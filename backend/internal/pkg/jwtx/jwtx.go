@@ -3,19 +3,32 @@
 package jwtx
 
 import (
+	"crypto/rand"
 	"crypto/rsa"
+	"encoding/hex"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 )
 
-// Claims 是签发到 JWT 中的自定义会话载荷。
+const (
+	issuer   = "llmgateway"
+	audience = "llmgateway-console"
+)
+
+// Claims 是签发到 JWT 中的自定义会话载荷，含 RFC 7519 全量标准字段。
 type Claims struct {
-	UserID   int64  `json:"uid"`
 	Username string `json:"username"`
 	Role     string `json:"role"`
+	Ver      int    `json:"ver"` // 会话代数：与 users.token_version 比对，仅最新有效
 	jwt.RegisteredClaims
+}
+
+// UserID 从 Subject 解析用户 ID。
+func (c *Claims) UserID() (int64, error) {
+	return strconv.ParseInt(c.Subject, 10, 64)
 }
 
 // Manager 持有 RSA 密钥对与令牌有效期，负责签/解 JWT。
@@ -46,22 +59,27 @@ func NewManager(privPath, pubPath string, ttlMinutes int) (*Manager, error) {
 	return &Manager{priv: priv, pub: pub, ttl: time.Duration(ttlMinutes) * time.Minute}, nil
 }
 
-// Sign 为指定用户签发一个 RS256 JWT。
-func (m *Manager) Sign(userID int64, username, role string) (string, error) {
+// Sign 为指定用户签发 RS256 JWT，携带 ver 会话代数。
+func (m *Manager) Sign(userID int64, username, role string, ver int) (string, error) {
 	now := time.Now()
 	claims := Claims{
-		UserID:   userID,
 		Username: username,
 		Role:     role,
+		Ver:      ver,
 		RegisteredClaims: jwt.RegisteredClaims{
-			IssuedAt:  jwt.NewNumericDate(now),
+			Issuer:    issuer,
+			Subject:   strconv.FormatInt(userID, 10),
+			Audience:  jwt.ClaimStrings{audience},
 			ExpiresAt: jwt.NewNumericDate(now.Add(m.ttl)),
+			NotBefore: jwt.NewNumericDate(now),
+			IssuedAt:  jwt.NewNumericDate(now),
+			ID:        newJTI(),
 		},
 	}
 	return jwt.NewWithClaims(jwt.SigningMethodRS256, claims).SignedString(m.priv)
 }
 
-// Parse 校验 JWT 签名与有效期并解析载荷，非 RS256 算法一律拒绝。
+// Parse 严格校验签名、算法、iss/aud/exp/nbf/iat，返回完整 claims。
 func (m *Manager) Parse(token string) (*Claims, error) {
 	claims := &Claims{}
 	_, err := jwt.ParseWithClaims(token, claims, func(t *jwt.Token) (interface{}, error) {
@@ -69,9 +87,21 @@ func (m *Manager) Parse(token string) (*Claims, error) {
 			return nil, jwt.ErrSignatureInvalid
 		}
 		return m.pub, nil
-	}, jwt.WithValidMethods([]string{"RS256"}))
+	},
+		jwt.WithValidMethods([]string{"RS256"}),
+		jwt.WithIssuer(issuer),
+		jwt.WithAudience(audience),
+		jwt.WithExpirationRequired())
 	if err != nil {
 		return nil, err
 	}
 	return claims, nil
+}
+
+func newJTI() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return strconv.FormatInt(time.Now().UnixNano(), 10)
+	}
+	return hex.EncodeToString(b)
 }

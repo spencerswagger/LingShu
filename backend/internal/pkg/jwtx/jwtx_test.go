@@ -8,6 +8,9 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
 )
 
 func writePEM(t *testing.T, dir, name string, pemBytes []byte) string {
@@ -42,14 +45,24 @@ func generateKeyFiles(t *testing.T) (privPath, pubPath string) {
 		writePEM(t, dir, "jwt_pub.pem", pubPEM)
 }
 
-func TestSignParse(t *testing.T) {
+func newManager(t *testing.T) *Manager {
+	t.Helper()
 	privPath, pubPath := generateKeyFiles(t)
 	m, err := NewManager(privPath, pubPath, 60)
 	if err != nil {
 		t.Fatal(err)
 	}
+	return m
+}
 
-	token, err := m.Sign(7, "alice", "admin")
+func (m *Manager) privKey() *rsa.PrivateKey {
+	return m.priv
+}
+
+func TestSignParse(t *testing.T) {
+	m := newManager(t)
+
+	token, err := m.Sign(7, "alice", "admin", 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,18 +70,18 @@ func TestSignParse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if claims.UserID != 7 || claims.Username != "alice" || claims.Role != "admin" {
+	uid, err := claims.UserID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uid != 7 || claims.Username != "alice" || claims.Role != "admin" {
 		t.Fatalf("claims mismatch: %+v", claims)
 	}
 }
 
 func TestParseTamperedTokenFails(t *testing.T) {
-	privPath, pubPath := generateKeyFiles(t)
-	m, err := NewManager(privPath, pubPath, 60)
-	if err != nil {
-		t.Fatal(err)
-	}
-	token, err := m.Sign(1, "bob", "user")
+	m := newManager(t)
+	token, err := m.Sign(1, "bob", "user", 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,12 +99,56 @@ func TestParseExpiredFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	token, err := m.Sign(2, "carol", "user")
+	token, err := m.Sign(2, "carol", "user", 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := m.Parse(token); err == nil {
 		t.Fatal("expired token should fail to parse")
+	}
+}
+
+func TestManager_ClaimsRoundTrip(t *testing.T) {
+	m := newManager(t)
+	tok, err := m.Sign(42, "alice", "ADMIN", 7)
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	c, err := m.Parse(tok)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if c.Subject != "42" || c.Issuer != "llmgateway" || c.Role != "ADMIN" || c.Ver != 7 || c.Username != "alice" {
+		t.Fatalf("unexpected claims: %+v", c)
+	}
+	if len(c.Audience) != 1 || c.Audience[0] != "llmgateway-console" {
+		t.Fatalf("unexpected audience: %v", c.Audience)
+	}
+	if c.ID == "" {
+		t.Fatal("jti should be set")
+	}
+	if c.NotBefore == nil || c.IssuedAt == nil || c.ExpiresAt == nil {
+		t.Fatal("nbf/iat/exp should be set")
+	}
+}
+
+func TestManager_Parse_RejectsWrongIssuer(t *testing.T) {
+	m := newManager(t)
+	// 手工构造 iss=evil 的 token（复用签名方法不允许覆盖 iss，故直接对 claims 对象签名）。
+	now := time.Now()
+	claims := Claims{
+		Username: "alice", Role: "ADMIN", Ver: 1,
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer: "evil", Subject: "1", Audience: jwt.ClaimStrings{"llmgateway-console"},
+			ExpiresAt: jwt.NewNumericDate(now.Add(time.Hour)), IssuedAt: jwt.NewNumericDate(now),
+		},
+	}
+	tok, err := jwt.NewWithClaims(jwt.SigningMethodRS256, claims).SignedString(m.privKey())
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	if _, err := m.Parse(tok); err == nil {
+		t.Fatal("should reject wrong issuer")
 	}
 }
 
