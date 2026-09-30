@@ -75,7 +75,7 @@ func (s *Service) Login(ctx context.Context, username, password string) (string,
 	if u.Status == StatusDisabled {
 		return "", nil, errDisabled()
 	}
-	token, err := s.jwt.Sign(u.ID, u.Username, u.Role)
+	token, err := s.jwt.Sign(u.ID, u.Username, u.Role, u.TokenVersion)
 	if err != nil {
 		return "", nil, fmt.Errorf("sign jwt: %w", err)
 	}
@@ -222,7 +222,7 @@ func (s *Service) AdminResetPassword(ctx context.Context, id int64, newPassword 
 	if err != nil {
 		return fmt.Errorf("hash password: %w", err)
 	}
-	if err := s.store.UpdatePassword(ctx, id, hash); err != nil {
+	if _, err := s.store.UpdatePassword(ctx, id, hash); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return errNotFound()
 		}

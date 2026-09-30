@@ -6,11 +6,13 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"log/slog"
+	"net"
 	"net/http"
 	"runtime/debug"
 	"strings"
 	"time"
 
+	"github.com/team/llmgateway/internal/domain/audit"
 	"github.com/team/llmgateway/internal/pkg/jwtx"
 	"github.com/team/llmgateway/internal/pkg/resp"
 )
@@ -163,4 +165,46 @@ func roleAllowed(role string, roles []string) bool {
 		}
 	}
 	return false
+}
+
+// WithAudit 记录管理端请求审计（method + path + 操作者 + request_id + 可信 IP）。
+// 须包在 WithAuth 内层以取得 user 上下文；target_id 从路径 {id} 解析。
+func WithAudit(store *audit.Store, logger *slog.Logger) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+			next.ServeHTTP(sw, r)
+			if store == nil {
+				return
+			}
+			uid, _ := UserIDFrom(r.Context())
+			username, _ := UsernameFrom(r.Context())
+			e := audit.Entry{
+				UserID:    uid,
+				Username:  username,
+				Action:    r.Method + " " + r.URL.Path,
+				RequestID: resp.RequestID(r),
+				IP:        clientIP(r),
+			}
+			if v := r.PathValue("id"); v != "" {
+				e.TargetID = v
+			}
+			if err := store.Insert(r.Context(), e); err != nil {
+				// 审计失败不影响业务响应，仅记日志
+				logger.Error("audit insert failed", "err", err)
+			}
+		})
+	}
+}
+
+// clientIP 取可信 X-Real-IP（nginx 覆盖），缺失回退 RemoteAddr。
+func clientIP(r *http.Request) string {
+	if v := r.Header.Get("X-Real-IP"); v != "" {
+		return v
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }
