@@ -39,6 +39,13 @@ http.interceptors.response.use(
     const body = err.response?.data
     const message = body?.message || '网络异常，请稍后重试'
     const requestId = body?.request_id || ''
+    // 40302：需先修改默认密码 → 置位 mustChange 并跳转改密页（放 401 处理之前）
+    if (err.response?.status === 403 && body?.code === 40302) {
+      useAuthStore().setMustChange(true)
+      if (router.currentRoute.value.path !== '/change-password') {
+        router.push('/change-password')
+      }
+    }
     // 401：清除本地登录态并跳转登录页
     if (err.response?.status === 401) {
       useAuthStore().logout()

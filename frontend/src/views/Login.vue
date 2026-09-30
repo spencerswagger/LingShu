@@ -2,7 +2,7 @@
 import { reactive, ref } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { login } from '@/api/auth'
+import { login, loginTotp } from '@/api/auth'
 import { useAuthStore } from '@/stores/auth'
 import ErrorBubble from '@/components/ErrorBubble.vue'
 
@@ -14,6 +14,10 @@ const formRef = ref()
 const loading = ref(false)
 const errMsg = ref('')
 const errReqId = ref('')
+const step = ref<'password' | 'totp'>('password')
+const preauthToken = ref('')
+const totpCode = ref('')
+const mustChange = ref(false)
 
 const form = reactive({ username: '', password: '' })
 
@@ -30,13 +34,48 @@ async function onLogin() {
   try {
     // 登录成功后由后端决角色，前端不提供选择
     const res = await login(form.username, form.password)
-    const { token, user } = res.data
-    auth.setAuth(token, user.Role, user.Username)
+    const d = res.data
+    // 已开两步验证：进入第二步（不发 token）
+    if (d.need_totp && d.preauth_token) {
+      step.value = 'totp'
+      preauthToken.value = d.preauth_token
+      mustChange.value = !!d.must_change_password
+      return
+    }
+    const { token, user } = d
+    auth.setAuth(token!, user!.Role, user!.Username, !!d.must_change_password)
     ElMessage.success('登录成功')
+    if (d.must_change_password) {
+      router.push('/change-password')
+      return
+    }
     const redirect = typeof route.query.redirect === 'string' ? route.query.redirect : ''
-    router.push(redirect || (user.Role === 'ADMIN' ? '/admin' : '/dev'))
+    router.push(redirect || (user!.Role === 'ADMIN' ? '/admin' : '/dev'))
   } catch (e: any) {
     errMsg.value = e?.message || '登录失败'
+    errReqId.value = e?.requestId || ''
+  } finally {
+    loading.value = false
+  }
+}
+
+async function onLoginTotp() {
+  errMsg.value = ''
+  errReqId.value = ''
+  loading.value = true
+  try {
+    const res = await loginTotp(preauthToken.value, totpCode.value)
+    const d = res.data
+    auth.setAuth(d.token!, d.user!.Role, d.user!.Username, !!d.must_change_password)
+    ElMessage.success('登录成功')
+    if (d.must_change_password) {
+      router.push('/change-password')
+      return
+    }
+    const redirect = typeof route.query.redirect === 'string' ? route.query.redirect : ''
+    router.push(redirect || (d.user!.Role === 'ADMIN' ? '/admin' : '/dev'))
+  } catch (e: any) {
+    errMsg.value = e?.message || '验证失败'
     errReqId.value = e?.requestId || ''
   } finally {
     loading.value = false
@@ -80,23 +119,40 @@ async function onLogin() {
     <!-- 右：登录表单 -->
     <main class="form-side">
       <div class="form-box">
-        <div class="form-head">
-          <div class="form-title">欢迎回来</div>
-          <div class="form-sub">请使用你的账号登录控制台</div>
+        <div v-if="step === 'password'">
+          <div class="form-head">
+            <div class="form-title">欢迎回来</div>
+            <div class="form-sub">请使用你的账号登录控制台</div>
+          </div>
+          <el-form ref="formRef" :model="form" :rules="rules" size="large" @keyup.enter="onLogin">
+            <el-form-item prop="username">
+              <el-input v-model="form.username" placeholder="用户名" clearable />
+            </el-form-item>
+            <el-form-item prop="password">
+              <el-input v-model="form.password" type="password" placeholder="密码" show-password />
+            </el-form-item>
+            <el-form-item>
+              <el-button type="primary" class="login-btn" :loading="loading" @click="onLogin">
+                登 录
+              </el-button>
+            </el-form-item>
+          </el-form>
         </div>
-        <el-form ref="formRef" :model="form" :rules="rules" size="large" @keyup.enter="onLogin">
-          <el-form-item prop="username">
-            <el-input v-model="form.username" placeholder="用户名" clearable />
-          </el-form-item>
-          <el-form-item prop="password">
-            <el-input v-model="form.password" type="password" placeholder="密码" show-password />
-          </el-form-item>
-          <el-form-item>
-            <el-button type="primary" class="login-btn" :loading="loading" @click="onLogin">
-              登 录
-            </el-button>
-          </el-form-item>
-        </el-form>
+        <div v-else>
+          <div class="form-head">
+            <div class="form-title">两步验证</div>
+            <div class="form-sub">请输入身份验证器中的动态码（或恢复码）</div>
+          </div>
+          <el-alert v-if="mustChange" type="warning" :closable="false" show-icon style="margin-bottom: 16px"
+            title="验证通过后需先修改默认密码" />
+          <el-input v-model="totpCode" placeholder="6 位动态码" size="large" @keyup.enter="onLoginTotp" />
+          <el-button type="primary" class="login-btn" :loading="loading" style="margin-top: 16px" @click="onLoginTotp">
+            验 证
+          </el-button>
+          <div class="form-sub" style="margin-top: 12px; text-align: center">
+            <el-link type="info" @click="step = 'password'">返回上一步</el-link>
+          </div>
+        </div>
         <ErrorBubble v-if="errMsg || errReqId" :message="errMsg" :request-id="errReqId" />
       </div>
     </main>
