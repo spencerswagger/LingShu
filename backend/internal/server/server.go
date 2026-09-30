@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/team/llmgateway/internal/config"
+	"github.com/team/llmgateway/internal/domain/audit"
 	"github.com/team/llmgateway/internal/domain/channel"
 	"github.com/team/llmgateway/internal/domain/console"
 	"github.com/team/llmgateway/internal/domain/identity"
@@ -16,6 +17,7 @@ import (
 	"github.com/team/llmgateway/internal/domain/sync"
 	"github.com/team/llmgateway/internal/domain/tag"
 	"github.com/team/llmgateway/internal/pkg/jwtx"
+	"github.com/team/llmgateway/internal/pkg/session"
 )
 
 // Deps 汇聚全量子处理器与可选网关 handler，由 main 装配后注入。
@@ -37,23 +39,27 @@ type Deps struct {
 
 // Server 汇聚 HTTP 服务所需依赖。
 type Server struct {
-	cfg    *config.Config
-	db     *sql.DB
-	logger *slog.Logger
-	jwtMgr *jwtx.Manager
-	deps   Deps
-	mux    *http.ServeMux
+	cfg      *config.Config
+	db       *sql.DB
+	logger   *slog.Logger
+	jwtMgr   *jwtx.Manager
+	sessions *session.Registry
+	audit    *audit.Store
+	deps     Deps
+	mux      *http.ServeMux
 }
 
 // New 构建 Server：接收全量子处理器（deps）并注册路由。
-func New(cfg *config.Config, db *sql.DB, logger *slog.Logger, jwtMgr *jwtx.Manager, deps Deps) *Server {
+func New(cfg *config.Config, db *sql.DB, logger *slog.Logger, jwtMgr *jwtx.Manager, sessions *session.Registry, auditStore *audit.Store, deps Deps) *Server {
 	s := &Server{
-		cfg:    cfg,
-		db:     db,
-		logger: logger,
-		jwtMgr: jwtMgr,
-		deps:   deps,
-		mux:    http.NewServeMux(),
+		cfg:      cfg,
+		db:       db,
+		logger:   logger,
+		jwtMgr:   jwtMgr,
+		sessions: sessions,
+		audit:    auditStore,
+		deps:     deps,
+		mux:      http.NewServeMux(),
 	}
 	s.routes()
 	return s
@@ -69,17 +75,17 @@ func (s *Server) routes() {
 	d := s.deps
 	s.mux.HandleFunc("POST /api/v1/auth/login", d.Identity.HandleLogin)
 	s.mux.HandleFunc("POST /api/v1/auth/login/totp", d.Identity.HandleLoginTOTP)
-	s.mux.Handle("GET /api/v1/auth/me", WithAuth(s.jwtMgr)(http.HandlerFunc(d.Identity.HandleMe)))
-	s.mux.Handle("PUT /api/v1/auth/me", WithAuth(s.jwtMgr)(http.HandlerFunc(d.Identity.HandleUpdateMe)))
-	s.mux.Handle("PUT /api/v1/auth/me/password", WithAuth(s.jwtMgr)(http.HandlerFunc(d.Identity.HandleChangePassword)))
-	s.mux.Handle("POST /api/v1/auth/logout", WithAuth(s.jwtMgr)(http.HandlerFunc(d.Identity.HandleLogout)))
-	s.mux.Handle("POST /api/v1/auth/me/totp/setup", WithAuth(s.jwtMgr)(http.HandlerFunc(d.Identity.HandleTOTPSetup)))
-	s.mux.Handle("POST /api/v1/auth/me/totp/confirm", WithAuth(s.jwtMgr)(http.HandlerFunc(d.Identity.HandleTOTPConfirm)))
-	s.mux.Handle("DELETE /api/v1/auth/me/totp", WithAuth(s.jwtMgr)(http.HandlerFunc(d.Identity.HandleTOTPDisable)))
+	s.mux.Handle("GET /api/v1/auth/me", WithAuth(s.jwtMgr, s.sessions)(http.HandlerFunc(d.Identity.HandleMe)))
+	s.mux.Handle("PUT /api/v1/auth/me", WithAuth(s.jwtMgr, s.sessions)(http.HandlerFunc(d.Identity.HandleUpdateMe)))
+	s.mux.Handle("PUT /api/v1/auth/me/password", WithAuth(s.jwtMgr, s.sessions)(http.HandlerFunc(d.Identity.HandleChangePassword)))
+	s.mux.Handle("POST /api/v1/auth/logout", WithAuth(s.jwtMgr, s.sessions)(http.HandlerFunc(d.Identity.HandleLogout)))
+	s.mux.Handle("POST /api/v1/auth/me/totp/setup", WithAuth(s.jwtMgr, s.sessions)(http.HandlerFunc(d.Identity.HandleTOTPSetup)))
+	s.mux.Handle("POST /api/v1/auth/me/totp/confirm", WithAuth(s.jwtMgr, s.sessions)(http.HandlerFunc(d.Identity.HandleTOTPConfirm)))
+	s.mux.Handle("DELETE /api/v1/auth/me/totp", WithAuth(s.jwtMgr, s.sessions)(http.HandlerFunc(d.Identity.HandleTOTPDisable)))
 
 	// ---- 管理端 ----
 	admin := http.NewServeMux()
-	s.mux.Handle("/api/v1/admin/", WithAuth(s.jwtMgr, identity.RoleAdmin)(admin))
+	s.mux.Handle("/api/v1/admin/", WithAuth(s.jwtMgr, s.sessions, identity.RoleAdmin)(WithAudit(s.audit, s.logger)(admin)))
 
 	// users / wallet / credit
 	admin.HandleFunc("GET /api/v1/admin/users", d.AdminUser.HandleListUsers)
@@ -173,7 +179,7 @@ func (s *Server) routes() {
 
 	// ---- 开发端 ----
 	dev := http.NewServeMux()
-	s.mux.Handle("/api/v1/dev/", WithAuth(s.jwtMgr, identity.RoleDeveloper)(dev))
+	s.mux.Handle("/api/v1/dev/", WithAuth(s.jwtMgr, s.sessions, identity.RoleDeveloper)(dev))
 
 	dev.HandleFunc("GET /api/v1/dev/tokens", d.TokenDev.HandleDevList)
 	dev.HandleFunc("POST /api/v1/dev/tokens", d.TokenDev.HandleDevCreate)

@@ -15,6 +15,7 @@ import (
 	"github.com/team/llmgateway/internal/domain/audit"
 	"github.com/team/llmgateway/internal/pkg/jwtx"
 	"github.com/team/llmgateway/internal/pkg/resp"
+	"github.com/team/llmgateway/internal/pkg/session"
 )
 
 // 用户身份在 context 中的键类型，避免字符串键冲突。
@@ -127,10 +128,11 @@ func bearerToken(r *http.Request) string {
 	return ""
 }
 
-// WithAuth 校验 Bearer JWT，并断言 claims.Role 属于 roles。
-// 认证失败返回 40101，越权（角色不符）返回 40301。
+// WithAuth 校验 Bearer JWT：Parse（RFC 全字段）→ SessionRegistry 校验 ver/status，
+// 断言 roles；must_change_password 用户仅放行白名单路径。
+// 认证失败返回 40101，越权（角色不符）返回 40301，强制改密未完成返回 40302。
 // 认证通过后将 userID/username/role 写入 context。
-func WithAuth(mgr *jwtx.Manager, roles ...string) func(http.Handler) http.Handler {
+func WithAuth(mgr *jwtx.Manager, sess *session.Registry, roles ...string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			token := bearerToken(r)
@@ -143,16 +145,45 @@ func WithAuth(mgr *jwtx.Manager, roles ...string) func(http.Handler) http.Handle
 				resp.Err(w, r, http.StatusUnauthorized, resp.CodeUnauthorized, "登录凭证无效或已过期")
 				return
 			}
+			userID, err := claims.UserID()
+			if err != nil {
+				resp.Err(w, r, http.StatusUnauthorized, resp.CodeUnauthorized, "登录凭证无效或已过期")
+				return
+			}
 			if !roleAllowed(claims.Role, roles) {
 				resp.Err(w, r, http.StatusForbidden, resp.CodeForbidden, "无权访问该资源")
 				return
 			}
-			ctx := context.WithValue(r.Context(), keyUserID, claims.UserID)
+			if sess != nil {
+				mustChange, serr := sess.Check(r.Context(), userID, claims.Ver)
+				if serr != nil {
+					resp.Err(w, r, http.StatusUnauthorized, resp.CodeUnauthorized, "登录凭证无效或已过期")
+					return
+				}
+				if mustChange && !allowedWhileMustChange(r) {
+					resp.Err(w, r, http.StatusForbidden, resp.CodeMustChangePassword, "请先修改默认密码")
+					return
+				}
+			}
+			ctx := context.WithValue(r.Context(), keyUserID, userID)
 			ctx = context.WithValue(ctx, keyUsername, claims.Username)
 			ctx = context.WithValue(ctx, keyRole, claims.Role)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
+}
+
+// allowedWhileMustChange 强制改密期间仅放行的路径。
+func allowedWhileMustChange(r *http.Request) bool {
+	switch {
+	case r.Method == "GET" && r.URL.Path == "/api/v1/auth/me":
+		return true
+	case r.Method == "PUT" && r.URL.Path == "/api/v1/auth/me/password":
+		return true
+	case r.Method == "POST" && r.URL.Path == "/api/v1/auth/logout":
+		return true
+	}
+	return false
 }
 
 func roleAllowed(role string, roles []string) bool {
