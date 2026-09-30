@@ -1,0 +1,57 @@
+# 一键部署：前端 + 后端 + PostgreSQL
+#
+#   docker compose up -d --build     # 启动（首次会构建前后端镜像）
+#   docker compose logs -f backend   # 查看后端日志
+#   docker compose down              # 停止（加 -v 连数据卷一起删除）
+#
+# 对外仅暴露 web 一个端口（默认 80，可用 APP_PORT 覆盖），前端静态资源与
+# 管理端 /api、网关 /v1 均由 nginx 在同一端口下反代到后端。
+# 后端启动时自动执行数据库迁移与初始管理员种子，无需手工操作。
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-llmgw}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-llmgw}
+      POSTGRES_DB: ${POSTGRES_DB:-llmgw}
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-llmgw} -d ${POSTGRES_DB:-llmgw}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./backend
+    environment:
+      # 数据库连接（默认指向本 compose 内的 postgres）
+      DATABASE_URL: postgres://${POSTGRES_USER:-llmgw}:${POSTGRES_PASSWORD:-llmgw}@postgres:5432/${POSTGRES_DB:-llmgw}?sslmode=disable
+      # 留空则首次启动自动生成强随机 SM4 密钥并持久化到 backend_keys 卷
+      SM4_KEY: ${SM4_KEY:-}
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      - backend_keys:/app/keys # JWT RSA 密钥对 + SM4 密钥
+      - backend_data:/app/data # 账单重试队列（WAL）
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ./frontend
+    ports:
+      - "${APP_PORT:-80}:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  backend_keys:
+  backend_data:

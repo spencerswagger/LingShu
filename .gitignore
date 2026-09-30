@@ -1,0 +1,10 @@
+.DS_Store
+*.log
+.env
+bin/
+dist/
+node_modules/
+backend/config.yaml
+backend/keys/
+backend/data/
+*.tsbuildinfo

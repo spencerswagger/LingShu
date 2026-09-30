@@ -1,0 +1,7 @@
+.git
+bin
+# 本地密钥/数据/配置不进镜像：容器内由卷持久化生成
+keys
+data
+config.yaml
+*.log

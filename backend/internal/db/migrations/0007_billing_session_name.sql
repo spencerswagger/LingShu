@@ -1,0 +1,1 @@
+ALTER TABLE billing_records ADD COLUMN IF NOT EXISTS session_name TEXT NOT NULL DEFAULT '';
