@@ -90,10 +90,10 @@ var ErrUsernameExists = errors.New("username already exists")
 // Create 插入新用户并返回回填主键后完整的用户，username 冲突返回 ErrUsernameExists。
 func (s *Store) Create(ctx context.Context, u *User) (*User, error) {
 	row := s.db.QueryRowContext(ctx,
-		`INSERT INTO users(username, password_hash, role, status, pricing_mode, nickname, is_system)
-		 VALUES($1, $2, $3, $4, $5, $6, $7)
+		`INSERT INTO users(username, password_hash, role, status, pricing_mode, nickname, is_system, must_change_password)
+		 VALUES($1, $2, $3, $4, $5, $6, $7, $8)
 		 RETURNING `+userCols,
-		u.Username, u.PasswordHash, u.Role, u.Status, u.PricingMode, u.Nickname, u.IsSystem)
+		u.Username, u.PasswordHash, u.Role, u.Status, u.PricingMode, u.Nickname, u.IsSystem, u.MustChangePassword)
 	created, err := scanUser(row)
 	if err != nil {
 		var pgErr *pgconn.PgError

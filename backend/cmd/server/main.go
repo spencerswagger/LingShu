@@ -16,6 +16,7 @@ import (
 
 	"github.com/team/llmgateway/internal/config"
 	"github.com/team/llmgateway/internal/db"
+	"github.com/team/llmgateway/internal/domain/audit"
 	"github.com/team/llmgateway/internal/domain/billing"
 	"github.com/team/llmgateway/internal/domain/channel"
 	"github.com/team/llmgateway/internal/domain/console"
@@ -27,6 +28,8 @@ import (
 	"github.com/team/llmgateway/internal/domain/tag"
 	"github.com/team/llmgateway/internal/pkg/jwtx"
 	"github.com/team/llmgateway/internal/pkg/logger"
+	"github.com/team/llmgateway/internal/pkg/ratelimit"
+	"github.com/team/llmgateway/internal/pkg/session"
 	"github.com/team/llmgateway/internal/seeding"
 	"github.com/team/llmgateway/internal/server"
 )
@@ -38,8 +41,7 @@ func sm4KeyFromConfig(cfg *config.Config) []byte {
 	k := strings.TrimSpace(cfg.Security.SM4Key)
 	b, err := hex.DecodeString(k)
 	if err != nil || len(b) != 16 {
-		slog.Error("security.sm4_key 缺失或非法：渠道凭据使用 SM4 加密，必须显式配置 32 位 hex（16 字节）密钥。请参照 config.example.yaml 设置（本地开发可用 dev-sm4-key 值的默认值，生产务必更换为强随机密钥）",
-			"sm4_key_invalid", k)
+		slog.Error("security.sm4_key 缺失或非法：渠道凭据使用 SM4 加密，必须显式配置 32 位 hex（16 字节）密钥。请参照 config.example.yaml 设置（本地开发可用 dev-sm4-key 值的默认值，生产务必更换为强随机密钥）")
 		os.Exit(1)
 	}
 	return b
@@ -125,7 +127,7 @@ func main() {
 	go app.billSvc.RunRetryQueue(ctx, time.Duration(cfg.Billing.RetryIntervalSeconds)*time.Second)
 	defer app.mgr.Stop()
 
-	srv := server.New(cfg, d, logr, jwtMgr, app.deps)
+	srv := server.New(cfg, d, logr, jwtMgr, app.sessions, app.auditStore, app.deps)
 	if err := srv.Run(ctx); err != nil {
 		slog.Error("server run", "error", err)
 		os.Exit(1)
@@ -134,11 +136,13 @@ func main() {
 
 // app 是装配结果的统称。
 type app struct {
-	deps    server.Deps
-	syncer  *sync.Syncer
-	mgr     *channel.Manager
-	sess    *router.SessionRegistry
-	billSvc *billing.Service
+	deps       server.Deps
+	syncer     *sync.Syncer
+	mgr        *channel.Manager
+	sess       *router.SessionRegistry
+	billSvc    *billing.Service
+	sessions   *session.Registry
+	auditStore *audit.Store
 }
 
 // buildApp 装配全部服务。
@@ -146,14 +150,38 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	// 渠道凭据与令牌明文共用 16 字节 SM4 密钥（取自安全配置）
 	sm4Key := sm4KeyFromConfig(cfg)
 
+	// 安全组件：会话注册表 / 审计 / 限流 / preauth / TOTP
+	sessions := session.NewRegistry(func(ctx context.Context, userID int64) (session.Entry, error) {
+		var e session.Entry
+		err := d.QueryRowContext(ctx,
+			`SELECT token_version, status, must_change_password FROM users WHERE id = $1 AND deleted_at IS NULL`,
+			userID).Scan(&e.Version, &e.Status, &e.MustChange)
+		return e, err
+	})
+	auditStore := audit.NewStore(d)
+	rl := ratelimit.New()
+	preAuth := identity.NewPreAuthStore()
+	go func() {
+		t := time.NewTicker(10 * time.Minute)
+		defer t.Stop()
+		for range t.C {
+			rl.Cleanup()
+		}
+	}()
+
 	// identity
 	userStore := identity.NewStore(d)
 	identitySvc := identity.NewService(userStore, jwtMgr)
+	identitySvc.SetSessionRegistry(sessions)
+	identitySvc.SetAudit(auditStore)
+	identitySvc.SetTOTP(identity.NewTOTPService(userStore, sm4Key))
 
 	creditStore := identity.NewCreditStore(d)
 	creditSvc := identity.NewCreditService(creditStore)
 
 	identityHandler := identity.NewHandler(identitySvc, creditSvc, userIDFrom)
+	identityHandler.SetRateLimiter(rl)
+	identityHandler.SetPreAuth(preAuth)
 	creditHandler := identity.NewCreditHandler(creditSvc, userIDFrom)
 
 	tokenStore := identity.NewTokenStore(d)
@@ -163,6 +191,7 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	tokenDevHandler := identity.NewTokenHandler(tokenSvc, userIDFrom)
 
 	adminUserHandler := identity.NewAdminUserHandler(identitySvc, creditSvc, userIDFrom)
+	adminUserHandler.SetTOTP(identity.NewTOTPService(userStore, sm4Key))
 
 	announceStore := identity.NewAnnouncementStore(d)
 	announceSvc := identity.NewAnnouncementService(announceStore)
@@ -314,10 +343,12 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 			SyncAdmin:    syncHandler,
 			Gateway:      gw.Handler(),
 		},
-		syncer:  syncer,
-		mgr:     chMgr,
-		sess:    sess,
-		billSvc: billSvc,
+		syncer:     syncer,
+		mgr:        chMgr,
+		sess:       sess,
+		billSvc:    billSvc,
+		sessions:   sessions,
+		auditStore: auditStore,
 	}, nil
 }
 

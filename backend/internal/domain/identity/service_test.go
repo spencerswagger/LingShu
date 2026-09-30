@@ -219,11 +219,11 @@ func TestService_AdminCreateUser_DuplicateName(t *testing.T) {
 	}
 	defer db.Close()
 
-	insertQuery := `INSERT INTO users(username, password_hash, role, status, pricing_mode, nickname, is_system)
-		 VALUES($1, $2, $3, $4, $5, $6, $7)
+	insertQuery := `INSERT INTO users(username, password_hash, role, status, pricing_mode, nickname, is_system, must_change_password)
+		 VALUES($1, $2, $3, $4, $5, $6, $7, $8)
 		 RETURNING `
 	mock.ExpectQuery(regexp.QuoteMeta(insertQuery)).
-		WithArgs("dup", sqlmock.AnyArg(), RoleDeveloper, StatusActive, PricingModeSale, "", false).
+		WithArgs("dup", sqlmock.AnyArg(), RoleDeveloper, StatusActive, PricingModeSale, "", false, false).
 		WillReturnError(&pgconn.PgError{Code: "23505", Message: "duplicate key"})
 
 	svc := NewService(NewStore(db), newTestManager(t))
