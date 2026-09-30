@@ -81,3 +81,22 @@ func TestSM4WrongKeyFails(t *testing.T) {
 		t.Fatal("decrypt with wrong key should fail")
 	}
 }
+
+func TestHashPassword_PBKDF2Format(t *testing.T) {
+	h, err := HashPassword("s3cret-pw!A")
+	if err != nil {
+		t.Fatalf("hash: %v", err)
+	}
+	if !strings.HasPrefix(h, "$pbkdf2-sm3$200000$") {
+		t.Fatalf("unexpected format: %q", h)
+	}
+	if !VerifyPassword("s3cret-pw!A", h) {
+		t.Fatal("verify should pass")
+	}
+	if VerifyPassword("wrong", h) {
+		t.Fatal("verify wrong password should fail")
+	}
+	if VerifyPassword("s3cret-pw!A", "bogus") {
+		t.Fatal("verify malformed stored should fail")
+	}
+}
