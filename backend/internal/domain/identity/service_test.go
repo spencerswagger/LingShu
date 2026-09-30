@@ -51,13 +51,13 @@ func newTestManager(t *testing.T) *jwtx.Manager {
 	return mgr
 }
 
-const selectUserByUsername = `SELECT id, username, password_hash, role, status, pricing_mode, nickname, is_system, created_at, updated_at FROM users WHERE username = $1`
+const selectUserByUsername = `SELECT id, username, password_hash, role, status, pricing_mode, nickname, is_system, must_change_password, token_version, totp_enabled, created_at, updated_at FROM users WHERE username = $1`
 
 func userRow(u *User) *sqlmock.Rows {
 	return sqlmock.NewRows([]string{"id", "username", "password_hash", "role", "status",
-		"pricing_mode", "nickname", "is_system", "created_at", "updated_at"}).
+		"pricing_mode", "nickname", "is_system", "must_change_password", "token_version", "totp_enabled", "created_at", "updated_at"}).
 		AddRow(u.ID, u.Username, u.PasswordHash, u.Role, u.Status,
-			u.PricingMode, u.Nickname, false, u.CreatedAt, u.UpdatedAt)
+			u.PricingMode, u.Nickname, false, u.MustChangePassword, u.TokenVersion, u.TOTPEnabled, u.CreatedAt, u.UpdatedAt)
 }
 
 func TestService_Login_Success(t *testing.T) {

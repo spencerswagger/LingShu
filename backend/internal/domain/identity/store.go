@@ -35,19 +35,24 @@ type User struct {
 	IsSystem     bool // 系统内置用户（健康探测开销归属），不出现在用户管理/登录等用户侧
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
+	// 安全字段（API 响应可见，均非敏感密文）。
+	MustChangePassword bool
+	TokenVersion       int
+	TOTPEnabled        bool
 	// 查询聚合字段（非表列）：余额与累计消费（completed 账单求和），List 时填充。
 	Balance    float64
 	TotalSpent float64
 }
 
 // userCols 列出 users 表查询时使用的全部列，保持各查询一致。
-const userCols = `id, username, password_hash, role, status, pricing_mode, nickname, is_system, created_at, updated_at`
+const userCols = `id, username, password_hash, role, status, pricing_mode, nickname, is_system, must_change_password, token_version, totp_enabled, created_at, updated_at`
 
 // scanUser 将一行扫描到 *User。
 func scanUser(row interface{ Scan(...any) error }) (*User, error) {
 	var u User
 	err := row.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Role, &u.Status,
-		&u.PricingMode, &u.Nickname, &u.IsSystem, &u.CreatedAt, &u.UpdatedAt)
+		&u.PricingMode, &u.Nickname, &u.IsSystem, &u.MustChangePassword,
+		&u.TokenVersion, &u.TOTPEnabled, &u.CreatedAt, &u.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -158,17 +163,39 @@ func (s *Store) Update(ctx context.Context, u *User) error {
 	return nil
 }
 
-// UpdatePassword 重置用户登录口令（管理员重置密码入口）。
-func (s *Store) UpdatePassword(ctx context.Context, id int64, hash string) error {
-	res, err := s.db.ExecContext(ctx,
-		`UPDATE users SET password_hash = $2, updated_at = now() WHERE id = $1 AND deleted_at IS NULL`, id, hash)
-	if err != nil {
-		return err
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return sql.ErrNoRows
-	}
-	return nil
+// BumpTokenVersion 会话代数 +1，返回新值（登录/登出用）。
+func (s *Store) BumpTokenVersion(ctx context.Context, id int64) (int64, error) {
+	var v int64
+	err := s.db.QueryRowContext(ctx,
+		`UPDATE users SET token_version = token_version + 1, updated_at = now()
+		 WHERE id = $1 AND deleted_at IS NULL RETURNING token_version`, id).Scan(&v)
+	return v, err
+}
+
+// ChangePassword 本人改密：更新哈希、清除 must_change_password、会话代数 +1，返回新版本。
+func (s *Store) ChangePassword(ctx context.Context, id int64, hash string) (int64, error) {
+	var v int64
+	err := s.db.QueryRowContext(ctx,
+		`UPDATE users SET password_hash = $2, must_change_password = false,
+		   token_version = token_version + 1, updated_at = now()
+		 WHERE id = $1 AND deleted_at IS NULL RETURNING token_version`, id, hash).Scan(&v)
+	return v, err
+}
+
+// UpdatePassword 管理员重置口令：更新哈希、会话代数 +1（不改 must_change_password），返回新版本。
+func (s *Store) UpdatePassword(ctx context.Context, id int64, hash string) (int64, error) {
+	var v int64
+	err := s.db.QueryRowContext(ctx,
+		`UPDATE users SET password_hash = $2, token_version = token_version + 1, updated_at = now()
+		 WHERE id = $1 AND deleted_at IS NULL RETURNING token_version`, id, hash).Scan(&v)
+	return v, err
+}
+
+// ClearMustChange 清除强制改密标记（改密页成功后的兜底）。
+func (s *Store) ClearMustChange(ctx context.Context, id int64) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE users SET must_change_password = false WHERE id = $1`, id)
+	return err
 }
 
 // UpdateNickname 仅更新昵称（本人资料修改入口），返回更新后的用户。
