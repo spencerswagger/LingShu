@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 
+	"github.com/team/llmgateway/internal/pkg/ratelimit"
 	"github.com/team/llmgateway/internal/pkg/resp"
 )
 
@@ -14,6 +16,8 @@ type Handler struct {
 	svc        *Service
 	credit     *CreditService
 	userIDFrom func(ctx context.Context) (int64, bool)
+	rl         *ratelimit.Limiter
+	preauth    *PreAuthStore
 }
 
 // NewHandler 创建身份认证 HTTP 处理器。
@@ -21,29 +25,227 @@ func NewHandler(svc *Service, credit *CreditService, userIDFrom func(ctx context
 	return &Handler{svc: svc, credit: credit, userIDFrom: userIDFrom}
 }
 
+func (h *Handler) SetRateLimiter(rl *ratelimit.Limiter) { h.rl = rl }
+func (h *Handler) SetPreAuth(p *PreAuthStore)           { h.preauth = p }
+
 type loginRequest struct {
 	Username string `json:"username"`
 	Password string `json:"password"`
 }
 
 type loginResponse struct {
-	Token string `json:"token"`
-	User  *User  `json:"user"`
+	Token              string `json:"token,omitempty"`
+	User               *User  `json:"user,omitempty"`
+	NeedTOTP           bool   `json:"need_totp,omitempty"`
+	PreAuthToken       string `json:"preauth_token,omitempty"`
+	MustChangePassword bool   `json:"must_change_password,omitempty"`
 }
 
-// HandleLogin POST /api/v1/auth/login 处理登录：校验口令并签发 JWT。
+// HandleLogin POST /api/v1/auth/login 处理登录第一步：校验口令并签发 JWT；
+// 已开 2FA 的用户返回 need_totp 与一次性 preauth_token（不发 token）。
 func (h *Handler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	var req loginRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "请求体格式错误")
 		return
 	}
-	token, user, err := h.svc.Login(r.Context(), req.Username, req.Password)
+	ip := clientIPOf(r)
+	if h.rl != nil {
+		if err := h.rl.Allow(ip, req.Username); err != nil {
+			resp.Err(w, r, http.StatusTooManyRequests, resp.CodeRateLimited, "尝试过于频繁，请稍后再试")
+			return
+		}
+	}
+	lr, err := h.svc.Login(r.Context(), req.Username, req.Password)
+	if err != nil {
+		if h.rl != nil {
+			h.rl.RecordFailure(ip, req.Username)
+		}
+		writeServiceErr(w, r, err)
+		return
+	}
+	if h.rl != nil {
+		h.rl.RecordSuccess(ip, req.Username)
+	}
+	if lr.NeedTOTP {
+		if h.preauth == nil {
+			resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "服务器内部错误")
+			return
+		}
+		pt := h.preauth.Issue(lr.User.ID)
+		resp.OK(w, r, loginResponse{NeedTOTP: true, PreAuthToken: pt, MustChangePassword: lr.MustChangePassword})
+		return
+	}
+	resp.OK(w, r, loginResponse{Token: lr.Token, User: lr.User, MustChangePassword: lr.MustChangePassword})
+}
+
+// HandleLoginTOTP POST /api/v1/auth/login/totp 第二步：校验 TOTP code 完成登录。
+func (h *Handler) HandleLoginTOTP(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		PreAuthToken string `json:"preauth_token"`
+		Code         string `json:"code"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "请求体格式错误")
+		return
+	}
+	if h.preauth == nil {
+		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "服务器内部错误")
+		return
+	}
+	userID, ok := h.preauth.Consume(req.PreAuthToken)
+	if !ok {
+		resp.Err(w, r, http.StatusUnauthorized, resp.CodeUnauthorized, "登录会话已过期，请重新登录")
+		return
+	}
+	username, _ := h.svc.store.GetByID(r.Context(), userID)
+	uname := ""
+	if username != nil {
+		uname = username.Username
+	}
+	ip := clientIPOf(r)
+	if h.rl != nil {
+		if err := h.rl.Allow(ip, uname); err != nil {
+			resp.Err(w, r, http.StatusTooManyRequests, resp.CodeRateLimited, "尝试过于频繁，请稍后再试")
+			return
+		}
+	}
+	lr, err := h.svc.LoginTOTP(r.Context(), userID, req.Code)
+	if err != nil {
+		if h.rl != nil {
+			h.rl.RecordFailure(ip, uname)
+		}
+		writeServiceErr(w, r, err)
+		return
+	}
+	if h.rl != nil {
+		h.rl.RecordSuccess(ip, uname)
+	}
+	resp.OK(w, r, loginResponse{Token: lr.Token, User: lr.User, MustChangePassword: lr.MustChangePassword})
+}
+
+// HandleLogout POST /api/v1/auth/logout 登出：bump ver 使当前 token 失效。
+func (h *Handler) HandleLogout(w http.ResponseWriter, r *http.Request) {
+	userID, ok := h.userIDFrom(r.Context())
+	if !ok {
+		resp.Err(w, r, http.StatusUnauthorized, resp.CodeUnauthorized, "未登录或登录已过期")
+		return
+	}
+	if err := h.svc.Logout(r.Context(), userID); err != nil {
+		writeServiceErr(w, r, err)
+		return
+	}
+	resp.OK(w, r, map[string]bool{"logout": true})
+}
+
+// HandleChangePassword PUT /api/v1/auth/me/password 本人改密。
+func (h *Handler) HandleChangePassword(w http.ResponseWriter, r *http.Request) {
+	userID, ok := h.userIDFrom(r.Context())
+	if !ok {
+		resp.Err(w, r, http.StatusUnauthorized, resp.CodeUnauthorized, "未登录或登录已过期")
+		return
+	}
+	var req struct {
+		OldPassword string `json:"old_password"`
+		NewPassword string `json:"new_password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "请求体格式错误")
+		return
+	}
+	token, err := h.svc.ChangeOwnPassword(r.Context(), userID, req.OldPassword, req.NewPassword)
 	if err != nil {
 		writeServiceErr(w, r, err)
 		return
 	}
-	resp.OK(w, r, loginResponse{Token: token, User: user})
+	resp.OK(w, r, map[string]string{"token": token})
+}
+
+// HandleTOTPSetup POST /api/v1/auth/me/totp/setup 生成 TOTP secret（待确认态）。
+func (h *Handler) HandleTOTPSetup(w http.ResponseWriter, r *http.Request) {
+	userID, ok := h.userIDFrom(r.Context())
+	if !ok {
+		resp.Err(w, r, http.StatusUnauthorized, resp.CodeUnauthorized, "未登录或登录已过期")
+		return
+	}
+	u, err := h.svc.store.GetByID(r.Context(), userID)
+	if err != nil {
+		writeServiceErr(w, r, err)
+		return
+	}
+	if h.svc.totp == nil {
+		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "服务器内部错误")
+		return
+	}
+	uri, secret, err := h.svc.totp.Setup(r.Context(), userID, u.Username)
+	if err != nil {
+		writeServiceErr(w, r, err)
+		return
+	}
+	resp.OK(w, r, map[string]string{"otpauth_uri": uri, "secret": secret})
+}
+
+// HandleTOTPConfirm POST /api/v1/auth/me/totp/confirm 确认绑定并返回恢复码。
+func (h *Handler) HandleTOTPConfirm(w http.ResponseWriter, r *http.Request) {
+	userID, ok := h.userIDFrom(r.Context())
+	if !ok {
+		resp.Err(w, r, http.StatusUnauthorized, resp.CodeUnauthorized, "未登录或登录已过期")
+		return
+	}
+	var req struct {
+		Code string `json:"code"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "请求体格式错误")
+		return
+	}
+	if h.svc.totp == nil {
+		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "服务器内部错误")
+		return
+	}
+	codes, err := h.svc.totp.Confirm(r.Context(), userID, req.Code)
+	if err != nil {
+		writeServiceErr(w, r, err)
+		return
+	}
+	resp.OK(w, r, map[string]any{"recovery_codes": codes})
+}
+
+// HandleTOTPDisable DELETE /api/v1/auth/me/totp 解绑（需当前 code）。
+func (h *Handler) HandleTOTPDisable(w http.ResponseWriter, r *http.Request) {
+	userID, ok := h.userIDFrom(r.Context())
+	if !ok {
+		resp.Err(w, r, http.StatusUnauthorized, resp.CodeUnauthorized, "未登录或登录已过期")
+		return
+	}
+	var req struct {
+		Code string `json:"code"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "请求体格式错误")
+		return
+	}
+	if h.svc.totp == nil {
+		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "服务器内部错误")
+		return
+	}
+	if err := h.svc.totp.Disable(r.Context(), userID, req.Code); err != nil {
+		writeServiceErr(w, r, err)
+		return
+	}
+	resp.OK(w, r, map[string]bool{"disabled": true})
+}
+
+// clientIPOf 取可信 X-Real-IP，缺失回退 RemoteAddr。
+func clientIPOf(r *http.Request) string {
+	if v := r.Header.Get("X-Real-IP"); v != "" {
+		return v
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }
 
 // HandleMe GET /api/v1/auth/me 返回当前登录用户资料与钱包余额（任意角色可用）。

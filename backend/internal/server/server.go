@@ -68,8 +68,14 @@ func New(cfg *config.Config, db *sql.DB, logger *slog.Logger, jwtMgr *jwtx.Manag
 func (s *Server) routes() {
 	d := s.deps
 	s.mux.HandleFunc("POST /api/v1/auth/login", d.Identity.HandleLogin)
+	s.mux.HandleFunc("POST /api/v1/auth/login/totp", d.Identity.HandleLoginTOTP)
 	s.mux.Handle("GET /api/v1/auth/me", WithAuth(s.jwtMgr)(http.HandlerFunc(d.Identity.HandleMe)))
 	s.mux.Handle("PUT /api/v1/auth/me", WithAuth(s.jwtMgr)(http.HandlerFunc(d.Identity.HandleUpdateMe)))
+	s.mux.Handle("PUT /api/v1/auth/me/password", WithAuth(s.jwtMgr)(http.HandlerFunc(d.Identity.HandleChangePassword)))
+	s.mux.Handle("POST /api/v1/auth/logout", WithAuth(s.jwtMgr)(http.HandlerFunc(d.Identity.HandleLogout)))
+	s.mux.Handle("POST /api/v1/auth/me/totp/setup", WithAuth(s.jwtMgr)(http.HandlerFunc(d.Identity.HandleTOTPSetup)))
+	s.mux.Handle("POST /api/v1/auth/me/totp/confirm", WithAuth(s.jwtMgr)(http.HandlerFunc(d.Identity.HandleTOTPConfirm)))
+	s.mux.Handle("DELETE /api/v1/auth/me/totp", WithAuth(s.jwtMgr)(http.HandlerFunc(d.Identity.HandleTOTPDisable)))
 
 	// ---- 管理端 ----
 	admin := http.NewServeMux()
@@ -81,6 +87,7 @@ func (s *Server) routes() {
 	admin.HandleFunc("PUT /api/v1/admin/users/{id}", d.AdminUser.HandleUpdateUser)
 	admin.HandleFunc("POST /api/v1/admin/users/batch-delete", d.AdminUser.HandleBatchDeleteUsers)
 	admin.HandleFunc("POST /api/v1/admin/users/{id}/reset-password", d.AdminUser.HandleResetPassword)
+	admin.HandleFunc("POST /api/v1/admin/users/{id}/reset-totp", d.AdminUser.HandleResetTOTP)
 	admin.HandleFunc("GET /api/v1/admin/users/{id}", d.AdminUser.HandleGetUser)
 	admin.HandleFunc("GET /api/v1/admin/users/{id}/wallet", d.Credit.HandleAdminWallet)
 	admin.HandleFunc("POST /api/v1/admin/users/{id}/wallet/recharge", d.Credit.HandleAdminRecharge)
