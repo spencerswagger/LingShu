@@ -10,6 +10,7 @@ import {
   Tickets,
   Bell,
   Wallet,
+  Lock,
   ArrowDown,
   SwitchButton,
 } from '@element-plus/icons-vue'
@@ -26,6 +27,7 @@ const menus = [
   { path: '/dev/wallet', title: '我的钱包', icon: Wallet },
   { path: '/dev/billings', title: '消费账单', icon: Tickets },
   { path: '/dev/announcements', title: '系统公告', icon: Bell },
+  { path: '/account/security', title: '账号安全', icon: Lock },
 ]
 
 function activeMenu() {
