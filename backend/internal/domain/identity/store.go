@@ -4,6 +4,7 @@ package identity
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -354,4 +355,68 @@ func (s *Store) EnsureWallet(ctx context.Context, userID int64) error {
 		return fmt.Errorf("ensure wallet: %w", err)
 	}
 	return nil
+}
+
+// ===== TOTP 专用（不进入 userCols，避免密文外泄） =====
+
+// TOTPSecret 返回用户 TOTP 密文与启用状态；用户不存在返回 sql.ErrNoRows。
+func (s *Store) TOTPSecret(ctx context.Context, id int64) (cipher string, enabled bool, err error) {
+	err = s.db.QueryRowContext(ctx,
+		`SELECT COALESCE(totp_secret_cipher, ''), totp_enabled FROM users WHERE id = $1 AND deleted_at IS NULL`,
+		id).Scan(&cipher, &enabled)
+	return
+}
+
+// SetTOTPSecret 保存待确认的 TOTP 密文（未启用态）。
+func (s *Store) SetTOTPSecret(ctx context.Context, id int64, cipher string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE users SET totp_secret_cipher = $2, totp_enabled = false WHERE id = $1`, id, cipher)
+	return err
+}
+
+// EnableTOTP 启用 TOTP 并落库恢复码哈希（jsonb）。
+func (s *Store) EnableTOTP(ctx context.Context, id int64, hashes []string) error {
+	b, err := json.Marshal(hashes)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx,
+		`UPDATE users SET totp_enabled = true, totp_recovery_hashes = $2::jsonb WHERE id = $1`, id, string(b))
+	return err
+}
+
+// GetRecoveryHashes 返回用户剩余恢复码哈希；未设置返回空切片。
+func (s *Store) GetRecoveryHashes(ctx context.Context, id int64) ([]string, error) {
+	var raw sql.NullString
+	err := s.db.QueryRowContext(ctx,
+		`SELECT totp_recovery_hashes::text FROM users WHERE id = $1 AND deleted_at IS NULL`, id).Scan(&raw)
+	if err != nil {
+		return nil, err
+	}
+	if !raw.Valid || raw.String == "" || raw.String == "null" {
+		return nil, nil
+	}
+	var out []string
+	if err := json.Unmarshal([]byte(raw.String), &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// SetRecoveryHashes 更新用户剩余恢复码哈希。
+func (s *Store) SetRecoveryHashes(ctx context.Context, id int64, hashes []string) error {
+	b, err := json.Marshal(hashes)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx,
+		`UPDATE users SET totp_recovery_hashes = $2::jsonb WHERE id = $1`, id, string(b))
+	return err
+}
+
+// DisableTOTP 解绑 TOTP：清空密文、恢复码并置未启用。
+func (s *Store) DisableTOTP(ctx context.Context, id int64) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE users SET totp_enabled = false, totp_secret_cipher = NULL, totp_recovery_hashes = NULL WHERE id = $1`, id)
+	return err
 }

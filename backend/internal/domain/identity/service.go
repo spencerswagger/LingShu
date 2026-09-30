@@ -9,9 +9,11 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/team/llmgateway/internal/domain/audit"
 	"github.com/team/llmgateway/internal/pkg/crypto"
 	"github.com/team/llmgateway/internal/pkg/jwtx"
 	"github.com/team/llmgateway/internal/pkg/resp"
+	"github.com/team/llmgateway/internal/pkg/session"
 )
 
 // APIError 是带 HTTP 状态码与业务码的领域错误，handler 据此返回响应。
@@ -49,6 +51,10 @@ func errInternal() *APIError {
 type Service struct {
 	store *Store
 	jwt   *jwtx.Manager
+	// 以下为可选安全依赖（nil 时对应能力降级/跳过）。
+	sessions *session.Registry
+	audit    *audit.Store
+	totp     *TOTPService
 }
 
 // NewService 创建认证服务。
@@ -56,31 +62,171 @@ func NewService(store *Store, jwtMgr *jwtx.Manager) *Service {
 	return &Service{store: store, jwt: jwtMgr}
 }
 
-// Login 校验用户名密码与账户状态，签发 JWT，返回 token 与用户信息。
+func (s *Service) SetSessionRegistry(r *session.Registry) { s.sessions = r }
+func (s *Service) SetAudit(a *audit.Store)                { s.audit = a }
+func (s *Service) SetTOTP(t *TOTPService)                 { s.totp = t }
+
+// LoginResult 登录结果：未开 2FA 时 Token 非空；已开 2FA 时 NeedTOTP=true 且 Token 为空。
+type LoginResult struct {
+	Token              string
+	User               *User
+	NeedTOTP           bool
+	MustChangePassword bool
+	TokenVersion       int64
+}
+
+// validatePasswordStrength 密码强度：≥8 字符且至少含两类字符（小写/大写/数字/符号）。
+func validatePasswordStrength(password string) error {
+	runes := utf8.RuneCountInString(password)
+	if runes < 8 {
+		return errBadRequest("密码至少 8 个字符")
+	}
+	var lower, upper, digit, symbol bool
+	for _, r := range password {
+		switch {
+		case r >= 'a' && r <= 'z':
+			lower = true
+		case r >= 'A' && r <= 'Z':
+			upper = true
+		case r >= '0' && r <= '9':
+			digit = true
+		default:
+			symbol = true
+		}
+	}
+	classes := 0
+	for _, b := range []bool{lower, upper, digit, symbol} {
+		if b {
+			classes++
+		}
+	}
+	if classes < 2 {
+		return errBadRequest("密码需至少包含字母、数字、符号中的两类")
+	}
+	return nil
+}
+
+// Login 第一步：校验口令与状态。未开 2FA 时完成登录（bump ver + 签发）；
+// 已开 2FA 时返回 NeedTOTP=true（不发 JWT、不 bump ver）。
 // 用户不存在、密码错误统一返回"用户名或密码错误"，避免账户枚举。
-func (s *Service) Login(ctx context.Context, username, password string) (string, *User, error) {
+func (s *Service) Login(ctx context.Context, username, password string) (*LoginResult, error) {
 	if username == "" || password == "" {
-		return "", nil, errBadRequest("用户名和密码不能为空")
+		return nil, errBadRequest("用户名和密码不能为空")
 	}
 	u, err := s.store.GetByUsername(ctx, username)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return "", nil, errUnauthorized()
+			return nil, errUnauthorized()
 		}
-		return "", nil, fmt.Errorf("get user by username: %w", err)
+		return nil, fmt.Errorf("get user by username: %w", err)
 	}
 	if !crypto.VerifyPassword(password, u.PasswordHash) {
-		return "", nil, errUnauthorized()
+		return nil, errUnauthorized()
 	}
 	if u.Status == StatusDisabled {
-		return "", nil, errDisabled()
+		return nil, errDisabled()
 	}
-	token, err := s.jwt.Sign(u.ID, u.Username, u.Role, u.TokenVersion)
+	u.PasswordHash = ""
+	if u.TOTPEnabled {
+		return &LoginResult{User: u, NeedTOTP: true, MustChangePassword: u.MustChangePassword}, nil
+	}
+	token, ver, err := s.issueSession(ctx, u)
 	if err != nil {
-		return "", nil, fmt.Errorf("sign jwt: %w", err)
+		return nil, err
 	}
-	u.PasswordHash = "" // 不外泄哈希
-	return token, u, nil
+	return &LoginResult{Token: token, User: u, MustChangePassword: u.MustChangePassword, TokenVersion: ver}, nil
+}
+
+// issueSession bump token_version 并签发新 JWT，同步内存会话注册表。
+func (s *Service) issueSession(ctx context.Context, u *User) (string, int64, error) {
+	ver, err := s.store.BumpTokenVersion(ctx, u.ID)
+	if err != nil {
+		return "", 0, fmt.Errorf("bump token version: %w", err)
+	}
+	token, err := s.jwt.Sign(u.ID, u.Username, u.Role, int(ver))
+	if err != nil {
+		return "", 0, fmt.Errorf("sign jwt: %w", err)
+	}
+	if s.sessions != nil {
+		s.sessions.Set(u.ID, session.Entry{Version: int(ver), Status: u.Status, MustChange: u.MustChangePassword})
+	}
+	return token, ver, nil
+}
+
+// LoginTOTP 第二步：校验 preauth 对应用户的 TOTP code，成功则完成登录。
+func (s *Service) LoginTOTP(ctx context.Context, userID int64, code string) (*LoginResult, error) {
+	if s.totp == nil {
+		return nil, errInternal()
+	}
+	ok, err := s.totp.Verify(ctx, userID, code)
+	if err != nil || !ok {
+		return nil, errUnauthorized()
+	}
+	u, err := s.store.GetByID(ctx, userID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, errUnauthorized()
+		}
+		return nil, fmt.Errorf("get user: %w", err)
+	}
+	if u.Status != StatusActive {
+		return nil, errDisabled()
+	}
+	u.PasswordHash = ""
+	token, _, err := s.issueSession(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	return &LoginResult{Token: token, User: u, MustChangePassword: u.MustChangePassword}, nil
+}
+
+// Logout 登出：会话代数 +1，当前 token 失效。
+func (s *Service) Logout(ctx context.Context, userID int64) error {
+	ver, err := s.store.BumpTokenVersion(ctx, userID)
+	if err != nil {
+		return err
+	}
+	if s.sessions != nil {
+		if u, err := s.store.GetByID(ctx, userID); err == nil {
+			s.sessions.Set(userID, session.Entry{Version: int(ver), Status: u.Status, MustChange: u.MustChangePassword})
+		}
+	}
+	return nil
+}
+
+// ChangeOwnPassword 本人改密：校验旧口令与强度，改密后会话代数 +1 并签发新 token。
+func (s *Service) ChangeOwnPassword(ctx context.Context, userID int64, oldPassword, newPassword string) (string, error) {
+	if err := validatePasswordStrength(newPassword); err != nil {
+		return "", err
+	}
+	u, err := s.store.GetByID(ctx, userID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", errUnauthorized()
+		}
+		return "", fmt.Errorf("get user: %w", err)
+	}
+	if !crypto.VerifyPassword(oldPassword, u.PasswordHash) {
+		return "", errUnauthorized()
+	}
+	hash, err := crypto.HashPassword(newPassword)
+	if err != nil {
+		return "", fmt.Errorf("hash password: %w", err)
+	}
+	ver, err := s.store.ChangePassword(ctx, userID, hash)
+	if err != nil {
+		return "", fmt.Errorf("change password: %w", err)
+	}
+	u.MustChangePassword = false
+	u.TokenVersion = int(ver)
+	if s.sessions != nil {
+		s.sessions.Set(userID, session.Entry{Version: int(ver), Status: u.Status, MustChange: false})
+	}
+	token, err := s.jwt.Sign(userID, u.Username, u.Role, int(ver))
+	if err != nil {
+		return "", fmt.Errorf("sign jwt: %w", err)
+	}
+	return token, nil
 }
 
 // normalizeNickname 清洗昵称：去首尾空白，空视为未设置；超长返回错误。
@@ -204,6 +350,9 @@ func (s *Service) UpdateUser(ctx context.Context, id int64, role, status string,
 		return nil, fmt.Errorf("get user: %w", err)
 	}
 	got.PasswordHash = ""
+	if s.sessions != nil {
+		s.sessions.Set(id, session.Entry{Version: got.TokenVersion, Status: got.Status, MustChange: got.MustChangePassword})
+	}
 	return got, nil
 }
 
@@ -222,11 +371,17 @@ func (s *Service) AdminResetPassword(ctx context.Context, id int64, newPassword 
 	if err != nil {
 		return fmt.Errorf("hash password: %w", err)
 	}
-	if _, err := s.store.UpdatePassword(ctx, id, hash); err != nil {
+	ver, err := s.store.UpdatePassword(ctx, id, hash)
+	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return errNotFound()
 		}
 		return fmt.Errorf("reset password: %w", err)
+	}
+	if s.sessions != nil {
+		if u, gerr := s.store.GetByID(ctx, id); gerr == nil {
+			s.sessions.Set(id, session.Entry{Version: int(ver), Status: u.Status, MustChange: u.MustChangePassword})
+		}
 	}
 	return nil
 }

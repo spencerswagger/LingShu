@@ -77,25 +77,64 @@ func TestService_Login_Success(t *testing.T) {
 
 	mock.ExpectQuery(regexp.QuoteMeta(selectUserByUsername)).
 		WithArgs("admin").WillReturnRows(userRow(u))
+	mock.ExpectQuery(regexp.QuoteMeta(
+		`UPDATE users SET token_version = token_version + 1, updated_at = now() WHERE id = $1 AND deleted_at IS NULL RETURNING token_version`)).
+		WithArgs(int64(1)).WillReturnRows(sqlmock.NewRows([]string{"token_version"}).AddRow(1))
 
 	mgr := newTestManager(t)
 	svc := NewService(NewStore(db), mgr)
 
-	token, got, err := svc.Login(context.Background(), "admin", "correct-password")
+	lr, err := svc.Login(context.Background(), "admin", "correct-password")
 	if err != nil {
 		t.Fatalf("login: %v", err)
 	}
-	if token == "" {
+	if lr.Token == "" {
 		t.Fatal("expected non-empty token")
 	}
+	got := lr.User
 	if got == nil || got.ID != 1 || got.Role != RoleAdmin {
 		t.Fatalf("unexpected user: %+v", got)
 	}
 	if got.PasswordHash != "" {
 		t.Fatal("password_hash should be cleared")
 	}
+	if lr.TokenVersion != 1 {
+		t.Fatalf("expected token_version 1, got %d", lr.TokenVersion)
+	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("mock expectations: %v", err)
+	}
+}
+
+func TestService_Login_RequiresTOTP(t *testing.T) {
+	db, mock, _ := sqlmock.New()
+	defer db.Close()
+	hash, _ := crypto.HashPassword("pass")
+	now := time.Now()
+	u := &User{ID: 3, Username: "sec", PasswordHash: hash, Role: RoleDeveloper,
+		Status: StatusActive, PricingMode: PricingModeSale, TOTPEnabled: true,
+		CreatedAt: now, UpdatedAt: now}
+	mock.ExpectQuery(regexp.QuoteMeta(selectUserByUsername)).WithArgs("sec").WillReturnRows(userRow(u))
+	svc := NewService(NewStore(db), newTestManager(t))
+	lr, err := svc.Login(context.Background(), "sec", "pass")
+	if err != nil {
+		t.Fatalf("login: %v", err)
+	}
+	if !lr.NeedTOTP || lr.Token != "" {
+		t.Fatalf("expected need_totp with no token, got %+v", lr)
+	}
+}
+
+func TestValidatePasswordStrength(t *testing.T) {
+	for _, ok := range []string{"Ab123456", "abcdefgh1", "12345678!"} {
+		if err := validatePasswordStrength(ok); err != nil {
+			t.Fatalf("should accept %q: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"short", "12345678", "abcdefgh"} {
+		if err := validatePasswordStrength(bad); err == nil {
+			t.Fatalf("should reject %q", bad)
+		}
 	}
 }
 
@@ -116,7 +155,7 @@ func TestService_Login_WrongPassword(t *testing.T) {
 
 	svc := NewService(NewStore(db), newTestManager(t))
 
-	_, _, err = svc.Login(context.Background(), "admin", "wrong-password")
+	_, err = svc.Login(context.Background(), "admin", "wrong-password")
 	var apiErr *APIError
 	if !asAPIError(err, &apiErr) || apiErr.Code != resp.CodeUnauthorized {
 		t.Fatalf("expected 40101, got %v", err)
@@ -136,7 +175,7 @@ func TestService_Login_UserNotFound(t *testing.T) {
 
 	svc := NewService(NewStore(db), newTestManager(t))
 
-	_, _, err = svc.Login(context.Background(), "ghost", "whatever")
+	_, err = svc.Login(context.Background(), "ghost", "whatever")
 	var apiErr *APIError
 	if !asAPIError(err, &apiErr) || apiErr.Code != resp.CodeUnauthorized {
 		t.Fatalf("expected 40101, got %v", err)
@@ -163,7 +202,7 @@ func TestService_Login_Disabled(t *testing.T) {
 
 	svc := NewService(NewStore(db), newTestManager(t))
 
-	_, _, err = svc.Login(context.Background(), "dev", "pass")
+	_, err = svc.Login(context.Background(), "dev", "pass")
 	var apiErr *APIError
 	if !asAPIError(err, &apiErr) || apiErr.Code != resp.CodeForbidden {
 		t.Fatalf("expected 40301, got %v", err)
@@ -208,7 +247,7 @@ func TestService_Login_EmptyInput(t *testing.T) {
 
 	svc := NewService(NewStore(db), newTestManager(t))
 
-	_, _, err = svc.Login(context.Background(), "", "")
+	_, err = svc.Login(context.Background(), "", "")
 	var apiErr *APIError
 	if !asAPIError(err, &apiErr) || apiErr.Code != resp.CodeBadRequest {
 		t.Fatalf("expected 40001, got %v", err)
