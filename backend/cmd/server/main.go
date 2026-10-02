@@ -26,6 +26,7 @@ import (
 	"github.com/team/llmgateway/internal/domain/router"
 	"github.com/team/llmgateway/internal/domain/sync"
 	"github.com/team/llmgateway/internal/domain/tag"
+	"github.com/team/llmgateway/internal/pkg/clientip"
 	"github.com/team/llmgateway/internal/pkg/jwtx"
 	"github.com/team/llmgateway/internal/pkg/logger"
 	"github.com/team/llmgateway/internal/pkg/ratelimit"
@@ -94,6 +95,9 @@ func main() {
 		os.Exit(1)
 	}
 	logr := logger.NewDefault()
+	// 打印生效的可信代理网段：信任边界失配是静默失败（审计 IP 退化为容器 IP），
+	// 显式打出便于部署时一眼发现。
+	clientip.LogTrustedNets()
 
 	// 装配全部领域服务、handler、网关与价格同步器。
 	app, err := buildApp(d, cfg, jwtMgr, logr)

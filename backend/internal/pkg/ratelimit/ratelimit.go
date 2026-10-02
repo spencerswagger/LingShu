@@ -12,9 +12,9 @@ const (
 	ipUserMaxFailures = 5                // 同 (IP,username) 1 分钟内最大失败数
 	ipUserWindow      = time.Minute      // (IP,username) 计数窗口
 	userMaxFailures   = 10               // 同用户名 15 分钟内累计最大失败数
-	userWindow        = 15 * time.Minute // 用户名计数窗口
-	lockBaseDuration  = time.Minute      // 账号锁定指数退避基数（第 10 次失败锁 1 分钟，之后每 10 次翻倍）
-	lockMaxDuration   = 60 * time.Minute // 锁定上限
+	userWindow        = 15 * time.Minute // 用户名计数窗口（超过该窗口无失败则计数清零）
+	lockBaseDuration  = time.Minute      // 首次锁定（第 10 次失败）时长
+	lockMaxDuration   = 60 * time.Minute // 锁定时长上限
 )
 
 // ErrRateLimited 表示触发限流/锁定。
@@ -58,8 +58,12 @@ func (l *Limiter) Allow(ip, username string) error {
 	return nil
 }
 
-// RecordFailure 记录一次失败；用户名维度达到阈值时按指数退避锁定账号
-// （第 10 次失败锁 1 分钟，之后每多 10 次翻倍，上限 60 分钟）。
+// RecordFailure 记录一次失败；账号维度计数达到阈值时按指数退避锁定：
+// 第 10 次失败锁 1 分钟，其后每多 10 次失败翻倍，上限 60 分钟。
+//
+// 实际行为提示：由于 userWindow=15 分钟，且锁定期间 Allow 直接拒绝、RecordFailure
+// 不会被调用，解锁后 15 分钟内未再累积失败即会清零计数，因此高等级退避（>2 倍）
+// 在真实流量下很少达到——lockMaxDuration 属防御性上限，并非常态路径。
 func (l *Limiter) RecordFailure(ip, username string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
