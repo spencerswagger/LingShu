@@ -13,7 +13,8 @@ const (
 	ipUserWindow      = time.Minute      // (IP,username) 计数窗口
 	userMaxFailures   = 10               // 同用户名 15 分钟内累计最大失败数
 	userWindow        = 15 * time.Minute // 用户名计数窗口
-	lockDuration      = 15 * time.Minute // 账号锁定时长
+	lockBaseDuration  = time.Minute      // 账号锁定指数退避基数（第 10 次失败锁 1 分钟，之后每 10 次翻倍）
+	lockMaxDuration   = 60 * time.Minute // 锁定上限
 )
 
 // ErrRateLimited 表示触发限流/锁定。
@@ -43,7 +44,7 @@ func New() *Limiter {
 	}
 }
 
-// Allow 判断 (ip, username) 是否被放行：账号锁定或任一维度窗口超限则拒绝。
+// Allow 判断 (ip, username) 是否被放行：账号退避锁有效或 (IP,username) 短窗超限则拒绝。
 func (l *Limiter) Allow(ip, username string) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -54,13 +55,11 @@ func (l *Limiter) Allow(ip, username string) error {
 	if c := l.ipUser[ip+"|"+username]; c != nil && now.Sub(c.start) < ipUserWindow && c.count >= ipUserMaxFailures {
 		return ErrRateLimited
 	}
-	if c := l.users[username]; c != nil && now.Sub(c.start) < userWindow && c.count >= userMaxFailures {
-		return ErrRateLimited
-	}
 	return nil
 }
 
-// RecordFailure 记录一次失败；用户名维度达到阈值时锁定账号。
+// RecordFailure 记录一次失败；用户名维度达到阈值时按指数退避锁定账号
+// （第 10 次失败锁 1 分钟，之后每多 10 次翻倍，上限 60 分钟）。
 func (l *Limiter) RecordFailure(ip, username string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -68,15 +67,22 @@ func (l *Limiter) RecordFailure(ip, username string) {
 	l.bump(l.ipUser, ip+"|"+username, now, ipUserWindow)
 	c := l.bump(l.users, username, now, userWindow)
 	if c.count >= userMaxFailures {
-		l.lockouts[username] = now.Add(lockDuration)
+		levels := c.count/userMaxFailures - 1
+		d := lockBaseDuration << levels
+		if d > lockMaxDuration {
+			d = lockMaxDuration
+		}
+		l.lockouts[username] = now.Add(d)
 	}
 }
 
-// RecordSuccess 登录成功：重置该 (IP,username) 计数。
+// RecordSuccess 登录成功：重置该 (IP,username) 与账号维度计数，并解除残留锁定。
 func (l *Limiter) RecordSuccess(ip, username string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	delete(l.ipUser, ip+"|"+username)
+	delete(l.users, username)
+	delete(l.lockouts, username)
 }
 
 func (l *Limiter) bump(m map[string]*counter, key string, now time.Time, win time.Duration) *counter {
