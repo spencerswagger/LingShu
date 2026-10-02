@@ -149,19 +149,23 @@ func (s *Store) List(ctx context.Context, filter, role, status string, page, siz
 	return users, total, nil
 }
 
-// Update 更新用户的状态、角色、计费模式与昵称，返回受影响行数。
-func (s *Store) Update(ctx context.Context, u *User) error {
-	res, err := s.db.ExecContext(ctx,
-		`UPDATE users SET role = $1, status = $2, pricing_mode = $3, nickname = $4, updated_at = now()
-		 WHERE id = $5`,
+// Update 更新用户的状态、角色、计费模式与昵称。
+// 角色是鉴权权威来源之一：角色变更时在同一条 SQL 内原子递增会话代数
+// （旧令牌立即失效），避免"角色已改但令牌未吊销"的中间态。
+// 返回最终 token_version / status / must_change_password。
+func (s *Store) Update(ctx context.Context, u *User) (ver int64, status string, mustChange bool, err error) {
+	row := s.db.QueryRowContext(ctx,
+		`UPDATE users
+		    SET role = $1, status = $2, pricing_mode = $3, nickname = $4,
+		        token_version = CASE WHEN role <> $1 THEN token_version + 1 ELSE token_version END,
+		        updated_at = now()
+		  WHERE id = $5 AND deleted_at IS NULL
+		  RETURNING token_version, status, must_change_password`,
 		u.Role, u.Status, u.PricingMode, u.Nickname, u.ID)
-	if err != nil {
-		return err
+	if err = row.Scan(&ver, &status, &mustChange); err != nil {
+		return 0, "", false, err
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return sql.ErrNoRows
-	}
-	return nil
+	return ver, status, mustChange, nil
 }
 
 // BumpTokenVersion 会话代数 +1，返回新值（登录/登出用）。
@@ -378,10 +382,10 @@ func (s *Store) TOTPSecret(ctx context.Context, id int64) (cipher string, enable
 	return
 }
 
-// SetTOTPSecret 保存待确认的 TOTP 密文（未启用态）。
+// SetTOTPSecret 落库待确认的 TOTP secret（enabled=false），并重置防重放时间步。
 func (s *Store) SetTOTPSecret(ctx context.Context, id int64, cipher string) error {
 	_, err := s.db.ExecContext(ctx,
-		`UPDATE users SET totp_secret_cipher = $2, totp_enabled = false WHERE id = $1`, id, cipher)
+		`UPDATE users SET totp_secret_cipher = $2, totp_enabled = false, totp_last_step = 0 WHERE id = $1`, id, cipher)
 	return err
 }
 
@@ -425,9 +429,10 @@ func (s *Store) SetRecoveryHashes(ctx context.Context, id int64, hashes []string
 	return err
 }
 
-// DisableTOTP 解绑 TOTP：清空密文、恢复码并置未启用。
+// DisableTOTP 解绑：清空 secret/恢复码，并重置防重放时间步
+// （避免时钟回拨或从备份恢复后把用户卡在"码总被判重放"）。
 func (s *Store) DisableTOTP(ctx context.Context, id int64) error {
 	_, err := s.db.ExecContext(ctx,
-		`UPDATE users SET totp_enabled = false, totp_secret_cipher = NULL, totp_recovery_hashes = NULL WHERE id = $1`, id)
+		`UPDATE users SET totp_enabled = false, totp_secret_cipher = NULL, totp_recovery_hashes = NULL, totp_last_step = 0 WHERE id = $1`, id)
 	return err
 }

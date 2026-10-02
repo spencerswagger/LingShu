@@ -254,6 +254,24 @@ func TestService_Login_EmptyInput(t *testing.T) {
 	}
 }
 
+// 回归 N2：超长用户名按认证失败处理（401，与"用户不存在"同构），且不查库。
+func TestService_Login_UsernameTooLong(t *testing.T) {
+	db, _, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	svc := NewService(NewStore(db), newTestManager(t))
+
+	long := strings.Repeat("a", 200)
+	_, err = svc.Login(context.Background(), long, "whatever")
+	var apiErr *APIError
+	if !asAPIError(err, &apiErr) || apiErr.Code != resp.CodeUnauthorized {
+		t.Fatalf("expected 40101 for over-long username, got %v", err)
+	}
+}
+
 func TestService_BatchDeleteUsers_BillingRecorded(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {

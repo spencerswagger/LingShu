@@ -113,3 +113,22 @@ func expectSecret(t *testing.T, mock sqlmock.Sqlmock, cipher string, enabled boo
 		`SELECT COALESCE(totp_secret_cipher, ''), totp_enabled FROM users WHERE id = $1 AND deleted_at IS NULL`)).
 		WithArgs(int64(1)).WillReturnRows(sqlmock.NewRows([]string{"cipher", "enabled"}).AddRow(cipher, enabled))
 }
+
+// 回归 N4：解绑路径不消费时间步——同一窗口内刚用于登录的码应能直接用于关闭 2FA。
+func TestTOTPService_Disable_DoesNotConsumeStep(t *testing.T) {
+	svc, mock := newTOTPService(t)
+	secret, cipher := secretRow(t, true)
+
+	// 仅取 secret + 执行 DisableTOTP；不应出现 TOTPLastStep 的读写期望（未设置即代表未调用）。
+	expectSecret(t, mock, cipher, true)
+	mock.ExpectExec(regexp.QuoteMeta(
+		`UPDATE users SET totp_enabled = false, totp_secret_cipher = NULL, totp_recovery_hashes = NULL, totp_last_step = 0 WHERE id = $1`)).
+		WithArgs(int64(1)).WillReturnResult(sqlmock.NewResult(1, 1))
+
+	if err := svc.Disable(context.Background(), 1, genCode(t, secret, time.Now())); err != nil {
+		t.Fatalf("disable should succeed without consuming step, got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("expectations: %v", err)
+	}
+}

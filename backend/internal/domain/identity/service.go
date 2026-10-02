@@ -118,12 +118,23 @@ func validatePasswordStrength(password string) error {
 	return nil
 }
 
+// maxUsernameLen 登录用户名长度上限。与 audit_logs.username 列宽对齐，
+// 避免超长用户名导致审计写入失败（varchar 超长在 PG 是报错而非截断）而静默丢失记录。
+const maxUsernameLen = 64
+
 // Login 第一步：校验口令与状态。未开 2FA 时完成登录（bump ver + 签发）；
 // 已开 2FA 时返回 NeedTOTP=true（不发 JWT、不 bump ver）。
 // 用户不存在、密码错误统一返回"用户名或密码错误"，避免账户枚举。
 func (s *Service) Login(ctx context.Context, username, password string) (*LoginResult, error) {
 	if username == "" || password == "" {
 		return nil, errBadRequest("用户名和密码不能为空")
+	}
+	// 超长用户名：按认证失败处理（与"用户不存在"同构，不引入枚举差异），
+	// 但必须留下审计——否则攻击者可用超长用户名让所有失败尝试不留痕。
+	if len(username) > maxUsernameLen {
+		s.auditLog(ctx, audit.Entry{Username: username[:maxUsernameLen], Action: "auth.login.fail",
+			Detail: map[string]any{"reason": "username_too_long", "len": len(username)}})
+		return nil, errUnauthorized()
 	}
 	u, err := s.store.GetByUsername(ctx, username)
 	if err != nil {
@@ -301,6 +312,8 @@ func (s *Service) AdminCreateUser(ctx context.Context, username, password, role,
 		return nil, fmt.Errorf("ensure wallet: %w", err)
 	}
 	created.PasswordHash = ""
+	s.auditLog(ctx, audit.Entry{Action: "admin.user.create", TargetType: "user", TargetID: strconv.FormatInt(created.ID, 10),
+		Detail: map[string]any{"username": created.Username, "role": created.Role, "pricing_mode": created.PricingMode}})
 	return created, nil
 }
 
@@ -369,19 +382,13 @@ func (s *Service) UpdateUser(ctx context.Context, id int64, role, status string,
 		return nil, fmt.Errorf("get user: %w", err)
 	}
 	u := &User{ID: id, Role: role, Status: status, PricingMode: pricingMode, Nickname: nick}
-	if err := s.store.Update(ctx, u); err != nil {
+	// 一条原子 SQL 完成"改属性 +（角色变更时）递增会话代数"，无中间态。
+	newVer, newStatus, newMustChange, err := s.store.Update(ctx, u)
+	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, errNotFound()
 		}
 		return nil, fmt.Errorf("update user: %w", err)
-	}
-	newVer := prev.TokenVersion
-	if prev.Role != role {
-		v, err := s.store.BumpTokenVersion(ctx, id)
-		if err != nil {
-			return nil, fmt.Errorf("bump token version on role change: %w", err)
-		}
-		newVer = int(v)
 	}
 	got, err := s.store.GetByID(ctx, id)
 	if err != nil {
@@ -391,9 +398,9 @@ func (s *Service) UpdateUser(ctx context.Context, id int64, role, status string,
 		return nil, fmt.Errorf("get user: %w", err)
 	}
 	got.PasswordHash = ""
-	got.TokenVersion = newVer
+	got.TokenVersion = int(newVer)
 	if s.sessions != nil {
-		s.sessions.Set(id, session.Entry{Version: newVer, Status: got.Status, MustChange: got.MustChangePassword})
+		s.sessions.Set(id, session.Entry{Version: int(newVer), Status: newStatus, MustChange: newMustChange})
 	}
 	s.auditLog(ctx, audit.Entry{Action: "admin.user.update", TargetType: "user", TargetID: strconv.FormatInt(id, 10),
 		Detail: map[string]any{"role": role, "status": status, "prev_role": prev.Role}})
@@ -427,6 +434,9 @@ func (s *Service) AdminResetPassword(ctx context.Context, id int64, newPassword 
 			s.sessions.Set(id, session.Entry{Version: int(ver), Status: u.Status, MustChange: u.MustChangePassword})
 		}
 	}
+	// 管理员重置他人口令是最高风险动作之一，必须留结构化审计（不含口令/哈希）。
+	s.auditLog(ctx, audit.Entry{Action: "admin.user.reset_password", TargetType: "user", TargetID: strconv.FormatInt(id, 10),
+		Detail: map[string]any{"token_version": ver}})
 	return nil
 }
 
@@ -476,5 +486,7 @@ func (s *Service) BatchDeleteUsers(ctx context.Context, ids []int64) (int64, err
 			s.sessions.Delete(id)
 		}
 	}
+	s.auditLog(ctx, audit.Entry{Action: "admin.user.batch_delete", TargetType: "user",
+		Detail: map[string]any{"ids": ids, "affected": n}})
 	return n, nil
 }

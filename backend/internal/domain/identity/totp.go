@@ -137,15 +137,29 @@ func (s *TOTPService) Confirm(ctx context.Context, userID int64, code string) ([
 
 // Verify 校验 TOTP code 或恢复码（均一次性：动态码按时间步防重放，恢复码用后作废）。
 func (s *TOTPService) Verify(ctx context.Context, userID int64, code string) (bool, error) {
+	return s.verify(ctx, userID, code, true)
+}
+
+// verify 校验 code（或恢复码）。consume=true 时对动态码做防重放消费（记录命中时间步），
+// consume=false 仅验码有效性（解绑场景已要求认证会话，重放不带来额外权限）。
+func (s *TOTPService) verify(ctx context.Context, userID int64, code string, consume bool) (bool, error) {
 	secret, err := s.secret(ctx, userID)
 	if err == nil && secret != "" {
 		if ok, step := verifyCode(secret, code); ok {
+			if !consume {
+				return true, nil
+			}
 			last, lerr := s.store.TOTPLastStep(ctx, userID)
 			if lerr != nil {
 				return false, nil
 			}
 			if step > last {
-				_ = s.store.SetTOTPLastStep(ctx, userID, step)
+				if serr := s.store.SetTOTPLastStep(ctx, userID, step); serr != nil {
+					// 写失败则该步未被记录（防重放 fail-open）：不拒绝登录（避免 DB 抖动升级为全员无法登录），
+					// 但必须留痕告警，便于运维发现防重放保护正在降级。
+					slog.WarnContext(ctx, "record totp last step failed, replay protection degraded",
+						"user_id", userID, "step", step, "err", serr)
+				}
 				return true, nil
 			}
 			return false, nil // 该时间步已消费过 → 重放
@@ -168,8 +182,10 @@ func (s *TOTPService) Verify(ctx context.Context, userID int64, code string) (bo
 }
 
 // Disable 解绑：校验 code（或恢复码）后清空 TOTP 与恢复码。
+// 不消费时间步——解绑已要求已认证会话，且同一 30s 窗口内刚用于登录的那个码
+// 若被判重放，会让"登录后顺手关闭 2FA"这一常见操作莫名失败。
 func (s *TOTPService) Disable(ctx context.Context, userID int64, code string) error {
-	ok, err := s.Verify(ctx, userID, code)
+	ok, err := s.verify(ctx, userID, code, false)
 	if err != nil || !ok {
 		return errBadRequest("验证码错误")
 	}
@@ -228,6 +244,10 @@ func (s *TOTPService) pendingSecret(ctx context.Context, userID int64) (string, 
 
 // verifyCode 校验动态码，返回是否命中与命中的时间步（未命中返回 false, 0）。
 // 时间窗为当前 ±1 步（共 3 个 30s 窗口），按步回推精确判定。
+//
+// 已知取舍：客户端时钟偏差约 ±30s 时，设备可能连续生成"上一步"的码，而防重放
+// 已把该步记为已消费 → 短时间内重复做 2FA 会被短暂误拒（窗口最长为漂移时长，≤30s）。
+// 现实中极少触发（通常已有会话）；若需精确，可改为记录已消费步集合而非单一 last。
 func verifyCode(secret, code string) (bool, int64) {
 	base := time.Now().Unix() / 30
 	for _, off := range []int64{0, -1, 1} {

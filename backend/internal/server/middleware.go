@@ -198,14 +198,15 @@ func roleAllowed(role string, roles []string) bool {
 	return false
 }
 
-// WithAudit 记录管理端请求审计（method + path + 操作者 + request_id + 可信 IP）。
-// 须包在 WithAuth 内层以取得 user 上下文；target_id 从路径 {id} 解析。
+// WithAudit 记录管理端「写操作」请求审计（method + path + 操作者 + request_id + 可信 IP）。
+// 须包在 WithAuth 内层以取得 user 上下文；target_type/target_id 从路径解析。
+// 只记写操作（POST/PUT/PATCH/DELETE）——读操作留痕噪声大且无追责价值。
 func WithAudit(store *audit.Store, logger *slog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
 			next.ServeHTTP(sw, r)
-			if store == nil {
+			if store == nil || !isAuditableMethod(r.Method) {
 				return
 			}
 			uid, _ := UserIDFrom(r.Context())
@@ -217,9 +218,7 @@ func WithAudit(store *audit.Store, logger *slog.Logger) func(http.Handler) http.
 				RequestID: resp.RequestID(r),
 				IP:        clientip.From(r),
 			}
-			if v := r.PathValue("id"); v != "" {
-				e.TargetID = v
-			}
+			e.TargetType, e.TargetID = auditTarget(r)
 			// 审计是对"已发生事实"的记录：脱离请求生命周期（客户端可能已断开），
 			// 并给独立超时，避免拖住连接（此时响应已发出）。
 			actx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 3*time.Second)
@@ -230,4 +229,30 @@ func WithAudit(store *audit.Store, logger *slog.Logger) func(http.Handler) http.
 			}
 		})
 	}
+}
+
+// isAuditableMethod 仅写操作入审计（读操作噪声大且无追责价值）。
+func isAuditableMethod(method string) bool {
+	switch method {
+	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+		return true
+	}
+	return false
+}
+
+// auditTarget 从管理端路径解析目标类型与目标 ID，如 /api/v1/admin/users/12 → ("user","12")。
+func auditTarget(r *http.Request) (string, string) {
+	const prefix = "/api/v1/admin/"
+	p := strings.TrimPrefix(r.URL.Path, prefix)
+	if p == r.URL.Path {
+		return "", ""
+	}
+	segs := strings.Split(strings.Trim(p, "/"), "/")
+	if len(segs) == 0 || segs[0] == "" {
+		return "", ""
+	}
+	// 路径首段为资源复数名（users/tokens/channels/...）；单数化去尾 s 作 target_type。
+	t := strings.TrimSuffix(segs[0], "s")
+	id := r.PathValue("id")
+	return t, id
 }
