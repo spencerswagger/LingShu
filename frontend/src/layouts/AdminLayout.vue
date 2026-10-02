@@ -87,8 +87,9 @@ const crumbBack = computed(() => {
   return ''
 })
 
-function logout() {
-  auth.logout()
+async function logout() {
+  // 先等服务端撤销 + 本地清态完成，再跳转；否则 token 未清空会被守卫弹回控制台
+  await auth.logout()
   router.push('/login')
 }
 </script>
