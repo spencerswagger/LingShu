@@ -46,9 +46,9 @@ http.interceptors.response.use(
         router.push('/change-password')
       }
     }
-    // 401：清除本地登录态并跳转登录页
+    // 401：服务端已判定凭证无效，只清本地态（绝不再发请求，避免与 logout() 递归）。
     if (err.response?.status === 401) {
-      useAuthStore().logout()
+      useAuthStore().clearLocal()
       if (router.currentRoute.value.path !== '/login') {
         router.push('/login')
       }

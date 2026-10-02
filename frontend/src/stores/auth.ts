@@ -66,12 +66,8 @@ export const useAuthStore = defineStore('auth', {
     displayName() {
       return this.nickname || this.username || ''
     },
-    async logout() {
-      try {
-        await logoutApi()
-      } catch {
-        // 忽略网络错误，本地仍清空
-      }
+    // 纯本地清态：无副作用、无网络、可重复调用（401 拦截器专用，杜绝递归）。
+    clearLocal() {
       this.token = ''
       this.role = ''
       this.username = ''
@@ -86,6 +82,15 @@ export const useAuthStore = defineStore('auth', {
       localStorage.removeItem('nickname')
       localStorage.removeItem('must_change_password')
       localStorage.removeItem('totp_enabled')
+    },
+    // 主动登出：先通知服务端（此时 token 有效），再清本地。
+    async logout() {
+      try {
+        await logoutApi()
+      } catch {
+        // 忽略网络错误，本地仍清空
+      }
+      this.clearLocal()
     },
   },
 })

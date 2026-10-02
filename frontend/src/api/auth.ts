@@ -15,6 +15,7 @@ export interface LoginResult {
   need_totp?: boolean
   preauth_token?: string
   must_change_password?: boolean
+  totp_enabled?: boolean
 }
 
 // 本人资料：user（PascalCase）+ balance

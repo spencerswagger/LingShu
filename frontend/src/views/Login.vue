@@ -43,14 +43,13 @@ async function onLogin() {
       return
     }
     const { token, user } = d
-    auth.setAuth(token!, user!.Role, user!.Username, !!d.must_change_password)
+    auth.setAuth(token!, user!.Role, user!.Username, !!d.must_change_password, !!d.totp_enabled)
     ElMessage.success('登录成功')
     if (d.must_change_password) {
       router.push('/change-password')
       return
     }
-    const redirect = typeof route.query.redirect === 'string' ? route.query.redirect : ''
-    router.push(redirect || (user!.Role === 'ADMIN' ? '/admin' : '/dev'))
+    router.push(safeRedirect(route.query.redirect) || (user!.Role === 'ADMIN' ? '/admin' : '/dev'))
   } catch (e: any) {
     errMsg.value = e?.message || '登录失败'
     errReqId.value = e?.requestId || ''
@@ -66,20 +65,26 @@ async function onLoginTotp() {
   try {
     const res = await loginTotp(preauthToken.value, totpCode.value)
     const d = res.data
-    auth.setAuth(d.token!, d.user!.Role, d.user!.Username, !!d.must_change_password)
+    auth.setAuth(d.token!, d.user!.Role, d.user!.Username, !!d.must_change_password, !!d.totp_enabled)
     ElMessage.success('登录成功')
     if (d.must_change_password) {
       router.push('/change-password')
       return
     }
-    const redirect = typeof route.query.redirect === 'string' ? route.query.redirect : ''
-    router.push(redirect || (d.user!.Role === 'ADMIN' ? '/admin' : '/dev'))
+    router.push(safeRedirect(route.query.redirect) || (d.user!.Role === 'ADMIN' ? '/admin' : '/dev'))
   } catch (e: any) {
     errMsg.value = e?.message || '验证失败'
     errReqId.value = e?.requestId || ''
   } finally {
     loading.value = false
   }
+}
+
+// safeRedirect 仅接受站内相对路径，杜绝开放重定向。
+function safeRedirect(v: unknown): string {
+  if (typeof v !== 'string') return ''
+  if (!v.startsWith('/') || v.startsWith('//')) return ''
+  return v
 }
 </script>
 
