@@ -174,7 +174,9 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	identitySvc := identity.NewService(userStore, jwtMgr)
 	identitySvc.SetSessionRegistry(sessions)
 	identitySvc.SetAudit(auditStore)
-	identitySvc.SetTOTP(identity.NewTOTPService(userStore, sm4Key))
+	totpSvc := identity.NewTOTPService(userStore, sm4Key)
+	totpSvc.SetAudit(auditStore)
+	identitySvc.SetTOTP(totpSvc)
 
 	creditStore := identity.NewCreditStore(d)
 	creditSvc := identity.NewCreditService(creditStore)
@@ -191,7 +193,7 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	tokenDevHandler := identity.NewTokenHandler(tokenSvc, userIDFrom)
 
 	adminUserHandler := identity.NewAdminUserHandler(identitySvc, creditSvc, userIDFrom)
-	adminUserHandler.SetTOTP(identity.NewTOTPService(userStore, sm4Key))
+	adminUserHandler.SetTOTP(totpSvc)
 
 	announceStore := identity.NewAnnouncementStore(d)
 	announceSvc := identity.NewAnnouncementService(announceStore)

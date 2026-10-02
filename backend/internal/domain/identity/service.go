@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -66,6 +68,16 @@ func (s *Service) SetSessionRegistry(r *session.Registry) { s.sessions = r }
 func (s *Service) SetAudit(a *audit.Store)                { s.audit = a }
 func (s *Service) SetTOTP(t *TOTPService)                 { s.totp = t }
 
+// auditLog 写入一条审计记录：nil-safe、失败仅记日志不阻塞业务。
+func (s *Service) auditLog(ctx context.Context, e audit.Entry) {
+	if s.audit == nil {
+		return
+	}
+	if err := s.audit.Insert(ctx, e); err != nil {
+		slog.ErrorContext(ctx, "audit insert failed", "action", e.Action, "err", err)
+	}
+}
+
 // LoginResult 登录结果：未开 2FA 时 Token 非空；已开 2FA 时 NeedTOTP=true 且 Token 为空。
 type LoginResult struct {
 	Token              string
@@ -116,14 +128,19 @@ func (s *Service) Login(ctx context.Context, username, password string) (*LoginR
 	u, err := s.store.GetByUsername(ctx, username)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
+			s.auditLog(ctx, audit.Entry{Username: username, Action: "auth.login.fail", Detail: map[string]any{"reason": "user_not_found"}})
 			return nil, errUnauthorized()
 		}
 		return nil, fmt.Errorf("get user by username: %w", err)
 	}
 	if !crypto.VerifyPassword(password, u.PasswordHash) {
+		s.auditLog(ctx, audit.Entry{UserID: u.ID, Username: u.Username, Action: "auth.login.fail",
+			TargetType: "user", TargetID: strconv.FormatInt(u.ID, 10), Detail: map[string]any{"reason": "bad_password"}})
 		return nil, errUnauthorized()
 	}
 	if u.Status == StatusDisabled {
+		s.auditLog(ctx, audit.Entry{UserID: u.ID, Username: u.Username, Action: "auth.login.fail",
+			TargetType: "user", TargetID: strconv.FormatInt(u.ID, 10), Detail: map[string]any{"reason": "disabled"}})
 		return nil, errDisabled()
 	}
 	u.PasswordHash = ""
@@ -134,6 +151,8 @@ func (s *Service) Login(ctx context.Context, username, password string) (*LoginR
 	if err != nil {
 		return nil, err
 	}
+	s.auditLog(ctx, audit.Entry{UserID: u.ID, Username: u.Username, Action: "auth.login.success",
+		TargetType: "user", TargetID: strconv.FormatInt(u.ID, 10)})
 	return &LoginResult{Token: token, User: u, MustChangePassword: u.MustChangePassword, TokenVersion: ver}, nil
 }
 
@@ -177,6 +196,8 @@ func (s *Service) LoginTOTP(ctx context.Context, userID int64, code string) (*Lo
 	if err != nil {
 		return nil, err
 	}
+	s.auditLog(ctx, audit.Entry{UserID: u.ID, Username: u.Username, Action: "auth.login_totp.success",
+		TargetType: "user", TargetID: strconv.FormatInt(u.ID, 10)})
 	return &LoginResult{Token: token, User: u, MustChangePassword: u.MustChangePassword}, nil
 }
 
@@ -191,6 +212,7 @@ func (s *Service) Logout(ctx context.Context, userID int64) error {
 			s.sessions.Set(userID, session.Entry{Version: int(ver), Status: u.Status, MustChange: u.MustChangePassword})
 		}
 	}
+	s.auditLog(ctx, audit.Entry{UserID: userID, Action: "auth.logout", TargetType: "user", TargetID: strconv.FormatInt(userID, 10)})
 	return nil
 }
 
@@ -226,6 +248,8 @@ func (s *Service) ChangeOwnPassword(ctx context.Context, userID int64, oldPasswo
 	if err != nil {
 		return "", fmt.Errorf("sign jwt: %w", err)
 	}
+	s.auditLog(ctx, audit.Entry{UserID: userID, Username: u.Username, Action: "auth.password.change",
+		TargetType: "user", TargetID: strconv.FormatInt(userID, 10)})
 	return token, nil
 }
 
@@ -258,12 +282,13 @@ func (s *Service) AdminCreateUser(ctx context.Context, username, password, role,
 		return nil, fmt.Errorf("hash password: %w", err)
 	}
 	u := &User{
-		Username:     username,
-		PasswordHash: hash,
-		Nickname:     nick,
-		Role:         role,
-		Status:       StatusActive,
-		PricingMode:  pricingMode,
+		Username:           username,
+		PasswordHash:       hash,
+		Nickname:           nick,
+		Role:               role,
+		Status:             StatusActive,
+		PricingMode:        pricingMode,
+		MustChangePassword: true, // 管理员新建账号强制首登改密
 	}
 	created, err := s.store.Create(ctx, u)
 	if err != nil {
@@ -321,6 +346,7 @@ func (s *Service) enrichLedger(ctx context.Context, ids []int64, apply func(id i
 }
 
 // UpdateUser 更新用户角色/状态/计费模式/昵称。
+// 角色是鉴权权威来源之一：角色变更会使旧令牌立即失效（bump token_version）。
 func (s *Service) UpdateUser(ctx context.Context, id int64, role, status string, pricingMode string, nickname string) (*User, error) {
 	if role != RoleAdmin && role != RoleDeveloper {
 		return nil, errBadRequest("角色只允许 ADMIN 或 DEVELOPER")
@@ -335,12 +361,27 @@ func (s *Service) UpdateUser(ctx context.Context, id int64, role, status string,
 	if err != nil {
 		return nil, err
 	}
+	prev, err := s.store.GetByID(ctx, id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, errNotFound()
+		}
+		return nil, fmt.Errorf("get user: %w", err)
+	}
 	u := &User{ID: id, Role: role, Status: status, PricingMode: pricingMode, Nickname: nick}
 	if err := s.store.Update(ctx, u); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, errNotFound()
 		}
 		return nil, fmt.Errorf("update user: %w", err)
+	}
+	newVer := prev.TokenVersion
+	if prev.Role != role {
+		v, err := s.store.BumpTokenVersion(ctx, id)
+		if err != nil {
+			return nil, fmt.Errorf("bump token version on role change: %w", err)
+		}
+		newVer = int(v)
 	}
 	got, err := s.store.GetByID(ctx, id)
 	if err != nil {
@@ -350,9 +391,12 @@ func (s *Service) UpdateUser(ctx context.Context, id int64, role, status string,
 		return nil, fmt.Errorf("get user: %w", err)
 	}
 	got.PasswordHash = ""
+	got.TokenVersion = newVer
 	if s.sessions != nil {
-		s.sessions.Set(id, session.Entry{Version: got.TokenVersion, Status: got.Status, MustChange: got.MustChangePassword})
+		s.sessions.Set(id, session.Entry{Version: newVer, Status: got.Status, MustChange: got.MustChangePassword})
 	}
+	s.auditLog(ctx, audit.Entry{Action: "admin.user.update", TargetType: "user", TargetID: strconv.FormatInt(id, 10),
+		Detail: map[string]any{"role": role, "status": status, "prev_role": prev.Role}})
 	return got, nil
 }
 
@@ -424,6 +468,13 @@ func (s *Service) BatchDeleteUsers(ctx context.Context, ids []int64) (int64, err
 			return 0, errBillingRecorded(brErr.Username)
 		}
 		return 0, fmt.Errorf("batch delete users: %w", err)
+	}
+	// 删除即断权：清缓存后，下次鉴权回落到 Loader，
+	// Loader 的 SQL 带 deleted_at IS NULL，软删行返回 sql.ErrNoRows → ErrRevoked。
+	if s.sessions != nil {
+		for _, id := range ids {
+			s.sessions.Delete(id)
+		}
 	}
 	return n, nil
 }

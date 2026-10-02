@@ -28,18 +28,18 @@ const (
 type User struct {
 	ID           int64
 	Username     string
-	PasswordHash string
+	PasswordHash string `json:"-"` // 永不外发（PBKDF2 存储值，靠 json:"-" 从序列化层杜绝泄露）
 	Nickname     string // 展示用昵称，可为空
 	Role         string
 	Status       string
 	PricingMode  string
-	IsSystem     bool // 系统内置用户（健康探测开销归属），不出现在用户管理/登录等用户侧
+	IsSystem     bool `json:"-"` // 系统内置用户，不对外暴露
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
 	// 安全字段（API 响应可见，均非敏感密文）。
 	MustChangePassword bool
-	TokenVersion       int
-	TOTPEnabled        bool
+	TokenVersion       int  `json:"-"` // 会话代数，无需外发
+	TOTPEnabled        bool // 前端账号安全页展示 2FA 状态用
 	// 查询聚合字段（非表列）：余额与累计消费（completed 账单求和），List 时填充。
 	Balance    float64
 	TotalSpent float64
@@ -183,20 +183,14 @@ func (s *Store) ChangePassword(ctx context.Context, id int64, hash string) (int6
 	return v, err
 }
 
-// UpdatePassword 管理员重置口令：更新哈希、会话代数 +1（不改 must_change_password），返回新版本。
+// UpdatePassword 管理员重置口令：更新哈希、强制首登改密、会话代数 +1，返回新版本。
 func (s *Store) UpdatePassword(ctx context.Context, id int64, hash string) (int64, error) {
 	var v int64
 	err := s.db.QueryRowContext(ctx,
-		`UPDATE users SET password_hash = $2, token_version = token_version + 1, updated_at = now()
+		`UPDATE users SET password_hash = $2, must_change_password = true,
+		   token_version = token_version + 1, updated_at = now()
 		 WHERE id = $1 AND deleted_at IS NULL RETURNING token_version`, id, hash).Scan(&v)
 	return v, err
-}
-
-// ClearMustChange 清除强制改密标记（改密页成功后的兜底）。
-func (s *Store) ClearMustChange(ctx context.Context, id int64) error {
-	_, err := s.db.ExecContext(ctx,
-		`UPDATE users SET must_change_password = false WHERE id = $1`, id)
-	return err
 }
 
 // UpdateNickname 仅更新昵称（本人资料修改入口），返回更新后的用户。
@@ -206,6 +200,23 @@ func (s *Store) UpdateNickname(ctx context.Context, id int64, nickname string) (
 		return nil, err
 	}
 	return s.GetByID(ctx, id)
+}
+
+// ===== TOTP 专用 =====
+
+// TOTPLastStep 返回用户最近一次消费的动态码时间步（防重放）。
+func (s *Store) TOTPLastStep(ctx context.Context, id int64) (int64, error) {
+	var v int64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COALESCE(totp_last_step, 0) FROM users WHERE id = $1 AND deleted_at IS NULL`, id).Scan(&v)
+	return v, err
+}
+
+// SetTOTPLastStep 记录用户最近消费的动态码时间步。
+func (s *Store) SetTOTPLastStep(ctx context.Context, id int64, step int64) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE users SET totp_last_step = $2 WHERE id = $1`, id, step)
+	return err
 }
 
 // Ledger 是用户列表聚合出的钱包级数据：当前余额与累计消费额（completed 账单积分数之和）。

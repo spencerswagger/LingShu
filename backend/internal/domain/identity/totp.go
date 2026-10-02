@@ -6,10 +6,13 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"log/slog"
+	"strconv"
 	"time"
 
 	"github.com/pquerna/otp"
 	"github.com/pquerna/otp/totp"
+	"github.com/team/llmgateway/internal/domain/audit"
 	"github.com/team/llmgateway/internal/pkg/crypto"
 )
 
@@ -65,10 +68,23 @@ func (p *PreAuthStore) Consume(token string) (int64, bool) {
 type TOTPService struct {
 	store  *Store
 	sm4Key []byte
+	audit  *audit.Store
 }
 
 func NewTOTPService(store *Store, sm4Key []byte) *TOTPService {
 	return &TOTPService{store: store, sm4Key: sm4Key}
+}
+
+// SetAudit 注入审计存储（nil 时跳过审计，不阻塞业务）。
+func (s *TOTPService) SetAudit(a *audit.Store) { s.audit = a }
+
+func (s *TOTPService) auditLog(ctx context.Context, e audit.Entry) {
+	if s.audit == nil {
+		return
+	}
+	if err := s.audit.Insert(ctx, e); err != nil {
+		slog.ErrorContext(ctx, "audit insert failed", "action", e.Action, "err", err)
+	}
 }
 
 // Setup 生成新 secret（覆盖未确认的旧 pending），返回 otpauth URI 与 base32 secret。
@@ -96,17 +112,17 @@ func (s *TOTPService) Setup(ctx context.Context, userID int64, username string) 
 
 // Confirm 确认绑定：校验 code 后启用并生成恢复码（SM3 哈希落库），返回明文恢复码一次。
 func (s *TOTPService) Confirm(ctx context.Context, userID int64, code string) ([]string, error) {
-	secret, err := s.secret(ctx, userID)
+	secret, err := s.pendingSecret(ctx, userID)
 	if err != nil {
-		return nil, errBadRequest("请先完成 TOTP 初始化")
+		return nil, err
 	}
-	if !verifyCode(secret, code) {
+	if ok, _ := verifyCode(secret, code); !ok {
 		return nil, errBadRequest("验证码错误")
 	}
 	codes := make([]string, 0, recoveryNum)
 	hashes := make([]string, 0, recoveryNum)
 	for i := 0; i < recoveryNum; i++ {
-		b := make([]byte, 5)
+		b := make([]byte, 10)
 		_, _ = rand.Read(b)
 		plain := hex.EncodeToString(b)
 		codes = append(codes, plain)
@@ -115,14 +131,25 @@ func (s *TOTPService) Confirm(ctx context.Context, userID int64, code string) ([
 	if err := s.store.EnableTOTP(ctx, userID, hashes); err != nil {
 		return nil, err
 	}
+	s.auditLog(ctx, audit.Entry{UserID: userID, Action: "totp.enable", TargetType: "user", TargetID: strconv.FormatInt(userID, 10)})
 	return codes, nil
 }
 
-// Verify 校验 TOTP code 或恢复码（恢复码一次性、用后作废）。返回是否有效。
+// Verify 校验 TOTP code 或恢复码（均一次性：动态码按时间步防重放，恢复码用后作废）。
 func (s *TOTPService) Verify(ctx context.Context, userID int64, code string) (bool, error) {
 	secret, err := s.secret(ctx, userID)
-	if err == nil && secret != "" && verifyCode(secret, code) {
-		return true, nil
+	if err == nil && secret != "" {
+		if ok, step := verifyCode(secret, code); ok {
+			last, lerr := s.store.TOTPLastStep(ctx, userID)
+			if lerr != nil {
+				return false, nil
+			}
+			if step > last {
+				_ = s.store.SetTOTPLastStep(ctx, userID, step)
+				return true, nil
+			}
+			return false, nil // 该时间步已消费过 → 重放
+		}
 	}
 	// 恢复码分支
 	hashes, herr := s.store.GetRecoveryHashes(ctx, userID)
@@ -146,12 +173,20 @@ func (s *TOTPService) Disable(ctx context.Context, userID int64, code string) er
 	if err != nil || !ok {
 		return errBadRequest("验证码错误")
 	}
-	return s.store.DisableTOTP(ctx, userID)
+	if err := s.store.DisableTOTP(ctx, userID); err != nil {
+		return err
+	}
+	s.auditLog(ctx, audit.Entry{UserID: userID, Action: "totp.disable", TargetType: "user", TargetID: strconv.FormatInt(userID, 10)})
+	return nil
 }
 
 // AdminForceDisable 管理员强制解绑（无需验证码）。
 func (s *TOTPService) AdminForceDisable(ctx context.Context, userID int64) error {
-	return s.store.DisableTOTP(ctx, userID)
+	if err := s.store.DisableTOTP(ctx, userID); err != nil {
+		return err
+	}
+	s.auditLog(ctx, audit.Entry{Action: "totp.admin_force_disable", TargetType: "user", TargetID: strconv.FormatInt(userID, 10)})
+	return nil
 }
 
 func (s *TOTPService) secret(ctx context.Context, userID int64) (string, error) {
@@ -172,12 +207,40 @@ func (s *TOTPService) secret(ctx context.Context, userID int64) (string, error) 
 	return string(b), nil
 }
 
-func verifyCode(secret, code string) bool {
-	ok, _ := totp.ValidateCustom(code, secret, time.Now(), totp.ValidateOpts{
-		Period:    30,
-		Skew:      1,
-		Digits:    otp.DigitsSix,
-		Algorithm: otp.AlgorithmSHA1,
-	})
-	return ok
+// pendingSecret 取"待确认绑定"的 TOTP secret（不要求已启用），供 Confirm 使用。
+func (s *TOTPService) pendingSecret(ctx context.Context, userID int64) (string, error) {
+	cipher, _, err := s.store.TOTPSecret(ctx, userID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", errBadRequest("用户不存在")
+		}
+		return "", err
+	}
+	if cipher == "" {
+		return "", errBadRequest("请先完成 TOTP 初始化")
+	}
+	b, err := crypto.SM4Decrypt(s.sm4Key, cipher)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+// verifyCode 校验动态码，返回是否命中与命中的时间步（未命中返回 false, 0）。
+// 时间窗为当前 ±1 步（共 3 个 30s 窗口），按步回推精确判定。
+func verifyCode(secret, code string) (bool, int64) {
+	base := time.Now().Unix() / 30
+	for _, off := range []int64{0, -1, 1} {
+		step := base + off
+		ok, _ := totp.ValidateCustom(code, secret, time.Unix(step*30, 0), totp.ValidateOpts{
+			Period:    30,
+			Skew:      0,
+			Digits:    otp.DigitsSix,
+			Algorithm: otp.AlgorithmSHA1,
+		})
+		if ok {
+			return true, step
+		}
+	}
+	return false, 0
 }

@@ -6,13 +6,13 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"log/slog"
-	"net"
 	"net/http"
 	"runtime/debug"
 	"strings"
 	"time"
 
 	"github.com/team/llmgateway/internal/domain/audit"
+	"github.com/team/llmgateway/internal/pkg/clientip"
 	"github.com/team/llmgateway/internal/pkg/jwtx"
 	"github.com/team/llmgateway/internal/pkg/resp"
 	"github.com/team/llmgateway/internal/pkg/session"
@@ -215,27 +215,19 @@ func WithAudit(store *audit.Store, logger *slog.Logger) func(http.Handler) http.
 				Username:  username,
 				Action:    r.Method + " " + r.URL.Path,
 				RequestID: resp.RequestID(r),
-				IP:        clientIP(r),
+				IP:        clientip.From(r),
 			}
 			if v := r.PathValue("id"); v != "" {
 				e.TargetID = v
 			}
-			if err := store.Insert(r.Context(), e); err != nil {
-				// 审计失败不影响业务响应，仅记日志
-				logger.Error("audit insert failed", "err", err)
+			// 审计是对"已发生事实"的记录：脱离请求生命周期（客户端可能已断开），
+			// 并给独立超时，避免拖住连接（此时响应已发出）。
+			actx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 3*time.Second)
+			defer cancel()
+			if err := store.Insert(actx, e); err != nil {
+				// 审计失败不影响业务响应，仅记日志（后续可接指标/告警）
+				logger.Error("audit insert failed", "action", e.Action, "err", err)
 			}
 		})
 	}
-}
-
-// clientIP 取可信 X-Real-IP（nginx 覆盖），缺失回退 RemoteAddr。
-func clientIP(r *http.Request) string {
-	if v := r.Header.Get("X-Real-IP"); v != "" {
-		return v
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
 }

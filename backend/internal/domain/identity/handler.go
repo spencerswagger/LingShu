@@ -4,9 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"net"
 	"net/http"
+	"strconv"
 
+	"github.com/team/llmgateway/internal/pkg/clientip"
 	"github.com/team/llmgateway/internal/pkg/ratelimit"
 	"github.com/team/llmgateway/internal/pkg/resp"
 )
@@ -39,6 +40,7 @@ type loginResponse struct {
 	NeedTOTP           bool   `json:"need_totp,omitempty"`
 	PreAuthToken       string `json:"preauth_token,omitempty"`
 	MustChangePassword bool   `json:"must_change_password,omitempty"`
+	TotpEnabled        bool   `json:"totp_enabled,omitempty"`
 }
 
 // HandleLogin POST /api/v1/auth/login 处理登录第一步：校验口令并签发 JWT；
@@ -49,7 +51,7 @@ func (h *Handler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "请求体格式错误")
 		return
 	}
-	ip := clientIPOf(r)
+	ip := clientip.From(r)
 	if h.rl != nil {
 		if err := h.rl.Allow(ip, req.Username); err != nil {
 			resp.Err(w, r, http.StatusTooManyRequests, resp.CodeRateLimited, "尝试过于频繁，请稍后再试")
@@ -73,10 +75,10 @@ func (h *Handler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		pt := h.preauth.Issue(lr.User.ID)
-		resp.OK(w, r, loginResponse{NeedTOTP: true, PreAuthToken: pt, MustChangePassword: lr.MustChangePassword})
+		resp.OK(w, r, loginResponse{NeedTOTP: true, PreAuthToken: pt, MustChangePassword: lr.MustChangePassword, TotpEnabled: true})
 		return
 	}
-	resp.OK(w, r, loginResponse{Token: lr.Token, User: lr.User, MustChangePassword: lr.MustChangePassword})
+	resp.OK(w, r, loginResponse{Token: lr.Token, User: lr.User, MustChangePassword: lr.MustChangePassword, TotpEnabled: lr.User.TOTPEnabled})
 }
 
 // HandleLoginTOTP POST /api/v1/auth/login/totp 第二步：校验 TOTP code 完成登录。
@@ -98,14 +100,11 @@ func (h *Handler) HandleLoginTOTP(w http.ResponseWriter, r *http.Request) {
 		resp.Err(w, r, http.StatusUnauthorized, resp.CodeUnauthorized, "登录会话已过期，请重新登录")
 		return
 	}
-	username, _ := h.svc.store.GetByID(r.Context(), userID)
-	uname := ""
-	if username != nil {
-		uname = username.Username
-	}
-	ip := clientIPOf(r)
+	// 第二步限流 key 用已握有的 userID（无需再查库取用户名，且不随改名漂移）。
+	rlKey := "uid:" + strconv.FormatInt(userID, 10)
+	ip := clientip.From(r)
 	if h.rl != nil {
-		if err := h.rl.Allow(ip, uname); err != nil {
+		if err := h.rl.Allow(ip, rlKey); err != nil {
 			resp.Err(w, r, http.StatusTooManyRequests, resp.CodeRateLimited, "尝试过于频繁，请稍后再试")
 			return
 		}
@@ -113,15 +112,15 @@ func (h *Handler) HandleLoginTOTP(w http.ResponseWriter, r *http.Request) {
 	lr, err := h.svc.LoginTOTP(r.Context(), userID, req.Code)
 	if err != nil {
 		if h.rl != nil {
-			h.rl.RecordFailure(ip, uname)
+			h.rl.RecordFailure(ip, rlKey)
 		}
 		writeServiceErr(w, r, err)
 		return
 	}
 	if h.rl != nil {
-		h.rl.RecordSuccess(ip, uname)
+		h.rl.RecordSuccess(ip, rlKey)
 	}
-	resp.OK(w, r, loginResponse{Token: lr.Token, User: lr.User, MustChangePassword: lr.MustChangePassword})
+	resp.OK(w, r, loginResponse{Token: lr.Token, User: lr.User, MustChangePassword: lr.MustChangePassword, TotpEnabled: true})
 }
 
 // HandleLogout POST /api/v1/auth/logout 登出：bump ver 使当前 token 失效。
@@ -234,18 +233,6 @@ func (h *Handler) HandleTOTPDisable(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp.OK(w, r, map[string]bool{"disabled": true})
-}
-
-// clientIPOf 取可信 X-Real-IP，缺失回退 RemoteAddr。
-func clientIPOf(r *http.Request) string {
-	if v := r.Header.Get("X-Real-IP"); v != "" {
-		return v
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
 }
 
 // HandleMe GET /api/v1/auth/me 返回当前登录用户资料与钱包余额（任意角色可用）。

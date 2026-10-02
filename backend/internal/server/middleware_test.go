@@ -183,15 +183,3 @@ func TestUserIDFrom_Empty(t *testing.T) {
 		t.Fatal("expected no user id in empty ctx")
 	}
 }
-
-func TestClientIP(t *testing.T) {
-	r := httptest.NewRequest("GET", "/", nil)
-	r.RemoteAddr = "203.0.113.5:443"
-	if got := clientIP(r); got != "203.0.113.5" {
-		t.Fatalf("expected remoteaddr host, got %q", got)
-	}
-	r.Header.Set("X-Real-IP", "198.51.100.9")
-	if got := clientIP(r); got != "198.51.100.9" {
-		t.Fatalf("expected x-real-ip, got %q", got)
-	}
-}
