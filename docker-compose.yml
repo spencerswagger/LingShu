@@ -33,6 +33,10 @@ services:
       DATABASE_URL: postgres://${POSTGRES_USER:-llmgw}:${POSTGRES_PASSWORD:-llmgw}@postgres:5432/${POSTGRES_DB:-llmgw}?sslmode=disable
       # 留空则首次启动自动生成强随机 SM4 密钥并持久化到 backend_keys 卷
       SM4_KEY: ${SM4_KEY:-}
+      # 可信代理网段（逗号分隔 CIDR）：仅当直连对端属于这些网段时才采信 X-Real-IP。
+      # 默认覆盖 docker 默认网络（172.16/12）与常用 overlay 段（10/8）。
+      # 注意：backend 不得暴露对外端口（限流/审计依赖此信任边界）。
+      TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-172.16.0.0/12,10.0.0.0/8}
       TZ: ${TZ:-Asia/Shanghai}
     volumes:
       - backend_keys:/app/keys # JWT RSA 密钥对 + SM4 密钥
