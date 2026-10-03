@@ -4,6 +4,7 @@ package identity
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -27,27 +28,32 @@ const (
 type User struct {
 	ID           int64
 	Username     string
-	PasswordHash string
+	PasswordHash string `json:"-"` // 永不外发（PBKDF2 存储值，靠 json:"-" 从序列化层杜绝泄露）
 	Nickname     string // 展示用昵称，可为空
 	Role         string
 	Status       string
 	PricingMode  string
-	IsSystem     bool // 系统内置用户（健康探测开销归属），不出现在用户管理/登录等用户侧
+	IsSystem     bool `json:"-"` // 系统内置用户，不对外暴露
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
+	// 安全字段（API 响应可见，均非敏感密文）。
+	MustChangePassword bool
+	TokenVersion       int  `json:"-"` // 会话代数，无需外发
+	TOTPEnabled        bool // 前端账号安全页展示 2FA 状态用
 	// 查询聚合字段（非表列）：余额与累计消费（completed 账单求和），List 时填充。
 	Balance    float64
 	TotalSpent float64
 }
 
 // userCols 列出 users 表查询时使用的全部列，保持各查询一致。
-const userCols = `id, username, password_hash, role, status, pricing_mode, nickname, is_system, created_at, updated_at`
+const userCols = `id, username, password_hash, role, status, pricing_mode, nickname, is_system, must_change_password, token_version, totp_enabled, created_at, updated_at`
 
 // scanUser 将一行扫描到 *User。
 func scanUser(row interface{ Scan(...any) error }) (*User, error) {
 	var u User
 	err := row.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Role, &u.Status,
-		&u.PricingMode, &u.Nickname, &u.IsSystem, &u.CreatedAt, &u.UpdatedAt)
+		&u.PricingMode, &u.Nickname, &u.IsSystem, &u.MustChangePassword,
+		&u.TokenVersion, &u.TOTPEnabled, &u.CreatedAt, &u.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -84,10 +90,10 @@ var ErrUsernameExists = errors.New("username already exists")
 // Create 插入新用户并返回回填主键后完整的用户，username 冲突返回 ErrUsernameExists。
 func (s *Store) Create(ctx context.Context, u *User) (*User, error) {
 	row := s.db.QueryRowContext(ctx,
-		`INSERT INTO users(username, password_hash, role, status, pricing_mode, nickname, is_system)
-		 VALUES($1, $2, $3, $4, $5, $6, $7)
+		`INSERT INTO users(username, password_hash, role, status, pricing_mode, nickname, is_system, must_change_password)
+		 VALUES($1, $2, $3, $4, $5, $6, $7, $8)
 		 RETURNING `+userCols,
-		u.Username, u.PasswordHash, u.Role, u.Status, u.PricingMode, u.Nickname, u.IsSystem)
+		u.Username, u.PasswordHash, u.Role, u.Status, u.PricingMode, u.Nickname, u.IsSystem, u.MustChangePassword)
 	created, err := scanUser(row)
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -143,32 +149,52 @@ func (s *Store) List(ctx context.Context, filter, role, status string, page, siz
 	return users, total, nil
 }
 
-// Update 更新用户的状态、角色、计费模式与昵称，返回受影响行数。
-func (s *Store) Update(ctx context.Context, u *User) error {
-	res, err := s.db.ExecContext(ctx,
-		`UPDATE users SET role = $1, status = $2, pricing_mode = $3, nickname = $4, updated_at = now()
-		 WHERE id = $5`,
+// Update 更新用户的状态、角色、计费模式与昵称。
+// 角色是鉴权权威来源之一：角色变更时在同一条 SQL 内原子递增会话代数
+// （旧令牌立即失效），避免"角色已改但令牌未吊销"的中间态。
+// 返回最终 token_version / status / must_change_password。
+func (s *Store) Update(ctx context.Context, u *User) (ver int64, status string, mustChange bool, err error) {
+	row := s.db.QueryRowContext(ctx,
+		`UPDATE users
+		    SET role = $1, status = $2, pricing_mode = $3, nickname = $4,
+		        token_version = CASE WHEN role <> $1 THEN token_version + 1 ELSE token_version END,
+		        updated_at = now()
+		  WHERE id = $5 AND deleted_at IS NULL
+		  RETURNING token_version, status, must_change_password`,
 		u.Role, u.Status, u.PricingMode, u.Nickname, u.ID)
-	if err != nil {
-		return err
+	if err = row.Scan(&ver, &status, &mustChange); err != nil {
+		return 0, "", false, err
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return sql.ErrNoRows
-	}
-	return nil
+	return ver, status, mustChange, nil
 }
 
-// UpdatePassword 重置用户登录口令（管理员重置密码入口）。
-func (s *Store) UpdatePassword(ctx context.Context, id int64, hash string) error {
-	res, err := s.db.ExecContext(ctx,
-		`UPDATE users SET password_hash = $2, updated_at = now() WHERE id = $1 AND deleted_at IS NULL`, id, hash)
-	if err != nil {
-		return err
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return sql.ErrNoRows
-	}
-	return nil
+// BumpTokenVersion 会话代数 +1，返回新值（登录/登出用）。
+func (s *Store) BumpTokenVersion(ctx context.Context, id int64) (int64, error) {
+	var v int64
+	err := s.db.QueryRowContext(ctx,
+		`UPDATE users SET token_version = token_version + 1, updated_at = now()
+		 WHERE id = $1 AND deleted_at IS NULL RETURNING token_version`, id).Scan(&v)
+	return v, err
+}
+
+// ChangePassword 本人改密：更新哈希、清除 must_change_password、会话代数 +1，返回新版本。
+func (s *Store) ChangePassword(ctx context.Context, id int64, hash string) (int64, error) {
+	var v int64
+	err := s.db.QueryRowContext(ctx,
+		`UPDATE users SET password_hash = $2, must_change_password = false,
+		   token_version = token_version + 1, updated_at = now()
+		 WHERE id = $1 AND deleted_at IS NULL RETURNING token_version`, id, hash).Scan(&v)
+	return v, err
+}
+
+// UpdatePassword 管理员重置口令：更新哈希、强制首登改密、会话代数 +1，返回新版本。
+func (s *Store) UpdatePassword(ctx context.Context, id int64, hash string) (int64, error) {
+	var v int64
+	err := s.db.QueryRowContext(ctx,
+		`UPDATE users SET password_hash = $2, must_change_password = true,
+		   token_version = token_version + 1, updated_at = now()
+		 WHERE id = $1 AND deleted_at IS NULL RETURNING token_version`, id, hash).Scan(&v)
+	return v, err
 }
 
 // UpdateNickname 仅更新昵称（本人资料修改入口），返回更新后的用户。
@@ -178,6 +204,23 @@ func (s *Store) UpdateNickname(ctx context.Context, id int64, nickname string) (
 		return nil, err
 	}
 	return s.GetByID(ctx, id)
+}
+
+// ===== TOTP 专用 =====
+
+// TOTPLastStep 返回用户最近一次消费的动态码时间步（防重放）。
+func (s *Store) TOTPLastStep(ctx context.Context, id int64) (int64, error) {
+	var v int64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COALESCE(totp_last_step, 0) FROM users WHERE id = $1 AND deleted_at IS NULL`, id).Scan(&v)
+	return v, err
+}
+
+// SetTOTPLastStep 记录用户最近消费的动态码时间步。
+func (s *Store) SetTOTPLastStep(ctx context.Context, id int64, step int64) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE users SET totp_last_step = $2 WHERE id = $1`, id, step)
+	return err
 }
 
 // Ledger 是用户列表聚合出的钱包级数据：当前余额与累计消费额（completed 账单积分数之和）。
@@ -327,4 +370,69 @@ func (s *Store) EnsureWallet(ctx context.Context, userID int64) error {
 		return fmt.Errorf("ensure wallet: %w", err)
 	}
 	return nil
+}
+
+// ===== TOTP 专用（不进入 userCols，避免密文外泄） =====
+
+// TOTPSecret 返回用户 TOTP 密文与启用状态；用户不存在返回 sql.ErrNoRows。
+func (s *Store) TOTPSecret(ctx context.Context, id int64) (cipher string, enabled bool, err error) {
+	err = s.db.QueryRowContext(ctx,
+		`SELECT COALESCE(totp_secret_cipher, ''), totp_enabled FROM users WHERE id = $1 AND deleted_at IS NULL`,
+		id).Scan(&cipher, &enabled)
+	return
+}
+
+// SetTOTPSecret 落库待确认的 TOTP secret（enabled=false），并重置防重放时间步。
+func (s *Store) SetTOTPSecret(ctx context.Context, id int64, cipher string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE users SET totp_secret_cipher = $2, totp_enabled = false, totp_last_step = 0 WHERE id = $1`, id, cipher)
+	return err
+}
+
+// EnableTOTP 启用 TOTP 并落库恢复码哈希（jsonb）。
+func (s *Store) EnableTOTP(ctx context.Context, id int64, hashes []string) error {
+	b, err := json.Marshal(hashes)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx,
+		`UPDATE users SET totp_enabled = true, totp_recovery_hashes = $2::jsonb WHERE id = $1`, id, string(b))
+	return err
+}
+
+// GetRecoveryHashes 返回用户剩余恢复码哈希；未设置返回空切片。
+func (s *Store) GetRecoveryHashes(ctx context.Context, id int64) ([]string, error) {
+	var raw sql.NullString
+	err := s.db.QueryRowContext(ctx,
+		`SELECT totp_recovery_hashes::text FROM users WHERE id = $1 AND deleted_at IS NULL`, id).Scan(&raw)
+	if err != nil {
+		return nil, err
+	}
+	if !raw.Valid || raw.String == "" || raw.String == "null" {
+		return nil, nil
+	}
+	var out []string
+	if err := json.Unmarshal([]byte(raw.String), &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// SetRecoveryHashes 更新用户剩余恢复码哈希。
+func (s *Store) SetRecoveryHashes(ctx context.Context, id int64, hashes []string) error {
+	b, err := json.Marshal(hashes)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx,
+		`UPDATE users SET totp_recovery_hashes = $2::jsonb WHERE id = $1`, id, string(b))
+	return err
+}
+
+// DisableTOTP 解绑：清空 secret/恢复码，并重置防重放时间步
+// （避免时钟回拨或从备份恢复后把用户卡在"码总被判重放"）。
+func (s *Store) DisableTOTP(ctx context.Context, id int64) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE users SET totp_enabled = false, totp_secret_cipher = NULL, totp_recovery_hashes = NULL, totp_last_step = 0 WHERE id = $1`, id)
+	return err
 }

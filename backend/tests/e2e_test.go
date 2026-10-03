@@ -30,8 +30,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pquerna/otp/totp"
 	"github.com/team/llmgateway/internal/config"
 	"github.com/team/llmgateway/internal/db"
+	"github.com/team/llmgateway/internal/domain/audit"
 	"github.com/team/llmgateway/internal/domain/billing"
 	"github.com/team/llmgateway/internal/domain/channel"
 	"github.com/team/llmgateway/internal/domain/console"
@@ -43,6 +45,8 @@ import (
 	"github.com/team/llmgateway/internal/domain/tag"
 	"github.com/team/llmgateway/internal/pkg/jwtx"
 	"github.com/team/llmgateway/internal/pkg/logger"
+	"github.com/team/llmgateway/internal/pkg/ratelimit"
+	"github.com/team/llmgateway/internal/pkg/session"
 	"github.com/team/llmgateway/internal/seeding"
 	"github.com/team/llmgateway/internal/server"
 )
@@ -137,14 +141,32 @@ func buildTestServer(t *testing.T, dsn string) (*httptest.Server, func()) {
 	}
 	logr := logger.NewDefault()
 
+	// 安全组件：会话注册表（loader 查 users 表 token_version/status/must_change，镜像 main 装配）、
+	// 审计 Store、登录限流、preauth 与 TOTP，保证安全端点（logout/totp 两步登录）可用。
+	sessions := session.NewRegistry(func(ctx context.Context, userID int64) (session.Entry, error) {
+		var e session.Entry
+		err := d.QueryRowContext(ctx,
+			`SELECT token_version, status, must_change_password FROM users WHERE id = $1 AND deleted_at IS NULL`,
+			userID).Scan(&e.Version, &e.Status, &e.MustChange)
+		return e, err
+	})
+	auditStore := audit.NewStore(d)
+	rl := ratelimit.New()
+	preAuth := identity.NewPreAuthStore()
+
 	// 复制 main.go buildApp 装配（含测试用 resolvers）。
 	userStore := identity.NewStore(d)
 	identitySvc := identity.NewService(userStore, jwtMgr)
+	identitySvc.SetSessionRegistry(sessions)
+	identitySvc.SetAudit(auditStore)
+	identitySvc.SetTOTP(identity.NewTOTPService(userStore, testSm4Key))
 
 	creditStore := identity.NewCreditStore(d)
 	creditSvc := identity.NewCreditService(creditStore)
 
 	identityHandler := identity.NewHandler(identitySvc, creditSvc, userIDFrom)
+	identityHandler.SetRateLimiter(rl)
+	identityHandler.SetPreAuth(preAuth)
 	creditHandler := identity.NewCreditHandler(creditSvc, userIDFrom)
 
 	tokenStore := identity.NewTokenStore(d)
@@ -152,6 +174,7 @@ func buildTestServer(t *testing.T, dsn string) (*httptest.Server, func()) {
 	tokenAdminHandler := identity.NewTokenHandler(tokenSvc, userIDFrom)
 	tokenDevHandler := identity.NewTokenHandler(tokenSvc, userIDFrom)
 	adminUserHandler := identity.NewAdminUserHandler(identitySvc, creditSvc, userIDFrom)
+	adminUserHandler.SetTOTP(identity.NewTOTPService(userStore, testSm4Key))
 	announceStore := identity.NewAnnouncementStore(d)
 	announceSvc := identity.NewAnnouncementService(announceStore)
 	announceHandler := identity.NewAnnouncementHandler(announceSvc, userIDFrom)
@@ -246,7 +269,7 @@ func buildTestServer(t *testing.T, dsn string) (*httptest.Server, func()) {
 		t.Fatalf("sync channels: %v", err)
 	}
 
-	srv := server.New(cfg, d, logr, jwtMgr, app.deps)
+	srv := server.New(cfg, d, logr, jwtMgr, sessions, auditStore, app.deps)
 	ts := httptest.NewServer(srv.Handler())
 	cleanup := func() {
 		ts.Close()
@@ -338,6 +361,90 @@ func startMockUpstream(t *testing.T) *httptest.Server {
 	return s
 }
 
+// ===== 登录与鉴权辅助 =====
+
+// adminNewPassword 是 e2e 中默认管理员首登改密后的新口令（满足强度要求：≥8 位且含多类字符）。
+const adminNewPassword = "Admin@123456"
+
+// login 以用户名/口令走 /auth/login 一步登录，返回 JWT；失败直接终止测试。
+func login(t *testing.T, base, username, password string) string {
+	t.Helper()
+	status, raw := req(t, http.MethodPost, base+"/api/v1/auth/login", "", map[string]string{"username": username, "password": password})
+	if status != http.StatusOK {
+		t.Fatalf("login %s status=%d body=%s", username, status, raw)
+	}
+	ar := decodeResp(t, raw)
+	var d struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(ar.Data, &d); err != nil {
+		t.Fatalf("decode login data: %v", err)
+	}
+	return d.Token
+}
+
+// loginAdmin 以默认管理员登录。seeding 新建的 admin 带 must_change_password=true，
+// 首次登录后走 /auth/me/password 白名单改密并返回新 token；口令已改过的后续登录
+// 自动改用 adminNewPassword，保证同一 server 内可重复调用。
+func loginAdmin(t *testing.T, base string) string {
+	t.Helper()
+	status, raw := req(t, http.MethodPost, base+"/api/v1/auth/login", "", map[string]string{"username": "admin", "password": "admin123"})
+	var d struct {
+		Token              string `json:"token"`
+		MustChangePassword bool   `json:"must_change_password"`
+	}
+	switch status {
+	case http.StatusOK:
+		ar := decodeResp(t, raw)
+		if err := json.Unmarshal(ar.Data, &d); err != nil {
+			t.Fatalf("decode admin login: %v", err)
+		}
+	case http.StatusUnauthorized:
+		// 默认口令已改（首登改密后再次登录），改用新口令
+		status, raw := req(t, http.MethodPost, base+"/api/v1/auth/login", "", map[string]string{"username": "admin", "password": adminNewPassword})
+		if status != http.StatusOK {
+			t.Fatalf("admin login(new pw) status=%d body=%s", status, raw)
+		}
+		ar := decodeResp(t, raw)
+		if err := json.Unmarshal(ar.Data, &d); err != nil {
+			t.Fatalf("decode admin login(new pw): %v", err)
+		}
+	default:
+		t.Fatalf("admin login status=%d body=%s", status, raw)
+	}
+	if !d.MustChangePassword {
+		return d.Token
+	}
+	// 强制首登改密：走白名单路径改密，返回新 token（旧 token 因 ver bump 失效）
+	status, raw = req(t, http.MethodPut, base+"/api/v1/auth/me/password", d.Token, map[string]string{
+		"old_password": "admin123",
+		"new_password": adminNewPassword,
+	})
+	if status != http.StatusOK {
+		t.Fatalf("admin change password status=%d body=%s", status, raw)
+	}
+	ar := decodeResp(t, raw)
+	var c struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(ar.Data, &c); err != nil {
+		t.Fatalf("decode change password: %v", err)
+	}
+	return c.Token
+}
+
+// apiGet 携带 Bearer token 发起 GET，返回 (状态码, 响应体)。
+func apiGet(t *testing.T, base, token, path string) (int, []byte) {
+	t.Helper()
+	return req(t, http.MethodGet, base+path, token, nil)
+}
+
+// apiPost 携带 Bearer token 发起 POST，返回 (状态码, 响应体)。
+func apiPost(t *testing.T, base, token, path string, body any) (int, []byte) {
+	t.Helper()
+	return req(t, http.MethodPost, base+path, token, body)
+}
+
 // ===== 冒烟用例 =====
 
 func TestE2E_GatewayBillingLoop(t *testing.T) {
@@ -348,24 +455,8 @@ func TestE2E_GatewayBillingLoop(t *testing.T) {
 
 	mock := startMockUpstream(t)
 
-	login := func(u, p string) string {
-		t.Helper()
-		status, raw := req(t, http.MethodPost, base+"/api/v1/auth/login", "", map[string]string{"username": u, "password": p})
-		if status != http.StatusOK {
-			t.Fatalf("login %s status=%d body=%s", u, status, raw)
-		}
-		ar := decodeResp(t, raw)
-		var d struct {
-			Token string `json:"token"`
-		}
-		if err := json.Unmarshal(ar.Data, &d); err != nil {
-			t.Fatalf("decode login data: %v", err)
-		}
-		return d.Token
-	}
-
-	// 1) admin 登录（seeding 建了 admin/admin123）
-	adminToken := login("admin", "admin123")
+	// 1) admin 登录（seeding 建了 admin/admin123，强制首登改密后获得可用 token）
+	adminToken := loginAdmin(t, base)
 
 	// 2) admin 建开发者用户 + 充值
 	var devID int64
@@ -468,7 +559,7 @@ func TestE2E_GatewayBillingLoop(t *testing.T) {
 	var devPlain string
 	var devToken string
 	{
-		devToken = login("dev1", "dev123")
+		devToken = login(t, base, "dev1", "dev123")
 		status, raw := req(t, http.MethodPost, base+"/api/v1/dev/tokens", devToken, map[string]any{
 			"display_name": "e2e", "tag_id": tagID,
 		})
@@ -653,4 +744,190 @@ func TestE2E_GatewayBillingLoop(t *testing.T) {
 			t.Fatalf("负路径B期望402, 实际 status=%d body=%s", status, raw)
 		}
 	}
+}
+
+// TestE2E_Security 安全加固回归：单会话（二次登录旧 token 失效）、登出失效、
+// TOTP 两步登录闭环、恢复码一次性。依赖 buildTestServer 已装配 sessions/audit/ratelimit/preauth/totp。
+func TestE2E_Security(t *testing.T) {
+	dsn := testDSN(t)
+	ts, cleanup := buildTestServer(t, dsn)
+	defer cleanup()
+	base := ts.URL
+
+	// 单会话：第二次登录后，第一次签发的 token 因 token_version 不匹配而失效（401）。
+	t.Run("single_session", func(t *testing.T) {
+		tok1 := loginAdmin(t, base)
+		tok2 := loginAdmin(t, base)
+		status, raw := apiGet(t, base, tok1, "/api/v1/auth/me")
+		if status != http.StatusUnauthorized {
+			t.Fatalf("expected old token 401, got %d body=%s", status, raw)
+		}
+		// 新 token 仍可用
+		status, raw = apiGet(t, base, tok2, "/api/v1/auth/me")
+		if status != http.StatusOK {
+			t.Fatalf("expected new token 200, got %d body=%s", status, raw)
+		}
+	})
+
+	// 登出后当前 token 立即失效。
+	t.Run("logout_invalidates", func(t *testing.T) {
+		tok := loginAdmin(t, base)
+		status, raw := apiPost(t, base, tok, "/api/v1/auth/logout", nil)
+		if status != http.StatusOK {
+			t.Fatalf("logout status=%d body=%s", status, raw)
+		}
+		status, raw = apiGet(t, base, tok, "/api/v1/auth/me")
+		if status != http.StatusUnauthorized {
+			t.Fatalf("expected 401 after logout, got %d body=%s", status, raw)
+		}
+	})
+
+	// TOTP 两步登录闭环 + 恢复码一次性。
+	t.Run("totp_two_step_login", func(t *testing.T) {
+		adminToken := loginAdmin(t, base)
+
+		// 建 developer 用户（后续 TOTP 绑定/两步登录）
+		status, raw := req(t, http.MethodPost, base+"/api/v1/admin/users", adminToken, map[string]string{
+			"username": "secdev", "password": "Secdev@12345", "role": "DEVELOPER", "pricing_mode": "sale",
+		})
+		if status != http.StatusOK {
+			t.Fatalf("create secdev status=%d body=%s", status, raw)
+		}
+		ar := decodeResp(t, raw)
+		var u struct {
+			ID int64 `json:"ID"`
+		}
+		if err := json.Unmarshal(ar.Data, &u); err != nil {
+			t.Fatalf("decode create secdev: %v", err)
+		}
+		if u.ID == 0 {
+			t.Fatal("create secdev 返回空 ID")
+		}
+
+		// dev 登录 → TOTP setup（拿 base32 secret）
+		devToken := login(t, base, "secdev", "Secdev@12345")
+		status, raw = req(t, http.MethodPost, base+"/api/v1/auth/me/totp/setup", devToken, nil)
+		if status != http.StatusOK {
+			t.Fatalf("totp setup status=%d body=%s", status, raw)
+		}
+		ar = decodeResp(t, raw)
+		var st struct {
+			Secret string `json:"secret"`
+		}
+		if err := json.Unmarshal(ar.Data, &st); err != nil {
+			t.Fatalf("decode totp setup: %v", err)
+		}
+		if st.Secret == "" {
+			t.Fatal("totp secret 为空")
+		}
+
+		// 用 pquerna 生成动态码并 confirm（返回恢复码）
+		code, err := totp.GenerateCode(st.Secret, time.Now())
+		if err != nil {
+			t.Fatalf("generate totp code: %v", err)
+		}
+		status, raw = req(t, http.MethodPost, base+"/api/v1/auth/me/totp/confirm", devToken, map[string]string{"code": code})
+		if status != http.StatusOK {
+			t.Fatalf("totp confirm status=%d body=%s", status, raw)
+		}
+		ar = decodeResp(t, raw)
+		var cf struct {
+			RecoveryCodes []string `json:"recovery_codes"`
+		}
+		if err := json.Unmarshal(ar.Data, &cf); err != nil {
+			t.Fatalf("decode totp confirm: %v", err)
+		}
+		if len(cf.RecoveryCodes) == 0 {
+			t.Fatal("恢复码为空")
+		}
+
+		// 第一步：密码登录 → need_totp + preauth_token（不发 token）
+		status, raw = req(t, http.MethodPost, base+"/api/v1/auth/login", "", map[string]string{
+			"username": "secdev", "password": "Secdev@12345",
+		})
+		if status != http.StatusOK {
+			t.Fatalf("two-step login step1 status=%d body=%s", status, raw)
+		}
+		ar = decodeResp(t, raw)
+		var l1 struct {
+			NeedTOTP     bool   `json:"need_totp"`
+			PreAuthToken string `json:"preauth_token"`
+		}
+		if err := json.Unmarshal(ar.Data, &l1); err != nil {
+			t.Fatalf("decode login step1: %v", err)
+		}
+		if !l1.NeedTOTP || l1.PreAuthToken == "" {
+			t.Fatalf("expected need_totp + preauth_token, got %+v", l1)
+		}
+
+		// 第二步：TOTP 动态码 → 成功签发 token，token 可访问 /me
+		code2, err := totp.GenerateCode(st.Secret, time.Now())
+		if err != nil {
+			t.Fatalf("generate totp code2: %v", err)
+		}
+		status, raw = req(t, http.MethodPost, base+"/api/v1/auth/login/totp", "", map[string]string{
+			"preauth_token": l1.PreAuthToken, "code": code2,
+		})
+		if status != http.StatusOK {
+			t.Fatalf("two-step login step2 status=%d body=%s", status, raw)
+		}
+		ar = decodeResp(t, raw)
+		var l2 struct {
+			Token string `json:"token"`
+		}
+		if err := json.Unmarshal(ar.Data, &l2); err != nil {
+			t.Fatalf("decode login step2: %v", err)
+		}
+		if l2.Token == "" {
+			t.Fatal("two-step 登录 token 为空")
+		}
+		status, raw = apiGet(t, base, l2.Token, "/api/v1/auth/me")
+		if status != http.StatusOK {
+			t.Fatalf("two-step token /me status=%d body=%s", status, raw)
+		}
+
+		// 恢复码一次性：首次使用成功，再次使用同一恢复码失败。
+		recovery := cf.RecoveryCodes[0]
+		status, raw = req(t, http.MethodPost, base+"/api/v1/auth/login", "", map[string]string{
+			"username": "secdev", "password": "Secdev@12345",
+		})
+		if status != http.StatusOK {
+			t.Fatalf("recovery login step1 status=%d body=%s", status, raw)
+		}
+		ar = decodeResp(t, raw)
+		var l1b struct {
+			PreAuthToken string `json:"preauth_token"`
+		}
+		if err := json.Unmarshal(ar.Data, &l1b); err != nil {
+			t.Fatalf("decode recovery step1: %v", err)
+		}
+		status, raw = req(t, http.MethodPost, base+"/api/v1/auth/login/totp", "", map[string]string{
+			"preauth_token": l1b.PreAuthToken, "code": recovery,
+		})
+		if status != http.StatusOK {
+			t.Fatalf("recovery code first use status=%d body=%s", status, raw)
+		}
+		decodeResp(t, raw)
+
+		// 复用同一恢复码 → 401（一次性）
+		status, raw = req(t, http.MethodPost, base+"/api/v1/auth/login", "", map[string]string{
+			"username": "secdev", "password": "Secdev@12345",
+		})
+		if status != http.StatusOK {
+			t.Fatalf("reuse login step1 status=%d body=%s", status, raw)
+		}
+		ar = decodeResp(t, raw)
+		var l1c struct {
+			PreAuthToken string `json:"preauth_token"`
+		}
+		if err := json.Unmarshal(ar.Data, &l1c); err != nil {
+			t.Fatalf("decode reuse step1: %v", err)
+		}
+		status, raw = req(t, http.MethodPost, base+"/api/v1/auth/login/totp", "", map[string]string{
+			"preauth_token": l1c.PreAuthToken, "code": recovery,
+		})
+		if status != http.StatusUnauthorized {
+			t.Fatalf("recovery code reuse should 401, got %d body=%s", status, raw)
+		}
+	})
 }
