@@ -9,6 +9,7 @@ import (
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/pquerna/otp/totp"
 	"github.com/team/llmgateway/internal/pkg/crypto"
+	"github.com/team/llmgateway/internal/pkg/resp"
 )
 
 // newTOTPService 构造绑定了 sqlmock 的 TOTPService。
@@ -112,6 +113,25 @@ func expectSecret(t *testing.T, mock sqlmock.Sqlmock, cipher string, enabled boo
 	mock.ExpectQuery(regexp.QuoteMeta(
 		`SELECT COALESCE(totp_secret_cipher, ''), totp_enabled FROM users WHERE id = $1 AND deleted_at IS NULL`)).
 		WithArgs(int64(1)).WillReturnRows(sqlmock.NewRows([]string{"cipher", "enabled"}).AddRow(cipher, enabled))
+}
+
+// 回归 R3：已启用 2FA 时调用 Setup 必须被拒绝，且不改动 totp_enabled。
+// 否则 Setup 会把 enabled 置回 false，形成一条"免动态码静默关闭 2FA"的捷径。
+func TestTOTPService_Setup_RejectedWhenEnabled(t *testing.T) {
+	svc, mock := newTOTPService(t)
+	_, cipher := secretRow(t, true)
+
+	// 只应发生一次 SELECT；未设置 UPDATE 期望即代表 totp_enabled 未被改写。
+	expectSecret(t, mock, cipher, true)
+
+	_, _, err := svc.Setup(context.Background(), 1, "u")
+	var apiErr *APIError
+	if !asAPIError(err, &apiErr) || apiErr.Code != resp.CodeBadRequest {
+		t.Fatalf("setup must be rejected when already enabled, got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("expectations: %v", err)
+	}
 }
 
 // 回归 N4：解绑路径不消费时间步——同一窗口内刚用于登录的码应能直接用于关闭 2FA。

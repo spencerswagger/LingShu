@@ -14,9 +14,16 @@ import (
 	"github.com/team/llmgateway/internal/domain/audit"
 	"github.com/team/llmgateway/internal/pkg/crypto"
 	"github.com/team/llmgateway/internal/pkg/jwtx"
+	"github.com/team/llmgateway/internal/pkg/reqmeta"
 	"github.com/team/llmgateway/internal/pkg/resp"
 	"github.com/team/llmgateway/internal/pkg/session"
 )
+
+// AuditSink 审计写入抽象：生产实现为 *audit.Store，测试可注入记录型实现，
+// 以便断言认证事件确实落库（而不仅是"调用返回了 401"）。
+type AuditSink interface {
+	Insert(ctx context.Context, e audit.Entry) error
+}
 
 // APIError 是带 HTTP 状态码与业务码的领域错误，handler 据此返回响应。
 type APIError struct {
@@ -55,7 +62,7 @@ type Service struct {
 	jwt   *jwtx.Manager
 	// 以下为可选安全依赖（nil 时对应能力降级/跳过）。
 	sessions *session.Registry
-	audit    *audit.Store
+	audit    AuditSink
 	totp     *TOTPService
 }
 
@@ -65,11 +72,21 @@ func NewService(store *Store, jwtMgr *jwtx.Manager) *Service {
 }
 
 func (s *Service) SetSessionRegistry(r *session.Registry) { s.sessions = r }
-func (s *Service) SetAudit(a *audit.Store)                { s.audit = a }
+func (s *Service) SetAudit(a AuditSink)                   { s.audit = a }
 func (s *Service) SetTOTP(t *TOTPService)                 { s.totp = t }
 
 // auditLog 写入一条审计记录：nil-safe、失败仅记日志不阻塞业务。
+// 自动补齐请求元数据（可信 IP / request id）——service 层拿不到 *http.Request，
+// 由 reqmeta 中间件在 handler 层注入上下文。
 func (s *Service) auditLog(ctx context.Context, e audit.Entry) {
+	if m := reqmeta.From(ctx); m.IP != "" || m.RequestID != "" {
+		if e.IP == "" {
+			e.IP = m.IP
+		}
+		if e.RequestID == "" {
+			e.RequestID = m.RequestID
+		}
+	}
 	if s.audit == nil {
 		return
 	}
@@ -118,9 +135,24 @@ func validatePasswordStrength(password string) error {
 	return nil
 }
 
-// maxUsernameLen 登录用户名长度上限。与 audit_logs.username 列宽对齐，
-// 避免超长用户名导致审计写入失败（varchar 超长在 PG 是报错而非截断）而静默丢失记录。
+// maxUsernameLen 登录用户名写入审计时的字节上限。目的是给审计存储封顶
+// （请求体上限 50MB，攻击者可用超长用户名把审计表撑爆）。
 const maxUsernameLen = 64
+
+// truncateUTF8 按 rune 边界把 s 截断到不超过 maxBytes 字节，保证结果仍是合法 UTF-8。
+// 直接 username[:64] 是字节切片，会切断多字节字符（中文/emoji）产生非法 UTF-8，
+// 而 PostgreSQL 对非法字节序列是报错（SQLSTATE 22021）而非静默替换 →
+// 会让审计 INSERT 失败、登录失败一条都留不下，等于审计被规避。
+func truncateUTF8(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
+}
 
 // Login 第一步：校验口令与状态。未开 2FA 时完成登录（bump ver + 签发）；
 // 已开 2FA 时返回 NeedTOTP=true（不发 JWT、不 bump ver）。
@@ -132,7 +164,7 @@ func (s *Service) Login(ctx context.Context, username, password string) (*LoginR
 	// 超长用户名：按认证失败处理（与"用户不存在"同构，不引入枚举差异），
 	// 但必须留下审计——否则攻击者可用超长用户名让所有失败尝试不留痕。
 	if len(username) > maxUsernameLen {
-		s.auditLog(ctx, audit.Entry{Username: username[:maxUsernameLen], Action: "auth.login.fail",
+		s.auditLog(ctx, audit.Entry{Username: truncateUTF8(username, maxUsernameLen), Action: "auth.login.fail",
 			Detail: map[string]any{"reason": "username_too_long", "len": len(username)}})
 		return nil, errUnauthorized()
 	}

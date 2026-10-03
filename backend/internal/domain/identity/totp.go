@@ -14,6 +14,7 @@ import (
 	"github.com/pquerna/otp/totp"
 	"github.com/team/llmgateway/internal/domain/audit"
 	"github.com/team/llmgateway/internal/pkg/crypto"
+	"github.com/team/llmgateway/internal/pkg/reqmeta"
 )
 
 const (
@@ -68,7 +69,7 @@ func (p *PreAuthStore) Consume(token string) (int64, bool) {
 type TOTPService struct {
 	store  *Store
 	sm4Key []byte
-	audit  *audit.Store
+	audit  AuditSink
 }
 
 func NewTOTPService(store *Store, sm4Key []byte) *TOTPService {
@@ -76,9 +77,17 @@ func NewTOTPService(store *Store, sm4Key []byte) *TOTPService {
 }
 
 // SetAudit 注入审计存储（nil 时跳过审计，不阻塞业务）。
-func (s *TOTPService) SetAudit(a *audit.Store) { s.audit = a }
+func (s *TOTPService) SetAudit(a AuditSink) { s.audit = a }
 
 func (s *TOTPService) auditLog(ctx context.Context, e audit.Entry) {
+	if m := reqmeta.From(ctx); m.IP != "" || m.RequestID != "" {
+		if e.IP == "" {
+			e.IP = m.IP
+		}
+		if e.RequestID == "" {
+			e.RequestID = m.RequestID
+		}
+	}
 	if s.audit == nil {
 		return
 	}
@@ -88,7 +97,20 @@ func (s *TOTPService) auditLog(ctx context.Context, e audit.Entry) {
 }
 
 // Setup 生成新 secret（覆盖未确认的旧 pending），返回 otpauth URI 与 base32 secret。
+// 已启用 2FA 时拒绝：Setup 会把 totp_enabled 置回 false，若允许直接调用，
+// 就等于提供了一条「免动态码即可静默关闭 2FA」的捷径，绕过 Disable 的验码保护。
+// 重绑需先经 Disable（要求动态码）关闭后再重新绑定。
 func (s *TOTPService) Setup(ctx context.Context, userID int64, username string) (uri, secret string, err error) {
+	cipher, enabled, err := s.store.TOTPSecret(ctx, userID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", "", errBadRequest("用户不存在")
+		}
+		return "", "", err
+	}
+	if enabled && cipher != "" {
+		return "", "", errBadRequest("已开启两步验证，请先关闭后再重新绑定")
+	}
 	key, err := totp.Generate(totp.GenerateOpts{
 		Issuer:      totpIssuer,
 		AccountName: username,
@@ -100,7 +122,7 @@ func (s *TOTPService) Setup(ctx context.Context, userID int64, username string) 
 	if err != nil {
 		return "", "", err
 	}
-	cipher, err := crypto.SM4Encrypt(s.sm4Key, []byte(key.Secret()))
+	cipher, err = crypto.SM4Encrypt(s.sm4Key, []byte(key.Secret()))
 	if err != nil {
 		return "", "", err
 	}

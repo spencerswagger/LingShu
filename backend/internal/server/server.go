@@ -17,6 +17,7 @@ import (
 	"github.com/team/llmgateway/internal/domain/sync"
 	"github.com/team/llmgateway/internal/domain/tag"
 	"github.com/team/llmgateway/internal/pkg/jwtx"
+	"github.com/team/llmgateway/internal/pkg/reqmeta"
 	"github.com/team/llmgateway/internal/pkg/session"
 )
 
@@ -210,7 +211,7 @@ func (s *Server) routes() {
 func (s *Server) Handler() http.Handler {
 	return WithRecover(s.logger)(
 		WithLogging(s.logger)(
-			WithRequestID(s.mux),
+			WithRequestID(reqmeta.Middleware(s.mux)),
 		),
 	)
 }
