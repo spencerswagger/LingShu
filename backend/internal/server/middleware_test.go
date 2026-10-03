@@ -1,16 +1,19 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/team/llmgateway/internal/pkg/jwtx"
@@ -181,5 +184,94 @@ func TestWithAuth_MustChangeWhitelist(t *testing.T) {
 func TestUserIDFrom_Empty(t *testing.T) {
 	if _, ok := UserIDFrom(t.Context()); ok {
 		t.Fatal("expected no user id in empty ctx")
+	}
+}
+
+// T1：客户端 x-request-id 必须经过白名单校验——超长/非法值一律替换为服务端 id。
+// 该值会经上下文最终落入 audit_logs.request_id，未校验则客户端可让审计写入失败。
+func TestWithRequestID_ValidatesClientID(t *testing.T) {
+	cases := []struct {
+		name    string
+		header  string
+		keepRaw bool // true 表示期望客户端值被原样沿用
+	}{
+		{"empty", "", false},
+		{"overlong", strings.Repeat("A", 300), false},
+		{"exactly 65", strings.Repeat("a", 65), false},
+		{"illegal chars", "bad id", false},
+		{"control chars", "abc\ndef", false},
+		{"valid", "client-req-123", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var got string
+			h := WithRequestID(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				got = resp.RequestID(r)
+				_, _ = w.Write([]byte(got))
+			}))
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", nil)
+			if tc.header != "" {
+				req.Header.Set("x-request-id", tc.header)
+			}
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+
+			if got == "" {
+				t.Fatal("request id 为空，未生成服务端 id")
+			}
+			if len(got) > 64 {
+				t.Fatalf("request id 超长未收敛: len=%d", len(got))
+			}
+			if !requestIDRe.MatchString(got) {
+				t.Fatalf("request id 不符合白名单: %q", got)
+			}
+			if rec.Header().Get("x-request-id") != got {
+				t.Fatalf("响应头 id 与上下文不一致: header=%q ctx=%q", rec.Header().Get("x-request-id"), got)
+			}
+			if tc.keepRaw {
+				if got != tc.header {
+					t.Fatalf("合法客户端 id 应被沿用: want %q got %q", tc.header, got)
+				}
+			} else if got == tc.header {
+				t.Fatalf("非法客户端 id 不应被透传: %q", got)
+			}
+		})
+	}
+}
+
+// T2/T5：用真实的 middlewareChain 断言访问日志的 requestId 非空。
+// 这钉住 WithRequestID 必须处于最外层——若退回内层，WithLogging 读到的 id 恒为空。
+func TestMiddlewareChain_LogsNonEmptyRequestID(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	s := &Server{logger: logger}
+
+	chain := s.middlewareChain(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	rec := httptest.NewRecorder()
+	chain.ServeHTTP(rec, req)
+
+	headerID := rec.Header().Get("x-request-id")
+	if headerID == "" {
+		t.Fatal("响应头 x-request-id 为空")
+	}
+
+	var logLine struct {
+		Msg       string `json:"msg"`
+		RequestID string `json:"requestId"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(buf.Bytes()), &logLine); err != nil {
+		t.Fatalf("解析访问日志失败: %v, raw=%q", err, buf.String())
+	}
+	if logLine.Msg != "http request" {
+		t.Fatalf("非访问日志: %q", buf.String())
+	}
+	if logLine.RequestID == "" {
+		t.Fatalf("访问日志 requestId 为空（WithRequestID 未处于最外层）: %s", buf.String())
+	}
+	if logLine.RequestID != headerID {
+		t.Fatalf("访问日志 requestId 与响应头不一致: log=%q header=%q", logLine.RequestID, headerID)
 	}
 }

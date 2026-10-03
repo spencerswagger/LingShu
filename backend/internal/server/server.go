@@ -207,13 +207,22 @@ func (s *Server) routes() {
 	})
 }
 
-// Handler 返回带全局中间件链的最终 handler。
-func (s *Server) Handler() http.Handler {
-	return WithRecover(s.logger)(
-		WithLogging(s.logger)(
-			WithRequestID(reqmeta.Middleware(s.mux)),
+// middlewareChain 组装全局中间件链（顺序敏感）。
+// WithRequestID 必须在最外层：它把 request id 写入请求 context 后向内层传递，
+// 放在内层会导致 WithLogging / WithRecover 读到的 requestId 恒为空。
+func (s *Server) middlewareChain(next http.Handler) http.Handler {
+	return WithRequestID(
+		WithRecover(s.logger)(
+			WithLogging(s.logger)(
+				reqmeta.Middleware(next),
+			),
 		),
 	)
+}
+
+// Handler 返回带全局中间件链的最终 handler。
+func (s *Server) Handler() http.Handler {
+	return s.middlewareChain(s.mux)
 }
 
 // Run 启动 HTTP 服务并阻塞，监听 SIGINT/SIGTERM 优雅退出。

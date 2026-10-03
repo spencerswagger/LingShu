@@ -15,7 +15,7 @@ CREATE TABLE audit_logs (
   target_type text NULL,
   target_id text NULL,
   detail jsonb NULL,
-  request_id varchar(64) NULL,
+  request_id text NULL,
   ip text NULL,
   created_at timestamptz NOT NULL DEFAULT now()
 );

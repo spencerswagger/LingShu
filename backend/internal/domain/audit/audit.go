@@ -4,7 +4,12 @@ package audit
 import (
 	"context"
 	"database/sql"
+	"expvar"
 )
+
+// InsertFailures 审计写入失败累计计数（expvar，可在 /debug/vars 或指标导出中观测）。
+// 审计是事后追责的唯一依据，其失效必须比业务失效更早被发现——写入失败不能只留在日志里。
+var InsertFailures = expvar.NewInt("audit_insert_failures")
 
 // Entry 一条审计记录。Detail 可选，绝不含口令/密钥明文。
 type Entry struct {
@@ -38,6 +43,9 @@ func (s *Store) Insert(ctx context.Context, e Entry) error {
 		`INSERT INTO audit_logs(user_id, username, action, target_type, target_id, detail, request_id, ip)
 		 VALUES($1, $2, $3, $4, $5, $6, $7, $8)`,
 		uid, nullString(e.Username), e.Action, e.TargetType, e.TargetID, e.Detail, e.RequestID, e.IP)
+	if err != nil {
+		InsertFailures.Add(1)
+	}
 	return err
 }
 

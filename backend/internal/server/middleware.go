@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"runtime/debug"
 	"strings"
 	"time"
@@ -58,11 +59,20 @@ func newRequestID() string {
 	return hex.EncodeToString(b)
 }
 
-// WithRequestID 确保请求带 x-request-id：缺失时生成并写入 context 与响应头。
+// requestIDRe 限定允许透传的客户端 request id：ASCII 可见字符子集，长度 ≤64。
+// 约束长度使其不超过审计列宽；约束字符集避免任意字节进入日志/审计（日志伪造）。
+// 不合法（含空串、超长、非法字符）一律丢弃客户端值，改由服务端生成，
+// 而不是拒绝请求——保持对现有客户端的兼容。
+var requestIDRe = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,64}$`)
+
+// WithRequestID 确保请求带 x-request-id：客户端值合规则沿用，否则生成新的，
+// 写入 context 与响应头。
+// 必须置于中间件链最外层：它通过 r.WithContext 把 id 传给内层，
+// 外层中间件（WithLogging/WithRecover）只能读到内层传入的同一个 r。
 func WithRequestID(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id := r.Header.Get("x-request-id")
-		if id == "" {
+		if !requestIDRe.MatchString(id) {
 			id = newRequestID()
 		}
 		r = resp.WithRequestID(r, id)

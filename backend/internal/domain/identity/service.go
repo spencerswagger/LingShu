@@ -143,6 +143,10 @@ const maxUsernameLen = 64
 // 直接 username[:64] 是字节切片，会切断多字节字符（中文/emoji）产生非法 UTF-8，
 // 而 PostgreSQL 对非法字节序列是报错（SQLSTATE 22021）而非静默替换 →
 // 会让审计 INSERT 失败、登录失败一条都留不下，等于审计被规避。
+//
+// 前提：入参本身是合法 UTF-8（截断只会保持、不会修复合法性）。当前调用方的
+// username 来自 json.Unmarshal，Go 的 JSON 解码会把非法字节替换为 U+FFFD，
+// 因此该前提成立；若将来接入非 JSON 来源的原始字节，需先做 utf8.ValidString 校验。
 func truncateUTF8(s string, maxBytes int) string {
 	if len(s) <= maxBytes {
 		return s
