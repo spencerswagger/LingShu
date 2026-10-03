@@ -89,6 +89,7 @@ docker compose up -d --build
 | `TZ` | `Asia/Shanghai` | 计费时段系数按时区计算 |
 | `JWT_TTL_MINUTES` | `720` | 登录令牌有效期 |
 | `SYNC_INTERVAL_MINUTES` | `60` | 外部价格源同步周期 |
+| `TRUSTED_PROXY_CIDRS` | `172.16.0.0/12`（compose 内设定） | 可信代理网段（逗号分隔 CIDR）。仅当直连对端属于这些网段时才采信 `X-Real-IP`，用于登录限流与审计的客户端 IP。**代码默认只信任回环**；若实际 Docker 网络不在默认段（可用 `docker network inspect <项目>_default` 查看），必须显式配置，否则审计 IP 会退化为 nginx 容器 IP、限流的 IP 维度也会退化。启动日志会打印生效网段 |
 
 > 生产环境请修改 `POSTGRES_PASSWORD` 与 `APP_PORT`，并在首次登录后立即改掉默认口令。
 

@@ -1,0 +1,154 @@
+package identity
+
+import (
+	"context"
+	"regexp"
+	"testing"
+	"time"
+
+	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/pquerna/otp/totp"
+	"github.com/team/llmgateway/internal/pkg/crypto"
+	"github.com/team/llmgateway/internal/pkg/resp"
+)
+
+// newTOTPService 构造绑定了 sqlmock 的 TOTPService。
+func newTOTPService(t *testing.T) (*TOTPService, sqlmock.Sqlmock) {
+	t.Helper()
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	svc := NewTOTPService(NewStore(db), []byte("0123456789abcdef"))
+	return svc, mock
+}
+
+// secretRow 生成真实 TOTP secret 与 SM4 密文。
+func secretRow(t *testing.T, enabled bool) (string, string) {
+	t.Helper()
+	key, err := totp.Generate(totp.GenerateOpts{Issuer: "llmgateway", AccountName: "u", SecretSize: 20})
+	if err != nil {
+		t.Fatalf("gen: %v", err)
+	}
+	cipher, err := crypto.SM4Encrypt([]byte("0123456789abcdef"), []byte(key.Secret()))
+	if err != nil {
+		t.Fatalf("encrypt: %v", err)
+	}
+	return key.Secret(), cipher
+}
+
+// genCode 生成 at 时刻的动态码。
+func genCode(t *testing.T, secret string, at time.Time) string {
+	t.Helper()
+	code, err := totp.GenerateCode(secret, at)
+	if err != nil {
+		t.Fatalf("gen code: %v", err)
+	}
+	return code
+}
+
+// 回归 C1：Confirm 在"待确认态"（enabled=false）也能取到 secret 并启用。
+func TestTOTPService_Confirm_PendingState(t *testing.T) {
+	svc, mock := newTOTPService(t)
+	secret, cipher := secretRow(t, false)
+
+	mock.ExpectQuery(regexp.QuoteMeta(
+		`SELECT COALESCE(totp_secret_cipher, ''), totp_enabled FROM users WHERE id = $1 AND deleted_at IS NULL`)).
+		WithArgs(int64(1)).WillReturnRows(sqlmock.NewRows([]string{"cipher", "enabled"}).AddRow(cipher, false))
+	mock.ExpectExec(regexp.QuoteMeta(
+		`UPDATE users SET totp_enabled = true, totp_recovery_hashes = $2::jsonb WHERE id = $1`)).
+		WithArgs(int64(1), sqlmock.AnyArg()).WillReturnResult(sqlmock.NewResult(1, 1))
+
+	codes, err := svc.Confirm(context.Background(), 1, genCode(t, secret, time.Now()))
+	if err != nil {
+		t.Fatalf("confirm should succeed in pending state, got %v", err)
+	}
+	if len(codes) != recoveryNum {
+		t.Fatalf("expected %d recovery codes, got %d", recoveryNum, len(codes))
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("expectations: %v", err)
+	}
+}
+
+// 回归 M10：同一时间步的动态码第二次校验被拒绝（防重放）。
+func TestTOTPService_Verify_ReplayRejected(t *testing.T) {
+	svc, mock := newTOTPService(t)
+	secret, cipher := secretRow(t, true)
+	code := genCode(t, secret, time.Now())
+
+	expectSecret(t, mock, cipher, true)
+	mock.ExpectQuery(regexp.QuoteMeta(
+		`SELECT COALESCE(totp_last_step, 0) FROM users WHERE id = $1 AND deleted_at IS NULL`)).
+		WithArgs(int64(1)).WillReturnRows(sqlmock.NewRows([]string{"step"}).AddRow(int64(0)))
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE users SET totp_last_step = $2 WHERE id = $1`)).
+		WithArgs(int64(1), sqlmock.AnyArg()).WillReturnResult(sqlmock.NewResult(1, 1))
+
+	ok, err := svc.Verify(context.Background(), 1, code)
+	if err != nil || !ok {
+		t.Fatalf("first verify should pass, ok=%v err=%v", ok, err)
+	}
+
+	// 第二次：同一时间步 → last >= step，判定重放
+	expectSecret(t, mock, cipher, true)
+	mock.ExpectQuery(regexp.QuoteMeta(
+		`SELECT COALESCE(totp_last_step, 0) FROM users WHERE id = $1 AND deleted_at IS NULL`)).
+		WithArgs(int64(1)).WillReturnRows(sqlmock.NewRows([]string{"step"}).AddRow(time.Now().Unix() / 30))
+
+	ok, err = svc.Verify(context.Background(), 1, code)
+	if err != nil {
+		t.Fatalf("replay verify should return (false, nil), got err %v", err)
+	}
+	if ok {
+		t.Fatal("same time-step code should be rejected as replay")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("expectations: %v", err)
+	}
+}
+
+func expectSecret(t *testing.T, mock sqlmock.Sqlmock, cipher string, enabled bool) {
+	t.Helper()
+	mock.ExpectQuery(regexp.QuoteMeta(
+		`SELECT COALESCE(totp_secret_cipher, ''), totp_enabled FROM users WHERE id = $1 AND deleted_at IS NULL`)).
+		WithArgs(int64(1)).WillReturnRows(sqlmock.NewRows([]string{"cipher", "enabled"}).AddRow(cipher, enabled))
+}
+
+// 回归 R3：已启用 2FA 时调用 Setup 必须被拒绝，且不改动 totp_enabled。
+// 否则 Setup 会把 enabled 置回 false，形成一条"免动态码静默关闭 2FA"的捷径。
+func TestTOTPService_Setup_RejectedWhenEnabled(t *testing.T) {
+	svc, mock := newTOTPService(t)
+	_, cipher := secretRow(t, true)
+
+	// 只应发生一次 SELECT；未设置 UPDATE 期望即代表 totp_enabled 未被改写。
+	expectSecret(t, mock, cipher, true)
+
+	_, _, err := svc.Setup(context.Background(), 1, "u")
+	var apiErr *APIError
+	if !asAPIError(err, &apiErr) || apiErr.Code != resp.CodeBadRequest {
+		t.Fatalf("setup must be rejected when already enabled, got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("expectations: %v", err)
+	}
+}
+
+// 回归 N4：解绑路径不消费时间步——同一窗口内刚用于登录的码应能直接用于关闭 2FA。
+func TestTOTPService_Disable_DoesNotConsumeStep(t *testing.T) {
+	svc, mock := newTOTPService(t)
+	secret, cipher := secretRow(t, true)
+
+	// 仅取 secret + 执行 DisableTOTP；不应出现 TOTPLastStep 的读写期望（未设置即代表未调用）。
+	expectSecret(t, mock, cipher, true)
+	mock.ExpectExec(regexp.QuoteMeta(
+		`UPDATE users SET totp_enabled = false, totp_secret_cipher = NULL, totp_recovery_hashes = NULL, totp_last_step = 0 WHERE id = $1`)).
+		WithArgs(int64(1)).WillReturnResult(sqlmock.NewResult(1, 1))
+
+	if err := svc.Disable(context.Background(), 1, genCode(t, secret, time.Now())); err != nil {
+		t.Fatalf("disable should succeed without consuming step, got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("expectations: %v", err)
+	}
+}

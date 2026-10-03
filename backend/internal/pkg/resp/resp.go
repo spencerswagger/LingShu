@@ -16,16 +16,17 @@ type Body struct {
 
 // 统一业务错误码
 const (
-	CodeOK            = 0
-	CodeBadRequest    = 40001
-	CodeUnauthorized  = 40101
-	CodeForbidden     = 40301
-	CodeNotFound      = 40401
-	CodeConflict      = 40901
-	CodeInsufficient  = 40201 // 余额不足
-	CodeRateLimited   = 42901
-	CodeNoRoute       = 50301 // 无匹配渠道
-	CodeInternalError = 50001
+	CodeOK                 = 0
+	CodeBadRequest         = 40001
+	CodeUnauthorized       = 40101
+	CodeForbidden          = 40301
+	CodeMustChangePassword = 40302 // 需先修改默认密码
+	CodeNotFound           = 40401
+	CodeConflict           = 40901
+	CodeInsufficient       = 40201 // 余额不足
+	CodeRateLimited        = 42901
+	CodeNoRoute            = 50301 // 无匹配渠道
+	CodeInternalError      = 50001
 )
 
 func Write(w http.ResponseWriter, status int, body Body) {

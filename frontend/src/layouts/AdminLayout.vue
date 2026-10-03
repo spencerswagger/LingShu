@@ -14,6 +14,7 @@ import {
   Tickets,
   Setting,
   Bell,
+  Lock,
   ArrowDown,
   SwitchButton,
 } from '@element-plus/icons-vue'
@@ -34,6 +35,7 @@ const menus = [
   { path: '/admin/billings', title: '账单', icon: Tickets },
   { path: '/admin/announcements', title: '公告', icon: Bell },
   { path: '/admin/system', title: '系统', icon: Setting },
+  { path: '/account/security', title: '账号安全', icon: Lock },
 ]
 
 function activeMenu() {
@@ -86,6 +88,7 @@ const crumbBack = computed(() => {
 })
 
 function logout() {
+  // logout 内部同步清空本地态（服务端撤销为旁路请求），此处无需等待，跳转立即发生
   auth.logout()
   router.push('/login')
 }

@@ -112,6 +112,18 @@ const router = createRouter({
     },
     // 根路径按角色重定向
     { path: '/', redirect: '/login' },
+    // 改密页（强制改密守卫白名单，登录后 ADMIN/DEVELOPER 均可访问）
+    {
+      path: '/change-password',
+      name: 'change-password',
+      component: () => import('@/views/ChangePassword.vue'),
+    },
+    // 账号安全页（TOTP 管理，登录后 ADMIN/DEVELOPER 均可访问）
+    {
+      path: '/account/security',
+      name: 'account-security',
+      component: () => import('@/views/AccountSecurity.vue'),
+    },
     // 403 / 兜底
     { path: '/403', name: 'forbidden', component: () => import('@/views/Forbidden.vue') },
     { path: '/:pathMatch(.*)*', redirect: '/login' },
@@ -132,6 +144,10 @@ router.beforeEach((to) => {
   const need = to.meta.roles as string[] | undefined
   if (need && need.length && auth.role && !need.includes(auth.role)) {
     return { name: 'forbidden' }
+  }
+  // 强制改密：非白名单页一律跳改密页
+  if (auth.mustChangePassword && !['login', 'change-password'].includes(to.name as string)) {
+    return { name: 'change-password' }
   }
   return true
 })

@@ -37,12 +37,15 @@ type AdminUserHandler struct {
 	svc        *Service
 	credit     *CreditService
 	userIDFrom func(ctx context.Context) (int64, bool)
+	totp       *TOTPService
 }
 
 // NewAdminUserHandler 创建管理端用户处理器。
 func NewAdminUserHandler(svc *Service, credit *CreditService, userIDFrom func(ctx context.Context) (int64, bool)) *AdminUserHandler {
 	return &AdminUserHandler{svc: svc, credit: credit, userIDFrom: userIDFrom}
 }
+
+func (h *AdminUserHandler) SetTOTP(t *TOTPService) { h.totp = t }
 
 // HandleListUsers GET /api/v1/admin/users?q=&role=&status=&page=&size=
 func (h *AdminUserHandler) HandleListUsers(w http.ResponseWriter, r *http.Request) {
@@ -117,6 +120,24 @@ func (h *AdminUserHandler) HandleResetPassword(w http.ResponseWriter, r *http.Re
 		return
 	}
 	if err := h.svc.AdminResetPassword(r.Context(), id, req.Password); err != nil {
+		writeServiceErr(w, r, err)
+		return
+	}
+	respOK(w, r, map[string]bool{"reset": true})
+}
+
+// HandleResetTOTP POST /api/v1/admin/users/{id}/reset-totp 强制解绑 TOTP。
+func (h *AdminUserHandler) HandleResetTOTP(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r)
+	if err != nil {
+		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "ID 参数无效")
+		return
+	}
+	if h.totp == nil {
+		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "服务器内部错误")
+		return
+	}
+	if err := h.totp.AdminForceDisable(r.Context(), id); err != nil {
 		writeServiceErr(w, r, err)
 		return
 	}

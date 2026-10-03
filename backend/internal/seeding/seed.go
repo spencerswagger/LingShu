@@ -37,7 +37,7 @@ var defaultSysConfigs = map[string]string{
 
 // systemUser / systemToken 常量：健康探测开销的归属身份（成本记账），用户侧界面隐藏。
 const (
-	systemUsername = "system"
+	systemUsername  = "system"
 	systemTokenName = "system-probe"
 )
 
@@ -143,11 +143,12 @@ func seedAdmin(ctx context.Context, db *sql.DB) error {
 	}
 	role := identity.RoleAdmin
 	created, err := store.Create(ctx, &identity.User{
-		Username:     defaultAdminUsername,
-		PasswordHash: hash,
-		Role:         role,
-		Status:       identity.StatusActive,
-		PricingMode:  identity.PricingModeSale,
+		Username:           defaultAdminUsername,
+		PasswordHash:       hash,
+		Role:               role,
+		Status:             identity.StatusActive,
+		PricingMode:        identity.PricingModeSale,
+		MustChangePassword: true, // 新建默认管理员强制首登改密
 	})
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -160,7 +161,7 @@ func seedAdmin(ctx context.Context, db *sql.DB) error {
 	if err := store.EnsureWallet(ctx, created.ID); err != nil {
 		return err
 	}
-	log.Printf("[seed] 已创建初始管理员账户 username=%s password=%s，请尽快修改默认口令", defaultAdminUsername, defaultAdminPassword)
+	log.Printf("[seed] 已创建初始管理员账户 username=%s，请尽快登录并修改默认口令", defaultAdminUsername)
 	return nil
 }
 

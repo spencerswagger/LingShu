@@ -56,6 +56,10 @@ export function resetUserPassword(id: number, password: string) {
     { password },
   )
 }
+// 强制解绑用户 TOTP（管理员操作，无需验证码）
+export function resetUserTotp(id: number) {
+  return http.post<{ reset: boolean }, ApiRes<{ reset: boolean }>>(`/admin/users/${id}/reset-totp`)
+}
 export function batchDeleteUsers(ids: number[]) {
   return http.post<{ affected: number }, ApiRes<{ affected: number }>>('/admin/users/batch-delete', {
     ids,
