@@ -83,14 +83,13 @@ export const useAuthStore = defineStore('auth', {
       localStorage.removeItem('must_change_password')
       localStorage.removeItem('totp_enabled')
     },
-    // 主动登出：先通知服务端（此时 token 有效），再清本地。
+    // 主动登出：先发请求（此刻 token 仍有效），随后同步清空本地态，最后再等服务端收尾。
+    // 顺序不可颠倒：若先 clearLocal 再请求，会因缺少 Authorization 头而 401。
+    // 先清本地可让调用方 await 几乎立即返回——断网/服务端不可达时不再受 axios 120s 超时拖累。
     async logout() {
-      try {
-        await logoutApi()
-      } catch {
-        // 忽略网络错误，本地仍清空
-      }
+      const p = logoutApi().catch(() => {})
       this.clearLocal()
+      await p
     },
   },
 })
