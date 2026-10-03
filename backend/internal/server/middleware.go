@@ -82,19 +82,34 @@ func WithRequestID(next http.Handler) http.Handler {
 }
 
 // WithLogging 输出请求访问日志：method/path/status/耗时/requestId。
+//
+// 日志写在 defer 中：panic 会把控制流从 next.ServeHTTP 直接掀起，函数尾部语句永不执行——
+// 而 500（panic）恰恰是最需要出现在访问日志里的请求。defer 保证"每一次进入的请求都留下
+// 一条访问记录"；panic 时状态记为 500，随后重新抛出，交给外层 WithRecover 写响应与 panic
+// 日志（defer 内→外执行，故此处先记录、再上抛）。
 func WithLogging(logger *slog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
 			start := time.Now()
+			defer func() {
+				rec := recover()
+				status := sw.status
+				if rec != nil {
+					status = http.StatusInternalServerError
+				}
+				logger.Log(r.Context(), slog.LevelInfo, "http request",
+					"method", r.Method,
+					"path", r.URL.Path,
+					"status", status,
+					"duration_ms", time.Since(start).Milliseconds(),
+					"requestId", resp.RequestID(r),
+				)
+				if rec != nil {
+					panic(rec)
+				}
+			}()
 			next.ServeHTTP(sw, r)
-			logger.Log(r.Context(), slog.LevelInfo, "http request",
-				"method", r.Method,
-				"path", r.URL.Path,
-				"status", sw.status,
-				"duration_ms", time.Since(start).Milliseconds(),
-				"requestId", resp.RequestID(r),
-			)
 		})
 	}
 }
@@ -119,6 +134,8 @@ func WithRecover(logger *slog.Logger) func(http.Handler) http.Handler {
 					logger.Log(r.Context(), slog.LevelError, "panic recovered",
 						"panic", rec,
 						"stack", string(debug.Stack()),
+						"method", r.Method,
+						"path", r.URL.Path,
 						"requestId", resp.RequestID(r),
 					)
 					resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "服务器内部错误")

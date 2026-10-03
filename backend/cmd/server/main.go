@@ -129,6 +129,9 @@ func main() {
 		slog.Info("billing retry queue has pending records", "pending", n)
 	}
 	go app.billSvc.RunRetryQueue(ctx, time.Duration(cfg.Billing.RetryIntervalSeconds)*time.Second)
+	// 审计写入失败汇总：审计失效必须早于业务失效被发现，把进程内 expvar 计数
+	// 变成日志侧可告警信号（本服务不暴露 /debug/vars）。
+	go audit.ReportInsertFailures(ctx, logr, time.Minute)
 	defer app.mgr.Stop()
 
 	srv := server.New(cfg, d, logr, jwtMgr, app.sessions, app.auditStore, app.deps)

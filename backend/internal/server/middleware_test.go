@@ -275,3 +275,55 @@ func TestMiddlewareChain_LogsNonEmptyRequestID(t *testing.T) {
 		t.Fatalf("访问日志 requestId 与响应头不一致: log=%q header=%q", logLine.RequestID, headerID)
 	}
 }
+
+// U2：panic 的请求也必须出现在访问日志里（status=500），且 panic 日志能定位到接口。
+// 用与 Handler 相同的嵌套关系（WithRecover 外层、WithLogging 内层）复刻。
+func TestWithLogging_RecordsPanicInAccessLog(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+
+	chain := WithRecover(logger)(WithLogging(logger)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		panic("boom")
+	})))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/boom", nil)
+	rec := httptest.NewRecorder()
+	chain.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d", rec.Code)
+	}
+
+	var accessLog, panicLog map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		if line == "" {
+			continue
+		}
+		var m map[string]any
+		if err := json.Unmarshal([]byte(line), &m); err != nil {
+			t.Fatalf("解析日志失败: %v, line=%q", err, line)
+		}
+		switch m["msg"] {
+		case "http request":
+			accessLog = m
+		case "panic recovered":
+			panicLog = m
+		}
+	}
+
+	if accessLog == nil {
+		t.Fatalf("panic 请求未写入访问日志: %s", buf.String())
+	}
+	if accessLog["status"] != float64(http.StatusInternalServerError) {
+		t.Fatalf("访问日志 status 应为 500，实际 %v", accessLog["status"])
+	}
+	if accessLog["path"] != "/api/v1/boom" {
+		t.Fatalf("访问日志应含 path，实际 %v", accessLog["path"])
+	}
+	if panicLog == nil {
+		t.Fatalf("缺少 panic 日志: %s", buf.String())
+	}
+	if panicLog["method"] != http.MethodGet || panicLog["path"] != "/api/v1/boom" {
+		t.Fatalf("panic 日志应含 method/path，实际 method=%v path=%v", panicLog["method"], panicLog["path"])
+	}
+}
