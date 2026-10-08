@@ -117,16 +117,24 @@ func (h *Handler) HandleLoginTOTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	lr, err := h.svc.LoginTOTP(r.Context(), userID, req.Code)
+	// 先做无副作用校验（只验码 + 查状态）：失败不消费 preauth、不改 token_version，
+	// 用户可直接重试（输错动态码/被限流的既有 UX 不变）。
+	u, err := h.svc.VerifyTOTP(r.Context(), userID, req.Code)
 	if err != nil {
 		// 失败计数已在 AllowAndRecord 中预记，此处不再 RecordFailure，避免重复计数
 		writeServiceErr(w, r, err)
 		return
 	}
-	// 动态码校验通过：此刻才消费一次性 preauth token（防重放）。
-	// 并发下同一 preauth 令牌只允许兑换一次会话：Consume 失败说明已被另一请求消费或已过期，返回 401。
+	// 校验通过才原子消费一次性 preauth token（防重放）：并发下同一 preauth 只允许
+	// 兑换一次会话，Consume 失败说明已被另一请求消费或已过期。此刻尚未签发会话，
+	// 败者不会 bump token_version 作废胜者刚签发的 JWT。
 	if _, ok := h.preauth.Consume(req.PreAuthToken); !ok {
 		resp.Err(w, r, http.StatusUnauthorized, resp.CodeUnauthorized, "登录会话已过期，请重新登录")
+		return
+	}
+	lr, err := h.svc.IssueTOTPSession(r.Context(), u)
+	if err != nil {
+		writeServiceErr(w, r, err)
 		return
 	}
 	if h.rl != nil {

@@ -86,7 +86,7 @@ const stateLabel: Record<string, string> = { NORMAL: '正常', DRAIN: '排空', 
 const tagOptions = ref<{ ID: string; Name: string }[]>([])
 async function loadTags() {
   try {
-    const res = await listTags({ enabled: true })
+    const res = await listTags({ Enabled: true })
     tagOptions.value = res.Data || []
   } catch {
     tagOptions.value = []

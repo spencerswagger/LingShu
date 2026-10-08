@@ -242,8 +242,12 @@ func (s *Service) issueSession(ctx context.Context, u *User) (string, int64, err
 	return token, ver, nil
 }
 
-// LoginTOTP 第二步：校验 preauth 对应用户的 TOTP code，成功则完成登录。
-func (s *Service) LoginTOTP(ctx context.Context, userID int64, code string) (*LoginResult, error) {
+// VerifyTOTP 第二步的无副作用校验：验证动态码（或恢复码）后取用户并检查状态。
+// 只验码与查状态——不 bump token_version、不签 JWT、不写成功审计。把「校验」与
+// 「签发会话」解耦，供 handler 在原子消费 preauth 之后才调用 IssueTOTPSession：
+// 这样并发下持同一 preauth 的败者（Consume 失败）不会 bump token_version，
+// 从而不会把胜者刚签发的 JWT 立即作废。
+func (s *Service) VerifyTOTP(ctx context.Context, userID int64, code string) (*User, error) {
 	if s.totp == nil {
 		return nil, errInternal()
 	}
@@ -262,6 +266,12 @@ func (s *Service) LoginTOTP(ctx context.Context, userID int64, code string) (*Lo
 		return nil, errDisabled()
 	}
 	u.PasswordHash = ""
+	return u, nil
+}
+
+// IssueTOTPSession 在 preauth 已被原子消费后签发会话：bump token_version + 签 JWT，
+// 同步内存会话注册表，并写 auth.login_totp.success 审计。
+func (s *Service) IssueTOTPSession(ctx context.Context, u *User) (*LoginResult, error) {
 	token, _, err := s.issueSession(ctx, u)
 	if err != nil {
 		return nil, err

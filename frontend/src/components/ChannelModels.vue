@@ -77,7 +77,7 @@ function isAdded(id: string): boolean {
 async function loadModules(dp: string) {
   const [cmRes, emRes] = await Promise.all([
     listChannelModels(dp),
-    listExternalModels({ enabled: true }),
+    listExternalModels({ Enabled: true }),
   ])
   list.value = cmRes.Data || []
   externalModels.value = emRes.Data || []
