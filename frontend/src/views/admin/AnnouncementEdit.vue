@@ -13,7 +13,7 @@ import ErrorBubble from '@/components/ErrorBubble.vue'
 const route = useRoute()
 const router = useRouter()
 // :id 存在则为编辑，否则为新建
-const editId = route.params.id ? Number(route.params.id) : null
+const editId = route.params.id ? String(route.params.id) : null
 
 const loading = ref(false)
 const saving = ref(false)
@@ -33,18 +33,18 @@ onMounted(async () => {
   loading.value = true
   try {
     const res = await listAnnouncements()
-    const row = (res.data.list || []).find((a: AdminAnnouncement) => a.id === editId)
+    const row = (res.data.list || []).find((a: AdminAnnouncement) => a.ID === editId)
     if (!row) {
       ElMessage.error('公告不存在')
       router.push('/admin/announcements')
       return
     }
-    form.title = row.title
-    form.content = row.content
-    form.level = row.level
-    form.publish_at = row.publish_at || null
-    form.expire_at = row.expire_at || null
-    form.enabled = row.enabled
+    form.title = row.Title
+    form.content = row.Content
+    form.level = row.Level
+    form.publish_at = row.PublishAt || null
+    form.expire_at = row.ExpireAt || null
+    form.enabled = row.Enabled
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
   } finally {
@@ -57,12 +57,12 @@ async function onSubmit() {
   if (!form.content.trim()) return ElMessage.warning('请填写公告内容')
 
   const payload = {
-    title: form.title.trim(),
-    content: form.content,
-    level: form.level,
-    publish_at: form.publish_at,
-    expire_at: form.expire_at,
-    enabled: form.enabled,
+    Title: form.title.trim(),
+    Content: form.content,
+    Level: form.level,
+    PublishAt: form.publish_at,
+    ExpireAt: form.expire_at,
+    Enabled: form.enabled,
   }
   saving.value = true
   errInfo.value = { message: '', requestId: '' }

@@ -44,8 +44,8 @@ func TestService_CreateModel(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + cols + ` FROM external_models WHERE external_name = $1`)).
 		WithArgs("qw-max").
 		WillReturnError(sql.ErrNoRows)
-	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO external_models(external_name, description, enabled, sale_rates, time_config, context_tiers) VALUES($1,$2,$3,$4,$5,$6) RETURNING `+cols)).
-		WithArgs("qw-max", "", true, sqlmock.AnyArg(), nil, nil).
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO external_models(id, external_name, description, enabled, sale_rates, time_config, context_tiers) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING `+cols)).
+		WithArgs(sqlmock.AnyArg(), "qw-max", "", true, sqlmock.AnyArg(), nil, nil).
 		WillReturnRows(extRow(&ExternalModel{ID: 1, ExternalName: "qw-max", Enabled: true, CreatedAt: now, UpdatedAt: now}, `{"input":1}`))
 
 	m, err := s.CreateModel(context.Background(), ExternalModelInput{

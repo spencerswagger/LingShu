@@ -76,18 +76,18 @@ function barClass(row: AdminUser): string {
 }
 
 // 通用保存：角色/状态/计价模式 hover 修改入口（PUT 需携带全部字段）
-async function saveAttr(row: AdminUser, payload: { role?: string; status?: string; pricing_mode?: string }, msg: string) {
+async function saveAttr(row: AdminUser, payload: { Role?: string; Status?: string; PricingMode?: string }, msg: string) {
   try {
     const res = await updateUser(row.ID, {
-      role: row.Role,
-      status: row.Status,
-      pricing_mode: row.PricingMode,
-      nickname: row.Nickname || '',
+      Role: row.Role,
+      Status: row.Status,
+      PricingMode: row.PricingMode,
+      Nickname: row.Nickname || '',
       ...payload,
     })
-    if (payload.role) row.Role = res.data.Role ?? payload.role
-    if (payload.status) row.Status = res.data.Status ?? payload.status
-    if (payload.pricing_mode) row.PricingMode = res.data.PricingMode ?? payload.pricing_mode
+    if (payload.Role) row.Role = res.data.Role ?? payload.Role
+    if (payload.Status) row.Status = res.data.Status ?? payload.Status
+    if (payload.PricingMode) row.PricingMode = res.data.PricingMode ?? payload.PricingMode
     ElMessage.success(msg)
   } catch (e: any) {
     ElMessage.error(e?.message || '更新失败')
@@ -95,7 +95,7 @@ async function saveAttr(row: AdminUser, payload: { role?: string; status?: strin
 }
 
 // 昵称编辑（用户名旁铅笔 → popover）
-const nickEditId = ref<number | null>(null)
+const nickEditId = ref<string | null>(null)
 const nickDraft = ref('')
 function openNickEdit(row: AdminUser) {
   nickEditId.value = nickEditId.value === row.ID ? null : row.ID
@@ -104,10 +104,10 @@ function openNickEdit(row: AdminUser) {
 async function saveNick(row: AdminUser) {
   try {
     const res = await updateUser(row.ID, {
-      role: row.Role,
-      status: row.Status,
-      pricing_mode: row.PricingMode,
-      nickname: nickDraft.value.trim(),
+      Role: row.Role,
+      Status: row.Status,
+      PricingMode: row.PricingMode,
+      Nickname: nickDraft.value.trim(),
     })
     row.Nickname = res.data.Nickname ?? nickDraft.value.trim()
     nickEditId.value = null
@@ -254,7 +254,7 @@ function onRowClick(row: AdminUser, _column: unknown, event: Event) {
                   </div>
                 </el-popover>
               </span>
-              <span class="t-clock">@{{ row.Username }} · #{{ row.ID }}</span>
+              <span class="t-clock">@{{ row.Username }}</span>
             </div>
           </template>
         </el-table-column>
@@ -282,8 +282,8 @@ function onRowClick(row: AdminUser, _column: unknown, event: Event) {
               <div class="pop-section">
                 <span class="pop-label">修改角色</span>
                 <div class="pop-actions">
-                  <el-button v-if="row.Role !== 'ADMIN'" size="small" type="danger" plain @click="saveAttr(row, { role: 'ADMIN' }, '已设为管理员')">管理员</el-button>
-                  <el-button v-if="row.Role !== 'DEVELOPER'" size="small" type="primary" plain @click="saveAttr(row, { role: 'DEVELOPER' }, '已设为开发者')">开发者</el-button>
+                  <el-button v-if="row.Role !== 'ADMIN'" size="small" type="danger" plain @click="saveAttr(row, { Role: 'ADMIN' }, '已设为管理员')">管理员</el-button>
+                  <el-button v-if="row.Role !== 'DEVELOPER'" size="small" type="primary" plain @click="saveAttr(row, { Role: 'DEVELOPER' }, '已设为开发者')">开发者</el-button>
                 </div>
               </div>
             </el-popover>
@@ -313,8 +313,8 @@ function onRowClick(row: AdminUser, _column: unknown, event: Event) {
               <div class="pop-section">
                 <span class="pop-label">修改状态</span>
                 <div class="pop-actions">
-                  <el-button v-if="row.Status !== 'ACTIVE'" size="small" type="success" plain @click="saveAttr(row, { status: 'ACTIVE' }, '已启用')">正常</el-button>
-                  <el-button v-if="row.Status !== 'DISABLED'" size="small" type="danger" plain @click="saveAttr(row, { status: 'DISABLED' }, '已禁用')">禁用</el-button>
+                  <el-button v-if="row.Status !== 'ACTIVE'" size="small" type="success" plain @click="saveAttr(row, { Status: 'ACTIVE' }, '已启用')">正常</el-button>
+                  <el-button v-if="row.Status !== 'DISABLED'" size="small" type="danger" plain @click="saveAttr(row, { Status: 'DISABLED' }, '已禁用')">禁用</el-button>
                 </div>
               </div>
             </el-popover>
@@ -357,8 +357,8 @@ function onRowClick(row: AdminUser, _column: unknown, event: Event) {
               <div class="pop-section">
                 <span class="pop-label">修改计价模式</span>
                 <div class="pop-actions">
-                  <el-button v-if="row.PricingMode !== 'sale'" size="small" type="success" plain @click="saveAttr(row, { pricing_mode: 'sale' }, '已切换为按售价')">按售价</el-button>
-                  <el-button v-if="row.PricingMode !== 'cost'" size="small" type="warning" plain @click="saveAttr(row, { pricing_mode: 'cost' }, '已切换为按成本')">按成本</el-button>
+                  <el-button v-if="row.PricingMode !== 'sale'" size="small" type="success" plain @click="saveAttr(row, { PricingMode: 'sale' }, '已切换为按售价')">按售价</el-button>
+                  <el-button v-if="row.PricingMode !== 'cost'" size="small" type="warning" plain @click="saveAttr(row, { PricingMode: 'cost' }, '已切换为按成本')">按成本</el-button>
                 </div>
               </div>
             </el-popover>
@@ -378,7 +378,7 @@ function onRowClick(row: AdminUser, _column: unknown, event: Event) {
       <!-- 充值弹窗（统一组件） -->
       <WalletChargeDlg
         v-model="chargeDlg"
-        :user-id="chargeUser?.ID ?? 0"
+        :user-id="chargeUser?.ID ?? ''"
         :username="chargeUser?.Username || ''"
         :nickname="chargeUser?.Nickname"
         :balance="chargeUser?.Balance ?? 0"

@@ -10,36 +10,36 @@ import (
 
 // Line 账单拆解的一行（如 "输入 1,234 × 1.0"）。
 type Line struct {
-	Label  string  `json:"label"`
-	Amount float64 `json:"amount"`
+	Label  string  `json:"Label"`
+	Amount float64 `json:"Amount"`
 }
 
 // Step 账单拆解的一个步骤（Token × 单价 / 系数调整 / 积分换算）。
 type Step struct {
-	Title    string  `json:"title"`
-	Lines    []Line  `json:"lines"`
-	Subtotal float64 `json:"subtotal"`
+	Title    string  `json:"Title"`
+	Lines    []Line  `json:"Lines"`
+	Subtotal float64 `json:"Subtotal"`
 }
 
 // RouteDiff 成本模式的额外路由差异展示（sale 模式或无差异时为 nil）。
 type RouteDiff struct {
-	Label string `json:"label"`
-	Value string `json:"value"`
+	Label string `json:"Label"`
+	Value string `json:"Value"`
 }
 
 // BillingDetail 账单详情（admin/dev 契约共用；InternalModelID/ChannelName 仅 admin 返回）。
 type BillingDetail struct {
-	BillingID       string     `json:"billing_id"`
-	CallTime        string     `json:"call_time"`
-	Model           string     `json:"model"`
-	PricingMode     string     `json:"pricing_mode"`
-	CreditsConsumed float64    `json:"credits_consumed"`
-	Status          string     `json:"status"`
-	Steps           []Step     `json:"steps"`
-	RouteDiff       *RouteDiff `json:"route_diff"`
+	BillingID       string     `json:"BillingID"`
+	CallTime        string     `json:"CallTime"`
+	Model           string     `json:"Model"`
+	PricingMode     string     `json:"PricingMode"`
+	CreditsConsumed float64    `json:"CreditsConsumed"`
+	Status          string     `json:"Status"`
+	Steps           []Step     `json:"Steps"`
+	RouteDiff       *RouteDiff `json:"RouteDiff"`
 	// admin only（只读）
-	InternalModelID string `json:"internal_model_id,omitempty"`
-	ChannelName     string `json:"channel_name,omitempty"`
+	InternalModelID string `json:"InternalModelID,omitempty"`
+	ChannelName     string `json:"ChannelName,omitempty"`
 }
 
 // 五段 token 的展示名与取值。

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/team/llmgateway/internal/pkg/idgen"
 )
 
 // 账户角色 / 状态 / 计费模式常量。
@@ -25,24 +26,25 @@ const (
 )
 
 // User 对应 users 表的一行。
+// 雪花 ID 超出 JS 安全整数，所有对外 ID 字段以字符串序列化（json ",string"）。
 type User struct {
-	ID           int64
-	Username     string
-	PasswordHash string `json:"-"` // 永不外发（PBKDF2 存储值，靠 json:"-" 从序列化层杜绝泄露）
-	Nickname     string // 展示用昵称，可为空
-	Role         string
-	Status       string
-	PricingMode  string
-	IsSystem     bool `json:"-"` // 系统内置用户，不对外暴露
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
+	ID           int64     `json:"ID,string"`
+	Username     string    `json:"Username"`
+	PasswordHash string    `json:"-"` // 永不外发（PBKDF2 存储值，靠 json:"-" 从序列化层杜绝泄露）
+	Nickname     string    `json:"Nickname"` // 展示用昵称，可为空
+	Role         string    `json:"Role"`
+	Status       string    `json:"Status"`
+	PricingMode  string    `json:"PricingMode"`
+	IsSystem     bool      `json:"-"` // 系统内置用户，不对外暴露
+	CreatedAt    time.Time `json:"CreatedAt"`
+	UpdatedAt    time.Time `json:"UpdatedAt"`
 	// 安全字段（API 响应可见，均非敏感密文）。
-	MustChangePassword bool
+	MustChangePassword bool `json:"MustChangePassword"`
 	TokenVersion       int  `json:"-"` // 会话代数，无需外发
-	TOTPEnabled        bool // 前端账号安全页展示 2FA 状态用
+	TOTPEnabled        bool `json:"TOTPEnabled"` // 前端账号安全页展示 2FA 状态用
 	// 查询聚合字段（非表列）：余额与累计消费（completed 账单求和），List 时填充。
-	Balance    float64
-	TotalSpent float64
+	Balance    float64 `json:"Balance,omitempty"`
+	TotalSpent float64 `json:"TotalSpent,omitempty"`
 }
 
 // userCols 列出 users 表查询时使用的全部列，保持各查询一致。
@@ -89,11 +91,14 @@ var ErrUsernameExists = errors.New("username already exists")
 
 // Create 插入新用户并返回回填主键后完整的用户，username 冲突返回 ErrUsernameExists。
 func (s *Store) Create(ctx context.Context, u *User) (*User, error) {
+	if u.ID == 0 {
+		u.ID = idgen.New()
+	}
 	row := s.db.QueryRowContext(ctx,
-		`INSERT INTO users(username, password_hash, role, status, pricing_mode, nickname, is_system, must_change_password)
-		 VALUES($1, $2, $3, $4, $5, $6, $7, $8)
+		`INSERT INTO users(id, username, password_hash, role, status, pricing_mode, nickname, is_system, must_change_password)
+		 VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		 RETURNING `+userCols,
-		u.Username, u.PasswordHash, u.Role, u.Status, u.PricingMode, u.Nickname, u.IsSystem, u.MustChangePassword)
+		u.ID, u.Username, u.PasswordHash, u.Role, u.Status, u.PricingMode, u.Nickname, u.IsSystem, u.MustChangePassword)
 	created, err := scanUser(row)
 	if err != nil {
 		var pgErr *pgconn.PgError

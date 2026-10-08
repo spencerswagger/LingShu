@@ -2,16 +2,17 @@ server:
   addr: ":8080"
   static_dir: ""
 database:
-  dsn: "postgres://llmgw:llmgw@127.0.0.1:5432/llmgw?sslmode=disable"
+  dsn: "postgres://llmgw:llmgw@127.0.0.1:5432/llmgw?sslmode=disable&timezone=Asia/Shanghai"
 jwt:
   private_key_path: "keys/jwt_rsa"
   public_key_path: "keys/jwt_rsa.pub"
-  ttl_minutes: 720
+  ttl_minutes: 360
 security:
-  # SM4 渠道凭据加密密钥，必须为 32 个 hex 字符（16 字节）。服务启动时若缺失或非法会直接退出。
-  # 下方为本地开发默认值（0123456789abcdef，仅限本地）；生产环境务必改为强随机密钥：
+  # SM4 渠道凭据加密密钥，必须为 32 个 hex 字符（16 字节）。
+  # 留空/删除本行时，服务启动时自动从 keys/sm4.key 读取；文件不存在则生成强随机密钥
+  # 写入该文件（chmod 600，目录缺失先创建），后续重启复用。生产环境建议显式配置强随机密钥：
   #   openssl rand -hex 16
-  sm4_key: "0123456789abcdef0123456789abcdef"
+  # sm4_key: ""
   # 可信代理网段（逗号分隔 CIDR）由环境变量 TRUSTED_PROXY_CIDRS 提供，不在此文件配置。
   # 仅当直连对端属于这些网段时才采信 X-Real-IP（用于登录限流与审计 IP）。
   # 代码默认只信任回环（127.0.0.0/8、::1）；容器部署时需显式声明代理网段，例如：

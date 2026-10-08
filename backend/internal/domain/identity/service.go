@@ -14,6 +14,7 @@ import (
 	"github.com/team/llmgateway/internal/domain/audit"
 	"github.com/team/llmgateway/internal/pkg/crypto"
 	"github.com/team/llmgateway/internal/pkg/jwtx"
+	"github.com/team/llmgateway/internal/pkg/ratelimit"
 	"github.com/team/llmgateway/internal/pkg/reqmeta"
 	"github.com/team/llmgateway/internal/pkg/resp"
 	"github.com/team/llmgateway/internal/pkg/session"
@@ -33,6 +34,9 @@ type APIError struct {
 }
 
 func (e *APIError) Error() string { return e.Message }
+
+// UserMessage 返回可直接落库/展示的中文业务文案（供计费失败原因归一使用）。
+func (e *APIError) UserMessage() string { return e.Message }
 
 func errBadRequest(msg string) *APIError {
 	return &APIError{HTTPStatus: http.StatusBadRequest, Code: resp.CodeBadRequest, Message: msg}
@@ -56,6 +60,16 @@ func errInternal() *APIError {
 	return &APIError{HTTPStatus: http.StatusInternalServerError, Code: resp.CodeInternalError, Message: "服务器内部错误"}
 }
 
+// errSecondFactorRateLimited 二次验证口令尝试过于频繁（防会话持有者暴力猜解当前口令）。
+func errSecondFactorRateLimited() *APIError {
+	return &APIError{HTTPStatus: http.StatusTooManyRequests, Code: resp.CodeRateLimited, Message: "尝试过于频繁，请稍后再试"}
+}
+
+// secondFactorKey 二次验证限流账号键：以 "sf:" 前缀与登录限流命名空间隔离，避免相互污染。
+func secondFactorKey(userID int64) string {
+	return "sf:" + strconv.FormatInt(userID, 10)
+}
+
 // Service 承载认证与用户管理业务逻辑。
 type Service struct {
 	store *Store
@@ -64,6 +78,8 @@ type Service struct {
 	sessions *session.Registry
 	audit    AuditSink
 	totp     *TOTPService
+	// rl 二次验证口令尝试限流器（复用登录限流器，key 用 "sf:" 前缀隔离命名空间）。
+	rl *ratelimit.Limiter
 }
 
 // NewService 创建认证服务。
@@ -74,6 +90,7 @@ func NewService(store *Store, jwtMgr *jwtx.Manager) *Service {
 func (s *Service) SetSessionRegistry(r *session.Registry) { s.sessions = r }
 func (s *Service) SetAudit(a AuditSink)                   { s.audit = a }
 func (s *Service) SetTOTP(t *TOTPService)                 { s.totp = t }
+func (s *Service) SetRateLimiter(rl *ratelimit.Limiter)   { s.rl = rl }
 
 // auditLog 写入一条审计记录：nil-safe、失败仅记日志不阻塞业务。
 // 自动补齐请求元数据（可信 IP / request id）——service 层拿不到 *http.Request，
@@ -158,6 +175,9 @@ func truncateUTF8(s string, maxBytes int) string {
 	return s[:cut]
 }
 
+// dummyPasswordHash 用户不存在时用于等开销校验的占位哈希（与真实口令哈希同格式同迭代数）。
+var dummyPasswordHash = "$pbkdf2-sm3$200000$00000000000000000000000000000000$0000000000000000000000000000000000000000000000000000000000000000"
+
 // Login 第一步：校验口令与状态。未开 2FA 时完成登录（bump ver + 签发）；
 // 已开 2FA 时返回 NeedTOTP=true（不发 JWT、不 bump ver）。
 // 用户不存在、密码错误统一返回"用户名或密码错误"，避免账户枚举。
@@ -175,6 +195,9 @@ func (s *Service) Login(ctx context.Context, username, password string) (*LoginR
 	u, err := s.store.GetByUsername(ctx, username)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
+			// 用户不存在也执行一次等开销的 PBKDF2 校验，抹平与「口令错误」路径的耗时差异，
+			// 防止攻击者借时序差异批量枚举有效用户名。
+			_ = crypto.VerifyPassword(password, dummyPasswordHash)
 			s.auditLog(ctx, audit.Entry{Username: username, Action: "auth.login.fail", Detail: map[string]any{"reason": "user_not_found"}})
 			return nil, errUnauthorized()
 		}
@@ -263,6 +286,42 @@ func (s *Service) Logout(ctx context.Context, userID int64) error {
 	return nil
 }
 
+// VerifyCurrentPassword 校验指定用户的当前口令（PBKDF2-SM3）。
+// 用于 TOTP 绑定/解绑等高危操作的二次验证：仅凭已登录会话不足以下达，
+// 必须同时出示当前口令。复用 crypto.VerifyPassword 的既有校验逻辑。
+// 安全加固：按用户维度限流，失败落审计——防会话持有者暴力猜解口令（每次校验都是
+// 高成本 PBKDF2，兼作 CPU 放大）；限流键 "sf:" 前缀与登录计数隔离。
+func (s *Service) VerifyCurrentPassword(ctx context.Context, userID int64, password string) error {
+	if password == "" {
+		return errForbidden("请输入当前口令")
+	}
+	key := secondFactorKey(userID)
+	ip := reqmeta.From(ctx).IP
+	if s.rl != nil {
+		if err := s.rl.AllowAndRecord(ip, key); err != nil {
+			return errSecondFactorRateLimited()
+		}
+	}
+	u, err := s.store.GetByID(ctx, userID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return errUnauthorized()
+		}
+		return fmt.Errorf("get user: %w", err)
+	}
+	if !crypto.VerifyPassword(password, u.PasswordHash) {
+		s.auditLog(ctx, audit.Entry{
+			UserID: userID, Username: u.Username, Action: "auth.second_factor.fail",
+			TargetType: "user", TargetID: strconv.FormatInt(userID, 10),
+		})
+		return errForbidden("当前口令错误")
+	}
+	if s.rl != nil {
+		s.rl.RecordSuccess(ip, key)
+	}
+	return nil
+}
+
 // ChangeOwnPassword 本人改密：校验旧口令与强度，改密后会话代数 +1 并签发新 token。
 func (s *Service) ChangeOwnPassword(ctx context.Context, userID int64, oldPassword, newPassword string) (string, error) {
 	if err := validatePasswordStrength(newPassword); err != nil {
@@ -313,6 +372,9 @@ func normalizeNickname(nickname string) (string, error) {
 func (s *Service) AdminCreateUser(ctx context.Context, username, password, role, pricingMode string, nickname string) (*User, error) {
 	if username == "" || password == "" {
 		return nil, errBadRequest("用户名和密码不能为空")
+	}
+	if err := validatePasswordStrength(password); err != nil {
+		return nil, err
 	}
 	if role != RoleAdmin && role != RoleDeveloper {
 		return nil, errBadRequest("角色只允许 ADMIN 或 DEVELOPER")
@@ -447,6 +509,9 @@ func (s *Service) UpdateUser(ctx context.Context, id int64, role, status string,
 func (s *Service) AdminResetPassword(ctx context.Context, id int64, newPassword string) error {
 	if newPassword == "" {
 		return errBadRequest("新密码不能为空")
+	}
+	if err := validatePasswordStrength(newPassword); err != nil {
+		return err
 	}
 	if _, err := s.store.GetByID(ctx, id); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {

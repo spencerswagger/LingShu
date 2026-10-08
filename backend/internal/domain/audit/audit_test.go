@@ -19,9 +19,9 @@ func TestStore_Insert(t *testing.T) {
 	defer db.Close()
 
 	mock.ExpectExec(regexp.QuoteMeta(
-		`INSERT INTO audit_logs(user_id, username, action, target_type, target_id, detail, request_id, ip)
-		 VALUES($1, $2, $3, $4, $5, $6, $7, $8)`)).
-		WithArgs(int64(1), "admin", "admin.user.reset_password", "user", "3", nil, "req-1", "1.2.3.4").
+		`INSERT INTO audit_logs(id, user_id, username, action, target_type, target_id, detail, request_id, ip)
+		 VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9)`)).
+		WithArgs(sqlmock.AnyArg(), int64(1), "admin", "admin.user.reset_password", "user", "3", nil, "req-1", "1.2.3.4").
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	s := NewStore(db)

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// 渠道内部模型子表：承载该渠道支持哪些内部模型（internal_model_id + 成本定价 + 绑定对外模型）。
+// 渠道内部模型子表：承载该渠道支持哪些内部模型（InternalModelID + 成本定价 + 绑定对外模型）。
 // 编辑态（readonly=false）支持：新增/编辑（抽屉内 ModelPricing 成本模式）+ 拉取上游模型。
 // 只读态（readonly=true）：仅供详情页展示。
 import { computed, onMounted, ref } from 'vue'
@@ -25,9 +25,10 @@ import {
 import ModelPricing from '@/components/ModelPricing.vue'
 import StatusTag from '@/components/StatusTag.vue'
 import ErrorBubble from '@/components/ErrorBubble.vue'
+import { fmtDateTime } from '@/utils/format'
 
 const props = defineProps<{
-  channelId: number
+  channelId: string
   readonly?: boolean
 }>()
 
@@ -40,20 +41,20 @@ const externalModels = ref<ExternalModel[]>([])
 
 // 编辑抽屉
 const drawerOpen = ref(false)
-const editingId = ref<number | null>(null) // null = 新增；否则为编辑的模型 id
-const editingForm = ref<Record<string, any>>({ internal_model_id: '', external_model_id: null })
+const editingId = ref<string | null>(null) // null = 新增；否则为编辑的模型 id
+const editingForm = ref<Record<string, any>>({ InternalModelID: '', ExternalModelID: null })
 const editingPricing = ref<Record<string, any>>({
-  cost_rates: { input: 0, output: 0, cache_read: 0, cache_write: 0, reasoning: 0 },
-  time_config: null,
-  context_tiers: null,
+  CostRates: { input: 0, output: 0, cache_read: 0, cache_write: 0, reasoning: 0 },
+  TimeConfig: null,
+  ContextTiers: null,
 })
 const saving = ref(false)
 const runtimeExpanded = ref<string[]>([])
 
 // 拉取上游模型后「批量配置」的待创建行：每个模型独立绑定对外模型与成本
 interface PendingRow {
-  internal_model_id: string
-  external_model_id: number | null
+  InternalModelID: string
+  ExternalModelID: string | null
   pricing: Record<string, any>
 }
 const pendingRows = ref<PendingRow[]>([])
@@ -67,13 +68,13 @@ const pulled = ref<PullModel[]>([])
 const pullChecked = ref<PullModel[]>([])
 
 // 已添加的内部模型 ID 集合：拉取弹窗中这些行不可勾选
-const addedIds = computed(() => new Set(list.value.map((m) => m.internal_model_id)))
+const addedIds = computed(() => new Set(list.value.map((m) => m.InternalModelID)))
 
 function isAdded(id: string): boolean {
   return addedIds.value.has(id)
 }
 
-async function loadModules(dp: number) {
+async function loadModules(dp: string) {
   const [cmRes, emRes] = await Promise.all([
     listChannelModels(dp),
     listExternalModels({ enabled: true }),
@@ -96,12 +97,12 @@ async function load() {
 onMounted(load)
 
 function fmtCost(m: ChannelModel, k: string): string {
-  const v = (m.cost_rates || {})[k]
+  const v = (m.CostRates || {})[k]
   return v == null ? '-' : String(Math.round(v * 1e6) / 1e6)
 }
 
 function costDetail(m: ChannelModel): string {
-  const r = m.cost_rates || {}
+  const r = m.CostRates || {}
   const parts = ['input', 'output', 'cache_read', 'cache_write', 'reasoning']
     .map((k) => `${rateLabels[k]} ${r[k] == null ? '-' : Math.round(r[k] * 1e6) / 1e6}`)
   return `${parts.join('，')}（单位：人民币元/百万 token）`
@@ -110,16 +111,16 @@ function costDetail(m: ChannelModel): string {
 function openCreate() {
   editingId.value = null
   editingForm.value = {
-    internal_model_id: '',
-    external_model_id: null,
-    cost_rates: { input: 0, output: 0, cache_read: 0, cache_write: 0, reasoning: 0 },
-    time_config: null,
-    context_tiers: null,
+    InternalModelID: '',
+    ExternalModelID: null,
+    CostRates: { input: 0, output: 0, cache_read: 0, cache_write: 0, reasoning: 0 },
+    TimeConfig: null,
+    ContextTiers: null,
   }
   editingPricing.value = {
-    cost_rates: { input: 0, output: 0, cache_read: 0, cache_write: 0, reasoning: 0 },
-    time_config: null,
-    context_tiers: null,
+    CostRates: { input: 0, output: 0, cache_read: 0, cache_write: 0, reasoning: 0 },
+    TimeConfig: null,
+    ContextTiers: null,
   }
   drawerOpen.value = true
 }
@@ -127,7 +128,7 @@ function openCreate() {
 // 手动设置内部模型状态（正常/排空/禁用）
 async function onToggleState(m: ChannelModel, action: 'normal' | 'drain' | 'disable') {
   try {
-    await channelModelState(props.channelId, m.id, action)
+    await channelModelState(props.channelId, m.ID, action)
     ElMessage.success('模型状态已更新')
     await load()
   } catch (e: any) {
@@ -136,42 +137,42 @@ async function onToggleState(m: ChannelModel, action: 'normal' | 'drain' | 'disa
 }
 
 function openEdit(m: ChannelModel) {
-  editingId.value = m.id
+  editingId.value = m.ID
   editingForm.value = {
     ...m,
-    // 后端可能返回字符串 id，统一转数字保证 el-select 精确匹配回显
-    external_model_id: Number(m.external_model_id),
+    // 对外模型 ID 现为雪花字符串，直接原样回填保证 el-select 精确匹配
+    ExternalModelID: m.ExternalModelID,
     // 模型级运行时配置（留空 = 继承渠道级兜底）
-    rate_limit: { ...(m.rate_limit || { rpm: 0, tpm: 0, burst_multiplier: 0, max_concurrent: 0 }) },
-    health_probe: { ...(m.health_probe || { interval: '', drain_interval_seconds: 0, timeout_ms: 0, fail_threshold: 0, recovery_threshold: 0, probe_model: '' }) },
-    reliability: { ...(m.reliability || { window_seconds: 0, min_samples: 0, error_rate_pct: 0, rate_429_pct: 0, p99_latency_ms: 0 }) },
+    RateLimit: { ...(m.RateLimit || { RPM: 0, TPM: 0, BurstMultiplier: 0, MaxConcurrent: 0 }) },
+    HealthProbe: { ...(m.HealthProbe || { Interval: '', DrainIntervalSeconds: 0, TimeoutMS: 0, FailThreshold: 0, RecoveryThreshold: 0, ProbeModel: '' }) },
+    Reliability: { ...(m.Reliability || { WindowSeconds: 0, MinSamples: 0, ErrorRatePct: 0, Rate429Pct: 0, P99LatencyMS: 0 }) },
   }
   editingPricing.value = {
-    cost_rates: { ...m.cost_rates },
-    time_config: m.time_config,
-    context_tiers: m.context_tiers,
+    CostRates: { ...m.CostRates },
+    TimeConfig: m.TimeConfig,
+    ContextTiers: m.ContextTiers,
   }
   drawerOpen.value = true
 }
 
 async function saveModel() {
   if (!editingForm.value) return
-  if (!editingForm.value.internal_model_id.trim())
+  if (!editingForm.value.InternalModelID.trim())
     return ElMessage.warning('请填写内部模型 ID')
-  if (editingForm.value.external_model_id == null || !Number(editingForm.value.external_model_id))
+  if (editingForm.value.ExternalModelID == null)
     return ElMessage.warning('请绑定一个对外模型')
 
   saving.value = true
   errInfo.value = { message: '', requestId: '' }
   const payload = {
-    internal_model_id: editingForm.value.internal_model_id.trim(),
-    external_model_id: Number(editingForm.value.external_model_id),
-    cost_rates: editingPricing.value.cost_rates,
-    time_config: editingPricing.value.time_config,
-    context_tiers: editingPricing.value.context_tiers,
-    rate_limit: editingForm.value.rate_limit,
-    health_probe: editingForm.value.health_probe,
-    reliability: editingForm.value.reliability,
+    InternalModelID: editingForm.value.InternalModelID.trim(),
+    ExternalModelID: editingForm.value.ExternalModelID,
+    CostRates: editingPricing.value.CostRates,
+    TimeConfig: editingPricing.value.TimeConfig,
+    ContextTiers: editingPricing.value.ContextTiers,
+    RateLimit: editingForm.value.RateLimit,
+    HealthProbe: editingForm.value.HealthProbe,
+    Reliability: editingForm.value.Reliability,
   }
   try {
     // 编辑既有条目
@@ -196,8 +197,8 @@ async function saveModel() {
 // 批量保存：逐行校验并创建（每个模型各自绑定对外模型与成本）
 async function saveBatch() {
   for (const row of pendingRows.value) {
-    if (row.external_model_id == null || !Number(row.external_model_id)) {
-      return ElMessage.warning(`「${row.internal_model_id}」请先绑定一个对外模型`)
+    if (row.ExternalModelID == null) {
+      return ElMessage.warning(`「${row.InternalModelID}」请先绑定一个对外模型`)
     }
   }
   saving.value = true
@@ -205,11 +206,11 @@ async function saveBatch() {
   try {
     for (const row of pendingRows.value) {
       await createChannelModel(props.channelId, {
-        internal_model_id: row.internal_model_id.trim(),
-        external_model_id: Number(row.external_model_id),
-        cost_rates: row.pricing.cost_rates,
-        time_config: row.pricing.time_config,
-        context_tiers: row.pricing.context_tiers,
+        InternalModelID: row.InternalModelID.trim(),
+        ExternalModelID: row.ExternalModelID!,
+        CostRates: row.pricing.CostRates,
+        TimeConfig: row.pricing.TimeConfig,
+        ContextTiers: row.pricing.ContextTiers,
       })
     }
     ElMessage.success(`已批量加入 ${pendingRows.value.length} 个内部模型`)
@@ -228,7 +229,7 @@ async function saveBatch() {
 async function onDelete(m: ChannelModel) {
   try {
     await ElMessageBox.confirm(
-      `确认删除该渠道的内部模型「${m.internal_model_id}」吗？`,
+      `确认删除该渠道的内部模型「${m.InternalModelID}」吗？`,
       '删除确认',
       { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' },
     )
@@ -236,7 +237,7 @@ async function onDelete(m: ChannelModel) {
     return
   }
   try {
-    await deleteChannelModel(props.channelId, m.id)
+    await deleteChannelModel(props.channelId, m.ID)
     ElMessage.success('已删除')
     await load()
   } catch (e: any) {
@@ -265,12 +266,12 @@ async function onPull() {
 function onAddPulled() {
   if (!pullChecked.value.length) return
   pendingRows.value = pullChecked.value.map((p) => ({
-    internal_model_id: p.id,
-    external_model_id: null,
+    InternalModelID: p.ID,
+    ExternalModelID: null,
     pricing: {
-      cost_rates: { input: 0, output: 0, cache_read: 0, cache_write: 0, reasoning: 0 },
-      time_config: null,
-      context_tiers: null,
+      CostRates: { input: 0, output: 0, cache_read: 0, cache_write: 0, reasoning: 0 },
+      TimeConfig: null,
+      ContextTiers: null,
     },
   }))
   activeRowIndex.value = 0
@@ -298,7 +299,7 @@ const selectedEntry = ref<CatalogEntry | null>(null)
 
 // 当前配置中的「内部模型 ID」：批量模式下取当前行，否则取单条表单
 const currentModelId = computed(() =>
-  pendingRows.value.length ? activeRow.value?.internal_model_id || '' : editingForm.value.internal_model_id,
+  pendingRows.value.length ? activeRow.value?.InternalModelID || '' : editingForm.value.InternalModelID,
 )
 // 当前配置的定价对象：批量模式下为当前行 pricing，否则为单条表单 pricing
 const currentPricing = computed(() =>
@@ -313,12 +314,12 @@ const recommended = computed(() => {
   const prefix = dash > 0 ? name.slice(0, dash) : name
   let best: CatalogEntry | null = null
   for (const e of catList.value) {
-    if (e.model_id !== name) continue
-    if (e.provider === prefix) {
+    if (e.ModelID !== name) continue
+    if (e.Provider === prefix) {
       best = e
       break
     }
-    if (best == null || e.provider < best.provider) best = e
+    if (best == null || e.Provider < best.Provider) best = e
   }
   return best || catList.value[0] || null
 })
@@ -391,18 +392,18 @@ async function onApplyCostCatalog() {
   if (!pricing) return ElMessage.warning('尚未选中需要配置的模型')
   catApplying.value = true
   try {
-    const next: Record<string, number> = { ...pricing.cost_rates }
+    const next: Record<string, number> = { ...pricing.CostRates }
     const apply = (k: string, usd: number) => {
       if (usd > 0) next[k] = usdToCnyPerM(usd)
     }
-    apply('input', entry.input_usd)
-    apply('output', entry.output_usd)
-    apply('cache_read', entry.cache_read_usd)
-    apply('cache_write', entry.cache_write_usd)
-    apply('reasoning', entry.reasoning_usd)
-    pricing.cost_rates = next
+    apply('input', entry.InputUSD)
+    apply('output', entry.OutputUSD)
+    apply('cache_read', entry.CacheReadUSD)
+    apply('cache_write', entry.CacheWriteUSD)
+    apply('reasoning', entry.ReasoningUSD)
+    pricing.CostRates = next
     catOpen.value = false
-    ElMessage.success(`已应用 models.dev 参考价（${entry.provider}/${entry.model_id}）到成本定价`)
+    ElMessage.success(`已应用 models.dev 参考价（${entry.Provider}/${entry.ModelID}）到成本定价`)
   } finally {
     catApplying.value = false
   }
@@ -464,7 +465,7 @@ function onRemoveRow(index: number) {
 
     <div v-loading="loading">
       <el-table :data="list" border stripe class="table-nowrap">
-        <el-table-column label="内部模型 ID" prop="internal_model_id" min-width="150" show-overflow-tooltip>
+        <el-table-column label="内部模型 ID" prop="InternalModelID" min-width="150" show-overflow-tooltip>
           <template #header>
             <el-tooltip :content="'上游模型名字（模型请求体中的 model 字段）。这个渠道收到该模型的调用时，使用此条的绑定与成本计费'" placement="top">
               <span>内部模型 ID</span>
@@ -473,8 +474,8 @@ function onRemoveRow(index: number) {
         </el-table-column>
         <el-table-column label="绑定对外模型" min-width="150">
           <template #default="{ row }">
-            <el-tooltip :content="row.external_name ? `开发者调用「${row.external_name}」时，可能路由到本渠道并复用该成本` : '未绑定'" placement="top">
-              <span>{{ row.external_name || '-' }}</span>
+            <el-tooltip :content="row.ExternalName ? `开发者调用「${row.ExternalName}」时，可能路由到本渠道并复用该成本` : '未绑定'" placement="top">
+              <span>{{ row.ExternalName || '-' }}</span>
             </el-tooltip>
           </template>
         </el-table-column>
@@ -503,15 +504,15 @@ function onRemoveRow(index: number) {
           <template #default="{ row }">
             <el-popover v-if="!readonly" trigger="hover" placement="left" :width="170">
               <template #reference>
-                <StatusTag :value="row.state" style="cursor: pointer" />
+                <StatusTag :value="row.State" style="cursor: pointer" />
               </template>
               <div class="pop-actions">
-                <el-button v-if="row.state !== 'NORMAL'" size="small" type="success" @click="onToggleState(row, 'normal')">正常</el-button>
-                <el-button v-if="row.state !== 'DRAIN'" size="small" type="warning" @click="onToggleState(row, 'drain')">排空</el-button>
-                <el-button v-if="row.state !== 'DISABLED'" size="small" type="danger" @click="onToggleState(row, 'disable')">禁用</el-button>
+                <el-button v-if="row.State !== 'NORMAL'" size="small" type="success" @click="onToggleState(row, 'normal')">正常</el-button>
+                <el-button v-if="row.State !== 'DRAIN'" size="small" type="warning" @click="onToggleState(row, 'drain')">排空</el-button>
+                <el-button v-if="row.State !== 'DISABLED'" size="small" type="danger" @click="onToggleState(row, 'disable')">禁用</el-button>
               </div>
             </el-popover>
-            <StatusTag v-else :value="row.state" />
+            <StatusTag v-else :value="row.State" />
           </template>
         </el-table-column>
         <el-table-column v-if="!readonly" label="操作" width="110" align="right">
@@ -556,15 +557,15 @@ function onRemoveRow(index: number) {
           @current-change="onRowChange"
         >
           <el-table-column type="index" width="44" align="center" />
-          <el-table-column label="内部模型 ID" prop="internal_model_id" min-width="150" show-overflow-tooltip />
+          <el-table-column label="内部模型 ID" prop="InternalModelID" min-width="150" show-overflow-tooltip />
           <el-table-column label="绑定对外模型" width="220">
             <template #default="{ row }">
-              <el-select v-model="row.external_model_id" style="width: 100%" placeholder="选择对外的发售模型">
+              <el-select v-model="row.ExternalModelID" style="width: 100%" placeholder="选择对外的发售模型">
                 <el-option
                   v-for="em in externalModels"
-                  :key="em.id"
-                  :label="em.external_name"
-                  :value="em.id"
+                  :key="em.ID"
+                  :label="em.ExternalName"
+                  :value="em.ID"
                 />
               </el-select>
             </template>
@@ -576,8 +577,8 @@ function onRemoveRow(index: number) {
           </el-table-column>
         </el-table>
         <div v-if="activeRow" class="batch-pricing">
-          <div class="batch-pricing-label">成本定价 — {{ activeRow.internal_model_id }}</div>
-          <ModelPricing v-model="activeRow.pricing" show-rates-key="cost_rates" title="成本">
+          <div class="batch-pricing-label">成本定价 — {{ activeRow.InternalModelID }}</div>
+          <ModelPricing v-model="activeRow.pricing" show-rates-key="CostRates" title="成本">
             <template #title-extra>
               <el-button size="small" @click="onOpenCatalog">从 models.dev 获取参考价</el-button>
             </template>
@@ -588,21 +589,21 @@ function onRemoveRow(index: number) {
       <el-form v-else label-width="110px" class="cm-form">
         <el-form-item label="内部模型 ID" required>
           <el-tooltip :content="'上游模型名（请求体 model 字段）。同一渠道内不可重复'" placement="top">
-            <el-input v-model="editingForm!.internal_model_id" placeholder="如 deepseek-chat" />
+            <el-input v-model="editingForm!.InternalModelID" placeholder="如 deepseek-chat" />
           </el-tooltip>
         </el-form-item>
         <el-form-item label="绑定对外模型" required>
-          <el-select v-model="editingForm!.external_model_id" style="width: 100%" placeholder="选择对外的发售模型">
+          <el-select v-model="editingForm!.ExternalModelID" style="width: 100%" placeholder="选择对外的发售模型">
             <el-option
               v-for="em in externalModels"
-              :key="em.id"
-              :label="em.external_name"
-              :value="em.id"
+              :key="em.ID"
+              :label="em.ExternalName"
+              :value="em.ID"
             />
           </el-select>
         </el-form-item>
         <div class="span-2">
-          <ModelPricing v-model="editingPricing" show-rates-key="cost_rates" title="成本">
+          <ModelPricing v-model="editingPricing" show-rates-key="CostRates" title="成本">
             <template #title-extra>
               <el-button size="small" @click="onOpenCatalog">从 models.dev 获取参考价</el-button>
             </template>
@@ -618,45 +619,45 @@ function onRemoveRow(index: number) {
                   <div class="runtime-title">限流</div>
                   <div class="rt-item">
                     <div class="rt-label">每分钟请求数</div>
-                    <el-input-number v-model="editingForm!.rate_limit.rpm" :min="0" size="small" controls-position="right" class="rt-ctrl" />
+                    <el-input-number v-model="editingForm!.RateLimit.RPM" :min="0" size="small" controls-position="right" class="rt-ctrl" />
                   </div>
                   <div class="rt-item">
                     <div class="rt-label">每分钟 Token 数</div>
-                    <el-input-number v-model="editingForm!.rate_limit.tpm" :min="0" size="small" controls-position="right" class="rt-ctrl" />
+                    <el-input-number v-model="editingForm!.RateLimit.TPM" :min="0" size="small" controls-position="right" class="rt-ctrl" />
                   </div>
                   <div class="rt-item">
                     <div class="rt-label">最大并发会话数</div>
-                    <el-input-number v-model="editingForm!.rate_limit.max_concurrent" :min="0" size="small" controls-position="right" class="rt-ctrl" />
+                    <el-input-number v-model="editingForm!.RateLimit.MaxConcurrent" :min="0" size="small" controls-position="right" class="rt-ctrl" />
                   </div>
                 </div>
                 <div class="runtime-col">
                   <div class="runtime-title">健康探测</div>
                   <div class="rt-item">
                     <div class="rt-label">排空间隔(秒)</div>
-                    <el-input-number v-model="editingForm!.health_probe.drain_interval_seconds" :min="0" size="small" controls-position="right" class="rt-ctrl" />
+                    <el-input-number v-model="editingForm!.HealthProbe.DrainIntervalSeconds" :min="0" size="small" controls-position="right" class="rt-ctrl" />
                   </div>
                   <div class="rt-item">
                     <div class="rt-label">连续失败阈值(次)</div>
-                    <el-input-number v-model="editingForm!.health_probe.fail_threshold" :min="0" size="small" controls-position="right" class="rt-ctrl" />
+                    <el-input-number v-model="editingForm!.HealthProbe.FailThreshold" :min="0" size="small" controls-position="right" class="rt-ctrl" />
                   </div>
                   <div class="rt-item">
                     <div class="rt-label">探测模型(可空)</div>
-                    <el-input v-model="editingForm!.health_probe.probe_model" size="small" class="rt-ctrl" placeholder="留空继承渠道级" />
+                    <el-input v-model="editingForm!.HealthProbe.ProbeModel" size="small" class="rt-ctrl" placeholder="留空继承渠道级" />
                   </div>
                 </div>
                 <div class="runtime-col">
                   <div class="runtime-title">可靠性</div>
                   <div class="rt-item">
                     <div class="rt-label">统计窗口(秒)</div>
-                    <el-input-number v-model="editingForm!.reliability.window_seconds" :min="0" size="small" controls-position="right" class="rt-ctrl" />
+                    <el-input-number v-model="editingForm!.Reliability.WindowSeconds" :min="0" size="small" controls-position="right" class="rt-ctrl" />
                   </div>
                   <div class="rt-item">
                     <div class="rt-label">错误率阈值(%)</div>
-                    <el-input-number v-model="editingForm!.reliability.error_rate_pct" :min="0" size="small" controls-position="right" class="rt-ctrl" />
+                    <el-input-number v-model="editingForm!.Reliability.ErrorRatePct" :min="0" size="small" controls-position="right" class="rt-ctrl" />
                   </div>
                   <div class="rt-item">
                     <div class="rt-label">P99延迟阈值(毫秒)</div>
-                    <el-input-number v-model="editingForm!.reliability.p99_latency_ms" :min="0" size="small" controls-position="right" class="rt-ctrl" />
+                    <el-input-number v-model="editingForm!.Reliability.P99LatencyMS" :min="0" size="small" controls-position="right" class="rt-ctrl" />
                   </div>
                 </div>
               </div>
@@ -686,16 +687,16 @@ function onRemoveRow(index: number) {
         <el-table-column
           type="selection"
           width="40"
-          :selectable="(row: PullModel) => !isAdded(row.id)"
+          :selectable="(row: PullModel) => !isAdded(row.ID)"
         />
         <el-table-column label="模型 ID" min-width="160" show-overflow-tooltip>
           <template #default="{ row }">
-            <span :class="{ 'muted-id': isAdded(row.id) }">{{ row.id }}</span>
-            <el-tag v-if="isAdded(row.id)" size="small" type="info" effect="plain" class="added-tag">已添加</el-tag>
+            <span :class="{ 'muted-id': isAdded(row.ID) }">{{ row.ID }}</span>
+            <el-tag v-if="isAdded(row.ID)" size="small" type="info" effect="plain" class="added-tag">已添加</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="类型" prop="object" width="110" />
-        <el-table-column label="归属" prop="owned_by" min-width="120" show-overflow-tooltip />
+        <el-table-column label="类型" prop="Object" width="110" />
+        <el-table-column label="归属" prop="OwnedBy" min-width="120" show-overflow-tooltip />
       </el-table>
       <el-empty v-if="!pulled.length" description="上游未返回任何模型" />
       <template #footer>
@@ -736,9 +737,9 @@ function onRemoveRow(index: number) {
       >
         <el-table-column label="供应商" min-width="100" show-overflow-tooltip>
           <template #default="{ row }">
-            <span>{{ row.provider }}</span>
+            <span>{{ row.Provider }}</span>
             <el-tag
-              v-if="modelNamePrefix && row.provider.toLowerCase() === modelNamePrefix.toLowerCase()"
+              v-if="modelNamePrefix && row.Provider.toLowerCase() === modelNamePrefix.toLowerCase()"
               size="small"
               type="primary"
               effect="light"
@@ -750,9 +751,9 @@ function onRemoveRow(index: number) {
         </el-table-column>
         <el-table-column label="模型 ID" min-width="130" show-overflow-tooltip>
           <template #default="{ row }">
-            <span>{{ row.model_id }}</span>
+            <span>{{ row.ModelID }}</span>
             <el-tag
-              v-if="currentModelId && row.model_id === currentModelId"
+              v-if="currentModelId && row.ModelID === currentModelId"
               size="small"
               type="success"
               effect="light"
@@ -765,49 +766,49 @@ function onRemoveRow(index: number) {
         <el-table-column label="输入" width="130" align="right">
           <template #default="{ row }">
             <div class="pcell">
-              <span class="cny">{{ usdToCnyPerM(row.input_usd) }}</span>
-              <span class="credit">≈ {{ usdToCredits(row.input_usd) }} 积分</span>
+              <span class="cny">{{ usdToCnyPerM(row.InputUSD) }}</span>
+              <span class="credit">≈ {{ usdToCredits(row.InputUSD) }} 积分</span>
             </div>
           </template>
         </el-table-column>
         <el-table-column label="输出" width="130" align="right">
           <template #default="{ row }">
             <div class="pcell">
-              <span class="cny">{{ usdToCnyPerM(row.output_usd) }}</span>
-              <span class="credit">≈ {{ usdToCredits(row.output_usd) }} 积分</span>
+              <span class="cny">{{ usdToCnyPerM(row.OutputUSD) }}</span>
+              <span class="credit">≈ {{ usdToCredits(row.OutputUSD) }} 积分</span>
             </div>
           </template>
         </el-table-column>
         <el-table-column label="缓存读" width="130" align="right">
           <template #default="{ row }">
-            <div v-if="row.cache_read_usd > 0" class="pcell">
-              <span class="cny">{{ usdToCnyPerM(row.cache_read_usd) }}</span>
-              <span class="credit">≈ {{ usdToCredits(row.cache_read_usd) }} 积分</span>
+            <div v-if="row.CacheReadUSD > 0" class="pcell">
+              <span class="cny">{{ usdToCnyPerM(row.CacheReadUSD) }}</span>
+              <span class="credit">≈ {{ usdToCredits(row.CacheReadUSD) }} 积分</span>
             </div>
             <span v-else class="zero">—</span>
           </template>
         </el-table-column>
         <el-table-column label="缓存写" width="130" align="right">
           <template #default="{ row }">
-            <div v-if="row.cache_write_usd > 0" class="pcell">
-              <span class="cny">{{ usdToCnyPerM(row.cache_write_usd) }}</span>
-              <span class="credit">≈ {{ usdToCredits(row.cache_write_usd) }} 积分</span>
+            <div v-if="row.CacheWriteUSD > 0" class="pcell">
+              <span class="cny">{{ usdToCnyPerM(row.CacheWriteUSD) }}</span>
+              <span class="credit">≈ {{ usdToCredits(row.CacheWriteUSD) }} 积分</span>
             </div>
             <span v-else class="zero">—</span>
           </template>
         </el-table-column>
         <el-table-column label="推理" width="130" align="right">
           <template #default="{ row }">
-            <div v-if="row.reasoning_usd > 0" class="pcell">
-              <span class="cny">{{ usdToCnyPerM(row.reasoning_usd) }}</span>
-              <span class="credit">≈ {{ usdToCredits(row.reasoning_usd) }} 积分</span>
+            <div v-if="row.ReasoningUSD > 0" class="pcell">
+              <span class="cny">{{ usdToCnyPerM(row.ReasoningUSD) }}</span>
+              <span class="credit">≈ {{ usdToCredits(row.ReasoningUSD) }} 积分</span>
             </div>
             <span v-else class="zero">—</span>
           </template>
         </el-table-column>
       </el-table>
       <div class="cat-status">
-        <span v-if="catUpdatedAt" class="status-item">数据同步于 {{ new Date(catUpdatedAt).toLocaleString() }}</span>
+        <span v-if="catUpdatedAt" class="status-item">数据同步于 {{ fmtDateTime(catUpdatedAt) }}</span>
         <span v-else class="status-item">价格数据尚未同步（服务启动或每 60 分钟拉取一次）</span>
         <span v-if="catTotal" class="status-item">命中 {{ catTotal }} 条</span>
       </div>
@@ -818,7 +819,7 @@ function onRemoveRow(index: number) {
       <template #footer>
         <el-button @click="catOpen = false">取消</el-button>
         <el-button type="primary" :loading="catApplying" @click="onApplyCostCatalog">
-          应用到成本{{ selectedEntry ? `（${selectedEntry.provider}/${selectedEntry.model_id}）` : '' }}
+          应用到成本{{ selectedEntry ? `（${selectedEntry.Provider}/${selectedEntry.ModelID}）` : '' }}
         </el-button>
       </template>
     </el-dialog>

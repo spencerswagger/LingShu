@@ -32,7 +32,7 @@ func TestDashboard_Aggregates(t *testing.T) {
 			float64(12.5), int64(10), int64(1), int64(2000), int64(400), int64(10), int64(10)))
 
 	// 2) 按天（仅返回 1 天，另一天应补零）
-	mock.ExpectQuery(regexp.QuoteMeta(`date_trunc('day', call_time)::date`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`date_trunc('day', call_time AT TIME ZONE 'Asia/Shanghai')::date`)).
 		WillReturnRows(sqlmock.NewRows([]string{"d", "calls", "failed", "credits", "tokens", "duration"}).
 			AddRow(from, int64(10), int64(1), float64(12.5), int64(150), int64(2000)))
 
@@ -122,7 +122,7 @@ func TestDashboard_UserScope(t *testing.T) {
 		}).AddRow(int64(0), int64(0), int64(0), int64(0), int64(0),
 			float64(0), int64(0), int64(0), int64(0), int64(0), int64(0), int64(0)))
 
-	mock.ExpectQuery(regexp.QuoteMeta(`date_trunc('day', call_time)::date`)).
+	mock.ExpectQuery(regexp.QuoteMeta(`date_trunc('day', call_time AT TIME ZONE 'Asia/Shanghai')::date`)).
 		WillReturnRows(sqlmock.NewRows([]string{"d", "calls", "failed", "credits", "tokens", "duration"}))
 
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT external_model_name,`)).

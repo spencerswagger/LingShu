@@ -130,10 +130,15 @@ func (h *Dev) HandleGetBilling(w http.ResponseWriter, r *http.Request) {
 }
 
 // fillZeroDates 生成最近 days 天（含今天）的（date → 零值）映射。
+// 按日切分以北京时间（Asia/Shanghai）为准。
 func fillZeroDates(days int) map[string]dailyRow {
 	out := make(map[string]dailyRow, days)
-	now := time.Now()
-	start := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	loc, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		loc = time.Local
+	}
+	now := time.Now().In(loc)
+	start := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
 	for i := days - 1; i >= 0; i-- {
 		d := start.AddDate(0, 0, -i)
 		out[d.Format("2006-01-02")] = dailyRow{}

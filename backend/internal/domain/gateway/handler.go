@@ -109,7 +109,7 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint string)
 		go g.touchLastUsed(context.Background(), token.ID)
 	}
 
-	// 2) 读取请求体（限 5MB）并解析 model / stream。
+	// 2) 读取请求体（上限 maxBodyBytes=64MB，异常/恶意超大请求体兜底）并解析 model / stream。
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
 	if err != nil || int64(len(body)) > maxBodyBytes {
 		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "请求体过大或无法读取")
@@ -499,11 +499,11 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 		g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, channel.Feedback{IsSuccess: false, Now: g.now()})
 		if !wrote.Load() {
 			// 请求体未送达上游：上游不可能计费 → 可安全转移。
-			g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "上游连接失败: "+err.Error(), msSince(start))
+			g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "上游连接失败", msSince(start))
 			return &fwdOutcome{retry: true}
 		}
 		// 请求已送达后失败（多为响应超时）：上游可能已生成并计费，转移会导致上游重复计费 → 不转移。
-		g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "上游请求失败（已送达，不转移）: "+err.Error(), msSince(start))
+		g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "上游请求失败（已送达，不转移）", msSince(start))
 		resp.Err(w, r, http.StatusBadGateway, resp.CodeInternalError, msgUpstreamDown)
 		return &fwdOutcome{responded: true, refundPre: true}
 	}
@@ -515,7 +515,7 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 		if err != nil {
 			// 已收到 2xx：上游已完成生成并计费，转移会造成上游重复计费 → 不转移。
 			g.logError(rt.Channel.ID, "read upstream body", err)
-			g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "读取上游响应失败: "+err.Error(), msSince(start))
+			g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "读取上游响应失败", msSince(start))
 			resp.Err(w, r, http.StatusBadGateway, resp.CodeInternalError, msgUpstreamDown)
 			return &fwdOutcome{responded: true, refundPre: true}
 		}
@@ -605,11 +605,11 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, channel.Feedback{IsSuccess: false, Now: g.now()})
 		if !wrote.Load() {
 			// 请求体未送达上游：上游不可能计费 → 可安全转移。
-			g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "上游流式连接失败: "+err.Error(), msSince(start))
+			g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "上游流式连接失败", msSince(start))
 			return &fwdOutcome{retry: true}
 		}
 		// 请求已送达后失败（多为响应超时）：上游可能已生成并计费，转移会导致上游重复计费 → 不转移。
-		g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "上游流式请求失败（已送达，不转移）: "+err.Error(), msSince(start))
+		g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "上游流式请求失败（已送达，不转移）", msSince(start))
 		resp.Err(w, r, http.StatusBadGateway, resp.CodeInternalError, msgUpstreamDown)
 		return &fwdOutcome{responded: true, refundPre: true}
 	}
@@ -623,7 +623,7 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		dur := msSince(start)
 		if herr != nil && !errors.Is(herr, context.Canceled) {
 			g.logError(rt.Channel.ID, "stream handle failed", herr)
-			g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "流式传输中断: "+herr.Error(), dur)
+			g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "流式传输中断", dur)
 		}
 		// 流结束后计费（预扣已在前置阶段完成；此处按实际扣费，差额由 serve 结算退补）。
 		// 此时请求 context 已随响应结束被取消：用脱离取消、带超时的 context，避免计费被误中断。

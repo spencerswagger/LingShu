@@ -62,6 +62,18 @@ func (s *KeyService) Create(ctx context.Context, channelID int64, name, credenti
 	return s.keys.GetByID(ctx, id)
 }
 
+// Get 按 ID 查询密钥（含归属渠道），供 HTTP 层做「路径渠道 ↔ 密钥」归属一致性校验。
+func (s *KeyService) Get(ctx context.Context, keyID int64) (*ChannelKey, error) {
+	k, err := s.keys.GetByID(ctx, keyID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, errNotFound("密钥不存在")
+		}
+		return nil, err
+	}
+	return k, nil
+}
+
 // Update 修改密钥名称/凭据：credential 为空表示不修改。
 // 加密规则与 KeyStore.UpdateInfo(updateCred) 保持一致。
 func (s *KeyService) Update(ctx context.Context, keyID int64, name, credential string) (*ChannelKey, error) {

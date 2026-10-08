@@ -26,6 +26,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -160,6 +161,7 @@ func buildTestServer(t *testing.T, dsn string) (*httptest.Server, func()) {
 	identitySvc.SetSessionRegistry(sessions)
 	identitySvc.SetAudit(auditStore)
 	identitySvc.SetTOTP(identity.NewTOTPService(userStore, testSm4Key))
+	identitySvc.SetRateLimiter(rl)
 
 	creditStore := identity.NewCreditStore(d)
 	creditSvc := identity.NewCreditService(creditStore)
@@ -168,11 +170,17 @@ func buildTestServer(t *testing.T, dsn string) (*httptest.Server, func()) {
 	identityHandler.SetRateLimiter(rl)
 	identityHandler.SetPreAuth(preAuth)
 	creditHandler := identity.NewCreditHandler(creditSvc, userIDFrom)
+	// 资金敏感操作（充值/覆盖/调整）需操作者当前口令二次验证（镜像 main 装配）。
+	creditHandler.SetPasswordVerifier(identitySvc.VerifyCurrentPassword)
 
 	tokenStore := identity.NewTokenStore(d)
 	tokenSvc := identity.NewTokenService(tokenStore)
+	tokenSvc.SetSecretKey(testSm4Key) // 令牌明文 SM4 加密落库，支持事后查看/复制（镜像 main 装配）
 	tokenAdminHandler := identity.NewTokenHandler(tokenSvc, userIDFrom)
 	tokenDevHandler := identity.NewTokenHandler(tokenSvc, userIDFrom)
+	// 查看明文密钥属敏感操作：需当前口令二次验证（X-Current-Password 头）。
+	tokenAdminHandler.SetPasswordVerifier(identitySvc.VerifyCurrentPassword)
+	tokenDevHandler.SetPasswordVerifier(identitySvc.VerifyCurrentPassword)
 	adminUserHandler := identity.NewAdminUserHandler(identitySvc, creditSvc, userIDFrom)
 	adminUserHandler.SetTOTP(identity.NewTOTPService(userStore, testSm4Key))
 	announceStore := identity.NewAnnouncementStore(d)
@@ -369,13 +377,13 @@ const adminNewPassword = "Admin@123456"
 // login 以用户名/口令走 /auth/login 一步登录，返回 JWT；失败直接终止测试。
 func login(t *testing.T, base, username, password string) string {
 	t.Helper()
-	status, raw := req(t, http.MethodPost, base+"/api/v1/auth/login", "", map[string]string{"username": username, "password": password})
+	status, raw := req(t, http.MethodPost, base+"/api/v1/auth/login", "", map[string]string{"Username": username, "Password": password})
 	if status != http.StatusOK {
 		t.Fatalf("login %s status=%d body=%s", username, status, raw)
 	}
 	ar := decodeResp(t, raw)
 	var d struct {
-		Token string `json:"token"`
+		Token string `json:"Token"`
 	}
 	if err := json.Unmarshal(ar.Data, &d); err != nil {
 		t.Fatalf("decode login data: %v", err)
@@ -388,10 +396,10 @@ func login(t *testing.T, base, username, password string) string {
 // 自动改用 adminNewPassword，保证同一 server 内可重复调用。
 func loginAdmin(t *testing.T, base string) string {
 	t.Helper()
-	status, raw := req(t, http.MethodPost, base+"/api/v1/auth/login", "", map[string]string{"username": "admin", "password": "admin123"})
+	status, raw := req(t, http.MethodPost, base+"/api/v1/auth/login", "", map[string]string{"Username": "admin", "Password": "admin123"})
 	var d struct {
-		Token              string `json:"token"`
-		MustChangePassword bool   `json:"must_change_password"`
+		Token              string `json:"Token"`
+		MustChangePassword bool   `json:"MustChangePassword"`
 	}
 	switch status {
 	case http.StatusOK:
@@ -401,7 +409,7 @@ func loginAdmin(t *testing.T, base string) string {
 		}
 	case http.StatusUnauthorized:
 		// 默认口令已改（首登改密后再次登录），改用新口令
-		status, raw := req(t, http.MethodPost, base+"/api/v1/auth/login", "", map[string]string{"username": "admin", "password": adminNewPassword})
+		status, raw := req(t, http.MethodPost, base+"/api/v1/auth/login", "", map[string]string{"Username": "admin", "Password": adminNewPassword})
 		if status != http.StatusOK {
 			t.Fatalf("admin login(new pw) status=%d body=%s", status, raw)
 		}
@@ -417,15 +425,15 @@ func loginAdmin(t *testing.T, base string) string {
 	}
 	// 强制首登改密：走白名单路径改密，返回新 token（旧 token 因 ver bump 失效）
 	status, raw = req(t, http.MethodPut, base+"/api/v1/auth/me/password", d.Token, map[string]string{
-		"old_password": "admin123",
-		"new_password": adminNewPassword,
+		"OldPassword": "admin123",
+		"NewPassword": adminNewPassword,
 	})
 	if status != http.StatusOK {
 		t.Fatalf("admin change password status=%d body=%s", status, raw)
 	}
 	ar := decodeResp(t, raw)
 	var c struct {
-		Token string `json:"token"`
+		Token string `json:"Token"`
 	}
 	if err := json.Unmarshal(ar.Data, &c); err != nil {
 		t.Fatalf("decode change password: %v", err)
@@ -459,27 +467,41 @@ func TestE2E_GatewayBillingLoop(t *testing.T) {
 	adminToken := loginAdmin(t, base)
 
 	// 2) admin 建开发者用户 + 充值
+	// 注：雪花 ID 超出 JS 安全整数，API 返回的 ID 一律为字符串，解析后转 int64 供内部使用。
 	var devID int64
 	{
 		status, raw := req(t, http.MethodPost, base+"/api/v1/admin/users", adminToken, map[string]string{
-			"username": "dev1", "password": "dev123", "role": "DEVELOPER", "pricing_mode": "sale",
+			"Username": "dev1", "Password": "Dev@123456", "Role": "DEVELOPER", "PricingMode": "sale",
 		})
 		if status != http.StatusOK {
 			t.Fatalf("create dev status=%d body=%s", status, raw)
 		}
 		ar := decodeResp(t, raw)
 		var u struct {
-			ID int64 `json:"id"`
+			ID string `json:"ID"`
 		}
 		if err := json.Unmarshal(ar.Data, &u); err != nil {
 			t.Fatalf("decode create dev: %v", err)
 		}
-		devID = u.ID
+		id, err := strconv.ParseInt(u.ID, 10, 64)
+		if err != nil {
+			t.Fatalf("parse dev id %q: %v", u.ID, err)
+		}
+		devID = id
 	}
 	const rechargeAmount = 100.0
 	{
+		// 负向断言：不带当前口令调用 recharge → 403。
 		path := fmt.Sprintf("/api/v1/admin/users/%d/wallet/recharge", devID)
-		status, raw := req(t, http.MethodPost, base+path, adminToken, map[string]float64{"amount": rechargeAmount})
+		status, raw := req(t, http.MethodPost, base+path, adminToken, map[string]any{"Amount": rechargeAmount})
+		if status != http.StatusForbidden {
+			t.Fatalf("recharge without password 期望 403, 实际 status=%d body=%s", status, raw)
+		}
+
+		// 正向充值：资金敏感操作需携带操作者当前口令。
+		status, raw = req(t, http.MethodPost, base+path, adminToken, map[string]any{
+			"Amount": rechargeAmount, "Password": adminNewPassword,
+		})
 		if status != http.StatusOK {
 			t.Fatalf("recharge status=%d body=%s", status, raw)
 		}
@@ -490,20 +512,24 @@ func TestE2E_GatewayBillingLoop(t *testing.T) {
 	var channelID int64
 	{
 		status, raw := req(t, http.MethodPost, base+"/api/v1/admin/channels", adminToken, map[string]any{
-			"name": "mock-provider", "protocol": "openai-compat", "base_url": mock.URL,
-			"auth_credential": "sk-test", "tags": map[string]string{"provider": "domestic"},
+			"Name": "mock-provider", "Protocol": "openai-compat", "BaseURL": mock.URL,
+			"Tags": map[string]string{"provider": "domestic"},
 		})
 		if status != http.StatusOK {
 			t.Fatalf("create channel status=%d body=%s", status, raw)
 		}
 		ar := decodeResp(t, raw)
 		var ch struct {
-			ID int64 `json:"id"`
+			ID string `json:"ID"`
 		}
 		if err := json.Unmarshal(ar.Data, &ch); err != nil {
 			t.Fatalf("decode channel: %v", err)
 		}
-		channelID = ch.ID
+		id, err := strconv.ParseInt(ch.ID, 10, 64)
+		if err != nil {
+			t.Fatalf("parse channel id %q: %v", ch.ID, err)
+		}
+		channelID = id
 	}
 
 	// 4) admin 建对外模型(qw-max，sale_rates 1.0/2.0) 与语义标签 {provider:domestic}；
@@ -513,25 +539,29 @@ func TestE2E_GatewayBillingLoop(t *testing.T) {
 	{
 		rates := map[string]float64{"input": 1.0, "output": 2.0, "cache_read": 1.0, "cache_write": 1.0, "reasoning": 1.0}
 		status, raw := req(t, http.MethodPost, base+"/api/v1/admin/models", adminToken, map[string]any{
-			"external_name": "qw-max", "sale_rates": rates,
+			"ExternalName": "qw-max", "SaleRates": rates,
 		})
 		if status != http.StatusOK {
 			t.Fatalf("create model status=%d body=%s", status, raw)
 		}
 		ar := decodeResp(t, raw)
 		var em struct {
-			ID int64 `json:"id"`
+			ID string `json:"ID"`
 		}
 		if err := json.Unmarshal(ar.Data, &em); err != nil {
 			t.Fatalf("decode external model: %v", err)
 		}
-		extModelID = em.ID
+		id, err := strconv.ParseInt(em.ID, 10, 64)
+		if err != nil {
+			t.Fatalf("parse ext model id %q: %v", em.ID, err)
+		}
+		extModelID = id
 	}
 	{
 		path := fmt.Sprintf("/api/v1/admin/channels/%d/models", channelID)
 		status, raw := req(t, http.MethodPost, base+path, adminToken, map[string]any{
-			"internal_model_id": "qwen-max", "external_model_id": extModelID,
-			"cost_rates": map[string]float64{"input": 1.0, "output": 2.0, "cache_read": 1.0, "cache_write": 1.0, "reasoning": 1.0},
+			"InternalModelID": "qwen-max", "ExternalModelID": strconv.FormatInt(extModelID, 10),
+			"CostRates": map[string]float64{"input": 1.0, "output": 2.0, "cache_read": 1.0, "cache_write": 1.0, "reasoning": 1.0},
 		})
 		if status != http.StatusOK {
 			t.Fatalf("create channel model status=%d body=%s", status, raw)
@@ -540,35 +570,40 @@ func TestE2E_GatewayBillingLoop(t *testing.T) {
 	}
 	{
 		status, raw := req(t, http.MethodPost, base+"/api/v1/admin/tags", adminToken, map[string]any{
-			"name": "dp", "kv_pairs": map[string]string{"provider": "domestic"},
+			"Name": "dp", "KVPairs": map[string]string{"provider": "domestic"},
 		})
 		if status != http.StatusOK {
 			t.Fatalf("create tag status=%d body=%s", status, raw)
 		}
 		ar := decodeResp(t, raw)
 		var tg struct {
-			ID int64 `json:"id"`
+			ID string `json:"ID"`
 		}
 		if err := json.Unmarshal(ar.Data, &tg); err != nil {
 			t.Fatalf("decode tag: %v", err)
 		}
-		tagID = tg.ID
+		id, err := strconv.ParseInt(tg.ID, 10, 64)
+		if err != nil {
+			t.Fatalf("parse tag id %q: %v", tg.ID, err)
+		}
+		tagID = id
 	}
 
-	// 5) dev 登录 → 创建令牌（带标签）记明文
+	// 5) dev 登录 → 创建令牌（带标签）记明文；查看密钥需 X-Current-Password 二次验证
 	var devPlain string
 	var devToken string
+	var devTokenID string
 	{
-		devToken = login(t, base, "dev1", "dev123")
+		devToken = login(t, base, "dev1", "Dev@123456")
 		status, raw := req(t, http.MethodPost, base+"/api/v1/dev/tokens", devToken, map[string]any{
-			"display_name": "e2e", "tag_id": tagID,
+			"DisplayName": "e2e", "TagID": strconv.FormatInt(tagID, 10),
 		})
 		if status != http.StatusOK {
 			t.Fatalf("create dev token status=%d body=%s", status, raw)
 		}
 		ar := decodeResp(t, raw)
 		var tk struct {
-			Plain string `json:"plain"`
+			Plain string `json:"Plain"`
 		}
 		if err := json.Unmarshal(ar.Data, &tk); err != nil {
 			t.Fatalf("decode token: %v", err)
@@ -577,6 +612,52 @@ func TestE2E_GatewayBillingLoop(t *testing.T) {
 			t.Fatal("令牌明文为空")
 		}
 		devPlain = tk.Plain
+
+		// 负向断言：不带 X-Current-Password 调用查看密钥 → 403。
+		status, raw = req(t, http.MethodGet, base+"/api/v1/dev/tokens", devToken, nil)
+		if status != http.StatusOK {
+			t.Fatalf("list dev tokens status=%d body=%s", status, raw)
+		}
+		ar = decodeResp(t, raw)
+		var tl struct {
+			List []struct {
+				ID string `json:"ID"`
+			} `json:"list"`
+		}
+		if err := json.Unmarshal(ar.Data, &tl); err != nil || len(tl.List) == 0 {
+			t.Fatalf("decode dev token list: %v", err)
+		}
+		devTokenID = tl.List[0].ID
+		status, raw = req(t, http.MethodGet, base+"/api/v1/dev/tokens/"+devTokenID+"/secret", devToken, nil)
+		if status != http.StatusForbidden {
+			t.Fatalf("secret without X-Current-Password 期望 403, 实际 status=%d body=%s", status, raw)
+		}
+		// 正向：携带当前口令可查看明文密钥。
+		r2, err := http.NewRequest(http.MethodGet, base+"/api/v1/dev/tokens/"+devTokenID+"/secret", nil)
+		if err != nil {
+			t.Fatalf("new secret request: %v", err)
+		}
+		r2.Header.Set("Authorization", "Bearer "+devToken)
+		r2.Header.Set("X-Current-Password", "Dev@123456")
+		resp, err := http.DefaultClient.Do(r2)
+		if err != nil {
+			t.Fatalf("do secret request: %v", err)
+		}
+		defer resp.Body.Close()
+		secretRaw, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("secret with password status=%d body=%s", resp.StatusCode, secretRaw)
+		}
+		secretAr := decodeResp(t, secretRaw)
+		var sk struct {
+			Plain string `json:"Plain"`
+		}
+		if err := json.Unmarshal(secretAr.Data, &sk); err != nil || sk.Plain == "" {
+			t.Fatalf("decode secret: %v raw=%s", err, secretRaw)
+		}
+		if sk.Plain != devPlain {
+			t.Fatalf("secret 明文与创建时不符: want %s got %s", devPlain, sk.Plain)
+		}
 	}
 
 	// 6) 网关转发：/v1/chat/completions → 200、无 X-Channel* 头、body 有 choices
@@ -615,10 +696,10 @@ func TestE2E_GatewayBillingLoop(t *testing.T) {
 		var d struct {
 			Total int64 `json:"total"`
 			List  []struct {
-				Status          string  `json:"status"`
-				CreditsConsumed float64 `json:"credits_consumed"`
-				Model           string  `json:"model"`
-				PricingMode     string  `json:"pricing_mode"`
+				Status          string  `json:"Status"`
+				CreditsConsumed float64 `json:"CreditsConsumed"`
+				Model           string  `json:"ExternalModel"`
+				PricingMode     string  `json:"PricingMode"`
 			} `json:"list"`
 		}
 		if err := json.Unmarshal(ar.Data, &d); err != nil {
@@ -673,31 +754,35 @@ func TestE2E_GatewayBillingLoop(t *testing.T) {
 		var wrongTagID int64
 		{
 			status, raw := req(t, http.MethodPost, base+"/api/v1/admin/tags", adminToken, map[string]any{
-				"name": "overseas", "kv_pairs": map[string]string{"provider": "overseas"},
+				"Name": "overseas", "KVPairs": map[string]string{"provider": "overseas"},
 			})
 			if status != http.StatusOK {
 				t.Fatalf("create wrong tag status=%d body=%s", status, raw)
 			}
 			ar := decodeResp(t, raw)
 			var tg struct {
-				ID int64 `json:"id"`
+				ID string `json:"ID"`
 			}
 			if err := json.Unmarshal(ar.Data, &tg); err != nil {
 				t.Fatalf("decode wrong tag: %v", err)
 			}
-			wrongTagID = tg.ID
+			id, err := strconv.ParseInt(tg.ID, 10, 64)
+			if err != nil {
+				t.Fatalf("parse wrong tag id %q: %v", tg.ID, err)
+			}
+			wrongTagID = id
 		}
 		var wrongPlain string
 		{
 			status, raw := req(t, http.MethodPost, base+"/api/v1/dev/tokens", devToken, map[string]any{
-				"display_name": "wrong-tag", "tag_id": wrongTagID,
+				"DisplayName": "wrong-tag", "TagID": strconv.FormatInt(wrongTagID, 10),
 			})
 			if status != http.StatusOK {
 				t.Fatalf("create wrong token status=%d body=%s", status, raw)
 			}
 			ar := decodeResp(t, raw)
 			var tk struct {
-				Plain string `json:"plain"`
+				Plain string `json:"Plain"`
 			}
 			if err := json.Unmarshal(ar.Data, &tk); err != nil {
 				t.Fatalf("decode wrong token: %v", err)
@@ -731,7 +816,9 @@ func TestE2E_GatewayBillingLoop(t *testing.T) {
 		}
 		// 调低至 0.001（保留极小余额，避免负数 adjust 需余额充足的问题）
 		path := fmt.Sprintf("/api/v1/admin/users/%d/wallet/adjust", devID)
-		status, raw := req(t, http.MethodPost, base+path, adminToken, map[string]float64{"amount": -(bal - 0.001)})
+		status, raw := req(t, http.MethodPost, base+path, adminToken, map[string]any{
+			"Amount": -(bal - 0.001), "Password": adminNewPassword,
+		})
 		if status != http.StatusOK {
 			t.Fatalf("adjust status=%d body=%s", status, raw)
 		}
@@ -788,31 +875,31 @@ func TestE2E_Security(t *testing.T) {
 
 		// 建 developer 用户（后续 TOTP 绑定/两步登录）
 		status, raw := req(t, http.MethodPost, base+"/api/v1/admin/users", adminToken, map[string]string{
-			"username": "secdev", "password": "Secdev@12345", "role": "DEVELOPER", "pricing_mode": "sale",
+			"Username": "secdev", "Password": "Secdev@12345", "Role": "DEVELOPER", "PricingMode": "sale",
 		})
 		if status != http.StatusOK {
 			t.Fatalf("create secdev status=%d body=%s", status, raw)
 		}
 		ar := decodeResp(t, raw)
 		var u struct {
-			ID int64 `json:"ID"`
+			ID string `json:"ID"`
 		}
 		if err := json.Unmarshal(ar.Data, &u); err != nil {
 			t.Fatalf("decode create secdev: %v", err)
 		}
-		if u.ID == 0 {
+		if u.ID == "" {
 			t.Fatal("create secdev 返回空 ID")
 		}
 
-		// dev 登录 → TOTP setup（拿 base32 secret）
+		// dev 登录 → TOTP setup（拿 base32 secret）；需当前口令二次验证
 		devToken := login(t, base, "secdev", "Secdev@12345")
-		status, raw = req(t, http.MethodPost, base+"/api/v1/auth/me/totp/setup", devToken, nil)
+		status, raw = req(t, http.MethodPost, base+"/api/v1/auth/me/totp/setup", devToken, map[string]string{"Password": "Secdev@12345"})
 		if status != http.StatusOK {
 			t.Fatalf("totp setup status=%d body=%s", status, raw)
 		}
 		ar = decodeResp(t, raw)
 		var st struct {
-			Secret string `json:"secret"`
+			Secret string `json:"Secret"`
 		}
 		if err := json.Unmarshal(ar.Data, &st); err != nil {
 			t.Fatalf("decode totp setup: %v", err)
@@ -821,18 +908,18 @@ func TestE2E_Security(t *testing.T) {
 			t.Fatal("totp secret 为空")
 		}
 
-		// 用 pquerna 生成动态码并 confirm（返回恢复码）
+		// 用 pquerna 生成动态码并 confirm（返回恢复码）；需当前口令二次验证
 		code, err := totp.GenerateCode(st.Secret, time.Now())
 		if err != nil {
 			t.Fatalf("generate totp code: %v", err)
 		}
-		status, raw = req(t, http.MethodPost, base+"/api/v1/auth/me/totp/confirm", devToken, map[string]string{"code": code})
+		status, raw = req(t, http.MethodPost, base+"/api/v1/auth/me/totp/confirm", devToken, map[string]string{"Password": "Secdev@12345", "Code": code})
 		if status != http.StatusOK {
 			t.Fatalf("totp confirm status=%d body=%s", status, raw)
 		}
 		ar = decodeResp(t, raw)
 		var cf struct {
-			RecoveryCodes []string `json:"recovery_codes"`
+			RecoveryCodes []string `json:"RecoveryCodes"`
 		}
 		if err := json.Unmarshal(ar.Data, &cf); err != nil {
 			t.Fatalf("decode totp confirm: %v", err)
@@ -843,15 +930,15 @@ func TestE2E_Security(t *testing.T) {
 
 		// 第一步：密码登录 → need_totp + preauth_token（不发 token）
 		status, raw = req(t, http.MethodPost, base+"/api/v1/auth/login", "", map[string]string{
-			"username": "secdev", "password": "Secdev@12345",
+			"Username": "secdev", "Password": "Secdev@12345",
 		})
 		if status != http.StatusOK {
 			t.Fatalf("two-step login step1 status=%d body=%s", status, raw)
 		}
 		ar = decodeResp(t, raw)
 		var l1 struct {
-			NeedTOTP     bool   `json:"need_totp"`
-			PreAuthToken string `json:"preauth_token"`
+			NeedTOTP     bool   `json:"NeedTOTP"`
+			PreAuthToken string `json:"PreAuthToken"`
 		}
 		if err := json.Unmarshal(ar.Data, &l1); err != nil {
 			t.Fatalf("decode login step1: %v", err)
@@ -866,14 +953,14 @@ func TestE2E_Security(t *testing.T) {
 			t.Fatalf("generate totp code2: %v", err)
 		}
 		status, raw = req(t, http.MethodPost, base+"/api/v1/auth/login/totp", "", map[string]string{
-			"preauth_token": l1.PreAuthToken, "code": code2,
+			"PreAuthToken": l1.PreAuthToken, "Code": code2,
 		})
 		if status != http.StatusOK {
 			t.Fatalf("two-step login step2 status=%d body=%s", status, raw)
 		}
 		ar = decodeResp(t, raw)
 		var l2 struct {
-			Token string `json:"token"`
+			Token string `json:"Token"`
 		}
 		if err := json.Unmarshal(ar.Data, &l2); err != nil {
 			t.Fatalf("decode login step2: %v", err)
@@ -889,20 +976,20 @@ func TestE2E_Security(t *testing.T) {
 		// 恢复码一次性：首次使用成功，再次使用同一恢复码失败。
 		recovery := cf.RecoveryCodes[0]
 		status, raw = req(t, http.MethodPost, base+"/api/v1/auth/login", "", map[string]string{
-			"username": "secdev", "password": "Secdev@12345",
+			"Username": "secdev", "Password": "Secdev@12345",
 		})
 		if status != http.StatusOK {
 			t.Fatalf("recovery login step1 status=%d body=%s", status, raw)
 		}
 		ar = decodeResp(t, raw)
 		var l1b struct {
-			PreAuthToken string `json:"preauth_token"`
+			PreAuthToken string `json:"PreAuthToken"`
 		}
 		if err := json.Unmarshal(ar.Data, &l1b); err != nil {
 			t.Fatalf("decode recovery step1: %v", err)
 		}
 		status, raw = req(t, http.MethodPost, base+"/api/v1/auth/login/totp", "", map[string]string{
-			"preauth_token": l1b.PreAuthToken, "code": recovery,
+			"PreAuthToken": l1b.PreAuthToken, "Code": recovery,
 		})
 		if status != http.StatusOK {
 			t.Fatalf("recovery code first use status=%d body=%s", status, raw)
@@ -911,20 +998,20 @@ func TestE2E_Security(t *testing.T) {
 
 		// 复用同一恢复码 → 401（一次性）
 		status, raw = req(t, http.MethodPost, base+"/api/v1/auth/login", "", map[string]string{
-			"username": "secdev", "password": "Secdev@12345",
+			"Username": "secdev", "Password": "Secdev@12345",
 		})
 		if status != http.StatusOK {
 			t.Fatalf("reuse login step1 status=%d body=%s", status, raw)
 		}
 		ar = decodeResp(t, raw)
 		var l1c struct {
-			PreAuthToken string `json:"preauth_token"`
+			PreAuthToken string `json:"PreAuthToken"`
 		}
 		if err := json.Unmarshal(ar.Data, &l1c); err != nil {
 			t.Fatalf("decode reuse step1: %v", err)
 		}
 		status, raw = req(t, http.MethodPost, base+"/api/v1/auth/login/totp", "", map[string]string{
-			"preauth_token": l1c.PreAuthToken, "code": recovery,
+			"PreAuthToken": l1c.PreAuthToken, "Code": recovery,
 		})
 		if status != http.StatusUnauthorized {
 			t.Fatalf("recovery code reuse should 401, got %d body=%s", status, raw)

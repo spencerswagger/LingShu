@@ -17,7 +17,7 @@ const creditValue = ref<string>('') // 积分价值 V=R/1e6，只读
 const fallbackOpen = ref(false)
 const fallbackSaving = ref(false)
 const fallbackErr = ref<{ message: string; requestId: string }>({ message: '', requestId: '' })
-const fallbackModel = ref<Record<string, any>>({ time_config: null, context_tiers: null })
+const fallbackModel = ref<Record<string, any>>({ TimeConfig: null, ContextTiers: null })
 
 async function load() {
   loading.value = true
@@ -47,14 +47,14 @@ async function onSave() {
     // PUT 三键必传：仅回传 R，时段/分档全局默认保留当前数据库值不动
     const cur = await getBillingConfig()
     await putBillingConfig({
-      r: r.value,
-      cny_rate: cnyRate.value,
-      context_tiers: cur.data.context_tiers || [],
-      time_config: cur.data.time_config || {
-        timezone: 'Asia/Shanghai',
-        default_coeff: 1,
-        periodic_segments: [],
-        date_overrides: [],
+      R: r.value,
+      CnyRate: cnyRate.value,
+      ContextTiers: cur.data.context_tiers || [],
+      TimeConfig: cur.data.time_config || {
+        Timezone: 'Asia/Shanghai',
+        Default: 1,
+        Periodic: [],
+        Overrides: [],
       },
     })
     ElMessage.success('计费配置已更新')
@@ -74,8 +74,8 @@ async function openFallback() {
     const tc = res.data.time_config as any
     const tiers = res.data.context_tiers || []
     fallbackModel.value = {
-      time_config: tc && tc.periodic_segments ? tc : null,
-      context_tiers: tiers.length ? tiers : null,
+      TimeConfig: tc && tc.Periodic ? tc : null,
+      ContextTiers: tiers.length ? tiers : null,
     }
   } catch (e: any) {
     fallbackErr.value = { message: e?.message, requestId: e?.requestId }
@@ -87,14 +87,14 @@ async function saveFallback() {
   fallbackErr.value = { message: '', requestId: '' }
   try {
     await putBillingConfig({
-      r: r.value,
-      cny_rate: cnyRate.value,
-      context_tiers: fallbackModel.value.context_tiers || [],
-      time_config: fallbackModel.value.time_config || {
-        timezone: 'Asia/Shanghai',
-        default_coeff: 1,
-        periodic_segments: [],
-        date_overrides: [],
+      R: r.value,
+      CnyRate: cnyRate.value,
+      ContextTiers: fallbackModel.value.ContextTiers || [],
+      TimeConfig: fallbackModel.value.TimeConfig || {
+        Timezone: 'Asia/Shanghai',
+        Default: 1,
+        Periodic: [],
+        Overrides: [],
       },
     })
     ElMessage.success('全局时段/分档默认值已保存')

@@ -38,39 +38,36 @@ function fmt(n: number | undefined) {
       <template v-else-if="detail">
         <!-- 账单概况 -->
         <el-descriptions :column="2" border>
-          <el-descriptions-item label="账单 ID" :span="2">
-            <span class="mono">{{ detail.billing_id }}</span>
-          </el-descriptions-item>
-          <el-descriptions-item label="时间">{{ detail.call_time }}</el-descriptions-item>
-          <el-descriptions-item label="模型">{{ detail.model }}</el-descriptions-item>
+          <el-descriptions-item label="时间" :span="2">{{ detail.CallTime }}</el-descriptions-item>
+          <el-descriptions-item label="模型">{{ detail.Model }}</el-descriptions-item>
           <el-descriptions-item label="模式">
-            <el-tag :type="detail.pricing_mode === 'cost' ? 'warning' : 'primary'" size="small" effect="plain">
-              {{ detail.pricing_mode === 'cost' ? '按成本' : '按售价' }}
+            <el-tag :type="detail.PricingMode === 'cost' ? 'warning' : 'primary'" size="small" effect="plain">
+              {{ detail.PricingMode === 'cost' ? '按成本' : '按售价' }}
             </el-tag>
           </el-descriptions-item>
-          <el-descriptions-item label="状态"><StatusTag :value="detail.status" /></el-descriptions-item>
+          <el-descriptions-item label="状态"><StatusTag :value="detail.Status" /></el-descriptions-item>
         </el-descriptions>
 
         <!-- 三步决算卡 -->
         <div class="steps">
-          <el-card v-for="(step, i) in detail.steps" :key="i" class="step-card" shadow="never">
+          <el-card v-for="(step, i) in detail.Steps" :key="i" class="step-card" shadow="never">
             <template #header>
               <div class="step-header">
                 <span class="step-no">Step {{ i + 1 }}</span>
-                <span class="step-title">{{ step.title }}</span>
+                <span class="step-title">{{ step.Title }}</span>
               </div>
             </template>
-            <div v-for="(line, j) in step.lines" :key="j" class="step-line">
-              <span class="line-label">{{ line.label }}</span>
-              <span class="line-amount">{{ fmt(line.amount) }}</span>
+            <div v-for="(line, j) in step.Lines" :key="j" class="step-line">
+              <span class="line-label">{{ line.Label }}</span>
+              <span class="line-amount">{{ fmt(line.Amount) }}</span>
             </div>
-            <div v-if="i === 1 && detail.route_diff" class="step-line route-diff">
-              <span class="line-label">{{ detail.route_diff.label }}</span>
-              <span class="line-amount">{{ detail.route_diff.value }}</span>
+            <div v-if="i === 1 && detail.RouteDiff" class="step-line route-diff">
+              <span class="line-label">{{ detail.RouteDiff.Label }}</span>
+              <span class="line-amount">{{ detail.RouteDiff.Value }}</span>
             </div>
             <el-divider content-position="right" style="margin: 8px 0">
               <span class="subtotal">
-                小计 <b>{{ fmt(step.subtotal) }}</b>
+                小计 <b>{{ fmt(step.Subtotal) }}</b>
               </span>
             </el-divider>
           </el-card>
@@ -79,10 +76,10 @@ function fmt(n: number | undefined) {
         <!-- 最终结果 -->
         <div class="result-strip">
           <span>最终应扣积分（≒）</span>
-          <span class="result-value">{{ fmt(detail.credits_consumed) }}</span>
+          <span class="result-value">{{ fmt(detail.CreditsConsumed) }}</span>
         </div>
 
-        <div v-if="detail.pricing_mode === 'cost' && detail.route_diff" class="cost-note">
+        <div v-if="detail.PricingMode === 'cost' && detail.RouteDiff" class="cost-note">
           * 成本模式含路由差异调整，实际扣减与最终积分可能存在差值。
         </div>
       </template>

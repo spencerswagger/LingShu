@@ -2,112 +2,113 @@ import { http, type ApiRes } from './http'
 
 // ===== 统计页（统一仪表盘）聚合接口：admin 全局 / dev 本人，同一响应结构 =====
 
-// 五段 Token 用量
+// 五段 Token 用量（后端 UsageSplit）
 export interface StatsUsageSplit {
-  input: number
-  output: number
-  cache_read: number
-  cache_write: number
-  reasoning: number
+  Input: number
+  Output: number
+  CacheRead: number
+  CacheWrite: number
+  Reasoning: number
 }
 
-// 按天聚合行
+// 按天聚合行（后端 DashDay）
 export interface StatsDaily {
-  date: string
-  calls: number
-  failed: number
-  credits: number
-  tokens: number
-  duration_ms: number
-  success_rate: number // 0~1
+  Date: string // 2006-01-02
+  Calls: number
+  Failed: number
+  Credits: number
+  Tokens: number
+  DurationMS: number
+  SuccessRate: number // 0~1
 }
 
-// 多维度 Top 项
+// 多维度 Top 项（后端 DashTopItem：模型 / 密钥 / 用户 / 模式 / 错误共用）
 export interface StatsTopItem {
-  key: string
-  label: string
-  sub_label: string
-  calls: number
-  failed: number
-  credits: number
-  tokens: number
+  Key: string
+  Label: string
+  SubLabel: string
+  Calls: number
+  Failed: number
+  Credits: number
+  Tokens: number
 }
 
+// 耗时分桶（后端 DashLatencyBucket）
 export interface StatsLatencyBucket {
-  bucket: string
-  count: number
+  Bucket: string
+  Count: number
 }
 
-// 用量块
+// 用量块（后端 DashboardStats）
 export interface StatsUsage {
-  from: string
-  to: string
-  days: number
-  total_tokens: StatsUsageSplit
-  total_credits: number
-  total_requests: number
-  failed_requests: number
-  success_rate: number
-  avg_duration_ms: number
-  p50_duration_ms: number
-  p90_duration_ms: number
-  p95_duration_ms: number
-  avg_first_token_ms: number
-  avg_rpm: number
-  avg_tpm: number
-  daily: StatsDaily[]
-  by_model: StatsTopItem[]
-  by_key: StatsTopItem[]
-  by_user: StatsTopItem[]
-  by_mode: StatsTopItem[]
-  errors: StatsTopItem[]
-  latency: StatsLatencyBucket[]
+  From: string
+  To: string
+  Days: number
+  Total: StatsUsageSplit
+  TotalCred: number
+  TotalCall: number
+  Failed: number
+  Success: number // 0~1
+  AvgMS: number
+  P50MS: number
+  P90MS: number
+  P95MS: number
+  AvgFirst: number
+  AvgRPM: number
+  AvgTPM: number
+  Daily: StatsDaily[]
+  ByModel: StatsTopItem[]
+  ByKey: StatsTopItem[]
+  ByUser: StatsTopItem[]
+  ByMode: StatsTopItem[]
+  Errors: StatsTopItem[]
+  Latency: StatsLatencyBucket[]
 }
 
-// 顶部关键指标
+// 顶部关键指标（后端 statsKPI）
 export interface StatsKPI {
-  total_tokens: number
-  total_credits: number
-  total_requests: number
-  failed_requests: number
-  success_rate: number
-  avg_duration_ms: number
-  avg_first_token_ms: number
-  rpm: number
-  tpm: number
-  delta_tokens: number
-  delta_credits: number
-  delta_requests: number
+  TotalTokens: number
+  TotalCredits: number
+  TotalRequests: number
+  FailedRequests: number
+  SuccessRate: number
+  AvgDurationMS: number
+  AvgFirstTokenMS: number
+  RPM: number
+  TPM: number
+  DeltaTokens: number
+  DeltaCredits: number
+  DeltaRequests: number
 }
 
 export interface StatsCounts {
-  total: number
-  normal: number
-  drain: number
-  disabled: number
+  Total: number
+  Normal: number
+  Drain: number
+  Disabled: number
 }
 
 export interface StatsModelCounts {
-  external_total: number
-  external_enabled: number
-  internal_total: number
-  internal_normal: number
+  ExternalTotal: number
+  ExternalEnabled: number
+  InternalTotal: number
+  InternalNormal: number
 }
 
 // 运维块（仅管理端返回）
 export interface StatsOps {
-  channels: StatsCounts
-  keys: StatsCounts
-  models: StatsModelCounts
+  Channels: StatsCounts
+  Keys: StatsCounts
+  Models: StatsModelCounts
 }
 
 export interface StatsDashboard {
-  scope: string // global | self
-  from: string
-  to: string
-  kpi: StatsKPI
-  usage: StatsUsage
-  ops?: StatsOps
+  Scope: string // global | self
+  From: string
+  To: string
+  KPI: StatsKPI
+  Usage: StatsUsage
+  Ops?: StatsOps
 }
 
 // 按角色选择端点：ADMIN → 全局；其余（DEVELOPER）→ 本人

@@ -19,8 +19,8 @@ const consumeSQL = `UPDATE credit_wallets SET balance = balance - $1, version = 
 
 const getBalanceSQL = `SELECT balance FROM credit_wallets WHERE user_id = $1`
 
-const insertFlowSQL = `INSERT INTO credit_flows(user_id, type, amount, ref_billing_id, session_id, remark)
-		 VALUES($1, $2, $3, $4, $5, $6)
+const insertFlowSQL = `INSERT INTO credit_flows(id, user_id, type, amount, ref_billing_id, session_id, remark)
+		 VALUES($1, $2, $3, $4, $5, $6, $7)
 		 RETURNING id, created_at`
 
 func TestCredit_Consume_Success(t *testing.T) {
@@ -30,14 +30,16 @@ func TestCredit_Consume_Success(t *testing.T) {
 	}
 	defer db.Close()
 
+	mock.ExpectBegin()
 	// 扣减前的 balance=13.5，扣 3.5 → after=10。
 	mock.ExpectQuery(regexp.QuoteMeta(consumeSQL)).
 		WithArgs(3.5, int64(7)).
 		WillReturnRows(sqlmock.NewRows([]string{"balance"}).AddRow(10.0))
 	// consume 流水：amount 为负；携带会话。
 	mock.ExpectQuery(regexp.QuoteMeta(insertFlowSQL)).
-		WithArgs(int64(7), FlowTypeConsume, -3.5, "bill-1", "sess-1", "测试消耗").
+		WithArgs(sqlmock.AnyArg(), int64(7), FlowTypeConsume, -3.5, "bill-1", "sess-1", "测试消耗").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(1), time.Now()))
+	mock.ExpectCommit()
 
 	svc := NewCreditService(NewCreditStore(db))
 	before, after, err := svc.Consume(context.Background(), 7, 3.5, "bill-1", "sess-1", "测试消耗")
@@ -63,6 +65,7 @@ func TestCredit_Consume_Insufficient(t *testing.T) {
 	defer db.Close()
 
 	amount := 10.0
+	mock.ExpectBegin()
 	// UPDATE 影响 0 行（余额不足，未命中 WHERE）。
 	mock.ExpectQuery(regexp.QuoteMeta(consumeSQL)).
 		WithArgs(amount, int64(7)).
@@ -71,6 +74,7 @@ func TestCredit_Consume_Insufficient(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(getBalanceSQL)).
 		WithArgs(int64(7)).
 		WillReturnRows(sqlmock.NewRows([]string{"balance"}).AddRow(5.0))
+	mock.ExpectRollback()
 
 	svc := NewCreditService(NewCreditStore(db))
 	_, _, err = svc.Consume(context.Background(), 7, amount, "bill-2", "", "")
@@ -93,6 +97,7 @@ func TestCredit_Consume_WalletMissing(t *testing.T) {
 	}
 	defer db.Close()
 
+	mock.ExpectBegin()
 	mock.ExpectQuery(regexp.QuoteMeta(consumeSQL)).
 		WithArgs(10.0, int64(7)).
 		WillReturnRows(sqlmock.NewRows([]string{"balance"}))
@@ -100,6 +105,7 @@ func TestCredit_Consume_WalletMissing(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(getBalanceSQL)).
 		WithArgs(int64(7)).
 		WillReturnError(sql.ErrNoRows)
+	mock.ExpectRollback()
 
 	svc := NewCreditService(NewCreditStore(db))
 	_, _, err = svc.Consume(context.Background(), 7, 10.0, "bill-3", "", "")
@@ -118,6 +124,7 @@ func TestCredit_Recharge_Success(t *testing.T) {
 
 	ensureSQL := `INSERT INTO credit_wallets(user_id, balance) VALUES ($1, 0)
 		 ON CONFLICT (user_id) DO NOTHING`
+	mock.ExpectBegin()
 	mock.ExpectExec(regexp.QuoteMeta(ensureSQL)).
 		WithArgs(int64(7)).WillReturnResult(sqlmock.NewResult(0, 1))
 
@@ -126,10 +133,11 @@ func TestCredit_Recharge_Success(t *testing.T) {
 	mock.ExpectExec(regexp.QuoteMeta(changeSQL)).
 		WithArgs(100.0, int64(7)).WillReturnResult(sqlmock.NewResult(0, 1))
 
-	// recharge 流水：ref_billing_id、session_id 为 nil/空。
+	// recharge 流水：ref_billing_id、session_id 为 nil/空；operatorID=1 写入备注前缀。
 	mock.ExpectQuery(regexp.QuoteMeta(insertFlowSQL)).
-		WithArgs(int64(7), FlowTypeRecharge, 100.0, nil, nil, "初始充值").
+		WithArgs(sqlmock.AnyArg(), int64(7), FlowTypeRecharge, 100.0, nil, nil, "操作员#1 初始充值").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(2), time.Now()))
+	mock.ExpectCommit()
 
 	svc := NewCreditService(NewCreditStore(db))
 	if err := svc.Recharge(context.Background(), 7, 1, 100.0, "初始充值"); err != nil {
@@ -181,6 +189,7 @@ func TestCredit_Adjust_Negative_Success(t *testing.T) {
 
 	ensureSQL := `INSERT INTO credit_wallets(user_id, balance) VALUES ($1, 0)
 		 ON CONFLICT (user_id) DO NOTHING`
+	mock.ExpectBegin()
 	mock.ExpectExec(regexp.QuoteMeta(ensureSQL)).
 		WithArgs(int64(7)).WillReturnResult(sqlmock.NewResult(0, 1))
 
@@ -190,8 +199,9 @@ func TestCredit_Adjust_Negative_Success(t *testing.T) {
 		WithArgs(-50.0, int64(7), 50.0).WillReturnResult(sqlmock.NewResult(0, 1))
 
 	mock.ExpectQuery(regexp.QuoteMeta(insertFlowSQL)).
-		WithArgs(int64(7), FlowTypeAdjust, -50.0, nil, nil, "测试调减").
+		WithArgs(sqlmock.AnyArg(), int64(7), FlowTypeAdjust, -50.0, nil, nil, "操作员#1 测试调减").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(3), time.Now()))
+	mock.ExpectCommit()
 
 	svc := NewCreditService(NewCreditStore(db))
 	if err := svc.Adjust(context.Background(), 7, 1, -50.0, "测试调减"); err != nil {
@@ -212,6 +222,7 @@ func TestCredit_Adjust_Negative_Insufficient(t *testing.T) {
 
 	ensureSQL := `INSERT INTO credit_wallets(user_id, balance) VALUES ($1, 0)
 		 ON CONFLICT (user_id) DO NOTHING`
+	mock.ExpectBegin()
 	mock.ExpectExec(regexp.QuoteMeta(ensureSQL)).
 		WithArgs(int64(7)).WillReturnResult(sqlmock.NewResult(0, 1))
 
@@ -219,6 +230,7 @@ func TestCredit_Adjust_Negative_Insufficient(t *testing.T) {
 		 WHERE user_id = $2 AND balance >= $3`
 	mock.ExpectExec(regexp.QuoteMeta(changeSQL)).
 		WithArgs(-100.0, int64(7), 100.0).WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectRollback()
 
 	svc := NewCreditService(NewCreditStore(db))
 	err = svc.Adjust(context.Background(), 7, 1, -100.0, "")

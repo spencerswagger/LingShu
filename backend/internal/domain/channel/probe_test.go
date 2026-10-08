@@ -91,8 +91,8 @@ func TestProbeChain_DrainToHealthy(t *testing.T) {
 }
 
 // insertProbeLogSQL 是 InsertProbeLog 的落库 SQL（密钥维度 channel_key_id，与 0001_init.sql 对齐）。
-const insertProbeLogSQL = `INSERT INTO probe_logs(channel_key_id, model_id, level, target, ok, error, input_tokens, output_tokens, cached_tokens, total_tokens, duration_ms)
-		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`
+const insertProbeLogSQL = `INSERT INTO probe_logs(id, channel_key_id, model_id, level, target, ok, error, input_tokens, output_tokens, cached_tokens, total_tokens, duration_ms)
+		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`
 
 // newKeyProbeTestManager 装载「1 渠道 + 若干内部模型 + cmStore」，返回 Manager 与 sqlmock。
 // keyStore 故意留空（nil）：探测测试不应触碰密钥持久化；探测记录经 cmStore.InsertProbeLog 落 probe_logs。
@@ -171,10 +171,10 @@ func TestKeyProbeOnce_DualKeys_RecordsPerKey(t *testing.T) {
 
 	target := srv.URL + "/chat/completions"
 	mock.ExpectExec(regexp.QuoteMeta(insertProbeLogSQL)).
-		WithArgs(int64(11), "m-default", "model", target, true, "", 3, 4, 0, 7, sqlmock.AnyArg()).
+		WithArgs(sqlmock.AnyArg(), int64(11), "m-default", "model", target, true, "", 3, 4, 0, 7, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectExec(regexp.QuoteMeta(insertProbeLogSQL)).
-		WithArgs(int64(12), "m-default", "model", target, false, "probe http status: 500", 0, 0, 0, 0, sqlmock.AnyArg()).
+		WithArgs(sqlmock.AnyArg(), int64(12), "m-default", "model", target, false, "probe http status: 500", 0, 0, 0, 0, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(2, 1))
 
 	mgr.keyProbeOnce(context.Background(), 11)
@@ -199,7 +199,7 @@ func TestKeyProbeOnce_EmptyCredentialFailsOnlyThatKey(t *testing.T) {
 	addKeyRuntime(t, mgr, 12, "", StateNormal)
 
 	mock.ExpectExec(regexp.QuoteMeta(insertProbeLogSQL)).
-		WithArgs(int64(12), "", "key", "", false, "密钥凭据为空或解密失败，无法探测", 0, 0, 0, 0, sqlmock.AnyArg()).
+		WithArgs(sqlmock.AnyArg(), int64(12), "", "key", "", false, "密钥凭据为空或解密失败，无法探测", 0, 0, 0, 0, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	mgr.keyProbeOnce(context.Background(), 12)
@@ -235,7 +235,7 @@ func TestKeyProbeOnce_AuthFailureDisablesOnlyThatKey(t *testing.T) {
 	addKeyRuntime(t, mgr, 12, testKeyBCred, StateNormal)
 
 	mock.ExpectExec(regexp.QuoteMeta(insertProbeLogSQL)).
-		WithArgs(int64(11), "m1", "model", srv.URL+"/chat/completions", false, sqlmock.AnyArg(), 0, 0, 0, 0, sqlmock.AnyArg()).
+		WithArgs(sqlmock.AnyArg(), int64(11), "m1", "model", srv.URL+"/chat/completions", false, sqlmock.AnyArg(), 0, 0, 0, 0, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	mgr.keyProbeOnce(context.Background(), 11)
@@ -270,7 +270,7 @@ func TestKeyProbeOnce_AllModelsDisabledFailsNoFallback(t *testing.T) {
 	addKeyRuntime(t, mgr, 11, testKeyACred, StateNormal)
 
 	mock.ExpectExec(regexp.QuoteMeta(insertProbeLogSQL)).
-		WithArgs(int64(11), "", "key", "", false, "无可用探测模型（全部禁用或无模型）", 0, 0, 0, 0, sqlmock.AnyArg()).
+		WithArgs(sqlmock.AnyArg(), int64(11), "", "key", "", false, "无可用探测模型（全部禁用或无模型）", 0, 0, 0, 0, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	mgr.keyProbeOnce(context.Background(), 11)
@@ -307,7 +307,7 @@ func TestKeyProbeOnce_ProbeModelTakesPriority(t *testing.T) {
 	addKeyRuntime(t, mgr, 11, testKeyACred, StateNormal)
 
 	mock.ExpectExec(regexp.QuoteMeta(insertProbeLogSQL)).
-		WithArgs(int64(11), "explicit-m", "key", srv.URL+"/chat/completions", true, "", 0, 0, 0, 1, sqlmock.AnyArg()).
+		WithArgs(sqlmock.AnyArg(), int64(11), "explicit-m", "key", srv.URL+"/chat/completions", true, "", 0, 0, 0, 1, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	mgr.keyProbeOnce(context.Background(), 11)
@@ -404,7 +404,7 @@ func TestKeyProbeOnceUnlessDisabled_DisabledKeySkipsProbe(t *testing.T) {
 
 	// 手动恢复 NORMAL：守卫放行，正常探测并落 probe_logs。
 	mock.ExpectExec(regexp.QuoteMeta(insertProbeLogSQL)).
-		WithArgs(int64(11), "m1", "model", srv.URL+"/chat/completions", true, "", 0, 0, 0, 1, sqlmock.AnyArg()).
+		WithArgs(sqlmock.AnyArg(), int64(11), "m1", "model", srv.URL+"/chat/completions", true, "", 0, 0, 0, 1, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	if err := mgr.ManualSetKeyState(11, "recover"); err != nil {

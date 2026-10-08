@@ -19,6 +19,7 @@ import (
 	"github.com/team/llmgateway/internal/domain/audit"
 	"github.com/team/llmgateway/internal/pkg/crypto"
 	"github.com/team/llmgateway/internal/pkg/jwtx"
+	"github.com/team/llmgateway/internal/pkg/ratelimit"
 	"github.com/team/llmgateway/internal/pkg/resp"
 )
 
@@ -221,16 +222,16 @@ func TestService_AdminCreateUser_DuplicateName(t *testing.T) {
 	}
 	defer db.Close()
 
-	insertQuery := `INSERT INTO users(username, password_hash, role, status, pricing_mode, nickname, is_system, must_change_password)
-		 VALUES($1, $2, $3, $4, $5, $6, $7, $8)
+	insertQuery := `INSERT INTO users(id, username, password_hash, role, status, pricing_mode, nickname, is_system, must_change_password)
+		 VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		 RETURNING `
 	mock.ExpectQuery(regexp.QuoteMeta(insertQuery)).
-		WithArgs("dup", sqlmock.AnyArg(), RoleDeveloper, StatusActive, PricingModeSale, "", false, true).
+		WithArgs(sqlmock.AnyArg(), "dup", sqlmock.AnyArg(), RoleDeveloper, StatusActive, PricingModeSale, "", false, true).
 		WillReturnError(&pgconn.PgError{Code: "23505", Message: "duplicate key"})
 
 	svc := NewService(NewStore(db), newTestManager(t))
 
-	_, err = svc.AdminCreateUser(context.Background(), "dup", "pwd", RoleDeveloper, PricingModeSale, "")
+	_, err = svc.AdminCreateUser(context.Background(), "dup", "DupPass@123", RoleDeveloper, PricingModeSale, "")
 	var apiErr *APIError
 	if !asAPIError(err, &apiErr) || apiErr.Code != resp.CodeConflict {
 		t.Fatalf("expected 40901, got %v", err)
@@ -424,6 +425,36 @@ func TestStore_Update_BumpsVersionOnRoleChange(t *testing.T) {
 	if ver != 5 || status != StatusActive || mustChange {
 		t.Fatalf("unexpected return: ver=%d status=%s mustChange=%v", ver, status, mustChange)
 	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("expectations: %v", err)
+	}
+}
+
+// TestVerifyCurrentPassword_RateLimited 二次验证口令尝试应受限流约束：
+// 账号进入锁定后直接返回 429，且不再查库（拦截发生在 PBKDF2 之前，防 CPU 放大）。
+func TestVerifyCurrentPassword_RateLimited(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	svc := NewService(NewStore(db), newTestManager(t))
+	rl := ratelimit.New()
+	svc.SetRateLimiter(rl)
+
+	key := secondFactorKey(9)
+	// 账号维度累计 10 次失败即进入退避锁定（与 IP 无关，故与请求 ip 取值无关）。
+	for i := 0; i < 10; i++ {
+		rl.RecordFailure("1.2.3.4", key)
+	}
+
+	err = svc.VerifyCurrentPassword(context.Background(), 9, "guess")
+	var apiErr *APIError
+	if !asAPIError(err, &apiErr) || apiErr.Code != resp.CodeRateLimited {
+		t.Fatalf("expected %d, got %v", resp.CodeRateLimited, err)
+	}
+	// 限流路径不应触达数据库（本用例未设置任何查询期望）。
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("expectations: %v", err)
 	}

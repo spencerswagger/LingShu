@@ -26,8 +26,8 @@ func TestKeyStoreInsert(t *testing.T) {
 	defer db.Close()
 	ks := NewKeyStore(db)
 
-	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO channel_keys(channel_id, name, credential_enc) VALUES($1,$2,$3) RETURNING id`)).
-		WithArgs(int64(1), "默认", "enc").
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO channel_keys(id, channel_id, name, credential_enc) VALUES($1,$2,$3,$4) RETURNING id`)).
+		WithArgs(sqlmock.AnyArg(), int64(1), "默认", "enc").
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(7)))
 
 	id, err := ks.Insert(context.Background(), ChannelKey{ChannelID: 1, Name: "默认", CredentialEnc: "enc"})
@@ -50,8 +50,8 @@ func TestKeyStoreInsert_UniqueViolation(t *testing.T) {
 	defer db.Close()
 	ks := NewKeyStore(db)
 
-	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO channel_keys(channel_id, name, credential_enc) VALUES($1,$2,$3) RETURNING id`)).
-		WithArgs(int64(1), "默认", "enc").
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO channel_keys(id, channel_id, name, credential_enc) VALUES($1,$2,$3,$4) RETURNING id`)).
+		WithArgs(sqlmock.AnyArg(), int64(1), "默认", "enc").
 		WillReturnError(&pgconn.PgError{Code: "23505"})
 
 	_, err = ks.Insert(context.Background(), ChannelKey{ChannelID: 1, Name: "默认", CredentialEnc: "enc"})
@@ -288,8 +288,8 @@ func TestKeyStoreInsertEvent(t *testing.T) {
 	defer db.Close()
 	ks := NewKeyStore(db)
 
-	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO channel_key_events(channel_key_id, from_state, to_state, reason) VALUES($1,$2,$3,$4)`)).
-		WithArgs(int64(7), "NORMAL", "DISABLED", "auth_failure").WillReturnResult(sqlmock.NewResult(10, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO channel_key_events(id, channel_key_id, from_state, to_state, reason) VALUES($1,$2,$3,$4,$5)`)).
+		WithArgs(sqlmock.AnyArg(), int64(7), "NORMAL", "DISABLED", "auth_failure").WillReturnResult(sqlmock.NewResult(10, 1))
 
 	if err := ks.InsertEvent(context.Background(), 7, StateNormal, StateDisabled, "auth_failure"); err != nil {
 		t.Fatalf("insert event: %v", err)

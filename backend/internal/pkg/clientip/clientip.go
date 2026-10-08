@@ -9,7 +9,7 @@
 package clientip
 
 import (
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -35,7 +35,7 @@ func parseTrustedNets() []*net.IPNet {
 		if _, n, err := net.ParseCIDR(c); err == nil {
 			out = append(out, n)
 		} else {
-			log.Printf("[clientip] 忽略非法的 TRUSTED_PROXY_CIDRS 条目: %q (%v)", c, err)
+			slog.Warn("忽略非法的 TRUSTED_PROXY_CIDRS 条目", "cidr", c, "err", err)
 		}
 	}
 	return out
@@ -49,7 +49,7 @@ func LogTrustedNets() {
 	for _, n := range trustedNets {
 		nets = append(nets, n.String())
 	}
-	log.Printf("[clientip] trusted proxy CIDRs: %v（仅这些对端会采信 X-Real-IP；如代理网段不在此列表，请检查 TRUSTED_PROXY_CIDRS）", nets)
+	slog.Info("trusted proxy CIDRs", "cidrs", nets, "hint", "仅这些对端会采信 X-Real-IP；如代理网段不在此列表，请检查 TRUSTED_PROXY_CIDRS")
 }
 
 var warnOnce sync.Once
@@ -67,8 +67,8 @@ func From(r *http.Request) string {
 	}
 	if raw != "" {
 		warnOnce.Do(func() {
-			log.Printf("[clientip] 对端 %s 不在可信代理网段内但携带了 X-Real-IP，已忽略并使用 TCP 对端地址；"+
-				"限流与审计将基于该地址，请检查 TRUSTED_PROXY_CIDRS 配置", host)
+			slog.Warn("对端不在可信代理网段内但携带了 X-Real-IP，已忽略并使用 TCP 对端地址", "remote", host,
+				"hint", "限流与审计将基于该地址，请检查 TRUSTED_PROXY_CIDRS 配置")
 		})
 	}
 	return host

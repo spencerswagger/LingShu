@@ -12,6 +12,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/team/llmgateway/internal/domain/billing"
+	"github.com/team/llmgateway/internal/pkg/idgen"
 )
 
 // ChannelModel 对应 channel_models 表一行：渠道 + 内部模型ID + 成本定价 + 绑定某对外模型。
@@ -242,10 +243,13 @@ func (s *channelModelStore) Insert(ctx context.Context, m *ChannelModel) (*Chann
 	if m.State == "" {
 		m.State = StateNormal // 新模型默认正常
 	}
+	if m.ID == 0 {
+		m.ID = idgen.New()
+	}
 	row := s.db.QueryRowContext(ctx,
-		`INSERT INTO channel_models(channel_id, internal_model_id, external_model_id, cost_rates, time_config, context_tiers, state, rate_limit, health_probe, reliability)
-		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING `+cmCols,
-		m.ChannelID, m.InternalModelID, m.ExternalModelID, cmJSON(m.CostRates),
+		`INSERT INTO channel_models(id, channel_id, internal_model_id, external_model_id, cost_rates, time_config, context_tiers, state, rate_limit, health_probe, reliability)
+		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING `+cmCols,
+		m.ID, m.ChannelID, m.InternalModelID, m.ExternalModelID, cmJSON(m.CostRates),
 		cmNullableJSON(m.TimeConfig), cmNullableJSON(m.ContextTiers),
 		string(m.State), marshalJSONB(m.RateLimit), marshalJSONB(m.HealthProbe),
 		marshalJSONB(m.Reliability))
@@ -292,10 +296,13 @@ func (s *channelModelStore) UpdateModelState(ctx context.Context, channelID int6
 
 // InsertModelEvent 记录一条内部模型状态流转事件。
 func (s *channelModelStore) InsertModelEvent(ctx context.Context, e *ChannelModelEvent) (*ChannelModelEvent, error) {
+	if e.ID == 0 {
+		e.ID = idgen.New()
+	}
 	row := s.db.QueryRowContext(ctx,
-		`INSERT INTO channel_model_events(channel_id, model_id, from_state, to_state, reason)
-		 VALUES($1,$2,$3,$4,$5) RETURNING `+modelEventCols,
-		e.ChannelID, e.ModelID, string(e.FromState), string(e.ToState), e.Reason)
+		`INSERT INTO channel_model_events(id, channel_id, model_id, from_state, to_state, reason)
+		 VALUES($1,$2,$3,$4,$5,$6) RETURNING `+modelEventCols,
+		e.ID, e.ChannelID, e.ModelID, string(e.FromState), string(e.ToState), e.Reason)
 	var created ChannelModelEvent
 	err := row.Scan(&created.ID, &created.ChannelID, &created.ModelID, &created.FromState,
 		&created.ToState, &created.Reason, &created.CreatedAt)
@@ -328,12 +335,15 @@ func (s *channelModelStore) ListModelEvents(ctx context.Context, channelID int64
 }
 
 // InsertProbeLog 落库一次探测记录（结果 + token 开销 + 层级）。probe_logs 唯一写入口。
-// 注：ProbeLog.ChannelID 字段本阶段暂存 channel_key_id（密钥维度）；列名与 0001_init.sql 对齐。
+// ProbeLog.ChannelKeyID 对应 probe_logs.channel_key_id（密钥维度）。
 func (s *channelModelStore) InsertProbeLog(ctx context.Context, p *ProbeLog) error {
+	if p.ID == 0 {
+		p.ID = idgen.New()
+	}
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO probe_logs(channel_key_id, model_id, level, target, ok, error, input_tokens, output_tokens, cached_tokens, total_tokens, duration_ms)
-		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
-		p.ChannelID, p.ModelID, p.Level, p.Target, p.OK, p.Error,
+		`INSERT INTO probe_logs(id, channel_key_id, model_id, level, target, ok, error, input_tokens, output_tokens, cached_tokens, total_tokens, duration_ms)
+		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+		p.ID, p.ChannelKeyID, p.ModelID, p.Level, p.Target, p.OK, p.Error,
 		p.InputTokens, p.OutputTokens, p.CachedTokens, p.TotalTokens, p.DurationMS)
 	return err
 }
@@ -386,7 +396,7 @@ func (s *channelModelStore) scanProbeLogs(rows interface {
 	list := make([]ProbeLog, 0, 16)
 	for rows.Next() {
 		var p ProbeLog
-		if err := rows.Scan(&p.ID, &p.ChannelID, &p.ModelID, &p.Level, &p.Target, &p.OK, &p.Error,
+		if err := rows.Scan(&p.ID, &p.ChannelKeyID, &p.ModelID, &p.Level, &p.Target, &p.OK, &p.Error,
 			&p.InputTokens, &p.OutputTokens, &p.CachedTokens, &p.TotalTokens, &p.DurationMS, &p.CreatedAt); err != nil {
 			return nil, err
 		}

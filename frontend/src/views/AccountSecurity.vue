@@ -20,13 +20,18 @@ onMounted(async () => {
 })
 
 async function onSetup() {
-  loading.value = true
   try {
-    const res = await totpSetup()
+    const { value: pwd } = await ElMessageBox.prompt('请输入当前登录口令以确认开启', '开启两步验证', {
+      inputType: 'password',
+      inputPlaceholder: '当前口令',
+    })
+    loading.value = true
+    const res = await totpSetup(pwd)
     setupUri.value = res.data.otpauth_uri
     setupSecret.value = res.data.secret
     qrDataUrl.value = await QRCode.toDataURL(res.data.otpauth_uri, { width: 220, margin: 1 })
   } catch (e: any) {
+    if (e === 'cancel' || e === 'close') return
     ElMessage.error(e?.message || '初始化失败')
   } finally {
     loading.value = false
@@ -35,14 +40,19 @@ async function onSetup() {
 
 async function onConfirm() {
   if (!code.value) return
-  loading.value = true
   try {
-    const res = await totpConfirm(code.value)
+    const { value: pwd } = await ElMessageBox.prompt('请输入当前登录口令以确认启用', '确认启用', {
+      inputType: 'password',
+      inputPlaceholder: '当前口令',
+    })
+    loading.value = true
+    const res = await totpConfirm(pwd, code.value)
     recoveryCodes.value = res.data.recovery_codes
     auth.setTotpEnabled(true)
     enabled.value = true
     ElMessage.success('已启用两步验证')
   } catch (e: any) {
+    if (e === 'cancel' || e === 'close') return
     ElMessage.error(e?.message || '验证失败')
   } finally {
     loading.value = false
@@ -51,10 +61,14 @@ async function onConfirm() {
 
 async function onDisable() {
   try {
+    const { value: pwd } = await ElMessageBox.prompt('请输入当前登录口令以确认关闭', '关闭两步验证', {
+      inputType: 'password',
+      inputPlaceholder: '当前口令',
+    })
     const { value } = await ElMessageBox.prompt('请输入当前动态码（或恢复码）以确认关闭', '关闭两步验证', {
       inputPlaceholder: '动态码',
     })
-    await totpDisable(value)
+    await totpDisable(pwd, value)
     auth.setTotpEnabled(false)
     enabled.value = false
     setupUri.value = ''

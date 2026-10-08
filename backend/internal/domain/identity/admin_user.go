@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http"
 
+	"github.com/team/llmgateway/internal/pkg/idgen"
 	"github.com/team/llmgateway/internal/pkg/resp"
 )
 
@@ -62,11 +63,11 @@ func (h *AdminUserHandler) HandleListUsers(w http.ResponseWriter, r *http.Reques
 // HandleCreateUser POST /api/v1/admin/users
 func (h *AdminUserHandler) HandleCreateUser(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Username    string `json:"username"`
-		Password    string `json:"password"`
-		Nickname    string `json:"nickname"`
-		Role        string `json:"role"`
-		PricingMode string `json:"pricing_mode"`
+		Username    string `json:"Username"`
+		Password    string `json:"Password"`
+		Nickname    string `json:"Nickname"`
+		Role        string `json:"Role"`
+		PricingMode string `json:"PricingMode"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "请求体格式错误")
@@ -88,10 +89,10 @@ func (h *AdminUserHandler) HandleUpdateUser(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	var req struct {
-		Role        string `json:"role"`
-		Status      string `json:"status"`
-		PricingMode string `json:"pricing_mode"`
-		Nickname    string `json:"nickname"`
+		Role        string `json:"Role"`
+		Status      string `json:"Status"`
+		PricingMode string `json:"PricingMode"`
+		Nickname    string `json:"Nickname"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "请求体格式错误")
@@ -113,7 +114,7 @@ func (h *AdminUserHandler) HandleResetPassword(w http.ResponseWriter, r *http.Re
 		return
 	}
 	var req struct {
-		Password string `json:"password"`
+		Password string `json:"Password"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "请求体格式错误")
@@ -147,13 +148,13 @@ func (h *AdminUserHandler) HandleResetTOTP(w http.ResponseWriter, r *http.Reques
 // HandleBatchDeleteUsers POST /api/v1/admin/users/batch-delete
 func (h *AdminUserHandler) HandleBatchDeleteUsers(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		IDs []int64 `json:"ids"`
+		IDs idgen.IDs `json:"IDs"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "请求体格式错误")
 		return
 	}
-	n, err := h.svc.BatchDeleteUsers(r.Context(), req.IDs)
+	n, err := h.svc.BatchDeleteUsers(r.Context(), []int64(req.IDs))
 	if err != nil {
 		writeServiceErr(w, r, err)
 		return

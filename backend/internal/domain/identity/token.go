@@ -19,6 +19,7 @@ import (
 
 	"github.com/emmansun/gmsm/sm3"
 	"github.com/team/llmgateway/internal/pkg/crypto"
+	"github.com/team/llmgateway/internal/pkg/idgen"
 	"github.com/team/llmgateway/internal/pkg/resp"
 )
 
@@ -136,11 +137,14 @@ func (s *TokenStore) UserStatus(ctx context.Context, userID int64) (role, status
 
 // CreateToken 插入令牌并回填主键与创建时间。
 func (s *TokenStore) CreateToken(ctx context.Context, t *Token) error {
+	if t.ID == 0 {
+		t.ID = idgen.New()
+	}
 	row := s.db.QueryRowContext(ctx,
-		`INSERT INTO tokens(token_hash, token_display, secret_cipher, user_id, display_name, tag_id, expires_at)
-		 VALUES($1, $2, $3, $4, $5, $6, $7)
+		`INSERT INTO tokens(id, token_hash, token_display, secret_cipher, user_id, display_name, tag_id, expires_at)
+		 VALUES($1, $2, $3, $4, $5, $6, $7, $8)
 		 RETURNING id, created_at`,
-		t.TokenHash, t.TokenDisplay, nullString(t.SecretCipher), t.UserID, t.DisplayName, t.TagID, t.ExpiresAt)
+		t.ID, t.TokenHash, t.TokenDisplay, nullString(t.SecretCipher), t.UserID, t.DisplayName, t.TagID, t.ExpiresAt)
 	var id int64
 	var createdAt time.Time
 	if err := row.Scan(&id, &createdAt); err != nil {
@@ -483,8 +487,9 @@ func (s *TokenService) Toggle(ctx context.Context, userID, tokenID int64) (*Toke
 // TokenHandler 暴露令牌 HTTP 处理器。userIDFrom 从 context 解析当前登录用户
 // （由 server 装配传入，避免 identity 反向依赖 server 造成循环引用）。
 type TokenHandler struct {
-	svc        *TokenService
-	userIDFrom func(ctx context.Context) (int64, bool)
+	svc            *TokenService
+	userIDFrom     func(ctx context.Context) (int64, bool)
+	verifyPassword func(ctx context.Context, userID int64, password string) error
 }
 
 // NewTokenHandler 创建令牌处理器。
@@ -492,18 +497,23 @@ func NewTokenHandler(svc *TokenService, userIDFrom func(ctx context.Context) (in
 	return &TokenHandler{svc: svc, userIDFrom: userIDFrom}
 }
 
+// SetPasswordVerifier 注入当前口令校验（查看明文密钥等高危操作二次验证；nil=跳过校验）。
+func (h *TokenHandler) SetPasswordVerifier(fn func(ctx context.Context, userID int64, password string) error) {
+	h.verifyPassword = fn
+}
+
 type tokenResponse struct {
-	ID           int64      `json:"id"`
-	TokenDisplay string     `json:"token_display,omitempty"`
-	UserID       int64      `json:"user_id,omitempty"`
-	Username     string     `json:"username,omitempty"`
-	UserNickname string     `json:"user_nickname,omitempty"` // 所属用户昵称（为空表示未设置）
-	DisplayName  string     `json:"display_name"`
-	TagID        *int64     `json:"tag_id"`
-	ExpiresAt    *time.Time `json:"expires_at,omitempty"`
-	LastUsedAt   *time.Time `json:"last_used_at,omitempty"`
-	Status       string     `json:"status"`
-	CreatedAt    time.Time  `json:"created_at"`
+	ID           int64      `json:"ID,string"`
+	TokenDisplay string     `json:"TokenDisplay,omitempty"`
+	UserID       int64      `json:"UserID,string,omitempty"`
+	Username     string     `json:"Username,omitempty"`
+	UserNickname string     `json:"UserNickname,omitempty"` // 所属用户昵称（为空表示未设置）
+	DisplayName  string     `json:"DisplayName"`
+	TagID        *int64     `json:"TagID,string"`
+	ExpiresAt    *time.Time `json:"ExpiresAt,omitempty"`
+	LastUsedAt   *time.Time `json:"LastUsedAt,omitempty"`
+	Status       string     `json:"Status"`
+	CreatedAt    time.Time  `json:"CreatedAt"`
 }
 
 func (t *Token) response() tokenResponse {
@@ -529,22 +539,22 @@ func (ti *TokenInfo) response() tokenResponse {
 
 // adminTokenCreateRequest 管理端创建令牌请求体。
 type adminTokenCreateRequest struct {
-	UserID      int64      `json:"user_id"`
-	DisplayName string     `json:"display_name"`
-	TagID       *int64     `json:"tag_id"`
-	ExpiresAt   *time.Time `json:"expires_at"`
+	UserID      int64      `json:"UserID,string"`
+	DisplayName string     `json:"DisplayName"`
+	TagID       *int64     `json:"TagID,string"`
+	ExpiresAt   *time.Time `json:"ExpiresAt"`
 }
 
 // devTokenCreateRequest 开发端创建令牌请求体。
 type devTokenCreateRequest struct {
-	DisplayName string     `json:"display_name"`
-	TagID       *int64     `json:"tag_id"`
-	ExpiresAt   *time.Time `json:"expires_at"`
+	DisplayName string     `json:"DisplayName"`
+	TagID       *int64     `json:"TagID,string"`
+	ExpiresAt   *time.Time `json:"ExpiresAt"`
 }
 
 type createdTokenResponse struct {
-	Plain   string `json:"plain"`
-	Display string `json:"display"`
+	Plain   string `json:"Plain"`
+	Display string `json:"Display"`
 }
 
 // HandleAdminList GET /api/v1/admin/tokens 管理端令牌列表（可选 user_id/status）。
@@ -591,13 +601,13 @@ func (h *TokenHandler) HandleAdminCreate(w http.ResponseWriter, r *http.Request)
 // HandleAdminBatchDelete POST /api/v1/admin/tokens/batch-delete 批量删除令牌。
 func (h *TokenHandler) HandleAdminBatchDelete(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		IDs []int64 `json:"ids"`
+		IDs idgen.IDs `json:"IDs"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "请求体格式错误")
 		return
 	}
-	n, err := h.svc.BatchDelete(r.Context(), req.IDs)
+	n, err := h.svc.BatchDelete(r.Context(), []int64(req.IDs))
 	if err != nil {
 		writeServiceErr(w, r, err)
 		return
@@ -606,11 +616,23 @@ func (h *TokenHandler) HandleAdminBatchDelete(w http.ResponseWriter, r *http.Req
 }
 
 // HandleAdminSecret GET /api/v1/admin/tokens/{id}/secret 管理端查看令牌密钥（可反复复制）。
+// 敏感操作：需当前口令二次验证（X-Current-Password 头），防会话持有者静默查看明文密钥。
 func (h *TokenHandler) HandleAdminSecret(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r)
 	if err != nil {
 		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "ID 参数无效")
 		return
+	}
+	userID, ok := h.userIDFrom(r.Context())
+	if !ok {
+		resp.Err(w, r, http.StatusUnauthorized, resp.CodeUnauthorized, "未登录或登录已过期")
+		return
+	}
+	if h.verifyPassword != nil {
+		if verr := h.verifyPassword(r.Context(), userID, r.Header.Get("X-Current-Password")); verr != nil {
+			writeServiceErr(w, r, verr)
+			return
+		}
 	}
 	plain, err := h.svc.Secret(r.Context(), id)
 	if err != nil {
@@ -682,6 +704,7 @@ func (h *TokenHandler) HandleDevRotate(w http.ResponseWriter, r *http.Request) {
 }
 
 // HandleDevSecret GET /api/v1/dev/tokens/{id}/secret 查看本人令牌密钥（可反复复制）。
+// 敏感操作：需当前口令二次验证（X-Current-Password 头）。
 func (h *TokenHandler) HandleDevSecret(w http.ResponseWriter, r *http.Request) {
 	userID, ok := h.userIDFrom(r.Context())
 	if !ok {
@@ -692,6 +715,12 @@ func (h *TokenHandler) HandleDevSecret(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "ID 参数无效")
 		return
+	}
+	if h.verifyPassword != nil {
+		if verr := h.verifyPassword(r.Context(), userID, r.Header.Get("X-Current-Password")); verr != nil {
+			writeServiceErr(w, r, verr)
+			return
+		}
 	}
 	t, err := h.svc.store.GetByID(r.Context(), id)
 	if err != nil {

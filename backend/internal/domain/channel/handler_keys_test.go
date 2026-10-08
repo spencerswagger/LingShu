@@ -133,15 +133,15 @@ func TestHandler_HandleCreateKey(t *testing.T) {
 		t.Fatalf("encrypt key-c: %v", err)
 	}
 
-	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO channel_keys(channel_id, name, credential_enc) VALUES($1,$2,$3) RETURNING id`)).
-		WithArgs(int64(1), "密钥C", credentialEncMatcher{key: testSM4Key, want: "sk-live-secret"}).
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO channel_keys(id, channel_id, name, credential_enc) VALUES($1,$2,$3,$4) RETURNING id`)).
+		WithArgs(sqlmock.AnyArg(), int64(1), "密钥C", credentialEncMatcher{key: testSM4Key, want: "sk-live-secret"}).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(13)))
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + channelKeyCols + ` FROM channel_keys WHERE id=$1 AND deleted_at IS NULL`)).
 		WithArgs(int64(13)).
 		WillReturnRows(channelKeyRow(&ChannelKey{ID: 13, ChannelID: 1, Name: "密钥C", CredentialEnc: encC, State: StateNormal, CreatedAt: now, UpdatedAt: now}))
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/channels/1/keys", strings.NewReader(`{"name":"密钥C","credential":"sk-live-secret"}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/channels/1/keys", strings.NewReader(`{"Name":"密钥C","Credential":"sk-live-secret"}`))
 	req.SetPathValue("id", "1")
 	h.HandleCreateKey(rec, req)
 
@@ -181,6 +181,9 @@ func TestHandler_HandleUpdateKey(t *testing.T) {
 		t.Fatalf("encrypt key-a: %v", err)
 	}
 
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + channelKeyCols + ` FROM channel_keys WHERE id=$1 AND deleted_at IS NULL`)).
+		WithArgs(int64(11)).
+		WillReturnRows(channelKeyRow(&ChannelKey{ID: 11, ChannelID: 1, Name: "key-a", CredentialEnc: encA, State: StateNormal, CreatedAt: now, UpdatedAt: now}))
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE channel_keys SET name=$1, updated_at=now() WHERE id=$2`)).
 		WithArgs("改名", int64(11)).WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + channelKeyCols + ` FROM channel_keys WHERE id=$1 AND deleted_at IS NULL`)).
@@ -188,7 +191,7 @@ func TestHandler_HandleUpdateKey(t *testing.T) {
 		WillReturnRows(channelKeyRow(&ChannelKey{ID: 11, ChannelID: 1, Name: "改名", CredentialEnc: encA, State: StateNormal, CreatedAt: now, UpdatedAt: now}))
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPut, "/api/v1/admin/channels/1/keys/11", strings.NewReader(`{"name":"改名"}`))
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/admin/channels/1/keys/11", strings.NewReader(`{"Name":"改名"}`))
 	req.SetPathValue("id", "1")
 	req.SetPathValue("kid", "11")
 	h.HandleUpdateKey(rec, req)
@@ -225,6 +228,9 @@ func TestHandler_HandleDeleteKey(t *testing.T) {
 		return 2
 	})
 
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + channelKeyCols + ` FROM channel_keys WHERE id=$1 AND deleted_at IS NULL`)).
+		WithArgs(int64(11)).
+		WillReturnRows(channelKeyRow(&ChannelKey{ID: 11, ChannelID: 1, Name: "key-a", CredentialEnc: "enc", State: StateNormal}))
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE channel_keys SET deleted_at=now() WHERE id=$1`)).
 		WithArgs(int64(11)).WillReturnResult(sqlmock.NewResult(0, 1))
 
@@ -264,6 +270,9 @@ func TestHandler_HandleDeleteKey(t *testing.T) {
 func TestHandler_HandleDeleteKey_NoKillerSkips(t *testing.T) {
 	h, mgr, mock := newHandlerWithKeys(t)
 
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + channelKeyCols + ` FROM channel_keys WHERE id=$1 AND deleted_at IS NULL`)).
+		WithArgs(int64(12)).
+		WillReturnRows(channelKeyRow(&ChannelKey{ID: 12, ChannelID: 1, Name: "key-b", CredentialEnc: "enc", State: StateNormal}))
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE channel_keys SET deleted_at=now() WHERE id=$1`)).
 		WithArgs(int64(12)).WillReturnResult(sqlmock.NewResult(0, 1))
 
@@ -296,16 +305,19 @@ func TestHandler_HandleKeyState(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + channelKeyCols + ` FROM channel_keys WHERE id=$1 AND deleted_at IS NULL`)).
 		WithArgs(int64(11)).
 		WillReturnRows(channelKeyRow(&ChannelKey{ID: 11, ChannelID: 1, Name: "key-a", CredentialEnc: encA, State: StateNormal, CreatedAt: now, UpdatedAt: now}))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + channelKeyCols + ` FROM channel_keys WHERE id=$1 AND deleted_at IS NULL`)).
+		WithArgs(int64(11)).
+		WillReturnRows(channelKeyRow(&ChannelKey{ID: 11, ChannelID: 1, Name: "key-a", CredentialEnc: encA, State: StateNormal, CreatedAt: now, UpdatedAt: now}))
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE channel_keys SET state=$1, last_err=$2, updated_at=now() WHERE id=$3`)).
 		WithArgs(string(StateDisabled), "", int64(11)).WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO channel_key_events(channel_key_id, from_state, to_state, reason) VALUES($1,$2,$3,$4)`)).
-		WithArgs(int64(11), string(StateNormal), string(StateDisabled), reasonManualDisable).WillReturnResult(sqlmock.NewResult(20, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO channel_key_events(id, channel_key_id, from_state, to_state, reason) VALUES($1,$2,$3,$4,$5)`)).
+		WithArgs(sqlmock.AnyArg(), int64(11), string(StateNormal), string(StateDisabled), reasonManualDisable).WillReturnResult(sqlmock.NewResult(20, 1))
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + channelKeyCols + ` FROM channel_keys WHERE id=$1 AND deleted_at IS NULL`)).
 		WithArgs(int64(11)).
 		WillReturnRows(channelKeyRow(&ChannelKey{ID: 11, ChannelID: 1, Name: "key-a", CredentialEnc: encA, State: StateDisabled, CreatedAt: now, UpdatedAt: now}))
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/channels/1/keys/11/state", strings.NewReader(`{"action":"disable"}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/channels/1/keys/11/state", strings.NewReader(`{"Action":"disable"}`))
 	req.SetPathValue("id", "1")
 	req.SetPathValue("kid", "11")
 	h.HandleKeyState(rec, req)
@@ -334,6 +346,9 @@ func TestHandler_HandleListKeyEvents(t *testing.T) {
 	h, _, mock := newHandlerWithKeys(t)
 	now := time.Now()
 
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + channelKeyCols + ` FROM channel_keys WHERE id=$1 AND deleted_at IS NULL`)).
+		WithArgs(int64(11)).
+		WillReturnRows(channelKeyRow(&ChannelKey{ID: 11, ChannelID: 1, Name: "key-a", CredentialEnc: "enc", State: StateNormal}))
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT `+channelKeyEventCols+` FROM channel_key_events WHERE channel_key_id=$1 ORDER BY created_at DESC LIMIT $2`)).
 		WithArgs(int64(11), 50).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "channel_key_id", "from_state", "to_state", "reason", "created_at"}).
@@ -414,7 +429,7 @@ func TestHandler_HandleBatchDelete_KillsKeySessions(t *testing.T) {
 	mock.ExpectCommit()
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/channels/batch-delete", strings.NewReader(`{"ids":[1]}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/channels/batch-delete", strings.NewReader(`{"IDs":[1]}`))
 	h.HandleBatchDelete(rec, req)
 
 	if rec.Code != http.StatusOK {

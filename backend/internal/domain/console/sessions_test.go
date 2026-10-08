@@ -215,19 +215,19 @@ func TestHandleKickSessions(t *testing.T) {
 	}
 
 	// 组合：session_ids（k1 + 不存在）先杀，随后 user_id=1 过滤再杀 k3；k1 不重复计数。
-	if got := post(t, `{"session_ids":["k1","not-exist"],"user_id":1}`); got != 2 {
+	if got := post(t, `{"SessionIDs":["k1","not-exist"],"UserID":"1"}`); got != 2 {
 		t.Fatalf("affected want 2, got %d", got)
 	}
 	// AND：user 1 + token 20 无人同时满足。
-	if got := post(t, `{"user_id":1,"token_id":20}`); got != 0 {
+	if got := post(t, `{"UserID":"1","TokenID":"20"}`); got != 0 {
 		t.Fatalf("AND affected want 0, got %d", got)
 	}
 	// 单维度：渠道密钥 100 + 用户 2。
-	if got := post(t, `{"user_id":2,"channel_key_id":100}`); got != 1 {
+	if got := post(t, `{"UserID":"2","ChannelKeyID":"100"}`); got != 1 {
 		t.Fatalf("affected want 1, got %d", got)
 	}
 	// session_ids 单维度。
-	if got := post(t, `{"session_ids":["k4"]}`); got != 1 {
+	if got := post(t, `{"SessionIDs":["k4"]}`); got != 1 {
 		t.Fatalf("affected want 1, got %d", got)
 	}
 
