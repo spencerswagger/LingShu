@@ -32,7 +32,7 @@ async function load() {
   errInfo.value = { message: '', requestId: '' }
   try {
     const res = await listTags()
-    list.value = res.data || []
+    list.value = res.Data || []
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
   } finally {

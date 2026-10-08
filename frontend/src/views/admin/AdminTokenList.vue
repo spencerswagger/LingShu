@@ -37,13 +37,13 @@ const secretName = ref('')
 async function load() {
   loading.value = true
   errInfo.value = { message: '', requestId: '' }
-  const params: Record<string, unknown> = { page: page.value, size: size.value }
-  if (filters.user_id) params.user_id = filters.user_id
-  if (filters.status) params.status = filters.status
+  const params: Record<string, unknown> = { Page: page.value, Size: size.value }
+  if (filters.user_id) params.UserID = filters.user_id
+  if (filters.status) params.Status = filters.status
   try {
     const res = await listTokens(params)
-    list.value = res.data.list
-    total.value = res.data.total
+    list.value = res.Data.List
+    total.value = res.Data.Total
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
   } finally {
@@ -58,7 +58,7 @@ watch(() => `${filters.user_id}|${filters.status}`, (v, o) => {
 })
 onMounted(() => {
   load()
-  listTags({ enabled: true }).then((r) => (tags.value = (r.data || []).filter((t) => t.Enabled))).catch(() => (tags.value = []))
+  listTags({ Enabled: true }).then((r) => (tags.value = (r.Data || []).filter((t) => t.Enabled))).catch(() => (tags.value = []))
 })
 
 // ---- 新建令牌（弹窗） ----
@@ -82,7 +82,7 @@ async function submitCreate() {
       TagID: createForm.value.TagID,
       ExpiresAt: createForm.value.ExpiresAt,
     })
-    createdPlain.value = res.data
+    createdPlain.value = res.Data
     ElMessage.success('令牌已创建')
     await load()
   } catch (e: any) {
@@ -119,7 +119,7 @@ async function onViewSecret(row: AdminToken) {
   secretPlain.value = null
   try {
     const res = await getTokenSecret(row.ID, pwd)
-    secretPlain.value = res.data
+    secretPlain.value = res.Data
   } catch (e: any) {
     secretPlain.value = null
     ElMessage.error(e?.message || '查看密钥失败')

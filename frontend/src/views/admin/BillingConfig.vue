@@ -24,10 +24,10 @@ async function load() {
   errInfo.value = { message: '', requestId: '' }
   try {
     const res = await getBillingConfig()
-    r.value = typeof res.data.r === 'string' ? Number(res.data.r) : Number(res.data.r)
-    const c = Number(res.data.cny_rate)
+    r.value = typeof res.Data.R === 'string' ? Number(res.Data.R) : Number(res.Data.R)
+    const c = Number(res.Data.CNYRate)
     if (c > 0) cnyRate.value = c
-    const cv = Number(res.data.credit_value)
+    const cv = Number(res.Data.CreditValue)
     if (!isNaN(cv)) creditValue.value = `1 积分 = ¥${cv}（R ÷ 1,000,000）`
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
@@ -49,8 +49,8 @@ async function onSave() {
     await putBillingConfig({
       R: r.value,
       CnyRate: cnyRate.value,
-      ContextTiers: cur.data.context_tiers || [],
-      TimeConfig: cur.data.time_config || {
+      ContextTiers: cur.Data.ContextTiers || [],
+      TimeConfig: cur.Data.TimeConfig || {
         Timezone: 'Asia/Shanghai',
         Default: 1,
         Periodic: [],
@@ -71,8 +71,8 @@ async function openFallback() {
   fallbackErr.value = { message: '', requestId: '' }
   try {
     const res = await getBillingConfig()
-    const tc = res.data.time_config as any
-    const tiers = res.data.context_tiers || []
+    const tc = res.Data.TimeConfig as any
+    const tiers = res.Data.ContextTiers || []
     fallbackModel.value = {
       TimeConfig: tc && tc.Periodic ? tc : null,
       ContextTiers: tiers.length ? tiers : null,

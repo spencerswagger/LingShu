@@ -245,7 +245,7 @@ func TestHandler_HandleDeleteKey(t *testing.T) {
 	}
 	var body struct {
 		Data struct {
-			Affected int `json:"affected"`
+			Affected int `json:"Affected"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {

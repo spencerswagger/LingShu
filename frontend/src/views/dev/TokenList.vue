@@ -39,7 +39,7 @@ const rotateDisplay = ref('')
 async function loadTags() {
   try {
     const res = await listDevTags()
-    const tags: DevTag[] = res.data || []
+    const tags: DevTag[] = res.Data || []
     tagNameMap.value = Object.fromEntries(tags.map((t) => [t.ID, t.Name]))
     tagOptions.value = [
       { value: null, label: '不选择（走默认路由）' },
@@ -60,8 +60,8 @@ async function load() {
   errInfo.value = { message: '', requestId: '' }
   try {
     const res = await listDevTokens(page.value, size.value)
-    list.value = res.data.list
-    total.value = res.data.total
+    list.value = res.Data.List
+    total.value = res.Data.Total
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
   } finally {
@@ -78,8 +78,8 @@ onMounted(() => {
 async function onToggle(row: DevToken) {
   try {
     const res = await toggleDevToken(row.ID)
-    row.Status = res.data.Status
-    ElMessage.success(res.data.Status === 'ACTIVE' ? '已启用' : '已禁用')
+    row.Status = res.Data.Status
+    ElMessage.success(res.Data.Status === 'ACTIVE' ? '已启用' : '已禁用')
   } catch (e: any) {
     ElMessage.error(e?.message || '操作失败')
   }
@@ -89,8 +89,8 @@ async function onToggle(row: DevToken) {
 async function onRotate(row: DevToken) {
   try {
     const res = await rotateDevToken(row.ID)
-    rotatePlain.value = res.data.Plain
-    rotateDisplay.value = res.data.Display
+    rotatePlain.value = res.Data.Plain
+    rotateDisplay.value = res.Data.Display
     rotateDialog.value = true
     await load()
   } catch (e: any) {
@@ -116,7 +116,7 @@ async function onViewSecret(row: DevToken) {
   secretPlain.value = null
   try {
     const res = await getDevTokenSecret(row.ID, pwd)
-    secretPlain.value = res.data
+    secretPlain.value = res.Data
   } catch (e: any) {
     secretPlain.value = null
     ElMessage.error(e?.message || '查看密钥失败')
@@ -143,7 +143,7 @@ async function submitCreate() {
       TagID: createForm.value.TagID,
       ExpiresAt: createForm.value.ExpiresAt,
     })
-    createdPlain.value = res.data
+    createdPlain.value = res.Data
     ElMessage.success('令牌已创建')
     await load()
   } catch (e: any) {

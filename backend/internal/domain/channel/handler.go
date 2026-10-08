@@ -128,8 +128,8 @@ func toInput(req *createChannelRequest) ChannelInput {
 
 // HandleList GET /api/v1/admin/channels
 func (h *Handler) HandleList(w http.ResponseWriter, r *http.Request) {
-	// 可选过滤：?state=NORMAL|DRAIN|DISABLED
-	state := State(r.URL.Query().Get("state"))
+	// 可选过滤：?State=NORMAL|DRAIN|DISABLED
+	state := State(r.URL.Query().Get("State"))
 
 	chs, err := h.svc.ListChannels(r.Context(), state)
 	if err != nil {
@@ -207,7 +207,7 @@ func (h *Handler) HandleBatchDelete(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	resp.OK(w, r, map[string]int64{"deleted": n})
+	resp.OK(w, r, map[string]int64{"Deleted": n})
 }
 
 // HandleListEvents GET /api/v1/admin/channels/{id}/events
@@ -267,7 +267,7 @@ type viewChannelModel struct {
 	InternalModelID string                   `json:"InternalModelID"`
 	ExternalModelID int64                    `json:"ExternalModelID,string"`
 	ExternalName    string                   `json:"ExternalName,omitempty"`
-	CostRates       billing.Rates            `json:"CostRates"`
+	CostRates       billing.WireRates        `json:"CostRates"`
 	TimeConfig      *billing.TimeCoeffConfig `json:"TimeConfig,omitempty"`
 	ContextTiers    []billing.TierRule       `json:"ContextTiers,omitempty"`
 	State           State                    `json:"State"`
@@ -285,7 +285,7 @@ func toChannelModelView(m *ChannelModel) viewChannelModel {
 		InternalModelID: m.InternalModelID,
 		ExternalModelID: m.ExternalModelID,
 		ExternalName:    m.ExternalName,
-		CostRates:       m.CostRates,
+		CostRates:       billing.WireRates(m.CostRates),
 		TimeConfig:      m.TimeConfig,
 		ContextTiers:    m.ContextTiers,
 		State:           m.State,
@@ -300,7 +300,7 @@ func toChannelModelView(m *ChannelModel) viewChannelModel {
 type channelModelRequest struct {
 	InternalModelID string                   `json:"InternalModelID"`
 	ExternalModelID int64                    `json:"ExternalModelID,string"`
-	CostRates       billing.Rates            `json:"CostRates"`
+	CostRates       billing.WireRates        `json:"CostRates"`
 	TimeConfig      *billing.TimeCoeffConfig `json:"TimeConfig"`
 	ContextTiers    []billing.TierRule       `json:"ContextTiers"`
 	RateLimit       *RateLimitConfig         `json:"RateLimit"`
@@ -312,7 +312,7 @@ func (req *channelModelRequest) toInput() ChannelModelInput {
 	return ChannelModelInput{
 		InternalModelID: req.InternalModelID,
 		ExternalModelID: req.ExternalModelID,
-		CostRates:       req.CostRates,
+		CostRates:       billing.Rates(req.CostRates),
 		TimeConfig:      req.TimeConfig,
 		ContextTiers:    req.ContextTiers,
 		RateLimit:       req.RateLimit,
@@ -401,18 +401,18 @@ func (h *Handler) HandleDeleteChannelModel(w http.ResponseWriter, r *http.Reques
 		writeServiceErr(w, r, err)
 		return
 	}
-	resp.OK(w, r, map[string]any{"affected": 1})
+	resp.OK(w, r, map[string]any{"Affected": 1})
 }
 
-// HandleCronPreview GET /api/v1/admin/channels/cron-preview?expr=...&limit=5
+// HandleCronPreview GET /api/v1/admin/channels/cron-preview?Expr=...&Limit=5
 // 依据 6 段 cron 表达式计算后续最近几次执行时间，供前端在编辑时预览校验。
 func (h *Handler) HandleCronPreview(w http.ResponseWriter, r *http.Request) {
-	expr := strings.TrimSpace(r.URL.Query().Get("expr"))
+	expr := strings.TrimSpace(r.URL.Query().Get("Expr"))
 	if expr == "" {
 		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "expr 不能为空")
 		return
 	}
-	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	limit, _ := strconv.Atoi(r.URL.Query().Get("Limit"))
 	if limit <= 0 || limit > 10 {
 		limit = 5
 	}
@@ -431,7 +431,7 @@ func (h *Handler) HandleCronPreview(w http.ResponseWriter, r *http.Request) {
 		times = append(times, next.Format(time.RFC3339))
 		after = next
 	}
-	resp.OK(w, r, map[string]any{"times": times})
+	resp.OK(w, r, map[string]any{"Times": times})
 }
 
 // HandlePullModels POST /api/v1/admin/channels/{id}/models/pull
@@ -450,7 +450,7 @@ func (h *Handler) HandlePullModels(w http.ResponseWriter, r *http.Request) {
 	for _, m := range models {
 		views = append(views, PullModelView{ID: m.ID, Object: m.Object, OwnedBy: m.OwnedBy})
 	}
-	resp.OK(w, r, map[string]any{"list": views})
+	resp.OK(w, r, map[string]any{"List": views})
 }
 
 // HandleModelState PUT/POST /api/v1/admin/channels/{id}/models/{mid}/state
@@ -491,13 +491,13 @@ func (h *Handler) HandleListModelEvents(w http.ResponseWriter, r *http.Request) 
 	resp.OK(w, r, evs)
 }
 
-// HandleListProbeLogs GET /api/v1/admin/channels/{id}/probe-logs?limit=N
+// HandleListProbeLogs GET /api/v1/admin/channels/{id}/probe-logs?Limit=N
 func (h *Handler) HandleListProbeLogs(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathID(w, r)
 	if !ok {
 		return
 	}
-	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	limit, _ := strconv.Atoi(r.URL.Query().Get("Limit"))
 	logs, err := h.svc.ListProbeLogs(r.Context(), id, limit)
 	if err != nil {
 		writeServiceErr(w, r, err)
@@ -723,7 +723,7 @@ func (h *Handler) HandleDeleteKey(w http.ResponseWriter, r *http.Request) {
 	if h.killKeySess != nil {
 		h.killKeySess(kid)
 	}
-	resp.OK(w, r, map[string]any{"affected": 1})
+	resp.OK(w, r, map[string]any{"Affected": 1})
 }
 
 // HandleKeyState POST /api/v1/admin/channels/{id}/keys/{kid}/state  {action:normal|drain|disable|recover}

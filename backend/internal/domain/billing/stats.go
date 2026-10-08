@@ -38,9 +38,9 @@ type DashDay struct {
 
 // DashTopItem 多维度 Top 项（模型 / 渠道密钥 / 用户 / 计费模式 / 错误共用）。
 type DashTopItem struct {
-	Key      string  `json:"Key"`       // 维度键（模型名 / 密钥名 / 用户名 / 模式 / 错误信息）
-	Label    string  `json:"Label"`     // 展示名
-	SubLabel string  `json:"SubLabel"`  // 次级展示（渠道名 / 昵称）
+	Key      string  `json:"Key"`      // 维度键（模型名 / 密钥名 / 用户名 / 模式 / 错误信息）
+	Label    string  `json:"Label"`    // 展示名
+	SubLabel string  `json:"SubLabel"` // 次级展示（渠道名 / 昵称）
 	Calls    int64   `json:"Calls"`
 	Failed   int64   `json:"Failed"`
 	Credits  float64 `json:"Credits"`

@@ -545,7 +545,7 @@ func TestSqlStore_Insert_MarshalError(t *testing.T) {
 // txInsertArgs 组装 insertBill 的完整 24 参数匹配（事务路径用例复用；首参为应用层雪花 ID）。
 func txInsertArgs(credits, before, after float64, status string) []driver.Value {
 	return []driver.Value{
-		sqlmock.AnyArg(),                 // id（应用层雪花 ID）
+		sqlmock.AnyArg(), // id（应用层雪花 ID）
 		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", "int-model", int64(1),
 		sqlmock.AnyArg(),                 // session_id
 		sqlmock.AnyArg(),                 // session_name

@@ -60,7 +60,7 @@ async function loadWallet() {
   errInfo.value = { message: '', requestId: '' }
   try {
     const res = await getDevWallet()
-    balance.value = res.data.balance
+    balance.value = res.Data.Balance
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
   } finally {
@@ -72,8 +72,8 @@ async function loadFlows() {
   flowsLoading.value = true
   try {
     const res = await listDevFlows(page.value, size.value)
-    flows.value = res.data.list
-    total.value = res.data.total
+    flows.value = res.Data.List
+    total.value = res.Data.Total
   } catch {
     flows.value = []
     total.value = 0

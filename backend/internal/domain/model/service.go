@@ -59,7 +59,7 @@ type CatalogEntry struct {
 	ModelID       string  `json:"ModelID"`
 	InputUSD      float64 `json:"InputUSD"` // 美元 / 百万 token
 	OutputUSD     float64 `json:"OutputUSD"`
-	CacheUSD      float64 `json:"CacheUSD"`
+	CacheUSD      float64 `json:"CacheReadUSD"`
 	CacheWriteUSD float64 `json:"CacheWriteUSD"`
 	ReasoningUSD  float64 `json:"ReasoningUSD"`
 }

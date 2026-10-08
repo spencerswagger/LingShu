@@ -72,10 +72,10 @@ async function load() {
   try {
     const { from, to } = resolveRange()
     const res = await getStatsDashboard(auth.role, {
-      from: toRFC3339CN(from),
-      to: toRFC3339CN(to),
+      From: toRFC3339CN(from),
+      To: toRFC3339CN(to),
     })
-    data.value = res.data
+    data.value = res.Data
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
   } finally {
@@ -86,7 +86,7 @@ async function load() {
 async function loadAnnouncements() {
   try {
     const res = isAdmin.value ? await listAnnouncements() : await listDevAnnouncements()
-    announcements.value = (res.data.list || []).filter((a) => a.Enabled).slice(0, 4)
+    announcements.value = (res.Data.List || []).filter((a) => a.Enabled).slice(0, 4)
   } catch {
     announcements.value = []
   }

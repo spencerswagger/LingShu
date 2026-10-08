@@ -26,7 +26,7 @@ type statsKPI struct {
 	AvgFirstTokenMS float64 `json:"AvgFirstTokenMS"`
 	RPM             float64 `json:"RPM"`
 	TPM             float64 `json:"TPM"`
-	DeltaTokens     float64 `json:"DeltaTokens"`   // 环比上期（比例，可为负）
+	DeltaTokens     float64 `json:"DeltaTokens"` // 环比上期（比例，可为负）
 	DeltaCredits    float64 `json:"DeltaCredits"`
 	DeltaRequests   float64 `json:"DeltaRequests"`
 }
@@ -65,9 +65,10 @@ type statsResp struct {
 }
 
 // statsRangeFromQuery 解析 from/to（RFC3339，缺省近 30 天），归一到整天边界，限制跨度 ≤366 天。
+// 日界统一按 Asia/Shanghai 归一（与全站统计口径一致），不随请求自带时区偏移截断。
 func statsRangeFromQuery(q url.Values, now time.Time) (time.Time, time.Time, error) {
 	to := now
-	if v := q.Get("to"); v != "" {
+	if v := q.Get("To"); v != "" {
 		t, err := time.Parse(time.RFC3339, v)
 		if err != nil {
 			return time.Time{}, time.Time{}, errors.New("to 时间格式应为 RFC3339")
@@ -75,7 +76,7 @@ func statsRangeFromQuery(q url.Values, now time.Time) (time.Time, time.Time, err
 		to = t
 	}
 	from := to.AddDate(0, 0, -29) // 近 30 天（含今天）
-	if v := q.Get("from"); v != "" {
+	if v := q.Get("From"); v != "" {
 		t, err := time.Parse(time.RFC3339, v)
 		if err != nil {
 			return time.Time{}, time.Time{}, errors.New("from 时间格式应为 RFC3339")
@@ -88,9 +89,21 @@ func statsRangeFromQuery(q url.Values, now time.Time) (time.Time, time.Time, err
 	if to.Sub(from) > 366*24*time.Hour {
 		return time.Time{}, time.Time{}, errors.New("时间跨度不能超过 366 天")
 	}
-	from = time.Date(from.Year(), from.Month(), from.Day(), 0, 0, 0, 0, from.Location())
-	to = time.Date(to.Year(), to.Month(), to.Day(), 23, 59, 59, 0, to.Location())
+	loc := cnLocation()
+	fromCN := from.In(loc)
+	toCN := to.In(loc)
+	from = time.Date(fromCN.Year(), fromCN.Month(), fromCN.Day(), 0, 0, 0, 0, loc)
+	to = time.Date(toCN.Year(), toCN.Month(), toCN.Day(), 23, 59, 59, 0, loc)
 	return from, to, nil
+}
+
+// cnLocation 返回北京时间时区；加载失败回退进程本地时区（进程时区已在启动时统一为 Asia/Shanghai）。
+func cnLocation() *time.Location {
+	loc, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		return time.Local
+	}
+	return loc
 }
 
 // deltaRatio 环比比例：(cur-prev)/prev；prev<=0 时返回 0。

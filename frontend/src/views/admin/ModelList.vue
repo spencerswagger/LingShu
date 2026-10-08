@@ -43,7 +43,7 @@ async function load() {
   errInfo.value = { message: '', requestId: '' }
   try {
     const res = await listExternalModels()
-    list.value = res.data || []
+    list.value = res.Data || []
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
   } finally {
@@ -121,17 +121,17 @@ async function onSyncPrices() {
   syncing.value = true
   try {
     const res = await syncModelsPrices()
-    const { updated, skipped } = res.data
+    const { Updated, Skipped } = res.Data
     const esc = (s: string) =>
       s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c] as string)
     const lines: string[] = []
-    if (updated.length) {
-      lines.push(`已更新 <b>${updated.length}</b> 个模型的售价：<br/>${updated.map(esc).join('、')}`)
+    if (Updated.length) {
+      lines.push(`已更新 <b>${Updated.length}</b> 个模型的售价：<br/>${Updated.map(esc).join('、')}`)
     } else {
       lines.push('没有模型被更新。')
     }
-    if (skipped.length) {
-      lines.push(`跳过 <b>${skipped.length}</b> 个（models.dev 无参考价）：<br/>${skipped.map(esc).join('、')}`)
+    if (Skipped.length) {
+      lines.push(`跳过 <b>${Skipped.length}</b> 个（models.dev 无参考价）：<br/>${Skipped.map(esc).join('、')}`)
     }
     // 结果常驻弹窗，避免 toast 一闪而过来不及查看同步明细
     try {
@@ -197,21 +197,21 @@ async function onSyncPrices() {
         <el-table-column label="售价·输入" width="110" align="right">
           <template #default="{ row }">
             <el-tooltip :content="ratesDetail(row)" placement="top">
-              <span class="rate-cell">{{ fmtRate(row.SaleRates?.input) }}</span>
+              <span class="rate-cell">{{ fmtRate(row.SaleRates?.Input) }}</span>
             </el-tooltip>
           </template>
         </el-table-column>
         <el-table-column label="售价·输出" width="110" align="right">
           <template #default="{ row }">
             <el-tooltip :content="ratesDetail(row)" placement="top">
-              <span class="rate-cell">{{ fmtRate(row.SaleRates?.output) }}</span>
+              <span class="rate-cell">{{ fmtRate(row.SaleRates?.Output) }}</span>
             </el-tooltip>
           </template>
         </el-table-column>
         <el-table-column label="售价·缓存读" width="120" align="right">
           <template #default="{ row }">
             <el-tooltip :content="ratesDetail(row)" placement="top">
-              <span class="rate-cell">{{ fmtRate(row.SaleRates?.cache_read) }}</span>
+              <span class="rate-cell">{{ fmtRate(row.SaleRates?.CacheRead) }}</span>
             </el-tooltip>
           </template>
         </el-table-column>

@@ -232,13 +232,13 @@ func ProviderModelKey(provider, modelID string) string {
 // PriceEntry 价格目录条目：含供应商维度，供「搜索浏览 models.dev 参考价」使用。
 // 价格均为美元 / 百万 token；cache_read / cache_write / reasoning 来自 models.dev cost 字段。
 type PriceEntry struct {
-	Provider      string  `json:"provider"`
-	ModelID       string  `json:"model_id"`
-	InputUSD      float64 `json:"input_usd"`
-	OutputUSD     float64 `json:"output_usd"`
-	CacheUSD      float64 `json:"cache_read_usd"`
-	CacheWriteUSD float64 `json:"cache_write_usd"`
-	ReasoningUSD  float64 `json:"reasoning_usd"`
+	Provider      string  `json:"Provider"`
+	ModelID       string  `json:"ModelID"`
+	InputUSD      float64 `json:"InputUSD"`
+	OutputUSD     float64 `json:"OutputUSD"`
+	CacheUSD      float64 `json:"CacheReadUSD"`
+	CacheWriteUSD float64 `json:"CacheWriteUSD"`
+	ReasoningUSD  float64 `json:"ReasoningUSD"`
 }
 
 // Recommended 返回某外部模型名（即 models.dev 模型 ID）下最合适的参考价：

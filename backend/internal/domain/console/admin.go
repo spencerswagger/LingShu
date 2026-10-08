@@ -65,32 +65,32 @@ func (h *Admin) SetSessionNameSetter(fn func(ctx context.Context, sessionID, nam
 
 // billingListItem 账单列表项（user_id 仅内部传参用，前端展示一律用 Username）。
 // Tokens 为五段用量；Rates/CoeffTime/CoeffContext/RValue 供前端悬停展示计费公式。
-// Tokens/Rates 为 billing 存储结构（JSONB 契约），内部字段保持 snake_case。
+// Tokens/Rates 对外为 PascalCase 视图（billing.WireUsage/WireRates），存储仍为 snake（JSONB 契约）。
 type billingListItem struct {
-	BillingID       string        `json:"BillingID"`
-	UserID          int64         `json:"UserID,string"`
-	Username        string        `json:"Username,omitempty"`
-	UserNickname    string        `json:"UserNickname,omitempty"` // 昵称（join users；为空表示未设置）
-	TokenName       string        `json:"TokenName,omitempty"`
-	ExternalModel   string        `json:"ExternalModel"`
-	PricingMode     string        `json:"PricingMode"`
-	CreditsConsumed float64       `json:"CreditsConsumed"`
-	Status          string        `json:"Status"`
-	CallTime        time.Time     `json:"CallTime"`
-	InternalModelID string        `json:"InternalModelID"`
-	ChannelKeyID    int64         `json:"ChannelKeyID,string"`
-	KeyName         string        `json:"KeyName,omitempty"` // 密钥名（join channel_keys；缺失时兜底 #<id>）
-	SessionID       string        `json:"SessionID,omitempty"`
-	SessionName     string        `json:"SessionName,omitempty"` // 会话可读名（sessions.name；缺失留空）
-	ChannelName     string        `json:"ChannelName,omitempty"`
-	Tokens          billing.Usage `json:"Tokens"`
-	Rates           billing.Rates `json:"Rates,omitempty"`
-	CoeffTime       float64       `json:"CoeffTime,omitempty"`
-	CoeffContext    float64       `json:"CoeffContext,omitempty"`
-	RValue          int64         `json:"RValue,omitempty"`
-	ErrorMessage    string        `json:"ErrorMessage,omitempty"`
-	DurationMs      *int64        `json:"DurationMs,omitempty"`
-	FirstTokenMs    *int64        `json:"FirstTokenMs,omitempty"`
+	BillingID       string            `json:"BillingID"`
+	UserID          int64             `json:"UserID,string"`
+	Username        string            `json:"Username,omitempty"`
+	UserNickname    string            `json:"UserNickname,omitempty"` // 昵称（join users；为空表示未设置）
+	TokenName       string            `json:"TokenName,omitempty"`
+	ExternalModel   string            `json:"ExternalModel"`
+	PricingMode     string            `json:"PricingMode"`
+	CreditsConsumed float64           `json:"CreditsConsumed"`
+	Status          string            `json:"Status"`
+	CallTime        time.Time         `json:"CallTime"`
+	InternalModelID string            `json:"InternalModelID"`
+	ChannelKeyID    int64             `json:"ChannelKeyID,string"`
+	KeyName         string            `json:"KeyName,omitempty"` // 密钥名（join channel_keys；缺失时兜底 #<id>）
+	SessionID       string            `json:"SessionID,omitempty"`
+	SessionName     string            `json:"SessionName,omitempty"` // 会话可读名（sessions.name；缺失留空）
+	ChannelName     string            `json:"ChannelName,omitempty"`
+	Tokens          billing.WireUsage `json:"Tokens"`
+	Rates           billing.WireRates `json:"Rates,omitempty"`
+	CoeffTime       float64           `json:"CoeffTime,omitempty"`
+	CoeffContext    float64           `json:"CoeffContext,omitempty"`
+	RValue          int64             `json:"RValue,omitempty"`
+	ErrorMessage    string            `json:"ErrorMessage,omitempty"`
+	DurationMs      *int64            `json:"DurationMs,omitempty"`
+	FirstTokenMs    *int64            `json:"FirstTokenMs,omitempty"`
 }
 
 func toListItem(rec *billing.Record) billingListItem {
@@ -105,8 +105,8 @@ func toListItem(rec *billing.Record) billingListItem {
 		InternalModelID: rec.InternalModelID,
 		ChannelKeyID:    rec.ChannelKeyID,
 		SessionID:       rec.SessionID,
-		Tokens:          rec.Tokens,
-		Rates:           rec.Rates,
+		Tokens:          billing.WireUsage(rec.Tokens),
+		Rates:           billing.WireRates(rec.Rates),
 		CoeffTime:       rec.Coefficients.Time,
 		CoeffContext:    rec.Coefficients.Context,
 		RValue:          rec.RValue,
@@ -119,40 +119,40 @@ func toListItem(rec *billing.Record) billingListItem {
 // buildBillingsFilter 解析账单列表/统计共用的查询参数（词法相同，避免两处漂移）。
 func buildBillingsFilter(q url.Values) (billing.RecordFilter, error) {
 	f := billing.RecordFilter{
-		Model:       q.Get("model"),
-		PricingMode: q.Get("pricing_mode"),
-		Status:      q.Get("status"),
-		SessionID:   q.Get("session_id"),
+		Model:       q.Get("Model"),
+		PricingMode: q.Get("PricingMode"),
+		Status:      q.Get("Status"),
+		SessionID:   q.Get("SessionID"),
 	}
-	if v := q.Get("user_id"); v != "" {
+	if v := q.Get("UserID"); v != "" {
 		id, err := strconv.ParseInt(v, 10, 64)
 		if err != nil {
 			return f, errors.New("user_id 必须为数字")
 		}
 		f.UserID = &id
 	}
-	if v := q.Get("token_id"); v != "" {
+	if v := q.Get("TokenID"); v != "" {
 		id, err := strconv.ParseInt(v, 10, 64)
 		if err != nil {
 			return f, errors.New("token_id 必须为数字")
 		}
 		f.TokenID = &id
 	}
-	if v := q.Get("channel_key_id"); v != "" {
+	if v := q.Get("ChannelKeyID"); v != "" {
 		id, err := strconv.ParseInt(v, 10, 64)
 		if err != nil {
 			return f, errors.New("channel_key_id 必须为数字")
 		}
 		f.ChannelKeyID = &id
 	}
-	if v := q.Get("from"); v != "" {
+	if v := q.Get("From"); v != "" {
 		t, err := time.Parse(time.RFC3339, v)
 		if err != nil {
 			return f, errors.New("from 时间格式应为 RFC3339")
 		}
 		f.From = &t
 	}
-	if v := q.Get("to"); v != "" {
+	if v := q.Get("To"); v != "" {
 		t, err := time.Parse(time.RFC3339, v)
 		if err != nil {
 			return f, errors.New("to 时间格式应为 RFC3339")
@@ -170,8 +170,8 @@ func (h *Admin) HandleListBillings(w http.ResponseWriter, r *http.Request) {
 		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, err.Error())
 		return
 	}
-	f.Page = parsePage(q.Get("page"))
-	f.Size = parseSize(q.Get("size"))
+	f.Page = parsePage(q.Get("Page"))
+	f.Size = parseSize(q.Get("Size"))
 	records, total, err := h.billing.ListRecords(r.Context(), f)
 	if err != nil {
 		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "查询账单失败")
@@ -184,7 +184,7 @@ func (h *Admin) HandleListBillings(w http.ResponseWriter, r *http.Request) {
 	if len(list) > 0 {
 		h.decorateList(r.Context(), list, records)
 	}
-	resp.OK(w, r, map[string]any{"list": list, "total": total, "page": f.Page, "size": f.Size})
+	resp.OK(w, r, map[string]any{"List": list, "Total": total, "Page": f.Page, "Size": f.Size})
 }
 
 // HandleBillingsStats GET /api/v1/admin/billings/stats 账单筛选聚合统计（总积分/token/平均 RPM·TPM 基础数据）。
@@ -495,12 +495,13 @@ func (h *Admin) HandleGetBillingConfig(w http.ResponseWriter, r *http.Request) {
 	// credit_value 由 r 派生（R / 1e6，每积分对应人民币元），不落库，解析失败时回退 0。
 	creditV, _ := creditValueFromRaw(rRaw)
 	creditRaw, _ := json.Marshal(creditV)
+	// 数据库配置键（billing.r 等）为存储层契约，保持不变；此处显式映射为对外 PascalCase 键。
 	resp.OK(w, r, map[string]json.RawMessage{
-		"r":             rRaw,
-		"cny_rate":      cnyRaw,
-		"credit_value":  creditRaw,
-		"context_tiers": tiersRaw,
-		"time_config":   timeRaw,
+		"R":            rRaw,
+		"CNYRate":      cnyRaw,
+		"CreditValue":  creditRaw,
+		"ContextTiers": tiersRaw,
+		"TimeConfig":   timeRaw,
 	})
 }
 
@@ -556,7 +557,7 @@ func (h *Admin) HandlePutBillingConfig(w http.ResponseWriter, r *http.Request) {
 		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "更新计费配置失败")
 		return
 	}
-	resp.OK(w, r, map[string]any{"affected": 1})
+	resp.OK(w, r, map[string]any{"Affected": 1})
 }
 
 func validPositiveNumber(b []byte) bool {
@@ -650,32 +651,32 @@ func (h *Admin) HandleListSessions(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	var userID, tokenID, keyID int64
 	var err error
-	if v := q.Get("user_id"); v != "" {
+	if v := q.Get("UserID"); v != "" {
 		userID, err = strconv.ParseInt(v, 10, 64)
 		if err != nil {
 			resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "user_id 必须为数字")
 			return
 		}
 	}
-	if v := q.Get("token_id"); v != "" {
+	if v := q.Get("TokenID"); v != "" {
 		tokenID, err = strconv.ParseInt(v, 10, 64)
 		if err != nil {
 			resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "token_id 必须为数字")
 			return
 		}
 	}
-	if v := q.Get("channel_key_id"); v != "" {
+	if v := q.Get("ChannelKeyID"); v != "" {
 		keyID, err = strconv.ParseInt(v, 10, 64)
 		if err != nil {
 			resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "channel_key_id 必须为数字")
 			return
 		}
 	}
-	prefix := q.Get("q")
-	expiredMode := q.Get("expired")
-	closedMode := q.Get("closed") // "1"=仅已关闭；"0"=仅未关闭（进行中+未过期）；空=不过滤
-	page := parsePage(q.Get("page"))
-	size := parseSize(q.Get("size"))
+	prefix := q.Get("Q")
+	expiredMode := q.Get("Expired")
+	closedMode := q.Get("Closed") // "1"=仅已关闭；"0"=仅未关闭（进行中+未过期）；空=不过滤
+	page := parsePage(q.Get("Page"))
+	size := parseSize(q.Get("Size"))
 
 	all := []*router.Session{}
 	if h.sessions != nil {
@@ -773,7 +774,7 @@ func (h *Admin) HandleListSessions(w http.ResponseWriter, r *http.Request) {
 		item.ChannelKeyName = keyNames[s.ChannelKeyID]
 		list = append(list, item)
 	}
-	resp.OK(w, r, map[string]any{"list": list, "total": total, "page": page, "size": size})
+	resp.OK(w, r, map[string]any{"List": list, "Total": total, "Page": page, "Size": size})
 }
 
 // kickSessionsRequest 踢下线请求体：任一维度非空即执行，多条件并存为 AND（与 B4 KillByFilter 语义一致）。
@@ -799,7 +800,7 @@ func (h *Admin) HandleKickSessions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if h.sessions == nil {
-		resp.OK(w, r, map[string]any{"affected": 0})
+		resp.OK(w, r, map[string]any{"Affected": 0})
 		return
 	}
 	affected := 0
@@ -811,7 +812,7 @@ func (h *Admin) HandleKickSessions(w http.ResponseWriter, r *http.Request) {
 	if req.UserID != 0 || req.TokenID != 0 || req.ChannelKeyID != 0 {
 		affected += h.sessions.CloseByFilter(req.UserID, req.TokenID, req.ChannelKeyID)
 	}
-	resp.OK(w, r, map[string]any{"affected": affected})
+	resp.OK(w, r, map[string]any{"Affected": affected})
 }
 
 // renameSessionRequest 会话改名请求体。
@@ -842,7 +843,7 @@ func (h *Admin) HandleRenameSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if h.sessionSetName == nil {
-		resp.OK(w, r, map[string]any{"updated": false})
+		resp.OK(w, r, map[string]any{"Updated": false})
 		return
 	}
 	if h.sessions != nil {
@@ -856,11 +857,11 @@ func (h *Admin) HandleRenameSession(w http.ResponseWriter, r *http.Request) {
 		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "会话改名失败")
 		return
 	}
-	resp.OK(w, r, map[string]any{"updated": updated})
+	resp.OK(w, r, map[string]any{"Updated": updated})
 }
 
 // sessionNames 批量反查会话可读名：优先用账单行冗余的 session_name 快照
-//（写入时固化，不随 sessions 投影过期清理丢失），缺失的再回查 sessions 表。
+// （写入时固化，不随 sessions 投影过期清理丢失），缺失的再回查 sessions 表。
 func (h *Admin) sessionNames(ctx context.Context, recs []billing.Record) map[string]string {
 	out := make(map[string]string)
 	seen := make(map[string]struct{}, len(recs))

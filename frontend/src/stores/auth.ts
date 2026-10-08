@@ -39,13 +39,13 @@ export const useAuthStore = defineStore('auth', {
       if (!this.token) return
       try {
         const res = await getMe()
-        const u = res.data.user
+        const u = res.Data.User
         this.username = u.Username
         this.role = u.Role
         this.nickname = u.Nickname || ''
         this.mustChangePassword = !!u.MustChangePassword
         this.totpEnabled = !!u.TOTPEnabled
-        this.balance = Number(res.data.balance ?? 0)
+        this.balance = Number(res.Data.Balance ?? 0)
         this.balanceLoaded = true
         localStorage.setItem('role', u.Role)
         localStorage.setItem('username', u.Username)
@@ -59,7 +59,7 @@ export const useAuthStore = defineStore('auth', {
     },
     async changeNickname(nickname: string) {
       const res = await updateMeNickname(nickname)
-      this.nickname = res.data.Nickname || ''
+      this.nickname = res.Data.Nickname || ''
       if (this.nickname) localStorage.setItem('nickname', this.nickname)
       else localStorage.removeItem('nickname')
     },

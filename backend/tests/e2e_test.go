@@ -289,10 +289,13 @@ func buildTestServer(t *testing.T, dsn string) (*httptest.Server, func()) {
 
 // ===== HTTP 辅助 =====
 
+// apiResp 是内部管理/开发端统一响应壳（PascalCase：{Code,Message,RequestID,Data}）。
+// 注意：/v1 OpenAI 兼容面不使用此壳，其成功响应保持小写、错误体为 {"error":{...}}。
 type apiResp struct {
-	Code    int             `json:"code"`
-	Message string          `json:"message"`
-	Data    json.RawMessage `json:"data"`
+	Code      int             `json:"Code"`
+	Message   string          `json:"Message"`
+	RequestID string          `json:"RequestID"`
+	Data      json.RawMessage `json:"Data"`
 }
 
 // rawReq 发送一次请求。token 非空时带 Authorization: Bearer。body 非 nil 时序列化为 JSON。
@@ -622,7 +625,7 @@ func TestE2E_GatewayBillingLoop(t *testing.T) {
 		var tl struct {
 			List []struct {
 				ID string `json:"ID"`
-			} `json:"list"`
+			} `json:"List"`
 		}
 		if err := json.Unmarshal(ar.Data, &tl); err != nil || len(tl.List) == 0 {
 			t.Fatalf("decode dev token list: %v", err)
@@ -694,13 +697,13 @@ func TestE2E_GatewayBillingLoop(t *testing.T) {
 		}
 		ar := decodeResp(t, raw)
 		var d struct {
-			Total int64 `json:"total"`
+			Total int64 `json:"Total"`
 			List  []struct {
 				Status          string  `json:"Status"`
 				CreditsConsumed float64 `json:"CreditsConsumed"`
 				Model           string  `json:"ExternalModel"`
 				PricingMode     string  `json:"PricingMode"`
-			} `json:"list"`
+			} `json:"List"`
 		}
 		if err := json.Unmarshal(ar.Data, &d); err != nil {
 			t.Fatalf("decode billings: %v", err)
@@ -738,7 +741,7 @@ func TestE2E_GatewayBillingLoop(t *testing.T) {
 		}
 		ar := decodeResp(t, raw)
 		var d struct {
-			Balance float64 `json:"balance"`
+			Balance float64 `json:"Balance"`
 		}
 		if err := json.Unmarshal(ar.Data, &d); err != nil {
 			t.Fatalf("decode wallet: %v", err)
@@ -807,7 +810,7 @@ func TestE2E_GatewayBillingLoop(t *testing.T) {
 			}
 			ar := decodeResp(t, raw)
 			var d struct {
-				Balance float64 `json:"balance"`
+				Balance float64 `json:"Balance"`
 			}
 			if err := json.Unmarshal(ar.Data, &d); err != nil {
 				t.Fatalf("decode wallet pre-adjust: %v", err)

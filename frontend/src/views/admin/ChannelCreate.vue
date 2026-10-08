@@ -15,7 +15,7 @@ const tagOptions = ref<{ ID: string; Name: string }[]>([])
 async function loadTags() {
   try {
     const res = await listTags({ enabled: true })
-    tagOptions.value = res.data || []
+    tagOptions.value = res.Data || []
   } catch {
     tagOptions.value = []
   }
@@ -78,7 +78,7 @@ async function refreshCronPreview() {
     }
     try {
       const res = await cronPreview(form.interval, 5)
-      cronFutures.value = res.data?.times || []
+      cronFutures.value = res.Data?.Times || []
     } catch {
       cronFutures.value = []
     }
@@ -128,7 +128,7 @@ async function onSubmit() {
       },
     })
     ElMessage.success('渠道已创建，请先添加密钥')
-    router.push(`/admin/channels/${res.data.ID}`)
+    router.push(`/admin/channels/${res.Data.ID}`)
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
   } finally {

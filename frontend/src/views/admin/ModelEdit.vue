@@ -29,7 +29,7 @@ const form = reactive({
   Enabled: true,
 })
 const pricing = reactive<Record<string, any>>({
-  SaleRates: { input: 0, output: 0, cache_read: 0, cache_write: 0, reasoning: 0 },
+  SaleRates: { Input: 0, Output: 0, CacheRead: 0, CacheWrite: 0, Reasoning: 0 },
   TimeConfig: null,
   ContextTiers: null,
 })
@@ -93,9 +93,9 @@ async function onOpenCatalog() {
   catQ.value = form.ExternalName
   try {
     const res = await getBillingConfig()
-    const v = Number(res.data.r)
+    const v = Number(res.Data.R)
     if (v > 0) catR.value = v
-    const c = Number(res.data.cny_rate)
+    const c = Number(res.Data.CNYRate)
     if (c > 0) catCnyRate.value = c
   } catch {
     /* 保持默认 */
@@ -108,9 +108,9 @@ async function onCatalogSearch() {
   errInfo.value = { message: '', requestId: '' }
   try {
     const res = await priceCatalog(catQ.value)
-    catList.value = res.data.list || []
-    catUpdatedAt.value = res.data.updated_at || ''
-    catTotal.value = res.data.total || 0
+    catList.value = res.Data.List || []
+    catUpdatedAt.value = res.Data.UpdatedAt || ''
+    catTotal.value = res.Data.Total || 0
     selectedEntry.value = null
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
@@ -126,7 +126,7 @@ async function onSyncNow() {
   errInfo.value = { message: '', requestId: '' }
   try {
     const res = await runSync()
-    ElMessage.success(res.data.summary)
+    ElMessage.success(res.Data.Summary)
     await onCatalogSearch()
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
@@ -146,11 +146,11 @@ async function onApplyCatalog() {
     const apply = (k: string, usd: number) => {
       if (usd > 0) next[k] = usdToCnyPerM(usd)
     }
-    apply('input', entry.InputUSD)
-    apply('output', entry.OutputUSD)
-    apply('cache_read', entry.CacheReadUSD)
-    apply('cache_write', entry.CacheWriteUSD)
-    apply('reasoning', entry.ReasoningUSD)
+    apply('Input', entry.InputUSD)
+    apply('Output', entry.OutputUSD)
+    apply('CacheRead', entry.CacheReadUSD)
+    apply('CacheWrite', entry.CacheWriteUSD)
+    apply('Reasoning', entry.ReasoningUSD)
     pricing.SaleRates = next
     catOpen.value = false
     ElMessage.success(`已应用 models.dev 参考价（${entry.Provider}/${entry.ModelID}）到售价可用的价格段`)
@@ -164,7 +164,7 @@ onMounted(async () => {
   errInfo.value = { message: '', requestId: '' }
   try {
     const res = await listExternalModels()
-    const row = (res.data || []).find((m: ExternalModel) => m.ID === id)
+    const row = (res.Data || []).find((m: ExternalModel) => m.ID === id)
     if (!row) {
       ElMessage.error('对外模型不存在')
       router.push('/admin/models')

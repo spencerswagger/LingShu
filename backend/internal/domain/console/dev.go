@@ -42,12 +42,12 @@ func (h *Dev) HandleUsage(w http.ResponseWriter, r *http.Request) {
 	}
 	q := r.URL.Query()
 	days := 30
-	if v := q.Get("days"); v != "" {
+	if v := q.Get("Days"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			days = n
 		}
 	}
-	list, err := h.billing.DailyUsage(r.Context(), userID, days, q.Get("model"))
+	list, err := h.billing.DailyUsage(r.Context(), userID, days, q.Get("Model"))
 	if err != nil {
 		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "查询用量失败")
 		return
@@ -65,9 +65,9 @@ func (h *Dev) HandleUsage(w http.ResponseWriter, r *http.Request) {
 	keys := sortedKeys(filled)
 	for _, k := range keys {
 		v := filled[k]
-		out = append(out, map[string]any{"date": k, "credits": v.Credits, "calls": v.Calls})
+		out = append(out, map[string]any{"Date": k, "Credits": v.Credits, "Calls": v.Calls})
 	}
-	resp.OK(w, r, map[string]any{"list": out, "days": days})
+	resp.OK(w, r, map[string]any{"List": out, "Days": days})
 }
 
 // HandleListBillings GET /api/v1/dev/billings?page=&size= 查询本人账单。
@@ -79,8 +79,8 @@ func (h *Dev) HandleListBillings(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	f := billing.RecordFilter{
 		UserID: &userID,
-		Page:   parsePage(q.Get("page")),
-		Size:   parseSize(q.Get("size")),
+		Page:   parsePage(q.Get("Page")),
+		Size:   parseSize(q.Get("Size")),
 	}
 	records, total, err := h.billing.ListRecords(r.Context(), f)
 	if err != nil {
@@ -91,7 +91,7 @@ func (h *Dev) HandleListBillings(w http.ResponseWriter, r *http.Request) {
 	for i := range records {
 		list = append(list, toListItem(&records[i]))
 	}
-	resp.OK(w, r, map[string]any{"list": list, "total": total, "page": f.Page, "size": f.Size})
+	resp.OK(w, r, map[string]any{"List": list, "Total": total, "Page": f.Page, "Size": f.Size})
 }
 
 // HandleGetBilling GET /api/v1/dev/billings/{billing_id} 本人账单详情（不含内部模型/渠道名）。

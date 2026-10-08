@@ -27,9 +27,9 @@ async function onSetup() {
     })
     loading.value = true
     const res = await totpSetup(pwd)
-    setupUri.value = res.data.otpauth_uri
-    setupSecret.value = res.data.secret
-    qrDataUrl.value = await QRCode.toDataURL(res.data.otpauth_uri, { width: 220, margin: 1 })
+    setupUri.value = res.Data.OtpAuthURI
+    setupSecret.value = res.Data.Secret
+    qrDataUrl.value = await QRCode.toDataURL(res.Data.OtpAuthURI, { width: 220, margin: 1 })
   } catch (e: any) {
     if (e === 'cancel' || e === 'close') return
     ElMessage.error(e?.message || '初始化失败')
@@ -47,7 +47,7 @@ async function onConfirm() {
     })
     loading.value = true
     const res = await totpConfirm(pwd, code.value)
-    recoveryCodes.value = res.data.recovery_codes
+    recoveryCodes.value = res.Data.RecoveryCodes
     auth.setTotpEnabled(true)
     enabled.value = true
     ElMessage.success('已启用两步验证')

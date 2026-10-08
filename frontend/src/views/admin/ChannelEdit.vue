@@ -87,7 +87,7 @@ const tagOptions = ref<{ ID: string; Name: string }[]>([])
 async function loadTags() {
   try {
     const res = await listTags({ enabled: true })
-    tagOptions.value = res.data || []
+    tagOptions.value = res.Data || []
   } catch {
     tagOptions.value = []
   }
@@ -163,7 +163,7 @@ async function refreshCronPreview() {
     }
     try {
       const res = await cronPreview(form.interval, 5)
-      cronFutures.value = res.data?.times || []
+      cronFutures.value = res.Data?.Times || []
     } catch {
       cronFutures.value = []
     }
@@ -180,9 +180,9 @@ async function load() {
   loading.value = true
   errInfo.value = { message: '', requestId: '' }
   try {
-    const [res, cmRes] = await Promise.all([listChannels(), listChannelModels(id).catch(() => ({ data: [] as never[] }))])
-    probeModels.value = (cmRes.data || []).map((m: { InternalModelID: string }) => m.InternalModelID)
-    const row = (res.data || []).find((c: AdminChannel) => c.ID === id)
+    const [res, cmRes] = await Promise.all([listChannels(), listChannelModels(id).catch(() => ({ Data: [] as never[] }))])
+    probeModels.value = (cmRes.Data || []).map((m: { InternalModelID: string }) => m.InternalModelID)
+    const row = (res.Data || []).find((c: AdminChannel) => c.ID === id)
     if (!row) {
       ElMessage.error('渠道不存在')
       router.push('/admin/channels')
@@ -227,20 +227,20 @@ onMounted(load)
 
 async function loadStateData() {
   const [evRes, meRes, plRes] = await Promise.all([
-    listChannelEvents(id).catch(() => ({ data: [] as ChannelEvent[] })),
-    listModelEvents(id).catch(() => ({ data: [] as ChannelModelEvent[] })),
-    listProbeLogs(id, 50).catch(() => ({ data: [] as ProbeLog[] })),
+    listChannelEvents(id).catch(() => ({ Data: [] as ChannelEvent[] })),
+    listModelEvents(id).catch(() => ({ Data: [] as ChannelModelEvent[] })),
+    listProbeLogs(id, 50).catch(() => ({ Data: [] as ProbeLog[] })),
   ])
-  events.value = evRes.data || []
-  modelEvents.value = meRes.data || []
-  probeLogs.value = plRes.data || []
+  events.value = evRes.Data || []
+  modelEvents.value = meRes.Data || []
+  probeLogs.value = plRes.Data || []
 }
 
 async function loadKeys() {
   keysLoading.value = true
   try {
     const res = await listChannelKeys(id)
-    keys.value = res.data || []
+    keys.value = res.Data || []
   } catch (e: any) {
     ElMessage.error(e?.message || '加载渠道密钥失败')
   } finally {
@@ -333,7 +333,7 @@ async function onToggleState(action: 'normal' | 'drain' | 'disable') {
   actionLoading.value = true
   try {
     const res = await channelState(id, action)
-    channel.value = res.data
+    channel.value = res.Data
     ElMessage.success(`已置为 ${label}`)
     await loadStateData()
   } catch (e: any) {

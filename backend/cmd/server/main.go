@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -28,6 +29,7 @@ import (
 	"github.com/team/llmgateway/internal/domain/sync"
 	"github.com/team/llmgateway/internal/domain/tag"
 	"github.com/team/llmgateway/internal/pkg/clientip"
+	"github.com/team/llmgateway/internal/pkg/idgen"
 	"github.com/team/llmgateway/internal/pkg/jwtx"
 	"github.com/team/llmgateway/internal/pkg/logger"
 	"github.com/team/llmgateway/internal/pkg/ratelimit"
@@ -102,6 +104,21 @@ func main() {
 	cfgPath := flag.String("config", "config.yaml", "config file path")
 	migrateOnly := flag.Bool("migrate-only", false, "run migrations and exit")
 	flag.Parse()
+
+	// 雪花 ID 工作节点：多实例部署须为每个实例分配唯一 worker（0~31），否则同毫秒会撞主键。
+	// 未设置时保留默认 0（单实例场景）；越界或非法值 fail-fast 退出。
+	if v := strings.TrimSpace(os.Getenv("IDGEN_WORKER")); v != "" {
+		w, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			slog.Error("IDGEN_WORKER 须为整数", "value", v, "error", err)
+			os.Exit(1)
+		}
+		if err := idgen.SetWorker(w); err != nil {
+			slog.Error("IDGEN_WORKER 越界", "value", v, "error", err)
+			os.Exit(1)
+		}
+		slog.Info("idgen worker 已按 IDGEN_WORKER 设置", "worker", w)
+	}
 
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {

@@ -16,10 +16,10 @@ export interface DevToken {
 
 // 分页结果
 export interface PageResult<T> {
-  list: T[]
-  total: number
-  page: number
-  size: number
+  List: T[]
+  Total: number
+  Page: number
+  Size: number
 }
 
 // 创建/轮换后返回的明文令牌（仅展示一次）
@@ -31,7 +31,7 @@ export interface CreatedToken {
 // 本人令牌列表
 export function listDevTokens(page = 1, size = 20, status = '') {
   return http.get<PageResult<DevToken>, ApiRes<PageResult<DevToken>>>('/dev/tokens', {
-    params: { page, size, status },
+    params: { Page: page, Size: size, Status: status },
   })
 }
 
@@ -64,7 +64,7 @@ export function getDevTokenSecret(id: string, password: string) {
 // 启用中的语义标签（令牌创建时可选；enabled=true 过滤）
 export function listDevTags() {
   return http.get<DevTag[], ApiRes<DevTag[]>>('/dev/tags', {
-    params: { enabled: true },
+    params: { Enabled: true },
   })
 }
 
@@ -82,13 +82,13 @@ export interface DevTag {
 
 // 钱包余额
 export function getDevWallet() {
-  return http.get<{ balance: number }, ApiRes<{ balance: number }>>('/dev/wallet')
+  return http.get<{ Balance: number }, ApiRes<{ Balance: number }>>('/dev/wallet')
 }
 
 // 钱包流水
 export function listDevFlows(page = 1, size = 20) {
   return http.get<PageResult<FlowItem>, ApiRes<PageResult<FlowItem>>>('/dev/wallet/flows', {
-    params: { page, size },
+    params: { Page: page, Size: size },
   })
 }
 
@@ -105,16 +105,16 @@ export interface FlowItem {
 
 // 按日用量
 export function getDevUsage(days = 30) {
-  return http.get<{ list: UsageDay[]; days: number }, ApiRes<{ list: UsageDay[]; days: number }>>(
+  return http.get<{ List: UsageDay[]; Days: number }, ApiRes<{ List: UsageDay[]; Days: number }>>(
     '/dev/usage',
-    { params: { days } },
+    { params: { Days: days } },
   )
 }
 
 export interface UsageDay {
-  date: string // 2006-01-02
-  credits: number
-  calls: number
+  Date: string // 2006-01-02
+  Credits: number
+  Calls: number
 }
 
 // 账单列表项（后端 billingListItem：ExternalModel 为模型字段名）
@@ -131,7 +131,7 @@ export interface BillingItem {
 // 本人账单列表
 export function listDevBillings(page = 1, size = 20) {
   return http.get<PageResult<BillingItem>, ApiRes<PageResult<BillingItem>>>('/dev/billings', {
-    params: { page, size },
+    params: { Page: page, Size: size },
   })
 }
 
@@ -166,7 +166,7 @@ export interface RouteDiff {
 
 // 有效公告（字段名 = Go 字段名）
 export function listDevAnnouncements() {
-  return http.get<{ list: DevAnnouncement[] }, ApiRes<{ list: DevAnnouncement[] }>>(
+  return http.get<{ List: DevAnnouncement[] }, ApiRes<{ List: DevAnnouncement[] }>>(
     '/dev/announcements',
   )
 }

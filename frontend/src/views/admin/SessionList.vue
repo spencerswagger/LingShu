@@ -62,18 +62,18 @@ async function saveRename(row: AdminSession) {
 async function load() {
   loading.value = true
   errInfo.value = { message: '', requestId: '' }
-  const params: Record<string, any> = { page: page.value, size: size.value }
-  if (filters.q.trim()) params.q = filters.q.trim()
-  if (filters.user_id) params.user_id = filters.user_id
-  if (filters.token_id && filters.token_id.trim()) params.token_id = filters.token_id.trim()
-  if (filters.channel_key_id && filters.channel_key_id.trim()) params.channel_key_id = filters.channel_key_id.trim()
-  if (filters.status === 'active') params.expired = 'active'
-  if (filters.status === 'expired') params.expired = 'expired'
-  if (filters.status === 'closed') params.closed = '1'
+  const params: Record<string, any> = { Page: page.value, Size: size.value }
+  if (filters.q.trim()) params.Q = filters.q.trim()
+  if (filters.user_id) params.UserID = filters.user_id
+  if (filters.token_id && filters.token_id.trim()) params.TokenID = filters.token_id.trim()
+  if (filters.channel_key_id && filters.channel_key_id.trim()) params.ChannelKeyID = filters.channel_key_id.trim()
+  if (filters.status === 'active') params.Expired = 'active'
+  if (filters.status === 'expired') params.Expired = 'expired'
+  if (filters.status === 'closed') params.Closed = '1'
   try {
     const res = await listSessions(params)
-    list.value = res.data.list || []
-    total.value = res.data.total || 0
+    list.value = res.Data.List || []
+    total.value = res.Data.Total || 0
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
   } finally {
@@ -106,7 +106,7 @@ async function close(ids: string[], label: string) {
   }
   try {
     const res = await kickSessions({ SessionIDs: ids })
-    ElMessage.success(`已关闭 ${res.data.affected} 个会话`)
+    ElMessage.success(`已关闭 ${res.Data.Affected} 个会话`)
     selected.value = []
     await load()
   } catch (e: any) {

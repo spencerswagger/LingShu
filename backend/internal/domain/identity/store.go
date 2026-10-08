@@ -30,7 +30,7 @@ const (
 type User struct {
 	ID           int64     `json:"ID,string"`
 	Username     string    `json:"Username"`
-	PasswordHash string    `json:"-"` // 永不外发（PBKDF2 存储值，靠 json:"-" 从序列化层杜绝泄露）
+	PasswordHash string    `json:"-"`        // 永不外发（PBKDF2 存储值，靠 json:"-" 从序列化层杜绝泄露）
 	Nickname     string    `json:"Nickname"` // 展示用昵称，可为空
 	Role         string    `json:"Role"`
 	Status       string    `json:"Status"`
@@ -40,7 +40,7 @@ type User struct {
 	UpdatedAt    time.Time `json:"UpdatedAt"`
 	// 安全字段（API 响应可见，均非敏感密文）。
 	MustChangePassword bool `json:"MustChangePassword"`
-	TokenVersion       int  `json:"-"` // 会话代数，无需外发
+	TokenVersion       int  `json:"-"`           // 会话代数，无需外发
 	TOTPEnabled        bool `json:"TOTPEnabled"` // 前端账号安全页展示 2FA 状态用
 	// 查询聚合字段（非表列）：余额与累计消费（completed 账单求和），List 时填充。
 	Balance    float64 `json:"Balance,omitempty"`

@@ -114,7 +114,7 @@ export interface StatsDashboard {
 // 按角色选择端点：ADMIN → 全局；其余（DEVELOPER）→ 本人
 export function getStatsDashboard(
   role: string,
-  params: { from?: string; to?: string } = {},
+  params: { From?: string; To?: string } = {},
 ): Promise<ApiRes<StatsDashboard>> {
   const path = role === 'ADMIN' ? '/admin/stats/dashboard' : '/dev/stats/dashboard'
   return http.get<StatsDashboard, ApiRes<StatsDashboard>>(path, { params })

@@ -32,7 +32,7 @@ onMounted(async () => {
   }
   try {
     const res = await getBillingConfig()
-    const v = Number(res.data.r)
+    const v = Number(res.Data.R)
     if (v > 0) r.value = v
   } catch {
     /* 保持默认 */
