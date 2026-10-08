@@ -81,7 +81,7 @@ async function loadFlows() {
 async function loadTokens() {
   tokenLoading.value = true
   try {
-    const res = await listTokens({ user_id: id, page: tokenPage.value, size: tokenSize.value })
+    const res = await listTokens({ UserID: id, Page: tokenPage.value, Size: tokenSize.value })
     tokens.value = res.Data.List
     tokenTotal.value = res.Data.Total
   } catch {

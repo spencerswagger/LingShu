@@ -65,14 +65,14 @@ func newHandlerWithKeys(t *testing.T) (*Handler, *Manager, sqlmock.Sqlmock) {
 
 // keysListResponse 列表端点的响应结构（Data 为数组）。
 type keysListResponse struct {
-	Code int              `json:"code"`
-	Data []viewChannelKey `json:"data"`
+	Code int              `json:"Code"`
+	Data []viewChannelKey `json:"Data"`
 }
 
 // keysItemResponse 单对象端点（创建/更新/切状态）的响应结构（Data 为对象）。
 type keysItemResponse struct {
-	Code int            `json:"code"`
-	Data viewChannelKey `json:"data"`
+	Code int            `json:"Code"`
+	Data viewChannelKey `json:"Data"`
 }
 
 // TestHandler_HandleListKeys 断言列表 = keySvc.List + manager.KeyViews 聚合
@@ -246,7 +246,7 @@ func TestHandler_HandleDeleteKey(t *testing.T) {
 	var body struct {
 		Data struct {
 			Affected int `json:"Affected"`
-		} `json:"data"`
+		} `json:"Data"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("unmarshal: %v", err)

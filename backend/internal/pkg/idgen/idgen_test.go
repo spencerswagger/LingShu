@@ -36,6 +36,40 @@ func TestNew_DefaultSingleton(t *testing.T) {
 	}
 }
 
+// TestNewGenerator_WorkerIDBounds 断言 workerID 越界（-1、maxWorker+1）fail-fast 返回 error，
+// 合法边界（0、maxWorker）成功（不再静默回退 0：静默回退会让多实例撞主键）。
+func TestNewGenerator_WorkerIDBounds(t *testing.T) {
+	for _, worker := range []int64{0, maxWorker} {
+		g, err := NewGenerator(worker)
+		if err != nil {
+			t.Fatalf("NewGenerator(%d) 合法边界应成功: %v", worker, err)
+		}
+		if g.workerID != worker {
+			t.Fatalf("NewGenerator(%d) workerID=%d", worker, g.workerID)
+		}
+	}
+	for _, worker := range []int64{-1, maxWorker + 1} {
+		if g, err := NewGenerator(worker); err == nil {
+			t.Fatalf("NewGenerator(%d) 越界应返回 error，实际 g=%+v", worker, g)
+		}
+	}
+}
+
+// TestSetWorker_Bounds 断言 SetWorker 越界返回 error，合法边界（0、maxWorker）成功。
+func TestSetWorker_Bounds(t *testing.T) {
+	t.Cleanup(func() { _ = SetWorker(0) }) // 还原默认单例，避免污染同包其它用例
+	for _, worker := range []int64{-1, maxWorker + 1} {
+		if err := SetWorker(worker); err == nil {
+			t.Fatalf("SetWorker(%d) 越界应返回 error", worker)
+		}
+	}
+	for _, worker := range []int64{0, maxWorker} {
+		if err := SetWorker(worker); err != nil {
+			t.Fatalf("SetWorker(%d) 合法边界应成功: %v", worker, err)
+		}
+	}
+}
+
 // TestGenerator_ClockRollback_NoBlockNoDuplicate 模拟时钟大幅回拨：
 // 逻辑时间戳被推到未来，Next() 不得忙等阻塞，且仍须正数、唯一、单调递增。
 func TestGenerator_ClockRollback_NoBlockNoDuplicate(t *testing.T) {

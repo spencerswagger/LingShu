@@ -14,7 +14,7 @@ const errInfo = ref<{ message: string; requestId: string }>({ message: '', reque
 const tagOptions = ref<{ ID: string; Name: string }[]>([])
 async function loadTags() {
   try {
-    const res = await listTags({ enabled: true })
+    const res = await listTags({ Enabled: true })
     tagOptions.value = res.Data || []
   } catch {
     tagOptions.value = []
