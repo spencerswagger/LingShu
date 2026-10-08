@@ -30,10 +30,10 @@ func (m credentialEncMatcher) Match(v driver.Value) bool {
 }
 
 const (
-	keyInsertSQL = `INSERT INTO channel_keys(channel_id, name, credential_enc) VALUES($1,$2,$3) RETURNING id`
+	keyInsertSQL = `INSERT INTO channel_keys(id, channel_id, name, credential_enc) VALUES($1,$2,$3,$4) RETURNING id`
 	keyGetSQL    = `SELECT ` + channelKeyCols + ` FROM channel_keys WHERE id=$1 AND deleted_at IS NULL`
 	keySetSQL    = `UPDATE channel_keys SET state=$1, last_err=$2, updated_at=now() WHERE id=$3`
-	keyEventSQL  = `INSERT INTO channel_key_events(channel_key_id, from_state, to_state, reason) VALUES($1,$2,$3,$4)`
+	keyEventSQL  = `INSERT INTO channel_key_events(id, channel_key_id, from_state, to_state, reason) VALUES($1,$2,$3,$4,$5)`
 )
 
 func TestKeyService_Create_EncryptAndInsert(t *testing.T) {
@@ -46,7 +46,7 @@ func TestKeyService_Create_EncryptAndInsert(t *testing.T) {
 
 	now := time.Now()
 	mock.ExpectQuery(regexp.QuoteMeta(keyInsertSQL)).
-		WithArgs(int64(1), "主", credentialEncMatcher{key: testSM4Key, want: "sk-secret"}).
+		WithArgs(sqlmock.AnyArg(), int64(1), "主", credentialEncMatcher{key: testSM4Key, want: "sk-secret"}).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(7)))
 
 	mock.ExpectQuery(regexp.QuoteMeta(keyGetSQL)).
@@ -97,7 +97,7 @@ func TestKeyService_Create_UniqueConflict(t *testing.T) {
 	svc := NewKeyService(NewKeyStore(db), testSM4Key)
 
 	mock.ExpectQuery(regexp.QuoteMeta(keyInsertSQL)).
-		WithArgs(int64(1), "主", sqlmock.AnyArg()).
+		WithArgs(sqlmock.AnyArg(), int64(1), "主", sqlmock.AnyArg()).
 		WillReturnError(&pgconn.PgError{Code: "23505"})
 
 	_, err = svc.Create(context.Background(), 1, "主", "sk-secret")
@@ -276,7 +276,7 @@ func TestKeyService_ForceState(t *testing.T) {
 			mock.ExpectExec(regexp.QuoteMeta(keySetSQL)).
 				WithArgs(string(tc.to), "", int64(7)).WillReturnResult(sqlmock.NewResult(0, 1))
 			mock.ExpectExec(regexp.QuoteMeta(keyEventSQL)).
-				WithArgs(int64(7), string(tc.from), string(tc.to), tc.reason).
+				WithArgs(sqlmock.AnyArg(), int64(7), string(tc.from), string(tc.to), tc.reason).
 				WillReturnResult(sqlmock.NewResult(10, 1))
 			mock.ExpectQuery(regexp.QuoteMeta(keyGetSQL)).
 				WithArgs(int64(7)).

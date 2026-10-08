@@ -11,7 +11,7 @@ const activeTab = ref('base')
 const saving = ref(false)
 const errInfo = ref<{ message: string; requestId: string }>({ message: '', requestId: '' })
 
-const tagOptions = ref<{ ID: number; Name: string }[]>([])
+const tagOptions = ref<{ ID: string; Name: string }[]>([])
 async function loadTags() {
   try {
     const res = await listTags({ enabled: true })
@@ -41,7 +41,7 @@ const form = reactive({
   name: '',
   protocol: 'openai-compat',
   base_url: '',
-  tag_ids: [] as number[],
+  tag_ids: [] as string[],
   priority: 100,
   weight: 1,
   session_ttl_minutes: 60,
@@ -94,37 +94,37 @@ async function onSubmit() {
   errInfo.value = { message: '', requestId: '' }
   try {
     const res = await createChannel({
-      name: form.name.trim(),
-      protocol: form.protocol,
-      base_url: form.base_url.trim(),
-      tag_ids: form.tag_ids,
-      priority: form.priority,
-      weight: Number(form.weight) || 1,
-      session_ttl_minutes: Number(form.session_ttl_minutes) || 60,
-      rate_limit: {
-        rpm: Number(form.rpm),
-        tpm: tpmRaw(),
-        burst_multiplier: Number(form.burst_multiplier),
-        on_exceed: form.on_exceed,
-        queue_size: 100,
-        queue_timeout_ms: Number(form.queue_timeout_ms),
-        max_concurrent: Number(form.max_concurrent),
+      Name: form.name.trim(),
+      Protocol: form.protocol,
+      BaseURL: form.base_url.trim(),
+      TagIDs: form.tag_ids,
+      Priority: form.priority,
+      Weight: Number(form.weight) || 1,
+      SessionTTLMinutes: Number(form.session_ttl_minutes) || 60,
+      RateLimit: {
+        RPM: Number(form.rpm),
+        TPM: tpmRaw(),
+        BurstMultiplier: Number(form.burst_multiplier),
+        OnExceed: form.on_exceed,
+        QueueSize: 100,
+        QueueTimeoutMS: Number(form.queue_timeout_ms),
+        MaxConcurrent: Number(form.max_concurrent),
       },
-      health_probe: {
-        interval: form.interval || '0 * * * * *',
-        drain_interval_seconds: Number(form.drain_interval_seconds),
-        timeout_ms: Number(form.timeout_ms),
-        fail_threshold: Number(form.fail_threshold),
-        recovery_threshold: Number(form.recovery_threshold),
-        probe_model: form.probe_model,
+      HealthProbe: {
+        Interval: form.interval || '0 * * * * *',
+        DrainIntervalSeconds: Number(form.drain_interval_seconds),
+        TimeoutMS: Number(form.timeout_ms),
+        FailThreshold: Number(form.fail_threshold),
+        RecoveryThreshold: Number(form.recovery_threshold),
+        ProbeModel: form.probe_model,
       },
-      reliability: {
-        window_seconds: Number(form.window_seconds),
-        min_samples: Number(form.min_samples),
-        error_rate_pct: Number(form.error_rate_pct),
-        rate_429_pct: Number(form.rate_429_pct),
-        p99_latency_ms: Number(form.p99_latency_ms),
-        auth_fail_threshold: Number(form.auth_fail_threshold),
+      Reliability: {
+        WindowSeconds: Number(form.window_seconds),
+        MinSamples: Number(form.min_samples),
+        ErrorRatePct: Number(form.error_rate_pct),
+        Rate429Pct: Number(form.rate_429_pct),
+        P99LatencyMS: Number(form.p99_latency_ms),
+        AuthFailThreshold: Number(form.auth_fail_threshold),
       },
     })
     ElMessage.success('渠道已创建，请先添加密钥')

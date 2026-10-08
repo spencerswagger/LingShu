@@ -2,15 +2,19 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
+	"io"
 	"log/slog"
 	"net/http"
 	"regexp"
 	"runtime/debug"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/team/llmgateway/internal/domain/audit"
 	"github.com/team/llmgateway/internal/pkg/clientip"
@@ -181,16 +185,20 @@ func WithAuth(mgr *jwtx.Manager, sess *session.Registry, roles ...string) func(h
 				resp.Err(w, r, http.StatusForbidden, resp.CodeForbidden, "无权访问该资源")
 				return
 			}
-			if sess != nil {
-				mustChange, serr := sess.Check(r.Context(), userID, claims.Ver)
-				if serr != nil {
-					resp.Err(w, r, http.StatusUnauthorized, resp.CodeUnauthorized, "登录凭证无效或已过期")
-					return
-				}
-				if mustChange && !allowedWhileMustChange(r) {
-					resp.Err(w, r, http.StatusForbidden, resp.CodeMustChangePassword, "请先修改默认密码")
-					return
-				}
+			// fail-closed：会话注册表是 ver/status 吊销校验的依赖，缺失时必须拒绝而非静默放行，
+			// 否则禁用/删除用户的令牌会在仅剩签名校验的情况下继续有效。
+			if sess == nil {
+				resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "服务器内部错误")
+				return
+			}
+			mustChange, serr := sess.Check(r.Context(), userID, claims.Ver)
+			if serr != nil {
+				resp.Err(w, r, http.StatusUnauthorized, resp.CodeUnauthorized, "登录凭证无效或已过期")
+				return
+			}
+			if mustChange && !allowedWhileMustChange(r) {
+				resp.Err(w, r, http.StatusForbidden, resp.CodeMustChangePassword, "请先修改默认密码")
+				return
 			}
 			ctx := context.WithValue(r.Context(), keyUserID, userID)
 			ctx = context.WithValue(ctx, keyUsername, claims.Username)
@@ -227,33 +235,28 @@ func roleAllowed(role string, roles []string) bool {
 
 // WithAudit 记录管理端「写操作」请求审计（method + path + 操作者 + request_id + 可信 IP）。
 // 须包在 WithAuth 内层以取得 user 上下文；target_type/target_id 从路径解析。
-// 只记写操作（POST/PUT/PATCH/DELETE）——读操作留痕噪声大且无追责价值。
+// 只记写操作（POST/PUT/PATCH/DELETE）——读操作留痕噪声大且无追责价值；
+// 敏感读（如明文密钥查看）走 WithAuditSensitiveRead 单独插桩。
+// Detail：从请求体解析常见金额字段（amount/balance/credits/delta 等）写入，
+// 便于追查账务类操作；解析失败或非 JSON 时静默跳过，不影响业务。
 func WithAudit(store *audit.Store, logger *slog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var detail any
+			auditWrite := store != nil && isAuditableMethod(r.Method)
+			if auditWrite {
+				detail = readAuditDetail(r)
+			}
 			sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
 			next.ServeHTTP(sw, r)
-			if store == nil || !isAuditableMethod(r.Method) {
+			if !auditWrite {
 				return
 			}
-			uid, _ := UserIDFrom(r.Context())
-			username, _ := UsernameFrom(r.Context())
 			e := audit.Entry{
-				UserID:    uid,
-				Username:  username,
-				Action:    r.Method + " " + r.URL.Path,
-				RequestID: resp.RequestID(r),
-				IP:        clientip.From(r),
+				Action: r.Method + " " + r.URL.Path,
+				Detail: detail,
 			}
-			e.TargetType, e.TargetID = auditTarget(r)
-			// 审计是对"已发生事实"的记录：脱离请求生命周期（客户端可能已断开），
-			// 并给独立超时，避免拖住连接（此时响应已发出）。
-			actx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 3*time.Second)
-			defer cancel()
-			if err := store.Insert(actx, e); err != nil {
-				// 审计失败不影响业务响应，仅记日志（后续可接指标/告警）
-				logger.Error("audit insert failed", "action", e.Action, "err", err)
-			}
+			storeAuditEntry(store, logger, r, e)
 		})
 	}
 }
@@ -267,10 +270,119 @@ func isAuditableMethod(method string) bool {
 	return false
 }
 
-// auditTarget 从管理端路径解析目标类型与目标 ID，如 /api/v1/admin/users/12 → ("user","12")。
+// sensitiveReadRe 匹配需要审计的敏感读路径：明文密钥查看等 GET 请求虽非写操作，
+// 但「谁能看到明文、何时看的、从哪个 IP」本身就是最高价值追责点。
+// 管理端与开发端均须覆盖——dev 用户查看自己令牌明文同样要留痕。
+// 注意不能用 ServeMux pattern 直接做白名单 key（r.URL.Path 是实际路径），故用正则。
+var sensitiveReadRe = regexp.MustCompile(`^GET /api/v1/(?:admin|dev)/tokens/[^/]+/secret$`)
+
+// isSensitiveRead 判断请求是否为需审计的敏感读。
+func isSensitiveRead(r *http.Request) bool {
+	return sensitiveReadRe.MatchString(r.Method + " " + r.URL.Path)
+}
+
+// WithAuditSensitiveRead 审计「敏感读」请求：仅当命中敏感读白名单时留痕
+// （含操作者/ip/request_id/目标 id），其余 GET 仍不审计。须包在 WithAuth 内层。
+func WithAuditSensitiveRead(store *audit.Store, logger *slog.Logger) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+			next.ServeHTTP(sw, r)
+			if store == nil || !isSensitiveRead(r) {
+				return
+			}
+			e := audit.Entry{
+				Action: "SENSITIVE_READ " + r.Method + " " + r.URL.Path,
+			}
+			storeAuditEntry(store, logger, r, e)
+		})
+	}
+}
+
+// storeAuditEntry 补全审计条目（操作者/request_id/可信 IP/目标）并写入存储：
+// 审计是对"已发生事实"的记录，脱离请求生命周期（客户端可能已断开），
+// 并给独立超时，避免拖住连接（此时响应已发出）；失败仅记日志。
+func storeAuditEntry(store *audit.Store, logger *slog.Logger, r *http.Request, e audit.Entry) {
+	e.UserID, _ = UserIDFrom(r.Context())
+	e.Username, _ = UsernameFrom(r.Context())
+	e.RequestID = resp.RequestID(r)
+	e.IP = clientip.From(r)
+	e.TargetType, e.TargetID = auditTarget(r)
+	actx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 3*time.Second)
+	defer cancel()
+	if err := store.Insert(actx, e); err != nil {
+		// 审计失败不影响业务响应，仅记日志（后续可接指标/告警）
+		logger.Error("audit insert failed", "action", e.Action, "err", err)
+	}
+}
+
+// auditAmountFields 写入审计 Detail 的常见金额字段名（契约 PascalCase：与 Go 字段名一致）。
+var auditAmountFields = []string{"Amount", "Balance", "Credits", "Delta", "Credit", "Value", "Price", "Fee"}
+
+// auditBodyLimit 读取审计 Detail 的请求体字节上限：足够覆盖常见 JSON 请求体，
+// 同时防止超大体（如大文件上传）拖慢审计前置读取。
+const auditBodyLimit = 1 << 20 // 1 MiB
+
+// auditDetailMaxLen Detail 中字符串字段按 rune 截断的上限，防止超长值撑爆审计列。
+const auditDetailMaxLen = 500
+
+// readAuditDetail 在请求体传给业务 handler 前读取并解析顶层常见金额字段，
+// 随后把 body 恢复原样，保证业务侧照常读取。解析失败/非 JSON 返回 nil（跳过），
+// 不报错、不影响业务。数字与数字字符串形式均支持，字符串按 rune 安全截断。
+//
+// 关键：审计只解析前 auditBodyLimit 字节，但回灌时必须拼回「已读前缀 + 剩余未读流」，
+// 否则 >1MiB 的请求体（大 JSON / 附件类接口）会被静默截断，业务侧读到残缺数据。
+func readAuditDetail(r *http.Request) any {
+	if r.Body == nil {
+		return nil
+	}
+	prefix, err := io.ReadAll(io.LimitReader(r.Body, auditBodyLimit))
+	// 无论读取成功与否都先恢复完整流：LimitReader 读满上限后 r.Body 仍指向剩余部分。
+	r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(prefix), r.Body))
+	if err != nil {
+		return nil
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(prefix, &m); err != nil {
+		return nil
+	}
+	detail := map[string]any{}
+	for _, key := range auditAmountFields {
+		raw, ok := m[key]
+		if !ok {
+			continue
+		}
+		var v any
+		if err := json.Unmarshal(raw, &v); err != nil {
+			continue
+		}
+		if s, ok := v.(string); ok {
+			detail[key] = truncateAuditString(s, auditDetailMaxLen)
+		} else {
+			detail[key] = v
+		}
+	}
+	if len(detail) == 0 {
+		return nil
+	}
+	return detail
+}
+
+// truncateAuditString 按 rune 边界截断字符串，保证结果仍是合法 UTF-8。
+func truncateAuditString(s string, maxRunes int) string {
+	if utf8.RuneCountInString(s) <= maxRunes {
+		return s
+	}
+	runes := []rune(s)
+	return string(runes[:maxRunes])
+}
+
+// auditTarget 从管理端/开发端路径解析目标类型与目标 ID，如 /api/v1/admin/users/12 → ("user","12")。
 func auditTarget(r *http.Request) (string, string) {
-	const prefix = "/api/v1/admin/"
-	p := strings.TrimPrefix(r.URL.Path, prefix)
+	p := strings.TrimPrefix(r.URL.Path, "/api/v1/admin/")
+	if p == r.URL.Path {
+		p = strings.TrimPrefix(r.URL.Path, "/api/v1/dev/")
+	}
 	if p == r.URL.Path {
 		return "", ""
 	}

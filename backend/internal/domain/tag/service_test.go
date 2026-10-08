@@ -33,8 +33,8 @@ func TestService_CreateTag(t *testing.T) {
 		WithArgs("premium").
 		WillReturnError(sql.ErrNoRows)
 	// 插入
-	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO semantic_tags(name, description, kv_pairs, enabled, created_by) VALUES($1,$2,$3,$4,$5) RETURNING `+cols)).
-		WithArgs("premium", "desc", sqlmock.AnyArg(), true, nullableID(42)).
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO semantic_tags(id, name, description, kv_pairs, enabled, created_by) VALUES($1,$2,$3,$4,$5,$6) RETURNING `+cols)).
+		WithArgs(sqlmock.AnyArg(), "premium", "desc", sqlmock.AnyArg(), true, nullableID(42)).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "description", "kv_pairs", "enabled", "created_by", "created_at"}).
 			AddRow(int64(1), "premium", "desc", `{"tier":"gold"}`, true, int64(42), now))
 

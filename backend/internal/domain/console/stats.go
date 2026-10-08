@@ -17,51 +17,51 @@ import (
 
 // statsKPI 顶部关键指标。
 type statsKPI struct {
-	TotalTokens     int64   `json:"total_tokens"`
-	TotalCredits    float64 `json:"total_credits"`
-	TotalRequests   int64   `json:"total_requests"`
-	FailedRequests  int64   `json:"failed_requests"`
-	SuccessRate     float64 `json:"success_rate"` // 0~1
-	AvgDurationMS   float64 `json:"avg_duration_ms"`
-	AvgFirstTokenMS float64 `json:"avg_first_token_ms"`
-	RPM             float64 `json:"rpm"`
-	TPM             float64 `json:"tpm"`
-	DeltaTokens     float64 `json:"delta_tokens"`   // 环比上期（比例，可为负）
-	DeltaCredits    float64 `json:"delta_credits"`
-	DeltaRequests   float64 `json:"delta_requests"`
+	TotalTokens     int64   `json:"TotalTokens"`
+	TotalCredits    float64 `json:"TotalCredits"`
+	TotalRequests   int64   `json:"TotalRequests"`
+	FailedRequests  int64   `json:"FailedRequests"`
+	SuccessRate     float64 `json:"SuccessRate"` // 0~1
+	AvgDurationMS   float64 `json:"AvgDurationMS"`
+	AvgFirstTokenMS float64 `json:"AvgFirstTokenMS"`
+	RPM             float64 `json:"RPM"`
+	TPM             float64 `json:"TPM"`
+	DeltaTokens     float64 `json:"DeltaTokens"`   // 环比上期（比例，可为负）
+	DeltaCredits    float64 `json:"DeltaCredits"`
+	DeltaRequests   float64 `json:"DeltaRequests"`
 }
 
 // statsCounts 三态计数（渠道 / 密钥共用）。
 type statsCounts struct {
-	Total    int `json:"total"`
-	Normal   int `json:"normal"`
-	Drain    int `json:"drain"`
-	Disabled int `json:"disabled"`
+	Total    int `json:"Total"`
+	Normal   int `json:"Normal"`
+	Drain    int `json:"Drain"`
+	Disabled int `json:"Disabled"`
 }
 
 // statsModelCounts 模型计数（对外模型 / 渠道内部模型）。
 type statsModelCounts struct {
-	ExternalTotal   int `json:"external_total"`
-	ExternalEnabled int `json:"external_enabled"`
-	InternalTotal   int `json:"internal_total"`
-	InternalNormal  int `json:"internal_normal"`
+	ExternalTotal   int `json:"ExternalTotal"`
+	ExternalEnabled int `json:"ExternalEnabled"`
+	InternalTotal   int `json:"InternalTotal"`
+	InternalNormal  int `json:"InternalNormal"`
 }
 
 // statsOps 运维块。
 type statsOps struct {
-	Channels statsCounts      `json:"channels"`
-	Keys     statsCounts      `json:"keys"`
-	Models   statsModelCounts `json:"models"`
+	Channels statsCounts      `json:"Channels"`
+	Keys     statsCounts      `json:"Keys"`
+	Models   statsModelCounts `json:"Models"`
 }
 
 // statsResp 统计页响应（admin/dev 共用；ops 仅 admin 返回）。
 type statsResp struct {
-	Scope string                 `json:"scope"` // global | self
-	From  string                 `json:"from"`
-	To    string                 `json:"to"`
-	KPI   statsKPI               `json:"kpi"`
-	Usage billing.DashboardStats `json:"usage"`
-	Ops   *statsOps              `json:"ops,omitempty"`
+	Scope string                 `json:"Scope"` // global | self
+	From  string                 `json:"From"`
+	To    string                 `json:"To"`
+	KPI   statsKPI               `json:"KPI"`
+	Usage billing.DashboardStats `json:"Usage"`
+	Ops   *statsOps              `json:"Ops,omitempty"`
 }
 
 // statsRangeFromQuery 解析 from/to（RFC3339，缺省近 30 天），归一到整天边界，限制跨度 ≤366 天。

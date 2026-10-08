@@ -13,11 +13,11 @@ import (
 
 // UsageSplit 五段 Token 用量。
 type UsageSplit struct {
-	Input      int64 `json:"input"`
-	Output     int64 `json:"output"`
-	CacheRead  int64 `json:"cache_read"`
-	CacheWrite int64 `json:"cache_write"`
-	Reasoning  int64 `json:"reasoning"`
+	Input      int64 `json:"Input"`
+	Output     int64 `json:"Output"`
+	CacheRead  int64 `json:"CacheRead"`
+	CacheWrite int64 `json:"CacheWrite"`
+	Reasoning  int64 `json:"Reasoning"`
 }
 
 // Total 五段求和。
@@ -27,56 +27,56 @@ func (u UsageSplit) Total() int64 {
 
 // DashDay 按天聚合行（趋势 / 成功率 / 吞吐量）。
 type DashDay struct {
-	Date        string  `json:"date"` // 2006-01-02
-	Calls       int64   `json:"calls"`
-	Failed      int64   `json:"failed"`
-	Credits     float64 `json:"credits"`
-	Tokens      int64   `json:"tokens"`
-	DurationMS  int64   `json:"duration_ms"`
-	SuccessRate float64 `json:"success_rate"` // 0~1
+	Date        string  `json:"Date"` // 2006-01-02
+	Calls       int64   `json:"Calls"`
+	Failed      int64   `json:"Failed"`
+	Credits     float64 `json:"Credits"`
+	Tokens      int64   `json:"Tokens"`
+	DurationMS  int64   `json:"DurationMS"`
+	SuccessRate float64 `json:"SuccessRate"` // 0~1
 }
 
 // DashTopItem 多维度 Top 项（模型 / 渠道密钥 / 用户 / 计费模式 / 错误共用）。
 type DashTopItem struct {
-	Key      string  `json:"key"`       // 维度键（模型名 / 密钥名 / 用户名 / 模式 / 错误信息）
-	Label    string  `json:"label"`     // 展示名
-	SubLabel string  `json:"sub_label"` // 次级展示（渠道名 / 昵称）
-	Calls    int64   `json:"calls"`
-	Failed   int64   `json:"failed"`
-	Credits  float64 `json:"credits"`
-	Tokens   int64   `json:"tokens"`
+	Key      string  `json:"Key"`       // 维度键（模型名 / 密钥名 / 用户名 / 模式 / 错误信息）
+	Label    string  `json:"Label"`     // 展示名
+	SubLabel string  `json:"SubLabel"`  // 次级展示（渠道名 / 昵称）
+	Calls    int64   `json:"Calls"`
+	Failed   int64   `json:"Failed"`
+	Credits  float64 `json:"Credits"`
+	Tokens   int64   `json:"Tokens"`
 }
 
 // DashLatencyBucket 耗时分桶（毫秒）。
 type DashLatencyBucket struct {
-	Bucket string `json:"bucket"`
-	Count  int64  `json:"count"`
+	Bucket string `json:"Bucket"`
+	Count  int64  `json:"Count"`
 }
 
 // DashboardStats 统计页单次聚合返回结构。
 type DashboardStats struct {
-	From      string          `json:"from"` // RFC3339
-	To        string          `json:"to"`
-	Days      int64           `json:"days"`
-	Total     UsageSplit      `json:"total_tokens"`
-	TotalCred float64         `json:"total_credits"`
-	TotalCall int64           `json:"total_requests"`
-	Failed    int64           `json:"failed_requests"`
-	Success   float64         `json:"success_rate"` // 0~1
-	AvgMS     float64         `json:"avg_duration_ms"`
-	P50MS     float64         `json:"p50_duration_ms"`
-	P90MS     float64         `json:"p90_duration_ms"`
-	P95MS     float64         `json:"p95_duration_ms"`
-	AvgFirst  float64         `json:"avg_first_token_ms"`
-	AvgRPM    float64         `json:"avg_rpm"`
-	AvgTPM    float64         `json:"avg_tpm"`
-	Daily     []DashDay       `json:"daily"`
-	ByModel   []DashTopItem   `json:"by_model"`
-	ByKey     []DashTopItem   `json:"by_key"`
-	ByUser    []DashTopItem   `json:"by_user"`
-	ByMode    []DashTopItem   `json:"by_mode"`
-	Errors    []DashTopItem   `json:"errors"`
-	Latency   []DashLatencyBucket `json:"latency"`
+	From      string              `json:"From"` // RFC3339
+	To        string              `json:"To"`
+	Days      int64               `json:"Days"`
+	Total     UsageSplit          `json:"Total"`
+	TotalCred float64             `json:"TotalCred"`
+	TotalCall int64               `json:"TotalCall"`
+	Failed    int64               `json:"Failed"`
+	Success   float64             `json:"Success"` // 0~1
+	AvgMS     float64             `json:"AvgMS"`
+	P50MS     float64             `json:"P50MS"`
+	P90MS     float64             `json:"P90MS"`
+	P95MS     float64             `json:"P95MS"`
+	AvgFirst  float64             `json:"AvgFirst"`
+	AvgRPM    float64             `json:"AvgRPM"`
+	AvgTPM    float64             `json:"AvgTPM"`
+	Daily     []DashDay           `json:"Daily"`
+	ByModel   []DashTopItem       `json:"ByModel"`
+	ByKey     []DashTopItem       `json:"ByKey"`
+	ByUser    []DashTopItem       `json:"ByUser"`
+	ByMode    []DashTopItem       `json:"ByMode"`
+	Errors    []DashTopItem       `json:"Errors"`
+	Latency   []DashLatencyBucket `json:"Latency"`
 }
 
 // dashWhere 生成时间范围 + 可选用户过滤 WHERE 子句；prefix 为表别名前缀（如 "br."）。
@@ -177,7 +177,7 @@ func (s *SqlStore) Dashboard(ctx context.Context, from, to time.Time, userID *in
 
 func (s *SqlStore) dashboardDaily(ctx context.Context, from, to time.Time, userID *int64, out *DashboardStats) error {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT date_trunc('day', call_time)::date,
+		`SELECT date_trunc('day', call_time AT TIME ZONE 'Asia/Shanghai')::date,
 		        count(*),
 		        COALESCE(sum((status='failed')::int),0),
 		        COALESCE(sum(credits_consumed),0),
@@ -205,8 +205,9 @@ func (s *SqlStore) dashboardDaily(ctx context.Context, from, to time.Time, userI
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	// 补零：保证区间内日期连续。
-	for d := from; !d.After(to); d = d.AddDate(0, 0, 1) {
+	// 补零：保证区间内日期连续（与 SQL 的 Asia/Shanghai 日界对齐）。
+	loc := cnLocation()
+	for d := from.In(loc); !d.After(to.In(loc)); d = d.AddDate(0, 0, 1) {
 		key := d.Format("2006-01-02")
 		if _, ok := byDate[key]; !ok {
 			byDate[key] = DashDay{Date: key, SuccessRate: 1}

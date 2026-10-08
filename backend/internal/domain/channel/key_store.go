@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/team/llmgateway/internal/pkg/idgen"
 )
 
 // ChannelKey 渠道密钥（运行时实体；配置与限流模板继承自渠道）。
@@ -76,10 +77,12 @@ func NewKeyStore(db *sql.DB) *KeyStore {
 
 // Insert 插入新密钥并返回回填主键 ID。同渠道同名冲突返回 ErrNameExists。
 func (s *KeyStore) Insert(ctx context.Context, k ChannelKey) (int64, error) {
-	var id int64
+	if k.ID == 0 {
+		k.ID = idgen.New()
+	}
 	err := s.db.QueryRowContext(ctx,
-		`INSERT INTO channel_keys(channel_id, name, credential_enc) VALUES($1,$2,$3) RETURNING id`,
-		k.ChannelID, k.Name, k.CredentialEnc).Scan(&id)
+		`INSERT INTO channel_keys(id, channel_id, name, credential_enc) VALUES($1,$2,$3,$4) RETURNING id`,
+		k.ID, k.ChannelID, k.Name, k.CredentialEnc).Scan(&k.ID)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
@@ -87,7 +90,7 @@ func (s *KeyStore) Insert(ctx context.Context, k ChannelKey) (int64, error) {
 		}
 		return 0, err
 	}
-	return id, nil
+	return k.ID, nil
 }
 
 // List 查询某渠道下未删除密钥，按 id 升序。
@@ -208,8 +211,8 @@ func (s *KeyStore) SoftDelete(ctx context.Context, id int64) error {
 // InsertEvent 记录一条密钥状态流转事件。
 func (s *KeyStore) InsertEvent(ctx context.Context, keyID int64, from, to State, reason string) error {
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO channel_key_events(channel_key_id, from_state, to_state, reason) VALUES($1,$2,$3,$4)`,
-		keyID, string(from), string(to), reason)
+		`INSERT INTO channel_key_events(id, channel_key_id, from_state, to_state, reason) VALUES($1,$2,$3,$4,$5)`,
+		idgen.New(), keyID, string(from), string(to), reason)
 	return err
 }
 

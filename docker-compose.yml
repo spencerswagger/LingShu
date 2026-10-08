@@ -39,6 +39,8 @@ services:
       # 否则审计 ip 会退化为 nginx 容器 IP、限流的 IP 维度也会退化。
       # 注意：backend 不得暴露对外端口（限流/审计依赖此信任边界）。
       TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-172.16.0.0/12}
+      # 登录令牌有效期（分钟）：与后端常量 config.DefaultJWTTTLMinutes 及 README 保持一致
+      JWT_TTL_MINUTES: ${JWT_TTL_MINUTES:-360}
       TZ: ${TZ:-Asia/Shanghai}
     volumes:
       - backend_keys:/app/keys # JWT RSA 密钥对 + SM4 密钥

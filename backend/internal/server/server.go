@@ -106,7 +106,7 @@ func (s *Server) routes() {
 	admin.HandleFunc("GET /api/v1/admin/tokens", d.TokenAdmin.HandleAdminList)
 	admin.HandleFunc("POST /api/v1/admin/tokens", d.TokenAdmin.HandleAdminCreate)
 	admin.HandleFunc("POST /api/v1/admin/tokens/batch-delete", d.TokenAdmin.HandleAdminBatchDelete)
-	admin.HandleFunc("GET /api/v1/admin/tokens/{id}/secret", d.TokenAdmin.HandleAdminSecret)
+	admin.Handle("GET /api/v1/admin/tokens/{id}/secret", WithAuditSensitiveRead(s.audit, s.logger)(http.HandlerFunc(d.TokenAdmin.HandleAdminSecret)))
 
 	// channels
 	admin.HandleFunc("GET /api/v1/admin/channels", d.Channel.HandleList)
@@ -180,13 +180,13 @@ func (s *Server) routes() {
 
 	// ---- 开发端 ----
 	dev := http.NewServeMux()
-	s.mux.Handle("/api/v1/dev/", WithAuth(s.jwtMgr, s.sessions, identity.RoleDeveloper)(dev))
+	s.mux.Handle("/api/v1/dev/", WithAuth(s.jwtMgr, s.sessions, identity.RoleDeveloper)(WithAudit(s.audit, s.logger)(dev)))
 
 	dev.HandleFunc("GET /api/v1/dev/tokens", d.TokenDev.HandleDevList)
 	dev.HandleFunc("POST /api/v1/dev/tokens", d.TokenDev.HandleDevCreate)
 	dev.HandleFunc("POST /api/v1/dev/tokens/{id}/rotate", d.TokenDev.HandleDevRotate)
 	dev.HandleFunc("POST /api/v1/dev/tokens/{id}/toggle", d.TokenDev.HandleDevToggle)
-	dev.HandleFunc("GET /api/v1/dev/tokens/{id}/secret", d.TokenDev.HandleDevSecret)
+	dev.Handle("GET /api/v1/dev/tokens/{id}/secret", WithAuditSensitiveRead(s.audit, s.logger)(http.HandlerFunc(d.TokenDev.HandleDevSecret)))
 	dev.HandleFunc("GET /api/v1/dev/tags", d.Tag.HandleList) // 列表过滤由 query enabled=true 控制
 	dev.HandleFunc("GET /api/v1/dev/wallet", d.Credit.HandleDevWallet)
 	dev.HandleFunc("GET /api/v1/dev/wallet/flows", d.Credit.HandleDevFlows)
@@ -227,10 +227,15 @@ func (s *Server) Handler() http.Handler {
 
 // Run 启动 HTTP 服务并阻塞，监听 SIGINT/SIGTERM 优雅退出。
 func (s *Server) Run(ctx context.Context) error {
+	// 注意：严禁设置 WriteTimeout——/v1 网关有 SSE 流式长连接，
+	// WriteTimeout 会切断流式响应。故只补 ReadTimeout/IdleTimeout/MaxHeaderBytes。
 	httpServer := &http.Server{
 		Addr:              s.cfg.Server.Addr,
 		Handler:           s.Handler(),
 		ReadHeaderTimeout: 15 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
 
 	errCh := make(chan error, 1)

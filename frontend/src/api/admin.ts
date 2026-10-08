@@ -1,12 +1,11 @@
 import { http, type ApiRes } from './http'
 import type { PageResult, BillingDetail, FlowItem } from './dev'
 
-// ===== 管理端 API（字段名与后端 handler 返回结构对齐） =====
+// ===== 管理端 API（字段名与后端 Go 结构体字段名对齐） =====
 
 // ===== 用户 =====
-// 后端 identity.User 结构体无 json tag → 序列化为 PascalCase 字段。
 export interface AdminUser {
-  ID: number
+  ID: string
   Username: string
   Nickname: string
   Role: string
@@ -29,67 +28,63 @@ export interface UserDetailData {
 export function listUsers(params: Record<string, unknown> = {}) {
   return http.get<PageResult<AdminUser>, ApiRes<PageResult<AdminUser>>>('/admin/users', { params })
 }
-export function getUser(id: number) {
+export function getUser(id: string) {
   return http.get<UserDetailData, ApiRes<UserDetailData>>(`/admin/users/${id}`)
 }
-// 创建用户：必填 username/password/role
+// 创建用户：必填 Username/Password/Role
 export function createUser(payload: {
-  username: string
-  password: string
-  nickname?: string
-  role: string
-  pricing_mode?: string
+  Username: string
+  Password: string
+  Nickname?: string
+  Role: string
+  PricingMode?: string
 }) {
   return http.post<AdminUser, ApiRes<AdminUser>>('/admin/users', payload)
 }
-// 更新用户：role/status/pricing_mode/nickname
+// 更新用户：Role/Status/PricingMode/Nickname
 export function updateUser(
-  id: number,
-  payload: { role?: string; status?: string; pricing_mode?: string; nickname?: string },
+  id: string,
+  payload: { Role?: string; Status?: string; PricingMode?: string; Nickname?: string },
 ) {
   return http.put<AdminUser, ApiRes<AdminUser>>(`/admin/users/${id}`, payload)
 }
 // 重置用户密码（管理员输入新密码）
-export function resetUserPassword(id: number, password: string) {
+export function resetUserPassword(id: string, password: string) {
   return http.post<{ reset: boolean }, ApiRes<{ reset: boolean }>>(
     `/admin/users/${id}/reset-password`,
-    { password },
+    { Password: password },
   )
 }
 // 强制解绑用户 TOTP（管理员操作，无需验证码）
-export function resetUserTotp(id: number) {
+export function resetUserTotp(id: string) {
   return http.post<{ reset: boolean }, ApiRes<{ reset: boolean }>>(`/admin/users/${id}/reset-totp`)
 }
-export function batchDeleteUsers(ids: number[]) {
+export function batchDeleteUsers(ids: string[]) {
   return http.post<{ affected: number }, ApiRes<{ affected: number }>>('/admin/users/batch-delete', {
-    ids,
+    IDs: ids,
   })
 }
 
-// 用户钱包
-export function getUserWallet(id: number) {
-  return http.get<{ balance: number }, ApiRes<{ balance: number }>>(`/admin/users/${id}/wallet`)
-}
-export function rechargeWallet(id: number, amount: number, remark: string) {
+export function rechargeWallet(id: string, amount: number, remark: string, password: string) {
   return http.post<{ affected: number }, ApiRes<{ affected: number }>>(
     `/admin/users/${id}/wallet/recharge`,
-    { amount, remark },
+    { Amount: amount, Remark: remark, Password: password },
   )
 }
-export function adjustWallet(id: number, amount: number, remark: string) {
+export function adjustWallet(id: string, amount: number, remark: string, password: string) {
   return http.post<{ affected: number }, ApiRes<{ affected: number }>>(
     `/admin/users/${id}/wallet/adjust`,
-    { amount, remark },
+    { Amount: amount, Remark: remark, Password: password },
   )
 }
 // 覆盖余额（直接 set）。
-export function setWallet(id: number, balance: number, remark: string) {
+export function setWallet(id: string, balance: number, remark: string, password: string) {
   return http.post<{ balance: number }, ApiRes<{ balance: number }>>(
     `/admin/users/${id}/wallet/set`,
-    { balance, remark },
+    { Balance: balance, Remark: remark, Password: password },
   )
 }
-export function listUserFlows(id: number, page = 1, size = 20) {
+export function listUserFlows(id: string, page = 1, size = 20) {
   return http.get<PageResult<FlowItem>, ApiRes<PageResult<FlowItem>>>(
     `/admin/users/${id}/wallet/flows`,
     { params: { page, size } },
@@ -97,23 +92,22 @@ export function listUserFlows(id: number, page = 1, size = 20) {
 }
 
 // ===== 令牌 =====
-// 后端令牌走专用 snake_case 响应。
 export interface AdminToken {
-  id: number
-  token_display: string
-  user_id: number
-  username: string
-  user_nickname?: string
-  display_name: string
-  tag_id: number | null
-  expires_at: string | null
-  last_used_at: string | null
-  status: string // ACTIVE | DISABLED
-  created_at: string
+  ID: string
+  TokenDisplay: string
+  UserID: string
+  Username: string
+  UserNickname?: string
+  DisplayName: string
+  TagID: string | null
+  ExpiresAt: string | null
+  LastUsedAt: string | null
+  Status: string // ACTIVE | DISABLED
+  CreatedAt: string
 }
 export interface CreatedToken {
-  plain: string
-  display: string
+  Plain: string
+  Display: string
 }
 
 export function listTokens(params: Record<string, unknown> = {}) {
@@ -122,59 +116,61 @@ export function listTokens(params: Record<string, unknown> = {}) {
   })
 }
 export function createToken(payload: {
-  user_id: number
-  display_name: string
-  tag_id?: number | null
-  expires_at?: string | null
+  UserID: string
+  DisplayName: string
+  TagID?: string | null
+  ExpiresAt?: string | null
 }) {
   return http.post<CreatedToken, ApiRes<CreatedToken>>('/admin/tokens', payload)
 }
-// 查看令牌密钥（SM4 加密落库，可随时查看/复制）
-export function getTokenSecret(id: number) {
-  return http.get<CreatedToken, ApiRes<CreatedToken>>(`/admin/tokens/${id}/secret`)
+// 查看令牌密钥（SM4 加密落库，可随时查看/复制）。敏感操作：需当前口令二次验证。
+export function getTokenSecret(id: string, password: string) {
+  return http.get<CreatedToken, ApiRes<CreatedToken>>(`/admin/tokens/${id}/secret`, {
+    headers: { 'X-Current-Password': password },
+  })
 }
-export function batchDeleteTokens(ids: number[]) {
+export function batchDeleteTokens(ids: string[]) {
   return http.post<{ affected: number }, ApiRes<{ affected: number }>>('/admin/tokens/batch-delete', {
-    ids,
+    IDs: ids,
   })
 }
 
 // ===== 渠道 =====
-// 后端 channel.Channel 无 json tag → 外层 PascalCase；内嵌 JSONB 结构采用小写 json tag。
+// 渠道级/模型级限流与可靠性为公共 JSONB 结构（字段名 = Go 字段名）。
 export interface RateLimitConfig {
-  rpm: number
-  tpm: number
-  burst_multiplier: number
-  on_exceed: string // QUEUE | REJECT
-  queue_size: number
-  queue_timeout_ms: number
-  max_concurrent: number
+  RPM: number // 每分钟请求数；0 表示不限
+  TPM: number // 每分钟 token 数；0 表示不限
+  BurstMultiplier: number // 瞬时超发系数
+  OnExceed: string // QUEUE 或 REJECT
+  QueueSize: number
+  QueueTimeoutMS: number
+  MaxConcurrent: number // 同时进行的请求上限（并发会话数）；0 表示不限
 }
 export interface HealthProbeConfig {
-  interval: string // 正常态探测频率（6 段 cron，含秒）
-  drain_interval_seconds: number // 排空态探测间隔（秒）
-  timeout_ms: number
-  fail_threshold: number
-  recovery_threshold: number
-  probe_model: string
+  Interval: string // 正常态探测频率（6 段 cron，含秒）
+  DrainIntervalSeconds: number // 排空态探测间隔（秒）
+  TimeoutMS: number
+  FailThreshold: number
+  RecoveryThreshold: number
+  ProbeModel: string
 }
 // 可靠性（真实调用滑动窗口评估），独立于健康探测
 export interface ReliabilityConfig {
-  window_seconds: number
-  min_samples: number
-  error_rate_pct: number
-  rate_429_pct: number
-  p99_latency_ms: number
-  auth_fail_threshold?: number
+  WindowSeconds: number
+  MinSamples: number
+  ErrorRatePct: number
+  Rate429Pct: number
+  P99LatencyMS: number
+  AuthFailThreshold?: number
 }
 export interface AdminChannel {
-  ID: number
+  ID: string
   Name: string
   Protocol: string
   BaseURL: string
   Tags: Record<string, string>
-  TagIDs: number[]
-  BoundTags: { ID: number; Name: string; KV: Record<string, string> }[]
+  TagIDs: string[]
+  BoundTags: { ID: string; Name: string; KV: Record<string, string> }[]
   Priority: number
   Weight: number
   State: string // NORMAL | DRAIN | DISABLED
@@ -182,30 +178,27 @@ export interface AdminChannel {
   HealthProbe: HealthProbeConfig
   Reliability: ReliabilityConfig
   SessionTTLMinutes: number
-  Enabled: boolean
-  KeyStates?: { key_id: number; key_name: string; state: string }[]
+  KeyStates?: { KeyID: string; KeyName: string; State: string }[]
   CreatedAt: string
   UpdatedAt: string
 }
 // 渠道入参（创建/更新共用）
 export interface ChannelInput {
-  name: string
-  protocol: string
-  base_url: string
-  tags?: Record<string, string>
-  tag_ids?: number[]
-  priority?: number
-  weight?: number
-  rate_limit?: RateLimitConfig
-  health_probe?: HealthProbeConfig
-  reliability?: ReliabilityConfig
-  session_ttl_minutes?: number
-  enabled?: boolean
+  Name: string
+  Protocol: string
+  BaseURL: string
+  TagIDs?: string[]
+  Priority?: number
+  Weight?: number
+  RateLimit?: RateLimitConfig
+  HealthProbe?: HealthProbeConfig
+  Reliability?: ReliabilityConfig
+  SessionTTLMinutes?: number
 }
 // 渠道状态流转事件
 export interface ChannelEvent {
-  ID: number
-  ChannelID: number
+  ID: string
+  ChannelID: string
   FromState: string
   ToState: string
   Reason: string
@@ -213,8 +206,8 @@ export interface ChannelEvent {
 }
 // 内部模型状态流转事件
 export interface ChannelModelEvent {
-  ID: number
-  ChannelID: number
+  ID: string
+  ChannelID: string
   ModelID: string
   FromState: string
   ToState: string
@@ -223,8 +216,8 @@ export interface ChannelModelEvent {
 }
 // 探测历史
 export interface ProbeLog {
-  ID: number
-  ChannelID: number
+  ID: string
+  ChannelID: string
   ModelID: string
   Level: string // key=密钥级探测；model=模型级探测（探针标识的探测模型）
   Target: string
@@ -245,35 +238,35 @@ export function listChannels(params: Record<string, unknown> = {}) {
 export function createChannel(payload: ChannelInput) {
   return http.post<AdminChannel, ApiRes<AdminChannel>>('/admin/channels', payload)
 }
-export function updateChannel(id: number, payload: ChannelInput) {
+export function updateChannel(id: string, payload: ChannelInput) {
   return http.put<AdminChannel, ApiRes<AdminChannel>>(`/admin/channels/${id}`, payload)
 }
-export function batchDeleteChannels(ids: number[]) {
+export function batchDeleteChannels(ids: string[]) {
   return http.post<{ deleted: number }, ApiRes<{ deleted: number }>>('/admin/channels/batch-delete', {
-    ids,
+    IDs: ids,
   })
 }
-export function listChannelEvents(id: number) {
+export function listChannelEvents(id: string) {
   return http.get<ChannelEvent[], ApiRes<ChannelEvent[]>>(`/admin/channels/${id}/events`)
 }
 // 手动状态流转（渠道与内部模型共用）：action = normal | drain | disable
-export function channelState(id: number, action: 'normal' | 'drain' | 'disable', reason = '') {
+export function channelState(id: string, action: 'normal' | 'drain' | 'disable', reason = '') {
   return http.post<AdminChannel, ApiRes<AdminChannel>>(`/admin/channels/${id}/state`, {
-    action,
-    reason,
+    Action: action,
+    Reason: reason,
   })
 }
 // 内部模型手动状态流转
-export function channelModelState(id: number, mid: number, action: 'normal' | 'drain' | 'disable', reason = '') {
+export function channelModelState(id: string, mid: string, action: 'normal' | 'drain' | 'disable', reason = '') {
   return http.put<unknown, ApiRes<unknown>>(`/admin/channels/${id}/models/${mid}/state`, {
-    action,
-    reason,
+    Action: action,
+    Reason: reason,
   })
 }
-export function listModelEvents(id: number) {
+export function listModelEvents(id: string) {
   return http.get<ChannelModelEvent[], ApiRes<ChannelModelEvent[]>>(`/admin/channels/${id}/model-events`)
 }
-export function listProbeLogs(id: number, limit = 50) {
+export function listProbeLogs(id: string, limit = 50) {
   return http.get<ProbeLog[], ApiRes<ProbeLog[]>>(`/admin/channels/${id}/probe-logs`, { params: { limit } })
 }
 // cron 表达式后续执行时间预览（前端编辑时校验用）
@@ -282,91 +275,67 @@ export function cronPreview(expr: string, limit = 5) {
     params: { expr, limit },
   })
 }
-// 运行时快照（snake_case 字段，含 last_err）
-export function getChannelSnapshot() {
-  return http.get<RuntimeChannel[], ApiRes<RuntimeChannel[]>>('/admin/channels/snapshot')
-}
-export interface RuntimeChannel {
-  id: number
-  name: string
-  protocol: string
-  base_url: string
-  tags: Record<string, string>
-  priority: number
-  state: string
-  last_err?: string
-  last_probe?: string
-  rate_limit: RateLimitConfig
-  health_probe: HealthProbeConfig
-  reliability: ReliabilityConfig
-  max_concurrent: number
-  session_ttl_minutes: number
-  enabled: boolean
-  created_at: string
-  updated_at: string
-}
 
 // 渠道密钥（channel_keys·运行时实体）：凭据只出尾号，状态三态独立流转
 export interface ChannelKey {
-  id: number
-  channel_id: number
-  name: string
-  credential_tail: string
-  state: string // NORMAL | DRAIN | DISABLED
-  last_err: string
-  active_sessions: number
-  created_at: string
-  updated_at: string
+  ID: string
+  ChannelID: string
+  Name: string
+  CredentialTail: string
+  State: string // NORMAL | DRAIN | DISABLED
+  LastErr: string
+  ActiveSessions: number
+  CreatedAt: string
+  UpdatedAt: string
 }
-export function listChannelKeys(id: number): Promise<ApiRes<ChannelKey[]>> {
+export function listChannelKeys(id: string): Promise<ApiRes<ChannelKey[]>> {
   return http.get<ChannelKey[], ApiRes<ChannelKey[]>>(`/admin/channels/${id}/keys`)
 }
 export function createChannelKey(
-  id: number,
-  payload: { name: string; credential: string },
+  id: string,
+  payload: { Name: string; Credential: string },
 ): Promise<ApiRes<ChannelKey>> {
   return http.post<ChannelKey, ApiRes<ChannelKey>>(`/admin/channels/${id}/keys`, payload)
 }
 export function updateChannelKey(
-  channelId: number,
-  keyId: number,
-  payload: { name: string; credential?: string },
+  channelId: string,
+  keyId: string,
+  payload: { Name: string; Credential?: string },
 ): Promise<ApiRes<ChannelKey>> {
   return http.put<ChannelKey, ApiRes<ChannelKey>>(
     `/admin/channels/${channelId}/keys/${keyId}`,
     payload,
   )
 }
-export function deleteChannelKey(channelId: number, keyId: number): Promise<ApiRes<unknown>> {
+export function deleteChannelKey(channelId: string, keyId: string): Promise<ApiRes<unknown>> {
   return http.delete<unknown, ApiRes<unknown>>(`/admin/channels/${channelId}/keys/${keyId}`)
 }
 export function channelKeyState(
-  channelId: number,
-  keyId: number,
+  channelId: string,
+  keyId: string,
   action: string,
 ): Promise<ApiRes<ChannelKey>> {
   return http.post<ChannelKey, ApiRes<ChannelKey>>(
     `/admin/channels/${channelId}/keys/${keyId}/state`,
-    { action },
+    { Action: action },
   )
 }
 
 // ===== 标签 =====
-// 后端 tag.Tag 无 json tag → PascalCase。
 export interface AdminTag {
-  ID: number
+  ID: string
   Name: string
   Description: string
   KVPairs: Record<string, string>
   Enabled: boolean
-  CreatedBy: number
+  CreatedBy: string
   CreatedAt: string
 }
 export interface TagInput {
-  name: string
-  description?: string
-  kv_pairs?: Record<string, string>
-  enabled?: boolean
+  Name: string
+  Description?: string
+  KVPairs?: Record<string, string>
+  Enabled?: boolean
 }
 export function listTags(params: Record<string, unknown> = {}) {
   return http.get<AdminTag[], ApiRes<AdminTag[]>>('/admin/tags', { params })
@@ -374,12 +343,12 @@ export function listTags(params: Record<string, unknown> = {}) {
 export function createTag(payload: TagInput) {
   return http.post<AdminTag, ApiRes<AdminTag>>('/admin/tags', payload)
 }
-export function updateTag(id: number, payload: TagInput) {
+export function updateTag(id: string, payload: TagInput) {
   return http.put<AdminTag, ApiRes<AdminTag>>(`/admin/tags/${id}`, payload)
 }
-export function batchDeleteTags(ids: number[]) {
+export function batchDeleteTags(ids: string[]) {
   return http.post<{ deleted: number }, ApiRes<{ deleted: number }>>('/admin/tags/batch-delete', {
-    ids,
+    IDs: ids,
   })
 }
 
@@ -402,26 +371,25 @@ export const rateHints: Record<string, string> = {
   reasoning: '推理倍率（每百万 token）：思维链/深度推理 token 单独计费费率。',
 }
 
-// ===== 对外模型（external_models·售价层）=====
-// 后端 model.Handler viewModel 显式 snake_case。
+// ===== 对外模型（external_models·售价层；字段名 = Go 字段名）=====
 export interface ExternalModel {
-  id: number
-  external_name: string
-  description: string
-  enabled: boolean
-  sale_rates: Record<string, number>
-  time_config: TimeCoeffConfig | null
-  context_tiers: ContextTier[] | null
-  created_at: string
-  updated_at: string
+  ID: string
+  ExternalName: string
+  Description: string
+  Enabled: boolean
+  SaleRates: Record<string, number>
+  TimeConfig: TimeCoeffConfig | null
+  ContextTiers: ContextTier[] | null
+  CreatedAt: string
+  UpdatedAt: string
 }
 export interface ExternalModelInput {
-  external_name: string
-  description?: string
-  enabled?: boolean
-  sale_rates: Record<string, number>
-  time_config?: TimeCoeffConfig | null
-  context_tiers?: ContextTier[] | null
+  ExternalName: string
+  Description?: string
+  Enabled?: boolean
+  SaleRates: Record<string, number>
+  TimeConfig?: TimeCoeffConfig | null
+  ContextTiers?: ContextTier[] | null
 }
 // 列表返回裸数组（非 {list}）
 export function listExternalModels(params: Record<string, unknown> = {}) {
@@ -430,29 +398,15 @@ export function listExternalModels(params: Record<string, unknown> = {}) {
 export function createExternalModel(payload: ExternalModelInput) {
   return http.post<ExternalModel, ApiRes<ExternalModel>>('/admin/models', payload)
 }
-export function updateExternalModel(id: number, payload: ExternalModelInput) {
+export function updateExternalModel(id: string, payload: ExternalModelInput) {
   return http.put<ExternalModel, ApiRes<ExternalModel>>(`/admin/models/${id}`, payload)
 }
-export function batchDeleteExternalModels(ids: number[]) {
+export function batchDeleteExternalModels(ids: string[]) {
   return http.post<{ deleted: number }, ApiRes<{ deleted: number }>>('/admin/models/batch-delete', {
-    ids,
+    IDs: ids,
   })
 }
 
-// models.dev 参考价（查看 + 一键应用为售价）
-export interface PriceReferenceResult {
-  reference: { input: number; output: number }
-  updated_at: string
-}
-export function getPriceReference(id: number) {
-  return http.get<PriceReferenceResult, ApiRes<PriceReferenceResult>>(
-    `/admin/models/${id}/price-reference`,
-  )
-}
-// 应用 models.dev 参考价到售价 input/output，返回最新对外模型
-export function applyPrice(id: number) {
-  return http.post<ExternalModel, ApiRes<ExternalModel>>(`/admin/models/${id}/apply-price`)
-}
 // 用 models.dev 参考价批量刷新全部对外模型售价；返回更新/跳过清单
 export interface SyncPricesResult {
   updated: string[]
@@ -463,13 +417,13 @@ export function syncModelsPrices() {
 }
 // models.dev 价格目录条目（供应商维度）；价格均为参考原始价 / 百万 token
 export interface CatalogEntry {
-  provider: string
-  model_id: string
-  input_usd: number
-  output_usd: number
-  cache_read_usd: number
-  cache_write_usd: number
-  reasoning_usd: number
+  Provider: string
+  ModelID: string
+  InputUSD: number
+  OutputUSD: number
+  CacheReadUSD: number
+  CacheWriteUSD: number
+  ReasoningUSD: number
 }
 export function priceCatalog(q: string) {
   return http.get<{ list: CatalogEntry[]; total: number; updated_at: string }, ApiRes<{ list: CatalogEntry[]; total: number; updated_at: string }>>(
@@ -478,63 +432,61 @@ export function priceCatalog(q: string) {
   )
 }
 
-// ===== 渠道内部模型（channel_models·成本层）=====
-// 后端 channel.Handler viewChannelModel 含 JOIN 出的 external_name。
+// ===== 渠道内部模型（channel_models·成本层；字段名 = Go 字段名）=====
+// 含 JOIN 出的 external_name。
 export interface ChannelModel {
-  id: number
-  channel_id: number
-  internal_model_id: string
-  external_model_id: number
-  external_name?: string
-  cost_rates: Record<string, number>
-  time_config: TimeCoeffConfig | null
-  context_tiers: ContextTier[] | null
-  state: string // NORMAL | DRAIN | DISABLED
-  rate_limit: RateLimitConfig
-  health_probe: HealthProbeConfig
-  reliability: ReliabilityConfig
-  enabled: boolean
-  created_at: string
-  updated_at: string
+  ID: string
+  ChannelID: string
+  InternalModelID: string
+  ExternalModelID: string
+  ExternalName?: string
+  CostRates: Record<string, number>
+  TimeConfig: TimeCoeffConfig | null
+  ContextTiers: ContextTier[] | null
+  State: string // NORMAL | DRAIN | DISABLED
+  RateLimit: RateLimitConfig
+  HealthProbe: HealthProbeConfig
+  Reliability: ReliabilityConfig
+  CreatedAt: string
+  UpdatedAt: string
 }
 export interface ChannelModelInput {
-  internal_model_id: string
-  external_model_id: number
-  cost_rates: Record<string, number>
-  time_config?: TimeCoeffConfig | null
-  context_tiers?: ContextTier[] | null
-  rate_limit?: RateLimitConfig
-  health_probe?: HealthProbeConfig
-  reliability?: ReliabilityConfig
-  enabled?: boolean
+  InternalModelID: string
+  ExternalModelID: string
+  CostRates: Record<string, number>
+  TimeConfig?: TimeCoeffConfig | null
+  ContextTiers?: ContextTier[] | null
+  RateLimit?: RateLimitConfig
+  HealthProbe?: HealthProbeConfig
+  Reliability?: ReliabilityConfig
 }
-export function listChannelModels(channelId: number) {
+export function listChannelModels(channelId: string) {
   return http.get<ChannelModel[], ApiRes<ChannelModel[]>>(`/admin/channels/${channelId}/models`)
 }
-export function createChannelModel(channelId: number, payload: ChannelModelInput) {
+export function createChannelModel(channelId: string, payload: ChannelModelInput) {
   return http.post<ChannelModel, ApiRes<ChannelModel>>(
     `/admin/channels/${channelId}/models`,
     payload,
   )
 }
-export function updateChannelModel(channelId: number, mid: number, payload: ChannelModelInput) {
+export function updateChannelModel(channelId: string, mid: string, payload: ChannelModelInput) {
   return http.put<ChannelModel, ApiRes<ChannelModel>>(
     `/admin/channels/${channelId}/models/${mid}`,
     payload,
   )
 }
-export function deleteChannelModel(channelId: number, mid: number) {
+export function deleteChannelModel(channelId: string, mid: string) {
   return http.delete<{ affected: number }, ApiRes<{ affected: number }>>(
     `/admin/channels/${channelId}/models/${mid}`,
   )
 }
 // 拉取渠道上游 /v1/models 列表（不落库），供管理员选择填入内部模型
 export interface PullModel {
-  id: string
-  object: string
-  owned_by: string
+  ID: string
+  Object: string
+  OwnedBy: string
 }
-export function pullChannelModels(channelId: number) {
+export function pullChannelModels(channelId: string) {
   return http.post<{ list: PullModel[] }, ApiRes<{ list: PullModel[] }>>(
     `/admin/channels/${channelId}/models/pull`,
   )
@@ -549,31 +501,30 @@ export interface BillingUsage {
   reasoning: number
 }
 export interface AdminBillingItem {
-  billing_id: string
-  user_id: number
-  username?: string
-  user_nickname?: string
-  token_name?: string
-  model: string
-  pricing_mode: string
-  credits_consumed: number
-  status: string
-  call_time: string
-  internal_model_id: string
-  channel_id: number
-  channel_name?: string
-  channel_key_id?: number
-  key_name?: string
-  session_id?: string
-  session_name?: string
-  tokens: BillingUsage
-  rates?: Record<string, number>
-  coeff_time?: number
-  coeff_context?: number
-  r_value?: number
-  error_message?: string
-  duration_ms?: number | null
-  first_token_ms?: number | null
+  BillingID: string
+  UserID: string
+  Username?: string
+  UserNickname?: string
+  TokenName?: string
+  ExternalModel: string
+  PricingMode: string
+  CreditsConsumed: number
+  Status: string
+  CallTime: string
+  InternalModelID: string
+  ChannelName?: string
+  ChannelKeyID?: string
+  KeyName?: string
+  SessionID?: string
+  SessionName?: string
+  Tokens: BillingUsage
+  Rates?: Record<string, number>
+  CoeffTime?: number
+  CoeffContext?: number
+  RValue?: number
+  ErrorMessage?: string
+  DurationMs?: number | null
+  FirstTokenMs?: number | null
 }
 export function listBillings(params: Record<string, unknown> = {}) {
   return http.get<PageResult<AdminBillingItem>, ApiRes<PageResult<AdminBillingItem>>>(
@@ -583,10 +534,10 @@ export function listBillings(params: Record<string, unknown> = {}) {
 }
 // 账单筛选聚合统计（与列表同 filter）：请求数/总积分/总 token/总耗时（统计栏用）。
 export interface BillingStats {
-  requests: number
-  credits_total: number
-  tokens_total: number
-  duration_total_ms: number
+  Requests: number
+  CreditsTotal: number
+  TokensTotal: number
+  DurationTotalMS: number
 }
 export function getBillingStats(params: Record<string, unknown> = {}) {
   return http.get<BillingStats, ApiRes<BillingStats>>('/admin/billings/stats', { params })
@@ -597,19 +548,22 @@ export function getBilling(billingId: string) {
 
 // ===== 会话（内存注册表 + DB 投影；按用户/令牌/密钥维度过滤与踢下线） =====
 export interface AdminSession {
-  session_id: string
-  name: string
-  user_name: string
-  user_nickname?: string
-  token_name: string
-  model: string
-  channel_key_name: string
-  session_raw: string
-  closed: boolean
-  created_at: string
-  last_active: string
-  expire_at: string
-  expired: boolean
+  SessionID: string
+  UserID: string
+  UserName: string
+  UserNickname?: string
+  TokenID: string
+  TokenName: string
+  Model: string
+  ChannelKeyID: string
+  ChannelKeyName: string
+  SessionRaw: string
+  SessionName: string
+  Closed: boolean
+  CreatedAt: string
+  LastActive: string
+  ExpireAt: string
+  Expired: boolean
 }
 export function listSessions(
   params: Record<string, any>,
@@ -633,35 +587,35 @@ export function renameSession(
 ): Promise<ApiRes<{ updated: boolean }>> {
   return http.put<{ updated: boolean }, ApiRes<{ updated: boolean }>>(
     `/admin/sessions/${sessionId}/name`,
-    { name },
+    { Name: name },
   )
 }
 
 // ===== 计费配置 =====
 export interface ContextTier {
-  min: number
-  max: number | null
-  coeff: number
+  Min: number
+  Max: number | null
+  Coeff: number
 }
 export interface Segment {
-  name: string
-  start: string // "HH:MM"
-  end: string // "HH:MM" 或 "24:00"
-  coeff: number
+  Name: string
+  Start: string // "HH:MM"
+  End: string // "HH:MM" 或 "24:00"
+  Coeff: number
 }
 export interface DateOverride {
-  name: string
-  start: string // "YYYY-MM-DD"
-  end: string
-  segments: Segment[]
+  Name: string
+  Start: string // "YYYY-MM-DD"
+  End: string
+  Segments: Segment[]
 }
 export interface TimeCoeffConfig {
-  timezone: string
-  default_coeff: number
-  periodic_segments: Segment[]
-  date_overrides: DateOverride[]
+  Timezone: string
+  Default: number
+  Periodic: Segment[]
+  Overrides: DateOverride[]
 }
-// r 可能为数字或数字字符串
+// r/cny_rate/credit_value 为后端 map 字面量键（保持 snake）；context_tiers/time_config 为 JSONB 原文（PascalCase）。
 export interface BillingConfigData {
   r: number | string
   cny_rate: number | string
@@ -673,32 +627,32 @@ export function getBillingConfig() {
   return http.get<BillingConfigData, ApiRes<BillingConfigData>>('/admin/configs/billing')
 }
 export function putBillingConfig(payload: {
-  r: number | string
-  cny_rate?: number | string
-  context_tiers: ContextTier[]
-  time_config: TimeCoeffConfig
+  R: number | string
+  CnyRate?: number | string
+  ContextTiers: ContextTier[]
+  TimeConfig: TimeCoeffConfig
 }) {
   return http.put<{ affected: number }, ApiRes<{ affected: number }>>('/admin/configs/billing', payload)
 }
 
-// ===== 公告 =====
+// ===== 公告（字段名 = Go 字段名）=====
 export interface AdminAnnouncement {
-  id: number
-  title: string
-  content: string
-  level: string // info | warning | danger
-  publish_at?: string
-  expire_at?: string
-  enabled: boolean
-  created_at: string
+  ID: string
+  Title: string
+  Content: string
+  Level: string // info | warning | danger
+  PublishAt?: string
+  ExpireAt?: string
+  Enabled: boolean
+  CreatedAt: string
 }
 export interface AnnouncementInput {
-  title: string
-  content: string
-  level: string
-  publish_at?: string | null
-  expire_at?: string | null
-  enabled?: boolean
+  Title: string
+  Content: string
+  Level: string
+  PublishAt?: string | null
+  ExpireAt?: string | null
+  Enabled?: boolean
 }
 export function listAnnouncements() {
   return http.get<{ list: AdminAnnouncement[] }, ApiRes<{ list: AdminAnnouncement[] }>>(
@@ -708,66 +662,17 @@ export function listAnnouncements() {
 export function createAnnouncement(payload: AnnouncementInput) {
   return http.post<AdminAnnouncement, ApiRes<AdminAnnouncement>>('/admin/announcements', payload)
 }
-export function updateAnnouncement(id: number, payload: AnnouncementInput) {
+export function updateAnnouncement(id: string, payload: AnnouncementInput) {
   return http.put<AdminAnnouncement, ApiRes<AdminAnnouncement>>(`/admin/announcements/${id}`, payload)
 }
-export function batchDeleteAnnouncements(ids: number[]) {
+export function batchDeleteAnnouncements(ids: string[]) {
   return http.post<{ deleted: number }, ApiRes<{ deleted: number }>>(
     '/admin/announcements/batch-delete',
-    { ids },
+    { IDs: ids },
   )
 }
 
-// ===== 价格同步：关注列表 + 告警 =====
-export interface WatchlistItem {
-  id: number
-  external_model_id: string
-  local_model_name: string
-  alert_on_change: boolean
-  last_synced_at?: string
-  created_at: string
-}
-export function listWatchlist() {
-  return http.get<{ list: WatchlistItem[] }, ApiRes<{ list: WatchlistItem[] }>>('/admin/watchlist')
-}
-export function upsertWatchlist(payload: {
-  external_model_id: string
-  local_model_name: string
-  alert_on_change: boolean
-}) {
-  return http.post<WatchlistItem, ApiRes<WatchlistItem>>('/admin/watchlist', payload)
-}
-export function batchDeleteWatchlist(ids: number[]) {
-  return http.post<{ deleted: number }, ApiRes<{ deleted: number }>>(
-    '/admin/watchlist/batch-delete',
-    { ids },
-  )
-}
+// ===== 价格同步：立即执行（watchlist/告警相关端点当前前端未使用） =====
 export function runSync() {
   return http.post<{ summary: string }, ApiRes<{ summary: string }>>('/admin/sync/run')
-}
-
-export interface SyncChange {
-  old: number
-  new: number
-  change_pct: number
-}
-export interface SyncAlert {
-  id: number
-  external_model_id: string
-  local_model_name: string
-  changes: Record<string, SyncChange>
-  status: string // pending | resolved | ignored
-  detected_at: string
-  resolved_at?: string
-}
-export function listAlerts(params: Record<string, unknown> = {}) {
-  return http.get<{ list: SyncAlert[] }, ApiRes<{ list: SyncAlert[] }>>('/admin/sync/alerts', {
-    params,
-  })
-}
-export function resolveAlert(id: number) {
-  return http.post<{ affected: number }, ApiRes<{ affected: number }>>(
-    `/admin/sync/alerts/${id}/resolve`,
-  )
 }

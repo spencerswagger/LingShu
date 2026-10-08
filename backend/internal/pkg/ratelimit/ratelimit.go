@@ -58,6 +58,27 @@ func (l *Limiter) Allow(ip, username string) error {
 	return nil
 }
 
+// AllowAndRecord 原子地完成「放行检查 + 预记一次失败」：判断 (ip, username) 是否可继续
+// 尝试，可则在同一临界区内先记一次失败再放行。这消除了 Allow（读计数）与
+// RecordFailure（写计数）分两次加锁的竞态窗口——并发请求可能同时通过 Allow，
+// 导致实际失败数超过窗口上限才触发锁定。
+//
+// 调用约定：放行后若口令校验失败，不要再次调用 RecordFailure（已预记）；
+// 校验成功则由 RecordSuccess 清零预记的计数。
+func (l *Limiter) AllowAndRecord(ip, username string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := l.now()
+	if until, ok := l.lockouts[username]; ok && now.Before(until) {
+		return ErrRateLimited
+	}
+	if c := l.ipUser[ip+"|"+username]; c != nil && now.Sub(c.start) < ipUserWindow && c.count >= ipUserMaxFailures {
+		return ErrRateLimited
+	}
+	l.recordLocked(ip, username, now)
+	return nil
+}
+
 // RecordFailure 记录一次失败；账号维度计数达到阈值时按指数退避锁定：
 // 第 10 次失败锁 1 分钟，其后每多 10 次失败翻倍，上限 60 分钟。
 //
@@ -67,7 +88,11 @@ func (l *Limiter) Allow(ip, username string) error {
 func (l *Limiter) RecordFailure(ip, username string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	now := l.now()
+	l.recordLocked(ip, username, l.now())
+}
+
+// recordLocked 在持锁下累计一次失败并推进锁定状态（供 RecordFailure / AllowAndRecord 共用）。
+func (l *Limiter) recordLocked(ip, username string, now time.Time) {
 	l.bump(l.ipUser, ip+"|"+username, now, ipUserWindow)
 	c := l.bump(l.users, username, now, userWindow)
 	if c.count >= userMaxFailures {

@@ -20,6 +20,7 @@ import {
 import ErrorBubble from '@/components/ErrorBubble.vue'
 import UserSelect from '@/components/UserSelect.vue'
 import ColumnFilter from '@/components/ColumnFilter.vue'
+import { fmtDate, fmtTime } from '@/utils/format'
 
 const route = useRoute()
 const router = useRouter()
@@ -30,7 +31,7 @@ const page = ref(1)
 const size = ref(20)
 const errInfo = ref<{ message: string; requestId: string }>({ message: '', requestId: '' })
 
-const stats = ref<BillingStats>({ requests: 0, credits_total: 0, tokens_total: 0, duration_total_ms: 0 })
+const stats = ref<BillingStats>({ Requests: 0, CreditsTotal: 0, TokensTotal: 0, DurationTotalMS: 0 })
 
 // ===== 列头筛选选项数据 =====
 const channels = ref<AdminChannel[]>([])
@@ -40,10 +41,10 @@ const tokens = ref<AdminToken[]>([])
 const sessions = ref<AdminSession[]>([])
 
 const filters = reactive({
-  user_id: (route.query.user_id ? Number(route.query.user_id) : undefined) as number | undefined,
-  token_id: undefined as number | undefined,
-  channel_id: undefined as number | undefined,
-  channel_key_id: undefined as number | undefined,
+  user_id: (route.query.user_id ? String(route.query.user_id) : undefined) as string | undefined,
+  token_id: undefined as string | undefined,
+  channel_id: undefined as string | undefined,
+  channel_key_id: undefined as string | undefined,
   session_id: undefined as string | undefined,
   model: undefined as string | undefined,
   status: undefined as string | undefined,
@@ -122,7 +123,7 @@ async function searchSessions(q: string) {
     sessions.value = []
   }
 }
-async function onChannelChange(id?: number) {
+async function onChannelChange(id?: string) {
   filters.channel_key_id = undefined
   channelKeys.value = []
   if (!id) return
@@ -185,29 +186,16 @@ onMounted(() => {
 })
 
 // ===== 展示格式化 =====
-function fmtDate(iso?: string): string {
-  if (!iso) return '-'
-  const d = new Date(iso)
-  if (isNaN(d.getTime())) return iso
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
-}
-function fmtTime(iso?: string): string {
-  if (!iso) return '-'
-  const d = new Date(iso)
-  if (isNaN(d.getTime())) return '-'
-  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}:${String(d.getSeconds()).padStart(2, '0')}`
-}
-
 // token 用量两行展示：第一行 输入/输出，第二行 缓存读/缓存写/推理（第二行全 0 不显示）
 function tokenLine1(row: AdminBillingItem): string {
-  const t = row.tokens || ({} as AdminBillingItem['tokens'])
+  const t = row.Tokens || ({} as AdminBillingItem['Tokens'])
   const parts: string[] = []
   if (t.input || t.input === 0) parts.push(`输入 ${t.input}`)
   if (t.output) parts.push(`输出 ${t.output}`)
   return parts.length ? parts.join(' · ') : '-'
 }
 function tokenLine2(row: AdminBillingItem): string {
-  const t = row.tokens || ({} as AdminBillingItem['tokens'])
+  const t = row.Tokens || ({} as AdminBillingItem['Tokens'])
   const parts: string[] = []
   if (t.cache_read) parts.push(`缓存读 ${t.cache_read}`)
   if (t.cache_write) parts.push(`缓存写 ${t.cache_write}`)
@@ -215,9 +203,9 @@ function tokenLine2(row: AdminBillingItem): string {
   return parts.join(' · ')
 }
 
-// 渠道-密钥双行：上渠道名，下密钥名（无 key_name 时 #<id> 兜底）
+// 渠道-密钥双行：上渠道名，下密钥名（无 key_name 时不展示兜底 ID）
 function keyLabel(row: AdminBillingItem): string {
-  return row.key_name || (row.channel_key_id ? `#${row.channel_key_id}` : '-')
+  return row.KeyName || '-'
 }
 
 function fmtMs(ms?: number | null): string {
@@ -227,37 +215,37 @@ function fmtMs(ms?: number | null): string {
 
 // 生成速率：输出 token / (总耗时 - 首字耗时)（流式）；非流式无首字 → 输出 / 总耗时。
 function tokenRate(row: AdminBillingItem): string {
-  const dur = row.duration_ms || 0
-  const first = row.first_token_ms
+  const dur = row.DurationMs || 0
+  const first = row.FirstTokenMs
   if (dur <= 0) return '-'
   const gen = first == null || first < 0 ? dur : dur - first
   if (gen <= 0) return '-'
-  const out = (row.tokens || {}).output || 0
+  const out = (row.Tokens || {}).output || 0
   if (!out) return '-'
   return `${Math.round((out / gen) * 1000)} tok/s`
 }
 
 // 统计栏：平均 RPM = 请求数 / 总耗时(分钟)；平均 TPM = 总 token / 总耗时(分钟)
 function avgRPM(): string {
-  const min = (stats.value.duration_total_ms || 0) / 60000
-  if (!stats.value.requests || min <= 0) return '-'
-  return (stats.value.requests / min).toFixed(1)
+  const min = (stats.value.DurationTotalMS || 0) / 60000
+  if (!stats.value.Requests || min <= 0) return '-'
+  return (stats.value.Requests / min).toFixed(1)
 }
 function avgTPM(): string {
-  const min = (stats.value.duration_total_ms || 0) / 60000
-  if (!stats.value.tokens_total || min <= 0) return '-'
-  return Math.round(stats.value.tokens_total / min).toLocaleString()
+  const min = (stats.value.DurationTotalMS || 0) / 60000
+  if (!stats.value.TokensTotal || min <= 0) return '-'
+  return Math.round(stats.value.TokensTotal / min).toLocaleString()
 }
-const creditsTotal = computed(() => stats.value.credits_total.toLocaleString(undefined, { maximumFractionDigits: 4 }))
-const tokensTotal = computed(() => stats.value.tokens_total.toLocaleString())
+const creditsTotal = computed(() => stats.value.CreditsTotal.toLocaleString(undefined, { maximumFractionDigits: 4 }))
+const tokensTotal = computed(() => stats.value.TokensTotal.toLocaleString())
 
 // 消耗积分公式（与详情页一致的三步式展示）：Token×单价 → 系数调整 → 积分换算
 function creditLines(row: AdminBillingItem): string[] {
-  const t = row.tokens || ({} as AdminBillingItem['tokens'])
-  const rates = row.rates || {}
-  const coeffTime = row.coeff_time ?? 1
-  const coeffCtx = row.coeff_context ?? 1
-  const r = row.r_value ?? 0
+  const t = row.Tokens || ({} as AdminBillingItem['Tokens'])
+  const rates = row.Rates || {}
+  const coeffTime = row.CoeffTime ?? 1
+  const coeffCtx = row.CoeffContext ?? 1
+  const r = row.RValue ?? 0
 
   const segs: Array<[number, string, string]> = [
     [t.input || 0, '输入', 'input'],
@@ -275,12 +263,12 @@ function creditLines(row: AdminBillingItem): string[] {
     sub1 += amt
     step1.push(`  ${label} ${n} × ${rate} = ${amt}`)
   }
-  if (!step1.length) return row.credits_consumed != null ? [`积分 ${row.credits_consumed}`] : ['-']
+  if (!step1.length) return row.CreditsConsumed != null ? [`积分 ${row.CreditsConsumed}`] : ['-']
   sub1 = Math.round(sub1 * 1e6) / 1e6
   const sub2 = Math.round(sub1 * coeffTime * coeffCtx * 1e6) / 1e6
   const final = r ? Math.round((sub2 / r) * 1e6) / 1e6 : sub2
   return [
-    `Token × 单价${row.pricing_mode === 'cost' ? '（成本）' : ''}`,
+    `Token × 单价${row.PricingMode === 'cost' ? '（成本）' : ''}`,
     ...step1,
     `  小计 = ${sub1}`,
     `系数调整：时段 ×${coeffTime}，分档 ×${coeffCtx} → ${sub2}`,
@@ -288,9 +276,9 @@ function creditLines(row: AdminBillingItem): string[] {
   ]
 }
 
-// 会话选项展示：名称优先，缺失用短 session_id。
+// 会话选项展示：名称优先，缺失用「未命名」。
 function sessionLabel(s: AdminSession): string {
-  return s.name || s.session_id.slice(0, 16)
+  return s.SessionName || '未命名'
 }
 </script>
 
@@ -325,8 +313,8 @@ function sessionLabel(s: AdminSession): string {
         border
         stripe
         class="table-nowrap clickable-rows"
-        row-key="billing_id"
-        @row-click="(row: AdminBillingItem) => router.push(`/admin/billings/${row.billing_id}`)"
+        row-key="BillingID"
+        @row-click="(row: AdminBillingItem) => router.push(`/admin/billings/${row.BillingID}`)"
       >
         <!-- 时间：筛选图标 → 浮窗时间段选择器 -->
         <el-table-column label="时间" min-width="130" align="center">
@@ -345,8 +333,8 @@ function sessionLabel(s: AdminSession): string {
           </template>
           <template #default="{ row }">
             <div class="t-time">
-              <span class="t-date">{{ fmtDate(row.call_time) }}</span>
-              <span class="t-clock">{{ fmtTime(row.call_time) }}</span>
+              <span class="t-date">{{ fmtDate(row.CallTime) }}</span>
+              <span class="t-clock">{{ fmtTime(row.CallTime) }}</span>
             </div>
           </template>
         </el-table-column>
@@ -372,9 +360,9 @@ function sessionLabel(s: AdminSession): string {
                 >
                   <el-option
                     v-for="tk in tokens"
-                    :key="tk.id"
-                    :label="tk.display_name || tk.token_display"
-                    :value="tk.id"
+                    :key="tk.ID"
+                    :label="tk.DisplayName || tk.TokenDisplay"
+                    :value="tk.ID"
                   />
                 </el-select>
               </div>
@@ -382,8 +370,8 @@ function sessionLabel(s: AdminSession): string {
           </template>
           <template #default="{ row }">
             <div class="t-time">
-              <span class="t-date">{{ row.user_nickname || row.username || '-' }}</span>
-              <span class="t-clock">{{ row.user_nickname && row.username ? '@' + row.username + ' · ' : '' }}{{ row.token_name || '-' }}</span>
+              <span class="t-date">{{ row.UserNickname || row.Username || '-' }}</span>
+              <span class="t-clock">{{ row.UserNickname && row.Username ? '@' + row.Username + ' · ' : '' }}{{ row.TokenName || '-' }}</span>
             </div>
           </template>
         </el-table-column>
@@ -400,14 +388,14 @@ function sessionLabel(s: AdminSession): string {
                 size="small"
                 style="width: 100%"
               >
-                <el-option v-for="m in models" :key="m.id" :label="m.external_name" :value="m.external_name" />
+                <el-option v-for="m in models" :key="m.ID" :label="m.ExternalName" :value="m.ExternalName" />
               </el-select>
             </ColumnFilter>
           </template>
           <template #default="{ row }">
             <div class="t-time">
-              <span class="t-date">{{ row.model || '-' }}</span>
-              <span class="t-clock">{{ row.internal_model_id || '-' }}</span>
+              <span class="t-date">{{ row.ExternalModel || '-' }}</span>
+              <span class="t-clock">{{ row.InternalModelID || '-' }}</span>
             </div>
           </template>
         </el-table-column>
@@ -440,14 +428,14 @@ function sessionLabel(s: AdminSession): string {
                   style="width: 100%"
                   :disabled="!filters.channel_id"
                 >
-                  <el-option v-for="k in channelKeys" :key="k.id" :label="k.name" :value="k.id" />
+                  <el-option v-for="k in channelKeys" :key="k.ID" :label="k.Name" :value="k.ID" />
                 </el-select>
               </div>
             </ColumnFilter>
           </template>
           <template #default="{ row }">
             <div class="t-time">
-              <span class="t-date">{{ row.channel_name || '-' }}</span>
+              <span class="t-date">{{ row.ChannelName || '-' }}</span>
               <span class="t-clock">{{ keyLabel(row) }}</span>
             </div>
           </template>
@@ -468,12 +456,12 @@ function sessionLabel(s: AdminSession): string {
                 :remote-method="(q: string) => searchSessions(q)"
                 @update:model-value="(v: any) => (filters.session_id = v ?? undefined)"
               >
-                <el-option v-for="s in sessions" :key="s.session_id" :label="sessionLabel(s)" :value="s.session_id" />
+                <el-option v-for="s in sessions" :key="s.SessionID" :label="sessionLabel(s)" :value="s.SessionID" />
               </el-select>
             </ColumnFilter>
           </template>
           <template #default="{ row }">
-            <span class="tok">{{ row.session_name || '-' }}</span>
+            <span class="tok">{{ row.SessionName || '-' }}</span>
           </template>
         </el-table-column>
 
@@ -495,8 +483,8 @@ function sessionLabel(s: AdminSession): string {
                 <div>速率：{{ tokenRate(row) }}</div>
               </template>
               <div class="t-time right">
-                <span class="t-date">首字 {{ fmtMs(row.first_token_ms) }}</span>
-                <span class="t-clock">总 {{ fmtMs(row.duration_ms) }}</span>
+                <span class="t-date">首字 {{ fmtMs(row.FirstTokenMs) }}</span>
+                <span class="t-clock">总 {{ fmtMs(row.DurationMs) }}</span>
               </div>
             </el-tooltip>
           </template>
@@ -513,8 +501,8 @@ function sessionLabel(s: AdminSession): string {
             </ColumnFilter>
           </template>
           <template #default="{ row }">
-            <span :class="['st', row.status === 'completed' ? 'st-ok' : 'st-fail']">
-              {{ row.status === 'completed' ? '成功' : '失败' }}
+            <span :class="['st', row.Status === 'completed' ? 'st-ok' : 'st-fail']">
+              {{ row.Status === 'completed' ? '成功' : '失败' }}
             </span>
           </template>
         </el-table-column>
@@ -525,16 +513,16 @@ function sessionLabel(s: AdminSession): string {
             <el-tooltip placement="top">
               <template #content>
                 <div style="text-align: left">
-                  <template v-if="row.status !== 'completed'">
-                    <div class="tip-fail">{{ row.error_message || '失败' }}</div>
+                  <template v-if="row.Status !== 'completed'">
+                    <div class="tip-fail">{{ row.ErrorMessage || '失败' }}</div>
                   </template>
                   <template v-else>
                     <div v-for="line in creditLines(row)" :key="line">{{ line }}</div>
                   </template>
                 </div>
               </template>
-              <span class="credit" :class="{ fail: row.status !== 'completed' }">
-                {{ row.credits_consumed ?? '-' }}
+              <span class="credit" :class="{ fail: row.Status !== 'completed' }">
+                {{ row.CreditsConsumed ?? '-' }}
               </span>
             </el-tooltip>
           </template>

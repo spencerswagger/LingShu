@@ -8,7 +8,7 @@ import ErrorBubble from '@/components/ErrorBubble.vue'
 
 const route = useRoute()
 const router = useRouter()
-const id = Number(route.params.id)
+const id = String(route.params.id)
 
 const loading = ref(false)
 const saving = ref(false)
@@ -50,10 +50,10 @@ async function onSubmit() {
   errInfo.value = { message: '', requestId: '' }
   try {
     await updateTag(id, {
-      name: form.name.trim(),
-      description: form.description,
-      kv_pairs: { ...form.kv_pairs },
-      enabled: form.enabled,
+      Name: form.name.trim(),
+      Description: form.description,
+      KVPairs: { ...form.kv_pairs },
+      Enabled: form.enabled,
     })
     ElMessage.success('标签已更新')
     router.push('/admin/tags')

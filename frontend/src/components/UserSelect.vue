@@ -5,11 +5,11 @@ import { onMounted, ref, watch } from 'vue'
 import { listUsers, getUser, type AdminUser } from '@/api/admin'
 
 const props = defineProps<{
-  modelValue: number | null | undefined
+  modelValue: string | null | undefined
   placeholder?: string
   clearable?: boolean
 }>()
-const emit = defineEmits<{ (e: 'update:modelValue', v: number | null): void }>()
+const emit = defineEmits<{ (e: 'update:modelValue', v: string | null): void }>()
 
 const loading = ref(false)
 const options = ref<AdminUser[]>([])
@@ -30,7 +30,7 @@ async function search(q: string) {
   }
 }
 
-function onChange(v: number | null | undefined) {
+function onChange(v: string | null | undefined) {
   const hit = options.value.find((u) => u.ID === v) || null
   selected.value = hit
   // 保留用户名到输入框便于展示

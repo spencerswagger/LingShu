@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/team/llmgateway/internal/domain/billing"
+	"github.com/team/llmgateway/internal/pkg/idgen"
 	"github.com/team/llmgateway/internal/pkg/resp"
 )
 
@@ -28,17 +29,17 @@ func NewHandler(svc *Service) *Handler {
 	return &Handler{svc: svc}
 }
 
-// viewModel 是对外模型的对外展示结构（显式 snake_case，避免领域字段泄漏）。
+// viewModel 是对外模型的对外展示结构（PascalCase 契约）。
 type viewModel struct {
-	ID           int64                    `json:"id"`
-	ExternalName string                   `json:"external_name"`
-	Description  string                   `json:"description"`
-	Enabled      bool                     `json:"enabled"`
-	SaleRates    billing.Rates            `json:"sale_rates"`
-	TimeConfig   *billing.TimeCoeffConfig `json:"time_config,omitempty"`
-	ContextTiers []billing.TierRule       `json:"context_tiers,omitempty"`
-	CreatedAt    time.Time                `json:"created_at"`
-	UpdatedAt    time.Time                `json:"updated_at"`
+	ID           int64                    `json:"ID,string"`
+	ExternalName string                   `json:"ExternalName"`
+	Description  string                   `json:"Description"`
+	Enabled      bool                     `json:"Enabled"`
+	SaleRates    billing.Rates            `json:"SaleRates"`
+	TimeConfig   *billing.TimeCoeffConfig `json:"TimeConfig,omitempty"`
+	ContextTiers []billing.TierRule       `json:"ContextTiers,omitempty"`
+	CreatedAt    time.Time                `json:"CreatedAt"`
+	UpdatedAt    time.Time                `json:"UpdatedAt"`
 }
 
 func toView(m *ExternalModel) viewModel {
@@ -56,12 +57,12 @@ func toView(m *ExternalModel) viewModel {
 }
 
 type createModelRequest struct {
-	ExternalName string                   `json:"external_name"`
-	Description  string                   `json:"description"`
-	Enabled      *bool                    `json:"enabled"`
-	SaleRates    billing.Rates            `json:"sale_rates"`
-	TimeConfig   *billing.TimeCoeffConfig `json:"time_config"`
-	ContextTiers []billing.TierRule       `json:"context_tiers"`
+	ExternalName string                   `json:"ExternalName"`
+	Description  string                   `json:"Description"`
+	Enabled      *bool                    `json:"Enabled"`
+	SaleRates    billing.Rates            `json:"SaleRates"`
+	TimeConfig   *billing.TimeCoeffConfig `json:"TimeConfig"`
+	ContextTiers []billing.TierRule       `json:"ContextTiers"`
 }
 
 func decodeBody(w http.ResponseWriter, r *http.Request, v any) bool {
@@ -144,7 +145,7 @@ func (h *Handler) HandleUpdate(w http.ResponseWriter, r *http.Request) {
 }
 
 type batchDeleteRequest struct {
-	IDs []int64 `json:"ids"`
+	IDs idgen.IDs `json:"IDs"`
 }
 
 // HandleBatchDelete POST /api/v1/admin/models/batch-delete
@@ -153,7 +154,7 @@ func (h *Handler) HandleBatchDelete(w http.ResponseWriter, r *http.Request) {
 	if !decodeBody(w, r, &req) {
 		return
 	}
-	n, err := h.svc.BatchDeleteModels(r.Context(), req.IDs)
+	n, err := h.svc.BatchDeleteModels(r.Context(), []int64(req.IDs))
 	if err != nil {
 		writeServiceErr(w, r, err)
 		return

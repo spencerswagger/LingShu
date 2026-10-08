@@ -24,10 +24,10 @@ async function onSubmit() {
   errInfo.value = { message: '', requestId: '' }
   try {
     await createTag({
-      name: form.name.trim(),
-      description: form.description,
-      kv_pairs: { ...form.kv_pairs },
-      enabled: form.enabled,
+      Name: form.name.trim(),
+      Description: form.description,
+      KVPairs: { ...form.kv_pairs },
+      Enabled: form.enabled,
     })
     ElMessage.success('标签已创建')
     router.push('/admin/tags')

@@ -31,9 +31,9 @@ const displayList = computed(() => {
   return list.value.filter((m) => {
     const hitQ =
       !q ||
-      (m.external_name || '').toLowerCase().includes(q) ||
-      (m.description || '').toLowerCase().includes(q)
-    const hitEn = filters.enabled === undefined || String(m.enabled) === filters.enabled
+      (m.ExternalName || '').toLowerCase().includes(q) ||
+      (m.Description || '').toLowerCase().includes(q)
+    const hitEn = filters.enabled === undefined || String(m.Enabled) === filters.enabled
     return hitQ && hitEn
   })
 })
@@ -59,7 +59,7 @@ function fmtRate(v: number | null | undefined): string {
 }
 
 function ratesDetail(m: ExternalModel): string {
-  const r = m.sale_rates || {}
+  const r = m.SaleRates || {}
   const parts = rateKeys.map((k) => `${rateLabels[k]} ${fmtRate(r[k])}`)
   return `${parts.join('，')}（单位：人民币元/百万 token）`
 }
@@ -67,7 +67,7 @@ function ratesDetail(m: ExternalModel): string {
 async function onDelete(row: ExternalModel) {
   try {
     await ElMessageBox.confirm(
-      `确认删除对外模型「${row.external_name}」吗？相关渠道内部模型的绑定关系将受影响。`,
+      `确认删除对外模型「${row.ExternalName}」吗？相关渠道内部模型的绑定关系将受影响。`,
       '删除确认',
       { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' },
     )
@@ -75,7 +75,7 @@ async function onDelete(row: ExternalModel) {
     return
   }
   try {
-    await batchDeleteExternalModels([row.id])
+    await batchDeleteExternalModels([row.ID])
     ElMessage.success('已删除')
     await load()
   } catch (e: any) {
@@ -85,7 +85,7 @@ async function onDelete(row: ExternalModel) {
 
 async function onBatchDelete() {
   if (!selected.value.length) return
-  const ids = selected.value.map((r) => r.id)
+  const ids = selected.value.map((r) => r.ID)
   try {
     await ElMessageBox.confirm(
       `确认删除选中的 ${ids.length} 个对外模型吗？`,
@@ -170,9 +170,9 @@ async function onSyncPrices() {
         border
         stripe
         class="table-nowrap clickable-rows"
-        row-key="id"
+        row-key="ID"
         @selection-change="(rows: any[]) => (selected = rows)"
-        @row-click="(row: ExternalModel, _c: unknown, e: Event) => !(e.target as HTMLElement)?.closest('.op-cell') && router.push(`/admin/models/${row.id}/edit`)"
+        @row-click="(row: ExternalModel, _c: unknown, e: Event) => !(e.target as HTMLElement)?.closest('.op-cell') && router.push(`/admin/models/${row.ID}/edit`)"
       >
         <el-table-column type="selection" width="44" />
         <el-table-column label="对外名称 / 描述" min-width="200">
@@ -189,29 +189,29 @@ async function onSyncPrices() {
           </template>
           <template #default="{ row }">
             <div class="t-time">
-              <span class="t-date">{{ row.external_name }}</span>
-              <span class="t-clock ellipsis">{{ row.description || '-' }}</span>
+              <span class="t-date">{{ row.ExternalName }}</span>
+              <span class="t-clock ellipsis">{{ row.Description || '-' }}</span>
             </div>
           </template>
         </el-table-column>
         <el-table-column label="售价·输入" width="110" align="right">
           <template #default="{ row }">
             <el-tooltip :content="ratesDetail(row)" placement="top">
-              <span class="rate-cell">{{ fmtRate(row.sale_rates?.input) }}</span>
+              <span class="rate-cell">{{ fmtRate(row.SaleRates?.input) }}</span>
             </el-tooltip>
           </template>
         </el-table-column>
         <el-table-column label="售价·输出" width="110" align="right">
           <template #default="{ row }">
             <el-tooltip :content="ratesDetail(row)" placement="top">
-              <span class="rate-cell">{{ fmtRate(row.sale_rates?.output) }}</span>
+              <span class="rate-cell">{{ fmtRate(row.SaleRates?.output) }}</span>
             </el-tooltip>
           </template>
         </el-table-column>
         <el-table-column label="售价·缓存读" width="120" align="right">
           <template #default="{ row }">
             <el-tooltip :content="ratesDetail(row)" placement="top">
-              <span class="rate-cell">{{ fmtRate(row.sale_rates?.cache_read) }}</span>
+              <span class="rate-cell">{{ fmtRate(row.SaleRates?.cache_read) }}</span>
             </el-tooltip>
           </template>
         </el-table-column>
@@ -225,8 +225,8 @@ async function onSyncPrices() {
             </ColumnFilter>
           </template>
           <template #default="{ row }">
-            <el-tag :type="row.enabled ? 'success' : 'info'" effect="plain" size="small">
-              {{ row.enabled ? '启用' : '停用' }}
+            <el-tag :type="row.Enabled ? 'success' : 'info'" effect="plain" size="small">
+              {{ row.Enabled ? '启用' : '停用' }}
             </el-tag>
           </template>
         </el-table-column>
@@ -234,7 +234,7 @@ async function onSyncPrices() {
           <template #default="{ row }">
             <div class="op-cell" @click.stop>
               <el-tooltip content="编辑" placement="top">
-                <el-icon class="op-icon" @click="router.push(`/admin/models/${row.id}/edit`)"><Edit /></el-icon>
+                <el-icon class="op-icon" @click="router.push(`/admin/models/${row.ID}/edit`)"><Edit /></el-icon>
               </el-tooltip>
               <el-tooltip content="删除" placement="top">
                 <el-icon class="op-icon danger" @click="onDelete(row)"><Delete /></el-icon>

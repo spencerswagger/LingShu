@@ -65,31 +65,32 @@ func (h *Admin) SetSessionNameSetter(fn func(ctx context.Context, sessionID, nam
 
 // billingListItem 账单列表项（user_id 仅内部传参用，前端展示一律用 Username）。
 // Tokens 为五段用量；Rates/CoeffTime/CoeffContext/RValue 供前端悬停展示计费公式。
+// Tokens/Rates 为 billing 存储结构（JSONB 契约），内部字段保持 snake_case。
 type billingListItem struct {
-	BillingID       string        `json:"billing_id"`
-	UserID          int64         `json:"user_id"`
-	Username        string        `json:"username,omitempty"`
-	UserNickname    string        `json:"user_nickname,omitempty"` // 昵称（join users；为空表示未设置）
-	TokenName       string        `json:"token_name,omitempty"`
-	ExternalModel   string        `json:"model"`
-	PricingMode     string        `json:"pricing_mode"`
-	CreditsConsumed float64       `json:"credits_consumed"`
-	Status          string        `json:"status"`
-	CallTime        time.Time     `json:"call_time"`
-	InternalModelID string        `json:"internal_model_id"`
-	ChannelKeyID    int64         `json:"channel_key_id"`
-	KeyName         string        `json:"key_name,omitempty"` // 密钥名（join channel_keys；缺失时兜底 #<id>）
-	SessionID       string        `json:"session_id,omitempty"`
-	SessionName     string        `json:"session_name,omitempty"` // 会话可读名（sessions.name；缺失留空）
-	ChannelName     string        `json:"channel_name,omitempty"`
-	Tokens          billing.Usage `json:"tokens"`
-	Rates           billing.Rates `json:"rates,omitempty"`
-	CoeffTime       float64       `json:"coeff_time,omitempty"`
-	CoeffContext    float64       `json:"coeff_context,omitempty"`
-	RValue          int64         `json:"r_value,omitempty"`
-	ErrorMessage    string        `json:"error_message,omitempty"`
-	DurationMs      *int64        `json:"duration_ms,omitempty"`
-	FirstTokenMs    *int64        `json:"first_token_ms,omitempty"`
+	BillingID       string        `json:"BillingID"`
+	UserID          int64         `json:"UserID,string"`
+	Username        string        `json:"Username,omitempty"`
+	UserNickname    string        `json:"UserNickname,omitempty"` // 昵称（join users；为空表示未设置）
+	TokenName       string        `json:"TokenName,omitempty"`
+	ExternalModel   string        `json:"ExternalModel"`
+	PricingMode     string        `json:"PricingMode"`
+	CreditsConsumed float64       `json:"CreditsConsumed"`
+	Status          string        `json:"Status"`
+	CallTime        time.Time     `json:"CallTime"`
+	InternalModelID string        `json:"InternalModelID"`
+	ChannelKeyID    int64         `json:"ChannelKeyID,string"`
+	KeyName         string        `json:"KeyName,omitempty"` // 密钥名（join channel_keys；缺失时兜底 #<id>）
+	SessionID       string        `json:"SessionID,omitempty"`
+	SessionName     string        `json:"SessionName,omitempty"` // 会话可读名（sessions.name；缺失留空）
+	ChannelName     string        `json:"ChannelName,omitempty"`
+	Tokens          billing.Usage `json:"Tokens"`
+	Rates           billing.Rates `json:"Rates,omitempty"`
+	CoeffTime       float64       `json:"CoeffTime,omitempty"`
+	CoeffContext    float64       `json:"CoeffContext,omitempty"`
+	RValue          int64         `json:"RValue,omitempty"`
+	ErrorMessage    string        `json:"ErrorMessage,omitempty"`
+	DurationMs      *int64        `json:"DurationMs,omitempty"`
+	FirstTokenMs    *int64        `json:"FirstTokenMs,omitempty"`
 }
 
 func toListItem(rec *billing.Record) billingListItem {
@@ -506,10 +507,10 @@ func (h *Admin) HandleGetBillingConfig(w http.ResponseWriter, r *http.Request) {
 // HandlePutBillingConfig PUT /api/v1/admin/configs/billing
 func (h *Admin) HandlePutBillingConfig(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		R            json.RawMessage `json:"r"`
-		CnyRate      json.RawMessage `json:"cny_rate"`
-		ContextTiers json.RawMessage `json:"context_tiers"`
-		TimeConfig   json.RawMessage `json:"time_config"`
+		R            json.RawMessage `json:"R"`
+		CnyRate      json.RawMessage `json:"CnyRate"`
+		ContextTiers json.RawMessage `json:"ContextTiers"`
+		TimeConfig   json.RawMessage `json:"TimeConfig"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "请求体格式错误")
@@ -624,22 +625,22 @@ func parseSize(v string) int {
 // sessionListItem 会话列表项：user/token/key 名称在可能时批量反查填充（查询失败为空串）；
 // 原始 ID 一并输出，供前端在名称缺失时兜底展示。
 type sessionListItem struct {
-	SessionID      string    `json:"session_id"`
-	UserID         int64     `json:"user_id"`
-	UserName       string    `json:"user_name,omitempty"`
-	UserNickname   string    `json:"user_nickname,omitempty"` // 昵称（为空表示未设置）
-	TokenID        int64     `json:"token_id,omitempty"`
-	TokenName      string    `json:"token_name,omitempty"`
-	Model          string    `json:"model"`
-	ChannelKeyID   int64     `json:"channel_key_id"`
-	ChannelKeyName string    `json:"channel_key_name,omitempty"`
-	SessionRaw     string    `json:"session_raw"`
-	SessionName    string    `json:"name"`
-	Closed         bool      `json:"closed"`
-	CreatedAt      time.Time `json:"created_at"`
-	LastActive     time.Time `json:"last_active"`
-	ExpireAt       time.Time `json:"expire_at"`
-	Expired        bool      `json:"expired"`
+	SessionID      string    `json:"SessionID"`
+	UserID         int64     `json:"UserID,string"`
+	UserName       string    `json:"UserName,omitempty"`
+	UserNickname   string    `json:"UserNickname,omitempty"` // 昵称（为空表示未设置）
+	TokenID        int64     `json:"TokenID,string,omitempty"`
+	TokenName      string    `json:"TokenName,omitempty"`
+	Model          string    `json:"Model"`
+	ChannelKeyID   int64     `json:"ChannelKeyID,string"`
+	ChannelKeyName string    `json:"ChannelKeyName,omitempty"`
+	SessionRaw     string    `json:"SessionRaw"`
+	SessionName    string    `json:"SessionName"`
+	Closed         bool      `json:"Closed"`
+	CreatedAt      time.Time `json:"CreatedAt"`
+	LastActive     time.Time `json:"LastActive"`
+	ExpireAt       time.Time `json:"ExpireAt"`
+	Expired        bool      `json:"Expired"`
 }
 
 // HandleListSessions GET /api/v1/admin/sessions
@@ -777,10 +778,10 @@ func (h *Admin) HandleListSessions(w http.ResponseWriter, r *http.Request) {
 
 // kickSessionsRequest 踢下线请求体：任一维度非空即执行，多条件并存为 AND（与 B4 KillByFilter 语义一致）。
 type kickSessionsRequest struct {
-	SessionIDs   []string `json:"session_ids"`
-	UserID       int64    `json:"user_id"`
-	TokenID      int64    `json:"token_id"`
-	ChannelKeyID int64    `json:"channel_key_id"`
+	SessionIDs   []string `json:"SessionIDs"`
+	UserID       int64    `json:"UserID,string"`
+	TokenID      int64    `json:"TokenID,string"`
+	ChannelKeyID int64    `json:"ChannelKeyID,string"`
 }
 
 // HandleKickSessions POST /api/v1/admin/sessions/kick
@@ -815,7 +816,7 @@ func (h *Admin) HandleKickSessions(w http.ResponseWriter, r *http.Request) {
 
 // renameSessionRequest 会话改名请求体。
 type renameSessionRequest struct {
-	Name string `json:"name"`
+	Name string `json:"Name"`
 }
 
 // HandleRenameSession PUT /api/v1/admin/sessions/{id}/name
