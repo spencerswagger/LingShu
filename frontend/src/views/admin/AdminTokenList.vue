@@ -2,7 +2,8 @@
 import { onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Delete, Key, Link, Plus } from '@element-plus/icons-vue'
-import { listTokens, batchDeleteTokens, createToken, getTokenSecret, listTags, type AdminToken } from '@/api/admin'
+import { listTokens, batchDeleteTokens, createToken, getTokenSecret, listTags, type AdminToken, type AdminTag } from '@/api/admin'
+import { fmtDate, fmtTime } from '@/utils/format'
 import ErrorBubble from '@/components/ErrorBubble.vue'
 import UserSelect from '@/components/UserSelect.vue'
 import ColumnFilter from '@/components/ColumnFilter.vue'
@@ -13,7 +14,7 @@ const total = ref(0)
 const page = ref(1)
 const size = ref(20)
 const filters = reactive({
-  user_id: undefined as number | undefined,
+  user_id: undefined as string | undefined,
   status: undefined as string | undefined,
 })
 const errInfo = ref<{ message: string; requestId: string }>({ message: '', requestId: '' })
@@ -23,33 +24,26 @@ const selected = ref<AdminToken[]>([])
 const createOpen = ref(false)
 const createSaving = ref(false)
 const createErr = ref<{ message: string; requestId: string }>({ message: '', requestId: '' })
-const createForm = ref({ user_id: null as number | null, display_name: '', tag_id: null as number | null, expires_at: null as string | null })
+const createForm = ref({ UserID: null as string | null, DisplayName: '', TagID: null as string | null, ExpiresAt: null as string | null })
 const tags = ref<AdminTag[]>([])
-const createdPlain = ref<{ plain: string; display: string } | null>(null)
+const createdPlain = ref<{ Plain: string; Display: string } | null>(null)
 
 // 查看密钥弹窗
 const secretOpen = ref(false)
 const secretLoading = ref(false)
-const secretPlain = ref<{ plain: string; display: string } | null>(null)
+const secretPlain = ref<{ Plain: string; Display: string } | null>(null)
 const secretName = ref('')
-
-interface AdminTag {
-  ID: number
-  Name: string
-  Description: string
-  Enabled: boolean
-}
 
 async function load() {
   loading.value = true
   errInfo.value = { message: '', requestId: '' }
-  const params: Record<string, unknown> = { page: page.value, size: size.value }
-  if (filters.user_id) params.user_id = filters.user_id
-  if (filters.status) params.status = filters.status
+  const params: Record<string, unknown> = { Page: page.value, Size: size.value }
+  if (filters.user_id) params.UserID = filters.user_id
+  if (filters.status) params.Status = filters.status
   try {
     const res = await listTokens(params)
-    list.value = res.data.list
-    total.value = res.data.total
+    list.value = res.Data.List
+    total.value = res.Data.Total
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
   } finally {
@@ -64,44 +58,31 @@ watch(() => `${filters.user_id}|${filters.status}`, (v, o) => {
 })
 onMounted(() => {
   load()
-  listTags({ enabled: true }).then((r) => (tags.value = (r.data || []).filter((t) => t.Enabled))).catch(() => (tags.value = []))
+  listTags({ Enabled: true }).then((r) => (tags.value = (r.Data || []).filter((t) => t.Enabled))).catch(() => (tags.value = []))
 })
-
-// 时间展示（短格式：日期 + 时分）
-function fmtDate(iso?: string): string {
-  if (!iso) return '-'
-  const d = new Date(iso)
-  if (isNaN(d.getTime())) return iso.slice(0, 10)
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
-}
-function fmtTime(iso?: string): string {
-  if (!iso) return '-'
-  const d = new Date(iso)
-  if (isNaN(d.getTime())) return '-'
-  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
-}
 
 // ---- 新建令牌（弹窗） ----
 function openCreate() {
   createOpen.value = true
   createdPlain.value = null
-  createForm.value = { user_id: null, display_name: '', tag_id: null, expires_at: null }
+  createForm.value = { UserID: null, DisplayName: '', TagID: null, ExpiresAt: null }
   createErr.value = { message: '', requestId: '' }
 }
 
 async function submitCreate() {
-  if (!createForm.value.user_id) return ElMessage.warning('请选择所属用户')
-  if (!createForm.value.display_name.trim()) return ElMessage.warning('请填写令牌名称')
+  const uid = createForm.value.UserID
+  if (!uid) return ElMessage.warning('请选择所属用户')
+  if (!createForm.value.DisplayName.trim()) return ElMessage.warning('请填写令牌名称')
   createSaving.value = true
   createErr.value = { message: '', requestId: '' }
   try {
     const res = await createToken({
-      user_id: createForm.value.user_id,
-      display_name: createForm.value.display_name.trim(),
-      tag_id: createForm.value.tag_id,
-      expires_at: createForm.value.expires_at,
+      UserID: uid,
+      DisplayName: createForm.value.DisplayName.trim(),
+      TagID: createForm.value.TagID,
+      ExpiresAt: createForm.value.ExpiresAt,
     })
-    createdPlain.value = res.data
+    createdPlain.value = res.Data
     ElMessage.success('令牌已创建')
     await load()
   } catch (e: any) {
@@ -120,15 +101,25 @@ async function copyText(text: string) {
   }
 }
 
-// ---- 查看密钥（可反复复制） ----
+// ---- 查看密钥（可反复复制；敏感操作需口令二次验证） ----
 async function onViewSecret(row: AdminToken) {
+  let pwd = ''
+  try {
+    const r = await ElMessageBox.prompt('查看明文密钥需要验证当前登录口令', '口令验证', {
+      inputType: 'password',
+      inputPlaceholder: '当前口令',
+    })
+    pwd = r.value
+  } catch {
+    return
+  }
   secretOpen.value = true
   secretLoading.value = true
-  secretName.value = row.display_name
+  secretName.value = row.DisplayName
   secretPlain.value = null
   try {
-    const res = await getTokenSecret(row.id)
-    secretPlain.value = res.data
+    const res = await getTokenSecret(row.ID, pwd)
+    secretPlain.value = res.Data
   } catch (e: any) {
     secretPlain.value = null
     ElMessage.error(e?.message || '查看密钥失败')
@@ -140,7 +131,7 @@ async function onViewSecret(row: AdminToken) {
 async function onDelete(row: AdminToken) {
   try {
     await ElMessageBox.confirm(
-      `确认删除令牌「${row.display_name}」吗？删除后立即失效不可恢复。`,
+      `确认删除令牌「${row.DisplayName}」吗？删除后立即失效不可恢复。`,
       '删除确认',
       { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' },
     )
@@ -148,7 +139,7 @@ async function onDelete(row: AdminToken) {
     return
   }
   try {
-    await batchDeleteTokens([row.id])
+    await batchDeleteTokens([row.ID])
     ElMessage.success('已删除')
     await load()
   } catch (e: any) {
@@ -158,7 +149,7 @@ async function onDelete(row: AdminToken) {
 
 async function onBatchDelete() {
   if (!selected.value.length) return
-  const ids = selected.value.map((r) => r.id)
+  const ids = selected.value.map((r) => r.ID)
   try {
     await ElMessageBox.confirm(
       `确认删除选中的 ${ids.length} 个令牌吗？此操作不可恢复。`,
@@ -207,15 +198,15 @@ function copyBaseUrl() {
         border
         stripe
         class="table-nowrap"
-        row-key="id"
+        row-key="ID"
         @selection-change="(rows: any[]) => (selected = rows)"
       >
         <el-table-column type="selection" width="44" />
         <el-table-column label="名称 / 标识" min-width="190">
           <template #default="{ row }">
             <div class="t-time">
-              <span class="t-date">{{ row.display_name }}</span>
-              <span class="t-clock mono">{{ row.token_display }}</span>
+              <span class="t-date">{{ row.DisplayName }}</span>
+              <span class="t-clock mono">{{ row.TokenDisplay }}</span>
             </div>
           </template>
         </el-table-column>
@@ -227,8 +218,8 @@ function copyBaseUrl() {
           </template>
           <template #default="{ row }">
             <div class="t-time">
-              <span class="t-date">{{ row.user_nickname || row.username || '-' }}</span>
-              <span v-if="row.user_nickname" class="t-clock">@{{ row.username }}</span>
+              <span class="t-date">{{ row.UserNickname || row.Username || '-' }}</span>
+              <span v-if="row.UserNickname" class="t-clock">@{{ row.Username }}</span>
             </div>
           </template>
         </el-table-column>
@@ -242,24 +233,24 @@ function copyBaseUrl() {
             </ColumnFilter>
           </template>
           <template #default="{ row }">
-            <el-tag :type="row.status === 'ACTIVE' ? 'success' : 'danger'" size="small" effect="light">
-              {{ row.status === 'ACTIVE' ? '启用' : '禁用' }}
+            <el-tag :type="row.Status === 'ACTIVE' ? 'success' : 'danger'" size="small" effect="light">
+              {{ row.Status === 'ACTIVE' ? '启用' : '禁用' }}
             </el-tag>
           </template>
         </el-table-column>
         <el-table-column label="最近使用 / 过期" min-width="190">
           <template #default="{ row }">
             <div class="t-time">
-              <span class="t-date">{{ row.last_used_at ? `${fmtDate(row.last_used_at)} ${fmtTime(row.last_used_at)}` : '从未使用' }}</span>
-              <span class="t-clock">{{ row.expires_at ? `${fmtDate(row.expires_at)} ${fmtTime(row.expires_at)}` : '永不过期' }}</span>
+              <span class="t-date">{{ row.LastUsedAt ? `${fmtDate(row.LastUsedAt)} ${fmtTime(row.LastUsedAt)}` : '从未使用' }}</span>
+              <span class="t-clock">{{ row.ExpiresAt ? `${fmtDate(row.ExpiresAt)} ${fmtTime(row.ExpiresAt)}` : '永不过期' }}</span>
             </div>
           </template>
         </el-table-column>
         <el-table-column label="创建时间" min-width="130">
           <template #default="{ row }">
             <div class="t-time">
-              <span class="t-date">{{ fmtDate(row.created_at) }}</span>
-              <span class="t-clock">{{ fmtTime(row.created_at) }}</span>
+              <span class="t-date">{{ fmtDate(row.CreatedAt) }}</span>
+              <span class="t-clock">{{ fmtTime(row.CreatedAt) }}</span>
             </div>
           </template>
         </el-table-column>
@@ -298,28 +289,28 @@ function copyBaseUrl() {
     <el-dialog v-model="createOpen" title="新建令牌" width="560px" :close-on-click-modal="false" destroy-on-close>
       <template v-if="createdPlain">
         <div class="plain-warning">令牌已创建，请复制并妥善保存。关闭后仍可在列表中随时查看/复制。</div>
-        <el-input :model-value="createdPlain.plain" readonly class="mono">
+        <el-input :model-value="createdPlain.Plain" readonly class="mono">
           <template #append>
-            <el-button text @click="copyText(createdPlain.plain)">复制</el-button>
+            <el-button text @click="copyText(createdPlain.Plain)">复制</el-button>
           </template>
         </el-input>
-        <div class="plain-tip">标识：<span class="mono">{{ createdPlain.display }}</span></div>
+        <div class="plain-tip">标识：<span class="mono">{{ createdPlain.Display }}</span></div>
       </template>
       <el-form v-else label-width="100px">
         <el-form-item label="所属用户" required>
-          <UserSelect v-model="createForm.user_id" placeholder="按用户名搜索" />
+          <UserSelect v-model="createForm.UserID" placeholder="按用户名搜索" />
         </el-form-item>
         <el-form-item label="令牌名称" required>
-          <el-input v-model="createForm.display_name" maxlength="64" placeholder="如 生产环境" />
+          <el-input v-model="createForm.DisplayName" maxlength="64" placeholder="如 生产环境" />
         </el-form-item>
         <el-form-item label="语义标签">
-          <el-select v-model="createForm.tag_id" placeholder="默认路由" clearable style="width: 100%">
+          <el-select v-model="createForm.TagID" placeholder="默认路由" clearable style="width: 100%">
             <el-option v-for="t in tags" :key="t.ID" :label="t.Name" :value="t.ID" />
           </el-select>
         </el-form-item>
         <el-form-item label="过期时间">
           <el-date-picker
-            v-model="createForm.expires_at"
+            v-model="createForm.ExpiresAt"
             type="datetime"
             value-format="YYYY-MM-DDTHH:mm:ssZ"
             placeholder="留空 = 永不过期"
@@ -345,9 +336,9 @@ function copyBaseUrl() {
     <el-dialog v-model="secretOpen" :title="`查看密钥 - ${secretName}`" width="520px" :close-on-click-modal="false">
       <div v-loading="secretLoading">
         <template v-if="secretPlain">
-          <el-input :model-value="secretPlain.plain" readonly class="mono">
+          <el-input :model-value="secretPlain.Plain" readonly class="mono">
             <template #append>
-              <el-button text @click="copyText(secretPlain.plain)">复制</el-button>
+              <el-button text @click="copyText(secretPlain.Plain)">复制</el-button>
             </template>
           </el-input>
           <div class="plain-tip">密钥可随时反复查看/复制。如怀疑泄露，可删除后新建。</div>

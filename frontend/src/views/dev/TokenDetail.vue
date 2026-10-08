@@ -8,7 +8,7 @@ import ErrorBubble from '@/components/ErrorBubble.vue'
 
 const route = useRoute()
 const router = useRouter()
-const tokenId = Number(route.params.id)
+const tokenId = String(route.params.id)
 
 const loading = ref(false)
 const token = ref<DevToken | null>(null)
@@ -25,7 +25,7 @@ async function copyPlain() {
   ElMessage.success('已复制')
 }
 
-const statusDesc = computed(() => token.value?.status || '')
+const statusDesc = computed(() => token.value?.Status || '')
 
 // 开发端未提供单条查询，复用列表按 id 定位
 async function load() {
@@ -33,7 +33,7 @@ async function load() {
   errInfo.value = { message: '', requestId: '' }
   try {
     const res = await listDevTokens(1, 500)
-    token.value = res.data.list.find((t) => t.id === tokenId) || null
+    token.value = res.Data.List.find((t) => t.ID === tokenId) || null
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
   } finally {
@@ -45,9 +45,9 @@ onMounted(load)
 async function onToggle() {
   if (!token.value) return
   try {
-    const res = await toggleDevToken(token.value.id)
-    token.value.status = res.data.status
-    ElMessage.success(res.data.status === 'ACTIVE' ? '已启用' : '已禁用')
+    const res = await toggleDevToken(token.value.ID)
+    token.value.Status = res.Data.Status
+    ElMessage.success(res.Data.Status === 'ACTIVE' ? '已启用' : '已禁用')
   } catch (e: any) {
     ElMessage.error(e?.message || '操作失败')
   }
@@ -56,9 +56,9 @@ async function onToggle() {
 async function onRotate() {
   if (!token.value) return
   try {
-    const res = await rotateDevToken(token.value.id)
-    rotatePlain.value = res.data.plain
-    rotateDisplay.value = res.data.display
+    const res = await rotateDevToken(token.value.ID)
+    rotatePlain.value = res.Data.Plain
+    rotateDisplay.value = res.Data.Display
     rotateDialog.value = true
     await load()
   } catch (e: any) {
@@ -75,7 +75,7 @@ async function onRotate() {
         <div class="switch-row">
           <span>启用状态</span>
           <el-switch
-            :model-value="token.status === 'ACTIVE'"
+            :model-value="token.Status === 'ACTIVE'"
             inline-prompt
             active-text="启"
             inactive-text="禁"
@@ -83,18 +83,18 @@ async function onRotate() {
           />
         </div>
         <el-descriptions :column="1" border>
-          <el-descriptions-item label="名称">{{ token.display_name }}</el-descriptions-item>
+          <el-descriptions-item label="名称">{{ token.DisplayName }}</el-descriptions-item>
           <el-descriptions-item label="标识">
-            <span class="mono">{{ token.token_display }}</span>
+            <span class="mono">{{ token.TokenDisplay }}</span>
           </el-descriptions-item>
           <el-descriptions-item label="路由">
-            <el-tag v-if="!token.tag_id" size="small" type="info" effect="plain">默认路由</el-tag>
-            <el-tag v-else size="small" effect="plain">标签 #{{ token.tag_id }}</el-tag>
+            <el-tag v-if="!token.TagID" size="small" type="info" effect="plain">默认路由</el-tag>
+            <el-tag v-else size="small" effect="plain">已绑定标签</el-tag>
           </el-descriptions-item>
           <el-descriptions-item label="状态"><StatusTag :value="statusDesc" /></el-descriptions-item>
-          <el-descriptions-item label="创建时间">{{ token.created_at }}</el-descriptions-item>
-          <el-descriptions-item label="最近使用">{{ token.last_used_at || '-' }}</el-descriptions-item>
-          <el-descriptions-item label="过期时间">{{ token.expires_at || '永不过期' }}</el-descriptions-item>
+          <el-descriptions-item label="创建时间">{{ token.CreatedAt }}</el-descriptions-item>
+          <el-descriptions-item label="最近使用">{{ token.LastUsedAt || '-' }}</el-descriptions-item>
+          <el-descriptions-item label="过期时间">{{ token.ExpiresAt || '永不过期' }}</el-descriptions-item>
         </el-descriptions>
 
         <div class="ops">

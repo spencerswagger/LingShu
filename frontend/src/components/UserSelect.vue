@@ -5,11 +5,11 @@ import { onMounted, ref, watch } from 'vue'
 import { listUsers, getUser, type AdminUser } from '@/api/admin'
 
 const props = defineProps<{
-  modelValue: number | null | undefined
+  modelValue: string | null | undefined
   placeholder?: string
   clearable?: boolean
 }>()
-const emit = defineEmits<{ (e: 'update:modelValue', v: number | null): void }>()
+const emit = defineEmits<{ (e: 'update:modelValue', v: string | null): void }>()
 
 const loading = ref(false)
 const options = ref<AdminUser[]>([])
@@ -21,8 +21,8 @@ const selected = ref<AdminUser | null>(null)
 async function search(q: string) {
   loading.value = true
   try {
-    const res = await listUsers({ q, page: 1, size: 50 })
-    options.value = res.data.list || []
+    const res = await listUsers({ Q: q, Page: 1, Size: 50 })
+    options.value = res.Data.List || []
   } catch {
     options.value = []
   } finally {
@@ -30,7 +30,7 @@ async function search(q: string) {
   }
 }
 
-function onChange(v: number | null | undefined) {
+function onChange(v: string | null | undefined) {
   const hit = options.value.find((u) => u.ID === v) || null
   selected.value = hit
   // 保留用户名到输入框便于展示
@@ -49,7 +49,7 @@ watch(
     }
     try {
       const res = await getUser(v)
-      const u = res.data?.user
+      const u = res.Data?.User
       if (u) {
         selected.value = u
         kw.value = u.Username

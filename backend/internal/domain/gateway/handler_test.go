@@ -332,9 +332,10 @@ func doRequestH(t *testing.T, gw *Gateway, path, token, body string, hdr map[str
 	return rec
 }
 
-func decodeBody(t *testing.T, rec *httptest.ResponseRecorder) resp.Body {
+// decodeOpenAIError 解析 /v1 的 OpenAI 标准错误体 {"error":{"message","type","code"}}。
+func decodeOpenAIError(t *testing.T, rec *httptest.ResponseRecorder) openAIErrorBody {
 	t.Helper()
-	var rb resp.Body
+	var rb openAIErrorBody
 	if err := json.Unmarshal(rec.Body.Bytes(), &rb); err != nil {
 		t.Fatalf("decode resp body: %v (body=%s)", err, rec.Body.String())
 	}
@@ -422,8 +423,8 @@ func TestServeModelNotFound(t *testing.T) {
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("want 404, got %d", rec.Code)
 	}
-	if rb := decodeBody(t, rec); rb.Code != resp.CodeNotFound {
-		t.Errorf("code want 40401, got %d", rb.Code)
+	if rb := decodeOpenAIError(t, rec); rb.Error.Code != "model_not_found" || rb.Error.Type != "invalid_request_error" {
+		t.Errorf("error want code=model_not_found type=invalid_request_error, got %+v", rb.Error)
 	}
 	assertChannelOpaque(t, rec)
 	if len(h.billing.reqs) != 1 || !h.billing.reqs[0].Fail || h.billing.reqs[0].ExternalModel != "ghost" {
@@ -447,8 +448,8 @@ func TestServeInsufficient(t *testing.T) {
 	if rec.Code != http.StatusPaymentRequired {
 		t.Fatalf("want 402, got %d: %s", rec.Code, rec.Body.String())
 	}
-	if rb := decodeBody(t, rec); rb.Code != resp.CodeInsufficient {
-		t.Errorf("code want 40201, got %d", rb.Code)
+	if rb := decodeOpenAIError(t, rec); rb.Error.Code != "insufficient_quota" || rb.Error.Type != "insufficient_quota" {
+		t.Errorf("error want code/type=insufficient_quota, got %+v", rb.Error)
 	}
 	if strings.Contains(rec.Body.String(), `"choice"`) {
 		t.Errorf("upstream success content leaked on 402: %s", rec.Body.String())
@@ -468,8 +469,8 @@ func TestServeUpstream429(t *testing.T) {
 	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("want 429, got %d", rec.Code)
 	}
-	if rb := decodeBody(t, rec); rb.Code != resp.CodeRateLimited {
-		t.Errorf("code want 42901, got %d", rb.Code)
+	if rb := decodeOpenAIError(t, rec); rb.Error.Code != "rate_limit_exceeded" || rb.Error.Type != "rate_limit_error" {
+		t.Errorf("error want code=rate_limit_exceeded type=rate_limit_error, got %+v", rb.Error)
 	}
 	if len(h.chans.feeds) == 0 || !h.chans.feeds[0].fb.Is429 {
 		t.Errorf("expected Is429 feedback, got %+v", h.chans.feeds)
@@ -484,8 +485,8 @@ func TestServeUnauthorized(t *testing.T) {
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("want 401, got %d", rec.Code)
 	}
-	if rb := decodeBody(t, rec); rb.Code != resp.CodeUnauthorized {
-		t.Errorf("code want 40101, got %d", rb.Code)
+	if rb := decodeOpenAIError(t, rec); rb.Error.Code != "invalid_api_key" || rb.Error.Type != "invalid_request_error" {
+		t.Errorf("error want code=invalid_api_key type=invalid_request_error, got %+v", rb.Error)
 	}
 }
 
@@ -498,8 +499,8 @@ func TestServeNoRoute(t *testing.T) {
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("want 503, got %d", rec.Code)
 	}
-	if rb := decodeBody(t, rec); rb.Code != resp.CodeNoRoute {
-		t.Errorf("code want 50301, got %d", rb.Code)
+	if rb := decodeOpenAIError(t, rec); rb.Error.Code != "service_unavailable" || rb.Error.Type != "server_error" {
+		t.Errorf("error want code=service_unavailable type=server_error, got %+v", rb.Error)
 	}
 	if len(h.billing.reqs) != 1 || !h.billing.reqs[0].Fail {
 		t.Fatalf("no-route must write 1 failed billing, got %+v", h.billing.reqs)

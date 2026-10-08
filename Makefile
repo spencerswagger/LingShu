@@ -12,8 +12,9 @@ keys:
 migrate:
 	cd backend && [ -f config.yaml ] || cp config.example.yaml config.yaml; go run ./cmd/server -migrate-only -config config.yaml
 run:
-	# 说明：security.sm4_key 必填（缺失会直接退出）。config.yaml 由 example 复制得来，
-	# 自带本地开发默认值；生产环境请务必替换为 openssl rand -hex 16 生成的强随机密钥。
+	# 说明：security.sm4_key 留空即自动生成——启动时从 keys/sm4.key 读取，文件不存在则
+	# 生成强随机密钥写入（chmod 600），后续重启复用；不提供公开默认密钥。多环境需共用
+	# 同一密钥时，用 openssl rand -hex 16 生成后显式配置。
 	cd backend && [ -f config.yaml ] || cp config.example.yaml config.yaml; go run ./cmd/server -config config.yaml
 test:
 	cd backend && go test ./...

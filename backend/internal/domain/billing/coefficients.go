@@ -8,9 +8,9 @@ import (
 
 // TierRule 上下文分档规则。
 type TierRule struct {
-	Min   int64   `json:"min"`
-	Max   *int64  `json:"max"` // nil 表示无上限
-	Coeff float64 `json:"coeff"`
+	Min   int64   `json:"Min"`
+	Max   *int64  `json:"Max"` // nil 表示无上限
+	Coeff float64 `json:"Coeff"`
 }
 
 // ContextTierCoeff 根据 inputTokens 落在的分档返回系数。
@@ -34,26 +34,26 @@ func ContextTierCoeff(inputTokens int64, tiers []TierRule) (float64, error) {
 
 // Segment 一段时间段。
 type Segment struct {
-	Name  string  `json:"name"`
-	Start string  `json:"start"` // "HH:MM"
-	End   string  `json:"end"`   // "HH:MM"，"24:00" 表示日末
-	Coeff float64 `json:"coeff"`
+	Name  string  `json:"Name"`
+	Start string  `json:"Start"` // "HH:MM"
+	End   string  `json:"End"`   // "HH:MM"，"24:00" 表示日末
+	Coeff float64 `json:"Coeff"`
 }
 
 // DateOverride 指定日期范围内的时段覆盖（忽略周期段）。
 type DateOverride struct {
-	Name     string    `json:"name"`
-	Start    string    `json:"start"` // "YYYY-MM-DD"
-	End      string    `json:"end"`
-	Segments []Segment `json:"segments"`
+	Name     string    `json:"Name"`
+	Start    string    `json:"Start"` // "YYYY-MM-DD"
+	End      string    `json:"End"`
+	Segments []Segment `json:"Segments"`
 }
 
 // TimeCoeffConfig 时段系数配置。
 type TimeCoeffConfig struct {
-	Timezone  string         `json:"timezone"`
-	Default   float64        `json:"default_coeff"`
-	Periodic  []Segment      `json:"periodic_segments"`
-	Overrides []DateOverride `json:"date_overrides"`
+	Timezone  string         `json:"Timezone"`
+	Default   float64        `json:"Default"`
+	Periodic  []Segment      `json:"Periodic"`
+	Overrides []DateOverride `json:"Overrides"`
 }
 
 // parseTimeOfDay 解析 "HH:MM" 为距 0 点的分钟数（0..1439）。"24:00" 视为 1440（日末边界）。

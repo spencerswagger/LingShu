@@ -17,57 +17,58 @@ import (
 
 // statsKPI 顶部关键指标。
 type statsKPI struct {
-	TotalTokens     int64   `json:"total_tokens"`
-	TotalCredits    float64 `json:"total_credits"`
-	TotalRequests   int64   `json:"total_requests"`
-	FailedRequests  int64   `json:"failed_requests"`
-	SuccessRate     float64 `json:"success_rate"` // 0~1
-	AvgDurationMS   float64 `json:"avg_duration_ms"`
-	AvgFirstTokenMS float64 `json:"avg_first_token_ms"`
-	RPM             float64 `json:"rpm"`
-	TPM             float64 `json:"tpm"`
-	DeltaTokens     float64 `json:"delta_tokens"`   // 环比上期（比例，可为负）
-	DeltaCredits    float64 `json:"delta_credits"`
-	DeltaRequests   float64 `json:"delta_requests"`
+	TotalTokens     int64   `json:"TotalTokens"`
+	TotalCredits    float64 `json:"TotalCredits"`
+	TotalRequests   int64   `json:"TotalRequests"`
+	FailedRequests  int64   `json:"FailedRequests"`
+	SuccessRate     float64 `json:"SuccessRate"` // 0~1
+	AvgDurationMS   float64 `json:"AvgDurationMS"`
+	AvgFirstTokenMS float64 `json:"AvgFirstTokenMS"`
+	RPM             float64 `json:"RPM"`
+	TPM             float64 `json:"TPM"`
+	DeltaTokens     float64 `json:"DeltaTokens"` // 环比上期（比例，可为负）
+	DeltaCredits    float64 `json:"DeltaCredits"`
+	DeltaRequests   float64 `json:"DeltaRequests"`
 }
 
 // statsCounts 三态计数（渠道 / 密钥共用）。
 type statsCounts struct {
-	Total    int `json:"total"`
-	Normal   int `json:"normal"`
-	Drain    int `json:"drain"`
-	Disabled int `json:"disabled"`
+	Total    int `json:"Total"`
+	Normal   int `json:"Normal"`
+	Drain    int `json:"Drain"`
+	Disabled int `json:"Disabled"`
 }
 
 // statsModelCounts 模型计数（对外模型 / 渠道内部模型）。
 type statsModelCounts struct {
-	ExternalTotal   int `json:"external_total"`
-	ExternalEnabled int `json:"external_enabled"`
-	InternalTotal   int `json:"internal_total"`
-	InternalNormal  int `json:"internal_normal"`
+	ExternalTotal   int `json:"ExternalTotal"`
+	ExternalEnabled int `json:"ExternalEnabled"`
+	InternalTotal   int `json:"InternalTotal"`
+	InternalNormal  int `json:"InternalNormal"`
 }
 
 // statsOps 运维块。
 type statsOps struct {
-	Channels statsCounts      `json:"channels"`
-	Keys     statsCounts      `json:"keys"`
-	Models   statsModelCounts `json:"models"`
+	Channels statsCounts      `json:"Channels"`
+	Keys     statsCounts      `json:"Keys"`
+	Models   statsModelCounts `json:"Models"`
 }
 
 // statsResp 统计页响应（admin/dev 共用；ops 仅 admin 返回）。
 type statsResp struct {
-	Scope string                 `json:"scope"` // global | self
-	From  string                 `json:"from"`
-	To    string                 `json:"to"`
-	KPI   statsKPI               `json:"kpi"`
-	Usage billing.DashboardStats `json:"usage"`
-	Ops   *statsOps              `json:"ops,omitempty"`
+	Scope string                 `json:"Scope"` // global | self
+	From  string                 `json:"From"`
+	To    string                 `json:"To"`
+	KPI   statsKPI               `json:"KPI"`
+	Usage billing.DashboardStats `json:"Usage"`
+	Ops   *statsOps              `json:"Ops,omitempty"`
 }
 
 // statsRangeFromQuery 解析 from/to（RFC3339，缺省近 30 天），归一到整天边界，限制跨度 ≤366 天。
+// 日界统一按 Asia/Shanghai 归一（与全站统计口径一致），不随请求自带时区偏移截断。
 func statsRangeFromQuery(q url.Values, now time.Time) (time.Time, time.Time, error) {
 	to := now
-	if v := q.Get("to"); v != "" {
+	if v := q.Get("To"); v != "" {
 		t, err := time.Parse(time.RFC3339, v)
 		if err != nil {
 			return time.Time{}, time.Time{}, errors.New("to 时间格式应为 RFC3339")
@@ -75,7 +76,7 @@ func statsRangeFromQuery(q url.Values, now time.Time) (time.Time, time.Time, err
 		to = t
 	}
 	from := to.AddDate(0, 0, -29) // 近 30 天（含今天）
-	if v := q.Get("from"); v != "" {
+	if v := q.Get("From"); v != "" {
 		t, err := time.Parse(time.RFC3339, v)
 		if err != nil {
 			return time.Time{}, time.Time{}, errors.New("from 时间格式应为 RFC3339")
@@ -88,9 +89,21 @@ func statsRangeFromQuery(q url.Values, now time.Time) (time.Time, time.Time, err
 	if to.Sub(from) > 366*24*time.Hour {
 		return time.Time{}, time.Time{}, errors.New("时间跨度不能超过 366 天")
 	}
-	from = time.Date(from.Year(), from.Month(), from.Day(), 0, 0, 0, 0, from.Location())
-	to = time.Date(to.Year(), to.Month(), to.Day(), 23, 59, 59, 0, to.Location())
+	loc := cnLocation()
+	fromCN := from.In(loc)
+	toCN := to.In(loc)
+	from = time.Date(fromCN.Year(), fromCN.Month(), fromCN.Day(), 0, 0, 0, 0, loc)
+	to = time.Date(toCN.Year(), toCN.Month(), toCN.Day(), 23, 59, 59, 0, loc)
 	return from, to, nil
+}
+
+// cnLocation 返回北京时间时区；加载失败回退进程本地时区（进程时区已在启动时统一为 Asia/Shanghai）。
+func cnLocation() *time.Location {
+	loc, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		return time.Local
+	}
+	return loc
 }
 
 // deltaRatio 环比比例：(cur-prev)/prev；prev<=0 时返回 0。

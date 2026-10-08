@@ -5,7 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 )
@@ -75,8 +75,13 @@ func NewSessionRegistry(now func() time.Time) *SessionRegistry {
 		byKy:  make(map[int64]map[string]bool),
 		now:   now,
 		stop:  make(chan struct{}),
-		logf:  log.Printf,
+		logf:  defaultSessionLogf,
 	}
+}
+
+// defaultSessionLogf 会话持久化失败的默认日志输出（与历史 log.Printf 同语义，改为 slog）。
+func defaultSessionLogf(format string, args ...any) {
+	slog.Default().Info(fmt.Sprintf(format, args...))
 }
 
 // SetStore 注入持久化投影存储（nil=禁用持久化，仅内存；现有调用方兼容）。
@@ -94,7 +99,7 @@ func (r *SessionRegistry) SetKeyChannelOf(fn func(keyID int64) int64) {
 	r.keyChannelOf = fn
 }
 
-// SetLogger 注入持久化失败日志函数（nil 关闭日志；默认标准 log.Printf）。
+// SetLogger 注入持久化失败日志函数（nil 关闭日志；默认 slog.Info）。
 func (r *SessionRegistry) SetLogger(fn func(format string, args ...any)) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

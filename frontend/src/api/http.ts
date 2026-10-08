@@ -3,16 +3,16 @@ import { ElMessage } from 'element-plus'
 import { useAuthStore } from '@/stores/auth'
 import router from '@/router'
 
-// 后端统一响应体：{code, message, request_id, data}
+// 后端统一响应体：{Code, Message, RequestID, Data}
 export interface ApiBody<T = unknown> {
-  code: number
-  message: string
-  request_id: string
-  data: T
+  Code: number
+  Message: string
+  RequestID: string
+  Data: T
 }
 
 // API 返回类型：成功拦截器已将响应解包为响应体 ApiBody<T>，
-// 故 axios 第二泛型（R）固定为 ApiBody<T>，调用方通过 res.data 取真实载荷。
+// 故 axios 第二泛型（R）固定为 ApiBody<T>，调用方通过 res.Data 取真实载荷。
 export type ApiRes<T> = ApiBody<T>
 
 // 归一化后的错误对象（供页面 ErrorBubble 展示 + 复制 requestId）
@@ -32,15 +32,15 @@ http.interceptors.request.use((cfg) => {
   return cfg
 })
 
-// 响应拦截：后端统一返回 {code,message,request_id,data}，成功时直接解出该 body
+// 响应拦截：后端统一返回 {Code,Message,RequestID,Data}，成功时直接解出该 body
 http.interceptors.response.use(
   (r) => r.data,
   (err) => {
     const body = err.response?.data
-    const message = body?.message || '网络异常，请稍后重试'
-    const requestId = body?.request_id || ''
+    const message = body?.Message || '网络异常，请稍后重试'
+    const requestId = body?.RequestID || ''
     // 40302：需先修改默认密码 → 置位 mustChange 并跳转改密页（放 401 处理之前）
-    if (err.response?.status === 403 && body?.code === 40302) {
+    if (err.response?.status === 403 && body?.Code === 40302) {
       useAuthStore().setMustChange(true)
       if (router.currentRoute.value.path !== '/change-password') {
         router.push('/change-password')
@@ -57,7 +57,7 @@ http.interceptors.response.use(
     return Promise.reject<ApiError>({
       message,
       requestId,
-      code: body?.code,
+      code: body?.Code,
       status: err.response?.status,
     })
   },

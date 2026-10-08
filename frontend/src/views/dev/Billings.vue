@@ -18,8 +18,8 @@ async function load() {
   errInfo.value = { message: '', requestId: '' }
   try {
     const res = await listDevBillings(page.value, size.value)
-    list.value = res.data.list
-    total.value = res.data.total
+    list.value = res.Data.List
+    total.value = res.Data.Total
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
   } finally {
@@ -41,29 +41,24 @@ onMounted(load)
         border
         stripe
         class="table-nowrap clickable-rows"
-        @row-click="(row: BillingItem) => router.push(`/dev/billings/${row.billing_id}`)"
+        @row-click="(row: BillingItem) => router.push(`/dev/billings/${row.BillingID}`)"
       >
-        <el-table-column label="账单 ID" prop="billing_id" min-width="260" show-overflow-tooltip>
-          <template #default="{ row }">
-            <span class="mono">{{ row.billing_id }}</span>
-          </template>
-        </el-table-column>
         <el-table-column label="时间" min-width="170">
-          <template #default="{ row }">{{ row.call_time }}</template>
+          <template #default="{ row }">{{ row.CallTime }}</template>
         </el-table-column>
-        <el-table-column label="模型" prop="model" min-width="160" show-overflow-tooltip />
+        <el-table-column label="模型" prop="ExternalModel" min-width="160" show-overflow-tooltip />
         <el-table-column label="模式" width="100" align="center">
           <template #default="{ row }">
-            <el-tag :type="row.pricing_mode === 'cost' ? 'warning' : 'primary'" size="small" effect="plain">
-              {{ row.pricing_mode === 'cost' ? '按成本' : '按售价' }}
+            <el-tag :type="row.PricingMode === 'cost' ? 'warning' : 'primary'" size="small" effect="plain">
+              {{ row.PricingMode === 'cost' ? '按成本' : '按售价' }}
             </el-tag>
           </template>
         </el-table-column>
         <el-table-column label="积分" width="110" align="right">
-          <template #default="{ row }">{{ row.credits_consumed }}</template>
+          <template #default="{ row }">{{ row.CreditsConsumed }}</template>
         </el-table-column>
         <el-table-column label="状态" width="90" align="center">
-          <template #default="{ row }"><StatusTag :value="row.status" /></template>
+          <template #default="{ row }"><StatusTag :value="row.Status" /></template>
         </el-table-column>
       </el-table>
 

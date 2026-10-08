@@ -130,7 +130,7 @@ const router = createRouter({
   ],
 })
 
-router.beforeEach((to) => {
+router.beforeEach(async (to) => {
   const auth = useAuthStore()
   // 未登录：除登录页外均跳登录
   if (!auth.token && to.name !== 'login') {
@@ -140,9 +140,15 @@ router.beforeEach((to) => {
   if (auth.token && to.name === 'login') {
     return auth.role === 'ADMIN' ? '/admin' : '/dev'
   }
-  // 角色校验
+  // 已登录访问受保护页：先拉取最新用户信息，同步本地角色（堵住本地清 role 绕过，
+  // 并解决管理员降权后本地角色陈旧的问题——后端 /auth/me 始终返回权威角色）。
+  if (auth.token) {
+    await auth.fetchProfile()
+    if (!auth.token) return { name: 'login', query: { redirect: to.fullPath } }
+  }
+  // 角色校验：角色缺失或与页面要求不符一律拦截（不再用 `auth.role &&` 短路跳过）
   const need = to.meta.roles as string[] | undefined
-  if (need && need.length && auth.role && !need.includes(auth.role)) {
+  if (need && need.length && !need.includes(auth.role)) {
     return { name: 'forbidden' }
   }
   // 强制改密：非白名单页一律跳改密页

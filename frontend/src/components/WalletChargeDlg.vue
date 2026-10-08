@@ -10,7 +10,7 @@ type OpMode = 'add' | 'sub' | 'set'
 
 const props = defineProps<{
   modelValue: boolean
-  userId: number
+  userId: string
   username: string
   nickname?: string
   balance: number
@@ -26,6 +26,7 @@ const QUICK = [10, 50, 100, 500]
 const opMode = ref<OpMode>('add')
 const amount = ref(0)
 const remark = ref('')
+const password = ref('')
 const loading = ref(false)
 
 watch(visible, (v) => {
@@ -33,6 +34,7 @@ watch(visible, (v) => {
     opMode.value = 'add'
     amount.value = 0
     remark.value = ''
+    password.value = ''
   }
 })
 
@@ -63,14 +65,15 @@ async function submit() {
     return ElMessage.warning('目标余额不能为负')
   if (opMode.value === 'sub' && !previewValid)
     return ElMessage.warning('减少后余额不能为负')
+  if (!password.value) return ElMessage.warning('请输入当前登录口令')
   loading.value = true
   try {
     if (opMode.value === 'add') {
-      await rechargeWallet(props.userId, amount.value, remark.value)
+      await rechargeWallet(props.userId, amount.value, remark.value, password.value)
     } else if (opMode.value === 'sub') {
-      await adjustWallet(props.userId, -amount.value, remark.value)
+      await adjustWallet(props.userId, -amount.value, remark.value, password.value)
     } else {
-      await setWallet(props.userId, amount.value, remark.value)
+      await setWallet(props.userId, amount.value, remark.value, password.value)
     }
     ElMessage.success('操作成功')
     visible.value = false
@@ -114,6 +117,14 @@ async function submit() {
       </el-form-item>
       <el-form-item label="备注">
         <el-input v-model="remark" type="textarea" :rows="2" placeholder="选填" />
+      </el-form-item>
+      <el-form-item label="口令">
+        <el-input
+          v-model="password"
+          type="password"
+          show-password
+          placeholder="当前登录口令（资金操作需二次验证）"
+        />
       </el-form-item>
     </el-form>
     <template #footer>

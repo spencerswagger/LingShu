@@ -23,7 +23,7 @@ func TestStore_Insert(t *testing.T) {
 	}
 	now := time.Now()
 	mock.ExpectQuery(regexp.QuoteMeta(insertChannelSQL)).
-		WithArgs("c1", "openai-compat", "https://x.example.com",
+		WithArgs(sqlmock.AnyArg(), "c1", "openai-compat", "https://x.example.com",
 			sqlmock.AnyArg(), 100, 0, "NORMAL", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), 0).
 		WillReturnRows(channelRow(&Channel{
 			ID: 7, Name: "c1", Protocol: "openai-compat", BaseURL: "https://x.example.com",
@@ -101,9 +101,9 @@ func TestStore_InsertEvent_ListEvents(t *testing.T) {
 	s := NewStore(db)
 
 	now := time.Now()
-	ins := `INSERT INTO channel_events(channel_id, from_state, to_state, reason) VALUES($1,$2,$3,$4) RETURNING ` + eventCols
+	ins := `INSERT INTO channel_events(id, channel_id, from_state, to_state, reason) VALUES($1,$2,$3,$4,$5) RETURNING ` + eventCols
 	mock.ExpectQuery(regexp.QuoteMeta(ins)).
-		WithArgs(int64(1), "NORMAL", "DISABLED", "auth_failure").
+		WithArgs(sqlmock.AnyArg(), int64(1), "NORMAL", "DISABLED", "auth_failure").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "channel_id", "from_state", "to_state", "reason", "created_at"}).
 			AddRow(int64(10), int64(1), "NORMAL", "DISABLED", "auth_failure", now))
 

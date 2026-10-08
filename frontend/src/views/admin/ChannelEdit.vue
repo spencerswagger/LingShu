@@ -31,7 +31,7 @@ import ErrorBubble from '@/components/ErrorBubble.vue'
 
 const route = useRoute()
 const router = useRouter()
-const id = Number(route.params.id)
+const id = String(route.params.id)
 
 const loading = ref(false)
 const saving = ref(false)
@@ -50,14 +50,14 @@ const keys = ref<ChannelKey[]>([])
 const keysLoading = ref(false)
 const keyDrawerOpen = ref(false)
 const keySaving = ref(false)
-const keyEditingId = ref<number | null>(null) // null = 新增
+const keyEditingId = ref<string | null>(null) // null = 新增
 const keyForm = reactive({ name: '', credential: '' })
 
 const form = reactive({
   name: '',
   protocol: 'openai-compat',
   base_url: '',
-  tag_ids: [] as number[],
+  tag_ids: [] as string[],
   priority: 100,
   weight: 1,
   session_ttl_minutes: 60,
@@ -83,11 +83,11 @@ const form = reactive({
 
 const stateLabel: Record<string, string> = { NORMAL: '正常', DRAIN: '排空', DISABLED: '禁用' }
 
-const tagOptions = ref<{ ID: number; Name: string }[]>([])
+const tagOptions = ref<{ ID: string; Name: string }[]>([])
 async function loadTags() {
   try {
-    const res = await listTags({ enabled: true })
-    tagOptions.value = res.data || []
+    const res = await listTags({ Enabled: true })
+    tagOptions.value = res.Data || []
   } catch {
     tagOptions.value = []
   }
@@ -163,7 +163,7 @@ async function refreshCronPreview() {
     }
     try {
       const res = await cronPreview(form.interval, 5)
-      cronFutures.value = res.data?.times || []
+      cronFutures.value = res.Data?.Times || []
     } catch {
       cronFutures.value = []
     }
@@ -180,9 +180,9 @@ async function load() {
   loading.value = true
   errInfo.value = { message: '', requestId: '' }
   try {
-    const [res, cmRes] = await Promise.all([listChannels(), listChannelModels(id).catch(() => ({ data: [] as never[] }))])
-    probeModels.value = (cmRes.data || []).map((m: { internal_model_id: string }) => m.internal_model_id)
-    const row = (res.data || []).find((c: AdminChannel) => c.ID === id)
+    const [res, cmRes] = await Promise.all([listChannels(), listChannelModels(id).catch(() => ({ Data: [] as never[] }))])
+    probeModels.value = (cmRes.Data || []).map((m: { InternalModelID: string }) => m.InternalModelID)
+    const row = (res.Data || []).find((c: AdminChannel) => c.ID === id)
     if (!row) {
       ElMessage.error('渠道不存在')
       router.push('/admin/channels')
@@ -192,28 +192,28 @@ async function load() {
     form.name = row.Name
     form.protocol = row.Protocol
     form.base_url = row.BaseURL
-    form.tag_ids = (row.TagIDs || []).map(Number)
+    form.tag_ids = row.TagIDs || []
     form.priority = row.Priority
     form.weight = row.Weight || 1
     form.session_ttl_minutes = row.SessionTTLMinutes || 60
-    form.rpm = row.RateLimit?.rpm || 0
-    setTpmDisplay(row.RateLimit?.tpm || 0)
-    form.burst_multiplier = row.RateLimit?.burst_multiplier || 1.2
-    form.on_exceed = row.RateLimit?.on_exceed || 'QUEUE'
-    form.queue_timeout_ms = row.RateLimit?.queue_timeout_ms || 0
-    form.max_concurrent = row.RateLimit?.max_concurrent || 16
-    form.interval = row.HealthProbe?.interval || '0 * * * * *'
-    form.drain_interval_seconds = num(row.HealthProbe?.drain_interval_seconds, 15)
-    form.timeout_ms = num(row.HealthProbe?.timeout_ms, 15000)
-    form.fail_threshold = num(row.HealthProbe?.fail_threshold, 1)
-    form.recovery_threshold = num(row.HealthProbe?.recovery_threshold, 2)
-    form.probe_model = row.HealthProbe?.probe_model || ''
-    form.window_seconds = num(row.Reliability?.window_seconds, 60)
-    form.min_samples = num(row.Reliability?.min_samples, 10)
-    form.error_rate_pct = num(row.Reliability?.error_rate_pct, 10)
-    form.rate_429_pct = num(row.Reliability?.rate_429_pct, 20)
-    form.p99_latency_ms = num(row.Reliability?.p99_latency_ms, 5000)
-    form.auth_fail_threshold = num(row.Reliability?.auth_fail_threshold, 3)
+    form.rpm = row.RateLimit?.RPM || 0
+    setTpmDisplay(row.RateLimit?.TPM || 0)
+    form.burst_multiplier = row.RateLimit?.BurstMultiplier || 1.2
+    form.on_exceed = row.RateLimit?.OnExceed || 'QUEUE'
+    form.queue_timeout_ms = row.RateLimit?.QueueTimeoutMS || 0
+    form.max_concurrent = row.RateLimit?.MaxConcurrent || 16
+    form.interval = row.HealthProbe?.Interval || '0 * * * * *'
+    form.drain_interval_seconds = num(row.HealthProbe?.DrainIntervalSeconds, 15)
+    form.timeout_ms = num(row.HealthProbe?.TimeoutMS, 15000)
+    form.fail_threshold = num(row.HealthProbe?.FailThreshold, 1)
+    form.recovery_threshold = num(row.HealthProbe?.RecoveryThreshold, 2)
+    form.probe_model = row.HealthProbe?.ProbeModel || ''
+    form.window_seconds = num(row.Reliability?.WindowSeconds, 60)
+    form.min_samples = num(row.Reliability?.MinSamples, 10)
+    form.error_rate_pct = num(row.Reliability?.ErrorRatePct, 10)
+    form.rate_429_pct = num(row.Reliability?.Rate429Pct, 20)
+    form.p99_latency_ms = num(row.Reliability?.P99LatencyMS, 5000)
+    form.auth_fail_threshold = num(row.Reliability?.AuthFailThreshold, 3)
     await loadStateData()
     await loadKeys()
     await loadTags()
@@ -227,20 +227,20 @@ onMounted(load)
 
 async function loadStateData() {
   const [evRes, meRes, plRes] = await Promise.all([
-    listChannelEvents(id).catch(() => ({ data: [] as ChannelEvent[] })),
-    listModelEvents(id).catch(() => ({ data: [] as ChannelModelEvent[] })),
-    listProbeLogs(id, 50).catch(() => ({ data: [] as ProbeLog[] })),
+    listChannelEvents(id).catch(() => ({ Data: [] as ChannelEvent[] })),
+    listModelEvents(id).catch(() => ({ Data: [] as ChannelModelEvent[] })),
+    listProbeLogs(id, 50).catch(() => ({ Data: [] as ProbeLog[] })),
   ])
-  events.value = evRes.data || []
-  modelEvents.value = meRes.data || []
-  probeLogs.value = plRes.data || []
+  events.value = evRes.Data || []
+  modelEvents.value = meRes.Data || []
+  probeLogs.value = plRes.Data || []
 }
 
 async function loadKeys() {
   keysLoading.value = true
   try {
     const res = await listChannelKeys(id)
-    keys.value = res.data || []
+    keys.value = res.Data || []
   } catch (e: any) {
     ElMessage.error(e?.message || '加载渠道密钥失败')
   } finally {
@@ -259,8 +259,8 @@ function openKeyCreate() {
   keyDrawerOpen.value = true
 }
 function openKeyEdit(k: ChannelKey) {
-  keyEditingId.value = k.id
-  keyForm.name = k.name
+  keyEditingId.value = k.ID
+  keyForm.name = k.Name
   keyForm.credential = ''
   keyDrawerOpen.value = true
 }
@@ -271,14 +271,14 @@ async function saveKey() {
   keySaving.value = true
   try {
     if (keyEditingId.value != null) {
-      const payload: { name: string; credential?: string } = { name: keyForm.name.trim() }
-      if (keyForm.credential.trim()) payload.credential = keyForm.credential.trim()
+      const payload: { Name: string; Credential?: string } = { Name: keyForm.name.trim() }
+      if (keyForm.credential.trim()) payload.Credential = keyForm.credential.trim()
       await updateChannelKey(id, keyEditingId.value, payload)
       ElMessage.success('密钥已更新')
     } else {
       await createChannelKey(id, {
-        name: keyForm.name.trim(),
-        credential: keyForm.credential.trim(),
+        Name: keyForm.name.trim(),
+        Credential: keyForm.credential.trim(),
       })
       ElMessage.success('密钥已添加')
     }
@@ -293,7 +293,7 @@ async function saveKey() {
 async function onDeleteKey(k: ChannelKey) {
   try {
     await ElMessageBox.confirm(
-      `确认删除密钥「${k.name}」吗？删除后该密钥立即停止路由。`,
+      `确认删除密钥「${k.Name}」吗？删除后该密钥立即停止路由。`,
       '删除确认',
       { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' },
     )
@@ -301,7 +301,7 @@ async function onDeleteKey(k: ChannelKey) {
     return
   }
   try {
-    await deleteChannelKey(id, k.id)
+    await deleteChannelKey(id, k.ID)
     ElMessage.success('已删除')
     await loadKeys()
   } catch (e: any) {
@@ -311,8 +311,8 @@ async function onDeleteKey(k: ChannelKey) {
 async function onKeyState(k: ChannelKey, action: 'normal' | 'drain' | 'disable') {
   const label = stateLabel[action.toUpperCase()] || action
   try {
-    await channelKeyState(id, k.id, action)
-    ElMessage.success(`密钥「${k.name}」已置为 ${label}`)
+    await channelKeyState(id, k.ID, action)
+    ElMessage.success(`密钥「${k.Name}」已置为 ${label}`)
     await loadKeys()
   } catch (e: any) {
     ElMessage.error(e?.message || '状态操作失败')
@@ -333,7 +333,7 @@ async function onToggleState(action: 'normal' | 'drain' | 'disable') {
   actionLoading.value = true
   try {
     const res = await channelState(id, action)
-    channel.value = res.data
+    channel.value = res.Data
     ElMessage.success(`已置为 ${label}`)
     await loadStateData()
   } catch (e: any) {
@@ -351,37 +351,37 @@ async function onSubmit() {
   errInfo.value = { message: '', requestId: '' }
   try {
     await updateChannel(id, {
-      name: form.name.trim(),
-      protocol: form.protocol,
-      base_url: form.base_url.trim(),
-      tag_ids: form.tag_ids,
-      priority: form.priority,
-      weight: Number(form.weight) || 1,
-      session_ttl_minutes: Number(form.session_ttl_minutes) || 60,
-      rate_limit: {
-        rpm: Number(form.rpm),
-        tpm: tpmRaw(),
-        burst_multiplier: Number(form.burst_multiplier),
-        on_exceed: form.on_exceed,
-        queue_size: 0,
-        queue_timeout_ms: Number(form.queue_timeout_ms),
-        max_concurrent: Number(form.max_concurrent),
+      Name: form.name.trim(),
+      Protocol: form.protocol,
+      BaseURL: form.base_url.trim(),
+      TagIDs: form.tag_ids,
+      Priority: form.priority,
+      Weight: Number(form.weight) || 1,
+      SessionTTLMinutes: Number(form.session_ttl_minutes) || 60,
+      RateLimit: {
+        RPM: Number(form.rpm),
+        TPM: tpmRaw(),
+        BurstMultiplier: Number(form.burst_multiplier),
+        OnExceed: form.on_exceed,
+        QueueSize: 0,
+        QueueTimeoutMS: Number(form.queue_timeout_ms),
+        MaxConcurrent: Number(form.max_concurrent),
       },
-      health_probe: {
-        interval: form.interval || '0 * * * * *',
-        drain_interval_seconds: Number(form.drain_interval_seconds),
-        timeout_ms: Number(form.timeout_ms),
-        fail_threshold: Number(form.fail_threshold),
-        recovery_threshold: Number(form.recovery_threshold),
-        probe_model: form.probe_model,
+      HealthProbe: {
+        Interval: form.interval || '0 * * * * *',
+        DrainIntervalSeconds: Number(form.drain_interval_seconds),
+        TimeoutMS: Number(form.timeout_ms),
+        FailThreshold: Number(form.fail_threshold),
+        RecoveryThreshold: Number(form.recovery_threshold),
+        ProbeModel: form.probe_model,
       },
-      reliability: {
-        window_seconds: Number(form.window_seconds),
-        min_samples: Number(form.min_samples),
-        error_rate_pct: Number(form.error_rate_pct),
-        rate_429_pct: Number(form.rate_429_pct),
-        p99_latency_ms: Number(form.p99_latency_ms),
-        auth_fail_threshold: Number(form.auth_fail_threshold),
+      Reliability: {
+        WindowSeconds: Number(form.window_seconds),
+        MinSamples: Number(form.min_samples),
+        ErrorRatePct: Number(form.error_rate_pct),
+        Rate429Pct: Number(form.rate_429_pct),
+        P99LatencyMS: Number(form.p99_latency_ms),
+        AuthFailThreshold: Number(form.auth_fail_threshold),
       },
     })
     ElMessage.success('渠道已更新')
@@ -438,29 +438,29 @@ async function onSubmit() {
             </div>
             <div v-loading="keysLoading">
               <el-table :data="keys" border stripe class="table-nowrap small">
-                <el-table-column label="名称" prop="name" min-width="130" show-overflow-tooltip />
+                <el-table-column label="名称" prop="Name" min-width="130" show-overflow-tooltip />
                 <el-table-column label="凭据尾号" min-width="110">
                   <template #default="{ row }">
-                    <span class="tail">••••••{{ row.credential_tail }}</span>
+                    <span class="tail">••••••{{ row.CredentialTail }}</span>
                   </template>
                 </el-table-column>
                 <el-table-column label="状态" width="110" align="center">
                   <template #default="{ row }">
                     <el-popover trigger="hover" placement="left" :width="170">
                       <template #reference>
-                        <StatusTag :value="row.state" style="cursor: pointer" />
+                        <StatusTag :value="row.State" style="cursor: pointer" />
                       </template>
                       <div class="pop-actions">
-                        <el-button v-if="row.state !== 'NORMAL'" size="small" type="success" @click="onKeyState(row, 'normal')">正常</el-button>
-                        <el-button v-if="row.state !== 'DRAIN'" size="small" type="warning" @click="onKeyState(row, 'drain')">排空</el-button>
-                        <el-button v-if="row.state !== 'DISABLED'" size="small" type="danger" @click="onKeyState(row, 'disable')">禁用</el-button>
+                        <el-button v-if="row.State !== 'NORMAL'" size="small" type="success" @click="onKeyState(row, 'normal')">正常</el-button>
+                        <el-button v-if="row.State !== 'DRAIN'" size="small" type="warning" @click="onKeyState(row, 'drain')">排空</el-button>
+                        <el-button v-if="row.State !== 'DISABLED'" size="small" type="danger" @click="onKeyState(row, 'disable')">禁用</el-button>
                       </div>
                     </el-popover>
                   </template>
                 </el-table-column>
                 <el-table-column label="最近错误" min-width="160">
                   <template #default="{ row }">
-                    <span class="last-err" :class="{ on: row.last_err }">{{ row.last_err || '无' }}</span>
+                    <span class="last-err" :class="{ on: row.LastErr }">{{ row.LastErr || '无' }}</span>
                   </template>
                 </el-table-column>
                 <el-table-column label="操作" width="90" align="right">
@@ -752,35 +752,35 @@ async function onSubmit() {
             <div class="sub-title">密钥状态</div>
             <div v-loading="keysLoading">
               <el-table :data="keys" border stripe class="table-nowrap small">
-                <el-table-column label="名称" prop="name" min-width="130" show-overflow-tooltip />
+                <el-table-column label="名称" prop="Name" min-width="130" show-overflow-tooltip />
                 <el-table-column label="状态" width="110" align="center">
                   <template #default="{ row }">
                     <el-popover trigger="hover" placement="left" :width="170">
                       <template #reference>
-                        <StatusTag :value="row.state" style="cursor: pointer" />
+                        <StatusTag :value="row.State" style="cursor: pointer" />
                       </template>
                       <div class="pop-actions">
-                        <el-button v-if="row.state !== 'NORMAL'" size="small" type="success" @click="onKeyState(row, 'normal')">正常</el-button>
-                        <el-button v-if="row.state !== 'DRAIN'" size="small" type="warning" @click="onKeyState(row, 'drain')">排空</el-button>
-                        <el-button v-if="row.state !== 'DISABLED'" size="small" type="danger" @click="onKeyState(row, 'disable')">禁用</el-button>
+                        <el-button v-if="row.State !== 'NORMAL'" size="small" type="success" @click="onKeyState(row, 'normal')">正常</el-button>
+                        <el-button v-if="row.State !== 'DRAIN'" size="small" type="warning" @click="onKeyState(row, 'drain')">排空</el-button>
+                        <el-button v-if="row.State !== 'DISABLED'" size="small" type="danger" @click="onKeyState(row, 'disable')">禁用</el-button>
                       </div>
                     </el-popover>
                   </template>
                 </el-table-column>
                 <el-table-column label="最近错误" min-width="180">
                   <template #default="{ row }">
-                    <span class="last-err" :class="{ on: row.last_err }">{{ row.last_err || '无' }}</span>
+                    <span class="last-err" :class="{ on: row.LastErr }">{{ row.LastErr || '无' }}</span>
                   </template>
                 </el-table-column>
                 <el-table-column label="活跃会话数" width="100" align="right">
-                  <template #default="{ row }">{{ row.active_sessions }}</template>
+                  <template #default="{ row }">{{ row.ActiveSessions }}</template>
                 </el-table-column>
                 <el-table-column label="操作" width="150" align="right">
                   <template #default="{ row }">
                     <div class="pop-actions key-state-ops">
-                      <el-button v-if="row.state !== 'NORMAL'" size="small" type="success" text @click="onKeyState(row, 'normal')">正常</el-button>
-                      <el-button v-if="row.state !== 'DRAIN'" size="small" type="warning" text @click="onKeyState(row, 'drain')">排空</el-button>
-                      <el-button v-if="row.state !== 'DISABLED'" size="small" type="danger" text @click="onKeyState(row, 'disable')">禁用</el-button>
+                      <el-button v-if="row.State !== 'NORMAL'" size="small" type="success" text @click="onKeyState(row, 'normal')">正常</el-button>
+                      <el-button v-if="row.State !== 'DRAIN'" size="small" type="warning" text @click="onKeyState(row, 'drain')">排空</el-button>
+                      <el-button v-if="row.State !== 'DISABLED'" size="small" type="danger" text @click="onKeyState(row, 'disable')">禁用</el-button>
                     </div>
                   </template>
                 </el-table-column>

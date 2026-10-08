@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/team/llmgateway/internal/pkg/dbx"
+	"github.com/team/llmgateway/internal/pkg/idgen"
+	"github.com/team/llmgateway/internal/pkg/money"
 )
 
 // 记账状态。
@@ -20,6 +22,11 @@ const (
 	StatusCompleted = "completed"
 	StatusFailed    = "failed"
 )
+
+// validateStoredMoney 校验金额在可存储范围内且非 NaN/Inf（实现迁移至 internal/pkg/money）。
+func validateStoredMoney(v float64, what string) error {
+	return money.Validate(v, what)
+}
 
 // Prices 常量（计费三配置在 sys_configs 中的 key）。
 const (
@@ -205,6 +212,9 @@ func (s *Service) Record(ctx context.Context, req RecordReq) (*Record, error) {
 		// rates 已在上一步校验过，此处不会触发；防御性返回。
 		return nil, err
 	}
+	if err := validateStoredMoney(rawTotal, "原始价值"); err != nil {
+		return nil, err
+	}
 
 	rec := &Record{
 		BillingID:       req.BillingID,
@@ -350,10 +360,27 @@ func (s *Service) consumeInTx(ctx context.Context, ex dbx.Execer, rec *Record, r
 	return s.credit.Consume(ctx, req.UserID, credits, rec.BillingID, req.SessionID, "实际调用差额")
 }
 
+// userMessageError 由业务错误实现：返回可直接落地展示的中文文案。
+// 内部/基础设施错误不实现该接口，其细节只进日志，落库统一归一为通用中文文案。
+type userMessageError interface{ UserMessage() string }
+
+// failureMessage 把结算失败原因转为落库文案：业务错误用其中文文案，其余归一为通用提示。
+func failureMessage(cause error) string {
+	var um userMessageError
+	if errors.As(cause, &um) {
+		if s := strings.TrimSpace(um.UserMessage()); s != "" {
+			return s
+		}
+	}
+	return "计费结算失败"
+}
+
 // insertFailedOutOfTx 扣款失败路径：在事务之外落 failed 账单（避免被回滚丢弃），失败仍入重试队列。
+// 内部错误细节只进日志，error_message 落库统一为中文业务文案。
 func (s *Service) insertFailedOutOfTx(ctx context.Context, rec *Record, cause error) (*Record, error) {
 	rec.Status = StatusFailed
-	rec.ErrorMessage = cause.Error()
+	rec.ErrorMessage = failureMessage(cause)
+	slog.ErrorContext(ctx, "billing settle failed", "billing_id", rec.BillingID, "user_id", rec.UserID, "err", cause)
 	if _, ierr := s.store.Insert(ctx, rec); ierr != nil && !isUniqueViolation(ierr) {
 		s.enqueueRetry(rec, ierr)
 	}
@@ -452,6 +479,9 @@ func (s *Service) requestCredits(req RecordReq) (credits, timeCoeff, ctxCoeff fl
 	}
 	credits, err = ComputeCredits(req.Tokens, req.Rates, timeCoeff, ctxCoeff, r)
 	if err != nil {
+		return 0, 0, 0, 0, err
+	}
+	if err := validateStoredMoney(credits, "计费积分"); err != nil {
 		return 0, 0, 0, 0, err
 	}
 	return credits, timeCoeff, ctxCoeff, r, nil
@@ -684,13 +714,16 @@ func (s *SqlStore) insertOn(ctx context.Context, ex dbx.Execer, rec *Record) (*R
 	firstTokenMs := nullableInt64For(rec.FirstTokenMs)
 
 	var created time.Time
+	if rec.ID == 0 {
+		rec.ID = idgen.New()
+	}
 	err = ex.QueryRowContext(ctx,
-		`INSERT INTO billing_records(billing_id, user_id, pricing_mode, token_id, external_model_name,
+		`INSERT INTO billing_records(id, billing_id, user_id, pricing_mode, token_id, external_model_name,
 			internal_model_id, channel_key_id, session_id, session_name, call_time, tokens, rates, coefficients, r_value,
 			raw_total, credits_consumed, cost_credits, balance_before, balance_after, status, error_message, duration_ms, first_token_ms)
-		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
+		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
 		 RETURNING id, created_at`,
-		rec.BillingID, rec.UserID, rec.PricingMode, tokenID, rec.ExternalModel,
+		rec.ID, rec.BillingID, rec.UserID, rec.PricingMode, tokenID, rec.ExternalModel,
 		rec.InternalModelID, channelKeyID, sessionID, sessionName, rec.CallTime, tokensRaw, ratesRaw, coeffRaw,
 		rec.RValue, rec.RawTotal, rec.CreditsConsumed, rec.CostCredits,
 		rec.BalanceBefore, rec.BalanceAfter, rec.Status, errMsg, durationMs, firstTokenMs).

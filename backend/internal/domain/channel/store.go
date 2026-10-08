@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/team/llmgateway/internal/pkg/idgen"
 )
 
 // State 渠道/内部模型三态。渠道级与内部模型级完全同构。
@@ -42,103 +43,105 @@ const (
 
 // RateLimitConfig 限流配置（rate_limit JSONB 反序列化目标）。
 type RateLimitConfig struct {
-	RPM             int     `json:"rpm"`              // 每分钟请求数；0 表示不限
-	TPM             int     `json:"tpm"`              // 每分钟 token 数；0 表示不限
-	BurstMultiplier float64 `json:"burst_multiplier"` // 瞬时超发系数
-	OnExceed        string  `json:"on_exceed"`        // QUEUE 或 REJECT
-	QueueSize       int     `json:"queue_size"`
-	QueueTimeoutMS  int     `json:"queue_timeout_ms"`
-	MaxConcurrent   int     `json:"max_concurrent"` // 同时进行的请求上限（并发会话数）；0 表示不限
+	RPM             int     `json:"RPM"`             // 每分钟请求数；0 表示不限
+	TPM             int     `json:"TPM"`             // 每分钟 token 数；0 表示不限
+	BurstMultiplier float64 `json:"BurstMultiplier"` // 瞬时超发系数
+	OnExceed        string  `json:"OnExceed"`        // QUEUE 或 REJECT
+	QueueSize       int     `json:"QueueSize"`
+	QueueTimeoutMS  int     `json:"QueueTimeoutMS"`
+	MaxConcurrent   int     `json:"MaxConcurrent"` // 同时进行的请求上限（并发会话数）；0 表示不限
 }
 
 // HealthProbeConfig 健康探测配置（health_probe JSONB）。
 // 探测与「可靠性」（真实调用窗口）是两个独立子系统：探测是主动行为，可靠性是被动统计。
 type HealthProbeConfig struct {
-	Interval             string `json:"interval"`               // 正常态探测频率（6 段 cron，含秒）
-	DrainIntervalSeconds int    `json:"drain_interval_seconds"` // 排空态探测频率（秒）
-	TimeoutMS            int    `json:"timeout_ms"`             // 单次探测超时
-	FailThreshold        int    `json:"fail_threshold"`         // 连续失败阈值 → DRAIN，默认 1
-	RecoveryThreshold    int    `json:"recovery_threshold"`     // 连续成功阈值 → NORMAL
-	ProbeModel           string `json:"probe_model"`            // 渠道级显式探测模型；空则取渠道内内部模型
+	Interval             string `json:"Interval"`             // 正常态探测频率（6 段 cron，含秒）
+	DrainIntervalSeconds int    `json:"DrainIntervalSeconds"` // 排空态探测频率（秒）
+	TimeoutMS            int    `json:"TimeoutMS"`            // 单次探测超时
+	FailThreshold        int    `json:"FailThreshold"`        // 连续失败阈值 → DRAIN，默认 1
+	RecoveryThreshold    int    `json:"RecoveryThreshold"`    // 连续成功阈值 → NORMAL
+	ProbeModel           string `json:"ProbeModel"`           // 渠道级显式探测模型；空则取渠道内内部模型
 }
 
 // ReliabilityConfig 可靠性配置（reliability JSONB）：真实调用的滑动窗口自动评估。
 // 任一窗口指标超限（且样本数达标）→ DRAIN；不承担恢复职责（恢复仅由健康探测驱动）。
 // 真实调用连续鉴权失败(401/403)达 AuthFailThreshold → DISABLED。
 type ReliabilityConfig struct {
-	WindowSeconds     int     `json:"window_seconds"`      // 滑动窗口时长（秒）
-	MinSamples        int     `json:"min_samples"`         // 窗口内最小样本数，不足不评估
-	ErrorRatePct      float64 `json:"error_rate_pct"`      // (失败+超时)/总数 阈值 %
-	Rate429Pct        float64 `json:"rate_429_pct"`        // 429 占比阈值 %
-	P99LatencyMS      int64   `json:"p99_latency_ms"`      // 成功样本 P99 耗时阈值 ms
-	AuthFailThreshold int     `json:"auth_fail_threshold"` // 连续鉴权失败阈值 → DISABLED，默认 3
+	WindowSeconds     int     `json:"WindowSeconds"`     // 滑动窗口时长（秒）
+	MinSamples        int     `json:"MinSamples"`        // 窗口内最小样本数，不足不评估
+	ErrorRatePct      float64 `json:"ErrorRatePct"`      // (失败+超时)/总数 阈值 %
+	Rate429Pct        float64 `json:"Rate429Pct"`        // 429 占比阈值 %
+	P99LatencyMS      int64   `json:"P99LatencyMS"`      // 成功样本 P99 耗时阈值 ms
+	AuthFailThreshold int     `json:"AuthFailThreshold"` // 连续鉴权失败阈值 → DISABLED，默认 3
 }
 
 // ChannelKeyState 渠道视图中的密钥聚合项（key_states）：渠道列表逐密钥状态快照。
-// KeyID/KeyName/State 取自运行时 KeyViews（内存权威），序列化为 snake_case 子项。
+// KeyID/KeyName/State 取自运行时 KeyViews（内存权威）。
 type ChannelKeyState struct {
-	KeyID   int64  `json:"key_id"`
-	KeyName string `json:"key_name"`
-	State   State  `json:"state"`
+	KeyID   int64  `json:"KeyID,string"`
+	KeyName string `json:"KeyName"`
+	State   State  `json:"State"`
 }
 
 // Channel 对应 channels 表的一行（配置模板，不含凭据；凭据收敛到 channel_keys.credential_enc）。
+// 雪花 ID 超出 JS 安全整数，ID/tag_ids 等 ID 字段以字符串序列化。
 type Channel struct {
-	ID                int64
-	Name              string
-	Protocol          string
-	BaseURL           string
-	Tags              map[string]string
-	TagIDs            []int64
-	BoundTags         []TagRef
-	Priority          int
-	Weight            int
-	State             State
-	RateLimit         RateLimitConfig
-	HealthProbe       HealthProbeConfig
-	Reliability       ReliabilityConfig
-	SessionTTLMinutes int               // 会话存活时长（分钟）；0 由运行时兜底 60
-	KeyStates         []ChannelKeyState // 密钥聚合态（无 json tag → 输出 PascalCase 键 "KeyStates"；列表视图经 Service 填充）
-	CreatedAt         time.Time
-	UpdatedAt         time.Time
+	ID                int64             `json:"ID,string"`
+	Name              string            `json:"Name"`
+	Protocol          string            `json:"Protocol"`
+	BaseURL           string            `json:"BaseURL"`
+	Tags              map[string]string `json:"Tags"`
+	TagIDs            idgen.IDs         `json:"TagIDs"`
+	BoundTags         []TagRef          `json:"BoundTags"`
+	Priority          int               `json:"Priority"`
+	Weight            int               `json:"Weight"`
+	State             State             `json:"State"`
+	RateLimit         RateLimitConfig   `json:"RateLimit"`
+	HealthProbe       HealthProbeConfig `json:"HealthProbe"`
+	Reliability       ReliabilityConfig `json:"Reliability"`
+	SessionTTLMinutes int               `json:"SessionTTLMinutes"` // 会话存活时长（分钟）；0 由运行时兜底 60
+	KeyStates         []ChannelKeyState `json:"KeyStates"`
+	CreatedAt         time.Time         `json:"CreatedAt"`
+	UpdatedAt         time.Time         `json:"UpdatedAt"`
 }
 
 // ChannelEvent 对应 channel_events 表一行，记录一次渠道状态流转。
 type ChannelEvent struct {
-	ID        int64
-	ChannelID int64
-	FromState State
-	ToState   State
-	Reason    string
-	CreatedAt time.Time
+	ID        int64     `json:"ID,string"`
+	ChannelID int64     `json:"ChannelID,string"`
+	FromState State     `json:"FromState"`
+	ToState   State     `json:"ToState"`
+	Reason    string    `json:"Reason"`
+	CreatedAt time.Time `json:"CreatedAt"`
 }
 
 // ChannelModelEvent 对应 channel_model_events 表一行，记录一次内部模型状态流转。
 type ChannelModelEvent struct {
-	ID        int64
-	ChannelID int64
-	ModelID   string
-	FromState State
-	ToState   State
-	Reason    string
-	CreatedAt time.Time
+	ID        int64     `json:"ID,string"`
+	ChannelID int64     `json:"ChannelID,string"`
+	ModelID   string    `json:"ModelID"`
+	FromState State     `json:"FromState"`
+	ToState   State     `json:"ToState"`
+	Reason    string    `json:"Reason"`
+	CreatedAt time.Time `json:"CreatedAt"`
 }
 
 // ProbeLog 对应 probe_logs 表一行，记录一次健康探测（结果+开销，供后续统计）。
+// ChannelKeyID 对应 probe_logs.channel_key_id（密钥维度；level=key 时为密钥默认探测目标）。
 type ProbeLog struct {
-	ID           int64
-	ChannelID    int64
-	ModelID      string // 探测目标模型；空=渠道级探测（level=channel 命中）
-	Level        string // channel=渠道级探测；model=模型级探测
-	Target       string
-	OK           bool
-	Error        string
-	InputTokens  int
-	OutputTokens int
-	CachedTokens int
-	TotalTokens  int
-	DurationMS   int
-	CreatedAt    time.Time
+	ID           int64     `json:"ID,string"`
+	ChannelKeyID int64     `json:"ChannelKeyID,string"`
+	ModelID      string    `json:"ModelID"` // 探测目标模型；空=渠道级探测
+	Level        string    `json:"Level"`   // key=密钥级探测；model=模型级探测
+	Target       string    `json:"Target"`
+	OK           bool      `json:"OK"`
+	Error        string    `json:"Error,omitempty"`
+	InputTokens  int       `json:"InputTokens"`
+	OutputTokens int       `json:"OutputTokens"`
+	CachedTokens int       `json:"CachedTokens"`
+	TotalTokens  int       `json:"TotalTokens"`
+	DurationMS   int       `json:"DurationMS"`
+	CreatedAt    time.Time `json:"CreatedAt"`
 }
 
 // channelCols 列出 channels 表查询时使用的全部列，保持各查询一致。
@@ -263,11 +266,14 @@ var ErrNameExists = errors.New("channel name already exists")
 
 // Insert 插入新渠道并返回回填主键后完整记录，name 冲突返回 ErrNameExists。
 func (s *Store) Insert(ctx context.Context, c *Channel) (*Channel, error) {
+	if c.ID == 0 {
+		c.ID = idgen.New()
+	}
 	row := s.db.QueryRowContext(ctx,
-		`INSERT INTO channels(name, protocol, base_url, tags, priority, weight, state, rate_limit, health_probe, reliability, session_ttl_minutes)
-		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+		`INSERT INTO channels(id, name, protocol, base_url, tags, priority, weight, state, rate_limit, health_probe, reliability, session_ttl_minutes)
+		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
 		 RETURNING `+channelCols,
-		c.Name, c.Protocol, c.BaseURL, marshalJSONB(c.Tags),
+		c.ID, c.Name, c.Protocol, c.BaseURL, marshalJSONB(c.Tags),
 		c.Priority, c.Weight, string(c.State), marshalJSONB(c.RateLimit), marshalJSONB(c.HealthProbe),
 		marshalJSONB(c.Reliability), c.SessionTTLMinutes)
 	created, err := scanChannel(row)
@@ -319,10 +325,13 @@ func (s *Store) UpdateState(ctx context.Context, id int64, st State) error {
 
 // InsertEvent 记录一条渠道状态流转事件，返回回填主键后的完整事件。
 func (s *Store) InsertEvent(ctx context.Context, e *ChannelEvent) (*ChannelEvent, error) {
+	if e.ID == 0 {
+		e.ID = idgen.New()
+	}
 	row := s.db.QueryRowContext(ctx,
-		`INSERT INTO channel_events(channel_id, from_state, to_state, reason)
-		 VALUES($1,$2,$3,$4) RETURNING `+eventCols,
-		e.ChannelID, string(e.FromState), string(e.ToState), e.Reason)
+		`INSERT INTO channel_events(id, channel_id, from_state, to_state, reason)
+		 VALUES($1,$2,$3,$4,$5) RETURNING `+eventCols,
+		e.ID, e.ChannelID, string(e.FromState), string(e.ToState), e.Reason)
 	created, err := scanEvent(row)
 	if err != nil {
 		return nil, err
@@ -393,9 +402,9 @@ func (s *Store) DeleteChannels(ctx context.Context, ids []int64) (int64, error) 
 
 // TagRef 渠道已绑定标签的解析结果（channel 域不依赖 tag 包，故自带结构）。
 type TagRef struct {
-	ID   int64
-	Name string
-	KV   map[string]string
+	ID   int64             `json:"ID,string"`
+	Name string            `json:"Name"`
+	KV   map[string]string `json:"KV,omitempty"`
 }
 
 // ListTagRefsByChannel 查询某渠道已绑定标签（含 KV），按 tag_id 升序。
@@ -529,11 +538,14 @@ func (s *Store) InsertWithTags(ctx context.Context, c *Channel, tagIDs []int64) 
 		return nil, err
 	}
 	defer tx.Rollback()
+	if c.ID == 0 {
+		c.ID = idgen.New()
+	}
 	row := tx.QueryRowContext(ctx,
-		`INSERT INTO channels(name, protocol, base_url, tags, priority, weight, state, rate_limit, health_probe, reliability, session_ttl_minutes)
-		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+		`INSERT INTO channels(id, name, protocol, base_url, tags, priority, weight, state, rate_limit, health_probe, reliability, session_ttl_minutes)
+		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
 		 RETURNING `+channelCols,
-		c.Name, c.Protocol, c.BaseURL, marshalJSONB(c.Tags),
+		c.ID, c.Name, c.Protocol, c.BaseURL, marshalJSONB(c.Tags),
 		c.Priority, c.Weight, string(c.State), marshalJSONB(c.RateLimit), marshalJSONB(c.HealthProbe),
 		marshalJSONB(c.Reliability), c.SessionTTLMinutes)
 	created, err := scanChannel(row)

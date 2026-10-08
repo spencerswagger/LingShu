@@ -19,6 +19,7 @@ import { useAuthStore } from '@/stores/auth'
 import { getStatsDashboard, type StatsDashboard, type StatsTopItem } from '@/api/stats'
 import { listAnnouncements, type AdminAnnouncement } from '@/api/admin'
 import { listDevAnnouncements } from '@/api/dev'
+import { toRFC3339CN } from '@/utils/format'
 import VChart from '@/components/VChart.vue'
 import ErrorBubble from '@/components/ErrorBubble.vue'
 
@@ -42,18 +43,7 @@ const rangeText = computed(() => {
   return `近 ${preset.value} 天`
 })
 
-// 生成 RFC3339（带本地时区偏移），保证后端按本地日期切分。
-function toRFC3339Local(d: Date): string {
-  const pad = (n: number) => String(n).padStart(2, '0')
-  const off = -d.getTimezoneOffset()
-  const sign = off >= 0 ? '+' : '-'
-  const oh = pad(Math.floor(Math.abs(off) / 60))
-  const om = pad(Math.abs(off) % 60)
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(
-    d.getMinutes(),
-  )}:${pad(d.getSeconds())}${sign}${oh}:${om}`
-}
-
+// 生成 RFC3339（固定 +08:00，Asia/Shanghai），保证后端按东八区日期切分。
 function parseYMD(s: string): Date {
   const [y, m, d] = s.split('-').map(Number)
   return new Date(y, (m || 1) - 1, d || 1)
@@ -82,10 +72,10 @@ async function load() {
   try {
     const { from, to } = resolveRange()
     const res = await getStatsDashboard(auth.role, {
-      from: toRFC3339Local(from),
-      to: toRFC3339Local(to),
+      From: toRFC3339CN(from),
+      To: toRFC3339CN(to),
     })
-    data.value = res.data
+    data.value = res.Data
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
   } finally {
@@ -96,7 +86,7 @@ async function load() {
 async function loadAnnouncements() {
   try {
     const res = isAdmin.value ? await listAnnouncements() : await listDevAnnouncements()
-    announcements.value = (res.data.list || []).filter((a) => a.enabled).slice(0, 4)
+    announcements.value = (res.Data.List || []).filter((a) => a.Enabled).slice(0, 4)
   } catch {
     announcements.value = []
   }
@@ -159,7 +149,7 @@ const tooltipCommon = {
 }
 
 // ===== KPI =====
-const daily = computed(() => data.value?.usage.daily ?? [])
+const daily = computed(() => data.value?.Usage.Daily ?? [])
 
 function sparkPoints(vals: number[]): string {
   if (!vals.length) return ''
@@ -175,58 +165,58 @@ function sparkPoints(vals: number[]): string {
 }
 
 const kpiCards = computed(() => {
-  const k = data.value?.kpi
-  const calls = daily.value.map((d) => d.calls)
-  const tokens = daily.value.map((d) => d.tokens)
-  const credits = daily.value.map((d) => Number(d.credits))
+  const k = data.value?.KPI
+  const calls = daily.value.map((d) => d.Calls)
+  const tokens = daily.value.map((d) => d.Tokens)
+  const credits = daily.value.map((d) => Number(d.Credits))
   return [
     {
       label: '总 Token',
-      value: k ? fmtCompact(k.total_tokens) : '-',
-      sub: `输入 ${fmtCompact(data.value?.usage.total_tokens.input ?? 0)} · 输出 ${fmtCompact(
-        data.value?.usage.total_tokens.output ?? 0,
+      value: k ? fmtCompact(k.TotalTokens) : '-',
+      sub: `输入 ${fmtCompact(data.value?.Usage.Total.Input ?? 0)} · 输出 ${fmtCompact(
+        data.value?.Usage.Total.Output ?? 0,
       )}`,
-      delta: k?.delta_tokens,
+      delta: k?.DeltaTokens,
       tone: 'primary',
       icon: DataLine,
       spark: sparkPoints(tokens),
     },
     {
       label: '总消费积分',
-      value: k ? fmtMoney(k.total_credits) : '-',
-      sub: `日均 ${fmtMoney((k?.total_credits ?? 0) / Math.max(data.value?.usage.days ?? 1, 1))}`,
-      delta: k?.delta_credits,
+      value: k ? fmtMoney(k.TotalCredits) : '-',
+      sub: `日均 ${fmtMoney((k?.TotalCredits ?? 0) / Math.max(data.value?.Usage.Days ?? 1, 1))}`,
+      delta: k?.DeltaCredits,
       tone: 'violet',
       icon: Coin,
       spark: sparkPoints(credits),
     },
     {
       label: '总请求数',
-      value: k ? fmtInt(k.total_requests) : '-',
-      sub: `失败 ${fmtInt(k?.failed_requests ?? 0)} 次`,
-      delta: k?.delta_requests,
+      value: k ? fmtInt(k.TotalRequests) : '-',
+      sub: `失败 ${fmtInt(k?.FailedRequests ?? 0)} 次`,
+      delta: k?.DeltaRequests,
       tone: 'primary',
       icon: Odometer,
       spark: sparkPoints(calls),
     },
     {
       label: '成功率',
-      value: k ? fmtPct(k.success_rate) : '-',
-      sub: `平均耗时 ${k ? fmtMs(k.avg_duration_ms) : '-'}`,
+      value: k ? fmtPct(k.SuccessRate) : '-',
+      sub: `平均耗时 ${k ? fmtMs(k.AvgDurationMS) : '-'}`,
       tone: 'success',
       icon: CircleCheckFilled,
     },
     {
       label: '平均耗时',
-      value: k ? fmtMs(k.avg_duration_ms) : '-',
-      sub: `首字 ${k ? fmtMs(k.avg_first_token_ms) : '-'}`,
+      value: k ? fmtMs(k.AvgDurationMS) : '-',
+      sub: `首字 ${k ? fmtMs(k.AvgFirstTokenMS) : '-'}`,
       tone: 'warning',
       icon: Timer,
     },
     {
       label: '吞吐量',
-      value: k ? `${fmtCompact(k.tpm)} TPM` : '-',
-      sub: `平均 ${k ? k.rpm.toFixed(2) : '-'} RPM（区间每分钟均值）`,
+      value: k ? `${fmtCompact(k.TPM)} TPM` : '-',
+      sub: `平均 ${k ? k.RPM.toFixed(2) : '-'} RPM（区间每分钟均值）`,
       tone: 'primary',
       icon: TrendCharts,
     },
@@ -239,7 +229,7 @@ const trendOption = computed<EChartsCoreOption>(() => {
   const metric = trendMetric.value
   const name = metric === 'tokens' ? 'Token' : metric === 'credits' ? '积分' : '请求数'
   const values = daily.value.map((d) =>
-    metric === 'tokens' ? d.tokens : metric === 'credits' ? Number(d.credits) : d.calls,
+    metric === 'tokens' ? d.Tokens : metric === 'credits' ? Number(d.Credits) : d.Calls,
   )
   return {
     grid: { left: 6, right: 16, top: 22, bottom: 4, containLabel: true },
@@ -251,7 +241,7 @@ const trendOption = computed<EChartsCoreOption>(() => {
     xAxis: {
       type: 'category',
       boundaryGap: false,
-      data: daily.value.map((d) => d.date.slice(5)),
+      data: daily.value.map((d) => d.Date.slice(5)),
       ...axisCommon,
     },
     yAxis: {
@@ -275,13 +265,13 @@ const trendOption = computed<EChartsCoreOption>(() => {
 })
 
 const compositionOption = computed<EChartsCoreOption>(() => {
-  const t = data.value?.usage.total_tokens
+  const t = data.value?.Usage.Total
   const items = [
-    { name: '输入', value: t?.input ?? 0 },
-    { name: '输出', value: t?.output ?? 0 },
-    { name: '缓存读', value: t?.cache_read ?? 0 },
-    { name: '缓存写', value: t?.cache_write ?? 0 },
-    { name: '推理', value: t?.reasoning ?? 0 },
+    { name: '输入', value: t?.Input ?? 0 },
+    { name: '输出', value: t?.Output ?? 0 },
+    { name: '缓存读', value: t?.CacheRead ?? 0 },
+    { name: '缓存写', value: t?.CacheWrite ?? 0 },
+    { name: '推理', value: t?.Reasoning ?? 0 },
   ].filter((i) => i.value > 0)
   return {
     tooltip: {
@@ -317,7 +307,7 @@ function hbarOption(items: StatsTopItem[], valueFn: (i: StatsTopItem) => number,
       formatter: (ps: any) => {
         const p = ps[0]
         const it = rows[p.dataIndex]
-        return `${it.label}${it.sub_label ? ' · ' + it.sub_label : ''}<br/>${fmtInt(valueFn(it))}`
+        return `${it.Label}${it.SubLabel ? ' · ' + it.SubLabel : ''}<br/>${fmtInt(valueFn(it))}`
       },
     },
     xAxis: {
@@ -327,7 +317,7 @@ function hbarOption(items: StatsTopItem[], valueFn: (i: StatsTopItem) => number,
     },
     yAxis: {
       type: 'category',
-      data: rows.map((i) => (i.sub_label ? `${i.label} · ${i.sub_label}` : i.label)),
+      data: rows.map((i) => (i.SubLabel ? `${i.Label} · ${i.SubLabel}` : i.Label)),
       ...axisCommon,
       axisLabel: { color: C.text, fontSize: 11, width: 120, overflow: 'truncate' },
     },
@@ -342,14 +332,14 @@ function hbarOption(items: StatsTopItem[], valueFn: (i: StatsTopItem) => number,
   }
 }
 const modelOption = computed<EChartsCoreOption>(() =>
-  hbarOption(data.value?.usage.by_model ?? [], (i) => i.tokens, C.primary),
+  hbarOption(data.value?.Usage.ByModel ?? [], (i) => i.Tokens, C.primary),
 )
 const keyOption = computed<EChartsCoreOption>(() =>
-  hbarOption(data.value?.usage.by_key ?? [], (i) => i.tokens, C.violet),
+  hbarOption(data.value?.Usage.ByKey ?? [], (i) => i.Tokens, C.violet),
 )
 
 // ===== 运维图表 =====
-const ops = computed(() => data.value?.ops)
+const ops = computed(() => data.value?.Ops)
 
 const successOption = computed<EChartsCoreOption>(() => ({
   grid: { left: 6, right: 16, top: 22, bottom: 4, containLabel: true },
@@ -358,7 +348,7 @@ const successOption = computed<EChartsCoreOption>(() => ({
     trigger: 'axis',
     valueFormatter: (v: number) => `${Number(v).toFixed(1)}%`,
   },
-  xAxis: { type: 'category', boundaryGap: false, data: daily.value.map((d) => d.date.slice(5)), ...axisCommon },
+  xAxis: { type: 'category', boundaryGap: false, data: daily.value.map((d) => d.Date.slice(5)), ...axisCommon },
   yAxis: {
     type: 'value',
     min: 0,
@@ -372,7 +362,7 @@ const successOption = computed<EChartsCoreOption>(() => ({
       type: 'line',
       smooth: true,
       showSymbol: false,
-      data: daily.value.map((d) => Number((d.success_rate * 100).toFixed(1))),
+      data: daily.value.map((d) => Number((d.SuccessRate * 100).toFixed(1))),
       lineStyle: { width: 2.4, color: C.success },
       itemStyle: { color: C.success },
       areaStyle: { color: 'rgba(18,183,106,0.10)' },
@@ -381,11 +371,11 @@ const successOption = computed<EChartsCoreOption>(() => ({
 }))
 
 const latencyOption = computed<EChartsCoreOption>(() => {
-  const b = data.value?.usage.latency ?? []
+  const b = data.value?.Usage.Latency ?? []
   return {
     grid: { left: 6, right: 16, top: 22, bottom: 4, containLabel: true },
     tooltip: { ...tooltipCommon, trigger: 'axis', axisPointer: { type: 'shadow' } },
-    xAxis: { type: 'category', data: b.map((x) => x.bucket), ...axisCommon },
+    xAxis: { type: 'category', data: b.map((x) => x.Bucket), ...axisCommon },
     yAxis: {
       type: 'value',
       splitLine: { lineStyle: { color: C.grid } },
@@ -394,7 +384,7 @@ const latencyOption = computed<EChartsCoreOption>(() => {
     series: [
       {
         type: 'bar',
-        data: b.map((x) => x.count),
+        data: b.map((x) => x.Count),
         barMaxWidth: 30,
         itemStyle: { color: C.warning, borderRadius: [4, 4, 0, 0] },
       },
@@ -406,7 +396,7 @@ const throughputOption = computed<EChartsCoreOption>(() => ({
   grid: { left: 6, right: 20, top: 30, bottom: 4, containLabel: true },
   tooltip: { ...tooltipCommon, trigger: 'axis' },
   legend: { top: 0, icon: 'circle', itemWidth: 8, textStyle: { color: C.sub, fontSize: 11 } },
-  xAxis: { type: 'category', data: daily.value.map((d) => d.date.slice(5)), ...axisCommon },
+  xAxis: { type: 'category', data: daily.value.map((d) => d.Date.slice(5)), ...axisCommon },
   yAxis: [
     {
       type: 'value',
@@ -427,7 +417,7 @@ const throughputOption = computed<EChartsCoreOption>(() => ({
     {
       name: 'Token',
       type: 'bar',
-      data: daily.value.map((d) => d.tokens),
+      data: daily.value.map((d) => d.Tokens),
       barMaxWidth: 16,
       itemStyle: { color: 'rgba(90,92,232,0.75)', borderRadius: [4, 4, 0, 0] },
     },
@@ -437,7 +427,7 @@ const throughputOption = computed<EChartsCoreOption>(() => ({
       yAxisIndex: 1,
       smooth: true,
       showSymbol: false,
-      data: daily.value.map((d) => d.calls),
+      data: daily.value.map((d) => d.Calls),
       lineStyle: { width: 2.2, color: C.success },
       itemStyle: { color: C.success },
     },
@@ -452,39 +442,39 @@ const opsCounts = computed(() => {
     {
       icon: Connection,
       title: '渠道',
-      total: o.channels.total,
+      total: o.Channels.Total,
       rows: [
-        { label: '健康', value: o.channels.normal, tone: 'success' },
-        { label: '排空', value: o.channels.drain, tone: 'warning' },
-        { label: '停用', value: o.channels.disabled, tone: 'danger' },
+        { label: '健康', value: o.Channels.Normal, tone: 'success' },
+        { label: '排空', value: o.Channels.Drain, tone: 'warning' },
+        { label: '停用', value: o.Channels.Disabled, tone: 'danger' },
       ],
     },
     {
       icon: Key,
       title: '渠道密钥',
-      total: o.keys.total,
+      total: o.Keys.Total,
       rows: [
-        { label: '健康', value: o.keys.normal, tone: 'success' },
-        { label: '排空', value: o.keys.drain, tone: 'warning' },
-        { label: '停用', value: o.keys.disabled, tone: 'danger' },
+        { label: '健康', value: o.Keys.Normal, tone: 'success' },
+        { label: '排空', value: o.Keys.Drain, tone: 'warning' },
+        { label: '停用', value: o.Keys.Disabled, tone: 'danger' },
       ],
     },
     {
       icon: Cpu,
       title: '对外模型',
-      total: o.models.external_total,
+      total: o.Models.ExternalTotal,
       rows: [
-        { label: '已启用', value: o.models.external_enabled, tone: 'success' },
-        { label: '未启用', value: o.models.external_total - o.models.external_enabled, tone: 'info' },
+        { label: '已启用', value: o.Models.ExternalEnabled, tone: 'success' },
+        { label: '未启用', value: o.Models.ExternalTotal - o.Models.ExternalEnabled, tone: 'info' },
       ],
     },
     {
       icon: DataLine,
       title: '渠道内部模型',
-      total: o.models.internal_total,
+      total: o.Models.InternalTotal,
       rows: [
-        { label: '正常', value: o.models.internal_normal, tone: 'success' },
-        { label: '异常', value: o.models.internal_total - o.models.internal_normal, tone: 'warning' },
+        { label: '正常', value: o.Models.InternalNormal, tone: 'success' },
+        { label: '异常', value: o.Models.InternalTotal - o.Models.InternalNormal, tone: 'warning' },
       ],
     },
   ]
@@ -569,47 +559,47 @@ const modeLabel = (m: string) =>
 
         <div class="card">
           <div class="block-title">Top 模型</div>
-          <VChart v-if="(data?.usage.by_model?.length ?? 0) > 0" :option="modelOption" height="260px" />
+          <VChart v-if="(data?.Usage.ByModel?.length ?? 0) > 0" :option="modelOption" height="260px" />
           <el-empty v-else description="暂无数据" :image-size="60" />
         </div>
 
         <div class="card">
           <div class="block-title">Top 渠道密钥</div>
-          <VChart v-if="(data?.usage.by_key?.length ?? 0) > 0" :option="keyOption" height="260px" />
+          <VChart v-if="(data?.Usage.ByKey?.length ?? 0) > 0" :option="keyOption" height="260px" />
           <el-empty v-else description="暂无数据" :image-size="60" />
         </div>
 
         <div class="card">
           <div class="block-title">计费模式分布</div>
           <div class="mode-list">
-            <div v-for="m in data?.usage.by_mode ?? []" :key="m.key" class="mode-item">
+            <div v-for="m in data?.Usage.ByMode ?? []" :key="m.Key" class="mode-item">
               <div class="mode-head">
-                <span class="mode-name">{{ modeLabel(m.key) }}</span>
-                <span class="mode-calls">{{ fmtInt(m.calls) }} 次</span>
+                <span class="mode-name">{{ modeLabel(m.Key) }}</span>
+                <span class="mode-calls">{{ fmtInt(m.Calls) }} 次</span>
               </div>
               <div class="mode-bar">
                 <div
                   class="mode-bar-in"
                   :style="{
                     width:
-                      ((m.calls / Math.max((data?.usage.by_mode ?? []).reduce((s, x) => s + x.calls, 0), 1)) *
+                      ((m.Calls / Math.max((data?.Usage.ByMode ?? []).reduce((s, x) => s + x.Calls, 0), 1)) *
                         100).toFixed(1) + '%',
                   }"
                 />
               </div>
               <div class="mode-foot">
-                <span>{{ fmtCompact(m.tokens) }} Token</span>
-                <span>{{ fmtMoney(m.credits) }} 积分</span>
+                <span>{{ fmtCompact(m.Tokens) }} Token</span>
+                <span>{{ fmtMoney(m.Credits) }} 积分</span>
               </div>
             </div>
-            <el-empty v-if="!(data?.usage.by_mode?.length ?? 0)" description="暂无数据" :image-size="60" />
+            <el-empty v-if="!(data?.Usage.ByMode?.length ?? 0)" description="暂无数据" :image-size="60" />
           </div>
         </div>
 
         <div v-if="isAdmin" class="card span-2">
           <div class="block-title">Top 用户</div>
           <el-table
-            :data="(data?.usage.by_user ?? []).slice(0, 8)"
+            :data="(data?.Usage.ByUser ?? []).slice(0, 8)"
             size="small"
             class="table-nowrap"
             empty-text="暂无数据"
@@ -617,21 +607,21 @@ const modeLabel = (m: string) =>
             <el-table-column type="index" label="#" width="52" />
             <el-table-column label="用户" min-width="140">
               <template #default="{ row }">
-                <span class="cell-main">{{ row.label }}</span>
-                <span v-if="row.sub_label" class="cell-sub">{{ row.sub_label }}</span>
+                <span class="cell-main">{{ row.Label }}</span>
+                <span v-if="row.SubLabel" class="cell-sub">{{ row.SubLabel }}</span>
               </template>
             </el-table-column>
             <el-table-column label="请求数" align="right" min-width="100">
-              <template #default="{ row }">{{ fmtInt(row.calls) }}</template>
+              <template #default="{ row }">{{ fmtInt(row.Calls) }}</template>
             </el-table-column>
             <el-table-column label="失败" align="right" min-width="90">
-              <template #default="{ row }">{{ fmtInt(row.failed) }}</template>
+              <template #default="{ row }">{{ fmtInt(row.Failed) }}</template>
             </el-table-column>
             <el-table-column label="Token" align="right" min-width="110">
-              <template #default="{ row }">{{ fmtCompact(row.tokens) }}</template>
+              <template #default="{ row }">{{ fmtCompact(row.Tokens) }}</template>
             </el-table-column>
             <el-table-column label="积分" align="right" min-width="110">
-              <template #default="{ row }">{{ fmtMoney(row.credits) }}</template>
+              <template #default="{ row }">{{ fmtMoney(row.Credits) }}</template>
             </el-table-column>
           </el-table>
         </div>
@@ -673,9 +663,9 @@ const modeLabel = (m: string) =>
             <div class="block-title">
               耗时分布
               <span class="block-note">
-                P50 {{ fmtMs(data?.usage.p50_duration_ms ?? 0) }} · P90
-                {{ fmtMs(data?.usage.p90_duration_ms ?? 0) }} · P95
-                {{ fmtMs(data?.usage.p95_duration_ms ?? 0) }}
+                P50 {{ fmtMs(data?.Usage.P50MS ?? 0) }} · P90
+                {{ fmtMs(data?.Usage.P90MS ?? 0) }} · P95
+                {{ fmtMs(data?.Usage.P95MS ?? 0) }}
               </span>
             </div>
             <VChart :option="latencyOption" height="280px" />
@@ -686,14 +676,14 @@ const modeLabel = (m: string) =>
           </div>
           <div class="card">
             <div class="block-title">错误 Top</div>
-            <el-table :data="(data?.usage.errors ?? []).slice(0, 8)" size="small" empty-text="暂无失败记录">
+            <el-table :data="(data?.Usage.Errors ?? []).slice(0, 8)" size="small" empty-text="暂无失败记录">
               <el-table-column label="错误信息" min-width="200">
                 <template #default="{ row }">
-                  <span class="cell-main">{{ row.label }}</span>
+                  <span class="cell-main">{{ row.Label }}</span>
                 </template>
               </el-table-column>
               <el-table-column label="次数" width="90" align="right">
-                <template #default="{ row }">{{ fmtInt(row.calls) }}</template>
+                <template #default="{ row }">{{ fmtInt(row.Calls) }}</template>
               </el-table-column>
             </el-table>
           </div>
@@ -707,10 +697,10 @@ const modeLabel = (m: string) =>
         <span class="section-line" />
       </div>
       <div v-if="announcements.length" class="card announce-card">
-        <div v-for="a in announcements" :key="a.id" class="announce-item">
-          <el-tag :type="(levelType(a.level) as any)" size="small" effect="light">{{ a.level }}</el-tag>
-          <span class="announce-title">{{ a.title }}</span>
-          <span class="announce-time">{{ a.publish_at || '立即发布' }}</span>
+        <div v-for="a in announcements" :key="a.ID" class="announce-item">
+          <el-tag :type="(levelType(a.Level) as any)" size="small" effect="light">{{ a.Level }}</el-tag>
+          <span class="announce-title">{{ a.Title }}</span>
+          <span class="announce-time">{{ a.PublishAt || '立即发布' }}</span>
         </div>
       </div>
 

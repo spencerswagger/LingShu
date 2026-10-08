@@ -13,8 +13,8 @@ import (
 
 const userStatusSQL = `SELECT role, status FROM users WHERE id = $1`
 
-const insertTokenSQL = `INSERT INTO tokens(token_hash, token_display, secret_cipher, user_id, display_name, tag_id, expires_at)
-			 VALUES($1, $2, $3, $4, $5, $6, $7)
+const insertTokenSQL = `INSERT INTO tokens(id, token_hash, token_display, secret_cipher, user_id, display_name, tag_id, expires_at)
+			 VALUES($1, $2, $3, $4, $5, $6, $7, $8)
 			 RETURNING id, created_at`
 
 const getTokenByHashSQL = `SELECT ` + tokenCols + ` FROM tokens WHERE token_hash = $1`
@@ -52,7 +52,7 @@ func TestToken_CreateAndLookupByPlain_Success(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"role", "status"}).AddRow(RoleDeveloper, StatusActive))
 	// 插入：secret_cipher 空串（未注入 SM4 密钥）+ hash/display 动态，user=1、name、tag=nil、expires=nil。
 	mock.ExpectQuery(regexp.QuoteMeta(insertTokenSQL)).
-		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), nil, int64(1), "dev-key", nil, nil).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), nil, int64(1), "dev-key", nil, nil).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(100), now))
 
 	svc := NewTokenService(NewTokenStore(db))
@@ -107,7 +107,7 @@ func TestToken_Create_TagIDNil_InsertsNull(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"role", "status"}).AddRow(RoleDeveloper, StatusActive))
 	// tag_id 与 expires_at 传 nil，落库即 NULL。
 	mock.ExpectQuery(regexp.QuoteMeta(insertTokenSQL)).
-		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), nil, int64(2), "名-key", nil, nil).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), nil, int64(2), "名-key", nil, nil).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(1), time.Now()))
 
 	svc := NewTokenService(NewTokenStore(db))

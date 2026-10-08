@@ -13,24 +13,25 @@ import {
 } from '@/api/admin'
 import ModelPricing from '@/components/ModelPricing.vue'
 import ErrorBubble from '@/components/ErrorBubble.vue'
+import { fmtDateTime } from '@/utils/format'
 
 const route = useRoute()
 const router = useRouter()
-const id = Number(route.params.id)
+const id = String(route.params.id)
 
 const loading = ref(false)
 const saving = ref(false)
 const errInfo = ref<{ message: string; requestId: string }>({ message: '', requestId: '' })
 
 const form = reactive({
-  external_name: '',
-  description: '',
-  enabled: true,
+  ExternalName: '',
+  Description: '',
+  Enabled: true,
 })
 const pricing = reactive<Record<string, any>>({
-  sale_rates: { input: 0, output: 0, cache_read: 0, cache_write: 0, reasoning: 0 },
-  time_config: null,
-  context_tiers: null,
+  SaleRates: { Input: 0, Output: 0, CacheRead: 0, CacheWrite: 0, Reasoning: 0 },
+  TimeConfig: null,
+  ContextTiers: null,
 })
 
 // models.dev 参考价市场（多供应商目录）
@@ -45,18 +46,18 @@ const catApplying = ref(false)
 
 // 推荐条目：与当前对外名称完全一致且供应商匹配前缀
 const recommended = computed(() => {
-  const name = form.external_name
+  const name = form.ExternalName
   let prefix = name
   const dash = name.indexOf('-')
   if (dash > 0) prefix = name.slice(0, dash)
   let best: CatalogEntry | null = null
   for (const e of catList.value) {
-    if (e.model_id !== name) continue
-    if (e.provider === prefix) {
+    if (e.ModelID !== name) continue
+    if (e.Provider === prefix) {
       best = e
       break
     }
-    if (best == null || e.provider < best.provider) {
+    if (best == null || e.Provider < best.Provider) {
       best = e
     }
   }
@@ -66,7 +67,7 @@ const selectedEntry = ref<CatalogEntry | null>(null)
 
 // 对外名称前缀（'-' 之前），用于标记「官方」供应商行（如 deepseek-flash → deepseek）
 const modelNamePrefix = computed(() => {
-  const name = form.external_name.trim()
+  const name = form.ExternalName.trim()
   const dash = name.indexOf('-')
   return dash > 0 ? name.slice(0, dash) : name
 })
@@ -89,12 +90,12 @@ function usdToCredits(usd: number): number {
 // 打开 models.dev 参考价市场：加载 R 并按当前模型名预搜索
 async function onOpenCatalog() {
   catOpen.value = true
-  catQ.value = form.external_name
+  catQ.value = form.ExternalName
   try {
     const res = await getBillingConfig()
-    const v = Number(res.data.r)
+    const v = Number(res.Data.R)
     if (v > 0) catR.value = v
-    const c = Number(res.data.cny_rate)
+    const c = Number(res.Data.CNYRate)
     if (c > 0) catCnyRate.value = c
   } catch {
     /* 保持默认 */
@@ -107,9 +108,9 @@ async function onCatalogSearch() {
   errInfo.value = { message: '', requestId: '' }
   try {
     const res = await priceCatalog(catQ.value)
-    catList.value = res.data.list || []
-    catUpdatedAt.value = res.data.updated_at || ''
-    catTotal.value = res.data.total || 0
+    catList.value = res.Data.List || []
+    catUpdatedAt.value = res.Data.UpdatedAt || ''
+    catTotal.value = res.Data.Total || 0
     selectedEntry.value = null
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
@@ -125,7 +126,7 @@ async function onSyncNow() {
   errInfo.value = { message: '', requestId: '' }
   try {
     const res = await runSync()
-    ElMessage.success(res.data.summary)
+    ElMessage.success(res.Data.Summary)
     await onCatalogSearch()
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
@@ -140,19 +141,19 @@ async function onApplyCatalog() {
   if (!entry) return ElMessage.warning('目录为空或未找到参考价')
   catApplying.value = true
   try {
-    const next: Record<string, number> = { ...pricing.sale_rates }
+    const next: Record<string, number> = { ...pricing.SaleRates }
     // 只有 models.dev 提供的价格段才覆盖，无价段保留原值（避免清空用户已填的缓存写/推理费率）
     const apply = (k: string, usd: number) => {
       if (usd > 0) next[k] = usdToCnyPerM(usd)
     }
-    apply('input', entry.input_usd)
-    apply('output', entry.output_usd)
-    apply('cache_read', entry.cache_read_usd)
-    apply('cache_write', entry.cache_write_usd)
-    apply('reasoning', entry.reasoning_usd)
-    pricing.sale_rates = next
+    apply('Input', entry.InputUSD)
+    apply('Output', entry.OutputUSD)
+    apply('CacheRead', entry.CacheReadUSD)
+    apply('CacheWrite', entry.CacheWriteUSD)
+    apply('Reasoning', entry.ReasoningUSD)
+    pricing.SaleRates = next
     catOpen.value = false
-    ElMessage.success(`已应用 models.dev 参考价（${entry.provider}/${entry.model_id}）到售价可用的价格段`)
+    ElMessage.success(`已应用 models.dev 参考价（${entry.Provider}/${entry.ModelID}）到售价可用的价格段`)
   } finally {
     catApplying.value = false
   }
@@ -163,18 +164,18 @@ onMounted(async () => {
   errInfo.value = { message: '', requestId: '' }
   try {
     const res = await listExternalModels()
-    const row = (res.data || []).find((m: ExternalModel) => m.id === id)
+    const row = (res.Data || []).find((m: ExternalModel) => m.ID === id)
     if (!row) {
       ElMessage.error('对外模型不存在')
       router.push('/admin/models')
       return
     }
-    form.external_name = row.external_name
-    form.description = row.description
-    form.enabled = row.enabled
-    pricing.sale_rates = { ...(row.sale_rates || {}) }
-    pricing.time_config = row.time_config
-    pricing.context_tiers = row.context_tiers
+    form.ExternalName = row.ExternalName
+    form.Description = row.Description
+    form.Enabled = row.Enabled
+    pricing.SaleRates = { ...(row.SaleRates || {}) }
+    pricing.TimeConfig = row.TimeConfig
+    pricing.ContextTiers = row.ContextTiers
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
   } finally {
@@ -183,18 +184,18 @@ onMounted(async () => {
 })
 
 async function onSubmit() {
-  if (!form.external_name.trim()) return ElMessage.warning('请填写对外模型名称')
+  if (!form.ExternalName.trim()) return ElMessage.warning('请填写对外模型名称')
 
   saving.value = true
   errInfo.value = { message: '', requestId: '' }
   try {
     await updateExternalModel(id, {
-      external_name: form.external_name.trim(),
-      description: form.description.trim(),
-      enabled: form.enabled,
-      sale_rates: pricing.sale_rates,
-      time_config: pricing.time_config,
-      context_tiers: pricing.context_tiers,
+      ExternalName: form.ExternalName.trim(),
+      Description: form.Description.trim(),
+      Enabled: form.Enabled,
+      SaleRates: pricing.SaleRates,
+      TimeConfig: pricing.TimeConfig,
+      ContextTiers: pricing.ContextTiers,
     })
     ElMessage.success('对外模型已更新')
     router.push('/admin/models')
@@ -211,17 +212,17 @@ async function onSubmit() {
     <div v-loading="loading" class="card" style="max-width: 1080px">
       <el-form label-width="110px" class="me-grid">
         <el-form-item label="对外名称" required>
-          <el-input v-model="form.external_name" />
+          <el-input v-model="form.ExternalName" />
         </el-form-item>
         <el-form-item label="描述">
-          <el-input v-model="form.description" placeholder="用途说明（可选）" />
+          <el-input v-model="form.Description" placeholder="用途说明（可选）" />
         </el-form-item>
-        <el-form-item label="启用"><el-switch v-model="form.enabled" /></el-form-item>
+        <el-form-item label="启用"><el-switch v-model="form.Enabled" /></el-form-item>
 
         <div class="span-2">
           <ModelPricing
             :model-value="pricing"
-            show-rates-key="sale_rates"
+            show-rates-key="SaleRates"
             title="售价"
             @update:model-value="Object.assign(pricing, $event)"
           >
@@ -272,9 +273,9 @@ async function onSubmit() {
       >
         <el-table-column label="供应商" min-width="100" show-overflow-tooltip>
           <template #default="{ row }">
-            <span>{{ row.provider }}</span>
+            <span>{{ row.Provider }}</span>
             <el-tag
-              v-if="modelNamePrefix && row.provider.toLowerCase() === modelNamePrefix.toLowerCase()"
+              v-if="modelNamePrefix && row.Provider.toLowerCase() === modelNamePrefix.toLowerCase()"
               size="small"
               type="primary"
               effect="light"
@@ -286,9 +287,9 @@ async function onSubmit() {
         </el-table-column>
         <el-table-column label="模型 ID" min-width="130" show-overflow-tooltip>
           <template #default="{ row }">
-            <span>{{ row.model_id }}</span>
+            <span>{{ row.ModelID }}</span>
             <el-tag
-              v-if="row.model_id === form.external_name"
+              v-if="row.ModelID === form.ExternalName"
               size="small"
               type="success"
               effect="light"
@@ -301,49 +302,49 @@ async function onSubmit() {
         <el-table-column label="输入" width="130" align="right">
           <template #default="{ row }">
             <div class="pcell">
-              <span class="cny">{{ usdToCnyPerM(row.input_usd) }}</span>
-              <span class="credit">≈ {{ usdToCredits(row.input_usd) }} 积分</span>
+              <span class="cny">{{ usdToCnyPerM(row.InputUSD) }}</span>
+              <span class="credit">≈ {{ usdToCredits(row.InputUSD) }} 积分</span>
             </div>
           </template>
         </el-table-column>
         <el-table-column label="输出" width="130" align="right">
           <template #default="{ row }">
             <div class="pcell">
-              <span class="cny">{{ usdToCnyPerM(row.output_usd) }}</span>
-              <span class="credit">≈ {{ usdToCredits(row.output_usd) }} 积分</span>
+              <span class="cny">{{ usdToCnyPerM(row.OutputUSD) }}</span>
+              <span class="credit">≈ {{ usdToCredits(row.OutputUSD) }} 积分</span>
             </div>
           </template>
         </el-table-column>
         <el-table-column label="缓存读" width="130" align="right">
           <template #default="{ row }">
-            <div v-if="row.cache_read_usd > 0" class="pcell">
-              <span class="cny">{{ usdToCnyPerM(row.cache_read_usd) }}</span>
-              <span class="credit">≈ {{ usdToCredits(row.cache_read_usd) }} 积分</span>
+            <div v-if="row.CacheReadUSD > 0" class="pcell">
+              <span class="cny">{{ usdToCnyPerM(row.CacheReadUSD) }}</span>
+              <span class="credit">≈ {{ usdToCredits(row.CacheReadUSD) }} 积分</span>
             </div>
             <span v-else class="zero">—</span>
           </template>
         </el-table-column>
         <el-table-column label="缓存写" width="130" align="right">
           <template #default="{ row }">
-            <div v-if="row.cache_write_usd > 0" class="pcell">
-              <span class="cny">{{ usdToCnyPerM(row.cache_write_usd) }}</span>
-              <span class="credit">≈ {{ usdToCredits(row.cache_write_usd) }} 积分</span>
+            <div v-if="row.CacheWriteUSD > 0" class="pcell">
+              <span class="cny">{{ usdToCnyPerM(row.CacheWriteUSD) }}</span>
+              <span class="credit">≈ {{ usdToCredits(row.CacheWriteUSD) }} 积分</span>
             </div>
             <span v-else class="zero">—</span>
           </template>
         </el-table-column>
         <el-table-column label="推理" width="130" align="right">
           <template #default="{ row }">
-            <div v-if="row.reasoning_usd > 0" class="pcell">
-              <span class="cny">{{ usdToCnyPerM(row.reasoning_usd) }}</span>
-              <span class="credit">≈ {{ usdToCredits(row.reasoning_usd) }} 积分</span>
+            <div v-if="row.ReasoningUSD > 0" class="pcell">
+              <span class="cny">{{ usdToCnyPerM(row.ReasoningUSD) }}</span>
+              <span class="credit">≈ {{ usdToCredits(row.ReasoningUSD) }} 积分</span>
             </div>
             <span v-else class="zero">—</span>
           </template>
         </el-table-column>
       </el-table>
       <div class="cat-status">
-        <span v-if="catUpdatedAt" class="status-item">数据同步于 {{ new Date(catUpdatedAt).toLocaleString() }}</span>
+        <span v-if="catUpdatedAt" class="status-item">数据同步于 {{ fmtDateTime(catUpdatedAt) }}</span>
         <span v-else class="status-item">价格数据尚未同步（服务启动或每 60 分钟拉取一次）</span>
         <span v-if="catTotal" class="status-item">命中 {{ catTotal }} 条</span>
       </div>
@@ -354,7 +355,7 @@ async function onSubmit() {
       <template #footer>
         <el-button @click="catOpen = false">取消</el-button>
         <el-button type="primary" :loading="catApplying" @click="onApplyCatalog">
-          应用为售价{{ selectedEntry ? `（${selectedEntry.provider}/${selectedEntry.model_id}）` : '' }}
+          应用为售价{{ selectedEntry ? `（${selectedEntry.Provider}/${selectedEntry.ModelID}）` : '' }}
         </el-button>
       </template>
     </el-dialog>

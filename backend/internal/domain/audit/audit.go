@@ -7,6 +7,8 @@ import (
 	"expvar"
 	"log/slog"
 	"time"
+
+	"github.com/team/llmgateway/internal/pkg/idgen"
 )
 
 // InsertFailures 审计写入失败累计计数（进程内 expvar）。
@@ -46,9 +48,9 @@ func (s *Store) Insert(ctx context.Context, e Entry) error {
 		uid = e.UserID
 	}
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO audit_logs(user_id, username, action, target_type, target_id, detail, request_id, ip)
-		 VALUES($1, $2, $3, $4, $5, $6, $7, $8)`,
-		uid, nullString(e.Username), e.Action, e.TargetType, e.TargetID, e.Detail, e.RequestID, e.IP)
+		`INSERT INTO audit_logs(id, user_id, username, action, target_type, target_id, detail, request_id, ip)
+		 VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+		idgen.New(), uid, nullString(e.Username), e.Action, e.TargetType, e.TargetID, e.Detail, e.RequestID, e.IP)
 	if err != nil {
 		InsertFailures.Add(1)
 	}

@@ -3,6 +3,7 @@ import { nextTick, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Edit } from '@element-plus/icons-vue'
 import { listSessions, kickSessions, renameSession, type AdminSession } from '@/api/admin'
+import { fmtDate, fmtTime } from '@/utils/format'
 import ErrorBubble from '@/components/ErrorBubble.vue'
 import UserSelect from '@/components/UserSelect.vue'
 import ColumnFilter from '@/components/ColumnFilter.vue'
@@ -20,27 +21,21 @@ const editingInputs = ref<Record<string, any>>({})
 
 const filters = reactive({
   q: '',
-  user_id: undefined as number | undefined,
+  user_id: undefined as string | undefined,
   token_id: undefined as string | undefined,
   channel_key_id: undefined as string | undefined,
   status: undefined as string | undefined, // active | expired | closed
 })
 
-function fmtDate(v: string): string {
-  return v ? v.slice(0, 10) : '-'
-}
-function fmtTime(v: string): string {
-  return v ? v.slice(11, 19) : ''
-}
 function setInputRef(el: any, id: string) {
   if (el) editingInputs.value[id] = el
 }
 
 function startRename(row: AdminSession) {
-  editingId.value = row.session_id
-  editingName.value = row.name || ''
+  editingId.value = row.SessionID
+  editingName.value = row.SessionName || ''
   nextTick(() => {
-    editingInputs.value[row.session_id]?.focus()
+    editingInputs.value[row.SessionID]?.focus()
   })
 }
 
@@ -53,10 +48,10 @@ async function saveRename(row: AdminSession) {
     load()
     return
   }
-  if (name === row.name) return
+  if (name === row.SessionName) return
   try {
     await renameSession(id, name)
-    row.name = name
+    row.SessionName = name
     ElMessage.success('已重命名')
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
@@ -67,18 +62,18 @@ async function saveRename(row: AdminSession) {
 async function load() {
   loading.value = true
   errInfo.value = { message: '', requestId: '' }
-  const params: Record<string, any> = { page: page.value, size: size.value }
-  if (filters.q.trim()) params.q = filters.q.trim()
-  if (filters.user_id) params.user_id = filters.user_id
-  if (filters.token_id && filters.token_id.trim()) params.token_id = filters.token_id.trim()
-  if (filters.channel_key_id && filters.channel_key_id.trim()) params.channel_key_id = filters.channel_key_id.trim()
-  if (filters.status === 'active') params.expired = 'active'
-  if (filters.status === 'expired') params.expired = 'expired'
-  if (filters.status === 'closed') params.closed = '1'
+  const params: Record<string, any> = { Page: page.value, Size: size.value }
+  if (filters.q.trim()) params.Q = filters.q.trim()
+  if (filters.user_id) params.UserID = filters.user_id
+  if (filters.token_id && filters.token_id.trim()) params.TokenID = filters.token_id.trim()
+  if (filters.channel_key_id && filters.channel_key_id.trim()) params.ChannelKeyID = filters.channel_key_id.trim()
+  if (filters.status === 'active') params.Expired = 'active'
+  if (filters.status === 'expired') params.Expired = 'expired'
+  if (filters.status === 'closed') params.Closed = '1'
   try {
     const res = await listSessions(params)
-    list.value = res.data.list || []
-    total.value = res.data.total || 0
+    list.value = res.Data.List || []
+    total.value = res.Data.Total || 0
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
   } finally {
@@ -110,8 +105,8 @@ async function close(ids: string[], label: string) {
     return
   }
   try {
-    const res = await kickSessions({ session_ids: ids })
-    ElMessage.success(`已关闭 ${res.data.affected} 个会话`)
+    const res = await kickSessions({ SessionIDs: ids })
+    ElMessage.success(`已关闭 ${res.Data.Affected} 个会话`)
     selected.value = []
     await load()
   } catch (e: any) {
@@ -120,11 +115,11 @@ async function close(ids: string[], label: string) {
 }
 
 function onCloseOne(row: AdminSession) {
-  close([row.session_id], '该')
+  close([row.SessionID], '该')
 }
 function onCloseBatch() {
   if (!selected.value.length) return
-  close(selected.value.map((r) => r.session_id), `${selected.value.length} 个`)
+  close(selected.value.map((r) => r.SessionID), `${selected.value.length} 个`)
 }
 </script>
 
@@ -143,7 +138,7 @@ function onCloseBatch() {
         border
         stripe
         class="table-nowrap"
-        row-key="session_id"
+        row-key="SessionID"
         @selection-change="(rows: AdminSession[]) => (selected = rows)"
       >
         <el-table-column type="selection" width="44" />
@@ -163,9 +158,9 @@ function onCloseBatch() {
           <template #default="{ row }">
             <div class="t-time">
               <el-input
-                v-if="editingId === row.session_id"
+                v-if="editingId === row.SessionID"
                 v-model="editingName"
-                :ref="(el: any) => setInputRef(el, row.session_id)"
+                :ref="(el: any) => setInputRef(el, row.SessionID)"
                 size="small"
                 maxlength="100"
                 placeholder="输入会话名称"
@@ -174,10 +169,10 @@ function onCloseBatch() {
                 @blur="saveRename(row)"
               />
               <span v-else class="cell-name" @click="startRename(row)">
-                <span class="name-text">{{ row.name || '未命名' }}</span>
+                <span class="name-text">{{ row.SessionName || '未命名' }}</span>
                 <el-icon class="name-edit"><Edit /></el-icon>
               </span>
-              <span class="t-clock">{{ row.model || '-' }}</span>
+              <span class="t-clock">{{ row.Model || '-' }}</span>
             </div>
           </template>
         </el-table-column>
@@ -189,8 +184,8 @@ function onCloseBatch() {
           </template>
           <template #default="{ row }">
             <div class="t-time">
-              <span class="t-date">{{ row.user_nickname || row.user_name || '-' }}</span>
-              <span class="t-clock">{{ row.user_nickname && row.user_name ? '@' + row.user_name + ' · ' : '' }}{{ row.token_name || '-' }}</span>
+              <span class="t-date">{{ row.UserNickname || row.UserName || '-' }}</span>
+              <span class="t-clock">{{ row.UserNickname && row.UserName ? '@' + row.UserName + ' · ' : '' }}{{ row.TokenName || '-' }}</span>
             </div>
           </template>
         </el-table-column>
@@ -211,22 +206,22 @@ function onCloseBatch() {
             </ColumnFilter>
           </template>
           <template #default="{ row }">
-            <span class="cell">{{ row.channel_key_name || '-' }}</span>
+            <span class="cell">{{ row.ChannelKeyName || '-' }}</span>
           </template>
         </el-table-column>
         <el-table-column label="创建 / 最近活跃" min-width="170">
           <template #default="{ row }">
             <div class="t-time">
-              <span class="t-date">{{ fmtDate(row.created_at) }} {{ fmtTime(row.created_at) }}</span>
-              <span class="t-clock">{{ fmtDate(row.last_active) }} {{ fmtTime(row.last_active) }}</span>
+              <span class="t-date">{{ fmtDate(row.CreatedAt) }} {{ fmtTime(row.CreatedAt) }}</span>
+              <span class="t-clock">{{ fmtDate(row.LastActive) }} {{ fmtTime(row.LastActive) }}</span>
             </div>
           </template>
         </el-table-column>
         <el-table-column label="过期时间" min-width="110">
           <template #default="{ row }">
             <div class="t-time">
-              <span class="t-date">{{ fmtDate(row.expire_at) }}</span>
-              <span class="t-clock">{{ fmtTime(row.expire_at) }}</span>
+              <span class="t-date">{{ fmtDate(row.ExpireAt) }}</span>
+              <span class="t-clock">{{ fmtTime(row.ExpireAt) }}</span>
             </div>
           </template>
         </el-table-column>
@@ -241,8 +236,8 @@ function onCloseBatch() {
             </ColumnFilter>
           </template>
           <template #default="{ row }">
-            <el-tag v-if="row.closed" type="info" size="small" effect="light">已关闭</el-tag>
-            <el-tag v-else-if="row.expired" type="danger" size="small" effect="light">已过期</el-tag>
+            <el-tag v-if="row.Closed" type="info" size="small" effect="light">已关闭</el-tag>
+            <el-tag v-else-if="row.Expired" type="danger" size="small" effect="light">已过期</el-tag>
             <el-tag v-else type="success" size="small" effect="light">进行中</el-tag>
           </template>
         </el-table-column>

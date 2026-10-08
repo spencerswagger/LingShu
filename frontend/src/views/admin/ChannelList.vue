@@ -16,7 +16,7 @@ import ErrorBubble from '@/components/ErrorBubble.vue'
 import ColumnFilter from '@/components/ColumnFilter.vue'
 
 // 密钥聚合态子项（与 AdminChannel.KeyStates 对齐）
-type KeyState = { key_id: number; key_name: string; state: string }
+type KeyState = { KeyID: string; KeyName: string; State: string }
 
 function keysOf(row: AdminChannel): KeyState[] {
   return row.KeyStates || []
@@ -28,8 +28,8 @@ function agg(row: AdminChannel): { text: string; tagType: 'success' | 'warning' 
   const keys = keysOf(row)
   if (!keys.length) return { text: '无密钥', tagType: 'info' }
   const y = keys.length
-  const x = keys.filter((k) => k.state !== 'DISABLED').length
-  const hasDrain = keys.some((k) => k.state === 'DRAIN')
+  const x = keys.filter((k) => k.State !== 'DISABLED').length
+  const hasDrain = keys.some((k) => k.State === 'DRAIN')
   let tagType: 'success' | 'warning' | 'danger' = 'success'
   if (x === y && !hasDrain) tagType = 'success'
   else if (x > 0) tagType = 'warning'
@@ -69,7 +69,7 @@ async function load() {
   errInfo.value = { message: '', requestId: '' }
   try {
     const res = await listChannels()
-    list.value = res.data || []
+    list.value = res.Data || []
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
   } finally {
@@ -79,7 +79,7 @@ async function load() {
 
 onMounted(load)
 
-const savingId = ref<number | null>(null)
+const savingId = ref<string | null>(null)
 async function onEditRouteField(row: AdminChannel, field: 'Priority' | 'Weight', v: number) {
   const num = Number(v)
   if (!Number.isFinite(num) || num < 1) {
@@ -92,11 +92,11 @@ async function onEditRouteField(row: AdminChannel, field: 'Priority' | 'Weight',
   savingId.value = row.ID
   try {
     await updateChannel(row.ID, {
-      name: row.Name,
-      protocol: row.Protocol,
-      base_url: row.BaseURL,
-      priority: field === 'Priority' ? num : row.Priority,
-      weight: field === 'Weight' ? num : (row.Weight ?? 1),
+      Name: row.Name,
+      Protocol: row.Protocol,
+      BaseURL: row.BaseURL,
+      Priority: field === 'Priority' ? num : row.Priority,
+      Weight: field === 'Weight' ? num : (row.Weight ?? 1),
     })
     ElMessage.success(`已更新${field === 'Priority' ? '优先级' : '权重'}`)
   } catch (e: any) {
@@ -121,7 +121,7 @@ async function onSetState(row: AdminChannel, action: 'normal' | 'drain' | 'disab
 // 逐密钥三态切换（popover 内）：调密钥级状态接口，成功后刷新列表（KeyStates 随之更新）
 async function onSetKeyState(row: AdminChannel, key: KeyState, action: 'normal' | 'drain' | 'disable') {
   try {
-    await channelKeyState(row.ID, key.key_id, action)
+    await channelKeyState(row.ID, key.KeyID, action)
     ElMessage.success('密钥状态已更新')
     await load()
   } catch (e: any) {
@@ -252,13 +252,13 @@ function onRowClick(row: AdminChannel, _column: unknown, event: Event) {
                 </div>
               </div>
               <template v-if="keysOf(row).length">
-                <div v-for="k in keysOf(row)" :key="k.key_id" class="key-row">
-                  <span class="key-name" :title="k.key_name">{{ k.key_name }}</span>
-                  <StatusTag :value="k.state" />
+                <div v-for="k in keysOf(row)" :key="k.KeyID" class="key-row">
+                  <span class="key-name" :title="k.KeyName">{{ k.KeyName }}</span>
+                  <StatusTag :value="k.State" />
                   <div class="pop-actions">
-                    <el-button v-if="k.state !== 'NORMAL'" size="small" type="success" @click="onSetKeyState(row, k, 'normal')">正常</el-button>
-                    <el-button v-if="k.state !== 'DRAIN'" size="small" type="warning" @click="onSetKeyState(row, k, 'drain')">排空</el-button>
-                    <el-button v-if="k.state !== 'DISABLED'" size="small" type="danger" @click="onSetKeyState(row, k, 'disable')">禁用</el-button>
+                    <el-button v-if="k.State !== 'NORMAL'" size="small" type="success" @click="onSetKeyState(row, k, 'normal')">正常</el-button>
+                    <el-button v-if="k.State !== 'DRAIN'" size="small" type="warning" @click="onSetKeyState(row, k, 'drain')">排空</el-button>
+                    <el-button v-if="k.State !== 'DISABLED'" size="small" type="danger" @click="onSetKeyState(row, k, 'disable')">禁用</el-button>
                   </div>
                 </div>
               </template>

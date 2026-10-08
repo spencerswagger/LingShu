@@ -83,10 +83,10 @@ func (s *SqlStore) ListRecords(ctx context.Context, f RecordFilter) ([]Record, i
 
 // RecordSummary 账单筛选聚合结果（统计栏）：请求数、总积分、总 token（五段求和）、总耗时。
 type RecordSummary struct {
-	Requests        int64   `json:"requests"`
-	CreditsTotal    float64 `json:"credits_total"`
-	TokensTotal     int64   `json:"tokens_total"`
-	DurationTotalMS int64   `json:"duration_total_ms"`
+	Requests        int64   `json:"Requests"`
+	CreditsTotal    float64 `json:"CreditsTotal"`
+	TokensTotal     int64   `json:"TokensTotal"`
+	DurationTotalMS int64   `json:"DurationTotalMS"`
 }
 
 // Summarize 按与列表完全相同的过滤条件聚合统计（不分页），供账单页统计栏展示。
@@ -111,12 +111,21 @@ func (s *SqlStore) Summarize(ctx context.Context, f RecordFilter) (RecordSummary
 	return out, nil
 }
 
+// cnLocation 返回北京时间时区；加载失败回退进程本地时区（进程时区已在启动时统一为 Asia/Shanghai）。
+func cnLocation() *time.Location {
+	loc, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		return time.Local
+	}
+	return loc
+}
+
 // DailyUsage 按日聚合某用户在最近 days 天内的调用量与积分消耗。
-// model 非空时按 external_model_name 过滤。
+// model 非空时按 external_model_name 过滤。按日切分以北京时间（Asia/Shanghai）为准。
 type DailyUsage struct {
-	Date    string  `json:"date"` // 2006-01-02
-	Credits float64 `json:"credits"`
-	Calls   int64   `json:"calls"`
+	Date    string  `json:"Date"` // 2006-01-02
+	Credits float64 `json:"Credits"`
+	Calls   int64   `json:"Calls"`
 }
 
 // DailyUsage 查询按日聚合结果（含零量日期占位可忽略）。
@@ -124,11 +133,12 @@ func (s *SqlStore) DailyUsage(ctx context.Context, userID int64, days int, model
 	if days <= 0 {
 		days = 30
 	}
-	cutoff := time.Now().AddDate(0, 0, -(days - 1))
+	now := time.Now().In(cnLocation())
+	cutoff := now.AddDate(0, 0, -(days - 1))
 	cutoff = time.Date(cutoff.Year(), cutoff.Month(), cutoff.Day(), 0, 0, 0, 0, cutoff.Location())
 
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT date_trunc('day', call_time)::date AS d,
+		`SELECT date_trunc('day', call_time AT TIME ZONE 'Asia/Shanghai')::date AS d,
 		        count(*) AS calls,
 		        COALESCE(sum(credits_consumed), 0) AS credits
 		 FROM billing_records

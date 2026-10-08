@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/team/llmgateway/internal/pkg/idgen"
 	"github.com/team/llmgateway/internal/pkg/resp"
 )
 
@@ -75,14 +76,17 @@ func scanAnnouncement(row interface{ Scan(...any) error }) (*Announcement, error
 
 // Create 插入公告并回填主键与创建时间。
 func (s *AnnouncementStore) Create(ctx context.Context, a *Announcement) (*Announcement, error) {
+	if a.ID == 0 {
+		a.ID = idgen.New()
+	}
 	var createdBy any
 	if a.CreatedBy != nil {
 		createdBy = *a.CreatedBy
 	}
 	row := s.db.QueryRowContext(ctx,
-		`INSERT INTO announcements(title, content, level, publish_at, expire_at, enabled, created_by)
-		 VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING `+announceCols,
-		a.Title, a.Content, a.Level, a.PublishAt, a.ExpireAt, a.Enabled, createdBy)
+		`INSERT INTO announcements(id, title, content, level, publish_at, expire_at, enabled, created_by)
+		 VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING `+announceCols,
+		a.ID, a.Title, a.Content, a.Level, a.PublishAt, a.ExpireAt, a.Enabled, createdBy)
 	created, err := scanAnnouncement(row)
 	if err != nil {
 		return nil, err
@@ -277,14 +281,14 @@ func NewAnnouncementHandler(svc *AnnouncementService, userIDFrom func(ctx contex
 }
 
 type announcementResponse struct {
-	ID        int64     `json:"id"`
-	Title     string    `json:"title"`
-	Content   string    `json:"content"`
-	Level     string    `json:"level"`
-	PublishAt *string   `json:"publish_at,omitempty"`
-	ExpireAt  *string   `json:"expire_at,omitempty"`
-	Enabled   bool      `json:"enabled"`
-	CreatedAt time.Time `json:"created_at"`
+	ID        int64     `json:"ID,string"`
+	Title     string    `json:"Title"`
+	Content   string    `json:"Content"`
+	Level     string    `json:"Level"`
+	PublishAt *string   `json:"PublishAt,omitempty"`
+	ExpireAt  *string   `json:"ExpireAt,omitempty"`
+	Enabled   bool      `json:"Enabled"`
+	CreatedAt time.Time `json:"CreatedAt"`
 }
 
 func fmtTime(t *time.Time) *string {
@@ -309,12 +313,12 @@ func (a *Announcement) response() announcementResponse {
 }
 
 type announcementInput struct {
-	Title     string     `json:"title"`
-	Content   string     `json:"content"`
-	Level     string     `json:"level"`
-	PublishAt *time.Time `json:"publish_at"`
-	ExpireAt  *time.Time `json:"expire_at"`
-	Enabled   *bool      `json:"enabled"`
+	Title     string     `json:"Title"`
+	Content   string     `json:"Content"`
+	Level     string     `json:"Level"`
+	PublishAt *time.Time `json:"PublishAt"`
+	ExpireAt  *time.Time `json:"ExpireAt"`
+	Enabled   *bool      `json:"Enabled"`
 }
 
 func (h *AnnouncementHandler) parseInput(w http.ResponseWriter, r *http.Request) (Announcement, bool) {
@@ -348,7 +352,7 @@ func (h *AnnouncementHandler) HandleAdminList(w http.ResponseWriter, r *http.Req
 	for i := range list {
 		items = append(items, list[i].response())
 	}
-	resp.OK(w, r, map[string]any{"list": items})
+	resp.OK(w, r, map[string]any{"List": items})
 }
 
 // HandleAdminCreate POST /api/v1/admin/announcements
@@ -388,18 +392,18 @@ func (h *AnnouncementHandler) HandleAdminUpdate(w http.ResponseWriter, r *http.R
 // HandleAdminBatchDelete POST /api/v1/admin/announcements/batch-delete
 func (h *AnnouncementHandler) HandleAdminBatchDelete(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		IDs []int64 `json:"ids"`
+		IDs idgen.IDs `json:"IDs"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "请求体格式错误")
 		return
 	}
-	n, err := h.svc.BatchDelete(r.Context(), req.IDs)
+	n, err := h.svc.BatchDelete(r.Context(), []int64(req.IDs))
 	if err != nil {
 		writeServiceErr(w, r, err)
 		return
 	}
-	resp.OK(w, r, map[string]int64{"deleted": n})
+	resp.OK(w, r, map[string]int64{"Deleted": n})
 }
 
 // HandleDevList GET /api/v1/dev/announcements 返回当前有效公告。
@@ -413,5 +417,5 @@ func (h *AnnouncementHandler) HandleDevList(w http.ResponseWriter, r *http.Reque
 	for i := range list {
 		items = append(items, list[i].response())
 	}
-	resp.OK(w, r, map[string]any{"list": items})
+	resp.OK(w, r, map[string]any{"List": items})
 }

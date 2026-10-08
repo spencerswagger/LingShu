@@ -14,17 +14,18 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/team/llmgateway/internal/pkg/idgen"
 )
 
-// Tag 对应 semantic_tags 表的一行。
+// Tag 对应 semantic_tags 表的一行。雪花 ID 以字符串序列化。
 type Tag struct {
-	ID          int64
-	Name        string
-	Description string
-	KVPairs     map[string]string
-	Enabled     bool
-	CreatedBy   int64 // 创建者 user_id；0 表示系统/无用户场景（admin 注入）
-	CreatedAt   time.Time
+	ID          int64             `json:"ID,string"`
+	Name        string            `json:"Name"`
+	Description string            `json:"Description"`
+	KVPairs     map[string]string `json:"KVPairs"`
+	Enabled     bool              `json:"Enabled"`
+	CreatedBy   int64             `json:"CreatedBy,string"` // 创建者 user_id；0 表示系统/无用户场景（admin 注入）
+	CreatedAt   time.Time         `json:"CreatedAt"`
 }
 
 // cols 列出 semantic_tags 表查询使用的全部列，保持各查询一致。
@@ -144,10 +145,13 @@ var ErrNameExists = errors.New("tag name already exists")
 
 // Insert 插入标签并返回回填主键后的完整记录，name 冲突返回 ErrNameExists。
 func (s *Store) Insert(ctx context.Context, t *Tag) (*Tag, error) {
+	if t.ID == 0 {
+		t.ID = idgen.New()
+	}
 	row := s.db.QueryRowContext(ctx,
-		`INSERT INTO semantic_tags(name, description, kv_pairs, enabled, created_by)
-		 VALUES($1,$2,$3,$4,$5) RETURNING `+cols,
-		t.Name, t.Description, jsonB(t.KVPairs), t.Enabled, nullableID(t.CreatedBy))
+		`INSERT INTO semantic_tags(id, name, description, kv_pairs, enabled, created_by)
+		 VALUES($1,$2,$3,$4,$5,$6) RETURNING `+cols,
+		t.ID, t.Name, t.Description, jsonB(t.KVPairs), t.Enabled, nullableID(t.CreatedBy))
 	created, err := scanTag(row)
 	if err != nil {
 		var pgErr *pgconn.PgError

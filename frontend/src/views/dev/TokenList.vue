@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { RefreshRight, Key, Link, Plus } from '@element-plus/icons-vue'
-import { listDevTokens, toggleDevToken, rotateDevToken, createDevToken, getDevTokenSecret, listDevTags, type DevToken } from '@/api/dev'
+import { listDevTokens, toggleDevToken, rotateDevToken, createDevToken, getDevTokenSecret, listDevTags, type DevToken, type DevTag } from '@/api/dev'
 import ErrorBubble from '@/components/ErrorBubble.vue'
 
 const router = useRouter()
@@ -15,20 +15,20 @@ const size = ref(20)
 const errInfo = ref<{ message: string; requestId: string }>({ message: '', requestId: '' })
 
 // 标签名映射：tag_id → name（令牌列表展示用）
-const tagNameMap = ref<Record<number, string>>({})
+const tagNameMap = ref<Record<string, string>>({})
 
 // 新建令牌弹窗
 const createOpen = ref(false)
 const createSaving = ref(false)
 const createErr = ref<{ message: string; requestId: string }>({ message: '', requestId: '' })
-const tagOptions = ref<{ value: number | null; label: string }[]>([{ value: null, label: '不选择（走默认路由）' }])
-const createForm = ref({ display_name: '', tag_id: null as number | null, expires_at: null as string | null })
-const createdPlain = ref<{ plain: string; display: string } | null>(null)
+const tagOptions = ref<{ value: string | null; label: string }[]>([{ value: null, label: '不选择（走默认路由）' }])
+const createForm = ref({ DisplayName: '', TagID: null as string | null, ExpiresAt: null as string | null })
+const createdPlain = ref<{ Plain: string; Display: string } | null>(null)
 
 // 查看密钥弹窗
 const secretOpen = ref(false)
 const secretLoading = ref(false)
-const secretPlain = ref<{ plain: string; display: string } | null>(null)
+const secretPlain = ref<{ Plain: string; Display: string } | null>(null)
 const secretName = ref('')
 
 // 轮换后的明文展示
@@ -39,11 +39,11 @@ const rotateDisplay = ref('')
 async function loadTags() {
   try {
     const res = await listDevTags()
-    const tags: { ID: number; Name: string }[] = res.data || []
+    const tags: DevTag[] = res.Data || []
     tagNameMap.value = Object.fromEntries(tags.map((t) => [t.ID, t.Name]))
     tagOptions.value = [
       { value: null, label: '不选择（走默认路由）' },
-      ...tags.filter((t) => (t as any).Enabled !== false).map((t) => ({ value: t.ID, label: t.Name })),
+      ...tags.filter((t) => t.Enabled !== false).map((t) => ({ value: t.ID, label: t.Name })),
     ]
   } catch {
     // 忽略，仅影响标签列展示
@@ -51,8 +51,8 @@ async function loadTags() {
 }
 
 function tagLabel(row: DevToken): string {
-  if (!row.tag_id) return '默认路由'
-  return tagNameMap.value[row.tag_id] ? `标签：${tagNameMap.value[row.tag_id]}` : `标签 #${row.tag_id}`
+  if (!row.TagID) return '默认路由'
+  return tagNameMap.value[row.TagID] ? `标签：${tagNameMap.value[row.TagID]}` : '标签'
 }
 
 async function load() {
@@ -60,8 +60,8 @@ async function load() {
   errInfo.value = { message: '', requestId: '' }
   try {
     const res = await listDevTokens(page.value, size.value)
-    list.value = res.data.list
-    total.value = res.data.total
+    list.value = res.Data.List
+    total.value = res.Data.Total
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
   } finally {
@@ -77,9 +77,9 @@ onMounted(() => {
 // 行内状态切换（实时反馈，无需刷新整页）
 async function onToggle(row: DevToken) {
   try {
-    const res = await toggleDevToken(row.id)
-    row.status = res.data.status
-    ElMessage.success(res.data.status === 'ACTIVE' ? '已启用' : '已禁用')
+    const res = await toggleDevToken(row.ID)
+    row.Status = res.Data.Status
+    ElMessage.success(res.Data.Status === 'ACTIVE' ? '已启用' : '已禁用')
   } catch (e: any) {
     ElMessage.error(e?.message || '操作失败')
   }
@@ -88,9 +88,9 @@ async function onToggle(row: DevToken) {
 // 轮换：作废旧令牌并换发新令牌
 async function onRotate(row: DevToken) {
   try {
-    const res = await rotateDevToken(row.id)
-    rotatePlain.value = res.data.plain
-    rotateDisplay.value = res.data.display
+    const res = await rotateDevToken(row.ID)
+    rotatePlain.value = res.Data.Plain
+    rotateDisplay.value = res.Data.Display
     rotateDialog.value = true
     await load()
   } catch (e: any) {
@@ -98,15 +98,25 @@ async function onRotate(row: DevToken) {
   }
 }
 
-// ---- 查看密钥（可反复复制） ----
+// ---- 查看密钥（可反复复制；敏感操作需口令二次验证） ----
 async function onViewSecret(row: DevToken) {
+  let pwd = ''
+  try {
+    const r = await ElMessageBox.prompt('查看明文密钥需要验证当前登录口令', '口令验证', {
+      inputType: 'password',
+      inputPlaceholder: '当前口令',
+    })
+    pwd = r.value
+  } catch {
+    return
+  }
   secretOpen.value = true
   secretLoading.value = true
-  secretName.value = row.display_name
+  secretName.value = row.DisplayName
   secretPlain.value = null
   try {
-    const res = await getDevTokenSecret(row.id)
-    secretPlain.value = res.data
+    const res = await getDevTokenSecret(row.ID, pwd)
+    secretPlain.value = res.Data
   } catch (e: any) {
     secretPlain.value = null
     ElMessage.error(e?.message || '查看密钥失败')
@@ -119,21 +129,21 @@ async function onViewSecret(row: DevToken) {
 function openCreate() {
   createOpen.value = true
   createdPlain.value = null
-  createForm.value = { display_name: '', tag_id: null, expires_at: null }
+  createForm.value = { DisplayName: '', TagID: null, ExpiresAt: null }
   createErr.value = { message: '', requestId: '' }
 }
 
 async function submitCreate() {
-  if (!createForm.value.display_name.trim()) return ElMessage.warning('请输入令牌名称')
+  if (!createForm.value.DisplayName.trim()) return ElMessage.warning('请输入令牌名称')
   createSaving.value = true
   createErr.value = { message: '', requestId: '' }
   try {
     const res = await createDevToken({
-      display_name: createForm.value.display_name.trim(),
-      tag_id: createForm.value.tag_id,
-      expires_at: createForm.value.expires_at,
+      DisplayName: createForm.value.DisplayName.trim(),
+      TagID: createForm.value.TagID,
+      ExpiresAt: createForm.value.ExpiresAt,
     })
-    createdPlain.value = res.data
+    createdPlain.value = res.Data
     ElMessage.success('令牌已创建')
     await load()
   } catch (e: any) {
@@ -178,28 +188,28 @@ function copyBaseUrl() {
         border
         stripe
         class="table-nowrap clickable-rows"
-        row-key="id"
+        row-key="ID"
         @selection-change="() => {}"
-        @row-click="(row: DevToken, _c: unknown, e: Event) => !(e.target as HTMLElement)?.closest('.op-cell') && router.push(`/dev/tokens/${row.id}`)"
+        @row-click="(row: DevToken, _c: unknown, e: Event) => !(e.target as HTMLElement)?.closest('.op-cell') && router.push(`/dev/tokens/${row.ID}`)"
       >
-        <el-table-column label="名称" prop="display_name" min-width="140" show-overflow-tooltip />
+        <el-table-column label="名称" prop="DisplayName" min-width="140" show-overflow-tooltip />
         <el-table-column label="标识" min-width="200" show-overflow-tooltip>
           <template #default="{ row }">
-            <el-tooltip :content="row.token_display" placement="top">
-              <span class="mono">{{ row.token_display }}</span>
+            <el-tooltip :content="row.TokenDisplay" placement="top">
+              <span class="mono">{{ row.TokenDisplay }}</span>
             </el-tooltip>
           </template>
         </el-table-column>
         <el-table-column label="路由" min-width="120">
           <template #default="{ row }">
-            <el-tag v-if="!row.tag_id" size="small" type="info" effect="plain">默认路由</el-tag>
+            <el-tag v-if="!row.TagID" size="small" type="info" effect="plain">默认路由</el-tag>
             <el-tag v-else size="small" effect="plain">{{ tagLabel(row) }}</el-tag>
           </template>
         </el-table-column>
         <el-table-column label="状态" width="90" align="center">
           <template #default="{ row }">
             <el-switch
-              :model-value="row.status === 'ACTIVE'"
+              :model-value="row.Status === 'ACTIVE'"
               inline-prompt
               active-text="启"
               inactive-text="禁"
@@ -209,13 +219,13 @@ function copyBaseUrl() {
         </el-table-column>
         <el-table-column label="最近使用" min-width="170">
           <template #default="{ row }">
-            <template v-if="row.last_used_at">{{ row.last_used_at }}</template>
+            <template v-if="row.LastUsedAt">{{ row.LastUsedAt }}</template>
             <span v-else class="never">从未使用</span>
           </template>
         </el-table-column>
         <el-table-column label="过期时间" min-width="150">
           <template #default="{ row }">
-            {{ row.expires_at || '永不过期' }}
+            {{ row.ExpiresAt || '永不过期' }}
           </template>
         </el-table-column>
         <el-table-column label="操作" width="130" align="right" fixed="right">
@@ -253,19 +263,19 @@ function copyBaseUrl() {
     <el-dialog v-model="createOpen" title="新建令牌" width="520px" :close-on-click-modal="false" destroy-on-close>
       <template v-if="createdPlain">
         <div class="plain-warning">令牌已创建，请复制并妥善保存。关闭后仍可在列表中随时查看/复制。</div>
-        <el-input :model-value="createdPlain.plain" readonly class="mono">
+        <el-input :model-value="createdPlain.Plain" readonly class="mono">
           <template #append>
-            <el-button text @click="copyText(createdPlain.plain)">复制</el-button>
+            <el-button text @click="copyText(createdPlain.Plain)">复制</el-button>
           </template>
         </el-input>
-        <div class="plain-tip">标识：<span class="mono">{{ createdPlain.display }}</span></div>
+        <div class="plain-tip">标识：<span class="mono">{{ createdPlain.Display }}</span></div>
       </template>
       <el-form v-else label-width="110px">
         <el-form-item label="名称" required>
-          <el-input v-model="createForm.display_name" placeholder="例：生产环境 Key" maxlength="50" show-word-limit />
+          <el-input v-model="createForm.DisplayName" placeholder="例：生产环境 Key" maxlength="50" show-word-limit />
         </el-form-item>
         <el-form-item label="语义标签">
-          <el-select v-model="createForm.tag_id" placeholder="选择标签" style="width: 100%">
+          <el-select v-model="createForm.TagID" placeholder="选择标签" style="width: 100%">
             <el-option
               v-for="opt in tagOptions"
               :key="String(opt.value)"
@@ -277,7 +287,7 @@ function copyBaseUrl() {
         </el-form-item>
         <el-form-item label="过期时间">
           <el-date-picker
-            v-model="createForm.expires_at"
+            v-model="createForm.ExpiresAt"
             type="datetime"
             placeholder="留空则永不过期"
             value-format="YYYY-MM-DDTHH:mm:00Z"
@@ -304,9 +314,9 @@ function copyBaseUrl() {
     <el-dialog v-model="secretOpen" :title="`查看密钥 - ${secretName}`" width="520px" :close-on-click-modal="false">
       <div v-loading="secretLoading">
         <template v-if="secretPlain">
-          <el-input :model-value="secretPlain.plain" readonly class="mono">
+          <el-input :model-value="secretPlain.Plain" readonly class="mono">
             <template #append>
-              <el-button text @click="copyText(secretPlain.plain)">复制</el-button>
+              <el-button text @click="copyText(secretPlain.Plain)">复制</el-button>
             </template>
           </el-input>
           <div class="plain-tip">密钥可随时反复查看/复制。如怀疑泄露，可轮换或删除后新建。</div>
