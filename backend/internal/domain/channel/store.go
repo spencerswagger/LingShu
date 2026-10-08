@@ -43,8 +43,8 @@ const (
 
 // RateLimitConfig 限流配置（rate_limit JSONB 反序列化目标）。
 type RateLimitConfig struct {
-	RPM             int     `json:"RPM"`              // 每分钟请求数；0 表示不限
-	TPM             int     `json:"TPM"`              // 每分钟 token 数；0 表示不限
+	RPM             int     `json:"RPM"`             // 每分钟请求数；0 表示不限
+	TPM             int     `json:"TPM"`             // 每分钟 token 数；0 表示不限
 	BurstMultiplier float64 `json:"BurstMultiplier"` // 瞬时超发系数
 	OnExceed        string  `json:"OnExceed"`        // QUEUE 或 REJECT
 	QueueSize       int     `json:"QueueSize"`
@@ -55,20 +55,20 @@ type RateLimitConfig struct {
 // HealthProbeConfig 健康探测配置（health_probe JSONB）。
 // 探测与「可靠性」（真实调用窗口）是两个独立子系统：探测是主动行为，可靠性是被动统计。
 type HealthProbeConfig struct {
-	Interval             string `json:"Interval"`               // 正常态探测频率（6 段 cron，含秒）
+	Interval             string `json:"Interval"`             // 正常态探测频率（6 段 cron，含秒）
 	DrainIntervalSeconds int    `json:"DrainIntervalSeconds"` // 排空态探测频率（秒）
-	TimeoutMS            int    `json:"TimeoutMS"`             // 单次探测超时
-	FailThreshold        int    `json:"FailThreshold"`         // 连续失败阈值 → DRAIN，默认 1
-	RecoveryThreshold    int    `json:"RecoveryThreshold"`     // 连续成功阈值 → NORMAL
-	ProbeModel           string `json:"ProbeModel"`            // 渠道级显式探测模型；空则取渠道内内部模型
+	TimeoutMS            int    `json:"TimeoutMS"`            // 单次探测超时
+	FailThreshold        int    `json:"FailThreshold"`        // 连续失败阈值 → DRAIN，默认 1
+	RecoveryThreshold    int    `json:"RecoveryThreshold"`    // 连续成功阈值 → NORMAL
+	ProbeModel           string `json:"ProbeModel"`           // 渠道级显式探测模型；空则取渠道内内部模型
 }
 
 // ReliabilityConfig 可靠性配置（reliability JSONB）：真实调用的滑动窗口自动评估。
 // 任一窗口指标超限（且样本数达标）→ DRAIN；不承担恢复职责（恢复仅由健康探测驱动）。
 // 真实调用连续鉴权失败(401/403)达 AuthFailThreshold → DISABLED。
 type ReliabilityConfig struct {
-	WindowSeconds     int     `json:"WindowSeconds"`      // 滑动窗口时长（秒）
-	MinSamples        int     `json:"MinSamples"`         // 窗口内最小样本数，不足不评估
+	WindowSeconds     int     `json:"WindowSeconds"`     // 滑动窗口时长（秒）
+	MinSamples        int     `json:"MinSamples"`        // 窗口内最小样本数，不足不评估
 	ErrorRatePct      float64 `json:"ErrorRatePct"`      // (失败+超时)/总数 阈值 %
 	Rate429Pct        float64 `json:"Rate429Pct"`        // 429 占比阈值 %
 	P99LatencyMS      int64   `json:"P99LatencyMS"`      // 成功样本 P99 耗时阈值 ms
@@ -132,7 +132,7 @@ type ProbeLog struct {
 	ID           int64     `json:"ID,string"`
 	ChannelKeyID int64     `json:"ChannelKeyID,string"`
 	ModelID      string    `json:"ModelID"` // 探测目标模型；空=渠道级探测
-	Level        string    `json:"Level"`   // channel=渠道级探测；model=模型级探测
+	Level        string    `json:"Level"`   // key=密钥级探测；model=模型级探测
 	Target       string    `json:"Target"`
 	OK           bool      `json:"OK"`
 	Error        string    `json:"Error,omitempty"`

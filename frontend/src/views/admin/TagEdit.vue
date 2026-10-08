@@ -26,7 +26,7 @@ onMounted(async () => {
   errInfo.value = { message: '', requestId: '' }
   try {
     const res = await listTags()
-    const row = (res.data || []).find((t: AdminTag) => t.ID === id)
+    const row = (res.Data || []).find((t: AdminTag) => t.ID === id)
     if (!row) {
       ElMessage.error('标签不存在')
       router.push('/admin/tags')

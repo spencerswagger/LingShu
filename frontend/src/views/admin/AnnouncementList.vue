@@ -41,7 +41,7 @@ async function load() {
   errInfo.value = { message: '', requestId: '' }
   try {
     const res = await listAnnouncements()
-    list.value = res.data.list || []
+    list.value = res.Data.List || []
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
   } finally {

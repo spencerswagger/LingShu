@@ -39,13 +39,13 @@ type Wallet struct {
 // Flow 对应 credit_flows 一行。
 // 雪花 ID 超出 JS 安全整数，ID/UserID 以字符串序列化。
 type Flow struct {
-	ID           int64  `json:"ID,string"`
-	UserID       int64  `json:"UserID,string"`
-	Type         string `json:"Type"`
-	Amount       float64 `json:"Amount"`
-	RefBillingID *string `json:"RefBillingID,omitempty"`
-	SessionID    string  `json:"SessionID,omitempty"` // 关联会话（预扣费等无账单流水直接携带，用于会话名解析）
-	Remark       *string `json:"Remark,omitempty"`
+	ID           int64     `json:"ID,string"`
+	UserID       int64     `json:"UserID,string"`
+	Type         string    `json:"Type"`
+	Amount       float64   `json:"Amount"`
+	RefBillingID *string   `json:"RefBillingID,omitempty"`
+	SessionID    string    `json:"SessionID,omitempty"` // 关联会话（预扣费等无账单流水直接携带，用于会话名解析）
+	Remark       *string   `json:"Remark,omitempty"`
 	CreatedAt    time.Time `json:"CreatedAt"`
 	// 查询聚合字段（非表列）：该笔流水后的钱包余额（按流水累计）与关联会话名称。
 	BalanceAfter float64 `json:"BalanceAfter"`
@@ -575,7 +575,7 @@ func (h *CreditHandler) HandleAdminWallet(w http.ResponseWriter, r *http.Request
 		writeServiceErr(w, r, err)
 		return
 	}
-	resp.OK(w, r, map[string]any{"balance": bal})
+	resp.OK(w, r, map[string]any{"Balance": bal})
 }
 
 // HandleAdminRecharge POST /api/v1/admin/users/{id}/wallet/recharge 管理员充值。
@@ -606,7 +606,7 @@ func (h *CreditHandler) HandleAdminRecharge(w http.ResponseWriter, r *http.Reque
 		writeServiceErr(w, r, err)
 		return
 	}
-	resp.OK(w, r, map[string]any{"affected": 1})
+	resp.OK(w, r, map[string]any{"Affected": 1})
 }
 
 // HandleAdminSet POST /api/v1/admin/users/{id}/wallet/set 覆盖余额。
@@ -637,7 +637,7 @@ func (h *CreditHandler) HandleAdminSet(w http.ResponseWriter, r *http.Request) {
 		writeServiceErr(w, r, err)
 		return
 	}
-	resp.OK(w, r, map[string]any{"balance": req.Balance})
+	resp.OK(w, r, map[string]any{"Balance": req.Balance})
 }
 
 // HandleAdminAdjust POST /api/v1/admin/users/{id}/wallet/adjust 管理员调整积分。
@@ -669,7 +669,7 @@ func (h *CreditHandler) HandleAdminAdjust(w http.ResponseWriter, r *http.Request
 		writeServiceErr(w, r, err)
 		return
 	}
-	resp.OK(w, r, map[string]any{"affected": 1})
+	resp.OK(w, r, map[string]any{"Affected": 1})
 }
 
 // HandleAdminFlows GET /api/v1/admin/users/{id}/wallet/flows 查询用户流水。
@@ -695,7 +695,7 @@ func (h *CreditHandler) HandleDevWallet(w http.ResponseWriter, r *http.Request) 
 		writeServiceErr(w, r, err)
 		return
 	}
-	resp.OK(w, r, map[string]any{"balance": bal})
+	resp.OK(w, r, map[string]any{"Balance": bal})
 }
 
 // HandleDevFlows GET /api/v1/dev/wallet/flows 查询本人流水。
@@ -729,5 +729,5 @@ func (h *CreditHandler) respondFlows(w http.ResponseWriter, r *http.Request, use
 			CreatedAt:    f.CreatedAt,
 		})
 	}
-	resp.OK(w, r, map[string]any{"list": items, "total": total, "page": page, "size": size})
+	resp.OK(w, r, map[string]any{"List": items, "Total": total, "Page": page, "Size": size})
 }

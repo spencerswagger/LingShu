@@ -32,7 +32,7 @@ async function onSubmit() {
   loading.value = true
   try {
     const res = await changeOwnPassword(form.oldPassword, form.newPassword)
-    auth.setAuth(res.data.token, auth.role, auth.username, false, auth.totpEnabled)
+    auth.setAuth(res.Data.Token, auth.role, auth.username, false, auth.totpEnabled)
     auth.setMustChange(false)
     ElMessage.success('密码修改成功')
     router.push(auth.role === 'ADMIN' ? '/admin' : '/dev')

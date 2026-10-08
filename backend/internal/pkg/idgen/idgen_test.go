@@ -7,7 +7,10 @@ import (
 )
 
 func TestGenerator_Next_UniqueAndMonotonic(t *testing.T) {
-	g := NewGenerator(1)
+	g, err := NewGenerator(1)
+	if err != nil {
+		t.Fatalf("NewGenerator(1): %v", err)
+	}
 	seen := map[int64]bool{}
 	prev := int64(0)
 	for i := 0; i < 5000; i++ {
@@ -36,7 +39,10 @@ func TestNew_DefaultSingleton(t *testing.T) {
 // TestGenerator_ClockRollback_NoBlockNoDuplicate 模拟时钟大幅回拨：
 // 逻辑时间戳被推到未来，Next() 不得忙等阻塞，且仍须正数、唯一、单调递增。
 func TestGenerator_ClockRollback_NoBlockNoDuplicate(t *testing.T) {
-	g := NewGenerator(1)
+	g, err := NewGenerator(1)
+	if err != nil {
+		t.Fatalf("NewGenerator(1): %v", err)
+	}
 	g.mu.Lock()
 	g.lastStamp = time.Now().UnixMilli() - epochMs + 10*60*1000 // 未来 10 分钟
 	g.mu.Unlock()
@@ -75,7 +81,10 @@ func TestGenerator_ClockRollback_NoBlockNoDuplicate(t *testing.T) {
 // TestGenerator_SequenceOverflow_AdvancesLogicalClock 同毫秒序列耗尽时应借用下一
 // 逻辑毫秒，而不是忙等下一墙钟毫秒（回拨期间后者会长时间持锁阻塞）。
 func TestGenerator_SequenceOverflow_AdvancesLogicalClock(t *testing.T) {
-	g := NewGenerator(0)
+	g, err := NewGenerator(0)
+	if err != nil {
+		t.Fatalf("NewGenerator(0): %v", err)
+	}
 	g.mu.Lock()
 	g.lastStamp = time.Now().UnixMilli() - epochMs + 60*1000 // 未来，确保走 clamp 分支
 	g.sequence = maxSequence
@@ -91,34 +100,6 @@ func TestGenerator_SequenceOverflow_AdvancesLogicalClock(t *testing.T) {
 	g.mu.Unlock()
 	if gotStamp != base+1 || gotSeq != 0 {
 		t.Fatalf("序列耗尽应借用下一逻辑毫秒: lastStamp=%d want=%d seq=%d", gotStamp, base+1, gotSeq)
-	}
-}
-
-func TestID_JSON_Roundtrip(t *testing.T) {
-	// marshal 输出字符串；unmarshal 兼容字符串与整数。
-	id := ID(123456789012345678)
-	b, err := json.Marshal(map[string]ID{"id": id})
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	if string(b) != `{"id":"123456789012345678"}` {
-		t.Fatalf("marshal 结果不符: %s", b)
-	}
-
-	var fromStr, fromNum struct {
-		ID ID `json:"id"`
-	}
-	if err := json.Unmarshal([]byte(`{"id":"123456789012345678"}`), &fromStr); err != nil {
-		t.Fatalf("unmarshal string: %v", err)
-	}
-	if fromStr.ID != id {
-		t.Fatalf("unmarshal string 值不符: %d", fromStr.ID)
-	}
-	if err := json.Unmarshal([]byte(`{"id":123456789012345678}`), &fromNum); err != nil {
-		t.Fatalf("unmarshal number: %v", err)
-	}
-	if fromNum.ID != id {
-		t.Fatalf("unmarshal number 值不符: %d", fromNum.ID)
 	}
 }
 

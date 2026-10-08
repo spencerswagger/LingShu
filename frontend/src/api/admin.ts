@@ -19,9 +19,9 @@ export interface AdminUser {
 
 // 用户详情：用户 + 钱包余额 + 最近流水。
 export interface UserDetailData {
-  user: AdminUser
-  wallet: { balance: number }
-  recent_flows: FlowItem[]
+  User: AdminUser
+  Wallet: { Balance: number }
+  RecentFlows: FlowItem[]
 }
 
 // 用户列表（分页）
@@ -50,36 +50,36 @@ export function updateUser(
 }
 // 重置用户密码（管理员输入新密码）
 export function resetUserPassword(id: string, password: string) {
-  return http.post<{ reset: boolean }, ApiRes<{ reset: boolean }>>(
+  return http.post<{ Reset: boolean }, ApiRes<{ Reset: boolean }>>(
     `/admin/users/${id}/reset-password`,
     { Password: password },
   )
 }
 // 强制解绑用户 TOTP（管理员操作，无需验证码）
 export function resetUserTotp(id: string) {
-  return http.post<{ reset: boolean }, ApiRes<{ reset: boolean }>>(`/admin/users/${id}/reset-totp`)
+  return http.post<{ Reset: boolean }, ApiRes<{ Reset: boolean }>>(`/admin/users/${id}/reset-totp`)
 }
 export function batchDeleteUsers(ids: string[]) {
-  return http.post<{ affected: number }, ApiRes<{ affected: number }>>('/admin/users/batch-delete', {
+  return http.post<{ Affected: number }, ApiRes<{ Affected: number }>>('/admin/users/batch-delete', {
     IDs: ids,
   })
 }
 
 export function rechargeWallet(id: string, amount: number, remark: string, password: string) {
-  return http.post<{ affected: number }, ApiRes<{ affected: number }>>(
+  return http.post<{ Affected: number }, ApiRes<{ Affected: number }>>(
     `/admin/users/${id}/wallet/recharge`,
     { Amount: amount, Remark: remark, Password: password },
   )
 }
 export function adjustWallet(id: string, amount: number, remark: string, password: string) {
-  return http.post<{ affected: number }, ApiRes<{ affected: number }>>(
+  return http.post<{ Affected: number }, ApiRes<{ Affected: number }>>(
     `/admin/users/${id}/wallet/adjust`,
     { Amount: amount, Remark: remark, Password: password },
   )
 }
 // 覆盖余额（直接 set）。
 export function setWallet(id: string, balance: number, remark: string, password: string) {
-  return http.post<{ balance: number }, ApiRes<{ balance: number }>>(
+  return http.post<{ Balance: number }, ApiRes<{ Balance: number }>>(
     `/admin/users/${id}/wallet/set`,
     { Balance: balance, Remark: remark, Password: password },
   )
@@ -87,7 +87,7 @@ export function setWallet(id: string, balance: number, remark: string, password:
 export function listUserFlows(id: string, page = 1, size = 20) {
   return http.get<PageResult<FlowItem>, ApiRes<PageResult<FlowItem>>>(
     `/admin/users/${id}/wallet/flows`,
-    { params: { page, size } },
+    { params: { Page: page, Size: size } },
   )
 }
 
@@ -130,7 +130,7 @@ export function getTokenSecret(id: string, password: string) {
   })
 }
 export function batchDeleteTokens(ids: string[]) {
-  return http.post<{ affected: number }, ApiRes<{ affected: number }>>('/admin/tokens/batch-delete', {
+  return http.post<{ Affected: number }, ApiRes<{ Affected: number }>>('/admin/tokens/batch-delete', {
     IDs: ids,
   })
 }
@@ -217,7 +217,7 @@ export interface ChannelModelEvent {
 // 探测历史
 export interface ProbeLog {
   ID: string
-  ChannelID: string
+  ChannelKeyID: string
   ModelID: string
   Level: string // key=密钥级探测；model=模型级探测（探针标识的探测模型）
   Target: string
@@ -242,7 +242,7 @@ export function updateChannel(id: string, payload: ChannelInput) {
   return http.put<AdminChannel, ApiRes<AdminChannel>>(`/admin/channels/${id}`, payload)
 }
 export function batchDeleteChannels(ids: string[]) {
-  return http.post<{ deleted: number }, ApiRes<{ deleted: number }>>('/admin/channels/batch-delete', {
+  return http.post<{ Deleted: number }, ApiRes<{ Deleted: number }>>('/admin/channels/batch-delete', {
     IDs: ids,
   })
 }
@@ -267,12 +267,12 @@ export function listModelEvents(id: string) {
   return http.get<ChannelModelEvent[], ApiRes<ChannelModelEvent[]>>(`/admin/channels/${id}/model-events`)
 }
 export function listProbeLogs(id: string, limit = 50) {
-  return http.get<ProbeLog[], ApiRes<ProbeLog[]>>(`/admin/channels/${id}/probe-logs`, { params: { limit } })
+  return http.get<ProbeLog[], ApiRes<ProbeLog[]>>(`/admin/channels/${id}/probe-logs`, { params: { Limit: limit } })
 }
 // cron 表达式后续执行时间预览（前端编辑时校验用）
 export function cronPreview(expr: string, limit = 5) {
-  return http.get<{ times: string[] }, ApiRes<{ times: string[] }>>('/admin/channels/cron-preview', {
-    params: { expr, limit },
+  return http.get<{ Times: string[] }, ApiRes<{ Times: string[] }>>('/admin/channels/cron-preview', {
+    params: { Expr: expr, Limit: limit },
   })
 }
 
@@ -347,28 +347,28 @@ export function updateTag(id: string, payload: TagInput) {
   return http.put<AdminTag, ApiRes<AdminTag>>(`/admin/tags/${id}`, payload)
 }
 export function batchDeleteTags(ids: string[]) {
-  return http.post<{ deleted: number }, ApiRes<{ deleted: number }>>('/admin/tags/batch-delete', {
+  return http.post<{ Deleted: number }, ApiRes<{ Deleted: number }>>('/admin/tags/batch-delete', {
     IDs: ids,
   })
 }
 
 // ===== 五段计价费率（售价/成本对称的公共定价 schema）=====
 // 与后端 billing.Rates / model.RateKeys 对齐，键必须齐全且非负。
-export const rateKeys = ['input', 'output', 'cache_read', 'cache_write', 'reasoning'] as const
+export const rateKeys = ['Input', 'Output', 'CacheRead', 'CacheWrite', 'Reasoning'] as const
 export const rateLabels: Record<string, string> = {
-  input: '输入',
-  output: '输出',
-  cache_read: '缓存读',
-  cache_write: '缓存写',
-  reasoning: '推理',
+  Input: '输入',
+  Output: '输出',
+  CacheRead: '缓存读',
+  CacheWrite: '缓存写',
+  Reasoning: '推理',
 }
 // 售价/成本五段倍率的 tooltip 解释（倍率 = 每百万 token 计费数值，照抄官方定价录入）
 export const rateHints: Record<string, string> = {
-  input: '输入倍率（每百万 token）：与官方定价数值一致，直接填官网价格即可。',
-  output: '输出倍率（每百万 token）：模型生成回复内容所计费。',
-  cache_read: '缓存读倍率（每百万 token）：命中提示词缓存的输入按此低价计费。',
-  cache_write: '缓存写倍率（每百万 token）：首次写入提示词缓存时按此单价计费。',
-  reasoning: '推理倍率（每百万 token）：思维链/深度推理 token 单独计费费率。',
+  Input: '输入倍率（每百万 token）：与官方定价数值一致，直接填官网价格即可。',
+  Output: '输出倍率（每百万 token）：模型生成回复内容所计费。',
+  CacheRead: '缓存读倍率（每百万 token）：命中提示词缓存的输入按此低价计费。',
+  CacheWrite: '缓存写倍率（每百万 token）：首次写入提示词缓存时按此单价计费。',
+  Reasoning: '推理倍率（每百万 token）：思维链/深度推理 token 单独计费费率。',
 }
 
 // ===== 对外模型（external_models·售价层；字段名 = Go 字段名）=====
@@ -402,15 +402,15 @@ export function updateExternalModel(id: string, payload: ExternalModelInput) {
   return http.put<ExternalModel, ApiRes<ExternalModel>>(`/admin/models/${id}`, payload)
 }
 export function batchDeleteExternalModels(ids: string[]) {
-  return http.post<{ deleted: number }, ApiRes<{ deleted: number }>>('/admin/models/batch-delete', {
+  return http.post<{ Deleted: number }, ApiRes<{ Deleted: number }>>('/admin/models/batch-delete', {
     IDs: ids,
   })
 }
 
 // 用 models.dev 参考价批量刷新全部对外模型售价；返回更新/跳过清单
 export interface SyncPricesResult {
-  updated: string[]
-  skipped: string[]
+  Updated: string[]
+  Skipped: string[]
 }
 export function syncModelsPrices() {
   return http.post<SyncPricesResult, ApiRes<SyncPricesResult>>('/admin/models/sync-prices')
@@ -426,9 +426,9 @@ export interface CatalogEntry {
   ReasoningUSD: number
 }
 export function priceCatalog(q: string) {
-  return http.get<{ list: CatalogEntry[]; total: number; updated_at: string }, ApiRes<{ list: CatalogEntry[]; total: number; updated_at: string }>>(
+  return http.get<{ List: CatalogEntry[]; Total: number; UpdatedAt: string }, ApiRes<{ List: CatalogEntry[]; Total: number; UpdatedAt: string }>>(
     '/admin/models/price-catalog',
-    { params: { q: q || undefined } },
+    { params: { Q: q || undefined } },
   )
 }
 
@@ -476,7 +476,7 @@ export function updateChannelModel(channelId: string, mid: string, payload: Chan
   )
 }
 export function deleteChannelModel(channelId: string, mid: string) {
-  return http.delete<{ affected: number }, ApiRes<{ affected: number }>>(
+  return http.delete<{ Affected: number }, ApiRes<{ Affected: number }>>(
     `/admin/channels/${channelId}/models/${mid}`,
   )
 }
@@ -487,18 +487,18 @@ export interface PullModel {
   OwnedBy: string
 }
 export function pullChannelModels(channelId: string) {
-  return http.post<{ list: PullModel[] }, ApiRes<{ list: PullModel[] }>>(
+  return http.post<{ List: PullModel[] }, ApiRes<{ List: PullModel[] }>>(
     `/admin/channels/${channelId}/models/pull`,
   )
 }
 
 // ===== 账单 =====
 export interface BillingUsage {
-  input: number
-  output: number
-  cache_read: number
-  cache_write: number
-  reasoning: number
+  Input: number
+  Output: number
+  CacheRead: number
+  CacheWrite: number
+  Reasoning: number
 }
 export interface AdminBillingItem {
   BillingID: string
@@ -567,16 +567,16 @@ export interface AdminSession {
 }
 export function listSessions(
   params: Record<string, any>,
-): Promise<ApiRes<{ list: AdminSession[]; total: number }>> {
+): Promise<ApiRes<{ List: AdminSession[]; Total: number }>> {
   return http.get<
-    { list: AdminSession[]; total: number },
-    ApiRes<{ list: AdminSession[]; total: number }>
+    { List: AdminSession[]; Total: number },
+    ApiRes<{ List: AdminSession[]; Total: number }>
   >('/admin/sessions', { params })
 }
 export function kickSessions(
   payload: Record<string, any>,
-): Promise<ApiRes<{ affected: number }>> {
-  return http.post<{ affected: number }, ApiRes<{ affected: number }>>(
+): Promise<ApiRes<{ Affected: number }>> {
+  return http.post<{ Affected: number }, ApiRes<{ Affected: number }>>(
     '/admin/sessions/kick',
     payload,
   )
@@ -584,8 +584,8 @@ export function kickSessions(
 export function renameSession(
   sessionId: string,
   name: string,
-): Promise<ApiRes<{ updated: boolean }>> {
-  return http.put<{ updated: boolean }, ApiRes<{ updated: boolean }>>(
+): Promise<ApiRes<{ Updated: boolean }>> {
+  return http.put<{ Updated: boolean }, ApiRes<{ Updated: boolean }>>(
     `/admin/sessions/${sessionId}/name`,
     { Name: name },
   )
@@ -615,13 +615,12 @@ export interface TimeCoeffConfig {
   Periodic: Segment[]
   Overrides: DateOverride[]
 }
-// r/cny_rate/credit_value 为后端 map 字面量键（保持 snake）；context_tiers/time_config 为 JSONB 原文（PascalCase）。
 export interface BillingConfigData {
-  r: number | string
-  cny_rate: number | string
-  credit_value: number | string // 积分价值 V=R/1e6（每积分对应人民币元），只读展示
-  context_tiers: ContextTier[]
-  time_config: TimeCoeffConfig
+  R: number | string
+  CNYRate: number | string
+  CreditValue: number | string // 积分价值 V=R/1e6（每积分对应人民币元），只读展示
+  ContextTiers: ContextTier[]
+  TimeConfig: TimeCoeffConfig
 }
 export function getBillingConfig() {
   return http.get<BillingConfigData, ApiRes<BillingConfigData>>('/admin/configs/billing')
@@ -632,7 +631,7 @@ export function putBillingConfig(payload: {
   ContextTiers: ContextTier[]
   TimeConfig: TimeCoeffConfig
 }) {
-  return http.put<{ affected: number }, ApiRes<{ affected: number }>>('/admin/configs/billing', payload)
+  return http.put<{ Affected: number }, ApiRes<{ Affected: number }>>('/admin/configs/billing', payload)
 }
 
 // ===== 公告（字段名 = Go 字段名）=====
@@ -655,7 +654,7 @@ export interface AnnouncementInput {
   Enabled?: boolean
 }
 export function listAnnouncements() {
-  return http.get<{ list: AdminAnnouncement[] }, ApiRes<{ list: AdminAnnouncement[] }>>(
+  return http.get<{ List: AdminAnnouncement[] }, ApiRes<{ List: AdminAnnouncement[] }>>(
     '/admin/announcements',
   )
 }
@@ -666,7 +665,7 @@ export function updateAnnouncement(id: string, payload: AnnouncementInput) {
   return http.put<AdminAnnouncement, ApiRes<AdminAnnouncement>>(`/admin/announcements/${id}`, payload)
 }
 export function batchDeleteAnnouncements(ids: string[]) {
-  return http.post<{ deleted: number }, ApiRes<{ deleted: number }>>(
+  return http.post<{ Deleted: number }, ApiRes<{ Deleted: number }>>(
     '/admin/announcements/batch-delete',
     { IDs: ids },
   )
@@ -674,5 +673,5 @@ export function batchDeleteAnnouncements(ids: string[]) {
 
 // ===== 价格同步：立即执行（watchlist/告警相关端点当前前端未使用） =====
 export function runSync() {
-  return http.post<{ summary: string }, ApiRes<{ summary: string }>>('/admin/sync/run')
+  return http.post<{ Summary: string }, ApiRes<{ Summary: string }>>('/admin/sync/run')
 }

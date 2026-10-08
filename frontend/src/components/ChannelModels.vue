@@ -44,7 +44,7 @@ const drawerOpen = ref(false)
 const editingId = ref<string | null>(null) // null = 新增；否则为编辑的模型 id
 const editingForm = ref<Record<string, any>>({ InternalModelID: '', ExternalModelID: null })
 const editingPricing = ref<Record<string, any>>({
-  CostRates: { input: 0, output: 0, cache_read: 0, cache_write: 0, reasoning: 0 },
+  CostRates: { Input: 0, Output: 0, CacheRead: 0, CacheWrite: 0, Reasoning: 0 },
   TimeConfig: null,
   ContextTiers: null,
 })
@@ -79,8 +79,8 @@ async function loadModules(dp: string) {
     listChannelModels(dp),
     listExternalModels({ enabled: true }),
   ])
-  list.value = cmRes.data || []
-  externalModels.value = emRes.data || []
+  list.value = cmRes.Data || []
+  externalModels.value = emRes.Data || []
 }
 
 async function load() {
@@ -103,7 +103,7 @@ function fmtCost(m: ChannelModel, k: string): string {
 
 function costDetail(m: ChannelModel): string {
   const r = m.CostRates || {}
-  const parts = ['input', 'output', 'cache_read', 'cache_write', 'reasoning']
+  const parts = ['Input', 'Output', 'CacheRead', 'CacheWrite', 'Reasoning']
     .map((k) => `${rateLabels[k]} ${r[k] == null ? '-' : Math.round(r[k] * 1e6) / 1e6}`)
   return `${parts.join('，')}（单位：人民币元/百万 token）`
 }
@@ -113,12 +113,12 @@ function openCreate() {
   editingForm.value = {
     InternalModelID: '',
     ExternalModelID: null,
-    CostRates: { input: 0, output: 0, cache_read: 0, cache_write: 0, reasoning: 0 },
+    CostRates: { Input: 0, Output: 0, CacheRead: 0, CacheWrite: 0, Reasoning: 0 },
     TimeConfig: null,
     ContextTiers: null,
   }
   editingPricing.value = {
-    CostRates: { input: 0, output: 0, cache_read: 0, cache_write: 0, reasoning: 0 },
+    CostRates: { Input: 0, Output: 0, CacheRead: 0, CacheWrite: 0, Reasoning: 0 },
     TimeConfig: null,
     ContextTiers: null,
   }
@@ -251,7 +251,7 @@ async function onPull() {
   errInfo.value = { message: '', requestId: '' }
   try {
     const res = await pullChannelModels(props.channelId)
-    pulled.value = res.data.list || []
+    pulled.value = res.Data.List || []
     pullChecked.value = []
     pullDialogOpen.value = true
   } catch (e: any) {
@@ -269,7 +269,7 @@ function onAddPulled() {
     InternalModelID: p.ID,
     ExternalModelID: null,
     pricing: {
-      CostRates: { input: 0, output: 0, cache_read: 0, cache_write: 0, reasoning: 0 },
+      CostRates: { Input: 0, Output: 0, CacheRead: 0, CacheWrite: 0, Reasoning: 0 },
       TimeConfig: null,
       ContextTiers: null,
     },
@@ -345,9 +345,9 @@ async function onOpenCatalog() {
   catQ.value = currentModelId.value || ''
   try {
     const res = await getBillingConfig()
-    const v = Number(res.data.r)
+    const v = Number(res.Data.R)
     if (v > 0) catR.value = v
-    const c = Number(res.data.cny_rate)
+    const c = Number(res.Data.CNYRate)
     if (c > 0) catCnyRate.value = c
   } catch {
     /* 保持默认 */
@@ -359,9 +359,9 @@ async function onCatalogSearch() {
   catLoading.value = true
   try {
     const res = await priceCatalog(catQ.value)
-    catList.value = res.data.list || []
-    catUpdatedAt.value = res.data.updated_at || ''
-    catTotal.value = res.data.total || 0
+    catList.value = res.Data.List || []
+    catUpdatedAt.value = res.Data.UpdatedAt || ''
+    catTotal.value = res.Data.Total || 0
     selectedEntry.value = null
   } catch (e: any) {
     ElMessage.error(e?.message || '获取 models.dev 参考价失败')
@@ -375,7 +375,7 @@ async function onSyncNow() {
   catSyncing.value = true
   try {
     const res = await runSync()
-    ElMessage.success(res.data.summary)
+    ElMessage.success(res.Data.Summary)
     await onCatalogSearch()
   } catch (e: any) {
     ElMessage.error(e?.message || '同步 models.dev 失败')
@@ -396,11 +396,11 @@ async function onApplyCostCatalog() {
     const apply = (k: string, usd: number) => {
       if (usd > 0) next[k] = usdToCnyPerM(usd)
     }
-    apply('input', entry.InputUSD)
-    apply('output', entry.OutputUSD)
-    apply('cache_read', entry.CacheReadUSD)
-    apply('cache_write', entry.CacheWriteUSD)
-    apply('reasoning', entry.ReasoningUSD)
+    apply('Input', entry.InputUSD)
+    apply('Output', entry.OutputUSD)
+    apply('CacheRead', entry.CacheReadUSD)
+    apply('CacheWrite', entry.CacheWriteUSD)
+    apply('Reasoning', entry.ReasoningUSD)
     pricing.CostRates = next
     catOpen.value = false
     ElMessage.success(`已应用 models.dev 参考价（${entry.Provider}/${entry.ModelID}）到成本定价`)
@@ -482,21 +482,21 @@ function onRemoveRow(index: number) {
         <el-table-column label="成本·输入" width="110" align="right">
           <template #default="{ row }">
             <el-tooltip :content="costDetail(row)" placement="top">
-              <span class="rate-cell">{{ fmtCost(row, 'input') }}</span>
+              <span class="rate-cell">{{ fmtCost(row, 'Input') }}</span>
             </el-tooltip>
           </template>
         </el-table-column>
         <el-table-column label="成本·输出" width="110" align="right">
           <template #default="{ row }">
             <el-tooltip :content="costDetail(row)" placement="top">
-              <span class="rate-cell">{{ fmtCost(row, 'output') }}</span>
+              <span class="rate-cell">{{ fmtCost(row, 'Output') }}</span>
             </el-tooltip>
           </template>
         </el-table-column>
         <el-table-column label="成本·缓存读" width="120" align="right">
           <template #default="{ row }">
             <el-tooltip :content="costDetail(row)" placement="top">
-              <span class="rate-cell">{{ fmtCost(row, 'cache_read') }}</span>
+              <span class="rate-cell">{{ fmtCost(row, 'CacheRead') }}</span>
             </el-tooltip>
           </template>
         </el-table-column>

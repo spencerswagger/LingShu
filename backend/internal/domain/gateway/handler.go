@@ -48,11 +48,11 @@ func (g *Gateway) handleModels(w http.ResponseWriter, r *http.Request) {
 	auth := r.Header.Get("Authorization")
 	plain, ok := strings.CutPrefix(auth, "Bearer ")
 	if !ok || plain == "" {
-		resp.Err(w, r, http.StatusUnauthorized, resp.CodeUnauthorized, msgInvalidToken)
+		writeOpenAIError(w, http.StatusUnauthorized, msgInvalidToken)
 		return
 	}
 	if _, err := g.tokens.LookupByPlain(ctx, plain); err != nil {
-		resp.Err(w, r, http.StatusUnauthorized, resp.CodeUnauthorized, msgInvalidToken)
+		writeOpenAIError(w, http.StatusUnauthorized, msgInvalidToken)
 		return
 	}
 
@@ -61,7 +61,7 @@ func (g *Gateway) handleModels(w http.ResponseWriter, r *http.Request) {
 		list, err := g.listEnabled(ctx)
 		if err != nil {
 			g.logError(0, "list enabled models", err)
-			resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, msgInternal)
+			writeOpenAIError(w, http.StatusInternalServerError, msgInternal)
 			return
 		}
 		for i := range list {
@@ -86,6 +86,68 @@ func writeOpenAI(w http.ResponseWriter, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// openAIErrorBody 是 OpenAI 标准错误响应体：{"error":{"message","type","code"}}。
+// /v1 对外错误一律用此形状，与内部统一壳 resp.Body（{Code,Message,RequestID,Data}）解耦，
+// 避免把内部契约外泄给下游客户端。
+type openAIErrorBody struct {
+	Error openAIErrorDetail `json:"error"`
+}
+
+type openAIErrorDetail struct {
+	Message string `json:"message"`
+	Type    string `json:"type"`
+	Code    string `json:"code"`
+}
+
+// writeOpenAIError 直接写出 OpenAI 标准错误体（不走内部统一壳 resp.Box），HTTP 状态码沿用业务语义。
+// type/code 依据 HTTP 状态码归类为 OpenAI 语义，确保下游客户端按 OpenAI 规范解析错误。
+func writeOpenAIError(w http.ResponseWriter, status int, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(openAIErrorBody{Error: openAIErrorDetail{
+		Message: msg,
+		Type:    openAIErrorType(status),
+		Code:    openAIErrorCode(status),
+	}})
+}
+
+// openAIErrorType 依据 HTTP 状态码映射 OpenAI 错误 type。
+func openAIErrorType(status int) string {
+	switch {
+	case status == http.StatusTooManyRequests:
+		return "rate_limit_error"
+	case status == http.StatusPaymentRequired:
+		return "insufficient_quota"
+	case status >= 500:
+		return "server_error"
+	default:
+		return "invalid_request_error"
+	}
+}
+
+// openAIErrorCode 依据 HTTP 状态码映射 OpenAI 错误 code（字符串，不泄漏内部业务码）。
+func openAIErrorCode(status int) string {
+	switch status {
+	case http.StatusUnauthorized:
+		return "invalid_api_key"
+	case http.StatusNotFound:
+		return "model_not_found"
+	case http.StatusPaymentRequired:
+		return "insufficient_quota"
+	case http.StatusTooManyRequests:
+		return "rate_limit_exceeded"
+	case http.StatusBadGateway:
+		return "upstream_error"
+	case http.StatusServiceUnavailable:
+		return "service_unavailable"
+	default:
+		if status >= 500 {
+			return "internal_error"
+		}
+		return "invalid_request_error"
+	}
+}
+
 // serve 是 /v1/{endpoint} 统一入口的核心热路径。
 func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint string) {
 	start := time.Now()
@@ -96,12 +158,12 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint string)
 	auth := r.Header.Get("Authorization")
 	plain, ok := strings.CutPrefix(auth, "Bearer ")
 	if !ok || plain == "" {
-		resp.Err(w, r, http.StatusUnauthorized, resp.CodeUnauthorized, msgInvalidToken)
+		writeOpenAIError(w, http.StatusUnauthorized, msgInvalidToken)
 		return
 	}
 	token, err := g.tokens.LookupByPlain(ctx, plain)
 	if err != nil {
-		resp.Err(w, r, http.StatusUnauthorized, resp.CodeUnauthorized, msgInvalidToken)
+		writeOpenAIError(w, http.StatusUnauthorized, msgInvalidToken)
 		return
 	}
 	// 鉴权通过后异步记录最后使用时间，不阻塞热路径。
@@ -112,16 +174,16 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint string)
 	// 2) 读取请求体（上限 maxBodyBytes=64MB，异常/恶意超大请求体兜底）并解析 model / stream。
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
 	if err != nil || int64(len(body)) > maxBodyBytes {
-		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "请求体过大或无法读取")
+		writeOpenAIError(w, http.StatusBadRequest, "请求体过大或无法读取")
 		return
 	}
 	if err := requireJSONObject(body); err != nil {
-		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "请求体格式错误")
+		writeOpenAIError(w, http.StatusBadRequest, "请求体格式错误")
 		return
 	}
 	model, isStream, err := parseRequestMeta(body)
 	if err != nil || model == "" {
-		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "请求体必须包含 model 字段")
+		writeOpenAIError(w, http.StatusBadRequest, "请求体必须包含 model 字段")
 		return
 	}
 
@@ -131,7 +193,7 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint string)
 		kv, terr := g.tagKV(ctx, token.TagID)
 		if terr != nil {
 			l.Error("resolve tag kv failed", "user_id", token.UserID, "tag_id", token.TagID, "err", terr)
-			resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, msgInternal)
+			writeOpenAIError(w, http.StatusInternalServerError, msgInternal)
 			return
 		}
 		tagKV = kv
@@ -164,18 +226,18 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint string)
 			case router.KindModelNotFound:
 				// 未进入渠道也留痕：保证「每次请求必有一条账单记录」（模型未配置/停用）。
 				g.recordGatewayReject(ctx, model, token, "", sessionID, fmt.Sprintf(msgModelNotFound, model))
-				resp.Err(w, r, http.StatusNotFound, resp.CodeNotFound, fmt.Sprintf(msgModelNotFound, model))
+				writeOpenAIError(w, http.StatusNotFound, fmt.Sprintf(msgModelNotFound, model))
 			case router.KindNoRoute:
 				g.recordGatewayReject(ctx, model, token, "", sessionID, msgNoRoute)
-				resp.Err(w, r, http.StatusServiceUnavailable, resp.CodeNoRoute, msgNoRoute)
+				writeOpenAIError(w, http.StatusServiceUnavailable, msgNoRoute)
 			default: // KindNoAvailable
 				g.recordGatewayReject(ctx, model, token, "", sessionID, msgNoAvailable)
-				resp.Err(w, r, http.StatusServiceUnavailable, resp.CodeNoRoute, msgNoAvailable)
+				writeOpenAIError(w, http.StatusServiceUnavailable, msgNoAvailable)
 			}
 			return
 		}
 		l.Error("route failed", "model", model, "err", err)
-		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, msgInternal)
+		writeOpenAIError(w, http.StatusInternalServerError, msgInternal)
 		return
 	}
 
@@ -197,13 +259,13 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint string)
 		if bal, berr := g.credit.Balance(ctx, token.UserID); berr == nil && bal <= 0 {
 			l.Warn("zero balance rejected", "user_id", token.UserID, "balance", bal)
 			g.recordGatewayReject(ctx, model, token, pricingMode, sessionID, "积分余额不足（账户余额为 0）")
-			resp.Err(w, r, http.StatusPaymentRequired, resp.CodeInsufficient, msgInsufficient)
+			writeOpenAIError(w, http.StatusPaymentRequired, msgInsufficient)
 			return
 		}
 		est, formula, eerr := g.estimatePreConsumeCost(ctx, model, body)
 		if eerr != nil {
 			l.Error("estimate preconsume failed", "user_id", token.UserID, "model", model, "err", eerr)
-			resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, msgInternal)
+			writeOpenAIError(w, http.StatusInternalServerError, msgInternal)
 			return
 		}
 		if est > 0 {
@@ -225,10 +287,10 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint string)
 				}
 				if isInsufficient(err) {
 					l.Warn("preconsume insufficient", "user_id", token.UserID, "need", est, "err", err)
-					resp.Err(w, r, http.StatusPaymentRequired, resp.CodeInsufficient, msgInsufficient)
+					writeOpenAIError(w, http.StatusPaymentRequired, msgInsufficient)
 				} else {
 					l.Error("preconsume failed", "user_id", token.UserID, "need", est, "err", err)
-					resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, msgInternal)
+					writeOpenAIError(w, http.StatusInternalServerError, msgInternal)
 				}
 				return
 			}
@@ -240,7 +302,7 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint string)
 			l.Warn("resolve balance failed, skip precheck", "user_id", token.UserID, "err", berr)
 		} else if bal <= 0 {
 			g.recordGatewayReject(ctx, model, token, pricingMode, sessionID, "积分余额不足（账户余额为 0）")
-			resp.Err(w, r, http.StatusPaymentRequired, resp.CodeInsufficient, msgInsufficient)
+			writeOpenAIError(w, http.StatusPaymentRequired, msgInsufficient)
 			return
 		}
 	}
@@ -332,7 +394,7 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint string)
 		// 改写 body.model 为内部模型 ID（各候选渠道的 internal_model_id 可能不同）。
 		rewritten, rerr := rewriteModel(body, routeRes.InternalModelID)
 		if rerr != nil {
-			resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "请求体格式错误")
+			writeOpenAIError(w, http.StatusBadRequest, "请求体格式错误")
 			return
 		}
 
@@ -372,14 +434,14 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint string)
 		if !attempted {
 			g.recordGatewayReject(ctx, model, token, pricingMode, sessionID, msgRateLimited)
 		}
-		resp.Err(w, r, http.StatusTooManyRequests, resp.CodeRateLimited, msgRateLimited)
+		writeOpenAIError(w, http.StatusTooManyRequests, msgRateLimited)
 		return
 	}
 	g.refundAllPreConsume(ctx, token.UserID, preConsumed, "请求失败退回（无可用渠道）")
 	if !attempted {
 		g.recordGatewayReject(ctx, model, token, pricingMode, sessionID, msgNoAvailable)
 	}
-	resp.Err(w, r, http.StatusServiceUnavailable, resp.CodeNoRoute, msgNoAvailable)
+	writeOpenAIError(w, http.StatusServiceUnavailable, msgNoAvailable)
 }
 
 // recordGatewayReject 记录一次未进入渠道的网关拒绝（零余额/未路由/候选全部被拦截等）为 failed 账单，
@@ -504,7 +566,7 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 		}
 		// 请求已送达后失败（多为响应超时）：上游可能已生成并计费，转移会导致上游重复计费 → 不转移。
 		g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "上游请求失败（已送达，不转移）", msSince(start))
-		resp.Err(w, r, http.StatusBadGateway, resp.CodeInternalError, msgUpstreamDown)
+		writeOpenAIError(w, http.StatusBadGateway, msgUpstreamDown)
 		return &fwdOutcome{responded: true, refundPre: true}
 	}
 	defer up.Body.Close()
@@ -516,7 +578,7 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 			// 已收到 2xx：上游已完成生成并计费，转移会造成上游重复计费 → 不转移。
 			g.logError(rt.Channel.ID, "read upstream body", err)
 			g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "读取上游响应失败", msSince(start))
-			resp.Err(w, r, http.StatusBadGateway, resp.CodeInternalError, msgUpstreamDown)
+			writeOpenAIError(w, http.StatusBadGateway, msgUpstreamDown)
 			return &fwdOutcome{responded: true, refundPre: true}
 		}
 		dur := msSince(start)
@@ -537,11 +599,11 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 				g.logger.Warn("billing insufficient", "user_id", token.UserID, "err", berr)
 				// billing.Record 内部已落一条 failed（含实际 tokens/rates/系数与余额不足原因），
 				// 网关不再重复落账，保证每次请求恰好一条记录。
-				resp.Err(w, r, http.StatusPaymentRequired, resp.CodeInsufficient, msgInsufficient)
+				writeOpenAIError(w, http.StatusPaymentRequired, msgInsufficient)
 				return &fwdOutcome{responded: true, billFailed: true}
 			}
 			g.logError(rt.Channel.ID, "record billing failed", berr)
-			resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, msgInternal)
+			writeOpenAIError(w, http.StatusInternalServerError, msgInternal)
 			return &fwdOutcome{responded: true, billFailed: true}
 		}
 		out.charged = ch
@@ -569,7 +631,7 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 		if retryableUpstreamStatus(up.StatusCode) {
 			return &fwdOutcome{retry: true}
 		}
-		resp.Err(w, r, http.StatusBadGateway, resp.CodeInternalError, msgUpstreamDown)
+		writeOpenAIError(w, http.StatusBadGateway, msgUpstreamDown)
 		return &fwdOutcome{responded: true, refundPre: true}
 	}
 }
@@ -610,7 +672,7 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		}
 		// 请求已送达后失败（多为响应超时）：上游可能已生成并计费，转移会导致上游重复计费 → 不转移。
 		g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "上游流式请求失败（已送达，不转移）", msSince(start))
-		resp.Err(w, r, http.StatusBadGateway, resp.CodeInternalError, msgUpstreamDown)
+		writeOpenAIError(w, http.StatusBadGateway, msgUpstreamDown)
 		return &fwdOutcome{responded: true, refundPre: true}
 	}
 	defer up.Body.Close()
@@ -659,7 +721,7 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		if retryableUpstreamStatus(up.StatusCode) {
 			return &fwdOutcome{retry: true}
 		}
-		resp.Err(w, r, http.StatusBadGateway, resp.CodeInternalError, msgUpstreamDown)
+		writeOpenAIError(w, http.StatusBadGateway, msgUpstreamDown)
 		return &fwdOutcome{responded: true, refundPre: true}
 	}
 }

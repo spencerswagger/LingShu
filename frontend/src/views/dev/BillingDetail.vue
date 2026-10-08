@@ -17,7 +17,7 @@ onMounted(async () => {
   errInfo.value = { message: '', requestId: '' }
   try {
     const res = await getDevBilling(billingId)
-    detail.value = res.data
+    detail.value = res.Data
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
   } finally {

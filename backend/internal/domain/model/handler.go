@@ -35,7 +35,7 @@ type viewModel struct {
 	ExternalName string                   `json:"ExternalName"`
 	Description  string                   `json:"Description"`
 	Enabled      bool                     `json:"Enabled"`
-	SaleRates    billing.Rates            `json:"SaleRates"`
+	SaleRates    billing.WireRates        `json:"SaleRates"`
 	TimeConfig   *billing.TimeCoeffConfig `json:"TimeConfig,omitempty"`
 	ContextTiers []billing.TierRule       `json:"ContextTiers,omitempty"`
 	CreatedAt    time.Time                `json:"CreatedAt"`
@@ -48,7 +48,7 @@ func toView(m *ExternalModel) viewModel {
 		ExternalName: m.ExternalName,
 		Description:  m.Description,
 		Enabled:      m.Enabled,
-		SaleRates:    m.SaleRates,
+		SaleRates:    billing.WireRates(m.SaleRates),
 		TimeConfig:   m.TimeConfig,
 		ContextTiers: m.ContextTiers,
 		CreatedAt:    m.CreatedAt,
@@ -60,7 +60,7 @@ type createModelRequest struct {
 	ExternalName string                   `json:"ExternalName"`
 	Description  string                   `json:"Description"`
 	Enabled      *bool                    `json:"Enabled"`
-	SaleRates    billing.Rates            `json:"SaleRates"`
+	SaleRates    billing.WireRates        `json:"SaleRates"`
 	TimeConfig   *billing.TimeCoeffConfig `json:"TimeConfig"`
 	ContextTiers []billing.TierRule       `json:"ContextTiers"`
 }
@@ -78,16 +78,16 @@ func toInput(req *createModelRequest) ExternalModelInput {
 		ExternalName: req.ExternalName,
 		Description:  req.Description,
 		Enabled:      req.Enabled,
-		SaleRates:    req.SaleRates,
+		SaleRates:    billing.Rates(req.SaleRates),
 		TimeConfig:   req.TimeConfig,
 		ContextTiers: req.ContextTiers,
 	}
 }
 
-// HandleList GET /api/v1/admin/models（可选 ?enabled=true|false）
+// HandleList GET /api/v1/admin/models（可选 ?Enabled=true|false）
 func (h *Handler) HandleList(w http.ResponseWriter, r *http.Request) {
 	var enabled *bool
-	if v := r.URL.Query().Get("enabled"); v != "" {
+	if v := r.URL.Query().Get("Enabled"); v != "" {
 		b := v == "true"
 		enabled = &b
 	}
@@ -159,7 +159,7 @@ func (h *Handler) HandleBatchDelete(w http.ResponseWriter, r *http.Request) {
 		writeServiceErr(w, r, err)
 		return
 	}
-	resp.OK(w, r, map[string]int64{"deleted": n})
+	resp.OK(w, r, map[string]int64{"Deleted": n})
 }
 
 // HandlePriceReference GET /api/v1/admin/models/{id}/price-reference
@@ -174,14 +174,14 @@ func (h *Handler) HandlePriceReference(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp.OK(w, r, map[string]any{
-		"reference": map[string]float64{
-			"input":       ref.Input,
-			"output":      ref.Output,
-			"cache_read":  ref.CacheRead,
-			"cache_write": ref.CacheWrite,
-			"reasoning":   ref.Reasoning,
+		"Reference": map[string]float64{
+			"Input":      ref.Input,
+			"Output":     ref.Output,
+			"CacheRead":  ref.CacheRead,
+			"CacheWrite": ref.CacheWrite,
+			"Reasoning":  ref.Reasoning,
 		},
-		"updated_at": ref.UpdatedAt.Format(time.RFC3339),
+		"UpdatedAt": ref.UpdatedAt.Format(time.RFC3339),
 	})
 }
 
@@ -209,11 +209,11 @@ func (h *Handler) HandleSyncPrices(w http.ResponseWriter, r *http.Request) {
 	resp.OK(w, r, res)
 }
 
-// HandlePriceCatalog GET /api/v1/admin/models/price-catalog?q=关键词
+// HandlePriceCatalog GET /api/v1/admin/models/price-catalog?Q=关键词
 // 搜索 models.dev 价格目录（供应商 + 模型 ID + 美元原始价），供前端浏览选择。
-// 返回 {list, updated_at, total}：updated_at 为最近同步时间（从未同步为 0），total 为命中数。
+// 返回 {List, UpdatedAt, Total}：UpdatedAt 为最近同步时间（从未同步为 0），Total 为命中数。
 func (h *Handler) HandlePriceCatalog(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query().Get("q")
+	q := r.URL.Query().Get("Q")
 	list, updatedAt, total, err := h.svc.PriceCatalog(r.Context(), q)
 	if err != nil {
 		writeServiceErr(w, r, err)
@@ -227,9 +227,9 @@ func (h *Handler) HandlePriceCatalog(w http.ResponseWriter, r *http.Request) {
 		updated = updatedAt.Format(time.RFC3339)
 	}
 	resp.OK(w, r, map[string]any{
-		"list":       list,
-		"total":      total,
-		"updated_at": updated,
+		"List":      list,
+		"Total":     total,
+		"UpdatedAt": updated,
 	})
 }
 

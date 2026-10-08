@@ -57,8 +57,8 @@ async function loadUser() {
   errInfo.value = { message: '', requestId: '' }
   try {
     const res = await getUser(id)
-    user.value = res.data.user
-    balance.value = res.data.wallet?.balance ?? 0
+    user.value = res.Data.User
+    balance.value = res.Data.Wallet?.Balance ?? 0
     // 流水表数据一律由 loadFlows() 从 /users/:id/wallet/flows 分页获取，
     // getUser 返回的 recent_flows 仅为最近流水摘要，此处不展示。
   } catch (e: any) {
@@ -71,8 +71,8 @@ async function loadUser() {
 async function loadFlows() {
   try {
     const res = await listUserFlows(id, flowPage.value, flowSize.value)
-    flows.value = res.data.list
-    flowTotal.value = res.data.total
+    flows.value = res.Data.List
+    flowTotal.value = res.Data.Total
   } catch {
     flows.value = []
   }
@@ -82,8 +82,8 @@ async function loadTokens() {
   tokenLoading.value = true
   try {
     const res = await listTokens({ user_id: id, page: tokenPage.value, size: tokenSize.value })
-    tokens.value = res.data.list
-    tokenTotal.value = res.data.total
+    tokens.value = res.Data.List
+    tokenTotal.value = res.Data.Total
   } catch {
     tokens.value = []
   } finally {
@@ -109,9 +109,9 @@ async function saveAttr(payload: { Role?: string; Status?: string; PricingMode?:
       Nickname: u.Nickname || '',
       ...payload,
     })
-    if (payload.Role) u.Role = res.data.Role ?? payload.Role
-    if (payload.Status) u.Status = res.data.Status ?? payload.Status
-    if (payload.PricingMode) u.PricingMode = res.data.PricingMode ?? payload.PricingMode
+    if (payload.Role) u.Role = res.Data.Role ?? payload.Role
+    if (payload.Status) u.Status = res.Data.Status ?? payload.Status
+    if (payload.PricingMode) u.PricingMode = res.Data.PricingMode ?? payload.PricingMode
     ElMessage.success(msg)
   } catch (e: any) {
     ElMessage.error(e?.message || '更新失败')
@@ -136,7 +136,7 @@ async function saveNick() {
       PricingMode: u.PricingMode,
       Nickname: nickDraft.value.trim(),
     })
-    u.Nickname = res.data.Nickname ?? nickDraft.value.trim()
+    u.Nickname = res.Data.Nickname ?? nickDraft.value.trim()
     nickEditing.value = false
     ElMessage.success('昵称已更新')
   } catch (e: any) {

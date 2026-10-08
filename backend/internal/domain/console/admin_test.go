@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"regexp"
 	"testing"
 	"time"
@@ -168,7 +169,7 @@ func TestHandleListBillings_FilterParams(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, channel_id, name FROM channel_keys WHERE id = ANY('{3}'::bigint[])`)).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "channel_id", "name"}))
 
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/billings?channel_key_id=3&session_id=sess-1", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/billings?ChannelKeyID=3&SessionID=sess-1", nil)
 	rec := httptest.NewRecorder()
 	admin.HandleListBillings(rec, req)
 
@@ -176,10 +177,10 @@ func TestHandleListBillings_FilterParams(t *testing.T) {
 		t.Fatalf("status=%d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
 	var body struct {
-		Code int `json:"code"`
+		Code int `json:"Code"`
 		Data struct {
-			Total int64 `json:"total"`
-		} `json:"data"`
+			Total int64 `json:"Total"`
+		} `json:"Data"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("unmarshal: %v", err)
@@ -189,5 +190,51 @@ func TestHandleListBillings_FilterParams(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("mock expectations: %v", err)
+	}
+}
+
+// TestStatsRangeFromQuery_ShanghaiDayBoundary 断言统计区间日界统一按 Asia/Shanghai 归一，
+// 不随请求自带时区偏移截断。
+func TestStatsRangeFromQuery_ShanghaiDayBoundary(t *testing.T) {
+	loc, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		t.Fatalf("load Asia/Shanghai: %v", err)
+	}
+
+	// from 带 -05:00 偏移、to 带 Z（UTC）：各自换算为上海日历日后取整天边界。
+	q := url.Values{
+		"From": {"2026-09-01T08:30:00-05:00"}, // 上海 2026-09-01 21:30
+		"To":   {"2026-09-03T20:00:00Z"},      // 上海 2026-09-04 04:00（跨日）
+	}
+	from, to, err := statsRangeFromQuery(q, time.Now())
+	if err != nil {
+		t.Fatalf("statsRangeFromQuery: %v", err)
+	}
+	wantFrom := time.Date(2026, 9, 1, 0, 0, 0, 0, loc)
+	wantTo := time.Date(2026, 9, 4, 23, 59, 59, 0, loc)
+	if !from.Equal(wantFrom) || !to.Equal(wantTo) {
+		t.Fatalf("from=%v to=%v, want %v/%v", from, to, wantFrom, wantTo)
+	}
+	if from.Location().String() != "Asia/Shanghai" {
+		t.Fatalf("from location=%v, want Asia/Shanghai", from.Location())
+	}
+
+	// 缺省近 30 天：以 now 所在上海日历日为准。
+	now := time.Date(2026, 9, 3, 15, 0, 0, 0, time.UTC) // 上海 2026-09-03 23:00
+	from2, to2, err := statsRangeFromQuery(url.Values{}, now)
+	if err != nil {
+		t.Fatalf("statsRangeFromQuery default: %v", err)
+	}
+	if !from2.Equal(time.Date(2026, 8, 5, 0, 0, 0, 0, loc)) ||
+		!to2.Equal(time.Date(2026, 9, 3, 23, 59, 59, 0, loc)) {
+		t.Fatalf("default from=%v to=%v", from2, to2)
+	}
+
+	// 边界校验：from 晚于 to 报错。
+	if _, _, err := statsRangeFromQuery(url.Values{
+		"From": {"2026-09-05T00:00:00+08:00"},
+		"To":   {"2026-09-01T00:00:00+08:00"},
+	}, now); err == nil {
+		t.Fatalf("from 晚于 to 应报错")
 	}
 }

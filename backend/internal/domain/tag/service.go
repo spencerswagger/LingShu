@@ -167,7 +167,7 @@ func (s *Service) Resolve(ctx context.Context, ids []int64) ([]Tag, error) {
 	}
 	for i := range tags {
 		if !tags[i].Enabled {
-			return nil, errBadRequest("标签「"+tags[i].Name+"」已停用，无法绑定")
+			return nil, errBadRequest("标签「" + tags[i].Name + "」已停用，无法绑定")
 		}
 	}
 	return tags, nil

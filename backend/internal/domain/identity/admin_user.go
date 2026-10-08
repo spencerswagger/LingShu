@@ -48,16 +48,16 @@ func NewAdminUserHandler(svc *Service, credit *CreditService, userIDFrom func(ct
 
 func (h *AdminUserHandler) SetTOTP(t *TOTPService) { h.totp = t }
 
-// HandleListUsers GET /api/v1/admin/users?q=&role=&status=&page=&size=
+// HandleListUsers GET /api/v1/admin/users?Q=&Role=&Status=&Page=&Size=
 func (h *AdminUserHandler) HandleListUsers(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	page, size := parsePageSize(q)
-	users, total, err := h.svc.ListUsers(r.Context(), q.Get("q"), q.Get("role"), q.Get("status"), page, size)
+	users, total, err := h.svc.ListUsers(r.Context(), q.Get("Q"), q.Get("Role"), q.Get("Status"), page, size)
 	if err != nil {
 		writeServiceErr(w, r, err)
 		return
 	}
-	respOK(w, r, map[string]any{"list": users, "total": total, "page": page, "size": size})
+	respOK(w, r, map[string]any{"List": users, "Total": total, "Page": page, "Size": size})
 }
 
 // HandleCreateUser POST /api/v1/admin/users
@@ -124,7 +124,7 @@ func (h *AdminUserHandler) HandleResetPassword(w http.ResponseWriter, r *http.Re
 		writeServiceErr(w, r, err)
 		return
 	}
-	respOK(w, r, map[string]bool{"reset": true})
+	respOK(w, r, map[string]bool{"Reset": true})
 }
 
 // HandleResetTOTP POST /api/v1/admin/users/{id}/reset-totp 强制解绑 TOTP。
@@ -142,7 +142,7 @@ func (h *AdminUserHandler) HandleResetTOTP(w http.ResponseWriter, r *http.Reques
 		writeServiceErr(w, r, err)
 		return
 	}
-	respOK(w, r, map[string]bool{"reset": true})
+	respOK(w, r, map[string]bool{"Reset": true})
 }
 
 // HandleBatchDeleteUsers POST /api/v1/admin/users/batch-delete
@@ -159,7 +159,7 @@ func (h *AdminUserHandler) HandleBatchDeleteUsers(w http.ResponseWriter, r *http
 		writeServiceErr(w, r, err)
 		return
 	}
-	respOK(w, r, map[string]int64{"affected": n})
+	respOK(w, r, map[string]int64{"Affected": n})
 }
 
 // HandleGetUser GET /api/v1/admin/users/{id} 返回用户 + 钱包余额 + 最近流水摘要。
@@ -185,9 +185,9 @@ func (h *AdminUserHandler) HandleGetUser(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	respOK(w, r, map[string]any{
-		"user":         u,
-		"wallet":       map[string]any{"balance": balance},
-		"recent_flows": flows,
+		"User":        u,
+		"Wallet":      map[string]any{"Balance": balance},
+		"RecentFlows": flows,
 	})
 }
 

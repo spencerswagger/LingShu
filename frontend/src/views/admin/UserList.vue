@@ -26,14 +26,14 @@ const filters = reactive({
 async function load() {
   loading.value = true
   errInfo.value = { message: '', requestId: '' }
-  const params: Record<string, unknown> = { page: page.value, size: size.value }
-  if (filters.q.trim()) params.q = filters.q.trim()
-  if (filters.role) params.role = filters.role
-  if (filters.status) params.status = filters.status
+  const params: Record<string, unknown> = { Page: page.value, Size: size.value }
+  if (filters.q.trim()) params.Q = filters.q.trim()
+  if (filters.role) params.Role = filters.role
+  if (filters.status) params.Status = filters.status
   try {
     const res = await listUsers(params)
-    list.value = res.data.list
-    total.value = res.data.total
+    list.value = res.Data.List
+    total.value = res.Data.Total
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
   } finally {
@@ -85,9 +85,9 @@ async function saveAttr(row: AdminUser, payload: { Role?: string; Status?: strin
       Nickname: row.Nickname || '',
       ...payload,
     })
-    if (payload.Role) row.Role = res.data.Role ?? payload.Role
-    if (payload.Status) row.Status = res.data.Status ?? payload.Status
-    if (payload.PricingMode) row.PricingMode = res.data.PricingMode ?? payload.PricingMode
+    if (payload.Role) row.Role = res.Data.Role ?? payload.Role
+    if (payload.Status) row.Status = res.Data.Status ?? payload.Status
+    if (payload.PricingMode) row.PricingMode = res.Data.PricingMode ?? payload.PricingMode
     ElMessage.success(msg)
   } catch (e: any) {
     ElMessage.error(e?.message || '更新失败')
@@ -109,7 +109,7 @@ async function saveNick(row: AdminUser) {
       PricingMode: row.PricingMode,
       Nickname: nickDraft.value.trim(),
     })
-    row.Nickname = res.data.Nickname ?? nickDraft.value.trim()
+    row.Nickname = res.Data.Nickname ?? nickDraft.value.trim()
     nickEditId.value = null
     ElMessage.success('昵称已更新')
   } catch (e: any) {

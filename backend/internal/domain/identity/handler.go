@@ -110,21 +110,25 @@ func (h *Handler) HandleLoginTOTP(w http.ResponseWriter, r *http.Request) {
 	rlKey := "uid:" + strconv.FormatInt(userID, 10)
 	ip := clientip.From(r)
 	if h.rl != nil {
-		if err := h.rl.Allow(ip, rlKey); err != nil {
+		// 与第一步一致：AllowAndRecord 在同一临界区内完成「放行判断 + 预记一次失败」，
+		// 消除并发请求绕过失败窗口上限的竞态；校验成功后由 RecordSuccess 清零。
+		if err := h.rl.AllowAndRecord(ip, rlKey); err != nil {
 			resp.Err(w, r, http.StatusTooManyRequests, resp.CodeRateLimited, "尝试过于频繁，请稍后再试")
 			return
 		}
 	}
 	lr, err := h.svc.LoginTOTP(r.Context(), userID, req.Code)
 	if err != nil {
-		if h.rl != nil {
-			h.rl.RecordFailure(ip, rlKey)
-		}
+		// 失败计数已在 AllowAndRecord 中预记，此处不再 RecordFailure，避免重复计数
 		writeServiceErr(w, r, err)
 		return
 	}
 	// 动态码校验通过：此刻才消费一次性 preauth token（防重放）。
-	h.preauth.Consume(req.PreAuthToken)
+	// 并发下同一 preauth 令牌只允许兑换一次会话：Consume 失败说明已被另一请求消费或已过期，返回 401。
+	if _, ok := h.preauth.Consume(req.PreAuthToken); !ok {
+		resp.Err(w, r, http.StatusUnauthorized, resp.CodeUnauthorized, "登录会话已过期，请重新登录")
+		return
+	}
 	if h.rl != nil {
 		h.rl.RecordSuccess(ip, rlKey)
 	}
@@ -142,7 +146,7 @@ func (h *Handler) HandleLogout(w http.ResponseWriter, r *http.Request) {
 		writeServiceErr(w, r, err)
 		return
 	}
-	resp.OK(w, r, map[string]bool{"logout": true})
+	resp.OK(w, r, map[string]bool{"Logout": true})
 }
 
 // HandleChangePassword PUT /api/v1/auth/me/password 本人改密。
@@ -165,7 +169,7 @@ func (h *Handler) HandleChangePassword(w http.ResponseWriter, r *http.Request) {
 		writeServiceErr(w, r, err)
 		return
 	}
-	resp.OK(w, r, map[string]string{"token": token})
+	resp.OK(w, r, map[string]string{"Token": token})
 }
 
 // HandleTOTPSetup POST /api/v1/auth/me/totp/setup 生成 TOTP secret（待确认态）。
@@ -201,7 +205,7 @@ func (h *Handler) HandleTOTPSetup(w http.ResponseWriter, r *http.Request) {
 		writeServiceErr(w, r, err)
 		return
 	}
-	resp.OK(w, r, map[string]string{"otpauth_uri": uri, "secret": secret})
+	resp.OK(w, r, map[string]string{"OtpAuthURI": uri, "Secret": secret})
 }
 
 // HandleTOTPConfirm POST /api/v1/auth/me/totp/confirm 确认绑定并返回恢复码。
@@ -233,7 +237,7 @@ func (h *Handler) HandleTOTPConfirm(w http.ResponseWriter, r *http.Request) {
 		writeServiceErr(w, r, err)
 		return
 	}
-	resp.OK(w, r, map[string]any{"recovery_codes": codes})
+	resp.OK(w, r, map[string]any{"RecoveryCodes": codes})
 }
 
 // HandleTOTPDisable DELETE /api/v1/auth/me/totp 解绑（需当前口令 + 当前 code）。
@@ -263,7 +267,7 @@ func (h *Handler) HandleTOTPDisable(w http.ResponseWriter, r *http.Request) {
 		writeServiceErr(w, r, err)
 		return
 	}
-	resp.OK(w, r, map[string]bool{"disabled": true})
+	resp.OK(w, r, map[string]bool{"Disabled": true})
 }
 
 // HandleMe GET /api/v1/auth/me 返回当前登录用户资料与钱包余额（任意角色可用）。
@@ -283,7 +287,7 @@ func (h *Handler) HandleMe(w http.ResponseWriter, r *http.Request) {
 		writeServiceErr(w, r, err)
 		return
 	}
-	resp.OK(w, r, map[string]any{"user": u, "balance": balance})
+	resp.OK(w, r, map[string]any{"User": u, "Balance": balance})
 }
 
 // HandleUpdateMe PUT /api/v1/auth/me 修改本人昵称。

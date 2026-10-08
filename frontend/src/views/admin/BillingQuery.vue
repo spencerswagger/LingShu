@@ -51,6 +51,16 @@ const filters = reactive({
   range: null as [string, string] | null,
 })
 
+// 前端筛选态键 → 后端 query 参数键（PascalCase 契约）
+const paramKeyMap: Record<string, string> = {
+  user_id: 'UserID',
+  token_id: 'TokenID',
+  channel_key_id: 'ChannelKeyID',
+  session_id: 'SessionID',
+  model: 'Model',
+  status: 'Status',
+}
+
 function buildParams(extra: Record<string, unknown> = {}): Record<string, unknown> {
   const p: Record<string, unknown> = { ...extra }
   for (const [k, v] of Object.entries(filters)) {
@@ -58,12 +68,12 @@ function buildParams(extra: Record<string, unknown> = {}): Record<string, unknow
     if (k === 'channel_id') continue // 后端按 channel_key_id 过滤，渠道仅作级联
     if (k === 'range') {
       if (filters.range) {
-        p.from = filters.range[0]
-        p.to = filters.range[1]
+        p.From = filters.range[0]
+        p.To = filters.range[1]
       }
       continue
     }
-    p[k] = v
+    p[paramKeyMap[k] ?? k] = v
   }
   return p
 }
@@ -71,13 +81,13 @@ function buildParams(extra: Record<string, unknown> = {}): Record<string, unknow
 async function load() {
   loading.value = true
   errInfo.value = { message: '', requestId: '' }
-  const params = buildParams({ page: page.value, size: size.value })
+  const params = buildParams({ Page: page.value, Size: size.value })
   const statsParams = buildParams()
   try {
     const [billRes, statsRes] = await Promise.all([listBillings(params), getBillingStats(statsParams)])
-    list.value = billRes.data.list
-    total.value = billRes.data.total
-    stats.value = statsRes.data
+    list.value = billRes.Data.List
+    total.value = billRes.Data.Total
+    stats.value = statsRes.Data
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
   } finally {
@@ -89,7 +99,7 @@ async function load() {
 async function loadChannels() {
   if (channels.value.length) return
   try {
-    channels.value = (await listChannels()).data || []
+    channels.value = (await listChannels()).Data || []
   } catch {
     channels.value = []
   }
@@ -97,7 +107,7 @@ async function loadChannels() {
 async function loadModels() {
   if (models.value.length) return
   try {
-    models.value = (await listExternalModels({})).data || []
+    models.value = (await listExternalModels({})).Data || []
   } catch {
     models.value = []
   }
@@ -109,16 +119,16 @@ async function loadTokensOfUser() {
     return
   }
   try {
-    const res = await listTokens({ user_id: filters.user_id, page: 1, size: 100 })
-    tokens.value = res.data.list || []
+    const res = await listTokens({ UserID: filters.user_id, Page: 1, Size: 100 })
+    tokens.value = res.Data.List || []
   } catch {
     tokens.value = []
   }
 }
 async function searchSessions(q: string) {
   try {
-    const res = await listSessions({ q, page: 1, size: 50 })
-    sessions.value = res.data.list || []
+    const res = await listSessions({ Q: q, Page: 1, Size: 50 })
+    sessions.value = res.Data.List || []
   } catch {
     sessions.value = []
   }
@@ -128,7 +138,7 @@ async function onChannelChange(id?: string) {
   channelKeys.value = []
   if (!id) return
   try {
-    channelKeys.value = (await listChannelKeys(id)).data || []
+    channelKeys.value = (await listChannelKeys(id)).Data || []
   } catch {
     channelKeys.value = []
   }
@@ -190,16 +200,16 @@ onMounted(() => {
 function tokenLine1(row: AdminBillingItem): string {
   const t = row.Tokens || ({} as AdminBillingItem['Tokens'])
   const parts: string[] = []
-  if (t.input || t.input === 0) parts.push(`输入 ${t.input}`)
-  if (t.output) parts.push(`输出 ${t.output}`)
+  if (t.Input || t.Input === 0) parts.push(`输入 ${t.Input}`)
+  if (t.Output) parts.push(`输出 ${t.Output}`)
   return parts.length ? parts.join(' · ') : '-'
 }
 function tokenLine2(row: AdminBillingItem): string {
   const t = row.Tokens || ({} as AdminBillingItem['Tokens'])
   const parts: string[] = []
-  if (t.cache_read) parts.push(`缓存读 ${t.cache_read}`)
-  if (t.cache_write) parts.push(`缓存写 ${t.cache_write}`)
-  if (t.reasoning) parts.push(`推理 ${t.reasoning}`)
+  if (t.CacheRead) parts.push(`缓存读 ${t.CacheRead}`)
+  if (t.CacheWrite) parts.push(`缓存写 ${t.CacheWrite}`)
+  if (t.Reasoning) parts.push(`推理 ${t.Reasoning}`)
   return parts.join(' · ')
 }
 
@@ -220,7 +230,7 @@ function tokenRate(row: AdminBillingItem): string {
   if (dur <= 0) return '-'
   const gen = first == null || first < 0 ? dur : dur - first
   if (gen <= 0) return '-'
-  const out = (row.Tokens || {}).output || 0
+  const out = (row.Tokens || {}).Output || 0
   if (!out) return '-'
   return `${Math.round((out / gen) * 1000)} tok/s`
 }
@@ -248,11 +258,11 @@ function creditLines(row: AdminBillingItem): string[] {
   const r = row.RValue ?? 0
 
   const segs: Array<[number, string, string]> = [
-    [t.input || 0, '输入', 'input'],
-    [t.output || 0, '输出', 'output'],
-    [t.cache_read || 0, '缓存读', 'cache_read'],
-    [t.cache_write || 0, '缓存写', 'cache_write'],
-    [t.reasoning || 0, '推理', 'reasoning'],
+    [t.Input || 0, '输入', 'Input'],
+    [t.Output || 0, '输出', 'Output'],
+    [t.CacheRead || 0, '缓存读', 'CacheRead'],
+    [t.CacheWrite || 0, '缓存写', 'CacheWrite'],
+    [t.Reasoning || 0, '推理', 'Reasoning'],
   ]
   const step1: string[] = []
   let sub1 = 0

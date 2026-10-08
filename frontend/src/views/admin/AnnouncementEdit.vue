@@ -33,7 +33,7 @@ onMounted(async () => {
   loading.value = true
   try {
     const res = await listAnnouncements()
-    const row = (res.data.list || []).find((a: AdminAnnouncement) => a.ID === editId)
+    const row = (res.Data.List || []).find((a: AdminAnnouncement) => a.ID === editId)
     if (!row) {
       ElMessage.error('公告不存在')
       router.push('/admin/announcements')

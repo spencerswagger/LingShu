@@ -352,7 +352,7 @@ func (h *AnnouncementHandler) HandleAdminList(w http.ResponseWriter, r *http.Req
 	for i := range list {
 		items = append(items, list[i].response())
 	}
-	resp.OK(w, r, map[string]any{"list": items})
+	resp.OK(w, r, map[string]any{"List": items})
 }
 
 // HandleAdminCreate POST /api/v1/admin/announcements
@@ -403,7 +403,7 @@ func (h *AnnouncementHandler) HandleAdminBatchDelete(w http.ResponseWriter, r *h
 		writeServiceErr(w, r, err)
 		return
 	}
-	resp.OK(w, r, map[string]int64{"deleted": n})
+	resp.OK(w, r, map[string]int64{"Deleted": n})
 }
 
 // HandleDevList GET /api/v1/dev/announcements 返回当前有效公告。
@@ -417,5 +417,5 @@ func (h *AnnouncementHandler) HandleDevList(w http.ResponseWriter, r *http.Reque
 	for i := range list {
 		items = append(items, list[i].response())
 	}
-	resp.OK(w, r, map[string]any{"list": items})
+	resp.OK(w, r, map[string]any{"List": items})
 }

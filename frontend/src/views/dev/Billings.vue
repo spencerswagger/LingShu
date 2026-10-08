@@ -18,8 +18,8 @@ async function load() {
   errInfo.value = { message: '', requestId: '' }
   try {
     const res = await listDevBillings(page.value, size.value)
-    list.value = res.data.list
-    total.value = res.data.total
+    list.value = res.Data.List
+    total.value = res.Data.Total
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
   } finally {

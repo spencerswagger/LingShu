@@ -49,10 +49,10 @@ func pathID(w http.ResponseWriter, r *http.Request) (int64, bool) {
 	return id, true
 }
 
-// HandleList GET /api/v1/admin/tags（可选 ?enabled=true|false）
+// HandleList GET /api/v1/admin/tags（可选 ?Enabled=true|false）
 func (h *Handler) HandleList(w http.ResponseWriter, r *http.Request) {
 	var enabled *bool
-	if v := r.URL.Query().Get("enabled"); v != "" {
+	if v := r.URL.Query().Get("Enabled"); v != "" {
 		b := v == "true"
 		enabled = &b
 	}
@@ -112,7 +112,7 @@ func (h *Handler) HandleBatchDelete(w http.ResponseWriter, r *http.Request) {
 		writeServiceErr(w, r, err)
 		return
 	}
-	resp.OK(w, r, map[string]int64{"deleted": n})
+	resp.OK(w, r, map[string]int64{"Deleted": n})
 }
 
 func toInput(req *createTagRequest) TagInput {

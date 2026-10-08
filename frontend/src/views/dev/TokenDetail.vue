@@ -33,7 +33,7 @@ async function load() {
   errInfo.value = { message: '', requestId: '' }
   try {
     const res = await listDevTokens(1, 500)
-    token.value = res.data.list.find((t) => t.ID === tokenId) || null
+    token.value = res.Data.List.find((t) => t.ID === tokenId) || null
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
   } finally {
@@ -46,8 +46,8 @@ async function onToggle() {
   if (!token.value) return
   try {
     const res = await toggleDevToken(token.value.ID)
-    token.value.Status = res.data.Status
-    ElMessage.success(res.data.Status === 'ACTIVE' ? '已启用' : '已禁用')
+    token.value.Status = res.Data.Status
+    ElMessage.success(res.Data.Status === 'ACTIVE' ? '已启用' : '已禁用')
   } catch (e: any) {
     ElMessage.error(e?.message || '操作失败')
   }
@@ -57,8 +57,8 @@ async function onRotate() {
   if (!token.value) return
   try {
     const res = await rotateDevToken(token.value.ID)
-    rotatePlain.value = res.data.Plain
-    rotateDisplay.value = res.data.Display
+    rotatePlain.value = res.Data.Plain
+    rotateDisplay.value = res.Data.Display
     rotateDialog.value = true
     await load()
   } catch (e: any) {

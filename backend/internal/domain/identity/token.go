@@ -561,7 +561,7 @@ type createdTokenResponse struct {
 func (h *TokenHandler) HandleAdminList(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	var userID *int64
-	if v := q.Get("user_id"); v != "" {
+	if v := q.Get("UserID"); v != "" {
 		id, err := strconv.ParseInt(v, 10, 64)
 		if err != nil {
 			resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "user_id 必须为数字")
@@ -569,7 +569,7 @@ func (h *TokenHandler) HandleAdminList(w http.ResponseWriter, r *http.Request) {
 		}
 		userID = &id
 	}
-	status := q.Get("status")
+	status := q.Get("Status")
 	page, size := parsePageSize(q)
 	list, total, err := h.svc.List(r.Context(), userID, status, page, size)
 	if err != nil {
@@ -580,7 +580,7 @@ func (h *TokenHandler) HandleAdminList(w http.ResponseWriter, r *http.Request) {
 	for i := range list {
 		items = append(items, list[i].response())
 	}
-	resp.OK(w, r, map[string]any{"list": items, "total": total, "page": page, "size": size})
+	resp.OK(w, r, map[string]any{"List": items, "Total": total, "Page": page, "Size": size})
 }
 
 // HandleAdminCreate POST /api/v1/admin/tokens 管理端创建令牌。
@@ -612,7 +612,7 @@ func (h *TokenHandler) HandleAdminBatchDelete(w http.ResponseWriter, r *http.Req
 		writeServiceErr(w, r, err)
 		return
 	}
-	resp.OK(w, r, map[string]any{"affected": n})
+	resp.OK(w, r, map[string]any{"Affected": n})
 }
 
 // HandleAdminSecret GET /api/v1/admin/tokens/{id}/secret 管理端查看令牌密钥（可反复复制）。
@@ -651,7 +651,7 @@ func (h *TokenHandler) HandleDevList(w http.ResponseWriter, r *http.Request) {
 	}
 	q := r.URL.Query()
 	page, size := parsePageSize(q)
-	list, total, err := h.svc.List(r.Context(), &userID, q.Get("status"), page, size)
+	list, total, err := h.svc.List(r.Context(), &userID, q.Get("Status"), page, size)
 	if err != nil {
 		writeServiceErr(w, r, err)
 		return
@@ -660,7 +660,7 @@ func (h *TokenHandler) HandleDevList(w http.ResponseWriter, r *http.Request) {
 	for i := range list {
 		items = append(items, list[i].response())
 	}
-	resp.OK(w, r, map[string]any{"list": items, "total": total, "page": page, "size": size})
+	resp.OK(w, r, map[string]any{"List": items, "Total": total, "Page": page, "Size": size})
 }
 
 // HandleDevCreate POST /api/v1/dev/tokens 开发端创建本人令牌。
@@ -768,12 +768,12 @@ func pathID(r *http.Request) (int64, error) {
 func parsePageSize(q url.Values) (page, size int) {
 	page = 1
 	size = 20
-	if v := q.Get("page"); v != "" {
+	if v := q.Get("Page"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n >= 1 {
 			page = n
 		}
 	}
-	if v := q.Get("size"); v != "" {
+	if v := q.Get("Size"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n >= 1 {
 			size = n
 		}
