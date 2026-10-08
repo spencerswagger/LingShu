@@ -17,17 +17,17 @@ const creditValue = ref<string>('') // 积分价值 V=R/1e6，只读
 const fallbackOpen = ref(false)
 const fallbackSaving = ref(false)
 const fallbackErr = ref<{ message: string; requestId: string }>({ message: '', requestId: '' })
-const fallbackModel = ref<Record<string, any>>({ time_config: null, context_tiers: null })
+const fallbackModel = ref<Record<string, any>>({ TimeConfig: null, ContextTiers: null })
 
 async function load() {
   loading.value = true
   errInfo.value = { message: '', requestId: '' }
   try {
     const res = await getBillingConfig()
-    r.value = typeof res.data.r === 'string' ? Number(res.data.r) : Number(res.data.r)
-    const c = Number(res.data.cny_rate)
+    r.value = typeof res.Data.R === 'string' ? Number(res.Data.R) : Number(res.Data.R)
+    const c = Number(res.Data.CNYRate)
     if (c > 0) cnyRate.value = c
-    const cv = Number(res.data.credit_value)
+    const cv = Number(res.Data.CreditValue)
     if (!isNaN(cv)) creditValue.value = `1 积分 = ¥${cv}（R ÷ 1,000,000）`
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
@@ -47,14 +47,14 @@ async function onSave() {
     // PUT 三键必传：仅回传 R，时段/分档全局默认保留当前数据库值不动
     const cur = await getBillingConfig()
     await putBillingConfig({
-      r: r.value,
-      cny_rate: cnyRate.value,
-      context_tiers: cur.data.context_tiers || [],
-      time_config: cur.data.time_config || {
-        timezone: 'Asia/Shanghai',
-        default_coeff: 1,
-        periodic_segments: [],
-        date_overrides: [],
+      R: r.value,
+      CnyRate: cnyRate.value,
+      ContextTiers: cur.Data.ContextTiers || [],
+      TimeConfig: cur.Data.TimeConfig || {
+        Timezone: 'Asia/Shanghai',
+        Default: 1,
+        Periodic: [],
+        Overrides: [],
       },
     })
     ElMessage.success('计费配置已更新')
@@ -71,11 +71,11 @@ async function openFallback() {
   fallbackErr.value = { message: '', requestId: '' }
   try {
     const res = await getBillingConfig()
-    const tc = res.data.time_config as any
-    const tiers = res.data.context_tiers || []
+    const tc = res.Data.TimeConfig as any
+    const tiers = res.Data.ContextTiers || []
     fallbackModel.value = {
-      time_config: tc && tc.periodic_segments ? tc : null,
-      context_tiers: tiers.length ? tiers : null,
+      TimeConfig: tc && tc.Periodic ? tc : null,
+      ContextTiers: tiers.length ? tiers : null,
     }
   } catch (e: any) {
     fallbackErr.value = { message: e?.message, requestId: e?.requestId }
@@ -87,14 +87,14 @@ async function saveFallback() {
   fallbackErr.value = { message: '', requestId: '' }
   try {
     await putBillingConfig({
-      r: r.value,
-      cny_rate: cnyRate.value,
-      context_tiers: fallbackModel.value.context_tiers || [],
-      time_config: fallbackModel.value.time_config || {
-        timezone: 'Asia/Shanghai',
-        default_coeff: 1,
-        periodic_segments: [],
-        date_overrides: [],
+      R: r.value,
+      CnyRate: cnyRate.value,
+      ContextTiers: fallbackModel.value.ContextTiers || [],
+      TimeConfig: fallbackModel.value.TimeConfig || {
+        Timezone: 'Asia/Shanghai',
+        Default: 1,
+        Periodic: [],
+        Overrides: [],
       },
     })
     ElMessage.success('全局时段/分档默认值已保存')

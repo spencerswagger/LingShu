@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -27,6 +29,7 @@ import (
 	"github.com/team/llmgateway/internal/domain/sync"
 	"github.com/team/llmgateway/internal/domain/tag"
 	"github.com/team/llmgateway/internal/pkg/clientip"
+	"github.com/team/llmgateway/internal/pkg/idgen"
 	"github.com/team/llmgateway/internal/pkg/jwtx"
 	"github.com/team/llmgateway/internal/pkg/logger"
 	"github.com/team/llmgateway/internal/pkg/ratelimit"
@@ -35,17 +38,61 @@ import (
 	"github.com/team/llmgateway/internal/server"
 )
 
+// init 统一进程时区为北京时间（Asia/Shanghai）：按日/按小时切分的统计、
+// 时段计费系数与按日补零展示都以北京时间为准。
+func init() {
+	if err := os.Setenv("TZ", "Asia/Shanghai"); err == nil {
+		if loc, err := time.LoadLocation("Asia/Shanghai"); err == nil {
+			time.Local = loc
+		}
+	}
+}
+
 // sm4KeyFromConfig 读取渠道凭据加密密钥（SM4 要求 16 字节，即 32 个 hex 字符）。
-// 出于安全考虑，密钥禁止回退到内置默认值：为空或非法时直接退出并给出明确指引，
-// 强制部署者显式配置，杜绝生产环境用公开默认密钥加密渠道凭据。
+// 优先级：
+//  1. 配置了 security.sm4_key：校验 32 位 hex（非法直接退出），与 SM4_KEY 环境变量
+//     （docker-entrypoint 写入 config）路径保持兼容；
+//  2. 未配置：从 keys/sm4.key 读取，文件不存在则生成 16 字节强随机密钥写入
+//     （chmod 600，目录缺失先创建）并打印日志；之后重启复用该文件。
 func sm4KeyFromConfig(cfg *config.Config) []byte {
 	k := strings.TrimSpace(cfg.Security.SM4Key)
-	b, err := hex.DecodeString(k)
-	if err != nil || len(b) != 16 {
-		slog.Error("security.sm4_key 缺失或非法：渠道凭据使用 SM4 加密，必须显式配置 32 位 hex（16 字节）密钥。请参照 config.example.yaml 设置（本地开发可用 dev-sm4-key 值的默认值，生产务必更换为强随机密钥）")
+	if k != "" {
+		b, err := hex.DecodeString(k)
+		if err != nil || len(b) != 16 {
+			slog.Error("security.sm4_key 非法：必须为 32 位 hex（16 字节）密钥。请参照 config.example.yaml 设置；留空则自动从 keys/sm4.key 生成/复用")
+			os.Exit(1)
+		}
+		return b
+	}
+
+	const keyPath = "keys/sm4.key"
+	if b, err := os.ReadFile(keyPath); err == nil {
+		kb, derr := hex.DecodeString(strings.TrimSpace(string(b)))
+		if derr != nil || len(kb) != 16 {
+			slog.Error("keys/sm4.key 内容非法：必须为 32 位 hex（16 字节）。请修正或删除该文件后重启以重新生成")
+			os.Exit(1)
+		}
+		return kb
+	} else if !errors.Is(err, os.ErrNotExist) {
+		slog.Error("读取 keys/sm4.key 失败", "error", err)
 		os.Exit(1)
 	}
-	return b
+
+	kb := make([]byte, 16)
+	if _, err := rand.Read(kb); err != nil {
+		slog.Error("生成 SM4 密钥失败", "error", err)
+		os.Exit(1)
+	}
+	if err := os.MkdirAll("keys", 0o755); err != nil {
+		slog.Error("创建 keys 目录失败", "error", err)
+		os.Exit(1)
+	}
+	if err := os.WriteFile(keyPath, []byte(hex.EncodeToString(kb)), 0o600); err != nil {
+		slog.Error("写入 keys/sm4.key 失败", "error", err)
+		os.Exit(1)
+	}
+	slog.Info("未配置 security.sm4_key，已自动生成强随机密钥并写入 keys/sm4.key（后续重启复用）")
+	return kb
 }
 
 // userIDFrom 从请求上下文读取当前登录用户（server.UserIDFrom 适配）。
@@ -57,6 +104,21 @@ func main() {
 	cfgPath := flag.String("config", "config.yaml", "config file path")
 	migrateOnly := flag.Bool("migrate-only", false, "run migrations and exit")
 	flag.Parse()
+
+	// 雪花 ID 工作节点：多实例部署须为每个实例分配唯一 worker（0~31），否则同毫秒会撞主键。
+	// 未设置时保留默认 0（单实例场景）；越界或非法值 fail-fast 退出。
+	if v := strings.TrimSpace(os.Getenv("IDGEN_WORKER")); v != "" {
+		w, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			slog.Error("IDGEN_WORKER 须为整数", "value", v, "error", err)
+			os.Exit(1)
+		}
+		if err := idgen.SetWorker(w); err != nil {
+			slog.Error("IDGEN_WORKER 越界", "value", v, "error", err)
+			os.Exit(1)
+		}
+		slog.Info("idgen worker 已按 IDGEN_WORKER 设置", "worker", w)
+	}
 
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
@@ -184,6 +246,8 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	totpSvc := identity.NewTOTPService(userStore, sm4Key)
 	totpSvc.SetAudit(auditStore)
 	identitySvc.SetTOTP(totpSvc)
+	// 二次验证口令尝试限流：复用登录限流器（key 前缀 "sf:" 与登录计数隔离）。
+	identitySvc.SetRateLimiter(rl)
 
 	creditStore := identity.NewCreditStore(d)
 	creditSvc := identity.NewCreditService(creditStore)
@@ -192,12 +256,17 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	identityHandler.SetRateLimiter(rl)
 	identityHandler.SetPreAuth(preAuth)
 	creditHandler := identity.NewCreditHandler(creditSvc, userIDFrom)
+	// 充值/覆盖/调整积分属资金敏感操作：需操作者当前口令二次验证。
+	creditHandler.SetPasswordVerifier(identitySvc.VerifyCurrentPassword)
 
 	tokenStore := identity.NewTokenStore(d)
 	tokenSvc := identity.NewTokenService(tokenStore)
 	tokenSvc.SetSecretKey(sm4Key)
 	tokenAdminHandler := identity.NewTokenHandler(tokenSvc, userIDFrom)
 	tokenDevHandler := identity.NewTokenHandler(tokenSvc, userIDFrom)
+	// 查看明文密钥属敏感操作：需当前口令二次验证。
+	tokenAdminHandler.SetPasswordVerifier(identitySvc.VerifyCurrentPassword)
+	tokenDevHandler.SetPasswordVerifier(identitySvc.VerifyCurrentPassword)
 
 	adminUserHandler := identity.NewAdminUserHandler(identitySvc, creditSvc, userIDFrom)
 	adminUserHandler.SetTOTP(totpSvc)

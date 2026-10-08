@@ -55,13 +55,13 @@ type PriceSource interface {
 
 // CatalogEntry 价格目录条目（供应商维度），供搜索浏览 models.dev 参考价使用。
 type CatalogEntry struct {
-	Provider      string  `json:"provider"`
-	ModelID       string  `json:"model_id"`
-	InputUSD      float64 `json:"input_usd"` // 美元 / 百万 token
-	OutputUSD     float64 `json:"output_usd"`
-	CacheUSD      float64 `json:"cache_read_usd"`
-	CacheWriteUSD float64 `json:"cache_write_usd"`
-	ReasoningUSD  float64 `json:"reasoning_usd"`
+	Provider      string  `json:"Provider"`
+	ModelID       string  `json:"ModelID"`
+	InputUSD      float64 `json:"InputUSD"` // 美元 / 百万 token
+	OutputUSD     float64 `json:"OutputUSD"`
+	CacheUSD      float64 `json:"CacheReadUSD"`
+	CacheWriteUSD float64 `json:"CacheWriteUSD"`
+	ReasoningUSD  float64 `json:"ReasoningUSD"`
 }
 
 // ExternalModelInput 创建/更新对外模型的可写字段。
@@ -295,8 +295,8 @@ func (s *Service) PriceCatalog(ctx context.Context, q string) ([]CatalogEntry, t
 
 // SyncPricesResult 批量同步结果。
 type SyncPricesResult struct {
-	Updated []string `json:"updated"`
-	Skipped []string `json:"skipped"`
+	Updated []string `json:"Updated"`
+	Skipped []string `json:"Skipped"`
 }
 
 // SyncPrices 用 models.dev 参考价折算后的人民币倍率批量刷新所有对外模型的售价；

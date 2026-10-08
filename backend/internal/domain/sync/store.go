@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/team/llmgateway/internal/pkg/idgen"
 )
 
 // 告警状态。
@@ -36,9 +38,9 @@ type WatchlistItem struct {
 
 // Change 一次价格写入/变化维度（input/output）的变更明细。
 type Change struct {
-	Old       float64 `json:"old"`
-	New       float64 `json:"new"`
-	ChangePct float64 `json:"change_pct"` // 百分比，(new-old)/old*100
+	Old       float64 `json:"Old"`
+	New       float64 `json:"New"`
+	ChangePct float64 `json:"ChangePct"` // 百分比，(new-old)/old*100
 }
 
 // PriceAlert 对应 price_change_alerts 表一行。Changes 键为 "input"/"output"。
@@ -125,26 +127,20 @@ func (s *Store) GetWatchlistByExternalID(ctx context.Context, externalID string)
 }
 
 // UpsertWatchlist 按 external_model_id 幂等插入/更新关注项，返回回填后的完整记录。
-// external_model_id 无 DB 唯一约束（软删除后允许重建），改为查询后插入或更新；
-// 已软删除的历史行保留审计，新建独立行。
+// 原子语义：uq_watchlist_items_active 部分唯一索引（WHERE deleted_at IS NULL）+ ON CONFLICT 收敛，
+// 并发下同一 external_model_id 不会产生两条活跃行（软删除后可重建）。
 func (s *Store) UpsertWatchlist(ctx context.Context, in *WatchlistItem) (*WatchlistItem, error) {
-	existing, err := s.GetWatchlistByExternalID(ctx, in.ExternalModelID)
-	switch {
-	case err == nil:
-		var placeholders = "local_model_name = $1, alert_on_change = $2"
-		row := s.db.QueryRowContext(ctx,
-			`UPDATE watchlist_items SET `+placeholders+` WHERE id = $3 RETURNING `+watchlistCols,
-			in.LocalModelName, in.AlertOnChange, existing.ID)
-		return scanWatchlist(row)
-	case errors.Is(err, sql.ErrNoRows):
-		row := s.db.QueryRowContext(ctx,
-			`INSERT INTO watchlist_items(external_model_id, local_model_name, alert_on_change)
-			 VALUES($1,$2,$3) RETURNING `+watchlistCols,
-			in.ExternalModelID, in.LocalModelName, in.AlertOnChange)
-		return scanWatchlist(row)
-	default:
-		return nil, err
+	if in.ID == 0 {
+		in.ID = idgen.New()
 	}
+	row := s.db.QueryRowContext(ctx,
+		`INSERT INTO watchlist_items(id, external_model_id, local_model_name, alert_on_change)
+		 VALUES($1,$2,$3,$4)
+		 ON CONFLICT (external_model_id) WHERE deleted_at IS NULL
+		 DO UPDATE SET local_model_name = EXCLUDED.local_model_name, alert_on_change = EXCLUDED.alert_on_change
+		 RETURNING `+watchlistCols,
+		in.ID, in.ExternalModelID, in.LocalModelName, in.AlertOnChange)
+	return scanWatchlist(row)
 }
 
 // DeleteWatchlist 批量软删除关注项，返回删除数量。
@@ -190,11 +186,14 @@ func (s *Store) InsertAlert(ctx context.Context, a *PriceAlert) (*PriceAlert, er
 	if a.WatchlistItemID != nil {
 		watchID = *a.WatchlistItemID
 	}
+	if a.ID == 0 {
+		a.ID = idgen.New()
+	}
 	row := s.db.QueryRowContext(ctx,
-		`INSERT INTO price_change_alerts(admin_id, watchlist_item_id, external_model_id,
+		`INSERT INTO price_change_alerts(id, admin_id, watchlist_item_id, external_model_id,
 			local_model_name, changes, status, detected_at)
-		 VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING `+alertCols,
-		adminID, watchID, a.ExternalModelID, a.LocalModelName, changesRaw, a.Status, a.DetectedAt)
+		 VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING `+alertCols,
+		a.ID, adminID, watchID, a.ExternalModelID, a.LocalModelName, changesRaw, a.Status, a.DetectedAt)
 	return scanAlert(row)
 }
 

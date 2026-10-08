@@ -8,13 +8,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"time"
 
 	"github.com/team/llmgateway/internal/pkg/dbx"
 	"github.com/team/llmgateway/internal/pkg/decimalx"
+	"github.com/team/llmgateway/internal/pkg/idgen"
+	"github.com/team/llmgateway/internal/pkg/money"
 	"github.com/team/llmgateway/internal/pkg/resp"
 )
 
@@ -35,18 +37,19 @@ type Wallet struct {
 }
 
 // Flow 对应 credit_flows 一行。
+// 雪花 ID 超出 JS 安全整数，ID/UserID 以字符串序列化。
 type Flow struct {
-	ID           int64
-	UserID       int64
-	Type         string
-	Amount       float64
-	RefBillingID *string
-	SessionID    string // 关联会话（预扣费等无账单流水直接携带，用于会话名解析）
-	Remark       *string
-	CreatedAt    time.Time
+	ID           int64     `json:"ID,string"`
+	UserID       int64     `json:"UserID,string"`
+	Type         string    `json:"Type"`
+	Amount       float64   `json:"Amount"`
+	RefBillingID *string   `json:"RefBillingID,omitempty"`
+	SessionID    string    `json:"SessionID,omitempty"` // 关联会话（预扣费等无账单流水直接携带，用于会话名解析）
+	Remark       *string   `json:"Remark,omitempty"`
+	CreatedAt    time.Time `json:"CreatedAt"`
 	// 查询聚合字段（非表列）：该笔流水后的钱包余额（按流水累计）与关联会话名称。
-	BalanceAfter float64
-	SessionName  *string
+	BalanceAfter float64 `json:"BalanceAfter"`
+	SessionName  *string `json:"SessionName,omitempty"`
 }
 
 // CreditStore 提供 credit_wallets 与 credit_flows 的数据访问。
@@ -57,18 +60,6 @@ type CreditStore struct {
 // NewCreditStore 创建积分存储。
 func NewCreditStore(db *sql.DB) *CreditStore {
 	return &CreditStore{db: db}
-}
-
-// ConsumeCredit 原子扣减：余额足够才更新并返回扣减后余额。
-// 返回 exists=false 表示无匹配钱包（余额不足或钱包缺失，由服务层区分）。
-func (s *CreditStore) ConsumeCredit(ctx context.Context, userID int64, amount float64) (after float64, exists bool, err error) {
-	return consumeCreditOn(ctx, s.db, userID, amount)
-}
-
-// ConsumeCreditTx 与 ConsumeCredit 等价，但在调用方给定执行器（事务）上执行，
-// 供计费「扣款 + 积分流水 + 账单」同事务提交复用。
-func (s *CreditStore) ConsumeCreditTx(ctx context.Context, ex dbx.Execer, userID int64, amount float64) (after float64, exists bool, err error) {
-	return consumeCreditOn(ctx, ex, userID, amount)
 }
 
 func consumeCreditOn(ctx context.Context, ex dbx.Execer, userID int64, amount float64) (after float64, exists bool, err error) {
@@ -87,17 +78,8 @@ func consumeCreditOn(ctx context.Context, ex dbx.Execer, userID int64, amount fl
 	return bal, true, nil
 }
 
-// ChangeBalance 增加余额（amount 可为负）。requireSufficient 为真时要求余额充足。
+// changeBalanceOn 增加余额（amount 可为负）。requireSufficient 为真时要求余额充足。
 // 返回 changed 表示是否真的更新到行。
-func (s *CreditStore) ChangeBalance(ctx context.Context, userID int64, amount float64, requireSufficient bool) (changed bool, err error) {
-	return changeBalanceOn(ctx, s.db, userID, amount, requireSufficient)
-}
-
-// ChangeBalanceTx 是 ChangeBalance 的事务执行器版本。
-func (s *CreditStore) ChangeBalanceTx(ctx context.Context, ex dbx.Execer, userID int64, amount float64, requireSufficient bool) (changed bool, err error) {
-	return changeBalanceOn(ctx, ex, userID, amount, requireSufficient)
-}
-
 func changeBalanceOn(ctx context.Context, ex dbx.Execer, userID int64, amount float64, requireSufficient bool) (changed bool, err error) {
 	q := `UPDATE credit_wallets SET balance = balance + $1, version = version + 1, updated_at = now()
 	      WHERE user_id = $2`
@@ -116,28 +98,9 @@ func changeBalanceOn(ctx context.Context, ex dbx.Execer, userID int64, amount fl
 	return n > 0, nil
 }
 
-// SetBalance 覆盖钱包余额（直接 set，不走增量，余额可为任意非负值）。
-func (s *CreditStore) SetBalance(ctx context.Context, userID int64, balance float64) error {
-	res, err := s.db.ExecContext(ctx,
-		`UPDATE credit_wallets SET balance = $1, version = version + 1, updated_at = now()
-		 WHERE user_id = $2`, balance, userID)
-	if err != nil {
-		return err
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return sql.ErrNoRows
-	}
-	return nil
-}
-
 // GetBalance 查询余额；钱包不存在返回 sql.ErrNoRows。
 func (s *CreditStore) GetBalance(ctx context.Context, userID int64) (float64, error) {
 	return getBalanceOn(ctx, s.db, userID)
-}
-
-// GetBalanceTx 是 GetBalance 的事务执行器版本（可读到本事务内的未提交变更）。
-func (s *CreditStore) GetBalanceTx(ctx context.Context, ex dbx.Execer, userID int64) (float64, error) {
-	return getBalanceOn(ctx, ex, userID)
 }
 
 func getBalanceOn(ctx context.Context, ex dbx.Execer, userID int64) (float64, error) {
@@ -171,16 +134,19 @@ func (s *CreditStore) InsertFlowTx(ctx context.Context, ex dbx.Execer, f *Flow) 
 }
 
 func insertFlowOn(ctx context.Context, ex dbx.Execer, f *Flow) (*Flow, error) {
+	if f.ID == 0 {
+		f.ID = idgen.New()
+	}
 	var created time.Time
 	var sessionID any
 	if f.SessionID != "" {
 		sessionID = f.SessionID
 	}
 	err := ex.QueryRowContext(ctx,
-		`INSERT INTO credit_flows(user_id, type, amount, ref_billing_id, session_id, remark)
-		 VALUES($1, $2, $3, $4, $5, $6)
+		`INSERT INTO credit_flows(id, user_id, type, amount, ref_billing_id, session_id, remark)
+		 VALUES($1, $2, $3, $4, $5, $6, $7)
 		 RETURNING id, created_at`,
-		f.UserID, f.Type, f.Amount, f.RefBillingID, sessionID, f.Remark).
+		f.ID, f.UserID, f.Type, f.Amount, f.RefBillingID, sessionID, f.Remark).
 		Scan(&f.ID, &created)
 	if err != nil {
 		return nil, err
@@ -295,8 +261,21 @@ func formatFloat(f float64) string {
 
 // Consume 原子扣减积分并写入 consume 流水。返回扣减前后的余额。
 // 余额不足返回 40201，钱包不存在返回 40401。sessionID 非空时流水直接关联会话。
+// 未传外部事务时内部开启事务，保证「改余额 + 写流水」原子提交。
 func (s *CreditService) Consume(ctx context.Context, userID int64, amount float64, billingID, sessionID, remark string) (before, after float64, err error) {
-	return s.consumeOn(ctx, s.store.db, userID, amount, billingID, sessionID, remark)
+	tx, err := s.store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, 0, fmt.Errorf("begin consume tx: %w", err)
+	}
+	defer tx.Rollback()
+	before, after, err = s.consumeOn(ctx, tx, userID, amount, billingID, sessionID, remark)
+	if err != nil {
+		return 0, 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, 0, fmt.Errorf("commit consume tx: %w", err)
+	}
+	return before, after, nil
 }
 
 // ConsumeTx 在调用方给定执行器（事务）内完成扣减与流水写入；
@@ -309,6 +288,9 @@ func (s *CreditService) consumeOn(ctx context.Context, ex dbx.Execer, userID int
 	amount = decimalx.Round5(amount)
 	if amount <= 0 {
 		return 0, 0, errBadRequest("扣减积分必须大于 0")
+	}
+	if err := money.Validate(amount, "扣减积分"); err != nil {
+		return 0, 0, errBadRequest(err.Error())
 	}
 	after, changed, err := consumeCreditOn(ctx, ex, userID, amount)
 	if err != nil {
@@ -329,8 +311,9 @@ func (s *CreditService) consumeOn(ctx context.Context, ex dbx.Execer, userID int
 }
 
 // Settle 为 SettleBalance 的别名，满足 billing.CreditService 接口。
+// 未传外部事务时内部开启事务，保证「改余额 + 写流水」原子提交。
 func (s *CreditService) Settle(ctx context.Context, userID int64, delta float64, sessionID, remark string) (before, after float64, err error) {
-	return s.settleOn(ctx, s.store.db, userID, delta, sessionID, remark)
+	return s.settleWithTx(ctx, userID, delta, sessionID, remark)
 }
 
 // SettleTx 在调用方给定执行器（事务）内完成差额结算与流水写入。
@@ -340,12 +323,33 @@ func (s *CreditService) SettleTx(ctx context.Context, ex dbx.Execer, userID int6
 
 // SettleBalance 在预扣基础上多退少补：delta > 0 补扣（需余额充足），delta < 0 退回。
 // 返回差额流水的前后余额；补扣余额不足返回错误（计费落 failed）。
+// 未传外部事务时内部开启事务，保证「改余额 + 写流水」原子提交。
 func (s *CreditService) SettleBalance(ctx context.Context, userID int64, delta float64, sessionID, remark string) (before, after float64, err error) {
-	return s.settleOn(ctx, s.store.db, userID, delta, sessionID, remark)
+	return s.settleWithTx(ctx, userID, delta, sessionID, remark)
+}
+
+// settleWithTx 内部开启事务执行差额结算（非 Tx 入口共用）。
+func (s *CreditService) settleWithTx(ctx context.Context, userID int64, delta float64, sessionID, remark string) (before, after float64, err error) {
+	tx, err := s.store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, 0, fmt.Errorf("begin settle tx: %w", err)
+	}
+	defer tx.Rollback()
+	before, after, err = s.settleOn(ctx, tx, userID, delta, sessionID, remark)
+	if err != nil {
+		return 0, 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, 0, fmt.Errorf("commit settle tx: %w", err)
+	}
+	return before, after, nil
 }
 
 func (s *CreditService) settleOn(ctx context.Context, ex dbx.Execer, userID int64, delta float64, sessionID, remark string) (before, after float64, err error) {
 	delta = decimalx.Round5(delta)
+	if err := money.Validate(delta, "结算差额"); err != nil {
+		return 0, 0, errBadRequest(err.Error())
+	}
 	before, gErr := getBalanceOn(ctx, ex, userID)
 	if gErr != nil {
 		return 0, 0, gErr
@@ -377,63 +381,110 @@ func (s *CreditService) settleOn(ctx context.Context, ex dbx.Execer, userID int6
 }
 
 // Recharge 充值积分（amount > 0），写入 recharge 流水，operatorID 为操作管理员。
+// 改余额 + 写流水在同一事务内原子提交；operatorID 写入流水备注（操作员#<id>）。
 func (s *CreditService) Recharge(ctx context.Context, userID, operatorID int64, amount float64, remark string) error {
 	amount = decimalx.Round5(amount)
 	if amount <= 0 {
 		return errBadRequest("充值积分必须大于 0")
 	}
-	if err := s.store.EnsureWallet(ctx, userID); err != nil {
+	if err := money.Validate(amount, "充值积分"); err != nil {
+		return errBadRequest(err.Error())
+	}
+	tx, err := s.store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin recharge tx: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO credit_wallets(user_id, balance) VALUES ($1, 0) ON CONFLICT (user_id) DO NOTHING`, userID); err != nil {
 		return fmt.Errorf("ensure wallet: %w", err)
 	}
-	if _, err := s.store.ChangeBalance(ctx, userID, amount, false); err != nil {
+	if _, err := changeBalanceOn(ctx, tx, userID, amount, false); err != nil {
 		return fmt.Errorf("recharge: %w", err)
 	}
-	_ = operatorID
-	return s.insertFlow(ctx, FlowTypeRecharge, userID, amount, nil, "", remark, false)
+	if err := s.insertFlowOn(ctx, tx, FlowTypeRecharge, userID, amount, nil, "", operatorRemark(remark, operatorID), false); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // AdminSetBalance 覆盖钱包余额（直接 set），写入 set 流水。
+// 改余额 + 写流水在同一事务内原子提交。
 func (s *CreditService) AdminSetBalance(ctx context.Context, userID int64, balance float64, remark string) error {
 	balance = decimalx.Round5(balance)
 	if balance < 0 {
 		return errBadRequest("目标余额不能为负")
 	}
-	if err := s.store.EnsureWallet(ctx, userID); err != nil {
+	if err := money.Validate(balance, "目标余额"); err != nil {
+		return errBadRequest(err.Error())
+	}
+	tx, err := s.store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin set balance tx: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO credit_wallets(user_id, balance) VALUES ($1, 0) ON CONFLICT (user_id) DO NOTHING`, userID); err != nil {
 		return fmt.Errorf("ensure wallet: %w", err)
 	}
-	if err := s.store.SetBalance(ctx, userID, balance); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return errNotFound()
-		}
+	res, err := tx.ExecContext(ctx,
+		`UPDATE credit_wallets SET balance = $1, version = version + 1, updated_at = now()
+		 WHERE user_id = $2`, balance, userID)
+	if err != nil {
 		return fmt.Errorf("set balance: %w", err)
 	}
-	return s.insertFlow(ctx, FlowTypeSet, userID, balance, nil, "", remark, false)
+	if n, _ := res.RowsAffected(); n == 0 {
+		return errNotFound()
+	}
+	if err := s.insertFlowOn(ctx, tx, FlowTypeSet, userID, balance, nil, "", remark, false); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // Adjust 调整积分：amount > 0 上调，amount < 0 下调（需余额充足），写入 adjust 流水。
+// operatorID 为操作管理员；改余额 + 写流水在同一事务内原子提交；operatorID 写入流水备注。
 func (s *CreditService) Adjust(ctx context.Context, userID, operatorID int64, amount float64, remark string) error {
 	amount = decimalx.Round5(amount)
 	if amount == 0 {
 		return errBadRequest("调整积分数不能为 0")
 	}
-	if err := s.store.EnsureWallet(ctx, userID); err != nil {
+	if err := money.Validate(amount, "调整积分数"); err != nil {
+		return errBadRequest(err.Error())
+	}
+	tx, err := s.store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin adjust tx: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO credit_wallets(user_id, balance) VALUES ($1, 0) ON CONFLICT (user_id) DO NOTHING`, userID); err != nil {
 		return fmt.Errorf("ensure wallet: %w", err)
 	}
 	needSufficient := amount < 0
-	changed, err := s.store.ChangeBalance(ctx, userID, amount, needSufficient)
+	changed, err := changeBalanceOn(ctx, tx, userID, amount, needSufficient)
 	if err != nil {
 		return fmt.Errorf("adjust: %w", err)
 	}
 	if !changed {
 		return errInsufficient(-amount)
 	}
-	_ = operatorID
-	return s.insertFlow(ctx, FlowTypeAdjust, userID, amount, nil, "", remark, false)
+	if err := s.insertFlowOn(ctx, tx, FlowTypeAdjust, userID, amount, nil, "", operatorRemark(remark, operatorID), false); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
-// insertFlow 写入流水。billingID 非空时同步到 ref_billing_id，sessionID 同步会话。
-func (s *CreditService) insertFlow(ctx context.Context, flowType string, userID int64, amount float64, billingID *string, sessionID, remark string, hasBilling bool) error {
-	return s.insertFlowOn(ctx, s.store.db, flowType, userID, amount, billingID, sessionID, remark, hasBilling)
+// operatorRemark 将操作管理员 ID 写入流水备注前缀（operatorID=0 表示系统/无操作者，不加前缀）。
+func operatorRemark(remark string, operatorID int64) string {
+	if operatorID == 0 {
+		return remark
+	}
+	prefix := fmt.Sprintf("操作员#%d", operatorID)
+	if remark == "" {
+		return prefix
+	}
+	return prefix + " " + remark
 }
 
 // insertFlowOn 在给定执行器上写入流水（事务路径复用）。
@@ -486,8 +537,9 @@ func (s *CreditService) EnsureWallet(ctx context.Context, userID int64) error {
 
 // CreditHandler 暴露积分 HTTP 处理器。userIDFrom 从 context 解析当前登录用户。
 type CreditHandler struct {
-	svc        *CreditService
-	userIDFrom func(ctx context.Context) (int64, bool)
+	svc            *CreditService
+	userIDFrom     func(ctx context.Context) (int64, bool)
+	verifyPassword func(ctx context.Context, userID int64, password string) error
 }
 
 // NewCreditHandler 创建积分处理器。
@@ -495,20 +547,20 @@ func NewCreditHandler(svc *CreditService, userIDFrom func(ctx context.Context) (
 	return &CreditHandler{svc: svc, userIDFrom: userIDFrom}
 }
 
-type flowResponse struct {
-	ID           int64     `json:"id"`
-	Type         string    `json:"type"`
-	Amount       float64   `json:"amount"`
-	Balance      float64   `json:"balance"` // 该笔流水后的钱包余额
-	SessionName  *string   `json:"session_name,omitempty"`
-	RefBillingID *string   `json:"ref_billing_id,omitempty"`
-	Remark       *string   `json:"remark,omitempty"`
-	CreatedAt    time.Time `json:"created_at"`
+// SetPasswordVerifier 注入当前口令校验（充值/调整等资金敏感操作二次验证；nil=跳过校验）。
+func (h *CreditHandler) SetPasswordVerifier(fn func(ctx context.Context, userID int64, password string) error) {
+	h.verifyPassword = fn
 }
 
-type adjustRequest struct {
-	Amount float64 `json:"amount"`
-	Remark string  `json:"remark"`
+type flowResponse struct {
+	ID           int64     `json:"ID,string"`
+	Type         string    `json:"Type"`
+	Amount       float64   `json:"Amount"`
+	Balance      float64   `json:"Balance"` // 该笔流水后的钱包余额
+	SessionName  *string   `json:"SessionName,omitempty"`
+	RefBillingID *string   `json:"RefBillingID,omitempty"`
+	Remark       *string   `json:"Remark,omitempty"`
+	CreatedAt    time.Time `json:"CreatedAt"`
 }
 
 // HandleAdminWallet GET /api/v1/admin/users/{id}/wallet 查询用户钱包余额。
@@ -523,10 +575,11 @@ func (h *CreditHandler) HandleAdminWallet(w http.ResponseWriter, r *http.Request
 		writeServiceErr(w, r, err)
 		return
 	}
-	resp.OK(w, r, map[string]any{"balance": bal})
+	resp.OK(w, r, map[string]any{"Balance": bal})
 }
 
 // HandleAdminRecharge POST /api/v1/admin/users/{id}/wallet/recharge 管理员充值。
+// 资金敏感操作：需当前口令二次验证。
 func (h *CreditHandler) HandleAdminRecharge(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r)
 	if err != nil {
@@ -534,22 +587,30 @@ func (h *CreditHandler) HandleAdminRecharge(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	var req struct {
-		Amount float64 `json:"amount"`
-		Remark string  `json:"remark"`
+		Amount   float64 `json:"Amount"`
+		Remark   string  `json:"Remark"`
+		Password string  `json:"Password"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "请求体格式错误")
 		return
 	}
 	operatorID, _ := h.userIDFrom(r.Context())
+	if h.verifyPassword != nil && operatorID != 0 {
+		if verr := h.verifyPassword(r.Context(), operatorID, req.Password); verr != nil {
+			writeServiceErr(w, r, verr)
+			return
+		}
+	}
 	if err := h.svc.Recharge(r.Context(), id, operatorID, req.Amount, req.Remark); err != nil {
 		writeServiceErr(w, r, err)
 		return
 	}
-	resp.OK(w, r, map[string]any{"affected": 1})
+	resp.OK(w, r, map[string]any{"Affected": 1})
 }
 
 // HandleAdminSet POST /api/v1/admin/users/{id}/wallet/set 覆盖余额。
+// 资金敏感操作：需当前口令二次验证。
 func (h *CreditHandler) HandleAdminSet(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r)
 	if err != nil {
@@ -557,39 +618,58 @@ func (h *CreditHandler) HandleAdminSet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Balance float64 `json:"balance"`
-		Remark  string  `json:"remark"`
+		Balance  float64 `json:"Balance"`
+		Remark   string  `json:"Remark"`
+		Password string  `json:"Password"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "请求体格式错误")
 		return
 	}
+	operatorID, _ := h.userIDFrom(r.Context())
+	if h.verifyPassword != nil && operatorID != 0 {
+		if verr := h.verifyPassword(r.Context(), operatorID, req.Password); verr != nil {
+			writeServiceErr(w, r, verr)
+			return
+		}
+	}
 	if err := h.svc.AdminSetBalance(r.Context(), id, req.Balance, req.Remark); err != nil {
 		writeServiceErr(w, r, err)
 		return
 	}
-	resp.OK(w, r, map[string]any{"balance": req.Balance})
+	resp.OK(w, r, map[string]any{"Balance": req.Balance})
 }
 
 // HandleAdminAdjust POST /api/v1/admin/users/{id}/wallet/adjust 管理员调整积分。
+// 资金敏感操作：需当前口令二次验证。
 func (h *CreditHandler) HandleAdminAdjust(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r)
 	if err != nil {
 		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "ID 参数无效")
 		return
 	}
-	var req adjustRequest
+	var req struct {
+		Amount   float64 `json:"Amount"`
+		Remark   string  `json:"Remark"`
+		Password string  `json:"Password"`
+	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "请求体格式错误")
 		return
 	}
 	operatorID, _ := h.userIDFrom(r.Context())
+	if h.verifyPassword != nil && operatorID != 0 {
+		if verr := h.verifyPassword(r.Context(), operatorID, req.Password); verr != nil {
+			writeServiceErr(w, r, verr)
+			return
+		}
+	}
 	if err := h.svc.Adjust(r.Context(), id, operatorID, req.Amount, req.Remark); err != nil {
-		log.Printf("admin adjust failed: user=%d amount=%v err=%v", id, req.Amount, err)
+		slog.Error("admin adjust failed", "user", id, "amount", req.Amount, "err", err)
 		writeServiceErr(w, r, err)
 		return
 	}
-	resp.OK(w, r, map[string]any{"affected": 1})
+	resp.OK(w, r, map[string]any{"Affected": 1})
 }
 
 // HandleAdminFlows GET /api/v1/admin/users/{id}/wallet/flows 查询用户流水。
@@ -615,7 +695,7 @@ func (h *CreditHandler) HandleDevWallet(w http.ResponseWriter, r *http.Request) 
 		writeServiceErr(w, r, err)
 		return
 	}
-	resp.OK(w, r, map[string]any{"balance": bal})
+	resp.OK(w, r, map[string]any{"Balance": bal})
 }
 
 // HandleDevFlows GET /api/v1/dev/wallet/flows 查询本人流水。
@@ -649,5 +729,5 @@ func (h *CreditHandler) respondFlows(w http.ResponseWriter, r *http.Request, use
 			CreatedAt:    f.CreatedAt,
 		})
 	}
-	resp.OK(w, r, map[string]any{"list": items, "total": total, "page": page, "size": size})
+	resp.OK(w, r, map[string]any{"List": items, "Total": total, "Page": page, "Size": size})
 }

@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -325,5 +326,78 @@ func TestWithLogging_RecordsPanicInAccessLog(t *testing.T) {
 	}
 	if panicLog["method"] != http.MethodGet || panicLog["path"] != "/api/v1/boom" {
 		t.Fatalf("panic 日志应含 method/path，实际 method=%v path=%v", panicLog["method"], panicLog["path"])
+	}
+}
+
+// TestReadAuditDetail_PreservesLargeBody 校验 >1MiB 请求体在审计前置读取后仍完整可用
+// （回归：此前只把前 1MiB 回灌，业务侧读到被静默截断的 body）。
+// 说明：超大 body 截断后不是合法 JSON，审计详情允许为空；本用例只断言 body 完整性。
+func TestReadAuditDetail_PreservesLargeBody(t *testing.T) {
+	pad := strings.Repeat("a", (1<<20)+1024)
+	raw := []byte(`{"Amount":42,"Remark":"` + pad + `"}`)
+	r := httptest.NewRequest(http.MethodPost, "/api/v1/admin/users/1/wallet/recharge", bytes.NewReader(raw))
+
+	_ = readAuditDetail(r)
+	got, err := io.ReadAll(r.Body)
+	if err != nil {
+		t.Fatalf("读取回灌 body: %v", err)
+	}
+	if !bytes.Equal(got, raw) {
+		t.Fatalf("请求体被截断：原始 %d 字节，回灌 %d 字节", len(raw), len(got))
+	}
+}
+
+// TestReadAuditDetail_ExtractsAmount 校验正常体积请求体能解析出金额字段，且 body 完整回灌。
+func TestReadAuditDetail_ExtractsAmount(t *testing.T) {
+	raw := []byte(`{"Amount":42,"Reason":"充值"}`)
+	r := httptest.NewRequest(http.MethodPost, "/api/v1/admin/users/1/wallet/recharge", bytes.NewReader(raw))
+
+	detail := readAuditDetail(r)
+	m, ok := detail.(map[string]any)
+	if !ok {
+		t.Fatalf("应解析出金额详情，实际 %#v", detail)
+	}
+	if m["Amount"] != float64(42) {
+		t.Fatalf("Amount 应为 42，实际 %v", m["Amount"])
+	}
+	got, err := io.ReadAll(r.Body)
+	if err != nil {
+		t.Fatalf("读取回灌 body: %v", err)
+	}
+	if !bytes.Equal(got, raw) {
+		t.Fatalf("body 应被完整回灌：%q", got)
+	}
+}
+
+// TestIsSensitiveRead_CoversAdminAndDev 敏感读白名单须同时覆盖管理端与开发端的令牌密钥查看。
+func TestIsSensitiveRead_CoversAdminAndDev(t *testing.T) {
+	cases := []struct {
+		method, path string
+		want         bool
+	}{
+		{http.MethodGet, "/api/v1/admin/tokens/12/secret", true},
+		{http.MethodGet, "/api/v1/dev/tokens/12/secret", true},
+		{http.MethodGet, "/api/v1/dev/tokens", false},
+		{http.MethodPost, "/api/v1/dev/tokens/12/secret", false},
+		{http.MethodGet, "/api/v1/admin/users/12/secret", false},
+	}
+	for _, c := range cases {
+		r := httptest.NewRequest(c.method, c.path, nil)
+		if got := isSensitiveRead(r); got != c.want {
+			t.Errorf("isSensitiveRead(%s %s) = %v, want %v", c.method, c.path, got, c.want)
+		}
+	}
+}
+
+// TestAuditTarget_DevPath 开发端路径也应解析出 target_type/target_id（此前仅支持 admin 前缀）。
+func TestAuditTarget_DevPath(t *testing.T) {
+	mux := http.NewServeMux()
+	var tt, tid string
+	mux.HandleFunc("POST /api/v1/dev/tokens/{id}/rotate", func(w http.ResponseWriter, r *http.Request) {
+		tt, tid = auditTarget(r)
+	})
+	mux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/api/v1/dev/tokens/99/rotate", nil))
+	if tt != "token" || tid != "99" {
+		t.Fatalf("dev 路径解析应为 (token,99)，实际 (%s,%s)", tt, tid)
 	}
 }

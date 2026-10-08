@@ -6,6 +6,11 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// DefaultJWTTTLMinutes 登录令牌默认有效期（分钟）。
+// 单一权威默认值：docker-entrypoint.sh 的 JWT_TTL_MINUTES 默认值、README 环境变量表
+// 与 config.example.yaml 必须与之保持一致，避免生成配置与代码兜底值漂移。
+const DefaultJWTTTLMinutes = 360
+
 type Config struct {
 	Server   ServerConfig   `yaml:"server"`
 	Database DBConfig       `yaml:"database"`
@@ -58,7 +63,7 @@ func Load(path string) (*Config, error) {
 		c.Server.Addr = ":8080"
 	}
 	if c.JWT.TTLMinutes == 0 {
-		c.JWT.TTLMinutes = 720
+		c.JWT.TTLMinutes = DefaultJWTTTLMinutes
 	}
 	if c.Billing.RetryQueuePath == "" {
 		c.Billing.RetryQueuePath = "data/billing_retry.jsonl"

@@ -212,23 +212,30 @@ type HTTPDoer interface {
 	Do(*http.Request) (*http.Response, error)
 }
 
-// PullModel 是上游 /v1/models 返回的单个模型。
-type PullModel struct {
+// pullModel 是上游 /v1/models 返回的单个模型（外部 snake 契约，仅内部解析用）。
+type pullModel struct {
 	ID      string `json:"id"`
 	Object  string `json:"object"`
 	OwnedBy string `json:"owned_by"`
 }
 
+// PullModelView 是返回给前端的模型拉取视图（PascalCase 契约）。
+type PullModelView struct {
+	ID      string `json:"ID"`
+	Object  string `json:"Object"`
+	OwnedBy string `json:"OwnedBy"`
+}
+
 // PullModelsIndex 是 OpenAI-compat /v1/models 的响应外壳。
 type pullModelsIndex struct {
-	Data []PullModel `json:"data"`
+	Data []pullModel `json:"data"`
 }
 
 // PullModels 请求渠道的 base_url + /models 拉取模型列表，供管理员选择填入该渠道的内部模型。
 // 凭据来源为渠道第一个可用密钥（State 非 DISABLED 且明文非空）的 KeyRuntime.CredentialPlain；
 // 无可用密钥 → 50001「暂无可用渠道密钥」；上游 4xx/5xx/网络超时 → 50001（不泄漏上游名）。
 // 此接口只返回列表，不落库。
-func (s *Service) PullModels(ctx context.Context, channelID int64, doer HTTPDoer) ([]PullModel, error) {
+func (s *Service) PullModels(ctx context.Context, channelID int64, doer HTTPDoer) ([]pullModel, error) {
 	if s.mgr == nil {
 		return nil, errInternal()
 	}

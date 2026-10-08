@@ -150,19 +150,18 @@ type KeyRuntime struct {
 	CredentialPlain string   // 解密后的明文凭据（SM4Decrypt 成功才有值；失败置空）
 	Machine         *Machine // 密钥级状态机（阈值与现 buildRuntime 同源：渠道 health_probe/reliability）
 	Limiter         *Limiter // 密钥级限流窗口（渠道 rate_limit 配置）
-	// Reliability 密钥级可靠性窗口：现状包内无独立的 ReliabilityWindow 运行时结构
-	// （窗口语义由 Machine 滑动窗口承载），由 B2 引入独立结构后在此补齐，本任务不发明新结构。
+	// Reliability 密钥级可靠性窗口由 Machine 滑动窗口承载（窗口语义与阈值同源）。
 	lastProbe time.Time
 	CreatedAt time.Time
 }
 
 // KeyRuntimeView 是密钥运行时输出视图：凭据仅暴露尾号，绝不回传明文或密文。
 type KeyRuntimeView struct {
-	KeyID          int64  `json:"key_id"`
-	Name           string `json:"name"`
-	State          State  `json:"state"`
-	LastErr        string `json:"last_err,omitempty"`
-	CredentialTail string `json:"credential_tail,omitempty"` // 解密明文尾号（≤6 位整体脱敏），不含明文/密文
+	KeyID          int64  `json:"KeyID,string"`
+	Name           string `json:"Name"`
+	State          State  `json:"State"`
+	LastErr        string `json:"LastErr,omitempty"`
+	CredentialTail string `json:"CredentialTail,omitempty"` // 解密明文尾号（≤6 位整体脱敏），不含明文/密文
 }
 
 // ModelRuntime 内部模型运行时：与渠道运行时完全同构（状态机/限流器/探测），
@@ -177,38 +176,38 @@ type ModelRuntime struct {
 
 // ChannelView 是 API 输出结构：附当前状态/LastErr/探测时间及有效配置（凭据已收敛到 channel_keys）。
 type ChannelView struct {
-	ID            int64             `json:"id"`
-	Name          string            `json:"name"`
-	Protocol      string            `json:"protocol"`
-	BaseURL       string            `json:"base_url"`
-	Tags          map[string]string `json:"tags"`
-	BoundTags     []TagRef          `json:"bound_tags"`
-	Priority      int               `json:"priority"`
-	Weight        int               `json:"weight"`
-	State         State             `json:"state"`
-	LastErr       string            `json:"last_err,omitempty"`
-	LastProbe     *time.Time        `json:"last_probe,omitempty"`
-	RateLimit     RateLimitConfig   `json:"rate_limit"`
-	HealthProbe   HealthProbeConfig `json:"health_probe"`
-	Reliability   ReliabilityConfig `json:"reliability"`
-	MaxSessions   int               `json:"max_concurrent"`
-	SessionTTLMin int               `json:"session_ttl_minutes"`
-	CreatedAt     time.Time         `json:"created_at"`
-	UpdatedAt     time.Time         `json:"updated_at"`
+	ID            int64             `json:"ID,string"`
+	Name          string            `json:"Name"`
+	Protocol      string            `json:"Protocol"`
+	BaseURL       string            `json:"BaseURL"`
+	Tags          map[string]string `json:"Tags"`
+	BoundTags     []TagRef          `json:"BoundTags"`
+	Priority      int               `json:"Priority"`
+	Weight        int               `json:"Weight"`
+	State         State             `json:"State"`
+	LastErr       string            `json:"LastErr,omitempty"`
+	LastProbe     *time.Time        `json:"LastProbe,omitempty"`
+	RateLimit     RateLimitConfig   `json:"RateLimit"`
+	HealthProbe   HealthProbeConfig `json:"HealthProbe"`
+	Reliability   ReliabilityConfig `json:"Reliability"`
+	MaxSessions   int               `json:"MaxSessions"`
+	SessionTTLMin int               `json:"SessionTTLMin"`
+	CreatedAt     time.Time         `json:"CreatedAt"`
+	UpdatedAt     time.Time         `json:"UpdatedAt"`
 }
 
 // ModelView 是内部模型运行时输出：状态/LastErr/探测时间 + 有效配置。
 type ModelView struct {
-	ID              int64             `json:"id"`
-	InternalModelID string            `json:"internal_model_id"`
-	ExternalModelID int64             `json:"external_model_id"`
-	State           State             `json:"state"`
-	LastErr         string            `json:"last_err,omitempty"`
-	LastProbe       *time.Time        `json:"last_probe,omitempty"`
-	RateLimit       RateLimitConfig   `json:"rate_limit"`
-	HealthProbe     HealthProbeConfig `json:"health_probe"`
-	Reliability     ReliabilityConfig `json:"reliability"`
-	MaxSessions     int               `json:"max_concurrent"`
+	ID              int64             `json:"ID,string"`
+	InternalModelID string            `json:"InternalModelID"`
+	ExternalModelID int64             `json:"ExternalModelID,string"`
+	State           State             `json:"State"`
+	LastErr         string            `json:"LastErr,omitempty"`
+	LastProbe       *time.Time        `json:"LastProbe,omitempty"`
+	RateLimit       RateLimitConfig   `json:"RateLimit"`
+	HealthProbe     HealthProbeConfig `json:"HealthProbe"`
+	Reliability     ReliabilityConfig `json:"Reliability"`
+	MaxSessions     int               `json:"MaxSessions"`
 }
 
 // ProbeRecorder 探测开销记账钩子（装配层注入：以系统身份记入 billing_records）。

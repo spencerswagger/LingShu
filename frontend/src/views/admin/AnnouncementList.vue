@@ -23,9 +23,9 @@ const filters = reactive({
 const displayList = computed(() => {
   const q = filters.q.trim().toLowerCase()
   return list.value.filter((a) => {
-    const hitQ = !q || (a.title || '').toLowerCase().includes(q) || (a.content || '').toLowerCase().includes(q)
-    const hitLv = !filters.level || a.level === filters.level
-    const hitEn = filters.enabled === undefined || String(a.enabled) === filters.enabled
+    const hitQ = !q || (a.Title || '').toLowerCase().includes(q) || (a.Content || '').toLowerCase().includes(q)
+    const hitLv = !filters.level || a.Level === filters.level
+    const hitEn = filters.enabled === undefined || String(a.Enabled) === filters.enabled
     return hitQ && hitLv && hitEn
   })
 })
@@ -41,7 +41,7 @@ async function load() {
   errInfo.value = { message: '', requestId: '' }
   try {
     const res = await listAnnouncements()
-    list.value = res.data.list || []
+    list.value = res.Data.List || []
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
   } finally {
@@ -53,7 +53,7 @@ onMounted(load)
 async function onDelete(row: AdminAnnouncement) {
   try {
     await ElMessageBox.confirm(
-      `确认删除公告「${row.title}」吗？`,
+      `确认删除公告「${row.Title}」吗？`,
       '删除确认',
       { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' },
     )
@@ -61,7 +61,7 @@ async function onDelete(row: AdminAnnouncement) {
     return
   }
   try {
-    await batchDeleteAnnouncements([row.id])
+    await batchDeleteAnnouncements([row.ID])
     ElMessage.success('已删除')
     await load()
   } catch (e: any) {
@@ -71,7 +71,7 @@ async function onDelete(row: AdminAnnouncement) {
 
 async function onBatchDelete() {
   if (!selected.value.length) return
-  const ids = selected.value.map((r) => r.id)
+  const ids = selected.value.map((r) => r.ID)
   try {
     await ElMessageBox.confirm(
       `确认删除选中的 ${ids.length} 条公告吗？`,
@@ -110,9 +110,9 @@ async function onBatchDelete() {
         border
         stripe
         class="table-nowrap clickable-rows"
-        row-key="id"
+        row-key="ID"
         @selection-change="(rows: any[]) => (selected = rows)"
-        @row-click="(row: AdminAnnouncement, _c: unknown, e: Event) => !(e.target as HTMLElement)?.closest('.op-cell') && router.push(`/admin/announcements/${row.id}`)"
+        @row-click="(row: AdminAnnouncement, _c: unknown, e: Event) => !(e.target as HTMLElement)?.closest('.op-cell') && router.push(`/admin/announcements/${row.ID}`)"
       >
         <el-table-column type="selection" width="44" />
         <el-table-column label="标题 / 内容" min-width="240">
@@ -129,8 +129,8 @@ async function onBatchDelete() {
           </template>
           <template #default="{ row }">
             <div class="t-time">
-              <span class="t-date">{{ row.title }}</span>
-              <span class="t-clock ellipsis">{{ row.content || '-' }}</span>
+              <span class="t-date">{{ row.Title }}</span>
+              <span class="t-clock ellipsis">{{ row.Content || '-' }}</span>
             </div>
           </template>
         </el-table-column>
@@ -143,16 +143,16 @@ async function onBatchDelete() {
             </ColumnFilter>
           </template>
           <template #default="{ row }">
-            <el-tag :type="(levelMap[row.level]?.type as any) || 'info'" size="small" effect="light">
-              {{ levelMap[row.level]?.label || row.level }}
+            <el-tag :type="(levelMap[row.Level]?.type as any) || 'info'" size="small" effect="light">
+              {{ levelMap[row.Level]?.label || row.Level }}
             </el-tag>
           </template>
         </el-table-column>
         <el-table-column label="发布 / 过期" min-width="200">
           <template #default="{ row }">
             <div class="t-time">
-              <span class="t-date">{{ row.publish_at || '立即' }}</span>
-              <span class="t-clock">{{ row.expire_at || '永不过期' }}</span>
+              <span class="t-date">{{ row.PublishAt || '立即' }}</span>
+              <span class="t-clock">{{ row.ExpireAt || '永不过期' }}</span>
             </div>
           </template>
         </el-table-column>
@@ -166,8 +166,8 @@ async function onBatchDelete() {
             </ColumnFilter>
           </template>
           <template #default="{ row }">
-            <el-tag :type="row.enabled ? 'success' : 'info'" size="small" effect="plain">
-              {{ row.enabled ? '是' : '否' }}
+            <el-tag :type="row.Enabled ? 'success' : 'info'" size="small" effect="plain">
+              {{ row.Enabled ? '是' : '否' }}
             </el-tag>
           </template>
         </el-table-column>
@@ -175,7 +175,7 @@ async function onBatchDelete() {
           <template #default="{ row }">
             <div class="op-cell" @click.stop>
               <el-tooltip content="编辑" placement="top">
-                <el-icon class="op-icon" @click="router.push(`/admin/announcements/${row.id}`)"><Edit /></el-icon>
+                <el-icon class="op-icon" @click="router.push(`/admin/announcements/${row.ID}`)"><Edit /></el-icon>
               </el-tooltip>
               <el-tooltip content="删除" placement="top">
                 <el-icon class="op-icon danger" @click="onDelete(row)"><Delete /></el-icon>

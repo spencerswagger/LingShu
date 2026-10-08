@@ -2,7 +2,7 @@
 // （五段 rates + 模型级 time_config/context_tiers）。渠道内部模型与成本定价在
 // channel 包（channel_models）管理，此处不涉及。
 //
-// 数据模型对齐 db/migrations/0003_dual_model.sql 中 external_models 表。
+// 数据模型对齐 db/migrations/0001_init.sql 中 external_models 表。
 package model
 
 import (
@@ -17,6 +17,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/team/llmgateway/internal/domain/billing"
+	"github.com/team/llmgateway/internal/pkg/idgen"
 )
 
 // ExternalModel 对应 external_models 表的一行。
@@ -135,10 +136,13 @@ var ErrNameExists = errors.New("external model name already exists")
 
 // Insert 插入对外模型并返回回填主键后的完整记录；external_name 冲突返回 ErrNameExists。
 func (s *Store) Insert(ctx context.Context, m *ExternalModel) (*ExternalModel, error) {
+	if m.ID == 0 {
+		m.ID = idgen.New()
+	}
 	row := s.db.QueryRowContext(ctx,
-		`INSERT INTO external_models(external_name, description, enabled, sale_rates, time_config, context_tiers)
-		 VALUES($1,$2,$3,$4,$5,$6) RETURNING `+cols,
-		m.ExternalName, m.Description, m.Enabled, jsonB(m.SaleRates),
+		`INSERT INTO external_models(id, external_name, description, enabled, sale_rates, time_config, context_tiers)
+		 VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING `+cols,
+		m.ID, m.ExternalName, m.Description, m.Enabled, jsonB(m.SaleRates),
 		nullableJSON(m.TimeConfig), nullableJSON(m.ContextTiers))
 	created, err := scanExternal(row)
 	if err != nil {

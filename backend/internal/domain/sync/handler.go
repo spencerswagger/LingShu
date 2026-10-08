@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/team/llmgateway/internal/pkg/idgen"
 	"github.com/team/llmgateway/internal/pkg/resp"
 )
 
@@ -30,10 +31,10 @@ func errNotFound(msg string) *APIError {
 //
 //   - GET  /api/v1/admin/watchlist
 //   - POST /api/v1/admin/watchlist                     {external_model_id, local_model_name, alert_on_change}
-//   - PUT  /api/v1/admin/watchlist/{id}
+//   - PUT  /api/v1/admin/watchlist                     {external_model_id, local_model_name, alert_on_change}
 //   - POST /api/v1/admin/watchlist/batch-delete        {ids:[]}
 //   - POST /api/v1/admin/sync/run
-//   - GET  /api/v1/admin/sync/alerts                   ?status=
+//   - GET  /api/v1/admin/sync/alerts                   ?Status=
 //   - POST /api/v1/admin/sync/alerts/{id}/resolve
 type Handler struct {
 	svc        *Syncer
@@ -46,18 +47,18 @@ func NewHandler(svc *Syncer, userIDFrom func(ctx context.Context) (int64, bool))
 }
 
 type watchlistInput struct {
-	ExternalModelID string `json:"external_model_id"`
-	LocalModelName  string `json:"local_model_name"`
-	AlertOnChange   *bool  `json:"alert_on_change"`
+	ExternalModelID string `json:"ExternalModelID"`
+	LocalModelName  string `json:"LocalModelName"`
+	AlertOnChange   *bool  `json:"AlertOnChange"`
 }
 
 type watchlistResponse struct {
-	ID              int64   `json:"id"`
-	ExternalModelID string  `json:"external_model_id"`
-	LocalModelName  string  `json:"local_model_name"`
-	AlertOnChange   bool    `json:"alert_on_change"`
-	LastSyncedAt    *string `json:"last_synced_at,omitempty"`
-	CreatedAt       string  `json:"created_at"`
+	ID              int64   `json:"ID,string"`
+	ExternalModelID string  `json:"ExternalModelID"`
+	LocalModelName  string  `json:"LocalModelName"`
+	AlertOnChange   bool    `json:"AlertOnChange"`
+	LastSyncedAt    *string `json:"LastSyncedAt,omitempty"`
+	CreatedAt       string  `json:"CreatedAt"`
 }
 
 func toResponse(it *WatchlistItem) watchlistResponse {
@@ -86,7 +87,7 @@ func (h *Handler) HandleListWatchlist(w http.ResponseWriter, r *http.Request) {
 	for i := range items {
 		list = append(list, toResponse(&items[i]))
 	}
-	resp.OK(w, r, map[string]any{"list": list})
+	resp.OK(w, r, map[string]any{"List": list})
 }
 
 // HandleUpsertWatchlist POST/PUT /api/v1/admin/watchlist（按 external_model_id 幂等）
@@ -112,7 +113,7 @@ func (h *Handler) HandleUpsertWatchlist(w http.ResponseWriter, r *http.Request) 
 }
 
 type batchDeleteRequest struct {
-	IDs []int64 `json:"ids"`
+	IDs idgen.IDs `json:"IDs"`
 }
 
 // HandleBatchDeleteWatchlist POST /api/v1/admin/watchlist/batch-delete
@@ -122,12 +123,12 @@ func (h *Handler) HandleBatchDeleteWatchlist(w http.ResponseWriter, r *http.Requ
 		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "请求体格式错误")
 		return
 	}
-	n, err := h.svc.DeleteWatchlist(r.Context(), req.IDs)
+	n, err := h.svc.DeleteWatchlist(r.Context(), []int64(req.IDs))
 	if err != nil {
 		writeErr(w, r, err)
 		return
 	}
-	resp.OK(w, r, map[string]int64{"deleted": n})
+	resp.OK(w, r, map[string]int64{"Deleted": n})
 }
 
 // HandleRunSync POST /api/v1/admin/sync/run 立即执行一次同步。
@@ -137,22 +138,22 @@ func (h *Handler) HandleRunSync(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, r, err)
 		return
 	}
-	resp.OK(w, r, map[string]string{"summary": summary})
+	resp.OK(w, r, map[string]string{"Summary": summary})
 }
 
 type alertResponse struct {
-	ID              int64             `json:"id"`
-	ExternalModelID string            `json:"external_model_id"`
-	LocalModelName  string            `json:"local_model_name"`
-	Changes         map[string]Change `json:"changes"`
-	Status          string            `json:"status"`
-	DetectedAt      string            `json:"detected_at"`
-	ResolvedAt      *string           `json:"resolved_at,omitempty"`
+	ID              int64             `json:"ID,string"`
+	ExternalModelID string            `json:"ExternalModelID"`
+	LocalModelName  string            `json:"LocalModelName"`
+	Changes         map[string]Change `json:"Changes"`
+	Status          string            `json:"Status"`
+	DetectedAt      string            `json:"DetectedAt"`
+	ResolvedAt      *string           `json:"ResolvedAt,omitempty"`
 }
 
-// HandleListAlerts GET /api/v1/admin/sync/alerts?status=
+// HandleListAlerts GET /api/v1/admin/sync/alerts?Status=
 func (h *Handler) HandleListAlerts(w http.ResponseWriter, r *http.Request) {
-	status := r.URL.Query().Get("status")
+	status := r.URL.Query().Get("Status")
 	if status != "" && status != AlertStatusPending && status != AlertStatusResolved && status != AlertStatusIgnored {
 		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "status 只允许 pending/resolved/ignored")
 		return
@@ -179,7 +180,7 @@ func (h *Handler) HandleListAlerts(w http.ResponseWriter, r *http.Request) {
 		}
 		list = append(list, item)
 	}
-	resp.OK(w, r, map[string]any{"list": list})
+	resp.OK(w, r, map[string]any{"List": list})
 }
 
 // HandleResolveAlert POST /api/v1/admin/sync/alerts/{id}/resolve
@@ -198,7 +199,7 @@ func (h *Handler) HandleResolveAlert(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, r, err)
 		return
 	}
-	resp.OK(w, r, map[string]any{"affected": 1})
+	resp.OK(w, r, map[string]any{"Affected": 1})
 }
 
 func decodeWatchlistBody(w http.ResponseWriter, r *http.Request) (watchlistInput, bool) {

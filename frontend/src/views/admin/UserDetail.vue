@@ -2,7 +2,7 @@
 import { onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Delete, EditPen, Lock } from '@element-plus/icons-vue'
+import { Delete, EditPen, Lock, Unlock } from '@element-plus/icons-vue'
 import {
   getUser,
   listUserFlows,
@@ -10,16 +10,18 @@ import {
   batchDeleteTokens,
   updateUser,
   resetUserPassword,
+  resetUserTotp,
   type AdminUser,
   type AdminToken,
 } from '@/api/admin'
 import type { FlowItem } from '@/api/dev'
+import { fmtDate, fmtTime } from '@/utils/format'
 import ErrorBubble from '@/components/ErrorBubble.vue'
 import WalletChargeDlg from '@/components/WalletChargeDlg.vue'
 
 const route = useRoute()
 const router = useRouter()
-const id = Number(route.params.id)
+const id = String(route.params.id)
 
 const loading = ref(false)
 const user = ref<AdminUser | null>(null)
@@ -55,11 +57,10 @@ async function loadUser() {
   errInfo.value = { message: '', requestId: '' }
   try {
     const res = await getUser(id)
-    user.value = res.data.user
-    balance.value = res.data.wallet?.balance ?? 0
-    // 注意：流水表数据一律由 loadFlows() 从 /users/:id/wallet/flows 获取。
-    // getUser 返回的 recent_flows 字段为后端默认序列化（PascalCase），与表格
-    // 读取的小写字段不一致；且与 loadFlows 并发时会互相覆盖，导致表格空值。
+    user.value = res.Data.User
+    balance.value = res.Data.Wallet?.Balance ?? 0
+    // 流水表数据一律由 loadFlows() 从 /users/:id/wallet/flows 分页获取，
+    // getUser 返回的 recent_flows 仅为最近流水摘要，此处不展示。
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
   } finally {
@@ -70,8 +71,8 @@ async function loadUser() {
 async function loadFlows() {
   try {
     const res = await listUserFlows(id, flowPage.value, flowSize.value)
-    flows.value = res.data.list
-    flowTotal.value = res.data.total
+    flows.value = res.Data.List
+    flowTotal.value = res.Data.Total
   } catch {
     flows.value = []
   }
@@ -80,9 +81,9 @@ async function loadFlows() {
 async function loadTokens() {
   tokenLoading.value = true
   try {
-    const res = await listTokens({ user_id: id, page: tokenPage.value, size: tokenSize.value })
-    tokens.value = res.data.list
-    tokenTotal.value = res.data.total
+    const res = await listTokens({ UserID: id, Page: tokenPage.value, Size: tokenSize.value })
+    tokens.value = res.Data.List
+    tokenTotal.value = res.Data.Total
   } catch {
     tokens.value = []
   } finally {
@@ -97,20 +98,20 @@ onMounted(() => {
 })
 
 // 通用保存：角色/状态/计价模式 hover 修改（PUT 需携带全部字段）
-async function saveAttr(payload: { role?: string; status?: string; pricing_mode?: string }, msg: string) {
+async function saveAttr(payload: { Role?: string; Status?: string; PricingMode?: string }, msg: string) {
   const u = user.value
   if (!u) return
   try {
     const res = await updateUser(u.ID, {
-      role: u.Role,
-      status: u.Status,
-      pricing_mode: u.PricingMode,
-      nickname: u.Nickname || '',
+      Role: u.Role,
+      Status: u.Status,
+      PricingMode: u.PricingMode,
+      Nickname: u.Nickname || '',
       ...payload,
     })
-    if (payload.role) u.Role = res.data.Role ?? payload.role
-    if (payload.status) u.Status = res.data.Status ?? payload.status
-    if (payload.pricing_mode) u.PricingMode = res.data.PricingMode ?? payload.pricing_mode
+    if (payload.Role) u.Role = res.Data.Role ?? payload.Role
+    if (payload.Status) u.Status = res.Data.Status ?? payload.Status
+    if (payload.PricingMode) u.PricingMode = res.Data.PricingMode ?? payload.PricingMode
     ElMessage.success(msg)
   } catch (e: any) {
     ElMessage.error(e?.message || '更新失败')
@@ -130,12 +131,12 @@ async function saveNick() {
   if (!u) return
   try {
     const res = await updateUser(u.ID, {
-      role: u.Role,
-      status: u.Status,
-      pricing_mode: u.PricingMode,
-      nickname: nickDraft.value.trim(),
+      Role: u.Role,
+      Status: u.Status,
+      PricingMode: u.PricingMode,
+      Nickname: nickDraft.value.trim(),
     })
-    u.Nickname = res.data.Nickname ?? nickDraft.value.trim()
+    u.Nickname = res.Data.Nickname ?? nickDraft.value.trim()
     nickEditing.value = false
     ElMessage.success('昵称已更新')
   } catch (e: any) {
@@ -181,19 +182,6 @@ function fmtCredits(n?: number): string {
   if (n == null || isNaN(n)) return '-'
   return n.toLocaleString(undefined, { maximumFractionDigits: 4 })
 }
-// 时间双行
-function fmtDate(iso?: string): string {
-  if (!iso) return '-'
-  const d = new Date(iso)
-  if (isNaN(d.getTime())) return iso
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
-}
-function fmtTime(iso?: string): string {
-  if (!iso) return '-'
-  const d = new Date(iso)
-  if (isNaN(d.getTime())) return '-'
-  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}:${String(d.getSeconds()).padStart(2, '0')}`
-}
 // 流水类型
 const flowType = (t: string) =>
   ({ recharge: { label: '充值', type: 'success' }, consume: { label: '消费', type: 'warning' }, adjust: { label: '差额', type: 'info' }, set: { label: '设置', type: 'primary' } }[t] || { label: t, type: 'info' })
@@ -213,15 +201,15 @@ const FLOW_REMARK_MAP: Record<string, string> = {
   'gateway refund no available channel': '请求失败退回（无可用渠道）',
 }
 function flowRemark(row: FlowItem): string {
-  if (!row.remark) return '-'
-  return FLOW_REMARK_MAP[row.remark] ?? row.remark
+  if (!row.Remark) return '-'
+  return FLOW_REMARK_MAP[row.Remark] ?? row.Remark
 }
 
 // 删除令牌（无单令牌禁用接口，用删除管理即可）
 async function onDelToken(row: AdminToken) {
   try {
     await ElMessageBox.confirm(
-      `确认删除令牌「${row.display_name}」吗？删除后该令牌立即失效。`,
+      `确认删除令牌「${row.DisplayName}」吗？删除后该令牌立即失效。`,
       '删除确认',
       { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' },
     )
@@ -229,11 +217,36 @@ async function onDelToken(row: AdminToken) {
     return
   }
   try {
-    await batchDeleteTokens([row.id])
+    await batchDeleteTokens([row.ID])
     ElMessage.success('已删除')
     await loadTokens()
   } catch (e: any) {
     ElMessage.error(e?.message || '删除失败')
+  }
+}
+
+// 强制解绑 2FA（管理员操作，无需验证码）
+const totpResetLoading = ref(false)
+async function onResetTotp() {
+  const u = user.value
+  if (!u) return
+  try {
+    await ElMessageBox.confirm(
+      `确认强制解绑「${u.Nickname || u.Username}」的两步验证（2FA）吗？解绑后该用户可用密码直接登录。`,
+      '强制解绑 2FA',
+      { type: 'warning', confirmButtonText: '解绑', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  totpResetLoading.value = true
+  try {
+    await resetUserTotp(u.ID)
+    ElMessage.success('已强制解绑两步验证')
+  } catch (e: any) {
+    ElMessage.error(e?.message || '解绑失败')
+  } finally {
+    totpResetLoading.value = false
   }
 }
 </script>
@@ -278,8 +291,8 @@ async function onDelToken(row: AdminToken) {
                     <div class="pop-section">
                       <span class="pop-label">修改角色</span>
                       <div class="pop-actions">
-                        <el-button v-if="user.Role !== 'ADMIN'" size="small" type="danger" plain @click="saveAttr({ role: 'ADMIN' }, '已设为管理员')">管理员</el-button>
-                        <el-button v-if="user.Role !== 'DEVELOPER'" size="small" type="primary" plain @click="saveAttr({ role: 'DEVELOPER' }, '已设为开发者')">开发者</el-button>
+                        <el-button v-if="user.Role !== 'ADMIN'" size="small" type="danger" plain @click="saveAttr({ Role: 'ADMIN' }, '已设为管理员')">管理员</el-button>
+                        <el-button v-if="user.Role !== 'DEVELOPER'" size="small" type="primary" plain @click="saveAttr({ Role: 'DEVELOPER' }, '已设为开发者')">开发者</el-button>
                       </div>
                     </div>
                   </el-popover>
@@ -294,8 +307,8 @@ async function onDelToken(row: AdminToken) {
                     <div class="pop-section">
                       <span class="pop-label">修改状态</span>
                       <div class="pop-actions">
-                        <el-button v-if="user.Status !== 'ACTIVE'" size="small" type="success" plain @click="saveAttr({ status: 'ACTIVE' }, '已启用')">正常</el-button>
-                        <el-button v-if="user.Status !== 'DISABLED'" size="small" type="danger" plain @click="saveAttr({ status: 'DISABLED' }, '已禁用')">禁用</el-button>
+                        <el-button v-if="user.Status !== 'ACTIVE'" size="small" type="success" plain @click="saveAttr({ Status: 'ACTIVE' }, '已启用')">正常</el-button>
+                        <el-button v-if="user.Status !== 'DISABLED'" size="small" type="danger" plain @click="saveAttr({ Status: 'DISABLED' }, '已禁用')">禁用</el-button>
                       </div>
                     </div>
                   </el-popover>
@@ -310,8 +323,8 @@ async function onDelToken(row: AdminToken) {
                     <div class="pop-section">
                       <span class="pop-label">修改计价模式</span>
                       <div class="pop-actions">
-                        <el-button v-if="user.PricingMode !== 'sale'" size="small" type="success" plain @click="saveAttr({ pricing_mode: 'sale' }, '已切换为按售价')">按售价</el-button>
-                        <el-button v-if="user.PricingMode !== 'cost'" size="small" type="warning" plain @click="saveAttr({ pricing_mode: 'cost' }, '已切换为按成本')">按成本</el-button>
+                        <el-button v-if="user.PricingMode !== 'sale'" size="small" type="success" plain @click="saveAttr({ PricingMode: 'sale' }, '已切换为按售价')">按售价</el-button>
+                        <el-button v-if="user.PricingMode !== 'cost'" size="small" type="warning" plain @click="saveAttr({ PricingMode: 'cost' }, '已切换为按成本')">按成本</el-button>
                       </div>
                     </div>
                   </el-popover>
@@ -319,6 +332,9 @@ async function onDelToken(row: AdminToken) {
                 <el-descriptions-item label="操作">
                   <el-tooltip content="重置密码" placement="top">
                     <el-icon class="op-icon" @click="openReset"><Lock /></el-icon>
+                  </el-tooltip>
+                  <el-tooltip content="强制解绑两步验证（2FA）" placement="top">
+                    <el-icon class="op-icon" :class="{ 'is-loading': totpResetLoading }" @click="onResetTotp"><Unlock /></el-icon>
                   </el-tooltip>
                 </el-descriptions-item>
               </el-descriptions>
@@ -344,21 +360,21 @@ async function onDelToken(row: AdminToken) {
                 <el-table-column label="时间" min-width="150">
                   <template #default="{ row }">
                     <div class="t-time">
-                      <span class="t-date">{{ fmtDate(row.created_at) }}</span>
-                      <span class="t-clock">{{ fmtTime(row.created_at) }}</span>
+                      <span class="t-date">{{ fmtDate(row.CreatedAt) }}</span>
+                      <span class="t-clock">{{ fmtTime(row.CreatedAt) }}</span>
                     </div>
                   </template>
                 </el-table-column>
                 <el-table-column label="类型" width="90" align="center">
                   <template #default="{ row }">
-                    <el-tag :type="(flowType(row.type).type as any)" size="small" effect="light">
-                      {{ flowType(row.type).label }}
+                    <el-tag :type="(flowType(row.Type).type as any)" size="small" effect="light">
+                      {{ flowType(row.Type).label }}
                     </el-tag>
                   </template>
                 </el-table-column>
                 <el-table-column label="会话" min-width="140" show-overflow-tooltip>
                   <template #default="{ row }">
-                    <span v-if="row.session_name">{{ row.session_name }}</span>
+                    <span v-if="row.SessionName">{{ row.SessionName }}</span>
                     <span v-else class="t-clock">-</span>
                   </template>
                 </el-table-column>
@@ -368,10 +384,10 @@ async function onDelToken(row: AdminToken) {
                 <el-table-column label="金额" width="140" align="right">
                   <template #default="{ row }">
                     <div class="t-time amount-cell">
-                      <span :class="row.amount >= 0 ? 'pos' : 'neg'">
-                        {{ row.amount >= 0 ? '+' : '' }}{{ fmtCredits(row.amount) }}
+                      <span :class="row.Amount >= 0 ? 'pos' : 'neg'">
+                        {{ row.Amount >= 0 ? '+' : '' }}{{ fmtCredits(row.Amount) }}
                       </span>
-                      <span class="t-clock">余额 {{ fmtCredits(row.balance) }}</span>
+                      <span class="t-clock">余额 {{ fmtCredits(row.Balance) }}</span>
                     </div>
                   </template>
                 </el-table-column>
@@ -392,23 +408,23 @@ async function onDelToken(row: AdminToken) {
             <el-tab-pane label="该用户令牌">
               <div v-loading="tokenLoading">
                 <el-table :data="tokens" border stripe class="table-nowrap">
-                  <el-table-column label="名称" prop="display_name" min-width="130" show-overflow-tooltip />
+                  <el-table-column label="名称" prop="DisplayName" min-width="130" show-overflow-tooltip />
                   <el-table-column label="标识" min-width="180">
                     <template #default="{ row }">
-                      <el-tooltip :content="row.token_display" placement="top">
-                        <span class="mono">{{ row.token_display }}</span>
+                      <el-tooltip :content="row.TokenDisplay" placement="top">
+                        <span class="mono">{{ row.TokenDisplay }}</span>
                       </el-tooltip>
                     </template>
                   </el-table-column>
                   <el-table-column label="状态" width="90" align="center">
                     <template #default="{ row }">
-                      <el-tag :type="row.status === 'ACTIVE' ? 'success' : 'danger'" size="small" effect="light">
-                        {{ row.status === 'ACTIVE' ? '启用' : '禁用' }}
+                      <el-tag :type="row.Status === 'ACTIVE' ? 'success' : 'danger'" size="small" effect="light">
+                        {{ row.Status === 'ACTIVE' ? '启用' : '禁用' }}
                       </el-tag>
                     </template>
                   </el-table-column>
                   <el-table-column label="过期时间" min-width="150">
-                    <template #default="{ row }">{{ row.expires_at || '永不过期' }}</template>
+                    <template #default="{ row }">{{ row.ExpiresAt || '永不过期' }}</template>
                   </el-table-column>
                   <el-table-column label="操作" width="90" align="right" fixed="right">
                     <template #default="{ row }">
@@ -457,7 +473,7 @@ async function onDelToken(row: AdminToken) {
     <!-- 充值弹窗（统一组件） -->
     <WalletChargeDlg
       v-model="chargeDlg"
-      :user-id="user?.ID ?? 0"
+      :user-id="user?.ID ?? ''"
       :username="user?.Username || ''"
       :nickname="user?.Nickname"
       :balance="balance"
@@ -531,6 +547,15 @@ async function onDelToken(row: AdminToken) {
   cursor: pointer;
   color: var(--color-text-secondary);
   transition: color 0.15s;
+}
+.op-icon.is-loading {
+  opacity: 0.5;
+  pointer-events: none;
+  animation: op-spin 1s linear infinite;
+}
+@keyframes op-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
 }
 .op-icon:hover {
   color: var(--brand-primary);

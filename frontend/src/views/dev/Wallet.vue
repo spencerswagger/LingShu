@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { getDevWallet, listDevFlows, type FlowItem } from '@/api/dev'
+import { fmtDate, fmtTime } from '@/utils/format'
 import ErrorBubble from '@/components/ErrorBubble.vue'
 
 const loading = ref(false)
@@ -35,19 +36,6 @@ function fmtCredits(n?: number): string {
   if (n == null || isNaN(n)) return '-'
   return n.toLocaleString(undefined, { maximumFractionDigits: 4 })
 }
-// 时间双行
-function fmtDate(iso?: string): string {
-  if (!iso) return '-'
-  const d = new Date(iso)
-  if (isNaN(d.getTime())) return iso
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
-}
-function fmtTime(iso?: string): string {
-  if (!iso) return '-'
-  const d = new Date(iso)
-  if (isNaN(d.getTime())) return '-'
-  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}:${String(d.getSeconds()).padStart(2, '0')}`
-}
 // 系统生成备注规范化（兼容历史英文与旧中文 remark）。
 const FLOW_REMARK_MAP: Record<string, string> = {
   '实际调用差额': '实际调用差额',
@@ -63,8 +51,8 @@ const FLOW_REMARK_MAP: Record<string, string> = {
   'gateway refund no available channel': '请求失败退回（无可用渠道）',
 }
 function flowRemark(row: FlowItem): string {
-  if (!row.remark) return '-'
-  return FLOW_REMARK_MAP[row.remark] ?? row.remark
+  if (!row.Remark) return '-'
+  return FLOW_REMARK_MAP[row.Remark] ?? row.Remark
 }
 
 async function loadWallet() {
@@ -72,7 +60,7 @@ async function loadWallet() {
   errInfo.value = { message: '', requestId: '' }
   try {
     const res = await getDevWallet()
-    balance.value = res.data.balance
+    balance.value = res.Data.Balance
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
   } finally {
@@ -84,8 +72,8 @@ async function loadFlows() {
   flowsLoading.value = true
   try {
     const res = await listDevFlows(page.value, size.value)
-    flows.value = res.data.list
-    total.value = res.data.total
+    flows.value = res.Data.List
+    total.value = res.Data.Total
   } catch {
     flows.value = []
     total.value = 0
@@ -135,21 +123,21 @@ onMounted(reload)
           <el-table-column label="时间" min-width="150">
             <template #default="{ row }">
               <div class="t-time">
-                <span class="t-date">{{ fmtDate(row.created_at) }}</span>
-                <span class="t-clock">{{ fmtTime(row.created_at) }}</span>
+                <span class="t-date">{{ fmtDate(row.CreatedAt) }}</span>
+                <span class="t-clock">{{ fmtTime(row.CreatedAt) }}</span>
               </div>
             </template>
           </el-table-column>
           <el-table-column label="类型" width="90" align="center">
             <template #default="{ row }">
-              <el-tag :type="(flowType(row.type).type as any)" size="small" effect="light">
-                {{ flowType(row.type).label }}
+              <el-tag :type="(flowType(row.Type).type as any)" size="small" effect="light">
+                {{ flowType(row.Type).label }}
               </el-tag>
             </template>
           </el-table-column>
           <el-table-column label="会话" min-width="140" show-overflow-tooltip>
             <template #default="{ row }">
-              <span v-if="row.session_name">{{ row.session_name }}</span>
+              <span v-if="row.SessionName">{{ row.SessionName }}</span>
               <span v-else class="t-clock">-</span>
             </template>
           </el-table-column>
@@ -159,10 +147,10 @@ onMounted(reload)
           <el-table-column label="金额" width="140" align="right">
             <template #default="{ row }">
               <div class="t-time amount-cell">
-                <span :class="row.amount >= 0 ? 'pos' : 'neg'">
-                  {{ row.amount >= 0 ? '+' : '' }}{{ fmtCredits(row.amount) }}
+                <span :class="row.Amount >= 0 ? 'pos' : 'neg'">
+                  {{ row.Amount >= 0 ? '+' : '' }}{{ fmtCredits(row.Amount) }}
                 </span>
-                <span class="t-clock">余额 {{ fmtCredits(row.balance) }}</span>
+                <span class="t-clock">余额 {{ fmtCredits(row.Balance) }}</span>
               </div>
             </template>
           </el-table-column>

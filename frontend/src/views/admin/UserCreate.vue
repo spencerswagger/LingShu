@@ -25,11 +25,11 @@ async function onSubmit() {
   errInfo.value = { message: '', requestId: '' }
   try {
     await createUser({
-      username: form.username.trim(),
-      password: form.password,
-      nickname: form.nickname.trim(),
-      role: form.role,
-      pricing_mode: form.pricing_mode,
+      Username: form.username.trim(),
+      Password: form.password,
+      Nickname: form.nickname.trim(),
+      Role: form.role,
+      PricingMode: form.pricing_mode,
     })
     ElMessage.success('用户已创建')
     router.push('/admin/users')

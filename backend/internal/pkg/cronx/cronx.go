@@ -20,7 +20,7 @@ type Spec struct {
 	days     []int // 日（1-31）
 	months   []int // 月（1-12）
 	weekdays []int // 周（0-6，0=周日）
-	full     bool   // 是否等价于每秒（* * * * * *）
+	full     bool  // 是否等价于每秒（* * * * * *）
 }
 
 // Parse 解析 6 段 cron 表达式。
@@ -49,7 +49,7 @@ func Parse(expr string) (*Spec, error) {
 		if err != nil {
 			return nil, fmt.Errorf("cron %s段非法: %w", ranges[i].name, err)
 		}
-		if len(set) != (ranges[i].max-ranges[i].min+1) {
+		if len(set) != (ranges[i].max - ranges[i].min + 1) {
 			full = false
 		}
 		sets[i] = set

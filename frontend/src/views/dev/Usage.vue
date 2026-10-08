@@ -8,7 +8,7 @@ const errInfo = ref<{ message: string; requestId: string }>({ message: '', reque
 const list = ref<UsageDay[]>([])
 
 // 柱状图最大刻度，用于相对高度
-const maxCredits = computed(() => Math.max(...list.value.map((d) => d.credits), 1))
+const maxCredits = computed(() => Math.max(...list.value.map((d) => d.Credits), 1))
 
 // 将时间与量格式化展示（tooltip 真实值）
 function toLocal(d: string) {
@@ -20,7 +20,7 @@ async function load() {
   errInfo.value = { message: '', requestId: '' }
   try {
     const res = await getDevUsage(30)
-    list.value = res.data.list
+    list.value = res.Data.List
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
   } finally {
@@ -32,7 +32,7 @@ onMounted(load)
 // 汇总：总积分、总调用量
 const totals = computed(() =>
   list.value.reduce(
-    (acc, d) => ({ credits: acc.credits + d.credits, calls: acc.calls + d.calls }),
+    (acc, d) => ({ credits: acc.credits + d.Credits, calls: acc.calls + d.Calls }),
     { credits: 0, calls: 0 },
   ),
 )
@@ -42,7 +42,7 @@ const labelStep = computed(() => Math.max(1, Math.ceil(list.value.length / 10)))
 
 // 后端会补零返回近 30 天（每天都有条目），因此「有无用量」不能看 list.length，
 // 需判断是否存在真实消耗/调用，否则会渲染出一片空白柱状区 + 密集刻度。
-const hasUsage = computed(() => list.value.some((d) => d.credits > 0 || d.calls > 0))
+const hasUsage = computed(() => list.value.some((d) => d.Credits > 0 || d.Calls > 0))
 </script>
 
 <template>
@@ -59,11 +59,11 @@ const hasUsage = computed(() => list.value.some((d) => d.credits > 0 || d.calls 
 
       <!-- 按日柱状图：简单 div 柱条，避免引入大体积图表依赖 -->
       <div v-if="hasUsage" class="chart">
-        <div v-for="(d, i) in list" :key="i" class="bar-col" :title="`${toLocal(d.date)}：${d.credits.toFixed(2)} 积分 · ${d.calls} 次`">
+        <div v-for="(d, i) in list" :key="i" class="bar-col" :title="`${toLocal(d.Date)}：${d.Credits.toFixed(2)} 积分 · ${d.Calls} 次`">
           <div class="bar-wrap">
-            <div class="bar" :style="{ height: Math.max((d.credits / maxCredits) * 100, d.credits > 0 ? 2 : 0) + '%' }"></div>
+            <div class="bar" :style="{ height: Math.max((d.Credits / maxCredits) * 100, d.Credits > 0 ? 2 : 0) + '%' }"></div>
           </div>
-          <div class="bar-label" :class="{ 'is-hidden': i % labelStep !== 0 }">{{ toLocal(d.date).slice(5) }}</div>
+          <div class="bar-label" :class="{ 'is-hidden': i % labelStep !== 0 }">{{ toLocal(d.Date).slice(5) }}</div>
         </div>
       </div>
 

@@ -35,8 +35,8 @@ func asAPIError(err error) (*APIError, bool) {
 	return ae, ok
 }
 
-const insertChannelSQL = `INSERT INTO channels(name, protocol, base_url, tags, priority, weight, state, rate_limit, health_probe, reliability, session_ttl_minutes)
-		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+const insertChannelSQL = `INSERT INTO channels(id, name, protocol, base_url, tags, priority, weight, state, rate_limit, health_probe, reliability, session_ttl_minutes)
+		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
 		 RETURNING ` + channelCols
 
 func TestService_CreateChannel_Defaults(t *testing.T) {
@@ -53,7 +53,7 @@ func TestService_CreateChannel_Defaults(t *testing.T) {
 
 	mock.ExpectBegin()
 	mock.ExpectQuery(regexp.QuoteMeta(insertChannelSQL)).
-		WithArgs("my-channel", "openai-compat", "https://api.example.com",
+		WithArgs(sqlmock.AnyArg(), "my-channel", "openai-compat", "https://api.example.com",
 			sqlmock.AnyArg(), 100, 1, "NORMAL", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), DefaultSessionTTLMinutes).
 		WillReturnRows(channelRow(&Channel{
 			ID: 1, Name: "my-channel", Protocol: "openai-compat", BaseURL: "https://api.example.com",
@@ -284,7 +284,7 @@ func TestService_ListProbeLogs_AggregatesChannelKeys(t *testing.T) {
 	if len(logs) != 2 {
 		t.Fatalf("合并列表应有 2 条，got %d", len(logs))
 	}
-	if logs[0].ChannelID != 10 || logs[1].ChannelID != 11 {
+	if logs[0].ChannelKeyID != 10 || logs[1].ChannelKeyID != 11 {
 		t.Fatalf("应保留 channel_key_id（按密钥聚合合并）：%+v", logs)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -329,8 +329,8 @@ func TestService_ForceState_BatchKeys(t *testing.T) {
 			}))
 		mock.ExpectExec(regexp.QuoteMeta(`UPDATE channel_keys SET state=$1, last_err=$2, updated_at=now() WHERE id=$3`)).
 			WithArgs(string(StateDisabled), "", k.id).WillReturnResult(sqlmock.NewResult(0, 1))
-		mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO channel_key_events(channel_key_id, from_state, to_state, reason) VALUES($1,$2,$3,$4)`)).
-			WithArgs(k.id, string(StateNormal), string(StateDisabled), "manual_disable").
+		mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO channel_key_events(id, channel_key_id, from_state, to_state, reason) VALUES($1,$2,$3,$4,$5)`)).
+			WithArgs(sqlmock.AnyArg(), k.id, string(StateNormal), string(StateDisabled), "manual_disable").
 			WillReturnResult(sqlmock.NewResult(10, 1))
 		mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + channelKeyCols + ` FROM channel_keys WHERE id=$1 AND deleted_at IS NULL`)).
 			WithArgs(k.id).
@@ -340,9 +340,9 @@ func TestService_ForceState_BatchKeys(t *testing.T) {
 			}))
 	}
 
-	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO channel_events(channel_id, from_state, to_state, reason)
-		 VALUES($1,$2,$3,$4) RETURNING `+eventCols)).
-		WithArgs(int64(1), string(StateNormal), string(StateDisabled), "manual disable").
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO channel_events(id, channel_id, from_state, to_state, reason)
+		 VALUES($1,$2,$3,$4,$5) RETURNING `+eventCols)).
+		WithArgs(sqlmock.AnyArg(), int64(1), string(StateNormal), string(StateDisabled), "manual disable").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "channel_id", "from_state", "to_state", "reason", "created_at"}).
 			AddRow(int64(30), int64(1), string(StateNormal), string(StateDisabled), "manual disable", now))
 
@@ -406,8 +406,8 @@ func TestService_ForceState_BatchKeys_SyncMemory(t *testing.T) {
 			}))
 		mock.ExpectExec(regexp.QuoteMeta(`UPDATE channel_keys SET state=$1, last_err=$2, updated_at=now() WHERE id=$3`)).
 			WithArgs(string(StateDisabled), "", k.id).WillReturnResult(sqlmock.NewResult(0, 1))
-		mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO channel_key_events(channel_key_id, from_state, to_state, reason) VALUES($1,$2,$3,$4)`)).
-			WithArgs(k.id, string(StateNormal), string(StateDisabled), "manual_disable").
+		mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO channel_key_events(id, channel_key_id, from_state, to_state, reason) VALUES($1,$2,$3,$4,$5)`)).
+			WithArgs(sqlmock.AnyArg(), k.id, string(StateNormal), string(StateDisabled), "manual_disable").
 			WillReturnResult(sqlmock.NewResult(10, 1))
 		mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + channelKeyCols + ` FROM channel_keys WHERE id=$1 AND deleted_at IS NULL`)).
 			WithArgs(k.id).
@@ -417,9 +417,9 @@ func TestService_ForceState_BatchKeys_SyncMemory(t *testing.T) {
 			}))
 	}
 
-	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO channel_events(channel_id, from_state, to_state, reason)
-		 VALUES($1,$2,$3,$4) RETURNING `+eventCols)).
-		WithArgs(int64(1), string(StateNormal), string(StateDisabled), "manual disable").
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO channel_events(id, channel_id, from_state, to_state, reason)
+		 VALUES($1,$2,$3,$4,$5) RETURNING `+eventCols)).
+		WithArgs(sqlmock.AnyArg(), int64(1), string(StateNormal), string(StateDisabled), "manual disable").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "channel_id", "from_state", "to_state", "reason", "created_at"}).
 			AddRow(int64(30), int64(1), string(StateNormal), string(StateDisabled), "manual disable", now))
 

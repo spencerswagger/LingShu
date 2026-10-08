@@ -11,6 +11,7 @@ import (
 
 	"github.com/team/llmgateway/internal/domain/billing"
 	"github.com/team/llmgateway/internal/pkg/cronx"
+	"github.com/team/llmgateway/internal/pkg/idgen"
 	"github.com/team/llmgateway/internal/pkg/resp"
 )
 
@@ -66,15 +67,16 @@ func (h *Handler) SetSessionKiller(fn func(keyID int64) int) {
 }
 
 type createChannelRequest struct {
-	Name              string             `json:"name"`
-	Protocol          string             `json:"protocol"`
-	BaseURL           string             `json:"base_url"`
-	TagIDs            []int64            `json:"tag_ids"`
-	Priority          int                `json:"priority"`
-	RateLimit         *RateLimitConfig   `json:"rate_limit"`
-	HealthProbe       *HealthProbeConfig `json:"health_probe"`
-	Reliability       *ReliabilityConfig `json:"reliability"`
-	SessionTTLMinutes int                `json:"session_ttl_minutes"`
+	Name              string             `json:"Name"`
+	Protocol          string             `json:"Protocol"`
+	BaseURL           string             `json:"BaseURL"`
+	TagIDs            idgen.IDs          `json:"TagIDs"`
+	Priority          int                `json:"Priority"`
+	Weight            int                `json:"Weight"`
+	RateLimit         *RateLimitConfig   `json:"RateLimit"`
+	HealthProbe       *HealthProbeConfig `json:"HealthProbe"`
+	Reliability       *ReliabilityConfig `json:"Reliability"`
+	SessionTTLMinutes int                `json:"SessionTTLMinutes"`
 }
 
 func decodeBody(w http.ResponseWriter, r *http.Request, v any) bool {
@@ -94,13 +96,29 @@ func pathID(w http.ResponseWriter, r *http.Request) (int64, bool) {
 	return id, true
 }
 
+// requireKeyOwnership 校验密钥 kid 归属路径中的渠道 channelID（资源-路径一致性）。
+// 不满足返回 404，避免泄露跨渠道密钥的存在性；keyDepsReady 已确保 keySvc 就绪。
+func (h *Handler) requireKeyOwnership(w http.ResponseWriter, r *http.Request, channelID, kid int64) bool {
+	k, err := h.keySvc.Get(r.Context(), kid)
+	if err != nil {
+		writeServiceErr(w, r, err)
+		return false
+	}
+	if k.ChannelID != channelID {
+		writeServiceErr(w, r, errNotFound("密钥不存在"))
+		return false
+	}
+	return true
+}
+
 func toInput(req *createChannelRequest) ChannelInput {
 	return ChannelInput{
 		Name:              req.Name,
 		Protocol:          req.Protocol,
 		BaseURL:           req.BaseURL,
-		TagIDs:            req.TagIDs,
+		TagIDs:            []int64(req.TagIDs),
 		Priority:          req.Priority,
+		Weight:            req.Weight,
 		RateLimit:         req.RateLimit,
 		HealthProbe:       req.HealthProbe,
 		Reliability:       req.Reliability,
@@ -110,8 +128,8 @@ func toInput(req *createChannelRequest) ChannelInput {
 
 // HandleList GET /api/v1/admin/channels
 func (h *Handler) HandleList(w http.ResponseWriter, r *http.Request) {
-	// 可选过滤：?state=NORMAL|DRAIN|DISABLED
-	state := State(r.URL.Query().Get("state"))
+	// 可选过滤：?State=NORMAL|DRAIN|DISABLED
+	state := State(r.URL.Query().Get("State"))
 
 	chs, err := h.svc.ListChannels(r.Context(), state)
 	if err != nil {
@@ -154,7 +172,7 @@ func (h *Handler) HandleUpdate(w http.ResponseWriter, r *http.Request) {
 }
 
 type batchDeleteRequest struct {
-	IDs []int64 `json:"ids"`
+	IDs idgen.IDs `json:"IDs"`
 }
 
 // HandleBatchDelete POST /api/v1/admin/channels/batch-delete
@@ -176,7 +194,7 @@ func (h *Handler) HandleBatchDelete(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	n, err := h.svc.BatchDeleteChannels(r.Context(), req.IDs)
+	n, err := h.svc.BatchDeleteChannels(r.Context(), []int64(req.IDs))
 	if err != nil {
 		writeServiceErr(w, r, err)
 		return
@@ -189,7 +207,7 @@ func (h *Handler) HandleBatchDelete(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	resp.OK(w, r, map[string]int64{"deleted": n})
+	resp.OK(w, r, map[string]int64{"Deleted": n})
 }
 
 // HandleListEvents GET /api/v1/admin/channels/{id}/events
@@ -207,8 +225,8 @@ func (h *Handler) HandleListEvents(w http.ResponseWriter, r *http.Request) {
 }
 
 type stateRequest struct {
-	Action string `json:"action"` // normal | drain | disable
-	Reason string `json:"reason,omitempty"`
+	Action string `json:"Action"` // normal | drain | disable
+	Reason string `json:"Reason,omitempty"`
 }
 
 // HandleState POST /api/v1/admin/channels/{id}/state
@@ -244,20 +262,20 @@ func writeServiceErr(w http.ResponseWriter, r *http.Request, err error) {
 
 // viewChannelModel 是渠道内部模型的对外展示结构（含 JOIN 出的对外模型名与运行态）。
 type viewChannelModel struct {
-	ID              int64                    `json:"id"`
-	ChannelID       int64                    `json:"channel_id"`
-	InternalModelID string                   `json:"internal_model_id"`
-	ExternalModelID int64                    `json:"external_model_id"`
-	ExternalName    string                   `json:"external_name,omitempty"`
-	CostRates       billing.Rates            `json:"cost_rates"`
-	TimeConfig      *billing.TimeCoeffConfig `json:"time_config,omitempty"`
-	ContextTiers    []billing.TierRule       `json:"context_tiers,omitempty"`
-	State           State                    `json:"state"`
-	RateLimit       RateLimitConfig          `json:"rate_limit"`
-	HealthProbe     HealthProbeConfig        `json:"health_probe"`
-	Reliability     ReliabilityConfig        `json:"reliability"`
-	CreatedAt       time.Time                `json:"created_at"`
-	UpdatedAt       time.Time                `json:"updated_at"`
+	ID              int64                    `json:"ID,string"`
+	ChannelID       int64                    `json:"ChannelID,string"`
+	InternalModelID string                   `json:"InternalModelID"`
+	ExternalModelID int64                    `json:"ExternalModelID,string"`
+	ExternalName    string                   `json:"ExternalName,omitempty"`
+	CostRates       billing.WireRates        `json:"CostRates"`
+	TimeConfig      *billing.TimeCoeffConfig `json:"TimeConfig,omitempty"`
+	ContextTiers    []billing.TierRule       `json:"ContextTiers,omitempty"`
+	State           State                    `json:"State"`
+	RateLimit       RateLimitConfig          `json:"RateLimit"`
+	HealthProbe     HealthProbeConfig        `json:"HealthProbe"`
+	Reliability     ReliabilityConfig        `json:"Reliability"`
+	CreatedAt       time.Time                `json:"CreatedAt"`
+	UpdatedAt       time.Time                `json:"UpdatedAt"`
 }
 
 func toChannelModelView(m *ChannelModel) viewChannelModel {
@@ -267,7 +285,7 @@ func toChannelModelView(m *ChannelModel) viewChannelModel {
 		InternalModelID: m.InternalModelID,
 		ExternalModelID: m.ExternalModelID,
 		ExternalName:    m.ExternalName,
-		CostRates:       m.CostRates,
+		CostRates:       billing.WireRates(m.CostRates),
 		TimeConfig:      m.TimeConfig,
 		ContextTiers:    m.ContextTiers,
 		State:           m.State,
@@ -280,21 +298,21 @@ func toChannelModelView(m *ChannelModel) viewChannelModel {
 }
 
 type channelModelRequest struct {
-	InternalModelID string                   `json:"internal_model_id"`
-	ExternalModelID int64                    `json:"external_model_id"`
-	CostRates       billing.Rates            `json:"cost_rates"`
-	TimeConfig      *billing.TimeCoeffConfig `json:"time_config"`
-	ContextTiers    []billing.TierRule       `json:"context_tiers"`
-	RateLimit       *RateLimitConfig         `json:"rate_limit"`
-	HealthProbe     *HealthProbeConfig       `json:"health_probe"`
-	Reliability     *ReliabilityConfig       `json:"reliability"`
+	InternalModelID string                   `json:"InternalModelID"`
+	ExternalModelID int64                    `json:"ExternalModelID,string"`
+	CostRates       billing.WireRates        `json:"CostRates"`
+	TimeConfig      *billing.TimeCoeffConfig `json:"TimeConfig"`
+	ContextTiers    []billing.TierRule       `json:"ContextTiers"`
+	RateLimit       *RateLimitConfig         `json:"RateLimit"`
+	HealthProbe     *HealthProbeConfig       `json:"HealthProbe"`
+	Reliability     *ReliabilityConfig       `json:"Reliability"`
 }
 
 func (req *channelModelRequest) toInput() ChannelModelInput {
 	return ChannelModelInput{
 		InternalModelID: req.InternalModelID,
 		ExternalModelID: req.ExternalModelID,
-		CostRates:       req.CostRates,
+		CostRates:       billing.Rates(req.CostRates),
 		TimeConfig:      req.TimeConfig,
 		ContextTiers:    req.ContextTiers,
 		RateLimit:       req.RateLimit,
@@ -383,18 +401,18 @@ func (h *Handler) HandleDeleteChannelModel(w http.ResponseWriter, r *http.Reques
 		writeServiceErr(w, r, err)
 		return
 	}
-	resp.OK(w, r, map[string]any{"affected": 1})
+	resp.OK(w, r, map[string]any{"Affected": 1})
 }
 
-// HandleCronPreview GET /api/v1/admin/channels/cron-preview?expr=...&limit=5
+// HandleCronPreview GET /api/v1/admin/channels/cron-preview?Expr=...&Limit=5
 // 依据 6 段 cron 表达式计算后续最近几次执行时间，供前端在编辑时预览校验。
 func (h *Handler) HandleCronPreview(w http.ResponseWriter, r *http.Request) {
-	expr := strings.TrimSpace(r.URL.Query().Get("expr"))
+	expr := strings.TrimSpace(r.URL.Query().Get("Expr"))
 	if expr == "" {
 		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "expr 不能为空")
 		return
 	}
-	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	limit, _ := strconv.Atoi(r.URL.Query().Get("Limit"))
 	if limit <= 0 || limit > 10 {
 		limit = 5
 	}
@@ -413,7 +431,7 @@ func (h *Handler) HandleCronPreview(w http.ResponseWriter, r *http.Request) {
 		times = append(times, next.Format(time.RFC3339))
 		after = next
 	}
-	resp.OK(w, r, map[string]any{"times": times})
+	resp.OK(w, r, map[string]any{"Times": times})
 }
 
 // HandlePullModels POST /api/v1/admin/channels/{id}/models/pull
@@ -428,7 +446,11 @@ func (h *Handler) HandlePullModels(w http.ResponseWriter, r *http.Request) {
 		writeServiceErr(w, r, err)
 		return
 	}
-	resp.OK(w, r, map[string]any{"list": models})
+	views := make([]PullModelView, 0, len(models))
+	for _, m := range models {
+		views = append(views, PullModelView{ID: m.ID, Object: m.Object, OwnedBy: m.OwnedBy})
+	}
+	resp.OK(w, r, map[string]any{"List": views})
 }
 
 // HandleModelState PUT/POST /api/v1/admin/channels/{id}/models/{mid}/state
@@ -469,13 +491,13 @@ func (h *Handler) HandleListModelEvents(w http.ResponseWriter, r *http.Request) 
 	resp.OK(w, r, evs)
 }
 
-// HandleListProbeLogs GET /api/v1/admin/channels/{id}/probe-logs?limit=N
+// HandleListProbeLogs GET /api/v1/admin/channels/{id}/probe-logs?Limit=N
 func (h *Handler) HandleListProbeLogs(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathID(w, r)
 	if !ok {
 		return
 	}
-	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	limit, _ := strconv.Atoi(r.URL.Query().Get("Limit"))
 	logs, err := h.svc.ListProbeLogs(r.Context(), id, limit)
 	if err != nil {
 		writeServiceErr(w, r, err)
@@ -486,18 +508,17 @@ func (h *Handler) HandleListProbeLogs(w http.ResponseWriter, r *http.Request) {
 
 // ===== 渠道密钥（channel_keys）管理 =====
 
-// viewChannelKey 密钥管理 API 输出视图：凭据仅暴露明文尾号（KeyViews 已脱敏），
-// ActiveSessions 为密钥活跃会话数（本任务无会话聚合可用，恒 0，F1 接入）。
+// viewChannelKey 密钥管理 API 输出视图：凭据仅暴露明文尾号（KeyViews 已脱敏）。
 type viewChannelKey struct {
-	ID             int64     `json:"id"`
-	ChannelID      int64     `json:"channel_id"`
-	Name           string    `json:"name"`
-	CredentialTail string    `json:"credential_tail"`
-	State          State     `json:"state"`
-	LastErr        string    `json:"last_err,omitempty"`
-	ActiveSessions int       `json:"active_sessions"`
-	CreatedAt      time.Time `json:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	ID             int64     `json:"ID,string"`
+	ChannelID      int64     `json:"ChannelID,string"`
+	Name           string    `json:"Name"`
+	CredentialTail string    `json:"CredentialTail"`
+	State          State     `json:"State"`
+	LastErr        string    `json:"LastErr,omitempty"`
+	ActiveSessions int       `json:"ActiveSessions"`
+	CreatedAt      time.Time `json:"CreatedAt"`
+	UpdatedAt      time.Time `json:"UpdatedAt"`
 }
 
 // toChannelKeyView 以 DB 行为基底、可按运行时视图覆盖状态/尾号/最近错误。
@@ -555,8 +576,8 @@ func pathKeyID(w http.ResponseWriter, r *http.Request) (int64, bool) {
 }
 
 type createChannelKeyRequest struct {
-	Name       string `json:"name"`
-	Credential string `json:"credential"`
+	Name       string `json:"Name"`
+	Credential string `json:"Credential"`
 }
 
 // HandleListKeys GET /api/v1/admin/channels/{id}/keys
@@ -620,7 +641,8 @@ func (h *Handler) HandleCreateKey(w http.ResponseWriter, r *http.Request) {
 // HandleListKeyEvents GET /api/v1/admin/channels/{id}/keys/{kid}/events
 // 查询单个密钥的状态流转记录（channel_key_events，created_at 倒序，默认 50 条）。
 func (h *Handler) HandleListKeyEvents(w http.ResponseWriter, r *http.Request) {
-	if _, ok := pathID(w, r); !ok {
+	channelID, ok := pathID(w, r)
+	if !ok {
 		return
 	}
 	kid, ok := pathKeyID(w, r)
@@ -628,6 +650,9 @@ func (h *Handler) HandleListKeyEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !h.keyDepsReady(w, r) {
+		return
+	}
+	if !h.requireKeyOwnership(w, r, channelID, kid) {
 		return
 	}
 	evs, err := h.keySvc.ListEvents(r.Context(), kid, 50)
@@ -641,7 +666,8 @@ func (h *Handler) HandleListKeyEvents(w http.ResponseWriter, r *http.Request) {
 // HandleUpdateKey PUT /api/v1/admin/channels/{id}/keys/{kid}  {name,credential?}
 // 落库成功后以最新记录重读并 UpsertKey 重建运行时。
 func (h *Handler) HandleUpdateKey(w http.ResponseWriter, r *http.Request) {
-	if _, ok := pathID(w, r); !ok {
+	channelID, ok := pathID(w, r)
+	if !ok {
 		return
 	}
 	kid, ok := pathKeyID(w, r)
@@ -653,6 +679,9 @@ func (h *Handler) HandleUpdateKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !h.keyDepsReady(w, r) {
+		return
+	}
+	if !h.requireKeyOwnership(w, r, channelID, kid) {
 		return
 	}
 	k, err := h.keySvc.Update(r.Context(), kid, req.Name, req.Credential)
@@ -670,7 +699,8 @@ func (h *Handler) HandleUpdateKey(w http.ResponseWriter, r *http.Request) {
 // 软删成功后经 mgr.RemoveKey 立即摘除运行时，并联动清理该密钥全部存活会话
 // （内存+DB：经注入的 SessionRegistry.KillByFilter(channel_key_id=keyID) 踢下线）。
 func (h *Handler) HandleDeleteKey(w http.ResponseWriter, r *http.Request) {
-	if _, ok := pathID(w, r); !ok {
+	channelID, ok := pathID(w, r)
+	if !ok {
 		return
 	}
 	kid, ok := pathKeyID(w, r)
@@ -678,6 +708,9 @@ func (h *Handler) HandleDeleteKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !h.keyDepsReady(w, r) {
+		return
+	}
+	if !h.requireKeyOwnership(w, r, channelID, kid) {
 		return
 	}
 	if err := h.keySvc.Delete(r.Context(), kid); err != nil {
@@ -690,13 +723,14 @@ func (h *Handler) HandleDeleteKey(w http.ResponseWriter, r *http.Request) {
 	if h.killKeySess != nil {
 		h.killKeySess(kid)
 	}
-	resp.OK(w, r, map[string]any{"affected": 1})
+	resp.OK(w, r, map[string]any{"Affected": 1})
 }
 
 // HandleKeyState POST /api/v1/admin/channels/{id}/keys/{kid}/state  {action:normal|drain|disable|recover}
 // KeyService.ForceState 落库 + 写 channel_key_events；mgr.ManualSetKeyState 同步内存运行时（解决审查 BLOCK3 的单点场景）。
 func (h *Handler) HandleKeyState(w http.ResponseWriter, r *http.Request) {
-	if _, ok := pathID(w, r); !ok {
+	channelID, ok := pathID(w, r)
+	if !ok {
 		return
 	}
 	kid, ok := pathKeyID(w, r)
@@ -708,6 +742,9 @@ func (h *Handler) HandleKeyState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !h.keyDepsReady(w, r) {
+		return
+	}
+	if !h.requireKeyOwnership(w, r, channelID, kid) {
 		return
 	}
 	k, err := h.keySvc.ForceState(r.Context(), kid, req.Action)

@@ -8,10 +8,10 @@ import (
 )
 
 type Body struct {
-	Code      int         `json:"code"`
-	Message   string      `json:"message"`
-	RequestID string      `json:"request_id"`
-	Data      interface{} `json:"data,omitempty"`
+	Code      int         `json:"Code"`
+	Message   string      `json:"Message"`
+	RequestID string      `json:"RequestID"`
+	Data      interface{} `json:"Data,omitempty"`
 }
 
 // 统一业务错误码

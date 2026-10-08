@@ -8,11 +8,12 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/team/llmgateway/internal/domain/identity"
 	"github.com/team/llmgateway/internal/pkg/crypto"
+	"github.com/team/llmgateway/internal/pkg/idgen"
 )
 
 const (
@@ -95,13 +96,13 @@ func seedSystem(ctx context.Context, db *sql.DB) error {
 	}
 	// 系统密钥（探测账单中的 token 归属）
 	if _, err := db.ExecContext(ctx,
-		`INSERT INTO tokens(token_hash, token_display, user_id, display_name, status)
-		 VALUES ($1, $2, $3, $4, 'ACTIVE')
+		`INSERT INTO tokens(id, token_hash, token_display, user_id, display_name, status)
+		 VALUES ($1, $2, $3, $4, $5, 'ACTIVE')
 		 ON CONFLICT DO NOTHING`,
-		"system-probe-hash", "sk-gw-system-probe", u.ID, systemTokenName); err != nil {
+		idgen.New(), "system-probe-hash", "sk-gw-system-probe", u.ID, systemTokenName); err != nil {
 		return fmt.Errorf("seed system token: %w", err)
 	}
-	log.Printf("[seed] 系统探测身份就绪 username=%s token=%s", systemUsername, systemTokenName)
+	slog.Info("系统探测身份就绪", "username", systemUsername, "token", systemTokenName)
 	return nil
 }
 
@@ -161,7 +162,7 @@ func seedAdmin(ctx context.Context, db *sql.DB) error {
 	if err := store.EnsureWallet(ctx, created.ID); err != nil {
 		return err
 	}
-	log.Printf("[seed] 已创建初始管理员账户 username=%s，请尽快登录并修改默认口令", defaultAdminUsername)
+	slog.Info("已创建初始管理员账户，请尽快登录并修改默认口令", "username", defaultAdminUsername)
 	return nil
 }
 

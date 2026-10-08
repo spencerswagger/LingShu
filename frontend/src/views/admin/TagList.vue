@@ -32,7 +32,7 @@ async function load() {
   errInfo.value = { message: '', requestId: '' }
   try {
     const res = await listTags()
-    list.value = res.data || []
+    list.value = res.Data || []
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
   } finally {
@@ -92,10 +92,10 @@ async function onBatchDelete() {
 async function onToggle(row: AdminTag) {
   try {
     await updateTag(row.ID, {
-      name: row.Name,
-      description: row.Description,
-      kv_pairs: row.KVPairs,
-      enabled: !row.Enabled,
+      Name: row.Name,
+      Description: row.Description,
+      KVPairs: row.KVPairs,
+      Enabled: !row.Enabled,
     })
     row.Enabled = !row.Enabled
     ElMessage.success(row.Enabled ? '已启用' : '已停用')

@@ -34,22 +34,22 @@ async function onLogin() {
   try {
     // 登录成功后由后端决角色，前端不提供选择
     const res = await login(form.username, form.password)
-    const d = res.data
+    const d = res.Data
     // 已开两步验证：进入第二步（不发 token）
-    if (d.need_totp && d.preauth_token) {
+    if (d.NeedTOTP && d.PreAuthToken) {
       step.value = 'totp'
-      preauthToken.value = d.preauth_token
-      mustChange.value = !!d.must_change_password
+      preauthToken.value = d.PreAuthToken
+      mustChange.value = !!d.MustChangePassword
       return
     }
-    const { token, user } = d
-    auth.setAuth(token!, user!.Role, user!.Username, !!d.must_change_password, !!d.totp_enabled)
+    const { Token, User } = d
+    auth.setAuth(Token!, User!.Role, User!.Username, !!d.MustChangePassword, !!d.TotpEnabled)
     ElMessage.success('登录成功')
-    if (d.must_change_password) {
+    if (d.MustChangePassword) {
       router.push('/change-password')
       return
     }
-    router.push(safeRedirect(route.query.redirect) || (user!.Role === 'ADMIN' ? '/admin' : '/dev'))
+    router.push(safeRedirect(route.query.redirect) || (User!.Role === 'ADMIN' ? '/admin' : '/dev'))
   } catch (e: any) {
     errMsg.value = e?.message || '登录失败'
     errReqId.value = e?.requestId || ''
@@ -64,14 +64,14 @@ async function onLoginTotp() {
   loading.value = true
   try {
     const res = await loginTotp(preauthToken.value, totpCode.value)
-    const d = res.data
-    auth.setAuth(d.token!, d.user!.Role, d.user!.Username, !!d.must_change_password, !!d.totp_enabled)
+    const d = res.Data
+    auth.setAuth(d.Token!, d.User!.Role, d.User!.Username, !!d.MustChangePassword, !!d.TotpEnabled)
     ElMessage.success('登录成功')
-    if (d.must_change_password) {
+    if (d.MustChangePassword) {
       router.push('/change-password')
       return
     }
-    router.push(safeRedirect(route.query.redirect) || (d.user!.Role === 'ADMIN' ? '/admin' : '/dev'))
+    router.push(safeRedirect(route.query.redirect) || (d.User!.Role === 'ADMIN' ? '/admin' : '/dev'))
   } catch (e: any) {
     errMsg.value = e?.message || '验证失败'
     errReqId.value = e?.requestId || ''

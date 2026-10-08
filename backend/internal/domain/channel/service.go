@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/team/llmgateway/internal/pkg/idgen"
 	"github.com/team/llmgateway/internal/pkg/resp"
 )
 
@@ -167,7 +168,7 @@ func (s *Service) CreateChannel(ctx context.Context, in ChannelInput) (*Channel,
 		}
 		return nil, fmt.Errorf("create channel: %w", err)
 	}
-	created.TagIDs = in.TagIDs
+	created.TagIDs = idgen.IDs(in.TagIDs)
 	created.BoundTags = resolved
 
 	if s.mgr != nil {
@@ -246,7 +247,7 @@ func (s *Service) UpdateChannel(ctx context.Context, id int64, in ChannelInput) 
 		}
 		return nil, fmt.Errorf("update channel: %w", err)
 	}
-	c.TagIDs = in.TagIDs
+	c.TagIDs = idgen.IDs(in.TagIDs)
 	c.BoundTags = resolved
 
 	if s.mgr != nil {
@@ -287,7 +288,7 @@ func (s *Service) ListChannels(ctx context.Context, state State) ([]Channel, err
 		for i := range chs {
 			r := refs[chs[i].ID]
 			chs[i].BoundTags = r
-			chs[i].TagIDs = make([]int64, 0, len(r))
+			chs[i].TagIDs = make(idgen.IDs, 0, len(r))
 			for _, tr := range r {
 				chs[i].TagIDs = append(chs[i].TagIDs, tr.ID)
 			}

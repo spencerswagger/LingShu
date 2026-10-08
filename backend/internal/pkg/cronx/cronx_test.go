@@ -31,10 +31,10 @@ func TestParseValid(t *testing.T) {
 
 func TestParseInvalid(t *testing.T) {
 	for _, expr := range []string{
-		"* * * * *",     // 5 段
-		"60 * * * * *",  // 秒越界
-		"* * * 0 * *",   // 日越界
-		"a * * * * *",   // 非数字
+		"* * * * *",    // 5 段
+		"60 * * * * *", // 秒越界
+		"* * * 0 * *",  // 日越界
+		"a * * * * *",  // 非数字
 	} {
 		if _, err := Parse(expr); err == nil {
 			t.Fatalf("expected %q invalid", expr)

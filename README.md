@@ -87,7 +87,7 @@ docker compose up -d --build
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | `llmgw` | 数据库账号与库名 |
 | `SM4_KEY` | 空（自动生成） | 32 位 hex；如需固定密钥（多环境共用渠道凭据）可显式指定 |
 | `TZ` | `Asia/Shanghai` | 计费时段系数按时区计算 |
-| `JWT_TTL_MINUTES` | `720` | 登录令牌有效期 |
+| `JWT_TTL_MINUTES` | `360` | 登录令牌有效期（分钟） |
 | `SYNC_INTERVAL_MINUTES` | `60` | 外部价格源同步周期 |
 | `TRUSTED_PROXY_CIDRS` | `172.16.0.0/12`（compose 内设定） | 可信代理网段（逗号分隔 CIDR）。仅当直连对端属于这些网段时才采信 `X-Real-IP`，用于登录限流与审计的客户端 IP。**代码默认只信任回环**；若实际 Docker 网络不在默认段（可用 `docker network inspect <项目>_default` 查看），必须显式配置，否则审计 IP 会退化为 nginx 容器 IP、限流的 IP 维度也会退化。启动日志会打印生效网段 |
 
@@ -129,9 +129,10 @@ docker compose down -v           # 停止并删除数据卷（含数据库与密
    # 按需编辑 backend/config.yaml 的 database.dsn
    ```
 
-   > **`security.sm4_key` 必填**：渠道凭据用 SM4 加密落库，服务启动时若该密钥缺失或非法会直接退出（不会回退到内置默认值）。
-   > `config.example.yaml` 自带一个**本地开发默认值**（`0123456789abcdef`），方便 `cp` 后即可本地跑；
-   > **生产环境务必用 `openssl rand -hex 16` 生成强随机密钥后替换**。
+   > **`security.sm4_key` 渠道凭据加密密钥**（32 位 hex，16 字节）：**留空即自动生成**——启动时从
+   > `keys/sm4.key` 读取；文件不存在则生成强随机密钥并写入该文件（`chmod 600`），后续重启复用。
+   > 因此**不提供公开默认密钥**，也无需为本地开发手工填值。
+   > 若多环境需共用同一密钥（例如共享已加密的渠道凭据），用 `openssl rand -hex 16` 生成后显式配置。
 
 4. **执行迁移**：`make migrate`
 

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/team/llmgateway/internal/pkg/idgen"
 	"github.com/team/llmgateway/internal/pkg/resp"
 )
 
@@ -25,10 +26,10 @@ func NewHandler(svc *Service) *Handler {
 }
 
 type createTagRequest struct {
-	Name        string            `json:"name"`
-	Description string            `json:"description"`
-	KVPairs     map[string]string `json:"kv_pairs"`
-	Enabled     *bool             `json:"enabled"`
+	Name        string            `json:"Name"`
+	Description string            `json:"Description"`
+	KVPairs     map[string]string `json:"KVPairs"`
+	Enabled     *bool             `json:"Enabled"`
 }
 
 func decodeBody(w http.ResponseWriter, r *http.Request, v any) bool {
@@ -48,10 +49,10 @@ func pathID(w http.ResponseWriter, r *http.Request) (int64, bool) {
 	return id, true
 }
 
-// HandleList GET /api/v1/admin/tags（可选 ?enabled=true|false）
+// HandleList GET /api/v1/admin/tags（可选 ?Enabled=true|false）
 func (h *Handler) HandleList(w http.ResponseWriter, r *http.Request) {
 	var enabled *bool
-	if v := r.URL.Query().Get("enabled"); v != "" {
+	if v := r.URL.Query().Get("Enabled"); v != "" {
 		b := v == "true"
 		enabled = &b
 	}
@@ -97,7 +98,7 @@ func (h *Handler) HandleUpdate(w http.ResponseWriter, r *http.Request) {
 }
 
 type batchDeleteRequest struct {
-	IDs []int64 `json:"ids"`
+	IDs idgen.IDs `json:"IDs"`
 }
 
 // HandleBatchDelete POST /api/v1/admin/tags/batch-delete
@@ -106,12 +107,12 @@ func (h *Handler) HandleBatchDelete(w http.ResponseWriter, r *http.Request) {
 	if !decodeBody(w, r, &req) {
 		return
 	}
-	n, err := h.svc.BatchDeleteTags(r.Context(), req.IDs)
+	n, err := h.svc.BatchDeleteTags(r.Context(), []int64(req.IDs))
 	if err != nil {
 		writeServiceErr(w, r, err)
 		return
 	}
-	resp.OK(w, r, map[string]int64{"deleted": n})
+	resp.OK(w, r, map[string]int64{"Deleted": n})
 }
 
 func toInput(req *createTagRequest) TagInput {

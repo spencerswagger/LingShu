@@ -42,13 +42,13 @@ func attachTestSession(t *testing.T, reg *router.SessionRegistry, id string, use
 
 // sessionListBody 会话列表响应结构。
 type sessionListBody struct {
-	Code int `json:"code"`
+	Code int `json:"Code"`
 	Data struct {
-		List  []sessionListItem `json:"list"`
-		Total int               `json:"total"`
-		Page  int               `json:"page"`
-		Size  int               `json:"size"`
-	} `json:"data"`
+		List  []sessionListItem `json:"List"`
+		Total int               `json:"Total"`
+		Page  int               `json:"Page"`
+		Size  int               `json:"Size"`
+	} `json:"Data"`
 }
 
 // TestHandleListSessions_FilterAndNames 断言用户/令牌过滤 + user/token/key 名称批量反查 + expired 标记。
@@ -81,7 +81,7 @@ func TestHandleListSessions_FilterAndNames(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"id", "display_name"}).
 			AddRow(int64(10), "tok-a").AddRow(int64(20), "tok-b"))
 
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/sessions?user_id=1&expired=all", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/sessions?UserID=1&Expired=all", nil)
 	rec := httptest.NewRecorder()
 	admin.HandleListSessions(rec, req)
 
@@ -132,14 +132,14 @@ func TestHandleListSessions_ExpiredFilter(t *testing.T) {
 		query string
 		total int
 	}{
-		{"/api/v1/admin/sessions?expired=active", 2},
-		{"/api/v1/admin/sessions?expired=expired", 2},
-		{"/api/v1/admin/sessions?expired=all", 4},
+		{"/api/v1/admin/sessions?Expired=active", 2},
+		{"/api/v1/admin/sessions?Expired=expired", 2},
+		{"/api/v1/admin/sessions?Expired=all", 4},
 		{"/api/v1/admin/sessions", 4},
-		{"/api/v1/admin/sessions?channel_key_id=100", 2},
-		{"/api/v1/admin/sessions?q=alpha", 2},
-		{"/api/v1/admin/sessions?user_id=2&token_id=40", 1},
-		{"/api/v1/admin/sessions?channel_key_id=101&expired=expired", 1},
+		{"/api/v1/admin/sessions?ChannelKeyID=100", 2},
+		{"/api/v1/admin/sessions?Q=alpha", 2},
+		{"/api/v1/admin/sessions?UserID=2&TokenID=40", 1},
+		{"/api/v1/admin/sessions?ChannelKeyID=101&Expired=expired", 1},
 	}
 	for _, c := range cases {
 		rec := httptest.NewRecorder()
@@ -169,7 +169,7 @@ func TestHandleListSessions_Pagination(t *testing.T) {
 	}
 
 	rec := httptest.NewRecorder()
-	admin.HandleListSessions(rec, httptest.NewRequest(http.MethodGet, "/api/v1/admin/sessions?page=2&size=1", nil))
+	admin.HandleListSessions(rec, httptest.NewRequest(http.MethodGet, "/api/v1/admin/sessions?Page=2&Size=1", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d; body=%s", rec.Code, rec.Body.String())
 	}
@@ -205,8 +205,8 @@ func TestHandleKickSessions(t *testing.T) {
 		}
 		var res struct {
 			Data struct {
-				Affected int `json:"affected"`
-			} `json:"data"`
+				Affected int `json:"Affected"`
+			} `json:"Data"`
 		}
 		if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
 			t.Fatalf("unmarshal: %v", err)
@@ -215,19 +215,19 @@ func TestHandleKickSessions(t *testing.T) {
 	}
 
 	// 组合：session_ids（k1 + 不存在）先杀，随后 user_id=1 过滤再杀 k3；k1 不重复计数。
-	if got := post(t, `{"session_ids":["k1","not-exist"],"user_id":1}`); got != 2 {
+	if got := post(t, `{"SessionIDs":["k1","not-exist"],"UserID":"1"}`); got != 2 {
 		t.Fatalf("affected want 2, got %d", got)
 	}
 	// AND：user 1 + token 20 无人同时满足。
-	if got := post(t, `{"user_id":1,"token_id":20}`); got != 0 {
+	if got := post(t, `{"UserID":"1","TokenID":"20"}`); got != 0 {
 		t.Fatalf("AND affected want 0, got %d", got)
 	}
 	// 单维度：渠道密钥 100 + 用户 2。
-	if got := post(t, `{"user_id":2,"channel_key_id":100}`); got != 1 {
+	if got := post(t, `{"UserID":"2","ChannelKeyID":"100"}`); got != 1 {
 		t.Fatalf("affected want 1, got %d", got)
 	}
 	// session_ids 单维度。
-	if got := post(t, `{"session_ids":["k4"]}`); got != 1 {
+	if got := post(t, `{"SessionIDs":["k4"]}`); got != 1 {
 		t.Fatalf("affected want 1, got %d", got)
 	}
 

@@ -305,12 +305,12 @@ func (m *Manager) feedKeyAndTransit(keyID int64, fb Feedback) {
 }
 
 // recordProbe 落库探测记录（密钥维度）并触发记账钩子（系统身份，见装配层）；两者失败仅记日志。
-// 注：ProbeLog.ChannelID 字段本阶段暂存 channel_key_id（密钥维度）；INSERT 列名已对齐 probe_logs.channel_key_id。
+// ProbeLog.ChannelKeyID 对应 probe_logs.channel_key_id（密钥维度）。
 func (m *Manager) recordProbe(ctx context.Context, keyID int64, modelID, level, target string, ok bool, errMsg string, usage ProbeUsage, durationMS int64) {
 	if m.cmStore != nil {
 		pctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		if err := m.cmStore.InsertProbeLog(pctx, &ProbeLog{
-			ChannelID:    keyID, // 暂存 keyID（C1 起改为独立 ChannelKeyID 字段）
+			ChannelKeyID: keyID,
 			ModelID:      modelID,
 			Level:        level,
 			Target:       target,

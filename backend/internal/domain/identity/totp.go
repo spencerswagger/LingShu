@@ -21,13 +21,17 @@ const (
 	totpIssuer  = "llmgateway"
 	preAuthTTL  = 5 * time.Minute
 	recoveryNum = 10
+	// maxPreAuthEntries PreAuthStore 内存条数上限：达上限时淘汰最旧条目（而非拒绝签发），防无限增长。
+	maxPreAuthEntries = 10000
 )
 
 // PreAuthStore 进程内一次性登录预授权（2FA 第一步产物）。
 type PreAuthStore struct {
-	mu  chan struct{}
-	m   map[string]preAuthEntry
-	now func() time.Time
+	mu chan struct{}
+	m  map[string]preAuthEntry
+	// byUser 记录每用户当前有效的 token，实现「同一用户仅保留最新一个」。
+	byUser map[int64]string
+	now    func() time.Time
 }
 
 type preAuthEntry struct {
@@ -36,33 +40,103 @@ type preAuthEntry struct {
 }
 
 func NewPreAuthStore() *PreAuthStore {
-	return &PreAuthStore{mu: make(chan struct{}, 1), m: map[string]preAuthEntry{}, now: time.Now}
+	return &PreAuthStore{
+		mu:     make(chan struct{}, 1),
+		m:      map[string]preAuthEntry{},
+		byUser: map[int64]string{},
+		now:    time.Now,
+	}
 }
 
 // Issue 签发一次性 preauth token（5 分钟有效）。
-func (p *PreAuthStore) Issue(userID int64) string {
+// 同一用户仅保留最新一个 token（签发即作废旧 token）；存储达上限时淘汰最旧条目
+// 而非拒绝签发——避免攻击者灌满存储导致全体 2FA 用户第二步登录失败（DoS）。
+func (p *PreAuthStore) Issue(userID int64) (string, bool) {
 	b := make([]byte, 24)
-	_, _ = rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		return "", false
+	}
 	tok := hex.EncodeToString(b)
 	p.mu <- struct{}{}
-	p.m[tok] = preAuthEntry{userID: userID, exp: p.now().Add(preAuthTTL)}
-	<-p.mu
-	return tok
+	defer func() { <-p.mu }()
+	now := p.now()
+	p.pruneLocked(now)
+	if old, ok := p.byUser[userID]; ok {
+		p.removeLocked(old)
+	}
+	if len(p.m) >= maxPreAuthEntries {
+		p.evictOldestLocked()
+	}
+	p.m[tok] = preAuthEntry{userID: userID, exp: now.Add(preAuthTTL)}
+	p.byUser[userID] = tok
+	return tok, true
+}
+
+// Peek 只读校验 preauth token：命中且未过期返回 userID，但不删除。
+// 供「第二步限流 + 校验通过后再消费」的顺序使用：失败/限流时不销毁会话，允许重试。
+func (p *PreAuthStore) Peek(token string) (int64, bool) {
+	p.mu <- struct{}{}
+	defer func() { <-p.mu }()
+	now := p.now()
+	p.pruneLocked(now)
+	e, ok := p.m[token]
+	if !ok || now.After(e.exp) {
+		return 0, false
+	}
+	return e.userID, true
 }
 
 // Consume 消费一次性 preauth token，成功返回 userID 并删除。
 func (p *PreAuthStore) Consume(token string) (int64, bool) {
 	p.mu <- struct{}{}
 	defer func() { <-p.mu }()
+	now := p.now()
+	p.pruneLocked(now)
 	e, ok := p.m[token]
 	if !ok {
 		return 0, false
 	}
-	delete(p.m, token)
-	if p.now().After(e.exp) {
+	p.removeLocked(token)
+	if now.After(e.exp) {
 		return 0, false
 	}
 	return e.userID, true
+}
+
+// pruneLocked 惰性清理已过期条目，防止 TTL 只在校验时判定导致的内存无限增长。
+// 必须在持锁下调用。
+func (p *PreAuthStore) pruneLocked(now time.Time) {
+	for k, e := range p.m {
+		if now.After(e.exp) {
+			p.removeLocked(k)
+		}
+	}
+}
+
+// evictOldestLocked 淘汰最早过期（即最早签发）的一条，为新签发腾位。必须在持锁下调用。
+func (p *PreAuthStore) evictOldestLocked() {
+	oldestKey := ""
+	var oldestExp time.Time
+	for k, e := range p.m {
+		if oldestKey == "" || e.exp.Before(oldestExp) {
+			oldestKey, oldestExp = k, e.exp
+		}
+	}
+	if oldestKey != "" {
+		p.removeLocked(oldestKey)
+	}
+}
+
+// removeLocked 删除一条 token 并同步清理 byUser 反查。必须在持锁下调用。
+func (p *PreAuthStore) removeLocked(token string) {
+	e, ok := p.m[token]
+	if !ok {
+		return
+	}
+	delete(p.m, token)
+	if p.byUser[e.userID] == token {
+		delete(p.byUser, e.userID)
+	}
 }
 
 // TOTPService 负责 TOTP 绑定/确认/解绑/校验与恢复码。
@@ -196,7 +270,14 @@ func (s *TOTPService) verify(ctx context.Context, userID int64, code string, con
 	for i, h := range hashes {
 		if h == codeHash {
 			hashes = append(hashes[:i], hashes[i+1:]...)
-			_ = s.store.SetRecoveryHashes(ctx, userID, hashes)
+			if err := s.store.SetRecoveryHashes(ctx, userID, hashes); err != nil {
+				// 消费失败则该恢复码未被作废（防重放 fail-open）：必须留痕告警，
+				// 否则同一恢复码可被重复使用且无人察觉。
+				slog.ErrorContext(ctx, "consume recovery code failed, replay protection degraded",
+					"user_id", userID, "err", err)
+				s.auditLog(ctx, audit.Entry{UserID: userID, Action: "totp.recovery.consume_fail",
+					TargetType: "user", TargetID: strconv.FormatInt(userID, 10)})
+			}
 			return true, nil
 		}
 	}
