@@ -1,0 +1,104 @@
+# 构建前后端应用镜像并推送至阿里云容器镜像服务 ACR。
+#
+# 触发方式：
+#   - push 到 main          → 推送 <short-sha> 与 latest 两个标签
+#   - push tag vX.Y.Z(*)    → 推送版本号标签（预发布 tag 如 v0.1.0-rc1 不推送 latest）
+#   - 手动 workflow_dispatch → 只推 <short-sha>
+#
+# 依赖的仓库 Secrets（Settings → Secrets and variables → Actions）：
+#   DOCKER_USERNAME  ACR 登录用户名
+#   DOCKER_PASSWORD  ACR 登录密码（访问凭证 / 固定密码）
+# 未配置时自动降级为「只构建、不推送」，流水线不会因此失败。
+#
+# 镜像地址：<REGISTRY>/<NAMESPACE>/lingshu-{backend,web}:<tag>
+# 如需换仓库/命名空间，改下方 env 即可。
+name: Build & Push Images
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: registry.cn-hangzhou.aliyuncs.com
+  NAMESPACE: spencerswagger
+  PLATFORMS: linux/amd64
+
+jobs:
+  build:
+    name: ${{ matrix.name }} image
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: backend
+            context: ./backend
+            image: lingshu-backend
+          - name: web
+            context: ./frontend
+            image: lingshu-web
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Resolve image tags
+        id: tags
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            case "$GITHUB_REF_NAME" in
+              *-*) echo "list=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT" ;;        # 预发布 tag：不打 latest
+              *)   echo "list=$GITHUB_REF_NAME latest" >> "$GITHUB_OUTPUT" ;;
+            esac
+          else
+            echo "list=${GITHUB_SHA::8} latest" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Login to ACR (skipped when credentials are absent)
+        id: login
+        env:
+          USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          if [ -z "$USERNAME" ] || [ -z "$PASSWORD" ]; then
+            echo "::warning::未配置 DOCKER_USERNAME / DOCKER_PASSWORD，本次只构建、不推送镜像"
+            echo "push=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "$PASSWORD" | docker login "$REGISTRY" -u "$USERNAME" --password-stdin
+          echo "push=true" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        env:
+          PUSH: ${{ steps.login.outputs.push }}
+          TAGS: ${{ steps.tags.outputs.list }}
+          CONTEXT: ${{ matrix.context }}
+        run: |
+          set -euo pipefail
+          IMAGE="$REGISTRY/$NAMESPACE/${{ matrix.image }}"
+
+          args=(--platform "$PLATFORMS" --provenance=false --sbom=false)
+          tagargs=()
+          for t in $TAGS; do
+            tagargs+=(-t "$IMAGE:$t")
+          done
+          if [ "$PUSH" = "true" ]; then
+            args+=(--push)
+          else
+            args+=(--load)
+          fi
+
+          echo "building $IMAGE tags=[$TAGS] push=$PUSH context=$CONTEXT"
+          docker buildx build "${args[@]}" "${tagargs[@]}" "$CONTEXT"
