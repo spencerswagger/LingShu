@@ -1,0 +1,151 @@
+# 打 tag 触发：构建前后端发布包（后端静态二进制 tar.gz、前端静态资源 zip），
+# 上传为 workflow artifact，并在 GitHub 创建 Release 附上这些产物。
+#
+# 触发规则（与参考项目 CloudShuttle 保持一致）：
+#   - main 正式发布：打 vX.Y.Z（无后缀）；guard 会校验该 tag 必须已在 main 上
+#   - 其他分支预发布：打 vX.Y.Z-后缀（如 v0.1.0-rc1），任何分支都可以
+#   - 手动 workflow_dispatch：只产出 artifact，不建 release、不做分支校验
+#
+# 注意：Release 只负责「打包 + 建 Release」；镜像的构建与推送由 build-images.yml 负责。
+name: Release package
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  guard:
+    name: Validate tag (release on main, prerelease anywhere)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            if (context.refType !== 'tag') { core.info('manual run; skip tag validation'); return; }
+            const tag = context.ref.replace('refs/tags/', '');
+            if (tag.includes('-')) { core.info(`pre-release tag ${tag}; allowed on any branch`); return; }
+            const { data: mainB } = await github.rest.repos.getBranch({ owner: context.repo.owner, repo: context.repo.repo, branch: 'main' });
+            const { data: cmp } = await github.rest.repos.compareCommits({ owner: context.repo.owner, repo: context.repo.repo, base: tag, head: mainB.commit.sha });
+            const ok = cmp.status === 'behind' || cmp.status === 'identical';
+            if (!ok) core.setFailed(`release tag ${tag} 不在 main 上 (status=${cmp.status})；其他分支请改用带后缀的预发布 tag: ${tag}-rc1`);
+
+  backend:
+    name: Package backend (linux/amd64)
+    needs: [guard]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            echo "ver=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+          else
+            echo "ver=sha-${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build static binary
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cd backend
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -trimpath -ldflags "-s -w" -o ../dist/llmgateway ./cmd/server
+
+      - name: Assemble tar.gz
+        env:
+          VERSION: ${{ steps.ver.outputs.ver }}
+        run: |
+          set -euo pipefail
+          pkg="lingshu-backend-${VERSION}-linux-amd64"
+          mkdir -p "package/$pkg"
+          mv dist/llmgateway "package/$pkg/"
+          # 附上运行所需的两份文件：容器入口脚本与配置模板
+          cp backend/docker-entrypoint.sh backend/config.example.yaml "package/$pkg/"
+          tar -czf "${pkg}.tar.gz" -C package "$pkg"
+          ls -lh "${pkg}.tar.gz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: backend-tar
+          path: lingshu-backend-${{ steps.ver.outputs.ver }}-linux-amd64.tar.gz
+          if-no-files-found: error
+
+  frontend:
+    name: Package frontend (zip)
+    needs: [guard]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            echo "ver=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+          else
+            echo "ver=sha-${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install & build
+        working-directory: frontend
+        run: |
+          set -euo pipefail
+          npm ci
+          npm run build
+
+      - name: Zip dist
+        env:
+          VERSION: ${{ steps.ver.outputs.ver }}
+        run: |
+          set -euo pipefail
+          cd frontend/dist
+          zip -qr "../../lingshu-web-${VERSION}.zip" .
+          cd ../..
+          ls -lh "lingshu-web-${VERSION}.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-zip
+          path: lingshu-web-${{ steps.ver.outputs.ver }}.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish release assets
+    needs: [backend, frontend]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist-assets
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: LingShu ${{ github.ref_name }}
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          files: dist-assets/**/*
