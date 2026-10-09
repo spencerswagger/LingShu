@@ -2,6 +2,10 @@
 
 FROM registry.cn-hangzhou.aliyuncs.com/spencerswagger/library-node:22-alpine AS build
 WORKDIR /app
+
+# npm 依赖源替换为阿里云镜像（registry.npmmirror.com，原淘宝源），加速国内安装
+RUN npm config set registry https://registry.npmmirror.com
+
 COPY package.json package-lock.json ./
 RUN npm ci
 COPY . .
