@@ -4,6 +4,9 @@
 FROM registry.cn-hangzhou.aliyuncs.com/spencerswagger/library-golang:1.27-alpine AS build
 WORKDIR /src
 
+# 模块代理走阿里云镜像（GOPROXY），加速国内依赖拉取；末尾 direct 作为兜底
+ENV GOPROXY=https://mirrors.aliyun.com/goproxy/,direct
+
 # 先拷贝依赖清单，利用构建缓存
 COPY go.mod go.sum ./
 RUN go mod download
@@ -12,9 +15,11 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags "-s -w" -o /out/llmgateway ./cmd/server
 
 FROM registry.cn-hangzhou.aliyuncs.com/spencerswagger/library-alpine:3.20
-# openssl：首次启动生成 JWT RSA 密钥对与 SM4 密钥；tzdata：计费时段系数按 Asia/Shanghai 等时区计算；
-# su-exec：entrypoint 完成卷属主修复与初始化后，降权到非特权用户 app（uid 10001）运行主进程
-RUN apk add --no-cache ca-certificates tzdata openssl su-exec \
+# apk 软件源替换为阿里云镜像：仅改写仓库主机名，保留原有 alpine 版本路径（自动跟随基础镜像版本）
+# 安装：openssl（首次启动生成 JWT RSA 密钥对与 SM4 密钥）；tzdata（计费时段系数按 Asia/Shanghai 等时区计算）；
+#       su-exec（entrypoint 完成卷属主修复与初始化后，降权到非特权用户 app，uid 10001，运行主进程）
+RUN sed -i 's#//[^/]*/alpine#//mirrors.aliyun.com/alpine#g' /etc/apk/repositories \
+    && apk add --no-cache ca-certificates tzdata openssl su-exec \
     && adduser -D -u 10001 app
 
 WORKDIR /app
