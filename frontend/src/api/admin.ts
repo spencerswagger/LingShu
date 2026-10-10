@@ -321,6 +321,27 @@ export function channelKeyState(
   )
 }
 
+// 手动触发一轮健康探测的结果（密钥/内部模型探测共用）。
+export interface ProbeOutcome {
+  OK: boolean
+  Error?: string
+  DurationMS: number
+  ModelID?: string
+  State: string // 探测后的状态机状态：NORMAL | DRAIN | DISABLED
+}
+// 手动探测单个渠道密钥（同步执行一轮，结果按定时探测同规则驱动密钥状态机）
+export function probeChannelKey(channelId: string, keyId: string): Promise<ApiRes<ProbeOutcome>> {
+  return http.post<ProbeOutcome, ApiRes<ProbeOutcome>>(
+    `/admin/channels/${channelId}/keys/${keyId}/probe`,
+  )
+}
+// 手动探测单个渠道内部模型（经该渠道可用密钥发起，仅回喂模型状态机）
+export function probeChannelModel(channelId: string, mid: string): Promise<ApiRes<ProbeOutcome>> {
+  return http.post<ProbeOutcome, ApiRes<ProbeOutcome>>(
+    `/admin/channels/${channelId}/models/${mid}/probe`,
+  )
+}
+
 // ===== 标签 =====
 export interface AdminTag {
   ID: string
