@@ -461,6 +461,7 @@ export interface ChannelModel {
   InternalModelID: string
   ExternalModelID: string
   ExternalName?: string
+  ChannelName?: string
   CostRates: Record<string, number>
   TimeConfig: TimeCoeffConfig | null
   ContextTiers: ContextTier[] | null
@@ -483,6 +484,10 @@ export interface ChannelModelInput {
 }
 export function listChannelModels(channelId: string) {
   return http.get<ChannelModel[], ApiRes<ChannelModel[]>>(`/admin/channels/${channelId}/models`)
+}
+// 全部渠道内部模型（跨渠道；用于对外模型定价同步时选择来源）
+export function listAllChannelModels() {
+  return http.get<ChannelModel[], ApiRes<ChannelModel[]>>('/admin/channel-models')
 }
 export function createChannelModel(channelId: string, payload: ChannelModelInput) {
   return http.post<ChannelModel, ApiRes<ChannelModel>>(
