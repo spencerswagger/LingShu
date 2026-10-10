@@ -29,6 +29,14 @@ func (m credentialEncMatcher) Match(v driver.Value) bool {
 	return err == nil && string(plain) == m.want
 }
 
+// nonEmptyNameMatcher 断言落库名称为非空字符串（Create 名称为空时应生成默认名）。
+type nonEmptyNameMatcher struct{}
+
+func (nonEmptyNameMatcher) Match(v driver.Value) bool {
+	s, ok := v.(string)
+	return ok && s != ""
+}
+
 const (
 	keyInsertSQL = `INSERT INTO channel_keys(id, channel_id, name, credential_enc) VALUES($1,$2,$3,$4) RETURNING id`
 	keyGetSQL    = `SELECT ` + channelKeyCols + ` FROM channel_keys WHERE id=$1 AND deleted_at IS NULL`
@@ -68,6 +76,7 @@ func TestKeyService_Create_EncryptAndInsert(t *testing.T) {
 	}
 }
 
+// TestKeyService_Create_Validation 凭据为空（必填项）返回 400；名称留空不再报错（见生成默认名用例）。
 func TestKeyService_Create_Validation(t *testing.T) {
 	db, _, err := sqlmock.New()
 	if err != nil {
@@ -76,15 +85,42 @@ func TestKeyService_Create_Validation(t *testing.T) {
 	defer db.Close()
 	svc := NewKeyService(NewKeyStore(db), testSM4Key)
 
-	for _, tc := range []struct {
-		name string
-		cred string
-	}{{name: "", cred: "sk"}, {name: "主", cred: ""}} {
-		_, err := svc.Create(context.Background(), 1, tc.name, tc.cred)
-		var apiErr *APIError
-		if !errors.As(err, &apiErr) || apiErr.Code != resp.CodeBadRequest {
-			t.Fatalf("expected 40001 for name=%q cred=%q, got %v", tc.name, tc.cred, err)
-		}
+	_, err = svc.Create(context.Background(), 1, "主", "")
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != resp.CodeBadRequest {
+		t.Fatalf("expected 40001 for empty credential, got %v", err)
+	}
+}
+
+// TestKeyService_Create_GeneratesDefaultName 名称留空时生成非空默认名并落库。
+func TestKeyService_Create_GeneratesDefaultName(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+	svc := NewKeyService(NewKeyStore(db), testSM4Key)
+	now := time.Now()
+
+	mock.ExpectQuery(regexp.QuoteMeta(keyInsertSQL)).
+		WithArgs(sqlmock.AnyArg(), int64(1), nonEmptyNameMatcher{}, credentialEncMatcher{key: testSM4Key, want: "sk-secret"}).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(8)))
+	mock.ExpectQuery(regexp.QuoteMeta(keyGetSQL)).
+		WithArgs(int64(8)).
+		WillReturnRows(channelKeyRow(&ChannelKey{
+			ID: 8, ChannelID: 1, Name: "key-1a2b3c4d", CredentialEnc: "cipher", State: StateNormal,
+			CreatedAt: now, UpdatedAt: now,
+		}))
+
+	k, err := svc.Create(context.Background(), 1, "   ", "sk-secret")
+	if err != nil {
+		t.Fatalf("create with blank name: %v", err)
+	}
+	if k.Name == "" {
+		t.Fatalf("expected generated non-empty name, got %+v", k)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("mock expectations: %v", err)
 	}
 }
 
@@ -160,18 +196,33 @@ func TestKeyService_Update(t *testing.T) {
 	}
 }
 
-func TestKeyService_Update_EmptyName(t *testing.T) {
-	db, _, err := sqlmock.New()
+// TestKeyService_Update_BothEmptyNoop 名称与凭据都为空：只读一次当前记录并返回，不触发更新。
+func TestKeyService_Update_BothEmptyNoop(t *testing.T) {
+	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock: %v", err)
 	}
 	defer db.Close()
 	svc := NewKeyService(NewKeyStore(db), testSM4Key)
+	now := time.Now()
 
-	_, err = svc.Update(context.Background(), 7, "", "sk")
-	var apiErr *APIError
-	if !errors.As(err, &apiErr) || apiErr.Code != resp.CodeBadRequest {
-		t.Fatalf("expected 40001, got %v", err)
+	mock.ExpectQuery(regexp.QuoteMeta(keyGetSQL)).
+		WithArgs(int64(7)).
+		WillReturnRows(channelKeyRow(&ChannelKey{
+			ID: 7, ChannelID: 1, Name: "当前名", CredentialEnc: "cipher", State: StateNormal,
+			CreatedAt: now, UpdatedAt: now,
+		}))
+
+	k, err := svc.Update(context.Background(), 7, "", "")
+	if err != nil {
+		t.Fatalf("update both empty: %v", err)
+	}
+	if k.ID != 7 || k.Name != "当前名" {
+		t.Fatalf("unexpected key: %+v", k)
+	}
+	// 未发生的 UPDATE 若被执行，ExpectationsWereMet 会报错。
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("mock expectations: %v", err)
 	}
 }
 
