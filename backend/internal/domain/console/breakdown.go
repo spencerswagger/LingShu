@@ -48,15 +48,7 @@ var rateFields = []struct {
 	Label string
 	get   func(*billing.Usage) int64
 }{
-	// 输入行展示净输入（总输入减去命中缓存的子集），与计费扣减口径一致；
-	// 缓存写为独立段，不在此扣减。
-	{"input", "输入", func(u *billing.Usage) int64 {
-		net := u.Input - u.CacheRead
-		if net < 0 {
-			net = 0
-		}
-		return net
-	}},
+	{"input", "输入", func(u *billing.Usage) int64 { return u.Input }},
 	{"output", "输出", func(u *billing.Usage) int64 { return u.Output }},
 	{"cache_read", "缓存读", func(u *billing.Usage) int64 { return u.CacheRead }},
 	{"cache_write", "缓存写", func(u *billing.Usage) int64 { return u.CacheWrite }},

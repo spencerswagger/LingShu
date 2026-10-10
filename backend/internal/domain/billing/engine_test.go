@@ -31,25 +31,13 @@ func TestComputeCredits(t *testing.T) {
 			timeCoeff: 0.5, ctxCoeff: 1.0, r: 10000, want: 0.1184, // 0.2368 × 0.5
 		},
 		{
-			// 缓存读是输入的子集：净输入 900×1 + 缓存读 100×0.1 = 910；÷1000 = 0.91
-			name: "cache_read子集替换", u: Usage{Input: 1000, CacheRead: 100}, rates: fullRates(),
-			timeCoeff: 1.0, ctxCoeff: 1.0, r: 1000, want: 0.91,
+			// 缓存命中段参与计费：1000×1 + 100×0.1 = 1010；÷1000 = 1.01
+			name: "cache_read参与", u: Usage{Input: 1000, CacheRead: 100}, rates: fullRates(),
+			timeCoeff: 1.0, ctxCoeff: 1.0, r: 1000, want: 1.01,
 		},
 		{
-			// 缓存写为独立计费段（显式缓存写入，不与输入互斥）：输入 0 不参与，
-			// 仅 5000×0.3×1.2×1.5/10000=0.27
-			name: "cache_write-独立段", u: Usage{CacheWrite: 5000}, rates: fullRates(),
-			timeCoeff: 1.2, ctxCoeff: 1.5, r: 10000, want: 0.27,
-		},
-		{
-			// 缓存读越界上报（缓存>输入）：clamp cr=min(500,100)=100 → 100×0.1=10；÷1000 = 0.01
-			name: "cache_read越界clamp", u: Usage{Input: 100, CacheRead: 500}, rates: fullRates(),
-			timeCoeff: 1.0, ctxCoeff: 1.0, r: 1000, want: 0.01,
-		},
-		{
-			// 缓存读子集替换 + 缓存写独立：800×1 + 200×0.1 + 300×0.3 = 910；÷1000 = 0.91
-			name: "缓存读写混合", u: Usage{Input: 1000, CacheRead: 200, CacheWrite: 300}, rates: fullRates(),
-			timeCoeff: 1.0, ctxCoeff: 1.0, r: 1000, want: 0.91,
+			name: "cache_write-缓存回写", u: Usage{CacheWrite: 5000}, rates: fullRates(),
+			timeCoeff: 1.2, ctxCoeff: 1.5, r: 10000, want: 0.27, // 5000×0.3×1.2×1.5/10000=0.27
 		},
 		{
 			name: "r非正数报错", u: Usage{Input: 10}, rates: fullRates(),
