@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"strconv"
 	"time"
 
 	"github.com/team/llmgateway/internal/domain/identity"
@@ -294,6 +295,34 @@ func (g *Gateway) captureReqIncrement(sessObj *router.Session, body []byte) ([]j
 		incr = []json.RawMessage{}
 	}
 	return incr, fps
+}
+
+// callLogDecision 组装本次请求的决策轨迹（供成功/失败路径 writeCallLog 使用）：
+// attempts 为「到当前候选为止」已收集的全部候选结果 + 当前候选的最终结果（result 作为该候选理由），
+// 前端请求详情页据此展示候选渠道表与终态原因（success/上游失败等）。
+func callLogDecision(attempts []map[string]any, result string, preConsumed float64, curID, curKeyID int64, curModel string) map[string]any {
+	cloned := make([]map[string]any, 0, len(attempts)+1)
+	for i := range attempts {
+		m := make(map[string]any, len(attempts[i]))
+		for k, v := range attempts[i] {
+			m[k] = v
+		}
+		cloned = append(cloned, m)
+	}
+	cloned = append(cloned, map[string]any{
+		"order":             len(cloned) + 1,
+		"channel_id":        strconv.FormatInt(curID, 10),
+		"channel_key_id":    strconv.FormatInt(curKeyID, 10),
+		"internal_model_id": curModel,
+		"reason":            result,
+	})
+	return map[string]any{
+		"attempts":     cloned,
+		"time_coeff":   0,
+		"ctx_coeff":    0,
+		"pre_consumed": preConsumed,
+		"result":       result,
+	}
 }
 
 // writeCallLog 采集一条调用日志（写失败仅记日志，不阻塞/回滚请求语义）。
