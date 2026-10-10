@@ -68,16 +68,6 @@ const commonZones = [
   'America/New_York',
 ]
 
-// 默认四档上下文模板（与全局兜底默认一致，供一键填充）
-function defaultTiers(): ContextTier[] {
-  return [
-    { Min: 0, Max: 8000, Coeff: 1 },
-    { Min: 8001, Max: 32768, Coeff: 1.5 },
-    { Min: 32769, Max: 131072, Coeff: 2 },
-    { Min: 131073, Max: null, Coeff: 3 },
-  ]
-}
-
 // 从 modelValue 同步进内部编辑态（倍率直接展示，无单位换算）
 function syncFromModel() {
   const mv = props.modelValue || {}
@@ -104,9 +94,8 @@ function syncFromModel() {
     edit.Periodic = []
     edit.Overrides = []
   }
-  edit.Tiers = mv.ContextTiers && mv.ContextTiers.length
-    ? mv.ContextTiers.map((t: ContextTier) => ({ ...t }))
-    : defaultTiers()
+  // 分档默认留空，由用户按需添加
+  edit.Tiers = (mv.ContextTiers || []).map((t: ContextTier) => ({ ...t }))
 }
 
 const round6 = (n: number) => Math.round(n * 1e6) / 1e6
@@ -181,9 +170,8 @@ watch(r, () => {
   emit('update:modelValue', p)
 })
 
-// 开关切换：开启则用内部已填值（含默认模板）；关闭则二者置空
-function onConfiguredChange(v: boolean) {
-  if (v && !edit.Tiers.length) edit.Tiers = defaultTiers()
+// 开关切换：开启则用内部已填值；关闭则二者置空
+function onConfiguredChange(_v: boolean) {
   const p = pack()
   recordEmit(p)
   emit('update:modelValue', p)
@@ -298,7 +286,7 @@ recordEmit(pack())
         <el-table-column label="结束 (HH:MM)" width="130">
           <template #default="{ row }"><el-input v-model="row.End" placeholder="24:00" /></template>
         </el-table-column>
-        <el-table-column label="系数" width="120">
+        <el-table-column label="系数" width="160">
           <template #default="{ row }">
             <el-input-number v-model="row.Coeff" :min="0" :precision="3" :step="0.1" style="width: 100%" />
           </template>
@@ -340,7 +328,7 @@ recordEmit(pack())
           <el-table-column label="结束" width="120">
             <template #default="{ row }"><el-input v-model="row.End" placeholder="24:00" /></template>
           </el-table-column>
-          <el-table-column label="系数" width="120">
+          <el-table-column label="系数" width="160">
             <template #default="{ row }">
               <el-input-number v-model="row.Coeff" :min="0" :precision="3" :step="0.1" style="width: 100%" />
             </template>
@@ -375,7 +363,7 @@ recordEmit(pack())
             <el-input-number v-model="row.Max" :min="0" placeholder="空=无上限" :controls="false" style="width: 100%" />
           </template>
         </el-table-column>
-        <el-table-column label="系数 (coeff)" width="140">
+        <el-table-column label="系数 (coeff)" width="160">
           <template #default="{ row }">
             <el-input-number v-model="row.Coeff" :min="0" :precision="3" :step="0.1" style="width: 100%" />
           </template>
