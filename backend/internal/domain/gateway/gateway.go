@@ -90,6 +90,7 @@ type Gateway struct {
 	router          Router
 	channels        ChannelResolver
 	billing         BillingRecorder
+	callLogs        CallLogStore // 调用日志写入（nil=不采集，单测安全）
 	models          ModelResolver
 	channelModels   ChannelModelResolver
 	tagKV           TagKVResolver
@@ -169,6 +170,9 @@ func NewGateway(cfg GatewayConfig) *Gateway {
 		streamClient:    cfg.StreamClient,
 	}
 }
+
+// SetCallLogs 注入调用日志存储（nil=不采集调用日志；测试与未装配场景安全）。
+func (g *Gateway) SetCallLogs(s CallLogStore) { g.callLogs = s }
 
 // DefaultProviderFactory 默认协议工厂：目前仅 openai-compat。
 func DefaultProviderFactory(protocol, endpoint string) (Provider, bool) {

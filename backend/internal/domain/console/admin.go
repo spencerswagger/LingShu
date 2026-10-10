@@ -19,6 +19,7 @@ import (
 
 	"github.com/team/llmgateway/internal/domain/billing"
 	"github.com/team/llmgateway/internal/domain/channel"
+	"github.com/team/llmgateway/internal/domain/gateway"
 	"github.com/team/llmgateway/internal/domain/router"
 	"github.com/team/llmgateway/internal/pkg/decimalx"
 	"github.com/team/llmgateway/internal/pkg/resp"
@@ -34,6 +35,13 @@ type Admin struct {
 	sessions       *router.SessionRegistry                                          // 会话管理 API（F1 经 SetSessions 注入）
 	keyNameByIDs   func(ctx context.Context, ids []int64) (map[int64]string, error) // 渠道密钥名批量反查钩子（F1 装配真实实现）
 	sessionSetName func(ctx context.Context, sessionID, name string) (bool, error)  // 会话改名钩子（F1 装配 SessionStore.SetName）
+	callLogs       callLogReader                                                    // 调用日志只读查询（经 SetCallLogStore 注入；nil=未装配）
+}
+
+// callLogReader 调用日志只读查询抽象（gateway.SQLCallLogStore 满足；nil=未装配时查询为空）。
+type callLogReader interface {
+	GetByBillingID(ctx context.Context, billingID string) (*gateway.CallLog, error)
+	ListBySession(ctx context.Context, sessionID string) ([]gateway.CallLog, error)
 }
 
 // NewAdmin 创建控制台聚合处理器。
@@ -59,6 +67,21 @@ func (h *Admin) SetKeyNameResolver(fn func(ctx context.Context, ids []int64) (ma
 // SetSessionNameSetter 注入会话改名钩子（F1 装配 SessionStore.SetName；nil 时改名接口返回 404 语义）。
 func (h *Admin) SetSessionNameSetter(fn func(ctx context.Context, sessionID, name string) (bool, error)) {
 	h.sessionSetName = fn
+}
+
+// SetCallLogStore 注入调用日志只读查询（nil=未装配：BillingDetail.CallLog 为 nil、会话调用列表为空）。
+func (h *Admin) SetCallLogStore(s callLogReader) { h.callLogs = s }
+
+// attachCallLog 查 call_logs 并填充账单详情（未装配/无记录时为 nil）。
+func (h *Admin) attachCallLog(ctx context.Context, bid string) *CallLogView {
+	if h.callLogs == nil || bid == "" {
+		return nil
+	}
+	cl, err := h.callLogs.GetByBillingID(ctx, bid)
+	if err != nil || cl == nil {
+		return nil
+	}
+	return toCallLogView(cl)
 }
 
 // ===== 账单查询 =====
@@ -458,8 +481,35 @@ func (h *Admin) HandleGetBilling(w http.ResponseWriter, r *http.Request) {
 		RouteDiff:       routeDiff,
 		InternalModelID: rec.InternalModelID,
 		ChannelName:     h.channelNameByKeyID(r.Context(), rec.ChannelKeyID),
+		CallLog:         h.attachCallLog(r.Context(), rec.BillingID),
 	}
 	resp.OK(w, r, detail)
+}
+
+// HandleListSessionCalls GET /api/v1/admin/sessions/{session_id}/calls
+// 返回会话的完整调用记录（call_logs 按 created_at 升序）；未装配调用日志存储时返回空列表。
+func (h *Admin) HandleListSessionCalls(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session_id")
+	if sid == "" {
+		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "缺少会话 ID")
+		return
+	}
+	if h.callLogs == nil {
+		resp.OK(w, r, map[string]any{"List": []CallLogView{}, "Total": 0})
+		return
+	}
+	logs, err := h.callLogs.ListBySession(r.Context(), sid)
+	if err != nil {
+		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "查询调用日志失败")
+		return
+	}
+	list := make([]CallLogView, 0, len(logs))
+	for i := range logs {
+		if v := toCallLogView(&logs[i]); v != nil {
+			list = append(list, *v)
+		}
+	}
+	resp.OK(w, r, map[string]any{"List": list, "Total": len(list)})
 }
 
 // HandleChannelSnapshot GET /api/v1/admin/channels/snapshot
