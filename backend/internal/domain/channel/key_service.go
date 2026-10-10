@@ -2,9 +2,12 @@ package channel
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/team/llmgateway/internal/pkg/crypto"
 )
@@ -42,15 +45,42 @@ func NewKeyService(keys *KeyStore, sm4Key []byte) *KeyService {
 	return &KeyService{keys: keys, sm4Key: sm4Key}
 }
 
-// Create 新增密钥：名称/凭据非空校验，SM4 加密后落库（state 由 DDL 默认 NORMAL）。
-// 同渠道下名称冲突返回 409。
+// randUint32 生成随机 32 位无符号整数，用于拼装默认密钥名。
+// crypto/rand 读取失败极罕见，此时退化为 0，仍保证名称格式合法。
+func randUint32() uint32 {
+	var b [4]byte
+	_, _ = rand.Read(b[:])
+	return binary.BigEndian.Uint32(b[:])
+}
+
+// newDefaultKeyName 生成渠道密钥默认名（名称留空时使用）：形如 key-1a2b3c4d。
+func newDefaultKeyName() string {
+	return fmt.Sprintf("key-%08x", randUint32())
+}
+
+// Create 新增密钥：凭据必填，名称可留空（留空时生成随机默认名），SM4 加密后落库。
+// 名称留空生成的默认名在同渠道冲突时重新生成重试（最多 5 次），仍失败返回 409；
+// 名称非空时同渠道冲突同样返回 409。
 func (s *KeyService) Create(ctx context.Context, channelID int64, name, credential string) (*ChannelKey, error) {
-	if name == "" || credential == "" {
-		return nil, errBadRequest("密钥名称与凭据不能为空")
+	if credential == "" {
+		return nil, errBadRequest("密钥凭据不能为空")
 	}
 	enc, err := crypto.SM4Encrypt(s.sm4Key, []byte(credential))
 	if err != nil {
 		return nil, fmt.Errorf("encrypt key credential: %w", err)
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		for i := 0; i < 5; i++ {
+			id, err := s.keys.Insert(ctx, ChannelKey{ChannelID: channelID, Name: newDefaultKeyName(), CredentialEnc: enc})
+			if err == nil {
+				return s.keys.GetByID(ctx, id)
+			}
+			if !errors.Is(err, ErrNameExists) {
+				return nil, err
+			}
+		}
+		return nil, errConflict("该渠道下密钥名称已存在")
 	}
 	id, err := s.keys.Insert(ctx, ChannelKey{ChannelID: channelID, Name: name, CredentialEnc: enc})
 	if err != nil {
@@ -74,13 +104,25 @@ func (s *KeyService) Get(ctx context.Context, keyID int64) (*ChannelKey, error) 
 	return k, nil
 }
 
-// Update 修改密钥名称/凭据：credential 为空表示不修改。
+// Update 修改密钥名称/凭据：名称留空表示不改名，凭据留空表示不改凭据；
+// 两者都为空则不做更新，直接读取并返回当前记录。名称冲突返回 409。
 // 加密规则与 KeyStore.UpdateInfo(updateCred) 保持一致。
 func (s *KeyService) Update(ctx context.Context, keyID int64, name, credential string) (*ChannelKey, error) {
-	if name == "" {
-		return nil, errBadRequest("密钥名称不能为空")
-	}
+	name = strings.TrimSpace(name)
 	updateCred := credential != ""
+	if name == "" && !updateCred {
+		// 名称与凭据都为空：不改动，直接返回当前记录。
+		return s.keys.GetByID(ctx, keyID)
+	}
+	effectiveName := name
+	if effectiveName == "" {
+		// 名称为空 = 不改名：取当前名称用于回写，避免置空。
+		cur, err := s.keys.GetByID(ctx, keyID)
+		if err != nil {
+			return nil, err
+		}
+		effectiveName = cur.Name
+	}
 	var enc string
 	if updateCred {
 		var err error
@@ -89,7 +131,7 @@ func (s *KeyService) Update(ctx context.Context, keyID int64, name, credential s
 			return nil, fmt.Errorf("encrypt key credential: %w", err)
 		}
 	}
-	if err := s.keys.UpdateInfo(ctx, keyID, name, enc, updateCred); err != nil {
+	if err := s.keys.UpdateInfo(ctx, keyID, effectiveName, enc, updateCred); err != nil {
 		if errors.Is(err, ErrNameExists) {
 			return nil, errConflict("该渠道下密钥名称已存在")
 		}
