@@ -628,6 +628,7 @@ export interface Segment {
   Start: string // "HH:MM"
   End: string // "HH:MM" 或 "24:00"
   Coeff: number
+  Weekdays?: number[] // 0=周日…6=周六；空 = 每天生效
 }
 export interface DateOverride {
   Name: string

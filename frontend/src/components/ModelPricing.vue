@@ -44,6 +44,28 @@ onMounted(async () => {
 // 展示时在输入框右侧给出「≈ 积分/百万 token」辅助参考：积分 = 倍率 × 1e6 ÷ R。
 const creditPerM = (rate: number): number => Math.round(((rate || 0) * 1e6) / r.value * 1e6) / 1e6
 
+// 星期选项（0=周日…6=周六，与 Go time.Weekday 一致）
+const weekdayOptions = [
+  { v: 0, n: '日' },
+  { v: 1, n: '一' },
+  { v: 2, n: '二' },
+  { v: 3, n: '三' },
+  { v: 4, n: '四' },
+  { v: 5, n: '五' },
+  { v: 6, n: '六' },
+]
+const WEEKDAY_ALL: number[] = [0, 1, 2, 3, 4, 5, 6] // 全部选中 = 每天
+const WEEKDAY_WORK: number[] = [1, 2, 3, 4, 5]
+const WEEKDAY_WEEKEND: number[] = [0, 6]
+// 全选 7 天与留空等价（后端语义均为「每天」），保存时归并为空数组
+const normWeekdays = (ws?: number[]): number[] => {
+  if (!ws || !ws.length) return []
+  const dedup = Array.from(new Set(ws)).sort((a, b) => a - b)
+  return dedup.length === WEEKDAY_ALL.length ? [] : dedup
+}
+// el-checkbox 绑定值：undefined → []
+const wdVal = (ws?: number[]): number[] => ws || []
+
 const showRates = computed(() => !!props.showRatesKey)
 
 // 内部编辑态（避免直接改 prop）
@@ -83,10 +105,10 @@ function syncFromModel() {
   if (tc) {
     edit.Timezone = tc.Timezone || 'Asia/Shanghai'
     edit.Default = typeof tc.Default === 'number' ? tc.Default : 1
-    edit.Periodic = (tc.Periodic || []).map((s: Segment) => ({ ...s }))
+    edit.Periodic = (tc.Periodic || []).map((s: Segment) => ({ ...s, Weekdays: wdVal(s.Weekdays) }))
     edit.Overrides = (tc.Overrides || []).map((o: DateOverride) => ({
       ...o,
-      segments: (o.Segments || []).map((s) => ({ ...s })),
+      Segments: (o.Segments || []).map((s) => ({ ...s, Weekdays: wdVal(s.Weekdays) })),
     }))
   } else {
     edit.Timezone = 'Asia/Shanghai'
@@ -104,7 +126,12 @@ const round6 = (n: number) => Math.round(n * 1e6) / 1e6
 function cleanSegs(list: Segment[]): Segment[] {
   return list
     .filter((s) => !!s.Name)
-    .map((s) => ({ Name: s.Name, Start: s.Start || '00:00', End: s.End || '24:00', Coeff: Number(s.Coeff) }))
+    .map((s) => {
+      const wd = normWeekdays(s.Weekdays)
+      const out: Segment = { Name: s.Name, Start: s.Start || '00:00', End: s.End || '24:00', Coeff: Number(s.Coeff) }
+      if (wd.length) out.Weekdays = wd // 空 = 每天，不输出字段保持旧契约
+      return out
+    })
 }
 
 // 打包为 modelValue 完整对象（倍率即存储值，无换算）
@@ -184,13 +211,18 @@ function delTier(i: number) {
   edit.Tiers.splice(i, 1)
 }
 function addSeg(list: Segment[]) {
-  list.push({ Name: '', Start: '00:00', End: '24:00', Coeff: 1 })
+  list.push({ Name: '', Start: '00:00', End: '24:00', Coeff: 1, Weekdays: [] })
 }
 function addOverride() {
   edit.Overrides.push({ Name: '', Start: '', End: '', Segments: [] })
 }
 async function delOverride(i: number) {
   edit.Overrides.splice(i, 1)
+}
+
+// 快捷选择适用星期：全部（每天）/工作日/周末
+const setWeekdays = (row: Segment, preset: 'all' | 'work' | 'weekend') => {
+  row.Weekdays = preset === 'all' ? [] : preset === 'work' ? [...WEEKDAY_WORK] : [...WEEKDAY_WEEKEND]
 }
 
 // 初始化：先把传入值结算进内部编辑态，并记录快照（不主动 emit，
@@ -277,21 +309,35 @@ recordEmit(pack())
 
       <div class="sub-title">周期时段（Periodic）</div>
       <el-table :data="edit.Periodic" border class="table-nowrap">
-        <el-table-column label="名称" min-width="120">
+        <el-table-column label="名称" min-width="110">
           <template #default="{ row }"><el-input v-model="row.Name" placeholder="如 高峰段" /></template>
         </el-table-column>
-        <el-table-column label="开始 (HH:MM)" width="130">
+        <el-table-column label="开始 (HH:MM)" width="120">
           <template #default="{ row }"><el-input v-model="row.Start" placeholder="00:00" /></template>
         </el-table-column>
-        <el-table-column label="结束 (HH:MM)" width="130">
+        <el-table-column label="结束 (HH:MM)" width="120">
           <template #default="{ row }"><el-input v-model="row.End" placeholder="24:00" /></template>
+        </el-table-column>
+        <el-table-column label="适用星期" width="216" show-overflow-tooltip>
+          <template #default="{ row }">
+            <div class="wd-edit">
+              <el-checkbox-group v-model="row.Weekdays" size="small">
+                <el-checkbox v-for="w in weekdayOptions" :key="w.v" :value="w.v">{{ w.n }}</el-checkbox>
+              </el-checkbox-group>
+              <div class="wd-shortcut">
+                <el-button link type="primary" size="small" @click="setWeekdays(row, 'all')">全部</el-button>
+                <el-button link type="primary" size="small" @click="setWeekdays(row, 'work')">工作日</el-button>
+                <el-button link type="primary" size="small" @click="setWeekdays(row, 'weekend')">周末</el-button>
+              </div>
+            </div>
+          </template>
         </el-table-column>
         <el-table-column label="系数" width="160">
           <template #default="{ row }">
             <el-input-number v-model="row.Coeff" :min="0" :precision="3" :step="0.1" style="width: 100%" />
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="80" align="right">
+        <el-table-column label="操作" width="70" align="right">
           <template #default="{ $index }">
             <el-button type="danger" text size="small" :icon="Delete" @click="edit.Periodic.splice($index, 1)" />
           </template>
@@ -469,6 +515,29 @@ recordEmit(pack())
   margin: 14px 0 8px;
   display: flex;
   align-items: center;
+}
+.wd-edit {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: nowrap;
+}
+.wd-edit .el-checkbox-group {
+  flex-wrap: nowrap;
+}
+.wd-edit .el-checkbox {
+  margin-right: 4px;
+}
+.wd-edit .el-checkbox__label {
+  padding-left: 3px;
+  font-size: 12px;
+}
+.wd-shortcut {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  margin-left: 2px;
+  white-space: nowrap;
 }
 .form-row {
   display: flex;
