@@ -21,6 +21,16 @@ type ProbeUsage struct {
 	TotalTokens      int `json:"total_tokens"`
 }
 
+// ProbeOutcome 手动触发一轮健康探测的返回结果（供控制台展示）。
+// State 为探测后的状态机状态；OK 表示本次探测是否成功（密钥探测以 LastErr 是否为空判定）。
+type ProbeOutcome struct {
+	OK         bool   `json:"OK"`
+	Error      string `json:"Error,omitempty"`
+	DurationMS int64  `json:"DurationMS"`
+	ModelID    string `json:"ModelID,omitempty"`
+	State      string `json:"State"`
+}
+
 // nilOr 返回空串兜底。
 func nilOr(s string) string {
 	if s == "" {

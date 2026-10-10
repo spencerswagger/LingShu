@@ -2,7 +2,9 @@ package channel
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -416,5 +418,224 @@ func TestKeyProbeOnceUnlessDisabled_DisabledKeySkipsProbe(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("恢复后探测记录应写入：%v", err)
+	}
+}
+
+// expectModelTransition 预置一次内部模型状态流转的落库预期（事件 INSERT + 状态 UPDATE）。
+func expectModelTransition(mock sqlmock.Sqlmock, channelID int64, modelID string, from, to State, reason string) {
+	mock.ExpectQuery(regexp.QuoteMeta("INSERT INTO channel_model_events(")).
+		WithArgs(sqlmock.AnyArg(), channelID, modelID, string(from), string(to), reason).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "channel_id", "model_id", "from_state", "to_state", "reason", "created_at"}).
+			AddRow(int64(1), channelID, modelID, string(from), string(to), reason, time.Now()))
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE channel_models SET state=$1, updated_at=now() WHERE channel_id=$2 AND internal_model_id=$3`)).
+		WithArgs(string(to), channelID, modelID).WillReturnResult(sqlmock.NewResult(0, 1))
+}
+
+// TestProbeModelNow_SuccessKeepsNormal 模型手动探测成功：模型维持 NORMAL、仅落 probe_logs，
+// 且不回喂密钥状态机（密钥保持原状态）。
+func TestProbeModelNow_SuccessKeepsNormal(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"usage":{"total_tokens":1}}`))
+	}))
+	defer srv.Close()
+
+	mgr, mock := newKeyProbeTestManager(t, srv.URL, HealthProbeConfig{FailThreshold: 1, RecoveryThreshold: 2, TimeoutMS: 1000},
+		[]ChannelModel{{ID: 21, InternalModelID: "m1", ExternalModelID: 1, State: StateNormal}})
+	addKeyRuntime(t, mgr, 11, testKeyACred, StateNormal)
+
+	target := srv.URL + "/chat/completions"
+	mock.ExpectExec(regexp.QuoteMeta(insertProbeLogSQL)).
+		WithArgs(sqlmock.AnyArg(), int64(11), "m1", "model", target, true, "", 0, 0, 0, 1, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	out, err := mgr.ProbeModelNow(1, 21)
+	if err != nil {
+		t.Fatalf("ProbeModelNow: %v", err)
+	}
+	if !out.OK || out.Error != "" {
+		t.Fatalf("success probe want OK, got %+v", out)
+	}
+	if out.State != string(StateNormal) || out.ModelID != "m1" {
+		t.Fatalf("probe outcome want NORMAL/m1, got %+v", out)
+	}
+	if kr, _ := mgr.GetKeyRuntime(11); kr.Machine.State() != StateNormal {
+		t.Fatalf("手动模型探测不得回喂密钥状态机，key state=%s", kr.Machine.State())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("probe log not written: %v", err)
+	}
+}
+
+// TestProbeModelNow_FailureTransitionsDrain 模型手动探测失败：模型状态机 → DRAIN（reason probe_failed），
+// 落 channel_model_events + 状态持久化，且密钥状态不受影响。
+func TestProbeModelNow_FailureTransitionsDrain(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	mgr, mock := newKeyProbeTestManager(t, srv.URL, HealthProbeConfig{FailThreshold: 1, RecoveryThreshold: 2, TimeoutMS: 1000},
+		[]ChannelModel{{ID: 21, InternalModelID: "m1", ExternalModelID: 1, State: StateNormal}})
+	addKeyRuntime(t, mgr, 11, testKeyACred, StateNormal)
+
+	expectModelTransition(mock, 1, "m1", StateNormal, StateDrain, reasonProbeFail)
+	mock.ExpectExec(regexp.QuoteMeta(insertProbeLogSQL)).
+		WithArgs(sqlmock.AnyArg(), int64(11), "m1", "model", srv.URL+"/chat/completions", false, "probe http status: 500", 0, 0, 0, 0, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(2, 1))
+
+	out, err := mgr.ProbeModelNow(1, 21)
+	if err != nil {
+		t.Fatalf("ProbeModelNow: %v", err)
+	}
+	if out.OK || out.State != string(StateDrain) {
+		t.Fatalf("failure probe want DRAIN, got %+v", out)
+	}
+	if mr, _ := mgr.GetModelRuntime(1, 21); mr.Machine.State() != StateDrain {
+		t.Fatalf("model machine want DRAIN, got %s", mr.Machine.State())
+	}
+	if kr, _ := mgr.GetKeyRuntime(11); kr.Machine.State() != StateNormal {
+		t.Fatalf("手动模型探测不得回喂密钥状态机，key state=%s", kr.Machine.State())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("mock expectations: %v", err)
+	}
+}
+
+// TestProbeModelNow_AuthFailureTransitionsDisabled 模型手动探测 401：模型状态机 → DISABLED（reason auth_failure）。
+func TestProbeModelNow_AuthFailureTransitionsDisabled(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+
+	mgr, mock := newKeyProbeTestManager(t, srv.URL, HealthProbeConfig{FailThreshold: 1, RecoveryThreshold: 2, TimeoutMS: 1000},
+		[]ChannelModel{{ID: 21, InternalModelID: "m1", ExternalModelID: 1, State: StateNormal}})
+	addKeyRuntime(t, mgr, 11, testKeyACred, StateNormal)
+
+	expectModelTransition(mock, 1, "m1", StateNormal, StateDisabled, reasonAuthFailure)
+	mock.ExpectExec(regexp.QuoteMeta(insertProbeLogSQL)).
+		WithArgs(sqlmock.AnyArg(), int64(11), "m1", "model", srv.URL+"/chat/completions", false, sqlmock.AnyArg(), 0, 0, 0, 0, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(3, 1))
+
+	out, err := mgr.ProbeModelNow(1, 21)
+	if err != nil {
+		t.Fatalf("ProbeModelNow: %v", err)
+	}
+	if out.OK || out.State != string(StateDisabled) {
+		t.Fatalf("401 probe want DISABLED, got %+v", out)
+	}
+	if mr, _ := mgr.GetModelRuntime(1, 21); mr.Machine.State() != StateDisabled {
+		t.Fatalf("model machine want DISABLED, got %s", mr.Machine.State())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("mock expectations: %v", err)
+	}
+}
+
+// TestProbeModelNow_NoUsableKey 渠道无可用于探测的密钥（状态非 NORMAL/DRAIN 或凭据为空）→ OK=false 且不发起 HTTP。
+func TestProbeModelNow_NoUsableKey(t *testing.T) {
+	var called int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&called, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	mgr, _ := newKeyProbeTestManager(t, srv.URL, HealthProbeConfig{FailThreshold: 1, TimeoutMS: 1000},
+		[]ChannelModel{{ID: 21, InternalModelID: "m1", ExternalModelID: 1, State: StateNormal}})
+	addKeyRuntime(t, mgr, 11, testKeyACred, StateDisabled)
+
+	out, err := mgr.ProbeModelNow(1, 21)
+	if err != nil {
+		t.Fatalf("ProbeModelNow: %v", err)
+	}
+	if out.OK || out.Error != "无可用密钥" {
+		t.Fatalf("no usable key want Error=无可用密钥, got %+v", out)
+	}
+	if n := atomic.LoadInt32(&called); n != 0 {
+		t.Fatalf("无可用密钥不得发起 HTTP，got %d", n)
+	}
+}
+
+// TestProbeNow_MissingRuntimeReturnsErrNoRows 模型/密钥运行时不存在 → sql.ErrNoRows。
+func TestProbeNow_MissingRuntimeReturnsErrNoRows(t *testing.T) {
+	mgr, _ := newKeyProbeTestManager(t, "http://probe.local/v1", HealthProbeConfig{FailThreshold: 1, TimeoutMS: 1000},
+		[]ChannelModel{{ID: 21, InternalModelID: "m1", ExternalModelID: 1, State: StateNormal}})
+	addKeyRuntime(t, mgr, 11, testKeyACred, StateNormal)
+
+	if _, err := mgr.ProbeModelNow(1, 999); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("missing model want sql.ErrNoRows, got %v", err)
+	}
+	if _, err := mgr.ProbeKeyNow(999); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("missing key want sql.ErrNoRows, got %v", err)
+	}
+}
+
+// TestProbeKeyNow_FailureTransitionsDrain 密钥手动探测失败：密钥状态机 → DRAIN，落 probe_logs。
+func TestProbeKeyNow_FailureTransitionsDrain(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	mgr, mock := newKeyProbeTestManager(t, srv.URL, HealthProbeConfig{FailThreshold: 1, RecoveryThreshold: 2, TimeoutMS: 1000},
+		[]ChannelModel{{ID: 21, InternalModelID: "m1", ExternalModelID: 1, State: StateNormal}})
+	addKeyRuntime(t, mgr, 11, testKeyACred, StateNormal)
+
+	mock.ExpectExec(regexp.QuoteMeta(insertProbeLogSQL)).
+		WithArgs(sqlmock.AnyArg(), int64(11), "m1", "model", srv.URL+"/chat/completions", false, "probe http status: 500", 0, 0, 0, 0, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	out, err := mgr.ProbeKeyNow(11)
+	if err != nil {
+		t.Fatalf("ProbeKeyNow: %v", err)
+	}
+	if out.OK || out.State != string(StateDrain) {
+		t.Fatalf("failure key probe want DRAIN, got %+v", out)
+	}
+	if kr, _ := mgr.GetKeyRuntime(11); kr.Machine.State() != StateDrain {
+		t.Fatalf("key machine want DRAIN, got %s", kr.Machine.State())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("mock expectations: %v", err)
+	}
+}
+
+// TestProbeKeyNow_DrainRecoversToNormal 密钥手动探测连续成功达恢复阈值 → 由 DRAIN 恢复 NORMAL。
+func TestProbeKeyNow_DrainRecoversToNormal(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"usage":{"total_tokens":1}}`))
+	}))
+	defer srv.Close()
+
+	mgr, mock := newKeyProbeTestManager(t, srv.URL, HealthProbeConfig{FailThreshold: 1, RecoveryThreshold: 2, TimeoutMS: 1000},
+		[]ChannelModel{{ID: 21, InternalModelID: "m1", ExternalModelID: 1, State: StateNormal}})
+	addKeyRuntime(t, mgr, 11, testKeyACred, StateDrain)
+
+	target := srv.URL + "/chat/completions"
+	for i := 0; i < 2; i++ {
+		mock.ExpectExec(regexp.QuoteMeta(insertProbeLogSQL)).
+			WithArgs(sqlmock.AnyArg(), int64(11), "m1", "model", target, true, "", 0, 0, 0, 1, sqlmock.AnyArg()).
+			WillReturnResult(sqlmock.NewResult(int64(i+1), 1))
+	}
+
+	out, err := mgr.ProbeKeyNow(11)
+	if err != nil {
+		t.Fatalf("ProbeKeyNow #1: %v", err)
+	}
+	if out.State != string(StateDrain) {
+		t.Fatalf("首次成功（阈值 2）应维持 DRAIN，got %s", out.State)
+	}
+	out, err = mgr.ProbeKeyNow(11)
+	if err != nil {
+		t.Fatalf("ProbeKeyNow #2: %v", err)
+	}
+	if !out.OK || out.State != string(StateNormal) {
+		t.Fatalf("连续成功达阈值应恢复 NORMAL，got %+v", out)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("mock expectations: %v", err)
 	}
 }
