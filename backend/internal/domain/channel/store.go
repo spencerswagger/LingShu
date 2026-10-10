@@ -71,7 +71,7 @@ type ReliabilityConfig struct {
 	MinSamples        int     `json:"MinSamples"`        // 窗口内最小样本数，不足不评估
 	ErrorRatePct      float64 `json:"ErrorRatePct"`      // (失败+超时)/总数 阈值 %
 	Rate429Pct        float64 `json:"Rate429Pct"`        // 429 占比阈值 %
-	P99LatencyMS      int64   `json:"P99LatencyMS"`      // 成功样本 P99 耗时阈值 ms
+	P99LatencyMS      int64   `json:"P99LatencyMS"`      // 成功样本 P99 耗时阈值 ms（默认 120000ms = 120 秒；前端按秒录入/展示，提交转毫秒）
 	AuthFailThreshold int     `json:"AuthFailThreshold"` // 连续鉴权失败阈值 → DISABLED，默认 3
 }
 

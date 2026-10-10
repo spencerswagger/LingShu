@@ -69,7 +69,7 @@ const form = reactive({
   on_exceed: 'QUEUE' as string,
   queue_timeout_ms: 0,
   max_concurrent: 16,
-  interval: '0 * * * * *',
+  interval: '0 0 * * * *',
   drain_interval_seconds: 15,
   timeout_ms: 15000,
   fail_threshold: 1,
@@ -79,7 +79,7 @@ const form = reactive({
   min_samples: 10,
   error_rate_pct: 10,
   rate_429_pct: 20,
-  p99_latency_ms: 5000,
+  p99_latency_ms: 120, // 秒（提交转毫秒）
   auth_fail_threshold: 3,
 })
 
@@ -204,7 +204,7 @@ async function load() {
     form.on_exceed = row.RateLimit?.OnExceed || 'QUEUE'
     form.queue_timeout_ms = row.RateLimit?.QueueTimeoutMS || 0
     form.max_concurrent = row.RateLimit?.MaxConcurrent || 16
-    form.interval = row.HealthProbe?.Interval || '0 * * * * *'
+    form.interval = row.HealthProbe?.Interval || '0 0 * * * *'
     form.drain_interval_seconds = num(row.HealthProbe?.DrainIntervalSeconds, 15)
     form.timeout_ms = num(row.HealthProbe?.TimeoutMS, 15000)
     form.fail_threshold = num(row.HealthProbe?.FailThreshold, 1)
@@ -214,7 +214,7 @@ async function load() {
     form.min_samples = num(row.Reliability?.MinSamples, 10)
     form.error_rate_pct = num(row.Reliability?.ErrorRatePct, 10)
     form.rate_429_pct = num(row.Reliability?.Rate429Pct, 20)
-    form.p99_latency_ms = num(row.Reliability?.P99LatencyMS, 5000)
+    form.p99_latency_ms = num(row.Reliability?.P99LatencyMS, 120000) / 1000 // 毫秒回读为秒
     form.auth_fail_threshold = num(row.Reliability?.AuthFailThreshold, 3)
     await loadStateData()
     await loadKeys()
@@ -389,7 +389,7 @@ async function onSubmit() {
         MaxConcurrent: Number(form.max_concurrent),
       },
       HealthProbe: {
-        Interval: form.interval || '0 * * * * *',
+        Interval: form.interval || '0 0 * * * *',
         DrainIntervalSeconds: Number(form.drain_interval_seconds),
         TimeoutMS: Number(form.timeout_ms),
         FailThreshold: Number(form.fail_threshold),
@@ -401,7 +401,7 @@ async function onSubmit() {
         MinSamples: Number(form.min_samples),
         ErrorRatePct: Number(form.error_rate_pct),
         Rate429Pct: Number(form.rate_429_pct),
-        P99LatencyMS: Number(form.p99_latency_ms),
+        P99LatencyMS: Math.round(Number(form.p99_latency_ms) * 1000), // 秒转毫秒提交
         AuthFailThreshold: Number(form.auth_fail_threshold),
       },
     })
@@ -652,10 +652,10 @@ async function onSubmit() {
         </el-form-item>
             <el-form-item label="P99 耗时">
           <div class="with-unit">
-                <el-input-number v-model="form.p99_latency_ms" :min="0"  style="flex: 1" />
-                <span class="unit">ms</span>
+                <el-input-number v-model="form.p99_latency_ms" :min="0" :step="0.1" :precision="1" style="flex: 1" />
+                <span class="unit">秒</span>
               </div>
-          <div class="hint">P99 = 窗口内成功样本按时长升序排列的第 99 百分位耗时（99% 的请求快于该值），衡量长尾延迟；超过该毫秒数即排空</div>
+          <div class="hint">P99 = 窗口内成功样本按时长升序排列的第 99 百分位耗时（99% 的请求快于该值），衡量长尾延迟；超过该秒数即排空（自动转毫秒提交）</div>
         </el-form-item>
             <el-form-item label="鉴权失败熔断">
           <div class="with-unit">
