@@ -84,11 +84,7 @@ func parseUsageObj(raw []byte) (billing.Usage, error) {
 	reasoning := numAsInt(u.CompletionTokensDetails.ReasoningTokens)
 	// openai/deepseek 惯例：completion_tokens 已包含推理 token，而推理单独给出并单独计费，
 	// 从 output 中剔除推理部分，避免同一段 token 被输出价与推理价重复累计。
-	// 异常上报（reasoning > completion）先 clamp 到 output 再减，避免畸形数据导致重叠计费。
-	if reasoning > 0 {
-		if reasoning > output {
-			reasoning = output
-		}
+	if reasoning > 0 && output >= reasoning {
 		output -= reasoning
 	}
 	return billing.Usage{

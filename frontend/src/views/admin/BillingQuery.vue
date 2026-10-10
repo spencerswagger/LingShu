@@ -250,7 +250,6 @@ const creditsTotal = computed(() => stats.value.CreditsTotal.toLocaleString(unde
 const tokensTotal = computed(() => stats.value.TokensTotal.toLocaleString())
 
 // 消耗积分公式（与详情页一致的三步式展示）：Token×单价 → 系数调整 → 积分换算
-// 输入行展示净输入（总输入 − 命中缓存的子集），与后端计费口径一致；缓存写为独立段。
 function creditLines(row: AdminBillingItem): string[] {
   const t = row.Tokens || ({} as AdminBillingItem['Tokens'])
   const rates = row.Rates || {}
@@ -258,9 +257,8 @@ function creditLines(row: AdminBillingItem): string[] {
   const coeffCtx = row.CoeffContext ?? 1
   const r = row.RValue ?? 0
 
-  const netInput = Math.max((t.Input || 0) - (t.CacheRead || 0), 0)
   const segs: Array<[number, string, string]> = [
-    [netInput, '输入', 'Input'],
+    [t.Input || 0, '输入', 'Input'],
     [t.Output || 0, '输出', 'Output'],
     [t.CacheRead || 0, '缓存读', 'CacheRead'],
     [t.CacheWrite || 0, '缓存写', 'CacheWrite'],
