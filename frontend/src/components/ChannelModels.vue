@@ -14,6 +14,7 @@ import {
   channelModelState,
   probeChannelModel,
   listExternalModels,
+  createExternalModel,
   priceCatalog,
   getBillingConfig,
   runSync,
@@ -52,6 +53,17 @@ const editingPricing = ref<Record<string, any>>({
 const saving = ref(false)
 const runtimeExpanded = ref<string[]>([])
 const probingId = ref<string | null>(null) // 正在手动探测的模型 ID
+
+// 快速新建对外模型：绑定下拉选到「＋ 新建对外模型」时弹出
+const createExternalOpen = ref(false)
+const createExternalName = ref('')
+const createExternalEnabled = ref(true)
+const createExternalUseCost = ref(true) // 是否用当前上下文成本初始化售价
+const createExternalSaving = ref(false)
+const createTargetRowIndex = ref(-1) // >=0 为批量配置某行；-1 为单条编辑表单
+const createTargetSingle = ref(false) // 目标是否为单条编辑表单
+const editingExternalPrev = ref<string | null>(null) // 单条下拉选择前的值（选中 __create__ 时回退）
+const rowExternalPrev = ref<Record<number, string | null>>({}) // 批量各行下拉选择前的值
 
 // 拉取上游模型后「批量配置」的待创建行：每个模型独立绑定对外模型与成本
 interface PendingRow {
@@ -112,6 +124,7 @@ function costDetail(m: ChannelModel): string {
 
 function openCreate() {
   editingId.value = null
+  editingExternalPrev.value = null
   editingForm.value = {
     InternalModelID: '',
     ExternalModelID: null,
@@ -159,6 +172,7 @@ async function onProbeModel(m: ChannelModel) {
 
 function openEdit(m: ChannelModel) {
   editingId.value = m.ID
+  editingExternalPrev.value = m.ExternalModelID
   editingForm.value = {
     ...m,
     // 对外模型 ID 现为雪花字符串，直接原样回填保证 el-select 精确匹配
@@ -174,6 +188,83 @@ function openEdit(m: ChannelModel) {
     ContextTiers: m.ContextTiers,
   }
   drawerOpen.value = true
+}
+
+// 快速新建对外模型：打开发起弹窗。rowIndex >= 0 为目标批量行；-1 为单条编辑表单
+function openQuickCreateExternal(rowIndex: number) {
+  createTargetRowIndex.value = rowIndex
+  createTargetSingle.value = rowIndex < 0
+  createExternalName.value = ''
+  createExternalEnabled.value = true
+  createExternalUseCost.value = true
+  createExternalOpen.value = true
+}
+
+// 单条表单绑定对外模型下拉变更：选中「＋ 新建对外模型」时回退原值并弹窗
+function onSingleExternalChange(val: string | null) {
+  if (val === '__create__') {
+    editingForm.value.ExternalModelID = editingExternalPrev.value
+    openQuickCreateExternal(-1)
+    return
+  }
+  editingExternalPrev.value = val
+}
+
+// 批量配置某行绑定对外模型下拉变更：选中「＋ 新建对外模型」时回退原值并弹窗
+function onRowExternalChange(val: string | null, row: PendingRow, index: number) {
+  if (val === '__create__') {
+    row.ExternalModelID = rowExternalPrev.value[index] ?? null
+    openQuickCreateExternal(index)
+    return
+  }
+  rowExternalPrev.value[index] = val
+}
+
+// 确认新建对外模型：成功后把新模型加入下拉并回填到发起新建的目标
+async function confirmCreateExternal() {
+  const name = createExternalName.value.trim()
+  if (!name) return ElMessage.warning('请填写对外名称')
+  // 售价初始化：勾选时取「当前上下文」的成本五段作为售价
+  let costRates: Record<string, number> | null = null
+  if (createExternalUseCost.value) {
+    if (createTargetSingle.value) {
+      costRates = editingPricing.value.CostRates
+    } else {
+      costRates = pendingRows.value[createTargetRowIndex.value]?.pricing?.CostRates || null
+    }
+  }
+  const saleRates = { Input: 0, Output: 0, CacheRead: 0, CacheWrite: 0, Reasoning: 0, ...(costRates || {}) }
+
+  createExternalSaving.value = true
+  try {
+    const res = await createExternalModel({
+      ExternalName: name,
+      Description: '',
+      Enabled: createExternalEnabled.value,
+      SaleRates: saleRates,
+      TimeConfig: null,
+      ContextTiers: null,
+    })
+    const created = res.Data
+    // 保证下拉可选项包含新模型，并用其真实 ID 精确匹配回填
+    externalModels.value.push(created)
+    if (createTargetSingle.value) {
+      editingForm.value.ExternalModelID = created.ID
+      editingExternalPrev.value = created.ID
+    } else {
+      const row = pendingRows.value[createTargetRowIndex.value]
+      if (row) {
+        row.ExternalModelID = created.ID
+        rowExternalPrev.value[createTargetRowIndex.value] = created.ID
+      }
+    }
+    ElMessage.success('对外模型已创建')
+    createExternalOpen.value = false
+  } catch (e: any) {
+    ElMessage.error(e?.message || '创建对外模型失败')
+  } finally {
+    createExternalSaving.value = false
+  }
 }
 
 async function saveModel() {
@@ -286,6 +377,7 @@ async function onPull() {
 // 都作为一行单独绑定对外模型、单独配置成本，统一落库
 function onAddPulled() {
   if (!pullChecked.value.length) return
+  rowExternalPrev.value = {}
   pendingRows.value = pullChecked.value.map((p) => ({
     InternalModelID: p.ID,
     ExternalModelID: null,
@@ -587,14 +679,20 @@ function onRemoveRow(index: number) {
           <el-table-column type="index" width="44" align="center" />
           <el-table-column label="内部模型 ID" prop="InternalModelID" min-width="150" show-overflow-tooltip />
           <el-table-column label="绑定对外模型" width="220">
-            <template #default="{ row }">
-              <el-select v-model="row.ExternalModelID" style="width: 100%" placeholder="选择对外的发售模型">
+            <template #default="{ row, $index }">
+              <el-select
+                v-model="row.ExternalModelID"
+                style="width: 100%"
+                placeholder="选择对外的发售模型"
+                @change="(val: string | null) => onRowExternalChange(val, row, $index)"
+              >
                 <el-option
                   v-for="em in externalModels"
                   :key="em.ID"
                   :label="em.ExternalName"
                   :value="em.ID"
                 />
+                <el-option label="＋ 新建对外模型" value="__create__" />
               </el-select>
             </template>
           </el-table-column>
@@ -621,13 +719,19 @@ function onRemoveRow(index: number) {
           </el-tooltip>
         </el-form-item>
         <el-form-item label="绑定对外模型" required>
-          <el-select v-model="editingForm!.ExternalModelID" style="width: 100%" placeholder="选择对外的发售模型">
+          <el-select
+            v-model="editingForm!.ExternalModelID"
+            style="width: 100%"
+            placeholder="选择对外的发售模型"
+            @change="onSingleExternalChange"
+          >
             <el-option
               v-for="em in externalModels"
               :key="em.ID"
               :label="em.ExternalName"
               :value="em.ID"
             />
+            <el-option label="＋ 新建对外模型" value="__create__" />
           </el-select>
         </el-form-item>
         <div class="span-2">
@@ -736,6 +840,25 @@ function onRemoveRow(index: number) {
         >
           加入内部模型（{{ pullChecked.length }}）
         </el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 快速新建对外模型（绑定下拉选到「＋ 新建对外模型」时弹出） -->
+    <el-dialog v-model="createExternalOpen" title="新建对外模型" width="480px" destroy-on-close>
+      <el-form label-width="120px">
+        <el-form-item label="对外名称" required>
+          <el-input v-model="createExternalName" placeholder="如 gpt-4o" maxlength="128" clearable />
+        </el-form-item>
+        <el-form-item label="启用">
+          <el-switch v-model="createExternalEnabled" />
+        </el-form-item>
+        <el-form-item label="初始化售价">
+          <el-checkbox v-model="createExternalUseCost">用当前内部模型成本初始化售价</el-checkbox>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="createExternalOpen = false">取消</el-button>
+        <el-button type="primary" :loading="createExternalSaving" @click="confirmCreateExternal">创建</el-button>
       </template>
     </el-dialog>
 
