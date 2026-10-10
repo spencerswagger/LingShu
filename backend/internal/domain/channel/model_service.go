@@ -195,6 +195,14 @@ func (s *Service) ListChannelModels(ctx context.Context, channelID int64) ([]Cha
 	return s.cmStore.ListByChannel(ctx, channelID)
 }
 
+// ListAllChannelModels 查询全量渠道内部模型（跨渠道，含禁用），供对外模型编辑页「从内部模型同步定价」使用。
+func (s *Service) ListAllChannelModels(ctx context.Context) ([]ChannelModel, error) {
+	if s.cmStore == nil {
+		return nil, errInternal()
+	}
+	return s.cmStore.ListAll(ctx)
+}
+
 func classifyCMServiceErr(err error) error {
 	if errors.Is(err, ErrChannelModelExists) {
 		return errConflict("该渠道已存在相同内部模型 ID")

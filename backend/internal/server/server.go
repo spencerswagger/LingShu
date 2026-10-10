@@ -131,6 +131,7 @@ func (s *Server) routes() {
 	admin.HandleFunc("GET /api/v1/admin/channels/{id}/keys/{kid}/events", d.Channel.HandleListKeyEvents)
 
 	// 渠道内部模型（双层模型）
+	admin.HandleFunc("GET /api/v1/admin/channel-models", d.Channel.HandleListAllChannelModels)
 	admin.HandleFunc("GET /api/v1/admin/channels/{id}/models", d.Channel.HandleListChannelModels)
 	admin.HandleFunc("POST /api/v1/admin/channels/{id}/models", d.Channel.HandleCreateChannelModel)
 	admin.HandleFunc("POST /api/v1/admin/channels/{id}/models/pull", d.Channel.HandlePullModels)
