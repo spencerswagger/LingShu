@@ -15,19 +15,15 @@ import {
   probeChannelModel,
   listExternalModels,
   createExternalModel,
-  priceCatalog,
-  getBillingConfig,
-  runSync,
   rateLabels,
   type ChannelModel,
   type ExternalModel,
   type PullModel,
-  type CatalogEntry,
 } from '@/api/admin'
 import ModelPricing from '@/components/ModelPricing.vue'
+import ModelPriceCatalog from '@/components/ModelPriceCatalog.vue'
 import StatusTag from '@/components/StatusTag.vue'
 import ErrorBubble from '@/components/ErrorBubble.vue'
-import { fmtDateTime } from '@/utils/format'
 
 const props = defineProps<{
   channelId: string
@@ -397,19 +393,6 @@ function onAddPulled() {
   }, 280)
 }
 
-// ---- models.dev 参考价市场（为成本定价取数） ----
-const catOpen = ref(false)
-const catQ = ref('')
-const catLoading = ref(false)
-const catList = ref<CatalogEntry[]>([])
-const catUpdatedAt = ref('')
-const catTotal = ref(0)
-const catR = ref(10000)
-const catCnyRate = ref(6.8)
-const catApplying = ref(false)
-const catSyncing = ref(false)
-const selectedEntry = ref<CatalogEntry | null>(null)
-
 // 当前配置中的「内部模型 ID」：批量模式下取当前行，否则取单条表单
 const currentModelId = computed(() =>
   pendingRows.value.length ? activeRow.value?.InternalModelID || '' : editingForm.value.InternalModelID,
@@ -419,107 +402,27 @@ const currentPricing = computed(() =>
   pendingRows.value.length ? activeRow.value?.pricing || null : editingPricing.value,
 )
 
-// 推荐条目：与当前内部模型 ID 完全一致且供应商匹配前缀
-const recommended = computed(() => {
-  const name = currentModelId.value
-  if (!name) return null
-  const dash = name.indexOf('-')
-  const prefix = dash > 0 ? name.slice(0, dash) : name
-  let best: CatalogEntry | null = null
-  for (const e of catList.value) {
-    if (e.ModelID !== name) continue
-    if (e.Provider === prefix) {
-      best = e
-      break
-    }
-    if (best == null || e.Provider < best.Provider) best = e
-  }
-  return best || catList.value[0] || null
-})
-
-// 内部模型 ID 前缀（'-' 之前），用于标记「官方」供应商行
-const modelNamePrefix = computed(() => {
-  const name = currentModelId.value.trim()
-  const dash = name.indexOf('-')
-  return dash > 0 ? name.slice(0, dash) : name
-})
-
-// models.dev 参考价 → 倍率（每百万 token 计费数值；汇率仅在系统设置中配置）
-function usdToCnyPerM(usd: number): number {
-  return Math.round(usd * catCnyRate.value * 1e6) / 1e6
-}
-function usdToCredits(usd: number): number {
-  const rate = usdToCnyPerM(usd)
-  return Math.round((rate * 1e6) / catR.value * 1e6) / 1e6
+// models.dev 参考价市场（公共组件）
+const catalogRef = ref<InstanceType<typeof ModelPriceCatalog> | null>(null)
+// 只合并 models.dev 提供的价段，未提供的段保留原值
+function onApplyCostCatalog(partial: Record<string, number>) {
+  const p = currentPricing.value
+  if (!p) return ElMessage.warning('尚未选中需要配置的模型')
+  p.CostRates = { ...p.CostRates, ...partial }
 }
 
-async function onOpenCatalog() {
-  catOpen.value = true
-  catQ.value = currentModelId.value || ''
-  try {
-    const res = await getBillingConfig()
-    const v = Number(res.Data.R)
-    if (v > 0) catR.value = v
-    const c = Number(res.Data.CNYRate)
-    if (c > 0) catCnyRate.value = c
-  } catch {
-    /* 保持默认 */
-  }
-  await onCatalogSearch()
-}
-
-async function onCatalogSearch() {
-  catLoading.value = true
-  try {
-    const res = await priceCatalog(catQ.value)
-    catList.value = res.Data.List || []
-    catUpdatedAt.value = res.Data.UpdatedAt || ''
-    catTotal.value = res.Data.Total || 0
-    selectedEntry.value = null
-  } catch (e: any) {
-    ElMessage.error(e?.message || '获取 models.dev 参考价失败')
-  } finally {
-    catLoading.value = false
-  }
-}
-
-// 立即触发一次 models.dev 同步，成功后重搜当前关键词
-async function onSyncNow() {
-  catSyncing.value = true
-  try {
-    const res = await runSync()
-    ElMessage.success(res.Data.Summary)
-    await onCatalogSearch()
-  } catch (e: any) {
-    ElMessage.error(e?.message || '同步 models.dev 失败')
-  } finally {
-    catSyncing.value = false
-  }
-}
-
-// 应用所选（或推荐）条目为当前配置行的成本五段费率
-async function onApplyCostCatalog() {
-  const entry = selectedEntry.value || recommended.value
-  if (!entry) return ElMessage.warning('目录为空或未找到参考价')
-  const pricing = currentPricing.value
-  if (!pricing) return ElMessage.warning('尚未选中需要配置的模型')
-  catApplying.value = true
-  try {
-    const next: Record<string, number> = { ...pricing.CostRates }
-    const apply = (k: string, usd: number) => {
-      if (usd > 0) next[k] = usdToCnyPerM(usd)
-    }
-    apply('Input', entry.InputUSD)
-    apply('Output', entry.OutputUSD)
-    apply('CacheRead', entry.CacheReadUSD)
-    apply('CacheWrite', entry.CacheWriteUSD)
-    apply('Reasoning', entry.ReasoningUSD)
-    pricing.CostRates = next
-    catOpen.value = false
-    ElMessage.success(`已应用 models.dev 参考价（${entry.Provider}/${entry.ModelID}）到成本定价`)
-  } finally {
-    catApplying.value = false
-  }
+// 从对外模型同步定价：用所绑定对外模型的售价/时段/分档覆盖当前内部模型的成本侧
+function syncFromExternal() {
+  const p = currentPricing.value
+  if (!p) return ElMessage.warning('尚未选中需要配置的模型')
+  const extId = pendingRows.value.length ? activeRow.value?.ExternalModelID : editingForm.value.ExternalModelID
+  if (extId == null) return ElMessage.warning('请先绑定一个对外模型')
+  const em = externalModels.value.find((e) => String(e.ID) === String(extId))
+  if (!em) return ElMessage.warning('未找到该对外模型（可能已停用）')
+  p.CostRates = { ...(em.SaleRates || {}) }
+  p.TimeConfig = em.TimeConfig ? JSON.parse(JSON.stringify(em.TimeConfig)) : null
+  p.ContextTiers = em.ContextTiers ? JSON.parse(JSON.stringify(em.ContextTiers)) : null
+  ElMessage.success(`已用对外模型「${em.ExternalName}」的定价覆盖成本、时段与分档`)
 }
 
 // 当前行切换：批量配置表格选中某行后，更新真实的 activeRow 引用
@@ -660,7 +563,7 @@ function onRemoveRow(index: number) {
     <el-drawer
       v-model="drawerOpen"
       :title="pendingRows.length ? `批量配置内部模型（${pendingRows.length}）` : editingId == null ? '新增内部模型' : '编辑内部模型'"
-      :size="820"
+      :size="1080"
       destroy-on-close
     >
       <template v-if="pendingRows.length">
@@ -706,7 +609,8 @@ function onRemoveRow(index: number) {
           <div class="batch-pricing-label">成本定价 — {{ activeRow.InternalModelID }}</div>
           <ModelPricing v-model="activeRow.pricing" show-rates-key="CostRates" title="成本">
             <template #title-extra>
-              <el-button size="small" @click="onOpenCatalog">从 models.dev 获取参考价</el-button>
+              <el-button size="small" @click="catalogRef?.open()">从 models.dev 获取参考价</el-button>
+              <el-button size="small" @click="syncFromExternal">从对外模型同步定价</el-button>
             </template>
           </ModelPricing>
         </div>
@@ -737,7 +641,8 @@ function onRemoveRow(index: number) {
         <div class="span-2">
           <ModelPricing v-model="editingPricing" show-rates-key="CostRates" title="成本">
             <template #title-extra>
-              <el-button size="small" @click="onOpenCatalog">从 models.dev 获取参考价</el-button>
+              <el-button size="small" @click="catalogRef?.open()">从 models.dev 获取参考价</el-button>
+              <el-button size="small" @click="syncFromExternal">从对外模型同步定价</el-button>
             </template>
           </ModelPricing>
         </div>
@@ -862,118 +767,13 @@ function onRemoveRow(index: number) {
       </template>
     </el-dialog>
 
-    <!-- models.dev 参考价市场（成本定价取数） -->
-    <el-dialog v-model="catOpen" title="models.dev 参考价市场" width="920px" top="6vh">
-      <div class="cat-toolbar">
-        <el-input
-          v-model="catQ"
-          placeholder="搜索模型 ID 或供应商，如 deepseek / gpt-4o"
-          clearable
-          style="width: 320px"
-          @keyup.enter="onCatalogSearch"
-          @clear="onCatalogSearch"
-        />
-        <el-button type="primary" :loading="catLoading" @click="onCatalogSearch">搜索</el-button>
-        <el-button :loading="catSyncing" plain @click="onSyncNow">立即同步 models.dev</el-button>
-        <span class="cat-hint">同一模型在不同供应商下可能有不同的模型 ID 与价格，请选择与你渠道对应的供应商。</span>
-      </div>
-
-      <el-table
-        v-loading="catLoading"
-        :data="catList"
-        border
-        max-height="400"
-        highlight-current-row
-        @current-change="(row: CatalogEntry | null) => (selectedEntry = row)"
-      >
-        <el-table-column label="供应商" min-width="100" show-overflow-tooltip>
-          <template #default="{ row }">
-            <span>{{ row.Provider }}</span>
-            <el-tag
-              v-if="modelNamePrefix && row.Provider.toLowerCase() === modelNamePrefix.toLowerCase()"
-              size="small"
-              type="primary"
-              effect="light"
-              class="offi-tag"
-            >
-              官方
-            </el-tag>
-          </template>
-        </el-table-column>
-        <el-table-column label="模型 ID" min-width="130" show-overflow-tooltip>
-          <template #default="{ row }">
-            <span>{{ row.ModelID }}</span>
-            <el-tag
-              v-if="currentModelId && row.ModelID === currentModelId"
-              size="small"
-              type="success"
-              effect="light"
-              class="rec-tag"
-            >
-              推荐
-            </el-tag>
-          </template>
-        </el-table-column>
-        <el-table-column label="输入" width="130" align="right">
-          <template #default="{ row }">
-            <div class="pcell">
-              <span class="cny">{{ usdToCnyPerM(row.InputUSD) }}</span>
-              <span class="credit">≈ {{ usdToCredits(row.InputUSD) }} 积分</span>
-            </div>
-          </template>
-        </el-table-column>
-        <el-table-column label="输出" width="130" align="right">
-          <template #default="{ row }">
-            <div class="pcell">
-              <span class="cny">{{ usdToCnyPerM(row.OutputUSD) }}</span>
-              <span class="credit">≈ {{ usdToCredits(row.OutputUSD) }} 积分</span>
-            </div>
-          </template>
-        </el-table-column>
-        <el-table-column label="缓存读" width="130" align="right">
-          <template #default="{ row }">
-            <div v-if="row.CacheReadUSD > 0" class="pcell">
-              <span class="cny">{{ usdToCnyPerM(row.CacheReadUSD) }}</span>
-              <span class="credit">≈ {{ usdToCredits(row.CacheReadUSD) }} 积分</span>
-            </div>
-            <span v-else class="zero">—</span>
-          </template>
-        </el-table-column>
-        <el-table-column label="缓存写" width="130" align="right">
-          <template #default="{ row }">
-            <div v-if="row.CacheWriteUSD > 0" class="pcell">
-              <span class="cny">{{ usdToCnyPerM(row.CacheWriteUSD) }}</span>
-              <span class="credit">≈ {{ usdToCredits(row.CacheWriteUSD) }} 积分</span>
-            </div>
-            <span v-else class="zero">—</span>
-          </template>
-        </el-table-column>
-        <el-table-column label="推理" width="130" align="right">
-          <template #default="{ row }">
-            <div v-if="row.ReasoningUSD > 0" class="pcell">
-              <span class="cny">{{ usdToCnyPerM(row.ReasoningUSD) }}</span>
-              <span class="credit">≈ {{ usdToCredits(row.ReasoningUSD) }} 积分</span>
-            </div>
-            <span v-else class="zero">—</span>
-          </template>
-        </el-table-column>
-      </el-table>
-      <div class="cat-status">
-        <span v-if="catUpdatedAt" class="status-item">数据同步于 {{ fmtDateTime(catUpdatedAt) }}</span>
-        <span v-else class="status-item">价格数据尚未同步（服务启动或每 60 分钟拉取一次）</span>
-        <span v-if="catTotal" class="status-item">命中 {{ catTotal }} 条</span>
-      </div>
-      <el-empty v-if="!catLoading && !catList.length" description="未找到匹配的模型价格（同步数据来自后端定时拉取的 models.dev 缓存）" />
-      <p class="ref-note">
-        models.dev 提供各供应商参考价（模型 ID / 输入输出 / 缓存读写 / 推理）。表中数值为折算后的倍率建议值，点击「应用到成本」将其写入成本对应价格段（models.dev 未提供的段保留原值）。
-      </p>
-      <template #footer>
-        <el-button @click="catOpen = false">取消</el-button>
-        <el-button type="primary" :loading="catApplying" @click="onApplyCostCatalog">
-          应用到成本{{ selectedEntry ? `（${selectedEntry.Provider}/${selectedEntry.ModelID}）` : '' }}
-        </el-button>
-      </template>
-    </el-dialog>
+    <!-- models.dev 参考价市场（公共组件） -->
+    <ModelPriceCatalog
+      ref="catalogRef"
+      :model-name="currentModelId"
+      label="成本"
+      @apply="onApplyCostCatalog"
+    />
   </div>
 </template>
 
@@ -1107,58 +907,5 @@ function onRemoveRow(index: number) {
 }
 .rt-ctrl {
   width: 100%;
-}
-/* models.dev 参考价市场 */
-.cat-toolbar {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-bottom: 12px;
-  flex-wrap: wrap;
-}
-.cat-hint {
-  font-size: 12px;
-  color: var(--color-text-tertiary);
-}
-.cat-status {
-  display: flex;
-  gap: 16px;
-  margin-top: 8px;
-  font-size: 12px;
-  color: var(--color-text-secondary);
-}
-.status-item {
-  white-space: nowrap;
-}
-.rec-tag {
-  margin-left: 8px;
-}
-.offi-tag {
-  margin-left: 8px;
-}
-.credit {
-  color: var(--brand-primary);
-  font-size: 12px;
-  font-weight: 500;
-  white-space: nowrap;
-}
-.pcell {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-end;
-  gap: 2px;
-}
-.cny {
-  color: var(--color-text);
-  font-size: 12px;
-}
-.zero {
-  color: var(--color-text-tertiary);
-  font-size: 12px;
-}
-.ref-note {
-  font-size: 12px;
-  color: var(--color-text-secondary);
-  margin-top: 12px;
 }
 </style>

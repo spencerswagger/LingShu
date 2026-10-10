@@ -179,7 +179,7 @@ async function saveFallback() {
       </div>
 
       <!-- 全局时段/分档默认值 抽屉 -->
-      <el-drawer v-model="fallbackOpen" title="全局时段/分档默认值" :size="560">
+      <el-drawer v-model="fallbackOpen" title="全局时段/分档默认值" :size="720">
         <div class="fallback-tip">
           当前积分换算 R 值：{{ r }}。这里仅维护时段系数与上下文分档，R 值请在「积分换算」区块修改。
         </div>

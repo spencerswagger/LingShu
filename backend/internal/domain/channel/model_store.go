@@ -30,7 +30,8 @@ type ChannelModel struct {
 	RateLimit       RateLimitConfig
 	HealthProbe     HealthProbeConfig
 	Reliability     ReliabilityConfig
-	ExternalName    string // JOIN 展示用（渠道/对外模型关系）
+	ExternalName    string // JOIN 展示用（对外模型名）
+	ChannelName     string // JOIN 展示用（所属渠道名，仅 ListAll 查询填充）
 	CreatedAt       time.Time
 	UpdatedAt       time.Time
 }
@@ -148,6 +149,58 @@ func scanChannelModelJoinExt(row interface{ Scan(...any) error }) (*ChannelModel
 	return &m, nil
 }
 
+// cmColsJoinExtChannel 列出「JOIN 对外模型 + 渠道」查询使用的列（ListAll 用）。
+const cmColsJoinExtChannel = `cm.id, cm.channel_id, cm.internal_model_id, cm.external_model_id,
+	cm.cost_rates, cm.time_config, cm.context_tiers, cm.state, cm.rate_limit, cm.health_probe,
+	cm.reliability, cm.created_at, cm.updated_at, em.external_name, ch.name`
+
+// scanChannelModelJoinExtChannel 将「JOIN 对外模型 + 渠道」的一行扫描到 *ChannelModel，解析 JSONB 列。
+func scanChannelModelJoinExtChannel(row interface{ Scan(...any) error }) (*ChannelModel, error) {
+	var m ChannelModel
+	var costRaw, timeRaw, tiersRaw, rlRaw, hpRaw, relRaw []byte
+	var state string
+	err := row.Scan(&m.ID, &m.ChannelID, &m.InternalModelID, &m.ExternalModelID,
+		&costRaw, &timeRaw, &tiersRaw, &state, &rlRaw, &hpRaw, &relRaw,
+		&m.CreatedAt, &m.UpdatedAt, &m.ExternalName, &m.ChannelName)
+	if err != nil {
+		return nil, err
+	}
+	m.State = State(state)
+	if len(costRaw) > 0 {
+		if err := json.Unmarshal(costRaw, &m.CostRates); err != nil {
+			return nil, fmt.Errorf("parse cost_rates: %w", err)
+		}
+	}
+	if len(timeRaw) > 0 && string(timeRaw) != "null" {
+		var tc billing.TimeCoeffConfig
+		if err := json.Unmarshal(timeRaw, &tc); err != nil {
+			return nil, fmt.Errorf("parse time_config: %w", err)
+		}
+		m.TimeConfig = &tc
+	}
+	if len(tiersRaw) > 0 && string(tiersRaw) != "null" {
+		if err := json.Unmarshal(tiersRaw, &m.ContextTiers); err != nil {
+			return nil, fmt.Errorf("parse context_tiers: %w", err)
+		}
+	}
+	if len(rlRaw) > 0 {
+		if err := json.Unmarshal(rlRaw, &m.RateLimit); err != nil {
+			return nil, fmt.Errorf("parse rate_limit: %w", err)
+		}
+	}
+	if len(hpRaw) > 0 {
+		if err := json.Unmarshal(hpRaw, &m.HealthProbe); err != nil {
+			return nil, fmt.Errorf("parse health_probe: %w", err)
+		}
+	}
+	if len(relRaw) > 0 {
+		if err := json.Unmarshal(relRaw, &m.Reliability); err != nil {
+			return nil, fmt.Errorf("parse reliability: %w", err)
+		}
+	}
+	return &m, nil
+}
+
 // GetByID 按主键查询渠道内部模型；不存在返回 sql.ErrNoRows。
 func (s *channelModelStore) GetByID(ctx context.Context, id int64) (*ChannelModel, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT `+cmCols+` FROM channel_models WHERE id = $1 AND deleted_at IS NULL`, id)
@@ -178,6 +231,32 @@ func (s *channelModelStore) ListByExternal(ctx context.Context, externalModelID 
 	return s.listPlain(ctx,
 		`SELECT `+cmCols+` FROM channel_models
 		 WHERE external_model_id = $1 AND state != 'DISABLED' AND deleted_at IS NULL ORDER BY channel_id ASC, id ASC`, externalModelID)
+}
+
+// ListAll 查询全量渠道内部模型（跨渠道，含禁用），JOIN 出对外模型名与渠道名，按 渠道+id 升序。
+func (s *channelModelStore) ListAll(ctx context.Context) ([]ChannelModel, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+cmColsJoinExtChannel+` FROM channel_models cm
+		 LEFT JOIN external_models em ON em.id = cm.external_model_id
+		 JOIN channels ch ON ch.id = cm.channel_id
+		 WHERE cm.deleted_at IS NULL
+		 ORDER BY cm.channel_id ASC, cm.id ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("list channel models: %w", err)
+	}
+	defer rows.Close()
+	list := make([]ChannelModel, 0, 8)
+	for rows.Next() {
+		m, err := scanChannelModelJoinExtChannel(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan channel model: %w", err)
+		}
+		list = append(list, *m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return list, nil
 }
 
 // listPlain 用非 JOIN 的 10 列解析（ListByExternal 用）。

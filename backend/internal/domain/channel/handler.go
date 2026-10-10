@@ -267,6 +267,7 @@ type viewChannelModel struct {
 	InternalModelID string                   `json:"InternalModelID"`
 	ExternalModelID int64                    `json:"ExternalModelID,string"`
 	ExternalName    string                   `json:"ExternalName,omitempty"`
+	ChannelName     string                   `json:"ChannelName,omitempty"`
 	CostRates       billing.WireRates        `json:"CostRates"`
 	TimeConfig      *billing.TimeCoeffConfig `json:"TimeConfig,omitempty"`
 	ContextTiers    []billing.TierRule       `json:"ContextTiers,omitempty"`
@@ -285,6 +286,7 @@ func toChannelModelView(m *ChannelModel) viewChannelModel {
 		InternalModelID: m.InternalModelID,
 		ExternalModelID: m.ExternalModelID,
 		ExternalName:    m.ExternalName,
+		ChannelName:     m.ChannelName,
 		CostRates:       billing.WireRates(m.CostRates),
 		TimeConfig:      m.TimeConfig,
 		ContextTiers:    m.ContextTiers,
@@ -328,6 +330,21 @@ func (h *Handler) HandleListChannelModels(w http.ResponseWriter, r *http.Request
 		return
 	}
 	models, err := h.svc.ListChannelModels(r.Context(), id)
+	if err != nil {
+		writeServiceErr(w, r, err)
+		return
+	}
+	list := make([]viewChannelModel, 0, len(models))
+	for i := range models {
+		list = append(list, toChannelModelView(&models[i]))
+	}
+	resp.OK(w, r, list)
+}
+
+// HandleListAllChannelModels GET /api/v1/admin/channel-models
+// 返回跨渠道全量渠道内部模型（含所属渠道名与绑定对外模型名），供对外模型编辑页「从内部模型同步定价」。
+func (h *Handler) HandleListAllChannelModels(w http.ResponseWriter, r *http.Request) {
+	models, err := h.svc.ListAllChannelModels(r.Context())
 	if err != nil {
 		writeServiceErr(w, r, err)
 		return

@@ -73,6 +73,56 @@ func TestChannelModelStore_ListByExternal(t *testing.T) {
 	}
 }
 
+// cmJoinExtChannelRow 构造 JOIN 对外模型 + 渠道 的 15 列行（列顺序需与 cmColsJoinExtChannel / scanChannelModelJoinExtChannel 严格一致）。
+func cmJoinExtChannelRow(m *ChannelModel, costJSON string, timeJSON, tiersJSON any, externalName, channelName string) *sqlmock.Rows {
+	return sqlmock.NewRows([]string{
+		"id", "channel_id", "internal_model_id", "external_model_id", "cost_rates",
+		"time_config", "context_tiers", "state", "rate_limit", "health_probe", "reliability",
+		"created_at", "updated_at", "external_name", "channel_name",
+	}).AddRow(m.ID, m.ChannelID, m.InternalModelID, m.ExternalModelID, costJSON,
+		timeJSON, tiersJSON, string(m.State), `{}`, `{}`, `{}`, m.CreatedAt, m.UpdatedAt,
+		externalName, channelName)
+}
+
+func TestChannelModelStore_ListAll(t *testing.T) {
+	s, mock := mockCMStore(t)
+	now := time.Now()
+	q := `SELECT ` + cmColsJoinExtChannel + ` FROM channel_models cm
+		 LEFT JOIN external_models em ON em.id = cm.external_model_id
+		 JOIN channels ch ON ch.id = cm.channel_id
+		 WHERE cm.deleted_at IS NULL
+		 ORDER BY cm.channel_id ASC, cm.id ASC`
+	rows := cmJoinExtChannelRow(
+		&ChannelModel{ID: 1, ChannelID: 1, InternalModelID: "qwen-max", ExternalModelID: 2, State: StateNormal, CreatedAt: now, UpdatedAt: now},
+		`{"input":1}`, nil, nil, "qwen-max-ext", "阿里云",
+	).AddRow(2, 3, "qwen-plus", 5, `{}`,
+		`{"peak":1.5}`, `[{"threshold":1000,"coeff":0.9}]`, "NORMAL", `{}`, `{}`, `{}`, now, now, "qwen-plus-ext", "智谱")
+	mock.ExpectQuery(regexp.QuoteMeta(q)).WillReturnRows(rows)
+
+	list, err := s.ListAll(context.Background())
+	if err != nil {
+		t.Fatalf("list all: %v", err)
+	}
+	if len(list) != 2 {
+		t.Fatalf("expected 2, got %d", len(list))
+	}
+	if list[0].ExternalName != "qwen-max-ext" || list[0].ChannelName != "阿里云" {
+		t.Fatalf("unexpected row0 names: %+v", list[0])
+	}
+	if list[0].TimeConfig != nil || list[0].ContextTiers != nil {
+		t.Fatalf("row0 expect nil time_config/context_tiers, got %+v / %+v", list[0].TimeConfig, list[0].ContextTiers)
+	}
+	if list[1].ExternalName != "qwen-plus-ext" || list[1].ChannelName != "智谱" {
+		t.Fatalf("unexpected row1 names: %+v", list[1])
+	}
+	if list[1].TimeConfig == nil || list[1].ContextTiers == nil {
+		t.Fatalf("row1 expect non-nil time_config/context_tiers, got %+v / %+v", list[1].TimeConfig, list[1].ContextTiers)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("mock expectations: %v", err)
+	}
+}
+
 func TestChannelModelStore_Insert_Conflict(t *testing.T) {
 	s, mock := mockCMStore(t)
 	rates := billing.Rates{"input": 0.8, "output": 1.6, "cache_read": 0.05, "cache_write": 0.2, "reasoning": 0.8}

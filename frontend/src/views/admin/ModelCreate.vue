@@ -4,6 +4,7 @@ import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { createExternalModel } from '@/api/admin'
 import ModelPricing from '@/components/ModelPricing.vue'
+import ModelPriceCatalog from '@/components/ModelPriceCatalog.vue'
 import ErrorBubble from '@/components/ErrorBubble.vue'
 
 const router = useRouter()
@@ -21,6 +22,13 @@ const pricing = reactive<Record<string, any>>({
   TimeConfig: null,
   ContextTiers: null,
 })
+
+// models.dev 参考价市场（公共组件）
+const catalogRef = ref<InstanceType<typeof ModelPriceCatalog> | null>(null)
+// 只合并 models.dev 提供的价段，未提供的段保留原值
+function onApplyCatalog(partial: Record<string, number>) {
+  pricing.SaleRates = { ...pricing.SaleRates, ...partial }
+}
 
 async function onSubmit() {
   if (!form.ExternalName.trim()) return ElMessage.warning('请填写对外模型名称')
@@ -48,7 +56,7 @@ async function onSubmit() {
 
 <template>
   <div class="page-container">
-    <div v-loading="saving" class="card" style="max-width: 1080px">
+    <div v-loading="saving" class="card">
       <el-form label-width="110px" class="mc-grid">
         <el-form-item label="对外名称" required>
           <el-input v-model="form.ExternalName" placeholder="如 gpt-4o，作为开发者调用时的模型名" />
@@ -64,7 +72,13 @@ async function onSubmit() {
             show-rates-key="SaleRates"
             title="售价"
             @update:model-value="Object.assign(pricing, $event)"
-          />
+          >
+            <template #title-extra>
+              <el-button size="small" @click="catalogRef?.open()">
+                从 models.dev 获取参考价
+              </el-button>
+            </template>
+          </ModelPricing>
         </div>
 
         <el-form-item class="span-2 form-actions">
@@ -79,6 +93,14 @@ async function onSubmit() {
         :request-id="errInfo.requestId"
       />
     </div>
+
+    <!-- models.dev 参考价市场（公共组件） -->
+    <ModelPriceCatalog
+      ref="catalogRef"
+      :model-name="form.ExternalName"
+      label="售价"
+      @apply="onApplyCatalog"
+    />
   </div>
 </template>
 
