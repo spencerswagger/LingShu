@@ -69,7 +69,9 @@ func TestMachine_429Storm_goDrain(t *testing.T) {
 }
 
 func TestMachine_P99Latency_exceed_goDrain(t *testing.T) {
-	m := NewMachine(DefaultMachineConfig())
+	cfg := DefaultMachineConfig()
+	cfg.P99LatencyMS = 5000 // 显式低阈值验证「P99 超限 → DRAIN」机制（默认阈值已提至 120000ms）
+	m := NewMachine(cfg)
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	m.SetClock(func() time.Time { return base })
 
