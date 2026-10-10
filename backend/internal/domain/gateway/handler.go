@@ -314,26 +314,45 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint string)
 	//    - 全部候选都失败 → 退还预扣并返回聚合错误
 	sess := g.router.Sessions()
 	sessObj, hasSession := sess.Lookup(sessionID)
+	// 请求增量 diff：计算本次请求的增量消息与全量指纹（call_log 采集用，
+	// 新会话也在此初始化指纹，由下方 Attach 写入会话）。
+	reqMsgs, msgFps := g.captureReqIncrement(sessObj, body)
 	sawLimit := false  // 出现过限流类失败（本地限流 或 上游 429）
 	sawOther := false  // 出现过非限流类的可重试失败（上游 401/402/403/404/5xx、网络类）
 	attempted := false // 是否至少有一次候选真正发出上游调用（用于全被本地拦截时的账单兜底）
+	// 决策轨迹：每个候选渠道的处理结果与跳过原因（call_log decision 用，雪花 ID 以字符串序列化）。
+	attempts := make([]map[string]any, 0, len(routes))
 	for _, cr := range routes {
+		order := len(attempts) + 1
+		attempt := func(reason string) map[string]any {
+			return map[string]any{
+				"order":             order,
+				"channel_id":        strconv.FormatInt(cr.ChannelID, 10),
+				"channel_key_id":    strconv.FormatInt(cr.ChannelKeyID, 10),
+				"internal_model_id": cr.InternalModelID,
+				"reason":            reason,
+			}
+		}
 		// 密钥为运行时实体：路由候选已带 ChannelKeyID，这里做入口复查（状态可能已被灰度切换）。
 		// 统一读 Machine.State()：401 自动禁用后立即生效（kr.Key.State 是落库快照，可能滞后）。
 		kr, ok := g.channels.GetKeyRuntime(cr.ChannelKeyID)
 		if !ok || kr.Machine.State() == channel.StateDisabled {
+			attempts = append(attempts, attempt("禁用"))
 			continue
 		}
 		mr, mok := g.channels.GetModelRuntime(cr.ChannelID, cr.ModelRowID)
 		if !mok {
+			attempts = append(attempts, attempt("无模型运行时"))
 			continue
 		}
 		if mr.Machine.State() == channel.StateDisabled {
+			attempts = append(attempts, attempt("禁用"))
 			continue
 		}
 		rt, ok := g.channels.GetRuntime(cr.ChannelID)
 		if !ok {
 			l.Error("channel not in runtime", "channel_id", cr.ChannelID)
+			attempts = append(attempts, attempt("无渠道运行时"))
 			continue
 		}
 		// 密钥凭据解密失败/为空时，Manager 已把 CredentialPlain 清空（绝不外发密文）。
@@ -341,14 +360,18 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint string)
 			l.Error("channel key credential unavailable", "channel_key_id", cr.ChannelKeyID, "channel_id", cr.ChannelID)
 			g.channels.FeedResult(cr.ChannelKeyID, cr.ModelRowID, channel.Feedback{IsSuccess: false, Now: g.now()})
 			attempted = true // 该分支已自行落 failed 账单，终态不再兜底
-			g.recordFailure(ctx, &router.RouteResult{ChannelID: cr.ChannelID, ChannelKeyID: cr.ChannelKeyID, InternalModelID: cr.InternalModelID,
+			bid := g.recordFailure(ctx, &router.RouteResult{ChannelID: cr.ChannelID, ChannelKeyID: cr.ChannelKeyID, InternalModelID: cr.InternalModelID,
 				ModelRowID: cr.ModelRowID, ExternalModelID: cr.ExternalModelID, Revision: cr.Revision},
 				model, token, "", sessionID, sessionName, "密钥凭据不可用", msSince(start))
+			g.writeCallLog(ctx, bid, "", token, routeResFor(cr), model, "", sessionID, reqMsgs,
+				"error", "", "failed", "密钥凭据不可用", msSince(start), nil, nil)
+			attempts = append(attempts, attempt("凭据不可用"))
 			continue
 		}
 		prov, ok := g.providerFactory(rt.Channel.Protocol, endpoint)
 		if !ok {
 			l.Error("unsupported protocol", "protocol", rt.Channel.Protocol)
+			attempts = append(attempts, attempt("协议不支持"))
 			continue
 		}
 		routeRes := &router.RouteResult{ChannelID: cr.ChannelID, ChannelKeyID: cr.ChannelKeyID, InternalModelID: cr.InternalModelID,
@@ -362,10 +385,12 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint string)
 		// 限流：模型级窗口 → 密钥级窗口（任一超限 → 下一候选）。
 		if err := g.acquireLimit(ctx, mr.Model.RateLimit, mr.Limiter, estTokens(body)); err != nil {
 			sawLimit = true
+			attempts = append(attempts, attempt("限流"))
 			continue
 		}
 		if err := g.acquireLimit(ctx, rt.Channel.RateLimit, kr.Limiter, estTokens(body)); err != nil {
 			sawLimit = true
+			attempts = append(attempts, attempt("限流"))
 			continue
 		}
 
@@ -375,18 +400,20 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint string)
 		if !existing && sessionID != "" {
 			ttl := time.Duration(g.channels.SessionTTL(cr.ChannelID)) * time.Minute
 			ok2, _ := sess.Attach(&router.Session{
-				SessionID:       sessionID,
-				UserID:          token.UserID,
-				TokenID:         token.ID,
-				TokenDisplay:    token.DisplayName,
-				Model:           model,
-				SessionRaw:      sessionRaw,
-				Name:            sessionNameFor(sessionRaw, body),
-				ChannelKeyID:    cr.ChannelKeyID,
-				InternalModelID: cr.InternalModelID,
-				ExpireAt:        g.now().Add(ttl),
+				SessionID:           sessionID,
+				UserID:              token.UserID,
+				TokenID:             token.ID,
+				TokenDisplay:        token.DisplayName,
+				Model:               model,
+				SessionRaw:          sessionRaw,
+				Name:                sessionNameFor(sessionRaw, body),
+				ChannelKeyID:        cr.ChannelKeyID,
+				InternalModelID:     cr.InternalModelID,
+				ExpireAt:            g.now().Add(ttl),
+				LastMsgFingerprints: msgFps,
 			}, g.channels.KeyMaxSessions(cr.ChannelKeyID))
 			if !ok2 {
+				attempts = append(attempts, attempt("会话满"))
 				continue // 该密钥并发会话满 → 下一候选
 			}
 		}
@@ -401,10 +428,10 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint string)
 		var out *fwdOutcome
 		if isStream {
 			attempted = true
-			out = g.serveStream(w, r, start, prov, rt, routeRes, kr.CredentialPlain, rewritten, model, token, pricingMode, sessionID, sessionName, preConsumed)
+			out = g.serveStream(w, r, start, prov, rt, routeRes, kr.CredentialPlain, rewritten, model, token, pricingMode, sessionID, sessionName, preConsumed, reqMsgs)
 		} else {
 			attempted = true
-			out = g.serveNonStream(w, r, start, prov, rt, routeRes, kr.CredentialPlain, rewritten, model, token, pricingMode, sessionID, sessionName, preConsumed)
+			out = g.serveNonStream(w, r, start, prov, rt, routeRes, kr.CredentialPlain, rewritten, model, token, pricingMode, sessionID, sessionName, preConsumed, reqMsgs)
 		}
 		if out.responded {
 			if sessionID != "" {
@@ -415,42 +442,78 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint string)
 			if out.refundPre {
 				g.refundAllPreConsume(ctx, token.UserID, preConsumed, "请求失败退回")
 			}
+			switch {
+			case out.billFailed:
+				attempts = append(attempts, attempt("计费失败"))
+			case out.refundPre:
+				attempts = append(attempts, attempt("上游失败"))
+			default:
+				attempts = append(attempts, attempt("success"))
+			}
 			return
 		}
 		// retry：本次失败可安全转移（响应未写出、上游未计费），继续尝试下一候选。
 		if out.is429 {
+			attempts = append(attempts, attempt("上游失败(429)"))
 			sawLimit = true
 		} else {
+			attempts = append(attempts, attempt("上游失败"))
 			sawOther = true
 		}
 	}
 
 	// 所有候选都未成功。仅当失败全部属于限流类（本地限流/上游 429）时才回 429，
 	// 否则统一回「无可用渠道」——避免把 401/402/5xx 等误报成限流。
+	rejectDecision := func() map[string]any {
+		return map[string]any{
+			"attempts":     attempts,
+			"time_coeff":   0,
+			"ctx_coeff":    0,
+			"pre_consumed": preConsumed,
+			"result":       "rejected",
+		}
+	}
 	if sawLimit && !sawOther {
 		g.refundAllPreConsume(ctx, token.UserID, preConsumed, "请求失败退回（限流）")
 		// 全部候选被本地拦截（限流/并发/禁用等，未发出任何上游调用）时补一条失败账单；
 		// 已发出上游调用并落账的（如 429 重试）不重复落账。
 		if !attempted {
-			g.recordGatewayReject(ctx, model, token, pricingMode, sessionID, msgRateLimited)
+			bid := g.recordGatewayReject(ctx, model, token, pricingMode, sessionID, msgRateLimited)
+			g.writeCallLog(ctx, bid, "", token, &router.RouteResult{}, model, pricingMode, sessionID,
+				reqMsgs, "error", "", "failed", msgRateLimited, msSince(start), nil, rejectDecision())
 		}
 		writeOpenAIError(w, http.StatusTooManyRequests, msgRateLimited)
 		return
 	}
 	g.refundAllPreConsume(ctx, token.UserID, preConsumed, "请求失败退回（无可用渠道）")
 	if !attempted {
-		g.recordGatewayReject(ctx, model, token, pricingMode, sessionID, msgNoAvailable)
+		bid := g.recordGatewayReject(ctx, model, token, pricingMode, sessionID, msgNoAvailable)
+		g.writeCallLog(ctx, bid, "", token, &router.RouteResult{}, model, pricingMode, sessionID,
+			reqMsgs, "error", "", "failed", msgNoAvailable, msSince(start), nil, rejectDecision())
 	}
 	writeOpenAIError(w, http.StatusServiceUnavailable, msgNoAvailable)
 }
 
 // recordGatewayReject 记录一次未进入渠道的网关拒绝（零余额/未路由/候选全部被拦截等）为 failed 账单，
 // 保证「每次请求必有一条账单记录」；渠道维度留空（未实际路由到任何渠道）。
-func (g *Gateway) recordGatewayReject(ctx context.Context, model string, token *identity.Token, pricingMode, sessionID, reason string) {
+// 返回关联的 billing_id（Record 失败或未装配计费时为空串），供 call_log 关联。
+func (g *Gateway) recordGatewayReject(ctx context.Context, model string, token *identity.Token, pricingMode, sessionID, reason string) string {
 	if g.billing == nil || token == nil {
-		return
+		return ""
 	}
-	g.recordFailure(ctx, &router.RouteResult{}, model, token, pricingMode, sessionID, "", reason, nil)
+	return g.recordFailure(ctx, &router.RouteResult{}, model, token, pricingMode, sessionID, "", reason, nil)
+}
+
+// routeResFor 由路由候选构造最小 RouteResult（入口复查失败——凭据不可用等——用于账单与日志关联）。
+func routeResFor(cr *router.ChannelRoute) *router.RouteResult {
+	return &router.RouteResult{
+		ChannelID:       cr.ChannelID,
+		ChannelKeyID:    cr.ChannelKeyID,
+		InternalModelID: cr.InternalModelID,
+		ModelRowID:      cr.ModelRowID,
+		ExternalModelID: cr.ExternalModelID,
+		Revision:        cr.Revision,
+	}
 }
 
 // refundPreConsume 退还一次预扣冻结（失败时只记日志，不回滚请求语义）。
@@ -543,7 +606,7 @@ type fwdOutcome struct {
 func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start time.Time,
 	prov Provider, rt *channel.RuntimeChannel, routeRes *router.RouteResult, cred string,
 	body []byte, model string, token *identity.Token, pricingMode, sessionID, sessionName string,
-	preConsumed float64) *fwdOutcome {
+	preConsumed float64, reqMsgs []json.RawMessage) *fwdOutcome {
 
 	ctx := r.Context()
 	req, err := prov.BuildUpstreamRequest(ctx, rt.Channel.BaseURL, cred, body, false)
@@ -551,7 +614,9 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 		// 本地构建失败，未发出任何上游调用 → 可安全转移。
 		g.logError(rt.Channel.ID, "build upstream request", err)
 		g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, channel.Feedback{IsSuccess: false, Now: g.now()})
-		g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "构建上游请求失败", msSince(start))
+		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "构建上游请求失败", msSince(start))
+		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
+			"error", "构建上游请求失败", "failed", "构建上游请求失败", msSince(start), nil, nil)
 		return &fwdOutcome{retry: true}
 	}
 	req, wrote := withWriteTrace(req)
@@ -561,11 +626,15 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 		g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, channel.Feedback{IsSuccess: false, Now: g.now()})
 		if !wrote.Load() {
 			// 请求体未送达上游：上游不可能计费 → 可安全转移。
-			g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "上游连接失败", msSince(start))
+			bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "上游连接失败", msSince(start))
+			g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
+				"error", "上游连接失败", "failed", "上游连接失败", msSince(start), nil, nil)
 			return &fwdOutcome{retry: true}
 		}
 		// 请求已送达后失败（多为响应超时）：上游可能已生成并计费，转移会导致上游重复计费 → 不转移。
-		g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "上游请求失败（已送达，不转移）", msSince(start))
+		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "上游请求失败（已送达，不转移）", msSince(start))
+		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
+			"error", "上游请求失败（已送达，不转移）", "failed", "上游请求失败（已送达，不转移）", msSince(start), nil, nil)
 		writeOpenAIError(w, http.StatusBadGateway, msgUpstreamDown)
 		return &fwdOutcome{responded: true, refundPre: true}
 	}
@@ -577,7 +646,9 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 		if err != nil {
 			// 已收到 2xx：上游已完成生成并计费，转移会造成上游重复计费 → 不转移。
 			g.logError(rt.Channel.ID, "read upstream body", err)
-			g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "读取上游响应失败", msSince(start))
+			bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "读取上游响应失败", msSince(start))
+			g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
+				"error", "读取上游响应失败", "failed", "读取上游响应失败", msSince(start), nil, nil)
 			writeOpenAIError(w, http.StatusBadGateway, msgUpstreamDown)
 			return &fwdOutcome{responded: true, refundPre: true}
 		}
@@ -592,21 +663,28 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 			// 上游未返回 usage：按输入估算记账（保证每次调用都消耗积分，不允许赊账）。
 			usage = billing.Usage{Input: int64(estTokens(body))}
 		}
-		ch, berr := g.recordBilling(ctx, routeRes, model, token, usage, pricingMode, sessionID, sessionName, preConsumed, dur, nil)
+		ch, bid, berr := g.recordBilling(ctx, routeRes, model, token, usage, pricingMode, sessionID, sessionName, preConsumed, dur, nil)
 		if berr != nil {
 			out.billFailed = true
 			if isInsufficient(berr) {
 				g.logger.Warn("billing insufficient", "user_id", token.UserID, "err", berr)
 				// billing.Record 内部已落一条 failed（含实际 tokens/rates/系数与余额不足原因），
 				// 网关不再重复落账，保证每次请求恰好一条记录。
+				g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
+					"non_stream", string(raw), "failed", "积分余额不足，计费失败", dur, nil, nil)
 				writeOpenAIError(w, http.StatusPaymentRequired, msgInsufficient)
 				return &fwdOutcome{responded: true, billFailed: true}
 			}
 			g.logError(rt.Channel.ID, "record billing failed", berr)
+			g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
+				"non_stream", string(raw), "failed", "计费失败", dur, nil, nil)
 			writeOpenAIError(w, http.StatusInternalServerError, msgInternal)
 			return &fwdOutcome{responded: true, billFailed: true}
 		}
 		out.charged = ch
+		// 调用日志：成功路径（已知 billingID 且响应写出前）。
+		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
+			"non_stream", string(raw), "completed", "", dur, nil, nil)
 
 		// 渠道透明：只保留下游 Content-Type，清掉上游杂项（request-id 等），不下发任何 X-Channel* 头。
 		h := w.Header()
@@ -618,16 +696,24 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 
 	case up.StatusCode == http.StatusTooManyRequests:
 		g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, channel.Feedback{Is429: true, Now: g.now()})
-		g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "上游返回 429（触发限流）", msSince(start))
+		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "上游返回 429（触发限流）", msSince(start))
+		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
+			"error", "", "failed", "上游返回 429（触发限流）", msSince(start), nil, nil)
 		return &fwdOutcome{retry: true, is429: true}
 	case up.StatusCode == http.StatusUnauthorized || up.StatusCode == http.StatusForbidden:
 		// 凭据可能失效：先转移下一候选；连续失败达阈值由状态机熔断（channel.Machine）。
 		g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, channel.Feedback{IsAuthFailure: true, Now: g.now()})
-		g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, fmt.Sprintf("上游返回 %d（渠道凭据可能失效）", up.StatusCode), msSince(start))
+		errMsg := fmt.Sprintf("上游返回 %d（渠道凭据可能失效）", up.StatusCode)
+		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, errMsg, msSince(start))
+		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
+			"error", "", "failed", errMsg, msSince(start), nil, nil)
 		return &fwdOutcome{retry: true}
 	default:
 		g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, feedbackFail(start))
-		g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, fmt.Sprintf("上游返回 %d", up.StatusCode), msSince(start))
+		errMsg := fmt.Sprintf("上游返回 %d", up.StatusCode)
+		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, errMsg, msSince(start))
+		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
+			"error", "", "failed", errMsg, msSince(start), nil, nil)
 		if retryableUpstreamStatus(up.StatusCode) {
 			return &fwdOutcome{retry: true}
 		}
@@ -649,7 +735,7 @@ func msSince(start time.Time) *int64 {
 func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time.Time,
 	prov Provider, rt *channel.RuntimeChannel, routeRes *router.RouteResult, cred string,
 	body []byte, model string, token *identity.Token, pricingMode, sessionID, sessionName string,
-	preConsumed float64) *fwdOutcome {
+	preConsumed float64, reqMsgs []json.RawMessage) *fwdOutcome {
 
 	ctx := r.Context()
 	req, err := prov.BuildUpstreamRequest(ctx, rt.Channel.BaseURL, cred, body, true)
@@ -657,7 +743,9 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		// 本地构建失败，未发出任何上游调用 → 可安全转移。
 		g.logError(rt.Channel.ID, "build upstream stream request", err)
 		g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, channel.Feedback{IsSuccess: false, Now: g.now()})
-		g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "构建上游流式请求失败", msSince(start))
+		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "构建上游流式请求失败", msSince(start))
+		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
+			"error", "构建上游流式请求失败", "failed", "构建上游流式请求失败", msSince(start), nil, nil)
 		return &fwdOutcome{retry: true}
 	}
 	req, wrote := withWriteTrace(req)
@@ -667,11 +755,15 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, channel.Feedback{IsSuccess: false, Now: g.now()})
 		if !wrote.Load() {
 			// 请求体未送达上游：上游不可能计费 → 可安全转移。
-			g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "上游流式连接失败", msSince(start))
+			bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "上游流式连接失败", msSince(start))
+			g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
+				"error", "上游流式连接失败", "failed", "上游流式连接失败", msSince(start), nil, nil)
 			return &fwdOutcome{retry: true}
 		}
 		// 请求已送达后失败（多为响应超时）：上游可能已生成并计费，转移会导致上游重复计费 → 不转移。
-		g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "上游流式请求失败（已送达，不转移）", msSince(start))
+		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "上游流式请求失败（已送达，不转移）", msSince(start))
+		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
+			"error", "上游流式请求失败（已送达，不转移）", "failed", "上游流式请求失败（已送达，不转移）", msSince(start), nil, nil)
 		writeOpenAIError(w, http.StatusBadGateway, msgUpstreamDown)
 		return &fwdOutcome{responded: true, refundPre: true}
 	}
@@ -681,11 +773,13 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 	case up.StatusCode >= 200 && up.StatusCode < 300:
 		// 记录首个 SSE chunk 写出时机（首字耗时）。
 		ft := &firstTokenWriter{ResponseWriter: w}
-		usage, herr := prov.HandleStream(ctx, up, ft)
+		usage, assistantMsg, herr := prov.HandleStream(ctx, up, ft)
 		dur := msSince(start)
 		if herr != nil && !errors.Is(herr, context.Canceled) {
 			g.logError(rt.Channel.ID, "stream handle failed", herr)
-			g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "流式传输中断", dur)
+			bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "流式传输中断", dur)
+			g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
+				"error", string(assistantMsg), "failed", "流式传输中断", dur, ft.firstTokenMs(start), nil)
 		}
 		// 流结束后计费（预扣已在前置阶段完成；此处按实际扣费，差额由 serve 结算退补）。
 		// 此时请求 context 已随响应结束被取消：用脱离取消、带超时的 context，避免计费被误中断。
@@ -696,7 +790,7 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 			// 上游未返回 usage（流式响应无 usage 块）：按输入估算记账，保证每次调用都消耗积分。
 			usage = billing.Usage{Input: int64(estTokens(body))}
 		}
-		ch, berr := g.recordBilling(billCtx, routeRes, model, token, usage, pricingMode, sessionID, sessionName, preConsumed, dur, ft.firstTokenMs(start))
+		ch, bid, berr := g.recordBilling(billCtx, routeRes, model, token, usage, pricingMode, sessionID, sessionName, preConsumed, dur, ft.firstTokenMs(start))
 		if berr != nil {
 			g.logger.Error("stream billing failed", "user_id", token.UserID,
 				"channel_id", rt.Channel.ID, "model", model, "err", berr)
@@ -704,20 +798,39 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		} else {
 			out.charged = ch
 		}
+		// 调用日志：流结束后采集（含 herr 失败分支的 resp_kind=error；正常/billFailed 为 stream）。
+		switch {
+		case herr != nil && !errors.Is(herr, context.Canceled):
+			// 失败分支已在上面记录（resp_kind=error）。
+		case out.billFailed:
+			g.writeCallLog(billCtx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
+				"stream", string(assistantMsg), "failed", "流式计费失败", dur, ft.firstTokenMs(start), nil)
+		default:
+			g.writeCallLog(billCtx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
+				"stream", string(assistantMsg), "completed", "", dur, ft.firstTokenMs(start), nil)
+		}
 		g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, feedbackSuccess(start))
 		return out
 	case up.StatusCode == http.StatusTooManyRequests:
 		g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, channel.Feedback{Is429: true, Now: g.now()})
-		g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "上游返回 429（触发限流）", msSince(start))
+		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "上游返回 429（触发限流）", msSince(start))
+		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
+			"error", "", "failed", "上游返回 429（触发限流）", msSince(start), nil, nil)
 		return &fwdOutcome{retry: true, is429: true}
 	case up.StatusCode == http.StatusUnauthorized || up.StatusCode == http.StatusForbidden:
 		// 凭据可能失效：先转移下一候选；连续失败达阈值由状态机熔断（channel.Machine）。
 		g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, channel.Feedback{IsAuthFailure: true, Now: g.now()})
-		g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, fmt.Sprintf("上游返回 %d（渠道凭据可能失效）", up.StatusCode), msSince(start))
+		errMsg := fmt.Sprintf("上游返回 %d（渠道凭据可能失效）", up.StatusCode)
+		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, errMsg, msSince(start))
+		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
+			"error", "", "failed", errMsg, msSince(start), nil, nil)
 		return &fwdOutcome{retry: true}
 	default:
 		g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, feedbackFail(start))
-		g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, fmt.Sprintf("上游返回 %d", up.StatusCode), msSince(start))
+		errMsg := fmt.Sprintf("上游返回 %d", up.StatusCode)
+		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, errMsg, msSince(start))
+		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
+			"error", "", "failed", errMsg, msSince(start), nil, nil)
 		if retryableUpstreamStatus(up.StatusCode) {
 			return &fwdOutcome{retry: true}
 		}
@@ -747,13 +860,13 @@ func (w *firstTokenWriter) firstTokenMs(start time.Time) *int64 {
 	return &v
 }
 
-// recordBilling 依据 pricing_mode 选型计费单价并调用计费服务，返回实际扣减的积分。
+// recordBilling 依据 pricing_mode 选型计费单价并调用计费服务，返回实际扣减的积分、关联 billing_id 与错误。
 //
 // 双层模型计价：sale 用对外模型 ext.SaleRates + 其模型级 time/tiers；cost 用选中渠道
 // channel_models 的 CostRates + 其模型级 time/tiers；任一模型级为空则回落全局（billing 内部实现）。
 func (g *Gateway) recordBilling(ctx context.Context, routeRes *router.RouteResult,
 	model string, token *identity.Token, usage billing.Usage, pricingMode, sessionID, sessionName string,
-	preConsumed float64, durationMs, firstTokenMs *int64) (float64, error) {
+	preConsumed float64, durationMs, firstTokenMs *int64) (float64, string, error) {
 
 	// 记账脱离请求取消：上游调用已发生，不能因下游断开/流式结束而丢失账单。
 	ctx, cancel := billingCtx(ctx)
@@ -761,11 +874,11 @@ func (g *Gateway) recordBilling(ctx context.Context, routeRes *router.RouteResul
 
 	ext, err := g.models.GetByExternalName(ctx, model)
 	if err != nil {
-		return 0, fmt.Errorf("resolve external model: %w", err)
+		return 0, "", fmt.Errorf("resolve external model: %w", err)
 	}
 	cm, err := g.channelModels.GetByChannelAndInternal(ctx, routeRes.ChannelID, routeRes.InternalModelID)
 	if err != nil {
-		return 0, fmt.Errorf("resolve channel model rates: %w", err)
+		return 0, "", fmt.Errorf("resolve channel model rates: %w", err)
 	}
 
 	var rateCharged billing.Rates
@@ -781,7 +894,7 @@ func (g *Gateway) recordBilling(ctx context.Context, routeRes *router.RouteResul
 		ctxTiers = ext.ContextTiers
 	}
 	if len(rateCharged) == 0 {
-		return 0, errors.New("model rates empty")
+		return 0, "", errors.New("model rates empty")
 	}
 	tokenID := token.ID
 	req := billing.RecordReq{
@@ -808,19 +921,20 @@ func (g *Gateway) recordBilling(ctx context.Context, routeRes *router.RouteResul
 	}
 	rec, err := g.billing.Record(ctx, req)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	if rec == nil {
-		return 0, nil
+		return 0, "", nil
 	}
-	return rec.CreditsConsumed, nil
+	return rec.CreditsConsumed, rec.BillingID, nil
 }
 
 // recordFailure 记录一次失败调用（不扣积分，仅留痕）：上游错误/下游断开等原因。
+// 返回关联的 billing_id（Record 失败或未装配计费时为空串），供 call_log 关联。
 func (g *Gateway) recordFailure(ctx context.Context, routeRes *router.RouteResult,
-	model string, token *identity.Token, pricingMode, sessionID, sessionName, reason string, durationMs *int64) {
+	model string, token *identity.Token, pricingMode, sessionID, sessionName, reason string, durationMs *int64) string {
 	if g.billing == nil {
-		return
+		return ""
 	}
 	// 记账脱离请求取消：失败留痕同样不能因下游断开而丢失。
 	ctx, cancel := billingCtx(ctx)
@@ -840,9 +954,15 @@ func (g *Gateway) recordFailure(ctx context.Context, routeRes *router.RouteResul
 		ErrorMessage:    reason,
 		DurationMs:      durationMs,
 	}
-	if _, err := g.billing.Record(ctx, req); err != nil {
+	rec, err := g.billing.Record(ctx, req)
+	if err != nil {
 		g.logError(routeRes.ChannelID, "record failure billing", err)
+		return ""
 	}
+	if rec == nil {
+		return ""
+	}
+	return rec.BillingID
 }
 
 // isInsufficient 判断是否余额不足（40201 CodeInsufficient）。

@@ -127,6 +127,7 @@ func (f *fakeChannels) SessionTTL(int64) int { return 60 }
 // 无预扣时全额实扣（Consume）。credit 与网关预扣共用，便于验证最终净额。
 type fakeBilling struct {
 	reqs    []billing.RecordReq
+	bids    []string        // 每次 Record 返回的 BillingID（call_log 关联断言用）
 	ctxErrs []error         // 每次 Record 时的 ctx.Err()，用于验证记账 ctx 是否脱离请求取消
 	err     error           // Record（结算）时返回；EstimateCredits 默认不受影响
 	estErr  error           // EstimateCredits（预扣估算）时返回
@@ -146,6 +147,8 @@ func (f *fakeBilling) Record(ctx context.Context, req billing.RecordReq) (*billi
 	} else {
 		rec = &billing.Record{CreditsConsumed: 0}
 	}
+	rec.BillingID = fmt.Sprintf("bill-%06d", len(f.reqs))
+	f.bids = append(f.bids, rec.BillingID)
 	if f.credit != nil {
 		if req.PreConsumed > 0 {
 			delta := rec.CreditsConsumed - req.PreConsumed
@@ -247,7 +250,19 @@ type harness struct {
 	tok     *fakeToken
 	models  *fakeModel
 	cmclass *fakeChannelModel
+	clogs   *fakeCallLogs
 	clock   *testClock
+}
+
+// fakeCallLogs 内存调用日志存储（测试断言采集内容）。
+type fakeCallLogs struct {
+	inserted []*CallLog
+}
+
+func (f *fakeCallLogs) Insert(_ context.Context, c *CallLog) error {
+	cp := *c
+	f.inserted = append(f.inserted, &cp)
+	return nil
 }
 
 // testClock 可控时钟：网关与会话注册表共用同一指针，保证会话 TTL/过期判定确定可测。
@@ -307,7 +322,9 @@ func build(t *testing.T, upstreamURL string) *harness {
 		Now:    clock.now,
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
-	return &harness{gw: gw, chans: cf, billing: bf, rrouter: rr, tok: tok, models: mf, cmclass: cmf, clock: clock}
+	clog := &fakeCallLogs{}
+	gw.SetCallLogs(clog)
+	return &harness{gw: gw, chans: cf, billing: bf, rrouter: rr, tok: tok, models: mf, cmclass: cmf, clogs: clog, clock: clock}
 }
 
 // doRequest 向网关发送一次 OpenAI-compat 请求。
@@ -1373,5 +1390,175 @@ func TestServeRateLimitedReject_DoesNotOccupySession(t *testing.T) {
 	s, found := h.rrouter.sess.Lookup(sid)
 	if !found || s.ChannelKeyID != 1 {
 		t.Fatalf("恢复限流后应创建会话并绑定密钥 1，found=%v s=%+v", found, s)
+	}
+}
+
+// ===== 调用日志（call_logs）采集 =====
+
+// 调用日志-1：非流式成功——采集 1 条，billing_id 与账单一致、RespKind=non_stream、RespBody 非空。
+func TestServeCallLog_NonStreamSuccess(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"x","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`))
+	}))
+	defer upstream.Close()
+
+	h := build(t, upstream.URL)
+	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t", `{"model":"gpt-4","stream":false,"messages":[{"role":"user","content":"ping"}]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(h.clogs.inserted) != 1 {
+		t.Fatalf("call log inserted %d, want 1", len(h.clogs.inserted))
+	}
+	cl := h.clogs.inserted[0]
+	if cl.BillingID != h.billing.bids[0] || cl.BillingID == "" {
+		t.Errorf("call log billing_id want %q, got %q", h.billing.bids[0], cl.BillingID)
+	}
+	if cl.RespKind != "non_stream" || cl.Status != "completed" {
+		t.Errorf("call log resp_kind/status want non_stream/completed, got %q/%q", cl.RespKind, cl.Status)
+	}
+	if !strings.Contains(cl.RespBody, `"content":"hi"`) || cl.RespBody == "" {
+		t.Errorf("call log resp_body want upstream body, got %q", cl.RespBody)
+	}
+	if cl.Model != "gpt-4" {
+		t.Errorf("call log model wrong: model=%q", cl.Model)
+	}
+}
+
+// 调用日志-2：流式成功——RespKind=stream、RespBody 为拼接的 assistant content（增量拼接）。
+func TestServeCallLog_StreamSuccess(t *testing.T) {
+	streamBody := "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{\"content\":\" there\"}}]}\n\n" +
+		"data: [DONE]\n\n"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(streamBody))
+	}))
+	defer upstream.Close()
+
+	h := build(t, upstream.URL)
+	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t", `{"model":"gpt-4","stream":true}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(h.clogs.inserted) != 1 {
+		t.Fatalf("call log inserted %d, want 1", len(h.clogs.inserted))
+	}
+	cl := h.clogs.inserted[0]
+	if cl.RespKind != "stream" || cl.Status != "completed" {
+		t.Errorf("call log resp_kind/status want stream/completed, got %q/%q", cl.RespKind, cl.Status)
+	}
+	// RespBody 为拼装的 assistant 消息 JSON，content 增量拼接完整。
+	if !strings.Contains(cl.RespBody, `"content":"hi there"`) {
+		t.Errorf("call log resp_body want assembled content \"hi there\", got %q", cl.RespBody)
+	}
+	if cl.BillingID != h.billing.bids[0] || cl.BillingID == "" {
+		t.Errorf("call log billing_id want %q, got %q", h.billing.bids[0], cl.BillingID)
+	}
+}
+
+// 调用日志-3：全部候选被拦截（无可用渠道 503）——插入 1 条 failed + error，
+// Decision.attempts 包含候选渠道与跳过原因。
+func TestServeCallLog_AllCandidatesRejected(t *testing.T) {
+	h := build(t, "http://unused")
+	// 密钥运行时直接置为禁用（状态机入口复查拦截）。
+	h.chans.keys[1].Machine.ForceDisable(h.clock.t)
+
+	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t", `{"model":"gpt-4","stream":false}`)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("want 503, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(h.clogs.inserted) != 1 {
+		t.Fatalf("call log inserted %d, want 1", len(h.clogs.inserted))
+	}
+	cl := h.clogs.inserted[0]
+	if cl.Status != "failed" || cl.RespKind != "error" {
+		t.Errorf("call log want failed/error, got %q/%q", cl.Status, cl.RespKind)
+	}
+	if cl.BillingID != h.billing.bids[0] || cl.BillingID == "" {
+		t.Errorf("reject call log billing_id want %q, got %q", h.billing.bids[0], cl.BillingID)
+	}
+	dec, ok := cl.Decision.(map[string]any)
+	if !ok {
+		t.Fatalf("reject call log decision missing: %v", cl.Decision)
+	}
+	raw, _ := json.Marshal(dec)
+	var decision struct {
+		Attempts []map[string]any `json:"attempts"`
+		PreSum   float64          `json:"pre_consumed"`
+		Result   string           `json:"result"`
+	}
+	if err := json.Unmarshal(raw, &decision); err != nil {
+		t.Fatalf("unmarshal decision: %v", err)
+	}
+	if len(decision.Attempts) != 1 {
+		t.Fatalf("decision attempts want 1, got %+v", decision.Attempts)
+	}
+	a0 := decision.Attempts[0]
+	if a0["reason"] != "禁用" || a0["channel_id"] != "1" || a0["channel_key_id"] != "1" {
+		t.Errorf("decision attempt want 禁用/1/1, got %+v", a0)
+	}
+	if decision.Result != "rejected" {
+		t.Errorf("decision result want rejected, got %q", decision.Result)
+	}
+}
+
+// 调用日志-4：请求增量 diff——同一会话两次请求（第二次多 1 条消息），第二次只记录增量新增条。
+func TestServeCallLog_ReqIncrementDiff(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"x","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`))
+	}))
+	defer upstream.Close()
+
+	h := build(t, upstream.URL)
+	hdr := map[string]string{"x-session-id": "diff-sess"}
+	body1 := `{"model":"gpt-4","stream":false,"messages":[{"role":"system","content":"sys"},{"role":"user","content":"a"}]}`
+	body2 := `{"model":"gpt-4","stream":false,"messages":[{"role":"system","content":"sys"},{"role":"user","content":"a"},{"role":"user","content":"b"}]}`
+
+	rec1 := doRequestH(t, h.gw, "/v1/chat/completions", "sk-gw-t", body1, hdr)
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("first want 200, got %d: %s", rec1.Code, rec1.Body.String())
+	}
+	rec2 := doRequestH(t, h.gw, "/v1/chat/completions", "sk-gw-t", body2, hdr)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("second want 200, got %d: %s", rec2.Code, rec2.Body.String())
+	}
+	if len(h.clogs.inserted) != 2 {
+		t.Fatalf("call logs inserted %d, want 2", len(h.clogs.inserted))
+	}
+	// 第一次无上次指纹：降级取最后一条 user（1 条）。
+	first := h.clogs.inserted[0]
+	firstMsgs, ok := first.ReqMessages.([]json.RawMessage)
+	if !ok || len(firstMsgs) != 1 {
+		t.Fatalf("first increment want 1 message, got %T len=%d (%v)", first.ReqMessages, len(firstMsgs), first.ReqMessages)
+	}
+	// 第二次与上次指纹对齐：仅返回新增的第 3 条。
+	second := h.clogs.inserted[1]
+	secondMsgs, ok := second.ReqMessages.([]json.RawMessage)
+	if !ok || len(secondMsgs) != 1 {
+		t.Fatalf("second increment want 1 message, got %T len=%d (%v)", second.ReqMessages, len(secondMsgs), second.ReqMessages)
+	}
+	if !strings.Contains(string(secondMsgs[0]), `"content":"b"`) {
+		t.Errorf("second increment should only contain new message b, got %s", secondMsgs[0])
+	}
+	// 事件顺序：会话注册表内存里指纹已推进到第二次全量。
+	sid := router.SessionID(7, 42, "gpt-4", "diff-sess")
+	s, found := h.rrouter.sess.Lookup(sid)
+	if !found || len(s.LastMsgFingerprints) != 3 {
+		t.Fatalf("session fingerprints should be 3 after 2nd request, found=%v fps=%v", found, s.LastMsgFingerprints)
+	}
+	// 第三次（消息回退到 2 条）→ 与指纹对齐后 diff 为空（0 条增量）。
+	rec3 := doRequestH(t, h.gw, "/v1/chat/completions", "sk-gw-t", body1, hdr)
+	if rec3.Code != http.StatusOK {
+		t.Fatalf("third want 200, got %d: %s", rec3.Code, rec3.Body.String())
+	}
+	third := h.clogs.inserted[2]
+	if thirdMsgs, ok := third.ReqMessages.([]json.RawMessage); !ok || len(thirdMsgs) != 0 {
+		t.Fatalf("third increment want 0 messages (prefix aligned), got %T len=%d (%v)", third.ReqMessages, len(thirdMsgs), third.ReqMessages)
 	}
 }
