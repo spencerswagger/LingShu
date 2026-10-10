@@ -160,7 +160,7 @@ export interface ReliabilityConfig {
   MinSamples: number
   ErrorRatePct: number
   Rate429Pct: number
-  P99LatencyMS: number
+  P99LatencyMS: number // 单位毫秒（后端契约不变；默认 120000ms=120 秒，前端按秒录入/展示，提交转毫秒）
   AuthFailThreshold?: number
 }
 export interface AdminChannel {

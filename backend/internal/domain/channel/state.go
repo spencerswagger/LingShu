@@ -37,7 +37,7 @@ func (f Feedback) IsProbe() bool { return f.HasProbe }
 type MachineConfig struct {
 	WindowSeconds          int     // 滑动窗口长度，默认 60
 	ErrorRatePct           float64 // 窗口内 (failure+timeout)/total 阈值，默认 10
-	P99LatencyMS           int64   // 成功样本 P99 阈值，默认 5000
+	P99LatencyMS           int64   // 成功样本 P99 阈值，默认 120000（120 秒）
 	Rate429Pct             float64 // 窗口内 429 占比阈值，默认 20
 	ProbeFailThreshold     int     // 连续探活失败阈值 → DRAIN，默认 1
 	ProbeRecoveryThreshold int     // 连续探活成功阈值 → NORMAL，默认 2
@@ -50,7 +50,7 @@ func DefaultMachineConfig() MachineConfig {
 	return MachineConfig{
 		WindowSeconds:          60,
 		ErrorRatePct:           10,
-		P99LatencyMS:           5000,
+		P99LatencyMS:           120000,
 		Rate429Pct:             20,
 		ProbeFailThreshold:     1,
 		ProbeRecoveryThreshold: 2,

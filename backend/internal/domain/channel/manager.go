@@ -20,7 +20,7 @@ import (
 func DefaultRateLimit() RateLimitConfig {
 	return RateLimitConfig{
 		RPM:             1000,
-		TPM:             1000000,
+		TPM:             10000000,
 		BurstMultiplier: 1.2,
 		OnExceed:        OnExceedQueue,
 		QueueSize:       100,
@@ -32,7 +32,7 @@ func DefaultRateLimit() RateLimitConfig {
 // DefaultHealthProbe 返回健康探测默认配置（cron 调度 + 排空秒间隔）。
 func DefaultHealthProbe() HealthProbeConfig {
 	return HealthProbeConfig{
-		Interval:             "0 * * * * *", // 默认每分钟
+		Interval:             "0 0 * * * *", // 默认每天一次
 		DrainIntervalSeconds: 15,            // 排空态每 15 秒
 		TimeoutMS:            15000,         // 探测超时默认 15 秒
 		FailThreshold:        1,             // 一次失败即排空
@@ -48,7 +48,7 @@ func DefaultReliability() ReliabilityConfig {
 		MinSamples:        10,
 		ErrorRatePct:      10,
 		Rate429Pct:        20,
-		P99LatencyMS:      5000,
+		P99LatencyMS:      120000,
 		AuthFailThreshold: 3,
 	}
 }

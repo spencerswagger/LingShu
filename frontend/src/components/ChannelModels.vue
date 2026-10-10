@@ -127,6 +127,9 @@ function openCreate() {
     CostRates: { Input: 0, Output: 0, CacheRead: 0, CacheWrite: 0, Reasoning: 0 },
     TimeConfig: null,
     ContextTiers: null,
+    RateLimit: { RPM: 0, TPM: 0, BurstMultiplier: 0, MaxConcurrent: 0 },
+    HealthProbe: { Interval: '', DrainIntervalSeconds: 0, TimeoutMS: 0, FailThreshold: 0, RecoveryThreshold: 0, ProbeModel: '' },
+    Reliability: { WindowSeconds: 0, MinSamples: 0, ErrorRatePct: 0, Rate429Pct: 0, P99LatencyMS: 0 },
   }
   editingPricing.value = {
     CostRates: { Input: 0, Output: 0, CacheRead: 0, CacheWrite: 0, Reasoning: 0 },
@@ -176,7 +179,11 @@ function openEdit(m: ChannelModel) {
     // 模型级运行时配置（留空 = 继承渠道级兜底）
     RateLimit: { ...(m.RateLimit || { RPM: 0, TPM: 0, BurstMultiplier: 0, MaxConcurrent: 0 }) },
     HealthProbe: { ...(m.HealthProbe || { Interval: '', DrainIntervalSeconds: 0, TimeoutMS: 0, FailThreshold: 0, RecoveryThreshold: 0, ProbeModel: '' }) },
-    Reliability: { ...(m.Reliability || { WindowSeconds: 0, MinSamples: 0, ErrorRatePct: 0, Rate429Pct: 0, P99LatencyMS: 0 }) },
+    Reliability: {
+      ...(m.Reliability || { WindowSeconds: 0, MinSamples: 0, ErrorRatePct: 0, Rate429Pct: 0, P99LatencyMS: 0 }),
+      // P99 毫秒回读为秒展示（0 表示继承渠道级，保持 0）
+      P99LatencyMS: (m.Reliability?.P99LatencyMS ?? 0) / 1000,
+    },
   }
   editingPricing.value = {
     CostRates: { ...m.CostRates },
@@ -280,7 +287,11 @@ async function saveModel() {
     ContextTiers: editingPricing.value.ContextTiers,
     RateLimit: editingForm.value.RateLimit,
     HealthProbe: editingForm.value.HealthProbe,
-    Reliability: editingForm.value.Reliability,
+    Reliability: {
+      ...editingForm.value.Reliability,
+      // P99 秒转毫秒提交（0 表示继承渠道级，保持 0）
+      P99LatencyMS: Math.round((editingForm.value.Reliability?.P99LatencyMS ?? 0) * 1000),
+    },
   }
   try {
     // 编辑既有条目
@@ -693,8 +704,8 @@ function onRemoveRow(index: number) {
                     <el-input-number v-model="editingForm!.Reliability.ErrorRatePct" :min="0" size="small" controls-position="right" class="rt-ctrl" />
                   </div>
                   <div class="rt-item">
-                    <div class="rt-label">P99延迟阈值(毫秒)</div>
-                    <el-input-number v-model="editingForm!.Reliability.P99LatencyMS" :min="0" size="small" controls-position="right" class="rt-ctrl" />
+                    <div class="rt-label">P99延迟阈值(秒)</div>
+                    <el-input-number v-model="editingForm!.Reliability.P99LatencyMS" :min="0" :step="0.1" :precision="1" size="small" controls-position="right" class="rt-ctrl" />
                   </div>
                 </div>
               </div>
