@@ -205,6 +205,45 @@ func TestTimeCoeff_CoeffFor(t *testing.T) {
 			name: "非法时区报错", cfg: TimeCoeffConfig{Timezone: "Not/AZone"},
 			now: time.Now(), wantErr: true,
 		},
+		// ---- Weekdays（星期差异化） ----
+		// 2026-01-03 是周六、2026-01-05 是周一（Asia/Shanghai）。
+		{
+			name: "周末高峰1.5-周六命中",
+			cfg: TimeCoeffConfig{Timezone: "Asia/Shanghai", Default: 1.0, Periodic: []Segment{
+				{Name: "周末高峰", Start: "18:00", End: "22:00", Coeff: 1.5, Weekdays: []time.Weekday{time.Saturday}},
+				{Name: "工作日高峰", Start: "18:00", End: "22:00", Coeff: 2.0, Weekdays: []time.Weekday{time.Monday, time.Tuesday, time.Wednesday, time.Thursday, time.Friday}},
+			}},
+			now: time.Date(2026, 1, 3, 20, 0, 0, 0, shLoc(t)), want: 1.5,
+		},
+		{
+			name: "工作日高峰2.0-周一命中",
+			cfg: TimeCoeffConfig{Timezone: "Asia/Shanghai", Default: 1.0, Periodic: []Segment{
+				{Name: "周末高峰", Start: "18:00", End: "22:00", Coeff: 1.5, Weekdays: []time.Weekday{time.Saturday}},
+				{Name: "工作日高峰", Start: "18:00", End: "22:00", Coeff: 2.0, Weekdays: []time.Weekday{time.Monday, time.Tuesday, time.Wednesday, time.Thursday, time.Friday}},
+			}},
+			now: time.Date(2026, 1, 5, 20, 0, 0, 0, shLoc(t)), want: 2.0,
+		},
+		{
+			name: "周末外时段回落默认-周日",
+			cfg: TimeCoeffConfig{Timezone: "Asia/Shanghai", Default: 1.0, Periodic: []Segment{
+				{Name: "周末全天0.8", Start: "00:00", End: "24:00", Coeff: 0.8, Weekdays: []time.Weekday{time.Saturday, time.Sunday}},
+			}},
+			now: time.Date(2026, 1, 5, 12, 0, 0, 0, shLoc(t)), want: 1.0,
+		},
+		{
+			name: "跨午夜段按当前周日判定不命中周一段",
+			cfg: TimeCoeffConfig{Timezone: "Asia/Shanghai", Default: 1.0, Periodic: []Segment{
+				{Name: "周六夜", Start: "22:00", End: "02:00", Coeff: 0.8, Weekdays: []time.Weekday{time.Saturday}},
+			}},
+			now: time.Date(2026, 1, 5, 1, 0, 0, 0, shLoc(t)), want: 1.0, // 周一 01:00 属周一，不命中周六夜段
+		},
+		{
+			name: "跨午夜段周六01:00命中",
+			cfg: TimeCoeffConfig{Timezone: "Asia/Shanghai", Default: 1.0, Periodic: []Segment{
+				{Name: "周五夜", Start: "22:00", End: "02:00", Coeff: 0.8, Weekdays: []time.Weekday{time.Saturday}},
+			}},
+			now: time.Date(2026, 1, 3, 1, 0, 0, 0, shLoc(t)), want: 0.8, // 周六 01:00 属周六，命中
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -231,5 +270,30 @@ func TestValidateRates(t *testing.T) {
 	}
 	if err := ValidateRates(Rates{"input": 1}); err == nil || !strings.Contains(err.Error(), "output") {
 		t.Fatalf("缺键应报错，got %v", err)
+	}
+}
+
+func TestValidateTimeConfig_Weekdays(t *testing.T) {
+	good := TimeCoeffConfig{Timezone: "Asia/Shanghai", Default: 1.0, Periodic: []Segment{
+		{Name: "工作日高峰", Start: "18:00", End: "22:00", Coeff: 1.5, Weekdays: []time.Weekday{time.Monday, time.Saturday}},
+	}}
+	if err := ValidateTimeConfig(good); err != nil {
+		t.Fatalf("合法 Weekdays 应通过: %v", err)
+	}
+	bad := TimeCoeffConfig{Timezone: "Asia/Shanghai", Default: 1.0, Periodic: []Segment{
+		{Name: "非法星期", Start: "18:00", End: "22:00", Coeff: 1.5, Weekdays: []time.Weekday{7}},
+	}}
+	if err := ValidateTimeConfig(bad); err == nil || !strings.Contains(err.Error(), "weekday") {
+		t.Fatalf("非法 Weekdays 应报错，got %v", err)
+	}
+	// 日期覆盖段同样受 Weekdays 校验约束。
+	badOverride := TimeCoeffConfig{Timezone: "Asia/Shanghai", Default: 1.0,
+		Overrides: []DateOverride{{
+			Name: "国庆", Start: "2026-10-01", End: "2026-10-01",
+			Segments: []Segment{{Name: "全天", Start: "00:00", End: "24:00", Coeff: 0.8, Weekdays: []time.Weekday{-1}}},
+		}},
+	}
+	if err := ValidateTimeConfig(badOverride); err == nil {
+		t.Fatal("覆盖段非法 Weekdays 应报错")
 	}
 }
