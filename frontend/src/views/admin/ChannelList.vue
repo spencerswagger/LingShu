@@ -175,7 +175,7 @@ async function onBatchDelete() {
 // 点击整行进入详情；点击操作列（开关/图标按钮）不跳转
 function onRowClick(row: AdminChannel, _column: unknown, event: Event) {
   const el = event?.target as HTMLElement | null
-  if (el?.closest('.op-cell')) return
+  if (el?.closest('.op-cell') || el?.closest('.row-stop')) return
   router.push(`/admin/channels/${row.ID}`)
 }
 </script>
@@ -281,12 +281,15 @@ function onRowClick(row: AdminChannel, _column: unknown, event: Event) {
             <el-tooltip content="数字越大越先被路由" placement="top"><span>优先级</span></el-tooltip>
           </template>
           <template #default="{ row }">
-            <el-input-number
-              :model-value="row.Priority"
-              :min="1" :max="999" :controls="false" size="small"
-              class="inline-num"
-              @change="(v: number) => onEditRouteField(row, 'Priority', v)"
-            />
+            <div class="row-stop" @click.stop>
+              <el-input-number
+                :model-value="row.Priority"
+                :min="1" :max="999" :step="1" size="small"
+                controls-position="right"
+                class="inline-num"
+                @change="(v: number) => onEditRouteField(row, 'Priority', v)"
+              />
+            </div>
           </template>
         </el-table-column>
         <el-table-column label="权重" width="120" align="center">
@@ -294,12 +297,15 @@ function onRowClick(row: AdminChannel, _column: unknown, event: Event) {
             <el-tooltip content="同一优先级内按权重分配流量，权重越大流量越多；默认 1 等权" placement="top"><span>权重</span></el-tooltip>
           </template>
           <template #default="{ row }">
-            <el-input-number
-              :model-value="row.Weight ?? 1"
-              :min="1" :max="10000" :controls="false" size="small"
-              class="inline-num"
-              @change="(v: number) => onEditRouteField(row, 'Weight', v)"
-            />
+            <div class="row-stop" @click.stop>
+              <el-input-number
+                :model-value="row.Weight ?? 1"
+                :min="1" :max="10000" :step="1" size="small"
+                controls-position="right"
+                class="inline-num"
+                @change="(v: number) => onEditRouteField(row, 'Weight', v)"
+              />
+            </div>
           </template>
         </el-table-column>
         <el-table-column label="操作" width="110" align="right" fixed="right">
