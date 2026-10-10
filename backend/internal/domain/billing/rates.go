@@ -122,10 +122,24 @@ func ValidateRates(r Rates) error {
 }
 
 // sumRates 计算五段 token×单价 之和。
+// 缓存读（CacheRead）是输入（Usage.Input）的子集：上游返回的 Input 已包含命中缓存的 token，
+// 因此按缓存读价「替换」输入价而非在输入全价上叠加，先 clamp 到 Input 再从输入中扣除；
+// 缓存写（CacheWrite）为显式缓存写入的独立计费段，不与输入互斥、不从输入扣减，按缓存写价单独计费。
 func sumRates(u Usage, r Rates) float64 {
-	return float64(u.Input)*r["input"] +
+	input := u.Input
+	cr := minInt64(u.CacheRead, input)
+	input -= cr
+	return float64(input)*r["input"] +
 		float64(u.Output)*r["output"] +
-		float64(u.CacheRead)*r["cache_read"] +
+		float64(cr)*r["cache_read"] +
 		float64(u.CacheWrite)*r["cache_write"] +
 		float64(u.Reasoning)*r["reasoning"]
+}
+
+// minInt64 返回 a、b 中的较小值。
+func minInt64(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
 }

@@ -20,9 +20,10 @@ type UsageSplit struct {
 	Reasoning  int64 `json:"Reasoning"`
 }
 
-// Total 五段求和。
+// Total 各段求和（不计入重复的缓存读：缓存读是输入的组成部分，已在 Input 中；
+// 缓存写是独立计费/统计段，需计入；推理已从 Output 剥离，单独计入）。
 func (u UsageSplit) Total() int64 {
-	return u.Input + u.Output + u.CacheRead + u.CacheWrite + u.Reasoning
+	return u.Input + u.CacheWrite + u.Output + u.Reasoning
 }
 
 // DashDay 按天聚合行（趋势 / 成功率 / 吞吐量）。
@@ -96,13 +97,14 @@ func dashArgs(userID *int64, from, to time.Time, extra ...any) []any {
 	return append(args, extra...)
 }
 
-// tokenSum 五段 token 求和 SQL 表达式（prefix 为表别名前缀）。
+// tokenSum 求和 SQL 表达式（prefix 为表别名前缀）。
+// 与 UsageSplit.Total 口径一致：缓存读是输入的子集（已含于 input，不重复加），
+// 缓存写为独立段（计入）；推理已从 output 剥离（不计入的重复项，单独加 reasoning）。
 func tokenSum(prefix string) string {
 	p := prefix + "tokens"
 	return `(COALESCE(NULLIF(` + p + `->>'input','')::bigint,0)
-		+ COALESCE(NULLIF(` + p + `->>'output','')::bigint,0)
-		+ COALESCE(NULLIF(` + p + `->>'cache_read','')::bigint,0)
 		+ COALESCE(NULLIF(` + p + `->>'cache_write','')::bigint,0)
+		+ COALESCE(NULLIF(` + p + `->>'output','')::bigint,0)
 		+ COALESCE(NULLIF(` + p + `->>'reasoning','')::bigint,0))`
 }
 
