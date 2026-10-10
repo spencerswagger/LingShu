@@ -48,7 +48,7 @@ const probeModels = ref<string[]>([])
 // 渠道密钥（独立运行时实体）
 const keys = ref<ChannelKey[]>([])
 const keysLoading = ref(false)
-const keyDrawerOpen = ref(false)
+const keyDialogOpen = ref(false)
 const keySaving = ref(false)
 const keyEditingId = ref<string | null>(null) // null = 新增
 const keyForm = reactive({ name: '', credential: '' })
@@ -256,16 +256,16 @@ function openKeyCreate() {
   keyEditingId.value = null
   keyForm.name = ''
   keyForm.credential = ''
-  keyDrawerOpen.value = true
+  keyDialogOpen.value = true
 }
 function openKeyEdit(k: ChannelKey) {
   keyEditingId.value = k.ID
   keyForm.name = k.Name
   keyForm.credential = ''
-  keyDrawerOpen.value = true
+  keyDialogOpen.value = true
 }
 async function saveKey() {
-  if (!keyForm.name.trim()) return ElMessage.warning('请填写密钥名称')
+  // 新增时凭据必填；名称可留空（后端生成默认名）。编辑时两者均可留空（留空=不修改）。
   if (keyEditingId.value == null && !keyForm.credential.trim())
     return ElMessage.warning('请填写密钥凭据')
   keySaving.value = true
@@ -282,7 +282,7 @@ async function saveKey() {
       })
       ElMessage.success('密钥已添加')
     }
-    keyDrawerOpen.value = false
+    keyDialogOpen.value = false
     await loadKeys()
   } catch (e: any) {
     ElMessage.error(e?.message || '保存失败')
@@ -483,31 +483,32 @@ async function onSubmit() {
             <el-button type="primary" :loading="saving" @click="onSubmit">保存</el-button>
             <el-button @click="router.push('/admin/channels')">取消</el-button>
           </div>
-          <el-drawer
-            v-model="keyDrawerOpen"
+          <el-dialog
+            v-model="keyDialogOpen"
             :title="keyEditingId == null ? '新增密钥' : '编辑密钥'"
-            size="460"
+            width="520px"
             destroy-on-close
           >
             <el-form label-width="96px" class="key-form">
-              <el-form-item label="名称" required>
-                <el-input v-model="keyForm.name" maxlength="64" placeholder="如 默认密钥 / 备用密钥" />
+              <el-form-item label="名称">
+                <el-input v-model="keyForm.name" maxlength="64" placeholder="可留空，留空自动生成" />
+                <div class="hint">留空将由系统生成默认名</div>
               </el-form-item>
-              <el-form-item label="凭据">
+              <el-form-item label="凭据" required>
                 <el-input
                   v-model="keyForm.credential"
                   type="password"
                   show-password
                   :placeholder="keyEditingId == null ? '上游 API Key' : '留空 = 保持不变'"
                 />
-                <div class="hint">{{ keyEditingId == null ? '该密钥为渠道上游的真实 API Key，加密存储，仅回显尾号' : '修改凭据时填写新值；留空表示不修改' }}</div>
+                <div class="hint">该密钥为渠道上游真实 API Key，加密存储，仅回显尾号 / 修改时填写新值，留空表示不修改</div>
               </el-form-item>
             </el-form>
             <template #footer>
-              <el-button @click="keyDrawerOpen = false">取消</el-button>
+              <el-button @click="keyDialogOpen = false">取消</el-button>
               <el-button type="primary" :loading="keySaving" @click="saveKey">保存</el-button>
             </template>
-          </el-drawer>
+          </el-dialog>
           <ErrorBubble v-if="errInfo.message || errInfo.requestId" :message="errInfo.message" :request-id="errInfo.requestId" />
         </div>
       </el-tab-pane>
