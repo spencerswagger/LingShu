@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -1064,6 +1065,137 @@ func (m *Manager) feedAndTransit(keyID int64, modelRowID int64, fb Feedback) {
 // 首参为 channel_key_id（密钥=运行时实体），模型为渠道配置实体的模型级回喂（双回喂保持）。
 func (m *Manager) FeedResult(keyID int64, modelRowID int64, fb Feedback) {
 	m.feedAndTransit(keyID, modelRowID, fb)
+}
+
+// feedModelAndTransit 仅向内部模型状态机注入反馈，捕获状态流转并锁外持久化
+// （channel_model_events + channel_models.state）。用于内部模型手动探测：
+// 模型探测只回喂模型层，不改动密钥状态；cmStore 未装配时跳过持久化。
+func (m *Manager) feedModelAndTransit(channelID, modelRowID int64, fb Feedback) {
+	var mTr *pendingTransition
+	var modelID string
+	m.mu.Lock()
+	if mr, ok := m.mrt[channelID][modelRowID]; ok {
+		modelID = mr.Model.InternalModelID
+		prev := mr.Machine.State()
+		mr.Machine.Feed(fb)
+		if cur := mr.Machine.State(); cur != prev {
+			mTr = &pendingTransition{from: prev, to: cur, reason: mr.Machine.LastReason()}
+		}
+	}
+	m.mu.Unlock()
+
+	if mTr != nil {
+		if m.cmStore != nil {
+			m.persistModelTransition(channelID, modelID, mTr.from, mTr.to, mTr.reason)
+		}
+		m.logger.Info("model state transition", "channel_id", channelID,
+			"model", modelID, "from", mTr.from, "to", mTr.to, "reason", mTr.reason)
+	}
+}
+
+// pickUsableKeyLocked 选择该渠道下可用于探测的密钥：优先 NORMAL、其次 DRAIN，且凭据明文非空。
+// 无可用密钥返回 (0, "")。调用方需持有 m.mu（读或写锁）。
+func (m *Manager) pickUsableKeyLocked(channelID int64) (int64, string) {
+	var normal, drain []int64
+	for keyID := range m.keyOfCh[channelID] {
+		kr, ok := m.keys[keyID]
+		if !ok || kr.CredentialPlain == "" {
+			continue
+		}
+		switch kr.Machine.State() {
+		case StateNormal:
+			normal = append(normal, keyID)
+		case StateDrain:
+			drain = append(drain, keyID)
+		}
+	}
+	sort.Slice(normal, func(i, j int) bool { return normal[i] < normal[j] })
+	sort.Slice(drain, func(i, j int) bool { return drain[i] < drain[j] })
+	if len(normal) > 0 {
+		return normal[0], m.keys[normal[0]].CredentialPlain
+	}
+	if len(drain) > 0 {
+		return drain[0], m.keys[drain[0]].CredentialPlain
+	}
+	return 0, ""
+}
+
+// ProbeKeyNow 手动触发该密钥的一轮健康探测（同步执行，复用定时探测的语义）：
+// 按配置探测其 target 集合，结果驱动密钥状态机并落 probe_logs/记账。
+// 运行时不存在返回 sql.ErrNoRows；OK 以探测后该密钥 LastErr 是否为空判定。
+func (m *Manager) ProbeKeyNow(keyID int64) (ProbeOutcome, error) {
+	if _, ok := m.GetKeyRuntime(keyID); !ok {
+		return ProbeOutcome{}, sql.ErrNoRows
+	}
+	ctx := context.Background()
+	start := m.now()
+	m.keyProbeOnce(ctx, keyID)
+	dur := m.now().Sub(start).Milliseconds()
+
+	kr, ok := m.GetKeyRuntime(keyID)
+	if !ok {
+		return ProbeOutcome{}, sql.ErrNoRows
+	}
+	lastErr := kr.Key.LastErr
+	return ProbeOutcome{
+		OK:         lastErr == "",
+		Error:      lastErr,
+		DurationMS: dur,
+		State:      string(kr.Machine.State()),
+	}, nil
+}
+
+// ProbeModelNow 手动触发某个内部模型的一轮健康探测（同步执行）：
+// 选取该渠道下可用密钥（优先 NORMAL、其次 DRAIN，凭据非空；无则返回 Error="无可用密钥"），
+// 以该密钥凭据对该 InternalModelID 发起一次最小对话探测（level='model'），
+// 结果仅回喂模型状态机（不改动密钥状态），并落 probe_logs/记账。
+// 模型运行时不存在返回 sql.ErrNoRows。
+func (m *Manager) ProbeModelNow(channelID, modelRowID int64) (ProbeOutcome, error) {
+	m.mu.RLock()
+	mr, ok := m.mrt[channelID][modelRowID]
+	if !ok {
+		m.mu.RUnlock()
+		return ProbeOutcome{}, sql.ErrNoRows
+	}
+	modelID := mr.Model.InternalModelID
+	modelState := string(mr.Machine.State())
+	chRT, chOK := m.rt[channelID]
+	keyID, credential := m.pickUsableKeyLocked(channelID)
+	m.mu.RUnlock()
+
+	if !chOK {
+		return ProbeOutcome{OK: false, Error: "渠道运行时不存在", ModelID: modelID, State: modelState}, nil
+	}
+	if keyID == 0 {
+		return ProbeOutcome{OK: false, Error: "无可用密钥", ModelID: modelID, State: modelState}, nil
+	}
+
+	hp := normalizeHealthProbe(chRT.Channel.HealthProbe)
+	timeout := time.Duration(hp.TimeoutMS) * time.Millisecond
+	if timeout <= 0 {
+		timeout = 15 * time.Second
+	}
+	target := strings.TrimRight(chRT.Channel.BaseURL, "/") + "/chat/completions"
+
+	ctx := context.Background()
+	start := m.now()
+	fb, usage, errMsg := m.doProbe(ctx, target, credential, modelID, timeout)
+	dur := m.now().Sub(start).Milliseconds()
+
+	m.feedModelAndTransit(channelID, modelRowID, ProbeFeedback(fb))
+	m.recordProbe(ctx, keyID, modelID, "model", target, fb.IsSuccess, errMsg, usage, dur)
+
+	state := modelState
+	if mr2, ok := m.GetModelRuntime(channelID, modelRowID); ok {
+		state = string(mr2.Machine.State())
+	}
+	return ProbeOutcome{
+		OK:         errMsg == "",
+		Error:      errMsg,
+		DurationMS: dur,
+		ModelID:    modelID,
+		State:      state,
+	}, nil
 }
 
 // ManualSetState 手动设置渠道状态（正常/排空/禁用），写事件并持久化。

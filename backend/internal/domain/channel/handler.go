@@ -758,3 +758,58 @@ func (h *Handler) HandleKeyState(w http.ResponseWriter, r *http.Request) {
 	}
 	resp.OK(w, r, toChannelKeyView(k, h.keyRuntimeView(k.ID)))
 }
+
+// HandleProbeKey POST /api/v1/admin/channels/{id}/keys/{kid}/probe
+// 手动触发该密钥一轮健康探测（同步）：结果按定时探测同规则驱动密钥状态机，
+// 并落 probe_logs 与记账；返回 ProbeOutcome（探测后状态/耗时/错误）。
+func (h *Handler) HandleProbeKey(w http.ResponseWriter, r *http.Request) {
+	channelID, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	kid, ok := pathKeyID(w, r)
+	if !ok {
+		return
+	}
+	if !h.keyDepsReady(w, r) {
+		return
+	}
+	if !h.requireKeyOwnership(w, r, channelID, kid) {
+		return
+	}
+	if h.mgr == nil {
+		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "渠道运行时未装配")
+		return
+	}
+	out, err := h.mgr.ProbeKeyNow(kid)
+	if err != nil {
+		writeServiceErr(w, r, err)
+		return
+	}
+	resp.OK(w, r, out)
+}
+
+// HandleProbeModel POST /api/v1/admin/channels/{id}/models/{mid}/probe
+// 手动触发该内部模型一轮健康探测（同步）：经该渠道可用密钥对内部模型发起探测，
+// 结果仅回喂模型状态机并落 probe_logs 与记账；返回 ProbeOutcome（探测后状态/耗时/错误）。
+func (h *Handler) HandleProbeModel(w http.ResponseWriter, r *http.Request) {
+	channelID, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	mid, ok := pathMid(r.PathValue("mid"))
+	if !ok {
+		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "无效的渠道内部模型 ID")
+		return
+	}
+	if h.mgr == nil {
+		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "渠道运行时未装配")
+		return
+	}
+	out, err := h.mgr.ProbeModelNow(channelID, mid)
+	if err != nil {
+		writeServiceErr(w, r, err)
+		return
+	}
+	resp.OK(w, r, out)
+}

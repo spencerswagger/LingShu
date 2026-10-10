@@ -127,6 +127,7 @@ func (s *Server) routes() {
 	admin.HandleFunc("PUT /api/v1/admin/channels/{id}/keys/{kid}", d.Channel.HandleUpdateKey)
 	admin.HandleFunc("DELETE /api/v1/admin/channels/{id}/keys/{kid}", d.Channel.HandleDeleteKey)
 	admin.HandleFunc("POST /api/v1/admin/channels/{id}/keys/{kid}/state", d.Channel.HandleKeyState)
+	admin.HandleFunc("POST /api/v1/admin/channels/{id}/keys/{kid}/probe", d.Channel.HandleProbeKey)
 	admin.HandleFunc("GET /api/v1/admin/channels/{id}/keys/{kid}/events", d.Channel.HandleListKeyEvents)
 
 	// 渠道内部模型（双层模型）
@@ -135,6 +136,7 @@ func (s *Server) routes() {
 	admin.HandleFunc("POST /api/v1/admin/channels/{id}/models/pull", d.Channel.HandlePullModels)
 	admin.HandleFunc("PUT /api/v1/admin/channels/{id}/models/{mid}", d.Channel.HandleUpdateChannelModel)
 	admin.HandleFunc("DELETE /api/v1/admin/channels/{id}/models/{mid}", d.Channel.HandleDeleteChannelModel)
+	admin.HandleFunc("POST /api/v1/admin/channels/{id}/models/{mid}/probe", d.Channel.HandleProbeModel)
 
 	// tags
 	admin.HandleFunc("GET /api/v1/admin/tags", d.Tag.HandleList)
