@@ -12,6 +12,7 @@ import {
   deleteChannelModel,
   pullChannelModels,
   channelModelState,
+  probeChannelModel,
   listExternalModels,
   priceCatalog,
   getBillingConfig,
@@ -50,6 +51,7 @@ const editingPricing = ref<Record<string, any>>({
 })
 const saving = ref(false)
 const runtimeExpanded = ref<string[]>([])
+const probingId = ref<string | null>(null) // 正在手动探测的模型 ID
 
 // 拉取上游模型后「批量配置」的待创建行：每个模型独立绑定对外模型与成本
 interface PendingRow {
@@ -133,6 +135,25 @@ async function onToggleState(m: ChannelModel, action: 'normal' | 'drain' | 'disa
     await load()
   } catch (e: any) {
     ElMessage.error(e?.message || '状态操作失败')
+  }
+}
+
+// 手动触发一轮内部模型健康探测：经该渠道可用密钥发起，仅回喂模型状态机，随后刷新列表。
+async function onProbeModel(m: ChannelModel) {
+  probingId.value = m.ID
+  try {
+    const res = await probeChannelModel(props.channelId, m.ID)
+    const o = res.Data
+    if (o.OK) {
+      ElMessage.success(`模型「${m.InternalModelID}」探测成功（${o.DurationMS}ms）`)
+    } else {
+      ElMessage.error(`模型「${m.InternalModelID}」探测失败：${o.Error || '未知错误'}`)
+    }
+    await load()
+  } catch (e: any) {
+    ElMessage.error(e?.message || '探测失败')
+  } finally {
+    probingId.value = null
   }
 }
 
@@ -515,9 +536,16 @@ function onRemoveRow(index: number) {
             <StatusTag v-else :value="row.State" />
           </template>
         </el-table-column>
-        <el-table-column v-if="!readonly" label="操作" width="110" align="right">
+        <el-table-column v-if="!readonly" label="操作" width="160" align="right">
           <template #default="{ row }">
             <div class="op-cell" @click.stop>
+              <el-button
+                size="small"
+                text
+                type="primary"
+                :loading="probingId === row.ID"
+                @click="onProbeModel(row)"
+              >探测</el-button>
               <el-tooltip content="编辑" placement="top">
                 <el-icon class="op-icon" @click="openEdit(row)"><Edit /></el-icon>
               </el-tooltip>

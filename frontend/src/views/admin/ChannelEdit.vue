@@ -16,6 +16,7 @@ import {
   updateChannelKey,
   deleteChannelKey,
   channelKeyState,
+  probeChannelKey,
   cronPreview,
   listTags,
   type AdminChannel,
@@ -52,6 +53,7 @@ const keyDrawerOpen = ref(false)
 const keySaving = ref(false)
 const keyEditingId = ref<string | null>(null) // null = 新增
 const keyForm = reactive({ name: '', credential: '' })
+const probingKeyId = ref<string | null>(null) // 正在手动探测的密钥 ID
 
 const form = reactive({
   name: '',
@@ -319,6 +321,25 @@ async function onKeyState(k: ChannelKey, action: 'normal' | 'drain' | 'disable')
   }
 }
 
+// 手动触发一轮密钥健康探测：结果按定时探测同规则驱动密钥状态机，随后刷新列表。
+async function onProbeKey(k: ChannelKey) {
+  probingKeyId.value = k.ID
+  try {
+    const res = await probeChannelKey(id, k.ID)
+    const o = res.Data
+    if (o.OK) {
+      ElMessage.success(`密钥「${k.Name}」探测成功（${o.DurationMS}ms）`)
+    } else {
+      ElMessage.error(`密钥「${k.Name}」探测失败：${o.Error || '未知错误'}`)
+    }
+    await loadKeys()
+  } catch (e: any) {
+    ElMessage.error(e?.message || '探测失败')
+  } finally {
+    probingKeyId.value = null
+  }
+}
+
 async function onToggleState(action: 'normal' | 'drain' | 'disable') {
   const label = stateLabel[action.toUpperCase()] || action
   try {
@@ -463,9 +484,16 @@ async function onSubmit() {
                     <span class="last-err" :class="{ on: row.LastErr }">{{ row.LastErr || '无' }}</span>
                   </template>
                 </el-table-column>
-                <el-table-column label="操作" width="90" align="right">
+                <el-table-column label="操作" width="140" align="right">
                   <template #default="{ row }">
                     <div class="op-cell" @click.stop>
+                      <el-button
+                        size="small"
+                        text
+                        type="primary"
+                        :loading="probingKeyId === row.ID"
+                        @click="onProbeKey(row)"
+                      >探测</el-button>
                       <el-tooltip content="编辑" placement="top">
                         <el-icon class="op-icon" @click="openKeyEdit(row)"><Edit /></el-icon>
                       </el-tooltip>
