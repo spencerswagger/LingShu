@@ -31,9 +31,19 @@ func TestComputeCredits(t *testing.T) {
 			timeCoeff: 0.5, ctxCoeff: 1.0, r: 10000, want: 0.1184, // 0.2368 × 0.5
 		},
 		{
-			// 缓存命中段参与计费：1000×1 + 100×0.1 = 1010；÷1000 = 1.01
+			// 缓存命中段参与计费：输入全额 1000 中含缓存 100 → 非缓存 900×1 + 缓存 100×0.1 = 910；÷1000 = 0.91
 			name: "cache_read参与", u: Usage{Input: 1000, CacheRead: 100}, rates: fullRates(),
-			timeCoeff: 1.0, ctxCoeff: 1.0, r: 1000, want: 1.01,
+			timeCoeff: 1.0, ctxCoeff: 1.0, r: 1000, want: 0.91,
+		},
+		{
+			// 全部缓存命中：Input==CacheRead → input 段 0，只按 cache_read 价计 = 1000×0.1 = 100；÷1000 = 0.1
+			name: "cache_read全命中", u: Usage{Input: 1000, CacheRead: 1000}, rates: fullRates(),
+			timeCoeff: 1.0, ctxCoeff: 1.0, r: 1000, want: 0.1,
+		},
+		{
+			// 防御：cached_tokens 异常大于 prompt_tokens → nonCachedIn 按 0 计
+			name: "cache_read异常大于输入", u: Usage{Input: 100, CacheRead: 1000}, rates: fullRates(),
+			timeCoeff: 1.0, ctxCoeff: 1.0, r: 1000, want: 0.1, // 1000×0.1 ÷ 1000
 		},
 		{
 			name: "cache_write-缓存回写", u: Usage{CacheWrite: 5000}, rates: fullRates(),

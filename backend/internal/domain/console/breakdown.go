@@ -109,7 +109,14 @@ var rateFields = []struct {
 	Label string
 	get   func(*billing.Usage) int64
 }{
-	{"input", "输入", func(u *billing.Usage) int64 { return u.Input }},
+	{"input", "输入", func(u *billing.Usage) int64 {
+		// 输入口径与计费公式一致：(Input - CacheRead) 按输入价，缓存命中部分由「缓存读」行单独按 cache_read 价计。
+		nonCached := u.Input - u.CacheRead
+		if nonCached < 0 {
+			return 0
+		}
+		return nonCached
+	}},
 	{"output", "输出", func(u *billing.Usage) int64 { return u.Output }},
 	{"cache_read", "缓存读", func(u *billing.Usage) int64 { return u.CacheRead }},
 	{"cache_write", "缓存写", func(u *billing.Usage) int64 { return u.CacheWrite }},
