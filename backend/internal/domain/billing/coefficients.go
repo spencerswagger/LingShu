@@ -33,11 +33,14 @@ func ContextTierCoeff(inputTokens int64, tiers []TierRule) (float64, error) {
 }
 
 // Segment 一段时间段。
+// Weekdays 可选：限定该段生效的星期（0=周日…6=周六），空 = 每天生效。
+// 星期判定以「当前时刻所在日」为基准（跨午夜段同理：22:00-02:00 段在周日 01:00 按周日判定）。
 type Segment struct {
-	Name  string  `json:"Name"`
-	Start string  `json:"Start"` // "HH:MM"
-	End   string  `json:"End"`   // "HH:MM"，"24:00" 表示日末
-	Coeff float64 `json:"Coeff"`
+	Name     string         `json:"Name"`
+	Start    string         `json:"Start"` // "HH:MM"
+	End      string         `json:"End"`   // "HH:MM"，"24:00" 表示日末
+	Coeff    float64        `json:"Coeff"`
+	Weekdays []time.Weekday `json:"Weekdays,omitempty"`
 }
 
 // DateOverride 指定日期范围内的时段覆盖（忽略周期段）。
@@ -83,10 +86,28 @@ func segHit(nowMin, start, end int) bool {
 	return nowMin >= start || nowMin < end
 }
 
+// weekdayMatch 判断段是否在指定星期生效：Weekdays 为空（每天）或包含 weekday。
+func weekdayMatch(weekday time.Weekday, sg *Segment) bool {
+	if len(sg.Weekdays) == 0 {
+		return true
+	}
+	for _, w := range sg.Weekdays {
+		if w == weekday {
+			return true
+		}
+	}
+	return false
+}
+
 // bestSegCoeff 在一组段里找命中段；多个段重叠时取结束时间更晚的段（重叠兜底）。
-func bestSegCoeff(nowMin int, segs []Segment) (float64, bool) {
+// weekday 为「当前时刻所在日」的星期，段若声明了 Weekdays 且不含 weekday 则跳过。
+func bestSegCoeff(nowMin int, weekday time.Weekday, segs []Segment) (float64, bool) {
 	best, bestEnd, hit := 0.0, -1, false
-	for _, sg := range segs {
+	for i := range segs {
+		sg := &segs[i]
+		if !weekdayMatch(weekday, sg) {
+			continue
+		}
 		start, err := parseTimeOfDay(sg.Start)
 		if err != nil {
 			continue
@@ -108,11 +129,12 @@ func bestSegCoeff(nowMin int, segs []Segment) (float64, bool) {
 // coeffFor 依据配置与某个时区下的本地时间，返回时段系数。
 func (c TimeCoeffConfig) coeffFor(local time.Time) float64 {
 	m := local.Hour()*60 + local.Minute()
+	wd := local.Weekday()
 	// 1) 日期覆盖
 	for i := range c.Overrides {
 		ov := &c.Overrides[i]
 		if inDateRange(local, *ov) {
-			if coeff, ok := bestSegCoeff(m, ov.Segments); ok {
+			if coeff, ok := bestSegCoeff(m, wd, ov.Segments); ok {
 				return coeff
 			}
 			// 该日在覆盖范围内但覆盖段未命中 → 跳出覆盖判断，回落周期段；周期段也未命中则落入 default。
@@ -120,7 +142,7 @@ func (c TimeCoeffConfig) coeffFor(local time.Time) float64 {
 		}
 	}
 	// 2) 周期段
-	if coeff, ok := bestSegCoeff(m, c.Periodic); ok {
+	if coeff, ok := bestSegCoeff(m, wd, c.Periodic); ok {
 		return coeff
 	}
 	// 3) 默认
@@ -184,6 +206,11 @@ func validateSegment(sg Segment) error {
 	}
 	if _, err := parseTimeOfDay(sg.End); err != nil {
 		return err
+	}
+	for _, w := range sg.Weekdays {
+		if w < 0 || w > 6 {
+			return fmt.Errorf("weekday %d 非法（0=周日…6=周六）", w)
+		}
 	}
 	return nil
 }
