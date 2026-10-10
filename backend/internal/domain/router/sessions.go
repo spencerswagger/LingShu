@@ -28,6 +28,9 @@ type Session struct {
 	ExpireAt        time.Time
 	Closed          bool       // 已关闭：不再被路由命中、释放并发槽，但保留在列表（管理可见）
 	ClosedAt        *time.Time // 关闭时间（nil=未关闭）
+	// LastMsgFingerprints 该会话上次请求的每消息短 hash，用于 call_log 增量 diff
+	//（进程内存字段，不落库；DB 恢复后为空时网关降级为「最后一条 user + tool 链」）。
+	LastMsgFingerprints []string
 }
 
 // SessionID 计算会话指纹：sha256("llmgw-session:"+user+":"+token+":"+model+":"+raw)。

@@ -18,11 +18,27 @@ import (
 type Dev struct {
 	billing    *billing.SqlStore
 	userIDFrom func(ctx context.Context) (int64, bool)
+	callLogs   callLogReader // 调用日志只读查询（经 SetCallLogStore 注入；nil=未装配）
 }
 
 // NewDev 创建开发端控制台处理器。
 func NewDev(billingStore *billing.SqlStore, userIDFrom func(ctx context.Context) (int64, bool)) *Dev {
 	return &Dev{billing: billingStore, userIDFrom: userIDFrom}
+}
+
+// SetCallLogStore 注入调用日志只读查询（nil=未装配：BillingDetail.CallLog 为 nil）。
+func (h *Dev) SetCallLogStore(s callLogReader) { h.callLogs = s }
+
+// attachCallLog 查 call_logs 并填充账单详情（未装配/无记录时为 nil）。
+func (h *Dev) attachCallLog(ctx context.Context, bid string) *CallLogView {
+	if h.callLogs == nil || bid == "" {
+		return nil
+	}
+	cl, err := h.callLogs.GetByBillingID(ctx, bid)
+	if err != nil || cl == nil {
+		return nil
+	}
+	return toCallLogView(cl)
 }
 
 func (h *Dev) currentUser(w http.ResponseWriter, r *http.Request) (int64, bool) {
@@ -125,6 +141,7 @@ func (h *Dev) HandleGetBilling(w http.ResponseWriter, r *http.Request) {
 		Status:          rec.Status,
 		Steps:           steps,
 		RouteDiff:       routeDiff,
+		CallLog:         h.attachCallLog(r.Context(), rec.BillingID),
 	}
 	resp.OK(w, r, detail)
 }

@@ -366,6 +366,10 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	consoleAdmin.SetKeyNameResolver(keyNameResolver(d))
 	consoleAdmin.SetSessionNameSetter(sessionStore.SetName)
 	consoleDev := console.NewDev(billStore, userIDFrom)
+	// 调用日志：网关写入 + 控制台只读查询共用同一存储（billing_id 1:1 关联）。
+	callLogStore := gateway.NewSQLCallLogStore(d)
+	consoleAdmin.SetCallLogStore(callLogStore)
+	consoleDev.SetCallLogStore(callLogStore)
 
 	// sync
 	syncStore := sync.NewStore(d)
@@ -404,6 +408,8 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 		},
 		Logger: logr,
 	})
+	// 调用日志采集注入（nil=不采集；生产装配 SQL 存储，与 console 只读共用）。
+	gw.SetCallLogs(callLogStore)
 
 	return &app{
 		deps: server.Deps{
