@@ -173,7 +173,7 @@ const kpiCards = computed(() => {
     {
       label: '总 Token',
       value: k ? fmtCompact(k.TotalTokens) : '-',
-      sub: `输入 ${fmtCompact(data.value?.Usage.Total.Input ?? 0)} · 输出 ${fmtCompact(
+      sub: `输入(含缓存) ${fmtCompact(data.value?.Usage.Total.Input ?? 0)} · 输出 ${fmtCompact(
         data.value?.Usage.Total.Output ?? 0,
       )}`,
       delta: k?.DeltaTokens,
@@ -266,11 +266,12 @@ const trendOption = computed<EChartsCoreOption>(() => {
 
 const compositionOption = computed<EChartsCoreOption>(() => {
   const t = data.value?.Usage.Total
+  // 互斥分段：输入(非缓存) 为总输入扣除命中缓存的子集；缓存写/输出/推理为独立段。
   const items = [
-    { name: '输入', value: t?.Input ?? 0 },
-    { name: '输出', value: t?.Output ?? 0 },
+    { name: '输入(非缓存)', value: Math.max((t?.Input ?? 0) - (t?.CacheRead ?? 0), 0) },
     { name: '缓存读', value: t?.CacheRead ?? 0 },
     { name: '缓存写', value: t?.CacheWrite ?? 0 },
+    { name: '输出', value: t?.Output ?? 0 },
     { name: '推理', value: t?.Reasoning ?? 0 },
   ].filter((i) => i.value > 0)
   return {
