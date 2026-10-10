@@ -135,9 +135,32 @@ export function listDevBillings(page = 1, size = 20) {
   })
 }
 
-// 账单详情（三步拆解；admin 额外返回 InternalModelID/ChannelName）
+// 账单详情（三步拆解；admin 额外返回 InternalModelID/ChannelName），可能附带调用日志 CallLog
 export function getDevBilling(billingId: string) {
   return http.get<BillingDetail, ApiRes<BillingDetail>>(`/dev/billings/${billingId}`)
+}
+
+// 调用日志视图（后端 views.CallLogView）：账单/会话详情附带，admin 与 dev 共用同一契约
+export interface CallLogView {
+  BillingID: string
+  RequestID: string
+  SessionID: string
+  Model: string
+  Status: string // 'completed' | 'failed'
+  RespKind: string // 'non_stream' | 'stream' | 'error' | 'none'
+  ErrorMessage: string
+  DurationMs?: number
+  FirstTokenMs?: number
+  CallTime: string
+  ReqMessages: unknown // 请求增量 JSON（可能 null）
+  RespBody: string // 非流式完整响应体 / 流式 assistant 增量 JSON / 错误
+  Decision: unknown // 决策轨迹 JSON（可能 null）：{attempts:[{order,channel_id,channel_key_id,internal_model_id,reason}], time_coeff, ctx_coeff, pre_consumed, result}
+  PricingMode: string
+}
+
+// 单条调用日志（dev 详情同样填充 CallLog 字段）
+export function getDevCallLog(billingId: string) {
+  return http.get<CallLogView, ApiRes<CallLogView>>(`/dev/billings/${billingId}`)
 }
 
 export interface BillingDetail {
@@ -151,6 +174,7 @@ export interface BillingDetail {
   RouteDiff?: RouteDiff | null
   InternalModelID?: string
   ChannelName?: string
+  CallLog?: CallLogView | null
 }
 
 export interface Step {

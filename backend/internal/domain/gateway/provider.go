@@ -26,6 +26,6 @@ type Provider interface {
 	BuildUpstreamRequest(ctx context.Context, baseURL string, cred string, body []byte, isStream bool) (*http.Request, error)
 	// ExtractUsage 从非流式响应体解析 token 用量。
 	ExtractUsage(body []byte) (billing.Usage, error)
-	// HandleStream 透传流式 SSE 并返回统计到的用量。
-	HandleStream(ctx context.Context, upstream *http.Response, w http.ResponseWriter) (billing.Usage, error)
+	// HandleStream 透传流式 SSE，返回统计到的用量与拼装出的 assistant 消息 JSON（call_log 记录用）。
+	HandleStream(ctx context.Context, upstream *http.Response, w http.ResponseWriter) (billing.Usage, []byte, error)
 }

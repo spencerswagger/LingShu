@@ -1,5 +1,7 @@
 import { http, type ApiRes } from './http'
-import type { PageResult, BillingDetail, FlowItem } from './dev'
+import type { PageResult, BillingDetail, FlowItem, CallLogView } from './dev'
+// 调用日志视图类型与 dev 端共用（同一后端契约）；admin 详情页/会话记录直接复用
+export type { CallLogView } from './dev'
 
 // ===== 管理端 API（字段名与后端 Go 结构体字段名对齐） =====
 
@@ -571,6 +573,10 @@ export function getBillingStats(params: Record<string, unknown> = {}) {
 export function getBilling(billingId: string) {
   return http.get<BillingDetail, ApiRes<BillingDetail>>(`/admin/billings/${billingId}`)
 }
+// 单条调用日志（账单详情附带 CallLog 的独立端点；返回单对象，不强转 BillingDetail）
+export function getCallLog(billingId: string) {
+  return http.get<CallLogView, ApiRes<CallLogView>>(`/admin/billings/${billingId}`)
+}
 
 // ===== 会话（内存注册表 + DB 投影；按用户/令牌/密钥维度过滤与踢下线） =====
 export interface AdminSession {
@@ -615,6 +621,15 @@ export function renameSession(
     `/admin/sessions/${sessionId}/name`,
     { Name: name },
   )
+}
+// 会话完整调用记录（按时间序，含请求/响应/决策轨迹）
+export function listSessionCalls(
+  sessionId: string,
+): Promise<ApiRes<{ List: CallLogView[]; Total: number }>> {
+  return http.get<
+    { List: CallLogView[]; Total: number },
+    ApiRes<{ List: CallLogView[]; Total: number }>
+  >(`/admin/sessions/${sessionId}/calls`)
 }
 
 // ===== 计费配置 =====

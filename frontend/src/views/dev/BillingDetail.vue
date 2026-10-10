@@ -4,6 +4,7 @@ import { useRoute } from 'vue-router'
 import { getDevBilling, type BillingDetail } from '@/api/dev'
 import StatusTag from '@/components/StatusTag.vue'
 import ErrorBubble from '@/components/ErrorBubble.vue'
+import CallLogPanel from '@/components/CallLogPanel.vue'
 
 const route = useRoute()
 const billingId = String(route.params.id)
@@ -11,6 +12,26 @@ const billingId = String(route.params.id)
 const loading = ref(false)
 const detail = ref<BillingDetail | null>(null)
 const errInfo = ref<{ message: string; requestId: string }>({ message: '', requestId: '' })
+
+// 响应类型展示映射（来自调用日志）
+const respKindLabels: Record<string, string> = {
+  non_stream: '非流式',
+  stream: '流式',
+  error: '错误',
+  none: '无响应',
+}
+const respKindTypes: Record<string, 'primary' | 'success' | 'warning' | 'info' | 'danger'> = {
+  non_stream: 'primary',
+  stream: 'success',
+  error: 'danger',
+  none: 'info',
+}
+function respKindLabel(kind: string) {
+  return respKindLabels[kind] || kind || '-'
+}
+function respKindType(kind: string) {
+  return respKindTypes[kind] || 'info'
+}
 
 onMounted(async () => {
   loading.value = true
@@ -46,6 +67,14 @@ function fmt(n: number | undefined) {
             </el-tag>
           </el-descriptions-item>
           <el-descriptions-item label="状态"><StatusTag :value="detail.Status" /></el-descriptions-item>
+          <el-descriptions-item v-if="detail.CallLog" label="会话 ID" :span="2">
+            <span class="mono" style="word-break: break-all">{{ detail.CallLog.SessionID }}</span>
+          </el-descriptions-item>
+          <el-descriptions-item v-if="detail.CallLog" label="响应类型">
+            <el-tag :type="respKindType(detail.CallLog.RespKind)" size="small" effect="plain">
+              {{ respKindLabel(detail.CallLog.RespKind) }}
+            </el-tag>
+          </el-descriptions-item>
         </el-descriptions>
 
         <!-- 三步决算卡 -->
@@ -82,6 +111,9 @@ function fmt(n: number | undefined) {
         <div v-if="detail.PricingMode === 'cost' && detail.RouteDiff" class="cost-note">
           * 成本模式含路由差异调整，实际扣减与最终积分可能存在差值。
         </div>
+
+        <!-- 调用日志：请求 / 响应 / 决策轨迹（dev 不含渠道内部标识） -->
+        <CallLogPanel :log="detail.CallLog" :show-internal="false" />
       </template>
       <ErrorBubble v-if="errInfo.message || errInfo.requestId" :message="errInfo.message" :request-id="errInfo.requestId" />
     </div>
