@@ -364,7 +364,7 @@ function onRowClick(row: AdminUser, _column: unknown, event: Event) {
             </el-popover>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="80" align="center" class-name="op-cell">
+        <el-table-column label="操作" width="80" align="center">
           <template #default="{ row }">
             <div class="op-cell" @click.stop>
               <el-tooltip content="重置密码" placement="top">
