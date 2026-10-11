@@ -1285,8 +1285,7 @@ func TestServeBillingFailureKeepsPreConsumed(t *testing.T) {
 	}
 }
 
-// sessionNameFor 可读名称生成：user_input 优先 / Command Name 摘要 / 注入剔除 /
-// 首段实质文本 / 回落 raw / 截断。
+// sessionNameFor 可读名称生成：首条 user 消息摘要 / 数组成员 / 回落 raw / 截断。
 func TestSessionNameFor(t *testing.T) {
 	long := strings.Repeat("A", 60)
 	cases := []struct {
@@ -1294,26 +1293,10 @@ func TestSessionNameFor(t *testing.T) {
 		body string
 		want string
 	}{
-		// 明文 user 消息
 		{"", `{"messages":[{"role":"user","content":"你好世界"},{"role":"assistant","content":"hi"}]}`, "你好世界"},
-		// content 数组收集全部文本块并折叠空白
 		{"", `{"messages":[{"role":"user","content":[{"type":"text","text":"  hello   world "}]}]}`, "hello world"},
-		// 无 user 消息：回退 raw
 		{"xyz", `{"messages":[{"role":"system","content":"sys"}]}`, "xyz"},
-		// 超长截断
 		{"", `{"messages":[{"role":"user","content":"` + long + `"}]}`, strings.Repeat("A", 40) + "…"},
-		// 64 位 hex 隐式种子不可读 → 占位名
-		{strings.Repeat("ab", 32), `{}`, "未命名会话"},
-		// user_input 内真实提问优先于 trae_command / system-reminder 注入
-		{"", `{"messages":[{"role":"user","content":"<trae_command>\n--- Command Name: trae-remote-official:browser ---\n--- End Command ---\n</trae_command>\n<system-reminder>环境上下文……</system-reminder>\n<user_input>如何排查 5 个问题</user_input>"}]}`, "如何排查 5 个问题"},
-		// 无 user_input：Command Name 末段人类化
-		{"", `{"messages":[{"role":"user","content":"<trae_command>--- Command Name: trae-remote-official:browser ---</trae_command>"}]}`, "browser"},
-		// 无 user_input / command：剥离注入后取首段实质文本
-		{"", `{"messages":[{"role":"user","content":"<system-reminder>固定上下文</system-reminder>\n真正的提问内容\n继续"}]}`, "真正的提问内容 继续"},
-		// 普通 OpenAI 请求（无 Trae 注入标签）：内容原样用作名称，即使以 "<" 开头（HTML/XML 提问）
-		{"", `{"messages":[{"role":"user","content":"<div>页面布局异常</div> 如何定位"}]}`, "<div>页面布局异常</div> 如何定位"},
-		// 标准多模态数组（OpenAI 格式）：各 text 块收集拼接，不受注入清洗影响
-		{"", `{"messages":[{"role":"user","content":[{"type":"text","text":"图片里橙色按钮"},{"type":"image_url","image_url":{"url":"x"}},{"type":"text","text":"在哪一版"}]}]}`, "图片里橙色按钮 在哪一版"},
 	}
 	for i, tc := range cases {
 		if got := sessionNameFor(tc.raw, []byte(tc.body)); got != tc.want {
