@@ -35,7 +35,7 @@ async function onLogin() {
     // 登录成功后由后端决角色，前端不提供选择
     const res = await login(form.username, form.password)
     const d = res.Data
-    // 已开两步验证：进入第二步（不发 token）
+    // 已开多因素认证：进入第二步（不发 token）
     if (d.NeedTOTP && d.PreAuthToken) {
       step.value = 'totp'
       preauthToken.value = d.PreAuthToken
@@ -145,7 +145,7 @@ function safeRedirect(v: unknown): string {
         </div>
         <div v-else>
           <div class="form-head">
-            <div class="form-title">两步验证</div>
+            <div class="form-title">多因素认证</div>
             <div class="form-sub">请输入身份验证器中的动态码（或恢复码）</div>
           </div>
           <el-alert v-if="mustChange" type="warning" :closable="false" show-icon style="margin-bottom: 16px"

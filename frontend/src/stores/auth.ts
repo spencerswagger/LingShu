@@ -6,6 +6,7 @@ import { getMe, updateMeNickname, logout as logoutApi } from '@/api/auth'
 export const useAuthStore = defineStore('auth', {
   state: () => ({
     token: localStorage.getItem('token') || '',
+    userId: localStorage.getItem('user_id') || '',
     role: localStorage.getItem('role') || '',
     username: localStorage.getItem('username') || '',
     nickname: localStorage.getItem('nickname') || '',
@@ -40,6 +41,7 @@ export const useAuthStore = defineStore('auth', {
       try {
         const res = await getMe()
         const u = res.Data.User
+        this.userId = String(u.ID || '')
         this.username = u.Username
         this.role = u.Role
         this.nickname = u.Nickname || ''
@@ -47,6 +49,7 @@ export const useAuthStore = defineStore('auth', {
         this.totpEnabled = !!u.TOTPEnabled
         this.balance = Number(res.Data.Balance ?? 0)
         this.balanceLoaded = true
+        localStorage.setItem('user_id', this.userId)
         localStorage.setItem('role', u.Role)
         localStorage.setItem('username', u.Username)
         localStorage.setItem('must_change_password', this.mustChangePassword ? '1' : '0')
@@ -69,6 +72,7 @@ export const useAuthStore = defineStore('auth', {
     // 纯本地清态：无副作用、无网络、可重复调用（401 拦截器专用，杜绝递归）。
     clearLocal() {
       this.token = ''
+      this.userId = ''
       this.role = ''
       this.username = ''
       this.nickname = ''
@@ -77,6 +81,7 @@ export const useAuthStore = defineStore('auth', {
       this.mustChangePassword = false
       this.totpEnabled = false
       localStorage.removeItem('token')
+      localStorage.removeItem('user_id')
       localStorage.removeItem('role')
       localStorage.removeItem('username')
       localStorage.removeItem('nickname')

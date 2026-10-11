@@ -21,6 +21,7 @@ import ErrorBubble from '@/components/ErrorBubble.vue'
 import UserSelect from '@/components/UserSelect.vue'
 import ColumnFilter from '@/components/ColumnFilter.vue'
 import { fmtDate, fmtTime } from '@/utils/format'
+import { resolveBillingRange } from '@/utils/range'
 
 const route = useRoute()
 const router = useRouter()
@@ -50,6 +51,9 @@ const filters = reactive({
   status: undefined as string | undefined,
   range: null as [string, string] | null,
 })
+
+// URL 带 range（today|yesterday|month）时据此设置时间区间初值（Asia/Shanghai），首次 load 即生效
+filters.range = resolveBillingRange(route.query.range)
 
 // 前端筛选态键 → 后端 query 参数键（PascalCase 契约）
 const paramKeyMap: Record<string, string> = {
@@ -172,6 +176,16 @@ watch(
   },
 )
 watch(() => filters.user_id, loadTokensOfUser)
+
+// 同一页面内再次从用户面板跳转（URL query 变化）时同步筛选；上面的 filters watch 会自动刷新
+watch(
+  () => [route.query.range, route.query.user_id],
+  ([r, u]) => {
+    const rng = resolveBillingRange(r)
+    if (rng) filters.range = rng
+    filters.user_id = u ? String(u) : undefined
+  },
+)
 
 function reset() {
   filters.user_id = undefined
