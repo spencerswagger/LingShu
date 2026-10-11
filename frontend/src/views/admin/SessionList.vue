@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { nextTick, onMounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Edit } from '@element-plus/icons-vue'
 import { listSessions, kickSessions, renameSession, type AdminSession } from '@/api/admin'
@@ -7,6 +7,7 @@ import { fmtDate, fmtDateTime, fmtTime } from '@/utils/format'
 import ErrorBubble from '@/components/ErrorBubble.vue'
 import UserSelect from '@/components/UserSelect.vue'
 import ColumnFilter from '@/components/ColumnFilter.vue'
+import FilterBar from '@/components/FilterBar.vue'
 
 const loading = ref(false)
 const list = ref<AdminSession[]>([])
@@ -18,6 +19,8 @@ const errInfo = ref<{ message: string; requestId: string }>({ message: '', reque
 const editingId = ref('')
 const editingName = ref('')
 const editingInputs = ref<Record<string, any>>({})
+// 当前所选用户名（用于筛选标签展示）
+const userName = ref('')
 
 const filters = reactive({
   q: '',
@@ -25,6 +28,46 @@ const filters = reactive({
   token_id: undefined as string | undefined,
   channel_key_id: undefined as string | undefined,
 })
+
+// 生效中的筛选条件标签（用于统一工具栏展示与逐个移除）
+const activeTags = computed(() => {
+  const out: { key: string; label: string }[] = []
+  if (filters.q.trim()) out.push({ key: 'q', label: `会话 ID: ${filters.q.trim()}` })
+  if (filters.user_id) out.push({ key: 'user_id', label: `用户: ${userName.value || filters.user_id}` })
+  if (filters.token_id && filters.token_id.trim())
+    out.push({ key: 'token_id', label: `密钥: ${filters.token_id.trim()}` })
+  if (filters.channel_key_id && filters.channel_key_id.trim())
+    out.push({ key: 'channel_key_id', label: `渠道密钥: ${filters.channel_key_id.trim()}` })
+  return out
+})
+
+// 被 watch 监听、变化即回到第一页并重载的筛选字段
+const WATCHED_KEYS = ['user_id', 'token_id', 'channel_key_id'] as const
+
+// 关闭单个筛选标签：被监听字段由 watch 触发重载，会话 ID 手动触发
+function clearTag(key: string) {
+  if (key === 'q') {
+    filters.q = ''
+    onSearch()
+    return
+  }
+  if (key === 'user_id') filters.user_id = undefined
+  if (key === 'token_id') filters.token_id = undefined
+  if (key === 'channel_key_id') filters.channel_key_id = undefined
+}
+
+// 重置全部筛选：若存在被监听字段则由 watch 触发重载，否则手动重载，避免重复请求
+function resetFilters() {
+  const watchedActive = WATCHED_KEYS.some((k) => !!filters[k])
+  filters.q = ''
+  filters.user_id = undefined
+  filters.token_id = undefined
+  filters.channel_key_id = undefined
+  if (!watchedActive) {
+    page.value = 1
+    load()
+  }
+}
 
 function setInputRef(el: any, id: string) {
   if (el) editingInputs.value[id] = el
@@ -162,14 +205,20 @@ const pct = (v: unknown) => `${Math.round(num(v) * 100)}%`
 
 <template>
   <div class="page-container">
-    <div class="page-header">
-      <div class="page-title">会话</div>
-      <span class="page-count">共 {{ total }} 个会话</span>
-      <div class="page-header-spacer" />
-      <el-button v-if="selected.length" type="danger" @click="onCloseBatch">批量关闭</el-button>
-    </div>
-
     <div v-loading="loading" class="card">
+      <FilterBar
+        :tags="activeTags"
+        :loading="loading"
+        @clear="clearTag"
+        @reset="resetFilters"
+        @refresh="load"
+      >
+        <template #actions>
+          <el-button v-if="selected.length" type="danger" size="small" @click="onCloseBatch">
+            批量关闭
+          </el-button>
+        </template>
+      </FilterBar>
       <el-table
         :data="list"
         border
@@ -181,7 +230,11 @@ const pct = (v: unknown) => `${Math.round(num(v) * 100)}%`
         <el-table-column type="selection" width="44" />
         <el-table-column label="会话名称 / 模型" min-width="200">
           <template #header>
-            <ColumnFilter label="会话 ID" :active="!!filters.q" @clear="() => { filters.q = ''; onSearch() }">
+            <ColumnFilter
+              label="会话 ID"
+              :active="!!filters.q"
+              @clear="() => { filters.q = ''; onSearch() }"
+            >
               <el-input
                 v-model="filters.q"
                 placeholder="会话 ID 前缀"
@@ -215,8 +268,16 @@ const pct = (v: unknown) => `${Math.round(num(v) * 100)}%`
         </el-table-column>
         <el-table-column label="用户 / 令牌" min-width="150">
           <template #header>
-            <ColumnFilter label="用户" :active="!!filters.user_id" @clear="() => (filters.user_id = undefined)">
-              <UserSelect v-model="filters.user_id" placeholder="按用户名搜索" />
+            <ColumnFilter
+              label="用户"
+              :active="!!filters.user_id"
+              @clear="() => (filters.user_id = undefined)"
+            >
+              <UserSelect
+                v-model="filters.user_id"
+                placeholder="按用户名搜索"
+                @select="(u) => (userName = u ? u.Nickname || u.Username : '')"
+              />
             </ColumnFilter>
           </template>
           <template #default="{ row }">
