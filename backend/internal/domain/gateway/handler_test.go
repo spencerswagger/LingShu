@@ -1285,7 +1285,8 @@ func TestServeBillingFailureKeepsPreConsumed(t *testing.T) {
 	}
 }
 
-// sessionNameFor 可读名称生成：首条 user 消息摘要 / 数组成员 / 回落 raw / 截断。
+// sessionNameFor 可读名称生成（通用 XML 规则，不绑定客户端标签）：游离文本 /
+// <user*> 标签 / 首条正文 三段选取，兼容纯文本与多模态数组；回退 raw / 截断。
 func TestSessionNameFor(t *testing.T) {
 	long := strings.Repeat("A", 60)
 	cases := []struct {
@@ -1293,10 +1294,26 @@ func TestSessionNameFor(t *testing.T) {
 		body string
 		want string
 	}{
+		// 规则 1：纯文本（无 XML）→ 原文摘要
 		{"", `{"messages":[{"role":"user","content":"你好世界"},{"role":"assistant","content":"hi"}]}`, "你好世界"},
+		// 规则 1：content 数组收集全部文本块并折叠空白
 		{"", `{"messages":[{"role":"user","content":[{"type":"text","text":"  hello   world "}]}]}`, "hello world"},
+		// 无 user 消息：回退 raw
 		{"xyz", `{"messages":[{"role":"system","content":"sys"}]}`, "xyz"},
+		// 超长截断
 		{"", `{"messages":[{"role":"user","content":"` + long + `"}]}`, strings.Repeat("A", 40) + "…"},
+		// 64 位 hex 隐式种子不可读 → 占位名
+		{strings.Repeat("ab", 32), `{}`, "未命名会话"},
+		// 规则 2：全文在 XML 块内（块间无游离文本）→ 取 <user*> 标签内的真实提问
+		{"", `{"messages":[{"role":"user","content":"<trae_command>\n--- Command Name: trae-remote-official:browser ---\n--- End Command ---\n</trae_command>\n<system-reminder>环境上下文……</system-reminder>\n<user_input>如何排查 5 个问题</user_input>"}]}`, "如何排查 5 个问题"},
+		// 规则 1 优先于规则 2：游离在标签之外的文本最先命中
+		{"", `{"messages":[{"role":"user","content":"先决条件<x>包装内容</x><user>末尾</user>"}]}`, "先决条件"},
+		// 规则 3：无游离文本、无 user 标签 → 首条正文（标签块内部文本）
+		{"", `{"messages":[{"role":"user","content":"<trae_command>--- Command Name: browser ---</trae_command>"}]}`, "--- Command Name: browser ---"},
+		// 普通 OpenAI 请求（无 XML）：原样作名称，即使以 "<" 开头（HTML/XML 提问，标签不进入名称）
+		{"", `{"messages":[{"role":"user","content":"<div>页面布局异常</div> 如何定位"}]}`, "如何定位"},
+		// 标准多模态数组（OpenAI 格式）：各 text 块收集拼接
+		{"", `{"messages":[{"role":"user","content":[{"type":"text","text":"图片里橙色按钮"},{"type":"image_url","image_url":{"url":"x"}},{"type":"text","text":"在哪一版"}]}]}`, "图片里橙色按钮 在哪一版"},
 	}
 	for i, tc := range cases {
 		if got := sessionNameFor(tc.raw, []byte(tc.body)); got != tc.want {
