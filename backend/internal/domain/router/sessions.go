@@ -28,6 +28,7 @@ type Session struct {
 	ExpireAt        time.Time
 	Closed          bool       // 已关闭：不再被路由命中、释放并发槽，但保留在列表（管理可见）
 	ClosedAt        *time.Time // 关闭时间（nil=未关闭）
+	Inflight        int        // 进行中请求数（进程内存计数，不落库；管理端「实时状态」展示用）
 	// LastMsgFingerprints 该会话上次请求的每消息短 hash，用于 call_log 增量 diff
 	//（进程内存字段，不落库；DB 恢复后为空时网关降级为「最后一条 user + tool 链」）。
 	LastMsgFingerprints []string
@@ -51,7 +52,7 @@ type sessionPersister interface {
 // SessionRegistry 会话注册表（进程内存，DB 为持久化投影）：
 //   - 会话生命周期：创建/续期（滑动 TTL）/过期（周期清扫）/踢下线（Kill/KillByFilter）
 //   - 按渠道密钥存活会话计数（byKy）：max_concurrent 判定新会话创建（并发=存活会话数，非请求数）
-//   - 持久化钩子：Attach（新建/迁移）与 Renew → Upsert；Sweep 过期 → DeleteMany；Kill → Delete；
+//   - 持久化钩子：Attach（新建/迁移）与 Renew → Upsert；Sweep 过期仅清内存（DB 投影保留供历史查询）；Kill → Delete；
 //     DB 操作失败仅记日志，不影响热路径（内存为准，最终一致）
 //
 // 排空（渠道或模型）允许既有会话续行；禁用连既有会话也拒绝（由路由层判定）。
@@ -249,6 +250,31 @@ func (r *SessionRegistry) Renew(sessionID string, ttl time.Duration) {
 	}
 }
 
+// BeginRequest 标记会话上有一个请求开始（进行中计数 +1）。会话不存在时忽略。
+// 与 EndRequest 成对使用，用于管理端「实时状态」展示「正在请求」。
+func (r *SessionRegistry) BeginRequest(sessionID string) {
+	if sessionID == "" {
+		return
+	}
+	r.mu.Lock()
+	if s, ok := r.byKey[sessionID]; ok {
+		s.Inflight++
+	}
+	r.mu.Unlock()
+}
+
+// EndRequest 标记会话上一个请求结束（进行中计数 -1，下限 0）。会话不存在时忽略。
+func (r *SessionRegistry) EndRequest(sessionID string) {
+	if sessionID == "" {
+		return
+	}
+	r.mu.Lock()
+	if s, ok := r.byKey[sessionID]; ok && s.Inflight > 0 {
+		s.Inflight--
+	}
+	r.mu.Unlock()
+}
+
 // CountActive 返回某渠道密钥当前存活会话数（按 ChannelKeyID 计数）。
 // 按渠道聚合请用 CountActiveByChannel。
 func (r *SessionRegistry) CountActive(keyID int64) int {
@@ -279,30 +305,21 @@ func (r *SessionRegistry) CountActiveByChannel(channelID int64) int {
 // （管理列表仍可见），超过保留期才随清扫清理。受 LoadPersisted 恢复查询同一常量约束。
 const closedSessionRetention = 30 * 24 * time.Hour
 
-// SweepNow 清理过期会话并回算计数；批量删除 DB 投影（周期清扫调用）。
+// SweepNow 清理过期会话并回算计数（仅内存；DB 投影保留，供历史会话查询）。
 // 已关闭会话不随过期即删：保留 closedSessionRetention 时长供管理列表查看。
 func (r *SessionRegistry) SweepNow() {
 	t := r.now()
 	r.mu.Lock()
-	var expired []string
+	defer r.mu.Unlock()
 	for id, s := range r.byKey {
 		if !t.After(s.ExpireAt) {
 			continue
 		}
-		// 已关闭且在保留期内：保留（内存 + DB），继续展示在列表中。
+		// 已关闭且在保留期内：保留，继续展示在列表中。
 		if s.Closed && s.ClosedAt != nil && t.Sub(*s.ClosedAt) < closedSessionRetention {
 			continue
 		}
 		r.removeLocked(id, s.ChannelKeyID)
-		expired = append(expired, id)
-	}
-	store, logf := r.store, r.logf
-	r.mu.Unlock()
-
-	if store != nil && len(expired) > 0 {
-		if err := store.DeleteMany(context.Background(), expired); err != nil {
-			logf("sweep delete sessions: %v", err)
-		}
 	}
 }
 

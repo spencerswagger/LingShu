@@ -47,6 +47,13 @@ const throughputText = computed(() => {
   return `RPM ${Math.round(s.RPM)} · TPM ${compact(s.TPM)}`
 })
 
+// 缓存命中率（本月）= 缓存读 ÷ 输入(含缓存读)
+const cacheHitText = computed(() => {
+  const s = summary.value
+  if (!s || !s.InputTokens) return '--'
+  return `${((s.CacheReadTokens / s.InputTokens) * 100).toFixed(1)}%`
+})
+
 function goBilling(range: 'today' | 'yesterday' | 'month') {
   const path = isAdmin.value ? '/admin/billings' : '/dev/billings'
   const query: Record<string, string> = { range }
@@ -82,6 +89,11 @@ const metrics = computed<MetricItem[]>(() => {
     { label: '今日消耗', value: fmt(s?.TodayCredits), click: () => goBilling('today') },
     { label: '昨日消耗', value: fmt(s?.YesterdayCredits), click: () => goBilling('yesterday') },
     { label: '本月消耗', value: fmt(s?.MonthCredits), click: () => goBilling('month') },
+    {
+      label: '缓存命中率(本月)',
+      value: cacheHitText.value,
+      click: () => router.push(isAdmin.value ? '/admin/dashboard' : '/dev/usage'),
+    },
     {
       label: '吞吐速率',
       value: throughputText.value,

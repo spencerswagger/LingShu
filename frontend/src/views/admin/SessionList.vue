@@ -3,7 +3,7 @@ import { nextTick, onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Edit } from '@element-plus/icons-vue'
 import { listSessions, kickSessions, renameSession, type AdminSession } from '@/api/admin'
-import { fmtDate, fmtTime } from '@/utils/format'
+import { fmtDate, fmtDateTime, fmtTime } from '@/utils/format'
 import ErrorBubble from '@/components/ErrorBubble.vue'
 import UserSelect from '@/components/UserSelect.vue'
 import ColumnFilter from '@/components/ColumnFilter.vue'
@@ -24,7 +24,6 @@ const filters = reactive({
   user_id: undefined as string | undefined,
   token_id: undefined as string | undefined,
   channel_key_id: undefined as string | undefined,
-  status: undefined as string | undefined, // active | expired | closed
 })
 
 function setInputRef(el: any, id: string) {
@@ -67,9 +66,6 @@ async function load() {
   if (filters.user_id) params.UserID = filters.user_id
   if (filters.token_id && filters.token_id.trim()) params.TokenID = filters.token_id.trim()
   if (filters.channel_key_id && filters.channel_key_id.trim()) params.ChannelKeyID = filters.channel_key_id.trim()
-  if (filters.status === 'active') params.Expired = 'active'
-  if (filters.status === 'expired') params.Expired = 'expired'
-  if (filters.status === 'closed') params.Closed = '1'
   try {
     const res = await listSessions(params)
     list.value = res.Data.List || []
@@ -80,9 +76,9 @@ async function load() {
     loading.value = false
   }
 }
-// 用户/令牌/密钥/状态筛选变化自动刷新；会话 ID 由输入框 change 触发
+// 用户/令牌/密钥筛选变化自动刷新；会话 ID 由输入框 change 触发
 watch(
-  () => `${filters.user_id}|${filters.token_id}|${filters.channel_key_id}|${filters.status}`,
+  () => `${filters.user_id}|${filters.token_id}|${filters.channel_key_id}`,
   () => {
     page.value = 1
     load()
@@ -121,6 +117,47 @@ function onCloseBatch() {
   if (!selected.value.length) return
   close(selected.value.map((r) => r.SessionID), `${selected.value.length} 个`)
 }
+
+// ===== 实时状态 =====
+type DotState = 'requesting' | 'idle' | 'aging' | 'stale'
+
+// 会话状态圆点：绿=正在请求（有进行中请求）；蓝=无请求（存活空闲）；
+// 黄=已消耗 TTL 的 25%；灰=已消耗 TTL 的 50%（含已过期/已关闭）。
+function dotState(row: AdminSession): { key: DotState; label: string } {
+  if (row.Closed) return { key: 'stale', label: '已关闭' }
+  if (row.Inflight > 0) return { key: 'requesting', label: '正在请求' }
+  const last = new Date(row.LastActive).getTime()
+  const exp = new Date(row.ExpireAt).getTime()
+  const now = Date.now()
+  const span = exp - last
+  const ratio = span > 0 ? (now - last) / span : 1
+  if (row.Expired || now >= exp) return { key: 'stale', label: '已过期' }
+  if (ratio >= 0.5) return { key: 'stale', label: '已消耗 TTL 50%' }
+  if (ratio >= 0.25) return { key: 'aging', label: '已消耗 TTL 25%' }
+  return { key: 'idle', label: '无请求' }
+}
+
+// 状态为进行中（未关闭且未过期）才显示关闭操作。
+function canClose(row: AdminSession): boolean {
+  return !row.Closed && !row.Expired
+}
+
+// 数值容错：后端字段缺失（如版本不一致）时按 0 处理，避免渲染报错。
+const num = (v: unknown) => Number(v ?? 0)
+const intVal = (v: unknown) => Math.round(num(v))
+const fmtInt = (n: unknown) => num(n).toLocaleString('zh-CN')
+const fmtMoney = (n: unknown) =>
+  num(n).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+const compact = (n: unknown) => {
+  const v = num(n)
+  const abs = Math.abs(v)
+  if (abs >= 1e9) return `${(v / 1e9).toFixed(2)}B`
+  if (abs >= 1e6) return `${(v / 1e6).toFixed(2)}M`
+  if (abs >= 1e3) return `${(v / 1e3).toFixed(2)}K`
+  if (abs >= 1) return v.toFixed(abs >= 100 ? 0 : 1)
+  return v.toFixed(2)
+}
+const pct = (v: unknown) => `${Math.round(num(v) * 100)}%`
 </script>
 
 <template>
@@ -189,7 +226,7 @@ function onCloseBatch() {
             </div>
           </template>
         </el-table-column>
-        <el-table-column label="渠道-密钥" min-width="120" show-overflow-tooltip>
+        <el-table-column label="渠道 / 密钥" min-width="150" show-overflow-tooltip>
           <template #header>
             <ColumnFilter
               label="渠道-密钥"
@@ -206,42 +243,59 @@ function onCloseBatch() {
             </ColumnFilter>
           </template>
           <template #default="{ row }">
-            <span class="cell">{{ row.ChannelKeyName || '-' }}</span>
-          </template>
-        </el-table-column>
-        <el-table-column label="创建 / 最近活跃" min-width="170">
-          <template #default="{ row }">
             <div class="t-time">
-              <span class="t-date">{{ fmtDate(row.CreatedAt) }} {{ fmtTime(row.CreatedAt) }}</span>
-              <span class="t-clock">{{ fmtDate(row.LastActive) }} {{ fmtTime(row.LastActive) }}</span>
+              <span class="t-date">{{ row.ChannelName || '-' }}</span>
+              <span class="t-clock">{{ row.ChannelKeyName || '-' }}</span>
             </div>
           </template>
         </el-table-column>
         <el-table-column label="过期时间" min-width="110">
           <template #default="{ row }">
-            <div class="t-time">
-              <span class="t-date">{{ fmtDate(row.ExpireAt) }}</span>
-              <span class="t-clock">{{ fmtTime(row.ExpireAt) }}</span>
-            </div>
+            <el-tooltip placement="top" :show-after="120">
+              <template #content>
+                <div>创建：{{ fmtDateTime(row.CreatedAt) }}</div>
+                <div>最近活跃：{{ fmtDateTime(row.LastActive) }}</div>
+              </template>
+              <div class="t-time">
+                <span class="t-date">{{ fmtDate(row.ExpireAt) }}</span>
+                <span class="t-clock">{{ fmtTime(row.ExpireAt) }}</span>
+              </div>
+            </el-tooltip>
           </template>
         </el-table-column>
-        <el-table-column label="状态" min-width="86" align="center">
-          <template #header>
-            <ColumnFilter label="状态" :active="!!filters.status" @clear="() => (filters.status = undefined)">
-              <el-select v-model="filters.status" placeholder="会话状态" clearable size="small" style="width: 100%">
-                <el-option label="进行中" value="active" />
-                <el-option label="已过期" value="expired" />
-                <el-option label="已关闭" value="closed" />
-              </el-select>
-            </ColumnFilter>
-          </template>
+        <el-table-column label="实时状态" min-width="150">
           <template #default="{ row }">
-            <el-tag v-if="row.Closed" type="info" size="small" effect="light">已关闭</el-tag>
-            <el-tag v-else-if="row.Expired" type="danger" size="small" effect="light">已过期</el-tag>
-            <el-tag v-else type="success" size="small" effect="light">进行中</el-tag>
+            <el-popover placement="left" trigger="hover" :width="288" :show-after="120">
+              <template #reference>
+                <div class="rs-cell">
+                  <span class="dot-glow" :data-state="dotState(row).key" />
+                  <div class="rs-text">
+                    <span class="rs-main">{{ compact(row.ContextLen) }} · {{ intVal(row.Credits) }}积分</span>
+                    <span class="rs-sub">{{ compact(row.Tokens) }} · {{ pct(row.CacheHitRate) }}</span>
+                  </div>
+                </div>
+              </template>
+              <div class="rs-pop">
+                <div class="rs-pop-title">
+                  <span class="dot-glow" :data-state="dotState(row).key" />
+                  <span>{{ dotState(row).label }}</span>
+                </div>
+                <div class="rs-pop-grid">
+                  <div class="rs-pop-item"><span>总调用次数</span><b>{{ fmtInt(row.Calls) }}</b></div>
+                  <div class="rs-pop-item"><span>总消耗 Token</span><b>{{ compact(row.Tokens) }}</b></div>
+                  <div class="rs-pop-item"><span>总消耗积分</span><b>{{ fmtMoney(row.Credits) }}</b></div>
+                  <div class="rs-pop-item"><span>上下文长度</span><b>{{ compact(row.ContextLen) }}</b></div>
+                  <div class="rs-pop-item"><span>RPM</span><b>{{ num(row.RPM).toFixed(2) }}</b></div>
+                  <div class="rs-pop-item"><span>TPM</span><b>{{ compact(num(row.TPM)) }}</b></div>
+                  <div class="rs-pop-item"><span>用户消息次数</span><b>{{ fmtInt(row.UserMsgs) }}</b></div>
+                  <div class="rs-pop-item"><span>工具调用次数</span><b>{{ fmtInt(row.ToolCalls) }}</b></div>
+                  <div class="rs-pop-item rs-pop-wide"><span>缓存命中率</span><b>{{ pct(row.CacheHitRate) }}</b></div>
+                </div>
+              </div>
+            </el-popover>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="150" align="right" fixed="right">
+        <el-table-column label="操作" width="108" align="right" fixed="right">
           <template #default="{ row }">
             <el-button
               link
@@ -249,9 +303,9 @@ function onCloseBatch() {
               size="small"
               @click="$router.push({ name: 'admin-session-detail', params: { id: row.SessionID } })"
             >
-              完整记录
+              详情
             </el-button>
-            <el-button link type="danger" size="small" @click="onCloseOne(row)">关闭</el-button>
+            <el-button v-if="canClose(row)" link type="danger" size="small" @click="onCloseOne(row)">关闭</el-button>
           </template>
         </el-table-column>
       </el-table>
@@ -276,10 +330,6 @@ function onCloseBatch() {
 </template>
 
 <style scoped>
-.cell {
-  font-size: 12px;
-  color: var(--color-text-secondary);
-}
 .mono {
   font-family: 'SF Mono', Menlo, Consolas, monospace;
   font-size: 12px;
@@ -323,5 +373,88 @@ function onCloseBatch() {
 .name-edit {
   font-size: 13px;
   color: var(--color-text-secondary);
+}
+
+/* 实时状态单元格：光效圆点 + 概要（明细见悬停浮层） */
+.rs-cell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.rs-text {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.35;
+  min-width: 0;
+}
+.rs-main {
+  font-size: 12px;
+  color: var(--color-text);
+}
+.rs-sub {
+  font-size: 12px;
+  color: var(--color-text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 光效圆点：绿=正在请求（脉冲光晕）· 蓝=无请求 · 黄=已消耗 TTL 25% · 灰=已消耗 TTL 50%/已过期/已关闭 */
+.dot-glow {
+  flex-shrink: 0;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #98a2b3;
+}
+.dot-glow[data-state='requesting'] {
+  background: #12b76a;
+  animation: dot-pulse 1.4s ease-out infinite;
+}
+.dot-glow[data-state='idle'] {
+  background: #0ea5e9;
+  box-shadow: 0 0 6px rgba(14, 165, 233, 0.55);
+}
+.dot-glow[data-state='aging'] {
+  background: #f79009;
+  box-shadow: 0 0 6px rgba(247, 144, 9, 0.5);
+}
+.dot-glow[data-state='stale'] {
+  background: #98a2b3;
+}
+@keyframes dot-pulse {
+  0% { box-shadow: 0 0 0 0 rgba(18, 183, 106, 0.6); }
+  70% { box-shadow: 0 0 0 7px rgba(18, 183, 106, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(18, 183, 106, 0); }
+}
+
+/* 实时状态悬停明细 */
+.rs-pop-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-text);
+}
+.rs-pop-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 14px;
+}
+.rs-pop-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+.rs-pop-item b {
+  font-size: 13px;
+  color: var(--color-text);
+  font-variant-numeric: tabular-nums;
+}
+.rs-pop-wide {
+  grid-column: 1 / -1;
 }
 </style>

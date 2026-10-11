@@ -561,11 +561,14 @@ export function listBillings(params: Record<string, unknown> = {}) {
   )
 }
 // 账单筛选聚合统计（与列表同 filter）：请求数/总积分/总 token/总耗时（统计栏用）。
+// InputTokens=输入(含缓存读)总量，CacheReadTokens=缓存读命中量（用于缓存命中率）。
 export interface BillingStats {
   Requests: number
   CreditsTotal: number
   TokensTotal: number
   DurationTotalMS: number
+  InputTokens: number
+  CacheReadTokens: number
 }
 export function getBillingStats(params: Record<string, unknown> = {}) {
   return http.get<BillingStats, ApiRes<BillingStats>>('/admin/billings/stats', { params })
@@ -589,6 +592,7 @@ export interface AdminSession {
   Model: string
   ChannelKeyID: string
   ChannelKeyName: string
+  ChannelName?: string
   SessionRaw: string
   SessionName: string
   Closed: boolean
@@ -596,6 +600,17 @@ export interface AdminSession {
   LastActive: string
   ExpireAt: string
   Expired: boolean
+  // 实时状态（后端按 session_id 聚合）
+  Inflight: number // 进行中请求数（>0 = 正在请求）
+  Calls: number // 总调用次数
+  Tokens: number // 总消耗 Token
+  Credits: number // 总消耗积分
+  ContextLen: number // 上下文长度（最近一次请求输入 Token）
+  RPM: number // 近 5 分钟每分钟请求数
+  TPM: number // 近 5 分钟每分钟 Token 数
+  UserMsgs: number // 用户消息次数
+  ToolCalls: number // 工具调用次数
+  CacheHitRate: number // 缓存命中率（0~1）
 }
 export function listSessions(
   params: Record<string, any>,
