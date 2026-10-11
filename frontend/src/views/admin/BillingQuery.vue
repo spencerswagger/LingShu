@@ -32,7 +32,14 @@ const page = ref(1)
 const size = ref(20)
 const errInfo = ref<{ message: string; requestId: string }>({ message: '', requestId: '' })
 
-const stats = ref<BillingStats>({ Requests: 0, CreditsTotal: 0, TokensTotal: 0, DurationTotalMS: 0 })
+const stats = ref<BillingStats>({
+  Requests: 0,
+  CreditsTotal: 0,
+  TokensTotal: 0,
+  DurationTotalMS: 0,
+  InputTokens: 0,
+  CacheReadTokens: 0,
+})
 
 // ===== 列头筛选选项数据 =====
 const channels = ref<AdminChannel[]>([])
@@ -262,6 +269,12 @@ function avgTPM(): string {
 }
 const creditsTotal = computed(() => stats.value.CreditsTotal.toLocaleString(undefined, { maximumFractionDigits: 4 }))
 const tokensTotal = computed(() => stats.value.TokensTotal.toLocaleString())
+// 缓存命中率 = 缓存读 ÷ 输入(含缓存读)
+const cacheHitRate = computed(() => {
+  const s = stats.value
+  if (!s.InputTokens) return '-'
+  return `${((s.CacheReadTokens / s.InputTokens) * 100).toFixed(1)}%`
+})
 
 // 消耗积分公式（与详情页一致的三步式展示）：Token×单价 → 系数调整 → 积分换算
 function creditLines(row: AdminBillingItem): string[] {
@@ -319,11 +332,15 @@ function sessionLabel(s: AdminSession): string {
         <span class="stat-value">{{ tokensTotal }}</span>
       </div>
       <div class="stat">
-        <span class="stat-label" title="请求数 ÷ 符合条件的记录总耗时(分钟)">平均 RPM</span>
+        <span class="stat-label" title="缓存读占输入的比重">缓存命中率</span>
+        <span class="stat-value">{{ cacheHitRate }}</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label" title="每分钟平均请求数">平均 RPM</span>
         <span class="stat-value">{{ avgRPM() }}</span>
       </div>
       <div class="stat">
-        <span class="stat-label" title="总 Token ÷ 符合条件的记录总耗时(分钟)">平均 TPM</span>
+        <span class="stat-label" title="每分钟平均 Token 数">平均 TPM</span>
         <span class="stat-value">{{ avgTPM() }}</span>
       </div>
       <div class="stat-spacer" />

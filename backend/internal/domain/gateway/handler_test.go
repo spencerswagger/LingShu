@@ -882,6 +882,47 @@ func TestServeSessionAttachKeyAndRenew(t *testing.T) {
 	}
 }
 
+// 已关闭会话不得继续被服务：关闭后同标识请求应视为「新会话」重建（重新占并发槽、Closed 复位）。
+func TestServeClosedSessionReactivates(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"x","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`))
+	}))
+	defer upstream.Close()
+
+	h := build(t, upstream.URL)
+	sid := router.SessionID(7, 42, "gpt-4", "abc")
+	body := `{"model":"gpt-4","stream":false}`
+
+	// 首次请求建会话，随后关闭（释放并发槽）。
+	if rec := doRequestH(t, h.gw, "/v1/chat/completions", "sk-gw-t", body, map[string]string{"x-session-id": "abc"}); rec.Code != http.StatusOK {
+		t.Fatalf("first request want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !h.rrouter.sess.Close(sid) {
+		t.Fatalf("close session failed")
+	}
+	if n := h.rrouter.sess.CountActive(1); n != 0 {
+		t.Fatalf("关闭后并发槽应释放，got %d", n)
+	}
+
+	// 同标识再次请求：应重建为新会话（修复前会被当作 existing 续行，Closed 不复位、不占槽）。
+	rec := doRequestH(t, h.gw, "/v1/chat/completions", "sk-gw-t", body, map[string]string{"x-session-id": "abc"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("reactivated request want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	s, ok := h.rrouter.sess.Lookup(sid)
+	if !ok {
+		t.Fatalf("reactivated session not found")
+	}
+	if s.Closed {
+		t.Errorf("重新激活后会话不应仍为已关闭")
+	}
+	if n := h.rrouter.sess.CountActive(1); n != 1 {
+		t.Errorf("重新激活后应重新占并发槽，got %d", n)
+	}
+}
+
 // 场景 F1：余额前置检查——余额 <= 0 时流式/非流式均直接 402，且不发起任何上游调用、不写计费。
 func TestServeZeroBalanceRejected_BothModes(t *testing.T) {
 	var called int32

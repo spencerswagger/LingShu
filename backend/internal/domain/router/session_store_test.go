@@ -162,13 +162,14 @@ func TestSessionStoreLoadActive(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now()
 
+	// sqlmock 固定返回以下行，用于覆盖 closed / closed_at 的扫描路径（与实际 SQL 过滤无关）。
 	rows := sqlmock.NewRows([]string{"session_id", "user_id", "token_id", "model", "session_raw",
 		"channel_key_id", "internal_model_id", "created_at", "last_active", "expire_at", "name", "closed", "closed_at"}).
 		AddRow("abc", int64(1), int64(2), "qw-max", "sess", int64(7), "int1", now, now, now.Add(time.Hour), "今天的会话", false, nil).
 		AddRow("def", int64(2), nil, "qw-max", "", int64(8), "int2", now, now, now.Add(2*time.Hour), "", true, now)
 
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT `+sessionCols+` FROM sessions WHERE expire_at > $1 OR (closed AND closed_at > $2)`)).
-		WithArgs(now, now.Add(-closedSessionRetention)).WillReturnRows(rows)
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + sessionCols + ` FROM sessions WHERE expire_at > $1 AND NOT closed`)).
+		WithArgs(now).WillReturnRows(rows)
 
 	list, err := store.LoadActive(ctx, now)
 	if err != nil {

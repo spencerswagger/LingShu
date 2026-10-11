@@ -62,6 +62,9 @@ type meSummaryResp struct {
 	MonthCredits     float64 `json:"MonthCredits"`
 	RPM              float64 `json:"RPM"`
 	TPM              float64 `json:"TPM"`
+	// 本月缓存口径：InputTokens=输入(含缓存读)总量，CacheReadTokens=缓存读命中量；前端据此算缓存命中率。
+	InputTokens     int64 `json:"InputTokens"`
+	CacheReadTokens int64 `json:"CacheReadTokens"`
 }
 
 // HandleMeSummary GET /api/v1/auth/me/summary 本人摘要。
@@ -123,5 +126,7 @@ func (h *Dev) HandleMeSummary(w http.ResponseWriter, r *http.Request) {
 		MonthCredits:     mSum.CreditsTotal,
 		RPM:              float64(winSum.Requests) / 5.0,
 		TPM:              float64(winSum.TokensTotal) / 5.0,
+		InputTokens:      mSum.InputTokens,
+		CacheReadTokens:  mSum.CacheReadTokens,
 	})
 }

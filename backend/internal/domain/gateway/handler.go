@@ -314,6 +314,11 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint string)
 	//    - 全部候选都失败 → 退还预扣并返回聚合错误
 	sess := g.router.Sessions()
 	sessObj, hasSession := sess.Lookup(sessionID)
+	// 已关闭会话视为不存在：不参与续行（走下方 Attach 重建，重新占并发槽），
+	// 避免「关闭后同一会话标识仍被服务、且绕过并发上限」。sessObj 保留用于请求增量 diff 的指纹对齐。
+	if hasSession && sessObj != nil && sessObj.Closed {
+		hasSession = false
+	}
 	// 请求增量 diff：计算本次请求的增量消息与全量指纹（call_log 采集用，
 	// 新会话也在此初始化指纹，由下方 Attach 写入会话）。
 	reqMsgs, msgFps := g.captureReqIncrement(sessObj, body)
@@ -425,12 +430,19 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint string)
 		}
 
 		var out *fwdOutcome
+		// 进行中计数：包住整段上游转发（含流式全程），管理端「实时状态」据此判定「正在请求」。
+		if sessionID != "" {
+			sess.BeginRequest(sessionID)
+		}
 		if isStream {
 			attempted = true
 			out = g.serveStream(w, r, start, prov, rt, routeRes, kr.CredentialPlain, rewritten, model, token, pricingMode, sessionID, sessionName, preConsumed, reqMsgs, attempts)
 		} else {
 			attempted = true
 			out = g.serveNonStream(w, r, start, prov, rt, routeRes, kr.CredentialPlain, rewritten, model, token, pricingMode, sessionID, sessionName, preConsumed, reqMsgs, attempts)
+		}
+		if sessionID != "" {
+			sess.EndRequest(sessionID)
 		}
 		if out.responded {
 			if sessionID != "" {

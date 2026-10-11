@@ -239,7 +239,7 @@ func TestRegistry_RenewPersists(t *testing.T) {
 	}
 }
 
-func TestRegistry_SweepExpired_DeleteMany(t *testing.T) {
+func TestRegistry_SweepExpired_MemoryOnly(t *testing.T) {
 	now := time.Now()
 	r := NewSessionRegistry(func() time.Time { return now })
 	f := &fakePersister{}
@@ -251,8 +251,9 @@ func TestRegistry_SweepExpired_DeleteMany(t *testing.T) {
 	now = now.Add(2 * time.Second) // s1 过期
 	r.SweepNow()
 
-	if len(f.deleteMany) != 1 || sortedJoin(f.deleteMany[0]) != "s1" {
-		t.Fatalf("Sweep 应批量删除过期 s1，got %v", f.deleteMany)
+	// 过期清扫只清内存，不动 DB 投影（保留历史会话）。
+	if len(f.deleteMany) != 0 {
+		t.Fatalf("Sweep 不应删除 DB 投影，got %v", f.deleteMany)
 	}
 	if _, ok := r.Lookup("s1"); ok {
 		t.Fatal("s1 应已清除")
