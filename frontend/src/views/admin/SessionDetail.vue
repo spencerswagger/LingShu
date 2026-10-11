@@ -5,6 +5,8 @@ import { listSessions, listSessionCalls, type AdminSession, type CallLogView } f
 import { fmtDateTime } from '@/utils/format'
 import ErrorBubble from '@/components/ErrorBubble.vue'
 import StatusTag from '@/components/StatusTag.vue'
+import ChatBubble from '@/components/ChatBubble.vue'
+import { contentToBubbles, fmtJson, type MsgBubble } from '@/utils/messageParts'
 
 const route = useRoute()
 const router = useRouter()
@@ -41,6 +43,7 @@ interface TranscriptMsg {
 }
 interface RespInfo {
   text: string
+  reasoning: string
   toolCalls: unknown[]
 }
 interface TranscriptItem {
@@ -58,19 +61,16 @@ function msgSide(role?: string) {
   return role === 'user' ? 'right' : 'left'
 }
 
-function fmtJson(v: unknown) {
-  if (v == null) return ''
-  try {
-    return JSON.stringify(v, null, 2)
-  } catch {
-    return String(v)
-  }
+// 消息 content → 多气泡（纯文本/多模态数组/XML 标签块）
+function bubblesOf(m: TranscriptMsg): MsgBubble[] {
+  return contentToBubbles(m.content)
 }
 
-// 解析 RespBody（非流式消息对象 / 流式 assistant 增量数组 / 纯文本）：提取 content 文本与 tool_calls
+// 解析 RespBody（非流式消息对象 / 流式 assistant 增量数组 / 纯文本）：
+// 提取 content 文本、reasoning 推理过程与 tool_calls
 function respInfo(cl: CallLogView): RespInfo {
-  if (!cl.RespBody) return { text: '', toolCalls: [] }
-  const out: RespInfo = { text: '', toolCalls: [] }
+  if (!cl.RespBody) return { text: '', reasoning: '', toolCalls: [] }
+  const out: RespInfo = { text: '', reasoning: '', toolCalls: [] }
   const walk = (p: unknown): void => {
     if (p == null) return
     if (typeof p === 'string') {
@@ -90,6 +90,14 @@ function respInfo(cl: CallLogView): RespInfo {
           else if (c && typeof c.text === 'string' && c.text) out.text += c.text
         }
       }
+      // 推理过程（推理型模型 delta 携带）
+      if (typeof o.reasoning_content === 'string' && o.reasoning_content) out.reasoning += o.reasoning_content
+      if (Array.isArray(o.reasoning_content)) {
+        for (const c of o.reasoning_content) {
+          if (typeof c === 'string' && c) out.reasoning += c
+          else if (c && typeof c.text === 'string' && c.text) out.reasoning += c.text
+        }
+      }
       if (Array.isArray(o.tool_calls)) {
         out.toolCalls.push(...o.tool_calls.filter((t: any) => t && (t.function || t.id)))
       }
@@ -104,7 +112,7 @@ function respInfo(cl: CallLogView): RespInfo {
   try {
     walk(JSON.parse(cl.RespBody))
   } catch {
-    return { text: cl.RespBody, toolCalls: [] }
+    return { text: cl.RespBody, reasoning: '', toolCalls: [] }
   }
   return out
 }
@@ -139,58 +147,6 @@ function callChannel(cl: CallLogView): { channel: string; key: string; model: st
 const transcript = computed<TranscriptItem[]>(() =>
   calls.value.map((c) => ({ call: c, msgs: msgList(c.ReqMessages), resp: respInfo(c), channel: callChannel(c) })),
 )
-
-// ===== 消息可读渲染（问题 5）：content 数组 → 文本块；系统注入块默认折叠 =====
-// 折叠的注入标签：包裹层对用户价值低且占篇幅；user_input 是真实提问，保留在正文。
-const INJECT_TAGS = ['system-reminder', 'system_reminder', 'trae_command', 'tool_result', 'device_reminder']
-
-interface MsgView {
-  main: string
-  injects: Array<{ tag: string; text: string }>
-}
-
-// content 兼容 string / ChatGPT 多段数组，拼接为全文
-function textBlocksOf(v: unknown): string {
-  if (v == null) return ''
-  if (typeof v === 'string') return v
-  if (Array.isArray(v)) {
-    return v
-      .map((x: any) => {
-        if (typeof x === 'string') return x
-        if (x && typeof x === 'object') {
-          if (typeof x.text === 'string') return x.text
-          if (typeof x.content === 'string' || Array.isArray(x.content)) return textBlocksOf(x.content)
-        }
-        return ''
-      })
-      .join('\n')
-  }
-  return ''
-}
-
-// 从全文剥离注入块（system-reminder / trae_command 等），返回正文与折叠列表
-function splitInjects(full: string): MsgView {
-  let rest = full
-  const injects: Array<{ tag: string; text: string }> = []
-  for (const tag of INJECT_TAGS) {
-    const re = new RegExp(`<${tag}[^>]*>[\\s\\S]*?<\\/${tag}>`, 'gi')
-    rest = rest.replace(re, (m) => {
-      injects.push({ tag, text: m })
-      return '\n'
-    })
-  }
-  const main = rest
-    .split('\n')
-    .map((l) => l.trim())
-    .filter((l) => l)
-    .join('\n')
-  return { main, injects }
-}
-
-function msgView(m: TranscriptMsg): MsgView {
-  if (typeof m.content === 'string') return splitInjects(m.content)
-  return splitInjects(textBlocksOf(m.content))
-}
 </script>
 
 <template>
@@ -259,48 +215,40 @@ function msgView(m: TranscriptMsg): MsgView {
             class="msg-row"
             :class="msgSide(m.role) === 'right' ? 'is-user' : 'is-other'"
           >
-            <div class="msg-bubble">
+            <div class="msg-cluster">
               <div class="msg-role">{{ m.role || 'message' }}</div>
-              <template v-if="msgView(m).main">
-                <div class="msg-text">{{ msgView(m).main }}</div>
+              <template v-if="bubblesOf(m).length">
+                <div v-for="(b, bi) in bubblesOf(m)" :key="bi" class="msg-bubble">
+                  <ChatBubble :bubble="b" />
+                </div>
               </template>
-              <div v-else-if="m.content == null" class="msg-empty">（无文本内容）</div>
-              <div v-if="msgView(m).injects.length" class="msg-injects">
-                <el-collapse>
-                  <el-collapse-item
-                    v-for="(inj, ii) in msgView(m).injects"
-                    :key="ii"
-                    :name="'inj-' + mi + '-' + ii"
-                    :title="`注入块 &lt;${inj.tag}&gt;（${inj.text.length} 字）`"
-                  >
-                    <pre class="mono msg-json">{{ inj.text }}</pre>
-                  </el-collapse-item>
-                </el-collapse>
-              </div>
+              <div v-else class="msg-empty">（无文本内容）</div>
             </div>
           </div>
 
           <div class="msg-row is-other">
-            <div class="msg-bubble">
+            <div class="msg-cluster">
               <div class="msg-role">{{ item.call.RespKind === 'error' ? '错误' : 'assistant 响应' }}</div>
               <div v-if="item.call.RespKind === 'error' && item.call.ErrorMessage" class="resp-error">
                 {{ item.call.ErrorMessage }}
               </div>
-              <template v-else>
-                <div v-if="item.resp.text" class="msg-text">{{ item.resp.text }}</div>
-                <pre v-else class="mono msg-json">{{ item.call.RespBody }}</pre>
+              <template v-else-if="item.resp.text || item.resp.reasoning">
+                <div v-if="item.resp.text" class="msg-bubble">
+                  <ChatBubble :bubble="{ kind: 'text', text: item.resp.text }" />
+                </div>
+                <div v-if="item.resp.reasoning" class="msg-bubble">
+                  <ChatBubble :bubble="{ kind: 'xml', tag: 'reasoning', text: item.resp.reasoning }" />
+                </div>
               </template>
-              <div v-if="item.resp.toolCalls.length" class="tool-calls">
-                <el-collapse>
-                  <el-collapse-item
-                    v-for="(tc, ti) in item.resp.toolCalls"
-                    :key="ti"
-                    :name="'tc-' + ti"
-                    :title="'tool_calls[' + ti + ']'"
-                  >
-                    <pre class="mono msg-json">{{ fmtJson(tc) }}</pre>
-                  </el-collapse-item>
-                </el-collapse>
+              <template v-else>
+                <div class="msg-bubble">
+                  <ChatBubble :bubble="{ kind: 'json', text: item.call.RespBody || '—' }" />
+                </div>
+              </template>
+              <div v-if="item.resp.toolCalls.length">
+                <div v-for="(tc, ti) in item.resp.toolCalls" :key="ti" class="msg-bubble tool-bubble">
+                  <ChatBubble :bubble="{ kind: 'tool', text: fmtJson(tc) }" />
+                </div>
               </div>
             </div>
           </div>
@@ -377,8 +325,19 @@ function msgView(m: TranscriptMsg): MsgView {
 .msg-row.is-other {
   justify-content: flex-start;
 }
-.msg-bubble {
+.msg-cluster {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
   max-width: 92%;
+  min-width: 0;
+}
+.msg-row.is-user .msg-cluster {
+  align-items: flex-end;
+}
+.msg-bubble {
+  max-width: 100%;
   padding: 8px 12px;
   border-radius: 10px;
   background: var(--color-fill, #f6f7fa);
@@ -390,39 +349,18 @@ function msgView(m: TranscriptMsg): MsgView {
 .msg-role {
   font-size: 11px;
   color: var(--color-text-tertiary);
-  margin-bottom: 4px;
-}
-.msg-text {
-  font-size: 13px;
-  line-height: 1.6;
-  white-space: pre-wrap;
-  word-break: break-word;
+  margin-bottom: 2px;
 }
 .msg-empty {
   font-size: 12px;
   color: var(--color-text-tertiary);
 }
-.msg-injects {
-  margin-top: 6px;
-}
-.msg-json {
-  margin: 0;
-  padding: 8px 10px;
-  border-radius: 6px;
-  background: #101828;
-  color: #d0d5dd;
-  line-height: 1.5;
-  white-space: pre-wrap;
-  word-break: break-all;
-  max-height: 240px;
-  overflow: auto;
+.tool-bubble {
+  width: 100%;
 }
 .resp-error {
   font-size: 13px;
   font-weight: 600;
   color: var(--color-danger);
-}
-.tool-calls {
-  margin-top: 8px;
 }
 </style>
