@@ -284,10 +284,14 @@ function creditLines(row: AdminBillingItem): string[] {
   const coeffCtx = row.CoeffContext ?? 1
   const r = row.RValue ?? 0
 
+  // 输入(Input)已含缓存读(CacheRead)，为避免缓存命中 token 重复计费，
+  // 输入段按 (Input - CacheRead) 计（与后端 sumRates 口径一致）。
+  const cacheRead = t.CacheRead || 0
+  const nonCachedIn = Math.max((t.Input || 0) - cacheRead, 0)
   const segs: Array<[number, string, string]> = [
-    [t.Input || 0, '输入', 'Input'],
+    [nonCachedIn, cacheRead > 0 ? '输入(非缓存)' : '输入', 'Input'],
     [t.Output || 0, '输出', 'Output'],
-    [t.CacheRead || 0, '缓存读', 'CacheRead'],
+    [cacheRead, '缓存读', 'CacheRead'],
     [t.CacheWrite || 0, '缓存写', 'CacheWrite'],
     [t.Reasoning || 0, '推理', 'Reasoning'],
   ]

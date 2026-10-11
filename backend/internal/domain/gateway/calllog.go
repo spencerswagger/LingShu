@@ -297,10 +297,20 @@ func (g *Gateway) captureReqIncrement(sessObj *router.Session, body []byte) ([]j
 	return incr, fps
 }
 
+// preCharge 预扣决策快照：预扣阶段（估算输入 token × 时段/分档系数 ÷ R）的关键参数，
+// 供决策轨迹展示「预扣积分从何而来」。Credits<=0 表示未发生预扣（无单价/零余额等）。
+type preCharge struct {
+	Credits     float64
+	InputTokens int
+	TimeCoeff   float64
+	CtxCoeff    float64
+}
+
 // callLogDecision 组装本次请求的决策轨迹（供成功/失败路径 writeCallLog 使用）：
 // attempts 为「到当前候选为止」已收集的全部候选结果 + 当前候选的最终结果（result 作为该候选理由），
 // 前端请求详情页据此展示候选渠道表与终态原因（success/上游失败等）。
-func callLogDecision(attempts []map[string]any, result string, preConsumed float64, curID, curKeyID int64, curModel string) map[string]any {
+// 渠道/密钥名由运行时按 ID 回查（渠道 ID 为雪花值，直接展示不具可读性）。
+func (g *Gateway) callLogDecision(attempts []map[string]any, result string, pc preCharge, curID, curKeyID int64, curModel string) map[string]any {
 	cloned := make([]map[string]any, 0, len(attempts)+1)
 	for i := range attempts {
 		m := make(map[string]any, len(attempts[i]))
@@ -309,20 +319,39 @@ func callLogDecision(attempts []map[string]any, result string, preConsumed float
 		}
 		cloned = append(cloned, m)
 	}
+	chName, keyName := g.channelAndKeyNames(curID, curKeyID)
 	cloned = append(cloned, map[string]any{
 		"order":             len(cloned) + 1,
 		"channel_id":        strconv.FormatInt(curID, 10),
+		"channel_name":      chName,
 		"channel_key_id":    strconv.FormatInt(curKeyID, 10),
+		"channel_key_name":  keyName,
 		"internal_model_id": curModel,
 		"reason":            result,
 	})
 	return map[string]any{
-		"attempts":     cloned,
-		"time_coeff":   0,
-		"ctx_coeff":    0,
-		"pre_consumed": preConsumed,
-		"result":       result,
+		"attempts":         cloned,
+		"est_input_tokens": pc.InputTokens,
+		"time_coeff":       pc.TimeCoeff,
+		"ctx_coeff":        pc.CtxCoeff,
+		"pre_consumed":     pc.Credits,
+		"result":           result,
 	}
+}
+
+// channelAndKeyNames 按运行时回查渠道名/密钥名（未命中或运行时缺省时返回空串）。
+func (g *Gateway) channelAndKeyNames(channelID, keyID int64) (string, string) {
+	if g.channels == nil {
+		return "", ""
+	}
+	var chName, keyName string
+	if rt, ok := g.channels.GetRuntime(channelID); ok {
+		chName = rt.Channel.Name
+	}
+	if kr, ok := g.channels.GetKeyRuntime(keyID); ok {
+		keyName = kr.Key.Name
+	}
+	return chName, keyName
 }
 
 // writeCallLog 采集一条调用日志（写失败仅记日志，不阻塞/回滚请求语义）。
