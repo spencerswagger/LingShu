@@ -10,20 +10,24 @@ import (
 	"time"
 
 	"github.com/team/llmgateway/internal/domain/billing"
+	"github.com/team/llmgateway/internal/domain/router"
 	"github.com/team/llmgateway/internal/pkg/decimalx"
 	"github.com/team/llmgateway/internal/pkg/resp"
 )
 
 // Dev 承载开发端控制台处理器。userID 从鉴权上下文取（userIDFrom 注入）。
 type Dev struct {
-	billing    *billing.SqlStore
-	userIDFrom func(ctx context.Context) (int64, bool)
-	callLogs   callLogReader // 调用日志只读查询（经 SetCallLogStore 注入；nil=未装配）
+	billing      *billing.SqlStore
+	userIDFrom   func(ctx context.Context) (int64, bool)
+	callLogs     callLogReader           // 调用日志只读查询（经 SetCallLogStore 注入；nil=未装配）
+	sessions     *router.SessionRegistry // 会话注册表（经 SetSessions 注入；nil=未装配）
+	now          func() time.Time        // 时钟（测试可替换）
+	tokenCounter TokenCounter            // 令牌计数（经 SetTokenCounter 注入；nil=未装配）
 }
 
 // NewDev 创建开发端控制台处理器。
 func NewDev(billingStore *billing.SqlStore, userIDFrom func(ctx context.Context) (int64, bool)) *Dev {
-	return &Dev{billing: billingStore, userIDFrom: userIDFrom}
+	return &Dev{billing: billingStore, userIDFrom: userIDFrom, now: time.Now}
 }
 
 // SetCallLogStore 注入调用日志只读查询（nil=未装配：BillingDetail.CallLog 为 nil）。
@@ -86,7 +90,7 @@ func (h *Dev) HandleUsage(w http.ResponseWriter, r *http.Request) {
 	resp.OK(w, r, map[string]any{"List": out, "Days": days})
 }
 
-// HandleListBillings GET /api/v1/dev/billings?page=&size= 查询本人账单。
+// HandleListBillings GET /api/v1/dev/billings?page=&size=&from=&to= 查询本人账单。
 func (h *Dev) HandleListBillings(w http.ResponseWriter, r *http.Request) {
 	userID, ok := h.currentUser(w, r)
 	if !ok {
@@ -97,6 +101,22 @@ func (h *Dev) HandleListBillings(w http.ResponseWriter, r *http.Request) {
 		UserID: &userID,
 		Page:   parsePage(q.Get("Page")),
 		Size:   parseSize(q.Get("Size")),
+	}
+	if v := q.Get("From"); v != "" {
+		t, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "from 时间格式应为 RFC3339")
+			return
+		}
+		f.From = &t
+	}
+	if v := q.Get("To"); v != "" {
+		t, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "to 时间格式应为 RFC3339")
+			return
+		}
+		f.To = &t
 	}
 	records, total, err := h.billing.ListRecords(r.Context(), f)
 	if err != nil {
