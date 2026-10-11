@@ -11,6 +11,7 @@ import {
   DataLine,
   Key,
   Odometer,
+  PieChart,
   Timer,
   TrendCharts,
   CircleCheckFilled,
@@ -164,18 +165,33 @@ function sparkPoints(vals: number[]): string {
     .join(' ')
 }
 
-const kpiCards = computed(() => {
+// KPI 卡片：sub 为简要副标题；tip 存在时展示口径说明（tipTarget 指定挂在数值还是副标题上，默认副标题）。
+interface KpiCard {
+  label: string
+  value: string
+  sub: string
+  tip?: string
+  tipTarget?: 'value' | 'sub'
+  delta?: number
+  tone: string
+  icon: any
+  spark?: string
+}
+
+const kpiCards = computed<KpiCard[]>(() => {
   const k = data.value?.KPI
   const calls = daily.value.map((d) => d.Calls)
   const tokens = daily.value.map((d) => d.Tokens)
   const credits = daily.value.map((d) => Number(d.Credits))
+  const totalIn = data.value?.Usage.Total.Input ?? 0
+  const cacheRead = data.value?.Usage.Total.CacheRead ?? 0
+  const cacheHit = totalIn > 0 ? cacheRead / totalIn : 0
   return [
     {
       label: '总 Token',
       value: k ? fmtCompact(k.TotalTokens) : '-',
-      sub: `输入(含缓存) ${fmtCompact(data.value?.Usage.Total.Input ?? 0)} · 输出 ${fmtCompact(
-        data.value?.Usage.Total.Output ?? 0,
-      )}`,
+      sub: `输入 ${fmtCompact(totalIn)} · 输出 ${fmtCompact(data.value?.Usage.Total.Output ?? 0)}`,
+      tip: '输入含缓存读与缓存写',
       delta: k?.DeltaTokens,
       tone: 'primary',
       icon: DataLine,
@@ -200,6 +216,15 @@ const kpiCards = computed(() => {
       spark: sparkPoints(calls),
     },
     {
+      label: '缓存命中率',
+      value: fmtPct(cacheHit),
+      sub: `输入 ${fmtCompact(totalIn)} · 缓存读 ${fmtCompact(cacheRead)}`,
+      tip: '缓存读占输入的比重',
+      tipTarget: 'value',
+      tone: 'violet',
+      icon: PieChart,
+    },
+    {
       label: '成功率',
       value: k ? fmtPct(k.SuccessRate) : '-',
       sub: `平均耗时 ${k ? fmtMs(k.AvgDurationMS) : '-'}`,
@@ -216,7 +241,8 @@ const kpiCards = computed(() => {
     {
       label: '吞吐量',
       value: k ? `${fmtCompact(k.TPM)} TPM` : '-',
-      sub: `平均 ${k ? k.RPM.toFixed(2) : '-'} RPM（区间每分钟均值）`,
+      sub: `平均 ${k ? k.RPM.toFixed(2) : '-'} RPM`,
+      tip: '统计区间内的每分钟平均值',
       tone: 'primary',
       icon: TrendCharts,
     },
@@ -519,9 +545,22 @@ const modeLabel = (m: string) =>
             <span class="kpi-label">{{ c.label }}</span>
             <el-icon class="kpi-ic"><component :is="c.icon" /></el-icon>
           </div>
-          <div class="kpi-value">{{ c.value }}</div>
+          <div class="kpi-value">
+            <el-tooltip
+              v-if="c.tip && c.tipTarget === 'value'"
+              :content="c.tip"
+              placement="top"
+              :show-after="150"
+            >
+              <span>{{ c.value }}</span>
+            </el-tooltip>
+            <span v-else>{{ c.value }}</span>
+          </div>
           <div class="kpi-foot">
-            <span class="kpi-sub">{{ c.sub }}</span>
+            <el-tooltip v-if="c.tip && c.tipTarget !== 'value'" :content="c.tip" placement="top" :show-after="150">
+              <span class="kpi-sub">{{ c.sub }}</span>
+            </el-tooltip>
+            <span v-else class="kpi-sub">{{ c.sub }}</span>
             <span v-if="c.delta !== undefined" class="kpi-delta" :class="c.delta >= 0 ? 'up' : 'down'">
               {{ fmtDelta(c.delta as number) }}
             </span>
@@ -718,7 +757,7 @@ const modeLabel = (m: string) =>
 /* ===== 顶部指标带 ===== */
 .kpi-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
   gap: 14px;
   margin-bottom: 22px;
 }

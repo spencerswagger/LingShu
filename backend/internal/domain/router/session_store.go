@@ -9,12 +9,14 @@ import (
 // sessionCols 列出 sessions 表查询使用列，与 DDL 一致。
 const sessionCols = `session_id, user_id, token_id, model, session_raw, channel_key_id, internal_model_id, created_at, last_active, expire_at, COALESCE(name, ''), COALESCE(closed, false), COALESCE(closed_at, NULL)`
 
-// sessionUpsertSQL 创建/续期会话的 UPSERT：冲突（session_id）时只刷新运行时列，不覆盖 user/model/name 等归属。
-// name/closed 仅在新建行时写入（首次自动命名）；改名走 SetName、关闭走 SetClosed，网关续期不会覆盖。
+// sessionUpsertSQL 创建/续期会话的 UPSERT：冲突（session_id）时刷新运行时列并把会话复位为活跃态
+// （closed=false、closed_at=NULL）——Upsert 只由 Attach（新建/迁移/重新激活）与 Renew（仅未关闭会话）触发，
+// 因此复位不会覆盖「关闭」：Renew 对已关闭会话直接返回，不会走到这里。
+// user/model/name 等归属仅在新建行时写入；改名走 SetName。
 const sessionUpsertSQL = `
 INSERT INTO sessions(session_id, user_id, token_id, model, session_raw, channel_key_id, internal_model_id, name, created_at, last_active, expire_at, closed)
 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,false)
-ON CONFLICT (session_id) DO UPDATE SET last_active=$10, expire_at=$11, channel_key_id=$6, internal_model_id=$7`
+ON CONFLICT (session_id) DO UPDATE SET last_active=$10, expire_at=$11, channel_key_id=$6, internal_model_id=$7, closed=false, closed_at=NULL`
 
 // SessionStore 提供 sessions 表数据访问（内存为主、DB 为持久化投影，最终一致）。
 type SessionStore struct {
@@ -78,13 +80,12 @@ func (s *SessionStore) DeleteMany(ctx context.Context, ids []string) error {
 	return err
 }
 
-// LoadActive 查询启动恢复所需会话：未过期会话，或已关闭且仍在保留期内的会话
-// （保留期内已关闭会话重启后继续出现在管理列表）。
+// LoadActive 查询启动恢复所需会话：仅未过期且未关闭的会话（粘性路由 + 并发计数）。
+// 已关闭会话不再载入内存：会话列表已改读 sessions 表，关闭的会话既不参与路由也不需要留在内存。
 // sessions 表无 channel_id 列，会话维度只有 channel_key_id（含 internal_model_id）。
 func (s *SessionStore) LoadActive(ctx context.Context, now time.Time) ([]*Session, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT `+sessionCols+` FROM sessions WHERE expire_at > $1 OR (closed AND closed_at > $2)`,
-		now, now.Add(-closedSessionRetention))
+		`SELECT `+sessionCols+` FROM sessions WHERE expire_at > $1 AND NOT closed`, now)
 	if err != nil {
 		return nil, err
 	}

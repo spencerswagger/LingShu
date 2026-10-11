@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -675,6 +674,8 @@ func parseSize(v string) int {
 
 // sessionListItem 会话列表项：user/token/key 名称在可能时批量反查填充（查询失败为空串）；
 // 原始 ID 一并输出，供前端在名称缺失时兜底展示。
+// 实时状态字段（Inflight/Calls/Tokens/Credits/ContextLen/RPM/TPM/UserMsgs/ToolCalls/CacheHitRate）
+// 由 billing_records / call_logs 按 session_id 批量聚合得到（查询失败为 0）。
 type sessionListItem struct {
 	SessionID      string    `json:"SessionID"`
 	UserID         int64     `json:"UserID,string"`
@@ -685,6 +686,7 @@ type sessionListItem struct {
 	Model          string    `json:"Model"`
 	ChannelKeyID   int64     `json:"ChannelKeyID,string"`
 	ChannelKeyName string    `json:"ChannelKeyName,omitempty"`
+	ChannelName    string    `json:"ChannelName,omitempty"` // 所属渠道名（按密钥反查；缺失为空）
 	SessionRaw     string    `json:"SessionRaw"`
 	SessionName    string    `json:"SessionName"`
 	Closed         bool      `json:"Closed"`
@@ -692,11 +694,66 @@ type sessionListItem struct {
 	LastActive     time.Time `json:"LastActive"`
 	ExpireAt       time.Time `json:"ExpireAt"`
 	Expired        bool      `json:"Expired"`
+	// 实时状态
+	Inflight     int     `json:"Inflight"`     // 进行中请求数（>0 表示正在请求）
+	Calls        int64   `json:"Calls"`        // 总调用次数
+	Tokens       int64   `json:"Tokens"`       // 总消耗 Token（四段求和口径）
+	Credits      float64 `json:"Credits"`      // 总消耗积分
+	ContextLen   int64   `json:"ContextLen"`   // 上下文长度（最近一次请求的输入 Token 数）
+	RPM          float64 `json:"RPM"`          // 近 5 分钟每分钟请求数
+	TPM          float64 `json:"TPM"`          // 近 5 分钟每分钟 Token 数
+	UserMsgs     int64   `json:"UserMsgs"`     // 用户消息次数
+	ToolCalls    int64   `json:"ToolCalls"`    // 工具调用次数
+	CacheHitRate float64 `json:"CacheHitRate"` // 缓存命中率（缓存读 ÷ 输入，0~1）
 }
 
-// HandleListSessions GET /api/v1/admin/sessions
-// 过滤：user_id / token_id / channel_key_id / q（session_id 前缀）/ expired=active|expired|all（缺省 all）；
-// 分页：page（≥1，缺省 1）、size（≥1，缺省 20）；排序：last_active 倒序，同值按 session_id 升序。
+// sessionListCols 会话列表查询列（与 router.sessionCols 对齐；token_id 可空单独处理）。
+const sessionListCols = `session_id, user_id, token_id, model, session_raw, channel_key_id, internal_model_id, created_at, last_active, expire_at, COALESCE(name, ''), COALESCE(closed, false)`
+
+// sessionListWhere 构建会话列表过滤 WHERE 子句与参数（prepared 绑定，避免注入）。
+// expiredMode=active 仅未过期、expired 仅已过期；closedMode="1" 仅已关闭、"0" 仅未关闭；空串不过滤。
+// 无任何条件时 where 为空串（配合 WHERE 拼接使用）。
+func sessionListWhere(userID, tokenID, keyID int64, prefix, expiredMode, closedMode string, now time.Time) (string, []any) {
+	conds := make([]string, 0, 8)
+	args := make([]any, 0, 8)
+	bind := func(v any) string {
+		args = append(args, v)
+		return "$" + strconv.Itoa(len(args))
+	}
+	if userID != 0 {
+		conds = append(conds, "user_id = "+bind(userID))
+	}
+	if tokenID != 0 {
+		conds = append(conds, "token_id = "+bind(tokenID))
+	}
+	if keyID != 0 {
+		conds = append(conds, "channel_key_id = "+bind(keyID))
+	}
+	if prefix != "" {
+		conds = append(conds, "starts_with(session_id, "+bind(prefix)+")")
+	}
+	switch expiredMode {
+	case "active":
+		conds = append(conds, "expire_at > "+bind(now))
+	case "expired":
+		conds = append(conds, "expire_at <= "+bind(now))
+	}
+	switch closedMode {
+	case "1":
+		conds = append(conds, "closed = true")
+	case "0":
+		conds = append(conds, "closed = false")
+	}
+	if len(conds) == 0 {
+		return "", args
+	}
+	return " WHERE " + strings.Join(conds, " AND "), args
+}
+
+// HandleListSessions GET /api/v1/admin/sessions 会话列表（数据源为 sessions 表，含历史会话）。
+// 过滤：UserID / TokenID / ChannelKeyID / Q（session_id 前缀）/ Expired=active|expired / Closed=1|0；
+// 分页：Page（≥1，缺省 1）、Size（≥1，缺省 20）；排序：last_active 倒序，同值按 session_id 升序。
+// 进行中请求数（Inflight）取自内存注册表（DB 无该运行时字段），其余实时状态按 session_id 聚合。
 func (h *Admin) HandleListSessions(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	var userID, tokenID, keyID int64
@@ -724,79 +781,85 @@ func (h *Admin) HandleListSessions(w http.ResponseWriter, r *http.Request) {
 	}
 	prefix := q.Get("Q")
 	expiredMode := q.Get("Expired")
-	closedMode := q.Get("Closed") // "1"=仅已关闭；"0"=仅未关闭（进行中+未过期）；空=不过滤
+	closedMode := q.Get("Closed") // "1"=仅已关闭；"0"=仅未关闭；空=不过滤
 	page := parsePage(q.Get("Page"))
 	size := parseSize(q.Get("Size"))
-
-	all := []*router.Session{}
-	if h.sessions != nil {
-		all = h.sessions.ListAll()
-	}
 	now := h.now()
-	filtered := make([]*router.Session, 0, len(all))
-	for _, s := range all {
-		if userID != 0 && s.UserID != userID {
-			continue
-		}
-		if tokenID != 0 && s.TokenID != tokenID {
-			continue
-		}
-		if keyID != 0 && s.ChannelKeyID != keyID {
-			continue
-		}
-		if prefix != "" && !strings.HasPrefix(s.SessionID, prefix) {
-			continue
-		}
-		expired := !s.ExpireAt.After(now)
-		switch expiredMode {
-		case "active":
-			if expired {
-				continue
-			}
-		case "expired":
-			if !expired {
-				continue
-			}
-		}
-		switch closedMode {
-		case "1":
-			if !s.Closed {
-				continue
-			}
-		case "0":
-			if s.Closed {
-				continue
-			}
-		}
-		filtered = append(filtered, s)
-	}
-	sort.Slice(filtered, func(i, j int) bool {
-		if filtered[i].LastActive.Equal(filtered[j].LastActive) {
-			return filtered[i].SessionID < filtered[j].SessionID
-		}
-		return filtered[i].LastActive.After(filtered[j].LastActive)
-	})
 
-	total := len(filtered)
-	start := (page - 1) * size
-	if start > total {
-		start = total
+	if h.db == nil {
+		resp.OK(w, r, map[string]any{"List": []sessionListItem{}, "Total": 0, "Page": page, "Size": size})
+		return
 	}
-	end := start + size
-	if end > total {
-		end = total
+
+	whereSQL, args := sessionListWhere(userID, tokenID, keyID, prefix, expiredMode, closedMode, now)
+
+	var total int64
+	if err := h.db.QueryRowContext(r.Context(), `SELECT count(*) FROM sessions`+whereSQL, args...).Scan(&total); err != nil {
+		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "查询会话失败")
+		return
 	}
-	items := filtered[start:end]
+
+	sizeArg := "$" + strconv.Itoa(len(args)+1)
+	offsetArg := "$" + strconv.Itoa(len(args)+2)
+	listArgs := append(append([]any{}, args...), size, (page-1)*size)
+	rows, err := h.db.QueryContext(r.Context(),
+		`SELECT `+sessionListCols+` FROM sessions`+whereSQL+
+			` ORDER BY last_active DESC, session_id ASC LIMIT `+sizeArg+` OFFSET `+offsetArg, listArgs...)
+	if err != nil {
+		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "查询会话失败")
+		return
+	}
+	defer rows.Close()
+
+	items := make([]*router.Session, 0, size)
+	for rows.Next() {
+		var s router.Session
+		var tok sql.NullInt64
+		if err := rows.Scan(&s.SessionID, &s.UserID, &tok, &s.Model, &s.SessionRaw, &s.ChannelKeyID,
+			&s.InternalModelID, &s.CreatedAt, &s.LastActive, &s.ExpireAt, &s.Name, &s.Closed); err != nil {
+			resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "查询会话失败")
+			return
+		}
+		if tok.Valid {
+			s.TokenID = tok.Int64
+		}
+		items = append(items, &s)
+	}
+	if err := rows.Err(); err != nil {
+		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "查询会话失败")
+		return
+	}
+
+	// 进行中请求数：仅内存注册表持有该运行时字段（DB 为投影，不含 Inflight）。
+	inflight := map[string]int{}
+	if h.sessions != nil {
+		for _, s := range h.sessions.ListAll() {
+			if s.Inflight > 0 {
+				inflight[s.SessionID] = s.Inflight
+			}
+		}
+	}
 
 	// 名称反查仅针对当页展示项（N+1 规避：按 id 批量查询）。
+	keyIDs := collectSessionIDs(items, func(s *router.Session) int64 { return s.ChannelKeyID })
 	userNames := h.userNamesByIDs(r.Context(), collectSessionIDs(items, func(s *router.Session) int64 { return s.UserID }))
 	tokenNames := h.tokenNamesByIDs(r.Context(), collectSessionIDs(items, func(s *router.Session) int64 { return s.TokenID }))
 	keyNames := map[int64]string{}
 	if h.keyNameByIDs != nil {
-		if m, err := h.keyNameByIDs(r.Context(), collectSessionIDs(items, func(s *router.Session) int64 { return s.ChannelKeyID })); err == nil && m != nil {
+		if m, err := h.keyNameByIDs(r.Context(), keyIDs); err == nil && m != nil {
 			keyNames = m
 		}
 	}
+	channelNames := h.channelNamesByKeyIDs(r.Context(), keyIDs)
+
+	// 实时状态：按 session_id 批量聚合（billing_records + call_logs）。
+	sessionIDs := make([]string, 0, len(items))
+	for _, s := range items {
+		if s.SessionID != "" {
+			sessionIDs = append(sessionIDs, s.SessionID)
+		}
+	}
+	runtimes := h.sessionRuntimes(r.Context(), sessionIDs, now.Add(-sessionStatsWindow))
 
 	list := make([]sessionListItem, 0, len(items))
 	for _, s := range items {
@@ -813,6 +876,7 @@ func (h *Admin) HandleListSessions(w http.ResponseWriter, r *http.Request) {
 			LastActive:   s.LastActive,
 			ExpireAt:     s.ExpireAt,
 			Expired:      !s.ExpireAt.After(now),
+			Inflight:     inflight[s.SessionID],
 		}
 		if un, ok := userNames[s.UserID]; ok {
 			item.UserName = un.Username
@@ -822,6 +886,18 @@ func (h *Admin) HandleListSessions(w http.ResponseWriter, r *http.Request) {
 			item.TokenName = tokenNames[s.TokenID]
 		}
 		item.ChannelKeyName = keyNames[s.ChannelKeyID]
+		item.ChannelName = channelNames[s.ChannelKeyID]
+		if rt, ok := runtimes[s.SessionID]; ok {
+			item.Calls = rt.Calls
+			item.Tokens = rt.Tokens
+			item.Credits = decimalx.Round5(rt.Credits)
+			item.ContextLen = rt.ContextLen
+			item.RPM = decimalx.Round2(rt.RPM())
+			item.TPM = decimalx.Round2(rt.TPM())
+			item.UserMsgs = rt.UserMsgs
+			item.ToolCalls = rt.ToolCalls
+			item.CacheHitRate = decimalx.Round5(rt.CacheHitRate())
+		}
 		list = append(list, item)
 	}
 	resp.OK(w, r, map[string]any{"List": list, "Total": total, "Page": page, "Size": size})
@@ -945,6 +1021,151 @@ func (h *Admin) sessionNames(ctx context.Context, recs []billing.Record) map[str
 		if err := rows.Scan(&id, &name); err == nil {
 			out[id] = name
 		}
+	}
+	return out
+}
+
+// sessionStatsWindow 会话「实时状态」中 RPM/TPM 的统计窗口（近 5 分钟）。
+const sessionStatsWindow = 5 * time.Minute
+
+// sessionRuntime 会话实时聚合（按 session_id 汇总；来源 billing_records 与 call_logs）。
+type sessionRuntime struct {
+	Calls       int64   // 总调用次数
+	Tokens      int64   // 总消耗 Token（输入+输出+缓存写+推理；缓存读已含于输入，不重复计）
+	Credits     float64 // 总消耗积分
+	InputTokens int64   // 输入(含缓存读)总量
+	CacheRead   int64   // 缓存读命中量
+	ContextLen  int64   // 最近一次请求的输入 Token 数（当前上下文规模）
+	WinCalls    int64   // 窗口内调用次数
+	WinTokens   int64   // 窗口内 Token 数
+	UserMsgs    int64   // 用户消息次数
+	ToolCalls   int64   // 工具调用次数（req_messages 中 role=tool 计数）
+}
+
+// RPM 窗口内每分钟平均请求数。
+func (r sessionRuntime) RPM() float64 {
+	return float64(r.WinCalls) / sessionStatsWindow.Minutes()
+}
+
+// TPM 窗口内每分钟平均 Token 数。
+func (r sessionRuntime) TPM() float64 {
+	return float64(r.WinTokens) / sessionStatsWindow.Minutes()
+}
+
+// CacheHitRate 缓存命中率 = 缓存读 ÷ 输入(含缓存读)；无输入返回 0。
+func (r sessionRuntime) CacheHitRate() float64 {
+	if r.InputTokens <= 0 {
+		return 0
+	}
+	return float64(r.CacheRead) / float64(r.InputTokens)
+}
+
+// sessionRuntimes 批量聚合会话实时状态：billing_records（次数/Token/积分/上下文/窗口速率）
+// 与 call_logs（用户消息数/工具调用数）。查询失败仅返回已得部分，不影响会话列表主流程。
+func (h *Admin) sessionRuntimes(ctx context.Context, ids []string, windowStart time.Time) map[string]sessionRuntime {
+	out := make(map[string]sessionRuntime, len(ids))
+	if h.db == nil || len(ids) == 0 {
+		return out
+	}
+	// 汇总 + 窗口（FILTER）+ 输入/缓存读。
+	rows, err := h.db.QueryContext(ctx, `
+SELECT session_id,
+       count(*),
+       COALESCE(sum(credits_consumed), 0),
+       COALESCE(sum(
+           COALESCE(NULLIF(tokens->>'input','')::bigint, 0) +
+           COALESCE(NULLIF(tokens->>'output','')::bigint, 0) +
+           COALESCE(NULLIF(tokens->>'cache_write','')::bigint, 0) +
+           COALESCE(NULLIF(tokens->>'reasoning','')::bigint, 0)), 0),
+       COALESCE(sum(COALESCE(NULLIF(tokens->>'input','')::bigint, 0)), 0),
+       COALESCE(sum(COALESCE(NULLIF(tokens->>'cache_read','')::bigint, 0)), 0),
+       COALESCE(count(*) FILTER (WHERE call_time >= $2), 0),
+       COALESCE(sum(
+           COALESCE(NULLIF(tokens->>'input','')::bigint, 0) +
+           COALESCE(NULLIF(tokens->>'output','')::bigint, 0) +
+           COALESCE(NULLIF(tokens->>'cache_write','')::bigint, 0) +
+           COALESCE(NULLIF(tokens->>'reasoning','')::bigint, 0)) FILTER (WHERE call_time >= $2), 0)
+FROM billing_records
+WHERE session_id = ANY($1)
+GROUP BY session_id`, ids, windowStart)
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var sid string
+			var rt sessionRuntime
+			if err := rows.Scan(&sid, &rt.Calls, &rt.Credits, &rt.Tokens, &rt.InputTokens,
+				&rt.CacheRead, &rt.WinCalls, &rt.WinTokens); err != nil {
+				continue
+			}
+			out[sid] = rt
+		}
+	}
+	// 上下文长度：最近一次请求的输入 Token 数（DISTINCT ON 取每会话最新一行）。
+	crows, err := h.db.QueryContext(ctx, `
+SELECT DISTINCT ON (session_id) session_id, COALESCE(NULLIF(tokens->>'input','')::bigint, 0)
+FROM billing_records
+WHERE session_id = ANY($1)
+ORDER BY session_id, call_time DESC, id DESC`, ids)
+	if err == nil {
+		defer crows.Close()
+		for crows.Next() {
+			var sid string
+			var ctxLen int64
+			if err := crows.Scan(&sid, &ctxLen); err != nil {
+				continue
+			}
+			rt := out[sid]
+			rt.ContextLen = ctxLen
+			out[sid] = rt
+		}
+	}
+	// 用户消息数 / 工具调用数：来自 call_logs.req_messages（增量消息数组）。
+	lrows, err := h.db.QueryContext(ctx, `
+SELECT session_id,
+       COALESCE(sum(CASE WHEN jsonb_typeof(req_messages) = 'array'
+           THEN (SELECT count(*) FROM jsonb_array_elements(req_messages) e WHERE e->>'role' = 'user') ELSE 0 END), 0),
+       COALESCE(sum(CASE WHEN jsonb_typeof(req_messages) = 'array'
+           THEN (SELECT count(*) FROM jsonb_array_elements(req_messages) e WHERE e->>'role' = 'tool') ELSE 0 END), 0)
+FROM call_logs
+WHERE session_id = ANY($1)
+GROUP BY session_id`, ids)
+	if err == nil {
+		defer lrows.Close()
+		for lrows.Next() {
+			var sid string
+			var userMsgs, toolCalls int64
+			if err := lrows.Scan(&sid, &userMsgs, &toolCalls); err != nil {
+				continue
+			}
+			rt := out[sid]
+			rt.UserMsgs = userMsgs
+			rt.ToolCalls = toolCalls
+			out[sid] = rt
+		}
+	}
+	return out
+}
+
+// channelNamesByKeyIDs 批量由渠道密钥 ID 反查所属渠道名；失败返回 nil（会话列表以空串兜底）。
+func (h *Admin) channelNamesByKeyIDs(ctx context.Context, keyIDs []int64) map[int64]string {
+	if h.db == nil || len(keyIDs) == 0 {
+		return nil
+	}
+	rows, err := h.db.QueryContext(ctx,
+		`SELECT k.id, c.name FROM channel_keys k JOIN channels c ON c.id = k.channel_id
+		 WHERE k.id = ANY('{`+int64List(keyIDs)+`}'::bigint[])`)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	out := make(map[int64]string, len(keyIDs))
+	for rows.Next() {
+		var id int64
+		var name string
+		if err := rows.Scan(&id, &name); err != nil {
+			continue
+		}
+		out[id] = name
 	}
 	return out
 }

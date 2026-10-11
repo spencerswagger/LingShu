@@ -84,7 +84,7 @@ export function updateMeNickname(nickname: string) {
   )
 }
 
-// 本人摘要（右上角用户面板用）：令牌数/会话数/三档消耗/吞吐速率
+// 本人摘要（右上角用户面板用）：令牌数/会话数/三档消耗/吞吐速率/本月缓存口径
 export interface MeSummary {
   TokenCount: number
   SessionCount: number
@@ -93,6 +93,8 @@ export interface MeSummary {
   MonthCredits: number
   RPM: number
   TPM: number
+  InputTokens: number // 本月输入(含缓存读)
+  CacheReadTokens: number // 本月缓存读命中
 }
 
 export function getMeSummary() {

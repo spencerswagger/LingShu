@@ -69,19 +69,19 @@ func TestHandleMeSummary(t *testing.T) {
 	defer db.Close()
 
 	const summarySQL = `COALESCE(sum(credits_consumed), 0)`
-	rows := func(requests int64, credits float64, tokens int64) *sqlmock.Rows {
-		return sqlmock.NewRows([]string{"count", "credits", "tokens", "duration"}).
-			AddRow(requests, credits, tokens, int64(0))
+	rows := func(requests int64, credits float64, tokens, input, cacheRead int64) *sqlmock.Rows {
+		return sqlmock.NewRows([]string{"count", "credits", "tokens", "duration", "input", "cache_read"}).
+			AddRow(requests, credits, tokens, int64(0), input, cacheRead)
 	}
 	// 过滤参数：user_id=1；三档消耗带 status='completed'，吞吐窗口不带；
 	// 时间参数用 AnyArg（边界逻辑已由 TestSummaryRanges_Shanghai 覆盖）。
 	argsCompleted := []driver.Value{int64(1), nil, nil, "", "", "", "completed", sqlmock.AnyArg(), sqlmock.AnyArg()}
 	argsAll := []driver.Value{int64(1), nil, nil, "", "", "", "", sqlmock.AnyArg(), sqlmock.AnyArg()}
 	// 严格顺序：today、yesterday、month、window。
-	mock.ExpectQuery(regexp.QuoteMeta(summarySQL)).WithArgs(argsCompleted...).WillReturnRows(rows(10, 1.5, 100))
-	mock.ExpectQuery(regexp.QuoteMeta(summarySQL)).WithArgs(argsCompleted...).WillReturnRows(rows(20, 2.5, 200))
-	mock.ExpectQuery(regexp.QuoteMeta(summarySQL)).WithArgs(argsCompleted...).WillReturnRows(rows(30, 3.5, 300))
-	mock.ExpectQuery(regexp.QuoteMeta(summarySQL)).WithArgs(argsAll...).WillReturnRows(rows(50, 0.5, 500))
+	mock.ExpectQuery(regexp.QuoteMeta(summarySQL)).WithArgs(argsCompleted...).WillReturnRows(rows(10, 1.5, 100, 40, 10))
+	mock.ExpectQuery(regexp.QuoteMeta(summarySQL)).WithArgs(argsCompleted...).WillReturnRows(rows(20, 2.5, 200, 80, 20))
+	mock.ExpectQuery(regexp.QuoteMeta(summarySQL)).WithArgs(argsCompleted...).WillReturnRows(rows(30, 3.5, 300, 120, 30))
+	mock.ExpectQuery(regexp.QuoteMeta(summarySQL)).WithArgs(argsAll...).WillReturnRows(rows(50, 0.5, 500, 200, 50))
 
 	dev := NewDev(billing.NewSqlStore(db), func(context.Context) (int64, bool) { return 1, true })
 	dev.now = fixedNow
@@ -113,6 +113,8 @@ func TestHandleMeSummary(t *testing.T) {
 			MonthCredits     float64 `json:"MonthCredits"`
 			RPM              float64 `json:"RPM"`
 			TPM              float64 `json:"TPM"`
+			InputTokens      int64   `json:"InputTokens"`
+			CacheReadTokens  int64   `json:"CacheReadTokens"`
 		} `json:"Data"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
@@ -133,6 +135,10 @@ func TestHandleMeSummary(t *testing.T) {
 	}
 	if d.TPM != 100 { // 500 tokens / 5min
 		t.Fatalf("TPM=%v, want 100", d.TPM)
+	}
+	// 本月缓存口径：取自 month 那一次 Summarize（input=120、cache_read=30）。
+	if d.InputTokens != 120 || d.CacheReadTokens != 30 {
+		t.Fatalf("cache=%d/%d, want 120/30", d.InputTokens, d.CacheReadTokens)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("mock expectations: %v", err)
