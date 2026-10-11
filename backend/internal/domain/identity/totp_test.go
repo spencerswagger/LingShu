@@ -77,36 +77,20 @@ func TestTOTPService_Confirm_PendingState(t *testing.T) {
 	}
 }
 
-// 回归 M10：同一时间步的动态码第二次校验被拒绝（防重放）。
-func TestTOTPService_Verify_ReplayRejected(t *testing.T) {
+// 回归：动态码不再做时间步防重放——同一时间步内的有效码可重复使用。
+// 用户反复登录时不会再有「合法最新码被误判为已消费」而拒登的问题。
+func TestTOTPService_Verify_AllowsRepeatUse(t *testing.T) {
 	svc, mock := newTOTPService(t)
 	secret, cipher := secretRow(t, true)
 	code := genCode(t, secret, time.Now())
 
-	expectSecret(t, mock, cipher, true)
-	mock.ExpectQuery(regexp.QuoteMeta(
-		`SELECT COALESCE(totp_last_step, 0) FROM users WHERE id = $1 AND deleted_at IS NULL`)).
-		WithArgs(int64(1)).WillReturnRows(sqlmock.NewRows([]string{"step"}).AddRow(int64(0)))
-	mock.ExpectExec(regexp.QuoteMeta(`UPDATE users SET totp_last_step = $2 WHERE id = $1`)).
-		WithArgs(int64(1), sqlmock.AnyArg()).WillReturnResult(sqlmock.NewResult(1, 1))
-
-	ok, err := svc.Verify(context.Background(), 1, code)
-	if err != nil || !ok {
-		t.Fatalf("first verify should pass, ok=%v err=%v", ok, err)
-	}
-
-	// 第二次：同一时间步 → last >= step，判定重放
-	expectSecret(t, mock, cipher, true)
-	mock.ExpectQuery(regexp.QuoteMeta(
-		`SELECT COALESCE(totp_last_step, 0) FROM users WHERE id = $1 AND deleted_at IS NULL`)).
-		WithArgs(int64(1)).WillReturnRows(sqlmock.NewRows([]string{"step"}).AddRow(time.Now().Unix() / 30))
-
-	ok, err = svc.Verify(context.Background(), 1, code)
-	if err != nil {
-		t.Fatalf("replay verify should return (false, nil), got err %v", err)
-	}
-	if ok {
-		t.Fatal("same time-step code should be rejected as replay")
+	// 连续两次校验都应通过；未登记任何 last_step 读写期望，即证明防重放已移除。
+	for i := 0; i < 2; i++ {
+		expectSecret(t, mock, cipher, true)
+		ok, err := svc.Verify(context.Background(), 1, code)
+		if err != nil || !ok {
+			t.Fatalf("第 %d 次校验应通过，ok=%v err=%v", i+1, ok, err)
+		}
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("expectations: %v", err)
@@ -144,7 +128,7 @@ func TestTOTPService_Disable_DoesNotConsumeStep(t *testing.T) {
 	svc, mock := newTOTPService(t)
 	secret, cipher := secretRow(t, true)
 
-	// 仅取 secret + 执行 DisableTOTP；不应出现 TOTPLastStep 的读写期望（未设置即代表未调用）。
+	// 仅取 secret + 执行 DisableTOTP；不应出现任何动态码时间步的读写（未设置即代表未调用）。
 	expectSecret(t, mock, cipher, true)
 	mock.ExpectExec(regexp.QuoteMeta(
 		`UPDATE users SET totp_enabled = false, totp_secret_cipher = NULL, totp_recovery_hashes = NULL, totp_last_step = 0 WHERE id = $1`)).
@@ -238,9 +222,7 @@ func TestPreAuthStore_ExpiredTokenRejected(t *testing.T) {
 // 修复目标：把「校验」与「签发会话」解耦，顺序改为 无副作用校验 → 原子消费 preauth → 才签发，
 // 避免并发持同一 preauth 的败者（Consume 失败）bump token_version，作废胜者刚签发的 JWT。
 const (
-	selectTOTPLastStep = `SELECT COALESCE(totp_last_step, 0) FROM users WHERE id = $1 AND deleted_at IS NULL`
-	setTOTPLastStep    = `UPDATE users SET totp_last_step = $2 WHERE id = $1`
-	bumpTokenVersion   = `UPDATE users SET token_version = token_version + 1, updated_at = now() WHERE id = $1 AND deleted_at IS NULL RETURNING token_version`
+	bumpTokenVersion = `UPDATE users SET token_version = token_version + 1, updated_at = now() WHERE id = $1 AND deleted_at IS NULL RETURNING token_version`
 )
 
 // totpLoginFixture 装配 2FA 第二步登录的最小依赖：
@@ -297,14 +279,10 @@ func expectGetByID(t *testing.T, mock sqlmock.Sqlmock) {
 		WithArgs(int64(1)).WillReturnRows(userRow(u))
 }
 
-// expectTOTPVerifyOK 登记一次成功的动态码校验（取 secret + 防重放步进）。
+// expectTOTPVerifyOK 登记一次成功的动态码校验（仅取 secret，已无防重放步进）。
 func expectTOTPVerifyOK(t *testing.T, mock sqlmock.Sqlmock, cipher string) {
 	t.Helper()
 	expectSecret(t, mock, cipher, true)
-	mock.ExpectQuery(regexp.QuoteMeta(selectTOTPLastStep)).
-		WithArgs(int64(1)).WillReturnRows(sqlmock.NewRows([]string{"step"}).AddRow(int64(0)))
-	mock.ExpectExec(regexp.QuoteMeta(setTOTPLastStep)).
-		WithArgs(int64(1), sqlmock.AnyArg()).WillReturnResult(sqlmock.NewResult(1, 1))
 }
 
 // invalidCode 生成一个在当前 ±2 个时间步内都必然不匹配的 6 位码（确定性，无概率抖动）。
@@ -425,6 +403,18 @@ func TestHandleLoginTOTP_WrongCodeKeepsPreAuth(t *testing.T) {
 	rec := postTOTPLogin(t, h, tok, invalidCode(t, secret))
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("错误动态码应返回 401，实际 %d body=%s", rec.Code, rec.Body.String())
+	}
+	// 文案回归：第二步动态码校验失败必须与第一步「用户名或密码错误」区分，
+	// 否则用户会误以为账号/口令被拒（线上反馈的根因）。
+	var body struct {
+		Code    int
+		Message string
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.Message != "动态码或恢复码错误，请重新获取后重试" {
+		t.Fatalf("第二步失败文案应与口令错误区分，实际 %q", body.Message)
 	}
 	if uid, ok := p.Peek(tok); !ok || uid != 1 {
 		t.Fatalf("错误动态码不得消费 preauth：Peek 应仍命中用户 1，实际 (%d,%v)", uid, ok)

@@ -213,21 +213,6 @@ func (s *Store) UpdateNickname(ctx context.Context, id int64, nickname string) (
 
 // ===== TOTP 专用 =====
 
-// TOTPLastStep 返回用户最近一次消费的动态码时间步（防重放）。
-func (s *Store) TOTPLastStep(ctx context.Context, id int64) (int64, error) {
-	var v int64
-	err := s.db.QueryRowContext(ctx,
-		`SELECT COALESCE(totp_last_step, 0) FROM users WHERE id = $1 AND deleted_at IS NULL`, id).Scan(&v)
-	return v, err
-}
-
-// SetTOTPLastStep 记录用户最近消费的动态码时间步。
-func (s *Store) SetTOTPLastStep(ctx context.Context, id int64, step int64) error {
-	_, err := s.db.ExecContext(ctx,
-		`UPDATE users SET totp_last_step = $2 WHERE id = $1`, id, step)
-	return err
-}
-
 // Ledger 是用户列表聚合出的钱包级数据：当前余额与累计消费额（completed 账单积分数之和）。
 type Ledger struct {
 	Balance    float64
