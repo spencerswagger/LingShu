@@ -27,10 +27,19 @@ const rules = {
 }
 
 async function onLogin() {
+  // 重入保护：必须在任何 await 之前同步置位 loading，否则两次点击都能越过表单校验的
+  // 等待窗口，对同一 preauth 并发提交——败者 401 会触发 401 拦截器 clearLocal()，
+  // 把刚建立的成功会话状态清掉（表现为「输入动态码后仍提示失败」）。
+  if (loading.value) return
+  loading.value = true
   errMsg.value = ''
   errReqId.value = ''
-  await formRef.value.validate().catch(() => Promise.reject())
-  loading.value = true
+  try {
+    await formRef.value.validate()
+  } catch {
+    loading.value = false
+    return
+  }
   try {
     // 登录成功后由后端决角色，前端不提供选择
     const res = await login(form.username, form.password)
@@ -59,9 +68,11 @@ async function onLogin() {
 }
 
 async function onLoginTotp() {
+  // 同上：同一 preauth 只允许一次在途请求，避免重复提交导致败者 401 清掉成功会话。
+  if (loading.value) return
+  loading.value = true
   errMsg.value = ''
   errReqId.value = ''
-  loading.value = true
   try {
     const res = await loginTotp(preauthToken.value, totpCode.value)
     const d = res.Data
