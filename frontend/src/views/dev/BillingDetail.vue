@@ -77,43 +77,40 @@ function fmt(n: number | undefined) {
           </el-descriptions-item>
         </el-descriptions>
 
-        <!-- 三步决算卡 -->
-        <div class="steps">
-          <el-card v-for="(step, i) in detail.Steps" :key="i" class="step-card" shadow="never">
-            <template #header>
-              <div class="step-header">
-                <span class="step-no">Step {{ i + 1 }}</span>
-                <span class="step-title">{{ step.Title }}</span>
+        <!-- 计费计算公式 + 请求 / 响应 / 决策轨迹：合并为同一折叠组，样式统一 -->
+        <CallLogPanel :log="detail.CallLog" :show-internal="false" title="计费明细">
+          <template #prepend>
+            <el-collapse-item name="calc" title="计费计算公式">
+              <div class="calc-steps">
+                <div v-for="(step, i) in detail.Steps" :key="i" class="calc-step">
+                  <div class="step-header">
+                    <span class="step-no">Step {{ i + 1 }}</span>
+                    <span class="step-title">{{ step.Title }}</span>
+                  </div>
+                  <div v-for="(line, j) in step.Lines" :key="j" class="step-line">
+                    <span class="line-label">{{ line.Label }}</span>
+                    <span class="line-amount">{{ fmt(line.Amount) }}</span>
+                  </div>
+                  <div v-if="i === 1 && detail.RouteDiff" class="step-line route-diff">
+                    <span class="line-label">{{ detail.RouteDiff.Label }}</span>
+                    <span class="line-amount">{{ detail.RouteDiff.Value }}</span>
+                  </div>
+                  <div class="step-line step-subtotal">
+                    <span class="line-label">小计</span>
+                    <span class="line-amount"><b>{{ fmt(step.Subtotal) }}</b></span>
+                  </div>
+                </div>
               </div>
-            </template>
-            <div v-for="(line, j) in step.Lines" :key="j" class="step-line">
-              <span class="line-label">{{ line.Label }}</span>
-              <span class="line-amount">{{ fmt(line.Amount) }}</span>
-            </div>
-            <div v-if="i === 1 && detail.RouteDiff" class="step-line route-diff">
-              <span class="line-label">{{ detail.RouteDiff.Label }}</span>
-              <span class="line-amount">{{ detail.RouteDiff.Value }}</span>
-            </div>
-            <el-divider content-position="right" style="margin: 8px 0">
-              <span class="subtotal">
-                小计 <b>{{ fmt(step.Subtotal) }}</b>
-              </span>
-            </el-divider>
-          </el-card>
-        </div>
-
-        <!-- 最终结果 -->
-        <div class="result-strip">
-          <span>最终应扣积分（≒）</span>
-          <span class="result-value">{{ fmt(detail.CreditsConsumed) }}</span>
-        </div>
-
-        <div v-if="detail.PricingMode === 'cost' && detail.RouteDiff" class="cost-note">
-          * 成本模式含路由差异调整，实际扣减与最终积分可能存在差值。
-        </div>
-
-        <!-- 调用日志：请求 / 响应 / 决策轨迹（dev 不含渠道内部标识） -->
-        <CallLogPanel :log="detail.CallLog" :show-internal="false" />
+              <div class="result-strip">
+                <span>最终应扣积分（≒）</span>
+                <span class="result-value">{{ fmt(detail.CreditsConsumed) }}</span>
+              </div>
+              <div v-if="detail.PricingMode === 'cost' && detail.RouteDiff" class="cost-note">
+                * 成本模式含路由差异调整，实际扣减与最终积分可能存在差值。
+              </div>
+            </el-collapse-item>
+          </template>
+        </CallLogPanel>
       </template>
       <ErrorBubble v-if="errInfo.message || errInfo.requestId" :message="errInfo.message" :request-id="errInfo.requestId" />
     </div>
@@ -125,22 +122,23 @@ function fmt(n: number | undefined) {
   font-family: 'SF Mono', Menlo, Consolas, monospace;
   font-size: 12px;
 }
-.steps {
+.calc-steps {
   display: grid;
   grid-template-columns: 1fr;
-  gap: 12px;
-  margin-top: 16px;
+  gap: 14px;
 }
-.step-card {
-  border: 1px solid #f0f0f0;
+.calc-step {
+  border-left: 2px solid var(--el-color-primary-light-7);
+  padding: 2px 0 2px 12px;
 }
 .step-header {
   display: flex;
   align-items: center;
   gap: 8px;
+  margin-bottom: 4px;
 }
 .step-no {
-  color: var(--color-primary);
+  color: var(--brand-primary);
   font-weight: 700;
   font-size: 13px;
 }
@@ -151,7 +149,7 @@ function fmt(n: number | undefined) {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 4px 0;
+  padding: 3px 0;
   font-size: 13px;
   color: var(--color-text);
 }
@@ -164,22 +162,26 @@ function fmt(n: number | undefined) {
 .route-diff {
   color: var(--color-warning);
 }
-.subtotal {
-  font-size: 12px;
-  color: var(--color-text-secondary);
+.step-subtotal {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--color-border);
+}
+.step-subtotal .line-label {
+  color: var(--color-text);
 }
 .result-strip {
   margin-top: 16px;
-  background: var(--color-primary-light);
+  background: var(--brand-primary-soft);
   border-radius: 8px;
-  padding: 14px 18px;
+  padding: 12px 18px;
   display: flex;
   justify-content: space-between;
   align-items: center;
   font-weight: 600;
 }
 .result-value {
-  color: var(--color-primary);
+  color: var(--brand-primary);
   font-size: 22px;
   font-weight: 700;
 }
