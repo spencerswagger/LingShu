@@ -20,6 +20,7 @@ import {
 import ErrorBubble from '@/components/ErrorBubble.vue'
 import UserSelect from '@/components/UserSelect.vue'
 import ColumnFilter from '@/components/ColumnFilter.vue'
+import FilterBar from '@/components/FilterBar.vue'
 import { fmtDate, fmtTime } from '@/utils/format'
 import { resolveBillingRange } from '@/utils/range'
 
@@ -47,6 +48,8 @@ const channelKeys = ref<ChannelKey[]>([])
 const models = ref<ExternalModel[]>([])
 const tokens = ref<AdminToken[]>([])
 const sessions = ref<AdminSession[]>([])
+// 当前所选用户名（用于筛选标签展示）
+const userName = ref('')
 
 const filters = reactive({
   user_id: (route.query.user_id ? String(route.query.user_id) : undefined) as string | undefined,
@@ -166,6 +169,80 @@ function clearChannelKey() {
   channelKeys.value = []
 }
 
+// ===== 生效筛选标签 =====
+function channelLabel(id?: string) {
+  if (!id) return ''
+  return channels.value.find((c) => c.ID === id)?.Name || id
+}
+function channelKeyLabel(id?: string) {
+  if (!id) return ''
+  return channelKeys.value.find((k) => k.ID === id)?.Name || id
+}
+function tokenTagLabel(id?: string) {
+  if (!id) return ''
+  const tk = tokens.value.find((x) => x.ID === id)
+  return tk ? tk.DisplayName || tk.TokenDisplay : id
+}
+function sessionTagLabel(id?: string) {
+  if (!id) return ''
+  const s = sessions.value.find((x) => x.SessionID === id)
+  return s ? sessionLabel(s) : id
+}
+
+const activeTags = computed(() => {
+  const out: { key: string; label: string }[] = []
+  if (filters.range) {
+    out.push({
+      key: 'range',
+      label: `时间: ${fmtDate(filters.range[0])} ${fmtTime(filters.range[0])} ~ ${fmtDate(filters.range[1])} ${fmtTime(filters.range[1])}`,
+    })
+  }
+  if (filters.user_id) out.push({ key: 'user_id', label: `用户: ${userName.value || filters.user_id}` })
+  if (filters.token_id) out.push({ key: 'token_id', label: `密钥: ${tokenTagLabel(filters.token_id)}` })
+  if (filters.channel_key_id) {
+    const parts = [channelLabel(filters.channel_id), channelKeyLabel(filters.channel_key_id)].filter(Boolean).join(' · ')
+    out.push({ key: 'channel_key_id', label: `渠道密钥: ${parts || filters.channel_key_id}` })
+  } else if (filters.channel_id) {
+    out.push({ key: 'channel_id', label: `渠道: ${channelLabel(filters.channel_id)}` })
+  }
+  if (filters.session_id) out.push({ key: 'session_id', label: `会话: ${sessionTagLabel(filters.session_id)}` })
+  if (filters.model) out.push({ key: 'model', label: `模型: ${filters.model}` })
+  if (filters.status) out.push({ key: 'status', label: `状态: ${filters.status === 'completed' ? '成功' : '失败'}` })
+  return out
+})
+
+// 关闭单个筛选标签（被 watch 监听的字段变化后自动重载）
+function clearTag(key: string) {
+  switch (key) {
+    case 'range':
+      filters.range = null
+      break
+    case 'user_id':
+      filters.user_id = undefined
+      break
+    case 'token_id':
+      filters.token_id = undefined
+      break
+    case 'channel_id':
+      filters.channel_id = undefined
+      break
+    case 'channel_key_id':
+      filters.channel_id = undefined
+      filters.channel_key_id = undefined
+      channelKeys.value = []
+      break
+    case 'session_id':
+      filters.session_id = undefined
+      break
+    case 'model':
+      filters.model = undefined
+      break
+    case 'status':
+      filters.status = undefined
+      break
+  }
+}
+
 // ===== 筛选变化自动刷新 =====
 watch(
   () => ({
@@ -195,6 +272,16 @@ watch(
 )
 
 function reset() {
+  // 若存在被 watch 监听的字段，置空后由 watch 触发重载；否则手动重载，避免重复请求
+  const wasActive = !!(
+    filters.user_id ||
+    filters.token_id ||
+    filters.channel_key_id ||
+    filters.session_id ||
+    filters.model ||
+    filters.status ||
+    filters.range
+  )
   filters.user_id = undefined
   filters.token_id = undefined
   filters.channel_id = undefined
@@ -204,8 +291,10 @@ function reset() {
   filters.status = undefined
   filters.range = null
   channelKeys.value = []
-  page.value = 1
-  load()
+  if (!wasActive) {
+    page.value = 1
+    load()
+  }
 }
 
 onMounted(() => {
@@ -347,12 +436,16 @@ function sessionLabel(s: AdminSession): string {
         <span class="stat-label" title="每分钟平均 Token 数">平均 TPM</span>
         <span class="stat-value">{{ avgTPM() }}</span>
       </div>
-      <div class="stat-spacer" />
-      <el-button size="small" @click="reset">重置筛选</el-button>
-      <el-button type="primary" size="small" :loading="loading" @click="load">刷新</el-button>
     </div>
 
     <div v-loading="loading" class="card">
+      <FilterBar
+        :tags="activeTags"
+        :loading="loading"
+        @clear="clearTag"
+        @reset="reset"
+        @refresh="load"
+      />
       <el-table
         :data="list"
         border
@@ -364,7 +457,13 @@ function sessionLabel(s: AdminSession): string {
         <!-- 时间：筛选图标 → 浮窗时间段选择器 -->
         <el-table-column label="时间" min-width="130" align="center">
           <template #header>
-            <ColumnFilter label="时间" :width="360" :active="!!filters.range" @clear="() => (filters.range = null)">
+            <ColumnFilter
+              label="时间"
+              :width="360"
+              :active="!!filters.range"
+
+              @clear="() => (filters.range = null)"
+            >
               <el-date-picker
                 v-model="filters.range"
                 type="datetimerange"
@@ -390,17 +489,22 @@ function sessionLabel(s: AdminSession): string {
             <ColumnFilter
               label="用户 / 密钥"
               :active="!!filters.user_id || !!filters.token_id"
+
               @clear="clearUserKey"
             >
               <div class="f-stack">
-                <UserSelect v-model="filters.user_id" placeholder="按用户名搜索" clearable />
+                <UserSelect
+                  v-model="filters.user_id"
+                  placeholder="按用户名搜索"
+                  clearable
+                  @select="(u) => (userName = u ? u.Nickname || u.Username : '')"
+                />
                 <el-select
                   v-model="filters.token_id"
                   placeholder="密钥"
                   filterable
                   clearable
                   size="small"
-                  style="width: 100%"
                   :disabled="!filters.user_id"
                 >
                   <el-option
@@ -424,14 +528,18 @@ function sessionLabel(s: AdminSession): string {
         <!-- 模型 -->
         <el-table-column label="模型 / 内部" min-width="140">
           <template #header>
-            <ColumnFilter label="模型 / 内部" :active="!!filters.model" @clear="() => (filters.model = undefined)">
+            <ColumnFilter
+              label="模型 / 内部"
+              :active="!!filters.model"
+
+              @clear="() => (filters.model = undefined)"
+            >
               <el-select
                 v-model="filters.model"
                 placeholder="选择模型"
                 filterable
                 clearable
                 size="small"
-                style="width: 100%"
               >
                 <el-option v-for="m in models" :key="m.ID" :label="m.ExternalName" :value="m.ExternalName" />
               </el-select>
@@ -451,6 +559,7 @@ function sessionLabel(s: AdminSession): string {
             <ColumnFilter
               label="渠道 / 密钥"
               :active="!!filters.channel_id || !!filters.channel_key_id"
+
               @clear="clearChannelKey"
             >
               <div class="f-stack">
@@ -470,7 +579,6 @@ function sessionLabel(s: AdminSession): string {
                   filterable
                   clearable
                   size="small"
-                  style="width: 100%"
                   :disabled="!filters.channel_id"
                 >
                   <el-option v-for="k in channelKeys" :key="k.ID" :label="k.Name" :value="k.ID" />
@@ -489,7 +597,12 @@ function sessionLabel(s: AdminSession): string {
         <!-- 会话（带搜索下拉） -->
         <el-table-column label="会话" min-width="120">
           <template #header>
-            <ColumnFilter label="会话" :active="!!filters.session_id" @clear="() => (filters.session_id = undefined)">
+            <ColumnFilter
+              label="会话"
+              :active="!!filters.session_id"
+
+              @clear="() => (filters.session_id = undefined)"
+            >
               <el-select
                 :model-value="filters.session_id ?? undefined"
                 placeholder="搜索会话"
@@ -497,7 +610,6 @@ function sessionLabel(s: AdminSession): string {
                 remote
                 clearable
                 size="small"
-                style="width: 100%"
                 :remote-method="(q: string) => searchSessions(q)"
                 @update:model-value="(v: any) => (filters.session_id = v ?? undefined)"
               >
@@ -538,8 +650,13 @@ function sessionLabel(s: AdminSession): string {
         <!-- 状态 -->
         <el-table-column label="状态" min-width="80">
           <template #header>
-            <ColumnFilter label="状态" :active="!!filters.status" @clear="() => (filters.status = undefined)">
-              <el-select v-model="filters.status" placeholder="账单状态" clearable size="small" style="width: 100%">
+            <ColumnFilter
+              label="状态"
+              :active="!!filters.status"
+
+              @clear="() => (filters.status = undefined)"
+            >
+              <el-select v-model="filters.status" placeholder="账单状态" clearable size="small">
                 <el-option label="成功" value="completed" />
                 <el-option label="失败" value="failed" />
               </el-select>
@@ -615,9 +732,6 @@ function sessionLabel(s: AdminSession): string {
   font-weight: 700;
   font-variant-numeric: tabular-nums;
   color: var(--color-text);
-}
-.stat-spacer {
-  flex: 1;
 }
 .pager {
   display: flex;
