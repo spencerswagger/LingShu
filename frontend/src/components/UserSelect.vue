@@ -9,7 +9,11 @@ const props = defineProps<{
   placeholder?: string
   clearable?: boolean
 }>()
-const emit = defineEmits<{ (e: 'update:modelValue', v: string | null): void }>()
+const emit = defineEmits<{
+  (e: 'update:modelValue', v: string | null): void
+  // 向外暴露当前所选用户（用于筛选标签等场景展示用户名）
+  (e: 'select', u: AdminUser | null): void
+}>()
 
 const loading = ref(false)
 const options = ref<AdminUser[]>([])
@@ -36,15 +40,23 @@ function onChange(v: string | null | undefined) {
   // 保留用户名到输入框便于展示
   if (hit) kw.value = hit.Username
   emit('update:modelValue', v ?? null)
+  emit('select', hit)
 }
 
 // 外部给到 id（编辑回填/跳转筛选）时，若选项里没有，按 id 查回用户名展示
 watch(
   () => props.modelValue,
   async (v) => {
-    if (v == null || selected.value?.ID === v) return
+    if (v == null) {
+      selected.value = null
+      emit('select', null)
+      return
+    }
+    if (selected.value?.ID === v) return
     if (options.value.some((u) => u.ID === v)) {
-      selected.value = options.value.find((u) => u.ID === v) || null
+      const hit = options.value.find((u) => u.ID === v) || null
+      selected.value = hit
+      emit('select', hit)
       return
     }
     try {
@@ -54,6 +66,7 @@ watch(
         selected.value = u
         kw.value = u.Username
         if (!options.value.some((x) => x.ID === u.ID)) options.value.unshift(u)
+        emit('select', u)
       }
     } catch {
       /* 保持现状 */
