@@ -574,7 +574,8 @@ function onRemoveRow(index: number) {
     <el-drawer
       v-model="drawerOpen"
       :title="pendingRows.length ? `批量配置内部模型（${pendingRows.length}）` : editingId == null ? '新增内部模型' : '编辑内部模型'"
-      :size="1080"
+      <!-- 宽屏上限 1080px，窄屏自适应视口，左右留 24px -->
+      :size="'min(1080px, calc(100vw - 48px))'"
       destroy-on-close
     >
       <template v-if="pendingRows.length">
