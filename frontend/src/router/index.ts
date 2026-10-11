@@ -42,6 +42,7 @@ const router = createRouter({
         { path: 'tokens', name: 'admin-tokens', component: () => import('@/views/admin/AdminTokenList.vue'), meta: { title: '令牌' } },
         // 会话管理
         { path: 'sessions', name: 'admin-sessions', component: () => import('@/views/admin/SessionList.vue'), meta: { title: '会话' } },
+        { path: 'sessions/:id', name: 'admin-session-detail', component: () => import('@/views/admin/SessionDetail.vue'), meta: { title: '会话详情' } },
         // 账单
         { path: 'billings', name: 'admin-billings', component: () => import('@/views/admin/BillingQuery.vue'), meta: { title: '账单' } },
         { path: 'billings/:id', name: 'admin-billing-detail', component: () => import('@/views/admin/BillingDetail.vue'), meta: { title: '账单详情' } },

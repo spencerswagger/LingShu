@@ -7,7 +7,7 @@ import (
 )
 
 // sessionCols 列出 sessions 表查询使用列，与 DDL 一致。
-const sessionCols = `session_id, user_id, token_id, model, session_raw, channel_key_id, internal_model_id, created_at, last_active, expire_at, COALESCE(name, ''), COALESCE(closed, false)`
+const sessionCols = `session_id, user_id, token_id, model, session_raw, channel_key_id, internal_model_id, created_at, last_active, expire_at, COALESCE(name, ''), COALESCE(closed, false), COALESCE(closed_at, NULL)`
 
 // sessionUpsertSQL 创建/续期会话的 UPSERT：冲突（session_id）时只刷新运行时列，不覆盖 user/model/name 等归属。
 // name/closed 仅在新建行时写入（首次自动命名）；改名走 SetName、关闭走 SetClosed，网关续期不会覆盖。
@@ -55,9 +55,11 @@ func (s *SessionStore) SetName(ctx context.Context, sessionID, name string) (boo
 	return n > 0, err
 }
 
-// SetClosed 更新会话关闭状态（关闭后不命中路由，记录保留）。
+// SetClosed 更新会话关闭状态（关闭后不命中路由，记录保留；关闭时记录关闭时间用于保留期清扫）。
 func (s *SessionStore) SetClosed(ctx context.Context, sessionID string, closed bool) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE sessions SET closed=$2 WHERE session_id=$1`, sessionID, closed)
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE sessions SET closed=$2, closed_at=CASE WHEN $2 THEN COALESCE(closed_at, now()) ELSE NULL END WHERE session_id=$1`,
+		sessionID, closed)
 	return err
 }
 
@@ -76,11 +78,13 @@ func (s *SessionStore) DeleteMany(ctx context.Context, ids []string) error {
 	return err
 }
 
-// LoadActive 查询未过期会话（expire_at > now），用于启动恢复。
+// LoadActive 查询启动恢复所需会话：未过期会话，或已关闭且仍在保留期内的会话
+// （保留期内已关闭会话重启后继续出现在管理列表）。
 // sessions 表无 channel_id 列，会话维度只有 channel_key_id（含 internal_model_id）。
 func (s *SessionStore) LoadActive(ctx context.Context, now time.Time) ([]*Session, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT `+sessionCols+` FROM sessions WHERE expire_at > $1`, now)
+		`SELECT `+sessionCols+` FROM sessions WHERE expire_at > $1 OR (closed AND closed_at > $2)`,
+		now, now.Add(-closedSessionRetention))
 	if err != nil {
 		return nil, err
 	}
@@ -90,12 +94,18 @@ func (s *SessionStore) LoadActive(ctx context.Context, now time.Time) ([]*Sessio
 	for rows.Next() {
 		var sess Session
 		var token sql.NullInt64
+		var closedAt sql.NullTime
 		if err := rows.Scan(&sess.SessionID, &sess.UserID, &token, &sess.Model, &sess.SessionRaw,
-			&sess.ChannelKeyID, &sess.InternalModelID, &sess.CreatedAt, &sess.LastActive, &sess.ExpireAt, &sess.Name, &sess.Closed); err != nil {
+			&sess.ChannelKeyID, &sess.InternalModelID, &sess.CreatedAt, &sess.LastActive, &sess.ExpireAt,
+			&sess.Name, &sess.Closed, &closedAt); err != nil {
 			return nil, err
 		}
 		if token.Valid {
 			sess.TokenID = token.Int64
+		}
+		if closedAt.Valid {
+			v := closedAt.Time
+			sess.ClosedAt = &v
 		}
 		out = append(out, &sess)
 	}
