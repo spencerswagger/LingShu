@@ -9,6 +9,15 @@ import (
 	"github.com/DATA-DOG/go-sqlmock"
 )
 
+// TestUsageSplitTotalExcludesCacheRead 断言缓存读不重复计入总量：
+// 缓存读(CacheRead)已含于输入(Input)，Total 仅求和 Input/Output/CacheWrite/Reasoning。
+func TestUsageSplitTotalExcludesCacheRead(t *testing.T) {
+	u := UsageSplit{Input: 100, Output: 50, CacheRead: 30, CacheWrite: 10, Reasoning: 5}
+	if got := u.Total(); got != 165 {
+		t.Fatalf("Total()=%d, want 165（100+50+10+5，缓存读 30 不重复计入）", got)
+	}
+}
+
 // TestDashboard_Aggregates 断言 Dashboard 按固定顺序执行 9 条聚合查询，
 // 并正确计算总量 / 成功率 / 吞吐量，同时按天补零。
 func TestDashboard_Aggregates(t *testing.T) {
@@ -23,12 +32,12 @@ func TestDashboard_Aggregates(t *testing.T) {
 	to := time.Date(2026, 9, 3, 23, 59, 59, 0, time.UTC)
 	limit := 10
 
-	// 1) 总计：input/output/...（5 段）→ credits, calls, failed, sumdur, sumfirst, okdur, okfirst
+	// 1) 总计：input/output/...（4 段求和，缓存读已含于输入）→ credits, calls, failed, sumdur, sumfirst, okdur, okfirst
 	mock.ExpectQuery(regexp.QuoteMeta(`COALESCE(sum((first_token_ms IS NOT NULL)::int),0)`)).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"input", "output", "cache_read", "cache_write", "reasoning",
 			"credits", "calls", "failed", "sumdur", "sumfirst", "okdur", "okfirst",
-		}).AddRow(int64(100), int64(50), int64(0), int64(0), int64(0),
+		}).AddRow(int64(100), int64(50), int64(20), int64(0), int64(0),
 			float64(12.5), int64(10), int64(1), int64(2000), int64(400), int64(10), int64(10)))
 
 	// 2) 按天（仅返回 1 天，另一天应补零）
@@ -75,6 +84,7 @@ func TestDashboard_Aggregates(t *testing.T) {
 	if out.TotalCall != 10 || out.Failed != 1 {
 		t.Fatalf("calls=%d failed=%d, want 10/1", out.TotalCall, out.Failed)
 	}
+	// cache_read=20 已含于 input(100)、不重复计入，Total 仍为 150（100+50）。
 	if out.Total.Total() != 150 {
 		t.Fatalf("tokens=%d, want 150", out.Total.Total())
 	}

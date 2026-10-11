@@ -81,7 +81,8 @@ func (s *SqlStore) ListRecords(ctx context.Context, f RecordFilter) ([]Record, i
 	return list, total, nil
 }
 
-// RecordSummary 账单筛选聚合结果（统计栏）：请求数、总积分、总 token（五段求和）、总耗时。
+// RecordSummary 账单筛选聚合结果（统计栏）：请求数、总积分、总 token（四段求和）、总耗时。
+// 注：缓存读(cache_read)已含于 input，总量统计不重复计入（与 stats.go UsageSplit.Total() 口径一致）。
 type RecordSummary struct {
 	Requests        int64   `json:"Requests"`
 	CreditsTotal    float64 `json:"CreditsTotal"`
@@ -99,7 +100,6 @@ func (s *SqlStore) Summarize(ctx context.Context, f RecordFilter) (RecordSummary
 		        COALESCE(sum(
 		            COALESCE(NULLIF(tokens->>'input','')::bigint, 0) +
 		            COALESCE(NULLIF(tokens->>'output','')::bigint, 0) +
-		            COALESCE(NULLIF(tokens->>'cache_read','')::bigint, 0) +
 		            COALESCE(NULLIF(tokens->>'cache_write','')::bigint, 0) +
 		            COALESCE(NULLIF(tokens->>'reasoning','')::bigint, 0)), 0),
 		        COALESCE(sum(duration_ms), 0)
