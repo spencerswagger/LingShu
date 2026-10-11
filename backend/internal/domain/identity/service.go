@@ -44,6 +44,13 @@ func errBadRequest(msg string) *APIError {
 func errUnauthorized() *APIError {
 	return &APIError{HTTPStatus: http.StatusUnauthorized, Code: resp.CodeUnauthorized, Message: "用户名或密码错误"}
 }
+
+// errTOTPInvalid 第二步动态码/恢复码校验失败。
+// 文案必须与第一步的「用户名或密码错误」区分：否则用户输入动态码被拒时会误判为
+// 账号/口令有误（线上反馈：开启 2FA 后输入手机令牌却提示用户名或密码错误）。
+func errTOTPInvalid() *APIError {
+	return &APIError{HTTPStatus: http.StatusUnauthorized, Code: resp.CodeUnauthorized, Message: "动态码或恢复码错误，请重新获取后重试"}
+}
 func errDisabled() *APIError {
 	return &APIError{HTTPStatus: http.StatusForbidden, Code: resp.CodeForbidden, Message: "账户已被禁用，请联系管理员"}
 }
@@ -252,8 +259,11 @@ func (s *Service) VerifyTOTP(ctx context.Context, userID int64, code string) (*U
 		return nil, errInternal()
 	}
 	ok, err := s.totp.Verify(ctx, userID, code)
-	if err != nil || !ok {
-		return nil, errUnauthorized()
+	if err != nil {
+		return nil, fmt.Errorf("verify totp: %w", err)
+	}
+	if !ok {
+		return nil, errTOTPInvalid()
 	}
 	u, err := s.store.GetByID(ctx, userID)
 	if err != nil {
