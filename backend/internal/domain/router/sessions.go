@@ -113,7 +113,8 @@ func (r *SessionRegistry) SetLogger(fn func(format string, args ...any)) {
 	}
 }
 
-// Lookup 返回未过期会话（含已关闭的，供管理端改名/展示）；过期条目清除。
+// Lookup 返回会话（含已关闭的，供管理端改名/展示）；过期条目清除，
+// 但已关闭且仍在保留期内的会话不随过期清除（保留期语义与 SweepNow/LoadPersisted 一致）。
 func (r *SessionRegistry) Lookup(sessionID string) (*Session, bool) {
 	if sessionID == "" {
 		return nil, false
@@ -125,6 +126,11 @@ func (r *SessionRegistry) Lookup(sessionID string) (*Session, bool) {
 		return nil, false
 	}
 	if r.now().After(s.ExpireAt) {
+		if s.Closed && s.ClosedAt != nil {
+			if t := r.now(); t.Sub(*s.ClosedAt) < closedSessionRetention {
+				return s, true
+			}
+		}
 		r.removeLocked(sessionID, s.ChannelKeyID)
 		return nil, false
 	}
@@ -269,16 +275,26 @@ func (r *SessionRegistry) CountActiveByChannel(channelID int64) int {
 	return n
 }
 
+// closedSessionRetention 已关闭会话的列表保留期：关闭的会话在保留期内不因过期被清扫删除
+// （管理列表仍可见），超过保留期才随清扫清理。受 LoadPersisted 恢复查询同一常量约束。
+const closedSessionRetention = 30 * 24 * time.Hour
+
 // SweepNow 清理过期会话并回算计数；批量删除 DB 投影（周期清扫调用）。
+// 已关闭会话不随过期即删：保留 closedSessionRetention 时长供管理列表查看。
 func (r *SessionRegistry) SweepNow() {
 	t := r.now()
 	r.mu.Lock()
 	var expired []string
 	for id, s := range r.byKey {
-		if t.After(s.ExpireAt) {
-			r.removeLocked(id, s.ChannelKeyID)
-			expired = append(expired, id)
+		if !t.After(s.ExpireAt) {
+			continue
 		}
+		// 已关闭且在保留期内：保留（内存 + DB），继续展示在列表中。
+		if s.Closed && s.ClosedAt != nil && t.Sub(*s.ClosedAt) < closedSessionRetention {
+			continue
+		}
+		r.removeLocked(id, s.ChannelKeyID)
+		expired = append(expired, id)
 	}
 	store, logf := r.store, r.logf
 	r.mu.Unlock()
