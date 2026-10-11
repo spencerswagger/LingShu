@@ -250,6 +250,16 @@ func (s *TokenStore) ListTokens(ctx context.Context, userID *int64, status strin
 	return list, total, nil
 }
 
+// CountByUser 统计某用户未删除的令牌数量。
+func (s *TokenStore) CountByUser(ctx context.Context, userID int64) (int64, error) {
+	var total int64
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT count(*) FROM tokens WHERE user_id = $1 AND deleted_at IS NULL`, userID).Scan(&total); err != nil {
+		return 0, fmt.Errorf("count tokens by user: %w", err)
+	}
+	return total, nil
+}
+
 // scanTokenInfo 将列表 JOIN 行（tokens 列 + username）扫描到 *TokenInfo。
 func scanTokenInfo(row interface{ Scan(...any) error }) (*TokenInfo, error) {
 	var t Token

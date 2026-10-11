@@ -232,7 +232,7 @@ async function onResetTotp() {
   if (!u) return
   try {
     await ElMessageBox.confirm(
-      `确认强制解绑「${u.Nickname || u.Username}」的两步验证（2FA）吗？解绑后该用户可用密码直接登录。`,
+      `确认强制解绑「${u.Nickname || u.Username}」的多因素认证（2FA）吗？解绑后该用户可用密码直接登录。`,
       '强制解绑 2FA',
       { type: 'warning', confirmButtonText: '解绑', cancelButtonText: '取消' },
     )
@@ -242,7 +242,7 @@ async function onResetTotp() {
   totpResetLoading.value = true
   try {
     await resetUserTotp(u.ID)
-    ElMessage.success('已强制解绑两步验证')
+    ElMessage.success('已强制解绑多因素认证')
   } catch (e: any) {
     ElMessage.error(e?.message || '解绑失败')
   } finally {
@@ -333,7 +333,7 @@ async function onResetTotp() {
                   <el-tooltip content="重置密码" placement="top">
                     <el-icon class="op-icon" @click="openReset"><Lock /></el-icon>
                   </el-tooltip>
-                  <el-tooltip content="强制解绑两步验证（2FA）" placement="top">
+                  <el-tooltip content="强制解绑多因素认证（2FA）" placement="top">
                     <el-icon class="op-icon" :class="{ 'is-loading': totpResetLoading }" @click="onResetTotp"><Unlock /></el-icon>
                   </el-tooltip>
                 </el-descriptions-item>

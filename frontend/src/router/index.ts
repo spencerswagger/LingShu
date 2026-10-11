@@ -119,12 +119,6 @@ const router = createRouter({
       name: 'change-password',
       component: () => import('@/views/ChangePassword.vue'),
     },
-    // 账号安全页（TOTP 管理，登录后 ADMIN/DEVELOPER 均可访问）
-    {
-      path: '/account/security',
-      name: 'account-security',
-      component: () => import('@/views/AccountSecurity.vue'),
-    },
     // 403 / 兜底
     { path: '/403', name: 'forbidden', component: () => import('@/views/Forbidden.vue') },
     { path: '/:pathMatch(.*)*', redirect: '/login' },

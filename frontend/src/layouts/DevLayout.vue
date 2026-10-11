@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
 import { useAuthStore } from '@/stores/auth'
+import UserPanel from '@/components/UserPanel.vue'
 import {
   Odometer,
   Key,
@@ -10,9 +10,6 @@ import {
   Tickets,
   Bell,
   Wallet,
-  Lock,
-  ArrowDown,
-  SwitchButton,
 } from '@element-plus/icons-vue'
 
 const route = useRoute()
@@ -27,7 +24,6 @@ const menus = [
   { path: '/dev/wallet', title: '我的钱包', icon: Wallet },
   { path: '/dev/billings', title: '消费账单', icon: Tickets },
   { path: '/dev/announcements', title: '系统公告', icon: Bell },
-  { path: '/account/security', title: '账号安全', icon: Lock },
 ]
 
 function activeMenu() {
@@ -37,33 +33,6 @@ function activeMenu() {
   return p
 }
 
-const avatarText = computed(() => (auth.displayName() || 'D').slice(0, 1).toUpperCase())
-
-const roleLabel = computed(() => (auth.role === 'ADMIN' ? '管理员' : '开发者'))
-const balanceText = computed(() => (auth.balanceLoaded ? auth.balance.toFixed(5) : '--'))
-
-// 浮窗内修改本人昵称
-const editName = ref('')
-const saving = ref(false)
-async function saveName() {
-  const name = editName.value.trim()
-  if (!name) {
-    ElMessage.warning('昵称不能为空')
-    return
-  }
-  saving.value = true
-  try {
-    await auth.changeNickname(name)
-    ElMessage.success('昵称已更新')
-  } catch (e: any) {
-    ElMessage.error(e?.message || '修改失败')
-  } finally {
-    saving.value = false
-  }
-}
-function startEditName() {
-  editName.value = auth.nickname || auth.username || ''
-}
 onMounted(() => {
   auth.fetchProfile()
 })
@@ -74,12 +43,6 @@ const crumbBack = computed(() => {
   if (route.path !== parent && parent.startsWith('/dev/')) return parent
   return ''
 })
-
-function logout() {
-  // logout 内部同步清空本地态（服务端撤销为旁路请求），此处无需等待，跳转立即发生
-  auth.logout()
-  router.push('/login')
-}
 </script>
 
 <template>
@@ -111,43 +74,7 @@ function logout() {
           <span v-else class="crumb-cur">{{ route.meta.title || '' }}</span>
         </div>
         <div class="user-box">
-          <el-popover
-            placement="bottom-end"
-            :width="280"
-            trigger="hover"
-            popper-class="user-popover"
-            @show="startEditName"
-            @before-enter="auth.fetchProfile()"
-          >
-            <template #reference>
-              <span class="user-trigger">
-                <span class="avatar">{{ avatarText }}</span>
-                <span class="username">{{ auth.displayName() }}</span>
-                <el-icon class="arrow"><ArrowDown /></el-icon>
-              </span>
-            </template>
-            <div class="pop-body">
-              <div class="pop-name">
-                <span class="pop-nick">{{ auth.displayName() }}</span>
-                <el-tag size="small" effect="plain">{{ roleLabel }}</el-tag>
-              </div>
-              <div class="pop-sub">@{{ auth.username }}</div>
-              <div class="pop-balance">
-                余额
-                <b class="pop-balance-num">{{ balanceText }}</b>
-                积分
-              </div>
-              <div class="pop-edit">
-                <el-input v-model="editName" size="small" maxlength="40" placeholder="设置昵称" @keyup.enter="saveName" />
-                <el-button size="small" type="primary" :loading="saving" @click="saveName">保存</el-button>
-              </div>
-              <div class="pop-foot">
-                <el-button link type="danger" class="pop-logout" @click="logout">
-                  <el-icon><SwitchButton /></el-icon>退出登录
-                </el-button>
-              </div>
-            </div>
-          </el-popover>
+          <UserPanel />
         </div>
       </el-header>
       <el-main class="main">
@@ -278,104 +205,6 @@ function logout() {
 .user-box {
   display: flex;
   align-items: center;
-}
-
-/* 整块（头像+用户名+箭头）作为悬停触发器 */
-.user-trigger {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 10px;
-  border-radius: 10px;
-  cursor: pointer;
-  transition: background 0.15s;
-}
-
-.user-trigger:hover {
-  background: var(--color-fill, #f6f7fa);
-}
-
-.user-trigger .arrow {
-  font-size: 12px;
-  color: var(--color-text-tertiary);
-  transition: transform 0.15s;
-}
-
-.user-trigger:hover .arrow {
-  transform: rotate(180deg);
-}
-
-.avatar {
-  width: 30px;
-  height: 30px;
-  border-radius: 50%;
-  background: var(--brand-gradient);
-  color: #fff;
-  font-size: 14px;
-  font-weight: 600;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.username {
-  color: var(--color-text);
-  font-weight: 500;
-  font-size: 14px;
-}
-
-/* 用户信息浮窗 */
-.pop-body {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-.pop-name {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-.pop-nick {
-  font-size: 15px;
-  font-weight: 600;
-  color: var(--color-text);
-}
-.pop-sub {
-  font-size: 12px;
-  color: var(--color-text-secondary);
-  font-family: 'SF Mono', Menlo, Consolas, monospace;
-}
-.pop-balance {
-  display: flex;
-  align-items: baseline;
-  gap: 4px;
-  font-size: 13px;
-  color: var(--color-text-secondary);
-  background: var(--color-fill, #f6f7fa);
-  border-radius: 8px;
-  padding: 8px 10px;
-}
-.pop-balance-num {
-  font-size: 16px;
-  font-weight: 600;
-  color: var(--color-primary);
-  font-variant-numeric: tabular-nums;
-}
-.pop-edit {
-  display: flex;
-  gap: 8px;
-}
-.pop-foot {
-  border-top: 1px solid var(--color-border, #eee);
-  padding-top: 6px;
-  display: flex;
-  justify-content: center;
-}
-.pop-logout {
-  width: 100%;
-}
-.pop-logout .el-icon {
-  margin-right: 4px;
 }
 
 .main {

@@ -128,10 +128,10 @@ export interface BillingItem {
   CallTime: string
 }
 
-// 本人账单列表
-export function listDevBillings(page = 1, size = 20) {
+// 本人账单列表（支持时间区间 From/To，RFC3339）
+export function listDevBillings(params: { Page?: number; Size?: number; From?: string; To?: string } = {}) {
   return http.get<PageResult<BillingItem>, ApiRes<PageResult<BillingItem>>>('/dev/billings', {
-    params: { Page: page, Size: size },
+    params: { Page: params.Page ?? 1, Size: params.Size ?? 20, From: params.From, To: params.To },
   })
 }
 

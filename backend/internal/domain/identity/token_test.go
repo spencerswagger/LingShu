@@ -19,6 +19,8 @@ const insertTokenSQL = `INSERT INTO tokens(id, token_hash, token_display, secret
 
 const getTokenByHashSQL = `SELECT ` + tokenCols + ` FROM tokens WHERE token_hash = $1`
 
+const countByUserSQL = `SELECT count(*) FROM tokens WHERE user_id = $1 AND deleted_at IS NULL`
+
 func tokenRow(tok *Token) *sqlmock.Rows {
 	// 列顺序与 tokenCols 一致：id, token_hash, token_display, user_id, display_name,
 	// tag_id, expires_at, last_used_at, status, created_at
@@ -186,6 +188,30 @@ func TestToken_LookupByPlain_Expired_Fails(t *testing.T) {
 	}
 	if apiErr.HTTPStatus != 401 {
 		t.Fatalf("expected 401 for expired token, got %d", apiErr.HTTPStatus)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("mock expectations: %v", err)
+	}
+}
+
+func TestCountByUser(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery(regexp.QuoteMeta(countByUserSQL)).
+		WithArgs(int64(1)).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(3)))
+
+	store := NewTokenStore(db)
+	got, err := store.CountByUser(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("count by user: %v", err)
+	}
+	if got != 3 {
+		t.Fatalf("expected 3, got %d", got)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("mock expectations: %v", err)
