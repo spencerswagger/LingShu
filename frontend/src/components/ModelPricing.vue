@@ -526,8 +526,9 @@ recordEmit(pack())
 .wd-edit .el-checkbox-group {
   flex-wrap: nowrap;
 }
+/* 7 个勾选框合计约 217px，去掉横向 margin 使其在 216px 列内容区（约 190px）内单行放得下 */
 .wd-edit .el-checkbox {
-  margin-right: 4px;
+  margin-right: 0;
 }
 .wd-edit .el-checkbox__label {
   padding-left: 3px;
