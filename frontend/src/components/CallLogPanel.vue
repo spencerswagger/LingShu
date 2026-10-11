@@ -6,7 +6,9 @@ import type { CallLogView } from '@/api/dev'
 interface DecisionAttempt {
   order?: number
   channel_id?: string
+  channel_name?: string
   channel_key_id?: string
+  channel_key_name?: string
   internal_model_id?: string
   reason?: string
 }
@@ -14,6 +16,7 @@ interface DecisionView {
   attempts?: DecisionAttempt[]
   time_coeff?: number
   ctx_coeff?: number
+  est_input_tokens?: number
   pre_consumed?: number
   result?: unknown
 }
@@ -27,8 +30,10 @@ const props = withDefaults(
     log: CallLogView | null | undefined
     // 是否展示渠道/密钥/内部模型等内部标识（dev 端隐藏）
     showInternal?: boolean
+    // 面板总标题；置空则不展示标题
+    title?: string
   }>(),
-  { showInternal: true },
+  { showInternal: true, title: '请求 / 响应 / 决策轨迹' },
 )
 
 function fmtJson(v: unknown) {
@@ -90,9 +95,12 @@ function fmtResult(v: unknown): string {
 </script>
 
 <template>
-  <div v-if="log" class="call-log">
-    <div class="log-title">请求 / 响应 / 决策轨迹</div>
+  <div v-if="log || $slots.prepend" class="call-log">
+    <div v-if="title" class="log-title">{{ title }}</div>
     <el-collapse>
+      <!-- 调用方可在同一折叠组内前置自定义区块（如账单详情页的计费计算公式） -->
+      <slot name="prepend" />
+      <template v-if="log">
       <el-collapse-item name="req" title="请求增量">
         <template v-if="log.RespKind === 'error'">
           <div class="err-msg">{{ log.ErrorMessage || '请求失败，无更多信息' }}</div>
@@ -117,14 +125,15 @@ function fmtResult(v: unknown): string {
       <el-collapse-item name="decision" title="决策轨迹">
         <template v-if="decision">
           <div class="decision-tags">
-            <el-tag v-if="decision.time_coeff != null" size="small" effect="plain">
+            <el-tag v-if="decision.time_coeff && decision.time_coeff > 0" size="small" effect="plain">
               时段系数 ×{{ decision.time_coeff }}
             </el-tag>
-            <el-tag v-if="decision.ctx_coeff != null" size="small" effect="plain">
+            <el-tag v-if="decision.ctx_coeff && decision.ctx_coeff > 0" size="small" effect="plain">
               上下文分档 ×{{ decision.ctx_coeff }}
             </el-tag>
             <el-tag v-if="decision.pre_consumed != null" size="small" type="warning" effect="plain">
               预扣积分 {{ decision.pre_consumed }}
+              <span v-if="decision.est_input_tokens != null">（预估输入 {{ decision.est_input_tokens.toLocaleString() }} tok）</span>
             </el-tag>
           </div>
           <div v-if="decision.result != null" class="decision-result">
@@ -141,13 +150,17 @@ function fmtResult(v: unknown): string {
             <el-table-column label="顺序" width="64" align="center">
               <template #default="{ row }">#{{ row.order }}</template>
             </el-table-column>
-            <el-table-column v-if="showInternal" label="渠道 ID" min-width="150">
-              <template #default="{ row }"><span class="mono">{{ row.channel_id || '-' }}</span></template>
+            <el-table-column v-if="showInternal" label="渠道" min-width="140">
+              <template #default="{ row }">
+                <span :title="row.channel_id">{{ row.channel_name || row.channel_id || '-' }}</span>
+              </template>
             </el-table-column>
-            <el-table-column v-if="showInternal" label="渠道密钥 ID" min-width="150">
-              <template #default="{ row }"><span class="mono">{{ row.channel_key_id || '-' }}</span></template>
+            <el-table-column v-if="showInternal" label="渠道密钥" min-width="140">
+              <template #default="{ row }">
+                <span :title="row.channel_key_id">{{ row.channel_key_name || row.channel_key_id || '-' }}</span>
+              </template>
             </el-table-column>
-            <el-table-column v-if="showInternal" label="内部模型 ID" min-width="150">
+            <el-table-column v-if="showInternal" label="内部模型" min-width="140">
               <template #default="{ row }"><span class="mono">{{ row.internal_model_id || '-' }}</span></template>
             </el-table-column>
             <el-table-column label="原因" min-width="200">
@@ -157,6 +170,7 @@ function fmtResult(v: unknown): string {
         </template>
         <div v-else class="log-empty">（未记录决策轨迹）</div>
       </el-collapse-item>
+      </template>
     </el-collapse>
   </div>
 </template>
