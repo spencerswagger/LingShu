@@ -83,3 +83,18 @@ export function updateMeNickname(nickname: string) {
     { Nickname: nickname },
   )
 }
+
+// 本人摘要（右上角用户面板用）：令牌数/会话数/三档消耗/吞吐速率
+export interface MeSummary {
+  TokenCount: number
+  SessionCount: number
+  TodayCredits: number
+  YesterdayCredits: number
+  MonthCredits: number
+  RPM: number
+  TPM: number
+}
+
+export function getMeSummary() {
+  return http.get<MeSummary, ApiRes<MeSummary>>('/auth/me/summary')
+}

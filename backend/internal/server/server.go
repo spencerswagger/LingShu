@@ -77,6 +77,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/v1/auth/login", d.Identity.HandleLogin)
 	s.mux.HandleFunc("POST /api/v1/auth/login/totp", d.Identity.HandleLoginTOTP)
 	s.mux.Handle("GET /api/v1/auth/me", WithAuth(s.jwtMgr, s.sessions)(http.HandlerFunc(d.Identity.HandleMe)))
+	s.mux.Handle("GET /api/v1/auth/me/summary", WithAuth(s.jwtMgr, s.sessions)(http.HandlerFunc(d.DevConsole.HandleMeSummary)))
 	s.mux.Handle("PUT /api/v1/auth/me", WithAuth(s.jwtMgr, s.sessions)(http.HandlerFunc(d.Identity.HandleUpdateMe)))
 	s.mux.Handle("PUT /api/v1/auth/me/password", WithAuth(s.jwtMgr, s.sessions)(http.HandlerFunc(d.Identity.HandleChangePassword)))
 	s.mux.Handle("POST /api/v1/auth/logout", WithAuth(s.jwtMgr, s.sessions)(http.HandlerFunc(d.Identity.HandleLogout)))
