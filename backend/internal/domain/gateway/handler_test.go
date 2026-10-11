@@ -1425,6 +1425,29 @@ func TestServeCallLog_NonStreamSuccess(t *testing.T) {
 	if cl.Model != "gpt-4" {
 		t.Errorf("call log model wrong: model=%q", cl.Model)
 	}
+	// 决策轨迹：成功路径也应写入（attempts 含当前候选 success + result=success）。
+	dec, ok := cl.Decision.(map[string]any)
+	if !ok {
+		t.Fatalf("success call log decision missing: %v", cl.Decision)
+	}
+	raw, _ := json.Marshal(dec)
+	var sdec struct {
+		Attempts []map[string]any `json:"attempts"`
+		Result   string           `json:"result"`
+	}
+	if err := json.Unmarshal(raw, &sdec); err != nil {
+		t.Fatalf("unmarshal success decision: %v", err)
+	}
+	if len(sdec.Attempts) < 1 {
+		t.Fatalf("success decision attempts want >=1, got %+v", sdec.Attempts)
+	}
+	last := sdec.Attempts[len(sdec.Attempts)-1]
+	if last["reason"] != "success" {
+		t.Errorf("success decision last attempt want success, got %+v", last)
+	}
+	if sdec.Result != "success" {
+		t.Errorf("success decision result want success, got %q", sdec.Result)
+	}
 }
 
 // 调用日志-2：流式成功——RespKind=stream、RespBody 为拼接的 assistant content（增量拼接）。
@@ -1457,6 +1480,25 @@ func TestServeCallLog_StreamSuccess(t *testing.T) {
 	}
 	if cl.BillingID != h.billing.bids[0] || cl.BillingID == "" {
 		t.Errorf("call log billing_id want %q, got %q", h.billing.bids[0], cl.BillingID)
+	}
+	// 决策轨迹：流式成功路径同样应写入（result=success）。
+	dec, ok := cl.Decision.(map[string]any)
+	if !ok {
+		t.Fatalf("stream success call log decision missing: %v", cl.Decision)
+	}
+	raw, _ := json.Marshal(dec)
+	var sdec struct {
+		Attempts []map[string]any `json:"attempts"`
+		Result   string           `json:"result"`
+	}
+	if err := json.Unmarshal(raw, &sdec); err != nil {
+		t.Fatalf("unmarshal stream success decision: %v", err)
+	}
+	if len(sdec.Attempts) < 1 {
+		t.Fatalf("stream success decision attempts want >=1, got %+v", sdec.Attempts)
+	}
+	if sdec.Result != "success" {
+		t.Errorf("stream success decision result want success, got %q", sdec.Result)
 	}
 }
 

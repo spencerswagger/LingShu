@@ -122,8 +122,14 @@ func ValidateRates(r Rates) error {
 }
 
 // sumRates 计算五段 token×单价 之和。
+// 输入计费口径：Input 是全部输入 token（含命中缓存的 CacheRead 部分），缓存命中部分只按 cache_read 价计，
+// 因此 input 段按 (Input - CacheRead) 计、CacheRead 段按 cache_read 价计，避免缓存命中 token 双重计费。
 func sumRates(u Usage, r Rates) float64 {
-	return float64(u.Input)*r["input"] +
+	nonCachedIn := u.Input - u.CacheRead
+	if nonCachedIn < 0 {
+		nonCachedIn = 0 // 防御：上游返回的 cached_tokens 异常大于 prompt_tokens 时按 0 计
+	}
+	return float64(nonCachedIn)*r["input"] +
 		float64(u.Output)*r["output"] +
 		float64(u.CacheRead)*r["cache_read"] +
 		float64(u.CacheWrite)*r["cache_write"] +
