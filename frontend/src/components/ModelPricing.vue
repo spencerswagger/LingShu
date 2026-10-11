@@ -318,7 +318,7 @@ recordEmit(pack())
         <el-table-column label="结束 (HH:MM)" width="120">
           <template #default="{ row }"><el-input v-model="row.End" placeholder="24:00" /></template>
         </el-table-column>
-        <el-table-column label="适用星期" width="216" show-overflow-tooltip>
+        <el-table-column label="适用星期" min-width="216" show-overflow-tooltip>
           <template #default="{ row }">
             <div class="wd-edit">
               <el-checkbox-group v-model="row.Weekdays" size="small">
@@ -399,17 +399,17 @@ recordEmit(pack())
         </el-tooltip>
       </div>
       <el-table :data="edit.Tiers" border class="table-nowrap">
-        <el-table-column label="下限 (min)" width="140">
+        <el-table-column label="下限 (min)" min-width="140">
           <template #default="{ row }">
             <el-input-number v-model="row.Min" :min="0" :controls="false" style="width: 100%" />
           </template>
         </el-table-column>
-        <el-table-column label="上限 (max)" width="140">
+        <el-table-column label="上限 (max)" min-width="140">
           <template #default="{ row }">
             <el-input-number v-model="row.Max" :min="0" placeholder="空=无上限" :controls="false" style="width: 100%" />
           </template>
         </el-table-column>
-        <el-table-column label="系数 (coeff)" width="160">
+        <el-table-column label="系数 (coeff)" min-width="160">
           <template #default="{ row }">
             <el-input-number v-model="row.Coeff" :min="0" :precision="3" :step="0.1" style="width: 100%" />
           </template>
@@ -520,13 +520,15 @@ recordEmit(pack())
   display: flex;
   align-items: center;
   gap: 4px;
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
+  row-gap: 4px;
 }
 .wd-edit .el-checkbox-group {
   flex-wrap: nowrap;
 }
+/* 7 个勾选框合计约 217px，去掉横向 margin 使其在 216px 列内容区（约 190px）内单行放得下 */
 .wd-edit .el-checkbox {
-  margin-right: 4px;
+  margin-right: 0;
 }
 .wd-edit .el-checkbox__label {
   padding-left: 3px;
