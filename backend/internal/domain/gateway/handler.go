@@ -1107,7 +1107,12 @@ const implicitSessionMessages = 3
 // sessionNameLimit 会话可读名称最大长度（rune）。
 const sessionNameLimit = 40
 
-// sessionNameFor 生成会话可读名称：优先取首条 user 消息内容摘要；无消息时取原始标识。
+// sessionNameFor 生成会话可读名称（通用 XML 结构规则，不依赖任何客户端特有标签白名单）：
+//  1. 首个不在任何 XML 标签内的游离文本段；
+//  2. 首个被 <user*> 标签（如 <user_input>/<user>）包围的文本段；
+//  3. 首条正文（任意首个实质文本段）。
+//
+// 兼容纯文本 content 与 ChatGPT 多模态数组；无消息/无实质文本时回退原始标识。
 // 手动改名走独立接口，网关自动续期不会覆盖。
 func sessionNameFor(sessionRaw string, body []byte) string {
 	var req struct {
@@ -1116,49 +1121,181 @@ func sessionNameFor(sessionRaw string, body []byte) string {
 			Content json.RawMessage `json:"content"`
 		} `json:"messages"`
 	}
-	name := ""
-	if err := json.Unmarshal(body, &req); err == nil {
-		for _, m := range req.Messages {
-			if m.Role != "user" {
-				continue
-			}
-			if name = firstTextContent(m.Content); name != "" {
-				break
-			}
+	if err := json.Unmarshal(body, &req); err != nil {
+		return fallbackSessionName(sessionRaw)
+	}
+	for _, m := range req.Messages {
+		if m.Role != "user" {
+			continue
+		}
+		if name := sessionNameFromText(contentTextBlocks(m.Content)); name != "" {
+			return name
 		}
 	}
-	if name == "" {
-		name = sessionRaw
-	}
-	name = strings.Join(strings.Fields(name), " ")
-	runes := []rune(name)
-	if len(runes) > sessionNameLimit {
-		return string(runes[:sessionNameLimit]) + "…"
-	}
-	if name == "" {
-		return "未命名会话"
-	}
-	return name
+	return fallbackSessionName(sessionRaw)
 }
 
-// firstTextContent 兼容 string 与 ChatGPT 数组两种 content 形态，提取首段 text。
-func firstTextContent(raw json.RawMessage) string {
+// contentTextBlocks 兼容 string 与 ChatGPT 数组两种 content 形态，收集全部文本块（join 换行）。
+func contentTextBlocks(raw json.RawMessage) string {
 	var s string
 	if err := json.Unmarshal(raw, &s); err == nil {
-		return strings.TrimSpace(s)
+		return s
 	}
 	var parts []struct {
 		Type string `json:"type"`
 		Text string `json:"text"`
 	}
-	if err := json.Unmarshal(raw, &parts); err == nil {
-		for _, p := range parts {
-			if p.Type == "text" || p.Type == "input_text" {
-				return strings.TrimSpace(p.Text)
+	if err := json.Unmarshal(raw, &parts); err != nil {
+		return ""
+	}
+	var texts []string
+	for _, p := range parts {
+		if p.Type == "text" || p.Type == "input_text" {
+			if strings.TrimSpace(p.Text) != "" {
+				texts = append(texts, p.Text)
 			}
 		}
 	}
-	return ""
+	return strings.Join(texts, "\n")
+}
+
+// xmlTextPart 按 XML 标签切分后的文本片段：tag 为标签名（空串=游离于标签外的正文）。
+type xmlTextPart struct {
+	tag  string
+	body string
+}
+
+// xmlSplit 把文本按 XML 标签切分为片段：标签块与其之间的游离文本分开，保持原文顺序。
+// Go regexp（RE2）不支持反向引用，这里手写配对扫描 <name…>…</name>。
+func xmlSplit(s string) []xmlTextPart {
+	var parts []xmlTextPart
+	i, n := 0, len(s)
+	appendFree := func(free string) {
+		if t := strings.TrimSpace(free); t != "" {
+			parts = append(parts, xmlTextPart{body: t})
+		}
+	}
+	for i < n {
+		lt := strings.IndexByte(s[i:], '<')
+		if lt < 0 {
+			break
+		}
+		lt += i
+		if lt > i {
+			appendFree(s[i:lt])
+		}
+		gt := strings.IndexByte(s[lt:], '>')
+		if gt < 0 { // 无闭合 >：剩余均为游离文本
+			appendFree(s[lt:])
+			return parts
+		}
+		hdr := strings.TrimSpace(s[lt+1 : lt+gt])
+		if hdr == "" || strings.HasPrefix(hdr, "/") || strings.HasPrefix(hdr, "!") || strings.HasPrefix(hdr, "?") {
+			// 闭合标签 / 注释 / 声明：按游离文本跳过本对 < >
+			parts = append(parts, xmlTextPart{body: strings.TrimSpace(s[lt : lt+gt+1])})
+			i = lt + gt + 1
+			continue
+		}
+		name := hdr
+		if sp := strings.IndexAny(hdr, " \t\r\n/"); sp >= 0 {
+			name = hdr[:sp]
+		}
+		if !isXmlName(name) {
+			parts = append(parts, xmlTextPart{body: strings.TrimSpace(s[lt : lt+gt+1])})
+			i = lt + gt + 1
+			continue
+		}
+		closeTag := "</" + name + ">"
+		ci := strings.Index(s[lt+gt+1:], closeTag)
+		if ci < 0 { // 无配对闭合：开始标签按游离文本处理
+			parts = append(parts, xmlTextPart{body: strings.TrimSpace(s[lt : lt+gt+1])})
+			i = lt + gt + 1
+			continue
+		}
+		ci += lt + gt + 1
+		if inner := strings.TrimSpace(s[lt+gt+1 : ci]); inner != "" {
+			parts = append(parts, xmlTextPart{tag: name, body: inner})
+		}
+		i = ci + len(closeTag)
+	}
+	if i < n {
+		appendFree(s[i:])
+	}
+	return parts
+}
+
+// isXmlName 是否为合法 XML 标签名（首字符字母/下划线，后续可含数字、连字符、点）。
+func isXmlName(s string) bool {
+	if s == "" {
+		return false
+	}
+	for k, c := range s {
+		switch {
+		case k == 0:
+			if !(c == '_' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z') {
+				return false
+			}
+		case c == '_' || c == '-' || c == '.' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// isUserTag 判断标签名是否为 user 语义（<user> / <user_input> / <user-message> 等）。
+func isUserTag(tag string) bool {
+	return tag == "user" || strings.HasPrefix(tag, "user_") || strings.HasPrefix(tag, "user-")
+}
+
+// sessionNameFromText 按三段规则选取会话名称；无候选返回空串。
+func sessionNameFromText(text string) string {
+	parts := xmlSplit(text)
+	if len(parts) == 0 {
+		return ""
+	}
+	// 1) 首个不在任何 XML 标签内的文本段
+	for _, p := range parts {
+		if p.tag == "" {
+			return normalizeSessionName(p.body)
+		}
+	}
+	// 2) 首个被 <user*> 标签包围的文本段
+	for _, p := range parts {
+		if isUserTag(p.tag) {
+			return normalizeSessionName(p.body)
+		}
+	}
+	// 3) 首条正文
+	return normalizeSessionName(parts[0].body)
+}
+
+// normalizeSessionName 折叠空白并截断到会话名称上限；空串返回空（由调用方兜底）。
+func normalizeSessionName(s string) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if s == "" {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) > sessionNameLimit {
+		return string(runes[:sessionNameLimit]) + "…"
+	}
+	return s
+}
+
+// fallbackSessionName 无有效 user 文本时的兜底名称。
+// 隐式会话种子（64 位 hex）对人类不可读 → 占位名；显式会话标识直接截断展示。
+func fallbackSessionName(sessionRaw string) string {
+	trimmed := strings.TrimSpace(sessionRaw)
+	if trimmed == "" {
+		return "未命名会话"
+	}
+	if len(trimmed) == 64 {
+		if _, err := hex.DecodeString(trimmed); err == nil {
+			return "未命名会话"
+		}
+	}
+	return normalizeSessionName(trimmed)
 }
 
 // implicitSessionSeed 无客户端 x-session-id 时，以请求体前几条消息（role+content）生成会话种子。
