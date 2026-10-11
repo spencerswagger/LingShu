@@ -408,6 +408,45 @@ func TestSessionRegistry_Expiry(t *testing.T) {
 	}
 }
 
+// 已关闭会话保留期：关闭后过期且在保留期内 → Sweep 保留（列表可见）；
+// 超过保留期 → Sweep 清理；未关闭过期 → 立即清理（与历史行为一致）。
+func TestSessionRegistry_ClosedRetention(t *testing.T) {
+	now := time.Now()
+	r := NewSessionRegistry(func() time.Time { return now })
+
+	// 会话 a：未关闭，5 秒后过期（应被清扫）
+	if ok, _ := r.Attach(&Session{SessionID: "a", ChannelKeyID: 1, InternalModelID: "i", ExpireAt: now.Add(5 * time.Second)}, 10); !ok {
+		t.Fatal("attach a 应成功")
+	}
+	// 会话 b：已关闭，5 秒后过期（保留期内 → 不清扫）
+	if ok, _ := r.Attach(&Session{SessionID: "b", ChannelKeyID: 1, InternalModelID: "i", ExpireAt: now.Add(5 * time.Second)}, 10); !ok {
+		t.Fatal("attach b 应成功")
+	}
+	if !r.Close("b") {
+		t.Fatal("close b 应成功")
+	}
+	// 会话 c：已关闭但在保留期内过期的会话，模拟保留期很长 → 不动（同 b）
+
+	now = now.Add(6 * time.Second) // 全部过期（b/c 仍在保留期内）
+	r.SweepNow()
+	if _, ok := r.Lookup("a"); ok {
+		t.Fatal("未关闭且过期会话 a 应被清理")
+	}
+	if _, ok := r.Lookup("b"); !ok {
+		t.Fatal("已关闭且保留期内过期会话 b 应保留")
+	}
+	if r.CountActive(1) != 0 {
+		t.Fatalf("已关闭会话不应占并发槽，got %d", r.CountActive(1))
+	}
+
+	// 超出保留期后再清扫：已关闭会话也被清理
+	now = now.Add(31 * 24 * time.Hour)
+	r.SweepNow()
+	if _, ok := r.Lookup("b"); ok {
+		t.Fatal("已关闭会话超过保留期后应被清理")
+	}
+}
+
 func TestSessionRegistry_MaxConcurrent(t *testing.T) {
 	now := time.Now()
 	r := NewSessionRegistry(func() time.Time { return now })

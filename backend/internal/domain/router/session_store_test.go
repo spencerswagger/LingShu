@@ -163,12 +163,12 @@ func TestSessionStoreLoadActive(t *testing.T) {
 	now := time.Now()
 
 	rows := sqlmock.NewRows([]string{"session_id", "user_id", "token_id", "model", "session_raw",
-		"channel_key_id", "internal_model_id", "created_at", "last_active", "expire_at", "name", "closed"}).
-		AddRow("abc", int64(1), int64(2), "qw-max", "sess", int64(7), "int1", now, now, now.Add(time.Hour), "今天的会话", false).
-		AddRow("def", int64(2), nil, "qw-max", "", int64(8), "int2", now, now, now.Add(2*time.Hour), "", true)
+		"channel_key_id", "internal_model_id", "created_at", "last_active", "expire_at", "name", "closed", "closed_at"}).
+		AddRow("abc", int64(1), int64(2), "qw-max", "sess", int64(7), "int1", now, now, now.Add(time.Hour), "今天的会话", false, nil).
+		AddRow("def", int64(2), nil, "qw-max", "", int64(8), "int2", now, now, now.Add(2*time.Hour), "", true, now)
 
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + sessionCols + ` FROM sessions WHERE expire_at > $1`)).
-		WithArgs(now).WillReturnRows(rows)
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT `+sessionCols+` FROM sessions WHERE expire_at > $1 OR (closed AND closed_at > $2)`)).
+		WithArgs(now, now.Add(-closedSessionRetention)).WillReturnRows(rows)
 
 	list, err := store.LoadActive(ctx, now)
 	if err != nil {
@@ -177,11 +177,11 @@ func TestSessionStoreLoadActive(t *testing.T) {
 	if len(list) != 2 {
 		t.Fatalf("expect 2 rows, got %d", len(list))
 	}
-	if list[0].SessionID != "abc" || list[0].TokenID != 2 || list[0].ChannelKeyID != 7 || list[0].InternalModelID != "int1" {
+	if list[0].SessionID != "abc" || list[0].TokenID != 2 || list[0].ChannelKeyID != 7 || list[0].InternalModelID != "int1" || list[0].Closed || list[0].ClosedAt != nil {
 		t.Fatalf("unexpected first session: %+v", list[0])
 	}
 	// D3：Session 无 ChannelID/KeyID() 回退，LoadActive 不产生误导性渠道值，会话维度只有 channel_key_id。
-	if list[1].SessionID != "def" || list[1].TokenID != 0 || list[1].ChannelKeyID != 8 || !list[1].Closed {
+	if list[1].SessionID != "def" || list[1].TokenID != 0 || list[1].ChannelKeyID != 8 || !list[1].Closed || list[1].ClosedAt == nil {
 		t.Fatalf("unexpected second session: %+v", list[1])
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {

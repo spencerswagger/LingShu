@@ -1107,8 +1107,9 @@ const implicitSessionMessages = 3
 // sessionNameLimit 会话可读名称最大长度（rune）。
 const sessionNameLimit = 40
 
-// sessionNameFor 生成会话可读名称：优先取首条 user 消息内容摘要；无消息时取原始标识。
-// 手动改名走独立接口，网关自动续期不会覆盖。
+// sessionNameFor 生成会话可读名称：优先取首条 user 消息中的真实提问（<user_input>）或
+// 命令摘要（<trae_command> 的 Command Name），再剥离 system-reminder 等注入取首段实质文本；
+// 无有效文本时回退原始标识。手动改名走独立接口，网关自动续期不会覆盖。
 func sessionNameFor(sessionRaw string, body []byte) string {
 	var req struct {
 		Messages []struct {
@@ -1116,49 +1117,177 @@ func sessionNameFor(sessionRaw string, body []byte) string {
 			Content json.RawMessage `json:"content"`
 		} `json:"messages"`
 	}
-	name := ""
-	if err := json.Unmarshal(body, &req); err == nil {
-		for _, m := range req.Messages {
-			if m.Role != "user" {
-				continue
-			}
-			if name = firstTextContent(m.Content); name != "" {
-				break
-			}
+	if err := json.Unmarshal(body, &req); err != nil {
+		return fallbackSessionName(sessionRaw)
+	}
+	for _, m := range req.Messages {
+		if m.Role != "user" {
+			continue
+		}
+		if name := readableUserText(m.Content); name != "" {
+			return name
 		}
 	}
-	if name == "" {
-		name = sessionRaw
-	}
-	name = strings.Join(strings.Fields(name), " ")
-	runes := []rune(name)
-	if len(runes) > sessionNameLimit {
-		return string(runes[:sessionNameLimit]) + "…"
-	}
-	if name == "" {
-		return "未命名会话"
-	}
-	return name
+	return fallbackSessionName(sessionRaw)
 }
 
-// firstTextContent 兼容 string 与 ChatGPT 数组两种 content 形态，提取首段 text。
-func firstTextContent(raw json.RawMessage) string {
+// fallbackSessionName 无有效 user 文本时的兜底名称。
+// 隐式会话种子（64 位 hex）对人类不可读 → 占位名；显式会话标识直接截断展示。
+func fallbackSessionName(sessionRaw string) string {
+	trimmed := strings.TrimSpace(sessionRaw)
+	if trimmed == "" {
+		return "未命名会话"
+	}
+	if len(trimmed) == 64 {
+		if _, err := hex.DecodeString(trimmed); err == nil {
+			return "未命名会话"
+		}
+	}
+	return normalizeName(trimmed)
+}
+
+// readableUserText 从 user 消息 content（string 或 ChatGPT 多段数组）提取可读名称：
+// 依次尝试 <user_input> 内真实提问 → <trae_command> 命令摘要 → 剥离注入后首段实质文本。
+func readableUserText(raw json.RawMessage) string {
+	texts := contentTextBlocks(raw)
+	if len(texts) == 0 {
+		return ""
+	}
+	full := strings.Join(texts, "\n")
+	if v := tagContent(full, "user_input"); v != "" {
+		return normalizeName(v)
+	}
+	if v := traeCommandName(full); v != "" {
+		return normalizeName(v)
+	}
+	if v := stripInjectedText(full); v != "" {
+		return normalizeName(v)
+	}
+	return ""
+}
+
+// contentTextBlocks 兼容 string 与 ChatGPT 数组两种 content 形态，收集全部文本块。
+func contentTextBlocks(raw json.RawMessage) []string {
 	var s string
 	if err := json.Unmarshal(raw, &s); err == nil {
-		return strings.TrimSpace(s)
+		if t := strings.TrimSpace(s); t != "" {
+			return []string{t}
+		}
+		return nil
 	}
 	var parts []struct {
 		Type string `json:"type"`
 		Text string `json:"text"`
 	}
-	if err := json.Unmarshal(raw, &parts); err == nil {
-		for _, p := range parts {
-			if p.Type == "text" || p.Type == "input_text" {
-				return strings.TrimSpace(p.Text)
+	if err := json.Unmarshal(raw, &parts); err != nil {
+		return nil
+	}
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p.Type == "text" || p.Type == "input_text" {
+			if t := strings.TrimSpace(p.Text); t != "" {
+				out = append(out, t)
 			}
 		}
 	}
-	return ""
+	return out
+}
+
+// tagContent 提取 `<name…>…</name>` 块内内容；标签缺失返回空串。
+func tagContent(s, name string) string {
+	open := "<" + name
+	i := strings.Index(s, open)
+	if i < 0 {
+		return ""
+	}
+	j := strings.Index(s[i:], ">")
+	if j < 0 {
+		return ""
+	}
+	start := i + j + 1
+	k := strings.Index(s[start:], "</"+name+">")
+	if k < 0 {
+		return ""
+	}
+	return strings.TrimSpace(s[start : start+k])
+}
+
+// traeCommandName 提取 <trae_command> 内 `--- Command Name: X ---` 的命令名并人类化
+// （取末段，如 trae-remote-official:browser → browser）。
+func traeCommandName(s string) string {
+	const marker = "--- Command Name: "
+	i := strings.Index(s, marker)
+	if i < 0 {
+		return ""
+	}
+	rest := s[i+len(marker):]
+	end := strings.Index(rest, "---")
+	if end < 0 {
+		return ""
+	}
+	raw := strings.TrimSpace(rest[:end])
+	if k := strings.LastIndex(raw, ":"); k >= 0 && k < len(raw)-1 {
+		return strings.TrimSpace(raw[k+1:])
+	}
+	return raw
+}
+
+// injectedTagNames agent 客户端注入的 XML 块标签，名称提取时整体剔除。
+var injectedTagNames = []string{"system-reminder", "system_reminder", "trae_command", "user_input", "tool_call", "tool_result", "device_reminder"}
+
+// stripInjectedText 剔除常见注入 XML 块，返回拼接后的实质文本（名称回退用）。
+// 仅移除已识别的注入块；普通对话文本即使以 "<" 开头（如 HTML/XML 提问）也原样保留，
+// 不受 Trae 特有注入格式影响。
+func stripInjectedText(s string) string {
+	for _, name := range injectedTagNames {
+		s = removeTagBlock(s, name)
+	}
+	var parts []string
+	for _, line := range strings.Split(s, "\n") {
+		t := strings.TrimSpace(line)
+		if t == "" || strings.HasPrefix(t, "---") {
+			continue
+		}
+		parts = append(parts, t)
+	}
+	return strings.Join(parts, " ")
+}
+
+// removeTagBlock 移除 `<name…>…</name>` 整块（含未闭合的开始标签降级处理）；无匹配返回原样。
+func removeTagBlock(s, name string) string {
+	open := "<" + name
+	for {
+		i := strings.Index(s, open)
+		if i < 0 {
+			return s
+		}
+		j := strings.Index(s[i:], ">")
+		if j < 0 {
+			return s
+		}
+		start := i + j + 1
+		closeTag := "</" + name + ">"
+		k := strings.Index(s[start:], closeTag)
+		if k < 0 {
+			// 无闭合标签：退化为去掉开始标签，避免吞掉后续正文。
+			return s[:i] + s[i+len(open):]
+		}
+		end := start + k + len(closeTag)
+		s = s[:i] + s[end:]
+	}
+}
+
+// normalizeName 折叠空白并截断到会话名称上限；空串返回空（由调用方兜底）。
+func normalizeName(s string) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if s == "" {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) > sessionNameLimit {
+		return string(runes[:sessionNameLimit]) + "…"
+	}
+	return s
 }
 
 // implicitSessionSeed 无客户端 x-session-id 时，以请求体前几条消息（role+content）生成会话种子。
