@@ -11,6 +11,10 @@ interface DecisionAttempt {
   channel_key_name?: string
   internal_model_id?: string
   reason?: string
+  // 成本标量 / 是否有效 / 时段系数（仅排查用，不参与计费）
+  cost?: number
+  cost_known?: boolean
+  route_time_coeff?: number
 }
 interface DecisionView {
   attempts?: DecisionAttempt[]
@@ -92,6 +96,18 @@ function fmtResult(v: unknown): string {
   if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') return String(v)
   return fmtJson(v)
 }
+
+// 候选成本标量展示：无效成本（单价缺失/全 0）显式标注「未知」。
+function fmtCost(row: DecisionAttempt): string {
+  if (!row.cost_known) return '未知'
+  const c = row.cost ?? 0
+  return Number.isInteger(c) ? c.toLocaleString() : c.toFixed(4)
+}
+
+function fmtCoeff(v: number | undefined): string {
+  if (v == null) return '-'
+  return `×${v}`
+}
 </script>
 
 <template>
@@ -162,6 +178,15 @@ function fmtResult(v: unknown): string {
             </el-table-column>
             <el-table-column v-if="showInternal" label="内部模型" min-width="140">
               <template #default="{ row }"><span class="mono">{{ row.internal_model_id || '-' }}</span></template>
+            </el-table-column>
+            <el-table-column v-if="showInternal" label="成本" width="120" align="right">
+              <template #default="{ row }">
+                <span v-if="row.cost_known" class="mono">{{ fmtCost(row) }}</span>
+                <span v-else class="cost-unknown">未知</span>
+              </template>
+            </el-table-column>
+            <el-table-column v-if="showInternal" label="时段系数" width="100" align="right">
+              <template #default="{ row }"><span class="mono">{{ fmtCoeff(row.route_time_coeff) }}</span></template>
             </el-table-column>
             <el-table-column label="原因" min-width="200">
               <template #default="{ row }">{{ row.reason || '-' }}</template>
@@ -246,5 +271,8 @@ function fmtResult(v: unknown): string {
 }
 .attempt-table {
   margin-top: 4px;
+}
+.cost-unknown {
+  color: var(--color-text-tertiary);
 }
 </style>

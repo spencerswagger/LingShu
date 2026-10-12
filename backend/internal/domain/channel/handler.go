@@ -72,7 +72,6 @@ type createChannelRequest struct {
 	BaseURL           string             `json:"BaseURL"`
 	TagIDs            idgen.IDs          `json:"TagIDs"`
 	Priority          int                `json:"Priority"`
-	Weight            int                `json:"Weight"`
 	RateLimit         *RateLimitConfig   `json:"RateLimit"`
 	HealthProbe       *HealthProbeConfig `json:"HealthProbe"`
 	Reliability       *ReliabilityConfig `json:"Reliability"`
@@ -118,7 +117,6 @@ func toInput(req *createChannelRequest) ChannelInput {
 		BaseURL:           req.BaseURL,
 		TagIDs:            []int64(req.TagIDs),
 		Priority:          req.Priority,
-		Weight:            req.Weight,
 		RateLimit:         req.RateLimit,
 		HealthProbe:       req.HealthProbe,
 		Reliability:       req.Reliability,

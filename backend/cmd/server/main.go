@@ -299,6 +299,8 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	// billing
 	billStore := billing.NewSqlStore(d)
 	billCfgProvider := billing.NewConfigProvider(billStore)
+	// sys_configs 写入后失效 ConfigProvider 的路由成本缓存（样值 + 全局时段），保证配置修改即时生效。
+	billStore.SetConfigWriteHook(billCfgProvider.InvalidateCostConfig)
 	billSvc := billing.NewService(billStore, billCfgProvider, creditSvc)
 	// 账单落库失败时的本地持久重试队列：DB 抖动不丢账单（billing_id 唯一索引保证重投幂等）。
 	billSvc.SetRetryQueue(billing.NewRetryQueue(cfg.Billing.RetryQueuePath, logr))
@@ -353,6 +355,9 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	sess := router.NewSessionRegistry(time.Now)
 	sess.SetStore(sessionStore)
 	routerEngine := router.NewEngine(modelSvc, cmStore, chMgr, sess)
+	// 新会话创建的成本比较依赖：样值用量（routing.cost_sample）+ 全局时段（billing.time_config）。
+	// billing.ConfigProvider 结构上满足 router.CostConfig，直接注入（router 不直接读库）。
+	routerEngine.SetCostConfig(billCfgProvider)
 
 	// 密钥删除联动会话清理：路由注册表经 KillByFilter(channel_key_id=keyID) 踢下线该密钥全部存活会话
 	//（内存+DB 投影）。装配在 routerEngine 之后（SessionRegistry 已就绪）。

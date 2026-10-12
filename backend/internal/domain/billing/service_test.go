@@ -74,12 +74,15 @@ type fakeConfig struct {
 	cnyRate float64
 	tiers   []TierRule
 	tc      TimeCoeffConfig
+	sample  Usage
 }
 
 func (f *fakeConfig) R() (int64, error)                    { return f.r, nil }
 func (f *fakeConfig) CnyRate() (float64, error)            { return f.cnyRate, nil }
 func (f *fakeConfig) ContextTiers() ([]TierRule, error)    { return f.tiers, nil }
 func (f *fakeConfig) TimeConfig() (TimeCoeffConfig, error) { return f.tc, nil }
+func (f *fakeConfig) SampleUsage() (Usage, error)          { return f.sample, nil }
+func (f *fakeConfig) InvalidateCostConfig()                {}
 
 // ---- helpers ----
 
@@ -769,6 +772,109 @@ func TestConfigProvider_CnyRate(t *testing.T) {
 				t.Fatalf("CnyRate=%v, want %v", got, c.want)
 			}
 		})
+	}
+}
+
+// TestConfigProvider_SampleUsage 验证 routing.cost_sample 的解析：正常样值、缺失键、非法 JSON。
+func TestConfigProvider_SampleUsage(t *testing.T) {
+	p := &defaultConfigProvider{src: staticSource{
+		cfgCostSample: []byte(`{"input":10000,"cache_read":9000,"output":1000,"reasoning":500}`),
+	}}
+	got, err := p.SampleUsage()
+	if err != nil {
+		t.Fatalf("SampleUsage err=%v", err)
+	}
+	want := Usage{Input: 10000, CacheRead: 9000, Output: 1000, Reasoning: 500}
+	if got != want {
+		t.Fatalf("SampleUsage=%+v, want %+v", got, want)
+	}
+
+	// 缺失键：返回错误（由路由层回落内置默认）。
+	if _, err := (&defaultConfigProvider{src: staticSource{}}).SampleUsage(); err == nil {
+		t.Fatalf("缺失配置键应返回错误")
+	}
+	// 非法 JSON：返回错误。
+	if _, err := (&defaultConfigProvider{src: staticSource{cfgCostSample: []byte(`not-json`)}}).SampleUsage(); err == nil {
+		t.Fatalf("非法 JSON 应返回错误")
+	}
+}
+
+// countingSource 记录每个 key 的读取次数，用于验证缓存命中不重复读库。
+type countingSource struct {
+	data  map[string][]byte
+	calls map[string]int
+}
+
+func (s *countingSource) GetConfig(_ context.Context, key string) ([]byte, error) {
+	s.calls[key]++
+	v, ok := s.data[key]
+	if !ok {
+		return nil, errors.New("系统配置不存在")
+	}
+	return v, nil
+}
+
+// TestConfigProvider_CostCache_ReadThroughAndInvalidate 验证 F-R3-1：
+// 读取命中缓存不重复读库；InvalidateCostConfig 后重新读库并拿到新值。
+func TestConfigProvider_CostCache_ReadThroughAndInvalidate(t *testing.T) {
+	src := &countingSource{
+		data: map[string][]byte{
+			cfgCostSample: []byte(`{"input":10000,"output":1000}`),
+			cfgTimeConfig: []byte(`{"timezone":"Asia/Shanghai","default":1}`),
+		},
+		calls: map[string]int{},
+	}
+	p := &defaultConfigProvider{src: src}
+
+	// 首次读取 → 各直查一次。
+	if _, err := p.SampleUsage(); err != nil {
+		t.Fatalf("SampleUsage: %v", err)
+	}
+	if _, err := p.TimeConfig(); err != nil {
+		t.Fatalf("TimeConfig: %v", err)
+	}
+	if src.calls[cfgCostSample] != 1 || src.calls[cfgTimeConfig] != 1 {
+		t.Fatalf("首次应各读 1 次，got sample=%d time=%d", src.calls[cfgCostSample], src.calls[cfgTimeConfig])
+	}
+
+	// 再次读取 → 命中缓存，不再读库。
+	if _, err := p.SampleUsage(); err != nil {
+		t.Fatalf("SampleUsage(cached): %v", err)
+	}
+	if _, err := p.TimeConfig(); err != nil {
+		t.Fatalf("TimeConfig(cached): %v", err)
+	}
+	if src.calls[cfgCostSample] != 1 || src.calls[cfgTimeConfig] != 1 {
+		t.Fatalf("命中缓存不应再读库，got sample=%d time=%d", src.calls[cfgCostSample], src.calls[cfgTimeConfig])
+	}
+
+	// 写入新值 + 失效 → 重读新值（配置修改即时生效）。
+	src.data[cfgCostSample] = []byte(`{"input":1,"output":1}`)
+	p.InvalidateCostConfig()
+	got, err := p.SampleUsage()
+	if err != nil {
+		t.Fatalf("SampleUsage(invalidated): %v", err)
+	}
+	if got.Input != 1 || got.Output != 1 {
+		t.Fatalf("失效后应读到新值，got %+v", got)
+	}
+	if src.calls[cfgCostSample] != 2 {
+		t.Fatalf("失效后应重读一次，got %d", src.calls[cfgCostSample])
+	}
+}
+
+// TestDefaultConfigProvider_ErrorNotCached 验证读取失败不写缓存（瞬时故障可自愈）。
+func TestDefaultConfigProvider_ErrorNotCached(t *testing.T) {
+	src := &countingSource{data: map[string][]byte{}, calls: map[string]int{}}
+	p := &defaultConfigProvider{src: src}
+	if _, err := p.SampleUsage(); err == nil {
+		t.Fatalf("缺失键应返回错误")
+	}
+	if _, err := p.SampleUsage(); err == nil {
+		t.Fatalf("缺失键应再次返回错误")
+	}
+	if src.calls[cfgCostSample] != 2 {
+		t.Fatalf("失败不应写缓存，应读 2 次，got %d", src.calls[cfgCostSample])
 	}
 }
 

@@ -34,6 +34,9 @@ var defaultSysConfigs = map[string]string{
   {"name":"高峰","start":"18:00","end":"22:00","coeff":1.5},
   {"name":"低谷","start":"22:00","end":"24:00","coeff":0.5}
 ],"date_overrides":[]}`,
+	// 路由成本比较样值用量：新会话创建时以该样值代入渠道成本单价求和比较「谁更便宜」
+	//（不参与实际计费）。五段（输入/缓存读/缓存写/输出/推理）均可配置，缺省缓存写 0。
+	"routing.cost_sample": `{"input":10000,"cache_read":9000,"cache_write":0,"output":1000,"reasoning":500}`,
 }
 
 // systemUser / systemToken 常量：健康探测开销的归属身份（成本记账），用户侧界面隐藏。

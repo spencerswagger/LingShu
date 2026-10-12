@@ -2,7 +2,7 @@
 import { onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { QuestionFilled } from '@element-plus/icons-vue'
-import { getBillingConfig, putBillingConfig } from '@/api/admin'
+import { getBillingConfig, putBillingConfig, type CostSample } from '@/api/admin'
 import ModelPricing from '@/components/ModelPricing.vue'
 import ErrorBubble from '@/components/ErrorBubble.vue'
 
@@ -19,6 +19,15 @@ const fallbackSaving = ref(false)
 const fallbackErr = ref<{ message: string; requestId: string }>({ message: '', requestId: '' })
 const fallbackModel = ref<Record<string, any>>({ TimeConfig: null, ContextTiers: null })
 
+// 路由成本比较样值（routing.cost_sample）：新会话创建时的可比成本样值用量，不参与实际计费。
+const costSample = ref<CostSample>({
+  input: 10000,
+  cache_read: 9000,
+  cache_write: 0,
+  output: 1000,
+  reasoning: 500,
+})
+
 async function load() {
   loading.value = true
   errInfo.value = { message: '', requestId: '' }
@@ -29,6 +38,16 @@ async function load() {
     if (c > 0) cnyRate.value = c
     const cv = Number(res.Data.CreditValue)
     if (!isNaN(cv)) creditValue.value = `1 积分 = ¥${cv}（R ÷ 1,000,000）`
+    const cs = res.Data.CostSample
+    if (cs) {
+      costSample.value = {
+        input: Number(cs.input) || 0,
+        cache_read: Number(cs.cache_read) || 0,
+        cache_write: Number(cs.cache_write) || 0,
+        output: Number(cs.output) || 0,
+        reasoning: Number(cs.reasoning) || 0,
+      }
+    }
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
   } finally {
@@ -56,6 +75,7 @@ async function onSave() {
         Periodic: [],
         Overrides: [],
       },
+      CostSample: costSample.value,
     })
     ElMessage.success('计费配置已更新')
   } catch (e: any) {
@@ -96,6 +116,7 @@ async function saveFallback() {
         Periodic: [],
         Overrides: [],
       },
+      CostSample: costSample.value,
     })
     ElMessage.success('全局时段/分档默认值已保存')
     fallbackOpen.value = false
@@ -171,6 +192,40 @@ async function saveFallback() {
           <el-button @click="openFallback">维护默认值</el-button>
           <el-tooltip
             :content="'配置时段系数与上下文分档的全局默认值。对外模型与渠道内部模型未单独配置时，按此默认计费。'"
+            placement="top"
+          >
+            <el-icon class="hint-icon"><QuestionFilled /></el-icon>
+          </el-tooltip>
+        </div>
+      </div>
+
+      <el-divider />
+
+      <div class="config-block">
+        <div class="block-title">路由成本比较样值</div>
+        <div class="block-desc">新会话创建时，以该样值用量代入各候选渠道的成本单价求和，比较「谁更便宜」来决定落点（同优先级内取最低成本）。仅用于路由选择，不参与实际计费。</div>
+
+        <div class="form-row">
+          <span class="label">输入 tokens</span>
+          <el-input-number v-model="costSample.input" :min="0" :step="1000" />
+        </div>
+        <div class="form-row">
+          <span class="label">缓存读 tokens</span>
+          <el-input-number v-model="costSample.cache_read" :min="0" :step="1000" />
+        </div>
+        <div class="form-row">
+          <span class="label">缓存写 tokens</span>
+          <el-input-number v-model="costSample.cache_write" :min="0" :step="1000" />
+        </div>
+        <div class="form-row">
+          <span class="label">输出 tokens</span>
+          <el-input-number v-model="costSample.output" :min="0" :step="100" />
+        </div>
+        <div class="form-row">
+          <span class="label">推理 tokens</span>
+          <el-input-number v-model="costSample.reasoning" :min="0" :step="100" />
+          <el-tooltip
+            :content="'以该样值代入渠道成本单价求和（输入按「输入-缓存读」计入），作为新会话落点的可比成本；再乘以当前时段系数。'"
             placement="top"
           >
             <el-icon class="hint-icon"><QuestionFilled /></el-icon>

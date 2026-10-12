@@ -94,7 +94,6 @@ type Channel struct {
 	TagIDs            idgen.IDs         `json:"TagIDs"`
 	BoundTags         []TagRef          `json:"BoundTags"`
 	Priority          int               `json:"Priority"`
-	Weight            int               `json:"Weight"`
 	State             State             `json:"State"`
 	RateLimit         RateLimitConfig   `json:"RateLimit"`
 	HealthProbe       HealthProbeConfig `json:"HealthProbe"`
@@ -145,7 +144,7 @@ type ProbeLog struct {
 }
 
 // channelCols 列出 channels 表查询时使用的全部列，保持各查询一致。
-const channelCols = `id, name, protocol, base_url, tags, priority, weight, state, rate_limit, health_probe, reliability, session_ttl_minutes, created_at, updated_at`
+const channelCols = `id, name, protocol, base_url, tags, priority, state, rate_limit, health_probe, reliability, session_ttl_minutes, created_at, updated_at`
 
 const eventCols = `id, channel_id, from_state, to_state, reason, created_at`
 
@@ -157,7 +156,7 @@ func scanChannel(row interface{ Scan(...any) error }) (*Channel, error) {
 	var tagsRaw, rlRaw, hpRaw, relRaw []byte
 	var state string
 	err := row.Scan(&c.ID, &c.Name, &c.Protocol, &c.BaseURL,
-		&tagsRaw, &c.Priority, &c.Weight, &state, &rlRaw, &hpRaw, &relRaw, &c.SessionTTLMinutes,
+		&tagsRaw, &c.Priority, &state, &rlRaw, &hpRaw, &relRaw, &c.SessionTTLMinutes,
 		&c.CreatedAt, &c.UpdatedAt)
 	if err != nil {
 		return nil, err
@@ -270,11 +269,11 @@ func (s *Store) Insert(ctx context.Context, c *Channel) (*Channel, error) {
 		c.ID = idgen.New()
 	}
 	row := s.db.QueryRowContext(ctx,
-		`INSERT INTO channels(id, name, protocol, base_url, tags, priority, weight, state, rate_limit, health_probe, reliability, session_ttl_minutes)
-		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+		`INSERT INTO channels(id, name, protocol, base_url, tags, priority, state, rate_limit, health_probe, reliability, session_ttl_minutes)
+		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
 		 RETURNING `+channelCols,
 		c.ID, c.Name, c.Protocol, c.BaseURL, marshalJSONB(c.Tags),
-		c.Priority, c.Weight, string(c.State), marshalJSONB(c.RateLimit), marshalJSONB(c.HealthProbe),
+		c.Priority, string(c.State), marshalJSONB(c.RateLimit), marshalJSONB(c.HealthProbe),
 		marshalJSONB(c.Reliability), c.SessionTTLMinutes)
 	created, err := scanChannel(row)
 	if err != nil {
@@ -291,11 +290,11 @@ func (s *Store) Insert(ctx context.Context, c *Channel) (*Channel, error) {
 func (s *Store) Update(ctx context.Context, c *Channel) error {
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE channels SET name=$1, protocol=$2, base_url=$3,
-		        tags=$4, priority=$5, weight=$6, state=$7, rate_limit=$8, health_probe=$9,
-		        reliability=$10, session_ttl_minutes=$11, updated_at=now()
-		 WHERE id=$12`,
+		        tags=$4, priority=$5, state=$6, rate_limit=$7, health_probe=$8,
+		        reliability=$9, session_ttl_minutes=$10, updated_at=now()
+		 WHERE id=$11`,
 		c.Name, c.Protocol, c.BaseURL, marshalJSONB(c.Tags),
-		c.Priority, c.Weight, string(c.State), marshalJSONB(c.RateLimit), marshalJSONB(c.HealthProbe),
+		c.Priority, string(c.State), marshalJSONB(c.RateLimit), marshalJSONB(c.HealthProbe),
 		marshalJSONB(c.Reliability), c.SessionTTLMinutes, c.ID)
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -542,11 +541,11 @@ func (s *Store) InsertWithTags(ctx context.Context, c *Channel, tagIDs []int64) 
 		c.ID = idgen.New()
 	}
 	row := tx.QueryRowContext(ctx,
-		`INSERT INTO channels(id, name, protocol, base_url, tags, priority, weight, state, rate_limit, health_probe, reliability, session_ttl_minutes)
-		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+		`INSERT INTO channels(id, name, protocol, base_url, tags, priority, state, rate_limit, health_probe, reliability, session_ttl_minutes)
+		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
 		 RETURNING `+channelCols,
 		c.ID, c.Name, c.Protocol, c.BaseURL, marshalJSONB(c.Tags),
-		c.Priority, c.Weight, string(c.State), marshalJSONB(c.RateLimit), marshalJSONB(c.HealthProbe),
+		c.Priority, string(c.State), marshalJSONB(c.RateLimit), marshalJSONB(c.HealthProbe),
 		marshalJSONB(c.Reliability), c.SessionTTLMinutes)
 	created, err := scanChannel(row)
 	if err != nil {
@@ -574,11 +573,11 @@ func (s *Store) UpdateWithTags(ctx context.Context, c *Channel, tagIDs []int64) 
 	defer tx.Rollback()
 	res, err := tx.ExecContext(ctx,
 		`UPDATE channels SET name=$1, protocol=$2, base_url=$3,
-		        tags=$4, priority=$5, weight=$6, state=$7, rate_limit=$8, health_probe=$9,
-		        reliability=$10, session_ttl_minutes=$11, updated_at=now()
-		 WHERE id=$12 AND deleted_at IS NULL`,
+		        tags=$4, priority=$5, state=$6, rate_limit=$7, health_probe=$8,
+		        reliability=$9, session_ttl_minutes=$10, updated_at=now()
+		 WHERE id=$11 AND deleted_at IS NULL`,
 		c.Name, c.Protocol, c.BaseURL, marshalJSONB(c.Tags),
-		c.Priority, c.Weight, string(c.State), marshalJSONB(c.RateLimit), marshalJSONB(c.HealthProbe),
+		c.Priority, string(c.State), marshalJSONB(c.RateLimit), marshalJSONB(c.HealthProbe),
 		marshalJSONB(c.Reliability), c.SessionTTLMinutes, c.ID)
 	if err != nil {
 		var pgErr *pgconn.PgError
