@@ -184,7 +184,6 @@ type ChannelView struct {
 	Tags          map[string]string `json:"Tags"`
 	BoundTags     []TagRef          `json:"BoundTags"`
 	Priority      int               `json:"Priority"`
-	Weight        int               `json:"Weight"`
 	State         State             `json:"State"`
 	LastErr       string            `json:"LastErr,omitempty"`
 	LastProbe     *time.Time        `json:"LastProbe,omitempty"`
@@ -914,7 +913,6 @@ func (m *Manager) Snapshot() []ChannelView {
 			Tags:          c.Tags,
 			BoundTags:     btCp,
 			Priority:      c.Priority,
-			Weight:        c.Weight,
 			State:         rt.Machine.State(),
 			LastErr:       rt.LastErr,
 			LastProbe:     lp,

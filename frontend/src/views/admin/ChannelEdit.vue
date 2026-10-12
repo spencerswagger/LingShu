@@ -61,7 +61,6 @@ const form = reactive({
   base_url: '',
   tag_ids: [] as string[],
   priority: 100,
-  weight: 1,
   session_ttl_minutes: 60,
   rpm: 0,
   tpm: 0,
@@ -196,7 +195,6 @@ async function load() {
     form.base_url = row.BaseURL
     form.tag_ids = row.TagIDs || []
     form.priority = row.Priority
-    form.weight = row.Weight || 1
     form.session_ttl_minutes = row.SessionTTLMinutes || 60
     form.rpm = row.RateLimit?.RPM || 0
     setTpmDisplay(row.RateLimit?.TPM || 0)
@@ -377,7 +375,6 @@ async function onSubmit() {
       BaseURL: form.base_url.trim(),
       TagIDs: form.tag_ids,
       Priority: form.priority,
-      Weight: Number(form.weight) || 1,
       SessionTTLMinutes: Number(form.session_ttl_minutes) || 60,
       RateLimit: {
         RPM: Number(form.rpm),
@@ -442,11 +439,7 @@ async function onSubmit() {
             </el-form-item>
             <el-form-item label="优先级">
               <el-input-number v-model="form.priority" :min="1" :max="999" style="width: 100%" />
-              <div class="hint">优先级数字越大越先被路由；同一优先级的渠道按权重比例分配流量（权重越大流量越多）；已有会话固定路由到原渠道</div>
-            </el-form-item>
-            <el-form-item label="权重">
-              <el-input-number v-model="form.weight" :min="1" :max="10000" style="width: 100%" />
-              <div class="hint">仅在同一优先级内生效，权重越大被选中的概率越高；默认 1 表示等权</div>
+              <div class="hint">优先级数字越大越先被路由；同一优先级的渠道中，新会话选当前成本最低者（成本相同则存活会话更少者优先）；已有会话固定路由到原渠道</div>
             </el-form-item>
           </el-form>
           <div class="key-section">

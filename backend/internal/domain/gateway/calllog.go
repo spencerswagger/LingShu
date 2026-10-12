@@ -309,8 +309,9 @@ type preCharge struct {
 // callLogDecision 组装本次请求的决策轨迹（供成功/失败路径 writeCallLog 使用）：
 // attempts 为「到当前候选为止」已收集的全部候选结果 + 当前候选的最终结果（result 作为该候选理由），
 // 前端请求详情页据此展示候选渠道表与终态原因（success/上游失败等）。
+// cur 为当前候选的路由结果：除渠道/密钥/模型标识外，还携带成本标量/时段系数（OQ-3 排查用）。
 // 渠道/密钥名由运行时按 ID 回查（渠道 ID 为雪花值，直接展示不具可读性）。
-func (g *Gateway) callLogDecision(attempts []map[string]any, result string, pc preCharge, curID, curKeyID int64, curModel string) map[string]any {
+func (g *Gateway) callLogDecision(attempts []map[string]any, result string, pc preCharge, cur *router.RouteResult) map[string]any {
 	cloned := make([]map[string]any, 0, len(attempts)+1)
 	for i := range attempts {
 		m := make(map[string]any, len(attempts[i]))
@@ -319,15 +320,19 @@ func (g *Gateway) callLogDecision(attempts []map[string]any, result string, pc p
 		}
 		cloned = append(cloned, m)
 	}
-	chName, keyName := g.channelAndKeyNames(curID, curKeyID)
+	chName, keyName := g.channelAndKeyNames(cur.ChannelID, cur.ChannelKeyID)
 	cloned = append(cloned, map[string]any{
 		"order":             len(cloned) + 1,
-		"channel_id":        strconv.FormatInt(curID, 10),
+		"channel_id":        strconv.FormatInt(cur.ChannelID, 10),
 		"channel_name":      chName,
-		"channel_key_id":    strconv.FormatInt(curKeyID, 10),
+		"channel_key_id":    strconv.FormatInt(cur.ChannelKeyID, 10),
 		"channel_key_name":  keyName,
-		"internal_model_id": curModel,
+		"internal_model_id": cur.InternalModelID,
 		"reason":            result,
+		// 成本标量 / 是否有效 / 时段系数：仅排查用，不参与计费（OQ-3）。
+		"cost":             cur.Cost,
+		"cost_known":       cur.CostKnown,
+		"route_time_coeff": cur.TimeCoeff,
 	})
 	return map[string]any{
 		"attempts":         cloned,

@@ -173,7 +173,7 @@ func (s *SqlStore) DailyUsage(ctx context.Context, userID int64, days int, model
 	return out, nil
 }
 
-// UpsertConfig 写入/更新一条 sys_configs 配置，立即生效（无缓存）。
+// UpsertConfig 写入/更新一条 sys_configs 配置，写入成功后触发写钩子（失效配置缓存），立即生效。
 func (s *SqlStore) UpsertConfig(ctx context.Context, key string, value []byte, updatedBy int64) error {
 	var updater any
 	if updatedBy != 0 {
@@ -186,6 +186,9 @@ func (s *SqlStore) UpsertConfig(ctx context.Context, key string, value []byte, u
 		key, value, updater)
 	if err != nil {
 		return fmt.Errorf("upsert config %s: %w", key, err)
+	}
+	if s.onConfigWrite != nil {
+		s.onConfigWrite()
 	}
 	return nil
 }

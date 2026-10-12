@@ -541,6 +541,11 @@ func (h *Admin) HandleGetBillingConfig(w http.ResponseWriter, r *http.Request) {
 		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "读取计费配置失败")
 		return
 	}
+	// 路由成本比较样值（routing.cost_sample）：旧库未初始化时回退内置默认，保证前端可展示与保存。
+	sampleRaw, err := h.billing.GetConfig(ctx, "routing.cost_sample")
+	if err != nil {
+		sampleRaw = json.RawMessage(`{"input":10000,"cache_read":9000,"cache_write":0,"output":1000,"reasoning":500}`)
+	}
 	// credit_value 由 r 派生（R / 1e6，每积分对应人民币元），不落库，解析失败时回退 0。
 	creditV, _ := creditValueFromRaw(rRaw)
 	creditRaw, _ := json.Marshal(creditV)
@@ -551,6 +556,7 @@ func (h *Admin) HandleGetBillingConfig(w http.ResponseWriter, r *http.Request) {
 		"CreditValue":  creditRaw,
 		"ContextTiers": tiersRaw,
 		"TimeConfig":   timeRaw,
+		"CostSample":   sampleRaw,
 	})
 }
 
@@ -561,6 +567,7 @@ func (h *Admin) HandlePutBillingConfig(w http.ResponseWriter, r *http.Request) {
 		CnyRate      json.RawMessage `json:"CnyRate"`
 		ContextTiers json.RawMessage `json:"ContextTiers"`
 		TimeConfig   json.RawMessage `json:"TimeConfig"`
+		CostSample   json.RawMessage `json:"CostSample"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "请求体格式错误")
@@ -580,6 +587,10 @@ func (h *Admin) HandlePutBillingConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	if !isJSONObject(req.TimeConfig) {
 		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "time_config 必须是 JSON 对象")
+		return
+	}
+	if len(req.CostSample) > 0 && !validCostSample(req.CostSample) {
+		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "cost_sample 必须是各段非负的 JSON 对象")
 		return
 	}
 	operator, _ := h.userIDFrom(r.Context())
@@ -606,7 +617,30 @@ func (h *Admin) HandlePutBillingConfig(w http.ResponseWriter, r *http.Request) {
 		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "更新计费配置失败")
 		return
 	}
+	if len(req.CostSample) > 0 {
+		if err := h.billing.UpsertConfig(ctx, "routing.cost_sample", req.CostSample, operator); err != nil {
+			resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "更新计费配置失败")
+			return
+		}
+	}
 	resp.OK(w, r, map[string]any{"Affected": 1})
+}
+
+// validCostSample 校验路由成本比较样值：JSON 对象且各段为非负数值（缺省段按 0 处理）。
+func validCostSample(b []byte) bool {
+	if !isJSONObject(b) {
+		return false
+	}
+	var m map[string]float64
+	if err := json.Unmarshal(b, &m); err != nil {
+		return false
+	}
+	for _, v := range m {
+		if v < 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func validPositiveNumber(b []byte) bool {
