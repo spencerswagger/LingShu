@@ -2,11 +2,13 @@ package console
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,6 +16,9 @@ import (
 
 	"github.com/team/llmgateway/internal/domain/billing"
 )
+
+// testUserIDFrom 供写接口测试注入的操作者身份（固定用户 1）。
+func testUserIDFrom(context.Context) (int64, bool) { return 1, true }
 
 func TestCreditValueFromRaw(t *testing.T) {
 	cases := []struct {
@@ -236,5 +241,191 @@ func TestStatsRangeFromQuery_ShanghaiDayBoundary(t *testing.T) {
 		"To":   {"2026-09-01T00:00:00+08:00"},
 	}, now); err == nil {
 		t.Fatalf("from 晚于 to 应报错")
+	}
+}
+
+// expectConfigRow 登记一次 sys_configs 单键读取的期望返回（val=nil 表示返回 sql.ErrNoRows）。
+func expectConfigRow(mock sqlmock.Sqlmock, key string, val []byte) {
+	if val == nil {
+		mock.ExpectQuery(regexp.QuoteMeta(`SELECT value FROM sys_configs WHERE key=$1`)).
+			WithArgs(key).WillReturnError(sql.ErrNoRows)
+		return
+	}
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT value FROM sys_configs WHERE key=$1`)).
+		WithArgs(key).
+		WillReturnRows(sqlmock.NewRows([]string{"value"}).AddRow(val))
+}
+
+// costSamplePayload 从 GET /admin/configs/billing 响应中提取 CostSample 并解析。
+func costSamplePayload(t *testing.T, rec *httptest.ResponseRecorder) (input, cacheRead, output, reasoning int64) {
+	t.Helper()
+	var body struct {
+		Data map[string]json.RawMessage `json:"Data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	raw, ok := body.Data["CostSample"]
+	if !ok {
+		t.Fatalf("响应缺少 CostSample 键: %s", rec.Body.String())
+	}
+	var cs struct {
+		Input     int64 `json:"input"`
+		CacheRead int64 `json:"cache_read"`
+		Output    int64 `json:"output"`
+		Reasoning int64 `json:"reasoning"`
+	}
+	if err := json.Unmarshal(raw, &cs); err != nil {
+		t.Fatalf("unmarshal CostSample: %v", err)
+	}
+	return cs.Input, cs.CacheRead, cs.Output, cs.Reasoning
+}
+
+// TestHandleGetBillingConfig_IncludesCostSample 断言配置读取接口返回路由成本比较样值。
+func TestHandleGetBillingConfig_IncludesCostSample(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+	admin := NewAdmin(db, billing.NewSqlStore(db), nil, nil)
+
+	expectConfigRow(mock, "billing.r", []byte(`10000`))
+	expectConfigRow(mock, "billing.cny_rate", []byte(`6.8`))
+	expectConfigRow(mock, "billing.context_tiers", []byte(`[]`))
+	expectConfigRow(mock, "billing.time_config", []byte(`{"timezone":"Asia/Shanghai","default_coeff":1.0}`))
+	expectConfigRow(mock, "routing.cost_sample",
+		[]byte(`{"input":10000,"cache_read":9000,"output":1000,"reasoning":500}`))
+
+	rec := httptest.NewRecorder()
+	admin.HandleGetBillingConfig(rec, httptest.NewRequest(http.MethodGet, "/api/v1/admin/configs/billing", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	in, cr, out, re := costSamplePayload(t, rec)
+	if in != 10000 || cr != 9000 || out != 1000 || re != 500 {
+		t.Fatalf("CostSample=%d/%d/%d/%d, want 10000/9000/1000/500", in, cr, out, re)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("mock expectations: %v", err)
+	}
+}
+
+// TestHandleGetBillingConfig_CostSampleFallback 断言样值配置缺失时回退内置默认值。
+func TestHandleGetBillingConfig_CostSampleFallback(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+	admin := NewAdmin(db, billing.NewSqlStore(db), nil, nil)
+
+	expectConfigRow(mock, "billing.r", []byte(`10000`))
+	expectConfigRow(mock, "billing.cny_rate", []byte(`6.8`))
+	expectConfigRow(mock, "billing.context_tiers", []byte(`[]`))
+	expectConfigRow(mock, "billing.time_config", []byte(`{"timezone":"Asia/Shanghai","default_coeff":1.0}`))
+	expectConfigRow(mock, "routing.cost_sample", nil) // 缺失 → 回退内置默认
+
+	rec := httptest.NewRecorder()
+	admin.HandleGetBillingConfig(rec, httptest.NewRequest(http.MethodGet, "/api/v1/admin/configs/billing", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	in, cr, out, re := costSamplePayload(t, rec)
+	if in != 10000 || cr != 9000 || out != 1000 || re != 500 {
+		t.Fatalf("回退样值=%d/%d/%d/%d, want 10000/9000/1000/500", in, cr, out, re)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("mock expectations: %v", err)
+	}
+}
+
+// TestHandlePutBillingConfig_CostSampleRoundTrip 断言样值随配置写入落库（key=routing.cost_sample）。
+func TestHandlePutBillingConfig_CostSampleRoundTrip(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+	admin := NewAdmin(db, billing.NewSqlStore(db), nil, testUserIDFrom)
+
+	// 写入顺序与实现一致：r → cny_rate → context_tiers → time_config → routing.cost_sample。
+	expectUpsert := func(key string) {
+		mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO sys_configs(key, value, updated_by)`)).
+			WithArgs(key, sqlmock.AnyArg(), sqlmock.AnyArg()).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+	}
+	expectUpsert("billing.r")
+	expectUpsert("billing.cny_rate")
+	expectUpsert("billing.context_tiers")
+	expectUpsert("billing.time_config")
+	expectUpsert("routing.cost_sample")
+
+	body := `{"R":10000,"CnyRate":6.8,"ContextTiers":[],` +
+		`"TimeConfig":{"Timezone":"Asia/Shanghai","Default":1},` +
+		`"CostSample":{"input":12345,"cache_read":6000,"output":2000,"reasoning":300}}`
+	rec := httptest.NewRecorder()
+	admin.HandlePutBillingConfig(rec, httptest.NewRequest(http.MethodPut, "/api/v1/admin/configs/billing", strings.NewReader(body)))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("mock expectations: %v", err)
+	}
+}
+
+// TestHandlePutBillingConfig_CostSampleInvalid 断言非法样值（负数/非对象）返回 400 且不落库。
+func TestHandlePutBillingConfig_CostSampleInvalid(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"负数", `{"R":10000,"ContextTiers":[],"TimeConfig":{"Timezone":"Asia/Shanghai","Default":1},"CostSample":{"input":-1}}`},
+		{"非对象", `{"R":10000,"ContextTiers":[],"TimeConfig":{"Timezone":"Asia/Shanghai","Default":1},"CostSample":123}`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatalf("sqlmock: %v", err)
+			}
+			defer db.Close()
+			admin := NewAdmin(db, billing.NewSqlStore(db), nil, testUserIDFrom)
+
+			rec := httptest.NewRecorder()
+			admin.HandlePutBillingConfig(rec, httptest.NewRequest(http.MethodPut, "/api/v1/admin/configs/billing", strings.NewReader(c.body)))
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d, want 400; body=%s", rec.Code, rec.Body.String())
+			}
+			// 校验先于任何写入：不应产生 Exec。
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatalf("非法样值不应触发写库: %v", err)
+			}
+		})
+	}
+}
+
+// TestValidCostSample 覆盖样值校验的纯函数分支。
+func TestValidCostSample(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want bool
+	}{
+		{`{"input":10000,"cache_read":9000,"output":1000,"reasoning":500}`, true},
+		{`{"input":0}`, true},
+		{`{}`, true},
+		{`{"input":-1}`, false},
+		{`123`, false},
+		{`[1,2]`, false},
+		{`not-json`, false},
+	}
+	for _, c := range cases {
+		if got := validCostSample([]byte(c.raw)); got != c.want {
+			t.Fatalf("validCostSample(%s)=%v, want %v", c.raw, got, c.want)
+		}
 	}
 }

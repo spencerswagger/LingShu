@@ -43,13 +43,13 @@ const (
 )
 
 // ChannelInput 创建/更新渠道的可写字段。凭据由 channel_keys（密钥管理）承载，渠道层不再持有。
+// 权重已废弃并删除数据库列（0005 迁移）：同优先级内改由「成本最低 + 存活会话数」决定。
 type ChannelInput struct {
 	Name              string
 	Protocol          string
 	BaseURL           string
 	TagIDs            []int64
 	Priority          int
-	Weight            int
 	RateLimit         *RateLimitConfig
 	HealthProbe       *HealthProbeConfig
 	Reliability       *ReliabilityConfig
@@ -107,7 +107,6 @@ func validateBase(name, baseURL, protocol string) error {
 // fillDefaults 补齐默认值：priority=100、state=NORMAL、rate_limit/health_probe/reliability 默认。
 func fillDefaults(c *Channel, in ChannelInput) {
 	c.Priority = 100
-	c.Weight = 1
 	c.State = StateNormal
 	c.SessionTTLMinutes = DefaultSessionTTLMinutes
 	c.RateLimit = DefaultRateLimit()
@@ -115,9 +114,6 @@ func fillDefaults(c *Channel, in ChannelInput) {
 	c.Reliability = DefaultReliability()
 	if in.Priority > 0 {
 		c.Priority = in.Priority
-	}
-	if in.Weight > 0 {
-		c.Weight = in.Weight
 	}
 	if in.SessionTTLMinutes > 0 {
 		c.SessionTTLMinutes = in.SessionTTLMinutes
@@ -231,11 +227,6 @@ func (s *Service) UpdateChannel(ctx context.Context, id int64, in ChannelInput) 
 		c.Priority = in.Priority
 	} else {
 		c.Priority = existing.Priority
-	}
-	if in.Weight > 0 {
-		c.Weight = in.Weight
-	} else {
-		c.Weight = existing.Weight
 	}
 
 	if err := s.store.UpdateWithTags(ctx, c, in.TagIDs); err != nil {

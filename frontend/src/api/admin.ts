@@ -174,7 +174,6 @@ export interface AdminChannel {
   TagIDs: string[]
   BoundTags: { ID: string; Name: string; KV: Record<string, string> }[]
   Priority: number
-  Weight: number
   State: string // NORMAL | DRAIN | DISABLED
   RateLimit: RateLimitConfig
   HealthProbe: HealthProbeConfig
@@ -191,7 +190,6 @@ export interface ChannelInput {
   BaseURL: string
   TagIDs?: string[]
   Priority?: number
-  Weight?: number
   RateLimit?: RateLimitConfig
   HealthProbe?: HealthProbeConfig
   Reliability?: ReliabilityConfig
@@ -672,12 +670,20 @@ export interface TimeCoeffConfig {
   Periodic: Segment[]
   Overrides: DateOverride[]
 }
+export interface CostSample {
+  input: number
+  cache_read: number
+  cache_write: number
+  output: number
+  reasoning: number
+}
 export interface BillingConfigData {
   R: number | string
   CNYRate: number | string
   CreditValue: number | string // 积分价值 V=R/1e6（每积分对应人民币元），只读展示
   ContextTiers: ContextTier[]
   TimeConfig: TimeCoeffConfig
+  CostSample: CostSample // 路由成本比较样值用量（routing.cost_sample）
 }
 export function getBillingConfig() {
   return http.get<BillingConfigData, ApiRes<BillingConfigData>>('/admin/configs/billing')
@@ -687,6 +693,7 @@ export function putBillingConfig(payload: {
   CnyRate?: number | string
   ContextTiers: ContextTier[]
   TimeConfig: TimeCoeffConfig
+  CostSample?: CostSample
 }) {
   return http.put<{ Affected: number }, ApiRes<{ Affected: number }>>('/admin/configs/billing', payload)
 }

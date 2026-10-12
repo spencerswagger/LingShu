@@ -10,6 +10,7 @@ import (
 	"math/rand"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/team/llmgateway/internal/pkg/dbx"
@@ -34,6 +35,7 @@ const (
 	cfgTiers      = "billing.context_tiers"
 	cfgTimeConfig = "billing.time_config"
 	cfgCnyRate    = "billing.cny_rate"
+	cfgCostSample = "routing.cost_sample"
 )
 
 // Store 提供 billing_records 的数据访问。由基于 *sql.DB 的 SqlStore 实现。
@@ -533,17 +535,39 @@ type ConfigProvider interface {
 	CnyRate() (float64, error)
 	ContextTiers() ([]TierRule, error)
 	TimeConfig() (TimeCoeffConfig, error)
+	// SampleUsage 读取路由成本比较样值用量（routing.cost_sample）。
+	SampleUsage() (Usage, error)
+	// InvalidateCostConfig 清空路由成本相关的内存缓存（样值 + 全局时段）。
+	// 由装配层在 sys_configs 写入后调用（见 SqlStore.SetConfigWriteHook），保证配置修改即时生效。
+	InvalidateCostConfig()
 }
 
 // defaultConfigProvider 基于 sys_configs 的配置提供方。
-// Task 8 控制台改动后经 Store 更新即可（本阶段直查，无内存缓存）。
+//
+// 缓存：TimeConfig（全局时段）与 SampleUsage（路由成本样值）会缓存在内存中，
+// 避免新会话路由热路径每次直查 2 次 sys_configs（F-R3-1，NFR-1）。
+// 失效仅由装配层在 sys_configs 写入后经 InvalidateCostConfig 触发；
+// 其余配置（R/汇率/分档）不缓存，保持原语义。
+// 读取失败不写入缓存（瞬时故障可自愈）。
 type defaultConfigProvider struct {
 	src configSource
+
+	mu      sync.RWMutex
+	sample  *Usage           // 缓存的路由成本样值（nil=未缓存）
+	timeCfg *TimeCoeffConfig // 缓存的全局时段配置（nil=未缓存）
 }
 
 // NewConfigProvider 创建基于 sys_configs 的配置提供方。
 func NewConfigProvider(src configSource) ConfigProvider {
 	return &defaultConfigProvider{src: src}
+}
+
+// InvalidateCostConfig 清空路由成本样值与全局时段缓存。
+func (p *defaultConfigProvider) InvalidateCostConfig() {
+	p.mu.Lock()
+	p.sample = nil
+	p.timeCfg = nil
+	p.mu.Unlock()
 }
 
 // R 读取 billing.r（积分换算系数）。兼容数字（10000）与字符串（"10000"）两种 JSON 存储。
@@ -611,8 +635,15 @@ func (p *defaultConfigProvider) ContextTiers() ([]TierRule, error) {
 	return tiers, nil
 }
 
-// TimeConfig 读取 billing.time_config。
+// TimeConfig 读取 billing.time_config（带内存缓存，见 defaultConfigProvider 缓存说明）。
 func (p *defaultConfigProvider) TimeConfig() (TimeCoeffConfig, error) {
+	p.mu.RLock()
+	cached := p.timeCfg
+	p.mu.RUnlock()
+	if cached != nil {
+		return *cached, nil
+	}
+
 	raw, err := p.src.GetConfig(context.Background(), cfgTimeConfig)
 	if err != nil {
 		return TimeCoeffConfig{}, err
@@ -621,7 +652,37 @@ func (p *defaultConfigProvider) TimeConfig() (TimeCoeffConfig, error) {
 	if err := json.Unmarshal(raw, &tc); err != nil {
 		return TimeCoeffConfig{}, fmt.Errorf("解析 time_config: %w", err)
 	}
+
+	p.mu.Lock()
+	p.timeCfg = &tc
+	p.mu.Unlock()
 	return tc, nil
+}
+
+// SampleUsage 读取 routing.cost_sample（路由成本比较样值用量，带内存缓存）。
+// JSON 键与 Usage 一致（input/output/cache_read/cache_write/reasoning）；未提供的段按 0 处理
+// （如 cache_write 缺省即 0）。该值仅用于新会话创建时的成本比较，不参与实际计费。
+func (p *defaultConfigProvider) SampleUsage() (Usage, error) {
+	p.mu.RLock()
+	cached := p.sample
+	p.mu.RUnlock()
+	if cached != nil {
+		return *cached, nil
+	}
+
+	raw, err := p.src.GetConfig(context.Background(), cfgCostSample)
+	if err != nil {
+		return Usage{}, err
+	}
+	var u Usage
+	if err := json.Unmarshal(raw, &u); err != nil {
+		return Usage{}, fmt.Errorf("解析 routing.cost_sample: %w", err)
+	}
+
+	p.mu.Lock()
+	p.sample = &u
+	p.mu.Unlock()
+	return u, nil
 }
 
 // ===== SqlStore（billing_records + sys_configs）=====
@@ -629,11 +690,21 @@ func (p *defaultConfigProvider) TimeConfig() (TimeCoeffConfig, error) {
 // SqlStore 是存储层实现，同时满足 Store（billing_records）与 configSource（sys_configs）。
 type SqlStore struct {
 	db *sql.DB
+
+	// onConfigWrite 在 sys_configs 写入成功后触发（用于失效 ConfigProvider 缓存）。
+	// 由装配层经 SetConfigWriteHook 注入；为空时表示无缓存需要失效。
+	onConfigWrite func()
 }
 
 // NewSqlStore 创建基于 *sql.DB 的存储实现。
 func NewSqlStore(db *sql.DB) *SqlStore {
 	return &SqlStore{db: db}
+}
+
+// SetConfigWriteHook 注册 sys_configs 写入后的回调（如失效配置缓存）。
+// 非并发安全：仅应在启动装配阶段调用一次。
+func (s *SqlStore) SetConfigWriteHook(fn func()) {
+	s.onConfigWrite = fn
 }
 
 // recordCols 查询 billing_records 使用的全部列。
