@@ -1503,8 +1503,20 @@ func TestServeCallLog_NonStreamSuccess(t *testing.T) {
 	if last["reason"] != "success" {
 		t.Errorf("success decision last attempt want success, got %+v", last)
 	}
+	// OQ-3：决策轨迹每条候选应携带成本标量/是否有效/时段系数。
+	assertAttemptCostFields(t, last)
 	if sdec.Result != "success" {
 		t.Errorf("success decision result want success, got %q", sdec.Result)
+	}
+}
+
+// assertAttemptCostFields 断言决策轨迹候选条目含成本相关键（OQ-3）。
+func assertAttemptCostFields(t *testing.T, attempt map[string]any) {
+	t.Helper()
+	for _, k := range []string{"cost", "cost_known", "route_time_coeff"} {
+		if _, ok := attempt[k]; !ok {
+			t.Errorf("decision attempt 缺少成本字段 %q, got %+v", k, attempt)
+		}
 	}
 }
 
@@ -1601,6 +1613,8 @@ func TestServeCallLog_AllCandidatesRejected(t *testing.T) {
 	if a0["reason"] != "禁用" || a0["channel_id"] != "1" || a0["channel_key_id"] != "1" {
 		t.Errorf("decision attempt want 禁用/1/1, got %+v", a0)
 	}
+	// OQ-3：被拦截候选同样应携带成本字段。
+	assertAttemptCostFields(t, a0)
 	if decision.Result != "rejected" {
 		t.Errorf("decision result want rejected, got %q", decision.Result)
 	}

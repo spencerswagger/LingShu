@@ -96,6 +96,48 @@ func cm(chID int64, internal string) channel.ChannelModel {
 	}
 }
 
+// cmCost 构造带指定 input 单价的候选（其余段为 0）：样值下成本标量 = (10000-9000) × inputRate，
+// 随 inputRate 单调，便于构造「谁更便宜」的确定性场景。inputRate=0 时五段全 0 = 成本未知。
+func cmCost(chID int64, internal string, inputRate float64) channel.ChannelModel {
+	m := cm(chID, internal)
+	m.CostRates = billing.Rates{"input": inputRate, "output": 0, "cache_read": 0, "cache_write": 0, "reasoning": 0}
+	return m
+}
+
+// fakeCostConfig 满足 CostConfig（测试注入样值与全局时段）。
+type fakeCostConfig struct {
+	sample   billing.Usage
+	globalTC *billing.TimeCoeffConfig
+}
+
+func (f *fakeCostConfig) SampleUsage() (billing.Usage, error) {
+	if f.sample == (billing.Usage{}) {
+		return defaultCostSample, nil // 未显式设置时用内置默认，便于只关心时段回落的用例
+	}
+	return f.sample, nil
+}
+
+// TimeConfig 返回全局时段配置；未设置时返回错误（模拟配置缺失），
+// 使路由层回落时段系数 1（避免返回零值 TimeCoeffConfig 时 CoeffFor 得到 Default=0 而把成本全部清零）。
+func (f *fakeCostConfig) TimeConfig() (billing.TimeCoeffConfig, error) {
+	if f.globalTC == nil {
+		return billing.TimeCoeffConfig{}, errors.New("未配置全局时段")
+	}
+	return *f.globalTC, nil
+}
+
+// attachTo 在会话注册表上直接建立一条绑定 (keyID, internal) 的存活会话（用于构造存活会话数场景）。
+func attachTo(t *testing.T, r *SessionRegistry, id string, keyID int64, internal string) {
+	t.Helper()
+	ok, _ := r.Attach(&Session{
+		SessionID: id, ChannelKeyID: keyID, InternalModelID: internal,
+		ExpireAt: time.Now().Add(time.Hour),
+	}, 10)
+	if !ok {
+		t.Fatalf("attach %s 应成功", id)
+	}
+}
+
 func TestRoute_WithTags_SelectsMatching(t *testing.T) {
 	svc, mock := newModelService(t, 1)
 	defer func() { _ = mock.ExpectationsWereMet() }()
@@ -146,37 +188,284 @@ func TestRoute_WithTags_NoMatch(t *testing.T) {
 	}
 }
 
-func TestRoute_NoTags_RoundRobinDistribution(t *testing.T) {
-	const calls = 100
-	svc, mock := newModelService(t, calls)
+// AC-1：同优先级内选成本最低者。
+func TestRoute_SamePriority_LowestCostSelected(t *testing.T) {
+	svc, mock := newModelService(t, 1)
 	defer func() { _ = mock.ExpectationsWereMet() }()
 
-	// 同 priority（同层）两渠道在层内加权随机轮转，多次调用两渠道都应获选。
+	cheap := cmCost(1, "int1", 1) // 成本 1000
+	dear := cmCost(2, "int2", 3)  // 成本 3000
 	mgr := newManagerWithKeys(t, []*channel.Channel{
 		healthyCh(1, "a", nil, 100),
 		healthyCh(2, "b", nil, 100),
-	}, []channel.ChannelModel{cm(1, "int1"), cm(2, "int2")},
+	}, []channel.ChannelModel{cheap, dear},
 		[]channel.ChannelKey{newKey(11, 1, channel.StateNormal), newKey(21, 2, channel.StateNormal)})
-	e := NewEngine(svc, &fakeCMSource{cms: []channel.ChannelModel{cm(1, "int1"), cm(2, "int2")}}, mgr, nil)
+	e := NewEngine(svc, &fakeCMSource{cms: []channel.ChannelModel{cheap, dear}}, mgr, nil)
 
-	seen := map[int64]int{}
+	r, err := e.Route(context.Background(), RouteSpec{ExternalModel: "qw-max"})
+	if err != nil {
+		t.Fatalf("route: %v", err)
+	}
+	if r.ChannelID != 1 {
+		t.Fatalf("同优先级内应选成本最低的渠道 1，got %d", r.ChannelID)
+	}
+}
+
+// AC-2：priority 为硬分层——高优先级候选即便更贵也优先。
+func TestRoute_PriorityLayerBeatsLowerCost(t *testing.T) {
+	svc, mock := newModelService(t, 1)
+	defer func() { _ = mock.ExpectationsWereMet() }()
+
+	dearHighPrio := cmCost(1, "int1", 10) // 高优先级但更贵
+	cheapLowPrio := cmCost(2, "int2", 1)  // 低优先级但更便宜
+	mgr := newManagerWithKeys(t, []*channel.Channel{
+		healthyCh(1, "a", nil, 100),
+		healthyCh(2, "b", nil, 50),
+	}, []channel.ChannelModel{dearHighPrio, cheapLowPrio},
+		[]channel.ChannelKey{newKey(11, 1, channel.StateNormal), newKey(21, 2, channel.StateNormal)})
+	e := NewEngine(svc, &fakeCMSource{cms: []channel.ChannelModel{dearHighPrio, cheapLowPrio}}, mgr, nil)
+
+	r, err := e.Route(context.Background(), RouteSpec{ExternalModel: "qw-max"})
+	if err != nil {
+		t.Fatalf("route: %v", err)
+	}
+	if r.ChannelID != 1 {
+		t.Fatalf("高优先级层应优先（即便更贵），期望渠道 1，got %d", r.ChannelID)
+	}
+}
+
+// AC-3：时段系数参与成本比较并可翻转选择。
+func TestRoute_TimeCoeffFlipsChoice(t *testing.T) {
+	svc, mock := newModelService(t, 2)
+	defer func() { _ = mock.ExpectationsWereMet() }()
+
+	// 基准：渠道 1 更便宜（成本 2000 vs 10000）。
+	m1 := cmCost(1, "int1", 2)
+	m2 := cmCost(2, "int2", 10)
+	// 渠道 2 配模型级时段系数 0.1：当前成本 = 10000 × 0.1 = 1000 < 2000 → 翻转选中渠道 2。
+	tc := &billing.TimeCoeffConfig{Timezone: "Asia/Shanghai", Default: 0.1}
+	m2.TimeConfig = tc
+
+	mgr := newManagerWithKeys(t, []*channel.Channel{
+		healthyCh(1, "a", nil, 100),
+		healthyCh(2, "b", nil, 100),
+	}, []channel.ChannelModel{m1, m2},
+		[]channel.ChannelKey{newKey(11, 1, channel.StateNormal), newKey(21, 2, channel.StateNormal)})
+	e := NewEngine(svc, &fakeCMSource{cms: []channel.ChannelModel{m1, m2}}, mgr, nil)
+	e.SetClock(func() time.Time { return time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC) })
+
+	r, err := e.Route(context.Background(), RouteSpec{ExternalModel: "qw-max"})
+	if err != nil {
+		t.Fatalf("route: %v", err)
+	}
+	if r.ChannelID != 2 {
+		t.Fatalf("时段系数应使渠道 2 更便宜并被选中，got %d", r.ChannelID)
+	}
+}
+
+// AC-4：成本并列时，存活会话数更少者优先，且随会话分布自平衡。
+func TestRoute_CostTie_BreaksByActiveSessions(t *testing.T) {
+	svc, mock := newModelService(t, 2)
+	defer func() { _ = mock.ExpectationsWereMet() }()
+
+	// 两候选成本相同（同 inputRate）。
+	m1 := cmCost(1, "int1", 1)
+	m2 := cmCost(2, "int2", 1)
+	mgr := newManagerWithKeys(t, []*channel.Channel{
+		healthyCh(1, "a", nil, 100),
+		healthyCh(2, "b", nil, 100),
+	}, []channel.ChannelModel{m1, m2},
+		[]channel.ChannelKey{newKey(11, 1, channel.StateNormal), newKey(21, 2, channel.StateNormal)})
+	sess := NewSessionRegistry(nil)
+	e := NewEngine(svc, &fakeCMSource{cms: []channel.ChannelModel{m1, m2}}, mgr, sess)
+
+	// 渠道 1 已有 1 条会话 → 应优先渠道 2（存活 0）。
+	attachTo(t, sess, "s1", 11, "int1")
+	r, err := e.Route(context.Background(), RouteSpec{ExternalModel: "qw-max"})
+	if err != nil {
+		t.Fatalf("route: %v", err)
+	}
+	if r.ChannelID != 2 {
+		t.Fatalf("并列时应选存活会话更少的渠道 2，got %d", r.ChannelID)
+	}
+
+	// 渠道 2 也建一条会话 → 两者存活数相同 → 按稳定 id 次序回到渠道 1。
+	attachTo(t, sess, "s2", 21, "int2")
+	r2, err := e.Route(context.Background(), RouteSpec{ExternalModel: "qw-max"})
+	if err != nil {
+		t.Fatalf("route: %v", err)
+	}
+	if r2.ChannelID != 1 {
+		t.Fatalf("存活数再次并列时按稳定 id 应选渠道 1，got %d", r2.ChannelID)
+	}
+}
+
+// AC-5：同优先级、同成本、同存活会话数时按稳定 id 次序，且多次路由结果确定（无随机；权重已删除）。
+func TestRoute_TieBreaksByStableIDDeterministic(t *testing.T) {
+	const calls = 5
+	svc, mock := newModelService(t, calls)
+	defer func() { _ = mock.ExpectationsWereMet() }()
+
+	ch1 := healthyCh(1, "a", nil, 100)
+	ch2 := healthyCh(2, "b", nil, 100)
+	m1 := cmCost(1, "int1", 1)
+	m2 := cmCost(2, "int2", 1)
+	mgr := newManagerWithKeys(t, []*channel.Channel{ch1, ch2},
+		[]channel.ChannelModel{m1, m2},
+		[]channel.ChannelKey{newKey(11, 1, channel.StateNormal), newKey(21, 2, channel.StateNormal)})
+	e := NewEngine(svc, &fakeCMSource{cms: []channel.ChannelModel{m1, m2}}, mgr, nil)
+
 	for i := 0; i < calls; i++ {
 		r, err := e.Route(context.Background(), RouteSpec{ExternalModel: "qw-max"})
 		if err != nil {
 			t.Fatalf("route #%d: %v", i, err)
 		}
-		if r.ChannelID != 1 && r.ChannelID != 2 {
-			t.Fatalf("结果落在候选集之外：%d", r.ChannelID)
+		if r.ChannelID != 1 {
+			t.Fatalf("并列时应稳定命中最小的渠道 1，got %d（第 %d 次）", r.ChannelID, i)
 		}
-		seen[r.ChannelID]++
-	}
-	if len(seen) != 2 {
-		t.Fatalf("同层加权随机下期望两渠道都被命中，got %v", seen)
 	}
 }
 
-// 会话命中（Attach 后）应覆盖加权轮询：即使权重指向渠道 2，也返回渠道 1。
-func TestRoute_SessionHit_OverridesWeight(t *testing.T) {
+// AC-6：缺失成本（空/全 0）视为最贵；全缺时按 priority/存活/id 兜底。
+func TestRoute_MissingCostTreatedAsMostExpensive(t *testing.T) {
+	t.Run("部分缺失", func(t *testing.T) {
+		svc, mock := newModelService(t, 1)
+		defer func() { _ = mock.ExpectationsWereMet() }()
+
+		known := cmCost(1, "int1", 5) // 有有效成本
+		unknown := cmCost(2, "int2", 0)
+		unknown.CostRates = nil // 缺价
+		mgr := newManagerWithKeys(t, []*channel.Channel{
+			healthyCh(1, "a", nil, 100),
+			healthyCh(2, "b", nil, 100),
+		}, []channel.ChannelModel{known, unknown},
+			[]channel.ChannelKey{newKey(11, 1, channel.StateNormal), newKey(21, 2, channel.StateNormal)})
+		e := NewEngine(svc, &fakeCMSource{cms: []channel.ChannelModel{known, unknown}}, mgr, nil)
+
+		r, err := e.Route(context.Background(), RouteSpec{ExternalModel: "qw-max"})
+		if err != nil {
+			t.Fatalf("route: %v", err)
+		}
+		if r.ChannelID != 1 {
+			t.Fatalf("有有效成本者应优先，期望渠道 1，got %d", r.ChannelID)
+		}
+	})
+
+	t.Run("全部缺失按优先级兜底", func(t *testing.T) {
+		svc, mock := newModelService(t, 1)
+		defer func() { _ = mock.ExpectationsWereMet() }()
+
+		a := cmCost(1, "int1", 0)
+		a.CostRates = nil
+		b := cmCost(2, "int2", 0)
+		b.CostRates = nil
+		mgr := newManagerWithKeys(t, []*channel.Channel{
+			healthyCh(1, "a", nil, 50),
+			healthyCh(2, "b", nil, 100), // 更高优先级
+		}, []channel.ChannelModel{a, b},
+			[]channel.ChannelKey{newKey(11, 1, channel.StateNormal), newKey(21, 2, channel.StateNormal)})
+		e := NewEngine(svc, &fakeCMSource{cms: []channel.ChannelModel{a, b}}, mgr, nil)
+
+		r, err := e.Route(context.Background(), RouteSpec{ExternalModel: "qw-max"})
+		if err != nil {
+			t.Fatalf("全部缺价不应报错: %v", err)
+		}
+		if r.ChannelID != 2 {
+			t.Fatalf("全部缺价时按 priority 兜底，期望渠道 2，got %d", r.ChannelID)
+		}
+	})
+}
+
+// AC-8：RouteAll 完整序列按成本升序（同优先级内），首位最便宜。
+func TestRouteAll_OrderedByCostAscending(t *testing.T) {
+	svc, mock := newModelService(t, 1)
+	defer func() { _ = mock.ExpectationsWereMet() }()
+
+	dear := cmCost(1, "int1", 3)
+	cheap := cmCost(2, "int2", 1)
+	mgr := newManagerWithKeys(t, []*channel.Channel{
+		healthyCh(1, "a", nil, 100),
+		healthyCh(2, "b", nil, 100),
+	}, []channel.ChannelModel{dear, cheap},
+		[]channel.ChannelKey{newKey(11, 1, channel.StateNormal), newKey(21, 2, channel.StateNormal)})
+	e := NewEngine(svc, &fakeCMSource{cms: []channel.ChannelModel{dear, cheap}}, mgr, nil)
+
+	routes, err := e.RouteAll(context.Background(), RouteSpec{ExternalModel: "qw-max"})
+	if err != nil {
+		t.Fatalf("routeall: %v", err)
+	}
+	if len(routes) != 2 || routes[0].ChannelID != 2 || routes[1].ChannelID != 1 {
+		t.Fatalf("failover 序列应按成本升序（渠道 2 更便宜在前），got %+v", routes)
+	}
+}
+
+// AC-9/TR-5.2：注入的全局样值确实参与成本比较——同一候选集、仅样值不同，首选渠道发生翻转。
+// 该用例对「样值注入被忽略」有鉴别力：若始终回落内置默认，两次都会命中同一渠道（渠道 1）。
+func TestRoute_SampleUsageChangesChoice(t *testing.T) {
+	svc, mock := newModelService(t, 2)
+	defer func() { _ = mock.ExpectationsWereMet() }()
+
+	// 渠道 1 只按 output 计价；渠道 2 只按 input（有效输入 = input - cache_read）计价。
+	m1 := cm(1, "int1")
+	m1.CostRates = billing.Rates{"input": 0, "output": 1, "cache_read": 0, "cache_write": 0, "reasoning": 0}
+	m2 := cm(2, "int2")
+	m2.CostRates = billing.Rates{"input": 1, "output": 0, "cache_read": 0, "cache_write": 0, "reasoning": 0}
+	mgr := newManagerWithKeys(t, []*channel.Channel{
+		healthyCh(1, "a", nil, 100),
+		healthyCh(2, "b", nil, 100),
+	}, []channel.ChannelModel{m1, m2},
+		[]channel.ChannelKey{newKey(11, 1, channel.StateNormal), newKey(21, 2, channel.StateNormal)})
+	e := NewEngine(svc, &fakeCMSource{cms: []channel.ChannelModel{m1, m2}}, mgr, nil)
+
+	// 样值 A：输出极小、输入极大 → 渠道 1（output 计价）成本 1，渠道 2（input 计价）成本 100000 → 首选渠道 1。
+	e.SetCostConfig(&fakeCostConfig{sample: billing.Usage{Input: 100000, Output: 1}})
+	rA, err := e.Route(context.Background(), RouteSpec{ExternalModel: "qw-max"})
+	if err != nil {
+		t.Fatalf("route A: %v", err)
+	}
+	if rA.ChannelID != 1 {
+		t.Fatalf("样值 A 应首选渠道 1，got %d", rA.ChannelID)
+	}
+
+	// 样值 B：输出极大、输入极小 → 渠道 2 成本 1，渠道 1 成本 100000 → 翻转首选渠道 2。
+	e.SetCostConfig(&fakeCostConfig{sample: billing.Usage{Input: 1, Output: 100000}})
+	rB, err := e.Route(context.Background(), RouteSpec{ExternalModel: "qw-max"})
+	if err != nil {
+		t.Fatalf("route B: %v", err)
+	}
+	if rB.ChannelID != 2 {
+		t.Fatalf("样值 B 应翻转首选渠道 2，got %d", rB.ChannelID)
+	}
+}
+
+// AC-3/TR-1.1：模型级 time_config 为空时回落全局 billing.time_config 系数。
+func TestRoute_GlobalTimeCoeffFallback(t *testing.T) {
+	svc, mock := newModelService(t, 1)
+	defer func() { _ = mock.ExpectationsWereMet() }()
+
+	a := cmCost(1, "int1", 2) // 自带模型级时段系数 1 → 成本 2000
+	a.TimeConfig = &billing.TimeCoeffConfig{Timezone: "Asia/Shanghai", Default: 1}
+	b := cmCost(2, "int2", 10) // 无模型级时段 → 回落全局 0.1 → 成本 1000
+	mgr := newManagerWithKeys(t, []*channel.Channel{
+		healthyCh(1, "a", nil, 100),
+		healthyCh(2, "b", nil, 100),
+	}, []channel.ChannelModel{a, b},
+		[]channel.ChannelKey{newKey(11, 1, channel.StateNormal), newKey(21, 2, channel.StateNormal)})
+	e := NewEngine(svc, &fakeCMSource{cms: []channel.ChannelModel{a, b}}, mgr, nil)
+	e.SetClock(func() time.Time { return time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC) })
+	e.SetCostConfig(&fakeCostConfig{globalTC: &billing.TimeCoeffConfig{Timezone: "Asia/Shanghai", Default: 0.1}})
+
+	r, err := e.Route(context.Background(), RouteSpec{ExternalModel: "qw-max"})
+	if err != nil {
+		t.Fatalf("route: %v", err)
+	}
+	if r.ChannelID != 2 {
+		t.Fatalf("无模型级时段的候选应回落全局系数 0.1 而更便宜，期望渠道 2，got %d", r.ChannelID)
+	}
+}
+
+// AC-7：会话命中（Attach 后）应覆盖成本排序：即便按成本会选其他候选，也返回命中渠道。
+func TestRoute_SessionHit_OverridesCost(t *testing.T) {
 	svc, mock := newModelService(t, 1)
 	defer func() { _ = mock.ExpectationsWereMet() }()
 
@@ -521,28 +810,38 @@ func TestSessionRegistry_CountActiveByChannel_NoResolverReturnsZero(t *testing.T
 	}
 }
 
-func TestOrderByLayerAndWeight(t *testing.T) {
+// orderCandidates 直接单测：priority 降序 → 成本升序 → 存活会话数升序 → 稳定 id 兜底。
+func TestOrderCandidates_PriorityCostLoadThenID(t *testing.T) {
+	rates := func(v float64) billing.Rates {
+		return billing.Rates{"input": v, "output": 0, "cache_read": 0, "cache_write": 0, "reasoning": 0}
+	}
+	sess := NewSessionRegistry(nil)
+	attachTo(t, sess, "sx", 33, "i3") // 渠道 3（keyID=33）已有 1 条存活会话
+	e := &Engine{sess: sess, now: time.Now}
+
 	cands := []candidate{
-		{id: 1, priority: 100, weight: 1},
-		{id: 2, priority: 100, weight: 3},
-		{id: 3, priority: 50, weight: 1},
+		{id: 1, keyID: 11, modelRow: 101, priority: 100, costRates: rates(3)},  // 高优先级但最贵
+		{id: 2, keyID: 21, modelRow: 201, priority: 100, costRates: rates(1)},  // 高优先级便宜、无存活会话
+		{id: 3, keyID: 33, modelRow: 301, priority: 100, costRates: rates(1)},  // 与 id=2 同价但存活会话 1
+		{id: 4, keyID: 44, modelRow: 401, priority: 50, costRates: rates(0.1)}, // 低优先级层（即便最便宜也最后）
 	}
-	// 固定随机值 r=0：层 100 总权 4，落点 0 命中首个权重区间，
-	// 渠道顺序应以被选中者起始。验证高层两渠道排在低层之前。
-	got := orderByLayerAndWeight(cands, newStubRand(0))
-	if got[len(got)-1].id != 3 {
-		t.Fatalf("低优先级渠道应在最后，got %+v", got)
-	}
-	front := map[int64]bool{got[0].id: true, got[1].id: true}
-	if !front[1] || !front[2] {
-		t.Fatalf("高层两渠道应在前，got %+v", got)
+	sample, globalTC := e.costContext()
+	got := e.orderCandidates(cands, time.Now(), sample, globalTC)
+	want := []int64{2, 3, 1, 4}
+	for i := range want {
+		if got[i].id != want[i] {
+			t.Fatalf("排序不符：got %v（期望 id 顺序 %v）", candidateIDs(got), want)
+		}
 	}
 }
 
-type stubRand struct{ n int }
-
-func newStubRand(n int) *stubRand  { return &stubRand{n: n} }
-func (s *stubRand) Intn(_ int) int { return s.n }
+func candidateIDs(cs []candidate) []int64 {
+	out := make([]int64, len(cs))
+	for i := range cs {
+		out[i] = cs[i].id
+	}
+	return out
+}
 
 // B3：双密钥渠道 RouteAll 展开为两个 (渠道,密钥,模型) 候选，各携带不同 ChannelKeyID。
 func TestRouteAll_DualKeys_ExpandsKeyCandidates(t *testing.T) {
@@ -605,31 +904,26 @@ func TestRoute_DisabledKey_ExcludedFromCandidates(t *testing.T) {
 	}
 }
 
-// B3：Route 对双密钥渠道按轮询打散，多次调用下两个密钥都获选。
-func TestRoute_DualKeys_RoundRobinAcrossKeys(t *testing.T) {
-	const calls = 100
-	svc, mock := newModelService(t, calls)
+// 同渠道双密钥：成本相同 → 按存活会话数分流；密钥 11 已有存活会话时新会话落到密钥 12。
+func TestRoute_DualKeys_LoadBalancedBySessions(t *testing.T) {
+	svc, mock := newModelService(t, 1)
 	defer func() { _ = mock.ExpectationsWereMet() }()
 
+	m := cmCost(1, "int1", 1)
 	mgr := newManagerWithKeys(t,
 		[]*channel.Channel{healthyCh(1, "a", nil, 100)},
-		[]channel.ChannelModel{cm(1, "int1")},
+		[]channel.ChannelModel{m},
 		[]channel.ChannelKey{newKey(11, 1, channel.StateNormal), newKey(12, 1, channel.StateNormal)})
-	e := NewEngine(svc, &fakeCMSource{cms: []channel.ChannelModel{cm(1, "int1")}}, mgr, nil)
+	sess := NewSessionRegistry(nil)
+	e := NewEngine(svc, &fakeCMSource{cms: []channel.ChannelModel{m}}, mgr, sess)
 
-	seen := map[int64]int{}
-	for i := 0; i < calls; i++ {
-		r, err := e.Route(context.Background(), RouteSpec{ExternalModel: "qw-max"})
-		if err != nil {
-			t.Fatalf("route #%d: %v", i, err)
-		}
-		if r.ChannelKeyID != 11 && r.ChannelKeyID != 12 {
-			t.Fatalf("结果落在密钥候选之外：%d", r.ChannelKeyID)
-		}
-		seen[r.ChannelKeyID]++
+	attachTo(t, sess, "s1", 11, "int1")
+	r, err := e.Route(context.Background(), RouteSpec{ExternalModel: "qw-max"})
+	if err != nil {
+		t.Fatalf("route: %v", err)
 	}
-	if len(seen) != 2 {
-		t.Fatalf("密钥轮询打散应命中两个密钥，got %v", seen)
+	if r.ChannelKeyID != 12 {
+		t.Fatalf("密钥 11 已有存活会话，应落到密钥 12，got %d", r.ChannelKeyID)
 	}
 }
 

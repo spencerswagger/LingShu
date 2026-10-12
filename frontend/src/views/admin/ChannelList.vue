@@ -80,27 +80,26 @@ async function load() {
 onMounted(load)
 
 const savingId = ref<string | null>(null)
-async function onEditRouteField(row: AdminChannel, field: 'Priority' | 'Weight', v: number) {
+async function onEditPriority(row: AdminChannel, v: number) {
   const num = Number(v)
   if (!Number.isFinite(num) || num < 1) {
-    ElMessage.warning(field === 'Priority' ? '优先级需 ≥ 1' : '权重需 ≥ 1')
+    ElMessage.warning('优先级需 ≥ 1')
     await load()
     return
   }
-  const prev = row[field]
-  row[field] = num
+  const prev = row.Priority
+  row.Priority = num
   savingId.value = row.ID
   try {
     await updateChannel(row.ID, {
       Name: row.Name,
       Protocol: row.Protocol,
       BaseURL: row.BaseURL,
-      Priority: field === 'Priority' ? num : row.Priority,
-      Weight: field === 'Weight' ? num : (row.Weight ?? 1),
+      Priority: num,
     })
-    ElMessage.success(`已更新${field === 'Priority' ? '优先级' : '权重'}`)
+    ElMessage.success('已更新优先级')
   } catch (e: any) {
-    row[field] = prev
+    row.Priority = prev
     ElMessage.error(e?.message || '更新失败，已还原')
   } finally {
     savingId.value = null
@@ -278,7 +277,7 @@ function onRowClick(row: AdminChannel, _column: unknown, event: Event) {
         </el-table-column>
         <el-table-column label="优先级" width="130" align="center">
           <template #header>
-            <el-tooltip content="数字越大越先被路由" placement="top"><span>优先级</span></el-tooltip>
+            <el-tooltip content="数字越大越先被路由；同优先级内新会话选当前成本最低者" placement="top"><span>优先级</span></el-tooltip>
           </template>
           <template #default="{ row }">
             <div class="row-stop" @click.stop>
@@ -287,23 +286,7 @@ function onRowClick(row: AdminChannel, _column: unknown, event: Event) {
                 :min="1" :max="999" :step="1" size="small"
                 controls-position="right"
                 class="inline-num"
-                @change="(v: number) => onEditRouteField(row, 'Priority', v)"
-              />
-            </div>
-          </template>
-        </el-table-column>
-        <el-table-column label="权重" width="120" align="center">
-          <template #header>
-            <el-tooltip content="同一优先级内按权重分配流量，权重越大流量越多；默认 1 等权" placement="top"><span>权重</span></el-tooltip>
-          </template>
-          <template #default="{ row }">
-            <div class="row-stop" @click.stop>
-              <el-input-number
-                :model-value="row.Weight ?? 1"
-                :min="1" :max="10000" :step="1" size="small"
-                controls-position="right"
-                class="inline-num"
-                @change="(v: number) => onEditRouteField(row, 'Weight', v)"
+                @change="(v: number) => onEditPriority(row, v)"
               />
             </div>
           </template>

@@ -21,9 +21,9 @@ func channelRow(c *Channel) *sqlmock.Rows {
 	hp, _ := json.Marshal(c.HealthProbe)
 	rel, _ := json.Marshal(c.Reliability)
 	return sqlmock.NewRows([]string{"id", "name", "protocol", "base_url",
-		"tags", "priority", "weight", "state", "rate_limit", "health_probe", "reliability",
+		"tags", "priority", "state", "rate_limit", "health_probe", "reliability",
 		"session_ttl_minutes", "created_at", "updated_at"}).
-		AddRow(c.ID, c.Name, c.Protocol, c.BaseURL, tags, c.Priority, c.Weight,
+		AddRow(c.ID, c.Name, c.Protocol, c.BaseURL, tags, c.Priority,
 			string(c.State), rl, hp, rel, c.SessionTTLMinutes, c.CreatedAt, c.UpdatedAt)
 }
 
@@ -35,8 +35,8 @@ func asAPIError(err error) (*APIError, bool) {
 	return ae, ok
 }
 
-const insertChannelSQL = `INSERT INTO channels(id, name, protocol, base_url, tags, priority, weight, state, rate_limit, health_probe, reliability, session_ttl_minutes)
-		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+const insertChannelSQL = `INSERT INTO channels(id, name, protocol, base_url, tags, priority, state, rate_limit, health_probe, reliability, session_ttl_minutes)
+		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
 		 RETURNING ` + channelCols
 
 func TestService_CreateChannel_Defaults(t *testing.T) {
@@ -54,10 +54,10 @@ func TestService_CreateChannel_Defaults(t *testing.T) {
 	mock.ExpectBegin()
 	mock.ExpectQuery(regexp.QuoteMeta(insertChannelSQL)).
 		WithArgs(sqlmock.AnyArg(), "my-channel", "openai-compat", "https://api.example.com",
-			sqlmock.AnyArg(), 100, 1, "NORMAL", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), DefaultSessionTTLMinutes).
+			sqlmock.AnyArg(), 100, "NORMAL", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), DefaultSessionTTLMinutes).
 		WillReturnRows(channelRow(&Channel{
 			ID: 1, Name: "my-channel", Protocol: "openai-compat", BaseURL: "https://api.example.com",
-			Priority: 100, Weight: 1, State: StateNormal,
+			Priority: 100, State: StateNormal,
 			CreatedAt: time.Now(), UpdatedAt: time.Now(),
 		}))
 	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM channel_tags WHERE channel_id = $1`)).
@@ -108,7 +108,7 @@ func TestService_CreateChannel_BindsTags(t *testing.T) {
 	mock.ExpectQuery(`INSERT INTO channels`).
 		WillReturnRows(sqlmock.NewRows(strings.Split(channelCols, ", ")).
 			AddRow(int64(7), "c", "openai-compat", "https://x.example.com", []byte("{}"),
-				int64(100), int64(1), "NORMAL", []byte("{}"), []byte("{}"), []byte("{}"),
+				int64(100), "NORMAL", []byte("{}"), []byte("{}"), []byte("{}"),
 				int64(60), time.Now(), time.Now()))
 	mock.ExpectExec(`DELETE FROM channel_tags`).WithArgs(int64(7)).
 		WillReturnResult(sqlmock.NewResult(0, 0))
@@ -171,13 +171,13 @@ func TestService_UpdateChannel(t *testing.T) {
 		}))
 
 	updQuery := `UPDATE channels SET name=$1, protocol=$2, base_url=$3,
-		        tags=$4, priority=$5, weight=$6, state=$7, rate_limit=$8, health_probe=$9,
-		        reliability=$10, session_ttl_minutes=$11, updated_at=now()
-		 WHERE id=$12 AND deleted_at IS NULL`
+		        tags=$4, priority=$5, state=$6, rate_limit=$7, health_probe=$8,
+		        reliability=$9, session_ttl_minutes=$10, updated_at=now()
+		 WHERE id=$11 AND deleted_at IS NULL`
 	mock.ExpectBegin()
 	mock.ExpectExec(regexp.QuoteMeta(updQuery)).
 		WithArgs("renamed", "openai-compat", "https://b.example.com",
-			sqlmock.AnyArg(), 50, 0, "NORMAL", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), int64(0), int64(5)).
+			sqlmock.AnyArg(), 50, "NORMAL", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), int64(0), int64(5)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM channel_tags WHERE channel_id = $1`)).
 		WithArgs(int64(5)).WillReturnResult(sqlmock.NewResult(0, 0))
