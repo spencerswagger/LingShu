@@ -429,3 +429,177 @@ func TestValidCostSample(t *testing.T) {
 		}
 	}
 }
+
+// sessionConfigPayload 从 GET /admin/configs/session 响应中提取 SessionExpiration 并解析。
+func sessionConfigPayload(t *testing.T, rec *httptest.ResponseRecorder) struct {
+	DefaultTTLMinutes int `json:"default_ttl_minutes"`
+	ContextTiers      []struct {
+		MaxTokens  int `json:"max_tokens"`
+		TTLMinutes int `json:"ttl_minutes"`
+	} `json:"context_tiers"`
+	TurnTiers []struct {
+		MaxTurns   int `json:"max_turns"`
+		TTLMinutes int `json:"ttl_minutes"`
+	} `json:"turn_tiers"`
+} {
+	t.Helper()
+	var body struct {
+		Data map[string]json.RawMessage `json:"Data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	raw, ok := body.Data["SessionExpiration"]
+	if !ok {
+		t.Fatalf("响应缺少 SessionExpiration 键: %s", rec.Body.String())
+	}
+	var cfg struct {
+		DefaultTTLMinutes int `json:"default_ttl_minutes"`
+		ContextTiers      []struct {
+			MaxTokens  int `json:"max_tokens"`
+			TTLMinutes int `json:"ttl_minutes"`
+		} `json:"context_tiers"`
+		TurnTiers []struct {
+			MaxTurns   int `json:"max_turns"`
+			TTLMinutes int `json:"ttl_minutes"`
+		} `json:"turn_tiers"`
+	}
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatalf("unmarshal SessionExpiration: %v", err)
+	}
+	return cfg
+}
+
+// TestHandleGetSessionConfig 断言会话过期配置读取：已存在时返回库值，缺失时回退内置默认。
+func TestHandleGetSessionConfig(t *testing.T) {
+	t.Run("已存在返回库值", func(t *testing.T) {
+		db, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatalf("sqlmock: %v", err)
+		}
+		defer db.Close()
+		admin := NewAdmin(db, billing.NewSqlStore(db), nil, nil)
+
+		stored := `{"default_ttl_minutes":7,"context_tiers":[{"max_tokens":1000,"ttl_minutes":3}],"turn_tiers":[{"max_turns":3,"ttl_minutes":9}]}`
+		expectConfigRow(mock, "session.expiration", []byte(stored))
+
+		rec := httptest.NewRecorder()
+		admin.HandleGetSessionConfig(rec, httptest.NewRequest(http.MethodGet, "/api/v1/admin/configs/session", nil))
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status=%d, want 200; body=%s", rec.Code, rec.Body.String())
+		}
+		cfg := sessionConfigPayload(t, rec)
+		var want struct {
+			DefaultTTLMinutes int `json:"default_ttl_minutes"`
+			ContextTiers      []struct {
+				MaxTokens  int `json:"max_tokens"`
+				TTLMinutes int `json:"ttl_minutes"`
+			} `json:"context_tiers"`
+			TurnTiers []struct {
+				MaxTurns   int `json:"max_turns"`
+				TTLMinutes int `json:"ttl_minutes"`
+			} `json:"turn_tiers"`
+		}
+		if err := json.Unmarshal([]byte(stored), &want); err != nil {
+			t.Fatalf("unmarshal want: %v", err)
+		}
+		if cfg.DefaultTTLMinutes != want.DefaultTTLMinutes ||
+			len(cfg.ContextTiers) != len(want.ContextTiers) || len(cfg.TurnTiers) != len(want.TurnTiers) {
+			t.Fatalf("配置与写入值不一致: %+v vs %+v", cfg, want)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("mock expectations: %v", err)
+		}
+	})
+
+	t.Run("缺失回退内置默认", func(t *testing.T) {
+		db, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatalf("sqlmock: %v", err)
+		}
+		defer db.Close()
+		admin := NewAdmin(db, billing.NewSqlStore(db), nil, nil)
+
+		expectConfigRow(mock, "session.expiration", nil) // 缺失 → 回退内置默认
+
+		rec := httptest.NewRecorder()
+		admin.HandleGetSessionConfig(rec, httptest.NewRequest(http.MethodGet, "/api/v1/admin/configs/session", nil))
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status=%d, want 200; body=%s", rec.Code, rec.Body.String())
+		}
+		cfg := sessionConfigPayload(t, rec)
+		if cfg.DefaultTTLMinutes != 5 {
+			t.Fatalf("回退 default_ttl_minutes=%d, want 5", cfg.DefaultTTLMinutes)
+		}
+		if len(cfg.ContextTiers) == 0 || len(cfg.TurnTiers) == 0 {
+			t.Fatalf("回退配置分档不应为空: context=%d turn=%d", len(cfg.ContextTiers), len(cfg.TurnTiers))
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("mock expectations: %v", err)
+		}
+	})
+}
+
+// TestHandlePutSessionConfig 断言会话过期配置写入：合法落库返回 200，非法返回 400 且不落库。
+func TestHandlePutSessionConfig(t *testing.T) {
+	t.Run("合法配置落库", func(t *testing.T) {
+		db, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatalf("sqlmock: %v", err)
+		}
+		defer db.Close()
+		admin := NewAdmin(db, billing.NewSqlStore(db), nil, testUserIDFrom)
+
+		mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO sys_configs(key, value, updated_by)`)).
+			WithArgs("session.expiration", sqlmock.AnyArg(), sqlmock.AnyArg()).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+
+		body := `{"SessionExpiration":{"default_ttl_minutes":5,` +
+			`"context_tiers":[{"max_tokens":2000,"ttl_minutes":5},{"max_tokens":8000,"ttl_minutes":30}],` +
+			`"turn_tiers":[{"max_turns":2,"ttl_minutes":5},{"max_turns":10,"ttl_minutes":30}]}}`
+		rec := httptest.NewRecorder()
+		admin.HandlePutSessionConfig(rec, httptest.NewRequest(http.MethodPut, "/api/v1/admin/configs/session", strings.NewReader(body)))
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status=%d, want 200; body=%s", rec.Code, rec.Body.String())
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("mock expectations: %v", err)
+		}
+	})
+
+	t.Run("非法配置返回 400 且不落库", func(t *testing.T) {
+		cases := []struct {
+			name string
+			body string
+		}{
+			{"非 JSON 对象", `{"SessionExpiration":[1,2,3]}`},
+			{"default_ttl_minutes 为 0", `{"SessionExpiration":{"default_ttl_minutes":0,"context_tiers":[],"turn_tiers":[]}}`},
+			{"default_ttl_minutes 为负", `{"SessionExpiration":{"default_ttl_minutes":-5,"context_tiers":[],"turn_tiers":[]}}`},
+			{"context_tiers 上界非升序", `{"SessionExpiration":{"default_ttl_minutes":5,"context_tiers":[{"max_tokens":8000,"ttl_minutes":5},{"max_tokens":2000,"ttl_minutes":30}],"turn_tiers":[]}}`},
+		}
+		for _, c := range cases {
+			t.Run(c.name, func(t *testing.T) {
+				db, mock, err := sqlmock.New()
+				if err != nil {
+					t.Fatalf("sqlmock: %v", err)
+				}
+				defer db.Close()
+				admin := NewAdmin(db, billing.NewSqlStore(db), nil, testUserIDFrom)
+
+				rec := httptest.NewRecorder()
+				admin.HandlePutSessionConfig(rec, httptest.NewRequest(http.MethodPut, "/api/v1/admin/configs/session", strings.NewReader(c.body)))
+
+				if rec.Code != http.StatusBadRequest {
+					t.Fatalf("status=%d, want 400; body=%s", rec.Code, rec.Body.String())
+				}
+				// 校验先于任何写入：不应产生 Exec。
+				if err := mock.ExpectationsWereMet(); err != nil {
+					t.Fatalf("非法配置不应触发写库: %v", err)
+				}
+			})
+		}
+	})
+}

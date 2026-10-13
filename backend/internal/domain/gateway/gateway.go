@@ -33,7 +33,11 @@ type ChannelResolver interface {
 	GetModelRuntime(channelID, modelRowID int64) (*channel.ModelRuntime, bool)
 	FeedResult(keyID int64, modelRowID int64, f channel.Feedback)
 	KeyMaxSessions(keyID int64) int
-	SessionTTL(channelID int64) int
+}
+
+// SessionExpiryResolver 会话过期 TTL 计算抽象（router.SessionExpiryProvider 满足）。
+type SessionExpiryResolver interface {
+	TTL(ctxTokens, turns int) time.Duration
 }
 
 // BillingRecorder 计费抽象（billing.Service 满足）。
@@ -98,6 +102,7 @@ type Gateway struct {
 	balance         BalanceResolver
 	credit          CreditOps
 	providerFactory ProviderFactory
+	sessionExpiry   SessionExpiryResolver
 	touchLastUsed   func(ctx context.Context, tokenID int64) error
 	listEnabled     func(ctx context.Context) ([]model.ExternalModel, error)
 	logger          *slog.Logger
@@ -121,10 +126,13 @@ type GatewayConfig struct {
 	// Credit 可选：三阶段计费（预扣/退款）。装配后启用「预扣-结算-退补」；nil 时退化为 balance 检查。
 	Credit          CreditOps
 	ProviderFactory ProviderFactory
-	Logger          *slog.Logger
-	Now             func() time.Time
-	Client          *http.Client // nil 时默认 300s 超时
-	StreamClient    *http.Client // nil 时派生自 Client，但 body 不超时
+	// SessionExpiry 可选：会话过期 TTL 计算（上下文长度 + 用户对话次数双维度分档）。
+	// nil 时 handler 使用内置兜底时长。
+	SessionExpiry SessionExpiryResolver
+	Logger        *slog.Logger
+	Now           func() time.Time
+	Client        *http.Client // nil 时默认 300s 超时
+	StreamClient  *http.Client // nil 时派生自 Client，但 body 不超时
 	// TouchLastUsed 令牌鉴权通过后异步记录使用时间（可为空，热路径不阻塞）。
 	TouchLastUsed func(ctx context.Context, tokenID int64) error
 	// ListEnabledModels 返回启用中的对外模型（GET /v1/models 用；为空时该端点返回空列表）。
@@ -162,6 +170,7 @@ func NewGateway(cfg GatewayConfig) *Gateway {
 		balance:         cfg.Balance,
 		credit:          cfg.Credit,
 		providerFactory: cfg.ProviderFactory,
+		sessionExpiry:   cfg.SessionExpiry,
 		touchLastUsed:   cfg.TouchLastUsed,
 		listEnabled:     cfg.ListEnabledModels,
 		logger:          cfg.Logger,

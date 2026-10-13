@@ -163,6 +163,8 @@ func (s *Server) routes() {
 	admin.HandleFunc("GET /api/v1/admin/stats/dashboard", d.Console.HandleStatsDashboard)
 	admin.HandleFunc("GET /api/v1/admin/configs/billing", d.Console.HandleGetBillingConfig)
 	admin.HandleFunc("PUT /api/v1/admin/configs/billing", d.Console.HandlePutBillingConfig)
+	admin.HandleFunc("GET /api/v1/admin/configs/session", d.Console.HandleGetSessionConfig)
+	admin.HandleFunc("PUT /api/v1/admin/configs/session", d.Console.HandlePutSessionConfig)
 	admin.HandleFunc("GET /api/v1/admin/sessions", d.Console.HandleListSessions)
 	admin.HandleFunc("GET /api/v1/admin/sessions/{session_id}/calls", d.Console.HandleListSessionCalls)
 	admin.HandleFunc("POST /api/v1/admin/sessions/kick", d.Console.HandleKickSessions)

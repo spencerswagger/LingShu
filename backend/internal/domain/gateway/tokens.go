@@ -58,3 +58,22 @@ func countPromptTokens(body []byte, model string) (int, error) {
 func estimateRuneTokens(text string) int {
 	return (utf8.RuneCountInString(text) + 1) / 2
 }
+
+// countUserTurns 统计请求体中 user 角色消息条数（客户端每轮重发全量历史，天然随会话增长）。
+func countUserTurns(body []byte) int {
+	var req struct {
+		Messages []struct {
+			Role string `json:"role"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		return 0
+	}
+	n := 0
+	for i := range req.Messages {
+		if req.Messages[i].Role == "user" {
+			n++
+		}
+	}
+	return n
+}

@@ -37,6 +37,8 @@ var defaultSysConfigs = map[string]string{
 	// 路由成本比较样值用量：新会话创建时以该样值代入渠道成本单价求和比较「谁更便宜」
 	//（不参与实际计费）。五段（输入/缓存读/缓存写/输出/推理）均可配置，缺省缓存写 0。
 	"routing.cost_sample": `{"input":10000,"cache_read":9000,"cache_write":0,"output":1000,"reasoning":500}`,
+	// 会话过期分档兜底与示例档位（双维度取较大者，且不低于兜底 5 分钟）。
+	"session.expiration": `{"default_ttl_minutes":5,"context_tiers":[{"max_tokens":2000,"ttl_minutes":5},{"max_tokens":8000,"ttl_minutes":30},{"max_tokens":32000,"ttl_minutes":180},{"max_tokens":128000,"ttl_minutes":1440}],"turn_tiers":[{"max_turns":2,"ttl_minutes":5},{"max_turns":10,"ttl_minutes":30},{"max_turns":50,"ttl_minutes":180},{"max_turns":200,"ttl_minutes":1440}]}`,
 }
 
 // systemUser / systemToken 常量：健康探测开销的归属身份（成本记账），用户侧界面隐藏。
