@@ -231,11 +231,19 @@ func TestRegistry_RenewPersists(t *testing.T) {
 	if !up.LastActive.Equal(now) {
 		t.Fatalf("LastActive 应为续期时刻，got %v", up.LastActive)
 	}
-	if !up.ExpireAt.Equal(now.Add(30 * time.Minute)) {
-		t.Fatalf("ExpireAt 应滑动为 now+30m，got %v", up.ExpireAt)
+	// 只增不减：候选续期时刻 now+30m 早于现有 ExpireAt(now+1h)，不得缩短。
+	if !up.ExpireAt.Equal(now.Add(time.Hour)) {
+		t.Fatalf("ExpireAt 不应缩短，应保持 now+1h，got %v", up.ExpireAt)
 	}
 	if up.ChannelKeyID != 42 {
 		t.Fatalf("Renew Upsert 应保留密钥，got %d", up.ChannelKeyID)
+	}
+
+	// 更长 TTL：候选时间晚于现有 ExpireAt，应按候选延长。
+	r.Renew("s1", 3*time.Hour)
+	up = f.upserts[len(f.upserts)-1]
+	if !up.ExpireAt.Equal(now.Add(3 * time.Hour)) {
+		t.Fatalf("更长 TTL 应延长 ExpireAt 至 now+3h，got %v", up.ExpireAt)
 	}
 }
 

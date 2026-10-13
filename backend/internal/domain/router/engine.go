@@ -123,9 +123,6 @@ func noAvailable() *RouteError {
 		Code: resp.CodeNoRoute, Message: "无可用渠道，请稍后重试"}
 }
 
-// affinityTTL 缺省会话保持时长（渠道 session_ttl_minutes 覆盖，TTL 常量便于测试引用）。
-const affinityTTL = time.Hour
-
 // extModelSource 对外模型查询（model.Service 满足）。
 type extModelSource interface {
 	GetByExternalName(ctx context.Context, externalName string) (*model.ExternalModel, error)

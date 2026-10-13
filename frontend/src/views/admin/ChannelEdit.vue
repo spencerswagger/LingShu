@@ -61,7 +61,6 @@ const form = reactive({
   base_url: '',
   tag_ids: [] as string[],
   priority: 100,
-  session_ttl_minutes: 60,
   rpm: 0,
   tpm: 0,
   burst_multiplier: 1.2,
@@ -195,7 +194,6 @@ async function load() {
     form.base_url = row.BaseURL
     form.tag_ids = row.TagIDs || []
     form.priority = row.Priority
-    form.session_ttl_minutes = row.SessionTTLMinutes || 60
     form.rpm = row.RateLimit?.RPM || 0
     setTpmDisplay(row.RateLimit?.TPM || 0)
     form.burst_multiplier = row.RateLimit?.BurstMultiplier || 1.2
@@ -375,7 +373,6 @@ async function onSubmit() {
       BaseURL: form.base_url.trim(),
       TagIDs: form.tag_ids,
       Priority: form.priority,
-      SessionTTLMinutes: Number(form.session_ttl_minutes) || 60,
       RateLimit: {
         RPM: Number(form.rpm),
         TPM: tpmRaw(),
@@ -701,13 +698,6 @@ async function onSubmit() {
                 <span class="unit">个</span>
               </div>
           <div class="hint">每渠道存活会话数上限；新会话超限自动切换到下一候选</div>
-        </el-form-item>
-            <el-form-item label="会话存活时长">
-          <div style="display: flex; align-items: center; gap: 6px; width: 100%">
-                <el-input-number v-model="form.session_ttl_minutes" :min="1" style="flex: 1" />
-                <span>分钟</span>
-              </div>
-          <div class="hint">会话无活动超过该时长后过期释放</div>
         </el-form-item>
             <el-form-item label="超限策略">
           <el-radio-group v-model="form.on_exceed">

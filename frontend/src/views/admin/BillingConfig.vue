@@ -2,7 +2,7 @@
 import { onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { QuestionFilled } from '@element-plus/icons-vue'
-import { getBillingConfig, putBillingConfig, type CostSample } from '@/api/admin'
+import { getBillingConfig, putBillingConfig, type CostSample, getSessionConfig, putSessionConfig, type SessionExpirationData } from '@/api/admin'
 import ModelPricing from '@/components/ModelPricing.vue'
 import ErrorBubble from '@/components/ErrorBubble.vue'
 
@@ -28,11 +28,15 @@ const costSample = ref<CostSample>({
   reasoning: 500,
 })
 
+// 会话过期分档（后端按「上下文长度 + 对话次数」双维度分档，取较大者）
+const sessionExpiration = ref<SessionExpirationData>({ default_ttl_minutes: 5, context_tiers: [], turn_tiers: [] })
+const sessionSaving = ref(false)
+
 async function load() {
   loading.value = true
   errInfo.value = { message: '', requestId: '' }
   try {
-    const res = await getBillingConfig()
+    const [res, sessRes] = await Promise.all([getBillingConfig(), getSessionConfig()])
     r.value = typeof res.Data.R === 'string' ? Number(res.Data.R) : Number(res.Data.R)
     const c = Number(res.Data.CNYRate)
     if (c > 0) cnyRate.value = c
@@ -47,6 +51,12 @@ async function load() {
         output: Number(cs.output) || 0,
         reasoning: Number(cs.reasoning) || 0,
       }
+    }
+    const se = sessRes.Data.SessionExpiration
+    sessionExpiration.value = {
+      default_ttl_minutes: Number(se?.default_ttl_minutes) || 5,
+      context_tiers: se?.context_tiers || [],
+      turn_tiers: se?.turn_tiers || [],
     }
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
@@ -83,6 +93,39 @@ async function onSave() {
   } finally {
     saving.value = false
   }
+}
+
+// 保存会话过期分档配置（独立于计费配置，互不影响）
+async function saveSessionConfig() {
+  if (!Number.isInteger(sessionExpiration.value.default_ttl_minutes) || sessionExpiration.value.default_ttl_minutes <= 0) {
+    return ElMessage.warning('兜底 TTL 必须为正整数')
+  }
+
+  sessionSaving.value = true
+  errInfo.value = { message: '', requestId: '' }
+  try {
+    await putSessionConfig({ SessionExpiration: sessionExpiration.value })
+    ElMessage.success('会话过期分档已保存')
+  } catch (e: any) {
+    errInfo.value = { message: e?.message, requestId: e?.requestId }
+  } finally {
+    sessionSaving.value = false
+  }
+}
+
+// 上下文分档 增/删行
+function addContextTier() {
+  sessionExpiration.value.context_tiers.push({ max_tokens: 2000, ttl_minutes: 5 })
+}
+function removeContextTier(index: number) {
+  sessionExpiration.value.context_tiers.splice(index, 1)
+}
+// 对话次数分档 增/删行
+function addTurnTier() {
+  sessionExpiration.value.turn_tiers.push({ max_turns: 2, ttl_minutes: 5 })
+}
+function removeTurnTier(index: number) {
+  sessionExpiration.value.turn_tiers.splice(index, 1)
 }
 
 // 打开全局时段/分档默认值抽屉：读取当前 billing 配置
@@ -233,6 +276,64 @@ async function saveFallback() {
         </div>
       </div>
 
+      <el-divider />
+
+      <div class="config-block">
+        <div class="block-title">会话过期分档</div>
+        <div class="block-desc">
+          会话过期时长按「上下文长度（prompt token 估算）」与「用户对话次数」两维分别命中档位，取较大者，且不低于兜底值。档位为上界桶：实际值 ≤ 该档上界即命中该档，超过最大上界取最高档；过期时间只延长、不缩短。分档参数为系统级配置，对所有渠道生效。
+        </div>
+
+        <div class="form-row">
+          <span class="label">兜底 TTL（分钟）</span>
+          <el-input-number v-model="sessionExpiration.default_ttl_minutes" :min="1" />
+        </div>
+
+        <div class="tier-title">上下文分档</div>
+        <el-table :data="sessionExpiration.context_tiers" size="small" border>
+          <el-table-column label="最大 tokens" min-width="180">
+            <template #default="{ row }">
+              <el-input-number v-model="row.max_tokens" :min="1" style="width: 100%" />
+            </template>
+          </el-table-column>
+          <el-table-column label="TTL（分钟）" min-width="180">
+            <template #default="{ row }">
+              <el-input-number v-model="row.ttl_minutes" :min="1" style="width: 100%" />
+            </template>
+          </el-table-column>
+          <el-table-column label="操作" width="90" align="center">
+            <template #default="{ $index }">
+              <el-button link type="danger" @click="removeContextTier($index)">删除</el-button>
+            </template>
+          </el-table-column>
+        </el-table>
+        <el-button class="add-tier-btn" @click="addContextTier">添加档位</el-button>
+
+        <div class="tier-title">对话次数分档</div>
+        <el-table :data="sessionExpiration.turn_tiers" size="small" border>
+          <el-table-column label="最大对话次数" min-width="180">
+            <template #default="{ row }">
+              <el-input-number v-model="row.max_turns" :min="1" style="width: 100%" />
+            </template>
+          </el-table-column>
+          <el-table-column label="TTL（分钟）" min-width="180">
+            <template #default="{ row }">
+              <el-input-number v-model="row.ttl_minutes" :min="1" style="width: 100%" />
+            </template>
+          </el-table-column>
+          <el-table-column label="操作" width="90" align="center">
+            <template #default="{ $index }">
+              <el-button link type="danger" @click="removeTurnTier($index)">删除</el-button>
+            </template>
+          </el-table-column>
+        </el-table>
+        <el-button class="add-tier-btn" @click="addTurnTier">添加档位</el-button>
+
+        <div class="form-row">
+          <el-button type="primary" :loading="sessionSaving" @click="saveSessionConfig">保存分档配置</el-button>
+        </div>
+      </div>
+
       <!-- 全局时段/分档默认值 抽屉 -->
       <el-drawer v-model="fallbackOpen" title="全局时段/分档默认值" :size="720">
         <div class="fallback-tip">
@@ -275,6 +376,15 @@ async function saveFallback() {
   color: var(--color-text-secondary);
   font-size: 13px;
   margin-bottom: 14px;
+}
+.tier-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--color-text);
+  margin: 16px 0 8px;
+}
+.add-tier-btn {
+  margin-top: 10px;
 }
 .form-row {
   display: flex;

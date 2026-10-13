@@ -299,8 +299,15 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	// billing
 	billStore := billing.NewSqlStore(d)
 	billCfgProvider := billing.NewConfigProvider(billStore)
-	// sys_configs 写入后失效 ConfigProvider 的路由成本缓存（样值 + 全局时段），保证配置修改即时生效。
-	billStore.SetConfigWriteHook(billCfgProvider.InvalidateCostConfig)
+	// 会话过期分档配置 provider：读取 sys_configs 的 session.expiration，供 gateway 按
+	// 「上下文长度 + 用户对话次数」双维度计算会话 TTL。
+	sessExpiryProvider := router.NewSessionExpiryProvider(billStore)
+	// sys_configs 写入后失效 ConfigProvider 的路由成本缓存（样值 + 全局时段）与会话过期配置缓存，
+	// 保证配置修改即时生效（链式回调）。
+	billStore.SetConfigWriteHook(func() {
+		billCfgProvider.InvalidateCostConfig()
+		sessExpiryProvider.Invalidate()
+	})
 	billSvc := billing.NewService(billStore, billCfgProvider, creditSvc)
 	// 账单落库失败时的本地持久重试队列：DB 抖动不丢账单（billing_id 唯一索引保证重投幂等）。
 	billSvc.SetRetryQueue(billing.NewRetryQueue(cfg.Billing.RetryQueuePath, logr))
@@ -404,6 +411,8 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 		ChannelModels: cmStore,
 		TagKV:         tagKVResolver(tagStore),
 		Pricing:       pricingModeResolver(userStore),
+		// SessionExpiry 会话过期 TTL 分档计算（上下文长度 + 用户对话次数，取较大者，最低兜底 5 分钟）。
+		SessionExpiry: sessExpiryProvider,
 		// 三阶段计费（预扣/结算退补）：余额不足直接 402，请求后按实际多退少补。
 		Credit:          &creditOpsAdapter{svc: creditSvc},
 		Balance:         func(ctx context.Context, userID int64) (float64, error) { return creditSvc.GetWallet(ctx, userID) },

@@ -178,7 +178,6 @@ export interface AdminChannel {
   RateLimit: RateLimitConfig
   HealthProbe: HealthProbeConfig
   Reliability: ReliabilityConfig
-  SessionTTLMinutes: number
   KeyStates?: { KeyID: string; KeyName: string; State: string }[]
   CreatedAt: string
   UpdatedAt: string
@@ -193,7 +192,6 @@ export interface ChannelInput {
   RateLimit?: RateLimitConfig
   HealthProbe?: HealthProbeConfig
   Reliability?: ReliabilityConfig
-  SessionTTLMinutes?: number
 }
 // 渠道状态流转事件
 export interface ChannelEvent {
@@ -696,6 +694,29 @@ export function putBillingConfig(payload: {
   CostSample?: CostSample
 }) {
   return http.put<{ Affected: number }, ApiRes<{ Affected: number }>>('/admin/configs/billing', payload)
+}
+
+// ===== 会话过期分档配置（字段名 = 后端存储的 JSON key，snake_case）=====
+export interface SessionExpirationContextTier {
+  max_tokens: number
+  ttl_minutes: number
+}
+export interface SessionExpirationTurnTier {
+  max_turns: number
+  ttl_minutes: number
+}
+export interface SessionExpirationData {
+  default_ttl_minutes: number
+  context_tiers: SessionExpirationContextTier[]
+  turn_tiers: SessionExpirationTurnTier[]
+}
+export function getSessionConfig() {
+  return http.get<{ SessionExpiration: SessionExpirationData }, ApiRes<{ SessionExpiration: SessionExpirationData }>>(
+    '/admin/configs/session',
+  )
+}
+export function putSessionConfig(payload: { SessionExpiration: SessionExpirationData }) {
+  return http.put<{ Affected: number }, ApiRes<{ Affected: number }>>('/admin/configs/session', payload)
 }
 
 // ===== 公告（字段名 = Go 字段名）=====
