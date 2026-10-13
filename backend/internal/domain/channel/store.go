@@ -86,22 +86,22 @@ type ChannelKeyState struct {
 // Channel 对应 channels 表的一行（配置模板，不含凭据；凭据收敛到 channel_keys.credential_enc）。
 // 雪花 ID 超出 JS 安全整数，ID/tag_ids 等 ID 字段以字符串序列化。
 type Channel struct {
-	ID                int64             `json:"ID,string"`
-	Name              string            `json:"Name"`
-	Protocol          string            `json:"Protocol"`
-	BaseURL           string            `json:"BaseURL"`
-	Tags              map[string]string `json:"Tags"`
-	TagIDs            idgen.IDs         `json:"TagIDs"`
-	BoundTags         []TagRef          `json:"BoundTags"`
-	Priority          int               `json:"Priority"`
-	State             State             `json:"State"`
-	RateLimit         RateLimitConfig   `json:"RateLimit"`
-	HealthProbe       HealthProbeConfig `json:"HealthProbe"`
-	Reliability       ReliabilityConfig `json:"Reliability"`
-	SessionTTLMinutes int               `json:"SessionTTLMinutes"` // 会话存活时长（分钟）；0 由运行时兜底 60
-	KeyStates         []ChannelKeyState `json:"KeyStates"`
-	CreatedAt         time.Time         `json:"CreatedAt"`
-	UpdatedAt         time.Time         `json:"UpdatedAt"`
+	ID          int64             `json:"ID,string"`
+	Name        string            `json:"Name"`
+	Protocol    string            `json:"Protocol"`
+	BaseURL     string            `json:"BaseURL"`
+	Tags        map[string]string `json:"Tags"`
+	TagIDs      idgen.IDs         `json:"TagIDs"`
+	BoundTags   []TagRef          `json:"BoundTags"`
+	Priority    int               `json:"Priority"`
+	State       State             `json:"State"`
+	RateLimit   RateLimitConfig   `json:"RateLimit"`
+	HealthProbe HealthProbeConfig `json:"HealthProbe"`
+	Reliability ReliabilityConfig `json:"Reliability"`
+
+	KeyStates []ChannelKeyState `json:"KeyStates"`
+	CreatedAt time.Time         `json:"CreatedAt"`
+	UpdatedAt time.Time         `json:"UpdatedAt"`
 }
 
 // ChannelEvent 对应 channel_events 表一行，记录一次渠道状态流转。
@@ -144,7 +144,7 @@ type ProbeLog struct {
 }
 
 // channelCols 列出 channels 表查询时使用的全部列，保持各查询一致。
-const channelCols = `id, name, protocol, base_url, tags, priority, state, rate_limit, health_probe, reliability, session_ttl_minutes, created_at, updated_at`
+const channelCols = `id, name, protocol, base_url, tags, priority, state, rate_limit, health_probe, reliability, created_at, updated_at`
 
 const eventCols = `id, channel_id, from_state, to_state, reason, created_at`
 
@@ -156,7 +156,7 @@ func scanChannel(row interface{ Scan(...any) error }) (*Channel, error) {
 	var tagsRaw, rlRaw, hpRaw, relRaw []byte
 	var state string
 	err := row.Scan(&c.ID, &c.Name, &c.Protocol, &c.BaseURL,
-		&tagsRaw, &c.Priority, &state, &rlRaw, &hpRaw, &relRaw, &c.SessionTTLMinutes,
+		&tagsRaw, &c.Priority, &state, &rlRaw, &hpRaw, &relRaw,
 		&c.CreatedAt, &c.UpdatedAt)
 	if err != nil {
 		return nil, err
@@ -269,12 +269,12 @@ func (s *Store) Insert(ctx context.Context, c *Channel) (*Channel, error) {
 		c.ID = idgen.New()
 	}
 	row := s.db.QueryRowContext(ctx,
-		`INSERT INTO channels(id, name, protocol, base_url, tags, priority, state, rate_limit, health_probe, reliability, session_ttl_minutes)
-		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+		`INSERT INTO channels(id, name, protocol, base_url, tags, priority, state, rate_limit, health_probe, reliability)
+		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
 		 RETURNING `+channelCols,
 		c.ID, c.Name, c.Protocol, c.BaseURL, marshalJSONB(c.Tags),
 		c.Priority, string(c.State), marshalJSONB(c.RateLimit), marshalJSONB(c.HealthProbe),
-		marshalJSONB(c.Reliability), c.SessionTTLMinutes)
+		marshalJSONB(c.Reliability))
 	created, err := scanChannel(row)
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -291,11 +291,11 @@ func (s *Store) Update(ctx context.Context, c *Channel) error {
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE channels SET name=$1, protocol=$2, base_url=$3,
 		        tags=$4, priority=$5, state=$6, rate_limit=$7, health_probe=$8,
-		        reliability=$9, session_ttl_minutes=$10, updated_at=now()
-		 WHERE id=$11`,
+		        reliability=$9, updated_at=now()
+		 WHERE id=$10`,
 		c.Name, c.Protocol, c.BaseURL, marshalJSONB(c.Tags),
 		c.Priority, string(c.State), marshalJSONB(c.RateLimit), marshalJSONB(c.HealthProbe),
-		marshalJSONB(c.Reliability), c.SessionTTLMinutes, c.ID)
+		marshalJSONB(c.Reliability), c.ID)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
@@ -541,12 +541,12 @@ func (s *Store) InsertWithTags(ctx context.Context, c *Channel, tagIDs []int64) 
 		c.ID = idgen.New()
 	}
 	row := tx.QueryRowContext(ctx,
-		`INSERT INTO channels(id, name, protocol, base_url, tags, priority, state, rate_limit, health_probe, reliability, session_ttl_minutes)
-		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+		`INSERT INTO channels(id, name, protocol, base_url, tags, priority, state, rate_limit, health_probe, reliability)
+		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
 		 RETURNING `+channelCols,
 		c.ID, c.Name, c.Protocol, c.BaseURL, marshalJSONB(c.Tags),
 		c.Priority, string(c.State), marshalJSONB(c.RateLimit), marshalJSONB(c.HealthProbe),
-		marshalJSONB(c.Reliability), c.SessionTTLMinutes)
+		marshalJSONB(c.Reliability))
 	created, err := scanChannel(row)
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -574,11 +574,11 @@ func (s *Store) UpdateWithTags(ctx context.Context, c *Channel, tagIDs []int64) 
 	res, err := tx.ExecContext(ctx,
 		`UPDATE channels SET name=$1, protocol=$2, base_url=$3,
 		        tags=$4, priority=$5, state=$6, rate_limit=$7, health_probe=$8,
-		        reliability=$9, session_ttl_minutes=$10, updated_at=now()
-		 WHERE id=$11 AND deleted_at IS NULL`,
+		        reliability=$9, updated_at=now()
+		 WHERE id=$10 AND deleted_at IS NULL`,
 		c.Name, c.Protocol, c.BaseURL, marshalJSONB(c.Tags),
 		c.Priority, string(c.State), marshalJSONB(c.RateLimit), marshalJSONB(c.HealthProbe),
-		marshalJSONB(c.Reliability), c.SessionTTLMinutes, c.ID)
+		marshalJSONB(c.Reliability), c.ID)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {

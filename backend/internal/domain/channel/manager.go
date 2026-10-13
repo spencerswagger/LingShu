@@ -53,9 +53,6 @@ func DefaultReliability() ReliabilityConfig {
 	}
 }
 
-// DefaultSessionTTLMinutes 会话存活时长默认值（分钟）。
-const DefaultSessionTTLMinutes = 60
-
 // normalizeRateLimit 以默认值兜底零值字段。
 func normalizeRateLimit(r RateLimitConfig) RateLimitConfig {
 	def := DefaultRateLimit()
@@ -177,23 +174,22 @@ type ModelRuntime struct {
 
 // ChannelView 是 API 输出结构：附当前状态/LastErr/探测时间及有效配置（凭据已收敛到 channel_keys）。
 type ChannelView struct {
-	ID            int64             `json:"ID,string"`
-	Name          string            `json:"Name"`
-	Protocol      string            `json:"Protocol"`
-	BaseURL       string            `json:"BaseURL"`
-	Tags          map[string]string `json:"Tags"`
-	BoundTags     []TagRef          `json:"BoundTags"`
-	Priority      int               `json:"Priority"`
-	State         State             `json:"State"`
-	LastErr       string            `json:"LastErr,omitempty"`
-	LastProbe     *time.Time        `json:"LastProbe,omitempty"`
-	RateLimit     RateLimitConfig   `json:"RateLimit"`
-	HealthProbe   HealthProbeConfig `json:"HealthProbe"`
-	Reliability   ReliabilityConfig `json:"Reliability"`
-	MaxSessions   int               `json:"MaxSessions"`
-	SessionTTLMin int               `json:"SessionTTLMin"`
-	CreatedAt     time.Time         `json:"CreatedAt"`
-	UpdatedAt     time.Time         `json:"UpdatedAt"`
+	ID          int64             `json:"ID,string"`
+	Name        string            `json:"Name"`
+	Protocol    string            `json:"Protocol"`
+	BaseURL     string            `json:"BaseURL"`
+	Tags        map[string]string `json:"Tags"`
+	BoundTags   []TagRef          `json:"BoundTags"`
+	Priority    int               `json:"Priority"`
+	State       State             `json:"State"`
+	LastErr     string            `json:"LastErr,omitempty"`
+	LastProbe   *time.Time        `json:"LastProbe,omitempty"`
+	RateLimit   RateLimitConfig   `json:"RateLimit"`
+	HealthProbe HealthProbeConfig `json:"HealthProbe"`
+	Reliability ReliabilityConfig `json:"Reliability"`
+	MaxSessions int               `json:"MaxSessions"`
+	CreatedAt   time.Time         `json:"CreatedAt"`
+	UpdatedAt   time.Time         `json:"UpdatedAt"`
 }
 
 // ModelView 是内部模型运行时输出：状态/LastErr/探测时间 + 有效配置。
@@ -450,16 +446,6 @@ func mergeHealthProbe(model, ch HealthProbeConfig) HealthProbeConfig {
 		model.ProbeModel = ch.ProbeModel
 	}
 	return model
-}
-
-// SessionTTL 返回渠道会话存活时长（分钟），0 兜底默认。
-func (m *Manager) SessionTTL(channelID int64) int {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if rt, ok := m.rt[channelID]; ok && rt.Channel.SessionTTLMinutes > 0 {
-		return rt.Channel.SessionTTLMinutes
-	}
-	return DefaultSessionTTLMinutes
 }
 
 // MaxSessions 返回渠道并发会话数上限（0 兜底默认）。
@@ -906,23 +892,22 @@ func (m *Manager) Snapshot() []ChannelView {
 		btCp := make([]TagRef, len(srcRefs))
 		copy(btCp, srcRefs)
 		views = append(views, ChannelView{
-			ID:            c.ID,
-			Name:          c.Name,
-			Protocol:      c.Protocol,
-			BaseURL:       c.BaseURL,
-			Tags:          c.Tags,
-			BoundTags:     btCp,
-			Priority:      c.Priority,
-			State:         rt.Machine.State(),
-			LastErr:       rt.LastErr,
-			LastProbe:     lp,
-			RateLimit:     rl,
-			HealthProbe:   normalizeHealthProbe(c.HealthProbe),
-			Reliability:   normalizeReliability(c.Reliability),
-			MaxSessions:   rl.MaxConcurrent,
-			SessionTTLMin: c.SessionTTLMinutes,
-			CreatedAt:     c.CreatedAt,
-			UpdatedAt:     c.UpdatedAt,
+			ID:          c.ID,
+			Name:        c.Name,
+			Protocol:    c.Protocol,
+			BaseURL:     c.BaseURL,
+			Tags:        c.Tags,
+			BoundTags:   btCp,
+			Priority:    c.Priority,
+			State:       rt.Machine.State(),
+			LastErr:     rt.LastErr,
+			LastProbe:   lp,
+			RateLimit:   rl,
+			HealthProbe: normalizeHealthProbe(c.HealthProbe),
+			Reliability: normalizeReliability(c.Reliability),
+			MaxSessions: rl.MaxConcurrent,
+			CreatedAt:   c.CreatedAt,
+			UpdatedAt:   c.UpdatedAt,
 		})
 	}
 	return views

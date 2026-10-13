@@ -45,15 +45,14 @@ const (
 // ChannelInput 创建/更新渠道的可写字段。凭据由 channel_keys（密钥管理）承载，渠道层不再持有。
 // 权重已废弃并删除数据库列（0005 迁移）：同优先级内改由「成本最低 + 存活会话数」决定。
 type ChannelInput struct {
-	Name              string
-	Protocol          string
-	BaseURL           string
-	TagIDs            []int64
-	Priority          int
-	RateLimit         *RateLimitConfig
-	HealthProbe       *HealthProbeConfig
-	Reliability       *ReliabilityConfig
-	SessionTTLMinutes int
+	Name        string
+	Protocol    string
+	BaseURL     string
+	TagIDs      []int64
+	Priority    int
+	RateLimit   *RateLimitConfig
+	HealthProbe *HealthProbeConfig
+	Reliability *ReliabilityConfig
 }
 
 // TagResolver 由 tag 域经装配层适配实现；channel 不直接依赖 tag 包。
@@ -108,15 +107,11 @@ func validateBase(name, baseURL, protocol string) error {
 func fillDefaults(c *Channel, in ChannelInput) {
 	c.Priority = 100
 	c.State = StateNormal
-	c.SessionTTLMinutes = DefaultSessionTTLMinutes
 	c.RateLimit = DefaultRateLimit()
 	c.HealthProbe = DefaultHealthProbe()
 	c.Reliability = DefaultReliability()
 	if in.Priority > 0 {
 		c.Priority = in.Priority
-	}
-	if in.SessionTTLMinutes > 0 {
-		c.SessionTTLMinutes = in.SessionTTLMinutes
 	}
 	if in.RateLimit != nil {
 		c.RateLimit = normalizeRateLimit(*in.RateLimit)
@@ -210,7 +205,6 @@ func (s *Service) UpdateChannel(ctx context.Context, id int64, in ChannelInput) 
 	c.RateLimit = existing.RateLimit
 	c.HealthProbe = existing.HealthProbe
 	c.Reliability = existing.Reliability
-	c.SessionTTLMinutes = existing.SessionTTLMinutes
 	if in.RateLimit != nil {
 		c.RateLimit = normalizeRateLimit(*in.RateLimit)
 	}
@@ -219,9 +213,6 @@ func (s *Service) UpdateChannel(ctx context.Context, id int64, in ChannelInput) 
 	}
 	if in.Reliability != nil {
 		c.Reliability = normalizeReliability(*in.Reliability)
-	}
-	if in.SessionTTLMinutes > 0 {
-		c.SessionTTLMinutes = in.SessionTTLMinutes
 	}
 	if in.Priority > 0 {
 		c.Priority = in.Priority
