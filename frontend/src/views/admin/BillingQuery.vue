@@ -26,6 +26,12 @@ import { resolveBillingRange } from '@/utils/range'
 
 const route = useRoute()
 const router = useRouter()
+
+// mode='self' 时复用为开发者自助账单页（API 走 /dev 前缀）
+const props = withDefaults(defineProps<{ mode?: 'admin' | 'self' }>(), { mode: 'admin' })
+const isSelf = computed(() => props.mode === 'self')
+const base = computed(() => (isSelf.value ? '/dev' : '/admin'))
+
 const loading = ref(false)
 const list = ref<AdminBillingItem[]>([])
 const total = ref(0)
@@ -98,7 +104,10 @@ async function load() {
   const params = buildParams({ Page: page.value, Size: size.value })
   const statsParams = buildParams()
   try {
-    const [billRes, statsRes] = await Promise.all([listBillings(params), getBillingStats(statsParams)])
+    const [billRes, statsRes] = await Promise.all([
+      listBillings(params, base.value),
+      getBillingStats(statsParams, base.value),
+    ])
     list.value = billRes.Data.List
     total.value = billRes.Data.Total
     stats.value = statsRes.Data
@@ -111,6 +120,8 @@ async function load() {
 
 // ===== 选项加载 =====
 async function loadChannels() {
+  // self 模式仅服务端只读接口（无 /dev/channels），直接跳过，避免 403 噪音。
+  if (isSelf.value) return
   if (channels.value.length) return
   try {
     channels.value = (await listChannels()).Data || []
@@ -121,12 +132,14 @@ async function loadChannels() {
 async function loadModels() {
   if (models.value.length) return
   try {
-    models.value = (await listExternalModels({})).Data || []
+    models.value = (await listExternalModels({}, base.value)).Data || []
   } catch {
     models.value = []
   }
 }
 async function loadTokensOfUser() {
+  // self 模式无 admin 令牌接口，跳过，避免 403 噪音。
+  if (isSelf.value) return
   tokens.value = []
   if (!filters.user_id) {
     filters.token_id = undefined
@@ -141,7 +154,7 @@ async function loadTokensOfUser() {
 }
 async function searchSessions(q: string) {
   try {
-    const res = await listSessions({ Q: q, Page: 1, Size: 50 })
+    const res = await listSessions({ Q: q, Page: 1, Size: 50 }, base.value)
     sessions.value = res.Data.List || []
   } catch {
     sessions.value = []
@@ -452,7 +465,7 @@ function sessionLabel(s: AdminSession): string {
         stripe
         class="table-nowrap clickable-rows"
         row-key="BillingID"
-        @row-click="(row: AdminBillingItem) => router.push(`/admin/billings/${row.BillingID}`)"
+        @row-click="(row: AdminBillingItem) => router.push(isSelf ? `/dev/billings/${row.BillingID}` : `/admin/billings/${row.BillingID}`)"
       >
         <!-- 时间：筛选图标 → 浮窗时间段选择器 -->
         <el-table-column label="时间" min-width="130" align="center">
@@ -483,8 +496,8 @@ function sessionLabel(s: AdminSession): string {
           </template>
         </el-table-column>
 
-        <!-- 用户 / 密钥：筛选图标 → 浮窗（用户搜索 + 该用户令牌） -->
-        <el-table-column label="用户 / 密钥" min-width="150">
+        <!-- 用户 / 密钥：筛选图标 → 浮窗（用户搜索 + 该用户令牌）；self 模式不展示 -->
+        <el-table-column v-if="!isSelf" label="用户 / 密钥" min-width="150">
           <template #header>
             <ColumnFilter
               label="用户 / 密钥"
@@ -553,8 +566,8 @@ function sessionLabel(s: AdminSession): string {
           </template>
         </el-table-column>
 
-        <!-- 渠道 / 密钥 -->
-        <el-table-column label="渠道 / 密钥" min-width="150">
+        <!-- 渠道 / 密钥；self 模式不展示 -->
+        <el-table-column v-if="!isSelf" label="渠道 / 密钥" min-width="150">
           <template #header>
             <ColumnFilter
               label="渠道 / 密钥"

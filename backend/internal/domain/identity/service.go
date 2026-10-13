@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -433,6 +434,64 @@ func (s *Service) AdminCreateUser(ctx context.Context, username, password, role,
 	s.auditLog(ctx, audit.Entry{Action: "admin.user.create", TargetType: "user", TargetID: strconv.FormatInt(created.ID, 10),
 		Detail: map[string]any{"username": created.Username, "role": created.Role, "pricing_mode": created.PricingMode}})
 	return created, nil
+}
+
+// usernameRe 自助注册用户名规则：3-32 位字母、数字、下划线或中划线。
+var usernameRe = regexp.MustCompile(`^[A-Za-z0-9_-]{3,32}$`)
+
+// Register 开发者自助注册：校验用户名规则/口令强度/昵称 → 建号（固定 DEVELOPER/ACTIVE/sale，
+// 不强制改密）→ 建钱包 → 直接签发会话（注册即登录）。
+// 用户名唯一性由「先行查询 + DB 唯一约束」双重保证（并发下由 23505 兜底）。
+func (s *Service) Register(ctx context.Context, username, password, nickname string) (*LoginResult, error) {
+	if !usernameRe.MatchString(username) {
+		return nil, errBadRequest("用户名需为 3-32 位字母、数字、下划线或中划线")
+	}
+	if err := validatePasswordStrength(password); err != nil {
+		return nil, err
+	}
+	nick, err := normalizeNickname(nickname)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := s.store.GetByUsername(ctx, username); err == nil {
+		return nil, errUsernameExists()
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("query username: %w", err)
+	}
+	hash, err := crypto.HashPassword(password)
+	if err != nil {
+		return nil, fmt.Errorf("hash password: %w", err)
+	}
+	u := &User{
+		Username:           username,
+		PasswordHash:       hash,
+		Nickname:           nick,
+		Role:               RoleDeveloper,
+		Status:             StatusActive,
+		PricingMode:        PricingModeSale,
+		MustChangePassword: false, // 自主设置口令，不强制改密
+	}
+	created, err := s.store.Create(ctx, u)
+	if err != nil {
+		if errors.Is(err, ErrUsernameExists) {
+			return nil, errUsernameExists()
+		}
+		return nil, fmt.Errorf("create user: %w", err)
+	}
+	if err := s.store.EnsureWallet(ctx, created.ID); err != nil {
+		return nil, fmt.Errorf("ensure wallet: %w", err)
+	}
+	token, _, err := s.issueSession(ctx, created)
+	if err != nil {
+		return nil, err
+	}
+	created.PasswordHash = ""
+	s.auditLog(ctx, audit.Entry{
+		UserID: created.ID, Username: created.Username, Action: "auth.register.success",
+		TargetType: "user", TargetID: strconv.FormatInt(created.ID, 10),
+		Detail: map[string]any{"role": created.Role},
+	})
+	return &LoginResult{Token: token, User: created, MustChangePassword: false}, nil
 }
 
 // ListUsers 分页查询用户，调用方需具备管理权限。q 模糊匹配用户名；role/status 精确过滤。

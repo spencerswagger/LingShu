@@ -8,6 +8,9 @@ import StatusTag from '@/components/StatusTag.vue'
 import ChatBubble from '@/components/ChatBubble.vue'
 import { contentToBubbles, fmtJson, type MsgBubble } from '@/utils/messageParts'
 
+const props = withDefaults(defineProps<{ mode?: 'admin' | 'self' }>(), { mode: 'admin' })
+const isSelf = computed(() => props.mode === 'self')
+
 const route = useRoute()
 const router = useRouter()
 const sessionId = String(route.params.id)
@@ -22,8 +25,8 @@ onMounted(async () => {
   errInfo.value = { message: '', requestId: '' }
   try {
     const [metaRes, callsRes] = await Promise.all([
-      listSessions({ Q: sessionId, Size: 1 }),
-      listSessionCalls(sessionId),
+      listSessions({ Q: sessionId, Size: 1 }, isSelf.value ? '/dev' : '/admin'),
+      listSessionCalls(sessionId, isSelf.value ? '/dev' : '/admin'),
     ])
     meta.value = metaRes.Data.List?.[0] || null
     calls.value = callsRes.Data.List || []
@@ -154,7 +157,7 @@ const transcript = computed<TranscriptItem[]>(() =>
     <div class="page-header">
       <div class="page-title">会话详情</div>
       <div class="page-header-spacer" />
-      <el-button link @click="router.push('/admin/sessions')">返回会话列表</el-button>
+      <el-button link @click="router.push(isSelf ? '/dev/sessions' : '/admin/sessions')">返回会话列表</el-button>
     </div>
 
     <div v-loading="loading" class="card">

@@ -80,18 +80,6 @@ export interface DevTag {
 
 // ===== 开发端·钱包/用量/账单/公告 =====
 
-// 钱包余额
-export function getDevWallet() {
-  return http.get<{ Balance: number }, ApiRes<{ Balance: number }>>('/dev/wallet')
-}
-
-// 钱包流水
-export function listDevFlows(page = 1, size = 20) {
-  return http.get<PageResult<FlowItem>, ApiRes<PageResult<FlowItem>>>('/dev/wallet/flows', {
-    params: { Page: page, Size: size },
-  })
-}
-
 export interface FlowItem {
   ID: string
   Type: string // recharge | consume | adjust | set
@@ -101,20 +89,6 @@ export interface FlowItem {
   RefBillingID?: string
   Remark?: string
   CreatedAt: string
-}
-
-// 按日用量
-export function getDevUsage(days = 30) {
-  return http.get<{ List: UsageDay[]; Days: number }, ApiRes<{ List: UsageDay[]; Days: number }>>(
-    '/dev/usage',
-    { params: { Days: days } },
-  )
-}
-
-export interface UsageDay {
-  Date: string // 2006-01-02
-  Credits: number
-  Calls: number
 }
 
 // 账单列表项（后端 billingListItem：ExternalModel 为模型字段名）
