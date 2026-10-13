@@ -1,7 +1,7 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 
-// 路由表：/login 公开；/admin/* 仅 ADMIN；/dev/* 仅 DEVELOPER
+// 路由表：/login、/register 公开；/admin/* 仅 ADMIN；/dev/* 仅 DEVELOPER
 const router = createRouter({
   history: createWebHistory(),
   routes: [
@@ -9,6 +9,11 @@ const router = createRouter({
       path: '/login',
       name: 'login',
       component: () => import('@/views/Login.vue'),
+    },
+    {
+      path: '/register',
+      name: 'register',
+      component: () => import('@/views/Register.vue'),
     },
     {
       path: '/admin',
@@ -80,34 +85,39 @@ const router = createRouter({
           meta: { title: '令牌详情' },
         },
         {
-          path: 'usage',
-          name: 'dev-usage',
-          component: () => import('@/views/dev/Usage.vue'),
-          meta: { title: '用量统计' },
+          path: 'models',
+          name: 'dev-model-list',
+          component: () => import('@/views/admin/ModelList.vue'),
+          meta: { title: '模型' },
+          props: { mode: 'self' },
         },
         {
-          path: 'wallet',
-          name: 'dev-wallet',
-          component: () => import('@/views/dev/Wallet.vue'),
-          meta: { title: '我的钱包' },
+          path: 'sessions',
+          name: 'dev-sessions',
+          component: () => import('@/views/admin/SessionList.vue'),
+          meta: { title: '会话' },
+          props: { mode: 'self' },
+        },
+        {
+          path: 'sessions/:id',
+          name: 'dev-session-detail',
+          component: () => import('@/views/admin/SessionDetail.vue'),
+          meta: { title: '会话详情' },
+          props: { mode: 'self' },
         },
         {
           path: 'billings',
           name: 'dev-billings',
-          component: () => import('@/views/dev/Billings.vue'),
-          meta: { title: '消费账单' },
+          component: () => import('@/views/admin/BillingQuery.vue'),
+          meta: { title: '账单' },
+          props: { mode: 'self' },
         },
         {
           path: 'billings/:id',
           name: 'dev-billing-detail',
-          component: () => import('@/views/dev/BillingDetail.vue'),
+          component: () => import('@/views/admin/BillingDetail.vue'),
           meta: { title: '账单详情' },
-        },
-        {
-          path: 'announcements',
-          name: 'dev-announcements',
-          component: () => import('@/views/dev/Announcements.vue'),
-          meta: { title: '系统公告' },
+          props: { mode: 'self' },
         },
       ],
     },
@@ -127,12 +137,12 @@ const router = createRouter({
 
 router.beforeEach(async (to) => {
   const auth = useAuthStore()
-  // 未登录：除登录页外均跳登录
-  if (!auth.token && to.name !== 'login') {
+  // 未登录：除登录页、注册页外均跳登录
+  if (!auth.token && to.name !== 'login' && to.name !== 'register') {
     return { name: 'login', query: { redirect: to.fullPath } }
   }
-  // 已登录访问登录页：按角色回首页
-  if (auth.token && to.name === 'login') {
+  // 已登录访问登录/注册页：按角色回首页
+  if (auth.token && (to.name === 'login' || to.name === 'register')) {
     return auth.role === 'ADMIN' ? '/admin' : '/dev'
   }
   // 已登录访问受保护页：先拉取最新用户信息，同步本地角色（堵住本地清 role 绕过，
