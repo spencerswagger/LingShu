@@ -238,7 +238,9 @@ func (r *SessionRegistry) Renew(sessionID string, ttl time.Duration) {
 	}
 	s.LastActive = r.now()
 	if ttl > 0 {
-		s.ExpireAt = s.LastActive.Add(ttl)
+		if cand := s.LastActive.Add(ttl); cand.After(s.ExpireAt) {
+			s.ExpireAt = cand
+		}
 	}
 	store, logf := r.store, r.logf
 	r.mu.Unlock()

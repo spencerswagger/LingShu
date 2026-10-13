@@ -41,6 +41,9 @@ const (
 	msgInternal      = "服务器内部错误"
 )
 
+// sessionTTLFallback 会话过期兜底时长：resolver 缺失或返回非正值时使用（5 分钟）。
+const sessionTTLFallback = 5 * time.Minute
+
 // handleModels GET /v1/models 返回启用中的对外模型列表（OpenAI 兼容格式）。
 // 鉴权与 serve 一致：校验 Bearer 令牌；列表为空时返回空 data 而非报错。
 func (g *Gateway) handleModels(w http.ResponseWriter, r *http.Request) {
@@ -313,6 +316,18 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint string)
 	//    - 上游失败可安全转移（响应未写出且上游未计费，见 retryableUpstreamStatus / withWriteTrace）→ 下一候选
 	//    - 全部候选都失败 → 退还预扣并返回聚合错误
 	sess := g.router.Sessions()
+	// 会话过期 TTL：按上下文长度（prompt token）与用户对话次数双维度分档取较大者，最低兜底 5 分钟。
+	// 仅在有会话标识时计算（Attach/Renew 均在 sessionID != "" 下发生），避免无状态请求白跑 token 计数。
+	ttl := sessionTTLFallback
+	if sessionID != "" && g.sessionExpiry != nil {
+		ctxTokens, cerr := countPromptTokens(body, model)
+		if cerr != nil {
+			ctxTokens = estTokens(body) // 与限流/计费同一粗略口径
+		}
+		if v := g.sessionExpiry.TTL(ctxTokens, countUserTurns(body)); v > 0 {
+			ttl = v
+		}
+	}
 	sessObj, hasSession := sess.Lookup(sessionID)
 	// 已关闭会话视为不存在：不参与续行（走下方 Attach 重建，重新占并发槽），
 	// 避免「关闭后同一会话标识仍被服务、且绕过并发上限」。sessObj 保留用于请求增量 diff 的指纹对齐。
@@ -411,7 +426,6 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint string)
 		//（其他密钥/渠道/内部模型行仍有插槽时照常续用），不归为「限流类 429」；
 		// 全部候选都因会话满失败时由下面终结分支统一回报 503（无可用渠道）。
 		if !existing && sessionID != "" {
-			ttl := time.Duration(g.channels.SessionTTL(cr.ChannelID)) * time.Minute
 			ok2, _ := sess.Attach(&router.Session{
 				SessionID:           sessionID,
 				UserID:              token.UserID,
@@ -455,7 +469,7 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint string)
 		}
 		if out.responded {
 			if sessionID != "" {
-				sess.Renew(sessionID, time.Duration(g.channels.SessionTTL(cr.ChannelID))*time.Minute)
+				sess.Renew(sessionID, ttl)
 			}
 			// 实际消费差额已在 recordBilling → Record 内多退少补；若仅落 failed、
 			// 未实际消费（上游/转发失败），退回本次预扣。

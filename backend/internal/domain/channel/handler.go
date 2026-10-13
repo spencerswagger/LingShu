@@ -67,15 +67,14 @@ func (h *Handler) SetSessionKiller(fn func(keyID int64) int) {
 }
 
 type createChannelRequest struct {
-	Name              string             `json:"Name"`
-	Protocol          string             `json:"Protocol"`
-	BaseURL           string             `json:"BaseURL"`
-	TagIDs            idgen.IDs          `json:"TagIDs"`
-	Priority          int                `json:"Priority"`
-	RateLimit         *RateLimitConfig   `json:"RateLimit"`
-	HealthProbe       *HealthProbeConfig `json:"HealthProbe"`
-	Reliability       *ReliabilityConfig `json:"Reliability"`
-	SessionTTLMinutes int                `json:"SessionTTLMinutes"`
+	Name        string             `json:"Name"`
+	Protocol    string             `json:"Protocol"`
+	BaseURL     string             `json:"BaseURL"`
+	TagIDs      idgen.IDs          `json:"TagIDs"`
+	Priority    int                `json:"Priority"`
+	RateLimit   *RateLimitConfig   `json:"RateLimit"`
+	HealthProbe *HealthProbeConfig `json:"HealthProbe"`
+	Reliability *ReliabilityConfig `json:"Reliability"`
 }
 
 func decodeBody(w http.ResponseWriter, r *http.Request, v any) bool {
@@ -112,15 +111,14 @@ func (h *Handler) requireKeyOwnership(w http.ResponseWriter, r *http.Request, ch
 
 func toInput(req *createChannelRequest) ChannelInput {
 	return ChannelInput{
-		Name:              req.Name,
-		Protocol:          req.Protocol,
-		BaseURL:           req.BaseURL,
-		TagIDs:            []int64(req.TagIDs),
-		Priority:          req.Priority,
-		RateLimit:         req.RateLimit,
-		HealthProbe:       req.HealthProbe,
-		Reliability:       req.Reliability,
-		SessionTTLMinutes: req.SessionTTLMinutes,
+		Name:        req.Name,
+		Protocol:    req.Protocol,
+		BaseURL:     req.BaseURL,
+		TagIDs:      []int64(req.TagIDs),
+		Priority:    req.Priority,
+		RateLimit:   req.RateLimit,
+		HealthProbe: req.HealthProbe,
+		Reliability: req.Reliability,
 	}
 }
 

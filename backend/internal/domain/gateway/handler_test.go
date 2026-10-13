@@ -121,7 +121,19 @@ func (f *fakeChannels) KeyMaxSessions(int64) int {
 	return 16
 }
 
-func (f *fakeChannels) SessionTTL(int64) int { return 60 }
+// fakeSessionExpiry 可编程的会话过期 TTL fake（fn 为空时默认 60 分钟，保持既有测试时序余量）。
+type fakeSessionExpiry struct {
+	fn    func(ctxTokens, turns int) time.Duration
+	calls int
+}
+
+func (f *fakeSessionExpiry) TTL(ctxTokens, turns int) time.Duration {
+	f.calls++
+	if f.fn != nil {
+		return f.fn(ctxTokens, turns)
+	}
+	return 60 * time.Minute
+}
 
 // fakeBilling 模拟真实 billing.Record：已预扣时对同一钱包做差额结算（Settle），
 // 无预扣时全额实扣（Consume）。credit 与网关预扣共用，便于验证最终净额。
@@ -252,6 +264,7 @@ type harness struct {
 	cmclass *fakeChannelModel
 	clogs   *fakeCallLogs
 	clock   *testClock
+	expiry  *fakeSessionExpiry
 }
 
 // fakeCallLogs 内存调用日志存储（测试断言采集内容）。
@@ -306,6 +319,7 @@ func build(t *testing.T, upstreamURL string) *harness {
 		Limiter:         channel.NewLimiter(1000, 1000000, 1.2),
 	}
 	cf := &fakeChannels{rt: rt, mrt: mrt, keys: map[int64]*channel.KeyRuntime{1: kr}}
+	exp := &fakeSessionExpiry{}
 	gw := NewGateway(GatewayConfig{
 		Tokens:        tok,
 		Router:        rr,
@@ -319,12 +333,13 @@ func build(t *testing.T, upstreamURL string) *harness {
 		Pricing: func(_ context.Context, _ int64) (string, error) {
 			return identity.PricingModeSale, nil
 		},
-		Now:    clock.now,
-		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		SessionExpiry: exp,
+		Now:           clock.now,
+		Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	clog := &fakeCallLogs{}
 	gw.SetCallLogs(clog)
-	return &harness{gw: gw, chans: cf, billing: bf, rrouter: rr, tok: tok, models: mf, cmclass: cmf, clogs: clog, clock: clock}
+	return &harness{gw: gw, chans: cf, billing: bf, rrouter: rr, tok: tok, models: mf, cmclass: cmf, clogs: clog, clock: clock, expiry: exp}
 }
 
 // doRequest 向网关发送一次 OpenAI-compat 请求。
@@ -879,6 +894,78 @@ func TestServeSessionAttachKeyAndRenew(t *testing.T) {
 	}
 	if !s2.LastActive.After(last1) {
 		t.Errorf("renew did not advance last_active")
+	}
+}
+
+// 会话过期 TTL 按档位（上下文长度 + 对话次数）计算：续期只增不减。
+func TestServeSessionExpiryByTiers(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"x","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`))
+	}))
+	defer upstream.Close()
+
+	h := build(t, upstream.URL)
+	if h.expiry == nil {
+		t.Fatalf("harness expiry resolver not wired")
+	}
+	sid := router.SessionID(7, 42, "gpt-4", "tiers")
+	body := `{"model":"gpt-4","stream":false,"messages":[{"role":"user","content":"hello"}]}`
+
+	// 首次请求：TTL 档位返回 10 分钟。
+	h.expiry.fn = func(ctxTokens, turns int) time.Duration {
+		if turns >= 10 {
+			return 3 * time.Hour
+		}
+		return 10 * time.Minute
+	}
+	rec1 := doRequestH(t, h.gw, "/v1/chat/completions", "sk-gw-t", body, map[string]string{"x-session-id": "tiers"})
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("first request want 200, got %d: %s", rec1.Code, rec1.Body.String())
+	}
+	s1, ok := h.rrouter.sess.Lookup(sid)
+	if !ok {
+		t.Fatalf("session not attached after first request")
+	}
+	wantFirst := h.clock.now().Add(10 * time.Minute)
+	if d := s1.ExpireAt.Sub(wantFirst); d < -time.Second || d > time.Second {
+		t.Fatalf("first ExpireAt want ~now+10m, got %v (delta %v)", s1.ExpireAt, d)
+	}
+	expAfterFirst := s1.ExpireAt
+
+	// 第二次请求：TTL 更短（1 分钟），续期只增不减 → 不得缩短。
+	h.clock.add(time.Minute)
+	h.expiry.fn = func(ctxTokens, turns int) time.Duration { return time.Minute }
+	rec2 := doRequestH(t, h.gw, "/v1/chat/completions", "sk-gw-t", body, map[string]string{"x-session-id": "tiers"})
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("second request want 200, got %d: %s", rec2.Code, rec2.Body.String())
+	}
+	s2, ok := h.rrouter.sess.Lookup(sid)
+	if !ok {
+		t.Fatalf("session lost after second request")
+	}
+	if !s2.ExpireAt.Equal(expAfterFirst) {
+		t.Fatalf("ExpireAt should not shrink on shorter TTL, want %v got %v", expAfterFirst, s2.ExpireAt)
+	}
+
+	// 第三次请求：TTL 更长（3 小时），续期延长至当前时刻 + 3h。
+	h.expiry.fn = func(ctxTokens, turns int) time.Duration { return 3 * time.Hour }
+	rec3 := doRequestH(t, h.gw, "/v1/chat/completions", "sk-gw-t", body, map[string]string{"x-session-id": "tiers"})
+	if rec3.Code != http.StatusOK {
+		t.Fatalf("third request want 200, got %d: %s", rec3.Code, rec3.Body.String())
+	}
+	s3, ok := h.rrouter.sess.Lookup(sid)
+	if !ok {
+		t.Fatalf("session lost after third request")
+	}
+	wantThird := h.clock.now().Add(3 * time.Hour)
+	if d := s3.ExpireAt.Sub(wantThird); d < -time.Second || d > time.Second {
+		t.Fatalf("third ExpireAt want ~now+3h, got %v (delta %v)", s3.ExpireAt, d)
+	}
+
+	if h.expiry.calls < 3 {
+		t.Fatalf("resolver should be called at least 3 times, got %d", h.expiry.calls)
 	}
 }
 

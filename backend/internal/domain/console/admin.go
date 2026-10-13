@@ -626,6 +626,88 @@ func (h *Admin) HandlePutBillingConfig(w http.ResponseWriter, r *http.Request) {
 	resp.OK(w, r, map[string]any{"Affected": 1})
 }
 
+// ===== 会话过期配置读写 =====
+
+// sessionExpirationDefault 内置默认会话过期配置（与 seeding 的 session.expiration 种子一致），
+// 配置键缺失时回退，保证前端可展示与保存。
+const sessionExpirationDefault = `{"default_ttl_minutes":5,"context_tiers":[{"max_tokens":2000,"ttl_minutes":5},{"max_tokens":8000,"ttl_minutes":30},{"max_tokens":32000,"ttl_minutes":180},{"max_tokens":128000,"ttl_minutes":1440}],"turn_tiers":[{"max_turns":2,"ttl_minutes":5},{"max_turns":10,"ttl_minutes":30},{"max_turns":50,"ttl_minutes":180},{"max_turns":200,"ttl_minutes":1440}]}`
+
+// HandleGetSessionConfig GET /api/v1/admin/configs/session
+func (h *Admin) HandleGetSessionConfig(w http.ResponseWriter, r *http.Request) {
+	raw, err := h.billing.GetConfig(r.Context(), "session.expiration")
+	if err != nil {
+		// 旧库未初始化时回退内置默认（与 HandleGetBillingConfig 的 routing.cost_sample 做法一致）。
+		raw = []byte(sessionExpirationDefault)
+	}
+	resp.OK(w, r, map[string]json.RawMessage{"SessionExpiration": raw})
+}
+
+// HandlePutSessionConfig PUT /api/v1/admin/configs/session
+func (h *Admin) HandlePutSessionConfig(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionExpiration json.RawMessage `json:"SessionExpiration"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "请求体格式错误")
+		return
+	}
+	if err := validateSessionExpiration(req.SessionExpiration); err != nil {
+		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, err.Error())
+		return
+	}
+	operator, _ := h.userIDFrom(r.Context())
+	if err := h.billing.UpsertConfig(r.Context(), "session.expiration", req.SessionExpiration, operator); err != nil {
+		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "更新会话过期配置失败")
+		return
+	}
+	resp.OK(w, r, map[string]any{"Affected": 1})
+}
+
+// validateSessionExpiration 校验会话过期配置，返回 nil 表示合法；否则返回具体的中文原因（不含技术细节）。
+func validateSessionExpiration(raw []byte) error {
+	if !isJSONObject(raw) {
+		return errors.New("会话过期配置必须是 JSON 对象")
+	}
+	var cfg struct {
+		DefaultTTLMinutes int `json:"default_ttl_minutes"`
+		ContextTiers      []struct {
+			MaxTokens  int `json:"max_tokens"`
+			TTLMinutes int `json:"ttl_minutes"`
+		} `json:"context_tiers"`
+		TurnTiers []struct {
+			MaxTurns   int `json:"max_turns"`
+			TTLMinutes int `json:"ttl_minutes"`
+		} `json:"turn_tiers"`
+	}
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return errors.New("会话过期配置格式不合法")
+	}
+	if cfg.DefaultTTLMinutes <= 0 {
+		return errors.New("default_ttl_minutes 必须为正整数")
+	}
+	prevTokens := 0
+	for _, tier := range cfg.ContextTiers {
+		if tier.MaxTokens <= 0 || tier.TTLMinutes <= 0 {
+			return errors.New("context_tiers 的 max_tokens/ttl_minutes 必须为正整数")
+		}
+		if tier.MaxTokens <= prevTokens {
+			return errors.New("context_tiers 上界必须严格升序")
+		}
+		prevTokens = tier.MaxTokens
+	}
+	prevTurns := 0
+	for _, tier := range cfg.TurnTiers {
+		if tier.MaxTurns <= 0 || tier.TTLMinutes <= 0 {
+			return errors.New("turn_tiers 的 max_turns/ttl_minutes 必须为正整数")
+		}
+		if tier.MaxTurns <= prevTurns {
+			return errors.New("turn_tiers 上界必须严格升序")
+		}
+		prevTurns = tier.MaxTurns
+	}
+	return nil
+}
+
 // validCostSample 校验路由成本比较样值：JSON 对象且各段为非负数值（缺省段按 0 处理）。
 func validCostSample(b []byte) bool {
 	if !isJSONObject(b) {
