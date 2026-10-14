@@ -411,8 +411,8 @@ export interface ExternalModelInput {
   ContextTiers?: ContextTier[] | null
 }
 // 列表返回裸数组（非 {list}）
-export function listExternalModels(params: Record<string, unknown> = {}) {
-  return http.get<ExternalModel[], ApiRes<ExternalModel[]>>('/admin/models', { params })
+export function listExternalModels(params: Record<string, unknown> = {}, base = '/admin') {
+  return http.get<ExternalModel[], ApiRes<ExternalModel[]>>(`${base}/models`, { params })
 }
 export function createExternalModel(payload: ExternalModelInput) {
   return http.post<ExternalModel, ApiRes<ExternalModel>>('/admin/models', payload)
@@ -550,9 +550,9 @@ export interface AdminBillingItem {
   DurationMs?: number | null
   FirstTokenMs?: number | null
 }
-export function listBillings(params: Record<string, unknown> = {}) {
+export function listBillings(params: Record<string, unknown> = {}, base = '/admin') {
   return http.get<PageResult<AdminBillingItem>, ApiRes<PageResult<AdminBillingItem>>>(
-    '/admin/billings',
+    `${base}/billings`,
     { params },
   )
 }
@@ -566,11 +566,11 @@ export interface BillingStats {
   InputTokens: number
   CacheReadTokens: number
 }
-export function getBillingStats(params: Record<string, unknown> = {}) {
-  return http.get<BillingStats, ApiRes<BillingStats>>('/admin/billings/stats', { params })
+export function getBillingStats(params: Record<string, unknown> = {}, base = '/admin') {
+  return http.get<BillingStats, ApiRes<BillingStats>>(`${base}/billings/stats`, { params })
 }
-export function getBilling(billingId: string) {
-  return http.get<BillingDetail, ApiRes<BillingDetail>>(`/admin/billings/${billingId}`)
+export function getBilling(billingId: string, base = '/admin') {
+  return http.get<BillingDetail, ApiRes<BillingDetail>>(`${base}/billings/${billingId}`)
 }
 // 单条调用日志（账单详情附带 CallLog 的独立端点；返回单对象，不强转 BillingDetail）
 export function getCallLog(billingId: string) {
@@ -610,11 +610,12 @@ export interface AdminSession {
 }
 export function listSessions(
   params: Record<string, any>,
+  base = '/admin',
 ): Promise<ApiRes<{ List: AdminSession[]; Total: number }>> {
   return http.get<
     { List: AdminSession[]; Total: number },
     ApiRes<{ List: AdminSession[]; Total: number }>
-  >('/admin/sessions', { params })
+  >(`${base}/sessions`, { params })
 }
 export function kickSessions(
   payload: Record<string, any>,
@@ -636,11 +637,12 @@ export function renameSession(
 // 会话完整调用记录（按时间序，含请求/响应/决策轨迹）
 export function listSessionCalls(
   sessionId: string,
+  base = '/admin',
 ): Promise<ApiRes<{ List: CallLogView[]; Total: number }>> {
   return http.get<
     { List: CallLogView[]; Total: number },
     ApiRes<{ List: CallLogView[]; Total: number }>
-  >(`/admin/sessions/${sessionId}/calls`)
+  >(`${base}/sessions/${sessionId}/calls`)
 }
 
 // ===== 计费配置 =====

@@ -6,10 +6,9 @@ import UserPanel from '@/components/UserPanel.vue'
 import {
   Odometer,
   Key,
-  TrendCharts,
+  Cpu,
+  ChatDotRound,
   Tickets,
-  Bell,
-  Wallet,
 } from '@element-plus/icons-vue'
 
 const route = useRoute()
@@ -20,15 +19,16 @@ const auth = useAuthStore()
 const menus = [
   { path: '/dev/dashboard', title: '统计', icon: Odometer },
   { path: '/dev/tokens', title: '令牌', icon: Key },
-  { path: '/dev/usage', title: '用量统计', icon: TrendCharts },
-  { path: '/dev/wallet', title: '我的钱包', icon: Wallet },
-  { path: '/dev/billings', title: '消费账单', icon: Tickets },
-  { path: '/dev/announcements', title: '系统公告', icon: Bell },
+  { path: '/dev/models', title: '模型', icon: Cpu },
+  { path: '/dev/sessions', title: '会话', icon: ChatDotRound },
+  { path: '/dev/billings', title: '账单', icon: Tickets },
 ]
 
 function activeMenu() {
   const p = route.path
   if (p.startsWith('/dev/tokens')) return '/dev/tokens'
+  if (p.startsWith('/dev/models')) return '/dev/models'
+  if (p.startsWith('/dev/sessions')) return '/dev/sessions'
   if (p.startsWith('/dev/billings')) return '/dev/billings'
   return p
 }

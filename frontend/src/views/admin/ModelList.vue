@@ -15,6 +15,9 @@ import ErrorBubble from '@/components/ErrorBubble.vue'
 import ColumnFilter from '@/components/ColumnFilter.vue'
 
 const router = useRouter()
+// mode='self'：当前用户查看自己的对外模型（只读，走 /dev 前缀接口）
+const props = withDefaults(defineProps<{ mode?: 'admin' | 'self' }>(), { mode: 'admin' })
+const isSelf = computed(() => props.mode === 'self')
 const loading = ref(false)
 const list = ref<ExternalModel[]>([])
 const errInfo = ref<{ message: string; requestId: string }>({ message: '', requestId: '' })
@@ -42,7 +45,8 @@ async function load() {
   loading.value = true
   errInfo.value = { message: '', requestId: '' }
   try {
-    const res = await listExternalModels()
+    // self 模式只读展示可用模型：仅返回启用的对外模型
+    const res = await listExternalModels(isSelf.value ? { Enabled: true } : {}, isSelf.value ? '/dev' : '/admin')
     list.value = res.Data || []
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
@@ -105,6 +109,13 @@ async function onBatchDelete() {
   }
 }
 
+// 行点击：self 模式只读，不跳转
+function onRowClick(row: ExternalModel, _c: unknown, e: Event) {
+  if (isSelf.value) return
+  if ((e.target as HTMLElement)?.closest('.op-cell')) return
+  router.push(`/admin/models/${row.ID}/edit`)
+}
+
 // 批量用 models.dev 参考价刷新全部售价
 const syncing = ref(false)
 async function onSyncPrices() {
@@ -157,11 +168,11 @@ async function onSyncPrices() {
       <div class="page-title">模型</div>
       <span class="page-count">{{ list.length }} 个模型</span>
       <div class="page-header-spacer" />
-      <el-button :loading="syncing" @click="onSyncPrices">同步售价</el-button>
-      <el-button v-if="selected.length" type="danger" @click="onBatchDelete">
+      <el-button v-if="!isSelf" :loading="syncing" @click="onSyncPrices">同步售价</el-button>
+      <el-button v-if="!isSelf && selected.length" type="danger" @click="onBatchDelete">
         批量删除
       </el-button>
-      <el-button type="primary" @click="router.push('/admin/models/create')">新建</el-button>
+      <el-button v-if="!isSelf" type="primary" @click="router.push('/admin/models/create')">新建</el-button>
     </div>
 
     <div v-loading="loading" class="card">
@@ -172,9 +183,9 @@ async function onSyncPrices() {
         class="table-nowrap clickable-rows"
         row-key="ID"
         @selection-change="(rows: any[]) => (selected = rows)"
-        @row-click="(row: ExternalModel, _c: unknown, e: Event) => !(e.target as HTMLElement)?.closest('.op-cell') && router.push(`/admin/models/${row.ID}/edit`)"
+        @row-click="onRowClick"
       >
-        <el-table-column type="selection" width="44" />
+        <el-table-column v-if="!isSelf" type="selection" width="44" />
         <el-table-column label="对外名称 / 描述" min-width="200">
           <template #header>
             <ColumnFilter label="名称 / 描述" :active="!!filters.q" @clear="() => (filters.q = '')">
@@ -230,7 +241,7 @@ async function onSyncPrices() {
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="90" align="right" fixed="right">
+        <el-table-column v-if="!isSelf" label="操作" width="90" align="right" fixed="right">
           <template #default="{ row }">
             <div class="op-cell" @click.stop>
               <el-tooltip content="编辑" placement="top">

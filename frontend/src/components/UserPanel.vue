@@ -92,12 +92,12 @@ const metrics = computed<MetricItem[]>(() => {
     {
       label: '缓存命中率(本月)',
       value: cacheHitText.value,
-      click: () => router.push(isAdmin.value ? '/admin/dashboard' : '/dev/usage'),
+      click: () => router.push(isAdmin.value ? '/admin/dashboard' : '/dev/dashboard'),
     },
     {
       label: '吞吐速率',
       value: throughputText.value,
-      click: () => router.push(isAdmin.value ? '/admin/dashboard' : '/dev/usage'),
+      click: () => router.push(isAdmin.value ? '/admin/dashboard' : '/dev/dashboard'),
       span: true,
     },
   )

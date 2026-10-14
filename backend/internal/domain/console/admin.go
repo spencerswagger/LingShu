@@ -975,7 +975,7 @@ func (h *Admin) HandleListSessions(w http.ResponseWriter, r *http.Request) {
 			sessionIDs = append(sessionIDs, s.SessionID)
 		}
 	}
-	runtimes := h.sessionRuntimes(r.Context(), sessionIDs, now.Add(-sessionStatsWindow))
+	runtimes := sessionRuntimes(r.Context(), h.db, sessionIDs, now.Add(-sessionStatsWindow))
 
 	list := make([]sessionListItem, 0, len(items))
 	for _, s := range items {
@@ -1178,13 +1178,13 @@ func (r sessionRuntime) CacheHitRate() float64 {
 
 // sessionRuntimes 批量聚合会话实时状态：billing_records（次数/Token/积分/上下文/窗口速率）
 // 与 call_logs（用户消息数/工具调用数）。查询失败仅返回已得部分，不影响会话列表主流程。
-func (h *Admin) sessionRuntimes(ctx context.Context, ids []string, windowStart time.Time) map[string]sessionRuntime {
+func sessionRuntimes(ctx context.Context, db *sql.DB, ids []string, windowStart time.Time) map[string]sessionRuntime {
 	out := make(map[string]sessionRuntime, len(ids))
-	if h.db == nil || len(ids) == 0 {
+	if db == nil || len(ids) == 0 {
 		return out
 	}
 	// 汇总 + 窗口（FILTER）+ 输入/缓存读。
-	rows, err := h.db.QueryContext(ctx, `
+	rows, err := db.QueryContext(ctx, `
 SELECT session_id,
        count(*),
        COALESCE(sum(credits_consumed), 0),
@@ -1217,7 +1217,7 @@ GROUP BY session_id`, ids, windowStart)
 		}
 	}
 	// 上下文长度：最近一次请求的输入 Token 数（DISTINCT ON 取每会话最新一行）。
-	crows, err := h.db.QueryContext(ctx, `
+	crows, err := db.QueryContext(ctx, `
 SELECT DISTINCT ON (session_id) session_id, COALESCE(NULLIF(tokens->>'input','')::bigint, 0)
 FROM billing_records
 WHERE session_id = ANY($1)
@@ -1236,7 +1236,7 @@ ORDER BY session_id, call_time DESC, id DESC`, ids)
 		}
 	}
 	// 用户消息数 / 工具调用数：来自 call_logs.req_messages（增量消息数组）。
-	lrows, err := h.db.QueryContext(ctx, `
+	lrows, err := db.QueryContext(ctx, `
 SELECT session_id,
        COALESCE(sum(CASE WHEN jsonb_typeof(req_messages) = 'array'
            THEN (SELECT count(*) FROM jsonb_array_elements(req_messages) e WHERE e->>'role' = 'user') ELSE 0 END), 0),

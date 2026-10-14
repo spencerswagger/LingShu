@@ -229,12 +229,18 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	})
 	auditStore := audit.NewStore(d)
 	rl := ratelimit.New()
+	// 注册接口限流：独立实例，键为 IP 本身，与登录限流隔离，且不引入全局用户名维度锁定。
+	regLimiter := ratelimit.New()
+	// 验证码生成限流：独立实例，键为 IP 本身，按请求计数节流，避免无节流生成被滥用。
+	capLimiter := ratelimit.New()
 	preAuth := identity.NewPreAuthStore()
 	go func() {
 		t := time.NewTicker(10 * time.Minute)
 		defer t.Stop()
 		for range t.C {
 			rl.Cleanup()
+			regLimiter.Cleanup()
+			capLimiter.Cleanup()
 		}
 	}()
 
@@ -255,6 +261,10 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	identityHandler := identity.NewHandler(identitySvc, creditSvc, userIDFrom)
 	identityHandler.SetRateLimiter(rl)
 	identityHandler.SetPreAuth(preAuth)
+	// 注册接口：图形验证码 + 独立限流器（键为 IP 本身），与登录限流隔离。
+	identityHandler.SetCaptcha(identity.NewImageCaptcha())
+	identityHandler.SetRegisterLimiter(regLimiter)
+	identityHandler.SetCaptchaLimiter(capLimiter)
 	creditHandler := identity.NewCreditHandler(creditSvc, userIDFrom)
 	// 充值/覆盖/调整积分属资金敏感操作：需操作者当前口令二次验证。
 	creditHandler.SetPasswordVerifier(identitySvc.VerifyCurrentPassword)
@@ -378,6 +388,7 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	consoleAdmin.SetKeyNameResolver(keyNameResolver(d))
 	consoleAdmin.SetSessionNameSetter(sessionStore.SetName)
 	consoleDev := console.NewDev(billStore, userIDFrom)
+	consoleDev.SetDB(d)
 	consoleDev.SetSessions(sess)
 	consoleDev.SetTokenCounter(identity.NewTokenStore(d))
 	// 调用日志：网关写入 + 控制台只读查询共用同一存储（billing_id 1:1 关联）。
