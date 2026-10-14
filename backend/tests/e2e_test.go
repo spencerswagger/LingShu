@@ -746,9 +746,9 @@ func TestE2E_GatewayBillingLoop(t *testing.T) {
 		}
 	}
 
-	// 8) dev wallet → 余额 = 原充值 - credits
+	// 8) 本人资料（/auth/me）→ 余额 = 原充值 - credits
 	{
-		status, raw := req(t, http.MethodGet, base+"/api/v1/dev/wallet", devToken, nil)
+		status, raw := req(t, http.MethodGet, base+"/api/v1/auth/me", devToken, nil)
 		if status != http.StatusOK {
 			t.Fatalf("get wallet status=%d body=%s", status, raw)
 		}
@@ -817,7 +817,7 @@ func TestE2E_GatewayBillingLoop(t *testing.T) {
 	{
 		var bal float64
 		{
-			status, raw := req(t, http.MethodGet, base+"/api/v1/dev/wallet", devToken, nil)
+			status, raw := req(t, http.MethodGet, base+"/api/v1/auth/me", devToken, nil)
 			if status != http.StatusOK {
 				t.Fatalf("get wallet pre-adjust status=%d body=%s", status, raw)
 			}

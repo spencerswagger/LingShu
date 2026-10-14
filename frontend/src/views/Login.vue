@@ -153,6 +153,9 @@ function safeRedirect(v: unknown): string {
               </el-button>
             </el-form-item>
           </el-form>
+          <div class="form-sub" style="margin-top: 16px; text-align: center">
+            <el-link type="primary" @click="router.push('/register')">还没有账号？注册</el-link>
+          </div>
         </div>
         <div v-else>
           <div class="form-head">
