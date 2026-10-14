@@ -19,11 +19,33 @@ const form = reactive({ username: '', password: '', nickname: '', captchaCode: '
 const captcha = ref<{ CaptchaID: string; ImageBase64: string }>({ CaptchaID: '', ImageBase64: '' })
 const captchaLoading = ref(false)
 
+// 口令强度校验：≥8 位且至少包含两类字符（小写/大写/数字/符号），与后端规则保持一致
+function passwordClassCount(pwd: string): number {
+  let lower = false, upper = false, digit = false, symbol = false
+  for (const ch of pwd) {
+    if (ch >= 'a' && ch <= 'z') lower = true
+    else if (ch >= 'A' && ch <= 'Z') upper = true
+    else if (ch >= '0' && ch <= '9') digit = true
+    else symbol = true
+  }
+  return [lower, upper, digit, symbol].filter(Boolean).length
+}
+
 const rules = {
   username: [{ required: true, message: '请输入用户名', trigger: 'blur' }],
   password: [
     { required: true, message: '请输入密码', trigger: 'blur' },
     { min: 8, message: '密码至少 8 位', trigger: 'blur' },
+    {
+      validator: (_rule: unknown, value: string, cb: (err?: Error) => void) => {
+        if (value && passwordClassCount(value) < 2) {
+          cb(new Error('密码需至少包含字母、数字、符号中的两类'))
+          return
+        }
+        cb()
+      },
+      trigger: 'blur',
+    },
   ],
   captchaCode: [{ required: true, message: '请输入验证码', trigger: 'blur' }],
 }

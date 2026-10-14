@@ -195,7 +195,14 @@ func (s *Server) routes() {
 	dev.HandleFunc("POST /api/v1/dev/tokens/{id}/toggle", d.TokenDev.HandleDevToggle)
 	dev.Handle("GET /api/v1/dev/tokens/{id}/secret", WithAuditSensitiveRead(s.audit, s.logger)(http.HandlerFunc(d.TokenDev.HandleDevSecret)))
 	dev.HandleFunc("GET /api/v1/dev/tags", d.Tag.HandleList) // 列表过滤由 query enabled=true 控制
-	dev.HandleFunc("GET /api/v1/dev/models", d.Model.HandleList)
+	// 只读“可用模型”：服务端强制仅返回启用项，忽略客户端 ?Enabled= 覆盖。
+	dev.HandleFunc("GET /api/v1/dev/models", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		q.Set("Enabled", "true")
+		fr := r.Clone(r.Context())
+		fr.URL.RawQuery = q.Encode()
+		d.Model.HandleList(w, fr)
+	})
 	dev.HandleFunc("GET /api/v1/dev/stats/dashboard", d.DevConsole.HandleStatsDashboard)
 	dev.HandleFunc("GET /api/v1/dev/sessions", d.DevConsole.HandleListSessions)
 	dev.HandleFunc("GET /api/v1/dev/sessions/{session_id}/calls", d.DevConsole.HandleListSessionCalls)

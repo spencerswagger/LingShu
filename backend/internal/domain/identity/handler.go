@@ -21,6 +21,7 @@ type Handler struct {
 	preauth    *PreAuthStore
 	captcha    Captcha            // 图形验证码（经 SetCaptcha 注入；nil=未装配，注册接口 fail-closed）
 	regRL      *ratelimit.Limiter // 注册限流器（独立实例，键为 IP；nil=不启用）
+	capRL      *ratelimit.Limiter // 验证码生成限流器（独立实例，键为 IP；nil=不启用）
 }
 
 // NewHandler 创建身份认证 HTTP 处理器。
@@ -32,6 +33,7 @@ func (h *Handler) SetRateLimiter(rl *ratelimit.Limiter)    { h.rl = rl }
 func (h *Handler) SetPreAuth(p *PreAuthStore)              { h.preauth = p }
 func (h *Handler) SetCaptcha(c Captcha)                    { h.captcha = c }
 func (h *Handler) SetRegisterLimiter(l *ratelimit.Limiter) { h.regRL = l }
+func (h *Handler) SetCaptchaLimiter(l *ratelimit.Limiter)  { h.capRL = l }
 
 type loginRequest struct {
 	Username string `json:"Username"`
@@ -148,16 +150,18 @@ func (h *Handler) HandleLoginTOTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // HandleCaptcha GET /api/v1/auth/captcha 生成图形验证码（公开接口，无需登录）。
-// 生成节流：仅当注册限流器已对该 IP 计数/锁定（曾触发注册防爆破）时拒发新验证码；
-// 使用只读 Allow（不新增计数），避免正常浏览注册页被误伤。
+// 生成节流：独立限流器（键为 IP 本身）按请求计数，超过阈值即 429，避免无节流的
+// 验证码生成被滥用（内存/图片渲染放大）；与注册限流器隔离，互不影响。
 func (h *Handler) HandleCaptcha(w http.ResponseWriter, r *http.Request) {
 	if h.captcha == nil {
 		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "服务器内部错误")
 		return
 	}
-	if h.regRL != nil {
+	if h.capRL != nil {
 		ip := clientip.From(r)
-		if err := h.regRL.Allow(ip, ip); err != nil {
+		// 验证码生成本身无“成功/失败”语义，这里把每次生成计入限流计数以实现节流；
+		// 计数窗口过期后自动复位，不涉及 RecordSuccess。
+		if err := h.capRL.AllowAndRecord(ip, ip); err != nil {
 			resp.Err(w, r, http.StatusTooManyRequests, resp.CodeRateLimited, "尝试过于频繁，请稍后再试")
 			return
 		}
@@ -171,7 +175,8 @@ func (h *Handler) HandleCaptcha(w http.ResponseWriter, r *http.Request) {
 }
 
 // HandleRegister POST /api/v1/auth/register 开发者自助注册（公开接口）。
-// 流程：验证码校验（一次性消费）→ 独立 IP 限流 → 建号并直接签发会话（注册即登录）。
+// 流程：独立 IP 限流 → 验证码校验（一次性消费）→ 建号并直接签发会话（注册即登录）。
+// 限流前置于验证码校验，使“验证码错误”与“建号失败”两条失败路径都受防爆破约束。
 // 验证码服务未装配时 fail-closed（500），绝不放开注册。
 func (h *Handler) HandleRegister(w http.ResponseWriter, r *http.Request) {
 	var req struct {
@@ -190,18 +195,20 @@ func (h *Handler) HandleRegister(w http.ResponseWriter, r *http.Request) {
 		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "服务器内部错误")
 		return
 	}
-	if !h.captcha.Verify(req.CaptchaID, req.CaptchaCode) {
-		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "验证码错误或已过期，请刷新后重试")
-		return
-	}
 	ip := clientip.From(r)
 	// 独立注册限流器（键为 IP 本身）：与登录限流隔离，且不引入全局用户名维度锁定。
-	// AllowAndRecord 预记失败，注册成功后由 RecordSuccess 清零。
+	// 前置 AllowAndRecord 预记失败，使后续任何失败路径（含验证码错误）都计入防爆破；
+	// 注册成功后由 RecordSuccess 清零。
 	if h.regRL != nil {
 		if err := h.regRL.AllowAndRecord(ip, ip); err != nil {
 			resp.Err(w, r, http.StatusTooManyRequests, resp.CodeRateLimited, "尝试过于频繁，请稍后再试")
 			return
 		}
+	}
+	if !h.captcha.Verify(req.CaptchaID, req.CaptchaCode) {
+		// 失败计数已在 AllowAndRecord 中预记，此处不再 RecordFailure。
+		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "验证码错误或已过期，请刷新后重试")
+		return
 	}
 	lr, err := h.svc.Register(r.Context(), req.Username, req.Password, req.Nickname)
 	if err != nil {
