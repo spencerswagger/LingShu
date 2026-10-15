@@ -802,30 +802,67 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 
 	case up.StatusCode == http.StatusTooManyRequests:
 		g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, channel.Feedback{Is429: true, Now: g.now()})
-		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "上游返回 429（触发限流）", msSince(start))
+		upErr := readUpstreamErrBody(up)
+		errMsg := upstreamErrDetail(up.StatusCode, upErr)
+		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, errMsg, msSince(start))
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-			"error", "", "failed", "上游返回 429（触发限流）", msSince(start), nil, g.callLogDecision(attempts, "上游限流(429)", pc, routeRes))
+			"error", upErr, "failed", errMsg, msSince(start), nil, g.callLogDecision(attempts, "上游限流(429)", pc, routeRes))
 		return &fwdOutcome{retry: true, is429: true}
 	case up.StatusCode == http.StatusUnauthorized || up.StatusCode == http.StatusForbidden:
 		// 凭据可能失效：先转移下一候选；连续失败达阈值由状态机熔断（channel.Machine）。
 		g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, channel.Feedback{IsAuthFailure: true, Now: g.now()})
-		errMsg := fmt.Sprintf("上游返回 %d（渠道凭据可能失效）", up.StatusCode)
+		upErr := readUpstreamErrBody(up)
+		errMsg := upstreamErrDetail(up.StatusCode, upErr)
 		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, errMsg, msSince(start))
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-			"error", "", "failed", errMsg, msSince(start), nil, g.callLogDecision(attempts, "上游鉴权失败", pc, routeRes))
+			"error", upErr, "failed", errMsg, msSince(start), nil, g.callLogDecision(attempts, "上游鉴权失败", pc, routeRes))
 		return &fwdOutcome{retry: true}
 	default:
 		g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, feedbackFail(start))
-		errMsg := fmt.Sprintf("上游返回 %d", up.StatusCode)
+		upErr := readUpstreamErrBody(up)
+		errMsg := upstreamErrDetail(up.StatusCode, upErr)
 		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, errMsg, msSince(start))
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-			"error", "", "failed", errMsg, msSince(start), nil, g.callLogDecision(attempts, errMsg, pc, routeRes))
+			"error", upErr, "failed", errMsg, msSince(start), nil, g.callLogDecision(attempts, errMsg, pc, routeRes))
 		if retryableUpstreamStatus(up.StatusCode) {
 			return &fwdOutcome{retry: true}
 		}
 		writeOpenAIError(w, http.StatusBadGateway, msgUpstreamDown)
 		return &fwdOutcome{responded: true, refundPre: true}
 	}
+}
+
+// upstreamErrBytes 上游错误响应体的最大读取字节数（供审计展示，避免大响应体撑爆日志/库）。
+const upstreamErrBytes = 4096
+
+// readUpstreamErrBody 读取上游错误响应体（截断至 upstreamErrBytes）用于审计；读取失败返回空串。
+func readUpstreamErrBody(resp *http.Response) string {
+	b, err := io.ReadAll(io.LimitReader(resp.Body, upstreamErrBytes))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+// upstreamErrNote 上游错误状态码的中文说明（沿用既有文案，便于告警/检索）。
+func upstreamErrNote(status int) string {
+	switch status {
+	case http.StatusTooManyRequests:
+		return fmt.Sprintf("上游返回 %d（触发限流）", status)
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return fmt.Sprintf("上游返回 %d（渠道凭据可能失效）", status)
+	default:
+		return fmt.Sprintf("上游返回 %d", status)
+	}
+}
+
+// upstreamErrDetail 拼接状态码说明与上游响应体（截断；无响应体时仅说明），
+// 供 billing_records.error_message 与 call_logs.error_message 落库，管理员据此定位上游故障。
+func upstreamErrDetail(status int, body string) string {
+	if body == "" {
+		return upstreamErrNote(status)
+	}
+	return upstreamErrNote(status) + ": " + body
 }
 
 // msSince 从 start 至今的毫秒数。
@@ -933,24 +970,28 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		return out
 	case up.StatusCode == http.StatusTooManyRequests:
 		g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, channel.Feedback{Is429: true, Now: g.now()})
-		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "上游返回 429（触发限流）", msSince(start))
+		upErr := readUpstreamErrBody(up)
+		errMsg := upstreamErrDetail(up.StatusCode, upErr)
+		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, errMsg, msSince(start))
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-			"error", "", "failed", "上游返回 429（触发限流）", msSince(start), nil, g.callLogDecision(attempts, "上游限流(429)", pc, routeRes))
+			"error", upErr, "failed", errMsg, msSince(start), nil, g.callLogDecision(attempts, "上游限流(429)", pc, routeRes))
 		return &fwdOutcome{retry: true, is429: true}
 	case up.StatusCode == http.StatusUnauthorized || up.StatusCode == http.StatusForbidden:
 		// 凭据可能失效：先转移下一候选；连续失败达阈值由状态机熔断（channel.Machine）。
 		g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, channel.Feedback{IsAuthFailure: true, Now: g.now()})
-		errMsg := fmt.Sprintf("上游返回 %d（渠道凭据可能失效）", up.StatusCode)
+		upErr := readUpstreamErrBody(up)
+		errMsg := upstreamErrDetail(up.StatusCode, upErr)
 		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, errMsg, msSince(start))
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-			"error", "", "failed", errMsg, msSince(start), nil, g.callLogDecision(attempts, "上游鉴权失败", pc, routeRes))
+			"error", upErr, "failed", errMsg, msSince(start), nil, g.callLogDecision(attempts, "上游鉴权失败", pc, routeRes))
 		return &fwdOutcome{retry: true}
 	default:
 		g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, feedbackFail(start))
-		errMsg := fmt.Sprintf("上游返回 %d", up.StatusCode)
+		upErr := readUpstreamErrBody(up)
+		errMsg := upstreamErrDetail(up.StatusCode, upErr)
 		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, errMsg, msSince(start))
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-			"error", "", "failed", errMsg, msSince(start), nil, g.callLogDecision(attempts, errMsg, pc, routeRes))
+			"error", upErr, "failed", errMsg, msSince(start), nil, g.callLogDecision(attempts, errMsg, pc, routeRes))
 		if retryableUpstreamStatus(up.StatusCode) {
 			return &fwdOutcome{retry: true}
 		}

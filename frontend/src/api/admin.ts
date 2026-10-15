@@ -165,6 +165,14 @@ export interface ReliabilityConfig {
   P99LatencyMS: number // 单位毫秒（后端契约不变；默认 120000ms=120 秒，前端按秒录入/展示，提交转毫秒）
   AuthFailThreshold?: number
 }
+
+// 渠道视图中的逐密钥状态快照（与后端 ChannelKeyState 对齐）
+export interface ChannelKeyState {
+  KeyID: string
+  KeyName: string
+  State: string
+}
+
 export interface AdminChannel {
   ID: string
   Name: string
@@ -174,12 +182,11 @@ export interface AdminChannel {
   TagIDs: string[]
   BoundTags: { ID: string; Name: string; KV: Record<string, string> }[]
   Priority: number
-  State: string // NORMAL | DRAIN | DISABLED
   RateLimit: RateLimitConfig
   HealthProbe: HealthProbeConfig
   Reliability: ReliabilityConfig
   ChannelProtocolID?: number | string | null // 引用的渠道协议 ID；空=使用渠道内联配置
-  KeyStates?: { KeyID: string; KeyName: string; State: string }[]
+  KeyStates?: ChannelKeyState[]
   CreatedAt: string
   UpdatedAt: string
 }
@@ -195,15 +202,6 @@ export interface ChannelInput {
   Reliability?: ReliabilityConfig
   // 引用的渠道协议 ID（数字或 null）；选中后以协议配置为准，内联 protocol/base_url 被忽略
   ChannelProtocolID?: number | string | null
-}
-// 渠道状态流转事件
-export interface ChannelEvent {
-  ID: string
-  ChannelID: string
-  FromState: string
-  ToState: string
-  Reason: string
-  CreatedAt: string
 }
 // 内部模型状态流转事件
 export interface ChannelModelEvent {
@@ -247,17 +245,7 @@ export function batchDeleteChannels(ids: string[]) {
     IDs: ids,
   })
 }
-export function listChannelEvents(id: string) {
-  return http.get<ChannelEvent[], ApiRes<ChannelEvent[]>>(`/admin/channels/${id}/events`)
-}
-// 手动状态流转（渠道与内部模型共用）：action = normal | drain | disable
-export function channelState(id: string, action: 'normal' | 'drain' | 'disable', reason = '') {
-  return http.post<AdminChannel, ApiRes<AdminChannel>>(`/admin/channels/${id}/state`, {
-    Action: action,
-    Reason: reason,
-  })
-}
-// 内部模型手动状态流转
+// 内部模型手动状态流转：action = normal | drain | disable
 export function channelModelState(id: string, mid: string, action: 'normal' | 'drain' | 'disable', reason = '') {
   return http.put<unknown, ApiRes<unknown>>(`/admin/channels/${id}/models/${mid}/state`, {
     Action: action,

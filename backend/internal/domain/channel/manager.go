@@ -127,13 +127,13 @@ func normalizeReliability(r ReliabilityConfig) ReliabilityConfig {
 
 func stringsBlank(s string) bool { return s == "" }
 
-// RuntimeChannel 渠道配置模板运行时：静态信息 + 状态机 + 限流器（作为「渠道视图」保留，
-// 供现有 gateway/router/console 消费方继续编译；渠道自身可用性只认三态 state）。
-// Channel.State 以内存为准；渠道层不含凭据，凭据只在 KeyRuntime.CredentialPlain。
+// RuntimeChannel 渠道配置模板运行时：静态信息 + 限流器（作为「渠道视图」保留，
+// 供现有 gateway/router/console 消费方继续编译）。
+// 渠道无独立状态：可用性由该渠道下各密钥（KeyRuntime）与各内部模型（ModelRuntime）决定。
+// 渠道层不含凭据，凭据只在 KeyRuntime.CredentialPlain。
 // Keys 为该渠道全部密钥运行动态视图引用（同一指针，B3 起消费方经 Keys 取密钥）。
 type RuntimeChannel struct {
 	Channel   Channel
-	Machine   *Machine
 	Limiter   *Limiter
 	LastErr   string
 	lastProbe time.Time
@@ -174,7 +174,8 @@ type ModelRuntime struct {
 	lastProbe time.Time
 }
 
-// ChannelView 是 API 输出结构：附当前状态/LastErr/探测时间及有效配置（凭据已收敛到 channel_keys）。
+// ChannelView 是 API 输出结构：附 LastErr/探测时间及有效配置（凭据已收敛到 channel_keys）。
+// 渠道无独立状态，逐密钥状态经 Channel.KeyStates 输出。
 type ChannelView struct {
 	ID          int64             `json:"ID,string"`
 	Name        string            `json:"Name"`
@@ -183,7 +184,6 @@ type ChannelView struct {
 	Tags        map[string]string `json:"Tags"`
 	BoundTags   []TagRef          `json:"BoundTags"`
 	Priority    int               `json:"Priority"`
-	State       State             `json:"State"`
 	LastErr     string            `json:"LastErr,omitempty"`
 	LastProbe   *time.Time        `json:"LastProbe,omitempty"`
 	RateLimit   RateLimitConfig   `json:"RateLimit"`
@@ -214,7 +214,7 @@ type ModelView struct {
 type ProbeRecorder func(ctx context.Context, chID int64, modelID, target string, ok bool, errMsg string, usage ProbeUsage, durationMS int64) error
 
 // Manager 渠道配置模板 + 密钥运行动态管理器：内存态 + 状态机 + 限流器 + 健康探测调度。
-// rt = 渠道配置模板运行时（保留 Machine/Limiter 字段供现有消费方继续编译）；
+// rt = 渠道配置模板运行时（保留 Limiter/Keys 等字段供现有消费方继续编译）；
 // keys = 每个 channel_keys 一行一套独立运行时（状态机/限流器）；keyOfCh 为按渠道枚举索引。
 type Manager struct {
 	mu        sync.RWMutex
@@ -306,28 +306,10 @@ func (m *Manager) lookupChannelProtocol(ctx context.Context, id *int64) *channel
 	return cp
 }
 
-// buildRuntime 由静态渠道构建渠道运行时：按配置建状态机与限流器。
+// buildRuntime 由静态渠道构建渠道运行时：按配置建限流器（渠道无独立状态机）。
 // 渠道层不含凭据：密钥凭据解密见 buildKeyRuntime（KeyRuntime.CredentialPlain）。
 func (m *Manager) buildRuntime(ch *Channel) *RuntimeChannel {
 	rt := &RuntimeChannel{Channel: *ch}
-
-	// 状态机配置 = 可靠性（窗口）+ 探测阈值（失败/恢复）
-	hp := normalizeHealthProbe(ch.HealthProbe)
-	rel := normalizeReliability(ch.Reliability)
-	mcfg := DefaultMachineConfig()
-	mcfg.ProbeFailThreshold = hp.FailThreshold
-	mcfg.ProbeRecoveryThreshold = hp.RecoveryThreshold
-	mcfg.WindowSeconds = rel.WindowSeconds
-	mcfg.ErrorRatePct = rel.ErrorRatePct
-	mcfg.Rate429Pct = rel.Rate429Pct
-	mcfg.P99LatencyMS = rel.P99LatencyMS
-	mcfg.MinSamples = rel.MinSamples
-	mcfg.AuthFailThreshold = rel.AuthFailThreshold
-	mach := NewMachine(mcfg)
-	mach.SetClock(m.now)
-	mach.transition(ch.State, m.now(), "")
-	rt.Machine = mach
-
 	rl := normalizeRateLimit(ch.RateLimit)
 	rt.Limiter = NewLimiter(rl.RPM, rl.TPM, rl.BurstMultiplier)
 	rt.Limiter.SetClock(m.now)
@@ -484,7 +466,7 @@ func (m *Manager) MaxSessions(channelID int64) int {
 // SyncFromDB 启动时从库加载全部渠道（配置模板）与其内部模型、密钥运行时。
 // 顺序：先装载渠道，再 keyStore.ListAll 装配全部 key→KeyRuntime（模型运行时重建逻辑保持现状）。
 func (m *Manager) SyncFromDB(ctx context.Context) error {
-	chs, err := m.store.List(ctx, "")
+	chs, err := m.store.List(ctx)
 	if err != nil {
 		return fmt.Errorf("sync channels from db: %w", err)
 	}
@@ -495,11 +477,25 @@ func (m *Manager) SyncFromDB(ctx context.Context) error {
 			return fmt.Errorf("sync channel keys from db: %w", err)
 		}
 	}
+	// 锁外预解析渠道协议：避免持写锁做 DB 查询阻塞路由读锁（同一协议 ID 只查一次）。
+	protos := make(map[int64]*channelprotocol.ChannelProtocol)
+	for i := range chs {
+		id := chs[i].ChannelProtocolID
+		if id == nil || *id <= 0 {
+			continue
+		}
+		if _, ok := protos[*id]; ok {
+			continue
+		}
+		protos[*id] = m.lookupChannelProtocol(ctx, id)
+	}
 	m.mu.Lock()
 	for i := range chs {
 		ch := chs[i]
 		rt := m.buildRuntime(&ch)
-		rt.Protocol = m.lookupChannelProtocol(ctx, ch.ChannelProtocolID)
+		if ch.ChannelProtocolID != nil {
+			rt.Protocol = protos[*ch.ChannelProtocolID]
+		}
 		m.rt[ch.ID] = rt
 		if refs, rerr := m.store.ListTagRefsByChannel(ctx, ch.ID); rerr == nil {
 			m.boundTags[ch.ID] = refs
@@ -631,19 +627,15 @@ func (m *Manager) rebuildModelsLocked(channelID int64, models []ChannelModel) {
 
 // Upsert 同步渠道（配置模板）到运行时：重建渠道运行时与该渠道全部模型运行时（渠道级兜底可能变化）。
 // 同时重建该渠道全部 KeyRuntime（KeyStore.List）——密钥共享渠道配置，渠道更新后需以新配置刷新。
-// 停用渠道（state=DISABLED）同样装载运行时，可用性只认三态 state，恢复由 ForceState 完成。
+// 渠道无独立状态，配置保存不影响各密钥/模型的内存权威状态（由 rebuildChannelKeysLocked 保留）。
 func (m *Manager) Upsert(ch *Channel) {
+	// 锁外解析渠道协议：避免持写锁做 DB 查询阻塞路由读锁。
+	proto := m.lookupChannelProtocol(context.Background(), ch.ChannelProtocolID)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	prev := m.rt[ch.ID]
-	var st State = ch.State
-	if prev != nil {
-		st = prev.Machine.State() // 保留内存权威状态
-	}
-	rclog := *ch
-	rclog.State = st
-	rt := m.buildRuntime(&rclog)
-	rt.Protocol = m.lookupChannelProtocol(context.Background(), ch.ChannelProtocolID)
+	rt := m.buildRuntime(ch)
+	rt.Protocol = proto
 	if prev != nil {
 		rt.Channel.CreatedAt = prev.Channel.CreatedAt
 		rt.lastProbe = prev.lastProbe
@@ -900,7 +892,7 @@ func (m *Manager) ModelViews(channelID int64) []ModelView {
 	return views
 }
 
-// Snapshot 返回控制台渠道视图（当前状态 + LastErr + up/down）。
+// Snapshot 返回控制台渠道视图（LastErr + 有效配置；可用性见逐密钥状态）。
 func (m *Manager) Snapshot() []ChannelView {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -924,7 +916,6 @@ func (m *Manager) Snapshot() []ChannelView {
 			Tags:        c.Tags,
 			BoundTags:   btCp,
 			Priority:    c.Priority,
-			State:       rt.Machine.State(),
 			LastErr:     rt.LastErr,
 			LastProbe:   lp,
 			RateLimit:   rl,
@@ -967,27 +958,16 @@ func (m *Manager) BoundTags(channelID int64) []TagRef {
 	return cp
 }
 
-// DisableChannel 把渠道及其全部密钥运行时置为禁用（AC-17：上游 usage 缺失/无法解析时禁用渠道）。
-// 内存态即时生效（路由入口读 Machine.State()），并落库（channel_events + channels.state + 逐密钥）。
+// DisableChannel 把渠道下全部密钥运行时置为禁用（AC-17：上游 usage 缺失/无法解析时禁用渠道）。
+// 渠道无独立状态：禁用即逐密钥置 DISABLED（路由入口只读密钥/内部模型状态），并落库 channel_key_events。
 func (m *Manager) DisableChannel(id int64) {
 	var keyIDs []int64
-	var from State
-	has := false
 	m.mu.Lock()
-	if rt, ok := m.rt[id]; ok {
-		has = true
-		from = rt.Machine.State()
-		rt.Machine.ForceDisable(m.now())
-	}
 	for keyID := range m.keyOfCh[id] {
 		keyIDs = append(keyIDs, keyID)
 	}
 	m.mu.Unlock()
 
-	if has && from != StateDisabled {
-		m.persistChannelTransition(id, from, StateDisabled, "usage missing, channel disabled")
-		m.logger.Warn("channel disabled due to missing usage", "channel_id", id)
-	}
 	for _, keyID := range keyIDs {
 		var kfrom State
 		m.mu.Lock()
@@ -1000,6 +980,7 @@ func (m *Manager) DisableChannel(id int64) {
 			m.persistKeyTransition(keyID, kfrom, StateDisabled, "channel disabled: usage missing")
 		}
 	}
+	m.logger.Warn("channel disabled due to missing usage", "channel_id", id)
 }
 
 // Drop 删除运行时条目（渠道删除后调用）：同时摘除该渠道全部密钥运行时。
@@ -1014,20 +995,6 @@ func (m *Manager) Drop(id int64) {
 	}
 	delete(m.keyOfCh, id)
 	delete(m.keyOrder, id)
-}
-
-// persistChannelTransition 锁外写库：记录事件 + 更新渠道状态。
-func (m *Manager) persistChannelTransition(id int64, from, to State, reason string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if _, err := m.store.InsertEvent(ctx, &ChannelEvent{
-		ChannelID: id, FromState: from, ToState: to, Reason: reason,
-	}); err != nil {
-		m.logger.Error("insert channel event failed", "channel_id", id, "err", err)
-	}
-	if err := m.store.UpdateState(ctx, id, to); err != nil && !errors.Is(err, sql.ErrNoRows) {
-		m.logger.Error("update channel state failed", "channel_id", id, "err", err)
-	}
 }
 
 // persistKeyTransition 锁外写库：记录密钥状态事件 + 更新 channel_keys.state（keyStore 未装配时跳过）。
@@ -1167,6 +1134,7 @@ func (m *Manager) pickUsableKeyLocked(channelID int64) (int64, string) {
 
 // ProbeKeyNow 手动触发该密钥的一轮健康探测（同步执行，复用定时探测的语义）：
 // 按配置探测其 target 集合，结果驱动密钥状态机并落 probe_logs/记账。
+// 手动为管理员显式动作：本轮成功即视为已恢复（排空态直接置 NORMAL，免等连续成功阈值）。
 // 运行时不存在返回 sql.ErrNoRows；OK 以探测后该密钥 LastErr 是否为空判定。
 func (m *Manager) ProbeKeyNow(keyID int64) (ProbeOutcome, error) {
 	if _, ok := m.GetKeyRuntime(keyID); !ok {
@@ -1180,6 +1148,12 @@ func (m *Manager) ProbeKeyNow(keyID int64) (ProbeOutcome, error) {
 	kr, ok := m.GetKeyRuntime(keyID)
 	if !ok {
 		return ProbeOutcome{}, sql.ErrNoRows
+	}
+	if kr.Key.LastErr == "" && kr.Machine.State() == StateDrain {
+		m.ForceKeyNormal(keyID)
+		if kr2, ok2 := m.GetKeyRuntime(keyID); ok2 {
+			kr = kr2
+		}
 	}
 	lastErr := kr.Key.LastErr
 	return ProbeOutcome{
@@ -1230,6 +1204,13 @@ func (m *Manager) ProbeModelNow(channelID, modelRowID int64) (ProbeOutcome, erro
 	m.feedModelAndTransit(channelID, modelRowID, ProbeFeedback(fb))
 	m.recordProbe(ctx, keyID, modelID, "model", target, fb.IsSuccess, errMsg, usage, dur)
 
+	// 手动探测成功且模型仍排空（连续成功阈值未满）时立即恢复：管理员显式动作视为已确认恢复。
+	if errMsg == "" {
+		if mr2, ok := m.GetModelRuntime(channelID, modelRowID); ok && mr2.Machine.State() == StateDrain {
+			m.ForceModelNormal(channelID, modelRowID)
+		}
+	}
+
 	state := modelState
 	if mr2, ok := m.GetModelRuntime(channelID, modelRowID); ok {
 		state = string(mr2.Machine.State())
@@ -1241,36 +1222,6 @@ func (m *Manager) ProbeModelNow(channelID, modelRowID int64) (ProbeOutcome, erro
 		ModelID:    modelID,
 		State:      state,
 	}, nil
-}
-
-// ManualSetState 手动设置渠道状态（正常/排空/禁用），写事件并持久化。
-func (m *Manager) ManualSetState(id int64, st State) error {
-	m.mu.Lock()
-	rt, ok := m.rt[id]
-	if !ok {
-		m.mu.Unlock()
-		return sql.ErrNoRows
-	}
-	prev := rt.Machine.State()
-	switch st {
-	case StateNormal:
-		rt.Machine.ForceNormal(m.now())
-	case StateDrain:
-		rt.Machine.ForceDrain(m.now())
-	case StateDisabled:
-		rt.Machine.ForceDisable(m.now())
-	default:
-		m.mu.Unlock()
-		return fmt.Errorf("invalid state %q", st)
-	}
-	cur := rt.Machine.State()
-	m.mu.Unlock()
-
-	if prev != cur {
-		reason := rt.Machine.LastReason()
-		m.persistChannelTransition(id, prev, cur, reason)
-	}
-	return nil
 }
 
 // ManualSetModelState 手动设置内部模型状态，写事件并持久化。
@@ -1327,21 +1278,45 @@ func (m *Manager) ManualSetKeyState(keyID int64, action string) error {
 	return nil
 }
 
-// ForceChannelStateBatch 渠道级批量操作：将某渠道全部密钥状态机切到同一目标状态。
-// 分工说明：DB 批量落库（逐密钥 SetState + channel_key_events + 渠道级 channel_events）
-// 已在 A4 Service.ForceState 完成；本方法只负责内存 StateMachine 同步，避免双写冲突。
-func (m *Manager) ForceChannelStateBatch(channelID int64, action string) {
-	m.mu.RLock()
-	ids := make([]int64, 0, len(m.keyOfCh[channelID]))
-	for keyID := range m.keyOfCh[channelID] {
-		ids = append(ids, keyID)
-	}
-	m.mu.RUnlock()
-	for _, keyID := range ids {
-		if err := m.ManualSetKeyState(keyID, action); err != nil {
-			m.logger.Warn("force channel key state failed",
-				"channel_id", channelID, "key_id", keyID, "action", action, "error", err)
+// ForceKeyNormal 手动恢复单个密钥为 NORMAL（内存状态机 + 落库 channel_key_events/state）。
+// 供手动探测成功后立即恢复使用（管理员显式动作，免等排空间隔的连续成功阈值）。
+func (m *Manager) ForceKeyNormal(keyID int64) {
+	var tr *pendingTransition
+	m.mu.Lock()
+	if kr, ok := m.keys[keyID]; ok {
+		prev := kr.Machine.State()
+		kr.Machine.ForceNormal(m.now())
+		if cur := kr.Machine.State(); cur != prev {
+			tr = &pendingTransition{from: prev, to: cur, reason: kr.Machine.LastReason()}
 		}
+	}
+	m.mu.Unlock()
+	if tr != nil {
+		m.persistKeyTransition(keyID, tr.from, tr.to, tr.reason)
+	}
+}
+
+// ForceModelNormal 手动恢复单个内部模型为 NORMAL（内存状态机 + 落库 channel_model_events/state）。
+// 供手动模型探测成功后立即恢复使用。
+func (m *Manager) ForceModelNormal(channelID, modelRowID int64) {
+	var tr *pendingTransition
+	var modelID string
+	m.mu.Lock()
+	if mr, ok := m.mrt[channelID][modelRowID]; ok {
+		modelID = mr.Model.InternalModelID
+		prev := mr.Machine.State()
+		mr.Machine.ForceNormal(m.now())
+		if cur := mr.Machine.State(); cur != prev {
+			tr = &pendingTransition{from: prev, to: cur, reason: mr.Machine.LastReason()}
+		}
+	}
+	m.mu.Unlock()
+	if tr != nil {
+		if m.cmStore != nil {
+			m.persistModelTransition(channelID, modelID, tr.from, tr.to, tr.reason)
+		}
+		m.logger.Info("model state transition", "channel_id", channelID,
+			"model", modelID, "from", tr.from, "to", tr.to, "reason", tr.reason)
 	}
 }
 

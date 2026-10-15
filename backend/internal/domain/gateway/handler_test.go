@@ -307,7 +307,6 @@ func build(t *testing.T, upstreamURL string) *harness {
 			BaseURL:   upstreamURL,
 			RateLimit: channel.DefaultRateLimit(),
 		},
-		Machine: channel.NewMachine(channel.DefaultMachineConfig()),
 		Limiter: channel.NewLimiter(1000, 1000000, 1.2),
 	}
 	cl := channel.NewLimiter(1000, 1000000, 1.2)
@@ -1174,6 +1173,38 @@ func TestServePreConsume_RefundsOnUpstreamFailure(t *testing.T) {
 	}
 	if math.Abs(fc.consumed[0]-fc.refunded[0]) > 0.0001 {
 		t.Fatalf("failure must refund full pre-consume, consumed=%v refunded=%v", fc.consumed, fc.refunded)
+	}
+}
+
+// 上游非 2xx 时，上游错误响应体必须落进失败账单与调用日志（供管理员定位上游故障）。
+func TestServeNonStream_CapturesUpstreamErrorBody(t *testing.T) {
+	const upErrJSON = `{"error":{"message":"Insufficient balance","type":"insufficient_quota"}}`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(upErrJSON))
+	}))
+	defer upstream.Close()
+
+	h := build(t, upstream.URL)
+	_ = doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t",
+		`{"model":"gpt-4","stream":false,"messages":[{"role":"user","content":"hi"}]}`)
+
+	if len(h.billing.reqs) != 1 || !h.billing.reqs[0].Fail {
+		t.Fatalf("want 1 failed billing, got %+v", h.billing.reqs)
+	}
+	if !strings.Contains(h.billing.reqs[0].ErrorMessage, "Insufficient balance") {
+		t.Fatalf("失败账单应包含上游错误体, got %q", h.billing.reqs[0].ErrorMessage)
+	}
+	if len(h.clogs.inserted) == 0 {
+		t.Fatalf("want at least 1 call log")
+	}
+	cl := h.clogs.inserted[len(h.clogs.inserted)-1]
+	if !strings.Contains(cl.ErrorMessage, "Insufficient balance") {
+		t.Fatalf("调用日志 ErrorMessage 应包含上游错误体, got %q", cl.ErrorMessage)
+	}
+	if !strings.Contains(cl.RespBody, "Insufficient balance") {
+		t.Fatalf("调用日志 RespBody 应包含上游错误体, got %q", cl.RespBody)
 	}
 }
 
