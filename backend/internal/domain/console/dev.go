@@ -71,7 +71,7 @@ func (h *Dev) HandleListBillings(w http.ResponseWriter, r *http.Request) {
 		Size:   parseSize(q.Get("Size")),
 	}
 	if v := q.Get("From"); v != "" {
-		t, err := time.Parse(time.RFC3339, v)
+		t, err := parseRFC3339Lenient(v)
 		if err != nil {
 			resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "from 时间格式应为 RFC3339")
 			return
@@ -79,7 +79,7 @@ func (h *Dev) HandleListBillings(w http.ResponseWriter, r *http.Request) {
 		f.From = &t
 	}
 	if v := q.Get("To"); v != "" {
-		t, err := time.Parse(time.RFC3339, v)
+		t, err := parseRFC3339Lenient(v)
 		if err != nil {
 			resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "to 时间格式应为 RFC3339")
 			return
