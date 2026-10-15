@@ -185,6 +185,7 @@ export interface AdminChannel {
   RateLimit: RateLimitConfig
   HealthProbe: HealthProbeConfig
   Reliability: ReliabilityConfig
+  ChannelProtocolID?: number | string | null // 引用的渠道协议 ID；空=使用渠道内联配置
   KeyStates?: ChannelKeyState[]
   CreatedAt: string
   UpdatedAt: string
@@ -199,6 +200,8 @@ export interface ChannelInput {
   RateLimit?: RateLimitConfig
   HealthProbe?: HealthProbeConfig
   Reliability?: ReliabilityConfig
+  // 引用的渠道协议 ID（数字或 null）；选中后以协议配置为准，内联 protocol/base_url 被忽略
+  ChannelProtocolID?: number | string | null
 }
 // 内部模型状态流转事件
 export interface ChannelModelEvent {
@@ -260,6 +263,84 @@ export function cronPreview(expr: string, limit = 5) {
   return http.get<{ Times: string[] }, ApiRes<{ Times: string[] }>>('/admin/channels/cron-preview', {
     params: { Expr: expr, Limit: limit },
   })
+}
+
+// ===== 渠道协议（channel_protocols·可复用接入模板；字段名 = Go 字段名）=====
+// 单协议可选配置：缺省回退到渠道协议级 BaseURL / 基础协议内置默认路径。
+export interface ProtocolOption {
+  baseUrl?: string
+  path?: string
+  default?: boolean // 标记首选协议；同一作用域内至多一个
+}
+// 鉴权注入方式：header/scheme 决定注入位置与形式，query 为需放 querystring 的鉴权/版本参数。
+export interface ChannelProtocolAuth {
+  header: string // Authorization | x-api-key | api-key
+  scheme: string // bearer | raw
+  query?: Record<string, string>
+}
+// 请求头策略：passthroughMode 决定下游头透传方式，whitelist/blacklist 为名单，set 为覆盖键值（支持变量）。
+export interface ChannelProtocolRequestHeaders {
+  passthroughMode: string // none | whitelist | blacklist | all
+  whitelist: string[]
+  blacklist: string[]
+  set: Record<string, string>
+}
+export interface ChannelProtocolView {
+  ID: string
+  Name: string
+  BaseURL: string
+  Protocols: Record<string, ProtocolOption>
+  Auth: ChannelProtocolAuth
+  RequestHeaders: ChannelProtocolRequestHeaders
+  Models: Record<string, unknown>
+  PresetSourceID: string
+  Edited: boolean
+  SourceStatus: string // ACTIVE | STALE（来源已失效）
+}
+// 创建/更新入参（提交即视为「已编辑」）
+export interface ChannelProtocolInput {
+  Name: string
+  BaseURL: string
+  Protocols: Record<string, ProtocolOption>
+  Auth: ChannelProtocolAuth
+  RequestHeaders: ChannelProtocolRequestHeaders
+  Models: Record<string, unknown>
+}
+// 同步预览：Pending 为需二次确认才覆盖的条目（含差异文本），Applied 为本次直接覆盖数
+export interface ChannelProtocolSyncPending {
+  Id: string
+  Name: string
+  Diff: string
+  Edited: boolean
+  Stale: boolean
+}
+export interface ChannelProtocolSyncResult {
+  Pending: ChannelProtocolSyncPending[]
+  Applied: number
+}
+
+// 列表返回裸数组（非 {list}）
+export function listChannelProtocols() {
+  return http.get<ChannelProtocolView[], ApiRes<ChannelProtocolView[]>>('/admin/channel-protocols')
+}
+export function createChannelProtocol(payload: ChannelProtocolInput) {
+  return http.post<ChannelProtocolView, ApiRes<ChannelProtocolView>>('/admin/channel-protocols', payload)
+}
+export function getChannelProtocol(id: string) {
+  return http.get<ChannelProtocolView, ApiRes<ChannelProtocolView>>(`/admin/channel-protocols/${id}`)
+}
+export function updateChannelProtocol(id: string, payload: ChannelProtocolInput) {
+  return http.put<ChannelProtocolView, ApiRes<ChannelProtocolView>>(`/admin/channel-protocols/${id}`, payload)
+}
+export function deleteChannelProtocol(id: string) {
+  return http.delete<{ Affected: number }, ApiRes<{ Affected: number }>>(`/admin/channel-protocols/${id}`)
+}
+// 同步预设：confirm=false 返回待确认清单（已编辑条目），confirm=true 执行覆盖
+export function syncChannelProtocols(confirm: boolean) {
+  return http.post<ChannelProtocolSyncResult, ApiRes<ChannelProtocolSyncResult>>(
+    '/admin/channel-protocols/sync',
+    { confirm },
+  )
 }
 
 // 渠道密钥（channel_keys·运行时实体）：凭据只出尾号，状态三态独立流转
@@ -707,6 +788,18 @@ export function getSessionConfig() {
 }
 export function putSessionConfig(payload: { SessionExpiration: SessionExpirationData }) {
   return http.put<{ Affected: number }, ApiRes<{ Affected: number }>>('/admin/configs/session', payload)
+}
+
+// ===== 网关设置（sys_configs 键 gateway.upstream_response_header_whitelist）=====
+// 全局上游响应头白名单：列出后，上游该响应头才透传给客户端（默认空=仅基础协议硬编码响应头）。
+export interface GatewayConfigData {
+  UpstreamResponseHeaderWhitelist: string[]
+}
+export function getGatewayConfig() {
+  return http.get<GatewayConfigData, ApiRes<GatewayConfigData>>('/admin/configs/gateway')
+}
+export function putGatewayConfig(payload: { UpstreamResponseHeaderWhitelist: string[] }) {
+  return http.put<{ Affected: number }, ApiRes<{ Affected: number }>>('/admin/configs/gateway', payload)
 }
 
 // ===== 公告（字段名 = Go 字段名）=====

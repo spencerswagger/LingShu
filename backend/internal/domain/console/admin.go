@@ -663,6 +663,68 @@ func (h *Admin) HandlePutSessionConfig(w http.ResponseWriter, r *http.Request) {
 	resp.OK(w, r, map[string]any{"Affected": 1})
 }
 
+// ===== 网关设置（全局上游响应头白名单）=====
+
+// HandleGetGatewayConfig GET /api/v1/admin/configs/gateway
+// 返回全局上游响应头白名单（默认空，零配置）。
+func (h *Admin) HandleGetGatewayConfig(w http.ResponseWriter, r *http.Request) {
+	list := []string{}
+	raw, err := h.billing.GetConfig(r.Context(), gateway.UpstreamResponseHeaderWhitelistKey)
+	if err == nil {
+		_ = json.Unmarshal(raw, &list)
+	}
+	if list == nil {
+		list = []string{}
+	}
+	resp.OK(w, r, map[string]any{"UpstreamResponseHeaderWhitelist": list})
+}
+
+// HandlePutGatewayConfig PUT /api/v1/admin/configs/gateway
+func (h *Admin) HandlePutGatewayConfig(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		UpstreamResponseHeaderWhitelist []string `json:"UpstreamResponseHeaderWhitelist"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "请求体格式错误")
+		return
+	}
+	for _, name := range req.UpstreamResponseHeaderWhitelist {
+		if !validHeaderName(name) {
+			resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "非法的响应头名称："+name)
+			return
+		}
+	}
+	if req.UpstreamResponseHeaderWhitelist == nil {
+		req.UpstreamResponseHeaderWhitelist = []string{}
+	}
+	b, _ := json.Marshal(req.UpstreamResponseHeaderWhitelist)
+	operator, _ := h.userIDFrom(r.Context())
+	if err := h.billing.UpsertConfig(r.Context(), gateway.UpstreamResponseHeaderWhitelistKey, b, operator); err != nil {
+		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "更新网关设置失败")
+		return
+	}
+	resp.OK(w, r, map[string]any{"Affected": 1})
+}
+
+// validHeaderName 校验是否为合法 HTTP 头字段名（RFC 7230 token，非空）。
+func validHeaderName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case c == '!' || c == '#' || c == '$' || c == '%' || c == '&' || c == '\'' ||
+			c == '*' || c == '+' || c == '-' || c == '.' || c == '^' || c == '_' ||
+			c == '`' || c == '|' || c == '~':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // validateSessionExpiration 校验会话过期配置，返回 nil 表示合法；否则返回具体的中文原因（不含技术细节）。
 func validateSessionExpiration(raw []byte) error {
 	if !isJSONObject(raw) {

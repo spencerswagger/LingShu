@@ -31,6 +31,10 @@ const router = createRouter({
         { path: 'channels', name: 'admin-channels', component: () => import('@/views/admin/ChannelList.vue'), meta: { title: '渠道' } },
         { path: 'channels/create', name: 'admin-channel-create', component: () => import('@/views/admin/ChannelCreate.vue'), meta: { title: '新建渠道' } },
         { path: 'channels/:id', name: 'admin-channel-edit', component: () => import('@/views/admin/ChannelEdit.vue'), meta: { title: '渠道' } },
+        // 渠道协议
+        { path: 'channel-protocols', name: 'admin-channel-protocols', component: () => import('@/views/admin/ChannelProtocolList.vue'), meta: { title: '渠道协议' } },
+        { path: 'channel-protocols/create', name: 'admin-channel-protocol-create', component: () => import('@/views/admin/ChannelProtocolEdit.vue'), meta: { title: '新建渠道协议' } },
+        { path: 'channel-protocols/:id/edit', name: 'admin-channel-protocol-edit', component: () => import('@/views/admin/ChannelProtocolEdit.vue'), meta: { title: '编辑渠道协议' } },
         // 模型
         { path: 'models', name: 'admin-models', component: () => import('@/views/admin/ModelList.vue'), meta: { title: '模型' } },
         { path: 'models/create', name: 'admin-model-create', component: () => import('@/views/admin/ModelCreate.vue'), meta: { title: '新建模型' } },
@@ -54,6 +58,7 @@ const router = createRouter({
         // 系统管理（系统级全局配置统一放这里）
         { path: 'system', redirect: '/admin/system/config' },
         { path: 'system/config', name: 'admin-system-config', component: () => import('@/views/admin/BillingConfig.vue'), meta: { title: '系统' } },
+        { path: 'system/gateway', name: 'admin-system-gateway', component: () => import('@/views/admin/GatewayConfig.vue'), meta: { title: '网关设置' } },
         // 公告
         { path: 'announcements', name: 'admin-announcements', component: () => import('@/views/admin/AnnouncementList.vue'), meta: { title: '公告' } },
         { path: 'announcements/create', name: 'admin-announcement-create', component: () => import('@/views/admin/AnnouncementEdit.vue'), meta: { title: '新建公告' } },

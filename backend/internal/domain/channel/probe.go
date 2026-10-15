@@ -8,10 +8,99 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"slices"
+	"sort"
 	"strings"
 	"time"
+
+	"github.com/team/llmgateway/internal/domain/channelprotocol"
 )
+
+// effectiveProtocolBaseURL 求渠道某基础协议的有效上游基址：渠道级 base_url 优先，
+// 回落所引用渠道协议（协议级 baseUrl 优先，再回落协议级 base_url）。仅引用协议时渠道内联 base_url 可为空。
+func effectiveProtocolBaseURL(rt *RuntimeChannel, protocol string) string {
+	if s := strings.TrimSpace(rt.Channel.BaseURL); s != "" {
+		return s
+	}
+	if rt.Protocol != nil {
+		return rt.Protocol.EffectiveBaseURL(protocol)
+	}
+	return ""
+}
+
+// effectiveProtocolPath 求某基础协议的有效端点路径：渠道协议 path 覆盖优先，回落内置默认。
+func effectiveProtocolPath(rt *RuntimeChannel, protocol, defaultPath string) string {
+	if rt.Protocol != nil {
+		if spec, ok := rt.Protocol.Protocols[protocol]; ok && strings.TrimSpace(spec.Path) != "" {
+			return strings.TrimSpace(spec.Path)
+		}
+	}
+	return defaultPath
+}
+
+// effectiveProtocolAuth 求鉴权注入方式：渠道协议读取，内联渠道缺省 Authorization/Bearer。
+func effectiveProtocolAuth(rt *RuntimeChannel) channelprotocol.AuthSpec {
+	if rt.Protocol != nil {
+		return rt.Protocol.Auth
+	}
+	return channelprotocol.AuthSpec{Header: "Authorization", Scheme: "bearer"}
+}
+
+// renderAuth 把凭据按 AuthSpec 渲染为注入头名/头值与需追加的 query 参数（{api_key} 以凭据替换）。
+// 缺省 header=Authorization、scheme=bearer（与网关 injectAuth 语义一致）。
+func renderAuth(auth channelprotocol.AuthSpec, cred string) (header, value string, query [][2]string) {
+	header = strings.TrimSpace(auth.Header)
+	if header == "" {
+		header = "Authorization"
+	}
+	// 与网关 injectAuth 一致：无凭据不注入任何鉴权头/query（调用方据 value=="" 跳过设置）。
+	if cred == "" {
+		return header, "", nil
+	}
+	scheme := strings.ToLower(strings.TrimSpace(auth.Scheme))
+	value = cred
+	if scheme == "" || scheme == "bearer" {
+		value = "Bearer " + cred
+	}
+	for k, v := range auth.Query {
+		query = append(query, [2]string{k, strings.ReplaceAll(v, "{api_key}", cred)})
+	}
+	sort.Slice(query, func(i, j int) bool { return query[i][0] < query[j][0] })
+	return header, value, query
+}
+
+// joinProbeURL 拼基址与路径（去基址尾 /、路径头 /），并追加鉴权 query 参数。
+func joinProbeURL(base, path string, query [][2]string) string {
+	raw := strings.TrimRight(base, "/") + "/" + strings.TrimLeft(path, "/")
+	if len(query) == 0 {
+		return raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	q := u.Query()
+	for _, kv := range query {
+		q.Set(kv[0], kv[1])
+	}
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+// probeRequest 求一次探测的目标 URL 与鉴权头名/值：按渠道协议解析有效 baseURL/path/auth
+// （内联渠道回落 base_url + /chat/completions + Bearer）。base 为空时返回空 target，由调用方以可读错误处理。
+// 探测语义固定为 OpenAI 兼容的最小对话请求，故协议键取 openai-chat。
+func (m *Manager) probeRequest(ch *RuntimeChannel, cred string) (target, authHeader, authValue string) {
+	protocol := channelprotocol.ProtocolOpenAIChat
+	header, value, query := renderAuth(effectiveProtocolAuth(ch), cred)
+	base := effectiveProtocolBaseURL(ch, protocol)
+	if strings.TrimSpace(base) == "" {
+		return "", header, value
+	}
+	path := effectiveProtocolPath(ch, protocol, "/chat/completions")
+	return joinProbeURL(base, path, query), header, value
+}
 
 // ProbeUsage 探测请求的 token 开销（供记账）。
 type ProbeUsage struct {
@@ -202,11 +291,14 @@ func (m *Manager) probeOnce(ctx context.Context, keyID int64, probeModel, level 
 	if timeout <= 0 {
 		timeout = 15 * time.Second
 	}
-	base := strings.TrimRight(kr.Channel.BaseURL, "/")
-	target := base + "/chat/completions"
+	chRT, ok := m.GetRuntime(kr.Channel.ID)
+	if !ok {
+		chRT = &RuntimeChannel{Channel: *kr.Channel}
+	}
+	target, authHeader, authValue := m.probeRequest(chRT, kr.CredentialPlain)
 
 	start := m.now()
-	fb, usage, errMsg := m.doProbe(ctx, target, kr.CredentialPlain, probeModel, timeout)
+	fb, usage, errMsg := m.doProbeAuth(ctx, target, authHeader, authValue, probeModel, timeout)
 	dur := m.now().Sub(start).Milliseconds()
 
 	m.markKeyProbeResult(keyID, errMsg)
@@ -220,11 +312,15 @@ func (m *Manager) probeOnce(ctx context.Context, keyID int64, probeModel, level 
 // ProbeFeedback 用标记探测属性的反馈包装为普通反馈（保持语义一致）。
 func ProbeFeedback(fb Feedback) Feedback { return fb }
 
-// doProbe 构建并执行最小对话探测请求，解析响应 usage 与状态分类。
+// doProbeAuth 构建并执行最小对话探测请求，解析响应 usage 与状态分类（鉴权头名/值可定制，
+// 以支持 x-api-key/raw 等渠道协议鉴权）。
 // 2xx 成功；401/403 认证失败（→禁用）；429 上游限流；其余失败；超时标记 IsTimeout。
-func (m *Manager) doProbe(ctx context.Context, url, auth, model string, timeout time.Duration) (Feedback, ProbeUsage, string) {
+func (m *Manager) doProbeAuth(ctx context.Context, url, authHeader, authValue, model string, timeout time.Duration) (Feedback, ProbeUsage, string) {
 	fb := Feedback{HasProbe: true, Now: m.now()}
 	var usage ProbeUsage
+	if strings.TrimSpace(url) == "" {
+		return fb, usage, "渠道未配置 Base URL，无法探测"
+	}
 	payload, err := json.Marshal(map[string]any{
 		"model":      model,
 		"messages":   []map[string]string{{"role": "user", "content": "ping"}},
@@ -243,8 +339,8 @@ func (m *Manager) doProbe(ctx context.Context, url, auth, model string, timeout 
 		return fb, usage, err.Error()
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if auth != "" {
-		req.Header.Set("Authorization", "Bearer "+auth)
+	if authValue != "" {
+		req.Header.Set(authHeader, authValue)
 	}
 
 	resp, err := m.probeHTTP.Do(req)

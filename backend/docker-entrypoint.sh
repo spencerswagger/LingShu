@@ -75,6 +75,9 @@ sync:
 billing:
   retry_queue_path: "$DATA_DIR/billing_retry.jsonl"
   retry_interval_seconds: ${BILLING_RETRY_INTERVAL_SECONDS:-30}
+preset:
+  # 外挂渠道预设包地址；留空表示未配置（首次启动不拉取，AC-12）。
+  pack_url: "${PRESET_PACK_URL:-}"
 EOF
 chmod 600 "$CONFIG_PATH"
 
