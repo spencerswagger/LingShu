@@ -18,7 +18,7 @@ import (
 	"github.com/team/llmgateway/internal/pkg/crypto"
 )
 
-// 探测目标按渠道协议解析有效 baseURL/path/auth：仅引用协议（内联 base_url 为空）时不再探测到空 URL。
+// 探测目标按渠道协议解析有效 baseURL/path；鉴权按 openai-chat 隐含注入（Bearer）。
 func TestProbeRequest_HonorsChannelProtocol(t *testing.T) {
 	m := newProbeTestManager()
 	rt := &RuntimeChannel{
@@ -28,36 +28,34 @@ func TestProbeRequest_HonorsChannelProtocol(t *testing.T) {
 			Protocols: channelprotocol.Protocols{
 				channelprotocol.ProtocolOpenAIChat: {BaseURL: "https://proto-chat.example.com", Path: "/v2/chat"},
 			},
-			Auth: channelprotocol.AuthSpec{Header: "x-api-key", Scheme: "raw"},
 		},
 	}
 	target, header, value := m.probeRequest(rt, "sk-1")
 	if target != "https://proto-chat.example.com/v2/chat" {
 		t.Errorf("探测目标应取协议级 baseUrl+path, got %q", target)
 	}
-	if header != "x-api-key" || value != "sk-1" {
-		t.Errorf("探测鉴权应取协议 x-api-key/raw, got %q/%q", header, value)
+	if header != "Authorization" || value != "Bearer sk-1" {
+		t.Errorf("探测鉴权应按 openai-chat 隐含注入 Bearer, got %q/%q", header, value)
 	}
 }
 
-// renderAuth/joinProbeURL：auth.query 注入（含 {api_key} 替换、键排序）与去基址尾斜杠；空凭据不注入。
+// renderAuth/joinProbeURL：协议隐含鉴权渲染与去基址尾斜杠；空凭据不注入。
 func TestRenderAuthAndJoinProbeURL(t *testing.T) {
-	header, value, query := renderAuth(channelprotocol.AuthSpec{
-		Header: "Authorization", Scheme: "bearer",
-		Query: map[string]string{"api-version": "2025-04-01-preview", "key": "{api_key}"},
-	}, "sk-secret")
+	header, value := renderAuth(channelprotocol.ProtocolOpenAIChat, "sk-secret")
 	if header != "Authorization" || value != "Bearer sk-secret" {
 		t.Fatalf("renderAuth header/value 错误: %q/%q", header, value)
 	}
-	got := joinProbeURL("https://up.example.com/", "/chat/completions", query)
-	want := "https://up.example.com/chat/completions?api-version=2025-04-01-preview&key=sk-secret"
-	if got != want {
-		t.Fatalf("joinProbeURL want %q, got %q", want, got)
+	ah, av := renderAuth(channelprotocol.ProtocolAnthropicMessages, "sk-raw")
+	if ah != "x-api-key" || av != "sk-raw" {
+		t.Fatalf("renderAuth anthropic 错误: %q/%q", ah, av)
+	}
+	if _, v := renderAuth(channelprotocol.ProtocolOpenAIChat, ""); v != "" {
+		t.Fatalf("空凭据不应注入鉴权: value=%q", v)
 	}
 
-	// 空凭据：与网关 injectAuth 一致，不注入任何鉴权头/query。
-	if _, v, q := renderAuth(channelprotocol.AuthSpec{Header: "x-api-key", Scheme: "raw"}, ""); v != "" || len(q) != 0 {
-		t.Fatalf("空凭据不应注入鉴权: value=%q query=%v", v, q)
+	got := joinProbeURL("https://up.example.com/", "/chat/completions")
+	if want := "https://up.example.com/chat/completions"; got != want {
+		t.Fatalf("joinProbeURL want %q, got %q", want, got)
 	}
 }
 

@@ -2,14 +2,17 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
+import { Plus } from '@element-plus/icons-vue'
 import {
   createChannelProtocol,
   getChannelProtocol,
   updateChannelProtocol,
   type ChannelProtocolInput,
+  type ChannelProtocolModelOverride,
   type ProtocolOption,
 } from '@/api/admin'
 import KvpEditor from '@/components/KvpEditor.vue'
+import StringListEditor from '@/components/StringListEditor.vue'
 import ErrorBubble from '@/components/ErrorBubble.vue'
 
 const route = useRoute()
@@ -42,34 +45,35 @@ const defaultProtocol = ref<string>('')
 const form = reactive({
   name: '',
   base_url: '',
-  auth_header: 'Authorization',
-  auth_scheme: 'bearer',
-  auth_query: {} as Record<string, string>,
   passthrough_mode: 'none',
   whitelist: [] as string[],
   blacklist: [] as string[],
   set: {} as Record<string, string>,
-  models_text: '{}',
 })
+
+// 模型清单：每行一个内部模型，可覆盖可达协议子集与 BaseURL（留空 = 继承渠道协议级）
+type ModelRow = { id: string; protocols: string[]; baseUrl: string }
+const modelRows = ref<ModelRow[]>([])
 
 const enabledProtocols = computed(() => baseProtocols.filter((p) => protocols[p].enabled))
 
 // 来源预设 ID（只读回显）
 const presetSourceId = ref('')
 
-// 建议透传的白名单候选（来自预设包格式约定）
+// 请求头候选：仅 OpenAI / Anthropic 常用头，作为下拉提示（可自行输入任意头名）
 const headerSuggestions = [
   'anthropic-version',
   'anthropic-beta',
   'OpenAI-Organization',
   'OpenAI-Project',
   'OpenAI-Beta',
-  'traceparent',
-  'tracestate',
-  'x-request-id',
-  'x-session-id',
-  'x-client-request-id',
-  'x-opencode-session',
+]
+
+const passthroughOptions = [
+  { label: '不透传', value: 'none' },
+  { label: '白名单', value: 'whitelist' },
+  { label: '黑名单', value: 'blacklist' },
+  { label: '全部透传', value: 'all' },
 ]
 
 async function load() {
@@ -89,39 +93,58 @@ async function load() {
       protocols[p].baseUrl = opt?.baseUrl || ''
       if (opt?.default) defaultProtocol.value = p
     }
-    form.auth_header = v.Auth?.header || 'Authorization'
-    form.auth_scheme = v.Auth?.scheme || 'bearer'
-    form.auth_query = v.Auth?.query || {}
     form.passthrough_mode = v.RequestHeaders?.passthroughMode || 'none'
     form.whitelist = v.RequestHeaders?.whitelist || []
     form.blacklist = v.RequestHeaders?.blacklist || []
     form.set = v.RequestHeaders?.set || {}
-    form.models_text = JSON.stringify(v.Models ?? {}, null, 2)
+    modelRows.value = Object.entries(v.Models || {}).map(([mid, ov]) => ({
+      id: mid,
+      protocols: Object.keys(ov?.protocols || {}),
+      baseUrl: ov?.baseUrl || '',
+    }))
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
   } finally {
     loading.value = false
   }
 }
-onMounted(load)
+onMounted(() => {
+  // 返回「渠道」合并页时保持选中「渠道协议」视图
+  sessionStorage.setItem('admin-channels-tab', 'protocols')
+  load()
+})
+
+// 模型清单 增/删行
+function addModelRow() {
+  modelRows.value.push({ id: '', protocols: [], baseUrl: '' })
+}
+function removeModelRow(index: number) {
+  modelRows.value.splice(index, 1)
+}
+
+// 由行数据组装后端 Models（{ [内部模型 ID]: { baseUrl?, protocols? } }）
+function buildModels(): Record<string, ChannelProtocolModelOverride> {
+  const out: Record<string, ChannelProtocolModelOverride> = {}
+  for (const r of modelRows.value) {
+    const mid = r.id.trim()
+    if (!mid) continue
+    const ov: ChannelProtocolModelOverride = {}
+    if (r.baseUrl.trim()) ov.baseUrl = r.baseUrl.trim()
+    if (r.protocols.length) {
+      const p: Record<string, ProtocolOption> = {}
+      for (const name of r.protocols) p[name] = {}
+      ov.protocols = p
+    }
+    out[mid] = ov
+  }
+  return out
+}
 
 async function onSubmit() {
   if (!form.name.trim()) return ElMessage.warning('请填写名称')
   if (form.base_url.trim() && !/^https?:\/\//.test(form.base_url.trim()))
     return ElMessage.warning('BaseURL 必须以 http(s):// 开头')
   if (!enabledProtocols.value.length) return ElMessage.warning('请至少启用一个基础协议')
-
-  // models 以 JSON 文本域录入，提交前解析校验（必须为 JSON 对象）
-  let models: Record<string, unknown>
-  try {
-    const parsed = JSON.parse(form.models_text || '{}')
-    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      return ElMessage.warning('模型清单必须为 JSON 对象')
-    }
-    models = parsed as Record<string, unknown>
-  } catch {
-    return ElMessage.warning('模型清单 JSON 格式错误')
-  }
 
   const protoOut: Record<string, ProtocolOption> = {}
   for (const p of baseProtocols) {
@@ -137,18 +160,13 @@ async function onSubmit() {
     Name: form.name.trim(),
     BaseURL: form.base_url.trim(),
     Protocols: protoOut,
-    Auth: {
-      header: form.auth_header,
-      scheme: form.auth_scheme,
-      query: form.auth_query,
-    },
     RequestHeaders: {
       passthroughMode: form.passthrough_mode,
       whitelist: form.whitelist,
       blacklist: form.blacklist,
       set: form.set,
     },
-    Models: models,
+    Models: buildModels(),
   }
 
   saving.value = true
@@ -161,7 +179,7 @@ async function onSubmit() {
     } else {
       await createChannelProtocol(payload)
       ElMessage.success('渠道协议已创建')
-      router.push('/admin/channel-protocols')
+      router.push('/admin/channels')
     }
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
@@ -194,7 +212,7 @@ async function onSubmit() {
 
       <el-tab-pane label="协议配置" name="protocols">
         <div class="card">
-          <div class="block-desc">选择该协议模板原生支持的上游基础协议；键存在 = 支持。可逐协议覆盖路径与上游地址。</div>
+          <div class="block-desc">选择该协议模板原生支持的上游基础协议；键存在 = 支持。可逐协议覆盖路径与上游地址。鉴权由协议隐含（openai-* → Authorization Bearer；anthropic-messages → x-api-key），如需其它方式请在「请求头策略 → 覆盖」中显式写入。</div>
           <div v-for="p in baseProtocols" :key="p" class="proto-row">
             <el-checkbox v-model="protocols[p].enabled" class="proto-check">{{ protocolLabels[p] }}</el-checkbox>
             <div class="proto-fields">
@@ -213,75 +231,32 @@ async function onSubmit() {
         </div>
       </el-tab-pane>
 
-      <el-tab-pane label="鉴权" name="auth">
-        <div class="card">
-          <div class="block-desc">凭据仍存于渠道密钥（channel_keys）；此处仅描述鉴权注入方式。</div>
-          <el-form label-width="130px" class="form-grid">
-            <el-form-item label="Header">
-              <el-select v-model="form.auth_header" style="width: 100%">
-                <el-option label="Authorization" value="Authorization" />
-                <el-option label="x-api-key" value="x-api-key" />
-                <el-option label="api-key" value="api-key" />
-              </el-select>
-            </el-form-item>
-            <el-form-item label="Scheme">
-              <el-select v-model="form.auth_scheme" style="width: 100%">
-                <el-option label="bearer" value="bearer" />
-                <el-option label="raw" value="raw" />
-              </el-select>
-              <div class="hint">bearer = 注入 `Bearer &lt;凭据&gt;`；raw = 原样注入凭据</div>
-            </el-form-item>
-            <el-form-item class="span-2" label="Query 参数">
-              <KvpEditor v-model="form.auth_query" key-placeholder="参数名" value-placeholder="参数值（如 api-version）" />
-              <div class="hint">需放 querystring 的鉴权 / 版本参数（如 Azure api-version）</div>
-            </el-form-item>
-          </el-form>
-        </div>
-      </el-tab-pane>
-
       <el-tab-pane label="请求头策略" name="headers">
         <div class="card">
-          <div class="block-desc">控制下游请求头如何透传到上游；鉴权头由「鉴权」注入，不应写入 set。</div>
+          <div class="block-desc">控制下游请求头如何透传到上游；鉴权由基础协议隐含注入，「覆盖」在其之后应用，可显式覆盖鉴权头。</div>
           <el-form label-width="130px" class="form-grid">
-            <el-form-item label="透传模式">
-              <el-select v-model="form.passthrough_mode" style="width: 100%">
-                <el-option label="none（不透传）" value="none" />
-                <el-option label="whitelist（白名单）" value="whitelist" />
-                <el-option label="blacklist（黑名单）" value="blacklist" />
-                <el-option label="all（全部透传）" value="all" />
-              </el-select>
+            <el-form-item class="span-2" label="透传模式">
+              <el-segmented :model-value="form.passthrough_mode" :options="passthroughOptions" @change="(v: string | number | boolean) => (form.passthrough_mode = String(v))" />
             </el-form-item>
             <el-form-item label="白名单">
-              <el-select
+              <StringListEditor
                 v-model="form.whitelist"
-                multiple
-                filterable
-                allow-create
-                default-first-option
-                style="width: 100%"
+                :suggestions="headerSuggestions"
                 placeholder="仅这些下游头透传"
-                :disabled="form.passthrough_mode !== 'whitelist'"
-              >
-                <el-option v-for="h in headerSuggestions" :key="h" :label="h" :value="h" />
-              </el-select>
+              />
+              <div class="hint">下拉仅为常用头提示，可自行输入；仅在「白名单」模式下生效</div>
             </el-form-item>
             <el-form-item label="黑名单">
-              <el-select
+              <StringListEditor
                 v-model="form.blacklist"
-                multiple
-                filterable
-                allow-create
-                default-first-option
-                style="width: 100%"
+                :suggestions="headerSuggestions"
                 placeholder="除这些下游头外透传"
-                :disabled="form.passthrough_mode !== 'blacklist'"
-              >
-                <el-option v-for="h in headerSuggestions" :key="h" :label="h" :value="h" />
-              </el-select>
+              />
+              <div class="hint">下拉仅为常用头提示，可自行输入；仅在「黑名单」模式下生效</div>
             </el-form-item>
-            <el-form-item class="span-2" label="Set 覆盖">
+            <el-form-item class="span-2" label="覆盖">
               <KvpEditor v-model="form.set" key-placeholder="请求头名" value-placeholder="值（支持变量）" />
-              <div class="hint">覆盖语义（非合并）；支持变量 {api_key} / {session_id} / {request_id} / {model} / {client_header:NAME}</div>
+              <div class="hint">覆盖语义（非合并），在协议隐含鉴权之后应用；支持变量 {api_key} / {session_id} / {request_id} / {model} / {client_header:NAME}</div>
             </el-form-item>
           </el-form>
         </div>
@@ -289,15 +264,39 @@ async function onSubmit() {
 
       <el-tab-pane label="模型清单" name="models">
         <div class="card">
-          <div class="block-desc">模型清单以 JSON 对象录入（对齐预设包 models 字段）；提交时解析校验。</div>
-          <el-input v-model="form.models_text" type="textarea" :rows="16" class="code-area" />
+          <div class="block-desc">列出该协议模板下的内部模型；可为每个模型收窄可达协议子集并覆盖 BaseURL（留空 = 继承渠道协议级配置）。</div>
+          <el-table :data="modelRows" border class="model-table">
+            <el-table-column label="内部模型 ID" min-width="200">
+              <template #default="{ row }">
+                <el-input v-model="row.id" placeholder="上游模型名（请求体 model 字段）" />
+              </template>
+            </el-table-column>
+            <el-table-column label="可达协议" min-width="260">
+              <template #default="{ row }">
+                <el-select v-model="row.protocols" multiple clearable placeholder="留空 = 继承渠道协议" style="width: 100%">
+                  <el-option v-for="p in baseProtocols" :key="p" :label="protocolLabels[p]" :value="p" />
+                </el-select>
+              </template>
+            </el-table-column>
+            <el-table-column label="BaseURL 覆盖" min-width="200">
+              <template #default="{ row }">
+                <el-input v-model="row.baseUrl" placeholder="留空 = 继承协议级" />
+              </template>
+            </el-table-column>
+            <el-table-column label="操作" width="80" align="center">
+              <template #default="{ $index }">
+                <el-button link type="danger" @click="removeModelRow($index)">删除</el-button>
+              </template>
+            </el-table-column>
+          </el-table>
+          <el-button class="add-tier-btn" :icon="Plus" @click="addModelRow">添加模型</el-button>
         </div>
       </el-tab-pane>
     </el-tabs>
 
     <div class="actions">
       <el-button type="primary" :loading="saving" @click="onSubmit">{{ isEdit ? '保存' : '创建' }}</el-button>
-      <el-button @click="router.push('/admin/channel-protocols')">取消</el-button>
+      <el-button @click="router.push('/admin/channels')">取消</el-button>
       <ErrorBubble v-if="errInfo.message || errInfo.requestId" :message="errInfo.message" :request-id="errInfo.requestId" />
     </div>
   </div>
@@ -313,6 +312,7 @@ async function onSubmit() {
 .form-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
   gap: 0 28px;
 }
 .form-grid .span-2 {
@@ -355,14 +355,13 @@ async function onSubmit() {
 .init-form {
   margin-top: 16px;
 }
+.add-tier-btn {
+  margin-top: 10px;
+}
 .actions {
   margin-top: 20px;
   display: flex;
   align-items: center;
   gap: 8px;
-}
-.code-area :deep(textarea) {
-  font-family: 'SF Mono', Menlo, Consolas, monospace;
-  font-size: 12px;
 }
 </style>

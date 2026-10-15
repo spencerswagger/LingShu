@@ -180,14 +180,14 @@ func TestService_PullModels_HTTPServer(t *testing.T) {
 	}
 }
 
-// PullModels 按渠道协议解析有效 baseURL/auth；/models 端点固定，不复用协议对话端点 path。
+// PullModels 按渠道协议解析有效 baseURL；/models 端点固定，不复用协议对话端点 path；鉴权按 openai-chat 隐含注入。
 func TestService_PullModels_HonorsChannelProtocol(t *testing.T) {
 	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/models" {
 			t.Errorf("path want /models（不得复用协议 chat path）, got %s", r.URL.Path)
 		}
-		if got := r.Header.Get("x-api-key"); got != "sk-plain" {
-			t.Errorf("auth want x-api-key sk-plain, got %q", got)
+		if got := r.Header.Get("Authorization"); got != "Bearer sk-plain" {
+			t.Errorf("auth want Bearer sk-plain, got %q", got)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"qwen-max","object":"model","owned_by":"aliyun"}]}`))
@@ -202,7 +202,6 @@ func TestService_PullModels_HonorsChannelProtocol(t *testing.T) {
 			Protocols: channelprotocol.Protocols{
 				channelprotocol.ProtocolOpenAIChat: {Path: "/chat/completions"},
 			},
-			Auth: channelprotocol.AuthSpec{Header: "x-api-key", Scheme: "raw"},
 		},
 	}
 	rt.Keys = []*KeyRuntime{

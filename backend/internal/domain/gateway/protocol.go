@@ -61,14 +61,6 @@ func effectiveBaseURL(rt *channel.RuntimeChannel, protocol string) string {
 	return ""
 }
 
-// effectiveAuth 求鉴权注入方式：渠道协议读取，内联渠道缺省 Authorization/Bearer。
-func effectiveAuth(rt *channel.RuntimeChannel) channelprotocol.AuthSpec {
-	if rt.Protocol != nil {
-		return rt.Protocol.Auth
-	}
-	return channelprotocol.AuthSpec{Header: "Authorization", Scheme: "bearer"}
-}
-
 // effectiveHeaderPolicy 求请求头策略：渠道协议读取，内联渠道缺省 none。
 func effectiveHeaderPolicy(rt *channel.RuntimeChannel) channelprotocol.HeaderPolicy {
 	if rt.Protocol != nil {

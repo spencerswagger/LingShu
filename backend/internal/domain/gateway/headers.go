@@ -10,15 +10,15 @@ import (
 )
 
 // UpstreamRequest 是一次上游请求的构造上下文：把「基址 / 协议端点 / 凭据 / 请求体 /
-// 下游头 / 头策略 / 鉴权 / 变量」收敛为一个结构，供各基础协议适配器共享。
+// 下游头 / 头策略 / 协议 / 变量」收敛为一个结构，供各基础协议适配器共享。
 type UpstreamRequest struct {
 	BaseURL          string                       // 有效上游基址（协议级 baseUrl 优先）
 	Path             string                       // 协议端点路径覆盖（空则用基础协议内置默认）
-	Cred             string                       // 渠道凭据（{api_key} 变量与 auth 注入来源）
+	Cred             string                       // 渠道凭据（{api_key} 变量与鉴权注入来源）
 	Body             []byte                       // 已改写 model 的请求体
 	DownstreamHeader http.Header                  // 下游原始请求头（透传/变量取值来源）
 	HeaderPolicy     channelprotocol.HeaderPolicy // 请求头策略
-	Auth             channelprotocol.AuthSpec     // 鉴权注入方式
+	Protocol         string                       // 入站基础协议（决定隐含鉴权注入方式）
 	Vars             map[string]string            // 变量表：session_id / request_id / model
 }
 
@@ -61,15 +61,16 @@ var forcedBlacklist = map[string]bool{
 	"api-key":       true,
 }
 
-// authHeaderNames 鉴权头名集合：这些头禁止出现在用户可编辑 set（由 auth 注入，AC-9）。
-var authHeaderNames = map[string]bool{
+// credentialHeaderNames 凭据头名集合：透传恒禁止（避免把网关自身的凭据带上游）；
+// 但「覆盖(set)」允许显式写入，用于覆盖协议隐含的鉴权注入。
+var credentialHeaderNames = map[string]bool{
 	"authorization": true,
 	"x-api-key":     true,
 	"api-key":       true,
 }
 
-// buildUpstreamRequest 是各基础协议适配器共享的上游请求构造：拼 URL、注入 Content-Type、
-// 应用头策略（先减强制黑名单）、注入鉴权、返回 http.Request。
+// buildUpstreamRequest 是各基础协议适配器共享的上游请求构造：拼 URL、注入 Content-Type，
+// 依次应用「透传 → 协议隐含鉴权 → 覆盖(set)」，返回 http.Request。
 // defaultPath 为基址后拼接的基础协议内置默认路径（相对基址，可含 v1/…）。
 func buildUpstreamRequest(ctx context.Context, req UpstreamRequest, defaultPath, contentType string) (*http.Request, error) {
 	path := strings.TrimSpace(req.Path)
@@ -84,8 +85,12 @@ func buildUpstreamRequest(ctx context.Context, req UpstreamRequest, defaultPath,
 	if contentType != "" {
 		hreq.Header.Set("Content-Type", contentType)
 	}
-	applyHeaderPolicy(hreq.Header, req.DownstreamHeader, req.HeaderPolicy, req.Cred, req.Vars)
-	injectAuth(hreq, req.Auth, req.Cred, req.Vars)
+	// 1) 透传：按模式从下游选取头（强制黑名单含凭据头，恒不透传，AC-5/AC-8）。
+	applyPassthrough(hreq.Header, req.DownstreamHeader, req.HeaderPolicy)
+	// 2) 协议隐含鉴权：openai-* → Authorization Bearer；anthropic-messages → x-api-key。
+	injectProtocolAuth(hreq, req.Protocol, req.Cred)
+	// 3) 覆盖(set)：最后应用，可覆盖协议隐含鉴权头（显式意图优先）。
+	applyOverrides(hreq.Header, req.HeaderPolicy.Set, req.Cred, req.Vars, req.DownstreamHeader)
 	return hreq, nil
 }
 
@@ -94,10 +99,8 @@ func joinURL(baseURL, path string) string {
 	return strings.TrimRight(baseURL, "/") + "/" + strings.TrimLeft(path, "/")
 }
 
-// applyHeaderPolicy 依据 passthroughMode 从下游头选取候选 → 减去强制黑名单 → 覆盖 set（变量替换）。
-// 鉴权头由 injectAuth 在之后注入，故 set 中的鉴权头名会被跳过（AC-9）。
-// set 与透传同样受强制黑名单约束：任何模式下都不得把 Cookie/Host/Content-Length 等注入上游（AC-8）。
-func applyHeaderPolicy(dst, downstream http.Header, p channelprotocol.HeaderPolicy, cred string, vars map[string]string) {
+// applyPassthrough 依据 passthroughMode 从下游头选取候选 → 减去强制黑名单（含凭据头，AC-5/AC-8）。
+func applyPassthrough(dst, downstream http.Header, p channelprotocol.HeaderPolicy) {
 	mode := p.PassthroughMode
 	if mode == "" {
 		mode = channelprotocol.PassthroughNone
@@ -114,10 +117,15 @@ func applyHeaderPolicy(dst, downstream http.Header, p channelprotocol.HeaderPoli
 	default: // none
 		// 不透传任何下游头
 	}
-	// set：显式设置（覆盖语义），支持变量替换；鉴权头名与强制黑名单头名跳过（AC-8/AC-9）。
-	for name, val := range p.Set {
+}
+
+// applyOverrides 应用「覆盖(set)」：显式设置（覆盖语义），支持变量替换。
+// 仅受非凭据类强制黑名单约束（Cookie/Host/Content-Length 等恒不可注入，AC-8）；
+// 凭据头允许写入，从而覆盖协议隐含的鉴权注入。
+func applyOverrides(dst http.Header, set map[string]string, cred string, vars map[string]string, downstream http.Header) {
+	for name, val := range set {
 		lk := strings.ToLower(name)
-		if authHeaderNames[lk] || forcedBlacklist[lk] {
+		if forcedBlacklist[lk] && !credentialHeaderNames[lk] {
 			continue
 		}
 		dst.Set(name, substituteVars(val, vars, downstream, cred))
@@ -137,28 +145,17 @@ func copyHeaders(dst, downstream http.Header, allow func(key string) bool) {
 	}
 }
 
-// injectAuth 依据 auth(header/scheme/query) 注入凭据；缺省 header=Authorization、scheme=bearer。
-func injectAuth(req *http.Request, auth channelprotocol.AuthSpec, cred string, vars map[string]string) {
+// injectProtocolAuth 按基础协议隐含方式注入凭据；无凭据则不注入。
+func injectProtocolAuth(req *http.Request, protocol, cred string) {
 	if cred == "" {
 		return
 	}
-	header := strings.TrimSpace(auth.Header)
-	if header == "" {
-		header = "Authorization"
-	}
-	scheme := strings.ToLower(strings.TrimSpace(auth.Scheme))
+	header, scheme := channelprotocol.ProtocolAuth(protocol)
 	val := cred
-	if scheme == "" || scheme == "bearer" {
+	if scheme == "bearer" {
 		val = "Bearer " + cred
 	}
 	req.Header.Set(header, val)
-	if len(auth.Query) > 0 {
-		q := req.URL.Query()
-		for k, v := range auth.Query {
-			q.Set(k, substituteVars(v, vars, nil, cred))
-		}
-		req.URL.RawQuery = q.Encode()
-	}
 }
 
 // substituteVars 替换 set/query 值中的变量：{api_key} / {session_id} / {request_id} / {model} /

@@ -106,6 +106,7 @@ async function onDelete(row: ChannelProtocolView) {
 <template>
   <div class="page-container">
     <div class="page-header">
+      <slot name="header-left" />
       <div class="page-title">渠道协议</div>
       <span class="page-count">{{ list.length }} 个协议</span>
       <div class="page-header-spacer" />
