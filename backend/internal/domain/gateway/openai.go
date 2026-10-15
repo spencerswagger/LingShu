@@ -9,7 +9,6 @@ import (
 	"io"
 	"net/http"
 	"sort"
-	"strings"
 
 	"github.com/team/llmgateway/internal/domain/billing"
 )
@@ -19,6 +18,12 @@ const (
 	EndpointChatCompletions = "chat/completions"
 	EndpointCompletions     = "completions"
 	EndpointEmbeddings      = "embeddings"
+)
+
+// 新增基础协议的入站端点标识（相对 /v1/ 的最后一段；作为 Provider/eval 的端点键）。
+const (
+	EndpointResponses = "responses"
+	EndpointMessages  = "messages"
 )
 
 // OpenAIProvider 实现 OpenAI-compat 协议的 Provider。
@@ -47,17 +52,10 @@ func endpointName(ep string) string {
 	return "openai-" + ep
 }
 
-// BuildUpstreamRequest 构建 POST 上游请求：baseURL(去尾部 /) + / + endpoint，
-// 注入 Content-Type 与 Authorization: Bearer cred，body 原样透传。
-func (p *OpenAIProvider) BuildUpstreamRequest(ctx context.Context, baseURL, cred string, body []byte, _ bool) (*http.Request, error) {
-	url := strings.TrimRight(baseURL, "/") + "/" + strings.TrimLeft(p.endpoint, "/")
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+cred)
-	return req, nil
+// BuildUpstreamRequest 构建 POST 上游请求：基址 + endpoint（协议 path 覆盖优先），
+// 注入 Content-Type + 按头策略/鉴权注入请求头，body 原样透传。
+func (p *OpenAIProvider) BuildUpstreamRequest(ctx context.Context, req UpstreamRequest) (*http.Request, error) {
+	return buildUpstreamRequest(ctx, req, p.endpoint, "application/json")
 }
 
 // usageObj 是对 openai `usage` 对象的宽松结构，数字可为整数或浮点。
@@ -120,7 +118,7 @@ func usageZero(u billing.Usage) bool {
 		u.CacheWrite == 0 && u.Reasoning == 0
 }
 
-// ExtractUsage 从非流式响应体解析 token 用量；缺字段容错给 0。
+// ExtractUsage 从非流式响应体解析 token 用量；usage 缺失返回 ErrUsageMissing（AC-17 严格执行）。
 func (p *OpenAIProvider) ExtractUsage(body []byte) (billing.Usage, error) {
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.UseNumber()
@@ -131,13 +129,13 @@ func (p *OpenAIProvider) ExtractUsage(body []byte) (billing.Usage, error) {
 		return billing.Usage{}, err
 	}
 	if len(raw.Usage) == 0 {
-		return billing.Usage{}, nil
+		return billing.Usage{}, ErrUsageMissing
 	}
 	return parseUsageObj(raw.Usage)
 }
 
 // HandleStream 透传 SSE：逐行写回下游并 Flush，同时从 data 行提取 usage 与拼装 assistant 消息。
-// 若流中没有 usage（未开启 include_usage），按 delta content 字符数估算 completion tokens（*0.25）。
+// usage 缺失时返回 ErrUsageMissing（AC-17 严格执行：内容已透传，由调用方报错并禁用渠道）。
 // 返回 (usage, 拼装完成的 assistant 消息 JSON, error)；assistant 消息供 call_log 记录流式响应内容。
 func (p *OpenAIProvider) HandleStream(ctx context.Context, upstream *http.Response, w http.ResponseWriter) (billing.Usage, []byte, error) {
 	h := w.Header()
@@ -151,7 +149,6 @@ func (p *OpenAIProvider) HandleStream(ctx context.Context, upstream *http.Respon
 	br := bufio.NewReader(upstream.Body)
 
 	var usage billing.Usage
-	var estChars int64
 	sawUsage := false
 	asm := newStreamAssembler() // 按 data 行增量拼装完整 assistant 消息（call_log 采集）
 
@@ -168,12 +165,11 @@ func (p *OpenAIProvider) HandleStream(ctx context.Context, upstream *http.Respon
 			if bytes.HasPrefix(trimmed, []byte("data:")) {
 				data := bytes.TrimSpace(trimmed[len("data:"):])
 				if len(data) > 0 && !bytes.Equal(data, []byte("[DONE]")) {
-					u, has, chars := parseStreamData(data)
+					u, has, _ := parseStreamData(data)
 					if has {
 						usage = u
 						sawUsage = true
 					}
-					estChars += chars
 					asm.apply(data)
 				}
 			}
@@ -193,8 +189,7 @@ func (p *OpenAIProvider) HandleStream(ctx context.Context, upstream *http.Respon
 	}
 
 	if !sawUsage {
-		// 无 usage 时按 content 字符估算 completion tokens。
-		usage.Output = int64(float64(estChars) * 0.25)
+		return usage, asm.marshal(), ErrUsageMissing
 	}
 	return usage, asm.marshal(), nil
 }

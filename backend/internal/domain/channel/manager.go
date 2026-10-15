@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/team/llmgateway/internal/domain/channelprotocol"
 	"github.com/team/llmgateway/internal/pkg/cronx"
 	"github.com/team/llmgateway/internal/pkg/crypto"
 )
@@ -138,6 +139,8 @@ type RuntimeChannel struct {
 	LastErr   string
 	lastProbe time.Time
 	Keys      []*KeyRuntime // 该渠道全部密钥运行时视图（同一指针，KeyRuntime 独有状态机/限流器）
+	// Protocol 该渠道引用的渠道协议快照（nil=渠道内联配置，使用 Channel.Protocol/BaseURL）。
+	Protocol *channelprotocol.ChannelProtocol
 }
 
 // KeyRuntime 单个密钥的完整运行时（密钥=运行时实体，渠道=配置模板）。
@@ -188,8 +191,10 @@ type ChannelView struct {
 	HealthProbe HealthProbeConfig `json:"HealthProbe"`
 	Reliability ReliabilityConfig `json:"Reliability"`
 	MaxSessions int               `json:"MaxSessions"`
-	CreatedAt   time.Time         `json:"CreatedAt"`
-	UpdatedAt   time.Time         `json:"UpdatedAt"`
+	// ChannelProtocolID 引用的渠道协议 ID（nil=内联配置）；雪花 ID 序列化为字符串。
+	ChannelProtocolID *int64    `json:"ChannelProtocolID,string,omitempty"`
+	CreatedAt         time.Time `json:"CreatedAt"`
+	UpdatedAt         time.Time `json:"UpdatedAt"`
 }
 
 // ModelView 是内部模型运行时输出：状态/LastErr/探测时间 + 有效配置。
@@ -223,6 +228,8 @@ type Manager struct {
 	store     *Store
 	cmStore   *channelModelStore
 	keyStore  *KeyStore // 密钥存储（List/ListAll）；nil 表示未装配（B2 起装配层注入）
+	// cpStore 渠道协议存储：解析渠道引用的接入模板；nil=未装配（渠道协议不生效，走内联配置）。
+	cpStore *channelprotocol.Store
 
 	probeHTTP *http.Client
 	sm4Key    []byte
@@ -283,6 +290,22 @@ func (m *Manager) Stop() {
 
 // SetProbeRecorder 注入探测开销记账钩子。
 func (m *Manager) SetProbeRecorder(fn ProbeRecorder) { m.onProbe = fn }
+
+// SetChannelProtocolStore 注入渠道协议存储：装载渠道运行时解析其引用的接入模板。
+func (m *Manager) SetChannelProtocolStore(s *channelprotocol.Store) { m.cpStore = s }
+
+// lookupChannelProtocol 解析渠道引用的渠道协议（未引用/未装配/不存在返回 nil）。
+func (m *Manager) lookupChannelProtocol(ctx context.Context, id *int64) *channelprotocol.ChannelProtocol {
+	if m.cpStore == nil || id == nil || *id <= 0 {
+		return nil
+	}
+	cp, err := m.cpStore.GetByID(ctx, *id)
+	if err != nil {
+		m.logger.Error("load channel protocol failed", "channel_protocol_id", *id, "err", err)
+		return nil
+	}
+	return cp
+}
 
 // buildRuntime 由静态渠道构建渠道运行时：按配置建状态机与限流器。
 // 渠道层不含凭据：密钥凭据解密见 buildKeyRuntime（KeyRuntime.CredentialPlain）。
@@ -476,7 +499,9 @@ func (m *Manager) SyncFromDB(ctx context.Context) error {
 	m.mu.Lock()
 	for i := range chs {
 		ch := chs[i]
-		m.rt[ch.ID] = m.buildRuntime(&ch)
+		rt := m.buildRuntime(&ch)
+		rt.Protocol = m.lookupChannelProtocol(ctx, ch.ChannelProtocolID)
+		m.rt[ch.ID] = rt
 		if refs, rerr := m.store.ListTagRefsByChannel(ctx, ch.ID); rerr == nil {
 			m.boundTags[ch.ID] = refs
 		}
@@ -619,6 +644,7 @@ func (m *Manager) Upsert(ch *Channel) {
 	rclog := *ch
 	rclog.State = st
 	rt := m.buildRuntime(&rclog)
+	rt.Protocol = m.lookupChannelProtocol(context.Background(), ch.ChannelProtocolID)
 	if prev != nil {
 		rt.Channel.CreatedAt = prev.Channel.CreatedAt
 		rt.lastProbe = prev.lastProbe
@@ -906,8 +932,10 @@ func (m *Manager) Snapshot() []ChannelView {
 			HealthProbe: normalizeHealthProbe(c.HealthProbe),
 			Reliability: normalizeReliability(c.Reliability),
 			MaxSessions: rl.MaxConcurrent,
-			CreatedAt:   c.CreatedAt,
-			UpdatedAt:   c.UpdatedAt,
+			// ChannelProtocolID: 引用渠道协议 ID（渠道列表展示来源协议用）。
+			ChannelProtocolID: c.ChannelProtocolID,
+			CreatedAt:         c.CreatedAt,
+			UpdatedAt:         c.UpdatedAt,
 		})
 	}
 	return views
@@ -938,6 +966,41 @@ func (m *Manager) BoundTags(channelID int64) []TagRef {
 		cp = append(cp, r)
 	}
 	return cp
+}
+
+// DisableChannel 把渠道及其全部密钥运行时置为禁用（AC-17：上游 usage 缺失/无法解析时禁用渠道）。
+// 内存态即时生效（路由入口读 Machine.State()），并落库（channel_events + channels.state + 逐密钥）。
+func (m *Manager) DisableChannel(id int64) {
+	var keyIDs []int64
+	var from State
+	has := false
+	m.mu.Lock()
+	if rt, ok := m.rt[id]; ok {
+		has = true
+		from = rt.Machine.State()
+		rt.Machine.ForceDisable(m.now())
+	}
+	for keyID := range m.keyOfCh[id] {
+		keyIDs = append(keyIDs, keyID)
+	}
+	m.mu.Unlock()
+
+	if has && from != StateDisabled {
+		m.persistChannelTransition(id, from, StateDisabled, "usage missing, channel disabled")
+		m.logger.Warn("channel disabled due to missing usage", "channel_id", id)
+	}
+	for _, keyID := range keyIDs {
+		var kfrom State
+		m.mu.Lock()
+		if kr, ok := m.keys[keyID]; ok {
+			kfrom = kr.Machine.State()
+			kr.Machine.ForceDisable(m.now())
+		}
+		m.mu.Unlock()
+		if kfrom != "" && kfrom != StateDisabled {
+			m.persistKeyTransition(keyID, kfrom, StateDisabled, "channel disabled: usage missing")
+		}
+	}
 }
 
 // Drop 删除运行时条目（渠道删除后调用）：同时摘除该渠道全部密钥运行时。

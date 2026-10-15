@@ -9,23 +9,29 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"net/http"
 
 	"github.com/team/llmgateway/internal/domain/billing"
 )
 
-// Provider 抽象一个上游协议适配器。当前实现 openai-compat 一种协议。
+// ErrUsageMissing 表示上游响应缺失或无法解析 usage（AC-17：该次调用报错并禁用渠道）。
+var ErrUsageMissing = errors.New("upstream response missing usage")
+
+// Provider 抽象一个上游基础协议适配器。基础协议为代码固定的 3 个：
+// openai-chat / openai-responses / anthropic-messages。
 //
 // 实现要点：
-//   - BuildUpstreamRequest 把下游请求转成上游请求（注入渠道凭据到 Authorization）；
-//   - ExtractUsage 从非流式响应体解析 token 用量（容错，缺字段给 0）；
-//   - HandleStream 逐块透传 SSE 并统计 usage，返回最终用量。
+//   - BuildUpstreamRequest 依据构造上下文（基址/路径/凭据/下游头/头策略/鉴权）构建上游请求；
+//   - ExtractUsage 从非流式响应体解析 token 用量；usage 缺失/无法解析返回 ErrUsageMissing；
+//   - HandleStream 逐块透传 SSE 并统计 usage，返回最终用量与拼装的 assistant 消息（call_log 用）。
 type Provider interface {
 	Name() string
-	// BuildUpstreamRequest 构建上游请求，body 为已改写 model 的下游请求体。
-	BuildUpstreamRequest(ctx context.Context, baseURL string, cred string, body []byte, isStream bool) (*http.Request, error)
-	// ExtractUsage 从非流式响应体解析 token 用量。
+	// BuildUpstreamRequest 构建上游请求，req.Body 为已改写 model 的下游请求体。
+	BuildUpstreamRequest(ctx context.Context, req UpstreamRequest) (*http.Request, error)
+	// ExtractUsage 从非流式响应体解析 token 用量；缺失/无法解析返回 ErrUsageMissing。
 	ExtractUsage(body []byte) (billing.Usage, error)
-	// HandleStream 透传流式 SSE，返回统计到的用量与拼装出的 assistant 消息 JSON（call_log 记录用）。
+	// HandleStream 透传流式 SSE，返回统计到的用量与拼装出的 assistant 消息 JSON；
+	// usage 缺失返回 ErrUsageMissing（内容已透传，由调用方按 AC-17 处理）。
 	HandleStream(ctx context.Context, upstream *http.Response, w http.ResponseWriter) (billing.Usage, []byte, error)
 }
