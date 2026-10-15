@@ -383,6 +383,8 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	// 调用日志：网关写入 + 控制台只读查询共用同一存储（billing_id 1:1 关联）。
 	callLogStore := gateway.NewSQLCallLogStore(d)
 	consoleAdmin.SetCallLogStore(callLogStore)
+	consoleAdmin.SetRouterEngine(routerEngine)
+	consoleAdmin.SetModelSource(modelSvc)
 	consoleDev.SetCallLogStore(callLogStore)
 
 	// sync

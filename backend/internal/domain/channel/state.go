@@ -244,6 +244,49 @@ func (m *Machine) ForceDisable(now time.Time) State {
 // DrainReasons 返回当前排空触发原因列表（诊断用）。
 func (m *Machine) DrainReasons() []string { return m.drainingReasons }
 
+// MachineMetrics 状态机运行时只读指标快照，供管理员「服务状态」页聚合展示。
+type MachineMetrics struct {
+	WindowSeconds   int      `json:"WindowSeconds"`
+	Total           int      `json:"Total"`
+	Failures        int      `json:"Failures"`
+	Timeouts        int      `json:"Timeouts"`
+	Rate429         int      `json:"Rate429"`
+	SuccessSamples  int      `json:"SuccessSamples"`
+	MinSamples      int      `json:"MinSamples"`
+	SampleOK        bool     `json:"SampleOK"`
+	ErrorRatePct    float64  `json:"ErrorRatePct"`
+	Rate429Pct      float64  `json:"Rate429Pct"`
+	P99LatencyMS    int64    `json:"P99LatencyMS"`
+	ProbeFails      int      `json:"ProbeFails"`
+	ProbeOKs        int      `json:"ProbeOKs"`
+	AuthFails       int      `json:"AuthFails"`
+	DrainingReasons []string `json:"DrainingReasons,omitempty"`
+}
+
+// Metrics 返回状态机窗口指标与探活/鉴权计数的只读快照。
+// 直接读私有字段并复用现有指标计算，不持锁；调用方必须在 Manager.mu 保护下调用。
+// 注意：本方法不触发窗口 prune，窗口指标为「最近一次 Feed 时」的快照——空闲实体可能含
+// 已过期但尚未清理的样本，仅供最终一致的展示用途。
+func (m *Machine) Metrics() MachineMetrics {
+	return MachineMetrics{
+		WindowSeconds:   m.cfg.WindowSeconds,
+		Total:           len(m.total),
+		Failures:        len(m.failures),
+		Timeouts:        len(m.timeouts),
+		Rate429:         len(m.rate429),
+		SuccessSamples:  len(m.successLats),
+		MinSamples:      m.cfg.MinSamples,
+		SampleOK:        len(m.total) >= m.cfg.MinSamples,
+		ErrorRatePct:    m.errorRate(),
+		Rate429Pct:      m.rate429Pct(),
+		P99LatencyMS:    m.p99SuccessLatency(),
+		ProbeFails:      m.probeFails,
+		ProbeOKs:        m.probeOKs,
+		AuthFails:       m.authFails,
+		DrainingReasons: append([]string(nil), m.drainingReasons...),
+	}
+}
+
 // prune 移除滑动窗口外的请求记录（时间戳 + 成功样本）。
 func (m *Machine) prune(now time.Time) {
 	cutoff := now.Add(-time.Duration(m.cfg.WindowSeconds) * time.Second)
