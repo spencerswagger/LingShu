@@ -210,7 +210,7 @@ type ModelView struct {
 type ProbeRecorder func(ctx context.Context, chID int64, modelID, target string, ok bool, errMsg string, usage ProbeUsage, durationMS int64) error
 
 // Manager 渠道配置模板 + 密钥运行动态管理器：内存态 + 状态机 + 限流器 + 健康探测调度。
-// rt = 渠道配置模板运行时（保留 Machine/Limiter 字段供现有消费方继续编译）；
+// rt = 渠道配置模板运行时（保留 Limiter/Keys 等字段供现有消费方继续编译）；
 // keys = 每个 channel_keys 一行一套独立运行时（状态机/限流器）；keyOfCh 为按渠道枚举索引。
 type Manager struct {
 	mu        sync.RWMutex
@@ -851,7 +851,7 @@ func (m *Manager) ModelViews(channelID int64) []ModelView {
 	return views
 }
 
-// Snapshot 返回控制台渠道视图（当前状态 + LastErr + up/down）。
+// Snapshot 返回控制台渠道视图（LastErr + 有效配置；可用性见逐密钥状态）。
 func (m *Manager) Snapshot() []ChannelView {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
