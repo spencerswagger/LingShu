@@ -84,6 +84,7 @@ type ChannelKeyState struct {
 }
 
 // Channel 对应 channels 表的一行（配置模板，不含凭据；凭据收敛到 channel_keys.credential_enc）。
+// 渠道无独立状态：可用性由该渠道下各密钥（channel_keys.state）与各内部模型（channel_models.state）决定。
 // 雪花 ID 超出 JS 安全整数，ID/tag_ids 等 ID 字段以字符串序列化。
 type Channel struct {
 	ID          int64             `json:"ID,string"`
@@ -94,7 +95,6 @@ type Channel struct {
 	TagIDs      idgen.IDs         `json:"TagIDs"`
 	BoundTags   []TagRef          `json:"BoundTags"`
 	Priority    int               `json:"Priority"`
-	State       State             `json:"State"`
 	RateLimit   RateLimitConfig   `json:"RateLimit"`
 	HealthProbe HealthProbeConfig `json:"HealthProbe"`
 	Reliability ReliabilityConfig `json:"Reliability"`
@@ -102,16 +102,6 @@ type Channel struct {
 	KeyStates []ChannelKeyState `json:"KeyStates"`
 	CreatedAt time.Time         `json:"CreatedAt"`
 	UpdatedAt time.Time         `json:"UpdatedAt"`
-}
-
-// ChannelEvent 对应 channel_events 表一行，记录一次渠道状态流转。
-type ChannelEvent struct {
-	ID        int64     `json:"ID,string"`
-	ChannelID int64     `json:"ChannelID,string"`
-	FromState State     `json:"FromState"`
-	ToState   State     `json:"ToState"`
-	Reason    string    `json:"Reason"`
-	CreatedAt time.Time `json:"CreatedAt"`
 }
 
 // ChannelModelEvent 对应 channel_model_events 表一行，记录一次内部模型状态流转。
@@ -144,9 +134,7 @@ type ProbeLog struct {
 }
 
 // channelCols 列出 channels 表查询时使用的全部列，保持各查询一致。
-const channelCols = `id, name, protocol, base_url, tags, priority, state, rate_limit, health_probe, reliability, created_at, updated_at`
-
-const eventCols = `id, channel_id, from_state, to_state, reason, created_at`
+const channelCols = `id, name, protocol, base_url, tags, priority, rate_limit, health_probe, reliability, created_at, updated_at`
 
 const modelEventCols = `id, channel_id, model_id, from_state, to_state, reason, created_at`
 
@@ -154,14 +142,12 @@ const modelEventCols = `id, channel_id, model_id, from_state, to_state, reason, 
 func scanChannel(row interface{ Scan(...any) error }) (*Channel, error) {
 	var c Channel
 	var tagsRaw, rlRaw, hpRaw, relRaw []byte
-	var state string
 	err := row.Scan(&c.ID, &c.Name, &c.Protocol, &c.BaseURL,
-		&tagsRaw, &c.Priority, &state, &rlRaw, &hpRaw, &relRaw,
+		&tagsRaw, &c.Priority, &rlRaw, &hpRaw, &relRaw,
 		&c.CreatedAt, &c.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
-	c.State = State(state)
 	if len(tagsRaw) > 0 {
 		if err := json.Unmarshal(tagsRaw, &c.Tags); err != nil {
 			return nil, fmt.Errorf("parse tags: %w", err)
@@ -185,18 +171,6 @@ func scanChannel(row interface{ Scan(...any) error }) (*Channel, error) {
 	return &c, nil
 }
 
-func scanEvent(row interface{ Scan(...any) error }) (*ChannelEvent, error) {
-	var e ChannelEvent
-	var from, to string
-	err := row.Scan(&e.ID, &e.ChannelID, &from, &to, &e.Reason, &e.CreatedAt)
-	if err != nil {
-		return nil, err
-	}
-	e.FromState = State(from)
-	e.ToState = State(to)
-	return &e, nil
-}
-
 // marshalJSONB 将值序列化为 JSON，供 JSONB 列写入。写空值会序列化为 '{}' 而非 null。
 func marshalJSONB(v any) []byte {
 	b, _ := json.Marshal(v)
@@ -206,7 +180,7 @@ func marshalJSONB(v any) []byte {
 	return b
 }
 
-// Store 提供 channels / channel_events 表的基础数据访问。
+// Store 提供 channels / channel_keys / channel_models 表的基础数据访问。
 type Store struct {
 	db *sql.DB
 }
@@ -230,17 +204,11 @@ func (s *Store) GetByName(ctx context.Context, name string) (*Channel, error) {
 	return scanChannel(row)
 }
 
-// List 按条件查询渠道。state 非空时按 state 过滤。
-func (s *Store) List(ctx context.Context, state State) ([]Channel, error) {
-	query := `SELECT ` + channelCols + ` FROM channels WHERE deleted_at IS NULL`
-	args := []any{}
-	if state != "" {
-		query += ` AND state = $1`
-		args = append(args, string(state))
-	}
-	query += ` ORDER BY priority DESC, id ASC`
+// List 查询全部未删除渠道，按 priority 降序、id 升序。
+func (s *Store) List(ctx context.Context) ([]Channel, error) {
+	query := `SELECT ` + channelCols + ` FROM channels WHERE deleted_at IS NULL ORDER BY priority DESC, id ASC`
 
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := s.db.QueryContext(ctx, query)
 	if err != nil {
 		return nil, fmt.Errorf("list channels: %w", err)
 	}
@@ -269,11 +237,11 @@ func (s *Store) Insert(ctx context.Context, c *Channel) (*Channel, error) {
 		c.ID = idgen.New()
 	}
 	row := s.db.QueryRowContext(ctx,
-		`INSERT INTO channels(id, name, protocol, base_url, tags, priority, state, rate_limit, health_probe, reliability)
-		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+		`INSERT INTO channels(id, name, protocol, base_url, tags, priority, rate_limit, health_probe, reliability)
+		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
 		 RETURNING `+channelCols,
 		c.ID, c.Name, c.Protocol, c.BaseURL, marshalJSONB(c.Tags),
-		c.Priority, string(c.State), marshalJSONB(c.RateLimit), marshalJSONB(c.HealthProbe),
+		c.Priority, marshalJSONB(c.RateLimit), marshalJSONB(c.HealthProbe),
 		marshalJSONB(c.Reliability))
 	created, err := scanChannel(row)
 	if err != nil {
@@ -290,11 +258,11 @@ func (s *Store) Insert(ctx context.Context, c *Channel) (*Channel, error) {
 func (s *Store) Update(ctx context.Context, c *Channel) error {
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE channels SET name=$1, protocol=$2, base_url=$3,
-		        tags=$4, priority=$5, state=$6, rate_limit=$7, health_probe=$8,
-		        reliability=$9, updated_at=now()
-		 WHERE id=$10`,
+		        tags=$4, priority=$5, rate_limit=$6, health_probe=$7,
+		        reliability=$8, updated_at=now()
+		 WHERE id=$9`,
 		c.Name, c.Protocol, c.BaseURL, marshalJSONB(c.Tags),
-		c.Priority, string(c.State), marshalJSONB(c.RateLimit), marshalJSONB(c.HealthProbe),
+		c.Priority, marshalJSONB(c.RateLimit), marshalJSONB(c.HealthProbe),
 		marshalJSONB(c.Reliability), c.ID)
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -307,58 +275,6 @@ func (s *Store) Update(ctx context.Context, c *Channel) error {
 		return sql.ErrNoRows
 	}
 	return nil
-}
-
-// UpdateState 仅更新渠道权威状态并刷新 updated_at，供状态机/手动操作持久化使用。
-func (s *Store) UpdateState(ctx context.Context, id int64, st State) error {
-	res, err := s.db.ExecContext(ctx,
-		`UPDATE channels SET state=$1, updated_at=now() WHERE id=$2`, string(st), id)
-	if err != nil {
-		return err
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return sql.ErrNoRows
-	}
-	return nil
-}
-
-// InsertEvent 记录一条渠道状态流转事件，返回回填主键后的完整事件。
-func (s *Store) InsertEvent(ctx context.Context, e *ChannelEvent) (*ChannelEvent, error) {
-	if e.ID == 0 {
-		e.ID = idgen.New()
-	}
-	row := s.db.QueryRowContext(ctx,
-		`INSERT INTO channel_events(id, channel_id, from_state, to_state, reason)
-		 VALUES($1,$2,$3,$4,$5) RETURNING `+eventCols,
-		e.ID, e.ChannelID, string(e.FromState), string(e.ToState), e.Reason)
-	created, err := scanEvent(row)
-	if err != nil {
-		return nil, err
-	}
-	return created, nil
-}
-
-// ListEvents 按渠道查询事件（倒序），用于控制台展示状态变更历史。
-func (s *Store) ListEvents(ctx context.Context, channelID int64) ([]ChannelEvent, error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT `+eventCols+` FROM channel_events WHERE channel_id=$1 ORDER BY id DESC`, channelID)
-	if err != nil {
-		return nil, fmt.Errorf("list events: %w", err)
-	}
-	defer rows.Close()
-
-	events := make([]ChannelEvent, 0, 8)
-	for rows.Next() {
-		e, err := scanEvent(rows)
-		if err != nil {
-			return nil, fmt.Errorf("scan event: %w", err)
-		}
-		events = append(events, *e)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return events, nil
 }
 
 // DeleteChannels 批量软删除渠道，返回删除行数。软删除 channels 行、其 channel_keys 与 channel_models，
@@ -541,11 +457,11 @@ func (s *Store) InsertWithTags(ctx context.Context, c *Channel, tagIDs []int64) 
 		c.ID = idgen.New()
 	}
 	row := tx.QueryRowContext(ctx,
-		`INSERT INTO channels(id, name, protocol, base_url, tags, priority, state, rate_limit, health_probe, reliability)
-		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+		`INSERT INTO channels(id, name, protocol, base_url, tags, priority, rate_limit, health_probe, reliability)
+		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
 		 RETURNING `+channelCols,
 		c.ID, c.Name, c.Protocol, c.BaseURL, marshalJSONB(c.Tags),
-		c.Priority, string(c.State), marshalJSONB(c.RateLimit), marshalJSONB(c.HealthProbe),
+		c.Priority, marshalJSONB(c.RateLimit), marshalJSONB(c.HealthProbe),
 		marshalJSONB(c.Reliability))
 	created, err := scanChannel(row)
 	if err != nil {
@@ -573,11 +489,11 @@ func (s *Store) UpdateWithTags(ctx context.Context, c *Channel, tagIDs []int64) 
 	defer tx.Rollback()
 	res, err := tx.ExecContext(ctx,
 		`UPDATE channels SET name=$1, protocol=$2, base_url=$3,
-		        tags=$4, priority=$5, state=$6, rate_limit=$7, health_probe=$8,
-		        reliability=$9, updated_at=now()
-		 WHERE id=$10 AND deleted_at IS NULL`,
+		        tags=$4, priority=$5, rate_limit=$6, health_probe=$7,
+		        reliability=$8, updated_at=now()
+		 WHERE id=$9 AND deleted_at IS NULL`,
 		c.Name, c.Protocol, c.BaseURL, marshalJSONB(c.Tags),
-		c.Priority, string(c.State), marshalJSONB(c.RateLimit), marshalJSONB(c.HealthProbe),
+		c.Priority, marshalJSONB(c.RateLimit), marshalJSONB(c.HealthProbe),
 		marshalJSONB(c.Reliability), c.ID)
 	if err != nil {
 		var pgErr *pgconn.PgError

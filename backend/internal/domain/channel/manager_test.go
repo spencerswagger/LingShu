@@ -37,7 +37,7 @@ func newManagerWithTwoKeys(t *testing.T) (*Manager, sqlmock.Sqlmock) {
 
 	ch := &Channel{
 		ID: 1, Name: "c1", Protocol: ProtocolOpenAICompat,
-		BaseURL: "https://api.example.com", State: StateNormal,
+		BaseURL:     "https://api.example.com",
 		RateLimit:   RateLimitConfig{MaxConcurrent: 8},
 		HealthProbe: HealthProbeConfig{FailThreshold: 1, RecoveryThreshold: 2},
 		Reliability: ReliabilityConfig{WindowSeconds: 60, MinSamples: 10},
@@ -157,7 +157,7 @@ func TestManager_UpsertKey_StartsWithProbeLoop(t *testing.T) {
 		slog.New(slog.NewTextHandler(io.Discard, nil)), nowFn)
 	mgr.Upsert(&Channel{
 		ID: 1, Name: "c1", Protocol: ProtocolOpenAICompat,
-		BaseURL: "http://probe.local/v1", State: StateNormal,
+		BaseURL: "http://probe.local/v1",
 		HealthProbe: HealthProbeConfig{Interval: "* * * * * *", TimeoutMS: 1000,
 			FailThreshold: 1, RecoveryThreshold: 2},
 	})
@@ -191,7 +191,7 @@ func TestManager_KeyProbeOnce_ProbesAllNormalModels(t *testing.T) {
 		slog.New(slog.NewTextHandler(io.Discard, nil)), nowFn)
 	mgr.Upsert(&Channel{
 		ID: 1, Name: "c1", Protocol: ProtocolOpenAICompat,
-		BaseURL: "http://probe.local/v1", State: StateNormal,
+		BaseURL: "http://probe.local/v1",
 		HealthProbe: HealthProbeConfig{Interval: "* * * * * *", TimeoutMS: 1000,
 			FailThreshold: 1, RecoveryThreshold: 2},
 	})
@@ -218,7 +218,7 @@ func TestManager_PickKeyProbeTargets_MultiModelSorted(t *testing.T) {
 	mgr := NewManager(nil, nil, testSM4Key, nil, nil, nowFn, nil)
 	mgr.Upsert(&Channel{
 		ID: 1, Name: "c1", Protocol: ProtocolOpenAICompat,
-		BaseURL: "http://probe.local/v1", State: StateNormal,
+		BaseURL: "http://probe.local/v1",
 		HealthProbe: HealthProbeConfig{Interval: "* * * * * *", TimeoutMS: 1000,
 			FailThreshold: 1, RecoveryThreshold: 2},
 	})
@@ -238,8 +238,8 @@ func TestManager_PickKeyProbeTargets_MultiModelSorted(t *testing.T) {
 
 	targets := mgr.pickKeyProbeTargets(kr)
 	want := []probeTarget{
-		{Model: "m2", Level: "model"}, // 模型层全探：NORMAL 组在前（m1 为 DRAIN，排在其后）
-		{Model: "m1", Level: "model"},
+		{Model: "m2", Level: "model", ModelRowID: 2}, // 模型层全探：NORMAL 组在前（m1 为 DRAIN，排在其后）
+		{Model: "m1", Level: "model", ModelRowID: 1},
 	}
 	if !slices.Equal(targets, want) {
 		t.Fatalf("targets want %+v got %+v", want, targets)
@@ -327,7 +327,7 @@ func TestManager_RebuildModels_PreservesMemoryState(t *testing.T) {
 	nowFn := func() time.Time { return time.Date(2026, 9, 27, 10, 0, 0, 0, time.UTC) }
 	mgr := NewManager(nil, nil, testSM4Key, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), nowFn)
 	mgr.Upsert(&Channel{ID: 1, Name: "c1", Protocol: ProtocolOpenAICompat,
-		BaseURL: "https://api.example.com", State: StateNormal,
+		BaseURL:     "https://api.example.com",
 		HealthProbe: HealthProbeConfig{FailThreshold: 1, RecoveryThreshold: 2}})
 	mgr.UpsertModel(&ChannelModel{ID: 5, ChannelID: 1, InternalModelID: "m5", State: StateNormal})
 
@@ -382,38 +382,6 @@ func TestManager_ManualSetKeyState_TargetsOnly(t *testing.T) {
 	}
 	if err := mgr.ManualSetKeyState(999, "disable"); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("missing key want sql.ErrNoRows, got %v", err)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("mock expectations: %v", err)
-	}
-}
-
-func TestManager_ForceChannelStateBatch_DisablesAllAndViewsLinked(t *testing.T) {
-	mgr, mock := newManagerWithTwoKeys(t)
-
-	mgr.ForceChannelStateBatch(1, "disable")
-
-	krA, _ := mgr.GetKeyRuntime(11)
-	krB, _ := mgr.GetKeyRuntime(12)
-	if krA.Machine.State() != StateDisabled || krB.Machine.State() != StateDisabled {
-		t.Fatalf("both keys want DISABLED, got %s / %s", krA.Machine.State(), krB.Machine.State())
-	}
-
-	// 渠道 Keys 视图联动（同一指针，状态实时反映）。
-	rt, _ := mgr.GetRuntime(1)
-	for _, kv := range rt.Keys {
-		if kv.Machine.State() != StateDisabled {
-			t.Fatalf("channel Keys view state want DISABLED, got %s", kv.Machine.State())
-		}
-	}
-	if views := mgr.KeyViews(1); len(views) != 2 {
-		t.Fatalf("KeyViews want 2, got %d", len(views))
-	} else {
-		for _, v := range views {
-			if v.State != StateDisabled {
-				t.Fatalf("KeyViews state want DISABLED, got %s", v.State)
-			}
-		}
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("mock expectations: %v", err)

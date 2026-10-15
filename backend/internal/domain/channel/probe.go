@@ -139,14 +139,15 @@ func (m *Manager) keyProbeOnce(ctx context.Context, keyID int64) {
 		return
 	}
 	for _, t := range targets {
-		m.probeOnce(ctx, keyID, t.Model, t.Level)
+		m.probeOnce(ctx, keyID, t.Model, t.Level, t.ModelRowID)
 	}
 }
 
-// probeTarget 单次探测目标（模型 + 层级）。
+// probeTarget 单次探测目标（模型 + 层级 + 模型行 ID）。
 type probeTarget struct {
-	Model string
-	Level string
+	Model      string
+	Level      string
+	ModelRowID int64 // level='model' 时的 channel_models 行 ID（探测结果回喂模型状态机用）；0=无
 }
 
 // pickKeyProbeTargets 密钥级探测目标选型（探测分两层，模型无独立探测循环）：
@@ -177,17 +178,21 @@ func (m *Manager) pickKeyProbeTargets(kr *KeyRuntime) []probeTarget {
 	slices.Sort(drain)
 	targets := make([]probeTarget, 0, len(normal)+len(drain))
 	for _, id := range normal {
-		targets = append(targets, probeTarget{Model: m.mrt[kr.Channel.ID][id].Model.InternalModelID, Level: "model"})
+		mr := m.mrt[kr.Channel.ID][id]
+		targets = append(targets, probeTarget{Model: mr.Model.InternalModelID, Level: "model", ModelRowID: id})
 	}
 	for _, id := range drain {
-		targets = append(targets, probeTarget{Model: m.mrt[kr.Channel.ID][id].Model.InternalModelID, Level: "model"})
+		mr := m.mrt[kr.Channel.ID][id]
+		targets = append(targets, probeTarget{Model: mr.Model.InternalModelID, Level: "model", ModelRowID: id})
 	}
 	return targets
 }
 
-// probeOnce 执行一次真实最小对话探测并驱动该密钥状态机：
+// probeOnce 执行一次真实最小对话探测并驱动状态机：
 // 不过限流器、不占用会话、不进可靠性窗口（HasProbe=true）；结果落 probe_logs 与记账钩子。
-func (m *Manager) probeOnce(ctx context.Context, keyID int64, probeModel, level string) {
+// level='model'（带了 modelRowID）时同时回喂该内部模型状态机——定时探测据此恢复被真实调用
+// 打到 DRAIN 的模型，避免模型级排空成为永久死锁（此前只回喂密钥状态机）。
+func (m *Manager) probeOnce(ctx context.Context, keyID int64, probeModel, level string, modelRowID int64) {
 	kr, ok := m.GetKeyRuntime(keyID)
 	if !ok {
 		return
@@ -206,6 +211,9 @@ func (m *Manager) probeOnce(ctx context.Context, keyID int64, probeModel, level 
 
 	m.markKeyProbeResult(keyID, errMsg)
 	m.feedKeyAndTransit(keyID, ProbeFeedback(fb))
+	if modelRowID > 0 {
+		m.feedModelAndTransit(kr.Key.ChannelID, modelRowID, ProbeFeedback(fb))
+	}
 	m.recordProbe(ctx, keyID, probeModel, level, target, fb.IsSuccess, errMsg, usage, dur)
 }
 

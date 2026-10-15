@@ -179,18 +179,8 @@ func (h *Admin) HandleStatsDashboard(w http.ResponseWriter, r *http.Request) {
 // buildOps 汇总运维块：渠道/密钥运行时三态 + 对外模型、渠道内部模型计数。
 func (h *Admin) buildOps(ctx context.Context) (*statsOps, error) {
 	ops := &statsOps{}
-	// 渠道运行时三态
-	for _, v := range h.channelMgr.Snapshot() {
-		ops.Channels.Total++
-		switch v.State {
-		case channel.StateNormal:
-			ops.Channels.Normal++
-		case channel.StateDrain:
-			ops.Channels.Drain++
-		case channel.StateDisabled:
-			ops.Channels.Disabled++
-		}
-	}
+	// 渠道总数（渠道无独立状态，可用性由密钥/模型三态体现）
+	ops.Channels.Total = len(h.channelMgr.Snapshot())
 	// 密钥运行时三态
 	for st, n := range h.channelMgr.KeyStateCounts() {
 		ops.Keys.Total += n
