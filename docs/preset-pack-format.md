@@ -46,9 +46,8 @@
 | `gateway` | object | **本网关扩展块**（见第 6 节） | 扩展 |
 
 说明：
-- `npm`：v1 语义为**必填非空**。为支持非 models.dev 原生供应商，本格式允许为空（**偏离 v1**，需在包内显式承认）。本网关**不依赖**它，仅作展示。
+- `env` / `npm`：**本网关运行时不消费**（忽略），仅为与 models.dev v1 **完整对齐**而保留。`env` 语义为「该供应商读取 API Key 的环境变量名」，可作**前端提示**；`npm` 语义为「官方 AI SDK 包名」，v1 为**必填非空**，本格式原样保留、不参与运行时。
 - `api`：v1 为**可选字符串**，**无 `${ENV}` 模板**（模板是 v2 特性，本格式不采用）。本网关实际使用的上游地址以 `gateway.baseUrl` / `gateway.protocols[*].baseUrl` 为准。
-- `env`：v1 语义是「该供应商读取 API Key 的环境变量名」。本网关仅作**前端提示**（提示管理员通常填哪个 Key），运行时不读取环境变量。
 
 ## 5. Model 字段
 
@@ -199,7 +198,7 @@
   "id": "opencode-zen",
   "name": "OpenCode Zen",
   "env": ["OPENCODE_API_KEY"],
-  "npm": "@ai-sdk/opencode",     // 非 models.dev 原生供应商，此处为示例值；本格式允许为空（偏离 v1）
+  "npm": "@ai-sdk/opencode",     // 示意值；本项目不消费 npm，仅为对齐 v1 保留
   "api": null,
   "doc": "https://opencode.ai/docs/zen",
   "models": {
