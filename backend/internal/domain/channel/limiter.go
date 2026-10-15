@@ -72,6 +72,25 @@ func (l *Limiter) tpmBurst() int64 {
 // TokenLimit 返回 TPM 放大后的额度，供上层查询。
 func (l *Limiter) TokenLimit() int64 { return l.tpmBurst() }
 
+// RPMLimit 返回 RPM 放大后的额度，供上层查询。
+func (l *Limiter) RPMLimit() int { return l.rpmBurst() }
+
+// Usage 返回当前窗口内已放行请求数（rpm）与 token 合计（tpm），
+// 供控制台展示「本窗口用量/额度」。持 l.mu；
+// now 为零时取 l.now（l.now 为 nil 则兜底 time.Now）；先 prune 再 counts。
+func (l *Limiter) Usage(now time.Time) (rpm int, tpm int64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if now.IsZero() {
+		if l.now == nil {
+			l.now = time.Now
+		}
+		now = l.now()
+	}
+	l.prune(now)
+	return l.counts()
+}
+
 // prune 移除窗口外记录。
 func (l *Limiter) prune(now time.Time) {
 	cutoff := now.Add(-l.window)

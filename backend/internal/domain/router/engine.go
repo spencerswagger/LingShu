@@ -183,6 +183,27 @@ func (e *Engine) SetClock(now func() time.Time) {
 // Sessions 暴露会话注册表（网关创建/续期会话、并发校验、启动清扫用）。
 func (e *Engine) Sessions() *SessionRegistry { return e.sess }
 
+// ActiveKeySessions 返回某渠道密钥当前存活会话数（实时读取会话注册表）。
+// 供控制台「服务状态」页按密钥展示真实会话数（并发上限见 channel.KeyDetail.MaxSessions）；
+// 未装配会话注册表时返回 0。
+func (e *Engine) ActiveKeySessions(keyID int64) int {
+	if e.sess == nil {
+		return 0
+	}
+	return e.sess.CountActive(keyID)
+}
+
+// CostSample 返回成本比较所用样值用量（routing.cost_sample）；未注入 CostConfig 或读取失败时
+// 返回内置默认样值。控制台「服务状态」页成本列折叠区间与该样值同源，保证与决策轨迹成本可对比。
+func (e *Engine) CostSample() billing.Usage {
+	if e.costCfg != nil {
+		if s, err := e.costCfg.SampleUsage(); err == nil {
+			return s
+		}
+	}
+	return defaultCostSample
+}
+
 // candidate 是路由候选的运行时视图（候选 = (渠道, 密钥, 模型) 三元组）。
 type candidate struct {
 	id        int64

@@ -399,11 +399,160 @@ export function probeChannelKey(channelId: string, keyId: string): Promise<ApiRe
     `/admin/channels/${channelId}/keys/${keyId}/probe`,
   )
 }
+// 密钥状态流转事件（后端 channel.ChannelKeyEvent 无 json tag，故键为 PascalCase、ID 为数字）
+export interface ChannelKeyEvent {
+  ID: number
+  ChannelKeyID: number
+  FromState: string
+  ToState: string
+  Reason: string
+  CreatedAt: string
+}
+// 密钥状态流转事件（只读）
+export function listChannelKeyEvents(
+  channelId: string,
+  keyId: string,
+): Promise<ApiRes<ChannelKeyEvent[]>> {
+  return http.get<ChannelKeyEvent[], ApiRes<ChannelKeyEvent[]>>(
+    `/admin/channels/${channelId}/keys/${keyId}/events`,
+  )
+}
 // 手动探测单个渠道内部模型（经该渠道可用密钥发起，仅回喂模型状态机）
 export function probeChannelModel(channelId: string, mid: string): Promise<ApiRes<ProbeOutcome>> {
   return http.post<ProbeOutcome, ApiRes<ProbeOutcome>>(
     `/admin/channels/${channelId}/models/${mid}/probe`,
   )
+}
+
+// ===== 服务状态（只读聚合视图；字段名 = 后端 Go JSON 结构逐字对齐）=====
+// 状态机窗口指标（后端 channel.MachineMetrics）。窗口指标为最近一次 Feed 时快照，仅供最终一致展示。
+export interface MachineMetrics {
+  WindowSeconds: number
+  Total: number
+  Failures: number
+  Timeouts: number
+  Rate429: number
+  SuccessSamples: number
+  MinSamples: number
+  SampleOK: boolean
+  ErrorRatePct: number
+  Rate429Pct: number
+  P99LatencyMS: number
+  ProbeFails: number
+  ProbeOKs: number
+  AuthFails: number
+  DrainingReasons?: string[]
+}
+// 渠道运行时视图（后端 channel.ChannelView；渠道=配置模板，无自身状态字段）
+export interface ChannelRuntimeView {
+  ID: string
+  Name: string
+  Protocol: string
+  BaseURL: string
+  Tags: Record<string, string>
+  BoundTags: { ID: string; Name: string; KV?: Record<string, string> }[]
+  Priority: number
+  LastErr?: string
+  LastProbe?: string | null
+  RateLimit: RateLimitConfig
+  HealthProbe: HealthProbeConfig
+  Reliability: ReliabilityConfig
+  MaxSessions: number
+  CreatedAt: string
+  UpdatedAt: string
+}
+// 内部模型运行时视图（后端 channel.ModelView）
+export interface ModelRuntimeView {
+  ID: string
+  InternalModelID: string
+  ExternalModelID: string
+  State: string // NORMAL | DRAIN | DISABLED
+  LastErr?: string
+  LastProbe?: string | null
+  RateLimit: RateLimitConfig
+  HealthProbe: HealthProbeConfig
+  Reliability: ReliabilityConfig
+  MaxSessions: number
+}
+// 密钥运行时视图（后端 channel.KeyRuntimeView；凭据仅尾号）
+export interface KeyRuntimeView {
+  KeyID: string
+  Name: string
+  State: string // NORMAL | DRAIN | DISABLED
+  LastErr?: string
+  CredentialTail?: string
+  LastProbe?: string | null
+  DrainReasons?: string[]
+}
+// 内部模型层明细（后端 channel.ModelDetail）
+export interface ModelDetail {
+  View: ModelRuntimeView
+  Metrics: MachineMetrics
+  RPM: number
+  TPM: number
+  RPMLimit: number
+  TPMLimit: number
+}
+// 密钥层明细（后端 channel.KeyDetail）
+export interface KeyDetail {
+  View: KeyRuntimeView
+  Metrics: MachineMetrics
+  RPM: number
+  TPM: number
+  RPMLimit: number
+  TPMLimit: number
+  MaxSessions: number // 并发会话上限
+  ActiveSessions: number // 存活会话数（实时会话数）
+}
+// 渠道层明细（后端 channel.ChannelDetail；渠道无独立状态机，State 为内部模型/密钥派生最差值）
+export interface ChannelDetail {
+  View: ChannelRuntimeView
+  State: string // NORMAL | DRAIN | DISABLED（派生：全部内部模型与密钥的最差值）
+  RPM: number
+  TPM: number
+  RPMLimit: number
+  TPMLimit: number
+  Models: ModelDetail[]
+  Keys: KeyDetail[]
+}
+// 对外模型清单项（用于选择要展开的候选）
+export interface ExternalModelItem {
+  ID: string
+  ExternalName: string
+  Enabled: boolean
+}
+// 路由候选（顺序即 router.RouteAll 选区顺序，Rank 从 1 递增；不前端重算）
+export interface CandidateItem {
+  ChannelID: string
+  ChannelKeyID: string
+  InternalModelID: string
+  ModelRowID: string
+  ExternalModelID: string
+  Rank: number
+  Cost: number
+  CostKnown: boolean
+  TimeCoeff: number
+}
+// 成本比较样值：与后端 billing.Usage 同源（snake 键，逐字镜像）
+export interface SampleUsage {
+  input: number
+  output: number
+  cache_read: number
+  cache_write: number
+  reasoning: number
+}
+// 聚合视图（后端 console.ServiceStatusView）
+export interface ServiceStatusView {
+  DataTime: string
+  Channels: ChannelDetail[]
+  ExternalModels: ExternalModelItem[]
+  Candidates: Record<string, CandidateItem[]>
+  CandidatesDataTime?: string | null
+  SampleUsage: SampleUsage
+}
+// 服务状态聚合查询：Expand = 逗号分隔的对外模型 ID 列表（仅展开项才计算候选）
+export function getServiceStatus(params: { Expand?: string } = {}) {
+  return http.get<ServiceStatusView, ApiRes<ServiceStatusView>>('/admin/service-status', { params })
 }
 
 // ===== 标签 =====
