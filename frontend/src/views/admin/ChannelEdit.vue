@@ -67,6 +67,7 @@ const form = reactive({
   tpm: 0,
   burst_multiplier: 1.2,
   on_exceed: 'QUEUE' as string,
+  queue_size: 100,
   queue_timeout_ms: 0,
   max_concurrent: 16,
   interval: '0 0 * * * *',
@@ -215,6 +216,7 @@ async function load() {
     setTpmDisplay(row.RateLimit?.TPM || 0)
     form.burst_multiplier = row.RateLimit?.BurstMultiplier || 1.2
     form.on_exceed = row.RateLimit?.OnExceed || 'QUEUE'
+    form.queue_size = row.RateLimit?.QueueSize ?? 100
     form.queue_timeout_ms = row.RateLimit?.QueueTimeoutMS || 0
     form.max_concurrent = row.RateLimit?.MaxConcurrent || 16
     form.interval = row.HealthProbe?.Interval || '0 0 * * * *'
@@ -398,7 +400,7 @@ async function onSubmit() {
         TPM: tpmRaw(),
         BurstMultiplier: Number(form.burst_multiplier),
         OnExceed: form.on_exceed,
-        QueueSize: 0,
+        QueueSize: Number(form.queue_size),
         QueueTimeoutMS: Number(form.queue_timeout_ms),
         MaxConcurrent: Number(form.max_concurrent),
       },
@@ -448,7 +450,9 @@ async function onSubmit() {
             </el-form-item>
             <el-form-item label="协议">
               <el-select v-model="form.protocol" style="width: 100%" :disabled="usingProtocol">
-                <el-option label="openai-compat" value="openai-compat" />
+                <el-option label="openai-compat（OpenAI 兼容）" value="openai-compat" />
+                <el-option label="openai-responses" value="openai-responses" />
+                <el-option label="anthropic-messages" value="anthropic-messages" />
               </el-select>
             </el-form-item>
             <el-form-item class="span-2" label="Base URL">

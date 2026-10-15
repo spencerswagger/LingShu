@@ -19,7 +19,9 @@ CREATE TABLE IF NOT EXISTS channel_protocols (
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE UNIQUE INDEX IF NOT EXISTS uq_channel_protocols_active ON channel_protocols(name) WHERE deleted_at IS NULL;
-CREATE INDEX IF NOT EXISTS idx_channel_protocols_preset ON channel_protocols(preset_source_id);
+-- 预设来源 ID 唯一（仅约束外部来源条目；内联协议 preset_source_id='' 不受约束）：
+-- Sync 以 preset_source_id 为幂等键，唯一索引保证「一来源一条」，避免重复物化。
+CREATE UNIQUE INDEX IF NOT EXISTS uq_channel_protocols_preset ON channel_protocols(preset_source_id) WHERE deleted_at IS NULL AND preset_source_id <> '';
 
 -- 渠道可引用渠道协议；未引用时走渠道内联配置（channels.protocol + channels.base_url）。
 -- 外键不带 ON DELETE：预设条目删除时不级联删协议，避免破坏引用它的渠道（改标记 STALE）。

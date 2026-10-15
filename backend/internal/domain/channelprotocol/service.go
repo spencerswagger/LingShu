@@ -55,8 +55,6 @@ type Service struct {
 	logger *slog.Logger
 	// packURL 预设站点地址：为空表示未配置（不拉取，AC-12）。
 	packURL string
-	// initialized 标记首次启动拉取是否已执行（只首次拉取一次）。
-	initialized bool
 }
 
 // NewService 创建渠道协议服务。
@@ -66,9 +64,6 @@ func NewService(store *Store) *Service {
 
 // SetPackURL 注入预设站点地址（来自环境变量配置）。
 func (s *Service) SetPackURL(url string) { s.packURL = strings.TrimSpace(url) }
-
-// PackURL 返回预设站点地址。
-func (s *Service) PackURL() string { return s.packURL }
 
 // SetHTTPClient 注入 HTTP 客户端（测试用）。
 func (s *Service) SetHTTPClient(c *http.Client) {
@@ -231,9 +226,6 @@ func (s *Service) Delete(ctx context.Context, id int64) error {
 	return nil
 }
 
-// Initialized 返回首次启动拉取是否已执行。
-func (s *Service) Initialized() bool { return s.initialized }
-
 // InitialSync 首次启动（初始化）拉取一次预设包并物化；地址未设置则不拉取（AC-12）。
 // 失败仅记日志、不阻塞启动。返回是否实际执行了拉取。
 func (s *Service) InitialSync(ctx context.Context) bool {
@@ -246,7 +238,6 @@ func (s *Service) InitialSync(ctx context.Context) bool {
 		s.logger.Error("initial channel protocol sync failed", "err", err)
 		return false
 	}
-	s.initialized = true
 	s.logger.Info("initial channel protocol sync done", "applied", res.Applied, "pending", len(res.Pending))
 	return true
 }
@@ -275,13 +266,19 @@ func (s *Service) Sync(ctx context.Context, confirm bool) (*SyncResult, error) {
 
 	res := &SyncResult{Pending: make([]SyncPending, 0)}
 	seen := make(map[string]bool, len(pack))
-	for id, p := range pack {
-		seen[id] = true
+	for key, p := range pack {
 		cand := p.toChannelProtocol()
-		cur := bySource[id]
+		// 以物化后的 preset_source_id 为唯一键（落库即用它），与 ListByPresetSource 回读一致，
+		// 避免旧实现「map 键 vs p.ID」不一致导致重复插入并撞 name 唯一索引。
+		if cand.PresetSourceID == "" {
+			cand.PresetSourceID = key
+		}
+		sid := cand.PresetSourceID
+		seen[sid] = true
+		cur := bySource[sid]
 		if cur == nil {
 			if _, err := s.store.Insert(ctx, cand); err != nil {
-				return nil, fmt.Errorf("insert preset channel protocol %s: %w", id, err)
+				return nil, fmt.Errorf("insert preset channel protocol %s: %w", sid, err)
 			}
 			res.Applied++
 			continue

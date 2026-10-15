@@ -489,7 +489,6 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 			Path:             eff[baseProtocol].Path,
 			Cred:             kr.CredentialPlain,
 			Body:             rewritten,
-			IsStream:         isStream,
 			DownstreamHeader: r.Header,
 			HeaderPolicy:     effectiveHeaderPolicy(rt),
 			Auth:             effectiveAuth(rt),
@@ -959,6 +958,14 @@ func (w *firstTokenWriter) Write(p []byte) (int, error) {
 		w.first = time.Now()
 	}
 	return w.ResponseWriter.Write(p)
+}
+
+// Flush 透传底层 ResponseWriter 的 Flush：包装后仍满足 http.Flusher，
+// 保证 SSE 逐块下发不被缓冲（否则上游 Provider 的 flusher 断言恒为 nil，流式退化）。
+func (w *firstTokenWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 func (w *firstTokenWriter) firstTokenMs(start time.Time) *int64 {

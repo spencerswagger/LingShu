@@ -12,6 +12,7 @@ import (
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/team/llmgateway/internal/domain/billing"
+	"github.com/team/llmgateway/internal/domain/channelprotocol"
 	"github.com/team/llmgateway/internal/pkg/resp"
 )
 
@@ -175,6 +176,50 @@ func TestService_PullModels_HTTPServer(t *testing.T) {
 		t.Fatalf("pull models: %v", err)
 	}
 	if len(list) != 2 || list[0].ID != "qwen-max" {
+		t.Fatalf("unexpected list: %+v", list)
+	}
+}
+
+// PullModels 按渠道协议解析有效 baseURL/path/auth：内联 base_url 为空时回落渠道协议（协议级 baseUrl/path）。
+func TestService_PullModels_HonorsChannelProtocol(t *testing.T) {
+	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v2/models" {
+			t.Errorf("path want /v2/models, got %s", r.URL.Path)
+		}
+		if got := r.Header.Get("x-api-key"); got != "sk-plain" {
+			t.Errorf("auth want x-api-key sk-plain, got %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"qwen-max","object":"model","owned_by":"aliyun"}]}`))
+	}))
+	defer mock.Close()
+
+	mgr := NewManager(nil, nil, make([]byte, 16), nil, nil, nil)
+	rt := &RuntimeChannel{
+		Channel: Channel{ID: 1, Name: "p"},
+		Protocol: &channelprotocol.ChannelProtocol{
+			BaseURL: mock.URL,
+			Protocols: channelprotocol.Protocols{
+				channelprotocol.ProtocolOpenAIChat: {Path: "/v2/models"},
+			},
+			Auth: channelprotocol.AuthSpec{Header: "x-api-key", Scheme: "raw"},
+		},
+	}
+	rt.Keys = []*KeyRuntime{
+		{Key: ChannelKey{ID: 2, ChannelID: 1, Name: "k2", State: StateNormal}, CredentialPlain: "sk-plain"},
+	}
+	mgr.mu.Lock()
+	mgr.rt[1] = rt
+	mgr.mu.Unlock()
+
+	svc := NewService(nil)
+	svc.SetManager(mgr)
+
+	list, err := svc.PullModels(context.Background(), 1, mock.Client())
+	if err != nil {
+		t.Fatalf("pull models: %v", err)
+	}
+	if len(list) != 1 || list[0].ID != "qwen-max" {
 		t.Fatalf("unexpected list: %+v", list)
 	}
 }

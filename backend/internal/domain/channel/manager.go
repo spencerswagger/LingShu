@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"net/http"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -1221,11 +1220,11 @@ func (m *Manager) ProbeModelNow(channelID, modelRowID int64) (ProbeOutcome, erro
 	if timeout <= 0 {
 		timeout = 15 * time.Second
 	}
-	target := strings.TrimRight(chRT.Channel.BaseURL, "/") + "/chat/completions"
+	target, authHeader, authValue := m.probeRequest(chRT, credential)
 
 	ctx := context.Background()
 	start := m.now()
-	fb, usage, errMsg := m.doProbe(ctx, target, credential, modelID, timeout)
+	fb, usage, errMsg := m.doProbeAuth(ctx, target, authHeader, authValue, modelID, timeout)
 	dur := m.now().Sub(start).Milliseconds()
 
 	m.feedModelAndTransit(channelID, modelRowID, ProbeFeedback(fb))

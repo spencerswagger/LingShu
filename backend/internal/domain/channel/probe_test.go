@@ -14,8 +14,31 @@ import (
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/team/llmgateway/internal/domain/channelprotocol"
 	"github.com/team/llmgateway/internal/pkg/crypto"
 )
+
+// 探测目标按渠道协议解析有效 baseURL/path/auth：仅引用协议（内联 base_url 为空）时不再探测到空 URL。
+func TestProbeRequest_HonorsChannelProtocol(t *testing.T) {
+	m := newProbeTestManager()
+	rt := &RuntimeChannel{
+		Channel: Channel{ID: 1, Name: "c1"},
+		Protocol: &channelprotocol.ChannelProtocol{
+			BaseURL: "https://proto.example.com",
+			Protocols: channelprotocol.Protocols{
+				channelprotocol.ProtocolOpenAIChat: {BaseURL: "https://proto-chat.example.com", Path: "/v2/chat"},
+			},
+			Auth: channelprotocol.AuthSpec{Header: "x-api-key", Scheme: "raw"},
+		},
+	}
+	target, header, value := m.probeRequest(rt, "sk-1")
+	if target != "https://proto-chat.example.com/v2/chat" {
+		t.Errorf("探测目标应取协议级 baseUrl+path, got %q", target)
+	}
+	if header != "x-api-key" || value != "sk-1" {
+		t.Errorf("探测鉴权应取协议 x-api-key/raw, got %q/%q", header, value)
+	}
+}
 
 // newProbeTestManager 返回一个可执行 doProbe 的 Manager（store 为空，仅用于探测链路）。
 func newProbeTestManager() *Manager {
