@@ -249,7 +249,7 @@ const initialSyncedConfigKey = "channel_protocols.initial_synced"
 
 // InitialSynced 判断首次启动同步是否已执行过（跨重启持久，AC-12）。
 func (s *Store) InitialSynced(ctx context.Context) (bool, error) {
-	var v string
+	var v []byte
 	err := s.db.QueryRowContext(ctx,
 		`SELECT value FROM sys_configs WHERE key=$1`, initialSyncedConfigKey).Scan(&v)
 	if errors.Is(err, sql.ErrNoRows) {

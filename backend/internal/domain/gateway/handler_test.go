@@ -1782,3 +1782,36 @@ func TestServeCallLog_ReqIncrementDiff(t *testing.T) {
 		t.Fatalf("third increment want 0 messages (prefix aligned), got %T len=%d (%v)", third.ReqMessages, len(thirdMsgs), third.ReqMessages)
 	}
 }
+
+// 估算器：content 数组容错、多 choice 聚合（与流式一致）、anthropic content[]、未知形状响应体兜底、input 字段。
+func TestMissingUsageEstimate(t *testing.T) {
+	// content 为数组（多模态）不应导致整条解析失败。
+	cArr, _, _ := rawParts([]byte(`{"choices":[{"message":{"content":[{"type":"text","text":"hi"}]}}]}`))
+	if cArr != "hi" {
+		t.Fatalf("rawParts 应兼容 content 数组, got %q", cArr)
+	}
+
+	// 多 choice 聚合（与流式拼装口径一致）。
+	cMulti, _, _ := rawParts([]byte(`{"choices":[{"message":{"content":"a"}},{"message":{"content":"b"}}]}`))
+	if cMulti != "ab" {
+		t.Fatalf("rawParts 应聚合全部 choices, got %q", cMulti)
+	}
+
+	// anthropic 顶层 content[]。
+	cAnth, _, _ := rawParts([]byte(`{"content":[{"type":"text","text":"hi"}]}`))
+	if cAnth != "hi" {
+		t.Fatalf("rawParts 应识别 anthropic content[], got %q", cAnth)
+	}
+
+	// 未知形状（如 openai-responses）：正文提取为空 → 按响应体兜底，Output/Input 均 > 0。
+	u := missingUsageEstimate(
+		[]byte(`{"input":"hello world"}`),
+		[]byte(`{"output":[{"type":"message","content":[{"type":"output_text","text":"hi there"}]}]}`),
+		"gpt-4", "", "", nil)
+	if u.Output <= 0 {
+		t.Fatalf("未知形状应兜底估算输出, got %+v", u)
+	}
+	if u.Input <= 0 {
+		t.Fatalf("input 字段应计入输入估算, got %+v", u)
+	}
+}

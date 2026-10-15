@@ -82,7 +82,7 @@
 
 3. **渠道层扩展**：`domain/channel/service.go` 的 `ChannelInput`（`:45-56`）新增 `ChannelProtocolID`；创建/更新校验（`:89-103`）由「protocol 仅 `openai-compat`」改为二分：**有 `channel_protocol_id` → 以其 protocols 为准**；**无 → 要求内联 `base_url` + 协议**。`domain/channel/store.go:39-42` 的协议常量由单值枚举扩为三基础协议常量。
 
-4. **Provider 接口扩展**：`gateway/provider.go:23-31` 将 `BuildUpstreamRequest(ctx, baseURL, cred, body, isStream)` 的入参收敛为一个构造上下文（新增 `UpstreamRequest{BaseURL, Cred, Body, IsStream, DownstreamHeader, HeaderPolicy, Auth}`），或在 `context.Context` 中携带头策略（二者取其一，见 Architect 张力 T1）。`gateway/openai.go:26,52` 同步改写。
+4. **Provider 接口扩展**：`gateway/provider.go:23-31` 将 `BuildUpstreamRequest(ctx, baseURL, cred, body, isStream)` 的入参收敛为一个构造上下文（新增 `UpstreamRequest{BaseURL, Cred, Body, IsStream, DownstreamHeader, HeaderPolicy, Auth}`），或在 `context.Context` 中携带头策略（二者取其一，见 Architect 张力 T1）。`gateway/openai.go:26,52` 同步改写。（实现注：最终 `UpstreamRequest` 移除了未被消费的 `IsStream` 字段。）
 
 5. **新增两个 Provider 实现**：`gateway/responses.go`、`gateway/anthropic.go`，分别实现 `Name/BuildUpstreamRequest/ExtractUsage/HandleStream`；Anthropic 的 `ExtractUsage` 把推理 token **并入 output**（AC-16）。参照现有 `openai.go:139-199` 的 SSE 透传与 usage 解析写法。
 

@@ -754,7 +754,7 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 			// 故不退预扣，按可见内容估算 token 计费，并把渠道置 DISABLED。
 			g.channels.DisableChannel(routeRes.ChannelID)
 			content, reasoning, tools := rawParts(raw)
-			usage = missingUsageEstimate(ureq.Body, model, content, reasoning, tools)
+			usage = missingUsageEstimate(ureq.Body, raw, model, content, reasoning, tools)
 		}
 
 		// 非流式：先计费再响应。余额不足 → 402，不返成功 body。
@@ -794,7 +794,10 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 		h.Set("Content-Type", up.Header.Get("Content-Type"))
 		w.WriteHeader(up.StatusCode)
 		_, _ = w.Write(raw)
-		g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, feedbackSuccess(start))
+		// usage 缺失的渠道已置 DISABLED，不再回喂成功反馈（与流式路径一致，避免禁用态被注入成功样本）。
+		if !usageMissing {
+			g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, feedbackSuccess(start))
+		}
 		return out
 
 	case up.StatusCode == http.StatusTooManyRequests:
@@ -890,7 +893,7 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 			// 故不退预扣，按可见内容估算 token 计费，并把渠道置 DISABLED。
 			g.channels.DisableChannel(routeRes.ChannelID)
 			content, reasoning, tools := assistantParts(assistantMsg)
-			usage = missingUsageEstimate(ureq.Body, model, content, reasoning, tools)
+			usage = missingUsageEstimate(ureq.Body, assistantMsg, model, content, reasoning, tools)
 		}
 		hardErr := herr != nil && !errors.Is(herr, context.Canceled) && !usageMissing
 		if hardErr {
@@ -1111,11 +1114,34 @@ func estTokens(body []byte) int {
 	return n
 }
 
+// contentText 从 content/reasoning 字段提取纯文本：兼容 string、null 与 [{type,text}] 数组（多模态）。
+func contentText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return s
+	}
+	var parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(raw, &parts) == nil {
+		var b strings.Builder
+		for _, p := range parts {
+			b.WriteString(p.Text)
+		}
+		return b.String()
+	}
+	return ""
+}
+
 // assistantParts 从拼装好的 assistant 消息 JSON 提取 content / reasoning_content / tool_calls。
 func assistantParts(msg []byte) (content, reasoning string, tools []byte) {
 	var m struct {
-		Content          string            `json:"content"`
-		ReasoningContent string            `json:"reasoning_content"`
+		Content          json.RawMessage   `json:"content"`
+		ReasoningContent json.RawMessage   `json:"reasoning_content"`
 		ToolCalls        []json.RawMessage `json:"tool_calls"`
 	}
 	if err := json.Unmarshal(msg, &m); err != nil {
@@ -1124,43 +1150,77 @@ func assistantParts(msg []byte) (content, reasoning string, tools []byte) {
 	if len(m.ToolCalls) > 0 {
 		tools, _ = json.Marshal(m.ToolCalls)
 	}
-	return m.Content, m.ReasoningContent, tools
+	return contentText(m.Content), contentText(m.ReasoningContent), tools
 }
 
-// rawParts 从非流式上游响应体（OpenAI-compat 形状）提取 choices[0].message 的正文/推理/工具调用。
+// rawParts 从上游非流式响应体提取正文/推理/工具调用：聚合全部 choices（与流式拼装口径一致），
+// 并兼容 anthropic-messages 的顶层 content[] 数组。
 func rawParts(raw []byte) (content, reasoning string, tools []byte) {
 	var r struct {
 		Choices []struct {
 			Message struct {
-				Content          string            `json:"content"`
-				ReasoningContent string            `json:"reasoning_content"`
+				Content          json.RawMessage   `json:"content"`
+				ReasoningContent json.RawMessage   `json:"reasoning_content"`
 				ToolCalls        []json.RawMessage `json:"tool_calls"`
 			} `json:"message"`
 		} `json:"choices"`
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
 	}
-	if err := json.Unmarshal(raw, &r); err != nil || len(r.Choices) == 0 {
+	if err := json.Unmarshal(raw, &r); err != nil {
 		return "", "", nil
 	}
-	m := r.Choices[0].Message
-	if len(m.ToolCalls) > 0 {
-		tools, _ = json.Marshal(m.ToolCalls)
+	var cb, rb strings.Builder
+	var tcs []json.RawMessage
+	for _, c := range r.Choices {
+		cb.WriteString(contentText(c.Message.Content))
+		rb.WriteString(contentText(c.Message.ReasoningContent))
+		tcs = append(tcs, c.Message.ToolCalls...)
 	}
-	return m.Content, m.ReasoningContent, tools
+	for _, c := range r.Content {
+		cb.WriteString(c.Text)
+	}
+	if len(tcs) > 0 {
+		tools, _ = json.Marshal(tcs)
+	}
+	return cb.String(), rb.String(), tools
+}
+
+// estimateInputTokens 估算请求输入 token：优先 messages 结构（tiktoken），
+// 其次 openai-responses / embeddings 的 input 字段，最后按请求体字节数兜底。
+func estimateInputTokens(body []byte, model string) int {
+	var probe struct {
+		Messages json.RawMessage `json:"messages"`
+		Input    json.RawMessage `json:"input"`
+	}
+	_ = json.Unmarshal(body, &probe)
+	if len(probe.Messages) > 0 && string(probe.Messages) != "null" {
+		if n, err := countPromptTokens(body, model); err == nil {
+			return n
+		}
+	}
+	if len(probe.Input) > 0 && string(probe.Input) != "null" {
+		if t := contentText(probe.Input); t != "" {
+			return countTextTokens(t, model)
+		}
+	}
+	return estTokens(body)
 }
 
 // missingUsageEstimate 在「上游未返回/无法解析 usage」时按可见内容估算 token 用量（AC-17 放宽）：
-// 输入取请求 prompt 估算（tiktoken/字符级），输出/推理取响应正文与工具调用的文本估算。
-func missingUsageEstimate(reqBody []byte, model, content, reasoning string, tools []byte) billing.Usage {
-	in, err := countPromptTokens(reqBody, model)
-	if err != nil {
-		in = estTokens(reqBody)
-	}
+// 输入取请求 prompt 估算；输出/推理取响应正文与工具调用的文本估算；未知协议形状（如 openai-responses）
+// 提取为空时按响应体粗估兜底，避免近乎零计费。
+func missingUsageEstimate(reqBody, rawResp []byte, model, content, reasoning string, tools []byte) billing.Usage {
 	out := countTextTokens(content, model)
 	if len(tools) > 0 {
 		out += countTextTokens(string(tools), model)
 	}
+	if out == 0 && len(rawResp) > 0 {
+		out = estTokens(rawResp)
+	}
 	return billing.Usage{
-		Input:     int64(in),
+		Input:     int64(estimateInputTokens(reqBody, model)),
 		Output:    int64(out),
 		Reasoning: int64(countTextTokens(reasoning, model)),
 	}
