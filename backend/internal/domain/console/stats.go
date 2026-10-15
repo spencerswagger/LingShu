@@ -31,12 +31,17 @@ type statsKPI struct {
 	DeltaRequests   float64 `json:"DeltaRequests"`
 }
 
-// statsCounts 三态计数（渠道 / 密钥共用）。
+// statsCounts 三态计数（密钥 / 内部模型共用）。
 type statsCounts struct {
 	Total    int `json:"Total"`
 	Normal   int `json:"Normal"`
 	Drain    int `json:"Drain"`
 	Disabled int `json:"Disabled"`
+}
+
+// statsChannelCounts 渠道计数：渠道无独立状态，仅总数（三态见 Keys）。
+type statsChannelCounts struct {
+	Total int `json:"Total"`
 }
 
 // statsModelCounts 模型计数（对外模型 / 渠道内部模型）。
@@ -49,9 +54,9 @@ type statsModelCounts struct {
 
 // statsOps 运维块。
 type statsOps struct {
-	Channels statsCounts      `json:"Channels"`
-	Keys     statsCounts      `json:"Keys"`
-	Models   statsModelCounts `json:"Models"`
+	Channels statsChannelCounts `json:"Channels"`
+	Keys     statsCounts        `json:"Keys"`
+	Models   statsModelCounts   `json:"Models"`
 }
 
 // statsResp 统计页响应（admin/dev 共用；ops 仅 admin 返回）。
@@ -176,7 +181,7 @@ func (h *Admin) HandleStatsDashboard(w http.ResponseWriter, r *http.Request) {
 	resp.OK(w, r, out)
 }
 
-// buildOps 汇总运维块：渠道/密钥运行时三态 + 对外模型、渠道内部模型计数。
+// buildOps 汇总运维块：渠道总数 + 密钥运行时三态 + 对外模型、渠道内部模型计数。
 func (h *Admin) buildOps(ctx context.Context) (*statsOps, error) {
 	ops := &statsOps{}
 	// 渠道总数（渠道无独立状态，可用性由密钥/模型三态体现）

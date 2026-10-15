@@ -9,15 +9,13 @@ import {
   batchDeleteChannels,
   channelKeyState,
   type AdminChannel,
+  type ChannelKeyState,
 } from '@/api/admin'
 import StatusTag from '@/components/StatusTag.vue'
 import ErrorBubble from '@/components/ErrorBubble.vue'
 import ColumnFilter from '@/components/ColumnFilter.vue'
 
-// 密钥聚合态子项（与 AdminChannel.KeyStates 对齐）
-type KeyState = { KeyID: string; KeyName: string; State: string }
-
-function keysOf(row: AdminChannel): KeyState[] {
+function keysOf(row: AdminChannel): ChannelKeyState[] {
   return row.KeyStates || []
 }
 
@@ -89,7 +87,7 @@ async function onEditPriority(row: AdminChannel, v: number) {
 }
 
 // 逐密钥三态切换（popover 内）：调密钥级状态接口，成功后刷新列表（KeyStates 随之更新）
-async function onSetKeyState(row: AdminChannel, key: KeyState, action: 'normal' | 'drain' | 'disable') {
+async function onSetKeyState(row: AdminChannel, key: ChannelKeyState, action: 'normal' | 'drain' | 'disable') {
   try {
     await channelKeyState(row.ID, key.KeyID, action)
     ElMessage.success('密钥状态已更新')
@@ -214,7 +212,7 @@ function onRowClick(row: AdminChannel, _column: unknown, event: Event) {
                   <el-tag v-else type="info" size="small" effect="light">无密钥</el-tag>
                 </div>
               </template>
-              <div class="pop-section">
+              <div v-if="keysOf(row).length" class="pop-section">
                 <span class="pop-label">各密钥状态（渠道可用性以密钥为准）</span>
               </div>
               <template v-if="keysOf(row).length">

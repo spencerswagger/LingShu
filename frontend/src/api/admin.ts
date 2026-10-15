@@ -165,6 +165,14 @@ export interface ReliabilityConfig {
   P99LatencyMS: number // 单位毫秒（后端契约不变；默认 120000ms=120 秒，前端按秒录入/展示，提交转毫秒）
   AuthFailThreshold?: number
 }
+
+// 渠道视图中的逐密钥状态快照（与后端 ChannelKeyState 对齐）
+export interface ChannelKeyState {
+  KeyID: string
+  KeyName: string
+  State: string
+}
+
 export interface AdminChannel {
   ID: string
   Name: string
@@ -177,7 +185,7 @@ export interface AdminChannel {
   RateLimit: RateLimitConfig
   HealthProbe: HealthProbeConfig
   Reliability: ReliabilityConfig
-  KeyStates?: { KeyID: string; KeyName: string; State: string }[]
+  KeyStates?: ChannelKeyState[]
   CreatedAt: string
   UpdatedAt: string
 }

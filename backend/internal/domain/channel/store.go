@@ -1,7 +1,7 @@
-// Package channel 提供渠道（上游 LLM 供应商）的存储、CRUD、三态状态机、
+// Package channel 提供渠道（上游 LLM 供应商）的存储、CRUD、密钥/内部模型三态状态机、
 // 健康探测与 RPM/TPM 内存限流。
 //
-// 数据模型对齐 db/migrations/0001_init.sql 中 channels / channel_events 表。
+// 数据模型对齐 db/migrations 中 channels / channel_keys / channel_models 表。
 package channel
 
 import (
@@ -18,7 +18,7 @@ import (
 	"github.com/team/llmgateway/internal/pkg/idgen"
 )
 
-// State 渠道/内部模型三态。渠道级与内部模型级完全同构。
+// State 密钥/内部模型三态。密钥级与内部模型级完全同构（渠道无独立状态）。
 type State string
 
 const (
