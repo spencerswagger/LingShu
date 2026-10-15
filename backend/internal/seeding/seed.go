@@ -28,12 +28,14 @@ var defaultSysConfigs = map[string]string{
 	"billing.cny_rate": `6.8`,
 	// 上下文分档默认无：不启用分档（模型级/全局均为空时计费不加分档系数）。
 	"billing.context_tiers": `[]`,
-	"billing.time_config": `{"timezone":"Asia/Shanghai","default_coeff":1.0,"periodic_segments":[
-  {"name":"低谷","start":"00:00","end":"08:00","coeff":0.5},
-  {"name":"普通","start":"08:00","end":"18:00","coeff":1.0},
-  {"name":"高峰","start":"18:00","end":"22:00","coeff":1.5},
-  {"name":"低谷","start":"22:00","end":"24:00","coeff":0.5}
-],"date_overrides":[]}`,
+	// 时段系数默认配置：键名必须与 billing.TimeCoeffConfig 的 JSON 契约一致（PascalCase），
+	// 否则解析为零值（Timezone="" → CoeffFor 报错 → 时段系数恒 0 → 计费 0 → 结算失败）。
+	"billing.time_config": `{"Timezone":"Asia/Shanghai","Default":1.0,"Periodic":[
+  {"Name":"低谷","Start":"00:00","End":"08:00","Coeff":0.5},
+  {"Name":"普通","Start":"08:00","End":"18:00","Coeff":1.0},
+  {"Name":"高峰","Start":"18:00","End":"22:00","Coeff":1.5},
+  {"Name":"低谷","Start":"22:00","End":"24:00","Coeff":0.5}
+],"Overrides":[]}`,
 	// 路由成本比较样值用量：新会话创建时以该样值代入渠道成本单价求和比较「谁更便宜」
 	//（不参与实际计费）。五段（输入/缓存读/缓存写/输出/推理）均可配置，缺省缓存写 0。
 	"routing.cost_sample": `{"input":10000,"cache_read":9000,"cache_write":0,"output":1000,"reasoning":500}`,
