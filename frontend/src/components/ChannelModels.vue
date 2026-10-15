@@ -157,7 +157,8 @@ async function onProbeModel(m: ChannelModel) {
     const res = await probeChannelModel(props.channelId, m.ID)
     const o = res.Data
     if (o.OK) {
-      ElMessage.success(`模型「${m.InternalModelID}」探测成功（${o.DurationMS}ms）`)
+      const extra = o.State && o.State !== 'NORMAL' ? `，当前状态 ${o.State}` : ''
+      ElMessage.success(`模型「${m.InternalModelID}」探测成功（${o.DurationMS}ms${extra}）`)
     } else {
       ElMessage.error(`模型「${m.InternalModelID}」探测失败：${o.Error || '未知错误'}`)
     }

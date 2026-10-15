@@ -19,15 +19,15 @@ func TestStore_Insert(t *testing.T) {
 
 	c := &Channel{
 		Name: "c1", Protocol: "openai-compat", BaseURL: "https://x.example.com",
-		Tags: nil, Priority: 100, State: StateNormal,
+		Tags: nil, Priority: 100,
 	}
 	now := time.Now()
 	mock.ExpectQuery(regexp.QuoteMeta(insertChannelSQL)).
 		WithArgs(sqlmock.AnyArg(), "c1", "openai-compat", "https://x.example.com",
-			sqlmock.AnyArg(), 100, "NORMAL", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), nil).
+			sqlmock.AnyArg(), 100, sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), nil).
 		WillReturnRows(channelRow(&Channel{
 			ID: 7, Name: "c1", Protocol: "openai-compat", BaseURL: "https://x.example.com",
-			Priority: 100, State: StateNormal,
+			Priority:  100,
 			CreatedAt: now, UpdatedAt: now,
 		}))
 
@@ -52,83 +52,19 @@ func TestStore_List(t *testing.T) {
 	s := NewStore(db)
 
 	now := time.Now()
-	mock.ExpectQuery(`SELECT ` + regexp.QuoteMeta(channelCols) + ` FROM channels WHERE deleted_at IS NULL AND state = \$1 ORDER BY priority DESC, id ASC`).
-		WithArgs("NORMAL").
+	mock.ExpectQuery(`SELECT ` + regexp.QuoteMeta(channelCols) + ` FROM channels WHERE deleted_at IS NULL ORDER BY priority DESC, id ASC`).
 		WillReturnRows(channelRow(&Channel{
 			ID: 1, Name: "a", Protocol: "openai-compat", BaseURL: "https://a.example.com",
-			Priority: 100, State: StateNormal,
+			Priority:  100,
 			CreatedAt: now, UpdatedAt: now,
 		}))
 
-	chs, err := s.List(context.Background(), StateNormal)
+	chs, err := s.List(context.Background())
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
 	if len(chs) != 1 || chs[0].ID != 1 {
 		t.Fatalf("unexpected channels: %+v", chs)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("mock expectations: %v", err)
-	}
-}
-
-func TestStore_UpdateState(t *testing.T) {
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("sqlmock: %v", err)
-	}
-	defer db.Close()
-	s := NewStore(db)
-
-	mock.ExpectExec(regexp.QuoteMeta(`UPDATE channels SET state=$1, updated_at=now() WHERE id=$2`)).
-		WithArgs("DISABLED", int64(1)).
-		WillReturnResult(sqlmock.NewResult(0, 1))
-
-	if err := s.UpdateState(context.Background(), 1, StateDisabled); err != nil {
-		t.Fatalf("update state: %v", err)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("mock expectations: %v", err)
-	}
-}
-
-func TestStore_InsertEvent_ListEvents(t *testing.T) {
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("sqlmock: %v", err)
-	}
-	defer db.Close()
-	s := NewStore(db)
-
-	now := time.Now()
-	ins := `INSERT INTO channel_events(id, channel_id, from_state, to_state, reason) VALUES($1,$2,$3,$4,$5) RETURNING ` + eventCols
-	mock.ExpectQuery(regexp.QuoteMeta(ins)).
-		WithArgs(sqlmock.AnyArg(), int64(1), "NORMAL", "DISABLED", "auth_failure").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "channel_id", "from_state", "to_state", "reason", "created_at"}).
-			AddRow(int64(10), int64(1), "NORMAL", "DISABLED", "auth_failure", now))
-
-	e, err := s.InsertEvent(context.Background(), &ChannelEvent{
-		ChannelID: 1, FromState: StateNormal, ToState: StateDisabled, Reason: "auth_failure",
-	})
-	if err != nil {
-		t.Fatalf("insert event: %v", err)
-	}
-	if e.ID != 10 || e.ToState != StateDisabled {
-		t.Fatalf("unexpected event: %+v", e)
-	}
-
-	list := `SELECT ` + eventCols + ` FROM channel_events WHERE channel_id=$1 ORDER BY id DESC`
-	mock.ExpectQuery(regexp.QuoteMeta(list)).
-		WithArgs(int64(1)).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "channel_id", "from_state", "to_state", "reason", "created_at"}).
-			AddRow(int64(10), int64(1), "NORMAL", "DISABLED", "auth_failure", now))
-
-	evs, err := s.ListEvents(context.Background(), 1)
-	if err != nil {
-		t.Fatalf("list events: %v", err)
-	}
-	if len(evs) != 1 {
-		t.Fatalf("expected 1 event, got %d", len(evs))
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("mock expectations: %v", err)

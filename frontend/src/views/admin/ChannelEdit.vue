@@ -6,9 +6,7 @@ import { Plus, Edit, Delete } from '@element-plus/icons-vue'
 import {
   listChannels,
   updateChannel,
-  channelState,
   listChannelModels,
-  listChannelEvents,
   listModelEvents,
   listProbeLogs,
   listChannelKeys,
@@ -21,7 +19,6 @@ import {
   listTags,
   listChannelProtocols,
   type AdminChannel,
-  type ChannelEvent,
   type ChannelModelEvent,
   type ProbeLog,
   type ChannelKey,
@@ -41,10 +38,8 @@ const activeTab = ref('base')
 const errInfo = ref<{ message: string; requestId: string }>({ message: '', requestId: '' })
 
 const channel = ref<AdminChannel | null>(null)
-const events = ref<ChannelEvent[]>([])
 const modelEvents = ref<ChannelModelEvent[]>([])
 const probeLogs = ref<ProbeLog[]>([])
-const actionLoading = ref(false)
 // 探测模型下拉：渠道内部模型
 const probeModels = ref<string[]>([])
 // 渠道密钥（独立运行时实体）
@@ -244,12 +239,10 @@ async function load() {
 onMounted(load)
 
 async function loadStateData() {
-  const [evRes, meRes, plRes] = await Promise.all([
-    listChannelEvents(id).catch(() => ({ Data: [] as ChannelEvent[] })),
+  const [meRes, plRes] = await Promise.all([
     listModelEvents(id).catch(() => ({ Data: [] as ChannelModelEvent[] })),
     listProbeLogs(id, 50).catch(() => ({ Data: [] as ProbeLog[] })),
   ])
-  events.value = evRes.Data || []
   modelEvents.value = meRes.Data || []
   probeLogs.value = plRes.Data || []
 }
@@ -344,7 +337,8 @@ async function onProbeKey(k: ChannelKey) {
     const res = await probeChannelKey(id, k.ID)
     const o = res.Data
     if (o.OK) {
-      ElMessage.success(`密钥「${k.Name}」探测成功（${o.DurationMS}ms）`)
+      const extra = o.State && o.State !== 'NORMAL' ? `，当前状态 ${o.State}` : ''
+      ElMessage.success(`密钥「${k.Name}」探测成功（${o.DurationMS}ms${extra}）`)
     } else {
       ElMessage.error(`密钥「${k.Name}」探测失败：${o.Error || '未知错误'}`)
     }
@@ -353,30 +347,6 @@ async function onProbeKey(k: ChannelKey) {
     ElMessage.error(e?.message || '探测失败')
   } finally {
     probingKeyId.value = null
-  }
-}
-
-async function onToggleState(action: 'normal' | 'drain' | 'disable') {
-  const label = stateLabel[action.toUpperCase()] || action
-  try {
-    await ElMessageBox.confirm(`确认手动将渠道置为「${label}」？`, '状态操作', {
-      type: 'warning',
-      confirmButtonText: '确认',
-      cancelButtonText: '取消',
-    })
-  } catch {
-    return
-  }
-  actionLoading.value = true
-  try {
-    const res = await channelState(id, action)
-    channel.value = res.Data
-    ElMessage.success(`已置为 ${label}`)
-    await loadStateData()
-  } catch (e: any) {
-    ElMessage.error(e?.message || '操作失败')
-  } finally {
-    actionLoading.value = false
   }
 }
 
@@ -474,7 +444,7 @@ async function onSubmit() {
           <div class="key-section">
             <div class="key-head">
               <span class="state-label">渠道密钥</span>
-              <el-tooltip content="密钥为独立运行时实体：探测、限流、会话计数按密钥各自独立；渠道级状态为批量操作" placement="top">
+              <el-tooltip content="密钥为独立运行时实体：探测、限流、会话计数按密钥各自独立；渠道无独立状态，可用性以密钥为准" placement="top">
                 <span class="key-tip">?</span>
               </el-tooltip>
               <el-button size="small" type="primary" :icon="Plus" @click="openKeyCreate">新增密钥</el-button>
@@ -757,43 +727,7 @@ async function onSubmit() {
       <el-tab-pane label="状态" name="status">
         <div v-loading="loading" class="card">
           <template v-if="channel">
-            <div class="state-head">
-              <span class="state-label">渠道状态</span>
-              <StatusTag :value="channel.State" />
-              <div class="state-actions">
-                <template v-if="channel.State !== 'NORMAL'">
-                  <el-button size="small" type="success" :loading="actionLoading" @click="onToggleState('normal')">正常</el-button>
-                </template>
-                <template v-if="channel.State !== 'DRAIN'">
-                  <el-button size="small" type="warning" :loading="actionLoading" @click="onToggleState('drain')">排空</el-button>
-                </template>
-                <template v-if="channel.State !== 'DISABLED'">
-                  <el-button size="small" type="danger" :loading="actionLoading" @click="onToggleState('disable')">禁用</el-button>
-                </template>
-              </div>
-            </div>
-            <div class="sub-title">渠道状态流转记录</div>
-            <el-table :data="events" border stripe class="table-nowrap small">
-              <el-table-column label="变更" width="150">
-                <template #default="{ row }">
-                  <StatusTag :value="row.FromState" />
-                  <span class="arrow">→</span>
-                  <StatusTag :value="row.ToState" />
-                </template>
-              </el-table-column>
-              <el-table-column label="原因" min-width="200" show-overflow-tooltip>
-                <template #default="{ row }">{{ reasonZh(row.Reason) }}</template>
-              </el-table-column>
-              <el-table-column label="时间" min-width="150">
-                <template #default="{ row }">
-                  <div class="t-date">{{ fmtDate(row.CreatedAt) }}</div>
-                  <div class="t-time">{{ fmtTime(row.CreatedAt) }}</div>
-                </template>
-              </el-table-column>
-            </el-table>
-            <el-empty v-if="!events.length" description="暂无渠道状态流转记录" :image-size="48" />
-
-            <div class="sub-title">密钥状态</div>
+            <div class="sub-title">密钥状态（渠道无独立状态，可用性以密钥为准）</div>
             <div v-loading="keysLoading">
               <el-table :data="keys" border stripe class="table-nowrap small">
                 <el-table-column label="名称" prop="Name" min-width="130" show-overflow-tooltip />
@@ -939,18 +873,6 @@ async function onSubmit() {
 }
 .actions {
   margin-top: 20px;
-}
-.state-head {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  margin-bottom: 16px;
-}
-.state-actions {
-  margin-left: auto;
-  display: flex;
-  align-items: center;
-  gap: 8px;
 }
 .state-label {
   font-weight: 600;

@@ -194,7 +194,7 @@ func buildTestServer(t *testing.T, dsn string) (*httptest.Server, func()) {
 	chSvc := channel.NewService(chStore)
 	chSvc.SetManager(chMgr)
 	chSvc.SetChannelModelStore(cmStore)
-	chHandler := channel.NewHandler(chSvc, userIDFrom)
+	chHandler := channel.NewHandler(chSvc)
 
 	// 渠道协议（外挂预设包物化模板；e2e 未配置 preset url → 不拉取、列表为空，AC-12）。
 	cpStore := channelprotocol.NewStore(d)

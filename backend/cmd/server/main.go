@@ -302,7 +302,7 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	chSvc.SetChannelModelStore(cmStore)
 	keySvc := channel.NewKeyService(keyStore, sm4Key)
 	chSvc.SetKeyService(keySvc)
-	chHandler := channel.NewHandler(chSvc, userIDFrom)
+	chHandler := channel.NewHandler(chSvc)
 	chHandler.SetKeyDeps(keySvc, chMgr)
 
 	// 渠道协议（由外挂预设包物化的可复用接入模板）：首启拉取一次，后续管理员手动同步。

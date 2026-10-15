@@ -29,7 +29,7 @@ func newHandlerWithKeys(t *testing.T) (*Handler, *Manager, sqlmock.Sqlmock) {
 
 	ch := &Channel{
 		ID: 1, Name: "c1", Protocol: ProtocolOpenAICompat,
-		BaseURL: "https://api.example.com", State: StateNormal,
+		BaseURL:     "https://api.example.com",
 		RateLimit:   RateLimitConfig{MaxConcurrent: 8},
 		HealthProbe: HealthProbeConfig{FailThreshold: 1, RecoveryThreshold: 2},
 		Reliability: ReliabilityConfig{WindowSeconds: 60, MinSamples: 10},
@@ -58,7 +58,7 @@ func newHandlerWithKeys(t *testing.T) (*Handler, *Manager, sqlmock.Sqlmock) {
 		t.Fatalf("SyncFromDB: %v", err)
 	}
 	keySvc := NewKeyService(NewKeyStore(db), testSM4Key)
-	h := NewHandler(nil, nil)
+	h := NewHandler(nil)
 	h.SetKeyDeps(keySvc, mgr)
 	return h, mgr, mock
 }
@@ -379,7 +379,7 @@ func TestHandler_HandleBatchDelete_KillsKeySessions(t *testing.T) {
 	now := time.Date(2026, 9, 27, 10, 0, 0, 0, time.UTC)
 
 	ch := &Channel{ID: 1, Name: "c1", Protocol: ProtocolOpenAICompat,
-		BaseURL: "https://api.example.com", State: StateNormal}
+		BaseURL: "https://api.example.com"}
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + channelCols + ` FROM channels WHERE deleted_at IS NULL ORDER BY priority DESC, id ASC`)).
 		WillReturnRows(channelRow(ch))
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + channelKeyCols + ` FROM channel_keys WHERE deleted_at IS NULL ORDER BY channel_id, id`)).
@@ -402,7 +402,7 @@ func TestHandler_HandleBatchDelete_KillsKeySessions(t *testing.T) {
 	svc := NewService(NewStore(db))
 	svc.SetManager(mgr)
 	svc.SetKeyService(keySvc)
-	h := NewHandler(svc, nil)
+	h := NewHandler(svc)
 	h.SetKeyDeps(keySvc, mgr)
 	var killed []int64
 	h.SetSessionKiller(func(keyID int64) int {
