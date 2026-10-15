@@ -1,19 +1,21 @@
-# 渠道预设包 JSON 格式约定（v0.1 草案）
+# 渠道预设包 JSON 格式约定（v0.2 草案）
 
 ## 1. 目的
 
-约定「渠道预设包」的 JSON 格式与字段，用于描述一个供应商的接入方式（base URL、鉴权、特殊请求头）及其模型清单（能力、价格、对应基础协议）。格式**尽量对齐 models.dev**，只做最小扩展，从而复用其模型能力与价格数据。
+约定「渠道预设包」的 JSON 格式与字段，用于描述一个供应商的接入方式（base URL、鉴权、特殊请求头）及其模型清单（能力、价格、对应基础协议）。格式**对齐 models.dev v1**（`https://models.dev/api.json`），只做最小扩展，从而复用其模型能力与价格数据。
+
+> 本格式**只对齐 v1**，不消费 v2（`/experimental/v2.0/`，仍为实验态）。
 
 ## 2. 设计原则
 
-1. **对齐 models.dev**：provider / model 的字段名、两级嵌套形状、单位一律沿用 models.dev，不另造同义字段。
+1. **对齐 models.dev v1**：provider / model 的字段名、两级嵌套形状、单位一律沿用 v1，不另造同义字段；v1 字段即使本网关不消费，也**原样保留**以保证可无损读入 `api.json`。
 2. **扩展隔离**：本网关专有字段统一放进 `gateway` 命名空间，避免与 models.dev 现有 / 未来字段冲突（models.dev schema 是 strict，未知键会校验失败）。
 3. **可覆盖**：包内值是「默认值」，渠道协议 / 渠道可逐层覆盖。
-4. **开放枚举**：`modalities`、`type`、`protocols` 的键等枚举按需扩展，消费方遇未知值应透传 / 忽略而非报错。
+4. **开放枚举（本格式自身）**：`modalities`、`type`、`protocols` 的键在本格式内按开放枚举处理，消费方遇未知值应透传 / 忽略而非报错。注意：**v1 原文的 `modalities` / `type` 是封闭枚举**，开放对待是本网关的消费策略，非 v1 语义。
 
 ## 3. 顶层结构
 
-一个 provider 的 JSON 对象（与 models.dev `api.json` 中单个 provider 条目的形状一致，外加 `gateway` 块）：
+一个 provider 的 JSON 对象（与 models.dev v1 `api.json` 中单个 provider 条目的形状一致，外加 `gateway` 块）：
 
 ```jsonc
 {
@@ -28,41 +30,58 @@
 }
 ```
 
-多 provider 合并后形状 = `{ "<providerId>": { ...上例... } }`（与 models.dev `api.json` 一致）。
+多 provider 合并后形状 = `{ "<providerId>": { ...上例... } }`（与 models.dev v1 `api.json` 一致）。
 
 ## 4. Provider 字段
 
 | 字段 | 类型 | 含义 | 来源 |
 |---|---|---|---|
-| `id` | string | provider 唯一 ID | models.dev |
-| `name` | string | 展示名 | models.dev |
-| `env` | string[] | 该 provider 需要的 API Key 环境变量名 | models.dev |
-| `npm` | string \| null | 官方 AI SDK 包（隐式提示鉴权 / 端点实现） | models.dev |
-| `api` | string \| null | OpenAI 兼容 base URL（models.dev 仅对兼容类填充；支持 `${ENV}` 模板） | models.dev |
-| `doc` | string | 文档链接 | models.dev |
-| `models` | map | 模型表（见第 5 节） | models.dev |
+| `id` | string | provider 唯一 ID | models.dev v1 |
+| `name` | string | 展示名 | models.dev v1 |
+| `env` | string[] | 该 provider 需要的 API Key 环境变量名 | models.dev v1 |
+| `npm` | string | 官方 AI SDK 包名 | models.dev v1 |
+| `api` | string \| null | OpenAI 兼容 base URL | models.dev v1 |
+| `doc` | string | 文档链接 | models.dev v1 |
+| `models` | map | 模型表（见第 5 节） | models.dev v1 |
 | `gateway` | object | **本网关扩展块**（见第 6 节） | 扩展 |
+
+说明：
+- `npm`：v1 语义为**必填非空**。为支持非 models.dev 原生供应商，本格式允许为空（**偏离 v1**，需在包内显式承认）。本网关**不依赖**它，仅作展示。
+- `api`：v1 为**可选字符串**，**无 `${ENV}` 模板**（模板是 v2 特性，本格式不采用）。本网关实际使用的上游地址以 `gateway.baseUrl` / `gateway.protocols[*].baseUrl` 为准。
+- `env`：v1 语义是「该供应商读取 API Key 的环境变量名」。本网关仅作**前端提示**（提示管理员通常填哪个 Key），运行时不读取环境变量。
 
 ## 5. Model 字段
 
 | 字段 | 类型 | 含义 | 来源 |
 |---|---|---|---|
-| `id` | string | 上游模型 ID | models.dev |
-| `name` | string | 展示名 | models.dev |
-| `cost` | object | 价格，USD / 百万 token：`input,output,reasoning,cache_read,cache_write,input_audio,output_audio,tiers` | models.dev |
-| `limit` | object | `context,input,output` | models.dev |
-| `modalities` | object | `{input:[], output:[]}`，取值 text / audio / image / video / pdf（开放枚举） | models.dev |
-| `tool_call` | bool | 支持工具调用 | models.dev |
-| `reasoning` | bool | 支持推理 | models.dev |
-| `attachment` | bool | 支持附件 | models.dev |
-| `structured_output` | bool | 支持结构化输出 | models.dev |
-| `temperature` | bool | 支持 temperature | models.dev |
-| `knowledge` | string(date) | 知识截止 | models.dev |
-| `release_date` / `last_updated` | string(date) | 发布 / 更新日期 | models.dev |
-| `open_weights` | bool | 是否开源权重 | models.dev |
-| `type` | string | chat / image / video / embedding / ...（开放枚举） | models.dev |
-| `canonical_model_id` | string | 溯源到 lab 模型 | models.dev |
+| `id` | string | 上游模型 ID | v1 |
+| `name` | string | 展示名 | v1 |
+| `description` | string | 模型描述（v1 **必填**） | v1 |
+| `family` | string | 模型家族 slug | v1 |
+| `cost` | object | 价格，USD / 百万 token：`input,output,reasoning,cache_read,cache_write,input_audio,output_audio,tiers` | v1 |
+| `limit` | object | `context,input,output` | v1 |
+| `modalities` | object | `{input:[], output:[]}`，取值 text / audio / image / video / pdf | v1 |
+| `tool_call` | bool | 支持工具调用 | v1 |
+| `reasoning` | bool | 支持推理 | v1 |
+| `reasoning_options` | array | provider 侧推理控制项：`toggle` / `effort` / `budget_tokens` | v1 |
+| `interleaved` | `true` \| object | 思维链侧信道；`{ "field": "reasoning_content" \| "reasoning_details" }` | v1 |
+| `attachment` | bool | 支持附件 | v1 |
+| `structured_output` | bool | 支持结构化输出 | v1 |
+| `temperature` | bool | 支持 temperature | v1 |
+| `knowledge` | string(date) | 知识截止 | v1 |
+| `release_date` / `last_updated` | string(date) | 发布 / 更新日期 | v1 |
+| `open_weights` | bool | 是否开源权重 | v1 |
+| `status` | string | `alpha` / `beta` / `deprecated` | v1 |
+| `type` | string | chat / image / video / embedding / reranking / decision / transcription / speech / realtime | v1 |
+| `canonical_model_id` | string | 溯源到 lab 模型 | v1 |
+| `provider` | object | 模型级端点覆盖：`{npm?, api?, shape?: "responses"\|"completions", body?, headers?}` | v1 |
+| `experimental` | object | `{ modes: { <name>: { cost?, provider?: { body, headers } } } }` | v1 |
 | `gateway` | object | 模型级扩展覆盖（可选，见第 6.4 节） | 扩展 |
+
+说明：
+- **本格式不消费** `provider` 与 `experimental`（模型级端点/请求体覆盖由本格式的 `gateway` 表达），但**原样保留**以保证可无损读入 `api.json`。
+- `cost.context_over_200k`：v1 生成器的 **legacy 输出**（针对单档 ≥200k 的 tier）。消费方应**忽略 / 容忍**，计价统一走 `tiers`。
+- `type` / `modalities` 在 v1 为**封闭枚举**，本格式按开放枚举消费（见第 2 节第 4 条）。
 
 ## 6. `gateway` 扩展块
 
@@ -70,7 +89,7 @@
 
 | 字段 | 类型 | 含义 |
 |---|---|---|
-| `baseUrl` | string | 默认上游 base URL（支持 `${ENV}` 模板） |
+| `baseUrl` | string | 默认上游 base URL |
 | `protocols` | object | 该 provider **原生支持的上游基础协议集合**；键即协议名（`openai-chat` / `openai-responses` / `anthropic-messages`），键存在 = 支持。见下方说明。 |
 | `auth` | object | 凭据注入方式，见 6.2 |
 | `requestHeaders` | object | 特殊制式请求头，见 6.3 |
@@ -81,7 +100,7 @@
 |---|---|---|
 | `baseUrl` | string | 该协议专属 base URL（缺省回退到 provider 级 `baseUrl`） |
 | `path` | string | 该协议端点路径（缺省用基础协议内置默认路径，如 `/chat/completions`、`/responses`、`/v1/messages`） |
-| `default` | bool | 标记首选上游协议；同一作用域内**至多一个**。用途：二期跨协议转换的目标协议、网关自身发起调用时的协议。 |
+| `default` | bool | 标记首选上游协议；同一作用域内**至多一个**。用途：二期跨协议转换的目标协议、网关自身内部调用（取第一个协议）。 |
 
 ```jsonc
 "protocols": {
@@ -115,9 +134,21 @@
 ```
 
 - 变量见第 8 节。
-- **内置强制黑名单**（任何模式下都不透传）：凭证类、hop-by-hop、`cookie/host/content-length/accept-encoding`、WS 握手头。
 - **鉴权头由 `auth` 注入**，不进入用户可编辑的 `set`（防止误配把渠道凭据冲掉）。
 - 合并类头（如 `anthropic-beta`：客户端值 + 平台追加值需合并）由**基础协议适配器**处理，不靠 `set` 表达（`set` 是覆盖语义）。
+
+**内置强制黑名单（任何模式下都不透传）**：
+
+| 类别 | 头 |
+|---|---|
+| hop-by-hop（RFC 7230 §6.1） | `Connection` `Keep-Alive` `TE` `Trailer` `Transfer-Encoding` `Upgrade` `Proxy-Connection` `Proxy-Authorization` |
+| 由 URL / body 重新生成（下游值必须丢弃） | `Host`、HTTP/2 伪头 `:authority` `:method` `:scheme` `:path`、`Content-Length`、`Content-Type`、`Content-Encoding`、`Accept-Encoding` |
+| 安全 / 链路可信 | `Cookie` `Expect` `Via` `Forwarded` `X-Forwarded-For` `X-Forwarded-Proto` `X-Forwarded-Host` `X-Real-IP` `X-Current-Password` `anthropic-dangerous-direct-browser-access` |
+| 凭据（由 `auth` 注入） | `Authorization` `x-api-key` `Proxy-Authorization` |
+
+> `Accept-Encoding` 必须挡：Go `net/http` Transport 会自动补 `gzip` 并透明解压，透传下游的 `br` / `zstd` 会与之冲突，导致 SSE 字节与 token 口径不一致。
+
+**建议透传（白名单候选）**：`anthropic-version` `anthropic-beta` `OpenAI-Organization` `OpenAI-Project` `OpenAI-Beta` `traceparent` `tracestate` `x-request-id` `x-session-id` `x-client-request-id` `x-opencode-session`
 
 ### 6.4 模型级 `gateway`（可选，覆盖 provider 级）
 
@@ -153,13 +184,13 @@
 
 - 价格：**USD / 百万 token**（与 models.dev 一致）。若从 litellm（USD / token）导入，必须 ×1e6 换算。
 - 上下文 / 输出上限：整数 token。
-- 日期：`YYYY-MM-DD`。
-- 枚举（`modalities` / `type` / `protocols` 的键）**开放**：消费方遇未知值透传 / 忽略，不报错。
-- models.dev 两代字段形状：v1 用扁平能力布尔 + `cost`；v2（实验）用 `capabilities` + `api[protocol].base_url` + `compatibility`。消费方可按特征探测（存在 `capabilities` 即 v2）。
+- 日期：`YYYY-MM` **或** `YYYY-MM-DD`（models.dev v1 两种都产出，消费方须容忍）。
+- 枚举（`modalities` / `type` / `protocols` 的键）在本格式内**开放**：消费方遇未知值透传 / 忽略，不报错。注意 v1 原文的 `modalities` / `type` 实为**封闭枚举**，只有 v2 才开放。
+- **版本对齐**：本格式只对齐 models.dev **v1**（`/api.json`）；**不消费** v2（`/experimental/v2.0/`）。若未来 v2 转正，再单独评估迁移。
 
 ## 10. 响应头（不在本格式内）
 
-响应头由**入站基础协议硬编码**决定（`Content-Type`、SSE 形状、网关固定运维头如 `X-Request-Id` / `Retry-After`），另加一份**全局上游头白名单**（默认空、零配置）。上游头默认不透传（维持渠道透明）。因此格式中**不设**响应头字段。
+响应头由**入站基础协议硬编码**决定（`Content-Type`、SSE 形状、网关固定运维头如 `X-Request-Id` / `Retry-After`），另加一份**全局上游头白名单**（默认空、在系统菜单配置）。上游头默认不透传（维持渠道透明）。因此格式中**不设**响应头字段。
 
 ## 11. 完整示例
 
@@ -168,22 +199,26 @@
   "id": "opencode-zen",
   "name": "OpenCode Zen",
   "env": ["OPENCODE_API_KEY"],
-  "npm": null,
+  "npm": "@ai-sdk/opencode",     // 非 models.dev 原生供应商，此处为示例值；本格式允许为空（偏离 v1）
   "api": null,
   "doc": "https://opencode.ai/docs/zen",
   "models": {
     "claude-sonnet-4-5": {
       "id": "claude-sonnet-4-5",
       "name": "Claude Sonnet 4.5",
+      "description": "Anthropic Claude Sonnet 4.5 via OpenCode Zen.",
       "cost": { "input": 3, "output": 15, "cache_read": 0.3, "cache_write": 3.75 },
       "limit": { "context": 200000, "output": 64000 },
       "modalities": { "input": ["text", "image"], "output": ["text"] },
       "tool_call": true,
       "reasoning": true,
+      "reasoning_options": ["toggle", "budget_tokens"],
       "gateway": { "protocols": { "anthropic-messages": {} } }
     },
     "gpt-5-codex": {
       "id": "gpt-5-codex",
+      "name": "GPT-5 Codex",
+      "description": "OpenAI GPT-5 Codex via OpenCode Zen.",
       "cost": { "input": 1.25, "output": 10 },
       "limit": { "context": 400000, "output": 128000 },
       "tool_call": true,
