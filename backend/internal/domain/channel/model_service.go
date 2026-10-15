@@ -9,9 +9,9 @@ import (
 	"io"
 	"net/http"
 	"sort"
-	"strings"
 
 	"github.com/team/llmgateway/internal/domain/billing"
+	"github.com/team/llmgateway/internal/domain/channelprotocol"
 	"github.com/team/llmgateway/internal/pkg/resp"
 )
 
@@ -22,9 +22,11 @@ type ChannelModelInput struct {
 	CostRates       billing.Rates
 	TimeConfig      *billing.TimeCoeffConfig
 	ContextTiers    []billing.TierRule
-	RateLimit       *RateLimitConfig
-	HealthProbe     *HealthProbeConfig
-	Reliability     *ReliabilityConfig
+	// Protocols 模型级可达协议子集：非空时收窄该模型可用的上游协议。
+	Protocols   channelprotocol.Protocols
+	RateLimit   *RateLimitConfig
+	HealthProbe *HealthProbeConfig
+	Reliability *ReliabilityConfig
 }
 
 // validateCMInput 校验渠道内部模型：内部ID非空、外部模型绑定、成本五键非负、可选时段/分档合法。
@@ -49,6 +51,11 @@ func validateCMInput(channelID int64, in ChannelModelInput) error {
 	if len(in.ContextTiers) > 0 {
 		if err := billing.ValidateTiers(in.ContextTiers); err != nil {
 			return errBadRequest("context_tiers 非法：" + err.Error())
+		}
+	}
+	for name := range in.Protocols {
+		if !channelprotocol.IsBaseProtocol(channelprotocol.Canonical(name)) {
+			return errBadRequest("protocols 含不支持的基础协议：" + name)
 		}
 	}
 	return nil
@@ -83,6 +90,7 @@ func (s *Service) CreateChannelModel(ctx context.Context, channelID int64, in Ch
 		CostRates:       rateOrDefault(in.CostRates),
 		TimeConfig:      in.TimeConfig,
 		ContextTiers:    in.ContextTiers,
+		Protocols:       in.Protocols,
 		State:           StateNormal,
 	}
 	if in.RateLimit != nil {
@@ -137,6 +145,7 @@ func (s *Service) UpdateChannelModel(ctx context.Context, channelID, mid int64, 
 		CostRates:       rateOrDefault(in.CostRates),
 		TimeConfig:      in.TimeConfig,
 		ContextTiers:    in.ContextTiers,
+		Protocols:       in.Protocols,
 		State:           existing.State, // 状态由状态机/手动操作管理，CRUD 不改变
 		RateLimit:       existing.RateLimit,
 		HealthProbe:     existing.HealthProbe,
@@ -255,12 +264,22 @@ func (s *Service) PullModels(ctx context.Context, channelID int64, doer HTTPDoer
 	if !ok {
 		return nil, termsInternal("暂无可用渠道密钥")
 	}
-	baseURL := strings.TrimRight(rt.Channel.BaseURL, "/")
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/models", nil)
+	// 按渠道协议解析有效 baseURL/auth（内联渠道回落 base_url + Bearer），避免仅引用协议
+	// （内联 base_url 为空）时拉取到空 URL 或错误鉴权。
+	// 注意：/models 是独立的模型列表端点，**不复用**协议该基础协议的 path（那是 /chat/completions 等对话端点路径）。
+	base := effectiveProtocolBaseURL(rt, channelprotocol.ProtocolOpenAIChat)
+	if base == "" {
+		return nil, termsInternal("渠道未配置 Base URL，无法拉取模型")
+	}
+	authHeader, authValue, query := renderAuth(effectiveProtocolAuth(rt), cred)
+	target := joinProbeURL(base, "/models", query)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
 		return nil, termsInternal("构造模型拉取请求失败")
 	}
-	req.Header.Set("Authorization", "Bearer "+cred)
+	if authValue != "" {
+		req.Header.Set(authHeader, authValue)
+	}
 
 	if doer == nil {
 		doer = http.DefaultClient

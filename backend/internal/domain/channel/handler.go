@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/team/llmgateway/internal/domain/billing"
+	"github.com/team/llmgateway/internal/domain/channelprotocol"
 	"github.com/team/llmgateway/internal/pkg/cronx"
 	"github.com/team/llmgateway/internal/pkg/idgen"
 	"github.com/team/llmgateway/internal/pkg/resp"
@@ -67,14 +68,15 @@ func (h *Handler) SetSessionKiller(fn func(keyID int64) int) {
 }
 
 type createChannelRequest struct {
-	Name        string             `json:"Name"`
-	Protocol    string             `json:"Protocol"`
-	BaseURL     string             `json:"BaseURL"`
-	TagIDs      idgen.IDs          `json:"TagIDs"`
-	Priority    int                `json:"Priority"`
-	RateLimit   *RateLimitConfig   `json:"RateLimit"`
-	HealthProbe *HealthProbeConfig `json:"HealthProbe"`
-	Reliability *ReliabilityConfig `json:"Reliability"`
+	Name              string             `json:"Name"`
+	Protocol          string             `json:"Protocol"`
+	BaseURL           string             `json:"BaseURL"`
+	ChannelProtocolID idgen.OptID        `json:"ChannelProtocolID"`
+	TagIDs            idgen.IDs          `json:"TagIDs"`
+	Priority          int                `json:"Priority"`
+	RateLimit         *RateLimitConfig   `json:"RateLimit"`
+	HealthProbe       *HealthProbeConfig `json:"HealthProbe"`
+	Reliability       *ReliabilityConfig `json:"Reliability"`
 }
 
 func decodeBody(w http.ResponseWriter, r *http.Request, v any) bool {
@@ -111,14 +113,15 @@ func (h *Handler) requireKeyOwnership(w http.ResponseWriter, r *http.Request, ch
 
 func toInput(req *createChannelRequest) ChannelInput {
 	return ChannelInput{
-		Name:        req.Name,
-		Protocol:    req.Protocol,
-		BaseURL:     req.BaseURL,
-		TagIDs:      []int64(req.TagIDs),
-		Priority:    req.Priority,
-		RateLimit:   req.RateLimit,
-		HealthProbe: req.HealthProbe,
-		Reliability: req.Reliability,
+		Name:              req.Name,
+		Protocol:          req.Protocol,
+		BaseURL:           req.BaseURL,
+		ChannelProtocolID: req.ChannelProtocolID.Ptr(),
+		TagIDs:            []int64(req.TagIDs),
+		Priority:          req.Priority,
+		RateLimit:         req.RateLimit,
+		HealthProbe:       req.HealthProbe,
+		Reliability:       req.Reliability,
 	}
 }
 
@@ -258,21 +261,22 @@ func writeServiceErr(w http.ResponseWriter, r *http.Request, err error) {
 
 // viewChannelModel 是渠道内部模型的对外展示结构（含 JOIN 出的对外模型名与运行态）。
 type viewChannelModel struct {
-	ID              int64                    `json:"ID,string"`
-	ChannelID       int64                    `json:"ChannelID,string"`
-	InternalModelID string                   `json:"InternalModelID"`
-	ExternalModelID int64                    `json:"ExternalModelID,string"`
-	ExternalName    string                   `json:"ExternalName,omitempty"`
-	ChannelName     string                   `json:"ChannelName,omitempty"`
-	CostRates       billing.WireRates        `json:"CostRates"`
-	TimeConfig      *billing.TimeCoeffConfig `json:"TimeConfig,omitempty"`
-	ContextTiers    []billing.TierRule       `json:"ContextTiers,omitempty"`
-	State           State                    `json:"State"`
-	RateLimit       RateLimitConfig          `json:"RateLimit"`
-	HealthProbe     HealthProbeConfig        `json:"HealthProbe"`
-	Reliability     ReliabilityConfig        `json:"Reliability"`
-	CreatedAt       time.Time                `json:"CreatedAt"`
-	UpdatedAt       time.Time                `json:"UpdatedAt"`
+	ID              int64                     `json:"ID,string"`
+	ChannelID       int64                     `json:"ChannelID,string"`
+	InternalModelID string                    `json:"InternalModelID"`
+	ExternalModelID int64                     `json:"ExternalModelID,string"`
+	ExternalName    string                    `json:"ExternalName,omitempty"`
+	ChannelName     string                    `json:"ChannelName,omitempty"`
+	CostRates       billing.WireRates         `json:"CostRates"`
+	TimeConfig      *billing.TimeCoeffConfig  `json:"TimeConfig,omitempty"`
+	ContextTiers    []billing.TierRule        `json:"ContextTiers,omitempty"`
+	Protocols       channelprotocol.Protocols `json:"Protocols,omitempty"`
+	State           State                     `json:"State"`
+	RateLimit       RateLimitConfig           `json:"RateLimit"`
+	HealthProbe     HealthProbeConfig         `json:"HealthProbe"`
+	Reliability     ReliabilityConfig         `json:"Reliability"`
+	CreatedAt       time.Time                 `json:"CreatedAt"`
+	UpdatedAt       time.Time                 `json:"UpdatedAt"`
 }
 
 func toChannelModelView(m *ChannelModel) viewChannelModel {
@@ -286,6 +290,7 @@ func toChannelModelView(m *ChannelModel) viewChannelModel {
 		CostRates:       billing.WireRates(m.CostRates),
 		TimeConfig:      m.TimeConfig,
 		ContextTiers:    m.ContextTiers,
+		Protocols:       m.Protocols,
 		State:           m.State,
 		RateLimit:       m.RateLimit,
 		HealthProbe:     m.HealthProbe,
@@ -296,14 +301,15 @@ func toChannelModelView(m *ChannelModel) viewChannelModel {
 }
 
 type channelModelRequest struct {
-	InternalModelID string                   `json:"InternalModelID"`
-	ExternalModelID int64                    `json:"ExternalModelID,string"`
-	CostRates       billing.WireRates        `json:"CostRates"`
-	TimeConfig      *billing.TimeCoeffConfig `json:"TimeConfig"`
-	ContextTiers    []billing.TierRule       `json:"ContextTiers"`
-	RateLimit       *RateLimitConfig         `json:"RateLimit"`
-	HealthProbe     *HealthProbeConfig       `json:"HealthProbe"`
-	Reliability     *ReliabilityConfig       `json:"Reliability"`
+	InternalModelID string                    `json:"InternalModelID"`
+	ExternalModelID int64                     `json:"ExternalModelID,string"`
+	CostRates       billing.WireRates         `json:"CostRates"`
+	TimeConfig      *billing.TimeCoeffConfig  `json:"TimeConfig"`
+	ContextTiers    []billing.TierRule        `json:"ContextTiers"`
+	Protocols       channelprotocol.Protocols `json:"Protocols"`
+	RateLimit       *RateLimitConfig          `json:"RateLimit"`
+	HealthProbe     *HealthProbeConfig        `json:"HealthProbe"`
+	Reliability     *ReliabilityConfig        `json:"Reliability"`
 }
 
 func (req *channelModelRequest) toInput() ChannelModelInput {
@@ -313,6 +319,7 @@ func (req *channelModelRequest) toInput() ChannelModelInput {
 		CostRates:       billing.Rates(req.CostRates),
 		TimeConfig:      req.TimeConfig,
 		ContextTiers:    req.ContextTiers,
+		Protocols:       req.Protocols,
 		RateLimit:       req.RateLimit,
 		HealthProbe:     req.HealthProbe,
 		Reliability:     req.Reliability,

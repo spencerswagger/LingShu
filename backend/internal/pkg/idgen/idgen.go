@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -147,4 +148,48 @@ func (ids *IDs) UnmarshalJSON(b []byte) error {
 	}
 	*ids = out
 	return nil
+}
+
+// OptID 是可空单个雪花 ID 的 JSON 类型：序列化为字符串（0 输出 null），
+// 反序列化兼容字符串 / 整数 / null（用于渠道引用的 channel_protocol_id 等可选外键）。
+type OptID int64
+
+// MarshalJSON 将非零 ID 编码为字符串，零值输出 null。
+func (o OptID) MarshalJSON() ([]byte, error) {
+	if o == 0 {
+		return []byte("null"), nil
+	}
+	return json.Marshal(strconv.FormatInt(int64(o), 10))
+}
+
+// UnmarshalJSON 解析字符串 / 整数 / null 形式的可选 ID。
+func (o *OptID) UnmarshalJSON(b []byte) error {
+	s := strings.TrimSpace(string(b))
+	if s == "" || s == "null" {
+		*o = 0
+		return nil
+	}
+	var str string
+	if err := json.Unmarshal(b, &str); err == nil {
+		s = strings.TrimSpace(str)
+		if s == "" {
+			*o = 0
+			return nil
+		}
+	}
+	n, err := strconv.ParseInt(strings.Trim(s, `"`), 10, 64)
+	if err != nil {
+		return err
+	}
+	*o = OptID(n)
+	return nil
+}
+
+// Ptr 返回非零值的 *int64；零值返回 nil。
+func (o OptID) Ptr() *int64 {
+	if o == 0 {
+		return nil
+	}
+	v := int64(o)
+	return &v
 }

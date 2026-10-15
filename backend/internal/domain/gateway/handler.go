@@ -31,15 +31,33 @@ const maxBodyBytes int64 = 64 << 20
 
 // 下游对外错误文案（不泄漏渠道名/上游地址）。
 const (
-	msgInvalidToken  = "令牌无效或已过期"
-	msgModelNotFound = "模型 %s 未配置或已停用"
-	msgNoRoute       = "当前请求的语义标签无可用的服务渠道"
-	msgNoAvailable   = "无可用渠道，请稍后重试"
-	msgRateLimited   = "请求过于频繁，请稍后重试"
-	msgUpstreamDown  = "上游服务暂时不可用"
-	msgInsufficient  = "积分余额不足，请先充值"
-	msgInternal      = "服务器内部错误"
+	msgInvalidToken        = "令牌无效或已过期"
+	msgModelNotFound       = "模型 %s 未配置或已停用"
+	msgNoRoute             = "当前请求的语义标签无可用的服务渠道"
+	msgNoAvailable         = "无可用渠道，请稍后重试"
+	msgRateLimited         = "请求过于频繁，请稍后重试"
+	msgUpstreamDown        = "上游服务暂时不可用"
+	msgInsufficient        = "积分余额不足，请先充值"
+	msgInternal            = "服务器内部错误"
+	msgUnsupportedProtocol = "该模型不支持当前入站协议（无可直通的上游协议）"
 )
+
+// bearerPlain 从 Authorization 头提取 Bearer 令牌明文；非 Bearer 形式返回 ("", false)。
+func bearerPlain(auth string) (string, bool) {
+	return strings.CutPrefix(auth, "Bearer ")
+}
+
+// writeUnsupportedProtocol 写出 AC-4 固定错误：HTTP 400 + OpenAI 标准错误体，
+// type=unsupported_protocol、code=invalid_request_error。
+func writeUnsupportedProtocol(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusBadRequest)
+	_ = json.NewEncoder(w).Encode(openAIErrorBody{Error: openAIErrorDetail{
+		Message: msgUnsupportedProtocol,
+		Type:    "unsupported_protocol",
+		Code:    "invalid_request_error",
+	}})
+}
 
 // sessionTTLFallback 会话过期兜底时长：resolver 缺失或返回非正值时使用（5 分钟）。
 const sessionTTLFallback = 5 * time.Minute
@@ -151,16 +169,19 @@ func openAIErrorCode(status int) string {
 	}
 }
 
-// serve 是 /v1/{endpoint} 统一入口的核心热路径。
-func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint string) {
+// serve 是 /v1/{endpoint} 统一入口的核心热路径。baseProtocol 为入站端点对应的基础协议
+// （openai-chat / openai-responses / anthropic-messages），用于直通判定与 Provider 选择。
+func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, baseProtocol string) {
 	start := time.Now()
 	ctx := r.Context()
 	l := logger.WithRequestID(ctx, g.logger)
 
-	// 1) 认证：Authorization: Bearer <plain token>。
-	auth := r.Header.Get("Authorization")
-	plain, ok := strings.CutPrefix(auth, "Bearer ")
+	// 1) 认证：Authorization: Bearer <plain token>；兼容 Anthropic 客户端的 x-api-key。
+	plain, ok := bearerPlain(r.Header.Get("Authorization"))
 	if !ok || plain == "" {
+		plain = strings.TrimSpace(r.Header.Get("x-api-key"))
+	}
+	if plain == "" {
 		writeOpenAIError(w, http.StatusUnauthorized, msgInvalidToken)
 		return
 	}
@@ -337,9 +358,10 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint string)
 	// 请求增量 diff：计算本次请求的增量消息与全量指纹（call_log 采集用，
 	// 新会话也在此初始化指纹，由下方 Attach 写入会话）。
 	reqMsgs, msgFps := g.captureReqIncrement(sessObj, body)
-	sawLimit := false  // 出现过限流类失败（本地限流 或 上游 429）
-	sawOther := false  // 出现过非限流类的可重试失败（上游 401/402/403/404/5xx、网络类）
-	attempted := false // 是否至少有一次候选真正发出上游调用（用于全被本地拦截时的账单兜底）
+	sawLimit := false       // 出现过限流类失败（本地限流 或 上游 429）
+	sawOther := false       // 出现过非限流类的可重试失败（上游 401/402/403/404/5xx、网络类）
+	sawUnsupported := false // 出现过「入站协议 ∉ 模型可达 protocols」（AC-4）
+	attempted := false      // 是否至少有一次候选真正发出上游调用（用于全被本地拦截时的账单兜底）
 	// 决策轨迹：每个候选渠道的处理结果与跳过原因（call_log decision 用，雪花 ID 以字符串序列化）。
 	attempts := make([]map[string]any, 0, len(routes))
 	for _, cr := range routes {
@@ -395,10 +417,18 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint string)
 				"error", "", "failed", "密钥凭据不可用", msSince(start), nil, g.callLogDecision(attempts, "密钥凭据不可用", pc, routeResFor(cr)))
 			continue
 		}
-		prov, ok := g.providerFactory(rt.Channel.Protocol, endpoint)
-		if !ok {
-			l.Error("unsupported protocol", "protocol", rt.Channel.Protocol)
+		// 直通判定（AC-4/AC-18）：入站协议必须 ∈ 该模型可达 protocols，否则不发起上游请求。
+		eff := effectiveProtocols(rt, mr)
+		if !eff.Has(baseProtocol) {
+			sawUnsupported = true
 			attempts = append(attempts, attempt("协议不支持"))
+			continue
+		}
+		prov, ok := g.providerFactory(baseProtocol, endpoint)
+		if !ok {
+			l.Error("unsupported protocol", "protocol", baseProtocol)
+			attempts = append(attempts, attempt("协议不支持"))
+			sawUnsupported = true
 			continue
 		}
 		routeRes := &router.RouteResult{ChannelID: cr.ChannelID, ChannelKeyID: cr.ChannelKeyID, InternalModelID: cr.InternalModelID,
@@ -452,6 +482,22 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint string)
 			return
 		}
 
+		// 上游请求构造上下文：有效基址（协议级优先）/ 协议路径覆盖 / 头策略 / 鉴权 / 变量。
+		ureq := UpstreamRequest{
+			BaseURL:          effectiveBaseURL(rt, baseProtocol),
+			Path:             eff[baseProtocol].Path,
+			Cred:             kr.CredentialPlain,
+			Body:             rewritten,
+			DownstreamHeader: r.Header,
+			HeaderPolicy:     effectiveHeaderPolicy(rt),
+			Auth:             effectiveAuth(rt),
+			Vars: map[string]string{
+				"session_id": sessionID,
+				"request_id": logger.GetRequestID(ctx),
+				"model":      model,
+			},
+		}
+
 		var out *fwdOutcome
 		// 进行中计数：包住整段上游转发（含流式全程），管理端「实时状态」据此判定「正在请求」。
 		if sessionID != "" {
@@ -459,10 +505,10 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint string)
 		}
 		if isStream {
 			attempted = true
-			out = g.serveStream(w, r, start, prov, rt, routeRes, kr.CredentialPlain, rewritten, model, token, pricingMode, sessionID, sessionName, pc, reqMsgs, attempts)
+			out = g.serveStream(w, r, start, prov, rt, routeRes, ureq, model, token, pricingMode, sessionID, sessionName, pc, reqMsgs, attempts)
 		} else {
 			attempted = true
-			out = g.serveNonStream(w, r, start, prov, rt, routeRes, kr.CredentialPlain, rewritten, model, token, pricingMode, sessionID, sessionName, pc, reqMsgs, attempts)
+			out = g.serveNonStream(w, r, start, prov, rt, routeRes, ureq, model, token, pricingMode, sessionID, sessionName, pc, reqMsgs, attempts)
 		}
 		if sessionID != "" {
 			sess.EndRequest(sessionID)
@@ -507,6 +553,16 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint string)
 			"pre_consumed":     pc.Credits,
 			"result":           "rejected",
 		}
+	}
+	// AC-4/AC-18：全部候选都因「入站协议 ∉ 模型可达 protocols」被拒且未发起任何上游请求 →
+	// 返回固定错误（HTTP 400 + OpenAI 错误体，type=unsupported_protocol）。
+	if sawUnsupported && !attempted {
+		g.refundAllPreConsume(ctx, token.UserID, pc.Credits, "请求失败退回（协议不支持）")
+		bid := g.recordGatewayReject(ctx, model, token, pricingMode, sessionID, msgUnsupportedProtocol)
+		g.writeCallLog(ctx, bid, "", token, &router.RouteResult{}, model, pricingMode, sessionID,
+			reqMsgs, "error", "", "failed", msgUnsupportedProtocol, msSince(start), nil, rejectDecision())
+		writeUnsupportedProtocol(w)
+		return
 	}
 	if sawLimit && !sawOther {
 		g.refundAllPreConsume(ctx, token.UserID, pc.Credits, "请求失败退回（限流）")
@@ -642,12 +698,12 @@ type fwdOutcome struct {
 // 由调用方切换到下一候选；其余失败（请求已送达后的超时、已收 2xx 后读体失败、其余 4xx、
 // 504/524）直接写出响应，不再转移。
 func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start time.Time,
-	prov Provider, rt *channel.RuntimeChannel, routeRes *router.RouteResult, cred string,
-	body []byte, model string, token *identity.Token, pricingMode, sessionID, sessionName string,
+	prov Provider, rt *channel.RuntimeChannel, routeRes *router.RouteResult, ureq UpstreamRequest,
+	model string, token *identity.Token, pricingMode, sessionID, sessionName string,
 	pc preCharge, reqMsgs []json.RawMessage, attempts []map[string]any) *fwdOutcome {
 
 	ctx := r.Context()
-	req, err := prov.BuildUpstreamRequest(ctx, rt.Channel.BaseURL, cred, body, false)
+	req, err := prov.BuildUpstreamRequest(ctx, ureq)
 	if err != nil {
 		// 本地构建失败，未发出任何上游调用 → 可安全转移。
 		g.logError(rt.Channel.ID, "build upstream request", err)
@@ -691,16 +747,20 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 			return &fwdOutcome{responded: true, refundPre: true}
 		}
 		dur := msSince(start)
-		usage, _ := prov.ExtractUsage(raw)
+		usage, uerr := prov.ExtractUsage(raw)
+		usageMissing := uerr != nil || usageZero(usage)
+		if usageMissing {
+			// AC-17（放宽）：上游未返回/无法解析 usage 属极端协议违规；内容已由上游生成并在此透传，
+			// 故不退预扣，按可见内容估算 token 计费，并把渠道置 DISABLED。
+			g.channels.DisableChannel(routeRes.ChannelID)
+			content, reasoning, tools := rawParts(raw)
+			usage = missingUsageEstimate(ureq.Body, raw, model, content, reasoning, tools)
+		}
 
 		// 非流式：先计费再响应。余额不足 → 402，不返成功 body。
 		// 注意：上游已成功返回 2xx，计费失败（含余额不足）属用户侧/网关侧问题，
 		// 不反馈渠道失败，避免健康渠道被误判为故障（DRAIN_ONLY）。
 		out := &fwdOutcome{responded: true}
-		if usageZero(usage) {
-			// 上游未返回 usage：按输入估算记账（保证每次调用都消耗积分，不允许赊账）。
-			usage = billing.Usage{Input: int64(estTokens(body))}
-		}
 		ch, bid, berr := g.recordBilling(ctx, routeRes, model, token, usage, pricingMode, sessionID, sessionName, pc.Credits, dur, nil)
 		if berr != nil {
 			out.billFailed = true
@@ -721,15 +781,23 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 		}
 		out.charged = ch
 		// 调用日志：成功路径（已知 billingID 且响应写出前）。
+		reason := "success"
+		if usageMissing {
+			reason = "usage缺失(按估算计费)"
+		}
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-			"non_stream", string(raw), "completed", "", dur, nil, g.callLogDecision(attempts, "success", pc, routeRes))
+			"non_stream", string(raw), "completed", "", dur, nil, g.callLogDecision(attempts, reason, pc, routeRes))
 
-		// 渠道透明：只保留下游 Content-Type，清掉上游杂项（request-id 等），不下发任何 X-Channel* 头。
+		// 渠道透明：基础协议硬编码响应头 + 全局上游响应头白名单（默认空）；不下发任何 X-Channel* 头。
+		applyResponseHeaderWhitelist(w, up.Header, g.upstreamHeaders())
 		h := w.Header()
 		h.Set("Content-Type", up.Header.Get("Content-Type"))
 		w.WriteHeader(up.StatusCode)
 		_, _ = w.Write(raw)
-		g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, feedbackSuccess(start))
+		// usage 缺失的渠道已置 DISABLED，不再回喂成功反馈（与流式路径一致，避免禁用态被注入成功样本）。
+		if !usageMissing {
+			g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, feedbackSuccess(start))
+		}
 		return out
 
 	case up.StatusCode == http.StatusTooManyRequests:
@@ -771,12 +839,12 @@ func msSince(start time.Time) *int64 {
 // 响应未写出且上游未计费的失败（构建/连接失败、401/402/403/404/429、5xx 等）返回 retry，
 // 由调用方切换到下一候选；其余失败直接写出响应，不再转移。
 func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time.Time,
-	prov Provider, rt *channel.RuntimeChannel, routeRes *router.RouteResult, cred string,
-	body []byte, model string, token *identity.Token, pricingMode, sessionID, sessionName string,
+	prov Provider, rt *channel.RuntimeChannel, routeRes *router.RouteResult, ureq UpstreamRequest,
+	model string, token *identity.Token, pricingMode, sessionID, sessionName string,
 	pc preCharge, reqMsgs []json.RawMessage, attempts []map[string]any) *fwdOutcome {
 
 	ctx := r.Context()
-	req, err := prov.BuildUpstreamRequest(ctx, rt.Channel.BaseURL, cred, body, true)
+	req, err := prov.BuildUpstreamRequest(ctx, ureq)
 	if err != nil {
 		// 本地构建失败，未发出任何上游调用 → 可安全转移。
 		g.logError(rt.Channel.ID, "build upstream stream request", err)
@@ -809,25 +877,32 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 
 	switch {
 	case up.StatusCode >= 200 && up.StatusCode < 300:
+		// 基础协议硬编码 SSE 头 + 全局上游响应头白名单（须在 HandleStream 写响应头前注入）。
+		applyResponseHeaderWhitelist(w, up.Header, g.upstreamHeaders())
 		// 记录首个 SSE chunk 写出时机（首字耗时）。
 		ft := &firstTokenWriter{ResponseWriter: w}
 		usage, assistantMsg, herr := prov.HandleStream(ctx, up, ft)
 		dur := msSince(start)
-		if herr != nil && !errors.Is(herr, context.Canceled) {
-			g.logError(rt.Channel.ID, "stream handle failed", herr)
-			bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "流式传输中断", dur)
-			g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-				"error", string(assistantMsg), "failed", "流式传输中断", dur, ft.firstTokenMs(start), g.callLogDecision(attempts, "流式传输中断", pc, routeRes))
-		}
-		// 流结束后计费（预扣已在前置阶段完成；此处按实际扣费，差额由 serve 结算退补）。
-		// 此时请求 context 已随响应结束被取消：用脱离取消、带超时的 context，避免计费被误中断。
+		// 计费上下文（脱离请求取消、带超时）：响应结束后请求 ctx 会被取消，账单不可丢。
 		billCtx, cancelBill := billingCtx(ctx)
 		defer cancelBill()
 		out := &fwdOutcome{responded: true}
-		if usageZero(usage) {
-			// 上游未返回 usage（流式响应无 usage 块）：按输入估算记账，保证每次调用都消耗积分。
-			usage = billing.Usage{Input: int64(estTokens(body))}
+		usageMissing := errors.Is(herr, ErrUsageMissing)
+		if usageMissing {
+			// AC-17（放宽）：上游不符合接口协议的返回属极端情况；内容已透传无法撤回，
+			// 故不退预扣，按可见内容估算 token 计费，并把渠道置 DISABLED。
+			g.channels.DisableChannel(routeRes.ChannelID)
+			content, reasoning, tools := assistantParts(assistantMsg)
+			usage = missingUsageEstimate(ureq.Body, assistantMsg, model, content, reasoning, tools)
 		}
+		hardErr := herr != nil && !errors.Is(herr, context.Canceled) && !usageMissing
+		if hardErr {
+			g.logError(rt.Channel.ID, "stream handle failed", herr)
+			bid := g.recordFailure(billCtx, routeRes, model, token, pricingMode, sessionID, sessionName, "流式传输中断", dur)
+			g.writeCallLog(billCtx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
+				"error", string(assistantMsg), "failed", "流式传输中断", dur, ft.firstTokenMs(start), g.callLogDecision(attempts, "流式传输中断", pc, routeRes))
+		}
+		// 流结束后计费（预扣已在前置阶段完成；此处按实际/估算扣费，差额由 serve 结算退补）。
 		ch, bid, berr := g.recordBilling(billCtx, routeRes, model, token, usage, pricingMode, sessionID, sessionName, pc.Credits, dur, ft.firstTokenMs(start))
 		if berr != nil {
 			g.logger.Error("stream billing failed", "user_id", token.UserID,
@@ -836,18 +911,25 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		} else {
 			out.charged = ch
 		}
-		// 调用日志：流结束后采集（含 herr 失败分支的 resp_kind=error；正常/billFailed 为 stream）。
+		// 调用日志：流结束后采集（含 hardErr 失败分支的 resp_kind=error；正常/billFailed 为 stream）。
 		switch {
-		case herr != nil && !errors.Is(herr, context.Canceled):
+		case hardErr:
 			// 失败分支已在上面记录（resp_kind=error）。
 		case out.billFailed:
 			g.writeCallLog(billCtx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
 				"stream", string(assistantMsg), "failed", "流式计费失败", dur, ft.firstTokenMs(start), g.callLogDecision(attempts, "计费失败", pc, routeRes))
 		default:
+			reason := "success"
+			if usageMissing {
+				reason = "usage缺失(按估算计费)"
+			}
 			g.writeCallLog(billCtx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-				"stream", string(assistantMsg), "completed", "", dur, ft.firstTokenMs(start), g.callLogDecision(attempts, "success", pc, routeRes))
+				"stream", string(assistantMsg), "completed", "", dur, ft.firstTokenMs(start), g.callLogDecision(attempts, reason, pc, routeRes))
 		}
-		g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, feedbackSuccess(start))
+		// usage 缺失的渠道已置 DISABLED，不再回喂成功反馈（避免与禁用态冲突）。
+		if !usageMissing {
+			g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, feedbackSuccess(start))
+		}
 		return out
 	case up.StatusCode == http.StatusTooManyRequests:
 		g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, channel.Feedback{Is429: true, Now: g.now()})
@@ -888,6 +970,14 @@ func (w *firstTokenWriter) Write(p []byte) (int, error) {
 		w.first = time.Now()
 	}
 	return w.ResponseWriter.Write(p)
+}
+
+// Flush 透传底层 ResponseWriter 的 Flush：包装后仍满足 http.Flusher，
+// 保证 SSE 逐块下发不被缓冲（否则上游 Provider 的 flusher 断言恒为 nil，流式退化）。
+func (w *firstTokenWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 func (w *firstTokenWriter) firstTokenMs(start time.Time) *int64 {
@@ -1022,6 +1112,118 @@ func estTokens(body []byte) int {
 		n = 500000
 	}
 	return n
+}
+
+// contentText 从 content/reasoning 字段提取纯文本：兼容 string、null 与 [{type,text}] 数组（多模态）。
+func contentText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return s
+	}
+	var parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(raw, &parts) == nil {
+		var b strings.Builder
+		for _, p := range parts {
+			b.WriteString(p.Text)
+		}
+		return b.String()
+	}
+	return ""
+}
+
+// assistantParts 从拼装好的 assistant 消息 JSON 提取 content / reasoning_content / tool_calls。
+func assistantParts(msg []byte) (content, reasoning string, tools []byte) {
+	var m struct {
+		Content          json.RawMessage   `json:"content"`
+		ReasoningContent json.RawMessage   `json:"reasoning_content"`
+		ToolCalls        []json.RawMessage `json:"tool_calls"`
+	}
+	if err := json.Unmarshal(msg, &m); err != nil {
+		return "", "", nil
+	}
+	if len(m.ToolCalls) > 0 {
+		tools, _ = json.Marshal(m.ToolCalls)
+	}
+	return contentText(m.Content), contentText(m.ReasoningContent), tools
+}
+
+// rawParts 从上游非流式响应体提取正文/推理/工具调用：聚合全部 choices（与流式拼装口径一致），
+// 并兼容 anthropic-messages 的顶层 content[] 数组。
+func rawParts(raw []byte) (content, reasoning string, tools []byte) {
+	var r struct {
+		Choices []struct {
+			Message struct {
+				Content          json.RawMessage   `json:"content"`
+				ReasoningContent json.RawMessage   `json:"reasoning_content"`
+				ToolCalls        []json.RawMessage `json:"tool_calls"`
+			} `json:"message"`
+		} `json:"choices"`
+		Content []struct {
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(raw, &r); err != nil {
+		return "", "", nil
+	}
+	var cb, rb strings.Builder
+	var tcs []json.RawMessage
+	for _, c := range r.Choices {
+		cb.WriteString(contentText(c.Message.Content))
+		rb.WriteString(contentText(c.Message.ReasoningContent))
+		tcs = append(tcs, c.Message.ToolCalls...)
+	}
+	for _, c := range r.Content {
+		cb.WriteString(c.Text)
+	}
+	if len(tcs) > 0 {
+		tools, _ = json.Marshal(tcs)
+	}
+	return cb.String(), rb.String(), tools
+}
+
+// estimateInputTokens 估算请求输入 token：优先 messages 结构（tiktoken），
+// 其次 openai-responses / embeddings 的 input 字段，最后按请求体字节数兜底。
+func estimateInputTokens(body []byte, model string) int {
+	var probe struct {
+		Messages json.RawMessage `json:"messages"`
+		Input    json.RawMessage `json:"input"`
+	}
+	_ = json.Unmarshal(body, &probe)
+	if len(probe.Messages) > 0 && string(probe.Messages) != "null" {
+		if n, err := countPromptTokens(body, model); err == nil {
+			return n
+		}
+	}
+	if len(probe.Input) > 0 && string(probe.Input) != "null" {
+		if t := contentText(probe.Input); t != "" {
+			return countTextTokens(t, model)
+		}
+	}
+	return estTokens(body)
+}
+
+// missingUsageEstimate 在「上游未返回/无法解析 usage」时按可见内容估算 token 用量（AC-17 放宽）：
+// 输入取请求 prompt 估算；输出/推理取响应正文与工具调用的文本估算；未知协议形状（如 openai-responses）
+// 提取为空时按响应体粗估兜底，避免近乎零计费。
+func missingUsageEstimate(reqBody, rawResp []byte, model, content, reasoning string, tools []byte) billing.Usage {
+	out := countTextTokens(content, model)
+	if len(tools) > 0 {
+		out += countTextTokens(string(tools), model)
+	}
+	if out == 0 && len(rawResp) > 0 {
+		out = estTokens(rawResp)
+	}
+	return billing.Usage{
+		Input:     int64(estimateInputTokens(reqBody, model)),
+		Output:    int64(out),
+		Reasoning: int64(countTextTokens(reasoning, model)),
+	}
 }
 
 // preConsumeBuffer 预扣缓冲系数：预扣按估算输入代入本地公式（含全部倍率）精确冻结，

@@ -86,18 +86,21 @@ type ChannelKeyState struct {
 // Channel 对应 channels 表的一行（配置模板，不含凭据；凭据收敛到 channel_keys.credential_enc）。
 // 雪花 ID 超出 JS 安全整数，ID/tag_ids 等 ID 字段以字符串序列化。
 type Channel struct {
-	ID          int64             `json:"ID,string"`
-	Name        string            `json:"Name"`
-	Protocol    string            `json:"Protocol"`
-	BaseURL     string            `json:"BaseURL"`
-	Tags        map[string]string `json:"Tags"`
-	TagIDs      idgen.IDs         `json:"TagIDs"`
-	BoundTags   []TagRef          `json:"BoundTags"`
-	Priority    int               `json:"Priority"`
-	State       State             `json:"State"`
-	RateLimit   RateLimitConfig   `json:"RateLimit"`
-	HealthProbe HealthProbeConfig `json:"HealthProbe"`
-	Reliability ReliabilityConfig `json:"Reliability"`
+	ID        int64             `json:"ID,string"`
+	Name      string            `json:"Name"`
+	Protocol  string            `json:"Protocol"`
+	BaseURL   string            `json:"BaseURL"`
+	Tags      map[string]string `json:"Tags"`
+	TagIDs    idgen.IDs         `json:"TagIDs"`
+	BoundTags []TagRef          `json:"BoundTags"`
+	Priority  int               `json:"Priority"`
+	State     State             `json:"State"`
+	// ChannelProtocolID 引用的渠道协议 ID；nil=使用渠道内联配置（protocol + base_url）。
+	// 雪花 ID 超出 JS 安全整数，序列化为字符串（与其它 ID 字段一致）。
+	ChannelProtocolID *int64            `json:"ChannelProtocolID,string,omitempty"`
+	RateLimit         RateLimitConfig   `json:"RateLimit"`
+	HealthProbe       HealthProbeConfig `json:"HealthProbe"`
+	Reliability       ReliabilityConfig `json:"Reliability"`
 
 	KeyStates []ChannelKeyState `json:"KeyStates"`
 	CreatedAt time.Time         `json:"CreatedAt"`
@@ -144,7 +147,7 @@ type ProbeLog struct {
 }
 
 // channelCols 列出 channels 表查询时使用的全部列，保持各查询一致。
-const channelCols = `id, name, protocol, base_url, tags, priority, state, rate_limit, health_probe, reliability, created_at, updated_at`
+const channelCols = `id, name, protocol, base_url, tags, priority, state, rate_limit, health_probe, reliability, channel_protocol_id, created_at, updated_at`
 
 const eventCols = `id, channel_id, from_state, to_state, reason, created_at`
 
@@ -155,13 +158,18 @@ func scanChannel(row interface{ Scan(...any) error }) (*Channel, error) {
 	var c Channel
 	var tagsRaw, rlRaw, hpRaw, relRaw []byte
 	var state string
+	var cpID sql.NullInt64
 	err := row.Scan(&c.ID, &c.Name, &c.Protocol, &c.BaseURL,
 		&tagsRaw, &c.Priority, &state, &rlRaw, &hpRaw, &relRaw,
-		&c.CreatedAt, &c.UpdatedAt)
+		&cpID, &c.CreatedAt, &c.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
 	c.State = State(state)
+	if cpID.Valid {
+		v := cpID.Int64
+		c.ChannelProtocolID = &v
+	}
 	if len(tagsRaw) > 0 {
 		if err := json.Unmarshal(tagsRaw, &c.Tags); err != nil {
 			return nil, fmt.Errorf("parse tags: %w", err)
@@ -204,6 +212,14 @@ func marshalJSONB(v any) []byte {
 		b = []byte("{}")
 	}
 	return b
+}
+
+// nullableID 把可空 ID 指针转为 SQL 可写值：nil 写 NULL。
+func nullableID(id *int64) any {
+	if id == nil || *id <= 0 {
+		return nil
+	}
+	return *id
 }
 
 // Store 提供 channels / channel_events 表的基础数据访问。
@@ -269,12 +285,12 @@ func (s *Store) Insert(ctx context.Context, c *Channel) (*Channel, error) {
 		c.ID = idgen.New()
 	}
 	row := s.db.QueryRowContext(ctx,
-		`INSERT INTO channels(id, name, protocol, base_url, tags, priority, state, rate_limit, health_probe, reliability)
-		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+		`INSERT INTO channels(id, name, protocol, base_url, tags, priority, state, rate_limit, health_probe, reliability, channel_protocol_id)
+		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
 		 RETURNING `+channelCols,
 		c.ID, c.Name, c.Protocol, c.BaseURL, marshalJSONB(c.Tags),
 		c.Priority, string(c.State), marshalJSONB(c.RateLimit), marshalJSONB(c.HealthProbe),
-		marshalJSONB(c.Reliability))
+		marshalJSONB(c.Reliability), nullableID(c.ChannelProtocolID))
 	created, err := scanChannel(row)
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -291,11 +307,11 @@ func (s *Store) Update(ctx context.Context, c *Channel) error {
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE channels SET name=$1, protocol=$2, base_url=$3,
 		        tags=$4, priority=$5, state=$6, rate_limit=$7, health_probe=$8,
-		        reliability=$9, updated_at=now()
-		 WHERE id=$10`,
+		        reliability=$9, channel_protocol_id=$10, updated_at=now()
+		 WHERE id=$11`,
 		c.Name, c.Protocol, c.BaseURL, marshalJSONB(c.Tags),
 		c.Priority, string(c.State), marshalJSONB(c.RateLimit), marshalJSONB(c.HealthProbe),
-		marshalJSONB(c.Reliability), c.ID)
+		marshalJSONB(c.Reliability), nullableID(c.ChannelProtocolID), c.ID)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
@@ -541,12 +557,12 @@ func (s *Store) InsertWithTags(ctx context.Context, c *Channel, tagIDs []int64) 
 		c.ID = idgen.New()
 	}
 	row := tx.QueryRowContext(ctx,
-		`INSERT INTO channels(id, name, protocol, base_url, tags, priority, state, rate_limit, health_probe, reliability)
-		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+		`INSERT INTO channels(id, name, protocol, base_url, tags, priority, state, rate_limit, health_probe, reliability, channel_protocol_id)
+		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
 		 RETURNING `+channelCols,
 		c.ID, c.Name, c.Protocol, c.BaseURL, marshalJSONB(c.Tags),
 		c.Priority, string(c.State), marshalJSONB(c.RateLimit), marshalJSONB(c.HealthProbe),
-		marshalJSONB(c.Reliability))
+		marshalJSONB(c.Reliability), nullableID(c.ChannelProtocolID))
 	created, err := scanChannel(row)
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -574,11 +590,11 @@ func (s *Store) UpdateWithTags(ctx context.Context, c *Channel, tagIDs []int64) 
 	res, err := tx.ExecContext(ctx,
 		`UPDATE channels SET name=$1, protocol=$2, base_url=$3,
 		        tags=$4, priority=$5, state=$6, rate_limit=$7, health_probe=$8,
-		        reliability=$9, updated_at=now()
-		 WHERE id=$10 AND deleted_at IS NULL`,
+		        reliability=$9, channel_protocol_id=$10, updated_at=now()
+		 WHERE id=$11 AND deleted_at IS NULL`,
 		c.Name, c.Protocol, c.BaseURL, marshalJSONB(c.Tags),
 		c.Priority, string(c.State), marshalJSONB(c.RateLimit), marshalJSONB(c.HealthProbe),
-		marshalJSONB(c.Reliability), c.ID)
+		marshalJSONB(c.Reliability), nullableID(c.ChannelProtocolID), c.ID)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
