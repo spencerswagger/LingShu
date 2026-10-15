@@ -6,6 +6,7 @@ import UserPanel from '@/components/UserPanel.vue'
 import {
   Odometer,
   Connection,
+  Monitor,
   Cpu,
   PriceTag,
   User,
@@ -26,6 +27,7 @@ const menus = [
   { path: '/admin/dashboard', title: '统计', icon: Odometer },
   { path: '/admin/channels', title: '渠道', icon: Connection },
   { path: '/admin/channel-protocols', title: '渠道协议', icon: Connection },
+  { path: '/admin/service-status', title: '服务状态', icon: Monitor },
   { path: '/admin/models', title: '模型', icon: Cpu },
   { path: '/admin/tags', title: '标签', icon: PriceTag },
   { path: '/admin/users', title: '用户', icon: User },
@@ -40,7 +42,7 @@ const menus = [
 function activeMenu() {
   // 子页（新建/编辑/详情）高亮所属列表菜单
   const p = route.path
-  for (const m of ['/admin/channels', '/admin/channel-protocols', '/admin/models', '/admin/tags', '/admin/users', '/admin/tokens', '/admin/billings', '/admin/announcements']) {
+  for (const m of ['/admin/channels', '/admin/channel-protocols', '/admin/service-status', '/admin/models', '/admin/tags', '/admin/users', '/admin/tokens', '/admin/billings', '/admin/announcements']) {
     if (p.startsWith(m)) return m
   }
   if (p.startsWith('/admin/system/gateway')) return '/admin/system/gateway'
