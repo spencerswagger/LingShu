@@ -516,15 +516,17 @@ func (h *Admin) HandleChannelSnapshot(w http.ResponseWriter, r *http.Request) {
 	resp.OK(w, r, h.channelMgr.Snapshot())
 }
 
-// ===== 计费配置读写 =====
+// ===== 系统配置读写（计费 / 会话过期 / 网关白名单 统一入口）=====
 
-// HandleGetBillingConfig GET /api/v1/admin/configs/billing
-func (h *Admin) HandleGetBillingConfig(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+// sessionExpirationDefault 内置默认会话过期配置（与 seeding 的 session.expiration 种子一致），
+// 配置键缺失时回退，保证前端可展示与保存。
+const sessionExpirationDefault = `{"default_ttl_minutes":5,"context_tiers":[{"max_tokens":2000,"ttl_minutes":5},{"max_tokens":8000,"ttl_minutes":30},{"max_tokens":32000,"ttl_minutes":180},{"max_tokens":128000,"ttl_minutes":1440}],"turn_tiers":[{"max_turns":2,"ttl_minutes":5},{"max_turns":10,"ttl_minutes":30},{"max_turns":50,"ttl_minutes":180},{"max_turns":200,"ttl_minutes":1440}]}`
+
+// readBillingConfigRaw 读取计费配置各键原文，返回对外 PascalCase 键映射（CreditValue 由 R 派生）。
+func (h *Admin) readBillingConfigRaw(ctx context.Context) (map[string]json.RawMessage, error) {
 	rRaw, err := h.billing.GetConfig(ctx, "billing.r")
 	if err != nil {
-		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "读取计费配置失败")
-		return
+		return nil, err
 	}
 	cnyRaw, err := h.billing.GetConfig(ctx, "billing.cny_rate")
 	if err != nil {
@@ -533,13 +535,11 @@ func (h *Admin) HandleGetBillingConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	tiersRaw, err := h.billing.GetConfig(ctx, "billing.context_tiers")
 	if err != nil {
-		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "读取计费配置失败")
-		return
+		return nil, err
 	}
 	timeRaw, err := h.billing.GetConfig(ctx, "billing.time_config")
 	if err != nil {
-		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "读取计费配置失败")
-		return
+		return nil, err
 	}
 	// 路由成本比较样值（routing.cost_sample）：旧库未初始化时回退内置默认，保证前端可展示与保存。
 	sampleRaw, err := h.billing.GetConfig(ctx, "routing.cost_sample")
@@ -550,142 +550,95 @@ func (h *Admin) HandleGetBillingConfig(w http.ResponseWriter, r *http.Request) {
 	creditV, _ := creditValueFromRaw(rRaw)
 	creditRaw, _ := json.Marshal(creditV)
 	// 数据库配置键（billing.r 等）为存储层契约，保持不变；此处显式映射为对外 PascalCase 键。
-	resp.OK(w, r, map[string]json.RawMessage{
+	return map[string]json.RawMessage{
 		"R":            rRaw,
 		"CNYRate":      cnyRaw,
 		"CreditValue":  creditRaw,
 		"ContextTiers": tiersRaw,
 		"TimeConfig":   timeRaw,
 		"CostSample":   sampleRaw,
-	})
+	}, nil
 }
 
-// HandlePutBillingConfig PUT /api/v1/admin/configs/billing
-func (h *Admin) HandlePutBillingConfig(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		R            json.RawMessage `json:"R"`
-		CnyRate      json.RawMessage `json:"CnyRate"`
-		ContextTiers json.RawMessage `json:"ContextTiers"`
-		TimeConfig   json.RawMessage `json:"TimeConfig"`
-		CostSample   json.RawMessage `json:"CostSample"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "请求体格式错误")
-		return
-	}
-	if !validR(req.R) {
-		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "r 必须是整数或数字字符串")
-		return
-	}
-	if len(req.CnyRate) > 0 && !validPositiveNumber(req.CnyRate) {
-		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "cny_rate 必须是正数或数字字符串")
-		return
-	}
-	if !isJSONArray(req.ContextTiers) {
-		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "context_tiers 必须是 JSON 数组")
-		return
-	}
-	if !isJSONObject(req.TimeConfig) {
-		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "time_config 必须是 JSON 对象")
-		return
-	}
-	if len(req.CostSample) > 0 && !validCostSample(req.CostSample) {
-		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "cost_sample 必须是各段非负的 JSON 对象")
-		return
-	}
-	operator, _ := h.userIDFrom(r.Context())
-	ctx := r.Context()
-	// 仅更新前端显式传入的字段；r/cny_rate 未传时保留数据库原值（兼容旧前端不全量提交）。
-	// r 必须为正整数（validR 已校验 > 0），防止把 0/负值写入导致计费引擎运行时报错。
-	if len(req.R) > 0 {
-		if err := h.billing.UpsertConfig(ctx, "billing.r", req.R, operator); err != nil {
-			resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "更新计费配置失败")
-			return
-		}
-	}
-	if len(req.CnyRate) > 0 {
-		if err := h.billing.UpsertConfig(ctx, "billing.cny_rate", req.CnyRate, operator); err != nil {
-			resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "更新计费配置失败")
-			return
-		}
-	}
-	if err := h.billing.UpsertConfig(ctx, "billing.context_tiers", req.ContextTiers, operator); err != nil {
-		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "更新计费配置失败")
-		return
-	}
-	if err := h.billing.UpsertConfig(ctx, "billing.time_config", req.TimeConfig, operator); err != nil {
-		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "更新计费配置失败")
-		return
-	}
-	if len(req.CostSample) > 0 {
-		if err := h.billing.UpsertConfig(ctx, "routing.cost_sample", req.CostSample, operator); err != nil {
-			resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "更新计费配置失败")
-			return
-		}
-	}
-	resp.OK(w, r, map[string]any{"Affected": 1})
-}
-
-// ===== 会话过期配置读写 =====
-
-// sessionExpirationDefault 内置默认会话过期配置（与 seeding 的 session.expiration 种子一致），
-// 配置键缺失时回退，保证前端可展示与保存。
-const sessionExpirationDefault = `{"default_ttl_minutes":5,"context_tiers":[{"max_tokens":2000,"ttl_minutes":5},{"max_tokens":8000,"ttl_minutes":30},{"max_tokens":32000,"ttl_minutes":180},{"max_tokens":128000,"ttl_minutes":1440}],"turn_tiers":[{"max_turns":2,"ttl_minutes":5},{"max_turns":10,"ttl_minutes":30},{"max_turns":50,"ttl_minutes":180},{"max_turns":200,"ttl_minutes":1440}]}`
-
-// HandleGetSessionConfig GET /api/v1/admin/configs/session
-func (h *Admin) HandleGetSessionConfig(w http.ResponseWriter, r *http.Request) {
-	raw, err := h.billing.GetConfig(r.Context(), "session.expiration")
+// readSessionExpirationRaw 读取会话过期配置原文，缺失回退内置默认。
+func (h *Admin) readSessionExpirationRaw(ctx context.Context) json.RawMessage {
+	raw, err := h.billing.GetConfig(ctx, "session.expiration")
 	if err != nil {
-		// 旧库未初始化时回退内置默认（与 HandleGetBillingConfig 的 routing.cost_sample 做法一致）。
-		raw = []byte(sessionExpirationDefault)
+		return json.RawMessage(sessionExpirationDefault)
 	}
-	resp.OK(w, r, map[string]json.RawMessage{"SessionExpiration": raw})
+	return json.RawMessage(raw)
 }
 
-// HandlePutSessionConfig PUT /api/v1/admin/configs/session
-func (h *Admin) HandlePutSessionConfig(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		SessionExpiration json.RawMessage `json:"SessionExpiration"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "请求体格式错误")
-		return
-	}
-	if err := validateSessionExpiration(req.SessionExpiration); err != nil {
-		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, err.Error())
-		return
-	}
-	operator, _ := h.userIDFrom(r.Context())
-	if err := h.billing.UpsertConfig(r.Context(), "session.expiration", req.SessionExpiration, operator); err != nil {
-		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "更新会话过期配置失败")
-		return
-	}
-	resp.OK(w, r, map[string]any{"Affected": 1})
-}
-
-// ===== 网关设置（全局上游响应头白名单）=====
-
-// HandleGetGatewayConfig GET /api/v1/admin/configs/gateway
-// 返回全局上游响应头白名单（默认空，零配置）。
-func (h *Admin) HandleGetGatewayConfig(w http.ResponseWriter, r *http.Request) {
+// readGatewayWhitelistRaw 读取全局上游响应头白名单原文，缺失回退空数组。
+func (h *Admin) readGatewayWhitelistRaw(ctx context.Context) json.RawMessage {
 	list := []string{}
-	raw, err := h.billing.GetConfig(r.Context(), gateway.UpstreamResponseHeaderWhitelistKey)
-	if err == nil {
+	if raw, err := h.billing.GetConfig(ctx, gateway.UpstreamResponseHeaderWhitelistKey); err == nil {
 		_ = json.Unmarshal(raw, &list)
 	}
 	if list == nil {
 		list = []string{}
 	}
-	resp.OK(w, r, map[string]any{"UpstreamResponseHeaderWhitelist": list})
+	b, _ := json.Marshal(list)
+	return json.RawMessage(b)
 }
 
-// HandlePutGatewayConfig PUT /api/v1/admin/configs/gateway
-func (h *Admin) HandlePutGatewayConfig(w http.ResponseWriter, r *http.Request) {
+// HandleGetSystemConfig GET /api/v1/admin/configs/system
+// 一次返回系统全部配置：计费 Billing、会话过期 SessionExpiration、上游响应头白名单。
+func (h *Admin) HandleGetSystemConfig(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	billingMap, err := h.readBillingConfigRaw(ctx)
+	if err != nil {
+		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "读取计费配置失败")
+		return
+	}
+	billingRaw, _ := json.Marshal(billingMap)
+	resp.OK(w, r, map[string]json.RawMessage{
+		"Billing":                         billingRaw,
+		"SessionExpiration":               h.readSessionExpirationRaw(ctx),
+		"UpstreamResponseHeaderWhitelist": h.readGatewayWhitelistRaw(ctx),
+	})
+}
+
+// HandlePutSystemConfig PUT /api/v1/admin/configs/system
+// 一次落库系统全部配置（计费 + 会话过期 + 上游响应头白名单）；入参三组全量，任一校验失败返回 400。
+func (h *Admin) HandlePutSystemConfig(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		UpstreamResponseHeaderWhitelist []string `json:"UpstreamResponseHeaderWhitelist"`
+		Billing struct {
+			R            json.RawMessage `json:"R"`
+			CnyRate      json.RawMessage `json:"CnyRate"`
+			ContextTiers json.RawMessage `json:"ContextTiers"`
+			TimeConfig   json.RawMessage `json:"TimeConfig"`
+			CostSample   json.RawMessage `json:"CostSample"`
+		} `json:"Billing"`
+		SessionExpiration               json.RawMessage `json:"SessionExpiration"`
+		UpstreamResponseHeaderWhitelist []string        `json:"UpstreamResponseHeaderWhitelist"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "请求体格式错误")
+		return
+	}
+	if !validR(req.Billing.R) {
+		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "r 必须是整数或数字字符串")
+		return
+	}
+	if len(req.Billing.CnyRate) > 0 && !validPositiveNumber(req.Billing.CnyRate) {
+		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "cny_rate 必须是正数或数字字符串")
+		return
+	}
+	if !isJSONArray(req.Billing.ContextTiers) {
+		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "context_tiers 必须是 JSON 数组")
+		return
+	}
+	if !isJSONObject(req.Billing.TimeConfig) {
+		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "time_config 必须是 JSON 对象")
+		return
+	}
+	if len(req.Billing.CostSample) > 0 && !validCostSample(req.Billing.CostSample) {
+		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "cost_sample 必须是各段非负的 JSON 对象")
+		return
+	}
+	if err := validateSessionExpiration(req.SessionExpiration); err != nil {
+		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, err.Error())
 		return
 	}
 	for _, name := range req.UpstreamResponseHeaderWhitelist {
@@ -694,12 +647,44 @@ func (h *Admin) HandlePutGatewayConfig(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if req.UpstreamResponseHeaderWhitelist == nil {
-		req.UpstreamResponseHeaderWhitelist = []string{}
+	whitelist := req.UpstreamResponseHeaderWhitelist
+	if whitelist == nil {
+		whitelist = []string{}
 	}
-	b, _ := json.Marshal(req.UpstreamResponseHeaderWhitelist)
+	whitelistRaw, _ := json.Marshal(whitelist)
+
 	operator, _ := h.userIDFrom(r.Context())
-	if err := h.billing.UpsertConfig(r.Context(), gateway.UpstreamResponseHeaderWhitelistKey, b, operator); err != nil {
+	ctx := r.Context()
+	// 依次落库三组配置；任一失败即返回明确失败项（同一请求内顺序写入，非单事务）。
+	if err := h.billing.UpsertConfig(ctx, "billing.r", req.Billing.R, operator); err != nil {
+		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "更新计费配置失败（billing.r）")
+		return
+	}
+	if len(req.Billing.CnyRate) > 0 {
+		if err := h.billing.UpsertConfig(ctx, "billing.cny_rate", req.Billing.CnyRate, operator); err != nil {
+			resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "更新计费配置失败（billing.cny_rate）")
+			return
+		}
+	}
+	if err := h.billing.UpsertConfig(ctx, "billing.context_tiers", req.Billing.ContextTiers, operator); err != nil {
+		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "更新计费配置失败（billing.context_tiers）")
+		return
+	}
+	if err := h.billing.UpsertConfig(ctx, "billing.time_config", req.Billing.TimeConfig, operator); err != nil {
+		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "更新计费配置失败（billing.time_config）")
+		return
+	}
+	if len(req.Billing.CostSample) > 0 {
+		if err := h.billing.UpsertConfig(ctx, "routing.cost_sample", req.Billing.CostSample, operator); err != nil {
+			resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "更新计费配置失败（routing.cost_sample）")
+			return
+		}
+	}
+	if err := h.billing.UpsertConfig(ctx, "session.expiration", req.SessionExpiration, operator); err != nil {
+		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "更新会话过期配置失败")
+		return
+	}
+	if err := h.billing.UpsertConfig(ctx, gateway.UpstreamResponseHeaderWhitelistKey, whitelistRaw, operator); err != nil {
 		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "更新网关设置失败")
 		return
 	}

@@ -35,7 +35,6 @@ type Model struct {
 type GatewayBlock struct {
 	BaseURL        string       `json:"baseUrl"`
 	Protocols      Protocols    `json:"protocols"`
-	Auth           AuthSpec     `json:"auth"`
 	RequestHeaders HeaderPolicy `json:"requestHeaders"`
 }
 
@@ -46,7 +45,6 @@ func (p Provider) toChannelProtocol() *ChannelProtocol {
 		Name:           p.Name,
 		BaseURL:        p.Gateway.BaseURL,
 		Protocols:      canonicalProtocols(p.Gateway.Protocols),
-		Auth:           p.Gateway.Auth,
 		RequestHeaders: normalizePolicy(p.Gateway.RequestHeaders),
 		PresetSourceID: p.ID,
 		Edited:         false,

@@ -4,7 +4,7 @@
 // 通过 emit('apply', partial) 抛出，由父组件合并到对应的五段费率。
 import { computed, ref } from 'vue'
 import { ElMessage } from 'element-plus'
-import { getBillingConfig, priceCatalog, runSync, type CatalogEntry } from '@/api/admin'
+import { getSystemConfig, priceCatalog, runSync, type CatalogEntry } from '@/api/admin'
 import { fmtDateTime } from '@/utils/format'
 
 const props = defineProps<{
@@ -71,10 +71,10 @@ async function openCatalog() {
   catOpen.value = true
   catQ.value = props.modelName || ''
   try {
-    const res = await getBillingConfig()
-    const v = Number(res.Data.R)
+    const res = await getSystemConfig()
+    const v = Number(res.Data.Billing.R)
     if (v > 0) catR.value = v
-    const c = Number(res.Data.CNYRate)
+    const c = Number(res.Data.Billing.CNYRate)
     if (c > 0) catCnyRate.value = c
   } catch {
     /* 保持默认 */

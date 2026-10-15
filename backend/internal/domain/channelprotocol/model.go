@@ -1,7 +1,8 @@
 // Package channelprotocol 承载「渠道协议」实体：由外挂预设包 provider 条目物化而来的
-// 接入模板（baseURL / protocols / auth / 特殊请求头 / 模型清单），独立于渠道存在，
+// 接入模板（baseURL / protocols / 特殊请求头 / 模型清单），独立于渠道存在，
 // 可被多个渠道引用；未引用时渠道走内联配置。
 //
+// 鉴权由基础协议隐含（ProtocolAuth），不在协议内单独配置。
 // 基础协议为代码固定的 3 个：openai-chat / openai-responses / anthropic-messages。
 package channelprotocol
 
@@ -60,11 +61,15 @@ func (p Protocols) Has(name string) bool {
 	return ok
 }
 
-// AuthSpec 凭据注入方式。
-type AuthSpec struct {
-	Header string            `json:"header,omitempty"` // Authorization | x-api-key | api-key
-	Scheme string            `json:"scheme,omitempty"` // bearer | raw
-	Query  map[string]string `json:"query,omitempty"`  // 需放 querystring 的鉴权/版本参数
+// ProtocolAuth 返回某基础协议隐含的鉴权注入方式（协议不同则不同；凭据由渠道密钥提供）：
+// openai-chat / openai-responses → Authorization: Bearer <凭据>；
+// anthropic-messages → x-api-key: <凭据>（原样）。
+// 若需协议以外的鉴权方式，用请求头策略的「覆盖(set)」显式写入（会覆盖此处注入）。
+func ProtocolAuth(protocol string) (header, scheme string) {
+	if Canonical(protocol) == ProtocolAnthropicMessages {
+		return "x-api-key", "raw"
+	}
+	return "Authorization", "bearer"
 }
 
 // HeaderPolicy 请求头策略（对齐 docs/preset-pack-format.md 6.3）。
@@ -95,7 +100,6 @@ type ChannelProtocol struct {
 	Name           string                  `json:"Name"`
 	BaseURL        string                  `json:"BaseURL"`
 	Protocols      Protocols               `json:"Protocols"`
-	Auth           AuthSpec                `json:"Auth"`
 	RequestHeaders HeaderPolicy            `json:"RequestHeaders"`
 	Models         map[string]ModelGateway `json:"Models"`
 	PresetSourceID string                  `json:"PresetSourceID"`

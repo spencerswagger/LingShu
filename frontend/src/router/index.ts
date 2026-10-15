@@ -27,12 +27,12 @@ const router = createRouter({
           component: () => import('@/views/StatsDashboard.vue'),
           meta: { title: '统计' },
         },
-        // 渠道
-        { path: 'channels', name: 'admin-channels', component: () => import('@/views/admin/ChannelList.vue'), meta: { title: '渠道' } },
+        // 渠道（列表内含「渠道 / 渠道协议」页内切换）
+        { path: 'channels', name: 'admin-channels', component: () => import('@/views/admin/ChannelsPage.vue'), meta: { title: '渠道' } },
         { path: 'channels/create', name: 'admin-channel-create', component: () => import('@/views/admin/ChannelCreate.vue'), meta: { title: '新建渠道' } },
         { path: 'channels/:id', name: 'admin-channel-edit', component: () => import('@/views/admin/ChannelEdit.vue'), meta: { title: '渠道' } },
-        // 渠道协议
-        { path: 'channel-protocols', name: 'admin-channel-protocols', component: () => import('@/views/admin/ChannelProtocolList.vue'), meta: { title: '渠道协议' } },
+        // 渠道协议（列表已并入「渠道」页内切换，这里仅保留新建/编辑子页）
+        { path: 'channel-protocols', redirect: '/admin/channels' },
         { path: 'channel-protocols/create', name: 'admin-channel-protocol-create', component: () => import('@/views/admin/ChannelProtocolEdit.vue'), meta: { title: '新建渠道协议' } },
         { path: 'channel-protocols/:id/edit', name: 'admin-channel-protocol-edit', component: () => import('@/views/admin/ChannelProtocolEdit.vue'), meta: { title: '编辑渠道协议' } },
         // 模型
@@ -55,10 +55,10 @@ const router = createRouter({
         // 账单
         { path: 'billings', name: 'admin-billings', component: () => import('@/views/admin/BillingQuery.vue'), meta: { title: '账单' } },
         { path: 'billings/:id', name: 'admin-billing-detail', component: () => import('@/views/admin/BillingDetail.vue'), meta: { title: '账单详情' } },
-        // 系统管理（系统级全局配置统一放这里）
-        { path: 'system', redirect: '/admin/system/config' },
-        { path: 'system/config', name: 'admin-system-config', component: () => import('@/views/admin/BillingConfig.vue'), meta: { title: '系统' } },
-        { path: 'system/gateway', name: 'admin-system-gateway', component: () => import('@/views/admin/GatewayConfig.vue'), meta: { title: '网关设置' } },
+        // 系统管理（系统级全局配置统一铺在这一页）
+        { path: 'system', name: 'admin-system', component: () => import('@/views/admin/BillingConfig.vue'), meta: { title: '系统' } },
+        { path: 'system/config', redirect: '/admin/system' },
+        { path: 'system/gateway', redirect: '/admin/system' },
         // 公告
         { path: 'announcements', name: 'admin-announcements', component: () => import('@/views/admin/AnnouncementList.vue'), meta: { title: '公告' } },
         { path: 'announcements/create', name: 'admin-announcement-create', component: () => import('@/views/admin/AnnouncementEdit.vue'), meta: { title: '新建公告' } },

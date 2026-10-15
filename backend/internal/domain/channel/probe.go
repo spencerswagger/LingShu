@@ -8,9 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"net/url"
 	"slices"
-	"sort"
 	"strings"
 	"time"
 
@@ -39,53 +37,23 @@ func effectiveProtocolPath(rt *RuntimeChannel, protocol, defaultPath string) str
 	return defaultPath
 }
 
-// effectiveProtocolAuth 求鉴权注入方式：渠道协议读取，内联渠道缺省 Authorization/Bearer。
-func effectiveProtocolAuth(rt *RuntimeChannel) channelprotocol.AuthSpec {
-	if rt.Protocol != nil {
-		return rt.Protocol.Auth
-	}
-	return channelprotocol.AuthSpec{Header: "Authorization", Scheme: "bearer"}
-}
-
-// renderAuth 把凭据按 AuthSpec 渲染为注入头名/头值与需追加的 query 参数（{api_key} 以凭据替换）。
-// 缺省 header=Authorization、scheme=bearer（与网关 injectAuth 语义一致）。
-func renderAuth(auth channelprotocol.AuthSpec, cred string) (header, value string, query [][2]string) {
-	header = strings.TrimSpace(auth.Header)
-	if header == "" {
-		header = "Authorization"
-	}
-	// 与网关 injectAuth 一致：无凭据不注入任何鉴权头/query（调用方据 value=="" 跳过设置）。
+// renderAuth 把凭据按基础协议隐含方式渲染为注入头名/头值。
+// 无凭据时返回空头值，由调用方跳过注入（与网关 injectProtocolAuth 语义一致）。
+func renderAuth(protocol, cred string) (header, value string) {
+	header, scheme := channelprotocol.ProtocolAuth(protocol)
 	if cred == "" {
-		return header, "", nil
+		return header, ""
 	}
-	scheme := strings.ToLower(strings.TrimSpace(auth.Scheme))
 	value = cred
-	if scheme == "" || scheme == "bearer" {
+	if scheme == "bearer" {
 		value = "Bearer " + cred
 	}
-	for k, v := range auth.Query {
-		query = append(query, [2]string{k, strings.ReplaceAll(v, "{api_key}", cred)})
-	}
-	sort.Slice(query, func(i, j int) bool { return query[i][0] < query[j][0] })
-	return header, value, query
+	return header, value
 }
 
-// joinProbeURL 拼基址与路径（去基址尾 /、路径头 /），并追加鉴权 query 参数。
-func joinProbeURL(base, path string, query [][2]string) string {
-	raw := strings.TrimRight(base, "/") + "/" + strings.TrimLeft(path, "/")
-	if len(query) == 0 {
-		return raw
-	}
-	u, err := url.Parse(raw)
-	if err != nil {
-		return raw
-	}
-	q := u.Query()
-	for _, kv := range query {
-		q.Set(kv[0], kv[1])
-	}
-	u.RawQuery = q.Encode()
-	return u.String()
+// joinProbeURL 拼基址与路径（去基址尾 /、路径头 /）。
+func joinProbeURL(base, path string) string {
+	return strings.TrimRight(base, "/") + "/" + strings.TrimLeft(path, "/")
 }
 
 // probeRequest 求一次探测的目标 URL 与鉴权头名/值：按渠道协议解析有效 baseURL/path/auth
@@ -93,13 +61,13 @@ func joinProbeURL(base, path string, query [][2]string) string {
 // 探测语义固定为 OpenAI 兼容的最小对话请求，故协议键取 openai-chat。
 func (m *Manager) probeRequest(ch *RuntimeChannel, cred string) (target, authHeader, authValue string) {
 	protocol := channelprotocol.ProtocolOpenAIChat
-	header, value, query := renderAuth(effectiveProtocolAuth(ch), cred)
+	header, value := renderAuth(protocol, cred)
 	base := effectiveProtocolBaseURL(ch, protocol)
 	if strings.TrimSpace(base) == "" {
 		return "", header, value
 	}
 	path := effectiveProtocolPath(ch, protocol, "/chat/completions")
-	return joinProbeURL(base, path, query), header, value
+	return joinProbeURL(base, path), header, value
 }
 
 // ProbeUsage 探测请求的 token 开销（供记账）。
