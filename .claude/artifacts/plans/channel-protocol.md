@@ -18,7 +18,7 @@
 - AC-1 OpenAI Chat 入站命中含 `openai-chat` 的渠道协议 → 上游 `<baseUrl>/chat/completions` 直通，响应原样回传。
 - AC-2 Anthropic 入站 `POST /v1/messages` → 上游协议 `path`，按 `auth` 注入鉴权。
 - AC-3 OpenAI Responses 入站 `POST /v1/responses` → 上游协议 `path`（默认 `/responses`）。
-- AC-4 入站协议 ∉ 模型可达 protocols → 返回**固定错误**，且**不发起上游请求**。
+- AC-4 入站协议 ∉ 模型可达 protocols → 返回**固定错误**（HTTP `400` + OpenAI 错误体，`type=unsupported_protocol`、`code=invalid_request_error`），且**不发起上游请求**。
 - AC-5 `passthroughMode=none` → 下游自定义头不上游。
 - AC-6 `whitelist=["x-opencode-session"]` → 仅该头透传。
 - AC-7 `blacklist=["x-foo"]` → 除 `x-foo` 与强制黑名单外透传。
@@ -208,4 +208,4 @@
 
 ## Open questions
 
-- AC-4 固定错误的具体 HTTP 状态码与 `resp` 编码取值：实现时按现有约定选定（默认倾向 `400` + `resp.CodeBadRequest`，或新增专用码）。
+（无待决项。AC-4 已定案：HTTP `400` + OpenAI 标准错误体，`type=unsupported_protocol`、`code=invalid_request_error`。）

@@ -77,7 +77,7 @@
 - AC-1 OpenAI Chat 入站：客户端 `POST /v1/chat/completions` 命中渠道协议（其 protocols 含 `openai-chat`）→ 上游收到 `<baseUrl>/chat/completions`，零转换，响应体原样回传。
 - AC-2 Anthropic 入站：客户端 `POST /v1/messages` 命中 protocols 含 `anthropic-messages` → 上游收到协议 `path`（默认 `/v1/messages`），鉴权按 `auth` 注入（`x-api-key` 或 `Authorization`）。
 - AC-3 OpenAI Responses 入站：客户端 `POST /v1/responses` 命中 protocols 含 `openai-responses` → 上游收到协议 `path`（默认 `/responses`）。
-- AC-4 直通未命中：入站协议 ∉ 模型可达 protocols → 返回固定错误（固定 HTTP 状态 + 固定错误码），且**不发起上游请求**。
+- AC-4 直通未命中：入站协议 ∉ 模型可达 protocols → 返回固定错误（HTTP `400` + OpenAI 标准错误体 `{"error":{...}}`，`type=unsupported_protocol`、`code=invalid_request_error`），且**不发起上游请求**。
 - AC-5 头策略 `none`：下游自定义头（如 `x-opencode-session`）**不出现**在上游请求中。
 - AC-6 头策略 `whitelist`：`whitelist=["x-opencode-session"]` → 该头原样出现在上游请求，其余下游头不出现。
 - AC-7 头策略 `blacklist`：`blacklist=["x-foo"]` → 除 `x-foo` 与强制黑名单外，其余下游头透传。
@@ -95,9 +95,7 @@
 
 ## Open questions
 
-（无阻塞项，状态为 ALIGNED。以下为可默认处理、实现时确认的细节）
-
-- AC-4 固定错误的具体 HTTP 状态码与错误码取值：实现时按现有错误规范选取。
+（无待决项。AC-4 错误形状已定案：HTTP `400` + OpenAI 标准错误体，`type=unsupported_protocol`、`code=invalid_request_error`；网关客户端链路用 OpenAI 形状，不复用管理端 `resp` 包编码。）
 
 ## Core entities (ontology)
 
