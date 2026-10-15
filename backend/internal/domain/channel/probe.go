@@ -293,7 +293,9 @@ func (m *Manager) probeOnce(ctx context.Context, keyID int64, probeModel, level 
 	}
 	chRT, ok := m.GetRuntime(kr.Channel.ID)
 	if !ok {
+		// 兜底：补齐渠道协议，避免协议渠道探测回落默认 Bearer 鉴权。
 		chRT = &RuntimeChannel{Channel: *kr.Channel}
+		chRT.Protocol = m.lookupChannelProtocol(ctx, kr.Channel.ChannelProtocolID)
 	}
 	target, authHeader, authValue := m.probeRequest(chRT, kr.CredentialPlain)
 

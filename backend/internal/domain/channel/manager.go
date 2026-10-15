@@ -477,11 +477,25 @@ func (m *Manager) SyncFromDB(ctx context.Context) error {
 			return fmt.Errorf("sync channel keys from db: %w", err)
 		}
 	}
+	// 锁外预解析渠道协议：避免持写锁做 DB 查询阻塞路由读锁（同一协议 ID 只查一次）。
+	protos := make(map[int64]*channelprotocol.ChannelProtocol)
+	for i := range chs {
+		id := chs[i].ChannelProtocolID
+		if id == nil || *id <= 0 {
+			continue
+		}
+		if _, ok := protos[*id]; ok {
+			continue
+		}
+		protos[*id] = m.lookupChannelProtocol(ctx, id)
+	}
 	m.mu.Lock()
 	for i := range chs {
 		ch := chs[i]
 		rt := m.buildRuntime(&ch)
-		rt.Protocol = m.lookupChannelProtocol(ctx, ch.ChannelProtocolID)
+		if ch.ChannelProtocolID != nil {
+			rt.Protocol = protos[*ch.ChannelProtocolID]
+		}
 		m.rt[ch.ID] = rt
 		if refs, rerr := m.store.ListTagRefsByChannel(ctx, ch.ID); rerr == nil {
 			m.boundTags[ch.ID] = refs
@@ -615,11 +629,13 @@ func (m *Manager) rebuildModelsLocked(channelID int64, models []ChannelModel) {
 // 同时重建该渠道全部 KeyRuntime（KeyStore.List）——密钥共享渠道配置，渠道更新后需以新配置刷新。
 // 渠道无独立状态，配置保存不影响各密钥/模型的内存权威状态（由 rebuildChannelKeysLocked 保留）。
 func (m *Manager) Upsert(ch *Channel) {
+	// 锁外解析渠道协议：避免持写锁做 DB 查询阻塞路由读锁。
+	proto := m.lookupChannelProtocol(context.Background(), ch.ChannelProtocolID)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	prev := m.rt[ch.ID]
 	rt := m.buildRuntime(ch)
-	rt.Protocol = m.lookupChannelProtocol(context.Background(), ch.ChannelProtocolID)
+	rt.Protocol = proto
 	if prev != nil {
 		rt.Channel.CreatedAt = prev.Channel.CreatedAt
 		rt.lastProbe = prev.lastProbe
