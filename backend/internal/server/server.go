@@ -11,6 +11,7 @@ import (
 	"github.com/team/llmgateway/internal/config"
 	"github.com/team/llmgateway/internal/domain/audit"
 	"github.com/team/llmgateway/internal/domain/channel"
+	"github.com/team/llmgateway/internal/domain/channelprotocol"
 	"github.com/team/llmgateway/internal/domain/console"
 	"github.com/team/llmgateway/internal/domain/identity"
 	"github.com/team/llmgateway/internal/domain/model"
@@ -29,6 +30,7 @@ type Deps struct {
 	TokenAdmin   *identity.TokenHandler
 	TokenDev     *identity.TokenHandler
 	Channel      *channel.Handler
+	ChannelProto *channelprotocol.Handler
 	Tag          *tag.Handler
 	Model        *model.Handler
 	Announcement *identity.AnnouncementHandler
@@ -123,6 +125,20 @@ func (s *Server) routes() {
 	admin.HandleFunc("GET /api/v1/admin/channels/cron-preview", d.Channel.HandleCronPreview)
 	admin.HandleFunc("PUT /api/v1/admin/channels/{id}/models/{mid}/state", d.Channel.HandleModelState)
 	admin.HandleFunc("GET /api/v1/admin/channels/snapshot", d.Console.HandleChannelSnapshot)
+
+	// 渠道协议（channel_protocols·可复用接入模板）
+	if d.ChannelProto != nil {
+		admin.HandleFunc("GET /api/v1/admin/channel-protocols", d.ChannelProto.HandleList)
+		admin.HandleFunc("POST /api/v1/admin/channel-protocols", d.ChannelProto.HandleCreate)
+		admin.HandleFunc("POST /api/v1/admin/channel-protocols/sync", d.ChannelProto.HandleSync)
+		admin.HandleFunc("GET /api/v1/admin/channel-protocols/{id}", d.ChannelProto.HandleGet)
+		admin.HandleFunc("PUT /api/v1/admin/channel-protocols/{id}", d.ChannelProto.HandleUpdate)
+		admin.HandleFunc("DELETE /api/v1/admin/channel-protocols/{id}", d.ChannelProto.HandleDelete)
+	}
+
+	// 网关设置（全局上游响应头白名单）
+	admin.HandleFunc("GET /api/v1/admin/configs/gateway", d.Console.HandleGetGatewayConfig)
+	admin.HandleFunc("PUT /api/v1/admin/configs/gateway", d.Console.HandlePutGatewayConfig)
 
 	// 渠道密钥（channel_keys 运行时实体）
 	admin.HandleFunc("GET /api/v1/admin/channels/{id}/keys", d.Channel.HandleListKeys)

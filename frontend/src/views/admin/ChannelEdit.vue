@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, reactive, ref, watch } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Edit, Delete } from '@element-plus/icons-vue'
@@ -19,6 +19,7 @@ import {
   probeChannelKey,
   cronPreview,
   listTags,
+  listChannelProtocols,
   type AdminChannel,
   type ChannelEvent,
   type ChannelModelEvent,
@@ -59,12 +60,14 @@ const form = reactive({
   name: '',
   protocol: 'openai-compat',
   base_url: '',
+  channel_protocol_id: '' as string, // 引用的渠道协议 ID；空=使用内联配置
   tag_ids: [] as string[],
   priority: 100,
   rpm: 0,
   tpm: 0,
   burst_multiplier: 1.2,
   on_exceed: 'QUEUE' as string,
+  queue_size: 100,
   queue_timeout_ms: 0,
   max_concurrent: 16,
   interval: '0 0 * * * *',
@@ -81,6 +84,9 @@ const form = reactive({
   auth_fail_threshold: 3,
 })
 
+// 是否引用渠道协议：选中时内联 protocol/base_url 由协议承载，禁用内联编辑与校验
+const usingProtocol = computed(() => !!form.channel_protocol_id)
+
 const stateLabel: Record<string, string> = { NORMAL: '正常', DRAIN: '排空', DISABLED: '禁用' }
 
 const tagOptions = ref<{ ID: string; Name: string }[]>([])
@@ -90,6 +96,17 @@ async function loadTags() {
     tagOptions.value = res.Data || []
   } catch {
     tagOptions.value = []
+  }
+}
+
+// 渠道协议下拉：选中后以内联配置为准（protocol/base_url 交由协议承载，内联字段禁用）
+const protocolOptions = ref<{ ID: string; Name: string }[]>([])
+async function loadProtocols() {
+  try {
+    const res = await listChannelProtocols()
+    protocolOptions.value = res.Data || []
+  } catch {
+    protocolOptions.value = []
   }
 }
 
@@ -192,12 +209,14 @@ async function load() {
     form.name = row.Name
     form.protocol = row.Protocol
     form.base_url = row.BaseURL
+    form.channel_protocol_id = row.ChannelProtocolID != null ? String(row.ChannelProtocolID) : ''
     form.tag_ids = row.TagIDs || []
     form.priority = row.Priority
     form.rpm = row.RateLimit?.RPM || 0
     setTpmDisplay(row.RateLimit?.TPM || 0)
     form.burst_multiplier = row.RateLimit?.BurstMultiplier || 1.2
     form.on_exceed = row.RateLimit?.OnExceed || 'QUEUE'
+    form.queue_size = row.RateLimit?.QueueSize ?? 100
     form.queue_timeout_ms = row.RateLimit?.QueueTimeoutMS || 0
     form.max_concurrent = row.RateLimit?.MaxConcurrent || 16
     form.interval = row.HealthProbe?.Interval || '0 0 * * * *'
@@ -215,6 +234,7 @@ async function load() {
     await loadStateData()
     await loadKeys()
     await loadTags()
+    await loadProtocols()
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
   } finally {
@@ -362,7 +382,8 @@ async function onToggleState(action: 'normal' | 'drain' | 'disable') {
 
 async function onSubmit() {
   if (!form.name.trim()) return ElMessage.warning('请填写渠道名称')
-  if (!/^https?:\/\//.test(form.base_url)) return ElMessage.warning('Base URL 必须以 http(s):// 开头')
+  if (!usingProtocol.value && !/^https?:\/\//.test(form.base_url))
+    return ElMessage.warning('Base URL 必须以 http(s):// 开头')
 
   saving.value = true
   errInfo.value = { message: '', requestId: '' }
@@ -371,6 +392,7 @@ async function onSubmit() {
       Name: form.name.trim(),
       Protocol: form.protocol,
       BaseURL: form.base_url.trim(),
+      ChannelProtocolID: form.channel_protocol_id || null,
       TagIDs: form.tag_ids,
       Priority: form.priority,
       RateLimit: {
@@ -378,7 +400,7 @@ async function onSubmit() {
         TPM: tpmRaw(),
         BurstMultiplier: Number(form.burst_multiplier),
         OnExceed: form.on_exceed,
-        QueueSize: 0,
+        QueueSize: Number(form.queue_size),
         QueueTimeoutMS: Number(form.queue_timeout_ms),
         MaxConcurrent: Number(form.max_concurrent),
       },
@@ -418,13 +440,23 @@ async function onSubmit() {
             <el-form-item label="名称" required>
               <el-input v-model="form.name" maxlength="64" />
             </el-form-item>
+            <el-form-item class="span-2" label="渠道协议">
+              <el-select v-model="form.channel_protocol_id" clearable style="width: 100%"
+                placeholder="不使用（内联配置）">
+                <el-option label="不使用（内联配置）" value="" />
+                <el-option v-for="p in protocolOptions" :key="p.ID" :label="p.Name" :value="p.ID" />
+              </el-select>
+              <div class="hint">选中后以渠道协议承载 protocol / base_url 等配置，下方内联字段将被禁用；不选则使用内联配置</div>
+            </el-form-item>
             <el-form-item label="协议">
-              <el-select v-model="form.protocol" style="width: 100%">
-                <el-option label="openai-compat" value="openai-compat" />
+              <el-select v-model="form.protocol" style="width: 100%" :disabled="usingProtocol">
+                <el-option label="openai-compat（OpenAI 兼容）" value="openai-compat" />
+                <el-option label="openai-responses" value="openai-responses" />
+                <el-option label="anthropic-messages" value="anthropic-messages" />
               </el-select>
             </el-form-item>
             <el-form-item class="span-2" label="Base URL">
-          <el-input v-model="form.base_url" />
+          <el-input v-model="form.base_url" :disabled="usingProtocol" />
           <div class="hint">上游供应商地址，网关请求将转发到该地址下的 /chat/completions 等路径</div>
         </el-form-item>
             <el-form-item class="span-2" label="标签">
