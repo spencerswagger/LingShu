@@ -28,11 +28,11 @@ type ChannelModel struct {
 	TimeConfig      *billing.TimeCoeffConfig
 	ContextTiers    []billing.TierRule
 	// Protocols 模型级可达协议子集：非空时收窄该模型可用的上游协议（覆盖渠道协议中同模型定义）。
-	Protocols   channelprotocol.Protocols
-	State       State
-	RateLimit   RateLimitConfig
-	HealthProbe HealthProbeConfig
-	Reliability ReliabilityConfig
+	Protocols    channelprotocol.Protocols
+	State        State
+	RateLimit    RateLimitConfig
+	HealthProbe  HealthProbeConfig
+	Reliability  ReliabilityConfig
 	ExternalName string // JOIN 展示用（对外模型名）
 	ChannelName  string // JOIN 展示用（所属渠道名，仅 ListAll 查询填充）
 	CreatedAt    time.Time

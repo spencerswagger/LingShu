@@ -17,13 +17,13 @@ import (
 
 func cmTestCols() []string {
 	return []string{"id", "channel_id", "internal_model_id", "external_model_id", "cost_rates",
-		"time_config", "context_tiers", "state", "rate_limit", "health_probe", "reliability",
+		"time_config", "context_tiers", "protocols", "state", "rate_limit", "health_probe", "reliability",
 		"created_at", "updated_at"}
 }
 
 func cmRow(m *ChannelModel, costJSON string) *sqlmock.Rows {
 	return sqlmock.NewRows(cmTestCols()).AddRow(m.ID, m.ChannelID, m.InternalModelID, m.ExternalModelID,
-		costJSON, nil, nil, string(m.State), `{}`, `{}`, `{}`, m.CreatedAt, m.UpdatedAt)
+		costJSON, nil, nil, nil, string(m.State), `{}`, `{}`, `{}`, m.CreatedAt, m.UpdatedAt)
 }
 
 func mockCMStore(t *testing.T) (*channelModelStore, sqlmock.Sqlmock) {
@@ -62,7 +62,7 @@ func TestChannelModelStore_ListByExternal(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(q)).
 		WithArgs(int64(2)).
 		WillReturnRows(cmRow(&ChannelModel{ID: 1, ChannelID: 1, InternalModelID: "qwen-max", ExternalModelID: 2, CreatedAt: now, UpdatedAt: now}, `{}`).
-			AddRow(2, 3, "qwen-plus", 2, `{}`, nil, nil, "NORMAL", `{}`, `{}`, `{}`, now, now))
+			AddRow(2, 3, "qwen-plus", 2, `{}`, nil, nil, nil, "NORMAL", `{}`, `{}`, `{}`, now, now))
 
 	list, err := s.ListByExternal(context.Background(), 2)
 	if err != nil {
@@ -73,14 +73,14 @@ func TestChannelModelStore_ListByExternal(t *testing.T) {
 	}
 }
 
-// cmJoinExtChannelRow 构造 JOIN 对外模型 + 渠道 的 15 列行（列顺序需与 cmColsJoinExtChannel / scanChannelModelJoinExtChannel 严格一致）。
+// cmJoinExtChannelRow 构造 JOIN 对外模型 + 渠道 的 16 列行（列顺序需与 cmColsJoinExtChannel / scanChannelModelJoinExtChannel 严格一致）。
 func cmJoinExtChannelRow(m *ChannelModel, costJSON string, timeJSON, tiersJSON any, externalName, channelName string) *sqlmock.Rows {
 	return sqlmock.NewRows([]string{
 		"id", "channel_id", "internal_model_id", "external_model_id", "cost_rates",
-		"time_config", "context_tiers", "state", "rate_limit", "health_probe", "reliability",
+		"time_config", "context_tiers", "protocols", "state", "rate_limit", "health_probe", "reliability",
 		"created_at", "updated_at", "external_name", "channel_name",
 	}).AddRow(m.ID, m.ChannelID, m.InternalModelID, m.ExternalModelID, costJSON,
-		timeJSON, tiersJSON, string(m.State), `{}`, `{}`, `{}`, m.CreatedAt, m.UpdatedAt,
+		timeJSON, tiersJSON, nil, string(m.State), `{}`, `{}`, `{}`, m.CreatedAt, m.UpdatedAt,
 		externalName, channelName)
 }
 
@@ -96,7 +96,7 @@ func TestChannelModelStore_ListAll(t *testing.T) {
 		&ChannelModel{ID: 1, ChannelID: 1, InternalModelID: "qwen-max", ExternalModelID: 2, State: StateNormal, CreatedAt: now, UpdatedAt: now},
 		`{"input":1}`, nil, nil, "qwen-max-ext", "阿里云",
 	).AddRow(2, 3, "qwen-plus", 5, `{}`,
-		`{"peak":1.5}`, `[{"threshold":1000,"coeff":0.9}]`, "NORMAL", `{}`, `{}`, `{}`, now, now, "qwen-plus-ext", "智谱")
+		`{"peak":1.5}`, `[{"threshold":1000,"coeff":0.9}]`, nil, "NORMAL", `{}`, `{}`, `{}`, now, now, "qwen-plus-ext", "智谱")
 	mock.ExpectQuery(regexp.QuoteMeta(q)).WillReturnRows(rows)
 
 	list, err := s.ListAll(context.Background())
@@ -126,8 +126,8 @@ func TestChannelModelStore_ListAll(t *testing.T) {
 func TestChannelModelStore_Insert_Conflict(t *testing.T) {
 	s, mock := mockCMStore(t)
 	rates := billing.Rates{"input": 0.8, "output": 1.6, "cache_read": 0.05, "cache_write": 0.2, "reasoning": 0.8}
-	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO channel_models(id, channel_id, internal_model_id, external_model_id, cost_rates, time_config, context_tiers, state, rate_limit, health_probe, reliability) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING `+cmCols)).
-		WithArgs(sqlmock.AnyArg(), int64(1), "qwen-max", int64(2), sqlmock.AnyArg(), nil, nil, "NORMAL", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO channel_models(id, channel_id, internal_model_id, external_model_id, cost_rates, time_config, context_tiers, protocols, state, rate_limit, health_probe, reliability) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING `+cmCols)).
+		WithArgs(sqlmock.AnyArg(), int64(1), "qwen-max", int64(2), sqlmock.AnyArg(), nil, nil, nil, "NORMAL", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnError(&pgconn.PgError{Code: "23505"})
 
 	_, err := s.Insert(context.Background(), &ChannelModel{

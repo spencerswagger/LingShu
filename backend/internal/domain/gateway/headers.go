@@ -12,15 +12,15 @@ import (
 // UpstreamRequest 是一次上游请求的构造上下文：把「基址 / 协议端点 / 凭据 / 请求体 /
 // 下游头 / 头策略 / 鉴权 / 变量」收敛为一个结构，供各基础协议适配器共享。
 type UpstreamRequest struct {
-	BaseURL          string                             // 有效上游基址（协议级 baseUrl 优先）
-	Path             string                             // 协议端点路径覆盖（空则用基础协议内置默认）
-	Cred             string                             // 渠道凭据（{api_key} 变量与 auth 注入来源）
-	Body             []byte                             // 已改写 model 的请求体
-	IsStream         bool                               // 是否流式
-	DownstreamHeader http.Header                        // 下游原始请求头（透传/变量取值来源）
-	HeaderPolicy     channelprotocol.HeaderPolicy       // 请求头策略
-	Auth             channelprotocol.AuthSpec           // 鉴权注入方式
-	Vars             map[string]string                  // 变量表：session_id / request_id / model
+	BaseURL          string                       // 有效上游基址（协议级 baseUrl 优先）
+	Path             string                       // 协议端点路径覆盖（空则用基础协议内置默认）
+	Cred             string                       // 渠道凭据（{api_key} 变量与 auth 注入来源）
+	Body             []byte                       // 已改写 model 的请求体
+	IsStream         bool                         // 是否流式
+	DownstreamHeader http.Header                  // 下游原始请求头（透传/变量取值来源）
+	HeaderPolicy     channelprotocol.HeaderPolicy // 请求头策略
+	Auth             channelprotocol.AuthSpec     // 鉴权注入方式
+	Vars             map[string]string            // 变量表：session_id / request_id / model
 }
 
 // forcedBlacklist 是内置强制黑名单（常量表，不入库、不可配置）：任何透传模式下都不上游。
@@ -46,14 +46,14 @@ var forcedBlacklist = map[string]bool{
 	"content-encoding": true,
 	"accept-encoding":  true,
 	// 安全 / 链路可信
-	"cookie":            true,
-	"expect":            true,
-	"via":               true,
-	"forwarded":         true,
-	"x-forwarded-for":   true,
-	"x-forwarded-proto": true,
-	"x-forwarded-host":  true,
-	"x-real-ip":         true,
+	"cookie":             true,
+	"expect":             true,
+	"via":                true,
+	"forwarded":          true,
+	"x-forwarded-for":    true,
+	"x-forwarded-proto":  true,
+	"x-forwarded-host":   true,
+	"x-real-ip":          true,
 	"x-current-password": true,
 	"anthropic-dangerous-direct-browser-access": true,
 	// 凭据（由 auth 注入）

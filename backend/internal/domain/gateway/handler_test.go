@@ -88,6 +88,7 @@ type fakeChannels struct {
 	mrt               *channel.ModelRuntime
 	keys              map[int64]*channel.KeyRuntime
 	feeds             []feedEntry
+	disabled          []int64
 	maxSessionsPerKey int // 覆盖默认 16（测试会话并发上限用）
 }
 
@@ -119,6 +120,11 @@ func (f *fakeChannels) KeyMaxSessions(int64) int {
 		return f.maxSessionsPerKey
 	}
 	return 16
+}
+
+// DisableChannel 记录 AC-17 触发的渠道禁用（usage 缺失/无法解析）。
+func (f *fakeChannels) DisableChannel(channelID int64) {
+	f.disabled = append(f.disabled, channelID)
 }
 
 // fakeSessionExpiry 可编程的会话过期 TTL fake（fn 为空时默认 60 分钟，保持既有测试时序余量）。
@@ -573,8 +579,9 @@ func TestServeStream(t *testing.T) {
 	assertChannelOpaque(t, rec)
 }
 
-// 场景 8：流式无边 result 头透传（顺带覆盖 stream_options/include_usage 之前的普通 data）。
-func TestServeStreamNoUsageEstimatesCompletion(t *testing.T) {
+// 场景 8（AC-17 严格执行）：流式响应无 usage 块（未开启 include_usage）→ 落 failed 账单 + 禁用渠道。
+// 内容已透传无法回改，故 HTTP 状态仍为 200，但该次调用计为失败并禁用渠道。
+func TestServeStreamNoUsageDisablesChannel(t *testing.T) {
 	streamBody := "data: {\"choices\":[{\"delta\":{\"content\":\"hello world\"}}]}\n\n" +
 		"data: [DONE]\n\n"
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -587,14 +594,13 @@ func TestServeStreamNoUsageEstimatesCompletion(t *testing.T) {
 	h := build(t, upstream.URL)
 	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t", `{"model":"gpt-4","stream":true}`)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("want 200, got %d", rec.Code)
+		t.Fatalf("want 200 (stream already responded), got %d", rec.Code)
 	}
-	if len(h.billing.reqs) != 1 {
-		t.Fatalf("billing called %d, want 1", len(h.billing.reqs))
+	if len(h.billing.reqs) != 1 || !h.billing.reqs[0].Fail {
+		t.Fatalf("usage 缺失应落 1 条 failed 账单, got %+v", h.billing.reqs)
 	}
-	// "hello world" = 11 chars * 0.25 = 2.75 → 2。
-	if out := h.billing.reqs[0].Tokens.Output; out != 2 {
-		t.Errorf("estimated output want 2, got %d", out)
+	if len(h.chans.disabled) != 1 || h.chans.disabled[0] != 1 {
+		t.Fatalf("usage 缺失应禁用渠道 1, got %+v", h.chans.disabled)
 	}
 }
 
@@ -1360,8 +1366,8 @@ func TestServeFailover_ConnectionError(t *testing.T) {
 	}
 }
 
-// 场景 F6：上游成功但未返回 usage（usageZero）→ 仍按输入估算记账，保证每次调用都消耗积分。
-func TestServeZeroUsageChargesEstimatedInput(t *testing.T) {
+// 场景 F6（AC-17 严格执行）：上游成功但未返回 usage → 该次调用报错（502）+ 渠道禁用 + 预扣退回。
+func TestServeZeroUsageRejectsAndDisablesChannel(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -1375,14 +1381,18 @@ func TestServeZeroUsageChargesEstimatedInput(t *testing.T) {
 
 	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t",
 		`{"model":"gpt-4","stream":false,"messages":[{"role":"user","content":"hello"}]}`)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("usage 缺失 want 502, got %d: %s", rec.Code, rec.Body.String())
 	}
-	if len(h.billing.reqs) != 1 {
-		t.Fatalf("zero-usage must still bill once, got %d records", len(h.billing.reqs))
+	if len(h.billing.reqs) != 1 || !h.billing.reqs[0].Fail {
+		t.Fatalf("usage 缺失应落 1 条 failed 账单, got %+v", h.billing.reqs)
 	}
-	if h.billing.reqs[0].Fail || h.billing.reqs[0].Tokens.Input <= 0 {
-		t.Fatalf("zero-usage billing want normal record with estimated input, got %+v", h.billing.reqs[0])
+	if len(h.chans.disabled) != 1 || h.chans.disabled[0] != 1 {
+		t.Fatalf("usage 缺失应禁用渠道 1, got %+v", h.chans.disabled)
+	}
+	// 未实际消费（按 failed 处理）→ 全额退回预扣。
+	if len(fc.refunded) != 1 {
+		t.Fatalf("usage 缺失应退回预扣, got refunded=%v", fc.refunded)
 	}
 }
 
@@ -1610,7 +1620,7 @@ func assertAttemptCostFields(t *testing.T, attempt map[string]any) {
 // 调用日志-2：流式成功——RespKind=stream、RespBody 为拼接的 assistant content（增量拼接）。
 func TestServeCallLog_StreamSuccess(t *testing.T) {
 	streamBody := "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n" +
-		"data: {\"choices\":[{\"delta\":{\"content\":\" there\"}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{\"content\":\" there\"}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n" +
 		"data: [DONE]\n\n"
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")

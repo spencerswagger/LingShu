@@ -349,7 +349,9 @@ type internalBinding struct {
 func (e *Engine) usableCandidates(internalByChannel map[int64][]internalBinding) []candidate {
 	cands := make([]candidate, 0, 16)
 	for _, v := range e.chMgr.Snapshot() {
-		if v.State == channel.StateDisabled || v.Protocol != channel.ProtocolOpenAICompat {
+		// 协议可用性由网关按「入站协议 ∈ 模型可达 protocols」判定（AC-4/AC-18）；
+		// 路由层只排除禁用渠道（渠道协议引用/内联协议的差异在网关解析）。
+		if v.State == channel.StateDisabled {
 			continue
 		}
 		binds, ok := internalByChannel[v.ID]

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/team/llmgateway/internal/domain/channelprotocol"
 	"github.com/team/llmgateway/internal/pkg/idgen"
 	"github.com/team/llmgateway/internal/pkg/resp"
 )
@@ -53,6 +54,8 @@ type ChannelInput struct {
 	RateLimit   *RateLimitConfig
 	HealthProbe *HealthProbeConfig
 	Reliability *ReliabilityConfig
+	// ChannelProtocolID 引用的渠道协议 ID（可空）；非空时以渠道协议为准，base_url/protocol 仅在覆盖时填写。
+	ChannelProtocolID *int64
 }
 
 // TagResolver 由 tag 域经装配层适配实现；channel 不直接依赖 tag 包。
@@ -63,10 +66,11 @@ type TagResolver interface {
 // Service 承载渠道 CRUD 业务逻辑（配置模板，不含凭据）。
 type Service struct {
 	store       *Store
-	cmStore     *channelModelStore // 渠道内部模型存储（双层模型）；装配时经 SetChannelModelStore 注入
-	keys        *KeyService        // 密钥服务：渠道级 ForceState 批量枚举/流转全部密钥；装配时经 SetKeyService 注入
-	mgr         *Manager           // 可选：装配时注入，用于动态态同步/内部模型手动状态流转
-	tagResolver TagResolver        // 可选：装配时注入，创建/更新渠道时解析并绑定标签
+	cmStore     *channelModelStore     // 渠道内部模型存储（双层模型）；装配时经 SetChannelModelStore 注入
+	keys        *KeyService            // 密钥服务：渠道级 ForceState 批量枚举/流转全部密钥；装配时经 SetKeyService 注入
+	mgr         *Manager               // 可选：装配时注入，用于动态态同步/内部模型手动状态流转
+	tagResolver TagResolver            // 可选：装配时注入，创建/更新渠道时解析并绑定标签
+	cpStore     *channelprotocol.Store // 可选：引用渠道协议时校验存在性
 }
 
 // NewService 创建渠道服务。
@@ -86,19 +90,40 @@ func (s *Service) SetKeyService(k *KeyService) { s.keys = k }
 // SetTagResolver 注入标签解析器。
 func (s *Service) SetTagResolver(r TagResolver) { s.tagResolver = r }
 
-// validateBase 校验 name/base_url/protocol 基础约束。
-func validateBase(name, baseURL, protocol string) error {
-	if name == "" {
+// SetChannelProtocolStore 注入渠道协议存储：引用渠道协议时校验其存在。
+func (s *Service) SetChannelProtocolStore(c *channelprotocol.Store) { s.cpStore = c }
+
+// validateBase 校验渠道基础约束：名称必填；引用渠道协议时 base_url/protocol 可省略，
+// 未引用时要求内联 base_url + 基础协议。
+func (s *Service) validateBase(in ChannelInput) error {
+	if in.Name == "" {
 		return errBadRequest("渠道名称不能为空")
 	}
-	if baseURL == "" {
+	if b := in.BaseURL; b != "" {
+		if !strings.HasPrefix(b, "http://") && !strings.HasPrefix(b, "https://") {
+			return errBadRequest("BaseURL 必须以 http:// 或 https:// 开头")
+		}
+	}
+	if in.ChannelProtocolID != nil && *in.ChannelProtocolID > 0 {
+		if s.cpStore != nil {
+			if _, err := s.cpStore.GetByID(context.Background(), *in.ChannelProtocolID); err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					return errBadRequest("引用的渠道协议不存在")
+				}
+				return fmt.Errorf("check channel protocol: %w", err)
+			}
+		}
+		return nil
+	}
+	// 内联配置：要求 base_url + 基础协议。
+	if in.BaseURL == "" {
 		return errBadRequest("渠道 BaseURL 不能为空")
 	}
-	if !strings.HasPrefix(baseURL, "http://") && !strings.HasPrefix(baseURL, "https://") {
-		return errBadRequest("BaseURL 必须以 http:// 或 https:// 开头")
+	if in.Protocol == "" {
+		return errBadRequest("渠道协议不能为空")
 	}
-	if protocol != ProtocolOpenAICompat {
-		return errBadRequest("协议目前仅支持 openai-compat")
+	if !channelprotocol.IsBaseProtocol(channelprotocol.Canonical(in.Protocol)) {
+		return errBadRequest("协议仅支持 openai-chat / openai-responses / anthropic-messages")
 	}
 	return nil
 }
@@ -126,7 +151,7 @@ func fillDefaults(c *Channel, in ChannelInput) {
 
 // CreateChannel 创建渠道：校验 + 唯一性 + 默认值。凭据由渠道密钥（channel_keys）承载，不在本层录入。
 func (s *Service) CreateChannel(ctx context.Context, in ChannelInput) (*Channel, error) {
-	if err := validateBase(in.Name, in.BaseURL, in.Protocol); err != nil {
+	if err := s.validateBase(in); err != nil {
 		return nil, err
 	}
 	// 名称唯一预检查（友好报错）；store 层 23505 兜底并发冲突。
@@ -146,9 +171,10 @@ func (s *Service) CreateChannel(ctx context.Context, in ChannelInput) (*Channel,
 	}
 
 	c := &Channel{
-		Name:     in.Name,
-		Protocol: in.Protocol,
-		BaseURL:  in.BaseURL,
+		Name:              in.Name,
+		Protocol:          in.Protocol,
+		BaseURL:           in.BaseURL,
+		ChannelProtocolID: in.ChannelProtocolID,
 	}
 	fillDefaults(c, in)
 
@@ -173,7 +199,7 @@ func (s *Service) CreateChannel(ctx context.Context, in ChannelInput) (*Channel,
 // UpdateChannel 更新渠道可写字段。
 // name 重复 → 40901；渠道不存在 → 40401。
 func (s *Service) UpdateChannel(ctx context.Context, id int64, in ChannelInput) (*Channel, error) {
-	if err := validateBase(in.Name, in.BaseURL, in.Protocol); err != nil {
+	if err := s.validateBase(in); err != nil {
 		return nil, err
 	}
 	existing, err := s.store.Get(ctx, id)
@@ -194,13 +220,14 @@ func (s *Service) UpdateChannel(ctx context.Context, id int64, in ChannelInput) 
 	}
 
 	c := &Channel{
-		ID:        id,
-		Name:      in.Name,
-		Protocol:  in.Protocol,
-		BaseURL:   in.BaseURL,
-		Tags:      existing.Tags,  // tags 列保持不变，不再从 input 设置
-		State:     existing.State, // 状态由状态机/手动操作管理，CRUD 不改变
-		CreatedAt: existing.CreatedAt,
+		ID:                id,
+		Name:              in.Name,
+		Protocol:          in.Protocol,
+		BaseURL:           in.BaseURL,
+		ChannelProtocolID: in.ChannelProtocolID,
+		Tags:              existing.Tags,  // tags 列保持不变，不再从 input 设置
+		State:             existing.State, // 状态由状态机/手动操作管理，CRUD 不改变
+		CreatedAt:         existing.CreatedAt,
 	}
 	c.RateLimit = existing.RateLimit
 	c.HealthProbe = existing.HealthProbe
