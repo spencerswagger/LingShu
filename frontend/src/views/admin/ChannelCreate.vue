@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { reactive, ref, watch } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { createChannel, cronPreview, listTags } from '@/api/admin'
+import { createChannel, cronPreview, listTags, listChannelProtocols } from '@/api/admin'
 import CronInput from '@/components/CronInput.vue'
 import ErrorBubble from '@/components/ErrorBubble.vue'
 
@@ -21,6 +21,18 @@ async function loadTags() {
   }
 }
 loadTags()
+
+// 渠道协议下拉：选中后以内联配置为准（protocol/base_url 交由协议承载，内联字段禁用）
+const protocolOptions = ref<{ ID: string; Name: string }[]>([])
+async function loadProtocols() {
+  try {
+    const res = await listChannelProtocols()
+    protocolOptions.value = res.Data || []
+  } catch {
+    protocolOptions.value = []
+  }
+}
+loadProtocols()
 
 // TPM 单位切换：后端仍保存原始 token 数，仅前端以 百万/K/无 展示辅助录入
 // 注意：el-select 的 @change 触发时 v-model 已更新为新单位，须用 tpmPrevUnit 记录切换前单位换算
@@ -41,6 +53,7 @@ const form = reactive({
   name: '',
   protocol: 'openai-compat',
   base_url: '',
+  channel_protocol_id: '' as string, // 引用的渠道协议 ID；空=使用内联配置
   tag_ids: [] as string[],
   priority: 100,
   rpm: 1000,
@@ -62,6 +75,9 @@ const form = reactive({
   p99_latency_ms: 120,
   auth_fail_threshold: 3,
 })
+
+// 是否引用渠道协议：选中时内联 protocol/base_url 由协议承载，禁用内联编辑与校验
+const usingProtocol = computed(() => !!form.channel_protocol_id)
 
 // 正常态 cron 后续执行时间预览（防写错）
 const cronFutures = ref<string[]>([])
@@ -86,7 +102,8 @@ watch(() => form.interval, refreshCronPreview, { immediate: true })
 
 async function onSubmit() {
   if (!form.name.trim()) return ElMessage.warning('请填写渠道名称')
-  if (!/^https?:\/\//.test(form.base_url)) return ElMessage.warning('Base URL 必须以 http(s):// 开头')
+  if (!usingProtocol.value && !/^https?:\/\//.test(form.base_url))
+    return ElMessage.warning('Base URL 必须以 http(s):// 开头')
 
   saving.value = true
   errInfo.value = { message: '', requestId: '' }
@@ -95,6 +112,7 @@ async function onSubmit() {
       Name: form.name.trim(),
       Protocol: form.protocol,
       BaseURL: form.base_url.trim(),
+      ChannelProtocolID: form.channel_protocol_id || null,
       TagIDs: form.tag_ids,
       Priority: form.priority,
       RateLimit: {
@@ -142,13 +160,21 @@ async function onSubmit() {
             <el-form-item label="名称" required>
               <el-input v-model="form.name" placeholder="如 主渠道-DeepSeek" maxlength="64" />
             </el-form-item>
+            <el-form-item class="span-2" label="渠道协议">
+              <el-select v-model="form.channel_protocol_id" clearable style="width: 100%"
+                placeholder="不使用（内联配置）">
+                <el-option label="不使用（内联配置）" value="" />
+                <el-option v-for="p in protocolOptions" :key="p.ID" :label="p.Name" :value="p.ID" />
+              </el-select>
+              <div class="hint">选中后以渠道协议承载 protocol / base_url 等配置，下方内联字段将被禁用</div>
+            </el-form-item>
             <el-form-item label="协议">
-              <el-select v-model="form.protocol" style="width: 100%">
+              <el-select v-model="form.protocol" style="width: 100%" :disabled="usingProtocol">
                 <el-option label="openai-compat" value="openai-compat" />
               </el-select>
             </el-form-item>
             <el-form-item class="span-2" label="Base URL">
-          <el-input v-model="form.base_url" placeholder="https://api.example.com/v1" />
+          <el-input v-model="form.base_url" :disabled="usingProtocol" placeholder="https://api.example.com/v1" />
           <div class="hint">上游供应商地址，网关请求将转发到该地址下的 /chat/completions 等路径</div>
         </el-form-item>
             <el-form-item class="span-2" label="标签">
