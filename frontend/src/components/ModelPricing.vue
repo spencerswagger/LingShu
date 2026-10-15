@@ -8,7 +8,7 @@
 // 「配置模型级」开关：关闭时 TimeConfig / ContextTiers 置 null，运行时回落全局兜底。
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { Plus, Delete, QuestionFilled } from '@element-plus/icons-vue'
-import { getBillingConfig, rateKeys, rateLabels, rateHints, type ContextTier, type Segment, type DateOverride } from '@/api/admin'
+import { getSystemConfig, rateKeys, rateLabels, rateHints, type ContextTier, type Segment, type DateOverride } from '@/api/admin'
 
 const props = defineProps<{
   // 完整定价对象（含 showRatesKey 指定的费率键 + time_config + context_tiers）
@@ -31,8 +31,8 @@ onMounted(async () => {
     return
   }
   try {
-    const res = await getBillingConfig()
-    const v = Number(res.Data.R)
+    const res = await getSystemConfig()
+    const v = Number(res.Data.Billing.R)
     if (v > 0) r.value = v
   } catch {
     /* 保持默认 */

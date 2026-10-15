@@ -482,7 +482,7 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 			return
 		}
 
-		// 上游请求构造上下文：有效基址（协议级优先）/ 协议路径覆盖 / 头策略 / 鉴权 / 变量。
+		// 上游请求构造上下文：有效基址（协议级优先）/ 协议路径覆盖 / 头策略 / 入站协议 / 变量。
 		ureq := UpstreamRequest{
 			BaseURL:          effectiveBaseURL(rt, baseProtocol),
 			Path:             eff[baseProtocol].Path,
@@ -490,7 +490,7 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 			Body:             rewritten,
 			DownstreamHeader: r.Header,
 			HeaderPolicy:     effectiveHeaderPolicy(rt),
-			Auth:             effectiveAuth(rt),
+			Protocol:         baseProtocol,
 			Vars: map[string]string{
 				"session_id": sessionID,
 				"request_id": logger.GetRequestID(ctx),

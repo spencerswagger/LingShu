@@ -90,7 +90,6 @@
 |---|---|---|
 | `baseUrl` | string | 默认上游 base URL |
 | `protocols` | object | 该 provider **原生支持的上游基础协议集合**；键即协议名（`openai-chat` / `openai-responses` / `anthropic-messages`），键存在 = 支持。见下方说明。 |
-| `auth` | object | 凭据注入方式，见 6.2 |
 | `requestHeaders` | object | 特殊制式请求头，见 6.3 |
 
 `protocols` 每一项可带：
@@ -111,15 +110,16 @@
 
 网关按**客户端入站协议**与该集合求交：命中即直通（零转换）；未命中则一期返回固定错误、二期再按 `default` 目标做转换。
 
-### 6.2 `auth`
+### 6.2 鉴权（由基础协议隐含，无需配置）
 
-```jsonc
-"auth": {
-  "header": "Authorization",                       // Authorization | x-api-key | api-key
-  "scheme": "bearer",                              // bearer | raw（原样注入）
-  "query": { "api-version": "2025-04-01-preview" } // 需放 querystring 的鉴权 / 版本参数（如 Azure）
-}
-```
+鉴权**不**在预设包中配置：各基础协议隐含各自的凭据注入方式，凭据来自渠道密钥（`channel_keys`）。
+
+| 基础协议 | 注入方式 |
+|---|---|
+| `openai-chat` / `openai-responses` | `Authorization: Bearer <凭据>` |
+| `anthropic-messages` | `x-api-key: <凭据>`（原样） |
+
+若需协议以外的鉴权方式，用 `requestHeaders.set` 显式写入（`set` 在协议隐含注入**之后**应用，会覆盖它）。
 
 ### 6.3 `requestHeaders`
 
@@ -133,7 +133,7 @@
 ```
 
 - 变量见第 8 节。
-- **鉴权头由 `auth` 注入**，不进入用户可编辑的 `set`（防止误配把渠道凭据冲掉）。
+- **鉴权由基础协议隐含注入**（见 6.2）；`set` 在其之后应用，因此可显式覆盖鉴权头（用于协议以外的方式）。
 - 合并类头（如 `anthropic-beta`：客户端值 + 平台追加值需合并）由**基础协议适配器**处理，不靠 `set` 表达（`set` 是覆盖语义）。
 
 **内置强制黑名单（任何模式下都不透传）**：
@@ -143,7 +143,7 @@
 | hop-by-hop（RFC 7230 §6.1） | `Connection` `Keep-Alive` `TE` `Trailer` `Transfer-Encoding` `Upgrade` `Proxy-Connection` `Proxy-Authorization` |
 | 由 URL / body 重新生成（下游值必须丢弃） | `Host`、HTTP/2 伪头 `:authority` `:method` `:scheme` `:path`、`Content-Length`、`Content-Type`、`Content-Encoding`、`Accept-Encoding` |
 | 安全 / 链路可信 | `Cookie` `Expect` `Via` `Forwarded` `X-Forwarded-For` `X-Forwarded-Proto` `X-Forwarded-Host` `X-Real-IP` `X-Current-Password` `anthropic-dangerous-direct-browser-access` |
-| 凭据（由 `auth` 注入） | `Authorization` `x-api-key` `Proxy-Authorization` |
+| 凭据（由基础协议隐含注入；透传恒禁止，`set` 可显式覆盖） | `Authorization` `x-api-key` `Proxy-Authorization` |
 
 > `Accept-Encoding` 必须挡：Go `net/http` Transport 会自动补 `gzip` 并透明解压，透传下游的 `br` / `zstd` 会与之冲突，导致 SSE 字节与 token 口径不一致。
 
@@ -231,7 +231,6 @@
       "anthropic-messages": { "path": "/messages" },
       "openai-responses":   { "path": "/responses" }
     },
-    "auth": { "header": "Authorization", "scheme": "bearer" },
     "requestHeaders": {
       "passthroughMode": "whitelist",
       "whitelist": ["x-opencode-session"]

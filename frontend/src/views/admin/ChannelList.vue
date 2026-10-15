@@ -151,6 +151,7 @@ function onRowClick(row: AdminChannel, _column: unknown, event: Event) {
 <template>
   <div class="page-container">
     <div class="page-header">
+      <slot name="header-left" />
       <div class="page-title">渠道</div>
       <span class="page-count">{{ list.length }} 个渠道</span>
       <div class="page-header-spacer" />

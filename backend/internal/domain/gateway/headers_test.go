@@ -8,16 +8,19 @@ import (
 	"github.com/team/llmgateway/internal/domain/channelprotocol"
 )
 
-// buildReq 用给定头策略构建上游请求，便于断言最终上游头集合。
-func buildReq(t *testing.T, downstream http.Header, policy channelprotocol.HeaderPolicy, auth channelprotocol.AuthSpec, cred string, vars map[string]string) *http.Request {
+// buildReq 用给定头策略构建上游请求，便于断言最终上游头集合；protocol 为空时按 openai-chat。
+func buildReq(t *testing.T, downstream http.Header, policy channelprotocol.HeaderPolicy, protocol, cred string, vars map[string]string) *http.Request {
 	t.Helper()
+	if protocol == "" {
+		protocol = channelprotocol.ProtocolOpenAIChat
+	}
 	req, err := buildUpstreamRequest(context.Background(), UpstreamRequest{
 		BaseURL:          "https://up.example.com",
 		Cred:             cred,
 		Body:             []byte(`{}`),
 		DownstreamHeader: downstream,
 		HeaderPolicy:     policy,
-		Auth:             auth,
+		Protocol:         protocol,
 		Vars:             vars,
 	}, "/chat/completions", "application/json")
 	if err != nil {
@@ -33,7 +36,7 @@ func TestHeaderPolicy_None(t *testing.T) {
 	down.Set("X-Custom", "v")
 
 	req := buildReq(t, down, channelprotocol.HeaderPolicy{PassthroughMode: channelprotocol.PassthroughNone},
-		channelprotocol.AuthSpec{}, "sk", nil)
+		"", "sk", nil)
 	if got := req.Header.Get("x-opencode-session"); got != "" {
 		t.Errorf("none 模式不应透传下游头，got %q", got)
 	}
@@ -51,7 +54,7 @@ func TestHeaderPolicy_Whitelist(t *testing.T) {
 	req := buildReq(t, down, channelprotocol.HeaderPolicy{
 		PassthroughMode: channelprotocol.PassthroughWhitelist,
 		Whitelist:       []string{"x-opencode-session"},
-	}, channelprotocol.AuthSpec{}, "sk", nil)
+	}, "", "sk", nil)
 	if got := req.Header.Get("x-opencode-session"); got != "sess-123" {
 		t.Errorf("whitelist 应放行 x-opencode-session，got %q", got)
 	}
@@ -69,7 +72,7 @@ func TestHeaderPolicy_Blacklist(t *testing.T) {
 	req := buildReq(t, down, channelprotocol.HeaderPolicy{
 		PassthroughMode: channelprotocol.PassthroughBlacklist,
 		Blacklist:       []string{"x-foo"},
-	}, channelprotocol.AuthSpec{}, "sk", nil)
+	}, "", "sk", nil)
 	if got := req.Header.Get("x-foo"); got != "" {
 		t.Errorf("blacklist 应排除 x-foo，got %q", got)
 	}
@@ -87,18 +90,22 @@ func TestHeaderPolicy_ForcedBlacklist(t *testing.T) {
 	down.Set("X-Keep", "ok")
 
 	req := buildReq(t, down, channelprotocol.HeaderPolicy{PassthroughMode: channelprotocol.PassthroughAll},
-		channelprotocol.AuthSpec{}, "sk", nil)
+		"", "sk", nil)
 	for _, h := range []string{"Cookie", "Accept-Encoding", "Connection", "Host", "X-Forwarded-For"} {
 		if got := req.Header.Get(h); got != "" {
 			t.Errorf("强制黑名单头 %s 不应上游，got %q", h, got)
 		}
+	}
+	// 下游 Authorization 属凭据头，透传恒禁止；上游看到的必为协议隐含注入值。
+	if got := req.Header.Get("Authorization"); got != "Bearer sk" {
+		t.Errorf("下游 Authorization 不应透传，应为协议注入值，got %q", got)
 	}
 	if got := req.Header.Get("X-Keep"); got != "ok" {
 		t.Errorf("all 模式应透传非黑名单头 X-Keep，got %q", got)
 	}
 }
 
-// AC-9：set 变量替换（api_key/session_id/model/client_header），且鉴权头不出现在用户 set 生效面。
+// set 变量替换（api_key/session_id/model/client_header）与「覆盖(set)」对鉴权头的显式覆盖。
 func TestHeaderPolicy_SetVariables(t *testing.T) {
 	down := http.Header{}
 	down.Set("x-down", "from-client")
@@ -110,9 +117,8 @@ func TestHeaderPolicy_SetVariables(t *testing.T) {
 			"X-Sess":        "{session_id}",
 			"X-Model":       "{model}",
 			"X-From":        "{client_header:x-down}",
-			"Authorization": "user-tried-to-override",
 		},
-	}, channelprotocol.AuthSpec{}, "sk-secret", map[string]string{
+	}, "", "sk-secret", map[string]string{
 		"session_id": "sess-1", "request_id": "req-1", "model": "gpt-4",
 	})
 	if got := req.Header.Get("X-Api-Key-Var"); got != "sk-secret" {
@@ -127,24 +133,20 @@ func TestHeaderPolicy_SetVariables(t *testing.T) {
 	if got := req.Header.Get("X-From"); got != "from-client" {
 		t.Errorf("{client_header:x-down} 替换错误，got %q", got)
 	}
-	// 鉴权头不经由 set 注入（由 auth 注入）：set 中的 Authorization 被跳过，以 auth 注入值为准。
-	if got := req.Header.Get("Authorization"); got != "Bearer sk-secret" {
-		t.Errorf("鉴权头应以 auth 注入值为准（忽略 set）, got %q", got)
-	}
 }
 
-// set 无法覆盖 auth 注入的鉴权头（AuthSpec 配置 Authorization 时以 auth 值为准）。
-func TestHeaderPolicy_SetCannotOverrideAuth(t *testing.T) {
+// 「覆盖(set)」在协议隐含鉴权之后应用，可覆盖鉴权头（显式意图优先）。
+func TestHeaderPolicy_SetOverridesProtocolAuth(t *testing.T) {
 	req := buildReq(t, http.Header{}, channelprotocol.HeaderPolicy{
 		PassthroughMode: channelprotocol.PassthroughNone,
-		Set:             map[string]string{"Authorization": "user-tried-to-override"},
-	}, channelprotocol.AuthSpec{Header: "Authorization", Scheme: "bearer"}, "sk-secret", nil)
-	if got := req.Header.Get("Authorization"); got != "Bearer sk-secret" {
-		t.Errorf("鉴权头应以 auth 注入值为准, got %q", got)
+		Set:             map[string]string{"Authorization": "Token custom-override"},
+	}, channelprotocol.ProtocolOpenAIChat, "sk-secret", nil)
+	if got := req.Header.Get("Authorization"); got != "Token custom-override" {
+		t.Errorf("set 应覆盖协议隐含鉴权，got %q", got)
 	}
 }
 
-// AC-8：set 同样受强制黑名单约束，任何模式下都不能把 Cookie/Host/Content-Length 等注入上游。
+// AC-8：set 同样受非凭据类强制黑名单约束，任何模式下都不能把 Cookie/Host/Content-Length 等注入上游。
 func TestHeaderPolicy_SetCannotInjectForcedBlacklist(t *testing.T) {
 	req := buildReq(t, http.Header{}, channelprotocol.HeaderPolicy{
 		PassthroughMode: channelprotocol.PassthroughAll,
@@ -155,7 +157,7 @@ func TestHeaderPolicy_SetCannotInjectForcedBlacklist(t *testing.T) {
 			"X-Forwarded-For": "1.2.3.4",
 			"X-Ok":            "kept",
 		},
-	}, channelprotocol.AuthSpec{}, "sk", nil)
+	}, "", "sk", nil)
 	for _, h := range []string{"Cookie", "Host", "Content-Length", "X-Forwarded-For"} {
 		if got := req.Header.Get(h); got != "" {
 			t.Errorf("set 注入的强制黑名单头 %s 不应上游, got %q", h, got)
@@ -166,24 +168,33 @@ func TestHeaderPolicy_SetCannotInjectForcedBlacklist(t *testing.T) {
 	}
 }
 
-// 鉴权注入：默认 Authorization: Bearer；x-api-key 走 raw；query 参数注入。
-func TestInjectAuth(t *testing.T) {
+// 协议隐含鉴权：openai-chat/openai-responses → Authorization: Bearer；anthropic-messages → x-api-key（原样）。
+func TestInjectProtocolAuth(t *testing.T) {
 	req := buildReq(t, http.Header{}, channelprotocol.HeaderPolicy{},
-		channelprotocol.AuthSpec{Header: "Authorization", Scheme: "bearer"}, "sk-abc", nil)
+		channelprotocol.ProtocolOpenAIChat, "sk-abc", nil)
 	if got := req.Header.Get("Authorization"); got != "Bearer sk-abc" {
-		t.Errorf("bearer 注入错误，got %q", got)
+		t.Errorf("openai-chat 应注入 Authorization Bearer，got %q", got)
 	}
 
 	req = buildReq(t, http.Header{}, channelprotocol.HeaderPolicy{},
-		channelprotocol.AuthSpec{Header: "x-api-key", Scheme: "raw"}, "sk-raw", nil)
+		channelprotocol.ProtocolOpenAIResponses, "sk-resp", nil)
+	if got := req.Header.Get("Authorization"); got != "Bearer sk-resp" {
+		t.Errorf("openai-responses 应注入 Authorization Bearer，got %q", got)
+	}
+
+	req = buildReq(t, http.Header{}, channelprotocol.HeaderPolicy{},
+		channelprotocol.ProtocolAnthropicMessages, "sk-raw", nil)
 	if got := req.Header.Get("x-api-key"); got != "sk-raw" {
-		t.Errorf("raw x-api-key 注入错误，got %q", got)
+		t.Errorf("anthropic-messages 应注入 x-api-key 原样凭据，got %q", got)
+	}
+	if got := req.Header.Get("Authorization"); got != "" {
+		t.Errorf("anthropic-messages 不应注入 Authorization，got %q", got)
 	}
 
+	// 无凭据不注入。
 	req = buildReq(t, http.Header{}, channelprotocol.HeaderPolicy{},
-		channelprotocol.AuthSpec{Header: "Authorization", Scheme: "bearer",
-			Query: map[string]string{"api-version": "2025-04-01-preview"}}, "sk-q", nil)
-	if got := req.URL.Query().Get("api-version"); got != "2025-04-01-preview" {
-		t.Errorf("query 鉴权参数注入错误，got %q", got)
+		channelprotocol.ProtocolOpenAIChat, "", nil)
+	if got := req.Header.Get("Authorization"); got != "" {
+		t.Errorf("无凭据不应注入鉴权头，got %q", got)
 	}
 }
