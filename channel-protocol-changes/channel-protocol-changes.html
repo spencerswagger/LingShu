@@ -249,21 +249,24 @@ flowchart TD
 flowchart TD
   P["预设配置站点<br/>地址硬编码 · 规则见 preset-pack-format.md"] --> S["首次启动（初始化）拉取一次"]
   S --> M["把 provider 条目物化为渠道协议<br/>baseUrl · protocols · auth · requestHeaders · 模型快照"]
-  M --> DB[("channel_protocols 表")]
-  T["后续更新<br/>管理员在前端页面点击按钮触发"] --> Q{"该条目已标记「有更新」？"}
+  M --> DB[("channel_protocols 表<br/>每条带标记「同步」/「已编辑」")]
+  T["管理员在前端页面点击「同步」按钮"] --> Q{"该条目状态？"}
   DB --> Q
-  Q -- 否 --> U["直接更新"]
-  Q -- 是 --> W["人工确认后再更新"]
+  Q -- 未编辑 --> U["标记「同步」· 直接覆盖更新"]
+  Q -- 已编辑 --> D["标记「已编辑」· 展示与预设的差异"]
+  D --> C["二次确认后覆盖 / 放弃"]
+  DB -. 预设条目被删除或改名 .-> K["保留渠道协议 · 标记「来源已失效」"]
       </pre>
-      <figcaption>图 2：首次启动拉取入库；后续更新由管理员手动触发，按标记分流</figcaption>
+      <figcaption>图 2：首次启动拉取入库；后续由管理员手动触发，按「同步 / 已编辑」分流</figcaption>
     </figure>
     <div class="callout">
       <h4>同步语义</h4>
       <p>
         <b>自动拉取只在首次启动（初始化）时发生一次</b>，把预设灌进渠道协议表；之后<b>不再</b>每次启动都拉。
-        后续要同步预设更新，需管理员在前端页面<b>点击按钮</b>触发；此时按标记分流：
-        <mark class="key">已标记「有更新」（本地被编辑过）的条目 → 人工确认后再更新</mark>；
-        <mark class="key">其余 → 直接更新</mark>。
+        后续同步需管理员在前端页面<b>点击按钮</b>触发，此时按条目状态分流：
+        <mark class="key">未编辑（标记「同步」）→ 直接覆盖更新</mark>；
+        <mark class="key">已编辑（标记「已编辑」）→ 先展示与预设的差异，二次确认后才覆盖（可放弃）</mark>。
+        预设条目被<b>删除 / 改名</b>时<b>不级联删除</b>渠道协议，而是<b>保留并标记「来源已失效」</b>。
       </p>
     </div>
   </section>
@@ -347,7 +350,7 @@ erDiagram
           <tr><td class="file">id</td><td>string</td><td>渠道协议主键</td><td>生成</td></tr>
           <tr><td class="file">name</td><td>string</td><td>展示名</td><td>预设 <code>name</code></td></tr>
           <tr><td class="file">preset_source_id</td><td>string | null</td><td>来源预设站点的条目 ID，用于同步比对</td><td>预设 <code>id</code></td></tr>
-          <tr><td class="file">edited</td><td>bool</td><td>本地是否被改过；置真后该条目在后续预设更新时需人工确认</td><td>本地标记</td></tr>
+          <tr><td class="file">edited</td><td>bool</td><td>本地是否被改过：false 显示标记「同步」，true 显示「已编辑」；已编辑的条目同步时需展示差异并二次确认</td><td>本地标记</td></tr>
           <tr><td class="file">base_url</td><td>string</td><td>默认上游 BaseURL；渠道可覆盖</td><td>预设 <code>gateway.baseUrl</code></td></tr>
           <tr><td class="file">protocols</td><td>jsonb</td><td>协议映射，键 ∈ {<code>openai-chat</code>, <code>openai-responses</code>, <code>anthropic-messages</code>}，值可含 <code>baseUrl</code>/<code>path</code>/<code>default</code></td><td>预设 <code>gateway.protocols</code></td></tr>
           <tr><td class="file">auth</td><td>jsonb</td><td>{<code>header</code>, <code>scheme</code>, <code>query</code>}；鉴权头由它注入，不进入可编辑头集</td><td>预设 <code>gateway.auth</code></td></tr>
@@ -359,8 +362,8 @@ erDiagram
     <div class="callout">
       <h4>渠道协议的生命周期</h4>
       <p>
-        <b>首次启动自动沉淀</b> → 可被本地编辑（置 <code>edited</code>、标记「有更新」）→ 后续预设更新由管理员<b>手动触发</b>：
-        <code>edited</code> 条目<b>需人工确认</b>后才覆盖，其余直接更新。不提供「后台手工新建渠道协议」入口。</p>
+        <b>首次启动自动沉淀</b>（初始标记「同步」）→ 可被本地编辑（置 <code>edited</code>、标记「已编辑」）→ 后续预设更新由管理员<b>手动触发</b>：
+        「同步」条目直接覆盖；「已编辑」条目<b>展示差异 + 二次确认</b>后才覆盖。预设条目被删除 / 改名时<b>保留并标记「来源已失效」</b>，不级联删除。不提供「后台手工新建渠道协议」入口。</p>
     </div>
   </section>
 
@@ -478,12 +481,22 @@ erDiagram
           <tr>
             <td>预设数据规则</td>
             <td><span class="chip p1">已定</span></td>
-            <td>以本仓库 <code>preset-pack-format.md</code> 为准；models.dev 只提供两级嵌套形状与成本口径，不承载接入配置</td>
+            <td>以本仓库 <code>preset-pack-format.md</code> 为准，<b>对齐 models.dev v1</b>（完整保留其字段，不消费 v2）；models.dev 只提供两级嵌套形状与成本口径，不承载接入配置</td>
           </tr>
           <tr>
             <td>预设同步时机</td>
             <td><span class="chip p1">已定</span></td>
-            <td><b>仅首次启动（初始化）自动拉取一次</b>；后续更新由管理员在前端点击按钮触发，已标记「有更新」的条目需人工确认，其余直接更新</td>
+            <td><b>仅首次启动（初始化）自动拉取一次</b>；后续更新由管理员在前端点击按钮触发：未编辑（标记「同步」）直接覆盖，已编辑（标记「已编辑」）先展示差异再二次确认</td>
+          </tr>
+          <tr>
+            <td>预设条目删除 / 改名的外键行为</td>
+            <td><span class="chip p1">已定</span></td>
+            <td><b>不级联删除</b>，保留渠道协议并标记「来源已失效」</td>
+          </tr>
+          <tr>
+            <td><code>env</code> / <code>npm</code> 字段消费</td>
+            <td><span class="chip p1">已定</span></td>
+            <td>本项目运行时不消费（忽略）；格式文档仍完整保留这两个 v1 字段</td>
           </tr>
           <tr>
             <td>渠道内联配置一键沉淀为渠道协议</td>
