@@ -5,7 +5,10 @@
 // 基础协议为代码固定的 3 个：openai-chat / openai-responses / anthropic-messages。
 package channelprotocol
 
-import "strings"
+import (
+	"strings"
+	"time"
+)
 
 // 基础协议（代码固定，不可由预设包新增）。
 const (
@@ -13,6 +16,18 @@ const (
 	ProtocolOpenAIResponses   = "openai-responses"
 	ProtocolAnthropicMessages = "anthropic-messages"
 )
+
+// LegacyProtocolOpenAICompat 是历史单协议枚举值。渠道内联配置沿用该值时，
+// 按 openai-chat 语义解释（见 Canonical）。
+const LegacyProtocolOpenAICompat = "openai-compat"
+
+// Canonical 把协议名归一：历史值 openai-compat 映射为 openai-chat，其余原样返回。
+func Canonical(name string) string {
+	if name == LegacyProtocolOpenAICompat {
+		return ProtocolOpenAIChat
+	}
+	return name
+}
 
 // BaseProtocols 返回全部基础协议名（有序，稳定）。
 func BaseProtocols() []string {
@@ -117,8 +132,8 @@ type ChannelProtocol struct {
 	PresetSourceID string                  `json:"PresetSourceID"`
 	Edited         bool                    `json:"Edited"`
 	SourceStatus   string                  `json:"SourceStatus"`
-	CreatedAt      string                  `json:"CreatedAt,omitempty"`
-	UpdatedAt      string                  `json:"UpdatedAt,omitempty"`
+	CreatedAt      time.Time               `json:"CreatedAt,omitempty"`
+	UpdatedAt      time.Time               `json:"UpdatedAt,omitempty"`
 }
 
 // EffectiveBaseURL 返回某基础协议的有效 baseURL：协议级 baseUrl 优先，回落渠道协议级 base_url。

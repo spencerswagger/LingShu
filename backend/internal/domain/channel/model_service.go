@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/team/llmgateway/internal/domain/billing"
+	"github.com/team/llmgateway/internal/domain/channelprotocol"
 	"github.com/team/llmgateway/internal/pkg/resp"
 )
 
@@ -22,9 +23,11 @@ type ChannelModelInput struct {
 	CostRates       billing.Rates
 	TimeConfig      *billing.TimeCoeffConfig
 	ContextTiers    []billing.TierRule
-	RateLimit       *RateLimitConfig
-	HealthProbe     *HealthProbeConfig
-	Reliability     *ReliabilityConfig
+	// Protocols 模型级可达协议子集：非空时收窄该模型可用的上游协议。
+	Protocols   channelprotocol.Protocols
+	RateLimit   *RateLimitConfig
+	HealthProbe *HealthProbeConfig
+	Reliability *ReliabilityConfig
 }
 
 // validateCMInput 校验渠道内部模型：内部ID非空、外部模型绑定、成本五键非负、可选时段/分档合法。
@@ -49,6 +52,11 @@ func validateCMInput(channelID int64, in ChannelModelInput) error {
 	if len(in.ContextTiers) > 0 {
 		if err := billing.ValidateTiers(in.ContextTiers); err != nil {
 			return errBadRequest("context_tiers 非法：" + err.Error())
+		}
+	}
+	for name := range in.Protocols {
+		if !channelprotocol.IsBaseProtocol(channelprotocol.Canonical(name)) {
+			return errBadRequest("protocols 含不支持的基础协议：" + name)
 		}
 	}
 	return nil
@@ -83,6 +91,7 @@ func (s *Service) CreateChannelModel(ctx context.Context, channelID int64, in Ch
 		CostRates:       rateOrDefault(in.CostRates),
 		TimeConfig:      in.TimeConfig,
 		ContextTiers:    in.ContextTiers,
+		Protocols:       in.Protocols,
 		State:           StateNormal,
 	}
 	if in.RateLimit != nil {
@@ -137,6 +146,7 @@ func (s *Service) UpdateChannelModel(ctx context.Context, channelID, mid int64, 
 		CostRates:       rateOrDefault(in.CostRates),
 		TimeConfig:      in.TimeConfig,
 		ContextTiers:    in.ContextTiers,
+		Protocols:       in.Protocols,
 		State:           existing.State, // 状态由状态机/手动操作管理，CRUD 不改变
 		RateLimit:       existing.RateLimit,
 		HealthProbe:     existing.HealthProbe,

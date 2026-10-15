@@ -12,6 +12,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/team/llmgateway/internal/domain/billing"
+	"github.com/team/llmgateway/internal/domain/channelprotocol"
 	"github.com/team/llmgateway/internal/pkg/idgen"
 )
 
@@ -26,27 +27,29 @@ type ChannelModel struct {
 	CostRates       billing.Rates
 	TimeConfig      *billing.TimeCoeffConfig
 	ContextTiers    []billing.TierRule
-	State           State
-	RateLimit       RateLimitConfig
-	HealthProbe     HealthProbeConfig
-	Reliability     ReliabilityConfig
-	ExternalName    string // JOIN 展示用（对外模型名）
-	ChannelName     string // JOIN 展示用（所属渠道名，仅 ListAll 查询填充）
-	CreatedAt       time.Time
-	UpdatedAt       time.Time
+	// Protocols 模型级可达协议子集：非空时收窄该模型可用的上游协议（覆盖渠道协议中同模型定义）。
+	Protocols   channelprotocol.Protocols
+	State       State
+	RateLimit   RateLimitConfig
+	HealthProbe HealthProbeConfig
+	Reliability ReliabilityConfig
+	ExternalName string // JOIN 展示用（对外模型名）
+	ChannelName  string // JOIN 展示用（所属渠道名，仅 ListAll 查询填充）
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
 }
 
 // cmCols 列出 channel_models 表查询使用的列。
 const cmCols = `id, channel_id, internal_model_id, external_model_id, cost_rates,
-	time_config, context_tiers, state, rate_limit, health_probe, reliability, created_at, updated_at`
+	time_config, context_tiers, protocols, state, rate_limit, health_probe, reliability, created_at, updated_at`
 
 // scanChannelModel 将一行扫描到 *ChannelModel，解析 JSONB 列。
 func scanChannelModel(row interface{ Scan(...any) error }) (*ChannelModel, error) {
 	var m ChannelModel
-	var costRaw, timeRaw, tiersRaw, rlRaw, hpRaw, relRaw []byte
+	var costRaw, timeRaw, tiersRaw, protocolsRaw, rlRaw, hpRaw, relRaw []byte
 	var state string
 	err := row.Scan(&m.ID, &m.ChannelID, &m.InternalModelID, &m.ExternalModelID,
-		&costRaw, &timeRaw, &tiersRaw, &state, &rlRaw, &hpRaw, &relRaw,
+		&costRaw, &timeRaw, &tiersRaw, &protocolsRaw, &state, &rlRaw, &hpRaw, &relRaw,
 		&m.CreatedAt, &m.UpdatedAt)
 	if err != nil {
 		return nil, err
@@ -67,6 +70,11 @@ func scanChannelModel(row interface{ Scan(...any) error }) (*ChannelModel, error
 	if len(tiersRaw) > 0 && string(tiersRaw) != "null" {
 		if err := json.Unmarshal(tiersRaw, &m.ContextTiers); err != nil {
 			return nil, fmt.Errorf("parse context_tiers: %w", err)
+		}
+	}
+	if len(protocolsRaw) > 0 && string(protocolsRaw) != "null" {
+		if err := json.Unmarshal(protocolsRaw, &m.Protocols); err != nil {
+			return nil, fmt.Errorf("parse protocols: %w", err)
 		}
 	}
 	if len(rlRaw) > 0 {
@@ -100,15 +108,15 @@ func NewChannelModelStore(db *sql.DB) *channelModelStore {
 }
 
 const cmColsJoinExt = `cm.id, cm.channel_id, cm.internal_model_id, cm.external_model_id,
-	cm.cost_rates, cm.time_config, cm.context_tiers, cm.state, cm.rate_limit, cm.health_probe,
+	cm.cost_rates, cm.time_config, cm.context_tiers, cm.protocols, cm.state, cm.rate_limit, cm.health_probe,
 	cm.reliability, cm.created_at, cm.updated_at, em.external_name`
 
 func scanChannelModelJoinExt(row interface{ Scan(...any) error }) (*ChannelModel, error) {
 	var m ChannelModel
-	var costRaw, timeRaw, tiersRaw, rlRaw, hpRaw, relRaw []byte
+	var costRaw, timeRaw, tiersRaw, protocolsRaw, rlRaw, hpRaw, relRaw []byte
 	var state string
 	err := row.Scan(&m.ID, &m.ChannelID, &m.InternalModelID, &m.ExternalModelID,
-		&costRaw, &timeRaw, &tiersRaw, &state, &rlRaw, &hpRaw, &relRaw,
+		&costRaw, &timeRaw, &tiersRaw, &protocolsRaw, &state, &rlRaw, &hpRaw, &relRaw,
 		&m.CreatedAt, &m.UpdatedAt, &m.ExternalName)
 	if err != nil {
 		return nil, err
@@ -131,6 +139,11 @@ func scanChannelModelJoinExt(row interface{ Scan(...any) error }) (*ChannelModel
 			return nil, fmt.Errorf("parse context_tiers: %w", err)
 		}
 	}
+	if len(protocolsRaw) > 0 && string(protocolsRaw) != "null" {
+		if err := json.Unmarshal(protocolsRaw, &m.Protocols); err != nil {
+			return nil, fmt.Errorf("parse protocols: %w", err)
+		}
+	}
 	if len(rlRaw) > 0 {
 		if err := json.Unmarshal(rlRaw, &m.RateLimit); err != nil {
 			return nil, fmt.Errorf("parse rate_limit: %w", err)
@@ -151,16 +164,16 @@ func scanChannelModelJoinExt(row interface{ Scan(...any) error }) (*ChannelModel
 
 // cmColsJoinExtChannel 列出「JOIN 对外模型 + 渠道」查询使用的列（ListAll 用）。
 const cmColsJoinExtChannel = `cm.id, cm.channel_id, cm.internal_model_id, cm.external_model_id,
-	cm.cost_rates, cm.time_config, cm.context_tiers, cm.state, cm.rate_limit, cm.health_probe,
+	cm.cost_rates, cm.time_config, cm.context_tiers, cm.protocols, cm.state, cm.rate_limit, cm.health_probe,
 	cm.reliability, cm.created_at, cm.updated_at, em.external_name, ch.name`
 
 // scanChannelModelJoinExtChannel 将「JOIN 对外模型 + 渠道」的一行扫描到 *ChannelModel，解析 JSONB 列。
 func scanChannelModelJoinExtChannel(row interface{ Scan(...any) error }) (*ChannelModel, error) {
 	var m ChannelModel
-	var costRaw, timeRaw, tiersRaw, rlRaw, hpRaw, relRaw []byte
+	var costRaw, timeRaw, tiersRaw, protocolsRaw, rlRaw, hpRaw, relRaw []byte
 	var state string
 	err := row.Scan(&m.ID, &m.ChannelID, &m.InternalModelID, &m.ExternalModelID,
-		&costRaw, &timeRaw, &tiersRaw, &state, &rlRaw, &hpRaw, &relRaw,
+		&costRaw, &timeRaw, &tiersRaw, &protocolsRaw, &state, &rlRaw, &hpRaw, &relRaw,
 		&m.CreatedAt, &m.UpdatedAt, &m.ExternalName, &m.ChannelName)
 	if err != nil {
 		return nil, err
@@ -181,6 +194,11 @@ func scanChannelModelJoinExtChannel(row interface{ Scan(...any) error }) (*Chann
 	if len(tiersRaw) > 0 && string(tiersRaw) != "null" {
 		if err := json.Unmarshal(tiersRaw, &m.ContextTiers); err != nil {
 			return nil, fmt.Errorf("parse context_tiers: %w", err)
+		}
+	}
+	if len(protocolsRaw) > 0 && string(protocolsRaw) != "null" {
+		if err := json.Unmarshal(protocolsRaw, &m.Protocols); err != nil {
+			return nil, fmt.Errorf("parse protocols: %w", err)
 		}
 	}
 	if len(rlRaw) > 0 {
@@ -326,10 +344,10 @@ func (s *channelModelStore) Insert(ctx context.Context, m *ChannelModel) (*Chann
 		m.ID = idgen.New()
 	}
 	row := s.db.QueryRowContext(ctx,
-		`INSERT INTO channel_models(id, channel_id, internal_model_id, external_model_id, cost_rates, time_config, context_tiers, state, rate_limit, health_probe, reliability)
-		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING `+cmCols,
+		`INSERT INTO channel_models(id, channel_id, internal_model_id, external_model_id, cost_rates, time_config, context_tiers, protocols, state, rate_limit, health_probe, reliability)
+		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING `+cmCols,
 		m.ID, m.ChannelID, m.InternalModelID, m.ExternalModelID, cmJSON(m.CostRates),
-		cmNullableJSON(m.TimeConfig), cmNullableJSON(m.ContextTiers),
+		cmNullableJSON(m.TimeConfig), cmNullableJSON(m.ContextTiers), cmNullableProtocols(m.Protocols),
 		string(m.State), marshalJSONB(m.RateLimit), marshalJSONB(m.HealthProbe),
 		marshalJSONB(m.Reliability))
 	created, err := scanChannelModel(row)
@@ -343,11 +361,11 @@ func (s *channelModelStore) Insert(ctx context.Context, m *ChannelModel) (*Chann
 func (s *channelModelStore) Update(ctx context.Context, m *ChannelModel) error {
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE channel_models SET internal_model_id=$1, external_model_id=$2, cost_rates=$3,
-		        time_config=$4, context_tiers=$5, state=$6, rate_limit=$7, health_probe=$8,
-		        reliability=$9, updated_at=now()
-		 WHERE id=$10`,
+		        time_config=$4, context_tiers=$5, protocols=$6, state=$7, rate_limit=$8, health_probe=$9,
+		        reliability=$10, updated_at=now()
+		 WHERE id=$11`,
 		m.InternalModelID, m.ExternalModelID, cmJSON(m.CostRates),
-		cmNullableJSON(m.TimeConfig), cmNullableJSON(m.ContextTiers),
+		cmNullableJSON(m.TimeConfig), cmNullableJSON(m.ContextTiers), cmNullableProtocols(m.Protocols),
 		string(m.State), marshalJSONB(m.RateLimit), marshalJSONB(m.HealthProbe),
 		marshalJSONB(m.Reliability), m.ID)
 	if err != nil {
@@ -532,6 +550,18 @@ func cmNullableJSON(v any) any {
 	}
 	b, err := json.Marshal(v)
 	if err != nil || string(b) == "null" {
+		return nil
+	}
+	return json.RawMessage(b)
+}
+
+// cmNullableProtocols 把模型级协议子集序列化为 JSONB：空集合写 NULL（表示「继承渠道协议」）。
+func cmNullableProtocols(p channelprotocol.Protocols) any {
+	if len(p) == 0 {
+		return nil
+	}
+	b, err := json.Marshal(p)
+	if err != nil {
 		return nil
 	}
 	return json.RawMessage(b)
