@@ -155,11 +155,13 @@ type KeyRuntime struct {
 
 // KeyRuntimeView 是密钥运行时输出视图：凭据仅暴露尾号，绝不回传明文或密文。
 type KeyRuntimeView struct {
-	KeyID          int64  `json:"KeyID,string"`
-	Name           string `json:"Name"`
-	State          State  `json:"State"`
-	LastErr        string `json:"LastErr,omitempty"`
-	CredentialTail string `json:"CredentialTail,omitempty"` // 解密明文尾号（≤6 位整体脱敏），不含明文/密文
+	KeyID          int64      `json:"KeyID,string"`
+	Name           string     `json:"Name"`
+	State          State      `json:"State"`
+	LastErr        string     `json:"LastErr,omitempty"`
+	CredentialTail string     `json:"CredentialTail,omitempty"` // 解密明文尾号（≤6 位整体脱敏），不含明文/密文
+	LastProbe      *time.Time `json:"LastProbe,omitempty"`      // 最近一次探测时间；零值则省略
+	DrainReasons   []string   `json:"DrainReasons,omitempty"`   // 排空触发原因（诊断用，副本）
 }
 
 // ModelRuntime 内部模型运行时：与渠道运行时完全同构（状态机/限流器/探测），
@@ -786,12 +788,19 @@ func (m *Manager) KeyViews(channelID int64) []KeyRuntimeView {
 		if !ok {
 			continue
 		}
+		var lp *time.Time
+		if !kr.lastProbe.IsZero() {
+			t := kr.lastProbe
+			lp = &t
+		}
 		views = append(views, KeyRuntimeView{
 			KeyID:          kr.Key.ID,
 			Name:           kr.Key.Name,
 			State:          kr.Machine.State(),
 			LastErr:        kr.Key.LastErr,
 			CredentialTail: credentialTail(kr.CredentialPlain),
+			LastProbe:      lp,
+			DrainReasons:   append([]string(nil), kr.Machine.DrainReasons()...),
 		})
 	}
 	sort.Slice(views, func(i, j int) bool { return views[i].KeyID < views[j].KeyID })

@@ -121,6 +121,7 @@ func (s *Server) routes() {
 	admin.HandleFunc("GET /api/v1/admin/channels/cron-preview", d.Channel.HandleCronPreview)
 	admin.HandleFunc("PUT /api/v1/admin/channels/{id}/models/{mid}/state", d.Channel.HandleModelState)
 	admin.HandleFunc("GET /api/v1/admin/channels/snapshot", d.Console.HandleChannelSnapshot)
+	admin.HandleFunc("GET /api/v1/admin/service-status", d.Console.HandleServiceStatus)
 
 	// 渠道密钥（channel_keys 运行时实体）
 	admin.HandleFunc("GET /api/v1/admin/channels/{id}/keys", d.Channel.HandleListKeys)

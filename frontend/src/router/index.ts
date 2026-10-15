@@ -26,6 +26,8 @@ const router = createRouter({
         { path: 'channels', name: 'admin-channels', component: () => import('@/views/admin/ChannelList.vue'), meta: { title: '渠道' } },
         { path: 'channels/create', name: 'admin-channel-create', component: () => import('@/views/admin/ChannelCreate.vue'), meta: { title: '新建渠道' } },
         { path: 'channels/:id', name: 'admin-channel-edit', component: () => import('@/views/admin/ChannelEdit.vue'), meta: { title: '渠道' } },
+        // 服务状态（渠道侧通路矩阵）
+        { path: 'service-status', name: 'admin-service-status', component: () => import('@/views/admin/ServiceStatus.vue'), meta: { title: '服务状态' } },
         // 模型
         { path: 'models', name: 'admin-models', component: () => import('@/views/admin/ModelList.vue'), meta: { title: '模型' } },
         { path: 'models/create', name: 'admin-model-create', component: () => import('@/views/admin/ModelCreate.vue'), meta: { title: '新建模型' } },
