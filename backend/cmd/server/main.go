@@ -313,6 +313,14 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	cpHandler := channelprotocol.NewHandler(cpSvc)
 	chMgr.SetChannelProtocolStore(cpStore)
 	chSvc.SetChannelProtocolStore(cpStore)
+	// 协议变更钩子：先定向重物化引用渠道的 channel_models，再全量重建运行时。
+	// 保证协议（含请求头策略）变更后引用渠道的模型与运行时即时生效（无重启、无渠道重存）。
+	cpSvc.SetChannelRefresher(func(ctx context.Context, protocolID int64) error {
+		if err := chSvc.RematerializeProtocol(ctx, protocolID); err != nil {
+			return err
+		}
+		return chMgr.SyncFromDB(ctx)
+	})
 
 	// tag / model
 	tagStore := tag.NewStore(d)

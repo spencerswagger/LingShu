@@ -9,6 +9,8 @@ package channelprotocol
 import (
 	"strings"
 	"time"
+
+	"github.com/team/llmgateway/internal/domain/billing"
 )
 
 // 基础协议（代码固定，不可由预设包新增）。
@@ -88,10 +90,17 @@ const (
 	PassthroughAll       = "all"
 )
 
-// ModelGateway 预设包中模型级 gateway 覆盖（本网关仅消费 protocols / baseUrl）。
+// ModelGateway 预设包中模型级 gateway 覆盖：既承载协议/基址覆盖，也承载该模型
+// 在渠道协议清单中的完整配置（对外模型绑定 / 成本 / 时段 / 分档）。
+// 追加字段均为 camelCase，向后兼容（旧数据无这些键时零值）。
 type ModelGateway struct {
 	BaseURL   string    `json:"baseUrl,omitempty"`
 	Protocols Protocols `json:"protocols,omitempty"`
+	// ExternalModelID 该内部模型绑定的对外模型 ID；>0 才参与自动物化为 channel_models。
+	ExternalModelID int64                    `json:"externalModelID,string,omitempty"`
+	CostRates       billing.WireRates        `json:"costRates,omitempty"`
+	TimeConfig      *billing.TimeCoeffConfig `json:"timeConfig,omitempty"`
+	ContextTiers    []billing.TierRule       `json:"contextTiers,omitempty"`
 }
 
 // ChannelProtocol 对应 channel_protocols 表一行。

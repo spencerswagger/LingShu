@@ -2,17 +2,25 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { Plus } from '@element-plus/icons-vue'
+import { Plus, Delete, Edit, RefreshRight } from '@element-plus/icons-vue'
 import {
   createChannelProtocol,
   getChannelProtocol,
   updateChannelProtocol,
+  pullChannelProtocolModels,
+  listExternalModels,
+  createExternalModel,
+  rateLabels,
   type ChannelProtocolInput,
   type ChannelProtocolModelOverride,
   type ProtocolOption,
+  type ExternalModel,
+  type PullModel,
 } from '@/api/admin'
 import KvpEditor from '@/components/KvpEditor.vue'
 import StringListEditor from '@/components/StringListEditor.vue'
+import ModelPricing from '@/components/ModelPricing.vue'
+import ModelPriceCatalog from '@/components/ModelPriceCatalog.vue'
 import ErrorBubble from '@/components/ErrorBubble.vue'
 
 const route = useRoute()
@@ -51,23 +59,27 @@ const form = reactive({
   set: {} as Record<string, string>,
 })
 
-// 模型清单：每行一个内部模型，可覆盖可达协议子集与 BaseURL（留空 = 继承渠道协议级）
-type ModelRow = { id: string; protocols: string[]; baseUrl: string }
-const modelRows = ref<ModelRow[]>([])
-
-const enabledProtocols = computed(() => baseProtocols.filter((p) => protocols[p].enabled))
-
 // 来源预设 ID（只读回显）
 const presetSourceId = ref('')
 
-// 请求头候选：仅 OpenAI / Anthropic 常用头，作为下拉提示（可自行输入任意头名）
+// 请求头真实候选：HTTP 通用 / OpenAI / Anthropic 常用头（可自行输入任意头名）
 const headerSuggestions = [
-  'anthropic-version',
-  'anthropic-beta',
+  'Accept',
+  'Accept-Language',
+  'User-Agent',
+  'Referer',
+  'Origin',
+  'Cache-Control',
+  'Pragma',
   'OpenAI-Organization',
   'OpenAI-Project',
   'OpenAI-Beta',
+  'anthropic-version',
+  'anthropic-beta',
+  'anthropic-dangerous-direct-browser-access',
 ]
+// 覆盖值可插入的变量
+const valueVariables = ['{api_key}', '{session_id}', '{request_id}', '{model}', '{client_header:NAME}']
 
 const passthroughOptions = [
   { label: '不透传', value: 'none' },
@@ -75,6 +87,39 @@ const passthroughOptions = [
   { label: '黑名单', value: 'blacklist' },
   { label: '全部透传', value: 'all' },
 ]
+
+const enabledProtocols = computed(() => baseProtocols.filter((p) => protocols[p].enabled))
+
+// ===== 协议模型清单 =====
+// 每行一个内部模型：可绑定对外模型、配置成本定价、收窄可达协议子集、覆盖 BaseURL。
+type ModelRow = {
+  id: string
+  protocols: string[]
+  baseUrl: string
+  externalModelID: string | null
+  pricing: Record<string, any>
+}
+const modelRows = ref<ModelRow[]>([])
+
+// 下拉数据：启用的对外模型
+const externalModels = ref<ExternalModel[]>([])
+
+function emptyPricing(): Record<string, any> {
+  return {
+    CostRates: { Input: 0, Output: 0, CacheRead: 0, CacheWrite: 0, Reasoning: 0 },
+    TimeConfig: null,
+    ContextTiers: null,
+  }
+}
+
+async function loadExternalModels() {
+  try {
+    const res = await listExternalModels({ Enabled: true })
+    externalModels.value = res.Data || []
+  } catch {
+    /* 忽略：绑定下拉为空时仍可编辑其它字段 */
+  }
+}
 
 async function load() {
   if (!isEdit.value) return
@@ -101,6 +146,12 @@ async function load() {
       id: mid,
       protocols: Object.keys(ov?.protocols || {}),
       baseUrl: ov?.baseUrl || '',
+      externalModelID: ov?.externalModelID ?? null,
+      pricing: {
+        CostRates: { Input: 0, Output: 0, CacheRead: 0, CacheWrite: 0, Reasoning: 0, ...(ov?.costRates || {}) },
+        TimeConfig: ov?.timeConfig ?? null,
+        ContextTiers: ov?.contextTiers ?? null,
+      },
     }))
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
@@ -111,18 +162,189 @@ async function load() {
 onMounted(() => {
   // 返回「渠道」合并页时保持选中「渠道协议」视图
   sessionStorage.setItem('admin-channels-tab', 'protocols')
+  loadExternalModels()
   load()
 })
 
-// 模型清单 增/删行
-function addModelRow() {
-  modelRows.value.push({ id: '', protocols: [], baseUrl: '' })
+// ===== 模型行 增/改/删 =====
+const modelDrawerOpen = ref(false)
+const editingIndex = ref<number | null>(null) // null = 新增；否则为编辑的行号
+const editingForm = ref<{ id: string; protocols: string[]; baseUrl: string; externalModelID: string | null }>({
+  id: '',
+  protocols: [],
+  baseUrl: '',
+  externalModelID: null,
+})
+const editingPricing = ref<Record<string, any>>(emptyPricing())
+const editingExternalPrev = ref<string | null>(null)
+
+function openCreateModel() {
+  editingIndex.value = null
+  editingExternalPrev.value = null
+  editingForm.value = { id: '', protocols: [], baseUrl: '', externalModelID: null }
+  editingPricing.value = emptyPricing()
+  modelDrawerOpen.value = true
+}
+function openEditModel(row: ModelRow, index: number) {
+  editingIndex.value = index
+  editingExternalPrev.value = row.externalModelID
+  editingForm.value = {
+    id: row.id,
+    protocols: [...row.protocols],
+    baseUrl: row.baseUrl,
+    externalModelID: row.externalModelID,
+  }
+  editingPricing.value = {
+    CostRates: { ...(row.pricing.CostRates || {}) },
+    TimeConfig: row.pricing.TimeConfig ? JSON.parse(JSON.stringify(row.pricing.TimeConfig)) : null,
+    ContextTiers: row.pricing.ContextTiers ? JSON.parse(JSON.stringify(row.pricing.ContextTiers)) : null,
+  }
+  modelDrawerOpen.value = true
+}
+function saveModel() {
+  const mid = editingForm.value.id.trim()
+  if (!mid) return ElMessage.warning('请填写内部模型 ID')
+  const dup = modelRows.value.some((r, i) => i !== editingIndex.value && r.id.trim() === mid)
+  if (dup) return ElMessage.warning('该内部模型 ID 已存在')
+  const row: ModelRow = {
+    id: mid,
+    protocols: [...editingForm.value.protocols],
+    baseUrl: editingForm.value.baseUrl.trim(),
+    externalModelID: editingForm.value.externalModelID,
+    pricing: {
+      CostRates: { ...(editingPricing.value.CostRates || {}) },
+      TimeConfig: editingPricing.value.TimeConfig ?? null,
+      ContextTiers: editingPricing.value.ContextTiers ?? null,
+    },
+  }
+  if (editingIndex.value == null) modelRows.value.push(row)
+  else modelRows.value[editingIndex.value] = row
+  modelDrawerOpen.value = false
 }
 function removeModelRow(index: number) {
   modelRows.value.splice(index, 1)
 }
 
-// 由行数据组装后端 Models（{ [内部模型 ID]: { baseUrl?, protocols? } }）
+// 快速新建对外模型：绑定下拉选到「＋ 新建对外模型」时弹出
+const createExternalOpen = ref(false)
+const createExternalName = ref('')
+const createExternalEnabled = ref(true)
+const createExternalUseCost = ref(true)
+const createExternalSaving = ref(false)
+
+function openQuickCreateExternal() {
+  createExternalName.value = ''
+  createExternalEnabled.value = true
+  createExternalUseCost.value = true
+  createExternalOpen.value = true
+}
+function onExternalChange(val: string | null) {
+  if (val === '__create__') {
+    editingForm.value.externalModelID = editingExternalPrev.value
+    openQuickCreateExternal()
+    return
+  }
+  editingExternalPrev.value = val
+}
+async function confirmCreateExternal() {
+  const name = createExternalName.value.trim()
+  if (!name) return ElMessage.warning('请填写对外名称')
+  const costRates = createExternalUseCost.value ? editingPricing.value.CostRates : null
+  const saleRates = { Input: 0, Output: 0, CacheRead: 0, CacheWrite: 0, Reasoning: 0, ...(costRates || {}) }
+  createExternalSaving.value = true
+  try {
+    const res = await createExternalModel({
+      ExternalName: name,
+      Description: '',
+      Enabled: createExternalEnabled.value,
+      SaleRates: saleRates,
+      TimeConfig: null,
+      ContextTiers: null,
+    })
+    const created = res.Data
+    externalModels.value.push(created)
+    editingForm.value.externalModelID = created.ID
+    editingExternalPrev.value = created.ID
+    ElMessage.success('对外模型已创建')
+    createExternalOpen.value = false
+  } catch (e: any) {
+    ElMessage.error(e?.message || '创建对外模型失败')
+  } finally {
+    createExternalSaving.value = false
+  }
+}
+
+// 从 models 端点拉取（临时 ApiKey，不落库）
+const pullDialogOpen = ref(false)
+const pullApiKey = ref('')
+const pullLoading = ref(false)
+const pulled = ref<PullModel[]>([])
+const pullChecked = ref<PullModel[]>([])
+
+const addedIds = computed(() => new Set(modelRows.value.map((m) => m.id.trim())))
+function isAdded(mid: string): boolean {
+  return addedIds.value.has(mid.trim())
+}
+function openPull() {
+  pullApiKey.value = ''
+  pulled.value = []
+  pullChecked.value = []
+  pullDialogOpen.value = true
+}
+async function doPull() {
+  if (!pullApiKey.value.trim()) return ElMessage.warning('请填写临时 ApiKey')
+  pullLoading.value = true
+  try {
+    const res = await pullChannelProtocolModels(id, pullApiKey.value.trim())
+    pulled.value = res.Data.List || []
+    pullChecked.value = []
+  } catch (e: any) {
+    ElMessage.error(e?.message || '拉取协议模型失败')
+  } finally {
+    pullLoading.value = false
+  }
+}
+function onAddPulled() {
+  if (!pullChecked.value.length) return
+  let added = 0
+  for (const p of pullChecked.value) {
+    if (isAdded(p.ID)) continue
+    modelRows.value.push({ id: p.ID, protocols: [], baseUrl: '', externalModelID: null, pricing: emptyPricing() })
+    added++
+  }
+  ElMessage.success(`已加入 ${added} 个模型（请在清单中绑定对外模型并配置成本）`)
+  pullDialogOpen.value = false
+}
+
+// models.dev 参考价：合并到当前编辑模型的成本侧
+const catalogRef = ref<InstanceType<typeof ModelPriceCatalog> | null>(null)
+const currentModelId = computed(() => editingForm.value.id)
+function onApplyCostCatalog(partial: Record<string, number>) {
+  editingPricing.value.CostRates = { ...editingPricing.value.CostRates, ...partial }
+}
+
+// 展示辅助
+function externalName(extId: string | null): string {
+  if (!extId) return ''
+  const em = externalModels.value.find((e) => String(e.ID) === String(extId))
+  return em?.ExternalName || ''
+}
+function fmtCost(row: ModelRow, k: string): string {
+  const v = (row.pricing.CostRates || {})[k]
+  return v == null ? '-' : String(Math.round(v * 1e6) / 1e6)
+}
+function costDetail(row: ModelRow): string {
+  const r = row.pricing.CostRates || {}
+  const parts = ['Input', 'Output', 'CacheRead', 'CacheWrite', 'Reasoning'].map(
+    (k) => `${rateLabels[k]} ${r[k] == null ? '-' : Math.round(r[k] * 1e6) / 1e6}`,
+  )
+  return `${parts.join('，')}（单位：人民币元/百万 token）`
+}
+function protocolNames(row: ModelRow): string {
+  return row.protocols.map((p) => protocolLabels[p] || p).join('、')
+}
+
+// 由行数据组装后端 Models（{ [内部模型 ID]: { baseUrl?, protocols?, externalModelID?, costRates?, timeConfig?, contextTiers? } }）
 function buildModels(): Record<string, ChannelProtocolModelOverride> {
   const out: Record<string, ChannelProtocolModelOverride> = {}
   for (const r of modelRows.value) {
@@ -135,6 +357,10 @@ function buildModels(): Record<string, ChannelProtocolModelOverride> {
       for (const name of r.protocols) p[name] = {}
       ov.protocols = p
     }
+    if (r.externalModelID) ov.externalModelID = r.externalModelID
+    if (r.pricing.CostRates) ov.costRates = r.pricing.CostRates
+    if (r.pricing.TimeConfig) ov.timeConfig = r.pricing.TimeConfig
+    if (r.pricing.ContextTiers) ov.contextTiers = r.pricing.ContextTiers
     out[mid] = ov
   }
   return out
@@ -207,17 +433,14 @@ async function onSubmit() {
               <div class="hint">渠道协议级默认上游地址；各协议可单独覆盖</div>
             </el-form-item>
           </el-form>
-        </div>
-      </el-tab-pane>
 
-      <el-tab-pane label="协议配置" name="protocols">
-        <div class="card">
+          <div class="section-title">基础协议</div>
           <div class="block-desc">选择该协议模板原生支持的上游基础协议；键存在 = 支持。可逐协议覆盖路径与上游地址。鉴权由协议隐含（openai-* → Authorization Bearer；anthropic-messages → x-api-key），如需其它方式请在「请求头策略 → 覆盖」中显式写入。</div>
           <div v-for="p in baseProtocols" :key="p" class="proto-row">
             <el-checkbox v-model="protocols[p].enabled" class="proto-check">{{ protocolLabels[p] }}</el-checkbox>
             <div class="proto-fields">
-              <el-input v-model="protocols[p].path" size="small" placeholder="路径，留空用内置默认（如 /chat/completions）" :disabled="!protocols[p].enabled" />
-              <el-input v-model="protocols[p].baseUrl" size="small" placeholder="该协议专属 BaseURL，留空回退协议级" :disabled="!protocols[p].enabled" />
+              <el-input v-model="protocols[p].path" placeholder="路径，留空用内置默认（如 /chat/completions）" :disabled="!protocols[p].enabled" />
+              <el-input v-model="protocols[p].baseUrl" placeholder="该协议专属 BaseURL，留空回退协议级" :disabled="!protocols[p].enabled" />
             </div>
           </div>
           <el-form label-width="130px" class="init-form">
@@ -234,29 +457,24 @@ async function onSubmit() {
       <el-tab-pane label="请求头策略" name="headers">
         <div class="card">
           <div class="block-desc">控制下游请求头如何透传到上游；鉴权由基础协议隐含注入，「覆盖」在其之后应用，可显式覆盖鉴权头。</div>
-          <el-form label-width="130px" class="form-grid">
-            <el-form-item class="span-2" label="透传模式">
+          <el-form label-width="130px">
+            <el-form-item label="透传模式">
               <el-segmented :model-value="form.passthrough_mode" :options="passthroughOptions" @change="(v: string | number | boolean) => (form.passthrough_mode = String(v))" />
             </el-form-item>
-            <el-form-item label="白名单">
-              <StringListEditor
-                v-model="form.whitelist"
-                :suggestions="headerSuggestions"
-                placeholder="仅这些下游头透传"
-              />
-              <div class="hint">下拉仅为常用头提示，可自行输入；仅在「白名单」模式下生效</div>
+            <el-form-item v-if="form.passthrough_mode === 'whitelist'" label="白名单">
+              <StringListEditor v-model="form.whitelist" :suggestions="headerSuggestions" placeholder="仅这些下游头透传" />
             </el-form-item>
-            <el-form-item label="黑名单">
-              <StringListEditor
-                v-model="form.blacklist"
-                :suggestions="headerSuggestions"
-                placeholder="除这些下游头外透传"
-              />
-              <div class="hint">下拉仅为常用头提示，可自行输入；仅在「黑名单」模式下生效</div>
+            <el-form-item v-else-if="form.passthrough_mode === 'blacklist'" label="黑名单">
+              <StringListEditor v-model="form.blacklist" :suggestions="headerSuggestions" placeholder="除这些下游头外透传" />
             </el-form-item>
-            <el-form-item class="span-2" label="覆盖">
-              <KvpEditor v-model="form.set" key-placeholder="请求头名" value-placeholder="值（支持变量）" />
-              <div class="hint">覆盖语义（非合并），在协议隐含鉴权之后应用；支持变量 {api_key} / {session_id} / {request_id} / {model} / {client_header:NAME}</div>
+            <el-form-item label="覆盖">
+              <KvpEditor
+                v-model="form.set"
+                key-placeholder="请求头名"
+                value-placeholder="值（支持变量）"
+                :key-suggestions="headerSuggestions"
+                :value-suggestions="valueVariables"
+              />
             </el-form-item>
           </el-form>
         </div>
@@ -264,32 +482,60 @@ async function onSubmit() {
 
       <el-tab-pane label="模型清单" name="models">
         <div class="card">
-          <div class="block-desc">列出该协议模板下的内部模型；可为每个模型收窄可达协议子集并覆盖 BaseURL（留空 = 继承渠道协议级配置）。</div>
-          <el-table :data="modelRows" border class="model-table">
-            <el-table-column label="内部模型 ID" min-width="200">
+          <div class="model-head">
+            <div class="block-desc">列出该协议模板下的内部模型；可为每个模型绑定对外模型、配置成本定价、收窄可达协议子集并覆盖 BaseURL（留空 = 继承渠道协议级配置）。</div>
+            <div class="model-toolbar">
+              <el-tooltip v-if="!isEdit" content="保存协议后可用临时 ApiKey 从 models 端点拉取" placement="top">
+                <span><el-button :icon="RefreshRight" disabled>从 models 端点拉取</el-button></span>
+              </el-tooltip>
+              <el-button v-else :icon="RefreshRight" @click="openPull">从 models 端点拉取</el-button>
+              <el-button type="primary" :icon="Plus" @click="openCreateModel">添加模型</el-button>
+            </div>
+          </div>
+          <el-table :data="modelRows" border stripe class="model-table table-nowrap">
+            <el-table-column label="内部模型 ID" min-width="180" show-overflow-tooltip>
+              <template #default="{ row }">{{ row.id || '—' }}</template>
+            </el-table-column>
+            <el-table-column label="绑定对外模型" min-width="160">
               <template #default="{ row }">
-                <el-input v-model="row.id" placeholder="上游模型名（请求体 model 字段）" />
+                <span v-if="externalName(row.externalModelID)">{{ externalName(row.externalModelID) }}</span>
+                <el-tag v-else type="info" size="small" effect="light">未绑定</el-tag>
               </template>
             </el-table-column>
-            <el-table-column label="可达协议" min-width="260">
+            <el-table-column label="成本·输入" width="110" align="right">
               <template #default="{ row }">
-                <el-select v-model="row.protocols" multiple clearable placeholder="留空 = 继承渠道协议" style="width: 100%">
-                  <el-option v-for="p in baseProtocols" :key="p" :label="protocolLabels[p]" :value="p" />
-                </el-select>
+                <el-tooltip :content="costDetail(row)" placement="top">
+                  <span class="rate-cell">{{ fmtCost(row, 'Input') }}</span>
+                </el-tooltip>
               </template>
             </el-table-column>
-            <el-table-column label="BaseURL 覆盖" min-width="200">
+            <el-table-column label="成本·输出" width="110" align="right">
               <template #default="{ row }">
-                <el-input v-model="row.baseUrl" placeholder="留空 = 继承协议级" />
+                <el-tooltip :content="costDetail(row)" placement="top">
+                  <span class="rate-cell">{{ fmtCost(row, 'Output') }}</span>
+                </el-tooltip>
               </template>
             </el-table-column>
-            <el-table-column label="操作" width="80" align="center">
-              <template #default="{ $index }">
-                <el-button link type="danger" @click="removeModelRow($index)">删除</el-button>
+            <el-table-column label="可达协议" min-width="180">
+              <template #default="{ row }">{{ protocolNames(row) || '继承协议级' }}</template>
+            </el-table-column>
+            <el-table-column label="BaseURL 覆盖" min-width="180" show-overflow-tooltip>
+              <template #default="{ row }">{{ row.baseUrl || '—' }}</template>
+            </el-table-column>
+            <el-table-column label="操作" width="110" align="right">
+              <template #default="{ row, $index }">
+                <div class="op-cell">
+                  <el-tooltip content="编辑" placement="top">
+                    <el-icon class="op-icon" @click="openEditModel(row, $index)"><Edit /></el-icon>
+                  </el-tooltip>
+                  <el-tooltip content="删除" placement="top">
+                    <el-icon class="op-icon danger" @click="removeModelRow($index)"><Delete /></el-icon>
+                  </el-tooltip>
+                </div>
               </template>
             </el-table-column>
           </el-table>
-          <el-button class="add-tier-btn" :icon="Plus" @click="addModelRow">添加模型</el-button>
+          <el-empty v-if="!modelRows.length" description="暂无模型" :image-size="48" />
         </div>
       </el-tab-pane>
     </el-tabs>
@@ -299,6 +545,90 @@ async function onSubmit() {
       <el-button @click="router.push('/admin/channels')">取消</el-button>
       <ErrorBubble v-if="errInfo.message || errInfo.requestId" :message="errInfo.message" :request-id="errInfo.requestId" />
     </div>
+
+    <!-- 协议模型 编辑抽屉 -->
+    <el-drawer
+      v-model="modelDrawerOpen"
+      :title="editingIndex == null ? '添加协议模型' : '编辑协议模型'"
+      :size="'min(880px, calc(100vw - 48px))'"
+      destroy-on-close
+    >
+      <el-form label-width="120px" class="model-form">
+        <el-form-item label="内部模型 ID" required>
+          <el-input v-model="editingForm.id" placeholder="上游模型名（请求体 model 字段）" />
+        </el-form-item>
+        <el-form-item label="绑定对外模型">
+          <el-select v-model="editingForm.externalModelID" style="width: 100%" placeholder="选择对外的发售模型" @change="onExternalChange">
+            <el-option v-for="em in externalModels" :key="em.ID" :label="em.ExternalName" :value="em.ID" />
+            <el-option label="＋ 新建对外模型" value="__create__" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="可达协议">
+          <el-select v-model="editingForm.protocols" multiple clearable placeholder="留空 = 继承协议级" style="width: 100%">
+            <el-option v-for="p in baseProtocols" :key="p" :label="protocolLabels[p]" :value="p" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="BaseURL 覆盖">
+          <el-input v-model="editingForm.baseUrl" placeholder="留空 = 继承协议级" />
+        </el-form-item>
+        <div class="span-2">
+          <ModelPricing v-model="editingPricing" show-rates-key="CostRates" title="成本">
+            <template #title-extra>
+              <el-button @click="catalogRef?.open()">从 models.dev 获取参考价</el-button>
+            </template>
+          </ModelPricing>
+        </div>
+      </el-form>
+      <template #footer>
+        <el-button @click="modelDrawerOpen = false">取消</el-button>
+        <el-button type="primary" @click="saveModel">保存</el-button>
+      </template>
+    </el-drawer>
+
+    <!-- 从 models 端点拉取（临时 ApiKey）弹窗 -->
+    <el-dialog v-model="pullDialogOpen" title="从 models 端点拉取" width="560px" destroy-on-close>
+      <div class="pull-row">
+        <el-input v-model="pullApiKey" placeholder="临时 ApiKey（仅本次拉取使用，不落库）" show-password clearable @keyup.enter="doPull" />
+        <el-button type="primary" :loading="pullLoading" @click="doPull">拉取</el-button>
+      </div>
+      <el-table :data="pulled" border max-height="340" @selection-change="(rows: PullModel[]) => (pullChecked = rows)">
+        <el-table-column type="selection" width="40" :selectable="(row: PullModel) => !isAdded(row.ID)" />
+        <el-table-column label="模型 ID" min-width="200" show-overflow-tooltip>
+          <template #default="{ row }">
+            <span :class="{ 'muted-id': isAdded(row.ID) }">{{ row.ID }}</span>
+            <el-tag v-if="isAdded(row.ID)" size="small" type="info" effect="plain" class="added-tag">已添加</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="归属" prop="OwnedBy" min-width="120" show-overflow-tooltip />
+      </el-table>
+      <el-empty v-if="!pullLoading && pullApiKey && !pulled.length" description="未拉取到模型，请检查 ApiKey 并点击「拉取」" :image-size="48" />
+      <template #footer>
+        <el-button @click="pullDialogOpen = false">取消</el-button>
+        <el-button type="primary" :disabled="!pullChecked.length" @click="onAddPulled">加入清单（{{ pullChecked.length }}）</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 快速新建对外模型 -->
+    <el-dialog v-model="createExternalOpen" title="新建对外模型" width="480px" destroy-on-close>
+      <el-form label-width="120px">
+        <el-form-item label="对外名称" required>
+          <el-input v-model="createExternalName" placeholder="如 gpt-4o" maxlength="128" clearable />
+        </el-form-item>
+        <el-form-item label="启用">
+          <el-switch v-model="createExternalEnabled" />
+        </el-form-item>
+        <el-form-item label="初始化售价">
+          <el-checkbox v-model="createExternalUseCost">用当前内部模型成本初始化售价</el-checkbox>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="createExternalOpen = false">取消</el-button>
+        <el-button type="primary" :loading="createExternalSaving" @click="confirmCreateExternal">创建</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- models.dev 参考价市场 -->
+    <ModelPriceCatalog ref="catalogRef" :model-name="currentModelId" label="成本" @apply="onApplyCostCatalog" />
   </div>
 </template>
 
@@ -334,6 +664,13 @@ async function onSubmit() {
   font-size: 13px;
   margin-bottom: 14px;
 }
+.section-title {
+  font-size: 15px;
+  font-weight: 600;
+  margin: 18px 0 8px;
+  padding-top: 14px;
+  border-top: 1px solid var(--color-border);
+}
 .proto-row {
   display: flex;
   align-items: flex-start;
@@ -344,7 +681,7 @@ async function onSubmit() {
 .proto-check {
   width: 160px;
   flex: none;
-  margin-top: 4px;
+  margin-top: 6px;
 }
 .proto-fields {
   flex: 1;
@@ -355,8 +692,48 @@ async function onSubmit() {
 .init-form {
   margin-top: 16px;
 }
-.add-tier-btn {
-  margin-top: 10px;
+.model-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+.model-head .block-desc {
+  flex: 1;
+  margin-bottom: 14px;
+}
+.model-toolbar {
+  display: flex;
+  gap: 8px;
+  flex: none;
+}
+.model-table {
+  margin-top: 4px;
+}
+.rate-cell {
+  cursor: help;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text);
+}
+.muted-id {
+  color: var(--color-text-tertiary);
+  text-decoration: line-through;
+}
+.added-tag {
+  margin-left: 8px;
+}
+.pull-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.model-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 24px;
+}
+.model-form .span-2 {
+  grid-column: 1 / -1;
 }
 .actions {
   margin-top: 20px;

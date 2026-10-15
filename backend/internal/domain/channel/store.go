@@ -244,6 +244,28 @@ func (s *Store) List(ctx context.Context) ([]Channel, error) {
 	return channels, nil
 }
 
+// ListByProtocol 查询引用某渠道协议的全部未删除渠道（按 id 升序），供协议变更后定向重物化。
+func (s *Store) ListByProtocol(ctx context.Context, protocolID int64) ([]Channel, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+channelCols+` FROM channels WHERE channel_protocol_id = $1 AND deleted_at IS NULL ORDER BY id ASC`, protocolID)
+	if err != nil {
+		return nil, fmt.Errorf("list channels by protocol: %w", err)
+	}
+	defer rows.Close()
+	channels := make([]Channel, 0, 8)
+	for rows.Next() {
+		c, err := scanChannel(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan channel: %w", err)
+		}
+		channels = append(channels, *c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return channels, nil
+}
+
 // ErrNameExists 表示渠道名称唯一约束冲突（PG 23505）。
 var ErrNameExists = errors.New("channel name already exists")
 

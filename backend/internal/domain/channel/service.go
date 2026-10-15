@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 
+	"github.com/team/llmgateway/internal/domain/billing"
 	"github.com/team/llmgateway/internal/domain/channelprotocol"
 	"github.com/team/llmgateway/internal/pkg/idgen"
 	"github.com/team/llmgateway/internal/pkg/resp"
@@ -191,6 +193,8 @@ func (s *Service) CreateChannel(ctx context.Context, in ChannelInput) (*Channel,
 		s.mgr.Upsert(&upsert)
 		s.mgr.SetBoundTags(created.ID, created.BoundTags)
 	}
+	// 引用协议时自动物化 channel_models（仅 externalModelID>0 的行）。
+	s.materializeForChannel(ctx, created.ID, in.ChannelProtocolID)
 	return created, nil
 }
 
@@ -261,6 +265,7 @@ func (s *Service) UpdateChannel(ctx context.Context, id int64, in ChannelInput) 
 		s.mgr.Upsert(&upsert)
 		s.mgr.SetBoundTags(c.ID, c.BoundTags)
 	}
+	s.materializeForChannel(ctx, c.ID, in.ChannelProtocolID)
 	return c, nil
 }
 
@@ -333,6 +338,103 @@ func (s *Service) BatchDeleteChannels(ctx context.Context, ids []int64) (int64, 
 		}
 	}
 	return n, nil
+}
+
+// materializeForChannel 渠道引用协议时自动物化 channel_models（Create/Update 成功后调用）。
+// 未引用协议、未装配 cmStore/cpStore 或协议已不存在时静默跳过。
+func (s *Service) materializeForChannel(ctx context.Context, channelID int64, protocolID *int64) {
+	if protocolID == nil || *protocolID <= 0 || s.cmStore == nil || s.cpStore == nil {
+		return
+	}
+	cp, err := s.cpStore.GetByID(ctx, *protocolID)
+	if err != nil {
+		return
+	}
+	_, _ = s.materializeFromProtocol(ctx, channelID, cp)
+}
+
+// materializeFromProtocol 按协议模型清单物化/更新该渠道的 channel_models：
+// 仅处理 externalModelID>0 的行；按 (channel_id, internal_model_id) upsert，保留既有 State 与
+// 运行参数（rate_limit/health_probe/reliability），不删除协议未列出的渠道模型。返回写入行数。
+func (s *Service) materializeFromProtocol(ctx context.Context, channelID int64, cp *channelprotocol.ChannelProtocol) (int, error) {
+	if cp == nil || s.cmStore == nil || len(cp.Models) == 0 {
+		return 0, nil
+	}
+	// 固定按内部模型 ID 升序写入，保证物化顺序稳定可测。
+	keys := make([]string, 0, len(cp.Models))
+	for k := range cp.Models {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	n := 0
+	for _, internalID := range keys {
+		mg := cp.Models[internalID]
+		if mg.ExternalModelID <= 0 {
+			continue // 未绑定对外模型的行不物化（D5：channel_models.external_model_id NOT NULL）
+		}
+		m := &ChannelModel{
+			ChannelID:       channelID,
+			InternalModelID: internalID,
+			ExternalModelID: mg.ExternalModelID,
+			CostRates:       billing.Rates(mg.CostRates),
+			TimeConfig:      mg.TimeConfig,
+			ContextTiers:    mg.ContextTiers,
+			Protocols:       mg.Protocols,
+		}
+		existing, err := s.cmStore.GetByChannelAndInternal(ctx, channelID, internalID)
+		switch {
+		case err == nil:
+			m.ID = existing.ID
+			m.State = existing.State // 保留渠道侧状态（状态机为权威）
+			m.RateLimit = existing.RateLimit
+			m.HealthProbe = existing.HealthProbe
+			m.Reliability = existing.Reliability
+			if uerr := s.cmStore.Update(ctx, m); uerr != nil {
+				return n, fmt.Errorf("update channel model %q: %w", internalID, uerr)
+			}
+			if fresh, ferr := s.cmStore.GetByID(ctx, m.ID); ferr == nil && s.mgr != nil {
+				s.mgr.UpsertModel(fresh)
+			}
+		case errors.Is(err, sql.ErrNoRows):
+			m.State = StateNormal
+			created, cerr := s.cmStore.Insert(ctx, m)
+			if cerr != nil {
+				return n, fmt.Errorf("insert channel model %q: %w", internalID, cerr)
+			}
+			if s.mgr != nil {
+				s.mgr.UpsertModel(created)
+			}
+		default:
+			return n, fmt.Errorf("get channel model %q: %w", internalID, err)
+		}
+		n++
+	}
+	return n, nil
+}
+
+// RematerializeProtocol 按协议重物化引用该协议的全部渠道的 channel_models（协议 CRUD/Sync 后刷新）。
+// 物化仅 upsert、不删除；保留既有渠道模型状态与运行参数。协议已不存在时视为无目标、正常返回。
+func (s *Service) RematerializeProtocol(ctx context.Context, protocolID int64) error {
+	if s.cmStore == nil || s.cpStore == nil || protocolID <= 0 {
+		return nil
+	}
+	cp, err := s.cpStore.GetByID(ctx, protocolID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		return fmt.Errorf("get channel protocol: %w", err)
+	}
+	chs, err := s.store.ListByProtocol(ctx, protocolID)
+	if err != nil {
+		return err
+	}
+	for i := range chs {
+		if _, merr := s.materializeFromProtocol(ctx, chs[i].ID, cp); merr != nil {
+			return fmt.Errorf("rematerialize channel %d from protocol %d: %w", chs[i].ID, protocolID, merr)
+		}
+	}
+	return nil
 }
 
 // ModelForceState 手动设置内部模型状态（normal/drain/disable），写模型事件。
