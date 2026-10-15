@@ -1,6 +1,7 @@
 package billing
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -57,6 +58,62 @@ type TimeCoeffConfig struct {
 	Default   float64        `json:"Default"`
 	Periodic  []Segment      `json:"Periodic"`
 	Overrides []DateOverride `json:"Overrides"`
+}
+
+// timeConfigLegacy 是历史 snake_case 形状（timezone/default_coeff/periodic_segments/date_overrides）。
+// 仅用于读取既有部署可能残留的旧种子数据，不对外输出。
+type timeConfigLegacy struct {
+	Timezone  string           `json:"timezone"`
+	Default   float64          `json:"default_coeff"`
+	Periodic  []segmentLegacy  `json:"periodic_segments"`
+	Overrides []overrideLegacy `json:"date_overrides"`
+}
+
+type segmentLegacy struct {
+	Name  string  `json:"name"`
+	Start string  `json:"start"`
+	End   string  `json:"end"`
+	Coeff float64 `json:"coeff"`
+}
+
+type overrideLegacy struct {
+	Name     string          `json:"name"`
+	Start    string          `json:"start"`
+	End      string          `json:"end"`
+	Segments []segmentLegacy `json:"segments"`
+}
+
+func (l timeConfigLegacy) toConfig() TimeCoeffConfig {
+	out := TimeCoeffConfig{Timezone: l.Timezone, Default: l.Default}
+	for _, s := range l.Periodic {
+		out.Periodic = append(out.Periodic, Segment{Name: s.Name, Start: s.Start, End: s.End, Coeff: s.Coeff})
+	}
+	for _, o := range l.Overrides {
+		ov := DateOverride{Name: o.Name, Start: o.Start, End: o.End}
+		for _, s := range o.Segments {
+			ov.Segments = append(ov.Segments, Segment{Name: s.Name, Start: s.Start, End: s.End, Coeff: s.Coeff})
+		}
+		out.Overrides = append(out.Overrides, ov)
+	}
+	return out
+}
+
+// ParseTimeConfig 解析时段系数配置：优先新契约（PascalCase，与 HTTP API/seed 一致）；
+// 若新契约解析结果为空（历史 snake_case 种子写入导致零值），回退按 snake_case 解析，
+// 兼容既有部署的历史数据，避免时段系数恒 0 导致计费为 0。
+func ParseTimeConfig(raw []byte) (TimeCoeffConfig, error) {
+	var tc TimeCoeffConfig
+	if err := json.Unmarshal(raw, &tc); err != nil {
+		return TimeCoeffConfig{}, err
+	}
+	if len(tc.Periodic) == 0 && len(tc.Overrides) == 0 && tc.Default == 0 {
+		var legacy timeConfigLegacy
+		if err := json.Unmarshal(raw, &legacy); err == nil &&
+			(legacy.Timezone != "" || legacy.Default != 0 || len(legacy.Periodic) > 0 || len(legacy.Overrides) > 0) {
+			return legacy.toConfig(), nil
+		}
+	}
+	return tc, nil
 }
 
 // parseTimeOfDay 解析 "HH:MM" 为距 0 点的分钟数（0..1439）。"24:00" 视为 1440（日末边界）。
