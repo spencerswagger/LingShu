@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { getBilling } from '@/api/admin'
 import type { BillingDetail } from '@/api/dev'
@@ -9,6 +9,10 @@ import CallLogPanel from '@/components/CallLogPanel.vue'
 
 const route = useRoute()
 const billingId = String(route.params.id)
+
+// mode='self' 时复用为开发者自助账单详情页（API 走 /dev 前缀，隐藏 admin 字段）
+const props = withDefaults(defineProps<{ mode?: 'admin' | 'self' }>(), { mode: 'admin' })
+const isSelf = computed(() => props.mode === 'self')
 
 const loading = ref(false)
 const detail = ref<BillingDetail | null>(null)
@@ -38,7 +42,7 @@ onMounted(async () => {
   loading.value = true
   errInfo.value = { message: '', requestId: '' }
   try {
-    const res = await getBilling(billingId)
+    const res = await getBilling(billingId, isSelf.value ? '/dev' : '/admin')
     detail.value = res.Data
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
@@ -60,8 +64,8 @@ function fmt(n: number | undefined) {
         <el-descriptions :column="2" border>
           <el-descriptions-item label="时间" :span="2">{{ detail.CallTime }}</el-descriptions-item>
           <el-descriptions-item label="模型">{{ detail.Model }}</el-descriptions-item>
-          <!-- admin 额外只读字段 -->
-          <el-descriptions-item label="渠道">{{ detail.ChannelName || '-' }}</el-descriptions-item>
+          <!-- admin 额外只读字段；self 模式（dev 响应不含该字段）不展示 -->
+          <el-descriptions-item v-if="!isSelf" label="渠道">{{ detail.ChannelName || '-' }}</el-descriptions-item>
           <el-descriptions-item label="模式">
             <el-tag :type="detail.PricingMode === 'cost' ? 'warning' : 'primary'" size="small" effect="plain">
               {{ detail.PricingMode === 'cost' ? '按成本' : '按售价' }}

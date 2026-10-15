@@ -14,8 +14,52 @@ import (
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/team/llmgateway/internal/domain/channelprotocol"
 	"github.com/team/llmgateway/internal/pkg/crypto"
 )
+
+// 探测目标按渠道协议解析有效 baseURL/path/auth：仅引用协议（内联 base_url 为空）时不再探测到空 URL。
+func TestProbeRequest_HonorsChannelProtocol(t *testing.T) {
+	m := newProbeTestManager()
+	rt := &RuntimeChannel{
+		Channel: Channel{ID: 1, Name: "c1"},
+		Protocol: &channelprotocol.ChannelProtocol{
+			BaseURL: "https://proto.example.com",
+			Protocols: channelprotocol.Protocols{
+				channelprotocol.ProtocolOpenAIChat: {BaseURL: "https://proto-chat.example.com", Path: "/v2/chat"},
+			},
+			Auth: channelprotocol.AuthSpec{Header: "x-api-key", Scheme: "raw"},
+		},
+	}
+	target, header, value := m.probeRequest(rt, "sk-1")
+	if target != "https://proto-chat.example.com/v2/chat" {
+		t.Errorf("探测目标应取协议级 baseUrl+path, got %q", target)
+	}
+	if header != "x-api-key" || value != "sk-1" {
+		t.Errorf("探测鉴权应取协议 x-api-key/raw, got %q/%q", header, value)
+	}
+}
+
+// renderAuth/joinProbeURL：auth.query 注入（含 {api_key} 替换、键排序）与去基址尾斜杠；空凭据不注入。
+func TestRenderAuthAndJoinProbeURL(t *testing.T) {
+	header, value, query := renderAuth(channelprotocol.AuthSpec{
+		Header: "Authorization", Scheme: "bearer",
+		Query: map[string]string{"api-version": "2025-04-01-preview", "key": "{api_key}"},
+	}, "sk-secret")
+	if header != "Authorization" || value != "Bearer sk-secret" {
+		t.Fatalf("renderAuth header/value 错误: %q/%q", header, value)
+	}
+	got := joinProbeURL("https://up.example.com/", "/chat/completions", query)
+	want := "https://up.example.com/chat/completions?api-version=2025-04-01-preview&key=sk-secret"
+	if got != want {
+		t.Fatalf("joinProbeURL want %q, got %q", want, got)
+	}
+
+	// 空凭据：与网关 injectAuth 一致，不注入任何鉴权头/query。
+	if _, v, q := renderAuth(channelprotocol.AuthSpec{Header: "x-api-key", Scheme: "raw"}, ""); v != "" || len(q) != 0 {
+		t.Fatalf("空凭据不应注入鉴权: value=%q query=%v", v, q)
+	}
+}
 
 // newProbeTestManager 返回一个可执行 doProbe 的 Manager（store 为空，仅用于探测链路）。
 func newProbeTestManager() *Manager {
@@ -33,7 +77,7 @@ func TestDoProbe_MarksProbeFeedback(t *testing.T) {
 	defer srv.Close()
 
 	m := newProbeTestManager()
-	fb, usage, errMsg := m.doProbe(context.Background(), srv.URL+"/chat/completions", "key", "m1", 2*time.Second)
+	fb, usage, errMsg := m.doProbeAuth(context.Background(), srv.URL+"/chat/completions", "Authorization", "Bearer key", "m1", 2*time.Second)
 	if errMsg != "" {
 		t.Fatalf("unexpected error: %s", errMsg)
 	}
@@ -56,7 +100,7 @@ func TestDoProbe_MarksTimeout(t *testing.T) {
 	defer srv.Close()
 
 	m := newProbeTestManager()
-	fb, _, errMsg := m.doProbe(context.Background(), srv.URL+"/chat/completions", "key", "m1", 30*time.Millisecond)
+	fb, _, errMsg := m.doProbeAuth(context.Background(), srv.URL+"/chat/completions", "Authorization", "Bearer key", "m1", 30*time.Millisecond)
 	if errMsg == "" {
 		t.Fatalf("expected timeout error, got nil, fb=%+v", fb)
 	}
@@ -115,7 +159,7 @@ func newKeyProbeTestManager(t *testing.T, baseURL string, hp HealthProbeConfig, 
 	}
 	ch := &Channel{
 		ID: 1, Name: "c1", Protocol: ProtocolOpenAICompat, BaseURL: baseURL,
-		State: StateNormal, RateLimit: RateLimitConfig{MaxConcurrent: 8},
+		RateLimit:   RateLimitConfig{MaxConcurrent: 8},
 		HealthProbe: hp,
 		Reliability: ReliabilityConfig{WindowSeconds: 60, MinSamples: 10},
 		CreatedAt:   now, UpdatedAt: now,
@@ -319,6 +363,43 @@ func TestKeyProbeOnce_ProbeModelTakesPriority(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("explicit model probe log not written with level=model: %v", err)
+	}
+}
+
+// TestKeyProbeOnce_RecoversDrainedModel 定时密钥探测同时回喂内部模型状态机：
+// 被真实调用打到 DRAIN 的内部模型，经连续探活成功达阈值后自动恢复 NORMAL（不再永久死锁）。
+func TestKeyProbeOnce_RecoversDrainedModel(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"usage":{"total_tokens":1}}`))
+	}))
+	defer srv.Close()
+
+	mgr, mock := newKeyProbeTestManager(t, srv.URL, HealthProbeConfig{FailThreshold: 1, RecoveryThreshold: 2, TimeoutMS: 1000},
+		[]ChannelModel{{ID: 21, InternalModelID: "m1", ExternalModelID: 1, State: StateDrain}})
+	addKeyRuntime(t, mgr, 11, testKeyACred, StateNormal)
+
+	mr, ok := mgr.GetModelRuntime(1, 21)
+	if !ok || mr.Machine.State() != StateDrain {
+		t.Fatalf("setup: model want DRAIN, got %+v", mr)
+	}
+
+	// 第一次探活成功：阈值 2 未满 → 模型仍 DRAIN（无状态流转事件）。
+	mock.ExpectExec(regexp.QuoteMeta(insertProbeLogSQL)).WillReturnResult(sqlmock.NewResult(1, 1))
+	mgr.keyProbeOnce(context.Background(), 11)
+	if mr.Machine.State() != StateDrain {
+		t.Fatalf("首次探活成功（阈值 2）应维持 DRAIN，got %s", mr.Machine.State())
+	}
+
+	// 第二次探活成功：达阈值 → 模型恢复 NORMAL 并落 channel_model_events。
+	expectModelTransition(mock, 1, "m1", StateDrain, StateNormal, reasonProbeRecover)
+	mock.ExpectExec(regexp.QuoteMeta(insertProbeLogSQL)).WillReturnResult(sqlmock.NewResult(2, 1))
+	mgr.keyProbeOnce(context.Background(), 11)
+	if mr.Machine.State() != StateNormal {
+		t.Fatalf("连续探活成功应恢复 NORMAL，got %s", mr.Machine.State())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("mock expectations: %v", err)
 	}
 }
 
@@ -602,7 +683,8 @@ func TestProbeKeyNow_FailureTransitionsDrain(t *testing.T) {
 	}
 }
 
-// TestProbeKeyNow_DrainRecoversToNormal 密钥手动探测连续成功达恢复阈值 → 由 DRAIN 恢复 NORMAL。
+// TestProbeKeyNow_DrainRecoversToNormal 密钥手动探测成功 → 立即由 DRAIN 恢复 NORMAL：
+// 手动为管理员显式动作，免等连续成功阈值（定时探测仍按 RecoveryThreshold 累计）。
 func TestProbeKeyNow_DrainRecoversToNormal(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -615,25 +697,19 @@ func TestProbeKeyNow_DrainRecoversToNormal(t *testing.T) {
 	addKeyRuntime(t, mgr, 11, testKeyACred, StateDrain)
 
 	target := srv.URL + "/chat/completions"
-	for i := 0; i < 2; i++ {
-		mock.ExpectExec(regexp.QuoteMeta(insertProbeLogSQL)).
-			WithArgs(sqlmock.AnyArg(), int64(11), "m1", "model", target, true, "", 0, 0, 0, 1, sqlmock.AnyArg()).
-			WillReturnResult(sqlmock.NewResult(int64(i+1), 1))
-	}
+	mock.ExpectExec(regexp.QuoteMeta(insertProbeLogSQL)).
+		WithArgs(sqlmock.AnyArg(), int64(11), "m1", "model", target, true, "", 0, 0, 0, 1, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	out, err := mgr.ProbeKeyNow(11)
 	if err != nil {
-		t.Fatalf("ProbeKeyNow #1: %v", err)
-	}
-	if out.State != string(StateDrain) {
-		t.Fatalf("首次成功（阈值 2）应维持 DRAIN，got %s", out.State)
-	}
-	out, err = mgr.ProbeKeyNow(11)
-	if err != nil {
-		t.Fatalf("ProbeKeyNow #2: %v", err)
+		t.Fatalf("ProbeKeyNow: %v", err)
 	}
 	if !out.OK || out.State != string(StateNormal) {
-		t.Fatalf("连续成功达阈值应恢复 NORMAL，got %+v", out)
+		t.Fatalf("手动探测成功应立即恢复 NORMAL，got %+v", out)
+	}
+	if kr, _ := mgr.GetKeyRuntime(11); kr.Machine.State() != StateNormal {
+		t.Fatalf("key machine want NORMAL, got %s", kr.Machine.State())
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("mock expectations: %v", err)

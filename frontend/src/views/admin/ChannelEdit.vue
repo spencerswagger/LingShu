@@ -1,14 +1,12 @@
 <script setup lang="ts">
-import { onMounted, reactive, ref, watch } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Edit, Delete } from '@element-plus/icons-vue'
 import {
   listChannels,
   updateChannel,
-  channelState,
   listChannelModels,
-  listChannelEvents,
   listModelEvents,
   listProbeLogs,
   listChannelKeys,
@@ -19,8 +17,8 @@ import {
   probeChannelKey,
   cronPreview,
   listTags,
+  listChannelProtocols,
   type AdminChannel,
-  type ChannelEvent,
   type ChannelModelEvent,
   type ProbeLog,
   type ChannelKey,
@@ -40,10 +38,8 @@ const activeTab = ref('base')
 const errInfo = ref<{ message: string; requestId: string }>({ message: '', requestId: '' })
 
 const channel = ref<AdminChannel | null>(null)
-const events = ref<ChannelEvent[]>([])
 const modelEvents = ref<ChannelModelEvent[]>([])
 const probeLogs = ref<ProbeLog[]>([])
-const actionLoading = ref(false)
 // 探测模型下拉：渠道内部模型
 const probeModels = ref<string[]>([])
 // 渠道密钥（独立运行时实体）
@@ -59,12 +55,14 @@ const form = reactive({
   name: '',
   protocol: 'openai-compat',
   base_url: '',
+  channel_protocol_id: '' as string, // 引用的渠道协议 ID；空=使用内联配置
   tag_ids: [] as string[],
   priority: 100,
   rpm: 0,
   tpm: 0,
   burst_multiplier: 1.2,
   on_exceed: 'QUEUE' as string,
+  queue_size: 100,
   queue_timeout_ms: 0,
   max_concurrent: 16,
   interval: '0 0 * * * *',
@@ -81,6 +79,9 @@ const form = reactive({
   auth_fail_threshold: 3,
 })
 
+// 是否引用渠道协议：选中时内联 protocol/base_url 由协议承载，禁用内联编辑与校验
+const usingProtocol = computed(() => !!form.channel_protocol_id)
+
 const stateLabel: Record<string, string> = { NORMAL: '正常', DRAIN: '排空', DISABLED: '禁用' }
 
 const tagOptions = ref<{ ID: string; Name: string }[]>([])
@@ -90,6 +91,17 @@ async function loadTags() {
     tagOptions.value = res.Data || []
   } catch {
     tagOptions.value = []
+  }
+}
+
+// 渠道协议下拉：选中后以内联配置为准（protocol/base_url 交由协议承载，内联字段禁用）
+const protocolOptions = ref<{ ID: string; Name: string }[]>([])
+async function loadProtocols() {
+  try {
+    const res = await listChannelProtocols()
+    protocolOptions.value = res.Data || []
+  } catch {
+    protocolOptions.value = []
   }
 }
 
@@ -192,12 +204,14 @@ async function load() {
     form.name = row.Name
     form.protocol = row.Protocol
     form.base_url = row.BaseURL
+    form.channel_protocol_id = row.ChannelProtocolID != null ? String(row.ChannelProtocolID) : ''
     form.tag_ids = row.TagIDs || []
     form.priority = row.Priority
     form.rpm = row.RateLimit?.RPM || 0
     setTpmDisplay(row.RateLimit?.TPM || 0)
     form.burst_multiplier = row.RateLimit?.BurstMultiplier || 1.2
     form.on_exceed = row.RateLimit?.OnExceed || 'QUEUE'
+    form.queue_size = row.RateLimit?.QueueSize ?? 100
     form.queue_timeout_ms = row.RateLimit?.QueueTimeoutMS || 0
     form.max_concurrent = row.RateLimit?.MaxConcurrent || 16
     form.interval = row.HealthProbe?.Interval || '0 0 * * * *'
@@ -215,6 +229,7 @@ async function load() {
     await loadStateData()
     await loadKeys()
     await loadTags()
+    await loadProtocols()
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
   } finally {
@@ -224,12 +239,10 @@ async function load() {
 onMounted(load)
 
 async function loadStateData() {
-  const [evRes, meRes, plRes] = await Promise.all([
-    listChannelEvents(id).catch(() => ({ Data: [] as ChannelEvent[] })),
+  const [meRes, plRes] = await Promise.all([
     listModelEvents(id).catch(() => ({ Data: [] as ChannelModelEvent[] })),
     listProbeLogs(id, 50).catch(() => ({ Data: [] as ProbeLog[] })),
   ])
-  events.value = evRes.Data || []
   modelEvents.value = meRes.Data || []
   probeLogs.value = plRes.Data || []
 }
@@ -324,7 +337,8 @@ async function onProbeKey(k: ChannelKey) {
     const res = await probeChannelKey(id, k.ID)
     const o = res.Data
     if (o.OK) {
-      ElMessage.success(`密钥「${k.Name}」探测成功（${o.DurationMS}ms）`)
+      const extra = o.State && o.State !== 'NORMAL' ? `，当前状态 ${o.State}` : ''
+      ElMessage.success(`密钥「${k.Name}」探测成功（${o.DurationMS}ms${extra}）`)
     } else {
       ElMessage.error(`密钥「${k.Name}」探测失败：${o.Error || '未知错误'}`)
     }
@@ -336,33 +350,10 @@ async function onProbeKey(k: ChannelKey) {
   }
 }
 
-async function onToggleState(action: 'normal' | 'drain' | 'disable') {
-  const label = stateLabel[action.toUpperCase()] || action
-  try {
-    await ElMessageBox.confirm(`确认手动将渠道置为「${label}」？`, '状态操作', {
-      type: 'warning',
-      confirmButtonText: '确认',
-      cancelButtonText: '取消',
-    })
-  } catch {
-    return
-  }
-  actionLoading.value = true
-  try {
-    const res = await channelState(id, action)
-    channel.value = res.Data
-    ElMessage.success(`已置为 ${label}`)
-    await loadStateData()
-  } catch (e: any) {
-    ElMessage.error(e?.message || '操作失败')
-  } finally {
-    actionLoading.value = false
-  }
-}
-
 async function onSubmit() {
   if (!form.name.trim()) return ElMessage.warning('请填写渠道名称')
-  if (!/^https?:\/\//.test(form.base_url)) return ElMessage.warning('Base URL 必须以 http(s):// 开头')
+  if (!usingProtocol.value && !/^https?:\/\//.test(form.base_url))
+    return ElMessage.warning('Base URL 必须以 http(s):// 开头')
 
   saving.value = true
   errInfo.value = { message: '', requestId: '' }
@@ -371,6 +362,7 @@ async function onSubmit() {
       Name: form.name.trim(),
       Protocol: form.protocol,
       BaseURL: form.base_url.trim(),
+      ChannelProtocolID: form.channel_protocol_id || null,
       TagIDs: form.tag_ids,
       Priority: form.priority,
       RateLimit: {
@@ -378,7 +370,7 @@ async function onSubmit() {
         TPM: tpmRaw(),
         BurstMultiplier: Number(form.burst_multiplier),
         OnExceed: form.on_exceed,
-        QueueSize: 0,
+        QueueSize: Number(form.queue_size),
         QueueTimeoutMS: Number(form.queue_timeout_ms),
         MaxConcurrent: Number(form.max_concurrent),
       },
@@ -418,13 +410,23 @@ async function onSubmit() {
             <el-form-item label="名称" required>
               <el-input v-model="form.name" maxlength="64" />
             </el-form-item>
+            <el-form-item class="span-2" label="渠道协议">
+              <el-select v-model="form.channel_protocol_id" clearable style="width: 100%"
+                placeholder="不使用（内联配置）">
+                <el-option label="不使用（内联配置）" value="" />
+                <el-option v-for="p in protocolOptions" :key="p.ID" :label="p.Name" :value="p.ID" />
+              </el-select>
+              <div class="hint">选中后以渠道协议承载 protocol / base_url 等配置，下方内联字段将被禁用；不选则使用内联配置</div>
+            </el-form-item>
             <el-form-item label="协议">
-              <el-select v-model="form.protocol" style="width: 100%">
-                <el-option label="openai-compat" value="openai-compat" />
+              <el-select v-model="form.protocol" style="width: 100%" :disabled="usingProtocol">
+                <el-option label="openai-compat（OpenAI 兼容）" value="openai-compat" />
+                <el-option label="openai-responses" value="openai-responses" />
+                <el-option label="anthropic-messages" value="anthropic-messages" />
               </el-select>
             </el-form-item>
             <el-form-item class="span-2" label="Base URL">
-          <el-input v-model="form.base_url" />
+          <el-input v-model="form.base_url" :disabled="usingProtocol" />
           <div class="hint">上游供应商地址，网关请求将转发到该地址下的 /chat/completions 等路径</div>
         </el-form-item>
             <el-form-item class="span-2" label="标签">
@@ -442,7 +444,7 @@ async function onSubmit() {
           <div class="key-section">
             <div class="key-head">
               <span class="state-label">渠道密钥</span>
-              <el-tooltip content="密钥为独立运行时实体：探测、限流、会话计数按密钥各自独立；渠道级状态为批量操作" placement="top">
+              <el-tooltip content="密钥为独立运行时实体：探测、限流、会话计数按密钥各自独立；渠道无独立状态，可用性以密钥为准" placement="top">
                 <span class="key-tip">?</span>
               </el-tooltip>
               <el-button size="small" type="primary" :icon="Plus" @click="openKeyCreate">新增密钥</el-button>
@@ -725,43 +727,7 @@ async function onSubmit() {
       <el-tab-pane label="状态" name="status">
         <div v-loading="loading" class="card">
           <template v-if="channel">
-            <div class="state-head">
-              <span class="state-label">渠道状态</span>
-              <StatusTag :value="channel.State" />
-              <div class="state-actions">
-                <template v-if="channel.State !== 'NORMAL'">
-                  <el-button size="small" type="success" :loading="actionLoading" @click="onToggleState('normal')">正常</el-button>
-                </template>
-                <template v-if="channel.State !== 'DRAIN'">
-                  <el-button size="small" type="warning" :loading="actionLoading" @click="onToggleState('drain')">排空</el-button>
-                </template>
-                <template v-if="channel.State !== 'DISABLED'">
-                  <el-button size="small" type="danger" :loading="actionLoading" @click="onToggleState('disable')">禁用</el-button>
-                </template>
-              </div>
-            </div>
-            <div class="sub-title">渠道状态流转记录</div>
-            <el-table :data="events" border stripe class="table-nowrap small">
-              <el-table-column label="变更" width="150">
-                <template #default="{ row }">
-                  <StatusTag :value="row.FromState" />
-                  <span class="arrow">→</span>
-                  <StatusTag :value="row.ToState" />
-                </template>
-              </el-table-column>
-              <el-table-column label="原因" min-width="200" show-overflow-tooltip>
-                <template #default="{ row }">{{ reasonZh(row.Reason) }}</template>
-              </el-table-column>
-              <el-table-column label="时间" min-width="150">
-                <template #default="{ row }">
-                  <div class="t-date">{{ fmtDate(row.CreatedAt) }}</div>
-                  <div class="t-time">{{ fmtTime(row.CreatedAt) }}</div>
-                </template>
-              </el-table-column>
-            </el-table>
-            <el-empty v-if="!events.length" description="暂无渠道状态流转记录" :image-size="48" />
-
-            <div class="sub-title">密钥状态</div>
+            <div class="sub-title">密钥状态（渠道无独立状态，可用性以密钥为准）</div>
             <div v-loading="keysLoading">
               <el-table :data="keys" border stripe class="table-nowrap small">
                 <el-table-column label="名称" prop="Name" min-width="130" show-overflow-tooltip />
@@ -907,18 +873,6 @@ async function onSubmit() {
 }
 .actions {
   margin-top: 20px;
-}
-.state-head {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  margin-bottom: 16px;
-}
-.state-actions {
-  margin-left: auto;
-  display: flex;
-  align-items: center;
-  gap: 8px;
 }
 .state-label {
   font-weight: 600;

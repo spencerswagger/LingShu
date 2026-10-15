@@ -26,3 +26,8 @@ billing:
   # billing_id 唯一索引保证重投幂等。留空则关闭该兜底（落库失败仅告警）。
   retry_queue_path: "data/billing_retry.jsonl"
   retry_interval_seconds: 30
+preset:
+  # 外挂渠道预设包地址（对齐 models.dev v1 形状，见 docs/preset-pack-format.md）。
+  # 首次启动（初始化）自动拉取一次并物化为渠道协议；后续由管理员在「渠道协议」页手动同步。
+  # 留空表示未配置：启动时不拉取（不报错），渠道协议列表为空。
+  pack_url: ""

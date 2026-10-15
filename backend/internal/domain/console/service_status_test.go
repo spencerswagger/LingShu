@@ -137,7 +137,7 @@ func TestHandleServiceStatus(t *testing.T) {
 func TestHandleServiceStatus_ActiveSessions(t *testing.T) {
 	mgr := channel.NewManager(nil, nil, nil, nil, nil, nil)
 	ch := channel.Channel{
-		ID: 1, Name: "c1", Protocol: channel.ProtocolOpenAICompat, State: channel.StateNormal,
+		ID: 1, Name: "c1", Protocol: channel.ProtocolOpenAICompat,
 		RateLimit: channel.RateLimitConfig{RPM: 100, TPM: 1000, BurstMultiplier: 1.0, MaxConcurrent: 8},
 	}
 	mgr.Upsert(&ch)

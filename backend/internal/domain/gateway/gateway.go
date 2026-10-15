@@ -8,6 +8,7 @@ import (
 
 	"github.com/team/llmgateway/internal/domain/billing"
 	"github.com/team/llmgateway/internal/domain/channel"
+	"github.com/team/llmgateway/internal/domain/channelprotocol"
 	"github.com/team/llmgateway/internal/domain/identity"
 	"github.com/team/llmgateway/internal/domain/model"
 	"github.com/team/llmgateway/internal/domain/router"
@@ -33,6 +34,8 @@ type ChannelResolver interface {
 	GetModelRuntime(channelID, modelRowID int64) (*channel.ModelRuntime, bool)
 	FeedResult(keyID int64, modelRowID int64, f channel.Feedback)
 	KeyMaxSessions(keyID int64) int
+	// DisableChannel 将渠道及其全部密钥置为禁用（AC-17：上游 usage 缺失/无法解析时）。
+	DisableChannel(channelID int64)
 }
 
 // SessionExpiryResolver 会话过期 TTL 计算抽象（router.SessionExpiryProvider 满足）。
@@ -109,6 +112,8 @@ type Gateway struct {
 	now             func() time.Time
 	client          *http.Client // 非流式上游客户端（默认 300s 超时）
 	streamClient    *http.Client // 流式上游客户端（不设 body 超时，由 ctx 控制）
+	// upstreamRespHeaders 全局上游响应头白名单（默认空，未配置时返回 nil）。
+	upstreamRespHeaders func() []string
 }
 
 // GatewayConfig 是 NewGateway 的入参。
@@ -137,6 +142,9 @@ type GatewayConfig struct {
 	TouchLastUsed func(ctx context.Context, tokenID int64) error
 	// ListEnabledModels 返回启用中的对外模型（GET /v1/models 用；为空时该端点返回空列表）。
 	ListEnabledModels func(ctx context.Context) ([]model.ExternalModel, error)
+	// UpstreamResponseHeaderWhitelist 读取全局上游响应头白名单（sys_configs，默认空）。
+	// 未配置/读取失败按空处理（不透传任何上游头，维持渠道透明）。
+	UpstreamResponseHeaderWhitelist func() ([]string, error)
 }
 
 // NewGateway 构造网关。缺省项使用合理默认值。
@@ -158,56 +166,89 @@ func NewGateway(cfg GatewayConfig) *Gateway {
 		streamClient.Timeout = 0
 		cfg.StreamClient = &streamClient
 	}
+	var respHeaders func() []string
+	if cfg.UpstreamResponseHeaderWhitelist != nil {
+		respHeaders = func() []string {
+			if cfg.UpstreamResponseHeaderWhitelist == nil {
+				return nil
+			}
+			names, err := cfg.UpstreamResponseHeaderWhitelist()
+			if err != nil {
+				return nil
+			}
+			return names
+		}
+	}
 	return &Gateway{
-		tokens:          cfg.Tokens,
-		router:          cfg.Router,
-		channels:        cfg.Channels,
-		billing:         cfg.Billing,
-		models:          cfg.Models,
-		channelModels:   cfg.ChannelModels,
-		tagKV:           cfg.TagKV,
-		pricing:         cfg.Pricing,
-		balance:         cfg.Balance,
-		credit:          cfg.Credit,
-		providerFactory: cfg.ProviderFactory,
-		sessionExpiry:   cfg.SessionExpiry,
-		touchLastUsed:   cfg.TouchLastUsed,
-		listEnabled:     cfg.ListEnabledModels,
-		logger:          cfg.Logger,
-		now:             cfg.Now,
-		client:          cfg.Client,
-		streamClient:    cfg.StreamClient,
+		tokens:              cfg.Tokens,
+		router:              cfg.Router,
+		channels:            cfg.Channels,
+		billing:             cfg.Billing,
+		models:              cfg.Models,
+		channelModels:       cfg.ChannelModels,
+		tagKV:               cfg.TagKV,
+		pricing:             cfg.Pricing,
+		balance:             cfg.Balance,
+		credit:              cfg.Credit,
+		providerFactory:     cfg.ProviderFactory,
+		sessionExpiry:       cfg.SessionExpiry,
+		touchLastUsed:       cfg.TouchLastUsed,
+		listEnabled:         cfg.ListEnabledModels,
+		logger:              cfg.Logger,
+		now:                 cfg.Now,
+		client:              cfg.Client,
+		streamClient:        cfg.StreamClient,
+		upstreamRespHeaders: respHeaders,
 	}
 }
 
 // SetCallLogs 注入调用日志存储（nil=不采集调用日志；测试与未装配场景安全）。
 func (g *Gateway) SetCallLogs(s CallLogStore) { g.callLogs = s }
 
-// DefaultProviderFactory 默认协议工厂：目前仅 openai-compat。
-func DefaultProviderFactory(protocol, endpoint string) (Provider, bool) {
-	if protocol != channel.ProtocolOpenAICompat {
-		return nil, false
+// upstreamHeaders 返回全局上游响应头白名单（未配置/读取失败返回 nil=不透传任何上游头）。
+func (g *Gateway) upstreamHeaders() []string {
+	if g.upstreamRespHeaders == nil {
+		return nil
 	}
-	return NewOpenAIProvider(endpoint), true
+	return g.upstreamRespHeaders()
+}
+
+// DefaultProviderFactory 依据基础协议 + 端点创建 Provider。
+// openai-compat 为历史枚举值，按 openai-chat 语义解析。
+func DefaultProviderFactory(protocol, endpoint string) (Provider, bool) {
+	switch channelprotocol.Canonical(protocol) {
+	case channelprotocol.ProtocolOpenAIChat:
+		return NewOpenAIProvider(endpoint), true
+	case channelprotocol.ProtocolOpenAIResponses:
+		return NewResponsesProvider(), true
+	case channelprotocol.ProtocolAnthropicMessages:
+		return NewAnthropicProvider(), true
+	}
+	return nil, false
 }
 
 // Handler 返回挂载了 /v1 各端点的 http.Handler。
 //
 //   - GET  /v1/models
-//   - POST /v1/chat/completions
-//   - POST /v1/completions
-//   - POST /v1/embeddings
+//   - POST /v1/chat/completions  (openai-chat)
+//   - POST /v1/completions       (openai-chat)
+//   - POST /v1/embeddings        (openai-chat)
+//   - POST /v1/responses         (openai-responses)
+//   - POST /v1/messages          (anthropic-messages)
 func (g *Gateway) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/models", g.handleModels)
 	mux.HandleFunc("POST /v1/chat/completions", g.serveWith(EndpointChatCompletions))
 	mux.HandleFunc("POST /v1/completions", g.serveWith(EndpointCompletions))
 	mux.HandleFunc("POST /v1/embeddings", g.serveWith(EndpointEmbeddings))
+	mux.HandleFunc("POST /v1/responses", g.serveWith(EndpointResponses))
+	mux.HandleFunc("POST /v1/messages", g.serveWith(EndpointMessages))
 	return mux
 }
 
 func (g *Gateway) serveWith(endpoint string) http.HandlerFunc {
+	proto := protocolForEndpoint(endpoint)
 	return func(w http.ResponseWriter, r *http.Request) {
-		g.serve(w, r, endpoint)
+		g.serve(w, r, endpoint, proto)
 	}
 }
