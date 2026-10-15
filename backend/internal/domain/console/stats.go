@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/team/llmgateway/internal/domain/billing"
@@ -69,12 +70,21 @@ type statsResp struct {
 	Ops   *statsOps              `json:"Ops,omitempty"`
 }
 
+// parseRFC3339Lenient 解析 RFC3339 时间，并兼容查询串中未编码的 '+'：'2026-10-15T23:59:59+08:00'
+// 若被 URL 解码为空格（' 08:00'）会解析失败，这里把空格还原为 '+' 后重试。
+func parseRFC3339Lenient(v string) (time.Time, error) {
+	if t, err := time.Parse(time.RFC3339, v); err == nil {
+		return t, nil
+	}
+	return time.Parse(time.RFC3339, strings.ReplaceAll(v, " ", "+"))
+}
+
 // statsRangeFromQuery 解析 from/to（RFC3339，缺省近 30 天），归一到整天边界，限制跨度 ≤366 天。
 // 日界统一按 Asia/Shanghai 归一（与全站统计口径一致），不随请求自带时区偏移截断。
 func statsRangeFromQuery(q url.Values, now time.Time) (time.Time, time.Time, error) {
 	to := now
 	if v := q.Get("To"); v != "" {
-		t, err := time.Parse(time.RFC3339, v)
+		t, err := parseRFC3339Lenient(v)
 		if err != nil {
 			return time.Time{}, time.Time{}, errors.New("to 时间格式应为 RFC3339")
 		}
@@ -82,7 +92,7 @@ func statsRangeFromQuery(q url.Values, now time.Time) (time.Time, time.Time, err
 	}
 	from := to.AddDate(0, 0, -29) // 近 30 天（含今天）
 	if v := q.Get("From"); v != "" {
-		t, err := time.Parse(time.RFC3339, v)
+		t, err := parseRFC3339Lenient(v)
 		if err != nil {
 			return time.Time{}, time.Time{}, errors.New("from 时间格式应为 RFC3339")
 		}
