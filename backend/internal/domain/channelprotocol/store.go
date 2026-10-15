@@ -128,15 +128,42 @@ func (s *Store) ListByPresetSource(ctx context.Context) ([]ChannelProtocol, erro
 	return list, rows.Err()
 }
 
+// execer 抽象 *sql.DB / *sql.Tx 的写入能力，使 Store 的写方法可在事务内复用。
+type execer interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+// WithTx 在单个事务内执行 fn：fn 返回错误则回滚，否则提交。用于预设同步的原子落库。
+func (s *Store) WithTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	if err := fn(tx); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit tx: %w", err)
+	}
+	return nil
+}
+
 // Insert 插入新渠道协议并返回回填主键后的完整记录。
 func (s *Store) Insert(ctx context.Context, cp *ChannelProtocol) (*ChannelProtocol, error) {
+	return insertOn(ctx, s.db, cp)
+}
+
+// insertOn 在给定执行器（库或事务）上插入。
+func insertOn(ctx context.Context, e execer, cp *ChannelProtocol) (*ChannelProtocol, error) {
 	if cp.ID == 0 {
 		cp.ID = idgen.New()
 	}
 	if cp.SourceStatus == "" {
 		cp.SourceStatus = SourceActive
 	}
-	row := s.db.QueryRowContext(ctx,
+	row := e.QueryRowContext(ctx,
 		`INSERT INTO channel_protocols(id, name, base_url, protocols, auth, request_headers, models,
 		        preset_source_id, edited, source_status)
 		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING `+cpCols,
@@ -152,7 +179,12 @@ func (s *Store) Insert(ctx context.Context, cp *ChannelProtocol) (*ChannelProtoc
 
 // Update 全量更新渠道协议可写字段（含 edited/source_status），刷新 updated_at。
 func (s *Store) Update(ctx context.Context, cp *ChannelProtocol) error {
-	res, err := s.db.ExecContext(ctx,
+	return updateOn(ctx, s.db, cp)
+}
+
+// updateOn 在给定执行器（库或事务）上全量更新。
+func updateOn(ctx context.Context, e execer, cp *ChannelProtocol) error {
+	res, err := e.ExecContext(ctx,
 		`UPDATE channel_protocols SET name=$1, base_url=$2, protocols=$3, auth=$4,
 		        request_headers=$5, models=$6, preset_source_id=$7, edited=$8, source_status=$9,
 		        updated_at=now()
@@ -171,7 +203,12 @@ func (s *Store) Update(ctx context.Context, cp *ChannelProtocol) error {
 
 // UpdateSourceStatus 仅更新来源状态（ACTIVE/STALE）。
 func (s *Store) UpdateSourceStatus(ctx context.Context, id int64, status string) error {
-	res, err := s.db.ExecContext(ctx,
+	return updateSourceStatusOn(ctx, s.db, id, status)
+}
+
+// updateSourceStatusOn 在给定执行器（库或事务）上更新来源状态。
+func updateSourceStatusOn(ctx context.Context, e execer, id int64, status string) error {
+	res, err := e.ExecContext(ctx,
 		`UPDATE channel_protocols SET source_status=$1, updated_at=now() WHERE id=$2 AND deleted_at IS NULL`,
 		status, id)
 	if err != nil {
@@ -205,4 +242,32 @@ func (s *Store) CountChannelRefs(ctx context.Context, id int64) (int64, error) {
 		return 0, fmt.Errorf("count channel refs: %w", err)
 	}
 	return n, nil
+}
+
+// initialSyncedConfigKey 是「首次启动已同步预设」标记在 sys_configs 中的键。
+const initialSyncedConfigKey = "channel_protocols.initial_synced"
+
+// InitialSynced 判断首次启动同步是否已执行过（跨重启持久，AC-12）。
+func (s *Store) InitialSynced(ctx context.Context) (bool, error) {
+	var v string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT value FROM sys_configs WHERE key=$1`, initialSyncedConfigKey).Scan(&v)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read initial-synced flag: %w", err)
+	}
+	return true, nil
+}
+
+// MarkInitialSynced 落「首次启动已同步」标记（幂等，ON CONFLICT DO NOTHING）。
+func (s *Store) MarkInitialSynced(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO sys_configs(key, value) VALUES ($1, 'true'::jsonb) ON CONFLICT (key) DO NOTHING`,
+		initialSyncedConfigKey)
+	if err != nil {
+		return fmt.Errorf("mark initial-synced: %w", err)
+	}
+	return nil
 }

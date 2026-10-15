@@ -75,8 +75,10 @@ func TestSync_InsertsNewPreset(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + cpCols + ` FROM channel_protocols WHERE deleted_at IS NULL AND preset_source_id <> '' ORDER BY id ASC`)).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "base_url", "protocols", "auth", "request_headers",
 			"models", "preset_source_id", "edited", "source_status", "created_at", "updated_at"}))
+	mock.ExpectBegin()
 	mock.ExpectQuery(`INSERT INTO channel_protocols`).
 		WillReturnRows(cpRow(1, "OpenCode Zen", "https://opencode.ai/zen/v1", "opencode-zen", false, SourceActive))
+	mock.ExpectCommit()
 
 	res, err := svc.Sync(context.Background(), false)
 	if err != nil {
@@ -95,8 +97,10 @@ func TestSync_OverwritesUnedited(t *testing.T) {
 	svc, mock := newTestService(t, "http://x")
 	mock.ExpectQuery(`SELECT .* FROM channel_protocols WHERE deleted_at IS NULL AND preset_source_id <> '' ORDER BY id ASC`).
 		WillReturnRows(cpRow(5, "Old Name", "https://old.example.com", "opencode-zen", false, SourceActive))
+	mock.ExpectBegin()
 	mock.ExpectExec(`UPDATE channel_protocols SET`).
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
 
 	res, err := svc.Sync(context.Background(), false)
 	if err != nil {
@@ -112,6 +116,8 @@ func TestSync_EditedRequiresConfirm(t *testing.T) {
 	svc, mock := newTestService(t, "http://x")
 	mock.ExpectQuery(`SELECT .* FROM channel_protocols WHERE deleted_at IS NULL AND preset_source_id <> '' ORDER BY id ASC`).
 		WillReturnRows(cpRow(6, "Edited Name", "https://edited.example.com", "opencode-zen", true, SourceActive))
+	mock.ExpectBegin()
+	mock.ExpectCommit()
 
 	res, err := svc.Sync(context.Background(), false)
 	if err != nil {
@@ -131,7 +137,9 @@ func TestSync_EditedRequiresConfirm(t *testing.T) {
 	svc2, mock2 := newTestService(t, "http://x")
 	mock2.ExpectQuery(`SELECT .* FROM channel_protocols WHERE deleted_at IS NULL AND preset_source_id <> '' ORDER BY id ASC`).
 		WillReturnRows(cpRow(6, "Edited Name", "https://edited.example.com", "opencode-zen", true, SourceActive))
+	mock2.ExpectBegin()
 	mock2.ExpectExec(`UPDATE channel_protocols SET`).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock2.ExpectCommit()
 	res2, err := svc2.Sync(context.Background(), true)
 	if err != nil {
 		t.Fatalf("sync confirm: %v", err)
@@ -146,6 +154,7 @@ func TestSync_MarksStale(t *testing.T) {
 	svc, mock := newTestService(t, "http://x")
 	mock.ExpectQuery(`SELECT .* FROM channel_protocols WHERE deleted_at IS NULL AND preset_source_id <> '' ORDER BY id ASC`).
 		WillReturnRows(cpRow(7, "Removed Provider", "https://removed.example.com", "removed-provider", false, SourceActive))
+	mock.ExpectBegin()
 	// 新增当前 pack 内条目。
 	mock.ExpectQuery(`INSERT INTO channel_protocols`).
 		WillReturnRows(cpRow(8, "OpenCode Zen", "https://opencode.ai/zen/v1", "opencode-zen", false, SourceActive))
@@ -153,6 +162,7 @@ func TestSync_MarksStale(t *testing.T) {
 	mock.ExpectExec(`UPDATE channel_protocols SET source_status=.*`).
 		WithArgs(SourceStale, int64(7)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
 
 	res, err := svc.Sync(context.Background(), false)
 	if err != nil {

@@ -90,7 +90,7 @@
 - AC-14 同步-已编辑：管理员触发同步，已编辑条目先展示差异，二次确认后才覆盖；放弃则不改动。
 - AC-15 预设条目删除 / 改名：对应渠道协议**不删除**，标记「来源已失效」；引用它的渠道仍可用。
 - AC-16 usage 归一化：三个协议各自响应的 usage 均归一化为五段 `input/output/cache_read/cache_write/reasoning`；Anthropic 的推理 token **并入 output**。
-- AC-17 计费失败：上游响应缺失或无法解析 usage → 该次调用返回错误，且对应渠道被置为禁用（`state=DISABLED`）。
+- AC-17 usage 缺失（放宽）：上游响应缺失或无法解析 usage 属极端协议违规 —— 因响应正文已产出/透传，**不退预扣**，而是按可见内容（请求 prompt + 响应正文/推理/工具调用）**估算 token 正常结算**，同时将对应渠道置为禁用（`state=DISABLED`）。流式与非流式行为一致：非流式透传上游正文（`200`），流式内容已透传无法回改。
 - AC-18 模型级子集：某模型 `protocols` 仅含 `anthropic-messages` 时，即使渠道协议支持 openai-chat，该模型对 openai-chat 入站返回 AC-4 的固定错误。
 
 ## Open questions
