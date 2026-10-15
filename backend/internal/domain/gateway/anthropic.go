@@ -84,7 +84,7 @@ type anthropicStreamEvent struct {
 }
 
 // HandleStream 透传 Anthropic SSE 事件：拼接 text_delta，从 message_start（输入/缓存）与
-// message_delta（累计输出）汇总 usage。usage 缺失返回 ErrUsageMissing（内容已透传，按 AC-17 处理）。
+// message_delta（累计输出）汇总 usage。usage 缺失返回 ErrUsageMissing（内容已透传，按 AC-17 放宽：估算计费并禁用渠道）。
 func (p *AnthropicProvider) HandleStream(ctx context.Context, upstream *http.Response, w http.ResponseWriter) (billing.Usage, []byte, error) {
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")

@@ -89,7 +89,7 @@ type responsesStreamEvent struct {
 }
 
 // HandleStream 透传 Responses SSE 事件：增量拼接 output_text，从 response.completed 取 usage。
-// usage 缺失返回 ErrUsageMissing（内容已透传，由调用方按 AC-17 处理）。
+// usage 缺失返回 ErrUsageMissing（内容已透传，由调用方按 AC-17 放宽：估算计费并禁用渠道）。
 func (p *ResponsesProvider) HandleStream(ctx context.Context, upstream *http.Response, w http.ResponseWriter) (billing.Usage, []byte, error) {
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")

@@ -579,9 +579,9 @@ func TestServeStream(t *testing.T) {
 	assertChannelOpaque(t, rec)
 }
 
-// 场景 8（AC-17 严格执行）：流式响应无 usage 块（未开启 include_usage）→ 落 failed 账单 + 禁用渠道。
-// 内容已透传无法回改，故 HTTP 状态仍为 200，但该次调用计为失败并禁用渠道。
-func TestServeStreamNoUsageDisablesChannel(t *testing.T) {
+// 场景 8（AC-17 放宽）：流式响应无 usage 块（未开启 include_usage）→ 按可见内容估算计费（不退预扣）+ 禁用渠道。
+// 内容已透传无法回改，故 HTTP 状态仍为 200，按估算 token 正常结算并禁用渠道。
+func TestServeStreamNoUsageEstimatesAndDisablesChannel(t *testing.T) {
 	streamBody := "data: {\"choices\":[{\"delta\":{\"content\":\"hello world\"}}]}\n\n" +
 		"data: [DONE]\n\n"
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -596,8 +596,11 @@ func TestServeStreamNoUsageDisablesChannel(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("want 200 (stream already responded), got %d", rec.Code)
 	}
-	if len(h.billing.reqs) != 1 || !h.billing.reqs[0].Fail {
-		t.Fatalf("usage 缺失应落 1 条 failed 账单, got %+v", h.billing.reqs)
+	if len(h.billing.reqs) != 1 || h.billing.reqs[0].Fail {
+		t.Fatalf("usage 缺失应按估算计费（成功账单）, got %+v", h.billing.reqs)
+	}
+	if u := h.billing.reqs[0].Tokens; u.Input <= 0 || u.Output <= 0 {
+		t.Fatalf("usage 缺失应按可见内容估算 token, got %+v", u)
 	}
 	if len(h.chans.disabled) != 1 || h.chans.disabled[0] != 1 {
 		t.Fatalf("usage 缺失应禁用渠道 1, got %+v", h.chans.disabled)
@@ -1366,8 +1369,8 @@ func TestServeFailover_ConnectionError(t *testing.T) {
 	}
 }
 
-// 场景 F6（AC-17 严格执行）：上游成功但未返回 usage → 该次调用报错（502）+ 渠道禁用 + 预扣退回。
-func TestServeZeroUsageRejectsAndDisablesChannel(t *testing.T) {
+// 场景 F6（AC-17 放宽）：上游成功但未返回 usage → 透传上游正文(200) + 按可见内容估算计费（不退预扣）+ 渠道禁用。
+func TestServeZeroUsageEstimatesAndDisablesChannel(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -1381,18 +1384,24 @@ func TestServeZeroUsageRejectsAndDisablesChannel(t *testing.T) {
 
 	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t",
 		`{"model":"gpt-4","stream":false,"messages":[{"role":"user","content":"hello"}]}`)
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("usage 缺失 want 502, got %d: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("usage 缺失应透传上游正文(200), got %d: %s", rec.Code, rec.Body.String())
 	}
-	if len(h.billing.reqs) != 1 || !h.billing.reqs[0].Fail {
-		t.Fatalf("usage 缺失应落 1 条 failed 账单, got %+v", h.billing.reqs)
+	if !strings.Contains(rec.Body.String(), "hi") {
+		t.Fatalf("usage 缺失应透传上游正文, got %s", rec.Body.String())
+	}
+	if len(h.billing.reqs) != 1 || h.billing.reqs[0].Fail {
+		t.Fatalf("usage 缺失应按估算计费（成功账单）, got %+v", h.billing.reqs)
+	}
+	if u := h.billing.reqs[0].Tokens; u.Input <= 0 || u.Output <= 0 {
+		t.Fatalf("usage 缺失应按可见内容估算 token, got %+v", u)
 	}
 	if len(h.chans.disabled) != 1 || h.chans.disabled[0] != 1 {
 		t.Fatalf("usage 缺失应禁用渠道 1, got %+v", h.chans.disabled)
 	}
-	// 未实际消费（按 failed 处理）→ 全额退回预扣。
-	if len(fc.refunded) != 1 {
-		t.Fatalf("usage 缺失应退回预扣, got refunded=%v", fc.refunded)
+	// 内容已透传、按估算正常结算 → 不应退回预扣（差额由结算多退少补）。
+	if len(fc.refunded) != 0 {
+		t.Fatalf("usage 缺失内容已透传，不应退回预扣, got refunded=%v", fc.refunded)
 	}
 }
 

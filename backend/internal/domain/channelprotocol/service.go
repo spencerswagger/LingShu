@@ -227,16 +227,29 @@ func (s *Service) Delete(ctx context.Context, id int64) error {
 }
 
 // InitialSync 首次启动（初始化）拉取一次预设包并物化；地址未设置则不拉取（AC-12）。
-// 失败仅记日志、不阻塞启动。返回是否实际执行了拉取。
+// 仅「首次启动」执行：以 sys_configs 标记持久化，已同步过则跳过（跨重启幂等）。
+// 失败仅记日志、不阻塞启动。返回本次是否实际执行了拉取。
 func (s *Service) InitialSync(ctx context.Context) bool {
 	if s.packURL == "" {
 		s.logger.Info("preset pack url not configured, skip initial channel protocol sync")
+		return false
+	}
+	synced, err := s.store.InitialSynced(ctx)
+	if err != nil {
+		s.logger.Error("read channel protocol initial-sync flag failed", "err", err)
+		return false
+	}
+	if synced {
+		s.logger.Info("initial channel protocol sync skipped (already synced on a previous start)")
 		return false
 	}
 	res, err := s.Sync(ctx, true)
 	if err != nil {
 		s.logger.Error("initial channel protocol sync failed", "err", err)
 		return false
+	}
+	if err := s.store.MarkInitialSynced(ctx); err != nil {
+		s.logger.Error("mark channel protocol initial-synced failed", "err", err)
 	}
 	s.logger.Info("initial channel protocol sync done", "applied", res.Applied, "pending", len(res.Pending))
 	return true
@@ -266,65 +279,72 @@ func (s *Service) Sync(ctx context.Context, confirm bool) (*SyncResult, error) {
 
 	res := &SyncResult{Pending: make([]SyncPending, 0)}
 	seen := make(map[string]bool, len(pack))
-	for key, p := range pack {
-		cand := p.toChannelProtocol()
-		// 以物化后的 preset_source_id 为唯一键（落库即用它），与 ListByPresetSource 回读一致，
-		// 避免旧实现「map 键 vs p.ID」不一致导致重复插入并撞 name 唯一索引。
-		if cand.PresetSourceID == "" {
-			cand.PresetSourceID = key
-		}
-		sid := cand.PresetSourceID
-		seen[sid] = true
-		cur := bySource[sid]
-		if cur == nil {
-			if _, err := s.store.Insert(ctx, cand); err != nil {
-				return nil, fmt.Errorf("insert preset channel protocol %s: %w", sid, err)
+	// 全部写入（新增/覆盖/标记 STALE）收敛在同一事务内，保证预设同步原子：
+	// 任一条失败整体回滚，避免出现「同步半完成」的中间态。
+	err = s.store.WithTx(ctx, func(tx *sql.Tx) error {
+		for key, p := range pack {
+			cand := p.toChannelProtocol()
+			// 以物化后的 preset_source_id 为唯一键（落库即用它），与 ListByPresetSource 回读一致，
+			// 避免旧实现「map 键 vs p.ID」不一致导致重复插入并撞 name 唯一索引。
+			if cand.PresetSourceID == "" {
+				cand.PresetSourceID = key
 			}
-			res.Applied++
-			continue
-		}
-		diff := diffOf(cur, cand)
-		if !cur.Edited {
-			if err := s.overwriteFromPreset(ctx, cur, cand); err != nil {
-				return nil, err
+			sid := cand.PresetSourceID
+			seen[sid] = true
+			cur := bySource[sid]
+			if cur == nil {
+				if _, ierr := insertOn(ctx, tx, cand); ierr != nil {
+					return fmt.Errorf("insert preset channel protocol %s: %w", sid, ierr)
+				}
+				res.Applied++
+				continue
 			}
-			res.Applied++
-			continue
-		}
-		if confirm {
-			if err := s.overwriteFromPreset(ctx, cur, cand); err != nil {
-				return nil, err
+			diff := diffOf(cur, cand)
+			if !cur.Edited {
+				if oerr := s.overwriteFromPreset(ctx, tx, cur, cand); oerr != nil {
+					return oerr
+				}
+				res.Applied++
+				continue
 			}
-			res.Applied++
-			continue
+			if confirm {
+				if oerr := s.overwriteFromPreset(ctx, tx, cur, cand); oerr != nil {
+					return oerr
+				}
+				res.Applied++
+				continue
+			}
+			res.Pending = append(res.Pending, SyncPending{
+				Id: strconv.FormatInt(cur.ID, 10), Name: cur.Name, Diff: diff, Edited: true,
+			})
 		}
-		res.Pending = append(res.Pending, SyncPending{
-			Id: strconv.FormatInt(cur.ID, 10), Name: cur.Name, Diff: diff, Edited: true,
-		})
-	}
 
-	// 来源已失效：预设中已不存在，标记 STALE（不删除，AC-15）。
-	for _, e := range existing {
-		if seen[e.PresetSourceID] {
-			continue
+		// 来源已失效：预设中已不存在，标记 STALE（不删除，AC-15）。
+		for _, e := range existing {
+			if seen[e.PresetSourceID] {
+				continue
+			}
+			if e.SourceStatus == SourceStale {
+				continue
+			}
+			if uerr := updateSourceStatusOn(ctx, tx, e.ID, SourceStale); uerr != nil {
+				return fmt.Errorf("mark channel protocol stale id=%d: %w", e.ID, uerr)
+			}
+			res.Pending = append(res.Pending, SyncPending{
+				Id: strconv.FormatInt(e.ID, 10), Name: e.Name, Diff: "预设来源已失效（保留协议）",
+				Edited: e.Edited, Stale: true,
+			})
 		}
-		if e.SourceStatus == SourceStale {
-			continue
-		}
-		if err := s.store.UpdateSourceStatus(ctx, e.ID, SourceStale); err != nil {
-			s.logger.Error("mark channel protocol stale failed", "id", e.ID, "err", err)
-			continue
-		}
-		res.Pending = append(res.Pending, SyncPending{
-			Id: strconv.FormatInt(e.ID, 10), Name: e.Name, Diff: "预设来源已失效（保留协议）",
-			Edited: e.Edited, Stale: true,
-		})
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return res, nil
 }
 
-// overwriteFromPreset 用预设值覆盖（保留 ID/created_at），编辑标记复位、来源置 ACTIVE。
-func (s *Service) overwriteFromPreset(ctx context.Context, cur, cand *ChannelProtocol) error {
+// overwriteFromPreset 用预设值覆盖（保留 ID/created_at），编辑标记复位、来源置 ACTIVE（在事务内执行）。
+func (s *Service) overwriteFromPreset(ctx context.Context, tx *sql.Tx, cur, cand *ChannelProtocol) error {
 	next := *cand
 	next.ID = cur.ID
 	next.CreatedAt = cur.CreatedAt
@@ -333,7 +353,7 @@ func (s *Service) overwriteFromPreset(ctx context.Context, cur, cand *ChannelPro
 	if err := validate(&next); err != nil {
 		return err
 	}
-	if err := s.store.Update(ctx, &next); err != nil {
+	if err := updateOn(ctx, tx, &next); err != nil {
 		return fmt.Errorf("update preset channel protocol %d: %w", cur.ID, err)
 	}
 	return nil

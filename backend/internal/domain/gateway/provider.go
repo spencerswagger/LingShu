@@ -15,7 +15,7 @@ import (
 	"github.com/team/llmgateway/internal/domain/billing"
 )
 
-// ErrUsageMissing 表示上游响应缺失或无法解析 usage（AC-17：该次调用报错并禁用渠道）。
+// ErrUsageMissing 表示上游响应缺失或无法解析 usage（AC-17 放宽：由调用方按可见内容估算计费并禁用渠道）。
 var ErrUsageMissing = errors.New("upstream response missing usage")
 
 // Provider 抽象一个上游基础协议适配器。基础协议为代码固定的 3 个：

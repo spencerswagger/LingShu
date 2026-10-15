@@ -118,7 +118,7 @@ func usageZero(u billing.Usage) bool {
 		u.CacheWrite == 0 && u.Reasoning == 0
 }
 
-// ExtractUsage 从非流式响应体解析 token 用量；usage 缺失返回 ErrUsageMissing（AC-17 严格执行）。
+// ExtractUsage 从非流式响应体解析 token 用量；usage 缺失返回 ErrUsageMissing（AC-17 放宽）。
 func (p *OpenAIProvider) ExtractUsage(body []byte) (billing.Usage, error) {
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.UseNumber()
@@ -135,7 +135,7 @@ func (p *OpenAIProvider) ExtractUsage(body []byte) (billing.Usage, error) {
 }
 
 // HandleStream 透传 SSE：逐行写回下游并 Flush，同时从 data 行提取 usage 与拼装 assistant 消息。
-// usage 缺失时返回 ErrUsageMissing（AC-17 严格执行：内容已透传，由调用方报错并禁用渠道）。
+// usage 缺失时返回 ErrUsageMissing（AC-17 放宽：内容已透传，由调用方按估算计费并禁用渠道）。
 // 返回 (usage, 拼装完成的 assistant 消息 JSON, error)；assistant 消息供 call_log 记录流式响应内容。
 func (p *OpenAIProvider) HandleStream(ctx context.Context, upstream *http.Response, w http.ResponseWriter) (billing.Usage, []byte, error) {
 	h := w.Header()
