@@ -2,6 +2,8 @@ package channelprotocol
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -176,6 +178,64 @@ func TestSync_MarksStale(t *testing.T) {
 	}
 	if !stale {
 		t.Fatalf("来源失效条目应在 Pending 中标记 Stale, got %+v", res)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("expectations: %v", err)
+	}
+}
+
+// 事务性：写入中途失败 → 整体回滚并返回错误（不再出现「同步半完成」）。
+func TestSync_RollsBackOnFailure(t *testing.T) {
+	svc, mock := newTestService(t, "http://x")
+	mock.ExpectQuery(`SELECT .* FROM channel_protocols WHERE deleted_at IS NULL AND preset_source_id <> '' ORDER BY id ASC`).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "base_url", "protocols", "auth", "request_headers",
+			"models", "preset_source_id", "edited", "source_status", "created_at", "updated_at"}))
+	mock.ExpectBegin()
+	mock.ExpectQuery(`INSERT INTO channel_protocols`).WillReturnError(errors.New("insert boom"))
+	mock.ExpectRollback()
+
+	if _, err := svc.Sync(context.Background(), false); err == nil {
+		t.Fatalf("insert 失败应返回错误")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("expectations: %v", err)
+	}
+}
+
+// InitialSync 幂等：已同步过（sys_configs 标记存在）→ 跳过，不再拉取/写库。
+func TestInitialSync_SkipsWhenAlreadySynced(t *testing.T) {
+	svc, mock := newTestService(t, "http://x")
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT value FROM sys_configs WHERE key=$1`)).
+		WithArgs(initialSyncedConfigKey).
+		WillReturnRows(sqlmock.NewRows([]string{"value"}).AddRow([]byte("true")))
+
+	if svc.InitialSync(context.Background()) {
+		t.Fatalf("已同步时应跳过 InitialSync")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("expectations: %v", err)
+	}
+}
+
+// InitialSync 首次：执行同步并在成功后落「已同步」标记。
+func TestInitialSync_MarksWhenFirstRun(t *testing.T) {
+	svc, mock := newTestService(t, "http://x")
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT value FROM sys_configs WHERE key=$1`)).
+		WithArgs(initialSyncedConfigKey).
+		WillReturnError(sql.ErrNoRows)
+	mock.ExpectQuery(`SELECT .* FROM channel_protocols WHERE deleted_at IS NULL AND preset_source_id <> '' ORDER BY id ASC`).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "base_url", "protocols", "auth", "request_headers",
+			"models", "preset_source_id", "edited", "source_status", "created_at", "updated_at"}))
+	mock.ExpectBegin()
+	mock.ExpectQuery(`INSERT INTO channel_protocols`).
+		WillReturnRows(cpRow(1, "OpenCode Zen", "https://opencode.ai/zen/v1", "opencode-zen", false, SourceActive))
+	mock.ExpectCommit()
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO sys_configs(key, value) VALUES ($1, 'true'::jsonb) ON CONFLICT (key) DO NOTHING`)).
+		WithArgs(initialSyncedConfigKey).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if !svc.InitialSync(context.Background()) {
+		t.Fatalf("首次启动应执行同步")
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("expectations: %v", err)

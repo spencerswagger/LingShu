@@ -40,6 +40,27 @@ func TestProbeRequest_HonorsChannelProtocol(t *testing.T) {
 	}
 }
 
+// renderAuth/joinProbeURL：auth.query 注入（含 {api_key} 替换、键排序）与去基址尾斜杠；空凭据不注入。
+func TestRenderAuthAndJoinProbeURL(t *testing.T) {
+	header, value, query := renderAuth(channelprotocol.AuthSpec{
+		Header: "Authorization", Scheme: "bearer",
+		Query: map[string]string{"api-version": "2025-04-01-preview", "key": "{api_key}"},
+	}, "sk-secret")
+	if header != "Authorization" || value != "Bearer sk-secret" {
+		t.Fatalf("renderAuth header/value 错误: %q/%q", header, value)
+	}
+	got := joinProbeURL("https://up.example.com/", "/chat/completions", query)
+	want := "https://up.example.com/chat/completions?api-version=2025-04-01-preview&key=sk-secret"
+	if got != want {
+		t.Fatalf("joinProbeURL want %q, got %q", want, got)
+	}
+
+	// 空凭据：与网关 injectAuth 一致，不注入任何鉴权头/query。
+	if _, v, q := renderAuth(channelprotocol.AuthSpec{Header: "x-api-key", Scheme: "raw"}, ""); v != "" || len(q) != 0 {
+		t.Fatalf("空凭据不应注入鉴权: value=%q query=%v", v, q)
+	}
+}
+
 // newProbeTestManager 返回一个可执行 doProbe 的 Manager（store 为空，仅用于探测链路）。
 func newProbeTestManager() *Manager {
 	return NewManager(nil, nil, []byte("0123456789abcdef"), &http.Client{Timeout: 2 * time.Second}, nil, time.Now)
@@ -56,7 +77,7 @@ func TestDoProbe_MarksProbeFeedback(t *testing.T) {
 	defer srv.Close()
 
 	m := newProbeTestManager()
-	fb, usage, errMsg := m.doProbe(context.Background(), srv.URL+"/chat/completions", "key", "m1", 2*time.Second)
+	fb, usage, errMsg := m.doProbeAuth(context.Background(), srv.URL+"/chat/completions", "Authorization", "Bearer key", "m1", 2*time.Second)
 	if errMsg != "" {
 		t.Fatalf("unexpected error: %s", errMsg)
 	}
@@ -79,7 +100,7 @@ func TestDoProbe_MarksTimeout(t *testing.T) {
 	defer srv.Close()
 
 	m := newProbeTestManager()
-	fb, _, errMsg := m.doProbe(context.Background(), srv.URL+"/chat/completions", "key", "m1", 30*time.Millisecond)
+	fb, _, errMsg := m.doProbeAuth(context.Background(), srv.URL+"/chat/completions", "Authorization", "Bearer key", "m1", 30*time.Millisecond)
 	if errMsg == "" {
 		t.Fatalf("expected timeout error, got nil, fb=%+v", fb)
 	}

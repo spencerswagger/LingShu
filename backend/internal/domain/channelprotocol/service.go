@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -228,7 +229,7 @@ func (s *Service) Delete(ctx context.Context, id int64) error {
 
 // InitialSync 首次启动（初始化）拉取一次预设包并物化；地址未设置则不拉取（AC-12）。
 // 仅「首次启动」执行：以 sys_configs 标记持久化，已同步过则跳过（跨重启幂等）。
-// 失败仅记日志、不阻塞启动。返回本次是否实际执行了拉取。
+// 失败仅记日志、不阻塞启动。返回本次是否完整执行并成功落「已同步」标记（标记失败返回 false，下次启动重试）。
 func (s *Service) InitialSync(ctx context.Context) bool {
 	if s.packURL == "" {
 		s.logger.Info("preset pack url not configured, skip initial channel protocol sync")
@@ -249,7 +250,9 @@ func (s *Service) InitialSync(ctx context.Context) bool {
 		return false
 	}
 	if err := s.store.MarkInitialSynced(ctx); err != nil {
+		// 未持久化标记 → 下次启动会重试（Sync 幂等，安全）。
 		s.logger.Error("mark channel protocol initial-synced failed", "err", err)
+		return false
 	}
 	s.logger.Info("initial channel protocol sync done", "applied", res.Applied, "pending", len(res.Pending))
 	return true
@@ -279,10 +282,17 @@ func (s *Service) Sync(ctx context.Context, confirm bool) (*SyncResult, error) {
 
 	res := &SyncResult{Pending: make([]SyncPending, 0)}
 	seen := make(map[string]bool, len(pack))
+	// 固定按来源键升序遍历，保证 Pending 顺序稳定（pack 为 map，range 顺序随机）。
+	keys := make([]string, 0, len(pack))
+	for k := range pack {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
 	// 全部写入（新增/覆盖/标记 STALE）收敛在同一事务内，保证预设同步原子：
 	// 任一条失败整体回滚，避免出现「同步半完成」的中间态。
 	err = s.store.WithTx(ctx, func(tx *sql.Tx) error {
-		for key, p := range pack {
+		for _, key := range keys {
+			p := pack[key]
 			cand := p.toChannelProtocol()
 			// 以物化后的 preset_source_id 为唯一键（落库即用它），与 ListByPresetSource 回读一致，
 			// 避免旧实现「map 键 vs p.ID」不一致导致重复插入并撞 name 唯一索引。

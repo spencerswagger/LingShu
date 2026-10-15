@@ -264,12 +264,15 @@ func (s *Service) PullModels(ctx context.Context, channelID int64, doer HTTPDoer
 	if !ok {
 		return nil, termsInternal("暂无可用渠道密钥")
 	}
-	// 按渠道协议解析有效 baseURL/path/auth（内联渠道回落 base_url + /models + Bearer），
-	// 避免仅引用协议（内联 base_url 为空）时拉取到空/错误 URL 或错误鉴权。
+	// 按渠道协议解析有效 baseURL/auth（内联渠道回落 base_url + Bearer），避免仅引用协议
+	// （内联 base_url 为空）时拉取到空 URL 或错误鉴权。
+	// 注意：/models 是独立的模型列表端点，**不复用**协议该基础协议的 path（那是 /chat/completions 等对话端点路径）。
 	base := effectiveProtocolBaseURL(rt, channelprotocol.ProtocolOpenAIChat)
-	path := effectiveProtocolPath(rt, channelprotocol.ProtocolOpenAIChat, "/models")
+	if base == "" {
+		return nil, termsInternal("渠道未配置 Base URL，无法拉取模型")
+	}
 	authHeader, authValue, query := renderAuth(effectiveProtocolAuth(rt), cred)
-	target := joinProbeURL(base, path, query)
+	target := joinProbeURL(base, "/models", query)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
 		return nil, termsInternal("构造模型拉取请求失败")

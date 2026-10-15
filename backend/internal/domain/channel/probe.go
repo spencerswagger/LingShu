@@ -54,6 +54,10 @@ func renderAuth(auth channelprotocol.AuthSpec, cred string) (header, value strin
 	if header == "" {
 		header = "Authorization"
 	}
+	// 与网关 injectAuth 一致：无凭据不注入任何鉴权头/query（调用方据 value=="" 跳过设置）。
+	if cred == "" {
+		return header, "", nil
+	}
 	scheme := strings.ToLower(strings.TrimSpace(auth.Scheme))
 	value = cred
 	if scheme == "" || scheme == "bearer" {
@@ -85,13 +89,16 @@ func joinProbeURL(base, path string, query [][2]string) string {
 }
 
 // probeRequest 求一次探测的目标 URL 与鉴权头名/值：按渠道协议解析有效 baseURL/path/auth
-// （内联渠道回落 base_url + /chat/completions + Bearer），避免仅引用协议时探测到空/错误 URL。
+// （内联渠道回落 base_url + /chat/completions + Bearer）。base 为空时返回空 target，由调用方以可读错误处理。
 // 探测语义固定为 OpenAI 兼容的最小对话请求，故协议键取 openai-chat。
 func (m *Manager) probeRequest(ch *RuntimeChannel, cred string) (target, authHeader, authValue string) {
 	protocol := channelprotocol.ProtocolOpenAIChat
-	base := effectiveProtocolBaseURL(ch, protocol)
-	path := effectiveProtocolPath(ch, protocol, "/chat/completions")
 	header, value, query := renderAuth(effectiveProtocolAuth(ch), cred)
+	base := effectiveProtocolBaseURL(ch, protocol)
+	if strings.TrimSpace(base) == "" {
+		return "", header, value
+	}
+	path := effectiveProtocolPath(ch, protocol, "/chat/completions")
 	return joinProbeURL(base, path, query), header, value
 }
 
@@ -297,21 +304,15 @@ func (m *Manager) probeOnce(ctx context.Context, keyID int64, probeModel, level 
 // ProbeFeedback 用标记探测属性的反馈包装为普通反馈（保持语义一致）。
 func ProbeFeedback(fb Feedback) Feedback { return fb }
 
-// doProbe 以默认 Authorization/Bearer 凭据执行一次最小对话探测（保留既有调用契约）。
-func (m *Manager) doProbe(ctx context.Context, url, auth, model string, timeout time.Duration) (Feedback, ProbeUsage, string) {
-	value := ""
-	if auth != "" {
-		value = "Bearer " + auth
-	}
-	return m.doProbeAuth(ctx, url, "Authorization", value, model, timeout)
-}
-
 // doProbeAuth 构建并执行最小对话探测请求，解析响应 usage 与状态分类（鉴权头名/值可定制，
 // 以支持 x-api-key/raw 等渠道协议鉴权）。
 // 2xx 成功；401/403 认证失败（→禁用）；429 上游限流；其余失败；超时标记 IsTimeout。
 func (m *Manager) doProbeAuth(ctx context.Context, url, authHeader, authValue, model string, timeout time.Duration) (Feedback, ProbeUsage, string) {
 	fb := Feedback{HasProbe: true, Now: m.now()}
 	var usage ProbeUsage
+	if strings.TrimSpace(url) == "" {
+		return fb, usage, "渠道未配置 Base URL，无法探测"
+	}
 	payload, err := json.Marshal(map[string]any{
 		"model":      model,
 		"messages":   []map[string]string{{"role": "user", "content": "ping"}},

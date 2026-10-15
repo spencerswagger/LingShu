@@ -180,11 +180,11 @@ func TestService_PullModels_HTTPServer(t *testing.T) {
 	}
 }
 
-// PullModels 按渠道协议解析有效 baseURL/path/auth：内联 base_url 为空时回落渠道协议（协议级 baseUrl/path）。
+// PullModels 按渠道协议解析有效 baseURL/auth；/models 端点固定，不复用协议对话端点 path。
 func TestService_PullModels_HonorsChannelProtocol(t *testing.T) {
 	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v2/models" {
-			t.Errorf("path want /v2/models, got %s", r.URL.Path)
+		if r.URL.Path != "/models" {
+			t.Errorf("path want /models（不得复用协议 chat path）, got %s", r.URL.Path)
 		}
 		if got := r.Header.Get("x-api-key"); got != "sk-plain" {
 			t.Errorf("auth want x-api-key sk-plain, got %q", got)
@@ -200,7 +200,7 @@ func TestService_PullModels_HonorsChannelProtocol(t *testing.T) {
 		Protocol: &channelprotocol.ChannelProtocol{
 			BaseURL: mock.URL,
 			Protocols: channelprotocol.Protocols{
-				channelprotocol.ProtocolOpenAIChat: {Path: "/v2/models"},
+				channelprotocol.ProtocolOpenAIChat: {Path: "/chat/completions"},
 			},
 			Auth: channelprotocol.AuthSpec{Header: "x-api-key", Scheme: "raw"},
 		},
