@@ -60,6 +60,7 @@ const form = reactive({
   tpm: 1000000,
   burst_multiplier: 1.2,
   on_exceed: 'QUEUE',
+  queue_size: 100,
   queue_timeout_ms: 5000,
   max_concurrent: 16,
   interval: '0 0 * * * *',
@@ -120,7 +121,7 @@ async function onSubmit() {
         TPM: tpmRaw(),
         BurstMultiplier: Number(form.burst_multiplier),
         OnExceed: form.on_exceed,
-        QueueSize: 100,
+        QueueSize: Number(form.queue_size),
         QueueTimeoutMS: Number(form.queue_timeout_ms),
         MaxConcurrent: Number(form.max_concurrent),
       },
@@ -170,7 +171,9 @@ async function onSubmit() {
             </el-form-item>
             <el-form-item label="协议">
               <el-select v-model="form.protocol" style="width: 100%" :disabled="usingProtocol">
-                <el-option label="openai-compat" value="openai-compat" />
+                <el-option label="openai-compat（OpenAI 兼容）" value="openai-compat" />
+                <el-option label="openai-responses" value="openai-responses" />
+                <el-option label="anthropic-messages" value="anthropic-messages" />
               </el-select>
             </el-form-item>
             <el-form-item class="span-2" label="Base URL">
@@ -210,7 +213,6 @@ async function onSubmit() {
                 placeholder="留空自动选型"
                 style="width: 100%"
               >
-                <el-option v-for="m in []" :key="m" :label="m" :value="m" />
               </el-select>
               <div class="hint">选渠道内的内部模型作为探测目标（真实最小对话请求）；留空自动选型</div>
             </el-form-item>

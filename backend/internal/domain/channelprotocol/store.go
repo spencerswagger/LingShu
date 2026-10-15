@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/team/llmgateway/internal/pkg/idgen"
@@ -88,13 +87,6 @@ func (s *Store) GetByID(ctx context.Context, id int64) (*ChannelProtocol, error)
 func (s *Store) GetByName(ctx context.Context, name string) (*ChannelProtocol, error) {
 	row := s.db.QueryRowContext(ctx,
 		`SELECT `+cpCols+` FROM channel_protocols WHERE name=$1 AND deleted_at IS NULL`, name)
-	return scanChannelProtocol(row)
-}
-
-// GetByPresetSourceID 按预设来源 ID 查询；不存在返回 sql.ErrNoRows。
-func (s *Store) GetByPresetSourceID(ctx context.Context, sourceID string) (*ChannelProtocol, error) {
-	row := s.db.QueryRowContext(ctx,
-		`SELECT `+cpCols+` FROM channel_protocols WHERE preset_source_id=$1 AND deleted_at IS NULL`, sourceID)
 	return scanChannelProtocol(row)
 }
 
@@ -213,13 +205,4 @@ func (s *Store) CountChannelRefs(ctx context.Context, id int64) (int64, error) {
 		return 0, fmt.Errorf("count channel refs: %w", err)
 	}
 	return n, nil
-}
-
-// sourceIDList 把来源 ID 列表拼成 SQL 数组字面量（沿用仓库既有 ANY 写法）。
-func sourceIDList(ids []string) string {
-	parts := make([]string, 0, len(ids))
-	for _, id := range ids {
-		parts = append(parts, "'"+strings.ReplaceAll(id, "'", "''")+"'")
-	}
-	return "{" + strings.Join(parts, ",") + "}"
 }

@@ -29,11 +29,6 @@ func Canonical(name string) string {
 	return name
 }
 
-// BaseProtocols 返回全部基础协议名（有序，稳定）。
-func BaseProtocols() []string {
-	return []string{ProtocolOpenAIChat, ProtocolOpenAIResponses, ProtocolAnthropicMessages}
-}
-
 // IsBaseProtocol 判断协议名是否为基础协议。
 func IsBaseProtocol(name string) bool {
 	switch name {
@@ -63,32 +58,6 @@ type Protocols map[string]ProtocolSpec
 func (p Protocols) Has(name string) bool {
 	_, ok := p[name]
 	return ok
-}
-
-// Names 返回协议集合中的协议名（仅基础协议，未知键忽略），按基础协议顺序稳定输出。
-func (p Protocols) Names() []string {
-	out := make([]string, 0, len(p))
-	for _, name := range BaseProtocols() {
-		if _, ok := p[name]; ok {
-			out = append(out, name)
-		}
-	}
-	return out
-}
-
-// DefaultProtocol 返回标记 default 的协议名；无则返回第一个基础协议（稳定）。
-func (p Protocols) DefaultProtocol() string {
-	for _, name := range BaseProtocols() {
-		if spec, ok := p[name]; ok && spec.Default {
-			return name
-		}
-	}
-	for _, name := range BaseProtocols() {
-		if _, ok := p[name]; ok {
-			return name
-		}
-	}
-	return ""
 }
 
 // AuthSpec 凭据注入方式。

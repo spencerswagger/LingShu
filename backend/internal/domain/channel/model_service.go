@@ -9,7 +9,6 @@ import (
 	"io"
 	"net/http"
 	"sort"
-	"strings"
 
 	"github.com/team/llmgateway/internal/domain/billing"
 	"github.com/team/llmgateway/internal/domain/channelprotocol"
@@ -265,12 +264,19 @@ func (s *Service) PullModels(ctx context.Context, channelID int64, doer HTTPDoer
 	if !ok {
 		return nil, termsInternal("暂无可用渠道密钥")
 	}
-	baseURL := strings.TrimRight(rt.Channel.BaseURL, "/")
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/models", nil)
+	// 按渠道协议解析有效 baseURL/path/auth（内联渠道回落 base_url + /models + Bearer），
+	// 避免仅引用协议（内联 base_url 为空）时拉取到空/错误 URL 或错误鉴权。
+	base := effectiveProtocolBaseURL(rt, channelprotocol.ProtocolOpenAIChat)
+	path := effectiveProtocolPath(rt, channelprotocol.ProtocolOpenAIChat, "/models")
+	authHeader, authValue, query := renderAuth(effectiveProtocolAuth(rt), cred)
+	target := joinProbeURL(base, path, query)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
 		return nil, termsInternal("构造模型拉取请求失败")
 	}
-	req.Header.Set("Authorization", "Bearer "+cred)
+	if authValue != "" {
+		req.Header.Set(authHeader, authValue)
+	}
 
 	if doer == nil {
 		doer = http.DefaultClient

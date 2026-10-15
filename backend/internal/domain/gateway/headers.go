@@ -16,7 +16,6 @@ type UpstreamRequest struct {
 	Path             string                       // 协议端点路径覆盖（空则用基础协议内置默认）
 	Cred             string                       // 渠道凭据（{api_key} 变量与 auth 注入来源）
 	Body             []byte                       // 已改写 model 的请求体
-	IsStream         bool                         // 是否流式
 	DownstreamHeader http.Header                  // 下游原始请求头（透传/变量取值来源）
 	HeaderPolicy     channelprotocol.HeaderPolicy // 请求头策略
 	Auth             channelprotocol.AuthSpec     // 鉴权注入方式
@@ -86,7 +85,7 @@ func buildUpstreamRequest(ctx context.Context, req UpstreamRequest, defaultPath,
 		hreq.Header.Set("Content-Type", contentType)
 	}
 	applyHeaderPolicy(hreq.Header, req.DownstreamHeader, req.HeaderPolicy, req.Cred, req.Vars)
-	injectAuth(hreq, req.Auth, req.Cred)
+	injectAuth(hreq, req.Auth, req.Cred, req.Vars)
 	return hreq, nil
 }
 
@@ -97,6 +96,7 @@ func joinURL(baseURL, path string) string {
 
 // applyHeaderPolicy 依据 passthroughMode 从下游头选取候选 → 减去强制黑名单 → 覆盖 set（变量替换）。
 // 鉴权头由 injectAuth 在之后注入，故 set 中的鉴权头名会被跳过（AC-9）。
+// set 与透传同样受强制黑名单约束：任何模式下都不得把 Cookie/Host/Content-Length 等注入上游（AC-8）。
 func applyHeaderPolicy(dst, downstream http.Header, p channelprotocol.HeaderPolicy, cred string, vars map[string]string) {
 	mode := p.PassthroughMode
 	if mode == "" {
@@ -114,9 +114,10 @@ func applyHeaderPolicy(dst, downstream http.Header, p channelprotocol.HeaderPoli
 	default: // none
 		// 不透传任何下游头
 	}
-	// set：显式设置（覆盖语义），支持变量替换；鉴权头名跳过（由 auth 注入）。
+	// set：显式设置（覆盖语义），支持变量替换；鉴权头名与强制黑名单头名跳过（AC-8/AC-9）。
 	for name, val := range p.Set {
-		if authHeaderNames[strings.ToLower(name)] {
+		lk := strings.ToLower(name)
+		if authHeaderNames[lk] || forcedBlacklist[lk] {
 			continue
 		}
 		dst.Set(name, substituteVars(val, vars, downstream, cred))
@@ -137,7 +138,7 @@ func copyHeaders(dst, downstream http.Header, allow func(key string) bool) {
 }
 
 // injectAuth 依据 auth(header/scheme/query) 注入凭据；缺省 header=Authorization、scheme=bearer。
-func injectAuth(req *http.Request, auth channelprotocol.AuthSpec, cred string) {
+func injectAuth(req *http.Request, auth channelprotocol.AuthSpec, cred string, vars map[string]string) {
 	if cred == "" {
 		return
 	}
@@ -154,7 +155,7 @@ func injectAuth(req *http.Request, auth channelprotocol.AuthSpec, cred string) {
 	if len(auth.Query) > 0 {
 		q := req.URL.Query()
 		for k, v := range auth.Query {
-			q.Set(k, substituteVars(v, nil, nil, cred))
+			q.Set(k, substituteVars(v, vars, nil, cred))
 		}
 		req.URL.RawQuery = q.Encode()
 	}
@@ -199,7 +200,7 @@ func resolveVar(token string, vars map[string]string, downstream http.Header, cr
 	}
 	if name, ok := strings.CutPrefix(token, "client_header:"); ok {
 		if downstream != nil {
-			return downstream.Get(name)
+			return downstream.Get(strings.TrimSpace(name))
 		}
 		return ""
 	}

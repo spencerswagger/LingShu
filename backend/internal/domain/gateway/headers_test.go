@@ -144,6 +144,28 @@ func TestHeaderPolicy_SetCannotOverrideAuth(t *testing.T) {
 	}
 }
 
+// AC-8：set 同样受强制黑名单约束，任何模式下都不能把 Cookie/Host/Content-Length 等注入上游。
+func TestHeaderPolicy_SetCannotInjectForcedBlacklist(t *testing.T) {
+	req := buildReq(t, http.Header{}, channelprotocol.HeaderPolicy{
+		PassthroughMode: channelprotocol.PassthroughAll,
+		Set: map[string]string{
+			"Cookie":          "session=evil",
+			"Host":            "evil.example.com",
+			"Content-Length":  "12345",
+			"X-Forwarded-For": "1.2.3.4",
+			"X-Ok":            "kept",
+		},
+	}, channelprotocol.AuthSpec{}, "sk", nil)
+	for _, h := range []string{"Cookie", "Host", "Content-Length", "X-Forwarded-For"} {
+		if got := req.Header.Get(h); got != "" {
+			t.Errorf("set 注入的强制黑名单头 %s 不应上游, got %q", h, got)
+		}
+	}
+	if got := req.Header.Get("X-Ok"); got != "kept" {
+		t.Errorf("set 非黑名单头 X-Ok 应生效, got %q", got)
+	}
+}
+
 // 鉴权注入：默认 Authorization: Bearer；x-api-key 走 raw；query 参数注入。
 func TestInjectAuth(t *testing.T) {
 	req := buildReq(t, http.Header{}, channelprotocol.HeaderPolicy{},

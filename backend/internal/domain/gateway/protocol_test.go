@@ -203,3 +203,47 @@ func TestServeChannelProtocolProtocols(t *testing.T) {
 		t.Errorf("上游路径应走协议 path 覆盖, got %q", gotPath)
 	}
 }
+
+// 响应头白名单过滤 hop-by-hop/Content-Length：即使被误列入白名单也不透传。
+func TestApplyResponseHeaderWhitelist_FiltersHopByHop(t *testing.T) {
+	upstream := http.Header{}
+	upstream.Set("Content-Length", "123")
+	upstream.Set("Connection", "keep-alive")
+	upstream.Set("X-Trace", "trace-abc")
+
+	rec := httptest.NewRecorder()
+	applyResponseHeaderWhitelist(rec, upstream, []string{"Content-Length", "Connection", "X-Trace"})
+
+	if got := rec.Header().Get("Content-Length"); got != "" {
+		t.Errorf("Content-Length 不应透传, got %q", got)
+	}
+	if got := rec.Header().Get("Connection"); got != "" {
+		t.Errorf("Connection 不应透传, got %q", got)
+	}
+	if got := rec.Header().Get("X-Trace"); got != "trace-abc" {
+		t.Errorf("X-Trace 应透传, got %q", got)
+	}
+}
+
+// 内联渠道 protocol 为空 → 回落 openai-chat，避免键为 "" 导致全部入站协议被判不支持。
+func TestServeInlineEmptyProtocolFallsBack(t *testing.T) {
+	var gotPath string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"x","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2}}`))
+	}))
+	defer upstream.Close()
+
+	h := build(t, upstream.URL)
+	h.chans.rt.Channel.Protocol = ""
+
+	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t", `{"model":"gpt-4","stream":false}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("空 protocol 应回落 openai-chat, want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if gotPath != "/chat/completions" {
+		t.Errorf("上游路径 want /chat/completions, got %q", gotPath)
+	}
+}

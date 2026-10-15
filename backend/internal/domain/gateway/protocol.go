@@ -32,7 +32,13 @@ func effectiveProtocols(rt *channel.RuntimeChannel, mr *channel.ModelRuntime) ch
 	} else if len(mr.Model.Protocols) > 0 {
 		base = mr.Model.Protocols
 	} else {
-		base = channelprotocol.Protocols{channelprotocol.Canonical(rt.Channel.Protocol): {}}
+		// 内联渠道：渠道 protocol 归一化；空/非法值回落 openai-chat（否则会以 "" 为键，
+		// 导致全部入站协议被判为不支持，AC-4 错误外溢到所有请求）。
+		name := channelprotocol.Canonical(strings.TrimSpace(rt.Channel.Protocol))
+		if !channelprotocol.IsBaseProtocol(name) {
+			name = channelprotocol.ProtocolOpenAIChat
+		}
+		base = channelprotocol.Protocols{name: {}}
 	}
 	if len(base) == 0 {
 		return nil
@@ -71,12 +77,26 @@ func effectiveHeaderPolicy(rt *channel.RuntimeChannel) channelprotocol.HeaderPol
 	return channelprotocol.HeaderPolicy{PassthroughMode: channelprotocol.PassthroughNone}
 }
 
+// responseHopByHop 响应侧禁止透传的头：hop-by-hop（RFC 7230 §6.1）与由响应体长度决定的 Content-Length。
+// 即使被误列入白名单也不透传，避免破坏下游读体/连接复用。
+var responseHopByHop = map[string]bool{
+	"connection":         true,
+	"keep-alive":         true,
+	"te":                 true,
+	"trailer":            true,
+	"transfer-encoding":  true,
+	"upgrade":            true,
+	"proxy-connection":   true,
+	"proxy-authenticate": true,
+	"content-length":     true,
+}
+
 // applyResponseHeaderWhitelist 把上游响应头中命中白名单的项复制到下游响应头。
-// 未命中白名单的上游头默认不透传（维持渠道透明，AC-10/AC-11）。
+// 未命中白名单的上游头默认不透传（维持渠道透明，AC-10/AC-11）；hop-by-hop/Content-Length 恒不透传。
 func applyResponseHeaderWhitelist(w http.ResponseWriter, upstream http.Header, whitelist []string) {
 	for _, name := range whitelist {
 		name = strings.TrimSpace(name)
-		if name == "" {
+		if name == "" || responseHopByHop[strings.ToLower(name)] {
 			continue
 		}
 		if vals, ok := upstream[http.CanonicalHeaderKey(name)]; ok {
