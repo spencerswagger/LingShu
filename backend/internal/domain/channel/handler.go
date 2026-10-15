@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/team/llmgateway/internal/domain/billing"
+	"github.com/team/llmgateway/internal/domain/channelprotocol"
 	"github.com/team/llmgateway/internal/pkg/cronx"
 	"github.com/team/llmgateway/internal/pkg/idgen"
 	"github.com/team/llmgateway/internal/pkg/resp"
@@ -267,6 +268,7 @@ type viewChannelModel struct {
 	CostRates       billing.WireRates        `json:"CostRates"`
 	TimeConfig      *billing.TimeCoeffConfig `json:"TimeConfig,omitempty"`
 	ContextTiers    []billing.TierRule       `json:"ContextTiers,omitempty"`
+	Protocols       channelprotocol.Protocols `json:"Protocols,omitempty"`
 	State           State                    `json:"State"`
 	RateLimit       RateLimitConfig          `json:"RateLimit"`
 	HealthProbe     HealthProbeConfig        `json:"HealthProbe"`
@@ -286,6 +288,7 @@ func toChannelModelView(m *ChannelModel) viewChannelModel {
 		CostRates:       billing.WireRates(m.CostRates),
 		TimeConfig:      m.TimeConfig,
 		ContextTiers:    m.ContextTiers,
+		Protocols:       m.Protocols,
 		State:           m.State,
 		RateLimit:       m.RateLimit,
 		HealthProbe:     m.HealthProbe,
@@ -296,14 +299,15 @@ func toChannelModelView(m *ChannelModel) viewChannelModel {
 }
 
 type channelModelRequest struct {
-	InternalModelID string                   `json:"InternalModelID"`
-	ExternalModelID int64                    `json:"ExternalModelID,string"`
-	CostRates       billing.WireRates        `json:"CostRates"`
-	TimeConfig      *billing.TimeCoeffConfig `json:"TimeConfig"`
-	ContextTiers    []billing.TierRule       `json:"ContextTiers"`
-	RateLimit       *RateLimitConfig         `json:"RateLimit"`
-	HealthProbe     *HealthProbeConfig       `json:"HealthProbe"`
-	Reliability     *ReliabilityConfig       `json:"Reliability"`
+	InternalModelID string                    `json:"InternalModelID"`
+	ExternalModelID int64                     `json:"ExternalModelID,string"`
+	CostRates       billing.WireRates         `json:"CostRates"`
+	TimeConfig      *billing.TimeCoeffConfig  `json:"TimeConfig"`
+	ContextTiers    []billing.TierRule        `json:"ContextTiers"`
+	Protocols       channelprotocol.Protocols `json:"Protocols"`
+	RateLimit       *RateLimitConfig          `json:"RateLimit"`
+	HealthProbe     *HealthProbeConfig        `json:"HealthProbe"`
+	Reliability     *ReliabilityConfig        `json:"Reliability"`
 }
 
 func (req *channelModelRequest) toInput() ChannelModelInput {
@@ -313,6 +317,7 @@ func (req *channelModelRequest) toInput() ChannelModelInput {
 		CostRates:       billing.Rates(req.CostRates),
 		TimeConfig:      req.TimeConfig,
 		ContextTiers:    req.ContextTiers,
+		Protocols:       req.Protocols,
 		RateLimit:       req.RateLimit,
 		HealthProbe:     req.HealthProbe,
 		Reliability:     req.Reliability,

@@ -95,9 +95,11 @@ type Channel struct {
 	BoundTags   []TagRef          `json:"BoundTags"`
 	Priority    int               `json:"Priority"`
 	State       State             `json:"State"`
-	RateLimit   RateLimitConfig   `json:"RateLimit"`
-	HealthProbe HealthProbeConfig `json:"HealthProbe"`
-	Reliability ReliabilityConfig `json:"Reliability"`
+	// ChannelProtocolID 引用的渠道协议 ID；nil=使用渠道内联配置（protocol + base_url）。
+	ChannelProtocolID *int64            `json:"ChannelProtocolID,omitempty"`
+	RateLimit         RateLimitConfig   `json:"RateLimit"`
+	HealthProbe       HealthProbeConfig `json:"HealthProbe"`
+	Reliability       ReliabilityConfig `json:"Reliability"`
 
 	KeyStates []ChannelKeyState `json:"KeyStates"`
 	CreatedAt time.Time         `json:"CreatedAt"`
