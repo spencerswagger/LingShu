@@ -123,6 +123,7 @@ func (s *Server) routes() {
 	admin.HandleFunc("GET /api/v1/admin/channels/cron-preview", d.Channel.HandleCronPreview)
 	admin.HandleFunc("PUT /api/v1/admin/channels/{id}/models/{mid}/state", d.Channel.HandleModelState)
 	admin.HandleFunc("GET /api/v1/admin/channels/snapshot", d.Console.HandleChannelSnapshot)
+	admin.HandleFunc("GET /api/v1/admin/service-status", d.Console.HandleServiceStatus)
 
 	// 渠道协议（channel_protocols·可复用接入模板）
 	if d.ChannelProto != nil {
