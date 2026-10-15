@@ -19,6 +19,7 @@ import (
 	"github.com/team/llmgateway/internal/domain/billing"
 	"github.com/team/llmgateway/internal/domain/channel"
 	"github.com/team/llmgateway/internal/domain/gateway"
+	"github.com/team/llmgateway/internal/domain/model"
 	"github.com/team/llmgateway/internal/domain/router"
 	"github.com/team/llmgateway/internal/pkg/decimalx"
 	"github.com/team/llmgateway/internal/pkg/resp"
@@ -35,6 +36,20 @@ type Admin struct {
 	keyNameByIDs   func(ctx context.Context, ids []int64) (map[int64]string, error) // 渠道密钥名批量反查钩子（F1 装配真实实现）
 	sessionSetName func(ctx context.Context, sessionID, name string) (bool, error)  // 会话改名钩子（F1 装配 SessionStore.SetName）
 	callLogs       callLogReader                                                    // 调用日志只读查询（经 SetCallLogStore 注入；nil=未装配）
+	routeEng       routeEngine                                                      // 路由引擎（服务状态候选顺序来源；经 SetRouterEngine 注入；nil=不计算候选）
+	models         externalModelSource                                              // 对外模型只读枚举（经 SetModelSource 注入；nil=列表为空）
+}
+
+// routeEngine 聚合端点所需的路由引擎能力（router.Engine 满足）。
+type routeEngine interface {
+	RouteAll(ctx context.Context, spec router.RouteSpec) ([]*router.ChannelRoute, error)
+	CostSample() billing.Usage
+	ActiveKeySessions(keyID int64) int
+}
+
+// externalModelSource 对外模型只读枚举（model.Service 满足）。
+type externalModelSource interface {
+	ListModels(ctx context.Context, enabled *bool) ([]model.ExternalModel, error)
 }
 
 // callLogReader 调用日志只读查询抽象（gateway.SQLCallLogStore 满足；nil=未装配时查询为空）。
@@ -70,6 +85,12 @@ func (h *Admin) SetSessionNameSetter(fn func(ctx context.Context, sessionID, nam
 
 // SetCallLogStore 注入调用日志只读查询（nil=未装配：BillingDetail.CallLog 为 nil、会话调用列表为空）。
 func (h *Admin) SetCallLogStore(s callLogReader) { h.callLogs = s }
+
+// SetRouterEngine 注入路由引擎（服务状态候选顺序来源）。nil 时不计算候选、不报错。
+func (h *Admin) SetRouterEngine(e routeEngine) { h.routeEng = e }
+
+// SetModelSource 注入对外模型只读枚举。nil 时对外模型列表为空、不报错。
+func (h *Admin) SetModelSource(s externalModelSource) { h.models = s }
 
 // attachCallLog 查 call_logs 并填充账单详情（未装配/无记录时为 nil）。
 func (h *Admin) attachCallLog(ctx context.Context, bid string) *CallLogView {
