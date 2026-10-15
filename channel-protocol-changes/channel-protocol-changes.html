@@ -160,7 +160,7 @@
       <h4>四个逻辑面的变动方向</h4>
       <ul class="tight" style="margin-bottom:0">
         <li><b>协议面</b>：入站补齐 <code>/v1/responses</code>、<code>/v1/messages</code>；上游明确三种基础协议，按「入站协议是否命中模型的 <code>protocols</code>」决定直通或拒绝。</li>
-        <li><b>实体面</b>：新增「渠道协议」——由预设站点在启动时拉取并沉淀；渠道要么引用它，要么在渠道内自行配置。</li>
+        <li><b>实体面</b>：新增「渠道协议」——由预设站点在<b>首次启动</b>时拉取并沉淀；渠道要么引用它，要么在渠道内自行配置。</li>
         <li><b>头策略面</b>：从「忽略全部下游头」改为「鉴权规格注入 + 可配置透传（白/黑名单）+ 变量替换」，并保留一份内置强制黑名单。</li>
         <li><b>计费面</b>：三套协议的真实响应 usage 各自归一化到平台既有的五段口径，<b>不改计费公式与记账流程</b>。</li>
       </ul>
@@ -180,7 +180,7 @@
           <tr><td>入站端点</td><td class="asis"><code>/v1/chat/completions</code>、<code>/v1/completions</code>、<code>/v1/embeddings</code>、<code>/v1/models</code></td><td>新增 <code>/v1/responses</code>、<code>/v1/messages</code></td></tr>
           <tr><td>协议选择</td><td class="asis">渠道表单一个 <code>protocol</code> 枚举值</td><td>模型级 <code>protocols</code> 集合（键存在即支持）；命中即直通，未命中一期拒绝、二期映射</td></tr>
           <tr><td>配置载体</td><td class="asis">渠道表单直接承载协议与地址</td><td>「渠道协议」独立实体沉淀预设；渠道<b>引用</b>它，或<b>在渠道内自行配置</b>（无协议时）</td></tr>
-          <tr><td>预设来源</td><td class="asis">无（无内置预设）</td><td>外挂预设站点，<b>启动时自动拉取</b>入库到渠道协议表；规则对齐 models.dev</td></tr>
+          <tr><td>预设来源</td><td class="asis">无（无内置预设）</td><td>外挂预设站点，<b>首次启动（初始化）时拉取一次</b>入库；后续更新由管理员手动触发；数据规则遵循本仓库 <code>preset-pack-format.md</code></td></tr>
           <tr><td>下游请求头</td><td class="asis">只读 <code>Authorization</code> + <code>x-session-id</code>，其余全部丢弃</td><td>鉴权规格注入 + 透传模式（none/whitelist/blacklist/all）+ <code>set</code>（含变量）+ 内置强制黑名单</td></tr>
           <tr><td>上游响应头</td><td class="asis">仅回写 <code>Content-Type</code>；流式另设固定 SSE 头</td><td>按入站协议<b>硬编码</b> + 一份<b>全局上游头白名单（默认空）</b>，不提供渠道级响应头配置</td></tr>
           <tr><td>计费口径</td><td class="asis">仅 <code>openai-chat</code> 的 usage 映射到五段</td><td>三协议真实响应 usage 各自归一化到同一五段；价格 <code>cost → Rates</code> 同名映射</td></tr>
@@ -240,27 +240,30 @@ flowchart TD
   <section id="preset">
     <h2>四、渠道协议的来源与同步</h2>
     <p>
-      渠道协议<b>不由后台手工创建</b>。它的唯一来源是外挂的<b>预设配置站点</b>——地址在网关内硬编码（后续提供），
-      数据规则对齐 models.dev。网关<mark class="key">首次启动时自动拉取</mark>，把每个 provider 条目物化成一行渠道协议并写入数据库。
+      渠道协议<b>不由后台手工创建</b>。它的唯一来源是外挂的<b>预设配置站点</b>——地址在网关内硬编码（后续提供）。
+      数据规则<b>遵循本仓库 <code>preset-pack-format.md</code></b>：在 models.dev 的两级嵌套形状上扩展 <code>gateway</code> 块，
+      承载协议、鉴权、特殊请求头等配置——<mark class="key">models.dev 本身只有成本与能力口径，没有这些接入配置</mark>，不能作为规则依据。
     </p>
     <figure class="diagram">
       <pre class="mermaid">
 flowchart TD
-  P["预设配置站点<br/>地址硬编码 · 规则对齐 models.dev"] --> S["网关启动时自动拉取"]
+  P["预设配置站点<br/>地址硬编码 · 规则见 preset-pack-format.md"] --> S["首次启动（初始化）拉取一次"]
   S --> M["把 provider 条目物化为渠道协议<br/>baseUrl · protocols · auth · requestHeaders · 模型快照"]
-  M --> Q{"库中同源条目已被本地编辑？"}
-  Q -- 否 --> U["直接写入 / 覆盖"]
-  Q -- 是 --> W["保留本地修改<br/>标记「预设有更新」等待人工确认"]
-  U --> DB[("channel_protocols 表")]
-  W --> DB
+  M --> DB[("channel_protocols 表")]
+  T["后续更新<br/>管理员在前端页面点击按钮触发"] --> Q{"该条目已标记「有更新」？"}
+  DB --> Q
+  Q -- 否 --> U["直接更新"]
+  Q -- 是 --> W["人工确认后再更新"]
       </pre>
-      <figcaption>图 2：预设站点 → 启动拉取 → 物化 → 落库（含本地编辑保护）</figcaption>
+      <figcaption>图 2：首次启动拉取入库；后续更新由管理员手动触发，按标记分流</figcaption>
     </figure>
     <div class="callout">
       <h4>同步语义</h4>
       <p>
-        拉取是<b>启动时自动</b>发生的，不依赖人工点按钮；但若某条渠道协议已被本地编辑过（<code>edited</code>），
-        自动拉取<b>不覆盖</b>它，只标记「有更新」，由管理员确认后再决定是否接受覆盖。这样既保证预设常新，又不吞掉本地调整。
+        <b>自动拉取只在首次启动（初始化）时发生一次</b>，把预设灌进渠道协议表；之后<b>不再</b>每次启动都拉。
+        后续要同步预设更新，需管理员在前端页面<b>点击按钮</b>触发；此时按标记分流：
+        <mark class="key">已标记「有更新」（本地被编辑过）的条目 → 人工确认后再更新</mark>；
+        <mark class="key">其余 → 直接更新</mark>。
       </p>
     </div>
   </section>
@@ -269,7 +272,7 @@ flowchart TD
   <section id="create-flow">
     <h2>五、新建渠道流程</h2>
     <p>
-      新建渠道<b>不再区分「预设 / 非预设」</b>——预设已在启动时统一沉淀为渠道协议。所以只有两种情况：
+      新建渠道<b>不再区分「预设 / 非预设」</b>——预设已在首次启动时统一沉淀为渠道协议。所以只有两种情况：
       <mark class="key">命中已有渠道协议 → 引用</mark>；<mark class="key">没有渠道协议 → 在渠道内逐项配置</mark>。
       后者不会去「创建渠道协议」。
     </p>
@@ -312,7 +315,7 @@ erDiagram
     string id
     string name
     string preset_source_id "来源预设条目 ID"
-    bool edited "本地是否被改过 同步时保护"
+    bool edited "本地是否被改过 更新需人工确认"
     string base_url
     jsonb protocols "协议映射 键存在即支持"
     jsonb auth "header scheme query"
@@ -344,7 +347,7 @@ erDiagram
           <tr><td class="file">id</td><td>string</td><td>渠道协议主键</td><td>生成</td></tr>
           <tr><td class="file">name</td><td>string</td><td>展示名</td><td>预设 <code>name</code></td></tr>
           <tr><td class="file">preset_source_id</td><td>string | null</td><td>来源预设站点的条目 ID，用于同步比对</td><td>预设 <code>id</code></td></tr>
-          <tr><td class="file">edited</td><td>bool</td><td>本地是否被改过；决定自动拉取时是否保护不覆盖</td><td>本地标记</td></tr>
+          <tr><td class="file">edited</td><td>bool</td><td>本地是否被改过；置真后该条目在后续预设更新时需人工确认</td><td>本地标记</td></tr>
           <tr><td class="file">base_url</td><td>string</td><td>默认上游 BaseURL；渠道可覆盖</td><td>预设 <code>gateway.baseUrl</code></td></tr>
           <tr><td class="file">protocols</td><td>jsonb</td><td>协议映射，键 ∈ {<code>openai-chat</code>, <code>openai-responses</code>, <code>anthropic-messages</code>}，值可含 <code>baseUrl</code>/<code>path</code>/<code>default</code></td><td>预设 <code>gateway.protocols</code></td></tr>
           <tr><td class="file">auth</td><td>jsonb</td><td>{<code>header</code>, <code>scheme</code>, <code>query</code>}；鉴权头由它注入，不进入可编辑头集</td><td>预设 <code>gateway.auth</code></td></tr>
@@ -356,8 +359,8 @@ erDiagram
     <div class="callout">
       <h4>渠道协议的生命周期</h4>
       <p>
-        <b>自动沉淀</b>（启动拉取）→ 可被本地编辑（置 <code>edited</code>）→ 再次拉取时若 <code>edited</code> 为真则<b>不覆盖</b>、标记「有更新」→ 管理员确认后接受。
-        不提供「后台手工新建渠道协议」入口。</p>
+        <b>首次启动自动沉淀</b> → 可被本地编辑（置 <code>edited</code>、标记「有更新」）→ 后续预设更新由管理员<b>手动触发</b>：
+        <code>edited</code> 条目<b>需人工确认</b>后才覆盖，其余直接更新。不提供「后台手工新建渠道协议」入口。</p>
     </div>
   </section>
 
@@ -441,7 +444,7 @@ erDiagram
         <div class="num" style="font-size:1.15rem">一期</div>
         <div class="lbl" style="margin-top:10px; text-align:left; color:var(--ink)">
           三协议入站与上游 · protocols 匹配（未命中返回固定错误）· 头策略引擎 · 响应头硬编码 + 全局白名单 ·
-          预设启动拉取与物化 · 建渠道两分支 · 三协议 usage 归一化
+          预设首次启动拉取与物化 · 建渠道两分支 · 三协议 usage 归一化
         </div>
       </div>
       <div class="metric zero">
@@ -457,7 +460,7 @@ erDiagram
         <tbody>
           <tr><td><span class="chip none">响应头配置化</span></td><td>硬编码 + 全局白名单已足够，且配置化会让渠道切换被客户端感知</td></tr>
           <tr><td><span class="chip none">内置硬编码预设</span></td><td>预设全部走外挂站点，本项目只定 JSON 格式与字段</td></tr>
-          <tr><td><span class="chip none">后台手工新建渠道协议</span></td><td>渠道协议由启动拉取沉淀；无对应协议时在渠道内自行配置</td></tr>
+          <tr><td><span class="chip none">后台手工新建渠道协议</span></td><td>渠道协议由首次启动拉取沉淀；无对应协议时在渠道内自行配置</td></tr>
           <tr><td><span class="chip none">跨协议转换（一期）</span></td><td>先以「直通最大化」拿下绝大多数场景，映射风险推到二期</td></tr>
           <tr><td><span class="chip none">计费引擎 / 路由 / 会话 / 状态机</span></td><td>与协议无关，口径已调好，本次不动</td></tr>
         </tbody>
@@ -465,23 +468,38 @@ erDiagram
     </div>
   </section>
 
-  <!-- ============ 待确认 ============ -->
-  <section id="opening">
-    <h2>十、待你确认的方向点</h2>
-    <div class="callout q">
-      <h4>两个会影响实体落表的取舍</h4>
-      <p>
-        <b>① 预设冲突处理</b>：启动自动拉取时，遇到本地 <code>edited</code> 的条目「保留本地 + 标记有更新、人工确认」，是否认可？还是要求自动覆盖？<br>
-        <b>② 渠道内联配置</b>：渠道未命中协议时，配置直接落在渠道自身字段上（<code>inline_*</code>）。是否需要额外提供「把某渠道的内联配置一键沉淀成一条渠道协议」的可选动作？（不做则渠道间无法复用同一制式）
-      </p>
+  <!-- ============ 已拍板 ============ -->
+  <section id="decided">
+    <h2>十、已拍板的方向点</h2>
+    <div class="table-wrap" style="max-height:none">
+      <table>
+        <thead><tr><th>议题</th><th>结论</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>预设数据规则</td>
+            <td><span class="chip p1">已定</span></td>
+            <td>以本仓库 <code>preset-pack-format.md</code> 为准；models.dev 只提供两级嵌套形状与成本口径，不承载接入配置</td>
+          </tr>
+          <tr>
+            <td>预设同步时机</td>
+            <td><span class="chip p1">已定</span></td>
+            <td><b>仅首次启动（初始化）自动拉取一次</b>；后续更新由管理员在前端点击按钮触发，已标记「有更新」的条目需人工确认，其余直接更新</td>
+          </tr>
+          <tr>
+            <td>渠道内联配置一键沉淀为渠道协议</td>
+            <td><span class="chip none">暂不做</span></td>
+            <td>属加分项而非必选项；一期渠道未命中协议时仅支持在渠道内逐项配置</td>
+          </tr>
+        </tbody>
+      </table>
     </div>
   </section>
 
   <footer>
     <h2>设计与格式依据</h2>
     <ol>
-      <li><code>docs/preset-pack-format.md</code> — 预设包 JSON 格式与字段约定（本仓库产出）</li>
-      <li>models.dev 数据格式（provider / model 两级嵌套、字段集、单位、许可）</li>
+      <li><code>docs/preset-pack-format.md</code> — 预设数据规则（<b>唯一依据</b>）：provider / model 两级形状沿用 models.dev，网关专有配置隔离在 <code>gateway</code> 块</li>
+      <li>models.dev —— 仅作为两级嵌套形状与成本 / 能力口径的参照，不提供协议、鉴权、请求头等接入配置</li>
       <li>现有实现现状：单协议网关、仅注入 <code>Content-Type</code> + <code>Authorization</code>、渠道单值协议枚举</li>
       <li>平台既有五段计费口径（billing.Usage / Rates）</li>
     </ol>
