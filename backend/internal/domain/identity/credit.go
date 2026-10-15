@@ -683,32 +683,6 @@ func (h *CreditHandler) HandleAdminFlows(w http.ResponseWriter, r *http.Request)
 	h.respondFlows(w, r, id, page, size)
 }
 
-// HandleDevWallet GET /api/v1/dev/wallet 查询本人钱包余额。
-func (h *CreditHandler) HandleDevWallet(w http.ResponseWriter, r *http.Request) {
-	userID, ok := h.userIDFrom(r.Context())
-	if !ok {
-		resp.Err(w, r, http.StatusUnauthorized, resp.CodeUnauthorized, "未登录或登录已过期")
-		return
-	}
-	bal, err := h.svc.GetWallet(r.Context(), userID)
-	if err != nil {
-		writeServiceErr(w, r, err)
-		return
-	}
-	resp.OK(w, r, map[string]any{"Balance": bal})
-}
-
-// HandleDevFlows GET /api/v1/dev/wallet/flows 查询本人流水。
-func (h *CreditHandler) HandleDevFlows(w http.ResponseWriter, r *http.Request) {
-	userID, ok := h.userIDFrom(r.Context())
-	if !ok {
-		resp.Err(w, r, http.StatusUnauthorized, resp.CodeUnauthorized, "未登录或登录已过期")
-		return
-	}
-	page, size := parsePageSize(r.URL.Query())
-	h.respondFlows(w, r, userID, page, size)
-}
-
 // respondFlows 输出流水分页结果。
 func (h *CreditHandler) respondFlows(w http.ResponseWriter, r *http.Request, userID int64, page, size int) {
 	list, total, err := h.svc.ListFlows(r.Context(), userID, page, size)

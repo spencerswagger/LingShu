@@ -6,7 +6,6 @@ import { computed, onMounted, ref, watch } from 'vue'
 import type { EChartsCoreOption } from 'echarts/core'
 import {
   Coin,
-  Connection,
   Cpu,
   DataLine,
   Key,
@@ -466,16 +465,6 @@ const opsCounts = computed(() => {
   const o = ops.value
   if (!o) return []
   return [
-    {
-      icon: Connection,
-      title: '渠道',
-      total: o.Channels.Total,
-      rows: [
-        { label: '健康', value: o.Channels.Normal, tone: 'success' },
-        { label: '排空', value: o.Channels.Drain, tone: 'warning' },
-        { label: '停用', value: o.Channels.Disabled, tone: 'danger' },
-      ],
-    },
     {
       icon: Key,
       title: '渠道密钥',

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
+import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Edit } from '@element-plus/icons-vue'
 import { listSessions, kickSessions, renameSession, type AdminSession } from '@/api/admin'
@@ -8,6 +9,10 @@ import ErrorBubble from '@/components/ErrorBubble.vue'
 import UserSelect from '@/components/UserSelect.vue'
 import ColumnFilter from '@/components/ColumnFilter.vue'
 import FilterBar from '@/components/FilterBar.vue'
+
+const props = withDefaults(defineProps<{ mode?: 'admin' | 'self' }>(), { mode: 'admin' })
+const isSelf = computed(() => props.mode === 'self')
+const router = useRouter()
 
 const loading = ref(false)
 const list = ref<AdminSession[]>([])
@@ -110,7 +115,7 @@ async function load() {
   if (filters.token_id && filters.token_id.trim()) params.TokenID = filters.token_id.trim()
   if (filters.channel_key_id && filters.channel_key_id.trim()) params.ChannelKeyID = filters.channel_key_id.trim()
   try {
-    const res = await listSessions(params)
+    const res = await listSessions(params, isSelf.value ? '/dev' : '/admin')
     list.value = res.Data.List || []
     total.value = res.Data.Total || 0
   } catch (e: any) {
@@ -134,6 +139,7 @@ function onSearch() {
 onMounted(load)
 
 async function close(ids: string[], label: string) {
+  if (isSelf.value) return
   try {
     await ElMessageBox.confirm(
       `确认关闭选中的 ${label} 会话吗？关闭后该会话不再被请求命中（并发槽释放），记录保留在列表中。`,
@@ -159,6 +165,13 @@ function onCloseOne(row: AdminSession) {
 function onCloseBatch() {
   if (!selected.value.length) return
   close(selected.value.map((r) => r.SessionID), `${selected.value.length} 个`)
+}
+
+function goDetail(row: AdminSession) {
+  router.push({
+    name: isSelf.value ? 'dev-session-detail' : 'admin-session-detail',
+    params: { id: row.SessionID },
+  })
 }
 
 // ===== 实时状态 =====
@@ -214,7 +227,7 @@ const pct = (v: unknown) => `${Math.round(num(v) * 100)}%`
         @refresh="load"
       >
         <template #actions>
-          <el-button v-if="selected.length" type="danger" size="small" @click="onCloseBatch">
+          <el-button v-if="!isSelf && selected.length" type="danger" size="small" @click="onCloseBatch">
             批量关闭
           </el-button>
         </template>
@@ -227,7 +240,7 @@ const pct = (v: unknown) => `${Math.round(num(v) * 100)}%`
         row-key="SessionID"
         @selection-change="(rows: AdminSession[]) => (selected = rows)"
       >
-        <el-table-column type="selection" width="44" />
+        <el-table-column v-if="!isSelf" type="selection" width="44" />
         <el-table-column label="会话名称 / 模型" min-width="200">
           <template #header>
             <ColumnFilter
@@ -258,15 +271,18 @@ const pct = (v: unknown) => `${Math.round(num(v) * 100)}%`
                 @keyup.enter="saveRename(row)"
                 @blur="saveRename(row)"
               />
-              <span v-else class="cell-name" @click="startRename(row)">
+              <span v-else-if="!isSelf" class="cell-name" @click="startRename(row)">
                 <span class="name-text">{{ row.SessionName || '未命名' }}</span>
                 <el-icon class="name-edit"><Edit /></el-icon>
+              </span>
+              <span v-else class="cell-name-plain">
+                <span class="name-text">{{ row.SessionName || '未命名' }}</span>
               </span>
               <span class="t-clock">{{ row.Model || '-' }}</span>
             </div>
           </template>
         </el-table-column>
-        <el-table-column label="用户 / 令牌" min-width="150">
+        <el-table-column v-if="!isSelf" label="用户 / 令牌" min-width="150">
           <template #header>
             <ColumnFilter
               label="用户"
@@ -287,7 +303,7 @@ const pct = (v: unknown) => `${Math.round(num(v) * 100)}%`
             </div>
           </template>
         </el-table-column>
-        <el-table-column label="渠道 / 密钥" min-width="150" show-overflow-tooltip>
+        <el-table-column v-if="!isSelf" label="渠道 / 密钥" min-width="150" show-overflow-tooltip>
           <template #header>
             <ColumnFilter
               label="渠道-密钥"
@@ -362,11 +378,11 @@ const pct = (v: unknown) => `${Math.round(num(v) * 100)}%`
               link
               type="primary"
               size="small"
-              @click="$router.push({ name: 'admin-session-detail', params: { id: row.SessionID } })"
+              @click="goDetail(row)"
             >
               详情
             </el-button>
-            <el-button v-if="canClose(row)" link type="danger" size="small" @click="onCloseOne(row)">关闭</el-button>
+            <el-button v-if="!isSelf && canClose(row)" link type="danger" size="small" @click="onCloseOne(row)">关闭</el-button>
           </template>
         </el-table-column>
       </el-table>
@@ -423,6 +439,11 @@ const pct = (v: unknown) => `${Math.round(num(v) * 100)}%`
   cursor: pointer;
   max-width: 100%;
   color: var(--color-primary, #409eff);
+}
+.cell-name-plain {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
 }
 .name-text {
   display: inline-block;

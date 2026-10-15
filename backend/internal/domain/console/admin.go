@@ -684,6 +684,68 @@ func (h *Admin) HandlePutSessionConfig(w http.ResponseWriter, r *http.Request) {
 	resp.OK(w, r, map[string]any{"Affected": 1})
 }
 
+// ===== 网关设置（全局上游响应头白名单）=====
+
+// HandleGetGatewayConfig GET /api/v1/admin/configs/gateway
+// 返回全局上游响应头白名单（默认空，零配置）。
+func (h *Admin) HandleGetGatewayConfig(w http.ResponseWriter, r *http.Request) {
+	list := []string{}
+	raw, err := h.billing.GetConfig(r.Context(), gateway.UpstreamResponseHeaderWhitelistKey)
+	if err == nil {
+		_ = json.Unmarshal(raw, &list)
+	}
+	if list == nil {
+		list = []string{}
+	}
+	resp.OK(w, r, map[string]any{"UpstreamResponseHeaderWhitelist": list})
+}
+
+// HandlePutGatewayConfig PUT /api/v1/admin/configs/gateway
+func (h *Admin) HandlePutGatewayConfig(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		UpstreamResponseHeaderWhitelist []string `json:"UpstreamResponseHeaderWhitelist"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "请求体格式错误")
+		return
+	}
+	for _, name := range req.UpstreamResponseHeaderWhitelist {
+		if !validHeaderName(name) {
+			resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "非法的响应头名称："+name)
+			return
+		}
+	}
+	if req.UpstreamResponseHeaderWhitelist == nil {
+		req.UpstreamResponseHeaderWhitelist = []string{}
+	}
+	b, _ := json.Marshal(req.UpstreamResponseHeaderWhitelist)
+	operator, _ := h.userIDFrom(r.Context())
+	if err := h.billing.UpsertConfig(r.Context(), gateway.UpstreamResponseHeaderWhitelistKey, b, operator); err != nil {
+		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "更新网关设置失败")
+		return
+	}
+	resp.OK(w, r, map[string]any{"Affected": 1})
+}
+
+// validHeaderName 校验是否为合法 HTTP 头字段名（RFC 7230 token，非空）。
+func validHeaderName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case c == '!' || c == '#' || c == '$' || c == '%' || c == '&' || c == '\'' ||
+			c == '*' || c == '+' || c == '-' || c == '.' || c == '^' || c == '_' ||
+			c == '`' || c == '|' || c == '~':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // validateSessionExpiration 校验会话过期配置，返回 nil 表示合法；否则返回具体的中文原因（不含技术细节）。
 func validateSessionExpiration(raw []byte) error {
 	if !isJSONObject(raw) {
@@ -996,7 +1058,7 @@ func (h *Admin) HandleListSessions(w http.ResponseWriter, r *http.Request) {
 			sessionIDs = append(sessionIDs, s.SessionID)
 		}
 	}
-	runtimes := h.sessionRuntimes(r.Context(), sessionIDs, now.Add(-sessionStatsWindow))
+	runtimes := sessionRuntimes(r.Context(), h.db, sessionIDs, now.Add(-sessionStatsWindow))
 
 	list := make([]sessionListItem, 0, len(items))
 	for _, s := range items {
@@ -1199,13 +1261,13 @@ func (r sessionRuntime) CacheHitRate() float64 {
 
 // sessionRuntimes 批量聚合会话实时状态：billing_records（次数/Token/积分/上下文/窗口速率）
 // 与 call_logs（用户消息数/工具调用数）。查询失败仅返回已得部分，不影响会话列表主流程。
-func (h *Admin) sessionRuntimes(ctx context.Context, ids []string, windowStart time.Time) map[string]sessionRuntime {
+func sessionRuntimes(ctx context.Context, db *sql.DB, ids []string, windowStart time.Time) map[string]sessionRuntime {
 	out := make(map[string]sessionRuntime, len(ids))
-	if h.db == nil || len(ids) == 0 {
+	if db == nil || len(ids) == 0 {
 		return out
 	}
 	// 汇总 + 窗口（FILTER）+ 输入/缓存读。
-	rows, err := h.db.QueryContext(ctx, `
+	rows, err := db.QueryContext(ctx, `
 SELECT session_id,
        count(*),
        COALESCE(sum(credits_consumed), 0),
@@ -1238,7 +1300,7 @@ GROUP BY session_id`, ids, windowStart)
 		}
 	}
 	// 上下文长度：最近一次请求的输入 Token 数（DISTINCT ON 取每会话最新一行）。
-	crows, err := h.db.QueryContext(ctx, `
+	crows, err := db.QueryContext(ctx, `
 SELECT DISTINCT ON (session_id) session_id, COALESCE(NULLIF(tokens->>'input','')::bigint, 0)
 FROM billing_records
 WHERE session_id = ANY($1)
@@ -1257,7 +1319,7 @@ ORDER BY session_id, call_time DESC, id DESC`, ids)
 		}
 	}
 	// 用户消息数 / 工具调用数：来自 call_logs.req_messages（增量消息数组）。
-	lrows, err := h.db.QueryContext(ctx, `
+	lrows, err := db.QueryContext(ctx, `
 SELECT session_id,
        COALESCE(sum(CASE WHEN jsonb_typeof(req_messages) = 'array'
            THEN (SELECT count(*) FROM jsonb_array_elements(req_messages) e WHERE e->>'role' = 'user') ELSE 0 END), 0),

@@ -6,10 +6,8 @@ import {
   getServiceStatus,
   probeChannelKey,
   probeChannelModel,
-  channelState,
   channelModelState,
   channelKeyState,
-  listChannelEvents,
   listModelEvents,
   listProbeLogs,
   listChannelKeyEvents,
@@ -224,9 +222,25 @@ function machineReasonLines(m: MachineMetrics, rel: ReliabilityConfig): ReasonLi
   out.push({ text: `窗口 ${m.WindowSeconds}s · 样本 ${m.Total} · 失败 ${m.Failures}` })
   return out
 }
+// 渠道无独立状态机（渠道=配置模板）：原因由其内部模型与密钥的异常项派生。
 function channelReasonOf(c: ChannelDetail): ReasonLine[] {
-  const lines = machineReasonLines(c.Metrics, c.View.Reliability)
-  if (c.View.LastErr) lines.unshift({ text: '上次错误：' + c.View.LastErr, danger: true })
+  const lines: ReasonLine[] = []
+  if (c.View.LastErr) lines.push({ text: '上次错误：' + c.View.LastErr, danger: true })
+  for (const m of c.Models) {
+    if (m.View.State !== 'NORMAL') {
+      let t = `内部模型 ${m.View.InternalModelID}：${m.View.State}`
+      if (m.View.LastErr) t += `（${m.View.LastErr}）`
+      lines.push({ text: t, danger: m.View.State === 'DISABLED' })
+    }
+  }
+  for (const k of c.Keys) {
+    if (k.View.State !== 'NORMAL') {
+      let t = `密钥 ${k.View.Name || k.View.KeyID}：${k.View.State}`
+      if (k.View.LastErr) t += `（${k.View.LastErr}）`
+      lines.push({ text: t, danger: k.View.State === 'DISABLED' })
+    }
+  }
+  if (!lines.length) lines.push({ text: '全部内部模型与密钥正常' })
   return lines
 }
 function modelReasonOf(m: ModelDetail): ReasonLine[] {
@@ -344,7 +358,7 @@ function internalCell(r: MatrixRow): DimCell {
   }
 }
 function channelCell(r: MatrixRow): DimCell {
-  return { state: r.channel.View.State, name: r.channel.View.Name, sub: '#' + r.channel.View.ID, reason: channelReasonOf(r.channel), multi: false }
+  return { state: r.channel.State, name: r.channel.View.Name, sub: '#' + r.channel.View.ID, reason: channelReasonOf(r.channel), multi: false }
 }
 function keyCell(r: MatrixRow): DimCell {
   const ks = r.keys
@@ -470,8 +484,8 @@ function onRowClick(row: MatrixRow) {
   selectRow(row)
 }
 
-// ===== 事件链 tab（仅在选中行或对应 tab 被查看时调用；失败仅提示一次）=====
-const tabKeys = ['channel', 'model', 'probe', 'key'] as const
+// ===== 事件链 tab（渠道无独立状态机，故无「渠道事件」tab；仅在选中行或对应 tab 被查看时调用）=====
+const tabKeys = ['model', 'probe', 'key'] as const
 type TabKey = (typeof tabKeys)[number]
 interface TabRec {
   data: any[]
@@ -483,12 +497,11 @@ function blankTab(): TabRec {
   return { data: [], loading: false, error: { message: '', requestId: '' }, loadedFor: '' }
 }
 const tabState = reactive<Record<TabKey, TabRec>>({
-  channel: blankTab(),
   model: blankTab(),
   probe: blankTab(),
   key: blankTab(),
 })
-const activeTab = ref<TabKey>('channel')
+const activeTab = ref<TabKey>('model')
 function resetTabs() {
   for (const k of tabKeys) tabState[k] = blankTab()
 }
@@ -501,8 +514,7 @@ async function ensureTab(tab: TabKey) {
   rec.error = { message: '', requestId: '' }
   try {
     const chId = row.channel.View.ID
-    if (tab === 'channel') rec.data = (await listChannelEvents(chId)).Data || []
-    else if (tab === 'model') rec.data = (await listModelEvents(chId)).Data || []
+    if (tab === 'model') rec.data = (await listModelEvents(chId)).Data || []
     else if (tab === 'probe') rec.data = (await listProbeLogs(chId, 50)).Data || []
     else if (row.key) rec.data = (await listChannelKeyEvents(chId, row.key.View.KeyID)).Data || []
     else rec.data = []
@@ -561,12 +573,11 @@ function doProbeModel() {
   const mid = r.model.View.ID
   runOp(() => probeChannelModel(r.channel.View.ID, mid), probeMsg)
 }
-function doState(level: 'channel' | 'model' | 'key', action: 'normal' | 'drain' | 'disable') {
+// 渠道无独立状态机，故不支持渠道级强制状态（仅内部模型/密钥可手动流转）。
+function doState(level: 'model' | 'key', action: 'normal' | 'drain' | 'disable') {
   const r = selectedRow.value
   if (!r) return
-  if (level === 'channel') {
-    runOp(() => channelState(r.channel.View.ID, action), () => '渠道状态已更新')
-  } else if (level === 'model') {
+  if (level === 'model') {
     if (!r.model) return
     const mid = r.model.View.ID
     runOp(() => channelModelState(r.channel.View.ID, mid, action), () => '模型状态已更新')
@@ -879,10 +890,9 @@ onUnmounted(stopTimer)
             <div class="kv"><span class="k">Protocol</span><span class="v">{{ selectedRow.channel.View.Protocol }}</span></div>
             <div class="kv"><span class="k">BaseURL</span><span class="v">{{ selectedRow.channel.View.BaseURL }}</span></div>
             <div class="kv"><span class="k">Priority</span><span class="v">{{ selectedRow.channel.View.Priority }}</span></div>
-            <div class="kv"><span class="k">State</span><span class="v"><StatusTag :value="selectedRow.channel.View.State" /></span></div>
+            <div class="kv"><span class="k">State</span><span class="v"><StatusTag :value="selectedRow.channel.State" /></span></div>
             <div class="kv"><span class="k">LastProbe</span><span class="v">{{ fmtDateTime(selectedRow.channel.View.LastProbe) }}</span></div>
             <div v-if="selectedRow.channel.View.LastErr" class="kv"><span class="k">LastErr</span><span class="v danger">{{ selectedRow.channel.View.LastErr }}</span></div>
-            <div class="kv"><span class="k">窗口指标</span><span class="v">错误率 {{ pct(selectedRow.channel.Metrics.ErrorRatePct) }} · 429 {{ pct(selectedRow.channel.Metrics.Rate429Pct) }} · P99 {{ selectedRow.channel.Metrics.P99LatencyMS }}ms</span></div>
             <div class="kv"><span class="k">用量/额度</span><span class="v">RPM {{ selectedRow.channel.RPM }}/{{ selectedRow.channel.RPMLimit }} · TPM {{ selectedRow.channel.TPM }}/{{ selectedRow.channel.TPMLimit }}</span></div>
             <div class="kv"><span class="k">Reliability 阈值</span><span class="v">错误率 &lt;{{ selectedRow.channel.View.Reliability.ErrorRatePct }}% · 429 &lt;{{ selectedRow.channel.View.Reliability.Rate429Pct }}% · P99 &lt;{{ selectedRow.channel.View.Reliability.P99LatencyMS }}ms</span></div>
             <div class="kv"><span class="k">RateLimit</span><span class="v">RPM {{ selectedRow.channel.View.RateLimit.RPM }} · TPM {{ selectedRow.channel.View.RateLimit.TPM }} · 并发 {{ selectedRow.channel.View.RateLimit.MaxConcurrent }}</span></div>
@@ -931,14 +941,6 @@ onUnmounted(stopTimer)
                 <el-button size="small" :loading="opLoading" :disabled="opLoading || !selectedRow.model" @click="doProbeModel">重新探测该模型</el-button>
               </div>
             </div>
-            <div class="op-grp">
-              <div class="op-grp-title">强制状态 · 渠道</div>
-              <div class="op-btns">
-                <el-button size="small" type="success" :disabled="opLoading || selectedRow.channel.View.State === 'NORMAL'" @click="doState('channel', 'normal')">正常</el-button>
-                <el-button size="small" type="warning" :disabled="opLoading || selectedRow.channel.View.State === 'DRAIN'" @click="doState('channel', 'drain')">排空</el-button>
-                <el-button size="small" type="danger" :disabled="opLoading || selectedRow.channel.View.State === 'DISABLED'" @click="doState('channel', 'disable')">禁用</el-button>
-              </div>
-            </div>
             <div v-if="selectedRow.model" class="op-grp">
               <div class="op-grp-title">强制状态 · 内部模型</div>
               <div class="op-btns">
@@ -961,17 +963,6 @@ onUnmounted(stopTimer)
           <div class="insp-sec">
             <div class="insp-sec-title">事件链</div>
             <el-tabs v-model="activeTab">
-              <el-tab-pane label="渠道事件" name="channel">
-                <div v-loading="tabState.channel.loading">
-                  <ErrorBubble v-if="tabState.channel.error.message || tabState.channel.error.requestId" :message="tabState.channel.error.message" :request-id="tabState.channel.error.requestId" />
-                  <div v-for="e in tabState.channel.data" :key="e.ID" class="ev-row">
-                    <StatusTag :value="e.FromState" /><span class="ev-arrow">→</span><StatusTag :value="e.ToState" />
-                    <span class="ev-reason">{{ e.Reason || '—' }}</span>
-                    <span class="ev-time">{{ fmtDateTime(e.CreatedAt) }}</span>
-                  </div>
-                  <div v-if="!tabState.channel.loading && !tabState.channel.data.length" class="ev-empty">暂无事件</div>
-                </div>
-              </el-tab-pane>
               <el-tab-pane label="模型事件" name="model">
                 <div v-loading="tabState.model.loading">
                   <ErrorBubble v-if="tabState.model.error.message || tabState.model.error.requestId" :message="tabState.model.error.message" :request-id="tabState.model.error.requestId" />

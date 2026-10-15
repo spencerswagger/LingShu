@@ -84,7 +84,6 @@ func healthyCh(id int64, name string, tags map[string]string, priority int) *cha
 	return &channel.Channel{
 		ID: id, Name: name, Protocol: channel.ProtocolOpenAICompat,
 		BaseURL: "https://x.example.com", Tags: tags, Priority: priority,
-		State: channel.StateNormal,
 	}
 }
 
@@ -565,11 +564,11 @@ func TestRoute_DrainedSession_StillRoutes(t *testing.T) {
 	defer func() { _ = mock.ExpectationsWereMet() }()
 
 	a := healthyCh(1, "a", nil, 100)
-	a.State = channel.StateDrain // 渠道排空
 	b := healthyCh(2, "b", nil, 100)
+	// 渠道 1 的密钥 11 置排空：会话命中该 (密钥,模型) 时仍放行（排空只拦新会话）。
 	mgr := newManagerWithKeys(t, []*channel.Channel{a, b},
 		[]channel.ChannelModel{cm(1, "int1"), cm(2, "int2")},
-		[]channel.ChannelKey{newKey(11, 1, channel.StateNormal), newKey(21, 2, channel.StateNormal)})
+		[]channel.ChannelKey{newKey(11, 1, channel.StateDrain), newKey(21, 2, channel.StateNormal)})
 	e := NewEngine(svc, &fakeCMSource{cms: []channel.ChannelModel{cm(1, "int1"), cm(2, "int2")}}, mgr, NewSessionRegistry(nil))
 
 	key := "t|m|sess-drained"
@@ -660,11 +659,10 @@ func TestRoute_AllDisabled(t *testing.T) {
 	svc, mock := newModelService(t, 1)
 	defer func() { _ = mock.ExpectationsWereMet() }()
 
-	down := healthyCh(1, "a", nil, 100)
-	down.State = channel.StateDisabled
 	dis := cm(1, "int1")
-	mgr := newManagerWithKeys(t, []*channel.Channel{down}, []channel.ChannelModel{dis},
-		[]channel.ChannelKey{newKey(11, 1, channel.StateNormal)})
+	dis.State = channel.StateDisabled
+	mgr := newManagerWithKeys(t, []*channel.Channel{healthyCh(1, "a", nil, 100)}, []channel.ChannelModel{dis},
+		[]channel.ChannelKey{newKey(11, 1, channel.StateDisabled)})
 	e := NewEngine(svc, &fakeCMSource{cms: []channel.ChannelModel{dis}}, mgr, nil)
 
 	_, err := e.Route(context.Background(), RouteSpec{ExternalModel: "qw-max"})

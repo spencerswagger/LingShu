@@ -11,6 +11,7 @@ import (
 	"github.com/team/llmgateway/internal/config"
 	"github.com/team/llmgateway/internal/domain/audit"
 	"github.com/team/llmgateway/internal/domain/channel"
+	"github.com/team/llmgateway/internal/domain/channelprotocol"
 	"github.com/team/llmgateway/internal/domain/console"
 	"github.com/team/llmgateway/internal/domain/identity"
 	"github.com/team/llmgateway/internal/domain/model"
@@ -29,6 +30,7 @@ type Deps struct {
 	TokenAdmin   *identity.TokenHandler
 	TokenDev     *identity.TokenHandler
 	Channel      *channel.Handler
+	ChannelProto *channelprotocol.Handler
 	Tag          *tag.Handler
 	Model        *model.Handler
 	Announcement *identity.AnnouncementHandler
@@ -76,6 +78,8 @@ func (s *Server) routes() {
 	d := s.deps
 	s.mux.HandleFunc("POST /api/v1/auth/login", d.Identity.HandleLogin)
 	s.mux.HandleFunc("POST /api/v1/auth/login/totp", d.Identity.HandleLoginTOTP)
+	s.mux.HandleFunc("GET /api/v1/auth/captcha", d.Identity.HandleCaptcha)
+	s.mux.HandleFunc("POST /api/v1/auth/register", d.Identity.HandleRegister)
 	s.mux.Handle("GET /api/v1/auth/me", WithAuth(s.jwtMgr, s.sessions)(http.HandlerFunc(d.Identity.HandleMe)))
 	s.mux.Handle("GET /api/v1/auth/me/summary", WithAuth(s.jwtMgr, s.sessions)(http.HandlerFunc(d.DevConsole.HandleMeSummary)))
 	s.mux.Handle("PUT /api/v1/auth/me", WithAuth(s.jwtMgr, s.sessions)(http.HandlerFunc(d.Identity.HandleUpdateMe)))
@@ -114,14 +118,26 @@ func (s *Server) routes() {
 	admin.HandleFunc("POST /api/v1/admin/channels", d.Channel.HandleCreate)
 	admin.HandleFunc("PUT /api/v1/admin/channels/{id}", d.Channel.HandleUpdate)
 	admin.HandleFunc("POST /api/v1/admin/channels/batch-delete", d.Channel.HandleBatchDelete)
-	admin.HandleFunc("GET /api/v1/admin/channels/{id}/events", d.Channel.HandleListEvents)
 	admin.HandleFunc("GET /api/v1/admin/channels/{id}/model-events", d.Channel.HandleListModelEvents)
 	admin.HandleFunc("GET /api/v1/admin/channels/{id}/probe-logs", d.Channel.HandleListProbeLogs)
-	admin.HandleFunc("POST /api/v1/admin/channels/{id}/state", d.Channel.HandleState)
 	admin.HandleFunc("GET /api/v1/admin/channels/cron-preview", d.Channel.HandleCronPreview)
 	admin.HandleFunc("PUT /api/v1/admin/channels/{id}/models/{mid}/state", d.Channel.HandleModelState)
 	admin.HandleFunc("GET /api/v1/admin/channels/snapshot", d.Console.HandleChannelSnapshot)
 	admin.HandleFunc("GET /api/v1/admin/service-status", d.Console.HandleServiceStatus)
+
+	// 渠道协议（channel_protocols·可复用接入模板）
+	if d.ChannelProto != nil {
+		admin.HandleFunc("GET /api/v1/admin/channel-protocols", d.ChannelProto.HandleList)
+		admin.HandleFunc("POST /api/v1/admin/channel-protocols", d.ChannelProto.HandleCreate)
+		admin.HandleFunc("POST /api/v1/admin/channel-protocols/sync", d.ChannelProto.HandleSync)
+		admin.HandleFunc("GET /api/v1/admin/channel-protocols/{id}", d.ChannelProto.HandleGet)
+		admin.HandleFunc("PUT /api/v1/admin/channel-protocols/{id}", d.ChannelProto.HandleUpdate)
+		admin.HandleFunc("DELETE /api/v1/admin/channel-protocols/{id}", d.ChannelProto.HandleDelete)
+	}
+
+	// 网关设置（全局上游响应头白名单）
+	admin.HandleFunc("GET /api/v1/admin/configs/gateway", d.Console.HandleGetGatewayConfig)
+	admin.HandleFunc("PUT /api/v1/admin/configs/gateway", d.Console.HandlePutGatewayConfig)
 
 	// 渠道密钥（channel_keys 运行时实体）
 	admin.HandleFunc("GET /api/v1/admin/channels/{id}/keys", d.Channel.HandleListKeys)
@@ -196,10 +212,18 @@ func (s *Server) routes() {
 	dev.HandleFunc("POST /api/v1/dev/tokens/{id}/toggle", d.TokenDev.HandleDevToggle)
 	dev.Handle("GET /api/v1/dev/tokens/{id}/secret", WithAuditSensitiveRead(s.audit, s.logger)(http.HandlerFunc(d.TokenDev.HandleDevSecret)))
 	dev.HandleFunc("GET /api/v1/dev/tags", d.Tag.HandleList) // 列表过滤由 query enabled=true 控制
-	dev.HandleFunc("GET /api/v1/dev/wallet", d.Credit.HandleDevWallet)
-	dev.HandleFunc("GET /api/v1/dev/wallet/flows", d.Credit.HandleDevFlows)
+	// 只读“可用模型”：服务端强制仅返回启用项，忽略客户端 ?Enabled= 覆盖。
+	dev.HandleFunc("GET /api/v1/dev/models", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		q.Set("Enabled", "true")
+		fr := r.Clone(r.Context())
+		fr.URL.RawQuery = q.Encode()
+		d.Model.HandleList(w, fr)
+	})
 	dev.HandleFunc("GET /api/v1/dev/stats/dashboard", d.DevConsole.HandleStatsDashboard)
-	dev.HandleFunc("GET /api/v1/dev/usage", d.DevConsole.HandleUsage)
+	dev.HandleFunc("GET /api/v1/dev/sessions", d.DevConsole.HandleListSessions)
+	dev.HandleFunc("GET /api/v1/dev/sessions/{session_id}/calls", d.DevConsole.HandleListSessionCalls)
+	dev.HandleFunc("GET /api/v1/dev/billings/stats", d.DevConsole.HandleBillingsStats)
 	dev.HandleFunc("GET /api/v1/dev/billings", d.DevConsole.HandleListBillings)
 	dev.HandleFunc("GET /api/v1/dev/billings/{billing_id}", d.DevConsole.HandleGetBilling)
 	dev.HandleFunc("GET /api/v1/dev/announcements", d.Announcement.HandleDevList)

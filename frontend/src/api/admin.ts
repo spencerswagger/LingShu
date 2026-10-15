@@ -165,6 +165,14 @@ export interface ReliabilityConfig {
   P99LatencyMS: number // 单位毫秒（后端契约不变；默认 120000ms=120 秒，前端按秒录入/展示，提交转毫秒）
   AuthFailThreshold?: number
 }
+
+// 渠道视图中的逐密钥状态快照（与后端 ChannelKeyState 对齐）
+export interface ChannelKeyState {
+  KeyID: string
+  KeyName: string
+  State: string
+}
+
 export interface AdminChannel {
   ID: string
   Name: string
@@ -174,11 +182,11 @@ export interface AdminChannel {
   TagIDs: string[]
   BoundTags: { ID: string; Name: string; KV: Record<string, string> }[]
   Priority: number
-  State: string // NORMAL | DRAIN | DISABLED
   RateLimit: RateLimitConfig
   HealthProbe: HealthProbeConfig
   Reliability: ReliabilityConfig
-  KeyStates?: { KeyID: string; KeyName: string; State: string }[]
+  ChannelProtocolID?: number | string | null // 引用的渠道协议 ID；空=使用渠道内联配置
+  KeyStates?: ChannelKeyState[]
   CreatedAt: string
   UpdatedAt: string
 }
@@ -192,15 +200,8 @@ export interface ChannelInput {
   RateLimit?: RateLimitConfig
   HealthProbe?: HealthProbeConfig
   Reliability?: ReliabilityConfig
-}
-// 渠道状态流转事件
-export interface ChannelEvent {
-  ID: string
-  ChannelID: string
-  FromState: string
-  ToState: string
-  Reason: string
-  CreatedAt: string
+  // 引用的渠道协议 ID（数字或 null）；选中后以协议配置为准，内联 protocol/base_url 被忽略
+  ChannelProtocolID?: number | string | null
 }
 // 内部模型状态流转事件
 export interface ChannelModelEvent {
@@ -244,17 +245,7 @@ export function batchDeleteChannels(ids: string[]) {
     IDs: ids,
   })
 }
-export function listChannelEvents(id: string) {
-  return http.get<ChannelEvent[], ApiRes<ChannelEvent[]>>(`/admin/channels/${id}/events`)
-}
-// 手动状态流转（渠道与内部模型共用）：action = normal | drain | disable
-export function channelState(id: string, action: 'normal' | 'drain' | 'disable', reason = '') {
-  return http.post<AdminChannel, ApiRes<AdminChannel>>(`/admin/channels/${id}/state`, {
-    Action: action,
-    Reason: reason,
-  })
-}
-// 内部模型手动状态流转
+// 内部模型手动状态流转：action = normal | drain | disable
 export function channelModelState(id: string, mid: string, action: 'normal' | 'drain' | 'disable', reason = '') {
   return http.put<unknown, ApiRes<unknown>>(`/admin/channels/${id}/models/${mid}/state`, {
     Action: action,
@@ -272,6 +263,84 @@ export function cronPreview(expr: string, limit = 5) {
   return http.get<{ Times: string[] }, ApiRes<{ Times: string[] }>>('/admin/channels/cron-preview', {
     params: { Expr: expr, Limit: limit },
   })
+}
+
+// ===== 渠道协议（channel_protocols·可复用接入模板；字段名 = Go 字段名）=====
+// 单协议可选配置：缺省回退到渠道协议级 BaseURL / 基础协议内置默认路径。
+export interface ProtocolOption {
+  baseUrl?: string
+  path?: string
+  default?: boolean // 标记首选协议；同一作用域内至多一个
+}
+// 鉴权注入方式：header/scheme 决定注入位置与形式，query 为需放 querystring 的鉴权/版本参数。
+export interface ChannelProtocolAuth {
+  header: string // Authorization | x-api-key | api-key
+  scheme: string // bearer | raw
+  query?: Record<string, string>
+}
+// 请求头策略：passthroughMode 决定下游头透传方式，whitelist/blacklist 为名单，set 为覆盖键值（支持变量）。
+export interface ChannelProtocolRequestHeaders {
+  passthroughMode: string // none | whitelist | blacklist | all
+  whitelist: string[]
+  blacklist: string[]
+  set: Record<string, string>
+}
+export interface ChannelProtocolView {
+  ID: string
+  Name: string
+  BaseURL: string
+  Protocols: Record<string, ProtocolOption>
+  Auth: ChannelProtocolAuth
+  RequestHeaders: ChannelProtocolRequestHeaders
+  Models: Record<string, unknown>
+  PresetSourceID: string
+  Edited: boolean
+  SourceStatus: string // ACTIVE | STALE（来源已失效）
+}
+// 创建/更新入参（提交即视为「已编辑」）
+export interface ChannelProtocolInput {
+  Name: string
+  BaseURL: string
+  Protocols: Record<string, ProtocolOption>
+  Auth: ChannelProtocolAuth
+  RequestHeaders: ChannelProtocolRequestHeaders
+  Models: Record<string, unknown>
+}
+// 同步预览：Pending 为需二次确认才覆盖的条目（含差异文本），Applied 为本次直接覆盖数
+export interface ChannelProtocolSyncPending {
+  Id: string
+  Name: string
+  Diff: string
+  Edited: boolean
+  Stale: boolean
+}
+export interface ChannelProtocolSyncResult {
+  Pending: ChannelProtocolSyncPending[]
+  Applied: number
+}
+
+// 列表返回裸数组（非 {list}）
+export function listChannelProtocols() {
+  return http.get<ChannelProtocolView[], ApiRes<ChannelProtocolView[]>>('/admin/channel-protocols')
+}
+export function createChannelProtocol(payload: ChannelProtocolInput) {
+  return http.post<ChannelProtocolView, ApiRes<ChannelProtocolView>>('/admin/channel-protocols', payload)
+}
+export function getChannelProtocol(id: string) {
+  return http.get<ChannelProtocolView, ApiRes<ChannelProtocolView>>(`/admin/channel-protocols/${id}`)
+}
+export function updateChannelProtocol(id: string, payload: ChannelProtocolInput) {
+  return http.put<ChannelProtocolView, ApiRes<ChannelProtocolView>>(`/admin/channel-protocols/${id}`, payload)
+}
+export function deleteChannelProtocol(id: string) {
+  return http.delete<{ Affected: number }, ApiRes<{ Affected: number }>>(`/admin/channel-protocols/${id}`)
+}
+// 同步预设：confirm=false 返回待确认清单（已编辑条目），confirm=true 执行覆盖
+export function syncChannelProtocols(confirm: boolean) {
+  return http.post<ChannelProtocolSyncResult, ApiRes<ChannelProtocolSyncResult>>(
+    '/admin/channel-protocols/sync',
+    { confirm },
+  )
 }
 
 // 渠道密钥（channel_keys·运行时实体）：凭据只出尾号，状态三态独立流转
@@ -333,12 +402,21 @@ export function probeChannelKey(channelId: string, keyId: string): Promise<ApiRe
     `/admin/channels/${channelId}/keys/${keyId}/probe`,
   )
 }
-// 密钥状态流转事件（只读；与 listChannelEvents 同风格）
+// 密钥状态流转事件（后端 channel.ChannelKeyEvent 无 json tag，故键为 PascalCase、ID 为数字）
+export interface ChannelKeyEvent {
+  ID: number
+  ChannelKeyID: number
+  FromState: string
+  ToState: string
+  Reason: string
+  CreatedAt: string
+}
+// 密钥状态流转事件（只读）
 export function listChannelKeyEvents(
   channelId: string,
   keyId: string,
-): Promise<ApiRes<ChannelEvent[]>> {
-  return http.get<ChannelEvent[], ApiRes<ChannelEvent[]>>(
+): Promise<ApiRes<ChannelKeyEvent[]>> {
+  return http.get<ChannelKeyEvent[], ApiRes<ChannelKeyEvent[]>>(
     `/admin/channels/${channelId}/keys/${keyId}/events`,
   )
 }
@@ -368,7 +446,7 @@ export interface MachineMetrics {
   AuthFails: number
   DrainingReasons?: string[]
 }
-// 渠道运行时视图（后端 channel.ChannelView）
+// 渠道运行时视图（后端 channel.ChannelView；渠道=配置模板，无自身状态字段）
 export interface ChannelRuntimeView {
   ID: string
   Name: string
@@ -377,7 +455,6 @@ export interface ChannelRuntimeView {
   Tags: Record<string, string>
   BoundTags: { ID: string; Name: string; KV?: Record<string, string> }[]
   Priority: number
-  State: string // NORMAL | DRAIN | DISABLED
   LastErr?: string
   LastProbe?: string | null
   RateLimit: RateLimitConfig
@@ -430,10 +507,10 @@ export interface KeyDetail {
   MaxSessions: number // 并发会话上限
   ActiveSessions: number // 存活会话数（实时会话数）
 }
-// 渠道层明细（后端 channel.ChannelDetail）
+// 渠道层明细（后端 channel.ChannelDetail；渠道无独立状态机，State 为内部模型/密钥派生最差值）
 export interface ChannelDetail {
   View: ChannelRuntimeView
-  Metrics: MachineMetrics
+  State: string // NORMAL | DRAIN | DISABLED（派生：全部内部模型与密钥的最差值）
   RPM: number
   TPM: number
   RPMLimit: number
@@ -552,8 +629,8 @@ export interface ExternalModelInput {
   ContextTiers?: ContextTier[] | null
 }
 // 列表返回裸数组（非 {list}）
-export function listExternalModels(params: Record<string, unknown> = {}) {
-  return http.get<ExternalModel[], ApiRes<ExternalModel[]>>('/admin/models', { params })
+export function listExternalModels(params: Record<string, unknown> = {}, base = '/admin') {
+  return http.get<ExternalModel[], ApiRes<ExternalModel[]>>(`${base}/models`, { params })
 }
 export function createExternalModel(payload: ExternalModelInput) {
   return http.post<ExternalModel, ApiRes<ExternalModel>>('/admin/models', payload)
@@ -691,9 +768,9 @@ export interface AdminBillingItem {
   DurationMs?: number | null
   FirstTokenMs?: number | null
 }
-export function listBillings(params: Record<string, unknown> = {}) {
+export function listBillings(params: Record<string, unknown> = {}, base = '/admin') {
   return http.get<PageResult<AdminBillingItem>, ApiRes<PageResult<AdminBillingItem>>>(
-    '/admin/billings',
+    `${base}/billings`,
     { params },
   )
 }
@@ -707,11 +784,11 @@ export interface BillingStats {
   InputTokens: number
   CacheReadTokens: number
 }
-export function getBillingStats(params: Record<string, unknown> = {}) {
-  return http.get<BillingStats, ApiRes<BillingStats>>('/admin/billings/stats', { params })
+export function getBillingStats(params: Record<string, unknown> = {}, base = '/admin') {
+  return http.get<BillingStats, ApiRes<BillingStats>>(`${base}/billings/stats`, { params })
 }
-export function getBilling(billingId: string) {
-  return http.get<BillingDetail, ApiRes<BillingDetail>>(`/admin/billings/${billingId}`)
+export function getBilling(billingId: string, base = '/admin') {
+  return http.get<BillingDetail, ApiRes<BillingDetail>>(`${base}/billings/${billingId}`)
 }
 // 单条调用日志（账单详情附带 CallLog 的独立端点；返回单对象，不强转 BillingDetail）
 export function getCallLog(billingId: string) {
@@ -751,11 +828,12 @@ export interface AdminSession {
 }
 export function listSessions(
   params: Record<string, any>,
+  base = '/admin',
 ): Promise<ApiRes<{ List: AdminSession[]; Total: number }>> {
   return http.get<
     { List: AdminSession[]; Total: number },
     ApiRes<{ List: AdminSession[]; Total: number }>
-  >('/admin/sessions', { params })
+  >(`${base}/sessions`, { params })
 }
 export function kickSessions(
   payload: Record<string, any>,
@@ -777,11 +855,12 @@ export function renameSession(
 // 会话完整调用记录（按时间序，含请求/响应/决策轨迹）
 export function listSessionCalls(
   sessionId: string,
+  base = '/admin',
 ): Promise<ApiRes<{ List: CallLogView[]; Total: number }>> {
   return http.get<
     { List: CallLogView[]; Total: number },
     ApiRes<{ List: CallLogView[]; Total: number }>
-  >(`/admin/sessions/${sessionId}/calls`)
+  >(`${base}/sessions/${sessionId}/calls`)
 }
 
 // ===== 计费配置 =====
@@ -858,6 +937,18 @@ export function getSessionConfig() {
 }
 export function putSessionConfig(payload: { SessionExpiration: SessionExpirationData }) {
   return http.put<{ Affected: number }, ApiRes<{ Affected: number }>>('/admin/configs/session', payload)
+}
+
+// ===== 网关设置（sys_configs 键 gateway.upstream_response_header_whitelist）=====
+// 全局上游响应头白名单：列出后，上游该响应头才透传给客户端（默认空=仅基础协议硬编码响应头）。
+export interface GatewayConfigData {
+  UpstreamResponseHeaderWhitelist: string[]
+}
+export function getGatewayConfig() {
+  return http.get<GatewayConfigData, ApiRes<GatewayConfigData>>('/admin/configs/gateway')
+}
+export function putGatewayConfig(payload: { UpstreamResponseHeaderWhitelist: string[] }) {
+  return http.put<{ Affected: number }, ApiRes<{ Affected: number }>>('/admin/configs/gateway', payload)
 }
 
 // ===== 公告（字段名 = Go 字段名）=====

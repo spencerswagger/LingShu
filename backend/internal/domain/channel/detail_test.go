@@ -30,21 +30,14 @@ func TestRuntimeDetails_AggregatesLayers(t *testing.T) {
 
 	ch := Channel{
 		ID: 1, Name: "c1", Protocol: ProtocolOpenAICompat, BaseURL: "https://api.example.com",
-		State:       StateNormal,
 		RateLimit:   RateLimitConfig{RPM: 100, TPM: 1000, BurstMultiplier: 1.0, MaxConcurrent: 8},
 		HealthProbe: HealthProbeConfig{FailThreshold: 1, RecoveryThreshold: 2},
 		Reliability: ReliabilityConfig{WindowSeconds: 60, MinSamples: 10},
 	}
-	chMachine := newDetailTestMachine(nowFn)
-	chMachine.Feed(Feedback{IsSuccess: true, LatencyMS: 100, Now: base})
-	chMachine.Feed(Feedback{IsSuccess: true, LatencyMS: 200, Now: base})
-	chMachine.Feed(Feedback{IsSuccess: true, LatencyMS: 300, Now: base})
-	chMachine.Feed(Feedback{Now: base})                  // 非超时/非429 失败
-	chMachine.Feed(Feedback{IsTimeout: true, Now: base}) // 超时
 	chLimiter := newDetailTestLimiter(100, 1000, 1.0, nowFn)
 	chLimiter.Record(base, 10)
 	chLimiter.Record(base, 20)
-	rt := &RuntimeChannel{Channel: ch, Machine: chMachine, Limiter: chLimiter}
+	rt := &RuntimeChannel{Channel: ch, Limiter: chLimiter}
 
 	cm := ChannelModel{ID: 7, ChannelID: 1, InternalModelID: "qwen-max", ExternalModelID: 2, State: StateNormal}
 	mMachine := newDetailTestMachine(nowFn)
@@ -70,22 +63,11 @@ func TestRuntimeDetails_AggregatesLayers(t *testing.T) {
 		t.Fatalf("want 1 channel detail, got %d", len(got))
 	}
 	cd := got[0]
-	if cd.View.ID != 1 || cd.View.Name != "c1" || cd.View.State != StateNormal {
-		t.Fatalf("channel view mismatch: %+v", cd.View)
+	if cd.View.ID != 1 || cd.View.Name != "c1" || cd.State != StateNormal {
+		t.Fatalf("channel view mismatch: %+v state=%s", cd.View, cd.State)
 	}
 	if cd.View.MaxSessions != 8 {
 		t.Fatalf("channel MaxSessions want 8, got %d", cd.View.MaxSessions)
-	}
-	// 渠道指标：total=5 failures=1 timeouts=1 rate429=0 success=3
-	if cd.Metrics.Total != 5 || cd.Metrics.Failures != 1 || cd.Metrics.Timeouts != 1 ||
-		cd.Metrics.Rate429 != 0 || cd.Metrics.SuccessSamples != 3 {
-		t.Fatalf("channel metrics mismatch: %+v", cd.Metrics)
-	}
-	if cd.Metrics.ErrorRatePct != 40 || cd.Metrics.Rate429Pct != 0 || cd.Metrics.P99LatencyMS != 300 {
-		t.Fatalf("channel metric rates mismatch: %+v", cd.Metrics)
-	}
-	if cd.Metrics.WindowSeconds != 60 || cd.Metrics.MinSamples != 10 || cd.Metrics.SampleOK {
-		t.Fatalf("channel window config mismatch: %+v", cd.Metrics)
 	}
 	if cd.RPM != 2 || cd.TPM != 30 || cd.RPMLimit != 100 || cd.TPMLimit != 1000 {
 		t.Fatalf("channel usage mismatch: rpm=%d tpm=%d rpmLimit=%d tpmLimit=%d", cd.RPM, cd.TPM, cd.RPMLimit, cd.TPMLimit)
@@ -132,10 +114,9 @@ func TestRuntimeDetails_DrainedIncluded(t *testing.T) {
 	nowFn := func() time.Time { return base }
 	mgr := newDetailTestManager(nowFn)
 
-	ch := Channel{ID: 1, Name: "c1", State: StateNormal,
+	ch := Channel{ID: 1, Name: "c1",
 		RateLimit: RateLimitConfig{RPM: 100, TPM: 1000, BurstMultiplier: 1.0, MaxConcurrent: 8}}
-	chMachine := newDetailTestMachine(nowFn)
-	rt := &RuntimeChannel{Channel: ch, Machine: chMachine, Limiter: newDetailTestLimiter(100, 1000, 1.0, nowFn)}
+	rt := &RuntimeChannel{Channel: ch, Limiter: newDetailTestLimiter(100, 1000, 1.0, nowFn)}
 
 	cm := ChannelModel{ID: 7, ChannelID: 1, InternalModelID: "qwen-max", ExternalModelID: 2, State: StateNormal}
 	mMachine := newDetailTestMachine(nowFn)
@@ -158,7 +139,6 @@ func TestRuntimeDetails_DrainedIncluded(t *testing.T) {
 		}
 		mach.ForceDrain(base)
 	}
-	drain(chMachine)
 	drain(mMachine)
 	drain(kMachine)
 
@@ -172,8 +152,8 @@ func TestRuntimeDetails_DrainedIncluded(t *testing.T) {
 		t.Fatalf("drained channel must still be exported, got %d", len(got))
 	}
 	cd := got[0]
-	if cd.View.State != StateDrain || len(cd.Metrics.DrainingReasons) == 0 {
-		t.Fatalf("channel should be DRAIN with reasons: state=%s reasons=%v", cd.View.State, cd.Metrics.DrainingReasons)
+	if cd.State != StateDrain {
+		t.Fatalf("channel derived state should be DRAIN, got %s", cd.State)
 	}
 	if len(cd.Models) != 1 || cd.Models[0].View.State != StateDrain || len(cd.Models[0].Metrics.DrainingReasons) == 0 {
 		t.Fatalf("model should be DRAIN with reasons: %+v", cd.Models)
@@ -193,9 +173,9 @@ func TestRuntimeDetails_OrderAndEmpty(t *testing.T) {
 	mgr := newDetailTestManager(nowFn)
 
 	buildChannel := func(chID int64) *RuntimeChannel {
-		ch := Channel{ID: chID, Name: "c", State: StateNormal,
+		ch := Channel{ID: chID, Name: "c",
 			RateLimit: RateLimitConfig{RPM: 100, TPM: 1000, BurstMultiplier: 1.0, MaxConcurrent: 4}}
-		return &RuntimeChannel{Channel: ch, Machine: newDetailTestMachine(nowFn), Limiter: newDetailTestLimiter(100, 1000, 1.0, nowFn)}
+		return &RuntimeChannel{Channel: ch, Limiter: newDetailTestLimiter(100, 1000, 1.0, nowFn)}
 	}
 	mgr.rt[3] = buildChannel(3) // 空模型/空密钥渠道
 	mgr.rt[1] = buildChannel(1)

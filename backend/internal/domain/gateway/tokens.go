@@ -59,6 +59,19 @@ func estimateRuneTokens(text string) int {
 	return (utf8.RuneCountInString(text) + 1) / 2
 }
 
+// countTextTokens 估算一段文本的 token 数（OpenAI 系 tiktoken，未知模型回退字符级）。
+func countTextTokens(text, model string) int {
+	if text == "" {
+		return 0
+	}
+	if enc, err := tokenizer.ForModel(tokenizer.Model(model)); err == nil {
+		if c, cerr := enc.Count(text); cerr == nil {
+			return c
+		}
+	}
+	return estimateRuneTokens(text)
+}
+
 // countUserTurns 统计请求体中 user 角色消息条数（客户端每轮重发全量历史，天然随会话增长）。
 func countUserTurns(body []byte) int {
 	var req struct {

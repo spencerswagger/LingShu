@@ -5,7 +5,7 @@ import (
 	"time"
 )
 
-// 状态流转原因，供写 channel_events / channel_model_events 时使用。
+// 状态流转原因，供写 channel_key_events / channel_model_events 时使用。
 const (
 	reasonErrorRate     = "error_rate_exceeded"
 	reason429           = "http_429_exceeded"

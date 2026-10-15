@@ -10,11 +10,11 @@
 //  1. model.Service.GetByExternalName 取启用对外模型；
 //  2. channel.Store.ListByExternal(ext.ID) 取绑定该对外模型的全部非禁用 channel_models；
 //     同一对外模型在同一渠道/密钥下可绑定多个内部模型，每行都是独立候选；
-//  3. 候选过滤（两层级联）：渠道.state != DISABLED、密钥.state != DISABLED、
-//     且该内部模型行.state != DISABLED——禁用/排空某内部模型只跳过该行，
-//     同渠道/密钥的其他内部模型仍候选；
+//  3. 候选过滤（两层级联）：密钥.state != DISABLED、且该内部模型行.state != DISABLED
+//     ——渠道无独立状态，可用性由密钥与内部模型决定；
+//     禁用/排空某内部模型只跳过该行，同渠道/密钥的其他内部模型仍候选；
 //  4. 会话命中（SessionRegistry）：命中的 (渠道,密钥,内部模型) 即使排空也放行并排首位；
-//  5. 新会话只在「渠道、密钥、内部模型都为正常」的候选中选择；空标签过滤同理；
+//  5. 新会话只在「密钥、内部模型都为正常」的候选中选择；空标签过滤同理；
 //  6. 新会话候选排序：priority 降序（高优先级层永远优先）→ 当前成本升序
 //     （同优先级内最便宜优先）→ 存活会话数升序（成本并列时更少者优先）→
 //     渠道/模型行/密钥 ID 升序兜底；并发会话上限由网关在会话创建时校验；
@@ -219,7 +219,6 @@ type candidate struct {
 	cost      float64
 	costKnown bool
 	timeCoeff float64
-	chState   channel.State
 	mState    channel.State
 	keyState  channel.State
 }
@@ -248,7 +247,7 @@ func (e *Engine) Route(ctx context.Context, spec RouteSpec) (*RouteResult, error
 
 // RouteAll 返回全部可用候选渠道（网关据此在超限/429/失败时按序 failover）：
 //   - 会话命中（含排空，禁用除外）排首；
-//   - 其余为「渠道与模型都正常」的候选，按 priority 降序 → 成本升序 → 存活会话数升序 → 稳定 id 排序。
+//   - 其余为「密钥与模型都正常」的候选，按 priority 降序 → 成本升序 → 存活会话数升序 → 稳定 id 排序。
 func (e *Engine) RouteAll(ctx context.Context, spec RouteSpec) ([]*ChannelRoute, error) {
 	cands, extID, err := e.collectCandidates(ctx, spec)
 	if err != nil {
@@ -339,7 +338,7 @@ func (e *Engine) collectCandidates(ctx context.Context, spec RouteSpec) ([]candi
 				}
 			}
 		}
-		if c.chState == channel.StateNormal && c.mState == channel.StateNormal && c.keyState == channel.StateNormal {
+		if c.mState == channel.StateNormal && c.keyState == channel.StateNormal {
 			normal = append(normal, c)
 		}
 	}
@@ -361,18 +360,17 @@ type internalBinding struct {
 	timeCfg   *billing.TimeCoeffConfig // 该行模型级时段配置
 }
 
-// usableCandidates 返回「渠道非禁用 且 密钥非禁用」的候选，按内部模型行逐条展开
+// usableCandidates 返回「密钥非禁用」的候选，按内部模型行逐条展开
 // （候选 = 每 (渠道,密钥,内部模型) 一条），含排空候选：会话命中时允许其续行；
-// 普通选择由上层过滤为「渠道/模型/密钥都正常」。
+// 普通选择由上层过滤为「模型/密钥都正常」。
 // 某内部模型禁用/排空只跳过该行：同一渠道/密钥下的其他内部模型行仍正常展开候选。
 // 展开顺序仅为收集顺序：渠道按快照遍历、同渠道按内部模型行 id 升序、各自按密钥轮询顺序，
 // 最终顺序由 orderCandidates 决定。
 func (e *Engine) usableCandidates(internalByChannel map[int64][]internalBinding) []candidate {
 	cands := make([]candidate, 0, 16)
 	for _, v := range e.chMgr.Snapshot() {
-		if v.State == channel.StateDisabled || v.Protocol != channel.ProtocolOpenAICompat {
-			continue
-		}
+		// 协议可用性由网关按「入站协议 ∈ 模型可达 protocols」判定（AC-4/AC-18）；
+		// 路由层不做协议过滤；渠道无独立状态，可用性由密钥/内部模型三态决定。
 		binds, ok := internalByChannel[v.ID]
 		if !ok {
 			continue // 该渠道未绑定当前对外模型 → 不候选
@@ -410,7 +408,6 @@ func (e *Engine) usableCandidates(internalByChannel map[int64][]internalBinding)
 					revision:  v.UpdatedAt.UnixNano(),
 					costRates: b.costRates,
 					timeCfg:   b.timeCfg,
-					chState:   v.State,
 					mState:    mState,
 					keyState:  kr.Machine.State(),
 				})

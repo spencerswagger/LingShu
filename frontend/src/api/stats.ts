@@ -95,9 +95,14 @@ export interface StatsModelCounts {
   InternalNormal: number
 }
 
+// 渠道无独立状态，仅总数（可用性见 Keys 三态）
+export interface StatsChannelCounts {
+  Total: number
+}
+
 // 运维块（仅管理端返回）
 export interface StatsOps {
-  Channels: StatsCounts
+  Channels: StatsChannelCounts
   Keys: StatsCounts
   Models: StatsModelCounts
 }

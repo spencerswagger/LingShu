@@ -33,6 +33,16 @@ export interface MeResult {
   Balance: number
 }
 
+// 图形验证码：注册前获取（公开接口）
+export function genCaptcha() {
+  return http.get<{ CaptchaID: string; ImageBase64: string }, ApiRes<{ CaptchaID: string; ImageBase64: string }>>('/auth/captcha')
+}
+
+// 自主注册：成功即返回已签发会话（Token + User）
+export function register(payload: { Username: string; Password: string; Nickname: string; CaptchaID: string; CaptchaCode: string }) {
+  return http.post<LoginResult, ApiRes<LoginResult>>('/auth/register', payload)
+}
+
 // 登录第一步（密码校验；已开 2FA 时返回 NeedTOTP + PreAuthToken）
 export function login(username: string, password: string) {
   return http.post<LoginResult, ApiRes<LoginResult>>('/auth/login', { Username: username, Password: password })

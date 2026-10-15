@@ -5,16 +5,33 @@ import (
 	"time"
 )
 
-// ChannelDetail 渠道层运行明细：渠道视图 + 状态机指标 + 限流窗口用量/额度 + 内部模型/密钥明细。
+// ChannelDetail 渠道层运行明细：渠道视图 + 派生状态 + 限流窗口用量/额度 + 内部模型/密钥明细。
+// 渠道无独立状态机（渠道=配置模板），故不含状态机指标；State 为其内部模型与密钥的最差状态。
 type ChannelDetail struct {
-	View     ChannelView
-	Metrics  MachineMetrics
+	View ChannelView
+	// State 渠道派生状态：渠道无独立状态机，取其全部内部模型与密钥的最差值
+	// （DISABLED > DRAIN > NORMAL）；无模型且无密钥时为 NORMAL。
+	State    State
 	RPM      int
 	TPM      int64
 	RPMLimit int
 	TPMLimit int64
 	Models   []ModelDetail
 	Keys     []KeyDetail
+}
+
+// worstState 取一组状态中的最差值（DISABLED > DRAIN > NORMAL）；空参返回 NORMAL。
+func worstState(states ...State) State {
+	w := StateNormal
+	for _, s := range states {
+		switch s {
+		case StateDisabled:
+			return StateDisabled
+		case StateDrain:
+			w = StateDrain
+		}
+	}
+	return w
 }
 
 // ModelDetail 内部模型层运行明细：模型视图 + 状态机指标 + 限流窗口用量/额度。
@@ -84,7 +101,6 @@ func (m *Manager) RuntimeDetails() []ChannelDetail {
 				Tags:        c.Tags,
 				BoundTags:   btCp,
 				Priority:    c.Priority,
-				State:       rt.Machine.State(),
 				LastErr:     rt.LastErr,
 				LastProbe:   lp,
 				RateLimit:   rl,
@@ -94,7 +110,6 @@ func (m *Manager) RuntimeDetails() []ChannelDetail {
 				CreatedAt:   c.CreatedAt,
 				UpdatedAt:   c.UpdatedAt,
 			},
-			Metrics:  rt.Machine.Metrics(),
 			RPM:      cRPM,
 			TPM:      cTPM,
 			RPMLimit: rt.Limiter.RPMLimit(),
@@ -168,6 +183,16 @@ func (m *Manager) RuntimeDetails() []ChannelDetail {
 			})
 		}
 		sort.Slice(detail.Keys, func(i, j int) bool { return detail.Keys[i].View.KeyID < detail.Keys[j].View.KeyID })
+
+		// 渠道派生状态：渠道=配置模板、无独立状态机，取全部内部模型与密钥的最差值。
+		states := make([]State, 0, len(detail.Models)+len(detail.Keys))
+		for i := range detail.Models {
+			states = append(states, detail.Models[i].View.State)
+		}
+		for i := range detail.Keys {
+			states = append(states, detail.Keys[i].View.State)
+		}
+		detail.State = worstState(states...)
 
 		out = append(out, detail)
 	}
