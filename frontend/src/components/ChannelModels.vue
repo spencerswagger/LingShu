@@ -49,6 +49,7 @@ const editingPricing = ref<Record<string, any>>({
 const saving = ref(false)
 const runtimeExpanded = ref<string[]>([])
 const probingId = ref<string | null>(null) // 正在手动探测的模型 ID
+const bindingId = ref<string | null>(null) // 正在列表内联绑定对外模型的模型 ID
 
 // 快速新建对外模型：绑定下拉选到「＋ 新建对外模型」时弹出
 const createExternalOpen = ref(false)
@@ -167,6 +168,33 @@ async function onProbeModel(m: ChannelModel) {
     ElMessage.error(e?.message || '探测失败')
   } finally {
     probingId.value = null
+  }
+}
+
+// 列表内联绑定对外模型：直接在下拉里改，改完即时保存（无需开抽屉）
+async function onInlineBindExternal(row: ChannelModel, val: string) {
+  if (!val || val === row.ExternalModelID) return
+  const prev = row.ExternalModelID
+  row.ExternalModelID = val
+  bindingId.value = row.ID
+  try {
+    await updateChannelModel(props.channelId, row.ID, {
+      InternalModelID: row.InternalModelID,
+      ExternalModelID: val,
+      CostRates: row.CostRates,
+      TimeConfig: row.TimeConfig,
+      ContextTiers: row.ContextTiers,
+      RateLimit: row.RateLimit,
+      HealthProbe: row.HealthProbe,
+      Reliability: row.Reliability,
+    })
+    ElMessage.success('已绑定对外模型')
+    await load()
+  } catch (e: any) {
+    row.ExternalModelID = prev
+    ElMessage.error(e?.message || '绑定失败，已还原')
+  } finally {
+    bindingId.value = null
   }
 }
 
@@ -500,9 +528,25 @@ function onRemoveRow(index: number) {
             </el-tooltip>
           </template>
         </el-table-column>
-        <el-table-column label="绑定对外模型" min-width="150">
+        <el-table-column label="绑定对外模型" min-width="190">
+          <template #header>
+            <el-tooltip :content="'开发者调用该对外模型时，可能路由到本渠道并复用该成本；可直接在列表内修改'" placement="top">
+              <span>绑定对外模型</span>
+            </el-tooltip>
+          </template>
           <template #default="{ row }">
-            <el-tooltip :content="row.ExternalName ? `开发者调用「${row.ExternalName}」时，可能路由到本渠道并复用该成本` : '未绑定'" placement="top">
+            <el-select
+              v-if="!readonly"
+              :model-value="row.ExternalModelID || null"
+              size="small"
+              placeholder="未绑定"
+              style="width: 100%"
+              :loading="bindingId === row.ID"
+              @change="(v: string) => onInlineBindExternal(row, v)"
+            >
+              <el-option v-for="em in externalModels" :key="em.ID" :label="em.ExternalName" :value="em.ID" />
+            </el-select>
+            <el-tooltip v-else :content="row.ExternalName ? `开发者调用「${row.ExternalName}」时，可能路由到本渠道并复用该成本` : '未绑定'" placement="top">
               <span>{{ row.ExternalName || '-' }}</span>
             </el-tooltip>
           </template>
@@ -571,11 +615,10 @@ function onRemoveRow(index: number) {
       />
     </div>
 
-    <!-- 新增/编辑/批量配置 内部模型 抽屉 -->
+    <!-- 新增/编辑/批量配置 内部模型 抽屉（宽屏上限 1080px，窄屏自适应视口，左右留 24px） -->
     <el-drawer
       v-model="drawerOpen"
       :title="pendingRows.length ? `批量配置内部模型（${pendingRows.length}）` : editingId == null ? '新增内部模型' : '编辑内部模型'"
-      <!-- 宽屏上限 1080px，窄屏自适应视口，左右留 24px -->
       :size="'min(1080px, calc(100vw - 48px))'"
       destroy-on-close
     >

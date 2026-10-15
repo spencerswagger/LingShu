@@ -272,11 +272,10 @@ export interface ProtocolOption {
   path?: string
   default?: boolean // 标记首选协议；同一作用域内至多一个
 }
-// 鉴权注入方式：header/scheme 决定注入位置与形式，query 为需放 querystring 的鉴权/版本参数。
-export interface ChannelProtocolAuth {
-  header: string // Authorization | x-api-key | api-key
-  scheme: string // bearer | raw
-  query?: Record<string, string>
+// 模型级 gateway 覆盖：baseUrl 与可达协议子集（键存在 = 可达）。
+export interface ChannelProtocolModelOverride {
+  baseUrl?: string
+  protocols?: Record<string, ProtocolOption>
 }
 // 请求头策略：passthroughMode 决定下游头透传方式，whitelist/blacklist 为名单，set 为覆盖键值（支持变量）。
 export interface ChannelProtocolRequestHeaders {
@@ -290,9 +289,8 @@ export interface ChannelProtocolView {
   Name: string
   BaseURL: string
   Protocols: Record<string, ProtocolOption>
-  Auth: ChannelProtocolAuth
   RequestHeaders: ChannelProtocolRequestHeaders
-  Models: Record<string, unknown>
+  Models: Record<string, ChannelProtocolModelOverride>
   PresetSourceID: string
   Edited: boolean
   SourceStatus: string // ACTIVE | STALE（来源已失效）
@@ -302,9 +300,8 @@ export interface ChannelProtocolInput {
   Name: string
   BaseURL: string
   Protocols: Record<string, ProtocolOption>
-  Auth: ChannelProtocolAuth
   RequestHeaders: ChannelProtocolRequestHeaders
-  Models: Record<string, unknown>
+  Models: Record<string, ChannelProtocolModelOverride>
 }
 // 同步预览：Pending 为需二次确认才覆盖的条目（含差异文本），Applied 为本次直接覆盖数
 export interface ChannelProtocolSyncPending {
@@ -754,19 +751,6 @@ export interface BillingConfigData {
   TimeConfig: TimeCoeffConfig
   CostSample: CostSample // 路由成本比较样值用量（routing.cost_sample）
 }
-export function getBillingConfig() {
-  return http.get<BillingConfigData, ApiRes<BillingConfigData>>('/admin/configs/billing')
-}
-export function putBillingConfig(payload: {
-  R: number | string
-  CnyRate?: number | string
-  ContextTiers: ContextTier[]
-  TimeConfig: TimeCoeffConfig
-  CostSample?: CostSample
-}) {
-  return http.put<{ Affected: number }, ApiRes<{ Affected: number }>>('/admin/configs/billing', payload)
-}
-
 // ===== 会话过期分档配置（字段名 = 后端存储的 JSON key，snake_case）=====
 export interface SessionExpirationContextTier {
   max_tokens: number
@@ -781,25 +765,28 @@ export interface SessionExpirationData {
   context_tiers: SessionExpirationContextTier[]
   turn_tiers: SessionExpirationTurnTier[]
 }
-export function getSessionConfig() {
-  return http.get<{ SessionExpiration: SessionExpirationData }, ApiRes<{ SessionExpiration: SessionExpirationData }>>(
-    '/admin/configs/session',
-  )
-}
-export function putSessionConfig(payload: { SessionExpiration: SessionExpirationData }) {
-  return http.put<{ Affected: number }, ApiRes<{ Affected: number }>>('/admin/configs/session', payload)
-}
 
-// ===== 网关设置（sys_configs 键 gateway.upstream_response_header_whitelist）=====
-// 全局上游响应头白名单：列出后，上游该响应头才透传给客户端（默认空=仅基础协议硬编码响应头）。
-export interface GatewayConfigData {
+// ===== 系统配置（计费 + 会话过期 + 网关白名单，统一入口）=====
+export interface SystemConfigData {
+  Billing: BillingConfigData
+  SessionExpiration: SessionExpirationData
   UpstreamResponseHeaderWhitelist: string[]
 }
-export function getGatewayConfig() {
-  return http.get<GatewayConfigData, ApiRes<GatewayConfigData>>('/admin/configs/gateway')
+export function getSystemConfig() {
+  return http.get<SystemConfigData, ApiRes<SystemConfigData>>('/admin/configs/system')
 }
-export function putGatewayConfig(payload: { UpstreamResponseHeaderWhitelist: string[] }) {
-  return http.put<{ Affected: number }, ApiRes<{ Affected: number }>>('/admin/configs/gateway', payload)
+export function putSystemConfig(payload: {
+  Billing: {
+    R: number | string
+    CnyRate?: number | string
+    ContextTiers: ContextTier[]
+    TimeConfig: TimeCoeffConfig
+    CostSample?: CostSample
+  }
+  SessionExpiration: SessionExpirationData
+  UpstreamResponseHeaderWhitelist: string[]
+}) {
+  return http.put<{ Affected: number }, ApiRes<{ Affected: number }>>('/admin/configs/system', payload)
 }
 
 // ===== 公告（字段名 = Go 字段名）=====

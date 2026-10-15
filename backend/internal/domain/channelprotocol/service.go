@@ -119,20 +119,6 @@ func validate(cp *ChannelProtocol) error {
 	if defaults > 1 {
 		return errBadRequest("同一渠道协议内至多一个默认协议(default)")
 	}
-	if h := strings.ToLower(strings.TrimSpace(cp.Auth.Header)); h != "" {
-		switch h {
-		case "authorization", "x-api-key", "api-key":
-		default:
-			return errBadRequest("auth.header 只支持 Authorization / x-api-key / api-key")
-		}
-	}
-	if sc := strings.ToLower(strings.TrimSpace(cp.Auth.Scheme)); sc != "" {
-		switch sc {
-		case "bearer", "raw":
-		default:
-			return errBadRequest("auth.scheme 只支持 bearer / raw")
-		}
-	}
 	switch strings.ToLower(strings.TrimSpace(cp.RequestHeaders.PassthroughMode)) {
 	case "", PassthroughNone, PassthroughWhitelist, PassthroughBlacklist, PassthroughAll:
 	default:
@@ -377,9 +363,6 @@ func diffOf(cur, cand *ChannelProtocol) string {
 	}
 	if !sameJSON(cur.Protocols, cand.Protocols) {
 		fmt.Fprintf(&b, "Protocols: %s → %s\n", mustJSON(cur.Protocols), mustJSON(cand.Protocols))
-	}
-	if !sameJSON(cur.Auth, cand.Auth) {
-		fmt.Fprintf(&b, "Auth: %s → %s\n", mustJSON(cur.Auth), mustJSON(cand.Auth))
 	}
 	if !sameJSON(cur.RequestHeaders, cand.RequestHeaders) {
 		fmt.Fprintf(&b, "RequestHeaders: %s → %s\n", mustJSON(cur.RequestHeaders), mustJSON(cand.RequestHeaders))

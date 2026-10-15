@@ -14,7 +14,6 @@ import {
   Tickets,
   Setting,
   Bell,
-  SetUp,
 } from '@element-plus/icons-vue'
 
 const route = useRoute()
@@ -25,7 +24,6 @@ const auth = useAuthStore()
 const menus = [
   { path: '/admin/dashboard', title: '统计', icon: Odometer },
   { path: '/admin/channels', title: '渠道', icon: Connection },
-  { path: '/admin/channel-protocols', title: '渠道协议', icon: Connection },
   { path: '/admin/models', title: '模型', icon: Cpu },
   { path: '/admin/tags', title: '标签', icon: PriceTag },
   { path: '/admin/users', title: '用户', icon: User },
@@ -33,17 +31,17 @@ const menus = [
   { path: '/admin/sessions', title: '会话', icon: ChatDotRound },
   { path: '/admin/billings', title: '账单', icon: Tickets },
   { path: '/admin/announcements', title: '公告', icon: Bell },
-  { path: '/admin/system/gateway', title: '网关设置', icon: SetUp },
   { path: '/admin/system', title: '系统', icon: Setting },
 ]
 
 function activeMenu() {
   // 子页（新建/编辑/详情）高亮所属列表菜单
   const p = route.path
-  for (const m of ['/admin/channels', '/admin/channel-protocols', '/admin/models', '/admin/tags', '/admin/users', '/admin/tokens', '/admin/billings', '/admin/announcements']) {
+  for (const m of ['/admin/channels', '/admin/models', '/admin/tags', '/admin/users', '/admin/tokens', '/admin/billings', '/admin/announcements']) {
     if (p.startsWith(m)) return m
   }
-  if (p.startsWith('/admin/system/gateway')) return '/admin/system/gateway'
+  // 渠道协议为「渠道」页内切换的视图，归入「渠道」菜单高亮
+  if (p.startsWith('/admin/channel-protocols')) return '/admin/channels'
   if (p.startsWith('/admin/system')) return '/admin/system'
   return p
 }

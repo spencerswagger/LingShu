@@ -134,10 +134,6 @@ func (s *Server) routes() {
 		admin.HandleFunc("DELETE /api/v1/admin/channel-protocols/{id}", d.ChannelProto.HandleDelete)
 	}
 
-	// 网关设置（全局上游响应头白名单）
-	admin.HandleFunc("GET /api/v1/admin/configs/gateway", d.Console.HandleGetGatewayConfig)
-	admin.HandleFunc("PUT /api/v1/admin/configs/gateway", d.Console.HandlePutGatewayConfig)
-
 	// 渠道密钥（channel_keys 运行时实体）
 	admin.HandleFunc("GET /api/v1/admin/channels/{id}/keys", d.Channel.HandleListKeys)
 	admin.HandleFunc("POST /api/v1/admin/channels/{id}/keys", d.Channel.HandleCreateKey)
@@ -177,10 +173,8 @@ func (s *Server) routes() {
 	admin.HandleFunc("GET /api/v1/admin/billings/stats", d.Console.HandleBillingsStats)
 	admin.HandleFunc("GET /api/v1/admin/billings/{billing_id}", d.Console.HandleGetBilling)
 	admin.HandleFunc("GET /api/v1/admin/stats/dashboard", d.Console.HandleStatsDashboard)
-	admin.HandleFunc("GET /api/v1/admin/configs/billing", d.Console.HandleGetBillingConfig)
-	admin.HandleFunc("PUT /api/v1/admin/configs/billing", d.Console.HandlePutBillingConfig)
-	admin.HandleFunc("GET /api/v1/admin/configs/session", d.Console.HandleGetSessionConfig)
-	admin.HandleFunc("PUT /api/v1/admin/configs/session", d.Console.HandlePutSessionConfig)
+	admin.HandleFunc("GET /api/v1/admin/configs/system", d.Console.HandleGetSystemConfig)
+	admin.HandleFunc("PUT /api/v1/admin/configs/system", d.Console.HandlePutSystemConfig)
 	admin.HandleFunc("GET /api/v1/admin/sessions", d.Console.HandleListSessions)
 	admin.HandleFunc("GET /api/v1/admin/sessions/{session_id}/calls", d.Console.HandleListSessionCalls)
 	admin.HandleFunc("POST /api/v1/admin/sessions/kick", d.Console.HandleKickSessions)
