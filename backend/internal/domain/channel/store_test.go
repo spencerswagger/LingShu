@@ -24,7 +24,7 @@ func TestStore_Insert(t *testing.T) {
 	now := time.Now()
 	mock.ExpectQuery(regexp.QuoteMeta(insertChannelSQL)).
 		WithArgs(sqlmock.AnyArg(), "c1", "openai-compat", "https://x.example.com",
-			sqlmock.AnyArg(), 100, sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+			sqlmock.AnyArg(), 100, sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), nil).
 		WillReturnRows(channelRow(&Channel{
 			ID: 7, Name: "c1", Protocol: "openai-compat", BaseURL: "https://x.example.com",
 			Priority:  100,

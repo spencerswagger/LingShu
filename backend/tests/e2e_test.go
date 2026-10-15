@@ -37,6 +37,7 @@ import (
 	"github.com/team/llmgateway/internal/domain/audit"
 	"github.com/team/llmgateway/internal/domain/billing"
 	"github.com/team/llmgateway/internal/domain/channel"
+	"github.com/team/llmgateway/internal/domain/channelprotocol"
 	"github.com/team/llmgateway/internal/domain/console"
 	"github.com/team/llmgateway/internal/domain/gateway"
 	"github.com/team/llmgateway/internal/domain/identity"
@@ -195,6 +196,13 @@ func buildTestServer(t *testing.T, dsn string) (*httptest.Server, func()) {
 	chSvc.SetChannelModelStore(cmStore)
 	chHandler := channel.NewHandler(chSvc)
 
+	// 渠道协议（外挂预设包物化模板；e2e 未配置 preset url → 不拉取、列表为空，AC-12）。
+	cpStore := channelprotocol.NewStore(d)
+	cpSvc := channelprotocol.NewService(cpStore)
+	cpHandler := channelprotocol.NewHandler(cpSvc)
+	chMgr.SetChannelProtocolStore(cpStore)
+	chSvc.SetChannelProtocolStore(cpStore)
+
 	tagStore := tag.NewStore(d)
 	tagSvc := tag.NewService(tagStore)
 	tagHandler := tag.NewHandler(tagSvc)
@@ -263,6 +271,7 @@ func buildTestServer(t *testing.T, dsn string) (*httptest.Server, func()) {
 			TokenAdmin:   tokenAdminHandler,
 			TokenDev:     tokenDevHandler,
 			Channel:      chHandler,
+			ChannelProto: cpHandler,
 			Tag:          tagHandler,
 			Model:        modelHandler,
 			Announcement: announceHandler,

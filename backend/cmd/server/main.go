@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -21,6 +22,7 @@ import (
 	"github.com/team/llmgateway/internal/domain/audit"
 	"github.com/team/llmgateway/internal/domain/billing"
 	"github.com/team/llmgateway/internal/domain/channel"
+	"github.com/team/llmgateway/internal/domain/channelprotocol"
 	"github.com/team/llmgateway/internal/domain/console"
 	"github.com/team/llmgateway/internal/domain/gateway"
 	"github.com/team/llmgateway/internal/domain/identity"
@@ -168,6 +170,10 @@ func main() {
 		os.Exit(1)
 	}
 
+	// 预设渠道协议首次启动拉取（仅初始化时一次）：地址未设置则不拉取；失败仅日志、不阻塞启动（AC-12）。
+	// 须在装载渠道运行时之前完成，保证渠道引用的渠道协议在运行时可见。
+	app.cpSvc.InitialSync(ctx)
+
 	// 装载渠道运行态（内存权威状态），并启动健康探测与价格同步。
 	if err := app.mgr.SyncFromDB(ctx); err != nil {
 		slog.Error("sync channels from db", "error", err)
@@ -208,6 +214,7 @@ type app struct {
 	deps       server.Deps
 	syncer     *sync.Syncer
 	mgr        *channel.Manager
+	cpSvc      *channelprotocol.Service
 	sess       *router.SessionRegistry
 	billSvc    *billing.Service
 	sessions   *session.Registry
@@ -297,6 +304,15 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	chSvc.SetKeyService(keySvc)
 	chHandler := channel.NewHandler(chSvc)
 	chHandler.SetKeyDeps(keySvc, chMgr)
+
+	// 渠道协议（由外挂预设包物化的可复用接入模板）：首启拉取一次，后续管理员手动同步。
+	cpStore := channelprotocol.NewStore(d)
+	cpSvc := channelprotocol.NewService(cpStore)
+	cpSvc.SetPackURL(cfg.Preset.PackURL)
+	cpSvc.SetLogger(logr)
+	cpHandler := channelprotocol.NewHandler(cpSvc)
+	chMgr.SetChannelProtocolStore(cpStore)
+	chSvc.SetChannelProtocolStore(cpStore)
 
 	// tag / model
 	tagStore := tag.NewStore(d)
@@ -433,6 +449,18 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 			enabled := true
 			return modelSvc.ListModels(ctx, &enabled)
 		},
+		// 全局上游响应头白名单（sys_configs，默认空=不透传任何上游头）。
+		UpstreamResponseHeaderWhitelist: func() ([]string, error) {
+			raw, err := billStore.GetConfig(context.Background(), gateway.UpstreamResponseHeaderWhitelistKey)
+			if err != nil {
+				return nil, err
+			}
+			var names []string
+			if err := json.Unmarshal(raw, &names); err != nil {
+				return nil, err
+			}
+			return names, nil
+		},
 		Logger: logr,
 	})
 	// 调用日志采集注入（nil=不采集；生产装配 SQL 存储，与 console 只读共用）。
@@ -446,6 +474,7 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 			TokenAdmin:   tokenAdminHandler,
 			TokenDev:     tokenDevHandler,
 			Channel:      chHandler,
+			ChannelProto: cpHandler,
 			Tag:          tagHandler,
 			Model:        modelHandler,
 			Announcement: announceHandler,
@@ -456,6 +485,7 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 		},
 		syncer:     syncer,
 		mgr:        chMgr,
+		cpSvc:      cpSvc,
 		sess:       sess,
 		billSvc:    billSvc,
 		sessions:   sessions,

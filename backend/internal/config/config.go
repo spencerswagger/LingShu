@@ -18,6 +18,13 @@ type Config struct {
 	Security SecurityConfig `yaml:"security"`
 	Sync     SyncConfig     `yaml:"sync"`
 	Billing  BillingConfig  `yaml:"billing"`
+	Preset   PresetConfig   `yaml:"preset"`
+}
+
+// PresetConfig 渠道预设包配置。PackURL 为外挂预设站点地址：
+// 为空表示未配置，首次启动不拉取（AC-12）。
+type PresetConfig struct {
+	PackURL string `yaml:"pack_url"`
 }
 
 // BillingConfig 计费相关配置。

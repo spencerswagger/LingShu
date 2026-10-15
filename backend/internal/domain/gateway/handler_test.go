@@ -88,6 +88,7 @@ type fakeChannels struct {
 	mrt               *channel.ModelRuntime
 	keys              map[int64]*channel.KeyRuntime
 	feeds             []feedEntry
+	disabled          []int64
 	maxSessionsPerKey int // 覆盖默认 16（测试会话并发上限用）
 }
 
@@ -119,6 +120,11 @@ func (f *fakeChannels) KeyMaxSessions(int64) int {
 		return f.maxSessionsPerKey
 	}
 	return 16
+}
+
+// DisableChannel 记录 AC-17 触发的渠道禁用（usage 缺失/无法解析）。
+func (f *fakeChannels) DisableChannel(channelID int64) {
+	f.disabled = append(f.disabled, channelID)
 }
 
 // fakeSessionExpiry 可编程的会话过期 TTL fake（fn 为空时默认 60 分钟，保持既有测试时序余量）。
@@ -572,8 +578,9 @@ func TestServeStream(t *testing.T) {
 	assertChannelOpaque(t, rec)
 }
 
-// 场景 8：流式无边 result 头透传（顺带覆盖 stream_options/include_usage 之前的普通 data）。
-func TestServeStreamNoUsageEstimatesCompletion(t *testing.T) {
+// 场景 8（AC-17 放宽）：流式响应无 usage 块（未开启 include_usage）→ 按可见内容估算计费（不退预扣）+ 禁用渠道。
+// 内容已透传无法回改，故 HTTP 状态仍为 200，按估算 token 正常结算并禁用渠道。
+func TestServeStreamNoUsageEstimatesAndDisablesChannel(t *testing.T) {
 	streamBody := "data: {\"choices\":[{\"delta\":{\"content\":\"hello world\"}}]}\n\n" +
 		"data: [DONE]\n\n"
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -586,14 +593,16 @@ func TestServeStreamNoUsageEstimatesCompletion(t *testing.T) {
 	h := build(t, upstream.URL)
 	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t", `{"model":"gpt-4","stream":true}`)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("want 200, got %d", rec.Code)
+		t.Fatalf("want 200 (stream already responded), got %d", rec.Code)
 	}
-	if len(h.billing.reqs) != 1 {
-		t.Fatalf("billing called %d, want 1", len(h.billing.reqs))
+	if len(h.billing.reqs) != 1 || h.billing.reqs[0].Fail {
+		t.Fatalf("usage 缺失应按估算计费（成功账单）, got %+v", h.billing.reqs)
 	}
-	// "hello world" = 11 chars * 0.25 = 2.75 → 2。
-	if out := h.billing.reqs[0].Tokens.Output; out != 2 {
-		t.Errorf("estimated output want 2, got %d", out)
+	if u := h.billing.reqs[0].Tokens; u.Input <= 0 || u.Output <= 0 {
+		t.Fatalf("usage 缺失应按可见内容估算 token, got %+v", u)
+	}
+	if len(h.chans.disabled) != 1 || h.chans.disabled[0] != 1 {
+		t.Fatalf("usage 缺失应禁用渠道 1, got %+v", h.chans.disabled)
 	}
 }
 
@@ -1391,8 +1400,8 @@ func TestServeFailover_ConnectionError(t *testing.T) {
 	}
 }
 
-// 场景 F6：上游成功但未返回 usage（usageZero）→ 仍按输入估算记账，保证每次调用都消耗积分。
-func TestServeZeroUsageChargesEstimatedInput(t *testing.T) {
+// 场景 F6（AC-17 放宽）：上游成功但未返回 usage → 透传上游正文(200) + 按可见内容估算计费（不退预扣）+ 渠道禁用。
+func TestServeZeroUsageEstimatesAndDisablesChannel(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -1407,13 +1416,23 @@ func TestServeZeroUsageChargesEstimatedInput(t *testing.T) {
 	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t",
 		`{"model":"gpt-4","stream":false,"messages":[{"role":"user","content":"hello"}]}`)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
+		t.Fatalf("usage 缺失应透传上游正文(200), got %d: %s", rec.Code, rec.Body.String())
 	}
-	if len(h.billing.reqs) != 1 {
-		t.Fatalf("zero-usage must still bill once, got %d records", len(h.billing.reqs))
+	if !strings.Contains(rec.Body.String(), "hi") {
+		t.Fatalf("usage 缺失应透传上游正文, got %s", rec.Body.String())
 	}
-	if h.billing.reqs[0].Fail || h.billing.reqs[0].Tokens.Input <= 0 {
-		t.Fatalf("zero-usage billing want normal record with estimated input, got %+v", h.billing.reqs[0])
+	if len(h.billing.reqs) != 1 || h.billing.reqs[0].Fail {
+		t.Fatalf("usage 缺失应按估算计费（成功账单）, got %+v", h.billing.reqs)
+	}
+	if u := h.billing.reqs[0].Tokens; u.Input <= 0 || u.Output <= 0 {
+		t.Fatalf("usage 缺失应按可见内容估算 token, got %+v", u)
+	}
+	if len(h.chans.disabled) != 1 || h.chans.disabled[0] != 1 {
+		t.Fatalf("usage 缺失应禁用渠道 1, got %+v", h.chans.disabled)
+	}
+	// 内容已透传、按估算正常结算 → 不应退回预扣（差额由结算多退少补）。
+	if len(fc.refunded) != 0 {
+		t.Fatalf("usage 缺失内容已透传，不应退回预扣, got refunded=%v", fc.refunded)
 	}
 }
 
@@ -1641,7 +1660,7 @@ func assertAttemptCostFields(t *testing.T, attempt map[string]any) {
 // 调用日志-2：流式成功——RespKind=stream、RespBody 为拼接的 assistant content（增量拼接）。
 func TestServeCallLog_StreamSuccess(t *testing.T) {
 	streamBody := "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n" +
-		"data: {\"choices\":[{\"delta\":{\"content\":\" there\"}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{\"content\":\" there\"}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n" +
 		"data: [DONE]\n\n"
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -1792,5 +1811,38 @@ func TestServeCallLog_ReqIncrementDiff(t *testing.T) {
 	third := h.clogs.inserted[2]
 	if thirdMsgs, ok := third.ReqMessages.([]json.RawMessage); !ok || len(thirdMsgs) != 0 {
 		t.Fatalf("third increment want 0 messages (prefix aligned), got %T len=%d (%v)", third.ReqMessages, len(thirdMsgs), third.ReqMessages)
+	}
+}
+
+// 估算器：content 数组容错、多 choice 聚合（与流式一致）、anthropic content[]、未知形状响应体兜底、input 字段。
+func TestMissingUsageEstimate(t *testing.T) {
+	// content 为数组（多模态）不应导致整条解析失败。
+	cArr, _, _ := rawParts([]byte(`{"choices":[{"message":{"content":[{"type":"text","text":"hi"}]}}]}`))
+	if cArr != "hi" {
+		t.Fatalf("rawParts 应兼容 content 数组, got %q", cArr)
+	}
+
+	// 多 choice 聚合（与流式拼装口径一致）。
+	cMulti, _, _ := rawParts([]byte(`{"choices":[{"message":{"content":"a"}},{"message":{"content":"b"}}]}`))
+	if cMulti != "ab" {
+		t.Fatalf("rawParts 应聚合全部 choices, got %q", cMulti)
+	}
+
+	// anthropic 顶层 content[]。
+	cAnth, _, _ := rawParts([]byte(`{"content":[{"type":"text","text":"hi"}]}`))
+	if cAnth != "hi" {
+		t.Fatalf("rawParts 应识别 anthropic content[], got %q", cAnth)
+	}
+
+	// 未知形状（如 openai-responses）：正文提取为空 → 按响应体兜底，Output/Input 均 > 0。
+	u := missingUsageEstimate(
+		[]byte(`{"input":"hello world"}`),
+		[]byte(`{"output":[{"type":"message","content":[{"type":"output_text","text":"hi there"}]}]}`),
+		"gpt-4", "", "", nil)
+	if u.Output <= 0 {
+		t.Fatalf("未知形状应兜底估算输出, got %+v", u)
+	}
+	if u.Input <= 0 {
+		t.Fatalf("input 字段应计入输入估算, got %+v", u)
 	}
 }
