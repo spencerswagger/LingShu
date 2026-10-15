@@ -193,7 +193,7 @@ func buildTestServer(t *testing.T, dsn string) (*httptest.Server, func()) {
 	chSvc := channel.NewService(chStore)
 	chSvc.SetManager(chMgr)
 	chSvc.SetChannelModelStore(cmStore)
-	chHandler := channel.NewHandler(chSvc, userIDFrom)
+	chHandler := channel.NewHandler(chSvc)
 
 	tagStore := tag.NewStore(d)
 	tagSvc := tag.NewService(tagStore)

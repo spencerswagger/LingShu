@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"strings"
 
@@ -64,7 +63,7 @@ type TagResolver interface {
 type Service struct {
 	store       *Store
 	cmStore     *channelModelStore // 渠道内部模型存储（双层模型）；装配时经 SetChannelModelStore 注入
-	keys        *KeyService        // 密钥服务：渠道级 ForceState 批量枚举/流转全部密钥；装配时经 SetKeyService 注入
+	keys        *KeyService        // 密钥服务：枚举渠道密钥（ListProbeLogs/批量删除联动）；装配时经 SetKeyService 注入
 	mgr         *Manager           // 可选：装配时注入，用于动态态同步/内部模型手动状态流转
 	tagResolver TagResolver        // 可选：装配时注入，创建/更新渠道时解析并绑定标签
 }
@@ -80,7 +79,7 @@ func (s *Service) SetManager(m *Manager) { s.mgr = m }
 // SetChannelModelStore 注入渠道内部模型存储（双层模型）。
 func (s *Service) SetChannelModelStore(c *channelModelStore) { s.cmStore = c }
 
-// SetKeyService 注入密钥服务；渠道级 ForceState 批量作用全部密钥时依赖它。
+// SetKeyService 注入密钥服务；枚举渠道密钥（ListProbeLogs 等）时依赖它。
 func (s *Service) SetKeyService(k *KeyService) { s.keys = k }
 
 // SetTagResolver 注入标签解析器。
@@ -103,10 +102,9 @@ func validateBase(name, baseURL, protocol string) error {
 	return nil
 }
 
-// fillDefaults 补齐默认值：priority=100、state=NORMAL、rate_limit/health_probe/reliability 默认。
+// fillDefaults 补齐默认值：priority=100、rate_limit/health_probe/reliability 默认。
 func fillDefaults(c *Channel, in ChannelInput) {
 	c.Priority = 100
-	c.State = StateNormal
 	c.RateLimit = DefaultRateLimit()
 	c.HealthProbe = DefaultHealthProbe()
 	c.Reliability = DefaultReliability()
@@ -198,8 +196,7 @@ func (s *Service) UpdateChannel(ctx context.Context, id int64, in ChannelInput) 
 		Name:      in.Name,
 		Protocol:  in.Protocol,
 		BaseURL:   in.BaseURL,
-		Tags:      existing.Tags,  // tags 列保持不变，不再从 input 设置
-		State:     existing.State, // 状态由状态机/手动操作管理，CRUD 不改变
+		Tags:      existing.Tags, // tags 列保持不变，不再从 input 设置
 		CreatedAt: existing.CreatedAt,
 	}
 	c.RateLimit = existing.RateLimit
@@ -240,11 +237,11 @@ func (s *Service) UpdateChannel(ctx context.Context, id int64, in ChannelInput) 
 	return c, nil
 }
 
-// ListChannels 按 state 过滤查询渠道，并附带逐密钥聚合态 KeyStates。
+// ListChannels 查询全部渠道，并附带逐密钥聚合态 KeyStates。
 // 聚合源为注入 Manager 的 KeyViews（内存运行时，状态为准；mgr 未装配时 KeyStates 为空，
-// 前端显示「无密钥」）。接线依赖 F1：main.go 的 NewManager 需传入 keyStore，详见批 E3 Concerns。
-func (s *Service) ListChannels(ctx context.Context, state State) ([]Channel, error) {
-	chs, err := s.store.List(ctx, state)
+// 前端显示「无密钥」）。渠道无独立状态，其可用性以逐密钥状态呈现。
+func (s *Service) ListChannels(ctx context.Context) ([]Channel, error) {
+	chs, err := s.store.List(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list channels: %w", err)
 	}
@@ -279,17 +276,6 @@ func (s *Service) ListChannels(ctx context.Context, state State) ([]Channel, err
 	return chs, nil
 }
 
-// ListEvents 查询渠道事件（倒序）。
-func (s *Service) ListEvents(ctx context.Context, channelID int64) ([]ChannelEvent, error) {
-	if _, err := s.store.Get(ctx, channelID); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, errNotFound("渠道不存在")
-		}
-		return nil, fmt.Errorf("get channel: %w", err)
-	}
-	return s.store.ListEvents(ctx, channelID)
-}
-
 // DeleteChannel 删除单个渠道（软删除；历史账单记录保留，审计不丢失）。
 func (s *Service) DeleteChannel(ctx context.Context, id int64) error {
 	n, err := s.store.DeleteChannels(ctx, []int64{id})
@@ -320,54 +306,6 @@ func (s *Service) BatchDeleteChannels(ctx context.Context, ids []int64) (int64, 
 		}
 	}
 	return n, nil
-}
-
-// ForceState 渠道级批量状态：把动作作用于该渠道全部未删除密钥（逐一 SetState 落库 + 密钥事件），
-// 并写一条渠道级 channel_events。批量落库后经 mgr.ForceChannelStateBatch 同步内存 KeyRuntime
-// （路由/探测入口只读 Machine.State()，解决手动切换渠道状态后运行时无效的问题）。
-// operatorID 为兼容既有调用签名保留；本层事件暂不落 operator。
-func (s *Service) ForceState(ctx context.Context, id int64, action string, operatorID int64, reason string) (*Channel, error) {
-	if s.keys == nil {
-		return nil, errInternal()
-	}
-	st, ok := keyActionState[action]
-	if !ok {
-		return nil, errBadRequest("action 只允许 normal / drain / disable / recover")
-	}
-	ch, err := s.store.Get(ctx, id)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, errNotFound("渠道不存在")
-		}
-		return nil, fmt.Errorf("get channel: %w", err)
-	}
-	if reason == "" {
-		reason = "manual " + action
-	}
-	keys, err := s.keys.List(ctx, id)
-	if err != nil {
-		return nil, fmt.Errorf("list channel keys: %w", err)
-	}
-	// 批量落库语义：逐密钥 SetState + 密钥事件；单密钥失败不阻断其它，仅记日志。
-	for _, k := range keys {
-		if _, kerr := s.keys.ForceState(ctx, k.ID, action); kerr != nil {
-			slog.Default().Error("force channel keys: skip failing key",
-				"channel_id", id, "key_id", k.ID, "action", action, "error", kerr)
-		}
-	}
-	// 内存同步：把该渠道全部密钥状态机切到同一目标状态（路由/探测/会话创建立即按新状态判定）。
-	if s.mgr != nil {
-		s.mgr.ForceChannelStateBatch(id, action)
-	}
-	if _, err := s.store.InsertEvent(ctx, &ChannelEvent{
-		ChannelID: id,
-		FromState: ch.State,
-		ToState:   st,
-		Reason:    reason,
-	}); err != nil {
-		return nil, fmt.Errorf("insert channel event: %w", err)
-	}
-	return ch, nil
 }
 
 // ModelForceState 手动设置内部模型状态（normal/drain/disable），写模型事件。

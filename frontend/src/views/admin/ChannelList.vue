@@ -7,7 +7,6 @@ import {
   listChannels,
   updateChannel,
   batchDeleteChannels,
-  channelState,
   channelKeyState,
   type AdminChannel,
 } from '@/api/admin'
@@ -22,21 +21,6 @@ function keysOf(row: AdminChannel): KeyState[] {
   return row.KeyStates || []
 }
 
-// 聚合态徽标：x/y 正常（x=state!=DISABLED 的密钥数，y=密钥总数）。
-// 绿色=全部正常；橙色=部分禁用或含排空；红色=全部禁用；无密钥=灰色「无密钥」。
-function agg(row: AdminChannel): { text: string; tagType: 'success' | 'warning' | 'danger' | 'info' } {
-  const keys = keysOf(row)
-  if (!keys.length) return { text: '无密钥', tagType: 'info' }
-  const y = keys.length
-  const x = keys.filter((k) => k.State !== 'DISABLED').length
-  const hasDrain = keys.some((k) => k.State === 'DRAIN')
-  let tagType: 'success' | 'warning' | 'danger' = 'success'
-  if (x === y && !hasDrain) tagType = 'success'
-  else if (x > 0) tagType = 'warning'
-  else tagType = 'danger'
-  return { text: `${x}/${y} 正常`, tagType }
-}
-
 const router = useRouter()
 const loading = ref(false)
 const list = ref<AdminChannel[]>([])
@@ -47,20 +31,18 @@ const selected = ref<AdminChannel[]>([])
 
 const filters = reactive({
   q: '',
-  state: '' as string | undefined,
 })
 
-// 前端本地过滤（全量加载）：名称/地址关键词 + 渠道状态
+// 前端本地过滤（全量加载）：名称/地址关键词
 const displayList = computed(() => {
   const q = filters.q.trim().toLowerCase()
   return list.value.filter((c) => {
-    const hitQ =
+    return (
       !q ||
       (c.Name || '').toLowerCase().includes(q) ||
       (c.BaseURL || '').toLowerCase().includes(q) ||
       (c.Protocol || '').toLowerCase().includes(q)
-    const hitS = !filters.state || c.State === filters.state
-    return hitQ && hitS
+    )
   })
 })
 
@@ -103,17 +85,6 @@ async function onEditPriority(row: AdminChannel, v: number) {
     ElMessage.error(e?.message || '更新失败，已还原')
   } finally {
     savingId.value = null
-  }
-}
-
-// 悬停状态 tag 手动切换三态（与内部模型一致）
-async function onSetState(row: AdminChannel, action: 'normal' | 'drain' | 'disable') {
-  try {
-    await channelState(row.ID, action)
-    ElMessage.success('渠道状态已更新')
-    await load()
-  } catch (e: any) {
-    ElMessage.error(e?.message || '状态操作失败')
   }
 }
 
@@ -225,30 +196,26 @@ function onRowClick(row: AdminChannel, _column: unknown, event: Event) {
             </div>
           </template>
         </el-table-column>
-        <el-table-column label="状态" min-width="110" align="center">
-          <template #header>
-            <ColumnFilter label="状态" :active="!!filters.state" @clear="() => (filters.state = undefined)">
-              <el-select v-model="filters.state" placeholder="渠道状态" clearable size="small" style="width: 100%">
-                <el-option label="正常" value="NORMAL" />
-                <el-option label="排空" value="DRAIN" />
-                <el-option label="禁用" value="DISABLED" />
-              </el-select>
-            </ColumnFilter>
-          </template>
+        <el-table-column label="状态（按密钥）" min-width="160" align="center">
           <template #default="{ row }">
-            <el-popover trigger="hover" placement="left" :width="280">
+            <el-popover trigger="hover" placement="left" :width="300">
               <template #reference>
-                <el-tag :type="agg(row).tagType" size="small" effect="light" style="cursor: pointer">
-                  {{ agg(row).text }}
-                </el-tag>
+                <div class="key-state-cell">
+                  <template v-if="keysOf(row).length">
+                    <span
+                      v-for="k in keysOf(row)"
+                      :key="k.KeyID"
+                      class="key-state-chip"
+                      :title="k.KeyName"
+                    >
+                      <StatusTag :value="k.State" />
+                    </span>
+                  </template>
+                  <el-tag v-else type="info" size="small" effect="light">无密钥</el-tag>
+                </div>
               </template>
               <div class="pop-section">
-                <span class="pop-label">渠道级（批量作用于全部密钥）</span>
-                <div class="pop-actions">
-                  <el-button v-if="row.State !== 'NORMAL'" size="small" type="success" @click="onSetState(row, 'normal')">正常</el-button>
-                  <el-button v-if="row.State !== 'DRAIN'" size="small" type="warning" @click="onSetState(row, 'drain')">排空</el-button>
-                  <el-button v-if="row.State !== 'DISABLED'" size="small" type="danger" @click="onSetState(row, 'disable')">禁用</el-button>
-                </div>
+                <span class="pop-label">各密钥状态（渠道可用性以密钥为准）</span>
               </div>
               <template v-if="keysOf(row).length">
                 <div v-for="k in keysOf(row)" :key="k.KeyID" class="key-row">
@@ -335,6 +302,16 @@ function onRowClick(row: AdminChannel, _column: unknown, event: Event) {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.key-state-cell {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  justify-content: center;
+  cursor: pointer;
+}
+.key-state-chip {
+  display: inline-flex;
 }
 .pop-actions {
   display: flex;

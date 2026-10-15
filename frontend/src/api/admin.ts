@@ -174,7 +174,6 @@ export interface AdminChannel {
   TagIDs: string[]
   BoundTags: { ID: string; Name: string; KV: Record<string, string> }[]
   Priority: number
-  State: string // NORMAL | DRAIN | DISABLED
   RateLimit: RateLimitConfig
   HealthProbe: HealthProbeConfig
   Reliability: ReliabilityConfig
@@ -192,15 +191,6 @@ export interface ChannelInput {
   RateLimit?: RateLimitConfig
   HealthProbe?: HealthProbeConfig
   Reliability?: ReliabilityConfig
-}
-// 渠道状态流转事件
-export interface ChannelEvent {
-  ID: string
-  ChannelID: string
-  FromState: string
-  ToState: string
-  Reason: string
-  CreatedAt: string
 }
 // 内部模型状态流转事件
 export interface ChannelModelEvent {
@@ -244,17 +234,7 @@ export function batchDeleteChannels(ids: string[]) {
     IDs: ids,
   })
 }
-export function listChannelEvents(id: string) {
-  return http.get<ChannelEvent[], ApiRes<ChannelEvent[]>>(`/admin/channels/${id}/events`)
-}
-// 手动状态流转（渠道与内部模型共用）：action = normal | drain | disable
-export function channelState(id: string, action: 'normal' | 'drain' | 'disable', reason = '') {
-  return http.post<AdminChannel, ApiRes<AdminChannel>>(`/admin/channels/${id}/state`, {
-    Action: action,
-    Reason: reason,
-  })
-}
-// 内部模型手动状态流转
+// 内部模型手动状态流转：action = normal | drain | disable
 export function channelModelState(id: string, mid: string, action: 'normal' | 'drain' | 'disable', reason = '') {
   return http.put<unknown, ApiRes<unknown>>(`/admin/channels/${id}/models/${mid}/state`, {
     Action: action,

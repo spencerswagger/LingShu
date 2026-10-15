@@ -1,7 +1,6 @@
 package channel
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -22,8 +21,6 @@ import (
 //   - POST   /api/v1/admin/channels
 //   - PUT    /api/v1/admin/channels/{id}
 //   - POST   /api/v1/admin/channels/batch-delete {ids:[]}
-//   - GET    /api/v1/admin/channels/{id}/events
-//   - POST   /api/v1/admin/channels/{id}/state {action:"recover"|"disable"}
 //
 // 渠道内部模型（双层模型）：
 //   - GET    /api/v1/admin/channels/{id}/models
@@ -39,19 +36,15 @@ import (
 //   - DELETE /api/v1/admin/channels/{id}/keys/{kid}
 //   - POST   /api/v1/admin/channels/{id}/keys/{kid}/state {action}
 type Handler struct {
-	svc          *Service
-	operatorIDFn func(ctx context.Context) (int64, bool)
-	keySvc       *KeyService
-	mgr          *Manager
-	killKeySess  func(keyID int64) int // 密钥删除联动会话清理（装配层注入；nil=跳过）
+	svc         *Service
+	keySvc      *KeyService
+	mgr         *Manager
+	killKeySess func(keyID int64) int // 密钥删除联动会话清理（装配层注入；nil=跳过）
 }
 
-// NewHandler 创建渠道 HTTP 处理器。operatorIDFn 从鉴权上下文取操作者 ID（管理员手动状态切换记录到 channel_events）。
-func NewHandler(svc *Service, operatorIDFn func(ctx context.Context) (int64, bool)) *Handler {
-	if operatorIDFn == nil {
-		operatorIDFn = func(ctx context.Context) (int64, bool) { return 0, false }
-	}
-	return &Handler{svc: svc, operatorIDFn: operatorIDFn}
+// NewHandler 创建渠道 HTTP 处理器。
+func NewHandler(svc *Service) *Handler {
+	return &Handler{svc: svc}
 }
 
 // SetKeyDeps 注入密钥服务与运行时管理器（Task D2：KeyService 负责落库，成功后在 Manager 同步内存运行时）。
@@ -124,10 +117,7 @@ func toInput(req *createChannelRequest) ChannelInput {
 
 // HandleList GET /api/v1/admin/channels
 func (h *Handler) HandleList(w http.ResponseWriter, r *http.Request) {
-	// 可选过滤：?State=NORMAL|DRAIN|DISABLED
-	state := State(r.URL.Query().Get("State"))
-
-	chs, err := h.svc.ListChannels(r.Context(), state)
+	chs, err := h.svc.ListChannels(r.Context())
 	if err != nil {
 		writeServiceErr(w, r, err)
 		return
@@ -206,42 +196,9 @@ func (h *Handler) HandleBatchDelete(w http.ResponseWriter, r *http.Request) {
 	resp.OK(w, r, map[string]int64{"Deleted": n})
 }
 
-// HandleListEvents GET /api/v1/admin/channels/{id}/events
-func (h *Handler) HandleListEvents(w http.ResponseWriter, r *http.Request) {
-	id, ok := pathID(w, r)
-	if !ok {
-		return
-	}
-	evs, err := h.svc.ListEvents(r.Context(), id)
-	if err != nil {
-		writeServiceErr(w, r, err)
-		return
-	}
-	resp.OK(w, r, evs)
-}
-
 type stateRequest struct {
 	Action string `json:"Action"` // normal | drain | disable
 	Reason string `json:"Reason,omitempty"`
-}
-
-// HandleState POST /api/v1/admin/channels/{id}/state
-func (h *Handler) HandleState(w http.ResponseWriter, r *http.Request) {
-	id, ok := pathID(w, r)
-	if !ok {
-		return
-	}
-	var req stateRequest
-	if !decodeBody(w, r, &req) {
-		return
-	}
-	operatorID, _ := h.operatorIDFn(r.Context())
-	ch, err := h.svc.ForceState(r.Context(), id, req.Action, operatorID, req.Reason)
-	if err != nil {
-		writeServiceErr(w, r, err)
-		return
-	}
-	resp.OK(w, r, ch)
 }
 
 // writeServiceErr 将 channel.Service 返回的错误映射为统一响应。

@@ -21,10 +21,10 @@ func channelRow(c *Channel) *sqlmock.Rows {
 	hp, _ := json.Marshal(c.HealthProbe)
 	rel, _ := json.Marshal(c.Reliability)
 	return sqlmock.NewRows([]string{"id", "name", "protocol", "base_url",
-		"tags", "priority", "state", "rate_limit", "health_probe", "reliability",
+		"tags", "priority", "rate_limit", "health_probe", "reliability",
 		"created_at", "updated_at"}).
 		AddRow(c.ID, c.Name, c.Protocol, c.BaseURL, tags, c.Priority,
-			string(c.State), rl, hp, rel, c.CreatedAt, c.UpdatedAt)
+			rl, hp, rel, c.CreatedAt, c.UpdatedAt)
 }
 
 func asAPIError(err error) (*APIError, bool) {
@@ -35,8 +35,8 @@ func asAPIError(err error) (*APIError, bool) {
 	return ae, ok
 }
 
-const insertChannelSQL = `INSERT INTO channels(id, name, protocol, base_url, tags, priority, state, rate_limit, health_probe, reliability)
-		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+const insertChannelSQL = `INSERT INTO channels(id, name, protocol, base_url, tags, priority, rate_limit, health_probe, reliability)
+		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
 		 RETURNING ` + channelCols
 
 func TestService_CreateChannel_Defaults(t *testing.T) {
@@ -54,10 +54,10 @@ func TestService_CreateChannel_Defaults(t *testing.T) {
 	mock.ExpectBegin()
 	mock.ExpectQuery(regexp.QuoteMeta(insertChannelSQL)).
 		WithArgs(sqlmock.AnyArg(), "my-channel", "openai-compat", "https://api.example.com",
-			sqlmock.AnyArg(), 100, "NORMAL", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+			sqlmock.AnyArg(), 100, sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnRows(channelRow(&Channel{
 			ID: 1, Name: "my-channel", Protocol: "openai-compat", BaseURL: "https://api.example.com",
-			Priority: 100, State: StateNormal,
+			Priority:  100,
 			CreatedAt: time.Now(), UpdatedAt: time.Now(),
 		}))
 	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM channel_tags WHERE channel_id = $1`)).
@@ -70,8 +70,8 @@ func TestService_CreateChannel_Defaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if ch.State != StateNormal {
-		t.Fatalf("expected HEALTHY default, got %s", ch.State)
+	if ch.Name != "my-channel" {
+		t.Fatalf("unexpected channel: %+v", ch)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("mock expectations: %v", err)
@@ -108,7 +108,7 @@ func TestService_CreateChannel_BindsTags(t *testing.T) {
 	mock.ExpectQuery(`INSERT INTO channels`).
 		WillReturnRows(sqlmock.NewRows(strings.Split(channelCols, ", ")).
 			AddRow(int64(7), "c", "openai-compat", "https://x.example.com", []byte("{}"),
-				int64(100), "NORMAL", []byte("{}"), []byte("{}"), []byte("{}"),
+				int64(100), []byte("{}"), []byte("{}"), []byte("{}"),
 				time.Now(), time.Now()))
 	mock.ExpectExec(`DELETE FROM channel_tags`).WithArgs(int64(7)).
 		WillReturnResult(sqlmock.NewResult(0, 0))
@@ -143,7 +143,7 @@ func TestService_CreateChannel_DuplicateName(t *testing.T) {
 
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + channelCols + ` FROM channels WHERE name = $1`)).
 		WithArgs("dup").
-		WillReturnRows(channelRow(&Channel{ID: 1, Name: "dup", State: StateNormal}))
+		WillReturnRows(channelRow(&Channel{ID: 1, Name: "dup"}))
 
 	_, err = svc.CreateChannel(context.Background(), ChannelInput{
 		Name: "dup", Protocol: "openai-compat", BaseURL: "https://api.example.com",
@@ -166,18 +166,18 @@ func TestService_UpdateChannel(t *testing.T) {
 		WithArgs(int64(5)).
 		WillReturnRows(channelRow(&Channel{
 			ID: 5, Name: "old", Protocol: "openai-compat", BaseURL: "https://a.example.com",
-			Priority: 50, State: StateNormal,
+			Priority:  50,
 			CreatedAt: time.Now(), UpdatedAt: time.Now(),
 		}))
 
 	updQuery := `UPDATE channels SET name=$1, protocol=$2, base_url=$3,
-		        tags=$4, priority=$5, state=$6, rate_limit=$7, health_probe=$8,
-		        reliability=$9, updated_at=now()
-		 WHERE id=$10 AND deleted_at IS NULL`
+		        tags=$4, priority=$5, rate_limit=$6, health_probe=$7,
+		        reliability=$8, updated_at=now()
+		 WHERE id=$9 AND deleted_at IS NULL`
 	mock.ExpectBegin()
 	mock.ExpectExec(regexp.QuoteMeta(updQuery)).
 		WithArgs("renamed", "openai-compat", "https://b.example.com",
-			sqlmock.AnyArg(), 50, "NORMAL", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), int64(5)).
+			sqlmock.AnyArg(), 50, sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), int64(5)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM channel_tags WHERE channel_id = $1`)).
 		WithArgs(int64(5)).WillReturnResult(sqlmock.NewResult(0, 0))
@@ -260,7 +260,7 @@ func TestService_ListProbeLogs_AggregatesChannelKeys(t *testing.T) {
 		WithArgs(int64(1)).
 		WillReturnRows(channelRow(&Channel{
 			ID: 1, Name: "ch", Protocol: "openai-compat", BaseURL: "https://a.example.com",
-			Priority: 100, State: StateNormal, CreatedAt: now, UpdatedAt: now,
+			Priority: 100, CreatedAt: now, UpdatedAt: now,
 		}))
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + channelKeyCols + ` FROM channel_keys WHERE channel_id=$1 AND deleted_at IS NULL ORDER BY id`)).
 		WithArgs(int64(1)).
@@ -286,153 +286,6 @@ func TestService_ListProbeLogs_AggregatesChannelKeys(t *testing.T) {
 	}
 	if logs[0].ChannelKeyID != 10 || logs[1].ChannelKeyID != 11 {
 		t.Fatalf("应保留 channel_key_id（按密钥聚合合并）：%+v", logs)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("mock expectations: %v", err)
-	}
-}
-
-func TestService_ForceState_BatchKeys(t *testing.T) {
-	// 渠道级批量状态：枚举两密钥逐一 SetState + InsertEvent，最后写一条渠道级事件（顺序断言）。
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("sqlmock: %v", err)
-	}
-	defer db.Close()
-	svc := NewService(NewStore(db))
-	svc.SetKeyService(NewKeyService(NewKeyStore(db), testSM4Key))
-
-	now := time.Now()
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + channelCols + ` FROM channels WHERE id = $1 AND deleted_at IS NULL`)).
-		WithArgs(int64(1)).
-		WillReturnRows(channelRow(&Channel{
-			ID: 1, Name: "ch", Protocol: "openai-compat", BaseURL: "https://a.example.com",
-			Priority: 100, State: StateNormal, CreatedAt: now, UpdatedAt: now,
-		}))
-
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + channelKeyCols + ` FROM channel_keys WHERE channel_id=$1 AND deleted_at IS NULL ORDER BY id`)).
-		WithArgs(int64(1)).
-		WillReturnRows(channelKeyRow(&ChannelKey{
-			ID: 10, ChannelID: 1, Name: "k1", CredentialEnc: "enc", State: StateNormal,
-			CreatedAt: now, UpdatedAt: now,
-		}).AddRow(int64(11), int64(1), "k2", "enc", string(StateNormal), "", nil, now, now))
-
-	for _, k := range []struct {
-		id   int64
-		name string
-	}{{10, "k1"}, {11, "k2"}} {
-		mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + channelKeyCols + ` FROM channel_keys WHERE id=$1 AND deleted_at IS NULL`)).
-			WithArgs(k.id).
-			WillReturnRows(channelKeyRow(&ChannelKey{
-				ID: k.id, ChannelID: 1, Name: k.name, CredentialEnc: "enc", State: StateNormal,
-				CreatedAt: now, UpdatedAt: now,
-			}))
-		mock.ExpectExec(regexp.QuoteMeta(`UPDATE channel_keys SET state=$1, last_err=$2, updated_at=now() WHERE id=$3`)).
-			WithArgs(string(StateDisabled), "", k.id).WillReturnResult(sqlmock.NewResult(0, 1))
-		mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO channel_key_events(id, channel_key_id, from_state, to_state, reason) VALUES($1,$2,$3,$4,$5)`)).
-			WithArgs(sqlmock.AnyArg(), k.id, string(StateNormal), string(StateDisabled), "manual_disable").
-			WillReturnResult(sqlmock.NewResult(10, 1))
-		mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + channelKeyCols + ` FROM channel_keys WHERE id=$1 AND deleted_at IS NULL`)).
-			WithArgs(k.id).
-			WillReturnRows(channelKeyRow(&ChannelKey{
-				ID: k.id, ChannelID: 1, Name: k.name, CredentialEnc: "enc", State: StateDisabled,
-				CreatedAt: now, UpdatedAt: now,
-			}))
-	}
-
-	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO channel_events(id, channel_id, from_state, to_state, reason)
-		 VALUES($1,$2,$3,$4,$5) RETURNING `+eventCols)).
-		WithArgs(sqlmock.AnyArg(), int64(1), string(StateNormal), string(StateDisabled), "manual disable").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "channel_id", "from_state", "to_state", "reason", "created_at"}).
-			AddRow(int64(30), int64(1), string(StateNormal), string(StateDisabled), "manual disable", now))
-
-	ch, err := svc.ForceState(context.Background(), 1, ActionDisable, 0, "")
-	if err != nil {
-		t.Fatalf("force state: %v", err)
-	}
-	if ch.ID != 1 {
-		t.Fatalf("unexpected channel view: %+v", ch)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("mock expectations: %v", err)
-	}
-}
-
-// TestService_ForceState_BatchKeys_SyncMemory 渠道级批量状态落库后必须同步内存 KeyRuntime：
-// ForceChannelStateBatch 把该渠道全部密钥状态机切到目标状态（路由/探测只读 Machine.State()），
-// 手动切换渠道状态立即对运行时生效。回归：审查发现批量落库后内存 KeyRuntime 未联动。
-func TestService_ForceState_BatchKeys_SyncMemory(t *testing.T) {
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("sqlmock: %v", err)
-	}
-	defer db.Close()
-
-	// 内存运行时：渠道 1 + 密钥 11/12（机器初态 NORMAL）。
-	mgr := NewManager(nil, nil, testSM4Key, nil, nil, time.Now)
-	ch := &Channel{ID: 1, Name: "ch", Protocol: "openai-compat", BaseURL: "https://a.example.com", State: StateNormal}
-	mgr.Upsert(ch)
-	mgr.UpsertKey(ChannelKey{ID: 11, ChannelID: 1, Name: "k1", State: StateNormal})
-	mgr.UpsertKey(ChannelKey{ID: 12, ChannelID: 1, Name: "k2", State: StateNormal})
-
-	svc := NewService(NewStore(db))
-	svc.SetKeyService(NewKeyService(NewKeyStore(db), testSM4Key))
-	svc.SetManager(mgr)
-
-	now := time.Now()
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + channelCols + ` FROM channels WHERE id = $1 AND deleted_at IS NULL`)).
-		WithArgs(int64(1)).
-		WillReturnRows(channelRow(&Channel{
-			ID: 1, Name: "ch", Protocol: "openai-compat", BaseURL: "https://a.example.com",
-			Priority: 100, State: StateNormal, CreatedAt: now, UpdatedAt: now,
-		}))
-
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + channelKeyCols + ` FROM channel_keys WHERE channel_id=$1 AND deleted_at IS NULL ORDER BY id`)).
-		WithArgs(int64(1)).
-		WillReturnRows(channelKeyRow(&ChannelKey{
-			ID: 11, ChannelID: 1, Name: "k1", CredentialEnc: "enc", State: StateNormal,
-			CreatedAt: now, UpdatedAt: now,
-		}).AddRow(int64(12), int64(1), "k2", "enc", string(StateNormal), "", nil, now, now))
-
-	for _, k := range []struct {
-		id   int64
-		name string
-	}{{11, "k1"}, {12, "k2"}} {
-		mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + channelKeyCols + ` FROM channel_keys WHERE id=$1 AND deleted_at IS NULL`)).
-			WithArgs(k.id).
-			WillReturnRows(channelKeyRow(&ChannelKey{
-				ID: k.id, ChannelID: 1, Name: k.name, CredentialEnc: "enc", State: StateNormal,
-				CreatedAt: now, UpdatedAt: now,
-			}))
-		mock.ExpectExec(regexp.QuoteMeta(`UPDATE channel_keys SET state=$1, last_err=$2, updated_at=now() WHERE id=$3`)).
-			WithArgs(string(StateDisabled), "", k.id).WillReturnResult(sqlmock.NewResult(0, 1))
-		mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO channel_key_events(id, channel_key_id, from_state, to_state, reason) VALUES($1,$2,$3,$4,$5)`)).
-			WithArgs(sqlmock.AnyArg(), k.id, string(StateNormal), string(StateDisabled), "manual_disable").
-			WillReturnResult(sqlmock.NewResult(10, 1))
-		mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + channelKeyCols + ` FROM channel_keys WHERE id=$1 AND deleted_at IS NULL`)).
-			WithArgs(k.id).
-			WillReturnRows(channelKeyRow(&ChannelKey{
-				ID: k.id, ChannelID: 1, Name: k.name, CredentialEnc: "enc", State: StateDisabled,
-				CreatedAt: now, UpdatedAt: now,
-			}))
-	}
-
-	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO channel_events(id, channel_id, from_state, to_state, reason)
-		 VALUES($1,$2,$3,$4,$5) RETURNING `+eventCols)).
-		WithArgs(sqlmock.AnyArg(), int64(1), string(StateNormal), string(StateDisabled), "manual disable").
-		WillReturnRows(sqlmock.NewRows([]string{"id", "channel_id", "from_state", "to_state", "reason", "created_at"}).
-			AddRow(int64(30), int64(1), string(StateNormal), string(StateDisabled), "manual disable", now))
-
-	if _, err := svc.ForceState(context.Background(), 1, ActionDisable, 0, ""); err != nil {
-		t.Fatalf("force state: %v", err)
-	}
-
-	// 内存 KeyRuntime 已联动：两密钥状态机均 DISABLED（路由入口读 kr.Machine.State() 即拒绝）。
-	krA, _ := mgr.GetKeyRuntime(11)
-	krB, _ := mgr.GetKeyRuntime(12)
-	if krA.Machine.State() != StateDisabled || krB.Machine.State() != StateDisabled {
-		t.Fatalf("批量状态后内存 KeyRuntime 应为 DISABLED，got key11=%s key12=%s",
-			krA.Machine.State(), krB.Machine.State())
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("mock expectations: %v", err)

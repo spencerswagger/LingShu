@@ -295,7 +295,7 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	chSvc.SetChannelModelStore(cmStore)
 	keySvc := channel.NewKeyService(keyStore, sm4Key)
 	chSvc.SetKeyService(keySvc)
-	chHandler := channel.NewHandler(chSvc, userIDFrom)
+	chHandler := channel.NewHandler(chSvc)
 	chHandler.SetKeyDeps(keySvc, chMgr)
 
 	// tag / model
