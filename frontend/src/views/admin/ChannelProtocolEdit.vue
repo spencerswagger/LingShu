@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
-import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
+import { computed, onMounted, reactive, ref } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Delete, Edit, RefreshRight } from '@element-plus/icons-vue'
 import {
@@ -22,6 +22,7 @@ import StringListEditor from '@/components/StringListEditor.vue'
 import ModelPricing from '@/components/ModelPricing.vue'
 import ModelPriceCatalog from '@/components/ModelPriceCatalog.vue'
 import ErrorBubble from '@/components/ErrorBubble.vue'
+import { useUnsavedGuard } from '@/composables/useUnsavedGuard'
 
 const route = useRoute()
 const router = useRouter()
@@ -154,7 +155,7 @@ async function load() {
         ContextTiers: ov?.contextTiers ?? null,
       },
     }))
-    savedSnapshot.value = snapshot()
+    markSaved()
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
   } finally {
@@ -164,7 +165,6 @@ async function load() {
 
 // ===== 未保存修改守卫 =====
 // 以「提交口径」序列化当前表单快照，与最近一次加载/保存后的快照比对判断是否有未保存修改。
-const savedSnapshot = ref('')
 function snapshot(): string {
   return JSON.stringify({
     name: form.name,
@@ -178,36 +178,16 @@ function snapshot(): string {
     models: modelRows.value,
   })
 }
-const dirty = computed(() => isEdit.value && snapshot() !== savedSnapshot.value)
-
-function onBeforeUnload(e: BeforeUnloadEvent) {
-  if (!dirty.value) return
-  e.preventDefault()
-  e.returnValue = ''
-}
-
-onBeforeRouteLeave(async () => {
-  if (!dirty.value) return true
-  try {
-    await ElMessageBox.confirm('当前有未保存的修改，离开将丢失，确定离开吗？', '未保存的修改', {
-      type: 'warning',
-      confirmButtonText: '放弃修改并离开',
-      cancelButtonText: '留在本页',
-    })
-    return true
-  } catch {
-    return false
-  }
-})
+const { dirty, markSaved } = useUnsavedGuard(snapshot)
+// 新建：以当前空表单为基线；编辑：由 load() 成功后重建基线（加载失败则不判脏）。
+if (!isEdit.value) markSaved()
 
 onMounted(() => {
   // 返回「渠道」合并页时保持选中「渠道协议」视图
   sessionStorage.setItem('admin-channels-tab', 'protocols')
-  window.addEventListener('beforeunload', onBeforeUnload)
   loadExternalModels()
   load()
 })
-onBeforeUnmount(() => window.removeEventListener('beforeunload', onBeforeUnload))
 
 // ===== 模型行 增/改/删 =====
 const modelDrawerOpen = ref(false)
@@ -371,12 +351,21 @@ function onApplyCostCatalog(partial: Record<string, number>) {
   editingPricing.value.CostRates = { ...editingPricing.value.CostRates, ...partial }
 }
 
-// 从对外模型同步价格：用所绑定对外模型的售价 / 时段 / 分档覆盖当前内部模型的成本侧。
-function syncCostFromExternal() {
+// 从对外模型同步价格：用所绑定对外模型的售价 / 时段 / 分档覆盖当前内部模型的成本侧（覆盖前二次确认）。
+async function syncCostFromExternal() {
   const extId = editingForm.value.externalModelID
   if (!extId) return ElMessage.warning('请先绑定一个对外模型')
   const em = externalModels.value.find((e) => String(e.ID) === String(extId))
   if (!em) return ElMessage.warning('未找到该对外模型（可能已停用）')
+  try {
+    await ElMessageBox.confirm(
+      `将用对外模型「${em.ExternalName}」的售价 / 时段 / 分档覆盖当前成本配置，确定继续？`,
+      '同步对外模型价格',
+      { type: 'warning', confirmButtonText: '覆盖', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
   editingPricing.value.CostRates = { ...(em.SaleRates || {}) }
   editingPricing.value.TimeConfig = em.TimeConfig ? JSON.parse(JSON.stringify(em.TimeConfig)) : null
   editingPricing.value.ContextTiers = em.ContextTiers ? JSON.parse(JSON.stringify(em.ContextTiers)) : null
@@ -465,6 +454,7 @@ async function onSubmit() {
     } else {
       await createChannelProtocol(payload)
       ElMessage.success('渠道协议已创建')
+      markSaved() // 创建成功后再跳转，避免触发「未保存」离开确认
       router.push('/admin/channels')
     }
   } catch (e: any) {

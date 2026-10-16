@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
-import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Edit, Delete } from '@element-plus/icons-vue'
 import {
@@ -27,6 +27,7 @@ import ChannelModels from '@/components/ChannelModels.vue'
 import StatusTag from '@/components/StatusTag.vue'
 import CronInput from '@/components/CronInput.vue'
 import ErrorBubble from '@/components/ErrorBubble.vue'
+import { useUnsavedGuard } from '@/composables/useUnsavedGuard'
 
 const route = useRoute()
 const router = useRouter()
@@ -230,7 +231,7 @@ async function load() {
     await loadKeys()
     await loadTags()
     await loadProtocols()
-    savedSnapshot.value = snapshot()
+    markSaved()
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
   } finally {
@@ -241,7 +242,6 @@ async function load() {
 // ===== 未保存修改守卫 =====
 // 以「提交口径」序列化当前表单快照，与最近一次加载/保存后的快照比对判断是否有未保存修改。
 // 渠道密钥、内部模型在各自弹窗/子表中即时保存，不纳入本页 dirty。
-const savedSnapshot = ref('')
 function snapshot(): string {
   return JSON.stringify({
     name: form.name,
@@ -271,33 +271,8 @@ function snapshot(): string {
     auth_fail_threshold: form.auth_fail_threshold,
   })
 }
-const dirty = computed(() => snapshot() !== savedSnapshot.value)
-
-function onBeforeUnload(e: BeforeUnloadEvent) {
-  if (!dirty.value) return
-  e.preventDefault()
-  e.returnValue = ''
-}
-
-onBeforeRouteLeave(async () => {
-  if (!dirty.value) return true
-  try {
-    await ElMessageBox.confirm('当前有未保存的修改，离开将丢失，确定离开吗？', '未保存的修改', {
-      type: 'warning',
-      confirmButtonText: '放弃修改并离开',
-      cancelButtonText: '留在本页',
-    })
-    return true
-  } catch {
-    return false
-  }
-})
-
-onMounted(() => {
-  window.addEventListener('beforeunload', onBeforeUnload)
-  load()
-})
-onBeforeUnmount(() => window.removeEventListener('beforeunload', onBeforeUnload))
+const { dirty, markSaved } = useUnsavedGuard(snapshot)
+onMounted(load)
 
 async function loadStateData() {
   const [meRes, plRes] = await Promise.all([

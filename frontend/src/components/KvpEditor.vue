@@ -54,7 +54,6 @@ function emitChange() {
     if (k) map[k] = r.value
   }
   synced = map
-  initialized = true
   emit('update:modelValue', map)
 }
 // 变量插入：把所选变量追加到当前值末尾
