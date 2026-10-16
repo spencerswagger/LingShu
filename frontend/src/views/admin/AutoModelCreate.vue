@@ -52,7 +52,11 @@ function snapshot(): string {
 const { markSaved } = useUnsavedGuard(snapshot)
 markSaved() // 新建：以空表单为基线
 
-onMounted(loadCandidates)
+onMounted(() => {
+  // 返回「模型」合并页时保持选中「Auto 模型」视图
+  sessionStorage.setItem(isSelf.value ? 'dev-models-tab' : 'admin-models-tab', 'auto')
+  loadCandidates()
+})
 
 function validate(): string | null {
   if (!form.Name.trim()) return '请填写 Auto 模型名称'
