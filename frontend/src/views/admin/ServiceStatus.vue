@@ -541,14 +541,18 @@ const sampleUsageText = computed(() => {
 const selectedId = ref<string | null>(null)
 const selectedRow = computed<MatrixRow | null>(() => (selectedId.value ? rows.value.find((r) => r._id === selectedId.value) || null : null))
 const detailVisible = ref(false)
+// 切换行才重置事件链缓存（loadedFor 与数据同清）；重复选中同一行保留已加载数据，
+// 避免清空后因 selectedId 未变、watch 不触发而导致事件链恒为空。
 function selectRow(row: MatrixRow) {
+  if (selectedId.value !== row._id) resetTabs()
   selectedId.value = row._id
-  resetTabs()
 }
 // 点击列表任意行 → 打开「详情」弹窗（交互对齐「渠道」列表：行即入口，不再占用右侧栏）。
+// 打开时确保当前 tab 已加载：覆盖「切换行」与新选行两种路径（ensureTab 内部按 loadedFor 去重）。
 function onRowClick(row: MatrixRow) {
   selectRow(row)
   detailVisible.value = true
+  ensureTab(activeTab.value)
 }
 
 // ===== 事件链 tab（渠道无独立状态机，故无「渠道事件」tab；仅在选中行或对应 tab 被查看时调用）=====
