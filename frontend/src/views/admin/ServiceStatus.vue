@@ -463,7 +463,7 @@ function compact(v: number): string {
   return fmtInt(v)
 }
 // 成本列：取该行覆盖（渠道 × 内部模型）候选成本的 min–max。
-// 候选成本来自后端按需计算（仅在工具栏「展开对外模型」勾选后才有数据），故未展开时显示 —。
+// 候选由后端对全部启用对外模型实时计算；该行无匹配候选（如模型未绑定可用渠道密钥）或成本未知时显示 —。
 // 模型轴进入行轴时为单个内部模型；折叠态覆盖该渠道全部内部模型，聚合为区间。
 function costGroup(r: MatrixRow): { min: number; max: number } | null {
   const v = view.value
@@ -533,7 +533,7 @@ function sessionsLimit(r: MatrixRow): number {
 const sampleUsageText = computed(() => {
   const s = view.value?.SampleUsage
   if (!s) return ''
-  return `input/output/cache_read/cache_write/reasoning = ${fmtNum(s.input)}/${fmtNum(s.output)}/${fmtNum(s.cache_read)}/${fmtNum(s.cache_write)}/${fmtNum(s.reasoning)}`
+  return `input/output/cache_read = ${fmtNum(s.input)}/${fmtNum(s.output)}/${fmtNum(s.cache_read)}`
 })
 
 // ===== 选中行与详情弹窗 =====
@@ -596,9 +596,9 @@ async function ensureTab(tab: TabKey) {
     rec.loading = false
   }
 }
-watch([selectedId, activeTab], () => {
-  ensureTab(activeTab.value)
-})
+// 仅监听 activeTab：行变化由 onRowClick 显式触发 ensureTab；若同时监听 selectedId，
+// 切换行时 watch 与显式调用会各发一次相同请求（ensureTab 的 loadedFor 去重在 finally 才置位）。
+watch(activeTab, () => ensureTab(activeTab.value))
 
 // ===== 候选区（详情弹窗）=====
 const selectedCandidates = computed<CandidateItem[]>(() => {
@@ -710,7 +710,7 @@ onUnmounted(stopTimer)
 
 <template>
   <div class="page-container">
-    <!-- 工具条：维度勾选 / 展开对外模型 / 刷新间隔 + 手动刷新 / 数据时间 -->
+    <!-- 工具条：维度勾选 / 刷新间隔 + 手动刷新 / 数据时间 -->
     <div class="card toolbar">
       <div class="tb-item">
         <span class="tb-label">维度</span>
@@ -963,7 +963,7 @@ onUnmounted(stopTimer)
         <!-- 候选区 -->
         <div class="insp-sec">
           <div class="insp-sec-title">候选序位（{{ selectedRow.model ? selectedRow.model.View.ExternalModelID : '—' }}）</div>
-          <div v-if="!selectedCandidates.length" class="insp-empty-inline">该对外模型未展开，或模型维度已折叠，无色条与候选数据</div>
+          <div v-if="!selectedCandidates.length" class="insp-empty-inline">模型维度已折叠，或该对外模型当前无可用候选（停用/未绑定可用渠道密钥），无色条与候选数据</div>
           <div v-else class="cand-list">
             <div v-for="c in selectedCandidates" :key="c.Rank" class="cand-row" :class="{ hit: isSelectedCandidate(c) }">
               <span class="cand-rank">#{{ c.Rank }}</span>
@@ -1218,7 +1218,7 @@ onUnmounted(stopTimer)
 .rank-sym.rank-none {
   color: #98a2b3;
 }
-/* 行左缘色条：金★首选 / 浅灰次选 / 深灰不参与新会话；仅对外模型展开态出现 */
+/* 行左缘色条：金★首选 / 浅灰次选 / 深灰不参与新会话；仅「对外模型/内部模型」与「密钥」维度同时勾选时出现 */
 :deep(.el-table__row.rank-first) td:first-child {
   box-shadow: inset 4px 0 0 0 #f0b429;
 }

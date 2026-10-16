@@ -282,3 +282,50 @@ func TestHandleServiceStatus_FiltersDeletedExternalModels(t *testing.T) {
 		t.Fatalf("未注入模型源时不应过滤，got=%d", len(got))
 	}
 }
+
+// fakeRouteEngineNoRoute 对 failName 指定的对外模型返回路由业务错误（无可用候选），
+// 其余模型返回固定单条候选；用于验证「无候选属预期状态：跳过且不刷 ERROR」。
+type fakeRouteEngineNoRoute struct {
+	failName string
+	calls    int
+}
+
+func (f *fakeRouteEngineNoRoute) RouteAll(ctx context.Context, spec router.RouteSpec) ([]*router.ChannelRoute, error) {
+	f.calls++
+	if spec.ExternalModel == f.failName {
+		return nil, &router.RouteError{
+			Kind:       router.KindNoAvailable,
+			HTTPStatus: http.StatusServiceUnavailable,
+			Code:       resp.CodeNoRoute,
+			Message:    "无可用渠道，请稍后重试",
+		}
+	}
+	return []*router.ChannelRoute{{ChannelID: 1, ChannelKeyID: 1, InternalModelID: "m1", ExternalModelID: 7, Cost: 1.0, CostKnown: true}}, nil
+}
+
+func (f *fakeRouteEngineNoRoute) CostSample() billing.Usage { return billing.Usage{} }
+
+func (f *fakeRouteEngineNoRoute) ActiveKeySessions(keyID int64) int { return 0 }
+
+// TestHandleServiceStatus_NoAvailableCandidateSkipped 验证启用但无可用候选的对外模型：
+// RouteAll 返回路由业务错误时应跳过（不产生候选人条目、不影响其它模型），且请求仍正常返回 200。
+func TestHandleServiceStatus_NoAvailableCandidateSkipped(t *testing.T) {
+	h := NewAdmin(nil, nil, channel.NewManager(nil, nil, nil, nil, nil, nil), func(context.Context) (int64, bool) { return 1, true })
+	fe := &fakeRouteEngineNoRoute{failName: "gpt-no-route"}
+	h.SetRouterEngine(fe)
+	h.SetModelSource(fakeModelListSource{items: []model.ExternalModel{
+		{ID: 7, ExternalName: "gpt-x", Enabled: true},
+		{ID: 9, ExternalName: "gpt-no-route", Enabled: true},
+	}})
+
+	data := doStatus(t, h)
+	if len(data.Candidates["7"]) != 1 {
+		t.Fatalf("有候选模型 ID=7 应产生 1 条候选，got=%+v", data.Candidates["7"])
+	}
+	if _, ok := data.Candidates["9"]; ok {
+		t.Fatalf("无可用候选的模型 ID=9 不应产生候选人条目，got=%+v", data.Candidates["9"])
+	}
+	if fe.calls != 2 {
+		t.Fatalf("两个启用模型均应被计算一次，calls=%d, want 2", fe.calls)
+	}
+}
