@@ -106,23 +106,37 @@ flowchart TD
 
   <!-- 02 怎么判 -->
   <section>
-    <h2><span class="h2no">02</span>每轮怎么判（不用公式，说人话）</h2>
-    <ol class="steps">
-      <li><b>算这一轮在每个候选渠道上要花多少。</b>拿上一轮的上下文大小、缓存读量、输出量，分别乘上该渠道的输入价、缓存读价、输出价，三块加起来就是这一轮的大致花费。单价都要按<strong>当前时段</strong>的折扣算。</li>
-      <li><b>候选不是当前正在用的渠道时，再加一笔「重灌代价」。</b>因为换过去之后缓存就没了，原来命中缓存的那部分上下文要在新渠道按完整输入价重新算一遍——这笔代价等于<strong>缓存读量 ×（新渠道的输入价与缓存读价之差）</strong>。</li>
-      <li><b>选花费最低的那个候选。</b>它如果正好是当前渠道，就不换；是别的，就换过去。所有候选一次性算完、一次比完，可用性（状态、并发）在收集候选时就已确定，不再单独复判。</li>
-      <li><b>摊销轮数 H。</b>换渠道是「先付一笔、以后每轮省」，所以要按几次来摊这笔重灌代价。H 是一个可调参数，<mark class="key">不是对会话长度的预测</mark>。</li>
-    </ol>
-    <div class="verdict"><b>唯一的假设只有 H。</b>因为每轮都重算，H 设大一点只是早切一点、设小一点只是晚切一点，不会跑偏；它不是一个需要"猜对"的东西。</div>
+    <h2><span class="h2no">02</span>每轮怎么判</h2>
+
+    <div class="formula">
+      <div class="f-label">某个渠道的「每轮成本」</div>
+      <div class="f-body">缓存读token数 × 缓存读成本
+＋ 新增输入token数 × 输入成本
+＋ 输出token数 × 输出成本
+（三项成本都乘当前时段的折扣）</div>
+    </div>
+
+    <div class="formula">
+      <div class="f-label">换到某个渠道的一次性「重灌代价」</div>
+      <div class="f-body">缓存读token数 ×（新渠道输入成本 － 新渠道缓存读成本）</div>
+      <p class="f-note">换过去缓存就没了，原本命中缓存的那部分上下文要按新渠道的完整输入价重算一遍。</p>
+    </div>
+
+    <div class="formula">
+      <div class="f-label">判据：换不换</div>
+      <div class="f-body">（当前渠道每轮成本 － 新渠道每轮成本）× 摊销轮数 H
+　　＞　一次性重灌代价　→　换</div>
+      <p class="f-note">token 数取自上一轮真实用量；所有可用候选一次算完、一次比完，可用性（状态、并发）在收集候选时已确定，不再单独复判。</p>
+    </div>
 
     <figure class="chart-figure">
-      <figcaption>图 2 · 每轮成本 vs 当前上下文大小（缓存命中）
-        <span>上下文越小，均衡型每轮越便宜；上下文一大（约 1.4 万 token 以上），缓存便宜型反而更低。而上下文大小是每个请求当时就<b>已知</b>的，所以用不着预判。</span>
+      <figcaption>图 2 · 每轮成本 vs 缓存读 token 数
+        <span>缓存读越小，均衡型每轮越便宜；缓存读一大（约 1.4 万 token 以上），缓存便宜型反而更低。缓存读大小来自上一轮真实用量，所以用不着预判。</span>
       </figcaption>
       <div id="chart-perround" style="width:100%;min-height:380px;"></div>
     </figure>
 
-    <p>拿一组真实数字走一遍——<strong>上一个请求</strong>：上下文 2 万 token（其中缓存读 1.6 万）、输出 500；当前在渠道 B，候选里还有渠道 A：</p>
+    <p>拿一组真实数字走一遍——<strong>上一个请求</strong>：缓存读 2 万 token、新增输入 1000、输出 1000；当前在渠道 B，候选里还有渠道 A：</p>
     <div class="table-wrap">
       <table>
         <thead><tr><th>项</th><th>数值</th></tr></thead>
@@ -130,12 +144,14 @@ flowchart TD
           <tr><td>留在 B：这一轮花</td><td>0.0176 元</td></tr>
           <tr><td>换到 A：这一轮花</td><td>0.0140 元</td></tr>
           <tr><td>每轮能省</td><td><b>0.0036 元</b></td></tr>
-          <tr><td>换到 A 的一次性重灌代价</td><td>0.0288 元</td></tr>
-          <tr><td>按 H=10 摊：省下 0.036 元 &gt; 代价 0.0288 元</td><td class="yes">换</td></tr>
-          <tr><td>按 H=5 摊：只省 0.018 元 &lt; 代价 0.0288 元</td><td class="no">不换</td></tr>
+          <tr><td>换到 A 的一次性重灌代价</td><td>0.036 元</td></tr>
+          <tr><td>回本所需轮数 = 重灌代价 ÷ 每轮省下 = 0.036 ÷ 0.0036</td><td><b>10 轮</b></td></tr>
+          <tr><td>预计还能发超过 10 轮 → 换</td><td class="yes">换</td></tr>
+          <tr><td>预计只剩几轮 → 不换</td><td class="no">不换</td></tr>
         </tbody>
       </table>
     </div>
+    <div class="verdict"><b>唯一的假设只有 H（即"预计还要发几轮"）。</b>因为每轮都重算，H 设大只是早切一点、设小只是晚切一点，不会跑偏；它不是要一次猜对的东西。</div>
   </section>
 
   <!-- 03 因此不再需要 -->

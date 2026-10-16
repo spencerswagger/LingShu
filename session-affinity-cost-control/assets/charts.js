@@ -27,7 +27,7 @@
       tooltip: { trigger: 'axis', appendToBody: true, valueFormatter: function (v) { return v.toFixed(4) + ' 元'; } },
       legend: { data: ['A 缓存便宜型', 'B 均衡型'], textStyle: { color: muted }, top: 0 },
       grid: baseGrid,
-      xAxis: { type: 'category', name: '当前上下文大小（token）', nameLocation: 'middle', nameGap: 30, nameTextStyle: { color: muted },
+      xAxis: { type: 'category', name: '缓存读 token 数（≈ 当前上下文）', nameLocation: 'middle', nameGap: 30, nameTextStyle: { color: muted },
         boundaryGap: false, data: x, axisLine: { lineStyle: { color: rule } }, axisTick: { show: false },
         axisLabel: { color: muted, formatter: function (v) { return v / 1000 + 'k'; } } },
       yAxis: { type: 'value', name: '每轮成本（元）', nameTextStyle: { color: muted },
