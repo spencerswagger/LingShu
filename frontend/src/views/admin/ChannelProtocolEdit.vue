@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Delete, Edit, RefreshRight } from '@element-plus/icons-vue'
 import {
   createChannelProtocol,
@@ -22,6 +22,7 @@ import StringListEditor from '@/components/StringListEditor.vue'
 import ModelPricing from '@/components/ModelPricing.vue'
 import ModelPriceCatalog from '@/components/ModelPriceCatalog.vue'
 import ErrorBubble from '@/components/ErrorBubble.vue'
+import { useUnsavedGuard } from '@/composables/useUnsavedGuard'
 
 const route = useRoute()
 const router = useRouter()
@@ -62,7 +63,9 @@ const form = reactive({
 // 来源预设 ID（只读回显）
 const presetSourceId = ref('')
 
-// 请求头真实候选：HTTP 通用 / OpenAI / Anthropic 常用头（可自行输入任意头名）
+// 请求头真实候选：HTTP 通用 / OpenAI / Anthropic 常用头（可自行输入任意头名）。
+// 注意：内置强制黑名单（Cookie/Host/Content-Type/Accept-Encoding/X-Forwarded-*
+// /anthropic-dangerous-direct-browser-access 等）任何模式下都不会发往上游，故不作候选，避免配了却不生效。
 const headerSuggestions = [
   'Accept',
   'Accept-Language',
@@ -76,7 +79,6 @@ const headerSuggestions = [
   'OpenAI-Beta',
   'anthropic-version',
   'anthropic-beta',
-  'anthropic-dangerous-direct-browser-access',
 ]
 // 覆盖值可插入的变量
 const valueVariables = ['{api_key}', '{session_id}', '{request_id}', '{model}', '{client_header:NAME}']
@@ -153,12 +155,33 @@ async function load() {
         ContextTiers: ov?.contextTiers ?? null,
       },
     }))
+    markSaved()
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
   } finally {
     loading.value = false
   }
 }
+
+// ===== 未保存修改守卫 =====
+// 以「提交口径」序列化当前表单快照，与最近一次加载/保存后的快照比对判断是否有未保存修改。
+function snapshot(): string {
+  return JSON.stringify({
+    name: form.name,
+    base_url: form.base_url,
+    defaultProtocol: defaultProtocol.value,
+    protocols: baseProtocols.map((p) => ({ name: p, ...protocols[p] })),
+    passthrough_mode: form.passthrough_mode,
+    whitelist: form.whitelist,
+    blacklist: form.blacklist,
+    set: form.set,
+    models: modelRows.value,
+  })
+}
+const { dirty, markSaved } = useUnsavedGuard(snapshot)
+// 新建：以当前空表单为基线；编辑：由 load() 成功后重建基线（加载失败则不判脏）。
+if (!isEdit.value) markSaved()
+
 onMounted(() => {
   // 返回「渠道」合并页时保持选中「渠道协议」视图
   sessionStorage.setItem('admin-channels-tab', 'protocols')
@@ -233,7 +256,8 @@ const createExternalUseCost = ref(true)
 const createExternalSaving = ref(false)
 
 function openQuickCreateExternal() {
-  createExternalName.value = ''
+  // 对外名称默认用当前内部模型 ID 预填，减少手工输入
+  createExternalName.value = editingForm.value.id.trim()
   createExternalEnabled.value = true
   createExternalUseCost.value = true
   createExternalOpen.value = true
@@ -249,8 +273,12 @@ function onExternalChange(val: string | null) {
 async function confirmCreateExternal() {
   const name = createExternalName.value.trim()
   if (!name) return ElMessage.warning('请填写对外名称')
-  const costRates = createExternalUseCost.value ? editingPricing.value.CostRates : null
+  const useCost = createExternalUseCost.value
+  const costRates = useCost ? editingPricing.value.CostRates : null
   const saleRates = { Input: 0, Output: 0, CacheRead: 0, CacheWrite: 0, Reasoning: 0, ...(costRates || {}) }
+  // 初始化售价时同步时段与分档（与内部模型成本侧一致），避免仅同步五段费率而丢失时段/分档。
+  const timeConfig = useCost ? editingPricing.value.TimeConfig ?? null : null
+  const contextTiers = useCost ? editingPricing.value.ContextTiers ?? null : null
   createExternalSaving.value = true
   try {
     const res = await createExternalModel({
@@ -258,8 +286,8 @@ async function confirmCreateExternal() {
       Description: '',
       Enabled: createExternalEnabled.value,
       SaleRates: saleRates,
-      TimeConfig: null,
-      ContextTiers: null,
+      TimeConfig: timeConfig,
+      ContextTiers: contextTiers,
     })
     const created = res.Data
     externalModels.value.push(created)
@@ -321,6 +349,27 @@ const catalogRef = ref<InstanceType<typeof ModelPriceCatalog> | null>(null)
 const currentModelId = computed(() => editingForm.value.id)
 function onApplyCostCatalog(partial: Record<string, number>) {
   editingPricing.value.CostRates = { ...editingPricing.value.CostRates, ...partial }
+}
+
+// 从对外模型同步价格：用所绑定对外模型的售价 / 时段 / 分档覆盖当前内部模型的成本侧（覆盖前二次确认）。
+async function syncCostFromExternal() {
+  const extId = editingForm.value.externalModelID
+  if (!extId) return ElMessage.warning('请先绑定一个对外模型')
+  const em = externalModels.value.find((e) => String(e.ID) === String(extId))
+  if (!em) return ElMessage.warning('未找到该对外模型（可能已停用）')
+  try {
+    await ElMessageBox.confirm(
+      `将用对外模型「${em.ExternalName}」的售价 / 时段 / 分档覆盖当前成本配置，确定继续？`,
+      '同步对外模型价格',
+      { type: 'warning', confirmButtonText: '覆盖', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  editingPricing.value.CostRates = { ...(em.SaleRates || {}) }
+  editingPricing.value.TimeConfig = em.TimeConfig ? JSON.parse(JSON.stringify(em.TimeConfig)) : null
+  editingPricing.value.ContextTiers = em.ContextTiers ? JSON.parse(JSON.stringify(em.ContextTiers)) : null
+  ElMessage.success(`已用对外模型「${em.ExternalName}」的定价覆盖成本、时段与分档`)
 }
 
 // 展示辅助
@@ -405,6 +454,7 @@ async function onSubmit() {
     } else {
       await createChannelProtocol(payload)
       ElMessage.success('渠道协议已创建')
+      markSaved() // 创建成功后再跳转，避免触发「未保存」离开确认
       router.push('/admin/channels')
     }
   } catch (e: any) {
@@ -475,6 +525,7 @@ async function onSubmit() {
                 :key-suggestions="headerSuggestions"
                 :value-suggestions="valueVariables"
               />
+              <div class="hint">键可下拉选常用头，也可直接输入；值支持变量插入。内置强制黑名单（Cookie / Host / Content-Type / Content-Length / Accept-Encoding / X-Forwarded-* / anthropic-dangerous-direct-browser-access 等）任何模式下都不会发往上游，覆盖同样被忽略；鉴权头（Authorization / x-api-key）可被覆盖。</div>
             </el-form-item>
           </el-form>
         </div>
@@ -543,6 +594,7 @@ async function onSubmit() {
     <div class="actions">
       <el-button type="primary" :loading="saving" @click="onSubmit">{{ isEdit ? '保存' : '创建' }}</el-button>
       <el-button @click="router.push('/admin/channels')">取消</el-button>
+      <el-tag v-if="dirty" type="warning" size="small" effect="light">有未保存的修改</el-tag>
       <ErrorBubble v-if="errInfo.message || errInfo.requestId" :message="errInfo.message" :request-id="errInfo.requestId" />
     </div>
 
@@ -575,6 +627,7 @@ async function onSubmit() {
           <ModelPricing v-model="editingPricing" show-rates-key="CostRates" title="成本">
             <template #title-extra>
               <el-button @click="catalogRef?.open()">从 models.dev 获取参考价</el-button>
+              <el-button @click="syncCostFromExternal">从对外模型同步价格</el-button>
             </template>
           </ModelPricing>
         </div>

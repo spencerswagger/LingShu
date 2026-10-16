@@ -35,8 +35,8 @@ const router = createRouter({
         { path: 'channel-protocols', redirect: '/admin/channels' },
         { path: 'channel-protocols/create', name: 'admin-channel-protocol-create', component: () => import('@/views/admin/ChannelProtocolEdit.vue'), meta: { title: '新建渠道协议' } },
         { path: 'channel-protocols/:id/edit', name: 'admin-channel-protocol-edit', component: () => import('@/views/admin/ChannelProtocolEdit.vue'), meta: { title: '编辑渠道协议' } },
-        // 服务状态（渠道侧通路矩阵）
-        { path: 'service-status', name: 'admin-service-status', component: () => import('@/views/admin/ServiceStatus.vue'), meta: { title: '服务状态' } },
+        // 状态（渠道侧通路矩阵；菜单排在「统计」下方）
+        { path: 'service-status', name: 'admin-service-status', component: () => import('@/views/admin/ServiceStatus.vue'), meta: { title: '状态' } },
         // 模型
         { path: 'models', name: 'admin-models', component: () => import('@/views/admin/ModelList.vue'), meta: { title: '模型' } },
         { path: 'models/create', name: 'admin-model-create', component: () => import('@/views/admin/ModelCreate.vue'), meta: { title: '新建模型' } },

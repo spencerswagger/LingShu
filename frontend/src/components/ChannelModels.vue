@@ -226,7 +226,11 @@ function openEdit(m: ChannelModel) {
 function openQuickCreateExternal(rowIndex: number) {
   createTargetRowIndex.value = rowIndex
   createTargetSingle.value = rowIndex < 0
-  createExternalName.value = ''
+  // 对外名称默认用当前内部模型 ID 预填，减少手工输入
+  const mid = rowIndex < 0
+    ? editingForm.value.InternalModelID
+    : (pendingRows.value[rowIndex]?.InternalModelID || '')
+  createExternalName.value = (mid || '').trim()
   createExternalEnabled.value = true
   createExternalUseCost.value = true
   createExternalOpen.value = true
@@ -256,16 +260,18 @@ function onRowExternalChange(val: string | null, row: PendingRow, index: number)
 async function confirmCreateExternal() {
   const name = createExternalName.value.trim()
   if (!name) return ElMessage.warning('请填写对外名称')
-  // 售价初始化：勾选时取「当前上下文」的成本五段作为售价
-  let costRates: Record<string, number> | null = null
+  // 售价初始化：勾选时取「当前上下文」的定价（五段费率 + 时段 + 分档）作为对外模型的售价配置
+  let srcPricing: Record<string, any> | null = null
   if (createExternalUseCost.value) {
-    if (createTargetSingle.value) {
-      costRates = editingPricing.value.CostRates
-    } else {
-      costRates = pendingRows.value[createTargetRowIndex.value]?.pricing?.CostRates || null
-    }
+    srcPricing = createTargetSingle.value
+      ? editingPricing.value
+      : (pendingRows.value[createTargetRowIndex.value]?.pricing || null)
   }
+  const costRates = srcPricing?.CostRates || null
   const saleRates = { Input: 0, Output: 0, CacheRead: 0, CacheWrite: 0, Reasoning: 0, ...(costRates || {}) }
+  // 时段与分档随售价一并初始化，避免仅同步五段费率而丢失时段/分档。
+  const timeConfig = srcPricing?.TimeConfig ?? null
+  const contextTiers = srcPricing?.ContextTiers ?? null
 
   createExternalSaving.value = true
   try {
@@ -274,8 +280,8 @@ async function confirmCreateExternal() {
       Description: '',
       Enabled: createExternalEnabled.value,
       SaleRates: saleRates,
-      TimeConfig: null,
-      ContextTiers: null,
+      TimeConfig: timeConfig,
+      ContextTiers: contextTiers,
     })
     const created = res.Data
     // 保证下拉可选项包含新模型，并用其真实 ID 精确匹配回填
@@ -451,14 +457,23 @@ function onApplyCostCatalog(partial: Record<string, number>) {
   p.CostRates = { ...p.CostRates, ...partial }
 }
 
-// 从对外模型同步定价：用所绑定对外模型的售价/时段/分档覆盖当前内部模型的成本侧
-function syncFromExternal() {
+// 从对外模型同步定价：用所绑定对外模型的售价/时段/分档覆盖当前内部模型的成本侧（覆盖前二次确认）。
+async function syncFromExternal() {
   const p = currentPricing.value
   if (!p) return ElMessage.warning('尚未选中需要配置的模型')
   const extId = pendingRows.value.length ? activeRow.value?.ExternalModelID : editingForm.value.ExternalModelID
   if (extId == null) return ElMessage.warning('请先绑定一个对外模型')
   const em = externalModels.value.find((e) => String(e.ID) === String(extId))
   if (!em) return ElMessage.warning('未找到该对外模型（可能已停用）')
+  try {
+    await ElMessageBox.confirm(
+      `将用对外模型「${em.ExternalName}」的售价 / 时段 / 分档覆盖当前成本配置，确定继续？`,
+      '同步对外模型价格',
+      { type: 'warning', confirmButtonText: '覆盖', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
   p.CostRates = { ...(em.SaleRates || {}) }
   p.TimeConfig = em.TimeConfig ? JSON.parse(JSON.stringify(em.TimeConfig)) : null
   p.ContextTiers = em.ContextTiers ? JSON.parse(JSON.stringify(em.ContextTiers)) : null
