@@ -61,12 +61,9 @@ func effectiveBaseURL(rt *channel.RuntimeChannel, protocol string) string {
 	return ""
 }
 
-// effectiveHeaderPolicy 求请求头策略：渠道协议读取，内联渠道缺省 none。
+// effectiveHeaderPolicy 求请求头策略：渠道协议读取，内联渠道缺省空策略（等效 none）。
 func effectiveHeaderPolicy(rt *channel.RuntimeChannel) channelprotocol.HeaderPolicy {
-	if rt.Protocol != nil {
-		return rt.Protocol.RequestHeaders
-	}
-	return channelprotocol.HeaderPolicy{PassthroughMode: channelprotocol.PassthroughNone}
+	return rt.Protocol.EffectiveHeaderPolicy()
 }
 
 // responseHopByHop 响应侧禁止透传的头：hop-by-hop（RFC 7230 §6.1）与由响应体长度决定的 Content-Length。
