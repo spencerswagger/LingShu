@@ -15,8 +15,9 @@ const errMsg = ref('')
 const errReqId = ref('')
 
 const form = reactive({ username: '', password: '', nickname: '', captchaCode: '' })
-// 图形验证码：注册前获取（公开接口），点击图片可刷新
-const captcha = ref<{ CaptchaID: string; ImageBase64: string }>({ CaptchaID: '', ImageBase64: '' })
+// 图形验证码：注册前获取（公开接口），点击图片可刷新。
+// ImageDataURI 是后端返回的完整 data URI，直接用作 img src，前端不再拼接前缀。
+const captcha = ref<{ CaptchaID: string; ImageDataURI: string }>({ CaptchaID: '', ImageDataURI: '' })
 const captchaLoading = ref(false)
 
 // 口令强度校验：≥8 位且至少包含两类字符（小写/大写/数字/符号），与后端规则保持一致
@@ -156,9 +157,9 @@ onMounted(refreshCaptcha)
             <div class="captcha-row">
               <el-input v-model="form.captchaCode" placeholder="验证码" clearable @keyup.enter="onSubmit" />
               <img
-                v-if="captcha.ImageBase64"
+                v-if="captcha.ImageDataURI"
                 class="captcha-img"
-                :src="`data:image/png;base64,${captcha.ImageBase64}`"
+                :src="captcha.ImageDataURI"
                 alt="验证码"
                 title="点击刷新"
                 :class="{ 'is-loading': captchaLoading }"
