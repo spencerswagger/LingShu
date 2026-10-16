@@ -54,6 +54,7 @@ type Record struct {
 	PricingMode     string // "sale"/"cost"
 	TokenID         *int64
 	ExternalModel   string
+	AutoModelName   string // 请求的 Auto 模型名（非 Auto 请求为空，落库为 NULL）
 	InternalModelID string
 	ChannelKeyID    int64  // 落 channel_key_id：渠道密钥维度（运行时实体）
 	SessionID       string // 落 session_id：请求携带 x-session-id 时的会话维度；失败记录同样携带
@@ -84,6 +85,7 @@ type RecordReq struct {
 	PricingMode     string
 	TokenID         *int64
 	ExternalModel   string
+	AutoModelName   string // 请求的 Auto 模型名（非 Auto 请求为空）；仅留痕，不参与定价
 	InternalModelID string
 	ChannelKeyID    int64
 	SessionID       string
@@ -166,6 +168,7 @@ func (s *Service) Record(ctx context.Context, req RecordReq) (*Record, error) {
 			PricingMode:     req.PricingMode,
 			TokenID:         req.TokenID,
 			ExternalModel:   req.ExternalModel,
+			AutoModelName:   req.AutoModelName,
 			InternalModelID: req.InternalModelID,
 			ChannelKeyID:    req.ChannelKeyID,
 			SessionID:       req.SessionID,
@@ -224,6 +227,7 @@ func (s *Service) Record(ctx context.Context, req RecordReq) (*Record, error) {
 		PricingMode:     req.PricingMode,
 		TokenID:         req.TokenID,
 		ExternalModel:   req.ExternalModel,
+		AutoModelName:   req.AutoModelName,
 		InternalModelID: req.InternalModelID,
 		ChannelKeyID:    req.ChannelKeyID,
 		SessionID:       req.SessionID,
@@ -710,7 +714,7 @@ func (s *SqlStore) SetConfigWriteHook(fn func()) {
 
 // recordCols 查询 billing_records 使用的全部列。
 const recordCols = `id, billing_id, user_id, pricing_mode, token_id, external_model_name,
-	internal_model_id, channel_key_id, session_id, session_name, call_time, tokens, rates, coefficients, r_value,
+	auto_model_name, internal_model_id, channel_key_id, session_id, session_name, call_time, tokens, rates, coefficients, r_value,
 	raw_total, credits_consumed, cost_credits, balance_before, balance_after, status, error_message, duration_ms, first_token_ms`
 
 // GetConfig 读取 sys_configs 单键值；key 不存在返回错误。
@@ -776,6 +780,11 @@ func (s *SqlStore) insertOn(ctx context.Context, ex dbx.Execer, rec *Record) (*R
 	if rec.SessionID != "" {
 		sessionID = rec.SessionID
 	}
+	// auto_model_name 可空：非 Auto 请求写 NULL（与列语义一致）。
+	var autoModelName any
+	if rec.AutoModelName != "" {
+		autoModelName = rec.AutoModelName
+	}
 	// session_name 为 NOT NULL：空会话名写空串而非 NULL（与列默认值语义一致）。
 	sessionName := any(rec.SessionName)
 	var errMsg any
@@ -791,11 +800,11 @@ func (s *SqlStore) insertOn(ctx context.Context, ex dbx.Execer, rec *Record) (*R
 	}
 	err = ex.QueryRowContext(ctx,
 		`INSERT INTO billing_records(id, billing_id, user_id, pricing_mode, token_id, external_model_name,
-			internal_model_id, channel_key_id, session_id, session_name, call_time, tokens, rates, coefficients, r_value,
+			auto_model_name, internal_model_id, channel_key_id, session_id, session_name, call_time, tokens, rates, coefficients, r_value,
 			raw_total, credits_consumed, cost_credits, balance_before, balance_after, status, error_message, duration_ms, first_token_ms)
-		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
+		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
 		 RETURNING id, created_at`,
-		rec.ID, rec.BillingID, rec.UserID, rec.PricingMode, tokenID, rec.ExternalModel,
+		rec.ID, rec.BillingID, rec.UserID, rec.PricingMode, tokenID, rec.ExternalModel, autoModelName,
 		rec.InternalModelID, channelKeyID, sessionID, sessionName, rec.CallTime, tokensRaw, ratesRaw, coeffRaw,
 		rec.RValue, rec.RawTotal, rec.CreditsConsumed, rec.CostCredits,
 		rec.BalanceBefore, rec.BalanceAfter, rec.Status, errMsg, durationMs, firstTokenMs).
@@ -821,6 +830,7 @@ func sqlScan(row interface{ Scan(...any) error }) (*Record, error) {
 	var channelKeyID sql.NullInt64
 	var sessionID sql.NullString
 	var sessionName sql.NullString
+	var autoModelName sql.NullString
 	var rawTotal, consCred, costCred, balBefore, balAfter sql.NullFloat64
 	var errMsg sql.NullString
 	var durationMs, firstTokenMs sql.NullInt64
@@ -828,7 +838,7 @@ func sqlScan(row interface{ Scan(...any) error }) (*Record, error) {
 	var callTime time.Time
 
 	err := row.Scan(&rec.ID, &rec.BillingID, &rec.UserID, &rec.PricingMode, &tokenID,
-		&rec.ExternalModel, &rec.InternalModelID, &channelKeyID, &sessionID, &sessionName, &callTime,
+		&rec.ExternalModel, &autoModelName, &rec.InternalModelID, &channelKeyID, &sessionID, &sessionName, &callTime,
 		&tokensRaw, &ratesRaw, &coeffRaw, &rec.RValue,
 		&rawTotal, &consCred, &costCred, &balBefore, &balAfter, &rec.Status, &errMsg,
 		&durationMs, &firstTokenMs)
@@ -868,6 +878,7 @@ func sqlScan(row interface{ Scan(...any) error }) (*Record, error) {
 	rec.ErrorMessage = errMsg.String
 	rec.SessionID = sessionID.String
 	rec.SessionName = sessionName.String
+	rec.AutoModelName = autoModelName.String
 	rec.CallTime = callTime
 	if len(tokensRaw) > 0 {
 		_ = json.Unmarshal(tokensRaw, &rec.Tokens)

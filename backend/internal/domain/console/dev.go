@@ -124,6 +124,7 @@ func (h *Dev) HandleGetBilling(w http.ResponseWriter, r *http.Request) {
 		BillingID:       rec.BillingID,
 		CallTime:        rec.CallTime.Format(time.RFC3339),
 		Model:           rec.ExternalModel,
+		AutoModelName:   rec.AutoModelName,
 		PricingMode:     rec.PricingMode,
 		CreditsConsumed: decimalx.Round5(rec.CreditsConsumed),
 		Status:          rec.Status,

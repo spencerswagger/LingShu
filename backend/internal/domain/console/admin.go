@@ -116,6 +116,7 @@ type billingListItem struct {
 	UserNickname    string            `json:"UserNickname,omitempty"` // 昵称（join users；为空表示未设置）
 	TokenName       string            `json:"TokenName,omitempty"`
 	ExternalModel   string            `json:"ExternalModel"`
+	AutoModelName   string            `json:"AutoModelName,omitempty"` // 请求的 Auto 名（非 Auto 请求为空）
 	PricingMode     string            `json:"PricingMode"`
 	CreditsConsumed float64           `json:"CreditsConsumed"`
 	Status          string            `json:"Status"`
@@ -141,6 +142,7 @@ func toListItem(rec *billing.Record) billingListItem {
 		BillingID:       rec.BillingID,
 		UserID:          rec.UserID,
 		ExternalModel:   rec.ExternalModel,
+		AutoModelName:   rec.AutoModelName,
 		PricingMode:     rec.PricingMode,
 		CreditsConsumed: decimalx.Round5(rec.CreditsConsumed),
 		Status:          rec.Status,
@@ -494,6 +496,7 @@ func (h *Admin) HandleGetBilling(w http.ResponseWriter, r *http.Request) {
 		BillingID:       rec.BillingID,
 		CallTime:        rec.CallTime.Format(time.RFC3339),
 		Model:           rec.ExternalModel,
+		AutoModelName:   rec.AutoModelName,
 		PricingMode:     rec.PricingMode,
 		CreditsConsumed: decimalx.Round5(rec.CreditsConsumed),
 		Status:          rec.Status,

@@ -681,6 +681,51 @@ export function priceCatalog(q: string) {
   )
 }
 
+// ===== Auto 模型（对外模型之上的有序别名组；字段名 = Go 字段名）=====
+// 成员：请求 Auto 名时按 position 升序选择第一个可用的成员对外模型。
+export interface AutoModelMember {
+  ID: string // auto_model_members 行 ID；新建时后端生成，前端提交传 0/空即可
+  ExternalModelID: string // 对外模型 ID（字符串）
+  ExternalName: string // 后端 JOIN 填充，提交时不传
+  Enabled: boolean // 后端 JOIN 填充（成员对外模型是否启用）
+  Position: number // 升序即优先级
+}
+export interface AutoModel {
+  ID: string
+  Name: string
+  Scope: 'global' | 'private'
+  OwnerUserID?: string // private 时非空；global 为空
+  Enabled: boolean
+  Description: string
+  Members: AutoModelMember[]
+  CreatedAt: string
+  UpdatedAt: string
+}
+export interface AutoModelInput {
+  Name: string
+  Scope: string // 'global' | 'private'（dev 端由服务端强制覆盖为 private）
+  OwnerUserID?: string // 管理端建 private 时传；global 不传
+  Enabled?: boolean
+  Description: string
+  Members: { ExternalModelID: string; Position: number }[]
+}
+// 列表返回裸数组（非 {list}）；base 可传 '/dev' 复用开发者端
+export function listAutoModels(params: Record<string, unknown> = {}, base = '/admin') {
+  return http.get<AutoModel[], ApiRes<AutoModel[]>>(`${base}/auto-models`, { params })
+}
+export function getAutoModel(id: string, base = '/admin') {
+  return http.get<AutoModel, ApiRes<AutoModel>>(`${base}/auto-models/${id}`)
+}
+export function createAutoModel(payload: AutoModelInput, base = '/admin') {
+  return http.post<AutoModel, ApiRes<AutoModel>>(`${base}/auto-models`, payload)
+}
+export function updateAutoModel(id: string, payload: AutoModelInput, base = '/admin') {
+  return http.put<AutoModel, ApiRes<AutoModel>>(`${base}/auto-models/${id}`, payload)
+}
+export function deleteAutoModel(id: string, base = '/admin') {
+  return http.delete<{ Deleted: boolean }, ApiRes<{ Deleted: boolean }>>(`${base}/auto-models/${id}`)
+}
+
 // ===== 渠道内部模型（channel_models·成本层；字段名 = Go 字段名）=====
 // 含 JOIN 出的 external_name。
 export interface ChannelModel {
