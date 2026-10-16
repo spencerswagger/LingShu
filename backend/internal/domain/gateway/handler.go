@@ -72,7 +72,8 @@ func (g *Gateway) handleModels(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusUnauthorized, msgInvalidToken)
 		return
 	}
-	if _, err := g.tokens.LookupByPlain(ctx, plain); err != nil {
+	token, err := g.tokens.LookupByPlain(ctx, plain)
+	if err != nil {
 		writeOpenAIError(w, http.StatusUnauthorized, msgInvalidToken)
 		return
 	}
@@ -95,6 +96,34 @@ func (g *Gateway) handleModels(w http.ResponseWriter, r *http.Request) {
 				"created":  list[i].CreatedAt.Unix(),
 				"owned_by": "llm-gateway",
 			})
+		}
+	}
+	// Auto 模型一并列出（全局 + 该令牌用户的私有），否则客户端下拉看不到 auto 名。
+	// Auto 名与对外模型名不允许重名，正常无重复；此处仍做去重兜底。
+	if g.listAutoModels != nil && token != nil {
+		autos, err := g.listAutoModels(ctx, token.UserID)
+		if err != nil {
+			// 列 Auto 失败不阻断对外模型列表（降级为仅列对外模型）。
+			g.logError(0, "list auto models", err)
+		} else {
+			seen := make(map[string]bool, len(data))
+			for i := range data {
+				if id, ok := data[i]["id"].(string); ok {
+					seen[id] = true
+				}
+			}
+			for i := range autos {
+				if !autos[i].Enabled || seen[autos[i].Name] {
+					continue
+				}
+				seen[autos[i].Name] = true
+				data = append(data, map[string]any{
+					"id":       autos[i].Name,
+					"object":   "model",
+					"created":  autos[i].CreatedAt.Unix(),
+					"owned_by": "llm-gateway",
+				})
+			}
 		}
 	}
 	writeOpenAI(w, map[string]any{"object": "list", "data": data})
@@ -236,26 +265,81 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 		sessionID = router.SessionID(token.UserID, token.ID, model, sessionRaw)
 		sessionName = sessionNameFor(sessionRaw, body)
 	}
-	routeSpec := router.RouteSpec{
-		ExternalModel: model,
-		TagKV:         tagKV,
-		TagID:         token.TagID,
-		SessionKey:    sessionID,
+	// Auto 是「对外模型之上的一层有序别名组」：请求 Auto 名时按成员 position 升序，
+	// 逐个成员以「成员对外模型名」试路由，第一个产生非空候选的成员即被选中；
+	// 之后 model 替换为命中成员名，后续路由/亲和/计费/failover 完全沿用既有链路。
+	// requestedModel 保留原始请求名（Auto 名），用于账单 auto_model_name 留痕。
+	requestedModel := model
+	autoName := ""
+	var routes []*router.ChannelRoute
+	if g.auto != nil {
+		members, isAuto, aerr := g.auto.ResolveMembers(ctx, requestedModel, &token.UserID)
+		if aerr != nil {
+			l.Error("resolve auto model failed", "model", requestedModel, "err", aerr)
+			writeOpenAIError(w, http.StatusInternalServerError, msgInternal)
+			return
+		}
+		if isAuto {
+			autoName = requestedModel
+			model = "" // 未命中任何成员前保持空，避免误用 Auto 名做普通模型解析
+			for _, mem := range members {
+				if mem.ExternalName == "" {
+					continue // 成员对应对外模型已软删/不可解析 → 跳过
+				}
+				mRoutes, mErr := g.router.RouteAll(ctx, router.RouteSpec{
+					ExternalModel: mem.ExternalName,
+					TagKV:         tagKV,
+					TagID:         token.TagID,
+					SessionKey:    sessionID,
+				})
+				if mErr != nil {
+					// 单个成员路由失败（如该对外模型未配置）不阻断整体：继续尝试下一成员。
+					continue
+				}
+				if len(mRoutes) > 0 {
+					model = mem.ExternalName
+					routes = mRoutes
+					break
+				}
+			}
+			if model == "" {
+				// 全部成员均无可用候选（或成员对外模型均不可解析）→ 无可用渠道。
+				// 账单保留 auto 名（external_model_name 为空）便于按 Auto 排查。
+				g.recordGatewayReject(ctx, model, autoName, token, "", sessionID, msgNoAvailable)
+				writeOpenAIError(w, http.StatusServiceUnavailable, msgNoAvailable)
+				return
+			}
+		} else {
+			routeSpec := router.RouteSpec{
+				ExternalModel: model,
+				TagKV:         tagKV,
+				TagID:         token.TagID,
+				SessionKey:    sessionID,
+			}
+			routes, err = g.router.RouteAll(ctx, routeSpec)
+		}
+	} else {
+		routeSpec := router.RouteSpec{
+			ExternalModel: model,
+			TagKV:         tagKV,
+			TagID:         token.TagID,
+			SessionKey:    sessionID,
+		}
+		routes, err = g.router.RouteAll(ctx, routeSpec)
 	}
-	routes, err := g.router.RouteAll(ctx, routeSpec)
 	if err != nil {
 		var re *router.RouteError
 		if errors.As(err, &re) {
 			switch re.Kind {
 			case router.KindModelNotFound:
 				// 未进入渠道也留痕：保证「每次请求必有一条账单记录」（模型未配置/停用）。
-				g.recordGatewayReject(ctx, model, token, "", sessionID, fmt.Sprintf(msgModelNotFound, model))
+				g.recordGatewayReject(ctx, model, autoName, token, "", sessionID, fmt.Sprintf(msgModelNotFound, model))
 				writeOpenAIError(w, http.StatusNotFound, fmt.Sprintf(msgModelNotFound, model))
 			case router.KindNoRoute:
-				g.recordGatewayReject(ctx, model, token, "", sessionID, msgNoRoute)
+				g.recordGatewayReject(ctx, model, autoName, token, "", sessionID, msgNoRoute)
 				writeOpenAIError(w, http.StatusServiceUnavailable, msgNoRoute)
 			default: // KindNoAvailable
-				g.recordGatewayReject(ctx, model, token, "", sessionID, msgNoAvailable)
+				g.recordGatewayReject(ctx, model, autoName, token, "", sessionID, msgNoAvailable)
 				writeOpenAIError(w, http.StatusServiceUnavailable, msgNoAvailable)
 			}
 			return
@@ -282,7 +366,7 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 	if g.credit != nil {
 		if bal, berr := g.credit.Balance(ctx, token.UserID); berr == nil && bal <= 0 {
 			l.Warn("zero balance rejected", "user_id", token.UserID, "balance", bal)
-			g.recordGatewayReject(ctx, model, token, pricingMode, sessionID, "积分余额不足（账户余额为 0）")
+			g.recordGatewayReject(ctx, model, autoName, token, pricingMode, sessionID, "积分余额不足（账户余额为 0）")
 			writeOpenAIError(w, http.StatusPaymentRequired, msgInsufficient)
 			return
 		}
@@ -307,6 +391,7 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 						InternalModelID: r0.InternalModelID,
 						ModelRowID:      r0.ModelRowID,
 						ExternalModelID: r0.ExternalModelID,
+						AutoModelName:   autoName,
 						Revision:        r0.Revision,
 					}, model, token, pricingMode, sessionID, sessionName, msg, nil)
 				}
@@ -325,7 +410,7 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 		if berr != nil {
 			l.Warn("resolve balance failed, skip precheck", "user_id", token.UserID, "err", berr)
 		} else if bal <= 0 {
-			g.recordGatewayReject(ctx, model, token, pricingMode, sessionID, "积分余额不足（账户余额为 0）")
+			g.recordGatewayReject(ctx, model, autoName, token, pricingMode, sessionID, "积分余额不足（账户余额为 0）")
 			writeOpenAIError(w, http.StatusPaymentRequired, msgInsufficient)
 			return
 		}
@@ -411,10 +496,10 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 			g.channels.FeedResult(cr.ChannelKeyID, cr.ModelRowID, channel.Feedback{IsSuccess: false, Now: g.now()})
 			attempted = true // 该分支已自行落 failed 账单，终态不再兜底
 			bid := g.recordFailure(ctx, &router.RouteResult{ChannelID: cr.ChannelID, ChannelKeyID: cr.ChannelKeyID, InternalModelID: cr.InternalModelID,
-				ModelRowID: cr.ModelRowID, ExternalModelID: cr.ExternalModelID, Revision: cr.Revision},
+				ModelRowID: cr.ModelRowID, ExternalModelID: cr.ExternalModelID, AutoModelName: autoName, Revision: cr.Revision},
 				model, token, "", sessionID, sessionName, "密钥凭据不可用", msSince(start))
-			g.writeCallLog(ctx, bid, "", token, routeResFor(cr), model, "", sessionID, reqMsgs,
-				"error", "", "failed", "密钥凭据不可用", msSince(start), nil, g.callLogDecision(attempts, "密钥凭据不可用", pc, routeResFor(cr)))
+			g.writeCallLog(ctx, bid, "", token, routeResFor(cr, autoName), model, "", sessionID, reqMsgs,
+				"error", "", "failed", "密钥凭据不可用", msSince(start), nil, g.callLogDecision(attempts, "密钥凭据不可用", pc, routeResFor(cr, autoName)))
 			continue
 		}
 		// 直通判定（AC-4/AC-18）：入站协议必须 ∈ 该模型可达 protocols，否则不发起上游请求。
@@ -432,7 +517,7 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 			continue
 		}
 		routeRes := &router.RouteResult{ChannelID: cr.ChannelID, ChannelKeyID: cr.ChannelKeyID, InternalModelID: cr.InternalModelID,
-			ModelRowID: cr.ModelRowID, ExternalModelID: cr.ExternalModelID, Revision: cr.Revision,
+			ModelRowID: cr.ModelRowID, ExternalModelID: cr.ExternalModelID, AutoModelName: autoName, Revision: cr.Revision,
 			Cost: cr.Cost, CostKnown: cr.CostKnown, TimeCoeff: cr.TimeCoeff}
 
 		// 会话：既有会话命中本候选（密钥+模型）→ 续行；否则为新会话，但 Attach 放在限流通过之后
@@ -558,8 +643,8 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 	// 返回固定错误（HTTP 400 + OpenAI 错误体，type=unsupported_protocol）。
 	if sawUnsupported && !attempted {
 		g.refundAllPreConsume(ctx, token.UserID, pc.Credits, "请求失败退回（协议不支持）")
-		bid := g.recordGatewayReject(ctx, model, token, pricingMode, sessionID, msgUnsupportedProtocol)
-		g.writeCallLog(ctx, bid, "", token, &router.RouteResult{}, model, pricingMode, sessionID,
+		bid := g.recordGatewayReject(ctx, model, autoName, token, pricingMode, sessionID, msgUnsupportedProtocol)
+		g.writeCallLog(ctx, bid, "", token, &router.RouteResult{AutoModelName: autoName}, model, pricingMode, sessionID,
 			reqMsgs, "error", "", "failed", msgUnsupportedProtocol, msSince(start), nil, rejectDecision())
 		writeUnsupportedProtocol(w)
 		return
@@ -569,8 +654,8 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 		// 全部候选被本地拦截（限流/并发/禁用等，未发出任何上游调用）时补一条失败账单；
 		// 已发出上游调用并落账的（如 429 重试）不重复落账。
 		if !attempted {
-			bid := g.recordGatewayReject(ctx, model, token, pricingMode, sessionID, msgRateLimited)
-			g.writeCallLog(ctx, bid, "", token, &router.RouteResult{}, model, pricingMode, sessionID,
+			bid := g.recordGatewayReject(ctx, model, autoName, token, pricingMode, sessionID, msgRateLimited)
+			g.writeCallLog(ctx, bid, "", token, &router.RouteResult{AutoModelName: autoName}, model, pricingMode, sessionID,
 				reqMsgs, "error", "", "failed", msgRateLimited, msSince(start), nil, rejectDecision())
 		}
 		writeOpenAIError(w, http.StatusTooManyRequests, msgRateLimited)
@@ -578,8 +663,8 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 	}
 	g.refundAllPreConsume(ctx, token.UserID, pc.Credits, "请求失败退回（无可用渠道）")
 	if !attempted {
-		bid := g.recordGatewayReject(ctx, model, token, pricingMode, sessionID, msgNoAvailable)
-		g.writeCallLog(ctx, bid, "", token, &router.RouteResult{}, model, pricingMode, sessionID,
+		bid := g.recordGatewayReject(ctx, model, autoName, token, pricingMode, sessionID, msgNoAvailable)
+		g.writeCallLog(ctx, bid, "", token, &router.RouteResult{AutoModelName: autoName}, model, pricingMode, sessionID,
 			reqMsgs, "error", "", "failed", msgNoAvailable, msSince(start), nil, rejectDecision())
 	}
 	writeOpenAIError(w, http.StatusServiceUnavailable, msgNoAvailable)
@@ -588,21 +673,23 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 // recordGatewayReject 记录一次未进入渠道的网关拒绝（零余额/未路由/候选全部被拦截等）为 failed 账单，
 // 保证「每次请求必有一条账单记录」；渠道维度留空（未实际路由到任何渠道）。
 // 返回关联的 billing_id（Record 失败或未装配计费时为空串），供 call_log 关联。
-func (g *Gateway) recordGatewayReject(ctx context.Context, model string, token *identity.Token, pricingMode, sessionID, reason string) string {
+func (g *Gateway) recordGatewayReject(ctx context.Context, model, autoName string, token *identity.Token, pricingMode, sessionID, reason string) string {
 	if g.billing == nil || token == nil {
 		return ""
 	}
-	return g.recordFailure(ctx, &router.RouteResult{}, model, token, pricingMode, sessionID, "", reason, nil)
+	return g.recordFailure(ctx, &router.RouteResult{AutoModelName: autoName}, model, token, pricingMode, sessionID, "", reason, nil)
 }
 
 // routeResFor 由路由候选构造最小 RouteResult（入口复查失败——凭据不可用等——用于账单与日志关联）。
-func routeResFor(cr *router.ChannelRoute) *router.RouteResult {
+// autoName 为请求的 Auto 名（非 Auto 请求为空），随 RouteResult 贯穿到账单/调用日志留痕。
+func routeResFor(cr *router.ChannelRoute, autoName string) *router.RouteResult {
 	return &router.RouteResult{
 		ChannelID:       cr.ChannelID,
 		ChannelKeyID:    cr.ChannelKeyID,
 		InternalModelID: cr.InternalModelID,
 		ModelRowID:      cr.ModelRowID,
 		ExternalModelID: cr.ExternalModelID,
+		AutoModelName:   autoName,
 		Revision:        cr.Revision,
 		Cost:            cr.Cost,
 		CostKnown:       cr.CostKnown,
@@ -1071,6 +1158,7 @@ func (g *Gateway) recordBilling(ctx context.Context, routeRes *router.RouteResul
 		PricingMode:     pricingMode,
 		TokenID:         &tokenID,
 		ExternalModel:   model,
+		AutoModelName:   routeRes.AutoModelName,
 		InternalModelID: routeRes.InternalModelID,
 		ChannelKeyID:    routeRes.ChannelKeyID,
 		SessionID:       sessionID,
@@ -1114,6 +1202,7 @@ func (g *Gateway) recordFailure(ctx context.Context, routeRes *router.RouteResul
 		PricingMode:     pricingMode,
 		TokenID:         &tokenID,
 		ExternalModel:   model,
+		AutoModelName:   routeRes.AutoModelName,
 		InternalModelID: routeRes.InternalModelID,
 		ChannelKeyID:    routeRes.ChannelKeyID,
 		SessionID:       sessionID,

@@ -7,6 +7,7 @@ import {
   Odometer,
   Key,
   Cpu,
+  MagicStick,
   ChatDotRound,
   Tickets,
 } from '@element-plus/icons-vue'
@@ -20,6 +21,7 @@ const menus = [
   { path: '/dev/dashboard', title: '统计', icon: Odometer },
   { path: '/dev/tokens', title: '令牌', icon: Key },
   { path: '/dev/models', title: '模型', icon: Cpu },
+  { path: '/dev/auto-models', title: 'Auto 模型', icon: MagicStick },
   { path: '/dev/sessions', title: '会话', icon: ChatDotRound },
   { path: '/dev/billings', title: '账单', icon: Tickets },
 ]
@@ -28,6 +30,7 @@ function activeMenu() {
   const p = route.path
   if (p.startsWith('/dev/tokens')) return '/dev/tokens'
   if (p.startsWith('/dev/models')) return '/dev/models'
+  if (p.startsWith('/dev/auto-models')) return '/dev/auto-models'
   if (p.startsWith('/dev/sessions')) return '/dev/sessions'
   if (p.startsWith('/dev/billings')) return '/dev/billings'
   return p

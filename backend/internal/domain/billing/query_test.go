@@ -84,7 +84,7 @@ func TestGetByBillingID_ScanDims(t *testing.T) {
 	mock.ExpectQuery(regexp.MustCompile(`SELECT .* FROM billing_records WHERE billing_id=\$1`).String()).
 		WithArgs(billingID).
 		WillReturnRows(sqlmock.NewRows(recordColsForTest).AddRow(
-			int64(5), billingID, int64(7), "sale", nil, "ext-model", "int-model", int64(1), "sess-x", "会话A",
+			int64(5), billingID, int64(7), "sale", nil, "ext-model", nil, "int-model", int64(1), "sess-x", "会话A",
 			time.Now(), `{}`, `{}`, []byte(`{"time":1,"context":1}`), int64(10000),
 			nil, nil, nil, nil, nil, "completed", nil, nil, nil,
 		))

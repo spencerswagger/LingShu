@@ -27,7 +27,8 @@ type CallLog struct {
 	ChannelKeyID    *int64 // 最终命中渠道密钥
 	ExternalModelID *int64 // 最终命中对外模型
 	InternalModelID string // 最终命中内部模型
-	Model           string // 用户请求的对外模型名
+	Model           string // 用户请求的对外模型名（Auto 命中后为实际命中的成员对外模型名）
+	AutoModelName   string // 请求的 Auto 名（命中 Auto 时非空；非 Auto 请求为空）
 	PricingMode     string // sale / cost
 	Status          string // completed / failed
 	ReqMessages     any    // 请求增量 JSONB 原始值（可为 nil/空数组）
@@ -58,7 +59,7 @@ func NewSQLCallLogStore(db *sql.DB) *SQLCallLogStore {
 
 // callLogsCols 与 0002_call_logs.sql 列顺序一致的查询列（不含 id/created_at 自动列的读侧拆分）。
 const callLogsCols = `billing_id, request_id, session_id, user_id, channel_id, channel_key_id,
-	internal_model_id, external_model_id, model, pricing_mode, status, req_messages, resp_body, resp_kind,
+	internal_model_id, external_model_id, model, auto_model_name, pricing_mode, status, req_messages, resp_body, resp_kind,
 	decision, error_message, duration_ms, first_token_ms, created_at`
 
 // Insert 幂等插入一条调用日志：billing_id 冲突（ON CONFLICT DO NOTHING）静默跳过；
@@ -82,15 +83,23 @@ func (s *SQLCallLogStore) Insert(ctx context.Context, c *CallLog) error {
 	}
 	_, err = s.db.ExecContext(ctx, `
 INSERT INTO call_logs(id, billing_id, request_id, session_id, user_id, channel_id, channel_key_id,
-	internal_model_id, external_model_id, model, pricing_mode, status, req_messages, resp_body, resp_kind,
+	internal_model_id, external_model_id, model, auto_model_name, pricing_mode, status, req_messages, resp_body, resp_kind,
 	decision, error_message, duration_ms, first_token_ms, created_at)
-VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
 ON CONFLICT (billing_id) DO NOTHING`,
 		id, c.BillingID, c.RequestID, c.SessionID, nullableInt64(c.UserID), nullableInt64(c.ChannelID),
 		nullableInt64(c.ChannelKeyID), c.InternalModelID, nullableInt64(c.ExternalModelID), c.Model,
-		c.PricingMode, c.Status, reqRaw, c.RespBody, c.RespKind, decRaw, c.ErrorMessage,
+		nullableString(c.AutoModelName), c.PricingMode, c.Status, reqRaw, c.RespBody, c.RespKind, decRaw, c.ErrorMessage,
 		nullableInt64(c.DurationMs), nullableInt64(c.FirstTokenMs), created)
 	return err
+}
+
+// nullableString 空串 → SQL NULL（auto_model_name 等可空文本列用）。
+func nullableString(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
 }
 
 // nullableInt64 指针 int64 → 可空参数（nil → nil）。
@@ -166,12 +175,14 @@ func scanCallLog(row rowScanner) (*CallLog, error) {
 // JSONB 列读为 []byte 保留原始 value（查询侧再反序列化，null 给 nil）。
 func scanCallLogInto(s rowScanner, c *CallLog) error {
 	var uid, chID, keyID, extID, dur, ft sql.NullInt64
+	var autoName sql.NullString
 	var reqRaw, decRaw []byte
 	if err := s.Scan(&c.BillingID, &c.RequestID, &c.SessionID, &uid, &chID, &keyID,
-		&c.InternalModelID, &extID, &c.Model, &c.PricingMode, &c.Status, &reqRaw, &c.RespBody, &c.RespKind,
+		&c.InternalModelID, &extID, &c.Model, &autoName, &c.PricingMode, &c.Status, &reqRaw, &c.RespBody, &c.RespKind,
 		&decRaw, &c.ErrorMessage, &dur, &ft, &c.CreatedAt); err != nil {
 		return err
 	}
+	c.AutoModelName = autoName.String
 	if uid.Valid {
 		v := uid.Int64
 		c.UserID = &v
@@ -385,6 +396,9 @@ func (g *Gateway) writeCallLog(ctx context.Context, billingID, requestID string,
 		ErrorMessage: errMsg,
 		DurationMs:   durationMs,
 		FirstTokenMs: firstTokenMs,
+	}
+	if routeRes != nil {
+		cl.AutoModelName = routeRes.AutoModelName
 	}
 	if token != nil {
 		uid := token.UserID
