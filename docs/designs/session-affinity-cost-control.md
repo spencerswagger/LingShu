@@ -68,7 +68,7 @@ ownership: agent 实现，用户验收。
 
 2. **闲忙时重建权衡缺失**：`channel_models.time_config`（模型级时段系数）已在路由中生效（[resolveTimeCoeff](file:///workspace/backend/internal/domain/router/engine.go#L508-L522)），但会话一旦亲和组织**无脑粘性**（[collectCandidates](file:///workspace/backend/internal/domain/router/engine.go#L322-L348) 命中即置首）。当会话跨越闲/忙时切换、或其他渠道变便宜时，系统不会重新权衡——即便重灌上下文（丢缓存）可能是划算的。
 
-3. **「无法预判会话长短」是工程根因，而非信息缺失**：轮数与上下文 token **已被计算**（[handler.go:343-351](file:///workspace/backend/internal/domain/gateway/handler.go#L343-L351)），但**只用于会话 TTL**，且在 `RouteSpec`（[handler.go:239-245](file:///workspace/backend/internal/domain/gateway/handler.go#L239-L245)）构造**之后**才算出。`RouteSpec`（[engine.go:47-L52](file:///workspace/backend/internal/domain/router/engine.go#L47-L52)）无相位字段，`Session`（[sessions.go:16-L35](file:///workspace/backend/internal/domain/router/sessions.go#L16-L35)）也不记录相位。**相位是「到得太晚、且没有通道传入」，不是「拿不到」。**
+3. **相位不可得；且「会话未来长度」本质不可预判**：轮数与上下文 token 已被计算（[handler.go:343-351](file:///workspace/backend/internal/domain/gateway/handler.go#L343-L351)），但只用于会话 TTL，且在 `RouteSpec`（[handler.go:239-245](file:///workspace/backend/internal/domain/gateway/handler.go#L239-L245)）构造**之后**才算出；`RouteSpec`（[engine.go:47-L52](file:///workspace/backend/internal/domain/router/engine.go#L47-L52)）无相位字段，`Session`（[sessions.go:16-L35](file:///workspace/backend/internal/domain/router/sessions.go#L16-L35)）也不记录相位。**必须澄清**：这些量描述的是**已经发生的会话长度**（过去/现在），**无法预判会话未来是否还会继续发新请求**。因此策略不能建立在「预判长短」上，只能建立在**逐请求在线决策 + 允许中途迁移**上。
 
 ## Vision
 
