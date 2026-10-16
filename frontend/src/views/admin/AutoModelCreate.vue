@@ -31,7 +31,7 @@ const candidates = ref<ExternalModel[]>([])
 
 async function loadCandidates() {
   try {
-    const res = await listExternalModels({ Enabled: true })
+    const res = await listExternalModels({ Enabled: true }, base.value)
     candidates.value = res.Data || []
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }

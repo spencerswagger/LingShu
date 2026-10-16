@@ -255,6 +255,134 @@ func TestServeAuto_NonAutoRequestUnchanged(t *testing.T) {
 	}
 }
 
+// 场景 5（D4）：老会话粘原成员——首轮命中 A 后，即便成员列表被重排/改删，老会话仍走 A，
+// 完全不参考当前成员列表。
+func TestServeAuto_OldSessionSticksToOriginalMember(t *testing.T) {
+	var upstreamModel string
+	upstream := upstreamOK(&upstreamModel)
+	defer upstream.Close()
+
+	resolver := &fakeAutoResolver{
+		isAuto: true,
+		members: []automodel.Member{
+			autoMember(1, 101, "model-a", 0),
+			autoMember(2, 102, "model-b", 1),
+		},
+	}
+	h, ar := newAutoHarness(t, upstream.URL, resolver)
+	ar.byModel["model-a"] = routeFor("internal-a", 101, 1)
+	ar.byModel["model-b"] = routeFor("internal-b", 102, 1)
+
+	// 首轮：新会话，按 position 命中 A。
+	rec1 := doRequestH(t, h.gw, "/v1/chat/completions", "sk-gw-t",
+		`{"model":"auto","stream":false}`, map[string]string{"x-session-id": "sticky"})
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("first request want 200, got %d: %s", rec1.Code, rec1.Body.String())
+	}
+	if upstreamModel != "internal-a" {
+		t.Fatalf("first request upstream want internal-a, got %q", upstreamModel)
+	}
+
+	// 变更成员列表：把 B 提到首位并移除 A（模拟运营重排/改删）。
+	resolver.members = []automodel.Member{autoMember(2, 102, "model-b", 0)}
+	ar.asked = nil
+
+	// 二轮：同一会话，应仍然粘 A（老会话不考虑现在的成员）。
+	rec2 := doRequestH(t, h.gw, "/v1/chat/completions", "sk-gw-t",
+		`{"model":"auto","stream":false}`, map[string]string{"x-session-id": "sticky"})
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("second request want 200, got %d: %s", rec2.Code, rec2.Body.String())
+	}
+	if len(ar.asked) != 1 || ar.asked[0] != "model-a" {
+		t.Fatalf("old session should stick to member A only, asked=%v", ar.asked)
+	}
+	if upstreamModel != "internal-a" {
+		t.Fatalf("old session upstream want internal-a, got %q", upstreamModel)
+	}
+	if len(h.billing.reqs) != 2 || h.billing.reqs[1].ExternalModel != "model-a" || h.billing.reqs[1].AutoModelName != "auto" {
+		t.Fatalf("second billing attribution wrong: %+v", h.billing.reqs)
+	}
+}
+
+// 场景 5b（D4）：老会话原成员已不可路由 → 回退按当前成员列表 position 升序选择。
+func TestServeAuto_OldSessionFallbackWhenStickyMemberGone(t *testing.T) {
+	var upstreamModel string
+	upstream := upstreamOK(&upstreamModel)
+	defer upstream.Close()
+
+	resolver := &fakeAutoResolver{
+		isAuto: true,
+		members: []automodel.Member{
+			autoMember(1, 101, "model-a", 0),
+			autoMember(2, 102, "model-b", 1),
+		},
+	}
+	h, ar := newAutoHarness(t, upstream.URL, resolver)
+	ar.byModel["model-a"] = routeFor("internal-a", 101, 1)
+	ar.byModel["model-b"] = routeFor("internal-b", 102, 1)
+
+	if rec := doRequestH(t, h.gw, "/v1/chat/completions", "sk-gw-t",
+		`{"model":"auto","stream":false}`, map[string]string{"x-session-id": "fallback"}); rec.Code != http.StatusOK {
+		t.Fatalf("first request want 200, got %d", rec.Code)
+	}
+	// 原成员 A 变为不可路由（无候选），成员列表保留 A、B。
+	ar.byModel["model-a"] = nil
+	ar.asked = nil
+
+	rec := doRequestH(t, h.gw, "/v1/chat/completions", "sk-gw-t",
+		`{"model":"auto","stream":false}`, map[string]string{"x-session-id": "fallback"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("second request want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if upstreamModel != "internal-b" {
+		t.Fatalf("should fall back to member B, upstream=%q", upstreamModel)
+	}
+	if h.billing.reqs[1].ExternalModel != "model-b" {
+		t.Fatalf("fallback billing want model-b, got %q", h.billing.reqs[1].ExternalModel)
+	}
+}
+
+// 场景 6：GET /v1/models 一并列出对令牌用户可见的启用 Auto（全局 + 私有），非法/停用不列。
+func TestHandleModels_ListsAuto(t *testing.T) {
+	h := build(t, "http://unused")
+	h.gw.listAutoModels = func(_ context.Context, ownerUserID int64) ([]automodel.AutoModel, error) {
+		if ownerUserID != 7 {
+			t.Fatalf("listAutoModels owner want 7, got %d", ownerUserID)
+		}
+		return []automodel.AutoModel{
+			{Name: "auto-global", Enabled: true},
+			{Name: "auto-off", Enabled: false},
+		}, nil
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer sk-gw-t")
+	rec := httptest.NewRecorder()
+	h.gw.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Object string           `json:"object"`
+		Data   []map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	ids := map[string]bool{}
+	for _, d := range body.Data {
+		if id, ok := d["id"].(string); ok {
+			ids[id] = true
+		}
+	}
+	if !ids["auto-global"] {
+		t.Fatalf("enabled auto should be listed, data=%v", body.Data)
+	}
+	if ids["auto-off"] {
+		t.Fatalf("disabled auto must not be listed")
+	}
+}
+
 // 场景 4b：未装配 Auto 解析器（auto=nil）时行为与改动前一致（不调解析器）。
 func TestServeAuto_ResolverNil(t *testing.T) {
 	var upstreamModel string

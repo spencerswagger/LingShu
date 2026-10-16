@@ -275,6 +275,53 @@ func TestStore_Insert_ExternalModelMissing(t *testing.T) {
 	}
 }
 
+// D5：23503 外键冲突按约束名区分——owner_user_id 约束 → ErrOwnerUserMissing（而非 ErrExternalModelMissing）。
+func TestStore_Insert_OwnerUserMissing(t *testing.T) {
+	s, mock := newStoreMock(t)
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO auto_models(id, name, scope, owner_user_id, enabled, description)
+		 VALUES($1,$2,$3,$4,$5,$6) RETURNING `+autoCols)).
+		WithArgs(sqlmock.AnyArg(), "auto1", ScopePrivate, int64(7), true, "").
+		WillReturnError(&pgconn.PgError{Code: "23503", ConstraintName: "auto_models_owner_user_id_fkey"})
+	mock.ExpectRollback()
+
+	_, err := s.Insert(context.Background(), &AutoModel{
+		Name: "auto1", Scope: ScopePrivate, OwnerUserID: int64Ptr(7), Enabled: true,
+		Members: []Member{{ExternalModelID: 101, Position: 0}},
+	})
+	if !errors.Is(err, ErrOwnerUserMissing) {
+		t.Fatalf("want ErrOwnerUserMissing, got %v", err)
+	}
+	if errors.Is(err, ErrExternalModelMissing) {
+		t.Fatalf("owner FK must not be classified as ErrExternalModelMissing")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("mock expectations: %v", err)
+	}
+}
+
+// D5：成员 external_model_id 外键（约束名含 external_model）→ ErrExternalModelMissing。
+func TestStore_Insert_ExternalModelFKByConstraintName(t *testing.T) {
+	s, mock := newStoreMock(t)
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO auto_models(id, name, scope, owner_user_id, enabled, description)
+		 VALUES($1,$2,$3,$4,$5,$6) RETURNING `+autoCols)).
+		WithArgs(sqlmock.AnyArg(), "auto1", ScopeGlobal, nil, true, "").
+		WillReturnError(&pgconn.PgError{Code: "23503", ConstraintName: "auto_model_members_external_model_id_fkey"})
+	mock.ExpectRollback()
+
+	_, err := s.Insert(context.Background(), &AutoModel{
+		Name: "auto1", Scope: ScopeGlobal, Enabled: true,
+		Members: []Member{{ExternalModelID: 101, Position: 0}},
+	})
+	if !errors.Is(err, ErrExternalModelMissing) {
+		t.Fatalf("want ErrExternalModelMissing, got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("mock expectations: %v", err)
+	}
+}
+
 // --- Update ---
 
 func TestStore_Update_Success(t *testing.T) {

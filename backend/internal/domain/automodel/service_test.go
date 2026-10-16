@@ -214,6 +214,32 @@ func TestService_Create_ExternalModelMissing(t *testing.T) {
 	}
 }
 
+// D5：store 返回归属用户外键冲突（ErrOwnerUserMissing）→ 40001，文案「指定的归属用户不存在」。
+func TestService_Create_OwnerUserMissing(t *testing.T) {
+	s, mock := newServiceMock(t)
+	mock.ExpectQuery(regexp.QuoteMeta(getByNameAnySQL)).
+		WithArgs("auto1").
+		WillReturnError(sql.ErrNoRows)
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO auto_models(id, name, scope, owner_user_id, enabled, description)
+		 VALUES($1,$2,$3,$4,$5,$6) RETURNING `+autoCols)).
+		WithArgs(sqlmock.AnyArg(), "auto1", ScopePrivate, int64(7), true, "").
+		WillReturnError(&pgconn.PgError{Code: "23503", ConstraintName: "auto_models_owner_user_id_fkey"})
+	mock.ExpectRollback()
+
+	_, err := s.Create(context.Background(), AutoModelInput{
+		Name: "auto1", Scope: ScopePrivate, OwnerUserID: int64Ptr(7),
+		Members: []MemberInput{{ExternalModelID: 1, Position: 0}},
+	})
+	apiErr := wantAPIErr(t, err, resp.CodeBadRequest)
+	if apiErr.Message != "指定的归属用户不存在" {
+		t.Fatalf("unexpected message: %q", apiErr.Message)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("mock expectations: %v", err)
+	}
+}
+
 // 重点：扁平命名空间——已有同名 global 时，创建 private 亦被拒（GetByNameAny 命中）→ 40901。
 func TestService_Create_FlatNamespace_PrivateRejectedWhenGlobalExists(t *testing.T) {
 	s, mock := newServiceMock(t)

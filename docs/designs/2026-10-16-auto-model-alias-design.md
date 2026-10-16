@@ -97,7 +97,7 @@ ownership: agent 实现，用户验收。
 
 新增 `auto_models`：`id` / `name` / `scope`（global | private）/ `owner_user_id`（可空，global 为空）/ `enabled` / `description` / `deleted_at` / 时间戳。
 
-- 唯一性：global 按 `(name)`（`deleted_at IS NULL` 部分唯一）；private 按 `(owner_user_id, name)`（部分唯一）。
+- 唯一性：单一扁平命名空间——`(name)`（`deleted_at IS NULL` 部分唯一），即任意两个 Auto（无论 scope 与 owner）不得重名。
 - 跨表校验：应用层保证 `auto_models.name` 不与任何 `external_models.external_name` 重名。
 
 新增 `auto_model_members`：`id` / `auto_model_id`（外键）/ `external_model_id`（外键）/ `position`（升序优先级）/ `deleted_at` / 时间戳；按 `(auto_model_id, position)` 组织。
@@ -108,10 +108,11 @@ ownership: agent 实现，用户验收。
 
 在 handler 解析请求体得到请求模型名后、进入现有路由之前，插入 Auto 解析：
 
-1. 依名查 Auto（先查该用户私有，再查全局；因不允许重名，二者至多命中其一）。
-2. 命中 Auto → 取成员按 `position` 升序；对每个成员，以「成员对外模型名」调用现有路由（`RouteAll` / 候选收集）；第一个返回非空候选的成员即被选中，此后 `model` 替换为该成员名。
-3. 未命中 Auto → 保持现有逻辑（`GetByExternalName`）。
-4. 全部成员均无候选 → 按「无可用渠道」返回，并落拒绝账单（external_model_name 为空、auto 列保留请求的 Auto 名）。
+1. 依名查 Auto（单条查询内完成可见性过滤：global 对所有用户可见，private 仅 owner 可见；因扁平命名空间，二者至多命中其一）。
+2. 命中 Auto → 老会话粘性优先：若该会话已绑定的成员对外模型名（`Session.Model`）仍可路由（该对外模型仍存在且有候选），则**直接沿用该成员**，完全不参考当前成员列表（成员重排/增删都不改变老会话落点）。
+3. 新会话，或老会话原成员已不可路由 → 取成员按 `position` 升序；对每个成员，以「成员对外模型名」调用现有路由（`RouteAll` / 候选收集）；第一个返回非空候选的成员即被选中，此后 `model` 替换为该成员名。
+4. 未命中 Auto → 保持现有逻辑（`GetByExternalName`）。
+5. 全部成员均无候选 → 按「无可用渠道」返回，并落拒绝账单（external_model_name 为空、auto 列保留请求的 Auto 名）。
 
 Auto 解析必须早于预扣估算：预扣金额需以命中成员的售价计算（否则 Auto 名查不到售价会静默跳过预扣，使余额前置校验失效）。
 

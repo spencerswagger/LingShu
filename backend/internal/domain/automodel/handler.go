@@ -248,6 +248,29 @@ func (h *Handler) HandleDevList(w http.ResponseWriter, r *http.Request) {
 	resp.OK(w, r, views)
 }
 
+// HandleDevGet GET /api/v1/dev/auto-models/{id} 开发端详情（含可见性校验）。
+// 可见性：global 对所有登录用户可见；private 仅归属本人可见。
+func (h *Handler) HandleDevGet(w http.ResponseWriter, r *http.Request) {
+	userID, ok := h.currentUser(w, r)
+	if !ok {
+		return
+	}
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	m, err := h.svc.Get(r.Context(), id)
+	if err != nil {
+		writeServiceErr(w, r, err)
+		return
+	}
+	if m.Scope == ScopePrivate && (m.OwnerUserID == nil || *m.OwnerUserID != userID) {
+		resp.Err(w, r, http.StatusForbidden, resp.CodeForbidden, "无权查看该 Auto 模型")
+		return
+	}
+	resp.OK(w, r, toView(m))
+}
+
 // HandleDevCreate POST /api/v1/dev/auto-models 开发端创建（强制 private + 当前用户）。
 func (h *Handler) HandleDevCreate(w http.ResponseWriter, r *http.Request) {
 	userID, ok := h.currentUser(w, r)

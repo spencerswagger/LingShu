@@ -63,7 +63,10 @@ function fmt(n: number | undefined) {
       <template v-else-if="detail">
         <el-descriptions :column="2" border>
           <el-descriptions-item label="时间" :span="2">{{ detail.CallTime }}</el-descriptions-item>
-          <el-descriptions-item label="模型">{{ detail.Model }}</el-descriptions-item>
+          <el-descriptions-item label="模型">
+            {{ detail.Model }}
+            <el-tag v-if="detail.AutoModelName" size="small" effect="plain" type="success">Auto {{ detail.AutoModelName }}</el-tag>
+          </el-descriptions-item>
           <!-- admin 额外只读字段；self 模式（dev 响应不含该字段）不展示 -->
           <el-descriptions-item v-if="!isSelf" label="渠道">{{ detail.ChannelName || '-' }}</el-descriptions-item>
           <el-descriptions-item label="模式">

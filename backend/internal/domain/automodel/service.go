@@ -150,6 +150,9 @@ func (s *Service) Create(ctx context.Context, in AutoModelInput) (*AutoModel, er
 		if errors.Is(err, ErrExternalModelMissing) {
 			return nil, errBadRequest("成员引用的对外模型不存在")
 		}
+		if errors.Is(err, ErrOwnerUserMissing) {
+			return nil, errBadRequest("指定的归属用户不存在")
+		}
 		return nil, fmt.Errorf("create auto model: %w", err)
 	}
 	return created, nil
@@ -201,6 +204,9 @@ func (s *Service) Update(ctx context.Context, id int64, in AutoModelInput) (*Aut
 		}
 		if errors.Is(err, ErrExternalModelMissing) {
 			return nil, errBadRequest("成员引用的对外模型不存在")
+		}
+		if errors.Is(err, ErrOwnerUserMissing) {
+			return nil, errBadRequest("指定的归属用户不存在")
 		}
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, errNotFound("Auto 模型不存在")

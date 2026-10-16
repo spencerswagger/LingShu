@@ -326,7 +326,8 @@ func loadMembersQ(ctx context.Context, q rowQuerier, autoModelIDs []int64) (map[
 
 // classifyAutoErr 把数据库约束冲突映射为领域错误：
 //   - 23505（唯一约束）：主表名冲突 或 同 Auto 内 position 重复 → ErrNameExists；
-//   - 23503（外键约束）：成员引用的对外模型不存在 → ErrExternalModelMissing。
+//   - 23503（外键约束）：按约束名区分——成员引用 auto_model_members.external_model_id
+//     → ErrExternalModelMissing；owner_user_id → users 的归属用户不存在 → ErrOwnerUserMissing。
 func classifyAutoErr(err error) error {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
@@ -334,6 +335,14 @@ func classifyAutoErr(err error) error {
 		case "23505":
 			return ErrNameExists
 		case "23503":
+			// 仅「成员引用对外模型」的 FK 归一为 ErrExternalModelMissing；
+			// owner_user_id → users 的 FK 单独归一，避免误报成「成员模型不存在」。
+			if strings.Contains(pgErr.ConstraintName, "external_model") {
+				return ErrExternalModelMissing
+			}
+			if strings.Contains(pgErr.ConstraintName, "owner_user_id") {
+				return ErrOwnerUserMissing
+			}
 			return ErrExternalModelMissing
 		}
 	}
@@ -342,6 +351,9 @@ func classifyAutoErr(err error) error {
 
 // ErrExternalModelMissing 表示成员引用的对外模型不存在（PG 23503 外键冲突）。
 var ErrExternalModelMissing = errors.New("external model not found")
+
+// ErrOwnerUserMissing 表示私有 Auto 指定的归属用户不存在（owner_user_id 外键冲突）。
+var ErrOwnerUserMissing = errors.New("owner user not found")
 
 // nullableID 把可空外键转为可入库的 any（nil → NULL）。
 func nullableID(v *int64) any {

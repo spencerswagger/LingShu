@@ -44,6 +44,37 @@ func TestListRecords_FilterByKeyAndSession(t *testing.T) {
 	}
 }
 
+// TestListRecords_FilterByModelMatchesAutoName 断言 Model 过滤同时匹配
+// external_model_name 与 auto_model_name（Auto 账单按 Auto 名可搜）。
+func TestListRecords_FilterByModelMatchesAutoName(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	store := NewSqlStore(db)
+	f := RecordFilter{Model: "auto", Page: 1, Size: 10}
+
+	mock.ExpectQuery(`SELECT count\(\*\) FROM billing_records .*external_model_name = \$5 OR auto_model_name = \$5.*`).
+		WithArgs(nil, nil, nil, "", "auto", "", "", nil, nil).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(1)))
+	mock.ExpectQuery(`SELECT .* FROM billing_records .*external_model_name = \$5 OR auto_model_name = \$5.*LIMIT \$10 OFFSET \$11`).
+		WithArgs(nil, nil, nil, "", "auto", "", "", nil, nil, 10, 0).
+		WillReturnRows(completedRow(t))
+
+	_, total, err := store.ListRecords(context.Background(), f)
+	if err != nil {
+		t.Fatalf("ListRecords: %v", err)
+	}
+	if total != 1 {
+		t.Fatalf("total=%d, want 1", total)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("mock expectations: %v", err)
+	}
+}
+
 // TestListRecords_NoFilter 断言零值过滤器仍可用：参数位全部占位且不报错。
 func TestListRecords_NoFilter(t *testing.T) {
 	db, mock, err := sqlmock.New()
