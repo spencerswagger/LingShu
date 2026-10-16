@@ -125,6 +125,13 @@ func (h *Admin) HandleServiceStatus(w http.ResponseWriter, r *http.Request) {
 			}
 			routes, err := h.routeEng.RouteAll(ctx, router.RouteSpec{ExternalModel: m.ExternalName, SessionKey: ""})
 			if err != nil {
+				// 路由业务错误（如该对外模型未绑定可用渠道密钥 → 无可用候选／标签不匹配）属预期状态，
+				// 降级为 Debug 并跳过（该模型不出现在 Candidates，成本列回退 —）；其余为真实故障，保留 Error。
+				// 全量计算下每次刷新都会遍历全部启用模型，若不区分会周期性刷 ERROR 噪音。
+				if re, ok := router.AsRouteError(err); ok {
+					slog.Default().Debug("对外模型当前无可用候选", "request_id", resp.RequestID(r), "external_model_id", m.ID, "reason", re.Message)
+					continue
+				}
 				slog.Default().Error("计算候选顺序失败", "request_id", resp.RequestID(r), "external_model_id", m.ID, "err", err)
 				continue
 			}
