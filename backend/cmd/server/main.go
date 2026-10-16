@@ -20,6 +20,7 @@ import (
 	"github.com/team/llmgateway/internal/config"
 	"github.com/team/llmgateway/internal/db"
 	"github.com/team/llmgateway/internal/domain/audit"
+	"github.com/team/llmgateway/internal/domain/automodel"
 	"github.com/team/llmgateway/internal/domain/billing"
 	"github.com/team/llmgateway/internal/domain/channel"
 	"github.com/team/llmgateway/internal/domain/channelprotocol"
@@ -330,6 +331,35 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	modelSvc := model.NewService(model.NewStore(d))
 	modelHandler := model.NewHandler(modelSvc)
 
+	// automodel（Auto 模型：对外模型之上的有序别名组）
+	autoStore := automodel.NewStore(d)
+	autoSvc := automodel.NewService(autoStore)
+	autoHandler := automodel.NewHandler(autoSvc)
+	// 开发端接口需从 context 解析当前登录用户（server.UserIDFrom 由中间件写入）。
+	autoHandler.SetUserIDFrom(server.UserIDFrom)
+	// 跨表重名校验：Auto 名不得与任何 external_models.external_name 重名。
+	// 用 GetByName（忽略 enabled）判断「该名是否已被任何对外模型占用」——含未启用者，
+	// 避免「先建停用的对外模型 → 再建同名 Auto → 之后重新启用」绕过扁平命名空间约束。
+	autoSvc.SetExternalNameChecker(func(ctx context.Context, name string) (bool, error) {
+		if _, err := modelSvc.GetByName(ctx, name); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return false, nil
+			}
+			return false, err
+		}
+		return true, nil
+	})
+	// 反向跨表重名校验：对外模型名不得与任何 Auto 重名（与上方对称，堵住「先建 Auto 后建模型」）。
+	modelSvc.SetAutoNameChecker(func(ctx context.Context, name string) (bool, error) {
+		if _, err := autoStore.GetByNameAny(ctx, name); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return false, nil
+			}
+			return false, err
+		}
+		return true, nil
+	})
+
 	// billing
 	billStore := billing.NewSqlStore(d)
 	billCfgProvider := billing.NewConfigProvider(billStore)
@@ -447,6 +477,7 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 		Models:        modelSvc,
 		ChannelModels: cmStore,
 		TagKV:         tagKVResolver(tagStore),
+		Auto:          autoSvc,
 		Pricing:       pricingModeResolver(userStore),
 		// SessionExpiry 会话过期 TTL 分档计算（上下文长度 + 用户对话次数，取较大者，最低兜底 5 分钟）。
 		SessionExpiry: sessExpiryProvider,
@@ -458,6 +489,11 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 		ListEnabledModels: func(ctx context.Context) ([]model.ExternalModel, error) {
 			enabled := true
 			return modelSvc.ListModels(ctx, &enabled)
+		},
+		// GET /v1/models 一并列出全局 Auto + 该令牌用户的私有 Auto（store.List 保证可见性）。
+		ListAutoModels: func(ctx context.Context, ownerUserID int64) ([]automodel.AutoModel, error) {
+			uid := ownerUserID
+			return autoSvc.List(ctx, "", &uid)
 		},
 		// 全局上游响应头白名单（sys_configs，默认空=不透传任何上游头）。
 		UpstreamResponseHeaderWhitelist: func() ([]string, error) {
@@ -487,6 +523,7 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 			ChannelProto: cpHandler,
 			Tag:          tagHandler,
 			Model:        modelHandler,
+			AutoModel:    autoHandler,
 			Announcement: announceHandler,
 			Console:      consoleAdmin,
 			DevConsole:   consoleDev,

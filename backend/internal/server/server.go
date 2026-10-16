@@ -10,6 +10,7 @@ import (
 
 	"github.com/team/llmgateway/internal/config"
 	"github.com/team/llmgateway/internal/domain/audit"
+	"github.com/team/llmgateway/internal/domain/automodel"
 	"github.com/team/llmgateway/internal/domain/channel"
 	"github.com/team/llmgateway/internal/domain/channelprotocol"
 	"github.com/team/llmgateway/internal/domain/console"
@@ -33,6 +34,8 @@ type Deps struct {
 	ChannelProto *channelprotocol.Handler
 	Tag          *tag.Handler
 	Model        *model.Handler
+	// AutoModel 可选：Auto 模型管理（管理端 + 开发端）。
+	AutoModel    *automodel.Handler
 	Announcement *identity.AnnouncementHandler
 	Console      *console.Admin
 	DevConsole   *console.Dev
@@ -170,6 +173,15 @@ func (s *Server) routes() {
 	admin.HandleFunc("POST /api/v1/admin/models/sync-prices", d.Model.HandleSyncPrices)
 	admin.HandleFunc("GET /api/v1/admin/models/price-catalog", d.Model.HandlePriceCatalog)
 
+	// auto-models（Auto 模型：对外模型之上的有序别名组）
+	if d.AutoModel != nil {
+		admin.HandleFunc("GET /api/v1/admin/auto-models", d.AutoModel.HandleList)
+		admin.HandleFunc("GET /api/v1/admin/auto-models/{id}", d.AutoModel.HandleGet)
+		admin.HandleFunc("POST /api/v1/admin/auto-models", d.AutoModel.HandleCreate)
+		admin.HandleFunc("PUT /api/v1/admin/auto-models/{id}", d.AutoModel.HandleUpdate)
+		admin.HandleFunc("DELETE /api/v1/admin/auto-models/{id}", d.AutoModel.HandleDelete)
+	}
+
 	// billings / stats / configs / sessions
 	admin.HandleFunc("GET /api/v1/admin/billings", d.Console.HandleListBillings)
 	admin.HandleFunc("GET /api/v1/admin/billings/stats", d.Console.HandleBillingsStats)
@@ -222,6 +234,14 @@ func (s *Server) routes() {
 	dev.HandleFunc("GET /api/v1/dev/billings", d.DevConsole.HandleListBillings)
 	dev.HandleFunc("GET /api/v1/dev/billings/{billing_id}", d.DevConsole.HandleGetBilling)
 	dev.HandleFunc("GET /api/v1/dev/announcements", d.Announcement.HandleDevList)
+
+	// auto-models（开发端：仅本人私有 Auto；服务端强制 scope=private + owner=当前用户）
+	if d.AutoModel != nil {
+		dev.HandleFunc("GET /api/v1/dev/auto-models", d.AutoModel.HandleDevList)
+		dev.HandleFunc("POST /api/v1/dev/auto-models", d.AutoModel.HandleDevCreate)
+		dev.HandleFunc("PUT /api/v1/dev/auto-models/{id}", d.AutoModel.HandleDevUpdate)
+		dev.HandleFunc("DELETE /api/v1/dev/auto-models/{id}", d.AutoModel.HandleDevDelete)
+	}
 
 	// ---- 网关 ----
 	if d.Gateway != nil {
