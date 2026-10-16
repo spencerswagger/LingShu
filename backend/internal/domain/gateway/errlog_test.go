@@ -2,6 +2,8 @@ package gateway
 
 import (
 	"bytes"
+	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +13,7 @@ import (
 
 	"github.com/team/llmgateway/internal/domain/channel"
 	"github.com/team/llmgateway/internal/domain/router"
+	"github.com/team/llmgateway/internal/pkg/logger"
 )
 
 // withLogCapture 把网关日志改写到内存缓冲，返回读取函数（断言日志内容用）。
@@ -108,6 +111,10 @@ func TestMaskedUpstreamFailureIsLogged(t *testing.T) {
 		Limiter:         channel.NewLimiter(1000, 1000000, 1.2),
 	}
 	dump := withLogCapture(h)
+	// Fix 4 不变量：关闭客户端错误日志开关后，「成功请求的隐性失败」结论仍必须落盘
+	// （它是排查"用户正常、密钥却被禁用"的唯一现场，属服务端结论而非客户端错误）。
+	logger.SetClientErrorLogEnabled(false)
+	t.Cleanup(func() { logger.SetClientErrorLogEnabled(true) })
 
 	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-testtoken",
 		`{"model":"gpt-4","stream":false,"messages":[{"role":"user","content":"ping"}]}`)
@@ -199,6 +206,16 @@ func TestSanitizeErrSummaryStripsCredentials(t *testing.T) {
 	if got := sanitizeErrSummary(keep); got != keep {
 		t.Errorf("正常文案被误改: %q", got)
 	}
+	// Fix 3：模型名不得被当作凭据清洗（glm- 是智谱模型名前缀，不是凭据前缀），
+	// 否则恰好抹掉"模型不存在"这类报错里最需要的模型标识。
+	for _, modelText := range []string{
+		"The model glm-4-plus does not exist or you do not have access to it.",
+		"The model glm-4-plus-0111 is not available",
+	} {
+		if got := sanitizeErrSummary(modelText); got != modelText {
+			t.Errorf("模型名被误清洗: in=%q out=%q", modelText, got)
+		}
+	}
 	// 摘要路径也必须清洗。
 	_, _, _, summary := upstreamErrParts(`{"error":{"message":"Incorrect API key provided: sk-abc123456789","type":"invalid_request_error"}}`)
 	if strings.Contains(summary, "sk-abc123456789") {
@@ -217,5 +234,104 @@ func TestTruncateLogKeepsValidUTF8(t *testing.T) {
 	}
 	if got := truncateLog("短", 512); got != "短" {
 		t.Errorf("未超限不应改动: %q", got)
+	}
+}
+
+// Fix 1：日志与落库共用的错误体读取必须清洗凭据——
+// 账单 error_message 与调用日志 resp_body 都取自它，漏清洗等于两条链路同时落明文。
+func TestReadUpstreamErrBodySanitizesCredentials(t *testing.T) {
+	resp := &http.Response{Body: io.NopCloser(strings.NewReader(
+		`{"error":{"message":"Incorrect API key provided: sk-abc123456789"}}`))}
+	body := readUpstreamErrBody(resp)
+	if strings.Contains(body, "sk-abc123456789") {
+		t.Errorf("上游错误体未清洗凭据: %q", body)
+	}
+	if !strings.Contains(body, "***") {
+		t.Errorf("清洗标记缺失: %q", body)
+	}
+	// 同源链路：upstreamErrDetail 拼接的 errMsg 也不得含明文。
+	if detail := upstreamErrDetail(http.StatusUnauthorized, body); strings.Contains(detail, "sk-abc123456789") {
+		t.Errorf("errMsg 含凭据明文: %q", detail)
+	}
+}
+
+// Fix 2：语义成败判定不得只看状态码——流式中断时下游状态码仍为 200，但请求是失败的。
+func TestOutcomeIsFailure(t *testing.T) {
+	cases := []struct {
+		name string
+		out  *fwdOutcome
+		want bool
+	}{
+		{"成功(200)", &fwdOutcome{responded: true, downstreamStatus: http.StatusOK}, false},
+		{"计费失败(402)", &fwdOutcome{responded: true, billFailed: true, downstreamStatus: http.StatusPaymentRequired}, true},
+		{"上游失败(502)", &fwdOutcome{responded: true, refundPre: true, downstreamStatus: http.StatusBadGateway}, true},
+		{"流式中断(状态码仍 200)", &fwdOutcome{responded: true, interrupted: true, downstreamStatus: http.StatusOK}, true},
+		{"nil", nil, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := outcomeIsFailure(c.out); got != c.want {
+				t.Errorf("outcomeIsFailure = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// Fix 5 / Fix 9：网关本地拒绝的分级与开关——
+// 4xx 受客户端错误开关控制；5xx 恒以 Error 级落盘（否则按 Error 的告警会漏掉真实故障）。
+func TestLogRejectLevelAndSwitch(t *testing.T) {
+	h := build(t, "http://127.0.0.1:1")
+	body := `{"model":"gpt-4","stream":false,"messages":[{"role":"user","content":"ping"}]}`
+	logger.SetClientErrorLogEnabled(false)
+	t.Cleanup(func() { logger.SetClientErrorLogEnabled(true) })
+
+	// 4xx：模型未配置 → 404；开关关闭时应静默
+	h.rrouter.err = &router.RouteError{Kind: router.KindModelNotFound, HTTPStatus: http.StatusNotFound, Message: "模型未配置"}
+	dump := withLogCapture(h)
+	if rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-testtoken", body); rec.Code != http.StatusNotFound {
+		t.Fatalf("want 404, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if out := dump(); strings.Contains(out, "gateway request rejected") {
+		t.Errorf("开关关闭时 4xx 本地拒绝不应落日志：\n%s", out)
+	}
+
+	// 5xx：路由内部错误 → 500；必须落 Error
+	h.rrouter.err = errors.New("route boom")
+	dump = withLogCapture(h)
+	if rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-testtoken", body); rec.Code != http.StatusInternalServerError {
+		t.Fatalf("want 500, got %d: %s", rec.Code, rec.Body.String())
+	}
+	out := dump()
+	if !strings.Contains(out, "gateway request rejected") {
+		t.Errorf("5xx 本地拒绝必须落日志：\n%s", out)
+	}
+	if !strings.Contains(out, "level=ERROR") || !strings.Contains(out, "status=500") {
+		t.Errorf("5xx 本地拒绝应以 Error 级落盘：\n%s", out)
+	}
+}
+
+// Fix 4：4xx 请求级结论受开关控制；开关打开时照常落盘。
+func TestOutcomeLogSwitch4xx(t *testing.T) {
+	h := build(t, "http://127.0.0.1:1")
+	// anthropic-messages 不在该渠道模型可达协议内 → 未出网即被拒（400）
+	body := `{"model":"gpt-4","stream":false,"messages":[{"role":"user","content":"ping"}]}`
+
+	logger.SetClientErrorLogEnabled(false)
+	t.Cleanup(func() { logger.SetClientErrorLogEnabled(true) })
+	dump := withLogCapture(h)
+	if rec := doRequest(t, h.gw, "/v1/messages", "sk-gw-testtoken", body); rec.Code != http.StatusBadRequest {
+		t.Fatalf("want 400（协议不支持）, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if out := dump(); strings.Contains(out, "gateway request outcome") {
+		t.Errorf("开关关闭时 4xx 请求级结论不应落日志：\n%s", out)
+	}
+
+	logger.SetClientErrorLogEnabled(true)
+	dump = withLogCapture(h)
+	if rec := doRequest(t, h.gw, "/v1/messages", "sk-gw-testtoken", body); rec.Code != http.StatusBadRequest {
+		t.Fatalf("want 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if out := dump(); !strings.Contains(out, "gateway request outcome") {
+		t.Errorf("开关打开时应落 4xx 请求级结论：\n%s", out)
 	}
 }

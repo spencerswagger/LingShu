@@ -14,6 +14,7 @@ import (
 	"github.com/team/llmgateway/internal/domain/channel"
 	"github.com/team/llmgateway/internal/domain/channelprotocol"
 	"github.com/team/llmgateway/internal/domain/console"
+	"github.com/team/llmgateway/internal/domain/gateway"
 	"github.com/team/llmgateway/internal/domain/identity"
 	"github.com/team/llmgateway/internal/domain/model"
 	"github.com/team/llmgateway/internal/domain/sync"
@@ -248,7 +249,7 @@ func (s *Server) routes() {
 
 	// ---- 网关 ----
 	if d.Gateway != nil {
-		s.mux.Handle("/v1/", d.Gateway)
+		s.mux.Handle(gateway.InboundPrefix, d.Gateway)
 	}
 
 	s.mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {

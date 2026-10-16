@@ -53,9 +53,8 @@ const (
 	// fpMinLen 可安全展示首尾指纹的最小字符数：短于该长度一律整体遮蔽。
 	// 取 16 是为了避免"指纹"退化成可暴力补齐的准明文（n=9 时首尾各 4 位只剩 1 位未知）。
 	fpMinLen = 16
-	// inboundPrefix 入站端点的注册前缀，与网关 Handler 的注册路径一致。
-	// 集中为常量，避免前缀字面量在多处重复、改挂载点时日志与访问日志失配。
-	inboundPrefix = "/v1/"
+	// errFieldMaxBytes err_param / err_type / err_code 落日志的字节上限（防上游塞入超长文本）。
+	errFieldMaxBytes = 64
 )
 
 // 上游错误维度（诊断字段 err_scope，**不参与**状态机判定，仅用于事后分诊）：
@@ -102,7 +101,7 @@ func inboundPath(endpoint string) string {
 	if endpoint == "" || strings.HasPrefix(endpoint, "/") {
 		return endpoint
 	}
-	return inboundPrefix + endpoint
+	return InboundPrefix + endpoint
 }
 
 // diag 是一次上游调用的「落点现场」：只记录结构（地址、头名、鉴权头名与值指纹），不记录任何明文。
@@ -215,15 +214,18 @@ func upstreamErrParts(raw string) (param, errType, code, summary string) {
 		} `json:"error"`
 	}
 	if err := json.Unmarshal([]byte(raw), &v); err == nil && (v.Error.Message != "" || v.Error.Type != "" || v.Error.Code != "") {
-		return v.Error.Param, v.Error.Type, v.Error.Code, truncateLog(sanitizeErrSummary(v.Error.Message), errSummaryMaxBytes)
+		return cleanErrField(v.Error.Param), cleanErrField(v.Error.Type), cleanErrField(v.Error.Code),
+			truncateLog(sanitizeErrSummary(v.Error.Message), errSummaryMaxBytes)
 	}
 	return "", "", "", truncateLog(sanitizeErrSummary(raw), errSummaryMaxBytes)
 }
 
 // 上游可能在错误文案里回显它收到的凭据（如 "Incorrect API key provided: sk-abc…"）。
 // 三组样式覆盖常见写法：厂商前缀令牌、Bearer 头、key/token/secret=值。
+// 注意：前缀表只列**凭据**前缀。形如 glm-4-plus 的是模型名（glm- 是智谱的模型名前缀，
+// 其密钥并非该形态），列入会造成「模型标识被抹掉」，恰好破坏排查所需信息，故不纳入。
 var (
-	credValueRe  = regexp.MustCompile(`(?i)\b(?:sk|rk|pk|ak|gsk|xai|nvapi|hf|glm)[-_][A-Za-z0-9._\-]{6,}`)
+	credValueRe  = regexp.MustCompile(`(?i)\b(?:sk|rk|pk|ak|gsk|xai|nvapi|hf)[-_][A-Za-z0-9._\-]{6,}`)
 	credBearerRe = regexp.MustCompile(`(?i)\b(bearer)\s+[A-Za-z0-9._\-]{6,}`)
 	credKVRe     = regexp.MustCompile(`(?i)(api[\s_-]?key|access[\s_-]?token|secret|token)(\s*[:=]\s*)["']?[A-Za-z0-9._\-]{8,}`)
 )
@@ -234,6 +236,20 @@ func sanitizeErrSummary(s string) string {
 	s = credBearerRe.ReplaceAllString(s, "$1 ***")
 	s = credKVRe.ReplaceAllString(s, "$1$2***")
 	return s
+}
+
+// cleanErrField 对上游错误的短字段（param/type/code）做与摘要同样的清洗与截断：
+// 上游若把凭据回显在这些字段里，同样不得原样落盘。
+func cleanErrField(s string) string { return truncateLog(sanitizeErrSummary(s), errFieldMaxBytes) }
+
+// outcomeIsFailure 判定「已写出响应的一次转发」在语义上是否失败：
+// 计费失败 / 退款 / 流式中断均为失败（即便流式内容已下发、客户端状态码为 200），
+// 故请求级结论不得只看状态码，否则被截断的流式请求会被报成成功。
+func outcomeIsFailure(out *fwdOutcome) bool {
+	if out == nil {
+		return false
+	}
+	return out.billFailed || out.refundPre || out.interrupted
 }
 
 // modelScopeHints / credentialScopeHints 是上游报文的口径线索（小写匹配）。
@@ -375,11 +391,17 @@ func (g *Gateway) logReject(ctx context.Context, endpoint, model, reason string,
 		return
 	}
 	e := errInfo{kind: "rejected", stage: "request", downstream: status, reason: reason, durationMs: deref64(durationMs)}
-	g.logErr(ctx, slog.LevelWarn, "gateway request rejected", endpoint, "", model, token, nil, diag{}, e)
+	// 与内部 API / 访问日志同口径分级：本地 5xx 属服务端异常，必须落 Error，
+	// 否则按 Error 级别做的告警会漏掉这批真实故障。
+	lvl := slog.LevelWarn
+	if status >= http.StatusInternalServerError {
+		lvl = slog.LevelError
+	}
+	g.logErr(ctx, lvl, "gateway request rejected", endpoint, "", model, token, nil, diag{}, e)
 }
 
 // logUpstreamErr 记录一次「上游已参与」的失败：带上落点现场、上游状态码与报文口径。
-// masked 用于标记该失败已被后续候选掩盖（用户侧不可见）——这正是"用户正常、密钥被禁"的现场。
+// 候选级日志只给 retry（可能被掩盖）；是否**确实**被掩盖只由请求级 logOutcome 给出。
 func (g *Gateway) logUpstreamErr(ctx context.Context, lvl slog.Level, msg, endpoint, protocol, model string,
 	token *identity.Token, routeRes *router.RouteResult, d diag, e errInfo) {
 	if e.scope == "" && (e.summary != "" || e.param != "" || e.errType != "" || e.errCode != "") {
@@ -399,6 +421,11 @@ func (g *Gateway) logOutcome(ctx context.Context, lvl slog.Level, endpoint, mode
 		return
 	}
 	trail, failed := summarizeAttempts(attempts)
+	// 与候选级日志同口径：客户端类结论（4xx 且非「成功请求的隐性失败」）受开关控制，
+	// masked=true 表示请求确实成功，其隐性失败结论永不被关闭。
+	if status < http.StatusInternalServerError && !masked && !logger.ClientErrorLogEnabled() {
+		return
+	}
 	args := []any{
 		"endpoint", inboundPath(endpoint),
 		"model", model,
