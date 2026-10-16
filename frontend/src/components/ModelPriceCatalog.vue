@@ -150,6 +150,7 @@ defineExpose({ open: openCatalog })
         clearable
         style="width: 320px"
         @keyup.enter="onCatalogSearch"
+        @clear="onCatalogSearch"
       />
       <el-button type="primary" :loading="catLoading" :disabled="!catQ.trim()" @click="onCatalogSearch">搜索</el-button>
       <el-button :loading="catSyncing" plain @click="onSyncNow">立即同步 models.dev</el-button>

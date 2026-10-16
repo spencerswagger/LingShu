@@ -457,14 +457,23 @@ function onApplyCostCatalog(partial: Record<string, number>) {
   p.CostRates = { ...p.CostRates, ...partial }
 }
 
-// 从对外模型同步定价：用所绑定对外模型的售价/时段/分档覆盖当前内部模型的成本侧
-function syncFromExternal() {
+// 从对外模型同步定价：用所绑定对外模型的售价/时段/分档覆盖当前内部模型的成本侧（覆盖前二次确认）。
+async function syncFromExternal() {
   const p = currentPricing.value
   if (!p) return ElMessage.warning('尚未选中需要配置的模型')
   const extId = pendingRows.value.length ? activeRow.value?.ExternalModelID : editingForm.value.ExternalModelID
   if (extId == null) return ElMessage.warning('请先绑定一个对外模型')
   const em = externalModels.value.find((e) => String(e.ID) === String(extId))
   if (!em) return ElMessage.warning('未找到该对外模型（可能已停用）')
+  try {
+    await ElMessageBox.confirm(
+      `将用对外模型「${em.ExternalName}」的售价 / 时段 / 分档覆盖当前成本配置，确定继续？`,
+      '同步对外模型价格',
+      { type: 'warning', confirmButtonText: '覆盖', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
   p.CostRates = { ...(em.SaleRates || {}) }
   p.TimeConfig = em.TimeConfig ? JSON.parse(JSON.stringify(em.TimeConfig)) : null
   p.ContextTiers = em.ContextTiers ? JSON.parse(JSON.stringify(em.ContextTiers)) : null
