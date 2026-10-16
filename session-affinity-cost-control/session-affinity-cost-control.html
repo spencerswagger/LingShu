@@ -247,8 +247,38 @@ flowchart TD
       </table>
     </div>
 
-    <h3>其他情况：缓存读价差的方向不同，结论会反转</h3>
-    <p>「值不值得切主要取决于缓存价差」——对，但要补一句：<b>取决于缓存价差的方向与大小</b>。把 30144 个有序对按方向分类：</p>
+    <h3>三个变量各自的规律（不只缓存读）</h3>
+    <p>这才是"其他情况"的正解：<b>输入、缓存读、输出三个变量各有规律</b>。每轮（稳态）的节省其实是三项加权相加：</p>
+    <div class="formula">
+      <div class="f-label">每轮节省的构成</div>
+      <div class="f-body">
+        输入价差 <span class="op">×</span> 新增输入token数<br>
+        <span class="op">＋</span> 缓存读价差 <span class="op">×</span> 缓存读token数<br>
+        <span class="op">＋</span> 输出价差 <span class="op">×</span> 输出token数
+      </div>
+      <p class="f-note">价差均指「旧渠道单价 － 新渠道单价」。三项的权重就是各自的 token 数——谁权重大，谁主导结论。</p>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>变量</th><th>权重（token数）</th><th>主要生效区间</th><th>规律</th></tr></thead>
+        <tbody>
+          <tr><td>缓存读价差</td><td>缓存读token数（随会话增长）</td><td>长会话</td><td>正→越久越值得切；零→不影响；负→越久越不该切</td></tr>
+          <tr><td>输入价差</td><td>新增输入token数（每轮恒定）</td><td>短会话更突出</td><td>正→新渠道每次输入更省</td></tr>
+          <tr><td>输出价差</td><td>输出token数（每轮恒定、常较大）</td><td>所有会话；推理/长输出尤重</td><td>正→新渠道每次输出更省</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>关键：<b>短会话时缓存读项≈0，且重灌代价也≈0</b>（代价正比于缓存读量）——所以<b>短会话几乎只看输入/输出价差</b>；长会话缓存读项被放大，才由缓存读主导。输出价差每轮都生效，对推理/长输出会话权重最大。</p>
+    <p>再看三个维度各自的方向分布（30144 个有序对）：三者几乎一样——约 1/4 有利、1/2 同价、1/4 不利。</p>
+    <figure class="chart-figure">
+      <figcaption>图 3 · 三个价差维度的方向分布（30144 个有序对）
+        <span>输入、缓存读、输出三个维度都呈"约 1/4 新渠道更便宜、约一半同价、约 1/4 更贵"——所以不能只看缓存读一个维度。</span>
+      </figcaption>
+      <div id="chart-dimbar" style="width:100%;min-height:360px;"></div>
+    </figure>
+
+    <h3>缓存读维度：方向决定长期结论</h3>
+    <p>把 30144 个有序对按缓存读价差方向分类，长期走势随之不同：</p>
     <div class="table-wrap">
       <table>
         <thead><tr><th>缓存读价差方向</th><th>占比</th><th>长会话（缓存多）</th><th>短会话</th></tr></thead>
@@ -275,7 +305,7 @@ flowchart TD
       </table>
     </div>
     <figure class="chart-figure">
-      <figcaption>图 3 · 回本轮数随缓存读token数变化（三种新增输入/输出规模）
+      <figcaption>图 4 · 回本轮数随缓存读token数变化（三种新增输入/输出规模）
         <span>缓存读越大、回本越快（曲线向下）；新增输入与输出越大，整条曲线右移（更难回本）。三个 token 量都是变量——这就是"多维"。</span>
       </figcaption>
       <div id="chart-hcurve" style="width:100%;min-height:370px;"></div>
@@ -284,7 +314,7 @@ flowchart TD
     <h3>维度三：单对渠道的每轮花费（临界点）</h3>
     <p>两家渠道结构相反时（一家输入/输出便宜、缓存读贵；另一家相反），每轮花费随缓存读token数变化的曲线会相交：</p>
     <figure class="chart-figure">
-      <figcaption>图 4 · 每轮花费随缓存读token数变化（deepseek-v4-flash 真实价）
+      <figcaption>图 5 · 每轮花费随缓存读token数变化（deepseek-v4-flash 真实价）
         <span>两线交于约 1.35 万 token：其左 Venice AI 更省，其右 DeepSeek 更省。交点即临界点。</span>
       </figcaption>
       <div id="chart-perround" style="width:100%;min-height:370px;"></div>
@@ -320,7 +350,7 @@ flowchart TD
     </ul>
     <p>此外，把「未来可能还会再切」的因素计入摊销轮数的估计，也可进一步减少无谓切换。</p>
     <figure class="chart-figure">
-      <figcaption>图 5 · 各渠道价随时刻变化（示例：某渠道闲时 22–08，另一渠道闲时 00–06）
+      <figcaption>图 6 · 各渠道价随时刻变化（示例：某渠道闲时 22–08，另一渠道闲时 00–06）
         <span>「谁更省」随时间翻转，是「会多次切换」与「边界抖动」的共同来源。</span>
       </figcaption>
       <div id="chart-intraday" style="width:100%;min-height:340px;"></div>

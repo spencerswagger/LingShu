@@ -9,17 +9,19 @@
   function ready(id, fn) { if (document.getElementById(id)) fn(); }
   function rs(c) { window.addEventListener('resize', function () { c.resize(); }); }
   var baseGrid = { left: 8, right: 24, top: 48, bottom: 8, containLabel: true };
+  var kfmt = function (v) { return (v / 1000) + 'k'; };
 
-  /* ---------- 图：每轮花费 vs 缓存读token数（deepseek-v4-flash 真实价） ---------- */
+  /* ---------- 图：每轮花费 vs 缓存读token数（deepseek-v4-flash） ---------- */
   ready('chart-perround', function () {
     var crA = 0.028, inA = 0.138, ouA = 0.275;  // Venice AI
     var crB = 0.003, inB = 0.150, ouB = 0.600;  // DeepSeek
     var u = 1000, o = 1000;
     var base = (inA * u + ouA * o) / 1e6;
-    function cost(cr, pin, pou, C) { return (cr * C + pin * u + pou * o) / 1e6 / base; }
     var x = [], yA = [], yB = [];
-    for (var C = 0; C <= 40000; C += 2000) {
-      x.push(C); yA.push(+cost(crA, inA, ouA, C).toFixed(3)); yB.push(+cost(crB, inB, ouB, C).toFixed(3));
+    for (var C = 0; C <= 40000; C += 1000) {
+      x.push(C);
+      yA.push(+(((crA * C + inA * u + ouA * o) / 1e6) / base).toFixed(3));
+      yB.push(+(((crB * C + inB * u + ouB * o) / 1e6) / base).toFixed(3));
     }
     var c = echarts.init(document.getElementById('chart-perround'), null, { renderer: 'svg' });
     c.setOption({
@@ -29,13 +31,13 @@
       grid: baseGrid,
       xAxis: { type: 'category', name: '缓存读token数', nameLocation: 'middle', nameGap: 30, nameTextStyle: { color: muted },
         boundaryGap: false, data: x, axisLine: { lineStyle: { color: rule } }, axisTick: { show: false },
-        axisLabel: { color: muted, formatter: function (v) { return v / 1000 + 'k'; } } },
+        axisLabel: { color: muted, interval: 4, formatter: kfmt } },
       yAxis: { type: 'value', name: '每轮花费（基准=1）', nameTextStyle: { color: muted },
         axisLine: { show: false }, axisTick: { show: false }, splitLine: { lineStyle: { color: rule } }, axisLabel: { color: muted } },
       series: [
         { name: 'Venice AI（输入/输出便宜）', type: 'line', smooth: true, symbol: 'none', lineStyle: { width: 3 }, data: yA,
           markLine: { silent: true, symbol: 'none', lineStyle: { color: muted, type: 'dashed' },
-            label: { color: ink, fontWeight: 700, position: 'insideEndTop', formatter: '临界 ≈ 1.35 万 token' }, data: [{ xAxis: 7 }] } },
+            label: { color: ink, fontWeight: 700, position: 'insideEndTop', formatter: '临界 ≈ 1.35 万 token' }, data: [{ xAxis: 13 }] } },
         { name: 'DeepSeek（缓存读便宜）', type: 'line', smooth: true, symbol: 'none', lineStyle: { width: 3 }, data: yB }
       ]
     });
@@ -56,38 +58,74 @@
         data: labels, axisLine: { lineStyle: { color: rule } }, axisTick: { show: false }, axisLabel: { color: muted, fontSize: 11 } },
       yAxis: { type: 'value', name: '可切换对数', nameTextStyle: { color: muted },
         axisLine: { show: false }, axisTick: { show: false }, splitLine: { lineStyle: { color: rule } }, axisLabel: { color: muted } },
-      series: [{
-        type: 'bar', data: counts, barMaxWidth: 42, itemStyle: { borderRadius: [4, 4, 0, 0] },
+      series: [{ type: 'bar', data: counts, barMaxWidth: 42, itemStyle: { borderRadius: [4, 4, 0, 0] },
         label: { show: true, position: 'top', color: ink, fontSize: 10 },
         markLine: { silent: true, symbol: 'none', lineStyle: { color: accent2, type: 'dashed' },
-          label: { color: accent2, fontWeight: 700, formatter: '中位数落在 12–20 档（≈15 轮）' },
-          data: [{ xAxis: '12–20' }] }
-      }]
+          label: { color: accent2, fontWeight: 700, formatter: '中位（≈15 轮）落在 12–20 档' },
+          data: [{ xAxis: '12–20' }] } }]
     });
     rs(c);
   });
 
-  /* ---------- 图：回本轮数随 缓存读R 变化（三种 新增输入/输出 规模） ---------- */
+  /* ---------- 图：回本轮数随缓存读变化（5 种 新增输入/输出 规模，15 个数据点） ---------- */
   ready('chart-hcurve', function () {
-    var R = [20000, 30000, 60000, 120000, 240000];
-    var s1 = [18.0, 10.7, 7.6, 6.6, 6.2];      // 新增输入1000 / 输出1000
-    var s2 = [null, 58.0, 10.7, 7.6, 6.6];      // 新增输入2000 / 输出2000
-    var s3 = [null, null, 58.0, 10.7, 7.6];     // 新增输入4000 / 输出4000
+    var aO = 0.138, bO = 0.028, oO = 0.275;  // 旧
+    var aN = 0.150, bN = 0.003, oN = 0.600;  // 新
+    var R = [];
+    for (var r = 20000; r <= 300000; r += 20000) R.push(r);
+    var combos = [[500, 500], [1000, 1000], [2000, 2000], [4000, 4000], [8000, 8000]];
+    var colors = [accent, '#1E7F7F', muted, '#D97706', accent2];
+    var series = combos.map(function (cm, idx) {
+      var N = cm[0], O = cm[1];
+      var data = R.map(function (RR) {
+        var save = (bO - bN) * RR + (aO - aN) * N + (oO - oN) * O;
+        if (save <= 0) return null;
+        var h = (aN - bN) * RR / save;
+        return +h.toFixed(1);
+      });
+      return { name: '新增输入/输出 = ' + N + '/' + O, type: 'line', symbol: 'circle', symbolSize: 6,
+        lineStyle: { width: 2.5, color: colors[idx] }, itemStyle: { color: colors[idx] }, data: data, connectNulls: false };
+    });
     var c = echarts.init(document.getElementById('chart-hcurve'), null, { renderer: 'svg' });
     c.setOption({
-      animation: false, color: [accent, accent2, muted],
-      tooltip: { trigger: 'axis', appendToBody: true, valueFormatter: function (v) { return v + ' 轮'; } },
-      legend: { data: ['新增输入/输出 = 1000/1000', '= 2000/2000', '= 4000/4000'], textStyle: { color: muted }, top: 0 },
+      animation: false,
+      tooltip: { trigger: 'axis', appendToBody: true, valueFormatter: function (v) { return v === null ? '不回本' : v + ' 轮'; } },
+      legend: { data: series.map(function (s) { return s.name; }), textStyle: { color: muted, fontSize: 11 }, top: 0 },
       grid: baseGrid,
       xAxis: { type: 'category', name: '缓存读token数', nameLocation: 'middle', nameGap: 30, nameTextStyle: { color: muted },
         boundaryGap: false, data: R, axisLine: { lineStyle: { color: rule } }, axisTick: { show: false },
-        axisLabel: { color: muted, formatter: function (v) { return v / 1000 + 'k'; } } },
+        axisLabel: { color: muted, rotation: 30, formatter: kfmt } },
       yAxis: { type: 'value', name: '回本轮数', nameTextStyle: { color: muted }, max: 70,
         axisLine: { show: false }, axisTick: { show: false }, splitLine: { lineStyle: { color: rule } }, axisLabel: { color: muted } },
+      series: series
+    });
+    rs(c);
+  });
+
+  /* ---------- 图：三个价差维度的方向分布（30144 有序对） ---------- */
+  ready('chart-dimbar', function () {
+    var cats = ['输入价差', '缓存读价差', '输出价差'];
+    var cheaper = [24.4, 26.4, 24.2];  // 新渠道更便宜
+    var same = [51.1, 47.1, 51.5];     // 同价
+    var pricier = [24.4, 26.4, 24.2];  // 新渠道更贵
+    var c = echarts.init(document.getElementById('chart-dimbar'), null, { renderer: 'svg' });
+    c.setOption({
+      animation: false,
+      tooltip: { trigger: 'axis', appendToBody: true, axisPointer: { type: 'shadow' },
+        valueFormatter: function (v) { return v.toFixed(1) + '%'; } },
+      legend: { data: ['新渠道更便宜', '同价', '新渠道更贵'], textStyle: { color: muted }, top: 0 },
+      grid: baseGrid,
+      xAxis: { type: 'category', data: cats, axisLine: { lineStyle: { color: rule } }, axisTick: { show: false }, axisLabel: { color: ink, fontSize: 13 } },
+      yAxis: { type: 'value', name: '占全部有序对', nameTextStyle: { color: muted }, max: 60,
+        axisLine: { show: false }, axisTick: { show: false }, splitLine: { lineStyle: { color: rule } },
+        axisLabel: { color: muted, formatter: '{value}%' } },
       series: [
-        { name: '新增输入/输出 = 1000/1000', type: 'line', symbol: 'circle', symbolSize: 7, lineStyle: { width: 2.5 }, data: s1 },
-        { name: '= 2000/2000', type: 'line', symbol: 'circle', symbolSize: 7, lineStyle: { width: 2.5 }, data: s2, connectNulls: false },
-        { name: '= 4000/4000', type: 'line', symbol: 'circle', symbolSize: 7, lineStyle: { width: 2.5 }, data: s3, connectNulls: false }
+        { name: '新渠道更便宜', type: 'bar', data: cheaper, barMaxWidth: 46, itemStyle: { color: accent, borderRadius: [4, 4, 0, 0] },
+          label: { show: true, position: 'top', color: ink, fontSize: 10, formatter: '{c}%' } },
+        { name: '同价', type: 'bar', data: same, barMaxWidth: 46, itemStyle: { color: '#B9B6AC', borderRadius: [4, 4, 0, 0] },
+          label: { show: true, position: 'top', color: ink, fontSize: 10, formatter: '{c}%' } },
+        { name: '新渠道更贵', type: 'bar', data: pricier, barMaxWidth: 46, itemStyle: { color: accent2, borderRadius: [4, 4, 0, 0] },
+          label: { show: true, position: 'top', color: ink, fontSize: 10, formatter: '{c}%' } }
       ]
     });
     rs(c);
