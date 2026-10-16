@@ -354,6 +354,27 @@ export function pullChannelProtocolModels(id: string, apiKey: string) {
     { ApiKey: apiKey },
   )
 }
+// 渠道协议预设包：{ "<id>": Provider }（含 gateway 块），导出/导入共用
+export interface ChannelProtocolPack {
+  [key: string]: unknown
+}
+// 导入结果统计
+export interface ChannelProtocolBackupResult {
+  Created: number
+  Skipped: number
+  Warnings: string[]
+}
+// 导出全部渠道协议为预设包 JSON
+export function exportChannelProtocols() {
+  return http.get<ChannelProtocolPack, ApiRes<ChannelProtocolPack>>('/admin/channel-protocols/export')
+}
+// 从预设包 JSON 导入渠道协议（按名称/来源去重，仅新增不覆盖）
+export function importChannelProtocols(pack: ChannelProtocolPack) {
+  return http.post<ChannelProtocolBackupResult, ApiRes<ChannelProtocolBackupResult>>(
+    '/admin/channel-protocols/import',
+    pack,
+  )
+}
 
 // 渠道密钥（channel_keys·运行时实体）：凭据只出尾号，状态三态独立流转
 export interface ChannelKey {
