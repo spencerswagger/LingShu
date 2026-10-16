@@ -10,47 +10,48 @@
   function rs(c) { window.addEventListener('resize', function () { c.resize(); }); }
   var baseGrid = { left: 8, right: 24, top: 48, bottom: 8, containLabel: true };
 
-  /* ---------- 图1：每轮成本 vs 当前上下文大小（缓存命中） ---------- */
+  /* ---------- 图：每轮花费 vs 缓存读token数（真实价：deepseek-v4-flash） ---------- */
   ready('chart-perround', function () {
-    var cA = 0.2, iA = 2, oA = 8;   // A 缓存便宜型
-    var cB = 0.8, iB = 0.8, oB = 0.8; // B 均衡型
-    var u = 1000, o = 1000;         // 本轮新增输入 / 输出
-    function perTurn(pcr, pin, pout, C) { return (C * pcr + u * pin + o * pout) / 1e6; }
+    // Venice AI: IO 便宜、缓存读贵；DeepSeek: 缓存读便宜、输出贵（单位 美元/百万token，相对比较）
+    var crA = 0.028, inA = 0.138, ouA = 0.275;
+    var crB = 0.003, inB = 0.150, ouB = 0.600;
+    var u = 1000, o = 1000;
+    var base = (inA * u + ouA * o) / 1e6; // 归一化基准
+    function cost(cr, pin, pou, C) { return (cr * C + pin * u + pou * o) / 1e6 / base; }
     var x = [], yA = [], yB = [];
     for (var C = 0; C <= 40000; C += 2000) {
-      x.push(C); yA.push(+perTurn(cA, iA, oA, C).toFixed(5)); yB.push(+perTurn(cB, iB, oB, C).toFixed(5));
+      x.push(C); yA.push(+cost(crA, inA, ouA, C).toFixed(3)); yB.push(+cost(crB, inB, ouB, C).toFixed(3));
     }
-    var cross = 14000; // 0.2C+10000 = 0.8C+1600
     var c = echarts.init(document.getElementById('chart-perround'), null, { renderer: 'svg' });
     c.setOption({
       animation: false, color: [accent2, accent],
-      tooltip: { trigger: 'axis', appendToBody: true, valueFormatter: function (v) { return v.toFixed(4) + ' 元'; } },
-      legend: { data: ['A 缓存便宜型', 'B 均衡型'], textStyle: { color: muted }, top: 0 },
+      tooltip: { trigger: 'axis', appendToBody: true, valueFormatter: function (v) { return v.toFixed(2) + '×'; } },
+      legend: { data: ['Venice AI（输入/输出便宜）', 'DeepSeek（缓存读便宜）'], textStyle: { color: muted }, top: 0 },
       grid: baseGrid,
-      xAxis: { type: 'category', name: '缓存读 token 数（≈ 当前上下文）', nameLocation: 'middle', nameGap: 30, nameTextStyle: { color: muted },
+      xAxis: { type: 'category', name: '缓存读token数', nameLocation: 'middle', nameGap: 30, nameTextStyle: { color: muted },
         boundaryGap: false, data: x, axisLine: { lineStyle: { color: rule } }, axisTick: { show: false },
         axisLabel: { color: muted, formatter: function (v) { return v / 1000 + 'k'; } } },
-      yAxis: { type: 'value', name: '每轮成本（元）', nameTextStyle: { color: muted },
+      yAxis: { type: 'value', name: '每轮花费（基准=1）', nameTextStyle: { color: muted },
         axisLine: { show: false }, axisTick: { show: false }, splitLine: { lineStyle: { color: rule } },
-        axisLabel: { color: muted, formatter: function (v) { return v.toFixed(2); } } },
+        axisLabel: { color: muted } },
       series: [
-        { name: 'A 缓存便宜型', type: 'line', smooth: true, symbol: 'none', lineStyle: { width: 3 }, data: yA,
+        { name: 'Venice AI（输入/输出便宜）', type: 'line', smooth: true, symbol: 'none', lineStyle: { width: 3 }, data: yA,
           markLine: { silent: true, symbol: 'none', lineStyle: { color: muted, type: 'dashed' },
-            label: { color: ink, fontWeight: 700, position: 'insideEndTop', formatter: '交叉 ≈ 14k token' },
+            label: { color: ink, fontWeight: 700, position: 'insideEndTop', formatter: '临界 ≈ 1.35 万 token' },
             data: [{ xAxis: 7 }] } },
-        { name: 'B 均衡型', type: 'line', smooth: true, symbol: 'none', lineStyle: { width: 3 }, data: yB }
+        { name: 'DeepSeek（缓存读便宜）', type: 'line', smooth: true, symbol: 'none', lineStyle: { width: 3 }, data: yB }
       ]
     });
     rs(c);
   });
 
-  /* ---------- 图2：闲忙时——各渠道价随时刻变 ---------- */
+  /* ---------- 图：各渠道价随时刻变（闲忙时） ---------- */
   ready('chart-intraday', function () {
     var hours = [], A = [], B = [];
     for (var h = 0; h < 24; h++) {
       hours.push((h < 10 ? '0' + h : '' + h) + ':00');
-      A.push((h >= 22 || h < 8) ? 0.5 : 1.0);  // A 闲时 22–08
-      B.push((h < 6) ? 0.275 : 1.1);           // B 闲时 00–06
+      A.push((h >= 22 || h < 8) ? 0.5 : 1.0);
+      B.push((h < 6) ? 0.275 : 1.1);
     }
     var c = echarts.init(document.getElementById('chart-intraday'), null, { renderer: 'svg' });
     c.setOption({
@@ -70,7 +71,6 @@
     rs(c);
   });
 
-  /* ---------- Mermaid ---------- */
   if (window.mermaid) {
     mermaid.initialize({ startOnLoad: true, theme: 'neutral', securityLevel: 'loose' });
   }
