@@ -24,8 +24,8 @@ const auth = useAuthStore()
 // 管理端菜单
 const menus = [
   { path: '/admin/dashboard', title: '统计', icon: Odometer },
+  { path: '/admin/service-status', title: '状态', icon: Monitor },
   { path: '/admin/channels', title: '渠道', icon: Connection },
-  { path: '/admin/service-status', title: '服务状态', icon: Monitor },
   { path: '/admin/models', title: '模型', icon: Cpu },
   { path: '/admin/tags', title: '标签', icon: PriceTag },
   { path: '/admin/users', title: '用户', icon: User },
