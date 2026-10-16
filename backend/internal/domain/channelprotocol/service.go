@@ -56,6 +56,9 @@ type Service struct {
 	logger *slog.Logger
 	// packURL 预设站点地址：为空表示未配置（不拉取，AC-12）。
 	packURL string
+	// refresher 协议变更后回调（装配层注入）：按协议 ID 刷新引用渠道的模型与运行时；
+	// nil 表示未装配（跳过，保持现状）。
+	refresher func(ctx context.Context, protocolID int64) error
 }
 
 // NewService 创建渠道协议服务。
@@ -65,6 +68,22 @@ func NewService(store *Store) *Service {
 
 // SetPackURL 注入预设站点地址（来自环境变量配置）。
 func (s *Service) SetPackURL(url string) { s.packURL = strings.TrimSpace(url) }
+
+// SetChannelRefresher 注入协议变更后的引用渠道刷新钩子（CRUD/Sync/InitialSync 成功后调用）。
+// 刷新为最终一致：回调失败仅记日志，不使协议主操作失败。
+func (s *Service) SetChannelRefresher(fn func(ctx context.Context, protocolID int64) error) {
+	s.refresher = fn
+}
+
+// notifyRefresh 以协议 ID 回调刷新钩子（未装配则跳过；失败仅记日志）。
+func (s *Service) notifyRefresh(ctx context.Context, protocolID int64) {
+	if s.refresher == nil {
+		return
+	}
+	if err := s.refresher(ctx, protocolID); err != nil {
+		s.logger.Error("refresh channels for channel protocol failed", "protocol_id", protocolID, "err", err)
+	}
+}
 
 // SetHTTPClient 注入 HTTP 客户端（测试用）。
 func (s *Service) SetHTTPClient(c *http.Client) {
@@ -161,6 +180,7 @@ func (s *Service) Create(ctx context.Context, in ChannelProtocol) (*ChannelProto
 		}
 		return nil, fmt.Errorf("create channel protocol: %w", err)
 	}
+	s.notifyRefresh(ctx, created.ID)
 	return created, nil
 }
 
@@ -189,6 +209,7 @@ func (s *Service) Update(ctx context.Context, id int64, in ChannelProtocol) (*Ch
 		}
 		return nil, fmt.Errorf("update channel protocol: %w", err)
 	}
+	s.notifyRefresh(ctx, id)
 	return &cp, nil
 }
 
@@ -210,6 +231,7 @@ func (s *Service) Delete(ctx context.Context, id int64) error {
 		}
 		return fmt.Errorf("delete channel protocol: %w", err)
 	}
+	s.notifyRefresh(ctx, id)
 	return nil
 }
 
@@ -276,6 +298,7 @@ func (s *Service) Sync(ctx context.Context, confirm bool) (*SyncResult, error) {
 	sort.Strings(keys)
 	// 全部写入（新增/覆盖/标记 STALE）收敛在同一事务内，保证预设同步原子：
 	// 任一条失败整体回滚，避免出现「同步半完成」的中间态。
+	var changed []int64 // 本次事务内发生变更的协议 ID（提交成功后回调刷新引用渠道）
 	err = s.store.WithTx(ctx, func(tx *sql.Tx) error {
 		for _, key := range keys {
 			p := pack[key]
@@ -289,9 +312,11 @@ func (s *Service) Sync(ctx context.Context, confirm bool) (*SyncResult, error) {
 			seen[sid] = true
 			cur := bySource[sid]
 			if cur == nil {
-				if _, ierr := insertOn(ctx, tx, cand); ierr != nil {
+				created, ierr := insertOn(ctx, tx, cand)
+				if ierr != nil {
 					return fmt.Errorf("insert preset channel protocol %s: %w", sid, ierr)
 				}
+				changed = append(changed, created.ID)
 				res.Applied++
 				continue
 			}
@@ -300,6 +325,7 @@ func (s *Service) Sync(ctx context.Context, confirm bool) (*SyncResult, error) {
 				if oerr := s.overwriteFromPreset(ctx, tx, cur, cand); oerr != nil {
 					return oerr
 				}
+				changed = append(changed, cur.ID)
 				res.Applied++
 				continue
 			}
@@ -307,6 +333,7 @@ func (s *Service) Sync(ctx context.Context, confirm bool) (*SyncResult, error) {
 				if oerr := s.overwriteFromPreset(ctx, tx, cur, cand); oerr != nil {
 					return oerr
 				}
+				changed = append(changed, cur.ID)
 				res.Applied++
 				continue
 			}
@@ -326,6 +353,7 @@ func (s *Service) Sync(ctx context.Context, confirm bool) (*SyncResult, error) {
 			if uerr := updateSourceStatusOn(ctx, tx, e.ID, SourceStale); uerr != nil {
 				return fmt.Errorf("mark channel protocol stale id=%d: %w", e.ID, uerr)
 			}
+			changed = append(changed, e.ID)
 			res.Pending = append(res.Pending, SyncPending{
 				Id: strconv.FormatInt(e.ID, 10), Name: e.Name, Diff: "预设来源已失效（保留协议）",
 				Edited: e.Edited, Stale: true,
@@ -335,6 +363,9 @@ func (s *Service) Sync(ctx context.Context, confirm bool) (*SyncResult, error) {
 	})
 	if err != nil {
 		return nil, err
+	}
+	for _, id := range changed {
+		s.notifyRefresh(ctx, id)
 	}
 	return res, nil
 }

@@ -1,13 +1,16 @@
 <script setup lang="ts">
 import { ref, watch } from 'vue'
-import { Plus, Delete } from '@element-plus/icons-vue'
+import { Plus, Delete, ArrowDown } from '@element-plus/icons-vue'
 
 // 键值对行内编辑器（非弹窗）：以 Record<string,string> 作为 v-model，
 // 内部转为行数组以便行内增删编辑。空的 key 行在提交时自动过滤。
+// keySuggestions / valueSuggestions 作为下拉候选：键可选项 + 值（变量）可插入项，用户仍可自行输入。
 const props = defineProps<{
   modelValue?: Record<string, string>
   keyPlaceholder?: string
   valuePlaceholder?: string
+  keySuggestions?: string[]
+  valueSuggestions?: string[]
 }>()
 const emit = defineEmits<{
   (e: 'update:modelValue', v: Record<string, string>): void
@@ -39,16 +42,35 @@ function emitChange() {
   }
   emit('update:modelValue', map)
 }
+// 变量插入：把所选变量追加到当前值末尾
+function insertValue(index: number, token: string) {
+  const r = rows.value[index]
+  r.value = r.value ? r.value + token : token
+  emitChange()
+}
 </script>
 
 <template>
   <div class="kvp-editor">
     <div v-for="(row, i) in rows" :key="i" class="kvp-row">
-      <el-input
+      <el-select
+        v-if="keySuggestions && keySuggestions.length"
         :model-value="row.key"
-        placeholder="键"
-        size="small"
-        :class="{ 'kvp-key': true }"
+        filterable
+        allow-create
+        default-first-option
+        clearable
+        class="kvp-key"
+        :placeholder="keyPlaceholder || '键'"
+        @update:model-value="(v: string) => { row.key = v || ''; emitChange() }"
+      >
+        <el-option v-for="s in keySuggestions" :key="s" :label="s" :value="s" />
+      </el-select>
+      <el-input
+        v-else
+        :model-value="row.key"
+        :placeholder="keyPlaceholder || '键'"
+        class="kvp-key"
         :input-style="{ fontFamily: 'monospace' }"
         @update:model-value="row.key = $event; emitChange()"
       />
@@ -56,20 +78,29 @@ function emitChange() {
       <el-input
         :model-value="row.value"
         :placeholder="valuePlaceholder || '值'"
-        size="small"
         :input-style="{ fontFamily: 'monospace' }"
         @update:model-value="row.value = $event; emitChange()"
-      />
+      >
+        <template v-if="valueSuggestions && valueSuggestions.length" #append>
+          <el-dropdown trigger="click" @command="(v: string) => insertValue(i, v)">
+            <el-button :icon="ArrowDown" />
+            <template #dropdown>
+              <el-dropdown-menu>
+                <el-dropdown-item v-for="v in valueSuggestions" :key="v" :command="v">{{ v }}</el-dropdown-item>
+              </el-dropdown-menu>
+            </template>
+          </el-dropdown>
+        </template>
+      </el-input>
       <el-button
         type="danger"
         text
-        size="small"
         class="kvp-del"
         :icon="Delete"
         @click="removeRow(i)"
       />
     </div>
-    <el-button size="small" :icon="Plus" class="kvp-add" @click="addRow">添加键值对</el-button>
+    <el-button :icon="Plus" class="kvp-add" @click="addRow">添加键值对</el-button>
   </div>
 </template>
 

@@ -83,6 +83,13 @@ async function confirmSync() {
   }
 }
 
+// 点击整行进入编辑；点击操作列（图标按钮）不跳转
+function onRowClick(row: ChannelProtocolView, _column: unknown, event: Event) {
+  const el = event?.target as HTMLElement | null
+  if (el?.closest('.op-cell')) return
+  router.push(`/admin/channel-protocols/${row.ID}/edit`)
+}
+
 async function onDelete(row: ChannelProtocolView) {
   try {
     await ElMessageBox.confirm(`确认删除渠道协议「${row.Name}」吗？引用它的渠道将回退到内联配置。`, '删除确认', {
@@ -115,7 +122,7 @@ async function onDelete(row: ChannelProtocolView) {
     </div>
 
     <div v-loading="loading" class="card">
-      <el-table :data="list" border stripe class="table-nowrap" row-key="ID">
+      <el-table :data="list" border stripe class="table-nowrap clickable-rows" row-key="ID" @row-click="onRowClick">
         <el-table-column label="名称" min-width="200">
           <template #default="{ row }">
             <div class="t-time">
@@ -134,7 +141,7 @@ async function onDelete(row: ChannelProtocolView) {
         </el-table-column>
         <el-table-column label="操作" width="110" align="right" fixed="right">
           <template #default="{ row }">
-            <div class="op-cell">
+            <div class="op-cell" @click.stop>
               <el-tooltip content="编辑" placement="top">
                 <el-icon class="op-icon" @click="router.push(`/admin/channel-protocols/${row.ID}/edit`)"><Edit /></el-icon>
               </el-tooltip>

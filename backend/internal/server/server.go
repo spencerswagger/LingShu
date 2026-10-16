@@ -133,6 +133,7 @@ func (s *Server) routes() {
 		admin.HandleFunc("GET /api/v1/admin/channel-protocols/{id}", d.ChannelProto.HandleGet)
 		admin.HandleFunc("PUT /api/v1/admin/channel-protocols/{id}", d.ChannelProto.HandleUpdate)
 		admin.HandleFunc("DELETE /api/v1/admin/channel-protocols/{id}", d.ChannelProto.HandleDelete)
+		admin.HandleFunc("POST /api/v1/admin/channel-protocols/{id}/models/pull", d.ChannelProto.HandlePullModels)
 	}
 
 	// 渠道密钥（channel_keys 运行时实体）

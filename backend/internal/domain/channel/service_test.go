@@ -2,6 +2,7 @@ package channel
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"regexp"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/team/llmgateway/internal/domain/channelprotocol"
 	"github.com/team/llmgateway/internal/pkg/resp"
 )
 
@@ -289,5 +291,129 @@ func TestService_ListProbeLogs_AggregatesChannelKeys(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("mock expectations: %v", err)
+	}
+}
+
+// ---- 渠道协议物化 ----
+
+const cpByIdRe = `(?s)SELECT .* FROM channel_protocols WHERE id=\$1 AND deleted_at IS NULL`
+
+func cpProtoRow(id int64, baseURL, modelsJSON string) *sqlmock.Rows {
+	now := time.Now()
+	return sqlmock.NewRows([]string{"id", "name", "base_url", "protocols", "request_headers",
+		"models", "preset_source_id", "edited", "source_status", "created_at", "updated_at"}).
+		AddRow(id, "p", baseURL, `{"openai-chat":{}}`, `{"passthroughMode":"none"}`, modelsJSON, "", true,
+			channelprotocol.SourceActive, now, now)
+}
+
+func TestStore_ListByProtocol(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+	s := NewStore(db)
+	now := time.Now()
+	pid := int64(7)
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + channelCols + ` FROM channels WHERE channel_protocol_id = $1 AND deleted_at IS NULL ORDER BY id ASC`)).
+		WithArgs(pid).
+		WillReturnRows(channelRow(&Channel{
+			ID: 3, Name: "c", Protocol: "openai-chat", ChannelProtocolID: &pid,
+			Priority: 100, CreatedAt: now, UpdatedAt: now,
+		}))
+
+	chs, err := s.ListByProtocol(context.Background(), pid)
+	if err != nil {
+		t.Fatalf("list by protocol: %v", err)
+	}
+	if len(chs) != 1 || chs[0].ID != 3 {
+		t.Fatalf("unexpected channels: %+v", chs)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("expectations: %v", err)
+	}
+}
+
+// RematerializeProtocol：仅物化 externalModelID>0 的行；已存在的按 (channel,internal) upsert 并保留 State。
+func TestService_RematerializeProtocol_InsertsAndPreservesState(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+	svc := NewService(NewStore(db))
+	svc.SetChannelModelStore(NewChannelModelStore(db))
+	svc.SetChannelProtocolStore(channelprotocol.NewStore(db))
+	now := time.Now()
+	pid := int64(7)
+
+	modelsJSON := `{"qwen-max":{"externalModelID":"2","costRates":{"input":1,"output":2,"cache_read":0.1,"cache_write":0.2,"reasoning":1},"protocols":{"openai-chat":{}}},` +
+		`"qwen-plus":{"externalModelID":"5"},"no-bind":{"externalModelID":"0"}}`
+	mock.ExpectQuery(cpByIdRe).WithArgs(pid).WillReturnRows(cpProtoRow(7, "https://x.example.com", modelsJSON))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + channelCols + ` FROM channels WHERE channel_protocol_id = $1 AND deleted_at IS NULL ORDER BY id ASC`)).
+		WithArgs(pid).
+		WillReturnRows(channelRow(&Channel{ID: 1, Name: "c", Protocol: "openai-chat", ChannelProtocolID: &pid, Priority: 100, CreatedAt: now, UpdatedAt: now}))
+
+	cmGetRe := `(?s)SELECT .* FROM channel_models WHERE channel_id=\$1 AND internal_model_id=\$2 AND deleted_at IS NULL ORDER BY id ASC LIMIT 1`
+	// qwen-max：不存在 → Insert（NORMAL）。
+	mock.ExpectQuery(cmGetRe).WithArgs(int64(1), "qwen-max").WillReturnError(sql.ErrNoRows)
+	mock.ExpectQuery(`INSERT INTO channel_models`).
+		WillReturnRows(cmRow(&ChannelModel{ID: 100, ChannelID: 1, InternalModelID: "qwen-max", ExternalModelID: 2, State: StateNormal, CreatedAt: now, UpdatedAt: now}, `{}`))
+	// qwen-plus：已存在（DRAIN）→ Update 且 state 仍为 DRAIN。
+	mock.ExpectQuery(cmGetRe).WithArgs(int64(1), "qwen-plus").
+		WillReturnRows(cmRow(&ChannelModel{ID: 9, ChannelID: 1, InternalModelID: "qwen-plus", ExternalModelID: 5, State: StateDrain, CreatedAt: now, UpdatedAt: now}, `{}`))
+	mock.ExpectExec(`UPDATE channel_models SET`).
+		WithArgs("qwen-plus", int64(5), sqlmock.AnyArg(), nil, nil, nil, "DRAIN", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), int64(9)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := svc.RematerializeProtocol(context.Background(), pid); err != nil {
+		t.Fatalf("rematerialize: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("expectations: %v", err)
+	}
+}
+
+// 渠道引用协议时 CreateChannel 自动物化 channel_models。
+func TestService_CreateChannel_AutoMaterializesFromProtocol(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+	svc := NewService(NewStore(db))
+	svc.SetChannelModelStore(NewChannelModelStore(db))
+	svc.SetChannelProtocolStore(channelprotocol.NewStore(db))
+	now := time.Now()
+	pid := int64(7)
+	modelsJSON := `{"qwen-max":{"externalModelID":"2"}}`
+
+	// 引用协议存在性校验。
+	mock.ExpectQuery(cpByIdRe).WithArgs(pid).WillReturnRows(cpProtoRow(7, "https://x.example.com", modelsJSON))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + channelCols + ` FROM channels WHERE name = $1`)).
+		WithArgs("c1").WillReturnRows(sqlmock.NewRows(nil))
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta(insertChannelSQL)).
+		WillReturnRows(channelRow(&Channel{ID: 1, Name: "c1", ChannelProtocolID: &pid, Priority: 100, CreatedAt: now, UpdatedAt: now}))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM channel_tags WHERE channel_id = $1`)).
+		WithArgs(int64(1)).WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectCommit()
+
+	// 物化：再读协议 → 查模型 → 插入。
+	mock.ExpectQuery(cpByIdRe).WithArgs(pid).WillReturnRows(cpProtoRow(7, "https://x.example.com", modelsJSON))
+	mock.ExpectQuery(`(?s)SELECT .* FROM channel_models WHERE channel_id=\$1 AND internal_model_id=\$2 AND deleted_at IS NULL ORDER BY id ASC LIMIT 1`).
+		WithArgs(int64(1), "qwen-max").WillReturnError(sql.ErrNoRows)
+	mock.ExpectQuery(`INSERT INTO channel_models`).
+		WillReturnRows(cmRow(&ChannelModel{ID: 200, ChannelID: 1, InternalModelID: "qwen-max", ExternalModelID: 2, State: StateNormal, CreatedAt: now, UpdatedAt: now}, `{}`))
+
+	ch, err := svc.CreateChannel(context.Background(), ChannelInput{Name: "c1", ChannelProtocolID: &pid})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if ch.ID != 1 {
+		t.Fatalf("unexpected channel: %+v", ch)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("expectations: %v", err)
 	}
 }

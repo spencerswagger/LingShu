@@ -649,7 +649,8 @@ func (p *defaultConfigProvider) TimeConfig() (TimeCoeffConfig, error) {
 		return TimeCoeffConfig{}, err
 	}
 	var tc TimeCoeffConfig
-	if err := json.Unmarshal(raw, &tc); err != nil {
+	tc, err = ParseTimeConfig(raw)
+	if err != nil {
 		return TimeCoeffConfig{}, fmt.Errorf("解析 time_config: %w", err)
 	}
 

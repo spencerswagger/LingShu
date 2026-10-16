@@ -61,9 +61,9 @@ function removeRow(index: number) {
       >
         <el-option v-for="s in suggestions" :key="s" :label="s" :value="s" />
       </el-select>
-      <el-button type="danger" text size="small" class="sle-del" :icon="Delete" @click="removeRow(i)" />
+      <el-button type="danger" text class="sle-del" :icon="Delete" @click="removeRow(i)" />
     </div>
-    <el-button size="small" :icon="Plus" class="sle-add" @click="addRow">添加一项</el-button>
+    <el-button :icon="Plus" class="sle-add" @click="addRow">添加一项</el-button>
   </div>
 </template>
 

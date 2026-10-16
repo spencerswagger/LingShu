@@ -240,3 +240,135 @@ func TestInitialSync_MarksWhenFirstRun(t *testing.T) {
 		t.Fatalf("expectations: %v", err)
 	}
 }
+
+// ---- 变更刷新钩子（SetChannelRefresher） ----
+
+func TestCreate_InvokesRefresher(t *testing.T) {
+	svc, mock := newTestService(t, "")
+	var got int64
+	svc.SetChannelRefresher(func(_ context.Context, id int64) error { got = id; return nil })
+
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + cpCols + ` FROM channel_protocols WHERE name=$1 AND deleted_at IS NULL`)).
+		WithArgs("p1").WillReturnError(sql.ErrNoRows)
+	mock.ExpectQuery(`INSERT INTO channel_protocols`).
+		WillReturnRows(cpRow(42, "p1", "https://x.example.com", "", true, SourceActive))
+
+	cp, err := svc.Create(context.Background(), ChannelProtocol{Name: "p1", BaseURL: "https://x.example.com"})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if got != cp.ID || got != 42 {
+		t.Fatalf("期望刷新钩子以协议 ID 回调，got %d (cp.ID=%d)", got, cp.ID)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("expectations: %v", err)
+	}
+}
+
+func TestUpdate_InvokesRefresher(t *testing.T) {
+	svc, mock := newTestService(t, "")
+	var got int64
+	svc.SetChannelRefresher(func(_ context.Context, id int64) error { got = id; return nil })
+
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + cpCols + ` FROM channel_protocols WHERE id=$1 AND deleted_at IS NULL`)).
+		WithArgs(int64(5)).WillReturnRows(cpRow(5, "old", "https://x.example.com", "", true, SourceActive))
+	mock.ExpectExec(`UPDATE channel_protocols SET`).WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if _, err := svc.Update(context.Background(), 5, ChannelProtocol{Name: "new", BaseURL: "https://x.example.com"}); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if got != 5 {
+		t.Fatalf("期望刷新钩子以 5 回调，got %d", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("expectations: %v", err)
+	}
+}
+
+func TestDelete_InvokesRefresher(t *testing.T) {
+	svc, mock := newTestService(t, "")
+	var got int64
+	svc.SetChannelRefresher(func(_ context.Context, id int64) error { got = id; return nil })
+
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + cpCols + ` FROM channel_protocols WHERE id=$1 AND deleted_at IS NULL`)).
+		WithArgs(int64(8)).WillReturnRows(cpRow(8, "p", "https://x.example.com", "", true, SourceActive))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT COUNT(*) FROM channels WHERE channel_protocol_id=$1 AND deleted_at IS NULL`)).
+		WithArgs(int64(8)).WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(0)))
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE channel_protocols SET deleted_at=now(), updated_at=now() WHERE id=$1 AND deleted_at IS NULL`)).
+		WithArgs(int64(8)).WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := svc.Delete(context.Background(), 8); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if got != 8 {
+		t.Fatalf("期望刷新钩子以 8 回调，got %d", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("expectations: %v", err)
+	}
+}
+
+func TestSync_InvokesRefresher(t *testing.T) {
+	svc, mock := newTestService(t, "http://x")
+	var got []int64
+	svc.SetChannelRefresher(func(_ context.Context, id int64) error { got = append(got, id); return nil })
+
+	mock.ExpectQuery(`SELECT .* FROM channel_protocols WHERE deleted_at IS NULL AND preset_source_id <> '' ORDER BY id ASC`).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "base_url", "protocols", "request_headers",
+			"models", "preset_source_id", "edited", "source_status", "created_at", "updated_at"}))
+	mock.ExpectBegin()
+	mock.ExpectQuery(`INSERT INTO channel_protocols`).
+		WillReturnRows(cpRow(11, "OpenCode Zen", "https://opencode.ai/zen/v1", "opencode-zen", false, SourceActive))
+	mock.ExpectCommit()
+
+	if _, err := svc.Sync(context.Background(), false); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	if len(got) != 1 || got[0] != 11 {
+		t.Fatalf("期望同步成功后以变更协议 11 回调刷新，got %v", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("expectations: %v", err)
+	}
+}
+
+// ---- 协议模型拉取（/models） ----
+
+func TestPullModels_Success(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/models" {
+			t.Errorf("path want /models, got %s", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer sk-temp" {
+			t.Errorf("auth want Bearer sk-temp, got %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"qwen-max","object":"model","owned_by":"aliyun"}]}`))
+	}))
+	defer up.Close()
+
+	svc, mock := newTestService(t, "")
+	svc.SetHTTPClient(up.Client())
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + cpCols + ` FROM channel_protocols WHERE id=$1 AND deleted_at IS NULL`)).
+		WithArgs(int64(9)).WillReturnRows(cpRow(9, "P", up.URL, "", true, SourceActive))
+
+	list, err := svc.PullModels(context.Background(), 9, "sk-temp")
+	if err != nil {
+		t.Fatalf("pull models: %v", err)
+	}
+	if len(list) != 1 || list[0].ID != "qwen-max" || list[0].Object != "model" || list[0].OwnedBy != "aliyun" {
+		t.Fatalf("unexpected list: %+v", list)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("expectations: %v", err)
+	}
+}
+
+func TestPullModels_RejectsEmptyKey(t *testing.T) {
+	svc, _ := newTestService(t, "")
+	_, err := svc.PullModels(context.Background(), 9, "  ")
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.HTTPStatus != http.StatusBadRequest {
+		t.Fatalf("空 ApiKey 应返回 400，got %v", err)
+	}
+}
