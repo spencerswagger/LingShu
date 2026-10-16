@@ -49,6 +49,13 @@ type SyncResult struct {
 	Applied int           `json:"Applied"`
 }
 
+// ImportResult 渠道协议导入结果：Created 为新增数，Skipped 为去重跳过数，Warnings 为校验失败告警。
+type ImportResult struct {
+	Created  int      `json:"Created"`
+	Skipped  int      `json:"Skipped"`
+	Warnings []string `json:"Warnings"`
+}
+
 // Service 承载渠道协议业务逻辑（CRUD + 预设物化/同步）。
 type Service struct {
 	store  *Store
@@ -143,6 +150,13 @@ func validate(cp *ChannelProtocol) error {
 	default:
 		return errBadRequest("passthroughMode 只支持 none / whitelist / blacklist / all")
 	}
+	// sourceStatus 受 DB CHECK 约束（ACTIVE/STALE）；空值由 store 落库时默认 ACTIVE。
+	// 导入携带非法值时在此拦截 → 计入 Warnings 跳过，避免触发 23514 导致整批回滚。
+	switch cp.SourceStatus {
+	case "", SourceActive, SourceStale:
+	default:
+		return errBadRequest("sourceStatus 只支持 ACTIVE / STALE")
+	}
 	return nil
 }
 
@@ -161,6 +175,11 @@ func normalizeIn(cp *ChannelProtocol) {
 func (s *Service) Create(ctx context.Context, in ChannelProtocol) (*ChannelProtocol, error) {
 	cp := in
 	normalizeIn(&cp)
+	// 服务端掌控来源/编辑字段：先落定再校验，避免客户端传入的非法 sourceStatus 影响 Result。
+	cp.ID = 0
+	cp.PresetSourceID = ""
+	cp.Edited = true
+	cp.SourceStatus = SourceActive
 	if err := validate(&cp); err != nil {
 		return nil, err
 	}
@@ -169,10 +188,6 @@ func (s *Service) Create(ctx context.Context, in ChannelProtocol) (*ChannelProto
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("check channel protocol name: %w", err)
 	}
-	cp.ID = 0
-	cp.PresetSourceID = ""
-	cp.Edited = true
-	cp.SourceStatus = SourceActive
 	created, err := s.store.Insert(ctx, &cp)
 	if err != nil {
 		if errors.Is(err, ErrNameExists) {
@@ -192,14 +207,15 @@ func (s *Service) Update(ctx context.Context, id int64, in ChannelProtocol) (*Ch
 	}
 	cp := in
 	normalizeIn(&cp)
-	if err := validate(&cp); err != nil {
-		return nil, err
-	}
+	// 服务端掌控来源/编辑字段：先落定再校验，避免客户端传入的非法 sourceStatus 影响 Result。
 	cp.ID = id
 	cp.PresetSourceID = existing.PresetSourceID
 	cp.Edited = true
 	cp.SourceStatus = existing.SourceStatus
 	cp.CreatedAt = existing.CreatedAt
+	if err := validate(&cp); err != nil {
+		return nil, err
+	}
 	if err := s.store.Update(ctx, &cp); err != nil {
 		if errors.Is(err, ErrNameExists) {
 			return nil, errConflict("渠道协议名称已存在")
@@ -366,6 +382,106 @@ func (s *Service) Sync(ctx context.Context, confirm bool) (*SyncResult, error) {
 	}
 	for _, id := range changed {
 		s.notifyRefresh(ctx, id)
+	}
+	return res, nil
+}
+
+// Export 把全部渠道协议导出为预设包形状：键优先取 preset_source_id（非空时），否则取 name。
+// Protocols / Models 为空时初始化为非 nil 空集合，避免序列化为 null。
+func (s *Service) Export(ctx context.Context) (Pack, error) {
+	list, err := s.store.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	pack := make(Pack)
+	for i := range list {
+		cp := &list[i]
+		key := cp.PresetSourceID
+		if key == "" {
+			key = cp.Name
+		}
+		protocols := cp.Protocols
+		if protocols == nil {
+			protocols = Protocols{}
+		}
+		models := make(map[string]Model, len(cp.Models))
+		for modelID, mg := range cp.Models {
+			models[modelID] = Model{ID: modelID, Gateway: mg}
+		}
+		pack[key] = Provider{
+			ID:     cp.PresetSourceID,
+			Name:   cp.Name,
+			Models: models,
+			Gateway: GatewayBlock{
+				BaseURL:        cp.BaseURL,
+				Protocols:      protocols,
+				RequestHeaders: cp.RequestHeaders,
+				Edited:         cp.Edited,
+				SourceStatus:   cp.SourceStatus,
+			},
+		}
+	}
+	return pack, nil
+}
+
+// Import 从预设包形状导入渠道协议：逐条物化、校验、去重后插入，单事务提交。
+//   - Edited 为 true / SourceStatus 非空时覆盖物化默认值（否则保留 false / ACTIVE）；
+//   - 校验失败 → 追加 Warnings 并跳过（不计入 Created/Skipped）；
+//   - name 或非空 preset_source_id 已存在 → Skipped++；
+//   - 其余 → 新增（Created++），并登记新 name / preset_source_id 防批内重复。
+func (s *Service) Import(ctx context.Context, pack Pack) (*ImportResult, error) {
+	existing, err := s.store.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	names := make(map[string]bool, len(existing))
+	sources := make(map[string]bool, len(existing))
+	for i := range existing {
+		names[existing[i].Name] = true
+		if existing[i].PresetSourceID != "" {
+			sources[existing[i].PresetSourceID] = true
+		}
+	}
+	keys := make([]string, 0, len(pack))
+	for k := range pack {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	res := &ImportResult{Warnings: make([]string, 0)}
+	err = s.store.WithTx(ctx, func(tx *sql.Tx) error {
+		for _, key := range keys {
+			p := pack[key]
+			cand := p.toChannelProtocol()
+			if p.Gateway.Edited {
+				cand.Edited = true
+			}
+			if p.Gateway.SourceStatus != "" {
+				cand.SourceStatus = p.Gateway.SourceStatus
+			}
+			normalizeIn(cand)
+			if verr := validate(cand); verr != nil {
+				res.Warnings = append(res.Warnings, fmt.Sprintf("渠道协议 %q：%s", cand.Name, verr.Error()))
+				continue
+			}
+			if names[cand.Name] || (cand.PresetSourceID != "" && sources[cand.PresetSourceID]) {
+				res.Skipped++
+				continue
+			}
+			cand.ID = 0
+			if _, ierr := insertOn(ctx, tx, cand); ierr != nil {
+				return fmt.Errorf("import channel protocol %s: %w", key, ierr)
+			}
+			res.Created++
+			names[cand.Name] = true
+			if cand.PresetSourceID != "" {
+				sources[cand.PresetSourceID] = true
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return res, nil
 }

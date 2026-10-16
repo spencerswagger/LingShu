@@ -16,10 +16,10 @@ type Pack map[string]Provider
 type Provider struct {
 	ID      string           `json:"id"`
 	Name    string           `json:"name"`
-	Env     []string         `json:"env"`
-	Npm     string           `json:"npm"`
-	API     *string          `json:"api"`
-	Doc     string           `json:"doc"`
+	Env     []string         `json:"env,omitempty"`
+	Npm     string           `json:"npm,omitempty"`
+	API     *string          `json:"api,omitempty"`
+	Doc     string           `json:"doc,omitempty"`
 	Models  map[string]Model `json:"models"`
 	Gateway GatewayBlock     `json:"gateway"`
 }
@@ -37,6 +37,10 @@ type GatewayBlock struct {
 	BaseURL        string       `json:"baseUrl"`
 	Protocols      Protocols    `json:"protocols"`
 	RequestHeaders HeaderPolicy `json:"requestHeaders"`
+	// Edited / SourceStatus 仅用于导出/导入承载编辑标记与来源状态，
+	// 预设同步物化（toChannelProtocol）不读取它们。
+	Edited       bool   `json:"edited,omitempty"`
+	SourceStatus string `json:"sourceStatus,omitempty"`
 }
 
 // toChannelProtocol 把预设 provider 条目物化为渠道协议（edited=false，来源 ACTIVE）。

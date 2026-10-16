@@ -18,6 +18,8 @@ import (
 //   - DELETE /api/v1/admin/channel-protocols/{id}
 //   - POST   /api/v1/admin/channel-protocols/sync {confirm}
 //   - POST   /api/v1/admin/channel-protocols/{id}/models/pull {ApiKey}
+//   - GET    /api/v1/admin/channel-protocols/export
+//   - POST   /api/v1/admin/channel-protocols/import {Pack}
 type Handler struct {
 	svc *Service
 }
@@ -155,4 +157,30 @@ func (h *Handler) HandlePullModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp.OK(w, r, map[string]any{"List": list})
+}
+
+// HandleExport GET /api/v1/admin/channel-protocols/export
+// 导出全部渠道协议为预设包形状 JSON。
+func (h *Handler) HandleExport(w http.ResponseWriter, r *http.Request) {
+	pack, err := h.svc.Export(r.Context())
+	if err != nil {
+		writeErr(w, r, err)
+		return
+	}
+	resp.OK(w, r, pack)
+}
+
+// HandleImport POST /api/v1/admin/channel-protocols/import {Pack}
+// 从预设包形状 JSON 导入渠道协议，返回新增/跳过计数与告警。
+func (h *Handler) HandleImport(w http.ResponseWriter, r *http.Request) {
+	var pack Pack
+	if !decodeBody(w, r, &pack) {
+		return
+	}
+	result, err := h.svc.Import(r.Context(), pack)
+	if err != nil {
+		writeErr(w, r, err)
+		return
+	}
+	resp.OK(w, r, result)
 }

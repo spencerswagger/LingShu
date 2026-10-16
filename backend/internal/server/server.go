@@ -130,6 +130,8 @@ func (s *Server) routes() {
 		admin.HandleFunc("GET /api/v1/admin/channel-protocols", d.ChannelProto.HandleList)
 		admin.HandleFunc("POST /api/v1/admin/channel-protocols", d.ChannelProto.HandleCreate)
 		admin.HandleFunc("POST /api/v1/admin/channel-protocols/sync", d.ChannelProto.HandleSync)
+		admin.HandleFunc("GET /api/v1/admin/channel-protocols/export", d.ChannelProto.HandleExport)
+		admin.HandleFunc("POST /api/v1/admin/channel-protocols/import", d.ChannelProto.HandleImport)
 		admin.HandleFunc("GET /api/v1/admin/channel-protocols/{id}", d.ChannelProto.HandleGet)
 		admin.HandleFunc("PUT /api/v1/admin/channel-protocols/{id}", d.ChannelProto.HandleUpdate)
 		admin.HandleFunc("DELETE /api/v1/admin/channel-protocols/{id}", d.ChannelProto.HandleDelete)

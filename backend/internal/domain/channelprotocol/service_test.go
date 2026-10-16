@@ -372,3 +372,137 @@ func TestPullModels_RejectsEmptyKey(t *testing.T) {
 		t.Fatalf("空 ApiKey 应返回 400，got %v", err)
 	}
 }
+
+// ---- 渠道协议导入导出（Export / Import） ----
+
+// Export：预设来源用 preset_source_id 作键、自建用 name 作键，并承载编辑标记与来源状态。
+func TestExport(t *testing.T) {
+	svc, mock := newTestService(t, "")
+	now := time.Now()
+	mock.ExpectQuery(`SELECT .* FROM channel_protocols WHERE deleted_at IS NULL ORDER BY id ASC`).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "base_url", "protocols", "request_headers",
+			"models", "preset_source_id", "edited", "source_status", "created_at", "updated_at"}).
+			AddRow(int64(1), "Anthropic", "https://api.anthropic.com/v1", `{}`, `{}`, `{}`, "anthropic", false, SourceActive, now, now).
+			AddRow(int64(2), "my-proto", "https://my.example/v1", `{}`, `{}`, `{}`, "", true, SourceActive, now, now))
+
+	pack, err := svc.Export(context.Background())
+	if err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	if len(pack) != 2 {
+		t.Fatalf("期望导出 2 个 provider, got %d: %v", len(pack), pack)
+	}
+	preset, ok := pack["anthropic"]
+	if !ok {
+		t.Fatalf("预设应以 preset_source_id 作键, got %v", pack)
+	}
+	if preset.ID != "anthropic" || preset.Name != "Anthropic" {
+		t.Fatalf("预设条目 ID/Name 不符, got %+v", preset)
+	}
+	if preset.Gateway.Edited || preset.Gateway.SourceStatus != SourceActive {
+		t.Fatalf("预设条目标记应与库中一致(edited=false/ACTIVE), got %+v", preset.Gateway)
+	}
+	own, ok := pack["my-proto"]
+	if !ok {
+		t.Fatalf("自建应以 name 作键, got %v", pack)
+	}
+	if own.ID != "" || own.Name != "my-proto" {
+		t.Fatalf("自建条目 ID 应为空、Name 应为 my-proto, got %+v", own)
+	}
+	if !own.Gateway.Edited || own.Gateway.SourceStatus != SourceActive {
+		t.Fatalf("自建条目标记应与库中一致(edited=true/ACTIVE), got %+v", own.Gateway)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("expectations: %v", err)
+	}
+}
+
+// Import：name 已存在 → 跳过（Skipped++），不写库，仅 Begin/Commit。
+func TestImport_SkipsExisting(t *testing.T) {
+	svc, mock := newTestService(t, "")
+	mock.ExpectQuery(`SELECT .* FROM channel_protocols WHERE deleted_at IS NULL ORDER BY id ASC`).
+		WillReturnRows(cpRow(1, "dup-proto", "https://dup.example/v1", "", true, SourceActive))
+	mock.ExpectBegin()
+	mock.ExpectCommit()
+
+	pack := Pack{
+		"dup-proto": Provider{
+			ID:      "dup-proto",
+			Name:    "dup-proto",
+			Gateway: GatewayBlock{BaseURL: "https://x.example/v1"},
+		},
+	}
+	res, err := svc.Import(context.Background(), pack)
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if res.Skipped != 1 || res.Created != 0 {
+		t.Fatalf("同名协议应跳过, got %+v", res)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("expectations: %v", err)
+	}
+}
+
+// Import：新协议 → 单事务内插入（Created++），无告警。
+func TestImport_Creates(t *testing.T) {
+	svc, mock := newTestService(t, "")
+	mock.ExpectQuery(`SELECT .* FROM channel_protocols WHERE deleted_at IS NULL ORDER BY id ASC`).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "base_url", "protocols", "request_headers",
+			"models", "preset_source_id", "edited", "source_status", "created_at", "updated_at"}))
+	mock.ExpectBegin()
+	mock.ExpectQuery(`INSERT INTO channel_protocols`).
+		WillReturnRows(cpRow(101, "new-proto", "https://x.example/v1", "new-proto", false, SourceActive))
+	mock.ExpectCommit()
+
+	pack := Pack{
+		"new-proto": Provider{
+			ID:      "new-proto",
+			Name:    "new-proto",
+			Gateway: GatewayBlock{BaseURL: "https://x.example/v1"},
+		},
+	}
+	res, err := svc.Import(context.Background(), pack)
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if res.Created != 1 || res.Skipped != 0 {
+		t.Fatalf("应新增 1 条且无跳过, got %+v", res)
+	}
+	if len(res.Warnings) != 0 {
+		t.Fatalf("不应有告警, got %v", res.Warnings)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("expectations: %v", err)
+	}
+}
+
+// Import：条目携带非法 sourceStatus → 校验拦截记为 Warnings 并跳过，事务仍提交（不整批回滚）。
+func TestImport_WarnsOnInvalidSourceStatus(t *testing.T) {
+	svc, mock := newTestService(t, "")
+	mock.ExpectQuery(`SELECT .* FROM channel_protocols WHERE deleted_at IS NULL ORDER BY id ASC`).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "base_url", "protocols", "request_headers",
+			"models", "preset_source_id", "edited", "source_status", "created_at", "updated_at"}))
+	mock.ExpectBegin()
+	mock.ExpectCommit()
+
+	pack := Pack{
+		"bad-status": Provider{
+			Name:    "bad-status",
+			Gateway: GatewayBlock{BaseURL: "https://x.example/v1", SourceStatus: "BOGUS"},
+		},
+	}
+	res, err := svc.Import(context.Background(), pack)
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if res.Created != 0 || res.Skipped != 0 {
+		t.Fatalf("非法 sourceStatus 应跳过且不计入 Created/Skipped, got %+v", res)
+	}
+	if len(res.Warnings) != 1 {
+		t.Fatalf("应产生 1 条告警, got %v", res.Warnings)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("expectations: %v", err)
+	}
+}
