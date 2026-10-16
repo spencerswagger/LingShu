@@ -18,11 +18,24 @@ const emit = defineEmits<{
 
 // 内部行；0 表示占位空行（仅当存在且 key/value 均空时不提交）
 const rows = ref<Array<{ key: string; value: string }>>([])
+// synced 记录最近一次本地提交的映射：父组件回写一致时不重建行，
+// 避免「正在输入的空行 / 尚未填写 key 的新行」被回写覆盖而丢失（与 StringListEditor 同思路）。
+let synced: Record<string, string> = {}
+let initialized = false
+
+function sameMap(a: Record<string, string>, b: Record<string, string>): boolean {
+  const ka = Object.keys(a)
+  const kb = Object.keys(b)
+  if (ka.length !== kb.length) return false
+  return ka.every((k) => b[k] === a[k])
+}
 
 function fromMap() {
   const map = props.modelValue || {}
+  if (initialized && sameMap(map, synced)) return
   rows.value = Object.entries(map).map(([k, v]) => ({ key: k, value: String(v) }))
   if (rows.value.length === 0) rows.value.push({ key: '', value: '' })
+  initialized = true
 }
 
 watch(() => props.modelValue, fromMap, { immediate: true })
@@ -40,6 +53,8 @@ function emitChange() {
     const k = r.key.trim()
     if (k) map[k] = r.value
   }
+  synced = map
+  initialized = true
   emit('update:modelValue', map)
 }
 // 变量插入：把所选变量追加到当前值末尾

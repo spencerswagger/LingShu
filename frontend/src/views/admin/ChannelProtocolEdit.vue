@@ -62,7 +62,9 @@ const form = reactive({
 // 来源预设 ID（只读回显）
 const presetSourceId = ref('')
 
-// 请求头真实候选：HTTP 通用 / OpenAI / Anthropic 常用头（可自行输入任意头名）
+// 请求头真实候选：HTTP 通用 / OpenAI / Anthropic 常用头（可自行输入任意头名）。
+// 注意：内置强制黑名单（Cookie/Host/Content-Type/Accept-Encoding/X-Forwarded-*
+// /anthropic-dangerous-direct-browser-access 等）任何模式下都不会发往上游，故不作候选，避免配了却不生效。
 const headerSuggestions = [
   'Accept',
   'Accept-Language',
@@ -76,7 +78,6 @@ const headerSuggestions = [
   'OpenAI-Beta',
   'anthropic-version',
   'anthropic-beta',
-  'anthropic-dangerous-direct-browser-access',
 ]
 // 覆盖值可插入的变量
 const valueVariables = ['{api_key}', '{session_id}', '{request_id}', '{model}', '{client_header:NAME}']
@@ -534,6 +535,7 @@ async function onSubmit() {
                 :key-suggestions="headerSuggestions"
                 :value-suggestions="valueVariables"
               />
+              <div class="hint">键可下拉选常用头，也可直接输入；值支持变量插入。内置强制黑名单（Cookie / Host / Content-Type / Content-Length / Accept-Encoding / X-Forwarded-* / anthropic-dangerous-direct-browser-access 等）任何模式下都不会发往上游，覆盖同样被忽略；鉴权头（Authorization / x-api-key）可被覆盖。</div>
             </el-form-item>
           </el-form>
         </div>
