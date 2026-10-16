@@ -35,11 +35,11 @@ func (f *fakeCallLogStore) ListBySession(_ context.Context, _ string) ([]gateway
 func billingRecordRow(t *testing.T) ([]string, *sqlmock.Rows) {
 	t.Helper()
 	cols := []string{"id", "billing_id", "user_id", "pricing_mode", "token_id", "external_model_name",
-		"internal_model_id", "channel_key_id", "session_id", "session_name", "call_time", "tokens", "rates",
+		"auto_model_name", "internal_model_id", "channel_key_id", "session_id", "session_name", "call_time", "tokens", "rates",
 		"coefficients", "r_value", "raw_total", "credits_consumed", "cost_credits", "balance_before",
 		"balance_after", "status", "error_message", "duration_ms", "first_token_ms"}
 	rows := sqlmock.NewRows(cols).AddRow(
-		int64(1), "bill-0001", int64(7), "sale", nil, "gpt-4", "gpt-4-internal", int64(1), nil, nil,
+		int64(1), "bill-0001", int64(7), "sale", nil, "gpt-4", nil, "gpt-4-internal", int64(1), nil, nil,
 		time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC), []byte(`{"input":10}`), []byte(`{"input":1}`),
 		[]byte(`{"time":1,"context":1}`), int64(10000), 1.0, 1.0, 0.0, 100.0, 99.0, "completed", nil, nil, nil)
 	return cols, rows
@@ -68,7 +68,7 @@ func TestAdminHandleGetBilling_CallLog(t *testing.T) {
 
 	_, rows := billingRecordRow(t)
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, billing_id, user_id, pricing_mode, token_id, external_model_name,
-	internal_model_id, channel_key_id, session_id, session_name, call_time, tokens, rates, coefficients, r_value,
+	auto_model_name, internal_model_id, channel_key_id, session_id, session_name, call_time, tokens, rates, coefficients, r_value,
 	raw_total, credits_consumed, cost_credits, balance_before, balance_after, status, error_message, duration_ms, first_token_ms FROM billing_records WHERE billing_id=$1`)).
 		WithArgs("bill-0001").WillReturnRows(rows)
 	// 渠道名反查：密钥 id=1 无对应渠道行 → 空名（nil 影响展示）。
@@ -121,7 +121,7 @@ func TestAdminHandleGetBilling_CallLogNotInjected(t *testing.T) {
 
 	_, rows := billingRecordRow(t)
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, billing_id, user_id, pricing_mode, token_id, external_model_name,
-	internal_model_id, channel_key_id, session_id, session_name, call_time, tokens, rates, coefficients, r_value,
+	auto_model_name, internal_model_id, channel_key_id, session_id, session_name, call_time, tokens, rates, coefficients, r_value,
 	raw_total, credits_consumed, cost_credits, balance_before, balance_after, status, error_message, duration_ms, first_token_ms FROM billing_records WHERE billing_id=$1`)).
 		WithArgs("bill-0001").WillReturnRows(rows)
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT c.name FROM channels c JOIN channel_keys k ON k.channel_id = c.id WHERE k.id = $1`)).
@@ -206,12 +206,12 @@ func TestNewSQLCallLogStore_InsertAndQuery(t *testing.T) {
 	now := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
 	dur := int64(123)
 	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO call_logs(id, billing_id, request_id, session_id, user_id, channel_id, channel_key_id,
-	internal_model_id, external_model_id, model, pricing_mode, status, req_messages, resp_body, resp_kind,
+	internal_model_id, external_model_id, model, auto_model_name, pricing_mode, status, req_messages, resp_body, resp_kind,
 	decision, error_message, duration_ms, first_token_ms, created_at)
-VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
 ON CONFLICT (billing_id) DO NOTHING`)).
 		WithArgs(sqlmock.AnyArg(), "bill-0001", "req-1", "sess-1", int64(7), int64(1), int64(2), "gpt-4-internal",
-			int64(1), "gpt-4", "sale", "completed", []byte(`[{"role":"user","content":"a"}]`), `{"id":"x"}`,
+			int64(1), "gpt-4", nil, "sale", "completed", []byte(`[{"role":"user","content":"a"}]`), `{"id":"x"}`,
 			"non_stream", []byte(`{"result":"success"}`), "", int64(123), nil, now).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	if err := store.Insert(context.Background(), &gateway.CallLog{
@@ -227,13 +227,13 @@ ON CONFLICT (billing_id) DO NOTHING`)).
 
 	// ListBySession 读取（ReqMessages/Decision 为 JSONB bytes）。
 	rows := sqlmock.NewRows([]string{"billing_id", "request_id", "session_id", "user_id", "channel_id", "channel_key_id",
-		"internal_model_id", "external_model_id", "model", "pricing_mode", "status", "req_messages", "resp_body", "resp_kind",
+		"internal_model_id", "external_model_id", "model", "auto_model_name", "pricing_mode", "status", "req_messages", "resp_body", "resp_kind",
 		"decision", "error_message", "duration_ms", "first_token_ms", "created_at"}).
-		AddRow("bill-0001", "req-1", "sess-1", int64(7), int64(1), int64(2), "gpt-4-internal", int64(1), "gpt-4",
+		AddRow("bill-0001", "req-1", "sess-1", int64(7), int64(1), int64(2), "gpt-4-internal", int64(1), "gpt-4", nil,
 			"sale", "completed", []byte(`[{"role":"user","content":"a"}]`), `{"id":"x"}`, "non_stream",
 			[]byte(`{"result":"success"}`), "", int64(123), nil, now)
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT billing_id, request_id, session_id, user_id, channel_id, channel_key_id,
-	internal_model_id, external_model_id, model, pricing_mode, status, req_messages, resp_body, resp_kind,
+	internal_model_id, external_model_id, model, auto_model_name, pricing_mode, status, req_messages, resp_body, resp_kind,
 	decision, error_message, duration_ms, first_token_ms, created_at FROM call_logs WHERE session_id=$1 ORDER BY created_at ASC`)).
 		WithArgs("sess-1").WillReturnRows(rows)
 

@@ -8,6 +8,7 @@ import {
   Connection,
   Monitor,
   Cpu,
+  MagicStick,
   PriceTag,
   User,
   Key,
@@ -27,6 +28,7 @@ const menus = [
   { path: '/admin/service-status', title: '状态', icon: Monitor },
   { path: '/admin/channels', title: '渠道', icon: Connection },
   { path: '/admin/models', title: '模型', icon: Cpu },
+  { path: '/admin/auto-models', title: 'Auto 模型', icon: MagicStick },
   { path: '/admin/tags', title: '标签', icon: PriceTag },
   { path: '/admin/users', title: '用户', icon: User },
   { path: '/admin/tokens', title: '令牌', icon: Key },
@@ -39,7 +41,7 @@ const menus = [
 function activeMenu() {
   // 子页（新建/编辑/详情）高亮所属列表菜单
   const p = route.path
-  for (const m of ['/admin/channels', '/admin/service-status', '/admin/models', '/admin/tags', '/admin/users', '/admin/tokens', '/admin/billings', '/admin/announcements']) {
+  for (const m of ['/admin/channels', '/admin/service-status', '/admin/models', '/admin/auto-models', '/admin/tags', '/admin/users', '/admin/tokens', '/admin/billings', '/admin/announcements']) {
     if (p.startsWith(m)) return m
   }
   // 渠道协议为「渠道」页内切换的视图，归入「渠道」菜单高亮

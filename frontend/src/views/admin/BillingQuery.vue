@@ -7,6 +7,7 @@ import {
   listChannels,
   listChannelKeys,
   listExternalModels,
+  listAutoModels,
   listSessions,
   listTokens,
   type AdminBillingItem,
@@ -52,6 +53,7 @@ const stats = ref<BillingStats>({
 const channels = ref<AdminChannel[]>([])
 const channelKeys = ref<ChannelKey[]>([])
 const models = ref<ExternalModel[]>([])
+const autoNames = ref<string[]>([])
 const tokens = ref<AdminToken[]>([])
 const sessions = ref<AdminSession[]>([])
 // 当前所选用户名（用于筛选标签展示）
@@ -135,6 +137,17 @@ async function loadModels() {
     models.value = (await listExternalModels({}, base.value)).Data || []
   } catch {
     models.value = []
+  }
+}
+// Auto 名一并作为模型筛选项：Auto 请求的账单 external_model_name 记命中成员名，
+// 但用户按 Auto 名也应能搜到（后端 Model 过滤同时匹配 auto_model_name）。
+async function loadAutoNames() {
+  if (autoNames.value.length) return
+  try {
+    const res = await listAutoModels({}, base.value)
+    autoNames.value = (res.Data || []).map((a) => a.Name)
+  } catch {
+    autoNames.value = []
   }
 }
 async function loadTokensOfUser() {
@@ -313,6 +326,7 @@ function reset() {
 onMounted(() => {
   loadChannels()
   loadModels()
+  loadAutoNames()
   searchSessions('')
   loadTokensOfUser()
   load()
@@ -555,12 +569,21 @@ function sessionLabel(s: AdminSession): string {
                 size="small"
               >
                 <el-option v-for="m in models" :key="m.ID" :label="m.ExternalName" :value="m.ExternalName" />
+                <el-option
+                  v-for="n in autoNames"
+                  :key="'auto-' + n"
+                  :label="n + '（Auto）'"
+                  :value="n"
+                />
               </el-select>
             </ColumnFilter>
           </template>
           <template #default="{ row }">
             <div class="t-time">
-              <span class="t-date">{{ row.ExternalModel || '-' }}</span>
+              <span class="t-date">
+                {{ row.ExternalModel || '-' }}
+                <el-tag v-if="row.AutoModelName" size="small" effect="plain" type="success">Auto {{ row.AutoModelName }}</el-tag>
+              </span>
               <span class="t-clock">{{ row.InternalModelID || '-' }}</span>
             </div>
           </template>

@@ -41,6 +41,10 @@ const router = createRouter({
         { path: 'models', name: 'admin-models', component: () => import('@/views/admin/ModelList.vue'), meta: { title: '模型' } },
         { path: 'models/create', name: 'admin-model-create', component: () => import('@/views/admin/ModelCreate.vue'), meta: { title: '新建模型' } },
         { path: 'models/:id/edit', name: 'admin-model-edit', component: () => import('@/views/admin/ModelEdit.vue'), meta: { title: '编辑模型' } },
+        // Auto 模型（对外模型之上的有序别名组）
+        { path: 'auto-models', name: 'admin-auto-models', component: () => import('@/views/admin/AutoModelList.vue'), meta: { title: 'Auto 模型' } },
+        { path: 'auto-models/create', name: 'admin-auto-model-create', component: () => import('@/views/admin/AutoModelCreate.vue'), meta: { title: '新建 Auto 模型' } },
+        { path: 'auto-models/:id/edit', name: 'admin-auto-model-edit', component: () => import('@/views/admin/AutoModelEdit.vue'), meta: { title: '编辑 Auto 模型' } },
         // 语义标签
         { path: 'tags', name: 'admin-tags', component: () => import('@/views/admin/TagList.vue'), meta: { title: '标签' } },
         { path: 'tags/create', name: 'admin-tag-create', component: () => import('@/views/admin/TagCreate.vue'), meta: { title: '新建标签' } },
@@ -96,6 +100,28 @@ const router = createRouter({
           name: 'dev-model-list',
           component: () => import('@/views/admin/ModelList.vue'),
           meta: { title: '模型' },
+          props: { mode: 'self' },
+        },
+        // Auto 模型（开发者端：global 只读 + 本人 private 可写）
+        {
+          path: 'auto-models',
+          name: 'dev-auto-models',
+          component: () => import('@/views/admin/AutoModelList.vue'),
+          meta: { title: 'Auto 模型' },
+          props: { mode: 'self' },
+        },
+        {
+          path: 'auto-models/create',
+          name: 'dev-auto-model-create',
+          component: () => import('@/views/admin/AutoModelCreate.vue'),
+          meta: { title: '新建 Auto 模型' },
+          props: { mode: 'self' },
+        },
+        {
+          path: 'auto-models/:id/edit',
+          name: 'dev-auto-model-edit',
+          component: () => import('@/views/admin/AutoModelEdit.vue'),
+          meta: { title: '编辑 Auto 模型' },
           props: { mode: 'self' },
         },
         {
