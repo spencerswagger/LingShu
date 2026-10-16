@@ -5,6 +5,8 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"sync"
+	"sync/atomic"
 )
 
 // CtxRequestIDKey 是 requestID 在 context 中的键类型，供 middleware 与 resp 共用。
@@ -39,6 +41,18 @@ func NewDefault() *slog.Logger {
 	return New(os.Stdout, slog.LevelInfo)
 }
 
+var (
+	fallbackOnce   sync.Once
+	fallbackLogger *slog.Logger
+)
+
+// Fallback 返回进程级兜底 logger（stdout，与主 logger 同出口、同格式），
+// 供底层包在请求 ctx 未注入 logger 时使用：宁可换个出口，也不静默丢弃异常记录。
+func Fallback() *slog.Logger {
+	fallbackOnce.Do(func() { fallbackLogger = NewDefault() })
+	return fallbackLogger
+}
+
 // WithRequestID 从 ctx 读取 requestID，有则返回带 requestId 字段的新 logger。
 func WithRequestID(ctx context.Context, l *slog.Logger) *slog.Logger {
 	if id := GetRequestID(ctx); id != "" {
@@ -46,3 +60,46 @@ func WithRequestID(ctx context.Context, l *slog.Logger) *slog.Logger {
 	}
 	return l
 }
+
+// ---- 请求级 logger 注入 ----
+//
+// 供 resp 等"无 logger 参数"的底层包落日志：由装配层中间件在请求入口注入一次，
+// 走 context 而非包级全局变量，避免多处构造 server 时相互覆盖。
+
+type ctxKeyLogger struct{}
+
+// WithLogger 把 logger 注入 context；l 为 nil 时原样返回。
+func WithLogger(ctx context.Context, l *slog.Logger) context.Context {
+	if l == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, ctxKeyLogger{}, l)
+}
+
+// From 从 context 取出注入的 logger；未注入返回 nil（调用方据此跳过日志，单测安全）。
+func From(ctx context.Context) *slog.Logger {
+	if v, ok := ctx.Value(ctxKeyLogger{}).(*slog.Logger); ok {
+		return v
+	}
+	return nil
+}
+
+// ---- 客户端错误日志开关 ----
+//
+// 4xx/业务拒绝在网关与内部 API 多处都会落日志；高并发下失效令牌、脚本化错误调用
+// 可能刷屏并淹没真实异常，故提供进程级开关：
+//   - 运维入口：环境变量 LOG_CLIENT_ERRORS=off（**启动时读取一次，变更需重启**）；
+//   - 嵌入/测试入口：SetClientErrorLogEnabled（运行时切换）。
+// 关闭后 4xx 仍进入访问日志（降为 Info 级），5xx 始终记录。
+
+var clientErrLog = func() *atomic.Bool {
+	b := &atomic.Bool{}
+	b.Store(os.Getenv("LOG_CLIENT_ERRORS") != "off")
+	return b
+}()
+
+// ClientErrorLogEnabled 返回"客户端错误是否落日志"。
+func ClientErrorLogEnabled() bool { return clientErrLog.Load() }
+
+// SetClientErrorLogEnabled 设置客户端错误日志开关（运维/测试用）。
+func SetClientErrorLogEnabled(on bool) { clientErrLog.Store(on) }
