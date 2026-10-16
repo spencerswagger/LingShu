@@ -85,7 +85,9 @@ func WithRequestID(next http.Handler) http.Handler {
 	})
 }
 
-// WithLogging 输出请求访问日志：method/path/status/耗时/requestId。
+// WithLogging 输出请求日志：method/path/status/耗时/requestId/客户端 IP。
+// 级别按状态码分级（2xx/3xx=Info、4xx=Warn、5xx=Error），使"接口异常"在日志里天然可过滤：
+// 运维不必再逐条翻访问日志找问题，直接按级别 + path 聚合即可定位异常面。
 //
 // 日志写在 defer 中：panic 会把控制流从 next.ServeHTTP 直接掀起，函数尾部语句永不执行——
 // 而 500（panic）恰恰是最需要出现在访问日志里的请求。defer 保证"每一次进入的请求都留下
@@ -102,12 +104,20 @@ func WithLogging(logger *slog.Logger) func(http.Handler) http.Handler {
 				if rec != nil {
 					status = http.StatusInternalServerError
 				}
-				logger.Log(r.Context(), slog.LevelInfo, "http request",
+				lvl := slog.LevelInfo
+				switch {
+				case status >= http.StatusInternalServerError:
+					lvl = slog.LevelError
+				case status >= http.StatusBadRequest:
+					lvl = slog.LevelWarn
+				}
+				logger.Log(r.Context(), lvl, "http request",
 					"method", r.Method,
 					"path", r.URL.Path,
 					"status", status,
 					"duration_ms", time.Since(start).Milliseconds(),
 					"requestId", resp.RequestID(r),
+					"ip", clientip.From(r),
 				)
 				if rec != nil {
 					panic(rec)

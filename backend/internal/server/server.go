@@ -20,6 +20,7 @@ import (
 	"github.com/team/llmgateway/internal/domain/tag"
 	"github.com/team/llmgateway/internal/pkg/jwtx"
 	"github.com/team/llmgateway/internal/pkg/reqmeta"
+	"github.com/team/llmgateway/internal/pkg/resp"
 	"github.com/team/llmgateway/internal/pkg/session"
 )
 
@@ -67,6 +68,8 @@ func New(cfg *config.Config, db *sql.DB, logger *slog.Logger, jwtMgr *jwtx.Manag
 		deps:     deps,
 		mux:      http.NewServeMux(),
 	}
+	// 内部 API 异常日志落点：本包 Err 是全部内部接口错误的唯一出口，注入后即全量覆盖。
+	resp.SetErrorLogger(logger)
 	s.routes()
 	return s
 }
