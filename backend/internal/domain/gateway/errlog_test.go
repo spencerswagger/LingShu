@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"log/slog"
@@ -194,12 +195,25 @@ func TestSanitizeErrSummaryStripsCredentials(t *testing.T) {
 		{"Incorrect API key provided: sk-abc123456789", "sk-abc123456789"},
 		{"Unauthorized: Bearer test-key-abcdef", "test-key-abcdef"},
 		{"invalid credential api_key=AKIA1234567890abcd", "AKIA1234567890abcd"},
+		{"xai key xai-abc123456789", "xai-abc123456789"},
+		{"gsk token gsk_abc123456789", "gsk_abc123456789"},
+		{"nvapi key nvapi-abc123456789", "nvapi-abc123456789"},
+		{"hf token hf_abc123456789", "hf_abc123456789"},
 	}
 	for _, c := range cases {
 		got := sanitizeErrSummary(c.in)
 		if strings.Contains(got, c.mustNot) {
 			t.Errorf("凭据片段未被清洗: in=%q out=%q", c.in, got)
 		}
+	}
+	// URL query 必须被抹除（保留 host+path），避免底层错误串里的 ?key=... 泄漏。
+	const urlMsg = `Post "https://api.vendor.com/v1/chat/completions?key=sk-secret123456": dial tcp: timeout`
+	gotURL := sanitizeErrSummary(urlMsg)
+	if strings.Contains(gotURL, "key=sk-secret123456") {
+		t.Errorf("URL query 未抹除: %q", gotURL)
+	}
+	if !strings.Contains(gotURL, "https://api.vendor.com/v1/chat/completions") {
+		t.Errorf("URL host+path 应保留: %q", gotURL)
 	}
 	// 正常文案不应被改动（避免过度清洗影响排查）。
 	const keep = "The model does not exist or you do not have access to it."
@@ -333,5 +347,42 @@ func TestOutcomeLogSwitch4xx(t *testing.T) {
 	}
 	if out := dump(); !strings.Contains(out, "gateway request outcome") {
 		t.Errorf("开关打开时应落 4xx 请求级结论：\n%s", out)
+	}
+}
+
+// 请求级结论的开关门控必须只覆盖 4xx 客户端类结论：
+// 流式中断（status=200、masked=false）虽非 5xx，却只可能是故障，开关关闭时也必须落 ERROR。
+func TestOutcomeLogGate(t *testing.T) {
+	h := build(t, "http://127.0.0.1:1")
+	ctx := context.Background()
+	trail := []map[string]any{{"order": 1, "reason": "流式中断"}}
+
+	logger.SetClientErrorLogEnabled(false)
+	t.Cleanup(func() { logger.SetClientErrorLogEnabled(true) })
+
+	// 4xx 客户端类结论：开关关闭时不落盘。
+	dump := withLogCapture(h)
+	h.gw.logOutcome(ctx, slog.LevelError, "chat/completions", "gpt-4", "候选失败且请求最终失败", 402, false, nil, "sess-1", trail, nil)
+	if out := dump(); strings.Contains(out, "gateway request outcome") {
+		t.Errorf("开关关闭时 4xx（402）结论不应落盘：\n%s", out)
+	}
+
+	// 流式中断形态（status=200、masked=false）：只可能是故障，必须落盘且为 ERROR。
+	dump = withLogCapture(h)
+	h.gw.logOutcome(ctx, slog.LevelError, "chat/completions", "gpt-4", "候选失败且请求最终失败", 200, false, nil, "sess-1", trail, nil)
+	out := dump()
+	if !strings.Contains(out, "gateway request outcome") {
+		t.Errorf("流式中断（status=200）结论必须落盘：\n%s", out)
+	}
+	if !strings.Contains(out, "level=ERROR") {
+		t.Errorf("流式中断结论应为 Error 级：\n%s", out)
+	}
+
+	// 开关打开时 4xx 结论落盘。
+	logger.SetClientErrorLogEnabled(true)
+	dump = withLogCapture(h)
+	h.gw.logOutcome(ctx, slog.LevelError, "chat/completions", "gpt-4", "候选失败且请求最终失败", 402, false, nil, "sess-1", trail, nil)
+	if out := dump(); !strings.Contains(out, "gateway request outcome") {
+		t.Errorf("开关打开时 4xx（402）结论应落盘：\n%s", out)
 	}
 }

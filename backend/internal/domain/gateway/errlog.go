@@ -35,6 +35,7 @@ import (
 //  4. 转发头：header_names / cred_headers（**仅头名**）
 //  5. 判定线索：upstream_status / err_scope / err_param / err_type / err_code / err_summary
 //  6. 尝试轨迹：attempt / attempts_total / retry / reason / duration_ms
+//     （attempts_total 仅在已知候选总数时输出；候选总数总以请求级结论的 attempts 为准）
 //  7. 请求级结论（logOutcome）：status（真实下游状态码）/ attempts / failed_candidates
 //     / masked_by_failover（仅"确实成功且中间有候选失败"才为 true）/ attempt_trail / session_id
 //
@@ -230,8 +231,12 @@ var (
 	credKVRe     = regexp.MustCompile(`(?i)(api[\s_-]?key|access[\s_-]?token|secret|token)(\s*[:=]\s*)["']?[A-Za-z0-9._\-]{8,}`)
 )
 
-// sanitizeErrSummary 对上游错误文案做凭据样式清洗，避免第三方回显把凭据带进日志。
+// urlQueryRe 匹配 URL 中的 query 串：日志只允许保留 host + path（红线：query 一律丢弃）。
+var urlQueryRe = regexp.MustCompile(`(?i)(https?://[^\s"'\)\]，。]+)\?[^\s"'\)\]，。]*`)
+
+// sanitizeErrSummary 对上游错误文案做凭据样式清洗与 URL query 抹除，避免回显把凭据带进日志。
 func sanitizeErrSummary(s string) string {
+	s = urlQueryRe.ReplaceAllString(s, "$1?***")
 	s = credValueRe.ReplaceAllString(s, "***")
 	s = credBearerRe.ReplaceAllString(s, "$1 ***")
 	s = credKVRe.ReplaceAllString(s, "$1$2***")
@@ -294,7 +299,7 @@ func containsAny(haystack string, hints []string) bool {
 // errInfo 描述一次异常的上下文（与 diag 一并落日志）。
 type errInfo struct {
 	kind          string // 失败类型：rejected / build_failed / connect_failed / upstream_status / usage_missing / billing_failed / stream_interrupted ...
-	stage         string // request / route / non_stream / stream
+	stage         string // request / route / reject（本地拒绝，未进入上游）/ non_stream / stream
 	status        int    // 上游状态码；0 表示未收到响应
 	downstream    int    // 返回给下游的状态码（本地拒绝等非上游失败场景）
 	attempt       int    // 当前候选序号（1 起）
@@ -312,6 +317,7 @@ type errInfo struct {
 
 // logErr 落一条网关侧异常日志。任何失败分支都应调用它——包括最终返回给用户的失败，
 // 以及被 failover 掩盖、用户侧完全不可见的中间失败。
+// reason 也过清洗（含 URL query 抹除），避免底层错误串携带完整 URL/凭据绕过脱敏红线。
 func (g *Gateway) logErr(ctx context.Context, lvl slog.Level, msg, endpoint, protocol, model string,
 	token *identity.Token, routeRes *router.RouteResult, d diag, e errInfo) {
 	if g.logger == nil {
@@ -356,7 +362,10 @@ func (g *Gateway) logErr(ctx context.Context, lvl slog.Level, msg, endpoint, pro
 		args = append(args, "status", e.downstream)
 	}
 	if e.attempt > 0 {
-		args = append(args, "attempt", e.attempt, "attempts_total", e.attemptsTotal)
+		args = append(args, "attempt", e.attempt)
+		if e.attemptsTotal > 0 {
+			args = append(args, "attempts_total", e.attemptsTotal)
+		}
 	}
 	// masked_by_failover 不在此输出：候选级日志无法预知后续候选是否成功，
 	// 该结论只由请求级 logOutcome 在"确实成功"时给出，避免把"可能被掩盖"说成"已掩盖"。
@@ -376,7 +385,7 @@ func (g *Gateway) logErr(ctx context.Context, lvl slog.Level, msg, endpoint, pro
 	if e.summary != "" {
 		args = append(args, "err_summary", e.summary)
 	}
-	args = append(args, "reason", e.reason, "duration_ms", e.durationMs)
+	args = append(args, "reason", sanitizeErrSummary(e.reason), "duration_ms", e.durationMs)
 	args = append(args, d.kv()...)
 	logger.WithRequestID(ctx, g.logger).Log(ctx, lvl, msg, args...)
 }
@@ -390,7 +399,7 @@ func (g *Gateway) logReject(ctx context.Context, endpoint, model, reason string,
 	if status < http.StatusInternalServerError && !logger.ClientErrorLogEnabled() {
 		return
 	}
-	e := errInfo{kind: "rejected", stage: "request", downstream: status, reason: reason, durationMs: deref64(durationMs)}
+	e := errInfo{kind: "rejected", stage: "reject", downstream: status, reason: reason, durationMs: deref64(durationMs)}
 	// 与内部 API / 访问日志同口径分级：本地 5xx 属服务端异常，必须落 Error，
 	// 否则按 Error 级别做的告警会漏掉这批真实故障。
 	lvl := slog.LevelWarn
@@ -421,9 +430,9 @@ func (g *Gateway) logOutcome(ctx context.Context, lvl slog.Level, endpoint, mode
 		return
 	}
 	trail, failed := summarizeAttempts(attempts)
-	// 与候选级日志同口径：客户端类结论（4xx 且非「成功请求的隐性失败」）受开关控制，
-	// masked=true 表示请求确实成功，其隐性失败结论永不被关闭。
-	if status < http.StatusInternalServerError && !masked && !logger.ClientErrorLogEnabled() {
+	// 仅"客户端类失败结论"（4xx 且非"成功请求的隐性失败"）受开关控制：
+	// 不可用 status < 500 判定，否则流式中断（status=200）等只可能是故障的结论会被一并丢弃。
+	if status >= http.StatusBadRequest && status < http.StatusInternalServerError && !masked && !logger.ClientErrorLogEnabled() {
 		return
 	}
 	args := []any{
@@ -446,7 +455,7 @@ func (g *Gateway) logOutcome(ctx context.Context, lvl slog.Level, endpoint, mode
 	logger.WithRequestID(ctx, g.logger).Log(ctx, lvl, "gateway request outcome", args...)
 }
 
-// summarizeAttempts 把决策轨迹压缩为「原因链 + 失败候选数」，便于一条日志看清路由过程。
+// summarizeAttempts 把决策轨迹压缩为「原因链 + 真实失败候选数（跳过不计）」，便于一条日志看清路由过程。
 func summarizeAttempts(attempts []map[string]any) (trail string, failed int) {
 	if len(attempts) == 0 {
 		return "", 0
@@ -454,13 +463,20 @@ func summarizeAttempts(attempts []map[string]any) (trail string, failed int) {
 	parts := make([]string, 0, len(attempts))
 	for _, a := range attempts {
 		reason, _ := a["reason"].(string)
+		skipped, _ := a["skipped"].(bool)
 		order, _ := a["order"]
-		if order != nil {
-			parts = append(parts, fmtAny(order)+"."+reason)
-		} else {
-			parts = append(parts, reason)
+		label := reason
+		if skipped {
+			label = reason + "(跳过)"
 		}
-		if reason != "" && reason != "success" {
+		if order != nil {
+			parts = append(parts, fmtAny(order)+"."+label)
+		} else {
+			parts = append(parts, label)
+		}
+		// 只有真正失败（上游失败/本地 5xx/计费失败/流式中断）才计入候选失败；
+		// 跳过（禁用/限流/会话满/协议不支持/无运行时）不算失败。
+		if !skipped && reason != "" && reason != "success" {
 			failed++
 		}
 	}

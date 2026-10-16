@@ -17,7 +17,7 @@ type Body struct {
 
 // logAPIError 落一条内部 API 异常日志：method/path/status/业务码/文案 + requestId。
 // logger 由装配层中间件经 context 注入（无包级全局，避免多处构造 server 相互覆盖）；
-// 未注入时回退进程默认 logger（stderr）——宁可日志换个出口，也不静默丢弃异常记录。
+// 未注入时回退 logger.Fallback()（stdout，与主 logger 同出口）——宁可日志换个出口，也不静默丢弃异常记录。
 // 级别按状态码分级（5xx=Error，其余 4xx/业务拒绝=Warn）；
 // 4xx 受 logger.ClientErrorLogEnabled 开关控制（默认开，可用 LOG_CLIENT_ERRORS=off 关闭以防刷屏），
 // 5xx 始终记录。
@@ -27,9 +27,9 @@ func logAPIError(r *http.Request, status, code int, msg string) {
 	}
 	l := logger.From(r.Context())
 	if l == nil {
-		// 装配层漏注入时不允许静默丢弃：回退默认 logger，保证内部 API 异常至少留下一条可见记录
-		// （否则只剩访问日志的 status，无法定位到业务码与文案）。
-		l = slog.Default()
+		// 装配层漏注入时不允许静默丢弃：回退 logger.Fallback()（stdout，与主 logger 同出口），
+		// 保证内部 API 异常至少留下一条可见记录（否则只剩访问日志的 status，无法定位到业务码与文案）。
+		l = logger.Fallback()
 	}
 	lvl := slog.LevelWarn
 	if status >= http.StatusInternalServerError {
