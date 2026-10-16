@@ -234,8 +234,12 @@ var (
 // urlQueryRe 匹配 URL 中的 query 串：日志只允许保留 host + path（红线：query 一律丢弃）。
 var urlQueryRe = regexp.MustCompile(`(?i)(https?://[^\s"'\)\]，。]+)\?[^\s"'\)\]，。]*`)
 
+// urlUserinfoRe 匹配 URL authority 中的 userinfo（user:pass@）：属凭据，必须抹除。
+var urlUserinfoRe = regexp.MustCompile(`(?i)(https?://)[^/@\s"'\)\]，。]+@`)
+
 // sanitizeErrSummary 对上游错误文案做凭据样式清洗与 URL query 抹除，避免回显把凭据带进日志。
 func sanitizeErrSummary(s string) string {
+	s = urlUserinfoRe.ReplaceAllString(s, "$1***@")
 	s = urlQueryRe.ReplaceAllString(s, "$1?***")
 	s = credValueRe.ReplaceAllString(s, "***")
 	s = credBearerRe.ReplaceAllString(s, "$1 ***")
@@ -298,7 +302,7 @@ func containsAny(haystack string, hints []string) bool {
 
 // errInfo 描述一次异常的上下文（与 diag 一并落日志）。
 type errInfo struct {
-	kind          string // 失败类型：rejected / build_failed / connect_failed / upstream_status / usage_missing / billing_failed / stream_interrupted ...
+	kind          string // 失败类型：rejected / build_failed / connect_failed / read_body_failed / upstream_status / usage_missing / billing_failed / stream_interrupted / credential_unavailable / client_gone / ...
 	stage         string // request / route / reject（本地拒绝，未进入上游）/ non_stream / stream
 	status        int    // 上游状态码；0 表示未收到响应
 	downstream    int    // 返回给下游的状态码（本地拒绝等非上游失败场景）
@@ -392,11 +396,11 @@ func (g *Gateway) logErr(ctx context.Context, lvl slog.Level, msg, endpoint, pro
 
 // logReject 记录一次「未进入上游」的网关拒绝（认证/参数/路由/余额/限流/协议不支持等）。
 // durationMs 允许为 nil（未计时），与账单侧 *int64 口径保持一致。
-// 客户端类拒绝（status < 500）受 logger.ClientErrorLogEnabled 开关控制：
+// 客户端类拒绝（4xx）受 logger.ClientErrorLogEnabled 开关控制：
 // 高并发下失效令牌/脚本化错误调用可能刷屏，可用 LOG_CLIENT_ERRORS=off 关闭；5xx 始终记录。
 func (g *Gateway) logReject(ctx context.Context, endpoint, model, reason string, status int,
 	token *identity.Token, durationMs *int64) {
-	if status < http.StatusInternalServerError && !logger.ClientErrorLogEnabled() {
+	if status >= http.StatusBadRequest && status < http.StatusInternalServerError && !logger.ClientErrorLogEnabled() {
 		return
 	}
 	e := errInfo{kind: "rejected", stage: "reject", downstream: status, reason: reason, durationMs: deref64(durationMs)}
@@ -430,9 +434,9 @@ func (g *Gateway) logOutcome(ctx context.Context, lvl slog.Level, endpoint, mode
 		return
 	}
 	trail, failed := summarizeAttempts(attempts)
-	// 仅"客户端类失败结论"（4xx 且非"成功请求的隐性失败"）受开关控制：
-	// 不可用 status < 500 判定，否则流式中断（status=200）等只可能是故障的结论会被一并丢弃。
-	if status >= http.StatusBadRequest && status < http.StatusInternalServerError && !masked && !logger.ClientErrorLogEnabled() {
+	// 仅"客户端类失败结论"（4xx）受开关控制：masked=true 必然 status<400（见 handler 侧 failedReq 判定），
+	// 故无需再判 masked。
+	if status >= http.StatusBadRequest && status < http.StatusInternalServerError && !logger.ClientErrorLogEnabled() {
 		return
 	}
 	args := []any{
