@@ -100,6 +100,7 @@ async function onDelete(row: AutoModel) {
 <template>
   <div class="page-container">
     <div class="page-header">
+      <slot name="header-left" />
       <div class="page-title">Auto 模型</div>
       <span class="page-count">{{ list.length }} 个 Auto 模型</span>
       <div class="page-header-spacer" />
