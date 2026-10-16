@@ -4,7 +4,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>会话亲和 × 成本：逻辑、公式与新方向</title>
+<title>会话成本路由：一个逐请求决策算法</title>
 <style>
   @font-face{font-family:'Bricolage Grotesque';src:url('./_shared/fonts/BricolageGrotesque-Regular.ttf') format('truetype');font-weight:400;font-display:swap;}
   @font-face{font-family:'Bricolage Grotesque';src:url('./_shared/fonts/BricolageGrotesque-Bold.ttf') format('truetype');font-weight:700;font-display:swap;}
@@ -31,14 +31,13 @@
     border-bottom:1px solid var(--rule);}
   .hero-inner{max-width:920px;margin:0 auto;}
   .kicker{font-family:var(--font-mono);font-size:0.75rem;letter-spacing:0.16em;text-transform:uppercase;color:var(--accent2);font-weight:700;margin:0 0 0.9rem;}
-  .hero h1{font-family:var(--font-head);font-weight:700;font-size:clamp(1.7rem,4.4vw,2.7rem);line-height:1.12;letter-spacing:-0.01em;margin:0 0 0.9rem;max-width:24em;}
-  .hero .lede{font-size:clamp(1rem,2.2vw,1.12rem);color:var(--muted);max-width:44em;margin:0;}
+  .hero h1{font-family:var(--font-head);font-weight:700;font-size:clamp(1.7rem,4.4vw,2.7rem);line-height:1.14;letter-spacing:-0.01em;margin:0 0 0.9rem;max-width:26em;}
+  .hero .lede{font-size:clamp(1rem,2.2vw,1.12rem);color:var(--muted);max-width:46em;margin:0;}
 
   .wrap{max-width:920px;margin:0 auto;padding:0 1.5rem 4rem;}
-  section{padding-top:2.6rem;}
+  section{padding-top:2.5rem;}
   h2{font-family:var(--font-head);font-weight:700;font-size:clamp(1.25rem,3vw,1.6rem);margin:0 0 0.8rem;}
   h2 .h2no{font-family:var(--font-mono);color:var(--accent2);font-size:0.8em;margin-right:0.4rem;}
-  h3{font-family:var(--font-head);font-weight:700;font-size:1.05rem;margin:1.7rem 0 0.6rem;}
   p{margin:0 0 0.9rem;}
 
   .table-wrap{overflow-x:auto;overflow-y:auto;max-height:600px;margin:1.1rem 0;border:1px solid var(--rule);border-radius:8px;}
@@ -46,25 +45,21 @@
   th,td{text-align:left;padding:0.62rem 0.85rem;border-bottom:1px solid var(--rule);vertical-align:top;}
   thead th{font-family:var(--font-mono);font-size:0.7rem;letter-spacing:0.06em;text-transform:uppercase;color:var(--accent);border-bottom:2px solid var(--accent);background:var(--bg2);}
   tbody tr:last-child td{border-bottom:none;}
-  td.mono,th.mono{font-family:var(--font-mono);font-size:0.82em;}
   .yes{color:var(--accent);font-weight:700;}
-  .no{color:var(--accent2);font-weight:700;}
+  .no{color:var(--accent2);font-weight:700;text-decoration:line-through;}
 
   .formula{background:var(--bg2);border:1px solid var(--rule);border-radius:8px;padding:0.9rem 1.15rem;margin:1.1rem 0;}
   .formula .f-label{font-family:var(--font-mono);font-size:0.68rem;font-weight:700;letter-spacing:0.12em;text-transform:uppercase;color:var(--muted);margin-bottom:0.5rem;}
-  .formula .f-body{font-family:var(--font-mono);font-size:clamp(0.86rem,2vw,1rem);line-height:1.8;overflow-x:auto;white-space:pre-wrap;}
+  .formula .f-body{font-family:var(--font-mono);font-size:clamp(0.85rem,2vw,0.98rem);line-height:1.8;overflow-x:auto;white-space:pre-wrap;}
   .formula .f-body .hl{color:var(--accent2);font-weight:700;}
-  .formula .f-note{margin:0.6rem 0 0;font-size:0.83rem;color:var(--muted);font-family:var(--font-body);}
+  .formula .f-note{margin:0.55rem 0 0;font-size:0.83rem;color:var(--muted);font-family:var(--font-body);}
 
   figure.chart-figure{margin:1.3rem 0;}
   figure.chart-figure figcaption{font-size:0.88rem;font-weight:700;margin-bottom:0.55rem;}
   figure.chart-figure figcaption span{display:block;font-weight:400;color:var(--muted);font-size:0.8rem;margin-top:0.15rem;}
-
-  .cards{display:grid;grid-template-columns:repeat(2,1fr);gap:0.9rem;margin:1.2rem 0;}
-  .card{background:var(--bg2);border:1px solid var(--rule);border-radius:8px;padding:1rem 1.1rem;}
-  .card .c-no{font-family:var(--font-mono);font-size:0.7rem;font-weight:700;color:var(--accent2);letter-spacing:0.1em;}
-  .card h4{margin:0.3rem 0 0.4rem;font-size:0.98rem;color:var(--ink);}
-  .card p{margin:0;font-size:0.87rem;color:var(--muted);line-height:1.6;}
+  figure.diagram{margin:1.3rem 0;text-align:center;}
+  figure.diagram .mermaid{background:var(--bg2);border:1px solid var(--rule);border-radius:8px;padding:1rem;}
+  figure.diagram figcaption{font-size:0.8rem;color:var(--muted);margin-top:0.5rem;}
 
   .callout{background:var(--bg2);border:1px solid var(--rule);border-left:4px solid var(--accent2);border-radius:8px;padding:0.9rem 1.15rem;margin:1.1rem 0;font-size:0.93rem;}
   .callout .co-tag{font-family:var(--font-mono);font-weight:700;font-size:0.7rem;letter-spacing:0.12em;color:var(--accent2);display:block;margin-bottom:0.3rem;}
@@ -72,14 +67,15 @@
   .verdict{background:var(--bg2);border:1px solid var(--rule);border-left:4px solid var(--accent);border-radius:8px;padding:0.9rem 1.15rem;margin:1.1rem 0;font-size:0.95rem;}
   .verdict b{color:var(--accent);}
 
-  ol.steps{margin:0.6rem 0;padding-left:1.25rem;}
-  ol.steps li{margin-bottom:0.55rem;}
+  .kill{list-style:none;padding:0;margin:1rem 0;}
+  .kill li{background:var(--bg2);border:1px solid var(--rule);border-radius:8px;padding:0.7rem 1rem;margin-bottom:0.6rem;font-size:0.9rem;}
+  .kill li b{color:var(--accent2);}
 
   footer{background:var(--bg2);border-top:1px solid var(--rule);padding:1.8rem 1.5rem;}
   footer .wrap{padding-bottom:0;}
   footer .colophon{font-family:var(--font-mono);font-size:0.74rem;color:var(--muted);margin:0;}
 
-  @media (max-width:720px){ .hero{padding:2.4rem 1.25rem 1.8rem;} .wrap{padding:0 1.25rem 3rem;} .cards{grid-template-columns:1fr;} body{font-size:15px;} }
+  @media (max-width:720px){ .hero{padding:2.4rem 1.25rem 1.8rem;} .wrap{padding:0 1.25rem 3rem;} body{font-size:15px;} }
   @media print{ section{break-inside:avoid;} h2{break-after:avoid;} }
 </style>
 </head>
@@ -87,158 +83,125 @@
 
 <header class="hero">
   <div class="hero-inner">
-    <p class="kicker">会话亲和 × 成本 · 逻辑与探索结论</p>
-    <h1>把「靠感觉选渠道」变成「有公式、能逐轮重算」</h1>
-    <p class="lede">你提了两个方向；我这里补上：<b>临界公式</b>、<b>闲忙时怎么切换与切换代价</b>、以及系统里<b>已经有什么 / 缺什么</b>和<b>你没想到的方向</b>。</p>
+    <p class="kicker">会话成本路由 · 结论版</p>
+    <h1>方向 1 和方向 2 是同一个算法：每个请求重算一次</h1>
+    <p class="lede">不预判会话长短，也不设两套逻辑。只做一件事：<b>请求来了，用上一轮的真实用量 + 各渠道当前价，算这轮该不该换渠道</b>——切换代价一并算进去。</p>
   </div>
 </header>
 
 <main class="wrap">
 
-  <!-- 你的输入 vs 我的补充 -->
+  <!-- 01 一个算法 -->
   <section>
-    <h2><span class="h2no">00</span>你的输入 → 我补的部分</h2>
+    <h2><span class="h2no">01</span>就一个决策：这个请求由哪个渠道服务</h2>
+    <figure class="diagram">
+      <pre class="mermaid">
+flowchart TD
+    A["新请求到达"] --> B["读上一轮真实 usage<br/>上下文 P · 缓存读 R · 输出 O"]
+    B --> C["每个候选渠道，取当前价（含时段系数）"]
+    C --> D1["留在当前渠道<br/>本轮成本 = P·p_cr + u·p_in + o·p_out"]
+    C --> D2["换到候选 c<br/>本轮成本 + 一次性重灌 R·(p_in−p_cr)"]
+    D1 --> E["取最小：argmin( 本轮成本 + 一次性代价 / H )"]
+    D2 --> E
+    E --> F{"最优是当前渠道吗？"}
+    F -->|是| G["不换"]
+    F -->|否| H["换（受并发 / 次数护栏）"]
+      </pre>
+      <figcaption>图 1 · 唯一的决策流程。方向 1（选谁）与方向 2（换不换）在这里是同一件事。</figcaption>
+    </figure>
+    <p>「短会话走 IO 便宜、长会话走缓存便宜」不是要去预判的东西——它是这个决策的<strong>结果</strong>：上下文一大，<span class="mono">p_cr</span> 那项自然占主导，决策自己就切过去了。</p>
+  </section>
+
+  <!-- 02 怎么算 -->
+  <section>
+    <h2><span class="h2no">02</span>每轮怎么判：两个量就够了</h2>
+    <div class="formula">
+      <div class="f-label">判据</div>
+      <div class="f-body">本轮成本(c) = P·p_cr^c + u·p_in^c + o·p_out^c        （都乘当前时段系数）
+一次性重灌代价(c) = <span class="hl">R · (p_in^c − p_cr^c)</span>
+
+换划算  ⟺  [本轮成本(当前) − 本轮成本(c)] × H  &gt;  一次性重灌代价(c)</div>
+      <p class="f-note">P / R / O 都来自<b>上一轮的真实 usage</b>；H 是摊销轮数（策略旋钮，不是对会话长度的预测）。</p>
+    </div>
+
+    <figure class="chart-figure">
+      <figcaption>图 2 · 每轮成本 vs 当前上下文大小（缓存命中）
+        <span>交叉在约 14k token：上下文小于它，均衡型每轮更便宜；大于它，缓存便宜型更便宜。上下文大小是每轮都<b>已知</b>的，所以不需要预判。</span>
+      </figcaption>
+      <div id="chart-perround" style="width:100%;min-height:380px;"></div>
+    </figure>
+
+    <p>代入一组真实数字看一遍——<strong>上一个请求</strong>的 usage：上下文 P=20,000（其中缓存读 R=16,000）、输出 500；当前在渠道 B，候选 A：</p>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>你给的</th><th>我补的结论</th></tr></thead>
+        <thead><tr><th>项</th><th>数值</th></tr></thead>
         <tbody>
-          <tr><td>短会话适合便宜渠道、长会话另说，<b>但我没有公式，也不知道临界点</b></td><td>临界轮数 <span class="mono">T* = 1 − 2·Δio/Δcr</span>；本例<b>临界在第 29 轮</b>（图 B）</td></tr>
-          <tr><td>闲忙时切换，<b>切换代价能不能算</b>（要重算一次输入）</td><td>迁移代价 <span class="mono">= C_t·(p_in − p_cr)</span>；<b>空闲超缓存 TTL 时代价为 0</b>；盈亏平衡见下（图 D）</td></tr>
-          <tr><td>短会话多为 subagent / sidecar（如取名），只有一次输入</td><td>这类<b>首轮就能按请求特征识别</b>，给默认短渠道；其余走逐轮在线决策</td></tr>
-          <tr><td>「还有没有其他方向？」</td><td><b>新增 4 个</b>：档案化成本样本 / 缓存能力与 TTL 元数据 / 实测成本回馈 / 可延迟流量闲时调度</td></tr>
-          <tr><td>—</td><td><b>附带发现 1 个真 Bug</b>：会话迁移失败时先摘旧会话、不回滚（目标并发满则会话丢失）</td></tr>
+          <tr><td>留在 B · 本轮成本</td><td>0.0176 元</td></tr>
+          <tr><td>换到 A · 本轮成本</td><td>0.0140 元</td></tr>
+          <tr><td>每轮省</td><td><b>0.0036 元</b></td></tr>
+          <tr><td>换到 A 的一次性重灌代价 = R·(p_in−p_cr)</td><td>0.0288 元</td></tr>
+          <tr><td>判据（H=10）</td><td class="yes">0.0036×10 = 0.036 &gt; 0.0288 → 换</td></tr>
+          <tr><td>判据（H=5）</td><td class="no">0.018 &lt; 0.0288 → 不换</td></tr>
         </tbody>
       </table>
     </div>
+    <div class="verdict"><b>H 是唯一的假设</b>。它不是预测会话长度，而是一个可调尺度：切换"付一次、省多次"，总要决定按几次来摊销。因为每轮都重算，设大了只影响早切一点、设小了晚切一点，不会跑偏到不可控。</div>
   </section>
 
-  <!-- 方向1 -->
+  <!-- 03 因此不再需要 -->
   <section>
-    <h2><span class="h2no">01</span>方向 1：临界点是有公式的</h2>
-    <p>先看两种定价的形状（把输入价看成 1）：</p>
-    <figure class="chart-figure">
-      <figcaption>图 A · 两种定价（以输入价归一化为 1）<span>A 缓存读近乎白送但输出贵；B 三项同价、缓存不省钱。</span></figcaption>
-      <div id="chart-price" style="width:100%;min-height:330px;"></div>
-    </figure>
-
-    <div class="formula">
-      <div class="f-label">单轮成本（命中缓存）</div>
-      <div class="f-body">cost_t = <span class="hl">C_t · p_cr</span> + u_t · p_in + o_t · p_out</div>
-      <p class="f-note">C_t = 本轮可命中的前缀上下文；u_t = 新增输入；o_t = 输出。短会话 C_t≈0；长会话累计 C_t ≈ T²/2（平方增长）→ 缓存读主导。</p>
-    </div>
-
-    <div class="formula">
-      <div class="f-label">临界轮数（你要的公式）</div>
-      <div class="f-body">令  Δio = (p_in+ρ·p_out)_A − (p_in+ρ·p_out)_B      Δcr = p_cr_A − p_cr_B
-
-<span class="hl">T* = 1 − 2 · Δio / Δcr</span></div>
-      <p class="f-note">T &lt; T*：IO 便宜者赢；T &gt; T*：缓存便宜者赢。</p>
-    </div>
-
-    <figure class="chart-figure">
-      <figcaption>图 B · 累计成本随会话变长——两条线交叉点即临界
-        <span>设定：A 输入2/缓存读0.2/输出8，B 各0.8（元/百万 token）；每轮 +1000 输入、+1000 输出。第 29 轮之前 B 便宜，之后 A 便宜。</span>
-      </figcaption>
-      <div id="chart-crossover" style="width:100%;min-height:390px;"></div>
-    </figure>
-
+    <h2><span class="h2no">03</span>因此这些都不需要</h2>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>到第几轮</th><th>A 缓存便宜型</th><th>B 均衡型</th><th>谁便宜</th></tr></thead>
+        <thead><tr><th>原以为需要</th><th>为什么不需要</th></tr></thead>
         <tbody>
-          <tr><td>第 1 轮</td><td>0.010</td><td>0.0016</td><td class="yes">B</td></tr>
-          <tr><td>第 29 轮</td><td>0.371</td><td>0.371</td><td><b>相等 ← 临界</b></td></tr>
-          <tr><td>第 50 轮</td><td>0.745</td><td>1.060</td><td class="yes">A</td></tr>
+          <tr><td>预判会话总轮数 T</td><td>只用当下已知的上下文大小；长会话会自己"走"到缓存便宜渠道</td></tr>
+          <tr><td>会话档案 / archetype 分层</td><td>长短是决策的<b>结果</b>，不需要先分类再路由</td></tr>
+          <tr><td>缓存真假 / 缓存 TTL 元数据</td><td>上一轮 <span class="mono">cache_read &gt; 0</span> 就证明是真缓存，R 的大小就是缓存量——直接用它算迁移代价</td></tr>
+          <tr><td>单独的闲忙时逻辑</td><td>各渠道价用<b>当前时刻</b>（含时段系数）代入同一个公式即可（图 3）</td></tr>
         </tbody>
       </table>
     </div>
-    <div class="verdict">注意：<b>价格「比值」只定形状，胜负要换算到同一绝对单位再比</b>。50:2:200 与 1:1:1 这两组只是相对数，不能直接得出谁更适合长会话。</div>
+
+    <figure class="chart-figure">
+      <figcaption>图 3 · 闲忙时：各渠道价随时刻变（A 闲时 22–08、B 闲时 00–06）
+        <span>所以「谁便宜」会随时间翻转——这也正好同一套逻辑处理：每轮用当前时刻的价重算即可。</span>
+      </figcaption>
+      <div id="chart-intraday" style="width:100%;min-height:340px;"></div>
+    </figure>
   </section>
 
-  <!-- 方向2 -->
+  <!-- 04 撤掉的方向 -->
   <section>
-    <h2><span class="h2no">02</span>方向 2：闲忙时切换</h2>
-    <p>各渠道闲忙时不同 → <mark class="key">「谁便宜」会随一天的时间翻转</mark>。下图两条线相交的时刻，就是当天该不该换渠道的边界：</p>
-    <figure class="chart-figure">
-      <figcaption>图 C · 闲忙时使「谁便宜」日内翻转
-        <span>渠道 A 闲时 22:00–08:00（系数 0.5）；渠道 B 闲时 00:00–06:00（系数 0.25）。00–06 点 B 更便宜，其余时刻 A 更便宜。</span>
-      </figcaption>
-      <div id="chart-intraday" style="width:100%;min-height:360px;"></div>
-    </figure>
-
-    <p>那要不要中途换？换的代价就是<strong>把上下文在新渠道重灌一次</strong>（丢缓存）：</p>
-    <div class="formula">
-      <div class="f-label">迁移代价与盈亏平衡</div>
-      <div class="f-body"><span class="hl">migration_penalty = C_t · (p_in^新 − p_cr^新)</span>
-
-换划算  ⟺  预计剩余轮数 × 每轮省下的钱  &gt;  migration_penalty
-空闲已超过目标渠道缓存 TTL  →  migration_penalty = 0（缓存本就失效，白赚）</div>
-    </div>
-
-    <figure class="chart-figure">
-      <figcaption>图 D · 该不该换：看「预计还要发几轮」
-        <span>不换每轮 0.020 元；换要一次性 0.240 元、之后每轮 0.012 元。预计还能发 ≥30 轮才划算。</span>
-      </figcaption>
-      <div id="chart-breakeven" style="width:100%;min-height:380px;"></div>
-    </figure>
-
+    <h2><span class="h2no">04</span>我之前提的四个方向：全部撤掉</h2>
+    <ul class="kill">
+      <li><b>档案化成本样本</b> —— 做逐请求决策就是它本身，没必要再套一层"最小落地形态"。</li>
+      <li><b>缓存能力 / 缓存 TTL 元数据</b> —— 看上一轮 usage 的 <span class="mono">cache_read</span> 就知道真假与大小，无需新增字段。</li>
+      <li><b>实测成本回馈</b> —— 现在连策略都没有，先做统计没有用武之地；等策略跑起来再说。</li>
+      <li><b>可延迟流量闲时调度</b> —— 请求已经到达，不可能压几个小时再发，逻辑不成立。</li>
+    </ul>
     <div class="callout">
-      <span class="co-tag">两个必须补的点</span>
-      <p><b>① 系统其实已经能算日内价差：</b>每模型已带「时段系数」且路由已按当前时刻计价——所以对<b>新会话</b>已自动选当时最便宜；问题只出在<b>老会话被无脑粘住</b>，跨过边界不会重算。</p>
-      <p><b>② 免代价窗口：</b>要判断「空闲是否超过缓存 TTL」，需要<b>每渠道的缓存 TTL 元数据</b>——这一项目前系统里<b>完全没有</b>（见表）。</p>
+      <span class="co-tag">唯一要顺带的</span>
+      <p>会话迁移存在真实缺陷：迁移时先摘除旧会话、再校验目标键并发上限，<mark class="key">失败不回滚</mark>，目标键满时旧会话会从注册表消失。这个算法依赖迁移可靠，得一并修。</p>
     </div>
   </section>
 
-  <!-- 新方向 -->
+  <!-- 05 落地 -->
   <section>
-    <h2><span class="h2no">03</span>你没提、但我探索出的方向</h2>
-    <div class="cards">
-      <div class="card"><span class="c-no">新增 1</span><h4>档案化成本样本</h4><p>把现在「一个全局成本样本」改成一组（冷启动 / 单请求工具 / 短对话 / 长智能体），按会话当前相位挑一个——这是方向 1 的最小落地形态，改动量小。</p></div>
-      <div class="card"><span class="c-no">新增 2</span><h4>缓存能力与 TTL 元数据</h4><p>渠道/模型级标注「是否真缓存 / 缓存 TTL / 缓存写价」。方向 2 的「免代价迁移」和方向 1 的「长会话吃缓存」都靠它才成立。</p></div>
-      <div class="card"><span class="c-no">新增 3</span><h4>实测成本回馈</h4><p>系统已记录每次调用的真实用量（含缓存读）。用真实命中率反推「每渠道每档案的真实单轮成本」，比名义价表更准，能抓出「嘴上便宜其实没缓存」。</p></div>
-      <div class="card"><span class="c-no">新增 4</span><h4>可延迟流量闲时调度</h4><p>sidecar/取名/摘要这类延迟不敏感的流量，与其中途迁移，不如<b>排到目标渠道闲时再发</b>，从根上规避迁移代价。</p></div>
-    </div>
-    <div class="callout">
-      <span class="co-tag">附带发现</span>
-      <p>会话迁移路径有真实缺陷：迁移时先摘除旧会话、再校验新键并发上限，<mark class="key">失败不回滚</mark>，目标键满时旧会话会从注册表消失。方向 2 依赖迁移可靠，必须随最早阶段一并修复。</p>
-    </div>
-  </section>
-
-  <!-- 现状探索结论 -->
-  <section>
-    <h2><span class="h2no">04</span>探索结论：系统里已有 / 缺什么</h2>
-    <div class="table-wrap">
-      <table>
-        <thead><tr><th>能力</th><th>现状</th><th>对成本路由的意义</th></tr></thead>
-        <tbody>
-          <tr><td>每模型「时段系数」（闲忙时）</td><td class="yes">已有，路由已生效</td><td>闲忙时价差其实已能算；只差「老会话重算」</td></tr>
-          <tr><td>全局「成本样本」</td><td class="yes">已有（但单一）</td><td>对所有会话一刀切 → 分不出短/长</td></tr>
-          <tr><td>会话亲和</td><td class="yes">已有（无条件粘性）</td><td>跨时段不会重建权衡 → 方向 2 的根因</td></tr>
-          <tr><td>轮数 / 上下文 token</td><td class="yes">已算，但只喂 TTL、且晚于路由</td><td>相位拿不到 → 要提前并传入</td></tr>
-          <tr><td>「档案 / archetype」概念</td><td class="no">缺失</td><td>无法区分场景 → 新增 1</td></tr>
-          <tr><td>缓存能力 / 缓存 TTL 元数据</td><td class="no">缺失</td><td>无法判免代价迁移 → 新增 2</td></tr>
-          <tr><td>迁移失败回滚</td><td class="no">有缺陷</td><td>迁移不可靠 → 必修</td></tr>
-        </tbody>
-      </table>
-    </div>
-
-    <h3>落地就三步</h3>
-    <ol class="steps">
-      <li><b>使能</b>：让路由拿到会话相位（轮数/上下文/已缓存前缀）＋ 加缓存 TTL 元数据 ＋ 修迁移回滚。</li>
-      <li><b>方向 1</b>：成本样本多档化，按相位选样本。</li>
-      <li><b>方向 2</b>：逐轮算迁移代价，达阈值才切（带次数上限与防抖）。</li>
-    </ol>
+    <h2><span class="h2no">05</span>落地：就实现这一个决策函数</h2>
+    <p>把上面图 1 的流程做成路由里的一个函数：<strong>入参</strong>是「上一轮 usage + 各候选渠道（含当前时段系数）」，<strong>出参</strong>是「本轮用哪个渠道」，附一条决策记录（各候选成本、一次性代价、是否切换、原因）。<strong>H</strong> 做成一个配置项。就这一件事。</p>
   </section>
 
 </main>
 
 <footer>
   <div class="wrap">
-    <p class="colophon">图 A–D 为示意数据（按公式生成）。完整设计见 docs/designs/session-affinity-cost-control.md。</p>
+    <p class="colophon">图为示意数据。设计与公式推导见 docs/designs/session-affinity-cost-control.md。</p>
   </div>
 </footer>
 
 <script src="./_shared/js/echarts.min.js"></script>
+<script src="./_shared/js/mermaid.min.js"></script>
 <script src="assets/charts.js"></script>
 </body>
 </html>
