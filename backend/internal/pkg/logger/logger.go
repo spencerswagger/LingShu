@@ -73,8 +73,10 @@ func From(ctx context.Context) *slog.Logger {
 
 // ---- 客户端错误日志开关 ----
 //
-// 4xx/业务拒绝在网关与内部 API 三处都会落日志；高并发下失效令牌、脚本化错误调用
-// 可能刷屏并淹没真实异常，故提供进程级开关（环境变量 LOG_CLIENT_ERRORS=off 关闭）。
+// 4xx/业务拒绝在网关与内部 API 多处都会落日志；高并发下失效令牌、脚本化错误调用
+// 可能刷屏并淹没真实异常，故提供进程级开关：
+//   - 运维入口：环境变量 LOG_CLIENT_ERRORS=off（**启动时读取一次，变更需重启**）；
+//   - 嵌入/测试入口：SetClientErrorLogEnabled（运行时切换）。
 // 关闭后 4xx 仍进入访问日志（降为 Info 级），5xx 始终记录。
 
 var clientErrLog = func() *atomic.Bool {

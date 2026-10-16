@@ -657,6 +657,8 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 				attempts = append(attempts, attempt("计费失败"))
 			case out.refundPre:
 				attempts = append(attempts, attempt("上游失败"))
+			case out.interrupted:
+				attempts = append(attempts, attempt("流式中断"))
 			default:
 				attempts = append(attempts, attempt("success"))
 			}
@@ -668,7 +670,7 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 				status = http.StatusOK // 兜底：已响应但未记录状态码（理论不可达）
 			}
 			if _, failed := summarizeAttempts(attempts); failed > 0 {
-				failedReq := out.billFailed || out.refundPre || status >= http.StatusBadRequest
+				failedReq := outcomeIsFailure(out) || status >= http.StatusBadRequest
 				lvl := slog.LevelWarn
 				reason := "候选失败后请求成功（隐性失败）"
 				if failedReq {
@@ -846,6 +848,9 @@ type fwdOutcome struct {
 	downstreamStatus int
 	billFailed       bool
 	refundPre        bool
+	// interrupted 流式传输中断（内容已部分下发、无法撤回）：语义上请求失败，
+	// 但下游状态码仍为 200，故必须单列，不能靠状态码判定成败。
+	interrupted bool
 }
 
 // serveNonStream 非流式转发：2xx 先计费再响应。
@@ -1045,12 +1050,15 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 const upstreamErrBytes = 4096
 
 // readUpstreamErrBody 读取上游错误响应体（截断至 upstreamErrBytes）用于审计；读取失败返回空串。
+// 注意：返回值同时用于**日志摘要**与**落库**（账单 error_message、调用日志 resp_body），
+// 因此在唯一出口统一做凭据样式清洗——上游可能在自己回传的报文里回显收到的凭据，
+// 不在此处清洗会同时突破"日志只落指纹"与"存储不落明文"两条红线。
 func readUpstreamErrBody(resp *http.Response) string {
 	b, err := io.ReadAll(io.LimitReader(resp.Body, upstreamErrBytes))
 	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(string(b))
+	return sanitizeErrSummary(strings.TrimSpace(string(b)))
 }
 
 // upstreamErrNote 上游错误状态码的中文说明（沿用既有文案，便于告警/检索）。
@@ -1160,6 +1168,7 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		}
 		hardErr := herr != nil && !errors.Is(herr, context.Canceled) && !usageMissing
 		if hardErr {
+			out.interrupted = true // 语义上失败：内容被截断，请求级结论不得记为"成功"
 			g.logError(rt.Channel.ID, "stream handle failed", herr)
 			g.logUpstreamErr(ctx, slog.LevelError, "stream interrupted", endpoint, ureq.Protocol, model, token, routeRes,
 				diagFromRequest(req, ureq.Protocol, ureq.Cred),

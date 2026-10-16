@@ -253,14 +253,19 @@ func DefaultProviderFactory(protocol, endpoint string) (Provider, bool) {
 //   - POST /v1/embeddings        (openai-chat)
 //   - POST /v1/responses         (openai-responses)
 //   - POST /v1/messages          (anthropic-messages)
+//
+// InboundPrefix 是网关对外端点的路径前缀：Handler 注册、server 挂载与异常日志的
+// endpoint 字段共用同一常量，避免前缀字面量在多处重复、改挂载点时日志与访问日志失配。
+const InboundPrefix = "/v1/"
+
 func (g *Gateway) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/models", g.handleModels)
-	mux.HandleFunc("POST /v1/chat/completions", g.serveWith(EndpointChatCompletions))
-	mux.HandleFunc("POST /v1/completions", g.serveWith(EndpointCompletions))
-	mux.HandleFunc("POST /v1/embeddings", g.serveWith(EndpointEmbeddings))
-	mux.HandleFunc("POST /v1/responses", g.serveWith(EndpointResponses))
-	mux.HandleFunc("POST /v1/messages", g.serveWith(EndpointMessages))
+	mux.HandleFunc("GET "+InboundPrefix+"models", g.handleModels)
+	mux.HandleFunc("POST "+InboundPrefix+EndpointChatCompletions, g.serveWith(EndpointChatCompletions))
+	mux.HandleFunc("POST "+InboundPrefix+EndpointCompletions, g.serveWith(EndpointCompletions))
+	mux.HandleFunc("POST "+InboundPrefix+EndpointEmbeddings, g.serveWith(EndpointEmbeddings))
+	mux.HandleFunc("POST "+InboundPrefix+EndpointResponses, g.serveWith(EndpointResponses))
+	mux.HandleFunc("POST "+InboundPrefix+EndpointMessages, g.serveWith(EndpointMessages))
 	return mux
 }
 
