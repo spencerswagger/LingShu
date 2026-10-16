@@ -9,10 +9,12 @@ import (
 	"net"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/team/llmgateway/internal/domain/channelprotocol"
+	"github.com/team/llmgateway/internal/pkg/idgen"
 )
 
 // effectiveProtocolBaseURL 求渠道某基础协议的有效上游基址：渠道级 base_url 优先，
@@ -51,13 +53,14 @@ func renderAuth(protocol, cred string) (header, value string) {
 	return header, value
 }
 
-// probeHeaderPolicy 求探测请求应套用的请求头策略：渠道协议读取（探测与真实转发同源），
-// 内联渠道/未引用协议时为空策略（无「覆盖」）。缺省时上游要求自定义头会导致探测必然失败。
-func probeHeaderPolicy(rt *RuntimeChannel) channelprotocol.HeaderPolicy {
-	if rt != nil && rt.Protocol != nil {
-		return rt.Protocol.RequestHeaders
+// headerOverrideVars 构造「覆盖(set)」的变量表：model 恒取内部模型 ID（与网关热路径口径一致）；
+// session_id/request_id 随机生成——探测/模型拉取无请求上下文，随机值保证头非空、行为与真实转发一致。
+func headerOverrideVars(model string) map[string]string {
+	return map[string]string{
+		"model":      model,
+		"session_id": strconv.FormatInt(idgen.New(), 10),
+		"request_id": strconv.FormatInt(idgen.New(), 10),
 	}
-	return channelprotocol.HeaderPolicy{}
 }
 
 // joinProbeURL 拼基址与路径（去基址尾 /、路径头 /）。
@@ -276,7 +279,7 @@ func (m *Manager) probeOnce(ctx context.Context, keyID int64, probeModel, level 
 	}
 	target, authHeader, authValue := m.probeRequest(chRT, kr.CredentialPlain)
 	// 探测与真实转发同源：套用协议「覆盖(set)」头，否则上游要求自定义头（如会话标识）时探测必失败。
-	policy := probeHeaderPolicy(chRT)
+	policy := chRT.Protocol.EffectiveHeaderPolicy()
 
 	start := m.now()
 	fb, usage, errMsg := m.doProbeAuth(ctx, target, authHeader, authValue, probeModel, policy, kr.CredentialPlain, timeout)
@@ -323,8 +326,8 @@ func (m *Manager) doProbeAuth(ctx context.Context, url, authHeader, authValue, m
 	if authValue != "" {
 		req.Header.Set(authHeader, authValue)
 	}
-	// 「覆盖(set)」：与网关热路径同一引擎（channelprotocol.ApplySet），支持 {api_key}/{model} 等变量。
-	channelprotocol.ApplySet(req.Header, policy.Set, cred, map[string]string{"model": model}, nil)
+	// 「覆盖(set)」：与网关热路径同一引擎（channelprotocol.ApplySet），支持 {api_key}/{model}/{session_id}/{request_id} 等变量。
+	channelprotocol.ApplySet(req.Header, policy.Set, cred, headerOverrideVars(model), nil)
 
 	resp, err := m.probeHTTP.Do(req)
 	if err != nil {
