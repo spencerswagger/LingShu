@@ -91,6 +91,26 @@ func (h *Admin) HandleServiceStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// 一致性收敛（不允许隐性逻辑）：渠道运行时快照只在启动/渠道编辑/协议同步时重建，
+	// 删除对外模型不会通知渠道 Manager，故仍引用已删对外模型的渠道内部模型会残留在快照里。
+	// 这里以「未删除的对外模型清单」为白名单，剔除对外模型已不存在的内部模型行，保证展示与库表删除语义一致。
+	// ExternalModels 为空（未注入模型源）时不做过滤，避免误删全部模型。
+	if len(view.ExternalModels) > 0 {
+		active := make(map[int64]struct{}, len(view.ExternalModels))
+		for _, m := range view.ExternalModels {
+			active[m.ID] = struct{}{}
+		}
+		for ci := range view.Channels {
+			models := view.Channels[ci].Models[:0]
+			for _, md := range view.Channels[ci].Models {
+				if _, ok := active[md.View.ExternalModelID]; ok {
+					models = append(models, md)
+				}
+			}
+			view.Channels[ci].Models = models
+		}
+	}
+
 	// 候选顺序：仅当 Expand 非空且已注入路由引擎时按需计算。
 	if expand := parseExpand(r.URL.Query().Get("Expand")); len(expand) > 0 && h.routeEng != nil {
 		nameByID := make(map[int64]string, len(view.ExternalModels))
