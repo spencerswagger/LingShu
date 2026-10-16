@@ -238,6 +238,7 @@ func (s *Server) routes() {
 	// auto-models（开发端：仅本人私有 Auto；服务端强制 scope=private + owner=当前用户）
 	if d.AutoModel != nil {
 		dev.HandleFunc("GET /api/v1/dev/auto-models", d.AutoModel.HandleDevList)
+		dev.HandleFunc("GET /api/v1/dev/auto-models/{id}", d.AutoModel.HandleDevGet)
 		dev.HandleFunc("POST /api/v1/dev/auto-models", d.AutoModel.HandleDevCreate)
 		dev.HandleFunc("PUT /api/v1/dev/auto-models/{id}", d.AutoModel.HandleDevUpdate)
 		dev.HandleFunc("DELETE /api/v1/dev/auto-models/{id}", d.AutoModel.HandleDevDelete)

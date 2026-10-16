@@ -36,7 +36,7 @@ const scopeLocked = true
 
 async function loadCandidates(extra: { ID: string; ExternalName: string }[] = []) {
   try {
-    const res = await listExternalModels({ Enabled: true })
+    const res = await listExternalModels({ Enabled: true }, base.value)
     const list: { ID: string; ExternalName: string }[] = res.Data || []
     const seen = new Set(list.map((m) => String(m.ID)))
     for (const e of extra) {

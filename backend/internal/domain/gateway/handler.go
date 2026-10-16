@@ -282,24 +282,42 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 		if isAuto {
 			autoName = requestedModel
 			model = "" // 未命中任何成员前保持空，避免误用 Auto 名做普通模型解析
-			for _, mem := range members {
-				if mem.ExternalName == "" {
-					continue // 成员对应对外模型已软删/不可解析 → 跳过
+			// 老会话粘性（D4）：会话已绑定的成员对外模型名（s.Model）优先，直接按该名路由，
+			// 不参考当前成员列表——成员重排/增删都不改变老会话落点，与「会话内粘性不变」一致。
+			if sessionID != "" {
+				if s, ok := g.router.Sessions().Lookup(sessionID); ok && s != nil && s.Model != "" {
+					if sRoutes, sErr := g.router.RouteAll(ctx, router.RouteSpec{
+						ExternalModel: s.Model,
+						TagKV:         tagKV,
+						TagID:         token.TagID,
+						SessionKey:    sessionID,
+					}); sErr == nil && len(sRoutes) > 0 {
+						model = s.Model
+						routes = sRoutes
+					}
 				}
-				mRoutes, mErr := g.router.RouteAll(ctx, router.RouteSpec{
-					ExternalModel: mem.ExternalName,
-					TagKV:         tagKV,
-					TagID:         token.TagID,
-					SessionKey:    sessionID,
-				})
-				if mErr != nil {
-					// 单个成员路由失败（如该对外模型未配置）不阻断整体：继续尝试下一成员。
-					continue
-				}
-				if len(mRoutes) > 0 {
-					model = mem.ExternalName
-					routes = mRoutes
-					break
+			}
+			// 新会话，或原成员对外模型已不可用 → 按成员 position 升序取第一个有可用候选的成员。
+			if model == "" {
+				for _, mem := range members {
+					if mem.ExternalName == "" {
+						continue // 成员对应对外模型已软删/不可解析 → 跳过
+					}
+					mRoutes, mErr := g.router.RouteAll(ctx, router.RouteSpec{
+						ExternalModel: mem.ExternalName,
+						TagKV:         tagKV,
+						TagID:         token.TagID,
+						SessionKey:    sessionID,
+					})
+					if mErr != nil {
+						// 单个成员路由失败（如该对外模型未配置）不阻断整体：继续尝试下一成员。
+						continue
+					}
+					if len(mRoutes) > 0 {
+						model = mem.ExternalName
+						routes = mRoutes
+						break
+					}
 				}
 			}
 			if model == "" {
