@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Delete, Edit, RefreshRight } from '@element-plus/icons-vue'
 import {
   createChannelProtocol,
@@ -153,18 +153,60 @@ async function load() {
         ContextTiers: ov?.contextTiers ?? null,
       },
     }))
+    savedSnapshot.value = snapshot()
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
   } finally {
     loading.value = false
   }
 }
+
+// ===== 未保存修改守卫 =====
+// 以「提交口径」序列化当前表单快照，与最近一次加载/保存后的快照比对判断是否有未保存修改。
+const savedSnapshot = ref('')
+function snapshot(): string {
+  return JSON.stringify({
+    name: form.name,
+    base_url: form.base_url,
+    defaultProtocol: defaultProtocol.value,
+    protocols: baseProtocols.map((p) => ({ name: p, ...protocols[p] })),
+    passthrough_mode: form.passthrough_mode,
+    whitelist: form.whitelist,
+    blacklist: form.blacklist,
+    set: form.set,
+    models: modelRows.value,
+  })
+}
+const dirty = computed(() => isEdit.value && snapshot() !== savedSnapshot.value)
+
+function onBeforeUnload(e: BeforeUnloadEvent) {
+  if (!dirty.value) return
+  e.preventDefault()
+  e.returnValue = ''
+}
+
+onBeforeRouteLeave(async () => {
+  if (!dirty.value) return true
+  try {
+    await ElMessageBox.confirm('当前有未保存的修改，离开将丢失，确定离开吗？', '未保存的修改', {
+      type: 'warning',
+      confirmButtonText: '放弃修改并离开',
+      cancelButtonText: '留在本页',
+    })
+    return true
+  } catch {
+    return false
+  }
+})
+
 onMounted(() => {
   // 返回「渠道」合并页时保持选中「渠道协议」视图
   sessionStorage.setItem('admin-channels-tab', 'protocols')
+  window.addEventListener('beforeunload', onBeforeUnload)
   loadExternalModels()
   load()
 })
+onBeforeUnmount(() => window.removeEventListener('beforeunload', onBeforeUnload))
 
 // ===== 模型行 增/改/删 =====
 const modelDrawerOpen = ref(false)
@@ -233,7 +275,8 @@ const createExternalUseCost = ref(true)
 const createExternalSaving = ref(false)
 
 function openQuickCreateExternal() {
-  createExternalName.value = ''
+  // 对外名称默认用当前内部模型 ID 预填，减少手工输入
+  createExternalName.value = editingForm.value.id.trim()
   createExternalEnabled.value = true
   createExternalUseCost.value = true
   createExternalOpen.value = true
@@ -249,8 +292,12 @@ function onExternalChange(val: string | null) {
 async function confirmCreateExternal() {
   const name = createExternalName.value.trim()
   if (!name) return ElMessage.warning('请填写对外名称')
-  const costRates = createExternalUseCost.value ? editingPricing.value.CostRates : null
+  const useCost = createExternalUseCost.value
+  const costRates = useCost ? editingPricing.value.CostRates : null
   const saleRates = { Input: 0, Output: 0, CacheRead: 0, CacheWrite: 0, Reasoning: 0, ...(costRates || {}) }
+  // 初始化售价时同步时段与分档（与内部模型成本侧一致），避免仅同步五段费率而丢失时段/分档。
+  const timeConfig = useCost ? editingPricing.value.TimeConfig ?? null : null
+  const contextTiers = useCost ? editingPricing.value.ContextTiers ?? null : null
   createExternalSaving.value = true
   try {
     const res = await createExternalModel({
@@ -258,8 +305,8 @@ async function confirmCreateExternal() {
       Description: '',
       Enabled: createExternalEnabled.value,
       SaleRates: saleRates,
-      TimeConfig: null,
-      ContextTiers: null,
+      TimeConfig: timeConfig,
+      ContextTiers: contextTiers,
     })
     const created = res.Data
     externalModels.value.push(created)
@@ -321,6 +368,18 @@ const catalogRef = ref<InstanceType<typeof ModelPriceCatalog> | null>(null)
 const currentModelId = computed(() => editingForm.value.id)
 function onApplyCostCatalog(partial: Record<string, number>) {
   editingPricing.value.CostRates = { ...editingPricing.value.CostRates, ...partial }
+}
+
+// 从对外模型同步价格：用所绑定对外模型的售价 / 时段 / 分档覆盖当前内部模型的成本侧。
+function syncCostFromExternal() {
+  const extId = editingForm.value.externalModelID
+  if (!extId) return ElMessage.warning('请先绑定一个对外模型')
+  const em = externalModels.value.find((e) => String(e.ID) === String(extId))
+  if (!em) return ElMessage.warning('未找到该对外模型（可能已停用）')
+  editingPricing.value.CostRates = { ...(em.SaleRates || {}) }
+  editingPricing.value.TimeConfig = em.TimeConfig ? JSON.parse(JSON.stringify(em.TimeConfig)) : null
+  editingPricing.value.ContextTiers = em.ContextTiers ? JSON.parse(JSON.stringify(em.ContextTiers)) : null
+  ElMessage.success(`已用对外模型「${em.ExternalName}」的定价覆盖成本、时段与分档`)
 }
 
 // 展示辅助
@@ -543,6 +602,7 @@ async function onSubmit() {
     <div class="actions">
       <el-button type="primary" :loading="saving" @click="onSubmit">{{ isEdit ? '保存' : '创建' }}</el-button>
       <el-button @click="router.push('/admin/channels')">取消</el-button>
+      <el-tag v-if="dirty" type="warning" size="small" effect="light">有未保存的修改</el-tag>
       <ErrorBubble v-if="errInfo.message || errInfo.requestId" :message="errInfo.message" :request-id="errInfo.requestId" />
     </div>
 
@@ -575,6 +635,7 @@ async function onSubmit() {
           <ModelPricing v-model="editingPricing" show-rates-key="CostRates" title="成本">
             <template #title-extra>
               <el-button @click="catalogRef?.open()">从 models.dev 获取参考价</el-button>
+              <el-button @click="syncCostFromExternal">从对外模型同步价格</el-button>
             </template>
           </ModelPricing>
         </div>
