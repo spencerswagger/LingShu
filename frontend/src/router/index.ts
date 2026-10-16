@@ -37,12 +37,12 @@ const router = createRouter({
         { path: 'channel-protocols/:id/edit', name: 'admin-channel-protocol-edit', component: () => import('@/views/admin/ChannelProtocolEdit.vue'), meta: { title: '编辑渠道协议' } },
         // 状态（渠道侧通路矩阵；菜单排在「统计」下方）
         { path: 'service-status', name: 'admin-service-status', component: () => import('@/views/admin/ServiceStatus.vue'), meta: { title: '状态' } },
-        // 模型
-        { path: 'models', name: 'admin-models', component: () => import('@/views/admin/ModelList.vue'), meta: { title: '模型' } },
+        // 模型（列表内含「模型 / Auto 模型」页内切换）
+        { path: 'models', name: 'admin-models', component: () => import('@/views/admin/ModelsPage.vue'), meta: { title: '模型' } },
         { path: 'models/create', name: 'admin-model-create', component: () => import('@/views/admin/ModelCreate.vue'), meta: { title: '新建模型' } },
         { path: 'models/:id/edit', name: 'admin-model-edit', component: () => import('@/views/admin/ModelEdit.vue'), meta: { title: '编辑模型' } },
-        // Auto 模型（对外模型之上的有序别名组）
-        { path: 'auto-models', name: 'admin-auto-models', component: () => import('@/views/admin/AutoModelList.vue'), meta: { title: 'Auto 模型' } },
+        // Auto 模型（列表已并入「模型」页内切换，这里仅保留新建/编辑子页）
+        { path: 'auto-models', redirect: '/admin/models' },
         { path: 'auto-models/create', name: 'admin-auto-model-create', component: () => import('@/views/admin/AutoModelCreate.vue'), meta: { title: '新建 Auto 模型' } },
         { path: 'auto-models/:id/edit', name: 'admin-auto-model-edit', component: () => import('@/views/admin/AutoModelEdit.vue'), meta: { title: '编辑 Auto 模型' } },
         // 语义标签
@@ -98,18 +98,12 @@ const router = createRouter({
         {
           path: 'models',
           name: 'dev-model-list',
-          component: () => import('@/views/admin/ModelList.vue'),
+          component: () => import('@/views/admin/ModelsPage.vue'),
           meta: { title: '模型' },
           props: { mode: 'self' },
         },
-        // Auto 模型（开发者端：global 只读 + 本人 private 可写）
-        {
-          path: 'auto-models',
-          name: 'dev-auto-models',
-          component: () => import('@/views/admin/AutoModelList.vue'),
-          meta: { title: 'Auto 模型' },
-          props: { mode: 'self' },
-        },
+        // Auto 模型（开发者端：global 只读 + 本人 private 可写；列表已并入「模型」页内切换）
+        { path: 'auto-models', redirect: '/dev/models' },
         {
           path: 'auto-models/create',
           name: 'dev-auto-model-create',
