@@ -272,10 +272,18 @@ export interface ProtocolOption {
   path?: string
   default?: boolean // 标记首选协议；同一作用域内至多一个
 }
-// 模型级 gateway 覆盖：baseUrl 与可达协议子集（键存在 = 可达）。
+// 模型级 gateway 覆盖：baseUrl / 可达协议子集（键存在 = 可达）/ 绑定对外模型 / 成本定价。
+// 与渠道内部模型（channel_models）一致地承载外部模型绑定与成本侧计费（camelCase，向后兼容）。
 export interface ChannelProtocolModelOverride {
   baseUrl?: string
   protocols?: Record<string, ProtocolOption>
+  // 绑定的对外模型 ID（雪花字符串）；空 = 未绑定
+  externalModelID?: string | null
+  // 成本五段费率（键 = Go rateKeys）
+  costRates?: Record<string, number>
+  // 模型级时段/分档（空 = 回落全局默认）
+  timeConfig?: TimeCoeffConfig | null
+  contextTiers?: ContextTier[] | null
 }
 // 请求头策略：passthroughMode 决定下游头透传方式，whitelist/blacklist 为名单，set 为覆盖键值（支持变量）。
 export interface ChannelProtocolRequestHeaders {
@@ -337,6 +345,13 @@ export function syncChannelProtocols(confirm: boolean) {
   return http.post<ChannelProtocolSyncResult, ApiRes<ChannelProtocolSyncResult>>(
     '/admin/channel-protocols/sync',
     { confirm },
+  )
+}
+// 用协议 baseUrl(openai-chat) + 临时 ApiKey 调上游 /models，返回可供选择填入协议模型清单的列表（不落库）
+export function pullChannelProtocolModels(id: string, apiKey: string) {
+  return http.post<{ List: PullModel[] }, ApiRes<{ List: PullModel[] }>>(
+    `/admin/channel-protocols/${id}/models/pull`,
+    { ApiKey: apiKey },
   )
 }
 

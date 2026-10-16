@@ -17,6 +17,7 @@ import (
 //   - PUT    /api/v1/admin/channel-protocols/{id}
 //   - DELETE /api/v1/admin/channel-protocols/{id}
 //   - POST   /api/v1/admin/channel-protocols/sync {confirm}
+//   - POST   /api/v1/admin/channel-protocols/{id}/models/pull {ApiKey}
 type Handler struct {
 	svc *Service
 }
@@ -133,4 +134,25 @@ func (h *Handler) HandleSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp.OK(w, r, res)
+}
+
+// HandlePullModels POST /api/v1/admin/channel-protocols/{id}/models/pull {ApiKey}
+// 用临时 API Key 拉取该协议 openai-chat 上游 /models 列表（不落库）。
+func (h *Handler) HandlePullModels(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		ApiKey string `json:"ApiKey"`
+	}
+	if !decodeBody(w, r, &req) {
+		return
+	}
+	list, err := h.svc.PullModels(r.Context(), id, req.ApiKey)
+	if err != nil {
+		writeErr(w, r, err)
+		return
+	}
+	resp.OK(w, r, map[string]any{"List": list})
 }

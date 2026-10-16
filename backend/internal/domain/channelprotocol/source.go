@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 )
 
 // Pack 是一个预设包：键为 provider ID，值为该 provider 条目。
@@ -55,17 +56,16 @@ func (p Provider) toChannelProtocol() *ChannelProtocol {
 		cp.Name = p.ID
 	}
 	for id, m := range p.Models {
-		if len(m.Gateway.Protocols) == 0 && m.Gateway.BaseURL == "" {
+		if len(m.Gateway.Protocols) == 0 && m.Gateway.BaseURL == "" && m.Gateway.ExternalModelID <= 0 {
 			continue
 		}
 		key := id
 		if m.ID != "" {
 			key = m.ID
 		}
-		cp.Models[key] = ModelGateway{
-			BaseURL:   m.Gateway.BaseURL,
-			Protocols: canonicalProtocols(m.Gateway.Protocols),
-		}
+		mg := m.Gateway
+		mg.Protocols = canonicalProtocols(mg.Protocols)
+		cp.Models[key] = mg
 	}
 	return cp
 }
@@ -116,4 +116,68 @@ func fetchPack(ctx context.Context, client *http.Client, url string) (Pack, erro
 		return nil, fmt.Errorf("解析预设包 JSON 失败: %w", err)
 	}
 	return pack, nil
+}
+
+// PullModelView 协议模型拉取返回给前端的单个模型视图（PascalCase 契约）。
+type PullModelView struct {
+	ID      string `json:"ID"`
+	Object  string `json:"Object"`
+	OwnedBy string `json:"OwnedBy"`
+}
+
+// pullUpstreamModel 上游 /models 返回的单个模型（外部 snake 契约，仅内部解析用）。
+type pullUpstreamModel struct {
+	ID      string `json:"id"`
+	Object  string `json:"object"`
+	OwnedBy string `json:"owned_by"`
+}
+
+// pullModelsResponse 是 OpenAI-compat /models 的响应外壳。
+type pullModelsResponse struct {
+	Data []pullUpstreamModel `json:"data"`
+}
+
+// PullModels 用临时 API Key 请求协议 openai-chat 的有效 baseUrl + /models 拉取上游模型列表（不落库）。
+// 临时 Key 仅用于本次请求，绝不落库；鉴权固定 Authorization: Bearer <ApiKey>。
+func (s *Service) PullModels(ctx context.Context, id int64, apiKey string) ([]PullModelView, error) {
+	apiKey = strings.TrimSpace(apiKey)
+	if apiKey == "" {
+		return nil, errBadRequest("ApiKey 不能为空")
+	}
+	cp, err := s.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	base := cp.EffectiveBaseURL(ProtocolOpenAIChat)
+	if strings.TrimSpace(base) == "" {
+		return nil, errBadRequest("该渠道协议未配置 openai-chat 的 Base URL，无法拉取模型")
+	}
+	target := strings.TrimRight(base, "/") + "/models"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		return nil, fmt.Errorf("构造模型拉取请求失败: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+
+	client := s.client
+	if client == nil {
+		client = http.DefaultClient
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("拉取协议模型失败: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("上游模型接口返回非 2xx 状态码: %d", resp.StatusCode)
+	}
+	var out pullModelsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("解析上游模型响应失败: %w", err)
+	}
+	views := make([]PullModelView, 0, len(out.Data))
+	for _, m := range out.Data {
+		views = append(views, PullModelView{ID: m.ID, Object: m.Object, OwnedBy: m.OwnedBy})
+	}
+	return views, nil
 }

@@ -189,14 +189,14 @@ func buildBillingsFilter(q url.Values) (billing.RecordFilter, error) {
 		f.ChannelKeyID = &id
 	}
 	if v := q.Get("From"); v != "" {
-		t, err := time.Parse(time.RFC3339, v)
+		t, err := parseRFC3339Lenient(v)
 		if err != nil {
 			return f, errors.New("from 时间格式应为 RFC3339")
 		}
 		f.From = &t
 	}
 	if v := q.Get("To"); v != "" {
-		t, err := time.Parse(time.RFC3339, v)
+		t, err := parseRFC3339Lenient(v)
 		if err != nil {
 			return f, errors.New("to 时间格式应为 RFC3339")
 		}
