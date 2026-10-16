@@ -245,6 +245,10 @@ func DefaultProviderFactory(protocol, endpoint string) (Provider, bool) {
 	return nil, false
 }
 
+// InboundPrefix 是网关对外端点的路径前缀：Handler 注册、server 挂载与异常日志的
+// endpoint 字段共用同一常量，避免前缀字面量在多处重复、改挂载点时日志与访问日志失配。
+const InboundPrefix = "/v1/"
+
 // Handler 返回挂载了 /v1 各端点的 http.Handler。
 //
 //   - GET  /v1/models
@@ -253,11 +257,6 @@ func DefaultProviderFactory(protocol, endpoint string) (Provider, bool) {
 //   - POST /v1/embeddings        (openai-chat)
 //   - POST /v1/responses         (openai-responses)
 //   - POST /v1/messages          (anthropic-messages)
-//
-// InboundPrefix 是网关对外端点的路径前缀：Handler 注册、server 挂载与异常日志的
-// endpoint 字段共用同一常量，避免前缀字面量在多处重复、改挂载点时日志与访问日志失配。
-const InboundPrefix = "/v1/"
-
 func (g *Gateway) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET "+InboundPrefix+"models", g.handleModels)

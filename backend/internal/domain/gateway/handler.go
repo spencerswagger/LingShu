@@ -507,26 +507,32 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 				"route_time_coeff": cr.TimeCoeff,
 			}
 		}
+		// skip 标记"未进入上游即被跳过"的候选：不计入候选失败（否则正常请求会被误判为隐性失败）。
+		skip := func(reason string) map[string]any {
+			m := attempt(reason)
+			m["skipped"] = true
+			return m
+		}
 		// 密钥为运行时实体：路由候选已带 ChannelKeyID，这里做入口复查（状态可能已被灰度切换）。
 		// 统一读 Machine.State()：401 自动禁用后立即生效（kr.Key.State 是落库快照，可能滞后）。
 		kr, ok := g.channels.GetKeyRuntime(cr.ChannelKeyID)
 		if !ok || kr.Machine.State() == channel.StateDisabled {
-			attempts = append(attempts, attempt("禁用"))
+			attempts = append(attempts, skip("禁用"))
 			continue
 		}
 		mr, mok := g.channels.GetModelRuntime(cr.ChannelID, cr.ModelRowID)
 		if !mok {
-			attempts = append(attempts, attempt("无模型运行时"))
+			attempts = append(attempts, skip("无模型运行时"))
 			continue
 		}
 		if mr.Machine.State() == channel.StateDisabled {
-			attempts = append(attempts, attempt("禁用"))
+			attempts = append(attempts, skip("禁用"))
 			continue
 		}
 		rt, ok := g.channels.GetRuntime(cr.ChannelID)
 		if !ok {
 			l.Error("channel not in runtime", "channel_id", cr.ChannelID)
-			attempts = append(attempts, attempt("无渠道运行时"))
+			attempts = append(attempts, skip("无渠道运行时"))
 			continue
 		}
 		// 密钥凭据解密失败/为空时，Manager 已把 CredentialPlain 清空（绝不外发密文）。
@@ -550,13 +556,13 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 		eff := effectiveProtocols(rt, mr)
 		if !eff.Has(baseProtocol) {
 			sawUnsupported = true
-			attempts = append(attempts, attempt("协议不支持"))
+			attempts = append(attempts, skip("协议不支持"))
 			continue
 		}
 		prov, ok := g.providerFactory(baseProtocol, endpoint)
 		if !ok {
 			l.Error("unsupported protocol", "protocol", baseProtocol)
-			attempts = append(attempts, attempt("协议不支持"))
+			attempts = append(attempts, skip("协议不支持"))
 			sawUnsupported = true
 			continue
 		}
@@ -572,12 +578,12 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 		// 限流：模型级窗口 → 密钥级窗口（任一超限 → 下一候选）。
 		if err := g.acquireLimit(ctx, mr.Model.RateLimit, mr.Limiter, estTokens(body)); err != nil {
 			sawLimit = true
-			attempts = append(attempts, attempt("限流"))
+			attempts = append(attempts, skip("限流"))
 			continue
 		}
 		if err := g.acquireLimit(ctx, rt.Channel.RateLimit, kr.Limiter, estTokens(body)); err != nil {
 			sawLimit = true
-			attempts = append(attempts, attempt("限流"))
+			attempts = append(attempts, skip("限流"))
 			continue
 		}
 
@@ -599,7 +605,7 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 				LastMsgFingerprints: msgFps,
 			}, g.channels.KeyMaxSessions(cr.ChannelKeyID))
 			if !ok2 {
-				attempts = append(attempts, attempt("会话满"))
+				attempts = append(attempts, skip("会话满"))
 				continue // 该密钥并发会话满 → 下一候选
 			}
 		}
@@ -1166,7 +1172,16 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 			content, reasoning, tools := assistantParts(assistantMsg)
 			usage = missingUsageEstimate(ureq.Body, assistantMsg, model, content, reasoning, tools)
 		}
-		hardErr := herr != nil && !errors.Is(herr, context.Canceled) && !usageMissing
+		// 客户端已离开（主动断开 / 下游写失败 / 请求 ctx 已取消）：内容无法送达，
+		// 既不算上游中断失败（不置 interrupted、不落 failed 账单），也不应在结论里声称"成功"。
+		clientGone := errors.Is(herr, context.Canceled) || ctx.Err() != nil
+		if clientGone && herr != nil {
+			g.logUpstreamErr(ctx, slog.LevelInfo, "stream client gone", endpoint, ureq.Protocol, model, token, routeRes,
+				diagFromRequest(req, ureq.Protocol, ureq.Cred),
+				errInfo{kind: "client_gone", stage: stage, status: up.StatusCode, attempt: attempt,
+					reason: "客户端已断开，流式响应未完整送达：" + herr.Error(), sessionID: sessionID, durationMs: *dur})
+		}
+		hardErr := herr != nil && !clientGone && !usageMissing
 		if hardErr {
 			out.interrupted = true // 语义上失败：内容被截断，请求级结论不得记为"成功"
 			g.logError(rt.Channel.ID, "stream handle failed", herr)

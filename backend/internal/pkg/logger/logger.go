@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"sync"
 	"sync/atomic"
 )
 
@@ -38,6 +39,18 @@ func New(w io.Writer, level slog.Level) *slog.Logger {
 // NewDefault 输出到 stdout，级别 INFO。
 func NewDefault() *slog.Logger {
 	return New(os.Stdout, slog.LevelInfo)
+}
+
+var (
+	fallbackOnce   sync.Once
+	fallbackLogger *slog.Logger
+)
+
+// Fallback 返回进程级兜底 logger（stdout，与主 logger 同出口、同格式），
+// 供底层包在请求 ctx 未注入 logger 时使用：宁可换个出口，也不静默丢弃异常记录。
+func Fallback() *slog.Logger {
+	fallbackOnce.Do(func() { fallbackLogger = NewDefault() })
+	return fallbackLogger
 }
 
 // WithRequestID 从 ctx 读取 requestID，有则返回带 requestId 字段的新 logger。
