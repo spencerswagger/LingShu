@@ -62,6 +62,8 @@ function snapshot(): string {
 const { markSaved } = useUnsavedGuard(snapshot)
 
 onMounted(async () => {
+  // 返回「模型」合并页时保持选中「Auto 模型」视图
+  sessionStorage.setItem(isSelf.value ? 'dev-models-tab' : 'admin-models-tab', 'auto')
   loading.value = true
   errInfo.value = { message: '', requestId: '' }
   let memberStubs: { ID: string; ExternalName: string }[] = []
