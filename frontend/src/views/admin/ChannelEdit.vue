@@ -27,6 +27,7 @@ import ChannelModels from '@/components/ChannelModels.vue'
 import StatusTag from '@/components/StatusTag.vue'
 import CronInput from '@/components/CronInput.vue'
 import ErrorBubble from '@/components/ErrorBubble.vue'
+import { useUnsavedGuard } from '@/composables/useUnsavedGuard'
 
 const route = useRoute()
 const router = useRouter()
@@ -230,12 +231,47 @@ async function load() {
     await loadKeys()
     await loadTags()
     await loadProtocols()
+    markSaved()
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
   } finally {
     loading.value = false
   }
 }
+
+// ===== 未保存修改守卫 =====
+// 以「提交口径」序列化当前表单快照，与最近一次加载/保存后的快照比对判断是否有未保存修改。
+// 渠道密钥、内部模型在各自弹窗/子表中即时保存，不纳入本页 dirty。
+function snapshot(): string {
+  return JSON.stringify({
+    name: form.name,
+    protocol: form.protocol,
+    base_url: form.base_url,
+    channel_protocol_id: form.channel_protocol_id,
+    tag_ids: form.tag_ids,
+    priority: form.priority,
+    rpm: form.rpm,
+    tpm: tpmRaw(),
+    burst_multiplier: form.burst_multiplier,
+    on_exceed: form.on_exceed,
+    queue_size: form.queue_size,
+    queue_timeout_ms: form.queue_timeout_ms,
+    max_concurrent: form.max_concurrent,
+    interval: form.interval,
+    drain_interval_seconds: form.drain_interval_seconds,
+    timeout_ms: form.timeout_ms,
+    fail_threshold: form.fail_threshold,
+    recovery_threshold: form.recovery_threshold,
+    probe_model: form.probe_model,
+    window_seconds: form.window_seconds,
+    min_samples: form.min_samples,
+    error_rate_pct: form.error_rate_pct,
+    rate_429_pct: form.rate_429_pct,
+    p99_latency_ms: form.p99_latency_ms,
+    auth_fail_threshold: form.auth_fail_threshold,
+  })
+}
+const { dirty, markSaved } = useUnsavedGuard(snapshot)
 onMounted(load)
 
 async function loadStateData() {
@@ -502,6 +538,7 @@ async function onSubmit() {
           <div class="actions">
             <el-button type="primary" :loading="saving" @click="onSubmit">保存</el-button>
             <el-button @click="router.push('/admin/channels')">取消</el-button>
+            <el-tag v-if="dirty" type="warning" size="small" effect="light">有未保存的修改</el-tag>
           </div>
           <el-dialog
             v-model="keyDialogOpen"
@@ -606,6 +643,7 @@ async function onSubmit() {
           <div class="actions">
             <el-button type="primary" :loading="saving" @click="onSubmit">保存</el-button>
             <el-button @click="router.push('/admin/channels')">取消</el-button>
+            <el-tag v-if="dirty" type="warning" size="small" effect="light">有未保存的修改</el-tag>
           </div>
           <ErrorBubble v-if="errInfo.message || errInfo.requestId" :message="errInfo.message" :request-id="errInfo.requestId" />
         </div>
@@ -660,6 +698,7 @@ async function onSubmit() {
           <div class="actions">
             <el-button type="primary" :loading="saving" @click="onSubmit">保存</el-button>
             <el-button @click="router.push('/admin/channels')">取消</el-button>
+            <el-tag v-if="dirty" type="warning" size="small" effect="light">有未保存的修改</el-tag>
           </div>
           <ErrorBubble v-if="errInfo.message || errInfo.requestId" :message="errInfo.message" :request-id="errInfo.requestId" />
         </div>
@@ -719,6 +758,7 @@ async function onSubmit() {
           <div class="actions">
             <el-button type="primary" :loading="saving" @click="onSubmit">保存</el-button>
             <el-button @click="router.push('/admin/channels')">取消</el-button>
+            <el-tag v-if="dirty" type="warning" size="small" effect="light">有未保存的修改</el-tag>
           </div>
           <ErrorBubble v-if="errInfo.message || errInfo.requestId" :message="errInfo.message" :request-id="errInfo.requestId" />
         </div>
