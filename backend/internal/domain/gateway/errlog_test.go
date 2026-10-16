@@ -61,6 +61,21 @@ func TestUpstreamAuthRejectedLogsFullScene(t *testing.T) {
 	if strings.Contains(out, "test-key") {
 		t.Errorf("日志泄漏凭据明文：\n%s", out)
 	}
+	// Fix 1：候选级日志不再声称"已被掩盖"（写出时无法预知后续候选是否成功）。
+	if strings.Contains(out, "masked_by_failover=true") {
+		t.Errorf("候选级日志不应声称已被掩盖：\n%s", out)
+	}
+	// 请求级结论：真实下游状态码 + 未被掩盖 + 会话维度可串联（Fix 2 / Fix 1 / Fix 7）。
+	for _, want := range []string{
+		"gateway request outcome",
+		"status=503",
+		"masked_by_failover=false",
+		"session_id=",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("请求级结论缺少 %q\n实际日志：\n%s", want, out)
+		}
+	}
 }
 
 // 被 failover 掩盖的中间失败（用户侧看到 200）同样必须留痕：
@@ -102,10 +117,13 @@ func TestMaskedUpstreamFailureIsLogged(t *testing.T) {
 
 	out := dump()
 	for _, want := range []string{
-		"upstream auth rejected", // 候选 1 的失败现场
-		"候选失败后请求成功（隐性失败）",        // 请求级结论：失败被掩盖
-		"1.上游失败 → 2.success",     // 原因链可读
-		"failed_candidates=1",    // 失败候选计数
+		"upstream auth rejected",  // 候选 1 的失败现场
+		"候选失败后请求成功（隐性失败）",         // 请求级结论：失败被掩盖
+		"1.上游失败 → 2.success",      // 原因链可读
+		"failed_candidates=1",     // 失败候选计数
+		"status=200",              // Fix 2：真实下游状态码
+		"masked_by_failover=true", // Fix 1：仅请求级结论给出"确实被掩盖"
+		"session_id=",             // Fix 7：会话维度可串联
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("日志缺少 %q\n实际日志：\n%s", want, out)
@@ -143,6 +161,13 @@ func TestErrScopeAndCredentialFingerprint(t *testing.T) {
 	if got := credFingerprint("short"); got != "***(len=5)" {
 		t.Errorf("短凭据应整体脱敏, got %q", got)
 	}
+	// 阈值边界：长度 9（< fpMinLen=16）必须整体脱敏——按首尾各 4 位会只剩 1 位未知，等于准明文。
+	if got := credFingerprint("abcdefghi"); got != "***(len=9)" {
+		t.Errorf("9 字符凭据必须整体脱敏, got %q", got)
+	}
+	if got := credFingerprint("abcdefghijklmno"); got != "***(len=15)" {
+		t.Errorf("15 字符凭据必须整体脱敏, got %q", got)
+	}
 	const cred = "Bearer sk-1234567890"
 	got := credFingerprint(cred)
 	if !strings.HasPrefix(got, "Bear") || !strings.Contains(got, "len=20") {
@@ -150,6 +175,34 @@ func TestErrScopeAndCredentialFingerprint(t *testing.T) {
 	}
 	if strings.Contains(got, "sk-1234567890") {
 		t.Errorf("凭据指纹不应含完整值: %q", got)
+	}
+}
+
+// 上游回显凭据时必须清洗，避免绕过"凭据只落指纹"红线（Fix 4）。
+func TestSanitizeErrSummaryStripsCredentials(t *testing.T) {
+	cases := []struct {
+		in      string
+		mustNot string
+	}{
+		{"Incorrect API key provided: sk-abc123456789", "sk-abc123456789"},
+		{"Unauthorized: Bearer test-key-abcdef", "test-key-abcdef"},
+		{"invalid credential api_key=AKIA1234567890abcd", "AKIA1234567890abcd"},
+	}
+	for _, c := range cases {
+		got := sanitizeErrSummary(c.in)
+		if strings.Contains(got, c.mustNot) {
+			t.Errorf("凭据片段未被清洗: in=%q out=%q", c.in, got)
+		}
+	}
+	// 正常文案不应被改动（避免过度清洗影响排查）。
+	const keep = "The model does not exist or you do not have access to it."
+	if got := sanitizeErrSummary(keep); got != keep {
+		t.Errorf("正常文案被误改: %q", got)
+	}
+	// 摘要路径也必须清洗。
+	_, _, _, summary := upstreamErrParts(`{"error":{"message":"Incorrect API key provided: sk-abc123456789","type":"invalid_request_error"}}`)
+	if strings.Contains(summary, "sk-abc123456789") {
+		t.Errorf("err_summary 泄漏凭据: %q", summary)
 	}
 }
 

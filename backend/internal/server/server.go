@@ -20,7 +20,6 @@ import (
 	"github.com/team/llmgateway/internal/domain/tag"
 	"github.com/team/llmgateway/internal/pkg/jwtx"
 	"github.com/team/llmgateway/internal/pkg/reqmeta"
-	"github.com/team/llmgateway/internal/pkg/resp"
 	"github.com/team/llmgateway/internal/pkg/session"
 )
 
@@ -68,8 +67,6 @@ func New(cfg *config.Config, db *sql.DB, logger *slog.Logger, jwtMgr *jwtx.Manag
 		deps:     deps,
 		mux:      http.NewServeMux(),
 	}
-	// 内部 API 异常日志落点：本包 Err 是全部内部接口错误的唯一出口，注入后即全量覆盖。
-	resp.SetErrorLogger(logger)
 	s.routes()
 	return s
 }
@@ -263,11 +260,14 @@ func (s *Server) routes() {
 // middlewareChain 组装全局中间件链（顺序敏感）。
 // WithRequestID 必须在最外层：它把 request id 写入请求 context 后向内层传递，
 // 放在内层会导致 WithLogging / WithRecover 读到的 requestId 恒为空。
+// WithLoggerContext 紧随其后，把进程 logger 注入 context 供 resp 等底层包落日志。
 func (s *Server) middlewareChain(next http.Handler) http.Handler {
 	return WithRequestID(
-		WithRecover(s.logger)(
-			WithLogging(s.logger)(
-				reqmeta.Middleware(next),
+		WithLoggerContext(s.logger)(
+			WithRecover(s.logger)(
+				WithLogging(s.logger)(
+					reqmeta.Middleware(next),
+				),
 			),
 		),
 	)

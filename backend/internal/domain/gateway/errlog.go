@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -33,7 +34,9 @@ import (
 //  3. 凭据载体：auth_header / auth_present / auth_empty / auth_overridden / auth_fp
 //  4. 转发头：header_names / cred_headers（**仅头名**）
 //  5. 判定线索：upstream_status / err_scope / err_param / err_type / err_code / err_summary
-//  6. 尝试轨迹：attempt / attempts_total / retry / masked_by_failover / reason / duration_ms
+//  6. 尝试轨迹：attempt / attempts_total / retry / reason / duration_ms
+//  7. 请求级结论（logOutcome）：status（真实下游状态码）/ attempts / failed_candidates
+//     / masked_by_failover（仅"确实成功且中间有候选失败"才为 true）/ attempt_trail / session_id
 //
 // 脱敏红线（硬约束，任何新增字段都不得突破）：
 //   - 绝不落凭据明文：凭据只落指纹（前 4 + 末 4 + 长度；短值整体脱敏），网关令牌同理；
@@ -47,6 +50,12 @@ const (
 	// fpPrefixRunes / fpSuffixRunes 凭据指纹保留的首尾字符数（rune，保证 UTF-8 安全）。
 	fpPrefixRunes = 4
 	fpSuffixRunes = 4
+	// fpMinLen 可安全展示首尾指纹的最小字符数：短于该长度一律整体遮蔽。
+	// 取 16 是为了避免"指纹"退化成可暴力补齐的准明文（n=9 时首尾各 4 位只剩 1 位未知）。
+	fpMinLen = 16
+	// inboundPrefix 入站端点的注册前缀，与网关 Handler 的注册路径一致。
+	// 集中为常量，避免前缀字面量在多处重复、改挂载点时日志与访问日志失配。
+	inboundPrefix = "/v1/"
 )
 
 // 上游错误维度（诊断字段 err_scope，**不参与**状态机判定，仅用于事后分诊）：
@@ -72,14 +81,15 @@ var credHeaderNames = map[string]bool{
 }
 
 // credFingerprint 返回凭据值的指纹：前 fpPrefixRunes + 末 fpSuffixRunes + 长度。
-// 空值返回 "empty"；长度不足首尾之和时整体脱敏为 "***(len=N)"。绝不返回任何可复原的完整值。
+// 空值返回 "empty"；**长度不足 fpMinLen 时整体脱敏为 "***(len=N)"**——
+// 短凭据若按首尾各取 4 位，几乎等于明文（如 n=9 只剩 1 位未知），故以长度阈值兜住。
 func credFingerprint(v string) string {
 	if v == "" {
 		return "empty"
 	}
 	r := []rune(v)
 	n := len(r)
-	if n <= fpPrefixRunes+fpSuffixRunes {
+	if n < fpMinLen {
 		return "***(len=" + strconv.Itoa(n) + ")"
 	}
 	return string(r[:fpPrefixRunes]) + "…" + string(r[n-fpSuffixRunes:]) + "(len=" + strconv.Itoa(n) + ")"
@@ -92,7 +102,7 @@ func inboundPath(endpoint string) string {
 	if endpoint == "" || strings.HasPrefix(endpoint, "/") {
 		return endpoint
 	}
-	return "/v1/" + endpoint
+	return inboundPrefix + endpoint
 }
 
 // diag 是一次上游调用的「落点现场」：只记录结构（地址、头名、鉴权头名与值指纹），不记录任何明文。
@@ -189,7 +199,8 @@ func (d diag) kv() []any {
 }
 
 // upstreamErrParts 解析上游错误体中的稳定字段（OpenAI 兼容形状 {error:{param,type,code,message}}）。
-// 非该形状时退化为整段摘要。返回值均经过截断（不含凭据，只取上游回传的错误文案）。
+// 非该形状时退化为整段摘要。返回值均经过**凭据样式清洗**与截断——
+// 上游可能在文案里回显它收到的凭据，直接落盘会突破"凭据只落指纹"的红线。
 func upstreamErrParts(raw string) (param, errType, code, summary string) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -204,9 +215,25 @@ func upstreamErrParts(raw string) (param, errType, code, summary string) {
 		} `json:"error"`
 	}
 	if err := json.Unmarshal([]byte(raw), &v); err == nil && (v.Error.Message != "" || v.Error.Type != "" || v.Error.Code != "") {
-		return v.Error.Param, v.Error.Type, v.Error.Code, truncateLog(v.Error.Message, errSummaryMaxBytes)
+		return v.Error.Param, v.Error.Type, v.Error.Code, truncateLog(sanitizeErrSummary(v.Error.Message), errSummaryMaxBytes)
 	}
-	return "", "", "", truncateLog(raw, errSummaryMaxBytes)
+	return "", "", "", truncateLog(sanitizeErrSummary(raw), errSummaryMaxBytes)
+}
+
+// 上游可能在错误文案里回显它收到的凭据（如 "Incorrect API key provided: sk-abc…"）。
+// 三组样式覆盖常见写法：厂商前缀令牌、Bearer 头、key/token/secret=值。
+var (
+	credValueRe  = regexp.MustCompile(`(?i)\b(?:sk|rk|pk|ak|gsk|xai|nvapi|hf|glm)[-_][A-Za-z0-9._\-]{6,}`)
+	credBearerRe = regexp.MustCompile(`(?i)\b(bearer)\s+[A-Za-z0-9._\-]{6,}`)
+	credKVRe     = regexp.MustCompile(`(?i)(api[\s_-]?key|access[\s_-]?token|secret|token)(\s*[:=]\s*)["']?[A-Za-z0-9._\-]{8,}`)
+)
+
+// sanitizeErrSummary 对上游错误文案做凭据样式清洗，避免第三方回显把凭据带进日志。
+func sanitizeErrSummary(s string) string {
+	s = credValueRe.ReplaceAllString(s, "***")
+	s = credBearerRe.ReplaceAllString(s, "$1 ***")
+	s = credKVRe.ReplaceAllString(s, "$1$2***")
+	return s
 }
 
 // modelScopeHints / credentialScopeHints 是上游报文的口径线索（小写匹配）。
@@ -256,8 +283,7 @@ type errInfo struct {
 	downstream    int    // 返回给下游的状态码（本地拒绝等非上游失败场景）
 	attempt       int    // 当前候选序号（1 起）
 	attemptsTotal int    // 候选总数
-	retry         bool   // 本次失败是否已转入下一候选（true 说明该失败可能被 failover 掩盖）
-	masked        bool   // 是否确认被后续候选/最终成功掩盖
+	retry         bool   // 本次失败是否已转入下一候选（true=可能被后续候选掩盖）
 	scope         string // err_scope
 	param         string
 	errType       string
@@ -316,7 +342,9 @@ func (g *Gateway) logErr(ctx context.Context, lvl slog.Level, msg, endpoint, pro
 	if e.attempt > 0 {
 		args = append(args, "attempt", e.attempt, "attempts_total", e.attemptsTotal)
 	}
-	args = append(args, "retry", e.retry, "masked_by_failover", e.masked)
+	// masked_by_failover 不在此输出：候选级日志无法预知后续候选是否成功，
+	// 该结论只由请求级 logOutcome 在"确实成功"时给出，避免把"可能被掩盖"说成"已掩盖"。
+	args = append(args, "retry", e.retry)
 	if e.scope != "" {
 		args = append(args, "err_scope", e.scope)
 	}
@@ -339,8 +367,13 @@ func (g *Gateway) logErr(ctx context.Context, lvl slog.Level, msg, endpoint, pro
 
 // logReject 记录一次「未进入上游」的网关拒绝（认证/参数/路由/余额/限流/协议不支持等）。
 // durationMs 允许为 nil（未计时），与账单侧 *int64 口径保持一致。
+// 客户端类拒绝（status < 500）受 logger.ClientErrorLogEnabled 开关控制：
+// 高并发下失效令牌/脚本化错误调用可能刷屏，可用 LOG_CLIENT_ERRORS=off 关闭；5xx 始终记录。
 func (g *Gateway) logReject(ctx context.Context, endpoint, model, reason string, status int,
 	token *identity.Token, durationMs *int64) {
+	if status < http.StatusInternalServerError && !logger.ClientErrorLogEnabled() {
+		return
+	}
 	e := errInfo{kind: "rejected", stage: "request", downstream: status, reason: reason, durationMs: deref64(durationMs)}
 	g.logErr(ctx, slog.LevelWarn, "gateway request rejected", endpoint, "", model, token, nil, diag{}, e)
 }
@@ -356,9 +389,12 @@ func (g *Gateway) logUpstreamErr(ctx context.Context, lvl slog.Level, msg, endpo
 }
 
 // logOutcome 在请求终态落一条「请求级结论」日志：
-// 成功但中间有候选失败（隐性失败）同样落 Warn，这是排查"用户正常、密钥却被禁用"的关键线索。
+//   - status 为**实际写出的下游状态码**，reason 与之一致（成功/失败不混淆）；
+//   - masked_by_failover 只在此处给出：仅当请求确实成功且中间有候选失败时为 true
+//     （候选级日志不再输出该字段，见 logErr 注释）；
+//   - 成功但中间有候选失败（隐性失败）落 Warn，这是排查"用户正常、密钥却被禁用"的关键线索。
 func (g *Gateway) logOutcome(ctx context.Context, lvl slog.Level, endpoint, model, reason string,
-	status int, token *identity.Token, attempts []map[string]any, durationMs *int64) {
+	status int, masked bool, token *identity.Token, sessionID string, attempts []map[string]any, durationMs *int64) {
 	if g.logger == nil {
 		return
 	}
@@ -370,11 +406,15 @@ func (g *Gateway) logOutcome(ctx context.Context, lvl slog.Level, endpoint, mode
 		"reason", reason,
 		"attempts", len(attempts),
 		"failed_candidates", failed,
+		"masked_by_failover", masked,
 		"attempt_trail", trail,
 		"duration_ms", deref64(durationMs),
 	}
 	if token != nil {
 		args = append(args, "user_id", token.UserID, "token_id", token.ID)
+	}
+	if sessionID != "" {
+		args = append(args, "session_id", sessionID)
 	}
 	logger.WithRequestID(ctx, g.logger).Log(ctx, lvl, "gateway request outcome", args...)
 }
