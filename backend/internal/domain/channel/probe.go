@@ -51,6 +51,15 @@ func renderAuth(protocol, cred string) (header, value string) {
 	return header, value
 }
 
+// probeHeaderPolicy 求探测请求应套用的请求头策略：渠道协议读取（探测与真实转发同源），
+// 内联渠道/未引用协议时为空策略（无「覆盖」）。缺省时上游要求自定义头会导致探测必然失败。
+func probeHeaderPolicy(rt *RuntimeChannel) channelprotocol.HeaderPolicy {
+	if rt != nil && rt.Protocol != nil {
+		return rt.Protocol.RequestHeaders
+	}
+	return channelprotocol.HeaderPolicy{}
+}
+
 // joinProbeURL 拼基址与路径（去基址尾 /、路径头 /）。
 func joinProbeURL(base, path string) string {
 	return strings.TrimRight(base, "/") + "/" + strings.TrimLeft(path, "/")
@@ -266,9 +275,11 @@ func (m *Manager) probeOnce(ctx context.Context, keyID int64, probeModel, level 
 		chRT.Protocol = m.lookupChannelProtocol(ctx, kr.Channel.ChannelProtocolID)
 	}
 	target, authHeader, authValue := m.probeRequest(chRT, kr.CredentialPlain)
+	// 探测与真实转发同源：套用协议「覆盖(set)」头，否则上游要求自定义头（如会话标识）时探测必失败。
+	policy := probeHeaderPolicy(chRT)
 
 	start := m.now()
-	fb, usage, errMsg := m.doProbeAuth(ctx, target, authHeader, authValue, probeModel, timeout)
+	fb, usage, errMsg := m.doProbeAuth(ctx, target, authHeader, authValue, probeModel, policy, kr.CredentialPlain, timeout)
 	dur := m.now().Sub(start).Milliseconds()
 
 	m.markKeyProbeResult(keyID, errMsg)
@@ -283,9 +294,9 @@ func (m *Manager) probeOnce(ctx context.Context, keyID int64, probeModel, level 
 func ProbeFeedback(fb Feedback) Feedback { return fb }
 
 // doProbeAuth 构建并执行最小对话探测请求，解析响应 usage 与状态分类（鉴权头名/值可定制，
-// 以支持 x-api-key/raw 等渠道协议鉴权）。
+// 以支持 x-api-key/raw 等渠道协议鉴权），并套用协议「覆盖(set)」请求头（与网关热路径同源）。
 // 2xx 成功；401/403 认证失败（→禁用）；429 上游限流；其余失败；超时标记 IsTimeout。
-func (m *Manager) doProbeAuth(ctx context.Context, url, authHeader, authValue, model string, timeout time.Duration) (Feedback, ProbeUsage, string) {
+func (m *Manager) doProbeAuth(ctx context.Context, url, authHeader, authValue, model string, policy channelprotocol.HeaderPolicy, cred string, timeout time.Duration) (Feedback, ProbeUsage, string) {
 	fb := Feedback{HasProbe: true, Now: m.now()}
 	var usage ProbeUsage
 	if strings.TrimSpace(url) == "" {
@@ -312,6 +323,8 @@ func (m *Manager) doProbeAuth(ctx context.Context, url, authHeader, authValue, m
 	if authValue != "" {
 		req.Header.Set(authHeader, authValue)
 	}
+	// 「覆盖(set)」：与网关热路径同一引擎（channelprotocol.ApplySet），支持 {api_key}/{model} 等变量。
+	channelprotocol.ApplySet(req.Header, policy.Set, cred, map[string]string{"model": model}, nil)
 
 	resp, err := m.probeHTTP.Do(req)
 	if err != nil {
