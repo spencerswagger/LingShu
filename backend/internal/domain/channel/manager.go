@@ -1205,7 +1205,7 @@ func (m *Manager) ProbeModelNow(channelID, modelRowID int64) (ProbeOutcome, erro
 	}
 	target, authHeader, authValue := m.probeRequest(chRT, credential)
 	// 手动模型探测同样套用协议「覆盖(set)」头（与定时探测/真实转发同源）。
-	policy := probeHeaderPolicy(chRT)
+	policy := chRT.Protocol.EffectiveHeaderPolicy()
 
 	ctx := context.Background()
 	start := m.now()

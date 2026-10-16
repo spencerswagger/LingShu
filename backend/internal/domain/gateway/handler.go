@@ -597,7 +597,8 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 			Vars: map[string]string{
 				"session_id": sessionID,
 				"request_id": logger.GetRequestID(ctx),
-				"model":      model,
+				// {model} 恒取内部模型 ID（与探测/拉取口径一致；请求体 model 亦已改写为它）。
+				"model": routeRes.InternalModelID,
 			},
 		}
 

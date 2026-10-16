@@ -129,6 +129,15 @@ func (cp *ChannelProtocol) EffectiveBaseURL(protocol string) string {
 	return strings.TrimSpace(cp.BaseURL)
 }
 
+// EffectiveHeaderPolicy 返回该渠道协议的请求头策略；nil 接收者返回零值策略（无透传、无「覆盖」）。
+// 网关热路径（真实转发）与渠道健康探测/模型拉取共用同一取值口径，避免各处漂移。
+func (cp *ChannelProtocol) EffectiveHeaderPolicy() HeaderPolicy {
+	if cp == nil {
+		return HeaderPolicy{}
+	}
+	return cp.RequestHeaders
+}
+
 // EffectiveModelProtocols 求某内部模型可达的上游协议集合：
 // 模型级覆盖（channel_models.protocols）优先，其次预设模型级定义，最后 provider 级协议集。
 func (cp *ChannelProtocol) EffectiveModelProtocols(internalModelID string, modelOverride Protocols) Protocols {

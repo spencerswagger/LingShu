@@ -99,6 +99,85 @@ func TestDoProbe_AppliesHeaderOverride(t *testing.T) {
 	}
 }
 
+// 手动模型探测（ProbeModelNow → probeOnce 链路）必须套用协议「覆盖(set)」头：
+// {model} 取内部模型 ID、{session_id}/{request_id} 随机非空且互不相同。
+func TestProbeModelNow_AppliesHeaderOverride(t *testing.T) {
+	var gotModel, gotSID, gotRID string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotModel = r.Header.Get("X-Model-Trace")
+		gotSID = r.Header.Get("X-Session-Id")
+		gotRID = r.Header.Get("X-Request-Id")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"usage":{"total_tokens":1}}`))
+	}))
+	defer srv.Close()
+
+	mgr, mock := newKeyProbeTestManager(t, srv.URL, HealthProbeConfig{FailThreshold: 1, RecoveryThreshold: 2, TimeoutMS: 1000},
+		[]ChannelModel{{ID: 21, InternalModelID: "m1", ExternalModelID: 1, State: StateNormal}})
+	addKeyRuntime(t, mgr, 11, testKeyACred, StateNormal)
+	mgr.rt[1].Protocol = &channelprotocol.ChannelProtocol{
+		RequestHeaders: channelprotocol.HeaderPolicy{
+			Set: map[string]string{
+				"X-Model-Trace": "{model}",
+				"X-Session-Id":  "{session_id}",
+				"X-Request-Id":  "{request_id}",
+			},
+		},
+	}
+
+	mock.ExpectExec(regexp.QuoteMeta(insertProbeLogSQL)).
+		WithArgs(sqlmock.AnyArg(), int64(11), "m1", "model", srv.URL+"/chat/completions", true, "", 0, 0, 0, 1, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	out, err := mgr.ProbeModelNow(1, 21)
+	if err != nil || !out.OK {
+		t.Fatalf("ProbeModelNow: err=%v out=%+v", err, out)
+	}
+	if gotModel != "m1" {
+		t.Errorf("{model} 应取内部模型 ID, got %q", gotModel)
+	}
+	if gotSID == "" || gotRID == "" {
+		t.Errorf("{session_id}/{request_id} 应随机生成非空, got %q/%q", gotSID, gotRID)
+	}
+	if gotSID == gotRID {
+		t.Errorf("{session_id} 与 {request_id} 应不同, both %q", gotSID)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("probe log not written: %v", err)
+	}
+}
+
+// 定时/密钥探测（keyProbeOnce → probeOnce 链路）同样套用协议「覆盖(set)」头。
+func TestKeyProbeOnce_AppliesHeaderOverride(t *testing.T) {
+	var gotModel string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotModel = r.Header.Get("X-Model-Trace")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}`))
+	}))
+	defer srv.Close()
+
+	mgr, mock := newKeyProbeTestManager(t, srv.URL,
+		HealthProbeConfig{Interval: "0 * * * * *", TimeoutMS: 1000, FailThreshold: 1, RecoveryThreshold: 2},
+		[]ChannelModel{{ID: 21, InternalModelID: "m-default", ExternalModelID: 1, State: StateNormal}})
+	addKeyRuntime(t, mgr, 11, testKeyACred, StateNormal)
+	mgr.rt[1].Protocol = &channelprotocol.ChannelProtocol{
+		RequestHeaders: channelprotocol.HeaderPolicy{Set: map[string]string{"X-Model-Trace": "{model}"}},
+	}
+
+	mock.ExpectExec(regexp.QuoteMeta(insertProbeLogSQL)).
+		WithArgs(sqlmock.AnyArg(), int64(11), "m-default", "model", srv.URL+"/chat/completions", true, "", 3, 4, 0, 7, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	mgr.keyProbeOnce(context.Background(), 11)
+	if gotModel != "m-default" {
+		t.Errorf("定时探测应套用覆盖头且 {model} 取内部模型 ID, got %q", gotModel)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("probe log not written: %v", err)
+	}
+}
+
 // newProbeTestManager 返回一个可执行 doProbe 的 Manager（store 为空，仅用于探测链路）。
 func newProbeTestManager() *Manager {
 	return NewManager(nil, nil, []byte("0123456789abcdef"), &http.Client{Timeout: 2 * time.Second}, nil, time.Now)
