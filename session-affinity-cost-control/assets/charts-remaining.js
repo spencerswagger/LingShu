@@ -59,4 +59,43 @@
     });
     rs(c);
   });
+
+  /* ---------- 图 3：按"当前轮消息角色"分段的 m(k)（示意） ---------- */
+  // 四条曲线基数不同，体现"角色是主信号"；均随 k 缓慢上升（次要信号）
+  function roleSeries(base) {
+    var out = [];
+    for (var i = 0; i <= 30; i++) {
+      out.push(+(base * (1 + 0.04 * i)).toFixed(2));
+    }
+    return out;
+  }
+  var mUser = roleSeries(9);
+  var mAsstTool = roleSeries(5);
+  var mTool = roleSeries(2.5);
+  var mAsstFinal = roleSeries(1.5);
+
+  ready('chart-role', function () {
+    var c = echarts.init(document.getElementById('chart-role'), null, { renderer: 'svg' });
+    c.setOption({
+      animation: false,
+      color: [accent, accent2, '#7C3AED', muted],
+      tooltip: { trigger: 'axis', appendToBody: true, valueFormatter: function (v) { return v + ' 轮'; } },
+      legend: {
+        data: ['最后一条是用户消息', '最后一条是含工具调用的助手消息', '最后一条是工具结果', '最后一条是最终助手消息'],
+        textStyle: { color: muted }, top: 0
+      },
+      grid: baseGrid,
+      xAxis: { type: 'category', name: '会话已进行轮数 k', nameLocation: 'middle', nameGap: 30, nameTextStyle: { color: muted },
+        boundaryGap: false, data: K, axisLine: { lineStyle: { color: rule } }, axisTick: { show: false }, axisLabel: { color: muted } },
+      yAxis: { type: 'value', name: '预计剩余轮数', nameTextStyle: { color: muted },
+        axisLine: { show: false }, axisTick: { show: false }, splitLine: { lineStyle: { color: rule } }, axisLabel: { color: muted } },
+      series: [
+        { name: '最后一条是用户消息', type: 'line', smooth: true, symbol: 'none', lineStyle: { width: 3 }, data: mUser },
+        { name: '最后一条是含工具调用的助手消息', type: 'line', smooth: true, symbol: 'none', lineStyle: { width: 2.5 }, data: mAsstTool },
+        { name: '最后一条是工具结果', type: 'line', smooth: true, symbol: 'none', lineStyle: { width: 2.5 }, data: mTool },
+        { name: '最后一条是最终助手消息', type: 'line', smooth: true, symbol: 'none', lineStyle: { width: 2, type: 'dashed' }, data: mAsstFinal }
+      ]
+    });
+    rs(c);
+  });
 })();
