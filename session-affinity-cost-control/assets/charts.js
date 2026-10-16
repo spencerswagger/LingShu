@@ -10,13 +10,12 @@
   function rs(c) { window.addEventListener('resize', function () { c.resize(); }); }
   var baseGrid = { left: 8, right: 24, top: 48, bottom: 8, containLabel: true };
 
-  /* ---------- 图：每轮花费 vs 缓存读token数（真实价：deepseek-v4-flash） ---------- */
+  /* ---------- 图：每轮花费 vs 缓存读token数（deepseek-v4-flash 真实价） ---------- */
   ready('chart-perround', function () {
-    // Venice AI: IO 便宜、缓存读贵；DeepSeek: 缓存读便宜、输出贵（单位 美元/百万token，相对比较）
-    var crA = 0.028, inA = 0.138, ouA = 0.275;
-    var crB = 0.003, inB = 0.150, ouB = 0.600;
+    var crA = 0.028, inA = 0.138, ouA = 0.275;  // Venice AI
+    var crB = 0.003, inB = 0.150, ouB = 0.600;  // DeepSeek
     var u = 1000, o = 1000;
-    var base = (inA * u + ouA * o) / 1e6; // 归一化基准
+    var base = (inA * u + ouA * o) / 1e6;
     function cost(cr, pin, pou, C) { return (cr * C + pin * u + pou * o) / 1e6 / base; }
     var x = [], yA = [], yB = [];
     for (var C = 0; C <= 40000; C += 2000) {
@@ -32,14 +31,63 @@
         boundaryGap: false, data: x, axisLine: { lineStyle: { color: rule } }, axisTick: { show: false },
         axisLabel: { color: muted, formatter: function (v) { return v / 1000 + 'k'; } } },
       yAxis: { type: 'value', name: '每轮花费（基准=1）', nameTextStyle: { color: muted },
-        axisLine: { show: false }, axisTick: { show: false }, splitLine: { lineStyle: { color: rule } },
-        axisLabel: { color: muted } },
+        axisLine: { show: false }, axisTick: { show: false }, splitLine: { lineStyle: { color: rule } }, axisLabel: { color: muted } },
       series: [
         { name: 'Venice AI（输入/输出便宜）', type: 'line', smooth: true, symbol: 'none', lineStyle: { width: 3 }, data: yA,
           markLine: { silent: true, symbol: 'none', lineStyle: { color: muted, type: 'dashed' },
-            label: { color: ink, fontWeight: 700, position: 'insideEndTop', formatter: '临界 ≈ 1.35 万 token' },
-            data: [{ xAxis: 7 }] } },
+            label: { color: ink, fontWeight: 700, position: 'insideEndTop', formatter: '临界 ≈ 1.35 万 token' }, data: [{ xAxis: 7 }] } },
         { name: 'DeepSeek（缓存读便宜）', type: 'line', smooth: true, symbol: 'none', lineStyle: { width: 3 }, data: yB }
+      ]
+    });
+    rs(c);
+  });
+
+  /* ---------- 图：回本轮数分布直方图（6850 组） ---------- */
+  ready('chart-hist', function () {
+    var labels = ['0–1', '1–2', '2–3', '3–5', '5–8', '8–12', '12–20', '20–30', '30–50', '>50'];
+    var counts = [255, 364, 393, 762, 607, 713, 798, 641, 930, 1387];
+    var c = echarts.init(document.getElementById('chart-hist'), null, { renderer: 'svg' });
+    c.setOption({
+      animation: false, color: [accent],
+      tooltip: { trigger: 'axis', appendToBody: true, axisPointer: { type: 'shadow' },
+        valueFormatter: function (v) { return v + ' 组'; } },
+      grid: baseGrid,
+      xAxis: { type: 'category', name: '回本轮数（长会话极限）', nameLocation: 'middle', nameGap: 30, nameTextStyle: { color: muted },
+        data: labels, axisLine: { lineStyle: { color: rule } }, axisTick: { show: false }, axisLabel: { color: muted, fontSize: 11 } },
+      yAxis: { type: 'value', name: '可切换对数', nameTextStyle: { color: muted },
+        axisLine: { show: false }, axisTick: { show: false }, splitLine: { lineStyle: { color: rule } }, axisLabel: { color: muted } },
+      series: [{
+        type: 'bar', data: counts, barMaxWidth: 42, itemStyle: { borderRadius: [4, 4, 0, 0] },
+        label: { show: true, position: 'top', color: ink, fontSize: 10 },
+        markLine: { silent: true, symbol: 'none', lineStyle: { color: accent2, type: 'dashed' },
+          label: { color: accent2, fontWeight: 700, formatter: '中位数落在 12–20 档（≈15 轮）' },
+          data: [{ xAxis: '12–20' }] }
+      }]
+    });
+    rs(c);
+  });
+
+  /* ---------- 图：回本轮数随 缓存读R 变化（三种 新增输入/输出 规模） ---------- */
+  ready('chart-hcurve', function () {
+    var R = [20000, 30000, 60000, 120000, 240000];
+    var s1 = [18.0, 10.7, 7.6, 6.6, 6.2];      // 新增输入1000 / 输出1000
+    var s2 = [null, 58.0, 10.7, 7.6, 6.6];      // 新增输入2000 / 输出2000
+    var s3 = [null, null, 58.0, 10.7, 7.6];     // 新增输入4000 / 输出4000
+    var c = echarts.init(document.getElementById('chart-hcurve'), null, { renderer: 'svg' });
+    c.setOption({
+      animation: false, color: [accent, accent2, muted],
+      tooltip: { trigger: 'axis', appendToBody: true, valueFormatter: function (v) { return v + ' 轮'; } },
+      legend: { data: ['新增输入/输出 = 1000/1000', '= 2000/2000', '= 4000/4000'], textStyle: { color: muted }, top: 0 },
+      grid: baseGrid,
+      xAxis: { type: 'category', name: '缓存读token数', nameLocation: 'middle', nameGap: 30, nameTextStyle: { color: muted },
+        boundaryGap: false, data: R, axisLine: { lineStyle: { color: rule } }, axisTick: { show: false },
+        axisLabel: { color: muted, formatter: function (v) { return v / 1000 + 'k'; } } },
+      yAxis: { type: 'value', name: '回本轮数', nameTextStyle: { color: muted }, max: 70,
+        axisLine: { show: false }, axisTick: { show: false }, splitLine: { lineStyle: { color: rule } }, axisLabel: { color: muted } },
+      series: [
+        { name: '新增输入/输出 = 1000/1000', type: 'line', symbol: 'circle', symbolSize: 7, lineStyle: { width: 2.5 }, data: s1 },
+        { name: '= 2000/2000', type: 'line', symbol: 'circle', symbolSize: 7, lineStyle: { width: 2.5 }, data: s2, connectNulls: false },
+        { name: '= 4000/4000', type: 'line', symbol: 'circle', symbolSize: 7, lineStyle: { width: 2.5 }, data: s3, connectNulls: false }
       ]
     });
     rs(c);

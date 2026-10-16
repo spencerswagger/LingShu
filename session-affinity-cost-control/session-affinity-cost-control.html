@@ -207,46 +207,85 @@ flowchart TD
   <!-- 05 实测模拟 -->
   <section>
     <h2><span class="h2no">05</span>models.dev 实测模拟</h2>
-    <p><b>数据</b>：models.dev，230 家渠道、8432 个含价模型，其中 5518 个含缓存读价。对「同一模型被多家渠道提供」的情形穷举渠道对，共 <b>6850 组可切换对</b>（口径为输入/缓存读/输出单价，相对比较，与本模型同构）。</p>
+    <p><b>数据</b>：models.dev，230 家渠道、8432 个含价模型（5518 个含缓存读价）。对「同一模型被多家渠道提供」的情形穷举渠道对，得到 <b>6850 组可切换对</b>（口径为输入 / 缓存读 / 输出单价，相对比较，与本模型同构）。</p>
 
+    <div class="callout">
+      <span class="co-tag">先纠正我上一条的说法</span>
+      <p>「中位数 15」<b>不是用某一组输入/输出算出来的</b>，它也不是唯一答案。回本轮数本身是一个<b>多维函数</b>：取决于 <b>缓存读token数、新增输入token数、输出token数</b>，以及<b>两渠道的三档单价与倍率</b>。<b>15 只是"长会话"这一个切面的极限值</b>——当缓存读token数很大时，新增输入与输出两项被稀释，回本轮数收敛到只由价格决定的常数。下面把它拆成三个维度看。</p>
+    </div>
+
+    <h3>判断式的另一种写法（更直观）</h3>
     <div class="formula">
-      <div class="f-label">长会话下「回本轮数」的计算式</div>
+      <div class="f-label">回本轮数（一般情形，中文）</div>
       <div class="f-body">
-        <span class="op">（</span>新渠道输入单价 <span class="op">－</span> 新渠道缓存读单价<span class="op">）</span><br>
-        <span class="op">÷</span><span class="op">（</span>旧渠道缓存读单价 <span class="op">－</span> 新渠道缓存读单价<span class="op">）</span>
+        分子 ＝ 缓存读token数 <span class="op">×</span><span class="op">（</span>新渠道输入单价 <span class="op">－</span> 新渠道缓存读单价<span class="op">）</span><br>
+        分母 ＝ 缓存读token数 <span class="op">×</span><span class="op">（</span>旧渠道缓存读单价 <span class="op">－</span> 新渠道缓存读单价<span class="op">）</span><br>
+        　　　<span class="op">＋</span> 新增输入token数 <span class="op">×</span><span class="op">（</span>旧渠道输入单价 <span class="op">－</span> 新渠道输入单价<span class="op">）</span><br>
+        　　　<span class="op">＋</span> 输出token数 <span class="op">×</span><span class="op">（</span>旧渠道输出单价 <span class="op">－</span> 新渠道输出单价<span class="op">）</span><br>
+        <span class="q">回本轮数 ＝ 分子 ÷ 分母</span>（可再乘各自渠道的时段与分档倍率）
       </div>
-      <p class="f-note">即：目标渠道提供的缓存折扣幅度 ÷ 两渠道的缓存读价差。会话越长，回本所需轮数越趋于该值。</p>
+      <p class="f-note">于是决策可等价写成：<b>「预计剩余轮数 ＞ 该候选的回本轮数」就切</b>。注意两个量不同：回本轮数是每轮用真实用量<b>现算</b>出来的（随维度变化）；预计剩余轮数才是那个<b>策略参数</b>。</p>
     </div>
 
-    <div class="table-wrap">
-      <table>
-        <thead><tr><th>回本轮数分布（6850 组）</th><th>p10</th><th>p25</th><th>中位数</th><th>p75</th><th>p90</th></tr></thead>
-        <tbody>
-          <tr><td>轮数</td><td>≈2</td><td>≈5</td><td><b>≈15</b></td><td>≈40</td><td>≈90</td></tr>
-        </tbody>
-      </table>
-    </div>
-
-    <p>具体例子（模型 <b>deepseek-v4-flash</b>，两家渠道结构相反）：</p>
-    <div class="table-wrap">
-      <table>
-        <thead><tr><th>渠道</th><th>输入</th><th>缓存读</th><th>输出</th><th>说明</th></tr></thead>
-        <tbody>
-          <tr><td>Venice AI</td><td>0.138</td><td>0.028</td><td>0.275</td><td>输入/输出便宜，缓存读贵</td></tr>
-          <tr><td>DeepSeek</td><td>0.150</td><td>0.003</td><td>0.600</td><td>缓存读便宜，输出贵</td></tr>
-        </tbody>
-      </table>
-    </div>
-    <p>两者在<b>缓存读约 1.35 万 token</b> 处相交（图 2）。会话越长，切到 DeepSeek 越划算；长会话下回本只需 <b>≈5.9 轮</b>——即会话只要还剩六轮以上，就值得切。</p>
-
+    <h3>维度一：长会话极限的分布（6850 组）</h3>
+    <p>当缓存读token数远大于新增输入与输出时，分母后两项可忽略，回本轮数 →（新渠道输入单价 － 新渠道缓存读单价）÷（旧渠道缓存读单价 － 新渠道缓存读单价）。把 6850 组按此值从小到大排序取中位，即得 <b>≈15 轮</b>。完整分布如下：</p>
     <figure class="chart-figure">
-      <figcaption>图 2 · 每轮花费随缓存读token数变化（真实价：deepseek-v4-flash）
-        <span>灰色虚线为临界点（约 1.35 万 token）：其左 Venice AI 更省，其右 DeepSeek 更省。</span>
+      <figcaption>图 2 · 回本轮数分布直方图（长会话极限，6850 组）
+        <span>中位数落在 12–20 档；但长尾很重——&gt;50 档就有 1387 组。说明"要不要切"高度依赖具体渠道对，不能一概而论。</span>
       </figcaption>
-      <div id="chart-perround" style="width:100%;min-height:380px;"></div>
+      <div id="chart-hist" style="width:100%;min-height:360px;"></div>
+    </figure>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>回本轮数</th><th>0–1</th><th>1–2</th><th>2–3</th><th>3–5</th><th>5–8</th><th>8–12</th><th>12–20</th><th>20–30</th><th>30–50</th><th>&gt;50</th></tr></thead>
+        <tbody><tr><td>组数</td><td>255</td><td>364</td><td>393</td><td>762</td><td>607</td><td>713</td><td><b>798</b></td><td>641</td><td>930</td><td>1387</td></tr></tbody>
+      </table>
+    </div>
+
+    <h3>维度二：随「缓存读 / 新增输入 / 输出」变化</h3>
+    <p>以 <b>deepseek-v4-flash</b>、Venice AI → DeepSeek 为例（旧 0.138/0.028/0.275，新 0.150/0.003/0.600）。同一对渠道，回本轮数会随三个 token 量一起变：</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>新增输入 / 输出</th><th>缓存读 2万</th><th>3万</th><th>6万</th><th>12万</th><th>24万</th></tr></thead>
+        <tbody>
+          <tr><td>1000 / 1000</td><td>18.0</td><td>10.7</td><td>7.6</td><td>6.6</td><td>6.2</td></tr>
+          <tr><td>2000 / 2000</td><td>不回本</td><td>58.0</td><td>10.7</td><td>7.6</td><td>6.6</td></tr>
+          <tr><td>4000 / 4000</td><td>不回本</td><td>不回本</td><td>58.0</td><td>10.7</td><td>7.6</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <figure class="chart-figure">
+      <figcaption>图 3 · 回本轮数随缓存读token数变化（三种新增输入/输出规模）
+        <span>缓存读越大、回本越快（曲线向下）；新增输入与输出越大，整条曲线右移（更难回本）。三个 token 量都是变量——这就是"多维"。</span>
+      </figcaption>
+      <div id="chart-hcurve" style="width:100%;min-height:370px;"></div>
     </figure>
 
-    <div class="verdict"><b>结论</b>：真实价格下的回本轮数大多落在「个位数到几十轮」——短会话多数不值得切，长会话很快值得切。这正是「摊销轮数」的合理量级区间。</div>
+    <h3>维度三：单对渠道的每轮花费（临界点）</h3>
+    <p>两家渠道结构相反时（一家输入/输出便宜、缓存读贵；另一家相反），每轮花费随缓存读token数变化的曲线会相交：</p>
+    <figure class="chart-figure">
+      <figcaption>图 4 · 每轮花费随缓存读token数变化（deepseek-v4-flash 真实价）
+        <span>两线交于约 1.35 万 token：其左 Venice AI 更省，其右 DeepSeek 更省。交点即临界点。</span>
+      </figcaption>
+      <div id="chart-perround" style="width:100%;min-height:370px;"></div>
+    </figure>
+
+    <h3>原始数据样例（旧渠道 → 新渠道）</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>模型</th><th>旧 → 新渠道</th><th>旧：输入/缓存读/输出</th><th>新：输入/缓存读/输出</th><th>长会话回本轮数</th></tr></thead>
+        <tbody>
+          <tr><td>glm-5.3</td><td>TensorX → OpenRouter</td><td>1.750 / 0.440 / 4.500</td><td>0.079 / 0.078 / 4.800</td><td>≈0（目标几乎无缓存折扣，随时可切）</td></tr>
+          <tr><td>glm-5.3</td><td>Kilo Gateway → OpenRouter</td><td>1.400 / 0.260 / 4.400</td><td>0.079 / 0.078 / 4.800</td><td>≈0</td></tr>
+          <tr><td>gpt-5-nano</td><td>Ofox → Vercel AI Gateway</td><td>0.040 / 0.008 / 0.320</td><td>0.050 / 0.005 / 0.400</td><td>15.0</td></tr>
+          <tr><td>gpt-5-nano</td><td>Ofox → FastRouter</td><td>0.040 / 0.008 / 0.320</td><td>0.050 / 0.005 / 0.400</td><td>15.0</td></tr>
+          <tr><td>gemini-3.5-flash</td><td>Poe → Merge Gateway</td><td>1.515 / 0.151 / 9.091</td><td>1.500 / 0.150 / 9.000</td><td>900（缓存价差极小，几乎不值得切）</td></tr>
+          <tr><td>gemini-3.5-flash</td><td>Poe → Eden AI</td><td>1.515 / 0.151 / 9.091</td><td>1.500 / 0.150 / 9.000</td><td>900</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="verdict"><b>结论</b>：回本轮数是「缓存读 / 新增输入 / 输出 / 两渠道三档单价 / 倍率」的多维函数；仅"长会话极限"这一个切面就落在个位数～几十轮（中位 ≈15）。因此<b>不能把它当常数</b>——每轮都要用真实用量现算。这与第 03 节一致：真正需要设定/学习的只有一个策略参数（预计剩余轮数）。</div>
   </section>
 
   <!-- 06 反复切换 -->
@@ -261,7 +300,7 @@ flowchart TD
     </ul>
     <p>此外，把「未来可能还会再切」的因素计入摊销轮数的估计，也可进一步减少无谓切换。</p>
     <figure class="chart-figure">
-      <figcaption>图 3 · 各渠道价随时刻变化（示例：某渠道闲时 22–08，另一渠道闲时 00–06）
+      <figcaption>图 5 · 各渠道价随时刻变化（示例：某渠道闲时 22–08，另一渠道闲时 00–06）
         <span>「谁更省」随时间翻转，是「会多次切换」与「边界抖动」的共同来源。</span>
       </figcaption>
       <div id="chart-intraday" style="width:100%;min-height:340px;"></div>
