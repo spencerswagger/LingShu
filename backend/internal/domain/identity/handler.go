@@ -166,12 +166,13 @@ func (h *Handler) HandleCaptcha(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	id, b64, err := h.captcha.Generate()
+	id, imageURI, err := h.captcha.Generate()
 	if err != nil {
 		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "验证码生成失败")
 		return
 	}
-	resp.OK(w, r, map[string]string{"CaptchaID": id, "ImageBase64": b64})
+	// imageURI 为含 "data:image/png;base64," 前缀的完整 data URI，前端可直接用作 img src。
+	resp.OK(w, r, map[string]string{"CaptchaID": id, "ImageDataURI": imageURI})
 }
 
 // HandleRegister POST /api/v1/auth/register 开发者自助注册（公开接口）。

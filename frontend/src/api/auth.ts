@@ -33,9 +33,10 @@ export interface MeResult {
   Balance: number
 }
 
-// 图形验证码：注册前获取（公开接口）
+// 图形验证码：注册前获取（公开接口）。
+// ImageDataURI 为后端直接返回的完整 data URI（含 "data:image/png;base64," 前缀），可直接用作 img src。
 export function genCaptcha() {
-  return http.get<{ CaptchaID: string; ImageBase64: string }, ApiRes<{ CaptchaID: string; ImageBase64: string }>>('/auth/captcha')
+  return http.get<{ CaptchaID: string; ImageDataURI: string }, ApiRes<{ CaptchaID: string; ImageDataURI: string }>>('/auth/captcha')
 }
 
 // 自主注册：成功即返回已签发会话（Token + User）
