@@ -660,11 +660,22 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 			default:
 				attempts = append(attempts, attempt("success"))
 			}
-			// 隐性失败可见化：请求最终成功、但中间有候选失败（用户侧无感知）。
-			// 这是"用户一切正常、密钥却被禁用"的唯一现场，必须落日志。
+			// 请求级结论：状态码取**实际写出的下游状态码**（由 fwdOutcome 带回），
+			// 避免把「计费失败(402/500)」「上游失败(502)」误报成成功；
+			// 只有真正成功（非计费失败/退款且 status<400）且中间有候选失败，才是"隐性失败"。
+			status := out.downstreamStatus
+			if status == 0 {
+				status = http.StatusOK // 兜底：已响应但未记录状态码（理论不可达）
+			}
 			if _, failed := summarizeAttempts(attempts); failed > 0 {
-				g.logOutcome(ctx, slog.LevelWarn, endpoint, model, "候选失败后请求成功（隐性失败）",
-					http.StatusOK, token, attempts, msSince(start))
+				failedReq := out.billFailed || out.refundPre || status >= http.StatusBadRequest
+				lvl := slog.LevelWarn
+				reason := "候选失败后请求成功（隐性失败）"
+				if failedReq {
+					lvl = slog.LevelError
+					reason = "候选失败且请求最终失败（详见各候选失败日志）"
+				}
+				g.logOutcome(ctx, lvl, endpoint, model, reason, status, !failedReq, token, sessionID, attempts, msSince(start))
 			}
 			return
 		}
@@ -697,7 +708,7 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 		bid := g.recordGatewayReject(ctx, model, autoName, token, pricingMode, sessionID, msgUnsupportedProtocol)
 		g.writeCallLog(ctx, bid, "", token, &router.RouteResult{AutoModelName: autoName}, model, pricingMode, sessionID,
 			reqMsgs, "error", "", "failed", msgUnsupportedProtocol, msSince(start), nil, rejectDecision())
-		g.logOutcome(ctx, slog.LevelWarn, endpoint, model, msgUnsupportedProtocol, http.StatusBadRequest, token, attempts, msSince(start))
+		g.logOutcome(ctx, slog.LevelWarn, endpoint, model, msgUnsupportedProtocol, http.StatusBadRequest, false, token, sessionID, attempts, msSince(start))
 		writeUnsupportedProtocol(w)
 		return
 	}
@@ -710,7 +721,7 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 			g.writeCallLog(ctx, bid, "", token, &router.RouteResult{AutoModelName: autoName}, model, pricingMode, sessionID,
 				reqMsgs, "error", "", "failed", msgRateLimited, msSince(start), nil, rejectDecision())
 		}
-		g.logOutcome(ctx, slog.LevelWarn, endpoint, model, "全部候选限流（本地限流/上游 429）", http.StatusTooManyRequests, token, attempts, msSince(start))
+		g.logOutcome(ctx, slog.LevelWarn, endpoint, model, "全部候选限流（本地限流/上游 429）", http.StatusTooManyRequests, false, token, sessionID, attempts, msSince(start))
 		writeOpenAIError(w, http.StatusTooManyRequests, msgRateLimited)
 		return
 	}
@@ -720,7 +731,7 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 		g.writeCallLog(ctx, bid, "", token, &router.RouteResult{AutoModelName: autoName}, model, pricingMode, sessionID,
 			reqMsgs, "error", "", "failed", msgNoAvailable, msSince(start), nil, rejectDecision())
 	}
-	g.logOutcome(ctx, slog.LevelError, endpoint, model, "全部候选均失败（无可用渠道）", http.StatusServiceUnavailable, token, attempts, msSince(start))
+	g.logOutcome(ctx, slog.LevelError, endpoint, model, "全部候选均失败（无可用渠道）", http.StatusServiceUnavailable, false, token, sessionID, attempts, msSince(start))
 	writeOpenAIError(w, http.StatusServiceUnavailable, msgNoAvailable)
 }
 
@@ -826,12 +837,15 @@ func billingCtx(ctx context.Context) (context.Context, context.CancelFunc) {
 // 预扣不退、按预扣计费，杜绝赊账）；refundPre=true 表示仅落了 failed 账单、
 // 未实际消费（上游/转发失败），预扣应全额退回。
 type fwdOutcome struct {
-	responded  bool
-	retry      bool
-	is429      bool
-	charged    float64
-	billFailed bool
-	refundPre  bool
+	responded bool
+	retry     bool
+	is429     bool
+	charged   float64
+	// downstreamStatus 已写出的下游 HTTP 状态码（responded=true 时有效；0=未记录）。
+	// 请求级日志必须用它而非固定 200：否则「计费失败(402/500)」「上游失败(502)」会被误报为成功。
+	downstreamStatus int
+	billFailed       bool
+	refundPre        bool
 }
 
 // serveNonStream 非流式转发：2xx 先计费再响应。
@@ -882,7 +896,7 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
 			"error", "上游请求失败（已送达，不转移）", "failed", "上游请求失败（已送达，不转移）", msSince(start), nil, g.callLogDecision(attempts, "上游请求失败", pc, routeRes))
 		writeOpenAIError(w, http.StatusBadGateway, msgUpstreamDown)
-		return &fwdOutcome{responded: true, refundPre: true}
+		return &fwdOutcome{responded: true, refundPre: true, downstreamStatus: http.StatusBadGateway}
 	}
 	defer up.Body.Close()
 
@@ -900,7 +914,7 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 			g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
 				"error", "读取上游响应失败", "failed", "读取上游响应失败", msSince(start), nil, g.callLogDecision(attempts, "读取上游响应失败", pc, routeRes))
 			writeOpenAIError(w, http.StatusBadGateway, msgUpstreamDown)
-			return &fwdOutcome{responded: true, refundPre: true}
+			return &fwdOutcome{responded: true, refundPre: true, downstreamStatus: http.StatusBadGateway}
 		}
 		dur := msSince(start)
 		usage, uerr := prov.ExtractUsage(raw)
@@ -935,7 +949,7 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 				g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
 					"non_stream", string(raw), "failed", "积分余额不足，计费失败", dur, nil, g.callLogDecision(attempts, "积分余额不足", pc, routeRes))
 				writeOpenAIError(w, http.StatusPaymentRequired, msgInsufficient)
-				return &fwdOutcome{responded: true, billFailed: true}
+				return &fwdOutcome{responded: true, billFailed: true, downstreamStatus: http.StatusPaymentRequired}
 			}
 			g.logError(rt.Channel.ID, "record billing failed", berr)
 			g.logUpstreamErr(ctx, slog.LevelError, "billing failed", endpoint, ureq.Protocol, model, token, routeRes,
@@ -945,7 +959,7 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 			g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
 				"non_stream", string(raw), "failed", "计费失败", dur, nil, g.callLogDecision(attempts, "计费失败", pc, routeRes))
 			writeOpenAIError(w, http.StatusInternalServerError, msgInternal)
-			return &fwdOutcome{responded: true, billFailed: true}
+			return &fwdOutcome{responded: true, billFailed: true, downstreamStatus: http.StatusInternalServerError}
 		}
 		out.charged = ch
 		// 调用日志：成功路径（已知 billingID 且响应写出前）。
@@ -960,6 +974,7 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 		applyResponseHeaderWhitelist(w, up.Header, g.upstreamHeaders())
 		h := w.Header()
 		h.Set("Content-Type", up.Header.Get("Content-Type"))
+		out.downstreamStatus = up.StatusCode // 请求级日志用真实状态码
 		w.WriteHeader(up.StatusCode)
 		_, _ = w.Write(raw)
 		// usage 缺失的渠道已置 DISABLED，不再回喂成功反馈（与流式路径一致，避免禁用态被注入成功样本）。
@@ -975,7 +990,7 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 		param, etype, ecode, summary := upstreamErrParts(upErr)
 		g.logUpstreamErr(ctx, slog.LevelWarn, "upstream rate limited", endpoint, ureq.Protocol, model, token, routeRes,
 			diagFromRequest(req, ureq.Protocol, ureq.Cred),
-			errInfo{kind: "upstream_status", stage: stage, status: up.StatusCode, attempt: attempt, retry: true, masked: true,
+			errInfo{kind: "upstream_status", stage: stage, status: up.StatusCode, attempt: attempt, retry: true,
 				param: param, errType: etype, errCode: ecode, summary: summary,
 				reason: "上游限流(429)，已转入下一候选", sessionID: sessionID, durationMs: *msSince(start)})
 		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, errMsg, msSince(start))
@@ -992,7 +1007,7 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 		param, etype, ecode, summary := upstreamErrParts(upErr)
 		g.logUpstreamErr(ctx, slog.LevelWarn, "upstream auth rejected", endpoint, ureq.Protocol, model, token, routeRes,
 			diagFromRequest(req, ureq.Protocol, ureq.Cred),
-			errInfo{kind: "upstream_status", stage: stage, status: up.StatusCode, attempt: attempt, retry: true, masked: true,
+			errInfo{kind: "upstream_status", stage: stage, status: up.StatusCode, attempt: attempt, retry: true,
 				param: param, errType: etype, errCode: ecode, summary: summary,
 				reason: "上游返回 401/403，已转入下一候选（该失败通常对下游不可见）", sessionID: sessionID, durationMs: *msSince(start)})
 		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, errMsg, msSince(start))
@@ -1012,7 +1027,7 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 		g.logUpstreamErr(ctx, lvl, "upstream error response", endpoint, ureq.Protocol, model, token, routeRes,
 			diagFromRequest(req, ureq.Protocol, ureq.Cred),
 			errInfo{kind: "upstream_status", stage: stage, status: up.StatusCode, attempt: attempt,
-				retry: retryable, masked: retryable,
+				retry: retryable,
 				param: param, errType: etype, errCode: ecode, summary: summary,
 				reason: errMsg, sessionID: sessionID, durationMs: *msSince(start)})
 		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, errMsg, msSince(start))
@@ -1022,7 +1037,7 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 			return &fwdOutcome{retry: true}
 		}
 		writeOpenAIError(w, http.StatusBadGateway, msgUpstreamDown)
-		return &fwdOutcome{responded: true, refundPre: true}
+		return &fwdOutcome{responded: true, refundPre: true, downstreamStatus: http.StatusBadGateway}
 	}
 }
 
@@ -1112,7 +1127,7 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
 			"error", "上游流式请求失败（已送达，不转移）", "failed", "上游流式请求失败（已送达，不转移）", msSince(start), nil, g.callLogDecision(attempts, "上游请求失败", pc, routeRes))
 		writeOpenAIError(w, http.StatusBadGateway, msgUpstreamDown)
-		return &fwdOutcome{responded: true, refundPre: true}
+		return &fwdOutcome{responded: true, refundPre: true, downstreamStatus: http.StatusBadGateway}
 	}
 	defer up.Body.Close()
 
@@ -1128,6 +1143,9 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		billCtx, cancelBill := billingCtx(ctx)
 		defer cancelBill()
 		out := &fwdOutcome{responded: true}
+		// 流式响应由 HandleStream 按 200 写响应头，内容一旦下发不可撤回：
+		// 计费失败/中断只影响账单与日志语义，下游状态码仍是 200，故照实记录。
+		out.downstreamStatus = http.StatusOK
 		usageMissing := errors.Is(herr, ErrUsageMissing)
 		if usageMissing {
 			// AC-17（放宽）：上游不符合接口协议的返回属极端情况；内容已透传无法撤回，
@@ -1191,7 +1209,7 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		param, etype, ecode, summary := upstreamErrParts(upErr)
 		g.logUpstreamErr(ctx, slog.LevelWarn, "upstream rate limited", endpoint, ureq.Protocol, model, token, routeRes,
 			diagFromRequest(req, ureq.Protocol, ureq.Cred),
-			errInfo{kind: "upstream_status", stage: stage, status: up.StatusCode, attempt: attempt, retry: true, masked: true,
+			errInfo{kind: "upstream_status", stage: stage, status: up.StatusCode, attempt: attempt, retry: true,
 				param: param, errType: etype, errCode: ecode, summary: summary,
 				reason: "上游限流(429)，已转入下一候选", sessionID: sessionID, durationMs: *msSince(start)})
 		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, errMsg, msSince(start))
@@ -1208,7 +1226,7 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		param, etype, ecode, summary := upstreamErrParts(upErr)
 		g.logUpstreamErr(ctx, slog.LevelWarn, "upstream auth rejected", endpoint, ureq.Protocol, model, token, routeRes,
 			diagFromRequest(req, ureq.Protocol, ureq.Cred),
-			errInfo{kind: "upstream_status", stage: stage, status: up.StatusCode, attempt: attempt, retry: true, masked: true,
+			errInfo{kind: "upstream_status", stage: stage, status: up.StatusCode, attempt: attempt, retry: true,
 				param: param, errType: etype, errCode: ecode, summary: summary,
 				reason: "上游返回 401/403，已转入下一候选（该失败通常对下游不可见）", sessionID: sessionID, durationMs: *msSince(start)})
 		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, errMsg, msSince(start))
@@ -1228,7 +1246,7 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		g.logUpstreamErr(ctx, lvl, "upstream error response", endpoint, ureq.Protocol, model, token, routeRes,
 			diagFromRequest(req, ureq.Protocol, ureq.Cred),
 			errInfo{kind: "upstream_status", stage: stage, status: up.StatusCode, attempt: attempt,
-				retry: retryable, masked: retryable,
+				retry: retryable,
 				param: param, errType: etype, errCode: ecode, summary: summary,
 				reason: errMsg, sessionID: sessionID, durationMs: *msSince(start)})
 		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, errMsg, msSince(start))
@@ -1238,7 +1256,7 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 			return &fwdOutcome{retry: true}
 		}
 		writeOpenAIError(w, http.StatusBadGateway, msgUpstreamDown)
-		return &fwdOutcome{responded: true, refundPre: true}
+		return &fwdOutcome{responded: true, refundPre: true, downstreamStatus: http.StatusBadGateway}
 	}
 }
 

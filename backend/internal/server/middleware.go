@@ -19,6 +19,7 @@ import (
 	"github.com/team/llmgateway/internal/domain/audit"
 	"github.com/team/llmgateway/internal/pkg/clientip"
 	"github.com/team/llmgateway/internal/pkg/jwtx"
+	"github.com/team/llmgateway/internal/pkg/logger"
 	"github.com/team/llmgateway/internal/pkg/resp"
 	"github.com/team/llmgateway/internal/pkg/session"
 )
@@ -85,15 +86,26 @@ func WithRequestID(next http.Handler) http.Handler {
 	})
 }
 
+// WithLoggerContext 把进程 logger 注入请求 context，供 resp 等底层包落日志
+// （替代此前的包级全局注入，避免多处构造 server 相互覆盖）。须置于中间件链靠外层。
+func WithLoggerContext(l *slog.Logger) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			next.ServeHTTP(w, r.WithContext(logger.WithLogger(r.Context(), l)))
+		})
+	}
+}
+
 // WithLogging 输出请求日志：method/path/status/耗时/requestId/客户端 IP。
 // 级别按状态码分级（2xx/3xx=Info、4xx=Warn、5xx=Error），使"接口异常"在日志里天然可过滤：
 // 运维不必再逐条翻访问日志找问题，直接按级别 + path 聚合即可定位异常面。
+// 4xx 受 logger.ClientErrorLogEnabled 开关控制：关闭时降为 Info（访问日志仍在，只是不再告警级）。
 //
 // 日志写在 defer 中：panic 会把控制流从 next.ServeHTTP 直接掀起，函数尾部语句永不执行——
 // 而 500（panic）恰恰是最需要出现在访问日志里的请求。defer 保证"每一次进入的请求都留下
 // 一条访问记录"；panic 时状态记为 500，随后重新抛出，交给外层 WithRecover 写响应与 panic
 // 日志（defer 内→外执行，故此处先记录、再上抛）。
-func WithLogging(logger *slog.Logger) func(http.Handler) http.Handler {
+func WithLogging(l *slog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
@@ -109,9 +121,11 @@ func WithLogging(logger *slog.Logger) func(http.Handler) http.Handler {
 				case status >= http.StatusInternalServerError:
 					lvl = slog.LevelError
 				case status >= http.StatusBadRequest:
-					lvl = slog.LevelWarn
+					if logger.ClientErrorLogEnabled() {
+						lvl = slog.LevelWarn
+					}
 				}
-				logger.Log(r.Context(), lvl, "http request",
+				l.Log(r.Context(), lvl, "http request",
 					"method", r.Method,
 					"path", r.URL.Path,
 					"status", status,
