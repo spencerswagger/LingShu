@@ -565,9 +565,9 @@ export interface ServiceStatusView {
   CandidatesDataTime?: string | null
   SampleUsage: SampleUsage
 }
-// 服务状态聚合查询：Expand = 逗号分隔的对外模型 ID 列表（仅展开项才计算候选）
-export function getServiceStatus(params: { Expand?: string } = {}) {
-  return http.get<ServiceStatusView, ApiRes<ServiceStatusView>>('/admin/service-status', { params })
+// 服务状态聚合查询：候选（成本/序位）由后端对全部启用对外模型计算，无需查询参数
+export function getServiceStatus() {
+  return http.get<ServiceStatusView, ApiRes<ServiceStatusView>>('/admin/service-status')
 }
 
 // ===== 标签 =====

@@ -58,7 +58,8 @@ type serviceStatusBody struct {
 	Data      json.RawMessage `json:"Data"`
 }
 
-// TestHandleServiceStatus 覆盖聚合端点：渠道明细、对外模型、按需候选展开与决策 14 的按需计算语义。
+// TestHandleServiceStatus 覆盖聚合端点：渠道明细、对外模型、全量候选计算（决策 14 调整为全量）。
+// 候选（成本/序位）对全部「已启用」对外模型逐一计算，不再依赖 Expand 查询参数；已禁用模型跳过。
 func TestHandleServiceStatus(t *testing.T) {
 	mgr := channel.NewManager(nil, nil, nil, nil, nil, nil)
 	h := NewAdmin(nil, nil, mgr, func(context.Context) (int64, bool) { return 1, true })
@@ -66,8 +67,8 @@ func TestHandleServiceStatus(t *testing.T) {
 	h.SetRouterEngine(fe)
 	h.SetModelSource(fakeModelSource{})
 
-	// 第一次请求：带 Expand=7，应按需计算候选。
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/service-status?Expand=7", nil)
+	// 第一次请求：无任何查询参数，应直接对启用的对外模型（ID=7）计算候选。
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/service-status", nil)
 	req = resp.WithRequestID(req, "req-service-status")
 	rec := httptest.NewRecorder()
 	h.HandleServiceStatus(rec, req)
@@ -97,24 +98,23 @@ func TestHandleServiceStatus(t *testing.T) {
 	}
 	cand := data.Candidates["7"]
 	if len(cand) != 2 {
-		t.Fatalf("Candidates[\"7\"] 长度=%d, want 2", len(cand))
+		t.Fatalf("Candidates[\"7\"] 长度=%d, want 2（无需 Expand 即应计算）", len(cand))
 	}
 	if cand[0].Rank != 1 || cand[1].Rank != 2 {
 		t.Fatalf("Rank=%d/%d, want 1/2", cand[0].Rank, cand[1].Rank)
 	}
 	if data.CandidatesDataTime == nil {
-		t.Fatalf("带 Expand 时 CandidatesDataTime 不应为 nil")
+		t.Fatalf("已注入引擎时应计算候选，CandidatesDataTime 不应为 nil")
 	}
 	if fe.calls != 1 {
 		t.Fatalf("RouteAll 调用次数=%d, want 1", fe.calls)
 	}
 
-	// 第二次请求：无 Expand，不应触发 RouteAll，候选为空且 CandidatesDataTime 为 nil。
-	req2 := httptest.NewRequest(http.MethodGet, "/api/v1/admin/service-status", nil)
+	// 第二次请求：仍应全量计算（不再受 Expand 参数控制），候选与首次一致。
 	rec2 := httptest.NewRecorder()
-	h.HandleServiceStatus(rec2, req2)
-	if fe.calls != 1 {
-		t.Fatalf("无 Expand 时不应触发 RouteAll，calls=%d", fe.calls)
+	h.HandleServiceStatus(rec2, httptest.NewRequest(http.MethodGet, "/api/v1/admin/service-status", nil))
+	if fe.calls != 2 {
+		t.Fatalf("第二次请求也应全量计算，calls=%d, want 2", fe.calls)
 	}
 	var body2 serviceStatusBody
 	if err := json.Unmarshal(rec2.Body.Bytes(), &body2); err != nil {
@@ -124,11 +124,30 @@ func TestHandleServiceStatus(t *testing.T) {
 	if err := json.Unmarshal(body2.Data, &data2); err != nil {
 		t.Fatalf("unmarshal Data2: %v", err)
 	}
-	if len(data2.Candidates) != 0 {
-		t.Fatalf("无 Expand 时 Candidates 应为空 map，got=%+v", data2.Candidates)
+	if len(data2.Candidates["7"]) != 2 {
+		t.Fatalf("第二次请求 Candidates[\"7\"] 长度=%d, want 2", len(data2.Candidates["7"]))
 	}
-	if data2.CandidatesDataTime != nil {
-		t.Fatalf("无 Expand 时 CandidatesDataTime 应为 nil，got=%v", data2.CandidatesDataTime)
+	if data2.CandidatesDataTime == nil {
+		t.Fatalf("第二次请求 CandidatesDataTime 不应为 nil")
+	}
+
+	// 已禁用的对外模型（ID=8）无法路由，应跳过而不产生候选与错误调用。
+	h2 := NewAdmin(nil, nil, channel.NewManager(nil, nil, nil, nil, nil, nil), func(context.Context) (int64, bool) { return 1, true })
+	fe2 := &fakeRouteEngine{}
+	h2.SetRouterEngine(fe2)
+	h2.SetModelSource(fakeModelListSource{items: []model.ExternalModel{
+		{ID: 7, ExternalName: "gpt-x", Enabled: true},
+		{ID: 8, ExternalName: "gpt-off", Enabled: false},
+	}})
+	data3 := doStatus(t, h2)
+	if len(data3.Candidates["7"]) != 2 {
+		t.Fatalf("启用模型 ID=7 应有候选，got=%+v", data3.Candidates["7"])
+	}
+	if _, ok := data3.Candidates["8"]; ok {
+		t.Fatalf("已禁用模型 ID=8 不应计算候选，got=%+v", data3.Candidates["8"])
+	}
+	if fe2.calls != 1 {
+		t.Fatalf("仅启用模型应触发 RouteAll，calls=%d, want 1", fe2.calls)
 	}
 }
 
