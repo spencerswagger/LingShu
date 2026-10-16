@@ -4,7 +4,6 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/team/llmgateway/internal/domain/billing"
@@ -13,7 +12,7 @@ import (
 	"github.com/team/llmgateway/internal/pkg/resp"
 )
 
-// ServiceStatusView 是「服务状态」页聚合视图：渠道三层运行明细 + 对外模型清单 + 按需展开的候选顺序 +
+// ServiceStatusView 是「服务状态」页聚合视图：渠道三层运行明细 + 对外模型清单 + 候选顺序（成本/序位）+
 // 成本比较样值。ID 类字段用 `,string` JSON tag，与既有 ChannelView/ModelView 契约一致。
 type ServiceStatusView struct {
 	DataTime           time.Time                  `json:"DataTime"`
@@ -24,7 +23,7 @@ type ServiceStatusView struct {
 	SampleUsage        billing.Usage              `json:"SampleUsage"`
 }
 
-// externalModelItem 对外模型清单项（只读枚举，供前端选择要展开的候选）。
+// externalModelItem 对外模型清单项（只读枚举，供前端展示名称/启用态并本地聚合成本与序位）。
 type externalModelItem struct {
 	ID           int64  `json:"ID,string"`
 	ExternalName string `json:"ExternalName"`
@@ -46,10 +45,11 @@ type candidateItem struct {
 
 // HandleServiceStatus GET /api/v1/admin/service-status
 //
-// 聚合端点：一次性返回渠道三层运行明细、对外模型清单、按需展开的候选顺序与成本比较样值。
+// 聚合端点：一次性返回渠道三层运行明细、对外模型清单、候选顺序（成本/序位）与成本比较样值。
 // DataTime 为最终一致快照时间（决策 13）：各层明细允许与路由热路径毫秒级错位，前端自行对齐展示。
-// 候选顺序按需计算（决策 14）：仅当传入 Expand（逗号分隔的对外模型 ID 列表）且非空时才逐项调用
-// RouteAll，且 SessionKey 传空以关闭会话亲和；未传 Expand 时不做任何路由计算。
+// 候选顺序对全部「已启用」对外模型逐一调用 RouteAll 计算，且 SessionKey 传空以关闭会话亲和。
+// 决策 14 已由「按需展开（Expand 参数）」调整为「全量计算」：保证「成本」列与「候选序位」在任何
+// 维度视图下都有值，前端不再需要「展开对外模型」控件（已禁用对外模型无法路由，跳过以免无谓报错）。
 //
 // 密钥存活会话数（Keys[].ActiveSessions）为「实时读取」路由会话注册表所得，非快照：
 // 与 MaxSessions（并发上限，静态配置）语义不同，前者是当前占用、后者是容量；未装配路由引擎时为 0。
@@ -116,21 +116,16 @@ func (h *Admin) HandleServiceStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 候选顺序：仅当 Expand 非空且已注入路由引擎时按需计算。
-	if expand := parseExpand(r.URL.Query().Get("Expand")); len(expand) > 0 && h.routeEng != nil {
-		nameByID := make(map[int64]string, len(view.ExternalModels))
+	// 候选顺序：对全部「已启用」对外模型逐一计算（不再依赖查询参数），使「成本」列与「候选序位」始终有值。
+	// 已禁用/已删除的对外模型无法路由（GetByExternalName 仅取启用且未删），跳过以免每轮产生无意义错误日志。
+	if h.routeEng != nil && h.models != nil {
 		for _, m := range view.ExternalModels {
-			nameByID[m.ID] = m.ExternalName
-		}
-		for _, id := range expand {
-			name, ok := nameByID[id]
-			if !ok {
-				slog.Default().Warn("展开的对外模型不存在", "request_id", resp.RequestID(r), "external_model_id", id)
+			if !m.Enabled {
 				continue
 			}
-			routes, err := h.routeEng.RouteAll(ctx, router.RouteSpec{ExternalModel: name, SessionKey: ""})
+			routes, err := h.routeEng.RouteAll(ctx, router.RouteSpec{ExternalModel: m.ExternalName, SessionKey: ""})
 			if err != nil {
-				slog.Default().Error("计算候选顺序失败", "request_id", resp.RequestID(r), "external_model_id", id, "err", err)
+				slog.Default().Error("计算候选顺序失败", "request_id", resp.RequestID(r), "external_model_id", m.ID, "err", err)
 				continue
 			}
 			items := make([]candidateItem, 0, len(routes))
@@ -147,7 +142,7 @@ func (h *Admin) HandleServiceStatus(w http.ResponseWriter, r *http.Request) {
 					TimeCoeff:       rt.TimeCoeff,
 				})
 			}
-			view.Candidates[strconv.FormatInt(id, 10)] = items
+			view.Candidates[strconv.FormatInt(m.ID, 10)] = items
 		}
 		cdt := dataTime
 		view.CandidatesDataTime = &cdt
@@ -159,29 +154,6 @@ func (h *Admin) HandleServiceStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp.OK(w, r, view)
-}
-
-// parseExpand 解析逗号分隔的对外模型 ID 列表；忽略空白项与非数字项。
-// 非法项（非数字）跳过并记录日志（不整请求失败）。
-func parseExpand(v string) []int64 {
-	if v == "" {
-		return nil
-	}
-	parts := strings.Split(v, ",")
-	out := make([]int64, 0, len(parts))
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p == "" {
-			continue
-		}
-		id, err := strconv.ParseInt(p, 10, 64)
-		if err != nil {
-			slog.Default().Warn("忽略非法的 Expand 项", "value", p)
-			continue
-		}
-		out = append(out, id)
-	}
-	return out
 }
 
 // worstChannelState 取渠道派生状态：渠道无独立状态机，取其全部内部模型与密钥的最差状态

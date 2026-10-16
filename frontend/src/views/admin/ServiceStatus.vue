@@ -32,8 +32,7 @@ import { fmtDateTime } from '@/utils/format'
 const DIM_KEYS: string[] = ['external', 'internal', 'channel', 'key']
 const dims = ref<string[]>(['channel', 'key']) // 默认只勾选「渠道 + 密钥」
 
-// 对外模型展开列表：其 ID 列表同时作为聚合端点的 Expand 参数（仅展开项才计算候选序位）。
-const expand = ref<string[]>([])
+// 刷新间隔（秒；manual 表示不自动刷新）。
 const refreshInterval = ref('30') // 默认 30 秒
 
 // 通路矩阵一行 = 已勾选维度叉积分组：折叠维度以 covered 集合渲染聚合摘要。
@@ -663,8 +662,7 @@ async function load() {
   loading.value = true
   errInfo.value = { message: '', requestId: '' }
   try {
-    const ex = expand.value.length ? expand.value.join(',') : undefined
-    const res = await getServiceStatus({ Expand: ex })
+    const res = await getServiceStatus()
     view.value = res.Data
   } catch (e: any) {
     errInfo.value = { message: e?.message || '', requestId: e?.requestId || '' }
@@ -685,7 +683,7 @@ function startTimer() {
   timer = window.setInterval(load, Number(refreshInterval.value) * 1000)
 }
 
-// URL 状态回写（dims / expand）：onMounted 读取回填，变更时写回。
+// URL 状态回写（dims）：onMounted 读取回填，变更时写回。
 function readUrl() {
   const dq = route.query.dims
   if (typeof dq === 'string' && dq) {
@@ -695,34 +693,15 @@ function readUrl() {
       .filter((s) => DIM_KEYS.includes(s))
     if (list.length) dims.value = list
   }
-  const eq = route.query.expand
-  if (typeof eq === 'string' && eq) {
-    expand.value = eq
-      .split(',')
-      .map((s) => s.trim())
-      .filter(Boolean)
-  }
 }
 function persistUrl() {
-  const query: Record<string, string> = { dims: dims.value.join(',') }
-  if (expand.value.length) query.expand = expand.value.join(',')
-  router.replace({ query })
+  router.replace({ query: { dims: dims.value.join(',') } })
 }
 
 onMounted(async () => {
   readUrl()
   await load()
   startTimer()
-  // 展开变化会改变 Expand 参数 → 立即重拉并重置定时器；dims 变化仅影响渲染与 URL。
-  watch(
-    expand,
-    () => {
-      persistUrl()
-      load()
-      startTimer()
-    },
-    { deep: true },
-  )
   watch(dims, () => persistUrl(), { deep: true })
   watch(refreshInterval, () => startTimer())
 })
@@ -741,17 +720,6 @@ onUnmounted(stopTimer)
           <el-checkbox label="channel">渠道</el-checkbox>
           <el-checkbox label="key">密钥</el-checkbox>
         </el-checkbox-group>
-      </div>
-      <div class="tb-item">
-        <span class="tb-label">展开对外模型（计算新会话序位）</span>
-        <el-select v-model="expand" multiple collapse-tags placeholder="未展开" size="small" class="tb-select">
-          <el-option
-            v-for="e in externalModels"
-            :key="e.ID"
-            :label="e.ExternalName + (e.Enabled ? '' : '（停用）')"
-            :value="e.ID"
-          />
-        </el-select>
       </div>
       <div class="tb-item">
         <span class="tb-label">刷新</span>
@@ -868,8 +836,8 @@ onUnmounted(stopTimer)
             <el-tooltip placement="top">
               <template #content>
                 <div class="tt">
-                  <div class="tt-line">成本 = 该行覆盖候选成本 min–max（引擎默认样值 {{ sampleUsageText }}）</div>
-                  <div class="tt-line">候选成本由后端按需计算：需先在工具栏「展开对外模型」勾选对应对外模型，未展开时显示 —</div>
+                  <div class="tt-line">成本 = 该行覆盖候选成本 min–max（引擎样值 {{ sampleUsageText }}）</div>
+                  <div class="tt-line">候选由引擎对全部启用对外模型实时计算，此处展示该行覆盖候选的成本区间</div>
                 </div>
               </template>
               <span>成本</span>
@@ -1089,10 +1057,10 @@ onUnmounted(stopTimer)
       维度列只展示名称，不展示内部 ID/行主键；状态以状态灯表达（与「会话」列表一致）。
     </div>
     <div class="foot-note">
-      成本区间来自后端按需计算的候选（需在工具栏展开对应对外模型）；未展开时显示 —。RPM/TPM/会话数均展示「当前值/上限」并附用量灯（≥100% 红、≥80% 橙）。
+      成本区间来自引擎对全部启用对外模型实时计算的候选成本；RPM/TPM/会话数均展示「当前值/上限」并附用量灯（≥100% 红、≥80% 橙）。
     </div>
     <div class="foot-note">
-      序位色条仅在对外模型与密钥同时展开时出现，不代表新会话会走这条。
+      序位色条仅在「对外模型/内部模型」与「密钥」两个维度同时勾选（行粒度为单一通路）时出现，不代表新会话会走这条。
     </div>
   </div>
 </template>
@@ -1115,9 +1083,6 @@ onUnmounted(stopTimer)
   font-size: 12px;
   color: var(--color-text-secondary);
   white-space: nowrap;
-}
-.tb-select {
-  min-width: 240px;
 }
 .tb-int {
   width: 96px;
