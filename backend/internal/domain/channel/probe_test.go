@@ -59,6 +59,46 @@ func TestRenderAuthAndJoinProbeURL(t *testing.T) {
 	}
 }
 
+// 探测请求必须套用协议「覆盖(set)」头（与真实转发同源），否则上游要求自定义头时探测必失败。
+func TestDoProbe_AppliesHeaderOverride(t *testing.T) {
+	var gotTrace, gotModelVar, gotKeyVar, gotBlocked string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotTrace = r.Header.Get("X-Session-Trace")
+		gotModelVar = r.Header.Get("X-Model-Var")
+		gotKeyVar = r.Header.Get("X-Key-Var")
+		gotBlocked = r.Header.Get("Cookie")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer srv.Close()
+
+	m := newProbeTestManager()
+	policy := channelprotocol.HeaderPolicy{
+		Set: map[string]string{
+			"X-Session-Trace": "trace-01",
+			"X-Model-Var":     "{model}",
+			"X-Key-Var":       "{api_key}",
+			"Cookie":          "session=evil", // 强制黑名单：任何模式下都不得注入
+		},
+	}
+	fb, _, errMsg := m.doProbeAuth(context.Background(), srv.URL+"/chat/completions", "Authorization", "Bearer key", "m1", policy, "key", 2*time.Second)
+	if errMsg != "" || !fb.IsSuccess {
+		t.Fatalf("probe failed: err=%q fb=%+v", errMsg, fb)
+	}
+	if gotTrace != "trace-01" {
+		t.Errorf("探测应套用覆盖常量头, got %q", gotTrace)
+	}
+	if gotModelVar != "m1" {
+		t.Errorf("{model} 应替换为探测模型, got %q", gotModelVar)
+	}
+	if gotKeyVar != "key" {
+		t.Errorf("{api_key} 应替换为渠道凭据, got %q", gotKeyVar)
+	}
+	if gotBlocked != "" {
+		t.Errorf("强制黑名单头 Cookie 不应注入, got %q", gotBlocked)
+	}
+}
+
 // newProbeTestManager 返回一个可执行 doProbe 的 Manager（store 为空，仅用于探测链路）。
 func newProbeTestManager() *Manager {
 	return NewManager(nil, nil, []byte("0123456789abcdef"), &http.Client{Timeout: 2 * time.Second}, nil, time.Now)
@@ -75,7 +115,7 @@ func TestDoProbe_MarksProbeFeedback(t *testing.T) {
 	defer srv.Close()
 
 	m := newProbeTestManager()
-	fb, usage, errMsg := m.doProbeAuth(context.Background(), srv.URL+"/chat/completions", "Authorization", "Bearer key", "m1", 2*time.Second)
+	fb, usage, errMsg := m.doProbeAuth(context.Background(), srv.URL+"/chat/completions", "Authorization", "Bearer key", "m1", channelprotocol.HeaderPolicy{}, "key", 2*time.Second)
 	if errMsg != "" {
 		t.Fatalf("unexpected error: %s", errMsg)
 	}
@@ -98,7 +138,7 @@ func TestDoProbe_MarksTimeout(t *testing.T) {
 	defer srv.Close()
 
 	m := newProbeTestManager()
-	fb, _, errMsg := m.doProbeAuth(context.Background(), srv.URL+"/chat/completions", "Authorization", "Bearer key", "m1", 30*time.Millisecond)
+	fb, _, errMsg := m.doProbeAuth(context.Background(), srv.URL+"/chat/completions", "Authorization", "Bearer key", "m1", channelprotocol.HeaderPolicy{}, "key", 30*time.Millisecond)
 	if errMsg == "" {
 		t.Fatalf("expected timeout error, got nil, fb=%+v", fb)
 	}
