@@ -550,6 +550,11 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 				model, token, "", sessionID, sessionName, "密钥凭据不可用", msSince(start))
 			g.writeCallLog(ctx, bid, "", token, routeResFor(cr, autoName), model, "", sessionID, reqMsgs,
 				"error", "", "failed", "密钥凭据不可用", msSince(start), nil, g.callLogDecision(attempts, "密钥凭据不可用", pc, routeResFor(cr, autoName)))
+			// 该候选未发上游但属"真实失败"（非跳过）：必须入轨迹，否则
+			// ① 请求级结论会丢掉"隐性失败"现场；② order 不递增导致候选序号重复；
+			// ③ sawOther 未置位会把"限流 + 凭据缺失"的混合失败误判成全部限流(429)。
+			attempts = append(attempts, attempt("凭据不可用"))
+			sawOther = true
 			continue
 		}
 		// 直通判定（AC-4/AC-18）：入站协议必须 ∈ 该模型可达 protocols，否则不发起上游请求。
@@ -1174,12 +1179,18 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		}
 		// 客户端已离开（主动断开 / 下游写失败 / 请求 ctx 已取消）：内容无法送达，
 		// 既不算上游中断失败（不置 interrupted、不落 failed 账单），也不应在结论里声称"成功"。
-		clientGone := errors.Is(herr, context.Canceled) || ctx.Err() != nil
-		if clientGone && herr != nil {
+		clientGone := streamClientGone(ctx, herr)
+		if clientGone {
+			// 客户端已离开：无论是否带回错误都要留痕（herr 为空时只记"已断开"），
+			// 避免"客户端中断"在观测面上完全消失。
+			reasonText := "客户端已断开，流式响应未完整送达"
+			if herr != nil {
+				reasonText += "：" + herr.Error()
+			}
 			g.logUpstreamErr(ctx, slog.LevelInfo, "stream client gone", endpoint, ureq.Protocol, model, token, routeRes,
 				diagFromRequest(req, ureq.Protocol, ureq.Cred),
 				errInfo{kind: "client_gone", stage: stage, status: up.StatusCode, attempt: attempt,
-					reason: "客户端已断开，流式响应未完整送达：" + herr.Error(), sessionID: sessionID, durationMs: *dur})
+					reason: reasonText, sessionID: sessionID, durationMs: *dur})
 		}
 		hardErr := herr != nil && !clientGone && !usageMissing
 		if hardErr {
@@ -1288,6 +1299,15 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 type firstTokenWriter struct {
 	http.ResponseWriter
 	first time.Time
+}
+
+// streamClientGone 判定"客户端已离开"：上游返回 context.Canceled，或请求 ctx 已取消
+// （下游写失败通常伴随请求 ctx 取消）。客户端离开不算上游中断失败，但必须留痕。
+func streamClientGone(ctx context.Context, herr error) bool {
+	if errors.Is(herr, context.Canceled) {
+		return true
+	}
+	return ctx.Err() != nil
 }
 
 func (w *firstTokenWriter) Write(p []byte) (int, error) {

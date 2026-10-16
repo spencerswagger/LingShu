@@ -215,6 +215,15 @@ func TestSanitizeErrSummaryStripsCredentials(t *testing.T) {
 	if !strings.Contains(gotURL, "https://api.vendor.com/v1/chat/completions") {
 		t.Errorf("URL host+path 应保留: %q", gotURL)
 	}
+	// Fix 7：URL authority 中的 userinfo（user:pass@）属凭据，必须连同 query 一并抹除。
+	const userinfoMsg = `Post "https://user:pass@api.vendor.com/v1/chat/completions?key=sk-secret123456": dial tcp: timeout`
+	gotUI := sanitizeErrSummary(userinfoMsg)
+	if strings.Contains(gotUI, "user:pass") || strings.Contains(gotUI, "key=sk-secret123456") {
+		t.Errorf("URL userinfo/query 未抹除: %q", gotUI)
+	}
+	if !strings.Contains(gotUI, "api.vendor.com/v1/chat/completions") {
+		t.Errorf("URL host+path 应保留: %q", gotUI)
+	}
 	// 正常文案不应被改动（避免过度清洗影响排查）。
 	const keep = "The model does not exist or you do not have access to it."
 	if got := sanitizeErrSummary(keep); got != keep {
@@ -384,5 +393,63 @@ func TestOutcomeLogGate(t *testing.T) {
 	h.gw.logOutcome(ctx, slog.LevelError, "chat/completions", "gpt-4", "候选失败且请求最终失败", 402, false, nil, "sess-1", trail, nil)
 	if out := dump(); !strings.Contains(out, "gateway request outcome") {
 		t.Errorf("开关打开时 4xx（402）结论应落盘：\n%s", out)
+	}
+}
+
+// 回归：跳过（未进入上游）候选不计入候选失败，原因链标注 (跳过)。
+func TestSummarizeAttemptsSkips(t *testing.T) {
+	attempts := []map[string]any{
+		{"order": 1, "reason": "限流", "skipped": true},
+		{"order": 2, "reason": "上游失败"},
+		{"order": 3, "reason": "success"},
+	}
+	trail, failed := summarizeAttempts(attempts)
+	if failed != 1 {
+		t.Errorf("failed = %d, want 1（仅真实失败计入）", failed)
+	}
+	if !strings.Contains(trail, "1.限流(跳过)") || !strings.Contains(trail, "2.上游失败") {
+		t.Errorf("原因链标注异常: %q", trail)
+	}
+}
+
+// 开关关闭时，masked=true（隐性失败，status=200）必须落盘且含 masked_by_failover=true。
+func TestOutcomeMaskedPathNotGated(t *testing.T) {
+	h := build(t, "http://127.0.0.1:1")
+	logger.SetClientErrorLogEnabled(false)
+	t.Cleanup(func() { logger.SetClientErrorLogEnabled(true) })
+	dump := withLogCapture(h)
+	h.gw.logOutcome(context.Background(), slog.LevelWarn, "chat/completions", "gpt-4",
+		"候选失败后请求成功（隐性失败）", http.StatusOK, true, nil, "sess-1",
+		[]map[string]any{{"order": 1, "reason": "上游失败"}, {"order": 2, "reason": "success"}}, nil)
+	out := dump()
+	if !strings.Contains(out, "gateway request outcome") || !strings.Contains(out, "masked_by_failover=true") {
+		t.Errorf("隐性失败结论必须落盘且带 masked_by_failover=true：\n%s", out)
+	}
+}
+
+// streamClientGone：上游返回 context.Canceled 或请求 ctx 已取消（含 herr 为空）判定为客户端已离开；
+// 正常读流错误（ctx 存活）不算客户端离开。
+func TestStreamClientGone(t *testing.T) {
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	alive := context.Background()
+	cases := []struct {
+		name string
+		ctx  context.Context
+		err  error
+		want bool
+	}{
+		{"上游返回 context.Canceled", alive, context.Canceled, true},
+		{"下游写失败但请求 ctx 已取消", canceled, errors.New("write tcp: broken pipe"), true},
+		{"herr 为空但请求 ctx 已取消", canceled, nil, true},
+		{"正常读流错误（ctx 存活）", alive, errors.New("unexpected EOF"), false},
+		{"无错误", alive, nil, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := streamClientGone(c.ctx, c.err); got != c.want {
+				t.Errorf("streamClientGone = %v, want %v", got, c.want)
+			}
+		})
 	}
 }
