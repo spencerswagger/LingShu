@@ -93,9 +93,11 @@ func (h *Admin) HandleServiceStatus(w http.ResponseWriter, r *http.Request) {
 
 	// 一致性收敛（不允许隐性逻辑）：渠道运行时快照只在启动/渠道编辑/协议同步时重建，
 	// 删除对外模型不会通知渠道 Manager，故仍引用已删对外模型的渠道内部模型会残留在快照里。
-	// 这里以「未删除的对外模型清单」为白名单，剔除对外模型已不存在的内部模型行，保证展示与库表删除语义一致。
-	// ExternalModels 为空（未注入模型源）时不做过滤，避免误删全部模型。
-	if len(view.ExternalModels) > 0 {
+	// 这里以「未删除的对外模型清单（List 自带 deleted_at IS NULL）」为白名单，剔除对外模型已
+	// 不存在的内部模型行，保证展示与库表删除语义一致。
+	// 仅当「已注入模型源」时才过滤：未注入（h.models==nil）无法判定存在性，跳过以免全部误删；
+	// 已注入但清单为空（全部对外模型均已删除）属合法信号，照常过滤以清空残留。
+	if h.models != nil {
 		active := make(map[int64]struct{}, len(view.ExternalModels))
 		for _, m := range view.ExternalModels {
 			active[m.ID] = struct{}{}
@@ -108,6 +110,9 @@ func (h *Admin) HandleServiceStatus(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			view.Channels[ci].Models = models
+			// 渠道无独立状态机，State 为「全部内部模型与密钥的最差值」；Models 已被裁剪，
+			// 必须据此重算，否则状态灯（取 State）会与提示（遍历已裁剪的 Models）自相矛盾。
+			view.Channels[ci].State = worstChannelState(models, view.Channels[ci].Keys)
 		}
 	}
 
@@ -177,4 +182,28 @@ func parseExpand(v string) []int64 {
 		out = append(out, id)
 	}
 	return out
+}
+
+// worstChannelState 取渠道派生状态：渠道无独立状态机，取其全部内部模型与密钥的最差状态
+// （DISABLED > DRAIN > NORMAL）；空参为 NORMAL。语义与 channel.worstState 一致，
+// 供 console 在裁剪 Models 后重算 ChannelDetail.State（channel.worstState 未导出）。
+func worstChannelState(models []channel.ModelDetail, keys []channel.KeyDetail) channel.State {
+	w := channel.StateNormal
+	for i := range models {
+		switch models[i].View.State {
+		case channel.StateDisabled:
+			return channel.StateDisabled
+		case channel.StateDrain:
+			w = channel.StateDrain
+		}
+	}
+	for i := range keys {
+		switch keys[i].View.State {
+		case channel.StateDisabled:
+			return channel.StateDisabled
+		case channel.StateDrain:
+			w = channel.StateDrain
+		}
+	}
+	return w
 }

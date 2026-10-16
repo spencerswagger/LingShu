@@ -190,3 +190,76 @@ func TestHandleServiceStatus_ActiveSessions(t *testing.T) {
 		t.Fatalf("未装配路由引擎时 ActiveSessions=%d, want 0", got)
 	}
 }
+
+// fakeModelListSource 返回可配置的对外模型清单，供「已删除对外模型残留过滤」断言使用。
+type fakeModelListSource struct{ items []model.ExternalModel }
+
+func (s fakeModelListSource) ListModels(ctx context.Context, enabled *bool) ([]model.ExternalModel, error) {
+	return s.items, nil
+}
+
+// doStatus 发起一次服务状态请求并解出 Data，供断言使用。
+func doStatus(t *testing.T, h *Admin) serviceStatusData {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/service-status", nil)
+	req = resp.WithRequestID(req, "req-status")
+	h.HandleServiceStatus(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var body serviceStatusBody
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	var data serviceStatusData
+	if err := json.Unmarshal(body.Data, &data); err != nil {
+		t.Fatalf("unmarshal Data: %v", err)
+	}
+	return data
+}
+
+// TestHandleServiceStatus_FiltersDeletedExternalModels 覆盖「已删除对外模型不再展示」的一致性收敛：
+// 渠道运行时快照会残留「外部模型已被软删」的内部模型行，聚合端点须按未删清单白名单剔除，
+// 并据裁剪后的结果重算渠道派生状态；未注入模型源时不得过滤。
+func TestHandleServiceStatus_FiltersDeletedExternalModels(t *testing.T) {
+	// 渠道含两个内部模型：m-live 绑定存在的对外模型 7；m-dead 绑定已删的对外模型 99（残留且为 DISABLED）。
+	newMgr := func() *channel.Manager {
+		mgr := channel.NewManager(nil, nil, nil, nil, nil, nil)
+		mgr.Upsert(&channel.Channel{ID: 1, Name: "c1", Protocol: channel.ProtocolOpenAICompat})
+		mgr.UpsertModel(&channel.ChannelModel{ID: 1, ChannelID: 1, InternalModelID: "m-live", ExternalModelID: 7, State: channel.StateNormal})
+		mgr.UpsertModel(&channel.ChannelModel{ID: 2, ChannelID: 1, InternalModelID: "m-dead", ExternalModelID: 99, State: channel.StateDisabled})
+		return mgr
+	}
+	newAdmin := func(mgr *channel.Manager) *Admin {
+		return NewAdmin(nil, nil, mgr, func(context.Context) (int64, bool) { return 1, true })
+	}
+
+	// 已注入模型源且清单仅含 7：剔除残留行，且渠道派生状态据裁剪结果重算（残留 DISABLED 行被删 → NORMAL）。
+	h := newAdmin(newMgr())
+	h.SetModelSource(fakeModelListSource{items: []model.ExternalModel{{ID: 7, ExternalName: "gpt-x", Enabled: true}}})
+	data := doStatus(t, h)
+	if len(data.Channels) != 1 {
+		t.Fatalf("want 1 channel, got %d", len(data.Channels))
+	}
+	models := data.Channels[0].Models
+	if len(models) != 1 || models[0].View.InternalModelID != "m-live" {
+		t.Fatalf("应只保留绑定存在对外模型的内部模型，got=%+v", models)
+	}
+	if got := string(data.Channels[0].State); got != string(channel.StateNormal) {
+		t.Fatalf("State=%s, want NORMAL（残留 DISABLED 行被剔除后据裁剪结果重算）", got)
+	}
+
+	// 已注入模型源但清单为空（全部对外模型均已删除）：残留行应全部清空。
+	h2 := newAdmin(newMgr())
+	h2.SetModelSource(fakeModelListSource{items: []model.ExternalModel{}})
+	if got := doStatus(t, h2).Channels[0].Models; len(got) != 0 {
+		t.Fatalf("清单为空时应清空全部残留模型，got=%+v", got)
+	}
+
+	// 未注入模型源：无法判定存在性，不做过滤（保留全部内部模型）。
+	h3 := newAdmin(newMgr())
+	if got := doStatus(t, h3).Channels[0].Models; len(got) != 2 {
+		t.Fatalf("未注入模型源时不应过滤，got=%d", len(got))
+	}
+}
