@@ -167,9 +167,30 @@ flowchart TD
 
   <!-- 03 摊销轮数 -->
   <section>
-    <h2><span class="h2no">03</span>摊销轮数：唯一的关键参数</h2>
-    <p>「会话还会不会继续、继续多久」难以建模，而本模型把它<b>收束为单一参数：摊销轮数</b>。由于每轮都重算，该参数对估计误差不敏感——设大只是早切一点、设小只是晚切一点，不会放大偏差。</p>
-    <p>因此后续的演进路径很自然：用真实数据<b>统计或学习</b>来估计与动态调整摊销轮数（以及时段倍率等），即可持续优化成本。这是本模型最合适的调优入口。</p>
+    <h2><span class="h2no">03</span>两个"轮数"要分清：一个能算，一个只能估</h2>
+    <p>之前说"收束到摊销轮数"，其实要拆成两个不同的量：</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>量</th><th>能否计算</th><th>依赖</th></tr></thead>
+        <tbody>
+          <tr><td>回本轮数（切换门槛）</td><td><b>可动态算出</b>：每轮用公式现算</td><td>价格 + 当前缓存读/新增输入/输出</td></tr>
+          <tr><td>预计剩余轮数（策略参数）</td><td><b>不可知，只能估计/学习</b></td><td>会话行为（与价格无关）</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>决策式：<b>预计剩余轮数 ＞ 回本轮数 就切</b>。</p>
+    <div class="formula">
+      <div class="f-label">回本轮数（可现算）</div>
+      <div class="f-body">
+        分子 ＝（新渠道输入单价 <span class="op">－</span> 新渠道缓存读单价）<span class="op">×</span> 缓存读token数<br>
+        分母 ＝（旧渠道缓存读单价 <span class="op">－</span> 新渠道缓存读单价）<span class="op">×</span> 缓存读token数<br>
+        　　　<span class="op">＋</span>（旧渠道输入单价 <span class="op">－</span> 新渠道输入单价）<span class="op">×</span> 新增输入token数<br>
+        　　　<span class="op">＋</span>（旧渠道输出单价 <span class="op">－</span> 新渠道输出单价）<span class="op">×</span> 输出token数<br>
+        回本轮数 ＝ 分子 <span class="op">÷</span> 分母（分母 ≤ 0 即永不回本）
+      </div>
+      <p class="f-note">长会话极限 ＝（新输入价 − 新缓存读价）÷（旧缓存读价 − 新缓存读价），只由价格决定——就是那个"下限"。</p>
+    </div>
+    <p>所以真正"收束为一个待估参数"的只有<b>预计剩余轮数</b>；回本轮数每轮现算、无需设定。详细敏感性实验见 <a href="./data-study.html">data-study.html</a>。</p>
   </section>
 
   <!-- 04 逐条回答 -->

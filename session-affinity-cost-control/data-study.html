@@ -100,6 +100,37 @@
     </ol>
   </div>
 
+  <section>
+    <h2><span class="h2no">公式</span>回本轮数的规律与计算公式</h2>
+    <p>把三个价差与三个 token 量代入，即可得到回本轮数的闭式——它<b>每轮都能现算</b>：</p>
+    <div class="formula">
+      <div class="f-label">回本轮数</div>
+      <div class="f-body">
+        分子 ＝（新渠道输入单价 <span class="op">－</span> 新渠道缓存读单价）<span class="op">×</span> 缓存读token数<br>
+        分母 ＝（旧渠道缓存读单价 <span class="op">－</span> 新渠道缓存读单价）<span class="op">×</span> 缓存读token数<br>
+        　　　<span class="op">＋</span>（旧渠道输入单价 <span class="op">－</span> 新渠道输入单价）<span class="op">×</span> 新增输入token数<br>
+        　　　<span class="op">＋</span>（旧渠道输出单价 <span class="op">－</span> 新渠道输出单价）<span class="op">×</span> 输出token数<br>
+        回本轮数 ＝ 分子 <span class="op">÷</span> 分母　（分母 ≤ 0 即永不回本）
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>规律</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td>长会话极限</td><td>＝（新输入价 − 新缓存读价）÷（旧缓存读价 − 新缓存读价）；只由价格决定，即"下限"</td></tr>
+          <tr><td>短会话极限</td><td>缓存读很小时回本轮数 → 0（若新渠道在输入/输出也占优）→ 几乎随时可切</td></tr>
+          <tr><td>临界缓存读</td><td>缓存读低于某值时分母 ≤ 0 → 永不回本（这就是"临界点"）</td></tr>
+          <tr><td>缓存读价差 ≤ 0</td><td>新渠道缓存更贵或同价 → 长会话不回本</td></tr>
+          <tr><td>权重大小</td><td>三项价差各乘各自 token 数；token 多且价差不利的那项决定回本轮数高低</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="callout">
+      <span class="co-tag">一个重要区分</span>
+      <p>回本轮数<b>可以动态计算</b>（上面公式，只依赖价格与当前用量）；而"<b>预计剩余轮数</b>"不可知、只能估计或学习。决策是「<mark class="key">预计剩余轮数 ＞ 回本轮数</mark>」——需要设定的参数只有"预计剩余轮数"一个，回本轮数每轮现算即可。</p>
+    </div>
+  </section>
+
   <!-- Q1 -->
   <section>
     <h2><span class="h2no">Q1</span>固定设 6，是否合理？</h2>
