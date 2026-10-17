@@ -864,6 +864,43 @@ func (m *Manager) KeyMaxSessions(keyID int64) int {
 	return normalizeRateLimit(kr.Channel.RateLimit).MaxConcurrent
 }
 
+// ListByExternal 返回绑定某对外模型的全部非禁用渠道内部模型（读内存快照，零 DB 查询）。
+// 与 channelModelStore.ListByExternal 语义等价，但数据源为 Manager 的内存快照而非查询 channel_models：
+// 该绑定为低频变更的配置层数据，路由热路径每请求都要读取，故按方案 A 纳入内存快照。
+//
+// 显式口径（不允许隐性逻辑）：
+//   - 数据来源：mrt（channelID → modelRowID → ModelRuntime）；不发起任何 DB 查询；
+//   - 过滤条件与 DB 版一致：仅返回 state != DISABLED 的行（此处取运行时权威状态）；
+//   - 排序与 DB 版一致：channel_id 升序 → 行 id 升序，保证候选收集顺序确定；
+//   - 返回的 ChannelModel 为快照值拷贝，其中 CostRates（map）与 TimeConfig（指针）按只读共享，
+//     调用方不得修改（路由只读，不做写回）。
+//
+// 失效（为何无需额外接线，也不依赖 TTL）：本快照仅由既有写路径维护，均持写锁更新 mrt：
+// 启动 SyncFromDB（全量）、渠道新增/编辑 Upsert、渠道内部模型 CRUD 与协议同步 UpsertModel/DropModel。
+// 因此对外模型绑定变更后本方法立即返回新结果，不存在缓存滞后。
+// 注意：对外模型自身的增删改（external_models）不改变本映射，无需接线；路由按 ID 精确匹配，
+// 名称解析仍由 model.Service.GetByExternalName 负责。
+func (m *Manager) ListByExternal(_ context.Context, externalModelID int64) ([]ChannelModel, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]ChannelModel, 0, 8)
+	for _, models := range m.mrt {
+		for _, mr := range models {
+			if mr.Model.ExternalModelID != externalModelID || mr.Machine.State() == StateDisabled {
+				continue
+			}
+			out = append(out, mr.Model)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].ChannelID != out[j].ChannelID {
+			return out[i].ChannelID < out[j].ChannelID
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out, nil
+}
+
 // ModelViews 返回某渠道全部模型运行时视图（控制台展示）。
 func (m *Manager) ModelViews(channelID int64) []ModelView {
 	m.mu.RLock()

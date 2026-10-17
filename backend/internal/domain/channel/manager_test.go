@@ -532,6 +532,53 @@ func TestManager_KeyOrderForRouting_ReadOnlyStableAscending(t *testing.T) {
 	}
 }
 
+// TestManager_ListByExternal_MemorySnapshotAndInvalidation 锁定 P0（方案 A）契约：
+// 候选绑定读内存快照、零 DB 查询，且在配置变更钩子后立即失效（无 TTL 兜底）。
+func TestManager_ListByExternal_MemorySnapshotAndInvalidation(t *testing.T) {
+	// store/cmStore/keyStore 全 nil：任何 DB 访问都会 panic，从而证明本方法零 DB 查询。
+	mgr := NewManager(nil, nil, make([]byte, 16), nil, nil, nil)
+	mgr.Upsert(&Channel{ID: 1, Name: "c1", Protocol: ProtocolOpenAICompat})
+	mgr.Upsert(&Channel{ID: 2, Name: "c2", Protocol: ProtocolOpenAICompat})
+	mgr.UpsertModel(&ChannelModel{ID: 201, ChannelID: 2, InternalModelID: "m-b", ExternalModelID: 7, State: StateNormal})
+	mgr.UpsertModel(&ChannelModel{ID: 101, ChannelID: 1, InternalModelID: "m-a", ExternalModelID: 7, State: StateNormal})
+	mgr.UpsertModel(&ChannelModel{ID: 102, ChannelID: 1, InternalModelID: "m-off", ExternalModelID: 7, State: StateDisabled})
+
+	got, err := mgr.ListByExternal(context.Background(), 7)
+	if err != nil {
+		t.Fatalf("ListByExternal: %v", err)
+	}
+	// 过滤 DISABLED(102)；按 channel_id 升序 → 行 id 升序。
+	if len(got) != 2 || got[0].ID != 101 || got[1].ID != 201 {
+		t.Fatalf("期望 [101 201]（按渠道/行 id 升序，过滤禁用），got %+v", got)
+	}
+
+	// 其它对外模型无绑定。
+	if other, _ := mgr.ListByExternal(context.Background(), 99); len(other) != 0 {
+		t.Fatalf("对外模型 99 期望空，got %+v", other)
+	}
+
+	// 删除（DropModel 钩子）立即失效。
+	mgr.DropModel(2, 201)
+	if got2, _ := mgr.ListByExternal(context.Background(), 7); len(got2) != 1 || got2[0].ID != 101 {
+		t.Fatalf("DropModel 后期望 [101]，got %+v", got2)
+	}
+
+	// 新增（UpsertModel 钩子）立即生效。
+	mgr.UpsertModel(&ChannelModel{ID: 301, ChannelID: 1, InternalModelID: "m-d", ExternalModelID: 7, State: StateNormal})
+	if got3, _ := mgr.ListByExternal(context.Background(), 7); len(got3) != 2 || got3[0].ID != 101 || got3[1].ID != 301 {
+		t.Fatalf("新增后期望 [101 301]，got %+v", got3)
+	}
+
+	// 改绑（UpsertModel 携带新 external_model_id）立即切换归属。
+	mgr.UpsertModel(&ChannelModel{ID: 101, ChannelID: 1, InternalModelID: "m-a", ExternalModelID: 8, State: StateNormal})
+	if got4, _ := mgr.ListByExternal(context.Background(), 7); len(got4) != 1 || got4[0].ID != 301 {
+		t.Fatalf("改绑后期望对外模型 7 仅剩 [301]，got %+v", got4)
+	}
+	if got5, _ := mgr.ListByExternal(context.Background(), 8); len(got5) != 1 || got5[0].ID != 101 {
+		t.Fatalf("改绑后期望对外模型 8 为 [101]，got %+v", got5)
+	}
+}
+
 // TestManager_Snapshot_NoCredentialWordingAtChannelLevel D3 核验（审查发现项）：
 // 渠道模板层 LastErr「渠道凭据为空/解密失败」文案已随 A5 删除，渠道快照不再误导；
 // 凭据类错误只出现在密钥级视图（KeyViews/KeyRuntimeView）。
