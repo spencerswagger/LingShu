@@ -24,8 +24,8 @@ const auth = useAuthStore()
 // 管理端菜单
 const menus = [
   { path: '/admin/dashboard', title: '统计', icon: Odometer },
+  { path: '/admin/service-status', title: '状态', icon: Monitor },
   { path: '/admin/channels', title: '渠道', icon: Connection },
-  { path: '/admin/service-status', title: '服务状态', icon: Monitor },
   { path: '/admin/models', title: '模型', icon: Cpu },
   { path: '/admin/tags', title: '标签', icon: PriceTag },
   { path: '/admin/users', title: '用户', icon: User },
@@ -44,6 +44,8 @@ function activeMenu() {
   }
   // 渠道协议为「渠道」页内切换的视图，归入「渠道」菜单高亮
   if (p.startsWith('/admin/channel-protocols')) return '/admin/channels'
+  // Auto 模型为「模型」页内切换的视图，归入「模型」菜单高亮
+  if (p.startsWith('/admin/auto-models')) return '/admin/models'
   if (p.startsWith('/admin/system')) return '/admin/system'
   return p
 }

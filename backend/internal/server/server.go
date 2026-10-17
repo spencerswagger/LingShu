@@ -10,9 +10,11 @@ import (
 
 	"github.com/team/llmgateway/internal/config"
 	"github.com/team/llmgateway/internal/domain/audit"
+	"github.com/team/llmgateway/internal/domain/automodel"
 	"github.com/team/llmgateway/internal/domain/channel"
 	"github.com/team/llmgateway/internal/domain/channelprotocol"
 	"github.com/team/llmgateway/internal/domain/console"
+	"github.com/team/llmgateway/internal/domain/gateway"
 	"github.com/team/llmgateway/internal/domain/identity"
 	"github.com/team/llmgateway/internal/domain/model"
 	"github.com/team/llmgateway/internal/domain/sync"
@@ -33,6 +35,8 @@ type Deps struct {
 	ChannelProto *channelprotocol.Handler
 	Tag          *tag.Handler
 	Model        *model.Handler
+	// AutoModel 可选：Auto 模型管理（管理端 + 开发端）。
+	AutoModel    *automodel.Handler
 	Announcement *identity.AnnouncementHandler
 	Console      *console.Admin
 	DevConsole   *console.Dev
@@ -130,6 +134,8 @@ func (s *Server) routes() {
 		admin.HandleFunc("GET /api/v1/admin/channel-protocols", d.ChannelProto.HandleList)
 		admin.HandleFunc("POST /api/v1/admin/channel-protocols", d.ChannelProto.HandleCreate)
 		admin.HandleFunc("POST /api/v1/admin/channel-protocols/sync", d.ChannelProto.HandleSync)
+		admin.HandleFunc("GET /api/v1/admin/channel-protocols/export", d.ChannelProto.HandleExport)
+		admin.HandleFunc("POST /api/v1/admin/channel-protocols/import", d.ChannelProto.HandleImport)
 		admin.HandleFunc("GET /api/v1/admin/channel-protocols/{id}", d.ChannelProto.HandleGet)
 		admin.HandleFunc("PUT /api/v1/admin/channel-protocols/{id}", d.ChannelProto.HandleUpdate)
 		admin.HandleFunc("DELETE /api/v1/admin/channel-protocols/{id}", d.ChannelProto.HandleDelete)
@@ -169,6 +175,15 @@ func (s *Server) routes() {
 	admin.HandleFunc("POST /api/v1/admin/models/{id}/apply-price", d.Model.HandleApplyPrice)
 	admin.HandleFunc("POST /api/v1/admin/models/sync-prices", d.Model.HandleSyncPrices)
 	admin.HandleFunc("GET /api/v1/admin/models/price-catalog", d.Model.HandlePriceCatalog)
+
+	// auto-models（Auto 模型：对外模型之上的有序别名组）
+	if d.AutoModel != nil {
+		admin.HandleFunc("GET /api/v1/admin/auto-models", d.AutoModel.HandleList)
+		admin.HandleFunc("GET /api/v1/admin/auto-models/{id}", d.AutoModel.HandleGet)
+		admin.HandleFunc("POST /api/v1/admin/auto-models", d.AutoModel.HandleCreate)
+		admin.HandleFunc("PUT /api/v1/admin/auto-models/{id}", d.AutoModel.HandleUpdate)
+		admin.HandleFunc("DELETE /api/v1/admin/auto-models/{id}", d.AutoModel.HandleDelete)
+	}
 
 	// billings / stats / configs / sessions
 	admin.HandleFunc("GET /api/v1/admin/billings", d.Console.HandleListBillings)
@@ -223,9 +238,18 @@ func (s *Server) routes() {
 	dev.HandleFunc("GET /api/v1/dev/billings/{billing_id}", d.DevConsole.HandleGetBilling)
 	dev.HandleFunc("GET /api/v1/dev/announcements", d.Announcement.HandleDevList)
 
+	// auto-models（开发端：仅本人私有 Auto；服务端强制 scope=private + owner=当前用户）
+	if d.AutoModel != nil {
+		dev.HandleFunc("GET /api/v1/dev/auto-models", d.AutoModel.HandleDevList)
+		dev.HandleFunc("GET /api/v1/dev/auto-models/{id}", d.AutoModel.HandleDevGet)
+		dev.HandleFunc("POST /api/v1/dev/auto-models", d.AutoModel.HandleDevCreate)
+		dev.HandleFunc("PUT /api/v1/dev/auto-models/{id}", d.AutoModel.HandleDevUpdate)
+		dev.HandleFunc("DELETE /api/v1/dev/auto-models/{id}", d.AutoModel.HandleDevDelete)
+	}
+
 	// ---- 网关 ----
 	if d.Gateway != nil {
-		s.mux.Handle("/v1/", d.Gateway)
+		s.mux.Handle(gateway.InboundPrefix, d.Gateway)
 	}
 
 	s.mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -237,11 +261,14 @@ func (s *Server) routes() {
 // middlewareChain 组装全局中间件链（顺序敏感）。
 // WithRequestID 必须在最外层：它把 request id 写入请求 context 后向内层传递，
 // 放在内层会导致 WithLogging / WithRecover 读到的 requestId 恒为空。
+// WithLoggerContext 紧随其后，把进程 logger 注入 context 供 resp 等底层包落日志。
 func (s *Server) middlewareChain(next http.Handler) http.Handler {
 	return WithRequestID(
-		WithRecover(s.logger)(
-			WithLogging(s.logger)(
-				reqmeta.Middleware(next),
+		WithLoggerContext(s.logger)(
+			WithRecover(s.logger)(
+				WithLogging(s.logger)(
+					reqmeta.Middleware(next),
+				),
 			),
 		),
 	)

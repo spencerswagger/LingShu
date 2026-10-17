@@ -83,9 +83,17 @@ async function openCatalog() {
 }
 
 async function onCatalogSearch() {
+  const q = catQ.value.trim()
+  // 空关键词会命中整份目录（数量极大，渲染卡顿）——此时不请求，仅提示用户输入关键词。
+  if (!q) {
+    catList.value = []
+    catTotal.value = 0
+    selectedEntry.value = null
+    return
+  }
   catLoading.value = true
   try {
-    const res = await priceCatalog(catQ.value)
+    const res = await priceCatalog(q)
     catList.value = res.Data.List || []
     catUpdatedAt.value = res.Data.UpdatedAt || ''
     catTotal.value = res.Data.Total || 0
@@ -142,7 +150,7 @@ defineExpose({ open: openCatalog })
         @keyup.enter="onCatalogSearch"
         @clear="onCatalogSearch"
       />
-      <el-button type="primary" :loading="catLoading" @click="onCatalogSearch">搜索</el-button>
+      <el-button type="primary" :loading="catLoading" :disabled="!catQ.trim()" @click="onCatalogSearch">搜索</el-button>
       <el-button :loading="catSyncing" plain @click="onSyncNow">立即同步 models.dev</el-button>
       <span class="cat-hint">同一模型在不同供应商下可能有不同的模型 ID 与价格，请选择与你渠道对应的供应商。</span>
     </div>
@@ -214,7 +222,10 @@ defineExpose({ open: openCatalog })
       <span v-else class="status-item">价格数据尚未同步（服务启动或每 60 分钟拉取一次）</span>
       <span v-if="catTotal" class="status-item">命中 {{ catTotal }} 条</span>
     </div>
-    <el-empty v-if="!catLoading && !catList.length" description="未找到匹配的模型价格（同步数据来自后端定时拉取的 models.dev 缓存）" />
+    <el-empty
+      v-if="!catLoading && !catList.length"
+      :description="catQ.trim() ? '未找到匹配的模型价格（同步数据来自后端定时拉取的 models.dev 缓存）' : '请输入模型 ID 或供应商关键词后搜索'"
+    />
     <p class="ref-note">
       models.dev 提供各供应商参考价（模型 ID / 输入输出 / 缓存读）。表中数值为折算后的倍率建议值，点击「应用」将其写入{{ applyLabel }}对应的价格段（输入/输出/缓存读三段，models.dev 未提供的段保留原值）。
     </p>

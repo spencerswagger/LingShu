@@ -140,7 +140,10 @@ const transcript = computed<TranscriptItem[]>(() =>
         <div class="call-head">
           <div class="call-meta">
             <span class="t-date mono">{{ fmtDateTime(item.call.CallTime) }}</span>
-            <span class="t-clock">{{ item.call.Model || '-' }}</span>
+            <span class="t-clock">
+              {{ item.call.Model || '-' }}
+              <el-tag v-if="item.call.AutoModelName" size="small" effect="plain" type="success">Auto {{ item.call.AutoModelName }}</el-tag>
+            </span>
           </div>
           <div class="call-meta call-channel" title="渠道信息">
             <span class="t-clock">渠道 {{ item.channel.channel }} · 密钥 {{ item.channel.key }} · 内部模型 {{ item.channel.model }}</span>

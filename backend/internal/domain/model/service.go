@@ -75,6 +75,9 @@ type ExternalModelInput struct {
 type Service struct {
 	store  *Store
 	pricer PriceSource
+	// autoNameExists 跨表重名校验：判断某名称是否已被 auto_models.name 占用
+	// （经 SetAutoNameChecker 由装配层注入；nil=跳过该检查）。
+	autoNameExists func(ctx context.Context, name string) (bool, error)
 }
 
 // NewService 创建对外模型服务。
@@ -84,6 +87,26 @@ func NewService(store *Store) *Service {
 
 // SetPriceSource 注入 models.dev 价格源（价格参考/应用售价接口使用）。
 func (s *Service) SetPriceSource(p PriceSource) { s.pricer = p }
+
+// SetAutoNameChecker 注入「是否与 Auto 模型重名」的校验（装配层传入，查 auto_models）。
+func (s *Service) SetAutoNameChecker(fn func(ctx context.Context, name string) (bool, error)) {
+	s.autoNameExists = fn
+}
+
+// checkAutoName 跨表重名校验（对外模型名不得与任意 Auto 名冲突）；未注入检查器时跳过。
+func (s *Service) checkAutoName(ctx context.Context, name string) error {
+	if s.autoNameExists == nil {
+		return nil
+	}
+	exists, err := s.autoNameExists(ctx, name)
+	if err != nil {
+		return fmt.Errorf("check auto name: %w", err)
+	}
+	if exists {
+		return errConflict("模型名已被 Auto 模型占用")
+	}
+	return nil
+}
 
 // GetByExternalName 返回指定对外名称的启用模型。无启用模型返回 ErrNotFound。
 func (s *Service) GetByExternalName(ctx context.Context, externalName string) (*ExternalModel, error) {
@@ -102,7 +125,13 @@ func (s *Service) GetByID(ctx context.Context, id int64) (*ExternalModel, error)
 	return s.store.GetByID(ctx, id)
 }
 
-// validateInput 校验对外模型可写字段：名称非空、售价三键非负、可选时段/分档合法。
+// GetByName 按对外名称查询（忽略 enabled）；无记录返回 sql.ErrNoRows。
+// 供 Auto 模型跨表重名校验等场景使用（需检查全部对外模型名，含未启用者）。
+func (s *Service) GetByName(ctx context.Context, name string) (*ExternalModel, error) {
+	return s.store.GetByName(ctx, name)
+}
+
+// validateInput 校验对外模型可写字段：名称非空、售价三段（三键）非负、可选时段/分档合法。
 func (s *Service) validateInput(in ExternalModelInput) error {
 	if in.ExternalName == "" {
 		return errBadRequest("模型对外名称不能为空")
@@ -130,7 +159,7 @@ func normalizeEnabled(in *bool, def bool) bool {
 	return def
 }
 
-// CreateModel 创建对外模型：校验 + 名称唯一 + 入库。
+// CreateModel 创建对外模型：校验 + 名称唯一 + 跨表重名（Auto）+ 入库。
 func (s *Service) CreateModel(ctx context.Context, in ExternalModelInput) (*ExternalModel, error) {
 	if err := s.validateInput(in); err != nil {
 		return nil, err
@@ -140,6 +169,10 @@ func (s *Service) CreateModel(ctx context.Context, in ExternalModelInput) (*Exte
 		return nil, errConflict("模型外部名已存在")
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("check external name: %w", err)
+	}
+	// 跨表重名：对外模型名不得与任意 Auto 名冲突（与 automodel 侧对称）。
+	if err := s.checkAutoName(ctx, in.ExternalName); err != nil {
+		return nil, err
 	}
 
 	created, err := s.store.Insert(ctx, &ExternalModel{
@@ -176,6 +209,10 @@ func (s *Service) UpdateModel(ctx context.Context, id int64, in ExternalModelInp
 			return nil, errConflict("模型外部名已存在")
 		} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return nil, fmt.Errorf("check external name: %w", err)
+		}
+		// 跨表重名：改名后不得与任意 Auto 名冲突。
+		if err := s.checkAutoName(ctx, in.ExternalName); err != nil {
+			return nil, err
 		}
 	}
 

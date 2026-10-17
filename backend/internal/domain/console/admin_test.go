@@ -153,12 +153,12 @@ func TestHandleListBillings_FilterParams(t *testing.T) {
 
 	rows := sqlmock.NewRows([]string{
 		"id", "billing_id", "user_id", "pricing_mode", "token_id", "external_model_name",
-		"internal_model_id", "channel_key_id", "session_id", "session_name", "call_time", "tokens", "rates",
+		"auto_model_name", "internal_model_id", "channel_key_id", "session_id", "session_name", "call_time", "tokens", "rates",
 		"coefficients", "r_value", "raw_total", "credits_consumed", "cost_credits",
 		"balance_before", "balance_after", "status", "error_message", "duration_ms",
 		"first_token_ms",
 	}).AddRow(
-		int64(1), "b1", int64(1), "sale", nil, "ext", "int", int64(3), "sess-1", "",
+		int64(1), "b1", int64(1), "sale", nil, "ext", nil, "int", int64(3), "sess-1", "",
 		time.Now(), `{}`, `{}`, `{"time":1,"context":1}`, int64(10000),
 		nil, nil, nil, nil, nil, "completed", nil, nil, nil,
 	)

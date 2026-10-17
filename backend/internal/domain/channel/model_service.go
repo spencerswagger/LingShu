@@ -280,6 +280,9 @@ func (s *Service) PullModels(ctx context.Context, channelID int64, doer HTTPDoer
 	if authValue != "" {
 		req.Header.Set(authHeader, authValue)
 	}
+	// 「覆盖(set)」：与探测/转发同一引擎。上游若要求自定义头，缺少它会导致拉取失败。
+	// /models 是模型列表端点、无目标模型，故 {model} 留空；{session_id}/{request_id} 随机。
+	channelprotocol.ApplySet(req.Header, rt.Protocol.EffectiveHeaderPolicy().Set, cred, headerOverrideVars(""), nil)
 
 	if doer == nil {
 		doer = http.DefaultClient

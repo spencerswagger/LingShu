@@ -96,6 +96,7 @@ export interface BillingItem {
   BillingID: string
   UserID: string
   ExternalModel: string
+  AutoModelName?: string // 请求的 Auto 名（非 Auto 请求为空）
   PricingMode: string // sale | cost
   CreditsConsumed: number
   Status: string // completed | failed
@@ -120,6 +121,7 @@ export interface CallLogView {
   RequestID: string
   SessionID: string
   Model: string
+  AutoModelName?: string // 请求的 Auto 名（非 Auto 请求为空）
   Status: string // 'completed' | 'failed'
   RespKind: string // 'non_stream' | 'stream' | 'error' | 'none'
   ErrorMessage: string
@@ -144,6 +146,7 @@ export interface BillingDetail {
   BillingID: string
   CallTime: string
   Model: string
+  AutoModelName?: string // 请求的 Auto 名（非 Auto 请求为空）
   PricingMode: string
   CreditsConsumed: number
   Status: string

@@ -58,8 +58,11 @@ type RouteResult struct {
 	InternalModelID string
 	ModelRowID      int64 // channel_models 行 ID（状态机回喂与模型级限流定位用）
 	ExternalModelID int64 // 命中对外模型的 ID（计费/展示用）
-	Revision        int64 // 选中渠道的变更代次（基于 Channel.UpdatedAt），用于亲和失效判断
-	Fallback        bool
+	// AutoModelName 请求的 Auto 名（命中 Auto 时非空；非 Auto 请求为空）。
+	// 仅用于账单/调用日志留痕；external_model_name 仍记实际命中的对外模型名。
+	AutoModelName string
+	Revision      int64 // 选中渠道的变更代次（基于 Channel.UpdatedAt），用于亲和失效判断
+	Fallback      bool
 	// 成本标量 / 时段系数（OQ-3：仅用于决策轨迹排查，不参与计费）。
 	Cost      float64 // 选中候选的成本标量（样值用量 × 单价 × 时段系数）
 	CostKnown bool    // 成本是否有效（false=单价缺失/全 0，视为最贵）

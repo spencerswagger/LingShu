@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/team/llmgateway/internal/domain/automodel"
 	"github.com/team/llmgateway/internal/domain/billing"
 	"github.com/team/llmgateway/internal/domain/channel"
 	"github.com/team/llmgateway/internal/domain/channelprotocol"
@@ -68,6 +69,13 @@ type ChannelModelResolver interface {
 // tagID 为 nil 时返回 nil map。
 type TagKVResolver func(ctx context.Context, tagID *int64) (map[string]string, error)
 
+// AutoResolver 解析「请求模型名是否为 Auto 模型」并返回其有序成员
+// （automodel.Service 满足）。返回 (成员列表, 是否 Auto, err)：
+// 未命中返回 (nil,false,nil)，交由上层按普通对外模型处理；停用的 Auto 亦视为未命中。
+type AutoResolver interface {
+	ResolveMembers(ctx context.Context, name string, ownerUserID *int64) ([]automodel.Member, bool, error)
+}
+
 // PricingModeResolver 由用户 ID 解析计费模式（"sale"/"cost"，装配层查 users 表实现）。
 type PricingModeResolver func(ctx context.Context, userID int64) (string, error)
 
@@ -101,6 +109,7 @@ type Gateway struct {
 	models          ModelResolver
 	channelModels   ChannelModelResolver
 	tagKV           TagKVResolver
+	auto            AutoResolver // Auto 模型解析（nil=不启用 Auto；未命中时零行为差异）
 	pricing         PricingModeResolver
 	balance         BalanceResolver
 	credit          CreditOps
@@ -108,10 +117,12 @@ type Gateway struct {
 	sessionExpiry   SessionExpiryResolver
 	touchLastUsed   func(ctx context.Context, tokenID int64) error
 	listEnabled     func(ctx context.Context) ([]model.ExternalModel, error)
-	logger          *slog.Logger
-	now             func() time.Time
-	client          *http.Client // 非流式上游客户端（默认 300s 超时）
-	streamClient    *http.Client // 流式上游客户端（不设 body 超时，由 ctx 控制）
+	// listAutoModels 返回对某用户可见的启用 Auto（全局 + 该用户私有），用于 GET /v1/models。
+	listAutoModels func(ctx context.Context, ownerUserID int64) ([]automodel.AutoModel, error)
+	logger         *slog.Logger
+	now            func() time.Time
+	client         *http.Client // 非流式上游客户端（默认 300s 超时）
+	streamClient   *http.Client // 流式上游客户端（不设 body 超时，由 ctx 控制）
 	// upstreamRespHeaders 全局上游响应头白名单（默认空，未配置时返回 nil）。
 	upstreamRespHeaders func() []string
 }
@@ -125,7 +136,9 @@ type GatewayConfig struct {
 	Models        ModelResolver
 	ChannelModels ChannelModelResolver
 	TagKV         TagKVResolver
-	Pricing       PricingModeResolver
+	// Auto 可选：Auto 模型解析（nil 时不启用 Auto，请求名一律按普通对外模型处理）。
+	Auto    AutoResolver
+	Pricing PricingModeResolver
 	// Balance 可选：余额前置检查（余额 <=0 时拒绝发起上游调用）。nil 时不检查（兼容旧装配）。
 	Balance BalanceResolver
 	// Credit 可选：三阶段计费（预扣/退款）。装配后启用「预扣-结算-退补」；nil 时退化为 balance 检查。
@@ -142,6 +155,9 @@ type GatewayConfig struct {
 	TouchLastUsed func(ctx context.Context, tokenID int64) error
 	// ListEnabledModels 返回启用中的对外模型（GET /v1/models 用；为空时该端点返回空列表）。
 	ListEnabledModels func(ctx context.Context) ([]model.ExternalModel, error)
+	// ListAutoModels 可选：返回对某用户可见的启用 Auto（全局 + 该用户私有），
+	// 用于 GET /v1/models 一并列出。nil 时不列 Auto。
+	ListAutoModels func(ctx context.Context, ownerUserID int64) ([]automodel.AutoModel, error)
 	// UpstreamResponseHeaderWhitelist 读取全局上游响应头白名单（sys_configs，默认空）。
 	// 未配置/读取失败按空处理（不透传任何上游头，维持渠道透明）。
 	UpstreamResponseHeaderWhitelist func() ([]string, error)
@@ -187,6 +203,7 @@ func NewGateway(cfg GatewayConfig) *Gateway {
 		models:              cfg.Models,
 		channelModels:       cfg.ChannelModels,
 		tagKV:               cfg.TagKV,
+		auto:                cfg.Auto,
 		pricing:             cfg.Pricing,
 		balance:             cfg.Balance,
 		credit:              cfg.Credit,
@@ -194,6 +211,7 @@ func NewGateway(cfg GatewayConfig) *Gateway {
 		sessionExpiry:       cfg.SessionExpiry,
 		touchLastUsed:       cfg.TouchLastUsed,
 		listEnabled:         cfg.ListEnabledModels,
+		listAutoModels:      cfg.ListAutoModels,
 		logger:              cfg.Logger,
 		now:                 cfg.Now,
 		client:              cfg.Client,
@@ -227,6 +245,10 @@ func DefaultProviderFactory(protocol, endpoint string) (Provider, bool) {
 	return nil, false
 }
 
+// InboundPrefix 是网关对外端点的路径前缀：Handler 注册、server 挂载与异常日志的
+// endpoint 字段共用同一常量，避免前缀字面量在多处重复、改挂载点时日志与访问日志失配。
+const InboundPrefix = "/v1/"
+
 // Handler 返回挂载了 /v1 各端点的 http.Handler。
 //
 //   - GET  /v1/models
@@ -237,12 +259,12 @@ func DefaultProviderFactory(protocol, endpoint string) (Provider, bool) {
 //   - POST /v1/messages          (anthropic-messages)
 func (g *Gateway) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/models", g.handleModels)
-	mux.HandleFunc("POST /v1/chat/completions", g.serveWith(EndpointChatCompletions))
-	mux.HandleFunc("POST /v1/completions", g.serveWith(EndpointCompletions))
-	mux.HandleFunc("POST /v1/embeddings", g.serveWith(EndpointEmbeddings))
-	mux.HandleFunc("POST /v1/responses", g.serveWith(EndpointResponses))
-	mux.HandleFunc("POST /v1/messages", g.serveWith(EndpointMessages))
+	mux.HandleFunc("GET "+InboundPrefix+"models", g.handleModels)
+	mux.HandleFunc("POST "+InboundPrefix+EndpointChatCompletions, g.serveWith(EndpointChatCompletions))
+	mux.HandleFunc("POST "+InboundPrefix+EndpointCompletions, g.serveWith(EndpointCompletions))
+	mux.HandleFunc("POST "+InboundPrefix+EndpointEmbeddings, g.serveWith(EndpointEmbeddings))
+	mux.HandleFunc("POST "+InboundPrefix+EndpointResponses, g.serveWith(EndpointResponses))
+	mux.HandleFunc("POST "+InboundPrefix+EndpointMessages, g.serveWith(EndpointMessages))
 	return mux
 }
 

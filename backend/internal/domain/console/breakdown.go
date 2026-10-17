@@ -36,6 +36,7 @@ type BillingDetail struct {
 	BillingID       string     `json:"BillingID"`
 	CallTime        string     `json:"CallTime"`
 	Model           string     `json:"Model"`
+	AutoModelName   string     `json:"AutoModelName,omitempty"` // 请求的 Auto 名（非 Auto 请求为空）
 	PricingMode     string     `json:"PricingMode"`
 	CreditsConsumed float64    `json:"CreditsConsumed"`
 	Status          string     `json:"Status"`
@@ -51,22 +52,23 @@ type BillingDetail struct {
 // CallLogView 调用日志只读视图（会话调用列表项与 BillingDetail.CallLog 共用）。
 // ReqMessages/Decision 为 JSONB 原始 value 反序列化结果（null 给 nil）；雪花 ID 以字符串序列化。
 type CallLogView struct {
-	BillingID    string `json:"BillingID"`
-	RequestID    string `json:"RequestID"`
-	SessionID    string `json:"SessionID"`
-	Model        string `json:"Model"`
-	Status       string `json:"Status"`
-	RespKind     string `json:"RespKind"`
-	ErrorMessage string `json:"ErrorMessage"`
-	DurationMs   *int64 `json:"DurationMs,omitempty"`
-	FirstTokenMs *int64 `json:"FirstTokenMs,omitempty"`
-	CallTime     string `json:"CallTime"`
-	ReqMessages  any    `json:"ReqMessages"` // JSONB 原始 value（可能 null）
-	RespBody     string `json:"RespBody"`
-	Decision     any    `json:"Decision"` // JSONB 原始 value（可能 null）
+	BillingID     string `json:"BillingID"`
+	RequestID     string `json:"RequestID"`
+	SessionID     string `json:"SessionID"`
+	Model         string `json:"Model"`
+	AutoModelName string `json:"AutoModelName,omitempty"` // 请求的 Auto 名（非 Auto 请求为空）
+	Status        string `json:"Status"`
+	RespKind      string `json:"RespKind"`
+	ErrorMessage  string `json:"ErrorMessage"`
+	DurationMs    *int64 `json:"DurationMs,omitempty"`
+	FirstTokenMs  *int64 `json:"FirstTokenMs,omitempty"`
+	CallTime      string `json:"CallTime"`
+	ReqMessages   any    `json:"ReqMessages"` // JSONB 原始 value（可能 null）
+	RespBody      string `json:"RespBody"`
+	Decision      any    `json:"Decision"` // JSONB 原始 value（可能 null）
 	// UpstreamUsage 上游原始 usage（JSONB 反序列化结果：{"Protocol":...,"Usage":{...}}，可能 null）：
 	// 诊断渠道 usage 口径用（billing_records.tokens 是归一化后的三段，看不出上游原文）。
-	UpstreamUsage any    `json:"UpstreamUsage"`
+	UpstreamUsage any `json:"UpstreamUsage"`
 	PricingMode   string `json:"PricingMode"`
 }
 
@@ -99,6 +101,7 @@ func toCallLogView(cl *gateway.CallLog) *CallLogView {
 		RequestID:     cl.RequestID,
 		SessionID:     cl.SessionID,
 		Model:         cl.Model,
+		AutoModelName: cl.AutoModelName,
 		Status:        cl.Status,
 		RespKind:      cl.RespKind,
 		ErrorMessage:  cl.ErrorMessage,

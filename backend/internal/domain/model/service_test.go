@@ -101,6 +101,29 @@ func TestService_CreateModel_NameExists(t *testing.T) {
 	}
 }
 
+// 跨表重名（反方向）：对外模型名与已有 Auto 名冲突 → 40901（checkAutoName 拦截，不落到 store）。
+func TestService_CreateModel_AutoNameConflict(t *testing.T) {
+	s, mock := mockService(t)
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + cols + ` FROM external_models WHERE external_name = $1`)).
+		WithArgs("shared").
+		WillReturnError(sql.ErrNoRows)
+	s.SetAutoNameChecker(func(_ context.Context, name string) (bool, error) {
+		return name == "shared", nil
+	})
+
+	_, err := s.CreateModel(context.Background(), ExternalModelInput{ExternalName: "shared", SaleRates: saleRates()})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != resp.CodeConflict {
+		t.Fatalf("期望与 Auto 重名 40901，got %v", err)
+	}
+	if apiErr.Message != "模型名已被 Auto 模型占用" {
+		t.Fatalf("unexpected message: %q", apiErr.Message)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("mock expectations: %v", err)
+	}
+}
+
 func TestService_UpdateModel(t *testing.T) {
 	s, mock := mockService(t)
 	now := time.Now()

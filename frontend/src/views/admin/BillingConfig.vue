@@ -1,8 +1,17 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { QuestionFilled } from '@element-plus/icons-vue'
-import { getSystemConfig, putSystemConfig, type BillingConfigData, type CostSample, type SessionExpirationData } from '@/api/admin'
+import {
+  getSystemConfig,
+  putSystemConfig,
+  exportChannelProtocols,
+  importChannelProtocols,
+  type BillingConfigData,
+  type CostSample,
+  type SessionExpirationData,
+  type ChannelProtocolPack,
+} from '@/api/admin'
 import ModelPricing from '@/components/ModelPricing.vue'
 import ErrorBubble from '@/components/ErrorBubble.vue'
 
@@ -47,6 +56,91 @@ const headerSuggestions = [
   'x-client-request-id',
   'x-opencode-session',
 ]
+
+// 渠道协议导入：隐藏文件输入 + 导出/导入操作状态
+const fileInput = ref<HTMLInputElement | null>(null)
+const exporting = ref(false)
+const importing = ref(false)
+
+// 生成本地时间戳文件名片段：YYYYMMDD-HHmmss
+function formatTs(d = new Date()) {
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`
+}
+
+// 导出全部渠道协议为预设包 JSON 并触发下载
+async function onExport() {
+  exporting.value = true
+  errInfo.value = { message: '', requestId: '' }
+  try {
+    const res = await exportChannelProtocols()
+    const text = JSON.stringify(res.Data, null, 2)
+    const blob = new Blob([text], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `channel-protocols-${formatTs()}.json`
+    a.click()
+    URL.revokeObjectURL(url)
+  } catch (e: any) {
+    errInfo.value = { message: e?.message, requestId: e?.requestId }
+  } finally {
+    exporting.value = false
+  }
+}
+
+// 触发隐藏文件选择框
+function triggerImport() {
+  fileInput.value?.click()
+}
+
+// 读取选中文件并导入渠道协议
+async function onFileChange(ev: Event) {
+  const input = ev.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file) {
+    return
+  }
+  try {
+    const raw = await file.text()
+    if (!raw) {
+      return
+    }
+    let parsed: ChannelProtocolPack
+    try {
+      parsed = JSON.parse(raw)
+    } catch {
+      ElMessage.error('文件不是合法 JSON')
+      return
+    }
+    await ElMessageBox.confirm(
+      '即将从该文件导入渠道协议（同名/同来源将自动跳过）。是否继续？',
+      '导入渠道协议',
+      { type: 'warning' },
+    )
+    importing.value = true
+    errInfo.value = { message: '', requestId: '' }
+    try {
+      const res = await importChannelProtocols(parsed)
+      ElMessage.success(`导入完成：新增 ${res.Data.Created} 条，跳过 ${res.Data.Skipped} 条`)
+      const warnings = res.Data.Warnings || []
+      if (warnings.length) {
+        ElMessageBox.alert(warnings.join('\n'), '导入告警', { type: 'warning' })
+      }
+    } catch (e: any) {
+      errInfo.value = { message: e?.message, requestId: e?.requestId }
+    } finally {
+      importing.value = false
+    }
+  } catch (e: any) {
+    // 用户取消确认弹窗：静默处理
+    if (e === 'cancel' || e === 'close') return
+    errInfo.value = { message: e?.message, requestId: e?.requestId }
+  } finally {
+    // 无论成败都重置，支持重复选择同一文件
+    input.value = ''
+  }
+}
 
 async function load() {
   loading.value = true
@@ -362,6 +456,26 @@ async function saveFallback() {
               <div class="hint">支持直接输入自定义头名回车添加；候选项为常见可透传头。</div>
             </el-form-item>
           </el-form>
+        </div>
+
+        <el-divider />
+
+        <div class="config-block">
+          <div class="block-title">备份与恢复</div>
+          <div class="block-desc">导出全部渠道协议为预设包 JSON，或从该文件导入。导入按名称/来源自动去重，仅新增不覆盖。</div>
+
+          <div class="form-row">
+            <span class="label">渠道协议</span>
+            <el-button type="primary" :loading="exporting" @click="onExport">导出</el-button>
+            <el-button :loading="importing" @click="triggerImport">导入</el-button>
+            <input
+              ref="fileInput"
+              type="file"
+              accept=".json,application/json"
+              style="display: none"
+              @change="onFileChange"
+            />
+          </div>
         </div>
 
         <ErrorBubble

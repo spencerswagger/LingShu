@@ -27,51 +27,7 @@ import (
 // 以便精确控制只应用 <0011 的历史迁移），再插入样例数据、执行 0011/0013 并断言结果；
 // 结束时无条件删除临时库。
 func TestMigrate_ThreeSegments(t *testing.T) {
-	dsn := os.Getenv("LLMGATEWAY_TEST_PG_DSN")
-	if dsn == "" {
-		t.Skip("未设置 LLMGATEWAY_TEST_PG_DSN，跳过迁移集成测试")
-	}
-
-	adminDB, err := Open(dsn)
-	if err != nil {
-		t.Fatalf("打开管理连接失败: %v", err)
-	}
-	defer adminDB.Close()
-	if err := adminDB.Ping(); err != nil {
-		t.Fatalf("管理连接 ping 失败（DSN 是否可达?）: %v", err)
-	}
-
-	name := fmt.Sprintf("llmgateway-test-%d", time.Now().UnixNano())
-	if _, err := adminDB.Exec(`CREATE DATABASE ` + quoteIdent(name)); err != nil {
-		t.Fatalf("创建临时库 %s 失败: %v", name, err)
-	}
-	// 清理必须在建库后立即注册：后续 DSN 构造/连接/建表任一步失败都会走到这里，
-	// 避免异常路径遗留临时库。tempDB 可能为 nil，defer 内按需关闭。
-	var tempDB *sql.DB
-	defer func() {
-		if tempDB != nil {
-			_ = tempDB.Close()
-		}
-		_, _ = adminDB.Exec(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1`, name)
-		if _, derr := adminDB.Exec(`DROP DATABASE IF EXISTS ` + quoteIdent(name)); derr != nil {
-			t.Logf("删除临时库 %s 失败: %v", name, derr)
-		} else {
-			t.Logf("已删除临时库 %s", name)
-		}
-	}()
-	tempDSN, err := withDatabase(dsn, name)
-	if err != nil {
-		t.Fatalf("构造临时库 DSN 失败: %v", err)
-	}
-	db, err := Open(tempDSN)
-	if err != nil {
-		t.Fatalf("打开临时库失败: %v", err)
-	}
-	tempDB = db
-	if err := tempDB.Ping(); err != nil {
-		t.Fatalf("临时库 ping 失败: %v", err)
-	}
-	t.Logf("已创建临时库 %s", name)
+	tempDB := openTempDB(t)
 
 	migDir := filepath.Join(filepath.Dir(mustCallerFile(t)), "migrations")
 	applyMigrationsBelow(t, tempDB, migDir, "0011")
@@ -104,7 +60,7 @@ func TestMigrate_ThreeSegments(t *testing.T) {
 			s.id, fmt.Sprintf("b-%d", i), s.tokens)
 	}
 
-	runMigration(t, tempDB, migDir, migrationFile(t, migDir, "0011"))
+	runMigration(t, tempDB, migDir, migrationFile(t, migDir, "0011_unify"))
 
 	for _, s := range samples {
 		var raw []byte
@@ -134,7 +90,7 @@ func TestMigrate_ThreeSegments(t *testing.T) {
 	exec(t, tempDB,
 		`INSERT INTO probe_logs(id, channel_key_id, target, ok, input_tokens, output_tokens, cached_tokens, total_tokens)
 		 VALUES (1, 1, 'http://x', true, 100, 50, 30, 150)`)
-	runMigration(t, tempDB, migDir, migrationFile(t, migDir, "0013"))
+	runMigration(t, tempDB, migDir, migrationFile(t, migDir, "0013_probe"))
 
 	var inTok, outTok, cachedTok, totalTok int
 	if err := tempDB.QueryRow(
@@ -146,6 +102,104 @@ func TestMigrate_ThreeSegments(t *testing.T) {
 		t.Fatalf("probe_logs 归一化: got input=%d cached=%d output=%d total=%d, want 70/30/50/150",
 			inTok, cachedTok, outTok, totalTok)
 	}
+}
+
+// TestMigrate_FullChain 验证「全新库」按文件名升序应用全部迁移可跑通，且合并后并存的两个
+// 0011_* 迁移（0011_auto_models 与 0011_unify_usage_three_segments）都能落地：
+// call_logs 同时具备 auto_model_name 与 upstream_usage 列，sale_rates 默认值已是三段。
+func TestMigrate_FullChain(t *testing.T) {
+	tempDB := openTempDB(t)
+	migDir := filepath.Join(filepath.Dir(mustCallerFile(t)), "migrations")
+
+	names := migrationNames(t, migDir)
+	for _, n := range names {
+		runMigration(t, tempDB, migDir, n)
+	}
+	t.Logf("已按序应用 %d 个迁移", len(names))
+
+	// 两个 0011_* 并存是刻意保留：改号会让已执行过 0013 的库把减法迁移重跑一次。
+	var dup11 int
+	for _, n := range names {
+		if strings.HasPrefix(n, "0011") {
+			dup11++
+		}
+	}
+	if dup11 < 2 {
+		t.Fatalf("期望合并后并存 2 个 0011_* 迁移, got %d", dup11)
+	}
+
+	cols := map[string]bool{}
+	rows, err := tempDB.Query(`SELECT column_name FROM information_schema.columns WHERE table_name='call_logs'`)
+	if err != nil {
+		t.Fatalf("查询 call_logs 列失败: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var c string
+		if err := rows.Scan(&c); err != nil {
+			t.Fatalf("扫描列名失败: %v", err)
+		}
+		cols[c] = true
+	}
+	for _, want := range []string{"auto_model_name", "upstream_usage"} {
+		if !cols[want] {
+			t.Fatalf("call_logs 缺少列 %s（合并后迁移链未跑通）", want)
+		}
+	}
+
+	var def string
+	if err := tempDB.QueryRow(
+		`SELECT column_default FROM information_schema.columns WHERE table_name='external_models' AND column_name='sale_rates'`).Scan(&def); err != nil {
+		t.Fatalf("读取 sale_rates 默认值失败: %v", err)
+	}
+	if strings.Contains(def, "cache_write") || strings.Contains(def, "reasoning") {
+		t.Fatalf("sale_rates 默认值仍含废弃键: %s", def)
+	}
+}
+
+// openTempDB 建一次性库并在测试结束（含失败）时删除；未设置 LLMGATEWAY_TEST_PG_DSN 时 skip。
+func openTempDB(t *testing.T) *sql.DB {
+	t.Helper()
+	dsn := os.Getenv("LLMGATEWAY_TEST_PG_DSN")
+	if dsn == "" {
+		t.Skip("未设置 LLMGATEWAY_TEST_PG_DSN，跳过迁移集成测试")
+	}
+	adminDB, err := Open(dsn)
+	if err != nil {
+		t.Fatalf("打开管理连接失败: %v", err)
+	}
+	t.Cleanup(func() { _ = adminDB.Close() })
+	if err := adminDB.Ping(); err != nil {
+		t.Fatalf("管理连接 ping 失败（DSN 是否可达?）: %v", err)
+	}
+
+	name := fmt.Sprintf("llmgateway-test-%d", time.Now().UnixNano())
+	if _, err := adminDB.Exec(`CREATE DATABASE ` + quoteIdent(name)); err != nil {
+		t.Fatalf("创建临时库 %s 失败: %v", name, err)
+	}
+	// 注册顺序 = 执行逆序：先注册 DROP，再注册连接关闭，保证 DROP 前已断开临时库连接。
+	t.Cleanup(func() {
+		_, _ = adminDB.Exec(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1`, name)
+		if _, derr := adminDB.Exec(`DROP DATABASE IF EXISTS ` + quoteIdent(name)); derr != nil {
+			t.Logf("删除临时库 %s 失败: %v", name, derr)
+		} else {
+			t.Logf("已删除临时库 %s", name)
+		}
+	})
+	tempDSN, err := withDatabase(dsn, name)
+	if err != nil {
+		t.Fatalf("构造临时库 DSN 失败: %v", err)
+	}
+	tempDB, err := Open(tempDSN)
+	if err != nil {
+		t.Fatalf("打开临时库失败: %v", err)
+	}
+	t.Cleanup(func() { _ = tempDB.Close() })
+	if err := tempDB.Ping(); err != nil {
+		t.Fatalf("临时库 ping 失败: %v", err)
+	}
+	t.Logf("已创建临时库 %s", name)
+	return tempDB
 }
 
 // applyMigrationsBelow 按文件名升序应用 <limit 的历史迁移（建表用）。
