@@ -449,7 +449,9 @@ func (s *Service) flushRetryOnce(ctx context.Context) {
 }
 
 // requestCredits 解析一次请求的应付积分与系数（Record 结算与 EstimateCredits 预扣共用同一口径）：
-// 模型级 time_config/context_tiers 非空则优先，否则回落全局；ctxCoeff 仅按输入 token 分档。
+// 模型级 time_config/context_tiers 非空则优先，否则回落全局；
+// ctxCoeff 按总输入 token（Input + CacheRead）分档——分档语义是「上下文长度」，
+// 三段口径下 Input 只是纯输入，必须加上缓存读才是本次请求实际处理的上下文规模。
 func (s *Service) requestCredits(req RecordReq) (credits, timeCoeff, ctxCoeff float64, r int64, err error) {
 	r, err = s.cfg.R()
 	if err != nil {
@@ -475,7 +477,7 @@ func (s *Service) requestCredits(req RecordReq) (credits, timeCoeff, ctxCoeff fl
 	if err != nil {
 		return 0, 0, 0, 0, err
 	}
-	ctxCoeff, err = ContextTierCoeff(req.Tokens.Input, tiers)
+	ctxCoeff, err = ContextTierCoeff(req.Tokens.Input+req.Tokens.CacheRead, tiers)
 	if err != nil {
 		return 0, 0, 0, 0, err
 	}
@@ -661,8 +663,8 @@ func (p *defaultConfigProvider) TimeConfig() (TimeCoeffConfig, error) {
 }
 
 // SampleUsage 读取 routing.cost_sample（路由成本比较样值用量，带内存缓存）。
-// JSON 键与 Usage 一致（input/output/cache_read/cache_write/reasoning）；未提供的段按 0 处理
-// （如 cache_write 缺省即 0）。该值仅用于新会话创建时的成本比较，不参与实际计费。
+// JSON 键与 Usage 一致（input/output/cache_read，三段口径）；未提供的段按 0 处理。
+// 该值仅用于新会话创建时的成本比较，不参与实际计费。
 func (p *defaultConfigProvider) SampleUsage() (Usage, error) {
 	p.mu.RLock()
 	cached := p.sample

@@ -319,7 +319,7 @@ onMounted(() => {
 })
 
 // ===== 展示格式化 =====
-// token 用量两行展示：第一行 输入/输出，第二行 缓存读/缓存写/推理（第二行全 0 不显示）
+// token 用量两行展示：第一行 输入/输出，第二行 缓存读（第二行全 0 不显示）
 function tokenLine1(row: AdminBillingItem): string {
   const t = row.Tokens || ({} as AdminBillingItem['Tokens'])
   const parts: string[] = []
@@ -331,8 +331,6 @@ function tokenLine2(row: AdminBillingItem): string {
   const t = row.Tokens || ({} as AdminBillingItem['Tokens'])
   const parts: string[] = []
   if (t.CacheRead) parts.push(`缓存读 ${t.CacheRead}`)
-  if (t.CacheWrite) parts.push(`缓存写 ${t.CacheWrite}`)
-  if (t.Reasoning) parts.push(`推理 ${t.Reasoning}`)
   return parts.join(' · ')
 }
 
@@ -371,11 +369,12 @@ function avgTPM(): string {
 }
 const creditsTotal = computed(() => stats.value.CreditsTotal.toLocaleString(undefined, { maximumFractionDigits: 4 }))
 const tokensTotal = computed(() => stats.value.TokensTotal.toLocaleString())
-// 缓存命中率 = 缓存读 ÷ 输入(含缓存读)
+// 缓存命中率 = 缓存读 ÷ (输入 + 缓存读)
 const cacheHitRate = computed(() => {
   const s = stats.value
-  if (!s.InputTokens) return '-'
-  return `${((s.CacheReadTokens / s.InputTokens) * 100).toFixed(1)}%`
+  const denom = s.InputTokens + s.CacheReadTokens
+  if (!denom) return '-'
+  return `${((s.CacheReadTokens / denom) * 100).toFixed(1)}%`
 })
 
 // 消耗积分公式（与详情页一致的三步式展示）：Token×单价 → 系数调整 → 积分换算
@@ -386,16 +385,12 @@ function creditLines(row: AdminBillingItem): string[] {
   const coeffCtx = row.CoeffContext ?? 1
   const r = row.RValue ?? 0
 
-  // 输入(Input)已含缓存读(CacheRead)，为避免缓存命中 token 重复计费，
-  // 输入段按 (Input - CacheRead) 计（与后端 sumRates 口径一致）。
-  const cacheRead = t.CacheRead || 0
-  const nonCachedIn = Math.max((t.Input || 0) - cacheRead, 0)
+  // 三段直接相加：输入为纯输入（不含缓存读）、缓存读单列、输出含推理，
+  // 与后端 sumRates 口径一致，不做 (Input - CacheRead) 减法。
   const segs: Array<[number, string, string]> = [
-    [nonCachedIn, cacheRead > 0 ? '输入(非缓存)' : '输入', 'Input'],
+    [t.Input || 0, '输入', 'Input'],
     [t.Output || 0, '输出', 'Output'],
-    [cacheRead, '缓存读', 'CacheRead'],
-    [t.CacheWrite || 0, '缓存写', 'CacheWrite'],
-    [t.Reasoning || 0, '推理', 'Reasoning'],
+    [t.CacheRead || 0, '缓存读', 'CacheRead'],
   ]
   const step1: string[] = []
   let sub1 = 0
@@ -438,7 +433,7 @@ function sessionLabel(s: AdminSession): string {
         <span class="stat-value">{{ tokensTotal }}</span>
       </div>
       <div class="stat">
-        <span class="stat-label" title="缓存读占输入的比重">缓存命中率</span>
+        <span class="stat-label" title="缓存读 ÷ (输入+缓存读)">缓存命中率</span>
         <span class="stat-value">{{ cacheHitRate }}</span>
       </div>
       <div class="stat">
@@ -635,7 +630,7 @@ function sessionLabel(s: AdminSession): string {
           </template>
         </el-table-column>
 
-        <!-- Token（双行：输入/输出 + 缓存/推理） -->
+        <!-- Token（双行：输入/输出 + 缓存读） -->
         <el-table-column label="Token" min-width="150" align="right">
           <template #default="{ row }">
             <div class="t-time right">

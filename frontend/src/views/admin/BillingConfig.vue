@@ -25,9 +25,7 @@ const fallbackModel = ref<Record<string, any>>({ TimeConfig: null, ContextTiers:
 const costSample = ref<CostSample>({
   input: 10000,
   cache_read: 9000,
-  cache_write: 0,
   output: 1000,
-  reasoning: 500,
 })
 
 // 会话过期分档（后端按「上下文长度 + 对话次数」双维度分档，取较大者）
@@ -67,9 +65,7 @@ async function load() {
       costSample.value = {
         input: Number(cs.input) || 0,
         cache_read: Number(cs.cache_read) || 0,
-        cache_write: Number(cs.cache_write) || 0,
         output: Number(cs.output) || 0,
-        reasoning: Number(cs.reasoning) || 0,
       }
     }
     const se = res.Data.SessionExpiration
@@ -269,18 +265,10 @@ async function saveFallback() {
             <el-input-number v-model="costSample.cache_read" :min="0" :step="1000" />
           </div>
           <div class="form-row">
-            <span class="label">缓存写 tokens</span>
-            <el-input-number v-model="costSample.cache_write" :min="0" :step="1000" />
-          </div>
-          <div class="form-row">
             <span class="label">输出 tokens</span>
             <el-input-number v-model="costSample.output" :min="0" :step="100" />
-          </div>
-          <div class="form-row">
-            <span class="label">推理 tokens</span>
-            <el-input-number v-model="costSample.reasoning" :min="0" :step="100" />
             <el-tooltip
-              :content="'以该样值代入渠道成本单价求和（输入按「输入-缓存读」计入），作为新会话落点的可比成本；再乘以当前时段系数。'"
+              :content="'以该样值代入渠道成本单价求和（三段相加：输入为纯输入、不含缓存读），作为新会话落点的可比成本；再乘以当前时段系数。'"
               placement="top"
             >
               <el-icon class="hint-icon"><QuestionFilled /></el-icon>

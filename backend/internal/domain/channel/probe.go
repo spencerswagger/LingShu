@@ -70,12 +70,19 @@ func (m *Manager) probeRequest(ch *RuntimeChannel, cred string) (target, authHea
 	return joinProbeURL(base, path), header, value
 }
 
-// ProbeUsage 探测请求的 token 开销（供记账）。
+// ProbeUsage 探测请求的三段 token 开销（口径与 billing.Usage 一致）：
+//   - InputTokens：纯输入，不含缓存读（上游缓存写 token 属于输入，已含在其中）；
+//   - OutputTokens：生成 token，含推理；
+//   - CachedTokens：命中提示词缓存读取的输入；
+//   - TotalTokens：优先采用上游 total_tokens（其定义即 prompt+completion，等于三段之和）；
+//     上游缺失(0)时按三段求和兜底。
+//
+// probe_logs 与探测记账（系统身份）共用该口径，不再保留上游原始的「输入含缓存读」形态。
 type ProbeUsage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	CachedTokens     int `json:"cached_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	InputTokens  int `json:"input_tokens"`
+	OutputTokens int `json:"output_tokens"`
+	CachedTokens int `json:"cached_tokens"`
+	TotalTokens  int `json:"total_tokens"`
 }
 
 // ProbeOutcome 手动触发一轮健康探测的返回结果（供控制台展示）。
@@ -331,19 +338,36 @@ func (m *Manager) doProbeAuth(ctx context.Context, url, authHeader, authValue, m
 		// 尽量解析 token 开销（探测记录与账单用）；解析失败不阻塞探测判定。
 		var body struct {
 			Usage struct {
-				PromptTokens        int `json:"prompt_tokens"`
-				CompletionTokens    int `json:"completion_tokens"`
-				TotalTokens         int `json:"total_tokens"`
-				PromptTokensDetails struct {
+				PromptTokens     int `json:"prompt_tokens"`
+				CompletionTokens int `json:"completion_tokens"`
+				TotalTokens      int `json:"total_tokens"`
+				// DeepSeek 原生风格：命中数在顶层 prompt_cache_hit_tokens（与 cached_tokens 同义）。
+				PromptCacheHitTokens int `json:"prompt_cache_hit_tokens"`
+				PromptTokensDetails  struct {
 					CachedTokens int `json:"cached_tokens"`
 				} `json:"prompt_tokens_details"`
 			} `json:"usage"`
 		}
 		if err := json.NewDecoder(resp.Body).Decode(&body); err == nil {
-			usage.PromptTokens = body.Usage.PromptTokens
-			usage.CompletionTokens = body.Usage.CompletionTokens
-			usage.CachedTokens = body.Usage.PromptTokensDetails.CachedTokens
+			// 三段口径（与 billing.Usage 一致）：探测固定走 OpenAI 兼容请求，prompt_tokens 是「含」口径，
+			// 命中缓存的 token 必须从输入中剔除；同时兜底 DeepSeek 原生顶层字段。
+			cached := body.Usage.PromptTokensDetails.CachedTokens
+			if cached == 0 {
+				cached = body.Usage.PromptCacheHitTokens
+			}
+			input := body.Usage.PromptTokens - cached
+			if input < 0 {
+				input = 0
+			}
+			usage.InputTokens = input
+			usage.OutputTokens = body.Usage.CompletionTokens
+			usage.CachedTokens = cached
+			// 上游 total_tokens 的定义即 prompt_tokens + completion_tokens，等于「输入+缓存读+输出」三段之和，
+			// 故直接采用上游值；仅在缺失（为 0）时按三段求和兜底。
 			usage.TotalTokens = body.Usage.TotalTokens
+			if usage.TotalTokens == 0 {
+				usage.TotalTokens = input + cached + body.Usage.CompletionTokens
+			}
 		}
 		return fb, usage, ""
 	case resp.StatusCode == http.StatusTooManyRequests:
@@ -400,8 +424,8 @@ func (m *Manager) recordProbe(ctx context.Context, keyID int64, modelID, level, 
 			Target:       target,
 			OK:           ok,
 			Error:        errMsg,
-			InputTokens:  usage.PromptTokens,
-			OutputTokens: usage.CompletionTokens,
+			InputTokens:  usage.InputTokens,
+			OutputTokens: usage.OutputTokens,
 			CachedTokens: usage.CachedTokens,
 			TotalTokens:  usage.TotalTokens,
 			DurationMS:   int(durationMS),

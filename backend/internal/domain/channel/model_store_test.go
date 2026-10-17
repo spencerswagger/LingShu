@@ -126,7 +126,7 @@ func TestChannelModelStore_ListAll(t *testing.T) {
 
 func TestChannelModelStore_Insert_Conflict(t *testing.T) {
 	s, mock := mockCMStore(t)
-	rates := billing.Rates{"input": 0.8, "output": 1.6, "cache_read": 0.05, "cache_write": 0.2, "reasoning": 0.8}
+	rates := billing.Rates{"input": 0.8, "output": 1.6, "cache_read": 0.05}
 	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO channel_models(id, channel_id, internal_model_id, external_model_id, cost_rates, time_config, context_tiers, protocols, state, rate_limit, health_probe, reliability) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING `+cmCols)).
 		WithArgs(sqlmock.AnyArg(), int64(1), "qwen-max", int64(2), sqlmock.AnyArg(), nil, nil, nil, "NORMAL", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnError(&pgconn.PgError{Code: "23505"})

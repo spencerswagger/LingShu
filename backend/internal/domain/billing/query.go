@@ -81,9 +81,9 @@ func (s *SqlStore) ListRecords(ctx context.Context, f RecordFilter) ([]Record, i
 	return list, total, nil
 }
 
-// RecordSummary 账单筛选聚合结果（统计栏）：请求数、总积分、总 token（四段求和）、总耗时。
-// 注：缓存读(cache_read)已含于 input，总量统计不重复计入（与 stats.go UsageSplit.Total() 口径一致）；
-// InputTokens 为「输入(含缓存读)」总量，CacheReadTokens 为缓存读命中量，二者用于计算缓存命中率。
+// RecordSummary 账单筛选聚合结果（统计栏）：请求数、总积分、总 token（三段求和）、总耗时。
+// 注：三段互斥（输入为纯输入、不含缓存读），总量统计直接求和 input/cache_read/output
+// （与 stats.go UsageSplit.Total() 口径一致）；缓存命中率分母 = InputTokens + CacheReadTokens。
 type RecordSummary struct {
 	Requests        int64   `json:"Requests"`
 	CreditsTotal    float64 `json:"CreditsTotal"`
@@ -102,9 +102,8 @@ func (s *SqlStore) Summarize(ctx context.Context, f RecordFilter) (RecordSummary
 		        COALESCE(sum(credits_consumed), 0),
 		        COALESCE(sum(
 		            COALESCE(NULLIF(tokens->>'input','')::bigint, 0) +
-		            COALESCE(NULLIF(tokens->>'output','')::bigint, 0) +
-		            COALESCE(NULLIF(tokens->>'cache_write','')::bigint, 0) +
-		            COALESCE(NULLIF(tokens->>'reasoning','')::bigint, 0)), 0),
+		            COALESCE(NULLIF(tokens->>'cache_read','')::bigint, 0) +
+		            COALESCE(NULLIF(tokens->>'output','')::bigint, 0)), 0),
 		        COALESCE(sum(duration_ms), 0),
 		        COALESCE(sum(COALESCE(NULLIF(tokens->>'input','')::bigint, 0)), 0),
 		        COALESCE(sum(COALESCE(NULLIF(tokens->>'cache_read','')::bigint, 0)), 0)

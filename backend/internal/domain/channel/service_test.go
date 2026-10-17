@@ -347,7 +347,7 @@ func TestService_RematerializeProtocol_InsertsAndPreservesState(t *testing.T) {
 	now := time.Now()
 	pid := int64(7)
 
-	modelsJSON := `{"qwen-max":{"externalModelID":"2","costRates":{"input":1,"output":2,"cache_read":0.1,"cache_write":0.2,"reasoning":1},"protocols":{"openai-chat":{}}},` +
+	modelsJSON := `{"qwen-max":{"externalModelID":"2","costRates":{"input":1,"output":2,"cache_read":0.1},"protocols":{"openai-chat":{}}},` +
 		`"qwen-plus":{"externalModelID":"5"},"no-bind":{"externalModelID":"0"}}`
 	mock.ExpectQuery(cpByIdRe).WithArgs(pid).WillReturnRows(cpProtoRow(7, "https://x.example.com", modelsJSON))
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + channelCols + ` FROM channels WHERE channel_protocol_id = $1 AND deleted_at IS NULL ORDER BY id ASC`)).

@@ -106,7 +106,7 @@ const externalModels = ref<ExternalModel[]>([])
 
 function emptyPricing(): Record<string, any> {
   return {
-    CostRates: { Input: 0, Output: 0, CacheRead: 0, CacheWrite: 0, Reasoning: 0 },
+    CostRates: { Input: 0, Output: 0, CacheRead: 0 },
     TimeConfig: null,
     ContextTiers: null,
   }
@@ -148,7 +148,7 @@ async function load() {
       baseUrl: ov?.baseUrl || '',
       externalModelID: ov?.externalModelID ?? null,
       pricing: {
-        CostRates: { Input: 0, Output: 0, CacheRead: 0, CacheWrite: 0, Reasoning: 0, ...(ov?.costRates || {}) },
+        CostRates: { Input: 0, Output: 0, CacheRead: 0, ...(ov?.costRates || {}) },
         TimeConfig: ov?.timeConfig ?? null,
         ContextTiers: ov?.contextTiers ?? null,
       },
@@ -250,7 +250,7 @@ async function confirmCreateExternal() {
   const name = createExternalName.value.trim()
   if (!name) return ElMessage.warning('请填写对外名称')
   const costRates = createExternalUseCost.value ? editingPricing.value.CostRates : null
-  const saleRates = { Input: 0, Output: 0, CacheRead: 0, CacheWrite: 0, Reasoning: 0, ...(costRates || {}) }
+  const saleRates = { Input: 0, Output: 0, CacheRead: 0, ...(costRates || {}) }
   createExternalSaving.value = true
   try {
     const res = await createExternalModel({
@@ -335,7 +335,7 @@ function fmtCost(row: ModelRow, k: string): string {
 }
 function costDetail(row: ModelRow): string {
   const r = row.pricing.CostRates || {}
-  const parts = ['Input', 'Output', 'CacheRead', 'CacheWrite', 'Reasoning'].map(
+  const parts = ['Input', 'Output', 'CacheRead'].map(
     (k) => `${rateLabels[k]} ${r[k] == null ? '-' : Math.round(r[k] * 1e6) / 1e6}`,
   )
   return `${parts.join('，')}（单位：人民币元/百万 token）`

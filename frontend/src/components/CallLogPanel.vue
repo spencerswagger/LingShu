@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import type { CallLogView } from '@/api/dev'
+import MessageBubbleGroup from '@/components/MessageBubbleGroup.vue'
+import { asMessageList, fmtJson, parseRespBody } from '@/utils/messageParts'
 
 // 决策轨迹 JSON 结构（后端 CallLogView.Decision）
 interface DecisionAttempt {
@@ -24,9 +26,10 @@ interface DecisionView {
   pre_consumed?: number
   result?: unknown
 }
-interface RespPart {
-  role?: string
-  text: string
+// 上游原始 usage（call_logs.upstream_usage）：{"Protocol":...,"Usage":{...}}
+interface UpstreamUsageView {
+  Protocol?: string
+  Usage?: Record<string, unknown>
 }
 
 const props = withDefaults(
@@ -40,50 +43,23 @@ const props = withDefaults(
   { showInternal: true, title: '请求 / 响应 / 决策轨迹' },
 )
 
-function fmtJson(v: unknown) {
-  if (v == null) return ''
-  try {
-    return JSON.stringify(v, null, 2)
-  } catch {
-    return String(v)
-  }
-}
+// ===== 请求增量：原样展示请求消息（气泡），并保留原始 JSON =====
+// 注意：失败请求也必须展示真实请求内容，不能被 ErrorMessage 覆盖（ErrorMessage 属于响应/决策维度）。
+const reqMsgs = computed(() => asMessageList(props.log?.ReqMessages))
+const reqRaw = computed(() => (props.log?.ReqMessages == null ? '' : fmtJson(props.log.ReqMessages)))
 
-// 响应体可能为：非流式消息对象 / 流式 assistant 增量数组 / 纯文本
-function parseRespPart(item: unknown): RespPart | null {
-  if (typeof item === 'string') return item ? { text: item } : null
-  if (item && typeof item === 'object') {
-    const o = item as Record<string, any>
-    const role = typeof o.role === 'string' ? o.role : undefined
-    const c = o.content
-    if (typeof c === 'string') return c ? { role, text: c } : role ? { role, text: '' } : null
-    if (Array.isArray(c)) {
-      const text = c
-        .map((x: any) => (typeof x === 'string' ? x : x && typeof x.text === 'string' ? x.text : ''))
-        .join('')
-      if (text) return { role, text }
-      return role ? { role, text: '' } : null
-    }
-    return { role, text: fmtJson(o) }
-  }
-  return null
-}
+// ===== 响应：消息形状 → 气泡；非消息形状（如上游错误体）→ 原始 JSON =====
+const resp = computed(() => parseRespBody(props.log?.RespBody || ''))
+const respIsMessage = computed(
+  () => !!(resp.value.text || resp.value.reasoning || resp.value.toolCalls.length),
+)
 
-const respParts = computed<RespPart[]>(() => {
-  const body = props.log?.RespBody
-  if (!body) return []
-  let parsed: unknown = null
-  try {
-    parsed = JSON.parse(body)
-  } catch {
-    return []
-  }
-  if (Array.isArray(parsed)) {
-    return parsed.map(parseRespPart).filter((p): p is RespPart => p !== null)
-  }
-  const part = parseRespPart(parsed)
-  return part ? [part] : []
+// ===== 上游原始 usage（诊断渠道口径：归一化结果见上方计费公式） =====
+const upstreamUsage = computed<UpstreamUsageView | null>(() => {
+  const v = props.log?.UpstreamUsage
+  return v && typeof v === 'object' ? (v as UpstreamUsageView) : null
 })
+const upstreamUsageJSON = computed(() => fmtJson(upstreamUsage.value?.Usage ?? upstreamUsage.value))
 
 const decision = computed<DecisionView | null>(() => {
   const d = props.log?.Decision as DecisionView | null | undefined
@@ -117,84 +93,124 @@ function fmtCoeff(v: number | undefined): string {
       <!-- 调用方可在同一折叠组内前置自定义区块（如账单详情页的计费计算公式） -->
       <slot name="prepend" />
       <template v-if="log">
-      <el-collapse-item name="req" title="请求增量">
-        <template v-if="log.RespKind === 'error'">
-          <div class="err-msg">{{ log.ErrorMessage || '请求失败，无更多信息' }}</div>
-        </template>
-        <pre v-else-if="log.ReqMessages != null" class="mono log-pre">{{ fmtJson(log.ReqMessages) }}</pre>
-        <div v-else class="log-empty">（未记录/继承历史上下文）</div>
-      </el-collapse-item>
+        <el-collapse-item name="req" title="请求增量">
+          <template v-if="reqMsgs.length">
+            <MessageBubbleGroup
+              v-for="(m, i) in reqMsgs"
+              :key="i"
+              :role="m.role || 'message'"
+              :content="m.content"
+              :tone="m.role === 'user' ? 'user' : 'assistant'"
+              empty-text="（该条消息无文本内容）"
+            />
+            <el-collapse class="raw-collapse">
+              <el-collapse-item name="req-raw" title="原始 JSON（增量消息数组）">
+                <pre class="mono log-pre">{{ reqRaw }}</pre>
+              </el-collapse-item>
+            </el-collapse>
+          </template>
+          <pre v-else-if="reqRaw" class="mono log-pre">{{ reqRaw }}</pre>
+          <div v-else class="log-empty">（未记录 / 继承历史上下文）</div>
+        </el-collapse-item>
 
-      <el-collapse-item name="resp" title="响应">
-        <template v-if="!log.RespBody">
-          <div class="log-empty">—</div>
-        </template>
-        <template v-else-if="respParts.length">
-          <div v-for="(part, k) in respParts" :key="k" class="resp-block">
-            <div v-if="part.role !== undefined" class="resp-role">{{ part.role }}</div>
-            <pre class="mono log-pre">{{ part.text }}</pre>
-          </div>
-        </template>
-        <pre v-else class="mono log-pre">{{ log.RespBody }}</pre>
-      </el-collapse-item>
+        <el-collapse-item name="resp" title="响应">
+          <!-- 网关侧失败：RespBody 可能为空，错误原因（error_message）独立展示，不依赖响应体 -->
+          <div v-if="log.ErrorMessage" class="resp-error">{{ log.ErrorMessage }}</div>
+          <template v-if="!log.RespBody">
+            <div class="log-empty">
+              {{
+                log.RespKind === 'error'
+                  ? '未收到上游响应（请求在网关侧终止，原因见「决策轨迹」）'
+                  : '—'
+              }}
+            </div>
+          </template>
+          <template v-else-if="respIsMessage">
+            <MessageBubbleGroup
+              role="assistant"
+              :content="resp.text"
+              :reasoning="resp.reasoning"
+              :tool-calls="resp.toolCalls"
+            />
+            <el-collapse class="raw-collapse">
+              <el-collapse-item name="resp-raw" title="原始响应">
+                <pre class="mono log-pre">{{ log.RespBody }}</pre>
+              </el-collapse-item>
+            </el-collapse>
+          </template>
+          <!-- 非消息形状（如上游错误体）：原样展示，不吞原文 -->
+          <pre v-else class="mono log-pre">{{ log.RespBody }}</pre>
+        </el-collapse-item>
 
-      <el-collapse-item name="decision" title="决策轨迹">
-        <template v-if="decision">
-          <div class="decision-tags">
-            <el-tag v-if="decision.time_coeff && decision.time_coeff > 0" size="small" effect="plain">
-              时段系数 ×{{ decision.time_coeff }}
+        <el-collapse-item v-if="upstreamUsage" name="usage" title="上游原始 usage">
+          <div class="usage-head">
+            <el-tag v-if="upstreamUsage.Protocol" size="small" effect="plain">
+              {{ upstreamUsage.Protocol }}
             </el-tag>
-            <el-tag v-if="decision.ctx_coeff && decision.ctx_coeff > 0" size="small" effect="plain">
-              上下文分档 ×{{ decision.ctx_coeff }}
-            </el-tag>
-            <el-tag v-if="decision.pre_consumed != null" size="small" type="warning" effect="plain">
-              预扣积分 {{ decision.pre_consumed }}
-              <span v-if="decision.est_input_tokens != null">（预估输入 {{ decision.est_input_tokens.toLocaleString() }} tok）</span>
-            </el-tag>
+            <span class="usage-hint">上游原始键值（未归一化）；三段归一化结果见上方计费明细</span>
           </div>
-          <div v-if="decision.result != null" class="decision-result">
-            <span class="d-label">最终结果</span>
-            <span class="d-value mono">{{ fmtResult(decision.result) }}</span>
-          </div>
-          <el-table
-            v-if="decision.attempts && decision.attempts.length"
-            :data="decision.attempts"
-            border
-            size="small"
-            class="attempt-table"
-          >
-            <el-table-column label="顺序" width="64" align="center">
-              <template #default="{ row }">#{{ row.order }}</template>
-            </el-table-column>
-            <el-table-column v-if="showInternal" label="渠道" min-width="140">
-              <template #default="{ row }">
-                <span :title="row.channel_id">{{ row.channel_name || row.channel_id || '-' }}</span>
-              </template>
-            </el-table-column>
-            <el-table-column v-if="showInternal" label="渠道密钥" min-width="140">
-              <template #default="{ row }">
-                <span :title="row.channel_key_id">{{ row.channel_key_name || row.channel_key_id || '-' }}</span>
-              </template>
-            </el-table-column>
-            <el-table-column v-if="showInternal" label="内部模型" min-width="140">
-              <template #default="{ row }"><span class="mono">{{ row.internal_model_id || '-' }}</span></template>
-            </el-table-column>
-            <el-table-column v-if="showInternal" label="成本" width="120" align="right">
-              <template #default="{ row }">
-                <span v-if="row.cost_known" class="mono">{{ fmtCost(row) }}</span>
-                <span v-else class="cost-unknown">未知</span>
-              </template>
-            </el-table-column>
-            <el-table-column v-if="showInternal" label="时段系数" width="100" align="right">
-              <template #default="{ row }"><span class="mono">{{ fmtCoeff(row.route_time_coeff) }}</span></template>
-            </el-table-column>
-            <el-table-column label="原因" min-width="200">
-              <template #default="{ row }">{{ row.reason || '-' }}</template>
-            </el-table-column>
-          </el-table>
-        </template>
-        <div v-else class="log-empty">（未记录决策轨迹）</div>
-      </el-collapse-item>
+          <pre class="mono log-pre">{{ upstreamUsageJSON }}</pre>
+        </el-collapse-item>
+
+        <el-collapse-item name="decision" title="决策轨迹">
+          <template v-if="decision">
+            <div class="decision-tags">
+              <el-tag v-if="decision.time_coeff && decision.time_coeff > 0" size="small" effect="plain">
+                时段系数 ×{{ decision.time_coeff }}
+              </el-tag>
+              <el-tag v-if="decision.ctx_coeff && decision.ctx_coeff > 0" size="small" effect="plain">
+                上下文分档 ×{{ decision.ctx_coeff }}
+              </el-tag>
+              <el-tag v-if="decision.pre_consumed != null" size="small" type="warning" effect="plain">
+                预扣积分 {{ decision.pre_consumed }}
+                <span v-if="decision.est_input_tokens != null"
+                  >（预估输入 {{ decision.est_input_tokens.toLocaleString() }} tok）</span
+                >
+              </el-tag>
+            </div>
+            <div v-if="decision.result != null" class="decision-result">
+              <span class="d-label">最终结果</span>
+              <span class="d-value mono">{{ fmtResult(decision.result) }}</span>
+            </div>
+            <el-table
+              v-if="decision.attempts && decision.attempts.length"
+              :data="decision.attempts"
+              border
+              size="small"
+              class="attempt-table"
+            >
+              <el-table-column label="顺序" width="64" align="center">
+                <template #default="{ row }">#{{ row.order }}</template>
+              </el-table-column>
+              <el-table-column v-if="showInternal" label="渠道" min-width="140">
+                <template #default="{ row }">
+                  <span :title="row.channel_id">{{ row.channel_name || row.channel_id || '-' }}</span>
+                </template>
+              </el-table-column>
+              <el-table-column v-if="showInternal" label="渠道密钥" min-width="140">
+                <template #default="{ row }">
+                  <span :title="row.channel_key_id">{{ row.channel_key_name || row.channel_key_id || '-' }}</span>
+                </template>
+              </el-table-column>
+              <el-table-column v-if="showInternal" label="内部模型" min-width="140">
+                <template #default="{ row }"><span class="mono">{{ row.internal_model_id || '-' }}</span></template>
+              </el-table-column>
+              <el-table-column v-if="showInternal" label="成本" width="120" align="right">
+                <template #default="{ row }">
+                  <span v-if="row.cost_known" class="mono">{{ fmtCost(row) }}</span>
+                  <span v-else class="cost-unknown">未知</span>
+                </template>
+              </el-table-column>
+              <el-table-column v-if="showInternal" label="时段系数" width="100" align="right">
+                <template #default="{ row }"><span class="mono">{{ fmtCoeff(row.route_time_coeff) }}</span></template>
+              </el-table-column>
+              <el-table-column label="原因" min-width="200">
+                <template #default="{ row }">{{ row.reason || '-' }}</template>
+              </el-table-column>
+            </el-table>
+          </template>
+          <div v-else class="log-empty">（未记录决策轨迹）</div>
+        </el-collapse-item>
       </template>
     </el-collapse>
   </div>
@@ -229,19 +245,26 @@ function fmtCoeff(v: number | undefined): string {
   color: var(--color-text-tertiary);
   padding: 8px 4px;
 }
-.err-msg {
-  font-size: 15px;
+.resp-error {
+  font-size: 13px;
   font-weight: 600;
   color: var(--color-danger);
-  padding: 8px 4px;
+  margin-bottom: 6px;
+  word-break: break-all;
 }
-.resp-block + .resp-block {
+.raw-collapse {
   margin-top: 10px;
 }
-.resp-role {
+.usage-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.usage-hint {
   font-size: 12px;
-  color: var(--color-text-secondary);
-  margin-bottom: 4px;
+  color: var(--color-text-tertiary);
 }
 .decision-tags {
   display: flex;
