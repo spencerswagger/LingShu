@@ -119,12 +119,9 @@ function fmtCoeff(v: number | undefined): string {
           <!-- 网关侧失败：RespBody 可能为空，错误原因（error_message）独立展示，不依赖响应体 -->
           <div v-if="log.ErrorMessage" class="resp-error">{{ log.ErrorMessage }}</div>
           <template v-if="!log.RespBody">
-            <div class="log-empty">
-              {{
-                log.RespKind === 'error'
-                  ? '未收到上游响应（请求在网关侧终止，原因见「决策轨迹」）'
-                  : '—'
-              }}
+            <!-- 已有 error_message 时不再重复叙述；仅在既无响应体也无错误原因时提示去看决策轨迹 -->
+            <div v-if="!log.ErrorMessage" class="log-empty">
+              {{ log.RespKind === 'error' ? '未收到上游响应（原因见「决策轨迹」）' : '—' }}
             </div>
           </template>
           <template v-else-if="respIsMessage">

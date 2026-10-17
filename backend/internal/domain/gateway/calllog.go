@@ -64,6 +64,15 @@ const callLogsCols = `billing_id, request_id, session_id, user_id, channel_id, c
 	internal_model_id, external_model_id, model, auto_model_name, pricing_mode, status, req_messages, resp_body, resp_kind,
 	decision, error_message, duration_ms, first_token_ms, created_at, upstream_usage`
 
+// insertCallLogSQL 写入一条调用日志。列与占位符必须一一对应（数量不等会让所有写日志失败），
+// 由 calllog_test.go 的 TestInsertCallLogSQL_ColumnPlaceholderCount 守卫。
+const insertCallLogSQL = `
+INSERT INTO call_logs(id, billing_id, request_id, session_id, user_id, channel_id, channel_key_id,
+	internal_model_id, external_model_id, model, auto_model_name, pricing_mode, status, req_messages, resp_body, resp_kind,
+	decision, error_message, duration_ms, first_token_ms, created_at, upstream_usage)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+ON CONFLICT (billing_id) DO NOTHING`
+
 // Insert 幂等插入一条调用日志：billing_id 冲突（ON CONFLICT DO NOTHING）静默跳过；
 // billing_id 为空串（拒绝场景）同样允许，靠 UNIQUE 约束保证拒绝场景也不重复落日志。
 func (s *SQLCallLogStore) Insert(ctx context.Context, c *CallLog) error {
@@ -83,12 +92,7 @@ func (s *SQLCallLogStore) Insert(ctx context.Context, c *CallLog) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.db.ExecContext(ctx, `
-INSERT INTO call_logs(id, billing_id, request_id, session_id, user_id, channel_id, channel_key_id,
-	internal_model_id, external_model_id, model, auto_model_name, pricing_mode, status, req_messages, resp_body, resp_kind,
-	decision, error_message, duration_ms, first_token_ms, created_at, upstream_usage)
-VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
-ON CONFLICT (billing_id) DO NOTHING`,
+	_, err = s.db.ExecContext(ctx, insertCallLogSQL,
 		id, c.BillingID, c.RequestID, c.SessionID, nullableInt64(c.UserID), nullableInt64(c.ChannelID),
 		nullableInt64(c.ChannelKeyID), c.InternalModelID, nullableInt64(c.ExternalModelID), c.Model,
 		nullableString(c.AutoModelName), c.PricingMode, c.Status, reqRaw, c.RespBody, c.RespKind, decRaw, c.ErrorMessage,

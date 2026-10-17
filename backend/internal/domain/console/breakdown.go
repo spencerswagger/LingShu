@@ -68,7 +68,7 @@ type CallLogView struct {
 	Decision      any    `json:"Decision"` // JSONB 原始 value（可能 null）
 	// UpstreamUsage 上游原始 usage（JSONB 反序列化结果：{"Protocol":...,"Usage":{...}}，可能 null）：
 	// 诊断渠道 usage 口径用（billing_records.tokens 是归一化后的三段，看不出上游原文）。
-	UpstreamUsage any `json:"UpstreamUsage"`
+	UpstreamUsage any    `json:"UpstreamUsage"`
 	PricingMode   string `json:"PricingMode"`
 }
 
