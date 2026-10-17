@@ -124,21 +124,31 @@
         写法 A：对每个候选算「该渠道本轮花费 <span class="op">＋</span> 该渠道重灌代价 <span class="op">÷</span> 预计剩余轮数」，取最小<br>
         写法 B：<span class="q">预计剩余轮数 ＞ 该候选的回本轮数 → 切换</span>
       </div>
+      <p class="f-note">A 与 B 数学上恒等（<code>C_新 ＋ 重灌代价 ÷ 轮数 &lt; C_旧 ⇔ 轮数 &gt; 回本轮数</code>）；<b>但前提是两边用同一套含倍率的口径</b>——A 用含倍率的「本轮花费 / 重灌代价」，B 的「回本轮数」也须含倍率（见公式四修正），否则闲忙时二者会分道扬镳。</p>
     </div>
 
     <div class="formula">
       <div class="f-label">公式四 · 回本轮数（可每轮现算）</div>
       <div class="f-body">
-        分子 ＝（新渠道输入单价 <span class="op">－</span> 新渠道缓存读单价）<span class="op">×</span> 缓存读token数<br>
-        分母 ＝（旧渠道缓存读单价 <span class="op">－</span> 新渠道缓存读单价）<span class="op">×</span> 缓存读token数<br>
-        　　　<span class="op">＋</span>（旧渠道输入单价 <span class="op">－</span> 新渠道输入单价）<span class="op">×</span> 新增输入token数<br>
-        　　　<span class="op">＋</span>（旧渠道输出单价 <span class="op">－</span> 新渠道输出单价）<span class="op">×</span> 输出token数<br>
-        <span class="q">回本轮数 ＝ 分子 ÷ 分母</span>（分母 ≤ 0 即永不回本）
+        记组合倍率 M ＝ 时段倍率 <span class="op">×</span> 上下文分档倍率（各渠道独立，记为 M<sub>旧</sub> / M<sub>新</sub>）<br>
+        分子 ＝（新渠道输入单价 <span class="op">－</span> 新渠道缓存读单价）<span class="op">×</span> 缓存读token数 <span class="op">×</span> M<sub>新</sub><br>
+        分母 ＝（旧渠道缓存读单价 <span class="op">×</span> M<sub>旧</sub> <span class="op">－</span> 新渠道缓存读单价 <span class="op">×</span> M<sub>新</sub>）<span class="op">×</span> 缓存读token数<br>
+        　　　<span class="op">＋</span>（旧渠道输入单价 <span class="op">×</span> M<sub>旧</sub> <span class="op">－</span> 新渠道输入单价 <span class="op">×</span> M<sub>新</sub>）<span class="op">×</span> 新增输入token数<br>
+        　　　<span class="op">＋</span>（旧渠道输出单价 <span class="op">×</span> M<sub>旧</sub> <span class="op">－</span> 新渠道输出单价 <span class="op">×</span> M<sub>新</sub>）<span class="op">×</span> 输出token数<br>
+        <span class="q">回本轮数 ＝ 分子 ÷ 分母</span>（分母 ≤ 0 <b>视为 +∞、即永不回本——须作为「覆盖规则」，不能直除</b>）
       </div>
-      <p class="f-note">长会话极限 ＝（新输入价 − 新缓存读价）÷（旧缓存读价 − 新缓存读价），只由价格决定。</p>
+      <p class="f-note">长会话极限 ＝（新输入价 − 新缓存读价）<span class="op">×</span> M<sub>新</sub> ÷（旧缓存读价 <span class="op">×</span> M<sub>旧</sub> − 新缓存读价 <span class="op">×</span> M<sub>新</sub>）；<b>仅当两渠道组合倍率相等（M<sub>旧</sub> ＝ M<sub>新</sub>）时才退化为「只由价格决定」</b>。闲忙时切换正是 M<sub>旧</sub> ≠ M<sub>新</sub>，漏乘倍率会把「回本 / 不回本」判反。</p>
     </div>
 
-    <div class="verdict"><b>分清两个"轮数"</b>：<b>回本轮数</b>可现算（公式四，只依赖价格与用量）；<b>预计剩余轮数</b>不可知、只能估——它是本模型唯一需要"设定/估计"的参数。接下来研究它。</div>
+    <div class="formula">
+      <div class="f-label">公式五 · 有效缓存读单价（修正「名义缓存价」偏差）</div>
+      <div class="f-body">
+        <span class="q">有效缓存读单价 b_eff ＝ α <span class="op">×</span> 名义缓存读单价 ＋ (1 − α) <span class="op">×</span> 输入单价</span>
+      </div>
+      <p class="f-note">α ＝ 该渠道<b>实测</b>缓存命中率（或直接用「有真实跨请求缓存 / 无」能力位）。公式一、公式二里的「缓存读单价」应取 b_eff：<b>若渠道无真实缓存（α≈0），b_eff→输入价，一次性重灌代价会退化为每轮代价，「长会话越久越值」的前提即崩塌</b>，回本轮数→+∞。故缓存定价必须与「是否真缓存」绑定，不能用报价表上的名义值。</p>
+    </div>
+
+    <div class="verdict"><b>分清两个"轮数"</b>：<b>回本轮数</b>可现算（公式四，只依赖价格、倍率与用量）；<b>预计剩余轮数</b>不可知、只能估——它是本模型唯一需要"设定/估计"的参数。接下来研究它。</div>
   </section>
 
   <!-- 二、预计剩余轮数研究 -->
