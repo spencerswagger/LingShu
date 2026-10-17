@@ -499,28 +499,28 @@ func TestManager_UpsertKey_AddsNewAndPreservesState(t *testing.T) {
 	}
 }
 
-func TestManager_KeyOrderForRouting_RoundRobin(t *testing.T) {
+// TestManager_KeyOrderForRouting_ReadOnlyStableAscending 锁定修正后的契约：
+// KeyOrderForRouting 只读、稳定、按 id 升序、无副作用（不轮转、不改变内部状态、不取写锁）。
+// 同渠道多密钥的流量分摊由路由择序的「存活会话数」实现，本方法不承担分流职责。
+func TestManager_KeyOrderForRouting_ReadOnlyStableAscending(t *testing.T) {
 	mgr, _ := newManagerWithTwoKeys(t)
 
-	// 初始按密钥 id 升序；每次调用旋转一位。
-	if got := mgr.KeyOrderForRouting(1); !slices.Equal(got, []int64{11, 12}) {
-		t.Fatalf("第 1 次调用期望 [11 12]，got %v", got)
-	}
-	if got := mgr.KeyOrderForRouting(1); !slices.Equal(got, []int64{12, 11}) {
-		t.Fatalf("第 2 次调用（旋转一位）期望 [12 11]，got %v", got)
-	}
-	if got := mgr.KeyOrderForRouting(1); !slices.Equal(got, []int64{11, 12}) {
-		t.Fatalf("第 3 次调用期望回到 [11 12]，got %v", got)
+	// 按 id 升序，且多次调用结果一致（无轮转副作用）。
+	for i := 0; i < 3; i++ {
+		if got := mgr.KeyOrderForRouting(1); !slices.Equal(got, []int64{11, 12}) {
+			t.Fatalf("第 %d 次调用期望稳定升序 [11 12]，got %v", i+1, got)
+		}
 	}
 
-	// 返回切片必须是防御拷贝：外部修改返回值不得影响内部轮询游标。
-	first := mgr.KeyOrderForRouting(1) // 此刻返回 [12 11]
+	// 返回切片必须是防御拷贝：外部修改返回值不得影响后续调用结果。
+	first := mgr.KeyOrderForRouting(1)
 	first[0] = 0
+	first = append(first, 99)
 	if got := mgr.KeyOrderForRouting(1); !slices.Equal(got, []int64{11, 12}) {
-		t.Fatalf("外部修改返回值影响后续轮询：%v", got)
+		t.Fatalf("外部修改返回值影响后续调用：%v", got)
 	}
 
-	// 密钥摘除后 keyOrder 重置重建，仅剩的密钥自成一序。
+	// 密钥摘除后反映剩余密钥，仍为升序且稳定。
 	mgr.RemoveKey(11)
 	if got := mgr.KeyOrderForRouting(1); !slices.Equal(got, []int64{12}) {
 		t.Fatalf("移除 key 11 后期望 [12]，got %v", got)
