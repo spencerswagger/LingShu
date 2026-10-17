@@ -224,7 +224,6 @@ type Manager struct {
 	mrt       map[int64]map[int64]*ModelRuntime // channelID → modelRowID → 模型运行时（模型保持渠道级，不复制到 KeyRuntime）
 	keys      map[int64]*KeyRuntime             // keyID → 密钥运行时（每密钥独立 Machine/Limiter）
 	keyOfCh   map[int64]map[int64]bool          // channelID → keyID 集合
-	keyOrder  map[int64][]int64                 // channelID → 密钥路由轮询顺序（KeyOrderForRouting 旋转维护）
 	boundTags map[int64][]TagRef                // channelID → 渠道已绑定标签（内存视图）
 	store     *Store
 	cmStore   *channelModelStore
@@ -268,7 +267,6 @@ func NewManager(store *Store, cmStore *channelModelStore, sm4Key []byte, probeHT
 		mrt:          make(map[int64]map[int64]*ModelRuntime),
 		keys:         make(map[int64]*KeyRuntime),
 		keyOfCh:      make(map[int64]map[int64]bool),
-		keyOrder:     make(map[int64][]int64),
 		boundTags:    make(map[int64][]TagRef),
 		probeRunning: make(map[int64]bool),
 		store:        store,
@@ -538,7 +536,6 @@ func (m *Manager) rebuildKeysLocked(keys []ChannelKey) {
 	}
 	m.keys = next
 	m.keyOfCh = byCh
-	m.keyOrder = make(map[int64][]int64)
 	m.syncAllKeysViewsLocked()
 }
 
@@ -575,7 +572,6 @@ func (m *Manager) rebuildChannelKeysLocked(channelID int64, keys []ChannelKey) {
 			delete(m.probeRunning, keyID)
 		}
 	}
-	m.keyOrder[channelID] = nil
 	m.syncChannelKeysViewLocked(channelID)
 }
 
@@ -685,7 +681,6 @@ func (m *Manager) UpsertKey(k ChannelKey) {
 	}
 	m.keys[k.ID] = kr
 	m.keyOfCh[k.ChannelID][k.ID] = true
-	m.keyOrder[k.ChannelID] = nil
 	m.syncChannelKeysViewLocked(k.ChannelID)
 	m.startKeyProbeIfNewLocked(k.ID)
 }
@@ -704,32 +699,27 @@ func (m *Manager) RemoveKey(keyID int64) {
 		delete(chSet, keyID)
 	}
 	delete(m.probeRunning, keyID)
-	m.keyOrder[chID] = nil
 	m.syncChannelKeysViewLocked(chID)
 }
 
-// KeyOrderForRouting 返回该渠道未删密钥的 id 列表，用于路由候选展开的轮询打散：
-// 初始按密钥 id 升序，每次调用把首元素移到末尾（round-robin 游标），
-// 保证同一渠道多个密钥分摊流量而非长期优先命中第一个。并发安全。
+// KeyOrderForRouting 返回该渠道未删密钥的 id 升序列表（只读、稳定、无副作用）。
+//
+// 语义（不允许隐性逻辑）：本方法不做任何轮询/轮转，也不承担分流职责——同渠道多密钥的流量分摊
+// 完全由路由择序的「存活会话数升序」实现（见 router.orderCandidates），本方法只在候选展开时
+// 提供一个按密钥枚举的稳定顺序（id 升序）。多次调用返回一致结果；返回切片为防御拷贝，调用方
+// 修改不影响内部状态。渠道无密钥或渠道不存在时返回 nil。并发安全（仅取读锁，不阻塞并发读）。
 func (m *Manager) KeyOrderForRouting(channelID int64) []int64 {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	order := m.keyOrder[channelID]
-	if order == nil {
-		ids := make([]int64, 0, len(m.keyOfCh[channelID]))
-		for keyID := range m.keyOfCh[channelID] {
-			ids = append(ids, keyID)
-		}
-		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-		order = ids
-		m.keyOrder[channelID] = order
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	ids := make([]int64, 0, len(m.keyOfCh[channelID]))
+	for keyID := range m.keyOfCh[channelID] {
+		ids = append(ids, keyID)
 	}
-	if len(order) == 0 {
+	if len(ids) == 0 {
 		return nil
 	}
-	out := append([]int64(nil), order...)
-	m.keyOrder[channelID] = append(order[1:], order[0])
-	return out
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
 }
 
 // UpsertModel 同步单个内部模型运行时（模型 CRUD 后调用）。
@@ -1003,7 +993,6 @@ func (m *Manager) Drop(id int64) {
 		delete(m.probeRunning, keyID)
 	}
 	delete(m.keyOfCh, id)
-	delete(m.keyOrder, id)
 }
 
 // persistKeyTransition 锁外写库：记录密钥状态事件 + 更新 channel_keys.state（keyStore 未装配时跳过）。
