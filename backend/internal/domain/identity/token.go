@@ -311,17 +311,87 @@ func (s *TokenStore) DeleteTokens(ctx context.Context, ids []int64) (int64, erro
 	return res.RowsAffected()
 }
 
+// HashesByIDs 按主键批量查询未删除令牌的哈希（供批量删除前置失效缓存使用）。
+// 返回顺序不保证与入参一致；软删行（deleted_at 非空）不返回。
+func (s *TokenStore) HashesByIDs(ctx context.Context, ids []int64) ([]string, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	parts := make([]string, 0, len(ids))
+	for _, id := range ids {
+		parts = append(parts, strconv.FormatInt(id, 10))
+	}
+	anyArg := "{" + strings.Join(parts, ",") + "}"
+
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT token_hash FROM tokens WHERE id = ANY($1::bigint[]) AND deleted_at IS NULL`, anyArg)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	hashes := make([]string, 0, len(ids))
+	for rows.Next() {
+		var h string
+		if err := rows.Scan(&h); err != nil {
+			return nil, err
+		}
+		hashes = append(hashes, h)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return hashes, nil
+}
+
 // TokenService 承载令牌业务逻辑。
 type TokenService struct {
 	store *TokenStore
 	// secretKey 为令牌明文 SM4 加密密钥（与渠道凭据同源）。nil 时创建仍返回明文但不落库，
 	// 事后无法查看/复制密钥（历史/测试场景）。
 	secretKey []byte
+	// cache 为 LookupByPlain 的两级读缓存（plain→entry + userID→hashes）；默认启用。
+	// 命中即 0 DB；失效由各写路径显式钩子保证（见 token_cache.go 失效矩阵）。nil 时退回纯直查。
+	cache *tokenCache
 }
 
-// NewTokenService 创建令牌服务。
+// NewTokenService 创建令牌服务（读缓存默认启用；安全 TTL / 开关见 SetTokenCacheTTL / SetTokenCacheEnabled）。
 func NewTokenService(store *TokenStore) *TokenService {
-	return &TokenService{store: store}
+	return &TokenService{store: store, cache: newTokenCache()}
+}
+
+// SetTokenCacheEnabled 开关令牌读缓存（默认启用）。关闭时 LookupByPlain 退回纯 DB 直查（安全态）。
+func (s *TokenService) SetTokenCacheEnabled(enabled bool) {
+	if s.cache != nil {
+		s.cache.setEnabled(enabled)
+	}
+}
+
+// SetTokenCacheTTL 设置读缓存安全 TTL（最后防线；不改变写路径即时失效语义）。
+func (s *TokenService) SetTokenCacheTTL(d time.Duration) {
+	if s.cache != nil {
+		s.cache.setTTL(d)
+	}
+}
+
+// InvalidateByHash 按令牌哈希失效缓存（写路径显式失效入口）。
+func (s *TokenService) InvalidateByHash(hash string) {
+	if s.cache != nil {
+		s.cache.invalidateByHash(hash)
+	}
+}
+
+// InvalidateByUserID 按用户失效其名下全部令牌缓存（用户写路径显式失效入口）。
+func (s *TokenService) InvalidateByUserID(userID int64) {
+	if s.cache != nil {
+		s.cache.invalidateByUserID(userID)
+	}
+}
+
+// InvalidateAll 清空全部令牌缓存（无法确定受影响键时的保守兜底）。
+func (s *TokenService) InvalidateAll() {
+	if s.cache != nil {
+		s.cache.invalidateAll()
+	}
 }
 
 // SetSecretKey 注入 SM4 密钥（创建令牌时加密明文落库，支持事后查看/复制密钥）。
@@ -382,6 +452,8 @@ func (s *TokenService) Create(ctx context.Context, userID int64, displayName str
 	if err := s.store.CreateToken(ctx, t); err != nil {
 		return "", fmt.Errorf("create token: %w", err)
 	}
+	// 写路径失效：新令牌使该用户令牌视图变化，按 userID 保守全清（含最短化「创建后立即使用」的缓存口径）。
+	s.InvalidateByUserID(userID)
 	return plain, nil
 }
 
@@ -411,8 +483,16 @@ func (s *TokenService) TouchLastUsed(ctx context.Context, tokenID int64) error {
 
 // LookupByPlain 按明文令牌校验，供网关鉴权使用。
 // 校验：status = ACTIVE、未过期、关联 user 存在且 ACTIVE。
+// 读缓存命中时直接返回缓存快照（0 DB）；未命中回源并按校验结果写缓存。
 func (s *TokenService) LookupByPlain(ctx context.Context, plain string) (*Token, error) {
-	t, err := s.store.GetByHash(ctx, tokenHash(plain))
+	hash := tokenHash(plain)
+	// 一级命中：零 DB 直接返回（写路径失效钩子保证即时性；ExpiresAt 精确过期与安全 TTL 在 get 内判定）。
+	if s.cache != nil {
+		if t, ok := s.cache.get(hash); ok {
+			return t, nil
+		}
+	}
+	t, err := s.store.GetByHash(ctx, hash)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, errInvalidToken()
@@ -433,6 +513,10 @@ func (s *TokenService) LookupByPlain(ctx context.Context, plain string) (*Token,
 	if !exists || status != StatusActive {
 		return nil, errInvalidToken()
 	}
+	// 仅缓存成功项：任一校验失败都不写缓存，避免负缓存掩盖后续变更。
+	if s.cache != nil {
+		s.cache.put(hash, t, status)
+	}
 	return t, nil
 }
 
@@ -446,9 +530,18 @@ func (s *TokenService) BatchDelete(ctx context.Context, ids []int64) (int64, err
 	if len(ids) == 0 {
 		return 0, errBadRequest("未指定要删除的令牌")
 	}
+	// 删除前按 ID 反查哈希，供删除后精确失效缓存（软删后 GetByID/GetByHash 即不可见，故须先查）。
+	hashes, herr := s.store.HashesByIDs(ctx, ids)
+	if herr != nil {
+		// 无法确定受影响哈希时按最保守方式整体失效，杜绝「已删令牌仍命中缓存」。
+		s.InvalidateAll()
+	}
 	n, err := s.store.DeleteTokens(ctx, ids)
 	if err != nil {
 		return 0, fmt.Errorf("batch delete tokens: %w", err)
+	}
+	for _, h := range hashes {
+		s.InvalidateByHash(h)
 	}
 	return n, nil
 }
@@ -468,6 +561,8 @@ func (s *TokenService) Rotate(ctx context.Context, userID, tokenID int64) (strin
 	if err := s.store.UpdateStatus(ctx, tokenID, StatusTokenDisabled); err != nil {
 		return "", fmt.Errorf("disable old token: %w", err)
 	}
+	// 写路径失效：旧令牌已禁用，立即按哈希清除其缓存项。
+	s.InvalidateByHash(t.TokenHash)
 	return s.Create(ctx, t.UserID, t.DisplayName, t.TagID, t.ExpiresAt)
 }
 
@@ -490,6 +585,8 @@ func (s *TokenService) Toggle(ctx context.Context, userID, tokenID int64) (*Toke
 	if err := s.store.UpdateStatus(ctx, tokenID, newStatus); err != nil {
 		return nil, fmt.Errorf("toggle token: %w", err)
 	}
+	// 写路径失效：状态已翻转，立即按哈希清除其缓存项。
+	s.InvalidateByHash(t.TokenHash)
 	t.Status = newStatus
 	return t, nil
 }

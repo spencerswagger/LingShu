@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
@@ -62,6 +63,16 @@ func nullableID(id int64) any {
 // Store 提供 semantic_tags 表的基础数据访问。
 type Store struct {
 	db *sql.DB
+
+	// tagCache 缓存 Store.GetByID（令牌鉴权热路径 → tagKVResolver 每请求读取；标签低频变更）。
+	//   - 数据来源：semantic_tags 表（deleted_at IS NULL 的行，含 enabled 状态）；
+	//   - 键 = tagID（雪花 ID 不复用，故仅做正缓存，无需负缓存）；
+	//   - 失效点（写路径显式失效，无 TTL）：本包 service.go 的 CreateTag（新 ID 名缓存无需清理，
+	//     仍按 ID 失效以防万一）、UpdateTag、BatchDeleteTags（按 ID 逐个失效）。
+	//   - 关闭开关（SetReadCacheEnabled(false)）时退回直查，不读写缓存。
+	tagMu        sync.RWMutex
+	tagCache     map[int64]*Tag
+	readCacheOff bool
 }
 
 // NewStore 创建标签存储，db 为 pgx stdlib 连接池。
@@ -69,11 +80,42 @@ func NewStore(db *sql.DB) *Store {
 	return &Store{db: db}
 }
 
+// SetReadCacheEnabled 开关标签读缓存（默认开启）；关闭后 GetByID 直查 DB。
+func (s *Store) SetReadCacheEnabled(on bool) { s.readCacheOff = !on }
+
+// invalidateTagID 失效单个标签 ID 的缓存（写路径调用）。
+func (s *Store) invalidateTagID(id int64) {
+	s.tagMu.Lock()
+	delete(s.tagCache, id)
+	s.tagMu.Unlock()
+}
+
 // GetByID 按主键查询；不存在返回 sql.ErrNoRows。
+// 带内存缓存（见 Store.tagCache 注释）：命中直接返回，零 DB 查询；未命中回源并写缓存。
 func (s *Store) GetByID(ctx context.Context, id int64) (*Tag, error) {
+	if !s.readCacheOff {
+		s.tagMu.RLock()
+		cached, ok := s.tagCache[id]
+		s.tagMu.RUnlock()
+		if ok {
+			return cached, nil
+		}
+	}
 	row := s.db.QueryRowContext(ctx,
 		`SELECT `+cols+` FROM semantic_tags WHERE id = $1 AND deleted_at IS NULL`, id)
-	return scanTag(row)
+	t, err := scanTag(row)
+	if err != nil {
+		return nil, err
+	}
+	if !s.readCacheOff {
+		s.tagMu.Lock()
+		if s.tagCache == nil {
+			s.tagCache = make(map[int64]*Tag)
+		}
+		s.tagCache[id] = t
+		s.tagMu.Unlock()
+	}
+	return t, nil
 }
 
 // GetByName 按名称查询；不存在返回 sql.ErrNoRows。

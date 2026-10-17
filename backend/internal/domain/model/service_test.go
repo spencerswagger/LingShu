@@ -262,3 +262,47 @@ func TestService_ApplyPrice(t *testing.T) {
 }
 
 func boolPtr(b bool) *bool { return &b }
+
+// TestService_GetByExternalName_CacheZeroDBAndInvalidate 验证对外模型名读缓存（STEP 21）：
+// 命中后零 DB（连续多次读取仅回源一次）；删除写路径后缓存立即失效（再读重新查库并读到新值）。
+func TestService_GetByExternalName_CacheZeroDBAndInvalidate(t *testing.T) {
+	s, mock := mockService(t)
+	now := time.Now()
+	q := regexp.QuoteMeta(`SELECT ` + cols + ` FROM external_models WHERE external_name = $1 AND enabled = true AND deleted_at IS NULL LIMIT 1`)
+
+	// 首次读取回源一次。
+	mock.ExpectQuery(q).WithArgs("qw-max").
+		WillReturnRows(extRow(&ExternalModel{ID: 2, ExternalName: "qw-max", Enabled: true, CreatedAt: now, UpdatedAt: now}, `{"input":1}`))
+	for i := 0; i < 3; i++ {
+		m, err := s.GetByExternalName(context.Background(), "qw-max")
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if m.ID != 2 {
+			t.Fatalf("unexpected: %+v", m)
+		}
+	}
+	// 仅一次回源：命中缓存不应再读库（多余的查询会命中 sqlmock 未预期调用而报错）。
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("命中缓存不应再读库: %v", err)
+	}
+
+	// 写路径（批量删除）后缓存立即失效：再读重新查库并拿到新值（ID 变化即证明读到了新快照）。
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE external_models SET deleted_at = now() WHERE id = ANY($1::bigint[])`)).
+		WithArgs(sqlmock.AnyArg()).WillReturnResult(sqlmock.NewResult(0, 1))
+	if _, err := s.BatchDeleteModels(context.Background(), []int64{2}); err != nil {
+		t.Fatalf("batch delete: %v", err)
+	}
+	mock.ExpectQuery(q).WithArgs("qw-max").
+		WillReturnRows(extRow(&ExternalModel{ID: 9, ExternalName: "qw-max", Enabled: true, CreatedAt: now, UpdatedAt: now}, `{"input":1}`))
+	got, err := s.GetByExternalName(context.Background(), "qw-max")
+	if err != nil {
+		t.Fatalf("get after invalidate: %v", err)
+	}
+	if got.ID != 9 {
+		t.Fatalf("失效后应读到新值，got %+v", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("mock expectations: %v", err)
+	}
+}

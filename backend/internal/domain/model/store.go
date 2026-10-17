@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
@@ -72,11 +73,51 @@ func scanExternal(row interface{ Scan(...any) error }) (*ExternalModel, error) {
 // Store 提供 external_models 表的基础数据访问。
 type Store struct {
 	db *sql.DB
+
+	// extNameCache 缓存 GetByExternalName 的结果（网关热路径每请求按对外名读取，配置低频变更）。
+	//   - 数据来源：external_models 表（仅 enabled=true 且 deleted_at IS NULL 的启用行）；
+	//   - 键 = external_name；值为命中的启用模型（查询所得完整快照，含 id/enabled）；
+	//     映射内 value=nil 表示「已确认无启用模型」的负缓存，避免不存在/停用名反复穿透到 DB；
+	//   - 失效点（写路径显式失效，无 TTL）：
+	//     本文件 Insert（按名失效）、Update/ApplySaleRates/BatchDelete（无旧名信息，整体清空），
+	//     以及 service.go 的 CreateModel/UpdateModel/BatchDeleteModels/ApplyPrice/SyncPrices。
+	//   - 关闭开关（SetReadCacheEnabled(false)）时退回直查，不读写缓存。
+	extNameMu    sync.RWMutex
+	extNameCache map[string]*ExternalModel
+	// readCacheOff 为 true 时关闭缓存（安全态：全部直查 DB）。仅启动装配阶段设置，运行期不变。
+	readCacheOff bool
 }
 
 // NewStore 创建对外模型存储，db 为 pgx stdlib 连接池。
 func NewStore(db *sql.DB) *Store {
 	return &Store{db: db}
+}
+
+// SetReadCacheEnabled 开关对外模型名读缓存（默认开启）；关闭后 GetByExternalName 直查 DB。
+func (s *Store) SetReadCacheEnabled(on bool) { s.readCacheOff = !on }
+
+// cacheExternalName 写入对外名缓存（m 为 nil 表示负缓存「无启用模型」）。
+func (s *Store) cacheExternalName(name string, m *ExternalModel) {
+	s.extNameMu.Lock()
+	if s.extNameCache == nil {
+		s.extNameCache = make(map[string]*ExternalModel)
+	}
+	s.extNameCache[name] = m
+	s.extNameMu.Unlock()
+}
+
+// invalidateExternalName 失效单个对外名称的缓存（写入后调用）。
+func (s *Store) invalidateExternalName(name string) {
+	s.extNameMu.Lock()
+	delete(s.extNameCache, name)
+	s.extNameMu.Unlock()
+}
+
+// invalidateAllExternalNames 清空全部对外名称缓存（缺少旧名信息时使用，如改名/批量删除）。
+func (s *Store) invalidateAllExternalNames() {
+	s.extNameMu.Lock()
+	s.extNameCache = nil
+	s.extNameMu.Unlock()
 }
 
 // GetByID 按主键查询；不存在返回 sql.ErrNoRows。
@@ -92,11 +133,36 @@ func (s *Store) GetByName(ctx context.Context, name string) (*ExternalModel, err
 }
 
 // GetByExternalName 返回指定对外名称的启用模型（供路由/计费使用）。
-// 无启用模型返回 sql.ErrNoRows。
+// 带内存缓存（见 Store.extNameCache 注释）：命中直接返回，零 DB 查询；未命中回源并写缓存
+// （含「无启用模型」负缓存）。无启用模型返回 sql.ErrNoRows。
 func (s *Store) GetByExternalName(ctx context.Context, externalName string) (*ExternalModel, error) {
+	if !s.readCacheOff {
+		s.extNameMu.RLock()
+		cached, ok := s.extNameCache[externalName]
+		s.extNameMu.RUnlock()
+		if ok {
+			if cached == nil {
+				return nil, sql.ErrNoRows
+			}
+			return cached, nil
+		}
+	}
 	row := s.db.QueryRowContext(ctx,
 		`SELECT `+cols+` FROM external_models WHERE external_name = $1 AND enabled = true AND deleted_at IS NULL LIMIT 1`, externalName)
-	return scanExternal(row)
+	m, err := scanExternal(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			if !s.readCacheOff {
+				s.cacheExternalName(externalName, nil)
+			}
+			return nil, sql.ErrNoRows
+		}
+		return nil, err
+	}
+	if !s.readCacheOff {
+		s.cacheExternalName(externalName, m)
+	}
+	return m, nil
 }
 
 // List 按 enabled 过滤查询，未指定时返回全部。
@@ -152,6 +218,8 @@ func (s *Store) Insert(ctx context.Context, m *ExternalModel) (*ExternalModel, e
 		}
 		return nil, err
 	}
+	// 新增启用模型：失效该对外名的（可能是负）缓存，保证随后读取立即看到新值。
+	s.invalidateExternalName(m.ExternalName)
 	return created, nil
 }
 
@@ -173,6 +241,8 @@ func (s *Store) Update(ctx context.Context, m *ExternalModel) error {
 	if n, _ := res.RowsAffected(); n == 0 {
 		return sql.ErrNoRows
 	}
+	// external_name/enabled 可能变化：无旧名信息，清空对外名缓存（写路径显式失效，无 TTL）。
+	s.invalidateAllExternalNames()
 	return nil
 }
 
@@ -186,6 +256,8 @@ func (s *Store) ApplySaleRates(ctx context.Context, id int64, rates billing.Rate
 	if n, _ := res.RowsAffected(); n == 0 {
 		return sql.ErrNoRows
 	}
+	// 售价变化会使缓存的模型快照过期：仅按 id 无法定位旧名，整体清空。
+	s.invalidateAllExternalNames()
 	return nil
 }
 
@@ -204,7 +276,13 @@ func (s *Store) BatchDelete(ctx context.Context, ids []int64) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	return res.RowsAffected()
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	// 删除后（按名）缓存的启用模型不应再可见：清空对外名缓存（写路径显式失效）。
+	s.invalidateAllExternalNames()
+	return n, nil
 }
 
 // jsonB 将值序列化为 JSON，供 NOT NULL JSONB 列写入；空值写 '{}' 而非 null。

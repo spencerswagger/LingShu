@@ -579,6 +579,63 @@ func TestManager_ListByExternal_MemorySnapshotAndInvalidation(t *testing.T) {
 	}
 }
 
+// TestManager_GetByChannelAndInternal_MemorySnapshotAndInvalidation 验证渠道内部模型单条查询读内存快照：
+// 命中零 DB（store/cmStore 为 nil，任何 DB 访问都会 panic）；UpsertModel/DropModel 后立即反映。
+// 语义与排序对齐 channelModelStore.GetByChannelAndInternal（多行匹配取行 id 最小者，不过滤 DISABLED）。
+func TestManager_GetByChannelAndInternal_MemorySnapshotAndInvalidation(t *testing.T) {
+	mgr := NewManager(nil, nil, make([]byte, 16), nil, nil, nil)
+	mgr.Upsert(&Channel{ID: 1, Name: "c1", Protocol: ProtocolOpenAICompat})
+	// 同一渠道同一内部模型存在多行（不同行 id）：应取最小行 id（等价 ORDER BY id ASC LIMIT 1）。
+	mgr.UpsertModel(&ChannelModel{ID: 102, ChannelID: 1, InternalModelID: "m-a", ExternalModelID: 7, State: StateNormal})
+	mgr.UpsertModel(&ChannelModel{ID: 101, ChannelID: 1, InternalModelID: "m-a", ExternalModelID: 7, State: StateNormal})
+
+	got, err := mgr.GetByChannelAndInternal(context.Background(), 1, "m-a")
+	if err != nil {
+		t.Fatalf("GetByChannelAndInternal: %v", err)
+	}
+	if got.ID != 101 || got.ExternalModelID != 7 {
+		t.Fatalf("应取行 id 最小者 101，got %+v", got)
+	}
+
+	// 未命中：内部模型不存在 / 渠道不存在 → sql.ErrNoRows。
+	if _, err := mgr.GetByChannelAndInternal(context.Background(), 1, "nope"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("want sql.ErrNoRows, got %v", err)
+	}
+	if _, err := mgr.GetByChannelAndInternal(context.Background(), 999, "m-a"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("want sql.ErrNoRows, got %v", err)
+	}
+
+	// DropModel（删除钩子）后立即改取次小行 id。
+	mgr.DropModel(1, 101)
+	got2, err := mgr.GetByChannelAndInternal(context.Background(), 1, "m-a")
+	if err != nil {
+		t.Fatalf("after DropModel: %v", err)
+	}
+	if got2.ID != 102 {
+		t.Fatalf("DropModel 后应取 102，got %d", got2.ID)
+	}
+
+	// UpsertModel（新增钩子）插入更小行 id 后立即生效。
+	mgr.UpsertModel(&ChannelModel{ID: 100, ChannelID: 1, InternalModelID: "m-a", ExternalModelID: 8, State: StateNormal})
+	got3, err := mgr.GetByChannelAndInternal(context.Background(), 1, "m-a")
+	if err != nil {
+		t.Fatalf("after UpsertModel: %v", err)
+	}
+	if got3.ID != 100 || got3.ExternalModelID != 8 {
+		t.Fatalf("UpsertModel 后应取 100，got %+v", got3)
+	}
+
+	// 不过滤 DISABLED：与 DB 版语义一致，禁用行仍可取出（计费在模型刚被禁用时仍能取成本单价）。
+	mgr.UpsertModel(&ChannelModel{ID: 99, ChannelID: 1, InternalModelID: "m-off", ExternalModelID: 7, State: StateDisabled})
+	got4, err := mgr.GetByChannelAndInternal(context.Background(), 1, "m-off")
+	if err != nil {
+		t.Fatalf("disabled: %v", err)
+	}
+	if got4.ID != 99 {
+		t.Fatalf("禁用行也应取到，got %d", got4.ID)
+	}
+}
+
 // TestManager_Snapshot_NoCredentialWordingAtChannelLevel D3 核验（审查发现项）：
 // 渠道模板层 LastErr「渠道凭据为空/解密失败」文案已随 A5 删除，渠道快照不再误导；
 // 凭据类错误只出现在密钥级视图（KeyViews/KeyRuntimeView）。

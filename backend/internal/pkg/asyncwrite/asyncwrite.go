@@ -342,6 +342,8 @@ func (w *Writer) worker(ctx context.Context, s *shard) {
 // process 执行单个任务：幂等去重 -> 有限重试执行 -> 仅成功后删除 WAL 记录。
 // 关键契约（不允许隐性丢失）：执行失败（重试耗尽）时**保留** WAL 记录，绝不 dropWAL——
 // 记录留待下次启动重放，与「绝不静默丢弃审计/会话」一致；仅成功或重复幂等键才删除记录。
+// 幂等语义：非空 IdempotencyKey 在本次运行内至多成功执行一次（done 集合进程内驻留、不释放，
+// 属既定取舍——超长运行进程应由上层周期轮换 Writer，避免去重集合无限增长）。
 func (w *Writer) process(ctx context.Context, env envelope) {
 	defer w.depth.Add(-1)
 
@@ -372,7 +374,6 @@ func (w *Writer) process(ctx context.Context, env envelope) {
 		return
 	}
 	w.dropWAL(env.seq)
-	w.release(job.IdempotencyKey)
 }
 
 // claim 对非空 IdempotencyKey 做一次性占用，返回 false 表示已被占用（应跳过）。
@@ -387,17 +388,6 @@ func (w *Writer) claim(idem string) bool {
 	}
 	w.done[idem] = struct{}{}
 	return true
-}
-
-// release 释放已成功完成任务的幂等占用，避免 done 集合随进程运行无限增长。
-// 仅在该任务的 WAL 记录已删除（成功）后调用；失败保留的场景不释放。
-func (w *Writer) release(idem string) {
-	if idem == "" {
-		return
-	}
-	w.idemMu.Lock()
-	defer w.idemMu.Unlock()
-	delete(w.done, idem)
 }
 
 // replayRecovered 对 New 时加载的 WAL 记录做重放：命中重放函数且幂等未完成才执行。
