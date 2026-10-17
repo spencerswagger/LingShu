@@ -13,6 +13,8 @@ interface DecisionAttempt {
   channel_key_name?: string
   internal_model_id?: string
   reason?: string
+  // 该候选未进入上游即被跳过（禁用/限流/会话满/协议不支持等）
+  skipped?: boolean
   // 成本标量 / 是否有效 / 时段系数（仅排查用，不参与计费）
   cost?: number
   cost_known?: boolean
@@ -205,7 +207,7 @@ function fmtCoeff(v: number | undefined): string {
                 <template #default="{ row }"><span class="mono">{{ fmtCoeff(row.route_time_coeff) }}</span></template>
               </el-table-column>
               <el-table-column label="原因" min-width="200">
-                <template #default="{ row }">{{ row.reason || '-' }}</template>
+                <template #default="{ row }">{{ row.reason || '-' }}{{ row.skipped ? '（跳过）' : '' }}</template>
               </el-table-column>
             </el-table>
           </template>

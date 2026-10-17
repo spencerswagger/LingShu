@@ -22,12 +22,14 @@ type RecordFilter struct {
 }
 
 // recordWhere 构建账单过滤 WHERE 子句与参数（ListRecords/Summarize 共用，避免两处漂移）。
+// Model 过滤同时匹配 external_model_name 与 auto_model_name：Auto 请求的账单
+// external_model_name 记命中成员名，用户按 Auto 名也应能搜到（见设计决策 #6）。
 func recordWhere(f RecordFilter) (string, []any) {
 	where := `WHERE ($1::bigint IS NULL OR user_id = $1)
 	          AND ($2::bigint IS NULL OR channel_key_id = $2)
 	          AND ($3::bigint IS NULL OR token_id = $3)
 	          AND ($4 = '' OR session_id = $4)
-	          AND ($5 = '' OR external_model_name = $5)
+	          AND ($5 = '' OR external_model_name = $5 OR auto_model_name = $5)
 	          AND ($6 = '' OR pricing_mode = $6)
 	          AND ($7 = '' OR status = $7)
 	          AND ($8::timestamptz IS NULL OR call_time >= $8)

@@ -59,6 +59,125 @@ func TestRenderAuthAndJoinProbeURL(t *testing.T) {
 	}
 }
 
+// 探测请求必须套用协议「覆盖(set)」头（与真实转发同源），否则上游要求自定义头时探测必失败。
+func TestDoProbe_AppliesHeaderOverride(t *testing.T) {
+	var gotTrace, gotModelVar, gotKeyVar, gotBlocked string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotTrace = r.Header.Get("X-Session-Trace")
+		gotModelVar = r.Header.Get("X-Model-Var")
+		gotKeyVar = r.Header.Get("X-Key-Var")
+		gotBlocked = r.Header.Get("Cookie")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer srv.Close()
+
+	m := newProbeTestManager()
+	policy := channelprotocol.HeaderPolicy{
+		Set: map[string]string{
+			"X-Session-Trace": "trace-01",
+			"X-Model-Var":     "{model}",
+			"X-Key-Var":       "{api_key}",
+			"Cookie":          "session=evil", // 强制黑名单：任何模式下都不得注入
+		},
+	}
+	fb, _, errMsg := m.doProbeAuth(context.Background(), srv.URL+"/chat/completions", "Authorization", "Bearer key", "m1", policy, "key", 2*time.Second)
+	if errMsg != "" || !fb.IsSuccess {
+		t.Fatalf("probe failed: err=%q fb=%+v", errMsg, fb)
+	}
+	if gotTrace != "trace-01" {
+		t.Errorf("探测应套用覆盖常量头, got %q", gotTrace)
+	}
+	if gotModelVar != "m1" {
+		t.Errorf("{model} 应替换为探测模型, got %q", gotModelVar)
+	}
+	if gotKeyVar != "key" {
+		t.Errorf("{api_key} 应替换为渠道凭据, got %q", gotKeyVar)
+	}
+	if gotBlocked != "" {
+		t.Errorf("强制黑名单头 Cookie 不应注入, got %q", gotBlocked)
+	}
+}
+
+// 手动模型探测（ProbeModelNow → probeOnce 链路）必须套用协议「覆盖(set)」头：
+// {model} 取内部模型 ID、{session_id}/{request_id} 随机非空且互不相同。
+func TestProbeModelNow_AppliesHeaderOverride(t *testing.T) {
+	var gotModel, gotSID, gotRID string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotModel = r.Header.Get("X-Model-Trace")
+		gotSID = r.Header.Get("X-Session-Id")
+		gotRID = r.Header.Get("X-Request-Id")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"usage":{"total_tokens":1}}`))
+	}))
+	defer srv.Close()
+
+	mgr, mock := newKeyProbeTestManager(t, srv.URL, HealthProbeConfig{FailThreshold: 1, RecoveryThreshold: 2, TimeoutMS: 1000},
+		[]ChannelModel{{ID: 21, InternalModelID: "m1", ExternalModelID: 1, State: StateNormal}})
+	addKeyRuntime(t, mgr, 11, testKeyACred, StateNormal)
+	mgr.rt[1].Protocol = &channelprotocol.ChannelProtocol{
+		RequestHeaders: channelprotocol.HeaderPolicy{
+			Set: map[string]string{
+				"X-Model-Trace": "{model}",
+				"X-Session-Id":  "{session_id}",
+				"X-Request-Id":  "{request_id}",
+			},
+		},
+	}
+
+	mock.ExpectExec(regexp.QuoteMeta(insertProbeLogSQL)).
+		WithArgs(sqlmock.AnyArg(), int64(11), "m1", "model", srv.URL+"/chat/completions", true, "", 0, 0, 0, 1, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	out, err := mgr.ProbeModelNow(1, 21)
+	if err != nil || !out.OK {
+		t.Fatalf("ProbeModelNow: err=%v out=%+v", err, out)
+	}
+	if gotModel != "m1" {
+		t.Errorf("{model} 应取内部模型 ID, got %q", gotModel)
+	}
+	if gotSID == "" || gotRID == "" {
+		t.Errorf("{session_id}/{request_id} 应随机生成非空, got %q/%q", gotSID, gotRID)
+	}
+	if gotSID == gotRID {
+		t.Errorf("{session_id} 与 {request_id} 应不同, both %q", gotSID)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("probe log not written: %v", err)
+	}
+}
+
+// 定时/密钥探测（keyProbeOnce → probeOnce 链路）同样套用协议「覆盖(set)」头。
+func TestKeyProbeOnce_AppliesHeaderOverride(t *testing.T) {
+	var gotModel string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotModel = r.Header.Get("X-Model-Trace")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}`))
+	}))
+	defer srv.Close()
+
+	mgr, mock := newKeyProbeTestManager(t, srv.URL,
+		HealthProbeConfig{Interval: "0 * * * * *", TimeoutMS: 1000, FailThreshold: 1, RecoveryThreshold: 2},
+		[]ChannelModel{{ID: 21, InternalModelID: "m-default", ExternalModelID: 1, State: StateNormal}})
+	addKeyRuntime(t, mgr, 11, testKeyACred, StateNormal)
+	mgr.rt[1].Protocol = &channelprotocol.ChannelProtocol{
+		RequestHeaders: channelprotocol.HeaderPolicy{Set: map[string]string{"X-Model-Trace": "{model}"}},
+	}
+
+	mock.ExpectExec(regexp.QuoteMeta(insertProbeLogSQL)).
+		WithArgs(sqlmock.AnyArg(), int64(11), "m-default", "model", srv.URL+"/chat/completions", true, "", 3, 4, 0, 7, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	mgr.keyProbeOnce(context.Background(), 11)
+	if gotModel != "m-default" {
+		t.Errorf("定时探测应套用覆盖头且 {model} 取内部模型 ID, got %q", gotModel)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("probe log not written: %v", err)
+	}
+}
+
 // newProbeTestManager 返回一个可执行 doProbe 的 Manager（store 为空，仅用于探测链路）。
 func newProbeTestManager() *Manager {
 	return NewManager(nil, nil, []byte("0123456789abcdef"), &http.Client{Timeout: 2 * time.Second}, nil, time.Now)
@@ -75,7 +194,7 @@ func TestDoProbe_MarksProbeFeedback(t *testing.T) {
 	defer srv.Close()
 
 	m := newProbeTestManager()
-	fb, usage, errMsg := m.doProbeAuth(context.Background(), srv.URL+"/chat/completions", "Authorization", "Bearer key", "m1", 2*time.Second)
+	fb, usage, errMsg := m.doProbeAuth(context.Background(), srv.URL+"/chat/completions", "Authorization", "Bearer key", "m1", channelprotocol.HeaderPolicy{}, "key", 2*time.Second)
 	if errMsg != "" {
 		t.Fatalf("unexpected error: %s", errMsg)
 	}
@@ -98,7 +217,7 @@ func TestDoProbe_MarksTimeout(t *testing.T) {
 	defer srv.Close()
 
 	m := newProbeTestManager()
-	fb, _, errMsg := m.doProbeAuth(context.Background(), srv.URL+"/chat/completions", "Authorization", "Bearer key", "m1", 30*time.Millisecond)
+	fb, _, errMsg := m.doProbeAuth(context.Background(), srv.URL+"/chat/completions", "Authorization", "Bearer key", "m1", channelprotocol.HeaderPolicy{}, "key", 30*time.Millisecond)
 	if errMsg == "" {
 		t.Fatalf("expected timeout error, got nil, fb=%+v", fb)
 	}
@@ -146,7 +265,7 @@ func TestDoProbe_UsageThreeSegments(t *testing.T) {
 		defer srv.Close()
 
 		m := newProbeTestManager()
-		_, usage, errMsg := m.doProbeAuth(context.Background(), srv.URL+"/chat/completions", "Authorization", "Bearer key", "m1", 2*time.Second)
+		_, usage, errMsg := m.doProbeAuth(context.Background(), srv.URL+"/chat/completions", "Authorization", "Bearer key", "m1", channelprotocol.HeaderPolicy{}, "key", 2*time.Second)
 		if errMsg != "" {
 			t.Fatalf("unexpected error: %s", errMsg)
 		}
@@ -163,7 +282,7 @@ func TestDoProbe_UsageThreeSegments(t *testing.T) {
 		defer srv.Close()
 
 		m := newProbeTestManager()
-		_, usage, errMsg := m.doProbeAuth(context.Background(), srv.URL+"/chat/completions", "Authorization", "Bearer key", "m1", 2*time.Second)
+		_, usage, errMsg := m.doProbeAuth(context.Background(), srv.URL+"/chat/completions", "Authorization", "Bearer key", "m1", channelprotocol.HeaderPolicy{}, "key", 2*time.Second)
 		if errMsg != "" {
 			t.Fatalf("unexpected error: %s", errMsg)
 		}
@@ -179,7 +298,7 @@ func TestDoProbe_UsageThreeSegments(t *testing.T) {
 		defer srv.Close()
 
 		m := newProbeTestManager()
-		_, usage, _ := m.doProbeAuth(context.Background(), srv.URL+"/chat/completions", "Authorization", "Bearer key", "m1", 2*time.Second)
+		_, usage, _ := m.doProbeAuth(context.Background(), srv.URL+"/chat/completions", "Authorization", "Bearer key", "m1", channelprotocol.HeaderPolicy{}, "key", 2*time.Second)
 		// 上游未给 total_tokens → 按三段求和兜底 = 10 + 0 + 5 = 15。
 		if usage.InputTokens != 10 || usage.TotalTokens != 15 {
 			t.Fatalf("total 兜底错误: %+v", usage)

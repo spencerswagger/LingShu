@@ -97,7 +97,7 @@ const (
 // recordColsForTest 与 recordCols 一致，仅供构造 mock 行。
 var recordColsForTest = []string{
 	"id", "billing_id", "user_id", "pricing_mode", "token_id", "external_model_name",
-	"internal_model_id", "channel_key_id", "session_id", "session_name", "call_time", "tokens", "rates",
+	"auto_model_name", "internal_model_id", "channel_key_id", "session_id", "session_name", "call_time", "tokens", "rates",
 	"coefficients", "r_value", "raw_total", "credits_consumed", "cost_credits",
 	"balance_before", "balance_after", "status", "error_message", "duration_ms",
 	"first_token_ms",
@@ -106,7 +106,7 @@ var recordColsForTest = []string{
 func completedRow(t *testing.T) *sqlmock.Rows {
 	t.Helper()
 	return sqlmock.NewRows(recordColsForTest).AddRow(
-		int64(5), billingID, int64(7), "sale", nil, "ext-model", "int-model", int64(1), nil, "",
+		int64(5), billingID, int64(7), "sale", nil, "ext-model", nil, "int-model", int64(1), nil, "",
 		time.Now(), `{}`, `{}`, []byte(`{"time":1,"context":1}`), int64(10000),
 		nil, nil, nil, nil, nil, "completed", nil, nil, nil,
 	)
@@ -181,7 +181,7 @@ func TestRecord_Success(t *testing.T) {
 	// Insert completed（断言关键字段）。
 	mock.ExpectQuery(insertBill.String()).WithArgs(
 		sqlmock.AnyArg(), // id
-		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", "int-model", int64(1),
+		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model", int64(1),
 		sqlmock.AnyArg(),                 // session_id
 		sqlmock.AnyArg(),                 // session_name
 		sqlmock.AnyArg(),                 // call_time
@@ -253,7 +253,7 @@ func TestRecord_ConsumeError_RecordsFailed(t *testing.T) {
 	// 失败 → Insert failed；内部错误细节只进日志，落库统一为中文业务文案。
 	mock.ExpectQuery(insertBill.String()).WithArgs(
 		sqlmock.AnyArg(), // id
-		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", "int-model", int64(1),
+		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model", int64(1),
 		sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), []byte(`{"time":1,"context":1}`),
 		int64(10000), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
 		sqlmock.AnyArg(), sqlmock.AnyArg(),
@@ -309,7 +309,7 @@ func TestRecord_FailedHistorical_NoDoubleConsume(t *testing.T) {
 	// 历史 failed 记录。
 	mock.ExpectQuery(selectByBillingID.String()).WithArgs(billingID).
 		WillReturnRows(sqlmock.NewRows(recordColsForTest).AddRow(
-			int64(9), billingID, testUserID, "sale", nil, "ext-model", "int-model", int64(1), nil, "",
+			int64(9), billingID, testUserID, "sale", nil, "ext-model", nil, "int-model", int64(1), nil, "",
 			time.Now(), `{}`, `{}`, []byte(`{"time":1,"context":1}`), int64(10000),
 			nil, nil, nil, nil, nil, "failed", "40201: 余额不足", nil, nil,
 		))
@@ -355,7 +355,7 @@ func TestRecord_CostMode_RecordsCostCredits(t *testing.T) {
 	// cost 模式：cost_credits 记录成本积分。
 	mock.ExpectQuery(insertBill.String()).WithArgs(
 		sqlmock.AnyArg(), // id
-		billingID, testUserID, "cost", sqlmock.AnyArg(), "ext-model", "int-model", int64(1),
+		billingID, testUserID, "cost", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model", int64(1),
 		sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), []byte(`{"time":1,"context":1}`),
 		int64(10000), sqlmock.AnyArg(), credits, costCredits,
 		sqlmock.AnyArg(), sqlmock.AnyArg(), "completed", sqlmock.AnyArg(),
@@ -409,7 +409,7 @@ func TestRecord_SaleMode_CostCreditsDistinctFromCredits(t *testing.T) {
 	// sale 模式：credits_consumed 按售价扣，cost_credits 记录成本（与售价不同）。
 	mock.ExpectQuery(insertBill.String()).WithArgs(
 		sqlmock.AnyArg(), // id
-		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", "int-model", int64(1),
+		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model", int64(1),
 		sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), []byte(`{"time":1,"context":1}`),
 		int64(10000), sqlmock.AnyArg(), credits, costCredits,
 		sqlmock.AnyArg(), sqlmock.AnyArg(), "completed", sqlmock.AnyArg(),
@@ -545,11 +545,11 @@ func TestSqlStore_Insert_MarshalError(t *testing.T) {
 
 // ---- 事务路径：扣款 + 积分流水 + 账单同事务 ----
 
-// txInsertArgs 组装 insertBill 的完整 24 参数匹配（事务路径用例复用；首参为应用层雪花 ID）。
+// txInsertArgs 组装 insertBill 的完整 25 参数匹配（事务路径用例复用；首参为应用层雪花 ID）。
 func txInsertArgs(credits, before, after float64, status string) []driver.Value {
 	return []driver.Value{
 		sqlmock.AnyArg(), // id（应用层雪花 ID）
-		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", "int-model", int64(1),
+		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model", int64(1),
 		sqlmock.AnyArg(),                 // session_id
 		sqlmock.AnyArg(),                 // session_name
 		sqlmock.AnyArg(),                 // call_time
@@ -916,7 +916,7 @@ func TestRecord_ModelLevelOverride(t *testing.T) {
 		WillReturnError(sql.ErrNoRows)
 	mock.ExpectQuery(insertBill.String()).WithArgs(
 		sqlmock.AnyArg(), // id
-		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", "int-model", int64(1),
+		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model", int64(1),
 		sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), []byte(`{"time":1.5,"context":2}`),
 		int64(10000), sqlmock.AnyArg(), credits, sqlmock.AnyArg(),
 		sqlmock.AnyArg(), sqlmock.AnyArg(), "completed", sqlmock.AnyArg(),
@@ -965,10 +965,10 @@ func TestRecord_Dimension(t *testing.T) {
 	mock.ExpectQuery(selectByBillingID.String()).WithArgs(billingID).
 		WillReturnError(sql.ErrNoRows)
 
-	// 关键断言：第 8 参数为 channel_key_id=42，第 9 参数为 session_id="sess-dim"。
+	// 关键断言：channel_key_id=42，session_id="sess-dim"（auto_model_name 插入后列位后移一位）。
 	mock.ExpectQuery(insertBill.String()).WithArgs(
 		sqlmock.AnyArg(), // id
-		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", "int-model", int64(42),
+		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model", int64(42),
 		"sess-dim",
 		sqlmock.AnyArg(),                 // session_name
 		sqlmock.AnyArg(),                 // call_time

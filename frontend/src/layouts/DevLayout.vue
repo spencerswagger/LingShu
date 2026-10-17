@@ -28,6 +28,8 @@ function activeMenu() {
   const p = route.path
   if (p.startsWith('/dev/tokens')) return '/dev/tokens'
   if (p.startsWith('/dev/models')) return '/dev/models'
+  // Auto 模型为「模型」页内切换的视图，归入「模型」菜单高亮
+  if (p.startsWith('/dev/auto-models')) return '/dev/models'
   if (p.startsWith('/dev/sessions')) return '/dev/sessions'
   if (p.startsWith('/dev/billings')) return '/dev/billings'
   return p
