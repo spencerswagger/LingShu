@@ -541,24 +541,29 @@ type ConfigProvider interface {
 	TimeConfig() (TimeCoeffConfig, error)
 	// SampleUsage 读取路由成本比较样值用量（routing.cost_sample）。
 	SampleUsage() (Usage, error)
-	// InvalidateCostConfig 清空路由成本相关的内存缓存（样值 + 全局时段）。
+	// InvalidateCostConfig 清空配置相关的内存缓存（样值 + 全局时段 + R + 上下文分档）。
 	// 由装配层在 sys_configs 写入后调用（见 SqlStore.SetConfigWriteHook），保证配置修改即时生效。
 	InvalidateCostConfig()
+	// SetCacheEnabled 开关配置读缓存（默认开启）；关闭后退回直查 DB（直查 fallback 安全开关）。
+	SetCacheEnabled(enabled bool)
 }
 
 // defaultConfigProvider 基于 sys_configs 的配置提供方。
 //
-// 缓存：TimeConfig（全局时段）与 SampleUsage（路由成本样值）会缓存在内存中，
-// 避免新会话路由热路径每次直查 2 次 sys_configs（F-R3-1，NFR-1）。
-// 失效仅由装配层在 sys_configs 写入后经 InvalidateCostConfig 触发；
-// 其余配置（R/汇率/分档）不缓存，保持原语义。
-// 读取失败不写入缓存（瞬时故障可自愈）。
+// 缓存：TimeConfig（全局时段）、SampleUsage（路由成本样值）、R（积分换算系数）与
+// ContextTiers（上下文分档）会缓存在内存中，避免网关/路由热路径每次直查 sys_configs
+// （F-R3-1，NFR-1）。失效仅由装配层在 sys_configs 写入后经 InvalidateCostConfig 触发；
+// 其余配置（汇率）不缓存，保持原语义。读取失败不写入缓存（瞬时故障可自愈）。
 type defaultConfigProvider struct {
 	src configSource
 
 	mu      sync.RWMutex
 	sample  *Usage           // 缓存的路由成本样值（nil=未缓存）
 	timeCfg *TimeCoeffConfig // 缓存的全局时段配置（nil=未缓存）
+	r       *int64           // 缓存的 billing.r（nil=未缓存）
+	tiers   *[]TierRule      // 缓存的 billing.context_tiers（nil=未缓存）
+	// cacheOff 为 true 时关闭全部配置缓存（安全态：直查 DB）。仅启动装配阶段设置，运行期不变。
+	cacheOff bool
 }
 
 // NewConfigProvider 创建基于 sys_configs 的配置提供方。
@@ -566,22 +571,46 @@ func NewConfigProvider(src configSource) ConfigProvider {
 	return &defaultConfigProvider{src: src}
 }
 
-// InvalidateCostConfig 清空路由成本样值与全局时段缓存。
+// SetCacheEnabled 开关配置读缓存（默认开启）；关闭后各配置读取直查 DB（直查 fallback 安全开关）。
+func (p *defaultConfigProvider) SetCacheEnabled(on bool) { p.cacheOff = !on }
+
+// InvalidateCostConfig 清空全部配置缓存（路由成本样值、全局时段、R、上下文分档）。
+// 由装配层在 sys_configs 写入后触发（见 SqlStore.SetConfigWriteHook），保证配置修改即时生效（无 TTL）。
 func (p *defaultConfigProvider) InvalidateCostConfig() {
 	p.mu.Lock()
 	p.sample = nil
 	p.timeCfg = nil
+	p.r = nil
+	p.tiers = nil
 	p.mu.Unlock()
 }
 
 // R 读取 billing.r（积分换算系数）。兼容数字（10000）与字符串（"10000"）两种 JSON 存储。
+// 带内存缓存（见 defaultConfigProvider 缓存说明）：命中直接返回，零 DB 查询；失败不写缓存。
 // 采用无 ctx 签名，配置读少且只读，暂用 Background ctx（保留取消传播可后续扩展）。
 func (p *defaultConfigProvider) R() (int64, error) {
+	if !p.cacheOff {
+		p.mu.RLock()
+		cached := p.r
+		p.mu.RUnlock()
+		if cached != nil {
+			return *cached, nil
+		}
+	}
 	raw, err := p.src.GetConfig(context.Background(), cfgR)
 	if err != nil {
 		return 0, err
 	}
-	return parseR(raw)
+	v, err := parseR(raw)
+	if err != nil {
+		return 0, err
+	}
+	if !p.cacheOff {
+		p.mu.Lock()
+		p.r = &v
+		p.mu.Unlock()
+	}
+	return v, nil
 }
 
 func parseR(raw []byte) (int64, error) {
@@ -626,8 +655,17 @@ func parseFloatConfig(raw []byte) (float64, error) {
 	return 0, errors.New("billing 浮点配置无法解析")
 }
 
-// ContextTiers 读取 billing.context_tiers。
+// ContextTiers 读取 billing.context_tiers（带内存缓存，见 defaultConfigProvider 缓存说明）。
+// 命中直接返回，零 DB 查询；失败不写缓存。
 func (p *defaultConfigProvider) ContextTiers() ([]TierRule, error) {
+	if !p.cacheOff {
+		p.mu.RLock()
+		cached := p.tiers
+		p.mu.RUnlock()
+		if cached != nil {
+			return *cached, nil
+		}
+	}
 	raw, err := p.src.GetConfig(context.Background(), cfgTiers)
 	if err != nil {
 		return nil, err
@@ -635,6 +673,11 @@ func (p *defaultConfigProvider) ContextTiers() ([]TierRule, error) {
 	var tiers []TierRule
 	if err := json.Unmarshal(raw, &tiers); err != nil {
 		return nil, fmt.Errorf("解析 context_tiers: %w", err)
+	}
+	if !p.cacheOff {
+		p.mu.Lock()
+		p.tiers = &tiers
+		p.mu.Unlock()
 	}
 	return tiers, nil
 }

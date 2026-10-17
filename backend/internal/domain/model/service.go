@@ -192,6 +192,8 @@ func (s *Service) CreateModel(ctx context.Context, in ExternalModelInput) (*Exte
 		}
 		return nil, fmt.Errorf("create external model: %w", err)
 	}
+	// 缓存失效：新增对外名后，GetByExternalName 的名称缓存必须立即刷新（写路径显式失效，无 TTL）。
+	s.store.invalidateExternalName(created.ExternalName)
 	return created, nil
 }
 
@@ -237,6 +239,9 @@ func (s *Service) UpdateModel(ctx context.Context, id int64, in ExternalModelInp
 		}
 		return nil, fmt.Errorf("update external model: %w", err)
 	}
+	// 缓存失效：外部名/启用态可能变化，旧名与新名两条键都需立即失效（写路径显式失效，无 TTL）。
+	s.store.invalidateExternalName(existing.ExternalName)
+	s.store.invalidateExternalName(in.ExternalName)
 	return s.store.GetByID(ctx, id)
 }
 
@@ -258,6 +263,8 @@ func (s *Service) BatchDeleteModels(ctx context.Context, ids []int64) (int64, er
 	if err != nil {
 		return 0, fmt.Errorf("batch delete external models: %w", err)
 	}
+	// 缓存失效：批量删除无旧名可依（仅 id），整体清空对外名缓存（写路径显式失效，无 TTL）。
+	s.store.invalidateAllExternalNames()
 	return n, nil
 }
 
@@ -317,6 +324,8 @@ func (s *Service) ApplyPrice(ctx context.Context, id int64) (*ExternalModel, err
 	if err := s.store.ApplySaleRates(ctx, id, m.SaleRates); err != nil {
 		return nil, fmt.Errorf("apply sale rates: %w", err)
 	}
+	// 缓存失效：售价变化会使 GetByExternalName 缓存的模型快照过期，按对外名立即失效（无 TTL）。
+	s.store.invalidateExternalName(m.ExternalName)
 	return s.store.GetByID(ctx, id)
 }
 
@@ -375,7 +384,13 @@ func (s *Service) SyncPrices(ctx context.Context) (*SyncPricesResult, error) {
 		if err := s.store.ApplySaleRates(ctx, m.ID, rates); err != nil {
 			return nil, fmt.Errorf("apply sale rates for %s: %w", m.ExternalName, err)
 		}
+		// 缓存失效：售价变化使该对外名的缓存快照过期，按名立即失效（无 TTL）。
+		s.store.invalidateExternalName(m.ExternalName)
 		res.Updated = append(res.Updated, m.ExternalName)
 	}
 	return res, nil
 }
+
+// SetReadCacheEnabled 开关对外模型名读缓存（默认开启）；关闭后 GetByExternalName 直查 DB。
+// 由装配层在启动时按配置设置，属于「直查 fallback 安全开关」。
+func (s *Service) SetReadCacheEnabled(on bool) { s.store.SetReadCacheEnabled(on) }

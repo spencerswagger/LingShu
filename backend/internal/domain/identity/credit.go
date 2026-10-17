@@ -62,11 +62,14 @@ func NewCreditStore(db *sql.DB) *CreditStore {
 	return &CreditStore{db: db}
 }
 
+// consumeCreditOn 原子条件扣减：单条 UPDATE 同时满足「余额充足 balance >= amount」与
+// 「非零余额 balance > 0」两个条件。返回 exists=false 表示无行命中（钱包缺失或余额不足），
+// 由调用方再区分 40401（钱包不存在）/ 40201（余额不足）。
 func consumeCreditOn(ctx context.Context, ex dbx.Execer, userID int64, amount float64) (after float64, exists bool, err error) {
 	var bal float64
 	err = ex.QueryRowContext(ctx,
 		`UPDATE credit_wallets SET balance = balance - $1, version = version + 1, updated_at = now()
-		 WHERE user_id = $2 AND balance >= $1
+		 WHERE user_id = $2 AND balance >= $1 AND balance > 0
 		 RETURNING balance`,
 		amount, userID).Scan(&bal)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -286,8 +289,24 @@ func (s *CreditService) ConsumeTx(ctx context.Context, ex dbx.Execer, userID int
 
 func (s *CreditService) consumeOn(ctx context.Context, ex dbx.Execer, userID int64, amount float64, billingID, sessionID, remark string) (before, after float64, err error) {
 	amount = decimalx.Round5(amount)
-	if amount <= 0 {
-		return 0, 0, errBadRequest("扣减积分必须大于 0")
+	if amount < 0 {
+		return 0, 0, errBadRequest("扣减积分不能为负")
+	}
+	if amount == 0 {
+		// 零金额扣减：作为「零余额守卫」——不写流水、不递增 version，仅查余额判定。
+		// 钱包缺失→40401、余额为 0→40201、余额 >0→放行（before==after）。
+		// 与条件写保持同一语义，使网关可把「费率缺失/估算为 0」也纳入统一资金拦截，无需独立余额读取。
+		bal, gErr := getBalanceOn(ctx, ex, userID)
+		if gErr != nil {
+			if errors.Is(gErr, sql.ErrNoRows) {
+				return 0, 0, errWalletNotFound()
+			}
+			return 0, 0, gErr
+		}
+		if bal <= 0 {
+			return 0, 0, errInsufficient(0)
+		}
+		return bal, bal, nil
 	}
 	if err := money.Validate(amount, "扣减积分"); err != nil {
 		return 0, 0, errBadRequest(err.Error())

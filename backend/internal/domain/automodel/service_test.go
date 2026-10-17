@@ -465,3 +465,62 @@ func TestService_Get_NotFound(t *testing.T) {
 		t.Fatalf("mock expectations: %v", err)
 	}
 }
+
+// TestService_ResolveMembers_CacheZeroDBAndInvalidate 验证 Auto 成员解析读缓存（STEP 24）：
+// 命中后零 DB（连续多次解析仅回源一次）；删除写路径后缓存立即失效（再解析重新查库并读到新成员）。
+func TestService_ResolveMembers_CacheZeroDBAndInvalidate(t *testing.T) {
+	s, mock := newServiceMock(t)
+	now := time.Now()
+	// 首次解析：主表 1 次 + 成员 1 次。
+	mock.ExpectQuery(regexp.QuoteMeta(getByNameSQL)).
+		WithArgs("auto1", int64(7)).
+		WillReturnRows(autoRow(10, "auto1", ScopeGlobal, nil, true, now))
+	mock.ExpectQuery(regexp.QuoteMeta(membersSQL)).
+		WithArgs("{10}").
+		WillReturnRows(sqlmock.NewRows(memberTestCols).
+			AddRow(int64(1), int64(10), int64(101), 0, "model-a", true))
+
+	for i := 0; i < 3; i++ {
+		members, isAuto, err := s.ResolveMembers(context.Background(), "auto1", int64Ptr(7))
+		if err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		if !isAuto || len(members) != 1 {
+			t.Fatalf("unexpected: (%+v,%v)", members, isAuto)
+		}
+	}
+	// 仅一次回源：命中缓存不应再读库。
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("命中缓存不应再读库: %v", err)
+	}
+
+	// 写路径（Delete）后缓存立即失效：再解析重新查库并读到新成员列表。
+	mock.ExpectBegin()
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE auto_models SET deleted_at=now() WHERE id=$1 AND deleted_at IS NULL`)).
+		WithArgs(int64(10)).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE auto_model_members SET deleted_at=now() WHERE auto_model_id=$1 AND deleted_at IS NULL`)).
+		WithArgs(int64(10)).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+	if err := s.Delete(context.Background(), 10); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	mock.ExpectQuery(regexp.QuoteMeta(getByNameSQL)).
+		WithArgs("auto1", int64(7)).
+		WillReturnRows(autoRow(10, "auto1", ScopeGlobal, nil, true, now))
+	mock.ExpectQuery(regexp.QuoteMeta(membersSQL)).
+		WithArgs("{10}").
+		WillReturnRows(sqlmock.NewRows(memberTestCols).
+			AddRow(int64(1), int64(10), int64(101), 0, "model-a", true).
+			AddRow(int64(2), int64(10), int64(102), 1, "model-b", true))
+	members, isAuto, err := s.ResolveMembers(context.Background(), "auto1", int64Ptr(7))
+	if err != nil {
+		t.Fatalf("resolve after invalidate: %v", err)
+	}
+	if !isAuto || len(members) != 2 {
+		t.Fatalf("失效后应重新查库并读到 2 个成员，got (%+v,%v)", members, isAuto)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("mock expectations: %v", err)
+	}
+}

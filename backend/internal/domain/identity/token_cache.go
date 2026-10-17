@@ -1,0 +1,217 @@
+// token_cache.go 令牌鉴权（TokenService.LookupByPlain）两级读缓存。
+//
+// 目标：网关每请求鉴权在缓存命中时 0 次 DB 查询；同时保证任何写路径后缓存「即时」失效
+// （无 TTL 延迟），令牌自然过期按自身 ExpiresAt「精确」生效。
+//
+// 结构（两级索引，共用同一把 RWMutex 保护）：
+//
+//	一级 plainHash -> tokenCacheEntry：命中即为鉴权结果（令牌快照 + 用户状态快照 + 写入时间）。
+//	二级 userID    -> set(plainHash)：按用户批量失效用的倒排索引（用户状态/资料变更时）。
+//
+// 失效矩阵（写路径 -> 失效动作；均为「同步、即时」失效，而非 TTL 到期）：
+//
+//	令牌域（TokenService）：
+//	  Create      -> InvalidateByUserID(userID)        // 新令牌使该用户令牌视图变化，保守按用户全清
+//	  BatchDelete -> InvalidateByHash(受影响令牌哈希)   // 删除前按 ID 反查哈希；反查失败则 InvalidateAll
+//	  Rotate      -> InvalidateByHash(旧令牌哈希)       // 旧令牌被禁用
+//	  Toggle      -> InvalidateByHash(令牌哈希)         // 状态翻转
+//	用户域（Service，经 SetUserWriteHook 回调，与 pkg/session 用户状态缓存同点触发，避免双缓存漂移）：
+//	  AdminCreateUser / UpdateUser / BatchDeleteUsers / AdminResetPassword
+//	              -> InvalidateByUserID(userID)         // 用户状态/角色/删除变更
+//
+// 过期语义：
+//  1. 精确过期：令牌自身 ExpiresAt 到点（now >= ExpiresAt）即视为未命中并回源 DB 复核——与 TTL 无关。
+//  2. 安全 TTL（默认 60s，可配置）：仅作「最后防线」——条目存活超过 TTL 一律视为未命中，用于兜底
+//     「理论上不该发生的失效遗漏」。TTL 不计入「即时失效」保证；即时性由上述失效钩子负责。
+//
+// 有界性：条目数上限默认 10 万，超限按 map 随机淘汰（简单策略），避免无界增长。
+// 开关：默认启用；SetTokenCacheEnabled(false) 后 LookupByPlain 退回纯 DB 直查（安全态）。
+package identity
+
+import (
+	"sync"
+	"time"
+)
+
+const (
+	// tokenCacheDefaultTTL 安全 TTL 默认值（最后防线，非即时失效机制）。
+	tokenCacheDefaultTTL = 60 * time.Second
+	// tokenCacheDefaultMaxEntries 缓存条目上限，超过后随机淘汰。
+	tokenCacheDefaultMaxEntries = 100000
+)
+
+// tokenCacheEntry 是一条鉴权结果快照。写入后不可变（更新即整体替换指针），
+// 因此命中路径可在 RLock 释放后安全读取。
+type tokenCacheEntry struct {
+	token      *Token
+	userStatus string
+	cachedAt   time.Time
+}
+
+// tokenCache 令牌鉴权两级读缓存。零值不可用，须经 newTokenCache 创建。
+type tokenCache struct {
+	mu         sync.RWMutex
+	enabled    bool
+	ttl        time.Duration
+	maxEntries int
+	// now 时钟注入点（默认 time.Now），便于测试精确过期边界。
+	now    func() time.Time
+	byHash map[string]*tokenCacheEntry
+	byUser map[int64]map[string]struct{}
+}
+
+// newTokenCache 创建缓存：默认启用、安全 TTL 60s、上限 10 万。
+func newTokenCache() *tokenCache {
+	return &tokenCache{
+		enabled:    true,
+		ttl:        tokenCacheDefaultTTL,
+		maxEntries: tokenCacheDefaultMaxEntries,
+		now:        time.Now,
+		byHash:     make(map[string]*tokenCacheEntry),
+		byUser:     make(map[int64]map[string]struct{}),
+	}
+}
+
+// setEnabled 开关缓存；关闭时清空全部条目（避免关闭期间残留旧值）。
+func (c *tokenCache) setEnabled(enabled bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.enabled = enabled
+	if !enabled {
+		c.clearLocked()
+	}
+}
+
+// setTTL 设置安全 TTL（最后防线）。
+func (c *tokenCache) setTTL(d time.Duration) {
+	c.mu.Lock()
+	c.ttl = d
+	c.mu.Unlock()
+}
+
+// get 读取缓存：命中返回令牌快照副本（调用方可安全使用/持有）。
+// 安全 TTL 超期或令牌自然过期时视为未命中，并顺手淘汰该条目。
+func (c *tokenCache) get(hash string) (*Token, bool) {
+	c.mu.RLock()
+	if !c.enabled {
+		c.mu.RUnlock()
+		return nil, false
+	}
+	e, ok := c.byHash[hash]
+	ttl := c.ttl
+	nowFn := c.now
+	c.mu.RUnlock()
+	if !ok {
+		return nil, false
+	}
+	now := nowFn()
+	// 安全 TTL：仅最后防线，超期即回源（即时性由写路径失效钩子保证，非本 TTL）。
+	if ttl > 0 && now.Sub(e.cachedAt) >= ttl {
+		c.invalidateByHash(hash)
+		return nil, false
+	}
+	// 精确过期：令牌自身的 ExpiresAt 到点即视为未命中（now >= ExpiresAt）。
+	if e.token.ExpiresAt != nil && !now.Before(*e.token.ExpiresAt) {
+		c.invalidateByHash(hash)
+		return nil, false
+	}
+	// 防御性校验：仅成功鉴权（用户 ACTIVE）才会写缓存；若快照状态异常则视为未命中。
+	if e.userStatus != StatusActive {
+		c.invalidateByHash(hash)
+		return nil, false
+	}
+	snap := *e.token
+	return &snap, true
+}
+
+// put 写入鉴权结果快照（仅成功项）。会做条目上限淘汰。
+func (c *tokenCache) put(hash string, t *Token, userStatus string) {
+	if t == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.enabled {
+		return
+	}
+	snap := *t
+	// 同一哈希覆盖：先从旧归属用户的倒排集合中摘除，避免脏索引。
+	if old, ok := c.byHash[hash]; ok {
+		c.removeFromUserLocked(old.token.UserID, hash)
+	}
+	c.byHash[hash] = &tokenCacheEntry{token: &snap, userStatus: userStatus, cachedAt: c.now()}
+	set := c.byUser[snap.UserID]
+	if set == nil {
+		set = make(map[string]struct{})
+		c.byUser[snap.UserID] = set
+	}
+	set[hash] = struct{}{}
+	c.evictLocked()
+}
+
+// invalidateByHash 按令牌哈希精确失效单个条目。
+func (c *tokenCache) invalidateByHash(hash string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if e, ok := c.byHash[hash]; ok {
+		c.removeFromUserLocked(e.token.UserID, hash)
+		delete(c.byHash, hash)
+	}
+}
+
+// invalidateByUserID 按用户失效其名下全部令牌条目（用户写路径）。
+func (c *tokenCache) invalidateByUserID(userID int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for h := range c.byUser[userID] {
+		delete(c.byHash, h)
+	}
+	delete(c.byUser, userID)
+}
+
+// invalidateAll 清空全部条目（用于无法确定受影响键时的保守兜底）。
+func (c *tokenCache) invalidateAll() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.clearLocked()
+}
+
+// clearLocked 清空两级索引（调用方须持有写锁）。
+func (c *tokenCache) clearLocked() {
+	c.byHash = make(map[string]*tokenCacheEntry)
+	c.byUser = make(map[int64]map[string]struct{})
+}
+
+// removeFromUserLocked 从某用户的倒排集合摘除哈希；集合为空则删除该用户键（调用方须持有写锁）。
+func (c *tokenCache) removeFromUserLocked(userID int64, hash string) {
+	set := c.byUser[userID]
+	if set == nil {
+		return
+	}
+	delete(set, hash)
+	if len(set) == 0 {
+		delete(c.byUser, userID)
+	}
+}
+
+// evictLocked 当条目数超过上限时随机淘汰至不超限（调用方须持有写锁）。
+// 策略刻意简单：缓存仅作加速，淘汰错误的代价是回源一次 DB，不影响正确性。
+func (c *tokenCache) evictLocked() {
+	if c.maxEntries <= 0 {
+		return
+	}
+	for len(c.byHash) > c.maxEntries {
+		for h, e := range c.byHash {
+			c.removeFromUserLocked(e.token.UserID, h)
+			delete(c.byHash, h)
+			break
+		}
+	}
+}
+
+// count 返回当前条目数（测试/观测用）。
+func (c *tokenCache) count() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return len(c.byHash)
+}

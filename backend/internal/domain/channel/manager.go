@@ -14,6 +14,7 @@ import (
 	"github.com/team/llmgateway/internal/domain/channelprotocol"
 	"github.com/team/llmgateway/internal/pkg/cronx"
 	"github.com/team/llmgateway/internal/pkg/crypto"
+	"github.com/team/llmgateway/internal/pkg/idgen"
 )
 
 // DefaultRateLimit 返回渠道限流默认配置。
@@ -215,6 +216,16 @@ type ModelView struct {
 // ProbeRecorder 探测开销记账钩子（装配层注入：以系统身份记入 billing_records）。
 type ProbeRecorder func(ctx context.Context, chID int64, modelID, target string, ok bool, errMsg string, usage ProbeUsage, durationMS int64) error
 
+// EventSink 渠道状态事件异步接收端（装配层注入）。
+//
+// 职责边界（不允许混淆）：仅承载「事件 INSERT」，状态列（channel_keys.state /
+// channel_models.state）仍由 Manager 同步落库——事件可异步且最终一致，状态列必须即时权威。
+// evID 为调用方预生成的事件 ID（雪花），供底层 ON CONFLICT (id) DO NOTHING 幂等与崩溃重放。
+type EventSink interface {
+	SubmitKeyEvent(ctx context.Context, evID, keyID int64, from, to State, reason string) error
+	SubmitModelEvent(ctx context.Context, evID, channelID int64, modelID string, from, to State, reason string) error
+}
+
 // Manager 渠道配置模板 + 密钥运行动态管理器：内存态 + 状态机 + 限流器 + 健康探测调度。
 // rt = 渠道配置模板运行时（保留 Limiter/Keys 等字段供现有消费方继续编译）；
 // keys = 每个 channel_keys 一行一套独立运行时（状态机/限流器）；keyOfCh 为按渠道枚举索引。
@@ -236,6 +247,8 @@ type Manager struct {
 	logger    *slog.Logger
 	now       func() time.Time
 	onProbe   ProbeRecorder
+	// eventSink 事件异步接收端（nil=未装配，事件退回同步 InsertEvent，保持既有行为兼容）。
+	eventSink EventSink
 
 	cancelCtx context.Context
 	cancel    context.CancelFunc
@@ -289,6 +302,9 @@ func (m *Manager) Stop() {
 
 // SetProbeRecorder 注入探测开销记账钩子。
 func (m *Manager) SetProbeRecorder(fn ProbeRecorder) { m.onProbe = fn }
+
+// SetEventSink 注入渠道状态事件异步接收端（nil=退回同步 InsertEvent）。
+func (m *Manager) SetEventSink(s EventSink) { m.eventSink = s }
 
 // SetChannelProtocolStore 注入渠道协议存储：装载渠道运行时解析其引用的接入模板。
 func (m *Manager) SetChannelProtocolStore(s *channelprotocol.Store) { m.cpStore = s }
@@ -901,6 +917,38 @@ func (m *Manager) ListByExternal(_ context.Context, externalModelID int64) ([]Ch
 	return out, nil
 }
 
+// GetByChannelAndInternal 按「渠道 + 内部模型ID」返回单条内部模型（读内存快照，零 DB 查询）。
+//
+// 语义与排序与 channelModelStore.GetByChannelAndInternal 完全等价（供网关计费取成本单价与
+// 模型级时段/分档）：
+//   - 数据来源：mrt（channelID → modelRowID → ModelRuntime）；不发起任何 DB 查询；
+//   - 匹配条件与 DB 版一致：channel_id 与 internal_model_id 精确相等（不过滤 DISABLED，
+//     保证模型刚被禁用时仍能取到本次请求的成本单价，计费口径与 DB 版一致）；
+//   - 排序与 DB 版一致：多行匹配时取行 id 最小者（等价 ORDER BY id ASC LIMIT 1）；
+//   - 返回值为快照值拷贝（CostRates/TimeConfig 只读共享，调用方不得修改）。
+//
+// 失效（为何无需额外接线，也不依赖 TTL）：本快照仅由既有写路径维护，均持写锁更新 mrt：
+// 启动 SyncFromDB（全量）、渠道新增/编辑 Upsert、渠道内部模型 CRUD 与协议同步 UpsertModel/DropModel。
+// 因此 UpsertModel/DropModel 后本方法立即返回新结果。未命中返回 sql.ErrNoRows。
+func (m *Manager) GetByChannelAndInternal(_ context.Context, channelID int64, internalModelID string) (*ChannelModel, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var best *ChannelModel
+	for _, mr := range m.mrt[channelID] {
+		if mr.Model.InternalModelID != internalModelID {
+			continue
+		}
+		if best == nil || mr.Model.ID < best.ID {
+			cp := mr.Model
+			best = &cp
+		}
+	}
+	if best == nil {
+		return nil, sql.ErrNoRows
+	}
+	return best, nil
+}
+
 // ModelViews 返回某渠道全部模型运行时视图（控制台展示）。
 func (m *Manager) ModelViews(channelID int64) []ModelView {
 	m.mu.RLock()
@@ -1032,31 +1080,46 @@ func (m *Manager) Drop(id int64) {
 	delete(m.keyOfCh, id)
 }
 
-// persistKeyTransition 锁外写库：记录密钥状态事件 + 更新 channel_keys.state（keyStore 未装配时跳过）。
-// 密钥自动禁用（401/403）等由探测驱动的状态流转经此持久化，重启后仍生效。
+// persistKeyTransition 锁外写库：更新 channel_keys.state（同步、权威）+ 记录密钥状态事件（可异步）。
+// 状态列必须同步落库（内存权威状态与 DB 一致、重启后仍生效）；事件 INSERT 仅在注入 eventSink 时异步，
+// 未注入时退回同步 InsertEvent（既有调用方与测试行为不变）。
+// keyStore 未装配时跳过。密钥自动禁用（401/403）等由探测驱动的状态流转经此持久化。
 func (m *Manager) persistKeyTransition(keyID int64, from, to State, reason string) {
 	if m.keyStore == nil {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := m.keyStore.InsertEvent(ctx, keyID, from, to, reason); err != nil {
+	// 事件 INSERT：注入 sink 时异步（预生成事件 ID，底层幂等），否则同步 InsertEvent。
+	if m.eventSink != nil {
+		if err := m.eventSink.SubmitKeyEvent(ctx, idgen.New(), keyID, from, to, reason); err != nil {
+			m.logger.Error("submit channel key event failed", "key_id", keyID, "err", err)
+		}
+	} else if err := m.keyStore.InsertEvent(ctx, keyID, from, to, reason); err != nil {
 		m.logger.Error("insert channel key event failed", "key_id", keyID, "err", err)
 	}
+	// 状态列必须同步落库（内存权威状态与 DB 一致、重启后仍生效）。
 	if err := m.keyStore.SetState(ctx, keyID, to, ""); err != nil {
 		m.logger.Error("update channel key state failed", "key_id", keyID, "err", err)
 	}
 }
 
-// persistModelTransition 锁外写库：记录模型事件 + 更新模型状态。
+// persistModelTransition 锁外写库：记录模型事件（可异步）+ 更新 channel_models.state（同步、权威）。
+// 事件 INSERT 仅在注入 eventSink 时异步，未注入时退回同步 InsertModelEvent；状态列始终同步落库。
 func (m *Manager) persistModelTransition(channelID int64, modelID string, from, to State, reason string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if _, err := m.cmStore.InsertModelEvent(ctx, &ChannelModelEvent{
+	// 事件 INSERT：注入 sink 时异步（预生成事件 ID，底层幂等），否则同步 InsertModelEvent。
+	if m.eventSink != nil {
+		if err := m.eventSink.SubmitModelEvent(ctx, idgen.New(), channelID, modelID, from, to, reason); err != nil {
+			m.logger.Error("submit model event failed", "channel_id", channelID, "model", modelID, "err", err)
+		}
+	} else if _, err := m.cmStore.InsertModelEvent(ctx, &ChannelModelEvent{
 		ChannelID: channelID, ModelID: modelID, FromState: from, ToState: to, Reason: reason,
 	}); err != nil {
 		m.logger.Error("insert model event failed", "channel_id", channelID, "model", modelID, "err", err)
 	}
+	// 状态列必须同步落库（内存权威状态与 DB 一致、重启后仍生效）。
 	if err := m.cmStore.UpdateModelState(ctx, channelID, modelID, to); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		m.logger.Error("update model state failed", "channel_id", channelID, "model", modelID, "err", err)
 	}

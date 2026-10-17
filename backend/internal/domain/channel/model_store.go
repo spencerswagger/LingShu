@@ -409,6 +409,16 @@ func (s *channelModelStore) InsertModelEvent(ctx context.Context, e *ChannelMode
 	return &created, nil
 }
 
+// InsertModelEventWithID 以显式事件 ID 幂等写入一条模型状态流转事件（ON CONFLICT (id) DO NOTHING）。
+// 供异步事件 sink 使用：事件 ID 由调用方预生成，重复提交/崩溃重放均不会产生重复事件。
+func (s *channelModelStore) InsertModelEventWithID(ctx context.Context, id, channelID int64, modelID string, from, to State, reason string) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO channel_model_events(id, channel_id, model_id, from_state, to_state, reason)
+		 VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT (id) DO NOTHING`,
+		id, channelID, modelID, string(from), string(to), reason)
+	return err
+}
+
 // ListModelEvents 查询某渠道的模型状态流转事件（倒序）。
 func (s *channelModelStore) ListModelEvents(ctx context.Context, channelID int64) ([]ChannelModelEvent, error) {
 	rows, err := s.db.QueryContext(ctx,

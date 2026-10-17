@@ -202,11 +202,22 @@ type fakeCredit struct {
 	consumed []float64
 	refunded []float64
 	settled  []float64
+	preErr   error // 预扣时强制返回的错误（用于钱包缺失 40401 等语义用例）
 }
 
 func (f *fakeCredit) Balance(_ context.Context, _ int64) (float64, error) { return f.balance, nil }
 
 func (f *fakeCredit) PreConsume(_ context.Context, _ int64, amount float64, _, _, _ string) error {
+	if f.preErr != nil {
+		return f.preErr
+	}
+	if amount <= 0 {
+		// 零金额=零余额守卫（对齐真实条件写语义）：余额>0 放行且不写流水/不改余额，余额<=0 拒绝。
+		if f.balance <= 0 {
+			return &identity.APIError{HTTPStatus: http.StatusPaymentRequired, Code: resp.CodeInsufficient, Message: "积分余额不足"}
+		}
+		return nil
+	}
 	if f.balance < amount {
 		return &identity.APIError{HTTPStatus: http.StatusPaymentRequired, Code: resp.CodeInsufficient, Message: "积分余额不足"}
 	}
@@ -1103,6 +1114,75 @@ func TestServeBudgetInsufficient_SkipsUpstream(t *testing.T) {
 			!strings.Contains(req.ErrorMessage, "Token × 单价") {
 			t.Fatalf("failed 账单公式应为多行三步式，got %q", req.ErrorMessage)
 		}
+	}
+}
+
+// TestServeFundSemantics 表驱动覆盖资金语义三类用例（去掉独立余额读取后由预扣条件写统一拦截）：
+//   - 零余额且预扣估算为 0（费率缺失）→ 402，不得放行；
+//   - 余额不足 → 402；
+//   - 钱包缺失 → 对外同样归 402（历史上前置 GetWallet 兜底建 0 余额钱包 → 归 402，
+//     移除前置读后需显式保持该对外行为一致；域层 40401/40201 仍可区分）。
+//
+// 三类均不得发起上游调用，且各留 1 条 failed 账单（每次请求必有一条记录）。
+func TestServeFundSemantics(t *testing.T) {
+	var called int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&called, 1)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer upstream.Close()
+
+	// 费率缺失 → 预扣估算为 0，用于验证「估算为 0 仍拦截零余额」。
+	noRatesModel := &model.ExternalModel{ExternalName: "gpt-4", Enabled: true}
+
+	cases := []struct {
+		name   string
+		mutate func(h *harness)
+		want   int
+	}{
+		{
+			name: "零余额且预扣估算为 0→402",
+			mutate: func(h *harness) {
+				h.models.mapping = noRatesModel
+				h.gw.credit = &fakeCredit{balance: 0}
+			},
+			want: http.StatusPaymentRequired,
+		},
+		{
+			name: "余额不足→402",
+			mutate: func(h *harness) {
+				h.gw.credit = &fakeCredit{balance: 0.0005}
+			},
+			want: http.StatusPaymentRequired,
+		},
+		{
+			name: "钱包缺失→对外归 402（保留既有对外行为）",
+			mutate: func(h *harness) {
+				h.gw.credit = &fakeCredit{preErr: &identity.APIError{
+					HTTPStatus: http.StatusNotFound, Code: resp.CodeNotFound, Message: "用户积分钱包不存在"}}
+			},
+			want: http.StatusPaymentRequired,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			before := atomic.LoadInt32(&called)
+			h := build(t, upstream.URL)
+			tc.mutate(h)
+			rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t",
+				`{"model":"gpt-4","stream":false,"max_tokens":2000,"messages":[{"role":"user","content":"hello"}]}`)
+			if rec.Code != tc.want {
+				t.Fatalf("want %d, got %d: %s", tc.want, rec.Code, rec.Body.String())
+			}
+			if atomic.LoadInt32(&called) != before {
+				t.Fatalf("资金拦截不得发起上游调用")
+			}
+			if len(h.billing.reqs) != 1 || !h.billing.reqs[0].Fail {
+				t.Fatalf("资金拦截应留 1 条 failed 账单，got %+v", h.billing.reqs)
+			}
+		})
 	}
 }
 
