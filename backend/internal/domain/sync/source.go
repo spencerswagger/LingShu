@@ -14,14 +14,12 @@ type ExternalPrice struct {
 	Pricing  Pricing `json:"pricing"`
 }
 
-// Pricing 模型单价（美元 / 百万 token）。除 prompt/completion 外保留缓存读写与推理价，
-// 供对外模型「查看/应用参考价」与价格目录展示使用。
+// Pricing 模型单价（美元 / 百万 token）。三段口径只保留 prompt/completion/cache_read，
+// 供对外模型「查看/应用参考价」与价格目录展示使用；models.dev 的 cache_write/reasoning 价无对应计费段，忽略。
 type Pricing struct {
 	Prompt     float64 `json:"prompt"`
 	Completion float64 `json:"completion"`
 	CacheRead  float64 `json:"cache_read"`
-	CacheWrite float64 `json:"cache_write"`
-	Reasoning  float64 `json:"reasoning"`
 }
 
 // sourcePayload 是 https://models.dev/api.json 的真实结构：
@@ -31,11 +29,9 @@ type sourcePayload map[string]struct {
 	Models map[string]struct {
 		ID   string `json:"id"`
 		Cost struct {
-			Input      *float64 `json:"input"`
-			Output     *float64 `json:"output"`
-			CacheRead  *float64 `json:"cache_read"`
-			CacheWrite *float64 `json:"cache_write"`
-			Reasoning  *float64 `json:"reasoning"`
+			Input     *float64 `json:"input"`
+			Output    *float64 `json:"output"`
+			CacheRead *float64 `json:"cache_read"`
 		} `json:"cost"`
 	} `json:"models"`
 }
@@ -50,15 +46,9 @@ func (p sourcePayload) flatten() []ExternalPrice {
 			if model.Cost.Input == nil || model.Cost.Output == nil {
 				continue
 			}
-			cacheRead, cacheWrite, reasoning := 0.0, 0.0, 0.0
+			cacheRead := 0.0
 			if model.Cost.CacheRead != nil {
 				cacheRead = *model.Cost.CacheRead
-			}
-			if model.Cost.CacheWrite != nil {
-				cacheWrite = *model.Cost.CacheWrite
-			}
-			if model.Cost.Reasoning != nil {
-				reasoning = *model.Cost.Reasoning
 			}
 			out = append(out, ExternalPrice{
 				ID:       modelID,
@@ -67,8 +57,6 @@ func (p sourcePayload) flatten() []ExternalPrice {
 					Prompt:     *model.Cost.Input,
 					Completion: *model.Cost.Output,
 					CacheRead:  cacheRead,
-					CacheWrite: cacheWrite,
-					Reasoning:  reasoning,
 				},
 			})
 		}

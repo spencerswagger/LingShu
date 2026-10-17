@@ -38,7 +38,11 @@ type anthropicUsage struct {
 	CacheReadInputTokens     any `json:"cache_read_input_tokens"`
 }
 
-// parseAnthropicUsage 归一化为五段：推理 token 已包含在 output 中，并入 output（AC-16，不单列 reasoning）。
+// parseAnthropicUsage 归一化为三段（三段口径见 billing.Usage）：
+// Anthropic 的 input_tokens 是「最后一个 cache breakpoint 之后」的 token，不含缓存读/写；
+// 而三段口径下「输入」是纯输入（不含缓存读），写缓存的 token 属于输入 token，
+// 故 Input = input_tokens + cache_creation_input_tokens。
+// 推理（thinking）已包含在 output_tokens 内，不再单列（AC-16）。
 func parseAnthropicUsage(raw []byte) (billing.Usage, error) {
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()
@@ -47,27 +51,30 @@ func parseAnthropicUsage(raw []byte) (billing.Usage, error) {
 		return billing.Usage{}, err
 	}
 	return billing.Usage{
-		Input:      numAsInt(u.InputTokens),
-		Output:     numAsInt(u.OutputTokens),
-		CacheRead:  numAsInt(u.CacheReadInputTokens),
-		CacheWrite: numAsInt(u.CacheCreationInputTokens),
+		Input:     numAsInt(u.InputTokens) + numAsInt(u.CacheCreationInputTokens),
+		Output:    numAsInt(u.OutputTokens),
+		CacheRead: numAsInt(u.CacheReadInputTokens),
 	}, nil
 }
 
-// ExtractUsage 从非流式响应体解析 token 用量；usage 缺失返回 ErrUsageMissing。
-func (p *AnthropicProvider) ExtractUsage(body []byte) (billing.Usage, error) {
+// ExtractUsage 从非流式响应体解析 token 用量与上游原始 usage；usage 缺失返回 ErrUsageMissing。
+func (p *AnthropicProvider) ExtractUsage(body []byte) (billing.Usage, []byte, error) {
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.UseNumber()
 	var raw struct {
 		Usage json.RawMessage `json:"usage"`
 	}
 	if err := dec.Decode(&raw); err != nil {
-		return billing.Usage{}, err
+		return billing.Usage{}, nil, err
 	}
 	if len(raw.Usage) == 0 {
-		return billing.Usage{}, ErrUsageMissing
+		return billing.Usage{}, nil, ErrUsageMissing
 	}
-	return parseAnthropicUsage(raw.Usage)
+	u, err := parseAnthropicUsage(raw.Usage)
+	if err != nil {
+		return billing.Usage{}, nil, err
+	}
+	return u, rawUsageJSON(p.Name(), []json.RawMessage{raw.Usage}), nil
 }
 
 // anthropicStreamEvent 流式事件的宽松解析目标。
@@ -85,7 +92,9 @@ type anthropicStreamEvent struct {
 
 // HandleStream 透传 Anthropic SSE 事件：拼接 text_delta，从 message_start（输入/缓存）与
 // message_delta（累计输出）汇总 usage。usage 缺失返回 ErrUsageMissing（内容已透传，按 AC-17 放宽：估算计费并禁用渠道）。
-func (p *AnthropicProvider) HandleStream(ctx context.Context, upstream *http.Response, w http.ResponseWriter) (billing.Usage, []byte, error) {
+// 返回 (usage, 上游原始 usage JSONB 值, assistant 消息 JSON, error)；原始 usage 由两处事件分片合并
+// （message_start 的输入/缓存 + message_delta 的累计输出），供诊断渠道口径（call_logs.upstream_usage）。
+func (p *AnthropicProvider) HandleStream(ctx context.Context, upstream *http.Response, w http.ResponseWriter) (billing.Usage, []byte, []byte, error) {
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("Cache-Control", "no-cache")
@@ -98,13 +107,14 @@ func (p *AnthropicProvider) HandleStream(ctx context.Context, upstream *http.Res
 
 	var usage billing.Usage
 	sawUsage := false
+	var rawParts []json.RawMessage // 上游原始 usage 分片（message_start + message_delta）
 	var content string
 
 	for {
 		line, err := br.ReadBytes('\n')
 		if len(line) > 0 {
 			if _, werr := w.Write(line); werr != nil {
-				return usage, responsesAssistant(content), werr
+				return usage, rawUsageJSON(p.Name(), rawParts), responsesAssistant(content), werr
 			}
 			if flusher != nil {
 				flusher.Flush()
@@ -119,10 +129,11 @@ func (p *AnthropicProvider) HandleStream(ctx context.Context, upstream *http.Res
 						case "message_start":
 							if len(ev.Message.Usage) > 0 {
 								if u, uerr := parseAnthropicUsage(ev.Message.Usage); uerr == nil {
+									// Input 已含 cache_creation（parseAnthropicUsage 内合并）。
 									usage.Input = u.Input
 									usage.CacheRead = u.CacheRead
-									usage.CacheWrite = u.CacheWrite
 									sawUsage = true
+									rawParts = append(rawParts, ev.Message.Usage)
 								}
 							}
 						case "content_block_delta":
@@ -134,6 +145,7 @@ func (p *AnthropicProvider) HandleStream(ctx context.Context, upstream *http.Res
 								if u, uerr := parseAnthropicUsage(ev.Usage); uerr == nil {
 									usage.Output = u.Output
 									sawUsage = true
+									rawParts = append(rawParts, ev.Usage)
 								}
 							}
 						}
@@ -145,17 +157,17 @@ func (p *AnthropicProvider) HandleStream(ctx context.Context, upstream *http.Res
 			if errors.Is(err, io.EOF) {
 				break
 			}
-			return usage, responsesAssistant(content), err
+			return usage, rawUsageJSON(p.Name(), rawParts), responsesAssistant(content), err
 		}
 		select {
 		case <-ctx.Done():
-			return usage, responsesAssistant(content), ctx.Err()
+			return usage, rawUsageJSON(p.Name(), rawParts), responsesAssistant(content), ctx.Err()
 		default:
 		}
 	}
 
 	if !sawUsage {
-		return usage, responsesAssistant(content), ErrUsageMissing
+		return usage, rawUsageJSON(p.Name(), rawParts), responsesAssistant(content), ErrUsageMissing
 	}
-	return usage, responsesAssistant(content), nil
+	return usage, rawUsageJSON(p.Name(), rawParts), responsesAssistant(content), nil
 }

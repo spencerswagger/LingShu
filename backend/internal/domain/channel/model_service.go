@@ -29,7 +29,7 @@ type ChannelModelInput struct {
 	Reliability *ReliabilityConfig
 }
 
-// validateCMInput 校验渠道内部模型：内部ID非空、外部模型绑定、成本五键非负、可选时段/分档合法。
+// validateCMInput 校验渠道内部模型：内部ID非空、外部模型绑定、成本三段（三键）非负、可选时段/分档合法。
 func validateCMInput(channelID int64, in ChannelModelInput) error {
 	if channelID <= 0 {
 		return errBadRequest("渠道 ID 缺失")
@@ -63,7 +63,7 @@ func validateCMInput(channelID int64, in ChannelModelInput) error {
 
 func rateOrDefault(r billing.Rates) billing.Rates {
 	if r == nil {
-		return billing.Rates{"input": 0.8, "output": 1.6, "cache_read": 0.05, "cache_write": 0.2, "reasoning": 0.8}
+		return billing.Rates{"input": 0.8, "output": 1.6, "cache_read": 0.05}
 	}
 	return r
 }

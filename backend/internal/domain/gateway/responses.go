@@ -37,12 +37,10 @@ type responsesUsage struct {
 	InputTokensDetails struct {
 		CachedTokens any `json:"cached_tokens"`
 	} `json:"input_tokens_details"`
-	OutputTokensDetails struct {
-		ReasoningTokens any `json:"reasoning_tokens"`
-	} `json:"output_tokens_details"`
 }
 
-// parseResponsesUsage 把 Responses usage 归一化为五段（推理 token 单列，从 output 中剔除）。
+// parseResponsesUsage 把 Responses usage 归一化为三段：
+// Input = input_tokens − cached_tokens（纯输入，不含缓存读）；Output = output_tokens（含推理）。
 func parseResponsesUsage(raw []byte) (billing.Usage, error) {
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()
@@ -50,33 +48,36 @@ func parseResponsesUsage(raw []byte) (billing.Usage, error) {
 	if err := dec.Decode(&u); err != nil {
 		return billing.Usage{}, err
 	}
-	output := numAsInt(u.OutputTokens)
-	reasoning := numAsInt(u.OutputTokensDetails.ReasoningTokens)
-	if reasoning > 0 && output >= reasoning {
-		output -= reasoning
+	cached := numAsInt(u.InputTokensDetails.CachedTokens)
+	input := numAsInt(u.InputTokens) - cached
+	if input < 0 {
+		input = 0 // 防御：上游 cached_tokens 异常大于 input_tokens 时按 0 计
 	}
 	return billing.Usage{
-		Input:     numAsInt(u.InputTokens),
-		Output:    output,
-		CacheRead: numAsInt(u.InputTokensDetails.CachedTokens),
-		Reasoning: reasoning,
+		Input:     input,
+		Output:    numAsInt(u.OutputTokens),
+		CacheRead: cached,
 	}, nil
 }
 
-// ExtractUsage 从非流式响应体解析 token 用量；usage 缺失返回 ErrUsageMissing。
-func (p *ResponsesProvider) ExtractUsage(body []byte) (billing.Usage, error) {
+// ExtractUsage 从非流式响应体解析 token 用量与上游原始 usage；usage 缺失返回 ErrUsageMissing。
+func (p *ResponsesProvider) ExtractUsage(body []byte) (billing.Usage, []byte, error) {
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.UseNumber()
 	var raw struct {
 		Usage json.RawMessage `json:"usage"`
 	}
 	if err := dec.Decode(&raw); err != nil {
-		return billing.Usage{}, err
+		return billing.Usage{}, nil, err
 	}
 	if len(raw.Usage) == 0 {
-		return billing.Usage{}, ErrUsageMissing
+		return billing.Usage{}, nil, ErrUsageMissing
 	}
-	return parseResponsesUsage(raw.Usage)
+	u, err := parseResponsesUsage(raw.Usage)
+	if err != nil {
+		return billing.Usage{}, nil, err
+	}
+	return u, rawUsageJSON(p.Name(), []json.RawMessage{raw.Usage}), nil
 }
 
 // responsesStreamEvent 流式事件的宽松解析目标。
@@ -90,7 +91,8 @@ type responsesStreamEvent struct {
 
 // HandleStream 透传 Responses SSE 事件：增量拼接 output_text，从 response.completed 取 usage。
 // usage 缺失返回 ErrUsageMissing（内容已透传，由调用方按 AC-17 放宽：估算计费并禁用渠道）。
-func (p *ResponsesProvider) HandleStream(ctx context.Context, upstream *http.Response, w http.ResponseWriter) (billing.Usage, []byte, error) {
+// 返回 (usage, 上游原始 usage JSONB 值, assistant 消息 JSON, error)。
+func (p *ResponsesProvider) HandleStream(ctx context.Context, upstream *http.Response, w http.ResponseWriter) (billing.Usage, []byte, []byte, error) {
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("Cache-Control", "no-cache")
@@ -103,13 +105,14 @@ func (p *ResponsesProvider) HandleStream(ctx context.Context, upstream *http.Res
 
 	var usage billing.Usage
 	sawUsage := false
+	var rawParts []json.RawMessage // 上游原始 usage 分片（诊断渠道口径，call_logs.upstream_usage）
 	var content string
 
 	for {
 		line, err := br.ReadBytes('\n')
 		if len(line) > 0 {
 			if _, werr := w.Write(line); werr != nil {
-				return usage, responsesAssistant(content), werr
+				return usage, rawUsageJSON(p.Name(), rawParts), responsesAssistant(content), werr
 			}
 			if flusher != nil {
 				flusher.Flush()
@@ -130,6 +133,7 @@ func (p *ResponsesProvider) HandleStream(ctx context.Context, upstream *http.Res
 								if u, uerr := parseResponsesUsage(ev.Response.Usage); uerr == nil {
 									usage = u
 									sawUsage = true
+									rawParts = append(rawParts, ev.Response.Usage)
 								}
 							}
 						}
@@ -141,19 +145,19 @@ func (p *ResponsesProvider) HandleStream(ctx context.Context, upstream *http.Res
 			if errors.Is(err, io.EOF) {
 				break
 			}
-			return usage, responsesAssistant(content), err
+			return usage, rawUsageJSON(p.Name(), rawParts), responsesAssistant(content), err
 		}
 		select {
 		case <-ctx.Done():
-			return usage, responsesAssistant(content), ctx.Err()
+			return usage, rawUsageJSON(p.Name(), rawParts), responsesAssistant(content), ctx.Err()
 		default:
 		}
 	}
 
 	if !sawUsage {
-		return usage, responsesAssistant(content), ErrUsageMissing
+		return usage, rawUsageJSON(p.Name(), rawParts), responsesAssistant(content), ErrUsageMissing
 	}
-	return usage, responsesAssistant(content), nil
+	return usage, rawUsageJSON(p.Name(), rawParts), responsesAssistant(content), nil
 }
 
 // responsesAssistant 拼装 Responses 流式输出为 assistant 消息 JSON（call_log 用）。

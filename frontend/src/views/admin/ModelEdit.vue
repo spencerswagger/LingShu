@@ -29,7 +29,7 @@ const form = reactive({
   Enabled: true,
 })
 const pricing = reactive<Record<string, any>>({
-  SaleRates: { Input: 0, Output: 0, CacheRead: 0, CacheWrite: 0, Reasoning: 0 },
+  SaleRates: { Input: 0, Output: 0, CacheRead: 0 },
   TimeConfig: null,
   ContextTiers: null,
 })

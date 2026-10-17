@@ -29,7 +29,7 @@ func (f *fakeRouteEngine) RouteAll(ctx context.Context, spec router.RouteSpec) (
 }
 
 func (f *fakeRouteEngine) CostSample() billing.Usage {
-	return billing.Usage{Input: 10000, Output: 1000, CacheRead: 9000, Reasoning: 500}
+	return billing.Usage{Input: 10000, Output: 1000, CacheRead: 9000}
 }
 
 // ActiveKeySessions 固定返回 3，供服务状态端点密钥存活会话数回填断言使用。

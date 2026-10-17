@@ -47,11 +47,13 @@ const throughputText = computed(() => {
   return `RPM ${Math.round(s.RPM)} · TPM ${compact(s.TPM)}`
 })
 
-// 缓存命中率（本月）= 缓存读 ÷ 输入(含缓存读)
+// 缓存命中率（本月）= 缓存读 ÷ (输入 + 缓存读)
 const cacheHitText = computed(() => {
   const s = summary.value
-  if (!s || !s.InputTokens) return '--'
-  return `${((s.CacheReadTokens / s.InputTokens) * 100).toFixed(1)}%`
+  if (!s) return '--'
+  const denom = s.InputTokens + s.CacheReadTokens
+  if (!denom) return '--'
+  return `${((s.CacheReadTokens / denom) * 100).toFixed(1)}%`
 })
 
 function goBilling(range: 'today' | 'yesterday' | 'month') {

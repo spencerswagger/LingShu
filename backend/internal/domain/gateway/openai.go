@@ -59,19 +59,26 @@ func (p *OpenAIProvider) BuildUpstreamRequest(ctx context.Context, req UpstreamR
 }
 
 // usageObj 是对 openai `usage` 对象的宽松结构，数字可为整数或浮点。
+// 说明：OpenAI 系的 prompt_tokens 是「含」口径——命中缓存的 cached_tokens 是它的子集；
+// 百炼显式缓存新建的 cache_creation_input_tokens 同样包含在 prompt_tokens 内。
+// DeepSeek 原生风格：prompt_tokens = prompt_cache_hit_tokens + prompt_cache_miss_tokens
+// （同为「含」口径），命中数放在顶层 prompt_cache_hit_tokens；部分上游只给这个字段而不给
+// prompt_tokens_details.cached_tokens，必须兜底识别，否则缓存读会被按全价输入计。
 type usageObj struct {
-	PromptTokens        any `json:"prompt_tokens"`
-	CompletionTokens    any `json:"completion_tokens"`
-	TotalTokens         any `json:"total_tokens"`
-	PromptTokensDetails struct {
+	PromptTokens         any `json:"prompt_tokens"`
+	CompletionTokens     any `json:"completion_tokens"`
+	TotalTokens          any `json:"total_tokens"`
+	PromptCacheHitTokens any `json:"prompt_cache_hit_tokens"`
+	PromptTokensDetails  struct {
 		CachedTokens any `json:"cached_tokens"`
 	} `json:"prompt_tokens_details"`
-	CompletionTokensDetails struct {
-		ReasoningTokens any `json:"reasoning_tokens"`
-	} `json:"completion_tokens_details"`
 }
 
-// parseUsageObj 解析 usage JSON（支持整数/浮点数字）。
+// parseUsageObj 解析 usage JSON（支持整数/浮点数字），归一化为三段：
+// Input = prompt_tokens − 缓存命中数（纯输入，不含缓存读；缓存写 token 天然已在 prompt_tokens 内）；
+// Output = completion_tokens（含推理，不再从输出中剥离 reasoning 单独计费）。
+// 缓存命中数取值：优先 prompt_tokens_details.cached_tokens，为空或 0 时回落顶层 prompt_cache_hit_tokens
+// （DeepSeek 原生风格；两者同义，官方文档明确 cached_tokens 与 prompt_cache_hit_tokens 相同）。
 func parseUsageObj(raw []byte) (billing.Usage, error) {
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()
@@ -79,18 +86,18 @@ func parseUsageObj(raw []byte) (billing.Usage, error) {
 	if err := dec.Decode(&u); err != nil {
 		return billing.Usage{}, err
 	}
-	output := numAsInt(u.CompletionTokens)
-	reasoning := numAsInt(u.CompletionTokensDetails.ReasoningTokens)
-	// openai/deepseek 惯例：completion_tokens 已包含推理 token，而推理单独给出并单独计费，
-	// 从 output 中剔除推理部分，避免同一段 token 被输出价与推理价重复累计。
-	if reasoning > 0 && output >= reasoning {
-		output -= reasoning
+	cached := numAsInt(u.PromptTokensDetails.CachedTokens)
+	if cached == 0 {
+		cached = numAsInt(u.PromptCacheHitTokens)
+	}
+	input := numAsInt(u.PromptTokens) - cached
+	if input < 0 {
+		input = 0 // 防御：上游 cached_tokens 异常大于 prompt_tokens 时按 0 计
 	}
 	return billing.Usage{
-		Input:     numAsInt(u.PromptTokens),
-		Output:    output,
-		CacheRead: numAsInt(u.PromptTokensDetails.CachedTokens),
-		Reasoning: reasoning,
+		Input:     input,
+		Output:    numAsInt(u.CompletionTokens),
+		CacheRead: cached,
 	}, nil
 }
 
@@ -114,30 +121,34 @@ func numAsInt(v any) int64 {
 
 // usageZero 判断 usage 是否全零。
 func usageZero(u billing.Usage) bool {
-	return u.Input == 0 && u.Output == 0 && u.CacheRead == 0 &&
-		u.CacheWrite == 0 && u.Reasoning == 0
+	return u.Input == 0 && u.Output == 0 && u.CacheRead == 0
 }
 
-// ExtractUsage 从非流式响应体解析 token 用量；usage 缺失返回 ErrUsageMissing（AC-17 放宽）。
-func (p *OpenAIProvider) ExtractUsage(body []byte) (billing.Usage, error) {
+// ExtractUsage 从非流式响应体解析 token 用量与上游原始 usage；usage 缺失返回 ErrUsageMissing（AC-17 放宽）。
+func (p *OpenAIProvider) ExtractUsage(body []byte) (billing.Usage, []byte, error) {
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.UseNumber()
 	var raw struct {
 		Usage json.RawMessage `json:"usage"`
 	}
 	if err := dec.Decode(&raw); err != nil {
-		return billing.Usage{}, err
+		return billing.Usage{}, nil, err
 	}
 	if len(raw.Usage) == 0 {
-		return billing.Usage{}, ErrUsageMissing
+		return billing.Usage{}, nil, ErrUsageMissing
 	}
-	return parseUsageObj(raw.Usage)
+	u, err := parseUsageObj(raw.Usage)
+	if err != nil {
+		return billing.Usage{}, nil, err
+	}
+	return u, rawUsageJSON(p.Name(), []json.RawMessage{raw.Usage}), nil
 }
 
 // HandleStream 透传 SSE：逐行写回下游并 Flush，同时从 data 行提取 usage 与拼装 assistant 消息。
 // usage 缺失时返回 ErrUsageMissing（AC-17 放宽：内容已透传，由调用方按估算计费并禁用渠道）。
-// 返回 (usage, 拼装完成的 assistant 消息 JSON, error)；assistant 消息供 call_log 记录流式响应内容。
-func (p *OpenAIProvider) HandleStream(ctx context.Context, upstream *http.Response, w http.ResponseWriter) (billing.Usage, []byte, error) {
+// 返回 (usage, 上游原始 usage JSONB 值, 拼装完成的 assistant 消息 JSON, error)；
+// assistant 消息供 call_log 记录流式响应内容，原始 usage 供诊断渠道口径（call_logs.upstream_usage）。
+func (p *OpenAIProvider) HandleStream(ctx context.Context, upstream *http.Response, w http.ResponseWriter) (billing.Usage, []byte, []byte, error) {
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("Cache-Control", "no-cache")
@@ -150,13 +161,14 @@ func (p *OpenAIProvider) HandleStream(ctx context.Context, upstream *http.Respon
 
 	var usage billing.Usage
 	sawUsage := false
-	asm := newStreamAssembler() // 按 data 行增量拼装完整 assistant 消息（call_log 采集）
+	var rawParts []json.RawMessage // 上游原始 usage 分片（多条累计时按同名键后写覆盖）
+	asm := newStreamAssembler()    // 按 data 行增量拼装完整 assistant 消息（call_log 采集）
 
 	for {
 		line, err := br.ReadBytes('\n')
 		if len(line) > 0 {
 			if _, werr := w.Write(line); werr != nil {
-				return usage, asm.marshal(), werr
+				return usage, rawUsageJSON(p.Name(), rawParts), asm.marshal(), werr
 			}
 			if flusher != nil {
 				flusher.Flush()
@@ -165,10 +177,11 @@ func (p *OpenAIProvider) HandleStream(ctx context.Context, upstream *http.Respon
 			if bytes.HasPrefix(trimmed, []byte("data:")) {
 				data := bytes.TrimSpace(trimmed[len("data:"):])
 				if len(data) > 0 && !bytes.Equal(data, []byte("[DONE]")) {
-					u, has, _ := parseStreamData(data)
+					u, raw, has := parseStreamData(data)
 					if has {
 						usage = u
 						sawUsage = true
+						rawParts = append(rawParts, raw)
 					}
 					asm.apply(data)
 				}
@@ -178,20 +191,20 @@ func (p *OpenAIProvider) HandleStream(ctx context.Context, upstream *http.Respon
 			if errors.Is(err, io.EOF) {
 				break
 			}
-			return usage, asm.marshal(), err
+			return usage, rawUsageJSON(p.Name(), rawParts), asm.marshal(), err
 		}
 		// 请求取消则中止透传（上游连接由 ctx 控制关闭）。
 		select {
 		case <-ctx.Done():
-			return usage, asm.marshal(), ctx.Err()
+			return usage, rawUsageJSON(p.Name(), rawParts), asm.marshal(), ctx.Err()
 		default:
 		}
 	}
 
 	if !sawUsage {
-		return usage, asm.marshal(), ErrUsageMissing
+		return usage, rawUsageJSON(p.Name(), rawParts), asm.marshal(), ErrUsageMissing
 	}
-	return usage, asm.marshal(), nil
+	return usage, rawUsageJSON(p.Name(), rawParts), asm.marshal(), nil
 }
 
 // streamToolCall 拼装中的单个工具调用（index → 增量累积状态）。
@@ -336,50 +349,34 @@ func (a *streamAssembler) marshal() []byte {
 	return b
 }
 
-// streamData 流式 data 行的宽松解析目标。
+// streamData 流式 data 行的 usage 解析目标（正文增量由 streamAssembler 处理，此处只取 usage）。
 type streamData struct {
 	Choices []struct {
-		Delta struct {
-			Content          any `json:"content"`
-			ReasoningContent any `json:"reasoning_content"`
-		} `json:"delta"`
-		Message struct {
-			Content any `json:"content"`
-		} `json:"message"`
 		Usage json.RawMessage `json:"usage"`
 	} `json:"choices"`
 	Usage json.RawMessage `json:"usage"`
 }
 
-// parseStreamData 解析单个 SSE data 块，返回：命中 usage、flag、累计 content 字符数。
-func parseStreamData(data []byte) (billing.Usage, bool, int64) {
+// parseStreamData 解析单个 SSE data 块，返回：命中 usage、该 usage 的原始 JSON、是否命中。
+// 原始 JSON 供 call_log 记录上游原文（诊断渠道 usage 口径）。
+func parseStreamData(data []byte) (billing.Usage, json.RawMessage, bool) {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()
 	var obj streamData
 	if err := dec.Decode(&obj); err != nil {
-		return billing.Usage{}, false, 0
+		return billing.Usage{}, nil, false
 	}
-	var chars int64
 	for _, c := range obj.Choices {
-		if s, ok := c.Delta.Content.(string); ok {
-			chars += int64(len(s))
-		}
-		if s, ok := c.Delta.ReasoningContent.(string); ok {
-			chars += int64(len(s))
-		}
-		if s, ok := c.Message.Content.(string); ok {
-			chars += int64(len(s))
-		}
 		if len(c.Usage) > 0 {
 			if u, err := parseUsageObj(c.Usage); err == nil && !usageZero(u) {
-				return u, true, chars
+				return u, c.Usage, true
 			}
 		}
 	}
 	if len(obj.Usage) > 0 {
 		if u, err := parseUsageObj(obj.Usage); err == nil && !usageZero(u) {
-			return u, true, chars
+			return u, obj.Usage, true
 		}
 	}
-	return billing.Usage{}, false, chars
+	return billing.Usage{}, nil, false
 }

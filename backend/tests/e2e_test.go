@@ -546,11 +546,11 @@ func TestE2E_GatewayBillingLoop(t *testing.T) {
 
 	// 4) admin 建对外模型(qw-max，sale_rates 1.0/2.0) 与语义标签 {provider:domestic}；
 	//    随后为渠道绑定内部模型（channel_models：internal qwen-max + cost 与 sale 相同）。
-	//    请求体统一用 PascalCase 键（Input/Output/CacheRead/CacheWrite/Reasoning）以锁定内部 API 契约。
+	//    请求体统一用 PascalCase 键（Input/Output/CacheRead）以锁定内部 API 契约（三段口径）。
 	var tagID int64
 	var extModelID int64
 	{
-		rates := map[string]float64{"Input": 1.0, "Output": 2.0, "CacheRead": 1.0, "CacheWrite": 1.0, "Reasoning": 1.0}
+		rates := map[string]float64{"Input": 1.0, "Output": 2.0, "CacheRead": 1.0}
 		status, raw := req(t, http.MethodPost, base+"/api/v1/admin/models", adminToken, map[string]any{
 			"ExternalName": "qw-max", "SaleRates": rates,
 		})
@@ -575,7 +575,7 @@ func TestE2E_GatewayBillingLoop(t *testing.T) {
 	{
 		status, raw := req(t, http.MethodPost, base+"/api/v1/admin/models", adminToken, map[string]any{
 			"ExternalName": "qw-max-legacy",
-			"SaleRates":    map[string]float64{"input": 1.0, "output": 2.0, "cache_read": 1.0, "cache_write": 1.0, "reasoning": 1.0},
+			"SaleRates":    map[string]float64{"input": 1.0, "output": 2.0, "cache_read": 1.0},
 		})
 		if status != http.StatusOK {
 			t.Fatalf("create legacy model(snake sale_rates) 兼容分支应通过，实际 status=%d body=%s", status, raw)
@@ -586,7 +586,7 @@ func TestE2E_GatewayBillingLoop(t *testing.T) {
 		path := fmt.Sprintf("/api/v1/admin/channels/%d/models", channelID)
 		status, raw := req(t, http.MethodPost, base+path, adminToken, map[string]any{
 			"InternalModelID": "qwen-max", "ExternalModelID": strconv.FormatInt(extModelID, 10),
-			"CostRates": map[string]float64{"Input": 1.0, "Output": 2.0, "CacheRead": 1.0, "CacheWrite": 1.0, "Reasoning": 1.0},
+			"CostRates": map[string]float64{"Input": 1.0, "Output": 2.0, "CacheRead": 1.0},
 		})
 		if status != http.StatusOK {
 			t.Fatalf("create channel model status=%d body=%s", status, raw)

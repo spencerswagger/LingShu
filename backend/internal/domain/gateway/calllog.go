@@ -35,6 +35,7 @@ type CallLog struct {
 	RespBody        string // 非流式完整响应体；流式为结构化提取的 assistant 增量 JSON
 	RespKind        string // non_stream / stream / error
 	Decision        any    // 决策轨迹 JSONB 原始值（候选渠道与原因、系数、预扣与结果）
+	UpstreamUsage   []byte // 上游原始 usage（JSONB 值：{"Protocol":...,"Usage":{...}}，见 rawusage.go；nil=无）
 	ErrorMessage    string
 	DurationMs      *int64
 	FirstTokenMs    *int64
@@ -57,10 +58,20 @@ func NewSQLCallLogStore(db *sql.DB) *SQLCallLogStore {
 	return &SQLCallLogStore{db: db}
 }
 
-// callLogsCols 与 0002_call_logs.sql 列顺序一致的查询列（不含 id/created_at 自动列的读侧拆分）。
+// callLogsCols 与 0002_call_logs.sql + 0011_auto_models.sql（auto_model_name）+ 0012（upstream_usage）
+// 迁移后的列顺序一致的查询列（不含 id/created_at 自动列的读侧拆分）。
 const callLogsCols = `billing_id, request_id, session_id, user_id, channel_id, channel_key_id,
 	internal_model_id, external_model_id, model, auto_model_name, pricing_mode, status, req_messages, resp_body, resp_kind,
-	decision, error_message, duration_ms, first_token_ms, created_at`
+	decision, error_message, duration_ms, first_token_ms, created_at, upstream_usage`
+
+// insertCallLogSQL 写入一条调用日志。列与占位符必须一一对应（数量不等会让所有写日志失败），
+// 由 calllog_test.go 的 TestInsertCallLogSQL_ColumnPlaceholderCount 守卫。
+const insertCallLogSQL = `
+INSERT INTO call_logs(id, billing_id, request_id, session_id, user_id, channel_id, channel_key_id,
+	internal_model_id, external_model_id, model, auto_model_name, pricing_mode, status, req_messages, resp_body, resp_kind,
+	decision, error_message, duration_ms, first_token_ms, created_at, upstream_usage)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+ON CONFLICT (billing_id) DO NOTHING`
 
 // Insert 幂等插入一条调用日志：billing_id 冲突（ON CONFLICT DO NOTHING）静默跳过；
 // billing_id 为空串（拒绝场景）同样允许，靠 UNIQUE 约束保证拒绝场景也不重复落日志。
@@ -81,17 +92,20 @@ func (s *SQLCallLogStore) Insert(ctx context.Context, c *CallLog) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.db.ExecContext(ctx, `
-INSERT INTO call_logs(id, billing_id, request_id, session_id, user_id, channel_id, channel_key_id,
-	internal_model_id, external_model_id, model, auto_model_name, pricing_mode, status, req_messages, resp_body, resp_kind,
-	decision, error_message, duration_ms, first_token_ms, created_at)
-VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
-ON CONFLICT (billing_id) DO NOTHING`,
+	_, err = s.db.ExecContext(ctx, insertCallLogSQL,
 		id, c.BillingID, c.RequestID, c.SessionID, nullableInt64(c.UserID), nullableInt64(c.ChannelID),
 		nullableInt64(c.ChannelKeyID), c.InternalModelID, nullableInt64(c.ExternalModelID), c.Model,
 		nullableString(c.AutoModelName), c.PricingMode, c.Status, reqRaw, c.RespBody, c.RespKind, decRaw, c.ErrorMessage,
-		nullableInt64(c.DurationMs), nullableInt64(c.FirstTokenMs), created)
+		nullableInt64(c.DurationMs), nullableInt64(c.FirstTokenMs), created, nullableBytes(c.UpstreamUsage))
 	return err
+}
+
+// nullableBytes JSONB 参数：空值给 NULL（避免写入空字符串被 jsonb 拒绝）。
+func nullableBytes(b []byte) any {
+	if len(b) == 0 {
+		return nil
+	}
+	return b
 }
 
 // nullableString 空串 → SQL NULL（auto_model_name 等可空文本列用）。
@@ -176,10 +190,10 @@ func scanCallLog(row rowScanner) (*CallLog, error) {
 func scanCallLogInto(s rowScanner, c *CallLog) error {
 	var uid, chID, keyID, extID, dur, ft sql.NullInt64
 	var autoName sql.NullString
-	var reqRaw, decRaw []byte
+	var reqRaw, decRaw, upRaw []byte
 	if err := s.Scan(&c.BillingID, &c.RequestID, &c.SessionID, &uid, &chID, &keyID,
 		&c.InternalModelID, &extID, &c.Model, &autoName, &c.PricingMode, &c.Status, &reqRaw, &c.RespBody, &c.RespKind,
-		&decRaw, &c.ErrorMessage, &dur, &ft, &c.CreatedAt); err != nil {
+		&decRaw, &c.ErrorMessage, &dur, &ft, &c.CreatedAt, &upRaw); err != nil {
 		return err
 	}
 	c.AutoModelName = autoName.String
@@ -212,6 +226,9 @@ func scanCallLogInto(s rowScanner, c *CallLog) error {
 	}
 	if len(decRaw) > 0 {
 		c.Decision = json.RawMessage(decRaw)
+	}
+	if len(upRaw) > 0 {
+		c.UpstreamUsage = upRaw
 	}
 	return nil
 }
@@ -373,9 +390,21 @@ func (g *Gateway) channelAndKeyNames(channelID, keyID int64) (string, string) {
 // writeCallLog 采集一条调用日志（写失败仅记日志，不阻塞/回滚请求语义）。
 // 拒绝等 Reject 场景 routeRes 传 &router.RouteResult{}（零值 → 相关引用字段不写入）；
 // requestID 为空时从 ctx 取（resp.RequestID 同源）。
+//
+// 本方法是 writeCallLogUsage 的简写（不带上游原始 usage）：绝大多数调用点（失败/拒绝/构建失败等）
+// 没有可采集的上游 usage，只有真正拿到上游响应的成功路径才用 writeCallLogUsage，避免为 20+ 个调用点
+// 逐个补参数。
 func (g *Gateway) writeCallLog(ctx context.Context, billingID, requestID string, token *identity.Token,
 	routeRes *router.RouteResult, model, pricingMode, sessionID string, reqMsgs []json.RawMessage,
 	respKind, respBody, status, errMsg string, durationMs, firstTokenMs *int64, decision any) {
+	g.writeCallLogUsage(ctx, billingID, requestID, token, routeRes, model, pricingMode, sessionID, reqMsgs,
+		respKind, respBody, status, errMsg, nil, durationMs, firstTokenMs, decision)
+}
+
+// writeCallLogUsage 同 writeCallLog，额外记录上游原始 usage（call_logs.upstream_usage，诊断渠道口径用）。
+func (g *Gateway) writeCallLogUsage(ctx context.Context, billingID, requestID string, token *identity.Token,
+	routeRes *router.RouteResult, model, pricingMode, sessionID string, reqMsgs []json.RawMessage,
+	respKind, respBody, status, errMsg string, upstreamUsage []byte, durationMs, firstTokenMs *int64, decision any) {
 	if g.callLogs == nil {
 		return
 	}
@@ -383,19 +412,20 @@ func (g *Gateway) writeCallLog(ctx context.Context, billingID, requestID string,
 		requestID = logger.GetRequestID(ctx)
 	}
 	cl := &CallLog{
-		BillingID:    billingID,
-		RequestID:    requestID,
-		SessionID:    sessionID,
-		Model:        model,
-		PricingMode:  pricingMode,
-		Status:       status,
-		ReqMessages:  reqMsgs,
-		RespBody:     respBody,
-		RespKind:     respKind,
-		Decision:     decision,
-		ErrorMessage: errMsg,
-		DurationMs:   durationMs,
-		FirstTokenMs: firstTokenMs,
+		BillingID:     billingID,
+		RequestID:     requestID,
+		SessionID:     sessionID,
+		Model:         model,
+		PricingMode:   pricingMode,
+		Status:        status,
+		ReqMessages:   reqMsgs,
+		RespBody:      respBody,
+		RespKind:      respKind,
+		Decision:      decision,
+		UpstreamUsage: upstreamUsage,
+		ErrorMessage:  errMsg,
+		DurationMs:    durationMs,
+		FirstTokenMs:  firstTokenMs,
 	}
 	if routeRes != nil {
 		cl.AutoModelName = routeRes.AutoModelName

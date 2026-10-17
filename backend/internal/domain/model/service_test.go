@@ -14,7 +14,7 @@ import (
 )
 
 func saleRates() billing.Rates {
-	return billing.Rates{"input": 1, "output": 2, "cache_read": 0.1, "cache_write": 0.3, "reasoning": 1}
+	return billing.Rates{"input": 1, "output": 2, "cache_read": 0.1}
 }
 
 // extCols 与 store.cols 一致，供构造 mock 行。
@@ -71,9 +71,9 @@ func TestService_CreateModel_Validation(t *testing.T) {
 	if !errors.As(err, &apiErr) || apiErr.Code != resp.CodeBadRequest {
 		t.Fatalf("期望名称空 40001，got %v", err)
 	}
-	// 缺键
+	// 缺键（三段任缺其一都应报错）
 	ok := saleRates()
-	delete(ok, "reasoning")
+	delete(ok, "cache_read")
 	_, err = s.CreateModel(context.Background(), ExternalModelInput{ExternalName: "x", SaleRates: ok})
 	if !errors.As(err, &apiErr) || apiErr.Code != resp.CodeBadRequest {
 		t.Fatalf("期望缺失键 40001，got %v", err)
@@ -239,14 +239,14 @@ func TestService_ApplyPrice(t *testing.T) {
 	now := time.Now()
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + cols + ` FROM external_models WHERE id = $1`)).
 		WithArgs(int64(1)).
-		WillReturnRows(extRow(&ExternalModel{ID: 1, ExternalName: "qw-max", Enabled: true, SaleRates: saleRates(), CreatedAt: now, UpdatedAt: now}, `{"input":1,"output":2,"cache_read":0.1,"cache_write":0.3,"reasoning":1}`))
+		WillReturnRows(extRow(&ExternalModel{ID: 1, ExternalName: "qw-max", Enabled: true, SaleRates: saleRates(), CreatedAt: now, UpdatedAt: now}, `{"input":1,"output":2,"cache_read":0.1}`))
 	s.SetPriceSource(fakePriceSource{refPrice: PriceRef{Input: 0.3, Output: 0.6, UpdatedAt: now}, has: true})
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE external_models SET sale_rates=$1, updated_at=now() WHERE id=$2`)).
 		WithArgs(sqlmock.AnyArg(), int64(1)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + cols + ` FROM external_models WHERE id = $1`)).
 		WithArgs(int64(1)).
-		WillReturnRows(extRow(&ExternalModel{ID: 1, ExternalName: "qw-max", Enabled: true, CreatedAt: now, UpdatedAt: now}, `{"input":0.3,"output":0.6,"cache_read":0.1,"cache_write":0.3,"reasoning":1}`))
+		WillReturnRows(extRow(&ExternalModel{ID: 1, ExternalName: "qw-max", Enabled: true, CreatedAt: now, UpdatedAt: now}, `{"input":0.3,"output":0.6,"cache_read":0.1}`))
 
 	m, err := s.ApplyPrice(context.Background(), 1)
 	if err != nil {
