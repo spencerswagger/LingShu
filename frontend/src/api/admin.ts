@@ -213,7 +213,7 @@ export interface ChannelModelEvent {
   Reason: string
   CreatedAt: string
 }
-// 探测历史
+// 探测历史（token 为三段口径，与账单一致：InputTokens=纯输入不含缓存读；TotalTokens=三段合计）
 export interface ProbeLog {
   ID: string
   ChannelKeyID: string
@@ -222,10 +222,10 @@ export interface ProbeLog {
   Target: string
   OK: boolean
   Error: string
-  InputTokens: number
-  OutputTokens: number
-  CachedTokens: number
-  TotalTokens: number
+  InputTokens: number // 纯输入（不含缓存读）
+  OutputTokens: number // 生成 token（含推理）
+  CachedTokens: number // 缓存读命中
+  TotalTokens: number // 三段合计 = 输入 + 缓存读 + 输出
   DurationMS: number
   CreatedAt: string
 }
@@ -279,7 +279,7 @@ export interface ChannelProtocolModelOverride {
   protocols?: Record<string, ProtocolOption>
   // 绑定的对外模型 ID（雪花字符串）；空 = 未绑定
   externalModelID?: string | null
-  // 成本五段费率（键 = Go rateKeys）
+  // 成本三段费率（键 = billing.Rates：Input/Output/CacheRead）
   costRates?: Record<string, number>
   // 模型级时段/分档（空 = 回落全局默认）
   timeConfig?: TimeCoeffConfig | null
@@ -553,8 +553,6 @@ export interface SampleUsage {
   input: number
   output: number
   cache_read: number
-  cache_write: number
-  reasoning: number
 }
 // 聚合视图（后端 console.ServiceStatusView）
 export interface ServiceStatusView {
@@ -601,23 +599,19 @@ export function batchDeleteTags(ids: string[]) {
   })
 }
 
-// ===== 五段计价费率（售价/成本对称的公共定价 schema）=====
-// 与后端 billing.Rates / model.RateKeys 对齐，键必须齐全且非负。
-export const rateKeys = ['Input', 'Output', 'CacheRead', 'CacheWrite', 'Reasoning'] as const
+// ===== 三段计价费率（售价/成本对称的公共定价 schema）=====
+// 与后端 billing.Rates 对齐，键必须齐全且非负。
+export const rateKeys = ['Input', 'Output', 'CacheRead'] as const
 export const rateLabels: Record<string, string> = {
   Input: '输入',
   Output: '输出',
   CacheRead: '缓存读',
-  CacheWrite: '缓存写',
-  Reasoning: '推理',
 }
-// 售价/成本五段倍率的 tooltip 解释（倍率 = 每百万 token 计费数值，照抄官方定价录入）
+// 售价/成本三段倍率的 tooltip 解释（倍率 = 每百万 token 计费数值，照抄官方定价录入）
 export const rateHints: Record<string, string> = {
-  Input: '输入倍率（每百万 token）：与官方定价数值一致，直接填官网价格即可。',
-  Output: '输出倍率（每百万 token）：模型生成回复内容所计费。',
-  CacheRead: '缓存读倍率（每百万 token）：命中提示词缓存的输入按此低价计费。',
-  CacheWrite: '缓存写倍率（每百万 token）：首次写入提示词缓存时按此单价计费。',
-  Reasoning: '推理倍率（每百万 token）：思维链/深度推理 token 单独计费费率。',
+  Input: '输入倍率（每百万 token）：纯输入，不含缓存读；上游报的缓存写 token 计入此段。',
+  Output: '输出倍率（每百万 token）：生成 token，含推理。',
+  CacheRead: '缓存读倍率（每百万 token）：命中提示词缓存读取的输入，按低价计费。',
 }
 
 // ===== 对外模型（external_models·售价层；字段名 = Go 字段名）=====
@@ -671,8 +665,6 @@ export interface CatalogEntry {
   InputUSD: number
   OutputUSD: number
   CacheReadUSD: number
-  CacheWriteUSD: number
-  ReasoningUSD: number
 }
 export function priceCatalog(q: string) {
   return http.get<{ List: CatalogEntry[]; Total: number; UpdatedAt: string }, ApiRes<{ List: CatalogEntry[]; Total: number; UpdatedAt: string }>>(
@@ -751,8 +743,6 @@ export interface BillingUsage {
   Input: number
   Output: number
   CacheRead: number
-  CacheWrite: number
-  Reasoning: number
 }
 export interface AdminBillingItem {
   BillingID: string
@@ -787,7 +777,7 @@ export function listBillings(params: Record<string, unknown> = {}, base = '/admi
   )
 }
 // 账单筛选聚合统计（与列表同 filter）：请求数/总积分/总 token/总耗时（统计栏用）。
-// InputTokens=输入(含缓存读)总量，CacheReadTokens=缓存读命中量（用于缓存命中率）。
+// InputTokens=纯输入（不含缓存读）总量，CacheReadTokens=缓存读命中量（缓存命中率 = 缓存读 ÷ (输入+缓存读)）。
 export interface BillingStats {
   Requests: number
   CreditsTotal: number
@@ -903,9 +893,7 @@ export interface TimeCoeffConfig {
 export interface CostSample {
   input: number
   cache_read: number
-  cache_write: number
   output: number
-  reasoning: number
 }
 export interface BillingConfigData {
   R: number | string

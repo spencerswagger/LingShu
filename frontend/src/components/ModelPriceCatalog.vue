@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // models.dev 参考价市场（公共组件）：按模型 ID / 供应商搜索参考价，供售价或成本定价取数。
 // 组件只负责取数与选择，不直接改父组件数据：底部「应用」时把 >0 的价段换算成倍率，
-// 通过 emit('apply', partial) 抛出，由父组件合并到对应的五段费率。
+// 通过 emit('apply', partial) 抛出，由父组件合并到对应的三段费率。
 import { computed, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { getSystemConfig, priceCatalog, runSync, type CatalogEntry } from '@/api/admin'
@@ -111,7 +111,7 @@ async function onSyncNow() {
   }
 }
 
-// 应用所选（或推荐）条目为五段费率：只抛出 models.dev 提供（>0）的价段，
+// 应用所选（或推荐）条目为三段费率：只抛出 models.dev 提供（>0）的价段，
 // 无价段不放进 partial，父组件合并时自然保留原值。
 function onApplyCatalog() {
   const entry = selectedEntry.value || recommended.value
@@ -123,8 +123,6 @@ function onApplyCatalog() {
   apply('Input', entry.InputUSD)
   apply('Output', entry.OutputUSD)
   apply('CacheRead', entry.CacheReadUSD)
-  apply('CacheWrite', entry.CacheWriteUSD)
-  apply('Reasoning', entry.ReasoningUSD)
   emit('apply', partial)
   catOpen.value = false
   ElMessage.success(`已应用 models.dev 参考价（${entry.Provider}/${entry.ModelID}）`)
@@ -210,24 +208,6 @@ defineExpose({ open: openCatalog })
           <span v-else class="zero">—</span>
         </template>
       </el-table-column>
-      <el-table-column label="缓存写" width="130" align="right">
-        <template #default="{ row }">
-          <div v-if="row.CacheWriteUSD > 0" class="pcell">
-            <span class="cny">{{ usdToCnyPerM(row.CacheWriteUSD) }}</span>
-            <span class="credit">≈ {{ usdToCredits(row.CacheWriteUSD) }} 积分</span>
-          </div>
-          <span v-else class="zero">—</span>
-        </template>
-      </el-table-column>
-      <el-table-column label="推理" width="130" align="right">
-        <template #default="{ row }">
-          <div v-if="row.ReasoningUSD > 0" class="pcell">
-            <span class="cny">{{ usdToCnyPerM(row.ReasoningUSD) }}</span>
-            <span class="credit">≈ {{ usdToCredits(row.ReasoningUSD) }} 积分</span>
-          </div>
-          <span v-else class="zero">—</span>
-        </template>
-      </el-table-column>
     </el-table>
     <div class="cat-status">
       <span v-if="catUpdatedAt" class="status-item">数据同步于 {{ fmtDateTime(catUpdatedAt) }}</span>
@@ -236,7 +216,7 @@ defineExpose({ open: openCatalog })
     </div>
     <el-empty v-if="!catLoading && !catList.length" description="未找到匹配的模型价格（同步数据来自后端定时拉取的 models.dev 缓存）" />
     <p class="ref-note">
-      models.dev 提供各供应商参考价（模型 ID / 输入输出 / 缓存读写 / 推理）。表中数值为折算后的倍率建议值，点击「应用」将其写入{{ applyLabel }}对应的价格段（models.dev 未提供的段保留原值）。
+      models.dev 提供各供应商参考价（模型 ID / 输入输出 / 缓存读）。表中数值为折算后的倍率建议值，点击「应用」将其写入{{ applyLabel }}对应的价格段（输入/输出/缓存读三段，models.dev 未提供的段保留原值）。
     </p>
     <template #footer>
       <el-button @click="catOpen = false">取消</el-button>

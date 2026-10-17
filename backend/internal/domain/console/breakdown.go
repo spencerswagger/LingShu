@@ -64,7 +64,10 @@ type CallLogView struct {
 	ReqMessages  any    `json:"ReqMessages"` // JSONB 原始 value（可能 null）
 	RespBody     string `json:"RespBody"`
 	Decision     any    `json:"Decision"` // JSONB 原始 value（可能 null）
-	PricingMode  string `json:"PricingMode"`
+	// UpstreamUsage 上游原始 usage（JSONB 反序列化结果：{"Protocol":...,"Usage":{...}}，可能 null）：
+	// 诊断渠道 usage 口径用（billing_records.tokens 是归一化后的三段，看不出上游原文）。
+	UpstreamUsage any    `json:"UpstreamUsage"`
+	PricingMode   string `json:"PricingMode"`
 }
 
 // toCallLogView 由存储层 CallLog 组装只读视图；ReqMessages/Decision 反序列化为 any，null 给 nil。
@@ -85,48 +88,46 @@ func toCallLogView(cl *gateway.CallLog) *CallLogView {
 			decision = v
 		}
 	}
+	var upstreamUsage any
+	if len(cl.UpstreamUsage) > 0 {
+		if err := json.Unmarshal(cl.UpstreamUsage, &upstreamUsage); err != nil {
+			upstreamUsage = nil
+		}
+	}
 	return &CallLogView{
-		BillingID:    cl.BillingID,
-		RequestID:    cl.RequestID,
-		SessionID:    cl.SessionID,
-		Model:        cl.Model,
-		Status:       cl.Status,
-		RespKind:     cl.RespKind,
-		ErrorMessage: cl.ErrorMessage,
-		DurationMs:   cl.DurationMs,
-		FirstTokenMs: cl.FirstTokenMs,
-		CallTime:     cl.CreatedAt.Format(time.RFC3339),
-		ReqMessages:  reqMsgs,
-		RespBody:     cl.RespBody,
-		Decision:     decision,
-		PricingMode:  cl.PricingMode,
+		BillingID:     cl.BillingID,
+		RequestID:     cl.RequestID,
+		SessionID:     cl.SessionID,
+		Model:         cl.Model,
+		Status:        cl.Status,
+		RespKind:      cl.RespKind,
+		ErrorMessage:  cl.ErrorMessage,
+		DurationMs:    cl.DurationMs,
+		FirstTokenMs:  cl.FirstTokenMs,
+		CallTime:      cl.CreatedAt.Format(time.RFC3339),
+		ReqMessages:   reqMsgs,
+		RespBody:      cl.RespBody,
+		Decision:      decision,
+		UpstreamUsage: upstreamUsage,
+		PricingMode:   cl.PricingMode,
 	}
 }
 
-// 五段 token 的展示名与取值。
+// 三段 token 的展示名与取值（口径见 billing.Usage：输入为纯输入、输出含推理，三段互斥）。
 var rateFields = []struct {
 	Key   string
 	Label string
 	get   func(*billing.Usage) int64
 }{
-	{"input", "输入", func(u *billing.Usage) int64 {
-		// 输入口径与计费公式一致：(Input - CacheRead) 按输入价，缓存命中部分由「缓存读」行单独按 cache_read 价计。
-		nonCached := u.Input - u.CacheRead
-		if nonCached < 0 {
-			return 0
-		}
-		return nonCached
-	}},
+	{"input", "输入", func(u *billing.Usage) int64 { return u.Input }},
 	{"output", "输出", func(u *billing.Usage) int64 { return u.Output }},
 	{"cache_read", "缓存读", func(u *billing.Usage) int64 { return u.CacheRead }},
-	{"cache_write", "缓存写", func(u *billing.Usage) int64 { return u.CacheWrite }},
-	{"reasoning", "推理", func(u *billing.Usage) int64 { return u.Reasoning }},
 }
 
 // buildBreakdown 由 billing.Record 组装三步拆解。金额依次 Round5。
 func buildBreakdown(rec *billing.Record) ([]Step, *RouteDiff) {
 	// 步骤一：Token × 单价
-	line1 := make([]Line, 0, 5)
+	line1 := make([]Line, 0, 3)
 	sub1 := 0.0
 	for _, f := range rateFields {
 		tok := f.get(&rec.Tokens)

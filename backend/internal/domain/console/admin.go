@@ -107,7 +107,7 @@ func (h *Admin) attachCallLog(ctx context.Context, bid string) *CallLogView {
 // ===== 账单查询 =====
 
 // billingListItem 账单列表项（user_id 仅内部传参用，前端展示一律用 Username）。
-// Tokens 为五段用量；Rates/CoeffTime/CoeffContext/RValue 供前端悬停展示计费公式。
+// Tokens 为三段用量（输入/缓存读/输出）；Rates/CoeffTime/CoeffContext/RValue 供前端悬停展示计费公式。
 // Tokens/Rates 对外为 PascalCase 视图（billing.WireUsage/WireRates），存储仍为 snake（JSONB 契约）。
 type billingListItem struct {
 	BillingID       string            `json:"BillingID"`
@@ -562,10 +562,10 @@ func (h *Admin) readBillingConfigRaw(ctx context.Context) (map[string]json.RawMe
 	if err != nil {
 		return nil, err
 	}
-	// 路由成本比较样值（routing.cost_sample）：旧库未初始化时回退内置默认，保证前端可展示与保存。
+	// 路由成本比较样值（routing.cost_sample，三段口径）：旧库未初始化时回退内置默认，保证前端可展示与保存。
 	sampleRaw, err := h.billing.GetConfig(ctx, "routing.cost_sample")
 	if err != nil {
-		sampleRaw = json.RawMessage(`{"input":10000,"cache_read":9000,"cache_write":0,"output":1000,"reasoning":500}`)
+		sampleRaw = json.RawMessage(`{"input":10000,"cache_read":9000,"output":1000}`)
 	}
 	// credit_value 由 r 派生（R / 1e6，每积分对应人民币元），不落库，解析失败时回退 0。
 	creditV, _ := creditValueFromRaw(rRaw)
@@ -881,14 +881,14 @@ type sessionListItem struct {
 	// 实时状态
 	Inflight     int     `json:"Inflight"`     // 进行中请求数（>0 表示正在请求）
 	Calls        int64   `json:"Calls"`        // 总调用次数
-	Tokens       int64   `json:"Tokens"`       // 总消耗 Token（四段求和口径）
+	Tokens       int64   `json:"Tokens"`       // 总消耗 Token（三段求和口径：输入+缓存读+输出）
 	Credits      float64 `json:"Credits"`      // 总消耗积分
 	ContextLen   int64   `json:"ContextLen"`   // 上下文长度（最近一次请求的输入 Token 数）
 	RPM          float64 `json:"RPM"`          // 近 5 分钟每分钟请求数
 	TPM          float64 `json:"TPM"`          // 近 5 分钟每分钟 Token 数
 	UserMsgs     int64   `json:"UserMsgs"`     // 用户消息次数
 	ToolCalls    int64   `json:"ToolCalls"`    // 工具调用次数
-	CacheHitRate float64 `json:"CacheHitRate"` // 缓存命中率（缓存读 ÷ 输入，0~1）
+	CacheHitRate float64 `json:"CacheHitRate"` // 缓存命中率（缓存读 ÷ 总输入(输入+缓存读)，0~1）
 }
 
 // sessionListCols 会话列表查询列（与 router.sessionCols 对齐；token_id 可空单独处理）。
@@ -1215,11 +1215,11 @@ const sessionStatsWindow = 5 * time.Minute
 // sessionRuntime 会话实时聚合（按 session_id 汇总；来源 billing_records 与 call_logs）。
 type sessionRuntime struct {
 	Calls       int64   // 总调用次数
-	Tokens      int64   // 总消耗 Token（输入+输出+缓存写+推理；缓存读已含于输入，不重复计）
+	Tokens      int64   // 总消耗 Token（输入+缓存读+输出，三段互斥直接求和）
 	Credits     float64 // 总消耗积分
-	InputTokens int64   // 输入(含缓存读)总量
+	InputTokens int64   // 纯输入总量（不含缓存读）
 	CacheRead   int64   // 缓存读命中量
-	ContextLen  int64   // 最近一次请求的输入 Token 数（当前上下文规模）
+	ContextLen  int64   // 最近一次请求的总输入 Token 数（输入+缓存读，即当前上下文规模）
 	WinCalls    int64   // 窗口内调用次数
 	WinTokens   int64   // 窗口内 Token 数
 	UserMsgs    int64   // 用户消息次数
@@ -1236,12 +1236,13 @@ func (r sessionRuntime) TPM() float64 {
 	return float64(r.WinTokens) / sessionStatsWindow.Minutes()
 }
 
-// CacheHitRate 缓存命中率 = 缓存读 ÷ 输入(含缓存读)；无输入返回 0。
+// CacheHitRate 缓存命中率 = 缓存读 ÷ 总输入(输入+缓存读)；无输入返回 0。
 func (r sessionRuntime) CacheHitRate() float64 {
-	if r.InputTokens <= 0 {
+	totalIn := r.InputTokens + r.CacheRead
+	if totalIn <= 0 {
 		return 0
 	}
-	return float64(r.CacheRead) / float64(r.InputTokens)
+	return float64(r.CacheRead) / float64(totalIn)
 }
 
 // sessionRuntimes 批量聚合会话实时状态：billing_records（次数/Token/积分/上下文/窗口速率）
@@ -1258,17 +1259,15 @@ SELECT session_id,
        COALESCE(sum(credits_consumed), 0),
        COALESCE(sum(
            COALESCE(NULLIF(tokens->>'input','')::bigint, 0) +
-           COALESCE(NULLIF(tokens->>'output','')::bigint, 0) +
-           COALESCE(NULLIF(tokens->>'cache_write','')::bigint, 0) +
-           COALESCE(NULLIF(tokens->>'reasoning','')::bigint, 0)), 0),
+           COALESCE(NULLIF(tokens->>'cache_read','')::bigint, 0) +
+           COALESCE(NULLIF(tokens->>'output','')::bigint, 0)), 0),
        COALESCE(sum(COALESCE(NULLIF(tokens->>'input','')::bigint, 0)), 0),
        COALESCE(sum(COALESCE(NULLIF(tokens->>'cache_read','')::bigint, 0)), 0),
        COALESCE(count(*) FILTER (WHERE call_time >= $2), 0),
        COALESCE(sum(
            COALESCE(NULLIF(tokens->>'input','')::bigint, 0) +
-           COALESCE(NULLIF(tokens->>'output','')::bigint, 0) +
-           COALESCE(NULLIF(tokens->>'cache_write','')::bigint, 0) +
-           COALESCE(NULLIF(tokens->>'reasoning','')::bigint, 0)) FILTER (WHERE call_time >= $2), 0)
+           COALESCE(NULLIF(tokens->>'cache_read','')::bigint, 0) +
+           COALESCE(NULLIF(tokens->>'output','')::bigint, 0)) FILTER (WHERE call_time >= $2), 0)
 FROM billing_records
 WHERE session_id = ANY($1)
 GROUP BY session_id`, ids, windowStart)
@@ -1284,9 +1283,10 @@ GROUP BY session_id`, ids, windowStart)
 			out[sid] = rt
 		}
 	}
-	// 上下文长度：最近一次请求的输入 Token 数（DISTINCT ON 取每会话最新一行）。
+	// 上下文长度：最近一次请求的总输入 Token 数（输入 + 缓存读，三段口径下二者互斥）。
 	crows, err := db.QueryContext(ctx, `
-SELECT DISTINCT ON (session_id) session_id, COALESCE(NULLIF(tokens->>'input','')::bigint, 0)
+SELECT DISTINCT ON (session_id) session_id,
+       COALESCE(NULLIF(tokens->>'input','')::bigint, 0) + COALESCE(NULLIF(tokens->>'cache_read','')::bigint, 0)
 FROM billing_records
 WHERE session_id = ANY($1)
 ORDER BY session_id, call_time DESC, id DESC`, ids)

@@ -103,7 +103,7 @@ export interface MeSummary {
   MonthCredits: number
   RPM: number
   TPM: number
-  InputTokens: number // 本月输入(含缓存读)
+  InputTokens: number // 本月纯输入（不含缓存读）
   CacheReadTokens: number // 本月缓存读命中
 }
 

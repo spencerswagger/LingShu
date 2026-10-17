@@ -134,6 +134,59 @@ func TestProbeChain_DrainToHealthy(t *testing.T) {
 	}
 }
 
+// TestDoProbe_UsageThreeSegments 探测 usage 归一化为三段（与 billing.Usage 一致）：
+// OpenAI 兼容的 prompt_tokens 是「含」口径，命中缓存 token 必须从输入中剔除；
+// DeepSeek 原生顶层 prompt_cache_hit_tokens 作为兜底；total_tokens 采用上游值。
+func TestDoProbe_UsageThreeSegments(t *testing.T) {
+	t.Run("openai-cached", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"usage":{"prompt_tokens":100,"completion_tokens":50,"total_tokens":150,"prompt_tokens_details":{"cached_tokens":20}}}`))
+		}))
+		defer srv.Close()
+
+		m := newProbeTestManager()
+		_, usage, errMsg := m.doProbeAuth(context.Background(), srv.URL+"/chat/completions", "Authorization", "Bearer key", "m1", 2*time.Second)
+		if errMsg != "" {
+			t.Fatalf("unexpected error: %s", errMsg)
+		}
+		// 输入 = 100 − 20 = 80（纯输入）；缓存读 20；输出 50；total 取上游 150 = 80+20+50。
+		if usage.InputTokens != 80 || usage.CachedTokens != 20 || usage.OutputTokens != 50 || usage.TotalTokens != 150 {
+			t.Fatalf("三段归一化错误: %+v", usage)
+		}
+	})
+	t.Run("deepseek-native", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"usage":{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120,"prompt_cache_hit_tokens":80}}`))
+		}))
+		defer srv.Close()
+
+		m := newProbeTestManager()
+		_, usage, errMsg := m.doProbeAuth(context.Background(), srv.URL+"/chat/completions", "Authorization", "Bearer key", "m1", 2*time.Second)
+		if errMsg != "" {
+			t.Fatalf("unexpected error: %s", errMsg)
+		}
+		if usage.InputTokens != 20 || usage.CachedTokens != 80 || usage.OutputTokens != 20 || usage.TotalTokens != 120 {
+			t.Fatalf("DeepSeek 原生兜底归一化错误: %+v", usage)
+		}
+	})
+	t.Run("total-missing-fallback", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"usage":{"prompt_tokens":10,"completion_tokens":5}}`))
+		}))
+		defer srv.Close()
+
+		m := newProbeTestManager()
+		_, usage, _ := m.doProbeAuth(context.Background(), srv.URL+"/chat/completions", "Authorization", "Bearer key", "m1", 2*time.Second)
+		// 上游未给 total_tokens → 按三段求和兜底 = 10 + 0 + 5 = 15。
+		if usage.InputTokens != 10 || usage.TotalTokens != 15 {
+			t.Fatalf("total 兜底错误: %+v", usage)
+		}
+	})
+}
+
 // insertProbeLogSQL 是 InsertProbeLog 的落库 SQL（密钥维度 channel_key_id，与 0001_init.sql 对齐）。
 const insertProbeLogSQL = `INSERT INTO probe_logs(id, channel_key_id, model_id, level, target, ok, error, input_tokens, output_tokens, cached_tokens, total_tokens, duration_ms)
 		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`

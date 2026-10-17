@@ -250,14 +250,14 @@ func (f *fakeChannelModel) GetByChannelAndInternal(_ context.Context, _ int64, _
 var testExternalModel = &model.ExternalModel{
 	ExternalName: "gpt-4",
 	Enabled:      true,
-	SaleRates:    billing.Rates{"input": 1.0, "output": 2.0, "cache_read": 0.25, "cache_write": 1.5, "reasoning": 4.0},
+	SaleRates:    billing.Rates{"input": 1.0, "output": 2.0, "cache_read": 0.25},
 }
 
 var testChannelModel = &channel.ChannelModel{
 	ChannelID:       1,
 	InternalModelID: "gpt-4-internal",
 	ExternalModelID: 1,
-	CostRates:       billing.Rates{"input": 0.5, "output": 1.0, "cache_read": 0.1, "cache_write": 0.8, "reasoning": 2.0},
+	CostRates:       billing.Rates{"input": 0.5, "output": 1.0, "cache_read": 0.1},
 }
 
 type harness struct {

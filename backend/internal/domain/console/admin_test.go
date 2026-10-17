@@ -1,6 +1,7 @@
 package console
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -273,21 +274,20 @@ func systemConfigPayload(t *testing.T, rec *httptest.ResponseRecorder) (billing,
 	return body.Data["Billing"], body.Data["SessionExpiration"], body.Data["UpstreamResponseHeaderWhitelist"]
 }
 
-// costSampleFromBilling 从 Billing 原文中解析路由成本比较样值。
-func costSampleFromBilling(t *testing.T, billing json.RawMessage) (input, cacheRead, output, reasoning int64) {
+// costSampleFromBilling 从 Billing 原文中解析路由成本比较样值（三段口径：input/cache_read/output）。
+func costSampleFromBilling(t *testing.T, billing json.RawMessage) (input, cacheRead, output int64) {
 	t.Helper()
 	var b struct {
 		CostSample struct {
 			Input     int64 `json:"input"`
 			CacheRead int64 `json:"cache_read"`
 			Output    int64 `json:"output"`
-			Reasoning int64 `json:"reasoning"`
 		} `json:"CostSample"`
 	}
 	if err := json.Unmarshal(billing, &b); err != nil {
 		t.Fatalf("unmarshal Billing: %v", err)
 	}
-	return b.CostSample.Input, b.CostSample.CacheRead, b.CostSample.Output, b.CostSample.Reasoning
+	return b.CostSample.Input, b.CostSample.CacheRead, b.CostSample.Output
 }
 
 // sessionExpirationView 会话过期配置的断言视图。
@@ -317,7 +317,7 @@ func TestHandleGetSystemConfig_ReturnsAllGroups(t *testing.T) {
 	expectConfigRow(mock, "billing.context_tiers", []byte(`[]`))
 	expectConfigRow(mock, "billing.time_config", []byte(`{"timezone":"Asia/Shanghai","default_coeff":1.0}`))
 	expectConfigRow(mock, "routing.cost_sample",
-		[]byte(`{"input":10000,"cache_read":9000,"output":1000,"reasoning":500}`))
+		[]byte(`{"input":10000,"cache_read":9000,"output":1000}`))
 	expectConfigRow(mock, "session.expiration",
 		[]byte(`{"default_ttl_minutes":7,"context_tiers":[{"max_tokens":1000,"ttl_minutes":3}],"turn_tiers":[{"max_turns":3,"ttl_minutes":9}]}`))
 	expectConfigRow(mock, "gateway.upstream_response_header_whitelist", []byte(`["traceparent"]`))
@@ -329,9 +329,12 @@ func TestHandleGetSystemConfig_ReturnsAllGroups(t *testing.T) {
 		t.Fatalf("status=%d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
 	billingRaw, sessionRaw, whitelistRaw := systemConfigPayload(t, rec)
-	in, cr, out, re := costSampleFromBilling(t, billingRaw)
-	if in != 10000 || cr != 9000 || out != 1000 || re != 500 {
-		t.Fatalf("CostSample=%d/%d/%d/%d, want 10000/9000/1000/500", in, cr, out, re)
+	in, cr, out := costSampleFromBilling(t, billingRaw)
+	if in != 10000 || cr != 9000 || out != 1000 {
+		t.Fatalf("CostSample=%d/%d/%d, want 10000/9000/1000（三段口径）", in, cr, out)
+	}
+	if bytes.Contains(billingRaw, []byte(`"reasoning"`)) || bytes.Contains(billingRaw, []byte(`"cache_write"`)) {
+		t.Fatalf("CostSample 不应含废弃键 reasoning/cache_write: %s", billingRaw)
 	}
 	var se sessionExpirationView
 	if err := json.Unmarshal(sessionRaw, &se); err != nil {
@@ -376,9 +379,12 @@ func TestHandleGetSystemConfig_Fallbacks(t *testing.T) {
 		t.Fatalf("status=%d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
 	billingRaw, sessionRaw, whitelistRaw := systemConfigPayload(t, rec)
-	in, cr, out, re := costSampleFromBilling(t, billingRaw)
-	if in != 10000 || cr != 9000 || out != 1000 || re != 500 {
-		t.Fatalf("回退样值=%d/%d/%d/%d, want 10000/9000/1000/500", in, cr, out, re)
+	in, cr, out := costSampleFromBilling(t, billingRaw)
+	if in != 10000 || cr != 9000 || out != 1000 {
+		t.Fatalf("回退样值=%d/%d/%d, want 10000/9000/1000（三段口径）", in, cr, out)
+	}
+	if bytes.Contains(billingRaw, []byte(`"reasoning"`)) || bytes.Contains(billingRaw, []byte(`"cache_write"`)) {
+		t.Fatalf("回退样值不应含废弃键 reasoning/cache_write: %s", billingRaw)
 	}
 	var se sessionExpirationView
 	if err := json.Unmarshal(sessionRaw, &se); err != nil {
@@ -416,7 +422,7 @@ func TestHandlePutSystemConfig_RoundTrip(t *testing.T) {
 
 	body := `{"Billing":{"R":10000,"CnyRate":6.8,"ContextTiers":[],` +
 		`"TimeConfig":{"Timezone":"Asia/Shanghai","Default":1},` +
-		`"CostSample":{"input":12345,"cache_read":6000,"output":2000,"reasoning":300}},` +
+		`"CostSample":{"input":12345,"cache_read":6000,"output":2000}},` +
 		`"SessionExpiration":{"default_ttl_minutes":5,` +
 		`"context_tiers":[{"max_tokens":2000,"ttl_minutes":5}],` +
 		`"turn_tiers":[{"max_turns":2,"ttl_minutes":5}]},` +
@@ -474,7 +480,7 @@ func TestValidCostSample(t *testing.T) {
 		raw  string
 		want bool
 	}{
-		{`{"input":10000,"cache_read":9000,"output":1000,"reasoning":500}`, true},
+		{`{"input":10000,"cache_read":9000,"output":1000}`, true},
 		{`{"input":0}`, true},
 		{`{}`, true},
 		{`{"input":-1}`, false},
