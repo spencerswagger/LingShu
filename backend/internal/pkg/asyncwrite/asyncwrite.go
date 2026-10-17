@@ -39,6 +39,9 @@ const (
 	// 去重仅为「进程内至多一次」的性能优化，正确性由 DB 侧唯一约束（如账单 billing_id、
 	// 事件主键的 ON CONFLICT）兜底，故允许有界淘汰导致极少数重复执行，但不允许无界增长。
 	defaultIdemMaxEntries = 100000
+	// statsLogInterval 运行期统计（Dropped/Retried）周期日志间隔。
+	// 仅在计数发生变化时输出，开销可忽略；使「绝不静默丢弃」契约在生产中可观测（P2-6）。
+	statsLogInterval = 30 * time.Second
 )
 
 // ErrBackpressure 表示队列背压超时：任务已写入 WAL（若启用）但未能入队。
@@ -462,16 +465,28 @@ func (w *Writer) replayRecovered(ctx context.Context) {
 }
 
 // commitLoop 周期性触发组提交，并在累积记录达到 MaxBatch 时立即提交。
+// 同时按 statsLogInterval 周期输出运行统计（仅在 Dropped/Retried 变化时），
+// 让「绝不静默丢弃」在生产中可观测（P2-6）。
 func (w *Writer) commitLoop(ctx context.Context) {
 	defer w.wg.Done()
 	t := time.NewTicker(w.cfg.FSyncInterval)
 	defer t.Stop()
+	statsT := time.NewTicker(statsLogInterval)
+	defer statsT.Stop()
+	var lastDropped, lastRetried int64
 	for {
 		select {
 		case <-t.C:
 			w.commit(false)
 		case <-w.commitCh:
 			w.commit(false)
+		case <-statsT.C:
+			dropped, retried := w.dropped.Load(), w.retried.Load()
+			if dropped != lastDropped || retried != lastRetried {
+				logger.Fallback().Warn("asyncwrite: 运行统计",
+					"dropped", dropped, "retried", retried, "depth", w.depth.Load())
+				lastDropped, lastRetried = dropped, retried
+			}
 		case <-w.stopCh:
 			return
 		case <-ctx.Done():

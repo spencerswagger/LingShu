@@ -944,8 +944,10 @@ func TestConfigProvider_R_TiersCache_ZeroDBAndInvalidate(t *testing.T) {
 func TestConfigProvider_SetCacheEnabled_OffAlwaysReadsDB(t *testing.T) {
 	src := &countingSource{
 		data: map[string][]byte{
-			cfgR:     []byte(`10000`),
-			cfgTiers: []byte(`[]`),
+			cfgR:          []byte(`10000`),
+			cfgTiers:      []byte(`[]`),
+			cfgTimeConfig: []byte(`{"Timezone":"UTC","Default":1}`),
+			cfgCostSample: []byte(`{"input":1}`),
 		},
 		calls: map[string]int{},
 	}
@@ -959,9 +961,17 @@ func TestConfigProvider_SetCacheEnabled_OffAlwaysReadsDB(t *testing.T) {
 		if _, err := p.ContextTiers(); err != nil {
 			t.Fatalf("ContextTiers: %v", err)
 		}
+		if _, err := p.TimeConfig(); err != nil {
+			t.Fatalf("TimeConfig: %v", err)
+		}
+		if _, err := p.SampleUsage(); err != nil {
+			t.Fatalf("SampleUsage: %v", err)
+		}
 	}
-	if src.calls[cfgR] != 3 || src.calls[cfgTiers] != 3 {
-		t.Fatalf("关闭缓存应每次直查，got r=%d tiers=%d", src.calls[cfgR], src.calls[cfgTiers])
+	if src.calls[cfgR] != 3 || src.calls[cfgTiers] != 3 ||
+		src.calls[cfgTimeConfig] != 3 || src.calls[cfgCostSample] != 3 {
+		t.Fatalf("关闭缓存应每次直查，got r=%d tiers=%d time=%d sample=%d",
+			src.calls[cfgR], src.calls[cfgTiers], src.calls[cfgTimeConfig], src.calls[cfgCostSample])
 	}
 }
 

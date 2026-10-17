@@ -685,12 +685,15 @@ func (p *defaultConfigProvider) ContextTiers() ([]TierRule, error) {
 }
 
 // TimeConfig 读取 billing.time_config（带内存缓存，见 defaultConfigProvider 缓存说明）。
+// cacheOff 时读写缓存均跳过（与 R/ContextTiers 一致），退回直查 DB。
 func (p *defaultConfigProvider) TimeConfig() (TimeCoeffConfig, error) {
-	p.mu.RLock()
-	cached := p.timeCfg
-	p.mu.RUnlock()
-	if cached != nil {
-		return *cached, nil
+	if !p.cacheOff {
+		p.mu.RLock()
+		cached := p.timeCfg
+		p.mu.RUnlock()
+		if cached != nil {
+			return *cached, nil
+		}
 	}
 
 	raw, err := p.src.GetConfig(context.Background(), cfgTimeConfig)
@@ -703,21 +706,26 @@ func (p *defaultConfigProvider) TimeConfig() (TimeCoeffConfig, error) {
 		return TimeCoeffConfig{}, fmt.Errorf("解析 time_config: %w", err)
 	}
 
-	p.mu.Lock()
-	p.timeCfg = &tc
-	p.mu.Unlock()
+	if !p.cacheOff {
+		p.mu.Lock()
+		p.timeCfg = &tc
+		p.mu.Unlock()
+	}
 	return tc, nil
 }
 
 // SampleUsage 读取 routing.cost_sample（路由成本比较样值用量，带内存缓存）。
 // JSON 键与 Usage 一致（input/output/cache_read，三段口径）；未提供的段按 0 处理。
 // 该值仅用于新会话创建时的成本比较，不参与实际计费。
+// cacheOff 时读写缓存均跳过（与 R/ContextTiers 一致），退回直查 DB。
 func (p *defaultConfigProvider) SampleUsage() (Usage, error) {
-	p.mu.RLock()
-	cached := p.sample
-	p.mu.RUnlock()
-	if cached != nil {
-		return *cached, nil
+	if !p.cacheOff {
+		p.mu.RLock()
+		cached := p.sample
+		p.mu.RUnlock()
+		if cached != nil {
+			return *cached, nil
+		}
 	}
 
 	raw, err := p.src.GetConfig(context.Background(), cfgCostSample)
@@ -729,9 +737,11 @@ func (p *defaultConfigProvider) SampleUsage() (Usage, error) {
 		return Usage{}, fmt.Errorf("解析 routing.cost_sample: %w", err)
 	}
 
-	p.mu.Lock()
-	p.sample = &u
-	p.mu.Unlock()
+	if !p.cacheOff {
+		p.mu.Lock()
+		p.sample = &u
+		p.mu.Unlock()
+	}
 	return u, nil
 }
 

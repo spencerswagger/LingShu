@@ -115,7 +115,8 @@ func (s *Store) cacheExternalName(name string, m *ExternalModel) {
 }
 
 // evictExternalNamesLocked 当缓存条目超过上限时按插入顺序 FIFO 淘汰最早条目（调用方须持有写锁）。
-// extNameOrder 可能含被失效删除的陈旧键（弹到时跳过即可），但每个存活键必有对应表项，故必然收敛。
+// 由于 invalidateExternalName 已同步摘除被失效键，extNameOrder 与 extNameCache 保持一致：
+// 每个存活键在顺序表中恰好出现一次，因此这里弹出的最早键必为有效条目。
 func (s *Store) evictExternalNamesLocked() {
 	if s.extNameMax <= 0 {
 		return
@@ -128,10 +129,28 @@ func (s *Store) evictExternalNamesLocked() {
 }
 
 // invalidateExternalName 失效单个对外名称的缓存（写入后调用）。
+// 除删除映射项外，还须同步从 extNameOrder 中摘除该名，否则「失效 → 回填」反复发生会使
+// 顺序表无界增长（陈旧键只增不减），最终虽不影响正确性却造成内存缓漏（P2-2）。
 func (s *Store) invalidateExternalName(name string) {
 	s.extNameMu.Lock()
 	delete(s.extNameCache, name)
+	s.removeExternalNameFromOrderLocked(name)
 	s.extNameMu.Unlock()
+}
+
+// removeExternalNameFromOrderLocked 从 FIFO 顺序表中摘除指定名（调用方须持有写锁）。
+// invalidateExternalName 为写路径低频调用，此处 O(n) 原地压缩可接受，换取顺序表与映射的严格一致。
+func (s *Store) removeExternalNameFromOrderLocked(name string) {
+	if len(s.extNameOrder) == 0 {
+		return
+	}
+	kept := s.extNameOrder[:0]
+	for _, n := range s.extNameOrder {
+		if n != name {
+			kept = append(kept, n)
+		}
+	}
+	s.extNameOrder = kept
 }
 
 // invalidateAllExternalNames 清空全部对外名称缓存（缺少旧名信息时使用，如改名/批量删除）。
@@ -142,8 +161,13 @@ func (s *Store) invalidateAllExternalNames() {
 	s.extNameMu.Unlock()
 }
 
-// cloneExternal 返回 ExternalModel 的防御性浅拷贝（并复制 SaleRates/ContextTiers 可变容器），
-// 避免缓存内部快照被外部消费方就地修改而污染缓存（P2-7）。
+// cloneExternal 返回 ExternalModel 的防御性深拷贝，避免缓存内部快照被外部消费方就地修改而污染缓存（P2-7/P2-4）。
+// 拷贝深度说明：
+//   - 值字段（含 *billing.TimeCoeffConfig 结构体本体）按值复制；
+//   - SaleRates map 复制为独立 map；
+//   - ContextTiers 每个 TierRule 按值复制，且 Max *int64 解引用后重新取址，避免共享同一指针；
+//   - TimeConfig.Periodic / Overrides 及其内层 Segments / Weekdays 切片均重新分配，
+//     保证消费者修改任一嵌套切片元素都不会回写缓存快照。
 func cloneExternal(m *ExternalModel) *ExternalModel {
 	if m == nil {
 		return nil
@@ -156,13 +180,53 @@ func cloneExternal(m *ExternalModel) *ExternalModel {
 		}
 	}
 	if m.ContextTiers != nil {
-		c.ContextTiers = append([]billing.TierRule(nil), m.ContextTiers...)
+		c.ContextTiers = make([]billing.TierRule, len(m.ContextTiers))
+		for i, t := range m.ContextTiers {
+			ct := t
+			if t.Max != nil {
+				v := *t.Max
+				ct.Max = &v
+			}
+			c.ContextTiers[i] = ct
+		}
 	}
 	if m.TimeConfig != nil {
 		tc := *m.TimeConfig
+		tc.Periodic = cloneSegments(m.TimeConfig.Periodic)
+		tc.Overrides = cloneOverrides(m.TimeConfig.Overrides)
 		c.TimeConfig = &tc
 	}
 	return &c
+}
+
+// cloneSegments 深拷贝时段切片（含 Weekdays 内层切片），nil 保持为 nil。
+func cloneSegments(in []billing.Segment) []billing.Segment {
+	if in == nil {
+		return nil
+	}
+	out := make([]billing.Segment, len(in))
+	for i, s := range in {
+		cs := s
+		if s.Weekdays != nil {
+			cs.Weekdays = append([]time.Weekday(nil), s.Weekdays...)
+		}
+		out[i] = cs
+	}
+	return out
+}
+
+// cloneOverrides 深拷贝日期覆盖切片（含每个覆盖项内层 Segments），nil 保持为 nil。
+func cloneOverrides(in []billing.DateOverride) []billing.DateOverride {
+	if in == nil {
+		return nil
+	}
+	out := make([]billing.DateOverride, len(in))
+	for i, o := range in {
+		co := o
+		co.Segments = cloneSegments(o.Segments)
+		out[i] = co
+	}
+	return out
 }
 
 // GetByID 按主键查询；不存在返回 sql.ErrNoRows。

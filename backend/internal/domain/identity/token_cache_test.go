@@ -165,6 +165,55 @@ func TestTokenCache_EvictionBound(t *testing.T) {
 	}
 }
 
+// TestTokenCache_DefensiveCopy 锁定 P2-5：get/put 深拷贝指针字段（TagID/ExpiresAt/LastUsedAt），
+// 缓存与调用方互不共享指针地址，任一方写 *ptr 都不得污染另一方。
+func TestTokenCache_DefensiveCopy(t *testing.T) {
+	svc := NewTokenService(nil)
+	c := svc.cache
+
+	tagID := int64(11)
+	exp := time.Now().Add(time.Hour)
+	last := time.Now().Add(-time.Minute)
+	// 先快照期望值：下方对 *tok 指针字段的写入会连带改写 tagID/exp/last 本身。
+	wantTag, wantExp, wantLast := tagID, exp, last
+	tok := &Token{
+		ID: 1, TokenHash: "h", UserID: 7, Status: StatusTokenActive,
+		TagID: &tagID, ExpiresAt: &exp, LastUsedAt: &last,
+	}
+	c.put("h", tok, StatusActive)
+
+	// 调用方修改自己持有的 Token 指针字段 → 缓存不受影响。
+	*tok.TagID = 99
+	*tok.ExpiresAt = exp.Add(48 * time.Hour)
+	*tok.LastUsedAt = time.Now()
+
+	got, ok := c.get("h")
+	if !ok {
+		t.Fatal("应命中缓存")
+	}
+	if *got.TagID != wantTag {
+		t.Fatalf("put 未深拷贝：TagID=%d", *got.TagID)
+	}
+	if !got.ExpiresAt.Equal(wantExp) {
+		t.Fatalf("put 未深拷贝：ExpiresAt=%v", *got.ExpiresAt)
+	}
+	if !got.LastUsedAt.Equal(wantLast) {
+		t.Fatalf("put 未深拷贝：LastUsedAt=%v", *got.LastUsedAt)
+	}
+
+	// 调用方修改 get 返回值的指针字段 → 缓存不受影响。
+	*got.TagID = 1234
+	*got.ExpiresAt = wantExp.Add(72 * time.Hour)
+
+	got2, ok := c.get("h")
+	if !ok {
+		t.Fatal("应再次命中缓存")
+	}
+	if *got2.TagID != wantTag || !got2.ExpiresAt.Equal(wantExp) {
+		t.Fatalf("get 未深拷贝：TagID=%d ExpiresAt=%v", *got2.TagID, *got2.ExpiresAt)
+	}
+}
+
 // TestTokenInvalidate_WritePaths：令牌域每条写路径写入后，受影响的缓存项必须「立即」失效。
 func TestTokenInvalidate_WritePaths(t *testing.T) {
 	ctx := context.Background()

@@ -588,3 +588,26 @@ func TestService_MembersCacheBounded(t *testing.T) {
 		t.Fatalf("membersCache 应有界（<=8），got %d", got)
 	}
 }
+
+// TestService_ResolveMembers_DefensiveCopy 锁定 P2-3：缓存命中返回的成员切片为副本，
+// 调用方就地修改不得污染缓存（再次解析应仍返回原始成员）。
+func TestService_ResolveMembers_DefensiveCopy(t *testing.T) {
+	s := NewService(nil)
+	s.cacheResolvedMembers("auto1\x00", []Member{{ExternalModelID: 10, ExternalName: "a"}}, true)
+
+	first, isAuto, err := s.ResolveMembers(context.Background(), "auto1", nil)
+	if err != nil || !isAuto {
+		t.Fatalf("resolve: err=%v isAuto=%v", err, isAuto)
+	}
+	// 就地篡改返回值。
+	first[0].ExternalModelID = 999
+	first[0].ExternalName = "mutated"
+
+	second, isAuto, err := s.ResolveMembers(context.Background(), "auto1", nil)
+	if err != nil || !isAuto {
+		t.Fatalf("resolve2: err=%v isAuto=%v", err, isAuto)
+	}
+	if second[0].ExternalModelID != 10 || second[0].ExternalName != "a" {
+		t.Fatalf("缓存被返回值修改污染：%+v", second[0])
+	}
+}
