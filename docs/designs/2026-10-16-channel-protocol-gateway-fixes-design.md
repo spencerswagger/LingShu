@@ -16,7 +16,7 @@ created_at: 2026-10-16
 intent: 修复渠道协议（channel_protocols）配置网关的 5 类可用性/一致性问题，使协议可编辑、可承载完整模型配置、可物化为渠道模型，并让请求头策略在协议变更后即时生效。
 constraints:
   - 不破坏既有 openai-compat 主链路与既有单测（go test ./... 必须绿）。
-  - 不改动计费五段公式与 usage 归一化。
+  - 不改动计费公式本身；usage 口径已统一为三段（见 .claude/artifacts/designs/channel-protocol.md AC-16），本设计不涉及该口径变更。
   - channel_protocols 表结构与 segment 兼容：models JSONB 只做向后兼容的字段扩展。
   - 迁移单向新增，不改现有列语义。
   - 前端沿用现有 Element Plus + 组件范式（ModelPricing / ModelPriceCatalog / KvpEditor 等）。

@@ -337,7 +337,7 @@ func TestRecord_CostMode_RecordsCostCredits(t *testing.T) {
 
 	usage := Usage{Input: 1000}
 	saleRates := fullRates()
-	costRates := Rates{"input": 0.8, "output": 0.16, "cache_read": 0.05, "cache_write": 0.2, "reasoning": 0.8}
+	costRates := Rates{"input": 0.8, "output": 0.16, "cache_read": 0.05}
 	credits, err := ComputeCredits(usage, saleRates, 1.0, 1.0, 10000)
 	if err != nil {
 		t.Fatalf("compute: %v", err)
@@ -391,7 +391,7 @@ func TestRecord_SaleMode_CostCreditsDistinctFromCredits(t *testing.T) {
 
 	usage := Usage{Input: 1000}
 	saleRates := fullRates()
-	costRates := Rates{"input": 0.8, "output": 0.16, "cache_read": 0.05, "cache_write": 0.2, "reasoning": 0.8}
+	costRates := Rates{"input": 0.8, "output": 0.16, "cache_read": 0.05}
 	credits, err := ComputeCredits(usage, saleRates, 1.0, 1.0, 10000)
 	if err != nil {
 		t.Fatalf("compute: %v", err)
@@ -779,13 +779,13 @@ func TestConfigProvider_CnyRate(t *testing.T) {
 // TestConfigProvider_SampleUsage 验证 routing.cost_sample 的解析：正常样值、缺失键、非法 JSON。
 func TestConfigProvider_SampleUsage(t *testing.T) {
 	p := &defaultConfigProvider{src: staticSource{
-		cfgCostSample: []byte(`{"input":10000,"cache_read":9000,"output":1000,"reasoning":500}`),
+		cfgCostSample: []byte(`{"input":10000,"cache_read":9000,"output":1000}`),
 	}}
 	got, err := p.SampleUsage()
 	if err != nil {
 		t.Fatalf("SampleUsage err=%v", err)
 	}
-	want := Usage{Input: 10000, CacheRead: 9000, Output: 1000, Reasoning: 500}
+	want := Usage{Input: 10000, CacheRead: 9000, Output: 1000}
 	if got != want {
 		t.Fatalf("SampleUsage=%+v, want %+v", got, want)
 	}

@@ -883,8 +883,10 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 				retry: true, reason: "构建上游请求失败：" + err.Error(), sessionID: sessionID, durationMs: *msSince(start)})
 		g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, channel.Feedback{IsSuccess: false, Now: g.now()})
 		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "构建上游请求失败", msSince(start))
+		// 网关侧失败（未发出上游调用）：resp_body 留空，原因只落 error_message 与决策轨迹，
+		// 避免「请求增量/响应/决策原因」三处都是同一句文案。
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-			"error", "构建上游请求失败", "failed", "构建上游请求失败", msSince(start), nil, g.callLogDecision(attempts, "上游请求构建失败", pc, routeRes))
+			"error", "", "failed", "构建上游请求失败", msSince(start), nil, g.callLogDecision(attempts, "上游请求构建失败", pc, routeRes))
 		return &fwdOutcome{retry: true}
 	}
 	req, wrote := withWriteTrace(req)
@@ -900,14 +902,16 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 		if !wrote.Load() {
 			// 请求体未送达上游：上游不可能计费 → 可安全转移。
 			bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "上游连接失败", msSince(start))
+			// 连接失败：上游未返回任何响应体，resp_body 留空（原因见 error_message / 决策轨迹）。
 			g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-				"error", "上游连接失败", "failed", "上游连接失败", msSince(start), nil, g.callLogDecision(attempts, "上游连接失败", pc, routeRes))
+				"error", "", "failed", "上游连接失败", msSince(start), nil, g.callLogDecision(attempts, "上游连接失败", pc, routeRes))
 			return &fwdOutcome{retry: true}
 		}
 		// 请求已送达后失败（多为响应超时）：上游可能已生成并计费，转移会导致上游重复计费 → 不转移。
 		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "上游请求失败（已送达，不转移）", msSince(start))
+		// 已送达但失败（多为超时）：上游可能已生成，但不返回响应体 → resp_body 留空。
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-			"error", "上游请求失败（已送达，不转移）", "failed", "上游请求失败（已送达，不转移）", msSince(start), nil, g.callLogDecision(attempts, "上游请求失败", pc, routeRes))
+			"error", "", "failed", "上游请求失败（已送达，不转移）", msSince(start), nil, g.callLogDecision(attempts, "上游请求失败", pc, routeRes))
 		writeOpenAIError(w, http.StatusBadGateway, msgUpstreamDown)
 		return &fwdOutcome{responded: true, refundPre: true, downstreamStatus: http.StatusBadGateway}
 	}
@@ -924,13 +928,15 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 				errInfo{kind: "read_body_failed", stage: stage, status: up.StatusCode, attempt: attempt,
 					reason: "读取上游响应失败：" + err.Error(), sessionID: sessionID, durationMs: *msSince(start)})
 			bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "读取上游响应失败", msSince(start))
+			// 读取失败：响应体不可用（读坏了），resp_body 留空而不是重复错误文案。
 			g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-				"error", "读取上游响应失败", "failed", "读取上游响应失败", msSince(start), nil, g.callLogDecision(attempts, "读取上游响应失败", pc, routeRes))
+				"error", "", "failed", "读取上游响应失败", msSince(start), nil, g.callLogDecision(attempts, "读取上游响应失败", pc, routeRes))
 			writeOpenAIError(w, http.StatusBadGateway, msgUpstreamDown)
 			return &fwdOutcome{responded: true, refundPre: true, downstreamStatus: http.StatusBadGateway}
 		}
 		dur := msSince(start)
-		usage, uerr := prov.ExtractUsage(raw)
+		// upstreamUsage：上游原始 usage（JSONB 值），随调用日志落库用于诊断渠道口径（见 rawusage.go）。
+		usage, upstreamUsage, uerr := prov.ExtractUsage(raw)
 		usageMissing := uerr != nil || usageZero(usage)
 		if usageMissing {
 			// AC-17（放宽）：上游未返回/无法解析 usage 属极端协议违规；内容已由上游生成并在此透传，
@@ -959,8 +965,8 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 						attempt: attempt, reason: "积分余额不足，计费失败：" + berr.Error(), sessionID: sessionID, durationMs: deref64(dur)})
 				// billing.Record 内部已落一条 failed（含实际 tokens/rates/系数与余额不足原因），
 				// 网关不再重复落账，保证每次请求恰好一条记录。
-				g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-					"non_stream", string(raw), "failed", "积分余额不足，计费失败", dur, nil, g.callLogDecision(attempts, "积分余额不足", pc, routeRes))
+				g.writeCallLogUsage(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
+					"non_stream", string(raw), "failed", "积分余额不足，计费失败", upstreamUsage, dur, nil, g.callLogDecision(attempts, "积分余额不足", pc, routeRes))
 				writeOpenAIError(w, http.StatusPaymentRequired, msgInsufficient)
 				return &fwdOutcome{responded: true, billFailed: true, downstreamStatus: http.StatusPaymentRequired}
 			}
@@ -969,8 +975,9 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 				diagFromRequest(req, ureq.Protocol, ureq.Cred),
 				errInfo{kind: "billing_failed", stage: stage, status: up.StatusCode, downstream: http.StatusInternalServerError,
 					attempt: attempt, reason: "计费失败：" + berr.Error(), sessionID: sessionID, durationMs: deref64(dur)})
-			g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-				"non_stream", string(raw), "failed", "计费失败", dur, nil, g.callLogDecision(attempts, "计费失败", pc, routeRes))
+			// 计费失败时上游已返回响应体，resp_body 保留其原文（网关侧错误只落 error_message 与决策轨迹）。
+			g.writeCallLogUsage(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
+				"non_stream", string(raw), "failed", "计费失败", upstreamUsage, dur, nil, g.callLogDecision(attempts, "计费失败", pc, routeRes))
 			writeOpenAIError(w, http.StatusInternalServerError, msgInternal)
 			return &fwdOutcome{responded: true, billFailed: true, downstreamStatus: http.StatusInternalServerError}
 		}
@@ -980,8 +987,8 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 		if usageMissing {
 			reason = "usage缺失(按估算计费)"
 		}
-		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-			"non_stream", string(raw), "completed", "", dur, nil, g.callLogDecision(attempts, reason, pc, routeRes))
+		g.writeCallLogUsage(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
+			"non_stream", string(raw), "completed", "", upstreamUsage, dur, nil, g.callLogDecision(attempts, reason, pc, routeRes))
 
 		// 渠道透明：基础协议硬编码响应头 + 全局上游响应头白名单（默认空）；不下发任何 X-Channel* 头。
 		applyResponseHeaderWhitelist(w, up.Header, g.upstreamHeaders())
@@ -1118,8 +1125,9 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 				retry: true, reason: "构建上游流式请求失败：" + err.Error(), sessionID: sessionID, durationMs: *msSince(start)})
 		g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, channel.Feedback{IsSuccess: false, Now: g.now()})
 		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "构建上游流式请求失败", msSince(start))
+		// 网关侧失败（未发出上游调用）：resp_body 留空，原因只落 error_message 与决策轨迹。
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-			"error", "构建上游流式请求失败", "failed", "构建上游流式请求失败", msSince(start), nil, g.callLogDecision(attempts, "上游请求构建失败", pc, routeRes))
+			"error", "", "failed", "构建上游流式请求失败", msSince(start), nil, g.callLogDecision(attempts, "上游请求构建失败", pc, routeRes))
 		return &fwdOutcome{retry: true}
 	}
 	req, wrote := withWriteTrace(req)
@@ -1134,14 +1142,16 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		if !wrote.Load() {
 			// 请求体未送达上游：上游不可能计费 → 可安全转移。
 			bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "上游流式连接失败", msSince(start))
+			// 连接失败：上游未返回任何响应体，resp_body 留空（原因见 error_message / 决策轨迹）。
 			g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-				"error", "上游流式连接失败", "failed", "上游流式连接失败", msSince(start), nil, g.callLogDecision(attempts, "上游连接失败", pc, routeRes))
+				"error", "", "failed", "上游流式连接失败", msSince(start), nil, g.callLogDecision(attempts, "上游连接失败", pc, routeRes))
 			return &fwdOutcome{retry: true}
 		}
 		// 请求已送达后失败（多为响应超时）：上游可能已生成并计费，转移会导致上游重复计费 → 不转移。
 		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "上游流式请求失败（已送达，不转移）", msSince(start))
+		// 已送达但失败（多为超时）：上游可能已生成，但不返回响应体 → resp_body 留空。
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-			"error", "上游流式请求失败（已送达，不转移）", "failed", "上游流式请求失败（已送达，不转移）", msSince(start), nil, g.callLogDecision(attempts, "上游请求失败", pc, routeRes))
+			"error", "", "failed", "上游流式请求失败（已送达，不转移）", msSince(start), nil, g.callLogDecision(attempts, "上游请求失败", pc, routeRes))
 		writeOpenAIError(w, http.StatusBadGateway, msgUpstreamDown)
 		return &fwdOutcome{responded: true, refundPre: true, downstreamStatus: http.StatusBadGateway}
 	}
@@ -1153,7 +1163,8 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		applyResponseHeaderWhitelist(w, up.Header, g.upstreamHeaders())
 		// 记录首个 SSE chunk 写出时机（首字耗时）。
 		ft := &firstTokenWriter{ResponseWriter: w}
-		usage, assistantMsg, herr := prov.HandleStream(ctx, up, ft)
+		// upstreamUsage：上游原始 usage 分片合并后的 JSONB 值（诊断渠道口径，见 rawusage.go）。
+		usage, upstreamUsage, assistantMsg, herr := prov.HandleStream(ctx, up, ft)
 		dur := msSince(start)
 		// 计费上下文（脱离请求取消、带超时）：响应结束后请求 ctx 会被取消，账单不可丢。
 		billCtx, cancelBill := billingCtx(ctx)
@@ -1198,8 +1209,8 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 				errInfo{kind: "stream_interrupted", stage: stage, status: up.StatusCode, attempt: attempt,
 					reason: "流式传输中断：" + herr.Error(), sessionID: sessionID, durationMs: *dur})
 			bid := g.recordFailure(billCtx, routeRes, model, token, pricingMode, sessionID, sessionName, "流式传输中断", dur)
-			g.writeCallLog(billCtx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-				"error", string(assistantMsg), "failed", "流式传输中断", dur, ft.firstTokenMs(start), g.callLogDecision(attempts, "流式传输中断", pc, routeRes))
+			g.writeCallLogUsage(billCtx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
+				"error", string(assistantMsg), "failed", "流式传输中断", upstreamUsage, dur, ft.firstTokenMs(start), g.callLogDecision(attempts, "流式传输中断", pc, routeRes))
 		}
 		// 流结束后计费（预扣已在前置阶段完成；此处按实际/估算扣费，差额由 serve 结算退补）。
 		ch, bid, berr := g.recordBilling(billCtx, routeRes, model, token, usage, pricingMode, sessionID, sessionName, pc.Credits, dur, ft.firstTokenMs(start))
@@ -1219,15 +1230,15 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		case hardErr:
 			// 失败分支已在上面记录（resp_kind=error）。
 		case out.billFailed:
-			g.writeCallLog(billCtx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-				"stream", string(assistantMsg), "failed", "流式计费失败", dur, ft.firstTokenMs(start), g.callLogDecision(attempts, "计费失败", pc, routeRes))
+			g.writeCallLogUsage(billCtx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
+				"stream", string(assistantMsg), "failed", "流式计费失败", upstreamUsage, dur, ft.firstTokenMs(start), g.callLogDecision(attempts, "计费失败", pc, routeRes))
 		default:
 			reason := "success"
 			if usageMissing {
 				reason = "usage缺失(按估算计费)"
 			}
-			g.writeCallLog(billCtx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-				"stream", string(assistantMsg), "completed", "", dur, ft.firstTokenMs(start), g.callLogDecision(attempts, reason, pc, routeRes))
+			g.writeCallLogUsage(billCtx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
+				"stream", string(assistantMsg), "completed", "", upstreamUsage, dur, ft.firstTokenMs(start), g.callLogDecision(attempts, reason, pc, routeRes))
 		}
 		// usage 缺失的渠道已置 DISABLED，不再回喂成功反馈（避免与禁用态冲突）。
 		if !usageMissing {
@@ -1564,10 +1575,11 @@ func estimateInputTokens(body []byte, model string) int {
 }
 
 // missingUsageEstimate 在「上游未返回/无法解析 usage」时按可见内容估算 token 用量（AC-17 放宽）：
-// 输入取请求 prompt 估算；输出/推理取响应正文与工具调用的文本估算；未知协议形状（如 openai-responses）
-// 提取为空时按响应体粗估兜底，避免近乎零计费。
+// 输入取请求 prompt 估算；输出取响应正文、推理与工具调用的文本估算，
+// 三段口径下推理并入输出（不再单列）。估算时缓存读无法区分，一律计入输入。
 func missingUsageEstimate(reqBody, rawResp []byte, model, content, reasoning string, tools []byte) billing.Usage {
 	out := countTextTokens(content, model)
+	out += countTextTokens(reasoning, model)
 	if len(tools) > 0 {
 		out += countTextTokens(string(tools), model)
 	}
@@ -1575,9 +1587,8 @@ func missingUsageEstimate(reqBody, rawResp []byte, model, content, reasoning str
 		out = estTokens(rawResp)
 	}
 	return billing.Usage{
-		Input:     int64(estimateInputTokens(reqBody, model)),
-		Output:    int64(out),
-		Reasoning: int64(countTextTokens(reasoning, model)),
+		Input:  int64(estimateInputTokens(reqBody, model)),
+		Output: int64(out),
 	}
 }
 

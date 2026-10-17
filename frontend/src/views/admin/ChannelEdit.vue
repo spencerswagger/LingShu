@@ -852,8 +852,10 @@ async function onSubmit() {
                   </el-tag>
                 </template>
               </el-table-column>
-              <el-table-column label="Token" width="130" align="right">
-                <template #default="{ row }">入{{ row.InputTokens }}·出{{ row.OutputTokens }}</template>
+              <el-table-column label="Token" width="190" align="right">
+                <template #default="{ row }">
+                  入{{ row.InputTokens }}·出{{ row.OutputTokens }}<span v-if="row.CachedTokens">·缓存读{{ row.CachedTokens }}</span>
+                </template>
               </el-table-column>
               <el-table-column label="耗时" width="90" align="right">
                 <template #default="{ row }">{{ row.DurationMS }}ms</template>

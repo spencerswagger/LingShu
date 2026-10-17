@@ -42,7 +42,7 @@ const drawerOpen = ref(false)
 const editingId = ref<string | null>(null) // null = 新增；否则为编辑的模型 id
 const editingForm = ref<Record<string, any>>({ InternalModelID: '', ExternalModelID: null })
 const editingPricing = ref<Record<string, any>>({
-  CostRates: { Input: 0, Output: 0, CacheRead: 0, CacheWrite: 0, Reasoning: 0 },
+  CostRates: { Input: 0, Output: 0, CacheRead: 0 },
   TimeConfig: null,
   ContextTiers: null,
 })
@@ -114,7 +114,7 @@ function fmtCost(m: ChannelModel, k: string): string {
 
 function costDetail(m: ChannelModel): string {
   const r = m.CostRates || {}
-  const parts = ['Input', 'Output', 'CacheRead', 'CacheWrite', 'Reasoning']
+  const parts = ['Input', 'Output', 'CacheRead']
     .map((k) => `${rateLabels[k]} ${r[k] == null ? '-' : Math.round(r[k] * 1e6) / 1e6}`)
   return `${parts.join('，')}（单位：人民币元/百万 token）`
 }
@@ -125,7 +125,7 @@ function openCreate() {
   editingForm.value = {
     InternalModelID: '',
     ExternalModelID: null,
-    CostRates: { Input: 0, Output: 0, CacheRead: 0, CacheWrite: 0, Reasoning: 0 },
+    CostRates: { Input: 0, Output: 0, CacheRead: 0 },
     TimeConfig: null,
     ContextTiers: null,
     RateLimit: { RPM: 0, TPM: 0, BurstMultiplier: 0, MaxConcurrent: 0 },
@@ -133,7 +133,7 @@ function openCreate() {
     Reliability: { WindowSeconds: 0, MinSamples: 0, ErrorRatePct: 0, Rate429Pct: 0, P99LatencyMS: 0 },
   }
   editingPricing.value = {
-    CostRates: { Input: 0, Output: 0, CacheRead: 0, CacheWrite: 0, Reasoning: 0 },
+    CostRates: { Input: 0, Output: 0, CacheRead: 0 },
     TimeConfig: null,
     ContextTiers: null,
   }
@@ -260,7 +260,7 @@ function onRowExternalChange(val: string | null, row: PendingRow, index: number)
 async function confirmCreateExternal() {
   const name = createExternalName.value.trim()
   if (!name) return ElMessage.warning('请填写对外名称')
-  // 售价初始化：勾选时取「当前上下文」的定价（五段费率 + 时段 + 分档）作为对外模型的售价配置
+  // 售价初始化：勾选时取「当前上下文」的定价（三段费率 + 时段 + 分档）作为对外模型的售价配置
   let srcPricing: Record<string, any> | null = null
   if (createExternalUseCost.value) {
     srcPricing = createTargetSingle.value
@@ -268,8 +268,8 @@ async function confirmCreateExternal() {
       : (pendingRows.value[createTargetRowIndex.value]?.pricing || null)
   }
   const costRates = srcPricing?.CostRates || null
-  const saleRates = { Input: 0, Output: 0, CacheRead: 0, CacheWrite: 0, Reasoning: 0, ...(costRates || {}) }
-  // 时段与分档随售价一并初始化，避免仅同步五段费率而丢失时段/分档。
+  const saleRates = { Input: 0, Output: 0, CacheRead: 0, ...(costRates || {}) }
+  // 时段与分档随售价一并初始化，避免仅同步三段费率而丢失时段/分档。
   const timeConfig = srcPricing?.TimeConfig ?? null
   const contextTiers = srcPricing?.ContextTiers ?? null
 
@@ -424,7 +424,7 @@ function onAddPulled() {
     InternalModelID: p.ID,
     ExternalModelID: null,
     pricing: {
-      CostRates: { Input: 0, Output: 0, CacheRead: 0, CacheWrite: 0, Reasoning: 0 },
+      CostRates: { Input: 0, Output: 0, CacheRead: 0 },
       TimeConfig: null,
       ContextTiers: null,
     },

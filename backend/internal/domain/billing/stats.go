@@ -11,19 +11,16 @@ import (
 	"time"
 )
 
-// UsageSplit 五段 Token 用量。
+// UsageSplit 三段 Token 用量。
 type UsageSplit struct {
-	Input      int64 `json:"Input"`
-	Output     int64 `json:"Output"`
-	CacheRead  int64 `json:"CacheRead"`
-	CacheWrite int64 `json:"CacheWrite"`
-	Reasoning  int64 `json:"Reasoning"`
+	Input     int64 `json:"Input"`
+	Output    int64 `json:"Output"`
+	CacheRead int64 `json:"CacheRead"`
 }
 
-// Total 求总量：缓存读(CacheRead)是输入(Input)的组成部分、已含于 Input 中，不重复计入
-// （与 breakdown.go 净输入口径一致）；缓存写为独立段计入；推理已从 Output 剥离单独计入。
+// Total 求总量：三段互斥（Input 为纯输入、不含缓存读），直接求和。
 func (u UsageSplit) Total() int64 {
-	return u.Input + u.Output + u.CacheWrite + u.Reasoning
+	return u.Input + u.CacheRead + u.Output
 }
 
 // DashDay 按天聚合行（趋势 / 成功率 / 吞吐量）。
@@ -98,13 +95,12 @@ func dashArgs(userID *int64, from, to time.Time, extra ...any) []any {
 }
 
 // tokenSum token 求和 SQL 表达式（prefix 为表别名前缀）。
-// 口径与 UsageSplit.Total() 一致：缓存读已含于输入、不重复计入，仅求和 input/output/cache_write/reasoning。
+// 口径与 UsageSplit.Total() 一致：三段互斥（输入为纯输入、不含缓存读），求和 input/cache_read/output。
 func tokenSum(prefix string) string {
 	p := prefix + "tokens"
 	return `(COALESCE(NULLIF(` + p + `->>'input','')::bigint,0)
-		+ COALESCE(NULLIF(` + p + `->>'output','')::bigint,0)
-		+ COALESCE(NULLIF(` + p + `->>'cache_write','')::bigint,0)
-		+ COALESCE(NULLIF(` + p + `->>'reasoning','')::bigint,0))`
+		+ COALESCE(NULLIF(` + p + `->>'cache_read','')::bigint,0)
+		+ COALESCE(NULLIF(` + p + `->>'output','')::bigint,0))`
 }
 
 // Dashboard 聚合统计页所需全部数据（一次调用）。
@@ -127,8 +123,6 @@ func (s *SqlStore) Dashboard(ctx context.Context, from, to time.Time, userID *in
 		    COALESCE(sum(COALESCE(NULLIF(tokens->>'input','')::bigint,0)),0),
 		    COALESCE(sum(COALESCE(NULLIF(tokens->>'output','')::bigint,0)),0),
 		    COALESCE(sum(COALESCE(NULLIF(tokens->>'cache_read','')::bigint,0)),0),
-		    COALESCE(sum(COALESCE(NULLIF(tokens->>'cache_write','')::bigint,0)),0),
-		    COALESCE(sum(COALESCE(NULLIF(tokens->>'reasoning','')::bigint,0)),0),
 		    COALESCE(sum(credits_consumed),0),
 		    count(*),
 		    COALESCE(sum((status='failed')::int),0),
@@ -138,7 +132,7 @@ func (s *SqlStore) Dashboard(ctx context.Context, from, to time.Time, userID *in
 		    COALESCE(sum((first_token_ms IS NOT NULL)::int),0)
 		 FROM billing_records `+dashWhere(""),
 		dashArgs(userID, from, to)...).
-		Scan(&total.Input, &total.Output, &total.CacheRead, &total.CacheWrite, &total.Reasoning,
+		Scan(&total.Input, &total.Output, &total.CacheRead,
 			&totalCred, &totalCall, &failed, &sumDur, &sumFirst, &okDur, &okFirst)
 	if err != nil {
 		return out, err

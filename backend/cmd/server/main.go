@@ -479,6 +479,7 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 			return fmt.Errorf("resolve external model: %w", err)
 		}
 		dur := durMS
+		// ProbeUsage 已按三段口径归一（InputTokens 为纯输入，缓存读单列），此处直接落库/记账。
 		_, err = billSvc.Record(ctx, billing.RecordReq{
 			UserID:          sysUID,
 			PricingMode:     identity.PricingModeCost,
@@ -487,8 +488,8 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 			InternalModelID: cm.InternalModelID,
 			ChannelKeyID:    keyID, // 探测记账落 channel_key_id（ProbeRecorder 首参为密钥 ID）
 			Tokens: billing.Usage{
-				Input:     int64(usage.PromptTokens),
-				Output:    int64(usage.CompletionTokens),
+				Input:     int64(usage.InputTokens),
+				Output:    int64(usage.OutputTokens),
 				CacheRead: int64(usage.CachedTokens),
 			},
 			Rates:      cm.CostRates,
@@ -712,12 +713,10 @@ func (a priceRefAdapter) ReferencePrice(externalName string) (model.PriceRef, bo
 		return model.PriceRef{}, false // 汇率配置缺失，不能把 USD 当 CNY 写库
 	}
 	return model.PriceRef{
-		Input:      p.Pricing.Prompt * rate,
-		Output:     p.Pricing.Completion * rate,
-		CacheRead:  p.Pricing.CacheRead * rate,
-		CacheWrite: p.Pricing.CacheWrite * rate,
-		Reasoning:  p.Pricing.Reasoning * rate,
-		UpdatedAt:  a.syncer.LastUpdated(),
+		Input:     p.Pricing.Prompt * rate,
+		Output:    p.Pricing.Completion * rate,
+		CacheRead: p.Pricing.CacheRead * rate,
+		UpdatedAt: a.syncer.LastUpdated(),
 	}, true
 }
 
@@ -726,13 +725,11 @@ func (a priceRefAdapter) SearchPrices(q string) []model.CatalogEntry {
 	out := make([]model.CatalogEntry, 0, len(entries))
 	for _, e := range entries {
 		out = append(out, model.CatalogEntry{
-			Provider:      e.Provider,
-			ModelID:       e.ModelID,
-			InputUSD:      e.InputUSD,
-			OutputUSD:     e.OutputUSD,
-			CacheUSD:      e.CacheUSD,
-			CacheWriteUSD: e.CacheWriteUSD,
-			ReasoningUSD:  e.ReasoningUSD,
+			Provider:  e.Provider,
+			ModelID:   e.ModelID,
+			InputUSD:  e.InputUSD,
+			OutputUSD: e.OutputUSD,
+			CacheUSD:  e.CacheUSD,
 		})
 	}
 	return out

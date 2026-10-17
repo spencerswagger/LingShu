@@ -23,7 +23,7 @@
 // 「当前成本」= 样值用量代入 channel_models.cost_rates 求和 × 当前时段系数：
 // 样值来自全局配置 routing.cost_sample；时段系数取候选模型级 time_config，
 // 为空回落全局 billing.time_config；上下文分档系数恒按 1（不参与比较）。
-// cost_rates 缺失/五段全 0 视为「成本未知」，排在有有效成本候选之后。
+// cost_rates 缺失/三段全 0 视为「成本未知」，排在有有效成本候选之后。
 // 渠道 weight 已废弃，不再参与任何路由选择。
 package router
 
@@ -147,9 +147,9 @@ type CostConfig interface {
 	TimeConfig() (billing.TimeCoeffConfig, error)
 }
 
-// defaultCostSample 内置默认样值用量（与 seeding 默认一致：输入 10000、缓存读 9000、
-// 输出 1000、推理 500、缓存写 0）。仅当未注入 CostConfig 或读取失败时兜底。
-var defaultCostSample = billing.Usage{Input: 10000, CacheRead: 9000, Output: 1000, Reasoning: 500}
+// defaultCostSample 内置默认样值用量（与 seeding 默认一致：输入 10000、缓存读 9000、输出 1000）。
+// 仅当未注入 CostConfig 或读取失败时兜底。
+var defaultCostSample = billing.Usage{Input: 10000, CacheRead: 9000, Output: 1000}
 
 // Engine 是路由选择引擎。
 type Engine struct {
@@ -550,8 +550,8 @@ func costScalar(sample billing.Usage, rates billing.Rates, timeCoeff float64) (f
 }
 
 // hasValidCost 判断成本单价表是否具备有效值：至少一段非 0（全 0/空视为成本未知）。
-// 口径说明（FR-5）：仅当五段全为 0 或缺失才算「成本未知」；若某候选仅 cache_write 有单价
-// 而样值 cache_write=0，其标量为 0 且仍视为有效（按最便宜参与比较），这是既定样值口径。
+// 口径说明（FR-5）：仅当三段全为 0 或缺失才算「成本未知」；若某候选仅 cache_read 有单价
+// 而样值 cache_read=0，其标量为 0 且仍视为有效（按最便宜参与比较），这是既定样值口径。
 func hasValidCost(rates billing.Rates) bool {
 	for _, v := range rates {
 		if v != 0 {

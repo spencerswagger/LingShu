@@ -36,12 +36,10 @@ func errInternal() *APIError {
 
 // PriceRef 是 models.dev 参考价按 billing.cny_rate 折算后的人民币倍率（人民币 / 百万 token）。
 type PriceRef struct {
-	Input      float64
-	Output     float64
-	CacheRead  float64
-	CacheWrite float64
-	Reasoning  float64
-	UpdatedAt  time.Time
+	Input     float64
+	Output    float64
+	CacheRead float64
+	UpdatedAt time.Time
 }
 
 // PriceSource 供价格参考接口查询 models.dev 缓存价格（由装配层以 sync.Syncer 适配）。
@@ -54,14 +52,13 @@ type PriceSource interface {
 }
 
 // CatalogEntry 价格目录条目（供应商维度），供搜索浏览 models.dev 参考价使用。
+// 三段口径下只保留 input/output/cache_read（models.dev 的 cache_write/reasoning 价无对应计费段，忽略）。
 type CatalogEntry struct {
-	Provider      string  `json:"Provider"`
-	ModelID       string  `json:"ModelID"`
-	InputUSD      float64 `json:"InputUSD"` // 美元 / 百万 token
-	OutputUSD     float64 `json:"OutputUSD"`
-	CacheUSD      float64 `json:"CacheReadUSD"`
-	CacheWriteUSD float64 `json:"CacheWriteUSD"`
-	ReasoningUSD  float64 `json:"ReasoningUSD"`
+	Provider  string  `json:"Provider"`
+	ModelID   string  `json:"ModelID"`
+	InputUSD  float64 `json:"InputUSD"` // 美元 / 百万 token
+	OutputUSD float64 `json:"OutputUSD"`
+	CacheUSD  float64 `json:"CacheReadUSD"`
 }
 
 // ExternalModelInput 创建/更新对外模型的可写字段。
@@ -134,7 +131,7 @@ func (s *Service) GetByName(ctx context.Context, name string) (*ExternalModel, e
 	return s.store.GetByName(ctx, name)
 }
 
-// validateInput 校验对外模型可写字段：名称非空、售价五键非负、可选时段/分档合法。
+// validateInput 校验对外模型可写字段：名称非空、售价三段（三键）非负、可选时段/分档合法。
 func (s *Service) validateInput(in ExternalModelInput) error {
 	if in.ExternalName == "" {
 		return errBadRequest("模型对外名称不能为空")
@@ -287,7 +284,8 @@ func (s *Service) PriceReference(ctx context.Context, id int64) (*PriceRef, erro
 	return &ref, nil
 }
 
-// ApplyPrice 把 models.dev 参考价折算后的人民币倍率应用到售价 input/output 及缓存读写/推理，其余键保持不变，更新入库。
+// ApplyPrice 把 models.dev 参考价折算后的人民币倍率应用到售价 input/output/cache_read，
+// 其余键保持不变，更新入库（三段口径无缓存写/推理段，models.dev 对应价格忽略）。
 func (s *Service) ApplyPrice(ctx context.Context, id int64) (*ExternalModel, error) {
 	m, err := s.store.GetByID(ctx, id)
 	if err != nil {
@@ -314,12 +312,6 @@ func (s *Service) ApplyPrice(ctx context.Context, id int64) (*ExternalModel, err
 	}
 	if ref.CacheRead > 0 {
 		m.SaleRates["cache_read"] = ref.CacheRead
-	}
-	if ref.CacheWrite > 0 {
-		m.SaleRates["cache_write"] = ref.CacheWrite
-	}
-	if ref.Reasoning > 0 {
-		m.SaleRates["reasoning"] = ref.Reasoning
 	}
 	if err := s.store.ApplySaleRates(ctx, id, m.SaleRates); err != nil {
 		return nil, fmt.Errorf("apply sale rates: %w", err)
@@ -374,12 +366,6 @@ func (s *Service) SyncPrices(ctx context.Context) (*SyncPricesResult, error) {
 		}
 		if ref.CacheRead > 0 {
 			rates["cache_read"] = ref.CacheRead
-		}
-		if ref.CacheWrite > 0 {
-			rates["cache_write"] = ref.CacheWrite
-		}
-		if ref.Reasoning > 0 {
-			rates["reasoning"] = ref.Reasoning
 		}
 		if err := s.store.ApplySaleRates(ctx, m.ID, rates); err != nil {
 			return nil, fmt.Errorf("apply sale rates for %s: %w", m.ExternalName, err)

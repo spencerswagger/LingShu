@@ -25,13 +25,17 @@ var ErrUsageMissing = errors.New("upstream response missing usage")
 //   - BuildUpstreamRequest 依据构造上下文（基址/路径/凭据/下游头/头策略/鉴权）构建上游请求；
 //   - ExtractUsage 从非流式响应体解析 token 用量；usage 缺失/无法解析返回 ErrUsageMissing；
 //   - HandleStream 逐块透传 SSE 并统计 usage，返回最终用量与拼装的 assistant 消息（call_log 用）。
+//
+// 两个方法都额外返回「上游原始 usage」的落库值（call_logs.upstream_usage，见 rawusage.go）：
+// 诊断各渠道 usage 口径不一致时（如输入是否含缓存读）必须看上游原文，而不是只看向量后的三段。
 type Provider interface {
 	Name() string
 	// BuildUpstreamRequest 构建上游请求，req.Body 为已改写 model 的下游请求体。
 	BuildUpstreamRequest(ctx context.Context, req UpstreamRequest) (*http.Request, error)
-	// ExtractUsage 从非流式响应体解析 token 用量；缺失/无法解析返回 ErrUsageMissing。
-	ExtractUsage(body []byte) (billing.Usage, error)
-	// HandleStream 透传流式 SSE，返回统计到的用量与拼装出的 assistant 消息 JSON；
-	// usage 缺失返回 ErrUsageMissing（内容已透传，由调用方按 AC-17 处理）。
-	HandleStream(ctx context.Context, upstream *http.Response, w http.ResponseWriter) (billing.Usage, []byte, error)
+	// ExtractUsage 从非流式响应体解析 token 用量与上游原始 usage（JSONB 值，nil=无）；
+	// 缺失/无法解析返回 ErrUsageMissing。
+	ExtractUsage(body []byte) (billing.Usage, []byte, error)
+	// HandleStream 透传流式 SSE，返回统计到的用量、上游原始 usage（多段分片合并，JSONB 值）与
+	// 拼装出的 assistant 消息 JSON；usage 缺失返回 ErrUsageMissing（内容已透传，由调用方按 AC-17 处理）。
+	HandleStream(ctx context.Context, upstream *http.Response, w http.ResponseWriter) (billing.Usage, []byte, []byte, error)
 }

@@ -1,5 +1,5 @@
 // Package model 提供对外模型（external_models）的存储与 CRUD：对外名称 + 售价定价
-// （五段 rates + 模型级 time_config/context_tiers）。渠道内部模型与成本定价在
+// （三段 rates：input/output/cache_read + 模型级 time_config/context_tiers）。渠道内部模型与成本定价在
 // channel 包（channel_models）管理，此处不涉及。
 //
 // 数据模型对齐 db/migrations/0001_init.sql 中 external_models 表。
@@ -22,7 +22,7 @@ import (
 )
 
 // ExternalModel 对应 external_models 表的一行。
-// SaleRates 为售价（五段单价）；TimeConfig/ContextTiers 可空，空则运行时回落全局。
+// SaleRates 为售价（三段单价）；TimeConfig/ContextTiers 可空，空则运行时回落全局。
 type ExternalModel struct {
 	ID           int64
 	ExternalName string
@@ -34,9 +34,6 @@ type ExternalModel struct {
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
 }
-
-// RateKeys 是计价费率 JSONB 必须包含的五个键。
-var RateKeys = []string{"input", "output", "cache_read", "cache_write", "reasoning"}
 
 // cols 列出 external_models 表查询使用的全部列。
 const cols = `id, external_name, description, enabled, sale_rates, time_config, context_tiers, created_at, updated_at`

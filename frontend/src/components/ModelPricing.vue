@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // 公共定价编辑器：以「同一套定价 schema」复用于售价(SaleRates)与成本(CostRates)。
 // 结构分三块：
-//   1) 五段费率（token 单价）
+//   1) 三段费率（token 单价）
 //   2) 时段系数（Periodic + Overrides + Default + Timezone）
 //   3) 上下文分档（ContextTiers）
 // 对齐后端 billing.Rates / TimeCoeffConfig / TierRule JSON 结构。

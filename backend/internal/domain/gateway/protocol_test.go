@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -10,47 +11,144 @@ import (
 	"github.com/team/llmgateway/internal/domain/channelprotocol"
 )
 
-// AC-16：三协议 usage 归一化为五段；Anthropic 推理 token 并入 output（不单列 reasoning）。
+// AC-16：三协议 usage 归一化为三段（输入纯输入/缓存读/输出含推理），缓存写并入输入。
+// 同时断言「上游原始 usage」被原样采集（落 call_logs.upstream_usage，供诊断渠道口径）。
 func TestExtractUsage_ThreeProtocols(t *testing.T) {
 	t.Run("openai-chat", func(t *testing.T) {
 		body := []byte(`{"usage":{"prompt_tokens":100,"completion_tokens":50,"prompt_tokens_details":{"cached_tokens":20},"completion_tokens_details":{"reasoning_tokens":10}}}`)
-		u, err := NewOpenAIProvider(EndpointChatCompletions).ExtractUsage(body)
+		u, raw, err := NewOpenAIProvider(EndpointChatCompletions).ExtractUsage(body)
 		if err != nil {
 			t.Fatalf("extract: %v", err)
 		}
-		if u.Input != 100 || u.Output != 40 || u.CacheRead != 20 || u.Reasoning != 10 || u.CacheWrite != 0 {
+		// Input = prompt_tokens(100) − cached(20) = 80；Output = completion_tokens(50)（含推理）。
+		if u.Input != 80 || u.Output != 50 || u.CacheRead != 20 {
 			t.Fatalf("openai-chat 归一化错误: %+v", u)
 		}
+		assertRawUsage(t, raw, "openai-chat", `"cached_tokens":20`)
+	})
+	t.Run("openai-chat-deepseek-native", func(t *testing.T) {
+		// DeepSeek 原生风格：只有顶层 prompt_cache_hit_tokens，没有 prompt_tokens_details.cached_tokens。
+		// prompt_tokens = hit + miss = 100 = 80 + 20。
+		body := []byte(`{"usage":{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120,"prompt_cache_hit_tokens":80,"prompt_cache_miss_tokens":20}}`)
+		u, raw, err := NewOpenAIProvider(EndpointChatCompletions).ExtractUsage(body)
+		if err != nil {
+			t.Fatalf("extract: %v", err)
+		}
+		// Input = 100 − 80 = 20（缓存读必须被识别，否则命中部分会被按全价输入计）。
+		if u.Input != 20 || u.Output != 20 || u.CacheRead != 80 {
+			t.Fatalf("deepseek 原生风格归一化错误: %+v", u)
+		}
+		assertRawUsage(t, raw, "openai-chat", `"prompt_cache_hit_tokens":80`)
 	})
 	t.Run("openai-responses", func(t *testing.T) {
 		body := []byte(`{"usage":{"input_tokens":200,"output_tokens":80,"input_tokens_details":{"cached_tokens":30},"output_tokens_details":{"reasoning_tokens":20}}}`)
-		u, err := NewResponsesProvider().ExtractUsage(body)
+		u, raw, err := NewResponsesProvider().ExtractUsage(body)
 		if err != nil {
 			t.Fatalf("extract: %v", err)
 		}
-		if u.Input != 200 || u.Output != 60 || u.CacheRead != 30 || u.Reasoning != 20 {
+		// Input = input_tokens(200) − cached(30) = 170；Output = output_tokens(80)（含推理）。
+		if u.Input != 170 || u.Output != 80 || u.CacheRead != 30 {
 			t.Fatalf("openai-responses 归一化错误: %+v", u)
 		}
+		assertRawUsage(t, raw, "openai-responses", `"input_tokens":200`)
 	})
 	t.Run("anthropic-messages", func(t *testing.T) {
 		body := []byte(`{"usage":{"input_tokens":300,"output_tokens":90,"cache_read_input_tokens":40,"cache_creation_input_tokens":15}}`)
-		u, err := NewAnthropicProvider().ExtractUsage(body)
+		u, raw, err := NewAnthropicProvider().ExtractUsage(body)
 		if err != nil {
 			t.Fatalf("extract: %v", err)
 		}
-		if u.Input != 300 || u.Output != 90 || u.CacheRead != 40 || u.CacheWrite != 15 || u.Reasoning != 0 {
+		// Input = input_tokens(300) + cache_creation(15) = 315（缓存写并入输入）；Output = output_tokens(90)。
+		if u.Input != 315 || u.Output != 90 || u.CacheRead != 40 {
 			t.Fatalf("anthropic-messages 归一化错误: %+v", u)
 		}
+		// 原始 usage 必须保留 cache_creation（否则事后无法核对写入 token 的处理）。
+		assertRawUsage(t, raw, "anthropic-messages", `"cache_creation_input_tokens":15`)
 	})
+}
+
+// assertRawUsage 断言上游原始 usage 落库值：为 {"Protocol":...,"Usage":{...}} 且含指定片段。
+func assertRawUsage(t *testing.T, raw []byte, protocol, wantFragment string) {
+	t.Helper()
+	if len(raw) == 0 {
+		t.Fatalf("原始 usage 为空，应落库")
+	}
+	var env struct {
+		Protocol string                     `json:"Protocol"`
+		Usage    map[string]json.RawMessage `json:"Usage"`
+	}
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatalf("原始 usage 非法 JSON: %v (%s)", err, raw)
+	}
+	if env.Protocol != protocol {
+		t.Fatalf("原始 usage Protocol=%q, want %q", env.Protocol, protocol)
+	}
+	if len(env.Usage) == 0 {
+		t.Fatalf("原始 usage 键值为空: %s", raw)
+	}
+	if !strings.Contains(string(raw), wantFragment) {
+		t.Fatalf("原始 usage 缺少 %s: %s", wantFragment, raw)
+	}
 }
 
 // AC-17 前置：usage 缺失时三协议均返回 ErrUsageMissing。
 func TestExtractUsage_Missing(t *testing.T) {
 	noUsage := []byte(`{"id":"x","choices":[]}`)
 	for _, p := range []Provider{NewOpenAIProvider(EndpointChatCompletions), NewResponsesProvider(), NewAnthropicProvider()} {
-		if _, err := p.ExtractUsage(noUsage); !errors.Is(err, ErrUsageMissing) {
+		if _, _, err := p.ExtractUsage(noUsage); !errors.Is(err, ErrUsageMissing) {
 			t.Errorf("%s usage 缺失应返回 ErrUsageMissing, got %v", p.Name(), err)
 		}
+	}
+}
+
+// 流式分片的 usage 解析：DeepSeek 原生风格（只有顶层 prompt_cache_hit_tokens）也要归一化，
+// 且必须同时返回原始 JSON 供 call_log 记录上游原文。
+func TestParseStreamData_DeepSeekNative(t *testing.T) {
+	data := []byte(`{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120,"prompt_cache_hit_tokens":80}}`)
+	u, raw, ok := parseStreamData(data)
+	if !ok {
+		t.Fatalf("应命中 usage")
+	}
+	// Input = 100 − 80 = 20（纯输入）；CacheRead = 80；Output = 20。
+	if u.Input != 20 || u.CacheRead != 80 || u.Output != 20 {
+		t.Fatalf("流式 DeepSeek 归一化错误: %+v", u)
+	}
+	if !strings.Contains(string(raw), `"prompt_cache_hit_tokens":80`) {
+		t.Fatalf("原始 usage 应保留顶层命中字段: %s", raw)
+	}
+}
+
+// rawUsageJSON 合并流式多分片：同名键后写覆盖（Anthropic 的 message_start 给输入/缓存、
+// message_delta 给累计输出），其余键保留；空输入返回 nil（不写 NULL 以外的值）。
+func TestRawUsageJSON_MergeShards(t *testing.T) {
+	start := json.RawMessage(`{"input_tokens":191,"output_tokens":1,"cache_read_input_tokens":96896,"cache_creation_input_tokens":0}`)
+	delta := json.RawMessage(`{"output_tokens":94}`)
+
+	got := rawUsageJSON("anthropic-messages", []json.RawMessage{start, delta})
+	var env struct {
+		Protocol string                     `json:"Protocol"`
+		Usage    map[string]json.RawMessage `json:"Usage"`
+	}
+	if err := json.Unmarshal(got, &env); err != nil {
+		t.Fatalf("原始 usage 非法 JSON: %v (%s)", err, got)
+	}
+	if env.Protocol != "anthropic-messages" {
+		t.Fatalf("Protocol=%q, want anthropic-messages", env.Protocol)
+	}
+	// output_tokens 后写覆盖为 94；input/cache_read 保留。
+	if string(env.Usage["output_tokens"]) != "94" {
+		t.Fatalf("output_tokens 应被后分片覆盖为 94，got %s", env.Usage["output_tokens"])
+	}
+	if string(env.Usage["input_tokens"]) != "191" || string(env.Usage["cache_read_input_tokens"]) != "96896" {
+		t.Fatalf("输入/缓存读键应保留，got %s", got)
+	}
+	// 无有效分片 → nil（落库为 NULL）。
+	if b := rawUsageJSON("openai-chat", nil); b != nil {
+		t.Fatalf("空分片应返回 nil，got %s", b)
+	}
+	// 非对象分片忽略，不 panic。
+	if b := rawUsageJSON("openai-chat", []json.RawMessage{json.RawMessage(`[1,2]`)}); b != nil {
+		t.Fatalf("非对象分片应被忽略，got %s", b)
 	}
 }
 
