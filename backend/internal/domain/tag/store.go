@@ -90,15 +90,32 @@ func (s *Store) invalidateTagID(id int64) {
 	s.tagMu.Unlock()
 }
 
+// cloneTag 返回 Tag 的防御性浅拷贝（并复制 KVPairs map）。缓存命中/回源都返回拷贝，
+// 避免 tag.KVPairs 被网关等消费方就地修改而污染缓存（P2-7）。
+func cloneTag(t *Tag) *Tag {
+	if t == nil {
+		return nil
+	}
+	c := *t
+	if t.KVPairs != nil {
+		c.KVPairs = make(map[string]string, len(t.KVPairs))
+		for k, v := range t.KVPairs {
+			c.KVPairs[k] = v
+		}
+	}
+	return &c
+}
+
 // GetByID 按主键查询；不存在返回 sql.ErrNoRows。
 // 带内存缓存（见 Store.tagCache 注释）：命中直接返回，零 DB 查询；未命中回源并写缓存。
+// 返回值始终为缓存快照的**防御性拷贝**（KVPairs 复制），调用方修改不会污染缓存。
 func (s *Store) GetByID(ctx context.Context, id int64) (*Tag, error) {
 	if !s.readCacheOff {
 		s.tagMu.RLock()
 		cached, ok := s.tagCache[id]
 		s.tagMu.RUnlock()
 		if ok {
-			return cached, nil
+			return cloneTag(cached), nil
 		}
 	}
 	row := s.db.QueryRowContext(ctx,
@@ -115,7 +132,7 @@ func (s *Store) GetByID(ctx context.Context, id int64) (*Tag, error) {
 		s.tagCache[id] = t
 		s.tagMu.Unlock()
 	}
-	return t, nil
+	return cloneTag(t), nil
 }
 
 // GetByName 按名称查询；不存在返回 sql.ErrNoRows。

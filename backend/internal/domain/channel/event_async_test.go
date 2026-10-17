@@ -2,10 +2,13 @@ package channel
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"regexp"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 type keyEventRecord struct {
@@ -120,5 +123,31 @@ func TestEventAsync_NilSinkFallsBackSync(t *testing.T) {
 
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("未注入 sink 时应同步更新状态并同步插入事件：%v", err)
+	}
+}
+
+// TestHandleReplayErrPermanent 锁定 P2-10：外键冲突 / ErrNoRows 属不可恢复重放，应丢弃（返回 nil）
+// 并计数（否则 WAL 记录会永久重试）；可恢复错误必须原样返回以便保留 WAL 重试。
+func TestHandleReplayErrPermanent(t *testing.T) {
+	before := DroppedEventReplays()
+	// 不可恢复：外键冲突（引用渠道/密钥被硬删除）。
+	if err := handleReplayErr("channel_key_event", "k", &pgconn.PgError{Code: "23503"}); err != nil {
+		t.Fatalf("外键冲突应被丢弃（返回 nil），got %v", err)
+	}
+	// 不可恢复：目标行缺失。
+	if err := handleReplayErr("channel_key_event", "k", sql.ErrNoRows); err != nil {
+		t.Fatalf("ErrNoRows 应被丢弃（返回 nil），got %v", err)
+	}
+	if got := DroppedEventReplays() - before; got != 2 {
+		t.Fatalf("不可恢复重放应计数 2，got %d", got)
+	}
+	// 可恢复：瞬时 DB 故障原样返回。
+	sentinel := errors.New("transient db error")
+	if err := handleReplayErr("channel_key_event", "k", sentinel); !errors.Is(err, sentinel) {
+		t.Fatalf("可恢复错误应原样返回，got %v", err)
+	}
+	// nil 透传。
+	if err := handleReplayErr("channel_key_event", "k", nil); err != nil {
+		t.Fatalf("nil 应返回 nil，got %v", err)
 	}
 }

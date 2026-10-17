@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"regexp"
 	"testing"
 	"time"
@@ -304,5 +305,90 @@ func TestService_GetByExternalName_CacheZeroDBAndInvalidate(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("mock expectations: %v", err)
+	}
+}
+
+// TestService_NameWriteHookFired 锁定 P1-4：对外模型写路径成功后必须回调 nameWriteHook
+// （装配层据此失效 automodel 依赖 external_models 的跨包读缓存）。
+func TestService_NameWriteHookFired(t *testing.T) {
+	s, mock := mockService(t)
+	now := time.Now()
+	fired := 0
+	s.SetNameWriteHook(func() { fired++ })
+
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + cols + ` FROM external_models WHERE external_name = $1`)).
+		WithArgs("qw-max").
+		WillReturnError(sql.ErrNoRows)
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO external_models(id, external_name, description, enabled, sale_rates, time_config, context_tiers) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING `+cols)).
+		WithArgs(sqlmock.AnyArg(), "qw-max", "", true, sqlmock.AnyArg(), nil, nil).
+		WillReturnRows(extRow(&ExternalModel{ID: 1, ExternalName: "qw-max", Enabled: true, CreatedAt: now, UpdatedAt: now}, `{"input":1}`))
+
+	if _, err := s.CreateModel(context.Background(), ExternalModelInput{ExternalName: "qw-max", SaleRates: saleRates()}); err != nil {
+		t.Fatalf("create model: %v", err)
+	}
+	if fired != 1 {
+		t.Fatalf("写路径应回调 nameWriteHook 一次，got %d", fired)
+	}
+
+	// 批量删除同样应触发一次跨包失效。
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE external_models SET deleted_at = now() WHERE id = ANY($1::bigint[])`)).
+		WithArgs(sqlmock.AnyArg()).WillReturnResult(sqlmock.NewResult(0, 1))
+	if _, err := s.BatchDeleteModels(context.Background(), []int64{1}); err != nil {
+		t.Fatalf("batch delete: %v", err)
+	}
+	if fired != 2 {
+		t.Fatalf("批量删除也应回调 nameWriteHook，got %d", fired)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("mock expectations: %v", err)
+	}
+}
+
+// TestStore_ExternalNameCacheBounded 锁定 P1-5：对外名读缓存（键来自请求体、用户可控）必须有界，
+// 防止认证用户以海量随机名打满负缓存造成内存耗尽 DoS。
+func TestStore_ExternalNameCacheBounded(t *testing.T) {
+	s := NewStore(nil)
+	s.extNameMax = 8
+	for i := 0; i < 100; i++ {
+		s.cacheExternalName(fmt.Sprintf("m-%d", i), nil) // 负缓存同样计入上限
+	}
+	s.extNameMu.RLock()
+	got := len(s.extNameCache)
+	s.extNameMu.RUnlock()
+	if got > 8 {
+		t.Fatalf("extNameCache 应有界（<=8），got %d", got)
+	}
+}
+
+// TestStore_GetByExternalName_DefensiveCopy 锁定 P2-7：缓存命中返回防御性拷贝，
+// 调用方就地修改返回值（尤其 SaleRates map / 字段）不得污染缓存快照。
+func TestStore_GetByExternalName_DefensiveCopy(t *testing.T) {
+	s, mock := mockService(t)
+	now := time.Now()
+	q := regexp.QuoteMeta(`SELECT ` + cols + ` FROM external_models WHERE external_name = $1 AND enabled = true AND deleted_at IS NULL LIMIT 1`)
+	mock.ExpectQuery(q).WithArgs("qw-max").
+		WillReturnRows(extRow(&ExternalModel{ID: 2, ExternalName: "qw-max", Enabled: true,
+			SaleRates: billing.Rates{"input": 1}, CreatedAt: now, UpdatedAt: now}, `{"input":1}`))
+
+	first, err := s.GetByExternalName(context.Background(), "qw-max")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	// 就地篡改返回值：不应影响已缓存的快照。
+	first.SaleRates["input"] = 999
+	first.ExternalName = "mutated"
+
+	second, err := s.GetByExternalName(context.Background(), "qw-max") // 命中缓存，0 DB
+	if err != nil {
+		t.Fatalf("get2: %v", err)
+	}
+	if second.SaleRates["input"] != 1 {
+		t.Fatalf("缓存被返回值修改污染：input=%v", second.SaleRates["input"])
+	}
+	if second.ExternalName != "qw-max" {
+		t.Fatalf("缓存被返回值修改污染：name=%q", second.ExternalName)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("命中缓存不应再读库: %v", err)
 	}
 }

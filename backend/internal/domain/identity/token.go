@@ -481,6 +481,12 @@ func (s *TokenService) TouchLastUsed(ctx context.Context, tokenID int64) error {
 	return s.store.TouchLastUsed(ctx, tokenID)
 }
 
+// tokenExpired 判定令牌在给定时刻是否已过期（fail-closed：now >= ExpiresAt 即过期）。
+// 提取为独立函数以便对相等边界做确定性测试，并与 token_cache 的过期口径保持一致（P2-6）。
+func tokenExpired(t *Token, now time.Time) bool {
+	return t.ExpiresAt != nil && !now.Before(*t.ExpiresAt)
+}
+
 // LookupByPlain 按明文令牌校验，供网关鉴权使用。
 // 校验：status = ACTIVE、未过期、关联 user 存在且 ACTIVE。
 // 读缓存命中时直接返回缓存快照（0 DB）；未命中回源并按校验结果写缓存。
@@ -502,7 +508,10 @@ func (s *TokenService) LookupByPlain(ctx context.Context, plain string) (*Token,
 	if t.Status != StatusTokenActive {
 		return nil, errInvalidToken()
 	}
-	if t.ExpiresAt != nil && time.Now().After(*t.ExpiresAt) {
+	// 过期边界与 token_cache 统一为「fail-closed」：now >= ExpiresAt 即拒绝（含相等时刻），
+	// 即 !now.Before(ExpiresAt)。原先的 now.After 在 now==ExpiresAt 时返回 false（被当作未过期而放行），
+	// 与缓存路径不一致；改为 !Before 后两条路径在相等时刻一致拒绝。
+	if tokenExpired(t, time.Now()) {
 		return nil, errInvalidToken()
 	}
 	// 关联用户需存在且 ACTIVE，防止账号被删/禁用后凭据仍可用。
