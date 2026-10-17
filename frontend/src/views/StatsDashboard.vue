@@ -184,13 +184,14 @@ const kpiCards = computed<KpiCard[]>(() => {
   const credits = daily.value.map((d) => Number(d.Credits))
   const totalIn = data.value?.Usage.Total.Input ?? 0
   const cacheRead = data.value?.Usage.Total.CacheRead ?? 0
-  const cacheHit = totalIn > 0 ? cacheRead / totalIn : 0
+  const totalInput = totalIn + cacheRead
+  const cacheHit = totalInput > 0 ? cacheRead / totalInput : 0
   return [
     {
       label: '总 Token',
       value: k ? fmtCompact(k.TotalTokens) : '-',
       sub: `输入 ${fmtCompact(totalIn)} · 输出 ${fmtCompact(data.value?.Usage.Total.Output ?? 0)}`,
-      tip: '输入含缓存读与缓存写',
+      tip: '输入为纯输入、不含缓存读，缓存读单列，输出含推理',
       delta: k?.DeltaTokens,
       tone: 'primary',
       icon: DataLine,
@@ -218,7 +219,7 @@ const kpiCards = computed<KpiCard[]>(() => {
       label: '缓存命中率',
       value: fmtPct(cacheHit),
       sub: `输入 ${fmtCompact(totalIn)} · 缓存读 ${fmtCompact(cacheRead)}`,
-      tip: '缓存读占输入的比重',
+      tip: '缓存读 ÷ (输入+缓存读)',
       tipTarget: 'value',
       tone: 'violet',
       icon: PieChart,
@@ -291,13 +292,11 @@ const trendOption = computed<EChartsCoreOption>(() => {
 
 const compositionOption = computed<EChartsCoreOption>(() => {
   const t = data.value?.Usage.Total
-  // 互斥分段口径：缓存读已含于输入，输入切片取净输入(Input - CacheRead)，各切片相加 = 总量、不重复。
+  // 三段口径：输入为纯输入、缓存读单列、输出含推理，各切片相加 = 总量、不重复。
   const items = [
-    { name: '输入(非缓存)', value: Math.max((t?.Input ?? 0) - (t?.CacheRead ?? 0), 0) },
-    { name: '输出', value: t?.Output ?? 0 },
+    { name: '输入', value: t?.Input ?? 0 },
     { name: '缓存读', value: t?.CacheRead ?? 0 },
-    { name: '缓存写', value: t?.CacheWrite ?? 0 },
-    { name: '推理', value: t?.Reasoning ?? 0 },
+    { name: '输出', value: t?.Output ?? 0 },
   ].filter((i) => i.value > 0)
   return {
     tooltip: {

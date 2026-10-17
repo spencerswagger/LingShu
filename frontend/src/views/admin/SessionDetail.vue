@@ -5,8 +5,14 @@ import { listSessions, listSessionCalls, type AdminSession, type CallLogView } f
 import { fmtDateTime } from '@/utils/format'
 import ErrorBubble from '@/components/ErrorBubble.vue'
 import StatusTag from '@/components/StatusTag.vue'
-import ChatBubble from '@/components/ChatBubble.vue'
-import { contentToBubbles, fmtJson, type MsgBubble } from '@/utils/messageParts'
+import MessageBubbleGroup from '@/components/MessageBubbleGroup.vue'
+import {
+  asMessageList,
+  parseRespBody,
+  contentOfBody,
+  type ChatMessage,
+  type RespInfo,
+} from '@/utils/messageParts'
 
 const props = withDefaults(defineProps<{ mode?: 'admin' | 'self' }>(), { mode: 'admin' })
 const isSelf = computed(() => props.mode === 'self')
@@ -40,84 +46,15 @@ onMounted(async () => {
 })
 
 // ===== 调用记录 =====
-interface TranscriptMsg {
-  role?: string
-  content?: unknown
-}
-interface RespInfo {
-  text: string
-  reasoning: string
-  toolCalls: unknown[]
-}
 interface TranscriptItem {
   call: CallLogView
-  msgs: TranscriptMsg[]
+  msgs: ChatMessage[]
   resp: RespInfo
   channel: { channel: string; key: string; model: string }
 }
 
-function msgList(v: unknown): TranscriptMsg[] {
-  if (!Array.isArray(v)) return []
-  return v.map((m) => (m && typeof m === 'object' ? (m as TranscriptMsg) : { content: m }))
-}
 function msgSide(role?: string) {
   return role === 'user' ? 'right' : 'left'
-}
-
-// 消息 content → 多气泡（纯文本/多模态数组/XML 标签块）
-function bubblesOf(m: TranscriptMsg): MsgBubble[] {
-  return contentToBubbles(m.content)
-}
-
-// 解析 RespBody（非流式消息对象 / 流式 assistant 增量数组 / 纯文本）：
-// 提取 content 文本、reasoning 推理过程与 tool_calls
-function respInfo(cl: CallLogView): RespInfo {
-  if (!cl.RespBody) return { text: '', reasoning: '', toolCalls: [] }
-  const out: RespInfo = { text: '', reasoning: '', toolCalls: [] }
-  const walk = (p: unknown): void => {
-    if (p == null) return
-    if (typeof p === 'string') {
-      if (p) out.text += p
-      return
-    }
-    if (Array.isArray(p)) {
-      for (const x of p) walk(x)
-      return
-    }
-    if (typeof p === 'object') {
-      const o = p as Record<string, any>
-      if (typeof o.content === 'string' && o.content) out.text += o.content
-      if (Array.isArray(o.content)) {
-        for (const c of o.content) {
-          if (typeof c === 'string' && c) out.text += c
-          else if (c && typeof c.text === 'string' && c.text) out.text += c.text
-        }
-      }
-      // 推理过程（推理型模型 delta 携带）
-      if (typeof o.reasoning_content === 'string' && o.reasoning_content) out.reasoning += o.reasoning_content
-      if (Array.isArray(o.reasoning_content)) {
-        for (const c of o.reasoning_content) {
-          if (typeof c === 'string' && c) out.reasoning += c
-          else if (c && typeof c.text === 'string' && c.text) out.reasoning += c.text
-        }
-      }
-      if (Array.isArray(o.tool_calls)) {
-        out.toolCalls.push(...o.tool_calls.filter((t: any) => t && (t.function || t.id)))
-      }
-      // 包裹层（OpenAI choices / message / delta）
-      for (const k of ['choices', 'message', 'delta']) {
-        const inner = o[k]
-        if (Array.isArray(inner)) for (const x of inner) walk(x)
-        else if (inner && typeof inner === 'object') walk(inner)
-      }
-    }
-  }
-  try {
-    walk(JSON.parse(cl.RespBody))
-  } catch {
-    return { text: cl.RespBody, reasoning: '', toolCalls: [] }
-  }
-  return out
 }
 
 // 渠道/密钥/内部模型：优先 Decision.result，缺省回退 attempts 末条
@@ -148,7 +85,12 @@ function callChannel(cl: CallLogView): { channel: string; key: string; model: st
 }
 
 const transcript = computed<TranscriptItem[]>(() =>
-  calls.value.map((c) => ({ call: c, msgs: msgList(c.ReqMessages), resp: respInfo(c), channel: callChannel(c) })),
+  calls.value.map((c) => ({
+    call: c,
+    msgs: asMessageList(c.ReqMessages),
+    resp: parseRespBody(c.RespBody),
+    channel: callChannel(c),
+  })),
 )
 </script>
 
@@ -214,7 +156,7 @@ const transcript = computed<TranscriptItem[]>(() =>
           </div>
         </div>
 
-        <div v-if="item.msgs.length || item.call.RespBody" class="msgs">
+        <div v-if="item.msgs.length || item.call.RespBody || item.call.ErrorMessage" class="msgs">
           <div
             v-for="(m, mi) in item.msgs"
             :key="mi"
@@ -222,40 +164,39 @@ const transcript = computed<TranscriptItem[]>(() =>
             :class="msgSide(m.role) === 'right' ? 'is-user' : 'is-other'"
           >
             <div class="msg-cluster">
-              <div class="msg-role">{{ m.role || 'message' }}</div>
-              <template v-if="bubblesOf(m).length">
-                <div v-for="(b, bi) in bubblesOf(m)" :key="bi" class="msg-bubble">
-                  <ChatBubble :bubble="b" />
-                </div>
-              </template>
-              <div v-else class="msg-empty">（无文本内容）</div>
+              <MessageBubbleGroup
+                :role="m.role || 'message'"
+                :content="m.content"
+                :tone="m.role === 'user' ? 'user' : 'assistant'"
+                empty-text="（无文本内容）"
+              />
             </div>
           </div>
 
           <div class="msg-row is-other">
             <div class="msg-cluster">
-              <div class="msg-role">{{ item.call.RespKind === 'error' ? '错误' : 'assistant 响应' }}</div>
-              <div v-if="item.call.RespKind === 'error' && item.call.ErrorMessage" class="resp-error">
-                {{ item.call.ErrorMessage }}
-              </div>
-              <template v-else-if="item.resp.text || item.resp.reasoning">
-                <div v-if="item.resp.text" class="msg-bubble">
-                  <ChatBubble :bubble="{ kind: 'text', text: item.resp.text }" />
-                </div>
-                <div v-if="item.resp.reasoning" class="msg-bubble">
-                  <ChatBubble :bubble="{ kind: 'xml', tag: 'reasoning', text: item.resp.reasoning }" />
-                </div>
+              <!-- 失败调用：错误原因 + 上游原始响应（若有），两者都不吞 -->
+              <template v-if="item.call.RespKind === 'error'">
+                <div v-if="item.call.ErrorMessage" class="resp-error">{{ item.call.ErrorMessage }}</div>
+                <MessageBubbleGroup
+                  v-if="item.call.RespBody"
+                  role="错误响应"
+                  :content="contentOfBody(item.call.RespBody)"
+                />
               </template>
-              <template v-else>
-                <div class="msg-bubble">
-                  <ChatBubble :bubble="{ kind: 'json', text: item.call.RespBody || '—' }" />
-                </div>
-              </template>
-              <div v-if="item.resp.toolCalls.length">
-                <div v-for="(tc, ti) in item.resp.toolCalls" :key="ti" class="msg-bubble tool-bubble">
-                  <ChatBubble :bubble="{ kind: 'tool', text: fmtJson(tc) }" />
-                </div>
-              </div>
+              <MessageBubbleGroup
+                v-else-if="item.resp.text || item.resp.reasoning || item.resp.toolCalls.length"
+                role="assistant 响应"
+                :content="item.resp.text"
+                :reasoning="item.resp.reasoning"
+                :tool-calls="item.resp.toolCalls"
+              />
+              <MessageBubbleGroup
+                v-else
+                role="assistant 响应"
+                :content="contentOfBody(item.call.RespBody || '')"
+                empty-text="（无内容）"
+              />
             </div>
           </div>
         </div>
@@ -342,31 +283,10 @@ const transcript = computed<TranscriptItem[]>(() =>
 .msg-row.is-user .msg-cluster {
   align-items: flex-end;
 }
-.msg-bubble {
-  max-width: 100%;
-  padding: 8px 12px;
-  border-radius: 10px;
-  background: var(--color-fill, #f6f7fa);
-  overflow-wrap: break-word;
-}
-.msg-row.is-user .msg-bubble {
-  background: var(--el-color-primary-light-9, #eef0fe);
-}
-.msg-role {
-  font-size: 11px;
-  color: var(--color-text-tertiary);
-  margin-bottom: 2px;
-}
-.msg-empty {
-  font-size: 12px;
-  color: var(--color-text-tertiary);
-}
-.tool-bubble {
-  width: 100%;
-}
 .resp-error {
   font-size: 13px;
   font-weight: 600;
   color: var(--color-danger);
+  margin-bottom: 6px;
 }
 </style>

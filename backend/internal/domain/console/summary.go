@@ -62,7 +62,8 @@ type meSummaryResp struct {
 	MonthCredits     float64 `json:"MonthCredits"`
 	RPM              float64 `json:"RPM"`
 	TPM              float64 `json:"TPM"`
-	// 本月缓存口径：InputTokens=输入(含缓存读)总量，CacheReadTokens=缓存读命中量；前端据此算缓存命中率。
+	// 本月缓存口径：InputTokens=纯输入（不含缓存读）总量，CacheReadTokens=缓存读命中量；
+	// 前端据此算缓存命中率（分母 = 输入 + 缓存读）。
 	InputTokens     int64 `json:"InputTokens"`
 	CacheReadTokens int64 `json:"CacheReadTokens"`
 }

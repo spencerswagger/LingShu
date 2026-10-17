@@ -7,7 +7,7 @@ import (
 )
 
 func fullRates() Rates {
-	return Rates{"input": 1.0, "output": 2.0, "cache_read": 0.1, "cache_write": 0.3, "reasoning": 1.0}
+	return Rates{"input": 1.0, "output": 2.0, "cache_read": 0.1}
 }
 
 func TestComputeCredits(t *testing.T) {
@@ -22,7 +22,7 @@ func TestComputeCredits(t *testing.T) {
 		wantErr   bool
 	}{
 		{
-			// 产品文档示例：五段求和 = 1234×1 + 567×2 = 2368；÷10000 = 0.2368（文档 §2.1.2 给出 0.2368）
+			// 产品文档示例：三段求和 = 1234×1 + 567×2 = 2368；÷10000 = 0.2368（文档 §2.1.2 给出 0.2368）
 			name: "文档示例", u: Usage{Input: 1234, Output: 567}, rates: fullRates(),
 			timeCoeff: 1.0, ctxCoeff: 1.0, r: 10000, want: 0.2368,
 		},
@@ -31,23 +31,24 @@ func TestComputeCredits(t *testing.T) {
 			timeCoeff: 0.5, ctxCoeff: 1.0, r: 10000, want: 0.1184, // 0.2368 × 0.5
 		},
 		{
-			// 缓存命中段参与计费：输入全额 1000 中含缓存 100 → 非缓存 900×1 + 缓存 100×0.1 = 910；÷1000 = 0.91
+			// 三段互斥：输入(纯输入)1000×1 + 缓存读 100×0.1 = 1010；÷1000 = 1.01
 			name: "cache_read参与", u: Usage{Input: 1000, CacheRead: 100}, rates: fullRates(),
-			timeCoeff: 1.0, ctxCoeff: 1.0, r: 1000, want: 0.91,
+			timeCoeff: 1.0, ctxCoeff: 1.0, r: 1000, want: 1.01,
 		},
 		{
-			// 全部缓存命中：Input==CacheRead → input 段 0，只按 cache_read 价计 = 1000×0.1 = 100；÷1000 = 0.1
+			// 全部缓存命中：输入 1000×1 + 缓存读 1000×0.1 = 1100；÷1000 = 1.1
 			name: "cache_read全命中", u: Usage{Input: 1000, CacheRead: 1000}, rates: fullRates(),
-			timeCoeff: 1.0, ctxCoeff: 1.0, r: 1000, want: 0.1,
+			timeCoeff: 1.0, ctxCoeff: 1.0, r: 1000, want: 1.1,
 		},
 		{
-			// 防御：cached_tokens 异常大于 prompt_tokens → nonCachedIn 按 0 计
-			name: "cache_read异常大于输入", u: Usage{Input: 100, CacheRead: 1000}, rates: fullRates(),
-			timeCoeff: 1.0, ctxCoeff: 1.0, r: 1000, want: 0.1, // 1000×0.1 ÷ 1000
+			// 输入与缓存读互斥直接求和：输入 100×1 + 缓存读 1000×0.1 = 200；÷1000 = 0.2
+			name: "cache_read大于输入", u: Usage{Input: 100, CacheRead: 1000}, rates: fullRates(),
+			timeCoeff: 1.0, ctxCoeff: 1.0, r: 1000, want: 0.2,
 		},
 		{
-			name: "cache_write-缓存回写", u: Usage{CacheWrite: 5000}, rates: fullRates(),
-			timeCoeff: 1.2, ctxCoeff: 1.5, r: 10000, want: 0.27, // 5000×0.3×1.2×1.5/10000=0.27
+			// 上游「缓存写」token 属于输入：5000×1.0×1.2×1.5 = 9000；÷10000 = 0.9
+			name: "缓存写并入输入按 input 计价", u: Usage{Input: 5000}, rates: fullRates(),
+			timeCoeff: 1.2, ctxCoeff: 1.5, r: 10000, want: 0.9,
 		},
 		{
 			name: "r非正数报错", u: Usage{Input: 10}, rates: fullRates(),
@@ -58,7 +59,7 @@ func TestComputeCredits(t *testing.T) {
 			timeCoeff: 1.0, ctxCoeff: 1.0, r: 10000, wantErr: true,
 		},
 		{
-			name: "负单价格报错", u: Usage{Input: 10}, rates: Rates{"input": -1.0, "output": 1, "cache_read": 1, "cache_write": 1, "reasoning": 1},
+			name: "负单价格报错", u: Usage{Input: 10}, rates: Rates{"input": -1.0, "output": 1, "cache_read": 1},
 			timeCoeff: 1.0, ctxCoeff: 1.0, r: 10000, wantErr: true,
 		},
 	}

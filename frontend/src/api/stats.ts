@@ -2,13 +2,11 @@ import { http, type ApiRes } from './http'
 
 // ===== 统计页（统一仪表盘）聚合接口：admin 全局 / dev 本人，同一响应结构 =====
 
-// 五段 Token 用量（后端 UsageSplit）
+// 三段 Token 用量（后端 UsageSplit）
 export interface StatsUsageSplit {
   Input: number
   Output: number
   CacheRead: number
-  CacheWrite: number
-  Reasoning: number
 }
 
 // 按天聚合行（后端 DashDay）

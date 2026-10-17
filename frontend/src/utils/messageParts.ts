@@ -144,3 +144,89 @@ function textBlocksOf(v: unknown): string {
   }
   return ''
 }
+
+// ===== 消息 / 响应解析（会话时间线与账单详情共用，避免两处口径漂移） =====
+
+/** 一条聊天消息（请求增量 / 会话消息）。 */
+export interface ChatMessage {
+  role?: string
+  content?: unknown
+}
+
+/** 请求增量 / 会话消息列表：非数组返回空；元素非对象时按 {content} 包装（兼容纯字符串数组）。 */
+export function asMessageList(v: unknown): ChatMessage[] {
+  if (!Array.isArray(v)) return []
+  return v.map((m) => (m && typeof m === 'object' ? (m as ChatMessage) : { content: m }))
+}
+
+/** 响应体的结构化内容：正文 / 推理 / 工具调用。 */
+export interface RespInfo {
+  text: string
+  reasoning: string
+  toolCalls: unknown[]
+}
+
+/**
+ * 响应体 → 结构化内容：
+ * 兼容非流式消息对象、流式 assistant 增量、OpenAI choices/message/delta 包裹层与纯文本；
+ * 无法解析为 JSON 时整体按纯文本返回。三者为空表示「非消息形状」（如上游错误体），
+ * 调用方应展示原始 JSON，不要吞掉原文。
+ */
+export function parseRespBody(body: string): RespInfo {
+  const out: RespInfo = { text: '', reasoning: '', toolCalls: [] }
+  if (!body) return out
+  const walk = (p: unknown): void => {
+    if (p == null) return
+    if (typeof p === 'string') {
+      if (p) out.text += p
+      return
+    }
+    if (Array.isArray(p)) {
+      for (const x of p) walk(x)
+      return
+    }
+    if (typeof p === 'object') {
+      const o = p as Record<string, any>
+      if (typeof o.content === 'string' && o.content) out.text += o.content
+      if (Array.isArray(o.content)) {
+        for (const c of o.content) {
+          if (typeof c === 'string' && c) out.text += c
+          else if (c && typeof c.text === 'string' && c.text) out.text += c.text
+        }
+      }
+      // 推理过程（推理型模型 delta 携带）
+      if (typeof o.reasoning_content === 'string' && o.reasoning_content) out.reasoning += o.reasoning_content
+      if (Array.isArray(o.reasoning_content)) {
+        for (const c of o.reasoning_content) {
+          if (typeof c === 'string' && c) out.reasoning += c
+          else if (c && typeof c.text === 'string' && c.text) out.reasoning += c.text
+        }
+      }
+      if (Array.isArray(o.tool_calls)) {
+        out.toolCalls.push(...o.tool_calls.filter((t: any) => t && (t.function || t.id)))
+      }
+      // 包裹层（OpenAI choices / message / delta）
+      for (const k of ['choices', 'message', 'delta']) {
+        const inner = o[k]
+        if (Array.isArray(inner)) for (const x of inner) walk(x)
+        else if (inner && typeof inner === 'object') walk(inner)
+      }
+    }
+  }
+  try {
+    walk(JSON.parse(body))
+  } catch {
+    return { text: body, reasoning: '', toolCalls: [] }
+  }
+  return out
+}
+
+/** 响应体 → 可直接交给 contentToBubbles 的内容：JSON 可解析则给解析结果，否则给原文。 */
+export function contentOfBody(body: string): unknown {
+  if (!body) return ''
+  try {
+    return JSON.parse(body)
+  } catch {
+    return body
+  }
+}

@@ -1,4 +1,4 @@
-// Package billing 提供大模型 API 调用的计费引擎（五段计费公式、上下文分档、
+// Package billing 提供大模型 API 调用的计费引擎（三段计费公式、上下文分档、
 // 时段系数、记账与钱包扣减）。本包只依赖接口，不耦合具体领域实现。
 package billing
 
@@ -8,41 +8,44 @@ import (
 	"strings"
 )
 
-// Usage 一次调用的五段 token 用量（单位：个）。
+// Usage 一次调用的三段 token 用量（单位：个）。
+// 口径（全平台统一，各上游协议的 usage 归一到这里）：
+//   - Input：纯输入，不含缓存读；上游的「缓存写」token（Anthropic 的
+//     cache_creation_input_tokens、百炼显式缓存的 cache_creation_input_tokens）
+//     属于输入 token，计入本段。
+//   - CacheRead：命中提示词缓存读取的输入。
+//   - Output：生成 token，含推理（Anthropic 无独立推理字段，推理本就在 output 内）。
+//
 // 该结构同时是 billing_records.tokens 的 JSONB 存储值，键必须保持 snake（存储契约），
 // 对外（HTTP）一律使用 WireUsage。
 type Usage struct {
-	Input      int64 `json:"input"`
-	Output     int64 `json:"output"`
-	CacheRead  int64 `json:"cache_read"`
-	CacheWrite int64 `json:"cache_write"`
-	Reasoning  int64 `json:"reasoning"`
+	Input     int64 `json:"input"`
+	Output    int64 `json:"output"`
+	CacheRead int64 `json:"cache_read"`
 }
 
 // WireUsage 是 Usage 的对外视图：JSON 键为 PascalCase（内部 API 契约），
 // 与 DB 存储（billing_records.tokens 的 snake 键）区分。仅用于 HTTP 响应/请求边界。
 // 与 Usage 之间可直接类型转换（字段同名同类型，仅 tag 不同）。
 type WireUsage struct {
-	Input      int64 `json:"Input"`
-	Output     int64 `json:"Output"`
-	CacheRead  int64 `json:"CacheRead"`
-	CacheWrite int64 `json:"CacheWrite"`
-	Reasoning  int64 `json:"Reasoning"`
+	Input     int64 `json:"Input"`
+	Output    int64 `json:"Output"`
+	CacheRead int64 `json:"CacheRead"`
 }
 
-// Rates 五段 token 的倍率表（倍率 = 人民币每百万 token 价格，无单位纯数字），键只能是五个 rateKey。
+// Rates 三段 token 的倍率表（倍率 = 人民币每百万 token 价格，无单位纯数字），键只能是三个 rateKey。
 // 该 map 同时是 external_models.sale_rates / channel_models.cost_rates 的 JSONB 存储值，
 // 键必须保持 snake（存储契约），对外（HTTP）一律使用 WireRates。
 type Rates map[string]float64
 
 // WireRates 是 Rates 的对外视图：JSON 键为 PascalCase（内部 API 契约），
 // 内部仍以 snake 键保存（与存储结构一致），因此可与 Rates 直接类型转换。
-// 兼容性：Marshal 时未知键（非五段）原样输出；Unmarshal 时既接受 PascalCase 也接受 snake 键。
+// 兼容性：Marshal 时未知键（非三段）原样输出；Unmarshal 时既接受 PascalCase 也接受 snake 键。
 type WireRates Rates
 
-// rateKeys 计费单价必须包含的五个键（售价/成本通用，与 external_models.sale_rates、
+// rateKeys 计费单价必须包含的三个键（售价/成本通用，与 external_models.sale_rates、
 // channel_models.cost_rates 的键保持一致）。
-var rateKeys = []string{"input", "output", "cache_read", "cache_write", "reasoning"}
+var rateKeys = []string{"input", "output", "cache_read"}
 
 // rateKeyPascal / rateKeySnake 由 rateKeys 推导出的双向命名映射（如 cache_read ↔ CacheRead）。
 var rateKeyPascal, rateKeySnake = buildRateKeyMaps()
@@ -107,7 +110,7 @@ func (w *WireRates) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-// ValidateRates 校验单价表：键齐全且均非负。
+// ValidateRates 校验单价表：三个键齐全且均非负（历史数据里的多余键不参与校验、不影响计费）。
 func ValidateRates(r Rates) error {
 	for _, k := range rateKeys {
 		v, ok := r[k]
@@ -121,17 +124,11 @@ func ValidateRates(r Rates) error {
 	return nil
 }
 
-// sumRates 计算五段 token×单价 之和。
-// 输入计费口径：Input 是全部输入 token（含命中缓存的 CacheRead 部分），缓存命中部分只按 cache_read 价计，
-// 因此 input 段按 (Input - CacheRead) 计、CacheRead 段按 cache_read 价计，避免缓存命中 token 双重计费。
+// sumRates 计算三段 token×单价 之和。
+// 三段互斥（Input 为纯输入、不含缓存读），直接相加即可，
+// 不存在缓存命中 token 被输出价与缓存价重复累计的问题。
 func sumRates(u Usage, r Rates) float64 {
-	nonCachedIn := u.Input - u.CacheRead
-	if nonCachedIn < 0 {
-		nonCachedIn = 0 // 防御：上游返回的 cached_tokens 异常大于 prompt_tokens 时按 0 计
-	}
-	return float64(nonCachedIn)*r["input"] +
+	return float64(u.Input)*r["input"] +
 		float64(u.Output)*r["output"] +
-		float64(u.CacheRead)*r["cache_read"] +
-		float64(u.CacheWrite)*r["cache_write"] +
-		float64(u.Reasoning)*r["reasoning"]
+		float64(u.CacheRead)*r["cache_read"]
 }

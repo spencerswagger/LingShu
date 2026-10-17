@@ -131,6 +131,9 @@ export interface CallLogView {
   ReqMessages: unknown // 请求增量 JSON（可能 null）
   RespBody: string // 非流式完整响应体 / 流式 assistant 增量 JSON / 错误
   Decision: unknown // 决策轨迹 JSON（可能 null）：{attempts:[{order,channel_id,channel_key_id,internal_model_id,reason}], time_coeff, ctx_coeff, pre_consumed, result}
+  // 上游原始 usage（可能 null）：{Protocol: 'openai-chat'|'openai-responses'|'anthropic-messages', Usage: {...上游原始键值...}}
+  // 用于诊断各渠道 usage 口径（billing_records.tokens 只有归一化后的三段）。
+  UpstreamUsage?: unknown
   PricingMode: string
 }
 

@@ -205,14 +205,16 @@ func TestNewSQLCallLogStore_InsertAndQuery(t *testing.T) {
 	store := gateway.NewSQLCallLogStore(db)
 	now := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
 	dur := int64(123)
+	// 上游原始 usage（诊断渠道口径）：落库值为 {"Protocol":...,"Usage":{...}}，见 gateway/rawusage.go。
+	upstreamUsage := []byte(`{"Protocol":"anthropic-messages","Usage":{"input_tokens":191,"cache_read_input_tokens":96896}}`)
 	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO call_logs(id, billing_id, request_id, session_id, user_id, channel_id, channel_key_id,
 	internal_model_id, external_model_id, model, auto_model_name, pricing_mode, status, req_messages, resp_body, resp_kind,
-	decision, error_message, duration_ms, first_token_ms, created_at)
-VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+	decision, error_message, duration_ms, first_token_ms, created_at, upstream_usage)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
 ON CONFLICT (billing_id) DO NOTHING`)).
 		WithArgs(sqlmock.AnyArg(), "bill-0001", "req-1", "sess-1", int64(7), int64(1), int64(2), "gpt-4-internal",
 			int64(1), "gpt-4", nil, "sale", "completed", []byte(`[{"role":"user","content":"a"}]`), `{"id":"x"}`,
-			"non_stream", []byte(`{"result":"success"}`), "", int64(123), nil, now).
+			"non_stream", []byte(`{"result":"success"}`), "", int64(123), nil, now, upstreamUsage).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	if err := store.Insert(context.Background(), &gateway.CallLog{
 		BillingID: "bill-0001", RequestID: "req-1", SessionID: "sess-1",
@@ -220,21 +222,22 @@ ON CONFLICT (billing_id) DO NOTHING`)).
 		InternalModelID: "gpt-4-internal", Model: "gpt-4", PricingMode: "sale", Status: "completed",
 		ReqMessages: []json.RawMessage{json.RawMessage(`{"role":"user","content":"a"}`)},
 		RespBody:    `{"id":"x"}`, RespKind: "non_stream",
-		Decision: map[string]any{"result": "success"}, DurationMs: &dur, FirstTokenMs: nil, CreatedAt: now,
+		Decision: map[string]any{"result": "success"}, UpstreamUsage: upstreamUsage,
+		DurationMs: &dur, FirstTokenMs: nil, CreatedAt: now,
 	}); err != nil {
 		t.Fatalf("insert: %v", err)
 	}
 
-	// ListBySession 读取（ReqMessages/Decision 为 JSONB bytes）。
+	// ListBySession 读取（ReqMessages/Decision/UpstreamUsage 为 JSONB bytes）。
 	rows := sqlmock.NewRows([]string{"billing_id", "request_id", "session_id", "user_id", "channel_id", "channel_key_id",
 		"internal_model_id", "external_model_id", "model", "auto_model_name", "pricing_mode", "status", "req_messages", "resp_body", "resp_kind",
-		"decision", "error_message", "duration_ms", "first_token_ms", "created_at"}).
+		"decision", "error_message", "duration_ms", "first_token_ms", "created_at", "upstream_usage"}).
 		AddRow("bill-0001", "req-1", "sess-1", int64(7), int64(1), int64(2), "gpt-4-internal", int64(1), "gpt-4", nil,
 			"sale", "completed", []byte(`[{"role":"user","content":"a"}]`), `{"id":"x"}`, "non_stream",
-			[]byte(`{"result":"success"}`), "", int64(123), nil, now)
+			[]byte(`{"result":"success"}`), "", int64(123), nil, now, upstreamUsage)
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT billing_id, request_id, session_id, user_id, channel_id, channel_key_id,
 	internal_model_id, external_model_id, model, auto_model_name, pricing_mode, status, req_messages, resp_body, resp_kind,
-	decision, error_message, duration_ms, first_token_ms, created_at FROM call_logs WHERE session_id=$1 ORDER BY created_at ASC`)).
+	decision, error_message, duration_ms, first_token_ms, created_at, upstream_usage FROM call_logs WHERE session_id=$1 ORDER BY created_at ASC`)).
 		WithArgs("sess-1").WillReturnRows(rows)
 
 	logs, err := store.ListBySession(context.Background(), "sess-1")
@@ -243,6 +246,9 @@ ON CONFLICT (billing_id) DO NOTHING`)).
 	}
 	if len(logs) != 1 {
 		t.Fatalf("list len want 1, got %d", len(logs))
+	}
+	if string(logs[0].UpstreamUsage) != string(upstreamUsage) {
+		t.Fatalf("UpstreamUsage=%s, want %s", logs[0].UpstreamUsage, upstreamUsage)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("mock expectations: %v", err)

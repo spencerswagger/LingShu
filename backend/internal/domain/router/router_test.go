@@ -29,7 +29,7 @@ func extRow(id int64, name string) *sqlmock.Rows {
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	return sqlmock.NewRows([]string{"id", "external_name", "description", "enabled", "sale_rates", "time_config", "context_tiers", "created_at", "updated_at"}).
 		AddRow(id, name, "", true,
-			`{"input":1.0,"output":2.0,"cache_read":0.1,"cache_write":0.3,"reasoning":1.0}`,
+			`{"input":1.0,"output":2.0,"cache_read":0.1}`,
 			nil, nil, now, now)
 }
 
@@ -91,15 +91,15 @@ func cm(chID int64, internal string) channel.ChannelModel {
 	return channel.ChannelModel{
 		ID: chID*100 + 1, ChannelID: chID, InternalModelID: internal,
 		ExternalModelID: 10, State: channel.StateNormal,
-		CostRates: billing.Rates{"input": 1, "output": 2, "cache_read": 0.1, "cache_write": 0.3, "reasoning": 1},
+		CostRates: billing.Rates{"input": 1, "output": 2, "cache_read": 0.1},
 	}
 }
 
-// cmCost 构造带指定 input 单价的候选（其余段为 0）：样值下成本标量 = (10000-9000) × inputRate，
-// 随 inputRate 单调，便于构造「谁更便宜」的确定性场景。inputRate=0 时五段全 0 = 成本未知。
+// cmCost 构造带指定 input 单价的候选（其余段为 0）：样值下成本标量 = 10000 × inputRate，
+// 随 inputRate 单调，便于构造「谁更便宜」的确定性场景。inputRate=0 时三段全 0 = 成本未知。
 func cmCost(chID int64, internal string, inputRate float64) channel.ChannelModel {
 	m := cm(chID, internal)
-	m.CostRates = billing.Rates{"input": inputRate, "output": 0, "cache_read": 0, "cache_write": 0, "reasoning": 0}
+	m.CostRates = billing.Rates{"input": inputRate, "output": 0, "cache_read": 0}
 	return m
 }
 
@@ -404,11 +404,11 @@ func TestRoute_SampleUsageChangesChoice(t *testing.T) {
 	svc, mock := newModelService(t, 2)
 	defer func() { _ = mock.ExpectationsWereMet() }()
 
-	// 渠道 1 只按 output 计价；渠道 2 只按 input（有效输入 = input - cache_read）计价。
+	// 渠道 1 只按 output 计价；渠道 2 只按 input（样值 input=10000）计价。
 	m1 := cm(1, "int1")
-	m1.CostRates = billing.Rates{"input": 0, "output": 1, "cache_read": 0, "cache_write": 0, "reasoning": 0}
+	m1.CostRates = billing.Rates{"input": 0, "output": 1, "cache_read": 0}
 	m2 := cm(2, "int2")
-	m2.CostRates = billing.Rates{"input": 1, "output": 0, "cache_read": 0, "cache_write": 0, "reasoning": 0}
+	m2.CostRates = billing.Rates{"input": 1, "output": 0, "cache_read": 0}
 	mgr := newManagerWithKeys(t, []*channel.Channel{
 		healthyCh(1, "a", nil, 100),
 		healthyCh(2, "b", nil, 100),
@@ -811,7 +811,7 @@ func TestSessionRegistry_CountActiveByChannel_NoResolverReturnsZero(t *testing.T
 // orderCandidates 直接单测：priority 降序 → 成本升序 → 存活会话数升序 → 稳定 id 兜底。
 func TestOrderCandidates_PriorityCostLoadThenID(t *testing.T) {
 	rates := func(v float64) billing.Rates {
-		return billing.Rates{"input": v, "output": 0, "cache_read": 0, "cache_write": 0, "reasoning": 0}
+		return billing.Rates{"input": v, "output": 0, "cache_read": 0}
 	}
 	sess := NewSessionRegistry(nil)
 	attachTo(t, sess, "sx", 33, "i3") // 渠道 3（keyID=33）已有 1 条存活会话

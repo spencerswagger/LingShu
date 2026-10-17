@@ -710,8 +710,8 @@ func (p *defaultConfigProvider) TimeConfig() (TimeCoeffConfig, error) {
 }
 
 // SampleUsage 读取 routing.cost_sample（路由成本比较样值用量，带内存缓存）。
-// JSON 键与 Usage 一致（input/output/cache_read/cache_write/reasoning）；未提供的段按 0 处理
-// （如 cache_write 缺省即 0）。该值仅用于新会话创建时的成本比较，不参与实际计费。
+// JSON 键与 Usage 一致（input/output/cache_read，三段口径）；未提供的段按 0 处理。
+// 该值仅用于新会话创建时的成本比较，不参与实际计费。
 func (p *defaultConfigProvider) SampleUsage() (Usage, error) {
 	p.mu.RLock()
 	cached := p.sample
