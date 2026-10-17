@@ -453,7 +453,9 @@ func (s *Service) flushRetryOnce(ctx context.Context) {
 }
 
 // requestCredits 解析一次请求的应付积分与系数（Record 结算与 EstimateCredits 预扣共用同一口径）：
-// 模型级 time_config/context_tiers 非空则优先，否则回落全局；ctxCoeff 仅按输入 token 分档。
+// 模型级 time_config/context_tiers 非空则优先，否则回落全局；
+// ctxCoeff 按总输入 token（Input + CacheRead）分档——分档语义是「上下文长度」，
+// 三段口径下 Input 只是纯输入，必须加上缓存读才是本次请求实际处理的上下文规模。
 func (s *Service) requestCredits(req RecordReq) (credits, timeCoeff, ctxCoeff float64, r int64, err error) {
 	r, err = s.cfg.R()
 	if err != nil {
@@ -479,7 +481,7 @@ func (s *Service) requestCredits(req RecordReq) (credits, timeCoeff, ctxCoeff fl
 	if err != nil {
 		return 0, 0, 0, 0, err
 	}
-	ctxCoeff, err = ContextTierCoeff(req.Tokens.Input, tiers)
+	ctxCoeff, err = ContextTierCoeff(req.Tokens.Input+req.Tokens.CacheRead, tiers)
 	if err != nil {
 		return 0, 0, 0, 0, err
 	}
