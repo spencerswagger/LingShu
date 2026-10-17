@@ -279,3 +279,36 @@ func TestService_GetByID_CacheZeroDBAndInvalidate(t *testing.T) {
 		t.Fatalf("expectations: %v", err)
 	}
 }
+
+// TestService_GetByID_DefensiveCopy 锁定 P2-7：GetByID 命中缓存返回防御性拷贝，
+// 消费方（网关 TagKVResolver 拿到 KVPairs）就地修改不得污染缓存快照。
+func TestService_GetByID_DefensiveCopy(t *testing.T) {
+	s, mock := mockStore(t)
+	now := time.Now()
+	q := regexp.QuoteMeta(`SELECT ` + cols + ` FROM semantic_tags WHERE id = $1 AND deleted_at IS NULL`)
+	mock.ExpectQuery(q).WithArgs(int64(1)).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "description", "kv_pairs", "enabled", "created_by", "created_at"}).
+			AddRow(int64(1), "gold", "", `{"tier":"gold"}`, true, nil, now))
+
+	first, err := s.store.GetByID(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	// 就地篡改返回值：不应影响已缓存的快照。
+	first.KVPairs["tier"] = "mutated"
+	first.KVPairs["extra"] = "x"
+
+	second, err := s.store.GetByID(context.Background(), 1) // 命中缓存，0 DB
+	if err != nil {
+		t.Fatalf("get2: %v", err)
+	}
+	if second.KVPairs["tier"] != "gold" {
+		t.Fatalf("缓存被返回值修改污染：%v", second.KVPairs)
+	}
+	if _, ok := second.KVPairs["extra"]; ok {
+		t.Fatalf("缓存被返回值修改污染（新增键泄漏）：%v", second.KVPairs)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("命中缓存不应再读库: %v", err)
+	}
+}

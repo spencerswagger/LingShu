@@ -211,18 +211,22 @@ func main() {
 	defer app.mgr.Stop()
 	// 优雅退出：排空非资金异步写队列并最终 fsync，完成后释放 writer 上下文。
 	// 用独立超时上下文，避免信号 ctx 已取消导致 Shutdown 立即超时（丢队列）。
-	defer func() {
+	// 封装为闭包，便于在 os.Exit 路径（会跳过 defer）显式调用；Shutdown/取消均幂等，可重复调用。
+	shutdownWriter := func() {
 		shCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := app.writer.Shutdown(shCtx); err != nil {
 			slog.Error("asyncwrite shutdown", "error", err)
 		}
 		writerCancel()
-	}()
+	}
+	defer shutdownWriter()
 
 	srv := server.New(cfg, d, logr, jwtMgr, app.sessions, app.auditStore, app.deps)
 	if err := srv.Run(ctx); err != nil {
 		slog.Error("server run", "error", err)
+		// os.Exit 会跳过所有 defer：此处显式先排空并关闭 async writer，避免退出时丢队列（P2-9）。
+		shutdownWriter()
 		os.Exit(1)
 	}
 }
@@ -399,6 +403,10 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	autoStore := automodel.NewStore(d)
 	autoSvc := automodel.NewService(autoStore)
 	autoSvc.SetReadCacheEnabled(readCacheOn)
+	// 跨包缓存失效（P1-4）：外部模型写路径变更 external_name/enabled 后，automodel.ResolveMembers
+	// 的结果（含 JOIN 自 external_models 的 ExternalName/Enabled）会过期，故接线使其立即失效。
+	// 两服务均已构造，此处一次性接线（写钩子先于网关消费读缓存，无「已读缓存但未接失效」窗口）。
+	modelSvc.SetNameWriteHook(autoSvc.InvalidateReadCache)
 	autoHandler := automodel.NewHandler(autoSvc)
 	// 开发端接口需从 context 解析当前登录用户（server.UserIDFrom 由中间件写入）。
 	autoHandler.SetUserIDFrom(server.UserIDFrom)

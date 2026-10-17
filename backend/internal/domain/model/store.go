@@ -75,32 +75,56 @@ type Store struct {
 	//   - 数据来源：external_models 表（仅 enabled=true 且 deleted_at IS NULL 的启用行）；
 	//   - 键 = external_name；值为命中的启用模型（查询所得完整快照，含 id/enabled）；
 	//     映射内 value=nil 表示「已确认无启用模型」的负缓存，避免不存在/停用名反复穿透到 DB；
+	//   - 键来自请求体（用户可控），故**有界**（extNameMax + FIFO 淘汰）：防止认证用户以海量
+	//     随机名打满负缓存造成内存耗尽 DoS。淘汰代价仅为回源一次 DB，不影响正确性。
 	//   - 失效点（写路径显式失效，无 TTL）：
 	//     本文件 Insert（按名失效）、Update/ApplySaleRates/BatchDelete（无旧名信息，整体清空），
 	//     以及 service.go 的 CreateModel/UpdateModel/BatchDeleteModels/ApplyPrice/SyncPrices。
 	//   - 关闭开关（SetReadCacheEnabled(false)）时退回直查，不读写缓存。
 	extNameMu    sync.RWMutex
 	extNameCache map[string]*ExternalModel
+	extNameOrder []string
+	extNameMax   int
 	// readCacheOff 为 true 时关闭缓存（安全态：全部直查 DB）。仅启动装配阶段设置，运行期不变。
 	readCacheOff bool
 }
 
+// defaultExternalNameCacheMax 对外名读缓存条目上限（键用户可控，必须有界）。
+const defaultExternalNameCacheMax = 100000
+
 // NewStore 创建对外模型存储，db 为 pgx stdlib 连接池。
 func NewStore(db *sql.DB) *Store {
-	return &Store{db: db}
+	return &Store{db: db, extNameMax: defaultExternalNameCacheMax}
 }
 
 // SetReadCacheEnabled 开关对外模型名读缓存（默认开启）；关闭后 GetByExternalName 直查 DB。
 func (s *Store) SetReadCacheEnabled(on bool) { s.readCacheOff = !on }
 
-// cacheExternalName 写入对外名缓存（m 为 nil 表示负缓存「无启用模型」）。
+// cacheExternalName 写入对外名缓存（m 为 nil 表示负缓存「无启用模型」），并做有界 FIFO 淘汰。
 func (s *Store) cacheExternalName(name string, m *ExternalModel) {
 	s.extNameMu.Lock()
 	if s.extNameCache == nil {
 		s.extNameCache = make(map[string]*ExternalModel)
 	}
+	if _, exists := s.extNameCache[name]; !exists {
+		s.extNameOrder = append(s.extNameOrder, name)
+	}
 	s.extNameCache[name] = m
+	s.evictExternalNamesLocked()
 	s.extNameMu.Unlock()
+}
+
+// evictExternalNamesLocked 当缓存条目超过上限时按插入顺序 FIFO 淘汰最早条目（调用方须持有写锁）。
+// extNameOrder 可能含被失效删除的陈旧键（弹到时跳过即可），但每个存活键必有对应表项，故必然收敛。
+func (s *Store) evictExternalNamesLocked() {
+	if s.extNameMax <= 0 {
+		return
+	}
+	for len(s.extNameCache) > s.extNameMax && len(s.extNameOrder) > 0 {
+		oldest := s.extNameOrder[0]
+		s.extNameOrder = s.extNameOrder[1:]
+		delete(s.extNameCache, oldest)
+	}
 }
 
 // invalidateExternalName 失效单个对外名称的缓存（写入后调用）。
@@ -114,7 +138,31 @@ func (s *Store) invalidateExternalName(name string) {
 func (s *Store) invalidateAllExternalNames() {
 	s.extNameMu.Lock()
 	s.extNameCache = nil
+	s.extNameOrder = nil
 	s.extNameMu.Unlock()
+}
+
+// cloneExternal 返回 ExternalModel 的防御性浅拷贝（并复制 SaleRates/ContextTiers 可变容器），
+// 避免缓存内部快照被外部消费方就地修改而污染缓存（P2-7）。
+func cloneExternal(m *ExternalModel) *ExternalModel {
+	if m == nil {
+		return nil
+	}
+	c := *m
+	if m.SaleRates != nil {
+		c.SaleRates = make(billing.Rates, len(m.SaleRates))
+		for k, v := range m.SaleRates {
+			c.SaleRates[k] = v
+		}
+	}
+	if m.ContextTiers != nil {
+		c.ContextTiers = append([]billing.TierRule(nil), m.ContextTiers...)
+	}
+	if m.TimeConfig != nil {
+		tc := *m.TimeConfig
+		c.TimeConfig = &tc
+	}
+	return &c
 }
 
 // GetByID 按主键查询；不存在返回 sql.ErrNoRows。
@@ -132,6 +180,7 @@ func (s *Store) GetByName(ctx context.Context, name string) (*ExternalModel, err
 // GetByExternalName 返回指定对外名称的启用模型（供路由/计费使用）。
 // 带内存缓存（见 Store.extNameCache 注释）：命中直接返回，零 DB 查询；未命中回源并写缓存
 // （含「无启用模型」负缓存）。无启用模型返回 sql.ErrNoRows。
+// 返回值始终为缓存快照的**防御性拷贝**，调用方就地修改不会污染缓存（P2-7）。
 func (s *Store) GetByExternalName(ctx context.Context, externalName string) (*ExternalModel, error) {
 	if !s.readCacheOff {
 		s.extNameMu.RLock()
@@ -141,7 +190,7 @@ func (s *Store) GetByExternalName(ctx context.Context, externalName string) (*Ex
 			if cached == nil {
 				return nil, sql.ErrNoRows
 			}
-			return cached, nil
+			return cloneExternal(cached), nil
 		}
 	}
 	row := s.db.QueryRowContext(ctx,
@@ -159,7 +208,7 @@ func (s *Store) GetByExternalName(ctx context.Context, externalName string) (*Ex
 	if !s.readCacheOff {
 		s.cacheExternalName(externalName, m)
 	}
-	return m, nil
+	return cloneExternal(m), nil
 }
 
 // List 按 enabled 过滤查询，未指定时返回全部。

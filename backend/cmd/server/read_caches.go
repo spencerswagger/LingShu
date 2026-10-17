@@ -14,8 +14,8 @@ import (
 //   - 数据来源：users.pricing_mode（经 identity.Store.GetByID 读取）；
 //   - 键 = userID；值为归一化后的计费模式（用户未设置时归一为 sale）；
 //   - 失效点（写路径显式失效，无 TTL）：identity 用户写路径
-//     （Service.AdminCreateUser / UpdateUser / BatchDeleteUsers）经 SetUserWriteHook 回调本缓存 Invalidate(userID)，
-//     用户计费模式变更后下一次解析立即读到新值；
+//     （Service.AdminCreateUser / UpdateUser / BatchDeleteUsers / AdminResetPassword）经 SetUserWriteHook
+//     回调本缓存 Invalidate(userID)，用户计费模式变更后下一次解析立即读到新值；
 //   - 未命中用户（sql.ErrNoRows）不写缓存，避免新建用户后被负缓存误导；
 //   - 由配置开关控制：关闭时装配层不创建缓存（resolver 传 nil），退回直查 DB。
 type pricingModeCache struct {

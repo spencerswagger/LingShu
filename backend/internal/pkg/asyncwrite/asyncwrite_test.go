@@ -271,8 +271,6 @@ func TestIdempotent(t *testing.T) {
 func TestBatchFSync(t *testing.T) {
 	ctx := context.Background()
 	var fsyncs int64
-	fsyncCounter = func() { atomic.AddInt64(&fsyncs, 1) }
-	defer func() { fsyncCounter = nil }()
 
 	walPath := filepath.Join(t.TempDir(), "wal.log")
 	w := New(Config{
@@ -281,6 +279,8 @@ func TestBatchFSync(t *testing.T) {
 		MaxBatch:   100,
 		QueueSize:  8192,
 	})
+	// 实例级测试钩子（取代旧包级变量，避免并行测试竞态），须在 Start 前设置。
+	w.fsyncCounter = func() { atomic.AddInt64(&fsyncs, 1) }
 	w.Start(ctx)
 
 	const n = 500
@@ -529,5 +529,117 @@ func TestWALRetainedOnFailure(t *testing.T) {
 	})
 	if err := w2.Shutdown(base); err != nil {
 		t.Fatalf("w2 Shutdown 失败: %v", err)
+	}
+}
+
+// TestSubmitBackpressureKeepsWAL 锁定 P1-1：队列背压溢出时 Submit 必须返回非 nil 错误，
+// 且**不得删除**已持久化的 WAL 记录（留待重启重放），避免已落盘的审计/会话/事件/调用日志静默丢失。
+func TestSubmitBackpressureKeepsWAL(t *testing.T) {
+	walPath := filepath.Join(t.TempDir(), "wal.log")
+	w := New(Config{
+		WALPath:    walPath,
+		AsyncKinds: map[Kind]bool{KindCallLog: true},
+		Shards:     1,
+		QueueSize:  1, // 每分片容量 1
+	})
+	// 故意不 Start：工作协程不消费队列，第二次提交必然触发背压超时。
+	if err := w.Submit(Job{
+		Kind: KindCallLog, Key: "k", IdempotencyKey: "idem-1", Payload: []byte("p1"),
+		Exec: func(context.Context) error { return nil },
+	}); err != nil {
+		t.Fatalf("首个提交失败: %v", err)
+	}
+	err := w.Submit(Job{
+		Kind: KindCallLog, Key: "k", IdempotencyKey: "idem-2", Payload: []byte("p2"),
+		Exec: func(context.Context) error { return nil },
+	})
+	if !errors.Is(err, ErrBackpressure) {
+		t.Fatalf("背压溢出应返回 ErrBackpressure，got %v", err)
+	}
+	if got := w.Stats().Dropped; got != 1 {
+		t.Fatalf("Dropped=%d，期望 1", got)
+	}
+	// 关键断言：被背压拒绝的任务其 WAL 记录必须保留。
+	data, rerr := os.ReadFile(walPath)
+	if rerr != nil {
+		t.Fatalf("读取 WAL 失败: %v", rerr)
+	}
+	if !bytes.Contains(data, []byte("idem-2")) {
+		t.Fatalf("背压溢出不得删除 WAL 记录，实际文件=%q", string(data))
+	}
+	if err := w.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown 失败: %v", err)
+	}
+}
+
+// TestSubmitWALWriteErrorNotQueued 锁定 P1-2：WAL 写入失败时必须返回错误且不入队、不执行 Exec，
+// 绝不把「未持久化」的任务伪称为已持久化。
+func TestSubmitWALWriteErrorNotQueued(t *testing.T) {
+	walPath := filepath.Join(t.TempDir(), "wal.log")
+	w := New(Config{
+		WALPath:    walPath,
+		AsyncKinds: map[Kind]bool{KindCallLog: true},
+	})
+	// 用只读句柄替换 WAL 文件，强制 appendWAL 写失败（Linux 下写只读 fd 返回 EBADF）。
+	ro, oerr := os.Open(walPath)
+	if oerr != nil {
+		t.Fatalf("只读打开 WAL 失败: %v", oerr)
+	}
+	defer ro.Close()
+	w.walMu.Lock()
+	if w.walFile != nil {
+		_ = w.walFile.Close()
+	}
+	w.walFile = ro
+	w.walMu.Unlock()
+
+	var ran int64
+	err := w.Submit(Job{
+		Kind: KindCallLog, Key: "k",
+		Exec: func(context.Context) error { atomic.AddInt64(&ran, 1); return nil },
+	})
+	if err == nil {
+		t.Fatal("WAL 写失败时 Submit 必须返回错误")
+	}
+	if got := w.Stats().Depth; got != 0 {
+		t.Fatalf("WAL 写失败不应入队，Depth=%d", got)
+	}
+	if atomic.LoadInt64(&ran) != 0 {
+		t.Fatal("WAL 写失败不应执行 Exec")
+	}
+}
+
+// TestIdemSetBounded 锁定 P1-3：幂等去重集合有界（FIFO 淘汰），不发生无界增长。
+func TestIdemSetBounded(t *testing.T) {
+	w := New(Config{AsyncKinds: map[Kind]bool{KindCallLog: true}})
+	w.idemMax = 8
+	for i := 0; i < 100; i++ {
+		if !w.claim(KindCallLog, fmt.Sprintf("idem-%d", i)) {
+			t.Fatalf("首次占用不应返回 false: %d", i)
+		}
+	}
+	w.idemMu.Lock()
+	got := len(w.done)
+	w.idemMu.Unlock()
+	if got > 8 {
+		t.Fatalf("去重集合应有界（<=8），got %d", got)
+	}
+	// 最早键已被 FIFO 淘汰：再次占用应成功（证明淘汰生效而非仅截断计数）。
+	if !w.claim(KindCallLog, "idem-0") {
+		t.Fatal("被 FIFO 淘汰的键应可再次占用")
+	}
+}
+
+// TestIdemKeyNamespacedByKind 锁定 P1-3：去重键带 Kind 命名空间，跨类别同名字符串互不误判。
+func TestIdemKeyNamespacedByKind(t *testing.T) {
+	w := New(Config{AsyncKinds: map[Kind]bool{KindCallLog: true, KindSession: true}})
+	if !w.claim(KindCallLog, "shared") {
+		t.Fatal("KindCallLog 首次占用应成功")
+	}
+	if !w.claim(KindSession, "shared") {
+		t.Fatal("不同 Kind 下同名 idem 不应被误判为重复")
+	}
+	if w.claim(KindCallLog, "shared") {
+		t.Fatal("同 Kind 同 idem 应判为重复")
 	}
 }

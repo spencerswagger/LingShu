@@ -62,9 +62,10 @@ func NewCreditStore(db *sql.DB) *CreditStore {
 	return &CreditStore{db: db}
 }
 
-// consumeCreditOn 原子条件扣减：单条 UPDATE 同时满足「余额充足 balance >= amount」与
-// 「非零余额 balance > 0」两个条件。返回 exists=false 表示无行命中（钱包缺失或余额不足），
-// 由调用方再区分 40401（钱包不存在）/ 40201（余额不足）。
+// consumeCreditOn 原子条件扣减：单条 UPDATE 以「余额充足 balance >= amount」为主条件。
+// `AND balance > 0` 是**防御性冗余**条件（本函数仅在 amount>0 时被调用，此时 balance>=amount>0
+// 已隐含 balance>0），保留为纵深防御，并非零余额守卫；真正的零余额守卫是 consumeOn 中 amount==0 的分支。
+// 返回 exists=false 表示无行命中（钱包缺失或余额不足），由调用方再区分 40401（钱包不存在）/ 40201（余额不足）。
 func consumeCreditOn(ctx context.Context, ex dbx.Execer, userID int64, amount float64) (after float64, exists bool, err error) {
 	var bal float64
 	err = ex.QueryRowContext(ctx,

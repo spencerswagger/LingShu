@@ -7,7 +7,8 @@
 //   - 安全模式：未开启异步的类别同步执行，绝不静默丢弃审计/会话数据。
 //
 // 丢失窗口上界 50ms：Submit 遇到队列满时最多短暂阻塞 50ms（等待下游消化），
-// 仍满才计 Dropped 并打日志；同步型类别则直接同步执行，不进入队列。
+// 仍满才计 Dropped、打 Error 日志并返回 ErrBackpressure（保留 WAL 记录待重启重放）；
+// 同步型类别则直接同步执行，不进入队列。
 package asyncwrite
 
 import (
@@ -17,6 +18,7 @@ import (
 	"hash/fnv"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -33,11 +35,15 @@ const (
 	backpressureWait     = 50 * time.Millisecond // 队列满时的短暂背压等待
 	maxExecAttempts      = 3                     // 单个任务最大执行尝试次数
 	retryBackoff         = 2 * time.Millisecond  // 重试间隔
+	// defaultIdemMaxEntries 幂等去重集合的有界上限（FIFO 淘汰）。
+	// 去重仅为「进程内至多一次」的性能优化，正确性由 DB 侧唯一约束（如账单 billing_id、
+	// 事件主键的 ON CONFLICT）兜底，故允许有界淘汰导致极少数重复执行，但不允许无界增长。
+	defaultIdemMaxEntries = 100000
 )
 
-// fsyncCounter 是测试钩子：每次真正执行一次 fsync 时（若非 nil）回调一次，
-// 便于断言组提交把 500 次写入压缩成远少于 500 次的 fsync。
-var fsyncCounter func()
+// ErrBackpressure 表示队列背压超时：任务已写入 WAL（若启用）但未能入队。
+// 调用方可据此感知「未入队但记录已持久化」，由下次重启重放兜底，绝不静默丢弃。
+var ErrBackpressure = errors.New("asyncwrite: 队列背压超时，任务未能入队")
 
 // Config 是 Writer 的构造配置；零值字段由 New 填充默认值。
 type Config struct {
@@ -115,9 +121,16 @@ type Writer struct {
 	replayMu sync.RWMutex
 	replay   map[Kind]replayFn
 
-	// 幂等去重集合（idemMu 保护）。
-	idemMu sync.Mutex
-	done   map[string]struct{}
+	// 幂等去重集合（idemMu 保护）。键带 Kind 命名空间（避免跨类别同名 IdempotencyKey 互相误判），
+	// 且默认有界（idemMax，FIFO 淘汰），防止长跑进程去重集合无界增长。
+	idemMu    sync.Mutex
+	done      map[string]struct{}
+	doneOrder []string
+	idemMax   int
+
+	// fsyncCounter 是测试钩子（每次真正 fsync 时回调一次）；作为实例字段而非包级变量，
+	// 避免并行测试共享可变状态产生数据竞争。须在 Start 之前设置。
+	fsyncCounter func()
 
 	commitCh chan struct{}
 
@@ -161,6 +174,7 @@ func New(cfg Config) *Writer {
 		pending:  make(map[uint64][]byte),
 		replay:   make(map[Kind]replayFn),
 		done:     make(map[string]struct{}),
+		idemMax:  defaultIdemMaxEntries,
 	}
 	w.shards = make([]*shard, cfg.Shards)
 	for i := range w.shards {
@@ -215,8 +229,9 @@ func (w *Writer) SetReplayFunc(kind Kind, fn func(ctx context.Context, key strin
 // Submit 提交一个任务。
 //
 //   - 若 AsyncKinds[job.Kind] 为 false（或 map 为 nil），同步执行 Exec 并返回其错误（安全模式）；
-//   - 否则写入 WAL（若已启用）并入队，成功返回 nil；队列满则短暂背压 50ms，
-//     仍满时计 Dropped 并打日志后返回 nil（绝不静默丢弃）。
+//   - 否则写入 WAL（若已启用）并入队：WAL 写入失败则记录日志并返回错误，不入队（不伪称已持久化）；
+//     队列满则短暂背压 50ms，仍满时计 Dropped、记 Error 日志并返回 ErrBackpressure——
+//     已持久化的 WAL 记录**保留**（不删除），留待重启重放，绝不静默丢弃。
 //   - Shutdown 之后调用返回错误。
 func (w *Writer) Submit(job Job) error {
 	if !w.cfg.AsyncKinds[job.Kind] {
@@ -236,17 +251,22 @@ func (w *Writer) Submit(job Job) error {
 		return errors.New("asyncwrite: writer 已关闭，拒绝新的提交")
 	}
 
-	seq, _ := w.appendWAL(job)
+	// 先落 WAL 再入队。WAL 写失败意味着「未持久化」，必须把错误如实返回给调用方，
+	// 绝不入队、不宣称已持久化（否则会在队列丢失时造成隐性数据丢失）。
+	seq, err := w.appendWAL(job)
+	if err != nil {
+		return err
+	}
 
 	w.depth.Add(1)
 	env := envelope{job: job, seq: seq}
 	if !w.enqueueLocked(env) {
 		w.depth.Add(-1)
 		w.dropped.Add(1)
-		logger.Fallback().Error("asyncwrite: 队列背压超时，任务被丢弃",
+		// 背压溢出：保留 WAL 记录（不 dropWAL）以便重启重放，并返回非 nil 错误，避免静默丢弃。
+		logger.Fallback().Error("asyncwrite: 队列背压超时，任务未入队（WAL 记录保留待重放）",
 			"kind", job.Kind, "key", job.Key, "idem", job.IdempotencyKey)
-		w.dropWAL(seq)
-		return nil
+		return ErrBackpressure
 	}
 	return nil
 }
@@ -342,13 +362,13 @@ func (w *Writer) worker(ctx context.Context, s *shard) {
 // process 执行单个任务：幂等去重 -> 有限重试执行 -> 仅成功后删除 WAL 记录。
 // 关键契约（不允许隐性丢失）：执行失败（重试耗尽）时**保留** WAL 记录，绝不 dropWAL——
 // 记录留待下次启动重放，与「绝不静默丢弃审计/会话」一致；仅成功或重复幂等键才删除记录。
-// 幂等语义：非空 IdempotencyKey 在本次运行内至多成功执行一次（done 集合进程内驻留、不释放，
-// 属既定取舍——超长运行进程应由上层周期轮换 Writer，避免去重集合无限增长）。
+// 幂等语义：非空 IdempotencyKey 在本次运行内至多成功执行一次（done 集合按 Kind 命名空间 +
+// 有界 FIFO 淘汰；淘汰仅意味着极少数重复执行，DB 侧 ON CONFLICT 等唯一约束仍保证最终幂等）。
 func (w *Writer) process(ctx context.Context, env envelope) {
 	defer w.depth.Add(-1)
 
 	job := env.job
-	if !w.claim(job.IdempotencyKey) {
+	if !w.claim(job.Kind, job.IdempotencyKey) {
 		w.dropWAL(env.seq)
 		return
 	}
@@ -377,17 +397,39 @@ func (w *Writer) process(ctx context.Context, env envelope) {
 }
 
 // claim 对非空 IdempotencyKey 做一次性占用，返回 false 表示已被占用（应跳过）。
-func (w *Writer) claim(idem string) bool {
+// 去重键带 Kind 命名空间，避免不同类别复用同一字符串 idem 时互相误判；
+// 集合有界（idemMax），超限按插入顺序 FIFO 淘汰最早条目（E6 修复：防无界增长）。
+func (w *Writer) claim(kind Kind, idem string) bool {
 	if idem == "" {
 		return true
 	}
+	key := idemKey(kind, idem)
 	w.idemMu.Lock()
 	defer w.idemMu.Unlock()
-	if _, ok := w.done[idem]; ok {
+	if _, ok := w.done[key]; ok {
 		return false
 	}
-	w.done[idem] = struct{}{}
+	w.done[key] = struct{}{}
+	w.doneOrder = append(w.doneOrder, key)
+	w.evictIdemLocked()
 	return true
+}
+
+// evictIdemLocked 当去重集合超过上限时按插入顺序淘汰最早条目（调用方须持有 idemMu）。
+func (w *Writer) evictIdemLocked() {
+	if w.idemMax <= 0 {
+		return
+	}
+	for len(w.done) > w.idemMax && len(w.doneOrder) > 0 {
+		oldest := w.doneOrder[0]
+		w.doneOrder = w.doneOrder[1:]
+		delete(w.done, oldest)
+	}
+}
+
+// idemKey 生成去重键：Kind 命名空间 + 原始幂等键，避免跨类别同名冲突。
+func idemKey(kind Kind, idem string) string {
+	return strconv.Itoa(int(kind)) + ":" + idem
 }
 
 // replayRecovered 对 New 时加载的 WAL 记录做重放：命中重放函数且幂等未完成才执行。
@@ -398,7 +440,7 @@ func (w *Writer) replayRecovered(ctx context.Context) {
 			logger.Fallback().Error("asyncwrite: WAL 记录解析失败", "err", err)
 			continue
 		}
-		if !w.claim(idem) {
+		if !w.claim(kind, idem) {
 			w.dropWAL(lr.seq)
 			continue
 		}
@@ -558,11 +600,11 @@ func (w *Writer) commit(force bool) {
 	w.walDirty = false
 }
 
-// recordFSync 记录 fsync 时间并回调测试钩子。
+// recordFSync 记录 fsync 时间并回调测试钩子（实例钩子，避免包级共享状态竞态）。
 func (w *Writer) recordFSync() {
 	w.lastSync.Store(time.Now().UnixNano())
-	if fsyncCounter != nil {
-		fsyncCounter()
+	if w.fsyncCounter != nil {
+		w.fsyncCounter()
 	}
 }
 
