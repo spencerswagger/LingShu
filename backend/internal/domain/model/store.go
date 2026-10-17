@@ -357,6 +357,8 @@ func (s *Store) Update(ctx context.Context, m *ExternalModel) error {
 }
 
 // ApplySaleRates 仅更新售价与 updated_at（一键应用 models.dev 参考价），不动其它字段。
+// 缓存失效由调用方负责（service.ApplyPrice 按名精确失效、SyncPrices 循环结束后整体失效一次），
+// 以免批量同步时每次调用都整体清空缓存造成写放大（此处不再自行 invalidateAll）。
 func (s *Store) ApplySaleRates(ctx context.Context, id int64, rates billing.Rates) error {
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE external_models SET sale_rates=$1, updated_at=now() WHERE id=$2`, jsonB(rates), id)
@@ -366,8 +368,6 @@ func (s *Store) ApplySaleRates(ctx context.Context, id int64, rates billing.Rate
 	if n, _ := res.RowsAffected(); n == 0 {
 		return sql.ErrNoRows
 	}
-	// 售价变化会使缓存的模型快照过期：仅按 id 无法定位旧名，整体清空。
-	s.invalidateAllExternalNames()
 	return nil
 }
 

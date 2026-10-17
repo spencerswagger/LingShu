@@ -392,11 +392,11 @@ func (s *Service) SyncPrices(ctx context.Context) (*SyncPricesResult, error) {
 		if err := s.store.ApplySaleRates(ctx, m.ID, rates); err != nil {
 			return nil, fmt.Errorf("apply sale rates for %s: %w", m.ExternalName, err)
 		}
-		// 缓存失效：售价变化使该对外名的缓存快照过期，按名立即失效（无 TTL）。
-		s.store.invalidateExternalName(m.ExternalName)
 		res.Updated = append(res.Updated, m.ExternalName)
 	}
-	// 跨包失效：批量售价同步完成，通知 automodel 失效其解析缓存（一次即可）。
+	// 缓存失效：批量同步完成后统一整体清空一次（售价变化使全部对外名缓存快照过期），
+	// 避免循环内逐次清空造成写放大；随后跨包失效 automodel 解析缓存（一次即可）。
+	s.store.invalidateAllExternalNames()
 	s.notifyNameWrite()
 	return res, nil
 }
