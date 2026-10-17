@@ -60,40 +60,58 @@
     rs(c);
   });
 
-  /* ---------- 图 3：按"当前轮消息角色"分段的 m(k)（示意） ---------- */
-  // 四条曲线基数不同，体现"角色是主信号"；均随 k 缓慢上升（次要信号）
-  function roleSeries(base) {
-    var out = [];
-    for (var i = 0; i <= 30; i++) {
-      out.push(+(base * (1 + 0.04 * i)).toFixed(2));
-    }
-    return out;
-  }
-  var mUser = roleSeries(9);
-  var mAsstTool = roleSeries(5);
-  var mTool = roleSeries(2.5);
-  var mAsstFinal = roleSeries(1.5);
-
-  ready('chart-role', function () {
-    var c = echarts.init(document.getElementById('chart-role'), null, { renderer: 'svg' });
+  /* ---------- 图 3：实测预测力对比（角色单用 vs k 单用，R²） ---------- */
+  ready('chart-predict', function () {
+    var c = echarts.init(document.getElementById('chart-predict'), null, { renderer: 'svg' });
     c.setOption({
-      animation: false,
-      color: [accent, accent2, '#7C3AED', muted],
-      tooltip: { trigger: 'axis', appendToBody: true, valueFormatter: function (v) { return v + ' 轮'; } },
-      legend: {
-        data: ['最后一条是用户消息', '最后一条是含工具调用的助手消息', '最后一条是工具结果', '最后一条是最终助手消息'],
-        textStyle: { color: muted }, top: 0
+      animation: false, color: [muted, accent],
+      tooltip: { trigger: 'axis', appendToBody: true, valueFormatter: function (v) { return (v == null) ? '—' : Number(v).toFixed(3); } },
+      legend: { data: ['角色单用', 'k 单用'], textStyle: { color: muted }, top: 0 },
+      grid: { left: 8, right: 26, top: 50, bottom: 34, containLabel: true },
+      xAxis: {
+        type: 'category', name: '场景', nameLocation: 'middle', nameGap: 46, nameTextStyle: { color: muted },
+        data: ['τ-bench\n真实Agent', 'SWE-agent\n编码Agent', 'OpenHands', '通用聊天\nWildChat', 'ToolACE\n(半合成)'],
+        axisLine: { lineStyle: { color: rule } }, axisTick: { show: false }, axisLabel: { color: muted, lineHeight: 14, interval: 0 }
       },
-      grid: baseGrid,
-      xAxis: { type: 'category', name: '会话已进行轮数 k', nameLocation: 'middle', nameGap: 30, nameTextStyle: { color: muted },
-        boundaryGap: false, data: K, axisLine: { lineStyle: { color: rule } }, axisTick: { show: false }, axisLabel: { color: muted } },
-      yAxis: { type: 'value', name: '预计剩余轮数', nameTextStyle: { color: muted },
-        axisLine: { show: false }, axisTick: { show: false }, splitLine: { lineStyle: { color: rule } }, axisLabel: { color: muted } },
+      yAxis: {
+        type: 'value', name: '测试集 R²', nameTextStyle: { color: muted }, min: -0.05, max: 0.35,
+        axisLine: { show: false }, axisTick: { show: false }, splitLine: { lineStyle: { color: rule } }, axisLabel: { color: muted }
+      },
       series: [
-        { name: '最后一条是用户消息', type: 'line', smooth: true, symbol: 'none', lineStyle: { width: 3 }, data: mUser },
-        { name: '最后一条是含工具调用的助手消息', type: 'line', smooth: true, symbol: 'none', lineStyle: { width: 2.5 }, data: mAsstTool },
-        { name: '最后一条是工具结果', type: 'line', smooth: true, symbol: 'none', lineStyle: { width: 2.5 }, data: mTool },
-        { name: '最后一条是最终助手消息', type: 'line', smooth: true, symbol: 'none', lineStyle: { width: 2, type: 'dashed' }, data: mAsstFinal }
+        { name: '角色单用', type: 'bar', barGap: '10%', barWidth: '32%', itemStyle: { color: muted, opacity: 0.55 }, data: [0.003, -0.019, 0.052, -0.004, 0.208] },
+        { name: 'k 单用', type: 'bar', barWidth: '32%', itemStyle: { color: accent }, data: [0.309, 0.052, 0.091, 0.001, 0.192] }
+      ]
+    });
+    rs(c);
+  });
+
+  /* ---------- 图 4：回本所需剩余请求数 n* 随折扣变化（缓存主导近似） ---------- */
+  ready('chart-breakeven', function () {
+    var disc = [10, 15, 20, 25, 30, 35, 40, 50, 60];
+    var nstar = disc.map(function (d) { return +(12.5 * (1 - d / 100) / (d / 100)).toFixed(1); });
+    var c = echarts.init(document.getElementById('chart-breakeven'), null, { renderer: 'svg' });
+    c.setOption({
+      animation: false, color: [accent2],
+      tooltip: { trigger: 'axis', appendToBody: true, valueFormatter: function (v) { return v + ' 发'; } },
+      grid: baseGrid,
+      xAxis: {
+        type: 'category', name: '目标渠道折扣', nameLocation: 'middle', nameGap: 30, nameTextStyle: { color: muted },
+        data: disc.map(function (d) { return d + '%'; }),
+        axisLine: { lineStyle: { color: rule } }, axisTick: { show: false }, axisLabel: { color: muted }
+      },
+      yAxis: {
+        type: 'value', name: '回本所需剩余请求数 n*', nameTextStyle: { color: muted }, max: 120,
+        axisLine: { show: false }, axisTick: { show: false }, splitLine: { lineStyle: { color: rule } }, axisLabel: { color: muted }
+      },
+      series: [
+        {
+          name: 'n*', type: 'line', smooth: true, symbolSize: 7, lineStyle: { width: 3 }, data: nstar,
+          markLine: {
+            silent: true, symbol: 'none', lineStyle: { color: muted, type: 'dashed' },
+            label: { formatter: '短会话典型 horizon ≈ 10 发', color: muted, position: 'insideEndTop', fontSize: 11 },
+            data: [{ yAxis: 10 }]
+          }
+        }
       ]
     });
     rs(c);

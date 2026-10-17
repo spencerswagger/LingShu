@@ -85,9 +85,9 @@
 
 <header class="hero">
   <div class="hero-inner">
-    <p class="kicker">会话成本路由 · 公式总表 + 剩余轮数研究</p>
+    <p class="kicker">会话成本路由 · 公式总表 + 剩余轮数研究（实证修订版）</p>
     <h1>把所有公式收口，然后研究「预计剩余轮数」怎么估</h1>
-    <p class="lede">先把前面推导的公式汇总成一张表；再针对唯一待估的参数——「预计剩余轮数」——给出方法选型与估算公式。</p>
+    <p class="lede">先把公式汇总成一张表；再针对唯一待估的参数「预计剩余轮数」，用 24 万条真实消息实证：<b>k（会话位置）为主信号、角色仅弱特征</b>，切换应门控在<b>缓存重置点</b>。</p>
     <a class="navlink" href="./session-affinity-cost-control.html">← 主报告</a>
     <a class="navlink" href="./data-study.html">← 数据研究</a>
   </div>
@@ -146,96 +146,110 @@
     <h2><span class="h2no">二</span>研究「预计剩余轮数」怎么估</h2>
 
     <div class="callout">
-      <span class="co-tag">先认错：上一版方向有偏</span>
-      <p>上一版把剩余轮数只当成"已进行轮数 k"的函数（纯生存分析）。这忽略了 AI 对话里<b>最强的信号</b>——<mark class="key">当前这一轮是什么角色的消息</mark>。你的例子一针见血：本次请求带的是用户对话（user 消息），剩余轮数大概率多；带的是工具调用结果（tool 消息），剩余轮数大概率少。</p>
-      <p>k（已进行轮数）仍有价值，但它是<b>次要</b>信号；<b>消息角色</b>才是主信号。下面把方法修正过来。</p>
+      <span class="co-tag">修正记录：结论又翻了一次，这次有实证</span>
+      <p>第 2 版曾提出"<b>当前轮消息角色是主信号、k 是次信号</b>"。为验证它，我们对 <b>24 万条真实消息</b>（6 个公开数据集）做了留出整段会话的预测检验——<mark class="key">结果证伪了"角色为主"</mark>：在最重要的真实 Agent 场景里，角色几乎零信息量，<b>k（会话位置）才是主信号</b>。本版按实证重写。</p>
     </div>
 
-    <h3>AI 对话的真实结构</h3>
-    <p>一个"用户意图"（从一条用户消息开始，到助手给出最终回答为止）内部的轮次模式相对固定：</p>
-    <div class="formula">
-      <div class="f-label">一个用户意图内的轮次模式</div>
-      <div class="f-body">
-        用户消息 <span class="op">→</span> ［助手消息(含工具调用) <span class="op">→</span> 工具结果］<span class="op">×</span> 工具调用次数 <span class="op">→</span> 助手消息(最终回答)
-      </div>
-      <p class="f-note">工具调用次数通常 0～3 次。所以"当前轮最后一条消息的角色"直接框定了"到这个意图结束还有几轮"的范围——这正是比 k 更强的信号。</p>
-    </div>
-
-    <h3>四种角色的剩余轮数先验（直觉量级）</h3>
+    <h3>实证：角色 vs k，谁更能预测「到会话结束还剩几轮」</h3>
+    <p>指标＝留出整段会话的梯度提升树测试集 R²（越高越能预测）。数据：WildChat / τ-bench / ToolACE / SWE-agent / OpenHands。</p>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>当前轮最后一条消息的角色</th><th>到本意图结束的剩余轮数（直觉量级）</th><th>理由</th></tr></thead>
+        <thead><tr><th>场景</th><th>角色单用</th><th>k 单用</th><th>二者合用</th><th>更强信号</th></tr></thead>
         <tbody>
-          <tr><td><b>用户消息</b>（user）</td><td>多（约 3～8 轮）</td><td>刚开启一个新意图，后面至少有助手回复 + 可能的工具链</td></tr>
-          <tr><td><b>含工具调用的助手消息</b>（assistant + tool_calls）</td><td>中（约 2～5 轮）</td><td>后面必有一条工具结果，然后助手还要继续（可能再调工具或给最终回答）</td></tr>
-          <tr><td><b>工具结果</b>（tool）</td><td>少（约 1～3 轮）</td><td>助手还要继续，但工具链通常不长，离最终回答不远</td></tr>
-          <tr><td><b>最终助手消息</b>（assistant，无 tool_calls）</td><td>不定</td><td>本意图已结束，剩余轮数取决于用户是否发起下一个意图</td></tr>
+          <tr><td>τ-bench 真实 Agent（660 轨迹）</td><td>0.003</td><td><b>0.309</b></td><td>0.320</td><td><b>k 压倒性</b></td></tr>
+          <tr><td>SWE-agent 编码 Agent（3000 轨迹）</td><td>−0.019</td><td>0.052</td><td>0.064</td><td>k</td></tr>
+          <tr><td>OpenHands（491 轨迹）</td><td>0.052</td><td>0.091</td><td>0.142</td><td>k（接近）</td></tr>
+          <tr><td>通用聊天 WildChat</td><td>−0.004</td><td>0.001</td><td>0.001</td><td><b>都无效</b></td></tr>
+          <tr><td>ToolACE（半合成，反例*）</td><td>0.208</td><td>0.192</td><td>0.464</td><td>角色略强</td></tr>
         </tbody>
       </table>
     </div>
+    <p class="f-note" style="margin:-0.2rem 0 0.9rem;">*ToolACE 是"用户提问→助手最终答复"构造的合成数据，把最终助手消息与结束绑定（77.6% 落在末尾），才让角色显得强——属数据构造假象，不可迁移到真实流量。</p>
 
-    <h3>修正方法：以"当前轮消息角色"为主协变量的条件估计</h3>
-    <p>不再用单一的一张 m(k) 表，而是按"最后一条消息的角色"分段，各估一张：</p>
-    <div class="formula">
-      <div class="f-label">条件平均剩余寿命（按角色分段查表）</div>
-      <div class="f-body">
-        对每个角色 r，从历史会话估该角色下的生存曲线 S<sub>r</sub>(k) ＝ "该角色出现在第 k 轮后，会话还能继续"的比例<br><br>
-        <span class="q">预计剩余轮数(k ｜ 角色=r) ＝ ［ S<sub>r</sub>(k+1) ＋ S<sub>r</sub>(k+2) ＋ S<sub>r</sub>(k+3) ＋ … ］÷ S<sub>r</sub>(k)</span>
-      </div>
-      <p class="f-note">在线时：读当前请求最后一条消息的角色 → 用对应角色的表查 m(k) → 与公式四的"回本轮数"比较 → 决策。</p>
+    <div class="callout">
+      <span class="co-tag">为什么角色在真实 Agent 里失效</span>
+      <p>真实 Agent 是 <b>用户 → 助手(工具调用) → 工具结果 → … 的循环</b>，角色<b>周期性重复</b>；唯一带"终止"含义的最终助手消息在这些数据里<b>并不落在末尾</b>（常在用户说"结束"时终止）。于是"看到什么角色"几乎不携带"还剩几轮"的信息，而"已经进行到第 k 步"直接刻画了剩余长度。</p>
     </div>
 
-    <h3>更进一步：分层拆解</h3>
-    <p>"剩余轮数"其实可以拆成两层，信号强度不同：</p>
-    <ol class="tight">
-      <li><b>本意图内剩余轮数</b>：从当前轮到"助手给出最终回答"——<b>强依赖当前轮角色</b>，k 的影响很小。用角色先验就能给得很准。</li>
-      <li><b>后续意图数</b>：本意图结束后，用户还会发起几个新意图——<b>弱依赖 k、强依赖用户行为</b>。这一层才需要生存分析。</li>
-    </ol>
-    <p>所以"先按角色分（吃掉第 1 层）、再叠加 k 的微调（第 2 层）"是最合理的顺序，而不是反过来。</p>
+    <h3>修正后的估计器</h3>
+    <div class="formula">
+      <div class="f-label">预计剩余轮数 · 会话剩余长度生存分析（k 为主）</div>
+      <div class="f-body">
+        生存曲线 S(k) ＝ "会话超过 k 轮"的历史比例（对未结束会话做右删失处理）<br><br>
+        <span class="q">预计剩余轮数(k) ＝ ［ S(k+1) ＋ S(k+2) ＋ S(k+3) ＋ … ］÷ S(k)</span>
+      </div>
+      <p class="f-note">角色仅作<b>弱特征、默认不启用</b>（实证增量很小，真实 Agent 场景近乎为零）。冷启动可先用几何 / 分档先验。</p>
+    </div>
 
-    <h3>为什么不能只用一个常数，也不能只看 k</h3>
-    <p>两个维度都要看：</p>
+    <h3>切换边界：是「缓存重置点」，不是「用户消息边界」</h3>
+    <p>实证还翻了一个更重要的结论。定量建模显示：缓存主导时，回本所需<b>剩余请求数</b>只取决于价差 ρ（目标价÷当前价），<b>与上下文长度无关</b>：</p>
+    <div class="formula">
+      <div class="f-label">回本所需剩余请求数（缓存主导近似）</div>
+      <div class="f-body">
+        <span class="q">n* ≈ 12.5 × ρ ÷ (1 − ρ)</span>
+      </div>
+      <p class="f-note">折扣 10% → n*≈111；20% → 36；30% → 21；50% → 9.3。所以短单任务会话（约 10 发）+ 折扣 &lt; 40% → <b>中途切换必然亏损</b>。</p>
+    </div>
+    <div class="callout">
+      <span class="co-tag">重要纠正</span>
+      <p><mark class="key">用户消息边界并不清空前缀缓存</mark>——在保留上下文时于用户轮切换，仍要付全额定金（实测多付 19%～40%）。真正"免费"的切换点是<b>缓存重置事件</b>：新会话 / 上下文压缩 / clear / TTL 空闲过期——此时 penalty≈0，<b>节省＝价差本身</b>。所以切换应<b>门控在缓存重置点</b>；会话中途切换仅当"剩余 horizon &gt; n*"才允许。</p>
+    </div>
+
+    <h3>目标函数：为什么必须同时看三档价</h3>
+    <p>models.dev 真实价格（2305 个模型 / 855 个多渠道）：同模型渠道价差中位 ≈30%、长尾极重（缓存读 P90=15.8×）；约 1/5～1/4 的候选对有 ≥40% 折扣。但——</p>
+    <div class="callout">
+      <span class="co-tag">关键反例</span>
+      <p>即便在零惩罚的重置点，<b>单按"最低输入价"路由只有 71%～77% 真省钱</b>；"最低输入价渠道"与"最低缓存读渠道"在 <b>23.2%</b> 的模型上不同源。输入价贵一点点、但有真实缓存定价的渠道，端到端可省数倍。<mark class="key">因此路由目标必须同时纳入 输入 / 缓存读 / 输出 三档</mark>。</p>
+    </div>
+
+    <h3>四张图看懂</h3>
     <figure class="chart-figure">
       <figcaption>图 1 · 生存曲线 S(k)：几何模型 vs 长尾（示意）
-        <span>几何模型衰减快、尾巴短；真实会话尾巴厚——说明 k 仍有信息。</span>
+        <span>真实会话尾巴厚——所以"越久越可能继续"，k 有信息。</span>
       </figcaption>
       <div id="chart-surv" style="width:100%;min-height:340px;"></div>
     </figure>
     <figure class="chart-figure">
       <figcaption>图 2 · 预计剩余轮数 m(k)：几何模型恒为常数 vs 长尾随 k 上升（示意）
-        <span>长尾下"已进行轮数越多、预计剩余越多"——所以 k 不能丢，但它只是次要信号。</span>
+        <span>k 是主信号，m(k) 应随 k 查表而非取常数。</span>
       </figcaption>
       <div id="chart-mrl" style="width:100%;min-height:340px;"></div>
     </figure>
     <figure class="chart-figure">
-      <figcaption>图 3 · 按"当前轮消息角色"分段的预计剩余轮数 m(k)（示意）
-        <span>四条曲线差异明显——用户消息远高于工具结果，证明角色才是主信号。</span>
+      <figcaption>图 3 · 实测预测力对比：角色单用 vs k 单用（真实 trace，R²）
+        <span>除合成数据反例外，k 普遍 ≥ 角色；真实 Agent 场景 k 碾压角色。</span>
       </figcaption>
-      <div id="chart-role" style="width:100%;min-height:360px;"></div>
+      <div id="chart-predict" style="width:100%;min-height:380px;"></div>
+    </figure>
+    <figure class="chart-figure">
+      <figcaption>图 4 · 回本所需剩余请求数 n* 随折扣变化（缓存主导近似）
+        <span>折扣越小、n* 越大；短会话（约 10 发）只有大折扣才值得中途切换。</span>
+      </figcaption>
+      <div id="chart-breakeven" style="width:100%;min-height:340px;"></div>
     </figure>
 
     <div class="callout">
       <span class="co-tag">核心结论</span>
-      <p><mark class="key">预计剩余轮数 = f(当前轮消息角色, 已进行轮数 k)</mark>，且角色的权重远大于 k。先按角色分段，再在段内用 k 微调。</p>
+      <p><mark class="key">预计剩余轮数 ≈ f(会话位置 k)</mark>（角色仅弱特征）；<b>切换门控在缓存重置点</b>，会话中途仅在长 horizon（&gt; n*）才切；<b>目标函数含三档价</b>。</p>
     </div>
 
     <h3>落地</h3>
     <ol class="tight">
-      <li><b>取数</b>：从调用日志重建每会话的轮数 T，并记录每轮最后一条消息的角色（user / assistant含工具 / tool / assistant最终）。注意右删失：未结束的会话只知"至少这么多轮"，用生存分析处理。</li>
-      <li><b>估表</b>：按角色分段估 S<sub>r</sub>(k) → 算出四张 m<sub>r</sub>(k) 表，离线定期重算（如每日）。角色内样本不足时回退到全局表。</li>
-      <li><b>在线</b>：每轮读当前请求最后一条消息的角色 + 当前 k → 查对应表得"预计剩余轮数" → 与公式四的"回本轮数"比较 → 决策。</li>
-      <li><b>冷启动</b>：无数据的角色先用上面的直觉量级先验（保守：宁可少切），随数据累积自动过渡到经验表。</li>
-      <li><b>评估</b>：用历史数据做<b>影子回放</b>——比较"用估计值决策"与"上帝视角（已知真实 T）"的总成本差距；并按角色画校准曲线（预测剩余 vs 实际剩余）。</li>
+      <li><b>取数</b>：从调用日志重建每会话轮数与末条角色（按 <code>session_id, request_id</code> 去重），并对未结束会话做右删失标注。</li>
+      <li><b>估表</b>：离线估 S(k) → m(k) 表（按模型/应用分层，样本不足回退全局），定期重算。</li>
+      <li><b>门控</b>：仅在<b>缓存重置点</b>（新会话 / 上下文压缩 / TTL 空闲过期）放宽切换；重置点真值用<b>逐轮缓存读跌向 0</b> 判定（该量已在采集，仅需序列化）。</li>
+      <li><b>在线</b>：每轮算回本轮数（现算）→ 与 m(k) 比较 → 仅在门控点 / 长 horizon 放行 → 决策。</li>
+      <li><b>评估</b>：影子回放，比较"估计值决策"与"上帝视角"总成本；分场景（聊天 vs 编码 Agent）看收益。</li>
     </ol>
 
-    <div class="verdict"><b>下一步建议</b>：先做"取数"——拿到真实会话的轮数 + 每轮最后一条消息的角色，画出按角色分段的 S<sub>r</sub>(k) 与 m<sub>r</sub>(k)，验证"用户消息远高于工具结果"这个假设是否成立、差距有多大。这直接决定了分段的收益。</div>
+    <div class="verdict"><b>落地性判断</b>：方案在<b>修正后具备落地可能且贴合业务</b>——估计器改用 k 的会话生存分析（原设计即有）、切换门控在缓存重置点、目标含三档价；运行时改动小（决策前算好相位 + 响应后回写上一轮用量）。剩余开放式问题：缓存重置事件的逐轮序列化方式、场景分层粒度。</div>
   </section>
 
 </main>
 
 <footer>
   <div class="wrap">
-    <p class="colophon">图 1、图 2 为示意曲线（几何 p=0.8 与一条长尾曲线）。公式与逐条问答见 session-affinity-cost-control.html，敏感性实验见 data-study.html。</p>
+    <p class="colophon">图 1、图 2 为示意曲线；图 3、图 4 依据真实数据（WildChat / τ-bench / SWE-agent / OpenHands / ToolACE 与 models.dev 平价）。公式与逐条问答见 session-affinity-cost-control.html，敏感性实验见 data-study.html。</p>
   </div>
 </footer>
 
