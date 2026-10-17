@@ -48,6 +48,29 @@ type tokenCacheEntry struct {
 	cachedAt   time.Time
 }
 
+// cloneToken 深拷贝 Token：除值字段外，额外为 TagID/ExpiresAt/LastUsedAt 三个指针字段
+// 分配新地址，避免缓存与调用方共享同一指针，任一方写 *ptr 都会污染另一方（P2-5）。
+// nil 入参返回 nil，nil 指针字段保持 nil。
+func cloneToken(t *Token) *Token {
+	if t == nil {
+		return nil
+	}
+	c := *t
+	if t.TagID != nil {
+		v := *t.TagID
+		c.TagID = &v
+	}
+	if t.ExpiresAt != nil {
+		v := *t.ExpiresAt
+		c.ExpiresAt = &v
+	}
+	if t.LastUsedAt != nil {
+		v := *t.LastUsedAt
+		c.LastUsedAt = &v
+	}
+	return &c
+}
+
 // tokenCache 令牌鉴权两级读缓存。零值不可用，须经 newTokenCache 创建。
 type tokenCache struct {
 	mu         sync.RWMutex
@@ -120,8 +143,8 @@ func (c *tokenCache) get(hash string) (*Token, bool) {
 		c.invalidateByHash(hash)
 		return nil, false
 	}
-	snap := *e.token
-	return &snap, true
+	// 防御性深拷贝：指针字段（TagID/ExpiresAt/LastUsedAt）独立分配，调用方修改不影响缓存（P2-5）。
+	return cloneToken(e.token), true
 }
 
 // put 写入鉴权结果快照（仅成功项）。会做条目上限淘汰。
@@ -134,12 +157,13 @@ func (c *tokenCache) put(hash string, t *Token, userStatus string) {
 	if !c.enabled {
 		return
 	}
-	snap := *t
+	// 防御性深拷贝：入缓存的是副本，调用方后续修改其持有的 Token（含指针字段）不影响缓存（P2-5）。
+	snap := cloneToken(t)
 	// 同一哈希覆盖：先从旧归属用户的倒排集合中摘除，避免脏索引。
 	if old, ok := c.byHash[hash]; ok {
 		c.removeFromUserLocked(old.token.UserID, hash)
 	}
-	c.byHash[hash] = &tokenCacheEntry{token: &snap, userStatus: userStatus, cachedAt: c.now()}
+	c.byHash[hash] = &tokenCacheEntry{token: snap, userStatus: userStatus, cachedAt: c.now()}
 	set := c.byUser[snap.UserID]
 	if set == nil {
 		set = make(map[string]struct{})

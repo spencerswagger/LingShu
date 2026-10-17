@@ -318,7 +318,8 @@ func (s *Service) ResolveMembers(ctx context.Context, name string, ownerUserID *
 		cached, ok := s.membersCache[key]
 		s.membersMu.RUnlock()
 		if ok {
-			return cached.members, cached.isAuto, nil
+			// 防御性拷贝：命中缓存返回副本，调用方就地修改成员切片不得污染缓存（P2-3）。
+			return append([]Member(nil), cached.members...), cached.isAuto, nil
 		}
 	}
 	m, err := s.store.GetByName(ctx, name, ownerUserID)
@@ -340,6 +341,7 @@ func (s *Service) ResolveMembers(ctx context.Context, name string, ownerUserID *
 
 // cacheResolvedMembers 写入 ResolveMembers 结果缓存（members 为 nil 表示负结果）。
 // 有界（membersCacheMax）：超过上限按插入顺序 FIFO 淘汰最早键，防用户可控键打满内存（P1-5）。
+// 防御性拷贝：存入缓存的是成员切片副本，避免调用方后续就地修改其持有的切片污染缓存（P2-3）。
 func (s *Service) cacheResolvedMembers(key string, members []Member, isAuto bool) {
 	if s.readCacheOff {
 		return
@@ -351,7 +353,7 @@ func (s *Service) cacheResolvedMembers(key string, members []Member, isAuto bool
 	if _, exists := s.membersCache[key]; !exists {
 		s.membersCacheOrder = append(s.membersCacheOrder, key)
 	}
-	s.membersCache[key] = resolveCacheEntry{members: members, isAuto: isAuto}
+	s.membersCache[key] = resolveCacheEntry{members: append([]Member(nil), members...), isAuto: isAuto}
 	s.evictMembersCacheLocked()
 	s.membersMu.Unlock()
 }
