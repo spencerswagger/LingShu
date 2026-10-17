@@ -344,6 +344,46 @@ func TestService_NameWriteHookFired(t *testing.T) {
 	}
 }
 
+// TestService_SyncPrices_InvalidatesEvenOnError 锁定评审修复（round4）：
+// 批量售价同步只要有任何一行写入成功，缓存就必须失效一次——即便中途某行出错提前返回，
+// 也必须清空对外名缓存并回调跨包 hook，否则已提交的售价变更会因缓存无 TTL 而无限期滞留旧价。
+func TestService_SyncPrices_InvalidatesEvenOnError(t *testing.T) {
+	s, mock := mockService(t)
+	s.SetPriceSource(fakePriceSource{refPrice: PriceRef{Input: 5}, has: true})
+	fired := 0
+	s.SetNameWriteHook(func() { fired++ })
+
+	now := time.Now()
+	listQ := `SELECT ` + cols + ` FROM external_models WHERE deleted_at IS NULL ORDER BY id ASC`
+	rows := extRow(&ExternalModel{ID: 1, ExternalName: "a", CreatedAt: now, UpdatedAt: now}, `{"input":1}`)
+	rows.AddRow(int64(2), "b", "", true, `{"input":1}`, nil, nil, now, now)
+	mock.ExpectQuery(regexp.QuoteMeta(listQ)).WillReturnRows(rows)
+	// 第 1 行成功写入。
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE external_models SET sale_rates=$1, updated_at=now() WHERE id=$2`)).
+		WithArgs(sqlmock.AnyArg(), int64(1)).WillReturnResult(sqlmock.NewResult(0, 1))
+	// 第 2 行失败 → SyncPrices 提前返回。
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE external_models SET sale_rates=$1, updated_at=now() WHERE id=$2`)).
+		WithArgs(sqlmock.AnyArg(), int64(2)).WillReturnError(errors.New("db down"))
+	// 预置缓存条目，验证出错路径同样被清空。
+	s.store.cacheExternalName("a", nil)
+
+	if _, err := s.SyncPrices(context.Background()); err == nil {
+		t.Fatalf("第 2 行 Update 失败时 SyncPrices 应返回错误")
+	}
+	if fired != 1 {
+		t.Fatalf("即便中途出错，也应失效一次（nameWriteHook），got %d", fired)
+	}
+	s.store.extNameMu.RLock()
+	_, present := s.store.extNameCache["a"]
+	s.store.extNameMu.RUnlock()
+	if present {
+		t.Fatalf("出错路径也必须清空对外名缓存（否则旧售价无限期滞留）")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("mock expectations: %v", err)
+	}
+}
+
 // TestStore_ExternalNameCacheBounded 锁定 P1-5：对外名读缓存（键来自请求体、用户可控）必须有界，
 // 防止认证用户以海量随机名打满负缓存造成内存耗尽 DoS。
 func TestStore_ExternalNameCacheBounded(t *testing.T) {

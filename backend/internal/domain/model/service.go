@@ -370,6 +370,16 @@ func (s *Service) SyncPrices(ctx context.Context) (*SyncPricesResult, error) {
 		return nil, fmt.Errorf("list external models: %w", err)
 	}
 	res := &SyncPricesResult{Updated: []string{}, Skipped: []string{}}
+	// 缓存失效：只要有任何一行售价成功写入，就必须失效一次——用 defer 保证即便中途出错提前
+	// return 也会执行（否则已提交的售价变更会因对外名缓存无 TTL 而无限期滞留旧价）。
+	// 统一在循环后整体清空一次，避免循环内逐次清空造成写放大；随后跨包失效 automodel 解析缓存。
+	invalidated := false
+	defer func() {
+		if invalidated {
+			s.store.invalidateAllExternalNames()
+			s.notifyNameWrite()
+		}
+	}()
 	for _, m := range models {
 		ref, ok := s.pricer.ReferencePrice(m.ExternalName)
 		if !ok {
@@ -392,12 +402,9 @@ func (s *Service) SyncPrices(ctx context.Context) (*SyncPricesResult, error) {
 		if err := s.store.ApplySaleRates(ctx, m.ID, rates); err != nil {
 			return nil, fmt.Errorf("apply sale rates for %s: %w", m.ExternalName, err)
 		}
+		invalidated = true
 		res.Updated = append(res.Updated, m.ExternalName)
 	}
-	// 缓存失效：批量同步完成后统一整体清空一次（售价变化使全部对外名缓存快照过期），
-	// 避免循环内逐次清空造成写放大；随后跨包失效 automodel 解析缓存（一次即可）。
-	s.store.invalidateAllExternalNames()
-	s.notifyNameWrite()
 	return res, nil
 }
 

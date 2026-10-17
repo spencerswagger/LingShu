@@ -78,7 +78,9 @@ type Store struct {
 	//   - 键来自请求体（用户可控），故**有界**（extNameMax + FIFO 淘汰）：防止认证用户以海量
 	//     随机名打满负缓存造成内存耗尽 DoS。淘汰代价仅为回源一次 DB，不影响正确性。
 	//   - 失效点（写路径显式失效，无 TTL）：
-	//     本文件 Insert（按名失效）、Update/ApplySaleRates/BatchDelete（无旧名信息，整体清空），
+	//     本文件 Insert（按名失效）、Update/BatchDelete（无旧名信息，整体清空）；
+	//     ApplySaleRates 自身**不再失效**（避免批量同步逐次全清写放大），由调用方负责：
+	//     service.ApplyPrice 按名失效、service.SyncPrices 循环结束后整体清空一次（均含跨包 hook）；
 	//     以及 service.go 的 CreateModel/UpdateModel/BatchDeleteModels/ApplyPrice/SyncPrices。
 	//   - 关闭开关（SetReadCacheEnabled(false)）时退回直查，不读写缓存。
 	extNameMu    sync.RWMutex
