@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strconv"
+	"sync"
 
 	"github.com/team/llmgateway/internal/pkg/resp"
 )
@@ -52,11 +54,62 @@ type Service struct {
 	// extNameExists 跨表重名校验：判断某名称是否已被 external_models.external_name 占用
 	// （经 SetExternalNameChecker 由装配层注入；nil=跳过该检查）。
 	extNameExists func(ctx context.Context, name string) (bool, error)
+
+	// membersCache 缓存 ResolveMembers（网关每请求按「请求名 + owner」解析 Auto；Auto 低频变更）。
+	//   - 数据来源：auto_models + auto_model_members（经 store.GetByName 的作用域可见性过滤 + JOIN）；
+	//   - 键 = name + "\x00" + ownerUserID（owner 为 nil 时后缀为空）；值 = 解析结果
+	//     （成员列表 + 是否 Auto），含「查无此名 / 已停用」的负结果（isAuto=false）；
+	//   - 键首段来自请求体（用户可控），故**有界**（membersCacheMax + FIFO 淘汰）：防止认证用户
+	//     以海量随机名打满负缓存造成内存耗尽 DoS。淘汰代价仅为回源一次 DB，不影响正确性。
+	//   - 失效点（写路径显式失效，无 TTL）：
+	//     本文件 Create/Update/Delete 成功后整体清空（改名/成员变更/删除均可能影响任意键，整体清空避免漏接）；
+	//     以及 **跨包** 对外模型写路径（model.Service 经 SetNameWriteHook 回调 InvalidateReadCache），
+	//     因解析结果含 JOIN 自 external_models 的 ExternalName/Enabled。
+	//   - 关闭开关（SetReadCacheEnabled(false)）时退回直查，不读写缓存。
+	membersMu         sync.RWMutex
+	membersCache      map[string]resolveCacheEntry
+	membersCacheOrder []string
+	membersCacheMax   int
+	readCacheOff      bool
 }
+
+// defaultMembersCacheMax ResolveMembers 读缓存条目上限（键用户可控，必须有界）。
+const defaultMembersCacheMax = 100000
+
+// resolveCacheEntry 是 ResolveMembers 的缓存项（含负结果）。
+type resolveCacheEntry struct {
+	members []Member
+	isAuto  bool
+}
+
+// membersCacheKey 生成 ResolveMembers 缓存键：name + ownerUserID（owner 为 nil 用空后缀）。
+func membersCacheKey(name string, ownerUserID *int64) string {
+	if ownerUserID == nil {
+		return name + "\x00"
+	}
+	return name + "\x00" + strconv.FormatInt(*ownerUserID, 10)
+}
+
+// invalidateMembersCache 清空 ResolveMembers 缓存（Auto 写路径调用）。
+func (s *Service) invalidateMembersCache() {
+	s.membersMu.Lock()
+	s.membersCache = nil
+	s.membersCacheOrder = nil
+	s.membersMu.Unlock()
+}
+
+// InvalidateReadCache 对外暴露的缓存失效入口：供跨包写路径（model.Service.SetNameWriteHook）
+// 在 external_models 变更后调用——因 ResolveMembers 结果含 JOIN 自 external_models 的
+// ExternalName/Enabled，模型改名/启停会影响解析结果（P1-4）。
+func (s *Service) InvalidateReadCache() { s.invalidateMembersCache() }
+
+// SetReadCacheEnabled 开关 Auto 成员解析读缓存（默认开启）；关闭后 ResolveMembers 直查 DB。
+// 由装配层在启动时按配置设置，属于「直查 fallback 安全开关」。
+func (s *Service) SetReadCacheEnabled(on bool) { s.readCacheOff = !on }
 
 // NewService 创建 Auto 模型服务。
 func NewService(store *Store) *Service {
-	return &Service{store: store}
+	return &Service{store: store, membersCacheMax: defaultMembersCacheMax}
 }
 
 // SetExternalNameChecker 注入跨表重名校验（装配层传入，查 external_models）。
@@ -155,6 +208,8 @@ func (s *Service) Create(ctx context.Context, in AutoModelInput) (*AutoModel, er
 		}
 		return nil, fmt.Errorf("create auto model: %w", err)
 	}
+	// 缓存失效：Auto 新增/成员落地后清空解析缓存（写路径显式失效，无 TTL）。
+	s.invalidateMembersCache()
 	return created, nil
 }
 
@@ -213,6 +268,8 @@ func (s *Service) Update(ctx context.Context, id int64, in AutoModelInput) (*Aut
 		}
 		return nil, fmt.Errorf("update auto model: %w", err)
 	}
+	// 缓存失效：改名/成员变更后清空解析缓存（写路径显式失效，无 TTL）。
+	s.invalidateMembersCache()
 	return s.store.GetByID(ctx, id)
 }
 
@@ -224,6 +281,8 @@ func (s *Service) Delete(ctx context.Context, id int64) error {
 		}
 		return fmt.Errorf("delete auto model: %w", err)
 	}
+	// 缓存失效：删除后清空解析缓存（写路径显式失效，无 TTL）。
+	s.invalidateMembersCache()
 	return nil
 }
 
@@ -253,8 +312,19 @@ func (s *Service) List(ctx context.Context, scope string, ownerUserID *int64) ([
 //   - 不是 Auto（查无此名）：返回 nil + false + nil（不报错，交由上层按普通对外模型处理）
 //   - 其它错误：返回 nil + false + err
 func (s *Service) ResolveMembers(ctx context.Context, name string, ownerUserID *int64) ([]Member, bool, error) {
+	key := membersCacheKey(name, ownerUserID)
+	if !s.readCacheOff {
+		s.membersMu.RLock()
+		cached, ok := s.membersCache[key]
+		s.membersMu.RUnlock()
+		if ok {
+			// 防御性拷贝：命中缓存返回副本，调用方就地修改成员切片不得污染缓存（P2-3）。
+			return append([]Member(nil), cached.members...), cached.isAuto, nil
+		}
+	}
 	m, err := s.store.GetByName(ctx, name, ownerUserID)
 	if errors.Is(err, sql.ErrNoRows) {
+		s.cacheResolvedMembers(key, nil, false)
 		return nil, false, nil
 	}
 	if err != nil {
@@ -262,9 +332,42 @@ func (s *Service) ResolveMembers(ctx context.Context, name string, ownerUserID *
 	}
 	if !m.Enabled {
 		// 停用的 Auto 视为不存在，回落普通模型解析。
+		s.cacheResolvedMembers(key, nil, false)
 		return nil, false, nil
 	}
+	s.cacheResolvedMembers(key, m.Members, true)
 	return m.Members, true, nil
+}
+
+// cacheResolvedMembers 写入 ResolveMembers 结果缓存（members 为 nil 表示负结果）。
+// 有界（membersCacheMax）：超过上限按插入顺序 FIFO 淘汰最早键，防用户可控键打满内存（P1-5）。
+// 防御性拷贝：存入缓存的是成员切片副本，避免调用方后续就地修改其持有的切片污染缓存（P2-3）。
+func (s *Service) cacheResolvedMembers(key string, members []Member, isAuto bool) {
+	if s.readCacheOff {
+		return
+	}
+	s.membersMu.Lock()
+	if s.membersCache == nil {
+		s.membersCache = make(map[string]resolveCacheEntry)
+	}
+	if _, exists := s.membersCache[key]; !exists {
+		s.membersCacheOrder = append(s.membersCacheOrder, key)
+	}
+	s.membersCache[key] = resolveCacheEntry{members: append([]Member(nil), members...), isAuto: isAuto}
+	s.evictMembersCacheLocked()
+	s.membersMu.Unlock()
+}
+
+// evictMembersCacheLocked 超过上限时按插入顺序 FIFO 淘汰最早键（调用方须持有写锁）。
+func (s *Service) evictMembersCacheLocked() {
+	if s.membersCacheMax <= 0 {
+		return
+	}
+	for len(s.membersCache) > s.membersCacheMax && len(s.membersCacheOrder) > 0 {
+		oldest := s.membersCacheOrder[0]
+		s.membersCacheOrder = s.membersCacheOrder[1:]
+		delete(s.membersCache, oldest)
+	}
 }
 
 // checkExternalName 跨表重名校验：未注入检查器时跳过；命中则报冲突。

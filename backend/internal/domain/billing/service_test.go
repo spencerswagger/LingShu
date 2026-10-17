@@ -83,6 +83,7 @@ func (f *fakeConfig) ContextTiers() ([]TierRule, error)    { return f.tiers, nil
 func (f *fakeConfig) TimeConfig() (TimeCoeffConfig, error) { return f.tc, nil }
 func (f *fakeConfig) SampleUsage() (Usage, error)          { return f.sample, nil }
 func (f *fakeConfig) InvalidateCostConfig()                {}
+func (f *fakeConfig) SetCacheEnabled(bool)                 {}
 
 // ---- helpers ----
 
@@ -875,6 +876,102 @@ func TestDefaultConfigProvider_ErrorNotCached(t *testing.T) {
 	}
 	if src.calls[cfgCostSample] != 2 {
 		t.Fatalf("失败不应写缓存，应读 2 次，got %d", src.calls[cfgCostSample])
+	}
+}
+
+// TestConfigProvider_R_TiersCache_ZeroDBAndInvalidate 验证 billing.r 与 billing.context_tiers 的读缓存（STEP 25）：
+// 首次各回源一次；随后连续读取命中缓存为 0 次 DB；InvalidateCostConfig（sys_configs 写钩子调用）后
+// 立即失效并重读新值。
+func TestConfigProvider_R_TiersCache_ZeroDBAndInvalidate(t *testing.T) {
+	src := &countingSource{
+		data: map[string][]byte{
+			cfgR:     []byte(`10000`),
+			cfgTiers: []byte(`[{"Min":0,"Max":null,"Coeff":1.5}]`),
+		},
+		calls: map[string]int{},
+	}
+	p := &defaultConfigProvider{src: src}
+
+	// 首次各直查一次。
+	if _, err := p.R(); err != nil {
+		t.Fatalf("R: %v", err)
+	}
+	if _, err := p.ContextTiers(); err != nil {
+		t.Fatalf("ContextTiers: %v", err)
+	}
+	if src.calls[cfgR] != 1 || src.calls[cfgTiers] != 1 {
+		t.Fatalf("首次应各读 1 次，got r=%d tiers=%d", src.calls[cfgR], src.calls[cfgTiers])
+	}
+
+	// 连续 5 次读取命中缓存：0 次额外 DB 查询。
+	for i := 0; i < 5; i++ {
+		if _, err := p.R(); err != nil {
+			t.Fatalf("R(cached): %v", err)
+		}
+		if _, err := p.ContextTiers(); err != nil {
+			t.Fatalf("ContextTiers(cached): %v", err)
+		}
+	}
+	if src.calls[cfgR] != 1 || src.calls[cfgTiers] != 1 {
+		t.Fatalf("命中缓存不应再读库，got r=%d tiers=%d", src.calls[cfgR], src.calls[cfgTiers])
+	}
+
+	// 写入新值 + 失效（等价 console UpsertConfig 触发的写钩子）→ 重读新值。
+	src.data[cfgR] = []byte(`20000`)
+	src.data[cfgTiers] = []byte(`[{"Min":0,"Max":null,"Coeff":2.0}]`)
+	p.InvalidateCostConfig()
+	gotR, err := p.R()
+	if err != nil {
+		t.Fatalf("R(invalidate): %v", err)
+	}
+	if gotR != 20000 {
+		t.Fatalf("失效后应读到新 R，got %d", gotR)
+	}
+	tiers, err := p.ContextTiers()
+	if err != nil {
+		t.Fatalf("ContextTiers(invalidate): %v", err)
+	}
+	if len(tiers) != 1 || tiers[0].Coeff != 2.0 {
+		t.Fatalf("失效后应读到新 tiers，got %+v", tiers)
+	}
+	if src.calls[cfgR] != 2 || src.calls[cfgTiers] != 2 {
+		t.Fatalf("失效后应各重读一次，got r=%d tiers=%d", src.calls[cfgR], src.calls[cfgTiers])
+	}
+}
+
+// TestConfigProvider_SetCacheEnabled_OffAlwaysReadsDB 验证直查 fallback 安全开关（STEP 28）：
+// 关闭缓存后每次读取都直查 DB（行为与引入缓存前一致）。
+func TestConfigProvider_SetCacheEnabled_OffAlwaysReadsDB(t *testing.T) {
+	src := &countingSource{
+		data: map[string][]byte{
+			cfgR:          []byte(`10000`),
+			cfgTiers:      []byte(`[]`),
+			cfgTimeConfig: []byte(`{"Timezone":"UTC","Default":1}`),
+			cfgCostSample: []byte(`{"input":1}`),
+		},
+		calls: map[string]int{},
+	}
+	p := &defaultConfigProvider{src: src}
+	p.SetCacheEnabled(false)
+
+	for i := 0; i < 3; i++ {
+		if _, err := p.R(); err != nil {
+			t.Fatalf("R: %v", err)
+		}
+		if _, err := p.ContextTiers(); err != nil {
+			t.Fatalf("ContextTiers: %v", err)
+		}
+		if _, err := p.TimeConfig(); err != nil {
+			t.Fatalf("TimeConfig: %v", err)
+		}
+		if _, err := p.SampleUsage(); err != nil {
+			t.Fatalf("SampleUsage: %v", err)
+		}
+	}
+	if src.calls[cfgR] != 3 || src.calls[cfgTiers] != 3 ||
+		src.calls[cfgTimeConfig] != 3 || src.calls[cfgCostSample] != 3 {
+		t.Fatalf("关闭缓存应每次直查，got r=%d tiers=%d time=%d sample=%d",
+			src.calls[cfgR], src.calls[cfgTiers], src.calls[cfgTimeConfig], src.calls[cfgCostSample])
 	}
 }
 

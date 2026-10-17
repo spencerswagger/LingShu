@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"regexp"
 	"testing"
 	"time"
@@ -463,5 +464,150 @@ func TestService_Get_NotFound(t *testing.T) {
 	wantAPIErr(t, err, resp.CodeNotFound)
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("mock expectations: %v", err)
+	}
+}
+
+// TestService_ResolveMembers_CacheZeroDBAndInvalidate 验证 Auto 成员解析读缓存（STEP 24）：
+// 命中后零 DB（连续多次解析仅回源一次）；删除写路径后缓存立即失效（再解析重新查库并读到新成员）。
+func TestService_ResolveMembers_CacheZeroDBAndInvalidate(t *testing.T) {
+	s, mock := newServiceMock(t)
+	now := time.Now()
+	// 首次解析：主表 1 次 + 成员 1 次。
+	mock.ExpectQuery(regexp.QuoteMeta(getByNameSQL)).
+		WithArgs("auto1", int64(7)).
+		WillReturnRows(autoRow(10, "auto1", ScopeGlobal, nil, true, now))
+	mock.ExpectQuery(regexp.QuoteMeta(membersSQL)).
+		WithArgs("{10}").
+		WillReturnRows(sqlmock.NewRows(memberTestCols).
+			AddRow(int64(1), int64(10), int64(101), 0, "model-a", true))
+
+	for i := 0; i < 3; i++ {
+		members, isAuto, err := s.ResolveMembers(context.Background(), "auto1", int64Ptr(7))
+		if err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		if !isAuto || len(members) != 1 {
+			t.Fatalf("unexpected: (%+v,%v)", members, isAuto)
+		}
+	}
+	// 仅一次回源：命中缓存不应再读库。
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("命中缓存不应再读库: %v", err)
+	}
+
+	// 写路径（Delete）后缓存立即失效：再解析重新查库并读到新成员列表。
+	mock.ExpectBegin()
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE auto_models SET deleted_at=now() WHERE id=$1 AND deleted_at IS NULL`)).
+		WithArgs(int64(10)).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE auto_model_members SET deleted_at=now() WHERE auto_model_id=$1 AND deleted_at IS NULL`)).
+		WithArgs(int64(10)).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+	if err := s.Delete(context.Background(), 10); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	mock.ExpectQuery(regexp.QuoteMeta(getByNameSQL)).
+		WithArgs("auto1", int64(7)).
+		WillReturnRows(autoRow(10, "auto1", ScopeGlobal, nil, true, now))
+	mock.ExpectQuery(regexp.QuoteMeta(membersSQL)).
+		WithArgs("{10}").
+		WillReturnRows(sqlmock.NewRows(memberTestCols).
+			AddRow(int64(1), int64(10), int64(101), 0, "model-a", true).
+			AddRow(int64(2), int64(10), int64(102), 1, "model-b", true))
+	members, isAuto, err := s.ResolveMembers(context.Background(), "auto1", int64Ptr(7))
+	if err != nil {
+		t.Fatalf("resolve after invalidate: %v", err)
+	}
+	if !isAuto || len(members) != 2 {
+		t.Fatalf("失效后应重新查库并读到 2 个成员，got (%+v,%v)", members, isAuto)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("mock expectations: %v", err)
+	}
+}
+
+// TestService_InvalidateReadCacheForcesReread 锁定 P1-4：导出的 InvalidateReadCache
+// （供 model.Service 写路径跨包调用）后，ResolveMembers 必须重新查库而非命中旧缓存。
+func TestService_InvalidateReadCacheForcesReread(t *testing.T) {
+	s, mock := newServiceMock(t)
+	now := time.Now()
+
+	mock.ExpectQuery(regexp.QuoteMeta(getByNameSQL)).
+		WithArgs("auto1", int64(7)).
+		WillReturnRows(autoRow(10, "auto1", ScopeGlobal, nil, true, now))
+	mock.ExpectQuery(regexp.QuoteMeta(membersSQL)).
+		WithArgs("{10}").
+		WillReturnRows(sqlmock.NewRows(memberTestCols).
+			AddRow(int64(1), int64(10), int64(101), 0, "model-a", true))
+
+	// 首次解析回源，第二次命中缓存（不应再有 DB 调用）。
+	if _, _, err := s.ResolveMembers(context.Background(), "auto1", int64Ptr(7)); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if _, _, err := s.ResolveMembers(context.Background(), "auto1", int64Ptr(7)); err != nil {
+		t.Fatalf("resolve cached: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("命中缓存不应再读库: %v", err)
+	}
+
+	// 模拟外部模型写路径 → 跨包失效；再解析必须重新查库并读到新成员。
+	s.InvalidateReadCache()
+	mock.ExpectQuery(regexp.QuoteMeta(getByNameSQL)).
+		WithArgs("auto1", int64(7)).
+		WillReturnRows(autoRow(10, "auto1", ScopeGlobal, nil, true, now))
+	mock.ExpectQuery(regexp.QuoteMeta(membersSQL)).
+		WithArgs("{10}").
+		WillReturnRows(sqlmock.NewRows(memberTestCols).
+			AddRow(int64(1), int64(10), int64(101), 0, "model-a", true).
+			AddRow(int64(2), int64(10), int64(102), 1, "model-b", true))
+	members, isAuto, err := s.ResolveMembers(context.Background(), "auto1", int64Ptr(7))
+	if err != nil {
+		t.Fatalf("resolve after invalidate: %v", err)
+	}
+	if !isAuto || len(members) != 2 {
+		t.Fatalf("跨包失效后应重新查库并读到 2 个成员，got (%+v,%v)", members, isAuto)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("mock expectations: %v", err)
+	}
+}
+
+// TestService_MembersCacheBounded 锁定 P1-5：ResolveMembers 缓存（键首段来自请求体、用户可控）
+// 必须有界（FIFO 淘汰），防止认证用户以海量随机名打满负缓存造成内存耗尽 DoS。
+func TestService_MembersCacheBounded(t *testing.T) {
+	s := NewService(nil)
+	s.membersCacheMax = 8
+	for i := 0; i < 100; i++ {
+		s.cacheResolvedMembers(fmt.Sprintf("n-%d\x00", i), nil, false)
+	}
+	s.membersMu.RLock()
+	got := len(s.membersCache)
+	s.membersMu.RUnlock()
+	if got > 8 {
+		t.Fatalf("membersCache 应有界（<=8），got %d", got)
+	}
+}
+
+// TestService_ResolveMembers_DefensiveCopy 锁定 P2-3：缓存命中返回的成员切片为副本，
+// 调用方就地修改不得污染缓存（再次解析应仍返回原始成员）。
+func TestService_ResolveMembers_DefensiveCopy(t *testing.T) {
+	s := NewService(nil)
+	s.cacheResolvedMembers("auto1\x00", []Member{{ExternalModelID: 10, ExternalName: "a"}}, true)
+
+	first, isAuto, err := s.ResolveMembers(context.Background(), "auto1", nil)
+	if err != nil || !isAuto {
+		t.Fatalf("resolve: err=%v isAuto=%v", err, isAuto)
+	}
+	// 就地篡改返回值。
+	first[0].ExternalModelID = 999
+	first[0].ExternalName = "mutated"
+
+	second, isAuto, err := s.ResolveMembers(context.Background(), "auto1", nil)
+	if err != nil || !isAuto {
+		t.Fatalf("resolve2: err=%v isAuto=%v", err, isAuto)
+	}
+	if second[0].ExternalModelID != 10 || second[0].ExternalName != "a" {
+		t.Fatalf("缓存被返回值修改污染：%+v", second[0])
 	}
 }
