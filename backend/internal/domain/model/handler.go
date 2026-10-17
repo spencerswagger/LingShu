@@ -175,11 +175,9 @@ func (h *Handler) HandlePriceReference(w http.ResponseWriter, r *http.Request) {
 	}
 	resp.OK(w, r, map[string]any{
 		"Reference": map[string]float64{
-			"Input":      ref.Input,
-			"Output":     ref.Output,
-			"CacheRead":  ref.CacheRead,
-			"CacheWrite": ref.CacheWrite,
-			"Reasoning":  ref.Reasoning,
+			"Input":     ref.Input,
+			"Output":    ref.Output,
+			"CacheRead": ref.CacheRead,
 		},
 		"UpdatedAt": ref.UpdatedAt.Format(time.RFC3339),
 	})

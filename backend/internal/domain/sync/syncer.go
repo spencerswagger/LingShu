@@ -230,15 +230,14 @@ func ProviderModelKey(provider, modelID string) string {
 }
 
 // PriceEntry 价格目录条目：含供应商维度，供「搜索浏览 models.dev 参考价」使用。
-// 价格均为美元 / 百万 token；cache_read / cache_write / reasoning 来自 models.dev cost 字段。
+// 价格均为美元 / 百万 token；三段口径只保留 input/output/cache_read
+// （cache_write/reasoning 无对应计费段，不展示）。
 type PriceEntry struct {
-	Provider      string  `json:"Provider"`
-	ModelID       string  `json:"ModelID"`
-	InputUSD      float64 `json:"InputUSD"`
-	OutputUSD     float64 `json:"OutputUSD"`
-	CacheUSD      float64 `json:"CacheReadUSD"`
-	CacheWriteUSD float64 `json:"CacheWriteUSD"`
-	ReasoningUSD  float64 `json:"ReasoningUSD"`
+	Provider  string  `json:"Provider"`
+	ModelID   string  `json:"ModelID"`
+	InputUSD  float64 `json:"InputUSD"`
+	OutputUSD float64 `json:"OutputUSD"`
+	CacheUSD  float64 `json:"CacheReadUSD"`
 }
 
 // Recommended 返回某外部模型名（即 models.dev 模型 ID）下最合适的参考价：
@@ -304,13 +303,11 @@ func (s *Syncer) SearchPrices(q string) []PriceEntry {
 			}
 		}
 		out = append(out, PriceEntry{
-			Provider:      p.Provider,
-			ModelID:       p.ID,
-			InputUSD:      p.Pricing.Prompt,
-			OutputUSD:     p.Pricing.Completion,
-			CacheUSD:      p.Pricing.CacheRead,
-			CacheWriteUSD: p.Pricing.CacheWrite,
-			ReasoningUSD:  p.Pricing.Reasoning,
+			Provider:  p.Provider,
+			ModelID:   p.ID,
+			InputUSD:  p.Pricing.Prompt,
+			OutputUSD: p.Pricing.Completion,
+			CacheUSD:  p.Pricing.CacheRead,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {

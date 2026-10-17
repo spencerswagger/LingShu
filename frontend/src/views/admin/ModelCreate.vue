@@ -18,7 +18,7 @@ const form = reactive({
 })
 // 定价对象（售价 + 可选模型级时段/分档）
 const pricing = reactive<Record<string, any>>({
-  SaleRates: { Input: 0, Output: 0, CacheRead: 0, CacheWrite: 0, Reasoning: 0 },
+  SaleRates: { Input: 0, Output: 0, CacheRead: 0 },
   TimeConfig: null,
   ContextTiers: null,
 })

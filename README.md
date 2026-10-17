@@ -4,16 +4,16 @@
 
 **灵枢（LingShu）** 是一套面向「渠道 / 模型 / 令牌 / 计费」全链路的 AI 网关与资产管理平台。
 它以 OpenAI 兼容协议的**统一网关**为入口，将多只上游渠道（供应商）包装成单一的调用平面，
-并按**令牌语义标签**智能路由；内置国密加密、JWT 鉴权、五段计费、会话亲和与健康探测，
+并按**令牌语义标签**智能路由；内置国密加密、JWT 鉴权、三段计费、会话亲和与健康探测，
 附完整的管理端 / 开发端前端页面。
 
 ## 功能列表
 
 - **身份与令牌**：管理员 / 开发者两种角色；JWT（RS256）鉴权；API Key（明文 HMAC→SM3 落库，只展示一次）
 - **渠道管理**：OpenAI-compat 上游对接，凭据 SM4-GCM 加密存储，超时 / 限流 / 健康探测与状态机（HEALTHY / DRAIN_ONLY / UNAVAILABLE）；一个渠道可挂多把密钥
-- **模型映射**：对外模型名 → 内部模型 ID 全局单射，含一套五段计价费率（sale / cost 双口径）
+- **模型映射**：对外模型名 → 内部模型 ID 全局单射，含一套三段计价费率（sale / cost 双口径）
 - **语义路由**：令牌绑定的语义标签（KV）严格匹配渠道标签 → 会话亲和 → 优先级分层、同层加权轮询
-- **计费**：五段 token 计费（input / output / cache_read / cache_write / reasoning）× 时段系数 × 上下文分档 ÷ R；调用前预估预扣、调用后多退少补；账单拆解三步展示，钱包积分乐观锁扣减（余额不足 402）
+- **计费**：三段 token 计费（输入 / 缓存读 / 输出，输入为纯输入、输出含推理）× 时段系数 × 上下文分档 ÷ R；调用前预估预扣、调用后多退少补；账单拆解三步展示，钱包积分乐观锁扣减（余额不足 402）
 - **控制台**：管理员数据看板（用户 / 渠道 / 账单 / 会话 / 统计 / 标签 / 汇率同步 watchlist），开发者用量、账单、钱包与令牌自助
 - **价格同步**：定时拉取外部价格源（models.dev/api.json）并与 watchlist 比对产生告警
 
@@ -179,7 +179,7 @@ docker compose down -v           # 停止并删除数据卷（含数据库与密
 | `backend/internal/domain/tag` | 语义标签 KV 与渠道绑定 |
 | `backend/internal/domain/model` | 模型映射（对外名 → 内部名）与费率 |
 | `backend/internal/domain/router` | 模型解析 → 标签匹配 → 会话亲和 → 优先级 / 加权路由 |
-| `backend/internal/domain/billing` | 五段计费、预估预扣、上下文分档、时段系数、账单记账、失败重试与统计 |
+| `backend/internal/domain/billing` | 三段计费、预估预扣、上下文分档、时段系数、账单记账、失败重试与统计 |
 | `backend/internal/domain/gateway` | 网关热路径：认证 → 路由 → 转发 → 计费（openai-compat 上游适配） |
 | `backend/internal/domain/console` | 管理端 / 开发端控制台查询、看板聚合与账单拆解 |
 | `backend/internal/domain/sync` | 外部价格源拉取与 watchlist 告警 |

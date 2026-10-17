@@ -30,7 +30,7 @@
 - AC-13 同步-未编辑 → 直接覆盖，标记回「同步」。
 - AC-14 同步-已编辑 → 展示差异 + 二次确认才覆盖；放弃不改动。
 - AC-15 预设条目删除/改名 → 协议**不删除**，标记「来源已失效」，引用渠道仍可用。
-- AC-16 三协议 usage 归一化五段；Anthropic 推理 token 并入 output。
+- AC-16 三协议 usage 归一化三段（输入/缓存读/输出；缓存写并入输入、推理并入输出，详见 design spec AC-16）。
 - AC-17 usage 缺失/无法解析 → 该次调用报错 + 渠道置 `DISABLED`。
 - AC-18 模型 `protocols` 仅含 `anthropic-messages` → 该模型对 openai-chat 返回 AC-4 固定错误。
 
@@ -84,7 +84,7 @@
 
 4. **Provider 接口扩展**：`gateway/provider.go:23-31` 将 `BuildUpstreamRequest(ctx, baseURL, cred, body, isStream)` 的入参收敛为一个构造上下文（新增 `UpstreamRequest{BaseURL, Cred, Body, IsStream, DownstreamHeader, HeaderPolicy, Auth}`），或在 `context.Context` 中携带头策略（二者取其一，见 Architect 张力 T1）。`gateway/openai.go:26,52` 同步改写。（实现注：最终 `UpstreamRequest` 移除了未被消费的 `IsStream` 字段。）
 
-5. **新增两个 Provider 实现**：`gateway/responses.go`、`gateway/anthropic.go`，分别实现 `Name/BuildUpstreamRequest/ExtractUsage/HandleStream`；Anthropic 的 `ExtractUsage` 把推理 token **并入 output**（AC-16）。参照现有 `openai.go:139-199` 的 SSE 透传与 usage 解析写法。
+5. **新增两个 Provider 实现**：`gateway/responses.go`、`gateway/anthropic.go`，分别实现 `Name/BuildUpstreamRequest/ExtractUsage/HandleStream`；Anthropic 的 usage 按三段口径归一（缓存写并入输入、推理并入 output，AC-16）。参照现有 `openai.go:139-199` 的 SSE 透传与 usage 解析写法。
 
 6. **头策略引擎**：新增 `gateway/headers.go`——常量**强制黑名单**表（不可配置）；`ApplyPolicy(mode, whitelist, blacklist, set, vars)`；变量替换 `{api_key}/{session_id}/{request_id}/{model}/{client_header:NAME}`。在 `openai.go:50-60`（及新 Provider）的请求构造处接入，替换现有「仅注入 `Content-Type` + `Authorization`」。
 
@@ -96,7 +96,7 @@
 
 10. **响应头**：在各 Provider 内**硬编码**入站响应头；全局上游响应头白名单从 `sys_configs`（表结构见 `migrations/0001_init.sql:271-276`）读 key `gateway.upstream_response_header_whitelist`，在写回处过滤上游头（非流式 `handler.go:640-733`、流式 `handler.go:769-779`）。
 
-11. **usage 归一化与计费接线**：各 Provider 的 `ExtractUsage`/`HandleStream` 归一到 `billing.Usage` 五段（`domain/billing/rates.go`）；`handler.go:694` 处 usage 缺失/解析失败 → 返回错误 + 置渠道 `state=DISABLED`（AC-17）。
+11. **usage 归一化与计费接线**：各 Provider 的 `ExtractUsage`/`HandleStream` 归一到 `billing.Usage`（三段：输入/缓存读/输出，`domain/billing/rates.go`）；`handler.go:694` 处 usage 缺失/解析失败 → 返回错误 + 置渠道 `state=DISABLED`（AC-17）。
 
 12. **预设同步**：新增 `backend/internal/domain/preset/{source,syncer,store}.go`，`fetchSource` 参照 `domain/sync/source.go:82-103` 的拉取/解析写法（**不复用价格 watchlist 语义**）；初始化拉取一次 + 管理员按钮触发；物化到 `channel_protocols`；实现「同步/已编辑/来源已失效」三态（AC-12~AC-15）。
 
@@ -127,7 +127,7 @@
 | 预设拉取阻塞启动 | 未设置环境变量直接跳过；失败仅日志、不 panic（AC-12） |
 | 同步覆盖掉管理员手工编辑 | `edited` 标记分流 + 已编辑条目**展示差异 + 二次确认**（AC-13/14） |
 | 删除预设条目引发级联删渠道 | 外键**不级联**（`ON DELETE` 缺省 RESTRICT/NO ACTION），改标记「来源已失效」（AC-15） |
-| usage 解析分支写错导致计费口径漂移 | 三协议 usage 归一化统一走 `billing.Usage` 五段；单测逐协议断言（AC-16） |
+| usage 解析分支写错导致计费口径漂移 | 三协议 usage 归一化统一走 `billing.Usage` 三段；单测逐协议断言（AC-16） |
 | 有效 baseURL/protocols 继承链多层覆盖算错 | 单测覆盖「渠道协议 ← 渠道 ← 模型级子集」三级优先级 |
 
 ## Verification steps
@@ -139,7 +139,7 @@
 - **AC-10/11**：构造带额外响应头的 fake 上游，断言客户端可见头集合。
 - **AC-12**：`PRESET_PACK_URL` 空 → 断言无出网请求；非法地址 → 断言进程起来且列表空。
 - **AC-13/14/15**：同步器单测，覆盖三态与二次确认分支。
-- **AC-16**：三协议各给样例响应体，断言 `billing.Usage` 五段数值。
+- **AC-16**：三协议各给样例响应体，断言 `billing.Usage` 三段数值。
 - **AC-17**：给缺 usage 的响应体，断言返回错误且渠道 state 变 `DISABLED`。
 - 回归：`go test ./backend/...` 全绿（尤其 `gateway/handler_test.go`）。
 

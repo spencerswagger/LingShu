@@ -1,0 +1,15 @@
+-- 0012_call_logs_upstream_usage：调用日志落库「上游原始 usage」。
+--
+-- 目的：诊断各渠道 usage 口径是否一致（例如输入是否包含缓存读）。billing_records.tokens 存的是
+-- 归一化后的三段用量，无法反推上游原文；本列保留上游 usage 原始键值，供事后比对与排查。
+--
+-- 落库形态（见 gateway/rawusage.go）：
+--   {"Protocol":"<基础协议名：openai-chat | openai-responses | anthropic-messages>",
+--    "Usage":{...上游 usage 原始键值...}}
+-- 协议名必须同存：不同协议的字段名与包含关系不同（OpenAI 的 prompt_tokens 含 cached_tokens，
+-- Anthropic 的 input_tokens 不含 cache_read/cache_creation），脱离协议无法判断口径。
+-- 流式响应的 usage 可能分散在多个事件（Anthropic 的 message_start/message_delta），
+-- 落库值为各分片按「同名键后写覆盖」合并后的对象（累计值语义下后出现的即最终值）。
+--
+-- 幂等：ADD COLUMN IF NOT EXISTS；旧数据该列为 NULL（无原始 usage，属预期）。
+ALTER TABLE call_logs ADD COLUMN IF NOT EXISTS upstream_usage JSONB NULL;
