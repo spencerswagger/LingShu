@@ -367,8 +367,19 @@ type internalBinding struct {
 // （候选 = 每 (渠道,密钥,内部模型) 一条），含排空候选：会话命中时允许其续行；
 // 普通选择由上层过滤为「模型/密钥都正常」。
 // 某内部模型禁用/排空只跳过该行：同一渠道/密钥下的其他内部模型行仍正常展开候选。
-// 展开顺序仅为收集顺序：渠道按快照遍历、同渠道按内部模型行 id 升序、各自按密钥轮询顺序，
+// 展开顺序仅为收集顺序：渠道按快照遍历、同渠道按内部模型行 id 升序、各自按密钥 id 升序，
 // 最终顺序由 orderCandidates 决定。
+//
+// 快照一致性（显式成文，不默认；P3「非原子快照」的既定取舍）：
+// 本方法对 channel.Manager 的读取为多次独立取锁——Snapshot()（渠道元信息/绑定标签）、
+// ModelViews()（内部模型状态）、KeyOrderForRouting()/GetKeyRuntime()（密钥状态）——
+// 因此同一次路由可能取自略有时序差的多个视图（TOCTOU）。这里显式接受该「最终一致」语义：
+//   - 各视图自身都是一致快照（各自在 Manager.mu 读锁内采集），不存在撕裂读；
+//   - 跨视图错位仅在「路由进行中恰好发生配置/状态变更」时出现，其结果仍是一个当时合法的候选
+//     集合（可能少/多包含一个刚变更的行），下一次路由即自愈，不产生错误渠道绑定；
+//   - 故不引入跨视图单锁快照，保持改动外科手术式（避免触及 NewEngine 签名与全部路由用例）。
+//
+// 若将来要求「单次路由内各视图严格同一时刻」，应新增 Manager 单锁快照方法收口此处。
 func (e *Engine) usableCandidates(internalByChannel map[int64][]internalBinding) []candidate {
 	cands := make([]candidate, 0, 16)
 	for _, v := range e.chMgr.Snapshot() {
@@ -395,7 +406,7 @@ func (e *Engine) usableCandidates(internalByChannel map[int64][]internalBinding)
 			if !foundModel {
 				continue
 			}
-			// 密钥级展开：同渠道多个可用密钥按路由轮询顺序平铺打散，state != DISABLED 才候选
+			// 密钥级展开：同渠道多个可用密钥按密钥 id 升序平铺（KeyOrderForRouting 不轮转），state != DISABLED 才候选
 			for _, keyID := range e.chMgr.KeyOrderForRouting(v.ID) {
 				kr, ok := e.chMgr.GetKeyRuntime(keyID)
 				if !ok || kr.Machine.State() == channel.StateDisabled {
