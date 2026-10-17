@@ -425,7 +425,10 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	sessionStore := router.NewSessionStore(d)
 	sess := router.NewSessionRegistry(time.Now)
 	sess.SetStore(sessionStore)
-	routerEngine := router.NewEngine(modelSvc, cmStore, chMgr, sess)
+	// 候选绑定改读 channel.Manager 内存快照（方案 A）：chMgr 实现了 router.channelModelSource，
+	// 每请求不再查询 channel_models 配置表；快照经既有 SyncFromDB/Upsert/UpsertModel/DropModel 钩子失效。
+	// 对外模型名称解析仍由 modelSvc（GetByExternalName）负责，未在此缓存。
+	routerEngine := router.NewEngine(modelSvc, chMgr, chMgr, sess)
 	// 新会话创建的成本比较依赖：样值用量（routing.cost_sample）+ 全局时段（billing.time_config）。
 	// billing.ConfigProvider 结构上满足 router.CostConfig，直接注入（router 不直接读库）。
 	routerEngine.SetCostConfig(billCfgProvider)
