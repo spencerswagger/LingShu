@@ -170,6 +170,20 @@ func validate(cp *ChannelProtocol) error {
 	if err := validateErrorPolicies(cp.ErrorPolicy); err != nil {
 		return err
 	}
+	if err := validateFeatures(cp.Features); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateFeatures 校验协议特性列表的合法性：Key 必须为代码实现并注册的合法特性
+// （未知特性 key 拒绝）；Params 允许为空（nil/空 map 均合法）。
+func validateFeatures(features []Feature) error {
+	for i := range features {
+		if !IsValidFeatureKey(features[i].Key) {
+			return errBadRequest(fmt.Sprintf("features[%d]：未知的特性 key：%s", i, features[i].Key))
+		}
+	}
 	return nil
 }
 
@@ -217,6 +231,18 @@ func normalizeErrorPolicies(policies []ErrorPolicy) []ErrorPolicy {
 	return out
 }
 
+// normalizeFeatures 归一协议特性：nil→空切片（落库为 '[]'）；Params nil→空 map（允许为空）。
+func normalizeFeatures(features []Feature) []Feature {
+	out := make([]Feature, 0, len(features))
+	for _, f := range features {
+		if f.Params == nil {
+			f.Params = map[string]any{}
+		}
+		out = append(out, f)
+	}
+	return out
+}
+
 // normalizeIn 归一化入参：协议键 canonical 化、策略补默认、名称去空白。
 func normalizeIn(cp *ChannelProtocol) {
 	cp.Name = strings.TrimSpace(cp.Name)
@@ -224,6 +250,7 @@ func normalizeIn(cp *ChannelProtocol) {
 	cp.Protocols = canonicalProtocols(cp.Protocols)
 	cp.RequestHeaders = normalizePolicy(cp.RequestHeaders)
 	cp.ErrorPolicy = normalizeErrorPolicies(cp.ErrorPolicy)
+	cp.Features = normalizeFeatures(cp.Features)
 	if cp.Models == nil {
 		cp.Models = map[string]ModelGateway{}
 	}

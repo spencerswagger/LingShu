@@ -13,7 +13,7 @@ import (
 )
 
 // cpCols 列出 channel_protocols 表查询使用的列。
-const cpCols = `id, name, base_url, protocols, request_headers, models, error_policy,
+const cpCols = `id, name, base_url, protocols, request_headers, models, error_policy, features,
 	preset_source_id, edited, source_status, created_at, updated_at`
 
 // ErrNameExists 表示渠道协议名称唯一约束冲突（PG 23505）。
@@ -38,10 +38,10 @@ func marshalJSONB(v any) []byte {
 // scanChannelProtocol 将一行扫描到 *ChannelProtocol，解析 JSONB 列。
 func scanChannelProtocol(row interface{ Scan(...any) error }) (*ChannelProtocol, error) {
 	var cp ChannelProtocol
-	var protocolsRaw, headersRaw, modelsRaw, errorPolicyRaw []byte
+	var protocolsRaw, headersRaw, modelsRaw, errorPolicyRaw, featuresRaw []byte
 	var status string
 	err := row.Scan(&cp.ID, &cp.Name, &cp.BaseURL, &protocolsRaw, &headersRaw,
-		&modelsRaw, &errorPolicyRaw, &cp.PresetSourceID, &cp.Edited, &status, &cp.CreatedAt, &cp.UpdatedAt)
+		&modelsRaw, &errorPolicyRaw, &featuresRaw, &cp.PresetSourceID, &cp.Edited, &status, &cp.CreatedAt, &cp.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -64,6 +64,11 @@ func scanChannelProtocol(row interface{ Scan(...any) error }) (*ChannelProtocol,
 	if len(errorPolicyRaw) > 0 {
 		if err := json.Unmarshal(errorPolicyRaw, &cp.ErrorPolicy); err != nil {
 			return nil, fmt.Errorf("parse error_policy: %w", err)
+		}
+	}
+	if len(featuresRaw) > 0 {
+		if err := json.Unmarshal(featuresRaw, &cp.Features); err != nil {
+			return nil, fmt.Errorf("parse features: %w", err)
 		}
 	}
 	return &cp, nil
@@ -165,11 +170,11 @@ func insertOn(ctx context.Context, e execer, cp *ChannelProtocol) (*ChannelProto
 		cp.SourceStatus = SourceActive
 	}
 	row := e.QueryRowContext(ctx,
-		`INSERT INTO channel_protocols(id, name, base_url, protocols, request_headers, models, error_policy,
+		`INSERT INTO channel_protocols(id, name, base_url, protocols, request_headers, models, error_policy, features,
 		        preset_source_id, edited, source_status)
-		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING `+cpCols,
+		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING `+cpCols,
 		cp.ID, cp.Name, cp.BaseURL, marshalJSONB(cp.Protocols),
-		marshalJSONB(cp.RequestHeaders), marshalJSONB(cp.Models), marshalJSONB(cp.ErrorPolicy),
+		marshalJSONB(cp.RequestHeaders), marshalJSONB(cp.Models), marshalJSONB(cp.ErrorPolicy), marshalJSONB(cp.Features),
 		cp.PresetSourceID, cp.Edited, cp.SourceStatus)
 	created, err := scanChannelProtocol(row)
 	if err != nil {
@@ -187,11 +192,11 @@ func (s *Store) Update(ctx context.Context, cp *ChannelProtocol) error {
 func updateOn(ctx context.Context, e execer, cp *ChannelProtocol) error {
 	res, err := e.ExecContext(ctx,
 		`UPDATE channel_protocols SET name=$1, base_url=$2, protocols=$3,
-		        request_headers=$4, models=$5, error_policy=$6, preset_source_id=$7, edited=$8, source_status=$9,
+		        request_headers=$4, models=$5, error_policy=$6, features=$7, preset_source_id=$8, edited=$9, source_status=$10,
 		        updated_at=now()
-		 WHERE id=$10 AND deleted_at IS NULL`,
+		 WHERE id=$11 AND deleted_at IS NULL`,
 		cp.Name, cp.BaseURL, marshalJSONB(cp.Protocols),
-		marshalJSONB(cp.RequestHeaders), marshalJSONB(cp.Models), marshalJSONB(cp.ErrorPolicy),
+		marshalJSONB(cp.RequestHeaders), marshalJSONB(cp.Models), marshalJSONB(cp.ErrorPolicy), marshalJSONB(cp.Features),
 		cp.PresetSourceID, cp.Edited, cp.SourceStatus, cp.ID)
 	if err != nil {
 		return classifyErr(err)

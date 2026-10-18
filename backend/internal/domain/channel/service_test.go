@@ -301,8 +301,8 @@ const cpByIdRe = `(?s)SELECT .* FROM channel_protocols WHERE id=\$1 AND deleted_
 func cpProtoRow(id int64, baseURL, modelsJSON string) *sqlmock.Rows {
 	now := time.Now()
 	return sqlmock.NewRows([]string{"id", "name", "base_url", "protocols", "request_headers",
-		"models", "error_policy", "preset_source_id", "edited", "source_status", "created_at", "updated_at"}).
-		AddRow(id, "p", baseURL, `{"openai-chat":{}}`, `{"passthroughMode":"none"}`, modelsJSON, `[]`, "", true,
+		"models", "error_policy", "features", "preset_source_id", "edited", "source_status", "created_at", "updated_at"}).
+		AddRow(id, "p", baseURL, `{"openai-chat":{}}`, `{"passthroughMode":"none"}`, modelsJSON, `[]`, `[]`, "", true,
 			channelprotocol.SourceActive, now, now)
 }
 
