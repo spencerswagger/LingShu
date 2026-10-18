@@ -53,6 +53,97 @@ interface TranscriptItem {
   channel: { channel: string; key: string; model: string }
 }
 
+// 决策轨迹项（后端 CallLogView.Decision.attempts[]，字段可能随版本扩展，全部可选）。
+interface TrailAttempt {
+  order?: number
+  channel_id?: string
+  channel_name?: string
+  channel_key_id?: string
+  channel_key_name?: string
+  internal_model_id?: string
+  reason?: string
+  // 该候选未进入上游即被排除（排空/禁用/限流/会话满/协议不支持等）
+  skipped?: boolean
+  // 排除原因的运维动作提示（后端 key 为 hint；兼容 exclusionHint / exclusion_hint 别名）
+  hint?: string
+  exclusionHint?: string
+  exclusion_hint?: string
+  // 流式失败诊断（已送达/未送达、是否收到首字节、阶段耗时）
+  delivered?: boolean
+  first_byte_received?: boolean
+  elapsed_ms?: number
+  upstream_status?: number
+}
+// 流式失败诊断（可能挂在 decision 顶层，也可能挂在失败候选项上）
+interface TrailDiag {
+  delivered?: boolean
+  first_byte_received?: boolean
+  elapsed_ms?: number
+  upstream_status?: number
+}
+
+function decisionObj(cl: CallLogView): Record<string, any> | null {
+  const d = cl.Decision
+  return d && typeof d === 'object' ? (d as Record<string, any>) : null
+}
+
+// 决策轨迹尝试项：无 attempts（拒绝/旧数据）时返回空数组，未知字段不影响渲染。
+function callAttempts(cl: CallLogView): TrailAttempt[] {
+  const d = decisionObj(cl)
+  return d && Array.isArray(d.attempts) ? (d.attempts as TrailAttempt[]) : []
+}
+
+// 流式失败诊断：优先取 decision 顶层，缺省回退到失败候选项（仅取已存在字段，未知字段容错）。
+function callStreamDiag(cl: CallLogView): TrailDiag {
+  const d = decisionObj(cl)
+  if (!d) return {}
+  const atts = Array.isArray(d.attempts) ? (d.attempts as TrailAttempt[]) : []
+  const src: TrailDiag = {}
+  for (const row of atts) {
+    if (row.delivered != null) src.delivered = row.delivered
+    if (row.first_byte_received != null) src.first_byte_received = row.first_byte_received
+    if (row.elapsed_ms != null) src.elapsed_ms = row.elapsed_ms
+    if (row.upstream_status != null) src.upstream_status = row.upstream_status
+  }
+  const diag: TrailDiag = {}
+  if (d.delivered != null) diag.delivered = !!d.delivered
+  else if (src.delivered != null) diag.delivered = src.delivered
+  if (d.first_byte_received != null) diag.first_byte_received = !!d.first_byte_received
+  else if (src.first_byte_received != null) diag.first_byte_received = src.first_byte_received
+  if (d.elapsed_ms != null) diag.elapsed_ms = Number(d.elapsed_ms)
+  else if (src.elapsed_ms != null) diag.elapsed_ms = src.elapsed_ms
+  if (d.upstream_status != null) diag.upstream_status = Number(d.upstream_status)
+  else if (src.upstream_status != null) diag.upstream_status = src.upstream_status
+  return diag
+}
+
+// 稳定排除/失败原因 → 中文标签；未知原因原样回退（对后端新增枚举容错）。
+const REASON_LABELS: Record<string, string> = {
+  no_binding: '未绑定渠道',
+  tag_no_route: '标签无路由',
+  drained: '排空',
+  no_candidate: '无候选',
+  session_full: '会话已满',
+  rate_limited: '限流',
+  unsupported_protocol: '协议不支持',
+  credential_unavailable: '凭据不可用',
+  disabled: '已禁用',
+}
+function reasonLabel(reason?: string): string {
+  if (!reason) return '-'
+  return REASON_LABELS[reason] || reason
+}
+
+// 排除原因的运维动作提示：兼容后端 hint 及 exclusionHint/exclusion_hint 别名，未知字段容错。
+function attemptHint(row: TrailAttempt): string {
+  return row.hint || row.exclusionHint || row.exclusion_hint || ''
+}
+
+// skipped 行样式：未进入上游即被排除的候选弱化展示。
+function attemptRowClass({ row }: { row: TrailAttempt }): string {
+  return row.skipped ? 'skipped-row' : ''
+}
+
 function msgSide(role?: string) {
   return role === 'user' ? 'right' : 'left'
 }
@@ -200,6 +291,58 @@ const transcript = computed<TranscriptItem[]>(() =>
             </div>
           </div>
         </div>
+
+        <!-- 决策轨迹：含路由层排除项（排空等）与流式失败诊断，未知字段容错 -->
+        <div v-if="callAttempts(item.call).length" class="trail">
+          <div class="trail-head">
+            <span class="trail-title">决策轨迹</span>
+            <el-tag
+              v-if="callStreamDiag(item.call).delivered != null"
+              size="small"
+              :type="callStreamDiag(item.call).delivered ? 'danger' : 'info'"
+              effect="plain"
+            >
+              上游{{ callStreamDiag(item.call).delivered ? '已送达' : '未送达' }}
+            </el-tag>
+            <el-tag v-if="callStreamDiag(item.call).first_byte_received != null" size="small" effect="plain">
+              {{ callStreamDiag(item.call).first_byte_received ? '已收首字节' : '未收首字节' }}
+            </el-tag>
+            <el-tag v-if="callStreamDiag(item.call).elapsed_ms != null" size="small" effect="plain">
+              阶段耗时 {{ callStreamDiag(item.call).elapsed_ms }}ms
+            </el-tag>
+            <el-tag v-if="callStreamDiag(item.call).upstream_status != null" size="small" effect="plain">
+              上游状态 {{ callStreamDiag(item.call).upstream_status }}
+            </el-tag>
+          </div>
+          <el-table
+            :data="callAttempts(item.call)"
+            border
+            size="small"
+            class="trail-table"
+            :row-class-name="attemptRowClass"
+          >
+            <el-table-column label="顺序" width="64" align="center">
+              <template #default="{ row }">#{{ row.order }}</template>
+            </el-table-column>
+            <el-table-column label="渠道" min-width="140">
+              <template #default="{ row }">
+                <span :title="row.channel_id">{{ row.channel_name || row.channel_id || '-' }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="内部模型" min-width="140">
+              <template #default="{ row }"><span class="mono">{{ row.internal_model_id || '-' }}</span></template>
+            </el-table-column>
+            <el-table-column label="原因" min-width="220">
+              <template #default="{ row }">
+                <span>{{ reasonLabel(row.reason) }}{{ row.skipped ? '（跳过）' : '' }}</span>
+                <!-- 排除原因的运维动作提示（如排空→查渠道/密钥状态或手动探测） -->
+                <el-tag v-if="attemptHint(row)" size="small" type="info" effect="plain" class="hint-tag">
+                  {{ attemptHint(row) }}
+                </el-tag>
+              </template>
+            </el-table-column>
+          </el-table>
+        </div>
       </div>
     </div>
   </div>
@@ -288,5 +431,30 @@ const transcript = computed<TranscriptItem[]>(() =>
   font-weight: 600;
   color: var(--color-danger);
   margin-bottom: 6px;
+}
+.trail {
+  margin-top: 10px;
+}
+.trail-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.trail-title {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--color-text-secondary);
+}
+.hint-tag {
+  margin-left: 6px;
+}
+/* skipped 行（未进入上游即被排除）：弱化展示，与真实失败候选区分 */
+.trail-table :deep(.skipped-row) {
+  color: var(--color-text-tertiary);
+}
+.trail-table :deep(.skipped-row td.el-table__cell) {
+  background: var(--color-primary-light-9);
 }
 </style>

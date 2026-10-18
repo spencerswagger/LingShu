@@ -537,3 +537,54 @@ func TestSanitizeErrSummaryMasksHighEntropyToken(t *testing.T) {
 		}
 	}
 }
+
+// Step 3：稳定排除原因 → 运维动作提示映射（纯函数）；未知 reason 返回空串。
+func TestExclusionHint_MapsReasons(t *testing.T) {
+	cases := map[string]string{
+		"drained":                "查渠道/密钥状态或手动探测",
+		"session_full":           "查会话并发/存活",
+		"rate_limited":           "查模型/渠道/密钥 RPM·TPM",
+		"unsupported_protocol":   "查协议可达性",
+		"credential_unavailable": "查密钥凭据",
+		"disabled":               "查禁用状态",
+	}
+	for reason, want := range cases {
+		if got := exclusionHint(reason); got != want {
+			t.Errorf("exclusionHint(%q) = %q, want %q", reason, got, want)
+		}
+	}
+	if got := exclusionHint("unknown_reason"); got != "" {
+		t.Errorf("未知 reason 应返回空串, got %q", got)
+	}
+}
+
+// Step 6：errInfo 流式诊断字段（delivered / first_byte_received / elapsed_ms）随日志输出；
+// 未填充时不输出，保证非流式失败日志字段集不变。
+func TestErrLog_StreamDiagnostics(t *testing.T) {
+	h := build(t, "http://unused")
+	dump := withLogCapture(h)
+
+	delivered := false
+	firstByte := false
+	elapsed := int64(123)
+	h.gw.logUpstreamErr(context.Background(), slog.LevelWarn, "upstream call failed", "chat/completions", "openai-chat", "gpt-4",
+		nil, &router.RouteResult{ChannelID: 1, ChannelKeyID: 1, InternalModelID: "gpt-4-internal"}, diag{},
+		errInfo{kind: "connect_failed", stage: "stream", attempt: 1, retry: true,
+			reason: "上游流式调用失败", delivered: &delivered, firstByteReceived: &firstByte, elapsedMS: &elapsed})
+	out := dump()
+	for _, want := range []string{"kind=connect_failed", "stage=stream",
+		"delivered=false", "first_byte_received=false", "elapsed_ms=123"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("errInfo 流式诊断字段缺失 %q\n%s", want, out)
+		}
+	}
+
+	// 未填充诊断字段时不应输出（非流式失败保持既有字段集）。
+	dump2 := withLogCapture(h)
+	h.gw.logUpstreamErr(context.Background(), slog.LevelWarn, "upstream error response", "chat/completions", "openai-chat", "gpt-4",
+		nil, nil, diag{}, errInfo{kind: "upstream_status", stage: "non_stream", status: http.StatusInternalServerError})
+	out2 := dump2()
+	if strings.Contains(out2, "delivered=") || strings.Contains(out2, "first_byte_received=") || strings.Contains(out2, "elapsed_ms=") {
+		t.Errorf("未填充诊断时不应输出相关字段：\n%s", out2)
+	}
+}

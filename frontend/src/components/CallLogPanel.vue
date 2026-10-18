@@ -13,14 +13,30 @@ interface DecisionAttempt {
   channel_key_name?: string
   internal_model_id?: string
   reason?: string
-  // 该候选未进入上游即被跳过（禁用/限流/会话满/协议不支持等）
+  // 该候选未进入上游即被跳过（禁用/限流/会话满/协议不支持/排空等）
   skipped?: boolean
+  // 排除原因的运维动作提示（后端 key 为 hint；兼容 exclusionHint / exclusion_hint 别名）
+  hint?: string
+  exclusionHint?: string
+  exclusion_hint?: string
+  // 流式失败诊断（已送达/未送达、是否收到首字节、阶段耗时）
+  delivered?: boolean
+  first_byte_received?: boolean
+  elapsed_ms?: number
+  upstream_status?: number
   // 成本标量 / 是否有效 / 时段系数（仅排查用，不参与计费）
   cost?: number
   cost_known?: boolean
   route_time_coeff?: number
 }
-interface DecisionView {
+// 流式失败诊断（可能挂在 decision 顶层，也可能挂在失败候选项上）
+interface StreamDiag {
+  delivered?: boolean
+  first_byte_received?: boolean
+  elapsed_ms?: number
+  upstream_status?: number
+}
+interface DecisionView extends StreamDiag {
   attempts?: DecisionAttempt[]
   time_coeff?: number
   ctx_coeff?: number
@@ -85,6 +101,33 @@ function fmtCost(row: DecisionAttempt): string {
 function fmtCoeff(v: number | undefined): string {
   if (v == null) return '-'
   return `×${v}`
+}
+
+// 稳定排除/失败原因 → 中文标签；未知原因原样回退（对后端新增枚举容错）。
+const REASON_LABELS: Record<string, string> = {
+  no_binding: '未绑定渠道',
+  tag_no_route: '标签无路由',
+  drained: '排空',
+  no_candidate: '无候选',
+  session_full: '会话已满',
+  rate_limited: '限流',
+  unsupported_protocol: '协议不支持',
+  credential_unavailable: '凭据不可用',
+  disabled: '已禁用',
+}
+function reasonLabel(reason?: string): string {
+  if (!reason) return '-'
+  return REASON_LABELS[reason] || reason
+}
+
+// 排除原因的运维动作提示：兼容后端 hint 及 exclusionHint/exclusion_hint 别名，未知字段容错。
+function attemptHint(row: DecisionAttempt): string {
+  return row.hint || row.exclusionHint || row.exclusion_hint || ''
+}
+
+// skipped 行样式：未进入上游即被排除的候选弱化展示。
+function attemptRowClass({ row }: { row: DecisionAttempt }): string {
+  return row.skipped ? 'skipped-row' : ''
 }
 </script>
 
@@ -166,6 +209,24 @@ function fmtCoeff(v: number | undefined): string {
                   >（预估输入 {{ decision.est_input_tokens.toLocaleString() }} tok）</span
                 >
               </el-tag>
+              <!-- 流式失败诊断：区分「已送达/未送达」并展示响应阶段线索（仅排查用） -->
+              <el-tag
+                v-if="decision.delivered != null"
+                size="small"
+                :type="decision.delivered ? 'danger' : 'info'"
+                effect="plain"
+              >
+                上游{{ decision.delivered ? '已送达' : '未送达' }}
+              </el-tag>
+              <el-tag v-if="decision.first_byte_received != null" size="small" effect="plain">
+                {{ decision.first_byte_received ? '已收首字节' : '未收首字节' }}
+              </el-tag>
+              <el-tag v-if="decision.elapsed_ms != null" size="small" effect="plain">
+                阶段耗时 {{ decision.elapsed_ms }}ms
+              </el-tag>
+              <el-tag v-if="decision.upstream_status != null" size="small" effect="plain">
+                上游状态 {{ decision.upstream_status }}
+              </el-tag>
             </div>
             <div v-if="decision.result != null" class="decision-result">
               <span class="d-label">最终结果</span>
@@ -177,6 +238,7 @@ function fmtCoeff(v: number | undefined): string {
               border
               size="small"
               class="attempt-table"
+              :row-class-name="attemptRowClass"
             >
               <el-table-column label="顺序" width="64" align="center">
                 <template #default="{ row }">#{{ row.order }}</template>
@@ -204,7 +266,13 @@ function fmtCoeff(v: number | undefined): string {
                 <template #default="{ row }"><span class="mono">{{ fmtCoeff(row.route_time_coeff) }}</span></template>
               </el-table-column>
               <el-table-column label="原因" min-width="200">
-                <template #default="{ row }">{{ row.reason || '-' }}{{ row.skipped ? '（跳过）' : '' }}</template>
+                <template #default="{ row }">
+                  <span>{{ reasonLabel(row.reason) }}{{ row.skipped ? '（跳过）' : '' }}</span>
+                  <!-- 排除原因的运维动作提示（如排空→查渠道/密钥状态或手动探测） -->
+                  <el-tag v-if="attemptHint(row)" size="small" type="info" effect="plain" class="hint-tag">
+                    {{ attemptHint(row) }}
+                  </el-tag>
+                </template>
               </el-table-column>
             </el-table>
           </template>
@@ -293,6 +361,16 @@ function fmtCoeff(v: number | undefined): string {
 }
 .attempt-table {
   margin-top: 4px;
+}
+.hint-tag {
+  margin-left: 6px;
+}
+/* skipped 行（未进入上游即被排除）：弱化展示，与真实失败候选区分 */
+.attempt-table :deep(.skipped-row) {
+  color: var(--color-text-tertiary);
+}
+.attempt-table :deep(.skipped-row td.el-table__cell) {
+  background: var(--color-primary-light-9);
 }
 .cost-unknown {
   color: var(--color-text-tertiary);

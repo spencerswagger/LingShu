@@ -24,6 +24,9 @@ type TokenLookup interface {
 type Router interface {
 	Route(ctx context.Context, spec router.RouteSpec) (*router.RouteResult, error)
 	RouteAll(ctx context.Context, spec router.RouteSpec) ([]*router.ChannelRoute, error)
+	// RouteAllWithExcluded 与 RouteAll 同语义，额外返回路由层被排除的候选
+	// （决策轨迹用；路由失败时也返回已收集的排除项）。
+	RouteAllWithExcluded(ctx context.Context, spec router.RouteSpec) (*router.RouteAllResult, error)
 	Sessions() *router.SessionRegistry
 }
 
