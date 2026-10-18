@@ -224,6 +224,24 @@ func (s *Store) NameOrAliasExists(ctx context.Context, name string) (bool, error
 	return true, nil
 }
 
+// AliasExistsForOther 判断某别名是否已被「其他」对外模型（id != excludeID）作为别名占用（忽略 enabled）。
+// 供别名命名空间的别名↔别名互斥校验：扁平命名空间下别名不得与他人别名重复。
+// excludeID 为当前模型主键（创建传 0，更新传自身 ID），用于排除对自身已存别名的误判。
+func (s *Store) AliasExistsForOther(ctx context.Context, alias string, excludeID int64) (bool, error) {
+	var one int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT 1 FROM external_models
+		 WHERE deleted_at IS NULL AND id <> $2 AND aliases @> to_jsonb(ARRAY[$1::text])
+		 LIMIT 1`, alias, excludeID).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // GetByExternalName 返回指定对外名称的启用模型（供路由/计费使用）。
 // 带内存缓存（见 Store.extNameCache 注释）：命中直接返回，零 DB 查询；未命中回源并写缓存
 // （含「无启用模型」负缓存）。无启用模型返回 sql.ErrNoRows。
@@ -241,8 +259,10 @@ func (s *Store) GetByExternalName(ctx context.Context, externalName string) (*Ex
 	gen := s.extNameCache.Generation()
 	// 名称解析：命中本模型 external_name 或其任一别名（别名 JSONB 包含判定），仍限定启用且未删除。
 	// 缓存键沿用入参名字（别名与其规范名为**不同键**、指向同一模型条目），负缓存语义不变。
+	// 确定性排序：多行匹配（历史脏数据可能出现别名/名称重叠）时优先精确 external_name 命中，
+	// 其后再按 id 升序，保证解析结果稳定不随物理行序漂移。
 	row := s.db.QueryRowContext(ctx,
-		`SELECT `+cols+` FROM external_models WHERE (external_name = $1 OR aliases @> to_jsonb(ARRAY[$1::text])) AND enabled = true AND deleted_at IS NULL LIMIT 1`, externalName)
+		`SELECT `+cols+` FROM external_models WHERE (external_name = $1 OR aliases @> to_jsonb(ARRAY[$1::text])) AND enabled = true AND deleted_at IS NULL ORDER BY (external_name = $1) DESC, id ASC LIMIT 1`, externalName)
 	m, err := scanExternal(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {

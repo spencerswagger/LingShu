@@ -25,8 +25,19 @@ func saleRates() billing.Rates {
 // extCols 与 store.cols 一致，供构造 mock 行。
 var extCols = []string{"id", "external_name", "description", "enabled", "sale_rates", "time_config", "context_tiers", "aliases", "created_at", "updated_at"}
 
-// extNameQuery 与 store.GetByExternalName 一致（含别名包含判定），供构造 mock 期望。
-const extNameQuery = `SELECT ` + cols + ` FROM external_models WHERE (external_name = $1 OR aliases @> to_jsonb(ARRAY[$1::text])) AND enabled = true AND deleted_at IS NULL LIMIT 1`
+// extNameQuery 与 store.GetByExternalName 一致（含别名包含判定 + 确定性排序），供构造 mock 期望。
+const extNameQuery = `SELECT ` + cols + ` FROM external_models WHERE (external_name = $1 OR aliases @> to_jsonb(ARRAY[$1::text])) AND enabled = true AND deleted_at IS NULL ORDER BY (external_name = $1) DESC, id ASC LIMIT 1`
+
+// aliasOtherQuery 与 store.AliasExistsForOther 一致（别名↔别名互斥校验），供构造 mock 期望。
+const aliasOtherQuery = `SELECT 1 FROM external_models
+		 WHERE deleted_at IS NULL AND id <> $2 AND aliases @> to_jsonb(ARRAY[$1::text])
+		 LIMIT 1`
+
+// expectAliasOtherNone 构造「别名未被其他模型占用」的 mock 期望（无匹配 → sql.ErrNoRows）。
+func expectAliasOtherNone(mock sqlmock.Sqlmock, alias string, excludeID int64) {
+	mock.ExpectQuery(regexp.QuoteMeta(aliasOtherQuery)).
+		WithArgs(alias, excludeID).WillReturnError(sql.ErrNoRows)
+}
 
 func extRow(m *ExternalModel, saleJSON string) *sqlmock.Rows {
 	aliasesJSON := `[]`
@@ -725,9 +736,11 @@ func TestService_ValidateAliases_AliasValidate(t *testing.T) {
 	if _, err := s.validateAliases(ctx, []string{"self"}, "self", 0); !isBadRequest(err) {
 		t.Fatalf("别名撞本模型名应 400，got %v", err)
 	}
-	// 去重且保持顺序（每个别名走一次 GetByName 唯一性查询 → 均无匹配）。
+	// 去重且保持顺序（每个别名走一次 GetByName 唯一性查询 + 一次别名↔别名互斥查询 → 均无匹配）。
 	expectGetByNameNoRows(mock, "a")
+	expectAliasOtherNone(mock, "a", 0)
 	expectGetByNameNoRows(mock, "b")
+	expectAliasOtherNone(mock, "b", 0)
 	got, err := s.validateAliases(ctx, []string{" a ", "a", "b"}, "self", 0)
 	if err != nil {
 		t.Fatalf("validate: %v", err)

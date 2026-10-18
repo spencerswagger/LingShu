@@ -33,8 +33,8 @@ func extRow(id int64, name string) *sqlmock.Rows {
 			nil, nil, `[]`, now, now)
 }
 
-// extNameQuery 与 model.Store.GetByExternalName 一致（含别名包含判定）。
-const extNameQuery = `SELECT id, external_name, description, enabled, sale_rates, time_config, context_tiers, aliases, created_at, updated_at FROM external_models WHERE (external_name = $1 OR aliases @> to_jsonb(ARRAY[$1::text])) AND enabled = true AND deleted_at IS NULL LIMIT 1`
+// extNameQuery 与 model.Store.GetByExternalName 一致（含别名包含判定 + 确定性排序）。
+const extNameQuery = `SELECT id, external_name, description, enabled, sale_rates, time_config, context_tiers, aliases, created_at, updated_at FROM external_models WHERE (external_name = $1 OR aliases @> to_jsonb(ARRAY[$1::text])) AND enabled = true AND deleted_at IS NULL ORDER BY (external_name = $1) DESC, id ASC LIMIT 1`
 
 // newModelService 构造可用的 model.Service（expectTimes 次外部查询）。
 func newModelService(t *testing.T, times int) (*model.Service, sqlmock.Sqlmock) {

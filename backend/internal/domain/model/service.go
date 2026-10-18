@@ -144,8 +144,9 @@ func normalizeAliases(in []string) ([]string, error) {
 }
 
 // validateAliases 归一化别名并校验命名空间（扁平）：不得与本模型 external_name 相同、
-// 不得与任何其他 external_name 重复、不得与任何 Auto 名重复。selfID 为当前模型主键
-// （创建传 0，更新传自身 ID），用于排除对自身 external_name 的误判。冲突返回明确错误。
+// 不得与任何其他 external_name 重复、不得与任何其他模型的别名重复、不得与任何 Auto 名重复。
+// selfID 为当前模型主键（创建传 0，更新传自身 ID），用于排除对自身 external_name/别名的误判。
+// 冲突返回明确错误。
 func (s *Service) validateAliases(ctx context.Context, raw []string, selfName string, selfID int64) ([]string, error) {
 	aliases, err := normalizeAliases(raw)
 	if err != nil {
@@ -160,6 +161,14 @@ func (s *Service) validateAliases(ctx context.Context, raw []string, selfName st
 			return nil, fmt.Errorf("check alias name: %w", err)
 		}
 		if err == nil && other.ID != selfID {
+			return nil, errConflict("别名已被其他对外模型占用")
+		}
+		// 别名↔别名互斥：不得与他人模型的别名重复（此前仅校验 external_name，存在漏网）。
+		taken, err := s.store.AliasExistsForOther(ctx, a, selfID)
+		if err != nil {
+			return nil, fmt.Errorf("check alias uniqueness: %w", err)
+		}
+		if taken {
 			return nil, errConflict("别名已被其他对外模型占用")
 		}
 		if s.autoNameExists != nil {

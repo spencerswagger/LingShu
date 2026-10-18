@@ -139,8 +139,8 @@ func (f *fakeChannels) FeedResultGated(keyID int64, modelRowID int64, fb channel
 	f.feeds = append(f.feeds, feedEntry{keyID: keyID, modelRowID: modelRowID, fb: fb})
 }
 
-// ManualSetKeyState 记录协议级错误策略触发的密钥动作（drain/disable）。
-func (f *fakeChannels) ManualSetKeyState(_ int64, action string) error {
+// ForceKeyState 记录协议级错误策略触发的密钥动作（drain/disable）；持久化由真实 Manager 承担。
+func (f *fakeChannels) ForceKeyState(_ context.Context, _ int64, action string) error {
 	f.keyActions = append(f.keyActions, action)
 	return nil
 }
