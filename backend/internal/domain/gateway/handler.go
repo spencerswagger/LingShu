@@ -633,6 +633,7 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 			DownstreamHeader: r.Header,
 			HeaderPolicy:     effectiveHeaderPolicy(rt),
 			Protocol:         baseProtocol,
+			Features:         protocolFeatures(rt),
 			Vars: map[string]string{
 				"session_id": sessionID,
 				"request_id": logger.GetRequestID(ctx),
@@ -945,6 +946,8 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 			return &fwdOutcome{responded: true, refundPre: true, downstreamStatus: http.StatusBadGateway}
 		}
 		dur := msSince(start)
+		// 响应侧协议特性（响应侧）：在 usage 归一/计费前对上游响应体做归一（未挂载时零差异）。
+		raw = normalizeUpstreamBody(raw, rt)
 		// upstreamUsage：上游原始 usage（JSONB 值），随调用日志落库用于诊断渠道口径（见 rawusage.go）。
 		usage, upstreamUsage, uerr := prov.ExtractUsage(raw)
 		usageMissing := uerr != nil || usageZero(usage)
@@ -1177,6 +1180,8 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		ft := &firstTokenWriter{ResponseWriter: w}
 		// upstreamUsage：上游原始 usage 分片合并后的 JSONB 值（诊断渠道口径，见 rawusage.go）。
 		usage, upstreamUsage, assistantMsg, herr := prov.HandleStream(ctx, up, ft)
+		// 响应侧协议特性：usage 拼装后、计费前对拼装结果做归一（未挂载时零差异）。
+		assistantMsg = normalizeUpstreamBody(assistantMsg, rt)
 		dur := msSince(start)
 		// 计费上下文（脱离请求取消、带超时）：响应结束后请求 ctx 会被取消，账单不可丢。
 		billCtx, cancelBill := billingCtx(ctx)

@@ -112,6 +112,20 @@ func applyResponseFeatures(body []byte, feats []ResponseFeature) ([]byte, error)
 	return body, nil
 }
 
+// normalizeUpstreamBody 对上游响应体按渠道协议挂载的响应侧特性依次归一；
+// 未挂载/无特性/归一失败时原样返回 body（保持默认安全态，计费读取归一后的内容）。
+func normalizeUpstreamBody(body []byte, rt *channel.RuntimeChannel) []byte {
+	feats := responseFeaturesFor(protocolFeatures(rt))
+	if len(feats) == 0 {
+		return body
+	}
+	out, err := applyResponseFeatures(body, feats)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
 // protocolFeatures 取渠道运行时挂载的协议特性；内联渠道（无渠道协议）返回 nil。
 func protocolFeatures(rt *channel.RuntimeChannel) []channelprotocol.Feature {
 	if rt == nil || rt.Protocol == nil {

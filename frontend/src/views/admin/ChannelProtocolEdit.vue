@@ -23,6 +23,7 @@ import {
   type ErrorMatch,
   type ErrorDisposition,
   type ChannelProtocolErrorStat,
+  type ProtocolFeature,
 } from '@/api/admin'
 import KvpEditor from '@/components/KvpEditor.vue'
 import StringListEditor from '@/components/StringListEditor.vue'
@@ -160,6 +161,52 @@ function removePolicy(index: number) {
   errorPolicies.value.splice(index, 1)
 }
 
+// ===== 协议特性 =====
+// 代码实现并注册的特性，可挂载/卸载并编辑其参数；未挂载任何特性时上游请求体与改造前逐字节一致。
+const featureCatalog = [
+  {
+    key: 'thinking-roundtrip',
+    label: 'thinking-roundtrip',
+    desc: '请求侧按上游约定回传 reasoning_content（修复 DeepSeek thinking 多轮 400）',
+  },
+  {
+    key: 'tool-schema-normalize',
+    label: 'tool-schema-normalize',
+    desc: '为缺失/非法 schema 的工具补齐 input_schema（修复 web_search 类工具 422）',
+  },
+] as const
+
+type FeatureForm = {
+  enabled: boolean // 是否挂载
+  enabledParam: boolean // thinking-roundtrip 参数：enabled
+  field: string // thinking-roundtrip 参数：field
+  onlyThinking: boolean // thinking-roundtrip 参数：onlyThinking
+  schemaText: string // tool-schema-normalize 参数：schema（JSON 文本，空 = 内置默认）
+}
+const featureForms = reactive<Record<string, FeatureForm>>({
+  'thinking-roundtrip': { enabled: false, enabledParam: true, field: 'reasoning_content', onlyThinking: false, schemaText: '' },
+  'tool-schema-normalize': { enabled: false, enabledParam: true, field: '', onlyThinking: false, schemaText: '' },
+})
+
+// 由表单组装后端 Features（挂载项才输出；schema 非空时解析为对象）。
+function buildFeatures(): ProtocolFeature[] {
+  const out: ProtocolFeature[] = []
+  const tr = featureForms['thinking-roundtrip']
+  if (tr.enabled) {
+    out.push({
+      key: 'thinking-roundtrip',
+      params: { enabled: tr.enabledParam, field: tr.field.trim() || 'reasoning_content', onlyThinking: tr.onlyThinking },
+    })
+  }
+  const ts = featureForms['tool-schema-normalize']
+  if (ts.enabled) {
+    const params: Record<string, unknown> = {}
+    if (ts.schemaText.trim()) params.schema = JSON.parse(ts.schemaText)
+    out.push({ key: 'tool-schema-normalize', params })
+  }
+  return out
+}
+
 // 加载「指定模型」候选：编辑态取引用该协议的渠道下的内部模型行；新建态取全部内部模型行。
 async function loadPolicyModelOptions() {
   try {
@@ -271,6 +318,26 @@ async function load() {
       downstreamStatus: p.disposition?.downstreamStatus || undefined,
       note: p.note || '',
     }))
+    for (const key of Object.keys(featureForms)) {
+      featureForms[key].enabled = false
+      featureForms[key].enabledParam = true
+      featureForms[key].field = key === 'thinking-roundtrip' ? 'reasoning_content' : ''
+      featureForms[key].onlyThinking = false
+      featureForms[key].schemaText = ''
+    }
+    for (const f of v.features || []) {
+      const ff = featureForms[f.key]
+      if (!ff) continue
+      ff.enabled = true
+      const p = (f.params || {}) as Record<string, any>
+      if (f.key === 'thinking-roundtrip') {
+        ff.enabledParam = p.enabled === undefined ? true : !!p.enabled
+        ff.field = typeof p.field === 'string' && p.field ? p.field : 'reasoning_content'
+        ff.onlyThinking = !!p.onlyThinking
+      } else if (f.key === 'tool-schema-normalize' && p.schema) {
+        ff.schemaText = JSON.stringify(p.schema, null, 2)
+      }
+    }
     modelRows.value = Object.entries(v.Models || {}).map(([mid, ov]) => ({
       id: mid,
       protocols: Object.keys(ov?.protocols || {}),
@@ -304,6 +371,7 @@ function snapshot(): string {
     set: form.set,
     models: modelRows.value,
     errorPolicy: errorPolicies.value,
+    features: featureForms,
   })
 }
 const { dirty, markSaved } = useUnsavedGuard(snapshot)
@@ -561,6 +629,13 @@ async function onSubmit() {
     protoOut[p] = opt
   }
 
+  let features: ProtocolFeature[]
+  try {
+    features = buildFeatures()
+  } catch {
+    return ElMessage.warning('tool-schema-normalize 的补齐 schema 不是合法 JSON')
+  }
+
   const payload: ChannelProtocolInput = {
     Name: form.name.trim(),
     BaseURL: form.base_url.trim(),
@@ -573,6 +648,7 @@ async function onSubmit() {
     },
     Models: buildModels(),
     errorPolicy: buildErrorPolicies(),
+    features,
   }
 
   saving.value = true
@@ -801,6 +877,46 @@ async function onSubmit() {
             </el-table>
             <el-empty v-if="!statsLoading && !errorStats.length" description="暂无统计数据" :image-size="48" />
           </template>
+        </div>
+      </el-tab-pane>
+
+      <el-tab-pane label="协议特性" name="features">
+        <div class="card">
+          <div class="block-desc">在代码中实现并注册的协议特性，可按需挂载/卸载并编辑其参数。未挂载任何特性时，上游请求体与改造前逐字节一致。</div>
+          <div v-for="f in featureCatalog" :key="f.key" class="feature-card">
+            <div class="feature-head">
+              <el-checkbox v-model="featureForms[f.key].enabled" class="feature-check">
+                <span class="feature-name">{{ f.label }}</span>
+              </el-checkbox>
+              <span class="hint-inline">{{ f.desc }}</span>
+            </div>
+            <el-form v-if="featureForms[f.key].enabled" label-width="140px" class="feature-form">
+              <template v-if="f.key === 'thinking-roundtrip'">
+                <el-form-item label="启用改写">
+                  <el-switch v-model="featureForms[f.key].enabledParam" />
+                  <span class="hint-inline">关闭后挂载但不改写</span>
+                </el-form-item>
+                <el-form-item label="推理字段名">
+                  <el-input v-model="featureForms[f.key].field" placeholder="reasoning_content" style="width: 320px" />
+                </el-form-item>
+                <el-form-item label="仅 thinking 模式">
+                  <el-switch v-model="featureForms[f.key].onlyThinking" />
+                  <span class="hint-inline">开启后仅在 thinking / reasoning 请求中回传</span>
+                </el-form-item>
+              </template>
+              <template v-else-if="f.key === 'tool-schema-normalize'">
+                <el-form-item label="补齐 schema">
+                  <el-input
+                    v-model="featureForms[f.key].schemaText"
+                    type="textarea"
+                    :rows="6"
+                    placeholder='留空使用内置最小 web_search schema；否则填入 JSON Schema 对象，如 {"type":"object","properties":{"query":{"type":"string"}}}'
+                  />
+                  <div class="hint">留空 = 使用内置最小 web_search schema；合法 JSON 对象将作为补齐用 schema</div>
+                </el-form-item>
+              </template>
+            </el-form>
+          </div>
         </div>
       </el-tab-pane>
     </el-tabs>
@@ -1051,6 +1167,27 @@ async function onSubmit() {
 }
 .stats-table {
   margin-top: 4px;
+}
+.feature-card {
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  padding: 14px 16px;
+  margin-bottom: 14px;
+}
+.feature-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.feature-check {
+  flex: none;
+}
+.feature-name {
+  font-weight: 600;
+  font-size: 14px;
+}
+.feature-form {
+  margin-top: 12px;
 }
 .actions {
   margin-top: 20px;

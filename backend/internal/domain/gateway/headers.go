@@ -20,12 +20,21 @@ type UpstreamRequest struct {
 	HeaderPolicy     channelprotocol.HeaderPolicy // 请求头策略
 	Protocol         string                       // 入站基础协议（决定隐含鉴权注入方式）
 	Vars             map[string]string            // 变量表：session_id / request_id / model
+	// Features 渠道协议挂载的协议特性（空=未挂载任何特性，请求体保持原样）。
+	Features []channelprotocol.Feature
 }
 
 // buildUpstreamRequest 是各基础协议适配器共享的上游请求构造：拼 URL、注入 Content-Type，
 // 依次应用「透传 → 协议隐含鉴权 → 覆盖(set)」，返回 http.Request。
 // defaultPath 为基址后拼接的基础协议内置默认路径（相对基址，可含 v1/…）。
 func buildUpstreamRequest(ctx context.Context, req UpstreamRequest, defaultPath, contentType string) (*http.Request, error) {
+	// 协议特性（请求侧）：按渠道协议挂载顺序改写请求体（未挂载时零差异）。
+	// 特性只改写 Body，与头部注入相互独立，故在构建请求前先行应用。
+	if feats := requestFeaturesFor(req.Features); len(feats) > 0 {
+		if err := applyRequestFeatures(&req, feats); err != nil {
+			return nil, err
+		}
+	}
 	path := strings.TrimSpace(req.Path)
 	if path == "" {
 		path = defaultPath
