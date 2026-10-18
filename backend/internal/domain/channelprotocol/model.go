@@ -153,6 +153,27 @@ type ErrorDisposition struct {
 	DownstreamStatus int    `json:"downstreamStatus,omitempty"`
 }
 
+// 协议特性 key：特性逻辑在代码中实现并注册，渠道协议按 key + 参数挂载（可多项启停）。
+const (
+	FeatureThinkingRoundtrip   = "thinking-roundtrip"   // 请求侧按上游约定回传 reasoning_content
+	FeatureToolSchemaNormalize = "tool-schema-normalize" // 对齐工具 input_schema
+)
+
+// Feature 渠道协议上挂载的一项协议特性：Key 指定代码实现的特性，Params 为其参数（允许为空）。
+type Feature struct {
+	Key    string         `json:"key"`
+	Params map[string]any `json:"params,omitempty"`
+}
+
+// IsValidFeatureKey 判断特性 key 是否为代码实现并注册的合法特性。
+func IsValidFeatureKey(key string) bool {
+	switch key {
+	case FeatureThinkingRoundtrip, FeatureToolSchemaNormalize:
+		return true
+	}
+	return false
+}
+
 // ChannelProtocol 对应 channel_protocols 表一行。
 type ChannelProtocol struct {
 	ID             int64                   `json:"ID,string"`
@@ -162,12 +183,14 @@ type ChannelProtocol struct {
 	RequestHeaders HeaderPolicy            `json:"RequestHeaders"`
 	Models         map[string]ModelGateway `json:"Models"`
 	// ErrorPolicy 协议级错误策略（空=未配置，行为与改造前一致）。
-	ErrorPolicy    []ErrorPolicy `json:"errorPolicy"`
-	PresetSourceID string        `json:"PresetSourceID"`
-	Edited         bool          `json:"Edited"`
-	SourceStatus   string        `json:"SourceStatus"`
-	CreatedAt      time.Time     `json:"CreatedAt,omitempty"`
-	UpdatedAt      time.Time     `json:"UpdatedAt,omitempty"`
+	ErrorPolicy []ErrorPolicy `json:"errorPolicy"`
+	// Features 协议特性集合（空=未挂载任何特性，行为与改造前逐字节一致）。
+	Features       []Feature `json:"features"`
+	PresetSourceID string    `json:"PresetSourceID"`
+	Edited         bool      `json:"Edited"`
+	SourceStatus   string    `json:"SourceStatus"`
+	CreatedAt      time.Time `json:"CreatedAt,omitempty"`
+	UpdatedAt      time.Time `json:"UpdatedAt,omitempty"`
 }
 
 // EffectiveBaseURL 返回某基础协议的有效 baseURL：协议级 baseUrl 优先，回落渠道协议级 base_url。
