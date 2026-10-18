@@ -279,6 +279,7 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 	// 缓存读与输出需上游响应后才知，路由时刻未知 → 仅带输入段（其余段为 0，不编造 token）。
 	// 该样值经 RouteSpec.SessionTokens 仅供「会话成本路由」（Enabled=true 且为起点）择优使用，
 	// 不参与默认成本排序（Enabled=false 时零行为变化）；输入 token 不可估时留 nil，回落全局 routing.cost_sample。
+	// 注：下方组装 RouteSpec 时 SessionTurn 恒传 0（「本会话已完成轮数」待 P2 接线，当前恒 0，安全态无路由影响）。
 	var turnTokens *billing.Usage
 	if in := estimateInputTokens(body, model); in > 0 {
 		turnTokens = &billing.Usage{Input: int64(in)}

@@ -50,9 +50,12 @@ type RouteSpec struct {
 	TagKV         map[string]string // 已解析的令牌标签 KV；无标签时 nil
 	TagID         *int64            // 用于日志
 	SessionKey    string            // token_id + model + x-session-id；空则不启用亲和
-	// Sample 本轮请求的三段 token 样值；非 nil 时用于成本比较（覆盖全局 routing.cost_sample）。
+	// Sample 本轮请求的三段 token 样值（逐请求显式样值兜底入口，成本比较用）：非 nil 时用于成本比较
+	// （覆盖全局 routing.cost_sample）。语义与会话级 SessionTokens 区分：Sample 服务于「默认成本排序 /
+	// 起点择优」的样值口径，而 SessionTokens 是「会话成本路由」的会话级明细（见下）。
 	// nil=回落全局样值；&billing.Usage{}（全零）为显式零样值，会关闭成本择优。
 	// 注意：Sample 同时参与「默认成本排序」（Enabled=false 亦生效），改动它会改变既有排序。
+	// 生产侧网关不写 Sample（改用 SessionTokens）；本字段保留为逐请求显式样值的兜底注入入口（测试/特殊调用方用）。
 	Sample *billing.Usage
 	// SessionTokens 本轮会话三段 token 明细（输入/缓存读/输出），仅供「会话成本路由」在
 	// SessionCostConfig.Enabled=true 且为起点时择优使用；与 Sample 刻意分离：即便网关每轮组装本轮样值，
@@ -61,6 +64,8 @@ type RouteSpec struct {
 	SessionTokens *billing.Usage
 	// SessionTurn 会话位置 k（本会话已完成轮数；0=起点/未知）。
 	// 供会话成本决策的经验式剩余轮数估计；起点择优中重灌代价=0、k 不进本轮花费，故零值不改变起点结果。
+	// 现状：网关组装处恒传 0（见 gateway/handler.go）——「本会话已完成轮数」待 P2 接线，
+	// 当前恒 0（安全态，无路由影响），勿误解为已生效。
 	SessionTurn int
 	// Now 本次路由时刻（零值=回落引擎时钟 e.now()）；供时段系数与决策轨迹求值。
 	Now time.Time
@@ -415,13 +420,15 @@ func (e *Engine) collectCandidates(ctx context.Context, spec RouteSpec) ([]candi
 	// 样值来源：优先 RouteSpec.SessionTokens（本轮可得三段），其次 RouteSpec.Sample，最后回落全局 sample。
 	cfg := e.sessionCostConfig()
 	hit := e.sess.Hit(spec.SessionKey)
+	// 会话成本路由样值来源：优先 RouteSpec.SessionTokens（本轮可得三段），其次 RouteSpec.Sample，
+	// 最后回落全局 sample；起点择优与中途切换/影子记录共用同一样值口径。
+	sessionSample := sample
+	if spec.SessionTokens != nil {
+		sessionSample = *spec.SessionTokens
+	} else if spec.Sample != nil {
+		sessionSample = *spec.Sample
+	}
 	if cfg.Enabled && !hit {
-		sessionSample := sample
-		if spec.SessionTokens != nil {
-			sessionSample = *spec.SessionTokens
-		} else if spec.Sample != nil {
-			sessionSample = *spec.Sample
-		}
 		picked := e.orderStartPick(normal, now, sessionSample, globalTC, globalTiers, cfg, spec.SessionKey, spec.SessionTurn)
 		if len(picked) == 0 {
 			return nil, 0, noAvailable()
@@ -432,16 +439,14 @@ func (e *Engine) collectCandidates(ctx context.Context, spec RouteSpec) ([]candi
 	//   - 中途 = 会话活跃亲和命中（Hit）且归属渠道在候选集内（sessionCand 非空），非起点；
 	//   - 仅当 Enabled 与 MidSwitch 同时为 true 时才评估切换；否则保持会话亲和、渠道不变（零变化）；
 	//   - 评估/抖动抑制/迁移见 midSwitch；未切换时回落下方「亲和优先」原语义。
+	//   - FIX-A：未启用切换（!cfg.Enabled 或 !cfg.MidSwitch）但存在会话成本 provider 时，走 else 分支
+	//     记录「若启用则会切换」的影子假设事件（emitShadowDecision），渠道保持现状、不迁移。
 	if cfg.Enabled && cfg.MidSwitch && hit && sessionCand != nil {
-		sessionSample := sample
-		if spec.SessionTokens != nil {
-			sessionSample = *spec.SessionTokens
-		} else if spec.Sample != nil {
-			sessionSample = *spec.Sample
-		}
 		if switched, ok := e.midSwitch(sessionCand, normal, now, sessionSample, globalTC, globalTiers, cfg, spec.SessionKey, spec.SessionTurn); ok {
 			return switched, ext.ID, nil
 		}
+	} else if !(cfg.Enabled && cfg.MidSwitch) && e.sessionCost != nil && hit && sessionCand != nil {
+		e.emitShadowDecision(sessionCand, normal, now, sessionSample, globalTC, globalTiers, cfg, spec.SessionKey, spec.SessionTurn)
 	}
 	ordered := e.orderCandidates(normal, now, sample, globalTC, globalTiers)
 	if sessionCand != nil {
@@ -759,6 +764,60 @@ func (e *Engine) midSwitch(cur *candidate, alts []candidate, now time.Time, samp
 	}
 	ordered := e.orderCandidates(rest, now, sample, globalTC, globalTiers)
 	return append([]candidate{best}, ordered...), true
+}
+
+// emitShadowDecision 记录一条「影子假设」事件（Step 6 / FIX-A）：当会话成本路由未启用切换
+// （!cfg.Enabled 或 !cfg.MidSwitch）但存在会话成本 provider 时由 collectCandidates 调用，
+// 对「若启用中途切换则会切换」的最优候选计算 decideSessionCost，经 shadowDecision 标记为
+// 影子/未切换后经既有 emitCostEvent 提交一条观测事件；**不改变最终选中渠道**（调用方继续按
+// 下方「亲和优先」原语义路由，且不执行会话迁移）——保证 Enabled=false 时对外路由行为零变化。
+//
+// 选靶口径与 midSwitch 一致：在「命中回本门控 + 滞回阈值」的候选里取本轮成本最低者；
+// 若没有任何候选「若启用则会切换」，则不产生影子记录（无假设节省可记）。
+func (e *Engine) emitShadowDecision(cur *candidate, alts []candidate, now time.Time, sample billing.Usage, globalTC *billing.TimeCoeffConfig, globalTiers []billing.TierRule, cfg SessionCostConfig, sessionID string, turn int) {
+	if cur == nil || len(alts) == 0 || sessionID == "" || e.costSink == nil {
+		return
+	}
+	curTC, curCtx := resolveCostCoeffs(cur.timeCfg, globalTC, cur.contextTiers, globalTiers, now, sample)
+	curCC := channelCost(cur, curTC, curCtx)
+
+	bestIdx := -1
+	var bestD SessionCostDecision
+	for i := range alts {
+		c := alts[i]
+		if !hasValidCost(c.costRates) {
+			continue // 成本未知（缺价/全 0）不作切换目标（保守，与 midSwitch 一致）
+		}
+		tc, ctx := resolveCostCoeffs(c.timeCfg, globalTC, c.contextTiers, globalTiers, now, sample)
+		cc := channelCost(&alts[i], tc, ctx)
+		d := decideSessionCost(cfg, &curCC, cc, sample.CacheRead, sample.Input, sample.Output, turn)
+		if !d.Switch {
+			continue // 若启用也不会切换（回本门控未通过）→ 无假设节省可记
+		}
+		if !hysteresisAllows(d.TurnCostOld, d.TurnCostNew, cfg.MinImprove) {
+			continue // 滞回：相对改善未超阈值
+		}
+		if bestIdx == -1 || d.TurnCostNew < bestD.TurnCostNew {
+			bestIdx, bestD = i, d
+		}
+	}
+	if bestIdx == -1 {
+		return // 若启用也不会切换 → 不产生影子记录
+	}
+	best := alts[bestIdx]
+	bestD.FromChannelKeyID = cur.keyID
+	bestD.ToChannelKeyID = best.keyID
+	shadow := shadowDecision(cfg, bestD)
+	if shadow.Switch {
+		// cfg.Enabled=true 但 MidSwitch=false：shadowDecision 只门控 Enabled，此处原样返回；
+		// 显式标记为影子/未切换，保证事件语义与「渠道实际未变」一致。
+		shadow.Switch = false
+		shadow.Reason = "影子模式(中途切换未启用，仅记录假设): " + shadow.Reason
+	}
+	ev := SessionCostEvent{SessionID: sessionID, Turn: turn, Decision: shadow, Shadow: true}
+	if err := e.emitCostEvent(ev); err != nil {
+		slog.Default().Warn("会话成本影子决策产物提交失败", "session_id", sessionID, "turn", turn, "err", err)
+	}
 }
 
 // channelCost 由候选构造其成本计价视图（三档成本单价 + 时段系数 + 上下文分档系数）。

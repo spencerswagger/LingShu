@@ -187,10 +187,10 @@ func TestSessionCost_EventsAndDistributionFromStore(t *testing.T) {
 	admin.SetSessionCostEventStore(store)
 
 	store.Append(router.SessionCostEvent{
-		SessionID: "s1", Turn: 1, CrossCacheRead: 13480, CrossCacheReadKnown: true,
-		Decision: router.SessionCostDecision{Switch: true, FromChannelKeyID: 21, ToChannelKeyID: 11,
+		SessionID: "s1", Turn: 1, CrossCacheRead: 13480, CrossCacheReadKnown: true, Shadow: true,
+		Decision: router.SessionCostDecision{Switch: false, FromChannelKeyID: 21, ToChannelKeyID: 11,
 			TurnCostOld: 0.00305, TurnCostNew: 0.00205, RechargeCost: 0.00294, PaybackTurns: 18.04,
-			RemainingTurns: 20, Reason: "中途：剩余轮数 > 回本轮数，切换更省"},
+			PaybackLimit: 5.88, RemainingTurns: 20, Reason: "影子模式(中途切换未启用，仅记录假设): 中途：剩余轮数 > 回本轮数，切换更省"},
 	})
 	store.Append(router.SessionCostEvent{
 		SessionID: "s1", Turn: 2, CrossCacheRead: 20000, CrossCacheReadKnown: true,
@@ -214,7 +214,9 @@ func TestSessionCost_EventsAndDistributionFromStore(t *testing.T) {
 			List []struct {
 				SessionID            string   `json:"SessionID"`
 				Turn                 int      `json:"Turn"`
+				Shadow               bool     `json:"Shadow"`
 				PaybackTurns         *float64 `json:"PaybackTurns"`
+				PaybackLimit         *float64 `json:"PaybackLimit"`
 				CrossCacheRead       float64  `json:"CrossCacheRead"`
 				CrossCacheReadKnown  bool     `json:"CrossCacheReadKnown"`
 				CrossCacheReadSource string   `json:"CrossCacheReadSource"`
@@ -234,6 +236,12 @@ func TestSessionCost_EventsAndDistributionFromStore(t *testing.T) {
 	}
 	if ev.Data.List[0].SessionID != "s1" || ev.Data.List[0].CrossCacheReadSource == "" {
 		t.Fatalf("events 首条不符: %+v", ev.Data.List[0])
+	}
+	if !ev.Data.List[0].Shadow {
+		t.Fatalf("events 首条应暴露 Shadow=true（影子假设标记）: %+v", ev.Data.List[0])
+	}
+	if ev.Data.List[0].PaybackLimit == nil || *ev.Data.List[0].PaybackLimit != 5.88 {
+		t.Fatalf("events 首条应暴露 PaybackLimit=5.88: %+v", ev.Data.List[0].PaybackLimit)
 	}
 	if ev.Data.List[2].PaybackTurns != nil {
 		t.Fatalf("NaN 回本轮数应序列化为 null，got %v", *ev.Data.List[2].PaybackTurns)

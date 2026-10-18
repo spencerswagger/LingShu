@@ -657,3 +657,137 @@ func TestMidSwitch_HysteresisSuppressesSwitch(t *testing.T) {
 		t.Fatalf("改善未超滞回阈值应保持亲和（ch2），got channel %d", r.ChannelID)
 	}
 }
+
+// ---- FIX-A：影子假设记录（未启用切换仍产出「若启用则会切换」的假设节省事件） ----
+
+// TestShadow_EngineEmitsAssumptionWhenMidSwitchOff Enabled=true 但 MidSwitch=false：
+// 渠道保持亲和不变（ch2），但经既有 sink 产出一条「若启用则会切换」的影子假设事件（Shadow=true、
+// Switch=false、含 TurnCostOld/New、RechargeCost、PaybackTurns、PaybackLimit、Reason 带影子前缀）。
+func TestShadow_EngineEmitsAssumptionWhenMidSwitchOff(t *testing.T) {
+	rates1, rates2 := midSwitchRates()
+	tok := startPickSample()
+
+	const offJSON = `{"enabled":true,"remaining_a":20,"remaining_b":0,"remaining_min":1,"remaining_max":20,"min_remaining":1,"cooldown_sec":0}`
+	e, sess := newMidSwitchEngine(t, offJSON, rates1, rates2, 100, 100, 1)
+	sink := &fakeCostEventSink{}
+	e.SetCostEventSink(sink)
+	key := "s-shadow-off"
+	attachTo(t, sess, key, 21, "int2") // 亲和命中更贵的 ch2（若启用则会切到更便宜的 ch1）
+
+	r, err := e.Route(context.Background(), RouteSpec{
+		ExternalModel: "qw-max", SessionKey: key, SessionTokens: &tok,
+	})
+	if err != nil {
+		t.Fatalf("route: %v", err)
+	}
+	if r.ChannelID != 2 {
+		t.Fatalf("MidSwitch 关闭时应保持亲和（ch2），渠道不得变，got channel %d", r.ChannelID)
+	}
+	evs := sink.snapshot()
+	if len(evs) != 1 {
+		t.Fatalf("应产出 1 条影子假设事件，got %d: %+v", len(evs), evs)
+	}
+	ev := evs[0]
+	if !ev.Shadow {
+		t.Fatalf("事件应标记 Shadow=true：%+v", ev)
+	}
+	if ev.Decision.Switch {
+		t.Fatalf("影子事件不得切换（Switch=false）：%+v", ev.Decision)
+	}
+	if !strings.Contains(ev.Decision.Reason, "影子") {
+		t.Fatalf("影子事件 Reason 应含\"影子\"：%q", ev.Decision.Reason)
+	}
+	if ev.Decision.FromChannelKeyID != 21 || ev.Decision.ToChannelKeyID != 11 {
+		t.Fatalf("影子事件转向应 21→11，got %d→%d", ev.Decision.FromChannelKeyID, ev.Decision.ToChannelKeyID)
+	}
+	if ev.Decision.TurnCostOld <= 0 || ev.Decision.TurnCostNew <= 0 || ev.Decision.RechargeCost <= 0 {
+		t.Fatalf("影子事件应保留非零假设字段：%+v", ev.Decision)
+	}
+	if ev.Decision.PaybackTurns <= 0 || math.IsNaN(ev.Decision.PaybackTurns) {
+		t.Fatalf("影子事件应保留有效回本假设：%v", ev.Decision.PaybackTurns)
+	}
+	if ev.Decision.PaybackLimit <= 0 || math.IsNaN(ev.Decision.PaybackLimit) {
+		t.Fatalf("影子事件应携带正 PaybackLimit：%v", ev.Decision.PaybackLimit)
+	}
+}
+
+// TestShadow_EngineEmitsAssumptionWhenDisabled Enabled=false（存在 provider）：渠道保持现状（亲和 ch2），
+// 仅多一条影子假设事件（Reason 带「未启用」前缀）；锁定「Enabled=false 对外路由行为零变化」。
+func TestShadow_EngineEmitsAssumptionWhenDisabled(t *testing.T) {
+	rates1, rates2 := midSwitchRates()
+	tok := startPickSample()
+
+	const disabledJSON = `{"enabled":false,"remaining_a":20,"remaining_b":0,"remaining_min":1,"remaining_max":20}`
+	e, sess := newMidSwitchEngine(t, disabledJSON, rates1, rates2, 100, 100, 1)
+	sink := &fakeCostEventSink{}
+	e.SetCostEventSink(sink)
+	key := "s-shadow-disabled"
+	attachTo(t, sess, key, 21, "int2")
+
+	r, err := e.Route(context.Background(), RouteSpec{
+		ExternalModel: "qw-max", SessionKey: key, SessionTokens: &tok,
+	})
+	if err != nil {
+		t.Fatalf("route: %v", err)
+	}
+	if r.ChannelID != 2 {
+		t.Fatalf("Enabled=false 应保持现状（亲和 ch2），got channel %d", r.ChannelID)
+	}
+	evs := sink.snapshot()
+	if len(evs) != 1 {
+		t.Fatalf("应产出 1 条影子假设事件，got %d", len(evs))
+	}
+	ev := evs[0]
+	if !ev.Shadow || ev.Decision.Switch {
+		t.Fatalf("影子事件应 Shadow=true 且 Switch=false：%+v", ev)
+	}
+	if !strings.Contains(ev.Decision.Reason, "未启用") && !strings.Contains(ev.Decision.Reason, "影子") {
+		t.Fatalf("影子事件 Reason 应含\"未启用\"或\"影子\"：%q", ev.Decision.Reason)
+	}
+}
+
+// TestShadow_NotEmittedWhenNoWouldSwitch 亲和命中更便宜的 ch1（若启用也不会切换）→ 不产出影子事件。
+func TestShadow_NotEmittedWhenNoWouldSwitch(t *testing.T) {
+	rates1, rates2 := midSwitchRates()
+	tok := startPickSample()
+
+	const offJSON = `{"enabled":true,"remaining_a":20,"remaining_b":0,"remaining_min":1,"remaining_max":20,"min_remaining":1,"cooldown_sec":0}`
+	e, sess := newMidSwitchEngine(t, offJSON, rates1, rates2, 100, 100, 1)
+	sink := &fakeCostEventSink{}
+	e.SetCostEventSink(sink)
+	key := "s-shadow-cheap"
+	attachTo(t, sess, key, 11, "int1") // 亲和命中更便宜的 ch1：若启用也不切换
+
+	r, err := e.Route(context.Background(), RouteSpec{
+		ExternalModel: "qw-max", SessionKey: key, SessionTokens: &tok,
+	})
+	if err != nil {
+		t.Fatalf("route: %v", err)
+	}
+	if r.ChannelID != 1 {
+		t.Fatalf("应保持亲和（ch1），got channel %d", r.ChannelID)
+	}
+	if evs := sink.snapshot(); len(evs) != 0 {
+		t.Fatalf("若启用也不会切换时不应产出影子事件，got %d: %+v", len(evs), evs)
+	}
+}
+
+// TestSessionCost_DecisionCarriesPaybackLimit FIX-B：中途决策携带 paybackLimit(旧,新)，
+// 起点（无旧渠道）置 0（无意义）。
+func TestSessionCost_DecisionCarriesPaybackLimit(t *testing.T) {
+	old := veniceChannel()
+	cand := deepSeekChannel()
+	const cr, newIn, out = int64(20000), int64(1000), int64(1000)
+	cfg := SessionCostConfig{RemainingA: 20, RemainingB: 0, RemainingMin: 1, RemainingMax: 20}
+
+	d := decideSessionCost(cfg, &old, cand, cr, newIn, out, 0)
+	sessionCostApprox(t, "中途 PaybackLimit", d.PaybackLimit, paybackLimit(old, cand), 1e-12)
+	if math.IsNaN(d.PaybackLimit) || d.PaybackLimit <= 0 {
+		t.Fatalf("中途 PaybackLimit 应为正有限值，got %v", d.PaybackLimit)
+	}
+
+	start := decideSessionCost(cfg, nil, cand, cr, newIn, out, 0)
+	if start.PaybackLimit != 0 {
+		t.Fatalf("起点无旧渠道，PaybackLimit 应为 0，got %v", start.PaybackLimit)
+	}
+}

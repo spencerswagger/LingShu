@@ -30,6 +30,9 @@ type SessionCostEvent struct {
 	SessionID string              `json:"session_id"`
 	Turn      int                 `json:"turn"`
 	Decision  SessionCostDecision `json:"decision"`
+	// Shadow 标记本条为「影子假设记录」（未启用切换时仍产出「若启用则会切换」的假设节省记录）：
+	// true 表示渠道实际未变、仅记录假设；此时 Decision.Switch 恒为 false，Decision.Reason 带影子前缀。
+	Shadow bool `json:"shadow"`
 	// CrossCacheRead 是本次决策的「临界缓存读」：旧渠道缓存读 vs 新渠道缓存读在给定用量下
 	// 每轮成本打平的缓存读 token 量（由 crossCacheRead 求得，来源=模型成本×真实 token）。
 	// CrossCacheReadKnown=false 表示无解（两渠道缓存读价相等）或起点择优（无旧渠道可比），此时值无意义。
