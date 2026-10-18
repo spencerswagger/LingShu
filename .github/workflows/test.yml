@@ -1,0 +1,77 @@
+# 单元 / 集成测试。补齐此前缺失的测试 CI：
+#   - 后端：起一次性 postgres 服务，设置 LLMGATEWAY_TEST_PG_DSN（迁移集成测试）与
+#     TEST_DATABASE_URL（e2e）后跑 go vet / go test（含 -race）。
+#   - 前端：npm ci 后跑 vue-tsc 类型检查。
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Backend tests (with Postgres)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: llmgw
+          POSTGRES_PASSWORD: llmgw
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U llmgw"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      # 迁移集成测试（internal/db）读它；e2e（tests/）读 TEST_DATABASE_URL。
+      LLMGATEWAY_TEST_PG_DSN: postgres://llmgw:llmgw@localhost:5432/postgres?sslmode=disable
+      TEST_DATABASE_URL: postgres://llmgw:llmgw@localhost:5432/postgres?sslmode=disable
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+
+      - name: go vet
+        working-directory: backend
+        run: go vet ./...
+
+      - name: go test
+        working-directory: backend
+        run: go test -race ./...
+
+  frontend:
+    name: Frontend typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install
+        working-directory: frontend
+        run: npm ci
+
+      - name: Typecheck
+        working-directory: frontend
+        run: npx vue-tsc --noEmit

@@ -3,6 +3,8 @@ package console
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -423,5 +425,49 @@ func TestHandleServiceStatus_ContextCanceledDowngraded(t *testing.T) {
 	}
 	if capture.warnCount() == 0 {
 		t.Fatalf("ctx 取消应降级为 WARN 日志，got=0")
+	}
+}
+
+// TestHandleServiceStatus_CtxErrorDowngradeVariants 补齐 ctx 降级的边界覆盖：
+//   - DeadlineExceeded：命中 errors.Is 的右侧分支；
+//   - 经 fmt.Errorf %w 包裹的 ctx 错误：验证能穿透包裹识别（真实路径 engine.RouteAll 以 %w 包裹）；
+//   - 反向护栏：非 ctx 的真实故障仍记 ERROR，防止降级条件被放宽而误伤真实故障。
+func TestHandleServiceStatus_CtxErrorDowngradeVariants(t *testing.T) {
+	cases := []struct {
+		name            string
+		err             error
+		wantError       int
+		wantWarnAtLeast int
+	}{
+		{"deadline_exceeded_downgraded", context.DeadlineExceeded, 0, 1},
+		{"wrapped_canceled_downgraded", fmt.Errorf("解析对外模型候选: %w", context.Canceled), 0, 1},
+		{"real_error_kept_as_error", errors.New("db down"), 1, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			prev := slog.Default()
+			defer slog.SetDefault(prev)
+			capture := &levelCaptureHandler{}
+			slog.SetDefault(slog.New(capture))
+
+			h := NewAdmin(nil, nil, channel.NewManager(nil, nil, nil, nil, nil, nil), func(context.Context) (int64, bool) { return 1, true })
+			h.SetRouterEngine(&fakeRouteEngineCtxErr{err: tc.err})
+			h.SetModelSource(fakeModelListSource{items: []model.ExternalModel{{ID: 7, ExternalName: "gpt-x", Enabled: true}}})
+
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/service-status", nil)
+			req = resp.WithRequestID(req, "req-"+tc.name)
+			h.HandleServiceStatus(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status=%d, want 200（日志级别不影响响应）; body=%s", rec.Code, rec.Body.String())
+			}
+			if got := capture.errorCount(); got != tc.wantError {
+				t.Fatalf("ERROR 计数=%d, want %d", got, tc.wantError)
+			}
+			if got := capture.warnCount(); got < tc.wantWarnAtLeast {
+				t.Fatalf("WARN 计数=%d, want >=%d", got, tc.wantWarnAtLeast)
+			}
+		})
 	}
 }
