@@ -275,6 +275,14 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 		sessionID = router.SessionID(token.UserID, token.ID, model, sessionRaw)
 		sessionName = sessionNameFor(sessionRaw, body)
 	}
+	// 会话成本路由起点样值（Step 10）：路由时刻仅能可靠得到「输入 token」（由请求体估算，tiktoken/字符级）；
+	// 缓存读与输出需上游响应后才知，路由时刻未知 → 仅带输入段（其余段为 0，不编造 token）。
+	// 该样值经 RouteSpec.SessionTokens 仅供「会话成本路由」（Enabled=true 且为起点）择优使用，
+	// 不参与默认成本排序（Enabled=false 时零行为变化）；输入 token 不可估时留 nil，回落全局 routing.cost_sample。
+	var turnTokens *billing.Usage
+	if in := estimateInputTokens(body, model); in > 0 {
+		turnTokens = &billing.Usage{Input: int64(in)}
+	}
 	// Auto 是「对外模型之上的一层有序别名组」：请求 Auto 名时按成员 position 升序，
 	// 逐个成员以「成员对外模型名」试路由，第一个产生非空候选的成员即被选中；
 	// 之后 model 替换为命中成员名，后续路由/亲和/计费/failover 完全沿用既有链路。
@@ -302,6 +310,9 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 						TagKV:         tagKV,
 						TagID:         token.TagID,
 						SessionKey:    sessionID,
+						SessionTokens: turnTokens,
+						SessionTurn:   0,
+						Now:           g.now(),
 					}); sErr == nil && len(sRoutes) > 0 {
 						model = s.Model
 						routes = sRoutes
@@ -319,6 +330,9 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 						TagKV:         tagKV,
 						TagID:         token.TagID,
 						SessionKey:    sessionID,
+						SessionTokens: turnTokens,
+						SessionTurn:   0,
+						Now:           g.now(),
 					})
 					if mErr != nil {
 						// 单个成员路由失败（如该对外模型未配置）不阻断整体：继续尝试下一成员。
@@ -345,6 +359,9 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 				TagKV:         tagKV,
 				TagID:         token.TagID,
 				SessionKey:    sessionID,
+				SessionTokens: turnTokens,
+				SessionTurn:   0,
+				Now:           g.now(),
 			}
 			routes, err = g.router.RouteAll(ctx, routeSpec)
 		}
@@ -354,6 +371,9 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 			TagKV:         tagKV,
 			TagID:         token.TagID,
 			SessionKey:    sessionID,
+			SessionTokens: turnTokens,
+			SessionTurn:   0,
+			Now:           g.now(),
 		}
 		routes, err = g.router.RouteAll(ctx, routeSpec)
 	}

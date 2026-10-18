@@ -28,6 +28,14 @@ type SessionCostConfig struct {
 	RemainingMax int     `json:"remaining_max"`
 	MinRemaining int     `json:"min_remaining"`
 	CooldownSec  int     `json:"cooldown_sec"`
+	// MidSwitch 是「会话中途切换」这一子阶段的独立开关（P2），默认 false 安全态：
+	// 即使 Enabled=true（P1 起点择优已放行），未显式开启本开关也会在中途保持会话亲和、渠道不变。
+	// 与设计 D10「P0 影子只读 → P1 起点择优 → P2 中途切换，逐级开关、可独立回退」一致：
+	// Enabled 为总开关，MidSwitch 为 P2 子开关（须 Enabled 与 MidSwitch 同时为 true 才启用中途切换）。
+	MidSwitch bool `json:"mid_switch"`
+	// MinImprove 是中途切换的滞回阈值（相对改善比例，0 ≤ x < 1）：仅当新渠道本轮成本相对当前渠道
+	// 的改善超过该比例才切换，抑制成本接近时来回横跳。默认 0 = 只要求新渠道严格更便宜（仍受回本门控约束）。
+	MinImprove float64 `json:"min_improve"`
 }
 
 // defaultSessionCostConfig 返回缺省配置：关闭（安全态）并带上默认阈值。
@@ -117,6 +125,8 @@ func parseSessionCostConfig(raw []byte) (SessionCostConfig, bool) {
 		RemainingMax *int     `json:"remaining_max"`
 		MinRemaining *int     `json:"min_remaining"`
 		CooldownSec  *int     `json:"cooldown_sec"`
+		MidSwitch    *bool    `json:"mid_switch"`
+		MinImprove   *float64 `json:"min_improve"`
 	}
 	if err := json.Unmarshal(raw, &in); err != nil {
 		return SessionCostConfig{}, false
@@ -143,6 +153,12 @@ func parseSessionCostConfig(raw []byte) (SessionCostConfig, bool) {
 	}
 	if in.CooldownSec != nil {
 		cfg.CooldownSec = *in.CooldownSec
+	}
+	if in.MidSwitch != nil {
+		cfg.MidSwitch = *in.MidSwitch
+	}
+	if in.MinImprove != nil {
+		cfg.MinImprove = *in.MinImprove
 	}
 	return cfg, true
 }

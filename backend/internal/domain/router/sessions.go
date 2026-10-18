@@ -26,9 +26,12 @@ type Session struct {
 	CreatedAt       time.Time
 	LastActive      time.Time
 	ExpireAt        time.Time
-	Closed          bool       // 已关闭：不再被路由命中、释放并发槽，但保留在列表（管理可见）
-	ClosedAt        *time.Time // 关闭时间（nil=未关闭）
-	Inflight        int        // 进行中请求数（进程内存计数，不落库；管理端「实时状态」展示用）
+	// LastSwitchAt 会话最近一次「渠道迁移」（成本切换）时刻，供「中途切换冷却」判定（CooldownSec）。
+	// 进程内存字段（不落库）：崩溃恢复后归零即冷却失效，属安全方向（宁可多切一次也不长期冻结）。
+	LastSwitchAt time.Time
+	Closed       bool       // 已关闭：不再被路由命中、释放并发槽，但保留在列表（管理可见）
+	ClosedAt     *time.Time // 关闭时间（nil=未关闭）
+	Inflight     int        // 进行中请求数（进程内存计数，不落库；管理端「实时状态」展示用）
 	// LastMsgFingerprints 该会话上次请求的每消息短 hash，用于 call_log 增量 diff
 	//（进程内存字段，不落库；DB 恢复后为空时网关降级为「最后一条 user + tool 链」）。
 	LastMsgFingerprints []string
@@ -254,6 +257,104 @@ func (r *SessionRegistry) Renew(sessionID string, ttl time.Duration) {
 			logf("session renew upsert %s: %v", sessionID, err)
 		}
 	}
+}
+
+// Migrate 把既有活跃会话迁移到新的 (渠道密钥, 内部模型)，用于「会话中途成本切换」后的会话归属更新。
+//
+// 语义（沿用 Attach 的密钥迁移校验 + Renew 的滑动 TTL）：
+//   - 会话不存在、已过期或已关闭 → 返回 false（不迁移，调用方保持原渠道）；
+//   - 目标密钥与当前相同 → 仅刷新内部模型并按滑动 TTL 续期（不新增计数），返回 true；
+//   - 目标密钥存活会话数 ≥ maxConcurrent → **原子回退**：不释放旧密钥计数、不改会话归属、
+//     不落库，直接返回 false（并发上限超限时保持原渠道，绝不把会话迁到已满的新密钥）；
+//   - 迁移成功 → 旧密钥计数 -1、新密钥计数 +1，更新 ChannelKeyID/InternalModelID/LastActive/
+//     LastSwitchAt，按 ttl 滑动延长 ExpireAt（只增不减），并经 sessionPersister.Upsert 落库
+//     （走既有 asyncwrite AsyncPersister，Key=session_id 保序）。
+//
+// maxConcurrent ≤ 0 视为不限；ttl ≤ 0 只刷新 LastActive/LastSwitchAt、不延长 ExpireAt。
+// 仅内存成功后才落库（失败仅记日志），内存为权威、DB 为最终一致的持久化投影。
+func (r *SessionRegistry) Migrate(sessionID string, newKeyID int64, newInternalModelID string, maxConcurrent int, ttl time.Duration) bool {
+	if sessionID == "" {
+		return false
+	}
+	if maxConcurrent <= 0 {
+		maxConcurrent = 1 << 30
+	}
+	t := r.now()
+
+	r.mu.Lock()
+	s, ok := r.byKey[sessionID]
+	if !ok || s.Closed || t.After(s.ExpireAt) {
+		r.mu.Unlock()
+		return false
+	}
+	if s.ChannelKeyID == newKeyID {
+		// 目标与当前同密钥：只刷新内部模型并滑动续期，不涉及计数迁移。
+		s.InternalModelID = newInternalModelID
+		s.LastActive = t
+		s.LastSwitchAt = t
+		if ttl > 0 {
+			if cand := t.Add(ttl); cand.After(s.ExpireAt) {
+				s.ExpireAt = cand
+			}
+		}
+		store, logf := r.store, r.logf
+		r.mu.Unlock()
+		if store != nil {
+			if err := store.Upsert(context.Background(), s); err != nil {
+				logf("session migrate upsert %s: %v", sessionID, err)
+			}
+		}
+		return true
+	}
+	// 并发上限校验先于任何状态改写：超限则原子回退（保持原渠道），不释放旧密钥计数。
+	if len(r.byKy[newKeyID]) >= maxConcurrent {
+		r.mu.Unlock()
+		return false
+	}
+	// 迁移成功：旧密钥 -1、新密钥 +1。
+	if ks, ok := r.byKy[s.ChannelKeyID]; ok {
+		delete(ks, sessionID)
+		if len(ks) == 0 {
+			delete(r.byKy, s.ChannelKeyID)
+		}
+	}
+	if r.byKy[newKeyID] == nil {
+		r.byKy[newKeyID] = make(map[string]bool)
+	}
+	r.byKy[newKeyID][sessionID] = true
+	s.ChannelKeyID = newKeyID
+	s.InternalModelID = newInternalModelID
+	s.LastActive = t
+	s.LastSwitchAt = t
+	if ttl > 0 {
+		if cand := t.Add(ttl); cand.After(s.ExpireAt) {
+			s.ExpireAt = cand
+		}
+	}
+	store, logf := r.store, r.logf
+	r.mu.Unlock()
+
+	if store != nil {
+		if err := store.Upsert(context.Background(), s); err != nil {
+			logf("session migrate upsert %s: %v", sessionID, err)
+		}
+	}
+	return true
+}
+
+// LastSwitchAt 返回会话最近一次渠道迁移时刻（不存在/从未切换返回 (零值, false)）。
+// 读锁保护（与 CountActive 同策略），供「中途切换冷却」判定安全读取，避免与并发 Migrate 竞争。
+func (r *SessionRegistry) LastSwitchAt(sessionID string) (time.Time, bool) {
+	if sessionID == "" {
+		return time.Time{}, false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	s, ok := r.byKey[sessionID]
+	if !ok {
+		return time.Time{}, false
+	}
+	return s.LastSwitchAt, true
 }
 
 // BeginRequest 标记会话上有一个请求开始（进行中计数 +1）。会话不存在时忽略。
