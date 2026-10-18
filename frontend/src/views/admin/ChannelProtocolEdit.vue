@@ -10,12 +10,19 @@ import {
   pullChannelProtocolModels,
   listExternalModels,
   createExternalModel,
+  listChannels,
+  listAllChannelModels,
+  getChannelProtocolErrorStats,
   rateLabels,
   type ChannelProtocolInput,
   type ChannelProtocolModelOverride,
   type ProtocolOption,
   type ExternalModel,
   type PullModel,
+  type ErrorPolicy,
+  type ErrorMatch,
+  type ErrorDisposition,
+  type ChannelProtocolErrorStat,
 } from '@/api/admin'
 import KvpEditor from '@/components/KvpEditor.vue'
 import StringListEditor from '@/components/StringListEditor.vue'
@@ -106,6 +113,112 @@ const modelRows = ref<ModelRow[]>([])
 // 下拉数据：启用的对外模型
 const externalModels = ref<ExternalModel[]>([])
 
+// ===== 错误策略 =====
+// 每条策略：生效范围（整渠道/指定模型）+ 错误签名（status/type/code/message）+ 处置（计入健康/failover/动作/下游状态码）。
+// failover 用 inherit 表示「未设置=沿用现状」，以匹配后端 *bool 语义。
+type ErrorPolicyForm = {
+  scope: string // channel | models
+  modelIds: number[] // scope=models 时生效的 channel_models 行 ID
+  status: number | undefined
+  errorType: string
+  errorCode: string
+  messageRegex: string
+  countIntoHealth: boolean
+  failover: string // inherit | true | false
+  action: string // none | drain | disable
+  downstreamStatus: number | undefined
+  note: string
+}
+const errorPolicies = ref<ErrorPolicyForm[]>([])
+// 可选模型（channel_models 行）：value 取行 ID，供「指定模型」多选。
+const policyModelOptions = ref<{ label: string; value: number }[]>([])
+
+// 协议级错误统计（按类别计数）
+const errorStats = ref<ChannelProtocolErrorStat[]>([])
+const statsLoading = ref(false)
+const statsRange = ref<[string, string] | null>(null)
+
+function emptyPolicy(): ErrorPolicyForm {
+  return {
+    scope: 'channel',
+    modelIds: [],
+    status: undefined,
+    errorType: '',
+    errorCode: '',
+    messageRegex: '',
+    countIntoHealth: true,
+    failover: 'inherit',
+    action: 'none',
+    downstreamStatus: undefined,
+    note: '',
+  }
+}
+function addPolicy() {
+  errorPolicies.value.push(emptyPolicy())
+}
+function removePolicy(index: number) {
+  errorPolicies.value.splice(index, 1)
+}
+
+// 加载「指定模型」候选：编辑态取引用该协议的渠道下的内部模型行；新建态取全部内部模型行。
+async function loadPolicyModelOptions() {
+  try {
+    const cmRes = await listAllChannelModels()
+    let rows = cmRes.Data || []
+    if (isEdit.value) {
+      const chRes = await listChannels()
+      const refIds = new Set(
+        (chRes.Data || [])
+          .filter((c) => String(c.ChannelProtocolID ?? '') === id)
+          .map((c) => String(c.ID)),
+      )
+      rows = rows.filter((cm) => refIds.has(String(cm.ChannelID)))
+    }
+    policyModelOptions.value = rows.map((cm) => ({
+      label: `${cm.InternalModelID}（${cm.ChannelName || cm.ChannelID}）`,
+      value: Number(cm.ID),
+    }))
+  } catch {
+    /* 忽略：选项加载失败仍可编辑其它字段 */
+  }
+}
+
+async function loadErrorStats() {
+  if (!isEdit.value) return
+  statsLoading.value = true
+  try {
+    const [from, to] = statsRange.value || []
+    const res = await getChannelProtocolErrorStats(id, from, to)
+    errorStats.value = res.Data?.Stats || []
+  } catch {
+    errorStats.value = []
+  } finally {
+    statsLoading.value = false
+  }
+}
+
+// 由表单组装后端 ErrorPolicy（字段名 = Go JSON tag）。
+function buildErrorPolicies(): ErrorPolicy[] {
+  return errorPolicies.value.map((p) => {
+    const match: ErrorMatch = {}
+    if (p.status) match.status = p.status
+    if (p.errorType.trim()) match.errorType = p.errorType.trim()
+    if (p.errorCode.trim()) match.errorCode = p.errorCode.trim()
+    if (p.messageRegex.trim()) match.messageRegex = p.messageRegex.trim()
+    const disposition: ErrorDisposition = {
+      countIntoHealth: p.countIntoHealth,
+      action: p.action || 'none',
+    }
+    if (p.failover === 'true') disposition.failover = true
+    else if (p.failover === 'false') disposition.failover = false
+    if (p.downstreamStatus) disposition.downstreamStatus = p.downstreamStatus
+    const out: ErrorPolicy = { scope: p.scope, match, disposition }
+    if (p.scope === 'models') out.modelIds = [...p.modelIds]
+    if (p.note.trim()) out.note = p.note.trim()
+    return out
+  })
+}
+
 function emptyPricing(): Record<string, any> {
   return {
     CostRates: { Input: 0, Output: 0, CacheRead: 0 },
@@ -144,6 +257,20 @@ async function load() {
     form.whitelist = v.RequestHeaders?.whitelist || []
     form.blacklist = v.RequestHeaders?.blacklist || []
     form.set = v.RequestHeaders?.set || {}
+    errorPolicies.value = (v.errorPolicy || []).map((p) => ({
+      scope: p.scope || 'channel',
+      modelIds: [...(p.modelIds || [])],
+      status: p.match?.status || undefined,
+      errorType: p.match?.errorType || '',
+      errorCode: p.match?.errorCode || '',
+      messageRegex: p.match?.messageRegex || '',
+      countIntoHealth: !!p.disposition?.countIntoHealth,
+      failover:
+        p.disposition?.failover == null ? 'inherit' : p.disposition.failover ? 'true' : 'false',
+      action: p.disposition?.action || 'none',
+      downstreamStatus: p.disposition?.downstreamStatus || undefined,
+      note: p.note || '',
+    }))
     modelRows.value = Object.entries(v.Models || {}).map(([mid, ov]) => ({
       id: mid,
       protocols: Object.keys(ov?.protocols || {}),
@@ -176,6 +303,7 @@ function snapshot(): string {
     blacklist: form.blacklist,
     set: form.set,
     models: modelRows.value,
+    errorPolicy: errorPolicies.value,
   })
 }
 const { dirty, markSaved } = useUnsavedGuard(snapshot)
@@ -186,7 +314,9 @@ onMounted(() => {
   // 返回「渠道」合并页时保持选中「渠道协议」视图
   sessionStorage.setItem('admin-channels-tab', 'protocols')
   loadExternalModels()
+  loadPolicyModelOptions()
   load()
+  loadErrorStats()
 })
 
 // ===== 模型行 增/改/删 =====
@@ -442,6 +572,7 @@ async function onSubmit() {
       set: form.set,
     },
     Models: buildModels(),
+    errorPolicy: buildErrorPolicies(),
   }
 
   saving.value = true
@@ -587,6 +718,89 @@ async function onSubmit() {
             </el-table-column>
           </el-table>
           <el-empty v-if="!modelRows.length" description="暂无模型" :image-size="48" />
+        </div>
+      </el-tab-pane>
+
+      <el-tab-pane label="错误策略" name="errorpolicy">
+        <div class="card">
+          <div class="block-desc">为命中「错误签名（status + type/code/message）」的上游错误配置处置：是否计入渠道健康、是否 failover、触发动作、下游状态码。未配置任何策略时保持既有行为（默认安全态）。</div>
+          <div class="policy-toolbar">
+            <el-button type="primary" :icon="Plus" @click="addPolicy">添加策略</el-button>
+          </div>
+          <el-empty v-if="!errorPolicies.length" description="暂无错误策略（默认安全态）" :image-size="48" />
+          <div v-for="(p, i) in errorPolicies" :key="i" class="policy-card">
+            <div class="policy-head">
+              <span class="policy-title">策略 {{ i + 1 }}</span>
+              <el-button link type="danger" :icon="Delete" @click="removePolicy(i)">删除</el-button>
+            </div>
+            <el-form label-width="110px" class="policy-form">
+              <el-form-item label="生效范围">
+                <el-radio-group v-model="p.scope">
+                  <el-radio value="channel">整渠道</el-radio>
+                  <el-radio value="models">指定模型</el-radio>
+                </el-radio-group>
+              </el-form-item>
+              <el-form-item v-if="p.scope === 'models'" class="span-2" label="指定模型">
+                <el-select v-model="p.modelIds" multiple filterable placeholder="选择生效的内部模型（channel_models 行）" style="width: 100%">
+                  <el-option v-for="opt in policyModelOptions" :key="opt.value" :label="opt.label" :value="opt.value" />
+                </el-select>
+              </el-form-item>
+              <el-form-item class="span-2" label="错误签名">
+                <div class="sig-row">
+                  <el-input-number v-model="p.status" :min="0" :max="599" :controls="false" placeholder="status" class="sig-status" />
+                  <el-input v-model="p.errorType" placeholder="errorType（可选）" />
+                  <el-input v-model="p.errorCode" placeholder="errorCode（可选）" />
+                </div>
+              </el-form-item>
+              <el-form-item class="span-2" label="消息正则">
+                <el-input v-model="p.messageRegex" placeholder="messageRegex（可选，Go 正则，命中 message 文本）" />
+              </el-form-item>
+              <el-form-item label="计入健康">
+                <el-switch v-model="p.countIntoHealth" />
+                <span class="hint-inline">关闭后该错误完全不影响熔断</span>
+              </el-form-item>
+              <el-form-item label="failover">
+                <el-select v-model="p.failover" style="width: 200px">
+                  <el-option label="沿用现状（默认）" value="inherit" />
+                  <el-option label="启用转移" value="true" />
+                  <el-option label="禁止转移" value="false" />
+                </el-select>
+              </el-form-item>
+              <el-form-item label="动作">
+                <el-select v-model="p.action" style="width: 200px">
+                  <el-option label="无" value="none" />
+                  <el-option label="排空（drain）" value="drain" />
+                  <el-option label="禁用（disable）" value="disable" />
+                </el-select>
+              </el-form-item>
+              <el-form-item label="下游状态码">
+                <el-input-number v-model="p.downstreamStatus" :min="0" :max="599" :controls="false" placeholder="0 = 默认 502" />
+              </el-form-item>
+              <el-form-item class="span-2" label="备注">
+                <el-input v-model="p.note" placeholder="可选说明" />
+              </el-form-item>
+            </el-form>
+          </div>
+
+          <template v-if="isEdit">
+            <div class="section-title">协议级错误统计</div>
+            <div class="stats-toolbar">
+              <el-date-picker
+                v-model="statsRange"
+                type="daterange"
+                value-format="YYYY-MM-DD"
+                range-separator="至"
+                start-placeholder="开始日期"
+                end-placeholder="结束日期"
+              />
+              <el-button :icon="RefreshRight" :loading="statsLoading" @click="loadErrorStats">刷新</el-button>
+            </div>
+            <el-table v-loading="statsLoading" :data="errorStats" border stripe size="small" class="stats-table">
+              <el-table-column label="错误类别" prop="Category" min-width="220" show-overflow-tooltip />
+              <el-table-column label="计数" prop="Count" width="120" align="right" />
+            </el-table>
+            <el-empty v-if="!statsLoading && !errorStats.length" description="暂无统计数据" :image-size="48" />
+          </template>
         </div>
       </el-tab-pane>
     </el-tabs>
@@ -787,6 +1001,56 @@ async function onSubmit() {
 }
 .model-form .span-2 {
   grid-column: 1 / -1;
+}
+.policy-toolbar {
+  margin-bottom: 12px;
+}
+.policy-card {
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  padding: 14px 16px;
+  margin-bottom: 14px;
+}
+.policy-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.policy-title {
+  font-weight: 600;
+  font-size: 14px;
+}
+.policy-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 24px;
+}
+.policy-form .span-2 {
+  grid-column: 1 / -1;
+}
+.sig-row {
+  display: flex;
+  gap: 8px;
+  width: 100%;
+}
+.sig-status {
+  width: 120px;
+  flex: none;
+}
+.hint-inline {
+  margin-left: 10px;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+.stats-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.stats-table {
+  margin-top: 4px;
 }
 .actions {
   margin-top: 20px;
