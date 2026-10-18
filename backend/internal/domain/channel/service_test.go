@@ -53,10 +53,14 @@ func TestService_CreateChannel_Defaults(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + channelCols + ` FROM channels WHERE name = $1`)).
 		WithArgs("my-channel").WillReturnRows(sqlmock.NewRows(nil))
 
+	wantRL := marshalJSONB(DefaultRateLimit())
+	wantHP := marshalJSONB(DefaultHealthProbe())
+	wantRel := marshalJSONB(DefaultReliability())
+
 	mock.ExpectBegin()
 	mock.ExpectQuery(regexp.QuoteMeta(insertChannelSQL)).
 		WithArgs(sqlmock.AnyArg(), "my-channel", "openai-compat", "https://api.example.com",
-			sqlmock.AnyArg(), 100, sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), nil).
+			sqlmock.AnyArg(), 100, wantRL, wantHP, wantRel, nil).
 		WillReturnRows(channelRow(&Channel{
 			ID: 1, Name: "my-channel", Protocol: "openai-compat", BaseURL: "https://api.example.com",
 			Priority:  100,
