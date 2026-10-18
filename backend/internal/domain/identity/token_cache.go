@@ -24,13 +24,18 @@
 //  2. 安全 TTL（默认 60s，可配置）：仅作「最后防线」——条目存活超过 TTL 一律视为未命中，用于兜底
 //     「理论上不该发生的失效遗漏」。TTL 不计入「即时失效」保证；即时性由上述失效钩子负责。
 //
-// 有界性：条目数上限默认 10 万，超限按 map 随机淘汰（简单策略），避免无界增长。
+// 有界性：条目数上限默认 10 万，超限按插入顺序 FIFO 淘汰最早条目，避免无界增长。
+// 存储/淘汰/代际/失效由 pkg/gencache 原语承载；本文件只保留 value 语义（TTL、精确过期、
+// 防御性深拷贝）与鉴权快照结构。
 // 开关：默认启用；SetTokenCacheEnabled(false) 后 LookupByPlain 退回纯 DB 直查（安全态）。
 package identity
 
 import (
+	"strconv"
 	"sync"
 	"time"
+
+	"github.com/team/llmgateway/internal/pkg/gencache"
 )
 
 const (
@@ -73,28 +78,25 @@ func cloneToken(t *Token) *Token {
 
 // tokenCache 令牌鉴权两级读缓存。零值不可用，须经 newTokenCache 创建。
 type tokenCache struct {
-	mu         sync.RWMutex
-	enabled    bool
-	ttl        time.Duration
-	maxEntries int
+	mu      sync.RWMutex
+	enabled bool
+	ttl     time.Duration
 	// now 时钟注入点（默认 time.Now），便于测试精确过期边界。
-	now    func() time.Time
-	byHash map[string]*tokenCacheEntry
-	byUser map[int64]map[string]struct{}
-	// gen 失效代际：任一失效（invalidate*/clearLocked）递增。读路径回源前捕获、回填时校验，
-	// 用于拒绝「回源期间发生失效」后回填的陈旧快照（防认证绕过窗口）。
-	gen uint64
+	now func() time.Time
+	// entries 承载 plainHash -> tokenCacheEntry 的存储、FIFO 淘汰、失效代际与
+	// userID 二级索引（以 userID 字符串作为 group）。
+	// 代际语义：读路径回源前捕获、回填时校验，拒绝「回源期间发生失效」的陈旧快照
+	// （防认证绕过窗口）。
+	entries *gencache.Cache[*tokenCacheEntry]
 }
 
 // newTokenCache 创建缓存：默认启用、安全 TTL 60s、上限 10 万。
 func newTokenCache() *tokenCache {
 	return &tokenCache{
-		enabled:    true,
-		ttl:        tokenCacheDefaultTTL,
-		maxEntries: tokenCacheDefaultMaxEntries,
-		now:        time.Now,
-		byHash:     make(map[string]*tokenCacheEntry),
-		byUser:     make(map[int64]map[string]struct{}),
+		enabled: true,
+		ttl:     tokenCacheDefaultTTL,
+		now:     time.Now,
+		entries: gencache.New[*tokenCacheEntry](tokenCacheDefaultMaxEntries),
 	}
 }
 
