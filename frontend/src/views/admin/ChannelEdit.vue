@@ -62,11 +62,11 @@ const form = reactive({
   rpm: 0,
   tpm: 0,
   burst_multiplier: 1.2,
-  on_exceed: 'QUEUE' as string,
+  on_exceed: 'REJECT' as string,
   queue_size: 100,
   queue_timeout_ms: 0,
-  max_concurrent: 16,
-  interval: '0 0 * * * *',
+  max_concurrent: 100,
+  interval: '0 0 0 * * *',
   drain_interval_seconds: 15,
   timeout_ms: 15000,
   fail_threshold: 1,
@@ -211,11 +211,11 @@ async function load() {
     form.rpm = row.RateLimit?.RPM || 0
     setTpmDisplay(row.RateLimit?.TPM || 0)
     form.burst_multiplier = row.RateLimit?.BurstMultiplier || 1.2
-    form.on_exceed = row.RateLimit?.OnExceed || 'QUEUE'
+    form.on_exceed = row.RateLimit?.OnExceed || 'REJECT'
     form.queue_size = row.RateLimit?.QueueSize ?? 100
     form.queue_timeout_ms = row.RateLimit?.QueueTimeoutMS || 0
-    form.max_concurrent = row.RateLimit?.MaxConcurrent || 16
-    form.interval = row.HealthProbe?.Interval || '0 0 * * * *'
+    form.max_concurrent = row.RateLimit?.MaxConcurrent || 100
+    form.interval = row.HealthProbe?.Interval || '0 0 0 * * *'
     form.drain_interval_seconds = num(row.HealthProbe?.DrainIntervalSeconds, 15)
     form.timeout_ms = num(row.HealthProbe?.TimeoutMS, 15000)
     form.fail_threshold = num(row.HealthProbe?.FailThreshold, 1)
@@ -411,7 +411,7 @@ async function onSubmit() {
         MaxConcurrent: Number(form.max_concurrent),
       },
       HealthProbe: {
-        Interval: form.interval || '0 0 * * * *',
+        Interval: form.interval || '0 0 0 * * *',
         DrainIntervalSeconds: Number(form.drain_interval_seconds),
         TimeoutMS: Number(form.timeout_ms),
         FailThreshold: Number(form.fail_threshold),
