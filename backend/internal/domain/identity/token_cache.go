@@ -41,7 +41,7 @@ import (
 const (
 	// tokenCacheDefaultTTL 安全 TTL 默认值（最后防线，非即时失效机制）。
 	tokenCacheDefaultTTL = 60 * time.Second
-	// tokenCacheDefaultMaxEntries 缓存条目上限，超过后随机淘汰。
+	// tokenCacheDefaultMaxEntries 缓存条目上限，超过后按 FIFO 淘汰最早插入的条目。
 	tokenCacheDefaultMaxEntries = 100000
 )
 
@@ -120,8 +120,8 @@ func (c *tokenCache) ensureEntriesLocked() *gencache.Cache[*tokenCacheEntry] {
 //
 // 锁序约定：统一为「先 c.mu，后原语锁」，二者不得嵌套持有。故此处先在 c.mu 内落定 enabled
 // 并取得原语引用，释放 c.mu 后再调用 InvalidateAll——不在持有 c.mu 时进入原语锁。
-// 语义等价：enabled 已在 c.mu 内落定，后续读路径要么看到 enabled=false 直接回源，
-// 要么并发回填携带的旧代际被 putAtGen 的代际校验拒绝。
+// 语义等价：enabled 已在 c.mu 内落定，生产读路径（LookupByPlain）要么看到 enabled=false 直接回源，
+// 要么其并发回填携带的旧代际被 putAtGen 拒绝。（无代际保护的 put 仅测试用，不在此路径。）
 func (c *tokenCache) setEnabled(enabled bool) {
 	c.mu.Lock()
 	c.enabled = enabled
