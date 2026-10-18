@@ -19,7 +19,7 @@ import (
 // 运行方式（本地 dev PG）：
 //
 //	cd backend
-//	LLMGATEWAY_TEST_PG_DSN='postgres://dev:123456@10.126.126.1:55432/postgres?sslmode=disable' \
+//	LLMGATEWAY_TEST_PG_DSN='postgres://user:pass@host:port/db' \
 //	  go test ./internal/db -run TestMigrate_ThreeSegments -v
 //
 // 未设置 LLMGATEWAY_TEST_PG_DSN 时该测试 t.Skip，不阻塞普通 go test ./...。

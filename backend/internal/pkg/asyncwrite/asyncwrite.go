@@ -620,14 +620,18 @@ func (w *Writer) commit(force bool) {
 	}
 	if _, err := f.Write(buf); err != nil {
 		logger.Fallback().Error("asyncwrite: 写入 WAL 临时文件失败", "err", err)
-		_ = f.Close()
+		if cerr := f.Close(); cerr != nil {
+			logger.Fallback().Error("asyncwrite: 关闭 WAL 临时文件失败", "err", cerr)
+		}
 		return
 	}
 	if err := f.Sync(); err != nil {
 		logger.Fallback().Error("asyncwrite: WAL 临时文件 fsync 失败", "err", err)
 	}
 	w.recordFSync()
-	_ = f.Close()
+	if cerr := f.Close(); cerr != nil {
+		logger.Fallback().Error("asyncwrite: 关闭 WAL 临时文件失败", "err", cerr)
+	}
 
 	if err := os.Rename(tmp, w.cfg.WALPath); err != nil {
 		logger.Fallback().Error("asyncwrite: WAL 重命名失败", "err", err)
@@ -636,11 +640,15 @@ func (w *Writer) commit(force bool) {
 	nf, err := os.OpenFile(w.cfg.WALPath, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
 	if err != nil {
 		logger.Fallback().Error("asyncwrite: 重开 WAL 失败", "err", err)
-		_ = w.walFile.Close()
+		if cerr := w.walFile.Close(); cerr != nil {
+			logger.Fallback().Error("asyncwrite: 关闭旧 WAL 文件失败", "err", cerr)
+		}
 		w.walFile = nil
 		return
 	}
-	_ = w.walFile.Close()
+	if cerr := w.walFile.Close(); cerr != nil {
+		logger.Fallback().Error("asyncwrite: 关闭旧 WAL 文件失败", "err", cerr)
+	}
 	w.walFile = nf
 	w.pendingOrder = kept
 	w.walDirty = false
@@ -660,6 +668,7 @@ func shardIndex(key string, n int) int {
 		return 0
 	}
 	h := fnv.New32a()
+	// hash.Hash.Write 契约保证恒返回 nil error（对内存 buffer 的写入不会失败），故此处忽略返回值。
 	_, _ = h.Write([]byte(key))
 	return int(h.Sum32() % uint32(n))
 }

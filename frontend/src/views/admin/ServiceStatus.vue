@@ -1171,26 +1171,33 @@ onUnmounted(stopTimer)
 }
 /* 状态灯：绿=正常 · 橙=排空 · 红=禁用/超限 · 灰=未知（与「会话」列表的光效圆点一致） */
 .lamp {
+  --lamp-ok: var(--color-success);
+  --lamp-warn: var(--color-warning);
+  --lamp-bad: var(--color-danger);
+  --lamp-off: var(--color-text-tertiary);
+  --lamp-ok-glow: rgba(18, 183, 106, 0.5);
+  --lamp-warn-glow: rgba(247, 144, 9, 0.5);
+  --lamp-bad-glow: rgba(240, 68, 56, 0.5);
   flex: none;
   width: 9px;
   height: 9px;
   border-radius: 50%;
-  background: #98a2b3;
+  background: var(--lamp-off);
 }
 .lamp[data-state='ok'] {
-  background: #12b76a;
-  box-shadow: 0 0 6px rgba(18, 183, 106, 0.5);
+  background: var(--lamp-ok);
+  box-shadow: 0 0 6px var(--lamp-ok-glow);
 }
 .lamp[data-state='warn'] {
-  background: #f79009;
-  box-shadow: 0 0 6px rgba(247, 144, 9, 0.5);
+  background: var(--lamp-warn);
+  box-shadow: 0 0 6px var(--lamp-warn-glow);
 }
 .lamp[data-state='bad'] {
-  background: #f04438;
-  box-shadow: 0 0 6px rgba(240, 68, 56, 0.5);
+  background: var(--lamp-bad);
+  box-shadow: 0 0 6px var(--lamp-bad-glow);
 }
 .lamp[data-state='off'] {
-  background: #98a2b3;
+  background: var(--lamp-off);
 }
 /* 指标单元格：用量灯 + 当前值/上限 */
 .mcell {

@@ -1,6 +1,8 @@
 package console
 
 import (
+	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -130,6 +132,12 @@ func (h *Admin) HandleServiceStatus(w http.ResponseWriter, r *http.Request) {
 				// 全量计算下每次刷新都会遍历全部启用模型，若不区分会周期性刷 ERROR 噪音。
 				if re, ok := router.AsRouteError(err); ok {
 					slog.Default().Debug("对外模型当前无可用候选", "request_id", resp.RequestID(r), "external_model_id", m.ID, "reason", re.Message)
+					continue
+				}
+				// 解析对外模型/渠道候选（DB 查询）时请求 ctx 被取消/超时（客户端中断），属客户端侧中断
+				// 而非服务真实故障：降级为 Warn 并跳过，避免全量循环下周期性刷 ERROR 噪音；响应不受影响。
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					slog.Default().Warn("计算候选顺序中断（请求已取消/超时）", "request_id", resp.RequestID(r), "external_model_id", m.ID, "err", err)
 					continue
 				}
 				slog.Default().Error("计算候选顺序失败", "request_id", resp.RequestID(r), "external_model_id", m.ID, "err", err)
