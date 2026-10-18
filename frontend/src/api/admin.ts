@@ -378,6 +378,26 @@ export function pullChannelProtocolModels(id: string, apiKey: string) {
     { ApiKey: apiKey },
   )
 }
+// 协议级错误统计：按错误类别（category，如 status:422 / code:<errCode> / type:<errType>）聚合的计数。
+export interface ChannelProtocolErrorStat {
+  Category: string
+  Count: number
+}
+// 协议级错误统计查询结果：From/To 为 YYYY-MM-DD（缺省为近 30 天，含今日）
+export interface ChannelProtocolErrorStatsData {
+  ID: string
+  From: string
+  To: string
+  Stats: ChannelProtocolErrorStat[]
+}
+// 查询某渠道协议在 [from, to]（YYYY-MM-DD，缺省近 30 天）内按错误类别聚合的计数
+export function getChannelProtocolErrorStats(id: string, from?: string, to?: string) {
+  return http.get<ChannelProtocolErrorStatsData, ApiRes<ChannelProtocolErrorStatsData>>(
+    `/admin/channel-protocols/${id}/error-stats`,
+    { params: { from, to } },
+  )
+}
+
 // 渠道协议预设包：{ "<id>": Provider }（含 gateway 块），导出/导入共用
 export interface ChannelProtocolPack {
   [key: string]: unknown
