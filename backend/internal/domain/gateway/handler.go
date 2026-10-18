@@ -401,6 +401,8 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 	if g.credit != nil {
 		est, formula, eerr := g.estimatePreConsumeCost(ctx, model, body)
 		if eerr != nil {
+			// 边界说明（口径已成文）：估算先于预扣，故「零余额 + 估算失败」返回 500（属网关内部
+			// 配置错误，如费率/系数非法），而非移除前置余额读之前该组合的 402。此变更经人工评审确认可接受。
 			l.Error("estimate preconsume failed", "user_id", token.UserID, "model", model, "err", eerr)
 			g.logReject(ctx, endpoint, model, "预扣金额估算失败："+eerr.Error(), http.StatusInternalServerError, token, msSince(start))
 			writeOpenAIError(w, http.StatusInternalServerError, msgInternal)
@@ -415,6 +417,9 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 		if err := g.credit.PreConsume(ctx, token.UserID, pc.Credits, "", sessionID, "预扣费"); err != nil {
 			// 失败也落 failed 账单：余额不足等预扣拒绝必须留痕（含公式与预扣积分），
 			// 便于用户核对「为什么没扣成」与对账。
+			// 口径说明（已成文，经人工评审确认可接受）：本分支统一用「归属首个候选渠道 + 公式消息」。
+			// 对零余额场景，这是相对移除前置余额读之前的「空归属 + 原因串『账户余额为 0』」的变化；
+			// 但 failed 记录 CreditsConsumed=0、不参与扣减，对账金额不受影响，且与「余额不足」分支口径一致。
 			msg := fmt.Sprintf("积分余额不足，预扣需 %.6f 积分；公式：\n%s", pc.Credits, formula)
 			if len(routes) > 0 {
 				r0 := routes[0]

@@ -1204,6 +1204,10 @@ func TestServeFundSemantics(t *testing.T) {
 //   - 有余额 + pc.Credits==0 → 零金额预扣放行，正常走上游并 200。
 //
 // 两例均断言 PreConsume 恰好被调用一次，且不产生正额扣款（证明零金额预扣语义与条件写一致）。
+//
+// 注：此处 402 由 fakeCredit 的零余额守卫模拟（见 fakeCredit.PreConsume），用于验证网关**仍照常下发**
+// 零金额预扣这一契约；真实零余额条件写（钱包缺失→40401 / 余额≤0→40201）由 identity 包
+// credit_zero_guard_test.go 覆盖，二者互补。
 func TestServeZeroCredits_DispatchesPreConsume(t *testing.T) {
 	var called int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
