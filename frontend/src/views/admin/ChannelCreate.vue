@@ -38,7 +38,7 @@ loadProtocols()
 // 注意：el-select 的 @change 触发时 v-model 已更新为新单位，须用 tpmPrevUnit 记录切换前单位换算
 const tpmUnit = ref<'M' | 'K' | '1'>('M')
 const tpmPrevUnit = ref<'M' | 'K' | '1'>('M')
-const tpmInput = ref<number>(1) // 默认 1000000 = 1 百万
+const tpmInput = ref<number>(10) // 默认 10000000 = 10 百万
 const tpmFactor: Record<'M' | 'K' | '1', number> = { M: 1000000, K: 1000, 1: 1 }
 function onTpmUnitChange() {
   const raw = (tpmInput.value || 0) * tpmFactor[tpmPrevUnit.value]
@@ -56,14 +56,14 @@ const form = reactive({
   channel_protocol_id: '' as string, // 引用的渠道协议 ID；空=使用内联配置
   tag_ids: [] as string[],
   priority: 100,
-  rpm: 1000,
+  rpm: 120,
   tpm: 1000000,
   burst_multiplier: 1.2,
-  on_exceed: 'QUEUE',
+  on_exceed: 'REJECT',
   queue_size: 100,
   queue_timeout_ms: 5000,
-  max_concurrent: 16,
-  interval: '0 0 * * * *',
+  max_concurrent: 100,
+  interval: '0 0 0 * * *',
   drain_interval_seconds: 15,
   timeout_ms: 15000,
   fail_threshold: 1,
@@ -126,7 +126,7 @@ async function onSubmit() {
         MaxConcurrent: Number(form.max_concurrent),
       },
       HealthProbe: {
-        Interval: form.interval || '0 0 * * * *',
+        Interval: form.interval || '0 0 0 * * *',
         DrainIntervalSeconds: Number(form.drain_interval_seconds),
         TimeoutMS: Number(form.timeout_ms),
         FailThreshold: Number(form.fail_threshold),
