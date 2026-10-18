@@ -111,7 +111,8 @@ func TestTokenCache_SafetyTTL(t *testing.T) {
 	}
 }
 
-// TestTokenCache_Disabled：关闭开关后 LookupByPlain 退回纯 DB 直查（每次各查一次）。
+// TestTokenCache_Disabled：关闭开关后 LookupByPlain 退回纯 DB 直查（每次各查一次）；
+// 且关闭时必须清空残留条目（否则该用例无法捕获「禁用不清空」缺陷——禁用后 get 本就 miss）。
 func TestTokenCache_Disabled(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
@@ -130,7 +131,15 @@ func TestTokenCache_Disabled(t *testing.T) {
 	}
 
 	svc := NewTokenService(NewTokenStore(db))
+	// 预置一条缓存项，令「禁用时清空」可被观测。
+	seedTokenCache(svc, hash, 1)
+	if got := svc.cache.count(); got != 1 {
+		t.Fatalf("前置缓存项应存在，got %d", got)
+	}
 	svc.SetTokenCacheEnabled(false)
+	if got := svc.cache.count(); got != 0 {
+		t.Fatalf("关闭缓存应清空残留条目（避免关闭期间残留旧值），got %d", got)
+	}
 	for i := 0; i < 2; i++ {
 		if _, err := svc.LookupByPlain(context.Background(), plain); err != nil {
 			t.Fatalf("lookup %d: %v", i, err)
