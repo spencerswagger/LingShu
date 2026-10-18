@@ -34,8 +34,12 @@ type SessionCostDecision struct {
 	TurnCostNew      float64
 	RechargeCost     float64
 	PaybackTurns     float64
-	RemainingTurns   int
-	Reason           string
+	// PaybackLimit 是与用量无关的经验阈值 = paybackLimit(旧渠道, 新渠道)：
+	// 即「(新输入价−新缓存读价)/(旧缓存读价−新缓存读价)」，刻画缓存读价差下单轮省钱的极限回本速度，
+	// 用于区分「受本轮用量影响的 PaybackTurns」与「理论回本上限」。起点（无旧渠道可比）无意义，置 0。
+	PaybackLimit   float64
+	RemainingTurns int
+	Reason         string
 }
 
 // remainingTurns 经验式剩余轮数：k 为已进行的轮数（或某种负载指标），
@@ -124,12 +128,14 @@ func crossCacheRead(ci, cj ChannelCost, newInputTokens, outputTokens int64) (flo
 func decideSessionCost(cfg SessionCostConfig, cur *ChannelCost, cand ChannelCost, cacheReadTokens, newInputTokens, outputTokens int64, k int) SessionCostDecision {
 	rem := remainingTurns(k, cfg)
 	if cur == nil {
-		// 起点：无旧渠道可比较，直接采用候选；重灌代价/回本均为 0。
+		// 起点：无旧渠道可比较，直接采用候选；重灌代价/回本均为 0；
+		// PaybackLimit（依赖旧渠道缓存读价）无意义，置 0。
 		return SessionCostDecision{
 			Switch:         true,
 			TurnCostNew:    perTurnCost(cand, cacheReadTokens, newInputTokens, outputTokens),
 			RechargeCost:   0,
 			PaybackTurns:   0,
+			PaybackLimit:   0,
 			RemainingTurns: rem,
 			Reason:         "起点（会话注册表未命中），直接择优采用候选渠道",
 		}
@@ -153,6 +159,7 @@ func decideSessionCost(cfg SessionCostConfig, cur *ChannelCost, cand ChannelCost
 		TurnCostNew:    perTurnCost(cand, cacheReadTokens, newInputTokens, outputTokens),
 		RechargeCost:   rechargeCost(cacheReadTokens, cand),
 		PaybackTurns:   pb,
+		PaybackLimit:   paybackLimit(*cur, cand),
 		RemainingTurns: rem,
 		Reason:         reason,
 	}

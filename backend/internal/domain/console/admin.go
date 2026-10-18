@@ -1439,7 +1439,6 @@ func (h *Admin) tokenNamesByIDs(ctx context.Context, ids []int64) map[int64]stri
 // 来源标签常量：面板所有值均显式标注来源，避免前端把「模型成本」与「售价/真实 token」混淆。
 const (
 	sourceModelCost      = "模型成本"
-	sourceRealTokens     = "真实 token"
 	sourceCurrentTime    = "当前时刻"
 	sourceContextTier    = "实际分档"
 	sourceCostSample     = "routing.cost_sample 默认样值（真实 token）"
@@ -1558,7 +1557,8 @@ func (h *Admin) sessionCostGlobalTimeConfig(ctx context.Context) (*billing.TimeC
 	return &tc, raw
 }
 
-// sessionCostGlobalTiers 读取全局上下文分档（billing.context_tiers）；缺失/非法返回 (nil, raw)。
+// sessionCostGlobalTiers 读取全局上下文分档（billing.context_tiers）；缺失（未装配/读取失败）返回 (nil, nil)，
+// 解析失败返回 (nil, raw)（原始 JSON 供前端展示），成功返回 (tiers, raw)。
 func (h *Admin) sessionCostGlobalTiers(ctx context.Context) ([]billing.TierRule, []byte) {
 	if h.billing == nil {
 		return nil, nil
@@ -1657,10 +1657,11 @@ func (h *Admin) externalModelID(ctx context.Context, name string) (int64, bool) 
 	return 0, false
 }
 
-// sessionCostEventView 单条会话成本决策产物的事件视图（含来源标签，PaybackTurns 为 NaN/Inf 时置 null）。
+// sessionCostEventView 单条会话成本决策产物的事件视图（含来源标签，PaybackTurns/PaybackLimit 为 NaN/Inf 时置 null）。
 type sessionCostEventView struct {
 	SessionID          string   `json:"SessionID"`
 	Turn               int      `json:"Turn"`
+	Shadow             bool     `json:"Shadow"`
 	Switch             bool     `json:"Switch"`
 	FromChannelKeyID   int64    `json:"FromChannelKeyID,string"`
 	ToChannelKeyID     int64    `json:"ToChannelKeyID,string"`
@@ -1668,6 +1669,7 @@ type sessionCostEventView struct {
 	TurnCostNew        float64  `json:"TurnCostNew"`
 	RechargeCost       float64  `json:"RechargeCost"`
 	PaybackTurns       *float64 `json:"PaybackTurns"`
+	PaybackLimit       *float64 `json:"PaybackLimit"`
 	RemainingTurns     int      `json:"RemainingTurns"`
 	Reason             string   `json:"Reason"`
 	CrossCacheRead     float64  `json:"CrossCacheRead"`
@@ -1782,6 +1784,7 @@ func toSessionCostEventView(ev router.SessionCostEvent) sessionCostEventView {
 	return sessionCostEventView{
 		SessionID:          ev.SessionID,
 		Turn:               ev.Turn,
+		Shadow:             ev.Shadow,
 		Switch:             d.Switch,
 		FromChannelKeyID:   d.FromChannelKeyID,
 		ToChannelKeyID:     d.ToChannelKeyID,
@@ -1789,6 +1792,7 @@ func toSessionCostEventView(ev router.SessionCostEvent) sessionCostEventView {
 		TurnCostNew:        d.TurnCostNew,
 		RechargeCost:       d.RechargeCost,
 		PaybackTurns:       finitePtr(d.PaybackTurns),
+		PaybackLimit:       finitePtr(d.PaybackLimit),
 		RemainingTurns:     d.RemainingTurns,
 		Reason:             d.Reason,
 		CrossCacheRead:     ev.CrossCacheRead,
