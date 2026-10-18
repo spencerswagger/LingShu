@@ -648,6 +648,13 @@ func expectGetByNameNoRows(mock sqlmock.Sqlmock, name string) {
 		WithArgs(name).WillReturnError(sql.ErrNoRows)
 }
 
+// expectAliasExistsForOtherNoRows 构造 AliasExistsForOther 的 mock 期望（无匹配 → 未被他人占用）。
+// validateAliases 对每个别名依次调用 GetByName 与 AliasExistsForOther，二者都需预置期望。
+func expectAliasExistsForOtherNoRows(mock sqlmock.Sqlmock, alias string, excludeID int64) {
+	mock.ExpectQuery(`SELECT 1 FROM external_models\s+WHERE deleted_at IS NULL AND id <> \$2 AND aliases @> to_jsonb\(ARRAY\[\$1::text\]\)\s+LIMIT 1`).
+		WithArgs(alias, excludeID).WillReturnError(sql.ErrNoRows)
+}
+
 func isBadRequest(err error) bool {
 	var apiErr *APIError
 	return errors.As(err, &apiErr) && apiErr.Code == resp.CodeBadRequest
@@ -780,6 +787,7 @@ func TestService_CreateModel_AliasValidate_AutoConflict(t *testing.T) {
 		return name == "auto-x", nil
 	})
 	expectGetByNameNoRows(mock, "auto-x")
+	expectAliasExistsForOtherNoRows(mock, "auto-x", 0)
 
 	_, err := s.CreateModel(context.Background(), ExternalModelInput{
 		ExternalName: "new-model", SaleRates: saleRates(), Aliases: []string{"auto-x"},
@@ -839,8 +847,9 @@ func TestService_UpdateModel_AliasInvalidate(t *testing.T) {
 
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + cols + ` FROM external_models WHERE id = $1`)).WithArgs(int64(1)).
 		WillReturnRows(extRow(&ExternalModel{ID: 1, ExternalName: "old", Enabled: true, Aliases: []string{"old-a"}, CreatedAt: now, UpdatedAt: now}, `{}`))
-	// validateAliases 逐个 GetByName 新别名。
+	// validateAliases 逐个 GetByName 新别名，并做别名↔别名互斥校验。
 	expectGetByNameNoRows(mock, "new-a")
+	expectAliasExistsForOtherNoRows(mock, "new-a", 1)
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE external_models SET external_name=$1, description=$2, enabled=$3, sale_rates=$4, time_config=$5, context_tiers=$6, aliases=$7, updated_at=now() WHERE id=$8`)).
 		WithArgs("old", "", true, sqlmock.AnyArg(), nil, nil, sqlmock.AnyArg(), int64(1)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
