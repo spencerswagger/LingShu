@@ -241,6 +241,19 @@ func normalizeEnabled(in *bool, def bool) bool {
 	return def
 }
 
+// checkExternalNameAliasCollision 校验对外名不得撞「其他」模型（id != selfID）的别名：
+// 扁平命名空间下 external_name 与 aliases 双向互斥。selfID=0 表示新建。
+func (s *Service) checkExternalNameAliasCollision(ctx context.Context, name string, selfID int64) error {
+	taken, err := s.store.AliasExistsForOther(ctx, name, selfID)
+	if err != nil {
+		return fmt.Errorf("check external name alias collision: %w", err)
+	}
+	if taken {
+		return errConflict("模型外部名已被其他对外模型的别名占用")
+	}
+	return nil
+}
+
 // CreateModel 创建对外模型：校验 + 别名命名空间 + 名称唯一 + 跨表重名（Auto）+ 入库。
 func (s *Service) CreateModel(ctx context.Context, in ExternalModelInput) (*ExternalModel, error) {
 	if err := s.validateInput(in); err != nil {
@@ -259,6 +272,10 @@ func (s *Service) CreateModel(ctx context.Context, in ExternalModelInput) (*Exte
 	}
 	// 跨表重名：对外模型名不得与任意 Auto 名冲突（与 automodel 侧对称）。
 	if err := s.checkAutoName(ctx, in.ExternalName); err != nil {
+		return nil, err
+	}
+	// 反向命名空间：对外名不得撞其他模型的别名（此前仅校验别名→external_name 单向，存在漏网）。
+	if err := s.checkExternalNameAliasCollision(ctx, in.ExternalName, 0); err != nil {
 		return nil, err
 	}
 
@@ -313,6 +330,10 @@ func (s *Service) UpdateModel(ctx context.Context, id int64, in ExternalModelInp
 		}
 		// 跨表重名：改名后不得与任意 Auto 名冲突。
 		if err := s.checkAutoName(ctx, in.ExternalName); err != nil {
+			return nil, err
+		}
+		// 反向命名空间：改名后不得撞其他模型的别名。
+		if err := s.checkExternalNameAliasCollision(ctx, in.ExternalName, id); err != nil {
 			return nil, err
 		}
 	}

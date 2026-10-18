@@ -69,6 +69,8 @@ func TestService_CreateModel(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + cols + ` FROM external_models WHERE external_name = $1`)).
 		WithArgs("qw-max").
 		WillReturnError(sql.ErrNoRows)
+	// 反向命名空间：对外名未撞他人别名。
+	expectAliasOtherNone(mock, "qw-max", 0)
 	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO external_models(id, external_name, description, enabled, sale_rates, time_config, context_tiers, aliases) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING `+cols)).
 		WithArgs(sqlmock.AnyArg(), "qw-max", "", true, sqlmock.AnyArg(), nil, nil, sqlmock.AnyArg()).
 		WillReturnRows(extRow(&ExternalModel{ID: 1, ExternalName: "qw-max", Enabled: true, CreatedAt: now, UpdatedAt: now}, `{"input":1}`))
@@ -350,6 +352,7 @@ func TestService_NameWriteHookFired(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + cols + ` FROM external_models WHERE external_name = $1`)).
 		WithArgs("qw-max").
 		WillReturnError(sql.ErrNoRows)
+	expectAliasOtherNone(mock, "qw-max", 0)
 	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO external_models(id, external_name, description, enabled, sale_rates, time_config, context_tiers, aliases) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING `+cols)).
 		WithArgs(sqlmock.AnyArg(), "qw-max", "", true, sqlmock.AnyArg(), nil, nil, sqlmock.AnyArg()).
 		WillReturnRows(extRow(&ExternalModel{ID: 1, ExternalName: "qw-max", Enabled: true, CreatedAt: now, UpdatedAt: now}, `{"input":1}`))
@@ -801,6 +804,51 @@ func TestService_CreateModel_AliasValidate_AutoConflict(t *testing.T) {
 	}
 }
 
+// TestService_CreateModel_ExternalNameAliasCollision（反向命名空间）对外名撞其他模型的别名 → 409。
+// 此前仅校验「别名 → external_name」，缺「external_name → 别名」方向，导致重名漏网。
+func TestService_CreateModel_ExternalNameAliasCollision(t *testing.T) {
+	s, mock := mockService(t)
+	expectGetByNameNoRows(mock, "cc-alias")
+	mock.ExpectQuery(regexp.QuoteMeta(aliasOtherQuery)).
+		WithArgs("cc-alias", int64(0)).
+		WillReturnRows(sqlmock.NewRows([]string{"1"}).AddRow(1))
+
+	_, err := s.CreateModel(context.Background(), ExternalModelInput{
+		ExternalName: "cc-alias", SaleRates: saleRates(),
+	})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != resp.CodeConflict {
+		t.Fatalf("对外名撞其他模型别名应 409，got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("mock expectations: %v", err)
+	}
+}
+
+// TestService_UpdateModel_ExternalNameAliasCollision（反向命名空间）改名撞其他模型的别名 → 409。
+func TestService_UpdateModel_ExternalNameAliasCollision(t *testing.T) {
+	s, mock := mockService(t)
+	now := time.Now()
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + cols + ` FROM external_models WHERE id = $1`)).
+		WithArgs(int64(1)).
+		WillReturnRows(extRow(&ExternalModel{ID: 1, ExternalName: "old", Enabled: true, CreatedAt: now, UpdatedAt: now}, `{}`))
+	expectGetByNameNoRows(mock, "cc-alias")
+	mock.ExpectQuery(regexp.QuoteMeta(aliasOtherQuery)).
+		WithArgs("cc-alias", int64(1)).
+		WillReturnRows(sqlmock.NewRows([]string{"1"}).AddRow(1))
+
+	_, err := s.UpdateModel(context.Background(), 1, ExternalModelInput{
+		ExternalName: "cc-alias", SaleRates: saleRates(),
+	})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != resp.CodeConflict {
+		t.Fatalf("改名撞其他模型别名应 409，got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("mock expectations: %v", err)
+	}
+}
+
 // TestStore_Insert_AliasInvalidate（Step 5）新增后别名键须逐个失效（避免旧负缓存滞留）。
 func TestStore_Insert_AliasInvalidate(t *testing.T) {
 	s, mock := mockService(t)
@@ -808,7 +856,7 @@ func TestStore_Insert_AliasInvalidate(t *testing.T) {
 	// 预置别名与规范名的负缓存。
 	s.store.cacheExternalName("cc-1", nil, s.store.extNameCache.Generation())
 	s.store.cacheExternalName("real", nil, s.store.extNameCache.Generation())
-	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO external_models(id, external_name, description, enabled, sale_rates, time_config, context_tiers, aliases) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING ` + cols)).
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO external_models(id, external_name, description, enabled, sale_rates, time_config, context_tiers, aliases) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING `+cols)).
 		WithArgs(sqlmock.AnyArg(), "real", "", true, sqlmock.AnyArg(), nil, nil, sqlmock.AnyArg()).
 		WillReturnRows(extRow(&ExternalModel{ID: 1, ExternalName: "real", Enabled: true, Aliases: []string{"cc-1"}, CreatedAt: now, UpdatedAt: now}, `{"input":1}`))
 
@@ -875,9 +923,9 @@ func TestService_UpdateModel_AliasInvalidate(t *testing.T) {
 }
 
 // TestStore_GetByExternalName_AliasResolve（Step 6）表驱动锁定别名解析语义与即时失效：
-//  1) 按别名命中正确模型；
-//  2) 未变更请求命中缓存 → 零 DB；
-//  3) 改名/删别名（写路径失效）后按旧别名不再命中，且无陈旧正缓存残留。
+//  1. 按别名命中正确模型；
+//  2. 未变更请求命中缓存 → 零 DB；
+//  3. 改名/删别名（写路径失效）后按旧别名不再命中，且无陈旧正缓存残留。
 func TestStore_GetByExternalName_AliasResolve(t *testing.T) {
 	now := time.Now()
 

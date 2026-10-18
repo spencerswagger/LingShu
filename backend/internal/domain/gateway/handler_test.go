@@ -2295,7 +2295,7 @@ func TestStreamDelivered_ConnectFailureFailsOver(t *testing.T) {
 }
 
 // Step 9：流式「已送达」——请求送达后失败（delivered=true）→ 回 502 且不转移
-//（即便仍有候选）；结构化日志与调用日志均带 delivered=true。
+// （即便仍有候选）；结构化日志与调用日志均带 delivered=true。
 func TestStreamDelivered_AfterDeliveredNoFailover(t *testing.T) {
 	live := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")

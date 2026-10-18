@@ -114,7 +114,8 @@ func (f *toolSchemaNormalizeFeature) RewriteRequest(req *UpstreamRequest) error 
 	return nil
 }
 
-// schemaValid 判断工具 schema 是否为可用的非空 JSON 对象（缺失/null/非对象/空对象均视为非法）。
+// schemaValid 判断工具 schema 是否为合法 JSON 对象（缺失/null/非对象视为非法）。
+// 空对象 `{}` 视为**合法**：工具显式声明无入参时不得被注入内置 schema（否则会带上 required query）。
 func schemaValid(raw json.RawMessage) bool {
 	t := bytes.TrimSpace(raw)
 	if len(t) == 0 || bytes.Equal(t, []byte("null")) {
@@ -124,5 +125,5 @@ func schemaValid(raw json.RawMessage) bool {
 	if json.Unmarshal(t, &obj) != nil {
 		return false
 	}
-	return len(obj) > 0
+	return true
 }
