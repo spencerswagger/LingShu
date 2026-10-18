@@ -829,7 +829,7 @@ func TestOrderCandidates_PriorityCostLoadThenID(t *testing.T) {
 		{id: 4, keyID: 44, modelRow: 401, priority: 50, costRates: rates(0.1)}, // 低优先级层（即便最便宜也最后）
 	}
 	sample, globalTC := e.costContext()
-	got := e.orderCandidates(cands, time.Now(), sample, globalTC)
+	got := e.orderCandidates(cands, time.Now(), sample, globalTC, nil)
 	want := []int64{2, 3, 1, 4}
 	for i := range want {
 		if got[i].id != want[i] {
