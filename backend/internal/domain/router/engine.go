@@ -20,9 +20,10 @@
 //     渠道/模型行/密钥 ID 升序兜底；并发会话上限由网关在会话创建时校验；
 //  7. 候选为空 → ErrNoAvailable。
 //
-// 「当前成本」= 样值用量代入 channel_models.cost_rates 求和 × 当前时段系数：
-// 样值来自全局配置 routing.cost_sample；时段系数取候选模型级 time_config，
-// 为空回落全局 billing.time_config；上下文分档系数恒按 1（不参与比较）。
+// 「当前成本」= 样值用量代入 channel_models.cost_rates 求和 × 当前时段系数 × 上下文分档系数：
+// 样值默认来自全局配置 routing.cost_sample，RouteSpec.Sample 非空时以本轮样值覆盖；
+// 时段系数取候选模型级 time_config，为空回落全局 billing.time_config；
+// 上下文分档系数按 input+cache_read 落在分档上取候选模型级 context_tiers，为空回落全局 billing.context_tiers。
 // cost_rates 缺失/三段全 0 视为「成本未知」，排在有有效成本候选之后。
 // 渠道 weight 已废弃，不再参与任何路由选择。
 package router
@@ -49,6 +50,9 @@ type RouteSpec struct {
 	TagKV         map[string]string // 已解析的令牌标签 KV；无标签时 nil
 	TagID         *int64            // 用于日志
 	SessionKey    string            // token_id + model + x-session-id；空则不启用亲和
+	// Sample 本轮请求的三段 token 样值；非 nil 时用于成本比较（覆盖全局 routing.cost_sample），
+	// nil 时回落全局样值。零值（&billing.Usage{}）亦为显式样值，与 nil 语义不同。
+	Sample *billing.Usage
 }
 
 // RouteResult 描述一次路由结果。
@@ -145,6 +149,8 @@ type CostConfig interface {
 	SampleUsage() (billing.Usage, error)
 	// TimeConfig 返回全局时段配置（billing.time_config），供候选模型级 time_config 为空时回落。
 	TimeConfig() (billing.TimeCoeffConfig, error)
+	// ContextTiers 返回全局上下文分档（billing.context_tiers），供候选模型级 context_tiers 为空时回落。
+	ContextTiers() ([]billing.TierRule, error)
 }
 
 // defaultCostSample 内置默认样值用量（与 seeding 默认一致：输入 10000、缓存读 9000、输出 1000）。
@@ -209,15 +215,16 @@ func (e *Engine) CostSample() billing.Usage {
 
 // candidate 是路由候选的运行时视图（候选 = (渠道, 密钥, 模型) 三元组）。
 type candidate struct {
-	id        int64
-	keyID     int64
-	modelRow  int64
-	internal  string
-	boundTags []channel.TagRef
-	priority  int
-	revision  int64
-	costRates billing.Rates            // 该内部模型行的成本单价（缺失=成本未知）
-	timeCfg   *billing.TimeCoeffConfig // 模型级时段系数（nil=回落全局）
+	id           int64
+	keyID        int64
+	modelRow     int64
+	internal     string
+	boundTags    []channel.TagRef
+	priority     int
+	revision     int64
+	costRates    billing.Rates            // 该内部模型行的成本单价（缺失=成本未知）
+	timeCfg      *billing.TimeCoeffConfig // 模型级时段系数（nil=回落全局）
+	contextTiers []billing.TierRule       // 模型级上下文分档（空=回落全局）
 	// 择序时回填的成本标量 / 时段系数（OQ-3：随候选携带至决策轨迹）。
 	cost      float64
 	costKnown bool
@@ -299,7 +306,7 @@ func (e *Engine) collectCandidates(ctx context.Context, spec RouteSpec) ([]candi
 	for _, cm := range cms {
 		internalByChannel[cm.ChannelID] = append(internalByChannel[cm.ChannelID],
 			internalBinding{internal: cm.InternalModelID, rowID: cm.ID,
-				costRates: cm.CostRates, timeCfg: cm.TimeConfig})
+				costRates: cm.CostRates, timeCfg: cm.TimeConfig, contextTiers: cm.ContextTiers})
 	}
 
 	cands := e.usableCandidates(internalByChannel)
@@ -327,6 +334,10 @@ func (e *Engine) collectCandidates(ctx context.Context, spec RouteSpec) ([]candi
 	// 避免同渠道多密钥共享会话时轮询切到非归属密钥。
 	now := e.now()
 	sample, globalTC := e.costContext()
+	if spec.Sample != nil {
+		sample = *spec.Sample // 本轮样值覆盖全局 routing.cost_sample
+	}
+	globalTiers := e.contextTiers()
 	normal := make([]candidate, 0, len(cands))
 	var sessionCand *candidate
 	for i := range cands {
@@ -335,7 +346,7 @@ func (e *Engine) collectCandidates(ctx context.Context, spec RouteSpec) ([]candi
 			if e.sess.Hit(spec.SessionKey) {
 				if s, ok := e.sess.Lookup(spec.SessionKey); ok &&
 					s.ChannelKeyID == c.keyID && s.InternalModelID == c.internal {
-					e.fillCost(&cands[i], sample, globalTC, now)
+					e.fillCost(&cands[i], sample, globalTC, now, globalTiers)
 					sessionCand = &cands[i]
 					continue
 				}
@@ -345,7 +356,7 @@ func (e *Engine) collectCandidates(ctx context.Context, spec RouteSpec) ([]candi
 			normal = append(normal, c)
 		}
 	}
-	ordered := e.orderCandidates(normal, now, sample, globalTC)
+	ordered := e.orderCandidates(normal, now, sample, globalTC, globalTiers)
 	if sessionCand != nil {
 		return append([]candidate{*sessionCand}, ordered...), ext.ID, nil
 	}
@@ -357,10 +368,11 @@ func (e *Engine) collectCandidates(ctx context.Context, spec RouteSpec) ([]candi
 
 // internalBinding 某渠道的一条内部模型绑定（同一对外模型下同渠道/密钥可有多个内部模型，各为独立候选）。
 type internalBinding struct {
-	internal  string
-	rowID     int64                    // channel_models 行 ID（状态机回喂与模型级限流定位用）
-	costRates billing.Rates            // 该行成本单价
-	timeCfg   *billing.TimeCoeffConfig // 该行模型级时段配置
+	internal     string
+	rowID        int64                    // channel_models 行 ID（状态机回喂与模型级限流定位用）
+	costRates    billing.Rates            // 该行成本单价
+	timeCfg      *billing.TimeCoeffConfig // 该行模型级时段配置
+	contextTiers []billing.TierRule       // 该行模型级上下文分档
 }
 
 // usableCandidates 返回「密钥非禁用」的候选，按内部模型行逐条展开
@@ -413,17 +425,18 @@ func (e *Engine) usableCandidates(internalByChannel map[int64][]internalBinding)
 					continue
 				}
 				cands = append(cands, candidate{
-					id:        v.ID,
-					keyID:     keyID,
-					modelRow:  modelRowID,
-					internal:  b.internal,
-					boundTags: v.BoundTags,
-					priority:  v.Priority,
-					revision:  v.UpdatedAt.UnixNano(),
-					costRates: b.costRates,
-					timeCfg:   b.timeCfg,
-					mState:    mState,
-					keyState:  kr.Machine.State(),
+					id:           v.ID,
+					keyID:        keyID,
+					modelRow:     modelRowID,
+					internal:     b.internal,
+					boundTags:    v.BoundTags,
+					priority:     v.Priority,
+					revision:     v.UpdatedAt.UnixNano(),
+					costRates:    b.costRates,
+					timeCfg:      b.timeCfg,
+					contextTiers: b.contextTiers,
+					mState:       mState,
+					keyState:     kr.Machine.State(),
 				})
 			}
 		}
@@ -445,16 +458,18 @@ type scoredCandidate struct {
 //   - 成本并列（或均缺失）时存活会话数更少者优先；
 //   - 再并列按 渠道 ID、模型行 ID、密钥 ID 升序兜底，保证结果确定（无随机）。
 //
-// 成本标量 = 样值用量代入 cost_rates 求和 × 当前时段系数（分档系数恒为 1）。
-// 全局样值与全局时段由 collectCandidates 只读一次并传入，逐候选仅做纯计算，不产生额外 IO。
-func (e *Engine) orderCandidates(cands []candidate, now time.Time, sample billing.Usage, globalTC *billing.TimeCoeffConfig) []candidate {
+// 成本标量 = 样值用量代入 cost_rates 求和 × 当前时段系数 × 上下文分档系数。
+// 样值、全局时段与全局分档由 collectCandidates 只读一次并传入，逐候选仅做纯计算，不产生额外 IO。
+// globalTiers 为可选透传参数（collectCandidates 传入本轮读到的全局分档）；未传或为空时按无分档（系数 1）处理。
+func (e *Engine) orderCandidates(cands []candidate, now time.Time, sample billing.Usage, globalTC *billing.TimeCoeffConfig, globalTiers ...[]billing.TierRule) []candidate {
 	if len(cands) == 0 {
 		return cands
 	}
+	tiers := pickTiers(globalTiers)
 	scored := make([]scoredCandidate, len(cands))
 	for i := range cands {
 		c := cands[i]
-		e.fillCost(&c, sample, globalTC, now)
+		e.fillCost(&c, sample, globalTC, now, tiers)
 		scored[i] = scoredCandidate{c: c, cost: c.cost, known: c.costKnown, load: e.sess.CountActive(c.keyID)}
 	}
 	sort.SliceStable(scored, func(i, j int) bool {
@@ -486,14 +501,24 @@ func (e *Engine) orderCandidates(cands []candidate, now time.Time, sample billin
 	return out
 }
 
-// fillCost 计算候选当前的时段系数与成本标量，并回填到候选字段
+// fillCost 计算候选当前的时段系数、上下文分档系数与成本标量，并回填到候选字段
 // （OQ-3：随候选携带至网关决策轨迹，便于排查「为何选中该渠道」）。
-func (e *Engine) fillCost(c *candidate, sample billing.Usage, globalTC *billing.TimeCoeffConfig, now time.Time) {
+// globalTiers 为可选透传参数（collectCandidates 传入本轮全局分档）；未传或为空时按无分档（系数 1）处理。
+func (e *Engine) fillCost(c *candidate, sample billing.Usage, globalTC *billing.TimeCoeffConfig, now time.Time, globalTiers ...[]billing.TierRule) {
 	tc := resolveTimeCoeff(c.timeCfg, globalTC, now)
-	cost, known := costScalar(sample, c.costRates, tc)
+	ctxCoeff := resolveCtxCoeff(c.contextTiers, pickTiers(globalTiers), sample)
+	cost, known := costScalar(sample, c.costRates, tc, ctxCoeff)
 	c.timeCoeff = tc
 	c.cost = cost
 	c.costKnown = known
+}
+
+// pickTiers 从可选透传的分档参数中取出全局分档；未传时返回 nil（视为无分档）。
+func pickTiers(globalTiers [][]billing.TierRule) []billing.TierRule {
+	if len(globalTiers) == 0 {
+		return nil
+	}
+	return globalTiers[0]
 }
 
 // costContext 读取一次全局成本参数（样值 + 全局时段），供本轮候选比较复用；
@@ -517,6 +542,20 @@ func (e *Engine) costContext() (billing.Usage, *billing.TimeCoeffConfig) {
 	return sample, globalTC
 }
 
+// contextTiers 读取一次全局上下文分档（billing.context_tiers），供本轮候选比较复用；
+// 未注入配置或读取失败时返回 nil（视为无分档，系数 1）并记录日志（不阻断路由）。
+func (e *Engine) contextTiers() []billing.TierRule {
+	if e.costCfg == nil {
+		return nil
+	}
+	tiers, err := e.costCfg.ContextTiers()
+	if err != nil {
+		slog.Default().Warn("全局上下文分档读取失败，分档系数按 1 处理", "err", err)
+		return nil
+	}
+	return tiers
+}
+
 // resolveTimeCoeff 求候选当前时段系数：模型级 time_config 优先，为空回落全局；均无则 1；
 // 解析失败回落 1 并记录日志（不阻断路由）。
 func resolveTimeCoeff(modelTC, globalTC *billing.TimeCoeffConfig, now time.Time) float64 {
@@ -535,14 +574,33 @@ func resolveTimeCoeff(modelTC, globalTC *billing.TimeCoeffConfig, now time.Time)
 	return v
 }
 
-// costScalar 计算候选成本标量 = sumRates(sample, rates) × 时段系数（分档系数恒为 1）。
+// resolveCtxCoeff 求候选当前上下文分档系数：tiers 取模型级（len>0）否则全局；均为空则 1；
+// 分档口径为 ContextTierCoeff(sample.Input+sample.CacheRead, tiers)（含缓存读，与计费一致）；
+// 解析失败回落 1 并记录日志（不阻断路由）。
+func resolveCtxCoeff(modelTiers, globalTiers []billing.TierRule, sample billing.Usage) float64 {
+	tiers := modelTiers
+	if len(tiers) == 0 {
+		tiers = globalTiers
+	}
+	if len(tiers) == 0 {
+		return 1
+	}
+	v, err := billing.ContextTierCoeff(sample.Input+sample.CacheRead, tiers)
+	if err != nil {
+		slog.Default().Warn("上下文分档系数解析失败，按 1 处理", "err", err)
+		return 1
+	}
+	return v
+}
+
+// costScalar 计算候选成本标量 = sumRates(sample, rates) × 时段系数 × 上下文分档系数。
 // 返回 (标量, 是否有效)；cost_rates 缺失/全 0、或单价表不合法（缺键/负值）时返回 (0, false)，
 // 由调用方按「成本未知（最贵）」处理。
-func costScalar(sample billing.Usage, rates billing.Rates, timeCoeff float64) (float64, bool) {
+func costScalar(sample billing.Usage, rates billing.Rates, timeCoeff, ctxCoeff float64) (float64, bool) {
 	if !hasValidCost(rates) {
 		return 0, false
 	}
-	total, err := billing.RawTotal(sample, rates, timeCoeff, 1)
+	total, err := billing.RawTotal(sample, rates, timeCoeff, ctxCoeff)
 	if err != nil {
 		return 0, false
 	}

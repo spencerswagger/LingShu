@@ -125,6 +125,11 @@ func (f *fakeCostConfig) TimeConfig() (billing.TimeCoeffConfig, error) {
 	return *f.globalTC, nil
 }
 
+// ContextTiers 满足扩展后的 CostConfig 接口（本用例不注入全局分档，返回 nil, nil）。
+func (f *fakeCostConfig) ContextTiers() ([]billing.TierRule, error) {
+	return nil, nil
+}
+
 // attachTo 在会话注册表上直接建立一条绑定 (keyID, internal) 的存活会话（用于构造存活会话数场景）。
 func attachTo(t *testing.T, r *SessionRegistry, id string, keyID int64, internal string) {
 	t.Helper()
