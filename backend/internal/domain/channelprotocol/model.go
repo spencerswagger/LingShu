@@ -103,6 +103,54 @@ type ModelGateway struct {
 	ContextTiers    []billing.TierRule       `json:"contextTiers,omitempty"`
 }
 
+// 错误策略的生效范围。
+const (
+	ErrorScopeChannel = "channel" // 整渠道生效
+	ErrorScopeModels  = "models"  // 仅对 ModelIDs 指定的模型生效
+)
+
+// 错误命中后的处置动作。
+const (
+	ErrorActionNone    = "none"    // 不额外动作
+	ErrorActionDrain   = "drain"   // 排空
+	ErrorActionDisable = "disable" // 禁用
+)
+
+// ErrorPolicy 协议级错误策略：对「命中签名」的错误按 Disposition 处置。
+// 未配置任何策略（空列表）时保持改造前行为（默认安全态）。
+type ErrorPolicy struct {
+	// Scope 生效范围：channel=整渠道；models=仅对 ModelIDs 生效。
+	Scope string `json:"scope"`
+	// ModelIDs scope=models 时生效的内部模型（channel_models 行）ID 列表。
+	ModelIDs []int64 `json:"modelIds,omitempty"`
+	// Match 错误签名（status + code/type/message）。
+	Match ErrorMatch `json:"match"`
+	// Disposition 命中后的处置。
+	Disposition ErrorDisposition `json:"disposition"`
+	// Note 备注（可读说明，不参与匹配）。
+	Note string `json:"note,omitempty"`
+}
+
+// ErrorMatch 错误签名：各字段为约束，空/零值表示不约束该维度。
+type ErrorMatch struct {
+	Status       int    `json:"status,omitempty"`
+	ErrorType    string `json:"errorType,omitempty"`
+	ErrorCode    string `json:"errorCode,omitempty"`
+	MessageRegex string `json:"messageRegex,omitempty"`
+}
+
+// ErrorDisposition 命中错误后的处置：
+//   - CountIntoHealth：是否计入渠道健康错误率/429 与鉴权计数（false=完全不影响熔断）；
+//   - Failover：是否 failover（*bool 区分「未设置=沿用现状」与「显式 false=不转移」）；
+//   - Action：none|drain|disable；
+//   - DownstreamStatus：命中后替代默认 502 的下游状态码（0=沿用默认）。
+type ErrorDisposition struct {
+	CountIntoHealth  bool   `json:"countIntoHealth"`
+	Failover         *bool  `json:"failover,omitempty"`
+	Action           string `json:"action,omitempty"`
+	DownstreamStatus int    `json:"downstreamStatus,omitempty"`
+}
+
 // ChannelProtocol 对应 channel_protocols 表一行。
 type ChannelProtocol struct {
 	ID             int64                   `json:"ID,string"`
@@ -111,11 +159,13 @@ type ChannelProtocol struct {
 	Protocols      Protocols               `json:"Protocols"`
 	RequestHeaders HeaderPolicy            `json:"RequestHeaders"`
 	Models         map[string]ModelGateway `json:"Models"`
-	PresetSourceID string                  `json:"PresetSourceID"`
-	Edited         bool                    `json:"Edited"`
-	SourceStatus   string                  `json:"SourceStatus"`
-	CreatedAt      time.Time               `json:"CreatedAt,omitempty"`
-	UpdatedAt      time.Time               `json:"UpdatedAt,omitempty"`
+	// ErrorPolicy 协议级错误策略（空=未配置，行为与改造前一致）。
+	ErrorPolicy    []ErrorPolicy `json:"errorPolicy"`
+	PresetSourceID string        `json:"PresetSourceID"`
+	Edited         bool          `json:"Edited"`
+	SourceStatus   string        `json:"SourceStatus"`
+	CreatedAt      time.Time     `json:"CreatedAt,omitempty"`
+	UpdatedAt      time.Time     `json:"UpdatedAt,omitempty"`
 }
 
 // EffectiveBaseURL 返回某基础协议的有效 baseURL：协议级 baseUrl 优先，回落渠道协议级 base_url。

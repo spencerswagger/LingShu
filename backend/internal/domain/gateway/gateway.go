@@ -34,7 +34,14 @@ type ChannelResolver interface {
 	GetKeyRuntime(keyID int64) (*channel.KeyRuntime, bool)
 	GetModelRuntime(channelID, modelRowID int64) (*channel.ModelRuntime, bool)
 	FeedResult(keyID int64, modelRowID int64, f channel.Feedback)
+	// FeedResultGated 回喂结果并带「是否计入健康」门控：countIntoHealth=false 完全不影响熔断。
+	FeedResultGated(keyID int64, modelRowID int64, f channel.Feedback, countIntoHealth bool)
 	KeyMaxSessions(keyID int64) int
+	// ManualSetKeyState 手动切换密钥状态（action ∈ normal/drain/disable/recover）；
+	// 供协议级错误策略按动作(drain|disable)处置。
+	ManualSetKeyState(keyID int64, action string) error
+	// ManualSetModelState 手动设置内部模型状态；供协议级错误策略按动作(drain|disable)处置。
+	ManualSetModelState(channelID, modelRowID int64, st channel.State) error
 	// DisableChannel 将渠道及其全部密钥置为禁用（AC-17：上游 usage 缺失/无法解析时）。
 	DisableChannel(channelID int64)
 }
@@ -63,6 +70,18 @@ type ModelResolver interface {
 // 计费按 cost 模式时需取选中渠道的成本定价与模型级时段/分档。
 type ChannelModelResolver interface {
 	GetByChannelAndInternal(ctx context.Context, channelID int64, internalModelID string) (*channel.ChannelModel, error)
+}
+
+// ProtocolResolver 渠道协议查询抽象（channelprotocol.Store 满足）。
+// 网关据此读取协议级错误策略（error_policy）等协议配置；nil=未装配（错误策略不生效，默认安全态）。
+type ProtocolResolver interface {
+	GetByID(ctx context.Context, id int64) (*channelprotocol.ChannelProtocol, error)
+}
+
+// ProtocolErrorStatsRecorder 协议级错误统计写入抽象（channelprotocol.Store 满足）。
+// 网关在命中错误策略时按错误类别累加当日计数；nil=未装配（不记统计，行为不变）。
+type ProtocolErrorStatsRecorder interface {
+	IncrProtocolErrorStat(ctx context.Context, protocolID int64, category string, day time.Time) error
 }
 
 // TagKVResolver 由令牌 TagID 解析其 KV 标签集合（装配层用 tag.Service 实现）。
@@ -108,6 +127,8 @@ type Gateway struct {
 	callLogs        CallLogStore // 调用日志写入（nil=不采集，单测安全）
 	models          ModelResolver
 	channelModels   ChannelModelResolver
+	protocols       ProtocolResolver           // 渠道协议查询（读协议级错误策略）；nil=未装配
+	protocolStats   ProtocolErrorStatsRecorder // 协议级错误统计写入；nil=未装配
 	tagKV           TagKVResolver
 	auto            AutoResolver // Auto 模型解析（nil=不启用 Auto；未命中时零行为差异）
 	pricing         PricingModeResolver
@@ -135,7 +156,11 @@ type GatewayConfig struct {
 	Billing       BillingRecorder
 	Models        ModelResolver
 	ChannelModels ChannelModelResolver
-	TagKV         TagKVResolver
+	// Protocols 可选：渠道协议查询（读协议级错误策略）。nil=未装配（错误策略不生效）。
+	Protocols ProtocolResolver
+	// ProtocolErrorStats 可选：协议级错误统计写入（命中策略时累加）。nil=未装配（不记统计）。
+	ProtocolErrorStats ProtocolErrorStatsRecorder
+	TagKV              TagKVResolver
 	// Auto 可选：Auto 模型解析（nil 时不启用 Auto，请求名一律按普通对外模型处理）。
 	Auto    AutoResolver
 	Pricing PricingModeResolver
@@ -202,6 +227,8 @@ func NewGateway(cfg GatewayConfig) *Gateway {
 		billing:             cfg.Billing,
 		models:              cfg.Models,
 		channelModels:       cfg.ChannelModels,
+		protocols:           cfg.Protocols,
+		protocolStats:       cfg.ProtocolErrorStats,
 		tagKV:               cfg.TagKV,
 		auto:                cfg.Auto,
 		pricing:             cfg.Pricing,

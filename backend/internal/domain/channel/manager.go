@@ -1174,6 +1174,17 @@ func (m *Manager) feedAndTransit(keyID int64, modelRowID int64, fb Feedback) {
 // FeedResult 供网关调用后回喂结果：一次真实调用同时驱动密钥与内部模型状态机。
 // 首参为 channel_key_id（密钥=运行时实体），模型为渠道配置实体的模型级回喂（双回喂保持）。
 func (m *Manager) FeedResult(keyID int64, modelRowID int64, fb Feedback) {
+	m.FeedResultGated(keyID, modelRowID, fb, true)
+}
+
+// FeedResultGated 回喂结果并带「是否计入健康」门控。
+// countIntoHealth=true 等价于 FeedResult（默认既有行为）；
+// countIntoHealth=false 时既不写入窗口样本，也不计 429/鉴权计数——即完全不影响熔断，
+// 供协议级错误策略显式声明「该错误不计入渠道健康」时使用。
+func (m *Manager) FeedResultGated(keyID int64, modelRowID int64, fb Feedback, countIntoHealth bool) {
+	if !countIntoHealth {
+		return
+	}
 	m.feedAndTransit(keyID, modelRowID, fb)
 }
 

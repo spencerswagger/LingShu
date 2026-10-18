@@ -1045,29 +1045,31 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 			"error", upErr, "failed", errMsg, msSince(start), nil, g.callLogDecision(attempts, "上游鉴权失败", pc, routeRes))
 		return &fwdOutcome{retry: true}
 	default:
-		g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, feedbackFail(start))
 		upErr := readUpstreamErrBody(up)
 		errMsg := upstreamErrDetail(up.StatusCode, upErr)
 		param, etype, ecode, summary := upstreamErrParts(upErr)
-		retryable := retryableUpstreamStatus(up.StatusCode)
+		// 协议级错误策略：命中则按其处置（是否计入健康 / 是否 failover / 动作 / 下游状态码），
+		// 未命中保持改造前行为（默认安全态）。非流式与流式共用同一决策函数，语义一致。
+		pol := g.applyErrorPolicy(rt, routeRes, up.StatusCode, etype, ecode, summary)
+		g.channels.FeedResultGated(routeRes.ChannelKeyID, routeRes.ModelRowID, feedbackFail(start), pol.countIntoHealth)
 		lvl := slog.LevelWarn
-		if !retryable {
+		if !pol.failover {
 			lvl = slog.LevelError // 已直接返回下游的失败，属用户可见异常
 		}
 		g.logUpstreamErr(ctx, lvl, "upstream error response", endpoint, ureq.Protocol, model, token, routeRes,
 			diagFromRequest(req, ureq.Protocol, ureq.Cred),
 			errInfo{kind: "upstream_status", stage: stage, status: up.StatusCode, attempt: attempt,
-				retry: retryable,
+				retry: pol.failover,
 				param: param, errType: etype, errCode: ecode, summary: summary,
 				reason: errMsg, sessionID: sessionID, durationMs: *msSince(start)})
 		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, errMsg, msSince(start))
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
 			"error", upErr, "failed", errMsg, msSince(start), nil, g.callLogDecision(attempts, errMsg, pc, routeRes))
-		if retryableUpstreamStatus(up.StatusCode) {
+		if pol.failover {
 			return &fwdOutcome{retry: true}
 		}
-		writeOpenAIError(w, http.StatusBadGateway, msgUpstreamDown)
-		return &fwdOutcome{responded: true, refundPre: true, downstreamStatus: http.StatusBadGateway}
+		writeOpenAIError(w, pol.downstreamStatus, msgUpstreamDown)
+		return &fwdOutcome{responded: true, refundPre: true, downstreamStatus: pol.downstreamStatus}
 	}
 }
 
@@ -1287,29 +1289,31 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 			"error", upErr, "failed", errMsg, msSince(start), nil, g.callLogDecision(attempts, "上游鉴权失败", pc, routeRes))
 		return &fwdOutcome{retry: true}
 	default:
-		g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, feedbackFail(start))
 		upErr := readUpstreamErrBody(up)
 		errMsg := upstreamErrDetail(up.StatusCode, upErr)
 		param, etype, ecode, summary := upstreamErrParts(upErr)
-		retryable := retryableUpstreamStatus(up.StatusCode)
+		// 协议级错误策略：命中则按其处置（是否计入健康 / 是否 failover / 动作 / 下游状态码），
+		// 未命中保持改造前行为（默认安全态）。与 serveNonStream 共用同一决策函数，语义一致。
+		pol := g.applyErrorPolicy(rt, routeRes, up.StatusCode, etype, ecode, summary)
+		g.channels.FeedResultGated(routeRes.ChannelKeyID, routeRes.ModelRowID, feedbackFail(start), pol.countIntoHealth)
 		lvl := slog.LevelWarn
-		if !retryable {
+		if !pol.failover {
 			lvl = slog.LevelError // 已直接返回下游的失败，属用户可见异常
 		}
 		g.logUpstreamErr(ctx, lvl, "upstream error response", endpoint, ureq.Protocol, model, token, routeRes,
 			diagFromRequest(req, ureq.Protocol, ureq.Cred),
 			errInfo{kind: "upstream_status", stage: stage, status: up.StatusCode, attempt: attempt,
-				retry: retryable,
+				retry: pol.failover,
 				param: param, errType: etype, errCode: ecode, summary: summary,
 				reason: errMsg, sessionID: sessionID, durationMs: *msSince(start)})
 		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, errMsg, msSince(start))
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
 			"error", upErr, "failed", errMsg, msSince(start), nil, g.callLogDecision(attempts, errMsg, pc, routeRes))
-		if retryableUpstreamStatus(up.StatusCode) {
+		if pol.failover {
 			return &fwdOutcome{retry: true}
 		}
-		writeOpenAIError(w, http.StatusBadGateway, msgUpstreamDown)
-		return &fwdOutcome{responded: true, refundPre: true, downstreamStatus: http.StatusBadGateway}
+		writeOpenAIError(w, pol.downstreamStatus, msgUpstreamDown)
+		return &fwdOutcome{responded: true, refundPre: true, downstreamStatus: pol.downstreamStatus}
 	}
 }
 

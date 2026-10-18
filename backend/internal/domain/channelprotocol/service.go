@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/team/llmgateway/internal/pkg/resp"
 )
@@ -123,6 +124,15 @@ func (s *Service) Get(ctx context.Context, id int64) (*ChannelProtocol, error) {
 	return cp, nil
 }
 
+// ErrorStats 汇总某渠道协议在 [from, to]（day 闭区间）内按 category 聚合的错误计数。
+// 协议不存在时返回 errNotFound，避免对无效 ID 静默返回空结果。
+func (s *Service) ErrorStats(ctx context.Context, id int64, from, to time.Time) ([]ErrorStat, error) {
+	if _, err := s.Get(ctx, id); err != nil {
+		return nil, err
+	}
+	return s.store.ErrorStats(ctx, id, from, to)
+}
+
 // validate 校验渠道协议字段合法性。
 func validate(cp *ChannelProtocol) error {
 	if strings.TrimSpace(cp.Name) == "" {
@@ -157,7 +167,54 @@ func validate(cp *ChannelProtocol) error {
 	default:
 		return errBadRequest("sourceStatus 只支持 ACTIVE / STALE")
 	}
+	if err := validateErrorPolicies(cp.ErrorPolicy); err != nil {
+		return err
+	}
 	return nil
+}
+
+// validateErrorPolicies 校验协议级错误策略列表的合法性：
+//   - Scope ∈ {channel, models}；scope=models 时 ModelIDs 非空；
+//   - Action ∈ {none, drain, disable}（空值已由 normalizeIn 归一为 none）；
+//   - DownstreamStatus 为 0 或合法 4xx/5xx；
+//   - MessageRegex 可编译。
+func validateErrorPolicies(policies []ErrorPolicy) error {
+	for i := range policies {
+		p := &policies[i]
+		switch p.Scope {
+		case ErrorScopeChannel:
+		case ErrorScopeModels:
+			if len(p.ModelIDs) == 0 {
+				return errBadRequest(fmt.Sprintf("error_policy[%d]：scope=models 时 modelIds 不能为空", i))
+			}
+		default:
+			return errBadRequest(fmt.Sprintf("error_policy[%d]：scope 只支持 channel / models", i))
+		}
+		switch p.Disposition.Action {
+		case ErrorActionNone, ErrorActionDrain, ErrorActionDisable:
+		default:
+			return errBadRequest(fmt.Sprintf("error_policy[%d]：action 只支持 none / drain / disable", i))
+		}
+		if s := p.Disposition.DownstreamStatus; s != 0 && (s < 400 || s > 599) {
+			return errBadRequest(fmt.Sprintf("error_policy[%d]：downstreamStatus 必须为 0 或合法 4xx/5xx", i))
+		}
+		if p.Match.MessageRegex != "" && compiledRegex(p.Match.MessageRegex) == nil {
+			return errBadRequest(fmt.Sprintf("error_policy[%d]：messageRegex 非法，无法编译", i))
+		}
+	}
+	return nil
+}
+
+// normalizeErrorPolicies 归一错误策略：nil→空切片（落库为 '[]'）；action 空值→none。
+func normalizeErrorPolicies(policies []ErrorPolicy) []ErrorPolicy {
+	out := make([]ErrorPolicy, 0, len(policies))
+	for _, p := range policies {
+		if p.Disposition.Action == "" {
+			p.Disposition.Action = ErrorActionNone
+		}
+		out = append(out, p)
+	}
+	return out
 }
 
 // normalizeIn 归一化入参：协议键 canonical 化、策略补默认、名称去空白。
@@ -166,6 +223,7 @@ func normalizeIn(cp *ChannelProtocol) {
 	cp.BaseURL = strings.TrimSpace(cp.BaseURL)
 	cp.Protocols = canonicalProtocols(cp.Protocols)
 	cp.RequestHeaders = normalizePolicy(cp.RequestHeaders)
+	cp.ErrorPolicy = normalizeErrorPolicies(cp.ErrorPolicy)
 	if cp.Models == nil {
 		cp.Models = map[string]ModelGateway{}
 	}

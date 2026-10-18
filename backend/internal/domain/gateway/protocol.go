@@ -1,12 +1,135 @@
 package gateway
 
 import (
+	"context"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/team/llmgateway/internal/domain/channel"
 	"github.com/team/llmgateway/internal/domain/channelprotocol"
+	"github.com/team/llmgateway/internal/domain/router"
 )
+
+// policyForProtocol 解析某协议针对给定上游错误命中的错误策略：
+// 经注入的协议查询接口取该协议 error_policy，按 (内部模型, status, errType, errCode, msg) 调 MatchError。
+//
+// 未装配协议查询接口 / 协议不存在 / 无命中时返回 (nil, false)——上层据此保持改造前行为
+// （默认安全态：不计入健康、沿用 retryableUpstreamStatus、默认 502）。
+func (g *Gateway) policyForProtocol(protocolID int64, channelID int64, internalModelID int64, status int, errType, errCode, msg string) (*channelprotocol.ErrorPolicy, bool) {
+	if g.protocols == nil || protocolID <= 0 {
+		return nil, false
+	}
+	cp, err := g.protocols.GetByID(context.Background(), protocolID)
+	if err != nil || cp == nil {
+		g.logger.Warn("load channel protocol for error policy failed", "protocol_id", protocolID, "channel_id", channelID, "err", err)
+		return nil, false
+	}
+	return channelprotocol.MatchError(cp.ErrorPolicy, "", internalModelID, status, errType, errCode, msg)
+}
+
+// errorPolicyOutcome 一次「上游错误 → 错误策略」决策的结果。
+// 未命中策略时保持改造前行为（默认安全态）：
+//   - countIntoHealth=true（照常计入渠道健康）；
+//   - failover=retryableUpstreamStatus(status)（沿用既有可转移判定）；
+//   - downstreamStatus=502（默认网关错误）。
+type errorPolicyOutcome struct {
+	countIntoHealth  bool // 是否计入渠道健康错误率/429/鉴权计数
+	failover         bool // 是否转移到下一候选
+	downstreamStatus int  // 未转移时写出的下游状态码（命中 Disposition 时替代默认 502）
+}
+
+// applyErrorPolicy 对一次上游错误（status + errType/errCode/msg）做统一策略决策并执行副作用：
+//   - 未命中策略 → 默认安全态（见 errorPolicyOutcome 注释）；
+//   - CountIntoHealth=false → 调用方以 FeedResultGated(..., false) 回喂（完全不影响熔断）；
+//   - Failover 显式设置时按其值决定是否转移（未设置沿用 retryableUpstreamStatus）；
+//   - Action=drain|disable → 手动置密钥/内部模型状态（ManualSetKeyState/ManualSetModelState）；
+//   - DownstreamStatus≠0 → 替代默认 502；
+//   - 命中策略时按错误类别累加协议级错误统计（protocol_error_stats）。
+//
+// 非流式（serveNonStream）与流式（serveStream）内部错误分支共用本函数，保证两处语义完全一致。
+func (g *Gateway) applyErrorPolicy(rt *channel.RuntimeChannel, routeRes *router.RouteResult,
+	status int, errType, errCode, msg string) errorPolicyOutcome {
+
+	out := errorPolicyOutcome{
+		countIntoHealth:  true,
+		failover:         retryableUpstreamStatus(status),
+		downstreamStatus: http.StatusBadGateway,
+	}
+	protocolID := protocolIDOf(rt)
+	pol, ok := g.policyForProtocol(protocolID, routeRes.ChannelID, routeRes.ModelRowID, status, errType, errCode, msg)
+	if !ok {
+		return out
+	}
+	out.countIntoHealth = pol.Disposition.CountIntoHealth
+	if pol.Disposition.Failover != nil {
+		out.failover = *pol.Disposition.Failover
+	}
+	if pol.Disposition.DownstreamStatus != 0 {
+		out.downstreamStatus = pol.Disposition.DownstreamStatus
+	}
+	g.applyPolicyAction(routeRes, pol)
+	g.recordProtocolErrorStat(protocolID, pol, status, errCode)
+	return out
+}
+
+// applyPolicyAction 按 Disposition.Action 手动置密钥/内部模型状态（none 不动作）。
+// drain/disable 同时作用于命中候选的密钥与内部模型行（双回喂语义一致）。
+func (g *Gateway) applyPolicyAction(routeRes *router.RouteResult, pol *channelprotocol.ErrorPolicy) {
+	switch pol.Disposition.Action {
+	case channelprotocol.ErrorActionDrain:
+		g.manualSetStates(routeRes, channel.ActionDrain, channel.StateDrain)
+	case channelprotocol.ErrorActionDisable:
+		g.manualSetStates(routeRes, channel.ActionDisable, channel.StateDisabled)
+	}
+}
+
+// manualSetStates 手动设置密钥与内部模型状态（失败仅记日志，不阻断错误响应）。
+func (g *Gateway) manualSetStates(routeRes *router.RouteResult, action string, st channel.State) {
+	if g.channels == nil {
+		return
+	}
+	if err := g.channels.ManualSetKeyState(routeRes.ChannelKeyID, action); err != nil {
+		g.logger.Warn("apply error policy key action failed",
+			"channel_key_id", routeRes.ChannelKeyID, "action", action, "err", err)
+	}
+	if err := g.channels.ManualSetModelState(routeRes.ChannelID, routeRes.ModelRowID, st); err != nil {
+		g.logger.Warn("apply error policy model action failed",
+			"channel_id", routeRes.ChannelID, "model_row_id", routeRes.ModelRowID, "state", st, "err", err)
+	}
+}
+
+// recordProtocolErrorStat 命中策略时按错误类别累加协议级统计（量小，同步 upsert；失败仅记日志）。
+func (g *Gateway) recordProtocolErrorStat(protocolID int64, pol *channelprotocol.ErrorPolicy, status int, errCode string) {
+	if g.protocolStats == nil || protocolID <= 0 {
+		return
+	}
+	if err := g.protocolStats.IncrProtocolErrorStat(context.Background(), protocolID, errorCategory(pol, status, errCode), g.now()); err != nil {
+		g.logger.Warn("record protocol error stat failed", "protocol_id", protocolID, "err", err)
+	}
+}
+
+// errorCategory 归出命中错误的类别标识：优先 code（code:<errCode>），其次 type，最后 status（status:<n>）。
+func errorCategory(pol *channelprotocol.ErrorPolicy, status int, errCode string) string {
+	switch {
+	case pol.Match.ErrorCode != "":
+		return "code:" + pol.Match.ErrorCode
+	case pol.Match.ErrorType != "":
+		return "type:" + pol.Match.ErrorType
+	case pol.Match.Status != 0:
+		return "status:" + strconv.Itoa(pol.Match.Status)
+	default:
+		return "status:" + strconv.Itoa(status)
+	}
+}
+
+// protocolIDOf 返回渠道运行时引用的渠道协议 ID（未引用/内联配置返回 0）。
+func protocolIDOf(rt *channel.RuntimeChannel) int64 {
+	if rt == nil || rt.Protocol == nil {
+		return 0
+	}
+	return rt.Protocol.ID
+}
 
 // UpstreamResponseHeaderWhitelistKey 是全局上游响应头白名单在 sys_configs 中的键（默认空，零配置）。
 const UpstreamResponseHeaderWhitelistKey = "gateway.upstream_response_header_whitelist"

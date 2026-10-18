@@ -16,8 +16,8 @@ import (
 func cpRow(id int64, name, baseURL, sourceID string, edited bool, status string) *sqlmock.Rows {
 	now := time.Now()
 	return sqlmock.NewRows([]string{"id", "name", "base_url", "protocols", "request_headers",
-		"models", "preset_source_id", "edited", "source_status", "created_at", "updated_at"}).
-		AddRow(id, name, baseURL, `{}`, `{}`, `{}`, sourceID, edited, status, now, now)
+		"models", "error_policy", "preset_source_id", "edited", "source_status", "created_at", "updated_at"}).
+		AddRow(id, name, baseURL, `{}`, `{}`, `{}`, `[]`, sourceID, edited, status, now, now)
 }
 
 const testPackJSON = `{
@@ -75,7 +75,7 @@ func TestSync_InsertsNewPreset(t *testing.T) {
 	svc, mock := newTestService(t, "http://x")
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + cpCols + ` FROM channel_protocols WHERE deleted_at IS NULL AND preset_source_id <> '' ORDER BY id ASC`)).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "base_url", "protocols", "request_headers",
-			"models", "preset_source_id", "edited", "source_status", "created_at", "updated_at"}))
+			"models", "error_policy", "preset_source_id", "edited", "source_status", "created_at", "updated_at"}))
 	mock.ExpectBegin()
 	mock.ExpectQuery(`INSERT INTO channel_protocols`).
 		WillReturnRows(cpRow(1, "OpenCode Zen", "https://opencode.ai/zen/v1", "opencode-zen", false, SourceActive))
@@ -188,7 +188,7 @@ func TestSync_RollsBackOnFailure(t *testing.T) {
 	svc, mock := newTestService(t, "http://x")
 	mock.ExpectQuery(`SELECT .* FROM channel_protocols WHERE deleted_at IS NULL AND preset_source_id <> '' ORDER BY id ASC`).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "base_url", "protocols", "request_headers",
-			"models", "preset_source_id", "edited", "source_status", "created_at", "updated_at"}))
+			"models", "error_policy", "preset_source_id", "edited", "source_status", "created_at", "updated_at"}))
 	mock.ExpectBegin()
 	mock.ExpectQuery(`INSERT INTO channel_protocols`).WillReturnError(errors.New("insert boom"))
 	mock.ExpectRollback()
@@ -224,7 +224,7 @@ func TestInitialSync_MarksWhenFirstRun(t *testing.T) {
 		WillReturnError(sql.ErrNoRows)
 	mock.ExpectQuery(`SELECT .* FROM channel_protocols WHERE deleted_at IS NULL AND preset_source_id <> '' ORDER BY id ASC`).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "base_url", "protocols", "request_headers",
-			"models", "preset_source_id", "edited", "source_status", "created_at", "updated_at"}))
+			"models", "error_policy", "preset_source_id", "edited", "source_status", "created_at", "updated_at"}))
 	mock.ExpectBegin()
 	mock.ExpectQuery(`INSERT INTO channel_protocols`).
 		WillReturnRows(cpRow(1, "OpenCode Zen", "https://opencode.ai/zen/v1", "opencode-zen", false, SourceActive))
@@ -315,7 +315,7 @@ func TestSync_InvokesRefresher(t *testing.T) {
 
 	mock.ExpectQuery(`SELECT .* FROM channel_protocols WHERE deleted_at IS NULL AND preset_source_id <> '' ORDER BY id ASC`).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "base_url", "protocols", "request_headers",
-			"models", "preset_source_id", "edited", "source_status", "created_at", "updated_at"}))
+			"models", "error_policy", "preset_source_id", "edited", "source_status", "created_at", "updated_at"}))
 	mock.ExpectBegin()
 	mock.ExpectQuery(`INSERT INTO channel_protocols`).
 		WillReturnRows(cpRow(11, "OpenCode Zen", "https://opencode.ai/zen/v1", "opencode-zen", false, SourceActive))
@@ -381,9 +381,9 @@ func TestExport(t *testing.T) {
 	now := time.Now()
 	mock.ExpectQuery(`SELECT .* FROM channel_protocols WHERE deleted_at IS NULL ORDER BY id ASC`).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "base_url", "protocols", "request_headers",
-			"models", "preset_source_id", "edited", "source_status", "created_at", "updated_at"}).
-			AddRow(int64(1), "Anthropic", "https://api.anthropic.com/v1", `{}`, `{}`, `{}`, "anthropic", false, SourceActive, now, now).
-			AddRow(int64(2), "my-proto", "https://my.example/v1", `{}`, `{}`, `{}`, "", true, SourceActive, now, now))
+			"models", "error_policy", "preset_source_id", "edited", "source_status", "created_at", "updated_at"}).
+			AddRow(int64(1), "Anthropic", "https://api.anthropic.com/v1", `{}`, `{}`, `{}`, `[]`, "anthropic", false, SourceActive, now, now).
+			AddRow(int64(2), "my-proto", "https://my.example/v1", `{}`, `{}`, `{}`, `[]`, "", true, SourceActive, now, now))
 
 	pack, err := svc.Export(context.Background())
 	if err != nil {
@@ -449,7 +449,7 @@ func TestImport_Creates(t *testing.T) {
 	svc, mock := newTestService(t, "")
 	mock.ExpectQuery(`SELECT .* FROM channel_protocols WHERE deleted_at IS NULL ORDER BY id ASC`).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "base_url", "protocols", "request_headers",
-			"models", "preset_source_id", "edited", "source_status", "created_at", "updated_at"}))
+			"models", "error_policy", "preset_source_id", "edited", "source_status", "created_at", "updated_at"}))
 	mock.ExpectBegin()
 	mock.ExpectQuery(`INSERT INTO channel_protocols`).
 		WillReturnRows(cpRow(101, "new-proto", "https://x.example/v1", "new-proto", false, SourceActive))
@@ -482,7 +482,7 @@ func TestImport_WarnsOnInvalidSourceStatus(t *testing.T) {
 	svc, mock := newTestService(t, "")
 	mock.ExpectQuery(`SELECT .* FROM channel_protocols WHERE deleted_at IS NULL ORDER BY id ASC`).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "base_url", "protocols", "request_headers",
-			"models", "preset_source_id", "edited", "source_status", "created_at", "updated_at"}))
+			"models", "error_policy", "preset_source_id", "edited", "source_status", "created_at", "updated_at"}))
 	mock.ExpectBegin()
 	mock.ExpectCommit()
 
@@ -504,5 +504,43 @@ func TestImport_WarnsOnInvalidSourceStatus(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("expectations: %v", err)
+	}
+}
+
+// ---- 错误策略校验（validateErrorPolicies） ----
+
+func TestValidateErrorPolicy(t *testing.T) {
+	tests := []struct {
+		name     string
+		policies []ErrorPolicy
+		wantErr  bool
+	}{
+		{"channel 合法", []ErrorPolicy{{Scope: ErrorScopeChannel, Disposition: ErrorDisposition{Action: ErrorActionNone}}}, false},
+		{"models 合法", []ErrorPolicy{{Scope: ErrorScopeModels, ModelIDs: []int64{1, 2}, Disposition: ErrorDisposition{Action: ErrorActionDrain}}}, false},
+		{"空 action 经归一为 none 后合法", []ErrorPolicy{{Scope: ErrorScopeChannel}}, false},
+		{"scope 非法", []ErrorPolicy{{Scope: "bogus", Disposition: ErrorDisposition{Action: ErrorActionNone}}}, true},
+		{"models 但 modelIds 为空", []ErrorPolicy{{Scope: ErrorScopeModels, Disposition: ErrorDisposition{Action: ErrorActionNone}}}, true},
+		{"action 非法", []ErrorPolicy{{Scope: ErrorScopeChannel, Disposition: ErrorDisposition{Action: "bogus"}}}, true},
+		{"downstreamStatus 非法(302)", []ErrorPolicy{{Scope: ErrorScopeChannel, Disposition: ErrorDisposition{Action: ErrorActionNone, DownstreamStatus: 302}}}, true},
+		{"downstreamStatus 合法(429)", []ErrorPolicy{{Scope: ErrorScopeChannel, Disposition: ErrorDisposition{Action: ErrorActionNone, DownstreamStatus: 429}}}, false},
+		{"messageRegex 非法", []ErrorPolicy{{Scope: ErrorScopeChannel, Disposition: ErrorDisposition{Action: ErrorActionNone}, Match: ErrorMatch{MessageRegex: "("}}}, true},
+		{"messageRegex 合法", []ErrorPolicy{{Scope: ErrorScopeChannel, Disposition: ErrorDisposition{Action: ErrorActionNone}, Match: ErrorMatch{MessageRegex: `^boom`}}}, false},
+		{"多策略其一非法", []ErrorPolicy{
+			{Scope: ErrorScopeChannel, Disposition: ErrorDisposition{Action: ErrorActionNone}},
+			{Scope: ErrorScopeChannel, Disposition: ErrorDisposition{Action: "bogus"}},
+		}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cp := ChannelProtocol{Name: "p", ErrorPolicy: tt.policies}
+			normalizeIn(&cp)
+			err := validate(&cp)
+			if tt.wantErr && err == nil {
+				t.Fatalf("期望校验失败，got nil")
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("期望校验通过，got %v", err)
+			}
+		})
 	}
 }

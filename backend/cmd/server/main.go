@@ -578,9 +578,13 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 		Billing:       billSvc,
 		Models:        modelSvc,
 		ChannelModels: channelModelsResolver,
-		TagKV:         tagKVResolver(tagStore),
-		Auto:          autoSvc,
-		Pricing:       newPricingModeResolver(userStore, pricingCache),
+		// Protocols 渠道协议查询：供网关读取协议级错误策略（error_policy）；默认安全态（未配置时行为不变）。
+		Protocols: cpStore,
+		// ProtocolErrorStats 协议级错误统计写入：命中错误策略时按错误类别累加当日计数。
+		ProtocolErrorStats: cpStore,
+		TagKV:              tagKVResolver(tagStore),
+		Auto:               autoSvc,
+		Pricing:            newPricingModeResolver(userStore, pricingCache),
 		// SessionExpiry 会话过期 TTL 分档计算（上下文长度 + 用户对话次数，取较大者，最低兜底 5 分钟）。
 		SessionExpiry: sessExpiryProvider,
 		// 三阶段计费（预扣/结算退补）：余额不足直接 402，请求后按实际多退少补。
