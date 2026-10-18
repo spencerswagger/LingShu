@@ -384,9 +384,12 @@ func TestAsyncKindSwitch(t *testing.T) {
 		t.Fatalf("nil AsyncKinds 应同步返回 Exec 错误，实际 err=%v", err)
 	}
 
-	// 同步执行不受 Shutdown 影响：未启用异步则无 WAL、无协程。
+	// 关停前同步可执行；关停后（含同步类别）一律拒绝，与 Submit 文档契约一致。
 	if err := w.Shutdown(ctx); err != nil {
 		t.Fatalf("Shutdown 失败: %v", err)
+	}
+	if err := w.Submit(Job{Kind: KindSession, Key: "k", Exec: func(ctx context.Context) error { return nil }}); !errors.Is(err, ErrClosed) {
+		t.Fatalf("关停后同步类别提交应返回 ErrClosed，实际 err=%v", err)
 	}
 }
 
@@ -644,10 +647,11 @@ func TestIdemKeyNamespacedByKind(t *testing.T) {
 	}
 }
 
-// TestQueueFullThenShutdown 锁定「队列满 + 关停」组合（P1-1 与 Shutdown 的竞态路径）：
-// 队列已满且无消费者时，并发提交会阻塞于背压；此时并发 Shutdown 绝不能出现
-// 「向已关闭 channel 发送」的 panic，Submit 必须尽快返回非 nil 错误（背压或已关闭），
-// 关停后 Depth 归零、已持久化但从未执行的 WAL 记录保留待重放，且关停后拒绝新提交。
+// TestQueueFullThenShutdown 锁定「队列满 + 关停」组合：
+// 队列已满且无消费者时，Submit 持 sendMu 读锁进入背压等待，并发 Shutdown 需取写锁——
+// 二者由 sendMu 串行化，故「关闭队列」与「阻塞发送」不会真正交错（这正是防 panic 的机制）。
+// 本用例验证该序列化安全：Submit 必须返回非 nil 错误（背压或已关闭）、关停不 panic、
+// 已持久化但从未执行的 WAL 记录保留待重放，且关停后拒绝新提交。
 func TestQueueFullThenShutdown(t *testing.T) {
 	walPath := filepath.Join(t.TempDir(), "wal.log")
 	w := New(Config{
@@ -687,7 +691,8 @@ func TestQueueFullThenShutdown(t *testing.T) {
 		t.Fatalf("队列满且关停时 Submit 必须返回错误")
 	}
 	// 未启动消费者时，首个入队任务保留在途（Depth=1）；与之竞争的提交被拒绝（背压或已关闭），
-	// 不产生净在途增量（在途计数不得泄漏）。
+	// 不产生净在途增量（在途计数不得泄漏）。注：这是「未 Start」的边界前提——Shutdown 文档所述
+	// 「返回后 Depth 应为 0」针对已 Start 的场景，由既有 TestShutdownFlush 覆盖。
 	if got := w.Stats().Depth; got != 1 {
 		t.Fatalf("关停后在途任务数=%d，期望 1（仅首个入队且未执行的任务）", got)
 	}

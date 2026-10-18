@@ -54,6 +54,9 @@ var ErrBackpressure = errors.New("asyncwrite: 队列背压超时，任务未能�
 // 在无 WAL 兜底的情况下静默丢失（违背「绝不静默丢弃」契约）。装配层应在启动期据此致命化。
 var ErrWALUnavailable = errors.New("asyncwrite: WAL 不可用，拒绝写入（配置了 WALPath 但打开失败）")
 
+// ErrClosed 表示 Writer 已关停（Shutdown 之后拒绝一切提交，含同步类别）。
+var ErrClosed = errors.New("asyncwrite: writer 已关闭，拒绝新的提交")
+
 // Config 是 Writer 的构造配置；零值字段由 New 填充默认值。
 type Config struct {
 	// WALPath 预写日志路径；为空表示纯内存模式（不落盘、不支持重放）。
@@ -252,8 +255,14 @@ func (w *Writer) SetReplayFunc(kind Kind, fn func(ctx context.Context, key strin
 //   - 否则写入 WAL（若已启用）并入队：WAL 写入失败则记录日志并返回错误，不入队（不伪称已持久化）；
 //     队列满则短暂背压 50ms，仍满时计 Dropped、记 Error 日志并返回 ErrBackpressure——
 //     已持久化的 WAL 记录**保留**（不删除），留待重启重放，绝不静默丢弃。
-//   - Shutdown 之后调用返回错误。
+//   - Shutdown 之后调用返回 ErrClosed（含同步类别）。
 func (w *Writer) Submit(job Job) error {
+	// 关停后拒绝一切提交（含同步类别），与本文档契约一致。异步分支在 sendMu.RLock 下会再查一次，
+	// 以闭合「关停关闭队列」与「入队」之间的竞态（避免向已关闭 channel 发送）。
+	if w.closed.Load() {
+		return ErrClosed
+	}
+
 	if !w.cfg.AsyncKinds[job.Kind] {
 		if job.Exec == nil {
 			return nil
@@ -268,7 +277,7 @@ func (w *Writer) Submit(job Job) error {
 	w.sendMu.RLock()
 	defer w.sendMu.RUnlock()
 	if w.closed.Load() {
-		return errors.New("asyncwrite: writer 已关闭，拒绝新的提交")
+		return ErrClosed
 	}
 
 	// 先落 WAL 再入队。WAL 写失败意味着「未持久化」，必须把错误如实返回给调用方，
