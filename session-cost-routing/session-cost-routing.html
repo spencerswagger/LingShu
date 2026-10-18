@@ -55,6 +55,8 @@
       --ok: #12b76a;
       --warn: #f79009;
       --danger: #f04438;
+      --accent3: #0e9f8a;  /* 第三个渠道（青绿） */
+      --accent4: #e0537a;  /* 第四个渠道（玫红） */
 
       --font-head: 'Bricolage Grotesque', 'Instrument Sans', system-ui, sans-serif;
       --font: 'Instrument Sans', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif;
@@ -229,6 +231,20 @@
     .phase .ph.p3 { background: var(--muted); }
     .phase .pb { font-size: 0.94rem; padding-bottom: 0.5rem; border-bottom: 1px dashed var(--rule); }
 
+    /* === 参数面板 === */
+    .panel { background: var(--bg2); border: 1px solid var(--rule); border-radius: var(--radius-m); padding: 1.1rem 1.2rem; margin: 1.4rem 0; }
+    .panel-title { font-family: var(--font-mono); font-size: 0.74rem; letter-spacing: 0.1em; text-transform: uppercase; color: var(--accent2); margin: 0 0 0.7rem; }
+    .panel-group + .panel-group { margin-top: 1.1rem; border-top: 1px dashed var(--rule); padding-top: 1rem; }
+    .ctrl-row { display: grid; grid-template-columns: 1.5fr repeat(3, 1fr); gap: 0.5rem 1rem; align-items: center; padding: 0.3rem 0; }
+    .ctrl-head { font-family: var(--font-mono); font-size: 0.76rem; color: var(--muted); }
+    .ctrl-name input[type="text"] { width: 100%; font-family: var(--font); font-size: 0.86rem; color: var(--ink); background: var(--bg); border: 1px solid var(--rule); border-radius: 6px; padding: 0.22rem 0.45rem; }
+    .ctrl-field { display: grid; gap: 0.2rem; }
+    .ctrl-field .lbl { font-family: var(--font-mono); font-size: 0.76rem; color: var(--muted); }
+    .ctrl-field .val { font-family: var(--font-mono); font-size: 0.8rem; color: var(--accent); }
+    .global-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.85rem 1.2rem; }
+    input[type="range"] { width: 100%; height: 20px; accent-color: var(--accent); cursor: pointer; }
+    .panel .chart-note { margin-top: 0.7rem; }
+
     ul.plain, ol.steps { margin: 0.7rem 0 0.7rem 1.25rem; }
     ul.plain li, ol.steps li { margin: 0.4rem 0; }
     .lead { font-size: 1.04rem; }
@@ -272,7 +288,7 @@
       <p class="subtitle">会话亲和 + 逐轮成本决策（会话成本路由）</p>
 
       <div class="one-line">
-        <strong>一句话结论：</strong>在“同一对外模型、多渠道售价结构不同”的前提下，把路由从「会话无脑粘性」升级为「会话亲和 + 逐轮成本决策」——只要目标渠道的<mark class="key">缓存读单价更便宜</mark>、且这次切换的<mark class="key">回本所需轮数小于预计剩余轮数</mark>，就在<mark class="key">缓存重置点</mark>把同一会话切到成本更优的渠道，大概率省钱，同时把“重灌上下文 / 丢缓存”的代价算进决策。
+        <strong>一句话结论：</strong>在“同一对外模型、多渠道售价结构不同”的前提下，把路由从「会话无脑粘性」升级为「会话亲和 + 逐轮成本决策」——只要目标渠道的<mark class="key">缓存读单价更便宜</mark>、且这次切换的<mark class="key">回本所需轮数小于预计剩余轮数</mark>，就在<mark class="key">划算的时机</mark>把同一会话切到成本更优的渠道：优先在<mark class="key">会话起点</mark>做零成本选路，会话中途则逐轮评估、把“重灌上下文 / 丢缓存”的代价算进决策。
       </div>
 
       <div class="tldr">
@@ -347,7 +363,7 @@
       <div class="sec-head"><span class="sec-num">02</span><h2>方案总览与决策流程</h2></div>
 
       <p class="lead">
-        方案做三件事：<strong>① 默认仍然会话亲和</strong>（保住缓存）；<strong>② 只在“缓存重置点”评估切换</strong>（避免白白重灌）；<strong>③ 切换决策同时算“本轮花费”和“一次性重灌代价”</strong>。
+        方案做三件事：<strong>① 默认仍然会话亲和</strong>（保住缓存）；<strong>② 决策点分两类</strong>——<strong>会话起点做零成本选路</strong>、<strong>会话中途逐轮评估</strong>（不依赖网关感知不到的 provider 事件）；<strong>③ 切换决策同时算“本轮花费”和“一次性重灌代价”</strong>。
       </p>
 
       <ol class="steps">
@@ -360,23 +376,22 @@
       <figure class="diagram">
         <pre class="mermaid">
 flowchart TD
-  S(["收到新请求：确定对外模型"]) --> Q1{"当前是否处于缓存重置点？<br/>新会话 / 上下文压缩 / clear / TTL 空闲过期"}
-  Q1 -- "否：前缀缓存仍有效" --> KEEP["保持当前渠道（会话亲和）"]
-  Q1 -- "是：可安全重灌" --> CAND["收集候选渠道<br/>同一对外模型下全部可用渠道"]
+  S(["收到新请求：确定对外模型"]) --> Q{"是否会话起点？<br/>新会话 / clear 之后"}
+  Q -- "是：初始选路（重灌代价 = 0）" --> CAND["收集候选渠道<br/>三档价 × 时段倍率 × 分档倍率"]
+  Q -- "否：会话中途，逐轮评估" --> CAND
   CAND --> POS["由会话位置 k 估算<br/>预计剩余轮数"]
   POS --> COST["对每个候选渠道计算：<br/>本轮花费 + 一次性重灌代价 ÷ 预计剩余轮数"]
   COST --> MIN["取最小值的渠道"]
   MIN --> GATE{"预计剩余轮数 > 回本轮数？"}
   GATE -- "是" --> SW["切换到成本更优渠道"]
-  GATE -- "否" --> KEEP2["保持当前渠道"]
+  GATE -- "否" --> KEEP["保持当前渠道（会话亲和）"]
   SW --> LOG["记录切换事件与预估节省<br/>异步落库"]
   KEEP --> LOG
-  KEEP2 --> LOG
         </pre>
-        <figcaption><span class="fc-num">图 D</span>会话成本路由决策流程：先卡“是否处于缓存重置点”，再算“本轮花费 + 重灌代价 ÷ 预计剩余轮数”取最小，并以“剩余轮数 &gt; 回本轮数”做最终门控。</figcaption>
+        <figcaption><span class="fc-num">图 D</span>会话成本路由决策流程：先判“是否会话起点”（起点则零成本初始选路），再算“本轮花费 + 重灌代价 ÷ 预计剩余轮数”取最小，并以“剩余轮数 &gt; 回本轮数”做最终门控。</figcaption>
       </figure>
 
-      <p class="chart-note">说明：图中的“缓存重置点”指新会话、上下文压缩、用户显式 clear、以及 TTL 空闲过期等会真正清空前缀缓存的时刻——只有这些点才值得考虑重灌。</p>
+      <p class="chart-note">说明：网关能<strong>可靠感知</strong>的切点其实只有<strong>会话起点</strong>（新会话 / clear 之后）——此时没有旧渠道，属于“初始选路”，重灌代价为 0。上下文压缩、TTL 空闲过期发生在 provider 侧、<strong>网关感知不到</strong>，因此不把它们当门控事件；中途切换一律按“需重灌”保守计价（详见第 04 章）。</p>
     </section>
 
     <!-- ===== 03 公式 ===== -->
@@ -471,9 +486,31 @@ B：若 预计剩余轮数 &gt; 回本轮数 → 切换</div>
         <li><strong>交叉点即切换时机</strong>：当剩余轮数掉到回本轮数以下，就不再切——这天然抑制了“快结束时还去折腾”的抖动。</li>
       </ul>
 
+      <h3>“缓存重置点”这一节为什么站不住</h3>
+      <p>把“等一个缓存重置点再切”当作主策略其实<strong>不可执行</strong>——逐个看，这些点要么根本不是“切换”，要么网关根本感知不到：</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>候选切点</th><th>实际情况</th><th>能否作为门控</th></tr></thead>
+          <tbody>
+            <tr><td>新会话</td><td>没有旧渠道，不存在“切换”，而是<strong>初始选路</strong></td><td>可——但它是“起点”，重灌代价 = 0</td></tr>
+            <tr><td>clear</td><td>等价于新会话（用户主动开新会话）</td><td>同“新会话”</td></tr>
+            <tr><td>上下文压缩</td><td>发生在 provider 内部，<strong>网关感知不到</strong></td><td>否——无法检测</td></tr>
+            <tr><td>TTL 空闲过期</td><td>发生在 provider 内部，<strong>网关感知不到</strong></td><td>否——无法检测</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>因此正确做法是放弃“检测重置点”，改为<strong>两类可执行的决策点</strong>：</p>
+      <ul class="plain">
+        <li><strong>① 起点择优（零额外代价）：</strong>每个新会话开始时，就按“本轮花费 + 剩余轮数摊还重灌代价”选渠道；因为此刻没有旧缓存，重灌代价为 0，这是最干净、最有效的决策点。</li>
+        <li><strong>② 中途逐轮评估：</strong>每一轮都算一次“切换总账”，把重灌代价<strong>按最坏情况</strong>直接计入（不去猜 provider 是否清过缓存），只有足够划算才切。</li>
+      </ul>
       <div class="callout warn">
-        <span class="tag">门控：只在缓存重置点</span>
-        切换唯一的“安全窗口”是<strong>缓存重置点</strong>：新会话、上下文压缩、用户 clear、TTL 空闲过期。在<strong>用户消息边界切换不会清空前缀缓存</strong>，等于既没享到新渠道的缓存读优势、又保留了旧渠道的重灌开销——<mark class="key">实测会多付 19%~40%</mark>。因此流程图第一步就卡在“是否处于缓存重置点”。
+        <span class="tag">中途切换的真实代价</span>
+        在<strong>用户消息边界切换不会清空前缀缓存</strong>，等于既没享到新渠道的缓存读优势、又保留了旧渠道的重灌开销——<mark class="key">实测会多付 19%~40%</mark>。所以中途切换的门槛必须更高（见 图 B 的“剩余轮数 &gt; 回本轮数”）。
+      </div>
+      <div class="callout">
+        <span class="tag">前置依赖 / 增强项</span>
+        若未来 provider 能回传“缓存已失效”信号（压缩、TTL 过期），网关即可把这种时刻当成“可免重灌”的增强切点；当前不具备该信号，因此按保守计价处理。
       </div>
 
       <h3>另一条近似：折扣够深才值得切</h3>
@@ -502,8 +539,8 @@ B：若 预计剩余轮数 &gt; 回本轮数 → 切换</div>
       </div>
       <p class="chart-note">结论：估计“还能聊几轮”时，用<strong>会话位置 k</strong>作为主信号，不要用消息角色。</p>
 
-      <h3>结论二 · 切换边界是缓存重置点</h3>
-      <p>只有新会话、上下文压缩、clear、TTL 空闲过期会真正清空前缀缓存。<strong>用户消息边界不清空前缀缓存</strong>；在那里切换会同时失去旧缓存、又付出新渠道的重灌成本，<mark class="key">实测多付 19%~40%</mark>。</p>
+      <h3>结论二 · 网关真正能用的切点只有“会话起点”</h3>
+      <p>网关能可靠感知的切点只有<strong>会话起点</strong>（新会话 / clear）；上下文压缩与 TTL 空闲过期发生在 provider 侧、<mark class="key">网关感知不到</mark>，不能作为门控。<strong>用户消息边界不清空前缀缓存</strong>，在那里切换会同时失去旧缓存、又付出新渠道重灌成本，<mark class="key">实测多付 19%~40%</mark>。</p>
 
       <h3>结论三 · 目标函数必须含三档价</h3>
       <ul class="plain">
@@ -530,37 +567,88 @@ B：若 预计剩余轮数 &gt; 回本轮数 → 切换</div>
       <div class="sec-head"><span class="sec-num">06</span><h2>管理界面可视化设计</h2></div>
 
       <p class="lead">
-        给管理员看的核心问题是两个：<mark class="key">“什么时候会切？”</mark> 和 <mark class="key">“能省多少？”</mark>。这里设计三类视图：<strong>函数图</strong>（看懂规则）、<strong>事件流</strong>（看清每次决策）、<strong>统计与影子对照</strong>（验证是否真省）。
+        给管理员看的核心问题是两个：<mark class="key">“什么时候会切？”</mark> 和 <mark class="key">“能省多少？”</mark>。由于决策<strong>入参较多</strong>（各渠道三档价、每轮 token、时段 / 分档倍率、预计剩余轮数、折扣），面板要把它们做成<strong>可调控件</strong>：拨动参数后，下面几张图实时重算，并让<strong>多个渠道的曲线在同一张图上汇聚、交叉</strong>——交叉处就是临界点。
       </p>
+
+      <h3>参数面板（可调输入）</h3>
+      <p>下列参数即决策函数的输入。默认值取自示例渠道（Venice / DeepSeek），可任意拨动，所有图随之更新。</p>
+      <div class="panel" id="router-panel">
+        <div class="panel-group">
+          <div class="panel-title">渠道三档价（积分 / 百万 token）</div>
+          <div class="ctrl-row ctrl-head"><span>渠道</span><span>输入价</span><span>缓存读价</span><span>输出价</span></div>
+          <div class="ctrl-row" data-ch="0">
+            <div class="ctrl-name"><input class="ch-name" type="text" value="Venice（当前）"></div>
+            <div class="ctrl-field"><input class="ch" data-p="in" type="range" min="0" max="0.7" step="0.001" value="0.138"><span class="val" data-out="in">0.138</span></div>
+            <div class="ctrl-field"><input class="ch" data-p="cr" type="range" min="0" max="0.7" step="0.001" value="0.028"><span class="val" data-out="cr">0.028</span></div>
+            <div class="ctrl-field"><input class="ch" data-p="out" type="range" min="0" max="0.7" step="0.001" value="0.275"><span class="val" data-out="out">0.275</span></div>
+          </div>
+          <div class="ctrl-row" data-ch="1">
+            <div class="ctrl-name"><input class="ch-name" type="text" value="DeepSeek（候选）"></div>
+            <div class="ctrl-field"><input class="ch" data-p="in" type="range" min="0" max="0.7" step="0.001" value="0.150"><span class="val" data-out="in">0.150</span></div>
+            <div class="ctrl-field"><input class="ch" data-p="cr" type="range" min="0" max="0.7" step="0.001" value="0.003"><span class="val" data-out="cr">0.003</span></div>
+            <div class="ctrl-field"><input class="ch" data-p="out" type="range" min="0" max="0.7" step="0.001" value="0.600"><span class="val" data-out="out">0.600</span></div>
+          </div>
+          <div class="ctrl-row" data-ch="2">
+            <div class="ctrl-name"><input class="ch-name" type="text" value="渠道 C（示例，可改）"></div>
+            <div class="ctrl-field"><input class="ch" data-p="in" type="range" min="0" max="0.7" step="0.001" value="0.120"><span class="val" data-out="in">0.120</span></div>
+            <div class="ctrl-field"><input class="ch" data-p="cr" type="range" min="0" max="0.7" step="0.001" value="0.012"><span class="val" data-out="cr">0.012</span></div>
+            <div class="ctrl-field"><input class="ch" data-p="out" type="range" min="0" max="0.7" step="0.001" value="0.420"><span class="val" data-out="out">0.420</span></div>
+          </div>
+          <p class="chart-note">渠道 C 的默认价仅用于演示“多曲线汇聚”，非实际报价，可直接改成你关心的渠道。</p>
+        </div>
+        <div class="panel-group">
+          <div class="panel-title">全局入参</div>
+          <div class="global-grid">
+            <div class="ctrl-field"><span class="lbl">每轮新增输入 token</span><input id="g-newin" type="range" min="0" max="8000" step="100" value="1000"><span class="val" id="v-newin">1000</span></div>
+            <div class="ctrl-field"><span class="lbl">每轮输出 token</span><input id="g-out" type="range" min="0" max="8000" step="100" value="1000"><span class="val" id="v-out">1000</span></div>
+            <div class="ctrl-field"><span class="lbl">预计剩余轮数（图 B 门槛）</span><input id="g-turns" type="range" min="1" max="60" step="1" value="6"><span class="val" id="v-turns">6</span></div>
+            <div class="ctrl-field"><span class="lbl">折扣 ρ（图 C）</span><input id="g-rho" type="range" min="0.05" max="0.9" step="0.01" value="0.5"><span class="val" id="v-rho">0.50</span></div>
+            <div class="ctrl-field"><span class="lbl">时段倍率</span><input id="g-time" type="range" min="0.5" max="2" step="0.05" value="1"><span class="val" id="v-time">1.00</span></div>
+            <div class="ctrl-field"><span class="lbl">上下文分档倍率</span><input id="g-bucket" type="range" min="0.5" max="2" step="0.05" value="1"><span class="val" id="v-bucket">1.00</span></div>
+            <div class="ctrl-field"><span class="lbl">短会话 horizon（图 C，发）</span><input id="g-horizon" type="range" min="2" max="40" step="1" value="10"><span class="val" id="v-horizon">10</span></div>
+            <div class="ctrl-field"><span class="lbl">模拟会话数（图 E）</span><input id="g-sessions" type="range" min="100" max="4000" step="100" value="1000"><span class="val" id="v-sessions">1000</span></div>
+            <div class="ctrl-field"><span class="lbl">token 波动幅度（图 E）</span><input id="g-spread" type="range" min="0" max="0.6" step="0.02" value="0.3"><span class="val" id="v-spread">30%</span></div>
+          </div>
+          <p class="chart-note">时段 / 分档倍率对“每轮花费”等比缩放（见 图 A）；在“回本（比值）”里会约掉，故 图 B / 图 C 不受其影响。</p>
+        </div>
+      </div>
 
       <!-- 图A -->
       <figure class="chart-figure">
-        <figcaption><span class="fc-num">图 A</span>每轮花费 vs 缓存读 token 数：两渠道曲线的交叉点＝临界点（示例 Venice → DeepSeek，交叉 ≈ 1.35 万 token）</figcaption>
+        <figcaption><span class="fc-num">图 A</span>多渠道路由临界点：各渠道“每轮花费 vs 缓存读 token”曲线汇聚并交叉，交叉点即临界点</figcaption>
         <div id="chart-turn-cost" style="width:100%;min-height:420px"></div>
-        <div class="chart-note">读法：交叉点以左，Venice 每轮更便宜；以右，DeepSeek 每轮更便宜。管理员据此一眼看到“缓存读超过多少就该考虑切换”。（纵轴单位为毫积分，1 毫积分 = 0.001 积分；数据经 1e6 缩放后便于阅读。）</div>
+        <div class="chart-note" id="turn-cost-note">读法：曲线越低越划算；当某条曲线穿过当前最低曲线，临界点即出现——交叉点右侧，该渠道更便宜。（纵轴单位为毫积分，1 毫积分 = 0.001 积分。）</div>
       </figure>
 
       <!-- 图B -->
       <figure class="chart-figure">
-        <figcaption><span class="fc-num">图 B</span>回本轮数 vs 缓存读 token 数：含水平门槛线“预计剩余轮数 = 6”，并标出下限 ≈ 5.9</figcaption>
+        <figcaption><span class="fc-num">图 B</span>回本轮数 vs 缓存读 token 数（当前渠道 → 候选渠道）：含门槛线“预计剩余轮数”，并标出回本下限</figcaption>
         <div id="chart-payback" style="width:100%;min-height:420px"></div>
-        <div class="chart-note">读法：曲线在门槛线 6 之上时，需要“剩余轮数 &gt; 回本轮数”才切；曲线随缓存读增大而下降并收敛到下限 5.9——即缓存读越大越值得切。</div>
+        <div class="chart-note" id="payback-note">读法：门槛线以上需要“剩余轮数 &gt; 回本轮数”才切；回本随缓存读增大而下降并收敛到下限。</div>
       </figure>
 
       <!-- 图C -->
       <figure class="chart-figure">
-        <figcaption><span class="fc-num">图 C</span>回本所需剩余请求数 n* vs 折扣 ρ：n* ≈ 12.5·ρ/(1−ρ)，标出“短会话 horizon ≈ 10 发”参考线</figcaption>
+        <figcaption><span class="fc-num">图 C</span>回本所需剩余请求数 n* vs 折扣 ρ：n* ≈ 12.5·ρ/(1−ρ)，含“短会话 horizon”参考线</figcaption>
         <div id="chart-discount" style="width:100%;min-height:420px"></div>
-        <div class="chart-note">读法：ρ = 目标价 ÷ 当前价，越小越便宜。曲线与 10 发参考线交于 ρ ≈ 0.44：折扣比这更深时，连短会话都能回本。</div>
+        <div class="chart-note" id="discount-note">读法：ρ = 目标价 ÷ 当前价，越小越便宜；曲线与 horizon 参考线的交点即“折扣至少要打到多少，短会话才值得切”。</div>
+      </figure>
+
+      <!-- 图E -->
+      <figure class="chart-figure">
+        <figcaption><span class="fc-num">图 E</span>临界点分布（模拟）：大量会话的临界缓存读分布，标出 P10 / 中位 / P90</figcaption>
+        <div id="chart-distribution" style="width:100%;min-height:420px"></div>
+        <div class="chart-note" id="distribution-note">说明：本图为<strong>参数化模拟</strong>（按上方“新增输入 / 输出 token 的均值与波动”抽样生成），<strong>非真实统计数据</strong>；用于预演“临界点会呈现什么分布”。接入真实调用日志后即以实测分布替代（见下）。</div>
       </figure>
 
       <h3>界面布局建议</h3>
       <p>建议在「渠道 / 路由」管理页新增一个“会话成本路由”面板，自上而下分为四块：</p>
       <ul class="plain">
-        <li><strong>① 现状指示器：</strong>当前会话的渠道、会话位置 k、预计剩余轮数、当前是否处于缓存重置点。</li>
-        <li><strong>② 候选报价对比：</strong>同一对外模型下各渠道的“本轮花费 / 重灌代价 / 回本轮数”并排，用颜色标注是否跨越临界点。</li>
-        <li><strong>③ 决策与节省：</strong>给出“保持 / 切换”建议，及本次切换的<strong>预估节省</strong>与回本门槛。</li>
-        <li><strong>④ 函数图区：</strong>即上面 图 A / 图 B / 图 C，作为“为什么是这个结论”的解释层。</li>
+        <li><strong>① 现状指示器：</strong>当前会话的渠道、会话位置 k、预计剩余轮数、当前是否处于<strong>会话起点</strong>。</li>
+        <li><strong>② 参数面板：</strong>各渠道三档价与全局入参均可调（见上），直接驱动 图 A / 图 B / 图 C / 图 E。</li>
+        <li><strong>③ 候选报价对比：</strong>同一对外模型下各渠道的“本轮花费 / 重灌代价 / 回本轮数”并排，用颜色标注是否跨越临界点。</li>
+        <li><strong>④ 决策与节省：</strong>给出“保持 / 切换”建议，及本次切换的<strong>预估节省</strong>与回本门槛。</li>
+        <li><strong>⑤ 函数图区：</strong>即上面 图 A / 图 B / 图 C / 图 E，作为“为什么是这个结论”的解释层。</li>
       </ul>
 
       <h3>统计 / 事件视图（设计建议）</h3>
@@ -593,12 +681,12 @@ B：若 预计剩余轮数 &gt; 回本轮数 → 切换</div>
             <tr><td class="mono">重灌代价</td><td>一次性重灌开销（公式 2）</td></tr>
             <tr><td class="mono">回本轮数</td><td>公式 4 的结果</td></tr>
             <tr><td class="mono">预计剩余轮数</td><td>由会话位置 k 估计</td></tr>
-            <tr><td class="mono">决策</td><td>切换 / 保持，及命中的门控（缓存重置点、剩余轮数 &gt; 回本）</td></tr>
+            <tr><td class="mono">决策</td><td>切换 / 保持，及命中的门控（会话起点零成本、剩余轮数 &gt; 回本）</td></tr>
             <tr><td class="mono">实际节省</td><td>结算后回填的真实节省（积分）</td></tr>
           </tbody>
         </table>
       </div>
-      <p class="chart-note">呈现形式建议：可筛选的时间序列表（支持按渠道、是否切换、是否缓存重置点过滤）。</p>
+      <p class="chart-note">呈现形式建议：可筛选的时间序列表（支持按渠道、是否切换、是否会话起点过滤）。</p>
 
       <h4>建议 3 · 缓存命中率 α</h4>
       <div class="table-wrap">
@@ -627,6 +715,28 @@ B：若 预计剩余轮数 &gt; 回本轮数 → 切换</div>
         </table>
       </div>
       <p class="chart-note">用途：先“只读”观测一段时间，验证公式与阈值（临界 1.35 万、下限 5.9、门槛 6）在本业务上是否成立，再逐步放开真实切换。</p>
+
+      <h3>用真实数据：把“每次请求的 token 明细”带进入参</h3>
+      <p>上面的图默认用“假设的每轮 token”。但真实系统里，<strong>会话内的每次请求都有精确的 token 明细</strong>（缓存读 / 新增输入 / 输出）——直接把这组明细<strong>带入每一次请求</strong>，算出来的就是这条会话<strong>真实</strong>的每轮花费与临界点，而不是估的：</p>
+      <ul class="plain">
+        <li>把 图 A / 图 B 的入参从“常数”换成“该会话本轮的真实 token 三元组”，逐轮重算；</li>
+        <li>“回本所需轮数”“临界缓存读”随之变成<strong>逐会话、逐轮的具体值</strong>，可直接写进切换事件流。</li>
+      </ul>
+
+      <h4>建议 5 · 临界点分布（用大量会话的真实明细）</h4>
+      <p>把每条会话的临界缓存读汇总起来，就会发现它<strong>不是单点，而是一个分布</strong>——这正是 图 E 想表达的东西：有的会话临界点很低（几乎一开就该切），有的很高（怎么切都不划算）。真实调用日志到位后，用<strong>观测分布</strong>替换 图 E 的模拟分布，即可回答“<mark class="key">大多数会话的临界点落在什么区间</mark>”。</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>字段</th><th>含义</th></tr></thead>
+          <tbody>
+            <tr><td class="mono">每次请求 token 明细</td><td>缓存读 / 新增输入 / 输出（来自调用日志，逐轮）</td></tr>
+            <tr><td class="mono">会话临界缓存读</td><td>由该会话 token 明细与各渠道三档价算出的临界点</td></tr>
+            <tr><td class="mono">分布统计</td><td>分位数（P10 / P50 / P90）、直方图、按渠道组合分层</td></tr>
+            <tr><td class="mono">规律观察</td><td>临界点是否随会话长度 / 渠道组合 / 时段呈系统性聚集</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="chart-note">呈现形式建议：直方图 + 分位数标记（即 图 E），并按渠道组合分组对比。</p>
     </section>
 
     <!-- ===== 07 落地 ===== -->
@@ -639,7 +749,7 @@ B：若 预计剩余轮数 &gt; 回本轮数 → 切换</div>
         <span class="ph">P0</span>
         <div class="pb"><strong>只读观测（影子模式）。</strong>开关处于“只记录不切换”：照常会话亲和，同时用公式计算“本可切换”的假设节省并落库，验证公式、阈值与账实一致性。风险最低。</div>
         <span class="ph p1">P1</span>
-        <div class="pb"><strong>保守切换（仅缓存重置点）。</strong>只在缓存重置点允许切换，并以“剩余轮数 &gt; 回本轮数”为门控。此阶段不动“用户消息边界”，规避 19%~40% 的多付。</div>
+        <div class="pb"><strong>起点择优 + 保守中途切换。</strong>先只在新会话起点做零成本选路；中途切换以“剩余轮数 &gt; 回本轮数”为门控，并保守计入重灌代价，规避 19%~40% 的多付。</div>
         <span class="ph p2">P2</span>
         <div class="pb"><strong>会话中途择优 + 抖动抑制。</strong>在非边界也可评估切换，但把重灌代价显式计入；引入最小剩余轮数、冷却时间、滞回（避免来回横跳）等抑制手段。</div>
         <span class="ph p3">P3</span>
@@ -652,7 +762,7 @@ B：若 预计剩余轮数 &gt; 回本轮数 → 切换</div>
           <thead><tr><th>风险</th><th>说明</th><th>对策</th></tr></thead>
           <tbody>
             <tr><td>重灌成本被低估</td><td>缓存未完全命中时更贵，b_eff 与名义价不符</td><td>用公式 5 的 b_eff 校正，并保留三档价；影子模式校准</td></tr>
-            <tr><td>缓存重置点识别不准</td><td>压缩 / clear / TTL 过期事件缺失会导致错误判断</td><td>以网关侧事件为准；无法确认时按“非重置点”保守处理</td></tr>
+            <tr><td>无法感知 provider 缓存失效</td><td>上下文压缩 / TTL 过期发生在 provider 内部，网关侧拿不到信号</td><td>不依赖检测：以“起点择优”为主，中途一律按最坏情况保守计入重灌代价</td></tr>
             <tr><td>切换抖动</td><td>渠道价格波动导致来回切换</td><td>冷却、滞回、最小剩余轮数门槛（P2 引入）</td></tr>
             <tr><td>账实不一致</td><td>预估节省与结算不符</td><td>异步落库回填实际节省，做“假设 vs 实际”偏差监控</td></tr>
             <tr><td>与 Auto 模型机制重叠</td><td>Auto 别名组已有自己的语义</td><td>明确边界：本方案在成本维度让其让位（见 08 章）</td></tr>
@@ -688,7 +798,7 @@ B：若 预计剩余轮数 &gt; 回本轮数 → 切换</div>
       <div class="sec-head"><span class="sec-num">09</span><h2>结论与来源</h2></div>
 
       <p class="lead">
-        在“同一对外模型、多渠道售价结构不同”的前提下，把路由从“会话无脑粘性”升级为“会话亲和 + 逐轮成本决策”，能在<strong>不牺牲缓存收益</strong>的同时，把长上下文会话切到缓存读更便宜的渠道。决策只需三个量：本轮花费、一次性重灌代价、预计剩余轮数；门槛只需两个数：<mark class="key">临界缓存读 ≈ 1.35 万 token</mark> 与 <mark class="key">回本下限 ≈ 5.9 轮</mark>。落地按 P0（影子观测）→ P1（仅缓存重置点切换）→ P2（中途择优）→ P3（闲忙时联动）推进，风险可控。
+        在“同一对外模型、多渠道售价结构不同”的前提下，把路由从“会话无脑粘性”升级为“会话亲和 + 逐轮成本决策”，能在<strong>不牺牲缓存收益</strong>的同时，把长上下文会话切到缓存读更便宜的渠道。决策只需三个量：本轮花费、一次性重灌代价、预计剩余轮数；门槛只需两个数：<mark class="key">临界缓存读 ≈ 1.35 万 token</mark> 与 <mark class="key">回本下限 ≈ 5.9 轮</mark>。落地按 P0（影子观测）→ P1（起点择优 + 保守中途切换）→ P2（中途择优）→ P3（闲忙时联动）推进，风险可控。
       </p>
 
       <div class="callout">
