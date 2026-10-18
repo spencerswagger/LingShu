@@ -364,21 +364,29 @@ func TestOutcomeLogSwitch4xx(t *testing.T) {
 func TestOutcomeLogGate(t *testing.T) {
 	h := build(t, "http://127.0.0.1:1")
 	ctx := context.Background()
-	trail := []map[string]any{{"order": 1, "reason": "流式中断"}}
+	attempts := []map[string]any{{"order": 1, "reason": "流式中断"}}
+	trail, failed := summarizeAttempts(attempts)
 
 	logger.SetClientErrorLogEnabled(false)
 	t.Cleanup(func() { logger.SetClientErrorLogEnabled(true) })
 
 	// 4xx 客户端类结论：开关关闭时不落盘。
 	dump := withLogCapture(h)
-	h.gw.logOutcome(ctx, slog.LevelError, "chat/completions", "gpt-4", "候选失败且请求最终失败", 402, false, nil, "sess-1", trail, nil)
+	h.gw.logOutcome(ctx, slog.LevelError, "chat/completions", "gpt-4", "候选失败且请求最终失败", 402, false, nil, "sess-1", attempts, trail, failed, nil)
 	if out := dump(); strings.Contains(out, "gateway request outcome") {
 		t.Errorf("开关关闭时 4xx（402）结论不应落盘：\n%s", out)
 	}
 
+	// 上游 429：与候选级日志同口径——不属客户端错误，开关关闭时也必须落盘。
+	dump = withLogCapture(h)
+	h.gw.logOutcome(ctx, slog.LevelWarn, "chat/completions", "gpt-4", "全部候选限流（本地限流/上游 429）", http.StatusTooManyRequests, false, nil, "sess-1", attempts, trail, failed, nil)
+	if out := dump(); !strings.Contains(out, "gateway request outcome") || !strings.Contains(out, "status=429") {
+		t.Errorf("开关关闭时上游 429 请求级结论仍应落盘（保持候选级/请求级同口径）：\n%s", out)
+	}
+
 	// 流式中断形态（status=200、masked=false）：只可能是故障，必须落盘且为 ERROR。
 	dump = withLogCapture(h)
-	h.gw.logOutcome(ctx, slog.LevelError, "chat/completions", "gpt-4", "候选失败且请求最终失败", 200, false, nil, "sess-1", trail, nil)
+	h.gw.logOutcome(ctx, slog.LevelError, "chat/completions", "gpt-4", "候选失败且请求最终失败", 200, false, nil, "sess-1", attempts, trail, failed, nil)
 	out := dump()
 	if !strings.Contains(out, "gateway request outcome") {
 		t.Errorf("流式中断（status=200）结论必须落盘：\n%s", out)
@@ -390,7 +398,7 @@ func TestOutcomeLogGate(t *testing.T) {
 	// 开关打开时 4xx 结论落盘。
 	logger.SetClientErrorLogEnabled(true)
 	dump = withLogCapture(h)
-	h.gw.logOutcome(ctx, slog.LevelError, "chat/completions", "gpt-4", "候选失败且请求最终失败", 402, false, nil, "sess-1", trail, nil)
+	h.gw.logOutcome(ctx, slog.LevelError, "chat/completions", "gpt-4", "候选失败且请求最终失败", 402, false, nil, "sess-1", attempts, trail, failed, nil)
 	if out := dump(); !strings.Contains(out, "gateway request outcome") {
 		t.Errorf("开关打开时 4xx（402）结论应落盘：\n%s", out)
 	}
@@ -418,9 +426,10 @@ func TestOutcomeMaskedPathNotGated(t *testing.T) {
 	logger.SetClientErrorLogEnabled(false)
 	t.Cleanup(func() { logger.SetClientErrorLogEnabled(true) })
 	dump := withLogCapture(h)
+	attempts := []map[string]any{{"order": 1, "reason": "上游失败"}, {"order": 2, "reason": "success"}}
+	trail, failed := summarizeAttempts(attempts)
 	h.gw.logOutcome(context.Background(), slog.LevelWarn, "chat/completions", "gpt-4",
-		"候选失败后请求成功（隐性失败）", http.StatusOK, true, nil, "sess-1",
-		[]map[string]any{{"order": 1, "reason": "上游失败"}, {"order": 2, "reason": "success"}}, nil)
+		"候选失败后请求成功（隐性失败）", http.StatusOK, true, nil, "sess-1", attempts, trail, failed, nil)
 	out := dump()
 	if !strings.Contains(out, "gateway request outcome") || !strings.Contains(out, "masked_by_failover=true") {
 		t.Errorf("隐性失败结论必须落盘且带 masked_by_failover=true：\n%s", out)
@@ -451,5 +460,80 @@ func TestStreamClientGone(t *testing.T) {
 				t.Errorf("streamClientGone = %v, want %v", got, c.want)
 			}
 		})
+	}
+}
+
+// diagFromTarget（上游请求构建失败、无实际鉴权头）路径下三态必须自洽：
+// present=false / empty=false / overridden=false，指纹为 empty——
+// 不得把"请求未生成"误报成"凭据被覆盖成空"。
+func TestDiagFromTargetAuthSemantics(t *testing.T) {
+	d := diagFromTarget("https://api.example.com", "/v1/chat/completions", "openai-chat", "test-key")
+	if d.authHeader == "" {
+		t.Fatalf("应推断出鉴权头名（Authorization），got %q", d.authHeader)
+	}
+	if d.authPresent || d.authEmpty || d.authOverridden {
+		t.Errorf("请求未生成时应 present/empty/overridden 均为 false，got present=%v empty=%v overridden=%v",
+			d.authPresent, d.authEmpty, d.authOverridden)
+	}
+	if d.authFP != "empty" {
+		t.Errorf("无实际凭据时指纹应为 empty，got %q", d.authFP)
+	}
+	// 对照：确有实际鉴权头且值与协议隐含注入值不一致时，overridden 才为 true。
+	req := httptest.NewRequest(http.MethodPost, "https://api.example.com/v1/chat/completions", nil)
+	req.Header.Set("Authorization", "Bearer other-key")
+	d2 := diagFromRequest(req, "openai-chat", "test-key")
+	if !d2.authPresent || !d2.authOverridden {
+		t.Errorf("显式覆盖鉴权头时应 present=true overridden=true，got present=%v overridden=%v",
+			d2.authPresent, d2.authOverridden)
+	}
+}
+
+// 上游 429 在 ClientErrorLogEnabled=off 时：候选级（logUpstreamErr）与请求级（logOutcome）
+// 都必须落盘——429 不属客户端错误，不得因开关关闭而出现"候选有、请求级无"。
+func TestUpstream429OutcomeNotGatedByClientSwitch(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer upstream.Close()
+
+	h := build(t, upstream.URL)
+	logger.SetClientErrorLogEnabled(false)
+	t.Cleanup(func() { logger.SetClientErrorLogEnabled(true) })
+	dump := withLogCapture(h)
+
+	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-testtoken",
+		`{"model":"gpt-4","stream":false,"messages":[{"role":"user","content":"ping"}]}`)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("want 429, got %d: %s", rec.Code, rec.Body.String())
+	}
+	out := dump()
+	if !strings.Contains(out, "upstream rate limited") {
+		t.Errorf("候选级 429 日志缺失：\n%s", out)
+	}
+	if !strings.Contains(out, "gateway request outcome") || !strings.Contains(out, "status=429") {
+		t.Errorf("开关关闭时请求级 429 结论必须落盘（与候选级同口径）：\n%s", out)
+	}
+}
+
+// 前缀样式（sk-/rk-/...）之外的"高熵长串"（无前缀明文令牌）也必须被兜底脱敏；
+// 同时不得误伤纯小写的模型名/错误标识（既有样式规则保持不变）。
+func TestSanitizeErrSummaryMasksHighEntropyToken(t *testing.T) {
+	const tok = "A1b2C3d4E5f6G7h8I9j0K1l2M3n4P5"
+	got := sanitizeErrSummary("upstream said token " + tok + " is invalid")
+	if strings.Contains(got, tok) {
+		t.Errorf("高熵长串未被脱敏: %q", got)
+	}
+	if !strings.Contains(got, "***") {
+		t.Errorf("缺少脱敏标记: %q", got)
+	}
+	// 纯小写（无大写）的模型名 / 错误标识必须原样保留。
+	for _, keep := range []string{
+		"claude-3-5-sonnet-20241022",
+		"gpt-4-turbo-2024-04-09",
+		"invalid_request_error",
+	} {
+		if out := sanitizeErrSummary(keep); out != keep {
+			t.Errorf("纯小写标识被误清洗: in=%q out=%q", keep, out)
+		}
 	}
 }

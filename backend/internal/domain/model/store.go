@@ -72,21 +72,19 @@ type Store struct {
 	db *sql.DB
 
 	// extNameCache 缓存 GetByExternalName 的结果（网关热路径每请求按对外名读取，配置低频变更）。
+	// 存储、FIFO 淘汰、失效代际均由 pkg/gencache 原语承担；本类型只保留 readCacheOff 开关
+	// 与 value 语义（负缓存 nil、读侧 cloneExternal 深拷贝）。
 	//   - 数据来源：external_models 表（仅 enabled=true 且 deleted_at IS NULL 的启用行）；
-	//   - 键 = external_name；值为命中的启用模型（查询所得完整快照，含 id/enabled）；
+	//   - 键值语义：键 = external_name；值为命中的启用模型（查询所得完整快照，含 id/enabled）；
 	//     映射内 value=nil 表示「已确认无启用模型」的负缓存，避免不存在/停用名反复穿透到 DB；
-	//   - 键来自请求体（用户可控），故**有界**（原语 FIFO 淘汰，上限 defaultExternalNameCacheMax）：防止认证用户以海量
-	//     随机名打满负缓存造成内存耗尽 DoS。淘汰代价仅为回源一次 DB，不影响正确性。
+	//   - 有界性：键来自请求体（用户可控），故**有界**（原语 FIFO 淘汰，上限 defaultExternalNameCacheMax）：
+	//     防止认证用户以海量随机名打满负缓存造成内存耗尽 DoS。淘汰代价仅为回源一次 DB，不影响正确性。
 	//   - 失效点（写路径显式失效，无 TTL）：
 	//     本文件 Insert（按名失效）、Update/BatchDelete（无旧名信息，整体清空）；
 	//     ApplySaleRates 自身**不再失效**（避免批量同步逐次全清写放大），由调用方负责：
 	//     service.ApplyPrice 按名失效、service.SyncPrices 循环结束后整体清空一次（均含跨包 hook）；
 	//     以及 service.go 的 CreateModel/UpdateModel/BatchDeleteModels/ApplyPrice/SyncPrices。
 	//   - 关闭开关（SetReadCacheEnabled(false)）时退回直查，不读写缓存。
-	// extNameCache 承载对外名读缓存的存储、FIFO 淘汰、失效代际；键 = external_name，
-	// value = 命中的启用模型快照（查询所得完整快照），value=nil 表示负缓存「已确认无启用模型」。
-	// 存储/淘汰/代际/失效均由 pkg/gencache 原语承担；本类型只保留 readCacheOff 开关
-	// 与 value 语义（负缓存 nil、读侧 cloneExternal 深拷贝）。
 	extNameCache *gencache.Cache[*ExternalModel]
 	// readCacheOff 为 true 时关闭缓存（安全态：全部直查 DB）。仅启动装配阶段设置，运行期不变。
 	readCacheOff bool

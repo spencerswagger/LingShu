@@ -386,6 +386,12 @@ func startMockUpstream(t *testing.T) *httptest.Server {
 // adminNewPassword 是 e2e 中默认管理员首登改密后的新口令（满足强度要求：≥8 位且含多类字符）。
 const adminNewPassword = "Admin@123456"
 
+// 管理员新建账号强制首登改密（identity.MustChangePassword=true），故 e2e 中由管理员创建的
+// dev/secdev 需先改密后才能访问受门禁保护的接口；以下为其改密后的口令，后续登录与
+// 二次验证（X-Current-Password / TOTP 的 Password 字段）一律使用新口令。
+const devNewPassword = "Dev@1234567"
+const secdevNewPassword = "Secdev@1234567"
+
 // login 以用户名/口令走 /auth/login 一步登录，返回 JWT；失败直接终止测试。
 func login(t *testing.T, base, username, password string) string {
 	t.Helper()
@@ -449,6 +455,30 @@ func loginAdmin(t *testing.T, base string) string {
 	}
 	if err := json.Unmarshal(ar.Data, &c); err != nil {
 		t.Fatalf("decode change password: %v", err)
+	}
+	return c.Token
+}
+
+// changePassword 走强制改密白名单路径 /auth/me/password，返回改密后的新 token
+// （改密会 bump 会话代数，旧 token 立即失效，故必须使用返回值）。
+func changePassword(t *testing.T, base, token, oldPw, newPw string) string {
+	t.Helper()
+	status, raw := req(t, http.MethodPut, base+"/api/v1/auth/me/password", token, map[string]string{
+		"OldPassword": oldPw,
+		"NewPassword": newPw,
+	})
+	if status != http.StatusOK {
+		t.Fatalf("change password status=%d body=%s", status, raw)
+	}
+	ar := decodeResp(t, raw)
+	var c struct {
+		Token string `json:"Token"`
+	}
+	if err := json.Unmarshal(ar.Data, &c); err != nil {
+		t.Fatalf("decode change password: %v", err)
+	}
+	if c.Token == "" {
+		t.Fatal("change password 返回空 token")
 	}
 	return c.Token
 }
@@ -544,6 +574,19 @@ func TestE2E_GatewayBillingLoop(t *testing.T) {
 		channelID = id
 	}
 
+	// 3b) 为渠道建一个密钥（channel_keys）：路由候选是「渠道 × 密钥 × 内部模型」三元组，
+	//     无密钥则无可用候选；请求带语义标签时会直接命中 noRoute（503）。
+	{
+		path := fmt.Sprintf("/api/v1/admin/channels/%d/keys", channelID)
+		status, raw := req(t, http.MethodPost, base+path, adminToken, map[string]any{
+			"Name": "k1", "Credential": "sk-mock-upstream",
+		})
+		if status != http.StatusOK {
+			t.Fatalf("create channel key status=%d body=%s", status, raw)
+		}
+		decodeResp(t, raw)
+	}
+
 	// 4) admin 建对外模型(qw-max，sale_rates 1.0/2.0) 与语义标签 {provider:domestic}；
 	//    随后为渠道绑定内部模型（channel_models：internal qwen-max + cost 与 sale 相同）。
 	//    请求体统一用 PascalCase 键（Input/Output/CacheRead）以锁定内部 API 契约（三段口径）。
@@ -620,6 +663,8 @@ func TestE2E_GatewayBillingLoop(t *testing.T) {
 	var devTokenID string
 	{
 		devToken = login(t, base, "dev1", "Dev@123456")
+		// 管理员新建账号强制首登改密：先改密，否则 dev/tokens 会被 40302 拦截。
+		devToken = changePassword(t, base, devToken, "Dev@123456", devNewPassword)
 		status, raw := req(t, http.MethodPost, base+"/api/v1/dev/tokens", devToken, map[string]any{
 			"DisplayName": "e2e", "TagID": strconv.FormatInt(tagID, 10),
 		})
@@ -663,7 +708,7 @@ func TestE2E_GatewayBillingLoop(t *testing.T) {
 			t.Fatalf("new secret request: %v", err)
 		}
 		r2.Header.Set("Authorization", "Bearer "+devToken)
-		r2.Header.Set("X-Current-Password", "Dev@123456")
+		r2.Header.Set("X-Current-Password", devNewPassword)
 		resp, err := http.DefaultClient.Do(r2)
 		if err != nil {
 			t.Fatalf("do secret request: %v", err)
@@ -918,7 +963,9 @@ func TestE2E_Security(t *testing.T) {
 
 		// dev 登录 → TOTP setup（拿 base32 secret）；需当前口令二次验证
 		devToken := login(t, base, "secdev", "Secdev@12345")
-		status, raw = req(t, http.MethodPost, base+"/api/v1/auth/me/totp/setup", devToken, map[string]string{"Password": "Secdev@12345"})
+		// 管理员新建账号强制首登改密：先改密，后续二次验证与登录一律使用新口令。
+		devToken = changePassword(t, base, devToken, "Secdev@12345", secdevNewPassword)
+		status, raw = req(t, http.MethodPost, base+"/api/v1/auth/me/totp/setup", devToken, map[string]string{"Password": secdevNewPassword})
 		if status != http.StatusOK {
 			t.Fatalf("totp setup status=%d body=%s", status, raw)
 		}
@@ -938,7 +985,7 @@ func TestE2E_Security(t *testing.T) {
 		if err != nil {
 			t.Fatalf("generate totp code: %v", err)
 		}
-		status, raw = req(t, http.MethodPost, base+"/api/v1/auth/me/totp/confirm", devToken, map[string]string{"Password": "Secdev@12345", "Code": code})
+		status, raw = req(t, http.MethodPost, base+"/api/v1/auth/me/totp/confirm", devToken, map[string]string{"Password": secdevNewPassword, "Code": code})
 		if status != http.StatusOK {
 			t.Fatalf("totp confirm status=%d body=%s", status, raw)
 		}
@@ -955,7 +1002,7 @@ func TestE2E_Security(t *testing.T) {
 
 		// 第一步：密码登录 → need_totp + preauth_token（不发 token）
 		status, raw = req(t, http.MethodPost, base+"/api/v1/auth/login", "", map[string]string{
-			"Username": "secdev", "Password": "Secdev@12345",
+			"Username": "secdev", "Password": secdevNewPassword,
 		})
 		if status != http.StatusOK {
 			t.Fatalf("two-step login step1 status=%d body=%s", status, raw)
@@ -1001,7 +1048,7 @@ func TestE2E_Security(t *testing.T) {
 		// 恢复码一次性：首次使用成功，再次使用同一恢复码失败。
 		recovery := cf.RecoveryCodes[0]
 		status, raw = req(t, http.MethodPost, base+"/api/v1/auth/login", "", map[string]string{
-			"Username": "secdev", "Password": "Secdev@12345",
+			"Username": "secdev", "Password": secdevNewPassword,
 		})
 		if status != http.StatusOK {
 			t.Fatalf("recovery login step1 status=%d body=%s", status, raw)
@@ -1023,7 +1070,7 @@ func TestE2E_Security(t *testing.T) {
 
 		// 复用同一恢复码 → 401（一次性）
 		status, raw = req(t, http.MethodPost, base+"/api/v1/auth/login", "", map[string]string{
-			"Username": "secdev", "Password": "Secdev@12345",
+			"Username": "secdev", "Password": secdevNewPassword,
 		})
 		if status != http.StatusOK {
 			t.Fatalf("reuse login step1 status=%d body=%s", status, raw)

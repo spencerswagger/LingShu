@@ -975,6 +975,100 @@ func TestConfigProvider_SetCacheEnabled_OffAlwaysReadsDB(t *testing.T) {
 	}
 }
 
+// invalidateFirstReadSource 在「某 key 首次回源」期间触发一次 InvalidateCostConfig，
+// 以确定性地模拟「读路径回源期间发生写路径失效」的时序（无需 sleep），用于验证陈旧回填被拒绝。
+type invalidateFirstReadSource struct {
+	src  *countingSource
+	p    *defaultConfigProvider
+	seen map[string]int
+}
+
+func (s *invalidateFirstReadSource) GetConfig(_ context.Context, key string) ([]byte, error) {
+	v, err := s.src.GetConfig(context.Background(), key)
+	s.seen[key]++
+	if s.seen[key] == 1 && s.p != nil {
+		// 首次回源期间发生失效：递增代际，读路径携带的陈旧代际回填随后必须被丢弃。
+		s.p.InvalidateCostConfig()
+	}
+	return v, err
+}
+
+// TestConfigProvider_StaleFillAfterInvalidateRejected 锁定并发「失效 + 回填」竞态（P2）：
+// 读路径回源前捕获代际；若回源期间发生失效（InvalidateCostConfig 递增代际，如 sys_configs 写钩子），
+// 携带陈旧代际的回填必须被丢弃，否则失效前读到的旧配置值（无 TTL）会滞留——R 滞留会污染计费分母。
+// 断言方式：首读回源期间失效 ⇒ 陈旧回填被拒 ⇒ 第二读仍须回源（总回源 2）；第三读才命中缓存。
+func TestConfigProvider_StaleFillAfterInvalidateRejected(t *testing.T) {
+	t.Run("R", func(t *testing.T) {
+		src := &countingSource{data: map[string][]byte{cfgR: []byte(`10000`)}, calls: map[string]int{}}
+		p := &defaultConfigProvider{}
+		p.src = &invalidateFirstReadSource{src: src, p: p, seen: map[string]int{}}
+
+		if got, err := p.R(); err != nil || got != 10000 {
+			t.Fatalf("R=%d err=%v", got, err)
+		}
+		if _, err := p.R(); err != nil { // 陈旧回填被拒 ⇒ 再次回源
+			t.Fatalf("R(second): %v", err)
+		}
+		if _, err := p.R(); err != nil { // 此时已回填 ⇒ 命中缓存
+			t.Fatalf("R(third): %v", err)
+		}
+		if src.calls[cfgR] != 2 {
+			t.Fatalf("失效后陈旧回填应被拒绝（第二读须回源，总回源 2）；got %d", src.calls[cfgR])
+		}
+	})
+	t.Run("ContextTiers", func(t *testing.T) {
+		src := &countingSource{data: map[string][]byte{cfgTiers: []byte(`[{"Min":0,"Max":null,"Coeff":1.5}]`)}, calls: map[string]int{}}
+		p := &defaultConfigProvider{}
+		p.src = &invalidateFirstReadSource{src: src, p: p, seen: map[string]int{}}
+
+		if tiers, err := p.ContextTiers(); err != nil || len(tiers) != 1 {
+			t.Fatalf("tiers=%v err=%v", tiers, err)
+		}
+		if _, err := p.ContextTiers(); err != nil { // 陈旧回填被拒 ⇒ 再次回源
+			t.Fatalf("tiers(second): %v", err)
+		}
+		if _, err := p.ContextTiers(); err != nil { // 此时已回填 ⇒ 命中缓存
+			t.Fatalf("tiers(third): %v", err)
+		}
+		if src.calls[cfgTiers] != 2 {
+			t.Fatalf("失效后陈旧回填应被拒绝（第二读须回源，总回源 2）；got %d", src.calls[cfgTiers])
+		}
+	})
+}
+
+// TestRequestCredits_ContextTierUsesInputPlusCacheRead 锁定 requestCredits 的上下文分档输入口径
+// （三段口径下 Input 只是纯输入，实际处理的上下文规模 = Input + CacheRead）——防止 3facce6 那类
+// 仅用 Input 分档的误改回归。构造「仅当计入 CacheRead 才命中高倍率分档」的用例，以
+// EstimateBreakdown（与 Record 同一 requestCredits 路径）返回的 ctxCoeff 断言。
+func TestRequestCredits_ContextTierUsesInputPlusCacheRead(t *testing.T) {
+	db, _, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	limit := int64(1000)
+	cfg := newFakeConfig()
+	cfg.tiers = []TierRule{
+		{Min: 0, Max: &limit, Coeff: 1.0},
+		{Min: limit, Max: nil, Coeff: 3.0},
+	}
+	svc := newTestService(db, &fakeCredit{}, cfg, time.Date(2026, 1, 2, 12, 0, 0, 0, shLocForTest(t)))
+
+	// Input=600 < 1000；Input+CacheRead=1200 ≥ 1000 ⇒ 应命中 Coeff=3.0 分档。
+	_, _, ctxCoeff, _, err := svc.EstimateBreakdown(context.Background(), RecordReq{
+		ExternalModel: "ext-model",
+		Tokens:        Usage{Input: 600, CacheRead: 600},
+		Rates:         fullRates(),
+	})
+	if err != nil {
+		t.Fatalf("estimate breakdown: %v", err)
+	}
+	if ctxCoeff != 3.0 {
+		t.Fatalf("上下文分档输入应为 Input+CacheRead（1200⇒3.0）；若仅用 Input（600）会误命中 1.0，got %v", ctxCoeff)
+	}
+}
+
 func shLocForTest(t *testing.T) *time.Location {
 	t.Helper()
 	loc, err := time.LoadLocation("Asia/Shanghai")

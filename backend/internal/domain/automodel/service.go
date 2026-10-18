@@ -56,19 +56,18 @@ type Service struct {
 	extNameExists func(ctx context.Context, name string) (bool, error)
 
 	// membersCache 缓存 ResolveMembers（网关每请求按「请求名 + owner」解析 Auto；Auto 低频变更）。
+	// 存储、FIFO 淘汰、失效代际均由 pkg/gencache 原语承担；本类型只保留 readCacheOff 开关
+	// 与 value 语义（含负结果 isAuto=false、读侧成员切片防御性拷贝）。
 	//   - 数据来源：auto_models + auto_model_members（经 store.GetByName 的作用域可见性过滤 + JOIN）；
-	//   - 键 = name + "\x00" + ownerUserID（owner 为 nil 时后缀为空）；值 = 解析结果
+	//   - 键值语义：键 = name + "\x00" + ownerUserID（owner 为 nil 时后缀为空）；值 = 解析结果
 	//     （成员列表 + 是否 Auto），含「查无此名 / 已停用」的负结果（isAuto=false）；
-	//   - 键首段来自请求体（用户可控），故**有界**（原语 FIFO 淘汰，上限 defaultMembersCacheMax）：防止认证用户
-	//     以海量随机名打满负缓存造成内存耗尽 DoS。淘汰代价仅为回源一次 DB，不影响正确性。
+	//   - 有界性：键首段来自请求体（用户可控），故**有界**（原语 FIFO 淘汰，上限 defaultMembersCacheMax）：
+	//     防止认证用户以海量随机名打满负缓存造成内存耗尽 DoS。淘汰代价仅为回源一次 DB，不影响正确性。
 	//   - 失效点（写路径显式失效，无 TTL）：
 	//     本文件 Create/Update/Delete 成功后整体清空（改名/成员变更/删除均可能影响任意键，整体清空避免漏接）；
 	//     以及 **跨包** 对外模型写路径（model.Service 经 SetNameWriteHook 回调 InvalidateReadCache），
 	//     因解析结果含 JOIN 自 external_models 的 ExternalName/Enabled。
 	//   - 关闭开关（SetReadCacheEnabled(false)）时退回直查，不读写缓存。
-	// membersCache 承载 ResolveMembers 结果的存储、FIFO 淘汰、失效代际；
-	// 键 = name + "\x00" + ownerUserID，value = 解析结果（含负结果 isAuto=false）。
-	// 存储/淘汰/代际/失效均由 pkg/gencache 原语承担。
 	membersCache *gencache.Cache[resolveCacheEntry]
 	readCacheOff bool
 }

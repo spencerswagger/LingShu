@@ -15,7 +15,7 @@ created_at: 2026-10-16
 intent: 在对外模型之上引入「Auto 模型」别名层——Auto 是一个有序的对外模型成员列表，请求 Auto 名时按序选择第一个可用的成员对外模型，解析完成后完全沿用现有路由/亲和/计费/failover 链路，使用户无需随上游模型演进更换请求名。
 
 constraints:
-  - 不改动计费五段公式、usage 归一化、cost 模式（PricingModeCost）与准入校验逻辑。
+  - 不改动计费三段公式（输入/缓存读/输出）、usage 归一化、cost 模式（PricingModeCost）与准入校验逻辑；计费口径以 channel-protocol AC-16 为准。
   - 不改动既有路由选择算法（priority/成本/存活会话数排序）、会话亲和粒度与 failover 语义。
   - 不放开 channel_models 唯一约束 uq_channel_models_active(channel_id, internal_model_id)；Auto 不直接绑定渠道。
   - billing_records.external_model_name 语义保持为「实际命中的对外模型名」，现有统计/查询/前端交互不变。
@@ -118,7 +118,7 @@ Auto 解析必须早于预扣估算：预扣金额需以命中成员的售价计
 
 **计费**
 
-售价/时段/分档取值由「按请求名取对外模型」改为「按命中成员取对外模型」——`recordBilling` 与 `estimatePreConsumeCost` 内取模型的入参统一为命中成员名；五段公式、cost 模式、usage 归一化不变。账单 `external_model_name` 保持为命中成员名，新增列写入请求的 Auto 名。
+售价/时段/分档取值由「按请求名取对外模型」改为「按命中成员取对外模型」——`recordBilling` 与 `estimatePreConsumeCost` 内取模型的入参统一为命中成员名；三段公式（输入/缓存读/输出）、cost 模式、usage 归一化不变（计费口径以 channel-protocol AC-16 为准）。账单 `external_model_name` 保持为命中成员名，新增列写入请求的 Auto 名。
 
 **接口**
 

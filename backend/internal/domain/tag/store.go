@@ -11,10 +11,10 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/team/llmgateway/internal/pkg/gencache"
 	"github.com/team/llmgateway/internal/pkg/idgen"
 )
 
@@ -60,34 +60,48 @@ func nullableID(id int64) any {
 	return id
 }
 
+// defaultTagCacheMax 标签 ID 读缓存条目上限。键为雪花 tagID（服务端生成、不复用），
+// 非用户可控；此处仍给出上限以约束极端批量导入下的内存占用。
+const defaultTagCacheMax = 100000
+
 // Store 提供 semantic_tags 表的基础数据访问。
 type Store struct {
 	db *sql.DB
 
 	// tagCache 缓存 Store.GetByID（令牌鉴权热路径 → tagKVResolver 每请求读取；标签低频变更）。
+	// 存储、FIFO 淘汰、失效代际均由 pkg/gencache 原语承担；本类型只保留 readCacheOff 开关
+	// 与 value 语义（正缓存、读侧 cloneTag 防御拷贝）。
 	//   - 数据来源：semantic_tags 表（deleted_at IS NULL 的行，含 enabled 状态）；
-	//   - 键 = tagID（雪花 ID 不复用，故仅做正缓存，无需负缓存）；
+	//   - 键值语义：键 = tagID（雪花 ID 不复用，故仅做正缓存，无需负缓存）；值为命中的完整快照；
 	//   - 失效点（写路径显式失效，无 TTL）：本包 service.go 的 CreateTag（新 ID 名缓存无需清理，
-	//     仍按 ID 失效以防万一）、UpdateTag、BatchDeleteTags（按 ID 逐个失效）。
+	//     仍按 ID 失效以防万一）、UpdateTag、BatchDeleteTags（按 ID 逐个失效）经 invalidateTagID 失效；
+	//     原语在失效时递增代际，回源期间发生失效的陈旧回填（PutAtGen）会被拒绝，不滞留旧快照；
 	//   - 关闭开关（SetReadCacheEnabled(false)）时退回直查，不读写缓存。
-	tagMu        sync.RWMutex
-	tagCache     map[int64]*Tag
+	tagCache     *gencache.Cache[*Tag]
 	readCacheOff bool
 }
 
 // NewStore 创建标签存储，db 为 pgx stdlib 连接池。
 func NewStore(db *sql.DB) *Store {
-	return &Store{db: db}
+	return &Store{db: db, tagCache: gencache.New[*Tag](defaultTagCacheMax)}
 }
 
 // SetReadCacheEnabled 开关标签读缓存（默认开启）；关闭后 GetByID 直查 DB。
 func (s *Store) SetReadCacheEnabled(on bool) { s.readCacheOff = !on }
 
-// invalidateTagID 失效单个标签 ID 的缓存（写路径调用）。
+// tagCacheKey 生成 GetByID 缓存键：雪花 tagID 的十进制字符串。
+func tagCacheKey(id int64) string { return strconv.FormatInt(id, 10) }
+
+// invalidateTagID 失效单个标签 ID 的缓存（写路径调用）；原语在失效时递增失效代际。
 func (s *Store) invalidateTagID(id int64) {
-	s.tagMu.Lock()
-	delete(s.tagCache, id)
-	s.tagMu.Unlock()
+	s.tagCache.Invalidate(tagCacheKey(id))
+}
+
+// cacheTag 写入 GetByID 缓存，仅在代际仍为 gen 时写入。
+// gen 为读路径回源前捕获的代际：回源期间若发生任一次写路径失效（bump 代际），
+// 本次回填被原语拒绝，避免失效前读到的旧快照（本缓存无 TTL）无限期滞留。
+func (s *Store) cacheTag(id int64, t *Tag, gen uint64) {
+	s.tagCache.PutAtGen(tagCacheKey(id), "", t, gen)
 }
 
 // cloneTag 返回 Tag 的防御性浅拷贝（并复制 KVPairs map）。缓存命中/回源都返回拷贝，
@@ -111,13 +125,12 @@ func cloneTag(t *Tag) *Tag {
 // 返回值始终为缓存快照的**防御性拷贝**（KVPairs 复制），调用方修改不会污染缓存。
 func (s *Store) GetByID(ctx context.Context, id int64) (*Tag, error) {
 	if !s.readCacheOff {
-		s.tagMu.RLock()
-		cached, ok := s.tagCache[id]
-		s.tagMu.RUnlock()
-		if ok {
+		if cached, ok := s.tagCache.Get(tagCacheKey(id)); ok {
 			return cloneTag(cached), nil
 		}
 	}
+	// 回源前捕获代际：回源期间若发生写路径失效（bump 代际），本次回填必须被拒绝（见 cacheTag）。
+	gen := s.tagCache.Generation()
 	row := s.db.QueryRowContext(ctx,
 		`SELECT `+cols+` FROM semantic_tags WHERE id = $1 AND deleted_at IS NULL`, id)
 	t, err := scanTag(row)
@@ -125,12 +138,7 @@ func (s *Store) GetByID(ctx context.Context, id int64) (*Tag, error) {
 		return nil, err
 	}
 	if !s.readCacheOff {
-		s.tagMu.Lock()
-		if s.tagCache == nil {
-			s.tagCache = make(map[int64]*Tag)
-		}
-		s.tagCache[id] = t
-		s.tagMu.Unlock()
+		s.cacheTag(id, t, gen)
 	}
 	return cloneTag(t), nil
 }
