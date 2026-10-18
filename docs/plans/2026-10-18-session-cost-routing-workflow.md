@@ -16,7 +16,7 @@ worktree: false
 
 ## Steps
 
-- [ ] **Step 1: 新增“会话成本路由”配置读取与默认安全态**
+- [x] **Step 1: 新增“会话成本路由”配置读取与默认安全态**
 action: 新建 `backend/internal/domain/router/cost_config.go`，定义 `type SessionCostConfig struct { Enabled bool; RemainingA float64; RemainingB float64; RemainingMin int; RemainingMax int; MinRemaining int; CooldownSec int }` 与 `func NewSessionCostProvider(src configSource) *SessionCostProvider`，从 `sys_configs` 键 `routing.session_cost` 读取（JSON 对象，缺省 `{Enabled:false, RemainingA:12, RemainingB:1, RemainingMin:1, RemainingMax:20, MinRemaining:1, CooldownSec:0}`），复用 `billing.ConfigProvider` 的缓存与失效代际机制。`Enabled=false` 为默认安全态（等价现状）。中文注释写明安全态语义。新增 `cost_config_test.go` 断言缺省值与解析。不改现有路由行为。
 loop: false
 verify: cd backend && go build ./... && go test ./internal/domain/router/ -run SessionCostConfig
