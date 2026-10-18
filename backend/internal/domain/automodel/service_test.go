@@ -12,6 +12,7 @@ import (
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/team/llmgateway/internal/domain/billing"
 	"github.com/team/llmgateway/internal/domain/model"
 	"github.com/team/llmgateway/internal/pkg/resp"
 )
@@ -613,71 +614,117 @@ func TestService_ResolveMembers_DefensiveCopy(t *testing.T) {
 	}
 }
 
+// extModelSelectSQL 与 model 包 Store.GetByID 一致（跨包测试硬编码；列序与 external_models 表一致）。
+const extModelSelectSQL = `SELECT id, external_name, description, enabled, sale_rates, time_config, context_tiers, created_at, updated_at FROM external_models WHERE id = $1 AND deleted_at IS NULL`
+
+// extModelRow 构造 external_models 全列查询的一行（列序与 extModelSelectSQL 一致）。
+func extModelRow(id int64, name string, enabled bool, now time.Time) *sqlmock.Rows {
+	return sqlmock.NewRows([]string{"id", "external_name", "description", "enabled", "sale_rates", "time_config", "context_tiers", "created_at", "updated_at"}).
+		AddRow(id, name, "", enabled, `{"input":1,"output":2,"cache_read":0.1}`, nil, nil, now, now)
+}
+
 // TestCrossPackage_ModelWriteInvalidatesResolveCache 跨包失效链路集成（P1-4）：
 // 按装配层同款接线把 model.Service.SetNameWriteHook 接到 automodel.Service.InvalidateReadCache，
-// 验证真实链路：ResolveMembers 命中缓存 → 零 DB；对外模型写路径（BatchDeleteModels）后
+// 验证真实链路：ResolveMembers 命中缓存 → 零 DB；对外模型写路径（参数化覆盖多条）后
 // → automodel 解析缓存被清空 → 下一次解析重新查库并读到新快照。
 func TestCrossPackage_ModelWriteInvalidatesResolveCache(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now()
 
-	// Auto 侧：真实 automodel.Service + sqlmock。
-	autoSvc, autoMock := newServiceMock(t)
-
-	// 对外模型侧：真实 model.Service + sqlmock，并按 main.go 同款接线注入跨包失效钩子。
-	mdb, modelMock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("sqlmock: %v", err)
-	}
-	t.Cleanup(func() { _ = mdb.Close() })
-	modelSvc := model.NewService(model.NewStore(mdb))
-	modelSvc.SetNameWriteHook(autoSvc.InvalidateReadCache)
-
-	// 首次解析回源（主表 + 成员各一次）。
-	autoMock.ExpectQuery(regexp.QuoteMeta(getByNameSQL)).
-		WithArgs("auto1", int64(7)).
-		WillReturnRows(autoRow(10, "auto1", ScopeGlobal, nil, true, now))
-	autoMock.ExpectQuery(regexp.QuoteMeta(membersSQL)).
-		WithArgs("{10}").
-		WillReturnRows(sqlmock.NewRows(memberTestCols).
-			AddRow(int64(1), int64(10), int64(101), 0, "model-a", true))
-	if _, isAuto, rerr := autoSvc.ResolveMembers(ctx, "auto1", int64Ptr(7)); rerr != nil || !isAuto {
-		t.Fatalf("首次解析失败: err=%v isAuto=%v", rerr, isAuto)
-	}
-	// 第二次命中缓存：不应再查库。
-	if _, _, rerr := autoSvc.ResolveMembers(ctx, "auto1", int64Ptr(7)); rerr != nil {
-		t.Fatalf("缓存命中解析失败: %v", rerr)
-	}
-	if merr := autoMock.ExpectationsWereMet(); merr != nil {
-		t.Fatalf("命中缓存不应再读库: %v", merr)
-	}
-
-	// 触发跨包链路：对外模型批量删除（model 写路径）→ nameWriteHook → automodel 缓存清空。
-	modelMock.ExpectExec(regexp.QuoteMeta(`UPDATE external_models SET deleted_at = now() WHERE id = ANY($1::bigint[])`)).
-		WithArgs(sqlmock.AnyArg()).WillReturnResult(sqlmock.NewResult(0, 1))
-	if _, derr := modelSvc.BatchDeleteModels(ctx, []int64{101}); derr != nil {
-		t.Fatalf("批量删除对外模型失败: %v", derr)
-	}
-	if merr := modelMock.ExpectationsWereMet(); merr != nil {
-		t.Fatalf("对外模型写路径 mock 未满足: %v", merr)
+	cases := []struct {
+		name  string
+		write func(t *testing.T, svc *model.Service, mock sqlmock.Sqlmock)
+	}{
+		{
+			name: "BatchDeleteModels",
+			write: func(t *testing.T, svc *model.Service, mock sqlmock.Sqlmock) {
+				mock.ExpectExec(regexp.QuoteMeta(`UPDATE external_models SET deleted_at = now() WHERE id = ANY($1::bigint[])`)).
+					WithArgs(sqlmock.AnyArg()).WillReturnResult(sqlmock.NewResult(0, 1))
+				if _, err := svc.BatchDeleteModels(ctx, []int64{101}); err != nil {
+					t.Fatalf("批量删除对外模型失败: %v", err)
+				}
+			},
+		},
+		{
+			name: "UpdateModel",
+			write: func(t *testing.T, svc *model.Service, mock sqlmock.Sqlmock) {
+				// UpdateModel：GetByID（既有）→ Update → GetByID（回读），名称不变故跳过 GetByName。
+				mock.ExpectQuery(regexp.QuoteMeta(extModelSelectSQL)).WithArgs(int64(101)).
+					WillReturnRows(extModelRow(101, "model-a", true, now))
+				mock.ExpectExec(regexp.QuoteMeta(`UPDATE external_models SET external_name=$1, description=$2, enabled=$3`)).
+					WithArgs("model-a", "", false, sqlmock.AnyArg(), nil, nil, int64(101)).
+					WillReturnResult(sqlmock.NewResult(0, 1))
+				mock.ExpectQuery(regexp.QuoteMeta(extModelSelectSQL)).WithArgs(int64(101)).
+					WillReturnRows(extModelRow(101, "model-a", false, now))
+				disabled := false
+				if _, err := svc.UpdateModel(ctx, 101, model.ExternalModelInput{
+					ExternalName: "model-a",
+					Enabled:      &disabled,
+					SaleRates:    billing.Rates{"input": 1, "output": 2, "cache_read": 0.1},
+				}); err != nil {
+					t.Fatalf("更新对外模型失败: %v", err)
+				}
+			},
+		},
 	}
 
-	// 跨包失效后：下一次解析必须重新查库，并读到「成员已停用」的新快照（证明未命中旧缓存）。
-	autoMock.ExpectQuery(regexp.QuoteMeta(getByNameSQL)).
-		WithArgs("auto1", int64(7)).
-		WillReturnRows(autoRow(10, "auto1", ScopeGlobal, nil, true, now))
-	autoMock.ExpectQuery(regexp.QuoteMeta(membersSQL)).
-		WithArgs("{10}").
-		WillReturnRows(sqlmock.NewRows(memberTestCols).
-			AddRow(int64(1), int64(10), int64(101), 0, "model-a", false))
-	members, isAuto, rerr := autoSvc.ResolveMembers(ctx, "auto1", int64Ptr(7))
-	if rerr != nil || !isAuto {
-		t.Fatalf("跨包失效后解析失败: err=%v isAuto=%v", rerr, isAuto)
-	}
-	if len(members) != 1 || members[0].Enabled {
-		t.Fatalf("跨包失效后应读到新快照（成员 disabled），got %+v", members)
-	}
-	if merr := autoMock.ExpectationsWereMet(); merr != nil {
-		t.Fatalf("跨包失效后应重新查库: %v", merr)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Auto 侧：真实 automodel.Service + sqlmock。
+			autoSvc, autoMock := newServiceMock(t)
+
+			// 对外模型侧：真实 model.Service + sqlmock，并按 main.go 同款接线注入跨包失效钩子。
+			mdb, modelMock, err := sqlmock.New()
+			if err != nil {
+				t.Fatalf("sqlmock: %v", err)
+			}
+			t.Cleanup(func() { _ = mdb.Close() })
+			modelSvc := model.NewService(model.NewStore(mdb))
+			modelSvc.SetNameWriteHook(autoSvc.InvalidateReadCache)
+
+			// 首次解析回源（主表 + 成员各一次）。
+			autoMock.ExpectQuery(regexp.QuoteMeta(getByNameSQL)).
+				WithArgs("auto1", int64(7)).
+				WillReturnRows(autoRow(10, "auto1", ScopeGlobal, nil, true, now))
+			autoMock.ExpectQuery(regexp.QuoteMeta(membersSQL)).
+				WithArgs("{10}").
+				WillReturnRows(sqlmock.NewRows(memberTestCols).
+					AddRow(int64(1), int64(10), int64(101), 0, "model-a", true))
+			if _, isAuto, rerr := autoSvc.ResolveMembers(ctx, "auto1", int64Ptr(7)); rerr != nil || !isAuto {
+				t.Fatalf("首次解析失败: err=%v isAuto=%v", rerr, isAuto)
+			}
+			// 第二次命中缓存：不应再查库。
+			if _, _, rerr := autoSvc.ResolveMembers(ctx, "auto1", int64Ptr(7)); rerr != nil {
+				t.Fatalf("缓存命中解析失败: %v", rerr)
+			}
+			if merr := autoMock.ExpectationsWereMet(); merr != nil {
+				t.Fatalf("命中缓存不应再读库: %v", merr)
+			}
+
+			// 触发跨包链路：对外模型写路径 → nameWriteHook → automodel 缓存清空。
+			tc.write(t, modelSvc, modelMock)
+			if merr := modelMock.ExpectationsWereMet(); merr != nil {
+				t.Fatalf("对外模型写路径 mock 未满足: %v", merr)
+			}
+
+			// 跨包失效后：下一次解析必须重新查库，并读到「成员已停用」的新快照（证明未命中旧缓存）。
+			autoMock.ExpectQuery(regexp.QuoteMeta(getByNameSQL)).
+				WithArgs("auto1", int64(7)).
+				WillReturnRows(autoRow(10, "auto1", ScopeGlobal, nil, true, now))
+			autoMock.ExpectQuery(regexp.QuoteMeta(membersSQL)).
+				WithArgs("{10}").
+				WillReturnRows(sqlmock.NewRows(memberTestCols).
+					AddRow(int64(1), int64(10), int64(101), 0, "model-a", false))
+			members, isAuto, rerr := autoSvc.ResolveMembers(ctx, "auto1", int64Ptr(7))
+			if rerr != nil || !isAuto {
+				t.Fatalf("跨包失效后解析失败: err=%v isAuto=%v", rerr, isAuto)
+			}
+			if len(members) != 1 || members[0].Enabled {
+				t.Fatalf("跨包失效后应读到新快照（成员 disabled），got %+v", members)
+			}
+			if merr := autoMock.ExpectationsWereMet(); merr != nil {
+				t.Fatalf("跨包失效后应重新查库: %v", merr)
+			}
+		})
 	}
 }
