@@ -266,7 +266,6 @@
     }
     var h = g.horizon;
     var crossRho = h / (12.5 + h);
-    window.__dbgC = { h: h, crossRho: crossRho, gHorizon: g.horizon };
 
     chart.setOption({
       animation: false, textStyle: { fontFamily: FONT },
@@ -416,7 +415,7 @@
     var chs = readChannels(), g = readGlobals();
     run('A', function () { renderA(chs, g); });
     run('B', function () { renderB(chs, g); });
-    run('C', function () { renderC(chs, g); });
+    run('C', function () { renderC(g); });
     run('E', function () { renderE(chs, g); });
   }
 
