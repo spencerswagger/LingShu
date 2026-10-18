@@ -14,6 +14,7 @@ import (
 
 	"github.com/team/llmgateway/internal/domain/billing"
 	"github.com/team/llmgateway/internal/domain/model"
+	"github.com/team/llmgateway/internal/pkg/gencache"
 	"github.com/team/llmgateway/internal/pkg/resp"
 )
 
@@ -579,15 +580,39 @@ func TestService_InvalidateReadCacheForcesReread(t *testing.T) {
 // 必须有界（FIFO 淘汰），防止认证用户以海量随机名打满负缓存造成内存耗尽 DoS。
 func TestService_MembersCacheBounded(t *testing.T) {
 	s := NewService(nil)
-	s.membersCacheMax = 8
+	// 直写底层原语上限（原语在构造时确定 max），验证有界 FIFO 淘汰。
+	s.membersCache = gencache.New[resolveCacheEntry](8)
 	for i := 0; i < 100; i++ {
-		s.cacheResolvedMembers(fmt.Sprintf("n-%d\x00", i), nil, false)
+		s.cacheResolvedMembers(fmt.Sprintf("n-%d\x00", i), nil, false, s.membersCache.Generation())
 	}
-	s.membersMu.RLock()
-	got := len(s.membersCache)
-	s.membersMu.RUnlock()
-	if got > 8 {
+	if got := s.membersCache.Count(); got > 8 {
 		t.Fatalf("membersCache 应有界（<=8），got %d", got)
+	}
+}
+
+// TestService_StaleMembersFillAfterInvalidateRejected 与 identity token_cache 的同名用例同构：
+// 读路径在回源 DB 前捕获代际；若回源期间发生失效（Auto 写路径 / 跨包对外模型写路径 bump 代际），
+// 携带陈旧代际的成员缓存回填必须被拒绝——否则失效前读到的旧成员列表会滞留（本缓存无 TTL）。
+func TestService_StaleMembersFillAfterInvalidateRejected(t *testing.T) {
+	s := NewService(nil)
+	fresh := []Member{{ExternalModelID: 10, ExternalName: "a"}}
+	key := membersCacheKey("auto1", nil)
+
+	// 读路径：回源前捕获代际。
+	gen := s.membersCache.Generation()
+	// 期间失效（Auto 写路径或跨包 InvalidateReadCache）。
+	s.invalidateMembersCache()
+	// 读路径回来回填（携带陈旧代际）。
+	s.cacheResolvedMembers(key, fresh, true, gen)
+
+	if _, ok := s.membersCache.Get(key); ok {
+		t.Fatal("失效后携带陈旧代际的回填必须被拒绝（否则旧成员列表无限期滞留）")
+	}
+
+	// 对照组：期间无失效时，携带当前代际的回填应正常命中。
+	s.cacheResolvedMembers(key, fresh, true, s.membersCache.Generation())
+	if _, ok := s.membersCache.Get(key); !ok {
+		t.Fatal("无失效发生时回填应正常命中")
 	}
 }
 
@@ -595,7 +620,7 @@ func TestService_MembersCacheBounded(t *testing.T) {
 // 调用方就地修改不得污染缓存（再次解析应仍返回原始成员）。
 func TestService_ResolveMembers_DefensiveCopy(t *testing.T) {
 	s := NewService(nil)
-	s.cacheResolvedMembers("auto1\x00", []Member{{ExternalModelID: 10, ExternalName: "a"}}, true)
+	s.cacheResolvedMembers("auto1\x00", []Member{{ExternalModelID: 10, ExternalName: "a"}}, true, s.membersCache.Generation())
 
 	first, isAuto, err := s.ResolveMembers(context.Background(), "auto1", nil)
 	if err != nil || !isAuto {

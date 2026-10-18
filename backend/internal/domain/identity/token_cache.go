@@ -77,14 +77,21 @@ func cloneToken(t *Token) *Token {
 }
 
 // tokenCache 令牌鉴权两级读缓存。零值不可用，须经 newTokenCache 创建。
+//
+// 存储、FIFO 淘汰、失效代际与 userID 二级倒排索引（group=userID 字符串）全部委托给
+// pkg/gencache 原语；本类型只保留 value 语义（开关、安全 TTL、精确过期判定、防御性深拷贝）
+// 以及「命中→过期判定→回源前取代际→putAtGen 回填」的编排。
 type tokenCache struct {
 	mu      sync.RWMutex
 	enabled bool
 	ttl     time.Duration
 	// now 时钟注入点（默认 time.Now），便于测试精确过期边界。
 	now func() time.Time
+	// maxEntries 条目上限（默认 10 万）。保留为字段：既有测试会在首次访问前直写调整上限，
+	// 底层原语据此创建（见 ensureEntriesLocked）。
+	maxEntries int
 	// entries 承载 plainHash -> tokenCacheEntry 的存储、FIFO 淘汰、失效代际与
-	// userID 二级索引（以 userID 字符串作为 group）。
+	// userID 二级索引（以 userID 字符串作为 group）。首次访问时按 maxEntries 创建。
 	// 代际语义：读路径回源前捕获、回填时校验，拒绝「回源期间发生失效」的陈旧快照
 	// （防认证绕过窗口）。
 	entries *gencache.Cache[*tokenCacheEntry]
@@ -93,21 +100,30 @@ type tokenCache struct {
 // newTokenCache 创建缓存：默认启用、安全 TTL 60s、上限 10 万。
 func newTokenCache() *tokenCache {
 	return &tokenCache{
-		enabled: true,
-		ttl:     tokenCacheDefaultTTL,
-		now:     time.Now,
-		entries: gencache.New[*tokenCacheEntry](tokenCacheDefaultMaxEntries),
+		enabled:    true,
+		ttl:        tokenCacheDefaultTTL,
+		now:        time.Now,
+		maxEntries: tokenCacheDefaultMaxEntries,
 	}
+}
+
+// ensureEntriesLocked 返回底层原语，首次访问时按当前 maxEntries 创建（调用方须持有 c.mu 写锁）。
+// maxEntries 仅在测试中于首次访问前被直写调整，故创建时机决定其生效上限。
+func (c *tokenCache) ensureEntriesLocked() *gencache.Cache[*tokenCacheEntry] {
+	if c.entries == nil {
+		c.entries = gencache.New[*tokenCacheEntry](c.maxEntries)
+	}
+	return c.entries
 }
 
 // setEnabled 开关缓存；关闭时清空全部条目（避免关闭期间残留旧值）。
 func (c *tokenCache) setEnabled(enabled bool) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.enabled = enabled
 	if !enabled {
-		c.clearLocked()
+		c.ensureEntriesLocked().InvalidateAll()
 	}
+	c.mu.Unlock()
 }
 
 // setTTL 设置安全 TTL（最后防线）。
@@ -125,10 +141,14 @@ func (c *tokenCache) get(hash string) (*Token, bool) {
 		c.mu.RUnlock()
 		return nil, false
 	}
-	e, ok := c.byHash[hash]
+	cache := c.entries
 	ttl := c.ttl
 	nowFn := c.now
 	c.mu.RUnlock()
+	if cache == nil {
+		return nil, false
+	}
+	e, ok := cache.Get(hash)
 	if !ok {
 		return nil, false
 	}
@@ -152,122 +172,89 @@ func (c *tokenCache) get(hash string) (*Token, bool) {
 	return cloneToken(e.token), true
 }
 
-// put 写入鉴权结果快照（仅成功项）。等价于以当前代际调用 putAtGen，供测试/直接写入使用。
+// put 写入鉴权结果快照（仅成功项）：以当前代际无条件写入（原语 Put），供测试/直接写入使用。
 func (c *tokenCache) put(hash string, t *Token, userStatus string) {
-	c.putAtGen(hash, t, userStatus, c.generation())
-}
-
-// putLocked 实际写入（调用方须持有写锁，且已确认 t 非 nil、缓存启用、代际新鲜）。
-func (c *tokenCache) putLocked(hash string, t *Token, userStatus string) {
+	if t == nil {
+		return
+	}
+	c.mu.Lock()
+	cache := c.ensureEntriesLocked()
+	enabled := c.enabled
+	nowFn := c.now
+	c.mu.Unlock()
+	if !enabled {
+		return
+	}
 	// 防御性深拷贝：入缓存的是副本，调用方后续修改其持有的 Token（含指针字段）不影响缓存（P2-5）。
 	snap := cloneToken(t)
-	// 同一哈希覆盖：先从旧归属用户的倒排集合中摘除，避免脏索引。
-	if old, ok := c.byHash[hash]; ok {
-		c.removeFromUserLocked(old.token.UserID, hash)
-	}
-	c.byHash[hash] = &tokenCacheEntry{token: snap, userStatus: userStatus, cachedAt: c.now()}
-	set := c.byUser[snap.UserID]
-	if set == nil {
-		set = make(map[string]struct{})
-		c.byUser[snap.UserID] = set
-	}
-	set[hash] = struct{}{}
-	c.evictLocked()
+	cache.Put(hash, strconv.FormatInt(snap.UserID, 10),
+		&tokenCacheEntry{token: snap, userStatus: userStatus, cachedAt: nowFn()})
 }
 
 // invalidateByHash 按令牌哈希精确失效单个条目。
 func (c *tokenCache) invalidateByHash(hash string) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.gen++
-	if e, ok := c.byHash[hash]; ok {
-		c.removeFromUserLocked(e.token.UserID, hash)
-		delete(c.byHash, hash)
-	}
+	cache := c.ensureEntriesLocked()
+	c.mu.Unlock()
+	cache.Invalidate(hash)
 }
 
 // invalidateByUserID 按用户失效其名下全部令牌条目（用户写路径）。
 func (c *tokenCache) invalidateByUserID(userID int64) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.gen++
-	for h := range c.byUser[userID] {
-		delete(c.byHash, h)
-	}
-	delete(c.byUser, userID)
+	cache := c.ensureEntriesLocked()
+	c.mu.Unlock()
+	cache.InvalidateGroup(strconv.FormatInt(userID, 10))
 }
 
 // invalidateAll 清空全部条目（用于无法确定受影响键时的保守兜底）。
 func (c *tokenCache) invalidateAll() {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.clearLocked()
-}
-
-// clearLocked 清空两级索引（调用方须持有写锁），并递增失效代际。
-func (c *tokenCache) clearLocked() {
-	c.gen++
-	c.byHash = make(map[string]*tokenCacheEntry)
-	c.byUser = make(map[int64]map[string]struct{})
-}
-
-// removeFromUserLocked 从某用户的倒排集合摘除哈希；集合为空则删除该用户键（调用方须持有写锁）。
-func (c *tokenCache) removeFromUserLocked(userID int64, hash string) {
-	set := c.byUser[userID]
-	if set == nil {
-		return
-	}
-	delete(set, hash)
-	if len(set) == 0 {
-		delete(c.byUser, userID)
-	}
-}
-
-// evictLocked 当条目数超过上限时随机淘汰至不超限（调用方须持有写锁）。
-// 策略刻意简单：缓存仅作加速，淘汰错误的代价是回源一次 DB，不影响正确性。
-func (c *tokenCache) evictLocked() {
-	if c.maxEntries <= 0 {
-		return
-	}
-	for len(c.byHash) > c.maxEntries {
-		for h, e := range c.byHash {
-			c.removeFromUserLocked(e.token.UserID, h)
-			delete(c.byHash, h)
-			break
-		}
-	}
+	cache := c.ensureEntriesLocked()
+	c.mu.Unlock()
+	cache.InvalidateAll()
 }
 
 // count 返回当前条目数（测试/观测用）。
 func (c *tokenCache) count() int {
 	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return len(c.byHash)
+	cache := c.entries
+	c.mu.RUnlock()
+	if cache == nil {
+		return 0
+	}
+	return cache.Count()
 }
 
 // generation 返回当前缓存代际（失效时递增）。
 // 读路径在回源 DB 前捕获代际，回填时校验未被 bump，避免「失效后回填陈旧快照」的认证绕过窗口。
 func (c *tokenCache) generation() uint64 {
 	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.gen
+	cache := c.entries
+	c.mu.RUnlock()
+	if cache == nil {
+		return 0
+	}
+	return cache.Generation()
 }
 
 // putAtGen 写入鉴权结果快照，仅在 gen 仍为最新（期间未发生失效）时写入。
-// 若期间发生任一次失效（invalidate*/clearLocked 已 bump 代际），本次回填被丢弃——
+// 若期间发生任一次失效（invalidate*/setEnabled(false) 已 bump 代际），本次回填被丢弃——
 // 否则会把失效前读到的陈旧（如 ACTIVE）快照回填进缓存，使撤销/禁用/删除在该条目存活期内失效。
 func (c *tokenCache) putAtGen(hash string, t *Token, userStatus string, gen uint64) {
 	if t == nil {
 		return
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if !c.enabled {
+	cache := c.ensureEntriesLocked()
+	enabled := c.enabled
+	nowFn := c.now
+	c.mu.Unlock()
+	if !enabled {
 		return
 	}
-	if c.gen != gen {
-		// 回源期间发生过失效：拒绝回填，交由下一次请求重新回源。
-		return
-	}
-	c.putLocked(hash, t, userStatus)
+	// 防御性深拷贝：入缓存的是副本，调用方后续修改其持有的 Token（含指针字段）不影响缓存（P2-5）。
+	snap := cloneToken(t)
+	cache.PutAtGen(hash, strconv.FormatInt(snap.UserID, 10),
+		&tokenCacheEntry{token: snap, userStatus: userStatus, cachedAt: nowFn()}, gen)
 }

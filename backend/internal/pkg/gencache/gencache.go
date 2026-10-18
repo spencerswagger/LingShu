@@ -91,19 +91,37 @@ func (c *Cache[V]) PutAtGen(key, group string, v V, gen uint64) bool {
 	if c.gen != gen {
 		return false
 	}
+	c.putLocked(key, group, v)
+	return true
+}
+
+// Put 以当前代际无条件写入键值（供测试/直写使用）。
+// 与「先 Generation() 再 PutAtGen」相比，Put 在同一把锁内取代际并写入，
+// 不会被并发的失效插入到两者之间而误判为陈旧。
+func (c *Cache[V]) Put(key, group string, v V) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.putLocked(key, group, v)
+}
+
+// putLocked 执行写入（含同键覆盖的 group 迁移、FIFO 追加与超限淘汰），不做代际校验（调用方须持有写锁）。
+// 契约：
+//   - 键已存在：覆盖值且不改变 FIFO 位置；group 变化时同步迁移二级索引；
+//   - 键不存在：追加到 FIFO 尾部，并在超限时淘汰最早键；
+//   - group 为空串表示不登记分组索引。
+func (c *Cache[V]) putLocked(key, group string, v V) {
 	if old, ok := c.m[key]; ok {
 		if old.group != group {
 			c.removeFromGroupLocked(key, old.group)
 			c.addToGroupLocked(key, group)
 		}
 		c.m[key] = entry[V]{value: v, group: group}
-	} else {
-		c.m[key] = entry[V]{value: v, group: group}
-		c.order = append(c.order, key)
-		c.addToGroupLocked(key, group)
+		return
 	}
+	c.m[key] = entry[V]{value: v, group: group}
+	c.order = append(c.order, key)
+	c.addToGroupLocked(key, group)
 	c.evictLocked()
-	return true
 }
 
 // Invalidate 失效单个键，并递增代际（即使该键不存在）。
