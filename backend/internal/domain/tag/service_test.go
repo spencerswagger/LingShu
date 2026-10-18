@@ -338,3 +338,53 @@ func TestStore_StaleCacheFillAfterInvalidateRejected(t *testing.T) {
 		t.Fatal("无失效发生时回填应正常命中")
 	}
 }
+
+// TestStore_GetByID_ConcurrentInvalidateRejectsStaleFill 在真实读路径（GetByID）上验证陈旧回填拒绝：
+// 借 sqlmock 自定义 QueryMatcher 在读路径回源 DB 期间（query 匹配时）触发一次写路径失效（bump 代际），
+// 断言陈旧快照未被种回缓存、且二次读取必须重新回源——从而锁定「GetByID 必须把回源前捕获的代际
+// 正确传递到回填」这一契约（若改回 Put 或恒传当前代际，本用例会失败）。
+func TestStore_GetByID_ConcurrentInvalidateRejectsStaleFill(t *testing.T) {
+	var store *Store
+	var invalidated bool
+	matcher := sqlmock.QueryMatcherFunc(func(expectedSQL, actualSQL string) error {
+		if !invalidated && store != nil {
+			invalidated = true
+			store.invalidateTagID(1) // 模拟 Update/BatchDelete 与本次读并发
+		}
+		return sqlmock.QueryMatcherRegexp.Match(expectedSQL, actualSQL)
+	})
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(matcher))
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	store = NewStore(db)
+
+	now := time.Now()
+	q := regexp.QuoteMeta(`SELECT ` + cols + ` FROM semantic_tags WHERE id = $1 AND deleted_at IS NULL`)
+	rows := func(name string) *sqlmock.Rows {
+		return sqlmock.NewRows([]string{"id", "name", "description", "kv_pairs", "enabled", "created_by", "created_at"}).
+			AddRow(int64(1), name, "", `{"tier":"gold"}`, true, nil, now)
+	}
+
+	mock.ExpectQuery(q).WithArgs(int64(1)).WillReturnRows(rows("gold"))
+	if _, err := store.GetByID(context.Background(), 1); err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if _, ok := store.tagCache.Get(tagCacheKey(1)); ok {
+		t.Fatal("回源期间失效后，携带陈旧代际的回填必须被拒绝（否则旧标签快照无限期滞留）")
+	}
+
+	// 缓存确为空：二次读取必须重新回源并拿到新值。
+	mock.ExpectQuery(q).WithArgs(int64(1)).WillReturnRows(rows("gold-v2"))
+	tg, err := store.GetByID(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("get2: %v", err)
+	}
+	if tg.Name != "gold-v2" {
+		t.Fatalf("二次读取应回源取新值，got %+v", tg)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("expectations: %v", err)
+	}
+}
