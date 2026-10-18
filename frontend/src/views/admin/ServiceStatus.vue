@@ -27,10 +27,10 @@ import { fmtDateTime } from '@/utils/format'
 
 // ===== 维度与行模型 =====
 // 维度 key：external=对外模型 / internal=内部模型 / channel=渠道 / key=密钥。
-// 统一语义（不允许隐性逻辑）：行轴 = 已勾选维度的叉积；未勾选维度一律「折叠为摘要」（不再隐藏列）。
+// 统一语义（不允许隐性逻辑）：行轴 = 已勾选维度的叉积；列 = 已勾选维度列（未勾选维度不再显示该列）。
 // 对外模型与内部模型共享同一条「模型轴」（值同源 ModelDetail.View）：勾选其一即把模型轴纳入行轴。
 const DIM_KEYS: string[] = ['external', 'internal', 'channel', 'key']
-const dims = ref<string[]>(['channel', 'key']) // 默认只勾选「渠道 + 密钥」
+const dims = ref<string[]>(['external', 'channel']) // 默认只勾选「对外模型 + 渠道」
 
 // 刷新间隔（秒；manual 表示不自动刷新）。
 const refreshInterval = ref('30') // 默认 30 秒
@@ -122,23 +122,19 @@ const rows = computed<MatrixRow[]>(() => {
   return out
 })
 
-// 列顺序固定：对外模型｜内部模型｜渠道｜密钥，随后指标列；span-method 依赖 columnIndex 对应本数组。
-type ColKey =
-  | 'external'
-  | 'internal'
-  | 'channel'
-  | 'key'
-  | 'priority'
-  | 'cost'
-  | 'modelRpm'
-  | 'modelTpm'
-  | 'keyRpm'
-  | 'keyTpm'
-  | 'sessions'
-const COLS: ColKey[] = ['external', 'internal', 'channel', 'key', 'priority', 'cost', 'modelRpm', 'modelTpm', 'keyRpm', 'keyTpm', 'sessions']
+// 列顺序：已勾选维度列（external,internal,channel,key 固定顺序）+ 指标列（priority,limits,sessions）。
+// span-method 依赖 columnIndex 对应本数组，故以 cols 计算属性作为唯一索引真源。
+type ColKey = 'external' | 'internal' | 'channel' | 'key' | 'priority' | 'limits' | 'sessions'
+const DIM_COLS: ColKey[] = ['external', 'internal', 'channel', 'key']
+const cols = computed<ColKey[]>(() => [
+  ...DIM_COLS.filter((k) => dims.value.includes(k)),
+  'priority',
+  'limits',
+  'sessions',
+])
 
 // 合并列分组键：仅对「已勾选且进入行轴」的维度列做连续合并；折叠维度列与叶级指标不合并。
-// 指标归属（决策 3）：优先级→渠道级；成本/模型级 RPM/TPM→(渠道×内部模型)级；会话数/密钥级 RPM/TPM→密钥级。
+// 指标归属：优先级→渠道级；合并限流列→随行轴（模型级/密钥级并置）；会话数→密钥级。
 function mergeKeyOf(ck: ColKey): ((r: MatrixRow) => string) | null {
   switch (ck) {
     case 'external':
@@ -151,14 +147,10 @@ function mergeKeyOf(ck: ColKey): ((r: MatrixRow) => string) | null {
       return keyAxis.value ? (r) => (r.key ? 'K' + r.channel.View.ID + '|' + r.key.View.KeyID : '') : null
     case 'priority':
       return (r) => 'C' + r.channel.View.ID
-    case 'cost':
-      // 模型轴进入行轴：(渠道 × 内部模型) 级；折叠态：成本覆盖该渠道全部模型，按渠道级合并。
-      return modelAxis.value ? (r) => 'CM' + r.channel.View.ID + '|' + (r.model ? r.model.View.ID : '') : (r) => 'C' + r.channel.View.ID
-    case 'modelRpm':
-    case 'modelTpm':
-      return modelAxis.value ? (r) => 'CM' + r.channel.View.ID + '|' + (r.model ? r.model.View.ID : '') : null
-    case 'keyRpm':
-    case 'keyTpm':
+    case 'limits':
+      // 合并粒度随行轴：模型轴+密钥轴=逐行（不合并）；仅模型轴=渠道×模型；仅密钥轴=渠道×密钥；都无=渠道。
+      return (r) =>
+        'L' + r.channel.View.ID + '|' + (modelAxis.value ? (r.model ? r.model.View.ID : '') : '*') + '|' + (keyAxis.value ? (r.key ? r.key.View.KeyID : '') : '*')
     case 'sessions':
       return keyAxis.value ? (r) => (r.key ? 'K' + r.channel.View.ID + '|' + r.key.View.KeyID : '') : null
     default:
@@ -182,14 +174,14 @@ function buildRuns(keyFn: (r: MatrixRow) => string): number[] {
 }
 const spans = computed(() => {
   const map: Partial<Record<ColKey, number[]>> = {}
-  for (const ck of COLS) {
+  for (const ck of cols.value) {
     const fn = mergeKeyOf(ck)
     if (fn) map[ck] = buildRuns(fn)
   }
   return map
 })
 function spanMethod({ rowIndex, columnIndex }: { rowIndex: number; columnIndex: number }): [number, number] {
-  const ck = COLS[columnIndex]
+  const ck = cols.value[columnIndex]
   const arr = ck ? spans.value[ck] : undefined
   if (arr) return [arr[rowIndex] ?? 1, 1]
   return [1, 1]
@@ -441,6 +433,15 @@ function rankSymbol(r: MatrixRow): string {
   if (rank === 2) return '☆'
   return '·' + rank
 }
+// 序位图标悬浮说明（避免符号含义不明）。
+function rankTip(r: MatrixRow): string {
+  const rank = rankOf(r)
+  if (rank === null) return ''
+  if (rank === 'none') return '不参与新会话（未进入候选排序）'
+  if (rank === 1) return '首选：新会话在该对外模型下的第 1 候选'
+  if (rank === 2) return '次选：第 2 候选'
+  return `第 ${rank} 候选`
+}
 function rowClassName({ row }: { row: MatrixRow }): string {
   return rankClass(row)
 }
@@ -462,28 +463,9 @@ function compact(v: number): string {
   if (abs >= 1e3) return `${(v / 1e3).toFixed(2)}K`
   return fmtInt(v)
 }
-// 成本列：取该行覆盖（渠道 × 内部模型）候选成本的 min–max。
-// 候选由后端对全部启用对外模型实时计算；该行无匹配候选（如模型未绑定可用渠道密钥）或成本未知时显示 —。
-// 模型轴进入行轴时为单个内部模型；折叠态覆盖该渠道全部内部模型，聚合为区间。
-function costGroup(r: MatrixRow): { min: number; max: number } | null {
-  const v = view.value
-  if (!v) return null
-  const ms = r.model ? [r.model] : r.models
-  const arr: number[] = []
-  for (const m of ms) {
-    const list = v.Candidates?.[m.View.ExternalModelID]
-    if (!list || !list.length) continue
-    for (const c of list) {
-      if (c.ChannelID === r.channel.View.ID && c.ModelRowID === m.View.ID && c.CostKnown) arr.push(c.Cost)
-    }
-  }
-  if (!arr.length) return null
-  return { min: Math.min(...arr), max: Math.max(...arr) }
-}
-function costCell(r: MatrixRow): string {
-  const g = costGroup(r)
-  if (!g) return '—'
-  return g.min === g.max ? fmtNum(g.min) : `${fmtNum(g.min)}–${fmtNum(g.max)}`
+// 「RPM 当前/上限 · TPM 当前/上限」文本（表格与弹窗共用）。
+function rpmTpmText(rpm: number, rpmLimit: number, tpm: number, tpmLimit: number): string {
+  return `RPM ${fmtInt(rpm)}/${fmtInt(rpmLimit)} · TPM ${compact(tpm)}/${compact(tpmLimit)}`
 }
 // 模型级 RPM/TPM：（渠道 × 内部模型）级；模型折叠时按组聚合（该行覆盖模型的合计）。
 function modelRpmVal(r: MatrixRow): number {
@@ -529,7 +511,38 @@ function sessionsLimit(r: MatrixRow): number {
   return r.keys.reduce((s, k) => s + k.MaxSessions, 0)
 }
 
-// 成本表头说明：样值取自 SampleUsage（与决策轨迹成本同源）。
+// 合并限流列：按行预计算模型级/密钥级两组「值-上限」，单元格内两行并置。
+interface LimitCell {
+  model: { rpm: number; rpmLimit: number; tpm: number; tpmLimit: number }
+  key: { rpm: number; rpmLimit: number; tpm: number; tpmLimit: number }
+}
+const EMPTY_LIMIT: LimitCell = {
+  model: { rpm: 0, rpmLimit: 0, tpm: 0, tpmLimit: 0 },
+  key: { rpm: 0, rpmLimit: 0, tpm: 0, tpmLimit: 0 },
+}
+const limitsByRow = computed<Record<string, LimitCell>>(() => {
+  const map: Record<string, LimitCell> = {}
+  for (const r of rows.value) {
+    map[r._id] = {
+      model: { rpm: modelRpmVal(r), rpmLimit: modelRpmLimit(r), tpm: modelTpmVal(r), tpmLimit: modelTpmLimit(r) },
+      key: { rpm: keyRpmVal(r), rpmLimit: keyRpmLimit(r), tpm: keyTpmVal(r), tpmLimit: keyTpmLimit(r) },
+    }
+  }
+  return map
+})
+function lm(row: MatrixRow): LimitCell {
+  return limitsByRow.value[row._id] ?? EMPTY_LIMIT
+}
+
+// 弹窗展示用：可靠性阈值与窗口指标文本。
+function relText(r: ReliabilityConfig): string {
+  return `错误率 <${r.ErrorRatePct}% · 429 <${r.Rate429Pct}% · P99 <${r.P99LatencyMS}ms`
+}
+function metricsText(m: MachineMetrics): string {
+  return `错误率 ${pct(m.ErrorRatePct)} · 429 ${pct(m.Rate429Pct)} · P99 ${m.P99LatencyMS}ms`
+}
+
+// 成本比较样值（候选区样值说明用）。
 const sampleUsageText = computed(() => {
   const s = view.value?.SampleUsage
   if (!s) return ''
@@ -540,6 +553,8 @@ const sampleUsageText = computed(() => {
 const selectedId = ref<string | null>(null)
 const selectedRow = computed<MatrixRow | null>(() => (selectedId.value ? rows.value.find((r) => r._id === selectedId.value) || null : null))
 const detailVisible = ref(false)
+// 顶层 tab：详情 / 事件链。打开弹窗默认停在「详情」。
+const activeTopTab = ref<'detail' | 'event'>('detail')
 // 切换行才重置事件链缓存（loadedFor 与数据同清）；重复选中同一行保留已加载数据，
 // 避免清空后因 selectedId 未变、watch 不触发而导致事件链恒为空。
 function selectRow(row: MatrixRow) {
@@ -547,14 +562,13 @@ function selectRow(row: MatrixRow) {
   selectedId.value = row._id
 }
 // 点击列表任意行 → 打开「详情」弹窗（交互对齐「渠道」列表：行即入口，不再占用右侧栏）。
-// 打开时确保当前 tab 已加载：覆盖「切换行」与新选行两种路径（ensureTab 内部按 loadedFor 去重）。
 function onRowClick(row: MatrixRow) {
   selectRow(row)
+  activeTopTab.value = 'detail'
   detailVisible.value = true
-  ensureTab(activeTab.value)
 }
 
-// ===== 事件链 tab（渠道无独立状态机，故无「渠道事件」tab；仅在选中行或对应 tab 被查看时调用）=====
+// ===== 事件链 tab（渠道无独立状态机，故无「渠道事件」tab；仅在切到事件链 tab 时按需加载）=====
 const tabKeys = ['model', 'probe', 'key'] as const
 type TabKey = (typeof tabKeys)[number]
 interface TabRec {
@@ -596,9 +610,13 @@ async function ensureTab(tab: TabKey) {
     rec.loading = false
   }
 }
-// 仅监听 activeTab：行变化由 onRowClick 显式触发 ensureTab；若同时监听 selectedId，
-// 切换行时 watch 与显式调用会各发一次相同请求（ensureTab 的 loadedFor 去重在 finally 才置位）。
-watch(activeTab, () => ensureTab(activeTab.value))
+// 切到事件链顶层 tab、或事件链内切换子 tab 时按需加载（loadedFor 去重）。
+watch(activeTopTab, (t) => {
+  if (t === 'event') ensureTab(activeTab.value)
+})
+watch(activeTab, () => {
+  if (activeTopTab.value === 'event') ensureTab(activeTab.value)
+})
 
 // ===== 候选区（详情弹窗）=====
 const selectedCandidates = computed<CandidateItem[]>(() => {
@@ -610,6 +628,28 @@ function isSelectedCandidate(c: CandidateItem): boolean {
   const r = selectedRow.value
   if (!r || !r.key) return false
   return c.ChannelID === r.channel.View.ID && c.ChannelKeyID === r.key.View.KeyID
+}
+// 候选序位显示名称（回退显示 ID）：渠道名 / 密钥名（尾号）。
+const channelNameByID = computed<Record<string, string>>(() => {
+  const map: Record<string, string> = {}
+  for (const c of view.value?.Channels || []) map[c.View.ID] = c.View.Name
+  return map
+})
+const keyNameByID = computed<Record<string, { name: string; tail: string }>>(() => {
+  const map: Record<string, { name: string; tail: string }> = {}
+  for (const c of view.value?.Channels || []) {
+    for (const k of c.Keys) map[`${c.View.ID}|${k.View.KeyID}`] = { name: k.View.Name || '', tail: k.View.CredentialTail || '' }
+  }
+  return map
+})
+function channelLabel(id: string): string {
+  return channelNameByID.value[id] || `渠道 ${id}`
+}
+function keyLabel(chId: string, keyId: string): string {
+  const k = keyNameByID.value[`${chId}|${keyId}`]
+  if (!k) return `密钥 ${keyId}`
+  const nm = k.name || `密钥 ${keyId}`
+  return k.tail ? `${nm}（${k.tail}）` : nm
 }
 
 // ===== 快速恢复操作编排（复用既有已审计写端点，不新增端点）=====
@@ -752,8 +792,8 @@ onUnmounted(stopTimer)
         :row-class-name="rowClassName"
         @row-click="onRowClick"
       >
-        <!-- 对外模型（勾选=进入行轴并合并；未勾选=折叠为摘要） -->
-        <el-table-column label="对外模型" min-width="190">
+        <!-- 对外模型（勾选=进入行轴并合并；未勾选=不显示该列） -->
+        <el-table-column v-if="dims.includes('external')" label="对外模型" min-width="140">
           <template #default="{ row }">
             <div class="hcell">
               <el-tooltip placement="top" :show-after="150">
@@ -770,7 +810,7 @@ onUnmounted(stopTimer)
         </el-table-column>
 
         <!-- 内部模型 -->
-        <el-table-column label="内部模型" min-width="170">
+        <el-table-column v-if="dims.includes('internal')" label="内部模型" min-width="140">
           <template #default="{ row }">
             <div class="hcell">
               <el-tooltip placement="top" :show-after="150">
@@ -786,26 +826,39 @@ onUnmounted(stopTimer)
           </template>
         </el-table-column>
 
-        <!-- 渠道 -->
-        <el-table-column label="渠道" min-width="180">
+        <!-- 渠道（渠道无独立状态机，不显示派生状态灯；序位图标附悬浮说明） -->
+        <el-table-column v-if="dims.includes('channel')" min-width="150">
+          <template #header>
+            <el-tooltip placement="top">
+              <template #content>
+                <div class="tt">
+                  <div class="tt-line">序位：★ 首选 · ☆ 次选 · ·N 第 N 候选 · — 不参与新会话</div>
+                  <div class="tt-line">顺序来自后端候选排序（Rank），前端不重算</div>
+                  <div class="tt-line">仅「对外模型/内部模型」与「密钥」维度同时勾选时出现</div>
+                </div>
+              </template>
+              <span>渠道</span>
+            </el-tooltip>
+          </template>
           <template #default="{ row }">
             <div class="hcell">
-              <span v-if="rankSymbol(row)" class="rank-sym" :class="rankClass(row)">{{ rankSymbol(row) }}</span>
+              <el-tooltip v-if="rankSymbol(row)" :content="rankTip(row)" placement="top">
+                <span class="rank-sym" :class="rankClass(row)">{{ rankSymbol(row) }}</span>
+              </el-tooltip>
               <el-tooltip placement="top" :show-after="150">
                 <template #content>
                   <div class="tt">
                     <div v-for="(l, i) in cell(row, 'channel').reason" :key="i" class="tt-line" :class="{ danger: l.danger }">{{ l.text }}</div>
                   </div>
                 </template>
-                <span class="lamp" :data-state="lampState(cell(row, 'channel').state)" />
+                <span class="hcell-name" :title="cell(row, 'channel').name">{{ cell(row, 'channel').name }}</span>
               </el-tooltip>
-              <span class="hcell-name" :title="cell(row, 'channel').name">{{ cell(row, 'channel').name }}</span>
             </div>
           </template>
         </el-table-column>
 
         <!-- 密钥 -->
-        <el-table-column label="密钥" min-width="170">
+        <el-table-column v-if="dims.includes('key')" label="密钥" min-width="150">
           <template #default="{ row }">
             <div class="hcell">
               <el-tooltip placement="top" :show-after="150">
@@ -823,67 +876,43 @@ onUnmounted(stopTimer)
         </el-table-column>
 
         <!-- 优先级（渠道级合并） -->
-        <el-table-column label="优先级" width="90" align="center">
+        <el-table-column label="优先级" min-width="80" align="center">
           <template #header>
             <el-tooltip content="数字越大越先被路由（渠道级）" placement="top"><span>优先级</span></el-tooltip>
           </template>
           <template #default="{ row }">{{ row.channel.View.Priority }}</template>
         </el-table-column>
 
-        <!-- 成本（渠道 × 内部模型级合并；折叠态按渠道覆盖全部模型） -->
-        <el-table-column label="成本" width="150" align="center">
+        <!-- RPM / TPM 合并列：单元格内两行（上行模型级、下行密钥级），各为「当前/上限」+ 用量灯 -->
+        <el-table-column label="RPM / TPM" min-width="190" align="center">
           <template #header>
             <el-tooltip placement="top">
               <template #content>
                 <div class="tt">
-                  <div class="tt-line">成本 = 该行覆盖候选成本 min–max（引擎样值 {{ sampleUsageText }}）</div>
-                  <div class="tt-line">候选由引擎对全部启用对外模型实时计算，此处展示该行覆盖候选的成本区间</div>
+                  <div class="tt-line">上行=模型级、下行=密钥级；均为「当前值/上限」</div>
+                  <div class="tt-line">用量灯：≥100% 红 · ≥80% 橙 · 其余绿</div>
+                  <div class="tt-line">折叠维度按覆盖集合求和</div>
                 </div>
               </template>
-              <span>成本</span>
+              <span>RPM / TPM</span>
             </el-tooltip>
           </template>
-          <template #default="{ row }">{{ costCell(row) }}</template>
-        </el-table-column>
-
-        <!-- 模型级 RPM / TPM（渠道 × 内部模型级合并）：当前值/上限 + 用量灯 -->
-        <el-table-column label="模型 RPM" width="130" align="center">
           <template #default="{ row }">
-            <div class="mcell">
-              <span class="lamp" :data-state="usageLamp(modelRpmVal(row), modelRpmLimit(row))" />
-              <span class="mtext">{{ fmtInt(modelRpmVal(row)) }}/{{ fmtInt(modelRpmLimit(row)) }}</span>
-            </div>
-          </template>
-        </el-table-column>
-        <el-table-column label="模型 TPM" width="150" align="center">
-          <template #default="{ row }">
-            <div class="mcell">
-              <span class="lamp" :data-state="usageLamp(modelTpmVal(row), modelTpmLimit(row))" />
-              <span class="mtext">{{ compact(modelTpmVal(row)) }}/{{ compact(modelTpmLimit(row)) }}</span>
-            </div>
-          </template>
-        </el-table-column>
-
-        <!-- 密钥级 RPM / TPM（密钥级合并） -->
-        <el-table-column label="密钥 RPM" width="130" align="center">
-          <template #default="{ row }">
-            <div class="mcell">
-              <span class="lamp" :data-state="usageLamp(keyRpmVal(row), keyRpmLimit(row))" />
-              <span class="mtext">{{ fmtInt(keyRpmVal(row)) }}/{{ fmtInt(keyRpmLimit(row)) }}</span>
-            </div>
-          </template>
-        </el-table-column>
-        <el-table-column label="密钥 TPM" width="150" align="center">
-          <template #default="{ row }">
-            <div class="mcell">
-              <span class="lamp" :data-state="usageLamp(keyTpmVal(row), keyTpmLimit(row))" />
-              <span class="mtext">{{ compact(keyTpmVal(row)) }}/{{ compact(keyTpmLimit(row)) }}</span>
+            <div class="lmcell">
+              <div class="lmrow">
+                <span class="lamp" :data-state="usageLamp(lm(row).model.rpm, lm(row).model.rpmLimit)" />
+                <span class="lmtext"><span class="lmk">模型</span>{{ fmtInt(lm(row).model.rpm) }}/{{ fmtInt(lm(row).model.rpmLimit) }} · {{ compact(lm(row).model.tpm) }}/{{ compact(lm(row).model.tpmLimit) }}</span>
+              </div>
+              <div class="lmrow">
+                <span class="lamp" :data-state="usageLamp(lm(row).key.rpm, lm(row).key.rpmLimit)" />
+                <span class="lmtext"><span class="lmk">密钥</span>{{ fmtInt(lm(row).key.rpm) }}/{{ fmtInt(lm(row).key.rpmLimit) }} · {{ compact(lm(row).key.tpm) }}/{{ compact(lm(row).key.tpmLimit) }}</span>
+              </div>
             </div>
           </template>
         </el-table-column>
 
         <!-- 会话数（密钥级）：存活会话/并发上限 + 用量灯 -->
-        <el-table-column label="会话数" width="130" align="center">
+        <el-table-column label="会话数" min-width="110" align="center">
           <template #header>
             <el-tooltip content="会话数 = 存活会话 ActiveSessions；上限 = MaxSessions（密钥并发上限）" placement="top"><span>会话数</span></el-tooltip>
           </template>
@@ -900,112 +929,155 @@ onUnmounted(stopTimer)
       <ErrorBubble v-if="errInfo.message || errInfo.requestId" :message="errInfo.message" :request-id="errInfo.requestId" />
     </div>
 
-    <!-- 详情弹窗：点击列表行打开，交互对齐「渠道」列表，充分利用大空间 -->
-    <el-dialog v-model="detailVisible" title="详情" width="min(1120px, 94vw)" top="4vh">
+    <!-- 详情弹窗：点击列表行打开；顶部 tab 切换「详情 / 事件链」 -->
+    <el-dialog v-model="detailVisible" title="详情" width="min(1120px, 94vw)" top="3vh" class="status-dlg">
       <div v-if="!selectedRow" class="insp-empty">请选择一行查看详情</div>
-      <div v-else class="dlg-grid">
-        <!-- 对外模型 -->
-        <div class="insp-sec">
-          <div class="insp-sec-title">对外模型</div>
-          <div class="kv"><span class="k">ID</span><span class="v">{{ selectedRow.model ? selectedRow.model.View.ExternalModelID : '—' }}</span></div>
-          <div class="kv"><span class="k">名称</span><span class="v">{{ selectedRow.model ? externalNameByID[selectedRow.model.View.ExternalModelID] || '—' : '—' }}</span></div>
-          <div class="kv"><span class="k">启用态</span><span class="v">{{ selectedRow.model ? (extEnabledOf(selectedRow.model.View.ExternalModelID) ? '启用' : '停用') : '—' }}</span></div>
-        </div>
-
-        <!-- 内部模型 -->
-        <div v-if="selectedRow.model" class="insp-sec">
-          <div class="insp-sec-title">内部模型</div>
-          <div class="kv"><span class="k">ModelRowID</span><span class="v">{{ selectedRow.model.View.ID }}</span></div>
-          <div class="kv"><span class="k">InternalModelID</span><span class="v">{{ selectedRow.model.View.InternalModelID }}</span></div>
-          <div class="kv"><span class="k">State</span><span class="v"><StatusTag :value="selectedRow.model.View.State" /></span></div>
-          <div class="kv"><span class="k">LastProbe</span><span class="v">{{ fmtDateTime(selectedRow.model.View.LastProbe) }}</span></div>
-          <div class="kv"><span class="k">窗口指标</span><span class="v">错误率 {{ pct(selectedRow.model.Metrics.ErrorRatePct) }} · 429 {{ pct(selectedRow.model.Metrics.Rate429Pct) }} · P99 {{ selectedRow.model.Metrics.P99LatencyMS }}ms</span></div>
-          <div class="kv"><span class="k">用量/额度</span><span class="v">RPM {{ selectedRow.model.RPM }}/{{ selectedRow.model.RPMLimit }} · TPM {{ compact(selectedRow.model.TPM) }}/{{ compact(selectedRow.model.TPMLimit) }}</span></div>
-          <div v-if="selectedRow.model.View.LastErr" class="kv"><span class="k">LastErr</span><span class="v danger">{{ selectedRow.model.View.LastErr }}</span></div>
-        </div>
-        <div v-else class="insp-sec">
-          <div class="insp-sec-title">内部模型</div>
-          <div class="insp-empty-inline">模型维度已折叠为摘要，勾选「对外模型/内部模型」后查看具体模型</div>
-        </div>
-
-        <!-- 渠道 -->
-        <div class="insp-sec">
-          <div class="insp-sec-title">渠道</div>
-          <div class="kv"><span class="k">ID / Name</span><span class="v">#{{ selectedRow.channel.View.ID }} {{ selectedRow.channel.View.Name }}</span></div>
-          <div class="kv"><span class="k">Protocol</span><span class="v">{{ selectedRow.channel.View.Protocol }}</span></div>
-          <div class="kv"><span class="k">BaseURL</span><span class="v">{{ selectedRow.channel.View.BaseURL }}</span></div>
-          <div class="kv"><span class="k">Priority</span><span class="v">{{ selectedRow.channel.View.Priority }}</span></div>
-          <div class="kv"><span class="k">State</span><span class="v"><StatusTag :value="selectedRow.channel.State" /></span></div>
-          <div class="kv"><span class="k">LastProbe</span><span class="v">{{ fmtDateTime(selectedRow.channel.View.LastProbe) }}</span></div>
-          <div v-if="selectedRow.channel.View.LastErr" class="kv"><span class="k">LastErr</span><span class="v danger">{{ selectedRow.channel.View.LastErr }}</span></div>
-          <div class="kv"><span class="k">用量/额度</span><span class="v">RPM {{ selectedRow.channel.RPM }}/{{ selectedRow.channel.RPMLimit }} · TPM {{ compact(selectedRow.channel.TPM) }}/{{ compact(selectedRow.channel.TPMLimit) }}</span></div>
-          <div class="kv"><span class="k">Reliability 阈值</span><span class="v">错误率 &lt;{{ selectedRow.channel.View.Reliability.ErrorRatePct }}% · 429 &lt;{{ selectedRow.channel.View.Reliability.Rate429Pct }}% · P99 &lt;{{ selectedRow.channel.View.Reliability.P99LatencyMS }}ms</span></div>
-          <div class="kv"><span class="k">RateLimit</span><span class="v">RPM {{ selectedRow.channel.View.RateLimit.RPM }} · TPM {{ selectedRow.channel.View.RateLimit.TPM }} · 并发 {{ selectedRow.channel.View.RateLimit.MaxConcurrent }}</span></div>
-        </div>
-
-        <!-- 密钥 -->
-        <div v-if="selectedRow.key" class="insp-sec">
-          <div class="insp-sec-title">密钥</div>
-          <div class="kv"><span class="k">KeyID</span><span class="v">{{ selectedRow.key.View.KeyID }}</span></div>
-          <div class="kv"><span class="k">Name</span><span class="v">{{ selectedRow.key.View.Name || '—' }}</span></div>
-          <div class="kv"><span class="k">State</span><span class="v"><StatusTag :value="selectedRow.key.View.State" /></span></div>
-          <div class="kv"><span class="k">CredentialTail</span><span class="v">{{ selectedRow.key.View.CredentialTail || '—' }}</span></div>
-          <div class="kv"><span class="k">LastProbe</span><span class="v">{{ fmtDateTime(selectedRow.key.View.LastProbe) }}</span></div>
-          <div v-if="selectedRow.key.View.DrainReasons && selectedRow.key.View.DrainReasons.length" class="kv"><span class="k">DrainReasons</span><span class="v danger">{{ selectedRow.key.View.DrainReasons.join('；') }}</span></div>
-          <div class="kv"><span class="k">用量/额度</span><span class="v">RPM {{ selectedRow.key.RPM }}/{{ selectedRow.key.RPMLimit }} · TPM {{ compact(selectedRow.key.TPM) }}/{{ compact(selectedRow.key.TPMLimit) }}</span></div>
-          <div class="kv"><span class="k">会话数</span><span class="v">{{ selectedRow.key.ActiveSessions }}/{{ selectedRow.key.MaxSessions }}（存活会话/并发上限）</span></div>
-        </div>
-        <div v-else class="insp-sec">
-          <div class="insp-sec-title">密钥</div>
-          <div class="insp-empty-inline">密钥维度已折叠为摘要，勾选「密钥」后查看具体密钥</div>
-        </div>
-
-        <!-- 候选区 -->
-        <div class="insp-sec">
-          <div class="insp-sec-title">候选序位（{{ selectedRow.model ? selectedRow.model.View.ExternalModelID : '—' }}）</div>
-          <div v-if="!selectedCandidates.length" class="insp-empty-inline">模型维度已折叠，或该对外模型当前无可用候选（停用/未绑定可用渠道密钥），无色条与候选数据</div>
-          <div v-else class="cand-list">
-            <div v-for="c in selectedCandidates" :key="c.Rank" class="cand-row" :class="{ hit: isSelectedCandidate(c) }">
-              <span class="cand-rank">#{{ c.Rank }}</span>
-              <span class="cand-id">渠道 {{ c.ChannelID }} · 密钥 {{ c.ChannelKeyID }}</span>
-              <span class="cand-cost">{{ c.CostKnown ? fmtNum(c.Cost) : '未知' }}<template v-if="c.TimeCoeff">（×{{ fmtNum(c.TimeCoeff) }}）</template></span>
-            </div>
-          </div>
-          <div v-if="selectedCandidates.length" class="cand-sample">样值：{{ sampleUsageText }}</div>
-        </div>
-
-        <!-- 快速恢复 -->
-        <div class="insp-sec">
-          <div class="insp-sec-title">快速恢复</div>
+      <el-tabs v-else v-model="activeTopTab" class="dlg-tabs">
+        <!-- ===== 详情：四列字段对比表（列 = 对外模型→内部模型→渠道→密钥）+ 候选序位 ===== -->
+        <el-tab-pane label="详情" name="detail">
+          <table class="cmp-table">
+            <thead>
+              <tr>
+                <th class="cmp-field"></th>
+                <th>对外模型</th>
+                <th>内部模型</th>
+                <th>渠道</th>
+                <th>密钥</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td class="cmp-field">名称</td>
+                <td>{{ cell(selectedRow, 'external').name }}</td>
+                <td>{{ cell(selectedRow, 'internal').name }}</td>
+                <td>{{ cell(selectedRow, 'channel').name }}</td>
+                <td>
+                  <span>{{ cell(selectedRow, 'key').name }}</span>
+                  <span v-if="cell(selectedRow, 'key').sub" class="cmp-sub">{{ cell(selectedRow, 'key').sub }}</span>
+                </td>
+              </tr>
+              <tr>
+                <td class="cmp-field">状态</td>
+                <td>{{ selectedRow.model ? (extEnabledOf(selectedRow.model.View.ExternalModelID) ? '启用' : '停用') : '—' }}</td>
+                <td><StatusTag :value="cell(selectedRow, 'internal').state" /></td>
+                <td class="cmp-muted">—</td>
+                <td><StatusTag :value="cell(selectedRow, 'key').state" /></td>
+              </tr>
+              <tr>
+                <td class="cmp-field">协议 · 接口地址</td>
+                <td class="cmp-muted">—</td>
+                <td class="cmp-muted">—</td>
+                <td>
+                  <div>{{ selectedRow.channel.View.Protocol }}</div>
+                  <div class="cmp-sub">{{ selectedRow.channel.View.BaseURL }}</div>
+                </td>
+                <td class="cmp-muted">—</td>
+              </tr>
+              <tr>
+                <td class="cmp-field">优先级</td>
+                <td class="cmp-muted">—</td>
+                <td class="cmp-muted">—</td>
+                <td>{{ selectedRow.channel.View.Priority }}</td>
+                <td class="cmp-muted">—</td>
+              </tr>
+              <tr>
+                <td class="cmp-field">限流 RPM/TPM</td>
+                <td class="cmp-muted">—</td>
+                <td>{{ selectedRow.model ? rpmTpmText(selectedRow.model.RPM, selectedRow.model.RPMLimit, selectedRow.model.TPM, selectedRow.model.TPMLimit) : '—' }}</td>
+                <td>{{ rpmTpmText(selectedRow.channel.RPM, selectedRow.channel.RPMLimit, selectedRow.channel.TPM, selectedRow.channel.TPMLimit) }}</td>
+                <td>{{ selectedRow.keys.length ? rpmTpmText(keyRpmVal(selectedRow), keyRpmLimit(selectedRow), keyTpmVal(selectedRow), keyTpmLimit(selectedRow)) : '—' }}</td>
+              </tr>
+              <tr>
+                <td class="cmp-field">会话数</td>
+                <td class="cmp-muted">—</td>
+                <td class="cmp-muted">—</td>
+                <td class="cmp-muted">—</td>
+                <td>{{ selectedRow.keys.length ? `${fmtInt(sessionsVal(selectedRow))}/${fmtInt(sessionsLimit(selectedRow))}` : '—' }}</td>
+              </tr>
+              <tr>
+                <td class="cmp-field">可靠性阈值</td>
+                <td class="cmp-muted">—</td>
+                <td>{{ selectedRow.model ? relText(selectedRow.model.View.Reliability) : '—' }}</td>
+                <td>{{ relText(selectedRow.channel.View.Reliability) }}</td>
+                <td class="cmp-muted">—</td>
+              </tr>
+              <tr>
+                <td class="cmp-field">窗口指标</td>
+                <td class="cmp-muted">—</td>
+                <td>{{ selectedRow.model ? metricsText(selectedRow.model.Metrics) : '—' }}</td>
+                <td class="cmp-muted">—</td>
+                <td class="cmp-muted">—</td>
+              </tr>
+              <tr>
+                <td class="cmp-field">最近探测</td>
+                <td class="cmp-muted">—</td>
+                <td>{{ selectedRow.model ? fmtDateTime(selectedRow.model.View.LastProbe) : '—' }}</td>
+                <td>{{ fmtDateTime(selectedRow.channel.View.LastProbe) }}</td>
+                <td>{{ selectedRow.key ? fmtDateTime(selectedRow.key.View.LastProbe) : '—' }}</td>
+              </tr>
+              <tr>
+                <td class="cmp-field">最近错误</td>
+                <td class="cmp-muted">—</td>
+                <td>
+                  <span v-if="selectedRow.model && selectedRow.model.View.LastErr" class="danger">{{ selectedRow.model.View.LastErr }}</span>
+                  <span v-else class="cmp-muted">—</span>
+                </td>
+                <td>
+                  <span v-if="selectedRow.channel.View.LastErr" class="danger">{{ selectedRow.channel.View.LastErr }}</span>
+                  <span v-else class="cmp-muted">—</span>
+                </td>
+                <td>
+                  <template v-if="selectedRow.key && (selectedRow.key.View.LastErr || (selectedRow.key.View.DrainReasons && selectedRow.key.View.DrainReasons.length))">
+                    <div v-if="selectedRow.key.View.LastErr" class="danger">{{ selectedRow.key.View.LastErr }}</div>
+                    <div v-if="selectedRow.key.View.DrainReasons && selectedRow.key.View.DrainReasons.length" class="danger">排空原因：{{ selectedRow.key.View.DrainReasons.join('；') }}</div>
+                  </template>
+                  <span v-else class="cmp-muted">—</span>
+                </td>
+              </tr>
+              <tr>
+                <td class="cmp-field">操作</td>
+                <td class="cmp-muted">—</td>
+                <td>
+                  <div v-if="selectedRow.model" class="op-btns">
+                    <el-button size="small" :loading="opLoading" :disabled="opLoading" @click="doProbeModel">重新探测</el-button>
+                    <el-button size="small" type="success" :disabled="opLoading || selectedRow.model.View.State === 'NORMAL'" @click="doState('model', 'normal')">正常</el-button>
+                    <el-button size="small" type="warning" :disabled="opLoading || selectedRow.model.View.State === 'DRAIN'" @click="doState('model', 'drain')">排空</el-button>
+                    <el-button size="small" type="danger" :disabled="opLoading || selectedRow.model.View.State === 'DISABLED'" @click="doState('model', 'disable')">禁用</el-button>
+                  </div>
+                  <span v-else class="cmp-muted">—</span>
+                </td>
+                <td class="cmp-muted">—</td>
+                <td>
+                  <div v-if="selectedRow.key" class="op-btns">
+                    <el-button size="small" :loading="opLoading" :disabled="opLoading" @click="doProbeKey">重新探测</el-button>
+                    <el-button size="small" type="success" :disabled="opLoading || selectedRow.key.View.State === 'NORMAL'" @click="doState('key', 'normal')">正常</el-button>
+                    <el-button size="small" type="warning" :disabled="opLoading || selectedRow.key.View.State === 'DRAIN'" @click="doState('key', 'drain')">排空</el-button>
+                    <el-button size="small" type="danger" :disabled="opLoading || selectedRow.key.View.State === 'DISABLED'" @click="doState('key', 'disable')">禁用</el-button>
+                  </div>
+                  <span v-else class="cmp-muted">—</span>
+                </td>
+              </tr>
+            </tbody>
+          </table>
           <ErrorBubble v-if="opErr.message || opErr.requestId" :message="opErr.message" :request-id="opErr.requestId" />
-          <div class="op-grp">
-            <div class="op-grp-title">重新探测</div>
-            <div class="op-btns">
-              <el-button size="small" :loading="opLoading" :disabled="opLoading || !selectedRow.key" @click="doProbeKey">重新探测该渠道密钥</el-button>
-              <el-button size="small" :loading="opLoading" :disabled="opLoading || !selectedRow.model" @click="doProbeModel">重新探测该模型</el-button>
-            </div>
-          </div>
-          <div v-if="selectedRow.model" class="op-grp">
-            <div class="op-grp-title">强制状态 · 内部模型</div>
-            <div class="op-btns">
-              <el-button size="small" type="success" :disabled="opLoading || selectedRow.model.View.State === 'NORMAL'" @click="doState('model', 'normal')">正常</el-button>
-              <el-button size="small" type="warning" :disabled="opLoading || selectedRow.model.View.State === 'DRAIN'" @click="doState('model', 'drain')">排空</el-button>
-              <el-button size="small" type="danger" :disabled="opLoading || selectedRow.model.View.State === 'DISABLED'" @click="doState('model', 'disable')">禁用</el-button>
-            </div>
-          </div>
-          <div class="op-grp">
-            <div class="op-grp-title">强制状态 · 密钥</div>
-            <div class="op-btns">
-              <el-button size="small" type="success" :disabled="opLoading || !selectedRow.key || selectedRow.key.View.State === 'NORMAL'" @click="doState('key', 'normal')">正常</el-button>
-              <el-button size="small" type="warning" :disabled="opLoading || !selectedRow.key || selectedRow.key.View.State === 'DRAIN'" @click="doState('key', 'drain')">排空</el-button>
-              <el-button size="small" type="danger" :disabled="opLoading || !selectedRow.key || selectedRow.key.View.State === 'DISABLED'" @click="doState('key', 'disable')">禁用</el-button>
-            </div>
-          </div>
-        </div>
 
-        <!-- 事件链（跨整行，充分利用弹窗宽度） -->
-        <div class="insp-sec dlg-span">
-          <div class="insp-sec-title">事件链</div>
+          <!-- 候选序位：显示渠道名 + 密钥名（回退显示 ID） -->
+          <div class="insp-sec">
+            <div class="insp-sec-title">候选序位（{{ selectedRow.model ? (externalNameByID[selectedRow.model.View.ExternalModelID] || selectedRow.model.View.ExternalModelID) : '—' }}）</div>
+            <div v-if="!selectedCandidates.length" class="insp-empty-inline">模型维度未纳入行轴，或该对外模型当前无可用候选（停用/未绑定可用渠道密钥）</div>
+            <div v-else class="cand-list">
+              <div v-for="c in selectedCandidates" :key="c.Rank" class="cand-row" :class="{ hit: isSelectedCandidate(c) }">
+                <span class="cand-rank">#{{ c.Rank }}</span>
+                <span class="cand-id">渠道 {{ channelLabel(c.ChannelID) }} · 密钥 {{ keyLabel(c.ChannelID, c.ChannelKeyID) }}</span>
+                <span class="cand-cost">{{ c.CostKnown ? fmtNum(c.Cost) : '未知' }}<template v-if="c.TimeCoeff">（×{{ fmtNum(c.TimeCoeff) }}）</template></span>
+              </div>
+            </div>
+            <div v-if="selectedCandidates.length" class="cand-sample">样值：{{ sampleUsageText }}</div>
+          </div>
+        </el-tab-pane>
+
+        <!-- ===== 事件链 ===== -->
+        <el-tab-pane label="事件链" name="event">
           <el-tabs v-model="activeTab">
             <el-tab-pane label="模型事件" name="model">
               <div v-loading="tabState.model.loading">
@@ -1042,25 +1114,22 @@ onUnmounted(stopTimer)
               </div>
             </el-tab-pane>
           </el-tabs>
-        </div>
-      </div>
+        </el-tab-pane>
+      </el-tabs>
     </el-dialog>
 
     <!-- 页脚：聚合语义显式成文（用户规范：不允许隐性逻辑） -->
     <div class="foot-note">
-      未勾选维度一律折叠为摘要；行轴 = 已勾选维度叉积（对外/内部模型共享同一条模型轴）。
+      未勾选维度不再显示对应列；行轴 = 已勾选维度叉积（对外/内部模型共享同一条模型轴）。
     </div>
     <div class="foot-note">
-      折叠摘要状态灯取覆盖集合中最差状态（DISABLED &gt; DRAIN &gt; NORMAL，红&gt;橙&gt;绿）并标注异常数；折叠列不合并，仅行轴维度列做连续合并。
+      折叠摘要状态灯取覆盖集合中最差状态（禁用 &gt; 排空 &gt; 正常，红&gt;橙&gt;绿）并标注异常数；折叠列不合并，仅行轴维度列做连续合并。
     </div>
     <div class="foot-note">
-      维度列只展示名称，不展示内部 ID/行主键；状态以状态灯表达（与「会话」列表一致）。
+      序位图标：★ 首选 · ☆ 次选 · ·N 第 N 候选 · — 不参与新会话；仅「对外模型/内部模型」与「密钥」维度同时勾选时出现，顺序由后端候选排序决定。
     </div>
     <div class="foot-note">
-      成本区间来自引擎对全部启用对外模型实时计算的候选成本；RPM/TPM/会话数均展示「当前值/上限」并附用量灯（≥100% 红、≥80% 橙）。
-    </div>
-    <div class="foot-note">
-      序位色条仅在「对外模型/内部模型」与「密钥」两个维度同时勾选（行粒度为单一通路）时出现，不代表新会话会走这条。
+      渠道无独立状态机，故不展示渠道级状态；RPM/TPM 合并列上行为模型级、下行为密钥级，均展示「当前值/上限」并附用量灯（≥100% 红、≥80% 橙）。
     </div>
   </div>
 </template>
@@ -1101,14 +1170,42 @@ onUnmounted(stopTimer)
   width: 100%;
   min-width: 0;
 }
-/* 弹窗：两列网格充分利用宽屏空间 */
-.dlg-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 0 28px;
+/* 弹窗：顶部 tab 承载详情与事件链 */
+.dlg-tabs :deep(.el-tabs__header) {
+  margin-bottom: 12px;
 }
-.dlg-span {
-  grid-column: 1 / -1;
+/* 四列字段对比表 */
+.cmp-table {
+  width: 100%;
+  table-layout: fixed;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.cmp-table th,
+.cmp-table td {
+  border: 1px solid var(--color-border);
+  padding: 6px 8px;
+  text-align: left;
+  vertical-align: top;
+  word-break: break-all;
+}
+.cmp-table thead th {
+  background: var(--el-fill-color-light);
+  font-weight: 600;
+  color: var(--color-text);
+}
+.cmp-table .cmp-field {
+  width: 88px;
+  background: var(--el-fill-color-light);
+  color: var(--color-text-tertiary);
+  font-weight: 400;
+}
+.cmp-muted {
+  color: var(--color-text-tertiary);
+}
+.cmp-sub {
+  margin-left: 6px;
+  color: var(--color-text-tertiary);
 }
 .insp-empty,
 .insp-empty-inline {
@@ -1119,37 +1216,13 @@ onUnmounted(stopTimer)
 .insp-sec {
   padding: 10px 0;
   border-top: 1px solid var(--color-border);
-}
-.dlg-grid > .insp-sec:nth-child(1),
-.dlg-grid > .insp-sec:nth-child(2) {
-  border-top: none;
+  margin-top: 12px;
 }
 .insp-sec-title {
   font-size: 13px;
   font-weight: 600;
   color: var(--color-text);
   margin-bottom: 6px;
-}
-.kv {
-  display: flex;
-  gap: 8px;
-  font-size: 12px;
-  line-height: 1.7;
-}
-.kv .k {
-  flex: none;
-  width: 96px;
-  color: var(--color-text-tertiary);
-}
-.kv .v {
-  flex: 1;
-  min-width: 0;
-  word-break: break-all;
-  color: var(--color-text);
-}
-.kv .v.danger,
-.danger {
-  color: var(--color-danger);
 }
 .hcell {
   display: flex;
@@ -1209,6 +1282,34 @@ onUnmounted(stopTimer)
 .mtext {
   font-variant-numeric: tabular-nums;
 }
+/* 合并限流列：模型级/密钥级两行 */
+.lmcell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  align-items: flex-start;
+  line-height: 1.5;
+}
+.lmrow {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.lmtext {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.lmk {
+  display: inline-block;
+  width: 30px;
+  color: var(--color-text-tertiary);
+}
+/* 操作按钮：列内自动换行 */
+.op-btns {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
 .rank-sym {
   flex: none;
   width: 14px;
@@ -1225,7 +1326,7 @@ onUnmounted(stopTimer)
 .rank-sym.rank-none {
   color: #98a2b3;
 }
-/* 行左缘色条：金★首选 / 浅灰次选 / 深灰不参与新会话；仅「对外模型/内部模型」与「密钥」维度同时勾选时出现 */
+/* 行左缘色条：金★首选 / 浅灰次选 / 深灰不参与新会话；仅模型轴与密钥轴同时进入行轴时出现 */
 :deep(.el-table__row.rank-first) td:first-child {
   box-shadow: inset 4px 0 0 0 #f0b429;
 }
@@ -1265,31 +1366,19 @@ onUnmounted(stopTimer)
   font-weight: 600;
 }
 .cand-id {
-  flex: none;
+  min-width: 0;
   color: var(--color-text-secondary);
 }
 .cand-cost {
   margin-left: auto;
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 .cand-sample {
   margin-top: 6px;
   font-size: 11px;
   color: var(--color-text-tertiary);
   word-break: break-all;
-}
-.op-grp {
-  margin-bottom: 8px;
-}
-.op-grp-title {
-  font-size: 12px;
-  color: var(--color-text-tertiary);
-  margin-bottom: 4px;
-}
-.op-btns {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
 }
 .ev-row {
   display: flex;
@@ -1328,5 +1417,13 @@ onUnmounted(stopTimer)
   font-size: 12px;
   color: var(--color-text-tertiary);
   line-height: 1.7;
+}
+</style>
+
+<!-- 弹窗被 teleport 到 body，scoped 样式无法作用于 .el-dialog__body，故单独用非 scoped 样式限制高度 -->
+<style>
+.status-dlg .el-dialog__body {
+  max-height: 82vh;
+  overflow: auto;
 }
 </style>
