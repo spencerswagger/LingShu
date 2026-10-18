@@ -1,11 +1,15 @@
 # 后端镜像：多阶段构建，产物为静态编译的单个二进制（无 CGO 依赖）。
 # 迁移 SQL 通过 go:embed 内嵌在二进制中，启动时自动执行，无需额外拷贝文件。
+#
+# 基础镜像与软件源统一使用 Docker Hub 官方镜像 / 官方源：
+# 镜像构建在 GitHub Actions（海外运行器）执行，官方源比国内镜像更快、更稳定，
+# 也避免从国内镜像仓库跨境拉取基础镜像导致的构建缓慢。
 
-FROM registry.cn-hangzhou.aliyuncs.com/spencerswagger/library-golang:1.27-alpine AS build
+FROM golang:1.27-alpine AS build
 WORKDIR /src
 
-# 模块代理走阿里云镜像（GOPROXY），加速国内依赖拉取；末尾 direct 作为兜底
-ENV GOPROXY=https://mirrors.aliyun.com/goproxy/,direct
+# 官方 Go 模块代理（与 Go 默认值一致，显式写出以固定口径；末尾 direct 作为兜底）
+ENV GOPROXY=https://proxy.golang.org,direct
 
 # 先拷贝依赖清单，利用构建缓存
 COPY go.mod go.sum ./
@@ -14,12 +18,10 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags "-s -w" -o /out/llmgateway ./cmd/server
 
-FROM registry.cn-hangzhou.aliyuncs.com/spencerswagger/library-alpine:3.20
-# apk 软件源替换为阿里云镜像：仅改写仓库主机名，保留原有 alpine 版本路径（自动跟随基础镜像版本）
+FROM alpine:3.20
 # 安装：openssl（首次启动生成 JWT RSA 密钥对与 SM4 密钥）；tzdata（计费时段系数按 Asia/Shanghai 等时区计算）；
 #       su-exec（entrypoint 完成卷属主修复与初始化后，降权到非特权用户 app，uid 10001，运行主进程）
-RUN sed -i 's#//[^/]*/alpine#//mirrors.aliyun.com/alpine#g' /etc/apk/repositories \
-    && apk add --no-cache ca-certificates tzdata openssl su-exec \
+RUN apk add --no-cache ca-certificates tzdata openssl su-exec \
     && adduser -D -u 10001 app
 
 WORKDIR /app
