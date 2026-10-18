@@ -704,3 +704,34 @@ func TestQueueFullThenShutdown(t *testing.T) {
 		t.Fatal("关停后 Submit 必须返回错误")
 	}
 }
+
+// TestWALUnavailableRefusesAsyncSubmit 锁定 P1：配置了 WALPath 却无法打开时（父路径为普通文件 / 目录不可写），
+// 不得静默降级为纯内存模式——否则四类「持久化」写（会话/渠道事件/调用日志）将失去 WAL 兜底，
+// 背压溢出或崩溃即静默丢失，违背「绝不静默丢弃」契约。此处要求：构造期以 Err() 暴露，
+// 且 Submit 直接拒绝而非静默接受。
+func TestWALUnavailableRefusesAsyncSubmit(t *testing.T) {
+	dir := t.TempDir()
+	// 让 WALPath 的父路径是一个普通文件 → MkdirAll 与 OpenFile 均失败。
+	blocker := filepath.Join(dir, "blocker")
+	if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
+		t.Fatalf("准备阻塞文件失败: %v", err)
+	}
+	walPath := filepath.Join(blocker, "asyncwrite.wal")
+
+	w := New(Config{WALPath: walPath, AsyncKinds: map[Kind]bool{KindCallLog: true}})
+	// 打开失败必须可被装配层感知（据此致命化启动）。
+	if w.Err() == nil {
+		t.Fatal("WAL 打开失败应通过 Err() 暴露，禁止静默降级为内存模式")
+	}
+	// 运行期：配置了 WAL 却不可用 → 拒绝新的异步提交，不伪称已持久化。
+	if err := w.Submit(Job{
+		Kind: KindCallLog, Key: "k", IdempotencyKey: "idem",
+		Exec: func(context.Context) error { return nil },
+	}); err == nil {
+		t.Fatal("WAL 不可用时 Submit 必须返回错误，禁止静默接受后丢失")
+	}
+	// 关停不应 panic。
+	if err := w.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown 失败: %v", err)
+	}
+}
