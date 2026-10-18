@@ -113,7 +113,7 @@ type diag struct {
 	authHeader     string   // 按入站协议隐含的鉴权头名
 	authPresent    bool     // 该头是否存在
 	authEmpty      bool     // 存在但值为空（典型：覆盖写入了空值）
-	authOverridden bool     // 实际值与"协议隐含注入值"不一致（含被覆盖/置空）
+	authOverridden bool     // 实际值与"协议隐含注入值"不一致（仅确有凭据头时才判覆盖）
 	authFP         string   // 实际发出的凭据值指纹
 }
 
@@ -144,6 +144,9 @@ func diagFromTarget(baseURL, path, protocol, cred string) diag {
 }
 
 // inspectAuth 比对实际鉴权头与「协议隐含注入」的期望值，得出 present/empty/overridden 与指纹。
+// overridden 仅在**确有实际鉴权头**（authPresent）时才可能成立：请求尚未构建成功时（diagFromTarget
+// 传空 Header）根本没有发出凭据，present=false / empty=false / overridden=false 三者必须自洽，
+// 否则会把「请求未生成」误报成「凭据被覆盖成空」。
 func (d *diag) inspectAuth(h http.Header, protocol, cred string) {
 	header, scheme := channelprotocol.ProtocolAuth(protocol)
 	d.authHeader = header
@@ -156,10 +159,10 @@ func (d *diag) inspectAuth(h http.Header, protocol, cred string) {
 	actual := strings.Join(vals, ",")
 	d.authEmpty = d.authPresent && strings.TrimSpace(actual) == ""
 	d.authFP = credFingerprint(actual)
-	d.authOverridden = cred != "" && actual != expected
+	d.authOverridden = d.authPresent && cred != "" && actual != expected
 }
 
-// headerNameSets 返回请求头名升序列表，以及其中的凭据类头名（均只含头名，无头值）。
+// headerNameSets 返回请求头名升序列表与其中的凭据类头名（仅头名，无头值——红线）。
 func headerNameSets(h http.Header) ([]string, []string) {
 	names := make([]string, 0, len(h))
 	creds := make([]string, 0, 4)
@@ -174,7 +177,7 @@ func headerNameSets(h http.Header) ([]string, []string) {
 	return names, creds
 }
 
-// kv 把落点现场展开为日志键值对。
+// kv 把落点现场展开为日志键值对（auth_* 仅在确有鉴权头名时输出）。
 func (d diag) kv() []any {
 	args := make([]any, 0, 12)
 	if d.upstream != "" {
@@ -231,6 +234,34 @@ var (
 	credKVRe     = regexp.MustCompile(`(?i)(api[\s_-]?key|access[\s_-]?token|secret|token)(\s*[:=]\s*)["']?[A-Za-z0-9._\-]{8,}`)
 )
 
+// credHighEntropyRe 兜底匹配疑似明文令牌的高熵长串：长度≥20 的 [A-Za-z0-9_-] 连续串。
+// 上面的前缀/Bearer/KV 样式能覆盖多数厂商令牌，但**无前缀的随机令牌**（自签密钥、
+// 内部网关令牌被上游回显等）会绕过它们，故再加一层兜底，避免其经日志与 call_logs 落库。
+var credHighEntropyRe = regexp.MustCompile(`[A-Za-z0-9_-]{20,}`)
+
+// maskHighEntropyToken 判定候选长串是否属"高熵令牌"并返回遮蔽结果：
+// 仅在**同时含数字与字母**、且（含大写字母 或 长度≥32）时遮蔽——
+// 随机令牌通常是混合大小写字母数字（或无大小写的长 hex）；而纯小写的模型名/错误标识
+// （claude-3-5-sonnet-20241022、invalid_request_error、gpt-4-turbo-2024-04-09）一律保留，
+// 否则恰好抹掉排查最需要的模型/错误标识。保持既有样式规则不变，仅追加这一层兜底。
+func maskHighEntropyToken(tok string) string {
+	var hasDigit, hasLetter, hasUpper bool
+	for _, r := range tok {
+		switch {
+		case r >= '0' && r <= '9':
+			hasDigit = true
+		case r >= 'a' && r <= 'z':
+			hasLetter = true
+		case r >= 'A' && r <= 'Z':
+			hasLetter, hasUpper = true, true
+		}
+	}
+	if hasDigit && hasLetter && (hasUpper || len(tok) >= 32) {
+		return "***"
+	}
+	return tok
+}
+
 // urlQueryRe 匹配 URL 中的 query 串：日志只允许保留 host + path（红线：query 一律丢弃）。
 var urlQueryRe = regexp.MustCompile(`(?i)(https?://[^\s"'\)\]，。]+)\?[^\s"'\)\]，。]*`)
 
@@ -244,6 +275,8 @@ func sanitizeErrSummary(s string) string {
 	s = credValueRe.ReplaceAllString(s, "***")
 	s = credBearerRe.ReplaceAllString(s, "$1 ***")
 	s = credKVRe.ReplaceAllString(s, "$1$2***")
+	// 兜底：前缀样式未命中的高熵长串（无前缀明文令牌）同样不得落盘。
+	s = credHighEntropyRe.ReplaceAllStringFunc(s, maskHighEntropyToken)
 	return s
 }
 
@@ -428,15 +461,20 @@ func (g *Gateway) logUpstreamErr(ctx context.Context, lvl slog.Level, msg, endpo
 //   - masked_by_failover 只在此处给出：仅当请求确实成功且中间有候选失败时为 true
 //     （候选级日志不再输出该字段，见 logErr 注释）；
 //   - 成功但中间有候选失败（隐性失败）落 Warn，这是排查"用户正常、密钥却被禁用"的关键线索。
+//
+// trail / failed 由调用方传入已算好的决策轨迹与失败候选数，避免与 handler 侧对同一
+// attempts 重复遍历（logOutcome 不再自行 summarizeAttempts）。
 func (g *Gateway) logOutcome(ctx context.Context, lvl slog.Level, endpoint, model, reason string,
-	status int, masked bool, token *identity.Token, sessionID string, attempts []map[string]any, durationMs *int64) {
+	status int, masked bool, token *identity.Token, sessionID string, attempts []map[string]any,
+	trail string, failed int, durationMs *int64) {
 	if g.logger == nil {
 		return
 	}
-	trail, failed := summarizeAttempts(attempts)
 	// 仅"客户端类失败结论"（4xx）受开关控制：masked=true 必然 status<400（见 handler 侧 failedReq 判定），
-	// 故无需再判 masked。
-	if status >= http.StatusBadRequest && status < http.StatusInternalServerError && !logger.ClientErrorLogEnabled() {
+	// 故无需再判 masked。429（上游限流）不属客户端错误——候选级日志从不被门控，
+	// 请求级必须同口径记录，否则 LOG_CLIENT_ERRORS=off 时会出现"候选有、请求级无"。
+	if status >= http.StatusBadRequest && status < http.StatusInternalServerError &&
+		status != http.StatusTooManyRequests && !logger.ClientErrorLogEnabled() {
 		return
 	}
 	args := []any{

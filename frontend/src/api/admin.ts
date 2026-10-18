@@ -551,7 +551,7 @@ export interface ChannelDetail {
   Models: ModelDetail[]
   Keys: KeyDetail[]
 }
-// 对外模型清单项（用于选择要展开的候选）
+// 对外模型清单项（供前端展示名称/启用态）
 export interface ExternalModelItem {
   ID: string
   ExternalName: string
@@ -887,7 +887,7 @@ export interface AdminSession {
   Calls: number // 总调用次数
   Tokens: number // 总消耗 Token
   Credits: number // 总消耗积分
-  ContextLen: number // 上下文长度（最近一次请求输入 Token）
+  ContextLen: number // 总输入 Token（输入+缓存读）
   RPM: number // 近 5 分钟每分钟请求数
   TPM: number // 近 5 分钟每分钟 Token 数
   UserMsgs: number // 用户消息次数

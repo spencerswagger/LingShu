@@ -312,3 +312,29 @@ func TestService_GetByID_DefensiveCopy(t *testing.T) {
 		t.Fatalf("命中缓存不应再读库: %v", err)
 	}
 }
+
+// TestStore_StaleCacheFillAfterInvalidateRejected 与 model/identity 的同名用例同构：
+// 读路径在回源 DB 前捕获代际；若回源期间发生写路径失效（bump 代际，如 Update/BatchDelete），
+// 携带陈旧代际的回填必须被拒绝——否则失效前读到的旧标签快照会滞留（本缓存无 TTL），
+// 后续鉴权热路径将持续读到该陈旧的 KVPairs/enabled 状态。
+func TestStore_StaleCacheFillAfterInvalidateRejected(t *testing.T) {
+	s := NewStore(nil)
+	fresh := &Tag{ID: 1, Name: "gold", KVPairs: map[string]string{"tier": "gold"}}
+
+	// 读路径：回源前捕获代际。
+	gen := s.tagCache.Generation()
+	// 期间写路径失效（如 UpdateTag/BatchDeleteTags 触发）。
+	s.invalidateTagID(1)
+	// 读路径回来回填（携带陈旧代际）。
+	s.cacheTag(1, fresh, gen)
+
+	if _, ok := s.tagCache.Get(tagCacheKey(1)); ok {
+		t.Fatal("失效后携带陈旧代际的回填必须被拒绝（否则旧标签快照无限期滞留）")
+	}
+
+	// 对照组：期间无失效时，携带当前代际的回填应正常命中（证明不会误杀正常回填路径）。
+	s.cacheTag(1, fresh, s.tagCache.Generation())
+	if _, ok := s.tagCache.Get(tagCacheKey(1)); !ok {
+		t.Fatal("无失效发生时回填应正常命中")
+	}
+}

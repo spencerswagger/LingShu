@@ -556,6 +556,10 @@ type ConfigProvider interface {
 // ContextTiers（上下文分档）会缓存在内存中，避免网关/路由热路径每次直查 sys_configs
 // （F-R3-1，NFR-1）。失效仅由装配层在 sys_configs 写入后经 InvalidateCostConfig 触发；
 // 其余配置（汇率）不缓存，保持原语义。读取失败不写入缓存（瞬时故障可自愈）。
+//
+// 失效代际（对齐 pkg/gencache 的 Generation/PutAtGen 语义）：InvalidateCostConfig 在清空
+// 四个缓存前先递增 gen；读路径回源前捕获 gen，回填时仅当 gen 未变才写入。这样「回源期间
+// 发生失效」的并发场景下陈旧回填被丢弃，避免旧配置（如 R，影响计费分母）无限期滞留（无 TTL）。
 type defaultConfigProvider struct {
 	src configSource
 
@@ -564,6 +568,8 @@ type defaultConfigProvider struct {
 	timeCfg *TimeCoeffConfig // 缓存的全局时段配置（nil=未缓存）
 	r       *int64           // 缓存的 billing.r（nil=未缓存）
 	tiers   *[]TierRule      // 缓存的 billing.context_tiers（nil=未缓存）
+	// gen 为失效代际：InvalidateCostConfig 递增；读路径回源前捕获、回填前校验（见上方说明）。
+	gen uint64
 	// cacheOff 为 true 时关闭全部配置缓存（安全态：直查 DB）。仅启动装配阶段设置，运行期不变。
 	cacheOff bool
 }
@@ -578,8 +584,10 @@ func (p *defaultConfigProvider) SetCacheEnabled(on bool) { p.cacheOff = !on }
 
 // InvalidateCostConfig 清空全部配置缓存（路由成本样值、全局时段、R、上下文分档）。
 // 由装配层在 sys_configs 写入后触发（见 SqlStore.SetConfigWriteHook），保证配置修改即时生效（无 TTL）。
+// 先递增失效代际再清空：并发的读路径可能正要回填同一配置，代际校验会拒绝其陈旧回填（见 defaultConfigProvider 说明）。
 func (p *defaultConfigProvider) InvalidateCostConfig() {
 	p.mu.Lock()
+	p.gen++
 	p.sample = nil
 	p.timeCfg = nil
 	p.r = nil
@@ -591,9 +599,11 @@ func (p *defaultConfigProvider) InvalidateCostConfig() {
 // 带内存缓存（见 defaultConfigProvider 缓存说明）：命中直接返回，零 DB 查询；失败不写缓存。
 // 采用无 ctx 签名，配置读少且只读，暂用 Background ctx（保留取消传播可后续扩展）。
 func (p *defaultConfigProvider) R() (int64, error) {
+	var gen uint64
 	if !p.cacheOff {
 		p.mu.RLock()
 		cached := p.r
+		gen = p.gen
 		p.mu.RUnlock()
 		if cached != nil {
 			return *cached, nil
@@ -609,7 +619,10 @@ func (p *defaultConfigProvider) R() (int64, error) {
 	}
 	if !p.cacheOff {
 		p.mu.Lock()
-		p.r = &v
+		// 仅当回源期间未发生失效（代际未变）才回填：避免失效前读到的旧值滞留（无 TTL）。
+		if p.gen == gen {
+			p.r = &v
+		}
 		p.mu.Unlock()
 	}
 	return v, nil
@@ -660,9 +673,11 @@ func parseFloatConfig(raw []byte) (float64, error) {
 // ContextTiers 读取 billing.context_tiers（带内存缓存，见 defaultConfigProvider 缓存说明）。
 // 命中直接返回，零 DB 查询；失败不写缓存。
 func (p *defaultConfigProvider) ContextTiers() ([]TierRule, error) {
+	var gen uint64
 	if !p.cacheOff {
 		p.mu.RLock()
 		cached := p.tiers
+		gen = p.gen
 		p.mu.RUnlock()
 		if cached != nil {
 			return *cached, nil
@@ -678,7 +693,10 @@ func (p *defaultConfigProvider) ContextTiers() ([]TierRule, error) {
 	}
 	if !p.cacheOff {
 		p.mu.Lock()
-		p.tiers = &tiers
+		// 仅当回源期间未发生失效（代际未变）才回填（见 defaultConfigProvider 说明）。
+		if p.gen == gen {
+			p.tiers = &tiers
+		}
 		p.mu.Unlock()
 	}
 	return tiers, nil
@@ -687,9 +705,11 @@ func (p *defaultConfigProvider) ContextTiers() ([]TierRule, error) {
 // TimeConfig 读取 billing.time_config（带内存缓存，见 defaultConfigProvider 缓存说明）。
 // cacheOff 时读写缓存均跳过（与 R/ContextTiers 一致），退回直查 DB。
 func (p *defaultConfigProvider) TimeConfig() (TimeCoeffConfig, error) {
+	var gen uint64
 	if !p.cacheOff {
 		p.mu.RLock()
 		cached := p.timeCfg
+		gen = p.gen
 		p.mu.RUnlock()
 		if cached != nil {
 			return *cached, nil
@@ -708,7 +728,10 @@ func (p *defaultConfigProvider) TimeConfig() (TimeCoeffConfig, error) {
 
 	if !p.cacheOff {
 		p.mu.Lock()
-		p.timeCfg = &tc
+		// 仅当回源期间未发生失效（代际未变）才回填（见 defaultConfigProvider 说明）。
+		if p.gen == gen {
+			p.timeCfg = &tc
+		}
 		p.mu.Unlock()
 	}
 	return tc, nil
@@ -719,9 +742,11 @@ func (p *defaultConfigProvider) TimeConfig() (TimeCoeffConfig, error) {
 // 该值仅用于新会话创建时的成本比较，不参与实际计费。
 // cacheOff 时读写缓存均跳过（与 R/ContextTiers 一致），退回直查 DB。
 func (p *defaultConfigProvider) SampleUsage() (Usage, error) {
+	var gen uint64
 	if !p.cacheOff {
 		p.mu.RLock()
 		cached := p.sample
+		gen = p.gen
 		p.mu.RUnlock()
 		if cached != nil {
 			return *cached, nil
@@ -739,7 +764,10 @@ func (p *defaultConfigProvider) SampleUsage() (Usage, error) {
 
 	if !p.cacheOff {
 		p.mu.Lock()
-		p.sample = &u
+		// 仅当回源期间未发生失效（代际未变）才回填（见 defaultConfigProvider 说明）。
+		if p.gen == gen {
+			p.sample = &u
+		}
 		p.mu.Unlock()
 	}
 	return u, nil
