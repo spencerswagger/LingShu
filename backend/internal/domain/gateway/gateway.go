@@ -40,9 +40,10 @@ type ChannelResolver interface {
 	// FeedResultGated 回喂结果并带「是否计入健康」门控：countIntoHealth=false 完全不影响熔断。
 	FeedResultGated(keyID int64, modelRowID int64, f channel.Feedback, countIntoHealth bool)
 	KeyMaxSessions(keyID int64) int
-	// ManualSetKeyState 手动切换密钥状态（action ∈ normal/drain/disable/recover）；
-	// 供协议级错误策略按动作(drain|disable)处置。
-	ManualSetKeyState(keyID int64, action string) error
+	// ForceKeyState 手动切换密钥状态并持久化（内存状态机 + channel_keys.state 落库 +
+	// channel_key_events 事件，与 KeyService.ForceState 同源）；供协议级错误策略按动作(drain|disable)处置。
+	// 区别于仅内存的 ManualSetKeyState：策略触发的密钥处置必须落库，重启后仍生效（与模型处置对称）。
+	ForceKeyState(ctx context.Context, keyID int64, action string) error
 	// ManualSetModelState 手动设置内部模型状态；供协议级错误策略按动作(drain|disable)处置。
 	ManualSetModelState(channelID, modelRowID int64, st channel.State) error
 	// DisableChannel 将渠道及其全部密钥置为禁用（AC-17：上游 usage 缺失/无法解析时）。

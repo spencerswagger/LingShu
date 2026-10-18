@@ -1366,7 +1366,8 @@ func (m *Manager) ManualSetModelState(channelID, modelRowID int64, st State) err
 
 // ManualSetKeyState 手动切换单个密钥状态（action ∈ normal/drain/disable/recover），
 // 仅同步内存状态机（ForceNormal/ForceDrain/ForceDisable，原因经 Machine 的 manual_* 记录）。
-// DB 落库与 channel_key_events 由 A4 KeyService.ForceState 负责，此处不写库避免双写。
+// DB 落库与 channel_key_events 由 HTTP 管理端点先行调用 KeyService.ForceState 负责，此处不写库避免双写。
+// 网关协议级错误策略触发的密钥处置无此前置落库步骤，须改用 ForceKeyState（内存 + 落库 + 事件）。
 func (m *Manager) ManualSetKeyState(keyID int64, action string) error {
 	st, ok := keyActionState[action]
 	if !ok {
@@ -1385,6 +1386,41 @@ func (m *Manager) ManualSetKeyState(keyID int64, action string) error {
 		kr.Machine.ForceDrain(m.now())
 	case StateDisabled:
 		kr.Machine.ForceDisable(m.now())
+	}
+	return nil
+}
+
+// ForceKeyState 手动切换单个密钥状态并持久化（action ∈ normal/drain/disable/recover）：
+// 内存状态机流转（ForceNormal/ForceDrain/ForceDisable）+ channel_keys.state 落库 +
+// channel_key_events 事件，与 KeyService.ForceState 同源（SetState + InsertEvent，经 persistKeyTransition）。
+// 状态无变化时不写库（幂等，避免冗余事件）。密钥运行时不存在返回 sql.ErrNoRows。
+// 供网关协议级错误策略按动作(drain|disable)处置——与内部模型 ManualSetModelState 对称落库，重启后仍生效。
+func (m *Manager) ForceKeyState(_ context.Context, keyID int64, action string) error {
+	st, ok := keyActionState[action]
+	if !ok {
+		return fmt.Errorf("invalid action %q", action)
+	}
+	var tr *pendingTransition
+	m.mu.Lock()
+	kr, ok := m.keys[keyID]
+	if !ok {
+		m.mu.Unlock()
+		return sql.ErrNoRows
+	}
+	prev := kr.Machine.State()
+	switch st {
+	case StateNormal:
+		kr.Machine.ForceNormal(m.now())
+	case StateDrain:
+		kr.Machine.ForceDrain(m.now())
+	case StateDisabled:
+		kr.Machine.ForceDisable(m.now())
+	}
+	cur := kr.Machine.State()
+	m.mu.Unlock()
+	if cur != prev {
+		tr = &pendingTransition{from: prev, to: cur, reason: keyActionReason[action]}
+		m.persistKeyTransition(keyID, tr.from, tr.to, tr.reason)
 	}
 	return nil
 }

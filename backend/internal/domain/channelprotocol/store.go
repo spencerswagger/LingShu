@@ -289,13 +289,15 @@ type ErrorStat struct {
 
 // IncrProtocolErrorStat 对 (protocol_id, category, day) 计数 +1（同步 upsert）。
 // 供网关在命中错误策略时按错误类别累加（量小，直接同步写）。
+// day 一律按 UTC 归日：写入侧与查询侧（ErrorStats 的 from/to，Handler 亦按 UTC 解析）统一为 UTC，
+// 避免本地时区跨日导致「写入落次日、查询按当日」的 off-by-one 漏计。
 func (s *Store) IncrProtocolErrorStat(ctx context.Context, protocolID int64, category string, day time.Time) error {
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO protocol_error_stats(protocol_id, category, day, count)
 		 VALUES($1,$2,$3,1)
 		 ON CONFLICT (protocol_id, category, day)
 		 DO UPDATE SET count = protocol_error_stats.count + 1`,
-		protocolID, category, day.Format(dayLayout))
+		protocolID, category, day.UTC().Format(dayLayout))
 	if err != nil {
 		return fmt.Errorf("incr protocol error stat: %w", err)
 	}
@@ -303,6 +305,7 @@ func (s *Store) IncrProtocolErrorStat(ctx context.Context, protocolID int64, cat
 }
 
 // ErrorStats 汇总某协议在 [from, to]（day 闭区间）内按 category 的计数（跨日累加，category 升序）。
+// from/to 同样按 UTC 归日，与写入侧（IncrProtocolErrorStat）口径一致。
 func (s *Store) ErrorStats(ctx context.Context, protocolID int64, from, to time.Time) ([]ErrorStat, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT category, COALESCE(SUM(count), 0) AS total
@@ -310,7 +313,7 @@ func (s *Store) ErrorStats(ctx context.Context, protocolID int64, from, to time.
 		 WHERE protocol_id=$1 AND day >= $2 AND day <= $3
 		 GROUP BY category
 		 ORDER BY category ASC`,
-		protocolID, from.Format(dayLayout), to.Format(dayLayout))
+		protocolID, from.UTC().Format(dayLayout), to.UTC().Format(dayLayout))
 	if err != nil {
 		return nil, fmt.Errorf("query protocol error stats: %w", err)
 	}

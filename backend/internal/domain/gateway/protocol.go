@@ -5,11 +5,16 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/team/llmgateway/internal/domain/channel"
 	"github.com/team/llmgateway/internal/domain/channelprotocol"
 	"github.com/team/llmgateway/internal/domain/router"
 )
+
+// protocolPolicyTimeout 协议级错误策略在错误热路径上的超时兜底：
+// 策略读取（GetByID）与错误统计写入（IncrProtocolErrorStat）都不得无界挂起而拖住错误响应。
+const protocolPolicyTimeout = 2 * time.Second
 
 // policyForProtocol 解析某协议针对给定上游错误命中的错误策略：
 // 经注入的协议查询接口取该协议 error_policy，按 (内部模型, status, errType, errCode, msg) 调 MatchError。
@@ -20,7 +25,11 @@ func (g *Gateway) policyForProtocol(protocolID int64, channelID int64, internalM
 	if g.protocols == nil || protocolID <= 0 {
 		return nil, false
 	}
-	cp, err := g.protocols.GetByID(context.Background(), protocolID)
+	// 有界上下文：脱离请求取消（错误响应收尾不应被下游断开连带取消），但带超时兜底，
+	// 避免 DB 慢/挂起拖住错误收尾（策略读取在错误热路径上）。
+	ctx, cancel := context.WithTimeout(context.Background(), protocolPolicyTimeout)
+	defer cancel()
+	cp, err := g.protocols.GetByID(ctx, protocolID)
 	if err != nil || cp == nil {
 		g.logger.Warn("load channel protocol for error policy failed", "protocol_id", protocolID, "channel_id", channelID, "err", err)
 		return nil, false
@@ -43,12 +52,13 @@ type errorPolicyOutcome struct {
 //   - 未命中策略 → 默认安全态（见 errorPolicyOutcome 注释）；
 //   - CountIntoHealth=false → 调用方以 FeedResultGated(..., false) 回喂（完全不影响熔断）；
 //   - Failover 显式设置时按其值决定是否转移（未设置沿用 retryableUpstreamStatus）；
-//   - Action=drain|disable → 手动置密钥/内部模型状态（ManualSetKeyState/ManualSetModelState）；
+//   - Action=drain|disable → 手动置密钥/内部模型状态（ForceKeyState/ManualSetModelState，均落库）；
 //   - DownstreamStatus≠0 → 替代默认 502；
 //   - 命中策略时按错误类别累加协议级错误统计（protocol_error_stats）。
 //
-// 非流式（serveNonStream）与流式（serveStream）内部错误分支共用本函数，保证两处语义完全一致。
-func (g *Gateway) applyErrorPolicy(rt *channel.RuntimeChannel, routeRes *router.RouteResult,
+// 非流式（serveNonStream）与流式（serveStream）内部错误分支共用本函数，保证两处语义完全一致；
+// 429 与 401/403 分支同样调用本函数，避免这些状态码绕过策略（此前仅默认分支生效）。
+func (g *Gateway) applyErrorPolicy(ctx context.Context, rt *channel.RuntimeChannel, routeRes *router.RouteResult,
 	status int, errType, errCode, msg string) errorPolicyOutcome {
 
 	out := errorPolicyOutcome{
@@ -68,28 +78,30 @@ func (g *Gateway) applyErrorPolicy(rt *channel.RuntimeChannel, routeRes *router.
 	if pol.Disposition.DownstreamStatus != 0 {
 		out.downstreamStatus = pol.Disposition.DownstreamStatus
 	}
-	g.applyPolicyAction(routeRes, pol)
+	g.applyPolicyAction(ctx, routeRes, pol)
 	g.recordProtocolErrorStat(protocolID, pol, status, errCode)
 	return out
 }
 
 // applyPolicyAction 按 Disposition.Action 手动置密钥/内部模型状态（none 不动作）。
 // drain/disable 同时作用于命中候选的密钥与内部模型行（双回喂语义一致）。
-func (g *Gateway) applyPolicyAction(routeRes *router.RouteResult, pol *channelprotocol.ErrorPolicy) {
+func (g *Gateway) applyPolicyAction(ctx context.Context, routeRes *router.RouteResult, pol *channelprotocol.ErrorPolicy) {
 	switch pol.Disposition.Action {
 	case channelprotocol.ErrorActionDrain:
-		g.manualSetStates(routeRes, channel.ActionDrain, channel.StateDrain)
+		g.manualSetStates(ctx, routeRes, channel.ActionDrain, channel.StateDrain)
 	case channelprotocol.ErrorActionDisable:
-		g.manualSetStates(routeRes, channel.ActionDisable, channel.StateDisabled)
+		g.manualSetStates(ctx, routeRes, channel.ActionDisable, channel.StateDisabled)
 	}
 }
 
 // manualSetStates 手动设置密钥与内部模型状态（失败仅记日志，不阻断错误响应）。
-func (g *Gateway) manualSetStates(routeRes *router.RouteResult, action string, st channel.State) {
+// 密钥走 ForceKeyState：内存状态机 + channel_keys.state 落库 + channel_key_events 事件，
+// 与内部模型 ManualSetModelState 对称持久化（此前仅内存，重启即丢）；错误统计路径已有界超时兜底。
+func (g *Gateway) manualSetStates(ctx context.Context, routeRes *router.RouteResult, action string, st channel.State) {
 	if g.channels == nil {
 		return
 	}
-	if err := g.channels.ManualSetKeyState(routeRes.ChannelKeyID, action); err != nil {
+	if err := g.channels.ForceKeyState(ctx, routeRes.ChannelKeyID, action); err != nil {
 		g.logger.Warn("apply error policy key action failed",
 			"channel_key_id", routeRes.ChannelKeyID, "action", action, "err", err)
 	}
@@ -100,11 +112,14 @@ func (g *Gateway) manualSetStates(routeRes *router.RouteResult, action string, s
 }
 
 // recordProtocolErrorStat 命中策略时按错误类别累加协议级统计（量小，同步 upsert；失败仅记日志）。
+// 写入上下文有界超时：错误热路径不得被 DB 慢/挂起拖着不放。
 func (g *Gateway) recordProtocolErrorStat(protocolID int64, pol *channelprotocol.ErrorPolicy, status int, errCode string) {
 	if g.protocolStats == nil || protocolID <= 0 {
 		return
 	}
-	if err := g.protocolStats.IncrProtocolErrorStat(context.Background(), protocolID, errorCategory(pol, status, errCode), g.now()); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), protocolPolicyTimeout)
+	defer cancel()
+	if err := g.protocolStats.IncrProtocolErrorStat(ctx, protocolID, errorCategory(pol, status, errCode), g.now()); err != nil {
 		g.logger.Warn("record protocol error stat failed", "protocol_id", protocolID, "err", err)
 	}
 }
