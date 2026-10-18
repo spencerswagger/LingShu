@@ -90,6 +90,10 @@ type fakeChannels struct {
 	feeds             []feedEntry
 	disabled          []int64
 	maxSessionsPerKey int // 覆盖默认 16（测试会话并发上限用）
+
+	// 协议级错误策略动作落点（drain/disable）：记录手动设置过的密钥/模型状态。
+	keyActions  []string
+	modelStates []channel.State
 }
 
 func (f *fakeChannels) GetRuntime(_ int64) (*channel.RuntimeChannel, bool) {
@@ -113,6 +117,26 @@ func (f *fakeChannels) GetModelRuntime(channelID, modelRowID int64) (*channel.Mo
 
 func (f *fakeChannels) FeedResult(keyID int64, modelRowID int64, fb channel.Feedback) {
 	f.feeds = append(f.feeds, feedEntry{keyID: keyID, modelRowID: modelRowID, fb: fb})
+}
+
+// FeedResultGated 与 fakeChannels.FeedResult 同语义，countIntoHealth=false 时不记录（不影响熔断）。
+func (f *fakeChannels) FeedResultGated(keyID int64, modelRowID int64, fb channel.Feedback, countIntoHealth bool) {
+	if !countIntoHealth {
+		return
+	}
+	f.feeds = append(f.feeds, feedEntry{keyID: keyID, modelRowID: modelRowID, fb: fb})
+}
+
+// ManualSetKeyState 记录协议级错误策略触发的密钥动作（drain/disable）。
+func (f *fakeChannels) ManualSetKeyState(_ int64, action string) error {
+	f.keyActions = append(f.keyActions, action)
+	return nil
+}
+
+// ManualSetModelState 记录协议级错误策略触发的内部模型状态。
+func (f *fakeChannels) ManualSetModelState(_, _ int64, st channel.State) error {
+	f.modelStates = append(f.modelStates, st)
+	return nil
 }
 
 func (f *fakeChannels) KeyMaxSessions(int64) int {
