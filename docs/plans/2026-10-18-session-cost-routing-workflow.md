@@ -33,18 +33,18 @@ max_iterations: 4
 gate: human
 verify: cd backend && go build ./... && go test ./internal/domain/router/ -run CostOrder
 
-- [ ] **Step 4: 写“会话成本决策层”的失败测试（起点 / 中途 / 亲和保真）**
+- [x] **Step 4: 写“会话成本决策层”的失败测试（起点 / 中途 / 亲和保真）**
 action: 新增 `backend/internal/domain/router/session_cost_test.go`，覆盖：① 起点（无旧渠道）重灌代价=0，按摊还成本最小选渠道；② 中途 `预计剩余轮数 ≤ 回本轮数` 时不切换；③ 中途 `预计剩余轮数 > 回本轮数` 时切换；④ 分母 ≤ 0（新渠道每轮不更便宜）永不回本不切换；⑤ 回本轮数用 Venice→DeepSeek 示例断言（缓存读 2 万→18 轮、下限 ≈ 5.9）。此步只写测试。
 loop: false
 verify: cd backend && go test ./internal/domain/router/ -run SessionCost 2>&1 | tail -20
 
-- [ ] **Step 5: 实现会话成本决策层（回本轮数 / 重灌代价 / k 经验式剩余轮数）**
+- [x] **Step 5: 实现会话成本决策层（回本轮数 / 重灌代价 / k 经验式剩余轮数）**
 action: 在 `engine.go` 新增决策函数：`remainingTurns(k) = clamp(RemainingA - RemainingB*k, RemainingMin, RemainingMax)`；`rechargeCost(新渠道, 缓存读) = 缓存读 × (新渠道输入价 − 新渠道缓存读价) × 新渠道时段倍率 × 分档倍率 ÷ 1e6`；`paybackTurns = 分子 ÷ 分母`（分子=新输入价−新缓存读价)×缓存读；分母=(旧缓存读−新缓存读)×缓存读 + (旧输入−新输入)×新增输入 + (旧输出−新输出)×输出；分母≤0 → 永不回本）。产出 `SessionCostDecision{Switch bool; FromChannelKeyID, ToChannelKeyID int64; TurnCostOld, TurnCostNew, RechargeCost, PaybackTurns float64; RemainingTurns int; Reason string}`。起点判定：`SessionRegistry.Lookup` 未命中即起点。
 loop: until go test ./internal/domain/router/ 全绿
 max_iterations: 4
 verify: cd backend && go build ./... && go test ./internal/domain/router/ -run SessionCost
 
-- [ ] **Step 6: 影子模式（只读假设节省）失败测试 + 实现**
+- [x] **Step 6: 影子模式（只读假设节省）失败测试 + 实现**
 action: 在 `session_cost_test.go` 增加用例：`SessionCostConfig.Enabled=false` 时 `SessionCostDecision.Switch` 恒为 false（渠道不变），但仍返回完整的“假设”字段（TurnCostOld/New/RechargeCost/PaybackTurns/Reason）供记账；随后在 `engine.go` 实现该分支（不改变选中渠道，仅计算并返回假设值）。
 loop: until go test ./internal/domain/router/ 全绿
 max_iterations: 3
@@ -57,7 +57,7 @@ max_iterations: 4
 verify: cd backend && go build ./... && go test ./internal/domain/router/ -run CostEvent && go test ./internal/pkg/asyncwrite/
 
 - [ ] **Step 8: P0 影子观测人工评审门（成本口径不变 + 账实校准口径）**
-action: 人工评审：① 路由成本口径改为“三档成本价 × 时段 × 分档”，确认不改变对外售价计费与响应语义；② 影子记录字段足以做“假设节省 vs 实际结算”校准；③ `Enabled=false` 默认安全态、开关可一键回退。产出 PASS/REVISE 结论。
+action: 人工评审：① 路由成本口径改为“三档成本价 × 时段 × 分档”，确认不改变对外售价计费与响应语义；② 影子记录字段足以做“假设节省 vs 实际结算”校准；③ `Enabled=false` 默认安全态、开关可一键回退。产出 PASS/REVISE 结论。（并在本门显式确认：成本比较口径变更=新基线，模型级 context_tiers 会影响存量排序；对外售价计费与响应语义不变。）
 loop: false
 gate: human
 verify:

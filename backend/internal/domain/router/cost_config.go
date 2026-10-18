@@ -11,10 +11,15 @@ const cfgSessionCost = "routing.session_cost"
 
 // SessionCostConfig 会话成本路由配置（routing.session_cost）。
 //
-// 安全态语义：Enabled=false 为默认安全态，表示不启用会话成本路由，
-// 路由行为与引入该配置前完全一致（等价现状）；只有在运维显式把
-// enabled 置为 true 后才允许后续步骤接入路由决策。配置缺失、读取失败
-// 或解析失败时同样回退到该安全态，避免配置异常放大为路由异常。
+// 安全态语义：Enabled=false 为默认安全态，门控的是「会话成本路由策略」
+// （起点择优 / 中途切换 / 闲忙时联动）；关闭 = 不启用这些策略。
+//
+// 注意：成本比较口径（三档成本价 × 时段系数 × 上下文分档系数，替代原「分档系数恒 1」）
+// 是 P0 既定新基线，**不由该开关回滚**；默认种子下模型级 context_tiers 为空、
+// 全局分档为空，故默认部署排序不变。该配置仍不改变对外售价计费与响应语义（成本价 ≠ 售价）。
+//
+// 只有在运维显式把 enabled 置为 true 后才允许后续步骤接入会话成本路由策略。
+// 配置缺失、读取失败或解析失败时同样回退到该安全态，避免配置异常放大为路由异常。
 type SessionCostConfig struct {
 	Enabled      bool    `json:"enabled"`
 	RemainingA   float64 `json:"remaining_a"`

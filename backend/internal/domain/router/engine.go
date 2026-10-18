@@ -50,8 +50,8 @@ type RouteSpec struct {
 	TagKV         map[string]string // 已解析的令牌标签 KV；无标签时 nil
 	TagID         *int64            // 用于日志
 	SessionKey    string            // token_id + model + x-session-id；空则不启用亲和
-	// Sample 本轮请求的三段 token 样值；非 nil 时用于成本比较（覆盖全局 routing.cost_sample），
-	// nil 时回落全局样值。零值（&billing.Usage{}）亦为显式样值，与 nil 语义不同。
+	// Sample 本轮请求的三段 token 样值；非 nil 时用于成本比较（覆盖全局 routing.cost_sample）。
+	// nil=回落全局样值；&billing.Usage{}（全零）为显式零样值，会关闭成本择优。
 	Sample *billing.Usage
 }
 
@@ -68,7 +68,8 @@ type RouteResult struct {
 	Revision      int64 // 选中渠道的变更代次（基于 Channel.UpdatedAt），用于亲和失效判断
 	Fallback      bool
 	// 成本标量 / 时段系数（OQ-3：仅用于决策轨迹排查，不参与计费）。
-	Cost      float64 // 选中候选的成本标量（样值用量 × 单价 × 时段系数）
+	// Cost = 样值用量 × 三档成本单价求和 × 时段系数 × 上下文分档系数。
+	Cost      float64
 	CostKnown bool    // 成本是否有效（false=单价缺失/全 0，视为最贵）
 	TimeCoeff float64 // 选中候选的时段系数（模型级优先，回落全局/1）
 }
@@ -82,6 +83,7 @@ type ChannelRoute struct {
 	ExternalModelID int64
 	Revision        int64
 	// 成本标量 / 时段系数（OQ-3：仅用于决策轨迹排查，不参与计费）。
+	// Cost = 样值用量 × 三档成本单价求和 × 时段系数 × 上下文分档系数。
 	Cost      float64
 	CostKnown bool
 	TimeCoeff float64
@@ -336,6 +338,9 @@ func (e *Engine) collectCandidates(ctx context.Context, spec RouteSpec) ([]candi
 	sample, globalTC := e.costContext()
 	if spec.Sample != nil {
 		sample = *spec.Sample // 本轮样值覆盖全局 routing.cost_sample
+		if *spec.Sample == (billing.Usage{}) {
+			slog.Default().Warn("路由收到本轮全零样值，成本择优将退化为会话数/ID 兜底；如非本意请改传 nil 以回落全局 routing.cost_sample")
+		}
 	}
 	globalTiers := e.contextTiers()
 	normal := make([]candidate, 0, len(cands))
@@ -346,7 +351,7 @@ func (e *Engine) collectCandidates(ctx context.Context, spec RouteSpec) ([]candi
 			if e.sess.Hit(spec.SessionKey) {
 				if s, ok := e.sess.Lookup(spec.SessionKey); ok &&
 					s.ChannelKeyID == c.keyID && s.InternalModelID == c.internal {
-					e.fillCost(&cands[i], sample, globalTC, now, globalTiers)
+					e.fillCost(&cands[i], sample, globalTC, globalTiers, now)
 					sessionCand = &cands[i]
 					continue
 				}
@@ -460,16 +465,15 @@ type scoredCandidate struct {
 //
 // 成本标量 = 样值用量代入 cost_rates 求和 × 当前时段系数 × 上下文分档系数。
 // 样值、全局时段与全局分档由 collectCandidates 只读一次并传入，逐候选仅做纯计算，不产生额外 IO。
-// globalTiers 为可选透传参数（collectCandidates 传入本轮读到的全局分档）；未传或为空时按无分档（系数 1）处理。
-func (e *Engine) orderCandidates(cands []candidate, now time.Time, sample billing.Usage, globalTC *billing.TimeCoeffConfig, globalTiers ...[]billing.TierRule) []candidate {
+// globalTiers 为全局上下文分档（collectCandidates 传入本轮读到的全局分档）；为空时按无分档（系数 1）处理。
+func (e *Engine) orderCandidates(cands []candidate, now time.Time, sample billing.Usage, globalTC *billing.TimeCoeffConfig, globalTiers []billing.TierRule) []candidate {
 	if len(cands) == 0 {
 		return cands
 	}
-	tiers := pickTiers(globalTiers)
 	scored := make([]scoredCandidate, len(cands))
 	for i := range cands {
 		c := cands[i]
-		e.fillCost(&c, sample, globalTC, now, tiers)
+		e.fillCost(&c, sample, globalTC, globalTiers, now)
 		scored[i] = scoredCandidate{c: c, cost: c.cost, known: c.costKnown, load: e.sess.CountActive(c.keyID)}
 	}
 	sort.SliceStable(scored, func(i, j int) bool {
@@ -503,22 +507,14 @@ func (e *Engine) orderCandidates(cands []candidate, now time.Time, sample billin
 
 // fillCost 计算候选当前的时段系数、上下文分档系数与成本标量，并回填到候选字段
 // （OQ-3：随候选携带至网关决策轨迹，便于排查「为何选中该渠道」）。
-// globalTiers 为可选透传参数（collectCandidates 传入本轮全局分档）；未传或为空时按无分档（系数 1）处理。
-func (e *Engine) fillCost(c *candidate, sample billing.Usage, globalTC *billing.TimeCoeffConfig, now time.Time, globalTiers ...[]billing.TierRule) {
+// globalTiers 为全局上下文分档（collectCandidates 传入本轮全局分档）；为空时按无分档（系数 1）处理。
+func (e *Engine) fillCost(c *candidate, sample billing.Usage, globalTC *billing.TimeCoeffConfig, globalTiers []billing.TierRule, now time.Time) {
 	tc := resolveTimeCoeff(c.timeCfg, globalTC, now)
-	ctxCoeff := resolveCtxCoeff(c.contextTiers, pickTiers(globalTiers), sample)
+	ctxCoeff := resolveCtxCoeff(c.contextTiers, globalTiers, sample)
 	cost, known := costScalar(sample, c.costRates, tc, ctxCoeff)
 	c.timeCoeff = tc
 	c.cost = cost
 	c.costKnown = known
-}
-
-// pickTiers 从可选透传的分档参数中取出全局分档；未传时返回 nil（视为无分档）。
-func pickTiers(globalTiers [][]billing.TierRule) []billing.TierRule {
-	if len(globalTiers) == 0 {
-		return nil
-	}
-	return globalTiers[0]
 }
 
 // costContext 读取一次全局成本参数（样值 + 全局时段），供本轮候选比较复用；
