@@ -333,6 +333,41 @@ func containsAny(haystack string, hints []string) bool {
 	return false
 }
 
+// exclusionHint 把候选/路由层的稳定排除原因映射为运维动作提示（纯函数）：
+// 将「为什么该候选没被使用」直接翻译成「该去查什么」，便于运维按 reason 定位。
+// reason 使用稳定枚举字符串（router.Exclude* 与网关跳过原因）；未知 reason 返回空串。
+// 网关候选循环内的跳过原因（见 handler.go 的 skip(...)）为中文直出文案，这里一并覆盖。
+func exclusionHint(reason string) string {
+	switch reason {
+	case "drained":
+		return "查渠道/密钥状态或手动探测"
+	case "session_full":
+		return "查会话并发/存活"
+	case "rate_limited":
+		return "查模型/渠道/密钥 RPM·TPM"
+	case "unsupported_protocol":
+		return "查协议可达性"
+	case "credential_unavailable":
+		return "查密钥凭据"
+	case "disabled":
+		return "查禁用状态"
+	// 网关候选循环内的跳过原因（中文直出，保持与调用日志一致）。
+	case "排空":
+		return "查渠道/密钥状态或手动探测"
+	case "会话满":
+		return "查会话并发/存活"
+	case "限流":
+		return "查模型/渠道/密钥 RPM·TPM"
+	case "协议不支持":
+		return "查协议可达性"
+	case "凭据不可用":
+		return "查密钥凭据"
+	case "禁用":
+		return "查禁用状态"
+	}
+	return ""
+}
+
 // errInfo 描述一次异常的上下文（与 diag 一并落日志）。
 type errInfo struct {
 	kind          string // 失败类型：rejected / build_failed / connect_failed / read_body_failed / upstream_status / usage_missing / billing_failed / stream_interrupted / credential_unavailable / client_gone / ...
@@ -350,6 +385,14 @@ type errInfo struct {
 	reason        string // 人类可读原因（中文）
 	sessionID     string
 	durationMs    int64
+	// 流式失败诊断（可空；仅流式上游失败分支填充，用于区分「已送达/未送达」与响应阶段）：
+	//   - delivered：请求体是否已完整送达上游（wrote.Load()）；false=连接阶段失败（可安全转移）；
+	//   - firstByteReceived：是否已收到上游首个响应字节；
+	//   - elapsedMS：从请求开始到本次失败的耗时（毫秒）。
+	// kind 仍为 connect_failed，由 delivered 区分「未送达（可转移）」与「已送达（不转移）」两种情形。
+	delivered         *bool
+	firstByteReceived *bool
+	elapsedMS         *int64
 }
 
 // logErr 落一条网关侧异常日志。任何失败分支都应调用它——包括最终返回给用户的失败，
@@ -423,6 +466,16 @@ func (g *Gateway) logErr(ctx context.Context, lvl slog.Level, msg, endpoint, pro
 		args = append(args, "err_summary", e.summary)
 	}
 	args = append(args, "reason", sanitizeErrSummary(e.reason), "duration_ms", e.durationMs)
+	// 流式失败诊断：仅当调用方填充时才输出（非流式失败保持既有字段集不变）。
+	if e.delivered != nil {
+		args = append(args, "delivered", *e.delivered)
+	}
+	if e.firstByteReceived != nil {
+		args = append(args, "first_byte_received", *e.firstByteReceived)
+	}
+	if e.elapsedMS != nil {
+		args = append(args, "elapsed_ms", *e.elapsedMS)
+	}
 	args = append(args, d.kv()...)
 	logger.WithRequestID(ctx, g.logger).Log(ctx, lvl, msg, args...)
 }
@@ -510,6 +563,10 @@ func summarizeAttempts(attempts []map[string]any) (trail string, failed int) {
 		label := reason
 		if skipped {
 			label = reason + "(跳过)"
+		}
+		// 稳定排除原因命中运维动作映射时，把「该去查什么」一并写入原因链（便于按 trail 直接定位）。
+		if hint, _ := a["hint"].(string); hint != "" {
+			label += "[" + hint + "]"
 		}
 		if order != nil {
 			parts = append(parts, fmtAny(order)+"."+label)

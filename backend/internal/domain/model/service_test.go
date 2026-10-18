@@ -3,9 +3,12 @@ package model
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -20,11 +23,31 @@ func saleRates() billing.Rates {
 }
 
 // extCols 与 store.cols 一致，供构造 mock 行。
-var extCols = []string{"id", "external_name", "description", "enabled", "sale_rates", "time_config", "context_tiers", "created_at", "updated_at"}
+var extCols = []string{"id", "external_name", "description", "enabled", "sale_rates", "time_config", "context_tiers", "aliases", "created_at", "updated_at"}
+
+// extNameQuery 与 store.GetByExternalName 一致（含别名包含判定 + 确定性排序），供构造 mock 期望。
+const extNameQuery = `SELECT ` + cols + ` FROM external_models WHERE (external_name = $1 OR aliases @> to_jsonb(ARRAY[$1::text])) AND enabled = true AND deleted_at IS NULL ORDER BY (external_name = $1) DESC, id ASC LIMIT 1`
+
+// aliasOtherQuery 与 store.AliasExistsForOther 一致（别名↔别名互斥校验），供构造 mock 期望。
+const aliasOtherQuery = `SELECT 1 FROM external_models
+		 WHERE deleted_at IS NULL AND id <> $2 AND aliases @> to_jsonb(ARRAY[$1::text])
+		 LIMIT 1`
+
+// expectAliasOtherNone 构造「别名未被其他模型占用」的 mock 期望（无匹配 → sql.ErrNoRows）。
+func expectAliasOtherNone(mock sqlmock.Sqlmock, alias string, excludeID int64) {
+	mock.ExpectQuery(regexp.QuoteMeta(aliasOtherQuery)).
+		WithArgs(alias, excludeID).WillReturnError(sql.ErrNoRows)
+}
 
 func extRow(m *ExternalModel, saleJSON string) *sqlmock.Rows {
+	aliasesJSON := `[]`
+	if len(m.Aliases) > 0 {
+		if b, err := json.Marshal(m.Aliases); err == nil {
+			aliasesJSON = string(b)
+		}
+	}
 	rows := sqlmock.NewRows(extCols).
-		AddRow(m.ID, m.ExternalName, m.Description, m.Enabled, saleJSON, nil, nil, m.CreatedAt, m.UpdatedAt)
+		AddRow(m.ID, m.ExternalName, m.Description, m.Enabled, saleJSON, nil, nil, aliasesJSON, m.CreatedAt, m.UpdatedAt)
 	return rows
 }
 
@@ -46,8 +69,10 @@ func TestService_CreateModel(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + cols + ` FROM external_models WHERE external_name = $1`)).
 		WithArgs("qw-max").
 		WillReturnError(sql.ErrNoRows)
-	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO external_models(id, external_name, description, enabled, sale_rates, time_config, context_tiers) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING `+cols)).
-		WithArgs(sqlmock.AnyArg(), "qw-max", "", true, sqlmock.AnyArg(), nil, nil).
+	// 反向命名空间：对外名未撞他人别名。
+	expectAliasOtherNone(mock, "qw-max", 0)
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO external_models(id, external_name, description, enabled, sale_rates, time_config, context_tiers, aliases) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING `+cols)).
+		WithArgs(sqlmock.AnyArg(), "qw-max", "", true, sqlmock.AnyArg(), nil, nil, sqlmock.AnyArg()).
 		WillReturnRows(extRow(&ExternalModel{ID: 1, ExternalName: "qw-max", Enabled: true, CreatedAt: now, UpdatedAt: now}, `{"input":1}`))
 
 	m, err := s.CreateModel(context.Background(), ExternalModelInput{
@@ -134,8 +159,8 @@ func TestService_UpdateModel(t *testing.T) {
 		WithArgs(int64(1)).
 		WillReturnRows(extRow(&ExternalModel{ID: 1, ExternalName: "qw-max", Enabled: true, CreatedAt: now, UpdatedAt: now}, `{}`))
 	// external 未变，跳过唯一性预检查
-	mock.ExpectExec(regexp.QuoteMeta(`UPDATE external_models SET external_name=$1, description=$2, enabled=$3, sale_rates=$4, time_config=$5, context_tiers=$6, updated_at=now() WHERE id=$7`)).
-		WithArgs("qw-max", "desc", true, sqlmock.AnyArg(), nil, nil, int64(1)).
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE external_models SET external_name=$1, description=$2, enabled=$3, sale_rates=$4, time_config=$5, context_tiers=$6, aliases=$7, updated_at=now() WHERE id=$8`)).
+		WithArgs("qw-max", "desc", true, sqlmock.AnyArg(), nil, nil, sqlmock.AnyArg(), int64(1)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + cols + ` FROM external_models WHERE id = $1`)).
 		WithArgs(int64(1)).
@@ -158,7 +183,7 @@ func TestService_UpdateModel(t *testing.T) {
 func TestService_GetByExternalName(t *testing.T) {
 	s, mock := mockService(t)
 	now := time.Now()
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + cols + ` FROM external_models WHERE external_name = $1 AND enabled = true AND deleted_at IS NULL LIMIT 1`)).
+	mock.ExpectQuery(regexp.QuoteMeta(extNameQuery)).
 		WithArgs("qw-max").
 		WillReturnRows(extRow(&ExternalModel{ID: 2, ExternalName: "qw-max", Enabled: true, CreatedAt: now, UpdatedAt: now}, `{}`))
 
@@ -173,7 +198,7 @@ func TestService_GetByExternalName(t *testing.T) {
 
 func TestService_GetByExternalName_NotFound(t *testing.T) {
 	s, mock := mockService(t)
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + cols + ` FROM external_models WHERE external_name = $1 AND enabled = true AND deleted_at IS NULL LIMIT 1`)).
+	mock.ExpectQuery(regexp.QuoteMeta(extNameQuery)).
 		WithArgs("nope").
 		WillReturnError(sql.ErrNoRows)
 
@@ -277,7 +302,7 @@ func boolPtr(b bool) *bool { return &b }
 func TestService_GetByExternalName_CacheZeroDBAndInvalidate(t *testing.T) {
 	s, mock := mockService(t)
 	now := time.Now()
-	q := regexp.QuoteMeta(`SELECT ` + cols + ` FROM external_models WHERE external_name = $1 AND enabled = true AND deleted_at IS NULL LIMIT 1`)
+	q := regexp.QuoteMeta(extNameQuery)
 
 	// 首次读取回源一次。
 	mock.ExpectQuery(q).WithArgs("qw-max").
@@ -327,8 +352,9 @@ func TestService_NameWriteHookFired(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + cols + ` FROM external_models WHERE external_name = $1`)).
 		WithArgs("qw-max").
 		WillReturnError(sql.ErrNoRows)
-	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO external_models(id, external_name, description, enabled, sale_rates, time_config, context_tiers) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING `+cols)).
-		WithArgs(sqlmock.AnyArg(), "qw-max", "", true, sqlmock.AnyArg(), nil, nil).
+	expectAliasOtherNone(mock, "qw-max", 0)
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO external_models(id, external_name, description, enabled, sale_rates, time_config, context_tiers, aliases) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING `+cols)).
+		WithArgs(sqlmock.AnyArg(), "qw-max", "", true, sqlmock.AnyArg(), nil, nil, sqlmock.AnyArg()).
 		WillReturnRows(extRow(&ExternalModel{ID: 1, ExternalName: "qw-max", Enabled: true, CreatedAt: now, UpdatedAt: now}, `{"input":1}`))
 
 	if _, err := s.CreateModel(context.Background(), ExternalModelInput{ExternalName: "qw-max", SaleRates: saleRates()}); err != nil {
@@ -364,7 +390,7 @@ func TestService_SyncPrices_InvalidatesEvenOnError(t *testing.T) {
 	now := time.Now()
 	listQ := `SELECT ` + cols + ` FROM external_models WHERE deleted_at IS NULL ORDER BY id ASC`
 	rows := extRow(&ExternalModel{ID: 1, ExternalName: "a", CreatedAt: now, UpdatedAt: now}, `{"input":1}`)
-	rows.AddRow(int64(2), "b", "", true, `{"input":1}`, nil, nil, now, now)
+	rows.AddRow(int64(2), "b", "", true, `{"input":1}`, nil, nil, `[]`, now, now)
 	mock.ExpectQuery(regexp.QuoteMeta(listQ)).WillReturnRows(rows)
 	// 第 1 行成功写入。
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE external_models SET sale_rates=$1, updated_at=now() WHERE id=$2`)).
@@ -402,8 +428,8 @@ func TestService_SyncPrices_SuccessInvalidatesOnce(t *testing.T) {
 	now := time.Now()
 	listQ := `SELECT ` + cols + ` FROM external_models WHERE deleted_at IS NULL ORDER BY id ASC`
 	rows := extRow(&ExternalModel{ID: 1, ExternalName: "a", CreatedAt: now, UpdatedAt: now}, `{"input":1}`)
-	rows.AddRow(int64(2), "b", "", true, `{"input":1}`, nil, nil, now, now)
-	rows.AddRow(int64(3), "c", "", true, `{"input":1}`, nil, nil, now, now)
+	rows.AddRow(int64(2), "b", "", true, `{"input":1}`, nil, nil, `[]`, now, now)
+	rows.AddRow(int64(3), "c", "", true, `{"input":1}`, nil, nil, `[]`, now, now)
 	mock.ExpectQuery(regexp.QuoteMeta(listQ)).WillReturnRows(rows)
 
 	// 两行成功写入（a/b）；c 无参考价不触发写。
@@ -450,7 +476,7 @@ func TestService_SyncPrices_AllSkippedNoInvalidate(t *testing.T) {
 	now := time.Now()
 	listQ := `SELECT ` + cols + ` FROM external_models WHERE deleted_at IS NULL ORDER BY id ASC`
 	rows := extRow(&ExternalModel{ID: 1, ExternalName: "a", CreatedAt: now, UpdatedAt: now}, `{"input":1}`)
-	rows.AddRow(int64(2), "b", "", true, `{"input":1}`, nil, nil, now, now)
+	rows.AddRow(int64(2), "b", "", true, `{"input":1}`, nil, nil, `[]`, now, now)
 	mock.ExpectQuery(regexp.QuoteMeta(listQ)).WillReturnRows(rows)
 
 	// 预置缓存条目：全部跳过时不得被清空。
@@ -497,7 +523,7 @@ func TestStore_ExternalNameCacheBounded(t *testing.T) {
 func TestStore_GetByExternalName_DefensiveCopy(t *testing.T) {
 	s, mock := mockService(t)
 	now := time.Now()
-	q := regexp.QuoteMeta(`SELECT ` + cols + ` FROM external_models WHERE external_name = $1 AND enabled = true AND deleted_at IS NULL LIMIT 1`)
+	q := regexp.QuoteMeta(extNameQuery)
 	mock.ExpectQuery(q).WithArgs("qw-max").
 		WillReturnRows(extRow(&ExternalModel{ID: 2, ExternalName: "qw-max", Enabled: true,
 			SaleRates: billing.Rates{"input": 1}, CreatedAt: now, UpdatedAt: now}, `{"input":1}`))
@@ -595,7 +621,7 @@ func TestStore_GetByExternalName_DisabledAlwaysQueriesDB(t *testing.T) {
 	s.SetReadCacheEnabled(false)
 
 	now := time.Now()
-	q := regexp.QuoteMeta(`SELECT ` + cols + ` FROM external_models WHERE external_name = $1 AND enabled = true AND deleted_at IS NULL LIMIT 1`)
+	q := regexp.QuoteMeta(extNameQuery)
 	for i := 0; i < 2; i++ {
 		mock.ExpectQuery(q).WithArgs("qw-max").
 			WillReturnRows(extRow(&ExternalModel{ID: 2, ExternalName: "qw-max", Enabled: true, CreatedAt: now, UpdatedAt: now}, `{"input":1}`))
@@ -615,6 +641,328 @@ func TestStore_GetByExternalName_DisabledAlwaysQueriesDB(t *testing.T) {
 	if got := s.extNameCache.Count(); got != 0 {
 		t.Fatalf("关闭缓存时不得写入缓存，got %d 条", got)
 	}
+}
+
+// ===== 对外模型「别名」特性单测（Step 2/3/4/5/6）=====
+
+// expectGetByNameNoRows 构造 GetByName 的 mock 期望（无匹配 → sql.ErrNoRows）。
+func expectGetByNameNoRows(mock sqlmock.Sqlmock, name string) {
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + cols + ` FROM external_models WHERE external_name = $1`)).
+		WithArgs(name).WillReturnError(sql.ErrNoRows)
+}
+
+// expectAliasExistsForOtherNoRows 构造 AliasExistsForOther 的 mock 期望（无匹配 → 未被他人占用）。
+// validateAliases 对每个别名依次调用 GetByName 与 AliasExistsForOther，二者都需预置期望。
+func expectAliasExistsForOtherNoRows(mock sqlmock.Sqlmock, alias string, excludeID int64) {
+	mock.ExpectQuery(`SELECT 1 FROM external_models\s+WHERE deleted_at IS NULL AND id <> \$2 AND aliases @> to_jsonb\(ARRAY\[\$1::text\]\)\s+LIMIT 1`).
+		WithArgs(alias, excludeID).WillReturnError(sql.ErrNoRows)
+}
+
+func isBadRequest(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && apiErr.Code == resp.CodeBadRequest
+}
+
+// TestStore_ExternalModelAliases_AliasDefaultsEmpty（Step 2）锁定迁移默认空：
+// 未指定别名的模型读出为非 nil 空切片（JSONB NOT NULL DEFAULT '[]'），而非 nil 指针。
+func TestStore_ExternalModelAliases_AliasDefaultsEmpty(t *testing.T) {
+	s, mock := mockService(t)
+	now := time.Now()
+	mock.ExpectQuery(regexp.QuoteMeta(extNameQuery)).WithArgs("qw-max").
+		WillReturnRows(extRow(&ExternalModel{ID: 2, ExternalName: "qw-max", Enabled: true, CreatedAt: now, UpdatedAt: now}, `{}`))
+
+	m, err := s.GetByExternalName(context.Background(), "qw-max")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if m.Aliases == nil {
+		t.Fatal("未指定别名时 Aliases 应为非 nil 空切片")
+	}
+	if len(m.Aliases) != 0 {
+		t.Fatalf("未指定别名时 Aliases 应为空，got %v", m.Aliases)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("mock expectations: %v", err)
+	}
+}
+
+// TestMigration_ExternalModelAliases_AliasIdempotent（Step 2）锁定迁移可重复执行：
+// 0017 必须用 ADD COLUMN IF NOT EXISTS 且默认 '[]'::jsonb，保证重复迁移不报错、旧行为逐字节一致。
+func TestMigration_ExternalModelAliases_AliasIdempotent(t *testing.T) {
+	b, err := os.ReadFile("../../db/migrations/0017_external_model_aliases.sql")
+	if err != nil {
+		t.Fatalf("读取迁移失败: %v", err)
+	}
+	sqlText := string(b)
+	if !strings.Contains(sqlText, "ADD COLUMN IF NOT EXISTS aliases") {
+		t.Fatalf("迁移必须使用 ADD COLUMN IF NOT EXISTS（保证重复执行不报错），got:\n%s", sqlText)
+	}
+	if !strings.Contains(sqlText, "DEFAULT '[]'::jsonb") {
+		t.Fatalf("迁移必须默认 '[]'::jsonb（默认安全态），got:\n%s", sqlText)
+	}
+}
+
+// TestStore_GetByExternalName_AliasResolution（Step 3）锁定别名解析：
+// 按别名请求走别名包含判定查询，DB 返回规范模型；缓存键为请求名（别名与规范名为不同键），
+// 重复按别名读取零 DB。负缓存语义不变。
+func TestStore_GetByExternalName_AliasResolution(t *testing.T) {
+	s, mock := mockService(t)
+	now := time.Now()
+	mock.ExpectQuery(regexp.QuoteMeta(extNameQuery)).WithArgs("cc-sonnet").
+		WillReturnRows(extRow(&ExternalModel{ID: 5, ExternalName: "claude-sonnet", Enabled: true,
+			Aliases: []string{"cc-sonnet"}, CreatedAt: now, UpdatedAt: now}, `{"input":1}`))
+
+	first, err := s.GetByExternalName(context.Background(), "cc-sonnet")
+	if err != nil {
+		t.Fatalf("alias resolve: %v", err)
+	}
+	if first.ExternalName != "claude-sonnet" || first.ID != 5 {
+		t.Fatalf("别名应解析到规范模型，got %+v", first)
+	}
+	// 缓存键为入参名：再次以别名读取应命中缓存（零 DB，多余查询会命中 sqlmock 未预期调用而报错）。
+	second, err := s.GetByExternalName(context.Background(), "cc-sonnet")
+	if err != nil {
+		t.Fatalf("alias resolve cached: %v", err)
+	}
+	if second.ExternalName != "claude-sonnet" {
+		t.Fatalf("unexpected: %+v", second)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("别名命中后应零 DB: %v", err)
+	}
+}
+
+// TestService_ValidateAliases_AliasValidate（Step 4）表驱动覆盖别名归一化与命名空间纯校验
+// （空白项 → 400、去重保序、不撞本模型 external_name）。
+func TestService_ValidateAliases_AliasValidate(t *testing.T) {
+	s, mock := mockService(t)
+	ctx := context.Background()
+
+	// 空白项 → 400（归一化阶段即返回，不触库）。
+	if _, err := s.validateAliases(ctx, []string{"  "}, "self", 0); !isBadRequest(err) {
+		t.Fatalf("空白别名应 400，got %v", err)
+	}
+	// 与本模型 external_name 相同 → 400（在 GetByName 之前短路，不触库）。
+	if _, err := s.validateAliases(ctx, []string{"self"}, "self", 0); !isBadRequest(err) {
+		t.Fatalf("别名撞本模型名应 400，got %v", err)
+	}
+	// 去重且保持顺序（每个别名走一次 GetByName 唯一性查询 + 一次别名↔别名互斥查询 → 均无匹配）。
+	expectGetByNameNoRows(mock, "a")
+	expectAliasOtherNone(mock, "a", 0)
+	expectGetByNameNoRows(mock, "b")
+	expectAliasOtherNone(mock, "b", 0)
+	got, err := s.validateAliases(ctx, []string{" a ", "a", "b"}, "self", 0)
+	if err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	if len(got) != 2 || got[0] != "a" || got[1] != "b" {
+		t.Fatalf("别名应去重并保序，got %v", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("mock expectations: %v", err)
+	}
+}
+
+// TestService_CreateModel_AliasValidate_Conflict（Step 4）别名撞任何其他 external_name → 409。
+func TestService_CreateModel_AliasValidate_Conflict(t *testing.T) {
+	s, mock := mockService(t)
+	now := time.Now()
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + cols + ` FROM external_models WHERE external_name = $1`)).
+		WithArgs("taken").
+		WillReturnRows(extRow(&ExternalModel{ID: 99, ExternalName: "taken", Enabled: true, CreatedAt: now, UpdatedAt: now}, `{}`))
+
+	_, err := s.CreateModel(context.Background(), ExternalModelInput{
+		ExternalName: "new-model", SaleRates: saleRates(), Aliases: []string{"taken"},
+	})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != resp.CodeConflict {
+		t.Fatalf("别名撞其他对外模型名应 409，got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("mock expectations: %v", err)
+	}
+}
+
+// TestService_CreateModel_AliasValidate_AutoConflict（Step 4）别名撞任何 Auto 名 → 409。
+func TestService_CreateModel_AliasValidate_AutoConflict(t *testing.T) {
+	s, mock := mockService(t)
+	s.SetAutoNameChecker(func(_ context.Context, name string) (bool, error) {
+		return name == "auto-x", nil
+	})
+	expectGetByNameNoRows(mock, "auto-x")
+	expectAliasExistsForOtherNoRows(mock, "auto-x", 0)
+
+	_, err := s.CreateModel(context.Background(), ExternalModelInput{
+		ExternalName: "new-model", SaleRates: saleRates(), Aliases: []string{"auto-x"},
+	})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != resp.CodeConflict {
+		t.Fatalf("别名撞 Auto 名应 409，got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("mock expectations: %v", err)
+	}
+}
+
+// TestService_CreateModel_ExternalNameAliasCollision（反向命名空间）对外名撞其他模型的别名 → 409。
+// 此前仅校验「别名 → external_name」，缺「external_name → 别名」方向，导致重名漏网。
+func TestService_CreateModel_ExternalNameAliasCollision(t *testing.T) {
+	s, mock := mockService(t)
+	expectGetByNameNoRows(mock, "cc-alias")
+	mock.ExpectQuery(regexp.QuoteMeta(aliasOtherQuery)).
+		WithArgs("cc-alias", int64(0)).
+		WillReturnRows(sqlmock.NewRows([]string{"1"}).AddRow(1))
+
+	_, err := s.CreateModel(context.Background(), ExternalModelInput{
+		ExternalName: "cc-alias", SaleRates: saleRates(),
+	})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != resp.CodeConflict {
+		t.Fatalf("对外名撞其他模型别名应 409，got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("mock expectations: %v", err)
+	}
+}
+
+// TestService_UpdateModel_ExternalNameAliasCollision（反向命名空间）改名撞其他模型的别名 → 409。
+func TestService_UpdateModel_ExternalNameAliasCollision(t *testing.T) {
+	s, mock := mockService(t)
+	now := time.Now()
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + cols + ` FROM external_models WHERE id = $1`)).
+		WithArgs(int64(1)).
+		WillReturnRows(extRow(&ExternalModel{ID: 1, ExternalName: "old", Enabled: true, CreatedAt: now, UpdatedAt: now}, `{}`))
+	expectGetByNameNoRows(mock, "cc-alias")
+	mock.ExpectQuery(regexp.QuoteMeta(aliasOtherQuery)).
+		WithArgs("cc-alias", int64(1)).
+		WillReturnRows(sqlmock.NewRows([]string{"1"}).AddRow(1))
+
+	_, err := s.UpdateModel(context.Background(), 1, ExternalModelInput{
+		ExternalName: "cc-alias", SaleRates: saleRates(),
+	})
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != resp.CodeConflict {
+		t.Fatalf("改名撞其他模型别名应 409，got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("mock expectations: %v", err)
+	}
+}
+
+// TestStore_Insert_AliasInvalidate（Step 5）新增后别名键须逐个失效（避免旧负缓存滞留）。
+func TestStore_Insert_AliasInvalidate(t *testing.T) {
+	s, mock := mockService(t)
+	now := time.Now()
+	// 预置别名与规范名的负缓存。
+	s.store.cacheExternalName("cc-1", nil, s.store.extNameCache.Generation())
+	s.store.cacheExternalName("real", nil, s.store.extNameCache.Generation())
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO external_models(id, external_name, description, enabled, sale_rates, time_config, context_tiers, aliases) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING `+cols)).
+		WithArgs(sqlmock.AnyArg(), "real", "", true, sqlmock.AnyArg(), nil, nil, sqlmock.AnyArg()).
+		WillReturnRows(extRow(&ExternalModel{ID: 1, ExternalName: "real", Enabled: true, Aliases: []string{"cc-1"}, CreatedAt: now, UpdatedAt: now}, `{"input":1}`))
+
+	if _, err := s.store.Insert(context.Background(), &ExternalModel{
+		ExternalName: "real", Enabled: true, SaleRates: saleRates(), Aliases: []string{"cc-1"},
+	}); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if _, present := s.store.extNameCache.Get("cc-1"); present {
+		t.Fatal("新增后别名键必须失效（避免旧负缓存滞留）")
+	}
+}
+
+// TestStore_BatchDelete_AliasInvalidate（Step 5）批量删除后整体清空（含别名键）。
+func TestStore_BatchDelete_AliasInvalidate(t *testing.T) {
+	s, mock := mockService(t)
+	s.store.cacheExternalName("cc-1", &ExternalModel{ID: 1, ExternalName: "real", Enabled: true}, s.store.extNameCache.Generation())
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE external_models SET deleted_at = now() WHERE id = ANY($1::bigint[])`)).
+		WithArgs(sqlmock.AnyArg()).WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if _, err := s.store.BatchDelete(context.Background(), []int64{1}); err != nil {
+		t.Fatalf("batch delete: %v", err)
+	}
+	if got := s.store.extNameCache.Count(); got != 0 {
+		t.Fatalf("批量删除应整体清空缓存（含别名键），剩余 %d", got)
+	}
+}
+
+// TestService_UpdateModel_AliasInvalidate（Step 5）改别名后旧别名键须立即失效；
+// 再按旧别名读取须回源 DB 且不再命中（无陈旧正缓存残留）。
+func TestService_UpdateModel_AliasInvalidate(t *testing.T) {
+	s, mock := mockService(t)
+	now := time.Now()
+	// 预置旧别名正缓存。
+	s.store.cacheExternalName("old-a", &ExternalModel{ID: 1, ExternalName: "old", Enabled: true, CreatedAt: now, UpdatedAt: now}, s.store.extNameCache.Generation())
+
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + cols + ` FROM external_models WHERE id = $1`)).WithArgs(int64(1)).
+		WillReturnRows(extRow(&ExternalModel{ID: 1, ExternalName: "old", Enabled: true, Aliases: []string{"old-a"}, CreatedAt: now, UpdatedAt: now}, `{}`))
+	// validateAliases 逐个 GetByName 新别名，并做别名↔别名互斥校验。
+	expectGetByNameNoRows(mock, "new-a")
+	expectAliasExistsForOtherNoRows(mock, "new-a", 1)
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE external_models SET external_name=$1, description=$2, enabled=$3, sale_rates=$4, time_config=$5, context_tiers=$6, aliases=$7, updated_at=now() WHERE id=$8`)).
+		WithArgs("old", "", true, sqlmock.AnyArg(), nil, nil, sqlmock.AnyArg(), int64(1)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + cols + ` FROM external_models WHERE id = $1`)).WithArgs(int64(1)).
+		WillReturnRows(extRow(&ExternalModel{ID: 1, ExternalName: "old", Enabled: true, Aliases: []string{"new-a"}, CreatedAt: now, UpdatedAt: now}, `{}`))
+
+	if _, err := s.UpdateModel(context.Background(), 1, ExternalModelInput{
+		ExternalName: "old", SaleRates: saleRates(), Aliases: []string{"new-a"},
+	}); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if _, present := s.store.extNameCache.Get("old-a"); present {
+		t.Fatal("改别名后旧别名键必须失效（否则陈旧模型滞留）")
+	}
+	// 旧别名立即按 DB 重新解析：DB 无匹配 → 不再命中（证明未残留正缓存）。
+	mock.ExpectQuery(regexp.QuoteMeta(extNameQuery)).WithArgs("old-a").WillReturnError(sql.ErrNoRows)
+	if _, err := s.GetByExternalName(context.Background(), "old-a"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("旧别名应解析失败，got %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("mock expectations: %v", err)
+	}
+}
+
+// TestStore_GetByExternalName_AliasResolve（Step 6）表驱动锁定别名解析语义与即时失效：
+//  1. 按别名命中正确模型；
+//  2. 未变更请求命中缓存 → 零 DB；
+//  3. 改名/删别名（写路径失效）后按旧别名不再命中，且无陈旧正缓存残留。
+func TestStore_GetByExternalName_AliasResolve(t *testing.T) {
+	now := time.Now()
+
+	t.Run("alias_hit_and_zero_db", func(t *testing.T) {
+		s, mock := mockService(t)
+		mock.ExpectQuery(regexp.QuoteMeta(extNameQuery)).WithArgs("cc").
+			WillReturnRows(extRow(&ExternalModel{ID: 5, ExternalName: "real", Enabled: true, Aliases: []string{"cc"}, CreatedAt: now, UpdatedAt: now}, `{"input":1}`))
+		for i := 0; i < 3; i++ {
+			m, err := s.GetByExternalName(context.Background(), "cc")
+			if err != nil || m.ID != 5 {
+				t.Fatalf("alias hit %d: m=%+v err=%v", i, m, err)
+			}
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("未变更请求应零 DB（仅命中缓存）: %v", err)
+		}
+	})
+
+	t.Run("stale_alias_purged_after_change", func(t *testing.T) {
+		s, mock := mockService(t)
+		// 预置旧别名正缓存。
+		s.store.cacheExternalName("old-a", &ExternalModel{ID: 5, ExternalName: "real", Enabled: true, Aliases: []string{"old-a"}, CreatedAt: now, UpdatedAt: now}, s.store.extNameCache.Generation())
+		// 模拟改名/删别名写路径失效。
+		s.store.invalidateAllExternalNames()
+		// 旧别名再读：必须回源 DB，得到「无启用模型」负结果（不再命中陈旧模型）。
+		mock.ExpectQuery(regexp.QuoteMeta(extNameQuery)).WithArgs("old-a").WillReturnError(sql.ErrNoRows)
+		if _, err := s.GetByExternalName(context.Background(), "old-a"); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("改名后旧别名不应命中，got %v", err)
+		}
+		// 无陈旧正缓存残留（该键要么不存在，要么已是负缓存 nil）。
+		if v, ok := s.store.extNameCache.Get("old-a"); ok && v != nil {
+			t.Fatalf("旧别名不得残留陈旧正缓存: %+v", v)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("mock expectations: %v", err)
+		}
+	})
 }
 
 // TestStore_GetByExternalName_DeepCopy 锁定 P2-4：缓存命中返回的深拷贝，消费者修改 TimeConfig

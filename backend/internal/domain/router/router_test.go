@@ -27,11 +27,14 @@ func (f *fakeCMSource) ListByExternal(_ context.Context, _ int64) ([]channel.Cha
 // extRow 构造 external_models 查询返回行。
 func extRow(id int64, name string) *sqlmock.Rows {
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	return sqlmock.NewRows([]string{"id", "external_name", "description", "enabled", "sale_rates", "time_config", "context_tiers", "created_at", "updated_at"}).
+	return sqlmock.NewRows([]string{"id", "external_name", "description", "enabled", "sale_rates", "time_config", "context_tiers", "aliases", "created_at", "updated_at"}).
 		AddRow(id, name, "", true,
 			`{"input":1.0,"output":2.0,"cache_read":0.1}`,
-			nil, nil, now, now)
+			nil, nil, `[]`, now, now)
 }
+
+// extNameQuery 与 model.Store.GetByExternalName 一致（含别名包含判定 + 确定性排序）。
+const extNameQuery = `SELECT id, external_name, description, enabled, sale_rates, time_config, context_tiers, aliases, created_at, updated_at FROM external_models WHERE (external_name = $1 OR aliases @> to_jsonb(ARRAY[$1::text])) AND enabled = true AND deleted_at IS NULL ORDER BY (external_name = $1) DESC, id ASC LIMIT 1`
 
 // newModelService 构造可用的 model.Service（expectTimes 次外部查询）。
 func newModelService(t *testing.T, times int) (*model.Service, sqlmock.Sqlmock) {
@@ -40,7 +43,7 @@ func newModelService(t *testing.T, times int) (*model.Service, sqlmock.Sqlmock) 
 	if err != nil {
 		t.Fatalf("sqlmock: %v", err)
 	}
-	query := `SELECT id, external_name, description, enabled, sale_rates, time_config, context_tiers, created_at, updated_at FROM external_models WHERE external_name = $1 AND enabled = true AND deleted_at IS NULL LIMIT 1`
+	query := extNameQuery
 	for i := 0; i < times; i++ {
 		mock.ExpectQuery(regexp.QuoteMeta(query)).
 			WithArgs("qw-max").
@@ -647,8 +650,7 @@ func TestRoute_ModelNotFound(t *testing.T) {
 	db, mock, _ := sqlmock.New()
 	defer db.Close()
 	svc := model.NewService(model.NewStore(db))
-	mock.ExpectQuery(regexp.QuoteMeta(
-		`SELECT id, external_name, description, enabled, sale_rates, time_config, context_tiers, created_at, updated_at FROM external_models WHERE external_name = $1 AND enabled = true AND deleted_at IS NULL LIMIT 1`)).
+	mock.ExpectQuery(regexp.QuoteMeta(extNameQuery)).
 		WithArgs("ghost-model").
 		WillReturnError(sql.ErrNoRows)
 
@@ -1029,4 +1031,121 @@ func TestRouteAll_TagAnyBoundMatch(t *testing.T) {
 	if len(routes) != 1 || routes[0].ChannelID != 2 {
 		t.Fatalf("期望仅命中渠道 2，got %+v", routes)
 	}
+}
+
+// Step 1：路由层排除候选产出——「仅因排空而无候选」也留下 drained 轨迹项（不再静默无记录）。
+func TestExcluded_DrainedAllCandidates(t *testing.T) {
+	svc, mock := newModelService(t, 1)
+	defer func() { _ = mock.ExpectationsWereMet() }()
+
+	mgr := newManagerWithKeys(t,
+		[]*channel.Channel{healthyCh(1, "a", nil, 100)},
+		[]channel.ChannelModel{cm(1, "int1")},
+		[]channel.ChannelKey{newKey(11, 1, channel.StateDrain)})
+	e := NewEngine(svc, &fakeCMSource{cms: []channel.ChannelModel{cm(1, "int1")}}, mgr, nil)
+
+	res, err := e.RouteAllWithExcluded(context.Background(), RouteSpec{ExternalModel: "qw-max"})
+	var re *RouteError
+	if !errors.As(err, &re) || re.Kind != KindNoAvailable {
+		t.Fatalf("all drained → KindNoAvailable, got %v", err)
+	}
+	if res == nil || len(res.Routes) != 0 {
+		t.Fatalf("all drained → 无候选, got %+v", res)
+	}
+	if len(res.Excluded) != 1 {
+		t.Fatalf("want 1 excluded (drained), got %+v", res.Excluded)
+	}
+	ex := res.Excluded[0]
+	if ex.Reason != ExcludeDrained || ex.ChannelID != 1 || ex.ChannelKeyID != 11 || ex.InternalModelID != "int1" {
+		t.Fatalf("drained excluded 身份/原因错误: %+v", ex)
+	}
+	if ex.ChannelName != "a" {
+		t.Fatalf("drained excluded 渠道名 want a, got %q", ex.ChannelName)
+	}
+}
+
+// Step 1：排空候选与会话命中并存时，仅非命中的排空候选被记入排除项。
+func TestExcluded_DrainedWithSessionHit(t *testing.T) {
+	svc, mock := newModelService(t, 1)
+	defer func() { _ = mock.ExpectationsWereMet() }()
+
+	mgr := newManagerWithKeys(t,
+		[]*channel.Channel{healthyCh(1, "a", nil, 100)},
+		[]channel.ChannelModel{cm(1, "int1")},
+		[]channel.ChannelKey{newKey(11, 1, channel.StateDrain)})
+	e := NewEngine(svc, &fakeCMSource{cms: []channel.ChannelModel{cm(1, "int1")}}, mgr, NewSessionRegistry(nil))
+
+	key := "t|qw-max|sess-drain"
+	if ok, _ := e.Sessions().Attach(&Session{
+		SessionID: key, ChannelKeyID: 11, InternalModelID: "int1",
+		ExpireAt: time.Now().Add(time.Hour),
+	}, 10); !ok {
+		t.Fatal("attach failed")
+	}
+
+	res, err := e.RouteAllWithExcluded(context.Background(), RouteSpec{ExternalModel: "qw-max", SessionKey: key})
+	if err != nil {
+		t.Fatalf("会话命中排空候选应放行，got %v", err)
+	}
+	if len(res.Routes) != 1 || res.Routes[0].ChannelKeyID != 11 {
+		t.Fatalf("会话命中应返回排空候选, got %+v", res.Routes)
+	}
+	if len(res.Excluded) != 0 {
+		t.Fatalf("会话命中候选不应被记为排除, got %+v", res.Excluded)
+	}
+}
+
+// Step 1：其余排除点（无绑定 / 标签无路由 / 无候选）各产出稳定 reason。
+func TestExcluded_OtherReasons(t *testing.T) {
+	t.Run("no_binding", func(t *testing.T) {
+		svc, mock := newModelService(t, 1)
+		defer func() { _ = mock.ExpectationsWereMet() }()
+		e := NewEngine(svc, &fakeCMSource{}, newManagerWithKeys(t, nil, nil, nil), nil)
+		res, err := e.RouteAllWithExcluded(context.Background(), RouteSpec{ExternalModel: "qw-max"})
+		var re *RouteError
+		if !errors.As(err, &re) || re.Kind != KindNoAvailable {
+			t.Fatalf("want KindNoAvailable, got %v", err)
+		}
+		if res == nil || len(res.Excluded) != 1 || res.Excluded[0].Reason != ExcludeNoBinding {
+			t.Fatalf("want no_binding excluded, got %+v", res)
+		}
+	})
+
+	t.Run("tag_no_route", func(t *testing.T) {
+		svc, mock := newModelService(t, 1)
+		defer func() { _ = mock.ExpectationsWereMet() }()
+		mgr := newManagerWithKeys(t, []*channel.Channel{healthyCh(1, "a", nil, 100)},
+			[]channel.ChannelModel{cm(1, "int1")},
+			[]channel.ChannelKey{newKey(11, 1, channel.StateNormal)})
+		mgr.SetBoundTags(1, []channel.TagRef{{ID: 1, KV: map[string]string{"region": "cn"}}})
+		e := NewEngine(svc, &fakeCMSource{cms: []channel.ChannelModel{cm(1, "int1")}}, mgr, nil)
+		res, err := e.RouteAllWithExcluded(context.Background(),
+			RouteSpec{ExternalModel: "qw-max", TagKV: map[string]string{"region": "us"}})
+		var re *RouteError
+		if !errors.As(err, &re) || re.Kind != KindNoRoute {
+			t.Fatalf("want KindNoRoute, got %v", err)
+		}
+		if res == nil || len(res.Excluded) != 1 || res.Excluded[0].Reason != ExcludeTagNoRoute {
+			t.Fatalf("want tag_no_route excluded, got %+v", res)
+		}
+	})
+
+	t.Run("no_candidate", func(t *testing.T) {
+		svc, mock := newModelService(t, 1)
+		defer func() { _ = mock.ExpectationsWereMet() }()
+		dis := cm(1, "int1")
+		dis.State = channel.StateDisabled
+		mgr := newManagerWithKeys(t, []*channel.Channel{healthyCh(1, "a", nil, 100)},
+			[]channel.ChannelModel{dis},
+			[]channel.ChannelKey{newKey(11, 1, channel.StateNormal)})
+		e := NewEngine(svc, &fakeCMSource{cms: []channel.ChannelModel{dis}}, mgr, nil)
+		res, err := e.RouteAllWithExcluded(context.Background(), RouteSpec{ExternalModel: "qw-max"})
+		var re *RouteError
+		if !errors.As(err, &re) || re.Kind != KindNoAvailable {
+			t.Fatalf("want KindNoAvailable, got %v", err)
+		}
+		if res == nil || len(res.Excluded) != 1 || res.Excluded[0].Reason != ExcludeNoCandidate {
+			t.Fatalf("want no_candidate excluded, got %+v", res)
+		}
+	})
 }

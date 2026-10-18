@@ -5,6 +5,7 @@ import { ElMessage } from 'element-plus'
 import { createExternalModel } from '@/api/admin'
 import ModelPricing from '@/components/ModelPricing.vue'
 import ModelPriceCatalog from '@/components/ModelPriceCatalog.vue'
+import StringListEditor from '@/components/StringListEditor.vue'
 import ErrorBubble from '@/components/ErrorBubble.vue'
 
 const router = useRouter()
@@ -15,6 +16,8 @@ const form = reactive({
   ExternalName: '',
   Description: '',
   Enabled: true,
+  // 别名：请求命中任一别名即解析到本模型（不出现在 /v1/models）
+  Aliases: [] as string[],
 })
 // 定价对象（售价 + 可选模型级时段/分档）
 const pricing = reactive<Record<string, any>>({
@@ -43,6 +46,7 @@ async function onSubmit() {
       SaleRates: pricing.SaleRates,
       TimeConfig: pricing.TimeConfig,
       ContextTiers: pricing.ContextTiers,
+      Aliases: form.Aliases,
     })
     ElMessage.success('对外模型已创建')
     router.push('/admin/models')
@@ -65,6 +69,13 @@ async function onSubmit() {
           <el-input v-model="form.Description" placeholder="用途说明（可选）" />
         </el-form-item>
         <el-form-item label="启用"><el-switch v-model="form.Enabled" /></el-form-item>
+
+        <el-form-item label="别名" class="span-2">
+          <StringListEditor
+            v-model="form.Aliases"
+            placeholder="输入别名后回车（仅用于模型名解析，不出现在 /v1/models）"
+          />
+        </el-form-item>
 
         <div class="span-2">
           <ModelPricing

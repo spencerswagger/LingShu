@@ -292,6 +292,32 @@ export interface ChannelProtocolRequestHeaders {
   blacklist: string[]
   set: Record<string, string>
 }
+// 协议级错误策略（字段名 = 后端 channelprotocol.ErrorPolicy 的 JSON tag，camelCase）
+export interface ErrorMatch {
+  status?: number
+  errorType?: string
+  errorCode?: string
+  messageRegex?: string
+}
+export interface ErrorDisposition {
+  countIntoHealth: boolean
+  // 未设置 = 沿用改造前行为；显式 false = 不转移
+  failover?: boolean | null
+  action?: string // none | drain | disable
+  downstreamStatus?: number // 0 = 沿用默认 502
+}
+export interface ErrorPolicy {
+  scope: string // channel | models
+  modelIds?: string[] // scope=models 时生效的 channel_models 行 ID（雪花字符串，避免精度丢失）
+  match: ErrorMatch
+  disposition: ErrorDisposition
+  note?: string
+}
+// 协议特性：Key 指定代码实现的特性（thinking-roundtrip / tool-schema-normalize），Params 为其参数（允许为空）。
+export interface ProtocolFeature {
+  key: string
+  params?: Record<string, unknown>
+}
 export interface ChannelProtocolView {
   ID: string
   Name: string
@@ -299,6 +325,10 @@ export interface ChannelProtocolView {
   Protocols: Record<string, ProtocolOption>
   RequestHeaders: ChannelProtocolRequestHeaders
   Models: Record<string, ChannelProtocolModelOverride>
+  // 协议级错误策略（空 = 未配置，保持默认安全态）
+  errorPolicy?: ErrorPolicy[]
+  // 协议特性（空 = 未挂载任何特性，行为与改造前逐字节一致）
+  features?: ProtocolFeature[]
   PresetSourceID: string
   Edited: boolean
   SourceStatus: string // ACTIVE | STALE（来源已失效）
@@ -310,6 +340,8 @@ export interface ChannelProtocolInput {
   Protocols: Record<string, ProtocolOption>
   RequestHeaders: ChannelProtocolRequestHeaders
   Models: Record<string, ChannelProtocolModelOverride>
+  errorPolicy?: ErrorPolicy[]
+  features?: ProtocolFeature[]
 }
 // 同步预览：Pending 为需二次确认才覆盖的条目（含差异文本），Applied 为本次直接覆盖数
 export interface ChannelProtocolSyncPending {
@@ -354,6 +386,26 @@ export function pullChannelProtocolModels(id: string, apiKey: string) {
     { ApiKey: apiKey },
   )
 }
+// 协议级错误统计：按错误类别（category，如 status:422 / code:<errCode> / type:<errType>）聚合的计数。
+export interface ChannelProtocolErrorStat {
+  Category: string
+  Count: number
+}
+// 协议级错误统计查询结果：From/To 为 YYYY-MM-DD（缺省为近 30 天，含今日）
+export interface ChannelProtocolErrorStatsData {
+  ID: string
+  From: string
+  To: string
+  Stats: ChannelProtocolErrorStat[]
+}
+// 查询某渠道协议在 [from, to]（YYYY-MM-DD，缺省近 30 天）内按错误类别聚合的计数
+export function getChannelProtocolErrorStats(id: string, from?: string, to?: string) {
+  return http.get<ChannelProtocolErrorStatsData, ApiRes<ChannelProtocolErrorStatsData>>(
+    `/admin/channel-protocols/${id}/error-stats`,
+    { params: { from, to } },
+  )
+}
+
 // 渠道协议预设包：{ "<id>": Provider }（含 gateway 块），导出/导入共用
 export interface ChannelProtocolPack {
   [key: string]: unknown
@@ -644,6 +696,8 @@ export interface ExternalModel {
   SaleRates: Record<string, number>
   TimeConfig: TimeCoeffConfig | null
   ContextTiers: ContextTier[] | null
+  // 别名：仅用于模型名解析（请求命中任一别名即路由到本模型），不出现在 /v1/models
+  Aliases?: string[]
   CreatedAt: string
   UpdatedAt: string
 }
@@ -654,6 +708,7 @@ export interface ExternalModelInput {
   SaleRates: Record<string, number>
   TimeConfig?: TimeCoeffConfig | null
   ContextTiers?: ContextTier[] | null
+  Aliases?: string[]
 }
 // 列表返回裸数组（非 {list}）
 export function listExternalModels(params: Record<string, unknown> = {}, base = '/admin') {
