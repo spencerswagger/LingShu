@@ -574,6 +574,19 @@ func TestE2E_GatewayBillingLoop(t *testing.T) {
 		channelID = id
 	}
 
+	// 3b) 为渠道建一个密钥（channel_keys）：路由候选是「渠道 × 密钥 × 内部模型」三元组，
+	//     无密钥则无可用候选；请求带语义标签时会直接命中 noRoute（503）。
+	{
+		path := fmt.Sprintf("/api/v1/admin/channels/%d/keys", channelID)
+		status, raw := req(t, http.MethodPost, base+path, adminToken, map[string]any{
+			"Name": "k1", "Credential": "sk-mock-upstream",
+		})
+		if status != http.StatusOK {
+			t.Fatalf("create channel key status=%d body=%s", status, raw)
+		}
+		decodeResp(t, raw)
+	}
+
 	// 4) admin 建对外模型(qw-max，sale_rates 1.0/2.0) 与语义标签 {provider:domestic}；
 	//    随后为渠道绑定内部模型（channel_models：internal qwen-max + cost 与 sale 相同）。
 	//    请求体统一用 PascalCase 键（Input/Output/CacheRead）以锁定内部 API 契约（三段口径）。
