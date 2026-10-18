@@ -108,10 +108,13 @@ func (s *asyncEventSink) SubmitModelEvent(ctx context.Context, evID, channelID i
 // droppedReplays 累计「不可恢复重放」被丢弃的事件数（P2-10）：
 // 当事件引用的渠道/密钥已被硬删除，导致外键冲突（PG 23503）或目标行缺失（sql.ErrNoRows）时，
 // 该 WAL 记录属于**永久失败**——继续重放只会无限循环、拖住 WAL 且永不成功，故丢弃并计数。
+//
+// 生产可观测性由下方 handleReplayErr 的 slog.Warn 提供（每次丢弃一条 Warn）；此计数仅供测试断言，
+// 故不导出，避免出现无生产消费方的悬空导出符号。
 var droppedReplays atomic.Int64
 
-// DroppedEventReplays 返回被丢弃的不可恢复重放事件数（测试/观测用）。
-func DroppedEventReplays() int64 { return droppedReplays.Load() }
+// droppedEventReplays 返回被丢弃的不可恢复重放事件数（测试用）。
+func droppedEventReplays() int64 { return droppedReplays.Load() }
 
 // isPermanentReplayErr 判定重放错误是否不可恢复（继续重试无意义）：
 //   - sql.ErrNoRows：目标行缺失；

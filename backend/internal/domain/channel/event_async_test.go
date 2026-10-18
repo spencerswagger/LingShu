@@ -129,7 +129,7 @@ func TestEventAsync_NilSinkFallsBackSync(t *testing.T) {
 // TestHandleReplayErrPermanent 锁定 P2-10：外键冲突 / ErrNoRows 属不可恢复重放，应丢弃（返回 nil）
 // 并计数（否则 WAL 记录会永久重试）；可恢复错误必须原样返回以便保留 WAL 重试。
 func TestHandleReplayErrPermanent(t *testing.T) {
-	before := DroppedEventReplays()
+	before := droppedEventReplays()
 	// 不可恢复：外键冲突（引用渠道/密钥被硬删除）。
 	if err := handleReplayErr("channel_key_event", "k", &pgconn.PgError{Code: "23503"}); err != nil {
 		t.Fatalf("外键冲突应被丢弃（返回 nil），got %v", err)
@@ -138,7 +138,7 @@ func TestHandleReplayErrPermanent(t *testing.T) {
 	if err := handleReplayErr("channel_key_event", "k", sql.ErrNoRows); err != nil {
 		t.Fatalf("ErrNoRows 应被丢弃（返回 nil），got %v", err)
 	}
-	if got := DroppedEventReplays() - before; got != 2 {
+	if got := droppedEventReplays() - before; got != 2 {
 		t.Fatalf("不可恢复重放应计数 2，got %d", got)
 	}
 	// 可恢复：瞬时 DB 故障原样返回。
