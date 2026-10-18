@@ -8,8 +8,8 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
-	"sync"
 
+	"github.com/team/llmgateway/internal/pkg/gencache"
 	"github.com/team/llmgateway/internal/pkg/resp"
 )
 
@@ -59,18 +59,18 @@ type Service struct {
 	//   - 数据来源：auto_models + auto_model_members（经 store.GetByName 的作用域可见性过滤 + JOIN）；
 	//   - 键 = name + "\x00" + ownerUserID（owner 为 nil 时后缀为空）；值 = 解析结果
 	//     （成员列表 + 是否 Auto），含「查无此名 / 已停用」的负结果（isAuto=false）；
-	//   - 键首段来自请求体（用户可控），故**有界**（membersCacheMax + FIFO 淘汰）：防止认证用户
+	//   - 键首段来自请求体（用户可控），故**有界**（原语 FIFO 淘汰，上限 defaultMembersCacheMax）：防止认证用户
 	//     以海量随机名打满负缓存造成内存耗尽 DoS。淘汰代价仅为回源一次 DB，不影响正确性。
 	//   - 失效点（写路径显式失效，无 TTL）：
 	//     本文件 Create/Update/Delete 成功后整体清空（改名/成员变更/删除均可能影响任意键，整体清空避免漏接）；
 	//     以及 **跨包** 对外模型写路径（model.Service 经 SetNameWriteHook 回调 InvalidateReadCache），
 	//     因解析结果含 JOIN 自 external_models 的 ExternalName/Enabled。
 	//   - 关闭开关（SetReadCacheEnabled(false)）时退回直查，不读写缓存。
-	membersMu         sync.RWMutex
-	membersCache      map[string]resolveCacheEntry
-	membersCacheOrder []string
-	membersCacheMax   int
-	readCacheOff      bool
+	// membersCache 承载 ResolveMembers 结果的存储、FIFO 淘汰、失效代际；
+	// 键 = name + "\x00" + ownerUserID，value = 解析结果（含负结果 isAuto=false）。
+	// 存储/淘汰/代际/失效均由 pkg/gencache 原语承担。
+	membersCache *gencache.Cache[resolveCacheEntry]
+	readCacheOff bool
 }
 
 // defaultMembersCacheMax ResolveMembers 读缓存条目上限（键用户可控，必须有界）。
@@ -92,10 +92,7 @@ func membersCacheKey(name string, ownerUserID *int64) string {
 
 // invalidateMembersCache 清空 ResolveMembers 缓存（Auto 写路径调用）。
 func (s *Service) invalidateMembersCache() {
-	s.membersMu.Lock()
-	s.membersCache = nil
-	s.membersCacheOrder = nil
-	s.membersMu.Unlock()
+	s.membersCache.InvalidateAll()
 }
 
 // InvalidateReadCache 对外暴露的缓存失效入口：供跨包写路径（model.Service.SetNameWriteHook）
@@ -109,7 +106,7 @@ func (s *Service) SetReadCacheEnabled(on bool) { s.readCacheOff = !on }
 
 // NewService 创建 Auto 模型服务。
 func NewService(store *Store) *Service {
-	return &Service{store: store, membersCacheMax: defaultMembersCacheMax}
+	return &Service{store: store, membersCache: gencache.New[resolveCacheEntry](defaultMembersCacheMax)}
 }
 
 // SetExternalNameChecker 注入跨表重名校验（装配层传入，查 external_models）。
@@ -314,17 +311,16 @@ func (s *Service) List(ctx context.Context, scope string, ownerUserID *int64) ([
 func (s *Service) ResolveMembers(ctx context.Context, name string, ownerUserID *int64) ([]Member, bool, error) {
 	key := membersCacheKey(name, ownerUserID)
 	if !s.readCacheOff {
-		s.membersMu.RLock()
-		cached, ok := s.membersCache[key]
-		s.membersMu.RUnlock()
-		if ok {
+		if cached, ok := s.membersCache.Get(key); ok {
 			// 防御性拷贝：命中缓存返回副本，调用方就地修改成员切片不得污染缓存（P2-3）。
 			return append([]Member(nil), cached.members...), cached.isAuto, nil
 		}
 	}
+	// 回源前捕获代际：回源期间若发生失效（bump 代际），本次回填必须被拒绝（见 cacheResolvedMembers）。
+	gen := s.membersCache.Generation()
 	m, err := s.store.GetByName(ctx, name, ownerUserID)
 	if errors.Is(err, sql.ErrNoRows) {
-		s.cacheResolvedMembers(key, nil, false)
+		s.cacheResolvedMembers(key, nil, false, gen)
 		return nil, false, nil
 	}
 	if err != nil {
@@ -332,42 +328,22 @@ func (s *Service) ResolveMembers(ctx context.Context, name string, ownerUserID *
 	}
 	if !m.Enabled {
 		// 停用的 Auto 视为不存在，回落普通模型解析。
-		s.cacheResolvedMembers(key, nil, false)
+		s.cacheResolvedMembers(key, nil, false, gen)
 		return nil, false, nil
 	}
-	s.cacheResolvedMembers(key, m.Members, true)
+	s.cacheResolvedMembers(key, m.Members, true, gen)
 	return m.Members, true, nil
 }
 
-// cacheResolvedMembers 写入 ResolveMembers 结果缓存（members 为 nil 表示负结果）。
-// 有界（membersCacheMax）：超过上限按插入顺序 FIFO 淘汰最早键，防用户可控键打满内存（P1-5）。
+// cacheResolvedMembers 写入 ResolveMembers 结果缓存（members 为 nil 表示负结果），仅在代际仍为 gen 时写入。
+// gen 为读路径回源前捕获的代际：回源期间若发生任一次失效（写路径），本次回填被原语拒绝。
+// 有界（原语 FIFO 淘汰）防用户可控键打满内存（P1-5）。
 // 防御性拷贝：存入缓存的是成员切片副本，避免调用方后续就地修改其持有的切片污染缓存（P2-3）。
-func (s *Service) cacheResolvedMembers(key string, members []Member, isAuto bool) {
+func (s *Service) cacheResolvedMembers(key string, members []Member, isAuto bool, gen uint64) {
 	if s.readCacheOff {
 		return
 	}
-	s.membersMu.Lock()
-	if s.membersCache == nil {
-		s.membersCache = make(map[string]resolveCacheEntry)
-	}
-	if _, exists := s.membersCache[key]; !exists {
-		s.membersCacheOrder = append(s.membersCacheOrder, key)
-	}
-	s.membersCache[key] = resolveCacheEntry{members: append([]Member(nil), members...), isAuto: isAuto}
-	s.evictMembersCacheLocked()
-	s.membersMu.Unlock()
-}
-
-// evictMembersCacheLocked 超过上限时按插入顺序 FIFO 淘汰最早键（调用方须持有写锁）。
-func (s *Service) evictMembersCacheLocked() {
-	if s.membersCacheMax <= 0 {
-		return
-	}
-	for len(s.membersCache) > s.membersCacheMax && len(s.membersCacheOrder) > 0 {
-		oldest := s.membersCacheOrder[0]
-		s.membersCacheOrder = s.membersCacheOrder[1:]
-		delete(s.membersCache, oldest)
-	}
+	s.membersCache.PutAtGen(key, "", resolveCacheEntry{members: append([]Member(nil), members...), isAuto: isAuto}, gen)
 }
 
 // checkExternalName 跨表重名校验：未注入检查器时跳过；命中则报冲突。

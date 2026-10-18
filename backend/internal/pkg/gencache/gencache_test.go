@@ -55,22 +55,31 @@ func TestCache_BoundedFIFO(t *testing.T) {
 	}
 	assertConsistent(t, c)
 
-	// 失效 b 后顺序表同步摘除；再插入 e 时淘汰的是当前最早的 c（而非陈旧 b）。
+	// 失效 b 后顺序表同步摘除；assertConsistent 校验 order 与 map 严格一致：
+	// 若失效未从顺序表摘除 b，len(order) 会大于 len(map) 而立即失败。
 	c.Invalidate("b")
 	if _, ok := c.Get("b"); ok {
 		t.Fatal("b 应已失效")
 	}
 	assertConsistent(t, c)
+
+	// 再插入两个键重新触达上限：淘汰的应是当前最早键 c（而非已失效的陈旧键 b）。
 	if !c.PutAtGen("e", "", 5, c.Generation()) {
 		t.Fatal("put e 应成功")
+	}
+	if !c.PutAtGen("f", "", 6, c.Generation()) {
+		t.Fatal("put f 应成功")
 	}
 	if _, ok := c.Get("c"); ok {
 		t.Fatal("c 应为当前最早键并被淘汰")
 	}
-	for _, k := range []string{"d", "e"} {
+	for _, k := range []string{"d", "e", "f"} {
 		if _, ok := c.Get(k); !ok {
 			t.Fatalf("%q 应仍存活", k)
 		}
+	}
+	if c.Count() != 3 {
+		t.Fatalf("count=%d, want 3", c.Count())
 	}
 	assertConsistent(t, c)
 }
@@ -99,6 +108,28 @@ func TestCache_PutAtGenStaleRejected(t *testing.T) {
 	if v, ok := c.Get("k"); !ok || v != 3 {
 		t.Fatalf("got (%d,%v), want (3,true)", v, ok)
 	}
+}
+
+// TestCache_PutWritesAtCurrentGeneration 锁定 Put 契约：以当前代际无条件写入（供测试/直写），
+// 无需先捕获代际；写入后失效仍会递增代际，使旧代际回填被拒。
+func TestCache_PutWritesAtCurrentGeneration(t *testing.T) {
+	c := New[int](0)
+	c.Put("k", "g", 7)
+	if v, ok := c.Get("k"); !ok || v != 7 {
+		t.Fatalf("Put 后应命中 (7,true)，got (%d,%v)", v, ok)
+	}
+	// Put 采用当前代际：失效后再用失效前的代际回填仍须被拒绝。
+	stale := c.Generation()
+	c.Invalidate("k")
+	if c.PutAtGen("k", "g", 8, stale) {
+		t.Fatal("Put 之后失效，携带陈旧代际的回填必须被拒绝")
+	}
+	// Put 本身不受旧代际约束（无条件写入）。
+	c.Put("k", "g", 9)
+	if v, ok := c.Get("k"); !ok || v != 9 {
+		t.Fatalf("Put 应无条件写入当前代际，got (%d,%v)", v, ok)
+	}
+	assertConsistent(t, c)
 }
 
 // TestCache_InvalidateBumpsGenerationEvenIfMissing 锁定「失效即使键不存在也递增代际」：

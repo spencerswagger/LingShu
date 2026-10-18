@@ -11,6 +11,7 @@ import (
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/team/llmgateway/internal/domain/billing"
+	"github.com/team/llmgateway/internal/pkg/gencache"
 	"github.com/team/llmgateway/internal/pkg/resp"
 )
 
@@ -372,7 +373,7 @@ func TestService_SyncPrices_InvalidatesEvenOnError(t *testing.T) {
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE external_models SET sale_rates=$1, updated_at=now() WHERE id=$2`)).
 		WithArgs(sqlmock.AnyArg(), int64(2)).WillReturnError(errors.New("db down"))
 	// 预置缓存条目，验证出错路径同样被清空。
-	s.store.cacheExternalName("a", nil)
+	s.store.cacheExternalName("a", nil, s.store.extNameCache.Generation())
 
 	if _, err := s.SyncPrices(context.Background()); err == nil {
 		t.Fatalf("第 2 行 Update 失败时 SyncPrices 应返回错误")
@@ -380,10 +381,7 @@ func TestService_SyncPrices_InvalidatesEvenOnError(t *testing.T) {
 	if fired != 1 {
 		t.Fatalf("即便中途出错，也应失效一次（nameWriteHook），got %d", fired)
 	}
-	s.store.extNameMu.RLock()
-	_, present := s.store.extNameCache["a"]
-	s.store.extNameMu.RUnlock()
-	if present {
+	if _, present := s.store.extNameCache.Get("a"); present {
 		t.Fatalf("出错路径也必须清空对外名缓存（否则旧售价无限期滞留）")
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -415,8 +413,8 @@ func TestService_SyncPrices_SuccessInvalidatesOnce(t *testing.T) {
 		WithArgs(sqlmock.AnyArg(), int64(2)).WillReturnResult(sqlmock.NewResult(0, 1))
 
 	// 预置缓存条目，验证成功路径被清空。
-	s.store.cacheExternalName("a", nil)
-	s.store.cacheExternalName("b", nil)
+	s.store.cacheExternalName("a", nil, s.store.extNameCache.Generation())
+	s.store.cacheExternalName("b", nil, s.store.extNameCache.Generation())
 
 	res, err := s.SyncPrices(context.Background())
 	if err != nil {
@@ -432,10 +430,7 @@ func TestService_SyncPrices_SuccessInvalidatesOnce(t *testing.T) {
 	if fired != 1 {
 		t.Fatalf("多行成功也应只失效一次（nameWriteHook），got %d", fired)
 	}
-	s.store.extNameMu.RLock()
-	remaining := len(s.store.extNameCache)
-	s.store.extNameMu.RUnlock()
-	if remaining != 0 {
+	if remaining := s.store.extNameCache.Count(); remaining != 0 {
 		t.Fatalf("成功路径必须清空对外名缓存，仍剩 %d 条", remaining)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -459,8 +454,8 @@ func TestService_SyncPrices_AllSkippedNoInvalidate(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(listQ)).WillReturnRows(rows)
 
 	// 预置缓存条目：全部跳过时不得被清空。
-	s.store.cacheExternalName("a", nil)
-	s.store.cacheExternalName("b", nil)
+	s.store.cacheExternalName("a", nil, s.store.extNameCache.Generation())
+	s.store.cacheExternalName("b", nil, s.store.extNameCache.Generation())
 
 	res, err := s.SyncPrices(context.Background())
 	if err != nil {
@@ -475,10 +470,7 @@ func TestService_SyncPrices_AllSkippedNoInvalidate(t *testing.T) {
 	if fired != 0 {
 		t.Fatalf("无任何写入时不应回调失效 hook，got %d", fired)
 	}
-	s.store.extNameMu.RLock()
-	remaining := len(s.store.extNameCache)
-	s.store.extNameMu.RUnlock()
-	if remaining != 2 {
+	if remaining := s.store.extNameCache.Count(); remaining != 2 {
 		t.Fatalf("无变更时缓存应保留（2 条），got %d", remaining)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
@@ -490,14 +482,12 @@ func TestService_SyncPrices_AllSkippedNoInvalidate(t *testing.T) {
 // 防止认证用户以海量随机名打满负缓存造成内存耗尽 DoS。
 func TestStore_ExternalNameCacheBounded(t *testing.T) {
 	s := NewStore(nil)
-	s.extNameMax = 8
+	// 直写底层原语上限（原语在构造时确定 max），验证有界 FIFO 淘汰。
+	s.extNameCache = gencache.New[*ExternalModel](8)
 	for i := 0; i < 100; i++ {
-		s.cacheExternalName(fmt.Sprintf("m-%d", i), nil) // 负缓存同样计入上限
+		s.cacheExternalName(fmt.Sprintf("m-%d", i), nil, s.extNameCache.Generation()) // 负缓存同样计入上限
 	}
-	s.extNameMu.RLock()
-	got := len(s.extNameCache)
-	s.extNameMu.RUnlock()
-	if got > 8 {
+	if got := s.extNameCache.Count(); got > 8 {
 		t.Fatalf("extNameCache 应有界（<=8），got %d", got)
 	}
 }
@@ -536,23 +526,43 @@ func TestStore_GetByExternalName_DefensiveCopy(t *testing.T) {
 }
 
 // TestStore_InvalidateExternalName_KeepsOrderBounded 锁定 P2-2：反复「失效 → 回填」同一对外名
-// 不得使 extNameOrder 无界增长（每次失效须同步从 FIFO 顺序表摘除该名，保持与映射一致）。
+// 不得造成内存缓漏。失效须同步从 FIFO 顺序表摘除该名，现由 gencache 原语保证
+// （原语单测 assertConsistent 校验 order 与 map 严格一致）；此处断言对外可观测结果：反复失效后缓存为空。
 func TestStore_InvalidateExternalName_KeepsOrderBounded(t *testing.T) {
 	s := NewStore(nil)
-	s.extNameMax = 8
+	s.extNameCache = gencache.New[*ExternalModel](8)
 	for i := 0; i < 1000; i++ {
-		s.cacheExternalName("same", &ExternalModel{ExternalName: "same", Enabled: true})
+		s.cacheExternalName("same", &ExternalModel{ExternalName: "same", Enabled: true}, s.extNameCache.Generation())
 		s.invalidateExternalName("same")
 	}
-	s.extNameMu.RLock()
-	cacheLen := len(s.extNameCache)
-	orderLen := len(s.extNameOrder)
-	s.extNameMu.RUnlock()
-	if cacheLen != 0 {
+	if cacheLen := s.extNameCache.Count(); cacheLen != 0 {
 		t.Fatalf("失效后缓存应为空，got %d", cacheLen)
 	}
-	if orderLen != 0 {
-		t.Fatalf("extNameOrder 不得无界增长（应与缓存一致为空），got %d", orderLen)
+}
+
+// TestStore_StaleCacheFillAfterInvalidateRejected 与 identity token_cache 的同名用例同构：
+// 读路径在回源 DB 前捕获代际；若回源期间发生写路径失效（bump 代际，如 Insert/Update/BatchDelete），
+// 携带陈旧代际的回填必须被拒绝——否则失效前读到的旧快照会滞留（本缓存无 TTL），
+// 后续请求将持续读到该陈旧的启用/停用状态。
+func TestStore_StaleCacheFillAfterInvalidateRejected(t *testing.T) {
+	s := NewStore(nil)
+	fresh := &ExternalModel{ID: 1, ExternalName: "x", Enabled: true}
+
+	// 读路径：回源前捕获代际。
+	gen := s.extNameCache.Generation()
+	// 期间写路径失效（如改名/批量删除清空缓存）。
+	s.invalidateExternalName("x")
+	// 读路径回来回填（携带陈旧代际）。
+	s.cacheExternalName("x", fresh, gen)
+
+	if _, ok := s.extNameCache.Get("x"); ok {
+		t.Fatal("失效后携带陈旧代际的回填必须被拒绝（否则旧配置快照无限期滞留）")
+	}
+
+	// 对照组：期间无失效时，携带当前代际的回填应正常命中（证明不会误杀正常回填路径）。
+	s.cacheExternalName("x", fresh, s.extNameCache.Generation())
+	if _, ok := s.extNameCache.Get("x"); !ok {
+		t.Fatal("无失效发生时回填应正常命中")
 	}
 }
 
@@ -573,7 +583,7 @@ func TestStore_GetByExternalName_DeepCopy(t *testing.T) {
 				Segments: []billing.Segment{{Name: "特价", Start: "00:00", End: "24:00", Coeff: 0.5}}}},
 		},
 	}
-	s.cacheExternalName("qw-max", seeded)
+	s.cacheExternalName("qw-max", seeded, s.extNameCache.Generation())
 
 	first, err := s.GetByExternalName(context.Background(), "qw-max")
 	if err != nil {
