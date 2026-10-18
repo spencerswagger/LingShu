@@ -9,8 +9,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -38,6 +40,7 @@ type Admin struct {
 	callLogs       callLogReader                                                    // 调用日志只读查询（经 SetCallLogStore 注入；nil=未装配）
 	routeEng       routeEngine                                                      // 路由引擎（服务状态候选顺序来源；经 SetRouterEngine 注入；nil=不计算候选）
 	models         externalModelSource                                              // 对外模型只读枚举（经 SetModelSource 注入；nil=列表为空）
+	sessionCostEvt *router.SessionCostEventStore                                    // 会话成本决策产物进程内存储（经 SetSessionCostEventStore 注入；nil=事件流为空）
 }
 
 // routeEngine 聚合端点所需的路由引擎能力（router.Engine 满足）。
@@ -91,6 +94,10 @@ func (h *Admin) SetRouterEngine(e routeEngine) { h.routeEng = e }
 
 // SetModelSource 注入对外模型只读枚举。nil 时对外模型列表为空、不报错。
 func (h *Admin) SetModelSource(s externalModelSource) { h.models = s }
+
+// SetSessionCostEventStore 注入会话成本决策产物进程内存储（「会话成本路由」面板 /events、/distribution 数据源）。
+// nil 时事件流/分布为空、不报错。
+func (h *Admin) SetSessionCostEventStore(s *router.SessionCostEventStore) { h.sessionCostEvt = s }
 
 // attachCallLog 查 call_logs 并填充账单详情（未装配/无记录时为 nil）。
 func (h *Admin) attachCallLog(ctx context.Context, bid string) *CallLogView {
@@ -1416,6 +1423,449 @@ func (h *Admin) tokenNamesByIDs(ctx context.Context, ids []int64) map[int64]stri
 			continue
 		}
 		out[id] = name
+	}
+	return out
+}
+
+// ===== 会话成本路由面板（Step 17）=====
+//
+// 三个只读端点，所有值均显式标注来源标签（Source/*Source 字段），便于前端区分
+// 「模型成本 / 真实 token / 当前时刻 / 实际分档」四类数据来源：
+//   - GET /api/v1/admin/session-cost/config       各候选渠道三档成本价 + 时段/分档倍率 + 当前时刻倍率 +
+//     routing.cost_sample 默认样值 + k 系数与门控阈值；
+//   - GET /api/v1/admin/session-cost/events       读 KindSessionCostEvent 落地的事件流（有界进程内存储）；
+//   - GET /api/v1/admin/session-cost/distribution 按会话聚合临界缓存读（crossCacheRead）的分位/直方。
+
+// 来源标签常量：面板所有值均显式标注来源，避免前端把「模型成本」与「售价/真实 token」混淆。
+const (
+	sourceModelCost      = "模型成本"
+	sourceCurrentTime    = "当前时刻"
+	sourceContextTier    = "实际分档"
+	sourceCostSample     = "routing.cost_sample 默认样值（真实 token）"
+	sourceTimeConfig     = "billing.time_config"
+	sourceTiersConfig    = "billing.context_tiers"
+	sourceSessionCostCfg = "routing.session_cost"
+	sourceSessionCostEvt = "asyncwrite KindSessionCostEvent（进程内落地）"
+	sourceCrossCacheRead = "crossCacheRead（模型成本 × 真实 token）"
+)
+
+// sessionCostTierView 单一候选渠道的三档成本价（模型成本来源）。
+type sessionCostTierView struct {
+	Input     float64 `json:"Input"`
+	CacheRead float64 `json:"CacheRead"`
+	Output    float64 `json:"Output"`
+	Source    string  `json:"Source"`
+}
+
+// sessionCostCandidateView 单个候选渠道的面板视图：三档成本价 + 时段/分档倍率（含来源标签）。
+type sessionCostCandidateView struct {
+	ChannelID       int64               `json:"ChannelID,string"`
+	InternalModelID string              `json:"InternalModelID"`
+	Cost            sessionCostTierView `json:"Cost"`
+	TimeCoeff       float64             `json:"TimeCoeff"`
+	TimeCoeffSource string              `json:"TimeCoeffSource"`
+	CtxCoeff        float64             `json:"CtxCoeff"`
+	CtxCoeffSource  string              `json:"CtxCoeffSource"`
+}
+
+// sessionCostGates 经验式剩余轮数 k 系数与中途切换门控阈值（均取自 routing.session_cost）。
+type sessionCostGates struct {
+	RemainingA   float64 `json:"RemainingA"`
+	RemainingB   float64 `json:"RemainingB"`
+	RemainingMin int     `json:"RemainingMin"`
+	RemainingMax int     `json:"RemainingMax"`
+	MinRemaining int     `json:"MinRemaining"`
+	CooldownSec  int     `json:"CooldownSec"`
+	MinImprove   float64 `json:"MinImprove"`
+	Source       string  `json:"Source"`
+}
+
+// sessionCostConfigResponse 「会话成本路由」配置面板响应。
+type sessionCostConfigResponse struct {
+	Now              time.Time                  `json:"Now"`
+	NowTimeCoeff     float64                    `json:"NowTimeCoeff"`
+	NowTimeCoeffSrc  string                     `json:"NowTimeCoeffSource"`
+	TimeConfig       json.RawMessage            `json:"TimeConfig,omitempty"`
+	TimeConfigSource string                     `json:"TimeConfigSource"`
+	ContextTiers     json.RawMessage            `json:"ContextTiers,omitempty"`
+	TiersSource      string                     `json:"ContextTiersSource"`
+	CostSample       billing.WireUsage          `json:"CostSample"`
+	CostSampleSource string                     `json:"CostSampleSource"`
+	SessionCost      router.SessionCostConfig   `json:"SessionCost"`
+	SessionCostSrc   string                     `json:"SessionCostSource"`
+	Gates            sessionCostGates           `json:"Gates"`
+	Candidates       []sessionCostCandidateView `json:"Candidates"`
+	CandidatesSource string                     `json:"CandidatesSource"`
+}
+
+// HandleSessionCostConfig GET /api/v1/admin/session-cost/config
+// 返回面板所需的全部配置项与候选渠道成本视图；?Model=<对外模型名> 时附带该模型的候选渠道。
+func (h *Admin) HandleSessionCostConfig(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	now := h.now()
+
+	globalTC, timeRaw := h.sessionCostGlobalTimeConfig(ctx)
+	globalTiers, tiersRaw := h.sessionCostGlobalTiers(ctx)
+	sample := h.sessionCostSample(ctx)
+	cfg, _ := h.sessionCostRoutingConfig(ctx)
+
+	nowCoeff := 1.0
+	if globalTC != nil {
+		if v, err := globalTC.CoeffFor(now); err == nil {
+			nowCoeff = v
+		}
+	}
+	cands := h.sessionCostCandidates(ctx, r.URL.Query().Get("Model"), now, sample, globalTC, globalTiers)
+
+	resp.OK(w, r, sessionCostConfigResponse{
+		Now:              now,
+		NowTimeCoeff:     nowCoeff,
+		NowTimeCoeffSrc:  sourceCurrentTime,
+		TimeConfig:       json.RawMessage(timeRaw),
+		TimeConfigSource: sourceTimeConfig,
+		ContextTiers:     json.RawMessage(tiersRaw),
+		TiersSource:      sourceTiersConfig,
+		CostSample:       billing.WireUsage(sample),
+		CostSampleSource: sourceCostSample,
+		SessionCost:      cfg,
+		SessionCostSrc:   sourceSessionCostCfg,
+		Gates: sessionCostGates{
+			RemainingA: cfg.RemainingA, RemainingB: cfg.RemainingB,
+			RemainingMin: cfg.RemainingMin, RemainingMax: cfg.RemainingMax,
+			MinRemaining: cfg.MinRemaining, CooldownSec: cfg.CooldownSec,
+			MinImprove: cfg.MinImprove, Source: sourceSessionCostCfg,
+		},
+		Candidates:       cands,
+		CandidatesSource: sourceModelCost,
+	})
+}
+
+// sessionCostGlobalTimeConfig 读取全局时段配置（billing.time_config）。
+// 缺失/非法返回 (nil, nil)；解析成功返回配置与原始 JSON（供前端展示）。
+func (h *Admin) sessionCostGlobalTimeConfig(ctx context.Context) (*billing.TimeCoeffConfig, []byte) {
+	if h.billing == nil {
+		return nil, nil
+	}
+	raw, err := h.billing.GetConfig(ctx, "billing.time_config")
+	if err != nil {
+		return nil, nil
+	}
+	tc, err := billing.ParseTimeConfig(raw)
+	if err != nil {
+		return nil, raw
+	}
+	return &tc, raw
+}
+
+// sessionCostGlobalTiers 读取全局上下文分档（billing.context_tiers）；缺失（未装配/读取失败）返回 (nil, nil)，
+// 解析失败返回 (nil, raw)（原始 JSON 供前端展示），成功返回 (tiers, raw)。
+func (h *Admin) sessionCostGlobalTiers(ctx context.Context) ([]billing.TierRule, []byte) {
+	if h.billing == nil {
+		return nil, nil
+	}
+	raw, err := h.billing.GetConfig(ctx, "billing.context_tiers")
+	if err != nil {
+		return nil, nil
+	}
+	var tiers []billing.TierRule
+	if err := json.Unmarshal(raw, &tiers); err != nil {
+		return nil, raw
+	}
+	return tiers, raw
+}
+
+// sessionCostSample 读取路由成本比较样值（routing.cost_sample，三段口径）；缺失/非法回落内置默认。
+func (h *Admin) sessionCostSample(ctx context.Context) billing.Usage {
+	if h.billing != nil {
+		if raw, err := h.billing.GetConfig(ctx, "routing.cost_sample"); err == nil {
+			var u billing.Usage
+			if json.Unmarshal(raw, &u) == nil {
+				return u
+			}
+		}
+	}
+	return billing.Usage{Input: 10000, CacheRead: 9000, Output: 1000}
+}
+
+// sessionCostRoutingConfig 读取会话成本路由配置（routing.session_cost）并解析为结构化配置；缺失回落零值。
+func (h *Admin) sessionCostRoutingConfig(ctx context.Context) (router.SessionCostConfig, []byte) {
+	var raw []byte
+	if h.billing != nil {
+		if b, err := h.billing.GetConfig(ctx, "routing.session_cost"); err == nil {
+			raw = b
+		}
+	}
+	var cfg router.SessionCostConfig
+	if len(raw) > 0 {
+		_ = json.Unmarshal(raw, &cfg)
+	}
+	return cfg, raw
+}
+
+// sessionCostCandidates 枚举某对外模型下绑定的候选渠道：三档成本价（模型成本）+ 时段/分档倍率。
+// 倍率口径与路由决策同源（router.ResolveTimeCoeff/ResolveCtxCoeff：模型级优先，回落全局）。
+func (h *Admin) sessionCostCandidates(ctx context.Context, model string, now time.Time, sample billing.Usage, globalTC *billing.TimeCoeffConfig, globalTiers []billing.TierRule) []sessionCostCandidateView {
+	out := []sessionCostCandidateView{}
+	if h.channelMgr == nil || model == "" {
+		return out
+	}
+	extID, ok := h.externalModelID(ctx, model)
+	if !ok {
+		return out
+	}
+	cms, err := h.channelMgr.ListByExternal(ctx, extID)
+	if err != nil {
+		return out
+	}
+	for i := range cms {
+		cm := cms[i]
+		tc := router.ResolveTimeCoeff(cm.TimeConfig, globalTC, now)
+		ctxCoeff := router.ResolveCtxCoeff(cm.ContextTiers, globalTiers, sample)
+		out = append(out, sessionCostCandidateView{
+			ChannelID:       cm.ChannelID,
+			InternalModelID: cm.InternalModelID,
+			Cost: sessionCostTierView{
+				Input:     cm.CostRates["input"],
+				CacheRead: cm.CostRates["cache_read"],
+				Output:    cm.CostRates["output"],
+				Source:    sourceModelCost,
+			},
+			TimeCoeff:       tc,
+			TimeCoeffSource: sourceCurrentTime,
+			CtxCoeff:        ctxCoeff,
+			CtxCoeffSource:  sourceContextTier,
+		})
+	}
+	return out
+}
+
+// externalModelID 由对外模型名解析其 ID（仅启用项）；未装配/未命中返回 (0, false)。
+func (h *Admin) externalModelID(ctx context.Context, name string) (int64, bool) {
+	if h.models == nil {
+		return 0, false
+	}
+	enabled := true
+	list, err := h.models.ListModels(ctx, &enabled)
+	if err != nil {
+		return 0, false
+	}
+	for i := range list {
+		if list[i].ExternalName == name {
+			return list[i].ID, true
+		}
+	}
+	return 0, false
+}
+
+// sessionCostEventView 单条会话成本决策产物的事件视图（含来源标签，PaybackTurns/PaybackLimit 为 NaN/Inf 时置 null）。
+type sessionCostEventView struct {
+	SessionID          string   `json:"SessionID"`
+	Turn               int      `json:"Turn"`
+	Shadow             bool     `json:"Shadow"`
+	Switch             bool     `json:"Switch"`
+	FromChannelKeyID   int64    `json:"FromChannelKeyID,string"`
+	ToChannelKeyID     int64    `json:"ToChannelKeyID,string"`
+	TurnCostOld        float64  `json:"TurnCostOld"`
+	TurnCostNew        float64  `json:"TurnCostNew"`
+	RechargeCost       float64  `json:"RechargeCost"`
+	PaybackTurns       *float64 `json:"PaybackTurns"`
+	PaybackLimit       *float64 `json:"PaybackLimit"`
+	RemainingTurns     int      `json:"RemainingTurns"`
+	Reason             string   `json:"Reason"`
+	CrossCacheRead     float64  `json:"CrossCacheRead"`
+	CrossCacheReadOK   bool     `json:"CrossCacheReadKnown"`
+	CrossCacheReadFrom string   `json:"CrossCacheReadSource"`
+}
+
+// sessionCostEventsResponse /events 响应。
+type sessionCostEventsResponse struct {
+	List   []sessionCostEventView `json:"List"`
+	Total  int                    `json:"Total"`
+	Source string                 `json:"Source"`
+}
+
+// HandleSessionCostEvents GET /api/v1/admin/session-cost/events
+// 读 KindSessionCostEvent 落地的事件流（有界进程内存储）；?SessionID= 过滤、?Limit= 截取最近 N 条。
+func (h *Admin) HandleSessionCostEvents(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	sid := q.Get("SessionID")
+	limit := parsePositiveInt(q.Get("Limit"))
+
+	events := h.sessionCostEventSnapshot()
+	list := make([]sessionCostEventView, 0, len(events))
+	for i := range events {
+		if sid != "" && events[i].SessionID != sid {
+			continue
+		}
+		list = append(list, toSessionCostEventView(events[i]))
+	}
+	if limit > 0 && len(list) > limit {
+		list = list[len(list)-limit:] // 保留最近的 limit 条（事件流按写入顺序旧→新）
+	}
+	resp.OK(w, r, sessionCostEventsResponse{List: list, Total: len(list), Source: sourceSessionCostEvt})
+}
+
+// sessionCostHistogramBin 直方图分桶（UpperBound 为该桶上界，末桶含最大值）。
+type sessionCostHistogramBin struct {
+	UpperBound float64 `json:"UpperBound"`
+	Count      int     `json:"Count"`
+}
+
+// sessionCostDistributionItem 单会话的临界缓存读分位与直方。
+type sessionCostDistributionItem struct {
+	SessionID       string                    `json:"SessionID"`
+	Count           int                       `json:"Count"`
+	P10             float64                   `json:"P10"`
+	Median          float64                   `json:"Median"`
+	P90             float64                   `json:"P90"`
+	QuantilesSource string                    `json:"QuantilesSource"`
+	Histogram       []sessionCostHistogramBin `json:"Histogram"`
+}
+
+// sessionCostDistributionResponse /distribution 响应。
+type sessionCostDistributionResponse struct {
+	Sessions      []sessionCostDistributionItem `json:"Sessions"`
+	TotalSessions int                           `json:"TotalSessions"`
+	Source        string                        `json:"Source"`
+}
+
+// HandleSessionCostDistribution GET /api/v1/admin/session-cost/distribution
+// 按会话聚合临界缓存读（crossCacheRead，仅取 CrossCacheReadKnown=true 的事件）的分位（P10/中位/P90）与直方。
+func (h *Admin) HandleSessionCostDistribution(w http.ResponseWriter, r *http.Request) {
+	events := h.sessionCostEventSnapshot()
+	bySession := make(map[string][]float64, len(events))
+	for i := range events {
+		ev := events[i]
+		if !ev.CrossCacheReadKnown {
+			continue
+		}
+		v := ev.CrossCacheRead
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			continue
+		}
+		bySession[ev.SessionID] = append(bySession[ev.SessionID], v)
+	}
+	ids := make([]string, 0, len(bySession))
+	for id := range bySession {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids) // 输出确定性：按 session_id 升序
+
+	items := make([]sessionCostDistributionItem, 0, len(ids))
+	for _, id := range ids {
+		vals := bySession[id]
+		sort.Float64s(vals)
+		items = append(items, sessionCostDistributionItem{
+			SessionID:       id,
+			Count:           len(vals),
+			P10:             quantile(vals, 0.10),
+			Median:          quantile(vals, 0.50),
+			P90:             quantile(vals, 0.90),
+			QuantilesSource: sourceCrossCacheRead,
+			Histogram:       histogram(vals, 10),
+		})
+	}
+	resp.OK(w, r, sessionCostDistributionResponse{
+		Sessions: items, TotalSessions: len(items), Source: sourceCrossCacheRead,
+	})
+}
+
+// sessionCostEventSnapshot 读取事件存储快照（未注入时返回 nil）。
+func (h *Admin) sessionCostEventSnapshot() []router.SessionCostEvent {
+	if h.sessionCostEvt == nil {
+		return nil
+	}
+	return h.sessionCostEvt.Snapshot()
+}
+
+// toSessionCostEventView 把事件转为面板视图（PaybackTurns 为 NaN/Inf 时序列化为 null，避免响应序列化失败）。
+func toSessionCostEventView(ev router.SessionCostEvent) sessionCostEventView {
+	d := ev.Decision
+	return sessionCostEventView{
+		SessionID:          ev.SessionID,
+		Turn:               ev.Turn,
+		Shadow:             ev.Shadow,
+		Switch:             d.Switch,
+		FromChannelKeyID:   d.FromChannelKeyID,
+		ToChannelKeyID:     d.ToChannelKeyID,
+		TurnCostOld:        d.TurnCostOld,
+		TurnCostNew:        d.TurnCostNew,
+		RechargeCost:       d.RechargeCost,
+		PaybackTurns:       finitePtr(d.PaybackTurns),
+		PaybackLimit:       finitePtr(d.PaybackLimit),
+		RemainingTurns:     d.RemainingTurns,
+		Reason:             d.Reason,
+		CrossCacheRead:     ev.CrossCacheRead,
+		CrossCacheReadOK:   ev.CrossCacheReadKnown,
+		CrossCacheReadFrom: sourceCrossCacheRead,
+	}
+}
+
+// finitePtr 把有限浮点转为指针；NaN/±Inf 返回 nil（JSON null）。
+func finitePtr(v float64) *float64 {
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return nil
+	}
+	return &v
+}
+
+// parsePositiveInt 解析正整数参数；非法/≤0 返回 0（表示不限制）。
+func parsePositiveInt(v string) int {
+	if n, err := strconv.Atoi(v); err == nil && n > 0 {
+		return n
+	}
+	return 0
+}
+
+// quantile 对已升序排列的样本求分位（q∈[0,1]，线性插值）；空样本返回 0。
+func quantile(sorted []float64, q float64) float64 {
+	n := len(sorted)
+	if n == 0 {
+		return 0
+	}
+	if n == 1 {
+		return sorted[0]
+	}
+	if q < 0 {
+		q = 0
+	}
+	if q > 1 {
+		q = 1
+	}
+	pos := q * float64(n-1)
+	lo := int(math.Floor(pos))
+	hi := int(math.Ceil(pos))
+	if lo == hi {
+		return sorted[lo]
+	}
+	frac := pos - float64(lo)
+	return sorted[lo]*(1-frac) + sorted[hi]*frac
+}
+
+// histogram 对已升序样本做等宽分桶（bins 个桶，UpperBound 为桶上界）；样本全等时返回单桶。
+func histogram(sorted []float64, bins int) []sessionCostHistogramBin {
+	if len(sorted) == 0 {
+		return []sessionCostHistogramBin{}
+	}
+	if bins <= 0 {
+		bins = 1
+	}
+	lo, hi := sorted[0], sorted[len(sorted)-1]
+	if hi <= lo {
+		return []sessionCostHistogramBin{{UpperBound: hi, Count: len(sorted)}}
+	}
+	width := (hi - lo) / float64(bins)
+	counts := make([]int, bins)
+	for _, v := range sorted {
+		idx := int((v - lo) / width)
+		if idx >= bins {
+			idx = bins - 1
+		}
+		counts[idx]++
+	}
+	out := make([]sessionCostHistogramBin, 0, bins)
+	for i := 0; i < bins; i++ {
+		out = append(out, sessionCostHistogramBin{UpperBound: lo + width*float64(i+1), Count: counts[i]})
 	}
 	return out
 }

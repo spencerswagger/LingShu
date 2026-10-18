@@ -128,6 +128,11 @@ func (f *fakeCostConfig) TimeConfig() (billing.TimeCoeffConfig, error) {
 	return *f.globalTC, nil
 }
 
+// ContextTiers 满足扩展后的 CostConfig 接口（本用例不注入全局分档，返回 nil, nil）。
+func (f *fakeCostConfig) ContextTiers() ([]billing.TierRule, error) {
+	return nil, nil
+}
+
 // attachTo 在会话注册表上直接建立一条绑定 (keyID, internal) 的存活会话（用于构造存活会话数场景）。
 func attachTo(t *testing.T, r *SessionRegistry, id string, keyID int64, internal string) {
 	t.Helper()
@@ -826,7 +831,7 @@ func TestOrderCandidates_PriorityCostLoadThenID(t *testing.T) {
 		{id: 4, keyID: 44, modelRow: 401, priority: 50, costRates: rates(0.1)}, // 低优先级层（即便最便宜也最后）
 	}
 	sample, globalTC := e.costContext()
-	got := e.orderCandidates(cands, time.Now(), sample, globalTC)
+	got := e.orderCandidates(cands, time.Now(), sample, globalTC, nil)
 	want := []int64{2, 3, 1, 4}
 	for i := range want {
 		if got[i].id != want[i] {

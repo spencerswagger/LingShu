@@ -15,6 +15,7 @@ import {
   Tickets,
   Setting,
   Bell,
+  DataAnalysis,
 } from '@element-plus/icons-vue'
 
 const route = useRoute()
@@ -32,6 +33,7 @@ const menus = [
   { path: '/admin/tokens', title: '令牌', icon: Key },
   { path: '/admin/sessions', title: '会话', icon: ChatDotRound },
   { path: '/admin/billings', title: '账单', icon: Tickets },
+  { path: '/admin/session-cost-routing', title: '会话成本', icon: DataAnalysis },
   { path: '/admin/announcements', title: '公告', icon: Bell },
   { path: '/admin/system', title: '系统', icon: Setting },
 ]
