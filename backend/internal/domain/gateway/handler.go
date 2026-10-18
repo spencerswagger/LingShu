@@ -682,7 +682,9 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 			if status == 0 {
 				status = http.StatusOK // 兜底：已响应但未记录状态码（理论不可达）
 			}
-			if _, failed := summarizeAttempts(attempts); failed > 0 {
+			// 决策轨迹与失败候选数只算一次，传入 logOutcome 复用（避免重复遍历 attempts）。
+			trail, failed := summarizeAttempts(attempts)
+			if failed > 0 {
 				failedReq := outcomeIsFailure(out) || status >= http.StatusBadRequest
 				lvl := slog.LevelWarn
 				reason := "候选失败后请求成功（隐性失败）"
@@ -690,7 +692,7 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 					lvl = slog.LevelError
 					reason = "候选失败且请求最终失败（详见各候选失败日志）"
 				}
-				g.logOutcome(ctx, lvl, endpoint, model, reason, status, !failedReq, token, sessionID, attempts, msSince(start))
+				g.logOutcome(ctx, lvl, endpoint, model, reason, status, !failedReq, token, sessionID, attempts, trail, failed, msSince(start))
 			}
 			return
 		}
@@ -703,6 +705,9 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 			sawOther = true
 		}
 	}
+
+	// 决策轨迹与失败候选数只算一次，供下方各终态结论复用（避免 logOutcome 再遍历 attempts）。
+	trail, failed := summarizeAttempts(attempts)
 
 	// 所有候选都未成功。仅当失败全部属于限流类（本地限流/上游 429）时才回 429，
 	// 否则统一回「无可用渠道」——避免把 401/402/5xx 等误报成限流。
@@ -723,7 +728,7 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 		bid := g.recordGatewayReject(ctx, model, autoName, token, pricingMode, sessionID, msgUnsupportedProtocol)
 		g.writeCallLog(ctx, bid, "", token, &router.RouteResult{AutoModelName: autoName}, model, pricingMode, sessionID,
 			reqMsgs, "error", "", "failed", msgUnsupportedProtocol, msSince(start), nil, rejectDecision())
-		g.logOutcome(ctx, slog.LevelWarn, endpoint, model, msgUnsupportedProtocol, http.StatusBadRequest, false, token, sessionID, attempts, msSince(start))
+		g.logOutcome(ctx, slog.LevelWarn, endpoint, model, msgUnsupportedProtocol, http.StatusBadRequest, false, token, sessionID, attempts, trail, failed, msSince(start))
 		writeUnsupportedProtocol(w)
 		return
 	}
@@ -736,7 +741,7 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 			g.writeCallLog(ctx, bid, "", token, &router.RouteResult{AutoModelName: autoName}, model, pricingMode, sessionID,
 				reqMsgs, "error", "", "failed", msgRateLimited, msSince(start), nil, rejectDecision())
 		}
-		g.logOutcome(ctx, slog.LevelWarn, endpoint, model, "全部候选限流（本地限流/上游 429）", http.StatusTooManyRequests, false, token, sessionID, attempts, msSince(start))
+		g.logOutcome(ctx, slog.LevelWarn, endpoint, model, "全部候选限流（本地限流/上游 429）", http.StatusTooManyRequests, false, token, sessionID, attempts, trail, failed, msSince(start))
 		writeOpenAIError(w, http.StatusTooManyRequests, msgRateLimited)
 		return
 	}
@@ -746,7 +751,7 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 		g.writeCallLog(ctx, bid, "", token, &router.RouteResult{AutoModelName: autoName}, model, pricingMode, sessionID,
 			reqMsgs, "error", "", "failed", msgNoAvailable, msSince(start), nil, rejectDecision())
 	}
-	g.logOutcome(ctx, slog.LevelError, endpoint, model, "全部候选均失败（无可用渠道）", http.StatusServiceUnavailable, false, token, sessionID, attempts, msSince(start))
+	g.logOutcome(ctx, slog.LevelError, endpoint, model, "全部候选均失败（无可用渠道）", http.StatusServiceUnavailable, false, token, sessionID, attempts, trail, failed, msSince(start))
 	writeOpenAIError(w, http.StatusServiceUnavailable, msgNoAvailable)
 }
 

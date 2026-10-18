@@ -3,8 +3,10 @@ package console
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -327,5 +329,99 @@ func TestHandleServiceStatus_NoAvailableCandidateSkipped(t *testing.T) {
 	}
 	if fe.calls != 2 {
 		t.Fatalf("两个启用模型均应被计算一次，calls=%d, want 2", fe.calls)
+	}
+}
+
+// fakeRouteEngineCtxErr 对任意请求返回固定的非路由业务错误，用于验证 ctx 取消/超时的降级路径。
+type fakeRouteEngineCtxErr struct {
+	err   error
+	calls int
+}
+
+func (f *fakeRouteEngineCtxErr) RouteAll(ctx context.Context, spec router.RouteSpec) ([]*router.ChannelRoute, error) {
+	f.calls++
+	return nil, f.err
+}
+
+func (f *fakeRouteEngineCtxErr) CostSample() billing.Usage         { return billing.Usage{} }
+func (f *fakeRouteEngineCtxErr) ActiveKeySessions(keyID int64) int { return 0 }
+
+// levelCaptureHandler 捕获 slog 记录并按级别计数，供降级断言使用。
+type levelCaptureHandler struct {
+	mu     sync.Mutex
+	errors int
+	warns  int
+}
+
+func (h *levelCaptureHandler) Enabled(ctx context.Context, l slog.Level) bool { return true }
+
+func (h *levelCaptureHandler) Handle(ctx context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	switch {
+	case r.Level >= slog.LevelError:
+		h.errors++
+	case r.Level >= slog.LevelWarn:
+		h.warns++
+	}
+	return nil
+}
+
+func (h *levelCaptureHandler) WithAttrs(attrs []slog.Attr) slog.Handler { return h }
+func (h *levelCaptureHandler) WithGroup(name string) slog.Handler       { return h }
+
+func (h *levelCaptureHandler) errorCount() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.errors
+}
+
+func (h *levelCaptureHandler) warnCount() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.warns
+}
+
+// TestHandleServiceStatus_ContextCanceledDowngraded 验证：请求 ctx 被取消/超时导致上游探测返回
+// 非路由业务错误时，按客户端中断处理——降级为 Warn 而非 Error（全量循环下客户端中断不刷 ERROR 噪音），
+// 且不影响响应（仍 200，仅跳过该模型候选）。
+func TestHandleServiceStatus_ContextCanceledDowngraded(t *testing.T) {
+	prev := slog.Default()
+	defer slog.SetDefault(prev)
+	capture := &levelCaptureHandler{}
+	slog.SetDefault(slog.New(capture))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	h := NewAdmin(nil, nil, channel.NewManager(nil, nil, nil, nil, nil, nil), func(context.Context) (int64, bool) { return 1, true })
+	fe := &fakeRouteEngineCtxErr{err: ctx.Err()}
+	h.SetRouterEngine(fe)
+	h.SetModelSource(fakeModelListSource{items: []model.ExternalModel{{ID: 7, ExternalName: "gpt-x", Enabled: true}}})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/service-status", nil).WithContext(ctx)
+	req = resp.WithRequestID(req, "req-ctx-canceled")
+	h.HandleServiceStatus(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200（ctx 取消仅影响日志级别，不影响响应）; body=%s", rec.Code, rec.Body.String())
+	}
+	var body serviceStatusBody
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	var data serviceStatusData
+	if err := json.Unmarshal(body.Data, &data); err != nil {
+		t.Fatalf("unmarshal Data: %v", err)
+	}
+	if _, ok := data.Candidates["7"]; ok {
+		t.Fatalf("ctx 取消应跳过该模型候选，got=%+v", data.Candidates["7"])
+	}
+	if capture.errorCount() != 0 {
+		t.Fatalf("ctx 取消不应产生 ERROR 日志，got=%d", capture.errorCount())
+	}
+	if capture.warnCount() == 0 {
+		t.Fatalf("ctx 取消应降级为 WARN 日志，got=0")
 	}
 }

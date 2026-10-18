@@ -886,7 +886,7 @@ type sessionListItem struct {
 	Calls        int64   `json:"Calls"`        // 总调用次数
 	Tokens       int64   `json:"Tokens"`       // 总消耗 Token（三段求和口径：输入+缓存读+输出）
 	Credits      float64 `json:"Credits"`      // 总消耗积分
-	ContextLen   int64   `json:"ContextLen"`   // 上下文长度（最近一次请求的输入 Token 数）
+	ContextLen   int64   `json:"ContextLen"`   // 总输入 Token（输入+缓存读）
 	RPM          float64 `json:"RPM"`          // 近 5 分钟每分钟请求数
 	TPM          float64 `json:"TPM"`          // 近 5 分钟每分钟 Token 数
 	UserMsgs     int64   `json:"UserMsgs"`     // 用户消息次数
