@@ -264,6 +264,7 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 			asyncwrite.KindChannelKeyEvent:   true,
 			asyncwrite.KindChannelModelEvent: true,
 			asyncwrite.KindCallLog:           true,
+			asyncwrite.KindSessionCostEvent:  true,
 		},
 	})
 	// 配置了 WALPath 却打不开（目录不可写/磁盘满）时致命化启动：绝不静默降级为内存模式，
@@ -446,6 +447,10 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	// 会话过期分档配置 provider：读取 sys_configs 的 session.expiration，供 gateway 按
 	// 「上下文长度 + 用户对话次数」双维度计算会话 TTL。
 	sessExpiryProvider := router.NewSessionExpiryProvider(billStore)
+	// 会话成本路由配置 provider（sys_configs 键 routing.session_cost）：提供起点择优 / 中途切换的
+	// 开关与门控参数（Enabled/MidSwitch/RemainingA/B/MinRemaining/CooldownSec/MinImprove）。
+	// 默认 Enabled=false、MidSwitch=false 安全态——读取失败/缺失/解析失败同样回落安全态，渠道不变。
+	sessionCostProvider := router.NewSessionCostProvider(billStore)
 	// 上游响应头白名单读缓存（单键 sys_configs，键 = gateway.UpstreamResponseHeaderWhitelistKey）：
 	// 网关每请求读取，console 低频写入；启用时命中零 DB，关闭时退回直查。
 	var whitelistCache *configValueCache
@@ -458,6 +463,7 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	billStore.SetConfigWriteHook(func() {
 		billCfgProvider.InvalidateCostConfig()
 		sessExpiryProvider.Invalidate()
+		sessionCostProvider.Invalidate()
 		if whitelistCache != nil {
 			whitelistCache.Invalidate()
 		}
@@ -525,6 +531,16 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	// 新会话创建的成本比较依赖：样值用量（routing.cost_sample）+ 全局时段（billing.time_config）。
 	// billing.ConfigProvider 结构上满足 router.CostConfig，直接注入（router 不直接读库）。
 	routerEngine.SetCostConfig(billCfgProvider)
+	// 会话成本路由配置注入：起点择优（P1）/ 中途切换（P2）的开关与门控参数来源。
+	// 未装配时引擎读缺省安全态（Enabled=false）——开关永远读不到、无法生效；此处补齐装配后
+	// 运维把 routing.session_cost.enabled 置 true 才可能真正放行起点择优 / 中途切换。
+	routerEngine.SetSessionCostProvider(sessionCostProvider)
+	// 会话成本决策产物经 asyncwrite 落库（Key=session_id 保序、IdempotencyKey=session_id:轮次 幂等），
+	// WAL 复用 data/asyncwrite.wal（与其余类别同源，由上 asyncWriter 统一承接）。
+	// 同时把每条事件的执行体（persist 回调）接到有界进程内存储 sessionCostEventStore，
+	// 供控制台「会话成本路由」面板 /events、/distribution 读取（单实例假设，不引入 Redis/同步往返）。
+	sessionCostEventStore := router.NewSessionCostEventStore(0)
+	routerEngine.SetCostEventSink(router.NewAsyncCostEventSink(asyncWriter, sessionCostEventStore))
 
 	// 密钥删除联动会话清理：路由注册表经 KillByFilter(channel_key_id=keyID) 踢下线该密钥全部存活会话
 	//（内存+DB 投影）。装配在 routerEngine 之后（SessionRegistry 已就绪）。
@@ -546,6 +562,8 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	consoleAdmin.SetCallLogStore(callLogStore)
 	consoleAdmin.SetRouterEngine(routerEngine)
 	consoleAdmin.SetModelSource(modelSvc)
+	// 会话成本路由面板数据源：决策事件流走进程内落地存储（与 sink persist 回调同源）。
+	consoleAdmin.SetSessionCostEventStore(sessionCostEventStore)
 	consoleDev.SetCallLogStore(callLogStore)
 
 	// sync

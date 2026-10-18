@@ -19,6 +19,9 @@ const (
 	KindCallLog
 	// KindTokenLastUsed 令牌最后使用时间写入（通常可容忍少量丢失，适合内存模式）。
 	KindTokenLastUsed
+	// KindSessionCostEvent 会话成本决策产物事件写入（决策轨迹/审计留痕）。
+	// 注意：默认 AsyncKinds 不含本类别 → 未显式登记时同步执行（安全态），既有默认行为不变。
+	KindSessionCostEvent
 )
 
 // String 便于日志排查，未知类别回落到数值。
@@ -34,6 +37,8 @@ func (k Kind) String() string {
 		return "call_log"
 	case KindTokenLastUsed:
 		return "token_last_used"
+	case KindSessionCostEvent:
+		return "session_cost_event"
 	default:
 		return "kind(" + strconv.Itoa(int(k)) + ")"
 	}
