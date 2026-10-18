@@ -732,10 +732,10 @@ func TestManager_Snapshot_NoCredentialWordingAtChannelLevel(t *testing.T) {
 }
 
 // TestDefaultConfigs 锁定渠道/模型默认配置（rc1 问题 1 修正后）：
-// 健康探测每天一次、P99 阈值 120 秒、TPM 10 百万。
+// 健康探测每天一次、P99 阈值 120 秒、TPM 10 百万、RPM 120、并发 100、超限拒绝。
 func TestDefaultConfigs(t *testing.T) {
-	if got := DefaultHealthProbe().Interval; got != "0 0 * * * *" {
-		t.Fatalf("DefaultHealthProbe.Interval want 每天一次(0 0 * * * *), got %q", got)
+	if got := DefaultHealthProbe().Interval; got != "0 0 0 * * *" {
+		t.Fatalf("DefaultHealthProbe.Interval want 每天一次(0 0 0 * * *), got %q", got)
 	}
 	if got := DefaultReliability().P99LatencyMS; got != 120000 {
 		t.Fatalf("DefaultReliability.P99LatencyMS want 120000(120s), got %d", got)
@@ -745,5 +745,14 @@ func TestDefaultConfigs(t *testing.T) {
 	}
 	if got := DefaultRateLimit().TPM; got != 10000000 {
 		t.Fatalf("DefaultRateLimit.TPM want 10000000(10M), got %d", got)
+	}
+	if got := DefaultRateLimit().RPM; got != 120 {
+		t.Fatalf("DefaultRateLimit.RPM want 120, got %d", got)
+	}
+	if got := DefaultRateLimit().MaxConcurrent; got != 100 {
+		t.Fatalf("DefaultRateLimit.MaxConcurrent want 100, got %d", got)
+	}
+	if got := DefaultRateLimit().OnExceed; got != OnExceedReject {
+		t.Fatalf("DefaultRateLimit.OnExceed want %s, got %q", OnExceedReject, got)
 	}
 }
