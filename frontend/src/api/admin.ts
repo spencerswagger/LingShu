@@ -292,6 +292,27 @@ export interface ChannelProtocolRequestHeaders {
   blacklist: string[]
   set: Record<string, string>
 }
+// 协议级错误策略（字段名 = 后端 channelprotocol.ErrorPolicy 的 JSON tag，camelCase）
+export interface ErrorMatch {
+  status?: number
+  errorType?: string
+  errorCode?: string
+  messageRegex?: string
+}
+export interface ErrorDisposition {
+  countIntoHealth: boolean
+  // 未设置 = 沿用改造前行为；显式 false = 不转移
+  failover?: boolean | null
+  action?: string // none | drain | disable
+  downstreamStatus?: number // 0 = 沿用默认 502
+}
+export interface ErrorPolicy {
+  scope: string // channel | models
+  modelIds?: number[] // scope=models 时生效的 channel_models 行 ID
+  match: ErrorMatch
+  disposition: ErrorDisposition
+  note?: string
+}
 export interface ChannelProtocolView {
   ID: string
   Name: string
@@ -299,6 +320,8 @@ export interface ChannelProtocolView {
   Protocols: Record<string, ProtocolOption>
   RequestHeaders: ChannelProtocolRequestHeaders
   Models: Record<string, ChannelProtocolModelOverride>
+  // 协议级错误策略（空 = 未配置，保持默认安全态）
+  errorPolicy?: ErrorPolicy[]
   PresetSourceID: string
   Edited: boolean
   SourceStatus: string // ACTIVE | STALE（来源已失效）
@@ -310,6 +333,7 @@ export interface ChannelProtocolInput {
   Protocols: Record<string, ProtocolOption>
   RequestHeaders: ChannelProtocolRequestHeaders
   Models: Record<string, ChannelProtocolModelOverride>
+  errorPolicy?: ErrorPolicy[]
 }
 // 同步预览：Pending 为需二次确认才覆盖的条目（含差异文本），Applied 为本次直接覆盖数
 export interface ChannelProtocolSyncPending {
