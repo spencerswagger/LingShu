@@ -1103,3 +1103,126 @@ export function batchDeleteAnnouncements(ids: string[]) {
 export function runSync() {
   return http.post<{ Summary: string }, ApiRes<{ Summary: string }>>('/admin/sync/run')
 }
+
+// ===== 会话成本路由面板（只读三端点；字段名 = 后端 Go 结构体字段名）=====
+// 所有值均带来源标签（Source/*Source），前端据此标注「模型成本 / 真实 token / 当前时刻 / 实际分档」。
+// 单渠道三档成本价（来源=模型成本）
+export interface SessionCostTierView {
+  Input: number
+  CacheRead: number
+  Output: number
+  Source: string
+}
+// 单个候选渠道：三档成本价 + 时段/分档倍率（各自带来源标签）
+export interface SessionCostCandidateView {
+  ChannelID: string
+  InternalModelID: string
+  Cost: SessionCostTierView
+  TimeCoeff: number
+  TimeCoeffSource: string
+  CtxCoeff: number
+  CtxCoeffSource: string
+}
+// 剩余轮数 k 系数与中途切换门控阈值（来源=routing.session_cost）
+export interface SessionCostGates {
+  RemainingA: number
+  RemainingB: number
+  RemainingMin: number
+  RemainingMax: number
+  MinRemaining: number
+  CooldownSec: number
+  MinImprove: number
+  Source: string
+}
+// 会话成本路由配置视图（routing.session_cost，snake_case，与后端 router.SessionCostConfig 对齐）
+export interface SessionCostRoutingConfig {
+  enabled: boolean
+  remaining_a: number
+  remaining_b: number
+  remaining_min: number
+  remaining_max: number
+  min_remaining: number
+  cooldown_sec: number
+  mid_switch: boolean
+  min_improve: number
+}
+export interface SessionCostConfigData {
+  Now: string
+  NowTimeCoeff: number
+  NowTimeCoeffSource: string
+  TimeConfig?: unknown // billing.time_config 原始 JSON（可能为空）
+  TimeConfigSource: string
+  ContextTiers?: unknown // billing.context_tiers 原始 JSON（可能为空）
+  ContextTiersSource: string
+  CostSample: BillingUsage // routing.cost_sample 默认样值（三段口径）
+  CostSampleSource: string
+  SessionCost: SessionCostRoutingConfig
+  SessionCostSource: string
+  Gates: SessionCostGates
+  Candidates: SessionCostCandidateView[]
+  CandidatesSource: string
+}
+// 配置面板：?Model=<对外模型名> 时附带该模型的候选渠道成本视图
+export function getSessionCostConfig(Model = '') {
+  return http.get<SessionCostConfigData, ApiRes<SessionCostConfigData>>(
+    '/admin/session-cost/config',
+    { params: { Model: Model || undefined } },
+  )
+}
+
+// 单条会话成本决策事件视图（PaybackTurns 为 NaN/Inf 时后端序列化为 null）
+export interface SessionCostEventView {
+  SessionID: string
+  Turn: number
+  Switch: boolean
+  FromChannelKeyID: string
+  ToChannelKeyID: string
+  TurnCostOld: number
+  TurnCostNew: number
+  RechargeCost: number
+  PaybackTurns: number | null
+  RemainingTurns: number
+  Reason: string
+  CrossCacheRead: number
+  CrossCacheReadKnown: boolean
+  CrossCacheReadSource: string
+}
+export interface SessionCostEventsData {
+  List: SessionCostEventView[]
+  Total: number
+  Source: string
+}
+// 事件流：?SessionID= 过滤、?Limit= 截取最近 N 条
+export function getSessionCostEvents(params: { SessionID?: string; Limit?: number } = {}) {
+  return http.get<SessionCostEventsData, ApiRes<SessionCostEventsData>>(
+    '/admin/session-cost/events',
+    { params },
+  )
+}
+
+// 直方图分桶（UpperBound 为该桶上界，末桶含最大值）
+export interface SessionCostHistogramBin {
+  UpperBound: number
+  Count: number
+}
+// 单会话临界缓存读（crossCacheRead）分位与直方
+export interface SessionCostDistributionItem {
+  SessionID: string
+  Count: number
+  P10: number
+  Median: number
+  P90: number
+  QuantilesSource: string
+  Histogram: SessionCostHistogramBin[]
+}
+export interface SessionCostDistributionData {
+  Sessions: SessionCostDistributionItem[]
+  TotalSessions: number
+  Source: string
+}
+// 临界缓存读分布（按会话聚合，仅取 CrossCacheReadKnown=true 的事件）
+export function getSessionCostDistribution() {
+  return http.get<SessionCostDistributionData, ApiRes<SessionCostDistributionData>>(
+    '/admin/session-cost/distribution',
+  )
+}
