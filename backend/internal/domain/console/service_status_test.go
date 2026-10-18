@@ -432,6 +432,9 @@ func TestHandleServiceStatus_ContextCanceledDowngraded(t *testing.T) {
 //   - DeadlineExceeded：命中 errors.Is 的右侧分支；
 //   - 经 fmt.Errorf %w 包裹的 ctx 错误：验证能穿透包裹识别（真实路径 engine.RouteAll 以 %w 包裹）；
 //   - 反向护栏：非 ctx 的真实故障仍记 ERROR，防止降级条件被放宽而误伤真实故障。
+//
+// 注意：本用例与 TestHandleServiceStatus_ContextCanceledDowngraded 均替换全局 slog.Default，
+// 故不可加 t.Parallel()（会成为跨用例竞态）；结束时已 defer 还原。
 func TestHandleServiceStatus_CtxErrorDowngradeVariants(t *testing.T) {
 	cases := []struct {
 		name            string

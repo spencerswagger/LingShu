@@ -1,6 +1,7 @@
 # 单元 / 集成测试。补齐此前缺失的测试 CI：
-#   - 后端：起一次性 postgres 服务，设置 LLMGATEWAY_TEST_PG_DSN（迁移集成测试）与
-#     TEST_DATABASE_URL（e2e）后跑 go vet / go test（含 -race）。
+#   - 后端：起一次性 postgres 服务，设置 LLMGATEWAY_TEST_PG_DSN（迁移集成测试，自建临时库）
+#     与 TEST_DATABASE_URL（e2e，用专用库 llmgw_test，避免与迁移测试共用库的脆弱耦合）
+#     后跑 go vet / go test（含 -race）。
 #   - 前端：npm ci 后跑 vue-tsc 类型检查。
 name: Test
 
@@ -33,12 +34,20 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     env:
-      # 迁移集成测试（internal/db）读它；e2e（tests/）读 TEST_DATABASE_URL。
+      # 迁移集成测试（internal/db）读它：以 postgres 库为管理连接，自建 llmgateway-test-* 临时库。
       LLMGATEWAY_TEST_PG_DSN: postgres://llmgw:llmgw@localhost:5432/postgres?sslmode=disable
-      TEST_DATABASE_URL: postgres://llmgw:llmgw@localhost:5432/postgres?sslmode=disable
+      # e2e（tests/）读它：用专用库，e2e 会 DROP SCHEMA public CASCADE，与迁移测试彻底解耦。
+      TEST_DATABASE_URL: postgres://llmgw:llmgw@localhost:5432/llmgw_test?sslmode=disable
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Create dedicated e2e database
+        run: |
+          set -euo pipefail
+          docker run --rm --network host postgres:16 \
+            psql "postgresql://llmgw:llmgw@localhost:5432/postgres?sslmode=disable" \
+            -v ON_ERROR_STOP=1 -c 'CREATE DATABASE llmgw_test;'
 
       - name: Set up Go
         uses: actions/setup-go@v5

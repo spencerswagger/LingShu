@@ -343,6 +343,9 @@ func TestStore_StaleCacheFillAfterInvalidateRejected(t *testing.T) {
 // 借 sqlmock 自定义 QueryMatcher 在读路径回源 DB 期间（query 匹配时）触发一次写路径失效（bump 代际），
 // 断言陈旧快照未被种回缓存、且二次读取必须重新回源——从而锁定「GetByID 必须把回源前捕获的代际
 // 正确传递到回填」这一契约（若改回 Put 或恒传当前代际，本用例会失败）。
+//
+// 时序前提：sqlmock 在 ordered 模式下于 driver 的 QueryContext 内同步调用 matcher，
+// 故「首条被匹配的查询」即 GetByID 的读路径 SELECT，其副作用恰好落在捕获代际之后、回填之前。
 func TestStore_GetByID_ConcurrentInvalidateRejectsStaleFill(t *testing.T) {
 	var store *Store
 	var invalidated bool
