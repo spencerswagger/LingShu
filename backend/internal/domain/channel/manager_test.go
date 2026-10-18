@@ -351,6 +351,64 @@ func TestManager_RebuildModels_PreservesMemoryState(t *testing.T) {
 	}
 }
 
+// TestFeedResultGated_CountIntoHealth 验证回喂门控：
+// countIntoHealth=false 时不写窗口样本、不计 429/鉴权计数（完全不影响熔断）；
+// countIntoHealth=true（等价 FeedResult）时正常驱动状态机。
+func TestFeedResultGated_CountIntoHealth(t *testing.T) {
+	now := time.Date(2026, 9, 27, 10, 0, 0, 0, time.UTC)
+	nowFn := func() time.Time { return now }
+	mgr := NewManager(nil, nil, testSM4Key, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), nowFn)
+	mgr.Upsert(&Channel{
+		ID: 1, Name: "c1", Protocol: ProtocolOpenAICompat,
+		Reliability: ReliabilityConfig{WindowSeconds: 60, MinSamples: 1, ErrorRatePct: 10, Rate429Pct: 20, AuthFailThreshold: 3},
+	})
+	mgr.UpsertModel(&ChannelModel{ID: 1, ChannelID: 1, InternalModelID: "m1", State: StateNormal})
+	enc, err := crypto.SM4Encrypt(testSM4Key, []byte("sk-gated-123456"))
+	if err != nil {
+		t.Fatalf("encrypt: %v", err)
+	}
+	mgr.UpsertKey(ChannelKey{ID: 11, ChannelID: 1, Name: "k", CredentialEnc: enc, State: StateNormal})
+
+	// countIntoHealth=false：失败与鉴权失败均不得影响熔断。
+	mgr.FeedResultGated(11, 1, Feedback{IsSuccess: false, Now: now}, false)
+	mgr.FeedResultGated(11, 1, Feedback{Is429: true, Now: now}, false)
+	mgr.FeedResultGated(11, 1, Feedback{IsAuthFailure: true, Now: now}, false)
+
+	kr, ok := mgr.GetKeyRuntime(11)
+	if !ok {
+		t.Fatalf("key 11 runtime missing")
+	}
+	mr, ok := mgr.GetModelRuntime(1, 1)
+	if !ok {
+		t.Fatalf("model runtime missing")
+	}
+	if kr.Machine.State() != StateNormal {
+		t.Fatalf("gated=false 时密钥状态应保持 NORMAL, got %s", kr.Machine.State())
+	}
+	if mr.Machine.State() != StateNormal {
+		t.Fatalf("gated=false 时模型状态应保持 NORMAL, got %s", mr.Machine.State())
+	}
+	mgr.mu.RLock()
+	km := kr.Machine.Metrics()
+	mgr.mu.RUnlock()
+	if km.Total != 0 || km.Rate429 != 0 || km.AuthFails != 0 {
+		t.Fatalf("gated=false 时不应写入窗口/429/鉴权计数, got %+v", km)
+	}
+
+	// countIntoHealth=true：单次失败即触发（MinSamples=1 + 错误率 100%）。
+	// 仅回喂密钥层（modelRowID=0），避免未装配 cmStore 时模型层持久化触发 nil 解引用。
+	mgr.FeedResultGated(11, 0, Feedback{IsSuccess: false, Now: now}, true)
+	if kr.Machine.State() != StateDrain {
+		t.Fatalf("gated=true 时失败应驱动排空, got %s", kr.Machine.State())
+	}
+	mgr.mu.RLock()
+	km2 := kr.Machine.Metrics()
+	mgr.mu.RUnlock()
+	if km2.Total != 1 || km2.Failures != 1 {
+		t.Fatalf("gated=true 时应写入窗口样本, got %+v", km2)
+	}
+}
+
 func TestManager_ManualSetKeyState_TargetsOnly(t *testing.T) {
 	mgr, mock := newManagerWithTwoKeys(t)
 

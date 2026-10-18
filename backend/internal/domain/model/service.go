@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/team/llmgateway/internal/domain/billing"
@@ -69,6 +70,8 @@ type ExternalModelInput struct {
 	SaleRates    billing.Rates
 	TimeConfig   *billing.TimeCoeffConfig
 	ContextTiers []billing.TierRule
+	// Aliases 为仅用于模型名解析的别名（不出现在 /v1/models）；空为无别名。
+	Aliases []string
 }
 
 // Service 承载对外模型 CRUD 与价格应用业务逻辑。
@@ -122,6 +125,71 @@ func (s *Service) checkAutoName(ctx context.Context, name string) error {
 	return nil
 }
 
+// normalizeAliases 去空白、去重并保持顺序；出现空白项返回 400（非空校验）。
+func normalizeAliases(in []string) ([]string, error) {
+	out := make([]string, 0, len(in))
+	seen := make(map[string]bool, len(in))
+	for _, raw := range in {
+		a := strings.TrimSpace(raw)
+		if a == "" {
+			return nil, errBadRequest("别名不能为空")
+		}
+		if seen[a] {
+			continue
+		}
+		seen[a] = true
+		out = append(out, a)
+	}
+	return out, nil
+}
+
+// validateAliases 归一化别名并校验命名空间（扁平）：不得与本模型 external_name 相同、
+// 不得与任何其他 external_name 重复、不得与任何其他模型的别名重复、不得与任何 Auto 名重复。
+// selfID 为当前模型主键（创建传 0，更新传自身 ID），用于排除对自身 external_name/别名的误判。
+// 冲突返回明确错误。
+func (s *Service) validateAliases(ctx context.Context, raw []string, selfName string, selfID int64) ([]string, error) {
+	aliases, err := normalizeAliases(raw)
+	if err != nil {
+		return nil, err
+	}
+	for _, a := range aliases {
+		if a == selfName {
+			return nil, errBadRequest("别名不能与模型对外名称相同")
+		}
+		other, err := s.store.GetByName(ctx, a)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("check alias name: %w", err)
+		}
+		if err == nil && other.ID != selfID {
+			return nil, errConflict("别名已被其他对外模型占用")
+		}
+		// 别名↔别名互斥：不得与他人模型的别名重复（此前仅校验 external_name，存在漏网）。
+		taken, err := s.store.AliasExistsForOther(ctx, a, selfID)
+		if err != nil {
+			return nil, fmt.Errorf("check alias uniqueness: %w", err)
+		}
+		if taken {
+			return nil, errConflict("别名已被其他对外模型占用")
+		}
+		if s.autoNameExists != nil {
+			exists, err := s.autoNameExists(ctx, a)
+			if err != nil {
+				return nil, fmt.Errorf("check auto name for alias: %w", err)
+			}
+			if exists {
+				return nil, errConflict("别名已被 Auto 模型占用")
+			}
+		}
+	}
+	return aliases, nil
+}
+
+// NameTaken 判断某名称是否已被任一对外模型的 external_name 或别名占用（忽略 enabled）。
+// 供 automodel 侧跨表命名空间校验（Auto 名不得撞任何对外模型名或别名）。
+func (s *Service) NameTaken(ctx context.Context, name string) (bool, error) {
+	return s.store.NameOrAliasExists(ctx, name)
+}
+
 // GetByExternalName 返回指定对外名称的启用模型。无启用模型返回 ErrNotFound。
 func (s *Service) GetByExternalName(ctx context.Context, externalName string) (*ExternalModel, error) {
 	m, err := s.store.GetByExternalName(ctx, externalName)
@@ -173,9 +241,27 @@ func normalizeEnabled(in *bool, def bool) bool {
 	return def
 }
 
-// CreateModel 创建对外模型：校验 + 名称唯一 + 跨表重名（Auto）+ 入库。
+// checkExternalNameAliasCollision 校验对外名不得撞「其他」模型（id != selfID）的别名：
+// 扁平命名空间下 external_name 与 aliases 双向互斥。selfID=0 表示新建。
+func (s *Service) checkExternalNameAliasCollision(ctx context.Context, name string, selfID int64) error {
+	taken, err := s.store.AliasExistsForOther(ctx, name, selfID)
+	if err != nil {
+		return fmt.Errorf("check external name alias collision: %w", err)
+	}
+	if taken {
+		return errConflict("模型外部名已被其他对外模型的别名占用")
+	}
+	return nil
+}
+
+// CreateModel 创建对外模型：校验 + 别名命名空间 + 名称唯一 + 跨表重名（Auto）+ 入库。
 func (s *Service) CreateModel(ctx context.Context, in ExternalModelInput) (*ExternalModel, error) {
 	if err := s.validateInput(in); err != nil {
+		return nil, err
+	}
+	// 别名命名空间校验（去重/非空/不撞本模型名/不撞其他对外名/不撞 Auto 名）。
+	aliases, err := s.validateAliases(ctx, in.Aliases, in.ExternalName, 0)
+	if err != nil {
 		return nil, err
 	}
 	// 名称唯一预检查（友好报错）；store 层 23505 兜底并发冲突。
@@ -188,6 +274,10 @@ func (s *Service) CreateModel(ctx context.Context, in ExternalModelInput) (*Exte
 	if err := s.checkAutoName(ctx, in.ExternalName); err != nil {
 		return nil, err
 	}
+	// 反向命名空间：对外名不得撞其他模型的别名（此前仅校验别名→external_name 单向，存在漏网）。
+	if err := s.checkExternalNameAliasCollision(ctx, in.ExternalName, 0); err != nil {
+		return nil, err
+	}
 
 	created, err := s.store.Insert(ctx, &ExternalModel{
 		ExternalName: in.ExternalName,
@@ -196,6 +286,7 @@ func (s *Service) CreateModel(ctx context.Context, in ExternalModelInput) (*Exte
 		SaleRates:    in.SaleRates,
 		TimeConfig:   in.TimeConfig,
 		ContextTiers: in.ContextTiers,
+		Aliases:      aliases,
 	})
 	if err != nil {
 		if errors.Is(err, ErrNameExists) {
@@ -205,6 +296,10 @@ func (s *Service) CreateModel(ctx context.Context, in ExternalModelInput) (*Exte
 	}
 	// 缓存失效：新增对外名后，GetByExternalName 的名称缓存必须立即刷新（写路径显式失效，无 TTL）。
 	s.store.invalidateExternalName(created.ExternalName)
+	// 别名与其规范名为不同缓存键：逐个失效，避免旧别名负缓存滞留。
+	for _, a := range created.Aliases {
+		s.store.invalidateExternalName(a)
+	}
 	// 跨包失效：通知 automodel 失效其 ResolveMembers 缓存（结果含 external_name）。
 	s.notifyNameWrite()
 	return created, nil
@@ -222,6 +317,11 @@ func (s *Service) UpdateModel(ctx context.Context, id int64, in ExternalModelInp
 		}
 		return nil, fmt.Errorf("get external model: %w", err)
 	}
+	// 别名命名空间校验（更新时排除自身 external_name）。
+	aliases, err := s.validateAliases(ctx, in.Aliases, in.ExternalName, id)
+	if err != nil {
+		return nil, err
+	}
 	if in.ExternalName != existing.ExternalName {
 		if other, err := s.store.GetByName(ctx, in.ExternalName); err == nil && other.ID != id {
 			return nil, errConflict("模型外部名已存在")
@@ -230,6 +330,10 @@ func (s *Service) UpdateModel(ctx context.Context, id int64, in ExternalModelInp
 		}
 		// 跨表重名：改名后不得与任意 Auto 名冲突。
 		if err := s.checkAutoName(ctx, in.ExternalName); err != nil {
+			return nil, err
+		}
+		// 反向命名空间：改名后不得撞其他模型的别名。
+		if err := s.checkExternalNameAliasCollision(ctx, in.ExternalName, id); err != nil {
 			return nil, err
 		}
 	}
@@ -242,6 +346,7 @@ func (s *Service) UpdateModel(ctx context.Context, id int64, in ExternalModelInp
 		SaleRates:    in.SaleRates,
 		TimeConfig:   in.TimeConfig,
 		ContextTiers: in.ContextTiers,
+		Aliases:      aliases,
 	}
 	if err := s.store.Update(ctx, m); err != nil {
 		if errors.Is(err, ErrNameExists) {
@@ -255,6 +360,13 @@ func (s *Service) UpdateModel(ctx context.Context, id int64, in ExternalModelInp
 	// 缓存失效：外部名/启用态可能变化，旧名与新名两条键都需立即失效（写路径显式失效，无 TTL）。
 	s.store.invalidateExternalName(existing.ExternalName)
 	s.store.invalidateExternalName(in.ExternalName)
+	// 别名键（旧集合 + 新集合）一并失效，避免改名/改别名后旧别名滞留正/负缓存。
+	for _, a := range existing.Aliases {
+		s.store.invalidateExternalName(a)
+	}
+	for _, a := range aliases {
+		s.store.invalidateExternalName(a)
+	}
 	// 跨包失效：external_name/enabled 变更影响 automodel.ResolveMembers 结果，通知其失效缓存。
 	s.notifyNameWrite()
 	return s.store.GetByID(ctx, id)

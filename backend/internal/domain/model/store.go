@@ -31,19 +31,21 @@ type ExternalModel struct {
 	SaleRates    billing.Rates
 	TimeConfig   *billing.TimeCoeffConfig
 	ContextTiers []billing.TierRule
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
+	// Aliases 为仅用于模型名解析的别名列表（不出现在 GET /v1/models）；空为无别名。
+	Aliases   []string
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // cols 列出 external_models 表查询使用的全部列。
-const cols = `id, external_name, description, enabled, sale_rates, time_config, context_tiers, created_at, updated_at`
+const cols = `id, external_name, description, enabled, sale_rates, time_config, context_tiers, aliases, created_at, updated_at`
 
-// scanExternal 将一行扫描到 *ExternalModel，解析 sale_rates/time_config/context_tiers JSONB。
+// scanExternal 将一行扫描到 *ExternalModel，解析 sale_rates/time_config/context_tiers/aliases JSONB。
 func scanExternal(row interface{ Scan(...any) error }) (*ExternalModel, error) {
 	var m ExternalModel
-	var saleRaw, timeRaw, tiersRaw []byte
+	var saleRaw, timeRaw, tiersRaw, aliasesRaw []byte
 	err := row.Scan(&m.ID, &m.ExternalName, &m.Description, &m.Enabled, &saleRaw,
-		&timeRaw, &tiersRaw, &m.CreatedAt, &m.UpdatedAt)
+		&timeRaw, &tiersRaw, &aliasesRaw, &m.CreatedAt, &m.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -62,6 +64,13 @@ func scanExternal(row interface{ Scan(...any) error }) (*ExternalModel, error) {
 	if len(tiersRaw) > 0 && string(tiersRaw) != "null" {
 		if err := json.Unmarshal(tiersRaw, &m.ContextTiers); err != nil {
 			return nil, fmt.Errorf("parse context_tiers: %w", err)
+		}
+	}
+	// aliases 恒为 JSONB NOT NULL；扫描结果统一为非 nil 切片（无别名为空切片）。
+	m.Aliases = []string{}
+	if len(aliasesRaw) > 0 && string(aliasesRaw) != "null" {
+		if err := json.Unmarshal(aliasesRaw, &m.Aliases); err != nil {
+			return nil, fmt.Errorf("parse aliases: %w", err)
 		}
 	}
 	return &m, nil
@@ -198,6 +207,41 @@ func (s *Store) GetByName(ctx context.Context, name string) (*ExternalModel, err
 	return scanExternal(row)
 }
 
+// NameOrAliasExists 判断某名称是否已被任一对外模型的 external_name 或 aliases 占用（忽略 enabled）。
+// 供跨表重名校验使用：Auto 名不得与任何对外模型名或别名重名（扁平命名空间，双向校验）。
+func (s *Store) NameOrAliasExists(ctx context.Context, name string) (bool, error) {
+	var one int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT 1 FROM external_models
+		 WHERE deleted_at IS NULL AND (external_name = $1 OR aliases @> to_jsonb(ARRAY[$1::text]))
+		 LIMIT 1`, name).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// AliasExistsForOther 判断某别名是否已被「其他」对外模型（id != excludeID）作为别名占用（忽略 enabled）。
+// 供别名命名空间的别名↔别名互斥校验：扁平命名空间下别名不得与他人别名重复。
+// excludeID 为当前模型主键（创建传 0，更新传自身 ID），用于排除对自身已存别名的误判。
+func (s *Store) AliasExistsForOther(ctx context.Context, alias string, excludeID int64) (bool, error) {
+	var one int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT 1 FROM external_models
+		 WHERE deleted_at IS NULL AND id <> $2 AND aliases @> to_jsonb(ARRAY[$1::text])
+		 LIMIT 1`, alias, excludeID).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // GetByExternalName 返回指定对外名称的启用模型（供路由/计费使用）。
 // 带内存缓存（见 Store.extNameCache 注释）：命中直接返回，零 DB 查询；未命中回源并写缓存
 // （含「无启用模型」负缓存）。无启用模型返回 sql.ErrNoRows。
@@ -213,8 +257,12 @@ func (s *Store) GetByExternalName(ctx context.Context, externalName string) (*Ex
 	}
 	// 回源前捕获代际：回源期间若发生写路径失效（bump 代际），本次回填必须被拒绝（见 cacheExternalName）。
 	gen := s.extNameCache.Generation()
+	// 名称解析：命中本模型 external_name 或其任一别名（别名 JSONB 包含判定），仍限定启用且未删除。
+	// 缓存键沿用入参名字（别名与其规范名为**不同键**、指向同一模型条目），负缓存语义不变。
+	// 确定性排序：多行匹配（历史脏数据可能出现别名/名称重叠）时优先精确 external_name 命中，
+	// 其后再按 id 升序，保证解析结果稳定不随物理行序漂移。
 	row := s.db.QueryRowContext(ctx,
-		`SELECT `+cols+` FROM external_models WHERE external_name = $1 AND enabled = true AND deleted_at IS NULL LIMIT 1`, externalName)
+		`SELECT `+cols+` FROM external_models WHERE (external_name = $1 OR aliases @> to_jsonb(ARRAY[$1::text])) AND enabled = true AND deleted_at IS NULL ORDER BY (external_name = $1) DESC, id ASC LIMIT 1`, externalName)
 	m, err := scanExternal(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -272,10 +320,10 @@ func (s *Store) Insert(ctx context.Context, m *ExternalModel) (*ExternalModel, e
 		m.ID = idgen.New()
 	}
 	row := s.db.QueryRowContext(ctx,
-		`INSERT INTO external_models(id, external_name, description, enabled, sale_rates, time_config, context_tiers)
-		 VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING `+cols,
+		`INSERT INTO external_models(id, external_name, description, enabled, sale_rates, time_config, context_tiers, aliases)
+		 VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING `+cols,
 		m.ID, m.ExternalName, m.Description, m.Enabled, jsonB(m.SaleRates),
-		nullableJSON(m.TimeConfig), nullableJSON(m.ContextTiers))
+		nullableJSON(m.TimeConfig), nullableJSON(m.ContextTiers), jsonAliases(m.Aliases))
 	created, err := scanExternal(row)
 	if err != nil {
 		var pgErr *pgconn.PgError
@@ -286,6 +334,10 @@ func (s *Store) Insert(ctx context.Context, m *ExternalModel) (*ExternalModel, e
 	}
 	// 新增启用模型：失效该对外名的（可能是负）缓存，保证随后读取立即看到新值。
 	s.invalidateExternalName(m.ExternalName)
+	// 别名与其规范名为不同缓存键：新增后旧别名可能仍滞留负缓存，需逐个失效。
+	for _, a := range m.Aliases {
+		s.invalidateExternalName(a)
+	}
 	return created, nil
 }
 
@@ -293,10 +345,10 @@ func (s *Store) Insert(ctx context.Context, m *ExternalModel) (*ExternalModel, e
 func (s *Store) Update(ctx context.Context, m *ExternalModel) error {
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE external_models SET external_name=$1, description=$2, enabled=$3,
-		        sale_rates=$4, time_config=$5, context_tiers=$6, updated_at=now()
-		 WHERE id=$7`,
+		        sale_rates=$4, time_config=$5, context_tiers=$6, aliases=$7, updated_at=now()
+		 WHERE id=$8`,
 		m.ExternalName, m.Description, m.Enabled, jsonB(m.SaleRates),
-		nullableJSON(m.TimeConfig), nullableJSON(m.ContextTiers), m.ID)
+		nullableJSON(m.TimeConfig), nullableJSON(m.ContextTiers), jsonAliases(m.Aliases), m.ID)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
@@ -356,6 +408,18 @@ func jsonB(v any) []byte {
 	b, _ := json.Marshal(v)
 	if b == nil {
 		b = []byte("{}")
+	}
+	return b
+}
+
+// jsonAliases 将别名列表序列化为 JSONB 列值；空列表写 '[]'（而非 null），保持 NOT NULL 语义。
+func jsonAliases(v []string) []byte {
+	if len(v) == 0 {
+		return []byte("[]")
+	}
+	b, err := json.Marshal(v)
+	if err != nil || b == nil {
+		return []byte("[]")
 	}
 	return b
 }

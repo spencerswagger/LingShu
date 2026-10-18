@@ -291,6 +291,7 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 	requestedModel := model
 	autoName := ""
 	var routes []*router.ChannelRoute
+	var excluded []router.ExcludedCandidate
 	if g.auto != nil {
 		members, isAuto, aerr := g.auto.ResolveMembers(ctx, requestedModel, &token.UserID)
 		if aerr != nil {
@@ -306,7 +307,7 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 			// 不参考当前成员列表——成员重排/增删都不改变老会话落点，与「会话内粘性不变」一致。
 			if sessionID != "" {
 				if s, ok := g.router.Sessions().Lookup(sessionID); ok && s != nil && s.Model != "" {
-					if sRoutes, sErr := g.router.RouteAll(ctx, router.RouteSpec{
+					if sRes, sErr := g.router.RouteAllWithExcluded(ctx, router.RouteSpec{
 						ExternalModel: s.Model,
 						TagKV:         tagKV,
 						TagID:         token.TagID,
@@ -314,9 +315,10 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 						SessionTokens: turnTokens,
 						SessionTurn:   0,
 						Now:           g.now(),
-					}); sErr == nil && len(sRoutes) > 0 {
+					}); sErr == nil && sRes != nil && len(sRes.Routes) > 0 {
 						model = s.Model
-						routes = sRoutes
+						routes = sRes.Routes
+						excluded = sRes.Excluded
 					}
 				}
 			}
@@ -326,7 +328,7 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 					if mem.ExternalName == "" {
 						continue // 成员对应对外模型已软删/不可解析 → 跳过
 					}
-					mRoutes, mErr := g.router.RouteAll(ctx, router.RouteSpec{
+					mRes, mErr := g.router.RouteAllWithExcluded(ctx, router.RouteSpec{
 						ExternalModel: mem.ExternalName,
 						TagKV:         tagKV,
 						TagID:         token.TagID,
@@ -339,9 +341,10 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 						// 单个成员路由失败（如该对外模型未配置）不阻断整体：继续尝试下一成员。
 						continue
 					}
-					if len(mRoutes) > 0 {
+					if mRes != nil && len(mRes.Routes) > 0 {
 						model = mem.ExternalName
-						routes = mRoutes
+						routes = mRes.Routes
+						excluded = mRes.Excluded
 						break
 					}
 				}
@@ -364,7 +367,12 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 				SessionTurn:   0,
 				Now:           g.now(),
 			}
-			routes, err = g.router.RouteAll(ctx, routeSpec)
+			res, rerr := g.router.RouteAllWithExcluded(ctx, routeSpec)
+			err = rerr
+			if res != nil {
+				routes = res.Routes
+				excluded = res.Excluded
+			}
 		}
 	} else {
 		routeSpec := router.RouteSpec{
@@ -376,26 +384,37 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 			SessionTurn:   0,
 			Now:           g.now(),
 		}
-		routes, err = g.router.RouteAll(ctx, routeSpec)
+		res, rerr := g.router.RouteAllWithExcluded(ctx, routeSpec)
+		err = rerr
+		if res != nil {
+			routes = res.Routes
+			excluded = res.Excluded
+		}
 	}
 	if err != nil {
 		var re *router.RouteError
 		if errors.As(err, &re) {
+			// 文案/状态码保持既有口径（模型未配置/标签无路由/无可用渠道）。
+			status := http.StatusServiceUnavailable
+			reason := msgNoAvailable
 			switch re.Kind {
 			case router.KindModelNotFound:
-				// 未进入渠道也留痕：保证「每次请求必有一条账单记录」（模型未配置/停用）。
-				g.recordGatewayReject(ctx, model, autoName, token, "", sessionID, fmt.Sprintf(msgModelNotFound, model))
-				g.logReject(ctx, endpoint, model, fmt.Sprintf(msgModelNotFound, model), http.StatusNotFound, token, msSince(start))
-				writeOpenAIError(w, http.StatusNotFound, fmt.Sprintf(msgModelNotFound, model))
+				status = http.StatusNotFound
+				reason = fmt.Sprintf(msgModelNotFound, model)
 			case router.KindNoRoute:
-				g.recordGatewayReject(ctx, model, autoName, token, "", sessionID, msgNoRoute)
-				g.logReject(ctx, endpoint, model, msgNoRoute, http.StatusServiceUnavailable, token, msSince(start))
-				writeOpenAIError(w, http.StatusServiceUnavailable, msgNoRoute)
-			default: // KindNoAvailable
-				g.recordGatewayReject(ctx, model, autoName, token, "", sessionID, msgNoAvailable)
-				g.logReject(ctx, endpoint, model, msgNoAvailable, http.StatusServiceUnavailable, token, msSince(start))
-				writeOpenAIError(w, http.StatusServiceUnavailable, msgNoAvailable)
+				reason = msgNoRoute
 			}
+			bid := g.recordGatewayReject(ctx, model, autoName, token, "", sessionID, reason)
+			// 路由层排除项（如排空）并入决策轨迹：既写调用日志，也让请求级结论带上 attempt_trail，
+			// 避免「仅因排空而无候选」在观测面上静默无记录（无排除项时行为完全不变）。
+			if exAttempts := excludedAttempts(excluded); len(exAttempts) > 0 {
+				trail, failed := summarizeAttempts(exAttempts)
+				g.writeCallLog(ctx, bid, "", token, &router.RouteResult{AutoModelName: autoName}, model, "", sessionID,
+					nil, "error", "", "failed", reason, msSince(start), nil, excludedRejectDecision(exAttempts))
+				g.logOutcome(ctx, slog.LevelWarn, endpoint, model, reason, status, false, token, sessionID, exAttempts, trail, failed, msSince(start))
+			}
+			g.logReject(ctx, endpoint, model, reason, status, token, msSince(start))
+			writeOpenAIError(w, status, reason)
 			return
 		}
 		l.Error("route failed", "model", model, "err", err)
@@ -510,13 +529,17 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 	sawUnsupported := false // 出现过「入站协议 ∉ 模型可达 protocols」（AC-4）
 	attempted := false      // 是否至少有一次候选真正发出上游调用（用于全被本地拦截时的账单兜底）
 	// 决策轨迹：每个候选渠道的处理结果与跳过原因（call_log decision 用，雪花 ID 以字符串序列化）。
-	attempts := make([]map[string]any, 0, len(routes))
+	// 先并入路由层排除项（如排空），再逐候选追加尝试结果；无排除项时轨迹与既有行为完全一致。
+	attempts := make([]map[string]any, 0, len(routes)+len(excluded))
+	attempts = append(attempts, excludedAttempts(excluded)...)
 	for _, cr := range routes {
 		order := len(attempts) + 1
 		// 渠道/密钥名：渠道 ID 为雪花值，直接展示不具可读性，随候选一并回查落轨迹。
 		chName, keyName := g.channelAndKeyNames(cr.ChannelID, cr.ChannelKeyID)
+		// out 在下方转发阶段赋值；此处提前声明，使轨迹项可并入流式失败诊断（streamDiag）。
+		var out *fwdOutcome
 		attempt := func(reason string) map[string]any {
-			return map[string]any{
+			m := map[string]any{
 				"order":             order,
 				"channel_id":        strconv.FormatInt(cr.ChannelID, 10),
 				"channel_name":      chName,
@@ -529,6 +552,13 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 				"cost_known":       cr.CostKnown,
 				"route_time_coeff": cr.TimeCoeff,
 			}
+			// 流式上游失败诊断（delivered/first_byte_received/elapsed_ms）：随失败候选轨迹落调用日志。
+			if out != nil {
+				for k, v := range out.streamDiag {
+					m[k] = v
+				}
+			}
+			return m
 		}
 		// skip 标记"未进入上游即被跳过"的候选：不计入候选失败（否则正常请求会被误判为隐性失败）。
 		skip := func(reason string) map[string]any {
@@ -654,6 +684,7 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 			DownstreamHeader: r.Header,
 			HeaderPolicy:     effectiveHeaderPolicy(rt),
 			Protocol:         baseProtocol,
+			Features:         protocolFeatures(rt),
 			Vars: map[string]string{
 				"session_id": sessionID,
 				"request_id": logger.GetRequestID(ctx),
@@ -662,7 +693,6 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 			},
 		}
 
-		var out *fwdOutcome
 		// 进行中计数：包住整段上游转发（含流式全程），管理端「实时状态」据此判定「正在请求」。
 		if sessionID != "" {
 			sess.BeginRequest(sessionID)
@@ -803,6 +833,40 @@ func routeResFor(cr *router.ChannelRoute, autoName string) *router.RouteResult {
 	}
 }
 
+// excludedAttempts 把路由层被排除的候选转为决策轨迹项：skipped=true 表示「未进入上游即被排除」
+// （不计入候选失败），reason 为稳定枚举字符串；命中运维动作映射时附 hint（运维动作提示）。
+func excludedAttempts(excluded []router.ExcludedCandidate) []map[string]any {
+	if len(excluded) == 0 {
+		return nil
+	}
+	out := make([]map[string]any, 0, len(excluded))
+	for i, ex := range excluded {
+		m := map[string]any{
+			"order":             i + 1,
+			"channel_id":        strconv.FormatInt(ex.ChannelID, 10),
+			"channel_name":      ex.ChannelName,
+			"channel_key_id":    strconv.FormatInt(ex.ChannelKeyID, 10),
+			"internal_model_id": ex.InternalModelID,
+			"reason":            ex.Reason,
+			"skipped":           true,
+		}
+		if hint := exclusionHint(ex.Reason); hint != "" {
+			m["hint"] = hint
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// excludedRejectDecision 为「路由层无候选但存在排除项」的拒绝场景组装决策轨迹：
+// 该路径无预扣信息可用，故仅含 attempts 与 result（不改既有键名）。
+func excludedRejectDecision(attempts []map[string]any) map[string]any {
+	return map[string]any{
+		"attempts": attempts,
+		"result":   "rejected",
+	}
+}
+
 // refundPreConsume 退还一次预扣冻结（失败时只记日志，不回滚请求语义）。
 func (g *Gateway) refundPreConsume(ctx context.Context, userID int64, amount float64, remark string) {
 	if g.credit == nil || amount <= 0 {
@@ -845,20 +909,24 @@ func retryableUpstreamStatus(code int) bool {
 	return code >= 500
 }
 
-// withWriteTrace 给请求挂上 httptrace，记录「请求体是否已完整送达上游」。
+// withWriteTrace 给请求挂上 httptrace，记录「请求体是否已完整送达上游」「是否已收到上游首字节」。
 // 用于区分两类调用失败：
 //   - 连接阶段失败（未送达）：上游不可能收到请求、不可能计费 → 可安全转移；
 //   - 请求已送达后失败（多为响应超时）：上游可能已生成并计费 → 不转移，避免上游重复计费。
-func withWriteTrace(req *http.Request) (*http.Request, *atomic.Bool) {
+func withWriteTrace(req *http.Request) (*http.Request, *atomic.Bool, *atomic.Bool) {
 	wrote := &atomic.Bool{}
+	gotFirstByte := &atomic.Bool{}
 	trace := &httptrace.ClientTrace{
 		WroteRequest: func(info httptrace.WroteRequestInfo) {
 			if info.Err == nil {
 				wrote.Store(true)
 			}
 		},
+		GotFirstResponseByte: func() {
+			gotFirstByte.Store(true)
+		},
 	}
-	return req.WithContext(httptrace.WithClientTrace(req.Context(), trace)), wrote
+	return req.WithContext(httptrace.WithClientTrace(req.Context(), trace)), wrote, gotFirstByte
 }
 
 // billingTimeout 记账/退款类操作的超时兜底。
@@ -890,6 +958,9 @@ type fwdOutcome struct {
 	// interrupted 流式传输中断（内容已部分下发、无法撤回）：语义上请求失败，
 	// 但下游状态码仍为 200，故必须单列，不能靠状态码判定成败。
 	interrupted bool
+	// streamDiag 流式上游失败诊断（仅排查用，随失败候选轨迹落调用日志）：
+	// delivered / first_byte_received / elapsed_ms（连接失败时无上游状态码，故不含 upstream_status）。
+	streamDiag map[string]any
 }
 
 // serveNonStream 非流式转发：2xx 先计费再响应。
@@ -920,7 +991,7 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 			"error", "", "failed", "构建上游请求失败", msSince(start), nil, g.callLogDecision(attempts, "上游请求构建失败", pc, routeRes))
 		return &fwdOutcome{retry: true}
 	}
-	req, wrote := withWriteTrace(req)
+	req, wrote, _ := withWriteTrace(req)
 	up, err := g.client.Do(req)
 	if err != nil {
 		g.logError(rt.Channel.ID, "upstream call failed", err)
@@ -966,6 +1037,8 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 			return &fwdOutcome{responded: true, refundPre: true, downstreamStatus: http.StatusBadGateway}
 		}
 		dur := msSince(start)
+		// 响应侧协议特性（响应侧）：在 usage 归一/计费前对上游响应体做归一（未挂载时零差异）。
+		raw = normalizeUpstreamBody(raw, rt)
 		// upstreamUsage：上游原始 usage（JSONB 值），随调用日志落库用于诊断渠道口径（见 rawusage.go）。
 		usage, upstreamUsage, uerr := prov.ExtractUsage(raw)
 		usageMissing := uerr != nil || usageZero(usage)
@@ -1035,60 +1108,91 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 		return out
 
 	case up.StatusCode == http.StatusTooManyRequests:
-		g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, channel.Feedback{Is429: true, Now: g.now()})
 		upErr := readUpstreamErrBody(up)
 		errMsg := upstreamErrDetail(up.StatusCode, upErr)
 		param, etype, ecode, summary := upstreamErrParts(upErr)
-		g.logUpstreamErr(ctx, slog.LevelWarn, "upstream rate limited", endpoint, ureq.Protocol, model, token, routeRes,
+		// 协议级错误策略同样覆盖 429（含 catch-all 策略）：此前仅默认分支生效，导致 429 绕过策略。
+		// 未命中保持改造前行为（按 Is429 回喂健康 + 可转移）；命中则按策略处置。
+		pol := g.applyErrorPolicy(ctx, rt, routeRes, up.StatusCode, etype, ecode, summary)
+		g.channels.FeedResultGated(routeRes.ChannelKeyID, routeRes.ModelRowID, channel.Feedback{Is429: true, Now: g.now()}, pol.countIntoHealth)
+		lvl := slog.LevelWarn
+		if !pol.failover {
+			lvl = slog.LevelError
+		}
+		reason429 := "上游限流(429)，已返回下游"
+		if pol.failover {
+			reason429 = "上游限流(429)，已转入下一候选"
+		}
+		g.logUpstreamErr(ctx, lvl, "upstream rate limited", endpoint, ureq.Protocol, model, token, routeRes,
 			diagFromRequest(req, ureq.Protocol, ureq.Cred),
-			errInfo{kind: "upstream_status", stage: stage, status: up.StatusCode, attempt: attempt, retry: true,
+			errInfo{kind: "upstream_status", stage: stage, status: up.StatusCode, attempt: attempt, retry: pol.failover,
 				param: param, errType: etype, errCode: ecode, summary: summary,
-				reason: "上游限流(429)，已转入下一候选", sessionID: sessionID, durationMs: *msSince(start)})
+				reason: reason429, sessionID: sessionID, durationMs: *msSince(start)})
 		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, errMsg, msSince(start))
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
 			"error", upErr, "failed", errMsg, msSince(start), nil, g.callLogDecision(attempts, "上游限流(429)", pc, routeRes))
-		return &fwdOutcome{retry: true, is429: true}
+		if pol.failover {
+			return &fwdOutcome{retry: true, is429: true}
+		}
+		writeOpenAIError(w, pol.downstreamStatus, msgUpstreamDown)
+		return &fwdOutcome{responded: true, refundPre: true, downstreamStatus: pol.downstreamStatus}
 	case up.StatusCode == http.StatusUnauthorized || up.StatusCode == http.StatusForbidden:
 		// 凭据可能失效：先转移下一候选；连续失败达阈值由状态机熔断（channel.Machine）。
 		// 注意：此处按状态码归类为「凭据失效」，但上游报文可能指向模型维度
 		//（日志字段 err_scope=model）；该字段仅用于事后分诊，不改变既有状态机判定。
-		g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, channel.Feedback{IsAuthFailure: true, Now: g.now()})
 		upErr := readUpstreamErrBody(up)
 		errMsg := upstreamErrDetail(up.StatusCode, upErr)
 		param, etype, ecode, summary := upstreamErrParts(upErr)
-		g.logUpstreamErr(ctx, slog.LevelWarn, "upstream auth rejected", endpoint, ureq.Protocol, model, token, routeRes,
+		// 协议级错误策略同样覆盖 401/403（此前绕过策略）；未命中保持改造前行为（按 IsAuthFailure 回喂 + 可转移）。
+		pol := g.applyErrorPolicy(ctx, rt, routeRes, up.StatusCode, etype, ecode, summary)
+		g.channels.FeedResultGated(routeRes.ChannelKeyID, routeRes.ModelRowID, channel.Feedback{IsAuthFailure: true, Now: g.now()}, pol.countIntoHealth)
+		lvl := slog.LevelWarn
+		if !pol.failover {
+			lvl = slog.LevelError
+		}
+		reasonAuth := "上游返回 401/403，已返回下游"
+		if pol.failover {
+			reasonAuth = "上游返回 401/403，已转入下一候选（该失败通常对下游不可见）"
+		}
+		g.logUpstreamErr(ctx, lvl, "upstream auth rejected", endpoint, ureq.Protocol, model, token, routeRes,
 			diagFromRequest(req, ureq.Protocol, ureq.Cred),
-			errInfo{kind: "upstream_status", stage: stage, status: up.StatusCode, attempt: attempt, retry: true,
+			errInfo{kind: "upstream_status", stage: stage, status: up.StatusCode, attempt: attempt, retry: pol.failover,
 				param: param, errType: etype, errCode: ecode, summary: summary,
-				reason: "上游返回 401/403，已转入下一候选（该失败通常对下游不可见）", sessionID: sessionID, durationMs: *msSince(start)})
+				reason: reasonAuth, sessionID: sessionID, durationMs: *msSince(start)})
 		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, errMsg, msSince(start))
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
 			"error", upErr, "failed", errMsg, msSince(start), nil, g.callLogDecision(attempts, "上游鉴权失败", pc, routeRes))
-		return &fwdOutcome{retry: true}
+		if pol.failover {
+			return &fwdOutcome{retry: true}
+		}
+		writeOpenAIError(w, pol.downstreamStatus, msgUpstreamDown)
+		return &fwdOutcome{responded: true, refundPre: true, downstreamStatus: pol.downstreamStatus}
 	default:
-		g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, feedbackFail(start))
 		upErr := readUpstreamErrBody(up)
 		errMsg := upstreamErrDetail(up.StatusCode, upErr)
 		param, etype, ecode, summary := upstreamErrParts(upErr)
-		retryable := retryableUpstreamStatus(up.StatusCode)
+		// 协议级错误策略：命中则按其处置（是否计入健康 / 是否 failover / 动作 / 下游状态码），
+		// 未命中保持改造前行为（默认安全态）。非流式与流式共用同一决策函数，语义一致。
+		pol := g.applyErrorPolicy(ctx, rt, routeRes, up.StatusCode, etype, ecode, summary)
+		g.channels.FeedResultGated(routeRes.ChannelKeyID, routeRes.ModelRowID, feedbackFail(start), pol.countIntoHealth)
 		lvl := slog.LevelWarn
-		if !retryable {
+		if !pol.failover {
 			lvl = slog.LevelError // 已直接返回下游的失败，属用户可见异常
 		}
 		g.logUpstreamErr(ctx, lvl, "upstream error response", endpoint, ureq.Protocol, model, token, routeRes,
 			diagFromRequest(req, ureq.Protocol, ureq.Cred),
 			errInfo{kind: "upstream_status", stage: stage, status: up.StatusCode, attempt: attempt,
-				retry: retryable,
+				retry: pol.failover,
 				param: param, errType: etype, errCode: ecode, summary: summary,
 				reason: errMsg, sessionID: sessionID, durationMs: *msSince(start)})
 		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, errMsg, msSince(start))
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
 			"error", upErr, "failed", errMsg, msSince(start), nil, g.callLogDecision(attempts, errMsg, pc, routeRes))
-		if retryableUpstreamStatus(up.StatusCode) {
+		if pol.failover {
 			return &fwdOutcome{retry: true}
 		}
-		writeOpenAIError(w, http.StatusBadGateway, msgUpstreamDown)
-		return &fwdOutcome{responded: true, refundPre: true, downstreamStatus: http.StatusBadGateway}
+		writeOpenAIError(w, pol.downstreamStatus, msgUpstreamDown)
+		return &fwdOutcome{responded: true, refundPre: true, downstreamStatus: pol.downstreamStatus}
 	}
 }
 
@@ -1161,30 +1265,49 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 			"error", "", "failed", "构建上游流式请求失败", msSince(start), nil, g.callLogDecision(attempts, "上游请求构建失败", pc, routeRes))
 		return &fwdOutcome{retry: true}
 	}
-	req, wrote := withWriteTrace(req)
+	req, wrote, gotFirstByte := withWriteTrace(req)
 	up, err := g.streamClient.Do(req)
 	if err != nil {
 		g.logError(rt.Channel.ID, "upstream stream call failed", err)
+		// 流式失败诊断：delivered 区分「已送达/未送达」，并补响应阶段线索
+		// （是否收到首字节、阶段耗时；连接失败时上游状态码不可得，故不写 upstream_status）。
+		delivered := wrote.Load()
+		firstByte := gotFirstByte.Load()
+		elapsed := msSince(start)
 		g.logUpstreamErr(ctx, slog.LevelWarn, "upstream call failed", endpoint, ureq.Protocol, model, token, routeRes,
 			diagFromRequest(req, ureq.Protocol, ureq.Cred),
 			errInfo{kind: "connect_failed", stage: stage, attempt: attempt,
-				retry: !wrote.Load(), reason: "上游流式调用失败：" + err.Error(), sessionID: sessionID, durationMs: *msSince(start)})
+				retry: !delivered, reason: "上游流式调用失败：" + err.Error(), sessionID: sessionID, durationMs: *elapsed,
+				delivered: &delivered, firstByteReceived: &firstByte, elapsedMS: elapsed})
 		g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, channel.Feedback{IsSuccess: false, Now: g.now()})
-		if !wrote.Load() {
+		streamDiag := map[string]any{
+			"delivered":           delivered,
+			"first_byte_received": firstByte,
+			"elapsed_ms":          *elapsed,
+		}
+		// 调用日志决策轨迹同样带上流式失败诊断（仅新增字段，不改既有键名）。
+		streamDecision := func(reason string) map[string]any {
+			dec := g.callLogDecision(attempts, reason, pc, routeRes)
+			for k, v := range streamDiag {
+				dec[k] = v
+			}
+			return dec
+		}
+		if !delivered {
 			// 请求体未送达上游：上游不可能计费 → 可安全转移。
 			bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "上游流式连接失败", msSince(start))
 			// 连接失败：上游未返回任何响应体，resp_body 留空（原因见 error_message / 决策轨迹）。
 			g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-				"error", "", "failed", "上游流式连接失败", msSince(start), nil, g.callLogDecision(attempts, "上游连接失败", pc, routeRes))
-			return &fwdOutcome{retry: true}
+				"error", "", "failed", "上游流式连接失败", msSince(start), nil, streamDecision("上游连接失败"))
+			return &fwdOutcome{retry: true, streamDiag: streamDiag}
 		}
 		// 请求已送达后失败（多为响应超时）：上游可能已生成并计费，转移会导致上游重复计费 → 不转移。
 		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "上游流式请求失败（已送达，不转移）", msSince(start))
 		// 已送达但失败（多为超时）：上游可能已生成，但不返回响应体 → resp_body 留空。
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-			"error", "", "failed", "上游流式请求失败（已送达，不转移）", msSince(start), nil, g.callLogDecision(attempts, "上游请求失败", pc, routeRes))
+			"error", "", "failed", "上游流式请求失败（已送达，不转移）", msSince(start), nil, streamDecision("上游请求失败"))
 		writeOpenAIError(w, http.StatusBadGateway, msgUpstreamDown)
-		return &fwdOutcome{responded: true, refundPre: true, downstreamStatus: http.StatusBadGateway}
+		return &fwdOutcome{responded: true, refundPre: true, downstreamStatus: http.StatusBadGateway, streamDiag: streamDiag}
 	}
 	defer up.Body.Close()
 
@@ -1196,6 +1319,8 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		ft := &firstTokenWriter{ResponseWriter: w}
 		// upstreamUsage：上游原始 usage 分片合并后的 JSONB 值（诊断渠道口径，见 rawusage.go）。
 		usage, upstreamUsage, assistantMsg, herr := prov.HandleStream(ctx, up, ft)
+		// 响应侧协议特性：usage 拼装后、计费前对拼装结果做归一（未挂载时零差异）。
+		assistantMsg = normalizeUpstreamBody(assistantMsg, rt)
 		dur := msSince(start)
 		// 计费上下文（脱离请求取消、带超时）：响应结束后请求 ctx 会被取消，账单不可丢。
 		billCtx, cancelBill := billingCtx(ctx)
@@ -1277,60 +1402,83 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		}
 		return out
 	case up.StatusCode == http.StatusTooManyRequests:
-		g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, channel.Feedback{Is429: true, Now: g.now()})
 		upErr := readUpstreamErrBody(up)
 		errMsg := upstreamErrDetail(up.StatusCode, upErr)
 		param, etype, ecode, summary := upstreamErrParts(upErr)
-		g.logUpstreamErr(ctx, slog.LevelWarn, "upstream rate limited", endpoint, ureq.Protocol, model, token, routeRes,
+		// 协议级错误策略同样覆盖 429（含 catch-all 策略）：此前仅默认分支生效，导致 429 绕过策略。
+		// 未命中保持改造前行为（按 Is429 回喂健康 + 可转移）；命中则按策略处置。
+		pol := g.applyErrorPolicy(ctx, rt, routeRes, up.StatusCode, etype, ecode, summary)
+		g.channels.FeedResultGated(routeRes.ChannelKeyID, routeRes.ModelRowID, channel.Feedback{Is429: true, Now: g.now()}, pol.countIntoHealth)
+		lvl := slog.LevelWarn
+		if !pol.failover {
+			lvl = slog.LevelError
+		}
+		g.logUpstreamErr(ctx, lvl, "upstream rate limited", endpoint, ureq.Protocol, model, token, routeRes,
 			diagFromRequest(req, ureq.Protocol, ureq.Cred),
-			errInfo{kind: "upstream_status", stage: stage, status: up.StatusCode, attempt: attempt, retry: true,
+			errInfo{kind: "upstream_status", stage: stage, status: up.StatusCode, attempt: attempt, retry: pol.failover,
 				param: param, errType: etype, errCode: ecode, summary: summary,
 				reason: "上游限流(429)，已转入下一候选", sessionID: sessionID, durationMs: *msSince(start)})
 		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, errMsg, msSince(start))
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
 			"error", upErr, "failed", errMsg, msSince(start), nil, g.callLogDecision(attempts, "上游限流(429)", pc, routeRes))
-		return &fwdOutcome{retry: true, is429: true}
+		if pol.failover {
+			return &fwdOutcome{retry: true, is429: true}
+		}
+		writeOpenAIError(w, pol.downstreamStatus, msgUpstreamDown)
+		return &fwdOutcome{responded: true, refundPre: true, downstreamStatus: pol.downstreamStatus}
 	case up.StatusCode == http.StatusUnauthorized || up.StatusCode == http.StatusForbidden:
 		// 凭据可能失效：先转移下一候选；连续失败达阈值由状态机熔断（channel.Machine）。
 		// 注意：此处按状态码归类为「凭据失效」，但上游报文可能指向模型维度
 		//（日志字段 err_scope=model）；该字段仅用于事后分诊，不改变既有状态机判定。
-		g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, channel.Feedback{IsAuthFailure: true, Now: g.now()})
 		upErr := readUpstreamErrBody(up)
 		errMsg := upstreamErrDetail(up.StatusCode, upErr)
 		param, etype, ecode, summary := upstreamErrParts(upErr)
-		g.logUpstreamErr(ctx, slog.LevelWarn, "upstream auth rejected", endpoint, ureq.Protocol, model, token, routeRes,
+		// 协议级错误策略同样覆盖 401/403（此前绕过策略）；未命中保持改造前行为（按 IsAuthFailure 回喂 + 可转移）。
+		pol := g.applyErrorPolicy(ctx, rt, routeRes, up.StatusCode, etype, ecode, summary)
+		g.channels.FeedResultGated(routeRes.ChannelKeyID, routeRes.ModelRowID, channel.Feedback{IsAuthFailure: true, Now: g.now()}, pol.countIntoHealth)
+		lvl := slog.LevelWarn
+		if !pol.failover {
+			lvl = slog.LevelError
+		}
+		g.logUpstreamErr(ctx, lvl, "upstream auth rejected", endpoint, ureq.Protocol, model, token, routeRes,
 			diagFromRequest(req, ureq.Protocol, ureq.Cred),
-			errInfo{kind: "upstream_status", stage: stage, status: up.StatusCode, attempt: attempt, retry: true,
+			errInfo{kind: "upstream_status", stage: stage, status: up.StatusCode, attempt: attempt, retry: pol.failover,
 				param: param, errType: etype, errCode: ecode, summary: summary,
 				reason: "上游返回 401/403，已转入下一候选（该失败通常对下游不可见）", sessionID: sessionID, durationMs: *msSince(start)})
 		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, errMsg, msSince(start))
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
 			"error", upErr, "failed", errMsg, msSince(start), nil, g.callLogDecision(attempts, "上游鉴权失败", pc, routeRes))
-		return &fwdOutcome{retry: true}
+		if pol.failover {
+			return &fwdOutcome{retry: true}
+		}
+		writeOpenAIError(w, pol.downstreamStatus, msgUpstreamDown)
+		return &fwdOutcome{responded: true, refundPre: true, downstreamStatus: pol.downstreamStatus}
 	default:
-		g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, feedbackFail(start))
 		upErr := readUpstreamErrBody(up)
 		errMsg := upstreamErrDetail(up.StatusCode, upErr)
 		param, etype, ecode, summary := upstreamErrParts(upErr)
-		retryable := retryableUpstreamStatus(up.StatusCode)
+		// 协议级错误策略：命中则按其处置（是否计入健康 / 是否 failover / 动作 / 下游状态码），
+		// 未命中保持改造前行为（默认安全态）。与 serveNonStream 共用同一决策函数，语义一致。
+		pol := g.applyErrorPolicy(ctx, rt, routeRes, up.StatusCode, etype, ecode, summary)
+		g.channels.FeedResultGated(routeRes.ChannelKeyID, routeRes.ModelRowID, feedbackFail(start), pol.countIntoHealth)
 		lvl := slog.LevelWarn
-		if !retryable {
+		if !pol.failover {
 			lvl = slog.LevelError // 已直接返回下游的失败，属用户可见异常
 		}
 		g.logUpstreamErr(ctx, lvl, "upstream error response", endpoint, ureq.Protocol, model, token, routeRes,
 			diagFromRequest(req, ureq.Protocol, ureq.Cred),
 			errInfo{kind: "upstream_status", stage: stage, status: up.StatusCode, attempt: attempt,
-				retry: retryable,
+				retry: pol.failover,
 				param: param, errType: etype, errCode: ecode, summary: summary,
 				reason: errMsg, sessionID: sessionID, durationMs: *msSince(start)})
 		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, errMsg, msSince(start))
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
 			"error", upErr, "failed", errMsg, msSince(start), nil, g.callLogDecision(attempts, errMsg, pc, routeRes))
-		if retryableUpstreamStatus(up.StatusCode) {
+		if pol.failover {
 			return &fwdOutcome{retry: true}
 		}
-		writeOpenAIError(w, http.StatusBadGateway, msgUpstreamDown)
-		return &fwdOutcome{responded: true, refundPre: true, downstreamStatus: http.StatusBadGateway}
+		writeOpenAIError(w, pol.downstreamStatus, msgUpstreamDown)
+		return &fwdOutcome{responded: true, refundPre: true, downstreamStatus: pol.downstreamStatus}
 	}
 }
 

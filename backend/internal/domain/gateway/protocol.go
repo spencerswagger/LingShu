@@ -1,12 +1,156 @@
 package gateway
 
 import (
+	"context"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/team/llmgateway/internal/domain/channel"
 	"github.com/team/llmgateway/internal/domain/channelprotocol"
+	"github.com/team/llmgateway/internal/domain/router"
 )
+
+// protocolPolicyTimeout 协议级错误策略在错误热路径上的超时兜底：
+// 策略读取（GetByID）与错误统计写入（IncrProtocolErrorStat）都不得无界挂起而拖住错误响应。
+const protocolPolicyTimeout = 2 * time.Second
+
+// policyForProtocol 解析某协议针对给定上游错误命中的错误策略：
+// 优先用运行时渠道的协议快照（rt.Protocol 为新建的 ChannelProtocol 快照，含 ErrorPolicy），
+// 直接取 error_policy 调 MatchError，避免每上游错误再回源一次 DB；
+// 仅当快照缺失时才退回 g.protocols.GetByID 读库（沿用 2s 有界上下文兜底）。
+//
+// 未装配协议查询接口 / 协议不存在 / 无命中时返回 (nil, false)——上层据此保持改造前行为
+// （默认安全态：不计入健康、沿用 retryableUpstreamStatus、默认 502）。
+func (g *Gateway) policyForProtocol(rt *channel.RuntimeChannel, channelID int64, internalModelID int64, status int, errType, errCode, msg string) (*channelprotocol.ErrorPolicy, bool) {
+	if rt != nil && rt.Protocol != nil {
+		return channelprotocol.MatchError(rt.Protocol.ErrorPolicy, "", internalModelID, status, errType, errCode, msg)
+	}
+	protocolID := protocolIDOf(rt)
+	if g.protocols == nil || protocolID <= 0 {
+		return nil, false
+	}
+	// 有界上下文：脱离请求取消（错误响应收尾不应被下游断开连带取消），但带超时兜底，
+	// 避免 DB 慢/挂起拖住错误收尾（策略读取在错误热路径上）。
+	ctx, cancel := context.WithTimeout(context.Background(), protocolPolicyTimeout)
+	defer cancel()
+	cp, err := g.protocols.GetByID(ctx, protocolID)
+	if err != nil || cp == nil {
+		g.logger.Warn("load channel protocol for error policy failed", "protocol_id", protocolID, "channel_id", channelID, "err", err)
+		return nil, false
+	}
+	return channelprotocol.MatchError(cp.ErrorPolicy, "", internalModelID, status, errType, errCode, msg)
+}
+
+// errorPolicyOutcome 一次「上游错误 → 错误策略」决策的结果。
+// 未命中策略时保持改造前行为（默认安全态）：
+//   - countIntoHealth=true（照常计入渠道健康）；
+//   - failover=retryableUpstreamStatus(status)（沿用既有可转移判定）；
+//   - downstreamStatus=502（默认网关错误）。
+type errorPolicyOutcome struct {
+	countIntoHealth  bool // 是否计入渠道健康错误率/429/鉴权计数
+	failover         bool // 是否转移到下一候选
+	downstreamStatus int  // 未转移时写出的下游状态码（命中 Disposition 时替代默认 502）
+}
+
+// applyErrorPolicy 对一次上游错误（status + errType/errCode/msg）做统一策略决策并执行副作用：
+//   - 未命中策略 → 默认安全态（见 errorPolicyOutcome 注释）；
+//   - CountIntoHealth=false → 调用方以 FeedResultGated(..., false) 回喂（完全不影响熔断）；
+//   - Failover 显式设置时按其值决定是否转移（未设置沿用 retryableUpstreamStatus）；
+//   - Action=drain|disable → 手动置密钥/内部模型状态（ForceKeyState/ManualSetModelState，均落库）；
+//   - DownstreamStatus≠0 → 替代默认 502；
+//   - 命中策略时按错误类别累加协议级错误统计（protocol_error_stats）。
+//
+// 非流式（serveNonStream）与流式（serveStream）内部错误分支共用本函数，保证两处语义完全一致；
+// 429 与 401/403 分支同样调用本函数，避免这些状态码绕过策略（此前仅默认分支生效）。
+func (g *Gateway) applyErrorPolicy(ctx context.Context, rt *channel.RuntimeChannel, routeRes *router.RouteResult,
+	status int, errType, errCode, msg string) errorPolicyOutcome {
+
+	out := errorPolicyOutcome{
+		countIntoHealth:  true,
+		failover:         retryableUpstreamStatus(status),
+		downstreamStatus: http.StatusBadGateway,
+	}
+	protocolID := protocolIDOf(rt)
+	pol, ok := g.policyForProtocol(rt, routeRes.ChannelID, routeRes.ModelRowID, status, errType, errCode, msg)
+	if !ok {
+		return out
+	}
+	out.countIntoHealth = pol.Disposition.CountIntoHealth
+	if pol.Disposition.Failover != nil {
+		out.failover = *pol.Disposition.Failover
+	}
+	if pol.Disposition.DownstreamStatus != 0 {
+		out.downstreamStatus = pol.Disposition.DownstreamStatus
+	}
+	g.applyPolicyAction(ctx, routeRes, pol)
+	g.recordProtocolErrorStat(protocolID, pol, status, errCode)
+	return out
+}
+
+// applyPolicyAction 按 Disposition.Action 手动置密钥/内部模型状态（none 不动作）。
+// drain/disable 同时作用于命中候选的密钥与内部模型行（双回喂语义一致）。
+func (g *Gateway) applyPolicyAction(ctx context.Context, routeRes *router.RouteResult, pol *channelprotocol.ErrorPolicy) {
+	switch pol.Disposition.Action {
+	case channelprotocol.ErrorActionDrain:
+		g.manualSetStates(ctx, routeRes, channel.ActionDrain, channel.StateDrain)
+	case channelprotocol.ErrorActionDisable:
+		g.manualSetStates(ctx, routeRes, channel.ActionDisable, channel.StateDisabled)
+	}
+}
+
+// manualSetStates 手动设置密钥与内部模型状态（失败仅记日志，不阻断错误响应）。
+// 密钥走 ForceKeyState：内存状态机 + channel_keys.state 落库 + channel_key_events 事件，
+// 与内部模型 ManualSetModelState 对称持久化（此前仅内存，重启即丢）；错误统计路径已有界超时兜底。
+func (g *Gateway) manualSetStates(ctx context.Context, routeRes *router.RouteResult, action string, st channel.State) {
+	if g.channels == nil {
+		return
+	}
+	if err := g.channels.ForceKeyState(ctx, routeRes.ChannelKeyID, action); err != nil {
+		g.logger.Warn("apply error policy key action failed",
+			"channel_key_id", routeRes.ChannelKeyID, "action", action, "err", err)
+	}
+	if err := g.channels.ManualSetModelState(routeRes.ChannelID, routeRes.ModelRowID, st); err != nil {
+		g.logger.Warn("apply error policy model action failed",
+			"channel_id", routeRes.ChannelID, "model_row_id", routeRes.ModelRowID, "state", st, "err", err)
+	}
+}
+
+// recordProtocolErrorStat 命中策略时按错误类别累加协议级统计（量小，同步 upsert；失败仅记日志）。
+// 写入上下文有界超时：错误热路径不得被 DB 慢/挂起拖着不放。
+func (g *Gateway) recordProtocolErrorStat(protocolID int64, pol *channelprotocol.ErrorPolicy, status int, errCode string) {
+	if g.protocolStats == nil || protocolID <= 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), protocolPolicyTimeout)
+	defer cancel()
+	if err := g.protocolStats.IncrProtocolErrorStat(ctx, protocolID, errorCategory(pol, status, errCode), g.now()); err != nil {
+		g.logger.Warn("record protocol error stat failed", "protocol_id", protocolID, "err", err)
+	}
+}
+
+// errorCategory 归出命中错误的类别标识：优先 code（code:<errCode>），其次 type，最后 status（status:<n>）。
+func errorCategory(pol *channelprotocol.ErrorPolicy, status int, errCode string) string {
+	switch {
+	case pol.Match.ErrorCode != "":
+		return "code:" + pol.Match.ErrorCode
+	case pol.Match.ErrorType != "":
+		return "type:" + pol.Match.ErrorType
+	case pol.Match.Status != 0:
+		return "status:" + strconv.Itoa(pol.Match.Status)
+	default:
+		return "status:" + strconv.Itoa(status)
+	}
+}
+
+// protocolIDOf 返回渠道运行时引用的渠道协议 ID（未引用/内联配置返回 0）。
+func protocolIDOf(rt *channel.RuntimeChannel) int64 {
+	if rt == nil || rt.Protocol == nil {
+		return 0
+	}
+	return rt.Protocol.ID
+}
 
 // UpstreamResponseHeaderWhitelistKey 是全局上游响应头白名单在 sys_configs 中的键（默认空，零配置）。
 const UpstreamResponseHeaderWhitelistKey = "gateway.upstream_response_header_whitelist"

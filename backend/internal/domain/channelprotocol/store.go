@@ -6,13 +6,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/team/llmgateway/internal/pkg/idgen"
 )
 
 // cpCols 列出 channel_protocols 表查询使用的列。
-const cpCols = `id, name, base_url, protocols, request_headers, models,
+const cpCols = `id, name, base_url, protocols, request_headers, models, error_policy, features,
 	preset_source_id, edited, source_status, created_at, updated_at`
 
 // ErrNameExists 表示渠道协议名称唯一约束冲突（PG 23505）。
@@ -37,10 +38,10 @@ func marshalJSONB(v any) []byte {
 // scanChannelProtocol 将一行扫描到 *ChannelProtocol，解析 JSONB 列。
 func scanChannelProtocol(row interface{ Scan(...any) error }) (*ChannelProtocol, error) {
 	var cp ChannelProtocol
-	var protocolsRaw, headersRaw, modelsRaw []byte
+	var protocolsRaw, headersRaw, modelsRaw, errorPolicyRaw, featuresRaw []byte
 	var status string
 	err := row.Scan(&cp.ID, &cp.Name, &cp.BaseURL, &protocolsRaw, &headersRaw,
-		&modelsRaw, &cp.PresetSourceID, &cp.Edited, &status, &cp.CreatedAt, &cp.UpdatedAt)
+		&modelsRaw, &errorPolicyRaw, &featuresRaw, &cp.PresetSourceID, &cp.Edited, &status, &cp.CreatedAt, &cp.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -58,6 +59,16 @@ func scanChannelProtocol(row interface{ Scan(...any) error }) (*ChannelProtocol,
 	if len(modelsRaw) > 0 {
 		if err := json.Unmarshal(modelsRaw, &cp.Models); err != nil {
 			return nil, fmt.Errorf("parse models: %w", err)
+		}
+	}
+	if len(errorPolicyRaw) > 0 {
+		if err := json.Unmarshal(errorPolicyRaw, &cp.ErrorPolicy); err != nil {
+			return nil, fmt.Errorf("parse error_policy: %w", err)
+		}
+	}
+	if len(featuresRaw) > 0 {
+		if err := json.Unmarshal(featuresRaw, &cp.Features); err != nil {
+			return nil, fmt.Errorf("parse features: %w", err)
 		}
 	}
 	return &cp, nil
@@ -159,11 +170,11 @@ func insertOn(ctx context.Context, e execer, cp *ChannelProtocol) (*ChannelProto
 		cp.SourceStatus = SourceActive
 	}
 	row := e.QueryRowContext(ctx,
-		`INSERT INTO channel_protocols(id, name, base_url, protocols, request_headers, models,
+		`INSERT INTO channel_protocols(id, name, base_url, protocols, request_headers, models, error_policy, features,
 		        preset_source_id, edited, source_status)
-		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING `+cpCols,
+		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING `+cpCols,
 		cp.ID, cp.Name, cp.BaseURL, marshalJSONB(cp.Protocols),
-		marshalJSONB(cp.RequestHeaders), marshalJSONB(cp.Models),
+		marshalJSONB(cp.RequestHeaders), marshalJSONB(cp.Models), marshalJSONB(cp.ErrorPolicy), marshalJSONB(cp.Features),
 		cp.PresetSourceID, cp.Edited, cp.SourceStatus)
 	created, err := scanChannelProtocol(row)
 	if err != nil {
@@ -181,11 +192,11 @@ func (s *Store) Update(ctx context.Context, cp *ChannelProtocol) error {
 func updateOn(ctx context.Context, e execer, cp *ChannelProtocol) error {
 	res, err := e.ExecContext(ctx,
 		`UPDATE channel_protocols SET name=$1, base_url=$2, protocols=$3,
-		        request_headers=$4, models=$5, preset_source_id=$6, edited=$7, source_status=$8,
+		        request_headers=$4, models=$5, error_policy=$6, features=$7, preset_source_id=$8, edited=$9, source_status=$10,
 		        updated_at=now()
-		 WHERE id=$9 AND deleted_at IS NULL`,
+		 WHERE id=$11 AND deleted_at IS NULL`,
 		cp.Name, cp.BaseURL, marshalJSONB(cp.Protocols),
-		marshalJSONB(cp.RequestHeaders), marshalJSONB(cp.Models),
+		marshalJSONB(cp.RequestHeaders), marshalJSONB(cp.Models), marshalJSONB(cp.ErrorPolicy), marshalJSONB(cp.Features),
 		cp.PresetSourceID, cp.Edited, cp.SourceStatus, cp.ID)
 	if err != nil {
 		return classifyErr(err)
@@ -265,4 +276,55 @@ func (s *Store) MarkInitialSynced(ctx context.Context) error {
 		return fmt.Errorf("mark initial-synced: %w", err)
 	}
 	return nil
+}
+
+// dayLayout 是协议级错误统计的日期口径（DATE 列，仅到日）。
+const dayLayout = "2006-01-02"
+
+// ErrorStat 协议级错误统计的一项（按 category 聚合后的计数）。
+type ErrorStat struct {
+	Category string `json:"Category"`
+	Count    int64  `json:"Count"`
+}
+
+// IncrProtocolErrorStat 对 (protocol_id, category, day) 计数 +1（同步 upsert）。
+// 供网关在命中错误策略时按错误类别累加（量小，直接同步写）。
+// day 一律按 UTC 归日：写入侧与查询侧（ErrorStats 的 from/to，Handler 亦按 UTC 解析）统一为 UTC，
+// 避免本地时区跨日导致「写入落次日、查询按当日」的 off-by-one 漏计。
+func (s *Store) IncrProtocolErrorStat(ctx context.Context, protocolID int64, category string, day time.Time) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO protocol_error_stats(protocol_id, category, day, count)
+		 VALUES($1,$2,$3,1)
+		 ON CONFLICT (protocol_id, category, day)
+		 DO UPDATE SET count = protocol_error_stats.count + 1`,
+		protocolID, category, day.UTC().Format(dayLayout))
+	if err != nil {
+		return fmt.Errorf("incr protocol error stat: %w", err)
+	}
+	return nil
+}
+
+// ErrorStats 汇总某协议在 [from, to]（day 闭区间）内按 category 的计数（跨日累加，category 升序）。
+// from/to 同样按 UTC 归日，与写入侧（IncrProtocolErrorStat）口径一致。
+func (s *Store) ErrorStats(ctx context.Context, protocolID int64, from, to time.Time) ([]ErrorStat, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT category, COALESCE(SUM(count), 0) AS total
+		 FROM protocol_error_stats
+		 WHERE protocol_id=$1 AND day >= $2 AND day <= $3
+		 GROUP BY category
+		 ORDER BY category ASC`,
+		protocolID, from.UTC().Format(dayLayout), to.UTC().Format(dayLayout))
+	if err != nil {
+		return nil, fmt.Errorf("query protocol error stats: %w", err)
+	}
+	defer rows.Close()
+	out := make([]ErrorStat, 0, 8)
+	for rows.Next() {
+		var st ErrorStat
+		if err := rows.Scan(&st.Category, &st.Count); err != nil {
+			return nil, fmt.Errorf("scan protocol error stat: %w", err)
+		}
+		out = append(out, st)
+	}
+	return out, rows.Err()
 }
