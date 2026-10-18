@@ -220,6 +220,13 @@ func (f fakePriceSource) ReferencePrice(_ string) (PriceRef, bool) { return f.re
 func (fakePriceSource) SearchPrices(_ string) []CatalogEntry       { return nil }
 func (fakePriceSource) LastUpdated() time.Time                     { return time.Time{} }
 
+// namePriceSource 按模型外部名提供参考价：命中 map 视为有参考价，缺失视为无（用于验证 SyncPrices 的跳过分类）。
+type namePriceSource map[string]PriceRef
+
+func (m namePriceSource) ReferencePrice(name string) (PriceRef, bool) { r, ok := m[name]; return r, ok }
+func (namePriceSource) SearchPrices(_ string) []CatalogEntry          { return nil }
+func (namePriceSource) LastUpdated() time.Time                        { return time.Time{} }
+
 func TestService_PriceReferenceNotFound(t *testing.T) {
 	s, mock := mockService(t)
 	now := time.Now()
@@ -378,6 +385,58 @@ func TestService_SyncPrices_InvalidatesEvenOnError(t *testing.T) {
 	s.store.extNameMu.RUnlock()
 	if present {
 		t.Fatalf("出错路径也必须清空对外名缓存（否则旧售价无限期滞留）")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("mock expectations: %v", err)
+	}
+}
+
+// TestService_SyncPrices_SuccessInvalidatesOnce 锁定成功路径的计数断言：
+// 批量售价同步在循环内可能出现多行成功写入，但缓存失效必须**恰好一次**（循环后统一清空，
+// 避免逐行清空造成写放大），跨包 hook 也只回调一次；同时验证有/无参考价的分类（Skipped/Updated）。
+func TestService_SyncPrices_SuccessInvalidatesOnce(t *testing.T) {
+	s, mock := mockService(t)
+	// 只有 a/b 有参考价，c 无参考价 → 跳过（不进 Updated）。
+	s.SetPriceSource(namePriceSource{"a": {Input: 5}, "b": {Input: 5}})
+	fired := 0
+	s.SetNameWriteHook(func() { fired++ })
+
+	now := time.Now()
+	listQ := `SELECT ` + cols + ` FROM external_models WHERE deleted_at IS NULL ORDER BY id ASC`
+	rows := extRow(&ExternalModel{ID: 1, ExternalName: "a", CreatedAt: now, UpdatedAt: now}, `{"input":1}`)
+	rows.AddRow(int64(2), "b", "", true, `{"input":1}`, nil, nil, now, now)
+	rows.AddRow(int64(3), "c", "", true, `{"input":1}`, nil, nil, now, now)
+	mock.ExpectQuery(regexp.QuoteMeta(listQ)).WillReturnRows(rows)
+
+	// 两行成功写入（a/b）；c 无参考价不触发写。
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE external_models SET sale_rates=$1, updated_at=now() WHERE id=$2`)).
+		WithArgs(sqlmock.AnyArg(), int64(1)).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE external_models SET sale_rates=$1, updated_at=now() WHERE id=$2`)).
+		WithArgs(sqlmock.AnyArg(), int64(2)).WillReturnResult(sqlmock.NewResult(0, 1))
+
+	// 预置缓存条目，验证成功路径被清空。
+	s.store.cacheExternalName("a", nil)
+	s.store.cacheExternalName("b", nil)
+
+	res, err := s.SyncPrices(context.Background())
+	if err != nil {
+		t.Fatalf("SyncPrices: %v", err)
+	}
+	if len(res.Updated) != 2 || res.Updated[0] != "a" || res.Updated[1] != "b" {
+		t.Fatalf("Updated 分类错误，got %+v", res.Updated)
+	}
+	if len(res.Skipped) != 1 || res.Skipped[0] != "c" {
+		t.Fatalf("Skipped 分类错误，got %+v", res.Skipped)
+	}
+	// 关键计数断言：多行成功但缓存只失效一次（无写放大）。
+	if fired != 1 {
+		t.Fatalf("多行成功也应只失效一次（nameWriteHook），got %d", fired)
+	}
+	s.store.extNameMu.RLock()
+	remaining := len(s.store.extNameCache)
+	s.store.extNameMu.RUnlock()
+	if remaining != 0 {
+		t.Fatalf("成功路径必须清空对外名缓存，仍剩 %d 条", remaining)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("mock expectations: %v", err)

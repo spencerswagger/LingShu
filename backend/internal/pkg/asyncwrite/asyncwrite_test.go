@@ -643,3 +643,64 @@ func TestIdemKeyNamespacedByKind(t *testing.T) {
 		t.Fatal("同 Kind 同 idem 应判为重复")
 	}
 }
+
+// TestQueueFullThenShutdown 锁定「队列满 + 关停」组合（P1-1 与 Shutdown 的竞态路径）：
+// 队列已满且无消费者时，并发提交会阻塞于背压；此时并发 Shutdown 绝不能出现
+// 「向已关闭 channel 发送」的 panic，Submit 必须尽快返回非 nil 错误（背压或已关闭），
+// 关停后 Depth 归零、已持久化但从未执行的 WAL 记录保留待重放，且关停后拒绝新提交。
+func TestQueueFullThenShutdown(t *testing.T) {
+	walPath := filepath.Join(t.TempDir(), "wal.log")
+	w := New(Config{
+		WALPath:    walPath,
+		AsyncKinds: map[Kind]bool{KindCallLog: true},
+		Shards:     1,
+		QueueSize:  1, // 每分片容量 1
+	})
+	// 故意不 Start：无消费者，第一个任务占满分片队列后，后续提交进入背压。
+	if err := w.Submit(Job{
+		Kind: KindCallLog, Key: "k", IdempotencyKey: "idem-1", Payload: []byte("p1"),
+		Exec: func(context.Context) error { return nil },
+	}); err != nil {
+		t.Fatalf("首个提交失败: %v", err)
+	}
+
+	// 并发发起一个必然进入背压的提交，与 Shutdown 竞争（触发「关闭队列 vs 阻塞发送」路径）。
+	var wg sync.WaitGroup
+	var subErr error
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		subErr = w.Submit(Job{
+			Kind: KindCallLog, Key: "k", IdempotencyKey: "idem-2", Payload: []byte("p2"),
+			Exec: func(context.Context) error { return nil },
+		})
+	}()
+
+	// 关停不得 panic，且应正常返回。
+	if err := w.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown 失败: %v", err)
+	}
+	wg.Wait()
+
+	// 背压或已关闭二选一，但必须是错误（绝不静默成功）。
+	if subErr == nil {
+		t.Fatalf("队列满且关停时 Submit 必须返回错误")
+	}
+	// 未启动消费者时，首个入队任务保留在途（Depth=1）；与之竞争的提交被拒绝（背压或已关闭），
+	// 不产生净在途增量（在途计数不得泄漏）。
+	if got := w.Stats().Depth; got != 1 {
+		t.Fatalf("关停后在途任务数=%d，期望 1（仅首个入队且未执行的任务）", got)
+	}
+	// 已持久化但从未执行的记录必须保留（绝不静默丢弃），留待重启重放。
+	data, err := os.ReadFile(walPath)
+	if err != nil {
+		t.Fatalf("读取 WAL 失败: %v", err)
+	}
+	if !bytes.Contains(data, []byte("idem-1")) {
+		t.Fatalf("未执行的 WAL 记录必须保留待重放，实际文件=%q", string(data))
+	}
+	// 关停后不得再接受提交。
+	if err := w.Submit(Job{Kind: KindCallLog, Key: "z", Exec: func(context.Context) error { return nil }}); err == nil {
+		t.Fatal("关停后 Submit 必须返回错误")
+	}
+}

@@ -151,6 +151,9 @@ type fakeBilling struct {
 	estErr  error           // EstimateCredits（预扣估算）时返回
 	rec     *billing.Record // 可选：Record 返回值（缺省 CreditsConsumed=0）
 	credit  *fakeCredit     // 可选：模拟真实 Record→钱包扣减（净额验证用）
+	// 可选：强制预扣估算返回固定值（用于构造 pc.Credits==0 的端到端用例）。
+	estOverride    bool
+	estOverrideVal float64
 }
 
 func (f *fakeBilling) Record(ctx context.Context, req billing.RecordReq) (*billing.Record, error) {
@@ -184,6 +187,9 @@ func (f *fakeBilling) EstimateCredits(_ context.Context, req billing.RecordReq) 
 	if f.estErr != nil {
 		return 0, f.estErr
 	}
+	if f.estOverride {
+		return f.estOverrideVal, nil
+	}
 	return billing.ComputeCredits(req.Tokens, req.Rates, 1, 1, 10000)
 }
 
@@ -191,6 +197,9 @@ func (f *fakeBilling) EstimateCredits(_ context.Context, req billing.RecordReq) 
 func (f *fakeBilling) EstimateBreakdown(_ context.Context, req billing.RecordReq) (float64, float64, float64, int64, error) {
 	if f.estErr != nil {
 		return 0, 0, 0, 0, f.estErr
+	}
+	if f.estOverride {
+		return f.estOverrideVal, 1, 1, 10000, nil
 	}
 	credits, err := billing.ComputeCredits(req.Tokens, req.Rates, 1, 1, 10000)
 	return credits, 1, 1, 10000, err
@@ -203,11 +212,13 @@ type fakeCredit struct {
 	refunded []float64
 	settled  []float64
 	preErr   error // 预扣时强制返回的错误（用于钱包缺失 40401 等语义用例）
+	preCalls int   // PreConsume 被调用的次数（含 amount==0 的零金额预扣，用于验证「照常下发」契约）
 }
 
 func (f *fakeCredit) Balance(_ context.Context, _ int64) (float64, error) { return f.balance, nil }
 
 func (f *fakeCredit) PreConsume(_ context.Context, _ int64, amount float64, _, _, _ string) error {
+	f.preCalls++
 	if f.preErr != nil {
 		return f.preErr
 	}
@@ -1184,6 +1195,71 @@ func TestServeFundSemantics(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestServeZeroCredits_DispatchesPreConsume 端到端锁定「pc.Credits==0 仍照常下发预扣」契约：
+// 去掉独立余额读取后，预扣条件写是唯一的资金拦截点，故即便预扣估算为 0（pc.Credits==0）
+// 也必须照常下发（不得因金额为 0 短路跳过）：
+//   - 零余额 + pc.Credits==0 → 被零余额守卫拦截（402，不发起上游）；
+//   - 有余额 + pc.Credits==0 → 零金额预扣放行，正常走上游并 200。
+//
+// 两例均断言 PreConsume 恰好被调用一次，且不产生正额扣款（证明零金额预扣语义与条件写一致）。
+func TestServeZeroCredits_DispatchesPreConsume(t *testing.T) {
+	var called int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&called, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"x","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`))
+	}))
+	defer upstream.Close()
+
+	const body = `{"model":"gpt-4","stream":false,"max_tokens":2000,"messages":[{"role":"user","content":"hello"}]}`
+
+	t.Run("零余额且预扣为0→402", func(t *testing.T) {
+		before := atomic.LoadInt32(&called)
+		h := build(t, upstream.URL)
+		fc := &fakeCredit{balance: 0}
+		h.gw.credit = fc
+		h.billing.estOverride = true // 预扣估算强制为 0 → pc.Credits==0
+		rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t", body)
+		if rec.Code != http.StatusPaymentRequired {
+			t.Fatalf("want 402, got %d: %s", rec.Code, rec.Body.String())
+		}
+		if fc.preCalls != 1 {
+			t.Fatalf("即便 pc.Credits==0 也必须下发一次预扣（条件写是唯一拦截点），got %d", fc.preCalls)
+		}
+		if len(fc.consumed) != 0 {
+			t.Fatalf("零金额预扣不应产生正额扣款，got %+v", fc.consumed)
+		}
+		if atomic.LoadInt32(&called) != before {
+			t.Fatal("零余额拦截不得发起上游调用")
+		}
+		if len(h.billing.reqs) != 1 || !h.billing.reqs[0].Fail {
+			t.Fatalf("拦截应留 1 条 failed 账单，got %+v", h.billing.reqs)
+		}
+	})
+
+	t.Run("有余额且预扣为0→200", func(t *testing.T) {
+		before := atomic.LoadInt32(&called)
+		h := build(t, upstream.URL)
+		fc := &fakeCredit{balance: 5000}
+		h.gw.credit = fc
+		h.billing.estOverride = true // 预扣估算强制为 0 → pc.Credits==0
+		rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t", body)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
+		}
+		if fc.preCalls != 1 {
+			t.Fatalf("pc.Credits==0 也必须下发一次预扣，got %d", fc.preCalls)
+		}
+		if len(fc.consumed) != 0 {
+			t.Fatalf("零金额预扣不应扣款，got %+v", fc.consumed)
+		}
+		if got := atomic.LoadInt32(&called) - before; got != 1 {
+			t.Fatalf("有余额应正常走上游一次，got %d", got)
+		}
+	})
 }
 
 // 场景 F4：三阶段计费结算——预扣冻结 + 实际消费差额结算（多退少补）。
