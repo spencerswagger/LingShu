@@ -15,6 +15,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"hash/fnv"
 	"os"
 	"path/filepath"
@@ -47,6 +48,11 @@ const (
 // ErrBackpressure 表示队列背压超时：任务已写入 WAL（若启用）但未能入队。
 // 调用方可据此感知「未入队但记录已持久化」，由下次重启重放兜底，绝不静默丢弃。
 var ErrBackpressure = errors.New("asyncwrite: 队列背压超时，任务未能入队")
+
+// ErrWALUnavailable 表示配置了 WALPath 但 WAL 不可用（打开失败或运行期重开失败）。
+// 此时拒绝异步提交而非静默降级为纯内存模式，避免「持久化」类别（会话/渠道事件/调用日志）
+// 在无 WAL 兜底的情况下静默丢失（违背「绝不静默丢弃」契约）。装配层应在启动期据此致命化。
+var ErrWALUnavailable = errors.New("asyncwrite: WAL 不可用，拒绝写入（配置了 WALPath 但打开失败）")
 
 // Config 是 Writer 的构造配置；零值字段由 New 填充默认值。
 type Config struct {
@@ -113,6 +119,7 @@ type Writer struct {
 	// WAL 状态（walMu 保护）。
 	walMu         sync.Mutex
 	walFile       *os.File
+	walErr        error
 	pending       map[uint64][]byte
 	pendingOrder  []uint64
 	nextSeq       uint64
@@ -188,11 +195,16 @@ func New(cfg Config) *Writer {
 		if dir := filepath.Dir(cfg.WALPath); dir != "" && dir != "." {
 			if err := os.MkdirAll(dir, 0o755); err != nil {
 				logger.Fallback().Error("asyncwrite: 创建 WAL 目录失败", "err", err, "path", cfg.WALPath)
+				w.walErr = fmt.Errorf("asyncwrite: 创建 WAL 目录失败: %w", err)
 			}
 		}
 		f, err := os.OpenFile(cfg.WALPath, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
 		if err != nil {
 			logger.Fallback().Error("asyncwrite: 打开 WAL 失败", "err", err, "path", cfg.WALPath)
+			// 记录失败：配置了 WAL 却打不开时，绝不允许静默降级为内存模式（见 Err/appendWAL）。
+			if w.walErr == nil {
+				w.walErr = fmt.Errorf("asyncwrite: 打开 WAL 失败: %w", err)
+			}
 		} else {
 			w.walFile = f
 			w.loadRecovered(cfg.WALPath)
@@ -200,6 +212,11 @@ func New(cfg Config) *Writer {
 	}
 	return w
 }
+
+// Err 返回构造期 WAL 打开/目录创建错误（nil 表示 WAL 正常或未配置）。
+// 装配层应据此致命化启动：配置了 WALPath 却不可用时不得静默降级为内存模式，
+// 否则「持久化」类别（会话/渠道事件/调用日志）将失去 WAL 兜底，违背「绝不静默丢弃」契约。
+func (w *Writer) Err() error { return w.walErr }
 
 // loadRecovered 读取既有 WAL，登记为待处理记录并保存原始字节供 Start 时重放。
 func (w *Writer) loadRecovered(path string) {
@@ -512,11 +529,16 @@ func (w *Writer) finalize() error {
 	return nil
 }
 
-// appendWAL 追加一条 WAL 记录并返回其内存序号（内存模式返回 0）。
+// appendWAL 追加一条 WAL 记录并返回其内存序号（显式内存模式返回 0）。
+// 若配置了 WALPath 却不可用（打开/重开失败），返回 ErrWALUnavailable——绝不由调用方静默降级为内存模式。
 func (w *Writer) appendWAL(job Job) (uint64, error) {
 	w.walMu.Lock()
 	defer w.walMu.Unlock()
 	if w.walFile == nil {
+		if w.cfg.WALPath != "" {
+			// 配置了 WAL 却不可用：拒绝写入，避免无兜底的静默丢弃。
+			return 0, ErrWALUnavailable
+		}
 		return 0, nil
 	}
 	rec := encodeRecord(job.Kind, job.Key, job.IdempotencyKey, job.Payload)

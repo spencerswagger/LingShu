@@ -266,6 +266,11 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 			asyncwrite.KindCallLog:           true,
 		},
 	})
+	// 配置了 WALPath 却打不开（目录不可写/磁盘满）时致命化启动：绝不静默降级为内存模式，
+	// 否则会话/渠道事件/调用日志将失去 WAL 兜底、崩溃即丢，违背「绝不静默丢弃」契约。
+	if err := asyncWriter.Err(); err != nil {
+		return nil, fmt.Errorf("asyncwrite WAL 不可用（拒绝静默降级为内存模式）: %w", err)
+	}
 
 	// 安全组件：会话注册表 / 审计 / 限流 / preauth / TOTP
 	sessions := session.NewRegistry(func(ctx context.Context, userID int64) (session.Entry, error) {
