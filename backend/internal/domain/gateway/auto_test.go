@@ -38,12 +38,22 @@ type autoFakeRouter struct {
 	asked     []string
 }
 
-func (f *autoFakeRouter) RouteAll(_ context.Context, spec router.RouteSpec) ([]*router.ChannelRoute, error) {
+func (f *autoFakeRouter) routeByModel(spec router.RouteSpec) ([]*router.ChannelRoute, error) {
 	f.asked = append(f.asked, spec.ExternalModel)
 	if err := f.modelErrs[spec.ExternalModel]; err != nil {
 		return nil, err
 	}
 	return f.byModel[spec.ExternalModel], nil
+}
+
+func (f *autoFakeRouter) RouteAll(_ context.Context, spec router.RouteSpec) ([]*router.ChannelRoute, error) {
+	return f.routeByModel(spec)
+}
+
+// RouteAllWithExcluded 与 RouteAll 同源（handler 现走该方法），保持 asked 记录一致。
+func (f *autoFakeRouter) RouteAllWithExcluded(_ context.Context, spec router.RouteSpec) (*router.RouteAllResult, error) {
+	routes, err := f.routeByModel(spec)
+	return &router.RouteAllResult{Routes: routes}, err
 }
 
 // autoMember 构造一个成员（ExternalName 即成员对外模型名）。

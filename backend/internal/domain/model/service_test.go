@@ -3,6 +3,7 @@ package model
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
@@ -20,11 +21,20 @@ func saleRates() billing.Rates {
 }
 
 // extCols 与 store.cols 一致，供构造 mock 行。
-var extCols = []string{"id", "external_name", "description", "enabled", "sale_rates", "time_config", "context_tiers", "created_at", "updated_at"}
+var extCols = []string{"id", "external_name", "description", "enabled", "sale_rates", "time_config", "context_tiers", "aliases", "created_at", "updated_at"}
+
+// extNameQuery 与 store.GetByExternalName 一致（含别名包含判定），供构造 mock 期望。
+const extNameQuery = `SELECT ` + cols + ` FROM external_models WHERE (external_name = $1 OR aliases @> to_jsonb(ARRAY[$1::text])) AND enabled = true AND deleted_at IS NULL LIMIT 1`
 
 func extRow(m *ExternalModel, saleJSON string) *sqlmock.Rows {
+	aliasesJSON := `[]`
+	if len(m.Aliases) > 0 {
+		if b, err := json.Marshal(m.Aliases); err == nil {
+			aliasesJSON = string(b)
+		}
+	}
 	rows := sqlmock.NewRows(extCols).
-		AddRow(m.ID, m.ExternalName, m.Description, m.Enabled, saleJSON, nil, nil, m.CreatedAt, m.UpdatedAt)
+		AddRow(m.ID, m.ExternalName, m.Description, m.Enabled, saleJSON, nil, nil, aliasesJSON, m.CreatedAt, m.UpdatedAt)
 	return rows
 }
 
@@ -46,8 +56,8 @@ func TestService_CreateModel(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + cols + ` FROM external_models WHERE external_name = $1`)).
 		WithArgs("qw-max").
 		WillReturnError(sql.ErrNoRows)
-	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO external_models(id, external_name, description, enabled, sale_rates, time_config, context_tiers) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING `+cols)).
-		WithArgs(sqlmock.AnyArg(), "qw-max", "", true, sqlmock.AnyArg(), nil, nil).
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO external_models(id, external_name, description, enabled, sale_rates, time_config, context_tiers, aliases) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING `+cols)).
+		WithArgs(sqlmock.AnyArg(), "qw-max", "", true, sqlmock.AnyArg(), nil, nil, sqlmock.AnyArg()).
 		WillReturnRows(extRow(&ExternalModel{ID: 1, ExternalName: "qw-max", Enabled: true, CreatedAt: now, UpdatedAt: now}, `{"input":1}`))
 
 	m, err := s.CreateModel(context.Background(), ExternalModelInput{
@@ -134,8 +144,8 @@ func TestService_UpdateModel(t *testing.T) {
 		WithArgs(int64(1)).
 		WillReturnRows(extRow(&ExternalModel{ID: 1, ExternalName: "qw-max", Enabled: true, CreatedAt: now, UpdatedAt: now}, `{}`))
 	// external 未变，跳过唯一性预检查
-	mock.ExpectExec(regexp.QuoteMeta(`UPDATE external_models SET external_name=$1, description=$2, enabled=$3, sale_rates=$4, time_config=$5, context_tiers=$6, updated_at=now() WHERE id=$7`)).
-		WithArgs("qw-max", "desc", true, sqlmock.AnyArg(), nil, nil, int64(1)).
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE external_models SET external_name=$1, description=$2, enabled=$3, sale_rates=$4, time_config=$5, context_tiers=$6, aliases=$7, updated_at=now() WHERE id=$8`)).
+		WithArgs("qw-max", "desc", true, sqlmock.AnyArg(), nil, nil, sqlmock.AnyArg(), int64(1)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + cols + ` FROM external_models WHERE id = $1`)).
 		WithArgs(int64(1)).
@@ -158,7 +168,7 @@ func TestService_UpdateModel(t *testing.T) {
 func TestService_GetByExternalName(t *testing.T) {
 	s, mock := mockService(t)
 	now := time.Now()
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + cols + ` FROM external_models WHERE external_name = $1 AND enabled = true AND deleted_at IS NULL LIMIT 1`)).
+	mock.ExpectQuery(regexp.QuoteMeta(extNameQuery)).
 		WithArgs("qw-max").
 		WillReturnRows(extRow(&ExternalModel{ID: 2, ExternalName: "qw-max", Enabled: true, CreatedAt: now, UpdatedAt: now}, `{}`))
 
@@ -173,7 +183,7 @@ func TestService_GetByExternalName(t *testing.T) {
 
 func TestService_GetByExternalName_NotFound(t *testing.T) {
 	s, mock := mockService(t)
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + cols + ` FROM external_models WHERE external_name = $1 AND enabled = true AND deleted_at IS NULL LIMIT 1`)).
+	mock.ExpectQuery(regexp.QuoteMeta(extNameQuery)).
 		WithArgs("nope").
 		WillReturnError(sql.ErrNoRows)
 
@@ -277,7 +287,7 @@ func boolPtr(b bool) *bool { return &b }
 func TestService_GetByExternalName_CacheZeroDBAndInvalidate(t *testing.T) {
 	s, mock := mockService(t)
 	now := time.Now()
-	q := regexp.QuoteMeta(`SELECT ` + cols + ` FROM external_models WHERE external_name = $1 AND enabled = true AND deleted_at IS NULL LIMIT 1`)
+	q := regexp.QuoteMeta(extNameQuery)
 
 	// 首次读取回源一次。
 	mock.ExpectQuery(q).WithArgs("qw-max").
@@ -327,8 +337,8 @@ func TestService_NameWriteHookFired(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + cols + ` FROM external_models WHERE external_name = $1`)).
 		WithArgs("qw-max").
 		WillReturnError(sql.ErrNoRows)
-	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO external_models(id, external_name, description, enabled, sale_rates, time_config, context_tiers) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING `+cols)).
-		WithArgs(sqlmock.AnyArg(), "qw-max", "", true, sqlmock.AnyArg(), nil, nil).
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO external_models(id, external_name, description, enabled, sale_rates, time_config, context_tiers, aliases) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING `+cols)).
+		WithArgs(sqlmock.AnyArg(), "qw-max", "", true, sqlmock.AnyArg(), nil, nil, sqlmock.AnyArg()).
 		WillReturnRows(extRow(&ExternalModel{ID: 1, ExternalName: "qw-max", Enabled: true, CreatedAt: now, UpdatedAt: now}, `{"input":1}`))
 
 	if _, err := s.CreateModel(context.Background(), ExternalModelInput{ExternalName: "qw-max", SaleRates: saleRates()}); err != nil {
@@ -364,7 +374,7 @@ func TestService_SyncPrices_InvalidatesEvenOnError(t *testing.T) {
 	now := time.Now()
 	listQ := `SELECT ` + cols + ` FROM external_models WHERE deleted_at IS NULL ORDER BY id ASC`
 	rows := extRow(&ExternalModel{ID: 1, ExternalName: "a", CreatedAt: now, UpdatedAt: now}, `{"input":1}`)
-	rows.AddRow(int64(2), "b", "", true, `{"input":1}`, nil, nil, now, now)
+	rows.AddRow(int64(2), "b", "", true, `{"input":1}`, nil, nil, `[]`, now, now)
 	mock.ExpectQuery(regexp.QuoteMeta(listQ)).WillReturnRows(rows)
 	// 第 1 行成功写入。
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE external_models SET sale_rates=$1, updated_at=now() WHERE id=$2`)).
@@ -402,8 +412,8 @@ func TestService_SyncPrices_SuccessInvalidatesOnce(t *testing.T) {
 	now := time.Now()
 	listQ := `SELECT ` + cols + ` FROM external_models WHERE deleted_at IS NULL ORDER BY id ASC`
 	rows := extRow(&ExternalModel{ID: 1, ExternalName: "a", CreatedAt: now, UpdatedAt: now}, `{"input":1}`)
-	rows.AddRow(int64(2), "b", "", true, `{"input":1}`, nil, nil, now, now)
-	rows.AddRow(int64(3), "c", "", true, `{"input":1}`, nil, nil, now, now)
+	rows.AddRow(int64(2), "b", "", true, `{"input":1}`, nil, nil, `[]`, now, now)
+	rows.AddRow(int64(3), "c", "", true, `{"input":1}`, nil, nil, `[]`, now, now)
 	mock.ExpectQuery(regexp.QuoteMeta(listQ)).WillReturnRows(rows)
 
 	// 两行成功写入（a/b）；c 无参考价不触发写。
@@ -450,7 +460,7 @@ func TestService_SyncPrices_AllSkippedNoInvalidate(t *testing.T) {
 	now := time.Now()
 	listQ := `SELECT ` + cols + ` FROM external_models WHERE deleted_at IS NULL ORDER BY id ASC`
 	rows := extRow(&ExternalModel{ID: 1, ExternalName: "a", CreatedAt: now, UpdatedAt: now}, `{"input":1}`)
-	rows.AddRow(int64(2), "b", "", true, `{"input":1}`, nil, nil, now, now)
+	rows.AddRow(int64(2), "b", "", true, `{"input":1}`, nil, nil, `[]`, now, now)
 	mock.ExpectQuery(regexp.QuoteMeta(listQ)).WillReturnRows(rows)
 
 	// 预置缓存条目：全部跳过时不得被清空。
@@ -497,7 +507,7 @@ func TestStore_ExternalNameCacheBounded(t *testing.T) {
 func TestStore_GetByExternalName_DefensiveCopy(t *testing.T) {
 	s, mock := mockService(t)
 	now := time.Now()
-	q := regexp.QuoteMeta(`SELECT ` + cols + ` FROM external_models WHERE external_name = $1 AND enabled = true AND deleted_at IS NULL LIMIT 1`)
+	q := regexp.QuoteMeta(extNameQuery)
 	mock.ExpectQuery(q).WithArgs("qw-max").
 		WillReturnRows(extRow(&ExternalModel{ID: 2, ExternalName: "qw-max", Enabled: true,
 			SaleRates: billing.Rates{"input": 1}, CreatedAt: now, UpdatedAt: now}, `{"input":1}`))
@@ -595,7 +605,7 @@ func TestStore_GetByExternalName_DisabledAlwaysQueriesDB(t *testing.T) {
 	s.SetReadCacheEnabled(false)
 
 	now := time.Now()
-	q := regexp.QuoteMeta(`SELECT ` + cols + ` FROM external_models WHERE external_name = $1 AND enabled = true AND deleted_at IS NULL LIMIT 1`)
+	q := regexp.QuoteMeta(extNameQuery)
 	for i := 0; i < 2; i++ {
 		mock.ExpectQuery(q).WithArgs("qw-max").
 			WillReturnRows(extRow(&ExternalModel{ID: 2, ExternalName: "qw-max", Enabled: true, CreatedAt: now, UpdatedAt: now}, `{"input":1}`))

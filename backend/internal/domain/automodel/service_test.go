@@ -689,12 +689,12 @@ func TestService_ResolveMembers_DefensiveCopy(t *testing.T) {
 }
 
 // extModelSelectSQL 与 model 包 Store.GetByID 一致（跨包测试硬编码；列序与 external_models 表一致）。
-const extModelSelectSQL = `SELECT id, external_name, description, enabled, sale_rates, time_config, context_tiers, created_at, updated_at FROM external_models WHERE id = $1 AND deleted_at IS NULL`
+const extModelSelectSQL = `SELECT id, external_name, description, enabled, sale_rates, time_config, context_tiers, aliases, created_at, updated_at FROM external_models WHERE id = $1 AND deleted_at IS NULL`
 
 // extModelRow 构造 external_models 全列查询的一行（列序与 extModelSelectSQL 一致）。
 func extModelRow(id int64, name string, enabled bool, now time.Time) *sqlmock.Rows {
-	return sqlmock.NewRows([]string{"id", "external_name", "description", "enabled", "sale_rates", "time_config", "context_tiers", "created_at", "updated_at"}).
-		AddRow(id, name, "", enabled, `{"input":1,"output":2,"cache_read":0.1}`, nil, nil, now, now)
+	return sqlmock.NewRows([]string{"id", "external_name", "description", "enabled", "sale_rates", "time_config", "context_tiers", "aliases", "created_at", "updated_at"}).
+		AddRow(id, name, "", enabled, `{"input":1,"output":2,"cache_read":0.1}`, nil, nil, `[]`, now, now)
 }
 
 // TestCrossPackage_ModelWriteInvalidatesResolveCache 跨包失效链路集成（P1-4）：

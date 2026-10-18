@@ -11,6 +11,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -36,12 +37,13 @@ func (f *fakeToken) LookupByPlain(_ context.Context, _ string) (*identity.Token,
 }
 
 type fakeRouter struct {
-	result  *router.RouteResult
-	routes  []*router.ChannelRoute
-	err     error
-	spec    router.RouteSpec
-	sess    *router.SessionRegistry
-	sessNow func() time.Time // 会话注册表时钟（与网关共用 mock clock）
+	result   *router.RouteResult
+	routes   []*router.ChannelRoute
+	excluded []router.ExcludedCandidate
+	err      error
+	spec     router.RouteSpec
+	sess     *router.SessionRegistry
+	sessNow  func() time.Time // 会话注册表时钟（与网关共用 mock clock）
 }
 
 func (f *fakeRouter) Route(_ context.Context, spec router.RouteSpec) (*router.RouteResult, error) {
@@ -50,7 +52,17 @@ func (f *fakeRouter) Route(_ context.Context, spec router.RouteSpec) (*router.Ro
 }
 
 func (f *fakeRouter) RouteAll(_ context.Context, spec router.RouteSpec) ([]*router.ChannelRoute, error) {
+	return f.routesOrErr()
+}
+
+// RouteAllWithExcluded 与 RouteAll 同源，额外携带被排除候选（决策轨迹测试用）。
+func (f *fakeRouter) RouteAllWithExcluded(_ context.Context, spec router.RouteSpec) (*router.RouteAllResult, error) {
 	f.spec = spec
+	routes, err := f.routesOrErr()
+	return &router.RouteAllResult{Routes: routes, Excluded: f.excluded}, err
+}
+
+func (f *fakeRouter) routesOrErr() ([]*router.ChannelRoute, error) {
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -2028,5 +2040,260 @@ func TestMissingUsageEstimate(t *testing.T) {
 	}
 	if u.Input <= 0 {
 		t.Fatalf("input 字段应计入输入估算, got %+v", u)
+	}
+}
+
+// Step 2：路由层排除项（排空）并入决策轨迹——skipped 项置于已尝试候选之前，
+// 且带稳定 reason 与运维动作 hint；无排除项时行为不变（见其余既有用例）。
+func TestDecision_ExcludedPrependedBeforeTried(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(testOKBody))
+	}))
+	defer upstream.Close()
+
+	h := build(t, upstream.URL)
+	h.rrouter.routes = []*router.ChannelRoute{
+		{ChannelID: 1, ChannelKeyID: 1, ModelRowID: 7, InternalModelID: "gpt-4-internal", ExternalModelID: 1},
+	}
+	h.rrouter.excluded = []router.ExcludedCandidate{
+		{ChannelID: 2, ChannelName: "ch2", ChannelKeyID: 21, InternalModelID: "gpt-4-internal", Reason: router.ExcludeDrained},
+	}
+
+	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t",
+		`{"model":"gpt-4","stream":false,"messages":[{"role":"user","content":"ping"}]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(h.clogs.inserted) != 1 {
+		t.Fatalf("want 1 call log, got %d", len(h.clogs.inserted))
+	}
+	dec, ok := h.clogs.inserted[0].Decision.(map[string]any)
+	if !ok {
+		t.Fatalf("decision missing: %v", h.clogs.inserted[0].Decision)
+	}
+	raw, _ := json.Marshal(dec)
+	var sdec struct {
+		Attempts []map[string]any `json:"attempts"`
+	}
+	if err := json.Unmarshal(raw, &sdec); err != nil {
+		t.Fatalf("unmarshal decision: %v", err)
+	}
+	if len(sdec.Attempts) != 2 {
+		t.Fatalf("want 2 attempts（排除项 + 成功候选）, got %+v", sdec.Attempts)
+	}
+	first := sdec.Attempts[0]
+	if first["reason"] != "drained" || first["skipped"] != true {
+		t.Errorf("排除项应为 drained/skipped，got %+v", first)
+	}
+	if first["hint"] == nil || first["hint"] == "" {
+		t.Errorf("排除项应带运维动作 hint，got %+v", first)
+	}
+	if sdec.Attempts[1]["reason"] != "success" {
+		t.Errorf("末项应为 success，got %+v", sdec.Attempts[1])
+	}
+}
+
+// Step 4：「所有候选因排空被排除」→ 503，且调用日志 decision.attempts 含 drained skipped 项，
+// 请求级结论 attempt_trail 含排空步骤（不再静默无记录）。
+func TestDrainTrail_AllDrainedRecorded(t *testing.T) {
+	h := build(t, "http://unused")
+	h.rrouter.err = &router.RouteError{Kind: router.KindNoAvailable, HTTPStatus: http.StatusServiceUnavailable, Message: msgNoAvailable}
+	h.rrouter.excluded = []router.ExcludedCandidate{
+		{ChannelID: 1, ChannelName: "ch1", ChannelKeyID: 11, InternalModelID: "gpt-4-internal", Reason: router.ExcludeDrained},
+	}
+	dump := withLogCapture(h)
+
+	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t", `{"model":"gpt-4","stream":false}`)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("want 503, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(h.clogs.inserted) != 1 {
+		t.Fatalf("want 1 call log with decision, got %d", len(h.clogs.inserted))
+	}
+	dec, ok := h.clogs.inserted[0].Decision.(map[string]any)
+	if !ok {
+		t.Fatalf("decision missing: %v", h.clogs.inserted[0].Decision)
+	}
+	raw, _ := json.Marshal(dec)
+	var sdec struct {
+		Attempts []map[string]any `json:"attempts"`
+		Result   string           `json:"result"`
+	}
+	if err := json.Unmarshal(raw, &sdec); err != nil {
+		t.Fatalf("unmarshal decision: %v", err)
+	}
+	if len(sdec.Attempts) != 1 || sdec.Attempts[0]["reason"] != "drained" || sdec.Attempts[0]["skipped"] != true {
+		t.Fatalf("decision attempts want 1 drained skipped, got %+v", sdec.Attempts)
+	}
+	if sdec.Result != "rejected" {
+		t.Errorf("decision result want rejected, got %q", sdec.Result)
+	}
+	out := dump()
+	if !strings.Contains(out, "attempt_trail=") || !strings.Contains(out, "drained") {
+		t.Errorf("请求级结论应含排空步骤 attempt_trail：\n%s", out)
+	}
+}
+
+// Step 5：流式上游失败诊断——「未送达」时结构化日志与调用日志均带
+// delivered / first_byte_received / elapsed_ms，且两条中文文案保持不变（此处为连接失败文案）。
+func TestStreamDiag_NotDeliveredFields(t *testing.T) {
+	dead := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	deadURL := dead.URL
+	dead.Close() // 关闭监听 → 连接被拒（请求未送达）
+
+	h := build(t, deadURL)
+	dump := withLogCapture(h)
+
+	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t", `{"model":"gpt-4","stream":true}`)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("want 503（单候选流式连接失败转移后无可用渠道）, got %d: %s", rec.Code, rec.Body.String())
+	}
+	out := dump()
+	for _, want := range []string{"upstream call failed", "kind=connect_failed", "stage=stream",
+		"delivered=false", "first_byte_received=false", "elapsed_ms="} {
+		if !strings.Contains(out, want) {
+			t.Errorf("流式失败诊断日志缺少 %q\n%s", want, out)
+		}
+	}
+	if len(h.clogs.inserted) == 0 {
+		t.Fatalf("want call log for stream connect failure")
+	}
+	cl := h.clogs.inserted[0]
+	if cl.ErrorMessage != "上游流式连接失败" {
+		t.Errorf("文案应保持「上游流式连接失败」, got %q", cl.ErrorMessage)
+	}
+	dec, ok := cl.Decision.(map[string]any)
+	if !ok {
+		t.Fatalf("decision missing: %v", cl.Decision)
+	}
+	if dec["delivered"] != false {
+		t.Errorf("调用日志 decision delivered want false, got %v", dec["delivered"])
+	}
+	if _, ok := dec["first_byte_received"]; !ok {
+		t.Errorf("调用日志 decision 缺 first_byte_received: %v", dec)
+	}
+	if _, ok := dec["elapsed_ms"]; !ok {
+		t.Errorf("调用日志 decision 缺 elapsed_ms: %v", dec)
+	}
+}
+
+// noWriteTraceTransport 模拟「请求未送达上游」的连接阶段失败：首次调用直接返回错误且不触发
+// WroteRequest 轨迹 → httptrace 判定 wrote=false，即 delivered=false（可安全转移）；
+// 后续调用交给真实 transport，用于验证 failover 到下一候选后能成功。
+type noWriteTraceTransport struct {
+	calls int32
+	real  http.RoundTripper
+}
+
+func (t *noWriteTraceTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if atomic.AddInt32(&t.calls, 1) == 1 {
+		return nil, errors.New("dial tcp 127.0.0.1:0: connect: connection refused")
+	}
+	if t.real == nil {
+		t.real = http.DefaultTransport
+	}
+	return t.real.RoundTrip(req)
+}
+
+// wroteThenFailTransport 模拟「请求已送达上游后失败」：先主动触发 WroteRequest（wrote=true，
+// 即 delivered=true），再返回错误——对应上游可能已生成并计费、不可转移的响应超时场景。
+type wroteThenFailTransport struct{ calls int32 }
+
+func (t *wroteThenFailTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	atomic.AddInt32(&t.calls, 1)
+	if tr := httptrace.ContextClientTrace(req.Context()); tr != nil && tr.WroteRequest != nil {
+		tr.WroteRequest(httptrace.WroteRequestInfo{Err: nil})
+	}
+	return nil, errors.New("read tcp 127.0.0.1:0: read: connection reset by peer")
+}
+
+// Step 9：流式「未送达」——连接阶段失败（delivered=false）→ 可 failover 到下一候选；
+// 结构化日志与失败候选调用日志均带 delivered=false。
+func TestStreamDelivered_ConnectFailureFailsOver(t *testing.T) {
+	live := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n"))
+	}))
+	defer live.Close()
+
+	h := build(t, live.URL)
+	addSecondKey(h, live.URL, "k2-secret")
+	// 第一候选：连接阶段失败（未送达）→ 安全转移到第二候选成功。
+	tt := &noWriteTraceTransport{}
+	h.gw.streamClient = &http.Client{Transport: tt}
+	dump := withLogCapture(h)
+
+	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t", `{"model":"gpt-4","stream":true}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("未送达应可 failover 到下一候选并成功, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "data:") {
+		t.Fatalf("应透传下一候选 SSE 内容, got %q", rec.Body.String())
+	}
+	if got := atomic.LoadInt32(&tt.calls); got != 2 {
+		t.Fatalf("未送达候选应发起一次失败调用后 failover 到下一候选（共 2 次）, got %d", got)
+	}
+	out := dump()
+	if !strings.Contains(out, "delivered=false") {
+		t.Errorf("结构化日志应含 delivered=false：\n%s", out)
+	}
+	var connFailed *CallLog
+	for _, cl := range h.clogs.inserted {
+		if cl.ErrorMessage == "上游流式连接失败" {
+			connFailed = cl
+		}
+	}
+	if connFailed == nil {
+		t.Fatalf("应有一条「上游流式连接失败」调用日志, got %+v", h.clogs.inserted)
+	}
+	dec, ok := connFailed.Decision.(map[string]any)
+	if !ok || dec["delivered"] != false {
+		t.Errorf("未送达候选 decision.delivered want false, got %v", connFailed.Decision)
+	}
+}
+
+// Step 9：流式「已送达」——请求送达后失败（delivered=true）→ 回 502 且不转移
+//（即便仍有候选）；结构化日志与调用日志均带 delivered=true。
+func TestStreamDelivered_AfterDeliveredNoFailover(t *testing.T) {
+	live := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer live.Close()
+
+	h := build(t, live.URL)
+	addSecondKey(h, live.URL, "k2-secret")
+	// 请求已送达后失败（多为响应超时）：不转移，直接回 502。
+	tt := &wroteThenFailTransport{}
+	h.gw.streamClient = &http.Client{Transport: tt}
+	dump := withLogCapture(h)
+
+	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t", `{"model":"gpt-4","stream":true}`)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("已送达后失败应回 502 且不转移, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := atomic.LoadInt32(&tt.calls); got != 1 {
+		t.Fatalf("已送达不应触发第二次上游调用, got %d", got)
+	}
+	out := dump()
+	if !strings.Contains(out, "delivered=true") {
+		t.Errorf("结构化日志应含 delivered=true：\n%s", out)
+	}
+	var deliveredFailed *CallLog
+	for _, cl := range h.clogs.inserted {
+		if cl.ErrorMessage == "上游流式请求失败（已送达，不转移）" {
+			deliveredFailed = cl
+		}
+	}
+	if deliveredFailed == nil {
+		t.Fatalf("应有一条「已送达，不转移」调用日志, got %+v", h.clogs.inserted)
+	}
+	dec, ok := deliveredFailed.Decision.(map[string]any)
+	if !ok || dec["delivered"] != true {
+		t.Errorf("已送达候选 decision.delivered want true, got %v", deliveredFailed.Decision)
 	}
 }

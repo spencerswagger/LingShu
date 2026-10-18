@@ -83,6 +83,32 @@ type ChannelRoute struct {
 	TimeCoeff float64
 }
 
+// 路由层排除原因（稳定枚举字符串：供决策轨迹展示与运维动作映射，勿随文案改动）。
+const (
+	ExcludeNoBinding   = "no_binding"   // 对外模型未绑定任何渠道内部模型
+	ExcludeTagNoRoute  = "tag_no_route" // 标签过滤后无候选
+	ExcludeDrained     = "drained"      // 排空候选被剔出新会话候选集
+	ExcludeNoCandidate = "no_candidate" // 无可用候选（密钥/内部模型均不可用）
+)
+
+// ExcludedCandidate 描述一个在路由层被排除、未进入候选的项（决策轨迹用）。
+// 对「无绑定 / 标签无路由 / 无候选」这类没有具体候选身份的排除点，仅 Reason 有效，
+// 身份字段为零值；「排空」则按候选逐条记录，使轨迹可见（不再静默无记录）。
+type ExcludedCandidate struct {
+	ChannelID       int64
+	ChannelName     string
+	ChannelKeyID    int64
+	InternalModelID string
+	Reason          string
+}
+
+// RouteAllResult 是 RouteAll 的完整结果：候选序列 + 被排除候选。
+// Excluded 为向后兼容的新增可空字段（无排除时为 nil）；既有候选序列语义不变。
+type RouteAllResult struct {
+	Routes   []*ChannelRoute
+	Excluded []ExcludedCandidate
+}
+
 // RouteErrorKind 区分不同路由失败原因。
 type RouteErrorKind int
 
@@ -210,6 +236,7 @@ func (e *Engine) CostSample() billing.Usage {
 // candidate 是路由候选的运行时视图（候选 = (渠道, 密钥, 模型) 三元组）。
 type candidate struct {
 	id        int64
+	chName    string // 渠道名（决策轨迹排除项展示用）
 	keyID     int64
 	modelRow  int64
 	internal  string
@@ -252,9 +279,19 @@ func (e *Engine) Route(ctx context.Context, spec RouteSpec) (*RouteResult, error
 //   - 会话命中（含排空，禁用除外）排首；
 //   - 其余为「密钥与模型都正常」的候选，按 priority 降序 → 成本升序 → 存活会话数升序 → 稳定 id 排序。
 func (e *Engine) RouteAll(ctx context.Context, spec RouteSpec) ([]*ChannelRoute, error) {
-	cands, extID, err := e.collectCandidates(ctx, spec)
+	res, err := e.RouteAllWithExcluded(ctx, spec)
 	if err != nil {
 		return nil, err
+	}
+	return res.Routes, nil
+}
+
+// RouteAllWithExcluded 与 RouteAll 同语义，但额外返回路由层被排除的候选（决策轨迹用）。
+// 即便路由失败（无可用候选等），也会返回已收集的排除项，使「仅因排空而无候选」留下轨迹。
+func (e *Engine) RouteAllWithExcluded(ctx context.Context, spec RouteSpec) (*RouteAllResult, error) {
+	cands, extID, excluded, err := e.collectCandidates(ctx, spec)
+	if err != nil {
+		return &RouteAllResult{Excluded: excluded}, err
 	}
 	out := make([]*ChannelRoute, 0, len(cands))
 	for _, c := range cands {
@@ -270,26 +307,28 @@ func (e *Engine) RouteAll(ctx context.Context, spec RouteSpec) ([]*ChannelRoute,
 			TimeCoeff:       c.timeCoeff,
 		})
 	}
-	return out, nil
+	return &RouteAllResult{Routes: out, Excluded: excluded}, nil
 }
 
 // collectCandidates 解析对外模型并返回排序后的候选集合：
 // 首位为会话命中候选（可排空，不可禁用），其余为双正常候选（按成本最优排序）。
-func (e *Engine) collectCandidates(ctx context.Context, spec RouteSpec) ([]candidate, int64, error) {
+// 同时返回路由层被排除的候选（决策轨迹用；路由失败时也返回已收集者）。
+func (e *Engine) collectCandidates(ctx context.Context, spec RouteSpec) ([]candidate, int64, []ExcludedCandidate, error) {
 	ext, err := e.models.GetByExternalName(ctx, spec.ExternalModel)
 	if err != nil {
 		if errors.Is(err, model.ErrNotFound) {
-			return nil, 0, modelNotFound(spec.ExternalModel)
+			return nil, 0, nil, modelNotFound(spec.ExternalModel)
 		}
-		return nil, 0, fmt.Errorf("resolve external model: %w", err)
+		return nil, 0, nil, fmt.Errorf("resolve external model: %w", err)
 	}
 
 	cms, err := e.cmSrc.ListByExternal(ctx, ext.ID)
 	if err != nil {
-		return nil, 0, fmt.Errorf("list bound channel models: %w", err)
+		return nil, 0, nil, fmt.Errorf("list bound channel models: %w", err)
 	}
 	if len(cms) == 0 {
-		return nil, 0, noAvailable()
+		// 对外模型未绑定任何渠道内部模型 → 记录排除项（可定位到「无绑定」）。
+		return nil, 0, []ExcludedCandidate{{Reason: ExcludeNoBinding}}, noAvailable()
 	}
 	// 每行绑定记录都是独立候选：同渠道/密钥下多个内部模型各自展开（若按行展开前先归并，
 	// 会导致某个内部模型禁用时渠道整体被跳过，或退而用同渠道另一行顶替，语义都会错乱；
@@ -315,11 +354,13 @@ func (e *Engine) collectCandidates(ctx context.Context, spec RouteSpec) ([]candi
 		}
 		cands = filtered
 		if len(cands) == 0 {
-			return nil, 0, noRoute()
+			// 标签过滤后为空 → 记录排除项（可定位到「标签无路由」）。
+			return nil, 0, []ExcludedCandidate{{Reason: ExcludeTagNoRoute}}, noRoute()
 		}
 	}
 	if len(cands) == 0 {
-		return nil, 0, noAvailable()
+		// 无可用候选（密钥/内部模型均不可用）→ 记录排除项。
+		return nil, 0, []ExcludedCandidate{{Reason: ExcludeNoCandidate}}, noAvailable()
 	}
 
 	// 会话命中：命中的 (密钥,模型) 即使排空也放行（禁用已被 usable 排除），并排首位。
@@ -328,6 +369,7 @@ func (e *Engine) collectCandidates(ctx context.Context, spec RouteSpec) ([]candi
 	now := e.now()
 	sample, globalTC := e.costContext()
 	normal := make([]candidate, 0, len(cands))
+	var excluded []ExcludedCandidate
 	var sessionCand *candidate
 	for i := range cands {
 		c := cands[i]
@@ -343,16 +385,26 @@ func (e *Engine) collectCandidates(ctx context.Context, spec RouteSpec) ([]candi
 		}
 		if c.mState == channel.StateNormal && c.keyState == channel.StateNormal {
 			normal = append(normal, c)
+		} else {
+			// 排空（非会话命中）候选被剔出新会话候选集 → 记录排除项（不再静默丢失）。
+			excluded = append(excluded, ExcludedCandidate{
+				ChannelID:       c.id,
+				ChannelName:     c.chName,
+				ChannelKeyID:    c.keyID,
+				InternalModelID: c.internal,
+				Reason:          ExcludeDrained,
+			})
 		}
 	}
 	ordered := e.orderCandidates(normal, now, sample, globalTC)
 	if sessionCand != nil {
-		return append([]candidate{*sessionCand}, ordered...), ext.ID, nil
+		return append([]candidate{*sessionCand}, ordered...), ext.ID, excluded, nil
 	}
 	if len(ordered) == 0 {
-		return nil, 0, noAvailable()
+		// 仅因排空而无候选：excluded 已携带排空项，随结果一并返回。
+		return nil, 0, excluded, noAvailable()
 	}
-	return ordered, ext.ID, nil
+	return ordered, ext.ID, excluded, nil
 }
 
 // internalBinding 某渠道的一条内部模型绑定（同一对外模型下同渠道/密钥可有多个内部模型，各为独立候选）。
@@ -414,6 +466,7 @@ func (e *Engine) usableCandidates(internalByChannel map[int64][]internalBinding)
 				}
 				cands = append(cands, candidate{
 					id:        v.ID,
+					chName:    v.Name,
 					keyID:     keyID,
 					modelRow:  modelRowID,
 					internal:  b.internal,

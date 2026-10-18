@@ -415,17 +415,11 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	autoHandler := automodel.NewHandler(autoSvc)
 	// 开发端接口需从 context 解析当前登录用户（server.UserIDFrom 由中间件写入）。
 	autoHandler.SetUserIDFrom(server.UserIDFrom)
-	// 跨表重名校验：Auto 名不得与任何 external_models.external_name 重名。
-	// 用 GetByName（忽略 enabled）判断「该名是否已被任何对外模型占用」——含未启用者，
-	// 避免「先建停用的对外模型 → 再建同名 Auto → 之后重新启用」绕过扁平命名空间约束。
+	// 跨表重名校验：Auto 名不得与任何 external_models.external_name 或别名重名。
+	// 用 NameTaken（忽略 enabled）判断「该名是否已被任何对外模型名/别名占用」——含未启用者与别名，
+	// 避免「先建停用模型或先配置别名 → 再建同名 Auto → 之后重新启用」绕过扁平命名空间约束。
 	autoSvc.SetExternalNameChecker(func(ctx context.Context, name string) (bool, error) {
-		if _, err := modelSvc.GetByName(ctx, name); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return false, nil
-			}
-			return false, err
-		}
-		return true, nil
+		return modelSvc.NameTaken(ctx, name)
 	})
 	// 反向跨表重名校验：对外模型名不得与任何 Auto 重名（与上方对称，堵住「先建 Auto 后建模型」）。
 	modelSvc.SetAutoNameChecker(func(ctx context.Context, name string) (bool, error) {

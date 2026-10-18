@@ -38,6 +38,7 @@ type viewModel struct {
 	SaleRates    billing.WireRates        `json:"SaleRates"`
 	TimeConfig   *billing.TimeCoeffConfig `json:"TimeConfig,omitempty"`
 	ContextTiers []billing.TierRule       `json:"ContextTiers,omitempty"`
+	Aliases      []string                 `json:"Aliases,omitempty"`
 	CreatedAt    time.Time                `json:"CreatedAt"`
 	UpdatedAt    time.Time                `json:"UpdatedAt"`
 }
@@ -51,6 +52,7 @@ func toView(m *ExternalModel) viewModel {
 		SaleRates:    billing.WireRates(m.SaleRates),
 		TimeConfig:   m.TimeConfig,
 		ContextTiers: m.ContextTiers,
+		Aliases:      m.Aliases,
 		CreatedAt:    m.CreatedAt,
 		UpdatedAt:    m.UpdatedAt,
 	}
@@ -63,6 +65,7 @@ type createModelRequest struct {
 	SaleRates    billing.WireRates        `json:"SaleRates"`
 	TimeConfig   *billing.TimeCoeffConfig `json:"TimeConfig"`
 	ContextTiers []billing.TierRule       `json:"ContextTiers"`
+	Aliases      []string                 `json:"Aliases"`
 }
 
 func decodeBody(w http.ResponseWriter, r *http.Request, v any) bool {
@@ -81,6 +84,7 @@ func toInput(req *createModelRequest) ExternalModelInput {
 		SaleRates:    billing.Rates(req.SaleRates),
 		TimeConfig:   req.TimeConfig,
 		ContextTiers: req.ContextTiers,
+		Aliases:      req.Aliases,
 	}
 }
 
