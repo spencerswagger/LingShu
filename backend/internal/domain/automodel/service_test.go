@@ -726,7 +726,7 @@ func TestCrossPackage_ModelWriteInvalidatesResolveCache(t *testing.T) {
 				mock.ExpectQuery(regexp.QuoteMeta(extModelSelectSQL)).WithArgs(int64(101)).
 					WillReturnRows(extModelRow(101, "model-a", true, now))
 				mock.ExpectExec(regexp.QuoteMeta(`UPDATE external_models SET external_name=$1, description=$2, enabled=$3`)).
-					WithArgs("model-a", "", false, sqlmock.AnyArg(), nil, nil, int64(101)).
+					WithArgs("model-a", "", false, sqlmock.AnyArg(), nil, nil, sqlmock.AnyArg(), int64(101)).
 					WillReturnResult(sqlmock.NewResult(0, 1))
 				mock.ExpectQuery(regexp.QuoteMeta(extModelSelectSQL)).WithArgs(int64(101)).
 					WillReturnRows(extModelRow(101, "model-a", false, now))

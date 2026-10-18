@@ -73,7 +73,7 @@ action: frontend/src/views/admin/ChannelProtocolEdit.vue 增加「错误策略�
 loop: false
 verify: cd frontend && npm run build
 
-- [x] **Step 13: 人工评审——默认策略下的健康熔断语义**
+- [ ] **Step 13: 人工评审——默认策略下的健康熔断语义**
 action: 汇总「未配置策略时」各错误类别（422/404/400/5xx/429/401）的 CountIntoHealth 取值与 failover 取值，形成一页对照表，提交人工确认（risk_level high，禁止自动通过）。
 gate: human
 
