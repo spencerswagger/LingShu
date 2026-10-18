@@ -21,12 +21,12 @@ action: 新建 `backend/internal/domain/router/cost_config.go`，定义 `type Se
 loop: false
 verify: cd backend && go build ./... && go test ./internal/domain/router/ -run SessionCostConfig
 
-- [ ] **Step 2: 写“成本比较纳入三档成本价 × 时段 × 分档”的失败测试**
+- [x] **Step 2: 写“成本比较纳入三档成本价 × 时段 × 分档”的失败测试**
 action: 在 `backend/internal/domain/router/router_test.go`（或新增 `cost_order_test.go`）写表驱动测试：给定两个候选渠道，构造“最低输入价渠道 ≠ 最低总成本渠道”，分别注入 `TimeCoeffConfig`（时段倍率≠1）与 `ContextTiers`（分档倍率≠1），断言 `orderCandidates` 择到总成本更优者；并断言样值优先取 `RouteSpec` 携带的本轮 token 三段（输入/缓存读/输出）。此步只写测试。
 loop: false
 verify: cd backend && go test ./internal/domain/router/ -run CostOrder 2>&1 | tail -20
 
-- [ ] **Step 3: 实现成本比较（替换“分档系数恒 1 + cost_sample 样值”口径）**
+- [x] **Step 3: 实现成本比较（替换“分档系数恒 1 + cost_sample 样值”口径）**
 action: 在 `backend/internal/domain/router/engine.go` 改造成本计算：用 `channel_models.cost_rates` 三档 × `billing.TimeCoeffConfig.CoeffFor(e.now())` × `billing.ContextTierCoeff(input+cacheRead, tiers)`；样值优先取 `RouteSpec` 新增字段（`SampleInput/SampleCacheRead/SampleOutput int64`），缺失时回退 `costSample`。`RouteSpec` 新增字段不改变旧调用行为（零值=回退）。扩展 `Engine` 以注入 `SessionCostProvider` 与 `ContextTiers()/TimeConfig()` 只读访问（复用 `billing.ConfigProvider`）。中文注释声明口径与回退规则。
 loop: until go test ./internal/domain/router/ 全绿
 max_iterations: 4
