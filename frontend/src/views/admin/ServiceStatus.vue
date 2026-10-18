@@ -1207,6 +1207,10 @@ onUnmounted(stopTimer)
   margin-left: 6px;
   color: var(--color-text-tertiary);
 }
+/* 错误文本告警色（详情对比表「最近错误」等） */
+.danger {
+  color: var(--color-danger);
+}
 .insp-empty,
 .insp-empty-inline {
   font-size: 12px;
