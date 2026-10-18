@@ -313,6 +313,11 @@ export interface ErrorPolicy {
   disposition: ErrorDisposition
   note?: string
 }
+// 协议特性：Key 指定代码实现的特性（thinking-roundtrip / tool-schema-normalize），Params 为其参数（允许为空）。
+export interface ProtocolFeature {
+  key: string
+  params?: Record<string, unknown>
+}
 export interface ChannelProtocolView {
   ID: string
   Name: string
@@ -322,6 +327,8 @@ export interface ChannelProtocolView {
   Models: Record<string, ChannelProtocolModelOverride>
   // 协议级错误策略（空 = 未配置，保持默认安全态）
   errorPolicy?: ErrorPolicy[]
+  // 协议特性（空 = 未挂载任何特性，行为与改造前逐字节一致）
+  features?: ProtocolFeature[]
   PresetSourceID: string
   Edited: boolean
   SourceStatus: string // ACTIVE | STALE（来源已失效）
@@ -334,6 +341,7 @@ export interface ChannelProtocolInput {
   RequestHeaders: ChannelProtocolRequestHeaders
   Models: Record<string, ChannelProtocolModelOverride>
   errorPolicy?: ErrorPolicy[]
+  features?: ProtocolFeature[]
 }
 // 同步预览：Pending 为需二次确认才覆盖的条目（含差异文本），Applied 为本次直接覆盖数
 export interface ChannelProtocolSyncPending {
