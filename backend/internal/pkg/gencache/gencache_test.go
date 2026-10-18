@@ -84,6 +84,81 @@ func TestCache_BoundedFIFO(t *testing.T) {
 	assertConsistent(t, c)
 }
 
+// TestCache_RepeatedInvalidateRefillKeepsOrderBounded 锁定「失效须同步从 FIFO 顺序表摘除」：
+// 反复「写入 → 失效」同一键不得让 order 只增不减（内存缓漏）。失效后 Count() 必须为 0，
+// 且 assertConsistent 校验 order 与 map 严格一致——若 Invalidate 未摘除 order 中的键，
+// 循环后 len(order)=1000、len(map)=0 会立即失败。
+func TestCache_RepeatedInvalidateRefillKeepsOrderBounded(t *testing.T) {
+	c := New[int](8)
+	for i := 0; i < 1000; i++ {
+		c.Put("same", "", i)
+		c.Invalidate("same")
+	}
+	if got := c.Count(); got != 0 {
+		t.Fatalf("反复失效后应为空，got %d", got)
+	}
+	assertConsistent(t, c)
+}
+
+// TestCache_EvictionClearsGroupIndex 锁定 FIFO 淘汰须同步清理 group 倒排索引：
+// 被淘汰键若残留在 groups 集合中，会导致 InvalidateGroup 命中幽灵键、并造成索引侧内存缓漏。
+func TestCache_EvictionClearsGroupIndex(t *testing.T) {
+	c := New[int](2)
+	g := c.Generation()
+	for _, k := range []string{"a", "b"} {
+		if !c.PutAtGen(k, "grp", 1, g) {
+			t.Fatalf("put %q 应成功", k)
+		}
+	}
+	// 第 3 个键触发 FIFO：最早的 a 被淘汰。
+	if !c.PutAtGen("c", "grp", 3, g) {
+		t.Fatal("put c 应成功")
+	}
+	if _, ok := c.Get("a"); ok {
+		t.Fatal("最早的键 a 应被 FIFO 淘汰")
+	}
+	if _, ghost := c.groups["grp"]["a"]; ghost {
+		t.Fatal("被淘汰键 a 不得残留在 group 索引中（否则按组失效会命中幽灵键）")
+	}
+	for _, k := range []string{"b", "c"} {
+		if _, ok := c.groups["grp"][k]; !ok {
+			t.Fatalf("存活键 %q 应仍登记在其 group 中", k)
+		}
+	}
+	assertConsistent(t, c)
+}
+
+// TestCache_OverwriteKeepsFIFOPosition 锁定 putLocked 契约：同键覆盖只换值、不改变 FIFO 位置。
+// a 与 b 依次插入，覆盖 a 后 a 仍在队首（order[0] 不变），再插入 c 触发淘汰时被淘汰的仍是
+// 位置未变的 a；若实现把覆盖键重新追加到队尾，则 order[0] 会变成 b、淘汰 b——本用例据 order[0]
+// 与淘汰结果双重锁定，确保「覆盖不刷新 FIFO 位置」。
+func TestCache_OverwriteKeepsFIFOPosition(t *testing.T) {
+	c := New[int](2)
+	g := c.Generation()
+	if !c.PutAtGen("a", "", 1, g) || !c.PutAtGen("b", "", 2, g) {
+		t.Fatal("初始写入应成功")
+	}
+	if !c.PutAtGen("a", "", 10, g) {
+		t.Fatal("覆盖 a 应成功")
+	}
+	if len(c.order) == 0 || c.order[0] != "a" {
+		t.Fatalf("同键覆盖不得改变 FIFO 位置：order[0]=%v, want a", c.order)
+	}
+	if !c.PutAtGen("c", "", 3, g) {
+		t.Fatal("插入 c 应成功")
+	}
+	if _, ok := c.Get("a"); ok {
+		t.Fatal("覆盖未改变 a 位置，a 应作为最早键被淘汰")
+	}
+	if v, ok := c.Get("b"); !ok || v != 2 {
+		t.Fatalf("b 应存活且保留原值 2，got (%d,%v)", v, ok)
+	}
+	if _, ok := c.Get("c"); !ok {
+		t.Fatal("c 应存活")
+	}
+	assertConsistent(t, c)
+}
+
 // TestCache_PutAtGenStaleRejected 锁定代际校验：陈旧代际拒绝回填，新鲜代际正常写入。
 func TestCache_PutAtGenStaleRejected(t *testing.T) {
 	c := New[int](0)
@@ -264,4 +339,51 @@ func TestCache_Concurrent(t *testing.T) {
 	if c.Count() > max {
 		t.Fatalf("并发后超过上限：%d > %d", c.Count(), max)
 	}
+	// 并发停止后校验顺序表与映射仍严格一致（并发失效/淘汰/覆盖不得破坏对应关系）。
+	assertConsistent(t, c)
+
+	// 无失效并发：不存在任何 Invalidate*，代际恒定，故每次回填携带的代际都最新，PutAtGen 必须全部成功。
+	noInv := New[int](max)
+	var wgNoInv sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wgNoInv.Add(1)
+		go func(w int) {
+			defer wgNoInv.Done()
+			for i := 0; i < ops; i++ {
+				key := fmt.Sprintf("n-%d-%d", w, i%16)
+				if !noInv.PutAtGen(key, "", i, noInv.Generation()) {
+					t.Errorf("无失效并发下 PutAtGen 不应失败")
+					return
+				}
+			}
+		}(w)
+	}
+	wgNoInv.Wait()
+	assertConsistent(t, noInv)
+
+	// 有失效并发：PutAtGen 可能因回源期间代际被 bump 而返回 false（预期），但必须不 panic，
+	// 且并发结束后顺序表与映射仍严格一致。
+	withInv := New[int](max)
+	var wgInv sync.WaitGroup
+	wgInv.Add(1)
+	go func() {
+		defer wgInv.Done()
+		for i := 0; i < ops; i++ {
+			withInv.Invalidate(fmt.Sprintf("n-%d", i%8))
+			withInv.InvalidateGroup(fmt.Sprintf("g-%d", i%3))
+		}
+	}()
+	for w := 0; w < workers; w++ {
+		wgInv.Add(1)
+		go func(w int) {
+			defer wgInv.Done()
+			for i := 0; i < ops; i++ {
+				key := fmt.Sprintf("n-%d-%d", w, i%16)
+				withInv.PutAtGen(key, fmt.Sprintf("g-%d", w%3), i, withInv.Generation())
+				withInv.Get(key)
+			}
+		}(w)
+	}
+	wgInv.Wait()
+	assertConsistent(t, withInv)
 }

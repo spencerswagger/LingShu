@@ -95,9 +95,8 @@ func (c *Cache[V]) PutAtGen(key, group string, v V, gen uint64) bool {
 	return true
 }
 
-// Put 以当前代际无条件写入键值（供测试/直写使用）。
-// 与「先 Generation() 再 PutAtGen」相比，Put 在同一把锁内取代际并写入，
-// 不会被并发的失效插入到两者之间而误判为陈旧。
+// Put 无条件写入键值：既不捕获、也不校验失效代际，因此不参与任何代际保护。
+// 仅供测试/直写使用；需要「回源期间发生失效则拒绝回填」代际保护的回填请用 PutAtGen。
 func (c *Cache[V]) Put(key, group string, v V) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

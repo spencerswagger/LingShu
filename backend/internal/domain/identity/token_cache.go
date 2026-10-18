@@ -117,13 +117,22 @@ func (c *tokenCache) ensureEntriesLocked() *gencache.Cache[*tokenCacheEntry] {
 }
 
 // setEnabled 开关缓存；关闭时清空全部条目（避免关闭期间残留旧值）。
+//
+// 锁序约定：统一为「先 c.mu，后原语锁」，二者不得嵌套持有。故此处先在 c.mu 内落定 enabled
+// 并取得原语引用，释放 c.mu 后再调用 InvalidateAll——不在持有 c.mu 时进入原语锁。
+// 语义等价：enabled 已在 c.mu 内落定，后续读路径要么看到 enabled=false 直接回源，
+// 要么并发回填携带的旧代际被 putAtGen 的代际校验拒绝。
 func (c *tokenCache) setEnabled(enabled bool) {
 	c.mu.Lock()
 	c.enabled = enabled
+	var cache *gencache.Cache[*tokenCacheEntry]
 	if !enabled {
-		c.ensureEntriesLocked().InvalidateAll()
+		cache = c.ensureEntriesLocked()
 	}
 	c.mu.Unlock()
+	if cache != nil {
+		cache.InvalidateAll()
+	}
 }
 
 // setTTL 设置安全 TTL（最后防线）。

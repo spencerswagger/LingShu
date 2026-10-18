@@ -616,6 +616,55 @@ func TestService_StaleMembersFillAfterInvalidateRejected(t *testing.T) {
 	}
 }
 
+// TestService_StaleNilMembersFillAfterInvalidateRejected 是上例的负结果(nil)变体：
+// 失效后携带陈旧代际的 nil（「查无此名 / 已停用」负结果）回填同样必须被原语拒绝，
+// 否则失效前的「非 Auto」结论会滞留，后续请求持续误判。
+func TestService_StaleNilMembersFillAfterInvalidateRejected(t *testing.T) {
+	s := NewService(nil)
+	key := membersCacheKey("auto1", nil)
+
+	gen := s.membersCache.Generation()
+	s.invalidateMembersCache()
+	s.cacheResolvedMembers(key, nil, false, gen)
+
+	if _, ok := s.membersCache.Get(key); ok {
+		t.Fatal("失效后携带陈旧代际的 nil 负结果回填必须被拒绝")
+	}
+}
+
+// TestService_ResolveMembers_DisabledAlwaysQueriesDB 锁定「关闭读缓存 ⇒ 每次直查 DB」：
+// SetReadCacheEnabled(false) 后连续两次 ResolveMembers 都必须回源（主表 + 成员各两次），
+// 且不写入缓存；若误读/误写缓存，第二次的 sqlmock 期望将不被消费而报错。
+func TestService_ResolveMembers_DisabledAlwaysQueriesDB(t *testing.T) {
+	s, mock := newServiceMock(t)
+	s.SetReadCacheEnabled(false)
+	now := time.Now()
+	for i := 0; i < 2; i++ {
+		mock.ExpectQuery(regexp.QuoteMeta(getByNameSQL)).
+			WithArgs("auto1", int64(7)).
+			WillReturnRows(autoRow(10, "auto1", ScopeGlobal, nil, true, now))
+		mock.ExpectQuery(regexp.QuoteMeta(membersSQL)).
+			WithArgs("{10}").
+			WillReturnRows(sqlmock.NewRows(memberTestCols).
+				AddRow(int64(1), int64(10), int64(101), 0, "model-a", true))
+	}
+	for i := 0; i < 2; i++ {
+		members, isAuto, err := s.ResolveMembers(context.Background(), "auto1", int64Ptr(7))
+		if err != nil {
+			t.Fatalf("resolve %d: %v", i, err)
+		}
+		if !isAuto || len(members) != 1 {
+			t.Fatalf("resolve %d unexpected: (%+v,%v)", i, members, isAuto)
+		}
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("关闭缓存时每次都应回源（主表+成员各两次）: %v", err)
+	}
+	if got := s.membersCache.Count(); got != 0 {
+		t.Fatalf("关闭缓存时不得写入缓存，got %d 条", got)
+	}
+}
+
 // TestService_ResolveMembers_DefensiveCopy 锁定 P2-3：缓存命中返回的成员切片为副本，
 // 调用方就地修改不得污染缓存（再次解析应仍返回原始成员）。
 func TestService_ResolveMembers_DefensiveCopy(t *testing.T) {

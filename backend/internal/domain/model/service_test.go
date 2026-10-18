@@ -566,6 +566,57 @@ func TestStore_StaleCacheFillAfterInvalidateRejected(t *testing.T) {
 	}
 }
 
+// TestStore_StaleNilCacheFillAfterInvalidateRejected 是上例的负缓存(nil)变体：
+// 失效后携带陈旧代际的 nil 回填（「已确认无启用模型」负缓存）同样必须被原语拒绝，
+// 否则失效前的「无模型」结论会滞留，后续请求持续误判该名不存在。
+func TestStore_StaleNilCacheFillAfterInvalidateRejected(t *testing.T) {
+	s := NewStore(nil)
+
+	gen := s.extNameCache.Generation()
+	s.invalidateExternalName("x")
+	s.cacheExternalName("x", nil, gen)
+
+	if _, ok := s.extNameCache.Get("x"); ok {
+		t.Fatal("失效后携带陈旧代际的 nil 负缓存回填必须被拒绝")
+	}
+}
+
+// TestStore_GetByExternalName_DisabledAlwaysQueriesDB 锁定「关闭读缓存 ⇒ 每次直查 DB，不读也不写缓存」：
+// SetReadCacheEnabled(false) 后连续两次 GetByExternalName 都必须回源，故 sqlmock 需消费两次相同的
+// SELECT 期望；若误读或误写缓存（第二次走缓存），第二次期望将不被消费而报错。末尾再断言缓存为空。
+func TestStore_GetByExternalName_DisabledAlwaysQueriesDB(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	s := NewStore(db)
+	s.SetReadCacheEnabled(false)
+
+	now := time.Now()
+	q := regexp.QuoteMeta(`SELECT ` + cols + ` FROM external_models WHERE external_name = $1 AND enabled = true AND deleted_at IS NULL LIMIT 1`)
+	for i := 0; i < 2; i++ {
+		mock.ExpectQuery(q).WithArgs("qw-max").
+			WillReturnRows(extRow(&ExternalModel{ID: 2, ExternalName: "qw-max", Enabled: true, CreatedAt: now, UpdatedAt: now}, `{"input":1}`))
+	}
+	for i := 0; i < 2; i++ {
+		m, err := s.GetByExternalName(context.Background(), "qw-max")
+		if err != nil {
+			t.Fatalf("get %d: %v", i, err)
+		}
+		if m.ID != 2 {
+			t.Fatalf("get %d unexpected: %+v", i, m)
+		}
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("关闭缓存时每次都应查库、且不写缓存: %v", err)
+	}
+	if got := s.extNameCache.Count(); got != 0 {
+		t.Fatalf("关闭缓存时不得写入缓存，got %d 条", got)
+	}
+}
+
 // TestStore_GetByExternalName_DeepCopy 锁定 P2-4：缓存命中返回的深拷贝，消费者修改 TimeConfig
 // 嵌套切片（Periodic/Overrides 及其内层 Segments/Weekdays）与 TierRule.Max 指针均不得污染缓存快照。
 func TestStore_GetByExternalName_DeepCopy(t *testing.T) {
