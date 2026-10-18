@@ -938,7 +938,7 @@ type fwdOutcome struct {
 	// 但下游状态码仍为 200，故必须单列，不能靠状态码判定成败。
 	interrupted bool
 	// streamDiag 流式上游失败诊断（仅排查用，随失败候选轨迹落调用日志）：
-	// delivered / first_byte_received / elapsed_ms / upstream_status。非流式失败为空。
+	// delivered / first_byte_received / elapsed_ms（连接失败时无上游状态码，故不含 upstream_status）。
 	streamDiag map[string]any
 }
 
@@ -1098,11 +1098,15 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 		if !pol.failover {
 			lvl = slog.LevelError
 		}
+		reason429 := "上游限流(429)，已返回下游"
+		if pol.failover {
+			reason429 = "上游限流(429)，已转入下一候选"
+		}
 		g.logUpstreamErr(ctx, lvl, "upstream rate limited", endpoint, ureq.Protocol, model, token, routeRes,
 			diagFromRequest(req, ureq.Protocol, ureq.Cred),
 			errInfo{kind: "upstream_status", stage: stage, status: up.StatusCode, attempt: attempt, retry: pol.failover,
 				param: param, errType: etype, errCode: ecode, summary: summary,
-				reason: "上游限流(429)，已转入下一候选", sessionID: sessionID, durationMs: *msSince(start)})
+				reason: reason429, sessionID: sessionID, durationMs: *msSince(start)})
 		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, errMsg, msSince(start))
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
 			"error", upErr, "failed", errMsg, msSince(start), nil, g.callLogDecision(attempts, "上游限流(429)", pc, routeRes))
@@ -1125,11 +1129,15 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 		if !pol.failover {
 			lvl = slog.LevelError
 		}
+		reasonAuth := "上游返回 401/403，已返回下游"
+		if pol.failover {
+			reasonAuth = "上游返回 401/403，已转入下一候选（该失败通常对下游不可见）"
+		}
 		g.logUpstreamErr(ctx, lvl, "upstream auth rejected", endpoint, ureq.Protocol, model, token, routeRes,
 			diagFromRequest(req, ureq.Protocol, ureq.Cred),
 			errInfo{kind: "upstream_status", stage: stage, status: up.StatusCode, attempt: attempt, retry: pol.failover,
 				param: param, errType: etype, errCode: ecode, summary: summary,
-				reason: "上游返回 401/403，已转入下一候选（该失败通常对下游不可见）", sessionID: sessionID, durationMs: *msSince(start)})
+				reason: reasonAuth, sessionID: sessionID, durationMs: *msSince(start)})
 		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, errMsg, msSince(start))
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
 			"error", upErr, "failed", errMsg, msSince(start), nil, g.callLogDecision(attempts, "上游鉴权失败", pc, routeRes))

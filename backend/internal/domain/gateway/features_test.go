@@ -69,7 +69,8 @@ func TestToolSchemaNormalize(t *testing.T) {
 	body := []byte(`{"model":"m","tools":[` +
 		`{"type":"web_search_20250305","name":"web_search"},` + // anthropic server 工具：缺 input_schema
 		`{"type":"function","function":{"name":"f"}},` + // OpenAI 风格：缺 parameters
-		`{"type":"function","function":{"name":"g","parameters":{"type":"object","properties":{"x":{"type":"string"}}}}}` + // 合法：不改
+		`{"type":"function","function":{"name":"g","parameters":{"type":"object","properties":{"x":{"type":"string"}}}}},` + // 合法：不改
+		`{"type":"web_search_20250305","name":"no_params","input_schema":{}}` + // 空对象：显式无入参，合法，不改
 		`]}`)
 
 	f := newToolSchemaNormalizeFeature(nil)
@@ -83,8 +84,8 @@ func TestToolSchemaNormalize(t *testing.T) {
 	if err := json.Unmarshal(req.Body, &got); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if len(got.Tools) != 3 {
-		t.Fatalf("tools 数应为 3，got %d", len(got.Tools))
+	if len(got.Tools) != 4 {
+		t.Fatalf("tools 数应为 4，got %d", len(got.Tools))
 	}
 	if _, ok := got.Tools[0]["input_schema"]; !ok {
 		t.Errorf("web_search server 工具应补 input_schema，got %s", got.Tools[0])
@@ -102,6 +103,10 @@ func TestToolSchemaNormalize(t *testing.T) {
 	}
 	if !bytes.Contains(fn2["parameters"], []byte(`"x"`)) {
 		t.Errorf("合法 parameters 不应被覆盖，got %s", fn2["parameters"])
+	}
+	// 空对象 input_schema：视为合法，不得注入内置 web_search schema（否则会带 required query）。
+	if s := bytes.TrimSpace(got.Tools[3]["input_schema"]); !bytes.Equal(s, []byte(`{}`)) {
+		t.Errorf("空对象 input_schema 不应被改写，got %s", got.Tools[3]["input_schema"])
 	}
 
 	// Params.schema 覆盖默认 schema。

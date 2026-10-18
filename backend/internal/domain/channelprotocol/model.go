@@ -155,7 +155,7 @@ type ErrorDisposition struct {
 
 // 协议特性 key：特性逻辑在代码中实现并注册，渠道协议按 key + 参数挂载（可多项启停）。
 const (
-	FeatureThinkingRoundtrip   = "thinking-roundtrip"   // 请求侧按上游约定回传 reasoning_content
+	FeatureThinkingRoundtrip   = "thinking-roundtrip"    // 请求侧按上游约定回传 reasoning_content
 	FeatureToolSchemaNormalize = "tool-schema-normalize" // 对齐工具 input_schema
 )
 

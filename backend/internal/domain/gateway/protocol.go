@@ -17,11 +17,17 @@ import (
 const protocolPolicyTimeout = 2 * time.Second
 
 // policyForProtocol 解析某协议针对给定上游错误命中的错误策略：
-// 经注入的协议查询接口取该协议 error_policy，按 (内部模型, status, errType, errCode, msg) 调 MatchError。
+// 优先用运行时渠道的协议快照（rt.Protocol 为新建的 ChannelProtocol 快照，含 ErrorPolicy），
+// 直接取 error_policy 调 MatchError，避免每上游错误再回源一次 DB；
+// 仅当快照缺失时才退回 g.protocols.GetByID 读库（沿用 2s 有界上下文兜底）。
 //
 // 未装配协议查询接口 / 协议不存在 / 无命中时返回 (nil, false)——上层据此保持改造前行为
 // （默认安全态：不计入健康、沿用 retryableUpstreamStatus、默认 502）。
-func (g *Gateway) policyForProtocol(protocolID int64, channelID int64, internalModelID int64, status int, errType, errCode, msg string) (*channelprotocol.ErrorPolicy, bool) {
+func (g *Gateway) policyForProtocol(rt *channel.RuntimeChannel, channelID int64, internalModelID int64, status int, errType, errCode, msg string) (*channelprotocol.ErrorPolicy, bool) {
+	if rt != nil && rt.Protocol != nil {
+		return channelprotocol.MatchError(rt.Protocol.ErrorPolicy, "", internalModelID, status, errType, errCode, msg)
+	}
+	protocolID := protocolIDOf(rt)
 	if g.protocols == nil || protocolID <= 0 {
 		return nil, false
 	}
@@ -67,7 +73,7 @@ func (g *Gateway) applyErrorPolicy(ctx context.Context, rt *channel.RuntimeChann
 		downstreamStatus: http.StatusBadGateway,
 	}
 	protocolID := protocolIDOf(rt)
-	pol, ok := g.policyForProtocol(protocolID, routeRes.ChannelID, routeRes.ModelRowID, status, errType, errCode, msg)
+	pol, ok := g.policyForProtocol(rt, routeRes.ChannelID, routeRes.ModelRowID, status, errType, errCode, msg)
 	if !ok {
 		return out
 	}
