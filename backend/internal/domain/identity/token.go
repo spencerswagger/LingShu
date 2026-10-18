@@ -498,6 +498,13 @@ func (s *TokenService) LookupByPlain(ctx context.Context, plain string) (*Token,
 			return t, nil
 		}
 	}
+	// 回源前捕获失效代际：若回源期间发生写路径失效（bump 代际，如禁用/软删用户），
+	// 本次回填必须被拒绝（见 putAtGen），否则会把失效前读到的陈旧 ACTIVE 快照回填进缓存，
+	// 使被禁用/删除的用户令牌在该条目存活期内（至多安全 TTL）仍可通过鉴权。
+	var cacheGen uint64
+	if s.cache != nil {
+		cacheGen = s.cache.generation()
+	}
 	t, err := s.store.GetByHash(ctx, hash)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -524,7 +531,7 @@ func (s *TokenService) LookupByPlain(ctx context.Context, plain string) (*Token,
 	}
 	// 仅缓存成功项：任一校验失败都不写缓存，避免负缓存掩盖后续变更。
 	if s.cache != nil {
-		s.cache.put(hash, t, status)
+		s.cache.putAtGen(hash, t, status, cacheGen)
 	}
 	return t, nil
 }

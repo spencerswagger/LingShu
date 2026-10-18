@@ -152,6 +152,32 @@ func TestTokenCache_InvalidateAll(t *testing.T) {
 	}
 }
 
+// TestTokenCache_StalePutAfterInvalidateRejected 锁定 P1（认证绕过窗口）：
+// 读路径在回源 DB 前捕获代际；若期间发生失效（写路径 bump 代际，例如禁用/软删用户），
+// 读到旧快照后的回填必须被拒绝——否则陈旧 ACTIVE 条目会存活至安全 TTL，被禁用用户的令牌
+// 在该窗口内仍可鉴权，违背「撤销/禁用/删除经钩子即时生效」承诺。
+func TestTokenCache_StalePutAfterInvalidateRejected(t *testing.T) {
+	c := newTokenCache()
+	tok := &Token{ID: 1, TokenHash: "h", UserID: 7, Status: StatusTokenActive}
+
+	// 读路径：回源前捕获代际。
+	gen := c.generation()
+	// 期间写路径失效（用户被禁用/软删）。
+	c.invalidateByUserID(7)
+	// 读路径回来回填（携带陈旧代际）。
+	c.putAtGen("h", tok, StatusActive, gen)
+
+	if _, ok := c.get("h"); ok {
+		t.Fatal("失效后携带陈旧代际的回填必须被拒绝，否则禁用用户在该条目存活期内仍可鉴权")
+	}
+
+	// 对照组：期间无失效时，携带当前代际的回填应正常命中（证明不会误杀正常回填路径）。
+	c.putAtGen("h", tok, StatusActive, c.generation())
+	if _, ok := c.get("h"); !ok {
+		t.Fatal("无失效发生时回填应正常命中")
+	}
+}
+
 // TestTokenCache_EvictionBound：条目超过上限时被淘汰，不无界增长。
 func TestTokenCache_EvictionBound(t *testing.T) {
 	svc := NewTokenService(nil)

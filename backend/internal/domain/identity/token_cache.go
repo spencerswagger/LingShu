@@ -81,6 +81,9 @@ type tokenCache struct {
 	now    func() time.Time
 	byHash map[string]*tokenCacheEntry
 	byUser map[int64]map[string]struct{}
+	// gen 失效代际：任一失效（invalidate*/clearLocked）递增。读路径回源前捕获、回填时校验，
+	// 用于拒绝「回源期间发生失效」后回填的陈旧快照（防认证绕过窗口）。
+	gen uint64
 }
 
 // newTokenCache 创建缓存：默认启用、安全 TTL 60s、上限 10 万。
@@ -147,16 +150,13 @@ func (c *tokenCache) get(hash string) (*Token, bool) {
 	return cloneToken(e.token), true
 }
 
-// put 写入鉴权结果快照（仅成功项）。会做条目上限淘汰。
+// put 写入鉴权结果快照（仅成功项）。等价于以当前代际调用 putAtGen，供测试/直接写入使用。
 func (c *tokenCache) put(hash string, t *Token, userStatus string) {
-	if t == nil {
-		return
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if !c.enabled {
-		return
-	}
+	c.putAtGen(hash, t, userStatus, c.generation())
+}
+
+// putLocked 实际写入（调用方须持有写锁，且已确认 t 非 nil、缓存启用、代际新鲜）。
+func (c *tokenCache) putLocked(hash string, t *Token, userStatus string) {
 	// 防御性深拷贝：入缓存的是副本，调用方后续修改其持有的 Token（含指针字段）不影响缓存（P2-5）。
 	snap := cloneToken(t)
 	// 同一哈希覆盖：先从旧归属用户的倒排集合中摘除，避免脏索引。
@@ -177,6 +177,7 @@ func (c *tokenCache) put(hash string, t *Token, userStatus string) {
 func (c *tokenCache) invalidateByHash(hash string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.gen++
 	if e, ok := c.byHash[hash]; ok {
 		c.removeFromUserLocked(e.token.UserID, hash)
 		delete(c.byHash, hash)
@@ -187,6 +188,7 @@ func (c *tokenCache) invalidateByHash(hash string) {
 func (c *tokenCache) invalidateByUserID(userID int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.gen++
 	for h := range c.byUser[userID] {
 		delete(c.byHash, h)
 	}
@@ -200,8 +202,9 @@ func (c *tokenCache) invalidateAll() {
 	c.clearLocked()
 }
 
-// clearLocked 清空两级索引（调用方须持有写锁）。
+// clearLocked 清空两级索引（调用方须持有写锁），并递增失效代际。
 func (c *tokenCache) clearLocked() {
+	c.gen++
 	c.byHash = make(map[string]*tokenCacheEntry)
 	c.byUser = make(map[int64]map[string]struct{})
 }
@@ -238,4 +241,31 @@ func (c *tokenCache) count() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return len(c.byHash)
+}
+
+// generation 返回当前缓存代际（失效时递增）。
+// 读路径在回源 DB 前捕获代际，回填时校验未被 bump，避免「失效后回填陈旧快照」的认证绕过窗口。
+func (c *tokenCache) generation() uint64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.gen
+}
+
+// putAtGen 写入鉴权结果快照，仅在 gen 仍为最新（期间未发生失效）时写入。
+// 若期间发生任一次失效（invalidate*/clearLocked 已 bump 代际），本次回填被丢弃——
+// 否则会把失效前读到的陈旧（如 ACTIVE）快照回填进缓存，使撤销/禁用/删除在该条目存活期内失效。
+func (c *tokenCache) putAtGen(hash string, t *Token, userStatus string, gen uint64) {
+	if t == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.enabled {
+		return
+	}
+	if c.gen != gen {
+		// 回源期间发生过失效：拒绝回填，交由下一次请求重新回源。
+		return
+	}
+	c.putLocked(hash, t, userStatus)
 }
