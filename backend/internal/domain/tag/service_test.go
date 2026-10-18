@@ -229,3 +229,86 @@ func TestService_BatchDelete_BlockedByChannel(t *testing.T) {
 		t.Fatalf("expectations: %v", err)
 	}
 }
+
+// TestService_GetByID_CacheZeroDBAndInvalidate 验证标签读缓存（STEP 22）：
+// 命中后零 DB（连续多次读取仅回源一次）；删除写路径后缓存立即失效（再读重新查库并读到新值）。
+func TestService_GetByID_CacheZeroDBAndInvalidate(t *testing.T) {
+	s, mock := mockStore(t)
+	now := time.Now()
+	q := regexp.QuoteMeta(`SELECT ` + cols + ` FROM semantic_tags WHERE id = $1 AND deleted_at IS NULL`)
+	tagRows := func(name string) *sqlmock.Rows {
+		return sqlmock.NewRows([]string{"id", "name", "description", "kv_pairs", "enabled", "created_by", "created_at"}).
+			AddRow(int64(1), name, "", `{"tier":"gold"}`, true, nil, now)
+	}
+
+	// 首次读取回源一次。
+	mock.ExpectQuery(q).WithArgs(int64(1)).WillReturnRows(tagRows("gold"))
+	for i := 0; i < 3; i++ {
+		tg, err := s.store.GetByID(context.Background(), 1)
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if tg.Name != "gold" {
+			t.Fatalf("unexpected: %+v", tg)
+		}
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("命中缓存不应再读库: %v", err)
+	}
+
+	// 写路径（批量删除）后缓存立即失效：再读重新查库并拿到新值。
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT count(*) FROM tokens WHERE tag_id = ANY($1::bigint[]) AND deleted_at IS NULL`)).
+		WithArgs(sqlmock.AnyArg()).WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(0)))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT COUNT(*) FROM channel_tags WHERE tag_id = ANY($1::bigint[])`)).
+		WithArgs(sqlmock.AnyArg()).WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(0)))
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE semantic_tags SET deleted_at = now() WHERE id = ANY($1::bigint[])`)).
+		WithArgs(sqlmock.AnyArg()).WillReturnResult(sqlmock.NewResult(0, 1))
+	if _, err := s.BatchDeleteTags(context.Background(), []int64{1}); err != nil {
+		t.Fatalf("batch delete: %v", err)
+	}
+
+	mock.ExpectQuery(q).WithArgs(int64(1)).WillReturnRows(tagRows("gold-v2"))
+	tg, err := s.store.GetByID(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("get after invalidate: %v", err)
+	}
+	if tg.Name != "gold-v2" {
+		t.Fatalf("失效后应读到新值，got %+v", tg)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("expectations: %v", err)
+	}
+}
+
+// TestService_GetByID_DefensiveCopy 锁定 P2-7：GetByID 命中缓存返回防御性拷贝，
+// 消费方（网关 TagKVResolver 拿到 KVPairs）就地修改不得污染缓存快照。
+func TestService_GetByID_DefensiveCopy(t *testing.T) {
+	s, mock := mockStore(t)
+	now := time.Now()
+	q := regexp.QuoteMeta(`SELECT ` + cols + ` FROM semantic_tags WHERE id = $1 AND deleted_at IS NULL`)
+	mock.ExpectQuery(q).WithArgs(int64(1)).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "name", "description", "kv_pairs", "enabled", "created_by", "created_at"}).
+			AddRow(int64(1), "gold", "", `{"tier":"gold"}`, true, nil, now))
+
+	first, err := s.store.GetByID(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	// 就地篡改返回值：不应影响已缓存的快照。
+	first.KVPairs["tier"] = "mutated"
+	first.KVPairs["extra"] = "x"
+
+	second, err := s.store.GetByID(context.Background(), 1) // 命中缓存，0 DB
+	if err != nil {
+		t.Fatalf("get2: %v", err)
+	}
+	if second.KVPairs["tier"] != "gold" {
+		t.Fatalf("缓存被返回值修改污染：%v", second.KVPairs)
+	}
+	if _, ok := second.KVPairs["extra"]; ok {
+		t.Fatalf("缓存被返回值修改污染（新增键泄漏）：%v", second.KVPairs)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("命中缓存不应再读库: %v", err)
+	}
+}

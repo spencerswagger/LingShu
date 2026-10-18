@@ -216,6 +216,15 @@ func (s *KeyStore) InsertEvent(ctx context.Context, keyID int64, from, to State,
 	return err
 }
 
+// InsertEventWithID 以显式事件 ID 幂等写入一条密钥状态流转事件（ON CONFLICT (id) DO NOTHING）。
+// 供异步事件 sink 使用：事件 ID 由调用方预生成，重复提交/崩溃重放均不会产生重复事件。
+func (s *KeyStore) InsertEventWithID(ctx context.Context, id, keyID int64, from, to State, reason string) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO channel_key_events(id, channel_key_id, from_state, to_state, reason) VALUES($1,$2,$3,$4,$5) ON CONFLICT (id) DO NOTHING`,
+		id, keyID, string(from), string(to), reason)
+	return err
+}
+
 // ListEvents 查询密钥状态流转事件（created_at 倒序）；limit<=0 时取 50 条。
 func (s *KeyStore) ListEvents(ctx context.Context, keyID int64, limit int) ([]ChannelKeyEvent, error) {
 	if limit <= 0 {

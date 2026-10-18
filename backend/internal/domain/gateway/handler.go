@@ -395,53 +395,55 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 
 	// 6) 计费前置（三阶段计费，对齐 new-api pre-consume/settle/refund）：
 	// 装配 Credit 时按「输入(tiktoken)+模型输出上限」估算金额做原子预扣，余额不足直接 402；
-	// 请求结束后按实际账单退补（多退少补）。zero 余额在任何模式下一律拦截，杜绝赊账。
+	// 请求结束后按实际账单退补（多退少补）。
+	// 零余额与费率缺失(估算为 0)均由预扣条件写统一拦截，错误码语义不变（不再前置独立读余额）。
 	var pc preCharge
 	if g.credit != nil {
-		if bal, berr := g.credit.Balance(ctx, token.UserID); berr == nil && bal <= 0 {
-			l.Warn("zero balance rejected", "user_id", token.UserID, "balance", bal)
-			g.recordGatewayReject(ctx, model, autoName, token, pricingMode, sessionID, "积分余额不足（账户余额为 0）")
-			g.logReject(ctx, endpoint, model, "积分余额不足（账户余额为 0）", http.StatusPaymentRequired, token, msSince(start))
-			writeOpenAIError(w, http.StatusPaymentRequired, msgInsufficient)
-			return
-		}
 		est, formula, eerr := g.estimatePreConsumeCost(ctx, model, body)
 		if eerr != nil {
+			// 边界说明（口径已成文）：估算先于预扣，故「零余额 + 估算失败」返回 500（属网关内部
+			// 配置错误，如费率/系数非法），而非移除前置余额读之前该组合的 402。此变更经人工评审确认可接受。
 			l.Error("estimate preconsume failed", "user_id", token.UserID, "model", model, "err", eerr)
 			g.logReject(ctx, endpoint, model, "预扣金额估算失败："+eerr.Error(), http.StatusInternalServerError, token, msSince(start))
 			writeOpenAIError(w, http.StatusInternalServerError, msgInternal)
 			return
 		}
 		pc = est
-		if pc.Credits > 0 {
-			pc.Credits = pc.Credits * preConsumeBuffer // 预扣 = 估算输入代入本地公式 × 缓冲；输出留待结算按实际多退少补
-			if err := g.credit.PreConsume(ctx, token.UserID, pc.Credits, "", sessionID, "预扣费"); err != nil {
-				// 失败也落 failed 账单：余额不足等预扣拒绝必须留痕（含公式与预扣积分），
-				// 便于用户核对「为什么没扣成」与对账。
-				msg := fmt.Sprintf("积分余额不足，预扣需 %.6f 积分；公式：\n%s", pc.Credits, formula)
-				if len(routes) > 0 {
-					r0 := routes[0]
-					g.recordFailure(ctx, &router.RouteResult{
-						ChannelID:       r0.ChannelID,
-						ChannelKeyID:    r0.ChannelKeyID,
-						InternalModelID: r0.InternalModelID,
-						ModelRowID:      r0.ModelRowID,
-						ExternalModelID: r0.ExternalModelID,
-						AutoModelName:   autoName,
-						Revision:        r0.Revision,
-					}, model, token, pricingMode, sessionID, sessionName, msg, nil)
-				}
-				if isInsufficient(err) {
-					l.Warn("preconsume insufficient", "user_id", token.UserID, "need", pc.Credits, "err", err)
-					g.logReject(ctx, endpoint, model, fmt.Sprintf("积分余额不足，预扣需 %.6f 积分", pc.Credits), http.StatusPaymentRequired, token, msSince(start))
-					writeOpenAIError(w, http.StatusPaymentRequired, msgInsufficient)
-				} else {
-					l.Error("preconsume failed", "user_id", token.UserID, "need", pc.Credits, "err", err)
-					g.logReject(ctx, endpoint, model, "预扣失败："+err.Error(), http.StatusInternalServerError, token, msSince(start))
-					writeOpenAIError(w, http.StatusInternalServerError, msgInternal)
-				}
-				return
+		// 零余额与费率缺失(估算为 0)均由预扣条件写统一拦截，用户可见语义不变：
+		// 余额不足/零余额 40201、钱包缺失 40401（历史上前置 GetWallet 会兜底建 0 余额钱包 → 归 402），
+		// 二者对用户都表现为「积分余额不足 → 402」，与移除前置读之前的对外行为一致。
+		// 故即便 pc.Credits==0 也照常下发预扣，由服务端零余额守卫兜住，无需独立余额读取。
+		pc.Credits = pc.Credits * preConsumeBuffer // 预扣 = 估算输入代入本地公式 × 缓冲；输出留待结算按实际多退少补
+		if err := g.credit.PreConsume(ctx, token.UserID, pc.Credits, "", sessionID, "预扣费"); err != nil {
+			// 失败也落 failed 账单：余额不足等预扣拒绝必须留痕（含公式与预扣积分），
+			// 便于用户核对「为什么没扣成」与对账。
+			// 口径说明（已成文，经人工评审确认可接受）：本分支统一用「归属首个候选渠道 + 公式消息」。
+			// 对零余额场景，这是相对移除前置余额读之前的「空归属 + 原因串『账户余额为 0』」的变化；
+			// 但 failed 记录 CreditsConsumed=0、不参与扣减，对账金额不受影响，且与「余额不足」分支口径一致。
+			msg := fmt.Sprintf("积分余额不足，预扣需 %.6f 积分；公式：\n%s", pc.Credits, formula)
+			if len(routes) > 0 {
+				r0 := routes[0]
+				g.recordFailure(ctx, &router.RouteResult{
+					ChannelID:       r0.ChannelID,
+					ChannelKeyID:    r0.ChannelKeyID,
+					InternalModelID: r0.InternalModelID,
+					ModelRowID:      r0.ModelRowID,
+					ExternalModelID: r0.ExternalModelID,
+					AutoModelName:   autoName,
+					Revision:        r0.Revision,
+				}, model, token, pricingMode, sessionID, sessionName, msg, nil)
 			}
+			if isInsufficient(err) || isWalletMissing(err) {
+				// 余额不足/零余额，或钱包缺失（等价于余额为 0）：对外统一 402。
+				l.Warn("preconsume insufficient", "user_id", token.UserID, "need", pc.Credits, "err", err)
+				g.logReject(ctx, endpoint, model, fmt.Sprintf("积分余额不足，预扣需 %.6f 积分", pc.Credits), http.StatusPaymentRequired, token, msSince(start))
+				writeOpenAIError(w, http.StatusPaymentRequired, msgInsufficient)
+			} else {
+				l.Error("preconsume failed", "user_id", token.UserID, "need", pc.Credits, "err", err)
+				g.logReject(ctx, endpoint, model, "预扣失败："+err.Error(), http.StatusInternalServerError, token, msSince(start))
+				writeOpenAIError(w, http.StatusInternalServerError, msgInternal)
+			}
+			return
 		}
 	} else if g.balance != nil {
 		bal, berr := g.balance(ctx, token.UserID)
@@ -1456,6 +1458,17 @@ func isInsufficient(err error) bool {
 	var ae *identity.APIError
 	if errors.As(err, &ae) {
 		return ae.Code == resp.CodeInsufficient
+	}
+	return false
+}
+
+// isWalletMissing 判断是否积分钱包缺失（40401 CodeNotFound）。
+// 对网关而言「钱包缺失」等价于余额为 0：历史上前置 GetWallet 会兜底建 0 余额钱包并归 402，
+// 移除前置读后需在此显式把该错误按 402 处理，保持对外行为一致。
+func isWalletMissing(err error) bool {
+	var ae *identity.APIError
+	if errors.As(err, &ae) {
+		return ae.Code == resp.CodeNotFound
 	}
 	return false
 }

@@ -2,6 +2,7 @@ package channel
 
 import (
 	"sort"
+	"sync/atomic"
 	"time"
 )
 
@@ -68,10 +69,14 @@ func DefaultMachineConfig() MachineConfig {
 //   - 真实调用连续鉴权失败(401/403) ≥ AuthFailThreshold → DISABLED；
 //     健康探测的 401/403 视为确定性检查，一次即 DISABLED
 //   - DISABLED 为终态，仅手动退出；无排空超时自动禁用
+//
+// 并发安全（不允许隐性逻辑）：state 由 atomic.Value 承载，State() 为无锁原子读，
+// 可在 Manager.mu 之外安全调用（router 热路径经 GetKeyRuntime 取出后即读 State()）；
+// 其余字段（lastReason/窗口计数等）仅在 Manager.mu 保护下读写，不提供锁外访问。
 type Machine struct {
 	cfg             MachineConfig
 	now             func() time.Time
-	state           State
+	state           atomic.Value // State：原子读，避免 Manager.mu 外的读与锁内写的 data race
 	lastReason      string
 	failures        []time.Time // 非超时/非429 的失败
 	timeouts        []time.Time
@@ -115,7 +120,9 @@ func NewMachine(cfg MachineConfig) *Machine {
 			cfg.AuthFailThreshold = def.AuthFailThreshold
 		}
 	}
-	return &Machine{cfg: cfg, now: time.Now, state: StateNormal}
+	m := &Machine{cfg: cfg, now: time.Now}
+	m.state.Store(StateNormal)
+	return m
 }
 
 // SetClock 注入时钟函数，便于测试中伪造时间保证确定性。nil 表示恢复系统时钟。
@@ -126,8 +133,13 @@ func (m *Machine) SetClock(fn func() time.Time) {
 	m.now = fn
 }
 
-// State 返回当前状态。
-func (m *Machine) State() State { return m.state }
+// State 返回当前状态（原子读，可在 Manager.mu 之外安全调用）。
+func (m *Machine) State() State {
+	if v := m.state.Load(); v != nil {
+		return v.(State)
+	}
+	return StateNormal // 构造期兜底：正常路径 NewMachine 已 Store(StateNormal)
+}
 
 // LastReason 返回最近一次状态流转的原因；未发生流转则为空串。
 func (m *Machine) LastReason() string { return m.lastReason }
@@ -145,13 +157,13 @@ func (m *Machine) Feed(f Feedback) State {
 	if f.IsAuthFailure {
 		if f.IsProbe() {
 			m.transition(StateDisabled, now, reasonAuthFailure)
-			return m.state
+			return m.State()
 		}
 		m.authFails++
 		if m.authFails >= m.cfg.AuthFailThreshold {
 			m.transition(StateDisabled, now, reasonAuthFailure)
 		}
-		return m.state
+		return m.State()
 	}
 	// 非鉴权失败 → 打断「连续鉴权失败」计数（连续 = 中间没有其它结果）。
 	m.authFails = 0
@@ -177,7 +189,7 @@ func (m *Machine) Feed(f Feedback) State {
 	}
 
 	m.evaluate(now)
-	return m.state
+	return m.State()
 }
 
 // evaluate 根据窗口指标与当前状态计算目标状态并执行合法流转。
@@ -185,11 +197,11 @@ func (m *Machine) Feed(f Feedback) State {
 func (m *Machine) evaluate(now time.Time) {
 	sampleOK := len(m.total) >= m.cfg.MinSamples
 	switch {
-	case m.state == StateDisabled:
+	case m.State() == StateDisabled:
 		return // 终态，仅手动恢复
 	case m.probeFails >= m.cfg.ProbeFailThreshold:
 		m.ensureDrain(now, reasonProbeFail)
-	case m.state == StateDrain && m.probeOKs >= m.cfg.ProbeRecoveryThreshold:
+	case m.State() == StateDrain && m.probeOKs >= m.cfg.ProbeRecoveryThreshold:
 		// 排空恢复仅由健康探测驱动：真实调用不参与恢复判定。
 		m.drainingReasons = nil
 		m.probeOKs = 0
@@ -213,8 +225,8 @@ func (m *Machine) ensureDrain(now time.Time, reason string) {
 
 // transition 在状态实际变化时更新 state 与 lastReason。
 func (m *Machine) transition(next State, now time.Time, reason string) {
-	if m.state != next {
-		m.state = next
+	if m.State() != next {
+		m.state.Store(next)
 		m.lastReason = reason
 	}
 }
@@ -226,19 +238,19 @@ func (m *Machine) ForceNormal(now time.Time) State {
 	m.probeFails = 0
 	m.authFails = 0
 	m.transition(StateNormal, now, reasonManualNormal)
-	return m.state
+	return m.State()
 }
 
 // ForceDrain 手动置排空。
 func (m *Machine) ForceDrain(now time.Time) State {
 	m.transition(StateDrain, now, reasonManualDrain)
-	return m.state
+	return m.State()
 }
 
 // ForceDisable 手动置禁用：任意状态 → DISABLED（终态）。
 func (m *Machine) ForceDisable(now time.Time) State {
 	m.transition(StateDisabled, now, reasonManualDisable)
-	return m.state
+	return m.State()
 }
 
 // DrainReasons 返回当前排空触发原因列表（诊断用）。

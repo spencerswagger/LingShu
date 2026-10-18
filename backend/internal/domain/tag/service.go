@@ -92,6 +92,8 @@ func (s *Service) CreateTag(ctx context.Context, in TagInput, creatorID int64) (
 		}
 		return nil, fmt.Errorf("create tag: %w", err)
 	}
+	// 缓存失效：新标签 ID 落地后按 ID 失效其读缓存（写路径显式失效，无 TTL）。
+	s.store.invalidateTagID(created.ID)
 	return created, nil
 }
 
@@ -133,6 +135,8 @@ func (s *Service) UpdateTag(ctx context.Context, id int64, in TagInput) (*Tag, e
 		}
 		return nil, fmt.Errorf("update tag: %w", err)
 	}
+	// 缓存失效：标签内容/启用态可能变化，按 ID 立即失效读缓存（写路径显式失效，无 TTL）。
+	s.store.invalidateTagID(id)
 	return s.store.GetByID(ctx, id)
 }
 
@@ -200,5 +204,13 @@ func (s *Service) BatchDeleteTags(ctx context.Context, ids []int64) (int64, erro
 		}
 		return 0, fmt.Errorf("batch delete tags: %w", err)
 	}
+	// 缓存失效：逐个被删标签 ID 立即失效读缓存（写路径显式失效，无 TTL）。
+	for _, id := range ids {
+		s.store.invalidateTagID(id)
+	}
 	return n, nil
 }
+
+// SetReadCacheEnabled 开关标签读缓存（默认开启）；关闭后 GetByID 直查 DB。
+// 由装配层在启动时按配置设置，属于「直查 fallback 安全开关」。
+func (s *Service) SetReadCacheEnabled(on bool) { s.store.SetReadCacheEnabled(on) }

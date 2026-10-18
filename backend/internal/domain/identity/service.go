@@ -88,6 +88,11 @@ type Service struct {
 	totp     *TOTPService
 	// rl 二次验证口令尝试限流器（复用登录限流器，key 用 "sf:" 前缀隔离命名空间）。
 	rl *ratelimit.Limiter
+	// onUserWrite 用户写路径回调（用户在 新增/更新/删除 后调用，携带受影响 userID）。
+	// 由装配层经 SetUserWriteHook 注入，用于失效网关侧「按 userID 键」的读缓存（如计费模式）
+	// 以及令牌鉴权读缓存（TokenService.InvalidateByUserID），保证用户写后多份缓存同时失效。
+	// nil=无缓存需要失效。非并发安全：仅应在启动装配阶段调用一次。
+	onUserWrite func(userID int64)
 }
 
 // NewService 创建认证服务。
@@ -99,6 +104,18 @@ func (s *Service) SetSessionRegistry(r *session.Registry) { s.sessions = r }
 func (s *Service) SetAudit(a AuditSink)                   { s.audit = a }
 func (s *Service) SetTOTP(t *TOTPService)                 { s.totp = t }
 func (s *Service) SetRateLimiter(rl *ratelimit.Limiter)   { s.rl = rl }
+
+// SetUserWriteHook 注册用户写路径回调（用户新增/更新/删除/重置口令后触发，携带受影响 userID）。
+// 供装配层失效「定价模式」等按 userID 键的读缓存与令牌鉴权读缓存（TokenService.InvalidateByUserID），
+// 保证用户写后各缓存即时同步失效（无 TTL）。回调在 session 缓存写入的同一代码点触发，避免双缓存漂移。
+func (s *Service) SetUserWriteHook(fn func(userID int64)) { s.onUserWrite = fn }
+
+// notifyUserWrite 触发用户写路径回调（nil-safe）。
+func (s *Service) notifyUserWrite(userID int64) {
+	if s.onUserWrite != nil {
+		s.onUserWrite(userID)
+	}
+}
 
 // auditLog 写入一条审计记录：nil-safe、失败仅记日志不阻塞业务。
 // 自动补齐请求元数据（可信 IP / request id）——service 层拿不到 *http.Request，
@@ -433,6 +450,8 @@ func (s *Service) AdminCreateUser(ctx context.Context, username, password, role,
 	created.PasswordHash = ""
 	s.auditLog(ctx, audit.Entry{Action: "admin.user.create", TargetType: "user", TargetID: strconv.FormatInt(created.ID, 10),
 		Detail: map[string]any{"username": created.Username, "role": created.Role, "pricing_mode": created.PricingMode}})
+	// 用户写路径：通知缓存失效（计费模式等按 userID 键的读缓存）。
+	s.notifyUserWrite(created.ID)
 	return created, nil
 }
 
@@ -603,6 +622,9 @@ func (s *Service) UpdateUser(ctx context.Context, id int64, role, status string,
 	if s.sessions != nil {
 		s.sessions.Set(id, session.Entry{Version: int(newVer), Status: newStatus, MustChange: newMustChange})
 	}
+	// 用户写路径：与 session 缓存写入同点触发回调，失效令牌鉴权缓存（按 userID）与计费模式等读缓存，
+	// 避免「session 已更新但令牌缓存未失效」的双缓存漂移窗口。
+	s.notifyUserWrite(id)
 	s.auditLog(ctx, audit.Entry{Action: "admin.user.update", TargetType: "user", TargetID: strconv.FormatInt(id, 10),
 		Detail: map[string]any{"role": role, "status": status, "prev_role": prev.Role}})
 	return got, nil
@@ -638,6 +660,8 @@ func (s *Service) AdminResetPassword(ctx context.Context, id int64, newPassword 
 			s.sessions.Set(id, session.Entry{Version: int(ver), Status: u.Status, MustChange: u.MustChangePassword})
 		}
 	}
+	// 用户写路径：与 session 缓存写入同点触发回调，失效令牌鉴权缓存与计费模式等读缓存（口令重置为高危动作，保守全清）。
+	s.notifyUserWrite(id)
 	// 管理员重置他人口令是最高风险动作之一，必须留结构化审计（不含口令/哈希）。
 	s.auditLog(ctx, audit.Entry{Action: "admin.user.reset_password", TargetType: "user", TargetID: strconv.FormatInt(id, 10),
 		Detail: map[string]any{"token_version": ver}})
@@ -689,6 +713,11 @@ func (s *Service) BatchDeleteUsers(ctx context.Context, ids []int64) (int64, err
 		for _, id := range ids {
 			s.sessions.Delete(id)
 		}
+	}
+	// 用户写路径：与 session 缓存删除同点逐 userID 触发回调，失效令牌鉴权缓存与计费模式等读缓存，
+	// 避免双缓存漂移。
+	for _, id := range ids {
+		s.notifyUserWrite(id)
 	}
 	s.auditLog(ctx, audit.Entry{Action: "admin.user.batch_delete", TargetType: "user",
 		Detail: map[string]any{"ids": ids, "affected": n}})

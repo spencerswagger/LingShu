@@ -78,11 +78,25 @@ type Service struct {
 	// autoNameExists 跨表重名校验：判断某名称是否已被 auto_models.name 占用
 	// （经 SetAutoNameChecker 由装配层注入；nil=跳过该检查）。
 	autoNameExists func(ctx context.Context, name string) (bool, error)
+	// nameWriteHook 对外模型名/启用态写入后的跨包失效钩子（经 SetNameWriteHook 注入，nil=跳过）。
+	// automodel.ResolveMembers 的结果 JOIN 了 external_models 的 external_name/enabled，
+	// 故本包任一写路径成功后需回调其读缓存失效（P1-4）。
+	nameWriteHook func()
 }
 
 // NewService 创建对外模型服务。
 func NewService(store *Store) *Service {
 	return &Service{store: store}
+}
+
+// SetNameWriteHook 注入对外模型写路径后的失效钩子（装配层传入，用于失效 automodel 的跨包读缓存）。
+func (s *Service) SetNameWriteHook(fn func()) { s.nameWriteHook = fn }
+
+// notifyNameWrite 在写路径成功后回调失效钩子（nil 时跳过）。
+func (s *Service) notifyNameWrite() {
+	if s.nameWriteHook != nil {
+		s.nameWriteHook()
+	}
 }
 
 // SetPriceSource 注入 models.dev 价格源（价格参考/应用售价接口使用）。
@@ -189,6 +203,10 @@ func (s *Service) CreateModel(ctx context.Context, in ExternalModelInput) (*Exte
 		}
 		return nil, fmt.Errorf("create external model: %w", err)
 	}
+	// 缓存失效：新增对外名后，GetByExternalName 的名称缓存必须立即刷新（写路径显式失效，无 TTL）。
+	s.store.invalidateExternalName(created.ExternalName)
+	// 跨包失效：通知 automodel 失效其 ResolveMembers 缓存（结果含 external_name）。
+	s.notifyNameWrite()
 	return created, nil
 }
 
@@ -234,6 +252,11 @@ func (s *Service) UpdateModel(ctx context.Context, id int64, in ExternalModelInp
 		}
 		return nil, fmt.Errorf("update external model: %w", err)
 	}
+	// 缓存失效：外部名/启用态可能变化，旧名与新名两条键都需立即失效（写路径显式失效，无 TTL）。
+	s.store.invalidateExternalName(existing.ExternalName)
+	s.store.invalidateExternalName(in.ExternalName)
+	// 跨包失效：external_name/enabled 变更影响 automodel.ResolveMembers 结果，通知其失效缓存。
+	s.notifyNameWrite()
 	return s.store.GetByID(ctx, id)
 }
 
@@ -255,6 +278,10 @@ func (s *Service) BatchDeleteModels(ctx context.Context, ids []int64) (int64, er
 	if err != nil {
 		return 0, fmt.Errorf("batch delete external models: %w", err)
 	}
+	// 缓存失效：批量删除无旧名可依（仅 id），整体清空对外名缓存（写路径显式失效，无 TTL）。
+	s.store.invalidateAllExternalNames()
+	// 跨包失效：删除使部分 external_name 不再存在，通知 automodel 失效其解析缓存。
+	s.notifyNameWrite()
 	return n, nil
 }
 
@@ -309,6 +336,10 @@ func (s *Service) ApplyPrice(ctx context.Context, id int64) (*ExternalModel, err
 	if err := s.store.ApplySaleRates(ctx, id, m.SaleRates); err != nil {
 		return nil, fmt.Errorf("apply sale rates: %w", err)
 	}
+	// 缓存失效：售价变化会使 GetByExternalName 缓存的模型快照过期，按对外名立即失效（无 TTL）。
+	s.store.invalidateExternalName(m.ExternalName)
+	// 跨包失效：统一通知 automodel 失效解析缓存（与其它写路径一致，避免口径不一致）。
+	s.notifyNameWrite()
 	return s.store.GetByID(ctx, id)
 }
 
@@ -339,6 +370,16 @@ func (s *Service) SyncPrices(ctx context.Context) (*SyncPricesResult, error) {
 		return nil, fmt.Errorf("list external models: %w", err)
 	}
 	res := &SyncPricesResult{Updated: []string{}, Skipped: []string{}}
+	// 缓存失效：只要有任何一行售价成功写入，就必须失效一次——用 defer 保证即便中途出错提前
+	// return 也会执行（否则已提交的售价变更会因对外名缓存无 TTL 而无限期滞留旧价）。
+	// 统一在循环后整体清空一次，避免循环内逐次清空造成写放大；随后跨包失效 automodel 解析缓存。
+	invalidated := false
+	defer func() {
+		if invalidated {
+			s.store.invalidateAllExternalNames()
+			s.notifyNameWrite()
+		}
+	}()
 	for _, m := range models {
 		ref, ok := s.pricer.ReferencePrice(m.ExternalName)
 		if !ok {
@@ -361,7 +402,12 @@ func (s *Service) SyncPrices(ctx context.Context) (*SyncPricesResult, error) {
 		if err := s.store.ApplySaleRates(ctx, m.ID, rates); err != nil {
 			return nil, fmt.Errorf("apply sale rates for %s: %w", m.ExternalName, err)
 		}
+		invalidated = true
 		res.Updated = append(res.Updated, m.ExternalName)
 	}
 	return res, nil
 }
+
+// SetReadCacheEnabled 开关对外模型名读缓存（默认开启）；关闭后 GetByExternalName 直查 DB。
+// 由装配层在启动时按配置设置，属于「直查 fallback 安全开关」。
+func (s *Service) SetReadCacheEnabled(on bool) { s.store.SetReadCacheEnabled(on) }
