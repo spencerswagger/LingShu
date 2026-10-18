@@ -238,3 +238,30 @@ func TestToken_LookupByPlain_Disabled_Fails(t *testing.T) {
 		t.Fatal("expected error for disabled token")
 	}
 }
+
+// TestTokenExpiredBoundary 锁定 P2-6：过期判定 fail-closed，now==ExpiresAt 即视为过期，
+// 且 LookupByPlain 的判定口径与 token_cache.get 的 !now.Before(ExpiresAt) 完全一致。
+func TestTokenExpiredBoundary(t *testing.T) {
+	exp := time.Now()
+	tok := &Token{ExpiresAt: &exp}
+	if tokenExpired(tok, exp.Add(-time.Nanosecond)) {
+		t.Fatal("过期前 1ns 不应判为过期")
+	}
+	if !tokenExpired(tok, exp) {
+		t.Fatal("now==ExpiresAt 应判为过期（fail-closed）")
+	}
+	if !tokenExpired(tok, exp.Add(time.Nanosecond)) {
+		t.Fatal("过期后应判为过期")
+	}
+	if tokenExpired(&Token{}, exp) {
+		t.Fatal("ExpiresAt 为 nil 不应判为过期")
+	}
+
+	// 与缓存路径一致：now==ExpiresAt 时缓存 get 应视为未命中。
+	svc := NewTokenService(nil)
+	svc.cache.now = func() time.Time { return exp }
+	svc.cache.put("h", &Token{ID: 1, UserID: 7, TokenHash: "h", Status: StatusTokenActive, ExpiresAt: &exp}, StatusActive)
+	if _, ok := svc.cache.get("h"); ok {
+		t.Fatal("缓存路径在 now==ExpiresAt 时应视为未命中（两路径口径须一致）")
+	}
+}

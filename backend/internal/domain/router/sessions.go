@@ -57,7 +57,11 @@ type sessionPersister interface {
 //
 // 排空（渠道或模型）允许既有会话续行；禁用连既有会话也拒绝（由路由层判定）。
 type SessionRegistry struct {
-	mu    sync.Mutex
+	// mu 保护 byKey/byKy/store/logf/keyChannelOf。
+	// 取值策略（不允许隐性逻辑）：纯读方法（CountActive）用 RLock 以允许并发读，
+	// 与路由热路径的并发计数不互相阻塞；Lookup/Hit（会惰性删除过期会话 removeLocked）、
+	// Attach/Renew/Close/Kill/Sweep 等一切可能改写内部状态的方法一律用 Lock（写锁）。
+	mu    sync.RWMutex
 	byKey map[string]*Session       // sessionID → 会话
 	byKy  map[int64]map[string]bool // 渠道密钥 keyID → {sessionID}（B4 起由 byCh 迁移）
 	store sessionPersister          // 持久化投影（nil=仅内存，兼容现有调用方）
@@ -278,10 +282,11 @@ func (r *SessionRegistry) EndRequest(sessionID string) {
 }
 
 // CountActive 返回某渠道密钥当前存活会话数（按 ChannelKeyID 计数）。
+// 纯读方法（不惰性删除、不改写任何状态），故用读锁：与路由热路径的并发读互不阻塞。
 // 按渠道聚合请用 CountActiveByChannel。
 func (r *SessionRegistry) CountActive(keyID int64) int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	return len(r.byKy[keyID])
 }
 

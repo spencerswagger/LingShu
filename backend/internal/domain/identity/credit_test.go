@@ -14,7 +14,7 @@ import (
 
 // consumeSQL 与 credit.go 中 ConsumeCredit 保持一致（匹配时空白会被折叠）。
 const consumeSQL = `UPDATE credit_wallets SET balance = balance - $1, version = version + 1, updated_at = now()
-		 WHERE user_id = $2 AND balance >= $1
+		 WHERE user_id = $2 AND balance >= $1 AND balance > 0
 		 RETURNING balance`
 
 const getBalanceSQL = `SELECT balance FROM credit_wallets WHERE user_id = $1`
@@ -157,6 +157,9 @@ func TestCredit_Consume_UsesAtomicGuard(t *testing.T) {
 	}
 	if !strings.Contains(consumeSQL, "balance >= $1") {
 		t.Fatal("consume must guard balance >= amount in the same statement")
+	}
+	if !strings.Contains(consumeSQL, "balance > 0") {
+		t.Fatal("consume must also guard balance > 0 (零余额拦截) in the same statement")
 	}
 	if strings.Contains(consumeSQL, ";") || strings.Contains(consumeSQL, "BEGIN") {
 		t.Fatal("consume must be a single atomic statement, no explicit transaction")

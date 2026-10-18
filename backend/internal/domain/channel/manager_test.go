@@ -499,28 +499,28 @@ func TestManager_UpsertKey_AddsNewAndPreservesState(t *testing.T) {
 	}
 }
 
-func TestManager_KeyOrderForRouting_RoundRobin(t *testing.T) {
+// TestManager_KeyOrderForRouting_ReadOnlyStableAscending 锁定修正后的契约：
+// KeyOrderForRouting 只读、稳定、按 id 升序、无副作用（不轮转、不改变内部状态、不取写锁）。
+// 同渠道多密钥的流量分摊由路由择序的「存活会话数」实现，本方法不承担分流职责。
+func TestManager_KeyOrderForRouting_ReadOnlyStableAscending(t *testing.T) {
 	mgr, _ := newManagerWithTwoKeys(t)
 
-	// 初始按密钥 id 升序；每次调用旋转一位。
-	if got := mgr.KeyOrderForRouting(1); !slices.Equal(got, []int64{11, 12}) {
-		t.Fatalf("第 1 次调用期望 [11 12]，got %v", got)
-	}
-	if got := mgr.KeyOrderForRouting(1); !slices.Equal(got, []int64{12, 11}) {
-		t.Fatalf("第 2 次调用（旋转一位）期望 [12 11]，got %v", got)
-	}
-	if got := mgr.KeyOrderForRouting(1); !slices.Equal(got, []int64{11, 12}) {
-		t.Fatalf("第 3 次调用期望回到 [11 12]，got %v", got)
+	// 按 id 升序，且多次调用结果一致（无轮转副作用）。
+	for i := 0; i < 3; i++ {
+		if got := mgr.KeyOrderForRouting(1); !slices.Equal(got, []int64{11, 12}) {
+			t.Fatalf("第 %d 次调用期望稳定升序 [11 12]，got %v", i+1, got)
+		}
 	}
 
-	// 返回切片必须是防御拷贝：外部修改返回值不得影响内部轮询游标。
-	first := mgr.KeyOrderForRouting(1) // 此刻返回 [12 11]
+	// 返回切片必须是防御拷贝：外部修改返回值不得影响后续调用结果。
+	first := mgr.KeyOrderForRouting(1)
 	first[0] = 0
+	first = append(first, 99)
 	if got := mgr.KeyOrderForRouting(1); !slices.Equal(got, []int64{11, 12}) {
-		t.Fatalf("外部修改返回值影响后续轮询：%v", got)
+		t.Fatalf("外部修改返回值影响后续调用：%v", got)
 	}
 
-	// 密钥摘除后 keyOrder 重置重建，仅剩的密钥自成一序。
+	// 密钥摘除后反映剩余密钥，仍为升序且稳定。
 	mgr.RemoveKey(11)
 	if got := mgr.KeyOrderForRouting(1); !slices.Equal(got, []int64{12}) {
 		t.Fatalf("移除 key 11 后期望 [12]，got %v", got)
@@ -529,6 +529,110 @@ func TestManager_KeyOrderForRouting_RoundRobin(t *testing.T) {
 	// 未知渠道返回 nil。
 	if got := mgr.KeyOrderForRouting(99); got != nil {
 		t.Fatalf("未知渠道期望 nil，got %v", got)
+	}
+}
+
+// TestManager_ListByExternal_MemorySnapshotAndInvalidation 锁定 P0（方案 A）契约：
+// 候选绑定读内存快照、零 DB 查询，且在配置变更钩子后立即失效（无 TTL 兜底）。
+func TestManager_ListByExternal_MemorySnapshotAndInvalidation(t *testing.T) {
+	// store/cmStore/keyStore 全 nil：任何 DB 访问都会 panic，从而证明本方法零 DB 查询。
+	mgr := NewManager(nil, nil, make([]byte, 16), nil, nil, nil)
+	mgr.Upsert(&Channel{ID: 1, Name: "c1", Protocol: ProtocolOpenAICompat})
+	mgr.Upsert(&Channel{ID: 2, Name: "c2", Protocol: ProtocolOpenAICompat})
+	mgr.UpsertModel(&ChannelModel{ID: 201, ChannelID: 2, InternalModelID: "m-b", ExternalModelID: 7, State: StateNormal})
+	mgr.UpsertModel(&ChannelModel{ID: 101, ChannelID: 1, InternalModelID: "m-a", ExternalModelID: 7, State: StateNormal})
+	mgr.UpsertModel(&ChannelModel{ID: 102, ChannelID: 1, InternalModelID: "m-off", ExternalModelID: 7, State: StateDisabled})
+
+	got, err := mgr.ListByExternal(context.Background(), 7)
+	if err != nil {
+		t.Fatalf("ListByExternal: %v", err)
+	}
+	// 过滤 DISABLED(102)；按 channel_id 升序 → 行 id 升序。
+	if len(got) != 2 || got[0].ID != 101 || got[1].ID != 201 {
+		t.Fatalf("期望 [101 201]（按渠道/行 id 升序，过滤禁用），got %+v", got)
+	}
+
+	// 其它对外模型无绑定。
+	if other, _ := mgr.ListByExternal(context.Background(), 99); len(other) != 0 {
+		t.Fatalf("对外模型 99 期望空，got %+v", other)
+	}
+
+	// 删除（DropModel 钩子）立即失效。
+	mgr.DropModel(2, 201)
+	if got2, _ := mgr.ListByExternal(context.Background(), 7); len(got2) != 1 || got2[0].ID != 101 {
+		t.Fatalf("DropModel 后期望 [101]，got %+v", got2)
+	}
+
+	// 新增（UpsertModel 钩子）立即生效。
+	mgr.UpsertModel(&ChannelModel{ID: 301, ChannelID: 1, InternalModelID: "m-d", ExternalModelID: 7, State: StateNormal})
+	if got3, _ := mgr.ListByExternal(context.Background(), 7); len(got3) != 2 || got3[0].ID != 101 || got3[1].ID != 301 {
+		t.Fatalf("新增后期望 [101 301]，got %+v", got3)
+	}
+
+	// 改绑（UpsertModel 携带新 external_model_id）立即切换归属。
+	mgr.UpsertModel(&ChannelModel{ID: 101, ChannelID: 1, InternalModelID: "m-a", ExternalModelID: 8, State: StateNormal})
+	if got4, _ := mgr.ListByExternal(context.Background(), 7); len(got4) != 1 || got4[0].ID != 301 {
+		t.Fatalf("改绑后期望对外模型 7 仅剩 [301]，got %+v", got4)
+	}
+	if got5, _ := mgr.ListByExternal(context.Background(), 8); len(got5) != 1 || got5[0].ID != 101 {
+		t.Fatalf("改绑后期望对外模型 8 为 [101]，got %+v", got5)
+	}
+}
+
+// TestManager_GetByChannelAndInternal_MemorySnapshotAndInvalidation 验证渠道内部模型单条查询读内存快照：
+// 命中零 DB（store/cmStore 为 nil，任何 DB 访问都会 panic）；UpsertModel/DropModel 后立即反映。
+// 语义与排序对齐 channelModelStore.GetByChannelAndInternal（多行匹配取行 id 最小者，不过滤 DISABLED）。
+func TestManager_GetByChannelAndInternal_MemorySnapshotAndInvalidation(t *testing.T) {
+	mgr := NewManager(nil, nil, make([]byte, 16), nil, nil, nil)
+	mgr.Upsert(&Channel{ID: 1, Name: "c1", Protocol: ProtocolOpenAICompat})
+	// 同一渠道同一内部模型存在多行（不同行 id）：应取最小行 id（等价 ORDER BY id ASC LIMIT 1）。
+	mgr.UpsertModel(&ChannelModel{ID: 102, ChannelID: 1, InternalModelID: "m-a", ExternalModelID: 7, State: StateNormal})
+	mgr.UpsertModel(&ChannelModel{ID: 101, ChannelID: 1, InternalModelID: "m-a", ExternalModelID: 7, State: StateNormal})
+
+	got, err := mgr.GetByChannelAndInternal(context.Background(), 1, "m-a")
+	if err != nil {
+		t.Fatalf("GetByChannelAndInternal: %v", err)
+	}
+	if got.ID != 101 || got.ExternalModelID != 7 {
+		t.Fatalf("应取行 id 最小者 101，got %+v", got)
+	}
+
+	// 未命中：内部模型不存在 / 渠道不存在 → sql.ErrNoRows。
+	if _, err := mgr.GetByChannelAndInternal(context.Background(), 1, "nope"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("want sql.ErrNoRows, got %v", err)
+	}
+	if _, err := mgr.GetByChannelAndInternal(context.Background(), 999, "m-a"); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("want sql.ErrNoRows, got %v", err)
+	}
+
+	// DropModel（删除钩子）后立即改取次小行 id。
+	mgr.DropModel(1, 101)
+	got2, err := mgr.GetByChannelAndInternal(context.Background(), 1, "m-a")
+	if err != nil {
+		t.Fatalf("after DropModel: %v", err)
+	}
+	if got2.ID != 102 {
+		t.Fatalf("DropModel 后应取 102，got %d", got2.ID)
+	}
+
+	// UpsertModel（新增钩子）插入更小行 id 后立即生效。
+	mgr.UpsertModel(&ChannelModel{ID: 100, ChannelID: 1, InternalModelID: "m-a", ExternalModelID: 8, State: StateNormal})
+	got3, err := mgr.GetByChannelAndInternal(context.Background(), 1, "m-a")
+	if err != nil {
+		t.Fatalf("after UpsertModel: %v", err)
+	}
+	if got3.ID != 100 || got3.ExternalModelID != 8 {
+		t.Fatalf("UpsertModel 后应取 100，got %+v", got3)
+	}
+
+	// 不过滤 DISABLED：与 DB 版语义一致，禁用行仍可取出（计费在模型刚被禁用时仍能取成本单价）。
+	mgr.UpsertModel(&ChannelModel{ID: 99, ChannelID: 1, InternalModelID: "m-off", ExternalModelID: 7, State: StateDisabled})
+	got4, err := mgr.GetByChannelAndInternal(context.Background(), 1, "m-off")
+	if err != nil {
+		t.Fatalf("disabled: %v", err)
+	}
+	if got4.ID != 99 {
+		t.Fatalf("禁用行也应取到，got %d", got4.ID)
 	}
 }
 
