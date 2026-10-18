@@ -68,16 +68,16 @@ action: 在 backend/internal/domain/channelprotocol/handler.go 增加 `GET /admi
 loop: false
 verify: cd backend && go test ./internal/domain/channelprotocol/ -run ErrorStats -v
 
-- [ ] **Step 12: 前端——协议编辑页错误策略配置 + 统计展示**
+- [x] **Step 12: 前端——协议编辑页错误策略配置 + 统计展示**
 action: frontend/src/views/admin/ChannelProtocolEdit.vue 增加「错误策略」配置区（生效范围单选 整渠道/指定模型 + 模型多选；错误签名 status/type/code/message 输入；处置开关 计入健康/failover/动作/下游状态码）；frontend/src/api/admin.ts 扩展 `ErrorPolicy` 类型与 `getChannelProtocolErrorStats(id)`。协议详情或服务状态页增加按类别计数展示。
 loop: false
 verify: cd frontend && npm run build
 
-- [ ] **Step 13: 人工评审——默认策略下的健康熔断语义**
+- [x] **Step 13: 人工评审——默认策略下的健康熔断语义**
 action: 汇总「未配置策略时」各错误类别（422/404/400/5xx/429/401）的 CountIntoHealth 取值与 failover 取值，形成一页对照表，提交人工确认（risk_level high，禁止自动通过）。
 gate: human
 
-- [ ] **Step 14: 全量回归 + 竞态**
+- [x] **Step 14: 全量回归 + 竞态**
 action: 运行全量后端测试与竞态检测，确认默认安全态下行为与改造前一致。
 verify:
   - type: shell

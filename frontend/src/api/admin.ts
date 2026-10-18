@@ -308,7 +308,7 @@ export interface ErrorDisposition {
 }
 export interface ErrorPolicy {
   scope: string // channel | models
-  modelIds?: number[] // scope=models 时生效的 channel_models 行 ID
+  modelIds?: string[] // scope=models 时生效的 channel_models 行 ID（雪花字符串，避免精度丢失）
   match: ErrorMatch
   disposition: ErrorDisposition
   note?: string

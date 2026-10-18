@@ -118,7 +118,7 @@ const externalModels = ref<ExternalModel[]>([])
 // failover 用 inherit 表示「未设置=沿用现状」，以匹配后端 *bool 语义。
 type ErrorPolicyForm = {
   scope: string // channel | models
-  modelIds: number[] // scope=models 时生效的 channel_models 行 ID
+  modelIds: string[] // scope=models 时生效的 channel_models 行 ID（雪花字符串，避免精度丢失）
   status: number | undefined
   errorType: string
   errorCode: string
@@ -131,7 +131,7 @@ type ErrorPolicyForm = {
 }
 const errorPolicies = ref<ErrorPolicyForm[]>([])
 // 可选模型（channel_models 行）：value 取行 ID，供「指定模型」多选。
-const policyModelOptions = ref<{ label: string; value: number }[]>([])
+const policyModelOptions = ref<{ label: string; value: string }[]>([])
 
 // 协议级错误统计（按类别计数）
 const errorStats = ref<ChannelProtocolErrorStat[]>([])
@@ -176,7 +176,7 @@ async function loadPolicyModelOptions() {
     }
     policyModelOptions.value = rows.map((cm) => ({
       label: `${cm.InternalModelID}（${cm.ChannelName || cm.ChannelID}）`,
-      value: Number(cm.ID),
+      value: String(cm.ID),
     }))
   } catch {
     /* 忽略：选项加载失败仍可编辑其它字段 */

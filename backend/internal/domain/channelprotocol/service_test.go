@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/team/llmgateway/internal/pkg/idgen"
 )
 
 func cpRow(id int64, name, baseURL, sourceID string, edited bool, status string) *sqlmock.Rows {
@@ -516,7 +517,7 @@ func TestValidateErrorPolicy(t *testing.T) {
 		wantErr  bool
 	}{
 		{"channel 合法", []ErrorPolicy{{Scope: ErrorScopeChannel, Disposition: ErrorDisposition{Action: ErrorActionNone}}}, false},
-		{"models 合法", []ErrorPolicy{{Scope: ErrorScopeModels, ModelIDs: []int64{1, 2}, Disposition: ErrorDisposition{Action: ErrorActionDrain}}}, false},
+		{"models 合法", []ErrorPolicy{{Scope: ErrorScopeModels, ModelIDs: idgen.IDs{1, 2}, Disposition: ErrorDisposition{Action: ErrorActionDrain}}}, false},
 		{"空 action 经归一为 none 后合法", []ErrorPolicy{{Scope: ErrorScopeChannel}}, false},
 		{"scope 非法", []ErrorPolicy{{Scope: "bogus", Disposition: ErrorDisposition{Action: ErrorActionNone}}}, true},
 		{"models 但 modelIds 为空", []ErrorPolicy{{Scope: ErrorScopeModels, Disposition: ErrorDisposition{Action: ErrorActionNone}}}, true},

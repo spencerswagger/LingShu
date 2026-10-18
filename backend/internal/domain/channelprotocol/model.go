@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/team/llmgateway/internal/domain/billing"
+	"github.com/team/llmgateway/internal/pkg/idgen"
 )
 
 // 基础协议（代码固定，不可由预设包新增）。
@@ -122,7 +123,8 @@ type ErrorPolicy struct {
 	// Scope 生效范围：channel=整渠道；models=仅对 ModelIDs 生效。
 	Scope string `json:"scope"`
 	// ModelIDs scope=models 时生效的内部模型（channel_models 行）ID 列表。
-	ModelIDs []int64 `json:"modelIds,omitempty"`
+	// 雪花 ID 超出 JS 安全整数，须以字符串数组序列化（idgen.IDs，对齐既有 ID 约定）。
+	ModelIDs idgen.IDs `json:"modelIds,omitempty"`
 	// Match 错误签名（status + code/type/message）。
 	Match ErrorMatch `json:"match"`
 	// Disposition 命中后的处置。

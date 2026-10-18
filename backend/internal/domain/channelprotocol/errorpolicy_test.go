@@ -1,6 +1,12 @@
 package channelprotocol
 
-import "testing"
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+
+	"github.com/team/llmgateway/internal/pkg/idgen"
+)
 
 // TestMatchError 表驱动覆盖错误策略匹配契约：
 //   - 优先级：status+code > status+type > 仅 status（与策略出现顺序无关）；
@@ -45,7 +51,7 @@ func TestMatchError(t *testing.T) {
 		{
 			name: "scope=models 且模型在 ModelIDs 内 → 命中",
 			policies: []ErrorPolicy{
-				{Scope: models, ModelIDs: []int64{7, 8}, Note: "models", Match: ErrorMatch{Status: 404}},
+				{Scope: models, ModelIDs: idgen.IDs{7, 8}, Note: "models", Match: ErrorMatch{Status: 404}},
 			},
 			modelID: 7, status: 404,
 			want: 0,
@@ -53,7 +59,7 @@ func TestMatchError(t *testing.T) {
 		{
 			name: "scope=models 且模型不在 ModelIDs 内 → 不命中",
 			policies: []ErrorPolicy{
-				{Scope: models, ModelIDs: []int64{7, 8}, Note: "models", Match: ErrorMatch{Status: 404}},
+				{Scope: models, ModelIDs: idgen.IDs{7, 8}, Note: "models", Match: ErrorMatch{Status: 404}},
 			},
 			modelID: 9, status: 404,
 			want: -1,
@@ -107,7 +113,7 @@ func TestMatchError(t *testing.T) {
 		{
 			name: "可选 scope 收紧：scope=channel 时 models 策略不命中",
 			policies: []ErrorPolicy{
-				{Scope: models, ModelIDs: []int64{1}, Note: "m", Match: ErrorMatch{Status: 429}},
+				{Scope: models, ModelIDs: idgen.IDs{1}, Note: "m", Match: ErrorMatch{Status: 429}},
 			},
 			scope: channel, modelID: 1, status: 429,
 			want: -1,
@@ -130,5 +136,40 @@ func TestMatchError(t *testing.T) {
 				t.Fatalf("命中策略不符：want #%d(%s) got (%s)", tt.want, tt.policies[tt.want].Note, got.Note)
 			}
 		})
+	}
+}
+
+// TestErrorPolicyModelIDsJSON 验证雪花 ID 精度契约：
+//   - 编码：modelIds 以 JSON 字符串数组输出（避免超出 JS 安全整数而丢精度）；
+//   - 解码：兼容字符串数组与历史整数数组两种形式。
+func TestErrorPolicyModelIDsJSON(t *testing.T) {
+	snowflake := int64(1234567890123456789)
+	p := ErrorPolicy{
+		Scope:    ErrorScopeModels,
+		ModelIDs: idgen.IDs{snowflake, 2},
+		Match:    ErrorMatch{Status: 404},
+	}
+	b, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if want := `"modelIds":["1234567890123456789","2"]`; !strings.Contains(string(b), want) {
+		t.Fatalf("modelIds 应以字符串数组编码：got %s，want 含 %s", b, want)
+	}
+
+	var back ErrorPolicy
+	if err := json.Unmarshal(b, &back); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(back.ModelIDs) != 2 || back.ModelIDs[0] != snowflake || back.ModelIDs[1] != 2 {
+		t.Fatalf("字符串数组往返不符：%+v", back.ModelIDs)
+	}
+
+	var legacy ErrorPolicy
+	if err := json.Unmarshal([]byte(`{"scope":"models","modelIds":[123,456],"match":{}}`), &legacy); err != nil {
+		t.Fatalf("历史整数数组应兼容解析：%v", err)
+	}
+	if len(legacy.ModelIDs) != 2 || legacy.ModelIDs[0] != 123 || legacy.ModelIDs[1] != 456 {
+		t.Fatalf("整数数组兼容解析不符：%+v", legacy.ModelIDs)
 	}
 }
