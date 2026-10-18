@@ -398,7 +398,7 @@ flowchart TD
     <section id="s3">
       <div class="sec-head"><span class="sec-num">03</span><h2>三条核心公式与有效缓存读单价</h2></div>
 
-      <p class="lead">所有花费单位都是<strong>积分</strong>，单价是<strong>积分 / 百万 token</strong>。倍率（时段倍率、上下文分档倍率）默认按当前时刻与上下文长度取值。</p>
+      <p class="lead">所有花费单位都是<strong>积分</strong>，单价是<strong>积分 / 百万 token</strong>。倍率（时段倍率、上下文分档倍率）在线上按「模型成本」里的时段 / 分档配置、<strong>以当前时刻与实际上下文长度自动取值</strong>（见第 06 章“线上取值来源”）。</p>
 
       <div class="formula">
         <div class="fname">公式 1 · 本轮花费</div>
@@ -571,7 +571,7 @@ B：若 预计剩余轮数 &gt; 回本轮数 → 切换</div>
       </p>
 
       <h3>参数面板（可调输入）</h3>
-      <p>下列参数即决策函数的输入。默认值取自示例渠道（Venice / DeepSeek），可任意拨动，所有图随之更新。</p>
+      <p>下列参数即决策函数的输入。<strong>本报告用滑块演示</strong>，便于直观看到“多条函数如何汇聚出临界点”；<strong>线上环境这些值默认从真实来源自动取</strong>（模型成本 + 会话真实 token + 当前时刻 / 实际分档），仅在 What-if 模拟时才允许覆盖（详见下方“线上取值来源”与“线上交互设计”）。</p>
       <div class="panel" id="router-panel">
         <div class="panel-group">
           <div class="panel-title">渠道三档价（积分 / 百万 token）</div>
@@ -609,9 +609,41 @@ B：若 预计剩余轮数 &gt; 回本轮数 → 切换</div>
             <div class="ctrl-field"><span class="lbl">模拟会话数（图 E）</span><input id="g-sessions" type="range" min="100" max="4000" step="100" value="1000"><span class="val" id="v-sessions">1000</span></div>
             <div class="ctrl-field"><span class="lbl">token 波动幅度（图 E）</span><input id="g-spread" type="range" min="0" max="0.6" step="0.02" value="0.3"><span class="val" id="v-spread">30%</span></div>
           </div>
-          <p class="chart-note">时段 / 分档倍率对“每轮花费”等比缩放（见 图 A）；在“回本（比值）”里会约掉，故 图 B / 图 C 不受其影响。</p>
+          <p class="chart-note">时段 / 分档倍率对“每轮花费”等比缩放（见 图 A），在“回本（比值）”里会约掉，故 图 B / 图 C 不受其影响。<strong>线上：模型定价、时段倍率、上下文分档倍率均从「模型成本」配置读取</strong>（时段按当前时刻、分档按实际上下文长度取值），此处的滑块仅为 What-if 演示。</p>
         </div>
       </div>
+
+      <h3>线上取值来源（这些入参不是手填的）</h3>
+      <p>线下演示用手填滑块；线上应<strong>从真实来源自动取值</strong>，人只在其上做“假设推演”：</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>入参</th><th>线上来源</th><th>取值规则</th></tr></thead>
+          <tbody>
+            <tr><td>模型三档价<br>（输入 / 缓存读 / 输出）</td><td><strong>模型成本配置</strong></td><td>取该对外模型下“渠道 × 密钥 × 内部模型”的实际三档价</td></tr>
+            <tr><td>时段倍率</td><td><strong>模型成本 · 时段配置</strong></td><td>按<strong>当前时刻</strong>落在哪个时段自动取值（闲 / 忙等）</td></tr>
+            <tr><td>上下文分档倍率</td><td><strong>模型成本 · 分档配置</strong></td><td>按<strong>当前实际上下文 token 落在哪一档</strong>自动取值——不是手选的档位</td></tr>
+            <tr><td>每轮新增输入 / 输出 token</td><td><strong>该会话本轮真实 usage</strong></td><td>来自调用日志的逐轮 token 明细</td></tr>
+            <tr><td>预计剩余轮数</td><td>会话位置 k 估计</td><td>由该会话当前进度推算</td></tr>
+            <tr><td>折扣 ρ</td><td>计算得出</td><td>= 目标渠道当前价 ÷ 当前渠道当前价</td></tr>
+            <tr><td>模拟会话数 / token 波动</td><td>统计参数（仅 What-if）</td><td>只用于“临界点分布”模拟，线上非必需</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="callout">
+        <span class="tag">只读 vs 可覆盖</span>
+        线上默认把来源值设为<strong>只读</strong>（灰显 + 来源标签，如“来自模型成本”“来自本轮 usage”）；只有切到 <strong>What-if</strong> 时才允许覆盖某一项，并在图上高亮“假设值 vs 真实值”的差异——既能看真实结论，也能做“如果调价 / 换档会怎样”的推演。
+      </div>
+
+      <h3>线上交互设计（比滑块更顺手）</h3>
+      <ul class="plain">
+        <li><strong>① 会话上下文条（顶部）：</strong>渠道、会话位置 k、<strong>当前上下文 token 及命中的分档</strong>、当前时段、预计剩余轮数——一眼看清“现在的处境”。</li>
+        <li><strong>② 候选渠道卡片：</strong>价格<strong>实时取自模型成本</strong>，卡片直接显示“本轮花费 / 重灌代价 / 回本轮数 / 建议”，支持多选并排对比。</li>
+        <li><strong>③ 图上叠加“当前位置”：</strong>把当前缓存读 token 画成一条竖线，直接看到它落在临界点的哪一侧。</li>
+        <li><strong>④ What-if 覆盖：</strong>对任一来源值点“假设”进入覆盖模式（改价、改档、改剩余轮数），函数图实时预览临界点移动；退出即恢复真实值。</li>
+        <li><strong>⑤ 预设场景：</strong>闲时 / 忙时、短会话 / 长会话、单渠道 / 多渠道，一键切换。</li>
+        <li><strong>⑥ 一键应用 + 留痕：</strong>把建议应用到路由配置，变更走异步落库留痕；判定依据（临界点、回本、门槛）随事件一并记录。</li>
+        <li><strong>⑦ 边界态提示：</strong>模型成本缺失、无临界点、目标渠道不可用等，给出明确文案而非空白图。</li>
+      </ul>
 
       <!-- 图A -->
       <figure class="chart-figure">
