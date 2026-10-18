@@ -443,6 +443,49 @@ func TestService_SyncPrices_SuccessInvalidatesOnce(t *testing.T) {
 	}
 }
 
+// TestService_SyncPrices_AllSkippedNoInvalidate 锁定成功路径的负向对照：
+// 当所有模型都无参考价（全部 Skipped、无一行写入）时，缓存**不得**被清空、跨包 hook **不得**回调——
+// 否则会在无任何售价变更时白白打掉缓存（写放大），与「有变更才失效」的收敛策略相悖。
+func TestService_SyncPrices_AllSkippedNoInvalidate(t *testing.T) {
+	s, mock := mockService(t)
+	s.SetPriceSource(namePriceSource{}) // 任何模型都无参考价
+	fired := 0
+	s.SetNameWriteHook(func() { fired++ })
+
+	now := time.Now()
+	listQ := `SELECT ` + cols + ` FROM external_models WHERE deleted_at IS NULL ORDER BY id ASC`
+	rows := extRow(&ExternalModel{ID: 1, ExternalName: "a", CreatedAt: now, UpdatedAt: now}, `{"input":1}`)
+	rows.AddRow(int64(2), "b", "", true, `{"input":1}`, nil, nil, now, now)
+	mock.ExpectQuery(regexp.QuoteMeta(listQ)).WillReturnRows(rows)
+
+	// 预置缓存条目：全部跳过时不得被清空。
+	s.store.cacheExternalName("a", nil)
+	s.store.cacheExternalName("b", nil)
+
+	res, err := s.SyncPrices(context.Background())
+	if err != nil {
+		t.Fatalf("SyncPrices: %v", err)
+	}
+	if len(res.Updated) != 0 {
+		t.Fatalf("无参考价时 Updated 应为空，got %+v", res.Updated)
+	}
+	if len(res.Skipped) != 2 {
+		t.Fatalf("无参考价时 Skipped 应为全量，got %+v", res.Skipped)
+	}
+	if fired != 0 {
+		t.Fatalf("无任何写入时不应回调失效 hook，got %d", fired)
+	}
+	s.store.extNameMu.RLock()
+	remaining := len(s.store.extNameCache)
+	s.store.extNameMu.RUnlock()
+	if remaining != 2 {
+		t.Fatalf("无变更时缓存应保留（2 条），got %d", remaining)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("mock expectations: %v", err)
+	}
+}
+
 // TestStore_ExternalNameCacheBounded 锁定 P1-5：对外名读缓存（键来自请求体、用户可控）必须有界，
 // 防止认证用户以海量随机名打满负缓存造成内存耗尽 DoS。
 func TestStore_ExternalNameCacheBounded(t *testing.T) {
