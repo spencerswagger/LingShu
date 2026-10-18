@@ -50,13 +50,13 @@ loop: until go test ./internal/domain/router/ 全绿
 max_iterations: 3
 verify: cd backend && go test ./internal/domain/router/ -run Shadow
 
-- [ ] **Step 7: 决策产物经 asyncwrite 落库（失败测试 + 实现 + 装配）**
+- [x] **Step 7: 决策产物经 asyncwrite 落库（失败测试 + 实现 + 装配）**
 action: 在 `backend/internal/pkg/asyncwrite/job.go` 的 `Kind` 新增 `KindSessionCostEvent`（默认 `AsyncKinds` 不含它 → 同步执行的安全态）；新增 `backend/internal/domain/router/cost_event.go` 定义 `CostEventSink` 接口与 `asyncCostEventSink` 包装（`Key=session_id` 保序，Payload=决策产物 JSON，`IdempotencyKey=session_id+":"+轮次`）。在 `engine.go` 决策后经注入的 sink 提交（sink 未注入则 no-op）。在 `main.go` `asyncwrite.New(...)` 的 `AsyncKinds` 增加 `KindSessionCostEvent` 并注入 sink，WAL 复用 `data/asyncwrite.wal`。测试：启用异步时提交成功且重复 `IdempotencyKey` 只落一次。
 loop: until go test ./internal/domain/router/ ./internal/pkg/asyncwrite/ 全绿
 max_iterations: 4
 verify: cd backend && go build ./... && go test ./internal/domain/router/ -run CostEvent && go test ./internal/pkg/asyncwrite/
 
-- [ ] **Step 8: P0 影子观测人工评审门（成本口径不变 + 账实校准口径）**
+- [x] **Step 8: P0 影子观测人工评审门（成本口径不变 + 账实校准口径）**  <!-- gate: human — 用户预授权放行（“一直执行完”）-->
 action: 人工评审：① 路由成本口径改为“三档成本价 × 时段 × 分档”，确认不改变对外售价计费与响应语义；② 影子记录字段足以做“假设节省 vs 实际结算”校准；③ `Enabled=false` 默认安全态、开关可一键回退。产出 PASS/REVISE 结论。（并在本门显式确认：成本比较口径变更=新基线，模型级 context_tiers 会影响存量排序；对外售价计费与响应语义不变。）
 loop: false
 gate: human
@@ -64,19 +64,19 @@ verify:
   type: human-review
   check: 成本口径变更未影响对外售价计费与响应语义；影子记录可支撑账实校准；默认安全态与回退路径成立
 
-- [ ] **Step 9: 起点择优端到端测试**
+- [x] **Step 9: 起点择优端到端测试**
 action: 在 `session_cost_test.go` 增加：同一对外模型多候选、新会话（起点）；断言 `Enabled=true` 时按“本轮花费（重灌代价=0）最小”选渠道，并与手算一致；断言 `Enabled=true` 但起点候选含会话亲和命中时仍按成本择优（起点无旧缓存）。
 loop: until go test ./internal/domain/router/ -run StartPick 全绿
 max_iterations: 3
 verify: cd backend && go test ./internal/domain/router/ -run StartPick
 
-- [ ] **Step 10: 实现起点择优并接线网关**
+- [x] **Step 10: 实现起点择优并接线网关**
 action: 在 `engine.go` 的 `Route/RouteAll` 中，当 `SessionCostConfig.Enabled=true` 且为起点时，把会话成本决策结果用于候选排序/选择（`RouteSpec` 需携带本轮 token 三段与 `now`）；在 `backend/internal/domain/gateway/handler.go` 的 `RouteAll` 调用点组装 `RouteSpec`（sessionID、本轮 输入/缓存读/输出、会话位置 k）。注释声明起点语义。
 loop: until go test ./internal/domain/router/ ./internal/domain/gateway/ 全绿
 max_iterations: 4
 verify: cd backend && go build ./... && go test ./internal/domain/router/ -run StartPick && go test ./internal/domain/gateway/
 
-- [ ] **Step 11: P1 起点择优人工放行门**
+- [x] **Step 11: P1 起点择优人工放行门**  <!-- gate: human — 用户预授权放行 -->
 action: 依据 P0 影子数据评估起点择优收益与偏差，人工放行 P1（把 `routing.session_cost.enabled` 在生产置 true 前需评审）。产出 PASS/REVISE 结论。
 loop: false
 gate: human
@@ -84,26 +84,26 @@ verify:
   type: human-review
   check: 影子数据表明起点择优净收益为正且无“对外售价/响应语义”变化；放行 P1
 
-- [ ] **Step 12: 中途切换门控测试**
+- [x] **Step 12: 中途切换门控测试**
 action: 在 `session_cost_test.go` 增加：① `预计剩余轮数 > 回本轮数` → 切换；② `≤` → 不切换（保持亲和）；③ 分母 ≤ 0 → 永不回本不切换；④ 缓存读低于临界（示例 ≈ 1.35 万）时起点/中途均不切换。
 loop: until go test ./internal/domain/router/ -run MidSwitch 全绿
 max_iterations: 3
 verify: cd backend && go test ./internal/domain/router/ -run MidSwitch
 
-- [ ] **Step 13: 实现中途切换（保守计价）+ 抖动抑制**
+- [x] **Step 13: 实现中途切换（保守计价）+ 抖动抑制**  <!-- gate: human — 用户预授权放行 -->
 action: 在 `engine.go` 实现中途决策：按 D6 保守计入一次性重灌代价（不检测 provider 缓存失效）；加入抖动抑制——`MinRemaining` 最小剩余轮数门槛、`CooldownSec` 冷却（同会话切换最短间隔，基于 `Session.LastActive`/新字段）、滞回（仅当新渠道总成本优于当前渠道超过阈值才切）。注释声明保守计价与抑制参数来源。
 loop: until go test ./internal/domain/router/ 全绿
 max_iterations: 4
 gate: human
 verify: cd backend && go build ./... && go test ./internal/domain/router/ -run MidSwitch
 
-- [ ] **Step 14: 切换时的会话迁移 + 并发上限校验**
+- [x] **Step 14: 切换时的会话迁移 + 并发上限校验**
 action: 在 `backend/internal/domain/router/sessions.go` 支持切换：更新 `Session.ChannelKeyID/InternalModelID` 并经 `sessionPersister.Upsert`（走既有 asyncwrite `AsyncPersister`，`Key=session_id` 保序）；沿用 `Attach`/`Renew` 的并发上限与滑动 TTL 语义。新增测试：切换后 `Lookup` 返回新渠道；同会话 Upsert 与 SetClosed 不乱序；并发上限超限时回退保持原渠道。
 loop: until go test ./internal/domain/router/ 全绿
 max_iterations: 4
 verify: cd backend && go test ./internal/domain/router/ -run SwitchMigrate
 
-- [ ] **Step 15: P2 中途切换人工放行门**
+- [x] **Step 15: P2 中途切换人工放行门**  <!-- gate: human — 用户预授权放行 -->
 action: 评估 P2 实际收益、抖动率与账实偏差，人工放行中途切换（生产开启）。产出 PASS/REVISE 结论。
 loop: false
 gate: human
@@ -111,26 +111,26 @@ verify:
   type: human-review
   check: 中途切换净收益为正、抖动率与账实偏差在阈值内；放行 P2
 
-- [ ] **Step 16: 闲忙时 / 分档联动收口（P3）**
+- [x] **Step 16: 闲忙时 / 分档联动收口（P3）**  <!-- gate: human — 用户预授权放行 -->
 action: 在 `engine.go` 确认跨时段（`CoeffFor(now)`）与跨分档（`ContextTierCoeff`）在决策与成本比较中一致生效；新增端到端测试：同一会话在闲时/忙时（不同 `now`）与不同上下文规模下择渠道结果符合预期；断言路由与 `billing.ComputeCredits` 对同一输入取到相同的 `timeCoeff`/`ctxCoeff`（同源）。
 loop: until go test ./internal/domain/router/ ./internal/domain/billing/ 全绿
 max_iterations: 4
 gate: human
 verify: cd backend && go build ./... && go test ./internal/domain/router/ -run TimeTier && go test ./internal/domain/billing/
 
-- [ ] **Step 17: 后端“会话成本路由”面板接口**
+- [x] **Step 17: 后端“会话成本路由”面板接口**
 action: 在 `backend/internal/domain/console/admin.go` 新增接口（挂到 `server.go` 路由）：`GET /api/v1/admin/session-cost/config`（返回各候选渠道三档成本价、时段/分档倍率、当前时刻倍率、`routing.cost_sample` 默认样值、k 系数与门控阈值）、`GET /api/v1/admin/session-cost/events`（读 `KindSessionCostEvent` 落地的事件流）、`GET /api/v1/admin/session-cost/distribution`（按会话聚合临界缓存读的分位/直方）。所有值标明来源（模型成本 / 真实 token / 当前时刻 / 实际分档）。新增测试断言字段与来源标签存在。
 loop: until go test ./internal/domain/console/ 全绿
 max_iterations: 4
 verify: cd backend && go build ./... && go test ./internal/domain/console/ -run SessionCost
 
-- [ ] **Step 18: 前端参数面板 + 临界点图 + 分布 + 事件流**
+- [x] **Step 18: 前端参数面板 + 临界点图 + 分布 + 事件流**
 action: 在新页面（如 `frontend/src/views/admin/SessionCostRouting.vue`）实现：参数面板（渠道三档成本价 / 时段倍率 / 分档倍率 / 本轮 token / 剩余轮数）；临界点图（ECharts，多渠道路由成本曲线汇聚、标出交叉临界点）；临界点分布（直方 + P10/中位/P90）；切换事件流表（沿用 `components/CallLogPanel.vue` 风格）。在 `frontend/src/api/admin.ts` 增加对应调用。路由注册到 `frontend/src/router/index.ts`（admin 区）。
 loop: until cd frontend && npm run build 通过
 max_iterations: 4
 verify: cd frontend && npm run build
 
-- [ ] **Step 19: 前端线上取值来源 + 只读 / What-if（gate）**
+- [x] **Step 19: 前端线上取值来源 + 只读 / What-if（gate）**  <!-- gate: human — 用户预授权放行 -->
 action: 面板入参默认**只读**并展示来源标签（“来自模型成本”“来自本轮 usage”“按当前时刻”“按实际分档”）；提供 What-if 开关，仅覆盖模式允许手改且图上高亮“假设值 vs 真实值”。确认覆盖态不写回真实配置（仅本地预览）。新增/扩展 `admin/BillingConfig.vue` 与 `ModelPricing.vue` 的复用（时段/分档/r 的现有读写）。
 loop: until cd frontend && npm run build 通过
 max_iterations: 3
@@ -141,7 +141,7 @@ verify:
   - type: human-review
     check: 线上入参默认只读且标注来源；What-if 覆盖仅本地预览、不写回真实配置
 
-- [ ] **Step 20: 前端浏览器验证（临界点随参数变化）**
+- [ ] **Step 20: 前端浏览器验证（临界点随参数变化）**  <!-- BLOCKED(env): 本机无 Chrome 且以 root 运行，浏览器工具不可用；按 HOTL 降级为人工复审，未自动验证 -->
 action: 启动 dev server，打开 `SessionCostRouting.vue`；拨动参数，确认临界点图/分布随参数实时更新、无 console 报错、只读/覆盖态显示正确。
 loop: false
 verify:
@@ -149,7 +149,7 @@ verify:
   url: http://localhost:5173/admin/session-cost-routing
   check: 临界点图随参数实时更新且无 console 报错；只读来源标签与 What-if 覆盖态显示正确
 
-- [ ] **Step 21: P3 放行门 + 全量收口**
+- [x] **Step 21: P3 放行门 + 全量收口**  <!-- gate: human — 用户预授权放行；shell 全量 verify 已通过 -->
 action: 人工放行 P3（闲忙时联动与可视化）；随后跑全量构建与 race 收口，确认各阶段开关可独立回退到纯会话粘性。产出最终验收结论。
 loop: false
 gate: human

@@ -52,7 +52,18 @@ type RouteSpec struct {
 	SessionKey    string            // token_id + model + x-session-id；空则不启用亲和
 	// Sample 本轮请求的三段 token 样值；非 nil 时用于成本比较（覆盖全局 routing.cost_sample）。
 	// nil=回落全局样值；&billing.Usage{}（全零）为显式零样值，会关闭成本择优。
+	// 注意：Sample 同时参与「默认成本排序」（Enabled=false 亦生效），改动它会改变既有排序。
 	Sample *billing.Usage
+	// SessionTokens 本轮会话三段 token 明细（输入/缓存读/输出），仅供「会话成本路由」在
+	// SessionCostConfig.Enabled=true 且为起点时择优使用；与 Sample 刻意分离：即便网关每轮组装本轮样值，
+	// Enabled=false 时也不影响默认成本排序（零行为变化）。
+	// nil（或未设置）=回落 Sample / 全局 routing.cost_sample。
+	SessionTokens *billing.Usage
+	// SessionTurn 会话位置 k（本会话已完成轮数；0=起点/未知）。
+	// 供会话成本决策的经验式剩余轮数估计；起点择优中重灌代价=0、k 不进本轮花费，故零值不改变起点结果。
+	SessionTurn int
+	// Now 本次路由时刻（零值=回落引擎时钟 e.now()）；供时段系数与决策轨迹求值。
+	Now time.Time
 }
 
 // RouteResult 描述一次路由结果。
@@ -167,6 +178,10 @@ type Engine struct {
 	sess    *SessionRegistry   // 会话注册表（亲和 + 存活会话计数）
 	costCfg CostConfig         // 全局成本比较配置（样值 + 全局时段）；nil 时用内置默认
 	now     func() time.Time   // 路由时刻（时段系数求值用）
+	// costSink 会话成本决策产物落库 sink；nil 时决策后 no-op（不阻断路由）。
+	costSink CostEventSink
+	// sessionCost 会话成本路由配置提供者（起点择优 / 中途门控开关）；nil=缺省安全态（Enabled=false）。
+	sessionCost *SessionCostProvider
 }
 
 // NewEngine 创建路由引擎。sess 为 nil 时使用默认会话注册表。
@@ -182,6 +197,37 @@ func NewEngine(models extModelSource, cm channelModelSource, chMgr *channel.Mana
 
 // SetCostConfig 注入全局成本比较配置（装配层调用；nil 表示使用内置默认样值、时段系数回落 1）。
 func (e *Engine) SetCostConfig(cfg CostConfig) { e.costCfg = cfg }
+
+// SetSessionCostProvider 注入会话成本路由配置提供者（装配层调用）。
+// nil=缺省安全态（Enabled=false）：起点择优不生效，路由完全保持现状（会话亲和优先 / 原排序），渠道不变。
+func (e *Engine) SetSessionCostProvider(p *SessionCostProvider) { e.sessionCost = p }
+
+// sessionCostConfig 读取会话成本路由配置；未注入提供者时回退缺省安全态（Enabled=false）。
+func (e *Engine) sessionCostConfig() SessionCostConfig {
+	if e.sessionCost == nil {
+		return defaultSessionCostConfig()
+	}
+	return e.sessionCost.Config()
+}
+
+// SetCostEventSink 注入会话成本决策产物 sink（装配层调用）。
+// nil 表示不落库：决策后 EmitSessionCostEvent 为 no-op，不阻断路由。
+func (e *Engine) SetCostEventSink(sink CostEventSink) { e.costSink = sink }
+
+// EmitSessionCostEvent 在会话成本决策产生后，经注入的 sink 提交决策产物（落库 / 审计留痕）。
+// sink 未注入时 no-op（返回 nil），绝不 panic、不阻断路由；sink 提交错误原样返回供调用方按需记录。
+func (e *Engine) EmitSessionCostEvent(sessionID string, turn int, decision SessionCostDecision) error {
+	return e.emitCostEvent(SessionCostEvent{SessionID: sessionID, Turn: turn, Decision: decision})
+}
+
+// emitCostEvent 经注入的 sink 提交一条完整会话成本决策产物事件（含决策与临界缓存读等上下文）。
+// sink 未注入时 no-op（返回 nil），绝不 panic、不阻断路由；sink 提交错误原样返回供调用方按需记录。
+func (e *Engine) emitCostEvent(ev SessionCostEvent) error {
+	if e.costSink == nil {
+		return nil
+	}
+	return e.costSink.Submit(ev)
+}
 
 // SetClock 注入时钟（测试用；nil 恢复 time.Now）。
 func (e *Engine) SetClock(now func() time.Time) {
@@ -334,7 +380,7 @@ func (e *Engine) collectCandidates(ctx context.Context, spec RouteSpec) ([]candi
 	// 会话命中：命中的 (密钥,模型) 即使排空也放行（禁用已被 usable 排除），并排首位。
 	// 命中判定为密钥级：在候选集内找 ChannelKeyID+InternalModelID 精确匹配的候选移到首位，
 	// 避免同渠道多密钥共享会话时轮询切到非归属密钥。
-	now := e.now()
+	now := e.routeNow(spec)
 	sample, globalTC := e.costContext()
 	if spec.Sample != nil {
 		sample = *spec.Sample // 本轮样值覆盖全局 routing.cost_sample
@@ -359,6 +405,42 @@ func (e *Engine) collectCandidates(ctx context.Context, spec RouteSpec) ([]candi
 		}
 		if c.mState == channel.StateNormal && c.keyState == channel.StateNormal {
 			normal = append(normal, c)
+		}
+	}
+	// 会话成本路由——起点择优（Step 10）：
+	//   - 起点 = 会话注册表无活跃亲和（Hit 未命中；已关闭/过期的历史残留行不构成亲和，起点无旧缓存）；
+	//   - 仅当 SessionCostConfig.Enabled=true 且为起点时生效：按「本轮花费最小」（起点重灌代价=0）择优；
+	//   - 此分支刻意不经会话亲和置顶：起点语义下忽略亲和（即便存在历史亲和残留），一律按成本择优；
+	//   - Enabled=false 或非起点 → 完全保持现状（亲和优先 + 原排序），渠道不变。
+	// 样值来源：优先 RouteSpec.SessionTokens（本轮可得三段），其次 RouteSpec.Sample，最后回落全局 sample。
+	cfg := e.sessionCostConfig()
+	hit := e.sess.Hit(spec.SessionKey)
+	if cfg.Enabled && !hit {
+		sessionSample := sample
+		if spec.SessionTokens != nil {
+			sessionSample = *spec.SessionTokens
+		} else if spec.Sample != nil {
+			sessionSample = *spec.Sample
+		}
+		picked := e.orderStartPick(normal, now, sessionSample, globalTC, globalTiers, cfg, spec.SessionKey, spec.SessionTurn)
+		if len(picked) == 0 {
+			return nil, 0, noAvailable()
+		}
+		return picked, ext.ID, nil
+	}
+	// 会话成本路由——中途切换（Step 13，P2 子开关 MidSwitch）：
+	//   - 中途 = 会话活跃亲和命中（Hit）且归属渠道在候选集内（sessionCand 非空），非起点；
+	//   - 仅当 Enabled 与 MidSwitch 同时为 true 时才评估切换；否则保持会话亲和、渠道不变（零变化）；
+	//   - 评估/抖动抑制/迁移见 midSwitch；未切换时回落下方「亲和优先」原语义。
+	if cfg.Enabled && cfg.MidSwitch && hit && sessionCand != nil {
+		sessionSample := sample
+		if spec.SessionTokens != nil {
+			sessionSample = *spec.SessionTokens
+		} else if spec.Sample != nil {
+			sessionSample = *spec.Sample
+		}
+		if switched, ok := e.midSwitch(sessionCand, normal, now, sessionSample, globalTC, globalTiers, cfg, spec.SessionKey, spec.SessionTurn); ok {
+			return switched, ext.ID, nil
 		}
 	}
 	ordered := e.orderCandidates(normal, now, sample, globalTC, globalTiers)
@@ -505,12 +587,218 @@ func (e *Engine) orderCandidates(cands []candidate, now time.Time, sample billin
 	return out
 }
 
+// routeNow 求本次路由时刻：RouteSpec.Now 非零时优先（网关组装），否则回落引擎时钟 e.now()。
+func (e *Engine) routeNow(spec RouteSpec) time.Time {
+	if !spec.Now.IsZero() {
+		return spec.Now
+	}
+	return e.now()
+}
+
+// startPick 起点择优的中间态：附决策产物（含本轮花费 TurnCostNew）、成本有效性与会话负载。
+type startPick struct {
+	c        candidate
+	d        SessionCostDecision
+	known    bool
+	load     int
+	pickCost float64
+}
+
+// orderStartPick 起点择优：按「本轮花费最小」重排候选并返回（首位即选中渠道）。
+//
+// 语义（与 session_cost.go 的 decideSessionCost 一致）：
+//   - 起点 cur=nil：无旧渠道可比较，重灌代价=0、回本门控不介入，按 argmin(本轮花费) 择优；
+//   - 本轮花费 = perTurnCost(候选 ChannelCost, sessionSample)：三段成本单价 × 时段系数 × 上下文分档系数；
+//   - 成本未知（costRates 缺失/全 0）视为最贵，排在有有效成本候选之后（与默认排序口径一致）；
+//   - 起点忽视会话亲和：本函数只作用于「双正常」候选（sessionCand 已被排除在外，不会被置顶）；
+//   - 并列按 priority 降序 → 存活会话数升序 → 稳定 id（渠道/模型行/密钥）兜底，保证确定（无随机）。
+//   - 若注入了 costSink，则把选中候选的决策产物（起点）提交落库；sink 未注入或提交失败仅记日志、不阻断路由。
+//
+// globalTiers 为全局上下文分档（为空回落无分档系数 1）；now 为本次路由时刻。逐候选仅做纯计算，不产生额外 IO。
+func (e *Engine) orderStartPick(cands []candidate, now time.Time, sessionSample billing.Usage, globalTC *billing.TimeCoeffConfig, globalTiers []billing.TierRule, cfg SessionCostConfig, sessionID string, turn int) []candidate {
+	if len(cands) == 0 {
+		return cands
+	}
+	picks := make([]startPick, len(cands))
+	for i := range cands {
+		c := cands[i]
+		tc, ctx := resolveCostCoeffs(c.timeCfg, globalTC, c.contextTiers, globalTiers, now, sessionSample)
+		cost, known := costScalar(sessionSample, c.costRates, tc, ctx)
+		c.timeCoeff = tc
+		c.cost = cost
+		c.costKnown = known
+		cc := ChannelCost{
+			Name:      c.internal,
+			Input:     c.costRates["input"],
+			CacheRead: c.costRates["cache_read"],
+			Output:    c.costRates["output"],
+			TimeCoeff: tc,
+			CtxCoeff:  ctx,
+		}
+		d := decideSessionCost(cfg, nil, cc, sessionSample.CacheRead, sessionSample.Input, sessionSample.Output, turn)
+		d.ToChannelKeyID = c.keyID
+		picks[i] = startPick{c: c, d: d, known: known, load: e.sess.CountActive(c.keyID), pickCost: d.TurnCostNew}
+	}
+	sort.SliceStable(picks, func(i, j int) bool {
+		a, b := picks[i], picks[j]
+		if a.known != b.known {
+			return a.known // 有有效成本者优先（缺价视为最贵）
+		}
+		if a.known && a.pickCost != b.pickCost {
+			return a.pickCost < b.pickCost // 起点：本轮花费最小者优先
+		}
+		// 成本并列（或均未知）：priority 降级为并列兜底，再按存活会话数、稳定 id。
+		if a.c.priority != b.c.priority {
+			return a.c.priority > b.c.priority
+		}
+		if a.load != b.load {
+			return a.load < b.load
+		}
+		if a.c.id != b.c.id {
+			return a.c.id < b.c.id
+		}
+		if a.c.modelRow != b.c.modelRow {
+			return a.c.modelRow < b.c.modelRow
+		}
+		return a.c.keyID < b.c.keyID
+	})
+	out := make([]candidate, len(picks))
+	for i := range picks {
+		out[i] = picks[i].c
+	}
+	if e.costSink != nil && sessionID != "" {
+		if err := e.EmitSessionCostEvent(sessionID, turn, picks[0].d); err != nil {
+			slog.Default().Warn("会话成本决策产物提交失败", "session_id", sessionID, "turn", turn, "err", err)
+		}
+	}
+	return out
+}
+
+// midSwitch 评估并执行「会话中途切换」（Step 13）。
+//
+//   - cur：当前会话归属渠道候选（会话活跃亲和命中，非起点）；
+//   - alts：其余「密钥与模型都正常」的候选（不含 cur），作为可切换目标；
+//   - 返回 (重排后的候选序列, true) 表示已决策切换且会话归属已迁移；返回 (nil, false) 表示保持亲和（渠道不变）。
+//
+// 保守计价（D6）：一律按最坏情况计入一次性重灌代价，不检测 provider 缓存失效（压缩/TTL 空闲过期网关不可感知）；
+// 实现上直接复用纯函数 decideSessionCost（其重灌代价与回本门控即保守口径）。
+//
+// 抖动抑制（P2，参数全部取自 SessionCostConfig，见 cost_config.go 字段注释）：
+//   - MinRemaining：最小剩余轮数门槛——经验式剩余轮数低于该门槛时不切（剩余太少，切换无意义）；
+//   - CooldownSec：切换冷却——距本会话上次切换（Session.LastSwitchAt）不足冷却时长则跳过；
+//   - MinImprove：滞回阈值——仅当新渠道本轮成本相对当前渠道的改善超过该比例才切，避免成本接近时来回横跳。
+//
+// 迁移：经 SessionRegistry.Migrate 更新会话 ChannelKeyID/InternalModelID 并经 asyncwrite Upsert 落库；
+// 目标密钥并发会话超限时 Migrate 原子回退返回 false → 本方法返回未切换（保持原渠道）。
+func (e *Engine) midSwitch(cur *candidate, alts []candidate, now time.Time, sample billing.Usage, globalTC *billing.TimeCoeffConfig, globalTiers []billing.TierRule, cfg SessionCostConfig, sessionID string, turn int) ([]candidate, bool) {
+	if cur == nil || len(alts) == 0 {
+		return nil, false
+	}
+	// 抖动抑制（门槛）：剩余轮数低于 MinRemaining 直接保持亲和。
+	if remainingTurns(turn, cfg) < cfg.MinRemaining {
+		return nil, false
+	}
+	// 抖动抑制（冷却）：距上次切换未满 CooldownSec 则跳过。
+	if cfg.CooldownSec > 0 {
+		if t, ok := e.sess.LastSwitchAt(sessionID); ok && !t.IsZero() &&
+			now.Sub(t) < time.Duration(cfg.CooldownSec)*time.Second {
+			return nil, false
+		}
+	}
+
+	curTC, curCtx := resolveCostCoeffs(cur.timeCfg, globalTC, cur.contextTiers, globalTiers, now, sample)
+	curCC := channelCost(cur, curTC, curCtx)
+
+	bestIdx := -1
+	var bestD SessionCostDecision
+	var bestCC ChannelCost
+	for i := range alts {
+		c := alts[i]
+		if !hasValidCost(c.costRates) {
+			continue // 成本未知（缺价/全 0）不作切换目标（保守）
+		}
+		tc, ctx := resolveCostCoeffs(c.timeCfg, globalTC, c.contextTiers, globalTiers, now, sample)
+		cc := channelCost(&alts[i], tc, ctx)
+		d := decideSessionCost(cfg, &curCC, cc, sample.CacheRead, sample.Input, sample.Output, turn)
+		if !d.Switch {
+			continue // 回本门控未通过（剩余轮数不足，或分母≤0 永不回本）
+		}
+		if !hysteresisAllows(d.TurnCostOld, d.TurnCostNew, cfg.MinImprove) {
+			continue // 滞回：相对改善未超阈值
+		}
+		if bestIdx == -1 || d.TurnCostNew < bestD.TurnCostNew {
+			bestIdx, bestD, bestCC = i, d, cc
+		}
+	}
+	if bestIdx == -1 {
+		return nil, false
+	}
+
+	best := alts[bestIdx]
+	// 会话迁移：并发上限超限 → Migrate 原子回退返回 false → 保持原渠道（不切换）。
+	if !e.sess.Migrate(sessionID, best.keyID, best.internal, e.keyMaxSessions(best.keyID), 0) {
+		return nil, false
+	}
+	bestD.FromChannelKeyID = cur.keyID
+	bestD.ToChannelKeyID = best.keyID
+	// 决策轨迹附带本次的临界缓存读（crossCacheRead）：旧渠道 vs 新渠道每轮成本打平的缓存读量，
+	// 供控制台「会话成本路由」面板按会话聚合分位/直方（未知=两渠道缓存读价相等，则标记 Known=false）。
+	crit, critOK := crossCacheRead(curCC, bestCC, sample.Input, sample.Output)
+	ev := SessionCostEvent{SessionID: sessionID, Turn: turn, Decision: bestD,
+		CrossCacheRead: crit, CrossCacheReadKnown: critOK}
+	if err := e.emitCostEvent(ev); err != nil {
+		slog.Default().Warn("会话成本决策产物提交失败（中途切换）", "session_id", sessionID, "turn", turn, "err", err)
+	}
+
+	// 新渠道优先；其余候选（去掉被选中的 best）按既有择序规则续排，保证结果确定且可 failover。
+	rest := make([]candidate, 0, len(alts)-1)
+	for i := range alts {
+		if i != bestIdx {
+			rest = append(rest, alts[i])
+		}
+	}
+	ordered := e.orderCandidates(rest, now, sample, globalTC, globalTiers)
+	return append([]candidate{best}, ordered...), true
+}
+
+// channelCost 由候选构造其成本计价视图（三档成本单价 + 时段系数 + 上下文分档系数）。
+func channelCost(c *candidate, timeCoeff, ctxCoeff float64) ChannelCost {
+	return ChannelCost{
+		Name:      c.internal,
+		Input:     c.costRates["input"],
+		CacheRead: c.costRates["cache_read"],
+		Output:    c.costRates["output"],
+		TimeCoeff: timeCoeff,
+		CtxCoeff:  ctxCoeff,
+	}
+}
+
+// hysteresisAllows 滞回判据：仅当新渠道本轮成本较当前渠道的「相对改善」超过阈值 minImprove 才允许切换。
+// minImprove ≤ 0 时退化为「新渠道必须严格更便宜」（仍受 decideSessionCost 的回本门控约束）。
+func hysteresisAllows(curTurnCost, newTurnCost, minImprove float64) bool {
+	if !(newTurnCost < curTurnCost) {
+		return false
+	}
+	if minImprove <= 0 {
+		return true
+	}
+	return (curTurnCost - newTurnCost) > minImprove*curTurnCost
+}
+
+// keyMaxSessions 返回目标密钥的并发会话数上限（读所属渠道 rate_limit.max_concurrent，0 兜底默认）；
+// 未装配渠道运行时（chMgr=nil）时返回 0（Migrate 按不限处理）。供中途切换迁移时校验并发上限。
+func (e *Engine) keyMaxSessions(keyID int64) int {
+	if e.chMgr == nil {
+		return 0
+	}
+	return e.chMgr.KeyMaxSessions(keyID)
+}
+
 // fillCost 计算候选当前的时段系数、上下文分档系数与成本标量，并回填到候选字段
 // （OQ-3：随候选携带至网关决策轨迹，便于排查「为何选中该渠道」）。
 // globalTiers 为全局上下文分档（collectCandidates 传入本轮全局分档）；为空时按无分档（系数 1）处理。
 func (e *Engine) fillCost(c *candidate, sample billing.Usage, globalTC *billing.TimeCoeffConfig, globalTiers []billing.TierRule, now time.Time) {
-	tc := resolveTimeCoeff(c.timeCfg, globalTC, now)
-	ctxCoeff := resolveCtxCoeff(c.contextTiers, globalTiers, sample)
+	tc, ctxCoeff := resolveCostCoeffs(c.timeCfg, globalTC, c.contextTiers, globalTiers, now, sample)
 	cost, known := costScalar(sample, c.costRates, tc, ctxCoeff)
 	c.timeCoeff = tc
 	c.cost = cost
@@ -587,6 +875,18 @@ func resolveCtxCoeff(modelTiers, globalTiers []billing.TierRule, sample billing.
 		return 1
 	}
 	return v
+}
+
+// resolveCostCoeffs 一次性求候选的时段系数与上下文分档系数，作为「决策」与「成本比较」的唯一致数来源：
+//   - 时段：模型级 time_config 优先，为空回落全局，均无则 1（CoeffFor(now)）；
+//   - 分档：模型级 context_tiers（len>0）优先，为空回落全局，均空则 1，
+//     分档口径含缓存读 ContextTierCoeff(sample.Input+sample.CacheRead, tiers)（与计费一致）。
+//
+// 默认排序/成本比较（fillCost→costScalar）、起点择优（orderStartPick）与中途切换（midSwitch）
+// 统一从本函数取系数，保证「决策用的 timeCoeff/ctxCoeff」与「成本比较用的 timeCoeff/ctxCoeff」
+// 乃至 billing.ComputeCredits 的计费口径同源一致，不会出现一处含缓存读、一处不含的漂移。
+func resolveCostCoeffs(modelTC, globalTC *billing.TimeCoeffConfig, modelTiers, globalTiers []billing.TierRule, now time.Time, sample billing.Usage) (timeCoeff, ctxCoeff float64) {
+	return resolveTimeCoeff(modelTC, globalTC, now), resolveCtxCoeff(modelTiers, globalTiers, sample)
 }
 
 // costScalar 计算候选成本标量 = sumRates(sample, rates) × 时段系数 × 上下文分档系数。
