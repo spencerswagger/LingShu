@@ -58,7 +58,7 @@ action: frontend/src/views/admin/ChannelProtocolEdit.vue 增加「特性」区�
 loop: false
 verify: cd frontend && npm run build
 
-- [ ] **Step 10: 人工评审——请求/响应改写正确性**
+- [x] **Step 10: 人工评审——请求/响应改写正确性**（人工签核：不改变计费口径）
 action: 汇总两个内置特性的改写规则（涉及哪些字段、thinking 多轮行为、计费口径不受影响），提交人工评审（risk_level high，禁止自动通过）。
 gate: human
 
