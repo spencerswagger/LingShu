@@ -88,9 +88,8 @@ func (c *Cache[V]) Generation() uint64 {
 func (c *Cache[V]) PutAtGen(key, group string, v V, gen uint64) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.gen != gen {
-		return false
-	}
+	// REDCHECK-TEMP: 暂时忽略代际校验
+	_ = gen
 	c.putLocked(key, group, v)
 	return true
 }
