@@ -708,6 +708,45 @@ func TestServeModels(t *testing.T) {
 	}
 }
 
+// 场景 8b：别名仅用于模型名解析，绝不进入 GET /v1/models——
+// 输出仅含启用对外模型名与 Auto 名，别名无论规范模型是否启用都不得出现。
+func TestHandleModels_AliasNotListed(t *testing.T) {
+	h := build(t, "http://unused")
+	h.gw.listEnabled = func(_ context.Context) ([]model.ExternalModel, error) {
+		return []model.ExternalModel{
+			{ID: 1, ExternalName: "real-model", Enabled: true,
+				Aliases: []string{"cc-default", "sonnet"}, CreatedAt: time.Unix(1700000000, 0)},
+		}, nil
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer sk-gw-t")
+	rec := httptest.NewRecorder()
+	h.gw.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Object string `json:"object"`
+		Data   []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode models resp: %v", err)
+	}
+	ids := map[string]bool{}
+	for _, d := range body.Data {
+		ids[d.ID] = true
+	}
+	if !ids["real-model"] {
+		t.Fatalf("启用对外模型名应被列出，data=%s", rec.Body.String())
+	}
+	if ids["cc-default"] || ids["sonnet"] {
+		t.Fatalf("别名绝不进入 /v1/models，data=%s", rec.Body.String())
+	}
+}
+
 // 场景 B5-1：双密钥候选，keyA 已 DISABLED → 循环跳过 keyA，转发使用 keyB 明文凭据。
 func TestServeDisabledKeyFailover(t *testing.T) {
 	var upstreamAuth string

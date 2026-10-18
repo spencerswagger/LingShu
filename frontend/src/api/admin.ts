@@ -696,6 +696,8 @@ export interface ExternalModel {
   SaleRates: Record<string, number>
   TimeConfig: TimeCoeffConfig | null
   ContextTiers: ContextTier[] | null
+  // 别名：仅用于模型名解析（请求命中任一别名即路由到本模型），不出现在 /v1/models
+  Aliases?: string[]
   CreatedAt: string
   UpdatedAt: string
 }
@@ -706,6 +708,7 @@ export interface ExternalModelInput {
   SaleRates: Record<string, number>
   TimeConfig?: TimeCoeffConfig | null
   ContextTiers?: ContextTier[] | null
+  Aliases?: string[]
 }
 // 列表返回裸数组（非 {list}）
 export function listExternalModels(params: Record<string, unknown> = {}, base = '/admin') {
