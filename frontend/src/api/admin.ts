@@ -1177,6 +1177,9 @@ export interface SessionCostEventView {
   Switch: boolean
   FromChannelKeyID: string
   ToChannelKeyID: string
+  // 由渠道密钥 ID 解析出的所属渠道名（起点无旧渠道或密钥不存在时为空串）
+  FromChannelName: string
+  ToChannelName: string
   TurnCostOld: number
   TurnCostNew: number
   RechargeCost: number

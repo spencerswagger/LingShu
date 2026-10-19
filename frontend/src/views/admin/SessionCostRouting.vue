@@ -153,6 +153,12 @@ function fmtNum(v: number | null | undefined): string {
   if (a >= 1000) return v.toLocaleString('zh-CN', { maximumFractionDigits: 2 })
   return String(round6(v))
 }
+// 渠道迁移展示：优先渠道名；起点（keyID=0）显示「起点」；解析不到名时回落 ID。
+function chLabel(keyID: string | undefined, name: string | undefined): string {
+  if (name) return name
+  if (!keyID || keyID === '0') return '起点'
+  return keyID
+}
 
 const PALETTE = ['#5a5ce8', '#e6a23c', '#67c23a', '#f56c6c', '#36cfc9', '#b37feb', '#ff85c0', '#909399']
 
@@ -551,7 +557,7 @@ onMounted(async () => {
           </el-table-column>
           <el-table-column label="渠道迁移" min-width="200">
             <template #default="{ row }">
-              <span class="mono">{{ row.FromChannelKeyID || '-' }} → {{ row.ToChannelKeyID || '-' }}</span>
+              <span class="mono">{{ chLabel(row.FromChannelKeyID, row.FromChannelName) }} → {{ chLabel(row.ToChannelKeyID, row.ToChannelName) }}</span>
             </template>
           </el-table-column>
           <el-table-column label="本轮成本（旧→新）" min-width="170" align="right">
