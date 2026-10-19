@@ -117,10 +117,9 @@ const rows = computed<MatrixRow[]>(() => {
 
 // 列顺序：已勾选维度列（external,internal,channel,key 固定顺序）+ 指标列（priority,limits,sessions）。
 // span-method 依赖 columnIndex 对应本数组，故以 cols 计算属性作为唯一索引真源。
-type ColKey = 'external' | 'internal' | 'channel' | 'key' | 'rank' | 'priority' | 'limits' | 'sessions'
+type ColKey = 'external' | 'internal' | 'channel' | 'key' | 'priority' | 'limits' | 'sessions'
 const DIM_COLS: ColKey[] = ['external', 'internal', 'channel', 'key']
 const cols = computed<ColKey[]>(() => [
-  ...(modelAxis.value && keyAxis.value ? (['rank'] as ColKey[]) : []),
   ...DIM_COLS.filter((k) => dims.value.includes(k)),
   'priority',
   'limits',
@@ -128,20 +127,19 @@ const cols = computed<ColKey[]>(() => [
 ])
 
 // 合并列分组键：仅对「已勾选且进入行轴」的维度列做连续合并；折叠维度列与叶级指标不合并。
+// 关键：维度列合并键必须带上状态，否则会把「同名但状态不同」的行并成一格（例如某渠道已禁用却显示为绿）。
 // 指标归属：优先级→渠道级；合并限流列→随行轴（模型级/密钥级并置）；会话数→密钥级。
 function mergeKeyOf(ck: ColKey): ((r: MatrixRow) => string) | null {
   switch (ck) {
     case 'external':
-      return dims.value.includes('external') ? (r) => (r.model ? 'E' + r.model.View.ExternalModelID : '') : null
+      return dims.value.includes('external') ? (r) => (r.model ? 'E' + r.model.View.ExternalModelID + '|' + extRowState(r) : '') : null
     case 'internal':
-      return dims.value.includes('internal') ? (r) => (r.model ? 'E' + r.model.View.ExternalModelID + '|I' + r.model.View.InternalModelID : '') : null
+      return dims.value.includes('internal') ? (r) => (r.model ? 'E' + r.model.View.ExternalModelID + '|I' + r.model.View.InternalModelID + '|' + r.model.View.State : '') : null
     case 'channel':
       return chanAxis.value ? (r) => 'C' + r.channel.View.ID : null
     case 'key':
-      return keyAxis.value ? (r) => (r.key ? 'K' + r.channel.View.ID + '|' + r.key.View.KeyID : '') : null
-    case 'rank':
-      // 序位列为独立通路列：不参与合并，保证每个通路行各自的序位图标可见。
-      return null
+      // 密钥列跨模型合并，但序位可能随外部模型不同 → 把序位并入合并键，避免色条与实际不符。
+      return keyAxis.value ? (r) => (r.key ? 'K' + r.channel.View.ID + '|' + r.key.View.KeyID + '|' + String(rankOf(r)) : '') : null
     case 'priority':
       return (r) => 'C' + r.channel.View.ID
     case 'limits':
@@ -311,14 +309,12 @@ function extPathsOf(extId: string): { channel: string; model: string; state: str
   }
   return out
 }
-function extStateOf(extId: string): string {
-  if (!extEnabledOf(extId)) return 'DISABLED'
-  const paths = extPathsOf(extId)
-  if (!paths.length) return 'DISABLED'
-  const healthy = paths.filter((p) => p.state === 'NORMAL').length
-  if (healthy === 0) return 'DISABLED'
-  if (healthy < paths.length) return 'PARTIAL'
-  return 'NORMAL'
+// 对外模型无自身状态机。行口径：本行通路是否可用 = 对外模型启用 ? 本行内部模型状态 : 禁用。
+// 这样同一行的「对外模型灯」与「内部模型灯」口径一致，不会出现「对外黄、内部绿」的矛盾。
+// 全局可用性（跨渠道 x/y 通路）只放在 tooltip 里说明，不再用一个聚合色灯误导。
+function extRowState(r: MatrixRow): string {
+  if (!r.model) return 'NORMAL'
+  return extEnabledOf(r.model.View.ExternalModelID) ? r.model.View.State : 'DISABLED'
 }
 function extReasonOf(extId: string): ReasonLine[] {
   const enabled = extEnabledOf(extId)
@@ -329,7 +325,7 @@ function extReasonOf(extId: string): ReasonLine[] {
     lines.push({ text: '已停用：不参与路由' })
     return lines
   }
-  lines.push({ text: `可用通路 ${healthy}/${paths.length}`, danger: healthy === 0 })
+  lines.push({ text: `全局可用通路 ${healthy}/${paths.length}`, danger: healthy === 0 })
   for (const p of paths) {
     if (p.state !== 'NORMAL') lines.push({ text: `渠道 ${p.channel} · 模型 ${p.model}：${stateLabel(p.state)}`, danger: p.state === 'DISABLED' })
   }
@@ -352,17 +348,6 @@ function foldModelsReason(ms: ModelDetail[]): ReasonLine[] {
     }
   }
   if (!lines.length) lines.push({ text: '全部内部模型正常' })
-  return lines
-}
-function foldExternalReason(ids: string[], ms: ModelDetail[]): ReasonLine[] {
-  const lines: ReasonLine[] = []
-  for (const id of ids) {
-    lines.push({ text: `对外模型 ${externalNameByID.value[id] || id}：${extEnabledOf(id) ? '启用' : '停用'}`, danger: !extEnabledOf(id) })
-  }
-  for (const m of ms) {
-    if (m.View.State !== 'NORMAL') lines.push({ text: `${m.View.InternalModelID}：${m.View.State}`, danger: m.View.State === 'DISABLED' })
-  }
-  if (!lines.length) lines.push({ text: '全部正常' })
   return lines
 }
 function foldKeysReason(ks: KeyDetail[]): ReasonLine[] {
@@ -388,19 +373,9 @@ interface DimCell {
   multi: boolean
 }
 function externalCell(r: MatrixRow): DimCell {
-  const ids = [...new Set(r.models.map((m) => m.View.ExternalModelID))]
-  if (ids.length === 0) return { state: 'NORMAL', name: '—', sub: '', reason: [{ text: '无对外模型' }], multi: false }
-  if (ids.length === 1) {
-    return { state: extStateOf(ids[0]), name: externalNameByID.value[ids[0]] || ids[0], sub: '', reason: extReasonOf(ids[0]), multi: false }
-  }
-  const states = [...r.models.map((m) => m.View.State), ...ids.map(extStateOf)]
-  return {
-    state: worstState(states),
-    name: foldText(r.models.length, r.models.filter((m) => m.View.State !== 'NORMAL').length),
-    sub: '',
-    reason: foldExternalReason(ids, r.models),
-    multi: true,
-  }
+  const extId = r.model ? r.model.View.ExternalModelID : r.models[0]?.View.ExternalModelID
+  if (!extId) return { state: 'NORMAL', name: '—', sub: '', reason: [{ text: '无对外模型' }], multi: false }
+  return { state: extRowState(r), name: externalNameByID.value[extId] || extId, sub: '', reason: extReasonOf(extId), multi: false }
 }
 function internalCell(r: MatrixRow): DimCell {
   const ms = r.models
@@ -465,25 +440,14 @@ function rankClass(r: MatrixRow): string {
   if (rank === 1) return 'rank-first'
   return 'rank-second'
 }
-function rankSymbol(r: MatrixRow): string {
-  const rank = rankOf(r)
-  if (rank === null) return ''
-  if (rank === 'none') return '—'
-  if (rank === 1) return '★'
-  if (rank === 2) return '☆'
-  return '·' + rank
-}
-// 序位悬浮说明：符号与左侧竖条同义（同一颜色语义）。
+// 序位悬停释义（色条即序位语义）。
 function rankTip(r: MatrixRow): string {
   const rank = rankOf(r)
   if (rank === null) return ''
-  if (rank === 'none') return '不参与新会话（未进入候选排序）· 左侧深灰竖条'
-  if (rank === 1) return '首选（第 1 候选）· 左侧金色竖条'
-  if (rank === 2) return '次选（第 2 候选）· 左侧浅灰竖条'
-  return `第 ${rank} 候选 · 左侧浅灰竖条`
-}
-function rowClassName({ row }: { row: MatrixRow }): string {
-  return rankClass(row)
+  if (rank === 'none') return '不参与新会话（未进入候选排序）'
+  if (rank === 1) return '首选（第 1 候选）'
+  if (rank === 2) return '次选（第 2 候选）'
+  return `第 ${rank} 候选`
 }
 
 // ===== 指标列取值 =====
@@ -807,30 +771,8 @@ onUnmounted(stopTimer)
         class="table-nowrap clickable-rows"
         row-key="_id"
         :span-method="spanMethod"
-        :row-class-name="rowClassName"
         @row-click="onRowClick"
       >
-        <!-- 序位（独立列，不参与合并）：★/☆/·N 与行左侧竖条同义 -->
-        <el-table-column label="序位" min-width="64" align="center">
-          <template #header>
-            <el-tooltip placement="top">
-              <template #content>
-                <div class="tt">
-                  <div class="tt-line">★ 首选 · ☆ 次选 · ·N 第 N 候选 · — 不参与新会话</div>
-                  <div class="tt-line">顺序来自后端候选排序（Rank），前端不重算</div>
-                  <div class="tt-line">行左侧竖条与序位同色：金=首选 · 浅灰=次选 · 深灰=不参与</div>
-                </div>
-              </template>
-              <span>序位</span>
-            </el-tooltip>
-          </template>
-          <template #default="{ row }">
-            <el-tooltip :content="rankTip(row)" placement="top" :disabled="!rankSymbol(row)">
-              <span class="rank-cell" :class="rankClass(row)">{{ rankSymbol(row) || '—' }}</span>
-            </el-tooltip>
-          </template>
-        </el-table-column>
-
         <!-- 对外模型 -->
         <el-table-column label="对外模型" min-width="160">
           <template #default="{ row }">
@@ -885,6 +827,9 @@ onUnmounted(stopTimer)
         <el-table-column label="密钥" min-width="200">
           <template #default="{ row }">
             <div class="hcell">
+              <el-tooltip v-if="rankClass(row)" :content="rankTip(row)" placement="top">
+                <span class="rank-bar" :class="rankClass(row)" />
+              </el-tooltip>
               <el-tooltip placement="top" :show-after="150">
                 <template #content>
                   <div class="tt">
@@ -1144,13 +1089,13 @@ onUnmounted(stopTimer)
 
     <!-- 页脚：聚合语义显式成文（用户规范：不允许隐性逻辑） -->
     <div class="foot-note">
-      维度固定全量展示：行轴恒为「对外模型 × 内部模型 × 渠道 × 密钥」叉积；列固定为序位 + 四维度列 + 优先级/限流/会话数。
+      维度固定全量展示：行轴恒为「对外模型 × 内部模型 × 渠道 × 密钥」叉积；列固定为四维度列 + 优先级/限流/会话数。
     </div>
     <div class="foot-note">
-      状态灯语义：绿=正常 · 橙=部分可用或排空 · 红=整体不可用/禁用 · 灰=未知。对外模型为派生聚合——全部通路正常=绿；仍有可用通路=橙（部分可用）；全不可用/停用=红；悬停状态灯可见「可用通路 x/y」与具体异常通路。
+      状态灯按「本行通路」着色，同一行的对外模型灯与内部模型灯口径一致；悬停状态灯可见全局可用通路 x/y 与具体异常渠道/模型。
     </div>
     <div class="foot-note">
-      行左侧竖条与「序位」列同色同义：金=首选 · 浅灰=次选 · 深灰=不参与新会话（悬停序位单元格查看说明）；顺序由后端候选排序决定。
+      密钥单元格左侧色条为序位：金=首选 · 浅灰=次选 · 深灰=不参与新会话（悬停色条查看释义）；顺序由后端候选排序决定。
     </div>
     <div class="foot-note">
       渠道无独立状态机，故渠道列不展示状态灯；RPM/TPM 合并列上行为模型级、下行为密钥级，均展示「当前值/上限」并附用量灯（≥100% 红、≥80% 橙）。
@@ -1340,31 +1285,22 @@ onUnmounted(stopTimer)
   flex-wrap: wrap;
   gap: 4px;
 }
-.rank-cell {
-  display: block;
-  width: 100%;
-  text-align: center;
-  font-size: 14px;
-  font-weight: 700;
+/* 序位色条：置于密钥单元格最左侧；金=首选 · 浅灰=次选 · 深灰=不参与新会话（悬停看释义） */
+.rank-bar {
+  flex: none;
+  width: 4px;
+  height: 18px;
+  border-radius: 2px;
+  background: currentColor;
 }
-.rank-cell.rank-first {
+.rank-bar.rank-first {
   color: #f0b429;
 }
-.rank-cell.rank-second {
+.rank-bar.rank-second {
   color: #b6bccd;
 }
-.rank-cell.rank-none {
+.rank-bar.rank-none {
   color: #98a2b3;
-}
-/* 行左缘色条：金★首选 / 浅灰次选 / 深灰不参与新会话；仅模型轴与密钥轴同时进入行轴时出现 */
-:deep(.el-table__row.rank-first) td:first-child {
-  box-shadow: inset 4px 0 0 0 #f0b429;
-}
-:deep(.el-table__row.rank-second) td:first-child {
-  box-shadow: inset 4px 0 0 0 #c7cbd3;
-}
-:deep(.el-table__row.rank-none) td:first-child {
-  box-shadow: inset 4px 0 0 0 #98a2b3;
 }
 .tt {
   max-width: 320px;
