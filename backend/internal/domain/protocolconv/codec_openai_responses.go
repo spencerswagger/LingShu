@@ -733,6 +733,13 @@ func (openaiResponsesCodec) DecodeEvent(data []byte) ([]CanonicalEvent, *LossyRe
 			DeltaKind: DeltaToolJSON,
 			Text:      top.Delta,
 		}}, rep, nil
+	case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
+		return []CanonicalEvent{{
+			Type:      EventContentBlockDelta,
+			Index:     idx,
+			DeltaKind: DeltaThinking,
+			Text:      top.Delta,
+		}}, rep, nil
 	case "response.completed", "response.incomplete":
 		status := top.Response.Status
 		if status == "" && top.Type == "response.incomplete" {
@@ -775,6 +782,12 @@ func (openaiResponsesCodec) EncodeEvent(ev CanonicalEvent) ([][]byte, *LossyRepo
 		case DeltaText:
 			return [][]byte{dataFrame(map[string]interface{}{
 				"type":         "response.output_text.delta",
+				"output_index": ev.Index,
+				"delta":        ev.Text,
+			})}, rep, nil
+		case DeltaThinking:
+			return [][]byte{dataFrame(map[string]interface{}{
+				"type":         "response.reasoning_summary_text.delta",
 				"output_index": ev.Index,
 				"delta":        ev.Text,
 			})}, rep, nil
