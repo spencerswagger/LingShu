@@ -43,6 +43,9 @@ const (
 	msgUnsupportedProtocol = "该模型不支持当前入站协议（无可直通的上游协议）"
 )
 
+// reasonClientGone 下游客户端断开（建连阶段取消）的统一归因文案，供决策轨迹、调用日志与失败候选统计共用。
+const reasonClientGone = "客户端断开"
+
 // bearerPlain 从 Authorization 头提取 Bearer 令牌明文；非 Bearer 形式返回 ("", false)。
 func bearerPlain(auth string) (string, bool) {
 	return strings.CutPrefix(auth, "Bearer ")
@@ -716,10 +719,14 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 			if out.refundPre {
 				g.refundAllPreConsume(ctx, token.UserID, pc.Credits, "请求失败退回")
 			}
+			// billFailed 优先：结算失败是最需处置的终态（预扣不退、杜绝赊账），
+			// 即便同时命中 client-gone/upstreamFailed 也按「计费失败」归因。
 			switch {
 			case out.billFailed:
 				attempts = append(attempts, attempt("计费失败"))
-			case out.refundPre:
+			case out.clientGone:
+				attempts = append(attempts, attempt(reasonClientGone))
+			case out.upstreamFailed, out.refundPre:
 				attempts = append(attempts, attempt("上游失败"))
 			case out.interrupted:
 				attempts = append(attempts, attempt("流式中断"))
@@ -735,6 +742,13 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 			}
 			// 决策轨迹与失败候选数只算一次，传入 logOutcome 复用（避免重复遍历 attempts）。
 			trail, failed := summarizeAttempts(attempts)
+			// 下游客户端断开（建连阶段取消）：独立结论文案、Info 级、不计失败候选（天然 status<400）。
+			// 仅当本次请求没有其它真实候选失败时，client-gone 才是唯一结论；否则落入下方
+			// failed>0 分支，避免用 client-gone 结论遮蔽既有的真实上游失败。
+			if out.clientGone && failed == 0 {
+				g.logOutcome(ctx, slog.LevelInfo, endpoint, model, "客户端已断开，按估算结算", status, false, token, sessionID, attempts, trail, failed, msSince(start))
+				return
+			}
 			if failed > 0 {
 				failedReq := outcomeIsFailure(out) || status >= http.StatusBadRequest
 				lvl := slog.LevelWarn
@@ -891,6 +905,10 @@ func (g *Gateway) refundAllPreConsume(ctx context.Context, userID int64, preCons
 // statusOriginTimeout 源站超时（Cloudflare 524），不在 net/http 常量表中。
 const statusOriginTimeout = 524
 
+// statusClientClosedRequest 客户端已关闭连接（nginx 约定 499），不在 net/http 常量表中。
+// 仅用于 client-gone（下游确已断开、客户端不会真正读到该状态）场景，供访问日志与请求级结论区分。
+const statusClientClosedRequest = 499
+
 // retryableUpstreamStatus 判断「上游已返回状态码」时，本次失败能否安全转移到下一候选。
 //
 // 判定依据是「该次上游调用是否可能已被计费」——否则转移会造成上游两次计费、下游只计一次：
@@ -958,6 +976,12 @@ type fwdOutcome struct {
 	// interrupted 流式传输中断（内容已部分下发、无法撤回）：语义上请求失败，
 	// 但下游状态码仍为 200，故必须单列，不能靠状态码判定成败。
 	interrupted bool
+	// clientGone 下游客户端/前置代理提前断开导致的请求取消（建连阶段、尚未写出任何响应）：
+	// 与上游失败区分——不视为候选失败、按估算输入结算、不回喂渠道健康。
+	clientGone bool
+	// upstreamFailed 已送达后上游失败/响应超时（无上游状态码）：已按估算输入用量结算、
+	// 不再整单退预扣（对齐 new-api「除非上游明确报错」）；请求级结论仍计为失败候选。
+	upstreamFailed bool
 	// streamDiag 流式上游失败诊断（仅排查用，随失败候选轨迹落调用日志）：
 	// delivered / first_byte_received / elapsed_ms（连接失败时无上游状态码，故不含 upstream_status）。
 	streamDiag map[string]any
@@ -995,6 +1019,16 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 	up, err := g.client.Do(req)
 	if err != nil {
 		g.logError(rt.Channel.ID, "upstream call failed", err)
+		// 建连阶段因下游客户端/前置代理提前断开而取消：与上游失败区分（详见 serveStream 同分支）。
+		// 非流式无首字节/流式诊断字段，故不带 delivered/firstByteReceived/elapsedMS。
+		if streamClientGone(ctx, err) {
+			g.logUpstreamErr(ctx, slog.LevelInfo, "client gone", endpoint, ureq.Protocol, model, token, routeRes,
+				diagFromRequest(req, ureq.Protocol, ureq.Cred),
+				errInfo{kind: "client_gone", stage: stage, attempt: attempt, retry: false,
+					reason: "下游客户端已断开，请求取消", sessionID: sessionID, durationMs: *msSince(start)})
+			return g.settleClientGoneTail(ctx, w, msSince(start), routeRes, model, token, pricingMode,
+				sessionID, sessionName, pc, reqMsgs, attempts, nil)
+		}
 		// 连接阶段失败（未送达，可转移）与已送达后失败（多为超时，不转移）语义不同，现场一并记录。
 		g.logUpstreamErr(ctx, slog.LevelWarn, "upstream call failed", endpoint, ureq.Protocol, model, token, routeRes,
 			diagFromRequest(req, ureq.Protocol, ureq.Cred),
@@ -1010,12 +1044,10 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 			return &fwdOutcome{retry: true}
 		}
 		// 请求已送达后失败（多为响应超时）：上游可能已生成并计费，转移会导致上游重复计费 → 不转移。
-		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "上游请求失败（已送达，不转移）", msSince(start))
-		// 已送达但失败（多为超时）：上游可能已生成，但不返回响应体 → resp_body 留空。
-		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-			"error", "", "failed", "上游请求失败（已送达，不转移）", msSince(start), nil, g.callLogDecision(attempts, "上游请求失败", pc, routeRes))
-		writeOpenAIError(w, http.StatusBadGateway, msgUpstreamDown)
-		return &fwdOutcome{responded: true, refundPre: true, downstreamStatus: http.StatusBadGateway}
+		// 上游未返回错误状态码（Do 报错/响应超时）：对齐 new-api 按估算输入用量结算（多退少补），
+		// 不再整单退预扣——上游已可能生成并计费，避免平台资损。
+		return g.settleDeliveredTimeout(ctx, w, msSince(start), routeRes, model, token, pricingMode,
+			sessionID, sessionName, pc, reqMsgs, attempts, "上游请求失败", nil)
 	}
 	defer up.Body.Close()
 
@@ -1274,17 +1306,29 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		delivered := wrote.Load()
 		firstByte := gotFirstByte.Load()
 		elapsed := msSince(start)
+		streamDiag := map[string]any{
+			"delivered":           delivered,
+			"first_byte_received": firstByte,
+			"elapsed_ms":          *elapsed,
+		}
+		// 建连阶段（尚未写出任何下游响应）因下游客户端/前置代理提前断开而取消：
+		// 与上游失败区分——归因 client_gone（Info）、不回喂渠道健康、不写 502，
+		// 按估算输入用量结算（多退少补，而非整单退预扣）。
+		if streamClientGone(ctx, err) {
+			g.logUpstreamErr(ctx, slog.LevelInfo, "stream client gone", endpoint, ureq.Protocol, model, token, routeRes,
+				diagFromRequest(req, ureq.Protocol, ureq.Cred),
+				errInfo{kind: "client_gone", stage: stage, attempt: attempt, retry: false,
+					reason: "下游客户端已断开，请求取消", sessionID: sessionID, durationMs: *elapsed,
+					delivered: &delivered, firstByteReceived: &firstByte, elapsedMS: elapsed})
+			return g.settleClientGoneTail(ctx, w, elapsed, routeRes, model, token, pricingMode,
+				sessionID, sessionName, pc, reqMsgs, attempts, streamDiag)
+		}
 		g.logUpstreamErr(ctx, slog.LevelWarn, "upstream call failed", endpoint, ureq.Protocol, model, token, routeRes,
 			diagFromRequest(req, ureq.Protocol, ureq.Cred),
 			errInfo{kind: "connect_failed", stage: stage, attempt: attempt,
 				retry: !delivered, reason: "上游流式调用失败：" + err.Error(), sessionID: sessionID, durationMs: *elapsed,
 				delivered: &delivered, firstByteReceived: &firstByte, elapsedMS: elapsed})
 		g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, channel.Feedback{IsSuccess: false, Now: g.now()})
-		streamDiag := map[string]any{
-			"delivered":           delivered,
-			"first_byte_received": firstByte,
-			"elapsed_ms":          *elapsed,
-		}
 		// 调用日志决策轨迹同样带上流式失败诊断（仅新增字段，不改既有键名）。
 		streamDecision := func(reason string) map[string]any {
 			dec := g.callLogDecision(attempts, reason, pc, routeRes)
@@ -1302,12 +1346,10 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 			return &fwdOutcome{retry: true, streamDiag: streamDiag}
 		}
 		// 请求已送达后失败（多为响应超时）：上游可能已生成并计费，转移会导致上游重复计费 → 不转移。
-		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "上游流式请求失败（已送达，不转移）", msSince(start))
-		// 已送达但失败（多为超时）：上游可能已生成，但不返回响应体 → resp_body 留空。
-		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-			"error", "", "failed", "上游流式请求失败（已送达，不转移）", msSince(start), nil, streamDecision("上游请求失败"))
-		writeOpenAIError(w, http.StatusBadGateway, msgUpstreamDown)
-		return &fwdOutcome{responded: true, refundPre: true, downstreamStatus: http.StatusBadGateway, streamDiag: streamDiag}
+		// 上游未返回错误状态码（Do 报错/响应超时）：对齐 new-api 按估算输入用量结算（多退少补），
+		// 不再整单退预扣——上游已可能生成并计费，避免平台资损。
+		return g.settleDeliveredTimeout(ctx, w, elapsed, routeRes, model, token, pricingMode,
+			sessionID, sessionName, pc, reqMsgs, attempts, "上游流式请求失败", streamDiag)
 	}
 	defer up.Body.Close()
 
@@ -1343,7 +1385,10 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		}
 		// 客户端已离开（主动断开 / 下游写失败 / 请求 ctx 已取消）：内容无法送达，
 		// 既不算上游中断失败（不置 interrupted、不落 failed 账单），也不应在结论里声称"成功"。
-		clientGone := streamClientGone(ctx, herr)
+		// 已收响应头之后（HandleStream）维持改造前判据：请求 ctx 只要已结束（Canceled/DeadlineExceeded）
+		// 即视为客户端/传输侧离开；建连阶段才用更严格的 streamClientGone（仅认 Canceled），
+		// 以免把上游超时误归为客户端断开。参见设计 Scope：本阶段「维持现行为」。
+		clientGone := errors.Is(herr, context.Canceled) || ctx.Err() != nil
 		if clientGone {
 			// 客户端已离开：无论是否带回错误都要留痕（herr 为空时只记"已断开"），
 			// 避免"客户端中断"在观测面上完全消失。
@@ -1488,13 +1533,15 @@ type firstTokenWriter struct {
 	first time.Time
 }
 
-// streamClientGone 判定"客户端已离开"：上游返回 context.Canceled，或请求 ctx 已取消
-// （下游写失败通常伴随请求 ctx 取消）。客户端离开不算上游中断失败，但必须留痕。
+// streamClientGone 判定"客户端已离开"：上游返回 context.Canceled，或请求 ctx 本身以
+// context.Canceled 结束（下游写失败/提前断开通常伴随请求 ctx 取消）。仅认 Canceled——
+// 不把 DeadlineExceeded 等其它取消原因当作客户端离开，避免掩盖真实上游故障；客户端离开
+// 不算上游中断失败，但必须留痕。
 func streamClientGone(ctx context.Context, herr error) bool {
 	if errors.Is(herr, context.Canceled) {
 		return true
 	}
-	return ctx.Err() != nil
+	return errors.Is(ctx.Err(), context.Canceled)
 }
 
 func (w *firstTokenWriter) Write(p []byte) (int, error) {
@@ -1625,6 +1672,62 @@ func (g *Gateway) recordFailure(ctx context.Context, routeRes *router.RouteResul
 		return ""
 	}
 	return rec.BillingID
+}
+
+// settleClientGoneTail 收敛 client-gone（建连阶段因下游断开取消）的结算收尾，供流式/非流式共用：
+// 按估算输入用量结算（多退少补、不整单退预扣）→ 落调用日志 → 写回 499（不写 body）；
+// 结算失败归因「计费失败」并置 billFailed（预扣不退，对齐既有语义）。
+// diag 非空时（流式）并入调用日志决策，并随 fwdOutcome 带回；nil（非流式）则不带流式诊断。
+func (g *Gateway) settleClientGoneTail(ctx context.Context, w http.ResponseWriter, dur *int64,
+	routeRes *router.RouteResult, model string, token *identity.Token, pricingMode, sessionID, sessionName string,
+	pc preCharge, reqMsgs []json.RawMessage, attempts []map[string]any, diag map[string]any) *fwdOutcome {
+
+	_, bid, berr := g.recordBilling(ctx, routeRes, model, token, billing.Usage{Input: int64(pc.InputTokens)},
+		pricingMode, sessionID, sessionName, pc.Credits, dur, nil)
+	logReason := reasonClientGone
+	if berr != nil {
+		g.logger.Error("client-gone billing failed", "user_id", token.UserID, "channel_id", routeRes.ChannelID, "model", model, "err", berr)
+		logReason = "计费失败"
+	}
+	dec := g.callLogDecision(attempts, logReason, pc, routeRes)
+	for k, v := range diag {
+		dec[k] = v
+	}
+	g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
+		"error", "", "failed", logReason, dur, nil, dec)
+	// 下游确已断开：写回 499（不写 body），供访问日志与请求级结论区分 client-gone 与成功。
+	w.WriteHeader(statusClientClosedRequest)
+	// 结算失败置 billFailed（预扣不退=对齐既有 billFailed 语义）。
+	return &fwdOutcome{responded: true, clientGone: true, billFailed: berr != nil,
+		downstreamStatus: statusClientClosedRequest, streamDiag: diag}
+}
+
+// settleDeliveredTimeout 收敛「已送达后上游失败/响应超时（无上游状态码）」的结算收尾，供流式/非流式共用：
+// 按估算输入用量结算（多退少补、不整单退预扣）→ 落调用日志 → 写回 502（OpenAI 错误体）；
+// 结算失败归因「计费失败」并置 billFailed（预扣不退，对齐既有语义）。
+// descPrefix 区分流式/非流式文案（「上游请求失败」/「上游流式请求失败」）；diag 非空时（流式）并入决策。
+func (g *Gateway) settleDeliveredTimeout(ctx context.Context, w http.ResponseWriter, dur *int64,
+	routeRes *router.RouteResult, model string, token *identity.Token, pricingMode, sessionID, sessionName string,
+	pc preCharge, reqMsgs []json.RawMessage, attempts []map[string]any, descPrefix string, diag map[string]any) *fwdOutcome {
+
+	_, bid, berr := g.recordBilling(ctx, routeRes, model, token, billing.Usage{Input: int64(pc.InputTokens)},
+		pricingMode, sessionID, sessionName, pc.Credits, dur, nil)
+	logDesc, logReason := descPrefix+"（已送达，不转移）", "上游请求失败"
+	if berr != nil {
+		g.logger.Error("delivered-timeout billing failed", "user_id", token.UserID, "channel_id", routeRes.ChannelID, "model", model, "err", berr)
+		logDesc, logReason = "计费失败", "计费失败"
+	}
+	// 已送达但失败（多为超时）：上游可能已生成，但不返回响应体 → resp_body 留空。
+	dec := g.callLogDecision(attempts, logReason, pc, routeRes)
+	for k, v := range diag {
+		dec[k] = v
+	}
+	g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
+		"error", "", "failed", logDesc, dur, nil, dec)
+	writeOpenAIError(w, http.StatusBadGateway, msgUpstreamDown)
+	// 结算失败置 billFailed（预扣不退=对齐既有 billFailed 语义），归因优先于 upstreamFailed。
+	return &fwdOutcome{responded: true, upstreamFailed: true, billFailed: berr != nil,
+		downstreamStatus: http.StatusBadGateway, streamDiag: diag}
 }
 
 // isInsufficient 判断是否余额不足（40201 CodeInsufficient）。
