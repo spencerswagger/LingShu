@@ -1,6 +1,6 @@
 ---
 intent: 精简「状态」页表格与详情弹窗（列宽自适应、去成本列、四组限流合一列、详情改四列字段对比表）；顺带回填渠道/内部模型最近探测时间、让会话成本事件流展示渠道名、使非有限浮点经 WAL 往返不漂移，并把三态操作按钮抽为共享组件统一各渠道页面。
-success_criteria: 表格无成本列、四组 RPM/TPM 合并为一列、列宽自适应、渠道列无派生状态灯；详情弹窗无 ID 行、字段全中文、四列对比表、操作按钮就近、顶部「详情/事件链」tab、候选显示名称；渠道/内部模型「最近探测」经探测后非空；事件流渠道迁移展示渠道名；非有限浮点经 WAL 编码→重放后不退化；前端 vue-tsc 零类型错误、后端 go build/go test 全绿。
+success_criteria: 表格无成本列、四组 RPM/TPM 合并为一列、列宽自适应、渠道列无派生状态灯；详情弹窗无 ID 行、字段全中文、四列对比表、操作按钮就近、顶部「详情/事件链」tab、候选显示名称；渠道/内部模型「最近探测」经探测后非空；事件流渠道迁移展示渠道名；同一轮次多次独立决策各自留痕（幂等键按发射唯一）；非有限浮点经 WAL 编码→重放后不退化；前端 vue-tsc 零类型错误、后端 go build/go test 全绿。
 risk_level: medium
 auto_approve: false
 ---
@@ -70,7 +70,7 @@ loop: false
 verify: (cd backend && go build ./... && go test ./internal/domain/console/...)
 
 - [x] **Step 13: 事件幂等键与 WAL 非有限浮点无损往返**
-action: 在 backend/internal/domain/router/cost_event.go 中，幂等键改为 `session:turn:from>to`（避免起点与切换撞键）；`sanitizeEventForJSON` 重构为 `marshalEventForJSON`/`unmarshalEventFromJSON`，非有限浮点在 `__non_finite` 记录字段名，重放时还原为 NaN，保证 WAL 往返不把「未知」退化为 0。
+action: 在 backend/internal/domain/router/cost_event.go 中，幂等键由 `session:turn:from>to` 改为 `session:Seq`——`Seq` 由 sink 在 Submit 时分配、每次发射单调唯一（基准取 UnixNano，避免重启后与 WAL 遗留记录撞键），修复网关 `SessionTurn` 恒 0 时同轮次多次独立决策（影子记录 / 来回切换）撞键被 asyncwrite 静默去重丢弃的问题；`sanitizeEventForJSON` 重构为 `marshalEventForJSON`/`unmarshalEventFromJSON`，非有限浮点在 `__non_finite` 记录字段名，重放时还原为 NaN，保证 WAL 往返不把「未知」退化为 0。
 loop: false
 verify: (cd backend && go test ./internal/domain/router/...)
 
