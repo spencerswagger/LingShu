@@ -556,6 +556,8 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	consoleAdmin.SetCallLogStore(callLogStore)
 	consoleAdmin.SetRouterEngine(routerEngine)
 	consoleAdmin.SetModelSource(modelSvc)
+	// 成本曲线积分换算系数 R 来源（billing.ConfigProvider 满足，含 R() 方法）：曲线 Σ(token×费率) ÷ R 得积分。
+	consoleAdmin.SetCostRProvider(billCfgProvider)
 	// 会话成本路由面板数据源：决策事件流走进程内落地存储（与 sink persist 回调同源）。
 	consoleAdmin.SetSessionCostEventStore(sessionCostEventStore)
 	consoleDev.SetCallLogStore(callLogStore)

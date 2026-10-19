@@ -1247,11 +1247,22 @@ export interface CostStatRow {
   CacheHitRate: number
   InputOutputRatio: number
 }
-// 成本统计：Rows 为逐行明细，Total 为全量汇总行（口径同 Rows）
+// 成本统计汇总行：与 CostStatRow 同口径，但不含渠道/模型维度字段（全量合计）。
+export interface CostStatTotal {
+  CostCredits: number
+  SaleCredits: number
+  Requests: number
+  InputTokens: number
+  CacheReadTokens: number
+  OutputTokens: number
+  CacheHitRate: number
+  InputOutputRatio: number
+}
+// 成本统计：Rows 为逐行明细，Total 为全量汇总行（口径同 Rows，仅缺维度字段）
 export function getCostStats() {
   return http.get<
-    { Rows: CostStatRow[]; Total: CostStatRow },
-    ApiRes<{ Rows: CostStatRow[]; Total: CostStatRow }>
+    { Rows: CostStatRow[]; Total: CostStatTotal },
+    ApiRes<{ Rows: CostStatRow[]; Total: CostStatTotal }>
   >('/admin/cost/stats')
 }
 // 全平台 token 默认值（仅由 token 求和得出，与金额解耦）
