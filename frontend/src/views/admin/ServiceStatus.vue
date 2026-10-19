@@ -517,23 +517,27 @@ function lm(row: MatrixRow): LimitCell {
   return limitsByRow.value[row._id] ?? EMPTY_LIMIT
 }
 
-// 弹窗展示用：可靠性阈值与窗口指标文本。
+// 弹窗展示用：可靠性阈值与实时窗口文本。
+function p99(ms: number): string {
+  if (!Number.isFinite(ms)) return '—'
+  return ms >= 1000 ? `${Number((ms / 1000).toFixed(1))}s` : `${ms}ms`
+}
 function relText(r: ReliabilityConfig): string {
-  return `错误率 <${r.ErrorRatePct}% · 429 <${r.Rate429Pct}% · P99 <${r.P99LatencyMS}ms`
+  return `错误率 <${r.ErrorRatePct}% · 429 <${r.Rate429Pct}% · P99 <${p99(r.P99LatencyMS)}`
 }
 function metricsText(m: MachineMetrics): string {
-  return `错误率 ${pct(m.ErrorRatePct)} · 429 ${pct(m.Rate429Pct)} · P99 ${m.P99LatencyMS}ms`
+  return `错误率 ${pct(m.ErrorRatePct)} · 429 ${pct(m.Rate429Pct)} · P99 ${p99(m.P99LatencyMS)}`
 }
 // 探测时间展示：空值统一用「—」占位，与其它空值占位一致。
 function dt(v?: string | null): string {
   return v ? fmtDateTime(v) : '—'
 }
 
-// 成本比较样值（候选区样值说明用）。
+// 成本比较样值说明（候选成本按此样值用量估算）。
 const sampleUsageText = computed(() => {
   const s = view.value?.SampleUsage
   if (!s) return ''
-  return `input/output/cache_read = ${fmtNum(s.input)}/${fmtNum(s.output)}/${fmtNum(s.cache_read)}`
+  return `成本按样值用量估算：输入 ${fmtNum(s.input)} / 缓存读 ${fmtNum(s.cache_read)} / 输出 ${fmtNum(s.output)}（token）`
 })
 
 // ===== 选中行与详情弹窗 =====
@@ -878,7 +882,7 @@ onUnmounted(stopTimer)
     </div>
 
     <!-- 详情弹窗：点击列表行打开；顶部 tab 切换「详情 / 事件链」 -->
-    <el-dialog v-model="detailVisible" title="详情" width="min(1120px, 94vw)" top="3vh" class="status-dlg">
+    <el-dialog v-model="detailVisible" width="min(1400px, 96vw)" top="2vh" class="status-dlg">
       <div v-if="!selectedRow" class="insp-empty">请选择一行查看详情</div>
       <el-tabs v-else v-model="activeTopTab" class="dlg-tabs">
         <!-- ===== 详情：四列字段对比表（列 = 对外模型→内部模型→渠道→密钥）+ 候选序位 ===== -->
@@ -894,6 +898,7 @@ onUnmounted(stopTimer)
               </tr>
             </thead>
             <tbody>
+              <tr class="cmp-section"><td colspan="5">标识</td></tr>
               <tr>
                 <td class="cmp-field">名称</td>
                 <td>{{ cell(selectedRow, 'external').name }}</td>
@@ -901,9 +906,11 @@ onUnmounted(stopTimer)
                 <td>{{ cell(selectedRow, 'channel').name }}</td>
                 <td>
                   <span>{{ cell(selectedRow, 'key').name }}</span>
-                  <span v-if="cell(selectedRow, 'key').sub" class="cmp-sub">{{ cell(selectedRow, 'key').sub }}</span>
+                  <span v-if="cell(selectedRow, 'key').sub" class="cmp-sub">尾号 {{ cell(selectedRow, 'key').sub }}</span>
                 </td>
               </tr>
+
+              <tr class="cmp-section"><td colspan="5">可用性</td></tr>
               <tr>
                 <td class="cmp-field">状态</td>
                 <td>{{ selectedRow.model ? (extEnabledOf(selectedRow.model.View.ExternalModelID) ? '启用' : '停用') : '—' }}</td>
@@ -911,8 +918,10 @@ onUnmounted(stopTimer)
                 <td class="cmp-muted">—</td>
                 <td><StatusTag :value="selectedRow.key ? selectedRow.key.View.State : 'NORMAL'" /></td>
               </tr>
+
+              <tr class="cmp-section"><td colspan="5">接入</td></tr>
               <tr>
-                <td class="cmp-field">协议 · 接口地址</td>
+                <td class="cmp-field">协议 / 接口地址</td>
                 <td class="cmp-muted">—</td>
                 <td class="cmp-muted">—</td>
                 <td>
@@ -922,35 +931,39 @@ onUnmounted(stopTimer)
                 <td class="cmp-muted">—</td>
               </tr>
               <tr>
-                <td class="cmp-field">优先级</td>
+                <td class="cmp-field">路由优先级</td>
                 <td class="cmp-muted">—</td>
                 <td class="cmp-muted">—</td>
-                <td>{{ selectedRow.channel.View.Priority }}</td>
+                <td>{{ selectedRow.channel.View.Priority }}<span class="cmp-sub">数字越大越先路由</span></td>
                 <td class="cmp-muted">—</td>
               </tr>
+
+              <tr class="cmp-section"><td colspan="5">容量（当前 / 上限）</td></tr>
               <tr>
-                <td class="cmp-field">限流 RPM/TPM</td>
+                <td class="cmp-field">限流窗口</td>
                 <td class="cmp-muted">—</td>
                 <td>{{ selectedRow.model ? rpmTpmText(selectedRow.model.RPM, selectedRow.model.RPMLimit, selectedRow.model.TPM, selectedRow.model.TPMLimit) : '—' }}</td>
                 <td>{{ rpmTpmText(selectedRow.channel.RPM, selectedRow.channel.RPMLimit, selectedRow.channel.TPM, selectedRow.channel.TPMLimit) }}</td>
                 <td>{{ selectedRow.keys.length ? rpmTpmText(keyRpmVal(selectedRow), keyRpmLimit(selectedRow), keyTpmVal(selectedRow), keyTpmLimit(selectedRow)) : '—' }}</td>
               </tr>
               <tr>
-                <td class="cmp-field">会话数</td>
+                <td class="cmp-field">并发会话</td>
                 <td class="cmp-muted">—</td>
                 <td class="cmp-muted">—</td>
                 <td class="cmp-muted">—</td>
-                <td>{{ selectedRow.keys.length ? `${fmtInt(sessionsVal(selectedRow))}/${fmtInt(sessionsLimit(selectedRow))}` : '—' }}</td>
+                <td>{{ selectedRow.keys.length ? `${fmtInt(sessionsVal(selectedRow))} / ${fmtInt(sessionsLimit(selectedRow))}` : '—' }}</td>
               </tr>
+
+              <tr class="cmp-section"><td colspan="5">健康</td></tr>
               <tr>
-                <td class="cmp-field">可靠性阈值</td>
+                <td class="cmp-field">判定阈值<span class="cmp-sub">（触发排空/禁用）</span></td>
                 <td class="cmp-muted">—</td>
                 <td>{{ selectedRow.model ? relText(selectedRow.model.View.Reliability) : '—' }}</td>
                 <td>{{ relText(selectedRow.channel.View.Reliability) }}</td>
                 <td class="cmp-muted">—</td>
               </tr>
               <tr>
-                <td class="cmp-field">窗口指标</td>
+                <td class="cmp-field">实时窗口</td>
                 <td class="cmp-muted">—</td>
                 <td>{{ selectedRow.model ? metricsText(selectedRow.model.Metrics) : '—' }}</td>
                 <td class="cmp-muted">—</td>
@@ -982,8 +995,10 @@ onUnmounted(stopTimer)
                   <span v-else class="cmp-muted">—</span>
                 </td>
               </tr>
+
+              <tr class="cmp-section"><td colspan="5">操作</td></tr>
               <tr>
-                <td class="cmp-field">操作</td>
+                <td class="cmp-field">探测 / 强制状态</td>
                 <td class="cmp-muted">—</td>
                 <td>
                   <div v-if="selectedRow.model" class="op-btns">
@@ -1009,18 +1024,21 @@ onUnmounted(stopTimer)
           </table>
           <ErrorBubble v-if="opErr.message || opErr.requestId" :message="opErr.message" :request-id="opErr.requestId" />
 
-          <!-- 候选序位：显示渠道名 + 密钥名（回退显示 ID） -->
+          <!-- 路由候选：新会话按此顺序择优（成本低者优先） -->
           <div class="insp-sec">
-            <div class="insp-sec-title">候选序位（{{ selectedRow.model ? (externalNameByID[selectedRow.model.View.ExternalModelID] || selectedRow.model.View.ExternalModelID) : '—' }}）</div>
-            <div v-if="!selectedCandidates.length" class="insp-empty-inline">模型维度未纳入行轴，或该对外模型当前无可用候选（停用/未绑定可用渠道密钥）</div>
+            <div class="insp-sec-title">
+              路由候选（{{ selectedRow.model ? (externalNameByID[selectedRow.model.View.ExternalModelID] || selectedRow.model.View.ExternalModelID) : '—' }}）
+              <span class="insp-sec-hint">新会话按此顺序择优，成本越低越靠前</span>
+            </div>
+            <div v-if="!selectedCandidates.length" class="insp-empty-inline">该对外模型当前无可用候选（停用 / 未绑定可用渠道密钥）</div>
             <div v-else class="cand-list">
               <div v-for="c in selectedCandidates" :key="c.Rank" class="cand-row" :class="{ hit: isSelectedCandidate(c) }">
                 <span class="cand-rank">#{{ c.Rank }}</span>
                 <span class="cand-id">渠道 {{ channelLabel(c.ChannelID) }} · 密钥 {{ keyLabel(c.ChannelID, c.ChannelKeyID) }}</span>
-                <span class="cand-cost">{{ c.CostKnown ? fmtNum(c.Cost) : '未知' }}<template v-if="c.TimeCoeff">（×{{ fmtNum(c.TimeCoeff) }}）</template></span>
+                <span class="cand-cost">成本 {{ c.CostKnown ? fmtNum(c.Cost) : '未知' }}<template v-if="c.TimeCoeff"> · 时段系数 ×{{ fmtNum(c.TimeCoeff) }}</template></span>
               </div>
             </div>
-            <div v-if="selectedCandidates.length" class="cand-sample">样值：{{ sampleUsageText }}</div>
+            <div v-if="selectedCandidates.length" class="cand-sample">{{ sampleUsageText }}</div>
           </div>
         </el-tab-pane>
 
@@ -1144,9 +1162,25 @@ onUnmounted(stopTimer)
   color: var(--color-text);
 }
 .cmp-table .cmp-field {
-  width: 76px;
+  width: 118px;
   background: var(--el-fill-color-light);
-  color: var(--color-text-tertiary);
+  color: var(--color-text-secondary);
+  font-weight: 500;
+  white-space: nowrap;
+}
+/* 分组行：横向贯穿，作为字段分组标题 */
+.cmp-table .cmp-section td {
+  background: #eef1f7;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+  padding: 3px 8px;
+  letter-spacing: 0.5px;
+}
+/* 字段名后的灰色小注（阈值说明等）：独占一行显示 */
+.cmp-table .cmp-field .cmp-sub {
+  display: block;
+  margin-left: 0;
   font-weight: 400;
 }
 .cmp-muted {
@@ -1176,6 +1210,12 @@ onUnmounted(stopTimer)
   font-weight: 600;
   color: var(--color-text);
   margin-bottom: 6px;
+}
+.insp-sec-hint {
+  margin-left: 8px;
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--color-text-tertiary);
 }
 .hcell {
   display: flex;
@@ -1371,7 +1411,12 @@ onUnmounted(stopTimer)
 <!-- 弹窗被 teleport 到 body，scoped 样式无法作用于 .el-dialog__body，故单独用非 scoped 样式限制高度 -->
 <style>
 .status-dlg .el-dialog__body {
-  max-height: 82vh;
+  max-height: 88vh;
   overflow: auto;
+}
+/* 无标题（详情标题已由顶部 tab 表达），头部仅保留关闭按钮并压扁 */
+.status-dlg .el-dialog__header {
+  padding: 8px 12px 0;
+  margin-right: 0;
 }
 </style>
