@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/team/llmgateway/internal/domain/channel"
@@ -296,5 +297,76 @@ func TestStreamConversion(t *testing.T) {
 	// 计费用量取上游 openai usage（12/7）。
 	if len(h.billing.reqs) != 1 || h.billing.reqs[0].Tokens.Input != 12 || h.billing.reqs[0].Tokens.Output != 7 {
 		t.Fatalf("流式计费用量应取上游 openai usage, got %+v", h.billing.reqs)
+	}
+}
+
+// TestCompletionsEndpointNoConversion 断言非 chat 形状端点（/v1/completions）不做跨协议转换：
+// 模型可达协议不含 openai-chat 时按不支持处理（HTTP 400 + unsupported_protocol），且绝不发起上游调用。
+func TestCompletionsEndpointNoConversion(t *testing.T) {
+	var calls int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	h := build(t, upstream.URL)
+	// 模型仅可达 anthropic-messages（不含 openai-chat）→ /v1/completions 不可转换。
+	h.chans.mrt.Model.Protocols = channelprotocol.Protocols{channelprotocol.ProtocolAnthropicMessages: {}}
+
+	rec := doRequest(t, h.gw, "/v1/completions", "sk-gw-t", `{"model":"gpt-4","prompt":"ping"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("want 400 不支持协议，got %d: %s", rec.Code, rec.Body.String())
+	}
+	if et := decodeOpenAIError(t, rec).Error.Type; et != "unsupported_protocol" {
+		t.Fatalf("want type=unsupported_protocol，got %q", et)
+	}
+	if n := atomic.LoadInt32(&calls); n != 0 {
+		t.Fatalf("/v1/completions 不应转换或发起上游调用，上游被调用 %d 次", n)
+	}
+}
+
+// TestStreamConversionToolOnlyAnthropicTarget 端到端：anthropic-messages 入站 → 模型仅可达 openai-chat →
+// 上游返回「仅工具调用」且 finish_reason 与 usage 分片的 openai-chat 流。断言下游 anthropic SSE：
+// 工具块下标从 0 连续起始（上游 tool_calls 下标为 1 也不得起始于 1）、终止帧前先补 content_block_stop，
+// 且 finish_reason 与 usage 合并为唯一一帧 message_delta。
+func TestStreamConversionToolOnlyAnthropicTarget(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(
+			"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"\"}}]}}]}\n\n" +
+				"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{}\"}}]}}]}\n\n" +
+				"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" +
+				"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n" +
+				"data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	h := build(t, upstream.URL)
+	// 模型仅可达 openai-chat → anthropic-messages 入站需转换为 openai-chat 上游。
+	h.chans.mrt.Model.Protocols = channelprotocol.Protocols{channelprotocol.ProtocolOpenAIChat: {}}
+
+	rec := postWithHeaders(t, h.gw, "/v1/messages",
+		`{"model":"gpt-4","stream":true,"max_tokens":100,"messages":[{"role":"user","content":"ping"}]}`,
+		map[string]string{"x-api-key": "sk-gw-t"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if n := strings.Count(body, "event: message_delta"); n != 1 {
+		t.Fatalf("finish_reason 与 usage 应合并为唯一 message_delta 帧，got %d: %s", n, body)
+	}
+	if !strings.Contains(body, "event: content_block_stop") {
+		t.Fatalf("anthropic 下游应先补 content_block_stop，got %s", body)
+	}
+	if strings.Contains(body, `"index":1`) {
+		t.Fatalf("下游块下标应从 0 连续起始（工具块不得起始于 1），got %s", body)
+	}
+	if !strings.Contains(body, "event: message_stop") {
+		t.Fatalf("anthropic 下游应以 message_stop 收尾，got %s", body)
+	}
+	if len(h.billing.reqs) != 1 || h.billing.reqs[0].Tokens.Input != 10 || h.billing.reqs[0].Tokens.Output != 5 {
+		t.Fatalf("计费用量应取上游 openai usage(10/5)，got %+v", h.billing.reqs)
 	}
 }

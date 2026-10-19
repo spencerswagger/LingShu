@@ -40,7 +40,9 @@ func matrixInboundBody(proto string, stream bool) string {
 	case channelprotocol.ProtocolOpenAIResponses:
 		return `{"model":"gpt-4","stream":` + st + `,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"ping"}]}]}`
 	case channelprotocol.ProtocolAnthropicMessages:
-		return `{"model":"gpt-4","stream":` + st + `,"max_tokens":100,"messages":[{"role":"user","content":"ping"}]}`
+		// 含 anthropic 专有字段（system / stop_sequences），使 openai-chat 目标的形状判别不再同义反复：
+		// 转换后 system 折叠进 messages、stop_sequences 映射为 stop，均可与直通的 anthropic 体区分。
+		return `{"model":"gpt-4","stream":` + st + `,"max_tokens":100,"system":"be nice","stop_sequences":["END"],"messages":[{"role":"user","content":"ping"}]}`
 	default:
 		return `{"model":"gpt-4","stream":` + st + `,"messages":[{"role":"user","content":"ping"}]}`
 	}
@@ -78,6 +80,29 @@ func matrixTargetReqKey(proto string) string {
 		return `"input"`
 	default:
 		return `"messages"`
+	}
+}
+
+// matrixTargetReqChecker 断言上游收到的请求体确为目标协议形状（非源协议直通残留）。
+// 对 openai-chat 目标额外强化：源为 anthropic 时，直通体与转换体都含 "messages"，仅凭该键
+// 无法区分；故追加目标特有判据——不得残留 anthropic 专有键 "stop_sequences"，且须已把
+// system 折叠为 messages 内的 system 角色、把 stop_sequences 映射为 stop（这些仅在真正转换后出现）。
+func matrixTargetReqChecker(t *testing.T, src, tgt string, body []byte) {
+	t.Helper()
+	s := string(body)
+	if !strings.Contains(s, matrixTargetReqKey(tgt)) {
+		t.Fatalf("上游应收到 %s 形状请求体（含 %s），got %s", tgt, matrixTargetReqKey(tgt), body)
+	}
+	if tgt == channelprotocol.ProtocolOpenAIChat && src == channelprotocol.ProtocolAnthropicMessages {
+		if strings.Contains(s, `"stop_sequences"`) {
+			t.Fatalf("转换到 openai-chat 后不应残留 anthropic 专有键 stop_sequences，got %s", body)
+		}
+		if !strings.Contains(s, `"role":"system"`) {
+			t.Fatalf("转换到 openai-chat 后 system 应折叠进 messages（system 角色），got %s", body)
+		}
+		if !strings.Contains(s, `"stop":"END"`) {
+			t.Fatalf("转换到 openai-chat 后 stop_sequences 应映射为 stop，got %s", body)
+		}
 	}
 }
 
@@ -203,10 +228,8 @@ func TestProtocolConversionMatrix(t *testing.T) {
 					if rec.Code != http.StatusOK {
 						t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
 					}
-					// (a) 上游收到目标协议形状请求体。
-					if !strings.Contains(string(gotBody), matrixTargetReqKey(tgt)) {
-						t.Fatalf("上游应收到 %s 形状请求体（含 %s），got %s", tgt, matrixTargetReqKey(tgt), gotBody)
-					}
+					// (a) 上游收到目标协议形状请求体（非源协议直通残留）。
+					matrixTargetReqChecker(t, src, tgt, gotBody)
 					// (a2) 转换时上游必须用目标协议的规范端点（而非入站端点）。
 					if suffix := matrixTargetUpstreamPathSuffix(tgt); !strings.HasSuffix(gotPath, suffix) {
 						t.Fatalf("转换到 %s 时上游路径应以 %q 结尾（规范端点），got %q", tgt, suffix, gotPath)

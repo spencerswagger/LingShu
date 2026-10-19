@@ -148,6 +148,67 @@ func TestEmptyStopReasonNotLeaking(t *testing.T) {
 	}
 }
 
+// TestOpenAIChatStreamUsageInChoices 断言 usage 位于 choices[].usage 时同样被提取，
+// 且优先级与网关 parseStreamData 一致（choices[].usage 优先于顶层 usage）。
+func TestOpenAIChatStreamUsageInChoices(t *testing.T) {
+	data := `{"choices":[{"index":0,"delta":{},"finish_reason":"stop",` +
+		`"usage":{"prompt_tokens":30,"completion_tokens":3,"total_tokens":33}}],` +
+		`"usage":{"prompt_tokens":12,"completion_tokens":7,"total_tokens":19}}`
+	evs, _, err := openAIChatCodec{}.DecodeEvent([]byte(data))
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	var terminal *CanonicalEvent
+	for i := range evs {
+		if evs[i].Type == EventMessageDelta {
+			terminal = &evs[i]
+		}
+	}
+	if terminal == nil || !terminal.HasUsage {
+		t.Fatalf("期望带 usage 的 MessageDelta，got %+v", evs)
+	}
+	// choices[].usage 优先：Input=prompt-cached=30，Output=3。
+	if terminal.Usage.Input != 30 || terminal.Usage.Output != 3 {
+		t.Fatalf("usage 应优先取 choices[].usage，got %+v", terminal.Usage)
+	}
+}
+
+// TestOpenAIResponsesStreamIncomplete 断言 response.incomplete 与 response.completed 同样处理：
+// 携带 usage 且状态归入 length 家族（下游以 incomplete 呈现）。
+func TestOpenAIResponsesStreamIncomplete(t *testing.T) {
+	cases := []struct {
+		name string
+		data string
+	}{
+		{"with_status", `{"type":"response.incomplete","response":{"status":"incomplete","usage":{"input_tokens":10,"output_tokens":4,"total_tokens":14}}}`},
+		{"status_absent", `{"type":"response.incomplete","response":{"usage":{"input_tokens":10,"output_tokens":4,"total_tokens":14}}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			evs, _, err := openaiResponsesCodec{}.DecodeEvent([]byte(tc.data))
+			if err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if len(evs) != 1 || evs[0].Type != EventMessageDelta {
+				t.Fatalf("期望单个 MessageDelta，got %+v", evs)
+			}
+			if evs[0].StopReason != stopReasonLength {
+				t.Fatalf("incomplete 应归一为 length 家族，got %q", evs[0].StopReason)
+			}
+			if !evs[0].HasUsage || evs[0].Usage.Input != 10 || evs[0].Usage.Output != 4 {
+				t.Fatalf("usage 未正确携带：%+v", evs[0])
+			}
+			frames, _, err := openaiResponsesCodec{}.EncodeEvent(evs[0])
+			if err != nil {
+				t.Fatalf("encode: %v", err)
+			}
+			if len(frames) != 1 || !strings.Contains(string(frames[0]), `"status":"incomplete"`) {
+				t.Fatalf("下游应为 incomplete 状态，got %q", frames)
+			}
+		})
+	}
+}
+
 func decodeSSE(t *testing.T, c StreamCodec, s string) []CanonicalEvent {
 	t.Helper()
 	out := []CanonicalEvent{}
