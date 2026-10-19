@@ -124,19 +124,19 @@ type ColKey = 'external' | 'internal' | 'channel' | 'key' | 'priority' | 'limits
 const COLS: ColKey[] = ['external', 'internal', 'channel', 'key', 'priority', 'limits', 'sessions']
 
 // 单元格合并：连续且「合并键相同」的行并成一格。
-// 关键：对外/内部模型的合并键**带上状态** —— 只合并同名同状态的行，既拿到合并的紧凑，
-// 又不会把「某渠道已禁用」的行并进绿色的格子里；密钥/限流按自身粒度合并。
+// 合并键**只含名称/ID，不含状态** —— 保证合并块与行顺序完全稳定（状态抖动不会让块裂开/合上）。
+// 合并格内显示「组聚合状态灯」：组内全正常=绿 · 部分异常=橙（部分可用）· 全异常=红，
+// 因此不会把某条异常行并进绿色格子里而把状态藏起来。异常明细见悬停 tooltip。
 function mergeKeyOf(ck: ColKey): (r: MatrixRow) => string {
   switch (ck) {
     case 'external':
-      return (r) => (r.model ? 'E' + r.model.View.ExternalModelID + '|' + extRowState(r) : '')
+      return (r) => (r.model ? 'E' + r.model.View.ExternalModelID : '')
     case 'internal':
-      return (r) => (r.model ? 'E' + r.model.View.ExternalModelID + '|I' + r.model.View.InternalModelID + '|' + r.model.View.State : '')
+      return (r) => (r.model ? 'E' + r.model.View.ExternalModelID + '|I' + r.model.View.InternalModelID : '')
     case 'channel':
       return (r) => 'C' + r.channel.View.ID
     case 'key':
-      // 序位可能随外部模型不同，故并入合并键，保证色条与所在行一致。
-      return (r) => (r.key ? 'K' + r.channel.View.ID + '|' + r.key.View.KeyID + '|' + String(rankOf(r)) : '')
+      return (r) => (r.key ? 'K' + r.channel.View.ID + '|' + r.key.View.KeyID : '')
     case 'priority':
       return (r) => 'C' + r.channel.View.ID
     case 'limits':
@@ -146,23 +146,30 @@ function mergeKeyOf(ck: ColKey): (r: MatrixRow) => string {
   }
 }
 
-// 预计算「连续相同键的 run-length」：首行 rowspan=组长，其余行 rowspan=0。
-function buildRuns(keyFn: (r: MatrixRow) => string): number[] {
+// 预计算「连续相同键的 run-length」：首行 rowspan=组长，其余行 rowspan=0；同时保留每个 run 的行下标区间。
+function runsOf(keyFn: (r: MatrixRow) => string): { spans: number[]; ranges: [number, number][] } {
   const src = rows.value
   const spans = new Array<number>(src.length).fill(1)
+  const ranges: [number, number][] = []
   let i = 0
   while (i < src.length) {
     let j = i + 1
     while (j < src.length && keyFn(src[j]) === keyFn(src[i])) j++
     spans[i] = j - i
     for (let t = i + 1; t < j; t++) spans[t] = 0
+    ranges.push([i, j])
     i = j
   }
-  return spans
+  return { spans, ranges }
 }
+const runData = computed(() => {
+  const map: Partial<Record<ColKey, { spans: number[]; ranges: [number, number][] }>> = {}
+  for (const ck of COLS) map[ck] = runsOf(mergeKeyOf(ck))
+  return map
+})
 const spans = computed(() => {
   const map: Partial<Record<ColKey, number[]>> = {}
-  for (const ck of COLS) map[ck] = buildRuns(mergeKeyOf(ck))
+  for (const ck of COLS) map[ck] = runData.value[ck]!.spans
   return map
 })
 function spanMethod({ rowIndex, columnIndex }: { rowIndex: number; columnIndex: number }): [number, number] {
@@ -173,13 +180,6 @@ function spanMethod({ rowIndex, columnIndex }: { rowIndex: number; columnIndex: 
 }
 
 // ===== 状态灯与原因 =====
-// 状态严重度：DISABLED > DRAIN > NORMAL（决策 7）。折叠列状态灯取覆盖集合中最差状态。
-const STATE_RANK: Record<string, number> = { NORMAL: 0, DRAIN: 1, DISABLED: 2 }
-function worstState(states: string[]): string {
-  let w = 'NORMAL'
-  for (const s of states) if ((STATE_RANK[s] ?? 0) > (STATE_RANK[w] ?? 0)) w = s
-  return w
-}
 // 状态中文名（含聚合态 PARTIAL）。
 function stateLabel(state: string): string {
   switch (state) {
@@ -236,17 +236,6 @@ interface ReasonLine {
 function pct(v: number): string {
   return `${(Number.isFinite(v) ? v : 0).toFixed(2)}%`
 }
-function machineReasonLines(m: MachineMetrics, rel: ReliabilityConfig): ReasonLine[] {
-  const out: ReasonLine[] = []
-  if (m.DrainingReasons && m.DrainingReasons.length) {
-    out.push({ text: '排空原因：' + m.DrainingReasons.join('；') })
-  }
-  out.push({ text: `错误率 ${pct(m.ErrorRatePct)}（阈值 ${rel.ErrorRatePct}%）`, danger: rel.ErrorRatePct > 0 && m.ErrorRatePct > rel.ErrorRatePct })
-  out.push({ text: `429 占比 ${pct(m.Rate429Pct)}（阈值 ${rel.Rate429Pct}%）`, danger: rel.Rate429Pct > 0 && m.Rate429Pct > rel.Rate429Pct })
-  out.push({ text: `P99 ${m.P99LatencyMS}ms（阈值 ${rel.P99LatencyMS}ms）`, danger: rel.P99LatencyMS > 0 && m.P99LatencyMS > rel.P99LatencyMS })
-  out.push({ text: `窗口 ${m.WindowSeconds}s · 样本 ${m.Total} · 失败 ${m.Failures}` })
-  return out
-}
 // 渠道无独立状态机（渠道=配置模板）：原因由其内部模型与密钥的异常项派生。
 function channelReasonOf(c: ChannelDetail): ReasonLine[] {
   const lines: ReasonLine[] = []
@@ -266,11 +255,6 @@ function channelReasonOf(c: ChannelDetail): ReasonLine[] {
     }
   }
   if (!lines.length) lines.push({ text: '全部内部模型与密钥正常' })
-  return lines
-}
-function modelReasonOf(m: ModelDetail): ReasonLine[] {
-  const lines = machineReasonLines(m.Metrics, m.View.Reliability)
-  if (m.View.LastErr) lines.unshift({ text: '上次错误：' + m.View.LastErr, danger: true })
   return lines
 }
 function keyReasonOf(k: KeyDetail): ReasonLine[] {
@@ -324,36 +308,15 @@ function extReasonOf(extId: string): ReasonLine[] {
   return lines
 }
 
-// 折叠摘要文案：覆盖多个值时形如「共 n 项 · n 项异常」；恰好 1 值时正常显示单值。
-function foldText(n: number, abnormal: number): string {
-  return `共 ${n} 项 · ${abnormal} 项异常`
-}
-function foldModelsReason(ms: ModelDetail[]): ReasonLine[] {
-  const lines: ReasonLine[] = []
-  for (const m of ms) {
-    if (m.View.State !== 'NORMAL') {
-      let t = `${m.View.InternalModelID}：${m.View.State}`
-      if (m.View.LastErr) t += `（${m.View.LastErr}）`
-      lines.push({ text: t, danger: m.View.State === 'DISABLED' })
-    }
-  }
-  if (!lines.length) lines.push({ text: '全部内部模型正常' })
-  return lines
-}
-function foldKeysReason(ks: KeyDetail[]): ReasonLine[] {
-  const lines: ReasonLine[] = []
-  for (const k of ks) {
-    if (k.View.State !== 'NORMAL') {
-      let t = `${k.View.Name || k.View.KeyID}：${k.View.State}`
-      if (k.View.LastErr) t += `（${k.View.LastErr}）`
-      lines.push({ text: t, danger: k.View.State === 'DISABLED' })
-    }
-  }
-  if (!lines.length) lines.push({ text: '全部密钥正常' })
-  return lines
+function aggState(states: string[]): string {
+  if (!states.length) return 'NORMAL'
+  const ok = states.filter((s) => s === 'NORMAL').length
+  if (ok === states.length) return 'NORMAL'
+  if (ok === 0) return 'DISABLED'
+  return 'PARTIAL'
 }
 
-// 维度单元格视图模型：勾选列=单值；折叠列覆盖多值时=聚合摘要。
+// 维度单元格视图模型：名称 + 组聚合状态灯 + 悬停原因。
 // 规范（不允许隐性逻辑）：维度列只展示名称（不含 ID / 行主键），状态以状态灯表达。
 interface DimCell {
   state: string
@@ -362,55 +325,64 @@ interface DimCell {
   reason: ReasonLine[]
   multi: boolean
 }
-function externalCell(r: MatrixRow): DimCell {
-  const extId = r.model ? r.model.View.ExternalModelID : r.models[0]?.View.ExternalModelID
+function modelGroupReason(run: MatrixRow[]): ReasonLine[] {
+  const lines: ReasonLine[] = []
+  for (const r of run) {
+    const m = r.model
+    if (!m || m.View.State === 'NORMAL') continue
+    lines.push({ text: `渠道 ${r.channel.View.Name}：${stateLabel(m.View.State)}`, danger: m.View.State === 'DISABLED' })
+    if (m.View.LastErr) lines.push({ text: `　${m.View.LastErr}`, danger: true })
+    lines.push({ text: `　${metricsText(m.Metrics)}` })
+  }
+  if (!lines.length) lines.push({ text: '全部通路正常' })
+  return lines
+}
+function externalGroup(run: MatrixRow[]): DimCell {
+  const extId = run[0].model ? run[0].model.View.ExternalModelID : run[0].models[0]?.View.ExternalModelID
   if (!extId) return { state: 'NORMAL', name: '—', sub: '', reason: [{ text: '无对外模型' }], multi: false }
-  return { state: extRowState(r), name: externalNameByID.value[extId] || extId, sub: '', reason: extReasonOf(extId), multi: false }
+  return { state: aggState(run.map(extRowState)), name: externalNameByID.value[extId] || extId, sub: '', reason: extReasonOf(extId), multi: false }
 }
-function internalCell(r: MatrixRow): DimCell {
-  const ms = r.models
-  if (ms.length === 0) return { state: 'NORMAL', name: '—', sub: '', reason: [{ text: '无内部模型' }], multi: false }
-  if (ms.length === 1) {
-    const m = ms[0]
-    return { state: m.View.State, name: m.View.InternalModelID, sub: '', reason: modelReasonOf(m), multi: false }
-  }
+function internalGroup(run: MatrixRow[]): DimCell {
+  const m0 = run[0].model
+  if (!m0) return { state: 'NORMAL', name: '—', sub: '', reason: [{ text: '无内部模型' }], multi: false }
+  return { state: aggState(run.map((r) => (r.model ? r.model.View.State : 'NORMAL'))), name: m0.View.InternalModelID, sub: '', reason: modelGroupReason(run), multi: false }
+}
+function channelGroup(run: MatrixRow[]): DimCell {
+  const c = run[0].channel
+  return { state: c.State, name: c.View.Name, sub: '', reason: channelReasonOf(c), multi: false }
+}
+function keyGroup(run: MatrixRow[]): DimCell {
+  const k = run[0].key
+  if (!k) return { state: 'NORMAL', name: '—', sub: '', reason: [{ text: '无密钥' }], multi: false }
   return {
-    state: worstState(ms.map((m) => m.View.State)),
-    name: foldText(ms.length, ms.filter((m) => m.View.State !== 'NORMAL').length),
-    sub: '',
-    reason: foldModelsReason(ms),
-    multi: true,
+    state: aggState(run.map((r) => (r.key ? r.key.View.State : 'NORMAL'))),
+    name: k.View.Name || `密钥 ${k.View.KeyID}`,
+    sub: k.View.CredentialTail || '',
+    reason: keyReasonOf(k),
+    multi: false,
   }
 }
-function channelCell(r: MatrixRow): DimCell {
-  return { state: r.channel.State, name: r.channel.View.Name, sub: '', reason: channelReasonOf(r.channel), multi: false }
-}
-function keyCell(r: MatrixRow): DimCell {
-  const ks = r.keys
-  if (ks.length === 0) return { state: 'NORMAL', name: '—', sub: '', reason: [{ text: '无密钥' }], multi: false }
-  if (ks.length === 1) {
-    const k = ks[0]
-    return { state: k.View.State, name: k.View.Name || `密钥 ${k.View.KeyID}`, sub: k.View.CredentialTail || '', reason: keyReasonOf(k), multi: false }
-  }
-  return {
-    state: worstState(ks.map((k) => k.View.State)),
-    name: foldText(ks.length, ks.filter((k) => k.View.State !== 'NORMAL').length),
-    sub: '',
-    reason: foldKeysReason(ks),
-    multi: true,
-  }
-}
-// 预计算每行的四个维度单元格，供模板取用。
+
+type DimKey = 'external' | 'internal' | 'channel' | 'key'
+// 按合并组预计算单元格：组内所有行共用同一聚合格（仅首行渲染）。
 const EMPTY_CELL: DimCell = { state: 'NORMAL', name: '—', sub: '', reason: [], multi: false }
-const cellsByRow = computed<Record<string, { external: DimCell; internal: DimCell; channel: DimCell; key: DimCell }>>(() => {
-  const map: Record<string, { external: DimCell; internal: DimCell; channel: DimCell; key: DimCell }> = {}
-  for (const r of rows.value) {
-    map[r._id] = { external: externalCell(r), internal: internalCell(r), channel: channelCell(r), key: keyCell(r) }
+const cellByRow = computed<Record<string, Partial<Record<DimKey, DimCell>>>>(() => {
+  const src = rows.value
+  const map: Record<string, Partial<Record<DimKey, DimCell>>> = {}
+  const put = (ck: DimKey, build: (run: MatrixRow[]) => DimCell) => {
+    for (const [i, j] of runData.value[ck]!.ranges) {
+      const c = build(src.slice(i, j))
+      for (let t = i; t < j; t++) (map[src[t]._id] ||= {})[ck] = c
+    }
   }
+  put('external', externalGroup)
+  put('internal', internalGroup)
+  put('channel', channelGroup)
+  put('key', keyGroup)
   return map
 })
-function cell(row: MatrixRow, dim: 'external' | 'internal' | 'channel' | 'key'): DimCell {
-  return cellsByRow.value[row._id]?.[dim] ?? EMPTY_CELL
+function cell(row: MatrixRow, dim: DimKey): DimCell {
+  return cellByRow.value[row._id]?.[dim] ?? EMPTY_CELL
 }
 
 // ===== 序位色条（决策 5 / R9）=====
@@ -423,21 +395,38 @@ function rankOf(r: MatrixRow): number | 'none' | null {
   const c = list.find((x) => x.ChannelID === r.channel.View.ID && x.ChannelKeyID === r.key!.View.KeyID)
   return c ? c.Rank : 'none'
 }
-function rankClass(r: MatrixRow): string {
-  const rank = rankOf(r)
-  if (rank === null) return ''
-  if (rank === 'none') return 'rank-none'
-  if (rank === 1) return 'rank-first'
-  return 'rank-second'
+// 序位色条悬停释义（色条即序位语义）。密钥列合并组可能跨多个对外模型：
+// 组内序位一致 → 用该序位；不一致 → 中性灰并注明「多个对外模型下序位不同」。
+interface RankInfo {
+  show: boolean
+  cls: string
+  tip: string
 }
-// 序位悬停释义（色条即序位语义）。
-function rankTip(r: MatrixRow): string {
-  const rank = rankOf(r)
-  if (rank === null) return ''
-  if (rank === 'none') return '不参与新会话（未进入候选排序）'
-  if (rank === 1) return '首选（第 1 候选）'
-  if (rank === 2) return '次选（第 2 候选）'
-  return `第 ${rank} 候选`
+const rankByRow = computed<Record<string, RankInfo>>(() => {
+  const src = rows.value
+  const map: Record<string, RankInfo> = {}
+  for (const [i, j] of runData.value.key!.ranges) {
+    const ranks = src.slice(i, j).map(rankOf)
+    const uniq = [...new Set(ranks.map((x) => String(x)))]
+    let info: RankInfo
+    if (uniq.length === 1 && ranks[0] !== null) {
+      const rank = ranks[0]
+      info = {
+        show: true,
+        cls: rank === 'none' ? 'rank-none' : rank === 1 ? 'rank-first' : 'rank-second',
+        tip: rank === 'none' ? '不参与新会话（未进入候选排序）' : rank === 1 ? '首选（第 1 候选）' : rank === 2 ? '次选（第 2 候选）' : `第 ${rank} 候选`,
+      }
+    } else if (uniq.length === 1) {
+      info = { show: false, cls: '', tip: '' }
+    } else {
+      info = { show: true, cls: 'rank-mixed', tip: '多个对外模型下序位不同' }
+    }
+    for (let t = i; t < j; t++) map[src[t]._id] = info
+  }
+  return map
+})
+function rankInfo(r: MatrixRow): RankInfo {
+  return rankByRow.value[r._id] ?? { show: false, cls: '', tip: '' }
 }
 
 // ===== 指标列取值 =====
@@ -817,8 +806,8 @@ onUnmounted(stopTimer)
         <el-table-column label="密钥" min-width="200">
           <template #default="{ row }">
             <div class="hcell">
-              <el-tooltip v-if="rankClass(row)" :content="rankTip(row)" placement="top">
-                <span class="rank-bar" :class="rankClass(row)" />
+              <el-tooltip v-if="rankInfo(row).show" :content="rankInfo(row).tip" placement="top">
+                <span class="rank-bar" :class="rankInfo(row).cls" />
               </el-tooltip>
               <el-tooltip placement="top" :show-after="150">
                 <template #content>
@@ -918,9 +907,9 @@ onUnmounted(stopTimer)
               <tr>
                 <td class="cmp-field">状态</td>
                 <td>{{ selectedRow.model ? (extEnabledOf(selectedRow.model.View.ExternalModelID) ? '启用' : '停用') : '—' }}</td>
-                <td><StatusTag :value="cell(selectedRow, 'internal').state" /></td>
+                <td><StatusTag :value="selectedRow.model ? selectedRow.model.View.State : 'NORMAL'" /></td>
                 <td class="cmp-muted">—</td>
-                <td><StatusTag :value="cell(selectedRow, 'key').state" /></td>
+                <td><StatusTag :value="selectedRow.key ? selectedRow.key.View.State : 'NORMAL'" /></td>
               </tr>
               <tr>
                 <td class="cmp-field">协议 · 接口地址</td>
@@ -1291,6 +1280,9 @@ onUnmounted(stopTimer)
 }
 .rank-bar.rank-none {
   color: #98a2b3;
+}
+.rank-bar.rank-mixed {
+  color: #c7cbd3;
 }
 .tt {
   max-width: 320px;
