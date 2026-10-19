@@ -43,6 +43,9 @@ const (
 	msgUnsupportedProtocol = "该模型不支持当前入站协议（无可直通的上游协议）"
 )
 
+// reasonClientGone 下游客户端断开（建连阶段取消）的统一归因文案，供决策轨迹、调用日志与失败候选统计共用。
+const reasonClientGone = "客户端断开"
+
 // bearerPlain 从 Authorization 头提取 Bearer 令牌明文；非 Bearer 形式返回 ("", false)。
 func bearerPlain(auth string) (string, bool) {
 	return strings.CutPrefix(auth, "Bearer ")
@@ -718,7 +721,7 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 			}
 			switch {
 			case out.clientGone:
-				attempts = append(attempts, attempt("客户端断开"))
+				attempts = append(attempts, attempt(reasonClientGone))
 			case out.billFailed:
 				attempts = append(attempts, attempt("计费失败"))
 			case out.refundPre:
@@ -738,7 +741,9 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 			// 决策轨迹与失败候选数只算一次，传入 logOutcome 复用（避免重复遍历 attempts）。
 			trail, failed := summarizeAttempts(attempts)
 			// 下游客户端断开（建连阶段取消）：独立结论文案、Info 级、不计失败候选（天然 status<400）。
-			if out.clientGone {
+			// 仅当本次请求没有其它真实候选失败时，client-gone 才是唯一结论；否则落入下方
+			// failed>0 分支，避免用 client-gone 结论遮蔽既有的真实上游失败。
+			if out.clientGone && failed == 0 {
 				g.logOutcome(ctx, slog.LevelInfo, endpoint, model, "客户端已断开，按估算结算", status, false, token, sessionID, attempts, trail, failed, msSince(start))
 				return
 			}
@@ -1013,9 +1018,12 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 				errInfo{kind: "client_gone", stage: stage, attempt: attempt, retry: false,
 					reason: "下游客户端已断开，请求取消", sessionID: sessionID, durationMs: *msSince(start)})
 			usage := billing.Usage{Input: int64(pc.InputTokens)}
-			_, bid, _ := g.recordBilling(ctx, routeRes, model, token, usage, pricingMode, sessionID, sessionName, pc.Credits, msSince(start), nil)
+			_, bid, berr := g.recordBilling(ctx, routeRes, model, token, usage, pricingMode, sessionID, sessionName, pc.Credits, msSince(start), nil)
+			if berr != nil {
+				g.logger.Error("client-gone billing failed", "user_id", token.UserID, "channel_id", routeRes.ChannelID, "model", model, "err", berr)
+			}
 			g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-				"error", "", "failed", "客户端断开", msSince(start), nil, g.callLogDecision(attempts, "客户端断开", pc, routeRes))
+				"error", "", "failed", reasonClientGone, msSince(start), nil, g.callLogDecision(attempts, reasonClientGone, pc, routeRes))
 			return &fwdOutcome{responded: true, clientGone: true}
 		}
 		// 连接阶段失败（未送达，可转移）与已送达后失败（多为超时，不转移）语义不同，现场一并记录。
@@ -1312,13 +1320,16 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 					reason: "下游客户端已断开，请求取消", sessionID: sessionID, durationMs: *elapsed,
 					delivered: &delivered, firstByteReceived: &firstByte, elapsedMS: elapsed})
 			usage := billing.Usage{Input: int64(pc.InputTokens)}
-			_, bid, _ := g.recordBilling(ctx, routeRes, model, token, usage, pricingMode, sessionID, sessionName, pc.Credits, elapsed, nil)
-			dec := g.callLogDecision(attempts, "客户端断开", pc, routeRes)
+			_, bid, berr := g.recordBilling(ctx, routeRes, model, token, usage, pricingMode, sessionID, sessionName, pc.Credits, elapsed, nil)
+			if berr != nil {
+				g.logger.Error("client-gone billing failed", "user_id", token.UserID, "channel_id", routeRes.ChannelID, "model", model, "err", berr)
+			}
+			dec := g.callLogDecision(attempts, reasonClientGone, pc, routeRes)
 			for k, v := range streamDiag {
 				dec[k] = v
 			}
 			g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-				"error", "", "failed", "客户端断开", elapsed, nil, dec)
+				"error", "", "failed", reasonClientGone, elapsed, nil, dec)
 			return &fwdOutcome{responded: true, clientGone: true, streamDiag: streamDiag}
 		}
 		g.logUpstreamErr(ctx, slog.LevelWarn, "upstream call failed", endpoint, ureq.Protocol, model, token, routeRes,
@@ -1530,13 +1541,15 @@ type firstTokenWriter struct {
 	first time.Time
 }
 
-// streamClientGone 判定"客户端已离开"：上游返回 context.Canceled，或请求 ctx 已取消
-// （下游写失败通常伴随请求 ctx 取消）。客户端离开不算上游中断失败，但必须留痕。
+// streamClientGone 判定"客户端已离开"：上游返回 context.Canceled，或请求 ctx 本身以
+// context.Canceled 结束（下游写失败/提前断开通常伴随请求 ctx 取消）。仅认 Canceled——
+// 不把 DeadlineExceeded 等其它取消原因当作客户端离开，避免掩盖真实上游故障；客户端离开
+// 不算上游中断失败，但必须留痕。
 func streamClientGone(ctx context.Context, herr error) bool {
 	if errors.Is(herr, context.Canceled) {
 		return true
 	}
-	return ctx.Err() != nil
+	return errors.Is(ctx.Err(), context.Canceled)
 }
 
 func (w *firstTokenWriter) Write(p []byte) (int, error) {
