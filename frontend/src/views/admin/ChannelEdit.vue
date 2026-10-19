@@ -25,6 +25,7 @@ import {
 } from '@/api/admin'
 import ChannelModels from '@/components/ChannelModels.vue'
 import StatusTag from '@/components/StatusTag.vue'
+import StateActions from '@/components/StateActions.vue'
 import CronInput from '@/components/CronInput.vue'
 import ErrorBubble from '@/components/ErrorBubble.vue'
 import { useUnsavedGuard } from '@/composables/useUnsavedGuard'
@@ -500,9 +501,7 @@ async function onSubmit() {
                         <StatusTag :value="row.State" style="cursor: pointer" />
                       </template>
                       <div class="pop-actions">
-                        <el-button v-if="row.State !== 'NORMAL'" size="small" type="success" @click="onKeyState(row, 'normal')">正常</el-button>
-                        <el-button v-if="row.State !== 'DRAIN'" size="small" type="warning" @click="onKeyState(row, 'drain')">排空</el-button>
-                        <el-button v-if="row.State !== 'DISABLED'" size="small" type="danger" @click="onKeyState(row, 'disable')">禁用</el-button>
+                        <StateActions :state="row.State" @set="(a) => onKeyState(row, a)" />
                       </div>
                     </el-popover>
                   </template>
@@ -778,9 +777,7 @@ async function onSubmit() {
                         <StatusTag :value="row.State" style="cursor: pointer" />
                       </template>
                       <div class="pop-actions">
-                        <el-button v-if="row.State !== 'NORMAL'" size="small" type="success" @click="onKeyState(row, 'normal')">正常</el-button>
-                        <el-button v-if="row.State !== 'DRAIN'" size="small" type="warning" @click="onKeyState(row, 'drain')">排空</el-button>
-                        <el-button v-if="row.State !== 'DISABLED'" size="small" type="danger" @click="onKeyState(row, 'disable')">禁用</el-button>
+                        <StateActions :state="row.State" @set="(a) => onKeyState(row, a)" />
                       </div>
                     </el-popover>
                   </template>
@@ -796,9 +793,7 @@ async function onSubmit() {
                 <el-table-column label="操作" width="150" align="right">
                   <template #default="{ row }">
                     <div class="pop-actions key-state-ops">
-                      <el-button v-if="row.State !== 'NORMAL'" size="small" type="success" text @click="onKeyState(row, 'normal')">正常</el-button>
-                      <el-button v-if="row.State !== 'DRAIN'" size="small" type="warning" text @click="onKeyState(row, 'drain')">排空</el-button>
-                      <el-button v-if="row.State !== 'DISABLED'" size="small" type="danger" text @click="onKeyState(row, 'disable')">禁用</el-button>
+                      <StateActions :state="row.State" @set="(a) => onKeyState(row, a)" />
                     </div>
                   </template>
                 </el-table-column>
