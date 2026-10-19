@@ -116,7 +116,7 @@ func ConvertResponse(from, to string, body []byte) ([]byte, *LossyReport, error)
 	rep := &LossyReport{}
 	rep.Merge(parseRep)
 	if resp != nil {
-		resp.FinishReason = nativeFinishReason(to, canonicalFinishReason(from, resp.FinishReason), rep)
+		resp.FinishReason = stopReasonFromCanonical(to, stopReasonToCanonical(from, resp.FinishReason), rep)
 	}
 
 	out, serRep, err := toCodec.SerializeResponse(resp)
@@ -154,85 +154,4 @@ func EncodeStreamEvents(protocol string, events []CanonicalEvent) ([][]byte, *Lo
 		frames = append(frames, encoded...)
 	}
 	return frames, rep, nil
-}
-
-// ConvertStreamEvent 将单个 from 协议流帧转换为 to 协议帧序列：先解码为规范事件再逐条编码，停止原因已由流编解码器归一。
-func ConvertStreamEvent(from, to string, data []byte) ([][]byte, *LossyReport, error) {
-	events, decRep, err := DecodeStreamEvents(from, data)
-	if err != nil {
-		return nil, decRep, err
-	}
-	frames, encRep, err := EncodeStreamEvents(to, events)
-	if err != nil {
-		return nil, encRep, err
-	}
-	rep := &LossyReport{}
-	rep.Merge(decRep)
-	rep.Merge(encRep)
-	return frames, rep, nil
-}
-
-func canonicalFinishReason(protocol, native string) string {
-	if native == "" {
-		return ""
-	}
-	switch channelprotocol.Canonical(protocol) {
-	case channelprotocol.ProtocolOpenAIChat:
-		switch native {
-		case "function_call":
-			return stopReasonToolCalls
-		}
-	case channelprotocol.ProtocolOpenAIResponses:
-		switch native {
-		case "max_output_tokens":
-			return stopReasonLength
-		case "completed":
-			return stopReasonStop
-		}
-	case channelprotocol.ProtocolAnthropicMessages:
-		switch native {
-		case "end_turn", "stop_sequence":
-			return stopReasonStop
-		case "max_tokens":
-			return stopReasonLength
-		case "tool_use":
-			return stopReasonToolCalls
-		}
-	}
-	return native
-}
-
-func nativeFinishReason(protocol, canonical string, rep *LossyReport) string {
-	if canonical == "" {
-		return ""
-	}
-	switch channelprotocol.Canonical(protocol) {
-	case channelprotocol.ProtocolOpenAIChat:
-		return canonical
-	case channelprotocol.ProtocolOpenAIResponses:
-		switch canonical {
-		case stopReasonLength:
-			return "max_output_tokens"
-		case stopReasonContentFilter:
-			return "content_filter"
-		case stopReasonStop:
-			return "stop"
-		case stopReasonToolCalls:
-			return "tool_calls"
-		}
-		return canonical
-	case channelprotocol.ProtocolAnthropicMessages:
-		switch canonical {
-		case stopReasonStop:
-			return "end_turn"
-		case stopReasonLength:
-			return "max_tokens"
-		case stopReasonToolCalls:
-			return "tool_use"
-		case stopReasonContentFilter:
-			rep.Note("stop reason content_filter remapped to end_turn for anthropic target")
-			return "end_turn"
-		}
-	}
-	return canonical
 }

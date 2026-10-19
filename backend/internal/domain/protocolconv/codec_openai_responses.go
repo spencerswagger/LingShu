@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 
 	"github.com/team/llmgateway/internal/domain/billing"
+	"github.com/team/llmgateway/internal/domain/channelprotocol"
 )
 
 type openaiResponsesCodec struct{}
@@ -748,7 +749,7 @@ func (openaiResponsesCodec) DecodeEvent(data []byte) ([]CanonicalEvent, *LossyRe
 		}
 		ev := CanonicalEvent{
 			Type:       EventMessageDelta,
-			StopReason: responsesStopReason(status),
+			StopReason: stopReasonToCanonical(channelprotocol.ProtocolOpenAIResponses, status),
 		}
 		if len(top.Response.Usage) > 0 && !isJSONNull(top.Response.Usage) {
 			ev.Usage = parseRespUsage(top.Response.Usage)

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 
 	"github.com/team/llmgateway/internal/domain/billing"
+	"github.com/team/llmgateway/internal/domain/channelprotocol"
 )
 
 // 规范停止原因取值，作为各协议间归一化的中间词表。
@@ -14,54 +15,74 @@ const (
 	stopReasonContentFilter = "content_filter"
 )
 
-// normalizeStopReason 将任意协议原生 stop reason 归一化为规范取值。
-func normalizeStopReason(native string) string {
-	switch native {
-	case "", stopReasonStop, stopReasonLength, stopReasonToolCalls, stopReasonContentFilter:
-		return native
-	case "end_turn", "stop_sequence":
-		return stopReasonStop
-	case "max_tokens":
-		return stopReasonLength
-	case "tool_use", "function_call":
-		return stopReasonToolCalls
-	default:
-		return native
-	}
-}
-
-// anthropicStopReason 将规范 stop reason 转换为 Anthropic 原生取值。
-func anthropicStopReason(canonical string) string {
-	switch canonical {
-	case "":
+// stopReasonToCanonical 把指定协议的原生停止原因归一化为规范词表取值
+// （stop|length|tool_calls|content_filter|""），为流式解码与 ConvertResponse 共用的唯一解码映射。
+func stopReasonToCanonical(protocol, native string) string {
+	if native == "" {
 		return ""
-	case stopReasonStop:
-		return "end_turn"
-	case stopReasonLength:
-		return "max_tokens"
-	case stopReasonToolCalls:
-		return "tool_use"
-	case stopReasonContentFilter:
-		return "end_turn"
-	default:
-		return canonical
 	}
+	switch channelprotocol.Canonical(protocol) {
+	case channelprotocol.ProtocolOpenAIChat:
+		switch native {
+		case "function_call":
+			return stopReasonToolCalls
+		}
+	case channelprotocol.ProtocolOpenAIResponses:
+		switch native {
+		case "completed":
+			return stopReasonStop
+		case "incomplete", "max_output_tokens":
+			return stopReasonLength
+		}
+	case channelprotocol.ProtocolAnthropicMessages:
+		switch native {
+		case "end_turn", "stop_sequence":
+			return stopReasonStop
+		case "max_tokens":
+			return stopReasonLength
+		case "tool_use":
+			return stopReasonToolCalls
+		}
+	}
+	return native
 }
 
-// openAIStopReason 将规范 stop reason 转换为 OpenAI 原生取值。
-func openAIStopReason(canonical string) string {
-	switch canonical {
-	case "", stopReasonStop, stopReasonLength, stopReasonToolCalls, stopReasonContentFilter:
+// stopReasonFromCanonical 把规范停止原因落回指定协议的原生取值，
+// 为流式编码与 ConvertResponse 共用的唯一编码映射。
+func stopReasonFromCanonical(protocol, canonical string, rep *LossyReport) string {
+	if canonical == "" {
+		return ""
+	}
+	switch channelprotocol.Canonical(protocol) {
+	case channelprotocol.ProtocolOpenAIChat:
 		return canonical
-	case "end_turn", "stop_sequence":
-		return stopReasonStop
-	case "max_tokens":
-		return stopReasonLength
-	case "tool_use", "function_call":
-		return stopReasonToolCalls
-	default:
+	case channelprotocol.ProtocolOpenAIResponses:
+		switch canonical {
+		case stopReasonLength:
+			return "max_output_tokens"
+		case stopReasonContentFilter:
+			return "content_filter"
+		case stopReasonStop:
+			return "stop"
+		case stopReasonToolCalls:
+			return "tool_calls"
+		}
+		return canonical
+	case channelprotocol.ProtocolAnthropicMessages:
+		switch canonical {
+		case stopReasonStop:
+			return "end_turn"
+		case stopReasonLength:
+			return "max_tokens"
+		case stopReasonToolCalls:
+			return "tool_use"
+		case stopReasonContentFilter:
+			rep.Note("stop reason content_filter remapped to end_turn for anthropic target")
+			return "end_turn"
+		}
 		return canonical
 	}
+	return canonical
 }
 
 // responsesStatus 依据规范 stop reason 生成 OpenAI Responses 的 status。
@@ -73,20 +94,6 @@ func responsesStatus(canonical string) string {
 		return "incomplete"
 	default:
 		return "completed"
-	}
-}
-
-// responsesStopReason 将 OpenAI Responses 的 status 归一化为规范 stop reason。
-func responsesStopReason(status string) string {
-	switch status {
-	case "":
-		return ""
-	case "completed":
-		return stopReasonStop
-	case "incomplete":
-		return stopReasonLength
-	default:
-		return status
 	}
 }
 

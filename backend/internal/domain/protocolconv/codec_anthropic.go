@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 
 	"github.com/team/llmgateway/internal/domain/billing"
+	"github.com/team/llmgateway/internal/domain/channelprotocol"
 )
 
 type anthropicCodec struct{}
@@ -754,7 +755,7 @@ func (anthropicCodec) DecodeEvent(data []byte) ([]CanonicalEvent, *LossyReport, 
 				StopReason string `json:"stop_reason"`
 			}
 			_ = json.Unmarshal(raw, &d)
-			ev.StopReason = normalizeStopReason(d.StopReason)
+			ev.StopReason = stopReasonToCanonical(channelprotocol.ProtocolAnthropicMessages, d.StopReason)
 		}
 		if raw, ok := top["usage"]; ok && !isJSONNull(raw) {
 			ev.Usage = parseAnthropicUsage(raw)
@@ -841,7 +842,7 @@ func (anthropicCodec) EncodeEvent(ev CanonicalEvent) ([][]byte, *LossyReport, er
 		}
 		delta := map[string]interface{}{}
 		if ev.StopReason != "" {
-			delta["stop_reason"] = anthropicStopReason(ev.StopReason)
+			delta["stop_reason"] = stopReasonFromCanonical(channelprotocol.ProtocolAnthropicMessages, ev.StopReason, rep)
 		}
 		payload := map[string]interface{}{
 			"type":  "message_delta",

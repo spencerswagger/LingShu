@@ -26,7 +26,7 @@ type canonicalToolCall struct {
 // pumpConvertedStream 是跨协议流式转换泵：把上游 SSE 逐帧解码为规范事件，按入站协议重新编码后下发。
 // 与各 Provider.HandleStream 的返回契约一致（usage、上游原始 usage JSONB、assistant 消息 JSON、error）：
 // 上游无 usage 时返回 ErrUsageMissing（内容已下发，由调用方按 AC-17 处理）。
-func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Response, inboundProto, upstreamProto string, w http.ResponseWriter) (billing.Usage, []byte, []byte, error) {
+func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Response, inboundProto, upstreamProto string, lossy *protocolconv.LossyReport, w http.ResponseWriter) (billing.Usage, []byte, []byte, error) {
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("Cache-Control", "no-cache")
@@ -237,7 +237,12 @@ func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Respon
 				payload := bytes.TrimSpace(trimmed[len("data:"):])
 				if len(payload) > 0 && !bytes.Equal(payload, []byte("[DONE]")) {
 					evs, _, derr := protocolconv.DecodeStreamEvents(upstreamProto, payload)
-					if derr == nil {
+					if derr != nil {
+						// 上游畸形帧不得静默丢弃：记入本次损耗诊断（随调用日志决策轨迹落痕）并告警，
+						// 但不中断流（单帧坏不终止整条流）。
+						lossy.Note("upstream malformed stream frame dropped: protocol=" + upstreamProto + " err=" + derr.Error())
+						g.logger.Warn("upstream malformed stream frame dropped", "upstream_protocol", upstreamProto, "err", derr)
+					} else {
 						carriedUsage := false
 						for _, ev := range evs {
 							if ev.HasUsage {

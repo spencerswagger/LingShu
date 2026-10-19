@@ -110,7 +110,7 @@ func TestMatrix(t *testing.T) {
 				if err != nil {
 					t.Fatalf("parse source response: %v", err)
 				}
-				wantCanonical := canonicalFinishReason(from, fromResp.FinishReason)
+				wantCanonical := stopReasonToCanonical(from, fromResp.FinishReason)
 
 				out, _, err := ConvertResponse(from, to, []byte(matrixResponseSamples[from]))
 				if err != nil {
@@ -121,7 +121,7 @@ func TestMatrix(t *testing.T) {
 					t.Fatalf("parse converted response: %v\nbody=%s", err, out)
 				}
 
-				if got := canonicalFinishReason(to, gotResp.FinishReason); got != wantCanonical {
+				if got := stopReasonToCanonical(to, gotResp.FinishReason); got != wantCanonical {
 					t.Fatalf("finish reason mismatch: got %q want %q (native=%q)", got, wantCanonical, gotResp.FinishReason)
 				}
 				if got, want := responseText(gotResp), responseText(fromResp); got != want {
@@ -143,10 +143,17 @@ func TestMatrix(t *testing.T) {
 					}
 					for _, fr := range frames {
 						for _, payload := range sseDataPayloads(string(fr)) {
-							outFrames, rep, err := ConvertStreamEvent(from, to, []byte(payload))
+							events, decRep, err := DecodeStreamEvents(from, []byte(payload))
 							if err != nil {
-								t.Fatalf("ConvertStreamEvent: %v", err)
+								t.Fatalf("DecodeStreamEvents: %v", err)
 							}
+							outFrames, encRep, err := EncodeStreamEvents(to, events)
+							if err != nil {
+								t.Fatalf("EncodeStreamEvents: %v", err)
+							}
+							rep := &LossyReport{}
+							rep.Merge(decRep)
+							rep.Merge(encRep)
 							if !rep.IsEmpty() {
 								t.Fatalf("unexpected lossy report: %+v", rep)
 							}
@@ -352,10 +359,10 @@ func TestResponsesFinishReasonVocabulary(t *testing.T) {
 	if resp.FinishReason != "max_output_tokens" {
 		t.Fatalf("responses finish reason = %q", resp.FinishReason)
 	}
-	if got := canonicalFinishReason(channelprotocol.ProtocolOpenAIResponses, resp.FinishReason); got != stopReasonLength {
+	if got := stopReasonToCanonical(channelprotocol.ProtocolOpenAIResponses, resp.FinishReason); got != stopReasonLength {
 		t.Fatalf("canonical finish reason = %q, want %q", got, stopReasonLength)
 	}
-	if got := nativeFinishReason(channelprotocol.ProtocolOpenAIResponses, stopReasonLength, &LossyReport{}); got != "max_output_tokens" {
+	if got := stopReasonFromCanonical(channelprotocol.ProtocolOpenAIResponses, stopReasonLength, &LossyReport{}); got != "max_output_tokens" {
 		t.Fatalf("native length = %q, want max_output_tokens", got)
 	}
 }
