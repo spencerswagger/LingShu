@@ -2259,6 +2259,56 @@ func (t *wroteThenFailTransport) RoundTrip(req *http.Request) (*http.Response, e
 
 // Step 9：流式「未送达」——连接阶段失败（delivered=false）→ 可 failover 到下一候选；
 // 结构化日志与失败候选调用日志均带 delivered=false。
+// 对照用例：上游「明确返回错误状态码」（非 client-gone、非无状态码超时）必须仍整单退预扣，
+// 与「已送达超时」改为按估算结算形成对照（对齐 new-api「除非上游明确报错」）。
+func TestUpstreamExplicitError_StillRefundsFullPreConsume(t *testing.T) {
+	upstream := upstreamErrServer(t, http.StatusGatewayTimeout, `{"error":{"message":"timeout"}}`)
+	defer upstream.Close()
+
+	h := build(t, upstream.URL)
+	fc := &fakeCredit{balance: 5000}
+	h.gw.credit = fc
+	dump := withLogCapture(h)
+
+	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t",
+		`{"model":"gpt-4","stream":false,"max_tokens":2000,"messages":[{"role":"user","content":"hello"}]}`)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("want 502（默认网关错误）, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(fc.consumed) != 1 || len(fc.refunded) != 1 || math.Abs(fc.consumed[0]-fc.refunded[0]) > 0.0001 {
+		t.Fatalf("上游明确报错必须整单退预扣, consumed=%v refunded=%v", fc.consumed, fc.refunded)
+	}
+	if out := dump(); strings.Contains(out, "kind=client_gone") {
+		t.Errorf("上游明确报错不应归为 client_gone：\n%s", out)
+	}
+}
+
+// 结算失败（recordBilling 报错）时置 billFailed（预扣不退=对齐既有 billFailed 语义），
+// 请求级归因为「计费失败」且不整单退预扣——避免「扣了却无账单」的静默不一致。
+func TestDeliveredTimeout_BillingFailureMarksBillFailed(t *testing.T) {
+	live := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
+	defer live.Close()
+
+	h := build(t, live.URL)
+	fc := &fakeCredit{balance: 5000}
+	h.gw.credit = fc
+	h.billing.err = errors.New("record boom")                        // 结算失败注入
+	h.gw.client = &http.Client{Transport: &wroteThenFailTransport{}} // 已送达后失败（非流式）
+	dump := withLogCapture(h)
+
+	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t",
+		`{"model":"gpt-4","stream":false,"max_tokens":2000,"messages":[{"role":"user","content":"hello"}]}`)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("want 502（已送达后失败）, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(fc.refunded) != 0 {
+		t.Fatalf("结算失败不应整单退预扣（billFailed 语义）, refunded=%v", fc.refunded)
+	}
+	if out := dump(); !strings.Contains(out, "计费失败") {
+		t.Errorf("结算失败应归因为计费失败：\n%s", out)
+	}
+}
+
 func TestStreamDelivered_ConnectFailureFailsOver(t *testing.T) {
 	live := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
