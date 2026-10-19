@@ -36,14 +36,14 @@ verify: cd backend && go test ./internal/domain/protocolconv/ -run TestAnthropic
 gate: auto
 
 - [x] **Step 5: 实现三协议流式事件编解码（SSE ↔ canonical）**
-action: 新建 `backend/internal/domain/protocolconv/stream.go`，为三协议各实现 `DecodeSSE(data []byte) ([]CanonicalEvent, error)` 与 `EncodeEvent(CanonicalEvent) ([][]byte, error)`：anthropic 的 message_start/content_block_start/content_block_delta/text_delta/input_json_delta/message_delta/message_stop；openai-chat 的 choices[].delta（content/tool_calls）与尾帧 usage；openai-responses 的 response.output_text.delta 与 response.completed（usage）。新建 `backend/internal/domain/protocolconv/stream_test.go`，断言三协议各自 SSE 均能解码为同一 canonical 序列并编码回各自形状（含 usage 与 stop_reason）。
+action: 新建 `backend/internal/domain/protocolconv/stream.go`，为三协议各实现 `DecodeEvent(data []byte) ([]CanonicalEvent, *LossyReport, error)` 与 `EncodeEvent(CanonicalEvent) ([][]byte, *LossyReport, error)`（StreamCodec 接口）：anthropic 的 message_start/content_block_start/content_block_delta/text_delta/input_json_delta/message_delta/message_stop；openai-chat 的 choices[].delta（content/tool_calls）与尾帧 usage；openai-responses 的 response.output_text.delta 与 response.completed（usage）。新建 `backend/internal/domain/protocolconv/stream_test.go`，断言三协议各自 SSE 均能解码为同一 canonical 序列并编码回各自形状（含 usage 与 stop_reason）。
 loop: until cd backend && go test ./internal/domain/protocolconv/ -run TestStream passes
 max_iterations: 3
 verify: cd backend && go test ./internal/domain/protocolconv/ -run TestStream -v
 gate: auto
 
 - [x] **Step 6: 实现转换编排 convert.go（六方向矩阵）**
-action: 新建 `backend/internal/domain/protocolconv/convert.go`，实现 `SelectUpstreamProtocol(inbound string, supported channelprotocol.Protocols, override []string) (string, bool)`（固定优先序常量 openai-chat → anthropic-messages → openai-responses，override 有序列表优先）、`ConvertRequest(from, to string, body []byte) ([]byte, *LossyReport, error)`、`ConvertResponse(from, to string, body []byte) ([]byte, *LossyReport, error)`、`ConvertStreamEvent(from, to string, data []byte) ([][]byte, *LossyReport, error)`。新建 `backend/internal/domain/protocolconv/convert_test.go`，参数化覆盖 6 个有序方向 × 请求/响应/事件三类往返。
+action: 新建 `backend/internal/domain/protocolconv/convert.go`，实现 `SelectUpstreamProtocol(inbound string, supported channelprotocol.Protocols, override []string) (string, bool)`（固定优先序常量 openai-chat → anthropic-messages → openai-responses，override 有序列表优先）、`ConvertRequest(from, to string, body []byte) ([]byte, *LossyReport, error)`、`ConvertResponse(from, to string, body []byte) ([]byte, *LossyReport, error)`、以及流式事件解码/编码的导出入口 `DecodeStreamEvents` / `EncodeStreamEvents`。新建 `backend/internal/domain/protocolconv/convert_test.go`，参数化覆盖 6 个有序方向 × 请求/响应/事件三类往返。
 loop: until cd backend && go test ./internal/domain/protocolconv/ -run TestMatrix passes
 max_iterations: 3
 verify: cd backend && go test ./internal/domain/protocolconv/ -run TestMatrix -v
@@ -71,19 +71,19 @@ verify: cd backend && go test ./internal/domain/gateway/ -run TestNonStreamConve
 gate: auto
 
 - [x] **Step 10: gateway 流式转换 pump 集成**
-action: 在 `backend/internal/domain/gateway/handler.go`（或新建 `backend/internal/domain/gateway/conversion_stream.go`）新增 `pumpConvertedStream(ctx, upstream body, upstreamProto, inboundProto, w) (billing.Usage, []byte, []byte, error)`：读上游 SSE 行 → 上游 codec `DecodeSSE` 为 canonical 事件 → 入站 codec `EncodeEvent` 写回并 Flush；累计三段 usage、拼装 assistant 消息（供 call_log）。`serveStream` 在 converted 时走该 pump，直通仍走既有 `prov.HandleStream`（逐字节透传）。测试用假上游断言下游收到入站协议事件序列、顺序保真、usage 正确。
+action: 在 `backend/internal/domain/gateway/handler.go`（或新建 `backend/internal/domain/gateway/conversion_stream.go`）新增 `pumpConvertedStream(ctx, upstream body, upstreamProto, inboundProto, w) (billing.Usage, []byte, []byte, error)`：读上游 SSE 行 → 上游 codec `DecodeEvent` 为 canonical 事件 → 入站 codec `EncodeEvent` 写回并 Flush；累计三段 usage、拼装 assistant 消息（供 call_log）。`serveStream` 在 converted 时走该 pump，直通仍走既有 `prov.HandleStream`（逐字节透传）。测试用假上游断言下游收到入站协议事件序列、顺序保真、usage 正确。
 loop: until cd backend && go test ./internal/domain/gateway/ -run TestStreamConversion passes
 max_iterations: 3
 verify: cd backend && go test ./internal/domain/gateway/ -run TestStreamConversion -v
 gate: human
 
 - [x] **Step 11: 配置面（转换开关 + 目标优先序 + 总开关）**
-action: 在 `backend/internal/domain/channelprotocol/model.go` 的 `ModelGateway` 追加 `ConvertEnabled *bool json:"convertEnabled,omitempty"` 与 `ConvertTargets []string json:"convertTargets,omitempty"`；在 `backend/internal/domain/channel/model_store.go` 的 `ChannelModel` 同步这两字段；在 `backend/internal/domain/channel/manager.go` 构建 `ModelRuntime` 时透传；新增 sys_config 键 `gateway.protocol_conversion.enabled`（默认 true）并在 `backend/cmd/server/main.go` 装配为网关可读函数。测试断言字段 JSONB 往返与运行时透传、总开关关闭时不转换。
-loop: until cd backend && go test ./internal/domain/channel/... ./internal/domain/channelprotocol/... passes
+action: 在 `backend/internal/domain/channelprotocol/model.go` 的 `ModelGateway` 追加 `ConvertEnabled *bool json:"convertEnabled,omitempty"` 与 `ConvertTargets []string json:"convertTargets,omitempty"`（随 `channel_protocols.models` JSONB 持久化）；运行时经 `rt.Protocol.EffectiveModelConvert(internalModelID)` 读取，未落到 `backend/internal/domain/channel/model_store.go` 与 `backend/internal/domain/channel/manager.go`。新增 sys_config 键 `gateway.protocol_conversion.enabled`（默认 true），在网关装配为全局开关 `protocolConvEnabled func() bool`（见 `backend/internal/domain/gateway/gateway.go`）。测试断言字段 JSONB 往返与总开关关闭时不转换。
+loop: until cd backend && go test ./internal/domain/channelprotocol/... ./internal/domain/gateway/... passes
 max_iterations: 3
 verify:
   - type: shell
-    command: cd backend && go test ./internal/domain/channel/... ./internal/domain/channelprotocol/...
+    command: cd backend && go test ./internal/domain/channelprotocol/... ./internal/domain/gateway/...
   - type: shell
     command: cd backend && go build ./cmd/server/
 gate: auto
@@ -102,10 +102,10 @@ verify:
 gate: auto
 
 - [x] **Step 13: 矩阵集成测试（假上游 × 6 方向 × 流式/非流式）**
-action: 新建 `backend/tests/protocol_conversion_test.go`：起三个协议的假上游（openai-chat / openai-responses / anthropic-messages），对 6 个有序方向分别以入站协议 A 发请求、配置渠道仅支持上游协议 B，断言非流式与流式两条路径：上游收到的请求体为 B 形状、下游收到 A 形状、usage 按 B 解析、直通方向字节级不变（AC-P2-1~AC-P2-4、AC-P2-8）。
-loop: until cd backend && go test ./tests/ -run TestProtocolConversion passes
+action: 新建 `backend/internal/domain/gateway/protocol_conversion_matrix_test.go`（package gateway）：起三个协议的假上游（openai-chat / openai-responses / anthropic-messages），对 6 个有序方向分别以入站协议 A 发请求、配置渠道仅支持上游协议 B，断言非流式与流式两条路径：上游收到的请求体为 B 形状、下游收到 A 形状、usage 按 B 解析、直通方向字节级不变（AC-P2-1~AC-P2-4、AC-P2-8）。
+loop: until cd backend && go test ./internal/domain/gateway/ -run TestProtocolConversionMatrix passes
 max_iterations: 3
-verify: cd backend && go test ./tests/ -run TestProtocolConversion -v
+verify: cd backend && go test ./internal/domain/gateway/ -run TestProtocolConversionMatrix -v
 gate: auto
 
 - [x] **Step 14: 人工评审（路由语义 + 流式 pump）**

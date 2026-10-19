@@ -1,6 +1,7 @@
 package protocolconv
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -364,6 +365,42 @@ func TestResponsesFinishReasonVocabulary(t *testing.T) {
 	}
 	if got := stopReasonFromCanonical(channelprotocol.ProtocolOpenAIResponses, stopReasonLength, &LossyReport{}); got != "max_output_tokens" {
 		t.Fatalf("native length = %q, want max_output_tokens", got)
+	}
+}
+
+// TestConvertRequestErrorStage 单测 parse-vs-serialize 阶段映射助手 ConvertStage：
+// 入站请求体对其声明协议不合法 → parse（候选无关）；未知目标协议 → serialize（可转移）；
+// 非 ConvertError 与 nil 一律返回空串。
+func TestConvertRequestErrorStage(t *testing.T) {
+	// 合法 JSON 且含 model，但 messages 为对象（非数组）→ openai-chat 解析失败 → parse。
+	_, _, perr := ConvertRequest(
+		channelprotocol.ProtocolOpenAIChat,
+		channelprotocol.ProtocolAnthropicMessages,
+		[]byte(`{"model":"m","messages":{"not":"an array"}}`),
+	)
+	if got := ConvertStage(perr); got != StageParse {
+		t.Fatalf("invalid inbound for its protocol: stage=%q want %q (err=%v)", got, StageParse, perr)
+	}
+	var ce *ConvertError
+	if !errors.As(perr, &ce) || ce.Stage != StageParse || ce.Err == nil {
+		t.Fatalf("expected *ConvertError{Stage:parse} with wrapped err, got %#v", perr)
+	}
+
+	// 未知目标协议 → serialize。
+	_, _, serr := ConvertRequest(
+		channelprotocol.ProtocolOpenAIChat,
+		"unknown-proto",
+		[]byte(matrixRequestSamples[channelprotocol.ProtocolOpenAIChat]),
+	)
+	if got := ConvertStage(serr); got != StageSerialize {
+		t.Fatalf("unknown target protocol: stage=%q want %q (err=%v)", got, StageSerialize, serr)
+	}
+
+	if got := ConvertStage(errors.New("boom")); got != "" {
+		t.Fatalf("plain error: stage=%q want empty", got)
+	}
+	if got := ConvertStage(nil); got != "" {
+		t.Fatalf("nil error: stage=%q want empty", got)
 	}
 }
 

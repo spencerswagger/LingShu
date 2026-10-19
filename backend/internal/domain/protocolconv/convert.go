@@ -1,10 +1,49 @@
 package protocolconv
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/team/llmgateway/internal/domain/channelprotocol"
 )
+
+// 转换失败阶段取值：StageParse 为入站请求体解析失败（候选无关），
+// StageSerialize 为目标协议序列化失败（含未知协议，可转移）。
+const (
+	StageParse     = "parse"
+	StageSerialize = "serialize"
+)
+
+// ConvertError 描述一次请求转换失败及其所处阶段，供上层按阶段区分处置。
+type ConvertError struct {
+	Stage string
+	Err   error
+}
+
+// Error 实现 error 接口。
+func (e *ConvertError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return fmt.Sprintf("protocolconv: %s stage: %v", e.Stage, e.Err)
+}
+
+// Unwrap 暴露底层错误，供 errors.Is/As 追溯。
+func (e *ConvertError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+// ConvertStage 返回转换错误所处阶段（StageParse/StageSerialize）；非 ConvertError 返回空串。
+func ConvertStage(err error) string {
+	var ce *ConvertError
+	if errors.As(err, &ce) {
+		return ce.Stage
+	}
+	return ""
+}
 
 // defaultTargetOrder 是未指定 override 时选择上游协议的默认偏好顺序。
 var defaultTargetOrder = []string{
@@ -63,11 +102,11 @@ func codecFor(protocol string) (Codec, bool) {
 func ConvertRequest(from, to string, body []byte) ([]byte, *LossyReport, error) {
 	fromCodec, ok := codecFor(from)
 	if !ok {
-		return nil, nil, fmt.Errorf("protocolconv: unknown source protocol %q", from)
+		return nil, nil, &ConvertError{Stage: StageSerialize, Err: fmt.Errorf("protocolconv: unknown source protocol %q", from)}
 	}
 	toCodec, ok := codecFor(to)
 	if !ok {
-		return nil, nil, fmt.Errorf("protocolconv: unknown target protocol %q", to)
+		return nil, nil, &ConvertError{Stage: StageSerialize, Err: fmt.Errorf("protocolconv: unknown target protocol %q", to)}
 	}
 
 	if channelprotocol.Canonical(from) == channelprotocol.Canonical(to) {
@@ -76,7 +115,7 @@ func ConvertRequest(from, to string, body []byte) ([]byte, *LossyReport, error) 
 
 	req, parseRep, err := fromCodec.ParseRequest(body)
 	if err != nil {
-		return nil, parseRep, err
+		return nil, parseRep, &ConvertError{Stage: StageParse, Err: err}
 	}
 	if channelprotocol.Canonical(to) == channelprotocol.ProtocolAnthropicMessages && req != nil && len(req.Extra) > 0 {
 		parseRep.Note("top-level extras dropped for anthropic target")
@@ -84,7 +123,7 @@ func ConvertRequest(from, to string, body []byte) ([]byte, *LossyReport, error) 
 	}
 	out, serRep, err := toCodec.SerializeRequest(req)
 	if err != nil {
-		return nil, serRep, err
+		return nil, serRep, &ConvertError{Stage: StageSerialize, Err: err}
 	}
 
 	rep := &LossyReport{}

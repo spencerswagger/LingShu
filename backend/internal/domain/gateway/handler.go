@@ -529,14 +529,27 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 	// 请求增量 diff：计算本次请求的增量消息与全量指纹（call_log 采集用，
 	// 新会话也在此初始化指纹，由下方 Attach 写入会话）。
 	reqMsgs, msgFps := g.captureReqIncrement(sessObj, body)
-	sawLimit := false       // 出现过限流类失败（本地限流 或 上游 429）
-	sawOther := false       // 出现过非限流类的可重试失败（上游 401/402/403/404/5xx、网络类）
-	sawUnsupported := false // 出现过「入站协议 ∉ 模型可达 protocols」（AC-4）
-	attempted := false      // 是否至少有一次候选真正发出上游调用（用于全被本地拦截时的账单兜底）
+	sawLimit := false                // 出现过限流类失败（本地限流 或 上游 429）
+	sawOther := false                // 出现过非限流类的可重试失败（上游 401/402/403/404/5xx、网络类）
+	sawUnsupported := false          // 出现过「入站协议 ∉ 模型可达 protocols」（AC-4）
+	sawConvertSerializeFail := false // 出现过「目标协议序列化失败」（AC-P2-9，全候选失败时回 500 而非 503）
+	attempted := false               // 是否至少有一次候选真正发出上游调用（用于全被本地拦截时的账单兜底）
 	// 决策轨迹：每个候选渠道的处理结果与跳过原因（call_log decision 用，雪花 ID 以字符串序列化）。
 	// 先并入路由层排除项（如排空），再逐候选追加尝试结果；无排除项时轨迹与既有行为完全一致。
 	attempts := make([]map[string]any, 0, len(routes)+len(excluded))
 	attempts = append(attempts, excludedAttempts(excluded)...)
+	// rejectDecision 构造「本次请求被拒」的决策记录，供各终态分支的调用日志复用
+	//（只依赖 attempts 与预扣信息，提前定义以便候选循环内也能落相同口径的决策）。
+	rejectDecision := func() map[string]any {
+		return map[string]any{
+			"attempts":         attempts,
+			"est_input_tokens": pc.InputTokens,
+			"time_coeff":       pc.TimeCoeff,
+			"ctx_coeff":        pc.CtxCoeff,
+			"pre_consumed":     pc.Credits,
+			"result":           "rejected",
+		}
+	}
 	for _, cr := range routes {
 		order := len(attempts) + 1
 		// 渠道/密钥名：渠道 ID 为雪花值，直接展示不具可读性，随候选一并回查落轨迹。
@@ -699,13 +712,30 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 			return
 		}
 
-		// 跨协议请求转换（Step 9）：仅在 converted 时把入站协议请求体转为上游协议；
-		// 转换失败视同本地构建失败（未发出上游调用，可安全转移）→ skip 后继续下一候选。
+		// 跨协议请求转换（Step 9）：仅在 converted 时把入站协议请求体转为上游协议。
+		// AC-P2-9：按失败阶段区分处置——
+		//   parse：入站请求体解析失败，与候选无关（任何上游都读不出），立即 400 且不转移；
+		//   serialize：目标协议序列化失败，视同本地构建失败（未发出上游调用），跳过本候选继续，
+		//             若最终全候选失败则在终结分支回 500（而非 503 聚合）。
 		upstreamBody := rewritten
 		if converted {
 			convBody, reqLossy, cerr := protocolconv.ConvertRequest(baseProtocol, upstreamProto, rewritten)
 			if cerr != nil {
+				if protocolconv.ConvertStage(cerr) == protocolconv.StageParse {
+					l.Error("convert request parse failed", "from", baseProtocol, "to", upstreamProto, "err", cerr)
+					t, f := summarizeAttempts(attempts)
+					g.refundAllPreConsume(ctx, token.UserID, pc.Credits, "请求失败退回（请求体格式错误）")
+					if !attempted {
+						bid := g.recordGatewayReject(ctx, model, autoName, token, pricingMode, sessionID, "请求体格式错误")
+						g.writeCallLog(ctx, bid, "", token, &router.RouteResult{AutoModelName: autoName}, model, pricingMode, sessionID,
+							reqMsgs, "error", "", "failed", "请求体格式错误", msSince(start), nil, rejectDecision())
+					}
+					g.logOutcome(ctx, slog.LevelWarn, endpoint, model, "请求体格式错误（协议转换解析失败）", http.StatusBadRequest, false, token, sessionID, attempts, t, f, msSince(start))
+					writeOpenAIError(w, http.StatusBadRequest, "请求体格式错误")
+					return
+				}
 				l.Error("convert request failed", "from", baseProtocol, "to", upstreamProto, "err", cerr)
+				sawConvertSerializeFail = true
 				attempts = append(attempts, skip("转换失败"))
 				continue
 			}
@@ -819,16 +849,6 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 
 	// 所有候选都未成功。仅当失败全部属于限流类（本地限流/上游 429）时才回 429，
 	// 否则统一回「无可用渠道」——避免把 401/402/5xx 等误报成限流。
-	rejectDecision := func() map[string]any {
-		return map[string]any{
-			"attempts":         attempts,
-			"est_input_tokens": pc.InputTokens,
-			"time_coeff":       pc.TimeCoeff,
-			"ctx_coeff":        pc.CtxCoeff,
-			"pre_consumed":     pc.Credits,
-			"result":           "rejected",
-		}
-	}
 	// AC-4/AC-18：全部候选都因「入站协议 ∉ 模型可达 protocols」被拒且未发起任何上游请求 →
 	// 返回固定错误（HTTP 400 + OpenAI 错误体，type=unsupported_protocol）。
 	if sawUnsupported && !attempted {
@@ -851,6 +871,19 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 		}
 		g.logOutcome(ctx, slog.LevelWarn, endpoint, model, "全部候选限流（本地限流/上游 429）", http.StatusTooManyRequests, false, token, sessionID, attempts, trail, failed, msSince(start))
 		writeOpenAIError(w, http.StatusTooManyRequests, msgRateLimited)
+		return
+	}
+	// AC-P2-9：全部候选失败且有候选因目标协议序列化失败被跳（未发出上游调用）→ 回 500，
+	// 而非「无可用渠道」503 聚合（属服务端转换故障，非渠道不可用）。
+	if sawConvertSerializeFail {
+		g.refundAllPreConsume(ctx, token.UserID, pc.Credits, "请求失败退回（协议转换失败）")
+		if !attempted {
+			bid := g.recordGatewayReject(ctx, model, autoName, token, pricingMode, sessionID, msgInternal)
+			g.writeCallLog(ctx, bid, "", token, &router.RouteResult{AutoModelName: autoName}, model, pricingMode, sessionID,
+				reqMsgs, "error", "", "failed", msgInternal, msSince(start), nil, rejectDecision())
+		}
+		g.logOutcome(ctx, slog.LevelError, endpoint, model, "全部候选失败（协议转换序列化失败）", http.StatusInternalServerError, false, token, sessionID, attempts, trail, failed, msSince(start))
+		writeOpenAIError(w, http.StatusInternalServerError, msgInternal)
 		return
 	}
 	g.refundAllPreConsume(ctx, token.UserID, pc.Credits, "请求失败退回（无可用渠道）")
