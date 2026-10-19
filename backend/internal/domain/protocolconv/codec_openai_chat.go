@@ -555,9 +555,10 @@ func (openAIChatCodec) ParseResponse(body []byte) (*CanonicalResponse, *LossyRep
 		if len(choices) > 0 {
 			var ch struct {
 				Message struct {
-					Role      string          `json:"role"`
-					Content   json.RawMessage `json:"content"`
-					ToolCalls []oaiToolCall   `json:"tool_calls"`
+					Role             string          `json:"role"`
+					Content          json.RawMessage `json:"content"`
+					ReasoningContent string          `json:"reasoning_content"`
+					ToolCalls        []oaiToolCall   `json:"tool_calls"`
 				} `json:"message"`
 				FinishReason string `json:"finish_reason"`
 			}
@@ -567,10 +568,15 @@ func (openAIChatCodec) ParseResponse(body []byte) (*CanonicalResponse, *LossyRep
 			if ch.Message.Role != "" {
 				resp.Role = ch.Message.Role
 			}
-			blocks, err := parseOAIContent(ch.Message.Content, rep)
+			var blocks []ContentBlock
+			if ch.Message.ReasoningContent != "" {
+				blocks = append(blocks, ContentBlock{Kind: BlockThinking, Text: ch.Message.ReasoningContent})
+			}
+			contentBlocks, err := parseOAIContent(ch.Message.Content, rep)
 			if err != nil {
 				return nil, rep, err
 			}
+			blocks = append(blocks, contentBlocks...)
 			for _, tc := range ch.Message.ToolCalls {
 				blocks = append(blocks, toolCallToBlock(tc, rep))
 			}
@@ -631,6 +637,7 @@ func (openAIChatCodec) SerializeResponse(resp *CanonicalResponse) ([]byte, *Loss
 	default:
 		parts := make([]interface{}, 0, len(resp.Blocks))
 		include := false
+		var reasoning bytes.Buffer
 		for _, b := range resp.Blocks {
 			switch b.Kind {
 			case BlockText:
@@ -642,6 +649,8 @@ func (openAIChatCodec) SerializeResponse(resp *CanonicalResponse) ([]byte, *Loss
 					"image_url": map[string]interface{}{"url": oaiImageURL(b)},
 				})
 				include = true
+			case BlockThinking:
+				reasoning.WriteString(b.Text)
 			case BlockToolUse:
 			default:
 				rep.Add("response.block." + b.Kind)
@@ -651,6 +660,9 @@ func (openAIChatCodec) SerializeResponse(resp *CanonicalResponse) ([]byte, *Loss
 			msg["content"] = parts
 		} else {
 			msg["content"] = nil
+		}
+		if reasoning.Len() > 0 {
+			msg["reasoning_content"] = reasoning.String()
 		}
 	}
 

@@ -2,6 +2,7 @@ package protocolconv
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -154,4 +155,39 @@ func TestOpenAIResponsesCodec(t *testing.T) {
 			t.Fatalf("round trip mismatch\nresp1=%+v\nresp2=%+v\nserialized=%s", resp1, resp2, out)
 		}
 	})
+}
+
+func TestOpenAIResponsesReasoningStream(t *testing.T) {
+	codec := openaiResponsesCodec{}
+	ev := CanonicalEvent{Type: EventContentBlockDelta, Index: 0, DeltaKind: DeltaThinking, Text: "chain of thought"}
+
+	frames, _, err := codec.EncodeEvent(ev)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if len(frames) != 1 {
+		t.Fatalf("expected single frame, got %d", len(frames))
+	}
+	if !strings.Contains(string(frames[0]), "response.reasoning_summary_text.delta") {
+		t.Fatalf("encoded reasoning frame has wrong type: %s", frames[0])
+	}
+	payloads := sseDataPayloads(string(frames[0]))
+	if len(payloads) != 1 {
+		t.Fatalf("expected single data payload, got %d", len(payloads))
+	}
+	got, _, err := codec.DecodeEvent([]byte(payloads[0]))
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if want := []CanonicalEvent{ev}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("reasoning stream round-trip mismatch: got %+v want %+v", got, want)
+	}
+
+	rt, _, err := codec.DecodeEvent([]byte(`{"type":"response.reasoning_text.delta","output_index":0,"delta":"raw thought"}`))
+	if err != nil {
+		t.Fatalf("decode reasoning_text.delta: %v", err)
+	}
+	if len(rt) != 1 || rt[0].Type != EventContentBlockDelta || rt[0].DeltaKind != DeltaThinking || rt[0].Text != "raw thought" {
+		t.Fatalf("unexpected decoding of response.reasoning_text.delta: %+v", rt)
+	}
 }

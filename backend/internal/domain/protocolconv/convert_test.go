@@ -451,3 +451,48 @@ func eventUsage(evs []CanonicalEvent) (billing.Usage, bool) {
 	}
 	return billing.Usage{}, false
 }
+
+// TestConvertReasoningRoundTrip 断言非流式下 reasoning 文本可跨协议保留：
+// chat(reasoning_content) 与 responses(reasoning.summary) 互转，及与 anthropic(thinking) 互转。
+func TestConvertReasoningRoundTrip(t *testing.T) {
+	const reasoning = "chain of thought"
+
+	chatBody := `{"id":"c1","model":"m","choices":[{"index":0,"message":{"role":"assistant","reasoning_content":"` + reasoning + `","content":"hi"},"finish_reason":"stop"}]}`
+	responsesBody := `{"id":"r1","object":"response","model":"m","status":"completed","output":[{"type":"reasoning","summary":[{"type":"summary_text","text":"` + reasoning + `"}]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hi"}]}]}`
+	anthropicBody := `{"id":"m1","type":"message","role":"assistant","model":"m","content":[{"type":"thinking","thinking":"` + reasoning + `","signature":""},{"type":"text","text":"hi"}],"stop_reason":"end_turn"}`
+
+	cases := []struct {
+		name     string
+		from, to string
+		body     string
+	}{
+		{"chat_to_responses", channelprotocol.ProtocolOpenAIChat, channelprotocol.ProtocolOpenAIResponses, chatBody},
+		{"responses_to_chat", channelprotocol.ProtocolOpenAIResponses, channelprotocol.ProtocolOpenAIChat, responsesBody},
+		{"chat_to_anthropic", channelprotocol.ProtocolOpenAIChat, channelprotocol.ProtocolAnthropicMessages, chatBody},
+		{"anthropic_to_chat", channelprotocol.ProtocolAnthropicMessages, channelprotocol.ProtocolOpenAIChat, anthropicBody},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, _, err := ConvertResponse(tc.from, tc.to, []byte(tc.body))
+			if err != nil {
+				t.Fatalf("ConvertResponse: %v", err)
+			}
+			got, _, err := mustCodec(t, tc.to).ParseResponse(out)
+			if err != nil {
+				t.Fatalf("parse converted response: %v\nbody=%s", err, out)
+			}
+			if txt := responseThinkingText(got); txt != reasoning {
+				t.Fatalf("reasoning text not preserved: got %q want %q (body=%s)", txt, reasoning, out)
+			}
+		})
+	}
+}
+
+func responseThinkingText(resp *CanonicalResponse) string {
+	for _, b := range resp.Blocks {
+		if b.Kind == BlockThinking {
+			return b.Text
+		}
+	}
+	return ""
+}

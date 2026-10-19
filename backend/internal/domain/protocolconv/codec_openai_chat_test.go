@@ -2,6 +2,7 @@ package protocolconv
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -134,6 +135,48 @@ func TestOpenAIChatCodec(t *testing.T) {
 		out, _, err := codec.SerializeResponse(resp1)
 		if err != nil {
 			t.Fatalf("serialize: %v", err)
+		}
+		resp2, _, err := codec.ParseResponse(out)
+		if err != nil {
+			t.Fatalf("reparse: %v", err)
+		}
+		if !reflect.DeepEqual(resp1, resp2) {
+			t.Fatalf("round trip mismatch\nresp1=%+v\nresp2=%+v\nserialized=%s", resp1, resp2, out)
+		}
+	})
+
+	t.Run("response/reasoning_content", func(t *testing.T) {
+		body := `{
+			"id": "chatcmpl-ghi",
+			"object": "chat.completion",
+			"model": "gpt-4o",
+			"choices": [
+				{"index": 0, "message": {"role": "assistant", "reasoning_content": "Let me think.", "content": "Hello!"}, "finish_reason": "stop"}
+			],
+			"usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
+		}`
+		resp1, _, err := codec.ParseResponse([]byte(body))
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if len(resp1.Blocks) != 2 || resp1.Blocks[0].Kind != BlockThinking || resp1.Blocks[0].Text != "Let me think." {
+			t.Fatalf("expected leading thinking block, got %+v", resp1.Blocks)
+		}
+		if resp1.Blocks[1].Kind != BlockText || resp1.Blocks[1].Text != "Hello!" {
+			t.Fatalf("expected trailing text block, got %+v", resp1.Blocks)
+		}
+		out, _, err := codec.SerializeResponse(resp1)
+		if err != nil {
+			t.Fatalf("serialize: %v", err)
+		}
+		if !strings.Contains(string(out), `"reasoning_content":"Let me think."`) {
+			t.Fatalf("serialized chat response missing reasoning_content: %s", out)
+		}
+		if !strings.Contains(string(out), `"text":"Hello!"`) {
+			t.Fatalf("serialized chat response suffered content regression: %s", out)
+		}
+		if strings.Contains(string(out), `"Let me think."`) && strings.Contains(string(out), `"content":"Let me think."`) {
+			t.Fatalf("thinking text leaked into content: %s", out)
 		}
 		resp2, _, err := codec.ParseResponse(out)
 		if err != nil {
