@@ -112,6 +112,94 @@
     window.addEventListener('resize', function () { chart.resize(); });
   })();
 
+  // ---------- 图 2：火山 vs DeepSeek 官方（闲/忙时）交叉点 ----------
+  (function () {
+    var chart = initChart('chart-crossover');
+    if (!chart) return;
+    var xs = [];
+    var vol = [];
+    var idle = [];
+    var busy = [];
+    for (var x = 0; x <= 140; x += 10) {
+      xs.push(x);
+      vol.push(0.1 * x + 0.6);       // 火山：三项同价 0.1
+      idle.push(0.01 * x + 4.5);     // 官方闲时：缓存 0.01、输入 0.5、输出 2
+      busy.push(0.02 * x + 9.0);     // 官方忙时：缓存 0.02、输入 1、输出 4
+    }
+    chart.setOption({
+      animation: false,
+      tooltip: { trigger: 'axis', appendToBody: true },
+      legend: { data: ['火山（三项同价）', '官方·闲时', '官方·忙时'], bottom: 0, textStyle: { color: ink }, itemGap: 18 },
+      grid: { left: 8, right: 24, top: 24, bottom: 48, containLabel: true },
+      xAxis: {
+        type: 'value',
+        min: 0,
+        max: 140,
+        name: '累计缓存读量（千 token）',
+        nameLocation: 'middle',
+        nameGap: 28,
+        nameTextStyle: { color: muted },
+        axisLabel: axisLabel,
+        splitLine: splitLine
+      },
+      yAxis: {
+        type: 'value',
+        name: '每轮成本（示意单位）',
+        nameTextStyle: { color: muted },
+        axisLabel: axisLabel,
+        splitLine: splitLine
+      },
+      series: [
+        {
+          name: '火山（三项同价）',
+          type: 'line',
+          symbol: 'none',
+          lineStyle: { color: accent, width: 3 },
+          itemStyle: { color: accent },
+          data: xs.map(function (v, i) { return [v, vol[i]]; }),
+          markLine: {
+            silent: true,
+            symbol: 'none',
+            lineStyle: { color: muted, type: 'dotted' },
+            label: { color: muted, fontSize: 10, formatter: '交叉点' },
+            data: [{ xAxis: 43 }, { xAxis: 105 }]
+          }
+        },
+        {
+          name: '官方·闲时',
+          type: 'line',
+          symbol: 'none',
+          lineStyle: { color: accent2, width: 3 },
+          itemStyle: { color: accent2 },
+          data: xs.map(function (v, i) { return [v, idle[i]]; }),
+          markPoint: {
+            symbol: 'pin',
+            symbolSize: 46,
+            itemStyle: { color: accent2 },
+            label: { color: '#fff', fontSize: 9, formatter: '≈43' },
+            data: [{ coord: [43, 0.01 * 43 + 4.5] }]
+          }
+        },
+        {
+          name: '官方·忙时',
+          type: 'line',
+          symbol: 'none',
+          lineStyle: { color: accent2, width: 2, type: 'dashed' },
+          itemStyle: { color: accent2 },
+          data: xs.map(function (v, i) { return [v, busy[i]]; }),
+          markPoint: {
+            symbol: 'pin',
+            symbolSize: 46,
+            itemStyle: { color: accent2 },
+            label: { color: '#fff', fontSize: 9, formatter: '≈105' },
+            data: [{ coord: [105, 0.02 * 105 + 9.0] }]
+          }
+        }
+      ]
+    });
+    window.addEventListener('resize', function () { chart.resize(); });
+  })();
+
   // ---------- Mermaid ----------
   if (typeof mermaid !== 'undefined') {
     mermaid.initialize({ startOnLoad: false, theme: 'neutral', securityLevel: 'loose' });

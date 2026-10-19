@@ -159,13 +159,35 @@
   <div class="wrap">
     <h2><span class="idx">02</span>成本怎么算</h2>
     <p>成本函数退化成一个<strong>简单的线性加法</strong>：这一轮的缓存命中量 × 缓存价，加上新输入量 × 输入价，加上输出量 × 输出价，就完了。</p>
-    <p>没有系数、没有台阶、没有开关。因为价格不随时间变，同一家渠道"谁更便宜"这个结论也就<strong>基本固定</strong>——中途需要换渠道的情形大幅减少。</p>
+    <p>没有系数、没有台阶、没有开关。价格不随时间变，但<strong>"谁更便宜"并不会自动固定</strong>——它取决于这一轮的 token 构成（缓存占多少、输出多少）。这里要分两种渠道看：</p>
+    <ul class="tight">
+      <li><strong>比值相同的渠道</strong>：它和官方渠道的价格比完全一样（比如输入 : 缓存 : 输出 都是 1 : 4 : 0.02），只是整体打个八折、或贵一点。这种情况下，谁最便宜<strong>确实从头到尾不变</strong>，排名稳定。</li>
+      <li><strong>比值不同的渠道</strong>：比如火山把输入 / 输出 / 缓存<strong>定成同一个价</strong>（如 0.1 / 0.1 / 0.1），等于"不给缓存优惠、变相鼓励短会话"。它和官方渠道谁更便宜，<strong>要看会话里缓存占多大比例——而这个比例会随会话变长而上升，于是排名会在中途翻转。</strong></li>
+    </ul>
 
     <figure class="chart-figure">
       <figcaption>图 1：有无分档/时段，每轮花费的形状对比 <span>（示意）</span></figcaption>
       <div id="chart-cost-shape" class="chart-container"></div>
     </figure>
     <p>橙线是完整版：聊长了会突然变贵、到点会突然变便宜，台阶式跳变。蓝线是极简版：随着上下文增长<strong>平滑上涨</strong>，没有突变。正是这些"突变"，让完整版不得不引入跨档/跨时段的分段模拟、临界点判断和防抖措施。</p>
+
+    <h3>关键点：排序会在会话中途翻转</h3>
+    <p>把"火山"和"DeepSeek 官方"放到一起看：官方缓存极便宜（约为输入价的 2%），但输入 / 输出单价高；火山三项同价，输入 / 输出都便宜，但缓存<strong>完全没有优惠</strong>。两条成本线因此会<strong>交叉</strong>——交叉点就是"该切 / 不该切"的分界。</p>
+
+    <figure class="chart-figure">
+      <figcaption>图 2：火山 vs DeepSeek 官方（闲时 / 忙时）——随缓存量增长的交叉点 <span>（示意；按每轮新增输入 5k、输出 1k token 估算）</span></figcaption>
+      <div id="chart-crossover" class="chart-container"></div>
+    </figure>
+
+    <ul class="tight">
+      <li><strong>缓存还很少</strong>（短会话、刚起步）：火山更便宜 → 留在火山。</li>
+      <li><strong>官方闲时</strong>：缓存量堆到约 <strong>43 千 token（≈4.3 万）</strong> 后官方反超 → 该切到官方。</li>
+      <li><strong>官方忙时</strong>：同样要反超，门槛抬高到约 <strong>105 千 token（≈10.5 万）</strong> → 忙时切过去要更晚才划算。</li>
+    </ul>
+    <div class="callout warn">
+      <span class="tag">结论</span>
+      <p><mark class="key">同一个会话，随着它越聊越长、缓存越堆越多，最优渠道可能从火山翻到官方；而"什么时候翻"，又取决于当时是闲时还是忙时。</mark>切换点还会随"每轮输出多少"移动——输出越多，交点越靠右。</p>
+    </div>
   </div>
 </section>
 
@@ -201,7 +223,7 @@ flowchart TD
   D -- "触发" --> Z
   D -- "通过" --> E["切换 · 记一笔切换费 · 立下回本目标"]
       </pre>
-      <figcaption>图 2：极简版的决策流程——两道门 + 防抖</figcaption>
+      <figcaption>图 3：极简版的决策流程——两道门 + 防抖</figcaption>
     </figure>
 
     <h3>为什么可以少一道门</h3>
@@ -217,15 +239,16 @@ flowchart TD
 <section id="s5">
   <div class="wrap">
     <h2><span class="idx">05</span>新会话怎么选渠道</h2>
-    <p>同一套成本模型，但更简单：价格固定后，"最划算的渠道"相对稳定，创建时几乎只要挑一次就够。</p>
+    <p>同一套成本模型，但创建时的信号更少：能观测的只有模型、首轮输入大小、当前时段、渠道稳定性。</p>
     <ul class="tight">
       <li><strong>只看当下能观测到的信号</strong>：哪个模型、首轮输入多大、各家渠道的历史稳定性。不要用"之后会不会变成长对话"这类<strong>事后才知道</strong>的特征。</li>
       <li><strong>没有历史数据时</strong>，退化为"当轮最低价 + 渠道稳定"，先绑一个安全值。</li>
-      <li>因为渠道排序稳定，创建时选中对的渠道，基本就锁定了大部分收益。</li>
+      <li>创建时选对渠道仍然重要；<strong>但只要存在"比值不同"的渠道（火山这类），排名会在会话中途翻转，晚上的切换才是更大的收益来源</strong>（见 §2 的交叉点）。</li>
     </ul>
     <div class="callout ok">
-      <span class="tag">收益结构的变化</span>
-      <p>完整版里，中途切换是收益的重要来源；<strong>极简版里，收益的绝大部分来自"创建时选对渠道"</strong>，中途切换只是锦上添花、且很少触发。</p>
+      <span class="tag">收益结构取决于"比值"</span>
+      <p>若各家渠道<strong>比值相同</strong>（只是整体打折），排名稳定，收益绝大部分来自"创建时选对渠道"，中途切换很少触发。</p>
+      <p>但只要存在<strong>比值不同</strong>的渠道（火山这类：三项同价），排名就会随会话变长而翻转——这时中途切换本身就是实实在在的收益来源，不能省。</p>
     </div>
   </div>
 </section>
@@ -255,7 +278,7 @@ flowchart TD
     <h2><span class="idx">07</span>相对完整版删掉了什么</h2>
 
     <figure class="chart-figure">
-      <figcaption>图 3：完整版与极简版的体量对比 <span>（示意）</span></figcaption>
+      <figcaption>图 4：完整版与极简版的体量对比 <span>（示意）</span></figcaption>
       <div id="chart-scope" class="chart-container short"></div>
     </figure>
 
@@ -287,13 +310,13 @@ flowchart TD
     <ul class="tight">
       <li><strong>还得估"之后还能聊几轮"和"输出多长"</strong>——这是会话本身的属性，与分档时段无关。</li>
       <li><strong>切换费的保守口径</strong>——整段上下文按输入价重灌一遍。</li>
-      <li><strong>一个仍会翻转的细节</strong>：输出占比能改变"谁更便宜"（A 输入便宜、B 输出便宜），所以并非完全静态——只是不再随时间跳动了。</li>
+      <li><strong>排序会翻转（重要）</strong>：只要存在"比值不同"的渠道（如火山三项同价），"谁更便宜"就会随会话里缓存的占比变化而翻转——所以即便是极简版，<strong>中途切换也有真实价值，并不是"选一次就够"</strong>。</li>
       <li><strong>工程一致性</strong>——账本要用固定基准、并发/重启下状态别乱、切换要按会话串行。</li>
       <li><strong>质量护栏</strong>——不换到行为明显不同的模型上，别让同一段对话的答案风格突变。</li>
     </ul>
     <div class="callout ok">
       <span class="tag">一句话总结</span>
-      <p>分档和闲忙时，正是"中途切换"价值与风险的主要来源。去掉它们，问题从"在线决策"退回成<strong>"静态选路 + 一次性投资判断"</strong>：先只做"创建时选对渠道 + 一道简单回本门"，就能拿到绝大部分收益。</p>
+      <p>去掉分档和闲忙时后，决策不再需要"分段模拟"，收敛成一道简单的回本判断。但如果渠道之间<strong>比值不同</strong>，会话中途的"谁更便宜"仍会翻转，中途切换依然有价值——只是判断本身变简单了。</p>
     </div>
   </div>
 </section>
