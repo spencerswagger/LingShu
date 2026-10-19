@@ -1659,12 +1659,16 @@ func (h *Admin) externalModelID(ctx context.Context, name string) (int64, bool) 
 
 // sessionCostEventView 单条会话成本决策产物的事件视图（含来源标签，PaybackTurns/PaybackLimit 为 NaN/Inf 时置 null）。
 type sessionCostEventView struct {
-	SessionID          string   `json:"SessionID"`
-	Turn               int      `json:"Turn"`
-	Shadow             bool     `json:"Shadow"`
-	Switch             bool     `json:"Switch"`
-	FromChannelKeyID   int64    `json:"FromChannelKeyID,string"`
-	ToChannelKeyID     int64    `json:"ToChannelKeyID,string"`
+	SessionID        string `json:"SessionID"`
+	Turn             int    `json:"Turn"`
+	Shadow           bool   `json:"Shadow"`
+	Switch           bool   `json:"Switch"`
+	FromChannelKeyID int64  `json:"FromChannelKeyID,string"`
+	ToChannelKeyID   int64  `json:"ToChannelKeyID,string"`
+	// FromChannelName/ToChannelName 由渠道密钥 ID 解析出的所属渠道名（仅供展示，避免面板暴露裸 ID；
+	// 密钥已不存在或起点无旧渠道时为空串，前端回落展示 ID）。
+	FromChannelName    string   `json:"FromChannelName"`
+	ToChannelName      string   `json:"ToChannelName"`
 	TurnCostOld        float64  `json:"TurnCostOld"`
 	TurnCostNew        float64  `json:"TurnCostNew"`
 	RechargeCost       float64  `json:"RechargeCost"`
@@ -1697,7 +1701,7 @@ func (h *Admin) HandleSessionCostEvents(w http.ResponseWriter, r *http.Request) 
 		if sid != "" && events[i].SessionID != sid {
 			continue
 		}
-		list = append(list, toSessionCostEventView(events[i]))
+		list = append(list, h.toSessionCostEventView(events[i]))
 	}
 	if limit > 0 && len(list) > limit {
 		list = list[len(list)-limit:] // 保留最近的 limit 条（事件流按写入顺序旧→新）
@@ -1779,7 +1783,8 @@ func (h *Admin) sessionCostEventSnapshot() []router.SessionCostEvent {
 }
 
 // toSessionCostEventView 把事件转为面板视图（PaybackTurns 为 NaN/Inf 时序列化为 null，避免响应序列化失败）。
-func toSessionCostEventView(ev router.SessionCostEvent) sessionCostEventView {
+// 渠道密钥 ID 同步解析为所属渠道名，供面板直接展示渠道迁移。
+func (h *Admin) toSessionCostEventView(ev router.SessionCostEvent) sessionCostEventView {
 	d := ev.Decision
 	return sessionCostEventView{
 		SessionID:          ev.SessionID,
@@ -1788,6 +1793,8 @@ func toSessionCostEventView(ev router.SessionCostEvent) sessionCostEventView {
 		Switch:             d.Switch,
 		FromChannelKeyID:   d.FromChannelKeyID,
 		ToChannelKeyID:     d.ToChannelKeyID,
+		FromChannelName:    h.channelKeyName(d.FromChannelKeyID),
+		ToChannelName:      h.channelKeyName(d.ToChannelKeyID),
 		TurnCostOld:        d.TurnCostOld,
 		TurnCostNew:        d.TurnCostNew,
 		RechargeCost:       d.RechargeCost,
@@ -1799,6 +1806,19 @@ func toSessionCostEventView(ev router.SessionCostEvent) sessionCostEventView {
 		CrossCacheReadOK:   ev.CrossCacheReadKnown,
 		CrossCacheReadFrom: sourceCrossCacheRead,
 	}
+}
+
+// channelKeyName 由渠道密钥 ID 解析所属渠道名（事件流渠道迁移展示用）。
+// 未装配渠道管理器、keyID 为 0（起点无旧渠道）或密钥不存在时返回空串，由前端回落展示 ID。
+func (h *Admin) channelKeyName(keyID int64) string {
+	if h.channelMgr == nil || keyID == 0 {
+		return ""
+	}
+	kr, ok := h.channelMgr.GetKeyRuntime(keyID)
+	if !ok || kr.Channel == nil {
+		return ""
+	}
+	return kr.Channel.Name
 }
 
 // finitePtr 把有限浮点转为指针；NaN/±Inf 返回 nil（JSON null）。

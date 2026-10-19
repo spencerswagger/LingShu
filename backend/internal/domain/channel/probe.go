@@ -293,6 +293,10 @@ func (m *Manager) probeOnce(ctx context.Context, keyID int64, probeModel, level 
 	dur := m.now().Sub(start).Milliseconds()
 
 	m.markKeyProbeResult(keyID, errMsg)
+	m.markChannelProbeResult(kr.Key.ChannelID)
+	if modelRowID > 0 {
+		m.markModelProbeResult(kr.Key.ChannelID, modelRowID, errMsg)
+	}
 	m.feedKeyAndTransit(keyID, ProbeFeedback(fb))
 	if modelRowID > 0 {
 		m.feedModelAndTransit(kr.Key.ChannelID, modelRowID, ProbeFeedback(fb))
@@ -404,6 +408,25 @@ func (m *Manager) markKeyProbeResult(keyID int64, errMsg string) {
 	if kr, ok := m.keys[keyID]; ok {
 		kr.lastProbe = m.now()
 		kr.Key.LastErr = errMsg
+	}
+}
+
+// markModelProbeResult 更新该内部模型的 lastProbe（锁内写）。
+// 不改 LastErr：模型「最近错误」不展示，避免引入瞬时 429 噪音，保持现有语义。
+func (m *Manager) markModelProbeResult(channelID, modelRowID int64, errMsg string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if mr := m.mrt[channelID][modelRowID]; mr != nil {
+		mr.lastProbe = m.now()
+	}
+}
+
+// markChannelProbeResult 更新该渠道的 lastProbe（锁内写）。
+func (m *Manager) markChannelProbeResult(channelID int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if rt := m.rt[channelID]; rt != nil {
+		rt.lastProbe = m.now()
 	}
 }
 
