@@ -1450,7 +1450,7 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		var upstreamUsage, assistantMsg []byte
 		var herr error
 		if conv.converted {
-			usage, upstreamUsage, assistantMsg, herr = g.pumpConvertedStream(ctx, up, conv.inbound, conv.upstream, ft)
+			usage, upstreamUsage, assistantMsg, herr = g.pumpConvertedStream(ctx, up, conv.inbound, conv.upstream, lossy, ft)
 		} else {
 			usage, upstreamUsage, assistantMsg, herr = prov.HandleStream(ctx, up, ft)
 		}

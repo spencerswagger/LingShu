@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 
 	"github.com/team/llmgateway/internal/domain/billing"
+	"github.com/team/llmgateway/internal/domain/channelprotocol"
 )
 
 type openAIChatCodec struct{}
@@ -897,7 +898,7 @@ func (openAIChatCodec) DecodeEvent(data []byte) ([]CanonicalEvent, *LossyReport,
 		if ch.FinishReason != nil {
 			ev := CanonicalEvent{
 				Type:       EventMessageDelta,
-				StopReason: normalizeStopReason(*ch.FinishReason),
+				StopReason: stopReasonToCanonical(channelprotocol.ProtocolOpenAIChat, *ch.FinishReason),
 			}
 			if hasUsage && !usageAttached {
 				ev.Usage = usage
@@ -984,7 +985,7 @@ func (openAIChatCodec) EncodeEvent(ev CanonicalEvent) ([][]byte, *LossyReport, e
 			"delta": map[string]interface{}{},
 		}
 		if ev.StopReason != "" {
-			choice["finish_reason"] = openAIStopReason(ev.StopReason)
+			choice["finish_reason"] = stopReasonFromCanonical(channelprotocol.ProtocolOpenAIChat, ev.StopReason, rep)
 		}
 		payload := map[string]interface{}{
 			"choices": []interface{}{choice},

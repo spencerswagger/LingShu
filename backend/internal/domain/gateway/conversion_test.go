@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -297,6 +298,66 @@ func TestStreamConversion(t *testing.T) {
 	// 计费用量取上游 openai usage（12/7）。
 	if len(h.billing.reqs) != 1 || h.billing.reqs[0].Tokens.Input != 12 || h.billing.reqs[0].Tokens.Output != 7 {
 		t.Fatalf("流式计费用量应取上游 openai usage, got %+v", h.billing.reqs)
+	}
+}
+
+// TestStreamConversionMalformedFrameObserved 断言转换泵遇上游畸形帧时不再静默丢弃：
+// 流仍完整完成（200 + message_stop），且畸形帧经损耗诊断随调用日志决策轨迹的 lossy_notes 落痕。
+func TestStreamConversionMalformedFrameObserved(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(
+			"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"}}]}\n\n" +
+				"data: {oops-not-json}\n\n" +
+				"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":7}}\n\n" +
+				"data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	h := build(t, upstream.URL)
+	h.chans.mrt.Model.Protocols = channelprotocol.Protocols{channelprotocol.ProtocolOpenAIChat: {}}
+
+	rec := postWithHeaders(t, h.gw, "/v1/messages",
+		`{"model":"gpt-4","stream":true,"max_tokens":100,"messages":[{"role":"user","content":"ping"}]}`,
+		map[string]string{"x-api-key": "sk-gw-t"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "event: message_stop") {
+		t.Fatalf("畸形帧不应中断流：下游应以 message_stop 收尾，got %s", body)
+	}
+	// 畸形帧不得影响后续有效帧解析与计费（12/7）。
+	if len(h.billing.reqs) != 1 || h.billing.reqs[0].Tokens.Input != 12 || h.billing.reqs[0].Tokens.Output != 7 {
+		t.Fatalf("畸形帧不应影响后续有效帧计费（12/7），got %+v", h.billing.reqs)
+	}
+	// 畸形帧须可观测：随调用日志决策轨迹的 lossy_notes 落痕。
+	if len(h.clogs.inserted) == 0 {
+		t.Fatalf("缺少调用日志")
+	}
+	raw, err := json.Marshal(h.clogs.inserted[0].Decision)
+	if err != nil {
+		t.Fatalf("marshal decision: %v", err)
+	}
+	var dec struct {
+		Attempts []map[string]any `json:"attempts"`
+	}
+	if err := json.Unmarshal(raw, &dec); err != nil {
+		t.Fatalf("unmarshal decision: %v", err)
+	}
+	if len(dec.Attempts) == 0 {
+		t.Fatalf("decision attempts 为空: %s", raw)
+	}
+	notes, _ := dec.Attempts[len(dec.Attempts)-1]["lossy_notes"].([]any)
+	found := false
+	for _, n := range notes {
+		if s, ok := n.(string); ok && strings.Contains(s, "malformed") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("畸形帧未在 lossy_notes 中体现: %s", raw)
 	}
 }
 
