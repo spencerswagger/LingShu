@@ -284,6 +284,10 @@ export interface ChannelProtocolModelOverride {
   // 模型级时段/分档（空 = 回落全局默认）
   timeConfig?: TimeCoeffConfig | null
   contextTiers?: ContextTier[] | null
+  // 跨协议转换：不写字段 = 继承（对应后端 ConvertEnabled *bool 的 nil）；true = 开启；false = 关闭
+  convertEnabled?: boolean
+  // 目标协议优先序（键 = 基础协议名：openai-chat / anthropic-messages / openai-responses）；空 = 继承全局默认顺序
+  convertTargets?: string[]
 }
 // 请求头策略：passthroughMode 决定下游头透传方式，whitelist/blacklist 为名单，set 为覆盖键值（支持变量）。
 export interface ChannelProtocolRequestHeaders {

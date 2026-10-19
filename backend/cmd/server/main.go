@@ -643,6 +643,30 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 			}
 			return names, nil
 		},
+		// 全局跨协议转换开关（sys_configs 键 = gateway.ProtocolConversionEnabledKey，默认开启）。
+		// 缺省/空/解析失败一律按开启处理；仅显式 false（JSON 布尔或字符串 "false"/"0"）才关闭。
+		ProtocolConversionEnabled: func() bool {
+			raw, err := billStore.GetConfig(context.Background(), gateway.ProtocolConversionEnabledKey)
+			if err != nil {
+				return true
+			}
+			s := strings.TrimSpace(string(raw))
+			if s == "" {
+				return true
+			}
+			var b bool
+			if err := json.Unmarshal([]byte(s), &b); err == nil {
+				return b
+			}
+			var str string
+			if err := json.Unmarshal([]byte(s), &str); err == nil {
+				switch strings.ToLower(strings.TrimSpace(str)) {
+				case "false", "0":
+					return false
+				}
+			}
+			return true
+		},
 		Logger: logr,
 	})
 	// 调用日志采集注入（nil=不采集；生产装配 SQL 存储，与 console 只读共用）。
