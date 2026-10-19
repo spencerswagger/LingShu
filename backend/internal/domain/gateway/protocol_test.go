@@ -177,6 +177,8 @@ func TestServeUnsupportedProtocol(t *testing.T) {
 	h := build(t, upstream.URL)
 	// 模型级可达协议子集仅 anthropic-messages。
 	h.chans.mrt.Model.Protocols = channelprotocol.Protocols{channelprotocol.ProtocolAnthropicMessages: {}}
+	// 关闭跨协议转换：本用例验证「无直通且不可转换」时回固定 400（AC-4）。
+	h.gw.protocolConvEnabled = func() bool { return false }
 
 	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t", `{"model":"gpt-4","stream":false}`)
 	if rec.Code != http.StatusBadRequest {

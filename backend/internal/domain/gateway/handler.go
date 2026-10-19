@@ -19,7 +19,9 @@ import (
 
 	"github.com/team/llmgateway/internal/domain/billing"
 	"github.com/team/llmgateway/internal/domain/channel"
+	"github.com/team/llmgateway/internal/domain/channelprotocol"
 	"github.com/team/llmgateway/internal/domain/identity"
+	"github.com/team/llmgateway/internal/domain/protocolconv"
 	"github.com/team/llmgateway/internal/domain/router"
 	"github.com/team/llmgateway/internal/pkg/logger"
 	"github.com/team/llmgateway/internal/pkg/resp"
@@ -527,20 +529,37 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 	// 请求增量 diff：计算本次请求的增量消息与全量指纹（call_log 采集用，
 	// 新会话也在此初始化指纹，由下方 Attach 写入会话）。
 	reqMsgs, msgFps := g.captureReqIncrement(sessObj, body)
-	sawLimit := false       // 出现过限流类失败（本地限流 或 上游 429）
-	sawOther := false       // 出现过非限流类的可重试失败（上游 401/402/403/404/5xx、网络类）
-	sawUnsupported := false // 出现过「入站协议 ∉ 模型可达 protocols」（AC-4）
-	attempted := false      // 是否至少有一次候选真正发出上游调用（用于全被本地拦截时的账单兜底）
+	sawLimit := false                // 出现过限流类失败（本地限流 或 上游 429）
+	sawOther := false                // 出现过非限流类的可重试失败（上游 401/402/403/404/5xx、网络类）
+	sawUnsupported := false          // 出现过「入站协议 ∉ 模型可达 protocols」（AC-4）
+	sawConvertSerializeFail := false // 出现过「目标协议序列化失败」（AC-P2-9，全候选失败时回 500 而非 503）
+	attempted := false               // 是否至少有一次候选真正发出上游调用（用于全被本地拦截时的账单兜底）
 	// 决策轨迹：每个候选渠道的处理结果与跳过原因（call_log decision 用，雪花 ID 以字符串序列化）。
 	// 先并入路由层排除项（如排空），再逐候选追加尝试结果；无排除项时轨迹与既有行为完全一致。
 	attempts := make([]map[string]any, 0, len(routes)+len(excluded))
 	attempts = append(attempts, excludedAttempts(excluded)...)
+	// rejectDecision 构造「本次请求被拒」的决策记录，供各终态分支的调用日志复用
+	//（只依赖 attempts 与预扣信息，提前定义以便候选循环内也能落相同口径的决策）。
+	rejectDecision := func() map[string]any {
+		return map[string]any{
+			"attempts":         attempts,
+			"est_input_tokens": pc.InputTokens,
+			"time_coeff":       pc.TimeCoeff,
+			"ctx_coeff":        pc.CtxCoeff,
+			"pre_consumed":     pc.Credits,
+			"result":           "rejected",
+		}
+	}
 	for _, cr := range routes {
 		order := len(attempts) + 1
 		// 渠道/密钥名：渠道 ID 为雪花值，直接展示不具可读性，随候选一并回查落轨迹。
 		chName, keyName := g.channelAndKeyNames(cr.ChannelID, cr.ChannelKeyID)
 		// out 在下方转发阶段赋值；此处提前声明，使轨迹项可并入流式失败诊断（streamDiag）。
 		var out *fwdOutcome
+		// 协议转换上下文（Step 7/9）：默认为直通（converted=false → 不新增任何轨迹字段）；
+		// 解析出上游协议后按实际转换情况更新，供 attempt/skip 与调用日志决策轨迹落痕。
+		plan := convPlan{inbound: baseProtocol, upstream: baseProtocol}
+		var convLossy *protocolconv.LossyReport
 		attempt := func(reason string) map[string]any {
 			m := map[string]any{
 				"order":             order,
@@ -554,6 +573,10 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 				"cost":             cr.Cost,
 				"cost_known":       cr.CostKnown,
 				"route_time_coeff": cr.TimeCoeff,
+			}
+			// 协议转换字段（仅转换候选新增；直通候选键集不变）。
+			for k, v := range conversionAttemptFields(plan, convLossy) {
+				m[k] = v
 			}
 			// 流式上游失败诊断（delivered/first_byte_received/elapsed_ms）：随失败候选轨迹落调用日志。
 			if out != nil {
@@ -613,20 +636,31 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 			sawOther = true
 			continue
 		}
-		// 直通判定（AC-4/AC-18）：入站协议必须 ∈ 该模型可达 protocols，否则不发起上游请求。
+		// 上游协议解析（AC-4/AC-18 + 跨协议转换）：
+		// 入站协议 ∈ 模型可达 protocols → 直通；否则在全局/模型级开关允许时按转换器挑选目标协议；
+		// 两者皆无 → 判定「协议不支持」跳过（不发起上游请求）。
 		eff := effectiveProtocols(rt, mr)
-		if !eff.Has(baseProtocol) {
+		upstreamProto, converted, uok := g.resolveUpstreamProtocol(rt, mr, baseProtocol, endpoint)
+		if !uok {
 			sawUnsupported = true
 			attempts = append(attempts, skip("协议不支持"))
 			continue
 		}
-		prov, ok := g.providerFactory(baseProtocol, endpoint)
-		if !ok {
-			l.Error("unsupported protocol", "protocol", baseProtocol)
+		// 转换时上游 Provider 用目标协议的规范端点（如 openai-chat → chat/completions），
+		// 直通时沿用入站端点（保留 completions/embeddings 语义）。
+		provEndpoint := endpoint
+		if converted {
+			provEndpoint = canonicalProviderEndpoint(upstreamProto)
+		}
+		prov, pok := g.providerFactory(upstreamProto, provEndpoint)
+		if !pok {
+			l.Error("unsupported protocol", "protocol", upstreamProto)
 			attempts = append(attempts, skip("协议不支持"))
 			sawUnsupported = true
 			continue
 		}
+		// 记录本次候选的转换上下文（供轨迹/调用日志落痕；直通时不新增任何字段）。
+		plan = convPlan{inbound: baseProtocol, upstream: upstreamProto, converted: converted}
 		routeRes := &router.RouteResult{ChannelID: cr.ChannelID, ChannelKeyID: cr.ChannelKeyID, InternalModelID: cr.InternalModelID,
 			ModelRowID: cr.ModelRowID, ExternalModelID: cr.ExternalModelID, AutoModelName: autoName, Revision: cr.Revision,
 			Cost: cr.Cost, CostKnown: cr.CostKnown, TimeCoeff: cr.TimeCoeff}
@@ -678,16 +712,55 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 			return
 		}
 
-		// 上游请求构造上下文：有效基址（协议级优先）/ 协议路径覆盖 / 头策略 / 入站协议 / 变量。
+		// 跨协议请求转换（Step 9）：仅在 converted 时把入站协议请求体转为上游协议。
+		// AC-P2-9：按失败阶段区分处置——
+		//   parse：入站请求体解析失败，与候选无关（任何上游都读不出），立即 400 且不转移；
+		//   serialize：目标协议序列化失败，视同本地构建失败（未发出上游调用），跳过本候选继续，
+		//             若最终全候选失败则在终结分支回 500（而非 503 聚合）。
+		upstreamBody := rewritten
+		if converted {
+			convBody, reqLossy, cerr := protocolconv.ConvertRequest(baseProtocol, upstreamProto, rewritten)
+			if cerr != nil {
+				if protocolconv.ConvertStage(cerr) == protocolconv.StageParse {
+					l.Error("convert request parse failed", "from", baseProtocol, "to", upstreamProto, "err", cerr)
+					t, f := summarizeAttempts(attempts)
+					g.refundAllPreConsume(ctx, token.UserID, pc.Credits, "请求失败退回（请求体格式错误）")
+					if !attempted {
+						bid := g.recordGatewayReject(ctx, model, autoName, token, pricingMode, sessionID, "请求体格式错误")
+						g.writeCallLog(ctx, bid, "", token, &router.RouteResult{AutoModelName: autoName}, model, pricingMode, sessionID,
+							reqMsgs, "error", "", "failed", "请求体格式错误", msSince(start), nil, rejectDecision())
+					}
+					g.logOutcome(ctx, slog.LevelWarn, endpoint, model, "请求体格式错误（协议转换解析失败）", http.StatusBadRequest, false, token, sessionID, attempts, t, f, msSince(start))
+					writeOpenAIError(w, http.StatusBadRequest, "请求体格式错误")
+					return
+				}
+				l.Error("convert request failed", "from", baseProtocol, "to", upstreamProto, "err", cerr)
+				sawConvertSerializeFail = true
+				attempts = append(attempts, skip("转换失败"))
+				continue
+			}
+			upstreamBody = convBody
+			convLossy = &protocolconv.LossyReport{}
+			convLossy.Merge(reqLossy)
+		}
+
+		// 上游请求构造上下文：有效基址（协议级优先）/ 协议路径覆盖 / 头策略 / 上游协议 / 变量。
+		// 鉴权注入与路径均按「实际上游协议」取值（转换时即目标协议，直通时等于入站协议）。
+		// 协议特性按渠道协议编写，仅对直通（同协议）生效；转换时置空，避免用渠道协议的特性
+		// 改写跨协议请求体（会破坏目标协议形状）。
+		var reqFeatures []channelprotocol.Feature
+		if !converted {
+			reqFeatures = protocolFeatures(rt)
+		}
 		ureq := UpstreamRequest{
-			BaseURL:          effectiveBaseURL(rt, baseProtocol),
-			Path:             eff[baseProtocol].Path,
+			BaseURL:          effectiveBaseURL(rt, upstreamProto),
+			Path:             eff[upstreamProto].Path,
 			Cred:             kr.CredentialPlain,
-			Body:             rewritten,
+			Body:             upstreamBody,
 			DownstreamHeader: r.Header,
 			HeaderPolicy:     effectiveHeaderPolicy(rt),
-			Protocol:         baseProtocol,
-			Features:         protocolFeatures(rt),
+			Protocol:         upstreamProto,
+			Features:         reqFeatures,
 			Vars: map[string]string{
 				"session_id": sessionID,
 				"request_id": logger.GetRequestID(ctx),
@@ -702,10 +775,10 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 		}
 		if isStream {
 			attempted = true
-			out = g.serveStream(w, r, start, endpoint, prov, rt, routeRes, ureq, model, token, pricingMode, sessionID, sessionName, pc, reqMsgs, attempts)
+			out = g.serveStream(w, r, start, endpoint, prov, rt, routeRes, ureq, model, token, pricingMode, sessionID, sessionName, pc, reqMsgs, attempts, plan, convLossy)
 		} else {
 			attempted = true
-			out = g.serveNonStream(w, r, start, endpoint, prov, rt, routeRes, ureq, model, token, pricingMode, sessionID, sessionName, pc, reqMsgs, attempts)
+			out = g.serveNonStream(w, r, start, endpoint, prov, rt, routeRes, ureq, model, token, pricingMode, sessionID, sessionName, pc, reqMsgs, attempts, plan, convLossy)
 		}
 		if sessionID != "" {
 			sess.EndRequest(sessionID)
@@ -776,16 +849,6 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 
 	// 所有候选都未成功。仅当失败全部属于限流类（本地限流/上游 429）时才回 429，
 	// 否则统一回「无可用渠道」——避免把 401/402/5xx 等误报成限流。
-	rejectDecision := func() map[string]any {
-		return map[string]any{
-			"attempts":         attempts,
-			"est_input_tokens": pc.InputTokens,
-			"time_coeff":       pc.TimeCoeff,
-			"ctx_coeff":        pc.CtxCoeff,
-			"pre_consumed":     pc.Credits,
-			"result":           "rejected",
-		}
-	}
 	// AC-4/AC-18：全部候选都因「入站协议 ∉ 模型可达 protocols」被拒且未发起任何上游请求 →
 	// 返回固定错误（HTTP 400 + OpenAI 错误体，type=unsupported_protocol）。
 	if sawUnsupported && !attempted {
@@ -808,6 +871,19 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 		}
 		g.logOutcome(ctx, slog.LevelWarn, endpoint, model, "全部候选限流（本地限流/上游 429）", http.StatusTooManyRequests, false, token, sessionID, attempts, trail, failed, msSince(start))
 		writeOpenAIError(w, http.StatusTooManyRequests, msgRateLimited)
+		return
+	}
+	// AC-P2-9：全部候选失败且有候选因目标协议序列化失败被跳（未发出上游调用）→ 回 500，
+	// 而非「无可用渠道」503 聚合（属服务端转换故障，非渠道不可用）。
+	if sawConvertSerializeFail {
+		g.refundAllPreConsume(ctx, token.UserID, pc.Credits, "请求失败退回（协议转换失败）")
+		if !attempted {
+			bid := g.recordGatewayReject(ctx, model, autoName, token, pricingMode, sessionID, msgInternal)
+			g.writeCallLog(ctx, bid, "", token, &router.RouteResult{AutoModelName: autoName}, model, pricingMode, sessionID,
+				reqMsgs, "error", "", "failed", msgInternal, msSince(start), nil, rejectDecision())
+		}
+		g.logOutcome(ctx, slog.LevelError, endpoint, model, "全部候选失败（协议转换序列化失败）", http.StatusInternalServerError, false, token, sessionID, attempts, trail, failed, msSince(start))
+		writeOpenAIError(w, http.StatusInternalServerError, msgInternal)
 		return
 	}
 	g.refundAllPreConsume(ctx, token.UserID, pc.Credits, "请求失败退回（无可用渠道）")
@@ -994,11 +1070,16 @@ type fwdOutcome struct {
 func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start time.Time, endpoint string,
 	prov Provider, rt *channel.RuntimeChannel, routeRes *router.RouteResult, ureq UpstreamRequest,
 	model string, token *identity.Token, pricingMode, sessionID, sessionName string,
-	pc preCharge, reqMsgs []json.RawMessage, attempts []map[string]any) *fwdOutcome {
+	pc preCharge, reqMsgs []json.RawMessage, attempts []map[string]any,
+	conv convPlan, lossy *protocolconv.LossyReport) *fwdOutcome {
 
 	ctx := r.Context()
 	stage := "non_stream"        // 日志用：失败发生的转发阶段
 	attempt := len(attempts) + 1 // 当前候选序号（候选总数由请求级 outcome 日志给出）
+	// dec 组装调用日志决策轨迹，并并入本次候选的协议转换上下文（直通时与 callLogDecision 完全一致）。
+	dec := func(reason string) map[string]any {
+		return g.callLogDecisionConv(attempts, reason, pc, routeRes, conv, lossy)
+	}
 	req, err := prov.BuildUpstreamRequest(ctx, ureq)
 	if err != nil {
 		// 本地构建失败，未发出任何上游调用 → 可安全转移。
@@ -1012,7 +1093,7 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 		// 网关侧失败（未发出上游调用）：resp_body 留空，原因只落 error_message 与决策轨迹，
 		// 避免「请求增量/响应/决策原因」三处都是同一句文案。
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-			"error", "", "failed", "构建上游请求失败", msSince(start), nil, g.callLogDecision(attempts, "上游请求构建失败", pc, routeRes))
+			"error", "", "failed", "构建上游请求失败", msSince(start), nil, dec("上游请求构建失败"))
 		return &fwdOutcome{retry: true}
 	}
 	req, wrote, _ := withWriteTrace(req)
@@ -1040,7 +1121,7 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 			bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "上游连接失败", msSince(start))
 			// 连接失败：上游未返回任何响应体，resp_body 留空（原因见 error_message / 决策轨迹）。
 			g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-				"error", "", "failed", "上游连接失败", msSince(start), nil, g.callLogDecision(attempts, "上游连接失败", pc, routeRes))
+				"error", "", "failed", "上游连接失败", msSince(start), nil, dec("上游连接失败"))
 			return &fwdOutcome{retry: true}
 		}
 		// 请求已送达后失败（多为响应超时）：上游可能已生成并计费，转移会导致上游重复计费 → 不转移。
@@ -1064,13 +1145,16 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 			bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "读取上游响应失败", msSince(start))
 			// 读取失败：响应体不可用（读坏了），resp_body 留空而不是重复错误文案。
 			g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-				"error", "", "failed", "读取上游响应失败", msSince(start), nil, g.callLogDecision(attempts, "读取上游响应失败", pc, routeRes))
+				"error", "", "failed", "读取上游响应失败", msSince(start), nil, dec("读取上游响应失败"))
 			writeOpenAIError(w, http.StatusBadGateway, msgUpstreamDown)
 			return &fwdOutcome{responded: true, refundPre: true, downstreamStatus: http.StatusBadGateway}
 		}
 		dur := msSince(start)
 		// 响应侧协议特性（响应侧）：在 usage 归一/计费前对上游响应体做归一（未挂载时零差异）。
-		raw = normalizeUpstreamBody(raw, rt)
+		// 转换候选的响应体是目标协议形状，渠道协议的特性针对源协议编写 → 置空跳过，避免破坏。
+		if !conv.converted {
+			raw = normalizeUpstreamBody(raw, rt)
+		}
 		// upstreamUsage：上游原始 usage（JSONB 值），随调用日志落库用于诊断渠道口径（见 rawusage.go）。
 		usage, upstreamUsage, uerr := prov.ExtractUsage(raw)
 		usageMissing := uerr != nil || usageZero(usage)
@@ -1084,6 +1168,29 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 					reason: "上游未返回或无法解析 usage（按估算计费并将渠道置禁用）", sessionID: sessionID, durationMs: *msSince(start)})
 			content, reasoning, tools := rawParts(raw)
 			usage = missingUsageEstimate(ureq.Body, raw, model, content, reasoning, tools)
+		}
+
+		// 跨协议响应转换（Step 9）：usage 已按「上游（物理）协议」解析完成，此处仅把响应体转回入站协议下发。
+		// 转换失败时上游已返回 2xx 并计费，无法转移下一候选 → 写 502（沿用既有网关错误风格）并退预扣。
+		respBody := raw
+		if conv.converted {
+			convertedBody, rLossy, rerr := protocolconv.ConvertResponse(conv.upstream, conv.inbound, raw)
+			if rerr != nil {
+				g.logError(rt.Channel.ID, "convert upstream response", rerr)
+				g.logUpstreamErr(ctx, slog.LevelError, "convert response failed", endpoint, ureq.Protocol, model, token, routeRes,
+					diagFromRequest(req, ureq.Protocol, ureq.Cred),
+					errInfo{kind: "convert_failed", stage: stage, status: up.StatusCode, attempt: attempt,
+						reason: "响应协议转换失败：" + rerr.Error(), sessionID: sessionID, durationMs: *dur})
+				bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "响应协议转换失败", dur)
+				g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
+					"error", string(raw), "failed", "响应协议转换失败", dur, nil, dec("响应协议转换失败"))
+				writeOpenAIError(w, http.StatusBadGateway, msgUpstreamDown)
+				return &fwdOutcome{responded: true, refundPre: true, downstreamStatus: http.StatusBadGateway}
+			}
+			respBody = convertedBody
+			if lossy != nil {
+				lossy.Merge(rLossy)
+			}
 		}
 
 		// 非流式：先计费再响应。余额不足 → 402，不返成功 body。
@@ -1102,7 +1209,7 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 				// billing.Record 内部已落一条 failed（含实际 tokens/rates/系数与余额不足原因），
 				// 网关不再重复落账，保证每次请求恰好一条记录。
 				g.writeCallLogUsage(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-					"non_stream", string(raw), "failed", "积分余额不足，计费失败", upstreamUsage, dur, nil, g.callLogDecision(attempts, "积分余额不足", pc, routeRes))
+					"non_stream", string(raw), "failed", "积分余额不足，计费失败", upstreamUsage, dur, nil, dec("积分余额不足"))
 				writeOpenAIError(w, http.StatusPaymentRequired, msgInsufficient)
 				return &fwdOutcome{responded: true, billFailed: true, downstreamStatus: http.StatusPaymentRequired}
 			}
@@ -1113,7 +1220,7 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 					attempt: attempt, reason: "计费失败：" + berr.Error(), sessionID: sessionID, durationMs: deref64(dur)})
 			// 计费失败时上游已返回响应体，resp_body 保留其原文（网关侧错误只落 error_message 与决策轨迹）。
 			g.writeCallLogUsage(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-				"non_stream", string(raw), "failed", "计费失败", upstreamUsage, dur, nil, g.callLogDecision(attempts, "计费失败", pc, routeRes))
+				"non_stream", string(raw), "failed", "计费失败", upstreamUsage, dur, nil, dec("计费失败"))
 			writeOpenAIError(w, http.StatusInternalServerError, msgInternal)
 			return &fwdOutcome{responded: true, billFailed: true, downstreamStatus: http.StatusInternalServerError}
 		}
@@ -1124,15 +1231,20 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 			reason = "usage缺失(按估算计费)"
 		}
 		g.writeCallLogUsage(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-			"non_stream", string(raw), "completed", "", upstreamUsage, dur, nil, g.callLogDecision(attempts, reason, pc, routeRes))
+			"non_stream", string(raw), "completed", "", upstreamUsage, dur, nil, dec(reason))
 
 		// 渠道透明：基础协议硬编码响应头 + 全局上游响应头白名单（默认空）；不下发任何 X-Channel* 头。
 		applyResponseHeaderWhitelist(w, up.Header, g.upstreamHeaders())
 		h := w.Header()
-		h.Set("Content-Type", up.Header.Get("Content-Type"))
+		if conv.converted {
+			// 转换后响应体为入站协议 JSON，恒以 application/json 下发。
+			h.Set("Content-Type", "application/json")
+		} else {
+			h.Set("Content-Type", up.Header.Get("Content-Type"))
+		}
 		out.downstreamStatus = up.StatusCode // 请求级日志用真实状态码
 		w.WriteHeader(up.StatusCode)
-		_, _ = w.Write(raw)
+		_, _ = w.Write(respBody)
 		// usage 缺失的渠道已置 DISABLED，不再回喂成功反馈（与流式路径一致，避免禁用态被注入成功样本）。
 		if !usageMissing {
 			g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, feedbackSuccess(start))
@@ -1162,7 +1274,7 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 				reason: reason429, sessionID: sessionID, durationMs: *msSince(start)})
 		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, errMsg, msSince(start))
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-			"error", upErr, "failed", errMsg, msSince(start), nil, g.callLogDecision(attempts, "上游限流(429)", pc, routeRes))
+			"error", upErr, "failed", errMsg, msSince(start), nil, dec("上游限流(429)"))
 		if pol.failover {
 			return &fwdOutcome{retry: true, is429: true}
 		}
@@ -1193,7 +1305,7 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 				reason: reasonAuth, sessionID: sessionID, durationMs: *msSince(start)})
 		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, errMsg, msSince(start))
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-			"error", upErr, "failed", errMsg, msSince(start), nil, g.callLogDecision(attempts, "上游鉴权失败", pc, routeRes))
+			"error", upErr, "failed", errMsg, msSince(start), nil, dec("上游鉴权失败"))
 		if pol.failover {
 			return &fwdOutcome{retry: true}
 		}
@@ -1219,7 +1331,7 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 				reason: errMsg, sessionID: sessionID, durationMs: *msSince(start)})
 		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, errMsg, msSince(start))
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-			"error", upErr, "failed", errMsg, msSince(start), nil, g.callLogDecision(attempts, errMsg, pc, routeRes))
+			"error", upErr, "failed", errMsg, msSince(start), nil, dec(errMsg))
 		if pol.failover {
 			return &fwdOutcome{retry: true}
 		}
@@ -1277,11 +1389,16 @@ func msSince(start time.Time) *int64 {
 func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time.Time, endpoint string,
 	prov Provider, rt *channel.RuntimeChannel, routeRes *router.RouteResult, ureq UpstreamRequest,
 	model string, token *identity.Token, pricingMode, sessionID, sessionName string,
-	pc preCharge, reqMsgs []json.RawMessage, attempts []map[string]any) *fwdOutcome {
+	pc preCharge, reqMsgs []json.RawMessage, attempts []map[string]any,
+	conv convPlan, lossy *protocolconv.LossyReport) *fwdOutcome {
 
 	ctx := r.Context()
 	stage := "stream"            // 日志用：失败发生的转发阶段
 	attempt := len(attempts) + 1 // 当前候选序号（候选总数由请求级 outcome 日志给出）
+	// dec 组装调用日志决策轨迹，并并入本次候选的协议转换上下文（直通时与 callLogDecision 完全一致）。
+	dec := func(reason string) map[string]any {
+		return g.callLogDecisionConv(attempts, reason, pc, routeRes, conv, lossy)
+	}
 	req, err := prov.BuildUpstreamRequest(ctx, ureq)
 	if err != nil {
 		// 本地构建失败，未发出任何上游调用 → 可安全转移。
@@ -1294,7 +1411,7 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "构建上游流式请求失败", msSince(start))
 		// 网关侧失败（未发出上游调用）：resp_body 留空，原因只落 error_message 与决策轨迹。
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-			"error", "", "failed", "构建上游流式请求失败", msSince(start), nil, g.callLogDecision(attempts, "上游请求构建失败", pc, routeRes))
+			"error", "", "failed", "构建上游流式请求失败", msSince(start), nil, dec("上游请求构建失败"))
 		return &fwdOutcome{retry: true}
 	}
 	req, wrote, gotFirstByte := withWriteTrace(req)
@@ -1331,11 +1448,11 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, channel.Feedback{IsSuccess: false, Now: g.now()})
 		// 调用日志决策轨迹同样带上流式失败诊断（仅新增字段，不改既有键名）。
 		streamDecision := func(reason string) map[string]any {
-			dec := g.callLogDecision(attempts, reason, pc, routeRes)
+			d := g.callLogDecisionConv(attempts, reason, pc, routeRes, conv, lossy)
 			for k, v := range streamDiag {
-				dec[k] = v
+				d[k] = v
 			}
-			return dec
+			return d
 		}
 		if !delivered {
 			// 请求体未送达上游：上游不可能计费 → 可安全转移。
@@ -1360,9 +1477,21 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		// 记录首个 SSE chunk 写出时机（首字耗时）。
 		ft := &firstTokenWriter{ResponseWriter: w}
 		// upstreamUsage：上游原始 usage 分片合并后的 JSONB 值（诊断渠道口径，见 rawusage.go）。
-		usage, upstreamUsage, assistantMsg, herr := prov.HandleStream(ctx, up, ft)
+		// 跨协议转换（Step 10）：converted 时改走转换泵（逐帧解码→规范事件→按入站协议编码下发），
+		// 非转换保持原 HandleStream 透传路径逐字节不变。
+		var usage billing.Usage
+		var upstreamUsage, assistantMsg []byte
+		var herr error
+		if conv.converted {
+			usage, upstreamUsage, assistantMsg, herr = g.pumpConvertedStream(ctx, up, conv.inbound, conv.upstream, lossy, ft)
+		} else {
+			usage, upstreamUsage, assistantMsg, herr = prov.HandleStream(ctx, up, ft)
+		}
 		// 响应侧协议特性：usage 拼装后、计费前对拼装结果做归一（未挂载时零差异）。
-		assistantMsg = normalizeUpstreamBody(assistantMsg, rt)
+		// 转换候选的拼装结果是目标协议形状，渠道协议特性针对源协议编写 → 置空跳过。
+		if !conv.converted {
+			assistantMsg = normalizeUpstreamBody(assistantMsg, rt)
+		}
 		dur := msSince(start)
 		// 计费上下文（脱离请求取消、带超时）：响应结束后请求 ctx 会被取消，账单不可丢。
 		billCtx, cancelBill := billingCtx(ctx)
@@ -1411,7 +1540,7 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 					reason: "流式传输中断：" + herr.Error(), sessionID: sessionID, durationMs: *dur})
 			bid := g.recordFailure(billCtx, routeRes, model, token, pricingMode, sessionID, sessionName, "流式传输中断", dur)
 			g.writeCallLogUsage(billCtx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-				"error", string(assistantMsg), "failed", "流式传输中断", upstreamUsage, dur, ft.firstTokenMs(start), g.callLogDecision(attempts, "流式传输中断", pc, routeRes))
+				"error", string(assistantMsg), "failed", "流式传输中断", upstreamUsage, dur, ft.firstTokenMs(start), dec("流式传输中断"))
 		}
 		// 流结束后计费（预扣已在前置阶段完成；此处按实际/估算扣费，差额由 serve 结算退补）。
 		ch, bid, berr := g.recordBilling(billCtx, routeRes, model, token, usage, pricingMode, sessionID, sessionName, pc.Credits, dur, ft.firstTokenMs(start))
@@ -1432,14 +1561,14 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 			// 失败分支已在上面记录（resp_kind=error）。
 		case out.billFailed:
 			g.writeCallLogUsage(billCtx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-				"stream", string(assistantMsg), "failed", "流式计费失败", upstreamUsage, dur, ft.firstTokenMs(start), g.callLogDecision(attempts, "计费失败", pc, routeRes))
+				"stream", string(assistantMsg), "failed", "流式计费失败", upstreamUsage, dur, ft.firstTokenMs(start), dec("计费失败"))
 		default:
 			reason := "success"
 			if usageMissing {
 				reason = "usage缺失(按估算计费)"
 			}
 			g.writeCallLogUsage(billCtx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-				"stream", string(assistantMsg), "completed", "", upstreamUsage, dur, ft.firstTokenMs(start), g.callLogDecision(attempts, reason, pc, routeRes))
+				"stream", string(assistantMsg), "completed", "", upstreamUsage, dur, ft.firstTokenMs(start), dec(reason))
 		}
 		// usage 缺失的渠道已置 DISABLED，不再回喂成功反馈（避免与禁用态冲突）。
 		if !usageMissing {
@@ -1465,7 +1594,7 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 				reason: "上游限流(429)，已转入下一候选", sessionID: sessionID, durationMs: *msSince(start)})
 		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, errMsg, msSince(start))
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-			"error", upErr, "failed", errMsg, msSince(start), nil, g.callLogDecision(attempts, "上游限流(429)", pc, routeRes))
+			"error", upErr, "failed", errMsg, msSince(start), nil, dec("上游限流(429)"))
 		if pol.failover {
 			return &fwdOutcome{retry: true, is429: true}
 		}
@@ -1492,7 +1621,7 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 				reason: "上游返回 401/403，已转入下一候选（该失败通常对下游不可见）", sessionID: sessionID, durationMs: *msSince(start)})
 		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, errMsg, msSince(start))
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-			"error", upErr, "failed", errMsg, msSince(start), nil, g.callLogDecision(attempts, "上游鉴权失败", pc, routeRes))
+			"error", upErr, "failed", errMsg, msSince(start), nil, dec("上游鉴权失败"))
 		if pol.failover {
 			return &fwdOutcome{retry: true}
 		}
@@ -1518,7 +1647,7 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 				reason: errMsg, sessionID: sessionID, durationMs: *msSince(start)})
 		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, errMsg, msSince(start))
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-			"error", upErr, "failed", errMsg, msSince(start), nil, g.callLogDecision(attempts, errMsg, pc, routeRes))
+			"error", upErr, "failed", errMsg, msSince(start), nil, dec(errMsg))
 		if pol.failover {
 			return &fwdOutcome{retry: true}
 		}
