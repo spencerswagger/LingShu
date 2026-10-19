@@ -118,8 +118,59 @@ const rows = computed<MatrixRow[]>(() => {
   return out
 })
 
-// 四个维度全量展示：每行即为一条独立通路（对外模型 × 内部模型 × 渠道 × 密钥）。
-// 因此不做任何单元格合并——避免「同名不同状态的行被并成一格」以及合并块随状态抖动而跳动。
+// 列顺序（与模板列一一对应）：对外模型 | 内部模型 | 渠道 | 密钥 | 优先级 | RPM/TPM | 会话数。
+// span-method 依赖 columnIndex 对应本数组。
+type ColKey = 'external' | 'internal' | 'channel' | 'key' | 'priority' | 'limits' | 'sessions'
+const COLS: ColKey[] = ['external', 'internal', 'channel', 'key', 'priority', 'limits', 'sessions']
+
+// 单元格合并：连续且「合并键相同」的行并成一格。
+// 关键：对外/内部模型的合并键**带上状态** —— 只合并同名同状态的行，既拿到合并的紧凑，
+// 又不会把「某渠道已禁用」的行并进绿色的格子里；密钥/限流按自身粒度合并。
+function mergeKeyOf(ck: ColKey): (r: MatrixRow) => string {
+  switch (ck) {
+    case 'external':
+      return (r) => (r.model ? 'E' + r.model.View.ExternalModelID + '|' + extRowState(r) : '')
+    case 'internal':
+      return (r) => (r.model ? 'E' + r.model.View.ExternalModelID + '|I' + r.model.View.InternalModelID + '|' + r.model.View.State : '')
+    case 'channel':
+      return (r) => 'C' + r.channel.View.ID
+    case 'key':
+      // 序位可能随外部模型不同，故并入合并键，保证色条与所在行一致。
+      return (r) => (r.key ? 'K' + r.channel.View.ID + '|' + r.key.View.KeyID + '|' + String(rankOf(r)) : '')
+    case 'priority':
+      return (r) => 'C' + r.channel.View.ID
+    case 'limits':
+      return (r) => 'L' + r.channel.View.ID + '|' + (r.model ? r.model.View.ID : '') + '|' + (r.key ? r.key.View.KeyID : '')
+    case 'sessions':
+      return (r) => (r.key ? 'K' + r.channel.View.ID + '|' + r.key.View.KeyID : '')
+  }
+}
+
+// 预计算「连续相同键的 run-length」：首行 rowspan=组长，其余行 rowspan=0。
+function buildRuns(keyFn: (r: MatrixRow) => string): number[] {
+  const src = rows.value
+  const spans = new Array<number>(src.length).fill(1)
+  let i = 0
+  while (i < src.length) {
+    let j = i + 1
+    while (j < src.length && keyFn(src[j]) === keyFn(src[i])) j++
+    spans[i] = j - i
+    for (let t = i + 1; t < j; t++) spans[t] = 0
+    i = j
+  }
+  return spans
+}
+const spans = computed(() => {
+  const map: Partial<Record<ColKey, number[]>> = {}
+  for (const ck of COLS) map[ck] = buildRuns(mergeKeyOf(ck))
+  return map
+})
+function spanMethod({ rowIndex, columnIndex }: { rowIndex: number; columnIndex: number }): [number, number] {
+  const ck = COLS[columnIndex]
+  const arr = ck ? spans.value[ck] : undefined
+  if (arr) return [arr[rowIndex] ?? 1, 1]
+  return [1, 1]
+}
 
 // ===== 状态灯与原因 =====
 // 状态严重度：DISABLED > DRAIN > NORMAL（决策 7）。折叠列状态灯取覆盖集合中最差状态。
@@ -709,6 +760,7 @@ onUnmounted(stopTimer)
         stripe
         class="table-nowrap clickable-rows"
         row-key="_id"
+        :span-method="spanMethod"
         @row-click="onRowClick"
       >
         <!-- 对外模型 -->
