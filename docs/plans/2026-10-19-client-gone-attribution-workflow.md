@@ -89,3 +89,45 @@ gate: human
 verify:
   type: human-review
   check: PR 评审结论无遗留 P0/P1 问题，且 go test ./... 与 go test -race 仍全绿
+
+- [ ] **Step 12: 追加测试（client-gone 归为 499）**
+action: 在 backend/internal/domain/gateway/handler_test.go 更新既有 4 个 TestClientGone_* 用例：断言 `rec.Code == 499`，请求级日志含 `status=499`，且不再写 502。既有断言中凡是检查 status=502 的改为 499；保留 kind=client_gone、无 feeds 等断言。
+verify: cd backend && go test -count=1 ./internal/domain/gateway/ -run 'TestClientGone'
+loop: false
+max_iterations: 3
+
+- [ ] **Step 13: 实现 499 语义**
+action: (1) handler.go 新增 `const statusClientClosedRequest = 499`（置于 statusOriginTimeout 附近）。(2) serveStream 与 serveNonStream 的 client-gone 分支：在返回前调用 `w.WriteHeader(statusClientClosedRequest)`（不写 body），并把返回改为 `&fwdOutcome{responded: true, clientGone: true, downstreamStatus: statusClientClosedRequest}`（流式分支保留 streamDiag）。(3) backend/internal/domain/gateway/errlog.go 的 logOutcome 客户端错误门控：把 499 与 429 一样豁免（在 `status != http.StatusTooManyRequests` 之外增加 `&& status != statusClientClosedRequest`）。
+verify: cd backend && go test -count=1 ./internal/domain/gateway/ -run 'TestClientGone'
+loop: until cd backend && go test -count=1 ./internal/domain/gateway/ -run 'TestClientGone' >/dev/null 2>&1
+max_iterations: 4
+
+- [ ] **Step 14: 追加测试（已送达超时按估算结算）**
+action: 在 handler_test.go 新增 TestDeliveredTimeout_StreamSettlesByEstimate（复用既有 wroteThenFailTransport）与 TestDeliveredTimeout_NonStreamSettlesByEstimate（新增等价「已送达后失败」transport 供 gw.client 使用）。断言：HTTP 502；按估算输入结算（h.billing 收到一次 Record 且 usage.Input>0、Output==0）；h.credit.refunded 不含等于整笔预扣的退款。并更新既有 TestStreamDelivered_AfterDeliveredNoFailover 以匹配新行为（不再整单退；调用日志/账单为估算结算记录）。
+verify: cd backend && go test -count=1 ./internal/domain/gateway/ -run 'TestDeliveredTimeout|TestStreamDelivered_AfterDeliveredNoFailover'
+loop: false
+max_iterations: 3
+
+- [ ] **Step 15: 实现「已送达超时」按估算结算**
+action: (1) handler.go 的 fwdOutcome 新增字段 `upstreamFailed bool`（注释：已送达后上游失败/响应超时，已按估算结算、不再整单退预扣）。(2) serveNonStream 与 serveStream 的 delivered=true（Do 报错）分支：把 `g.recordFailure(...)` 替换为 `g.recordBilling(ctx, routeRes, model, token, billing.Usage{Input: int64(pc.InputTokens)}, pricingMode, sessionID, sessionName, pc.Credits, <dur>, nil)`（dur：非流式 msSince(start)、流式为 elapsed），并捕获 berr 记 `g.logger.Error("delivered-timeout billing failed", ...)`；保留 writeCallLog 与 `writeOpenAIError(w, http.StatusBadGateway, msgUpstreamDown)`；返回由 `refundPre: true` 改为 `upstreamFailed: true, downstreamStatus: http.StatusBadGateway`（流式保留 streamDiag）。(3) handler 主循环 out.responded 的 switch 增加 `case out.upstreamFailed:` → `attempts = append(attempts, attempt("上游失败"))`（置于 billFailed 之后、refundPre 之前）。(4) errlog.go 的 outcomeIsFailure 增加 `|| out.upstreamFailed`。上游明确返回错误状态（5xx/504/401/403/429）的分支保持 `refundPre: true` 不变。
+verify: cd backend && go test -count=1 ./internal/domain/gateway/
+loop: until cd backend && go test -count=1 ./internal/domain/gateway/ >/dev/null 2>&1
+max_iterations: 4
+
+- [ ] **Step 16: 全量校验、提交、推送（更新 PR #51）**
+action: 运行 `go vet ./...`、`go test -count=1 ./...`、`go test -race -count=1 ./internal/domain/gateway/... ./internal/domain/channel/...` 全绿；提交（信息 `feat(gateway): 499 for client-gone and estimate-settlement for delivered timeouts`）；push 到 hotl/client-gone-attribution（更新 PR #51）。
+gate: human
+verify:
+  - type: shell
+    command: git -C /workspace log -1 --oneline
+  - type: shell
+    command: cd backend && go test -count=1 ./...
+
+- [ ] **Step 17: 复审循环（rev2）**
+action: 对 rev2 增量做多维度代码评审，重点：499 是否正确写回且访问日志可见、logOutcome 门控是否豁免 499、已送达超时是否按估算结算且未整单退、上游明确报错是否仍退款、流式与非流式是否一致、默认安全态是否保持。逐条修复并追加提交，复审至无 P0/P1。
+loop: until 复审结论无 P0/P1 未决问题
+max_iterations: 3
+gate: human
+verify:
+  type: human-review
+  check: rev2 评审无遗留 P0/P1，且 go test ./... 与 -race 仍全绿
