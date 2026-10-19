@@ -2309,6 +2309,84 @@ func TestDeliveredTimeout_BillingFailureMarksBillFailed(t *testing.T) {
 	}
 }
 
+// client-gone（非流式）分支下 recordBilling 报错 → 置 billFailed（预扣不退），
+// 请求级与调用日志归因「计费失败」，对齐主循环 switch 的 billFailed 优先归因。
+func TestClientGone_BillingFailureMarksBillFailed(t *testing.T) {
+	live := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer live.Close()
+
+	h := build(t, live.URL)
+	fc := &fakeCredit{balance: 5000}
+	h.gw.credit = fc
+	h.billing.credit = fc
+	h.billing.err = errors.New("record boom") // 结算失败注入
+	h.gw.client = &http.Client{Transport: &canceledTransport{}}
+	dump := withLogCapture(h)
+
+	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t",
+		`{"model":"gpt-4","stream":false,"messages":[{"role":"user","content":"ping"}]}`)
+	if rec.Code != 499 {
+		t.Fatalf("client-gone 应写回 499, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(fc.refunded) != 0 {
+		t.Fatalf("结算失败不应整单退预扣（billFailed 语义）, refunded=%v", fc.refunded)
+	}
+	if out := dump(); !strings.Contains(out, "计费失败") {
+		t.Errorf("结算失败应归因为计费失败：\n%s", out)
+	}
+	var cl *CallLog
+	for _, c := range h.clogs.inserted {
+		if c.ErrorMessage == "计费失败" {
+			cl = c
+		}
+	}
+	if cl == nil {
+		t.Fatalf("应有调用日志归因「计费失败」, got %+v", h.clogs.inserted)
+	}
+	if dec, ok := cl.Decision.(map[string]any); !ok || dec["result"] != "计费失败" {
+		t.Errorf("调用日志决策 reason 应为计费失败, got %v", cl.Decision)
+	}
+}
+
+// 流式「已送达超时」分支下 recordBilling 报错 → 置 billFailed（预扣不退），
+// 请求级与调用日志归因「计费失败」，对齐主循环 switch 的 billFailed 优先归因。
+func TestDeliveredTimeout_StreamBillingFailureMarksBillFailed(t *testing.T) {
+	live := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer live.Close()
+
+	h := build(t, live.URL)
+	fc := &fakeCredit{balance: 5000}
+	h.gw.credit = fc
+	h.billing.credit = fc
+	h.billing.err = errors.New("record boom")                              // 结算失败注入
+	h.gw.streamClient = &http.Client{Transport: &wroteThenFailTransport{}} // 已送达后失败（流式）
+	dump := withLogCapture(h)
+
+	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t",
+		`{"model":"gpt-4","stream":true,"messages":[{"role":"user","content":"ping"}]}`)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("已送达超时应回 502, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(fc.refunded) != 0 {
+		t.Fatalf("结算失败不应整单退预扣（billFailed 语义）, refunded=%v", fc.refunded)
+	}
+	if out := dump(); !strings.Contains(out, "计费失败") {
+		t.Errorf("结算失败应归因为计费失败：\n%s", out)
+	}
+	var cl *CallLog
+	for _, c := range h.clogs.inserted {
+		if c.ErrorMessage == "计费失败" {
+			cl = c
+		}
+	}
+	if cl == nil {
+		t.Fatalf("应有调用日志归因「计费失败」, got %+v", h.clogs.inserted)
+	}
+	if dec, ok := cl.Decision.(map[string]any); !ok || dec["result"] != "计费失败" {
+		t.Errorf("调用日志决策 reason 应为计费失败, got %v", cl.Decision)
+	}
+}
+
 func TestStreamDelivered_ConnectFailureFailsOver(t *testing.T) {
 	live := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")

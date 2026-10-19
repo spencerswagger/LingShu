@@ -452,6 +452,7 @@ func TestStreamClientGone(t *testing.T) {
 		{"下游写失败但请求 ctx 已取消", canceled, errors.New("write tcp: broken pipe"), true},
 		{"herr 为空但请求 ctx 已取消", canceled, nil, true},
 		{"正常读流错误（ctx 存活）", alive, errors.New("unexpected EOF"), false},
+		{"上游超时（ctx 存活）不得误判为客户端断开", alive, context.DeadlineExceeded, false},
 		{"无错误", alive, nil, false},
 	}
 	for _, c := range cases {
