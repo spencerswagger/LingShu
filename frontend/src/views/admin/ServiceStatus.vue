@@ -124,10 +124,11 @@ const rows = computed<MatrixRow[]>(() => {
 
 // 列顺序：已勾选维度列（external,internal,channel,key 固定顺序）+ 指标列（priority,limits,sessions）。
 // span-method 依赖 columnIndex 对应本数组，故以 cols 计算属性作为唯一索引真源。
-type ColKey = 'external' | 'internal' | 'channel' | 'key' | 'priority' | 'limits' | 'sessions'
+type ColKey = 'external' | 'internal' | 'channel' | 'key' | 'rank' | 'priority' | 'limits' | 'sessions'
 const DIM_COLS: ColKey[] = ['external', 'internal', 'channel', 'key']
 const cols = computed<ColKey[]>(() => [
   ...DIM_COLS.filter((k) => dims.value.includes(k)),
+  ...(modelAxis.value && keyAxis.value ? (['rank'] as ColKey[]) : []),
   'priority',
   'limits',
   'sessions',
@@ -145,6 +146,9 @@ function mergeKeyOf(ck: ColKey): ((r: MatrixRow) => string) | null {
       return chanAxis.value ? (r) => 'C' + r.channel.View.ID : null
     case 'key':
       return keyAxis.value ? (r) => (r.key ? 'K' + r.channel.View.ID + '|' + r.key.View.KeyID : '') : null
+    case 'rank':
+      // 序位列为独立通路列：不参与合并，保证每个通路行各自的序位图标可见。
+      return null
     case 'priority':
       return (r) => 'C' + r.channel.View.ID
     case 'limits':
@@ -541,6 +545,10 @@ function relText(r: ReliabilityConfig): string {
 function metricsText(m: MachineMetrics): string {
   return `错误率 ${pct(m.ErrorRatePct)} · 429 ${pct(m.Rate429Pct)} · P99 ${m.P99LatencyMS}ms`
 }
+// 探测时间展示：空值统一用「—」占位，与其它空值占位一致。
+function dt(v?: string | null): string {
+  return v ? fmtDateTime(v) : '—'
+}
 
 // 成本比较样值（候选区样值说明用）。
 const sampleUsageText = computed(() => {
@@ -793,7 +801,7 @@ onUnmounted(stopTimer)
         @row-click="onRowClick"
       >
         <!-- 对外模型（勾选=进入行轴并合并；未勾选=不显示该列） -->
-        <el-table-column v-if="dims.includes('external')" label="对外模型" min-width="140">
+        <el-table-column v-if="dims.includes('external')" label="对外模型" min-width="160">
           <template #default="{ row }">
             <div class="hcell">
               <el-tooltip placement="top" :show-after="150">
@@ -810,7 +818,7 @@ onUnmounted(stopTimer)
         </el-table-column>
 
         <!-- 内部模型 -->
-        <el-table-column v-if="dims.includes('internal')" label="内部模型" min-width="140">
+        <el-table-column v-if="dims.includes('internal')" label="内部模型" min-width="160">
           <template #default="{ row }">
             <div class="hcell">
               <el-tooltip placement="top" :show-after="150">
@@ -826,25 +834,10 @@ onUnmounted(stopTimer)
           </template>
         </el-table-column>
 
-        <!-- 渠道（渠道无独立状态机，不显示派生状态灯；序位图标附悬浮说明） -->
-        <el-table-column v-if="dims.includes('channel')" min-width="150">
-          <template #header>
-            <el-tooltip placement="top">
-              <template #content>
-                <div class="tt">
-                  <div class="tt-line">序位：★ 首选 · ☆ 次选 · ·N 第 N 候选 · — 不参与新会话</div>
-                  <div class="tt-line">顺序来自后端候选排序（Rank），前端不重算</div>
-                  <div class="tt-line">仅「对外模型/内部模型」与「密钥」维度同时勾选时出现</div>
-                </div>
-              </template>
-              <span>渠道</span>
-            </el-tooltip>
-          </template>
+        <!-- 渠道（渠道无独立状态机，不显示派生状态灯） -->
+        <el-table-column v-if="dims.includes('channel')" label="渠道" min-width="180">
           <template #default="{ row }">
             <div class="hcell">
-              <el-tooltip v-if="rankSymbol(row)" :content="rankTip(row)" placement="top">
-                <span class="rank-sym" :class="rankClass(row)">{{ rankSymbol(row) }}</span>
-              </el-tooltip>
               <el-tooltip placement="top" :show-after="150">
                 <template #content>
                   <div class="tt">
@@ -858,7 +851,7 @@ onUnmounted(stopTimer)
         </el-table-column>
 
         <!-- 密钥 -->
-        <el-table-column v-if="dims.includes('key')" label="密钥" min-width="150">
+        <el-table-column v-if="dims.includes('key')" label="密钥" min-width="200">
           <template #default="{ row }">
             <div class="hcell">
               <el-tooltip placement="top" :show-after="150">
@@ -872,6 +865,26 @@ onUnmounted(stopTimer)
               <span class="hcell-name" :title="cell(row, 'key').name">{{ cell(row, 'key').name }}</span>
               <span v-if="cell(row, 'key').sub" class="hcell-sub">{{ cell(row, 'key').sub }}</span>
             </div>
+          </template>
+        </el-table-column>
+
+        <!-- 序位（独立列，不参与合并）：仅模型轴与密钥轴同时进入行轴时存在 -->
+        <el-table-column v-if="modelAxis && keyAxis" label="序位" min-width="56" align="center">
+          <template #header>
+            <el-tooltip placement="top">
+              <template #content>
+                <div class="tt">
+                  <div class="tt-line">★ 首选 · ☆ 次选 · ·N 第 N 候选 · — 不参与新会话</div>
+                  <div class="tt-line">顺序来自后端候选排序（Rank）</div>
+                </div>
+              </template>
+              <span>序位</span>
+            </el-tooltip>
+          </template>
+          <template #default="{ row }">
+            <el-tooltip v-if="rankSymbol(row)" :content="rankTip(row)" placement="top">
+              <span class="rank-sym" :class="rankClass(row)">{{ rankSymbol(row) }}</span>
+            </el-tooltip>
           </template>
         </el-table-column>
 
@@ -1011,9 +1024,9 @@ onUnmounted(stopTimer)
               <tr>
                 <td class="cmp-field">最近探测</td>
                 <td class="cmp-muted">—</td>
-                <td>{{ selectedRow.model ? fmtDateTime(selectedRow.model.View.LastProbe) : '—' }}</td>
-                <td>{{ fmtDateTime(selectedRow.channel.View.LastProbe) }}</td>
-                <td>{{ selectedRow.key ? fmtDateTime(selectedRow.key.View.LastProbe) : '—' }}</td>
+                <td>{{ selectedRow.model ? dt(selectedRow.model.View.LastProbe) : '—' }}</td>
+                <td>{{ dt(selectedRow.channel.View.LastProbe) }}</td>
+                <td>{{ selectedRow.key ? dt(selectedRow.key.View.LastProbe) : '—' }}</td>
               </tr>
               <tr>
                 <td class="cmp-field">最近错误</td>
@@ -1126,7 +1139,7 @@ onUnmounted(stopTimer)
       折叠摘要状态灯取覆盖集合中最差状态（禁用 &gt; 排空 &gt; 正常，红&gt;橙&gt;绿）并标注异常数；折叠列不合并，仅行轴维度列做连续合并。
     </div>
     <div class="foot-note">
-      序位图标：★ 首选 · ☆ 次选 · ·N 第 N 候选 · — 不参与新会话；仅「对外模型/内部模型」与「密钥」维度同时勾选时出现，顺序由后端候选排序决定。
+      序位为独立「序位」列（不参与合并）：★ 首选 · ☆ 次选 · ·N 第 N 候选 · — 不参与新会话；仅「对外模型/内部模型」与「密钥」维度同时勾选时出现，顺序由后端候选排序决定。
     </div>
     <div class="foot-note">
       渠道无独立状态机，故不展示渠道级状态；RPM/TPM 合并列上行为模型级、下行为密钥级，均展示「当前值/上限」并附用量灯（≥100% 红、≥80% 橙）。
@@ -1187,7 +1200,8 @@ onUnmounted(stopTimer)
   padding: 6px 8px;
   text-align: left;
   vertical-align: top;
-  word-break: break-all;
+  word-break: normal;
+  overflow-wrap: break-word;
 }
 .cmp-table thead th {
   background: var(--el-fill-color-light);
@@ -1195,7 +1209,7 @@ onUnmounted(stopTimer)
   color: var(--color-text);
 }
 .cmp-table .cmp-field {
-  width: 88px;
+  width: 76px;
   background: var(--el-fill-color-light);
   color: var(--color-text-tertiary);
   font-weight: 400;
@@ -1245,6 +1259,7 @@ onUnmounted(stopTimer)
   font-size: 11px;
   color: var(--color-text-tertiary);
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 /* 状态灯：绿=正常 · 橙=排空 · 红=禁用/超限 · 灰=未知（与「会话」列表的光效圆点一致） */
 .lamp {
@@ -1292,12 +1307,12 @@ onUnmounted(stopTimer)
   flex-direction: column;
   gap: 2px;
   align-items: flex-start;
-  line-height: 1.5;
+  line-height: 1.4;
 }
 .lmrow {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 4px;
 }
 .lmtext {
   font-variant-numeric: tabular-nums;
