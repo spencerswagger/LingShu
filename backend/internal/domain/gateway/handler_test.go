@@ -2787,3 +2787,59 @@ func TestClientGone_RequestCtxCanceled(t *testing.T) {
 		t.Errorf("client-gone 不应回喂渠道健康, got %+v", h.chans.feeds)
 	}
 }
+
+// failThenCanceledTransport 模拟「首个候选真实上游失败（未送达、可转移），下一候选才因下游
+// 断开取消」：第 1 次 RoundTrip 返回普通连接错误（非 context.Canceled），第 2 次返回 context.Canceled。
+type failThenCanceledTransport struct{ calls int32 }
+
+func (t *failThenCanceledTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	if atomic.AddInt32(&t.calls, 1) == 1 {
+		return nil, errors.New("dial tcp 127.0.0.1:0: connect: connection refused")
+	}
+	return nil, context.Canceled
+}
+
+// client-gone 出现在「已有真实候选失败之后」时，不得用「客户端已断开」遮蔽真实失败：
+// 第 1 候选连接失败（计入 failed_candidates）→ 转移到第 2 候选命中 client-gone；
+// 请求级结论应为「候选失败且请求最终失败」（failed_candidates=1），而非 client-gone 的 Info 结论。
+func TestClientGone_AfterRealCandidateFailure(t *testing.T) {
+	live := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer live.Close()
+
+	h := build(t, live.URL)
+	fc := &fakeCredit{balance: 5000}
+	h.gw.credit = fc
+	h.billing.credit = fc
+	addSecondKey(h, live.URL, "k2-secret")
+	h.gw.client = &http.Client{Transport: &failThenCanceledTransport{}}
+	dump := withLogCapture(h)
+
+	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t",
+		`{"model":"gpt-4","stream":false,"messages":[{"role":"user","content":"ping"}]}`)
+	if rec.Code != 499 {
+		t.Fatalf("client-gone 应写回 499, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	out := dump()
+	// 第 1 候选（连接失败）与第 2 候选（client-gone）都应留痕。
+	if !strings.Contains(out, "kind=connect_failed") {
+		t.Errorf("首个候选连接失败应留痕 kind=connect_failed：\n%s", out)
+	}
+	if !strings.Contains(out, "kind=client_gone") {
+		t.Errorf("次个候选应留痕 kind=client_gone：\n%s", out)
+	}
+	line := logLineContaining(out, "gateway request outcome")
+	if line == "" {
+		t.Fatalf("缺少请求级结论日志 gateway request outcome：\n%s", out)
+	}
+	// 关键：真实失败优先——请求级结论不得被 client-gone 的 Info 文案遮蔽。
+	if !strings.Contains(line, "候选失败且请求最终失败") {
+		t.Errorf("存在真实候选失败时应归因为候选失败且请求最终失败：\n%s", line)
+	}
+	if !strings.Contains(line, "failed_candidates=1") {
+		t.Errorf("failed_candidates 应为 1（仅计首个真实失败，client-gone 不计）：\n%s", line)
+	}
+	if strings.Contains(line, "客户端已断开") {
+		t.Errorf("client-gone 结论不得遮蔽真实候选失败：\n%s", line)
+	}
+}
