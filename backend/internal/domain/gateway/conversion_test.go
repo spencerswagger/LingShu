@@ -431,3 +431,33 @@ func TestStreamConversionToolOnlyAnthropicTarget(t *testing.T) {
 		t.Fatalf("计费用量应取上游 openai usage(10/5)，got %+v", h.billing.reqs)
 	}
 }
+
+// TestConvertParseFailureReturns400 断言 AC-P2-9：入站请求体「合法 JSON 且含 model，但对其声明协议不合法」
+// 时，ConvertRequest 解析失败应立即回 HTTP 400，且绝不发起上游调用（解析失败与候选无关，不 failover）。
+func TestConvertParseFailureReturns400(t *testing.T) {
+	var calls int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	h := build(t, upstream.URL)
+	// 模型仅可达 anthropic-messages → openai-chat 入站需转换（才会触发 ConvertRequest）。
+	h.chans.mrt.Model.Protocols = channelprotocol.Protocols{channelprotocol.ProtocolAnthropicMessages: {}}
+
+	// messages 为对象（非数组）→ 合法 JSON 且含 model，但 openai-chat 解析失败。
+	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t",
+		`{"model":"gpt-4","messages":{"bad":"shape"}}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("want 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if n := atomic.LoadInt32(&calls); n != 0 {
+		t.Fatalf("入站解析失败不应发起上游调用（不 failover），上游被调用 %d 次", n)
+	}
+	// 仍落一条 failed 账单（对齐既有 400 路径的留痕口径）。
+	if len(h.billing.reqs) != 1 || !h.billing.reqs[0].Fail {
+		t.Fatalf("解析失败应落 1 条 failed 账单, got %+v", h.billing.reqs)
+	}
+}

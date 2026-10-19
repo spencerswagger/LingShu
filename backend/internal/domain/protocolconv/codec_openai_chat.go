@@ -672,16 +672,7 @@ func (openAIChatCodec) SerializeResponse(resp *CanonicalResponse) ([]byte, *Loss
 		msg["tool_calls"] = calls
 	}
 
-	usage := map[string]interface{}{
-		"prompt_tokens":     resp.Usage.Input + resp.Usage.CacheRead,
-		"completion_tokens": resp.Usage.Output,
-		"total_tokens":      resp.Usage.Input + resp.Usage.CacheRead + resp.Usage.Output,
-	}
-	if resp.Usage.CacheRead > 0 {
-		usage["prompt_tokens_details"] = map[string]interface{}{
-			"cached_tokens": resp.Usage.CacheRead,
-		}
-	}
+	usage := usageToOpenAI(resp.Usage)
 
 	out := map[string]interface{}{
 		"id":     resp.ID,

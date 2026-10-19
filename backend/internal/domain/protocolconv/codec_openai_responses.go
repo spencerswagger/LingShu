@@ -358,16 +358,7 @@ func (openaiResponsesCodec) SerializeResponse(resp *CanonicalResponse) ([]byte, 
 		}
 	}
 
-	usage := map[string]interface{}{
-		"input_tokens":  resp.Usage.Input + resp.Usage.CacheRead,
-		"output_tokens": resp.Usage.Output,
-		"total_tokens":  resp.Usage.Input + resp.Usage.CacheRead + resp.Usage.Output,
-	}
-	if resp.Usage.CacheRead > 0 {
-		usage["input_tokens_details"] = map[string]interface{}{
-			"cached_tokens": resp.Usage.CacheRead,
-		}
-	}
+	usage := usageToResponses(resp.Usage)
 	out["usage"] = usage
 
 	for k, v := range resp.Extra {
