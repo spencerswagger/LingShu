@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"errors"
+	"math"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -161,5 +162,60 @@ func TestCostEvent_EngineForwardsDecisionToSink(t *testing.T) {
 	e.SetCostEventSink(&fakeCostEventSink{err: errors.New("sink 故障")})
 	if err := e.EmitSessionCostEvent("s1", 4, d); err == nil {
 		t.Fatal("sink 提交错误应原样返回")
+	}
+}
+
+// TestCostEvent_WALRoundTripPreservesNonFinite 锁定：非有限浮点（「未知」）经 WAL 线格式
+// 编码 → 重放解码后仍为 NaN，不会退化成 0（否则崩溃重启后「未知」会被当成真实值 0）。
+func TestCostEvent_WALRoundTripPreservesNonFinite(t *testing.T) {
+	ev := SessionCostEvent{
+		SessionID:      "s-nan",
+		Turn:           7,
+		CrossCacheRead: math.Inf(1),
+		Decision: SessionCostDecision{
+			Switch:           true,
+			FromChannelKeyID: 1,
+			ToChannelKeyID:   2,
+			TurnCostOld:      math.NaN(),
+			TurnCostNew:      1.5,
+			RechargeCost:     math.NaN(),
+			PaybackTurns:     math.NaN(),
+			PaybackLimit:     math.NaN(),
+		},
+	}
+	payload, err := marshalEventForJSON(ev)
+	if err != nil {
+		t.Fatalf("marshalEventForJSON: %v", err)
+	}
+	if !math.IsInf(ev.CrossCacheRead, 1) || !math.IsNaN(ev.Decision.PaybackLimit) {
+		t.Fatalf("marshalEventForJSON 不应修改入参，got %+v", ev)
+	}
+
+	sink := NewAsyncCostEventSink(nil).(*asyncCostEventSink)
+	var got SessionCostEvent
+	var landed bool
+	sink.persist = func(_ context.Context, e SessionCostEvent) error {
+		got = e
+		landed = true
+		return nil
+	}
+	if err := sink.replay(context.Background(), "s-nan", payload); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if !landed {
+		t.Fatal("replay 未调用落地回调")
+	}
+	if !math.IsNaN(got.CrossCacheRead) {
+		t.Fatalf("CrossCacheRead 应还原为 NaN（未知），got %v", got.CrossCacheRead)
+	}
+	if !math.IsNaN(got.Decision.TurnCostOld) || !math.IsNaN(got.Decision.RechargeCost) ||
+		!math.IsNaN(got.Decision.PaybackTurns) || !math.IsNaN(got.Decision.PaybackLimit) {
+		t.Fatalf("未知字段应还原为 NaN，got %+v", got.Decision)
+	}
+	if got.Decision.TurnCostNew != 1.5 {
+		t.Fatalf("有限值应原样保留，got %v", got.Decision.TurnCostNew)
+	}
+	if got.SessionID != "s-nan" || got.Turn != 7 || !got.Decision.Switch {
+		t.Fatalf("普通字段应保留，got %+v", got)
 	}
 }
