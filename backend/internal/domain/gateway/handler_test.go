@@ -2477,3 +2477,55 @@ func TestClientGone_RequestOutcomeDistinct(t *testing.T) {
 		t.Errorf("client-gone 不应出现「候选失败」文案：\n%s", out)
 	}
 }
+
+// cancelThenErrTransport 模拟「请求 ctx 在转发过程中被取消，但上游返回的是普通错误
+// （非 context.Canceled）」：先取消请求 ctx，再返回一个与取消无关的上游错误。
+// 用于覆盖 streamClientGone 中 `errors.Is(ctx.Err(), context.Canceled)` 这条回退分支。
+type cancelThenErrTransport struct {
+	cancel context.CancelFunc
+	err    error
+}
+
+func (t *cancelThenErrTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	t.cancel()
+	return nil, t.err
+}
+
+// F5：用真实已取消的请求 ctx（而非仅 transport 直接返回 context.Canceled）触发 client-gone，
+// 覆盖 `ctx.Err()==context.Canceled` 分支——上游错误本身并非 context.Canceled。
+func TestClientGone_RequestCtxCanceled(t *testing.T) {
+	live := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer live.Close()
+
+	h := build(t, live.URL)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h.gw.client = &http.Client{Transport: &cancelThenErrTransport{
+		cancel: cancel,
+		err:    errors.New("read tcp 127.0.0.1:0: read: connection reset by peer"),
+	}}
+	dump := withLogCapture(h)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"gpt-4","stream":false,"messages":[{"role":"user","content":"ping"}]}`))
+	req = req.WithContext(ctx)
+	req.Header.Set("Authorization", "Bearer sk-gw-t")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.gw.Handler().ServeHTTP(rec, req)
+	_ = rec
+
+	out := dump()
+	if !strings.Contains(out, "kind=client_gone") {
+		t.Errorf("请求 ctx 已取消应归因为 kind=client_gone：\n%s", out)
+	}
+	if strings.Contains(out, "上游调用失败") {
+		t.Errorf("client-gone 不应误记为上游调用失败：\n%s", out)
+	}
+	if strings.Contains(out, "status=502") {
+		t.Errorf("client-gone 不应写出 502：\n%s", out)
+	}
+	if len(h.chans.feeds) != 0 {
+		t.Errorf("client-gone 不应回喂渠道健康, got %+v", h.chans.feeds)
+	}
+}
