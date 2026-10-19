@@ -108,6 +108,10 @@ type ModelRow = {
   baseUrl: string
   externalModelID: string | null
   pricing: Record<string, any>
+  // 跨协议转换：undefined = 继承；true = 开启；false = 关闭
+  convertEnabled?: boolean
+  // 目标协议优先序；空 = 继承全局默认顺序
+  convertTargets: string[]
 }
 const modelRows = ref<ModelRow[]>([])
 
@@ -343,6 +347,8 @@ async function load() {
       protocols: Object.keys(ov?.protocols || {}),
       baseUrl: ov?.baseUrl || '',
       externalModelID: ov?.externalModelID ?? null,
+      convertEnabled: ov?.convertEnabled,
+      convertTargets: [...(ov?.convertTargets || [])],
       pricing: {
         CostRates: { Input: 0, Output: 0, CacheRead: 0, ...(ov?.costRates || {}) },
         TimeConfig: ov?.timeConfig ?? null,
@@ -390,11 +396,20 @@ onMounted(() => {
 // ===== 模型行 增/改/删 =====
 const modelDrawerOpen = ref(false)
 const editingIndex = ref<number | null>(null) // null = 新增；否则为编辑的行号
-const editingForm = ref<{ id: string; protocols: string[]; baseUrl: string; externalModelID: string | null }>({
+const editingForm = ref<{
+  id: string
+  protocols: string[]
+  baseUrl: string
+  externalModelID: string | null
+  convertEnabled: string // inherit | true | false
+  convertTargets: string[]
+}>({
   id: '',
   protocols: [],
   baseUrl: '',
   externalModelID: null,
+  convertEnabled: 'inherit',
+  convertTargets: [],
 })
 const editingPricing = ref<Record<string, any>>(emptyPricing())
 const editingExternalPrev = ref<string | null>(null)
@@ -402,7 +417,7 @@ const editingExternalPrev = ref<string | null>(null)
 function openCreateModel() {
   editingIndex.value = null
   editingExternalPrev.value = null
-  editingForm.value = { id: '', protocols: [], baseUrl: '', externalModelID: null }
+  editingForm.value = { id: '', protocols: [], baseUrl: '', externalModelID: null, convertEnabled: 'inherit', convertTargets: [] }
   editingPricing.value = emptyPricing()
   modelDrawerOpen.value = true
 }
@@ -414,6 +429,8 @@ function openEditModel(row: ModelRow, index: number) {
     protocols: [...row.protocols],
     baseUrl: row.baseUrl,
     externalModelID: row.externalModelID,
+    convertEnabled: row.convertEnabled == null ? 'inherit' : row.convertEnabled ? 'true' : 'false',
+    convertTargets: [...row.convertTargets],
   }
   editingPricing.value = {
     CostRates: { ...(row.pricing.CostRates || {}) },
@@ -432,6 +449,9 @@ function saveModel() {
     protocols: [...editingForm.value.protocols],
     baseUrl: editingForm.value.baseUrl.trim(),
     externalModelID: editingForm.value.externalModelID,
+    convertEnabled:
+      editingForm.value.convertEnabled === 'inherit' ? undefined : editingForm.value.convertEnabled === 'true',
+    convertTargets: [...editingForm.value.convertTargets],
     pricing: {
       CostRates: { ...(editingPricing.value.CostRates || {}) },
       TimeConfig: editingPricing.value.TimeConfig ?? null,
@@ -535,7 +555,7 @@ function onAddPulled() {
   let added = 0
   for (const p of pullChecked.value) {
     if (isAdded(p.ID)) continue
-    modelRows.value.push({ id: p.ID, protocols: [], baseUrl: '', externalModelID: null, pricing: emptyPricing() })
+    modelRows.value.push({ id: p.ID, protocols: [], baseUrl: '', externalModelID: null, convertTargets: [], pricing: emptyPricing() })
     added++
   }
   ElMessage.success(`已加入 ${added} 个模型（请在清单中绑定对外模型并配置成本）`)
@@ -608,6 +628,8 @@ function buildModels(): Record<string, ChannelProtocolModelOverride> {
     if (r.pricing.CostRates) ov.costRates = r.pricing.CostRates
     if (r.pricing.TimeConfig) ov.timeConfig = r.pricing.TimeConfig
     if (r.pricing.ContextTiers) ov.contextTiers = r.pricing.ContextTiers
+    if (r.convertEnabled !== undefined) ov.convertEnabled = r.convertEnabled
+    if (r.convertTargets.length) ov.convertTargets = [...r.convertTargets]
     out[mid] = ov
   }
   return out
@@ -952,6 +974,22 @@ async function onSubmit() {
         </el-form-item>
         <el-form-item label="BaseURL 覆盖">
           <el-input v-model="editingForm.baseUrl" placeholder="留空 = 继承协议级" />
+        </el-form-item>
+        <el-form-item label="允许转换">
+          <el-select v-model="editingForm.convertEnabled" style="width: 240px">
+            <el-option label="继承（不写字段）" value="inherit" />
+            <el-option label="开启" value="true" />
+            <el-option label="关闭" value="false" />
+          </el-select>
+          <div class="hint">跨协议转换开关；继承 = 沿用全局默认。</div>
+        </el-form-item>
+        <el-form-item label="目标协议优先序">
+          <StringListEditor
+            v-model="editingForm.convertTargets"
+            :suggestions="[...baseProtocols]"
+            placeholder="目标协议（留空 = 继承全局默认顺序）"
+          />
+          <div class="hint">按顺序尝试转换的目标协议；可选：openai-chat / anthropic-messages / openai-responses。留空 = 继承全局默认顺序。</div>
         </el-form-item>
         <div class="span-2">
           <ModelPricing v-model="editingPricing" show-rates-key="CostRates" title="成本">

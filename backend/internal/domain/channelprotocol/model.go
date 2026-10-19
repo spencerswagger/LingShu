@@ -102,6 +102,10 @@ type ModelGateway struct {
 	CostRates       billing.WireRates        `json:"costRates,omitempty"`
 	TimeConfig      *billing.TimeCoeffConfig `json:"timeConfig,omitempty"`
 	ContextTiers    []billing.TierRule       `json:"contextTiers,omitempty"`
+	// ConvertEnabled 该模型是否允许跨协议转换（nil=继承全局开关）。
+	ConvertEnabled *bool `json:"convertEnabled,omitempty"`
+	// ConvertTargets 该模型转换时的目标协议偏好顺序（空=按默认偏好顺序）。
+	ConvertTargets []string `json:"convertTargets,omitempty"`
 }
 
 // 错误策略的生效范围。
@@ -226,4 +230,17 @@ func (cp *ChannelProtocol) EffectiveModelProtocols(internalModelID string, model
 		return mg.Protocols
 	}
 	return cp.Protocols
+}
+
+// EffectiveModelConvert 返回某内部模型的协议转换配置：
+// 模型存在于 Models 时返回其 ConvertEnabled/ConvertTargets；否则 (nil, nil) 表示继承全局默认。
+func (cp *ChannelProtocol) EffectiveModelConvert(internalModelID string) (enabled *bool, targets []string) {
+	if cp == nil {
+		return nil, nil
+	}
+	mg, ok := cp.Models[internalModelID]
+	if !ok {
+		return nil, nil
+	}
+	return mg.ConvertEnabled, mg.ConvertTargets
 }

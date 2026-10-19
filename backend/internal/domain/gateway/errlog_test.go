@@ -339,7 +339,8 @@ func TestLogRejectLevelAndSwitch(t *testing.T) {
 // Fix 4：4xx 请求级结论受开关控制；开关打开时照常落盘。
 func TestOutcomeLogSwitch4xx(t *testing.T) {
 	h := build(t, "http://127.0.0.1:1")
-	// anthropic-messages 不在该渠道模型可达协议内 → 未出网即被拒（400）
+	// anthropic-messages 不在该渠道模型可达协议内且禁用跨协议转换 → 未出网即被拒（400）
+	h.gw.protocolConvEnabled = func() bool { return false }
 	body := `{"model":"gpt-4","stream":false,"messages":[{"role":"user","content":"ping"}]}`
 
 	logger.SetClientErrorLogEnabled(false)

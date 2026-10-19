@@ -150,7 +150,12 @@ type Gateway struct {
 	streamClient   *http.Client // 流式上游客户端（不设 body 超时，由 ctx 控制）
 	// upstreamRespHeaders 全局上游响应头白名单（默认空，未配置时返回 nil）。
 	upstreamRespHeaders func() []string
+	// protocolConvEnabled 全局跨协议转换开关（nil=默认开启）。
+	protocolConvEnabled func() bool
 }
+
+// ProtocolConversionEnabledKey 是全局跨协议转换开关在 sys_configs 中的键（默认开启）。
+const ProtocolConversionEnabledKey = "gateway.protocol_conversion.enabled"
 
 // GatewayConfig 是 NewGateway 的入参。
 type GatewayConfig struct {
@@ -190,6 +195,9 @@ type GatewayConfig struct {
 	// UpstreamResponseHeaderWhitelist 读取全局上游响应头白名单（sys_configs，默认空）。
 	// 未配置/读取失败按空处理（不透传任何上游头，维持渠道透明）。
 	UpstreamResponseHeaderWhitelist func() ([]string, error)
+	// ProtocolConversionEnabled 读取全局跨协议转换开关（sys_configs，默认开启）。
+	// 返回 false 时禁用非直通的协议转换；未配置/读取失败按开启处理。
+	ProtocolConversionEnabled func() bool
 }
 
 // NewGateway 构造网关。缺省项使用合理默认值。
@@ -248,6 +256,7 @@ func NewGateway(cfg GatewayConfig) *Gateway {
 		client:              cfg.Client,
 		streamClient:        cfg.StreamClient,
 		upstreamRespHeaders: respHeaders,
+		protocolConvEnabled: cfg.ProtocolConversionEnabled,
 	}
 }
 
@@ -260,6 +269,14 @@ func (g *Gateway) upstreamHeaders() []string {
 		return nil
 	}
 	return g.upstreamRespHeaders()
+}
+
+// conversionEnabled 返回跨协议转换是否启用：未装配开关时默认开启。
+func (g *Gateway) conversionEnabled() bool {
+	if g.protocolConvEnabled == nil {
+		return true
+	}
+	return g.protocolConvEnabled()
 }
 
 // DefaultProviderFactory 依据基础协议 + 端点创建 Provider。
