@@ -1,6 +1,5 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { Refresh } from '@element-plus/icons-vue'
 import {
@@ -27,10 +26,10 @@ import { fmtDateTime } from '@/utils/format'
 
 // ===== 维度与行模型 =====
 // 维度 key：external=对外模型 / internal=内部模型 / channel=渠道 / key=密钥。
-// 统一语义（不允许隐性逻辑）：行轴 = 已勾选维度的叉积；列 = 已勾选维度列（未勾选维度不再显示该列）。
-// 对外模型与内部模型共享同一条「模型轴」（值同源 ModelDetail.View）：勾选其一即把模型轴纳入行轴。
-const DIM_KEYS: string[] = ['external', 'internal', 'channel', 'key']
-const dims = ref<string[]>(['external', 'channel']) // 默认只勾选「对外模型 + 渠道」
+// 页面固定全量展示四个维度（不再提供勾选）：行轴 = 四维度叉积；四个维度列恒定可见。
+// 对外模型与内部模型共享同一条「模型轴」（值同源 ModelDetail.View）。
+// 维度固定全量展示：四个维度列恒定可见，行轴恒为「对外模型 × 内部模型 × 渠道 × 密钥」的叉积。
+const dims = ref<string[]>(['external', 'internal', 'channel', 'key'])
 
 // 刷新间隔（秒；manual 表示不自动刷新）。
 const refreshInterval = ref('30') // 默认 30 秒
@@ -45,9 +44,6 @@ interface MatrixRow {
   models: ModelDetail[] // 该行覆盖的内部模型集合（折叠时为其渠道全部模型）
   keys: KeyDetail[] // 该行覆盖的密钥集合（折叠时为其渠道全部密钥）
 }
-
-const route = useRoute()
-const router = useRouter()
 
 const view = ref<ServiceStatusView | null>(null)
 const loading = ref(false)
@@ -64,9 +60,6 @@ const externalNameByID = computed<Record<string, string>>(() => {
   for (const e of externalModels.value) map[e.ID] = e.ExternalName
   return map
 })
-// 全部渠道的内部模型明细（对外模型状态机跨渠道取该对外模型下全部内部模型）。
-const allModels = computed<ModelDetail[]>(() => (view.value?.Channels || []).flatMap((c) => c.Models))
-
 // 数字 ID 升序；非纯数字（内部模型标识）按字典序。
 function idCmp(a: string, b: string): number {
   const na = Number(a)
@@ -127,8 +120,8 @@ const rows = computed<MatrixRow[]>(() => {
 type ColKey = 'external' | 'internal' | 'channel' | 'key' | 'rank' | 'priority' | 'limits' | 'sessions'
 const DIM_COLS: ColKey[] = ['external', 'internal', 'channel', 'key']
 const cols = computed<ColKey[]>(() => [
-  ...DIM_COLS.filter((k) => dims.value.includes(k)),
   ...(modelAxis.value && keyAxis.value ? (['rank'] as ColKey[]) : []),
+  ...DIM_COLS.filter((k) => dims.value.includes(k)),
   'priority',
   'limits',
   'sessions',
@@ -199,6 +192,26 @@ function worstState(states: string[]): string {
   for (const s of states) if ((STATE_RANK[s] ?? 0) > (STATE_RANK[w] ?? 0)) w = s
   return w
 }
+// 状态中文名（含聚合态 PARTIAL）。
+function stateLabel(state: string): string {
+  switch (state) {
+    case 'NORMAL':
+    case 'HEALTHY':
+    case 'ENABLED':
+    case 'ACTIVE':
+      return '正常'
+    case 'DRAIN':
+    case 'DRAIN_ONLY':
+      return '排空'
+    case 'DISABLED':
+    case 'UNAVAILABLE':
+      return '禁用'
+    case 'PARTIAL':
+      return '部分可用'
+    default:
+      return state || '未知'
+  }
+}
 // 状态灯色档：正常=绿（ok）· 排空=橙（warn）· 禁用=红（bad）· 未知=灰（off）。
 function lampState(state?: string): string {
   switch (state) {
@@ -209,6 +222,7 @@ function lampState(state?: string): string {
       return 'ok'
     case 'DRAIN':
     case 'DRAIN_ONLY':
+    case 'PARTIAL':
       return 'warn'
     case 'DISABLED':
     case 'UNAVAILABLE':
@@ -281,24 +295,46 @@ function keyReasonOf(k: KeyDetail): ReasonLine[] {
   return lines
 }
 
-// 对外模型无自身状态机：智能取该对外模型下全部内部模型的最差状态；停用时视为 DISABLED。
-function extSetOf(extId: string): ModelDetail[] {
-  return allModels.value.filter((m) => m.View.ExternalModelID === extId)
-}
 function extEnabledOf(extId: string): boolean {
   const e = externalModels.value.find((x) => x.ID === extId)
   return !!e && e.Enabled
 }
+// 对外模型无自身状态机：可用性 = 其名下全部「渠道×内部模型」通路的健康度。
+//   全部正常 → NORMAL（绿）；部分异常但仍有可用通路 → PARTIAL（橙·部分可用）；全不可用/停用 → DISABLED（红）。
+// 不用「最差值」直接压成红色——那会把「个别渠道/密钥坏、模型整体仍可用」误报成整体不可用。
+function extPathsOf(extId: string): { channel: string; model: string; state: string }[] {
+  const out: { channel: string; model: string; state: string }[] = []
+  for (const c of view.value?.Channels || []) {
+    for (const m of c.Models) {
+      if (m.View.ExternalModelID === extId) out.push({ channel: c.View.Name, model: m.View.InternalModelID, state: m.View.State })
+    }
+  }
+  return out
+}
 function extStateOf(extId: string): string {
   if (!extEnabledOf(extId)) return 'DISABLED'
-  return worstState(extSetOf(extId).map((m) => m.View.State))
+  const paths = extPathsOf(extId)
+  if (!paths.length) return 'DISABLED'
+  const healthy = paths.filter((p) => p.state === 'NORMAL').length
+  if (healthy === 0) return 'DISABLED'
+  if (healthy < paths.length) return 'PARTIAL'
+  return 'NORMAL'
 }
 function extReasonOf(extId: string): ReasonLine[] {
-  const lines: ReasonLine[] = [{ text: `启用态：${extEnabledOf(extId) ? '启用' : '停用'}`, danger: !extEnabledOf(extId) }]
-  for (const m of extSetOf(extId)) {
-    if (m.View.State !== 'NORMAL') lines.push({ text: `${m.View.InternalModelID}：${m.View.State}`, danger: m.View.State === 'DISABLED' })
+  const enabled = extEnabledOf(extId)
+  const paths = extPathsOf(extId)
+  const healthy = paths.filter((p) => p.state === 'NORMAL').length
+  const lines: ReasonLine[] = [{ text: enabled ? '启用' : '停用', danger: !enabled }]
+  if (!enabled) {
+    lines.push({ text: '已停用：不参与路由' })
+    return lines
   }
-  if (lines.length === 1) lines.push({ text: '全部内部模型正常' })
+  lines.push({ text: `可用通路 ${healthy}/${paths.length}`, danger: healthy === 0 })
+  for (const p of paths) {
+    if (p.state !== 'NORMAL') lines.push({ text: `渠道 ${p.channel} · 模型 ${p.model}：${stateLabel(p.state)}`, danger: p.state === 'DISABLED' })
+  }
+  if (healthy === paths.length) lines.push({ text: '全部通路正常' })
+  else if (healthy > 0) lines.push({ text: '仍有可用通路，模型整体可用' })
   return lines
 }
 
@@ -437,14 +473,14 @@ function rankSymbol(r: MatrixRow): string {
   if (rank === 2) return '☆'
   return '·' + rank
 }
-// 序位图标悬浮说明（避免符号含义不明）。
+// 序位悬浮说明：符号与左侧竖条同义（同一颜色语义）。
 function rankTip(r: MatrixRow): string {
   const rank = rankOf(r)
   if (rank === null) return ''
-  if (rank === 'none') return '不参与新会话（未进入候选排序）'
-  if (rank === 1) return '首选：新会话在该对外模型下的第 1 候选'
-  if (rank === 2) return '次选：第 2 候选'
-  return `第 ${rank} 候选`
+  if (rank === 'none') return '不参与新会话（未进入候选排序）· 左侧深灰竖条'
+  if (rank === 1) return '首选（第 1 候选）· 左侧金色竖条'
+  if (rank === 2) return '次选（第 2 候选）· 左侧浅灰竖条'
+  return `第 ${rank} 候选 · 左侧浅灰竖条`
 }
 function rowClassName({ row }: { row: MatrixRow }): string {
   return rankClass(row)
@@ -731,26 +767,9 @@ function startTimer() {
   timer = window.setInterval(load, Number(refreshInterval.value) * 1000)
 }
 
-// URL 状态回写（dims）：onMounted 读取回填，变更时写回。
-function readUrl() {
-  const dq = route.query.dims
-  if (typeof dq === 'string' && dq) {
-    const list = dq
-      .split(',')
-      .map((s) => s.trim())
-      .filter((s) => DIM_KEYS.includes(s))
-    if (list.length) dims.value = list
-  }
-}
-function persistUrl() {
-  router.replace({ query: { dims: dims.value.join(',') } })
-}
-
 onMounted(async () => {
-  readUrl()
   await load()
   startTimer()
-  watch(dims, () => persistUrl(), { deep: true })
   watch(refreshInterval, () => startTimer())
 })
 onUnmounted(stopTimer)
@@ -758,17 +777,8 @@ onUnmounted(stopTimer)
 
 <template>
   <div class="page-container">
-    <!-- 工具条：维度勾选 / 刷新间隔 + 手动刷新 / 数据时间 -->
+    <!-- 工具条：刷新间隔 + 手动刷新 / 数据时间（维度固定全量展示，不再选择） -->
     <div class="card toolbar">
-      <div class="tb-item">
-        <span class="tb-label">维度</span>
-        <el-checkbox-group v-model="dims" size="small" :min="1">
-          <el-checkbox label="external">对外模型</el-checkbox>
-          <el-checkbox label="internal">内部模型</el-checkbox>
-          <el-checkbox label="channel">渠道</el-checkbox>
-          <el-checkbox label="key">密钥</el-checkbox>
-        </el-checkbox-group>
-      </div>
       <div class="tb-item">
         <span class="tb-label">刷新</span>
         <el-select v-model="refreshInterval" size="small" class="tb-int">
@@ -800,8 +810,29 @@ onUnmounted(stopTimer)
         :row-class-name="rowClassName"
         @row-click="onRowClick"
       >
-        <!-- 对外模型（勾选=进入行轴并合并；未勾选=不显示该列） -->
-        <el-table-column v-if="dims.includes('external')" label="对外模型" min-width="160">
+        <!-- 序位（独立列，不参与合并）：★/☆/·N 与行左侧竖条同义 -->
+        <el-table-column label="序位" min-width="64" align="center">
+          <template #header>
+            <el-tooltip placement="top">
+              <template #content>
+                <div class="tt">
+                  <div class="tt-line">★ 首选 · ☆ 次选 · ·N 第 N 候选 · — 不参与新会话</div>
+                  <div class="tt-line">顺序来自后端候选排序（Rank），前端不重算</div>
+                  <div class="tt-line">行左侧竖条与序位同色：金=首选 · 浅灰=次选 · 深灰=不参与</div>
+                </div>
+              </template>
+              <span>序位</span>
+            </el-tooltip>
+          </template>
+          <template #default="{ row }">
+            <el-tooltip :content="rankTip(row)" placement="top" :disabled="!rankSymbol(row)">
+              <span class="rank-cell" :class="rankClass(row)">{{ rankSymbol(row) || '—' }}</span>
+            </el-tooltip>
+          </template>
+        </el-table-column>
+
+        <!-- 对外模型 -->
+        <el-table-column label="对外模型" min-width="160">
           <template #default="{ row }">
             <div class="hcell">
               <el-tooltip placement="top" :show-after="150">
@@ -818,7 +849,7 @@ onUnmounted(stopTimer)
         </el-table-column>
 
         <!-- 内部模型 -->
-        <el-table-column v-if="dims.includes('internal')" label="内部模型" min-width="160">
+        <el-table-column label="内部模型" min-width="160">
           <template #default="{ row }">
             <div class="hcell">
               <el-tooltip placement="top" :show-after="150">
@@ -835,7 +866,7 @@ onUnmounted(stopTimer)
         </el-table-column>
 
         <!-- 渠道（渠道无独立状态机，不显示派生状态灯） -->
-        <el-table-column v-if="dims.includes('channel')" label="渠道" min-width="180">
+        <el-table-column label="渠道" min-width="180">
           <template #default="{ row }">
             <div class="hcell">
               <el-tooltip placement="top" :show-after="150">
@@ -851,7 +882,7 @@ onUnmounted(stopTimer)
         </el-table-column>
 
         <!-- 密钥 -->
-        <el-table-column v-if="dims.includes('key')" label="密钥" min-width="200">
+        <el-table-column label="密钥" min-width="200">
           <template #default="{ row }">
             <div class="hcell">
               <el-tooltip placement="top" :show-after="150">
@@ -865,26 +896,6 @@ onUnmounted(stopTimer)
               <span class="hcell-name" :title="cell(row, 'key').name">{{ cell(row, 'key').name }}</span>
               <span v-if="cell(row, 'key').sub" class="hcell-sub">{{ cell(row, 'key').sub }}</span>
             </div>
-          </template>
-        </el-table-column>
-
-        <!-- 序位（独立列，不参与合并）：仅模型轴与密钥轴同时进入行轴时存在 -->
-        <el-table-column v-if="modelAxis && keyAxis" label="序位" min-width="56" align="center">
-          <template #header>
-            <el-tooltip placement="top">
-              <template #content>
-                <div class="tt">
-                  <div class="tt-line">★ 首选 · ☆ 次选 · ·N 第 N 候选 · — 不参与新会话</div>
-                  <div class="tt-line">顺序来自后端候选排序（Rank）</div>
-                </div>
-              </template>
-              <span>序位</span>
-            </el-tooltip>
-          </template>
-          <template #default="{ row }">
-            <el-tooltip v-if="rankSymbol(row)" :content="rankTip(row)" placement="top">
-              <span class="rank-sym" :class="rankClass(row)">{{ rankSymbol(row) }}</span>
-            </el-tooltip>
           </template>
         </el-table-column>
 
@@ -1133,16 +1144,16 @@ onUnmounted(stopTimer)
 
     <!-- 页脚：聚合语义显式成文（用户规范：不允许隐性逻辑） -->
     <div class="foot-note">
-      未勾选维度不再显示对应列；行轴 = 已勾选维度叉积（对外/内部模型共享同一条模型轴）。
+      维度固定全量展示：行轴恒为「对外模型 × 内部模型 × 渠道 × 密钥」叉积；列固定为序位 + 四维度列 + 优先级/限流/会话数。
     </div>
     <div class="foot-note">
-      折叠摘要状态灯取覆盖集合中最差状态（禁用 &gt; 排空 &gt; 正常，红&gt;橙&gt;绿）并标注异常数；折叠列不合并，仅行轴维度列做连续合并。
+      状态灯语义：绿=正常 · 橙=部分可用或排空 · 红=整体不可用/禁用 · 灰=未知。对外模型为派生聚合——全部通路正常=绿；仍有可用通路=橙（部分可用）；全不可用/停用=红；悬停状态灯可见「可用通路 x/y」与具体异常通路。
     </div>
     <div class="foot-note">
-      序位为独立「序位」列（不参与合并）：★ 首选 · ☆ 次选 · ·N 第 N 候选 · — 不参与新会话；仅「对外模型/内部模型」与「密钥」维度同时勾选时出现，顺序由后端候选排序决定。
+      行左侧竖条与「序位」列同色同义：金=首选 · 浅灰=次选 · 深灰=不参与新会话（悬停序位单元格查看说明）；顺序由后端候选排序决定。
     </div>
     <div class="foot-note">
-      渠道无独立状态机，故不展示渠道级状态；RPM/TPM 合并列上行为模型级、下行为密钥级，均展示「当前值/上限」并附用量灯（≥100% 红、≥80% 橙）。
+      渠道无独立状态机，故渠道列不展示状态灯；RPM/TPM 合并列上行为模型级、下行为密钥级，均展示「当前值/上限」并附用量灯（≥100% 红、≥80% 橙）。
     </div>
   </div>
 </template>
@@ -1329,20 +1340,20 @@ onUnmounted(stopTimer)
   flex-wrap: wrap;
   gap: 4px;
 }
-.rank-sym {
-  flex: none;
-  width: 14px;
+.rank-cell {
+  display: block;
+  width: 100%;
   text-align: center;
-  font-size: 13px;
+  font-size: 14px;
   font-weight: 700;
 }
-.rank-sym.rank-first {
+.rank-cell.rank-first {
   color: #f0b429;
 }
-.rank-sym.rank-second {
+.rank-cell.rank-second {
   color: #b6bccd;
 }
-.rank-sym.rank-none {
+.rank-cell.rank-none {
   color: #98a2b3;
 }
 /* 行左缘色条：金★首选 / 浅灰次选 / 深灰不参与新会话；仅模型轴与密钥轴同时进入行轴时出现 */
