@@ -36,9 +36,10 @@ func (f *fakeCostEventSink) snapshot() []SessionCostEvent {
 	return append([]SessionCostEvent(nil), f.events...)
 }
 
-// TestCostEvent_AsyncSubmitsAndIdempotentByTurn 锁定：启用异步时提交成功；
-// 同一 IdempotencyKey（session_id:轮次）重复提交只落一次，不同轮次各落一次。
-func TestCostEvent_AsyncSubmitsAndIdempotentByTurn(t *testing.T) {
+// TestCostEvent_AsyncSubmitsEachEmission 锁定：启用异步时每一次发射都各自留痕。
+// 注：不再按 (session, turn) 去重——网关 SessionTurn 恒 0，按轮次去重会把同轮次的多次独立决策
+// 静默丢弃；幂等键改为每次发射唯一的 session:Seq（见 Submit 注释）。
+func TestCostEvent_AsyncSubmitsEachEmission(t *testing.T) {
 	ctx := context.Background()
 	w := asyncwrite.New(asyncwrite.Config{
 		WALPath:    filepath.Join(t.TempDir(), "asyncwrite.wal"),
@@ -62,7 +63,7 @@ func TestCostEvent_AsyncSubmitsAndIdempotentByTurn(t *testing.T) {
 		t.Fatalf("首次提交失败: %v", err)
 	}
 	if err := sink.Submit(ev1); err != nil {
-		t.Fatalf("重复提交（同 IdempotencyKey）失败: %v", err)
+		t.Fatalf("再次提交失败: %v", err)
 	}
 	if err := sink.Submit(SessionCostEvent{SessionID: "s1", Turn: 2, Decision: SessionCostDecision{Switch: false}}); err != nil {
 		t.Fatalf("不同轮次提交失败: %v", err)
@@ -74,17 +75,53 @@ func TestCostEvent_AsyncSubmitsAndIdempotentByTurn(t *testing.T) {
 	got := append([]SessionCostEvent(nil), landed...)
 	mu.Unlock()
 
-	if len(got) != 2 {
-		t.Fatalf("期望落库 2 条（turn1 幂等去重 + turn2），got %d: %+v", len(got), got)
+	if len(got) != 3 {
+		t.Fatalf("每次发射都应留痕（共 3 次提交），got %d: %+v", len(got), got)
 	}
-	var turn1 int
-	for _, e := range got {
-		if e.SessionID == "s1" && e.Turn == 1 {
-			turn1++
+	if got[0].Seq == got[1].Seq || got[1].Seq == got[2].Seq || got[0].Seq == got[2].Seq {
+		t.Fatalf("Seq 应每次发射唯一，got %d/%d/%d", got[0].Seq, got[1].Seq, got[2].Seq)
+	}
+}
+
+// TestCostEvent_SameTurnSameTransitionNotDeduped 回归：网关 SessionTurn 恒 0 时，
+// 同一会话内「同一轮次、同一 from>to 转移」的多次独立决策（如影子记录、来回切换）必须各自留痕，
+// 不得因幂等键撞车被 asyncwrite 去重丢弃（旧实现用 session:turn:from>to 会把后发的静默丢弃）。
+func TestCostEvent_SameTurnSameTransitionNotDeduped(t *testing.T) {
+	ctx := context.Background()
+	w := asyncwrite.New(asyncwrite.Config{
+		WALPath:    filepath.Join(t.TempDir(), "asyncwrite.wal"),
+		AsyncKinds: map[asyncwrite.Kind]bool{asyncwrite.KindSessionCostEvent: true},
+	})
+	w.Start(ctx)
+	defer func() { _ = w.Shutdown(ctx) }()
+
+	sink := NewAsyncCostEventSink(w).(*asyncCostEventSink)
+	var mu sync.Mutex
+	var landed int
+	sink.persist = func(_ context.Context, _ SessionCostEvent) error {
+		mu.Lock()
+		landed++
+		mu.Unlock()
+		return nil
+	}
+
+	ev := SessionCostEvent{
+		SessionID: "s-collide",
+		Turn:      0, // 网关现状：恒 0
+		Decision:  SessionCostDecision{Switch: false, FromChannelKeyID: 7, ToChannelKeyID: 9},
+	}
+	for i := 0; i < 3; i++ {
+		if err := sink.Submit(ev); err != nil {
+			t.Fatalf("第 %d 次提交失败: %v", i+1, err)
 		}
 	}
-	if turn1 != 1 {
-		t.Fatalf("相同 IdempotencyKey 应只落一次，turn1 落库 %d 次", turn1)
+	waitAsyncDepthZero(t, w)
+
+	mu.Lock()
+	got := landed
+	mu.Unlock()
+	if got != 3 {
+		t.Fatalf("同 (session, turn, from>to) 的 3 次独立决策都应留痕，got %d（旧实现会去重为 1）", got)
 	}
 }
 
