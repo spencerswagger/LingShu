@@ -717,6 +717,8 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 				g.refundAllPreConsume(ctx, token.UserID, pc.Credits, "请求失败退回")
 			}
 			switch {
+			case out.clientGone:
+				attempts = append(attempts, attempt("客户端断开"))
 			case out.billFailed:
 				attempts = append(attempts, attempt("计费失败"))
 			case out.refundPre:
@@ -735,6 +737,11 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 			}
 			// 决策轨迹与失败候选数只算一次，传入 logOutcome 复用（避免重复遍历 attempts）。
 			trail, failed := summarizeAttempts(attempts)
+			// 下游客户端断开（建连阶段取消）：独立结论文案、Info 级、不计失败候选（天然 status<400）。
+			if out.clientGone {
+				g.logOutcome(ctx, slog.LevelInfo, endpoint, model, "客户端已断开，按估算结算", status, false, token, sessionID, attempts, trail, failed, msSince(start))
+				return
+			}
 			if failed > 0 {
 				failedReq := outcomeIsFailure(out) || status >= http.StatusBadRequest
 				lvl := slog.LevelWarn
@@ -958,6 +965,9 @@ type fwdOutcome struct {
 	// interrupted 流式传输中断（内容已部分下发、无法撤回）：语义上请求失败，
 	// 但下游状态码仍为 200，故必须单列，不能靠状态码判定成败。
 	interrupted bool
+	// clientGone 下游客户端/前置代理提前断开导致的请求取消（建连阶段、尚未写出任何响应）：
+	// 与上游失败区分——不视为候选失败、按估算输入结算、不回喂渠道健康。
+	clientGone bool
 	// streamDiag 流式上游失败诊断（仅排查用，随失败候选轨迹落调用日志）：
 	// delivered / first_byte_received / elapsed_ms（连接失败时无上游状态码，故不含 upstream_status）。
 	streamDiag map[string]any
@@ -995,6 +1005,19 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 	up, err := g.client.Do(req)
 	if err != nil {
 		g.logError(rt.Channel.ID, "upstream call failed", err)
+		// 建连阶段因下游客户端/前置代理提前断开而取消：与上游失败区分（详见 serveStream 同分支）。
+		// 非流式无首字节/流式诊断字段，故不带 delivered/firstByteReceived/elapsedMS。
+		if streamClientGone(ctx, err) {
+			g.logUpstreamErr(ctx, slog.LevelInfo, "client gone", endpoint, ureq.Protocol, model, token, routeRes,
+				diagFromRequest(req, ureq.Protocol, ureq.Cred),
+				errInfo{kind: "client_gone", stage: stage, attempt: attempt, retry: false,
+					reason: "下游客户端已断开，请求取消", sessionID: sessionID, durationMs: *msSince(start)})
+			usage := billing.Usage{Input: int64(pc.InputTokens)}
+			_, bid, _ := g.recordBilling(ctx, routeRes, model, token, usage, pricingMode, sessionID, sessionName, pc.Credits, msSince(start), nil)
+			g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
+				"error", "", "failed", "客户端断开", msSince(start), nil, g.callLogDecision(attempts, "客户端断开", pc, routeRes))
+			return &fwdOutcome{responded: true, clientGone: true}
+		}
 		// 连接阶段失败（未送达，可转移）与已送达后失败（多为超时，不转移）语义不同，现场一并记录。
 		g.logUpstreamErr(ctx, slog.LevelWarn, "upstream call failed", endpoint, ureq.Protocol, model, token, routeRes,
 			diagFromRequest(req, ureq.Protocol, ureq.Cred),
@@ -1274,17 +1297,36 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		delivered := wrote.Load()
 		firstByte := gotFirstByte.Load()
 		elapsed := msSince(start)
+		streamDiag := map[string]any{
+			"delivered":           delivered,
+			"first_byte_received": firstByte,
+			"elapsed_ms":          *elapsed,
+		}
+		// 建连阶段（尚未写出任何下游响应）因下游客户端/前置代理提前断开而取消：
+		// 与上游失败区分——归因 client_gone（Info）、不回喂渠道健康、不写 502，
+		// 按估算输入用量结算（多退少补，而非整单退预扣）。
+		if streamClientGone(ctx, err) {
+			g.logUpstreamErr(ctx, slog.LevelInfo, "stream client gone", endpoint, ureq.Protocol, model, token, routeRes,
+				diagFromRequest(req, ureq.Protocol, ureq.Cred),
+				errInfo{kind: "client_gone", stage: stage, attempt: attempt, retry: false,
+					reason: "下游客户端已断开，请求取消", sessionID: sessionID, durationMs: *elapsed,
+					delivered: &delivered, firstByteReceived: &firstByte, elapsedMS: elapsed})
+			usage := billing.Usage{Input: int64(pc.InputTokens)}
+			_, bid, _ := g.recordBilling(ctx, routeRes, model, token, usage, pricingMode, sessionID, sessionName, pc.Credits, elapsed, nil)
+			dec := g.callLogDecision(attempts, "客户端断开", pc, routeRes)
+			for k, v := range streamDiag {
+				dec[k] = v
+			}
+			g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
+				"error", "", "failed", "客户端断开", elapsed, nil, dec)
+			return &fwdOutcome{responded: true, clientGone: true, streamDiag: streamDiag}
+		}
 		g.logUpstreamErr(ctx, slog.LevelWarn, "upstream call failed", endpoint, ureq.Protocol, model, token, routeRes,
 			diagFromRequest(req, ureq.Protocol, ureq.Cred),
 			errInfo{kind: "connect_failed", stage: stage, attempt: attempt,
 				retry: !delivered, reason: "上游流式调用失败：" + err.Error(), sessionID: sessionID, durationMs: *elapsed,
 				delivered: &delivered, firstByteReceived: &firstByte, elapsedMS: elapsed})
 		g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, channel.Feedback{IsSuccess: false, Now: g.now()})
-		streamDiag := map[string]any{
-			"delivered":           delivered,
-			"first_byte_received": firstByte,
-			"elapsed_ms":          *elapsed,
-		}
 		// 调用日志决策轨迹同样带上流式失败诊断（仅新增字段，不改既有键名）。
 		streamDecision := func(reason string) map[string]any {
 			dec := g.callLogDecision(attempts, reason, pc, routeRes)

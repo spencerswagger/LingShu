@@ -1,0 +1,107 @@
+---
+design_type: feature
+created_at: 2026-10-19
+---
+
+# 客户端断开归因（Client-Gone Attribution）设计
+
+> Status: DRAFT (待用户审批；审批通过后进入 writing-plans)
+> Author: agent
+> Last updated: 2026-10-19
+> 背景：一次 502 事故根因定位为「上游首字节 > 30s + 终端客户端 30s 超时先断开」，链路（CDN/两层 nginx/网关）实测可支撑 60s+ 流式无截断，故障归因在「下游断开」而非上游。
+
+## Intent Contract
+
+```
+intent: 让「下游客户端 / 前置代理提前断开导致的请求取消」在网关内被正确归因——观测上不再误记为上游失败、健康上不再污染渠道熔断、计费上对齐 new-api 最新语义（按估算用量结算而非整单退款）。
+constraints:
+  - 不改变正常成功请求、真实上游失败（连接失败 / 5xx / 429 / 401-403）、计费失败、流式中断等既有分支的行为。
+  - 不改变计费公式、系数与预扣三阶段（pre-consume / settle / refund）模型；仅调整 client-gone 这一类的结算与退款落点。
+  - 不改动协议错误策略、协议特性、外部模型别名等既有扩展点。
+  - 无 schema 变更、无迁移、无新增配置项（沿用默认安全态）。
+  - go build / go vet / go test ./... 必须绿；相关路径 go test -race 零告警。
+  - 默认安全态：未能识别为 client-gone 时，行为与改造前逐字节一致。
+success_criteria:
+  - 建连阶段（尚未收到任何上游响应字节）因下游断开而取消：候选级日志 kind=client_gone（Info），不再出现「上游失败 / connect_failed」误记。
+  - 该类失败不再向渠道健康回喂失败样本，不参与错误率与熔断判定。
+  - 该类失败不再整单退还预扣，改为按估算（输入）用量结算；仅当上游明确返回失败时才整单退款。
+  - 请求级结论文案区分「客户端已断开」，且不计入 failed_candidates。
+  - 流式与非流式两条转发路径语义一致。
+risk_level: high   # 触及渠道健康熔断判定与计费/退款结算
+```
+
+## Verification Contract
+
+```
+verify_steps:
+  - run tests: cd backend && go test ./...
+  - race: cd backend && go test -race ./internal/domain/gateway/... ./internal/domain/channel/...
+  - build: cd backend && go build ./... && go vet ./...
+  - check:
+      1) 「下游断开」场景（请求 ctx 取消）分别打到流式与非流式转发入口，断言：候选级日志 kind=client_gone 且级别 Info、无 502 文案；渠道状态机窗口样本数不增、错误率不升；账单按估算输入用量结算（非 0），预扣未被整单退还。
+      2) 对照「真实上游连接失败（未送达）」：仍 kind=connect_failed、retry=true、回喂失败、整单退款不变。
+      3) 对照「已送达后上游超时（已送达且非客户端取消）」：仍按上游失败处理、回喂失败、退款不变。
+      4) HandleStream（已收响应头）阶段的 client-gone：行为与改造前一致（按实际用量计费、回喂成功）。
+      5) 默认安全态：ctx 未取消、Do 正常成功或失败时，行为逐字节同改造前。
+  - confirm:
+      1) client-gone 不再抬升渠道错误率、不再触发排空。
+      2) client-gone 账单可查，金额=估算输入用量对应额度（非 0）。
+      3) go test ./... 与 go test -race 全绿。
+```
+
+## Governance Contract
+
+```
+approval_gates:
+  - 渠道健康熔断语义变更（client-gone 不再计入健康）落地前，人工评审——直接影响全渠道可用性（risk_level high）。
+  - 计费/退款语义变更（client-gone 不再整单退、改为按估算结算）落地前，人工评审——直接影响平台收入与用户对账。
+  - 两条转发路径（流式 / 非流式）均需覆盖，避免口径不一致。
+rollback: 单次提交可整体回滚；本改为纯逻辑与日志、无迁移，回滚无需数据修复。
+ownership: agent 实现，用户验收。
+```
+
+## Scope
+
+| In scope | Out of scope |
+|---|---|
+| 建连阶段（未收到上游首字节）识别 client-gone（流式 + 非流式） | 已收响应头之后（HandleStream）的 client-gone（维持现行为） |
+| client-gone 候选级日志改 kind=client_gone / Info | 既有异常日志体系的整体重构 |
+| client-gone 不回喂渠道健康（中性） | 协议错误策略（按 status/type/code 匹配）扩展 |
+| client-gone 按估算结算、不整单退预扣 | 统一「已送达后失败」的退款策略（留作开放问题） |
+| client-gone 请求级结论区分且不计失败候选 | 前置 nginx / CDN 配置修复（运维侧，另附说明） |
+
+## Decisions
+
+| # | decision | choice | rejected alternatives |
+|---|---|---|---|
+| D1 | 覆盖范围 | 流式 + 非流式两条上游调用失败路径都识别 client-gone | 仅流式（非流式同源缺陷会遗漏） |
+| D2 | 归因 kind | 建连阶段复用既有 client_gone 枚举（此前仅用于 HandleStream） | 新增独立 kind（与既有枚举重复） |
+| D3 | 健康回喂 | 完全不回喂（健康门控关闭，等价不产生样本） | 回喂成功（建连阶段上游未响应，偏乐观）；维持回喂失败（不满足诉求） |
+| D4 | 计费策略 | 对齐 new-api rc.38：按估算（输入）用量结算，不整单退；仅上游明确失败才退 | 整单退预扣（旧 one-api 行为）；按预扣全额计费（无上游失败例外） |
+| D5 | 请求级结论 | 单独区分（reason 明示客户端断开），不计入 failed_candidates | 维持「候选失败」文案（误导） |
+| D6 | 判定信号 | 沿用既有「请求 ctx 已取消 / err 为 context.Canceled」判据 | 仅按超时（无法区分客户端主动断开） |
+
+## Surface
+
+**网关转发路径**：在流式与非流式的上游调用失败分支中，于「已送达 / 未送达」判定之前插入 client-gone 判定；命中即走独立归因分支（Info 日志、kind=client_gone、不回喂健康、按估算结算、不再写 502）。
+
+**渠道健康回喂**：client-gone 分支使用带「是否计入健康」门控的回喂接口，并以「不计入」调用，等价于不产生任何健康样本，避免污染错误率与熔断。
+
+**计费结算**：client-gone 分支以估算用量（输入 token 估计）调用既有结算路径，使预扣按估算多退少补，而不是整单退款；仅当上游明确报失败时维持整单退款。
+
+**请求级结论与决策轨迹**：转发结果的语义标记新增「client-gone」维度，供主循环据此（a）记录不同于「上游失败」的候选原因、（b）在请求级结论中区分文案且不计数为失败候选。
+
+**日志契约**：复用既有结构化异常日志体系；client-gone 仅在「stage / kind / 是否已送达 / 是否收到首字节 / 耗时」等既有字段上体现，不新增敏感字段。
+
+**配置**：无新增配置项。
+
+## Risks & Open Questions
+
+| Risk | Mitigation |
+|---|---|
+| 误判：把非客户端原因的取消（如进程优雅退出取消 ctx）当作 client-gone | 判据与既有 client-gone 判定一致；此类事件极少且不影响计费正确性（按估算结算而非免费）；必要时后续加宽判据 |
+| 计费争议：客户端未收到任何内容却被按输入估算计费 | 与 new-api rc.38 一致并写入文档；如需更宽松可后续加实例级开关（本期不做） |
+| client-gone 不回喂健康 → 极慢渠道致客户端成批断开时该渠道不被熔断 | 慢渠道仍由真实上游失败 / 成功样本 P99 耗时等信号暴露；不回喂仅为「中性」，不奖励 |
+| 「已送达后失败（非客户端取消）」仍整单退预扣，与 rc.38「按估算结算」不一致 | 本期范围限定 client-gone；是否统一留作开放问题，单独评审 |
+| Open question：是否将「非 client-gone 的已送达失败（响应超时）」也改为按估算结算 | 需与上游计费口径、对账一致性一并评审，独立于本次改动 |
+| Open question：请求级 client-gone 结论是否需要独立状态码（499 语义） | 由 writing-plans 阶段确定最小实现（优先复用现有结论通道，避免新增门控分支） |

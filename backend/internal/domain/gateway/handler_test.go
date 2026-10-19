@@ -2236,6 +2236,15 @@ func (t *noWriteTraceTransport) RoundTrip(req *http.Request) (*http.Response, er
 	return t.real.RoundTrip(req)
 }
 
+// canceledTransport 模拟「下游客户端/前置代理提前断开导致的请求取消」：RoundTrip 直接返回
+// context.Canceled（与上游无关，上游并未失败），用于验证 client-gone 归因分支。
+type canceledTransport struct{ calls int32 }
+
+func (t *canceledTransport) RoundTrip(_ *http.Request) (*http.Response, error) {
+	atomic.AddInt32(&t.calls, 1)
+	return nil, context.Canceled
+}
+
 // wroteThenFailTransport 模拟「请求已送达上游后失败」：先主动触发 WroteRequest（wrote=true，
 // 即 delivered=true），再返回错误——对应上游可能已生成并计费、不可转移的响应超时场景。
 type wroteThenFailTransport struct{ calls int32 }
@@ -2334,5 +2343,137 @@ func TestStreamDelivered_AfterDeliveredNoFailover(t *testing.T) {
 	dec, ok := deliveredFailed.Decision.(map[string]any)
 	if !ok || dec["delivered"] != true {
 		t.Errorf("已送达候选 decision.delivered want true, got %v", deliveredFailed.Decision)
+	}
+}
+
+// logLineContaining 返回文本日志中首条包含 substr 的行（TextHandler 每条记录占一行）。
+func logLineContaining(out, substr string) string {
+	for _, ln := range strings.Split(out, "\n") {
+		if strings.Contains(ln, substr) {
+			return ln
+		}
+	}
+	return ""
+}
+
+// Step 1（RED）：流式建连阶段因下游客户端/前置代理提前断开而取消（Do 返回 context.Canceled），
+// 必须归因为 client_gone（Info），不得误记为上游失败、不得写出 502，且不回喂渠道健康。
+// 改造前该测试应失败（RED）。
+func TestClientGone_StreamConnectStage_NoUpstreamFailure(t *testing.T) {
+	live := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer live.Close()
+
+	h := build(t, live.URL)
+	h.gw.streamClient = &http.Client{Transport: &canceledTransport{}}
+	dump := withLogCapture(h)
+
+	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t",
+		`{"model":"gpt-4","stream":true,"messages":[{"role":"user","content":"ping"}]}`)
+	_ = rec
+
+	out := dump()
+	if !strings.Contains(out, "kind=client_gone") {
+		t.Errorf("建连阶段 client-gone 应归因为 kind=client_gone：\n%s", out)
+	}
+	if strings.Contains(out, "上游流式调用失败") {
+		t.Errorf("client-gone 不应误记为上游流式失败：\n%s", out)
+	}
+	if strings.Contains(out, "status=502") {
+		t.Errorf("client-gone 不应写出 502：\n%s", out)
+	}
+	if len(h.chans.feeds) != 0 {
+		t.Errorf("client-gone 不应回喂渠道健康, got %+v", h.chans.feeds)
+	}
+}
+
+// Step 2（RED）：非流式建连阶段因下游客户端断开而取消（gw.client 返回 context.Canceled），
+// 语义与流式一致：kind=client_gone、不含 502、不回喂渠道健康。
+func TestClientGone_NonStreamConnectStage(t *testing.T) {
+	live := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer live.Close()
+
+	h := build(t, live.URL)
+	h.gw.client = &http.Client{Transport: &canceledTransport{}}
+	dump := withLogCapture(h)
+
+	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t",
+		`{"model":"gpt-4","stream":false,"messages":[{"role":"user","content":"ping"}]}`)
+	_ = rec
+
+	out := dump()
+	if !strings.Contains(out, "kind=client_gone") {
+		t.Errorf("建连阶段 client-gone 应归因为 kind=client_gone：\n%s", out)
+	}
+	if strings.Contains(out, "上游调用失败") {
+		t.Errorf("client-gone 不应误记为上游调用失败：\n%s", out)
+	}
+	if strings.Contains(out, "status=502") {
+		t.Errorf("client-gone 不应写出 502：\n%s", out)
+	}
+	if len(h.chans.feeds) != 0 {
+		t.Errorf("client-gone 不应回喂渠道健康, got %+v", h.chans.feeds)
+	}
+}
+
+// Step 3（RED）：client-gone 应按估算输入用量结算（Input>0、Output==0），且不整单退还预扣。
+func TestClientGone_SettlesByEstimateNotFullRefund(t *testing.T) {
+	live := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer live.Close()
+
+	h := build(t, live.URL)
+	fc := &fakeCredit{balance: 5000}
+	h.gw.credit = fc
+	h.billing.credit = fc
+	h.gw.streamClient = &http.Client{Transport: &canceledTransport{}}
+
+	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t",
+		`{"model":"gpt-4","stream":true,"messages":[{"role":"user","content":"ping"}]}`)
+	_ = rec
+
+	if len(h.billing.reqs) != 1 {
+		t.Fatalf("client-gone 应记录一次结算 Record, got %d: %+v", len(h.billing.reqs), h.billing.reqs)
+	}
+	u := h.billing.reqs[0].Tokens
+	if u.Input <= 0 || u.Output != 0 {
+		t.Fatalf("应按估算输入用量结算（Input>0, Output==0）, got %+v", u)
+	}
+	if len(fc.consumed) != 1 {
+		t.Fatalf("want 1 次预扣, got %v", fc.consumed)
+	}
+	pre := fc.consumed[0]
+	for _, r := range fc.refunded {
+		if math.Abs(r-pre) < 0.0001 {
+			t.Fatalf("client-gone 不应整单退还预扣 %.6f, refunded=%v", pre, fc.refunded)
+		}
+	}
+}
+
+// Step 4（RED）：请求级结论文案区分「客户端已断开」，且不计入 failed_candidates。
+// 改造前该测试应失败（RED）。
+func TestClientGone_RequestOutcomeDistinct(t *testing.T) {
+	live := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer live.Close()
+
+	h := build(t, live.URL)
+	h.gw.streamClient = &http.Client{Transport: &canceledTransport{}}
+	dump := withLogCapture(h)
+
+	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t",
+		`{"model":"gpt-4","stream":true,"messages":[{"role":"user","content":"ping"}]}`)
+	_ = rec
+
+	out := dump()
+	line := logLineContaining(out, "gateway request outcome")
+	if line == "" {
+		t.Fatalf("缺少请求级结论日志 gateway request outcome：\n%s", out)
+	}
+	if !strings.Contains(line, "客户端已断开") {
+		t.Errorf("请求级结论 reason 应含「客户端已断开」：\n%s", line)
+	}
+	if !strings.Contains(line, "failed_candidates=0") {
+		t.Errorf("client-gone 不应计入 failed_candidates：\n%s", line)
+	}
+	if strings.Contains(out, "候选失败") {
+		t.Errorf("client-gone 不应出现「候选失败」文案：\n%s", out)
 	}
 }
