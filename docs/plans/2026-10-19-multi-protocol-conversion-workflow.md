@@ -101,7 +101,7 @@ verify:
       kind: exists
 gate: auto
 
-- [ ] **Step 13: 矩阵集成测试（假上游 × 6 方向 × 流式/非流式）**
+- [x] **Step 13: 矩阵集成测试（假上游 × 6 方向 × 流式/非流式）**
 action: 新建 `backend/tests/protocol_conversion_test.go`：起三个协议的假上游（openai-chat / openai-responses / anthropic-messages），对 6 个有序方向分别以入站协议 A 发请求、配置渠道仅支持上游协议 B，断言非流式与流式两条路径：上游收到的请求体为 B 形状、下游收到 A 形状、usage 按 B 解析、直通方向字节级不变（AC-P2-1~AC-P2-4、AC-P2-8）。
 loop: until cd backend && go test ./tests/ -run TestProtocolConversion passes
 max_iterations: 3
@@ -117,7 +117,7 @@ verify:
   check: 路由语义（直通优先/默认开启/AC-18 取代/关闭回退）与流式转换 pump 正确性经人工复核通过
 gate: human
 
-- [ ] **Step 15: 全量测试与构建**
+- [x] **Step 15: 全量测试与构建**
 action: 运行后端全量测试、后端构建与前端构建，确保无回归（含既有 go test ./... 全绿与直通逐字节不回退）。
 loop: false
 max_iterations: 3
