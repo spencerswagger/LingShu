@@ -288,6 +288,9 @@ func TestOutcomeIsFailure(t *testing.T) {
 		{"成功(200)", &fwdOutcome{responded: true, downstreamStatus: http.StatusOK}, false},
 		{"计费失败(402)", &fwdOutcome{responded: true, billFailed: true, downstreamStatus: http.StatusPaymentRequired}, true},
 		{"上游失败(502)", &fwdOutcome{responded: true, refundPre: true, downstreamStatus: http.StatusBadGateway}, true},
+		{"已送达超时(502，按估算结算)", &fwdOutcome{responded: true, upstreamFailed: true, downstreamStatus: http.StatusBadGateway}, true},
+		{"已送达超时(状态码非 4xx/5xx 仍为语义失败)", &fwdOutcome{responded: true, upstreamFailed: true, downstreamStatus: http.StatusOK}, true},
+		{"client-gone(499) 非语义失败", &fwdOutcome{responded: true, clientGone: true, downstreamStatus: 499}, false},
 		{"流式中断(状态码仍 200)", &fwdOutcome{responded: true, interrupted: true, downstreamStatus: http.StatusOK}, true},
 		{"nil", nil, false},
 	}
@@ -452,6 +455,7 @@ func TestStreamClientGone(t *testing.T) {
 		{"下游写失败但请求 ctx 已取消", canceled, errors.New("write tcp: broken pipe"), true},
 		{"herr 为空但请求 ctx 已取消", canceled, nil, true},
 		{"正常读流错误（ctx 存活）", alive, errors.New("unexpected EOF"), false},
+		{"上游超时（ctx 存活）不得误判为客户端断开", alive, context.DeadlineExceeded, false},
 		{"无错误", alive, nil, false},
 	}
 	for _, c := range cases {
