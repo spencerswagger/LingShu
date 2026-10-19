@@ -75,6 +75,7 @@ type fakeConfig struct {
 	tiers   []TierRule
 	tc      TimeCoeffConfig
 	sample  Usage
+	profile SampleProfile
 }
 
 func (f *fakeConfig) R() (int64, error)                    { return f.r, nil }
@@ -82,6 +83,7 @@ func (f *fakeConfig) CnyRate() (float64, error)            { return f.cnyRate, n
 func (f *fakeConfig) ContextTiers() ([]TierRule, error)    { return f.tiers, nil }
 func (f *fakeConfig) TimeConfig() (TimeCoeffConfig, error) { return f.tc, nil }
 func (f *fakeConfig) SampleUsage() (Usage, error)          { return f.sample, nil }
+func (f *fakeConfig) SampleProfile() (SampleProfile, error) { return f.profile, nil }
 func (f *fakeConfig) InvalidateCostConfig()                {}
 func (f *fakeConfig) SetCacheEnabled(bool)                 {}
 

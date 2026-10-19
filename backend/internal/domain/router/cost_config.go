@@ -21,13 +21,22 @@ const cfgSessionCost = "routing.session_cost"
 // 只有在运维显式把 enabled 置为 true 后才允许后续步骤接入会话成本路由策略。
 // 配置缺失、读取失败或解析失败时同样回退到该安全态，避免配置异常放大为路由异常。
 type SessionCostConfig struct {
-	Enabled      bool    `json:"enabled"`
+	Enabled bool `json:"enabled"`
+	// RemainingA/RemainingB/RemainingMin/RemainingMax 是「预计剩余轮数」参数。
+	// 需求已定：剩余轮数**不再按会话位置 k 预测**，取固定值——默认 RemainingA=10、RemainingB=0，
+	// 即 clamp(10 − 0×k, RemainingMin, RemainingMax) ≡ 10。参数保留仅供运维微调
+	//（如需恢复经验式预测，设 RemainingB>0 即可）。会话轮次 k 仅用于决策产物观测。
 	RemainingA   float64 `json:"remaining_a"`
 	RemainingB   float64 `json:"remaining_b"`
 	RemainingMin int     `json:"remaining_min"`
 	RemainingMax int     `json:"remaining_max"`
 	MinRemaining int     `json:"min_remaining"`
 	CooldownSec  int     `json:"cooldown_sec"`
+	// ShadowEnabled 是「影子观测」的独立开关（P0），默认 false：
+	// 开启后，即便未启用切换（Enabled/MidSwitch 任一为 false），也在会话亲和命中且有更优候选时
+	// 产出「若启用则会切换」的假设节省事件（Shadow=true、渠道不变），供账实校准。
+	// 默认关闭，保证安全态下不产生任何额外异步写（WAL/事件流）与可观测副作用。
+	ShadowEnabled bool `json:"shadow_enabled"`
 	// MidSwitch 是「会话中途切换」这一子阶段的独立开关（P2），默认 false 安全态：
 	// 即使 Enabled=true（P1 起点择优已放行），未显式开启本开关也会在中途保持会话亲和、渠道不变。
 	// 与设计 D10「P0 影子只读 → P1 起点择优 → P2 中途切换，逐级开关、可独立回退」一致：
@@ -42,8 +51,8 @@ type SessionCostConfig struct {
 func defaultSessionCostConfig() SessionCostConfig {
 	return SessionCostConfig{
 		Enabled:      false,
-		RemainingA:   12,
-		RemainingB:   1,
+		RemainingA:   10,
+		RemainingB:   0,
 		RemainingMin: 1,
 		RemainingMax: 20,
 		MinRemaining: 1,
@@ -127,6 +136,7 @@ func parseSessionCostConfig(raw []byte) (SessionCostConfig, bool) {
 		CooldownSec  *int     `json:"cooldown_sec"`
 		MidSwitch    *bool    `json:"mid_switch"`
 		MinImprove   *float64 `json:"min_improve"`
+		ShadowEnable *bool    `json:"shadow_enabled"`
 	}
 	if err := json.Unmarshal(raw, &in); err != nil {
 		return SessionCostConfig{}, false
@@ -159,6 +169,9 @@ func parseSessionCostConfig(raw []byte) (SessionCostConfig, bool) {
 	}
 	if in.MinImprove != nil {
 		cfg.MinImprove = *in.MinImprove
+	}
+	if in.ShadowEnable != nil {
+		cfg.ShadowEnabled = *in.ShadowEnable
 	}
 	return cfg, true
 }

@@ -33,6 +33,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"sort"
 	"time"
@@ -63,9 +64,8 @@ type RouteSpec struct {
 	// nil（或未设置）=回落 Sample / 全局 routing.cost_sample。
 	SessionTokens *billing.Usage
 	// SessionTurn 会话位置 k（本会话已完成轮数；0=起点/未知）。
-	// 供会话成本决策的经验式剩余轮数估计；起点择优中重灌代价=0、k 不进本轮花费，故零值不改变起点结果。
-	// 现状：网关组装处恒传 0（见 gateway/handler.go）——「本会话已完成轮数」待 P2 接线，
-	// 当前恒 0（安全态，无路由影响），勿误解为已生效。
+	// 仅用于决策产物的观测（事件 Turn 可回放）与「若改用经验式」时的输入；**不参与剩余轮数计算**
+	//（需求已定剩余轮数为固定值，见 SessionCostConfig.RemainingA/B）。网关经 SessionRegistry.Turns 组装。
 	SessionTurn int
 	// Now 本次路由时刻（零值=回落引擎时钟 e.now()）；供时段系数与决策轨迹求值。
 	Now time.Time
@@ -88,6 +88,11 @@ type RouteResult struct {
 	Cost      float64
 	CostKnown bool    // 成本是否有效（false=单价缺失/全 0，视为最贵）
 	TimeCoeff float64 // 选中候选的时段系数（模型级优先，回落全局/1）
+	// SwitchFromKeyID 非 0 表示本候选是「会话中途切换」的决策目标（原归属渠道密钥 ID）。
+	// 引擎只做决策、**不迁移会话**；由网关在本候选通过可用性/限流校验后调用
+	// SessionRegistry.Migrate 完成迁移（保证会话归属与真实落点一致，见 gateway/handler.go）。
+	// 起点择优不设置（起点无旧渠道、不需迁移）。
+	SwitchFromKeyID int64
 }
 
 // ChannelRoute 单个候选渠道的路由信息，供网关在超限/429 时按序切换渠道（failover）。
