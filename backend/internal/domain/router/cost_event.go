@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strconv"
 	"sync"
 	"time"
@@ -80,24 +81,50 @@ func NewAsyncCostEventSink(w *asyncwrite.Writer, stores ...*SessionCostEventStor
 	return s
 }
 
-// Submit 提交一条会话成本决策产物：Key=session_id 保序，IdempotencyKey=session_id:轮次 幂等。
+// Submit 提交一条会话成本决策产物：Key=session_id 保序，IdempotencyKey=session_id:轮次:from>to 幂等。
+// 幂等键刻意纳入「from>to 转移」：网关侧 SessionTurn 尚未接线（恒 0），若仅用 session:turn，
+// 同会话的「起点」与后续「中途切换」会撞键而被 asyncwrite 去重丢弃，切换事件将不可见。
+// 纳入转移对后既保持「同一决策重放幂等」，又能让起点与各次不同切换各自留痕。
 func (s *asyncCostEventSink) Submit(ev SessionCostEvent) error {
 	if s.w == nil {
 		return s.persistEvent(context.Background(), ev)
 	}
-	payload, err := json.Marshal(ev)
+	payload, err := json.Marshal(sanitizeEventForJSON(ev))
 	if err != nil {
 		return err
 	}
 	return s.w.Submit(asyncwrite.Job{
 		Kind:           asyncwrite.KindSessionCostEvent,
 		Key:            ev.SessionID,
-		IdempotencyKey: ev.SessionID + ":" + strconv.Itoa(ev.Turn),
+		IdempotencyKey: ev.SessionID + ":" + strconv.Itoa(ev.Turn) + ":" + strconv.FormatInt(ev.Decision.FromChannelKeyID, 10) + ">" + strconv.FormatInt(ev.Decision.ToChannelKeyID, 10),
 		Payload:        payload,
 		Exec: func(c context.Context) error {
 			return s.persistEvent(c, ev)
 		},
 	})
+}
+
+// sanitizeEventForJSON 把决策产物里的非有限浮点（NaN/±Inf）归零后再序列化。
+// 背景：paybackLimit 在「新渠道缓存读价 ≥ 旧渠道缓存读价」时无解返回 NaN，而
+// encoding/json 无法序列化 NaN/Inf（报 "unsupported value: NaN"）会导致整条事件提交失败、
+// 中途切换事件被静默丢弃。此处仅对「序列化用的副本」归零，运行时（内存事件存储）仍保留 NaN，
+// 前端把 NaN 渲染为 null（= 未知），语义不受影响。
+func sanitizeEventForJSON(ev SessionCostEvent) SessionCostEvent {
+	fin := func(v float64) float64 {
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return 0
+		}
+		return v
+	}
+	ev.CrossCacheRead = fin(ev.CrossCacheRead)
+	d := ev.Decision
+	d.TurnCostOld = fin(d.TurnCostOld)
+	d.TurnCostNew = fin(d.TurnCostNew)
+	d.RechargeCost = fin(d.RechargeCost)
+	d.PaybackTurns = fin(d.PaybackTurns)
+	d.PaybackLimit = fin(d.PaybackLimit)
+	ev.Decision = d
+	return ev
 }
 
 // persistEvent 调用可选的落地回调；未设置时 no-op（该阶段仅经 asyncwrite 入队 / WAL 留痕）。
