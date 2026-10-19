@@ -12,7 +12,7 @@ intent: 在管理端新增「成本」菜单，提供三块能力——(1) 按�
 constraints:
   - 纯只读：不改路由、不改计费公式、不改对外售价与响应语义；不新增同步写路径。
   - 数据源沿用既有 billing_records（三段 token、credits_consumed、cost_credits、session_id、channel_key_id、internal_model_id、call_time）与 channel_models / external_models / channel_keys。
-  - 时间范围默认「全部历史」；全平台默认值只用 token 统计（命中率、输入输出比、每轮输入），不使用金额，避免被历史旧价干扰。
+  - 时间范围默认「全部历史」，且统计口径**仅含 status='completed' 的调用**（与既有消耗口径 summary.go 一致）；全平台默认值只用 token 统计（命中率、输入输出比、每轮输入），不使用金额，避免被历史旧价干扰。
   - 金额单位一律「积分」，不做 R 值/汇率折算。
   - 仅管理端（/admin），开发者端不加。
   - 复用既有前端范式（VChart.vue 的 ECharts 封装、api/admin.ts、Element Plus 表格/选择器/输入框）与后端 console 只读接口风格。
@@ -64,7 +64,7 @@ ownership: 前端维护者 + 后端维护者
 | # | 决策点 | 选择 | 放弃的备选 |
 | --- | --- | --- | --- |
 | 1 | 数据源 | billing_records 聚合（含三段 token、cost_credits、credits_consumed） | 从 call_logs 反算（token 不在 call_logs）/ 实时重算定价 |
-| 2 | 统计时间范围 | 全部历史（默认） | 近 7/30 天 |
+| 2 | 统计时间范围 | 全部历史（默认），仅含 status='completed' | 近 7/30 天 / 纳入 failed 账单 |
 | 3 | 默认值口径 | 只用 token 求和（命中率、输入输出比、每轮输入），与金额解耦 | 用金额反推（会被旧价干扰） |
 | 4 | 金额单位 | 仅积分 | 积分 + 折算元 |
 | 5 | 菜单范围 | 仅管理端 | 两端 |
