@@ -89,7 +89,7 @@ func (s *asyncCostEventSink) Submit(ev SessionCostEvent) error {
 	if s.w == nil {
 		return s.persistEvent(context.Background(), ev)
 	}
-	payload, err := json.Marshal(sanitizeEventForJSON(ev))
+	payload, err := marshalEventForJSON(ev)
 	if err != nil {
 		return err
 	}
@@ -104,27 +104,76 @@ func (s *asyncCostEventSink) Submit(ev SessionCostEvent) error {
 	})
 }
 
-// sanitizeEventForJSON 把决策产物里的非有限浮点（NaN/±Inf）归零后再序列化。
-// 背景：paybackLimit 在「新渠道缓存读价 ≥ 旧渠道缓存读价」时无解返回 NaN，而
-// encoding/json 无法序列化 NaN/Inf（报 "unsupported value: NaN"）会导致整条事件提交失败、
-// 中途切换事件被静默丢弃。此处仅对「序列化用的副本」归零，运行时（内存事件存储）仍保留 NaN，
-// 前端把 NaN 渲染为 null（= 未知），语义不受影响。
-func sanitizeEventForJSON(ev SessionCostEvent) SessionCostEvent {
-	fin := func(v float64) float64 {
-		if math.IsNaN(v) || math.IsInf(v, 0) {
-			return 0
+// sessionCostEventWire 是 SessionCostEvent 的 WAL 线格式：在原有字段之外额外记录
+// 「非有限浮点（NaN/±Inf）」的字段名。
+// 原因：encoding/json 无法编码 NaN/Inf（报 "unsupported value: NaN"），会导致整条事件提交失败、
+// 中途切换事件被静默丢弃，故编码前须把这些值规整为 0；但仅归零会让「未知」在崩溃重启重放后
+// 退化成 0（前端把 NaN 渲染为 null=未知，0 会被当成真实值）。故用 __non_finite 记录字段名，
+// 重放时据此还原为 NaN，保证 WAL 往返不改变语义。
+type sessionCostEventWire struct {
+	SessionCostEvent
+	NonFinite []string `json:"__non_finite,omitempty"`
+}
+
+// 线格式中「非有限浮点」字段标识（与 Payload 的 JSON 键一致）。
+const (
+	fieldCrossCacheRead = "cross_cache_read"
+	fieldTurnCostOld    = "TurnCostOld"
+	fieldTurnCostNew    = "TurnCostNew"
+	fieldRechargeCost   = "RechargeCost"
+	fieldPaybackTurns   = "PaybackTurns"
+	fieldPaybackLimit   = "PaybackLimit"
+)
+
+// isNonFiniteFloat 判定 NaN/±Inf。
+func isNonFiniteFloat(v float64) bool { return math.IsNaN(v) || math.IsInf(v, 0) }
+
+// marshalEventForJSON 把决策产物编码为 asyncwrite 的 Payload：非有限浮点先归零再序列化，
+// 并在 __non_finite 记录其字段名，供 unmarshalEventFromJSON 还原为 NaN。
+// 仅作用于「序列化副本」，不修改传入的 ev（运行时/内存事件存储仍保留 NaN）。
+func marshalEventForJSON(ev SessionCostEvent) ([]byte, error) {
+	w := sessionCostEventWire{SessionCostEvent: ev}
+	mark := func(name string, v *float64) {
+		if isNonFiniteFloat(*v) {
+			*v = 0
+			w.NonFinite = append(w.NonFinite, name)
 		}
-		return v
 	}
-	ev.CrossCacheRead = fin(ev.CrossCacheRead)
-	d := ev.Decision
-	d.TurnCostOld = fin(d.TurnCostOld)
-	d.TurnCostNew = fin(d.TurnCostNew)
-	d.RechargeCost = fin(d.RechargeCost)
-	d.PaybackTurns = fin(d.PaybackTurns)
-	d.PaybackLimit = fin(d.PaybackLimit)
-	ev.Decision = d
-	return ev
+	mark(fieldCrossCacheRead, &w.CrossCacheRead)
+	mark(fieldTurnCostOld, &w.Decision.TurnCostOld)
+	mark(fieldTurnCostNew, &w.Decision.TurnCostNew)
+	mark(fieldRechargeCost, &w.Decision.RechargeCost)
+	mark(fieldPaybackTurns, &w.Decision.PaybackTurns)
+	mark(fieldPaybackLimit, &w.Decision.PaybackLimit)
+	return json.Marshal(w)
+}
+
+// unmarshalEventFromJSON 是 marshalEventForJSON 的逆：解码后按 __non_finite 还原为 NaN。
+// 兼容旧格式（无 __non_finite）：此时非有限值退化为 0，与历史行为一致。
+func unmarshalEventFromJSON(payload []byte) (SessionCostEvent, error) {
+	var w sessionCostEventWire
+	if err := json.Unmarshal(payload, &w); err != nil {
+		return SessionCostEvent{}, fmt.Errorf("decode session cost event payload: %w", err)
+	}
+	ev := w.SessionCostEvent
+	nan := math.NaN()
+	for _, name := range w.NonFinite {
+		switch name {
+		case fieldCrossCacheRead:
+			ev.CrossCacheRead = nan
+		case fieldTurnCostOld:
+			ev.Decision.TurnCostOld = nan
+		case fieldTurnCostNew:
+			ev.Decision.TurnCostNew = nan
+		case fieldRechargeCost:
+			ev.Decision.RechargeCost = nan
+		case fieldPaybackTurns:
+			ev.Decision.PaybackTurns = nan
+		case fieldPaybackLimit:
+			ev.Decision.PaybackLimit = nan
+		}
+	}
+	return ev, nil
 }
 
 // persistEvent 调用可选的落地回调；未设置时 no-op（该阶段仅经 asyncwrite 入队 / WAL 留痕）。
@@ -137,9 +186,9 @@ func (s *asyncCostEventSink) persistEvent(ctx context.Context, ev SessionCostEve
 
 // replay 崩溃恢复重放：解码决策产物并交落地回调重建副作用（无回调时 no-op 幂等）。
 func (s *asyncCostEventSink) replay(ctx context.Context, _ string, payload []byte) error {
-	var ev SessionCostEvent
-	if err := json.Unmarshal(payload, &ev); err != nil {
-		return fmt.Errorf("decode session cost event payload: %w", err)
+	ev, err := unmarshalEventFromJSON(payload)
+	if err != nil {
+		return err
 	}
 	return s.persistEvent(ctx, ev)
 }
