@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
-import { Refresh, CircleCheck, VideoPause, CircleClose } from '@element-plus/icons-vue'
+import { Refresh } from '@element-plus/icons-vue'
 import {
   getServiceStatus,
   probeChannelKey,
@@ -20,6 +20,7 @@ import {
   type ExternalModelItem,
 } from '@/api/admin'
 import StatusTag from '@/components/StatusTag.vue'
+import StateActions from '@/components/StateActions.vue'
 import ErrorBubble from '@/components/ErrorBubble.vue'
 import { fmtDateTime } from '@/utils/format'
 
@@ -920,20 +921,16 @@ onUnmounted(stopTimer)
                     <div class="cm-name">{{ cell(selectedRow, 'internal').name }}</div>
                     <div class="cm-line">
                       <StatusTag :value="selectedRow.model ? selectedRow.model.View.State : 'NORMAL'" />
-                      <span v-if="selectedRow.model" class="icon-ops">
-                        <el-tooltip content="重新探测该模型" placement="top">
-                          <el-button text circle size="small" class="ico-probe" :icon="Refresh" :loading="opLoading" :disabled="opLoading" @click="doProbeModel" />
-                        </el-tooltip>
-                        <el-tooltip content="置为正常" placement="top">
-                          <el-button text circle size="small" class="ico-ok" :icon="CircleCheck" :disabled="opLoading || selectedRow.model.View.State === 'NORMAL'" @click="doState('model', 'normal')" />
-                        </el-tooltip>
-                        <el-tooltip content="排空" placement="top">
-                          <el-button text circle size="small" class="ico-warn" :icon="VideoPause" :disabled="opLoading || selectedRow.model.View.State === 'DRAIN'" @click="doState('model', 'drain')" />
-                        </el-tooltip>
-                        <el-tooltip content="禁用" placement="top">
-                          <el-button text circle size="small" class="ico-bad" :icon="CircleClose" :disabled="opLoading || selectedRow.model.View.State === 'DISABLED'" @click="doState('model', 'disable')" />
-                        </el-tooltip>
-                      </span>
+                      <StateActions
+                        v-if="selectedRow.model"
+                        :state="selectedRow.model.View.State"
+                        :loading="opLoading"
+                        show-probe
+                        probe-title="重新探测该模型"
+                        class="cm-ops"
+                        @probe="doProbeModel"
+                        @set="(a) => doState('model', a)"
+                      />
                     </div>
                   </div>
                 </td>
@@ -951,20 +948,16 @@ onUnmounted(stopTimer)
                     </div>
                     <div class="cm-line">
                       <StatusTag :value="selectedRow.key ? selectedRow.key.View.State : 'NORMAL'" />
-                      <span v-if="selectedRow.key" class="icon-ops">
-                        <el-tooltip content="重新探测该密钥" placement="top">
-                          <el-button text circle size="small" class="ico-probe" :icon="Refresh" :loading="opLoading" :disabled="opLoading" @click="doProbeKey" />
-                        </el-tooltip>
-                        <el-tooltip content="置为正常" placement="top">
-                          <el-button text circle size="small" class="ico-ok" :icon="CircleCheck" :disabled="opLoading || selectedRow.key.View.State === 'NORMAL'" @click="doState('key', 'normal')" />
-                        </el-tooltip>
-                        <el-tooltip content="排空" placement="top">
-                          <el-button text circle size="small" class="ico-warn" :icon="VideoPause" :disabled="opLoading || selectedRow.key.View.State === 'DRAIN'" @click="doState('key', 'drain')" />
-                        </el-tooltip>
-                        <el-tooltip content="禁用" placement="top">
-                          <el-button text circle size="small" class="ico-bad" :icon="CircleClose" :disabled="opLoading || selectedRow.key.View.State === 'DISABLED'" @click="doState('key', 'disable')" />
-                        </el-tooltip>
-                      </span>
+                      <StateActions
+                        v-if="selectedRow.key"
+                        :state="selectedRow.key.View.State"
+                        :loading="opLoading"
+                        show-probe
+                        probe-title="重新探测该密钥"
+                        class="cm-ops"
+                        @probe="doProbeKey"
+                        @set="(a) => doState('key', a)"
+                      />
                     </div>
                   </div>
                 </td>
@@ -1245,39 +1238,6 @@ onUnmounted(stopTimer)
   align-items: center;
   gap: 6px;
   flex-wrap: wrap;
-}
-/* 图标操作按钮：无边框，仅图标 + 悬浮底色 */
-.icon-ops {
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
-}
-.icon-ops .el-button {
-  margin-left: 0 !important;
-  width: 30px;
-  height: 30px;
-  padding: 0;
-  font-size: 17px;
-  color: var(--color-text-secondary);
-}
-.icon-ops .el-button .el-icon {
-  font-size: 17px;
-}
-.icon-ops .el-button:hover {
-  background: rgba(99, 102, 241, 0.1);
-}
-.icon-ops .ico-ok {
-  color: var(--color-success);
-}
-.icon-ops .ico-warn {
-  color: var(--color-warning);
-}
-.icon-ops .ico-bad {
-  color: var(--color-danger);
-}
-.icon-ops .el-button.is-disabled {
-  color: var(--el-text-color-disabled) !important;
-  background: transparent;
 }
 /* 「当前 / 阈值」内联对：灯 + 数值 */
 .pair {

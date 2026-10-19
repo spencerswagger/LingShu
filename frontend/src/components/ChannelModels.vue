@@ -23,6 +23,7 @@ import {
 import ModelPricing from '@/components/ModelPricing.vue'
 import ModelPriceCatalog from '@/components/ModelPriceCatalog.vue'
 import StatusTag from '@/components/StatusTag.vue'
+import StateActions from '@/components/StateActions.vue'
 import ErrorBubble from '@/components/ErrorBubble.vue'
 
 const props = defineProps<{
@@ -594,9 +595,7 @@ function onRemoveRow(index: number) {
                 <StatusTag :value="row.State" style="cursor: pointer" />
               </template>
               <div class="pop-actions">
-                <el-button v-if="row.State !== 'NORMAL'" size="small" type="success" @click="onToggleState(row, 'normal')">正常</el-button>
-                <el-button v-if="row.State !== 'DRAIN'" size="small" type="warning" @click="onToggleState(row, 'drain')">排空</el-button>
-                <el-button v-if="row.State !== 'DISABLED'" size="small" type="danger" @click="onToggleState(row, 'disable')">禁用</el-button>
+                <StateActions :state="row.State" @set="(a) => onToggleState(row, a)" />
               </div>
             </el-popover>
             <StatusTag v-else :value="row.State" />

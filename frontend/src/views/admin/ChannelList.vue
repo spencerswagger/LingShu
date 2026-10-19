@@ -12,6 +12,7 @@ import {
   type ChannelKeyState,
 } from '@/api/admin'
 import StatusTag from '@/components/StatusTag.vue'
+import StateActions from '@/components/StateActions.vue'
 import ErrorBubble from '@/components/ErrorBubble.vue'
 import ColumnFilter from '@/components/ColumnFilter.vue'
 
@@ -221,9 +222,7 @@ function onRowClick(row: AdminChannel, _column: unknown, event: Event) {
                   <span class="key-name" :title="k.KeyName">{{ k.KeyName }}</span>
                   <StatusTag :value="k.State" />
                   <div class="pop-actions">
-                    <el-button v-if="k.State !== 'NORMAL'" size="small" type="success" @click="onSetKeyState(row, k, 'normal')">正常</el-button>
-                    <el-button v-if="k.State !== 'DRAIN'" size="small" type="warning" @click="onSetKeyState(row, k, 'drain')">排空</el-button>
-                    <el-button v-if="k.State !== 'DISABLED'" size="small" type="danger" @click="onSetKeyState(row, k, 'disable')">禁用</el-button>
+                    <StateActions :state="k.State" @set="(a) => onSetKeyState(row, k, a)" />
                   </div>
                 </div>
               </template>
