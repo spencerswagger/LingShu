@@ -719,11 +719,13 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 			if out.refundPre {
 				g.refundAllPreConsume(ctx, token.UserID, pc.Credits, "请求失败退回")
 			}
+			// billFailed 优先：结算失败是最需处置的终态（预扣不退、杜绝赊账），
+			// 即便同时命中 client-gone/upstreamFailed 也按「计费失败」归因。
 			switch {
-			case out.clientGone:
-				attempts = append(attempts, attempt(reasonClientGone))
 			case out.billFailed:
 				attempts = append(attempts, attempt("计费失败"))
+			case out.clientGone:
+				attempts = append(attempts, attempt(reasonClientGone))
 			case out.upstreamFailed:
 				attempts = append(attempts, attempt("上游失败"))
 			case out.refundPre:
@@ -1035,7 +1037,8 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 				"error", "", "failed", reasonClientGone, msSince(start), nil, g.callLogDecision(attempts, reasonClientGone, pc, routeRes))
 			// 下游确已断开：写回 499（不写 body），供访问日志与请求级结论区分 client-gone 与成功。
 			w.WriteHeader(statusClientClosedRequest)
-			return &fwdOutcome{responded: true, clientGone: true, downstreamStatus: statusClientClosedRequest}
+			// 结算失败置 billFailed（预扣不退=对齐既有 billFailed 语义）。
+			return &fwdOutcome{responded: true, clientGone: true, billFailed: berr != nil, downstreamStatus: statusClientClosedRequest}
 		}
 		// 连接阶段失败（未送达，可转移）与已送达后失败（多为超时，不转移）语义不同，现场一并记录。
 		g.logUpstreamErr(ctx, slog.LevelWarn, "upstream call failed", endpoint, ureq.Protocol, model, token, routeRes,
@@ -1063,7 +1066,8 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
 			"error", "", "failed", "上游请求失败（已送达，不转移）", dur, nil, g.callLogDecision(attempts, "上游请求失败", pc, routeRes))
 		writeOpenAIError(w, http.StatusBadGateway, msgUpstreamDown)
-		return &fwdOutcome{responded: true, upstreamFailed: true, downstreamStatus: http.StatusBadGateway}
+		// 结算失败置 billFailed（预扣不退=对齐既有 billFailed 语义），归因优先于 upstreamFailed。
+		return &fwdOutcome{responded: true, upstreamFailed: true, billFailed: berr != nil, downstreamStatus: http.StatusBadGateway}
 	}
 	defer up.Body.Close()
 
@@ -1349,7 +1353,8 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 				"error", "", "failed", reasonClientGone, elapsed, nil, dec)
 			// 下游确已断开：写回 499（不写 body），供访问日志与请求级结论区分 client-gone 与成功。
 			w.WriteHeader(statusClientClosedRequest)
-			return &fwdOutcome{responded: true, clientGone: true, downstreamStatus: statusClientClosedRequest, streamDiag: streamDiag}
+			// 结算失败置 billFailed（预扣不退=对齐既有 billFailed 语义）。
+			return &fwdOutcome{responded: true, clientGone: true, billFailed: berr != nil, downstreamStatus: statusClientClosedRequest, streamDiag: streamDiag}
 		}
 		g.logUpstreamErr(ctx, slog.LevelWarn, "upstream call failed", endpoint, ureq.Protocol, model, token, routeRes,
 			diagFromRequest(req, ureq.Protocol, ureq.Cred),
@@ -1384,7 +1389,8 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
 			"error", "", "failed", "上游流式请求失败（已送达，不转移）", elapsed, nil, streamDecision("上游请求失败"))
 		writeOpenAIError(w, http.StatusBadGateway, msgUpstreamDown)
-		return &fwdOutcome{responded: true, upstreamFailed: true, downstreamStatus: http.StatusBadGateway, streamDiag: streamDiag}
+		// 结算失败置 billFailed（预扣不退=对齐既有 billFailed 语义），归因优先于 upstreamFailed。
+		return &fwdOutcome{responded: true, upstreamFailed: true, billFailed: berr != nil, downstreamStatus: http.StatusBadGateway, streamDiag: streamDiag}
 	}
 	defer up.Body.Close()
 
