@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
-import { Refresh } from '@element-plus/icons-vue'
+import { Refresh, CircleCheck, VideoPause, CircleClose } from '@element-plus/icons-vue'
 import {
   getServiceStatus,
   probeChannelKey,
@@ -18,7 +18,6 @@ import {
   type MachineMetrics,
   type CandidateItem,
   type ExternalModelItem,
-  type ReliabilityConfig,
 } from '@/api/admin'
 import StatusTag from '@/components/StatusTag.vue'
 import ErrorBubble from '@/components/ErrorBubble.vue'
@@ -446,10 +445,6 @@ function compact(v: number): string {
   if (abs >= 1e3) return `${(v / 1e3).toFixed(2)}K`
   return fmtInt(v)
 }
-// 「RPM 当前/上限 · TPM 当前/上限」文本（表格与弹窗共用）。
-function rpmTpmText(rpm: number, rpmLimit: number, tpm: number, tpmLimit: number): string {
-  return `RPM ${fmtInt(rpm)}/${fmtInt(rpmLimit)} · TPM ${compact(tpm)}/${compact(tpmLimit)}`
-}
 // 模型级 RPM/TPM：（渠道 × 内部模型）级；模型折叠时按组聚合（该行覆盖模型的合计）。
 function modelRpmVal(r: MatrixRow): number {
   if (modelAxis.value) return r.model ? r.model.RPM : 0
@@ -517,16 +512,29 @@ function lm(row: MatrixRow): LimitCell {
   return limitsByRow.value[row._id] ?? EMPTY_LIMIT
 }
 
-// 弹窗展示用：可靠性阈值与实时窗口文本。
+// 弹窗展示用：判定阈值与实时窗口文本。
 function p99(ms: number): string {
   if (!Number.isFinite(ms)) return '—'
   return ms >= 1000 ? `${Number((ms / 1000).toFixed(1))}s` : `${ms}ms`
 }
-function relText(r: ReliabilityConfig): string {
-  return `错误率 <${r.ErrorRatePct}% · 429 <${r.Rate429Pct}% · P99 <${p99(r.P99LatencyMS)}`
-}
 function metricsText(m: MachineMetrics): string {
   return `错误率 ${pct(m.ErrorRatePct)} · 429 ${pct(m.Rate429Pct)} · P99 ${p99(m.P99LatencyMS)}`
+}
+// 「当前 / 阈值」对（弹窗容量与健康列用）：cur 为 null 时显示 — 且灯为灰。
+function pairNum(cur: number | null, limit: number): string {
+  return `${cur === null ? '—' : fmtInt(cur)} / ${fmtInt(limit)}`
+}
+function pairCompact(cur: number | null, limit: number): string {
+  return `${cur === null ? '—' : compact(cur)} / ${compact(limit)}`
+}
+function pairPct(cur: number | null, limit: number): string {
+  return `${cur === null ? '—' : pct(cur)} / ${pct(limit)}`
+}
+function pairMs(cur: number | null, limit: number): string {
+  return `${cur === null ? '—' : p99(cur)} / ${p99(limit)}`
+}
+function metricLamp(cur: number | null, limit: number): string {
+  return cur === null || !Number.isFinite(cur) ? 'off' : usageLamp(cur, limit)
 }
 // 探测时间展示：空值统一用「—」占位，与其它空值占位一致。
 function dt(v?: string | null): string {
@@ -898,76 +906,130 @@ onUnmounted(stopTimer)
               </tr>
             </thead>
             <tbody>
-              <tr class="cmp-section"><td colspan="5">标识</td></tr>
+              <!-- 基本信息：名称 + 状态 + 操作（合成一行，不再各自成块） -->
               <tr>
-                <td class="cmp-field">名称</td>
-                <td>{{ cell(selectedRow, 'external').name }}</td>
-                <td>{{ cell(selectedRow, 'internal').name }}</td>
-                <td>{{ cell(selectedRow, 'channel').name }}</td>
+                <td class="cmp-field">基本信息</td>
                 <td>
-                  <span>{{ cell(selectedRow, 'key').name }}</span>
-                  <span v-if="cell(selectedRow, 'key').sub" class="cmp-sub">尾号 {{ cell(selectedRow, 'key').sub }}</span>
+                  <div class="cell-main">
+                    <div class="cm-name">{{ cell(selectedRow, 'external').name }}</div>
+                    <div class="cm-sub">{{ selectedRow.model ? (extEnabledOf(selectedRow.model.View.ExternalModelID) ? '启用' : '停用') : '—' }}</div>
+                  </div>
                 </td>
-              </tr>
-
-              <tr class="cmp-section"><td colspan="5">可用性</td></tr>
-              <tr>
-                <td class="cmp-field">状态</td>
-                <td>{{ selectedRow.model ? (extEnabledOf(selectedRow.model.View.ExternalModelID) ? '启用' : '停用') : '—' }}</td>
-                <td><StatusTag :value="selectedRow.model ? selectedRow.model.View.State : 'NORMAL'" /></td>
-                <td class="cmp-muted">—</td>
-                <td><StatusTag :value="selectedRow.key ? selectedRow.key.View.State : 'NORMAL'" /></td>
+                <td>
+                  <div class="cell-main">
+                    <div class="cm-name">{{ cell(selectedRow, 'internal').name }}</div>
+                    <div class="cm-line">
+                      <StatusTag :value="selectedRow.model ? selectedRow.model.View.State : 'NORMAL'" />
+                      <span v-if="selectedRow.model" class="icon-ops">
+                        <el-tooltip content="重新探测该模型" placement="top">
+                          <el-button text circle size="small" class="ico-probe" :icon="Refresh" :loading="opLoading" :disabled="opLoading" @click="doProbeModel" />
+                        </el-tooltip>
+                        <el-tooltip content="置为正常" placement="top">
+                          <el-button text circle size="small" class="ico-ok" :icon="CircleCheck" :disabled="opLoading || selectedRow.model.View.State === 'NORMAL'" @click="doState('model', 'normal')" />
+                        </el-tooltip>
+                        <el-tooltip content="排空" placement="top">
+                          <el-button text circle size="small" class="ico-warn" :icon="VideoPause" :disabled="opLoading || selectedRow.model.View.State === 'DRAIN'" @click="doState('model', 'drain')" />
+                        </el-tooltip>
+                        <el-tooltip content="禁用" placement="top">
+                          <el-button text circle size="small" class="ico-bad" :icon="CircleClose" :disabled="opLoading || selectedRow.model.View.State === 'DISABLED'" @click="doState('model', 'disable')" />
+                        </el-tooltip>
+                      </span>
+                    </div>
+                  </div>
+                </td>
+                <td>
+                  <div class="cell-main">
+                    <div class="cm-name">{{ cell(selectedRow, 'channel').name }}</div>
+                    <div class="cm-sub">{{ selectedRow.channel.View.Protocol }}</div>
+                  </div>
+                </td>
+                <td>
+                  <div class="cell-main">
+                    <div class="cm-name">
+                      {{ cell(selectedRow, 'key').name }}
+                      <span v-if="cell(selectedRow, 'key').sub" class="cm-sub-inline">尾号 {{ cell(selectedRow, 'key').sub }}</span>
+                    </div>
+                    <div class="cm-line">
+                      <StatusTag :value="selectedRow.key ? selectedRow.key.View.State : 'NORMAL'" />
+                      <span v-if="selectedRow.key" class="icon-ops">
+                        <el-tooltip content="重新探测该密钥" placement="top">
+                          <el-button text circle size="small" class="ico-probe" :icon="Refresh" :loading="opLoading" :disabled="opLoading" @click="doProbeKey" />
+                        </el-tooltip>
+                        <el-tooltip content="置为正常" placement="top">
+                          <el-button text circle size="small" class="ico-ok" :icon="CircleCheck" :disabled="opLoading || selectedRow.key.View.State === 'NORMAL'" @click="doState('key', 'normal')" />
+                        </el-tooltip>
+                        <el-tooltip content="排空" placement="top">
+                          <el-button text circle size="small" class="ico-warn" :icon="VideoPause" :disabled="opLoading || selectedRow.key.View.State === 'DRAIN'" @click="doState('key', 'drain')" />
+                        </el-tooltip>
+                        <el-tooltip content="禁用" placement="top">
+                          <el-button text circle size="small" class="ico-bad" :icon="CircleClose" :disabled="opLoading || selectedRow.key.View.State === 'DISABLED'" @click="doState('key', 'disable')" />
+                        </el-tooltip>
+                      </span>
+                    </div>
+                  </div>
+                </td>
               </tr>
 
               <tr class="cmp-section"><td colspan="5">接入</td></tr>
               <tr>
-                <td class="cmp-field">协议 / 接口地址</td>
+                <td class="cmp-field">接口地址</td>
                 <td class="cmp-muted">—</td>
                 <td class="cmp-muted">—</td>
-                <td>
-                  <div>{{ selectedRow.channel.View.Protocol }}</div>
-                  <div class="cmp-sub">{{ selectedRow.channel.View.BaseURL }}</div>
-                </td>
+                <td class="cmp-sub-block">{{ selectedRow.channel.View.BaseURL }}</td>
                 <td class="cmp-muted">—</td>
               </tr>
               <tr>
-                <td class="cmp-field">路由优先级</td>
+                <td class="cmp-field">路由优先级<span class="cmp-sub">越大越先</span></td>
                 <td class="cmp-muted">—</td>
                 <td class="cmp-muted">—</td>
-                <td>{{ selectedRow.channel.View.Priority }}<span class="cmp-sub">数字越大越先路由</span></td>
+                <td>{{ selectedRow.channel.View.Priority }}</td>
                 <td class="cmp-muted">—</td>
               </tr>
 
-              <tr class="cmp-section"><td colspan="5">容量（当前 / 上限）</td></tr>
+              <tr class="cmp-section"><td colspan="5">容量</td></tr>
               <tr>
-                <td class="cmp-field">限流窗口</td>
+                <td class="cmp-field">RPM</td>
                 <td class="cmp-muted">—</td>
-                <td>{{ selectedRow.model ? rpmTpmText(selectedRow.model.RPM, selectedRow.model.RPMLimit, selectedRow.model.TPM, selectedRow.model.TPMLimit) : '—' }}</td>
-                <td>{{ rpmTpmText(selectedRow.channel.RPM, selectedRow.channel.RPMLimit, selectedRow.channel.TPM, selectedRow.channel.TPMLimit) }}</td>
-                <td>{{ selectedRow.keys.length ? rpmTpmText(keyRpmVal(selectedRow), keyRpmLimit(selectedRow), keyTpmVal(selectedRow), keyTpmLimit(selectedRow)) : '—' }}</td>
+                <td><span class="pair"><span class="lamp" :data-state="metricLamp(selectedRow.model?.RPM ?? null, selectedRow.model?.RPMLimit ?? 0)" />{{ selectedRow.model ? pairNum(selectedRow.model.RPM, selectedRow.model.RPMLimit) : '—' }}</span></td>
+                <td><span class="pair"><span class="lamp" :data-state="metricLamp(selectedRow.channel.RPM, selectedRow.channel.RPMLimit)" />{{ pairNum(selectedRow.channel.RPM, selectedRow.channel.RPMLimit) }}</span></td>
+                <td><span v-if="selectedRow.keys.length" class="pair"><span class="lamp" :data-state="metricLamp(keyRpmVal(selectedRow), keyRpmLimit(selectedRow))" />{{ pairNum(keyRpmVal(selectedRow), keyRpmLimit(selectedRow)) }}</span><span v-else class="cmp-muted">—</span></td>
+              </tr>
+              <tr>
+                <td class="cmp-field">TPM</td>
+                <td class="cmp-muted">—</td>
+                <td><span class="pair"><span class="lamp" :data-state="metricLamp(selectedRow.model?.TPM ?? null, selectedRow.model?.TPMLimit ?? 0)" />{{ selectedRow.model ? pairCompact(selectedRow.model.TPM, selectedRow.model.TPMLimit) : '—' }}</span></td>
+                <td><span class="pair"><span class="lamp" :data-state="metricLamp(selectedRow.channel.TPM, selectedRow.channel.TPMLimit)" />{{ pairCompact(selectedRow.channel.TPM, selectedRow.channel.TPMLimit) }}</span></td>
+                <td><span v-if="selectedRow.keys.length" class="pair"><span class="lamp" :data-state="metricLamp(keyTpmVal(selectedRow), keyTpmLimit(selectedRow))" />{{ pairCompact(keyTpmVal(selectedRow), keyTpmLimit(selectedRow)) }}</span><span v-else class="cmp-muted">—</span></td>
               </tr>
               <tr>
                 <td class="cmp-field">并发会话</td>
                 <td class="cmp-muted">—</td>
                 <td class="cmp-muted">—</td>
                 <td class="cmp-muted">—</td>
-                <td>{{ selectedRow.keys.length ? `${fmtInt(sessionsVal(selectedRow))} / ${fmtInt(sessionsLimit(selectedRow))}` : '—' }}</td>
+                <td><span v-if="selectedRow.keys.length" class="pair"><span class="lamp" :data-state="metricLamp(sessionsVal(selectedRow), sessionsLimit(selectedRow))" />{{ pairNum(sessionsVal(selectedRow), sessionsLimit(selectedRow)) }}</span><span v-else class="cmp-muted">—</span></td>
               </tr>
 
               <tr class="cmp-section"><td colspan="5">健康</td></tr>
               <tr>
-                <td class="cmp-field">判定阈值<span class="cmp-sub">（触发排空/禁用）</span></td>
+                <td class="cmp-field">错误率</td>
                 <td class="cmp-muted">—</td>
-                <td>{{ selectedRow.model ? relText(selectedRow.model.View.Reliability) : '—' }}</td>
-                <td>{{ relText(selectedRow.channel.View.Reliability) }}</td>
+                <td><span v-if="selectedRow.model" class="pair"><span class="lamp" :data-state="metricLamp(selectedRow.model.Metrics.ErrorRatePct, selectedRow.model.View.Reliability.ErrorRatePct)" />{{ pairPct(selectedRow.model.Metrics.ErrorRatePct, selectedRow.model.View.Reliability.ErrorRatePct) }}</span><span v-else class="cmp-muted">—</span></td>
                 <td class="cmp-muted">—</td>
+                <td><span v-if="selectedRow.key" class="pair"><span class="lamp" :data-state="metricLamp(selectedRow.key.Metrics.ErrorRatePct, selectedRow.channel.View.Reliability.ErrorRatePct)" />{{ pairPct(selectedRow.key.Metrics.ErrorRatePct, selectedRow.channel.View.Reliability.ErrorRatePct) }}</span><span v-else class="cmp-muted">—</span></td>
               </tr>
               <tr>
-                <td class="cmp-field">实时窗口</td>
+                <td class="cmp-field">429 占比</td>
                 <td class="cmp-muted">—</td>
-                <td>{{ selectedRow.model ? metricsText(selectedRow.model.Metrics) : '—' }}</td>
+                <td><span v-if="selectedRow.model" class="pair"><span class="lamp" :data-state="metricLamp(selectedRow.model.Metrics.Rate429Pct, selectedRow.model.View.Reliability.Rate429Pct)" />{{ pairPct(selectedRow.model.Metrics.Rate429Pct, selectedRow.model.View.Reliability.Rate429Pct) }}</span><span v-else class="cmp-muted">—</span></td>
                 <td class="cmp-muted">—</td>
+                <td><span v-if="selectedRow.key" class="pair"><span class="lamp" :data-state="metricLamp(selectedRow.key.Metrics.Rate429Pct, selectedRow.channel.View.Reliability.Rate429Pct)" />{{ pairPct(selectedRow.key.Metrics.Rate429Pct, selectedRow.channel.View.Reliability.Rate429Pct) }}</span><span v-else class="cmp-muted">—</span></td>
+              </tr>
+              <tr>
+                <td class="cmp-field">P99 延迟</td>
                 <td class="cmp-muted">—</td>
+                <td><span v-if="selectedRow.model" class="pair"><span class="lamp" :data-state="metricLamp(selectedRow.model.Metrics.P99LatencyMS, selectedRow.model.View.Reliability.P99LatencyMS)" />{{ pairMs(selectedRow.model.Metrics.P99LatencyMS, selectedRow.model.View.Reliability.P99LatencyMS) }}</span><span v-else class="cmp-muted">—</span></td>
+                <td class="cmp-muted">—</td>
+                <td><span v-if="selectedRow.key" class="pair"><span class="lamp" :data-state="metricLamp(selectedRow.key.Metrics.P99LatencyMS, selectedRow.channel.View.Reliability.P99LatencyMS)" />{{ pairMs(selectedRow.key.Metrics.P99LatencyMS, selectedRow.channel.View.Reliability.P99LatencyMS) }}</span><span v-else class="cmp-muted">—</span></td>
               </tr>
               <tr>
                 <td class="cmp-field">最近探测</td>
@@ -992,31 +1054,6 @@ onUnmounted(stopTimer)
                     <div v-if="selectedRow.key.View.LastErr" class="danger">{{ selectedRow.key.View.LastErr }}</div>
                     <div v-if="selectedRow.key.View.DrainReasons && selectedRow.key.View.DrainReasons.length" class="danger">排空原因：{{ selectedRow.key.View.DrainReasons.join('；') }}</div>
                   </template>
-                  <span v-else class="cmp-muted">—</span>
-                </td>
-              </tr>
-
-              <tr class="cmp-section"><td colspan="5">操作</td></tr>
-              <tr>
-                <td class="cmp-field">探测 / 强制状态</td>
-                <td class="cmp-muted">—</td>
-                <td>
-                  <div v-if="selectedRow.model" class="op-btns">
-                    <el-button size="small" :loading="opLoading" :disabled="opLoading" @click="doProbeModel">重新探测</el-button>
-                    <el-button size="small" type="success" :disabled="opLoading || selectedRow.model.View.State === 'NORMAL'" @click="doState('model', 'normal')">正常</el-button>
-                    <el-button size="small" type="warning" :disabled="opLoading || selectedRow.model.View.State === 'DRAIN'" @click="doState('model', 'drain')">排空</el-button>
-                    <el-button size="small" type="danger" :disabled="opLoading || selectedRow.model.View.State === 'DISABLED'" @click="doState('model', 'disable')">禁用</el-button>
-                  </div>
-                  <span v-else class="cmp-muted">—</span>
-                </td>
-                <td class="cmp-muted">—</td>
-                <td>
-                  <div v-if="selectedRow.key" class="op-btns">
-                    <el-button size="small" :loading="opLoading" :disabled="opLoading" @click="doProbeKey">重新探测</el-button>
-                    <el-button size="small" type="success" :disabled="opLoading || selectedRow.key.View.State === 'NORMAL'" @click="doState('key', 'normal')">正常</el-button>
-                    <el-button size="small" type="warning" :disabled="opLoading || selectedRow.key.View.State === 'DRAIN'" @click="doState('key', 'drain')">排空</el-button>
-                    <el-button size="small" type="danger" :disabled="opLoading || selectedRow.key.View.State === 'DISABLED'" @click="doState('key', 'disable')">禁用</el-button>
-                  </div>
                   <span v-else class="cmp-muted">—</span>
                 </td>
               </tr>
@@ -1182,6 +1219,73 @@ onUnmounted(stopTimer)
   display: block;
   margin-left: 0;
   font-weight: 400;
+}
+/* 基本信息单元格：名称 + 状态 + 图标操作，纵向紧凑排列 */
+.cell-main {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.cm-name {
+  font-size: 12px;
+  color: var(--color-text);
+  word-break: break-all;
+}
+.cm-sub {
+  font-size: 12px;
+  color: var(--color-text-tertiary);
+}
+.cm-sub-inline {
+  margin-left: 6px;
+  font-size: 11px;
+  color: var(--color-text-tertiary);
+}
+.cm-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+/* 图标操作按钮：无边框，仅图标 + 悬浮底色 */
+.icon-ops {
+  display: inline-flex;
+  align-items: center;
+  gap: 0;
+}
+.icon-ops .el-button {
+  margin-left: 0 !important;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  color: var(--color-text-secondary);
+}
+.icon-ops .el-button:hover {
+  background: rgba(99, 102, 241, 0.1);
+}
+.icon-ops .ico-ok {
+  color: var(--color-success);
+}
+.icon-ops .ico-warn {
+  color: var(--color-warning);
+}
+.icon-ops .ico-bad {
+  color: var(--color-danger);
+}
+.icon-ops .el-button.is-disabled {
+  color: var(--el-text-color-disabled) !important;
+  background: transparent;
+}
+/* 「当前 / 阈值」内联对：灯 + 数值 */
+.pair {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.cmp-sub-block {
+  color: var(--color-text-secondary);
+  word-break: break-all;
 }
 .cmp-muted {
   color: var(--color-text-tertiary);
