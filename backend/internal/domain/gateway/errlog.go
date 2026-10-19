@@ -285,13 +285,14 @@ func sanitizeErrSummary(s string) string {
 func cleanErrField(s string) string { return truncateLog(sanitizeErrSummary(s), errFieldMaxBytes) }
 
 // outcomeIsFailure 判定「已写出响应的一次转发」在语义上是否失败：
-// 计费失败 / 退款 / 流式中断均为失败（即便流式内容已下发、客户端状态码为 200），
+// 计费失败 / 退款 / 已送达后上游失败（按估算结算但未送达内容） / 流式中断均为失败
+// （即便流式内容已下发、客户端状态码为 200），
 // 故请求级结论不得只看状态码，否则被截断的流式请求会被报成成功。
 func outcomeIsFailure(out *fwdOutcome) bool {
 	if out == nil {
 		return false
 	}
-	return out.billFailed || out.refundPre || out.interrupted
+	return out.billFailed || out.refundPre || out.upstreamFailed || out.interrupted
 }
 
 // modelScopeHints / credentialScopeHints 是上游报文的口径线索（小写匹配）。
@@ -524,10 +525,10 @@ func (g *Gateway) logOutcome(ctx context.Context, lvl slog.Level, endpoint, mode
 		return
 	}
 	// 仅"客户端类失败结论"（4xx）受开关控制：masked=true 必然 status<400（见 handler 侧 failedReq 判定），
-	// 故无需再判 masked。429（上游限流）不属客户端错误——候选级日志从不被门控，
+	// 故无需再判 masked。429（上游限流）与 499（client-gone）不属客户端错误——候选级日志从不被门控，
 	// 请求级必须同口径记录，否则 LOG_CLIENT_ERRORS=off 时会出现"候选有、请求级无"。
 	if status >= http.StatusBadRequest && status < http.StatusInternalServerError &&
-		status != http.StatusTooManyRequests && !logger.ClientErrorLogEnabled() {
+		status != http.StatusTooManyRequests && status != statusClientClosedRequest && !logger.ClientErrorLogEnabled() {
 		return
 	}
 	args := []any{
