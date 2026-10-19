@@ -34,7 +34,7 @@ const dims = ref<string[]>(['external', 'internal', 'channel', 'key'])
 // 刷新间隔（秒；manual 表示不自动刷新）。
 const refreshInterval = ref('30') // 默认 30 秒
 
-// 通路矩阵一行 = 已勾选维度叉积分组：折叠维度以 covered 集合渲染聚合摘要。
+// 通路矩阵一行 = 四个维度叉积（对外模型 × 内部模型 × 渠道 × 密钥），每行一条独立通路。
 // model 仅在模型轴进入行轴时有值；key 仅在密钥轴进入行轴时有值。
 interface MatrixRow {
   _id: string
@@ -49,9 +49,8 @@ const view = ref<ServiceStatusView | null>(null)
 const loading = ref(false)
 const errInfo = ref({ message: '', requestId: '' })
 
-// 轴勾选：模型轴（对外或内部任一）/ 渠道轴 / 密钥轴。
+// 轴开关：四个维度恒为全量展示，以下开关恒为 true（保留以便阅读语义）。
 const modelAxis = computed(() => dims.value.includes('external') || dims.value.includes('internal'))
-const chanAxis = computed(() => dims.value.includes('channel'))
 const keyAxis = computed(() => dims.value.includes('key'))
 
 const externalModels = computed<ExternalModelItem[]>(() => view.value?.ExternalModels || [])
@@ -60,14 +59,18 @@ const externalNameByID = computed<Record<string, string>>(() => {
   for (const e of externalModels.value) map[e.ID] = e.ExternalName
   return map
 })
-// 数字 ID 升序；非纯数字（内部模型标识）按字典序。
+// 数字 ID 升序（雪花 ID 超出 Number 安全整数范围，须用 BigInt 精确比较）；非纯数字按字典序。
 function idCmp(a: string, b: string): number {
-  const na = Number(a)
-  const nb = Number(b)
-  if (Number.isFinite(na) && Number.isFinite(nb) && a !== '' && b !== '') return na - nb
-  return a < b ? -1 : a > b ? 1 : 0
+  if (a === b) return 0
+  try {
+    const ba = BigInt(a)
+    const bb = BigInt(b)
+    return ba < bb ? -1 : ba > bb ? 1 : 0
+  } catch {
+    return a < b ? -1 : a > b ? 1 : 0
+  }
 }
-// 排序键 = 列显示顺序（对外模型标识 | 内部模型标识 | 渠道 ID | 密钥 ID），保证各列可连续合并。
+// 排序键：对外模型标识 | 内部模型标识 | 渠道 ID | 密钥 ID（稳定顺序，刷新后不跳动）。
 function cmpRow(a: MatrixRow, b: MatrixRow): number {
   const ae = a.model ? a.model.View.ExternalModelID : ''
   const be = b.model ? b.model.View.ExternalModelID : ''
@@ -115,72 +118,8 @@ const rows = computed<MatrixRow[]>(() => {
   return out
 })
 
-// 列顺序：已勾选维度列（external,internal,channel,key 固定顺序）+ 指标列（priority,limits,sessions）。
-// span-method 依赖 columnIndex 对应本数组，故以 cols 计算属性作为唯一索引真源。
-type ColKey = 'external' | 'internal' | 'channel' | 'key' | 'priority' | 'limits' | 'sessions'
-const DIM_COLS: ColKey[] = ['external', 'internal', 'channel', 'key']
-const cols = computed<ColKey[]>(() => [
-  ...DIM_COLS.filter((k) => dims.value.includes(k)),
-  'priority',
-  'limits',
-  'sessions',
-])
-
-// 合并列分组键：仅对「已勾选且进入行轴」的维度列做连续合并；折叠维度列与叶级指标不合并。
-// 关键：维度列合并键必须带上状态，否则会把「同名但状态不同」的行并成一格（例如某渠道已禁用却显示为绿）。
-// 指标归属：优先级→渠道级；合并限流列→随行轴（模型级/密钥级并置）；会话数→密钥级。
-function mergeKeyOf(ck: ColKey): ((r: MatrixRow) => string) | null {
-  switch (ck) {
-    case 'external':
-      return dims.value.includes('external') ? (r) => (r.model ? 'E' + r.model.View.ExternalModelID + '|' + extRowState(r) : '') : null
-    case 'internal':
-      return dims.value.includes('internal') ? (r) => (r.model ? 'E' + r.model.View.ExternalModelID + '|I' + r.model.View.InternalModelID + '|' + r.model.View.State : '') : null
-    case 'channel':
-      return chanAxis.value ? (r) => 'C' + r.channel.View.ID : null
-    case 'key':
-      // 密钥列跨模型合并，但序位可能随外部模型不同 → 把序位并入合并键，避免色条与实际不符。
-      return keyAxis.value ? (r) => (r.key ? 'K' + r.channel.View.ID + '|' + r.key.View.KeyID + '|' + String(rankOf(r)) : '') : null
-    case 'priority':
-      return (r) => 'C' + r.channel.View.ID
-    case 'limits':
-      // 合并粒度随行轴：模型轴+密钥轴=逐行（不合并）；仅模型轴=渠道×模型；仅密钥轴=渠道×密钥；都无=渠道。
-      return (r) =>
-        'L' + r.channel.View.ID + '|' + (modelAxis.value ? (r.model ? r.model.View.ID : '') : '*') + '|' + (keyAxis.value ? (r.key ? r.key.View.KeyID : '') : '*')
-    case 'sessions':
-      return keyAxis.value ? (r) => (r.key ? 'K' + r.channel.View.ID + '|' + r.key.View.KeyID : '') : null
-    default:
-      return null
-  }
-}
-
-// 预计算「连续相同值的 run-length」：首行 rowspan=组长，其余行 rowspan=0。
-function buildRuns(keyFn: (r: MatrixRow) => string): number[] {
-  const src = rows.value
-  const spans = new Array<number>(src.length).fill(1)
-  let i = 0
-  while (i < src.length) {
-    let j = i + 1
-    while (j < src.length && keyFn(src[j]) === keyFn(src[i])) j++
-    spans[i] = j - i
-    for (let t = i + 1; t < j; t++) spans[t] = 0
-    i = j
-  }
-  return spans
-}
-const spans = computed(() => {
-  const map: Partial<Record<ColKey, number[]>> = {}
-  for (const ck of cols.value) {
-    const fn = mergeKeyOf(ck)
-    if (fn) map[ck] = buildRuns(fn)
-  }
-  return map
-})
-function spanMethod({ rowIndex, columnIndex }: { rowIndex: number; columnIndex: number }): [number, number] {
-  const ck = cols.value[columnIndex]
-  const arr = ck ? spans.value[ck] : undefined
-  if (arr) return [arr[rowIndex] ?? 1, 1]
-  return [1, 1]
-}
+// 四个维度全量展示：每行即为一条独立通路（对外模型 × 内部模型 × 渠道 × 密钥）。
+// 因此不做任何单元格合并——避免「同名不同状态的行被并成一格」以及合并块随状态抖动而跳动。
 
 // ===== 状态灯与原因 =====
 // 状态严重度：DISABLED > DRAIN > NORMAL（决策 7）。折叠列状态灯取覆盖集合中最差状态。
@@ -770,7 +709,6 @@ onUnmounted(stopTimer)
         stripe
         class="table-nowrap clickable-rows"
         row-key="_id"
-        :span-method="spanMethod"
         @row-click="onRowClick"
       >
         <!-- 对外模型 -->
