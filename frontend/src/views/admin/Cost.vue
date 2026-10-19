@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // 「成本」只读页（仅管理端）：三块能力——
 //   A. 渠道 × 内部模型 成本统计表（含 Total 汇总行，可排序）；
-//   B. 模型定价曲线（多选内部模型 + 三个参数 + 成本/售价/两者切换 + 相邻曲线交点标注）；
+//   B. 模型定价曲线（多选内部模型 + 三个参数 + 成本/售价/两者切换 + 同指标交点标注）；
 //   C. 会话成本曲线（选一场会话，逐轮绘制 成本 与 售价）。
 // 纯只读：全部走 GET，无任何写路径。
 import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
@@ -19,6 +19,7 @@ import {
   getCostSession,
   listSessions,
   type CostStatRow,
+  type CostStatTotal,
   type CurveItem,
   type SessionPoint,
   type AdminSession,
@@ -58,7 +59,7 @@ function setErr(e: any) {
 // ===================================================================
 const loadingStats = ref(false)
 const statsRows = ref<CostStatRow[]>([])
-const statsTotal = ref<CostStatRow | null>(null)
+const statsTotal = ref<CostStatTotal | null>(null)
 
 async function loadStats() {
   loadingStats.value = true
@@ -147,7 +148,8 @@ async function loadDefaults() {
   try {
     const res = await getCostDefaults()
     const d = res.Data
-    params.perTurnInput = d.PerTurnInputTokens
+    // 每轮输入 token 需 >0：缺失/非正时回退 10000，避免输入框出现 0/负数导致曲线退化。
+    params.perTurnInput = d.PerTurnInputTokens > 0 ? d.PerTurnInputTokens : 10000
     params.hitRate = d.CacheHitRate
     params.inOutRatio = d.InputOutputRatio
   } catch {
@@ -155,7 +157,11 @@ async function loadDefaults() {
   }
 }
 
+// 曲线请求自增序号：丢弃过期响应，避免旧响应覆盖新响应（竞态）。
+let curveReqSeq = 0
+
 async function loadCurves() {
+  const seq = ++curveReqSeq
   loadingCurves.value = true
   try {
     const res = await getCostCurves({
@@ -164,6 +170,7 @@ async function loadCurves() {
       inOutRatio: params.inOutRatio,
       turns: TURNS,
     })
+    if (seq !== curveReqSeq) return // 已有更新的请求发出，丢弃本次过期响应
     curves.value = res.Data.Curves || []
     curveTurns.value = res.Data.Turns || TURNS
     const valid = new Set(curves.value.map(curveKey))
@@ -175,9 +182,10 @@ async function loadCurves() {
       selectedKeys.value = selectedKeys.value.filter((k) => valid.has(k))
     }
   } catch (e: any) {
+    if (seq !== curveReqSeq) return
     setErr(e)
   } finally {
-    loadingCurves.value = false
+    if (seq === curveReqSeq) loadingCurves.value = false
   }
 }
 
@@ -196,10 +204,12 @@ const selectedCurves = computed<CurveItem[]>(() =>
 )
 
 // 当前展示序列：每个所选模型按模式产出 成本 / 售价（成本实线、售价虚线，同色同模型）。
+// metric 标记指标类型（cost/sale），供交点计算仅在「同指标」内配对。
 interface BuildSeries {
   name: string
   color: string
   dashed: boolean
+  metric: 'cost' | 'sale'
   points: { t: number; y: number }[]
 }
 const displaySeries = computed<BuildSeries[]>(() => {
@@ -212,14 +222,18 @@ const displaySeries = computed<BuildSeries[]>(() => {
         name: mode.value === 'both' ? `${label} · 成本` : label,
         color,
         dashed: false,
+        metric: 'cost',
         points: c.Cost.map((y, i) => ({ t: i + 1, y })),
       })
     }
     if (mode.value === 'sale' || mode.value === 'both') {
+      // 售价曲线：后端在 sale_rates 缺失/全 0 时返回空数组，此处跳过空序列，避免画出误导的全 0 线。
+      if (!c.Sale.length) return
       out.push({
         name: mode.value === 'both' ? `${label} · 售价` : label,
         color,
         dashed: true,
+        metric: 'sale',
         points: c.Sale.map((y, i) => ({ t: i + 1, y })),
       })
     }
@@ -253,6 +267,8 @@ function linearFit(pts: { t: number; y: number }[]): FitLine {
 }
 
 // 相邻两条 series 的交点：k = (c2 − c1) / (m1 − m2)，y = m·k + c。
+// 交点含义：在第 k 轮，两条「同指标」曲线（成本↔成本 或 售价↔售价）的每轮值相等——
+// 成本口径下代表两条渠道/模型在该轮成本持平，售价口径下代表售价持平；跨指标（成本×售价）无业务含义。
 interface Crossing {
   t: number
   y: number
@@ -263,18 +279,24 @@ const crossings = computed<Crossing[]>(() => {
   const ss = displaySeries.value
   const out: Crossing[] = []
   const maxT = Math.max(curveTurns.value, 2)
-  for (let i = 0; i + 1 < ss.length; i++) {
-    const a = ss[i]
-    const b = ss[i + 1]
-    const fa = linearFit(a.points)
-    const fb = linearFit(b.points)
-    const dm = fa.m - fb.m
-    if (Math.abs(dm) <= 1e-12) continue
-    const t = (fb.c - fa.c) / dm
-    const y = fa.m * t + fa.c
-    if (!Number.isFinite(t) || !Number.isFinite(y)) continue
-    if (t < 1 || t > maxT) continue
-    out.push({ t: round2(t), y: round4(y), tag: `${a.name} × ${b.name}`, color: a.color })
+  // 仅在「同指标」内两两求交：成本组之间、售价组之间分别配对；
+  // 禁止把 成本×售价 当作相邻对求交（两者语义/量纲虽同为积分但不可比）。
+  // 售价组内每条序列对应一个模型，天然去重（不会与自己求交）。
+  for (const metric of ['cost', 'sale'] as const) {
+    const group = ss.filter((s) => s.metric === metric)
+    for (let i = 0; i + 1 < group.length; i++) {
+      const a = group[i]
+      const b = group[i + 1]
+      const fa = linearFit(a.points)
+      const fb = linearFit(b.points)
+      const dm = fa.m - fb.m
+      if (Math.abs(dm) <= 1e-12) continue
+      const t = (fb.c - fa.c) / dm
+      const y = fa.m * t + fa.c
+      if (!Number.isFinite(t) || !Number.isFinite(y)) continue
+      if (t < 1 || t > maxT) continue
+      out.push({ t: round2(t), y: round4(y), tag: `${a.name} × ${b.name}`, color: a.color })
+    }
   }
   return out
 })
@@ -435,10 +457,10 @@ onUnmounted(() => {
       <div class="card">
         <div class="block-title">
           成本统计
-          <el-tag size="small" effect="plain" type="info">渠道 × 内部模型</el-tag>
+          <el-tag size="small" effect="plain" type="info">渠道 × 内部模型 × 对外模型</el-tag>
         </div>
         <div class="block-desc">
-          按「渠道 × 内部模型」聚合：成本 = Σcost_credits、售价 = Σcredits_consumed、请求数、三段 token（输入/缓存读/输出）；
+          按「渠道 × 内部模型 × 对外模型」聚合（仅 completed 消耗）：成本 = Σcost_credits、售价 = Σcredits_consumed、请求数、三段 token（输入/缓存读/输出）；
           缓存命中率 = 缓存读 ÷ (输入 + 缓存读)，输入输出比 = 输入 ÷ 输出。表尾为全量合计行（不随排序变化）。
         </div>
         <el-table
@@ -472,7 +494,7 @@ onUnmounted(() => {
           <el-tag size="small" effect="plain">x = 轮次 1..{{ curveTurns }}</el-tag>
         </div>
         <div class="block-desc">
-          每轮成本 = 缓存读×缓存读价 + 新输入×输入价 + 输出×输出价（按当前费率推算，积分）；缓存读随轮次累计增长。
+          每轮成本 = （缓存读×缓存读价 + 新输入×输入价 + 输出×输出价）÷ R（积分；R 默认 10000）；缓存读随轮次累计增长。
           曲线用当前费率推算，与会话曲线的历史实际值口径不同。
         </div>
         <div class="curve-toolbar">
@@ -527,7 +549,7 @@ onUnmounted(() => {
           {{ curves.length ? '请选择至少一个内部模型以绘制曲线。' : '暂无可绘制的模型曲线。' }}
         </div>
         <div v-if="crossings.length" class="cross-list">
-          <span class="cross-title">相邻曲线交点（轮次 · 积分）：</span>
+          <span class="cross-title">同指标交点（成本↔成本 / 售价↔售价；轮次 · 积分）：</span>
           <el-tag v-for="(c, i) in crossings" :key="i" size="small" type="warning" effect="plain" class="cross-tag">
             #{{ i + 1 }} {{ c.tag }} ≈ 轮次 {{ fmt2(c.t) }} · {{ fmt2(c.y) }}
           </el-tag>
