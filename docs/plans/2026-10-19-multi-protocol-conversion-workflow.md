@@ -108,7 +108,7 @@ max_iterations: 3
 verify: cd backend && go test ./tests/ -run TestProtocolConversion -v
 gate: auto
 
-- [ ] **Step 14: 人工评审（路由语义 + 流式 pump）**
+- [x] **Step 14: 人工评审（路由语义 + 流式 pump）**
 action: 人工复核两项高风险变更：① 路由语义——直通优先、默认开启转换、一期 AC-18 被取代、`ConvertEnabled=false` 可回退到 AC-4（对照设计文档决策 D2 与治理契约）；② 流式转换 pump——事件顺序保真、无丢帧、usage 累计与直通路径互不影响。记录评审结论后再继续。
 loop: false
 max_iterations: 1
