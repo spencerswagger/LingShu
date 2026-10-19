@@ -1182,12 +1182,12 @@ onUnmounted(stopTimer)
   width: 100%;
   table-layout: fixed;
   border-collapse: collapse;
-  font-size: 12px;
+  font-size: 13px;
 }
 .cmp-table th,
 .cmp-table td {
   border: 1px solid var(--color-border);
-  padding: 6px 8px;
+  padding: 8px 10px;
   text-align: left;
   vertical-align: top;
   word-break: normal;
@@ -1211,8 +1211,8 @@ onUnmounted(stopTimer)
   font-size: 12px;
   font-weight: 600;
   color: var(--color-text-secondary);
-  padding: 3px 8px;
-  letter-spacing: 0.5px;
+  padding: 6px 10px;
+  letter-spacing: 1px;
 }
 /* 字段名后的灰色小注（阈值说明等）：独占一行显示 */
 .cmp-table .cmp-field .cmp-sub {
@@ -1227,7 +1227,7 @@ onUnmounted(stopTimer)
   gap: 4px;
 }
 .cm-name {
-  font-size: 12px;
+  font-size: 13px;
   color: var(--color-text);
   word-break: break-all;
 }
@@ -1237,7 +1237,7 @@ onUnmounted(stopTimer)
 }
 .cm-sub-inline {
   margin-left: 6px;
-  font-size: 11px;
+  font-size: 12px;
   color: var(--color-text-tertiary);
 }
 .cm-line {
@@ -1250,14 +1250,18 @@ onUnmounted(stopTimer)
 .icon-ops {
   display: inline-flex;
   align-items: center;
-  gap: 0;
+  gap: 2px;
 }
 .icon-ops .el-button {
   margin-left: 0 !important;
-  width: 22px;
-  height: 22px;
+  width: 30px;
+  height: 30px;
   padding: 0;
+  font-size: 17px;
   color: var(--color-text-secondary);
+}
+.icon-ops .el-button .el-icon {
+  font-size: 17px;
 }
 .icon-ops .el-button:hover {
   background: rgba(99, 102, 241, 0.1);
@@ -1279,9 +1283,13 @@ onUnmounted(stopTimer)
 .pair {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 7px;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
+}
+.pair .lamp {
+  width: 10px;
+  height: 10px;
 }
 .cmp-sub-block {
   color: var(--color-text-secondary);
