@@ -574,8 +574,9 @@ func summarizeAttempts(attempts []map[string]any) (trail string, failed int) {
 			parts = append(parts, label)
 		}
 		// 只有真正失败（上游失败/本地 5xx/计费失败/流式中断）才计入候选失败；
-		// 跳过（禁用/限流/会话满/协议不支持/无运行时）不算失败。
-		if !skipped && reason != "" && reason != "success" {
+		// 跳过（禁用/限流/会话满/协议不支持/无运行时）不算失败；
+		// 客户端断开（client-gone，建连阶段取消）按与 success 相同的规则排除，不计为失败候选。
+		if !skipped && reason != "" && reason != "success" && reason != "客户端断开" {
 			failed++
 		}
 	}
