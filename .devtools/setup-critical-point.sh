@@ -38,9 +38,12 @@ set_cost() {
 }
 
 echo "== 设置定价 =="
-set_cost "演示渠道-正常A" '{"input":2.0,"cache_read":0.2,"output":4.0}' '[]'
-set_cost "演示渠道-正常B" '{"input":1.0,"cache_read":0.1,"output":2.0}' '[{"Min":0,"Max":6000,"Coeff":5.0},{"Min":6000,"Max":null,"Coeff":1.0}]'
-set_cost "演示渠道-慢速" '{"input":3.0,"cache_read":0.3,"output":6.0}' '[]'
+# A：小上下文更便宜（原始 input 价高但无分档），且缓存读价低 → 缓存读越大越便宜（曲线斜率小）
+# B：大上下文更便宜（分档 >6000 回落 ×1），缓存读价高 → 缓存读小更便宜（曲线斜率大）
+# → A 与 B 的成本曲线在 缓存读 ≈ 26667 token 处相交（正面临界点，面板可见）
+set_cost "演示渠道-正常A" '{"input":2.0,"cache_read":0.05,"output":4.0}' '[]'
+set_cost "演示渠道-正常B" '{"input":1.0,"cache_read":0.50,"output":2.0}' '[{"Min":0,"Max":6000,"Coeff":5.0},{"Min":6000,"Max":null,"Coeff":1.0}]'
+set_cost "演示渠道-慢速" '{"input":3.0,"cache_read":0.30,"output":6.0}' '[]'
 set_cost "演示渠道-限流" '{"input":3.5,"cache_read":0.35,"output":7.0}' '[]'
 set_cost "演示渠道-故障" '{"input":1.05,"cache_read":0.105,"output":2.1}' '[]'
 
@@ -49,4 +52,4 @@ PGPASSWORD=llmgw psql -h 127.0.0.1 -U llmgw -d llmgw -v ON_ERROR_STOP=1 -c \
 "INSERT INTO sys_configs(key, value) VALUES ('routing.session_cost',
  '{\"enabled\":true,\"remaining_a\":12,\"remaining_b\":1,\"remaining_min\":1,\"remaining_max\":20,\"min_remaining\":1,\"cooldown_sec\":0,\"mid_switch\":true,\"min_improve\":0.1}'::jsonb)
  ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;" >/dev/null
-echo "  已写入并置 enabled=true / mid_switch=true / min_improve=0.1"
+echo "  已写入并置 enabled=true / mid_switch=true / min_improve=0.1 / min_remaining=1"
