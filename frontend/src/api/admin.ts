@@ -1152,6 +1152,12 @@ export interface SessionCostRoutingConfig {
   // 影子观测独立开关（P0，默认 false）：未启用切换时是否仍记录「若启用则会切换」的假设事件
   shadow_enabled: boolean
 }
+// 路由样值补齐比例（routing.sample_profile）：路由时刻只有「总输入」时，
+// 按此比例拆成 缓存读/纯输入/输出 三段（纯输入 + 缓存读 = 总输入）。
+export interface SessionCostSampleProfile {
+  cache_read_ratio: number
+  output_ratio: number
+}
 export interface SessionCostConfigData {
   Now: string
   NowTimeCoeff: number
@@ -1162,6 +1168,8 @@ export interface SessionCostConfigData {
   ContextTiersSource: string
   CostSample: BillingUsage // routing.cost_sample 默认样值（三段口径）
   CostSampleSource: string
+  SampleProfile: SessionCostSampleProfile // routing.sample_profile 补齐比例
+  SampleProfileSource: string
   SessionCost: SessionCostRoutingConfig
   SessionCostSource: string
   Gates: SessionCostGates

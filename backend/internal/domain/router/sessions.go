@@ -32,10 +32,10 @@ type Session struct {
 	// Turns 本会话已成功完成的轮数（Renew 时 +1；进程内存字段，不落库）。
 	// 用途：① 决策产物事件的 Turn 字段（可按轮次回放）；② 若将来恢复「按会话位置 k 预测剩余轮数」的经验式，
 	// 以此为输入。当前剩余轮数为固定值（SessionCostConfig.RemainingA/B），Turns 不参与门控计算。
-	Turns int
-	Closed       bool       // 已关闭：不再被路由命中、释放并发槽，但保留在列表（管理可见）
-	ClosedAt     *time.Time // 关闭时间（nil=未关闭）
-	Inflight     int        // 进行中请求数（进程内存计数，不落库；管理端「实时状态」展示用）
+	Turns    int
+	Closed   bool       // 已关闭：不再被路由命中、释放并发槽，但保留在列表（管理可见）
+	ClosedAt *time.Time // 关闭时间（nil=未关闭）
+	Inflight int        // 进行中请求数（进程内存计数，不落库；管理端「实时状态」展示用）
 	// LastMsgFingerprints 该会话上次请求的每消息短 hash，用于 call_log 增量 diff
 	//（进程内存字段，不落库；DB 恢复后为空时网关降级为「最后一条 user + tool 链」）。
 	LastMsgFingerprints []string

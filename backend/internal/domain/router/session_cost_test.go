@@ -357,7 +357,7 @@ func TestStartPick_Enabled_ChoosesMinPerTurnCost(t *testing.T) {
 		t.Fatalf("route（未启用）: %v", err)
 	}
 	if r0.ChannelID != 2 {
-		t.Fatalf("未启用时应保持现状（priority 更高的 ch2），got channel %d", r0.ChannelID)
+		t.Fatalf("未启用时应保持现状（同优先级下全局 routing.cost_sample 中 ch2 更便宜），got channel %d", r0.ChannelID)
 	}
 }
 
