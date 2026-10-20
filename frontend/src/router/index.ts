@@ -67,6 +67,8 @@ const router = createRouter({
         { path: 'system/gateway', redirect: '/admin/system' },
         // 会话成本路由（只读面板 + 临界点图 / 分布 / 事件流）
         { path: 'session-cost-routing', name: 'admin-session-cost-routing', component: () => import('@/views/admin/SessionCostRouting.vue'), meta: { title: '会话成本' } },
+        // 成本（只读：成本统计 + 定价曲线 + 会话成本曲线）
+        { path: 'cost', name: 'admin-cost', component: () => import('@/views/admin/Cost.vue'), meta: { title: '成本' } },
         // 公告
         { path: 'announcements', name: 'admin-announcements', component: () => import('@/views/admin/AnnouncementList.vue'), meta: { title: '公告' } },
         { path: 'announcements/create', name: 'admin-announcement-create', component: () => import('@/views/admin/AnnouncementEdit.vue'), meta: { title: '新建公告' } },
