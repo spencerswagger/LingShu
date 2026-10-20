@@ -89,6 +89,14 @@ func (f *fakeRouter) Sessions() *router.SessionRegistry {
 	return f.sess
 }
 
+// ConfirmSessionSwitch 与真实引擎同语义：把会话归属迁移到目标候选（并发上限按不限处理）。
+func (f *fakeRouter) ConfirmSessionSwitch(sessionID string, cr *router.ChannelRoute, turn int, ttl time.Duration) bool {
+	if sessionID == "" || cr == nil || cr.Switch == nil {
+		return false
+	}
+	return f.Sessions().Migrate(sessionID, cr.ChannelKeyID, cr.InternalModelID, 0, ttl)
+}
+
 type feedEntry struct {
 	keyID      int64
 	modelRowID int64

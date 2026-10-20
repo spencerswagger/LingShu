@@ -324,9 +324,9 @@ func TestStartPick_Enabled_ChoosesMinPerTurnCost(t *testing.T) {
 		t.Fatalf("用例构造失败：期望 ch1 本轮花费更小, ch1=%v ch2=%v", want1, want2)
 	}
 
-	// ch1 低优先级（50）、ch2 高优先级（100）：默认（Enabled=false）按优先级选 ch2，
-	// 启用起点择优后按本轮花费选 ch1 —— 二者通道不同，可鉴别开关是否真正生效。
-	e, _ := newStartPickEngine(t, true, rates1, rates2, 50, 100, 2)
+	// ch1 与 ch2 **同优先级**：起点择优在同层内按本轮花费选 ch1；
+	// ch2 的高优先级版本由 TestStartPick_PriorityOutranksCost 单独锁定（priority 不起作用时才比成本）。
+	e, _ := newStartPickEngine(t, true, rates1, rates2, 100, 100, 2)
 
 	r, err := e.Route(context.Background(), RouteSpec{
 		ExternalModel: "qw-max", SessionKey: "s-start", SessionTokens: &tok,
@@ -347,7 +347,8 @@ func TestStartPick_Enabled_ChoosesMinPerTurnCost(t *testing.T) {
 		t.Fatalf("起点重灌代价应为 0: got=%v", d.RechargeCost)
 	}
 
-	// Enabled=false 门控：完全保持现状（priority 为硬分层 → 选高优先级的 ch2）。
+	// Enabled=false 门控：完全保持现状——默认排序用全局 routing.cost_sample（默认样值
+	// 10000/9000/1000 下 ch2 更便宜），不使用会话本轮样值，故落在 ch2；与启用态（ch1）可鉴别。
 	e.SetSessionCostProvider(sessionCostProvider(t, false))
 	r0, err := e.Route(context.Background(), RouteSpec{
 		ExternalModel: "qw-max", SessionKey: "s-start-off", SessionTokens: &tok,

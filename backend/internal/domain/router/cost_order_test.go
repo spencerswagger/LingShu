@@ -50,6 +50,12 @@ func (f *costCfgFull) ContextTiers() ([]billing.TierRule, error) {
 	return f.tiers, nil
 }
 
+// SampleProfile 满足 CostConfig 接口：返回缺省补齐比例（缓存读 0.9 / 输出 0.1）。
+// 本文件用例均显式传入三段样值或只关心默认排序，故补齐逻辑不参与断言。
+func (f *costCfgFull) SampleProfile() (billing.SampleProfile, error) {
+	return billing.SampleProfile{CacheReadRatio: 0.9, OutputRatio: 0.1}, nil
+}
+
 // costOrderRates 构造含三段键的合法单价表。
 func costOrderRates(input, output, cacheRead float64) billing.Rates {
 	return billing.Rates{"input": input, "output": output, "cache_read": cacheRead}

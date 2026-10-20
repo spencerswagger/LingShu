@@ -27,6 +27,10 @@ type Router interface {
 	// RouteAllWithExcluded 与 RouteAll 同语义，额外返回路由层被排除的候选
 	// （决策轨迹用；路由失败时也返回已收集的排除项）。
 	RouteAllWithExcluded(ctx context.Context, spec router.RouteSpec) (*router.RouteAllResult, error)
+	// ConfirmSessionSwitch 确认「会话中途切换」的目标候选被采用：迁移会话归属（并发上限校验 +
+	// 滑动 TTL，失败原子回退）并补发决策产物事件。返回 false 表示迁移失败，调用方应保持原渠道。
+	// 路由层只做决策不做迁移（迁移时机必须在目标候选通过可用性/限流校验之后）。
+	ConfirmSessionSwitch(sessionID string, cr *router.ChannelRoute, turn int, ttl time.Duration) bool
 	Sessions() *router.SessionRegistry
 }
 
