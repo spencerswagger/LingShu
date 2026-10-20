@@ -44,6 +44,17 @@ type fakeRouter struct {
 	spec     router.RouteSpec
 	sess     *router.SessionRegistry
 	sessNow  func() time.Time // 会话注册表时钟（与网关共用 mock clock）
+	// switchFail=true 时 ConfirmSessionSwitch 返回 false（模拟目标密钥并发已满导致迁移失败）。
+	switchFail  bool
+	switchCalls []switchCall // 记录 ConfirmSessionSwitch 的调用（断言迁移时机与 ttl 透传）
+}
+
+// switchCall 记录一次 ConfirmSessionSwitch 调用（F1 迁移时机 / F8 ttl 透传断言用）。
+type switchCall struct {
+	sessionID string
+	keyID     int64
+	turn      int
+	ttl       time.Duration
 }
 
 func (f *fakeRouter) Route(_ context.Context, spec router.RouteSpec) (*router.RouteResult, error) {
@@ -90,8 +101,13 @@ func (f *fakeRouter) Sessions() *router.SessionRegistry {
 }
 
 // ConfirmSessionSwitch 与真实引擎同语义：把会话归属迁移到目标候选（并发上限按不限处理）。
+// switchFail=true 时返回 false（模拟目标密钥并发已满导致迁移失败），供网关 F1 回退用例断言。
 func (f *fakeRouter) ConfirmSessionSwitch(sessionID string, cr *router.ChannelRoute, turn int, ttl time.Duration) bool {
 	if sessionID == "" || cr == nil || cr.Switch == nil {
+		return false
+	}
+	f.switchCalls = append(f.switchCalls, switchCall{sessionID: sessionID, keyID: cr.ChannelKeyID, turn: turn, ttl: ttl})
+	if f.switchFail {
 		return false
 	}
 	return f.Sessions().Migrate(sessionID, cr.ChannelKeyID, cr.InternalModelID, 0, ttl)
@@ -2849,5 +2865,126 @@ func TestClientGone_AfterRealCandidateFailure(t *testing.T) {
 	}
 	if strings.Contains(line, "客户端已断开") {
 		t.Errorf("client-gone 结论不得遮蔽真实候选失败：\n%s", line)
+	}
+}
+
+// ---- F1：中途切换的迁移时机（路由只决策，网关在候选通过校验后才迁移） ----
+
+// newSwitchTestHarness 构造「会话已绑定 key 21，路由返回 [目标 key 11（带切换决策）, 原渠道 key 21]」的网关夹具：
+// 目标候选按 finalize 回调决定是否可用（如密钥被禁用），用于断言「候选被跳过时不迁移会话」。
+func newSwitchTestHarness(t *testing.T, upstreamURL string, disableTargetKey bool) *harness {
+	t.Helper()
+	h := build(t, upstreamURL)
+	normalCh := func(id int64, name string) *channel.KeyRuntime {
+		return &channel.KeyRuntime{
+			Key:             channel.ChannelKey{ID: id, ChannelID: 1, Name: name, State: channel.StateNormal},
+			Channel:         &channel.Channel{ID: 1, Protocol: channel.ProtocolOpenAICompat, BaseURL: upstreamURL},
+			CredentialPlain: "k-secret",
+			Machine:         channel.NewMachine(channel.DefaultMachineConfig()),
+			Limiter:         channel.NewLimiter(1000, 1000000, 1.2),
+		}
+	}
+	h.chans.keys[21] = normalCh(21, "k21")
+	if disableTargetKey {
+		kr := normalCh(11, "k11")
+		kr.Machine.ForceDisable(time.Now()) // 目标密钥禁用 → 候选在 ConfirmSessionSwitch 之前被跳过
+		h.chans.keys[11] = kr
+	} else {
+		h.chans.keys[11] = normalCh(11, "k11")
+	}
+	// 目标候选携带「从中途原渠道 21 切到 11」的决策产物；其后为原渠道回退候选（F1 回退保障）。
+	h.rrouter.routes = []*router.ChannelRoute{
+		{ChannelID: 1, ChannelKeyID: 11, ModelRowID: 7, InternalModelID: "gpt-4-internal", ExternalModelID: 1,
+			Switch: &router.SessionCostDecision{Switch: true, FromChannelKeyID: 21, ToChannelKeyID: 11}},
+		{ChannelID: 1, ChannelKeyID: 21, ModelRowID: 7, InternalModelID: "gpt-4-internal", ExternalModelID: 1},
+	}
+	// 会话已绑定原渠道 key 21。
+	h.rrouter.Sessions().Attach(&router.Session{
+		SessionID: router.SessionID(7, 42, "gpt-4", "s-mid"), ChannelKeyID: 21, InternalModelID: "gpt-4-internal",
+		ExpireAt: h.clock.now().Add(time.Hour),
+	}, 16)
+	return h
+}
+
+// okUpstream 返回一个固定 200 响应体的上游服务（供切换后转发成功路径使用）。
+func okUpstream(t *testing.T) *httptest.Server {
+	t.Helper()
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"x","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2}}`))
+	}))
+	t.Cleanup(up.Close)
+	return up
+}
+
+// TestMidSwitchGateway_MigratesOnlyAfterConfirm 候选通过校验后迁移：会话归属迁到 key 11，
+// 且 ConfirmSessionSwitch 收到真实 ttl（F8 透传）与请求级轮次（F7）。
+func TestMidSwitchGateway_MigratesOnlyAfterConfirm(t *testing.T) {
+	up := okUpstream(t)
+	h := newSwitchTestHarness(t, up.URL, false)
+	sid := router.SessionID(7, 42, "gpt-4", "s-mid")
+
+	rec := doRequestH(t, h.gw, "/v1/chat/completions", "sk-gw-t",
+		`{"model":"gpt-4","stream":false}`, map[string]string{"x-session-id": "s-mid"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(h.rrouter.switchCalls) != 1 {
+		t.Fatalf("应恰好调用一次 ConfirmSessionSwitch，got %d", len(h.rrouter.switchCalls))
+	}
+	call := h.rrouter.switchCalls[0]
+	if call.keyID != 11 || call.sessionID != sid {
+		t.Fatalf("ConfirmSessionSwitch 目标应为 key 11 / 该会话，got %+v", call)
+	}
+	if call.ttl <= 0 {
+		t.Fatalf("迁移应透传真实 ttl（F8），got %v", call.ttl)
+	}
+	s, ok := h.rrouter.Sessions().Lookup(sid)
+	if !ok || s.ChannelKeyID != 11 {
+		t.Fatalf("确认后会话应迁移到 key 11，got %+v ok=%v", s, ok)
+	}
+}
+
+// TestMidSwitchGateway_NoMigrateWhenCandidateSkipped 目标候选在确认前被跳过（密钥禁用）：
+// 不得迁移会话（留在原渠道 key 21），且请求经回退候选（原渠道）成功。
+func TestMidSwitchGateway_NoMigrateWhenCandidateSkipped(t *testing.T) {
+	up := okUpstream(t)
+	h := newSwitchTestHarness(t, up.URL, true) // 目标密钥 11 被禁用 → 候选在确认前被跳过
+	sid := router.SessionID(7, 42, "gpt-4", "s-mid")
+
+	rec := doRequestH(t, h.gw, "/v1/chat/completions", "sk-gw-t",
+		`{"model":"gpt-4","stream":false}`, map[string]string{"x-session-id": "s-mid"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("应 failover 到回退的原渠道并成功，got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(h.rrouter.switchCalls) != 0 {
+		t.Fatalf("候选被跳过时不得调用 ConfirmSessionSwitch，got %d 次", len(h.rrouter.switchCalls))
+	}
+	s, ok := h.rrouter.Sessions().Lookup(sid)
+	if !ok || s.ChannelKeyID != 21 {
+		t.Fatalf("候选被跳过时会话应保持原渠道 key 21，got %+v ok=%v", s, ok)
+	}
+}
+
+// TestMidSwitchGateway_MigrationFailureKeepsOldChannel 确认迁移失败（目标密钥会话满，F1）：
+// 该候选按「会话满」跳过，请求回退到原渠道 key 21 成功，会话归属不变。
+func TestMidSwitchGateway_MigrationFailureKeepsOldChannel(t *testing.T) {
+	up := okUpstream(t)
+	h := newSwitchTestHarness(t, up.URL, false)
+	h.rrouter.switchFail = true // 模拟目标密钥并发已满 → 迁移失败
+	sid := router.SessionID(7, 42, "gpt-4", "s-mid")
+
+	rec := doRequestH(t, h.gw, "/v1/chat/completions", "sk-gw-t",
+		`{"model":"gpt-4","stream":false}`, map[string]string{"x-session-id": "s-mid"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("迁移失败应回退原渠道并成功，got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(h.rrouter.switchCalls) != 1 {
+		t.Fatalf("应尝试一次确认迁移，got %d", len(h.rrouter.switchCalls))
+	}
+	s, ok := h.rrouter.Sessions().Lookup(sid)
+	if !ok || s.ChannelKeyID != 21 {
+		t.Fatalf("迁移失败时会话应保持原渠道 key 21，got %+v ok=%v", s, ok)
 	}
 }
