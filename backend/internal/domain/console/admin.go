@@ -1452,6 +1452,7 @@ const (
 	sourceSessionCostCfg = "routing.session_cost"
 	sourceSessionCostEvt = "asyncwrite KindSessionCostEvent（进程内落地）"
 	sourceCrossCacheRead = "crossCacheRead（模型成本 × 真实 token）"
+	sourceSampleProfile  = "routing.sample_profile（缓存读/输入比、输出/输入比）"
 )
 
 // sessionCostTierView 单一候选渠道的三档成本价（模型成本来源）。
@@ -1473,7 +1474,8 @@ type sessionCostCandidateView struct {
 	CtxCoeffSource  string              `json:"CtxCoeffSource"`
 }
 
-// sessionCostGates 经验式剩余轮数 k 系数与中途切换门控阈值（均取自 routing.session_cost）。
+// sessionCostGates 剩余轮数与中途切换的门控阈值（均取自 routing.session_cost）。
+// 剩余轮数为固定值（默认 remaining_a=10、remaining_b=0），不再按会话位置 k 预测。
 type sessionCostGates struct {
 	RemainingA   float64 `json:"RemainingA"`
 	RemainingB   float64 `json:"RemainingB"`
@@ -1496,11 +1498,15 @@ type sessionCostConfigResponse struct {
 	TiersSource      string                     `json:"ContextTiersSource"`
 	CostSample       billing.WireUsage          `json:"CostSample"`
 	CostSampleSource string                     `json:"CostSampleSource"`
-	SessionCost      router.SessionCostConfig   `json:"SessionCost"`
-	SessionCostSrc   string                     `json:"SessionCostSource"`
-	Gates            sessionCostGates           `json:"Gates"`
-	Candidates       []sessionCostCandidateView `json:"Candidates"`
-	CandidatesSource string                     `json:"CandidatesSource"`
+	// SampleProfile 是「只有总输入」样值的补齐比例（routing.sample_profile）：
+	// 路由时刻按它把总输入拆成 缓存读/纯输入/输出 三段参与比较，面板需展示以免误读成本口径。
+	SampleProfile       billing.SampleProfile `json:"SampleProfile"`
+	SampleProfileSource string                `json:"SampleProfileSource"`
+	SessionCost         router.SessionCostConfig   `json:"SessionCost"`
+	SessionCostSrc      string                     `json:"SessionCostSource"`
+	Gates               sessionCostGates           `json:"Gates"`
+	Candidates          []sessionCostCandidateView `json:"Candidates"`
+	CandidatesSource    string                     `json:"CandidatesSource"`
 }
 
 // HandleSessionCostConfig GET /api/v1/admin/session-cost/config
@@ -1521,6 +1527,7 @@ func (h *Admin) HandleSessionCostConfig(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 	cands := h.sessionCostCandidates(ctx, r.URL.Query().Get("Model"), now, sample, globalTC, globalTiers)
+	prof := h.sessionCostSampleProfile(ctx)
 
 	resp.OK(w, r, sessionCostConfigResponse{
 		Now:              now,
@@ -1532,6 +1539,8 @@ func (h *Admin) HandleSessionCostConfig(w http.ResponseWriter, r *http.Request) 
 		TiersSource:      sourceTiersConfig,
 		CostSample:       billing.WireUsage(sample),
 		CostSampleSource: sourceCostSample,
+		SampleProfile:       prof,
+		SampleProfileSource: sourceSampleProfile,
 		SessionCost:      cfg,
 		SessionCostSrc:   sourceSessionCostCfg,
 		Gates: sessionCostGates{
@@ -1590,6 +1599,19 @@ func (h *Admin) sessionCostSample(ctx context.Context) billing.Usage {
 		}
 	}
 	return billing.Usage{Input: 10000, CacheRead: 9000, Output: 1000}
+}
+
+// sessionCostSampleProfile 读取样值补齐比例（routing.sample_profile）；缺失/非法回落内置默认比例
+//（与路由 expandSample 的回落口径一致：解析失败不猜测，此处仅为面板展示方便给默认值）。
+func (h *Admin) sessionCostSampleProfile(ctx context.Context) billing.SampleProfile {
+	if h.billing != nil {
+		if raw, err := h.billing.GetConfig(ctx, "routing.sample_profile"); err == nil {
+			if prof, perr := billing.ParseSampleProfile(raw); perr == nil {
+				return prof
+			}
+		}
+	}
+	return billing.DefaultSampleProfile()
 }
 
 // sessionCostRoutingConfig 读取会话成本路由配置（routing.session_cost）并解析为结构化配置；缺失回落零值。

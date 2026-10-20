@@ -276,15 +276,20 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 	}
 	var sessionID string
 	var sessionName string
+	var sessionTurn int
 	if sessionRaw != "" {
 		sessionID = router.SessionID(token.UserID, token.ID, model, sessionRaw)
 		sessionName = sessionNameFor(sessionRaw, body)
+		// 会话位置 k（已成功完成轮数）：仅用于决策产物的轮次观测（事件 Turn 可回放）。
+		// 剩余轮数按需求取固定值（routing.session_cost.remaining_a），不由 k 预测。
+		sessionTurn = g.router.Sessions().Turns(sessionID)
 	}
-	// 会话成本路由起点样值（Step 10）：路由时刻仅能可靠得到「输入 token」（由请求体估算，tiktoken/字符级）；
-	// 缓存读与输出需上游响应后才知，路由时刻未知 → 仅带输入段（其余段为 0，不编造 token）。
-	// 该样值经 RouteSpec.SessionTokens 仅供「会话成本路由」（Enabled=true 且为起点）择优使用，
-	// 不参与默认成本排序（Enabled=false 时零行为变化）；输入 token 不可估时留 nil，回落全局 routing.cost_sample。
-	// 注：下方组装 RouteSpec 时 SessionTurn 恒传 0（「本会话已完成轮数」待 P2 接线，当前恒 0，安全态无路由影响）。
+	// 会话成本路由样值（Step 10）：路由时刻仅能可靠得到「总输入 token」（由请求体估算）；
+	// 缓存读与输出需上游响应后才知 → 仅带总输入段，其余段为 0，不编造 token。
+	// 引擎会按全局 routing.sample_profile（缓存读/输入比、输出/输入比）把它拆成三段后比较
+	//（见 router.Engine.expandSample），避免退化为「只按输入价择优」。
+	// 该样值经 RouteSpec.SessionTokens 仅供「会话成本路由」使用，不参与默认成本排序
+	//（Enabled=false 时零行为变化）；总输入不可估时留 nil，回落全局 routing.cost_sample。
 	var turnTokens *billing.Usage
 	if in := estimateInputTokens(body, model); in > 0 {
 		turnTokens = &billing.Usage{Input: int64(in)}
@@ -318,7 +323,7 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 						TagID:         token.TagID,
 						SessionKey:    sessionID,
 						SessionTokens: turnTokens,
-						SessionTurn:   0,
+						SessionTurn:   sessionTurn,
 						Now:           g.now(),
 					}); sErr == nil && sRes != nil && len(sRes.Routes) > 0 {
 						model = s.Model
@@ -339,7 +344,7 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 						TagID:         token.TagID,
 						SessionKey:    sessionID,
 						SessionTokens: turnTokens,
-						SessionTurn:   0,
+						SessionTurn:   sessionTurn,
 						Now:           g.now(),
 					})
 					if mErr != nil {
@@ -369,7 +374,7 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 				TagID:         token.TagID,
 				SessionKey:    sessionID,
 				SessionTokens: turnTokens,
-				SessionTurn:   0,
+				SessionTurn:   sessionTurn,
 				Now:           g.now(),
 			}
 			res, rerr := g.router.RouteAllWithExcluded(ctx, routeSpec)
@@ -386,7 +391,7 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 			TagID:         token.TagID,
 			SessionKey:    sessionID,
 			SessionTokens: turnTokens,
-			SessionTurn:   0,
+			SessionTurn:   sessionTurn,
 			Now:           g.now(),
 		}
 		res, rerr := g.router.RouteAllWithExcluded(ctx, routeSpec)
@@ -680,6 +685,23 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 			sawLimit = true
 			attempts = append(attempts, skip("限流"))
 			continue
+		}
+
+		// 会话中途切换确认（F1）：路由层只做「切到哪个候选」的决策，不迁移会话；
+		// 只有目标候选**真正通过**上面的状态复查与限流校验后，才在此迁移会话归属并补发决策事件。
+		// 迁移失败（目标密钥并发会话数已满）→ 视为该候选不可用（等同「会话满」），保持原渠道并 failover。
+		// 这样避免「会话已迁到某渠道、但该渠道随后被限流/跳过」导致的归属偏置与计数错位。
+		// 迁移带真实 ttl（与后续 Renew 同源），使 ExpireAt 随切换一起滑动延长（F8）。
+		if cr.Switch != nil && sessionID != "" {
+			if !g.router.ConfirmSessionSwitch(sessionID, cr, sessionTurn, ttl) {
+				attempts = append(attempts, skip("会话满"))
+				continue
+			}
+			// 迁移成功后会话归属已变，本次请求对本候选而言即为「既有会话命中」。
+			existing = true
+			if s, ok := sess.Lookup(sessionID); ok && s != nil {
+				sessObj = s
+			}
 		}
 
 		// 会话创建：限流已通过，按密钥校验并发上限。槽满只影响该候选 → failover 下一候选

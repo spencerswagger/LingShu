@@ -133,6 +133,12 @@ func (f *fakeCostConfig) ContextTiers() ([]billing.TierRule, error) {
 	return nil, nil
 }
 
+// SampleProfile 满足 CostConfig 接口：返回缺省补齐比例（缓存读 0.9 / 输出 0.1）。
+// 仅影响「只有总输入」的样值展开；本文件用例大多传三段样值，故不受影响。
+func (f *fakeCostConfig) SampleProfile() (billing.SampleProfile, error) {
+	return billing.SampleProfile{CacheReadRatio: 0.9, OutputRatio: 0.1}, nil
+}
+
 // attachTo 在会话注册表上直接建立一条绑定 (keyID, internal) 的存活会话（用于构造存活会话数场景）。
 func attachTo(t *testing.T, r *SessionRegistry, id string, keyID int64, internal string) {
 	t.Helper()
