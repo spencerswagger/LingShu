@@ -590,6 +590,7 @@ func TestMidSwitch_EngineDecidesWithoutMigrating(t *testing.T) {
 
 	// 网关确认采用该候选后才迁移（F8：带真实 ttl，ExpireAt 只增不减）。
 	before, _ := sess.Lookup(key)
+	beforeExpire := before.ExpireAt // 复制值：Migrate 会原地改写同一 *Session 指针
 	if !e.ConfirmSessionSwitch(key, cr, 0, 2*time.Hour) {
 		t.Fatal("确认切换应成功迁移会话")
 	}
@@ -597,8 +598,8 @@ func TestMidSwitch_EngineDecidesWithoutMigrating(t *testing.T) {
 	if !ok || s.ChannelKeyID != 11 || s.InternalModelID != "int1" {
 		t.Fatalf("确认后会话应迁移到新渠道(key=11,int1)，got %+v ok=%v", s, ok)
 	}
-	if !s.ExpireAt.After(before.ExpireAt) {
-		t.Fatalf("迁移应滑动延长 ExpireAt，before=%v after=%v", before.ExpireAt, s.ExpireAt)
+	if !s.ExpireAt.After(beforeExpire) {
+		t.Fatalf("迁移应滑动延长 ExpireAt，before=%v after=%v", beforeExpire, s.ExpireAt)
 	}
 	if sess.CountActive(11) != 1 || sess.CountActive(21) != 0 {
 		t.Fatalf("迁移后计数异常：key11=%d key21=%d", sess.CountActive(11), sess.CountActive(21))
