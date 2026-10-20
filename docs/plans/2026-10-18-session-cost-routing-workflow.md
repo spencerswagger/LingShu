@@ -16,6 +16,11 @@ worktree: false
 
 ## Steps
 
+> **修订（2026-10-20，全量 review 后）**：实现已按设计文档「修订记录」修正 F1–F8。要点：
+> 剩余轮数取固定值 10（不按 k 预测，k 仅作事件轮次观测）；中途切换改为**路由层只决策、网关确认后迁移**
+> （`Engine.ConfirmSessionSwitch`）；新增 `routing.sample_profile` 补齐路由时刻样值三段；影子观测改为独立开关
+> `shadow_enabled`（默认 false）；起点择优 priority 恢复硬分层。以下步骤保留原始执行记录，语义以修正后为准。
+
 - [x] **Step 1: 新增“会话成本路由”配置读取与默认安全态**
 action: 新建 `backend/internal/domain/router/cost_config.go`，定义 `type SessionCostConfig struct { Enabled bool; RemainingA float64; RemainingB float64; RemainingMin int; RemainingMax int; MinRemaining int; CooldownSec int }` 与 `func NewSessionCostProvider(src configSource) *SessionCostProvider`，从 `sys_configs` 键 `routing.session_cost` 读取（JSON 对象，缺省 `{Enabled:false, RemainingA:12, RemainingB:1, RemainingMin:1, RemainingMax:20, MinRemaining:1, CooldownSec:0}`），复用 `billing.ConfigProvider` 的缓存与失效代际机制。`Enabled=false` 为默认安全态（等价现状）。中文注释写明安全态语义。新增 `cost_config_test.go` 断言缺省值与解析。不改现有路由行为。
 loop: false
