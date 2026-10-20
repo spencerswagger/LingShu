@@ -51,8 +51,9 @@ func TestTimeTier_IdleVsPeakFlipsChannelSelection(t *testing.T) {
 	m2 := cm(2, "int2")
 	m2.CostRates = rates // 无时段配置 → 系数 1
 
-	// ch1 高优先级（闲时平价时按优先级优先），ch2 低优先级。
-	e := newTimeTierEngine(t, m1, m2, 100, 50, 2)
+	// 两渠道**同优先级**：平价时由稳定 id 兜底选 ch1；本用例只验证时段系数能否翻转择渠道
+	//（priority 为硬分层，若 ch1 优先级更高则永远选 ch1，无法体现系数差异）。
+	e := newTimeTierEngine(t, m1, m2, 100, 100, 2)
 	tok := billing.Usage{Input: 1000, CacheRead: 2000, Output: 500}
 	ctx := context.Background()
 
@@ -64,7 +65,7 @@ func TestTimeTier_IdleVsPeakFlipsChannelSelection(t *testing.T) {
 		t.Fatalf("route（闲时）: %v", err)
 	}
 	if rIdle.ChannelID != 1 {
-		t.Fatalf("闲时两渠道平价应由优先级选 ch1，got channel %d", rIdle.ChannelID)
+		t.Fatalf("闲时两渠道平价应由稳定 id 兜底选 ch1，got channel %d", rIdle.ChannelID)
 	}
 
 	peak := time.Date(2026, 1, 2, 20, 0, 0, 0, time.UTC) // 高峰：ch1 系数 ×2 → ch1 更贵
@@ -99,7 +100,8 @@ func TestTimeTier_ContextTierFlipsChannelSelection(t *testing.T) {
 	m2 := cm(2, "int2")
 	m2.CostRates = rates // 无分档 → 系数 1
 
-	e := newTimeTierEngine(t, m1, m2, 100, 50, 2)
+	// 两渠道同优先级：小上下文平价时由稳定 id 兜底选 ch1，大上下文由分档系数翻转择 ch2。
+	e := newTimeTierEngine(t, m1, m2, 100, 100, 2)
 	now := time.Date(2026, 1, 2, 12, 0, 0, 0, time.UTC)
 	ctx := context.Background()
 
@@ -111,7 +113,7 @@ func TestTimeTier_ContextTierFlipsChannelSelection(t *testing.T) {
 		t.Fatalf("route（小上下文）: %v", err)
 	}
 	if rSmall.ChannelID != 1 {
-		t.Fatalf("小上下文两渠道平价应由优先级选 ch1，got channel %d", rSmall.ChannelID)
+		t.Fatalf("小上下文两渠道平价应由稳定 id 兜底选 ch1，got channel %d", rSmall.ChannelID)
 	}
 
 	big := billing.Usage{Input: 6000, CacheRead: 4000, Output: 200} // 10000 ≥ 8000 → ch1 系数 2 → 更贵

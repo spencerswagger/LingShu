@@ -1596,6 +1596,19 @@ func (h *Admin) sessionCostSample(ctx context.Context) billing.Usage {
 	return billing.Usage{Input: 10000, CacheRead: 9000, Output: 1000}
 }
 
+// sessionCostSampleProfile 读取样值补齐比例（routing.sample_profile）；缺失/非法回落内置默认比例
+//（与路由 expandSample 的回落口径一致：解析失败不猜测，此处仅为面板展示方便给默认值）。
+func (h *Admin) sessionCostSampleProfile(ctx context.Context) billing.SampleProfile {
+	if h.billing != nil {
+		if raw, err := h.billing.GetConfig(ctx, "routing.sample_profile"); err == nil {
+			if prof, perr := billing.ParseSampleProfile(raw); perr == nil {
+				return prof
+			}
+		}
+	}
+	return billing.DefaultSampleProfile()
+}
+
 // sessionCostRoutingConfig 读取会话成本路由配置（routing.session_cost）并解析为结构化配置；缺失回落零值。
 func (h *Admin) sessionCostRoutingConfig(ctx context.Context) (router.SessionCostConfig, []byte) {
 	var raw []byte

@@ -590,7 +590,7 @@ func TestMidSwitch_EngineDecidesWithoutMigrating(t *testing.T) {
 
 	// 网关确认采用该候选后才迁移（F8：带真实 ttl，ExpireAt 只增不减）。
 	before, _ := sess.Lookup(key)
-	if !e.ConfirmSessionSwitch(key, cr, 0, time.Hour) {
+	if !e.ConfirmSessionSwitch(key, cr, 0, 2*time.Hour) {
 		t.Fatal("确认切换应成功迁移会话")
 	}
 	s, ok := sess.Lookup(key)
