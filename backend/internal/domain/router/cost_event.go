@@ -32,8 +32,9 @@ type SessionCostEvent struct {
 	SessionID string `json:"session_id"`
 	Turn      int    `json:"turn"`
 	// Seq 是本次发射的单调唯一序号（由 sink 在 Submit 时分配，随 Payload 落 WAL）。
-	// 仅用于构成 asyncwrite 幂等键：网关 SessionTurn 尚未接线（恒 0），无法区分轮次，
-	// 故以 Seq 保证「每一次独立决策」唯一，避免同轮次多次决策（影子记录 / 来回切换）撞键被去重丢弃；
+	// 仅用于构成 asyncwrite 幂等键：Turn 现由会话轮次（SessionRegistry.Turns）驱动、可重复取值
+	// （如影子记录与真实切换可能同轮次），故不能单独作为幂等键；
+	// 以 Seq 保证「每一次独立决策」唯一，避免同轮次多次决策撞键被去重丢弃；
 	// 同一条记录崩溃重放时复用同一 Seq，保持「同一次发射」幂等。
 	Seq      uint64              `json:"seq"`
 	Decision SessionCostDecision `json:"decision"`
@@ -52,7 +53,7 @@ type SessionCostEvent struct {
 // 保序与幂等（不允许隐性乱序 / 隐性重复）：
 //   - Key = session_id：同一会话的全部事件被哈希到同一分片串行执行，保证同会话决策产物保序；
 //   - IdempotencyKey = session_id + ":" + Seq：Seq 每次发射单调唯一，保证「每一次独立决策」各自留痕
-//     （网关 SessionTurn 恒 0，无法用轮次区分），同一条记录重放时复用同一键（进程内去重）；
+//     （Turn 来自会话轮次、可能在同一轮次内产生多条独立决策，不足以区分），同一条记录重放时复用同一键（进程内去重）；
 //   - Payload 编码完整决策产物，崩溃重启后由 KindSessionCostEvent 重放函数重建副作用；
 //   - 失败任务保留 WAL 记录待重启重放（不静默丢失决策轨迹）。
 type asyncCostEventSink struct {

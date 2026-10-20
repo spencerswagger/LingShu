@@ -88,11 +88,6 @@ type RouteResult struct {
 	Cost      float64
 	CostKnown bool    // 成本是否有效（false=单价缺失/全 0，视为最贵）
 	TimeCoeff float64 // 选中候选的时段系数（模型级优先，回落全局/1）
-	// SwitchFromKeyID 非 0 表示本候选是「会话中途切换」的决策目标（原归属渠道密钥 ID）。
-	// 引擎只做决策、**不迁移会话**；由网关在本候选通过可用性/限流校验后调用
-	// SessionRegistry.Migrate 完成迁移（保证会话归属与真实落点一致，见 gateway/handler.go）。
-	// 起点择优不设置（起点无旧渠道、不需迁移）。
-	SwitchFromKeyID int64
 }
 
 // ChannelRoute 单个候选渠道的路由信息，供网关在超限/429 时按序切换渠道（failover）。
@@ -111,8 +106,8 @@ type ChannelRoute struct {
 	// Switch 非 nil 表示本候选是「会话中途切换」的决策目标（含完整决策产物）。
 	// 引擎只做决策、**不迁移会话**：由网关在本候选通过可用性/限流校验后调用
 	// Engine.ConfirmSessionSwitch 完成迁移并补发决策产物事件，保证会话归属与真实落点一致。
+	// 原归属渠道由 Decision.FromChannelKeyID 承载，不再单列重复字段。
 	Switch          *SessionCostDecision
-	SwitchFromKeyID int64   // 切换前的归属渠道密钥 ID（Switch 非 nil 时有效）
 	CrossCacheRead  float64 // 本次切换的临界缓存读（Switch 非 nil 时有效）
 	CrossCacheKnown bool
 }
@@ -328,7 +323,6 @@ type candidate struct {
 	keyState  channel.State
 	// 会话中途切换：决定切换时回填到目标候选上，由 RouteAllWithExcluded 转交网关执行迁移。
 	switchDecision      *SessionCostDecision
-	switchFromKeyID     int64
 	crossCacheRead      float64
 	crossCacheReadKnown bool
 }
@@ -386,7 +380,6 @@ func (e *Engine) RouteAllWithExcluded(ctx context.Context, spec RouteSpec) (*Rou
 			CostKnown:       c.costKnown,
 			TimeCoeff:       c.timeCoeff,
 			Switch:          c.switchDecision,
-			SwitchFromKeyID: c.switchFromKeyID,
 			CrossCacheRead:  c.crossCacheRead,
 			CrossCacheKnown: c.crossCacheReadKnown,
 		})
@@ -841,20 +834,27 @@ func (e *Engine) midSwitch(cur *candidate, alts []candidate, now time.Time, samp
 	// 决策轨迹附带本次的临界缓存读（crossCacheRead）：旧渠道 vs 新渠道每轮成本打平的缓存读量，
 	// 供控制台「会话成本路由」面板按会话聚合分位/直方（未知=两渠道缓存读价相等，则标记 Known=false）。
 	target.crossCacheRead, target.crossCacheReadKnown = crossCacheRead(curCC, bestCC, sample.Input, sample.Output)
-	target.switchFromKeyID = cur.keyID
 	// 复制一份决策产物挂在候选上（避免多个候选共享同一指针被后续改写）。
 	d := bestD
 	target.switchDecision = &d
 
-	// 新渠道优先；其余候选（去掉被选中的目标）按既有择序规则续排，保证结果确定且可 failover。
+	// 目标渠道优先；原归属渠道作为**首选回退**紧随其后（它仍是健康的、且已建立缓存），
+	// 最后是其余候选按既有择序规则续排。
+	//
+	// 为什么必须保留原归属渠道（F1）：引擎只做决策、不迁移会话；真正的迁移发生在网关
+	// （ConfirmSessionSwitch），若目标密钥并发会话已满而迁移失败，网关会跳过该候选。
+	// 此时若候选序列里没有原渠道，请求就只能落到其它渠道或 503——既丢掉了「保持亲和」的
+	// 兜底，也与「迁移失败即保持原渠道」的意图不符。
+	out := make([]candidate, 0, len(alts)+1)
+	out = append(out, target, *cur)
 	rest := make([]candidate, 0, len(alts)-1)
 	for i := range alts {
 		if i != bestIdx {
 			rest = append(rest, alts[i])
 		}
 	}
-	ordered := e.orderCandidates(rest, now, sample, globalTC, globalTiers)
-	return append([]candidate{target}, ordered...), true
+	out = append(out, e.orderCandidates(rest, now, sample, globalTC, globalTiers)...)
+	return out, true
 }
 
 // ConfirmSessionSwitch 在网关确认「会话中途切换」的目标候选真正被采用（已通过可用性/限流校验）后调用：
@@ -1004,14 +1004,24 @@ func (e *Engine) expandSample(u billing.Usage) billing.Usage {
 	}
 	total := float64(u.Input)
 	pureInput := total / (1 + ratio)
-	cacheRead := total - pureInput
+	// 先定纯输入（四舍五入），再由「总输入 − 纯输入」得缓存读：
+	// 保证 Input + CacheRead 恒等于原始总输入（不因两处独立取整出现 ±1 漂移，
+	// 否则分档落档依据（Input+CacheRead）会与请求实际规模不一致）。
+	pi := int64(math.Round(pureInput))
+	if pi < 0 {
+		pi = 0
+	}
+	if pi > u.Input {
+		pi = u.Input
+	}
+	cacheRead := u.Input - pi
 	out := 0.0
 	if prof.OutputRatio > 0 && !math.IsNaN(prof.OutputRatio) && !math.IsInf(prof.OutputRatio, 0) {
-		out = pureInput * prof.OutputRatio
+		out = float64(pi) * prof.OutputRatio
 	}
 	return billing.Usage{
-		Input:     int64(math.Round(pureInput)),
-		CacheRead: int64(math.Round(cacheRead)),
+		Input:     pi,
+		CacheRead: cacheRead,
 		Output:    int64(math.Round(out)),
 	}
 }
