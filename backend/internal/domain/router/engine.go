@@ -761,7 +761,7 @@ func (e *Engine) orderStartPick(cands []candidate, now time.Time, sessionSample 
 // 重要：本函数只做决策，**不迁移会话、不发事件**。原因（F1）：路由阶段尚不知道目标候选能否真正
 // 承载本次请求（随后还要过密钥/模型状态复查、模型级与密钥级限流、并发会话上限）。若在此处迁移，
 // 一旦目标候选被限流/跳过，会话归属会偏置到从未服务过的渠道，且并发计数错位。
-// 故决策产物与切换前归属一并挂在目标候选上（candidate.switchDecision/switchFromKeyID），
+// 故决策产物挂在目标候选上（candidate.switchDecision，原归属渠道见 Decision.FromChannelKeyID），
 // 由网关在目标候选通过全部校验后调用 Engine.ConfirmSessionSwitch 完成迁移 + 补发事件。
 //
 // 保守计价（D6）：一律按最坏情况计入一次性重灌代价，不检测 provider 缓存失效（压缩/TTL 空闲过期网关不可感知）；

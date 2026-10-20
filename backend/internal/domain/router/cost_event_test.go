@@ -37,8 +37,8 @@ func (f *fakeCostEventSink) snapshot() []SessionCostEvent {
 }
 
 // TestCostEvent_AsyncSubmitsEachEmission 锁定：启用异步时每一次发射都各自留痕。
-// 注：不再按 (session, turn) 去重——网关 SessionTurn 恒 0，按轮次去重会把同轮次的多次独立决策
-// 静默丢弃；幂等键改为每次发射唯一的 session:Seq（见 Submit 注释）。
+// 注：不按 (session, turn) 去重——同一会话同一轮次可产生多条独立决策（如影子记录 + 真实切换），
+// 按轮次去重会把后发的静默丢弃；幂等键改为每次发射唯一的 session:Seq（见 Submit 注释）。
 func TestCostEvent_AsyncSubmitsEachEmission(t *testing.T) {
 	ctx := context.Background()
 	w := asyncwrite.New(asyncwrite.Config{
@@ -83,8 +83,8 @@ func TestCostEvent_AsyncSubmitsEachEmission(t *testing.T) {
 	}
 }
 
-// TestCostEvent_SameTurnSameTransitionNotDeduped 回归：网关 SessionTurn 恒 0 时，
-// 同一会话内「同一轮次、同一 from>to 转移」的多次独立决策（如影子记录、来回切换）必须各自留痕，
+// TestCostEvent_SameTurnSameTransitionNotDeduped 回归：同一会话「同一轮次、同一 from>to 转移」的
+// 多次独立决策（如影子记录、来回切换）必须各自留痕，
 // 不得因幂等键撞车被 asyncwrite 去重丢弃（旧实现用 session:turn:from>to 会把后发的静默丢弃）。
 func TestCostEvent_SameTurnSameTransitionNotDeduped(t *testing.T) {
 	ctx := context.Background()
@@ -107,7 +107,7 @@ func TestCostEvent_SameTurnSameTransitionNotDeduped(t *testing.T) {
 
 	ev := SessionCostEvent{
 		SessionID: "s-collide",
-		Turn:      0, // 网关现状：恒 0
+		Turn:      0, // 同轮次内的多次独立决策（不按轮次去重）
 		Decision:  SessionCostDecision{Switch: false, FromChannelKeyID: 7, ToChannelKeyID: 9},
 	}
 	for i := 0; i < 3; i++ {
