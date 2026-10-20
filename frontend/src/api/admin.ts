@@ -1233,3 +1233,89 @@ export function getSessionCostDistribution() {
     '/admin/session-cost/distribution',
   )
 }
+
+// ===== 成本（只读；字段名 = 后端 Go 结构体字段名）=====
+// 渠道 × 内部模型 维度的成本统计行：成本/售价（积分）、三段 token 与派生比率。
+// CacheHitRate 为 0~1 比率（缓存读 ÷ (输入+缓存读)）；InputOutputRatio = 输入 ÷ 输出。
+export interface CostStatRow {
+  ChannelID: number
+  ChannelName: string
+  InternalModelID: string
+  ExternalModelName: string
+  CostCredits: number
+  SaleCredits: number
+  Requests: number
+  InputTokens: number
+  CacheReadTokens: number
+  OutputTokens: number
+  CacheHitRate: number
+  InputOutputRatio: number
+}
+// 成本统计汇总行：与 CostStatRow 同口径，但不含渠道/模型维度字段（全量合计）。
+export interface CostStatTotal {
+  CostCredits: number
+  SaleCredits: number
+  Requests: number
+  InputTokens: number
+  CacheReadTokens: number
+  OutputTokens: number
+  CacheHitRate: number
+  InputOutputRatio: number
+}
+// 成本统计：Rows 为逐行明细，Total 为全量汇总行（口径同 Rows，仅缺维度字段）
+export function getCostStats() {
+  return http.get<
+    { Rows: CostStatRow[]; Total: CostStatTotal },
+    ApiRes<{ Rows: CostStatRow[]; Total: CostStatTotal }>
+  >('/admin/cost/stats')
+}
+// 全平台 token 默认值（仅由 token 求和得出，与金额解耦）
+export interface CostDefaults {
+  PerTurnInputTokens: number
+  CacheHitRate: number
+  InputOutputRatio: number
+}
+export function getCostDefaults() {
+  return http.get<CostDefaults, ApiRes<CostDefaults>>('/admin/cost/defaults')
+}
+// 定价曲线：某「渠道 × 内部模型」在轮次 1..Turns 上的每轮成本/售价（积分）
+export interface CurveItem {
+  ChannelID: number
+  ChannelName: string
+  InternalModelID: string
+  ExternalModelName: string
+  Cost: number[]
+  Sale: number[]
+}
+export interface CostCurvesData {
+  Turns: number
+  Curves: CurveItem[]
+}
+export function getCostCurves(params: {
+  perTurnInput: number
+  hitRate: number
+  inOutRatio: number
+  turns: number
+}) {
+  return http.get<CostCurvesData, ApiRes<CostCurvesData>>('/admin/cost/curves', { params })
+}
+// 会话逐轮成本点（取历史实际 cost_credits / credits_consumed）
+export interface SessionPoint {
+  Turn: number
+  CallTime: string
+  ChannelName: string
+  InternalModelID: string
+  InputTokens: number
+  CacheReadTokens: number
+  OutputTokens: number
+  CostCredits: number
+  SaleCredits: number
+}
+export interface CostSessionData {
+  SessionID: string
+  Points: SessionPoint[]
+  Totals: { CostCredits: number; SaleCredits: number }
+}
+export function getCostSession(id: string) {
+  return http.get<CostSessionData, ApiRes<CostSessionData>>(`/admin/cost/session/${id}`)
+}
