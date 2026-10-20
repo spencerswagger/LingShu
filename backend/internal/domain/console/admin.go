@@ -41,6 +41,7 @@ type Admin struct {
 	routeEng       routeEngine                                                      // 路由引擎（服务状态候选顺序来源；经 SetRouterEngine 注入；nil=不计算候选）
 	models         externalModelSource                                              // 对外模型只读枚举（经 SetModelSource 注入；nil=列表为空）
 	sessionCostEvt *router.SessionCostEventStore                                    // 会话成本决策产物进程内存储（经 SetSessionCostEventStore 注入；nil=事件流为空）
+	rProvider      costRProvider                                                    // 积分换算系数 R 来源（经 SetCostRProvider 注入；nil=未装配时成本曲线回退默认 10000）
 }
 
 // routeEngine 聚合端点所需的路由引擎能力（router.Engine 满足）。
@@ -98,6 +99,10 @@ func (h *Admin) SetModelSource(s externalModelSource) { h.models = s }
 // SetSessionCostEventStore 注入会话成本决策产物进程内存储（「会话成本路由」面板 /events、/distribution 数据源）。
 // nil 时事件流/分布为空、不报错。
 func (h *Admin) SetSessionCostEventStore(s *router.SessionCostEventStore) { h.sessionCostEvt = s }
+
+// SetCostRProvider 注入积分换算系数 R 的来源（billing.ConfigProvider 满足）。成本曲线按「÷R」把
+// Σ(token×费率) 换算为积分；nil=未装配时回退默认 10000（billing.r 默认值）。
+func (h *Admin) SetCostRProvider(p costRProvider) { h.rProvider = p }
 
 // attachCallLog 查 call_logs 并填充账单详情（未装配/无记录时为 nil）。
 func (h *Admin) attachCallLog(ctx context.Context, bid string) *CallLogView {
