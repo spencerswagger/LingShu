@@ -1149,6 +1149,8 @@ export interface SessionCostRoutingConfig {
   cooldown_sec: number
   mid_switch: boolean
   min_improve: number
+  // 影子观测独立开关（P0，默认 false）：未启用切换时是否仍记录「若启用则会切换」的假设事件
+  shadow_enabled: boolean
 }
 export interface SessionCostConfigData {
   Now: string
@@ -1174,10 +1176,12 @@ export function getSessionCostConfig(Model = '') {
   )
 }
 
-// 单条会话成本决策事件视图（PaybackTurns 为 NaN/Inf 时后端序列化为 null）
+// 单条会话成本决策事件视图（PaybackTurns/PaybackLimit 为 NaN/Inf 时后端序列化为 null）
 export interface SessionCostEventView {
   SessionID: string
   Turn: number
+  // Shadow=true 表示影子假设记录（渠道实际未变，仅记录「若启用则会切换」的假设节省）
+  Shadow: boolean
   Switch: boolean
   FromChannelKeyID: string
   ToChannelKeyID: string

@@ -76,6 +76,12 @@ func parseSampleProfile(raw []byte) (SampleProfile, error) {
 	return prof, nil
 }
 
+// DefaultSampleProfile 返回缺省补齐比例（导出给控制台面板，保证与路由口径同源）。
+func DefaultSampleProfile() SampleProfile { return defaultSampleProfile() }
+
+// ParseSampleProfile 解析 routing.sample_profile 原始 JSON（导出给控制台面板，缺省字段用默认比例补齐）。
+func ParseSampleProfile(raw []byte) (SampleProfile, error) { return parseSampleProfile(raw) }
+
 // Store 提供 billing_records 的数据访问。由基于 *sql.DB 的 SqlStore 实现。
 type Store interface {
 	GetByBillingID(ctx context.Context, billingID string) (*Record, error)
