@@ -42,9 +42,12 @@ type SessionCostDecision struct {
 	Reason         string
 }
 
-// remainingTurns 经验式剩余轮数：k 为已进行的轮数（或某种负载指标），
-// 结果 = clamp(RemainingA - RemainingB×k, RemainingMin, RemainingMax)。
-// 夹取到 [RemainingMin, RemainingMax]，保证剩余轮数永远是有界正整数。
+// remainingTurns 预计剩余轮数。
+//
+// 需求已定：**不再按会话位置 k 预测**，取固定值——默认配置 RemainingA=10、RemainingB=0，
+// 即 clamp(10 − 0×k, RemainingMin, RemainingMax) ≡ 10。参数保留以便运维微调，或将来恢复经验式
+// （把 RemainingB 设为正值即回到 clamp(a − b·k, min, max) 的语义）。
+// k 仅用于决策产物观测，不参与本函数的结果（RemainingB=0 时）。
 func remainingTurns(k int, cfg SessionCostConfig) int {
 	v := cfg.RemainingA - cfg.RemainingB*float64(k)
 	n := int(v)

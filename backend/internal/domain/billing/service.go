@@ -36,7 +36,51 @@ const (
 	cfgTimeConfig = "billing.time_config"
 	cfgCnyRate    = "billing.cny_rate"
 	cfgCostSample = "routing.cost_sample"
+	// cfgSampleProfile 是路由样值补齐比例（缓存读/纯输入、输出/纯输入）。
+	cfgSampleProfile = "routing.sample_profile"
 )
+
+// SampleProfile 是 routing.sample_profile 的解析结果：两个「相对纯输入」的比例，
+// 用于把「只有输入段（缓存读/输出未知）」的样值补齐为三段（供会话成本路由在路由时刻
+// 无缓存读/输出实测值时估算真实规模）。口径：
+//   - CacheReadRatio = 缓存读 token / 纯输入 token（默认 0.9，与 routing.cost_sample 默认样值同源）；
+//   - OutputRatio    = 输出 token / 纯输入 token（默认 0.1，同上）。
+//
+// 三段口径：纯输入 + 缓存读 = 总输入（prompt）。故给定总输入 P 时，纯输入 = P / (1 + CacheReadRatio)。
+type SampleProfile struct {
+	CacheReadRatio float64 `json:"cache_read_ratio"`
+	OutputRatio    float64 `json:"output_ratio"`
+}
+
+// defaultSampleProfile 缺省比例（与 routing.cost_sample 默认样值 10000/9000/1000 同源）。
+func defaultSampleProfile() SampleProfile {
+	return SampleProfile{CacheReadRatio: 0.9, OutputRatio: 0.1}
+}
+
+// parseSampleProfile 解析 routing.sample_profile：字段可缺省（用默认比例补齐）；JSON 非法返回错误。
+func parseSampleProfile(raw []byte) (SampleProfile, error) {
+	var in struct {
+		CacheReadRatio *float64 `json:"cache_read_ratio"`
+		OutputRatio    *float64 `json:"output_ratio"`
+	}
+	if err := json.Unmarshal(raw, &in); err != nil {
+		return SampleProfile{}, fmt.Errorf("解析 routing.sample_profile: %w", err)
+	}
+	prof := defaultSampleProfile()
+	if in.CacheReadRatio != nil {
+		prof.CacheReadRatio = *in.CacheReadRatio
+	}
+	if in.OutputRatio != nil {
+		prof.OutputRatio = *in.OutputRatio
+	}
+	return prof, nil
+}
+
+// DefaultSampleProfile 返回缺省补齐比例（导出给控制台面板，保证与路由口径同源）。
+func DefaultSampleProfile() SampleProfile { return defaultSampleProfile() }
+
+// ParseSampleProfile 解析 routing.sample_profile 原始 JSON（导出给控制台面板，缺省字段用默认比例补齐）。
+func ParseSampleProfile(raw []byte) (SampleProfile, error) { return parseSampleProfile(raw) }
 
 // Store 提供 billing_records 的数据访问。由基于 *sql.DB 的 SqlStore 实现。
 type Store interface {
@@ -543,6 +587,9 @@ type ConfigProvider interface {
 	TimeConfig() (TimeCoeffConfig, error)
 	// SampleUsage 读取路由成本比较样值用量（routing.cost_sample）。
 	SampleUsage() (Usage, error)
+	// SampleProfile 读取样值补齐比例（routing.sample_profile）：路由时刻只有输入段时，
+	// 按该比例估算缓存读/输出，补齐为三段（会话成本路由用）。缺失/解析失败返回错误。
+	SampleProfile() (SampleProfile, error)
 	// InvalidateCostConfig 清空配置相关的内存缓存（样值 + 全局时段 + R + 上下文分档）。
 	// 由装配层在 sys_configs 写入后调用（见 SqlStore.SetConfigWriteHook），保证配置修改即时生效。
 	InvalidateCostConfig()
@@ -565,6 +612,7 @@ type defaultConfigProvider struct {
 
 	mu      sync.RWMutex
 	sample  *Usage           // 缓存的路由成本样值（nil=未缓存）
+	profile *SampleProfile   // 缓存的样值补齐比例（nil=未缓存）
 	timeCfg *TimeCoeffConfig // 缓存的全局时段配置（nil=未缓存）
 	r       *int64           // 缓存的 billing.r（nil=未缓存）
 	tiers   *[]TierRule      // 缓存的 billing.context_tiers（nil=未缓存）
@@ -589,6 +637,7 @@ func (p *defaultConfigProvider) InvalidateCostConfig() {
 	p.mu.Lock()
 	p.gen++
 	p.sample = nil
+	p.profile = nil
 	p.timeCfg = nil
 	p.r = nil
 	p.tiers = nil
@@ -771,6 +820,41 @@ func (p *defaultConfigProvider) SampleUsage() (Usage, error) {
 		p.mu.Unlock()
 	}
 	return u, nil
+}
+
+// SampleProfile 读取 routing.sample_profile（样值补齐比例，带内存缓存，见 defaultConfigProvider 缓存说明）。
+// 缺失/解析失败返回错误（调用方回落全局 routing.cost_sample）；字段缺省用默认比例（0.9 / 0.1）补齐。
+// cacheOff 时读写缓存均跳过（与 SampleUsage/ContextTiers 一致），退回直查 DB。
+func (p *defaultConfigProvider) SampleProfile() (SampleProfile, error) {
+	var gen uint64
+	if !p.cacheOff {
+		p.mu.RLock()
+		cached := p.profile
+		gen = p.gen
+		p.mu.RUnlock()
+		if cached != nil {
+			return *cached, nil
+		}
+	}
+
+	raw, err := p.src.GetConfig(context.Background(), cfgSampleProfile)
+	if err != nil {
+		return SampleProfile{}, err
+	}
+	prof, err := parseSampleProfile(raw)
+	if err != nil {
+		return SampleProfile{}, err
+	}
+
+	if !p.cacheOff {
+		p.mu.Lock()
+		// 仅当回源期间未发生失效（代际未变）才回填（见 defaultConfigProvider 说明）。
+		if p.gen == gen {
+			p.profile = &prof
+		}
+		p.mu.Unlock()
+	}
+	return prof, nil
 }
 
 // ===== SqlStore（billing_records + sys_configs）=====

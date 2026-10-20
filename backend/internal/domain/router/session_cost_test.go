@@ -324,9 +324,9 @@ func TestStartPick_Enabled_ChoosesMinPerTurnCost(t *testing.T) {
 		t.Fatalf("用例构造失败：期望 ch1 本轮花费更小, ch1=%v ch2=%v", want1, want2)
 	}
 
-	// ch1 低优先级（50）、ch2 高优先级（100）：默认（Enabled=false）按优先级选 ch2，
-	// 启用起点择优后按本轮花费选 ch1 —— 二者通道不同，可鉴别开关是否真正生效。
-	e, _ := newStartPickEngine(t, true, rates1, rates2, 50, 100, 2)
+	// ch1 与 ch2 **同优先级**：起点择优在同层内按本轮花费选 ch1；
+	// ch2 的高优先级版本由 TestStartPick_PriorityOutranksCost 单独锁定（priority 不起作用时才比成本）。
+	e, _ := newStartPickEngine(t, true, rates1, rates2, 100, 100, 2)
 
 	r, err := e.Route(context.Background(), RouteSpec{
 		ExternalModel: "qw-max", SessionKey: "s-start", SessionTokens: &tok,
@@ -347,7 +347,8 @@ func TestStartPick_Enabled_ChoosesMinPerTurnCost(t *testing.T) {
 		t.Fatalf("起点重灌代价应为 0: got=%v", d.RechargeCost)
 	}
 
-	// Enabled=false 门控：完全保持现状（priority 为硬分层 → 选高优先级的 ch2）。
+	// Enabled=false 门控：完全保持现状——默认排序用全局 routing.cost_sample（默认样值
+	// 10000/9000/1000 下 ch2 更便宜），不使用会话本轮样值，故落在 ch2；与启用态（ch1）可鉴别。
 	e.SetSessionCostProvider(sessionCostProvider(t, false))
 	r0, err := e.Route(context.Background(), RouteSpec{
 		ExternalModel: "qw-max", SessionKey: "s-start-off", SessionTokens: &tok,
@@ -536,9 +537,12 @@ func TestMidSwitch_HoldsBelowCriticalCacheRead(t *testing.T) {
 	}
 }
 
-// TestMidSwitch_EngineSwitchesAndMigratesSession 引擎级：Enabled+MidSwitch 且为中途（亲和命中）时，
-// 按回本门控切到本轮更便宜的渠道，并把会话归属迁移到新渠道（Lookup 反映新密钥、计数迁移）。
-func TestMidSwitch_EngineSwitchesAndMigratesSession(t *testing.T) {
+// TestMidSwitch_EngineDecidesWithoutMigrating（F1）引擎级：Enabled+MidSwitch 且为中途（亲和命中）时，
+// 按回本门控决策切到本轮更便宜的渠道，但**路由阶段不迁移会话**——决策产物与切换前归属挂在目标候选上，
+// 由网关在候选通过可用性/限流校验后调用 ConfirmSessionSwitch 才真正迁移（Lookup/计数随之更新）。
+//
+// 这样避免「会话已迁到某渠道、但该渠道随后被限流/跳过」导致的归属偏置与并发计数错位。
+func TestMidSwitch_EngineDecidesWithoutMigrating(t *testing.T) {
 	rates1, rates2 := midSwitchRates()
 	tok := startPickSample()
 
@@ -546,20 +550,197 @@ func TestMidSwitch_EngineSwitchesAndMigratesSession(t *testing.T) {
 	key := "s-mid"
 	attachTo(t, sess, key, 21, "int2") // 中途：会话亲和命中更贵的 ch2
 
-	r, err := e.Route(context.Background(), RouteSpec{
+	res, err := e.RouteAllWithExcluded(context.Background(), RouteSpec{
 		ExternalModel: "qw-max", SessionKey: key, SessionTokens: &tok,
 	})
 	if err != nil {
 		t.Fatalf("route: %v", err)
 	}
-	if r.ChannelID != 1 {
-		t.Fatalf("中途应切到本轮更便宜的 ch1，got channel %d", r.ChannelID)
+	if len(res.Routes) == 0 {
+		t.Fatal("应有候选")
 	}
-	if s, ok := sess.Lookup(key); !ok || s.ChannelKeyID != 11 || s.InternalModelID != "int1" {
-		t.Fatalf("切换后会话应迁移到新渠道(key=11,int1)，got %+v ok=%v", s, ok)
+	cr := res.Routes[0]
+	if cr.ChannelID != 1 || cr.ChannelKeyID != 11 {
+		t.Fatalf("中途应决策切到本轮更便宜的 ch1，got channel %d key=%d", cr.ChannelID, cr.ChannelKeyID)
+	}
+	if cr.Switch == nil {
+		t.Fatal("目标候选应携带切换决策产物（Switch 非 nil）")
+	}
+	if !cr.Switch.Switch || cr.Switch.ToChannelKeyID != 11 || cr.Switch.FromChannelKeyID != 21 {
+		t.Fatalf("决策产物不符：%+v", cr.Switch)
+	}
+	// F4：目标候选必须回填成本标量/时段系数（否则决策轨迹显示「成本 0/未知」）。
+	if !cr.CostKnown || cr.Cost <= 0 {
+		t.Fatalf("目标候选应回填有效成本，got known=%v cost=%v", cr.CostKnown, cr.Cost)
+	}
+	if cr.TimeCoeff <= 0 {
+		t.Fatalf("目标候选应回填时段系数，got %v", cr.TimeCoeff)
+	}
+
+	// 路由阶段**不得**迁移会话（仍是旧的 key 21 / int2）。
+	if s, ok := sess.Lookup(key); !ok || s.ChannelKeyID != 21 || s.InternalModelID != "int2" {
+		t.Fatalf("路由阶段不应迁移会话，got %+v ok=%v", s, ok)
+	}
+	if sess.CountActive(21) != 1 || sess.CountActive(11) != 0 {
+		t.Fatalf("路由阶段计数不应变化：key21=%d key11=%d", sess.CountActive(21), sess.CountActive(11))
+	}
+	// F1 回退保障：原归属渠道（key 21）必须保留在候选序列中作为首选回退——
+	// 若目标密钥并发已满导致 ConfirmSessionSwitch 失败，网关需能回到仍健康的原渠道而非 503。
+	if len(res.Routes) < 2 {
+		t.Fatalf("候选序列应至少含「目标 + 原渠道」两候选，got %d", len(res.Routes))
+	}
+	if fb := res.Routes[1]; fb.ChannelKeyID != 21 || fb.InternalModelID != "int2" {
+		t.Fatalf("第 2 候选应为原归属渠道(key=21,int2)，got key=%d model=%q", fb.ChannelKeyID, fb.InternalModelID)
+	}
+	if res.Routes[1].Switch != nil {
+		t.Fatalf("回退候选不应携带切换决策产物（它不是切换目标）")
+	}
+
+	// 网关确认采用该候选后才迁移（F8：带真实 ttl，ExpireAt 只增不减）。
+	before, _ := sess.Lookup(key)
+	beforeExpire := before.ExpireAt // 复制值：Migrate 会原地改写同一 *Session 指针
+	if !e.ConfirmSessionSwitch(key, cr, 0, 2*time.Hour) {
+		t.Fatal("确认切换应成功迁移会话")
+	}
+	s, ok := sess.Lookup(key)
+	if !ok || s.ChannelKeyID != 11 || s.InternalModelID != "int1" {
+		t.Fatalf("确认后会话应迁移到新渠道(key=11,int1)，got %+v ok=%v", s, ok)
+	}
+	if !s.ExpireAt.After(beforeExpire) {
+		t.Fatalf("迁移应滑动延长 ExpireAt，before=%v after=%v", beforeExpire, s.ExpireAt)
 	}
 	if sess.CountActive(11) != 1 || sess.CountActive(21) != 0 {
 		t.Fatalf("迁移后计数异常：key11=%d key21=%d", sess.CountActive(11), sess.CountActive(21))
+	}
+}
+
+// TestMidSwitch_PriorityOutranksCost（F6）起点择优的 priority 是硬分层：低优先级渠道即便本轮更便宜，
+// 也不得压过高优先级渠道（与默认排序同语义）。
+func TestMidSwitch_PriorityOutranksCost(t *testing.T) {
+	tok := startPickSample()
+	// ch1 本轮花费更小（缓存读更便宜），但优先级只有 50；ch2 更贵但优先级 100。
+	rates1 := billing.Rates{"input": 0.3, "output": 1.5, "cache_read": 0.05}
+	rates2 := billing.Rates{"input": 0.3, "output": 1.5, "cache_read": 0.10}
+
+	e, _ := newStartPickEngine(t, true, rates1, rates2, 50, 100, 2)
+	r, err := e.Route(context.Background(), RouteSpec{
+		ExternalModel: "qw-max", SessionKey: "s-priority", SessionTokens: &tok,
+	})
+	if err != nil {
+		t.Fatalf("route: %v", err)
+	}
+	if r.ChannelID != 2 {
+		t.Fatalf("priority 应优先于成本：应选高优先级的 ch2，got channel %d", r.ChannelID)
+	}
+
+	// 同优先级时才按本轮花费择优（此时 ch1 胜出）。
+	e2, _ := newStartPickEngine(t, true, rates1, rates2, 100, 100, 2)
+	r2, err := e2.Route(context.Background(), RouteSpec{
+		ExternalModel: "qw-max", SessionKey: "s-same-priority", SessionTokens: &tok,
+	})
+	if err != nil {
+		t.Fatalf("route2: %v", err)
+	}
+	if r2.ChannelID != 1 {
+		t.Fatalf("同优先级应按本轮花费选 ch1，got channel %d", r2.ChannelID)
+	}
+}
+
+// TestExpandSample_InputOnlySplitByProfile（F3）路由时刻只有「总输入」时，按
+// routing.sample_profile 的比例拆成三段（缓存读/纯输入/输出），避免退化为「只按输入价择优」。
+func TestExpandSample_InputOnlySplitByProfile(t *testing.T) {
+	e := &Engine{costCfg: &fakeCostConfig{}}
+	got := e.expandSample(billing.Usage{Input: 10000}) // 总输入 10000
+	// 默认比例 cache_read_ratio=0.9 → 纯输入 = 10000/1.9 ≈ 5263，缓存读 ≈ 4737，输出 ≈ 526。
+	sessionCostApprox(t, "纯输入", float64(got.Input), 5263, 2)
+	sessionCostApprox(t, "缓存读", float64(got.CacheRead), 4737, 2)
+	sessionCostApprox(t, "输出", float64(got.Output), 526, 2)
+	if got.Input+got.CacheRead != 10000 {
+		t.Fatalf("纯输入 + 缓存读应等于总输入 10000，got %d", got.Input+got.CacheRead)
+	}
+
+	// 已含缓存读/输出的样值原样返回（不重复展开）。
+	tri := billing.Usage{Input: 1, CacheRead: 2, Output: 3}
+	if out := e.expandSample(tri); out != tri {
+		t.Fatalf("三段样值不应被改写，got %+v", out)
+	}
+	// 全零样值（显式关闭成本择优）原样返回。
+	if out := e.expandSample(billing.Usage{}); out != (billing.Usage{}) {
+		t.Fatalf("全零样值不应被改写，got %+v", out)
+	}
+	// 未注入 CostConfig 时原样返回（不猜测比例）。
+	if out := (&Engine{}).expandSample(billing.Usage{Input: 10000}); out != (billing.Usage{Input: 10000}) {
+		t.Fatalf("未注入配置时应原样返回，got %+v", out)
+	}
+}
+
+// fakeCostConfigProfile 让 SampleProfile 返回可定制比例（覆盖 expandSample 的边界不变式）。
+type fakeCostConfigProfile struct {
+	fakeCostConfig
+	prof billing.SampleProfile
+}
+
+func (f *fakeCostConfigProfile) SampleProfile() (billing.SampleProfile, error) { return f.prof, nil }
+
+// TestExpandSample_InvariantHoldsForExtremeRatio（P2）任意比例与任意总输入下，
+// Input+CacheRead 必须严格等于原始总输入（不得因两处独立取整产生 ±1 漂移）。
+func TestExpandSample_InvariantHoldsForExtremeRatio(t *testing.T) {
+	cases := []billing.SampleProfile{
+		{CacheReadRatio: 1.0, OutputRatio: 0.1},  // 含 ratio=1 且总输入为奇数（旧实现会 off-by-1）
+		{CacheReadRatio: 0.0, OutputRatio: 0.0},  // 无缓存读
+		{CacheReadRatio: 2.5, OutputRatio: 0.33}, // 大比例
+		{CacheReadRatio: -1.0, OutputRatio: 0.1}, // 非法负比例 → 按 0 处理
+	}
+	for _, prof := range cases {
+		e := &Engine{costCfg: &fakeCostConfigProfile{fakeCostConfig: fakeCostConfig{}, prof: prof}}
+		for _, total := range []int64{1, 3, 7, 10000, 99999} {
+			got := e.expandSample(billing.Usage{Input: total})
+			if got.Input+got.CacheRead != total {
+				t.Fatalf("prof=%+v total=%d：纯输入+缓存读应恒等于总输入，got %d+%d=%d",
+					prof, total, got.Input, got.CacheRead, got.Input+got.CacheRead)
+			}
+			if got.Input < 0 || got.CacheRead < 0 || got.Output < 0 {
+				t.Fatalf("prof=%+v total=%d：三段不得为负，got %+v", prof, total, got)
+			}
+		}
+	}
+
+	// 大比例（>1）下纯输入应被钳到 ≤ 总输入，缓存读不为负。
+	e := &Engine{costCfg: &fakeCostConfigProfile{prof: billing.SampleProfile{CacheReadRatio: 4.0}}}
+	got := e.expandSample(billing.Usage{Input: 10})
+	if got.CacheRead < 0 || got.Input > 10 || got.Input+got.CacheRead != 10 {
+		t.Fatalf("大比例下应保持非负且和等于总输入，got %+v", got)
+	}
+}
+
+// TestSessionRegistry_TurnsIncrementOnRenew（F7）会话轮次：初始 0；Renew 成功 +1（已关闭不续期、不增）。
+func TestSessionRegistry_TurnsIncrementOnRenew(t *testing.T) {
+	r := NewSessionRegistry(nil)
+	attachTo(t, r, "s-turns", 11, "int1")
+
+	if got := r.Turns("s-turns"); got != 0 {
+		t.Fatalf("新建会话轮次应为 0，got %d", got)
+	}
+	if got := r.Turns("nonexistent"); got != 0 {
+		t.Fatalf("不存在的会话应返回 0，got %d", got)
+	}
+	if got := r.Turns(""); got != 0 {
+		t.Fatalf("空 sessionID 应返回 0，got %d", got)
+	}
+
+	r.Renew("s-turns", time.Hour)
+	r.Renew("s-turns", time.Hour)
+	if got := r.Turns("s-turns"); got != 2 {
+		t.Fatalf("两次 Renew 后轮次应为 2，got %d", got)
+	}
+
+	// 已关闭会话不续期 → 轮次不再增长。
+	if !r.Close("s-turns") {
+		t.Fatal("关闭会话应成功")
+	}
+	r.Renew("s-turns", time.Hour)
+	if got := r.Turns("s-turns"); got != 2 {
+		t.Fatalf("已关闭会话 Renew 不应增加轮次，got %d", got)
 	}
 }
 
@@ -660,14 +841,15 @@ func TestMidSwitch_HysteresisSuppressesSwitch(t *testing.T) {
 
 // ---- FIX-A：影子假设记录（未启用切换仍产出「若启用则会切换」的假设节省事件） ----
 
-// TestShadow_EngineEmitsAssumptionWhenMidSwitchOff Enabled=true 但 MidSwitch=false：
+// TestShadow_EngineEmitsAssumptionWhenMidSwitchOff Enabled=true、MidSwitch=false 且显式开启
+// shadow_enabled=true（F5：影子观测为独立开关，默认关闭）：
 // 渠道保持亲和不变（ch2），但经既有 sink 产出一条「若启用则会切换」的影子假设事件（Shadow=true、
 // Switch=false、含 TurnCostOld/New、RechargeCost、PaybackTurns、PaybackLimit、Reason 带影子前缀）。
 func TestShadow_EngineEmitsAssumptionWhenMidSwitchOff(t *testing.T) {
 	rates1, rates2 := midSwitchRates()
 	tok := startPickSample()
 
-	const offJSON = `{"enabled":true,"remaining_a":20,"remaining_b":0,"remaining_min":1,"remaining_max":20,"min_remaining":1,"cooldown_sec":0}`
+	const offJSON = `{"enabled":true,"shadow_enabled":true,"remaining_a":20,"remaining_b":0,"remaining_min":1,"remaining_max":20,"min_remaining":1,"cooldown_sec":0}`
 	e, sess := newMidSwitchEngine(t, offJSON, rates1, rates2, 100, 100, 1)
 	sink := &fakeCostEventSink{}
 	e.SetCostEventSink(sink)
@@ -717,7 +899,7 @@ func TestShadow_EngineEmitsAssumptionWhenDisabled(t *testing.T) {
 	rates1, rates2 := midSwitchRates()
 	tok := startPickSample()
 
-	const disabledJSON = `{"enabled":false,"remaining_a":20,"remaining_b":0,"remaining_min":1,"remaining_max":20}`
+	const disabledJSON = `{"enabled":false,"shadow_enabled":true,"remaining_a":20,"remaining_b":0,"remaining_min":1,"remaining_max":20}`
 	e, sess := newMidSwitchEngine(t, disabledJSON, rates1, rates2, 100, 100, 1)
 	sink := &fakeCostEventSink{}
 	e.SetCostEventSink(sink)
@@ -751,7 +933,7 @@ func TestShadow_NotEmittedWhenNoWouldSwitch(t *testing.T) {
 	rates1, rates2 := midSwitchRates()
 	tok := startPickSample()
 
-	const offJSON = `{"enabled":true,"remaining_a":20,"remaining_b":0,"remaining_min":1,"remaining_max":20,"min_remaining":1,"cooldown_sec":0}`
+	const offJSON = `{"enabled":true,"shadow_enabled":true,"remaining_a":20,"remaining_b":0,"remaining_min":1,"remaining_max":20,"min_remaining":1,"cooldown_sec":0}`
 	e, sess := newMidSwitchEngine(t, offJSON, rates1, rates2, 100, 100, 1)
 	sink := &fakeCostEventSink{}
 	e.SetCostEventSink(sink)
@@ -769,6 +951,33 @@ func TestShadow_NotEmittedWhenNoWouldSwitch(t *testing.T) {
 	}
 	if evs := sink.snapshot(); len(evs) != 0 {
 		t.Fatalf("若启用也不会切换时不应产出影子事件，got %d: %+v", len(evs), evs)
+	}
+}
+
+// TestShadow_NotEmittedByDefault（F5）影子观测默认关闭：未显式开启 shadow_enabled 时，
+// 即便「若启用则会切换」，也不得产出任何事件（安全态零额外异步写与可观测副作用）。
+func TestShadow_NotEmittedByDefault(t *testing.T) {
+	rates1, rates2 := midSwitchRates()
+	tok := startPickSample()
+
+	const offJSON = `{"enabled":true,"remaining_a":20,"remaining_b":0,"remaining_min":1,"remaining_max":20,"min_remaining":1,"cooldown_sec":0}`
+	e, sess := newMidSwitchEngine(t, offJSON, rates1, rates2, 100, 100, 1)
+	sink := &fakeCostEventSink{}
+	e.SetCostEventSink(sink)
+	key := "s-shadow-default-off"
+	attachTo(t, sess, key, 21, "int2") // 亲和命中更贵 ch2 → 若开启影子会记录切到 ch1
+
+	r, err := e.Route(context.Background(), RouteSpec{
+		ExternalModel: "qw-max", SessionKey: key, SessionTokens: &tok,
+	})
+	if err != nil {
+		t.Fatalf("route: %v", err)
+	}
+	if r.ChannelID != 2 {
+		t.Fatalf("应保持亲和（ch2），got channel %d", r.ChannelID)
+	}
+	if evs := sink.snapshot(); len(evs) != 0 {
+		t.Fatalf("影子观测默认关闭时不应产出事件，got %d: %+v", len(evs), evs)
 	}
 }
 

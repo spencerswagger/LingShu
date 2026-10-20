@@ -415,11 +415,12 @@ onMounted(async () => {
         </div>
 
         <div class="gate-row">
-          <span class="gate-item">剩余轮数系数 A={{ fmtNum(gates?.RemainingA) }} / B={{ fmtNum(gates?.RemainingB) }}</span>
+          <span class="gate-item">剩余轮数 = clamp(A − B×k) = {{ fmtNum(gates?.RemainingA) }} − {{ fmtNum(gates?.RemainingB) }}×k（固定值，不预测）</span>
           <span class="gate-item">clamp 区间 [{{ gates?.RemainingMin ?? '-' }}, {{ gates?.RemainingMax ?? '-' }}]</span>
           <span class="gate-item">最小剩余轮数门槛 {{ gates?.MinRemaining ?? '-' }}</span>
           <span class="gate-item">冷却 {{ gates?.CooldownSec ?? '-' }}s</span>
           <span class="gate-item">滞回阈值 {{ fmtNum(gates?.MinImprove) }}</span>
+          <span class="gate-item">影子观测 {{ config?.SessionCost?.shadow_enabled ? '开启' : '关闭' }}</span>
           <el-tag size="small" effect="plain" type="info">{{ gates?.Source || '-' }}</el-tag>
         </div>
 
@@ -549,6 +550,13 @@ onMounted(async () => {
           <el-table-column prop="SessionID" label="会话" min-width="160" show-overflow-tooltip />
           <el-table-column label="轮次" width="72" align="center">
             <template #default="{ row }">#{{ row.Turn }}</template>
+          </el-table-column>
+          <el-table-column label="类型" width="92" align="center">
+            <template #default="{ row }">
+              <el-tag size="small" :type="row.Shadow ? 'warning' : 'primary'" effect="plain">
+                {{ row.Shadow ? '影子假设' : '实际决策' }}
+              </el-tag>
+            </template>
           </el-table-column>
           <el-table-column label="切换" width="80" align="center">
             <template #default="{ row }">

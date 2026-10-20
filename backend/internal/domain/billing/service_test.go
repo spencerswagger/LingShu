@@ -75,6 +75,7 @@ type fakeConfig struct {
 	tiers   []TierRule
 	tc      TimeCoeffConfig
 	sample  Usage
+	profile SampleProfile
 }
 
 func (f *fakeConfig) R() (int64, error)                    { return f.r, nil }
@@ -82,6 +83,7 @@ func (f *fakeConfig) CnyRate() (float64, error)            { return f.cnyRate, n
 func (f *fakeConfig) ContextTiers() ([]TierRule, error)    { return f.tiers, nil }
 func (f *fakeConfig) TimeConfig() (TimeCoeffConfig, error) { return f.tc, nil }
 func (f *fakeConfig) SampleUsage() (Usage, error)          { return f.sample, nil }
+func (f *fakeConfig) SampleProfile() (SampleProfile, error) { return f.profile, nil }
 func (f *fakeConfig) InvalidateCostConfig()                {}
 func (f *fakeConfig) SetCacheEnabled(bool)                 {}
 
@@ -861,6 +863,87 @@ func TestConfigProvider_CostCache_ReadThroughAndInvalidate(t *testing.T) {
 	}
 	if src.calls[cfgCostSample] != 2 {
 		t.Fatalf("失效后应重读一次，got %d", src.calls[cfgCostSample])
+	}
+}
+
+// TestConfigProvider_SampleProfileCache_AndInvalidate 验证 routing.sample_profile 的读缓存：
+// 首次回源一次、随后命中缓存零 DB、InvalidateCostConfig 后重读新值（配置修改即时生效）。
+func TestConfigProvider_SampleProfileCache_AndInvalidate(t *testing.T) {
+	src := &countingSource{
+		data:  map[string][]byte{cfgSampleProfile: []byte(`{"cache_read_ratio":0.5,"output_ratio":0.2}`)},
+		calls: map[string]int{},
+	}
+	p := &defaultConfigProvider{src: src}
+
+	got, err := p.SampleProfile()
+	if err != nil {
+		t.Fatalf("SampleProfile: %v", err)
+	}
+	if got.CacheReadRatio != 0.5 || got.OutputRatio != 0.2 {
+		t.Fatalf("应读到配置值，got %+v", got)
+	}
+	if src.calls[cfgSampleProfile] != 1 {
+		t.Fatalf("首次应读库 1 次，got %d", src.calls[cfgSampleProfile])
+	}
+
+	// 命中缓存：不再读库。
+	if _, err := p.SampleProfile(); err != nil {
+		t.Fatalf("SampleProfile(cached): %v", err)
+	}
+	if src.calls[cfgSampleProfile] != 1 {
+		t.Fatalf("命中缓存不应再读库，got %d", src.calls[cfgSampleProfile])
+	}
+
+	// 失效后重读新值（新增字段必须纳入 InvalidateCostConfig 的清理范围）。
+	src.data[cfgSampleProfile] = []byte(`{"cache_read_ratio":2.0}`)
+	p.InvalidateCostConfig()
+	got, err = p.SampleProfile()
+	if err != nil {
+		t.Fatalf("SampleProfile(invalidated): %v", err)
+	}
+	if got.CacheReadRatio != 2.0 {
+		t.Fatalf("失效后应读到新比例，got %+v", got)
+	}
+	if got.OutputRatio != 0.1 {
+		t.Fatalf("缺省字段应用默认输出比例 0.1，got %+v", got)
+	}
+	if src.calls[cfgSampleProfile] != 2 {
+		t.Fatalf("失效后应重读一次，got %d", src.calls[cfgSampleProfile])
+	}
+}
+
+// TestConfigProvider_SampleProfile_ErrorNotCached 缺失/非法配置返回错误且不写缓存（瞬时故障可自愈）。
+func TestConfigProvider_SampleProfile_ErrorNotCached(t *testing.T) {
+	missing := &countingSource{data: map[string][]byte{}, calls: map[string]int{}}
+	p := &defaultConfigProvider{src: missing}
+	if _, err := p.SampleProfile(); err == nil {
+		t.Fatal("缺失键应返回错误")
+	}
+	if _, err := p.SampleProfile(); err == nil {
+		t.Fatal("缺失键应再次返回错误")
+	}
+	if missing.calls[cfgSampleProfile] != 2 {
+		t.Fatalf("失败不应写缓存，应读 2 次，got %d", missing.calls[cfgSampleProfile])
+	}
+
+	bad := &defaultConfigProvider{src: staticSource{cfgSampleProfile: []byte(`not-json`)}}
+	if _, err := bad.SampleProfile(); err == nil {
+		t.Fatal("非法 JSON 应返回错误")
+	}
+}
+
+// TestParseSampleProfile_FillsDefaults 缺省字段用默认比例（0.9 / 0.1）补齐；空对象即默认。
+func TestParseSampleProfile_FillsDefaults(t *testing.T) {
+	got, err := parseSampleProfile([]byte(`{}`))
+	if err != nil {
+		t.Fatalf("parseSampleProfile: %v", err)
+	}
+	want := defaultSampleProfile()
+	if got != want {
+		t.Fatalf("空对象应为默认比例，got %+v want %+v", got, want)
+	}
+	if want.CacheReadRatio != 0.9 || want.OutputRatio != 0.1 {
+		t.Fatalf("默认比例应为 0.9/0.1，got %+v", want)
 	}
 }
 

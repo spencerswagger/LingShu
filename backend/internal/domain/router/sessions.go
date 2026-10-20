@@ -29,6 +29,10 @@ type Session struct {
 	// LastSwitchAt 会话最近一次「渠道迁移」（成本切换）时刻，供「中途切换冷却」判定（CooldownSec）。
 	// 进程内存字段（不落库）：崩溃恢复后归零即冷却失效，属安全方向（宁可多切一次也不长期冻结）。
 	LastSwitchAt time.Time
+	// Turns 本会话已成功完成的轮数（Renew 时 +1；进程内存字段，不落库）。
+	// 用途：① 决策产物事件的 Turn 字段（可按轮次回放）；② 若将来恢复「按会话位置 k 预测剩余轮数」的经验式，
+	// 以此为输入。当前剩余轮数为固定值（SessionCostConfig.RemainingA/B），Turns 不参与门控计算。
+	Turns int
 	Closed       bool       // 已关闭：不再被路由命中、释放并发槽，但保留在列表（管理可见）
 	ClosedAt     *time.Time // 关闭时间（nil=未关闭）
 	Inflight     int        // 进行中请求数（进程内存计数，不落库；管理端「实时状态」展示用）
@@ -233,6 +237,7 @@ func (r *SessionRegistry) Attach(s *Session, maxConcurrent int) (ok, created boo
 }
 
 // Renew 续期现存会话并落库（成功转发后调用；不改密钥归属）。已关闭会话不续期。
+// 同时把会话轮次 +1（本次请求已成功完成一轮），供决策产物事件按轮次回放。
 func (r *SessionRegistry) Renew(sessionID string, ttl time.Duration) {
 	if sessionID == "" {
 		return
@@ -244,6 +249,7 @@ func (r *SessionRegistry) Renew(sessionID string, ttl time.Duration) {
 		return
 	}
 	s.LastActive = r.now()
+	s.Turns++
 	if ttl > 0 {
 		if cand := s.LastActive.Add(ttl); cand.After(s.ExpireAt) {
 			s.ExpireAt = cand
@@ -355,6 +361,21 @@ func (r *SessionRegistry) LastSwitchAt(sessionID string) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	return s.LastSwitchAt, true
+}
+
+// Turns 返回会话已成功完成的轮数（会话不存在返回 0）。
+// 读锁保护；供网关在路由前组装 RouteSpec.SessionTurn（决策产物的轮次观测口径）。
+func (r *SessionRegistry) Turns(sessionID string) int {
+	if sessionID == "" {
+		return 0
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	s, ok := r.byKey[sessionID]
+	if !ok {
+		return 0
+	}
+	return s.Turns
 }
 
 // BeginRequest 标记会话上有一个请求开始（进行中计数 +1）。会话不存在时忽略。

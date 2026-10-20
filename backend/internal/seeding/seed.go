@@ -39,6 +39,14 @@ var defaultSysConfigs = map[string]string{
 	// 路由成本比较样值用量：新会话创建时以该样值代入渠道成本单价求和比较「谁更便宜」
 	//（不参与实际计费）。三段（输入/缓存读/输出）均可配置，缺省按 0 计。
 	"routing.cost_sample": `{"input":10000,"cache_read":9000,"output":1000}`,
+	// 路由样值补齐比例：路由时刻只有「输入 token」可知，按这两个「相对纯输入」的比例
+	// 估算缓存读与输出（纯输入 + 缓存读 = 总输入），供会话成本路由的成本比较使用。
+	// 默认值与 routing.cost_sample（10000/9000/1000）同源。
+	"routing.sample_profile": `{"cache_read_ratio":0.9,"output_ratio":0.1}`,
+	// 会话成本路由配置：默认安全态（enabled=false、mid_switch=false、shadow_enabled=false，
+	// 渠道不变、无额外异步写）。剩余轮数取固定值（remaining_a=10、remaining_b=0，即 clamp(10−0×k)≡10），
+	// 不再按会话位置 k 预测；remaining_* 与门控阈值保留供运维微调。
+	"routing.session_cost": `{"enabled":false,"mid_switch":false,"shadow_enabled":false,"remaining_a":10,"remaining_b":0,"remaining_min":1,"remaining_max":20,"min_remaining":1,"cooldown_sec":0,"min_improve":0}`,
 	// 会话过期分档兜底与示例档位（双维度取较大者，且不低于兜底 5 分钟）。
 	"session.expiration": `{"default_ttl_minutes":5,"context_tiers":[{"max_tokens":2000,"ttl_minutes":5},{"max_tokens":8000,"ttl_minutes":30},{"max_tokens":32000,"ttl_minutes":180},{"max_tokens":128000,"ttl_minutes":1440}],"turn_tiers":[{"max_turns":2,"ttl_minutes":5},{"max_turns":10,"ttl_minutes":30},{"max_turns":50,"ttl_minutes":180},{"max_turns":200,"ttl_minutes":1440}]}`,
 }
