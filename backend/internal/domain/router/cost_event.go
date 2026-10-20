@@ -94,8 +94,8 @@ func NewAsyncCostEventSink(w *asyncwrite.Writer, stores ...*SessionCostEventStor
 
 // Submit 提交一条会话成本决策产物：Key=session_id 保序，IdempotencyKey=session_id:Seq 幂等。
 // Seq 由本 sink 在提交时分配（每次发射单调唯一），确保同一会话内「每一次独立决策」各自留痕：
-// 网关侧 SessionTurn 尚未接线（恒 0），若用 session:turn（或再叠加 from>to 转移）都会在同轮次
-// 多次独立决策（如影子记录、来回切换）时撞键而被 asyncwrite 静默去重丢弃；Seq 随 Payload 落 WAL，
+// Turn 现由会话轮次驱动、可在同一轮次内产生多条独立决策（如影子记录、来回切换），
+// 若用 session:turn（或再叠加 from>to 转移）会撞键而被 asyncwrite 静默去重丢弃；Seq 随 Payload 落 WAL，
 // 同一条记录崩溃重放时仍复用同一键，保持「同一次发射」幂等。
 func (s *asyncCostEventSink) Submit(ev SessionCostEvent) error {
 	ev.Seq = s.nextSeq()

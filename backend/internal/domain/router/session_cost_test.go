@@ -566,9 +566,6 @@ func TestMidSwitch_EngineDecidesWithoutMigrating(t *testing.T) {
 	if cr.Switch == nil {
 		t.Fatal("目标候选应携带切换决策产物（Switch 非 nil）")
 	}
-	if cr.SwitchFromKeyID != 21 {
-		t.Fatalf("应记录切换前归属密钥 21，got %d", cr.SwitchFromKeyID)
-	}
 	if !cr.Switch.Switch || cr.Switch.ToChannelKeyID != 11 || cr.Switch.FromChannelKeyID != 21 {
 		t.Fatalf("决策产物不符：%+v", cr.Switch)
 	}
@@ -586,6 +583,17 @@ func TestMidSwitch_EngineDecidesWithoutMigrating(t *testing.T) {
 	}
 	if sess.CountActive(21) != 1 || sess.CountActive(11) != 0 {
 		t.Fatalf("路由阶段计数不应变化：key21=%d key11=%d", sess.CountActive(21), sess.CountActive(11))
+	}
+	// F1 回退保障：原归属渠道（key 21）必须保留在候选序列中作为首选回退——
+	// 若目标密钥并发已满导致 ConfirmSessionSwitch 失败，网关需能回到仍健康的原渠道而非 503。
+	if len(res.Routes) < 2 {
+		t.Fatalf("候选序列应至少含「目标 + 原渠道」两候选，got %d", len(res.Routes))
+	}
+	if fb := res.Routes[1]; fb.ChannelKeyID != 21 || fb.InternalModelID != "int2" {
+		t.Fatalf("第 2 候选应为原归属渠道(key=21,int2)，got key=%d model=%q", fb.ChannelKeyID, fb.InternalModelID)
+	}
+	if res.Routes[1].Switch != nil {
+		t.Fatalf("回退候选不应携带切换决策产物（它不是切换目标）")
 	}
 
 	// 网关确认采用该候选后才迁移（F8：带真实 ttl，ExpireAt 只增不减）。
@@ -663,6 +671,76 @@ func TestExpandSample_InputOnlySplitByProfile(t *testing.T) {
 	// 未注入 CostConfig 时原样返回（不猜测比例）。
 	if out := (&Engine{}).expandSample(billing.Usage{Input: 10000}); out != (billing.Usage{Input: 10000}) {
 		t.Fatalf("未注入配置时应原样返回，got %+v", out)
+	}
+}
+
+// fakeCostConfigProfile 让 SampleProfile 返回可定制比例（覆盖 expandSample 的边界不变式）。
+type fakeCostConfigProfile struct {
+	fakeCostConfig
+	prof billing.SampleProfile
+}
+
+func (f *fakeCostConfigProfile) SampleProfile() (billing.SampleProfile, error) { return f.prof, nil }
+
+// TestExpandSample_InvariantHoldsForExtremeRatio（P2）任意比例与任意总输入下，
+// Input+CacheRead 必须严格等于原始总输入（不得因两处独立取整产生 ±1 漂移）。
+func TestExpandSample_InvariantHoldsForExtremeRatio(t *testing.T) {
+	cases := []billing.SampleProfile{
+		{CacheReadRatio: 1.0, OutputRatio: 0.1},  // 含 ratio=1 且总输入为奇数（旧实现会 off-by-1）
+		{CacheReadRatio: 0.0, OutputRatio: 0.0},  // 无缓存读
+		{CacheReadRatio: 2.5, OutputRatio: 0.33}, // 大比例
+		{CacheReadRatio: -1.0, OutputRatio: 0.1}, // 非法负比例 → 按 0 处理
+	}
+	for _, prof := range cases {
+		e := &Engine{costCfg: &fakeCostConfigProfile{fakeCostConfig: fakeCostConfig{}, prof: prof}}
+		for _, total := range []int64{1, 3, 7, 10000, 99999} {
+			got := e.expandSample(billing.Usage{Input: total})
+			if got.Input+got.CacheRead != total {
+				t.Fatalf("prof=%+v total=%d：纯输入+缓存读应恒等于总输入，got %d+%d=%d",
+					prof, total, got.Input, got.CacheRead, got.Input+got.CacheRead)
+			}
+			if got.Input < 0 || got.CacheRead < 0 || got.Output < 0 {
+				t.Fatalf("prof=%+v total=%d：三段不得为负，got %+v", prof, total, got)
+			}
+		}
+	}
+
+	// 大比例（>1）下纯输入应被钳到 ≤ 总输入，缓存读不为负。
+	e := &Engine{costCfg: &fakeCostConfigProfile{prof: billing.SampleProfile{CacheReadRatio: 4.0}}}
+	got := e.expandSample(billing.Usage{Input: 10})
+	if got.CacheRead < 0 || got.Input > 10 || got.Input+got.CacheRead != 10 {
+		t.Fatalf("大比例下应保持非负且和等于总输入，got %+v", got)
+	}
+}
+
+// TestSessionRegistry_TurnsIncrementOnRenew（F7）会话轮次：初始 0；Renew 成功 +1（已关闭不续期、不增）。
+func TestSessionRegistry_TurnsIncrementOnRenew(t *testing.T) {
+	r := NewSessionRegistry(nil)
+	attachTo(t, r, "s-turns", 11, "int1")
+
+	if got := r.Turns("s-turns"); got != 0 {
+		t.Fatalf("新建会话轮次应为 0，got %d", got)
+	}
+	if got := r.Turns("nonexistent"); got != 0 {
+		t.Fatalf("不存在的会话应返回 0，got %d", got)
+	}
+	if got := r.Turns(""); got != 0 {
+		t.Fatalf("空 sessionID 应返回 0，got %d", got)
+	}
+
+	r.Renew("s-turns", time.Hour)
+	r.Renew("s-turns", time.Hour)
+	if got := r.Turns("s-turns"); got != 2 {
+		t.Fatalf("两次 Renew 后轮次应为 2，got %d", got)
+	}
+
+	// 已关闭会话不续期 → 轮次不再增长。
+	if !r.Close("s-turns") {
+		t.Fatal("关闭会话应成功")
+	}
+	r.Renew("s-turns", time.Hour)
+	if got := r.Turns("s-turns"); got != 2 {
+		t.Fatalf("已关闭会话 Renew 不应增加轮次，got %d", got)
 	}
 }
 
