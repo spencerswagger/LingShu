@@ -91,7 +91,7 @@ type anthropicStreamEvent struct {
 }
 
 // HandleStream 透传 Anthropic SSE 事件：拼接 text_delta，从 message_start（输入/缓存）与
-// message_delta（累计输出）汇总 usage。usage 缺失返回 ErrUsageMissing（内容已透传，按 AC-17 放宽：估算计费并禁用渠道）。
+// message_delta（累计输出）汇总 usage。usage 缺失返回 ErrUsageMissing（内容已透传，按 AC-17 放宽：估算计费）。
 // 返回 (usage, 上游原始 usage JSONB 值, assistant 消息 JSON, error)；原始 usage 由两处事件分片合并
 // （message_start 的输入/缓存 + message_delta 的累计输出），供诊断渠道口径（call_logs.upstream_usage）。
 func (p *AnthropicProvider) HandleStream(ctx context.Context, upstream *http.Response, w http.ResponseWriter) (billing.Usage, []byte, []byte, error) {

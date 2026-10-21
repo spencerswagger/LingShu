@@ -1042,31 +1042,6 @@ func (m *Manager) BoundTags(channelID int64) []TagRef {
 	return cp
 }
 
-// DisableChannel 把渠道下全部密钥运行时置为禁用（AC-17：上游 usage 缺失/无法解析时禁用渠道）。
-// 渠道无独立状态：禁用即逐密钥置 DISABLED（路由入口只读密钥/内部模型状态），并落库 channel_key_events。
-func (m *Manager) DisableChannel(id int64) {
-	var keyIDs []int64
-	m.mu.Lock()
-	for keyID := range m.keyOfCh[id] {
-		keyIDs = append(keyIDs, keyID)
-	}
-	m.mu.Unlock()
-
-	for _, keyID := range keyIDs {
-		var kfrom State
-		m.mu.Lock()
-		if kr, ok := m.keys[keyID]; ok {
-			kfrom = kr.Machine.State()
-			kr.Machine.ForceDisable(m.now())
-		}
-		m.mu.Unlock()
-		if kfrom != "" && kfrom != StateDisabled {
-			m.persistKeyTransition(keyID, kfrom, StateDisabled, "channel disabled: usage missing")
-		}
-	}
-	m.logger.Warn("channel disabled due to missing usage", "channel_id", id)
-}
-
 // Drop 删除运行时条目（渠道删除后调用）：同时摘除该渠道全部密钥运行时。
 func (m *Manager) Drop(id int64) {
 	m.mu.Lock()

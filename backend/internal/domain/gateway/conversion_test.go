@@ -12,6 +12,7 @@ import (
 	"github.com/team/llmgateway/internal/domain/channel"
 	"github.com/team/llmgateway/internal/domain/channelprotocol"
 	"github.com/team/llmgateway/internal/domain/protocolconv"
+	"github.com/team/llmgateway/internal/domain/router"
 )
 
 // TestResolveUpstreamProtocol 覆盖跨协议解析器的决策分支：
@@ -459,5 +460,54 @@ func TestConvertParseFailureReturns400(t *testing.T) {
 	// 仍落一条 failed 账单（对齐既有 400 路径的留痕口径）。
 	if len(h.billing.reqs) != 1 || !h.billing.reqs[0].Fail {
 		t.Fatalf("解析失败应落 1 条 failed 账单, got %+v", h.billing.reqs)
+	}
+}
+
+// TestReorderPassthroughFirst 断言新会话候选收敛：可直通的候选按相对顺序前移，
+// 需跨协议转换的候选保持相对顺序靠后；无区分度时原序不变（零行为变化）。
+func TestReorderPassthroughFirst(t *testing.T) {
+	cr := func(id int64) *router.ChannelRoute { return &router.ChannelRoute{ChannelID: id} }
+	ids := func(routes []*router.ChannelRoute) []int64 {
+		out := make([]int64, 0, len(routes))
+		for _, r := range routes {
+			out = append(out, r.ChannelID)
+		}
+		return out
+	}
+	equal := func(got, want []int64) bool {
+		if len(got) != len(want) {
+			return false
+		}
+		for i := range got {
+			if got[i] != want[i] {
+				return false
+			}
+		}
+		return true
+	}
+
+	tests := []struct {
+		name string
+		in   []int64
+		pass map[int64]bool
+		want []int64
+	}{
+		{"混合：直通前移且各自保序", []int64{1, 2, 3, 4, 5}, map[int64]bool{2: true, 4: true}, []int64{2, 4, 1, 3, 5}},
+		{"全部直通：原序不变", []int64{1, 2, 3}, map[int64]bool{1: true, 2: true, 3: true}, []int64{1, 2, 3}},
+		{"全部需转换：原序不变", []int64{1, 2, 3}, map[int64]bool{}, []int64{1, 2, 3}},
+		{"单候选：不重排", []int64{1}, map[int64]bool{}, []int64{1}},
+		{"仅第二名可直通：交换", []int64{1, 2}, map[int64]bool{2: true}, []int64{2, 1}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			routes := make([]*router.ChannelRoute, 0, len(tt.in))
+			for _, id := range tt.in {
+				routes = append(routes, cr(id))
+			}
+			reorderPassthroughFirst(routes, func(r *router.ChannelRoute) bool { return tt.pass[r.ChannelID] })
+			if got := ids(routes); !equal(got, tt.want) {
+				t.Fatalf("候选顺序 want %v, got %v", tt.want, got)
+			}
+		})
 	}
 }

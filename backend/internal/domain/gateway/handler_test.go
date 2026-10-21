@@ -124,7 +124,6 @@ type fakeChannels struct {
 	mrt               *channel.ModelRuntime
 	keys              map[int64]*channel.KeyRuntime
 	feeds             []feedEntry
-	disabled          []int64
 	maxSessionsPerKey int // 覆盖默认 16（测试会话并发上限用）
 
 	// 协议级错误策略动作落点（drain/disable）：记录手动设置过的密钥/模型状态。
@@ -180,11 +179,6 @@ func (f *fakeChannels) KeyMaxSessions(int64) int {
 		return f.maxSessionsPerKey
 	}
 	return 16
-}
-
-// DisableChannel 记录 AC-17 触发的渠道禁用（usage 缺失/无法解析）。
-func (f *fakeChannels) DisableChannel(channelID int64) {
-	f.disabled = append(f.disabled, channelID)
 }
 
 // fakeSessionExpiry 可编程的会话过期 TTL fake（fn 为空时默认 60 分钟，保持既有测试时序余量）。
@@ -660,9 +654,9 @@ func TestServeStream(t *testing.T) {
 	assertChannelOpaque(t, rec)
 }
 
-// 场景 8（AC-17 放宽）：流式响应无 usage 块（未开启 include_usage）→ 按可见内容估算计费（不退预扣）+ 禁用渠道。
-// 内容已透传无法回改，故 HTTP 状态仍为 200，按估算 token 正常结算并禁用渠道。
-func TestServeStreamNoUsageEstimatesAndDisablesChannel(t *testing.T) {
+// 场景 8（AC-17 放宽）：流式响应正常结束（[DONE]）但无 usage → 按可见内容估算计费（不退预扣）。
+// 「正常结束无 usage」属上游忽略平台注入的 include_usage（协议偏差），不惩罚渠道。
+func TestServeStreamDoneNoUsageEstimatesWithoutPunishingChannel(t *testing.T) {
 	streamBody := "data: {\"choices\":[{\"delta\":{\"content\":\"hello world\"}}]}\n\n" +
 		"data: [DONE]\n\n"
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -683,8 +677,143 @@ func TestServeStreamNoUsageEstimatesAndDisablesChannel(t *testing.T) {
 	if u := h.billing.reqs[0].Tokens; u.Input <= 0 || u.Output <= 0 {
 		t.Fatalf("usage 缺失应按可见内容估算 token, got %+v", u)
 	}
-	if len(h.chans.disabled) != 1 || h.chans.disabled[0] != 1 {
-		t.Fatalf("usage 缺失应禁用渠道 1, got %+v", h.chans.disabled)
+	if len(h.chans.feeds) != 0 {
+		t.Fatalf("正常结束无 usage 不应计入渠道健康失败, got %+v", h.chans.feeds)
+	}
+}
+
+// 流式响应未收到结束标记即 EOF（上游流被截断）：仍按估算计费，但计入渠道健康失败（不再禁用整条渠道）。
+func TestServeStreamTruncatedEstimatesAndFeedsHealthFailure(t *testing.T) {
+	streamBody := "data: {\"choices\":[{\"delta\":{\"content\":\"hello world\"}}]}\n\n" // 无 [DONE]
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(streamBody))
+	}))
+	defer upstream.Close()
+
+	h := build(t, upstream.URL)
+	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t", `{"model":"gpt-4","stream":true}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200 (stream already responded), got %d", rec.Code)
+	}
+	if len(h.billing.reqs) != 1 || h.billing.reqs[0].Fail {
+		t.Fatalf("上游流中断仍应按估算计费, got %+v", h.billing.reqs)
+	}
+	if u := h.billing.reqs[0].Tokens; u.Input <= 0 || u.Output <= 0 {
+		t.Fatalf("上游流中断应按可见内容估算 token, got %+v", u)
+	}
+	if len(h.chans.feeds) != 1 || h.chans.feeds[0].fb.IsSuccess {
+		t.Fatalf("上游流中断应计入渠道健康失败, got %+v", h.chans.feeds)
+	}
+}
+
+// 平台必需参数：客户端未带 stream_options.include_usage 时由网关为 OpenAI 兼容流式请求补齐，
+// 且保留客户端已有的其它 stream_options 键；非流式请求不改写。
+func TestServeStreamInjectsIncludeUsage(t *testing.T) {
+	var gotBodies []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotBodies = append(gotBodies, string(b))
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1}}\n\n" +
+			"data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	h := build(t, upstream.URL)
+	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t",
+		`{"model":"gpt-4","stream":true,"stream_options":{"foo":"bar"},"messages":[{"role":"user","content":"hello"}]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(gotBodies) != 1 {
+		t.Fatalf("上游应收到 1 次请求, got %d", len(gotBodies))
+	}
+	var body struct {
+		StreamOptions map[string]any `json:"stream_options"`
+	}
+	if err := json.Unmarshal([]byte(gotBodies[0]), &body); err != nil {
+		t.Fatalf("上游请求体非法 JSON: %v (%s)", err, gotBodies[0])
+	}
+	if body.StreamOptions["include_usage"] != true {
+		t.Fatalf("应补齐 include_usage=true, got %s", gotBodies[0])
+	}
+	if body.StreamOptions["foo"] != "bar" {
+		t.Fatalf("应保留已有 stream_options 键, got %s", gotBodies[0])
+	}
+}
+
+// 非流式请求不应被写入 stream_options（客户端未请求 usage 时非流式响应本就应带 usage）。
+func TestServeNonStreamDoesNotInjectIncludeUsage(t *testing.T) {
+	var gotBody string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"x","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`))
+	}))
+	defer upstream.Close()
+
+	h := build(t, upstream.URL)
+	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t",
+		`{"model":"gpt-4","stream":false,"messages":[{"role":"user","content":"hello"}]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(gotBody, "stream_options") {
+		t.Fatalf("非流式请求不应被写入 stream_options, got %s", gotBody)
+	}
+}
+
+// legacy /v1/completions 未定义 stream_options，注入可能被上游按未知参数拒绝：不得改写。
+func TestServeCompletionsStreamDoesNotInjectIncludeUsage(t *testing.T) {
+	var gotBody string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"text\":\"hi\",\"finish_reason\":\"stop\"}]}\n\n" +
+			"data: {\"id\":\"x\",\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1}}\n\n" +
+			"data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	h := build(t, upstream.URL)
+	rec := doRequest(t, h.gw, "/v1/completions", "sk-gw-t", `{"model":"gpt-4","prompt":"hello","stream":true}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(gotBody, "stream_options") {
+		t.Fatalf("legacy completions 不应被写入 stream_options, got %s", gotBody)
+	}
+}
+
+// hardErr（上游传输中断，如 unexpected EOF）已落 failed 账单与调用日志，必须回喂健康失败，
+// 否则持续读失败的上游永远进不了错误率窗口、无法被 DRAIN。
+func TestServeStreamBrokenBodyFeedsHealthFailure(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Content-Length", "1000") // 声明长度远大于实际写入 → 客户端读到 unexpected EOF
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"))
+	}))
+	defer upstream.Close()
+
+	h := build(t, upstream.URL)
+	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t", `{"model":"gpt-4","stream":true}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200 (stream already responded), got %d", rec.Code)
+	}
+	// hardErr 先落 failed 账单，随后仍会按零用量走一次结算记录（既有行为），故只断言首条为失败。
+	if len(h.billing.reqs) == 0 || !h.billing.reqs[0].Fail {
+		t.Fatalf("上游传输中断应落 failed 账单, got %+v", h.billing.reqs)
+	}
+	if len(h.chans.feeds) != 1 || h.chans.feeds[0].fb.IsSuccess {
+		t.Fatalf("上游传输中断应计入渠道健康失败, got %+v", h.chans.feeds)
 	}
 }
 
@@ -1659,8 +1788,9 @@ func TestServeFailover_ConnectionError(t *testing.T) {
 	}
 }
 
-// 场景 F6（AC-17 放宽）：上游成功但未返回 usage → 透传上游正文(200) + 按可见内容估算计费（不退预扣）+ 渠道禁用。
-func TestServeZeroUsageEstimatesAndDisablesChannel(t *testing.T) {
+// 场景 F6（AC-17 放宽）：上游成功但未返回 usage → 透传上游正文(200) + 按可见内容估算计费（不退预扣）
+// + 计入渠道健康失败（窗口错误率达标才 DRAIN，探针可自愈；不再单次禁用整条渠道）。
+func TestServeZeroUsageEstimatesAndFeedsHealthFailure(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -1686,8 +1816,8 @@ func TestServeZeroUsageEstimatesAndDisablesChannel(t *testing.T) {
 	if u := h.billing.reqs[0].Tokens; u.Input <= 0 || u.Output <= 0 {
 		t.Fatalf("usage 缺失应按可见内容估算 token, got %+v", u)
 	}
-	if len(h.chans.disabled) != 1 || h.chans.disabled[0] != 1 {
-		t.Fatalf("usage 缺失应禁用渠道 1, got %+v", h.chans.disabled)
+	if len(h.chans.feeds) != 1 || h.chans.feeds[0].fb.IsSuccess {
+		t.Fatalf("usage 缺失应计入渠道健康失败, got %+v", h.chans.feeds)
 	}
 	// 内容已透传、按估算正常结算 → 不应退回预扣（差额由结算多退少补）。
 	if len(fc.refunded) != 0 {
