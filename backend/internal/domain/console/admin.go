@@ -1489,19 +1489,19 @@ type sessionCostGates struct {
 
 // sessionCostConfigResponse 「会话成本路由」配置面板响应。
 type sessionCostConfigResponse struct {
-	Now              time.Time                  `json:"Now"`
-	NowTimeCoeff     float64                    `json:"NowTimeCoeff"`
-	NowTimeCoeffSrc  string                     `json:"NowTimeCoeffSource"`
-	TimeConfig       json.RawMessage            `json:"TimeConfig,omitempty"`
-	TimeConfigSource string                     `json:"TimeConfigSource"`
-	ContextTiers     json.RawMessage            `json:"ContextTiers,omitempty"`
-	TiersSource      string                     `json:"ContextTiersSource"`
-	CostSample       billing.WireUsage          `json:"CostSample"`
-	CostSampleSource string                     `json:"CostSampleSource"`
+	Now              time.Time         `json:"Now"`
+	NowTimeCoeff     float64           `json:"NowTimeCoeff"`
+	NowTimeCoeffSrc  string            `json:"NowTimeCoeffSource"`
+	TimeConfig       json.RawMessage   `json:"TimeConfig,omitempty"`
+	TimeConfigSource string            `json:"TimeConfigSource"`
+	ContextTiers     json.RawMessage   `json:"ContextTiers,omitempty"`
+	TiersSource      string            `json:"ContextTiersSource"`
+	CostSample       billing.WireUsage `json:"CostSample"`
+	CostSampleSource string            `json:"CostSampleSource"`
 	// SampleProfile 是「只有总输入」样值的补齐比例（routing.sample_profile）：
 	// 路由时刻按它把总输入拆成 缓存读/纯输入/输出 三段参与比较，面板需展示以免误读成本口径。
-	SampleProfile       billing.SampleProfile `json:"SampleProfile"`
-	SampleProfileSource string                `json:"SampleProfileSource"`
+	SampleProfile       billing.SampleProfile      `json:"SampleProfile"`
+	SampleProfileSource string                     `json:"SampleProfileSource"`
 	SessionCost         router.SessionCostConfig   `json:"SessionCost"`
 	SessionCostSrc      string                     `json:"SessionCostSource"`
 	Gates               sessionCostGates           `json:"Gates"`
@@ -1530,19 +1530,19 @@ func (h *Admin) HandleSessionCostConfig(w http.ResponseWriter, r *http.Request) 
 	prof := h.sessionCostSampleProfile(ctx)
 
 	resp.OK(w, r, sessionCostConfigResponse{
-		Now:              now,
-		NowTimeCoeff:     nowCoeff,
-		NowTimeCoeffSrc:  sourceCurrentTime,
-		TimeConfig:       json.RawMessage(timeRaw),
-		TimeConfigSource: sourceTimeConfig,
-		ContextTiers:     json.RawMessage(tiersRaw),
-		TiersSource:      sourceTiersConfig,
-		CostSample:       billing.WireUsage(sample),
-		CostSampleSource: sourceCostSample,
+		Now:                 now,
+		NowTimeCoeff:        nowCoeff,
+		NowTimeCoeffSrc:     sourceCurrentTime,
+		TimeConfig:          json.RawMessage(timeRaw),
+		TimeConfigSource:    sourceTimeConfig,
+		ContextTiers:        json.RawMessage(tiersRaw),
+		TiersSource:         sourceTiersConfig,
+		CostSample:          billing.WireUsage(sample),
+		CostSampleSource:    sourceCostSample,
 		SampleProfile:       prof,
 		SampleProfileSource: sourceSampleProfile,
-		SessionCost:      cfg,
-		SessionCostSrc:   sourceSessionCostCfg,
+		SessionCost:         cfg,
+		SessionCostSrc:      sourceSessionCostCfg,
 		Gates: sessionCostGates{
 			RemainingA: cfg.RemainingA, RemainingB: cfg.RemainingB,
 			RemainingMin: cfg.RemainingMin, RemainingMax: cfg.RemainingMax,
@@ -1602,7 +1602,7 @@ func (h *Admin) sessionCostSample(ctx context.Context) billing.Usage {
 }
 
 // sessionCostSampleProfile 读取样值补齐比例（routing.sample_profile）；缺失/非法回落内置默认比例
-//（与路由 expandSample 的回落口径一致：解析失败不猜测，此处仅为面板展示方便给默认值）。
+// （与路由 expandSample 的回落口径一致：解析失败不猜测，此处仅为面板展示方便给默认值）。
 func (h *Admin) sessionCostSampleProfile(ctx context.Context) billing.SampleProfile {
 	if h.billing != nil {
 		if raw, err := h.billing.GetConfig(ctx, "routing.sample_profile"); err == nil {

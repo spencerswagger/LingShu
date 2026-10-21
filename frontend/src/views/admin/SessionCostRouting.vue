@@ -398,6 +398,11 @@ onMounted(async () => {
             <el-tag size="small" effect="plain" type="info">{{ config?.CostSampleSource || '-' }}</el-tag>
           </div>
           <div class="param-item">
+            <span class="p-label">样值补齐比例（缓存读/纯输入 · 输出/纯输入）</span>
+            <span class="mark-line mono">{{ fmtNum(config?.SampleProfile?.cache_read_ratio) }} · {{ fmtNum(config?.SampleProfile?.output_ratio) }}</span>
+            <el-tag size="small" effect="plain" type="info">{{ config?.SampleProfileSource || '-' }}</el-tag>
+          </div>
+          <div class="param-item">
             <span class="p-label">当前时刻倍率</span>
             <span class="mark-line mono">{{ fmtNum(config?.NowTimeCoeff) }}</span>
             <el-tag size="small" effect="plain" type="info">{{ config?.NowTimeCoeffSource || '-' }}</el-tag>
