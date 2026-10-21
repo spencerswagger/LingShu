@@ -69,6 +69,41 @@ func (g *Gateway) resolveUpstreamProtocol(rt *channel.RuntimeChannel, mr *channe
 	return target, true, true
 }
 
+// candidatePassesThrough 判断候选渠道能否以入站协议直通（可达协议集包含入站协议）。
+// 运行时缺失时保守返回 true：查询失败不应改变既有候选排序。
+func (g *Gateway) candidatePassesThrough(cr *router.ChannelRoute, baseProtocol string) bool {
+	rt, ok := g.channels.GetRuntime(cr.ChannelID)
+	if !ok {
+		return true
+	}
+	mr, ok := g.channels.GetModelRuntime(cr.ChannelID, cr.ModelRowID)
+	if !ok {
+		return true
+	}
+	return effectiveProtocols(rt, mr).Has(baseProtocol)
+}
+
+// reorderPassthroughFirst 稳定分区：passthrough 为真的候选按相对顺序前移，其余靠后。
+// 无区分度（全真/全假）时保持原序，保证既有行为零变化。
+func reorderPassthroughFirst(routes []*router.ChannelRoute, passthrough func(*router.ChannelRoute) bool) {
+	if len(routes) < 2 {
+		return
+	}
+	direct := make([]*router.ChannelRoute, 0, len(routes))
+	rest := make([]*router.ChannelRoute, 0, len(routes))
+	for _, cr := range routes {
+		if passthrough(cr) {
+			direct = append(direct, cr)
+		} else {
+			rest = append(rest, cr)
+		}
+	}
+	if len(direct) == 0 || len(rest) == 0 {
+		return
+	}
+	copy(routes, append(direct, rest...))
+}
+
 // convPlan 记录一次候选的协议转换上下文：入站协议、实际上游协议、是否发生转换。
 // 直通（converted=false）时 conversionAttemptFields 不产出任何字段，保持既有键集不变。
 type convPlan struct {

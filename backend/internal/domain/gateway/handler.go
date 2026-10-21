@@ -531,6 +531,15 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 	if hasSession && sessObj != nil && sessObj.Closed {
 		hasSession = false
 	}
+	// 新会话优先直通候选：跨协议转换会重建请求体，改变上游 prompt 前缀，
+	// 导致上游推理缓存反复击穿（会话内的协议形态抖动）。
+	// 既有会话保持路由层顺序（会话命中排首、其协议随渠道固定），粘性优先，不做重排；
+	// 需转换的候选仍保留在队尾，仅作兜底。
+	if !hasSession {
+		reorderPassthroughFirst(routes, func(cr *router.ChannelRoute) bool {
+			return g.candidatePassesThrough(cr, baseProtocol)
+		})
+	}
 	// 请求增量 diff：计算本次请求的增量消息与全量指纹（call_log 采集用，
 	// 新会话也在此初始化指纹，由下方 Attach 写入会话）。
 	reqMsgs, msgFps := g.captureReqIncrement(sessObj, body)
