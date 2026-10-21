@@ -775,6 +775,13 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 			convLossy.Merge(reqLossy)
 		}
 
+		// 平台计费依赖上游返回 usage：OpenAI 兼容协议的流式请求幂等补
+		// stream_options.include_usage=true（客户端未显式请求时由网关补齐，其余 stream_options 键保留）。
+		// 非流式/非 OpenAI 兼容协议不改写；跨协议转换后的 body 已是目标协议形状，同样适用。
+		if isStream {
+			upstreamBody = ensureIncludeUsage(upstreamBody, upstreamProto)
+		}
+
 		// 上游请求构造上下文：有效基址（协议级优先）/ 协议路径覆盖 / 头策略 / 上游协议 / 变量。
 		// 鉴权注入与路径均按「实际上游协议」取值（转换时即目标协议，直通时等于入站协议）。
 		// 协议特性按渠道协议编写，仅对直通（同协议）生效；转换时置空，避免用渠道协议的特性
@@ -1190,13 +1197,13 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 		usage, upstreamUsage, uerr := prov.ExtractUsage(raw)
 		usageMissing := uerr != nil || usageZero(usage)
 		if usageMissing {
-			// AC-17（放宽）：上游未返回/无法解析 usage 属极端协议违规；内容已由上游生成并在此透传，
-			// 故不退预扣，按可见内容估算 token 计费，并把渠道置 DISABLED。
-			g.channels.DisableChannel(routeRes.ChannelID)
+			// AC-17（放宽）：上游未返回/无法解析 usage 属协议违规；内容已由上游生成并在此透传，
+			// 故不退预扣，按可见内容估算 token 计费（平台不能漏计费）。惩罚不再「单次禁用整条渠道」，
+			// 改为计入密钥健康失败（窗口错误率达标才 DRAIN，探针可自愈，见下方 FeedResult）。
 			g.logUpstreamErr(ctx, slog.LevelWarn, "upstream usage missing", endpoint, ureq.Protocol, model, token, routeRes,
 				diagFromRequest(req, ureq.Protocol, ureq.Cred),
 				errInfo{kind: "usage_missing", stage: stage, status: up.StatusCode, attempt: attempt,
-					reason: "上游未返回或无法解析 usage（按估算计费并将渠道置禁用）", sessionID: sessionID, durationMs: *msSince(start)})
+					reason: "上游未返回或无法解析 usage（按估算计费并计入渠道健康失败）", sessionID: sessionID, durationMs: *msSince(start)})
 			content, reasoning, tools := rawParts(raw)
 			usage = missingUsageEstimate(ureq.Body, raw, model, content, reasoning, tools)
 		}
@@ -1276,8 +1283,11 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 		out.downstreamStatus = up.StatusCode // 请求级日志用真实状态码
 		w.WriteHeader(up.StatusCode)
 		_, _ = w.Write(respBody)
-		// usage 缺失的渠道已置 DISABLED，不再回喂成功反馈（与流式路径一致，避免禁用态被注入成功样本）。
-		if !usageMissing {
+		// 渠道健康回喂：usage 缺失计入密钥健康失败（窗口错误率达标才 DRAIN，探针可自愈），
+		// 不再「单次 usage 缺失即禁用整条渠道」。
+		if usageMissing {
+			g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, channel.Feedback{IsSuccess: false, Now: g.now()})
+		} else {
 			g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, feedbackSuccess(start))
 		}
 		return out
@@ -1532,14 +1542,19 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		// 计费失败/中断只影响账单与日志语义，下游状态码仍是 200，故照实记录。
 		out.downstreamStatus = http.StatusOK
 		usageMissing := errors.Is(herr, ErrUsageMissing)
+		missingReason := usageMissingReason(herr)
+		// 客户端是否已离开必须先于 usage 缺失处置判定：客户端断开与上游 EOF 的竞态
+		// 不得被误判为上游 usage 缺失而惩罚渠道。
+		clientGone := errors.Is(herr, context.Canceled) || ctx.Err() != nil
+		// 内容已透传无法撤回，usage 缺失一律按可见内容估算计费（平台不能漏计费）；
+		// 是否惩罚渠道按缺失原因区分：仅「上游流被截断/流内 error/无法区分」计入健康失败，
+		// 「正常结束但无 usage」（上游忽略平台注入的 include_usage）与客户端断开不惩罚。
+		usageAnomaly := usageMissing && !clientGone && usageMissingPunishable(missingReason)
 		if usageMissing {
-			// AC-17（放宽）：上游不符合接口协议的返回属极端情况；内容已透传无法撤回，
-			// 故不退预扣，按可见内容估算 token 计费，并把渠道置 DISABLED。
-			g.channels.DisableChannel(routeRes.ChannelID)
 			g.logUpstreamErr(ctx, slog.LevelWarn, "upstream usage missing", endpoint, ureq.Protocol, model, token, routeRes,
 				diagFromRequest(req, ureq.Protocol, ureq.Cred),
 				errInfo{kind: "usage_missing", stage: stage, status: up.StatusCode, attempt: attempt,
-					reason: "上游流式响应未返回或无法解析 usage（按估算计费并将渠道置禁用）", sessionID: sessionID, durationMs: *dur})
+					reason: usageMissingLogReason(missingReason, clientGone, herr), sessionID: sessionID, durationMs: *dur})
 			content, reasoning, tools := assistantParts(assistantMsg)
 			usage = missingUsageEstimate(ureq.Body, assistantMsg, model, content, reasoning, tools)
 		}
@@ -1548,7 +1563,6 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		// 已收响应头之后（HandleStream）维持改造前判据：请求 ctx 只要已结束（Canceled/DeadlineExceeded）
 		// 即视为客户端/传输侧离开；建连阶段才用更严格的 streamClientGone（仅认 Canceled），
 		// 以免把上游超时误归为客户端断开。参见设计 Scope：本阶段「维持现行为」。
-		clientGone := errors.Is(herr, context.Canceled) || ctx.Err() != nil
 		if clientGone {
 			// 客户端已离开：无论是否带回错误都要留痕（herr 为空时只记"已断开"），
 			// 避免"客户端中断"在观测面上完全消失。
@@ -1573,6 +1587,9 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 			g.writeCallLogUsage(billCtx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
 				"error", string(assistantMsg), "failed", "流式传输中断", upstreamUsage, dur, ft.firstTokenMs(start), dec("流式传输中断"))
 		}
+		if usageAnomaly {
+			out.interrupted = true // 上游流被截断：内容不完整，请求级结论不得记为"成功"
+		}
 		// 流结束后计费（预扣已在前置阶段完成；此处按实际/估算扣费，差额由 serve 结算退补）。
 		ch, bid, berr := g.recordBilling(billCtx, routeRes, model, token, usage, pricingMode, sessionID, sessionName, pc.Credits, dur, ft.firstTokenMs(start))
 		if berr != nil {
@@ -1593,16 +1610,27 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		case out.billFailed:
 			g.writeCallLogUsage(billCtx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
 				"stream", string(assistantMsg), "failed", "流式计费失败", upstreamUsage, dur, ft.firstTokenMs(start), dec("计费失败"))
+		case usageAnomaly:
+			// 上游流中断但内容已部分下发：估算计费已在上面完成，调用日志如实记失败。
+			g.writeCallLogUsage(billCtx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
+				"stream", string(assistantMsg), "failed", "上游流式响应中断（按估算计费）", upstreamUsage, dur, ft.firstTokenMs(start), dec("上游流式响应中断"))
 		default:
 			reason := "success"
 			if usageMissing {
 				reason = "usage缺失(按估算计费)"
+				if missingReason == UsageMissingDoneNoUsage {
+					reason = "上游未返回usage(按估算计费)"
+				}
 			}
 			g.writeCallLogUsage(billCtx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
 				"stream", string(assistantMsg), "completed", "", upstreamUsage, dur, ft.firstTokenMs(start), dec(reason))
 		}
-		// usage 缺失的渠道已置 DISABLED，不再回喂成功反馈（避免与禁用态冲突）。
-		if !usageMissing {
+		// 渠道健康回喂：上游流中断计入密钥健康失败（窗口错误率达标才 DRAIN，探针可自愈），
+		// 不再「单次 usage 缺失即禁用整条渠道」；正常结束无 usage / 客户端断开不回喂失败。
+		switch {
+		case usageAnomaly:
+			g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, channel.Feedback{IsSuccess: false, Now: g.now()})
+		case !usageMissing:
 			g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, feedbackSuccess(start))
 		}
 		return out
@@ -2014,6 +2042,24 @@ func estimateInputTokens(body []byte, model string) int {
 		}
 	}
 	return estTokens(body)
+}
+
+// usageMissingLogReason 返回 usage 缺失的诊断文案：按「客户端断开 / 上游正常结束无 usage /
+// 上游流被截断 / 流内 error / 无法区分」区分，避免一律落「渠道已禁用」的笼统结论。
+func usageMissingLogReason(reason string, clientGone bool, err error) string {
+	if clientGone {
+		return "客户端已断开，未取到上游 usage（按估算计费，不惩罚渠道）"
+	}
+	switch reason {
+	case UsageMissingDoneNoUsage:
+		return "上游流正常结束但未返回 usage（已注入 include_usage，按估算计费，不惩罚渠道）"
+	case UsageMissingTruncated:
+		return "上游流未收到结束标记即中断（按估算计费并计入渠道健康失败）"
+	case UsageMissingErrorFrame:
+		return "上游流内返回 error 后中断（按估算计费并计入渠道健康失败）：" + err.Error()
+	default:
+		return "上游未返回或无法解析 usage（按估算计费并计入渠道健康失败）"
+	}
 }
 
 // missingUsageEstimate 在「上游未返回/无法解析 usage」时按可见内容估算 token 用量（AC-17 放宽）：

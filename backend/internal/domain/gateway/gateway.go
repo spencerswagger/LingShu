@@ -50,8 +50,6 @@ type ChannelResolver interface {
 	ForceKeyState(ctx context.Context, keyID int64, action string) error
 	// ManualSetModelState 手动设置内部模型状态；供协议级错误策略按动作(drain|disable)处置。
 	ManualSetModelState(channelID, modelRowID int64, st channel.State) error
-	// DisableChannel 将渠道及其全部密钥置为禁用（AC-17：上游 usage 缺失/无法解析时）。
-	DisableChannel(channelID int64)
 }
 
 // SessionExpiryResolver 会话过期 TTL 计算抽象（router.SessionExpiryProvider 满足）。

@@ -145,7 +145,8 @@ func (p *OpenAIProvider) ExtractUsage(body []byte) (billing.Usage, []byte, error
 }
 
 // HandleStream 透传 SSE：逐行写回下游并 Flush，同时从 data 行提取 usage 与拼装 assistant 消息。
-// usage 缺失时返回 ErrUsageMissing（AC-17 放宽：内容已透传，由调用方按估算计费并禁用渠道）。
+// usage 缺失时返回 UsageMissingError（可 errors.Is(ErrUsageMissing) 判定），并按流结束形态区分原因：
+// 收到 [DONE] 但无 usage（上游忽略 include_usage）/ 未收到 [DONE] 即 EOF（上游流被截断）/ 流内 error 帧。
 // 返回 (usage, 上游原始 usage JSONB 值, 拼装完成的 assistant 消息 JSON, error)；
 // assistant 消息供 call_log 记录流式响应内容，原始 usage 供诊断渠道口径（call_logs.upstream_usage）。
 func (p *OpenAIProvider) HandleStream(ctx context.Context, upstream *http.Response, w http.ResponseWriter) (billing.Usage, []byte, []byte, error) {
@@ -161,6 +162,8 @@ func (p *OpenAIProvider) HandleStream(ctx context.Context, upstream *http.Respon
 
 	var usage billing.Usage
 	sawUsage := false
+	sawDone := false               // 是否收到流结束标记 [DONE]（区分「正常结束无 usage」与「流被截断」）
+	var errorFrame string          // 流内 error 帧摘要（诊断用；空=未出现）
 	var rawParts []json.RawMessage // 上游原始 usage 分片（多条累计时按同名键后写覆盖）
 	asm := newStreamAssembler()    // 按 data 行增量拼装完整 assistant 消息（call_log 采集）
 
@@ -176,7 +179,12 @@ func (p *OpenAIProvider) HandleStream(ctx context.Context, upstream *http.Respon
 			trimmed := bytes.TrimSpace(line)
 			if bytes.HasPrefix(trimmed, []byte("data:")) {
 				data := bytes.TrimSpace(trimmed[len("data:"):])
-				if len(data) > 0 && !bytes.Equal(data, []byte("[DONE]")) {
+				if len(data) > 0 && bytes.Equal(data, []byte("[DONE]")) {
+					sawDone = true
+				} else if len(data) > 0 {
+					if msg := streamErrorFrame(data); msg != "" {
+						errorFrame = msg
+					}
 					u, raw, has := parseStreamData(data)
 					if has {
 						usage = u
@@ -202,9 +210,85 @@ func (p *OpenAIProvider) HandleStream(ctx context.Context, upstream *http.Respon
 	}
 
 	if !sawUsage {
-		return usage, rawUsageJSON(p.Name(), rawParts), asm.marshal(), ErrUsageMissing
+		reason := UsageMissingTruncated
+		switch {
+		case sawDone:
+			reason = UsageMissingDoneNoUsage
+		case errorFrame != "":
+			reason = UsageMissingErrorFrame
+		}
+		return usage, rawUsageJSON(p.Name(), rawParts), asm.marshal(),
+			&UsageMissingError{Reason: reason, Detail: errorFrame}
 	}
 	return usage, rawUsageJSON(p.Name(), rawParts), asm.marshal(), nil
+}
+
+// streamErrorFrame 提取 OpenAI 兼容流内 error 帧的可读摘要；非 error 帧返回空串。
+func streamErrorFrame(data []byte) string {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(data, &obj); err != nil {
+		return ""
+	}
+	raw, ok := obj["error"]
+	if !ok || len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+	var e struct {
+		Message string `json:"message"`
+		Type    string `json:"type"`
+	}
+	if err := json.Unmarshal(raw, &e); err != nil || e.Message == "" {
+		return ""
+	}
+	if e.Type != "" {
+		return e.Type + ": " + e.Message
+	}
+	return e.Message
+}
+
+// ensureIncludeUsage 为 OpenAI 兼容协议的流式请求幂等补 stream_options.include_usage=true。
+// 平台按 usage 计费，客户端未显式请求 usage 时由网关补齐（平台必需参数）；已有该键为 true 时原样返回，
+// 其余 stream_options 键保留。非流式/非 OpenAI 兼容协议/解析失败时按原样返回。
+func ensureIncludeUsage(body []byte, protocol string) []byte {
+	switch protocol {
+	case "openai-chat", "openai-completions":
+	default:
+		return body
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return body
+	}
+	var stream bool
+	rawStream, ok := obj["stream"]
+	if !ok || json.Unmarshal(rawStream, &stream) != nil || !stream {
+		return body
+	}
+	opts := make(map[string]json.RawMessage)
+	if raw, ok := obj["stream_options"]; ok && len(raw) > 0 && string(raw) != "null" {
+		if err := json.Unmarshal(raw, &opts); err != nil {
+			opts = make(map[string]json.RawMessage) // 结构异常：以平台必需参数为准重建
+		}
+	}
+	var include bool
+	if raw, ok := opts["include_usage"]; ok && json.Unmarshal(raw, &include) == nil && include {
+		return body
+	}
+	opts["include_usage"] = json.RawMessage("true")
+	encOpts, err := json.Marshal(opts)
+	if err != nil {
+		return body
+	}
+	obj["stream_options"] = encOpts
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 // streamToolCall 拼装中的单个工具调用（index → 增量累积状态）。

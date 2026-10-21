@@ -25,7 +25,7 @@ type canonicalToolCall struct {
 
 // pumpConvertedStream 是跨协议流式转换泵：把上游 SSE 逐帧解码为规范事件，按入站协议重新编码后下发。
 // 与各 Provider.HandleStream 的返回契约一致（usage、上游原始 usage JSONB、assistant 消息 JSON、error）：
-// 上游无 usage 时返回 ErrUsageMissing（内容已下发，由调用方按 AC-17 处理）。
+// 上游无 usage 时返回 ErrUsageMissing（内容已下发，由调用方按 AC-17 处理：估算计费）。
 func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Response, inboundProto, upstreamProto string, lossy *protocolconv.LossyReport, w http.ResponseWriter) (billing.Usage, []byte, []byte, error) {
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
