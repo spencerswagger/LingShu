@@ -250,13 +250,12 @@ func streamErrorFrame(data []byte) string {
 	return e.Message
 }
 
-// ensureIncludeUsage 为 OpenAI 兼容协议的流式请求幂等补 stream_options.include_usage=true。
+// ensureIncludeUsage 为 OpenAI Chat Completions 的流式请求幂等补 stream_options.include_usage=true。
 // 平台按 usage 计费，客户端未显式请求 usage 时由网关补齐（平台必需参数）；已有该键为 true 时原样返回，
-// 其余 stream_options 键保留。非流式/非 OpenAI 兼容协议/解析失败时按原样返回。
-func ensureIncludeUsage(body []byte, protocol string) []byte {
-	switch protocol {
-	case "openai-chat", "openai-completions":
-	default:
+// 其余 stream_options 键保留。仅限 chat/completions 端点：legacy completions/embeddings 未定义该参数
+// （注入可能被上游按未知参数拒绝），非 OpenAI 兼容协议同样不改写；解析失败时按原样返回。
+func ensureIncludeUsage(body []byte, protocol, endpoint string) []byte {
+	if protocol != "openai-chat" || endpoint != EndpointChatCompletions {
 		return body
 	}
 	var obj map[string]json.RawMessage

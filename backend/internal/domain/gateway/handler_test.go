@@ -768,6 +768,55 @@ func TestServeNonStreamDoesNotInjectIncludeUsage(t *testing.T) {
 	}
 }
 
+// legacy /v1/completions 未定义 stream_options，注入可能被上游按未知参数拒绝：不得改写。
+func TestServeCompletionsStreamDoesNotInjectIncludeUsage(t *testing.T) {
+	var gotBody string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"text\":\"hi\",\"finish_reason\":\"stop\"}]}\n\n" +
+			"data: {\"id\":\"x\",\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1}}\n\n" +
+			"data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	h := build(t, upstream.URL)
+	rec := doRequest(t, h.gw, "/v1/completions", "sk-gw-t", `{"model":"gpt-4","prompt":"hello","stream":true}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(gotBody, "stream_options") {
+		t.Fatalf("legacy completions 不应被写入 stream_options, got %s", gotBody)
+	}
+}
+
+// hardErr（上游传输中断，如 unexpected EOF）已落 failed 账单与调用日志，必须回喂健康失败，
+// 否则持续读失败的上游永远进不了错误率窗口、无法被 DRAIN。
+func TestServeStreamBrokenBodyFeedsHealthFailure(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Content-Length", "1000") // 声明长度远大于实际写入 → 客户端读到 unexpected EOF
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"))
+	}))
+	defer upstream.Close()
+
+	h := build(t, upstream.URL)
+	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t", `{"model":"gpt-4","stream":true}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200 (stream already responded), got %d", rec.Code)
+	}
+	// hardErr 先落 failed 账单，随后仍会按零用量走一次结算记录（既有行为），故只断言首条为失败。
+	if len(h.billing.reqs) == 0 || !h.billing.reqs[0].Fail {
+		t.Fatalf("上游传输中断应落 failed 账单, got %+v", h.billing.reqs)
+	}
+	if len(h.chans.feeds) != 1 || h.chans.feeds[0].fb.IsSuccess {
+		t.Fatalf("上游传输中断应计入渠道健康失败, got %+v", h.chans.feeds)
+	}
+}
+
 // 场景 8：GET /v1/models 返回启用模型列表（OpenAI 兼容格式）；未认证 → 401。
 func TestServeModels(t *testing.T) {
 	h := build(t, "http://unused")

@@ -775,11 +775,12 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 			convLossy.Merge(reqLossy)
 		}
 
-		// 平台计费依赖上游返回 usage：OpenAI 兼容协议的流式请求幂等补
+		// 平台计费依赖上游返回 usage：OpenAI Chat Completions 的流式请求幂等补
 		// stream_options.include_usage=true（客户端未显式请求时由网关补齐，其余 stream_options 键保留）。
-		// 非流式/非 OpenAI 兼容协议不改写；跨协议转换后的 body 已是目标协议形状，同样适用。
+		// 仅限 chat/completions 端点：legacy completions/embeddings 与非 OpenAI 协议均不改写
+		// （legacy completions 未定义该参数，注入可能被上游按未知参数拒绝）。
 		if isStream {
-			upstreamBody = ensureIncludeUsage(upstreamBody, upstreamProto)
+			upstreamBody = ensureIncludeUsage(upstreamBody, upstreamProto, provEndpoint)
 		}
 
 		// 上游请求构造上下文：有效基址（协议级优先）/ 协议路径覆盖 / 头策略 / 上游协议 / 变量。
@@ -1627,8 +1628,10 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		}
 		// 渠道健康回喂：上游流中断计入密钥健康失败（窗口错误率达标才 DRAIN，探针可自愈），
 		// 不再「单次 usage 缺失即禁用整条渠道」；正常结束无 usage / 客户端断开不回喂失败。
+		// hardErr（如 unexpected EOF / 下游写失败）同样属上游传输中断，必须回喂失败，
+		// 否则持续读失败的上游永远进不了错误率窗口。
 		switch {
-		case usageAnomaly:
+		case usageAnomaly, hardErr:
 			g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, channel.Feedback{IsSuccess: false, Now: g.now()})
 		case !usageMissing:
 			g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, feedbackSuccess(start))
