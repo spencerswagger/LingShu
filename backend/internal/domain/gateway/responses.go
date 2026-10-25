@@ -91,8 +91,9 @@ type responsesStreamEvent struct {
 }
 
 // HandleStream 透传 Responses SSE 事件：增量拼接 output_text，从 response.completed 取 usage。
-// usage 缺失返回 UsageMissingError，并按结束形态区分原因：收到 response.completed/incomplete
-// （正常结束但无 usage，不惩罚渠道）/ 未收到即 EOF（流被截断）/ response.failed（流内错误）。
+// usage 缺失返回 UsageMissingError，并按结束形态区分原因（口径见 streamEnd）：
+// 收到 response.completed/incomplete（协议正常结束但无 usage）/ 只有 [DONE]（该协议没有这个终止符，
+// 属兼容层或代理补发，不能证明正常结束）/ 连 [DONE] 都没有（流被截断）/ response.failed（流内错误）。
 // 返回 (usage, 上游原始 usage JSONB 值, assistant 消息 JSON, error)。
 func (p *ResponsesProvider) HandleStream(ctx context.Context, upstream *http.Response, w http.ResponseWriter) (billing.Usage, []byte, []byte, error) {
 	h := w.Header()
@@ -107,7 +108,8 @@ func (p *ResponsesProvider) HandleStream(ctx context.Context, upstream *http.Res
 
 	var usage billing.Usage
 	sawUsage := false
-	sawDone := false               // 是否收到 response.completed/incomplete（区分「正常结束无 usage」与「流被截断」）
+	sawDone := false               // 是否收到 response.completed/incomplete（协议终止事件 + 内容层收尾证据）
+	sawDoneMark := false           // 是否收到 [DONE]（非本协议终止符，只作终止标记，不证明正常结束）
 	sawError := false              // 是否出现 response.failed（计入渠道健康失败）
 	var errorFrame string          // response.failed 摘要（诊断用）
 	var rawParts []json.RawMessage // 上游原始 usage 分片（诊断渠道口径，call_logs.upstream_usage）
@@ -126,10 +128,11 @@ func (p *ResponsesProvider) HandleStream(ctx context.Context, upstream *http.Res
 			if bytes.HasPrefix(trimmed, []byte("data:")) {
 				data := bytes.TrimSpace(trimmed[len("data:"):])
 				if len(data) > 0 && bytes.Equal(data, []byte("[DONE]")) {
-					// 部分 Responses 兼容上游仍以 [DONE] 收尾：无条件视为终止标记。
-					// 若此前出现过 response.failed，归因由 usageMissingReasonOf 的
-					// error_frame > done_no_usage 优先级裁决，不会被收口标记洗成正常结束。
-					sawDone = true
+					// Responses 协议的终止符只有 response.completed/incomplete，[DONE] 只可能来自
+					// 兼容层或代理——而这类代理常在字节流结束时无条件补一个 [DONE]，上游被截断时同样会补。
+					// 故 [DONE] 只记终止标记，不算内容层收尾证据：缺 completed 即归因
+					// terminator_only（计入渠道健康失败），不被补发标记洗成「正常结束无 usage」。
+					sawDoneMark = true
 				} else if len(data) > 0 {
 					var ev responsesStreamEvent
 					if json.Unmarshal(data, &ev) == nil {
@@ -172,8 +175,10 @@ func (p *ResponsesProvider) HandleStream(ctx context.Context, upstream *http.Res
 	}
 
 	if !sawUsage {
+		// 终止事件本身即内容层收尾证据；[DONE] 只是标记，单独不成立（见 streamEnd）。
+		end := streamEnd{Terminal: sawDone || sawDoneMark, ContentComplete: sawDone}
 		return usage, rawUsageJSON(p.Name(), rawParts), responsesAssistant(content),
-			&UsageMissingError{Reason: usageMissingReasonOf(sawDone, sawError), Detail: errorFrame}
+			&UsageMissingError{Reason: usageMissingReasonOf(end, sawError), Detail: errorFrame}
 	}
 	return usage, rawUsageJSON(p.Name(), rawParts), responsesAssistant(content), nil
 }

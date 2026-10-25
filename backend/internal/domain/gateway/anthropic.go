@@ -84,16 +84,18 @@ type anthropicStreamEvent struct {
 		Usage json.RawMessage `json:"usage"`
 	} `json:"message"`
 	Delta struct {
-		Type string `json:"type"`
-		Text any    `json:"text"`
+		Type       string `json:"type"`
+		Text       any    `json:"text"`
+		StopReason string `json:"stop_reason"`
 	} `json:"delta"`
 	Usage json.RawMessage `json:"usage"`
 	Error json.RawMessage `json:"error"`
 }
 
 // HandleStream 透传 Anthropic SSE 事件：拼接 text_delta，从 message_start（输入/缓存）与
-// message_delta（累计输出）汇总 usage。usage 缺失返回 UsageMissingError，并按结束形态区分原因：
-// 收到 message_stop（正常结束但无 usage，不惩罚渠道）/ 未收到即 EOF（流被截断）/ 流内 error 事件。
+// message_delta（累计输出）汇总 usage。usage 缺失返回 UsageMissingError，并按结束形态区分原因
+// （口径见 streamEnd）：见过带 stop_reason 的 message_delta 即正常结束无 usage / 只有 message_stop
+// 而没收尾证据 = 疑似补发标记掩盖截断 / 连 message_stop 都没有 = 流被截断 / 流内 error 事件。
 // 返回 (usage, 上游原始 usage JSONB 值, assistant 消息 JSON, error)；原始 usage 由两处事件分片合并
 // （message_start 的输入/缓存 + message_delta 的累计输出），供诊断渠道口径（call_logs.upstream_usage）。
 func (p *AnthropicProvider) HandleStream(ctx context.Context, upstream *http.Response, w http.ResponseWriter) (billing.Usage, []byte, []byte, error) {
@@ -109,7 +111,8 @@ func (p *AnthropicProvider) HandleStream(ctx context.Context, upstream *http.Res
 
 	var usage billing.Usage
 	sawUsage := false
-	sawStop := false               // 是否收到 message_stop（区分「正常结束无 usage」与「流被截断」）
+	sawStop := false               // 是否收到 message_stop（终止标记；标记单独不能证明正常结束，见 streamEnd）
+	sawStopReason := false         // 是否收到带 stop_reason 的 message_delta（内容层收尾证据）
 	sawError := false              // 是否出现 error 事件（计入渠道健康失败）
 	var errorFrame string          // error 事件摘要（诊断用）
 	var rawParts []json.RawMessage // 上游原始 usage 分片（message_start + message_delta）
@@ -154,6 +157,10 @@ func (p *AnthropicProvider) HandleStream(ctx context.Context, upstream *http.Res
 								content += s
 							}
 						case "message_delta":
+							// stop_reason 是内容层收尾证据：上游真实生成完毕才给，代理补不出来。
+							if ev.Delta.StopReason != "" {
+								sawStopReason = true
+							}
 							if len(ev.Usage) > 0 {
 								if u, uerr := parseAnthropicUsage(ev.Usage); uerr == nil {
 									usage.Output = u.Output
@@ -180,8 +187,9 @@ func (p *AnthropicProvider) HandleStream(ctx context.Context, upstream *http.Res
 	}
 
 	if !sawUsage {
+		end := streamEnd{Terminal: sawStop, ContentComplete: sawStopReason}
 		return usage, rawUsageJSON(p.Name(), rawParts), responsesAssistant(content),
-			&UsageMissingError{Reason: usageMissingReasonOf(sawStop, sawError), Detail: errorFrame}
+			&UsageMissingError{Reason: usageMissingReasonOf(end, sawError), Detail: errorFrame}
 	}
 	return usage, rawUsageJSON(p.Name(), rawParts), responsesAssistant(content), nil
 }

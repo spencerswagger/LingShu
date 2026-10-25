@@ -26,8 +26,10 @@ type canonicalToolCall struct {
 // pumpConvertedStream 是跨协议流式转换泵：把上游 SSE 逐帧解码为规范事件，按入站协议重新编码后下发。
 // 与各 Provider.HandleStream 的返回契约一致（usage、上游原始 usage JSONB、assistant 消息 JSON、error）：
 // 上游无 usage 时返回 UsageMissingError，归因由 usageMissingReasonOf 统一裁决，
-// error 帧优先于终止标记（error_frame > done_no_usage > truncated）——上游先报错再补 [DONE]/终止事件时，
-// 收口标记不能把失败洗成「正常结束无 usage」，否则渠道惩罚会丢失。
+// error 帧优先于任何结束标记（error_frame > done_no_usage > terminator_only > truncated）——上游先报错
+// 再补 [DONE]/终止事件时，收口标记不能把失败洗成「正常结束无 usage」，否则渠道惩罚会丢失。
+// 「正常结束」另须交叉验证内容层收尾证据（见 streamEnd）：只有 [DONE]/message_stop 而缺
+// finish_reason/stop_reason 时，是代理补发标记掩盖截断，同样要计入渠道健康失败。
 // 流内 error 帧的探测方式取决于上游协议：
 //   - anthropic 由 codec 映射为 EventError，泵内据此置 sawError；
 //   - openai-responses 在 codec 中没有对应映射，由泵内 responsesFailedFrame 按原文探测 response.failed；
@@ -51,7 +53,8 @@ func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Respon
 
 	var usage billing.Usage
 	sawUsage := false
-	sawDone := false               // 是否收到上游终止标记（[DONE] / 终止事件）
+	sawDone := false               // 是否收到上游终止标记（[DONE] / 终止事件 / message_stop）
+	sawContentEnd := false         // 是否收到内容层收尾证据（finish_reason / stop_reason / responses 终止帧）
 	sawError := false              // 是否出现流内 error 帧
 	var errorFrame string          // error 帧摘要（诊断用）
 	var rawParts []json.RawMessage // 上游原始 usage 分片（携带 usage 的事件原文）
@@ -64,7 +67,6 @@ func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Respon
 
 	started := false
 	sawToolCall := false
-	sawTerminal := false // 是否收到过终止事件（message_delta）：EOF 前收到过 = 正常结束，否则为流截断
 	anthropicDown := downstream == channelprotocol.ProtocolAnthropicMessages
 
 	// 下游 anthropic 的内容块状态：openBlocks 记录已开启的下游块下标；
@@ -177,7 +179,6 @@ func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Respon
 		}
 
 		if ev.Type == protocolconv.EventMessageDelta {
-			sawTerminal = true
 			if anthropicDown && !started {
 				started = true
 				if err := emit([]channelEvent{{Type: protocolconv.EventMessageStart}}); err != nil {
@@ -295,8 +296,15 @@ func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Respon
 								sawDone = true
 							case upstreamResponses && ev.Type == protocolconv.EventMessageDelta:
 								// openai-responses 的终止帧（response.completed/incomplete）解码为
-								// message_delta，该协议没有 EventMessageStop，故以此判定「正常结束」。
+								// message_delta，该协议没有 EventMessageStop：终止帧本身既是标记、
+								// 也是内容层收尾证据（上游确实生成完毕才下发）。
 								sawDone = true
+								sawContentEnd = true
+							case ev.Type == protocolconv.EventMessageDelta && ev.StopReason != "":
+								// openai-chat / anthropic 的内容层收尾证据（finish_reason / stop_reason）：
+								// 只有 [DONE]/message_stop 而没收尾证据时，是代理补发标记掩盖截断
+								//（见 streamEnd），不能归因 done_no_usage。
+								sawContentEnd = true
 							case ev.Type == protocolconv.EventError:
 								sawError = true
 								if errorFrame == "" {
@@ -347,11 +355,13 @@ func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Respon
 	}
 
 	if !sawUsage {
-		// 「正常结束」有两个来源，合并后再参与归因：sawDone（[DONE] / message_stop / responses 终止事件）
-		// 与 sawTerminal（泵内收到过终止 message_delta，覆盖仅以 finish_reason 收尾、不补 [DONE] 的上游）。
-		// error 帧仍优先（见 usageMissingReasonOf），收口标记不得把上游报错洗成正常结束。
+		// 「正常结束」须交叉验证两类独立信号（见 streamEnd）：终止标记（[DONE] / message_stop /
+		// responses 终止帧）＋ 内容层收尾证据（finish_reason / stop_reason / responses 终止帧）。
+		// 仅有标记时说明标记可能由代理在上游截断后补发，不按正常结束归因（计入渠道健康失败）；
+		// error 帧仍最优先，收口标记不得把上游报错洗成正常结束。
+		end := streamEnd{Terminal: sawDone, ContentComplete: sawContentEnd}
 		return usage, rawUsageJSON(upstreamProto, rawParts), asm(),
-			&UsageMissingError{Reason: usageMissingReasonOf(sawDone || sawTerminal, sawError), Detail: errorFrame}
+			&UsageMissingError{Reason: usageMissingReasonOf(end, sawError), Detail: errorFrame}
 	}
 	return usage, rawUsageJSON(upstreamProto, rawParts), asm(), nil
 }

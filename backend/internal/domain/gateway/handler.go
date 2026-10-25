@@ -1607,10 +1607,10 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		// 客户端是否已离开必须先于 usage 缺失处置判定：客户端断开与上游 EOF 的竞态
 		// 不得被误判为上游 usage 缺失而惩罚渠道。
 		clientGone := errors.Is(herr, context.Canceled) || ctx.Err() != nil
-		// 会话级推理缓存：仅在流「正常结束」时记录本轮 assistant 的推理内容，避免把半截推理
-		// 写入缓存后回传给上游。「正常结束」含「收到 [DONE] 但 usage 缺失」（上游忽略平台注入的
-		// include_usage，内容完整，与下方不惩罚渠道的口径一致）；客户端断开、上游流截断、流内
-		// error（UsageMissingTruncated/UsageMissingErrorFrame）不计入。读取按响应侧别名容错。
+		// 会话级推理缓存：仅在流「按协议正常收尾」时记录本轮 assistant 的推理内容，避免把半截推理
+		// 写入缓存后回传给上游。「正常结束」只认 done_no_usage（内容层收尾证据齐备但上游忽略平台注入的
+		// include_usage，内容完整，与下方不惩罚渠道的口径一致）；客户端断开、上游流截断、
+		// 仅补发结束标记（terminator_only）、流内 error 均不计入。读取按响应侧别名容错。
 		normalEnd := herr == nil || (errors.Is(herr, ErrUsageMissing) && missingReason == UsageMissingDoneNoUsage)
 		if sessionID != "" && ureq.Protocol == channelprotocol.ProtocolOpenAIChat && !clientGone && normalEnd {
 			g.reasoning.RememberMessage(sessionID, assistantMsg)
@@ -1687,8 +1687,13 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 				"stream", string(assistantMsg), "failed", "流式计费失败", upstreamUsage, dur, ft.firstTokenMs(start), dec("计费失败"))
 		case usageAnomaly:
 			// 上游流中断但内容已部分下发：估算计费已在上面完成，调用日志如实记失败。
+			// 文案按缺失原因区分，避免「补发标记掩盖截断」与「干脆没有结束标记」在日志上混为一谈。
+			reasonText, decReason := "上游流式响应中断（按估算计费）", "上游流式响应中断"
+			if missingReason == UsageMissingTerminatorOnly {
+				reasonText, decReason = "上游流式响应中断（仅收到结束标记、内容层未见收尾证据，按估算计费）", "上游仅补发结束标记"
+			}
 			g.writeCallLogUsage(billCtx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-				"stream", string(assistantMsg), "failed", "上游流式响应中断（按估算计费）", upstreamUsage, dur, ft.firstTokenMs(start), dec("上游流式响应中断"))
+				"stream", string(assistantMsg), "failed", reasonText, upstreamUsage, dur, ft.firstTokenMs(start), dec(decReason))
 		default:
 			reason := "success"
 			if usageMissing {
@@ -2124,7 +2129,7 @@ func estimateInputTokens(body []byte, model string) int {
 }
 
 // usageMissingLogReason 返回 usage 缺失的诊断文案：按「客户端断开 / 上游正常结束无 usage /
-// 上游流被截断 / 流内 error / 无法区分」区分，避免一律落「渠道已禁用」的笼统结论。
+// 上游只补发结束标记 / 上游流被截断 / 流内 error / 无法区分」区分，避免一律落「渠道已禁用」的笼统结论。
 func usageMissingLogReason(reason string, clientGone bool, err error) string {
 	if clientGone {
 		return "客户端已断开，未取到上游 usage（按估算计费，不惩罚渠道）"
@@ -2132,6 +2137,8 @@ func usageMissingLogReason(reason string, clientGone bool, err error) string {
 	switch reason {
 	case UsageMissingDoneNoUsage:
 		return "上游流正常结束但未返回 usage（按估算计费，不惩罚渠道）"
+	case UsageMissingTerminatorOnly:
+		return "上游只补发流结束标记、内容层未见收尾证据（疑似代理补发标记掩盖截断；按估算计费并计入渠道健康失败）"
 	case UsageMissingTruncated:
 		return "上游流未收到结束标记即中断（按估算计费并计入渠道健康失败）"
 	case UsageMissingErrorFrame:

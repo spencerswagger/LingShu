@@ -80,13 +80,20 @@ func errorFrameDetail(raw json.RawMessage) string {
 
 // 流式 usage 缺失的可区分原因：计费一律按可见内容估算，但渠道健康惩罚按原因区别对待。
 const (
-	// UsageMissingDoneNoUsage 收到流结束标记但无 usage：平台已为 OpenAI 兼容流式请求注入
-	// stream_options.include_usage=true，此类属上游忽略该参数（协议偏差），不惩罚渠道。
+	// UsageMissingDoneNoUsage 流按协议正常收尾（收到内容层收尾证据）但无 usage：平台已为
+	// OpenAI 兼容流式请求注入 stream_options.include_usage=true，此类属上游忽略该参数
+	// （协议偏差），不惩罚渠道。
 	UsageMissingDoneNoUsage = "done_no_usage"
-	// UsageMissingTruncated 未收到流结束标记即读到 EOF（上游流被截断），计入渠道健康失败。
+	// UsageMissingTruncated 既未收到流结束标记、也未收到内容层收尾证据即读到 EOF（上游流被截断），
+	// 计入渠道健康失败。
 	UsageMissingTruncated = "truncated"
+	// UsageMissingTerminatorOnly 收到流结束标记（[DONE] / message_stop / 终止事件），但没有内容层
+	// 收尾证据（finish_reason / message_delta / response.completed）：典型形态是代理在上游被截断后
+	// 兜底补一个 [DONE] 掩盖截断。终止标记对中间层是零成本可伪造的，不能单独证明「正常结束」，
+	// 故计入渠道健康失败——否则渠道健康 / 调用日志 / 计费三个观测面会同时看不见这类坏渠道。
+	UsageMissingTerminatorOnly = "terminator_only"
 	// UsageMissingErrorFrame 上游在流内下发 error 帧后结束，计入渠道健康失败；
-	// 该归因优先于任何结束标记（见 usageMissingReasonOf）。
+	// 该归因优先于任何结束标记（见 streamEnd.reason）。
 	UsageMissingErrorFrame = "error_frame"
 	// UsageMissingUnknown 适配器无法区分流的结束形态（非 OpenAI 兼容协议），计入渠道健康失败。
 	UsageMissingUnknown = "unknown"
@@ -122,8 +129,8 @@ func usageMissingReason(err error) string {
 }
 
 // usageMissingPunishable 判断 usage 缺失是否应计入渠道健康失败：
-// 仅「流被截断 / 流内 error / 无法区分」计入；「正常结束但无 usage」（上游忽略
-// include_usage）与客户端断开不惩罚（后者由调用方先行判定）。
+// 仅「流被截断 / 只有结束标记没有内容收尾证据 / 流内 error / 无法区分」计入；
+// 「协议正常收尾但无 usage」（上游忽略 include_usage）与客户端断开不惩罚（后者由调用方先行判定）。
 func usageMissingPunishable(reason string) bool {
 	switch reason {
 	case "", UsageMissingDoneNoUsage:
@@ -133,19 +140,52 @@ func usageMissingPunishable(reason string) bool {
 	}
 }
 
-// usageMissingReasonOf 统一各协议适配器的 usage 缺失归因，优先级 error_frame > done_no_usage > truncated：
-// 上游已明确报错时，随后的 [DONE]/终止事件只是收口，不能把失败洗成「正常结束无 usage」，
-// 否则渠道健康惩罚会丢失。只有整段确实出现过 usage 时调用方才不报缺失（不受本函数影响）。
-// 各适配器的 sawDone/sawError 语义由自身协议定义，归因口径保持一致。
-func usageMissingReasonOf(sawDone, sawError bool) string {
+// streamEnd 汇总判断「流是否正常结束」的两类独立证据，供 usage 缺失归因交叉验证。
+//
+// 只认终止标记是不够的：终止标记（openai-chat 的 [DONE]、anthropic 的 message_stop、
+// responses 的终止事件）只说明「有人宣布流结束了」，而中间的代理 / 兼容层往往在字节流结束时
+// 无条件补一个 [DONE]——上游被截断、根本拿不到真实终止事件时同样会补。若把这种「补发的标记」
+// 当成正常结束，渠道健康 / 调用日志 / 计费三个观测面会同时看不见这个坏渠道，等于永远不处罚。
+//
+// 所以「正常结束」必须再叠加内容层收尾证据（ContentComplete）：
+//   - openai-chat：choices[].finish_reason 非空（上游真实生成完毕才有的字段）；
+//   - anthropic-messages：message_delta 且 stop_reason 非空；
+//   - openai-responses：response.completed / response.incomplete 终止事件本身。
+//
+// 这类证据是上游真实产出的内容，代理要伪造成本高得多；只有标记而没有内容证据时归因
+// UsageMissingTerminatorOnly（计入健康失败，但归因与「干脆没有标记」的 truncated 可区分）。
+//
+// 连接层信号（非 io.EOF 的读错误 / 超时 / 连接被重置）不进本结构：各适配器读到即直接返回原始
+// 错误，由 handler 按「流式传输中断」处置（同样回喂健康失败），无需在此重复判定。
+type streamEnd struct {
+	Terminal        bool // 是否收到流结束标记
+	ContentComplete bool // 是否收到内容层收尾证据
+}
+
+// normal 判断是否可归因为「正常结束但无 usage」：内容层收尾证据是必要条件（标记单独不算）。
+func (e streamEnd) normal() bool { return e.ContentComplete }
+
+// reason 按 error_frame > done_no_usage > terminator_only > truncated 归因。
+// error 帧优先：上游已明确报错时，随后的终止标记只是收口，不能把失败洗成「正常结束无 usage」。
+func (e streamEnd) reason(sawError bool) string {
 	switch {
 	case sawError:
 		return UsageMissingErrorFrame
-	case sawDone:
+	case e.normal():
 		return UsageMissingDoneNoUsage
+	case e.Terminal:
+		return UsageMissingTerminatorOnly
 	default:
 		return UsageMissingTruncated
 	}
+}
+
+// usageMissingReasonOf 统一各协议适配器的 usage 缺失归因（口径见 streamEnd.reason）：
+// 上游已明确报错时，随后的 [DONE]/终止事件只是收口，不能把失败洗成「正常结束无 usage」，
+// 否则渠道健康惩罚会丢失。只有整段确实出现过 usage 时调用方才不报缺失（不受本函数影响）。
+// 各适配器的 Terminal/ContentComplete 语义由自身协议定义，归因口径保持一致。
+func usageMissingReasonOf(end streamEnd, sawError bool) string {
+	return end.reason(sawError)
 }
 
 // Provider 抽象一个上游基础协议适配器。基础协议为代码固定的 3 个：

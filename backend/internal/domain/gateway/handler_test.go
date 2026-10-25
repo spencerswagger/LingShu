@@ -660,10 +660,13 @@ func TestServeStream(t *testing.T) {
 	assertChannelOpaque(t, rec)
 }
 
-// 场景 8（AC-17 放宽）：流式响应正常结束（[DONE]）但无 usage → 按可见内容估算计费（不退预扣）。
+// 场景 8（AC-17 放宽）：流式响应正常结束（finish_reason + [DONE]）但无 usage → 按可见内容估算计费（不退预扣）。
 // 「正常结束无 usage」属上游忽略平台注入的 include_usage（协议偏差），不惩罚渠道。
+// 注意：fixture 必须带 finish_reason——那是内容层收尾证据；只有 [DONE] 的形态见
+// TestServeStreamDoneOnlyWithoutFinishReasonPenalized（补发标记掩盖截断）。
 func TestServeStreamDoneNoUsageEstimatesWithoutPunishingChannel(t *testing.T) {
 	streamBody := "data: {\"choices\":[{\"delta\":{\"content\":\"hello world\"}}]}\n\n" +
+		"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
 		"data: [DONE]\n\n"
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -828,12 +831,58 @@ func TestServeStreamTruncatedEstimatesAndFeedsHealthFailure(t *testing.T) {
 	}
 }
 
-// 非 openai-chat 协议：流正常结束（message_stop / response.completed）但无 usage → 估算计费、不惩罚渠道；
-// 未收到结束标记即 EOF（截断）→ 仍估算计费，但计入渠道健康失败。
+// 「截断 + 补发 [DONE]」：上游中途断流，代理在字节流末尾兜底补一个 [DONE] 掩盖截断。
+// 只有结束标记、没有 finish_reason 的内容层收尾证据 → 不能判正常结束：估算计费照旧，
+// 但须归因 terminator_only 并计入渠道健康失败、调用日志记 failed，三个观测面都要能看见。
+func TestServeStreamDoneOnlyWithoutFinishReasonPenalized(t *testing.T) {
+	streamBody := "data: {\"choices\":[{\"delta\":{\"content\":\"hello wor\"}}]}\n\n" + // 截断：无 finish_reason
+		"data: [DONE]\n\n" // 代理补发
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(streamBody))
+	}))
+	defer upstream.Close()
+
+	h := build(t, upstream.URL)
+	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t", `{"model":"gpt-4","stream":true}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200 (stream already responded), got %d", rec.Code)
+	}
+	if len(h.chans.feeds) != 1 || h.chans.feeds[0].fb.IsSuccess {
+		t.Fatalf("补发 [DONE] 掩盖截断应计入渠道健康失败, got %+v", h.chans.feeds)
+	}
+	if len(h.billing.reqs) != 1 || h.billing.reqs[0].Fail {
+		t.Fatalf("usage 缺失应按估算计费（成功账单）, got %+v", h.billing.reqs)
+	}
+	if len(h.clogs.inserted) == 0 {
+		t.Fatalf("缺少调用日志")
+	}
+	last := h.clogs.inserted[len(h.clogs.inserted)-1]
+	if last.Status != "failed" || last.RespKind != "stream" {
+		t.Fatalf("补发 [DONE] 掩盖截断应记 failed/stream 调用日志, got status=%q resp_kind=%q", last.Status, last.RespKind)
+	}
+	if !strings.Contains(last.ErrorMessage, "仅收到结束标记") {
+		t.Fatalf("调用日志应区分「仅补发结束标记」与普通截断, got %q", last.ErrorMessage)
+	}
+	// 半截内容不得写入会话级推理缓存（内容不完整）。
+	h.gw.reasoning.mu.Lock()
+	n := len(h.gw.reasoning.entries)
+	h.gw.reasoning.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("补发标记掩盖截断不应写入推理缓存, got %d 条", n)
+	}
+}
+
+// 非 openai-chat 协议：流正常结束（末尾 message_delta/completed 收尾 + message_stop）但无 usage →
+// 估算计费、不惩罚渠道；未收到结束标记即 EOF（截断），或只有结束标记而没有内容层收尾证据
+// （代理补发 message_stop 掩盖截断）→ 仍估算计费，但计入渠道健康失败。
 func TestServeStreamNonOpenAINoUsageEndShape(t *testing.T) {
 	const anthropicStart = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\"}}\n\n"
 	const anthropicDelta = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0," +
 		"\"delta\":{\"type\":\"text_delta\",\"text\":\"hello world\"}}\n\n"
+	const anthropicMessageDelta = "event: message_delta\ndata: {\"type\":\"message_delta\"," +
+		"\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n"
 	const anthropicStop = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
 	const responsesDelta = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello world\"}\n\n"
 	const responsesDone = "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
@@ -844,8 +893,12 @@ func TestServeStreamNonOpenAINoUsageEndShape(t *testing.T) {
 		body       string
 		wantPunish bool
 	}{
-		{"anthropic 正常结束无 usage", channelprotocol.ProtocolAnthropicMessages, anthropicStart + anthropicDelta + anthropicStop, false},
+		{"anthropic 正常结束无 usage", channelprotocol.ProtocolAnthropicMessages,
+			anthropicStart + anthropicDelta + anthropicMessageDelta + anthropicStop, false},
 		{"anthropic 截断", channelprotocol.ProtocolAnthropicMessages, anthropicStart + anthropicDelta, true},
+		// 只有 message_stop 没有 message_delta：代理在上游截断后补发终止标记的形态，必须惩罚。
+		{"anthropic 仅 message_stop", channelprotocol.ProtocolAnthropicMessages,
+			anthropicStart + anthropicDelta + anthropicStop, true},
 		{"responses 正常结束无 usage", channelprotocol.ProtocolOpenAIResponses, responsesDelta + responsesDone, false},
 		{"responses 截断", channelprotocol.ProtocolOpenAIResponses, responsesDelta, true},
 	}
@@ -888,13 +941,51 @@ func TestServeStreamNonOpenAINoUsageEndShape(t *testing.T) {
 	}
 }
 
-// responses 直通仅以 [DONE] 收尾（无 response.completed/usage）：按正常结束归因，
-// 估算计费且不惩罚渠道（reason=done_no_usage）。
-func TestServeResponsesDoneOnlyNoUsageNoPenalty(t *testing.T) {
+// responses 直通仅以 [DONE] 收尾（无 response.completed/usage）：[DONE] 不是该协议的终止符，
+// 只可能来自兼容层或代理，而这类代理在字节流结束时无条件补一个 [DONE]——上游被截断时同样会补。
+// 故不能按正常结束归因：估算计费照旧（不丢计费），但必须归因 terminator_only 并计入渠道健康失败，
+// 否则坏渠道在渠道健康、调用日志、计费三个观测面上同时隐身。
+func TestServeResponsesDoneOnlyNoUsagePenalized(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\ndata: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	h := build(t, upstream.URL)
+	h.chans.rt.Channel.Protocol = channelprotocol.ProtocolOpenAIResponses
+	rec := doRequest(t, h.gw, "/v1/responses", "sk-gw-t", `{"model":"gpt-4","stream":true}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200 (stream already responded), got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(h.chans.feeds) != 1 || h.chans.feeds[0].fb.IsSuccess {
+		t.Fatalf("仅 [DONE] 收尾应计入渠道健康失败, got %+v", h.chans.feeds)
+	}
+	// usage 缺失仍按可见内容估算计费：账单不得是 failed，观测面不能靠少计费来体现异常。
+	if len(h.billing.reqs) != 1 || h.billing.reqs[0].Fail {
+		t.Fatalf("usage 缺失应按估算计费（成功账单）, got %+v", h.billing.reqs)
+	}
+	if len(h.clogs.inserted) == 0 {
+		t.Fatalf("缺少调用日志")
+	}
+	last := h.clogs.inserted[len(h.clogs.inserted)-1]
+	if last.Status != "failed" || last.RespKind != "stream" {
+		t.Fatalf("补发标记掩盖截断应记 failed/stream 调用日志, got status=%q resp_kind=%q", last.Status, last.RespKind)
+	}
+	if !strings.Contains(last.ErrorMessage, "仅收到结束标记") {
+		t.Fatalf("调用日志应区分「仅补发结束标记」与普通截断, got %q", last.ErrorMessage)
+	}
+}
+
+// responses 直通以 response.completed 收尾（无 usage）：协议正常结束，估算计费且不惩罚渠道
+// （reason=done_no_usage）——这是与上面「仅 [DONE]」判然有别的形态。
+func TestServeResponsesCompletedNoUsageNoPenalty(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n" +
+			"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"))
 	}))
 	defer upstream.Close()
 

@@ -402,6 +402,7 @@ func TestStreamConversionDoneNoUsageNotPunished(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(
 			"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hello world\"}}]}\n\n" +
+				"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
 				"data: [DONE]\n\n"))
 	}))
 	defer upstream.Close()
@@ -424,6 +425,105 @@ func TestStreamConversionDoneNoUsageNotPunished(t *testing.T) {
 	}
 	if len(h.chans.feeds) != 0 {
 		t.Fatalf("正常结束无 usage 不应计入渠道健康失败, got %+v", h.chans.feeds)
+	}
+}
+
+// 转换泵级归因矩阵：只有内容层收尾证据齐备才归 done_no_usage（不惩罚）；
+// 「截断 + 补发 [DONE]」（只有标记、无 finish_reason）归 terminator_only 并计入健康失败；
+// 未补 [DONE] 但给了 finish_reason 的兼容上游（连接干净结束）仍算正常结束。
+func TestStreamConversionUsageMissingEndShape(t *testing.T) {
+	const chatDelta = "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n"
+	const chatFinish = "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+
+	tests := []struct {
+		name       string
+		sse        string
+		wantReason string
+		wantPunish bool
+	}{
+		{
+			name:       "内容收尾 + [DONE]",
+			sse:        chatDelta + chatFinish + "data: [DONE]\n\n",
+			wantReason: UsageMissingDoneNoUsage,
+			wantPunish: false,
+		},
+		{
+			// 本 P2 的核心场景：上游被截断，代理兜底补一个 [DONE]。
+			// 修复前 pump 用 sawDone||sawTerminal 判定正常结束 → done_no_usage（红）。
+			name:       "截断 + 补发 [DONE]",
+			sse:        chatDelta + "data: [DONE]\n\n",
+			wantReason: UsageMissingTerminatorOnly,
+			wantPunish: true,
+		},
+		{
+			// 兼容上游不补 [DONE]、只靠 finish_reason 收尾且连接干净结束：内容证据齐备，算正常结束。
+			name:       "仅 finish_reason 无 [DONE]",
+			sse:        chatDelta + chatFinish,
+			wantReason: UsageMissingDoneNoUsage,
+			wantPunish: false,
+		},
+		{
+			name:       "既无标记也无收尾证据",
+			sse:        chatDelta,
+			wantReason: UsageMissingTruncated,
+			wantPunish: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pg := build(t, "http://unused")
+			_, _, _, err := pg.gw.pumpConvertedStream(context.Background(), sseResponse(tt.sse),
+				channelprotocol.ProtocolOpenAIChat, channelprotocol.ProtocolOpenAIChat,
+				&protocolconv.LossyReport{}, httptest.NewRecorder())
+			if !errors.Is(err, ErrUsageMissing) {
+				t.Fatalf("want ErrUsageMissing, got %v", err)
+			}
+			if got := usageMissingReason(err); got != tt.wantReason {
+				t.Fatalf("reason want %q, got %q", tt.wantReason, got)
+			}
+			if got := usageMissingPunishable(usageMissingReason(err)); got != tt.wantPunish {
+				t.Fatalf("punishable want %v, got %v", tt.wantPunish, got)
+			}
+		})
+	}
+}
+
+// 端到端（转换泵 + anthropic 入站）：上游截断后代理补发 [DONE]，渠道健康、调用日志两个观测面
+// 都必须能看见——回喂健康失败且调用日志 failed，计费仍按估算成功（不丢计费）。
+func TestStreamConversionDoneOnlyPenalized(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(
+			"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hel\"}}]}\n\n" +
+				"data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	h := build(t, upstream.URL)
+	h.chans.mrt.Model.Protocols = channelprotocol.Protocols{channelprotocol.ProtocolOpenAIChat: {}}
+
+	rec := postWithHeaders(t, h.gw, "/v1/messages",
+		`{"model":"gpt-4","stream":true,"max_tokens":100,"messages":[{"role":"user","content":"ping"}]}`,
+		map[string]string{"x-api-key": "sk-gw-t"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(h.chans.feeds) != 1 || h.chans.feeds[0].fb.IsSuccess {
+		t.Fatalf("补发 [DONE] 掩盖截断应计入渠道健康失败, got %+v", h.chans.feeds)
+	}
+	if len(h.billing.reqs) != 1 || h.billing.reqs[0].Fail {
+		t.Fatalf("usage 缺失应按估算计费（成功账单）, got %+v", h.billing.reqs)
+	}
+	if len(h.clogs.inserted) == 0 {
+		t.Fatalf("缺少调用日志")
+	}
+	last := h.clogs.inserted[len(h.clogs.inserted)-1]
+	if last.Status != "failed" || last.RespKind != "stream" {
+		t.Fatalf("补发 [DONE] 掩盖截断应记 failed/stream 调用日志, got status=%q resp_kind=%q", last.Status, last.RespKind)
+	}
+	if !strings.Contains(last.ErrorMessage, "仅收到结束标记") {
+		t.Fatalf("调用日志应区分「仅补发结束标记」与普通截断, got %q", last.ErrorMessage)
 	}
 }
 
