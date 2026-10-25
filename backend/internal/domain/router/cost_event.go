@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"math"
 	"strconv"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -72,20 +71,9 @@ var _ CostEventSink = (*asyncCostEventSink)(nil)
 
 // NewAsyncCostEventSink 创建会话成本决策产物的异步 sink，并注册 KindSessionCostEvent 的重放函数。
 // w 为 nil 时各提交方法同步直调落地回调（安全兜底）。
-//
-// 可选透传 stores[0]：把每条事件的执行体（persist 回调）接到该有界进程内存储（单实例假设，
-// 不引入 Redis / 同步往返）。控制台「会话成本路由」面板的 /events 与 /distribution 即读该存储。
-// 未传 store 时行为与既有完全一致（仅经 asyncwrite 入队 / WAL 留痕，persist 为 nil）。
-func NewAsyncCostEventSink(w *asyncwrite.Writer, stores ...*SessionCostEventStore) CostEventSink {
+func NewAsyncCostEventSink(w *asyncwrite.Writer) CostEventSink {
 	s := &asyncCostEventSink{w: w}
 	s.seq.Store(uint64(time.Now().UnixNano()))
-	if len(stores) > 0 && stores[0] != nil {
-		store := stores[0]
-		s.persist = func(_ context.Context, ev SessionCostEvent) error {
-			store.Append(ev)
-			return nil
-		}
-	}
 	if w != nil {
 		w.SetReplayFunc(asyncwrite.KindSessionCostEvent, s.replay)
 	}
@@ -214,90 +202,14 @@ func (s *asyncCostEventSink) replay(ctx context.Context, _ string, payload []byt
 	return s.persistEvent(ctx, ev)
 }
 
-// defaultSessionCostEventCap 是会话成本决策产物进程内存储的默认容量（有界环形，防无界增长）。
-const defaultSessionCostEventCap = 1000
-
-// SessionCostEventStore 是会话成本决策产物（KindSessionCostEvent）的有界进程内落地存储。
-//
-// 设计（单实例假设，符合「不引入 Redis / 同步往返」）：
-//   - 有界环形缓冲：容量固定，写满后覆盖最旧事件，保证长跑进程内存有界（不无界增长）；
-//   - 并发安全：读（Snapshot/Len）与写（Append）均持互斥锁，供 asyncwrite 工作协程并发落地、
-//     控制台并发读取（-race 安全）；
-//   - 只读快照：Snapshot 返回副本并按写入顺序（旧→新）展开，调用方不得修改共享底层数组。
-//
-// 定位：进程内「决策轨迹」观测缓存（重启即清零，不承诺持久化——持久化由 asyncwrite WAL + 重放兜底）；
-// 故容量溢出仅意味着最旧样本被淘汰，不影响路由与计费。
-type SessionCostEventStore struct {
-	mu   sync.Mutex
-	cap  int
-	buf  []SessionCostEvent
-	next int // 环形写指针：写满后指向最旧（将被覆盖）的位置
-}
-
-// NewSessionCostEventStore 创建有界事件存储；capacity ≤ 0 时使用默认容量。
-func NewSessionCostEventStore(capacity int) *SessionCostEventStore {
-	if capacity <= 0 {
-		capacity = defaultSessionCostEventCap
-	}
-	return &SessionCostEventStore{cap: capacity}
-}
-
-// Append 追写一条事件（并发安全）：未满则尾插；已满则覆盖最旧（环形）。
-func (s *SessionCostEventStore) Append(ev SessionCostEvent) {
-	if s == nil {
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.cap <= 0 {
-		s.cap = defaultSessionCostEventCap
-	}
-	if len(s.buf) < s.cap {
-		s.buf = append(s.buf, ev)
-		return
-	}
-	s.buf[s.next] = ev
-	s.next = (s.next + 1) % s.cap
-}
-
-// Len 返回当前存活事件数。
-func (s *SessionCostEventStore) Len() int {
-	if s == nil {
-		return 0
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return len(s.buf)
-}
-
-// Snapshot 返回全部事件副本，按写入顺序（旧→新）展开；空存储返回非 nil 空切片。
-func (s *SessionCostEventStore) Snapshot() []SessionCostEvent {
-	if s == nil {
-		return nil
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	n := len(s.buf)
-	if n == 0 {
-		return []SessionCostEvent{}
-	}
-	out := make([]SessionCostEvent, 0, n)
-	if s.cap <= 0 || n < s.cap {
-		return append(out, s.buf...)
-	}
-	out = append(out, s.buf[s.next:]...)
-	out = append(out, s.buf[:s.next]...)
-	return out
-}
-
 // ResolveTimeCoeff 导出路由侧的时段系数解析口径（模型级 time_config 优先，为空回落全局，均无则 1），
-// 供控制台「会话成本路由」面板与路由决策保持同源（避免两处口径漂移）。
+// 供外部调用方与路由决策保持同源（避免两处口径漂移）。
 func ResolveTimeCoeff(modelTC, globalTC *billing.TimeCoeffConfig, now time.Time) float64 {
 	return resolveTimeCoeff(modelTC, globalTC, now)
 }
 
 // ResolveCtxCoeff 导出路由侧的上下文分档系数解析口径（模型级 context_tiers 优先，为空回落全局，
-// 均空则 1；口径含缓存读 Input+CacheRead），供控制台面板与路由决策同源。
+// 均空则 1；口径含缓存读 Input+CacheRead），供外部调用方与路由决策同源。
 func ResolveCtxCoeff(modelTiers, globalTiers []billing.TierRule, sample billing.Usage) float64 {
 	return resolveCtxCoeff(modelTiers, globalTiers, sample)
 }

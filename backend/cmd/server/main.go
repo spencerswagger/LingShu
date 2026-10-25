@@ -529,12 +529,9 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	// 未装配时引擎读缺省安全态（Enabled=false）——开关永远读不到、无法生效；此处补齐装配后
 	// 运维把 routing.session_cost.enabled 置 true 才可能真正放行起点择优 / 中途切换。
 	routerEngine.SetSessionCostProvider(sessionCostProvider)
-	// 会话成本决策产物经 asyncwrite 落库（Key=session_id 保序、IdempotencyKey=session_id:轮次 幂等），
+	// 会话成本决策产物经 asyncwrite 落库（Key=session_id 保序、IdempotencyKey=session_id:Seq 幂等），
 	// WAL 复用 data/asyncwrite.wal（与其余类别同源，由上 asyncWriter 统一承接）。
-	// 同时把每条事件的执行体（persist 回调）接到有界进程内存储 sessionCostEventStore，
-	// 供决策事件流在进程内留痕与后续复用（单实例假设，不引入 Redis/同步往返）。
-	sessionCostEventStore := router.NewSessionCostEventStore(0)
-	routerEngine.SetCostEventSink(router.NewAsyncCostEventSink(asyncWriter, sessionCostEventStore))
+	routerEngine.SetCostEventSink(router.NewAsyncCostEventSink(asyncWriter))
 
 	// 密钥删除联动会话清理：路由注册表经 KillByFilter(channel_key_id=keyID) 踢下线该密钥全部存活会话
 	//（内存+DB 投影）。装配在 routerEngine 之后（SessionRegistry 已就绪）。
