@@ -375,11 +375,16 @@ function tokenRate(row: AdminBillingItem): string {
 }
 
 // 统计栏：平均 RPM/TPM 采用后端忙时口径（分子只算有耗时的请求，分母是这批请求的耗时之和）。
-// 本批请求里没有带耗时的样本（BusyRequests=0）或耗时合计为 0 时不出数，显示 —。
+// 有数据即显示：BusyRequests>0 且耗时合计>0 才出数，否则显示 —；
+// 样本少（请求数 < 20 或耗时合计 < 30 秒）时照常显示数值，只在旁边灰字标注「样本较少」。
 function busyRateReady(): boolean {
   const s = stats.value
   return (s.BusyRequests || 0) > 0 && (s.DurationTotalMS || 0) > 0
 }
+const lowSample = computed(() => {
+  const s = stats.value
+  return (s.BusyRequests || 0) < 20 || (s.DurationTotalMS || 0) < 30000
+})
 function avgRPM(): string {
   if (!busyRateReady()) return '—'
   return (stats.value.BusyRPM || 0).toFixed(1)
@@ -459,11 +464,17 @@ function sessionLabel(s: AdminSession): string {
       </div>
       <div class="stat">
         <span class="stat-label" title="每分钟平均请求数">平均 RPM</span>
-        <span class="stat-value">{{ avgRPM() }}</span>
+        <span class="stat-line">
+          <span class="stat-value">{{ avgRPM() }}</span>
+          <span v-if="busyRateReady() && lowSample" class="stat-note">样本较少</span>
+        </span>
       </div>
       <div class="stat">
         <span class="stat-label" title="每分钟平均 Token 数">平均 TPM</span>
-        <span class="stat-value">{{ avgTPM() }}</span>
+        <span class="stat-line">
+          <span class="stat-value">{{ avgTPM() }}</span>
+          <span v-if="busyRateReady() && lowSample" class="stat-note">样本较少</span>
+        </span>
       </div>
     </div>
 
@@ -770,6 +781,15 @@ function sessionLabel(s: AdminSession): string {
   font-weight: 700;
   font-variant-numeric: tabular-nums;
   color: var(--color-text);
+}
+.stat-line {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+.stat-note {
+  font-size: 11px;
+  color: var(--color-text-tertiary);
 }
 .pager {
   display: flex;

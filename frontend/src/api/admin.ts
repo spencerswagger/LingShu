@@ -952,8 +952,8 @@ export interface AdminSession {
   Tokens: number // 总消耗 Token
   Credits: number // 总消耗积分
   ContextLen: number // 总输入 Token（输入+缓存读）
-  RPM: number // 近 5 分钟每分钟请求数
-  TPM: number // 近 5 分钟每分钟 Token 数
+  RPM: number // 近 1 分钟每分钟请求数
+  TPM: number // 近 1 分钟每分钟 Token 数
   UserMsgs: number // 用户消息次数
   ToolCalls: number // 工具调用次数
   CacheHitRate: number // 缓存命中率（0~1）

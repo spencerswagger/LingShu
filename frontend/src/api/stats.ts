@@ -75,8 +75,10 @@ export interface StatsKPI {
   // RPM/TPM 为忙时口径（按有耗时请求的处理时长折算，文案仍叫 RPM/TPM）
   RPM: number
   TPM: number
-  // SumDurationMS 忙时分母：这批请求的耗时之和（毫秒），供前端做样本门槛判断
+  // SumDurationMS 忙时分母：这批请求的耗时之和（毫秒），供前端做样本量标注
   SumDurationMS: number
+  // BusyRequests 忙时分子：有耗时的请求数（与 RPM/TPM 分母同源）
+  BusyRequests: number
   DeltaTokens: number
   DeltaCredits: number
   DeltaRequests: number

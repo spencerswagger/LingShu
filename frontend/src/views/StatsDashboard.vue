@@ -171,6 +171,8 @@ interface KpiCard {
   sub: string
   tip?: string
   tipTarget?: 'value' | 'sub'
+  // subMuted：副标用更浅的灰字（用于「样本较少」这类口径提示）
+  subMuted?: boolean
   delta?: number
   tone: string
   icon: any
@@ -186,9 +188,10 @@ const kpiCards = computed<KpiCard[]>(() => {
   const cacheRead = data.value?.Usage.Total.CacheRead ?? 0
   const totalInput = totalIn + cacheRead
   const cacheHit = totalInput > 0 ? cacheRead / totalInput : 0
-  // 吞吐量（RPM/TPM）为忙时口径，后端已按「有耗时请求的处理时长之和」折算；
-  // 样本不足（请求数 < 20 或总耗时 < 30 秒）时该格不出数，避免小样本被放大成异常速率。
-  const throughputReady = !!k && k.TotalRequests >= 20 && (k.SumDurationMS ?? 0) >= 30000
+  // 吞吐量（RPM/TPM）为忙时口径，后端已按「有耗时请求的处理时长之和」折算。
+  // 有数据即显示（BusyRequests > 0 且总耗时 > 0）；样本少时只在副标灰字标注，不做硬门槛。
+  const throughputReady = !!k && (k.BusyRequests ?? 0) > 0 && (k.SumDurationMS ?? 0) > 0
+  const throughputLowSample = !!k && ((k.BusyRequests ?? 0) < 20 || (k.SumDurationMS ?? 0) < 30000)
   return [
     {
       label: '总 Token',
@@ -244,8 +247,11 @@ const kpiCards = computed<KpiCard[]>(() => {
     {
       label: '吞吐量',
       value: throughputReady ? `${fmtCompact(k?.TPM ?? 0)} TPM` : '—',
-      sub: throughputReady ? `平均 ${(k?.RPM ?? 0).toFixed(2)} RPM` : '样本不足',
-      tip: '忙时口径：按有耗时请求的处理时长折算的每分钟速率；请求数 < 20 或总耗时 < 30 秒不计',
+      sub: throughputReady
+        ? `平均 ${(k?.RPM ?? 0).toFixed(2)} RPM${throughputLowSample ? ' · 样本较少' : ''}`
+        : '-',
+      subMuted: throughputReady && throughputLowSample,
+      tip: '忙时口径：按有耗时请求的处理时长折算的每分钟速率；请求数 < 20 或总耗时 < 30 秒时仅标注样本较少',
       tone: 'primary',
       icon: TrendCharts,
     },
@@ -549,9 +555,9 @@ const modeLabel = (m: string) =>
           </div>
           <div class="kpi-foot">
             <el-tooltip v-if="c.tip && c.tipTarget !== 'value'" :content="c.tip" placement="top" :show-after="150">
-              <span class="kpi-sub">{{ c.sub }}</span>
+              <span class="kpi-sub" :class="{ muted: c.subMuted }">{{ c.sub }}</span>
             </el-tooltip>
-            <span v-else class="kpi-sub">{{ c.sub }}</span>
+            <span v-else class="kpi-sub" :class="{ muted: c.subMuted }">{{ c.sub }}</span>
             <span v-if="c.delta !== undefined" class="kpi-delta" :class="c.delta >= 0 ? 'up' : 'down'">
               {{ fmtDelta(c.delta as number) }}
             </span>
@@ -815,6 +821,7 @@ const modeLabel = (m: string) =>
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.kpi-sub.muted { color: var(--color-text-tertiary); }
 .kpi-delta {
   flex-shrink: 0;
   font-weight: 600;
