@@ -72,9 +72,11 @@ const costEntityResolveBody = `SELECT DISTINCT ON (cm.channel_id, cm.internal_mo
 // costStatsRow 「成本/售价对照」分组行（按实体聚合）。
 //
 // 实体键口径：EntityKey 是这条行的稳定标识（前端 row-key），格式两种：
-//   - `cm:<channel_model_id>`：账单行解析到了 channel_models 行；
-//   - `name:<对外模型名>`：解析不到时按账单里的原始文本单独成桶（不同文本不合并、不丢弃）；
-//     若同时带内部模型 ID，追加 `#<internal_model_id>`，避免不同内部模型共用同名文本被并成一条。
+//   - `cm:<channel_model_id>`：账单行解析到了 channel_models 行（渠道/对外模型由该行决定，键里不重复带）；
+//   - `name:<对外模型名>#<internal_model_id>@<channel_id>`：解析不到时按账单原始文本单独成桶。
+//     降级桶**按渠道分开**——同一文本在不同渠道下是两行，不同文本不合并、不丢弃；
+//     `internal_model_id` 为空时省略 `#<id>` 段（`name:<文本>@<channel_id>`）；
+//     无渠道（channel_key_id 为 NULL）时 `@0`。
 //
 // ExternalModelName 是**展示名**：解析成功的用当前对外模型名，解析不到的用账单原始文本；
 // 该实体历史上出现过的所有文本快照见 SnapshotNames（按字典序，供「曾用名」标注）。
@@ -120,8 +122,9 @@ const costStatsQuerySQL = `
 WITH res AS (` + costEntityResolveBody + `)
 SELECT CASE
            WHEN r.cm_id IS NOT NULL THEN 'cm:' || r.cm_id::text
-           WHEN b.internal_model_id <> '' THEN 'name:' || b.external_model_name || '#' || b.internal_model_id
-           ELSE 'name:' || b.external_model_name
+           WHEN b.internal_model_id <> ''
+               THEN 'name:' || b.external_model_name || '#' || b.internal_model_id || '@' || COALESCE(k.channel_id, 0)::text
+           ELSE 'name:' || b.external_model_name || '@' || COALESCE(k.channel_id, 0)::text
        END AS entity_key,
        MAX(k.channel_id)                    AS channel_id,
        MAX(COALESCE(c.name, ''))            AS channel_name,
@@ -487,11 +490,14 @@ func hasNonZeroRates(rates map[string]float64) bool {
 	return false
 }
 
-// 单会话成本明细的上限策略：默认 500 行、最多 2000 行（按时间正序取最早的 N 行）。
-// 失败轮也占行，长会话反复失败时行数会涨，故必须设上限并在响应里回报 Total / Truncated。
+// 单会话成本明细的行数上限策略：
+//   - **缺省不截断**（Limit=0 → SQL 里 LIMIT NULL），保证超长会话的老调用方仍能拿到全部行；
+//   - 显式传 Limit 时生效，且超过 2000 按 2000 收敛（保护单次响应体量）。
+//
+// 被截断时响应里 Truncated=true 并回报 Total，调用方可据此翻页/提示。
 const (
-	costSessionDefaultLimit = 500
-	costSessionMaxLimit     = 2000
+	costSessionDefaultLimit = 0    // 0 = 不截断（缺省放开，避免改变老调用方行为）
+	costSessionMaxLimit     = 2000 // 显式 Limit 的硬上限
 )
 
 // costSessionPoint 单会话逐轮成本点（含失败轮）。
@@ -522,7 +528,8 @@ type costSessionTotals struct {
 	SaleCredits float64 `json:"SaleCredits"`
 }
 
-// parseCostSessionLimit 解析会话明细的 Limit：缺省 500，上限 2000，非法报错。
+// parseCostSessionLimit 解析会话明细的 Limit：
+// 缺省（或 ≤0）= 不截断（0）；显式值超过 2000 按 2000 收敛；非数字报错。
 func parseCostSessionLimit(raw string) (int, error) {
 	if raw == "" {
 		return costSessionDefaultLimit, nil
@@ -542,7 +549,10 @@ func parseCostSessionLimit(raw string) (int, error) {
 
 // HandleCostSession GET /api/v1/admin/cost/session/{id}?Limit=
 // 返回指定会话按 call_time 升序的逐轮成本明细与合计，**含失败轮**（Status=failed、金额 0、TurnNo 占位）；
-// 缺 id 返回 400。总量受 Limit 约束（默认 500、最多 2000），超限时 Truncated=true 并回报 Total。
+// 缺 id 返回 400。
+//
+// 行数策略：**缺省不截断**（Limit 不传 → SQL `LIMIT NULL`），保证超长会话的老调用方行为与改造前一致；
+// 只有显式传 Limit 才省略尾部，且显式值超过 2000 按 2000 收敛；被截断时 Truncated=true 并回报 Total。
 //
 // 兼容性：成功行的字段值、相对顺序、金额口径与改造前完全一致；失败行是新增行，
 // 合计仍只累加成功轮，因此老调用方读 Totals 与读成功行的结果都不变。
@@ -596,7 +606,12 @@ LIMIT $2`,
 		fmt.Sprintf(costTokenRowSQL, "cache_read"),
 		fmt.Sprintf(costTokenRowSQL, "output"))
 
-	rowSet, err := h.db.QueryContext(r.Context(), sqlText, sid, limit)
+	// limit<=0 → 传 NULL，Postgres 的 `LIMIT NULL` 等价于不限制。
+	var limitArg any
+	if limit > 0 {
+		limitArg = limit
+	}
+	rowSet, err := h.db.QueryContext(r.Context(), sqlText, sid, limitArg)
 	if err != nil {
 		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "查询会话成本失败")
 		return

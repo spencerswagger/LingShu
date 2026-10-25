@@ -345,8 +345,8 @@ func TestHandleCostStats_EntityRows(t *testing.T) {
 			AddRow("cm:900", int64(5), "渠道A", int64(900), int64(31), "gpt-4o-int", "gpt-4o",
 				float64(0.00001), float64(0.00002), int64(3), int64(100), int64(20), int64(30),
 				`["gpt-4o","gpt-4o-legacy"]`).
-			// 解析不到的降级桶（同一文本不同内部模型不会并到一起）
-			AddRow("name:ghost-model#ghost-int", nil, "", int64(0), int64(0), "ghost-int", "ghost-model",
+			// 解析不到的降级桶（带渠道维度；跨渠道同名会分成两行）
+			AddRow("name:ghost-model#ghost-int@0", nil, "", int64(0), int64(0), "ghost-int", "ghost-model",
 				float64(0.00002), float64(0.00003), int64(1), int64(10), int64(0), int64(5),
 				`["ghost-model"]`))
 
@@ -375,7 +375,7 @@ func TestHandleCostStats_EntityRows(t *testing.T) {
 	}
 
 	fallback := body.Data.Rows[1]
-	if fallback.EntityKey != "name:ghost-model#ghost-int" {
+	if fallback.EntityKey != "name:ghost-model#ghost-int@0" {
 		t.Fatalf("降级桶键错: %q", fallback.EntityKey)
 	}
 	if fallback.ChannelName != "(无渠道)" || fallback.ChannelModelID != 0 || fallback.ExternalModelID != 0 {
@@ -420,9 +420,17 @@ func TestCostStatsQuery_ProbeExclusion(t *testing.T) {
 			t.Fatalf("成本统计 SQL 缺少关键条件：%s", want)
 		}
 	}
-	// 降级桶与实体键表达式必须在。
+	// 降级桶与实体键表达式必须在，且降级桶必须带渠道维度（否则跨渠道同名会被并成一行）。
 	if !contains(sql, "'cm:' || r.cm_id::text") || !contains(sql, "'name:' || b.external_model_name") {
 		t.Fatalf("实体键表达式缺失：%s", sql)
+	}
+	for _, want := range []string{
+		"|| '@' || COALESCE(k.channel_id, 0)::text",
+		"'#' || b.internal_model_id || '@' || COALESCE(k.channel_id, 0)::text",
+	} {
+		if !contains(sql, want) {
+			t.Fatalf("降级桶缺少渠道维度：%s", want)
+		}
 	}
 }
 

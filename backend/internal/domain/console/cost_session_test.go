@@ -63,12 +63,13 @@ func TestHandleCostSession_FailedRounds(t *testing.T) {
 
 	rows := sqlmock.NewRows(costSessionRowCols()).
 		AddRow(mustTime(t, "2026-10-25T10:00:00+08:00"), "渠道A", int64(100), "gpt-4o-int", "completed", int64(100), int64(10), int64(50), 1.5, 3.0).
-		AddRow(mustTime(t, "2026-10-25T10:01:00+08:00"), "渠道A", int64(100), "gpt-4o-int", "failed", int64(80), int64(0), int64(0), 0.0, 0.0).
+		// 失败轮在库里刻意给**非零**金额：接口必须把它们归零（否则下面「金额 0」的断言会平凡通过）。
+		AddRow(mustTime(t, "2026-10-25T10:01:00+08:00"), "渠道A", int64(100), "gpt-4o-int", "failed", int64(80), int64(0), int64(0), 9.99, 19.99).
 		AddRow(mustTime(t, "2026-10-25T10:02:00+08:00"), "渠道B", int64(200), "gpt-4o-int", "completed", int64(200), int64(20), int64(80), 2.5, 5.0).
-		AddRow(mustTime(t, "2026-10-25T10:03:00+08:00"), "渠道B", int64(200), "gpt-4o-int", "failed", int64(0), int64(0), int64(0), 0.0, 0.0).
+		AddRow(mustTime(t, "2026-10-25T10:03:00+08:00"), "渠道B", int64(200), "gpt-4o-int", "failed", int64(0), int64(0), int64(0), 0.12345, 0.54321).
 		AddRow(mustTime(t, "2026-10-25T10:04:00+08:00"), "渠道A", int64(100), "gpt-4o-int", "completed", int64(300), int64(30), int64(90), 3.5, 7.0)
 	mock.ExpectQuery(regexp.QuoteMeta(`ORDER BY b.call_time ASC, b.id ASC`)).
-		WithArgs("s-1", costSessionDefaultLimit).
+		WithArgs("s-1", nil).
 		WillReturnRows(rows)
 
 	h := NewAdmin(db, nil, nil, nil)
@@ -102,7 +103,10 @@ func TestHandleCostSession_FailedRounds(t *testing.T) {
 			t.Fatalf("第 %d 点 Failed=%v，want %v", i, pt.Failed, wantStatus[i] == "failed")
 		}
 		if pt.Failed && (pt.CostCredits != 0 || pt.SaleCredits != 0) {
-			t.Fatalf("第 %d 点失败轮金额必须 0：%+v", i, pt)
+			t.Fatalf("第 %d 点失败轮金额必须 0（库里给的是非零）：%+v", i, pt)
+		}
+		if !pt.Failed && (pt.CostCredits == 0 || pt.SaleCredits == 0) {
+			t.Fatalf("第 %d 点成功轮金额不应为 0：%+v", i, pt)
 		}
 	}
 	// 失败轮保留实际 token（上游可能已消耗），只是不计金额。
@@ -206,10 +210,10 @@ func TestParseCostSessionLimit(t *testing.T) {
 		want    int
 		wantErr bool
 	}{
-		{"", costSessionDefaultLimit, false},
+		{"", 0, false}, // 缺省 = 不截断
 		{"100", 100, false},
-		{"0", costSessionDefaultLimit, false},
-		{"-5", costSessionDefaultLimit, false},
+		{"0", 0, false},
+		{"-5", 0, false},
 		{"999999", costSessionMaxLimit, false},
 		{"abc", 0, true},
 	}
@@ -250,5 +254,85 @@ func TestCostSessionQuery_IncludesFailed(t *testing.T) {
 	// 空会话：Points 必须是 []，Totals 为 0（不返回 null）。
 	if !regexp.MustCompile(`"Points":\[\]`).MatchString(rec.Body.String()) {
 		t.Fatalf("空会话 Points 应为 []，body=%s", rec.Body.String())
+	}
+}
+
+// TestHandleCostSession_DefaultNoLimit 断言缺省**不截断**：超过 500 行的会话全量返回，
+// Truncated=false、Limit=0（= 不限），老调用方不会少拿尾部数据。
+func TestHandleCostSession_DefaultNoLimit(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	const n = 600
+	rows := sqlmock.NewRows(costSessionRowCols())
+	for i := 0; i < n; i++ {
+		status := "completed"
+		if i%7 == 3 {
+			status = "failed"
+		}
+		rows.AddRow(mustTime(t, "2026-10-25T10:00:00+08:00"), "c", int64(100), "m", status,
+			int64(10), int64(0), int64(5), 0.00001, 0.00002)
+	}
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT count(*) FROM billing_records WHERE session_id = $1`)).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(n)))
+	// 缺省 → LIMIT 传 NULL（= 不限），不能用 500 之类的默认值。
+	mock.ExpectQuery(regexp.QuoteMeta(`ORDER BY b.call_time ASC, b.id ASC`)).
+		WithArgs("s-long", nil).
+		WillReturnRows(rows)
+
+	h := NewAdmin(db, nil, nil, nil)
+	rec := httptest.NewRecorder()
+	h.HandleCostSession(rec, sessionReq("s-long", ""))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var body costSessionResp
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(body.Data.Points) != n {
+		t.Fatalf("行数=%d，want %d（缺省不得截断）", len(body.Data.Points), n)
+	}
+	if body.Data.Truncated || body.Data.Limit != 0 || body.Data.Total != n {
+		t.Fatalf("元信息错: Limit=%d Total=%d Truncated=%v", body.Data.Limit, body.Data.Total, body.Data.Truncated)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("未满足的期望: %v", err)
+	}
+}
+
+// TestHandleCostSession_ExplicitLimitOverCap 断言显式 Limit 超上限按 2000 收敛（仍能截断）。
+func TestHandleCostSession_ExplicitLimitOverCap(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT count(*) FROM billing_records WHERE session_id = $1`)).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(5000)))
+	mock.ExpectQuery(regexp.QuoteMeta(`ORDER BY b.call_time ASC, b.id ASC`)).
+		WithArgs("s-huge", costSessionMaxLimit).
+		WillReturnRows(sqlmock.NewRows(costSessionRowCols()).
+			AddRow(mustTime(t, "2026-10-25T10:00:00+08:00"), "c", nil, "m", "completed", int64(1), int64(0), int64(1), 0.1, 0.2))
+
+	h := NewAdmin(db, nil, nil, nil)
+	rec := httptest.NewRecorder()
+	h.HandleCostSession(rec, sessionReq("s-huge", "?Limit=99999"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var body costSessionResp
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if body.Data.Limit != costSessionMaxLimit {
+		t.Fatalf("Limit=%d，want %d（显式超上限按上限收敛）", body.Data.Limit, costSessionMaxLimit)
+	}
+	if !body.Data.Truncated || body.Data.Total != 5000 {
+		t.Fatalf("截断元信息错: Total=%d Truncated=%v", body.Data.Total, body.Data.Truncated)
 	}
 }
