@@ -63,7 +63,7 @@ func TestEventAsync_KeyTransition(t *testing.T) {
 		WithArgs(string(StateDisabled), "", int64(11)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	mgr.persistKeyTransition(11, StateNormal, StateDisabled, "channel disabled: usage missing")
+	mgr.persistKeyTransition(11, StateNormal, StateDisabled, "key disabled by health window")
 
 	if len(sink.keyEvents) != 1 {
 		t.Fatalf("密钥事件应经 sink 提交一次，got %d", len(sink.keyEvents))
@@ -72,7 +72,7 @@ func TestEventAsync_KeyTransition(t *testing.T) {
 	if ev.evID == 0 {
 		t.Fatalf("事件 ID 应由调用方预生成（非零）")
 	}
-	if ev.keyID != 11 || ev.from != StateNormal || ev.to != StateDisabled || ev.reason != "channel disabled: usage missing" {
+	if ev.keyID != 11 || ev.from != StateNormal || ev.to != StateDisabled || ev.reason != "key disabled by health window" {
 		t.Fatalf("sink 事件参数异常：%+v", ev)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {

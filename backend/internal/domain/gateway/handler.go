@@ -535,10 +535,27 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 	// 导致上游推理缓存反复击穿（会话内的协议形态抖动）。
 	// 既有会话保持路由层顺序（会话命中排首、其协议随渠道固定），粘性优先，不做重排；
 	// 需转换的候选仍保留在队尾，仅作兜底。
+	// 重排结果只在真的改序时体现在决策轨迹里（passthrough_first / passthrough_fallback），
+	// 未发生重排时轨迹键集与既有行为完全一致。
+	var passFlags map[*router.ChannelRoute]bool
+	reordered := false
 	if !hasSession {
-		reorderPassthroughFirst(routes, func(cr *router.ChannelRoute) bool {
-			return g.candidatePassesThrough(cr, baseProtocol)
+		passFlags = make(map[*router.ChannelRoute]bool, len(routes))
+		reordered = reorderPassthroughFirst(routes, func(cr *router.ChannelRoute) bool {
+			p := g.candidatePassesThrough(cr, baseProtocol)
+			passFlags[cr] = p
+			return p
 		})
+	}
+	// reorderMark 返回本次候选的重排标记（未发生重排时为空，轨迹键集不变）。
+	reorderMark := func(cr *router.ChannelRoute) string {
+		if !reordered {
+			return ""
+		}
+		if passFlags[cr] {
+			return reorderMarkFirst
+		}
+		return reorderMarkFallback
 	}
 	// 请求增量 diff：计算本次请求的增量消息与全量指纹（call_log 采集用，
 	// 新会话也在此初始化指纹，由下方 Attach 写入会话）。
@@ -576,9 +593,9 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 		chName, keyName := g.channelAndKeyNames(cr.ChannelID, cr.ChannelKeyID)
 		// out 在下方转发阶段赋值；此处提前声明，使轨迹项可并入流式失败诊断（streamDiag）。
 		var out *fwdOutcome
-		// 协议转换上下文（Step 7/9）：默认为直通（converted=false → 不新增任何轨迹字段）；
-		// 解析出上游协议后按实际转换情况更新，供 attempt/skip 与调用日志决策轨迹落痕。
-		plan := convPlan{inbound: baseProtocol, upstream: baseProtocol}
+		// 协议转换上下文（Step 7/9）：默认按直通且未重排初始化（converted=false、reorder 由路由实际标记决定，
+		// 两者皆空时才不新增轨迹字段）；解析出上游协议后按实际转换情况更新，供 attempt/skip 与调用日志决策轨迹落痕。
+		plan := convPlan{inbound: baseProtocol, upstream: baseProtocol, reorder: reorderMark(cr)}
 		var convLossy *protocolconv.LossyReport
 		attempt := func(reason string) map[string]any {
 			m := map[string]any{
@@ -594,7 +611,7 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 				"cost_known":       cr.CostKnown,
 				"route_time_coeff": cr.TimeCoeff,
 			}
-			// 协议转换字段（仅转换候选新增；直通候选键集不变）。
+			// 协议转换/重排字段（仅转换或发生直通重排的候选新增；两者皆无时键集不变）。
 			for k, v := range conversionAttemptFields(plan, convLossy) {
 				m[k] = v
 			}
@@ -679,8 +696,8 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 			sawUnsupported = true
 			continue
 		}
-		// 记录本次候选的转换上下文（供轨迹/调用日志落痕；直通时不新增任何字段）。
-		plan = convPlan{inbound: baseProtocol, upstream: upstreamProto, converted: converted}
+		// 记录本次候选的转换上下文（供轨迹/调用日志落痕；未转换且未发生直通重排时不新增任何字段）。
+		plan.inbound, plan.upstream, plan.converted = baseProtocol, upstreamProto, converted
 		routeRes := &router.RouteResult{ChannelID: cr.ChannelID, ChannelKeyID: cr.ChannelKeyID, InternalModelID: cr.InternalModelID,
 			ModelRowID: cr.ModelRowID, ExternalModelID: cr.ExternalModelID, AutoModelName: autoName, Revision: cr.Revision,
 			Cost: cr.Cost, CostKnown: cr.CostKnown, TimeCoeff: cr.TimeCoeff}
@@ -1152,7 +1169,8 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 	ctx := r.Context()
 	stage := "non_stream"        // 日志用：失败发生的转发阶段
 	attempt := len(attempts) + 1 // 当前候选序号（候选总数由请求级 outcome 日志给出）
-	// dec 组装调用日志决策轨迹，并并入本次候选的协议转换上下文（直通时与 callLogDecision 完全一致）。
+	// dec 组装调用日志决策轨迹，并并入本次候选的协议转换上下文
+	// （未转换且未发生直通重排时与 callLogDecision 完全一致）。
 	dec := func(reason string) map[string]any {
 		return g.callLogDecisionConv(attempts, reason, pc, routeRes, conv, lossy)
 	}
@@ -1589,10 +1607,10 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		// 客户端是否已离开必须先于 usage 缺失处置判定：客户端断开与上游 EOF 的竞态
 		// 不得被误判为上游 usage 缺失而惩罚渠道。
 		clientGone := errors.Is(herr, context.Canceled) || ctx.Err() != nil
-		// 会话级推理缓存：仅在流「正常结束」时记录本轮 assistant 的推理内容，避免把半截推理
-		// 写入缓存后回传给上游。「正常结束」含「收到 [DONE] 但 usage 缺失」（上游忽略平台注入的
-		// include_usage，内容完整，与下方不惩罚渠道的口径一致）；客户端断开、上游流截断、流内
-		// error（UsageMissingTruncated/UsageMissingErrorFrame）不计入。读取按响应侧别名容错。
+		// 会话级推理缓存：仅在流「按协议正常收尾」时记录本轮 assistant 的推理内容，避免把半截推理
+		// 写入缓存后回传给上游。「正常结束」只认 done_no_usage（内容层收尾证据齐备但上游忽略平台注入的
+		// include_usage，内容完整，与下方不惩罚渠道的口径一致）；客户端断开、上游流截断、
+		// 仅补发结束标记（terminator_only）、流内 error 均不计入。读取按响应侧别名容错。
 		normalEnd := herr == nil || (errors.Is(herr, ErrUsageMissing) && missingReason == UsageMissingDoneNoUsage)
 		if sessionID != "" && ureq.Protocol == channelprotocol.ProtocolOpenAIChat && !clientGone && normalEnd {
 			g.reasoning.RememberMessage(sessionID, assistantMsg)
@@ -1605,7 +1623,8 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 			g.logUpstreamErr(ctx, slog.LevelWarn, "upstream usage missing", endpoint, ureq.Protocol, model, token, routeRes,
 				diagFromRequest(req, ureq.Protocol, ureq.Cred),
 				errInfo{kind: "usage_missing", stage: stage, status: up.StatusCode, attempt: attempt,
-					reason: usageMissingLogReason(missingReason, clientGone, herr), sessionID: sessionID, durationMs: *dur})
+					usageReason: missingReason, // 结构化归因（可按 usage_reason 聚合，不依赖中文文案）
+					reason:      usageMissingLogReason(missingReason, clientGone, herr), sessionID: sessionID, durationMs: *dur})
 			content, reasoning, tools := assistantParts(assistantMsg)
 			usage = missingUsageEstimate(ureq.Body, assistantMsg, model, content, reasoning, tools)
 		}
@@ -1629,14 +1648,20 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		hardErr := herr != nil && !clientGone && !usageMissing
 		if hardErr {
 			out.interrupted = true // 语义上失败：内容被截断，请求级结论不得记为"成功"
+			// 下游写失败不是上游故障：kind 保持 stream_interrupted（响应已部分下发不可撤回），
+			// 但归因文案必须区分于「上游读侧中断」，避免把客户端断开误诊成上游故障。
+			reasonText := "流式传输中断"
+			if isDownstreamWriteErr(herr) {
+				reasonText = "下游写失败（传输错误或客户端断开）"
+			}
 			g.logError(rt.Channel.ID, "stream handle failed", herr)
 			g.logUpstreamErr(ctx, slog.LevelError, "stream interrupted", endpoint, ureq.Protocol, model, token, routeRes,
 				diagFromRequest(req, ureq.Protocol, ureq.Cred),
 				errInfo{kind: "stream_interrupted", stage: stage, status: up.StatusCode, attempt: attempt,
-					reason: "流式传输中断：" + herr.Error(), sessionID: sessionID, durationMs: *dur})
-			bid := g.recordFailure(billCtx, routeRes, model, token, pricingMode, sessionID, sessionName, "流式传输中断", dur)
+					reason: reasonText + "：" + herr.Error(), sessionID: sessionID, durationMs: *dur})
+			bid := g.recordFailure(billCtx, routeRes, model, token, pricingMode, sessionID, sessionName, reasonText, dur)
 			g.writeCallLogUsage(billCtx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-				"error", string(assistantMsg), "failed", "流式传输中断", upstreamUsage, dur, ft.firstTokenMs(start), dec("流式传输中断"))
+				"error", string(assistantMsg), "failed", reasonText, upstreamUsage, dur, ft.firstTokenMs(start), dec(reasonText))
 		}
 		if usageAnomaly {
 			out.interrupted = true // 上游流被截断：内容不完整，请求级结论不得记为"成功"
@@ -1663,8 +1688,16 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 				"stream", string(assistantMsg), "failed", "流式计费失败", upstreamUsage, dur, ft.firstTokenMs(start), dec("计费失败"))
 		case usageAnomaly:
 			// 上游流中断但内容已部分下发：估算计费已在上面完成，调用日志如实记失败。
+			// 文案按缺失原因区分，避免「补发标记掩盖截断」与「干脆没有结束标记」在日志上混为一谈；
+			// 同时落结构化字段 usage_reason，供看板按归因聚合（不依赖中文文案匹配）。
+			reasonText, decReason := "上游流式响应中断（按估算计费）", "上游流式响应中断"
+			if missingReason == UsageMissingTerminatorOnly {
+				reasonText, decReason = "上游流式响应中断（仅收到结束标记、内容层未见收尾证据，按估算计费）", "上游仅补发结束标记"
+			}
+			decision := dec(decReason)
+			decision["usage_reason"] = missingReason
 			g.writeCallLogUsage(billCtx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-				"stream", string(assistantMsg), "failed", "上游流式响应中断（按估算计费）", upstreamUsage, dur, ft.firstTokenMs(start), dec("上游流式响应中断"))
+				"stream", string(assistantMsg), "failed", reasonText, upstreamUsage, dur, ft.firstTokenMs(start), decision)
 		default:
 			reason := "success"
 			if usageMissing {
@@ -1673,14 +1706,20 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 					reason = "上游未返回usage(按估算计费)"
 				}
 			}
+			decision := dec(reason)
+			if usageMissing {
+				decision["usage_reason"] = missingReason
+			}
 			g.writeCallLogUsage(billCtx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-				"stream", string(assistantMsg), "completed", "", upstreamUsage, dur, ft.firstTokenMs(start), dec(reason))
+				"stream", string(assistantMsg), "completed", "", upstreamUsage, dur, ft.firstTokenMs(start), decision)
 		}
-		// 渠道健康回喂：上游流中断计入密钥健康失败（窗口错误率达标才 DRAIN，探针可自愈），
+		// 渠道健康回喂：上游读侧中断计入密钥健康失败（窗口错误率达标才 DRAIN，探针可自愈），
 		// 不再「单次 usage 缺失即禁用整条渠道」；正常结束无 usage / 客户端断开不回喂失败。
-		// hardErr（如 unexpected EOF / 下游写失败）同样属上游传输中断，必须回喂失败，
-		// 否则持续读失败的上游永远进不了错误率窗口。
+		// 下游写失败（客户端断开/传输错误）不是上游故障，既不回喂失败（健康上游会被误判为故障），
+		// 也不回喂成功（本次流并未完整送达），只由 interrupted 与调用日志留痕，
+		// 且失败归因文案为「下游写失败（传输错误或客户端断开）」，与上游读侧中断区分。
 		switch {
+		case isDownstreamWriteErr(herr):
 		case usageAnomaly, hardErr:
 			g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, channel.Feedback{IsSuccess: false, Now: g.now()})
 		case !usageMissing:
@@ -2098,14 +2137,16 @@ func estimateInputTokens(body []byte, model string) int {
 }
 
 // usageMissingLogReason 返回 usage 缺失的诊断文案：按「客户端断开 / 上游正常结束无 usage /
-// 上游流被截断 / 流内 error / 无法区分」区分，避免一律落「渠道已禁用」的笼统结论。
+// 上游只补发结束标记 / 上游流被截断 / 流内 error / 无法区分」区分，避免一律落「渠道已禁用」的笼统结论。
 func usageMissingLogReason(reason string, clientGone bool, err error) string {
 	if clientGone {
 		return "客户端已断开，未取到上游 usage（按估算计费，不惩罚渠道）"
 	}
 	switch reason {
 	case UsageMissingDoneNoUsage:
-		return "上游流正常结束但未返回 usage（已注入 include_usage，按估算计费，不惩罚渠道）"
+		return "上游流正常结束但未返回 usage（按估算计费，不惩罚渠道）"
+	case UsageMissingTerminatorOnly:
+		return "上游只补发流结束标记、内容层未见收尾证据（疑似代理补发标记掩盖截断；按估算计费并计入渠道健康失败）"
 	case UsageMissingTruncated:
 		return "上游流未收到结束标记即中断（按估算计费并计入渠道健康失败）"
 	case UsageMissingErrorFrame:

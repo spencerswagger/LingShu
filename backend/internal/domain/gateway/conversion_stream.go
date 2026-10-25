@@ -25,7 +25,19 @@ type canonicalToolCall struct {
 
 // pumpConvertedStream 是跨协议流式转换泵：把上游 SSE 逐帧解码为规范事件，按入站协议重新编码后下发。
 // 与各 Provider.HandleStream 的返回契约一致（usage、上游原始 usage JSONB、assistant 消息 JSON、error）：
-// 上游无 usage 时返回 ErrUsageMissing（内容已下发，由调用方按 AC-17 处理：估算计费）。
+// 上游无 usage 时返回 UsageMissingError，归因由 usageMissingReasonOf 统一裁决，
+// error 帧优先于任何结束标记（error_frame > done_no_usage > terminator_only > truncated）——上游先报错
+// 再补 [DONE]/终止事件时，收口标记不能把失败洗成「正常结束无 usage」，否则渠道惩罚会丢失。
+// 「正常结束」另须交叉验证内容层收尾证据（见 streamEnd）：只有 [DONE]/message_stop 而缺
+// finish_reason/stop_reason 时，是代理补发标记掩盖截断，同样要计入渠道健康失败。
+// 流内 error 帧的探测方式取决于上游协议：
+//   - anthropic 由 codec 映射为 EventError，泵内据此置 sawError；
+//   - openai-responses 在 codec 中没有对应映射，由泵内 responsesFailedFrame 按原文探测 response.failed；
+//   - openai-chat 的 codec DecodeEvent 没有 error 分支（error 帧解码为空事件），由泵内 openAIChatErrorFrame
+//     按顶层 error 键探测。
+//
+// 三种方式都以「帧本身是 error」置位 sawError，空 error 负载（{}）同样算，摘要可能为空串；
+// 因此不能靠摘要是否为空判断失败。
 func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Response, inboundProto, upstreamProto string, lossy *protocolconv.LossyReport, w http.ResponseWriter) (billing.Usage, []byte, []byte, error) {
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
@@ -41,7 +53,13 @@ func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Respon
 
 	var usage billing.Usage
 	sawUsage := false
+	sawDone := false               // 是否收到上游终止标记（[DONE] / 终止事件 / message_stop）
+	sawContentEnd := false         // 是否收到内容层收尾证据（finish_reason / stop_reason / responses 终止帧）
+	sawError := false              // 是否出现流内 error 帧
+	var errorFrame string          // error 帧摘要（诊断用）
 	var rawParts []json.RawMessage // 上游原始 usage 分片（携带 usage 的事件原文）
+	upstreamResponses := channelprotocol.Canonical(upstreamProto) == channelprotocol.ProtocolOpenAIResponses
+	upstreamChat := channelprotocol.Canonical(upstreamProto) == channelprotocol.ProtocolOpenAIChat
 
 	var content, reasoning bytes.Buffer
 	toolCalls := map[int]*canonicalToolCall{}
@@ -49,7 +67,6 @@ func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Respon
 
 	started := false
 	sawToolCall := false
-	sawTerminal := false // 是否收到过终止事件（message_delta）：EOF 前收到过 = 正常结束，否则为流截断
 	anthropicDown := downstream == channelprotocol.ProtocolAnthropicMessages
 
 	// 下游 anthropic 的内容块状态：openBlocks 记录已开启的下游块下标；
@@ -103,7 +120,7 @@ func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Respon
 				continue
 			}
 			if _, werr := w.Write(fr); werr != nil {
-				return werr
+				return wrapDownstreamWrite(werr)
 			}
 			if flusher != nil {
 				flusher.Flush()
@@ -162,7 +179,6 @@ func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Respon
 		}
 
 		if ev.Type == protocolconv.EventMessageDelta {
-			sawTerminal = true
 			if anthropicDown && !started {
 				started = true
 				if err := emit([]channelEvent{{Type: protocolconv.EventMessageStart}}); err != nil {
@@ -237,7 +253,30 @@ func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Respon
 			trimmed := bytes.TrimSpace(line)
 			if bytes.HasPrefix(trimmed, []byte("data:")) {
 				payload := bytes.TrimSpace(trimmed[len("data:"):])
-				if len(payload) > 0 && !bytes.Equal(payload, []byte("[DONE]")) {
+				if len(payload) > 0 && bytes.Equal(payload, []byte("[DONE]")) {
+					sawDone = true
+				} else if len(payload) > 0 {
+					// error 帧探测必须放在解码前：畸形 JSON 的 error 帧会让 DecodeStreamEvents 失败并被丢弃，
+					// 若探测留在解码成功分支内，随后的 [DONE] 会把失败洗成 done_no_usage（丢失渠道惩罚）。
+					// 两个探测函数自带字节预筛，绝大多数正常帧在预筛阶段即返回，成本可忽略。
+					if upstreamResponses {
+						if failed, detail := responsesFailedFrame(payload); failed {
+							// 只要出现 response.failed 就置位；error 负载为空不影响失败判定。
+							sawError = true
+							// 摘要首个非空优先：后续空负载不得清掉先前的诊断信息。
+							if detail != "" && errorFrame == "" {
+								errorFrame = detail
+							}
+						}
+					} else if upstreamChat {
+						if failed, detail := openAIChatErrorFrame(payload); failed {
+							// 顶层 error 键存在且非 null 即为失败帧，{"error":{}} 摘要为空也须置位。
+							sawError = true
+							if detail != "" && errorFrame == "" {
+								errorFrame = detail
+							}
+						}
+					}
 					evs, _, derr := protocolconv.DecodeStreamEvents(upstreamProto, payload)
 					if derr != nil {
 						// 上游畸形帧不得静默丢弃：记入本次损耗诊断（随调用日志决策轨迹落痕）并告警，
@@ -247,10 +286,33 @@ func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Respon
 					} else {
 						carriedUsage := false
 						for _, ev := range evs {
-							if ev.HasUsage {
+							// 零值守卫（口径同三条直通路径）：上游给 "usage":{} 或全零 usage 时
+							// 不能当作有效 usage，否则按 0 token 出账且调用日志记 completed
+							//（金额与异常同时隐身）；按「未取到 usage」走可见内容估算。
+							if ev.HasUsage && !usageZero(ev.Usage) {
 								carriedUsage = true
 								sawUsage = true
 								mergeConvertedUsage(&usage, upstreamProto, ev)
+							}
+							switch {
+							case ev.Type == protocolconv.EventMessageStop:
+								sawDone = true
+							case upstreamResponses && ev.Type == protocolconv.EventMessageDelta:
+								// openai-responses 的终止帧（response.completed/incomplete）解码为
+								// message_delta，该协议没有 EventMessageStop：终止帧本身既是标记、
+								// 也是内容层收尾证据（上游确实生成完毕才下发）。
+								sawDone = true
+								sawContentEnd = true
+							case ev.Type == protocolconv.EventMessageDelta && ev.StopReason != "":
+								// openai-chat / anthropic 的内容层收尾证据（finish_reason / stop_reason）：
+								// 只有 [DONE]/message_stop 而没收尾证据时，是代理补发标记掩盖截断
+								//（见 streamEnd），不能归因 done_no_usage。
+								sawContentEnd = true
+							case ev.Type == protocolconv.EventError:
+								sawError = true
+								if errorFrame == "" {
+									errorFrame = ev.ErrMessage
+								}
 							}
 							accumulateConvertedAssistant(&content, &reasoning, toolCalls, &toolOrder, ev)
 						}
@@ -296,15 +358,102 @@ func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Respon
 	}
 
 	if !sawUsage {
-		// 与 openai.go 同口径：按流的结束形态区分原因——收到过终止事件（message_delta）即正常结束
-		// （上游忽略 include_usage，内容完整，不惩罚渠道），否则视为流被截断。
-		reason := UsageMissingTruncated
-		if sawTerminal {
-			reason = UsageMissingDoneNoUsage
-		}
-		return usage, rawUsageJSON(upstreamProto, rawParts), asm(), &UsageMissingError{Reason: reason}
+		// 「正常结束」须交叉验证两类独立信号（见 streamEnd）：终止标记（[DONE] / message_stop /
+		// responses 终止帧）＋ 内容层收尾证据（finish_reason / stop_reason / responses 终止帧）。
+		// 仅有标记时说明标记可能由代理在上游截断后补发，不按正常结束归因（计入渠道健康失败）；
+		// error 帧仍最优先，收口标记不得把上游报错洗成正常结束。
+		end := streamEnd{Terminal: sawDone, ContentComplete: sawContentEnd}
+		return usage, rawUsageJSON(upstreamProto, rawParts), asm(),
+			&UsageMissingError{Reason: usageMissingReasonOf(end, sawError), Detail: errorFrame}
 	}
 	return usage, rawUsageJSON(upstreamProto, rawParts), asm(), nil
+}
+
+// responsesFailedFrame 按原文探测 openai-responses 的 response.failed 帧：
+// 返回「是否出现该失败帧」与错误摘要。该事件在解码器中没有对应规范事件（视为空事件），
+// 故必须按原文探测；只要帧类型为 response.failed 即为 true，error 负载为空（{} / 缺失）也置位，
+// 摘要则可能为空串。调用方据此置 sawError，不能依赖摘要是否为空。
+// 帧被上游截断成畸形 JSON 时退化为首键形状判定（见 leadingJSONField），避免漏检。
+func responsesFailedFrame(payload []byte) (bool, string) {
+	// 先按字节探测：绝大多数帧不是 response.failed，避免为每帧多做一次反序列化。
+	if !bytes.Contains(payload, []byte("response.failed")) {
+		return false, ""
+	}
+	var probe struct {
+		Type     string          `json:"type"`
+		Error    json.RawMessage `json:"error"`
+		Response struct {
+			Error json.RawMessage `json:"error"`
+		} `json:"response"`
+	}
+	if err := json.Unmarshal(payload, &probe); err != nil {
+		// 上游可能把失败帧截断成畸形 JSON，此时解码必然失败、摘要也无从解析；
+		// 若直接放弃，「error 帧 + [DONE]」会被收口成 done_no_usage。故退化为首键形状判定。
+		return leadingResponsesFailed(payload), ""
+	}
+	if probe.Type != "response.failed" {
+		return false, ""
+	}
+	if d := errorFrameDetail(probe.Response.Error); d != "" {
+		return true, d
+	}
+	return true, errorFrameDetail(probe.Error)
+}
+
+// openAIChatErrorFrame 按原文探测 openai-chat 上游的顶层 error 帧：返回「是否出现 error 帧」与错误摘要。
+// openai-chat codec 的 DecodeEvent 没有 error 分支，该帧会解码为空事件，若不在此按原文探测，
+// 随后的 [DONE] 就会把失败归因成 done_no_usage（不惩罚渠道、调用日志记 completed）。
+// 判定只看顶层 error 键是否存在且非 null：{"error":{}} 也算失败帧，此时摘要为空串，
+// 调用方不得用摘要是否为空反推失败。帧被截断成畸形 JSON 时同样按首键形状识别，避免漏检。
+func openAIChatErrorFrame(payload []byte) (bool, string) {
+	// 先按字节预筛：绝大多数正常帧不含 error 键，避免为每帧多做一次反序列化。
+	if !bytes.Contains(payload, []byte("\"error\"")) {
+		return false, ""
+	}
+	var probe struct {
+		Error json.RawMessage `json:"error"`
+	}
+	if err := json.Unmarshal(payload, &probe); err != nil {
+		// 同 responsesFailedFrame：截断的 error 帧解码必失败，按首键形状兜底识别，
+		// 否则失败会被随后的 [DONE] 洗成 done_no_usage（不惩罚渠道）。
+		key, _ := leadingJSONField(payload)
+		return bytes.Equal(key, []byte("error")), ""
+	}
+	// isNullRaw 同时覆盖「键缺失」（RawMessage 为 nil）与显式 null。
+	if isNullRaw(probe.Error) {
+		return false, ""
+	}
+	return true, errorFrameDetail(probe.Error)
+}
+
+// leadingJSONField 从（可能被上游截断的）帧首部取出「首个顶层键」及紧随其后的原始值片段。
+// 畸形帧无法整体反序列化，但首部形状仍足以判明帧类型；只认首个顶层键，
+// 避免正文（如 content 文本）里出现的同名字面量造成误判。
+func leadingJSONField(payload []byte) (key, value []byte) {
+	s := bytes.TrimSpace(payload)
+	if len(s) < 2 || s[0] != '{' {
+		return nil, nil
+	}
+	s = bytes.TrimSpace(s[1:])
+	if len(s) == 0 || s[0] != '"' {
+		return nil, nil
+	}
+	end := bytes.IndexByte(s[1:], '"')
+	if end < 0 {
+		return nil, nil
+	}
+	key = s[1 : 1+end]
+	s = bytes.TrimSpace(s[1+end+1:])
+	if len(s) == 0 || s[0] != ':' {
+		return nil, nil
+	}
+	return key, bytes.TrimSpace(s[1:])
+}
+
+// leadingResponsesFailed 判断畸形帧的首个顶层键 type 取值是否为 response.failed。
+func leadingResponsesFailed(payload []byte) bool {
+	key, val := leadingJSONField(payload)
+	return bytes.Equal(key, []byte("type")) && bytes.HasPrefix(val, []byte(`"response.failed"`))
 }
 
 // channelEvent 是 protocolconv.CanonicalEvent 的别名，便于在泵内构造事件字面量。

@@ -145,8 +145,9 @@ func (p *OpenAIProvider) ExtractUsage(body []byte) (billing.Usage, []byte, error
 }
 
 // HandleStream 透传 SSE：逐行写回下游并 Flush，同时从 data 行提取 usage 与拼装 assistant 消息。
-// usage 缺失时返回 UsageMissingError（可 errors.Is(ErrUsageMissing) 判定），并按流结束形态区分原因：
-// 收到 [DONE] 但无 usage（上游忽略 include_usage）/ 未收到 [DONE] 即 EOF（上游流被截断）/ 流内 error 帧。
+// usage 缺失时返回 UsageMissingError（可 errors.Is(ErrUsageMissing) 判定），并按结束形态区分原因
+// （口径见 streamEnd）：内容层见过 finish_reason 即正常结束无 usage（上游忽略 include_usage）/
+// 只有 [DONE] 没有 finish_reason = 疑似补发标记掩盖截断 / 连标记都没有 = 流被截断 / 流内 error 帧。
 // 返回 (usage, 上游原始 usage JSONB 值, 拼装完成的 assistant 消息 JSON, error)；
 // assistant 消息供 call_log 记录流式响应内容，原始 usage 供诊断渠道口径（call_logs.upstream_usage）。
 func (p *OpenAIProvider) HandleStream(ctx context.Context, upstream *http.Response, w http.ResponseWriter) (billing.Usage, []byte, []byte, error) {
@@ -162,8 +163,10 @@ func (p *OpenAIProvider) HandleStream(ctx context.Context, upstream *http.Respon
 
 	var usage billing.Usage
 	sawUsage := false
-	sawDone := false               // 是否收到流结束标记 [DONE]（区分「正常结束无 usage」与「流被截断」）
-	var errorFrame string          // 流内 error 帧摘要（诊断用；空=未出现）
+	sawDone := false               // 是否收到流结束标记 [DONE]（注意：标记单独不能证明正常结束，见 streamEnd）
+	sawFinishReason := false       // 是否出现过非空 finish_reason（内容层收尾证据）
+	sawError := false              // 是否出现流内 error 帧（诊断与惩罚归因用）
+	var errorFrame string          // 流内 error 帧摘要（诊断用；空=无摘要）
 	var rawParts []json.RawMessage // 上游原始 usage 分片（多条累计时按同名键后写覆盖）
 	asm := newStreamAssembler()    // 按 data 行增量拼装完整 assistant 消息（call_log 采集）
 
@@ -171,7 +174,7 @@ func (p *OpenAIProvider) HandleStream(ctx context.Context, upstream *http.Respon
 		line, err := br.ReadBytes('\n')
 		if len(line) > 0 {
 			if _, werr := w.Write(line); werr != nil {
-				return usage, rawUsageJSON(p.Name(), rawParts), asm.marshal(), werr
+				return usage, rawUsageJSON(p.Name(), rawParts), asm.marshal(), wrapDownstreamWrite(werr)
 			}
 			if flusher != nil {
 				flusher.Flush()
@@ -182,16 +185,27 @@ func (p *OpenAIProvider) HandleStream(ctx context.Context, upstream *http.Respon
 				if len(data) > 0 && bytes.Equal(data, []byte("[DONE]")) {
 					sawDone = true
 				} else if len(data) > 0 {
-					if msg := streamErrorFrame(data); msg != "" {
-						errorFrame = msg
+					u, raw, has, hasError, errDetail := parseStreamData(data)
+					if hasError {
+						// 以「error 键存在且非 null」置位，空负载（{"error":{}}）同样算失败帧。
+						sawError = true
+						// 摘要首个非空优先：后续 error 帧（尤其空负载）不得覆盖先前的诊断信息，
+						// 与 responses/anthropic 及转换泵的口径保持一致。
+						if errDetail != "" && errorFrame == "" {
+							errorFrame = errDetail
+						}
 					}
-					u, raw, has := parseStreamData(data)
 					if has {
 						usage = u
 						sawUsage = true
 						rawParts = append(rawParts, raw)
 					}
-					asm.apply(data)
+					// finish_reason 是「内容层收尾证据」，属渠道健康判定输入，故记在 HandleStream
+					// 自己的状态里（而不是藏在 call-log 装配器内）：装配器只如实回报本帧解析结果，
+					// 日后为 call_log 调整装配逻辑不会静默翻转 terminator_only 判定（那会误 DRAIN 健康渠道）。
+					if asm.apply(data) {
+						sawFinishReason = true
+					}
 				}
 			}
 		}
@@ -210,50 +224,24 @@ func (p *OpenAIProvider) HandleStream(ctx context.Context, upstream *http.Respon
 	}
 
 	if !sawUsage {
-		reason := UsageMissingTruncated
-		switch {
-		case sawDone:
-			reason = UsageMissingDoneNoUsage
-		case errorFrame != "":
-			reason = UsageMissingErrorFrame
-		}
+		// 交叉验证两类独立信号：内容层收尾证据（sawFinishReason = 上游给过 finish_reason）才是
+		// 「生成真的结束了」的证据；单独的 [DONE] 可能由代理在截断后兜底补发（见 streamEnd）。
+		end := streamEnd{Terminal: sawDone, ContentComplete: sawFinishReason}
 		return usage, rawUsageJSON(p.Name(), rawParts), asm.marshal(),
-			&UsageMissingError{Reason: reason, Detail: errorFrame}
+			&UsageMissingError{Reason: usageMissingReasonOf(end, sawError), Detail: errorFrame}
 	}
 	return usage, rawUsageJSON(p.Name(), rawParts), asm.marshal(), nil
-}
-
-// streamErrorFrame 提取 OpenAI 兼容流内 error 帧的可读摘要；非 error 帧返回空串。
-func streamErrorFrame(data []byte) string {
-	var obj map[string]json.RawMessage
-	if err := json.Unmarshal(data, &obj); err != nil {
-		return ""
-	}
-	raw, ok := obj["error"]
-	if !ok || len(raw) == 0 || string(raw) == "null" {
-		return ""
-	}
-	var s string
-	if err := json.Unmarshal(raw, &s); err == nil {
-		return s
-	}
-	var e struct {
-		Message string `json:"message"`
-		Type    string `json:"type"`
-	}
-	if err := json.Unmarshal(raw, &e); err != nil || e.Message == "" {
-		return ""
-	}
-	if e.Type != "" {
-		return e.Type + ": " + e.Message
-	}
-	return e.Message
 }
 
 // ensureIncludeUsage 为 OpenAI Chat Completions 的流式请求幂等补 stream_options.include_usage=true。
 // 平台按 usage 计费，客户端未显式请求 usage 时由网关补齐（平台必需参数）；已有该键为 true 时原样返回，
 // 其余 stream_options 键保留。仅限 chat/completions 端点：legacy completions/embeddings 未定义该参数
 // （注入可能被上游按未知参数拒绝），非 OpenAI 兼容协议同样不改写；解析失败时按原样返回。
+//
+// 取舍：判定「include_usage 已为 true」必须确认它是顶层 stream_options 的直接子键。
+// 字节级启发式无法可靠区分顶层与嵌套（正文/其它键里的同名字面量），故宁可每个流式请求
+// 固定做两次 json.Unmarshal（请求体一次、stream_options 一次；已为 true 时零次 marshal），
+// 也不做无法保证层级的字节匹配（漏注入会让平台拿不到 usage）。
 func ensureIncludeUsage(body []byte, protocol, endpoint string) []byte {
 	if protocol != "openai-chat" || endpoint != EndpointChatCompletions {
 		return body
@@ -262,19 +250,23 @@ func ensureIncludeUsage(body []byte, protocol, endpoint string) []byte {
 	if err := json.Unmarshal(body, &obj); err != nil {
 		return body
 	}
-	var stream bool
-	rawStream, ok := obj["stream"]
-	if !ok || json.Unmarshal(rawStream, &stream) != nil || !stream {
+	if !bytes.Equal(bytes.TrimSpace(obj["stream"]), []byte("true")) {
 		return body
 	}
-	opts := make(map[string]json.RawMessage)
-	if raw, ok := obj["stream_options"]; ok && len(raw) > 0 && string(raw) != "null" {
-		if err := json.Unmarshal(raw, &opts); err != nil {
-			opts = make(map[string]json.RawMessage) // 结构异常：以平台必需参数为准重建
-		}
+	rawOpts, hasOpts := obj["stream_options"]
+	if !hasOpts || len(bytes.TrimSpace(rawOpts)) == 0 {
+		// 无 stream_options：把新键直接插到对象尾部，其余字节原样保留（避免整包重序列化）。
+		return injectStreamOptions(body)
 	}
-	var include bool
-	if raw, ok := opts["include_usage"]; ok && json.Unmarshal(raw, &include) == nil && include {
+	opts := make(map[string]json.RawMessage)
+	if err := json.Unmarshal(rawOpts, &opts); err != nil {
+		opts = make(map[string]json.RawMessage) // 结构异常：以平台必需参数为准重建
+	}
+	if opts == nil {
+		// json.Unmarshal("null", &opts) 会把 map 置 nil，赋值前必须重新初始化。
+		opts = make(map[string]json.RawMessage)
+	}
+	if raw, ok := opts["include_usage"]; ok && bytes.Equal(bytes.TrimSpace(raw), []byte("true")) {
 		return body
 	}
 	opts["include_usage"] = json.RawMessage("true")
@@ -290,6 +282,23 @@ func ensureIncludeUsage(body []byte, protocol, endpoint string) []byte {
 	return out
 }
 
+// injectStreamOptions 在请求体对象末尾插入 stream_options.include_usage=true（保持其余字节不变）。
+// 仅在请求体已确认是含 stream:true 的非空对象时调用，故无需处理空对象。
+func injectStreamOptions(body []byte) []byte {
+	trimmed := bytes.TrimRight(body, " \t\r\n")
+	open := bytes.IndexByte(trimmed, '{')
+	if open < 0 || trimmed[len(trimmed)-1] != '}' {
+		return body
+	}
+	out := make([]byte, 0, len(body)+len(`"stream_options":{"include_usage":true}`)+1)
+	out = append(out, trimmed[:len(trimmed)-1]...)
+	out = append(out, ',')
+	out = append(out, `"stream_options":{"include_usage":true}`...)
+	out = append(out, '}')
+	out = append(out, body[len(trimmed):]...)
+	return out
+}
+
 // streamToolCall 拼装中的单个工具调用（index → 增量累积状态）。
 type streamToolCall struct {
 	Index        int
@@ -301,6 +310,8 @@ type streamToolCall struct {
 
 // streamAssembler 流式 data 行 → 完整 assistant 消息的拼装器：
 // 逐块提取 delta.content / delta.reasoning_content / delta.tool_calls（index/name/arguments 增量）并拼接。
+// 装配器本身不持有「渠道健康」判定状态：apply 只如实回报本帧是否带非空 finish_reason，
+// 由调用方（HandleStream）自行累积，避免观测装配与健康判定耦合（见 streamEnd）。
 type streamAssembler struct {
 	content          string
 	reasoningContent string
@@ -331,16 +342,23 @@ type asmDeltaRow struct {
 		Message struct {
 			Content any `json:"content"`
 		} `json:"message"`
+		FinishReason json.RawMessage `json:"finish_reason"`
 	} `json:"choices"`
 }
 
-// apply 解析单个 SSE data 块，把 content/reasoning_content/tool_calls 增量拼进装配器。
-func (a *streamAssembler) apply(data []byte) {
+// apply 解析单个 SSE data 块，把 content/reasoning_content/tool_calls 增量拼进装配器；
+// 同时如实回报本帧是否带非空 finish_reason（内容层收尾证据，由调用方决定如何用）。
+// 逐帧反序列化本就发生在此，回报该事实不增加解析开销。
+func (a *streamAssembler) apply(data []byte) (sawFinishReason bool) {
 	var obj asmDeltaRow
 	if err := json.Unmarshal(data, &obj); err != nil {
-		return
+		return false
 	}
 	for _, c := range obj.Choices {
+		// finish_reason 只认「非 null 且非空串」：部分上游在中间帧给 null 或 ""，那不是收尾。
+		if !isNullRaw(c.FinishReason) && !bytes.Equal(bytes.TrimSpace(c.FinishReason), []byte(`""`)) {
+			sawFinishReason = true
+		}
 		if s, ok := c.Delta.Content.(string); ok {
 			a.content += s
 		}
@@ -385,6 +403,7 @@ func (a *streamAssembler) apply(data []byte) {
 			a.toolCalls[idx] = cur
 		}
 	}
+	return sawFinishReason
 }
 
 // marshal 输出拼装完成的 assistant 消息 JSONB：
@@ -432,34 +451,44 @@ func (a *streamAssembler) marshal() []byte {
 	return b
 }
 
-// streamData 流式 data 行的 usage 解析目标（正文增量由 streamAssembler 处理，此处只取 usage）。
+// streamData 流式 data 行的解析目标（正文增量由 streamAssembler 处理，此处只取 usage 与 error 帧）。
 type streamData struct {
 	Choices []struct {
 		Usage json.RawMessage `json:"usage"`
 	} `json:"choices"`
 	Usage json.RawMessage `json:"usage"`
+	Error json.RawMessage `json:"error"`
 }
 
-// parseStreamData 解析单个 SSE data 块，返回：命中 usage、该 usage 的原始 JSON、是否命中。
+// parseStreamData 解析单个 SSE data 块，返回：命中 usage、该 usage 的原始 JSON、是否命中、
+// 本帧是否含 error（error 键存在且非 null，不依赖摘要是否为空）、流内 error 帧摘要
+// （空=无摘要，不代表没有 error 帧）。usage、error 判定与摘要取自同一次反序列化，
+// 避免同一帧被重复解析（每帧双解析是流式热路径上的额外开销）。
 // 原始 JSON 供 call_log 记录上游原文（诊断渠道 usage 口径）。
-func parseStreamData(data []byte) (billing.Usage, json.RawMessage, bool) {
+func parseStreamData(data []byte) (billing.Usage, json.RawMessage, bool, bool, string) {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()
 	var obj streamData
 	if err := dec.Decode(&obj); err != nil {
-		return billing.Usage{}, nil, false
+		return billing.Usage{}, nil, false, false, ""
+	}
+	errRaw := bytes.TrimSpace(obj.Error)
+	hasError := len(errRaw) > 0 && string(errRaw) != "null"
+	errDetail := ""
+	if hasError {
+		errDetail = errorFrameDetail(obj.Error)
 	}
 	for _, c := range obj.Choices {
 		if len(c.Usage) > 0 {
 			if u, err := parseUsageObj(c.Usage); err == nil && !usageZero(u) {
-				return u, c.Usage, true
+				return u, c.Usage, true, hasError, errDetail
 			}
 		}
 	}
 	if len(obj.Usage) > 0 {
 		if u, err := parseUsageObj(obj.Usage); err == nil && !usageZero(u) {
-			return u, obj.Usage, true
+			return u, obj.Usage, true, hasError, errDetail
 		}
 	}
-	return billing.Usage{}, nil, false
+	return billing.Usage{}, nil, false, hasError, errDetail
 }

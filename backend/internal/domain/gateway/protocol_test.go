@@ -1,8 +1,10 @@
 package gateway
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -105,9 +107,12 @@ func TestExtractUsage_Missing(t *testing.T) {
 // 且必须同时返回原始 JSON 供 call_log 记录上游原文。
 func TestParseStreamData_DeepSeekNative(t *testing.T) {
 	data := []byte(`{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120,"prompt_cache_hit_tokens":80}}`)
-	u, raw, ok := parseStreamData(data)
+	u, raw, ok, hasErr, errDetail := parseStreamData(data)
 	if !ok {
 		t.Fatalf("应命中 usage")
+	}
+	if hasErr || errDetail != "" {
+		t.Fatalf("非 error 帧不应置位或产生摘要, got hasErr=%v detail=%q", hasErr, errDetail)
 	}
 	// Input = 100 − 80 = 20（纯输入）；CacheRead = 80；Output = 20。
 	if u.Input != 20 || u.CacheRead != 80 || u.Output != 20 {
@@ -115,6 +120,406 @@ func TestParseStreamData_DeepSeekNative(t *testing.T) {
 	}
 	if !strings.Contains(string(raw), `"prompt_cache_hit_tokens":80`) {
 		t.Fatalf("原始 usage 应保留顶层命中字段: %s", raw)
+	}
+}
+
+// 单帧同时携带 usage 与 error 时，两者都必须取自同一次解析（一次反序列化拿全信息）。
+func TestParseStreamDataErrorFrame(t *testing.T) {
+	u, raw, ok, hasErr, errDetail := parseStreamData([]byte(
+		`{"choices":[],"error":{"type":"server_error","message":"boom"},"usage":{"prompt_tokens":7,"completion_tokens":3}}`))
+	if !ok || u.Input != 7 || u.Output != 3 {
+		t.Fatalf("同一帧的 usage 应照常解析: %+v ok=%v", u, ok)
+	}
+	if len(raw) == 0 {
+		t.Fatalf("应返回原始 usage 分片")
+	}
+	if !hasErr || errDetail != "server_error: boom" {
+		t.Fatalf("error 帧应置位且摘要 want %q, got hasErr=%v detail=%q", "server_error: boom", hasErr, errDetail)
+	}
+	// error 为 null / 字符串形式的老上游：分别为「无 error 帧」与「字符串摘要」。
+	if _, _, _, hasErr, d := parseStreamData([]byte(`{"error":null}`)); hasErr || d != "" {
+		t.Fatalf("error=null 不应置位或产生摘要, got hasErr=%v detail=%q", hasErr, d)
+	}
+	if _, _, _, hasErr, d := parseStreamData([]byte(`{"error":"plain failure"}`)); !hasErr || d != "plain failure" {
+		t.Fatalf("字符串 error 应置位并原样作为摘要, got hasErr=%v detail=%q", hasErr, d)
+	}
+	// 空对象负载：摘要为空但仍是 error 帧（HandleStream 依赖该布尔置 sawError，
+	// 否则 {"error":{}} 会被 [DONE] 洗成 done_no_usage，修复前即红）。
+	if _, _, _, hasErr, d := parseStreamData([]byte(`{"error":{}}`)); !hasErr || d != "" {
+		t.Fatalf("空 error 对象应置位且摘要为空, got hasErr=%v detail=%q", hasErr, d)
+	}
+}
+
+// sseResponse 把 SSE 文本包装为 HandleStream 期望的上游响应。
+func sseResponse(body string) *http.Response {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+}
+
+// 各协议按「结束形态」区分 usage 缺失原因（口径见 streamEnd）：
+// 只有内容层收尾证据齐备才归 done_no_usage（不惩罚渠道）；只有结束标记而没有收尾证据
+// （代理补发标记掩盖截断）归 terminator_only、连标记都没有归 truncated，两者都计入健康失败；
+// 流内 error 帧优先于任何结束标记。
+func TestHandleStreamUsageMissingReason(t *testing.T) {
+	const anthropicStart = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\"}}\n\n"
+	const anthropicStop = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+	const anthropicMessageDelta = "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n"
+	const responsesDelta = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n"
+	const chatDelta = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"
+	const chatFinish = "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+
+	tests := []struct {
+		name       string
+		provider   Provider
+		body       string
+		wantReason string
+		wantPunish bool
+		wantDetail string
+	}{
+		{
+			name:     "anthropic 正常结束无 usage",
+			provider: NewAnthropicProvider(),
+			body:     anthropicStart + anthropicMessageDelta + anthropicStop,
+			// 上游已按正常形态收尾（带 stop_reason 的 message_delta + message_stop），只是没给 usage
+			//（协议偏差），不惩罚渠道。
+			wantReason: UsageMissingDoneNoUsage,
+			wantPunish: false,
+		},
+		{
+			// 「截断 + 补发 message_stop」：只有终止标记、没有 message_delta 收尾证据。
+			name:       "anthropic 仅 message_stop 掩盖截断",
+			provider:   NewAnthropicProvider(),
+			body:       anthropicStart + anthropicStop,
+			wantReason: UsageMissingTerminatorOnly,
+			wantPunish: true,
+		},
+		{
+			name:       "anthropic 截断",
+			provider:   NewAnthropicProvider(),
+			body:       anthropicStart,
+			wantReason: UsageMissingTruncated,
+			wantPunish: true,
+		},
+		{
+			name:     "anthropic error 事件",
+			provider: NewAnthropicProvider(),
+			body: anthropicStart +
+				"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"busy\"}}\n\n",
+			wantReason: UsageMissingErrorFrame,
+			wantPunish: true,
+			wantDetail: "overloaded_error: busy",
+		},
+		{
+			name:     "responses 正常结束无 usage",
+			provider: NewResponsesProvider(),
+			body: responsesDelta +
+				"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+			wantReason: UsageMissingDoneNoUsage,
+			wantPunish: false,
+		},
+		{
+			// responses 的官方终止符只有 response.completed/incomplete；[DONE] 只可能来自兼容层或代理，
+			// 而这类代理在字节流结束时无条件补 [DONE] → 不能单独证明正常结束。
+			name:       "responses 仅 [DONE] 掩盖截断",
+			provider:   NewResponsesProvider(),
+			body:       responsesDelta + "data: [DONE]\n\n",
+			wantReason: UsageMissingTerminatorOnly,
+			wantPunish: true,
+		},
+		{
+			name:       "responses 截断",
+			provider:   NewResponsesProvider(),
+			body:       responsesDelta,
+			wantReason: UsageMissingTruncated,
+			wantPunish: true,
+		},
+		{
+			// 零值守卫：上游给 "usage":{} 时不得当成「有 usage」——否则按 0 token 出账（漏钱）
+			// 且调用日志记 completed，金额与异常同时隐身。按「未取到 usage」走缺失归因＋估算。
+			name:     "responses completed 但 usage 为空对象",
+			provider: NewResponsesProvider(),
+			body: responsesDelta +
+				"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{}}}\n\n",
+			wantReason: UsageMissingDoneNoUsage,
+			wantPunish: false,
+		},
+		{
+			// 同上：全零 usage（字段齐备但值全为 0）同样不算取到 usage。
+			name:       "responses completed 但 usage 全零",
+			provider:   NewResponsesProvider(),
+			body:       responsesDelta + "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n",
+			wantReason: UsageMissingDoneNoUsage,
+			wantPunish: false,
+		},
+		{
+			// anthropic 同一漏配：message_start 给 "usage":{} 时不能置 sawUsage（否则 0 token 出账）。
+			name:     "anthropic message_start 但 usage 为空对象",
+			provider: NewAnthropicProvider(),
+			body: "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"usage\":{}}}\n\n" +
+				anthropicMessageDelta + anthropicStop,
+			wantReason: UsageMissingDoneNoUsage,
+			wantPunish: false,
+		},
+		{
+			// openai-chat 既有守卫（parseStreamData 的 !usageZero）的对照用例。
+			name:     "openai usage 全零帧",
+			provider: NewOpenAIProvider(EndpointChatCompletions),
+			body: chatDelta + chatFinish +
+				"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0}}\n\n" +
+				"data: [DONE]\n\n",
+			wantReason: UsageMissingDoneNoUsage,
+			wantPunish: false,
+		},
+		{
+			name:     "responses failed",
+			provider: NewResponsesProvider(),
+			body: "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_error\"," +
+				"\"message\":\"boom\"}}}\n\n",
+			wantReason: UsageMissingErrorFrame,
+			wantPunish: true,
+			wantDetail: "server_error: boom",
+		},
+		{
+			name:     "responses failed 后补 [DONE]",
+			provider: NewResponsesProvider(),
+			body: "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_error\"," +
+				"\"message\":\"boom\"}}}\n\ndata: [DONE]\n\n",
+			// [DONE] 只是收口标记：上游先报 failed 再补 [DONE] 时仍须归因 error_frame（惩罚不丢失）。
+			wantReason: UsageMissingErrorFrame,
+			wantPunish: true,
+			wantDetail: "server_error: boom",
+		},
+		{
+			name:       "openai 正常结束无 usage",
+			provider:   NewOpenAIProvider(EndpointChatCompletions),
+			body:       chatDelta + chatFinish + "data: [DONE]\n\n",
+			wantReason: UsageMissingDoneNoUsage,
+			wantPunish: false,
+		},
+		{
+			// 「截断 + 补发 [DONE]」：内容层没有 finish_reason，只有代理补的结束标记。
+			name:       "openai 仅 [DONE] 掩盖截断",
+			provider:   NewOpenAIProvider(EndpointChatCompletions),
+			body:       chatDelta + "data: [DONE]\n\n",
+			wantReason: UsageMissingTerminatorOnly,
+			wantPunish: true,
+		},
+		{
+			// finish_reason 为 null 的中间帧不是收尾证据（部分上游逐帧给 null）。
+			name:       "openai finish_reason=null 后补 [DONE]",
+			provider:   NewOpenAIProvider(EndpointChatCompletions),
+			body:       "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n",
+			wantReason: UsageMissingTerminatorOnly,
+			wantPunish: true,
+		},
+		{
+			// 连接干净结束（io.EOF）+ 内容层收尾证据：不补 [DONE] 的兼容上游也算正常结束
+			//（finish_reason 是上游真实生成的证据，[DONE] 只是形式约定）。
+			name:       "openai 仅 finish_reason 无 [DONE]",
+			provider:   NewOpenAIProvider(EndpointChatCompletions),
+			body:       chatDelta + chatFinish,
+			wantReason: UsageMissingDoneNoUsage,
+			wantPunish: false,
+		},
+		{
+			// 连内容带标记都没有：真截断。
+			name:       "openai 截断",
+			provider:   NewOpenAIProvider(EndpointChatCompletions),
+			body:       chatDelta,
+			wantReason: UsageMissingTruncated,
+			wantPunish: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, _, err := tt.provider.HandleStream(context.Background(), sseResponse(tt.body), httptest.NewRecorder())
+			if !errors.Is(err, ErrUsageMissing) {
+				t.Fatalf("want ErrUsageMissing, got %v", err)
+			}
+			if got := usageMissingReason(err); got != tt.wantReason {
+				t.Fatalf("reason want %q, got %q", tt.wantReason, got)
+			}
+			if got := usageMissingPunishable(usageMissingReason(err)); got != tt.wantPunish {
+				t.Fatalf("punishable want %v, got %v", tt.wantPunish, got)
+			}
+			if tt.wantDetail != "" {
+				var ue *UsageMissingError
+				if !errors.As(err, &ue) || ue.Detail != tt.wantDetail {
+					t.Fatalf("detail want %q, got %+v", tt.wantDetail, ue)
+				}
+			}
+		})
+	}
+}
+
+// streamEnd.reason 的归因矩阵（四路适配器共用）：内容层收尾证据是「正常结束」的必要条件，
+// 终止标记单独不算；error 帧最优先（收口标记不得把上游报错洗成正常结束）。
+func TestStreamEndReasonMatrix(t *testing.T) {
+	tests := []struct {
+		name       string
+		end        streamEnd
+		sawError   bool
+		wantReason string
+		wantPunish bool
+	}{
+		{"error 帧优先于收尾证据", streamEnd{Terminal: true, ContentComplete: true}, true, UsageMissingErrorFrame, true},
+		{"error 帧优先于仅标记", streamEnd{Terminal: true}, true, UsageMissingErrorFrame, true},
+		{"标记 + 收尾证据", streamEnd{Terminal: true, ContentComplete: true}, false, UsageMissingDoneNoUsage, false},
+		{"仅收尾证据（兼容上游不补结束标记）", streamEnd{ContentComplete: true}, false, UsageMissingDoneNoUsage, false},
+		{"仅标记（代理补发标记掩盖截断）", streamEnd{Terminal: true}, false, UsageMissingTerminatorOnly, true},
+		{"两者皆无（真截断）", streamEnd{}, false, UsageMissingTruncated, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := usageMissingReasonOf(tt.end, tt.sawError)
+			if got != tt.wantReason {
+				t.Fatalf("reason want %q, got %q", tt.wantReason, got)
+			}
+			if p := usageMissingPunishable(got); p != tt.wantPunish {
+				t.Fatalf("punishable want %v, got %v", tt.wantPunish, p)
+			}
+		})
+	}
+}
+
+// flakyBodyReader 先吐出给定字节，再返回一个非 io.EOF 的错误（模拟连接被重置 / 上游读超时）。
+type flakyBodyReader struct {
+	data []byte
+	err  error
+}
+
+func (r *flakyBodyReader) Read(p []byte) (int, error) {
+	if len(r.data) > 0 {
+		n := copy(p, r.data)
+		r.data = r.data[n:]
+		return n, nil
+	}
+	return 0, r.err
+}
+
+// 连接层信号（非 io.EOF 的读错误 / 超时 / 连接被重置）优先于任何结束标记：即便 [DONE] 或终止事件
+// 已经收到，也必须按传输中断返回原始错误——handler 据此归为「流式传输中断」并回喂健康失败，
+// 不能被「内容已收尾 + 补发的结束标记」洗成正常结束。
+func TestHandleStreamConnectionErrorBeatsTerminator(t *testing.T) {
+	tests := []struct {
+		name     string
+		provider Provider
+		body     string
+	}{
+		{
+			name:     "openai-chat",
+			provider: NewOpenAIProvider(EndpointChatCompletions),
+			body: "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n" +
+				"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+				"data: [DONE]\n\n",
+		},
+		{
+			name:     "anthropic-messages",
+			provider: NewAnthropicProvider(),
+			body: "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\"}}\n\n" +
+				"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n" +
+				"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+		},
+		{
+			name:     "openai-responses",
+			provider: NewResponsesProvider(),
+			body: "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n" +
+				"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp := sseResponse(tt.body)
+			resp.Body = io.NopCloser(&flakyBodyReader{data: []byte(tt.body), err: errors.New("connection reset by peer")})
+			_, _, _, err := tt.provider.HandleStream(context.Background(), resp, httptest.NewRecorder())
+			if err == nil {
+				t.Fatalf("读错误必须上抛")
+			}
+			if errors.Is(err, ErrUsageMissing) {
+				t.Fatalf("连接中断不得归为 usage 缺失（会被当正常/截断处置）, got %v", err)
+			}
+			if !strings.Contains(err.Error(), "connection reset") {
+				t.Fatalf("应保留连接层原始错误, got %v", err)
+			}
+		})
+	}
+}
+
+// 直通路径的 error 帧摘要按「首个非空优先」聚合：上游可能先给出带详情的高价值 error，
+// 再补一个空负载 error 收尾；后者若无条件覆盖会把诊断信息清空。
+// 修复前 responses/anthropic 直接赋值，空摘要会清掉前一条，本用例即红。
+func TestHandleStreamErrorFrameKeepsFirstDetail(t *testing.T) {
+	tests := []struct {
+		name       string
+		provider   Provider
+		body       string
+		wantDetail string
+	}{
+		{
+			name:     "responses 连续 failed",
+			provider: NewResponsesProvider(),
+			body: "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_error\"," +
+				"\"message\":\"boom\"}}}\n\n" +
+				"data: {\"type\":\"response.failed\",\"response\":{\"error\":{}}}\n\n",
+			wantDetail: "server_error: boom",
+		},
+		{
+			name:     "anthropic 连续 error",
+			provider: NewAnthropicProvider(),
+			body: "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"," +
+				"\"message\":\"busy\"}}\n\n" +
+				"event: error\ndata: {\"type\":\"error\",\"error\":{}}\n\n",
+			wantDetail: "overloaded_error: busy",
+		},
+		{
+			// 直通 openai-chat：修复前后出现的非空摘要会覆盖前者，本用例即红。
+			name:     "openai-chat 连续 error",
+			provider: NewOpenAIProvider(EndpointChatCompletions),
+			body: "data: {\"error\":{\"type\":\"server_error\",\"message\":\"boom\"}}\n\n" +
+				"data: {\"error\":{\"type\":\"rate_limit_error\",\"message\":\"slow down\"}}\n\n",
+			wantDetail: "server_error: boom",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, _, err := tt.provider.HandleStream(context.Background(), sseResponse(tt.body), httptest.NewRecorder())
+			if !errors.Is(err, ErrUsageMissing) {
+				t.Fatalf("want ErrUsageMissing, got %v", err)
+			}
+			if got := usageMissingReason(err); got != UsageMissingErrorFrame {
+				t.Fatalf("reason want %q, got %q", UsageMissingErrorFrame, got)
+			}
+			var ue *UsageMissingError
+			if !errors.As(err, &ue) || ue.Detail != tt.wantDetail {
+				t.Fatalf("detail want %q, got %+v", tt.wantDetail, ue)
+			}
+		})
+	}
+}
+
+// failWriteRecorder 包装 ResponseRecorder：响应头照常可写，但每次 Write 都失败（模拟下游断开）。
+type failWriteRecorder struct {
+	*httptest.ResponseRecorder
+}
+
+func (w failWriteRecorder) Write([]byte) (int, error) { return 0, errors.New("downstream gone") }
+
+func (w failWriteRecorder) Flush() {}
+
+// 下游写失败必须被标记为 errDownstreamWrite：handler 据此区分「上游读侧中断」与「下游写失败」。
+func TestHandleStreamDownstreamWriteSentinel(t *testing.T) {
+	const body = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"
+	for _, p := range []Provider{
+		NewOpenAIProvider(EndpointChatCompletions), NewAnthropicProvider(), NewResponsesProvider(),
+	} {
+		_, _, _, err := p.HandleStream(context.Background(), sseResponse(body),
+			failWriteRecorder{httptest.NewRecorder()})
+		if !isDownstreamWriteErr(err) {
+			t.Fatalf("%s 下游写失败应可识别为下游错误, got %v", p.Name(), err)
+		}
 	}
 }
 

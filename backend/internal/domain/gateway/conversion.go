@@ -84,10 +84,11 @@ func (g *Gateway) candidatePassesThrough(cr *router.ChannelRoute, baseProtocol s
 }
 
 // reorderPassthroughFirst 稳定分区：passthrough 为真的候选按相对顺序前移，其余靠后。
-// 无区分度（全真/全假）时保持原序，保证既有行为零变化。
-func reorderPassthroughFirst(routes []*router.ChannelRoute, passthrough func(*router.ChannelRoute) bool) {
+// 无区分度（全真/全假）或原序已满足分区时保持原序，保证既有行为零变化。
+// 返回是否真的发生了顺序变化，供调用方仅在重排时给决策轨迹追加标记（未重排时键集不变）。
+func reorderPassthroughFirst(routes []*router.ChannelRoute, passthrough func(*router.ChannelRoute) bool) bool {
 	if len(routes) < 2 {
-		return
+		return false
 	}
 	direct := make([]*router.ChannelRoute, 0, len(routes))
 	rest := make([]*router.ChannelRoute, 0, len(routes))
@@ -99,41 +100,68 @@ func reorderPassthroughFirst(routes []*router.ChannelRoute, passthrough func(*ro
 		}
 	}
 	if len(direct) == 0 || len(rest) == 0 {
-		return
+		return false
 	}
-	copy(routes, append(direct, rest...))
+	ordered := append(direct, rest...)
+	for i := range ordered {
+		if ordered[i] != routes[i] {
+			copy(routes, ordered)
+			return true
+		}
+	}
+	return false
 }
 
-// convPlan 记录一次候选的协议转换上下文：入站协议、实际上游协议、是否发生转换。
-// 直通（converted=false）时 conversionAttemptFields 不产出任何字段，保持既有键集不变。
+// 直通重排标记取值：直通候选前移 / 被后移的兜底候选（仅在实际发生重排时写入轨迹）。
+const (
+	reorderMarkFirst    = "first"
+	reorderMarkFallback = "fallback"
+)
+
+// convPlan 记录一次候选的协议转换上下文：入站协议、实际上游协议、是否发生转换，
+// 以及该候选在直通重排中的位置标记（空=未重排，不产出任何字段）。
+// 直通（converted=false）且未重排时 conversionAttemptFields 不产出任何字段，保持既有键集不变。
 type convPlan struct {
 	inbound   string
 	upstream  string
 	converted bool
+	reorder   string
 }
 
-// conversionAttemptFields 把转换上下文与损耗报告转为决策轨迹附加字段：
-// 直通（converted=false）返回 nil——纯直通候选不新增任何键；
+// conversionAttemptFields 把转换上下文、损耗报告与直通重排标记转为决策轨迹附加字段：
+// 全部为空时返回 nil——纯直通且未重排的候选不新增任何键；
 // 转换时写入 converted/inbound_protocol/upstream_protocol，报告非空时再附 lossy/lossy_notes。
 func conversionAttemptFields(plan convPlan, rep *protocolconv.LossyReport) map[string]any {
-	if !plan.converted {
+	// 纯直通且未重排：不产出任何字段，直接返回 nil（避免每次命中都白白分配 map）。
+	if !plan.converted && plan.reorder == "" {
 		return nil
 	}
-	m := map[string]any{
-		"converted":         true,
-		"inbound_protocol":  plan.inbound,
-		"upstream_protocol": plan.upstream,
+	m := make(map[string]any, 6)
+	if plan.converted {
+		m["converted"] = true
+		m["inbound_protocol"] = plan.inbound
+		m["upstream_protocol"] = plan.upstream
+		if rep != nil && !rep.IsEmpty() {
+			m["lossy"] = rep.Dropped
+			m["lossy_notes"] = rep.Notes
+		}
 	}
-	if rep != nil && !rep.IsEmpty() {
-		m["lossy"] = rep.Dropped
-		m["lossy_notes"] = rep.Notes
+	switch plan.reorder {
+	case reorderMarkFirst:
+		m["passthrough_first"] = true
+	case reorderMarkFallback:
+		m["passthrough_fallback"] = true
+	}
+	if len(m) == 0 {
+		return nil
 	}
 	return m
 }
 
 // callLogDecisionConv 在 callLogDecision 基础上，将转换上下文/损耗并入「当前候选」的时间线条目
 // （即决策轨迹最后一项），使 call_logs 能看到该候选的入站→上游协议与丢失项。
-// 纯直通（converted=false）时不改动任何内容，输出与 callLogDecision 完全一致。
+// 未发生直通重排且未转换（reorder 为空、converted=false）时不改动任何内容，
+// 输出与 callLogDecision 完全一致；发生过重排的直通候选仍会并入 passthrough_* 标记。
 func (g *Gateway) callLogDecisionConv(attempts []map[string]any, result string, pc preCharge,
 	cur *router.RouteResult, conv convPlan, lossy *protocolconv.LossyReport) map[string]any {
 	dec := g.callLogDecision(attempts, result, pc, cur)
