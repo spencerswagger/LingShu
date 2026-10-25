@@ -27,7 +27,10 @@ type statsKPI struct {
 	AvgFirstTokenMS float64 `json:"AvgFirstTokenMS"`
 	RPM             float64 `json:"RPM"` // 忙时口径（见 billing.DashboardStats.BusyRPM），文案仍叫 RPM
 	TPM             float64 `json:"TPM"` // 忙时口径（见 billing.DashboardStats.BusyTPM），文案仍叫 TPM
-	// SumDurationMS 忙时分母（这批请求的耗时之和，毫秒），供前端做「样本量/时长是否够」的门槛判断。
+	// BusyRequests 忙时口径的分子（有耗时请求数，与 RPM/TPM 的分母同源）。
+	// 前端判断「样本是否偏少」必须用它，不能用 TotalRequests（后者含无耗时的失败记录，不同源会误判）。
+	BusyRequests int64 `json:"BusyRequests"`
+	// SumDurationMS 忙时分母（这批请求的耗时之和，毫秒），供前端做「样本量/时长是否够」的标注。
 	SumDurationMS int64   `json:"SumDurationMS"`
 	DeltaTokens   float64 `json:"DeltaTokens"` // 环比上期（比例，可为负）
 	DeltaCredits  float64 `json:"DeltaCredits"`
@@ -144,6 +147,7 @@ func buildKPI(ds billing.DashboardStats, prevCalls int64, prevCredits, prevToken
 		// 长区间（统计页默认近 30 天）不用墙钟平均，改用忙时处理速率：请求数/Token ÷ 耗时之和折算的分钟数。
 		RPM:           decimalx.Round2(ds.BusyRPM),
 		TPM:           decimalx.Round2(ds.BusyTPM),
+		BusyRequests:  ds.BusyRequests,
 		SumDurationMS: ds.SumDurationMS,
 		DeltaTokens:   decimalx.Round5(deltaRatio(float64(ds.Total.Total()), prevTokens)),
 		DeltaCredits:  decimalx.Round5(deltaRatio(ds.TotalCred, prevCredits)),

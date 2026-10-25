@@ -99,6 +99,9 @@ func TestDashboard_Aggregates(t *testing.T) {
 	if out.SumDurationMS != 2000 {
 		t.Fatalf("sum_duration_ms=%d, want 2000", out.SumDurationMS)
 	}
+	if out.BusyRequests != 10 { // = okdur（有耗时的请求数），与 RPM/TPM 的分母同源
+		t.Fatalf("busy_requests=%d, want 10", out.BusyRequests)
+	}
 	if out.BusyRPM != 300 || out.BusyTPM != 5100 {
 		t.Fatalf("busy_rpm=%v busy_tpm=%v, want 300/5100", out.BusyRPM, out.BusyTPM)
 	}

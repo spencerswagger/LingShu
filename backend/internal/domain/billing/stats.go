@@ -70,7 +70,9 @@ type DashboardStats struct {
 	AvgTPM    float64    `json:"AvgTPM"`
 	// 忙时口径（长区间用它代替墙钟平均）：BusyRPM/BusyTPM = 忙时处理数 ÷ 忙时分母，
 	// 忙时分母 = 这批请求的耗时之和折算成分钟（≈1 ÷ 平均耗时）；分母为 0 时两者为 0。
-	// 分子与分母同源（都只取 duration_ms 非空的行），SumDurationMS 一并返回供前端做样本门槛。
+	// 分子与分母同源（都只取 duration_ms 非空的行），SumDurationMS 一并返回供前端做样本标注。
+	// BusyRequests 是忙时口径的分子（有耗时的请求数），前端判断样本量必须用它而不是 TotalCall。
+	BusyRequests  int64               `json:"BusyRequests"`
 	BusyRPM       float64             `json:"BusyRPM"`
 	BusyTPM       float64             `json:"BusyTPM"`
 	SumDurationMS int64               `json:"SumDurationMS"`
@@ -162,6 +164,7 @@ func (s *SqlStore) Dashboard(ctx context.Context, from, to time.Time, userID *in
 		out.AvgTPM = float64(total.Total()) / minutes
 	}
 	// 忙时口径：分子只取 duration_ms 非空的行（与分母同源），分母 = 这些行的耗时之和。
+	out.BusyRequests = okDur
 	out.SumDurationMS = sumDur
 	out.BusyRPM = BusyRate(float64(okDur), sumDur)
 	out.BusyTPM = BusyRate(float64(busyTokens), sumDur)
