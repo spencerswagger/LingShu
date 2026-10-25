@@ -23,12 +23,27 @@
 
 | 交互 | 请求 |
 |---|---|
-| 页面加载 / 切范围 / 切模型排序 / 手动刷新 | `GET /admin|/dev/stats/dashboard`，参数 `From`、`To`、`Granularity`、`CompareDays=4`、`ModelSort`、`ModelLimit=50` |
+| 页面加载 / 切范围 / 切模型排序 / 手动刷新 | `GET /admin|/dev/stats/dashboard`，参数 `From`、`To`、`Granularity`、`CompareDays=4`、`ModelSort`、`ModelLimit=50`、`Window=exact` |
 | 进页面 + 每 30s | `GET /admin|/dev/stats/live?Window=60&SparkPoints=12&Limit=20` |
 
-- 粒度：近 24h → `hour`；7/30/90 天与自定义 → `day`（与后端 `auto` 的判定规律一致）。
-- `CompareDays=4` 恒定：四日对比序列由后端按小时桶返回，与 `Granularity` 解耦（`Usage.Compare` 在 `day` 粒度下依然是小时序列）。
-- 30s 刷新：`refreshTick()` 先取 `live`，再以**当前筛选条件**静默重取 `dashboard`；该函数只读 `preset`/`customRange`、从不写它们，因此刷新不会重置筛选；`document.visibilityState === 'hidden'` 时跳过，避免后台标签页空跑聚合。
+- 粒度：近 24h → `hour`；7/30/90 天与自定义 → `day`。`Granularity=hour` 遇长区间由后端自动降级为 `day`，前端按响应的 `Usage.Granularity` 渲染，不报错、不清空图。
+- `Window=exact`（后端默认）：首屏 KPI / `Usage.Hourly` / `ModelPlaza` 都按**请求区间的严格滚动窗口**算；`Usage.Daily` 与既有维度聚合仍是日界口径。切 `calendar` 时窗口为北京时间自然日归一。
+- `CompareDays=4` 恒定：四日对比序列由后端按小时桶返回，与 `Granularity` 解耦。
+- 30s 刷新：`refreshTick()` 先取 `live`，再以**当前筛选条件**静默重取 `dashboard`；该函数只读 `preset`/`customRange`、从不写它们，因此刷新不会重置筛选；`document.visibilityState === 'hidden'` 时跳过；已存在在途请求时本轮跳过（不叠加）。
+
+## 2.1 请求序号守卫
+
+筛选切换、模型排序、手动刷新、30s 轮询可能交叠，`StatsDashboard` 对 dashboard 与 live 各维护一个自增序号：
+
+- 每次发起 `seq = ++xxxSeq`，响应回来若 `seq !== xxxSeq` 直接丢弃（不写 `data`/`live`、不动 loading）；
+- `finally` 也只有最新序号才清 loading；
+- `refreshTick()` 在 `dashInFlight || liveInFlight || loading` 时整轮跳过，保证同一时刻不叠加重复请求。
+
+## 2.2 窗口标签与未匹配模型
+
+- 首屏两个大数字的窗口标签直接读 `KPI.WindowFrom / WindowTo / WindowMode`：`滚动 24 小时` / `自然日 2 天` 这类文案由窗口时长推导，tooltip 给出精确起止（后端 +08:00 墙钟）。**不再硬编码「近 24h」**。
+- `KPI` 口径已是滚动窗口（数值可能比改前小），属预期修正，前端不做补偿、不加额外解释。
+- `ModelPlaza.List` 可能出现 `Unmatched=true` 的兜底行（`Model="__unmatched__"`）：前端单独渲染成灰底虚线「未匹配模型」区块（Token / 请求·失败 / 吞吐 / 首字全程），**不参与普通模型排序与空模型折叠**，也不受 `Limit` 截断（后端保证）。
 
 ## 3. 三个吞吐口径（文案刻意分开）
 

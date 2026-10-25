@@ -93,9 +93,18 @@ const MODEL_SORT_OPTIONS: { key: ModelSort; label: string; tip: string }[] = [
 ]
 const MODEL_LIMIT = 50
 const COMPARE_DAYS = 4
+// 首屏 KPI / 小时趋势 / 模型广场都按「请求区间的严格滚动窗口」算（后端默认 exact）。
+const WINDOW_MODE: 'exact' | 'calendar' = 'exact'
+
+// 请求序号守卫：筛选切换、模型排序切换、手动刷新、30s 轮询可能在途交叠，
+// 只接受「最新一次」请求的响应，过期响应直接丢弃（不写 store、不闪界面）。
+let dashSeq = 0
+let dashInFlight = false
 
 // silent：定时刷新用，不显示整页 loading
 async function load(opts: { silent?: boolean } = {}) {
+  const seq = ++dashSeq
+  dashInFlight = true
   if (!opts.silent) loading.value = true
   errInfo.value = { message: '', requestId: '' }
   try {
@@ -107,12 +116,18 @@ async function load(opts: { silent?: boolean } = {}) {
       CompareDays: COMPARE_DAYS,
       ModelSort: modelSort.value,
       ModelLimit: MODEL_LIMIT,
+      Window: WINDOW_MODE,
     })
+    if (seq !== dashSeq) return // 已有更新的请求发出，丢弃本次过期响应
     data.value = res.Data
   } catch (e: any) {
+    if (seq !== dashSeq) return
     errInfo.value = { message: e?.message, requestId: e?.requestId }
   } finally {
-    if (!opts.silent) loading.value = false
+    if (seq === dashSeq) {
+      dashInFlight = false
+      loading.value = false
+    }
   }
 }
 
@@ -135,7 +150,13 @@ const LIVE_SPARK_POINTS = 12
 const LIVE_LIMIT = 20
 const LIVE_REFRESH_MS = 30000
 
+// 实时区同样加序号守卫：轮询 / 手动刷新交叠时只认最新响应。
+let liveSeq = 0
+let liveInFlight = false
+
 async function loadLive() {
+  const seq = ++liveSeq
+  liveInFlight = true
   liveLoading.value = true
   try {
     const res = await getStatsLive(auth.role, {
@@ -143,23 +164,30 @@ async function loadLive() {
       SparkPoints: LIVE_SPARK_POINTS,
       Limit: LIVE_LIMIT,
     })
+    if (seq !== liveSeq) return // 过期响应直接丢弃
     live.value = res.Data
     liveErr.value = ''
   } catch (e: any) {
+    if (seq !== liveSeq) return
     // 实时区失败不打断页面，也不清空上一次的数据（只标记失败）。
     liveErr.value = e?.message || '实时数据获取失败'
   } finally {
-    liveLoading.value = false
+    if (seq === liveSeq) {
+      liveInFlight = false
+      liveLoading.value = false
+    }
   }
 }
 
 // 30s 定时刷新：重取实时区 + 当前筛选条件下的 dashboard（静默，不闪整页 loading）。
 // 该函数只「读」preset / customRange，从不写它们，所以刷新不会重置用户选的筛选条件；
 // 页面不可见时直接跳过，避免后台标签页白跑一轮聚合。
+// 已有在途请求时本轮跳过（轮询与手动刷新不叠加），交叠时的响应由序号守卫裁决。
 async function refreshTick() {
   if (document.visibilityState === 'hidden') return
+  if (liveInFlight || dashInFlight || loading.value) return
   await loadLive()
-  if (!loading.value) await load({ silent: true })
+  await load({ silent: true })
 }
 
 let liveTimer: number | undefined
@@ -235,6 +263,32 @@ const tooltipCommon = {
 }
 
 // ===== ① 首屏大数字 =====
+// 首屏窗口标签直接跟后端 KPI 窗口走（不再硬编码「近 24h」）：
+//   WindowMode=exact    → 请求区间的严格滚动窗口（如「滚动 24 小时」）
+//   WindowMode=calendar → 北京时间自然日归一窗口（如「自然日 7 天」）
+// 后端把 KPI / Usage.Hourly / ModelPlaza 都算在这一个窗口内，所以标签与数字同源。
+function fmtWindowTs(iso: string): string {
+  // 直接切 RFC3339 里的墙钟（后端统一 +08:00），不用 Date 转换以免浏览器时区偏移
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(iso || '')
+  return m ? `${m[2]}-${m[3]} ${m[4]}:${m[5]}` : ''
+}
+
+const kpiWindow = computed(() => {
+  const k = data.value?.KPI
+  const mode = k?.WindowMode === 'calendar' ? '自然日' : '滚动'
+  const fromMs = Date.parse(k?.WindowFrom || '')
+  const toMs = Date.parse(k?.WindowTo || '')
+  if (!Number.isFinite(fromMs) || !Number.isFinite(toMs) || toMs <= fromMs) {
+    return { label: rangeText.value, tip: `窗口 = ${rangeText.value}（等待后端回传窗口）` }
+  }
+  const hours = Math.max(1, Math.round((toMs - fromMs) / 3600000))
+  const span = hours >= 48 ? `${Math.round(hours / 24)} 天` : `${hours} 小时`
+  return {
+    label: `${mode} ${span}`,
+    tip: `${mode}窗口 ${fmtWindowTs(k!.WindowFrom)} ~ ${fmtWindowTs(k!.WindowTo)}（${span}）；首屏数字 / 小时趋势 / 模型广场同源此窗口`,
+  }
+})
+
 // 吞吐量样本量判定：BusyRequests / SumDurationMS 是忙时口径的分子分母。
 const throughput = computed(() => {
   const k = data.value?.KPI
@@ -267,8 +321,8 @@ const bigStats = computed<BigStat[]>(() => {
       value: k ? fmtCompact(k.TotalTokens) : '--',
       sub: `输入 ${fmtCompact(t?.Input ?? 0)} · 输出 ${fmtCompact(t?.Output ?? 0)}`,
       delta: k?.DeltaTokens,
-      winLabel: rangeText.value,
-      winTip: '窗口 = 当前统计范围；输入为纯输入、缓存读单列、输出含推理',
+      winLabel: kpiWindow.value.label,
+      winTip: kpiWindow.value.tip,
     },
     {
       label: '总消费积分',
@@ -277,8 +331,8 @@ const bigStats = computed<BigStat[]>(() => {
       value: k ? fmtMoney(k.TotalCredits) : '--',
       sub: `日均 ${fmtMoney((k?.TotalCredits ?? 0) / Math.max(data.value?.Usage.Days ?? 1, 1))}`,
       delta: k?.DeltaCredits,
-      winLabel: rangeText.value,
-      winTip: '窗口 = 当前统计范围',
+      winLabel: kpiWindow.value.label,
+      winTip: kpiWindow.value.tip,
     },
     {
       label: '吞吐量',
@@ -287,11 +341,10 @@ const bigStats = computed<BigStat[]>(() => {
       value: throughput.value.ready ? fmtTPM(k?.TPM ?? 0) : '--',
       unit: ' TPM',
       sub: throughput.value.ready
-        ? `区间 ${rangeText.value} · 请求 ${(k?.RPM ?? 0).toFixed(1)} RPM${throughput.value.lowSample ? ' · 样本较少' : ''}`
-        : '区间内没有成功且带耗时的请求',
+        ? `${kpiWindow.value.label} · 请求 ${(k?.RPM ?? 0).toFixed(1)} RPM${throughput.value.lowSample ? ' · 样本较少' : ''}`
+        : '窗口内没有成功且带耗时的请求',
       winLabel: '忙时口径',
-      winTip:
-        '窗口 = 当前统计范围；忙时口径 = 成功且带耗时请求的 Token ÷ 同批耗时折算分钟数（≈60÷平均耗时）。与实时区的「近 60 分钟墙钟平均」不是同一口径',
+      winTip: `忙时口径 = 成功且带耗时请求的 Token ÷ 同批耗时折算分钟数（≈60÷平均耗时）。${kpiWindow.value.tip}`,
     },
   ]
 })
@@ -429,6 +482,7 @@ interface PlazaRow {
   color: string
   active: boolean
   enabled: boolean
+  unmatched: boolean
 }
 
 const plaza = computed<StatsModelPlaza | null>(() => data.value?.ModelPlaza ?? null)
@@ -438,7 +492,7 @@ const plazaRows = computed<PlazaRow[]>(() => {
   if (!list.length) return []
   const max = Math.max(...list.map((m) => m.Tokens), 1)
   return list.map((m, i) => ({
-    model: m.Model || m.Label || '(未命名模型)',
+    model: m.Unmatched ? '未匹配模型' : m.Model || m.Label || '(未命名模型)',
     tokensText: fmtCompact(m.Tokens),
     // BusyMS=0（窗口内没有成功且带耗时的请求）时后端 TPM 为 0，这里显示 —
     tpmText: m.BusyMS > 0 ? `${fmtTPM(m.TPM)} TPM` : '—',
@@ -452,13 +506,21 @@ const plazaRows = computed<PlazaRow[]>(() => {
     color: C.series[i % C.series.length],
     active: m.Active,
     enabled: m.Enabled,
+    unmatched: !!m.Unmatched,
   }))
 })
 
-const activeModels = computed(() => plazaRows.value.filter((m) => m.active))
-const idleModels = computed(() => plazaRows.value.filter((m) => !m.active))
+// 后端可能追加一行 Unmatched=true 的兜底行（改名/别名/无渠道导致归属不到的用量）。
+// 它不参与普通模型的排序与空模型折叠，单独渲染成「未匹配模型」区域（后端保证它不受 Limit 截断）。
+const plazaMatchedRows = computed(() => plazaRows.value.filter((m) => !m.unmatched))
+const unmatchedRow = computed(() => plazaRows.value.find((m) => m.unmatched) ?? null)
+
+const activeModels = computed(() => plazaMatchedRows.value.filter((m) => m.active))
+const idleModels = computed(() => plazaMatchedRows.value.filter((m) => !m.active))
 const idleExpanded = ref(false)
-const visibleModels = computed(() => (idleExpanded.value ? plazaRows.value : activeModels.value))
+const visibleModels = computed(() =>
+  idleExpanded.value ? plazaMatchedRows.value : activeModels.value,
+)
 
 const plazaTruncatedText = computed(() => {
   const p = plaza.value
@@ -696,12 +758,18 @@ const modeLabel = (m: string) =>
         </div>
       </div>
 
-      <!-- ③ 两张图：24h 四日对比 + 模型广场 -->
+      <!-- ③ 两张图：四日对比趋势 + 模型广场 -->
       <div class="chart-stack">
         <div class="card">
           <div class="card-head">
             <h3 class="card-title">用量趋势</h3>
-            <span class="win-chip">近 24h · 四日对比</span>
+            <el-tooltip
+              content="四日对比：今天 / 昨天 / 前天 / 大前天 各一条按小时序列（与筛选粒度解耦）"
+              placement="top"
+              :show-after="150"
+            >
+              <span class="win-chip">四日对比</span>
+            </el-tooltip>
             <span class="gran-chip">{{ effectiveGranularity === 'hour' ? '按小时' : '按天' }}</span>
             <div class="trend-legend">
               <span v-for="s in trendSeries" :key="s.label">
@@ -724,11 +792,11 @@ const modeLabel = (m: string) =>
           <div class="card-head">
             <h3 class="card-title">模型广场</h3>
             <el-tooltip
-              content="窗口 = 当前统计范围；按模型忙时口径（该模型成功且带耗时请求的 Token ÷ 同批耗时折算分钟数）"
+              :content="`${kpiWindow.tip}；按模型忙时口径（该模型成功且带耗时请求的 Token ÷ 同批耗时折算分钟数）`"
               placement="top"
               :show-after="150"
             >
-              <span class="win-chip">按模型忙时</span>
+              <span class="win-chip">{{ kpiWindow.label }} · 按模型忙时</span>
             </el-tooltip>
             <div class="sort-group">
               <span class="sort-label">排序：</span>
@@ -778,6 +846,26 @@ const modeLabel = (m: string) =>
                 </button>
               </span>
               <span v-if="plazaTruncatedText" class="trunc-note">{{ plazaTruncatedText }}</span>
+            </div>
+
+            <!-- 未匹配模型：后端兜底行（Unmatched=true），单独渲染、不参与排序与空模型折叠 -->
+            <div v-if="unmatchedRow" class="unmatched-row">
+              <div class="unmatched-head">
+                <span class="unmatched-name">未匹配模型</span>
+                <el-tooltip
+                  content="改名 / 别名 / 无渠道导致归属不到任何在册对外模型的用量：后端单列汇总，不计入目录数与条数上限"
+                  placement="top"
+                  :show-after="150"
+                >
+                  <span class="unmatched-tag">未归属</span>
+                </el-tooltip>
+              </div>
+              <div class="unmatched-stats">
+                <span>Token <b>{{ unmatchedRow.tokensText }}</b></span>
+                <span>请求 / 失败 <b>{{ unmatchedRow.callsText }}</b></span>
+                <span>吞吐（忙时）<b>{{ unmatchedRow.tpmText }}</b></span>
+                <span>首字 / 全程 <b>{{ unmatchedRow.latencyText }}</b></span>
+              </div>
             </div>
           </template>
           <el-empty v-else description="模型目录为空：还没有对外模型" :image-size="70" />
@@ -1314,6 +1402,47 @@ const modeLabel = (m: string) =>
   font-size: 11px;
   color: var(--color-text-tertiary);
   margin-top: 8px;
+}
+/* 未匹配模型：灰底虚线框，明显区别于普通模型卡 */
+.unmatched-row {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px dashed var(--color-border-strong);
+  border-radius: 10px;
+  background: #f7f8fa;
+}
+.unmatched-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.unmatched-name {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--color-text-secondary);
+}
+.unmatched-tag {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: #eef0f3;
+  color: var(--color-text-tertiary);
+  cursor: help;
+}
+.unmatched-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+.unmatched-stats b {
+  color: var(--color-text);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  font-family: 'SF Mono', Consolas, monospace;
 }
 
 /* ===== ④ 实时区 ===== */

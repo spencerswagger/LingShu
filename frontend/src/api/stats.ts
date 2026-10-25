@@ -74,6 +74,9 @@ export interface StatsModelStat {
   AvgMS: number
   AvgFirstMS: number
   Active: boolean // Calls>0；false = 空闲模型 → 折叠
+  // 后端兜底行：无法归属到任何在册对外模型的用量（改名/别名/无渠道）。
+  // Model 固定为 "__unmatched__"，Frontend 应单独渲染，不计入目录数、不受 Limit 截断。
+  Unmatched: boolean
 }
 
 // 模型广场（后端 ModelPlaza）
@@ -124,6 +127,11 @@ export interface StatsKPI {
   SuccessRate: number
   AvgDurationMS: number
   AvgFirstTokenMS: number
+  // 首屏 KPI 的实际窗口（与 Usage.Hourly / ModelPlaza 同源）：
+  // WindowMode=exact 为请求区间的严格滚动窗口，calendar 为北京时间自然日归一窗口。
+  WindowFrom: string // RFC3339
+  WindowTo: string // RFC3339
+  WindowMode: string // exact | calendar
   // RPM/TPM 为忙时口径（按有耗时请求的处理时长折算，文案仍叫 RPM/TPM）
   RPM: number
   TPM: number
@@ -189,6 +197,9 @@ export interface StatsDashboardParams {
   CompareDays?: number // 0~7，四线图传 4
   ModelSort?: 'tokens' | 'tpm' | 'failed' | 'latency'
   ModelLimit?: number // 1~200
+  // exact（默认）= 严格按请求区间的滚动窗口；calendar = 北京时间自然日归一。
+  // KPI / Hourly / ModelPlaza 跟这个窗口走，Usage.Daily 与其它维度聚合仍是日界口径。
+  Window?: 'exact' | 'calendar'
 }
 
 // ===== 实时区 /stats/live =====
