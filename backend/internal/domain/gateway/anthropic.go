@@ -144,7 +144,9 @@ func (p *AnthropicProvider) HandleStream(ctx context.Context, upstream *http.Res
 							}
 						case "message_start":
 							if len(ev.Message.Usage) > 0 {
-								if u, uerr := parseAnthropicUsage(ev.Message.Usage); uerr == nil {
+								// 零值守卫（口径同 openai-chat / responses / 非流式）：
+								// "usage":{} 或全零 usage 不算取到 usage，否则按 0 token 出账且无痕。
+								if u, uerr := parseAnthropicUsage(ev.Message.Usage); uerr == nil && !usageZero(u) {
 									// Input 已含 cache_creation（parseAnthropicUsage 内合并）。
 									usage.Input = u.Input
 									usage.CacheRead = u.CacheRead
@@ -162,7 +164,7 @@ func (p *AnthropicProvider) HandleStream(ctx context.Context, upstream *http.Res
 								sawStopReason = true
 							}
 							if len(ev.Usage) > 0 {
-								if u, uerr := parseAnthropicUsage(ev.Usage); uerr == nil {
+								if u, uerr := parseAnthropicUsage(ev.Usage); uerr == nil && !usageZero(u) {
 									usage.Output = u.Output
 									sawUsage = true
 									rawParts = append(rawParts, ev.Usage)

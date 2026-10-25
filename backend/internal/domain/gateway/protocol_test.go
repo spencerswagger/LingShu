@@ -237,6 +237,43 @@ func TestHandleStreamUsageMissingReason(t *testing.T) {
 			wantPunish: true,
 		},
 		{
+			// 零值守卫：上游给 "usage":{} 时不得当成「有 usage」——否则按 0 token 出账（漏钱）
+			// 且调用日志记 completed，金额与异常同时隐身。按「未取到 usage」走缺失归因＋估算。
+			name:     "responses completed 但 usage 为空对象",
+			provider: NewResponsesProvider(),
+			body: responsesDelta +
+				"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{}}}\n\n",
+			wantReason: UsageMissingDoneNoUsage,
+			wantPunish: false,
+		},
+		{
+			// 同上：全零 usage（字段齐备但值全为 0）同样不算取到 usage。
+			name:       "responses completed 但 usage 全零",
+			provider:   NewResponsesProvider(),
+			body:       responsesDelta + "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n",
+			wantReason: UsageMissingDoneNoUsage,
+			wantPunish: false,
+		},
+		{
+			// anthropic 同一漏配：message_start 给 "usage":{} 时不能置 sawUsage（否则 0 token 出账）。
+			name:     "anthropic message_start 但 usage 为空对象",
+			provider: NewAnthropicProvider(),
+			body: "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"usage\":{}}}\n\n" +
+				anthropicMessageDelta + anthropicStop,
+			wantReason: UsageMissingDoneNoUsage,
+			wantPunish: false,
+		},
+		{
+			// openai-chat 既有守卫（parseStreamData 的 !usageZero）的对照用例。
+			name:     "openai usage 全零帧",
+			provider: NewOpenAIProvider(EndpointChatCompletions),
+			body: chatDelta + chatFinish +
+				"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0}}\n\n" +
+				"data: [DONE]\n\n",
+			wantReason: UsageMissingDoneNoUsage,
+			wantPunish: false,
+		},
+		{
 			name:     "responses failed",
 			provider: NewResponsesProvider(),
 			body: "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_error\"," +

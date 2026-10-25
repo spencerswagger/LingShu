@@ -468,6 +468,13 @@ func TestStreamConversionUsageMissingEndShape(t *testing.T) {
 			wantReason: UsageMissingTruncated,
 			wantPunish: true,
 		},
+		{
+			// 零值守卫：上游给全零 usage 帧时不算取到 usage（否则按 0 token 出账且无痕）。
+			name:       "usage 全零帧",
+			sse:        chatDelta + chatFinish + "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0}}\n\ndata: [DONE]\n\n",
+			wantReason: UsageMissingDoneNoUsage,
+			wantPunish: false,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -485,6 +492,51 @@ func TestStreamConversionUsageMissingEndShape(t *testing.T) {
 				t.Fatalf("punishable want %v, got %v", tt.wantPunish, got)
 			}
 		})
+	}
+}
+
+// 端到端（转换泵 + anthropic 入站）：上游虽然给了 usage 帧但值全零，不得按 0 token 出账——
+// 零值守卫让它等同「未取到 usage」，按可见内容估算计费，并按 done_no_usage 归因（不惩罚渠道）。
+// 修复前：泵内 `if ev.HasUsage` 无零值守卫 → 账单 {0,0} 且调用日志 completed（红）。
+func TestStreamConversionZeroUsageEstimatesInsteadOfZeroBilling(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(
+			"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hello world\"}}]}\n\n" +
+				"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+				"data: {\"id\":\"c1\",\"choices\":[],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0}}\n\n" +
+				"data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	h := build(t, upstream.URL)
+	h.chans.mrt.Model.Protocols = channelprotocol.Protocols{channelprotocol.ProtocolOpenAIChat: {}}
+
+	rec := postWithHeaders(t, h.gw, "/v1/messages",
+		`{"model":"gpt-4","stream":true,"max_tokens":100,"messages":[{"role":"user","content":"ping"}]}`,
+		map[string]string{"x-api-key": "sk-gw-t"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(h.billing.reqs) != 1 || h.billing.reqs[0].Fail {
+		t.Fatalf("按估算计费（成功账单）, got %+v", h.billing.reqs)
+	}
+	if u := h.billing.reqs[0].Tokens; u.Input <= 0 || u.Output <= 0 {
+		t.Fatalf("全零 usage 不得按 0 token 出账，应按可见内容估算, got %+v", u)
+	}
+	if len(h.chans.feeds) != 0 {
+		t.Fatalf("正常结束无有效 usage 不应计入渠道健康失败, got %+v", h.chans.feeds)
+	}
+	if len(h.clogs.inserted) == 0 {
+		t.Fatalf("缺少调用日志")
+	}
+	last := h.clogs.inserted[len(h.clogs.inserted)-1]
+	if last.Status != "completed" {
+		t.Fatalf("估算计费记 completed, got status=%q err=%q", last.Status, last.ErrorMessage)
+	}
+	if got := decisionUsageReason(t, last.Decision); got != UsageMissingDoneNoUsage {
+		t.Fatalf("usage_reason want %q, got %q", UsageMissingDoneNoUsage, got)
 	}
 }
 
@@ -981,6 +1033,23 @@ func decisionAttempts(t *testing.T, decision any) []map[string]any {
 		t.Fatalf("unmarshal decision: %v", err)
 	}
 	return dec.Attempts
+}
+
+// decisionUsageReason 取出调用日志决策轨迹里的结构化 usage 缺失归因（usage_reason）。
+// 看板/告警按该字段聚合，不依赖 reason 的中文文案。
+func decisionUsageReason(t *testing.T, decision any) string {
+	t.Helper()
+	raw, err := json.Marshal(decision)
+	if err != nil {
+		t.Fatalf("marshal decision: %v", err)
+	}
+	var dec struct {
+		UsageReason string `json:"usage_reason"`
+	}
+	if err := json.Unmarshal(raw, &dec); err != nil {
+		t.Fatalf("unmarshal decision: %v", err)
+	}
+	return dec.UsageReason
 }
 
 // TestServeDecisionPassthroughReorderMarkers 断言直通重排可观测：

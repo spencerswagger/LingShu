@@ -144,7 +144,12 @@ func (p *ResponsesProvider) HandleStream(ctx context.Context, upstream *http.Res
 						case "response.completed", "response.incomplete":
 							sawDone = true
 							if len(ev.Response.Usage) > 0 {
-								if u, uerr := parseResponsesUsage(ev.Response.Usage); uerr == nil {
+								// 零值守卫：上游下发 "usage":{} 或全零 usage 时不能当成有效 usage，
+								// 否则按 0 token 出账（平台直接漏计费），且调用日志记 completed、
+								// 渠道健康也不亮 —— 金额与异常同时隐身。与 openai-chat 流式
+								// （parseStreamData 的 !usageZero）、非流式 handler 的 usageZero
+								// 判定口径一致：全零等同于「未取到 usage」，由调用方按可见内容估算。
+								if u, uerr := parseResponsesUsage(ev.Response.Usage); uerr == nil && !usageZero(u) {
 									usage = u
 									sawUsage = true
 									rawParts = append(rawParts, ev.Response.Usage)

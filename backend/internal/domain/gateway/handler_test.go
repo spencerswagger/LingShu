@@ -1010,6 +1010,89 @@ func TestServeResponsesCompletedNoUsageNoPenalty(t *testing.T) {
 	}
 }
 
+// 上游给「空 usage / 全零 usage」时不得按 0 token 出账：零值守卫让该情形等同「未取到 usage」，
+// 走可见内容估算计费，并按 done_no_usage 归因（内容完整、不惩罚渠道）。
+// 修复前：responses 流式的 completed 分支无零值守卫 → 0 token 结算 + 调用日志 completed，
+// 金额与异常同时隐身（本用例对 responses / anthropic 两条路径即红）。
+func TestServeZeroUsageEstimatesInsteadOfZeroBilling(t *testing.T) {
+	tests := []struct {
+		name     string
+		protocol string
+		path     string
+		header   map[string]string
+		body     string
+	}{
+		{
+			name:     "responses usage 空对象",
+			protocol: channelprotocol.ProtocolOpenAIResponses,
+			path:     "/v1/responses",
+			header:   map[string]string{"Authorization": "Bearer sk-gw-t"},
+			body: "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello world\"}\n\n" +
+				"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{}}}\n\n",
+		},
+		{
+			name:     "responses usage 全零",
+			protocol: channelprotocol.ProtocolOpenAIResponses,
+			path:     "/v1/responses",
+			header:   map[string]string{"Authorization": "Bearer sk-gw-t"},
+			body: "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello world\"}\n\n" +
+				"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"," +
+				"\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n",
+		},
+		{
+			name:     "anthropic usage 空对象",
+			protocol: channelprotocol.ProtocolAnthropicMessages,
+			path:     "/v1/messages",
+			header:   map[string]string{"x-api-key": "sk-gw-t"},
+			body: "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"usage\":{}}}\n\n" +
+				"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0," +
+				"\"delta\":{\"type\":\"text_delta\",\"text\":\"hello world\"}}\n\n" +
+				"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n" +
+				"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(tt.body))
+			}))
+			defer upstream.Close()
+
+			h := build(t, upstream.URL)
+			h.chans.rt.Channel.Protocol = tt.protocol
+			rec := postWithHeaders(t, h.gw, tt.path,
+				`{"model":"gpt-4","stream":true,"messages":[{"role":"user","content":"ping"}]}`, tt.header)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("want 200 (stream already responded), got %d: %s", rec.Code, rec.Body.String())
+			}
+			if len(h.billing.reqs) != 1 || h.billing.reqs[0].Fail {
+				t.Fatalf("按估算计费（成功账单）, got %+v", h.billing.reqs)
+			}
+			// 核心断言：不是 0 token 出账（修复前这里就是 {0,0}）。
+			if u := h.billing.reqs[0].Tokens; u.Input <= 0 || u.Output <= 0 {
+				t.Fatalf("空/全零 usage 不得按 0 token 出账，应按可见内容估算, got %+v", u)
+			}
+			// 内容完整、只是上游没给有效 usage：不惩罚渠道。
+			if len(h.chans.feeds) != 0 {
+				t.Fatalf("正常结束无有效 usage 不应计入渠道健康失败, got %+v", h.chans.feeds)
+			}
+			if len(h.clogs.inserted) == 0 {
+				t.Fatalf("缺少调用日志")
+			}
+			last := h.clogs.inserted[len(h.clogs.inserted)-1]
+			if last.Status != "completed" {
+				t.Fatalf("估算计费记 completed, got status=%q err=%q", last.Status, last.ErrorMessage)
+			}
+			// 结构化归因可统计（不依赖中文文案）。
+			if got := decisionUsageReason(t, last.Decision); got != UsageMissingDoneNoUsage {
+				t.Fatalf("usage_reason want %q, got %q", UsageMissingDoneNoUsage, got)
+			}
+		})
+	}
+}
+
 // responses 直通先发 response.failed 再补 [DONE]：[DONE] 只能收口，不得把失败洗成正常结束；
 // 仍归因 error_frame，计入渠道健康失败且调用日志 failed。
 func TestServeResponsesDoneAfterFailedStaysErrorFrame(t *testing.T) {

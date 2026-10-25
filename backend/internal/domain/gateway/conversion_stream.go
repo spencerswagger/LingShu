@@ -286,7 +286,10 @@ func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Respon
 					} else {
 						carriedUsage := false
 						for _, ev := range evs {
-							if ev.HasUsage {
+							// 零值守卫（口径同三条直通路径）：上游给 "usage":{} 或全零 usage 时
+							// 不能当作有效 usage，否则按 0 token 出账且调用日志记 completed
+							//（金额与异常同时隐身）；按「未取到 usage」走可见内容估算。
+							if ev.HasUsage && !usageZero(ev.Usage) {
 								carriedUsage = true
 								sawUsage = true
 								mergeConvertedUsage(&usage, upstreamProto, ev)

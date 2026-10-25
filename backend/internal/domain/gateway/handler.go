@@ -1623,7 +1623,8 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 			g.logUpstreamErr(ctx, slog.LevelWarn, "upstream usage missing", endpoint, ureq.Protocol, model, token, routeRes,
 				diagFromRequest(req, ureq.Protocol, ureq.Cred),
 				errInfo{kind: "usage_missing", stage: stage, status: up.StatusCode, attempt: attempt,
-					reason: usageMissingLogReason(missingReason, clientGone, herr), sessionID: sessionID, durationMs: *dur})
+					usageReason: missingReason, // 结构化归因（可按 usage_reason 聚合，不依赖中文文案）
+					reason:      usageMissingLogReason(missingReason, clientGone, herr), sessionID: sessionID, durationMs: *dur})
 			content, reasoning, tools := assistantParts(assistantMsg)
 			usage = missingUsageEstimate(ureq.Body, assistantMsg, model, content, reasoning, tools)
 		}
@@ -1687,13 +1688,16 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 				"stream", string(assistantMsg), "failed", "流式计费失败", upstreamUsage, dur, ft.firstTokenMs(start), dec("计费失败"))
 		case usageAnomaly:
 			// 上游流中断但内容已部分下发：估算计费已在上面完成，调用日志如实记失败。
-			// 文案按缺失原因区分，避免「补发标记掩盖截断」与「干脆没有结束标记」在日志上混为一谈。
+			// 文案按缺失原因区分，避免「补发标记掩盖截断」与「干脆没有结束标记」在日志上混为一谈；
+			// 同时落结构化字段 usage_reason，供看板按归因聚合（不依赖中文文案匹配）。
 			reasonText, decReason := "上游流式响应中断（按估算计费）", "上游流式响应中断"
 			if missingReason == UsageMissingTerminatorOnly {
 				reasonText, decReason = "上游流式响应中断（仅收到结束标记、内容层未见收尾证据，按估算计费）", "上游仅补发结束标记"
 			}
+			decision := dec(decReason)
+			decision["usage_reason"] = missingReason
 			g.writeCallLogUsage(billCtx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-				"stream", string(assistantMsg), "failed", reasonText, upstreamUsage, dur, ft.firstTokenMs(start), dec(decReason))
+				"stream", string(assistantMsg), "failed", reasonText, upstreamUsage, dur, ft.firstTokenMs(start), decision)
 		default:
 			reason := "success"
 			if usageMissing {
@@ -1702,8 +1706,12 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 					reason = "上游未返回usage(按估算计费)"
 				}
 			}
+			decision := dec(reason)
+			if usageMissing {
+				decision["usage_reason"] = missingReason
+			}
 			g.writeCallLogUsage(billCtx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-				"stream", string(assistantMsg), "completed", "", upstreamUsage, dur, ft.firstTokenMs(start), dec(reason))
+				"stream", string(assistantMsg), "completed", "", upstreamUsage, dur, ft.firstTokenMs(start), decision)
 		}
 		// 渠道健康回喂：上游读侧中断计入密钥健康失败（窗口错误率达标才 DRAIN，探针可自愈），
 		// 不再「单次 usage 缺失即禁用整条渠道」；正常结束无 usage / 客户端断开不回喂失败。

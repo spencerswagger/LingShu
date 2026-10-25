@@ -384,8 +384,11 @@ type errInfo struct {
 	errCode       string
 	summary       string
 	reason        string // 人类可读原因（中文）
-	sessionID     string
-	durationMs    int64
+	// usageReason：usage 缺失的结构化归因（取值见 UsageMissing* 常量；仅 usage_missing 分支填充）。
+	// reason 是中文自由文本，只能 LIKE 匹配；归因统计（如 terminator_only 占比）走本字段。
+	usageReason string
+	sessionID   string
+	durationMs  int64
 	// 流式失败诊断（可空；仅流式上游失败分支填充，用于区分「已送达/未送达」与响应阶段）：
 	//   - delivered：请求体是否已完整送达上游（wrote.Load()）；false=连接阶段失败（可安全转移）；
 	//   - firstByteReceived：是否已收到上游首个响应字节；
@@ -467,6 +470,10 @@ func (g *Gateway) logErr(ctx context.Context, lvl slog.Level, msg, endpoint, pro
 		args = append(args, "err_summary", e.summary)
 	}
 	args = append(args, "reason", sanitizeErrSummary(e.reason), "duration_ms", e.durationMs)
+	// usage 缺失的结构化归因：仅当调用方填充时才输出（其余失败保持既有字段集不变）。
+	if e.usageReason != "" {
+		args = append(args, "usage_reason", e.usageReason)
+	}
 	// 流式失败诊断：仅当调用方填充时才输出（非流式失败保持既有字段集不变）。
 	if e.delivered != nil {
 		args = append(args, "delivered", *e.delivered)

@@ -164,6 +164,7 @@ func (p *OpenAIProvider) HandleStream(ctx context.Context, upstream *http.Respon
 	var usage billing.Usage
 	sawUsage := false
 	sawDone := false               // 是否收到流结束标记 [DONE]（注意：标记单独不能证明正常结束，见 streamEnd）
+	sawFinishReason := false       // 是否出现过非空 finish_reason（内容层收尾证据）
 	sawError := false              // 是否出现流内 error 帧（诊断与惩罚归因用）
 	var errorFrame string          // 流内 error 帧摘要（诊断用；空=无摘要）
 	var rawParts []json.RawMessage // 上游原始 usage 分片（多条累计时按同名键后写覆盖）
@@ -199,7 +200,12 @@ func (p *OpenAIProvider) HandleStream(ctx context.Context, upstream *http.Respon
 						sawUsage = true
 						rawParts = append(rawParts, raw)
 					}
-					asm.apply(data)
+					// finish_reason 是「内容层收尾证据」，属渠道健康判定输入，故记在 HandleStream
+					// 自己的状态里（而不是藏在 call-log 装配器内）：装配器只如实回报本帧解析结果，
+					// 日后为 call_log 调整装配逻辑不会静默翻转 terminator_only 判定（那会误 DRAIN 健康渠道）。
+					if asm.apply(data) {
+						sawFinishReason = true
+					}
 				}
 			}
 		}
@@ -218,9 +224,9 @@ func (p *OpenAIProvider) HandleStream(ctx context.Context, upstream *http.Respon
 	}
 
 	if !sawUsage {
-		// 交叉验证两类独立信号：内容层收尾证据（asm.finished = 上游给过 finish_reason）才是
+		// 交叉验证两类独立信号：内容层收尾证据（sawFinishReason = 上游给过 finish_reason）才是
 		// 「生成真的结束了」的证据；单独的 [DONE] 可能由代理在截断后兜底补发（见 streamEnd）。
-		end := streamEnd{Terminal: sawDone, ContentComplete: asm.finished}
+		end := streamEnd{Terminal: sawDone, ContentComplete: sawFinishReason}
 		return usage, rawUsageJSON(p.Name(), rawParts), asm.marshal(),
 			&UsageMissingError{Reason: usageMissingReasonOf(end, sawError), Detail: errorFrame}
 	}
@@ -304,13 +310,12 @@ type streamToolCall struct {
 
 // streamAssembler 流式 data 行 → 完整 assistant 消息的拼装器：
 // 逐块提取 delta.content / delta.reasoning_content / delta.tool_calls（index/name/arguments 增量）并拼接。
-// 顺带记录「是否出现过非空 finish_reason」——这一帧本来就要逐帧反序列化，顺手判定不增加解析开销，
-// 却能给 usage 缺失归因提供内容层收尾证据（见 streamEnd）。
+// 装配器本身不持有「渠道健康」判定状态：apply 只如实回报本帧是否带非空 finish_reason，
+// 由调用方（HandleStream）自行累积，避免观测装配与健康判定耦合（见 streamEnd）。
 type streamAssembler struct {
 	content          string
 	reasoningContent string
 	toolCalls        map[int]streamToolCall
-	finished         bool // 是否出现过非空 finish_reason（上游真实生成完毕的证据）
 }
 
 // newStreamAssembler 创建空拼装器。
@@ -341,16 +346,18 @@ type asmDeltaRow struct {
 	} `json:"choices"`
 }
 
-// apply 解析单个 SSE data 块，把 content/reasoning_content/tool_calls 增量拼进装配器。
-func (a *streamAssembler) apply(data []byte) {
+// apply 解析单个 SSE data 块，把 content/reasoning_content/tool_calls 增量拼进装配器；
+// 同时如实回报本帧是否带非空 finish_reason（内容层收尾证据，由调用方决定如何用）。
+// 逐帧反序列化本就发生在此，回报该事实不增加解析开销。
+func (a *streamAssembler) apply(data []byte) (sawFinishReason bool) {
 	var obj asmDeltaRow
 	if err := json.Unmarshal(data, &obj); err != nil {
-		return
+		return false
 	}
 	for _, c := range obj.Choices {
 		// finish_reason 只认「非 null 且非空串」：部分上游在中间帧给 null 或 ""，那不是收尾。
 		if !isNullRaw(c.FinishReason) && !bytes.Equal(bytes.TrimSpace(c.FinishReason), []byte(`""`)) {
-			a.finished = true
+			sawFinishReason = true
 		}
 		if s, ok := c.Delta.Content.(string); ok {
 			a.content += s
@@ -396,6 +403,7 @@ func (a *streamAssembler) apply(data []byte) {
 			a.toolCalls[idx] = cur
 		}
 	}
+	return sawFinishReason
 }
 
 // marshal 输出拼装完成的 assistant 消息 JSONB：

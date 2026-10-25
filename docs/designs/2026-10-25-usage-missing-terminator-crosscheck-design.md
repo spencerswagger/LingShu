@@ -57,11 +57,36 @@ error_frame  >  done_no_usage  >  terminator_only  >  truncated
 handler 按「流式传输中断」处置并回喂失败，本身就压过任何结束标记。若把它也折进 usage 缺失，
 反而会丢掉传输层错误原文。
 
+## 零值守卫（usage 存在但为空/全零）
+
+「`usage` 键存在」不等于「取到 usage」：上游下发 `"usage":{}` 或全零 usage 时，解析结果为
+零值且 `err == nil`，若据此置 `sawUsage`，就会按 0 token 结算——钱直接漏掉，而调用日志仍记
+`completed`、渠道健康也不亮，金额与异常同时隐身。
+
+口径统一为：**全零 usage 等同于「未取到 usage」**，走缺失归因 + 可见内容估算。四条流式路径与
+非流式（`handler.go` 的 `usageZero(usage)`）、openai-chat 流式（`parseStreamData` 的
+`!usageZero(u)`）完全一致：
+
+| 路径 | 守卫位置 |
+|---|---|
+| `openai.go` 流式 | `parseStreamData`（既有，本次补对照用例） |
+| `responses.go` 流式 | `response.completed/incomplete` 的 usage 解析（本次补齐，评审 P2） |
+| `anthropic.go` 流式 | `message_start` / `message_delta` 的 usage 解析（同类漏配，本次一并补齐） |
+| `conversion_stream.go` 泵 | 规范事件 `HasUsage` 合并前（同上） |
+| 非流式 | `handler.go` `usageZero(usage)`（既有） |
+
+## 结构化归因字段
+
+`terminator_only` 若只能靠中文文案识别，看板/告警没法按归因聚合。故两处落结构化字段：
+
+- 异常日志：`errInfo.usageReason` → 日志属性 `usage_reason`（取值见 `UsageMissing*` 常量）；
+- 调用日志：`call_logs.decision->>'usage_reason'`（仅 usage 缺失时写入，其余请求键集不变）。
+
 ## 各路径实现要点
 
 | 路径 | `Terminal` | `ContentComplete` |
 |---|---|---|
-| `openai.go`（直通） | `[DONE]` | `streamAssembler.finished`（复用逐帧解析，不新增解码） |
+| `openai.go`（直通） | `[DONE]` | `sawFinishReason`（来自 `streamAssembler.apply` 的回报，复用逐帧解析，不新增解码） |
 | `anthropic.go`（直通） | `message_stop` | `message_delta.stop_reason` 非空 |
 | `responses.go`（直通） | `response.completed/incomplete` 或 `[DONE]` | 仅 `response.completed/incomplete`（`[DONE]` 非本协议终止符） |
 | `conversion_stream.go`（转换泵） | `[DONE]` / `EventMessageStop` / responses 终止帧 | `EventMessageDelta.StopReason` 非空，或 responses 终止帧 |
@@ -79,6 +104,9 @@ handler 按「流式传输中断」处置并回喂失败，本身就压过任何
    已足够证明内容完整；终止标记只是形式约定。
 5. **转换泵删除冗余 `sawTerminal`**（评审 P3）：其职责被 `ContentComplete` 完整吸收，
    两份状态并存只会让「正常结束」有两个真相来源。
+6. **健康判定状态不放在 call-log 装配器里**（评审 P3）：`streamAssembler` 只回报本帧是否带
+   `finish_reason`，`sawFinishReason` 由 `HandleStream` 自己累积——否则日后为 call_log 调整装配逻辑
+   会静默翻转 `terminator_only` 判定，后果是误 DRAIN 健康渠道。
 
 ## Verification
 
@@ -90,7 +118,9 @@ cd backend && go test -race $(go list ./... | grep -v '/tests')
 覆盖用例（四路一致性）：
 - 单元：`TestHandleStreamUsageMissingReason`（各协议 × 正常/仅标记/截断/error 帧）、
   `TestStreamEndReasonMatrix`（归因矩阵）、`TestHandleStreamConnectionErrorBeatsTerminator`（连接层优先）。
-- 转换泵：`TestStreamConversionUsageMissingEndShape`（含「截断 + 补发 [DONE]」「仅 finish_reason 无 [DONE]」）。
+- 转换泵：`TestStreamConversionUsageMissingEndShape`（含「截断 + 补发 [DONE]」「仅 finish_reason 无 [DONE]」「usage 全零帧」）。
+- 零值守卫：`TestServeZeroUsageEstimatesInsteadOfZeroBilling`（responses 空对象/全零、anthropic 空对象，
+  断言账单 token > 0 且 `usage_reason=done_no_usage`）、`TestStreamConversionZeroUsageEstimatesInsteadOfZeroBilling`（泵）。
 - 端到端：`TestServeStreamDoneOnlyWithoutFinishReasonPenalized`、`TestServeResponsesDoneOnlyNoUsagePenalized`、
   `TestServeResponsesCompletedNoUsageNoPenalty`、`TestServeStreamNonOpenAINoUsageEndShape`、
   `TestStreamConversionDoneOnlyPenalized`（健康回喂 + 调用日志 + 估算计费三面同时断言）。
