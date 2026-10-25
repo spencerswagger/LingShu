@@ -9,7 +9,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/team/llmgateway/internal/domain/billing"
 	"github.com/team/llmgateway/internal/pkg/asyncwrite"
 )
 
@@ -200,16 +199,4 @@ func (s *asyncCostEventSink) replay(ctx context.Context, _ string, payload []byt
 		return err
 	}
 	return s.persistEvent(ctx, ev)
-}
-
-// ResolveTimeCoeff 导出路由侧的时段系数解析口径（模型级 time_config 优先，为空回落全局，均无则 1），
-// 供外部调用方与路由决策保持同源（避免两处口径漂移）。
-func ResolveTimeCoeff(modelTC, globalTC *billing.TimeCoeffConfig, now time.Time) float64 {
-	return resolveTimeCoeff(modelTC, globalTC, now)
-}
-
-// ResolveCtxCoeff 导出路由侧的上下文分档系数解析口径（模型级 context_tiers 优先，为空回落全局，
-// 均空则 1；口径含缓存读 Input+CacheRead），供外部调用方与路由决策同源。
-func ResolveCtxCoeff(modelTiers, globalTiers []billing.TierRule, sample billing.Usage) float64 {
-	return resolveCtxCoeff(modelTiers, globalTiers, sample)
 }
