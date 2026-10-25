@@ -56,8 +56,8 @@ type SessionCostEvent struct {
 //   - 失败任务保留 WAL 记录待重启重放（不静默丢失决策轨迹）。
 type asyncCostEventSink struct {
 	w *asyncwrite.Writer
-	// persist 是可选落地回调：事件成功执行时调用（默认 nil = 仅经 asyncwrite 入队 / WAL 留痕，
-	// 供尚未接线落地存储的阶段使用）。作为实例字段而非包级变量，避免并行测试共享可变状态
+	// persist 是可选落地回调：事件成功执行时调用（默认 nil = 仅经 asyncwrite 入队 / WAL 留痕；
+	// 仅用于测试注入 / 预留扩展点）。作为实例字段而非包级变量，避免并行测试共享可变状态
 	// （与 asyncwrite.fsyncCounter、channel.droppedReplays 的测试范式一致）。
 	persist func(ctx context.Context, ev SessionCostEvent) error
 	// seq 是发射序号计数器（提交时 Add(1) 取号）；构造时以 UnixNano 为基准，避免进程重启后

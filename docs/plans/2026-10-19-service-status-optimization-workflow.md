@@ -68,6 +68,7 @@ verify: (cd backend && go build ./...)
 action: 在 backend/internal/domain/console/admin.go 中将 `toSessionCostEventView` 改为方法，新增 `channelKeyName`（`GetKeyRuntime` 解析密钥所属渠道名），响应新增 `FromChannelName`/`ToChannelName`；前端 `api/admin.ts` 与 `SessionCostRouting.vue` 展示渠道名（起点显示「起点」，解析不到回退 ID）。
 loop: false
 verify: (cd backend && go build ./... && go test ./internal/domain/console/...)
+移除说明（2026-10-25）：本 Step 涉及的 `SessionCostRouting.vue` 已移除（会话成本页面及配套接口/存储一并下线），此处仅保留历史实施记录。
 
 - [x] **Step 13: 事件幂等键与 WAL 非有限浮点无损往返**
 action: 在 backend/internal/domain/router/cost_event.go 中，幂等键由 `session:turn:from>to` 改为 `session:Seq`——`Seq` 由 sink 在 Submit 时分配、每次发射单调唯一（基准取 UnixNano，避免重启后与 WAL 遗留记录撞键），修复网关 `SessionTurn` 恒 0 时同轮次多次独立决策（影子记录 / 来回切换）撞键被 asyncwrite 静默去重丢弃的问题；`sanitizeEventForJSON` 重构为 `marshalEventForJSON`/`unmarshalEventFromJSON`，非有限浮点在 `__non_finite` 记录字段名，重放时还原为 NaN，保证 WAL 往返不把「未知」退化为 0。
