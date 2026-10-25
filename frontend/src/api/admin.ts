@@ -1188,11 +1188,16 @@ export function getCostCurves(params: {
 }) {
   return http.get<CostCurvesData, ApiRes<CostCurvesData>>('/admin/cost/curves', { params })
 }
-// 会话逐轮成本点（取历史实际 cost_credits / credits_consumed，仅 completed）
-// Status/Failed/TurnNo 为「按用户轮 + 失败轮」口径预留：当前后端不返回（只发 completed 行），
-// 字段到齐后前端自动把失败轮画成红点并按 0 积分计，不需要改结构。
+// 会话逐轮成本点（取历史实际 cost_credits / credits_consumed，**含失败轮**）
+// 两个序号刻意分开：
+//   - Turn   成功调用序号（1..N），失败轮为 0 —— 老字段，兼容用；
+//   - TurnNo 时间线序号（1..M，含失败轮）—— 前端 x 轴用这个，失败轮占位、轴不断裂。
+// 失败轮 Status='failed'、Failed=true、金额恒 0，token 保留实际值。
 export interface SessionPoint {
   Turn: number
+  TurnNo: number
+  Status: string // completed | failed
+  Failed: boolean
   CallTime: string
   ChannelName: string
   InternalModelID: string
@@ -1201,15 +1206,14 @@ export interface SessionPoint {
   OutputTokens: number
   CostCredits: number
   SaleCredits: number
-  Status?: string
-  Failed?: boolean
-  TurnNo?: number
-  FailRate?: number
 }
 export interface CostSessionData {
   SessionID: string
   Points: SessionPoint[]
   Totals: { CostCredits: number; SaleCredits: number }
+  Total: number // 该会话账单总行数（含失败轮）
+  Limit: number // 本次生效上限（缺省 500、最多 2000）
+  Truncated: boolean // 是否被 Limit 截断
 }
 export function getCostSession(id: string) {
   return http.get<CostSessionData, ApiRes<CostSessionData>>(`/admin/cost/session/${id}`)

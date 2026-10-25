@@ -389,6 +389,7 @@ const sessionId = ref('')
 const loadingSession = ref(false)
 const sessionPoints = ref<SessionPoint[]>([])
 const sessionTotals = ref<{ CostCredits: number; SaleCredits: number } | null>(null)
+const sessionMeta = ref<{ Total: number; Limit: number; Truncated: boolean } | null>(null)
 
 // 会话请求序号守卫：切换会话立即清空旧数据，并丢弃过期响应（防止旧响应后到覆盖新会话）。
 let sessionSeq = 0
@@ -421,6 +422,7 @@ function sessionLabel(s: AdminSession): string {
 function onSessionChange() {
   sessionPoints.value = []
   sessionTotals.value = null
+  sessionMeta.value = null
   loadSession()
 }
 
@@ -433,6 +435,11 @@ async function loadSession() {
     if (seq !== sessionSeq) return // 已切到别的会话，丢弃过期响应
     sessionPoints.value = res.Data.Points ?? []
     sessionTotals.value = res.Data.Totals ?? null
+    sessionMeta.value = {
+      Total: res.Data.Total ?? 0,
+      Limit: res.Data.Limit ?? 0,
+      Truncated: !!res.Data.Truncated,
+    }
   } catch (e: any) {
     if (seq !== sessionSeq) return
     setErr(e)
@@ -441,18 +448,32 @@ async function loadSession() {
   }
 }
 
-// 失败轮判定：后端当前只返回 completed 行（无 Status/Failed 字段），
-// 字段就绪后这里自动生效——失败轮画红点、金额按 0 计，但保留 x 轴位置不跳过。
+// 失败轮判定：后端直接给 Failed（= Status=='failed'），两个都给时取或。
 function isFailedPoint(p: SessionPoint): boolean {
   return p.Failed === true || (p.Status || '').toLowerCase() === 'failed'
 }
 
-const sessionFailedPoints = computed<[number, number][]>(() =>
-  sessionPoints.value.filter(isFailedPoint).map((p) => [p.Turn, 0]),
+// x 轴用 TurnNo（时间线序号，含失败轮）：失败轮占位、后续点不错位。
+// Turn 是「成功轮序号」，失败轮为 0，拿它当 x 会挤到最左边，不再使用。
+const failedPoints = computed<SessionPoint[]>(() => sessionPoints.value.filter(isFailedPoint))
+const failedCount = computed(() => failedPoints.value.length)
+
+// 失败轮红点：叠在图上，y 固定 0（失败轮金额恒 0），不参与正常曲线连接。
+const sessionFailedCoords = computed<[number, number][]>(() =>
+  failedPoints.value.map((p) => [p.TurnNo, 0]),
 )
+
+const sessionTruncatedText = computed(() => {
+  const m = sessionMeta.value
+  if (!m?.Truncated) return ''
+  return `仅显示最早 ${fmtInt(m.Limit)} 行，共 ${fmtInt(m.Total)} 行（可用 Limit 参数最多取 2000 行）`
+})
 
 const sessionOption = computed<EChartsCoreOption>(() => {
   const pts = sessionPoints.value
+  // 失败轮 y 置 null → 曲线在该轮断开，不使用 0 参与连线（避免把失败点连成「成本骤降」的假曲线）
+  const costData = pts.map((p) => [p.TurnNo, isFailedPoint(p) ? null : p.CostCredits])
+  const saleData = pts.map((p) => [p.TurnNo, isFailedPoint(p) ? null : p.SaleCredits])
   return {
     tooltip: {
       trigger: 'axis',
@@ -462,7 +483,7 @@ const sessionOption = computed<EChartsCoreOption>(() => {
     grid: { left: 12, right: 20, top: 24, bottom: 44, containLabel: true },
     xAxis: {
       type: 'value',
-      name: '轮次',
+      name: '调用序号',
       nameLocation: 'middle',
       nameGap: 26,
       min: 1,
@@ -481,26 +502,28 @@ const sessionOption = computed<EChartsCoreOption>(() => {
         type: 'line',
         showSymbol: true,
         symbolSize: 5,
+        connectNulls: false, // 失败轮断开，不连成正常曲线
         lineStyle: { width: 2.4, color: '#5a5ce8' },
         itemStyle: { color: '#5a5ce8' },
-        // 失败轮金额按 0 计，但保留该点（不跳过），x 轴不错位
-        data: pts.map((p) => [p.Turn, isFailedPoint(p) ? 0 : p.CostCredits]),
+        data: costData,
       },
       {
         name: '售价',
         type: 'line',
         showSymbol: true,
         symbolSize: 5,
+        connectNulls: false,
         lineStyle: { width: 2, type: 'dashed', color: '#e6a23c' },
         itemStyle: { color: '#e6a23c' },
-        data: pts.map((p) => [p.Turn, isFailedPoint(p) ? 0 : p.SaleCredits]),
+        data: saleData,
       },
       {
-        name: '失败轮',
+        // 失败轮单独一条红点散点：不带线、不参与连接，仅占位标注
+        name: '失败轮（未计费）',
         type: 'scatter',
         symbolSize: 9,
         itemStyle: { color: '#f04438' },
-        data: sessionFailedPoints.value,
+        data: sessionFailedCoords.value,
         z: 10,
       },
     ],
@@ -752,7 +775,8 @@ onUnmounted(() => {
           <el-tag size="small" effect="plain" type="info">切换防竞态</el-tag>
         </div>
         <div class="block-desc">
-          取该会话逐轮历史实际 cost_credits / credits_consumed（含当时时段/分档系数）。切换会话时立即清空旧数据并丢弃过期响应。
+          取该会话逐次调用的历史实际 cost_credits / credits_consumed（含当时时段/分档系数），x 轴 = 调用序号（含失败轮）。
+          切换会话时立即清空旧数据并丢弃过期响应。
         </div>
         <div class="curve-toolbar">
           <span class="p-label">会话</span>
@@ -771,8 +795,15 @@ onUnmounted(() => {
           <template v-if="sessionTotals">
             <el-tag size="small" effect="plain" type="info">成本 {{ fmt2(sessionTotals.CostCredits) }}</el-tag>
             <el-tag size="small" effect="plain" type="warning">售价 {{ fmt2(sessionTotals.SaleCredits) }}</el-tag>
-            <span class="page-count">{{ sessionPoints.length }} 轮</span>
+            <span class="page-count">{{ sessionPoints.length }} 次调用</span>
+            <el-tag v-if="failedCount" size="small" type="danger" effect="plain">
+              含 {{ failedCount }} 次失败调用，未计费
+            </el-tag>
           </template>
+        </div>
+        <div v-if="sessionTruncatedText" class="trunc-notice">
+          <el-tag size="small" type="warning" effect="plain">已截断</el-tag>
+          <span>{{ sessionTruncatedText }}</span>
         </div>
         <div v-loading="loadingSession">
           <VChart
@@ -787,10 +818,11 @@ onUnmounted(() => {
         <div class="legend">
           <span><i class="line-mark" style="background: #5a5ce8" />成本</span>
           <span><i class="line-mark dashed" style="border-color: #e6a23c" />售价</span>
-          <span><i class="dot-mark over" />失败轮（计 0）</span>
+          <span><i class="dot-mark over" />失败轮（未计费）</span>
         </div>
         <div class="hint">
-          失败轮在图上打红点并计 0 积分（保留该轮位置，不让 x 轴错位）；当前后端只返回已完成轮，失败轮标注待接口补齐字段后自动生效。
+          x 轴用调用序号（含失败轮，1..{{ sessionPoints.length }}）：失败轮打红点、金额按 0 呈现且不参与连线，后续轮次不左移。
+          合计只累加成功轮。
         </div>
       </div>
 
@@ -923,6 +955,14 @@ onUnmounted(() => {
   font-size: 13px;
   color: var(--color-text-tertiary);
   padding: 10px 4px;
+}
+.trunc-notice {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 10px;
+  font-size: 12px;
+  color: var(--color-warning);
 }
 
 /* ===== 移动版：数字墙 + 实体行 ===== */

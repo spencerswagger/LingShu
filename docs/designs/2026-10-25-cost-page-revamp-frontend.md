@@ -39,11 +39,17 @@ C 会话成本  会话下拉（名字·用户·模型·时间·N 次调用）+ �
 - **时段**：下拉来自 `TimeOptions`，选项 key = `Name|Start|End`；用户选择后带 `At=<Start>` 重取，让后端按该时段算系数。默认高亮 = 后端 `At` 回显的时刻落在哪个时段（按字符串切 `HH:MM`，避免浏览器时区错位）。
 - **图例**：页面内 HTML 图例（成本/售价/升档/超档），窄屏同样可读；ECharts 自带 legend 关闭。
 
-## 4. 会话成本：竞态与失败轮
+## 4. 会话成本：竞态、序号与失败轮
 
-- `sessionSeq` 序号守卫：切换会话时**先清空** `sessionPoints`/`sessionTotals`，再取数；响应回来若序号已过期直接丢弃，finally 也只有最新序号才清 loading。
+- `sessionSeq` 序号守卫：切换会话时**先清空** `sessionPoints`/`sessionTotals`/`sessionMeta`，再取数；响应回来若序号已过期直接丢弃，finally 也只有最新序号才清 loading。
 - 下拉标签：`名字 · 用户 · 模型 · 月-日 时:分 · N 次调用`，选项内 `title` 给全文，超长由 el-select 截断。
-- 失败轮：`isFailedPoint()` 认 `Failed === true` 或 `Status === 'failed'`，命中则金额按 0 计（点保留，x 轴不错位）并画红点。**当前后端 `/cost/session` 只返回 completed 行、且没有失败/轮次字段**，所以这段逻辑目前不会触发，字段到位后自动生效（不需要改模板）。
+- **x 轴用 `TurnNo`**（时间线序号，1..M，含失败轮）：`Turn` 是「成功轮序号」（失败轮为 0），拿它当 x 会把失败轮挤到原点，已不再使用。
+- **失败轮**：`Failed===true` 或 `Status==='failed'` 的点 →
+  - 成本/售价两条线的该点 y 置 `null` + `connectNulls:false`：曲线在该轮断开，不用 0 参与连线（否则会画出「成本骤降」的假曲线）；
+  - 另起一条红点散点序列（`scatter`，y=0）叠在图上标注「未计费」；
+  - 顶部给「含 N 次失败调用，未计费」标签，避免与合计对不上数。
+- **截断**：`Truncated=true` 时在图上方显示「仅显示最早 N 行，共 M 行」，提示 `Limit` 缺省 500 / 最多 2000。
+- 合计 `Totals` 仍只累加成功轮（后端口径），前端不做二次求和。
 
 ## 5. 与 demo / 后端的已知差异
 
@@ -51,8 +57,7 @@ C 会话成本  会话下拉（名字·用户·模型·时间·N 次调用）+ �
 |---|---|---|---|
 | 定价曲线横轴 | 文案写「轮 1…轮 30」 | 上下文 token（`Points[].Tokens`） | 新接口按 token 出点，轮次轴属旧 `/cost/curves` 口径 |
 | 交点标注 | 无 | 去掉（旧曲线的「同指标交点」一并移除） | 新接口只画同一实体的成本/售价两条线，无多模型同图 |
-| 失败轮红点 | 有 | 逻辑已实现，当前无数据可显示 | 后端未下发失败/轮次字段 |
-| 「按用户轮」 | 有 | 未实现，横轴仍是后端给的 `Turn` 序号 | 后端未提供 TurnNo/TurnKind，Spec 已列后置 |
+| 会话成本横轴 | 「轮 1..7」 | 调用序号（含失败轮） | 后端暂未提供「按用户轮」的 `TurnKind`，用 `TurnNo` 保证失败轮占位不错位 |
 | 移动版 | 独立页面 | 同组件 CSS 切换 | 仓库只有一套路由 |
 | 售价数字下降 | — | 不做任何前端补偿或解释性兜底 | 探测记账剔除是已确认的口径修正 |
 
@@ -63,7 +68,8 @@ C 会话成本  会话下拉（名字·用户·模型·时间·N 次调用）+ �
 - `/cost/stats` → `EntityKey=cm:9103`、`SnapshotNames=["gpt-4o","gpt-4o-pro"]`、`ExternalModelName=gpt-4o`（`gpt-4o-pro` 的账单已归一到同一实体，前端显示「曾用名 1」）。
 - `/cost/pricing-curve?ChannelModelID=9103&Step=8000&MaxTokens=40000&HitRate=0.3&InOutRatio=5&At=19:00` → `TimeCoeff=1.5`（高峰）、`Sale/Cost` 的 `Rates`/`TierBreaks`/`Points[].Credits|CreditsNoCoeff` 全部对上；`At=02:00` 时 `TimeCoeff=0.5`。
 - 缺费率模型 → `Cost.Available=false`、`Reason=渠道内部模型未配置成本费率`（前端红 tag）。
-- `/cost/session/sess-demo-2` → `Points[].Turn/CostCredits/SaleCredits` + `Totals` 与类型一致。
+- `/cost/session/sess-demo-3`（含 1 条 failed 行）→ `Turn` 1,0,2 / `TurnNo` 1,2,3 / `Status` completed,failed,completed / 失败行金额 0、token 保留；`Totals` 只累加成功轮（0.72 / 1.2）。
+- `/cost/session/sess-demo-3?Limit=2` → `Truncated=true`、`Total=3`、返回 2 行（`TurnNo` 1,2）。
 
 ## 7. 门禁
 
