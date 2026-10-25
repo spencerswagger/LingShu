@@ -302,6 +302,39 @@ func TestStreamConversion(t *testing.T) {
 	}
 }
 
+// 转换泵：上游以 [DONE] 正常收尾但未给 usage → 按估算计费，且不惩罚渠道
+// （「正常结束无 usage」属上游忽略 include_usage 的协议偏差，与流被截断区分）。
+func TestStreamConversionDoneNoUsageNotPunished(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(
+			"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hello world\"}}]}\n\n" +
+				"data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	h := build(t, upstream.URL)
+	// 模型仅可达 openai-chat → anthropic-messages 入站需转换为 openai-chat 上游（走转换泵）。
+	h.chans.mrt.Model.Protocols = channelprotocol.Protocols{channelprotocol.ProtocolOpenAIChat: {}}
+
+	rec := postWithHeaders(t, h.gw, "/v1/messages",
+		`{"model":"gpt-4","stream":true,"max_tokens":100,"messages":[{"role":"user","content":"ping"}]}`,
+		map[string]string{"x-api-key": "sk-gw-t"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(h.billing.reqs) != 1 || h.billing.reqs[0].Fail {
+		t.Fatalf("usage 缺失应按估算计费（成功账单）, got %+v", h.billing.reqs)
+	}
+	if u := h.billing.reqs[0].Tokens; u.Input <= 0 || u.Output <= 0 {
+		t.Fatalf("usage 缺失应按可见内容估算 token, got %+v", u)
+	}
+	if len(h.chans.feeds) != 0 {
+		t.Fatalf("正常结束无 usage 不应计入渠道健康失败, got %+v", h.chans.feeds)
+	}
+}
+
 // TestStreamConversionMalformedFrameObserved 断言转换泵遇上游畸形帧时不再静默丢弃：
 // 流仍完整完成（200 + message_stop），且畸形帧经损耗诊断随调用日志决策轨迹的 lossy_notes 落痕。
 func TestStreamConversionMalformedFrameObserved(t *testing.T) {
@@ -487,16 +520,18 @@ func TestReorderPassthroughFirst(t *testing.T) {
 	}
 
 	tests := []struct {
-		name string
-		in   []int64
-		pass map[int64]bool
-		want []int64
+		name        string
+		in          []int64
+		pass        map[int64]bool
+		want        []int64
+		wantReorder bool
 	}{
-		{"混合：直通前移且各自保序", []int64{1, 2, 3, 4, 5}, map[int64]bool{2: true, 4: true}, []int64{2, 4, 1, 3, 5}},
-		{"全部直通：原序不变", []int64{1, 2, 3}, map[int64]bool{1: true, 2: true, 3: true}, []int64{1, 2, 3}},
-		{"全部需转换：原序不变", []int64{1, 2, 3}, map[int64]bool{}, []int64{1, 2, 3}},
-		{"单候选：不重排", []int64{1}, map[int64]bool{}, []int64{1}},
-		{"仅第二名可直通：交换", []int64{1, 2}, map[int64]bool{2: true}, []int64{2, 1}},
+		{"混合：直通前移且各自保序", []int64{1, 2, 3, 4, 5}, map[int64]bool{2: true, 4: true}, []int64{2, 4, 1, 3, 5}, true},
+		{"全部直通：原序不变", []int64{1, 2, 3}, map[int64]bool{1: true, 2: true, 3: true}, []int64{1, 2, 3}, false},
+		{"全部需转换：原序不变", []int64{1, 2, 3}, map[int64]bool{}, []int64{1, 2, 3}, false},
+		{"单候选：不重排", []int64{1}, map[int64]bool{}, []int64{1}, false},
+		{"仅第二名可直通：交换", []int64{1, 2}, map[int64]bool{2: true}, []int64{2, 1}, true},
+		{"直通已在队首：顺序不变则不标记重排", []int64{1, 2, 3}, map[int64]bool{1: true, 2: true}, []int64{1, 2, 3}, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -504,9 +539,102 @@ func TestReorderPassthroughFirst(t *testing.T) {
 			for _, id := range tt.in {
 				routes = append(routes, cr(id))
 			}
-			reorderPassthroughFirst(routes, func(r *router.ChannelRoute) bool { return tt.pass[r.ChannelID] })
+			reordered := reorderPassthroughFirst(routes, func(r *router.ChannelRoute) bool { return tt.pass[r.ChannelID] })
+			if reordered != tt.wantReorder {
+				t.Fatalf("重排标记 want %v, got %v", tt.wantReorder, reordered)
+			}
 			if got := ids(routes); !equal(got, tt.want) {
 				t.Fatalf("候选顺序 want %v, got %v", tt.want, got)
+			}
+		})
+	}
+}
+
+// decisionAttempts 取出调用日志决策轨迹的 attempts 列表（JSONB 值 → 通用 map）。
+func decisionAttempts(t *testing.T, decision any) []map[string]any {
+	t.Helper()
+	raw, err := json.Marshal(decision)
+	if err != nil {
+		t.Fatalf("marshal decision: %v", err)
+	}
+	var dec struct {
+		Attempts []map[string]any `json:"attempts"`
+	}
+	if err := json.Unmarshal(raw, &dec); err != nil {
+		t.Fatalf("unmarshal decision: %v", err)
+	}
+	return dec.Attempts
+}
+
+// TestServeDecisionPassthroughReorderMarkers 断言直通重排可观测：
+// 确实发生重排时，直通候选轨迹带 passthrough_first=true、被后移的兜底候选带 passthrough_fallback=true；
+// 未发生重排时轨迹不出现这两个键（键集与既有行为完全一致）。
+func TestServeDecisionPassthroughReorderMarkers(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"msg1","type":"message","role":"assistant","model":"gpt-4-internal",` +
+			`"content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn",` +
+			`"usage":{"input_tokens":10,"output_tokens":5}}`))
+	}))
+	defer upstream.Close()
+
+	modelRuntime := func(rowID, channelID int64, protocols channelprotocol.Protocols) *channel.ModelRuntime {
+		return &channel.ModelRuntime{
+			Model:   channel.ChannelModel{ID: rowID, ChannelID: channelID, InternalModelID: "gpt-4-internal", Protocols: protocols},
+			Machine: channel.NewMachine(channel.DefaultMachineConfig()),
+			Limiter: channel.NewLimiter(1000, 1000000, 1.2),
+		}
+	}
+	// 候选 1 仅可达 anthropic-messages（需转换 → 兜底）；候选 2 可达 openai-chat（直通）。
+	convRoute := &router.ChannelRoute{ChannelID: 1, ChannelKeyID: 1, InternalModelID: "gpt-4-internal", ModelRowID: 7, ExternalModelID: 1}
+	directRoute := &router.ChannelRoute{ChannelID: 2, ChannelKeyID: 2, InternalModelID: "gpt-4-internal", ModelRowID: 8, ExternalModelID: 1}
+
+	tests := []struct {
+		name      string
+		routes    []*router.ChannelRoute
+		wantMarks bool
+	}{
+		{"需转换在前 → 重排后直通前移", []*router.ChannelRoute{convRoute, directRoute}, true},
+		{"直通已在前 → 未重排", []*router.ChannelRoute{directRoute, convRoute}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := build(t, upstream.URL)
+			h.rrouter.routes = tt.routes
+			// 候选 2 的密钥不在运行时 → 该候选被跳过，请求最终命中候选 1（两条轨迹都会落痕）。
+			h.chans.mrtByChannel = map[int64]*channel.ModelRuntime{
+				1: modelRuntime(7, 1, channelprotocol.Protocols{channelprotocol.ProtocolAnthropicMessages: {}}),
+				2: modelRuntime(8, 2, channelprotocol.Protocols{channelprotocol.ProtocolOpenAIChat: {}}),
+			}
+			rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t",
+				`{"model":"gpt-4","stream":false,"messages":[{"role":"user","content":"ping"}]}`)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
+			}
+			if len(h.clogs.inserted) == 0 {
+				t.Fatalf("缺少调用日志")
+			}
+			attempts := decisionAttempts(t, h.clogs.inserted[len(h.clogs.inserted)-1].Decision)
+			byChannel := make(map[string]map[string]any, len(attempts))
+			for _, a := range attempts {
+				if id, ok := a["channel_id"].(string); ok {
+					byChannel[id] = a
+				}
+			}
+			_, directFirst := byChannel["2"]["passthrough_first"]
+			_, directFallback := byChannel["2"]["passthrough_fallback"]
+			_, convFirst := byChannel["1"]["passthrough_first"]
+			_, convFallback := byChannel["1"]["passthrough_fallback"]
+			if tt.wantMarks {
+				if !directFirst || !convFallback {
+					t.Fatalf("重排后应标记直通/兜底候选: %+v", attempts)
+				}
+				if directFallback || convFirst {
+					t.Fatalf("直通/兜底标记不得互换: %+v", attempts)
+				}
+			} else if directFirst || directFallback || convFirst || convFallback {
+				t.Fatalf("未发生重排时不得追加重排标记: %+v", attempts)
 			}
 		})
 	}

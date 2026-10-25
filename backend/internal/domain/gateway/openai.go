@@ -163,7 +163,8 @@ func (p *OpenAIProvider) HandleStream(ctx context.Context, upstream *http.Respon
 	var usage billing.Usage
 	sawUsage := false
 	sawDone := false               // 是否收到流结束标记 [DONE]（区分「正常结束无 usage」与「流被截断」）
-	var errorFrame string          // 流内 error 帧摘要（诊断用；空=未出现）
+	sawError := false              // 是否出现流内 error 帧（诊断与惩罚归因用）
+	var errorFrame string          // 流内 error 帧摘要（诊断用；空=无摘要）
 	var rawParts []json.RawMessage // 上游原始 usage 分片（多条累计时按同名键后写覆盖）
 	asm := newStreamAssembler()    // 按 data 行增量拼装完整 assistant 消息（call_log 采集）
 
@@ -171,7 +172,7 @@ func (p *OpenAIProvider) HandleStream(ctx context.Context, upstream *http.Respon
 		line, err := br.ReadBytes('\n')
 		if len(line) > 0 {
 			if _, werr := w.Write(line); werr != nil {
-				return usage, rawUsageJSON(p.Name(), rawParts), asm.marshal(), werr
+				return usage, rawUsageJSON(p.Name(), rawParts), asm.marshal(), wrapDownstreamWrite(werr)
 			}
 			if flusher != nil {
 				flusher.Flush()
@@ -182,10 +183,11 @@ func (p *OpenAIProvider) HandleStream(ctx context.Context, upstream *http.Respon
 				if len(data) > 0 && bytes.Equal(data, []byte("[DONE]")) {
 					sawDone = true
 				} else if len(data) > 0 {
-					if msg := streamErrorFrame(data); msg != "" {
-						errorFrame = msg
+					u, raw, has, errDetail := parseStreamData(data)
+					if errDetail != "" {
+						sawError = true
+						errorFrame = errDetail
 					}
-					u, raw, has := parseStreamData(data)
 					if has {
 						usage = u
 						sawUsage = true
@@ -214,40 +216,13 @@ func (p *OpenAIProvider) HandleStream(ctx context.Context, upstream *http.Respon
 		switch {
 		case sawDone:
 			reason = UsageMissingDoneNoUsage
-		case errorFrame != "":
+		case sawError:
 			reason = UsageMissingErrorFrame
 		}
 		return usage, rawUsageJSON(p.Name(), rawParts), asm.marshal(),
 			&UsageMissingError{Reason: reason, Detail: errorFrame}
 	}
 	return usage, rawUsageJSON(p.Name(), rawParts), asm.marshal(), nil
-}
-
-// streamErrorFrame 提取 OpenAI 兼容流内 error 帧的可读摘要；非 error 帧返回空串。
-func streamErrorFrame(data []byte) string {
-	var obj map[string]json.RawMessage
-	if err := json.Unmarshal(data, &obj); err != nil {
-		return ""
-	}
-	raw, ok := obj["error"]
-	if !ok || len(raw) == 0 || string(raw) == "null" {
-		return ""
-	}
-	var s string
-	if err := json.Unmarshal(raw, &s); err == nil {
-		return s
-	}
-	var e struct {
-		Message string `json:"message"`
-		Type    string `json:"type"`
-	}
-	if err := json.Unmarshal(raw, &e); err != nil || e.Message == "" {
-		return ""
-	}
-	if e.Type != "" {
-		return e.Type + ": " + e.Message
-	}
-	return e.Message
 }
 
 // ensureIncludeUsage 为 OpenAI Chat Completions 的流式请求幂等补 stream_options.include_usage=true。
@@ -258,23 +233,28 @@ func ensureIncludeUsage(body []byte, protocol, endpoint string) []byte {
 	if protocol != "openai-chat" || endpoint != EndpointChatCompletions {
 		return body
 	}
+	// 快路径：已显式请求 usage（include_usage=true）时原样下发，省掉每个流式请求的
+	// 两次反序列化 + 一次全量序列化；include_usage=false 仍走下方改写（平台必需参数语义不变）。
+	if hasIncludeUsageTrue(body) {
+		return body
+	}
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(body, &obj); err != nil {
 		return body
 	}
-	var stream bool
-	rawStream, ok := obj["stream"]
-	if !ok || json.Unmarshal(rawStream, &stream) != nil || !stream {
+	if !bytes.Equal(bytes.TrimSpace(obj["stream"]), []byte("true")) {
 		return body
 	}
-	opts := make(map[string]json.RawMessage)
-	if raw, ok := obj["stream_options"]; ok && len(raw) > 0 && string(raw) != "null" {
-		if err := json.Unmarshal(raw, &opts); err != nil {
-			opts = make(map[string]json.RawMessage) // 结构异常：以平台必需参数为准重建
-		}
+	rawOpts, hasOpts := obj["stream_options"]
+	if !hasOpts || len(rawOpts) == 0 || string(bytes.TrimSpace(rawOpts)) == "null" {
+		// 无 stream_options：把新键直接插到对象尾部，其余字节原样保留（避免整包重序列化）。
+		return injectStreamOptions(body)
 	}
-	var include bool
-	if raw, ok := opts["include_usage"]; ok && json.Unmarshal(raw, &include) == nil && include {
+	opts := make(map[string]json.RawMessage)
+	if err := json.Unmarshal(rawOpts, &opts); err != nil {
+		opts = make(map[string]json.RawMessage) // 结构异常：以平台必需参数为准重建
+	}
+	if raw, ok := opts["include_usage"]; ok && bytes.Equal(bytes.TrimSpace(raw), []byte("true")) {
 		return body
 	}
 	opts["include_usage"] = json.RawMessage("true")
@@ -287,6 +267,49 @@ func ensureIncludeUsage(body []byte, protocol, endpoint string) []byte {
 	if err != nil {
 		return body
 	}
+	return out
+}
+
+// hasIncludeUsageTrue 判断请求体是否已含 "include_usage": true（容忍键值间空白与合法分隔符）。
+// 纯字节判定，无需反序列化；要求该键出现在 stream_options 之后，避免把 prompt 正文里的
+// 同名字面量误当成请求参数（否则会跳过注入，平台拿不到 usage）。
+func hasIncludeUsageTrue(body []byte) bool {
+	i := bytes.Index(body, []byte(`"include_usage"`))
+	if i < 0 {
+		return false
+	}
+	if j := bytes.Index(body, []byte(`"stream_options"`)); j < 0 || j > i {
+		return false
+	}
+	rest := bytes.TrimLeft(body[i+len(`"include_usage"`):], " \t\r\n")
+	if len(rest) == 0 || rest[0] != ':' {
+		return false
+	}
+	rest = bytes.TrimLeft(rest[1:], " \t\r\n")
+	if !bytes.HasPrefix(rest, []byte("true")) {
+		return false
+	}
+	rest = bytes.TrimLeft(rest[len("true"):], " \t\r\n")
+	return len(rest) == 0 || rest[0] == ',' || rest[0] == '}' || rest[0] == ']'
+}
+
+// injectStreamOptions 在请求体对象末尾插入 stream_options.include_usage=true（保持其余字节不变）。
+func injectStreamOptions(body []byte) []byte {
+	trimmed := bytes.TrimRight(body, " \t\r\n")
+	open := bytes.IndexByte(trimmed, '{')
+	if open < 0 || trimmed[len(trimmed)-1] != '}' {
+		return body
+	}
+	// 空对象 {} 不需要前置逗号。
+	empty := len(bytes.TrimSpace(trimmed[open+1:len(trimmed)-1])) == 0
+	out := make([]byte, 0, len(body)+len(`"stream_options":{"include_usage":true}`)+1)
+	out = append(out, trimmed[:len(trimmed)-1]...)
+	if !empty {
+		out = append(out, ',')
+	}
+	out = append(out, `"stream_options":{"include_usage":true}`...)
+	out = append(out, '}')
+	out = append(out, body[len(trimmed):]...)
 	return out
 }
 
@@ -432,34 +455,38 @@ func (a *streamAssembler) marshal() []byte {
 	return b
 }
 
-// streamData 流式 data 行的 usage 解析目标（正文增量由 streamAssembler 处理，此处只取 usage）。
+// streamData 流式 data 行的解析目标（正文增量由 streamAssembler 处理，此处只取 usage 与 error 帧）。
 type streamData struct {
 	Choices []struct {
 		Usage json.RawMessage `json:"usage"`
 	} `json:"choices"`
 	Usage json.RawMessage `json:"usage"`
+	Error json.RawMessage `json:"error"`
 }
 
-// parseStreamData 解析单个 SSE data 块，返回：命中 usage、该 usage 的原始 JSON、是否命中。
+// parseStreamData 解析单个 SSE data 块，返回：命中 usage、该 usage 的原始 JSON、是否命中、
+// 流内 error 帧摘要（空=无 error 帧）。usage 与 error 摘要取自同一次反序列化，
+// 避免同一帧被重复解析（每帧双解析是流式热路径上的额外开销）。
 // 原始 JSON 供 call_log 记录上游原文（诊断渠道 usage 口径）。
-func parseStreamData(data []byte) (billing.Usage, json.RawMessage, bool) {
+func parseStreamData(data []byte) (billing.Usage, json.RawMessage, bool, string) {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()
 	var obj streamData
 	if err := dec.Decode(&obj); err != nil {
-		return billing.Usage{}, nil, false
+		return billing.Usage{}, nil, false, ""
 	}
+	errDetail := errorFrameDetail(obj.Error)
 	for _, c := range obj.Choices {
 		if len(c.Usage) > 0 {
 			if u, err := parseUsageObj(c.Usage); err == nil && !usageZero(u) {
-				return u, c.Usage, true
+				return u, c.Usage, true, errDetail
 			}
 		}
 	}
 	if len(obj.Usage) > 0 {
 		if u, err := parseUsageObj(obj.Usage); err == nil && !usageZero(u) {
-			return u, obj.Usage, true
+			return u, obj.Usage, true, errDetail
 		}
 	}
-	return billing.Usage{}, nil, false
+	return billing.Usage{}, nil, false, errDetail
 }

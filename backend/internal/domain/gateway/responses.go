@@ -86,11 +86,13 @@ type responsesStreamEvent struct {
 	Delta    any    `json:"delta"`
 	Response struct {
 		Usage json.RawMessage `json:"usage"`
+		Error json.RawMessage `json:"error"`
 	} `json:"response"`
 }
 
 // HandleStream 透传 Responses SSE 事件：增量拼接 output_text，从 response.completed 取 usage。
-// usage 缺失返回 ErrUsageMissing（内容已透传，由调用方按 AC-17 放宽：估算计费）。
+// usage 缺失返回 UsageMissingError，并按结束形态区分原因：收到 response.completed/incomplete
+// （正常结束但无 usage，不惩罚渠道）/ 未收到即 EOF（流被截断）/ response.failed（流内错误）。
 // 返回 (usage, 上游原始 usage JSONB 值, assistant 消息 JSON, error)。
 func (p *ResponsesProvider) HandleStream(ctx context.Context, upstream *http.Response, w http.ResponseWriter) (billing.Usage, []byte, []byte, error) {
 	h := w.Header()
@@ -105,6 +107,9 @@ func (p *ResponsesProvider) HandleStream(ctx context.Context, upstream *http.Res
 
 	var usage billing.Usage
 	sawUsage := false
+	sawDone := false               // 是否收到 response.completed/incomplete（区分「正常结束无 usage」与「流被截断」）
+	sawError := false              // 是否出现 response.failed（计入渠道健康失败）
+	var errorFrame string          // response.failed 摘要（诊断用）
 	var rawParts []json.RawMessage // 上游原始 usage 分片（诊断渠道口径，call_logs.upstream_usage）
 	var content string
 
@@ -112,7 +117,7 @@ func (p *ResponsesProvider) HandleStream(ctx context.Context, upstream *http.Res
 		line, err := br.ReadBytes('\n')
 		if len(line) > 0 {
 			if _, werr := w.Write(line); werr != nil {
-				return usage, rawUsageJSON(p.Name(), rawParts), responsesAssistant(content), werr
+				return usage, rawUsageJSON(p.Name(), rawParts), responsesAssistant(content), wrapDownstreamWrite(werr)
 			}
 			if flusher != nil {
 				flusher.Flush()
@@ -128,7 +133,8 @@ func (p *ResponsesProvider) HandleStream(ctx context.Context, upstream *http.Res
 							if s, ok := ev.Delta.(string); ok {
 								content += s
 							}
-						case "response.completed":
+						case "response.completed", "response.incomplete":
+							sawDone = true
 							if len(ev.Response.Usage) > 0 {
 								if u, uerr := parseResponsesUsage(ev.Response.Usage); uerr == nil {
 									usage = u
@@ -136,6 +142,9 @@ func (p *ResponsesProvider) HandleStream(ctx context.Context, upstream *http.Res
 									rawParts = append(rawParts, ev.Response.Usage)
 								}
 							}
+						case "response.failed":
+							sawError = true
+							errorFrame = errorFrameDetail(ev.Response.Error)
 						}
 					}
 				}
@@ -155,7 +164,15 @@ func (p *ResponsesProvider) HandleStream(ctx context.Context, upstream *http.Res
 	}
 
 	if !sawUsage {
-		return usage, rawUsageJSON(p.Name(), rawParts), responsesAssistant(content), ErrUsageMissing
+		reason := UsageMissingTruncated
+		switch {
+		case sawDone:
+			reason = UsageMissingDoneNoUsage
+		case sawError:
+			reason = UsageMissingErrorFrame
+		}
+		return usage, rawUsageJSON(p.Name(), rawParts), responsesAssistant(content),
+			&UsageMissingError{Reason: reason, Detail: errorFrame}
 	}
 	return usage, rawUsageJSON(p.Name(), rawParts), responsesAssistant(content), nil
 }

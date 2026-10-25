@@ -535,10 +535,27 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 	// 导致上游推理缓存反复击穿（会话内的协议形态抖动）。
 	// 既有会话保持路由层顺序（会话命中排首、其协议随渠道固定），粘性优先，不做重排；
 	// 需转换的候选仍保留在队尾，仅作兜底。
+	// 重排结果只在真的改序时体现在决策轨迹里（passthrough_first / passthrough_fallback），
+	// 未发生重排时轨迹键集与既有行为完全一致。
+	var passFlags map[*router.ChannelRoute]bool
+	reordered := false
 	if !hasSession {
-		reorderPassthroughFirst(routes, func(cr *router.ChannelRoute) bool {
-			return g.candidatePassesThrough(cr, baseProtocol)
+		passFlags = make(map[*router.ChannelRoute]bool, len(routes))
+		reordered = reorderPassthroughFirst(routes, func(cr *router.ChannelRoute) bool {
+			p := g.candidatePassesThrough(cr, baseProtocol)
+			passFlags[cr] = p
+			return p
 		})
+	}
+	// reorderMark 返回本次候选的重排标记（未发生重排时为空，轨迹键集不变）。
+	reorderMark := func(cr *router.ChannelRoute) string {
+		if !reordered {
+			return ""
+		}
+		if passFlags[cr] {
+			return reorderMarkFirst
+		}
+		return reorderMarkFallback
 	}
 	// 请求增量 diff：计算本次请求的增量消息与全量指纹（call_log 采集用，
 	// 新会话也在此初始化指纹，由下方 Attach 写入会话）。
@@ -572,7 +589,7 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 		var out *fwdOutcome
 		// 协议转换上下文（Step 7/9）：默认为直通（converted=false → 不新增任何轨迹字段）；
 		// 解析出上游协议后按实际转换情况更新，供 attempt/skip 与调用日志决策轨迹落痕。
-		plan := convPlan{inbound: baseProtocol, upstream: baseProtocol}
+		plan := convPlan{inbound: baseProtocol, upstream: baseProtocol, reorder: reorderMark(cr)}
 		var convLossy *protocolconv.LossyReport
 		attempt := func(reason string) map[string]any {
 			m := map[string]any{
@@ -674,7 +691,7 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 			continue
 		}
 		// 记录本次候选的转换上下文（供轨迹/调用日志落痕；直通时不新增任何字段）。
-		plan = convPlan{inbound: baseProtocol, upstream: upstreamProto, converted: converted}
+		plan.inbound, plan.upstream, plan.converted = baseProtocol, upstreamProto, converted
 		routeRes := &router.RouteResult{ChannelID: cr.ChannelID, ChannelKeyID: cr.ChannelKeyID, InternalModelID: cr.InternalModelID,
 			ModelRowID: cr.ModelRowID, ExternalModelID: cr.ExternalModelID, AutoModelName: autoName, Revision: cr.Revision,
 			Cost: cr.Cost, CostKnown: cr.CostKnown, TimeCoeff: cr.TimeCoeff}
@@ -1626,11 +1643,12 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 			g.writeCallLogUsage(billCtx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
 				"stream", string(assistantMsg), "completed", "", upstreamUsage, dur, ft.firstTokenMs(start), dec(reason))
 		}
-		// 渠道健康回喂：上游流中断计入密钥健康失败（窗口错误率达标才 DRAIN，探针可自愈），
+		// 渠道健康回喂：上游读侧中断计入密钥健康失败（窗口错误率达标才 DRAIN，探针可自愈），
 		// 不再「单次 usage 缺失即禁用整条渠道」；正常结束无 usage / 客户端断开不回喂失败。
-		// hardErr（如 unexpected EOF / 下游写失败）同样属上游传输中断，必须回喂失败，
-		// 否则持续读失败的上游永远进不了错误率窗口。
+		// 下游写失败（客户端断开/传输错误）不是上游故障，既不回喂失败（健康上游会被误判为故障），
+		// 也不回喂成功（本次流并未完整送达），只由 interrupted 与调用日志留痕。
 		switch {
+		case isDownstreamWriteErr(herr):
 		case usageAnomaly, hardErr:
 			g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, channel.Feedback{IsSuccess: false, Now: g.now()})
 		case !usageMissing:

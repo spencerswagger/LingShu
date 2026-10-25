@@ -25,7 +25,8 @@ type canonicalToolCall struct {
 
 // pumpConvertedStream 是跨协议流式转换泵：把上游 SSE 逐帧解码为规范事件，按入站协议重新编码后下发。
 // 与各 Provider.HandleStream 的返回契约一致（usage、上游原始 usage JSONB、assistant 消息 JSON、error）：
-// 上游无 usage 时返回 ErrUsageMissing（内容已下发，由调用方按 AC-17 处理：估算计费）。
+// 上游无 usage 时返回 UsageMissingError，并按流结束形态区分原因（[DONE]/终止事件 = 正常结束无 usage；
+// 未收到终止标记即 EOF = 截断；流内 error 帧 = 上游报错）。
 func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Response, inboundProto, upstreamProto string, lossy *protocolconv.LossyReport, w http.ResponseWriter) (billing.Usage, []byte, []byte, error) {
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
@@ -41,7 +42,11 @@ func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Respon
 
 	var usage billing.Usage
 	sawUsage := false
+	sawDone := false               // 是否收到上游终止标记（[DONE] / 终止事件）
+	sawError := false              // 是否出现流内 error 帧
+	var errorFrame string          // error 帧摘要（诊断用）
 	var rawParts []json.RawMessage // 上游原始 usage 分片（携带 usage 的事件原文）
+	upstreamResponses := channelprotocol.Canonical(upstreamProto) == channelprotocol.ProtocolOpenAIResponses
 
 	var content, reasoning bytes.Buffer
 	toolCalls := map[int]*canonicalToolCall{}
@@ -102,7 +107,7 @@ func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Respon
 				continue
 			}
 			if _, werr := w.Write(fr); werr != nil {
-				return werr
+				return wrapDownstreamWrite(werr)
 			}
 			if flusher != nil {
 				flusher.Flush()
@@ -235,7 +240,9 @@ func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Respon
 			trimmed := bytes.TrimSpace(line)
 			if bytes.HasPrefix(trimmed, []byte("data:")) {
 				payload := bytes.TrimSpace(trimmed[len("data:"):])
-				if len(payload) > 0 && !bytes.Equal(payload, []byte("[DONE]")) {
+				if len(payload) > 0 && bytes.Equal(payload, []byte("[DONE]")) {
+					sawDone = true
+				} else if len(payload) > 0 {
 					evs, _, derr := protocolconv.DecodeStreamEvents(upstreamProto, payload)
 					if derr != nil {
 						// 上游畸形帧不得静默丢弃：记入本次损耗诊断（随调用日志决策轨迹落痕）并告警，
@@ -250,7 +257,26 @@ func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Respon
 								sawUsage = true
 								mergeConvertedUsage(&usage, upstreamProto, ev)
 							}
+							switch {
+							case ev.Type == protocolconv.EventMessageStop:
+								sawDone = true
+							case upstreamResponses && ev.Type == protocolconv.EventMessageDelta:
+								// openai-responses 的终止帧（response.completed/incomplete）解码为
+								// message_delta，该协议没有 EventMessageStop，故以此判定「正常结束」。
+								sawDone = true
+							case ev.Type == protocolconv.EventError:
+								sawError = true
+								if errorFrame == "" {
+									errorFrame = ev.ErrMessage
+								}
+							}
 							accumulateConvertedAssistant(&content, &reasoning, toolCalls, &toolOrder, ev)
+						}
+						if upstreamResponses {
+							if detail := responsesFailedFrame(payload); detail != "" {
+								sawError = true
+								errorFrame = detail
+							}
 						}
 						if carriedUsage {
 							if part := streamUsagePart(upstreamProto, payload); len(part) > 0 {
@@ -294,9 +320,40 @@ func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Respon
 	}
 
 	if !sawUsage {
-		return usage, rawUsageJSON(upstreamProto, rawParts), asm(), ErrUsageMissing
+		reason := UsageMissingTruncated
+		switch {
+		case sawDone:
+			reason = UsageMissingDoneNoUsage
+		case sawError:
+			reason = UsageMissingErrorFrame
+		}
+		return usage, rawUsageJSON(upstreamProto, rawParts), asm(),
+			&UsageMissingError{Reason: reason, Detail: errorFrame}
 	}
 	return usage, rawUsageJSON(upstreamProto, rawParts), asm(), nil
+}
+
+// responsesFailedFrame 从 openai-responses 上游帧原文提取 response.failed 的错误摘要；
+// 该事件在解码器中没有对应规范事件（视为空事件），故按原文探测以便归因到 error_frame。
+func responsesFailedFrame(payload []byte) string {
+	// 先按字节探测：绝大多数帧不是 response.failed，避免为每帧多做一次反序列化。
+	if !bytes.Contains(payload, []byte("response.failed")) {
+		return ""
+	}
+	var probe struct {
+		Type     string          `json:"type"`
+		Error    json.RawMessage `json:"error"`
+		Response struct {
+			Error json.RawMessage `json:"error"`
+		} `json:"response"`
+	}
+	if json.Unmarshal(payload, &probe) != nil || probe.Type != "response.failed" {
+		return ""
+	}
+	if d := errorFrameDetail(probe.Response.Error); d != "" {
+		return d
+	}
+	return errorFrameDetail(probe.Error)
 }
 
 // channelEvent 是 protocolconv.CanonicalEvent 的别名，便于在泵内构造事件字面量。

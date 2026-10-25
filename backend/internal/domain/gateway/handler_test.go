@@ -19,6 +19,7 @@ import (
 
 	"github.com/team/llmgateway/internal/domain/billing"
 	"github.com/team/llmgateway/internal/domain/channel"
+	"github.com/team/llmgateway/internal/domain/channelprotocol"
 	"github.com/team/llmgateway/internal/domain/identity"
 	"github.com/team/llmgateway/internal/domain/model"
 	"github.com/team/llmgateway/internal/domain/router"
@@ -120,9 +121,11 @@ type feedEntry struct {
 }
 
 type fakeChannels struct {
-	rt                *channel.RuntimeChannel
-	mrt               *channel.ModelRuntime
-	keys              map[int64]*channel.KeyRuntime
+	rt   *channel.RuntimeChannel
+	mrt  *channel.ModelRuntime
+	keys map[int64]*channel.KeyRuntime
+	// mrtByChannel 可选：按渠道返回不同模型运行时（多候选直通/转换混合场景用）。
+	mrtByChannel      map[int64]*channel.ModelRuntime
 	feeds             []feedEntry
 	maxSessionsPerKey int // 覆盖默认 16（测试会话并发上限用）
 
@@ -144,6 +147,9 @@ func (f *fakeChannels) GetKeyRuntime(keyID int64) (*channel.KeyRuntime, bool) {
 }
 
 func (f *fakeChannels) GetModelRuntime(channelID, modelRowID int64) (*channel.ModelRuntime, bool) {
+	if mr, ok := f.mrtByChannel[channelID]; ok {
+		return mr, true
+	}
 	if f.rt == nil || f.mrt == nil {
 		return nil, false
 	}
@@ -708,6 +714,96 @@ func TestServeStreamTruncatedEstimatesAndFeedsHealthFailure(t *testing.T) {
 	}
 }
 
+// 非 openai-chat 协议：流正常结束（message_stop / response.completed）但无 usage → 估算计费、不惩罚渠道；
+// 未收到结束标记即 EOF（截断）→ 仍估算计费，但计入渠道健康失败。
+func TestServeStreamNonOpenAINoUsageEndShape(t *testing.T) {
+	const anthropicStart = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\"}}\n\n"
+	const anthropicDelta = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0," +
+		"\"delta\":{\"type\":\"text_delta\",\"text\":\"hello world\"}}\n\n"
+	const anthropicStop = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+	const responsesDelta = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello world\"}\n\n"
+	const responsesDone = "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+
+	tests := []struct {
+		name       string
+		protocol   string
+		body       string
+		wantPunish bool
+	}{
+		{"anthropic 正常结束无 usage", channelprotocol.ProtocolAnthropicMessages, anthropicStart + anthropicDelta + anthropicStop, false},
+		{"anthropic 截断", channelprotocol.ProtocolAnthropicMessages, anthropicStart + anthropicDelta, true},
+		{"responses 正常结束无 usage", channelprotocol.ProtocolOpenAIResponses, responsesDelta + responsesDone, false},
+		{"responses 截断", channelprotocol.ProtocolOpenAIResponses, responsesDelta, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(tt.body))
+			}))
+			defer upstream.Close()
+
+			h := build(t, upstream.URL)
+			h.chans.rt.Channel.Protocol = tt.protocol
+			path := "/v1/responses"
+			hdr := map[string]string{"Authorization": "Bearer sk-gw-t"}
+			if tt.protocol == channelprotocol.ProtocolAnthropicMessages {
+				path, hdr = "/v1/messages", map[string]string{"x-api-key": "sk-gw-t"}
+			}
+			rec := postWithHeaders(t, h.gw, path,
+				`{"model":"gpt-4","stream":true,"messages":[{"role":"user","content":"ping"}]}`, hdr)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("want 200 (stream already responded), got %d", rec.Code)
+			}
+			// usage 缺失一律按可见内容估算计费（不丢计费）。
+			if len(h.billing.reqs) != 1 || h.billing.reqs[0].Fail {
+				t.Fatalf("usage 缺失应按估算计费（成功账单）, got %+v", h.billing.reqs)
+			}
+			if u := h.billing.reqs[0].Tokens; u.Input <= 0 || u.Output <= 0 {
+				t.Fatalf("usage 缺失应按可见内容估算 token, got %+v", u)
+			}
+			if tt.wantPunish {
+				if len(h.chans.feeds) != 1 || h.chans.feeds[0].fb.IsSuccess {
+					t.Fatalf("截断应计入渠道健康失败, got %+v", h.chans.feeds)
+				}
+			} else if len(h.chans.feeds) != 0 {
+				t.Fatalf("正常结束无 usage 不应计入渠道健康失败, got %+v", h.chans.feeds)
+			}
+		})
+	}
+}
+
+// 下游写失败不是上游故障：保持 interrupted（failed 调用日志）语义，但不得回喂渠道健康失败
+// （否则健康上游会被误判为故障、误杀熔断）。
+func TestServeStreamDownstreamWriteDoesNotFeedHealthFailure(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]," +
+			"\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\ndata: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	h := build(t, upstream.URL)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"gpt-4","stream":true}`))
+	req.Header.Set("Authorization", "Bearer sk-gw-t")
+	req.Header.Set("Content-Type", "application/json")
+	h.gw.Handler().ServeHTTP(failWriteRecorder{httptest.NewRecorder()}, req)
+
+	if len(h.chans.feeds) != 0 {
+		t.Fatalf("下游写失败不得回喂渠道健康（无论成功或失败）, got %+v", h.chans.feeds)
+	}
+	if len(h.clogs.inserted) == 0 {
+		t.Fatalf("缺少调用日志")
+	}
+	last := h.clogs.inserted[len(h.clogs.inserted)-1]
+	if last.Status != "failed" || last.RespKind != "error" {
+		t.Fatalf("下游写失败仍应保持 failed 调用日志语义, got status=%q resp_kind=%q", last.Status, last.RespKind)
+	}
+}
+
 // 平台必需参数：客户端未带 stream_options.include_usage 时由网关为 OpenAI 兼容流式请求补齐，
 // 且保留客户端已有的其它 stream_options 键；非流式请求不改写。
 func TestServeStreamInjectsIncludeUsage(t *testing.T) {
@@ -789,6 +885,100 @@ func TestServeCompletionsStreamDoesNotInjectIncludeUsage(t *testing.T) {
 	}
 	if strings.Contains(gotBody, "stream_options") {
 		t.Fatalf("legacy completions 不应被写入 stream_options, got %s", gotBody)
+	}
+}
+
+// ensureIncludeUsage 的重构契约：已是 true 时原样返回（快路径，不做任何解析/重序列化）；
+// include_usage=false 仍改写为 true；无 stream_options 时只插入新键、其余字节保持不变。
+func TestEnsureIncludeUsage(t *testing.T) {
+	tests := []struct {
+		name        string
+		body        string
+		protocol    string
+		endpoint    string
+		wantSame    bool
+		wantInclude bool
+		wantOptions map[string]any
+	}{
+		{
+			name:     "已含 include_usage=true 原样返回",
+			body:     `{"model":"m","stream":true,"stream_options":{"include_usage":true,"foo":"bar"}}`,
+			protocol: "openai-chat", endpoint: EndpointChatCompletions,
+			wantSame: true, wantInclude: true,
+		},
+		{
+			name:     "键值间空白也走快路径",
+			body:     `{"stream":true,"stream_options":{"include_usage" : true }}`,
+			protocol: "openai-chat", endpoint: EndpointChatCompletions,
+			wantSame: true, wantInclude: true,
+		},
+		{
+			name:     "include_usage=false 改写为 true",
+			body:     `{"stream":true,"stream_options":{"include_usage":false}}`,
+			protocol: "openai-chat", endpoint: EndpointChatCompletions,
+			wantInclude: true,
+		},
+		{
+			name:     "无 stream_options 时插入新键并保留其余字节",
+			body:     `{"model":"m","stream":true}`,
+			protocol: "openai-chat", endpoint: EndpointChatCompletions,
+			wantInclude: true,
+		},
+		{
+			name:     "已有其它 stream_options 键保留",
+			body:     `{"stream":true,"stream_options":{"foo":"bar"}}`,
+			protocol: "openai-chat", endpoint: EndpointChatCompletions,
+			wantInclude: true, wantOptions: map[string]any{"foo": "bar"},
+		},
+		{
+			name:     "非流式不改写",
+			body:     `{"stream":false}`,
+			protocol: "openai-chat", endpoint: EndpointChatCompletions,
+			wantSame: true,
+		},
+		{
+			name:     "legacy completions 端点不改写",
+			body:     `{"stream":true}`,
+			protocol: "openai-chat", endpoint: EndpointCompletions,
+			wantSame: true,
+		},
+		{
+			name:     "非 openai-chat 协议不改写",
+			body:     `{"stream":true}`,
+			protocol: channelprotocol.ProtocolAnthropicMessages, endpoint: EndpointChatCompletions,
+			wantSame: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ensureIncludeUsage([]byte(tt.body), tt.protocol, tt.endpoint)
+			if tt.wantSame {
+				if string(got) != tt.body {
+					t.Fatalf("应原样返回（不快路径改写）, got %s", got)
+				}
+				return
+			}
+			var body struct {
+				StreamOptions map[string]any `json:"stream_options"`
+			}
+			if err := json.Unmarshal(got, &body); err != nil {
+				t.Fatalf("改写结果非法 JSON: %v (%s)", err, got)
+			}
+			if body.StreamOptions["include_usage"] != tt.wantInclude {
+				t.Fatalf("include_usage want %v, got %s", tt.wantInclude, got)
+			}
+			for k, v := range tt.wantOptions {
+				if body.StreamOptions[k] != v {
+					t.Fatalf("stream_options[%s] want %v, got %s", k, v, got)
+				}
+			}
+		})
+	}
+	// 无 stream_options 的注入路径：原有字段逐字节保留（仅末尾追加）。
+	in := []byte(`{"model":"m","stream":true}`)
+	out := ensureIncludeUsage(in, "openai-chat", EndpointChatCompletions)
+	if !strings.HasPrefix(string(out), `{"model":"m","stream":true,`) {
+		t.Fatalf("注入时不得改动既有字节, got %s", out)
 	}
 }
 

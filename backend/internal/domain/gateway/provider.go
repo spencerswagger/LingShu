@@ -8,8 +8,11 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 
 	"github.com/team/llmgateway/internal/domain/billing"
@@ -18,6 +21,59 @@ import (
 // ErrUsageMissing 表示上游响应缺失或无法解析 usage（AC-17 放宽：由调用方按可见内容估算计费）。
 // 计费恒不丢失；是否惩罚渠道按缺失原因区分（见 UsageMissing* 常量与 usageMissingPunishable）。
 var ErrUsageMissing = errors.New("upstream response missing usage")
+
+// errDownstreamWrite 标记「SSE 写回下游失败」。它不是上游故障：若按普通错误上抛，
+// handler 会当作上游读侧中断回喂渠道健康，把健康上游误判为故障（误杀熔断）。
+var errDownstreamWrite = errors.New("downstream write failed")
+
+// wrapDownstreamWrite 把下游写失败包装为可识别哨兵错误，同时保留原始错误供日志/诊断。
+func wrapDownstreamWrite(err error) error {
+	return fmt.Errorf("%w: %w", errDownstreamWrite, err)
+}
+
+// isDownstreamWriteErr 判定错误是否来自下游写失败，供 handler 区分「上游读侧中断」与「下游写失败」。
+func isDownstreamWriteErr(err error) bool {
+	return errors.Is(err, errDownstreamWrite)
+}
+
+// errorSummary 是各协议流内 error 帧的宽松结构：字段名跨协议兼容（type/message/code）。
+type errorSummary struct {
+	Type    string `json:"type"`
+	Message string `json:"message"`
+	Code    any    `json:"code"`
+}
+
+// errorFrameDetail 从流内 error 帧的 error 值原文提取可读摘要：字符串直接返回；
+// 对象优先 type、其次 code，再拼 message；空值返回空串（无 error 帧）。
+// OpenAI / Anthropic / Responses 的 error 负载形状相近，故三协议共用同一解析。
+func errorFrameDetail(raw json.RawMessage) string {
+	t := bytes.TrimSpace(raw)
+	if len(t) == 0 || string(t) == "null" {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(t, &s) == nil {
+		return s
+	}
+	var e errorSummary
+	if json.Unmarshal(t, &e) != nil {
+		return ""
+	}
+	prefix := e.Type
+	if prefix == "" {
+		if c, ok := e.Code.(string); ok {
+			prefix = c
+		}
+	}
+	switch {
+	case e.Message == "":
+		return prefix
+	case prefix == "":
+		return e.Message
+	default:
+		return prefix + ": " + e.Message
+	}
+}
 
 // 流式 usage 缺失的可区分原因：计费一律按可见内容估算，但渠道健康惩罚按原因区别对待。
 const (

@@ -1,8 +1,10 @@
 package gateway
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -105,9 +107,12 @@ func TestExtractUsage_Missing(t *testing.T) {
 // 且必须同时返回原始 JSON 供 call_log 记录上游原文。
 func TestParseStreamData_DeepSeekNative(t *testing.T) {
 	data := []byte(`{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120,"prompt_cache_hit_tokens":80}}`)
-	u, raw, ok := parseStreamData(data)
+	u, raw, ok, errDetail := parseStreamData(data)
 	if !ok {
 		t.Fatalf("应命中 usage")
+	}
+	if errDetail != "" {
+		t.Fatalf("非 error 帧不应产生 error 摘要, got %q", errDetail)
 	}
 	// Input = 100 − 80 = 20（纯输入）；CacheRead = 80；Output = 20。
 	if u.Input != 20 || u.CacheRead != 80 || u.Output != 20 {
@@ -115,6 +120,153 @@ func TestParseStreamData_DeepSeekNative(t *testing.T) {
 	}
 	if !strings.Contains(string(raw), `"prompt_cache_hit_tokens":80`) {
 		t.Fatalf("原始 usage 应保留顶层命中字段: %s", raw)
+	}
+}
+
+// 单帧同时携带 usage 与 error 时，两者都必须取自同一次解析（一次反序列化拿全信息）。
+func TestParseStreamDataErrorFrame(t *testing.T) {
+	u, raw, ok, errDetail := parseStreamData([]byte(
+		`{"choices":[],"error":{"type":"server_error","message":"boom"},"usage":{"prompt_tokens":7,"completion_tokens":3}}`))
+	if !ok || u.Input != 7 || u.Output != 3 {
+		t.Fatalf("同一帧的 usage 应照常解析: %+v ok=%v", u, ok)
+	}
+	if len(raw) == 0 {
+		t.Fatalf("应返回原始 usage 分片")
+	}
+	if errDetail != "server_error: boom" {
+		t.Fatalf("error 摘要 want %q, got %q", "server_error: boom", errDetail)
+	}
+	// error 为 null / 字符串形式的老上游：分别为「无 error 帧」与「字符串摘要」。
+	if _, _, _, d := parseStreamData([]byte(`{"error":null}`)); d != "" {
+		t.Fatalf("error=null 不应产生摘要, got %q", d)
+	}
+	if _, _, _, d := parseStreamData([]byte(`{"error":"plain failure"}`)); d != "plain failure" {
+		t.Fatalf("字符串 error 应原样作为摘要, got %q", d)
+	}
+}
+
+// sseResponse 把 SSE 文本包装为 HandleStream 期望的上游响应。
+func sseResponse(body string) *http.Response {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+}
+
+// 非 openai-chat 协议同样按流结束形态区分 usage 缺失原因：
+// 正常结束（message_stop / response.completed）不惩罚渠道；截断与流内 error 帧计入健康失败。
+func TestHandleStreamUsageMissingReason(t *testing.T) {
+	const anthropicStart = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\"}}\n\n"
+	const anthropicStop = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+	const responsesDelta = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n"
+
+	tests := []struct {
+		name       string
+		provider   Provider
+		body       string
+		wantReason string
+		wantPunish bool
+		wantDetail string
+	}{
+		{
+			name:     "anthropic 正常结束无 usage",
+			provider: NewAnthropicProvider(),
+			body:     anthropicStart + anthropicStop,
+			// 上游已按正常形态收尾，只是没给 usage（协议偏差），不惩罚渠道。
+			wantReason: UsageMissingDoneNoUsage,
+			wantPunish: false,
+		},
+		{
+			name:       "anthropic 截断",
+			provider:   NewAnthropicProvider(),
+			body:       anthropicStart,
+			wantReason: UsageMissingTruncated,
+			wantPunish: true,
+		},
+		{
+			name:     "anthropic error 事件",
+			provider: NewAnthropicProvider(),
+			body: anthropicStart +
+				"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"busy\"}}\n\n",
+			wantReason: UsageMissingErrorFrame,
+			wantPunish: true,
+			wantDetail: "overloaded_error: busy",
+		},
+		{
+			name:     "responses 正常结束无 usage",
+			provider: NewResponsesProvider(),
+			body: responsesDelta +
+				"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+			wantReason: UsageMissingDoneNoUsage,
+			wantPunish: false,
+		},
+		{
+			name:       "responses 截断",
+			provider:   NewResponsesProvider(),
+			body:       responsesDelta,
+			wantReason: UsageMissingTruncated,
+			wantPunish: true,
+		},
+		{
+			name:     "responses failed",
+			provider: NewResponsesProvider(),
+			body: "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_error\"," +
+				"\"message\":\"boom\"}}}\n\n",
+			wantReason: UsageMissingErrorFrame,
+			wantPunish: true,
+			wantDetail: "server_error: boom",
+		},
+		{
+			name:       "openai 正常结束无 usage",
+			provider:   NewOpenAIProvider(EndpointChatCompletions),
+			body:       "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n",
+			wantReason: UsageMissingDoneNoUsage,
+			wantPunish: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, _, err := tt.provider.HandleStream(context.Background(), sseResponse(tt.body), httptest.NewRecorder())
+			if !errors.Is(err, ErrUsageMissing) {
+				t.Fatalf("want ErrUsageMissing, got %v", err)
+			}
+			if got := usageMissingReason(err); got != tt.wantReason {
+				t.Fatalf("reason want %q, got %q", tt.wantReason, got)
+			}
+			if got := usageMissingPunishable(usageMissingReason(err)); got != tt.wantPunish {
+				t.Fatalf("punishable want %v, got %v", tt.wantPunish, got)
+			}
+			if tt.wantDetail != "" {
+				var ue *UsageMissingError
+				if !errors.As(err, &ue) || ue.Detail != tt.wantDetail {
+					t.Fatalf("detail want %q, got %+v", tt.wantDetail, ue)
+				}
+			}
+		})
+	}
+}
+
+// failWriteRecorder 包装 ResponseRecorder：响应头照常可写，但每次 Write 都失败（模拟下游断开）。
+type failWriteRecorder struct {
+	*httptest.ResponseRecorder
+}
+
+func (w failWriteRecorder) Write([]byte) (int, error) { return 0, errors.New("downstream gone") }
+
+func (w failWriteRecorder) Flush() {}
+
+// 下游写失败必须被标记为 errDownstreamWrite：handler 据此区分「上游读侧中断」与「下游写失败」。
+func TestHandleStreamDownstreamWriteSentinel(t *testing.T) {
+	const body = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"
+	for _, p := range []Provider{
+		NewOpenAIProvider(EndpointChatCompletions), NewAnthropicProvider(), NewResponsesProvider(),
+	} {
+		_, _, _, err := p.HandleStream(context.Background(), sseResponse(body),
+			failWriteRecorder{httptest.NewRecorder()})
+		if !isDownstreamWriteErr(err) {
+			t.Fatalf("%s 下游写失败应可识别为下游错误, got %v", p.Name(), err)
+		}
 	}
 }
 
