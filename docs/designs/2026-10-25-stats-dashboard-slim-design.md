@@ -1,53 +1,61 @@
-# 统计页瘦身 + 首屏动静分区（设计说明）
+# 统计页改版（对齐定稿 demo）· 设计说明
 
-- 日期：2026-10-25
-- 范围：前端 `frontend/src/views/StatsDashboard.vue`（admin `/admin/dashboard` 与 dev `/dev/dashboard` 共用组件）
-- 需求来源：spencer 反馈「统计页分运维概览 / 用量分析两块，运维用不上（大家看状态页）；首屏百分比指标糊在一起；按天趋势看不出东西」
-- 本轮边界：只做「删运维块 + 首屏动静分区」；按小时聚合需后端 `billing/stats.go` 增小时粒度，接口就绪后再做
+- 日期：2026-10-25（v2，方案经 spencer 确认后重写；v1 为"删运维块 + 首屏两段式"）
+- 范围：前端 `frontend/src/views/StatsDashboard.vue`（admin `/admin/dashboard` 与 dev `/dev/dashboard` 共用）
+- 视觉基准：`https://lingshu-preview.pages.dev/stats-demo-pc`（PC）、`https://lingshu-preview.pages.dev/stats-demo`（移动）
+- 本轮边界：**只做前端布局与组件结构**，不接后端新接口，不改统计口径，不动状态页，不引入新依赖
 
-## 1. 删除「运维概览」整块
+## 1. 页面结构（自上而下）
 
-移除内容（管理端 `isAdmin` 块整体删除）：
+```
+工具栏    统计范围（近 24h / 7 / 30 / 90 天 / 自定义）+ 刷新 + 「每 30s 自动刷新」
+① 大数字  总 Token（窗口=统计范围） / 总消费积分（窗口=统计范围） / 吞吐量（窗口=近 1 分钟）
+② 小指标  总请求数 / 成功率 / 平均耗时 / 请求中会话 / 请求中用户
+③ 图 1    用量趋势：今天 / 昨天 / 前天 / 大前天 四线，按小时，缺数据断线
+③ 图 2    模型广场：Token 消耗 / 吞吐量 / 请求·失败 / 首字·全程，排序 + 复制 + 空模型折叠
+④ 实时区  我的会话（上下文 / 本轮 / 吞吐 / 已花 + 曲线） + 在线用户（仅管理端，吞吐 / 消耗 + 曲线）
+⑤ 更多维度 默认收起：Token 构成 / Top 渠道密钥 / 计费模式 / Top 用户（旧版用量分析里仍有数据支撑的部分）
+⑥ 最近公告（沿用）
+```
 
-| 区块 | 数据来源 | 处理 |
+层级原则：大数字 > 小指标 > 两张图 > 实时区 > 收起的历史维度；「运维概览」块（渠道密钥/模型计数/成功率趋势/耗时分布/吞吐量趋势）维持删除，不做任何成本/毛利内容。
+
+## 2. 三处吞吐量窗口（刻意区分，不混用同一个词）
+
+| 位置 | 窗口标签 | 数据现状 |
 |---|---|---|
-| 渠道密钥 / 对外模型 / 渠道内部模型 计数卡 | `Ops.Keys`、`Ops.Models` | 删除 |
-| 成功率趋势图 | `Usage.Daily[].SuccessRate` | 删除 |
-| 耗时分布图（P50/P90/P95 副标） | `Usage.Latency` + `Usage.P50MS/P90MS/P95MS` | 删除 |
-| 吞吐量趋势图（Token 柱 + 请求数线） | `Usage.Daily` | 删除 |
-| 错误 Top 表 | `Usage.Errors` | 随块删除（见下"取舍"） |
+| 首屏吞吐量大数字 | 近 1 分钟 | 现有 `KPI.TPM`（区间忙时折算），tooltip 说明实时窗口待接口 |
+| 模型广场吞吐列 | 近 10 分钟 | **无接口**，显示 `--` |
+| 实时会话/在线用户吞吐 | 近 60 分钟 | **无接口**，显示 `--` |
 
-连带清理：`ops` / `opsCounts` / `successOption` / `latencyOption` / `throughputOption` 计算属性，`KpiCard.tipTarget` 字段，图标 import（`Cpu` / `Key` / `PieChart` / `Timer` / `TrendCharts` / `CircleCheckFilled`），色板里失效的 `C.success / C.warning / C.danger`，以及 `.section-bar--ops`、`.ops-count-*`、`.ops-dot`、`.block-note`、`.inline-switch` 等样式。
+## 3. 占位纪律
 
-**取舍说明**：`错误 Top` 表虽然读的是 `Usage.Errors`（用量数据），但它位于「运维概览」块内，按"整块移除"处理；失败次数仍体现在「总请求数」卡片副标。若产品/运维仍需要按错误信息看 Top，可在「用量分析」里单开一张卡（本轮不做，避免改动用量分析既有内容）。
+无接口的指标一律 `--` 或骨架（灰虚线曲线、灰点），并在卡片内给出「待接口」说明；**不写死假数据**。涉及：
 
-**未动**：`frontend/src/api/stats.ts` 的类型定义（`StatsOps` 等）保持原样——后端仍在返回 `Ops` 字段，接口契约与统计口径不变，前端只是不再渲染。
+- 24h 小时趋势的四条线（series 全 `null`，只画坐标轴与图例，`connectNulls:false` 保证真实数据到位后缺数据处自动断线）
+- 模型广场「吞吐量」「首字 / 全程」两行，以及吞吐/首字/全程三个排序按钮（置灰 + tooltip）
+- 小指标「请求中会话 / 请求中用户」
+- 实时会话区的会话行与在线用户行（骨架 + 「数据待接入」）
 
-## 2. 首屏动静分区
+## 4. 30s 定时刷新框架
 
-```
-① lead-grid   静态总量（主视觉）  总 Token / 总消费积分 / 总请求数
-              大数字 30px + 迷你趋势线 + 环比 delta，不随粒度变化
-② mini-strip  次级小指标（弱化）  缓存命中率 / 成功率 / 平均耗时 / 吞吐量(TPM·RPM)
-              16px 单行内联，无图标无趋势线，口径说明走 tooltip
-③ 用量分析    动态图表区（原样保留）趋势 / Token 构成 / Top 模型 / Top 渠道密钥 / 计费模式 / Top 用户
-```
+- 定时器只在 `onMounted` 建一次、`onUnmounted` 清理；回调 `loadRealtime()` 内**不读写** `preset` / `customRange` / `data`，因此筛选条件变化不会重置筛选，定时触发也不会覆盖用户选择。
+- `liveSessions` / `liveUsers` 本轮恒为空集合，模板走骨架分支；接口就绪后只需在 `loadRealtime()` 里填这两个 ref，模板与筛选逻辑都不用改。
+- 预留 DTO：`LiveSessionDTO`（ID/Name/ContextUsed/ContextLimit/RoundTokens/TPM/SpentCredits/Spark）、`LiveUserDTO`（ID/Name/TPM/Tokens/Spark）。
 
-- 视觉分层：`lead-card` 有卡片 + 左侧色条 + sparkline；`mini-strip` 只有上下细线分隔的裸文字指标，刻意不与总量抢主位。
-- 响应式：`lead-grid` 用 `auto-fit minmax(260px,1fr)`（宽屏三列、窄屏自动折行）；`mini-strip` < 1000px 竖排。
-- 数据口径零改动：`leadCards` / `miniMetrics` 只是把原 `kpiCards` 的 7 张卡拆成两组，取数表达式与原实现逐项一致（含吞吐量忙时口径 `BusyRequests` / `SumDurationMS` 就绪判定与"样本较少"灰字）。
+## 5. 与定稿 demo 的已知差异
 
-## 3. 趋势图聚合粒度占位
+| 项 | demo | 实现 | 原因 |
+|---|---|---|---|
+| 总消费积分副标 | 今日 / 本月 | 日均 | 后端无「今日/本月」聚合，不编造 |
+| 大数字窗口标签 | 固定「近 24h」 | 跟随筛选范围（24h/7/30/90） | 数字本身随范围变化，标签必须同步 |
+| 趋势图 x 轴 | 有模拟曲线 | 空曲线 + 占位说明 | 小时粒度无接口 |
+| 模型广场 4 卡片 | 含 1 个空闲模型 + "另有 2 个已折叠" | 默认只列活跃（有请求）模型，空闲折叠可展开 | 同一交互语义，规则更确定 |
+| 在线用户 | admin 可见 | 同样仅 admin（`isAdmin`） | dev 端不应看到他人数据 |
+| 缓存命中率 | 无 | 移除 | 定稿小指标行固定 5 项 |
 
-「用量趋势」标题右侧新增 `按天 / 近 24 小时` 切换，整组 `disabled` + tooltip「按小时聚合待后端接口就绪后开放，当前为按天聚合」。
-
-本轮**只渲染按天数据**，`granularity` 仅供占位（`'day' | 'hour'`）。后端小时聚合就绪后，接线点集中在两处：
-
-1. `load()` 里按 `granularity` 追加查询参数（建议 `Granularity=hour` 之类可选参数，缺省按天，保证向后兼容）；
-2. `trendOption` 的 x 轴 label 走 `Date.slice(5)`，小时粒度需要改成 `HH:00` 或 `MM-DD HH:00`（按后端返回的 `Date` 格式确定）。
-
-## 4. 验收口径
+## 6. 验收口径
 
 - `npx vue-tsc --noEmit` 零错、`npm run build` 通过。
-- admin 统计页仅剩「首屏两段 + 用量分析 + 最近公告」；dev 端行为不变（本来就没有运维块，`Top 用户` 依旧仅管理端）。
-- 状态页 `ServiceStatus.vue` 未改动。
+- 状态页 `ServiceStatus.vue`、后端 Go 代码、接口契约均未改动。
+- 沙盒内无后端（8090 无服务）也无 docker，无法起联调环境截图；首屏视觉需 Gate 在演示环境核对。
