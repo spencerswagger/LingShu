@@ -253,6 +253,27 @@ func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Respon
 				if len(payload) > 0 && bytes.Equal(payload, []byte("[DONE]")) {
 					sawDone = true
 				} else if len(payload) > 0 {
+					// error 帧探测必须放在解码前：畸形 JSON 的 error 帧会让 DecodeStreamEvents 失败并被丢弃，
+					// 若探测留在解码成功分支内，随后的 [DONE] 会把失败洗成 done_no_usage（丢失渠道惩罚）。
+					// 两个探测函数自带字节预筛，绝大多数正常帧在预筛阶段即返回，成本可忽略。
+					if upstreamResponses {
+						if failed, detail := responsesFailedFrame(payload); failed {
+							// 只要出现 response.failed 就置位；error 负载为空不影响失败判定。
+							sawError = true
+							// 摘要首个非空优先：后续空负载不得清掉先前的诊断信息。
+							if detail != "" && errorFrame == "" {
+								errorFrame = detail
+							}
+						}
+					} else if upstreamChat {
+						if failed, detail := openAIChatErrorFrame(payload); failed {
+							// 顶层 error 键存在且非 null 即为失败帧，{"error":{}} 摘要为空也须置位。
+							sawError = true
+							if detail != "" && errorFrame == "" {
+								errorFrame = detail
+							}
+						}
+					}
 					evs, _, derr := protocolconv.DecodeStreamEvents(upstreamProto, payload)
 					if derr != nil {
 						// 上游畸形帧不得静默丢弃：记入本次损耗诊断（随调用日志决策轨迹落痕）并告警，
@@ -281,24 +302,6 @@ func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Respon
 								}
 							}
 							accumulateConvertedAssistant(&content, &reasoning, toolCalls, &toolOrder, ev)
-						}
-						if upstreamResponses {
-							if failed, detail := responsesFailedFrame(payload); failed {
-								// 只要出现 response.failed 就置位；error 负载为空不影响失败判定。
-								sawError = true
-								// 摘要首个非空优先：后续空负载不得清掉先前的诊断信息。
-								if detail != "" && errorFrame == "" {
-									errorFrame = detail
-								}
-							}
-						} else if upstreamChat {
-							if failed, detail := openAIChatErrorFrame(payload); failed {
-								// 顶层 error 键存在且非 null 即为失败帧，{"error":{}} 摘要为空也须置位。
-								sawError = true
-								if detail != "" && errorFrame == "" {
-									errorFrame = detail
-								}
-							}
 						}
 						if carriedUsage {
 							if part := streamUsagePart(upstreamProto, payload); len(part) > 0 {
@@ -352,6 +355,7 @@ func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Respon
 // 返回「是否出现该失败帧」与错误摘要。该事件在解码器中没有对应规范事件（视为空事件），
 // 故必须按原文探测；只要帧类型为 response.failed 即为 true，error 负载为空（{} / 缺失）也置位，
 // 摘要则可能为空串。调用方据此置 sawError，不能依赖摘要是否为空。
+// 帧被上游截断成畸形 JSON 时退化为首键形状判定（见 leadingJSONField），避免漏检。
 func responsesFailedFrame(payload []byte) (bool, string) {
 	// 先按字节探测：绝大多数帧不是 response.failed，避免为每帧多做一次反序列化。
 	if !bytes.Contains(payload, []byte("response.failed")) {
@@ -364,7 +368,12 @@ func responsesFailedFrame(payload []byte) (bool, string) {
 			Error json.RawMessage `json:"error"`
 		} `json:"response"`
 	}
-	if json.Unmarshal(payload, &probe) != nil || probe.Type != "response.failed" {
+	if err := json.Unmarshal(payload, &probe); err != nil {
+		// 上游可能把失败帧截断成畸形 JSON，此时解码必然失败、摘要也无从解析；
+		// 若直接放弃，「error 帧 + [DONE]」会被收口成 done_no_usage。故退化为首键形状判定。
+		return leadingResponsesFailed(payload), ""
+	}
+	if probe.Type != "response.failed" {
 		return false, ""
 	}
 	if d := errorFrameDetail(probe.Response.Error); d != "" {
@@ -377,7 +386,7 @@ func responsesFailedFrame(payload []byte) (bool, string) {
 // openai-chat codec 的 DecodeEvent 没有 error 分支，该帧会解码为空事件，若不在此按原文探测，
 // 随后的 [DONE] 就会把失败归因成 done_no_usage（不惩罚渠道、调用日志记 completed）。
 // 判定只看顶层 error 键是否存在且非 null：{"error":{}} 也算失败帧，此时摘要为空串，
-// 调用方不得用摘要是否为空反推失败。
+// 调用方不得用摘要是否为空反推失败。帧被截断成畸形 JSON 时同样按首键形状识别，避免漏检。
 func openAIChatErrorFrame(payload []byte) (bool, string) {
 	// 先按字节预筛：绝大多数正常帧不含 error 键，避免为每帧多做一次反序列化。
 	if !bytes.Contains(payload, []byte("\"error\"")) {
@@ -386,11 +395,47 @@ func openAIChatErrorFrame(payload []byte) (bool, string) {
 	var probe struct {
 		Error json.RawMessage `json:"error"`
 	}
+	if err := json.Unmarshal(payload, &probe); err != nil {
+		// 同 responsesFailedFrame：截断的 error 帧解码必失败，按首键形状兜底识别，
+		// 否则失败会被随后的 [DONE] 洗成 done_no_usage（不惩罚渠道）。
+		key, _ := leadingJSONField(payload)
+		return bytes.Equal(key, []byte("error")), ""
+	}
 	// isNullRaw 同时覆盖「键缺失」（RawMessage 为 nil）与显式 null。
-	if json.Unmarshal(payload, &probe) != nil || isNullRaw(probe.Error) {
+	if isNullRaw(probe.Error) {
 		return false, ""
 	}
 	return true, errorFrameDetail(probe.Error)
+}
+
+// leadingJSONField 从（可能被上游截断的）帧首部取出「首个顶层键」及紧随其后的原始值片段。
+// 畸形帧无法整体反序列化，但首部形状仍足以判明帧类型；只认首个顶层键，
+// 避免正文（如 content 文本）里出现的同名字面量造成误判。
+func leadingJSONField(payload []byte) (key, value []byte) {
+	s := bytes.TrimSpace(payload)
+	if len(s) < 2 || s[0] != '{' {
+		return nil, nil
+	}
+	s = bytes.TrimSpace(s[1:])
+	if len(s) == 0 || s[0] != '"' {
+		return nil, nil
+	}
+	end := bytes.IndexByte(s[1:], '"')
+	if end < 0 {
+		return nil, nil
+	}
+	key = s[1 : 1+end]
+	s = bytes.TrimSpace(s[1+end+1:])
+	if len(s) == 0 || s[0] != ':' {
+		return nil, nil
+	}
+	return key, bytes.TrimSpace(s[1:])
+}
+
+// leadingResponsesFailed 判断畸形帧的首个顶层键 type 取值是否为 response.failed。
+func leadingResponsesFailed(payload []byte) bool {
+	key, val := leadingJSONField(payload)
+	return bytes.Equal(key, []byte("type")) && bytes.HasPrefix(val, []byte(`"response.failed"`))
 }
 
 // channelEvent 是 protocolconv.CanonicalEvent 的别名，便于在泵内构造事件字面量。

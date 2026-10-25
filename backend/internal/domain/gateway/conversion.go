@@ -160,7 +160,8 @@ func conversionAttemptFields(plan convPlan, rep *protocolconv.LossyReport) map[s
 
 // callLogDecisionConv 在 callLogDecision 基础上，将转换上下文/损耗并入「当前候选」的时间线条目
 // （即决策轨迹最后一项），使 call_logs 能看到该候选的入站→上游协议与丢失项。
-// 纯直通（converted=false）时不改动任何内容，输出与 callLogDecision 完全一致。
+// 未发生直通重排且未转换（reorder 为空、converted=false）时不改动任何内容，
+// 输出与 callLogDecision 完全一致；发生过重排的直通候选仍会并入 passthrough_* 标记。
 func (g *Gateway) callLogDecisionConv(attempts []map[string]any, result string, pc preCharge,
 	cur *router.RouteResult, conv convPlan, lossy *protocolconv.LossyReport) map[string]any {
 	dec := g.callLogDecision(attempts, result, pc, cur)

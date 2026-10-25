@@ -587,8 +587,8 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 		chName, keyName := g.channelAndKeyNames(cr.ChannelID, cr.ChannelKeyID)
 		// out 在下方转发阶段赋值；此处提前声明，使轨迹项可并入流式失败诊断（streamDiag）。
 		var out *fwdOutcome
-		// 协议转换上下文（Step 7/9）：默认为直通（converted=false → 不新增任何轨迹字段）；
-		// 解析出上游协议后按实际转换情况更新，供 attempt/skip 与调用日志决策轨迹落痕。
+		// 协议转换上下文（Step 7/9）：默认按直通且未重排初始化（converted=false、reorder 由路由实际标记决定，
+		// 两者皆空时才不新增轨迹字段）；解析出上游协议后按实际转换情况更新，供 attempt/skip 与调用日志决策轨迹落痕。
 		plan := convPlan{inbound: baseProtocol, upstream: baseProtocol, reorder: reorderMark(cr)}
 		var convLossy *protocolconv.LossyReport
 		attempt := func(reason string) map[string]any {
@@ -605,7 +605,7 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 				"cost_known":       cr.CostKnown,
 				"route_time_coeff": cr.TimeCoeff,
 			}
-			// 协议转换字段（仅转换候选新增；直通候选键集不变）。
+			// 协议转换/重排字段（仅转换或发生直通重排的候选新增；两者皆无时键集不变）。
 			for k, v := range conversionAttemptFields(plan, convLossy) {
 				m[k] = v
 			}
@@ -690,7 +690,7 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 			sawUnsupported = true
 			continue
 		}
-		// 记录本次候选的转换上下文（供轨迹/调用日志落痕；直通时不新增任何字段）。
+		// 记录本次候选的转换上下文（供轨迹/调用日志落痕；未转换且未发生直通重排时不新增任何字段）。
 		plan.inbound, plan.upstream, plan.converted = baseProtocol, upstreamProto, converted
 		routeRes := &router.RouteResult{ChannelID: cr.ChannelID, ChannelKeyID: cr.ChannelKeyID, InternalModelID: cr.InternalModelID,
 			ModelRowID: cr.ModelRowID, ExternalModelID: cr.ExternalModelID, AutoModelName: autoName, Revision: cr.Revision,
@@ -1132,7 +1132,8 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 	ctx := r.Context()
 	stage := "non_stream"        // 日志用：失败发生的转发阶段
 	attempt := len(attempts) + 1 // 当前候选序号（候选总数由请求级 outcome 日志给出）
-	// dec 组装调用日志决策轨迹，并并入本次候选的协议转换上下文（直通时与 callLogDecision 完全一致）。
+	// dec 组装调用日志决策轨迹，并并入本次候选的协议转换上下文
+	// （未转换且未发生直通重排时与 callLogDecision 完全一致）。
 	dec := func(reason string) map[string]any {
 		return g.callLogDecisionConv(attempts, reason, pc, routeRes, conv, lossy)
 	}

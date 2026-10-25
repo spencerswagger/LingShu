@@ -490,6 +490,13 @@ func TestStreamConversionErrorFrameOpenAIChatUpstream(t *testing.T) {
 			wantDetail: "server_error: boom",
 		},
 		{
+			// 修复前：探测留在解码成功分支内，畸形 error 帧被记为损耗后丢弃，[DONE] 归因 done_no_usage → 不惩罚渠道（红）。
+			// 截断帧解不出摘要，Detail 为空，但失败归因必须仍是 error_frame。
+			name:       "畸形 JSON error 后补 [DONE]",
+			sse:        "data: {\"error\":{\"type\":\n\ndata: [DONE]\n\n",
+			wantDetail: "",
+		},
+		{
 			// 修复前：空 error 负载摘要为空，同样被 [DONE] 洗成 done_no_usage（红）。
 			name:       "空 error 后补 [DONE]",
 			sse:        "data: {\"error\":{}}\n\ndata: [DONE]\n\n",
@@ -540,6 +547,7 @@ func TestStreamConversionErrorFrameOpenAIChatUpstream(t *testing.T) {
 			if rec.Code != http.StatusOK {
 				t.Fatalf("want 200 (stream already responded), got %d", rec.Code)
 			}
+			// 下游 body 为空是既有行为（泵不合成下游 error 事件，属后续特性），本 PR 只保证计费/健康/日志口径。
 			if len(h.chans.feeds) != 1 || h.chans.feeds[0].fb.IsSuccess {
 				t.Fatalf("error_frame 应计入渠道健康失败, got %+v", h.chans.feeds)
 			}

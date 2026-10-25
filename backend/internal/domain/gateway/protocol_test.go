@@ -288,6 +288,14 @@ func TestHandleStreamErrorFrameKeepsFirstDetail(t *testing.T) {
 				"event: error\ndata: {\"type\":\"error\",\"error\":{}}\n\n",
 			wantDetail: "overloaded_error: busy",
 		},
+		{
+			// 直通 openai-chat：修复前后出现的非空摘要会覆盖前者，本用例即红。
+			name:     "openai-chat 连续 error",
+			provider: NewOpenAIProvider(EndpointChatCompletions),
+			body: "data: {\"error\":{\"type\":\"server_error\",\"message\":\"boom\"}}\n\n" +
+				"data: {\"error\":{\"type\":\"rate_limit_error\",\"message\":\"slow down\"}}\n\n",
+			wantDetail: "server_error: boom",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

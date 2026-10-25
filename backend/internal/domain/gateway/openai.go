@@ -187,7 +187,9 @@ func (p *OpenAIProvider) HandleStream(ctx context.Context, upstream *http.Respon
 					if hasError {
 						// 以「error 键存在且非 null」置位，空负载（{"error":{}}）同样算失败帧。
 						sawError = true
-						if errDetail != "" {
+						// 摘要首个非空优先：后续 error 帧（尤其空负载）不得覆盖先前的诊断信息，
+						// 与 responses/anthropic 及转换泵的口径保持一致。
+						if errDetail != "" && errorFrame == "" {
 							errorFrame = errDetail
 						}
 					}
