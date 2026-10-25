@@ -186,6 +186,9 @@ const kpiCards = computed<KpiCard[]>(() => {
   const cacheRead = data.value?.Usage.Total.CacheRead ?? 0
   const totalInput = totalIn + cacheRead
   const cacheHit = totalInput > 0 ? cacheRead / totalInput : 0
+  // 吞吐量（RPM/TPM）为忙时口径，后端已按「有耗时请求的处理时长之和」折算；
+  // 样本不足（请求数 < 20 或总耗时 < 30 秒）时该格不出数，避免小样本被放大成异常速率。
+  const throughputReady = !!k && k.TotalRequests >= 20 && (k.SumDurationMS ?? 0) >= 30000
   return [
     {
       label: '总 Token',
@@ -240,9 +243,9 @@ const kpiCards = computed<KpiCard[]>(() => {
     },
     {
       label: '吞吐量',
-      value: k ? `${fmtCompact(k.TPM)} TPM` : '-',
-      sub: `平均 ${k ? k.RPM.toFixed(2) : '-'} RPM`,
-      tip: '统计区间内的每分钟平均值',
+      value: throughputReady ? `${fmtCompact(k?.TPM ?? 0)} TPM` : '—',
+      sub: throughputReady ? `平均 ${(k?.RPM ?? 0).toFixed(2)} RPM` : '样本不足',
+      tip: '忙时口径：按有耗时请求的处理时长折算的每分钟速率；请求数 < 20 或总耗时 < 30 秒不计',
       tone: 'primary',
       icon: TrendCharts,
     },

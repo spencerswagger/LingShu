@@ -47,6 +47,10 @@ const stats = ref<BillingStats>({
   DurationTotalMS: 0,
   InputTokens: 0,
   CacheReadTokens: 0,
+  BusyRequests: 0,
+  BusyTokens: 0,
+  BusyRPM: 0,
+  BusyTPM: 0,
 })
 
 // ===== 列头筛选选项数据 =====
@@ -370,16 +374,19 @@ function tokenRate(row: AdminBillingItem): string {
   return `${Math.round((out / gen) * 1000)} tok/s`
 }
 
-// 统计栏：平均 RPM = 请求数 / 总耗时(分钟)；平均 TPM = 总 token / 总耗时(分钟)
+// 统计栏：平均 RPM/TPM 采用后端忙时口径（分子只算有耗时的请求，分母是这批请求的耗时之和）。
+// 本批请求里没有带耗时的样本（BusyRequests=0）或耗时合计为 0 时不出数，显示 —。
+function busyRateReady(): boolean {
+  const s = stats.value
+  return (s.BusyRequests || 0) > 0 && (s.DurationTotalMS || 0) > 0
+}
 function avgRPM(): string {
-  const min = (stats.value.DurationTotalMS || 0) / 60000
-  if (!stats.value.Requests || min <= 0) return '-'
-  return (stats.value.Requests / min).toFixed(1)
+  if (!busyRateReady()) return '—'
+  return (stats.value.BusyRPM || 0).toFixed(1)
 }
 function avgTPM(): string {
-  const min = (stats.value.DurationTotalMS || 0) / 60000
-  if (!stats.value.TokensTotal || min <= 0) return '-'
-  return Math.round(stats.value.TokensTotal / min).toLocaleString()
+  if (!busyRateReady()) return '—'
+  return Math.round(stats.value.BusyTPM || 0).toLocaleString()
 }
 const creditsTotal = computed(() => stats.value.CreditsTotal.toLocaleString(undefined, { maximumFractionDigits: 4 }))
 const tokensTotal = computed(() => stats.value.TokensTotal.toLocaleString())
