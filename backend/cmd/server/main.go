@@ -532,7 +532,7 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	// 会话成本决策产物经 asyncwrite 落库（Key=session_id 保序、IdempotencyKey=session_id:轮次 幂等），
 	// WAL 复用 data/asyncwrite.wal（与其余类别同源，由上 asyncWriter 统一承接）。
 	// 同时把每条事件的执行体（persist 回调）接到有界进程内存储 sessionCostEventStore，
-	// 供控制台「会话成本路由」面板 /events、/distribution 读取（单实例假设，不引入 Redis/同步往返）。
+	// 供决策事件流在进程内留痕与后续复用（单实例假设，不引入 Redis/同步往返）。
 	sessionCostEventStore := router.NewSessionCostEventStore(0)
 	routerEngine.SetCostEventSink(router.NewAsyncCostEventSink(asyncWriter, sessionCostEventStore))
 
@@ -558,8 +558,6 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	consoleAdmin.SetModelSource(modelSvc)
 	// 成本曲线积分换算系数 R 来源（billing.ConfigProvider 满足，含 R() 方法）：曲线 Σ(token×费率) ÷ R 得积分。
 	consoleAdmin.SetCostRProvider(billCfgProvider)
-	// 会话成本路由面板数据源：决策事件流走进程内落地存储（与 sink persist 回调同源）。
-	consoleAdmin.SetSessionCostEventStore(sessionCostEventStore)
 	consoleDev.SetCallLogStore(callLogStore)
 
 	// sync
