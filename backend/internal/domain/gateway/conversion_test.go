@@ -400,6 +400,23 @@ func TestStreamConversionErrorFrame(t *testing.T) {
 				"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"busy\"}}\n\n",
 			wantDetail: "busy",
 		},
+		{
+			// 修复前：sawError 与 sawDone 同时为真，归因优先取 done_no_usage → 不惩罚渠道（红）。
+			name:          "openai-responses response.failed 后补 [DONE]",
+			upstreamProto: channelprotocol.ProtocolOpenAIResponses,
+			sse: "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_error\"," +
+				"\"message\":\"boom\"}}}\n\ndata: [DONE]\n\n",
+			wantDetail: "server_error: boom",
+		},
+		{
+			// 修复前：空 error 负载使 responsesFailedFrame 返回空串 → sawError 不置位，
+			// 再由 [DONE] 归因 done_no_usage → 不惩罚渠道（红）。
+			name:          "openai-responses response.failed 空 error 后补 [DONE]",
+			upstreamProto: channelprotocol.ProtocolOpenAIResponses,
+			sse: "data: {\"type\":\"response.failed\",\"response\":{\"error\":{}}}\n\n" +
+				"data: [DONE]\n\n",
+			wantDetail: "",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

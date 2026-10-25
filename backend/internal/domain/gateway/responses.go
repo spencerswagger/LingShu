@@ -126,12 +126,10 @@ func (p *ResponsesProvider) HandleStream(ctx context.Context, upstream *http.Res
 			if bytes.HasPrefix(trimmed, []byte("data:")) {
 				data := bytes.TrimSpace(trimmed[len("data:"):])
 				if len(data) > 0 && bytes.Equal(data, []byte("[DONE]")) {
-					// 部分 Responses 兼容上游仍以 [DONE] 收尾：与转换泵口径一致视为正常结束。
-					// 但上游可能先报 response.failed 再补 [DONE]；此时 [DONE] 只是收口，
-					// 不能把失败洗成「正常结束无 usage」，否则渠道健康惩罚会丢失。
-					if !sawError {
-						sawDone = true
-					}
+					// 部分 Responses 兼容上游仍以 [DONE] 收尾：无条件视为终止标记。
+					// 若此前出现过 response.failed，归因由 usageMissingReasonOf 的
+					// error_frame > done_no_usage 优先级裁决，不会被收口标记洗成正常结束。
+					sawDone = true
 				} else if len(data) > 0 {
 					var ev responsesStreamEvent
 					if json.Unmarshal(data, &ev) == nil {

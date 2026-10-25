@@ -107,12 +107,12 @@ func TestExtractUsage_Missing(t *testing.T) {
 // 且必须同时返回原始 JSON 供 call_log 记录上游原文。
 func TestParseStreamData_DeepSeekNative(t *testing.T) {
 	data := []byte(`{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120,"prompt_cache_hit_tokens":80}}`)
-	u, raw, ok, errDetail := parseStreamData(data)
+	u, raw, ok, hasErr, errDetail := parseStreamData(data)
 	if !ok {
 		t.Fatalf("应命中 usage")
 	}
-	if errDetail != "" {
-		t.Fatalf("非 error 帧不应产生 error 摘要, got %q", errDetail)
+	if hasErr || errDetail != "" {
+		t.Fatalf("非 error 帧不应置位或产生摘要, got hasErr=%v detail=%q", hasErr, errDetail)
 	}
 	// Input = 100 − 80 = 20（纯输入）；CacheRead = 80；Output = 20。
 	if u.Input != 20 || u.CacheRead != 80 || u.Output != 20 {
@@ -125,7 +125,7 @@ func TestParseStreamData_DeepSeekNative(t *testing.T) {
 
 // 单帧同时携带 usage 与 error 时，两者都必须取自同一次解析（一次反序列化拿全信息）。
 func TestParseStreamDataErrorFrame(t *testing.T) {
-	u, raw, ok, errDetail := parseStreamData([]byte(
+	u, raw, ok, hasErr, errDetail := parseStreamData([]byte(
 		`{"choices":[],"error":{"type":"server_error","message":"boom"},"usage":{"prompt_tokens":7,"completion_tokens":3}}`))
 	if !ok || u.Input != 7 || u.Output != 3 {
 		t.Fatalf("同一帧的 usage 应照常解析: %+v ok=%v", u, ok)
@@ -133,15 +133,20 @@ func TestParseStreamDataErrorFrame(t *testing.T) {
 	if len(raw) == 0 {
 		t.Fatalf("应返回原始 usage 分片")
 	}
-	if errDetail != "server_error: boom" {
-		t.Fatalf("error 摘要 want %q, got %q", "server_error: boom", errDetail)
+	if !hasErr || errDetail != "server_error: boom" {
+		t.Fatalf("error 帧应置位且摘要 want %q, got hasErr=%v detail=%q", "server_error: boom", hasErr, errDetail)
 	}
 	// error 为 null / 字符串形式的老上游：分别为「无 error 帧」与「字符串摘要」。
-	if _, _, _, d := parseStreamData([]byte(`{"error":null}`)); d != "" {
-		t.Fatalf("error=null 不应产生摘要, got %q", d)
+	if _, _, _, hasErr, d := parseStreamData([]byte(`{"error":null}`)); hasErr || d != "" {
+		t.Fatalf("error=null 不应置位或产生摘要, got hasErr=%v detail=%q", hasErr, d)
 	}
-	if _, _, _, d := parseStreamData([]byte(`{"error":"plain failure"}`)); d != "plain failure" {
-		t.Fatalf("字符串 error 应原样作为摘要, got %q", d)
+	if _, _, _, hasErr, d := parseStreamData([]byte(`{"error":"plain failure"}`)); !hasErr || d != "plain failure" {
+		t.Fatalf("字符串 error 应置位并原样作为摘要, got hasErr=%v detail=%q", hasErr, d)
+	}
+	// 空对象负载：摘要为空但仍是 error 帧（HandleStream 依赖该布尔置 sawError，
+	// 否则 {"error":{}} 会被 [DONE] 洗成 done_no_usage，修复前即红）。
+	if _, _, _, hasErr, d := parseStreamData([]byte(`{"error":{}}`)); !hasErr || d != "" {
+		t.Fatalf("空 error 对象应置位且摘要为空, got hasErr=%v detail=%q", hasErr, d)
 	}
 }
 

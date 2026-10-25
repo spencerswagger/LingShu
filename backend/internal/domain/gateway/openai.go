@@ -183,10 +183,13 @@ func (p *OpenAIProvider) HandleStream(ctx context.Context, upstream *http.Respon
 				if len(data) > 0 && bytes.Equal(data, []byte("[DONE]")) {
 					sawDone = true
 				} else if len(data) > 0 {
-					u, raw, has, errDetail := parseStreamData(data)
-					if errDetail != "" {
+					u, raw, has, hasError, errDetail := parseStreamData(data)
+					if hasError {
+						// 以「error 键存在且非 null」置位，空负载（{"error":{}}）同样算失败帧。
 						sawError = true
-						errorFrame = errDetail
+						if errDetail != "" {
+							errorFrame = errDetail
+						}
 					}
 					if has {
 						usage = u
@@ -224,8 +227,9 @@ func (p *OpenAIProvider) HandleStream(ctx context.Context, upstream *http.Respon
 // （注入可能被上游按未知参数拒绝），非 OpenAI 兼容协议同样不改写；解析失败时按原样返回。
 //
 // 取舍：判定「include_usage 已为 true」必须确认它是顶层 stream_options 的直接子键。
-// 字节级启发式无法可靠区分顶层与嵌套（正文/其它键里的同名字面量），宁可每个流式请求
-// 多花一次 json.Unmarshal，也不做无法保证层级的字节匹配（漏注入会让平台拿不到 usage）。
+// 字节级启发式无法可靠区分顶层与嵌套（正文/其它键里的同名字面量），故宁可每个流式请求
+// 固定做两次 json.Unmarshal（请求体一次、stream_options 一次；已为 true 时零次 marshal），
+// 也不做无法保证层级的字节匹配（漏注入会让平台拿不到 usage）。
 func ensureIncludeUsage(body []byte, protocol, endpoint string) []byte {
 	if protocol != "openai-chat" || endpoint != EndpointChatCompletions {
 		return body
@@ -435,28 +439,34 @@ type streamData struct {
 }
 
 // parseStreamData 解析单个 SSE data 块，返回：命中 usage、该 usage 的原始 JSON、是否命中、
-// 流内 error 帧摘要（空=无 error 帧）。usage 与 error 摘要取自同一次反序列化，
+// 本帧是否含 error（error 键存在且非 null，不依赖摘要是否为空）、流内 error 帧摘要
+// （空=无摘要，不代表没有 error 帧）。usage、error 判定与摘要取自同一次反序列化，
 // 避免同一帧被重复解析（每帧双解析是流式热路径上的额外开销）。
 // 原始 JSON 供 call_log 记录上游原文（诊断渠道 usage 口径）。
-func parseStreamData(data []byte) (billing.Usage, json.RawMessage, bool, string) {
+func parseStreamData(data []byte) (billing.Usage, json.RawMessage, bool, bool, string) {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()
 	var obj streamData
 	if err := dec.Decode(&obj); err != nil {
-		return billing.Usage{}, nil, false, ""
+		return billing.Usage{}, nil, false, false, ""
 	}
-	errDetail := errorFrameDetail(obj.Error)
+	errRaw := bytes.TrimSpace(obj.Error)
+	hasError := len(errRaw) > 0 && string(errRaw) != "null"
+	errDetail := ""
+	if hasError {
+		errDetail = errorFrameDetail(obj.Error)
+	}
 	for _, c := range obj.Choices {
 		if len(c.Usage) > 0 {
 			if u, err := parseUsageObj(c.Usage); err == nil && !usageZero(u) {
-				return u, c.Usage, true, errDetail
+				return u, c.Usage, true, hasError, errDetail
 			}
 		}
 	}
 	if len(obj.Usage) > 0 {
 		if u, err := parseUsageObj(obj.Usage); err == nil && !usageZero(u) {
-			return u, obj.Usage, true, errDetail
+			return u, obj.Usage, true, hasError, errDetail
 		}
 	}
-	return billing.Usage{}, nil, false, errDetail
+	return billing.Usage{}, nil, false, hasError, errDetail
 }

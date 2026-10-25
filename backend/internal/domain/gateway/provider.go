@@ -46,7 +46,8 @@ type errorSummary struct {
 // errorFrameDetail 从流内 error 帧的 error 值原文提取可读摘要：字符串直接返回；
 // 对象优先 type、其次 code，再拼 message；空值返回空串。
 // 注意：`{"error":{}}` 这类无字段 error 帧同样返回空串，所以「返回空串」不等于「没有 error 帧」——
-// 调用方须以自己的帧类型判定（如 response.failed / EventError）来置位失败，不能只看摘要是否为空。
+// 调用方必须按帧类型（response.failed / EventError）或 error 键是否存在且非 null 来置位失败，
+// 不能只看摘要是否为空。
 // OpenAI / Anthropic / Responses 的 error 负载形状相近，故三协议共用同一解析。
 func errorFrameDetail(raw json.RawMessage) string {
 	t := bytes.TrimSpace(raw)
@@ -84,7 +85,8 @@ const (
 	UsageMissingDoneNoUsage = "done_no_usage"
 	// UsageMissingTruncated 未收到流结束标记即读到 EOF（上游流被截断），计入渠道健康失败。
 	UsageMissingTruncated = "truncated"
-	// UsageMissingErrorFrame 上游在流内下发 error 帧后结束，计入渠道健康失败。
+	// UsageMissingErrorFrame 上游在流内下发 error 帧后结束，计入渠道健康失败；
+	// 该归因优先于任何结束标记（见 usageMissingReasonOf）。
 	UsageMissingErrorFrame = "error_frame"
 	// UsageMissingUnknown 适配器无法区分流的结束形态（非 OpenAI 兼容协议），计入渠道健康失败。
 	UsageMissingUnknown = "unknown"
@@ -131,15 +133,16 @@ func usageMissingPunishable(reason string) bool {
 	}
 }
 
-// usageMissingReasonOf 统一各协议适配器的 usage 缺失归因：优先采信「收到终止标记」
-// （正常结束但上游忽略 include_usage），其次「流内 error」，其余按流被截断处理。
+// usageMissingReasonOf 统一各协议适配器的 usage 缺失归因，优先级 error_frame > done_no_usage > truncated：
+// 上游已明确报错时，随后的 [DONE]/终止事件只是收口，不能把失败洗成「正常结束无 usage」，
+// 否则渠道健康惩罚会丢失。只有整段确实出现过 usage 时调用方才不报缺失（不受本函数影响）。
 // 各适配器的 sawDone/sawError 语义由自身协议定义，归因口径保持一致。
 func usageMissingReasonOf(sawDone, sawError bool) string {
 	switch {
-	case sawDone:
-		return UsageMissingDoneNoUsage
 	case sawError:
 		return UsageMissingErrorFrame
+	case sawDone:
+		return UsageMissingDoneNoUsage
 	default:
 		return UsageMissingTruncated
 	}

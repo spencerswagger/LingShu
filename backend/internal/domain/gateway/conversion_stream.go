@@ -25,11 +25,13 @@ type canonicalToolCall struct {
 
 // pumpConvertedStream 是跨协议流式转换泵：把上游 SSE 逐帧解码为规范事件，按入站协议重新编码后下发。
 // 与各 Provider.HandleStream 的返回契约一致（usage、上游原始 usage JSONB、assistant 消息 JSON、error）：
-// 上游无 usage 时返回 UsageMissingError，并按流结束形态区分原因（[DONE]/终止事件 = 正常结束无 usage；
-// 未收到终止标记即 EOF = 截断）。流内 error 帧能否归因为 error_frame 取决于上游协议解码器：
-// anthropic 的 error 事件由 codec 映射为 EventError；openai-responses 在 codec 中没有对应映射，
-// 由泵内 responsesFailedFrame 按原文探测；openai-chat 无 error 映射，error 帧会落入 truncated
-// （truncated 与 error_frame 都计入渠道健康惩罚，仅归因文案不同）。
+// 上游无 usage 时返回 UsageMissingError，归因由 usageMissingReasonOf 统一裁决，
+// error 帧优先于终止标记（error_frame > done_no_usage > truncated）——上游先报错再补 [DONE]/终止事件时，
+// 收口标记不能把失败洗成「正常结束无 usage」，否则渠道惩罚会丢失。
+// 流内 error 帧的探测方式取决于上游协议：anthropic 由 codec 映射为 EventError；
+// openai-responses 在 codec 中没有对应映射，由泵内 responsesFailedFrame 按原文探测（空 error 负载也算）；
+// openai-chat 无 error 映射，error 帧会落入 truncated（truncated 与 error_frame 都计入渠道健康惩罚，
+// 仅归因文案不同）。
 func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Response, inboundProto, upstreamProto string, lossy *protocolconv.LossyReport, w http.ResponseWriter) (billing.Usage, []byte, []byte, error) {
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
@@ -276,9 +278,12 @@ func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Respon
 							accumulateConvertedAssistant(&content, &reasoning, toolCalls, &toolOrder, ev)
 						}
 						if upstreamResponses {
-							if detail := responsesFailedFrame(payload); detail != "" {
+							if failed, detail := responsesFailedFrame(payload); failed {
+								// 只要出现 response.failed 就置位；error 负载为空不影响失败判定。
 								sawError = true
-								errorFrame = detail
+								if detail != "" {
+									errorFrame = detail
+								}
 							}
 						}
 						if carriedUsage {
@@ -329,12 +334,14 @@ func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Respon
 	return usage, rawUsageJSON(upstreamProto, rawParts), asm(), nil
 }
 
-// responsesFailedFrame 从 openai-responses 上游帧原文提取 response.failed 的错误摘要；
-// 该事件在解码器中没有对应规范事件（视为空事件），故按原文探测以便归因到 error_frame。
-func responsesFailedFrame(payload []byte) string {
+// responsesFailedFrame 按原文探测 openai-responses 的 response.failed 帧：
+// 返回「是否出现该失败帧」与错误摘要。该事件在解码器中没有对应规范事件（视为空事件），
+// 故必须按原文探测；只要帧类型为 response.failed 即为 true，error 负载为空（{} / 缺失）也置位，
+// 摘要则可能为空串。调用方据此置 sawError，不能依赖摘要是否为空。
+func responsesFailedFrame(payload []byte) (bool, string) {
 	// 先按字节探测：绝大多数帧不是 response.failed，避免为每帧多做一次反序列化。
 	if !bytes.Contains(payload, []byte("response.failed")) {
-		return ""
+		return false, ""
 	}
 	var probe struct {
 		Type     string          `json:"type"`
@@ -344,12 +351,12 @@ func responsesFailedFrame(payload []byte) string {
 		} `json:"response"`
 	}
 	if json.Unmarshal(payload, &probe) != nil || probe.Type != "response.failed" {
-		return ""
+		return false, ""
 	}
 	if d := errorFrameDetail(probe.Response.Error); d != "" {
-		return d
+		return true, d
 	}
-	return errorFrameDetail(probe.Error)
+	return true, errorFrameDetail(probe.Error)
 }
 
 // channelEvent 是 protocolconv.CanonicalEvent 的别名，便于在泵内构造事件字面量。
