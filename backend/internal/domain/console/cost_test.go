@@ -231,8 +231,9 @@ func TestCostSession_MissingID_BadRequest(t *testing.T) {
 	}
 }
 
-// TestCostStats_Aggregation_ChannelDim 按渠道维度聚合（channel_id 语义=渠道 ID），
+// TestCostStats_Aggregation_ChannelDim 按实体聚合（channel_id 语义=渠道 ID），
 // channel_key_id 为 NULL 的行 ChannelName 置 "(无渠道)"，Total 同口径累加。
+// 改造后行结构多了 EntityKey / ChannelModelID / ExternalModelID / SnapshotNames（见 costStatsRow）。
 func TestCostStats_Aggregation_ChannelDim(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
@@ -241,13 +242,13 @@ func TestCostStats_Aggregation_ChannelDim(t *testing.T) {
 	defer db.Close()
 
 	rows := sqlmock.NewRows([]string{
-		"channel_id", "channel_name", "internal_model_id", "external_model_name",
-		"cost_credits", "sale_credits", "requests",
-		"input_tokens", "cache_read_tokens", "output_tokens",
+		"entity_key", "channel_id", "channel_name", "channel_model_id", "external_model_id",
+		"internal_model_id", "external_model_name", "cost_credits", "sale_credits", "requests",
+		"input_tokens", "cache_read_tokens", "output_tokens", "snapshot_names",
 	}).
-		AddRow(int64(1), "渠道A", "int1", "ext1", 10.0, 20.0, int64(3), int64(100), int64(50), int64(200)).
-		AddRow(nil, "", "int2", "ext2", 5.0, 6.0, int64(2), int64(10), int64(0), int64(20))
-	mock.ExpectQuery(`SELECT k\.channel_id.*FROM billing_records b LEFT JOIN channel_keys.*WHERE b\.status = 'completed'.*GROUP BY k\.channel_id`).
+		AddRow("cm:900", int64(1), "渠道A", int64(900), int64(31), "int1", "ext1", 10.0, 20.0, int64(3), int64(100), int64(50), int64(200), `["ext1"]`).
+		AddRow("name:ext2#int2", nil, "", int64(0), int64(0), "int2", "ext2", 5.0, 6.0, int64(2), int64(10), int64(0), int64(20), `["ext2"]`)
+	mock.ExpectQuery(`WITH res AS .*to_json\(array_agg\(DISTINCT b\.external_model_name\)\).*WHERE b\.status = 'completed'.*GROUP BY 1`).
 		WillReturnRows(rows)
 
 	h := NewAdmin(db, billing.NewSqlStore(db), nil, nil)
