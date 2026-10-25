@@ -98,6 +98,8 @@ ownership: 前端维护者 + 后端维护者
 - 工程：`.gitignore`；移除 `.devtools/`、`.uploads/`；还原 `.trae-html-share-packages/session-cost-routing/session-cost-routing.html.zip`。
 - 复用（不改）：`StatusTag.vue`、`ErrorBubble.vue`，以及 `@/api/admin` 既有端点。
 
+> 移除说明（2026-10-25）：上述 Surface 中的 `views/admin/SessionCostRouting.vue` 已移除（会话成本页面及其配套接口/存储一并下线），此处仅保留历史设计记录。
+
 ## Risks & Open Questions
 - 合并限流列在模型与密钥同时存在时无纵向合并，单元格较高；符合「挤挤放」预期。
 - Element Plus 表格列宽自适感受布局限制，极窄视口下仍可能横向滚动；通过减少列数缓解。

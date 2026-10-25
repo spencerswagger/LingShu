@@ -64,6 +64,7 @@ func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Respon
 
 	started := false
 	sawToolCall := false
+	sawTerminal := false // 是否收到过终止事件（message_delta）：EOF 前收到过 = 正常结束，否则为流截断
 	anthropicDown := downstream == channelprotocol.ProtocolAnthropicMessages
 
 	// 下游 anthropic 的内容块状态：openBlocks 记录已开启的下游块下标；
@@ -176,6 +177,7 @@ func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Respon
 		}
 
 		if ev.Type == protocolconv.EventMessageDelta {
+			sawTerminal = true
 			if anthropicDown && !started {
 				started = true
 				if err := emit([]channelEvent{{Type: protocolconv.EventMessageStart}}); err != nil {
@@ -345,8 +347,11 @@ func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Respon
 	}
 
 	if !sawUsage {
+		// 「正常结束」有两个来源，合并后再参与归因：sawDone（[DONE] / message_stop / responses 终止事件）
+		// 与 sawTerminal（泵内收到过终止 message_delta，覆盖仅以 finish_reason 收尾、不补 [DONE] 的上游）。
+		// error 帧仍优先（见 usageMissingReasonOf），收口标记不得把上游报错洗成正常结束。
 		return usage, rawUsageJSON(upstreamProto, rawParts), asm(),
-			&UsageMissingError{Reason: usageMissingReasonOf(sawDone, sawError), Detail: errorFrame}
+			&UsageMissingError{Reason: usageMissingReasonOf(sawDone || sawTerminal, sawError), Detail: errorFrame}
 	}
 	return usage, rawUsageJSON(upstreamProto, rawParts), asm(), nil
 }

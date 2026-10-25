@@ -65,8 +65,6 @@ const router = createRouter({
         { path: 'system', name: 'admin-system', component: () => import('@/views/admin/BillingConfig.vue'), meta: { title: '系统' } },
         { path: 'system/config', redirect: '/admin/system' },
         { path: 'system/gateway', redirect: '/admin/system' },
-        // 会话成本路由（只读面板 + 临界点图 / 分布 / 事件流）
-        { path: 'session-cost-routing', name: 'admin-session-cost-routing', component: () => import('@/views/admin/SessionCostRouting.vue'), meta: { title: '会话成本' } },
         // 成本（只读：成本统计 + 定价曲线 + 会话成本曲线）
         { path: 'cost', name: 'admin-cost', component: () => import('@/views/admin/Cost.vue'), meta: { title: '成本' } },
         // 公告

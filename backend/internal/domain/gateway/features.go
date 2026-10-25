@@ -5,6 +5,7 @@ import (
 
 	"github.com/team/llmgateway/internal/domain/channel"
 	"github.com/team/llmgateway/internal/domain/channelprotocol"
+	"github.com/team/llmgateway/internal/domain/protocolconv"
 )
 
 // 协议特性（protocol feature）：特性逻辑在代码中实现并注册，渠道协议按
@@ -47,6 +48,7 @@ func init() { registerFeatures() }
 func registerFeatures() {
 	features.registerRequest(channelprotocol.FeatureThinkingRoundtrip, newThinkingRoundtripFeature)
 	features.registerRequest(channelprotocol.FeatureToolSchemaNormalize, newToolSchemaNormalizeFeature)
+	features.registerRequest(channelprotocol.FeatureToolChoiceDowngrade, newToolChoiceDowngradeFeature)
 }
 
 // registerRequest 注册一个请求侧特性构造器。
@@ -132,6 +134,110 @@ func protocolFeatures(rt *channel.RuntimeChannel) []channelprotocol.Feature {
 		return nil
 	}
 	return rt.Protocol.Features
+}
+
+// convertedRequestFeatureKeys 是「对跨协议转换后的请求体同样安全」的请求侧特性白名单：
+// 键为特性 key，值为该特性可安全应用的目标协议集合（转换结果已具备这些协议的标准字段）。
+// 其余特性依赖源协议字段（thinking / anthropic 形状等），转换后已丢失，因此不登记在此。
+var convertedRequestFeatureKeys = map[string][]string{
+	channelprotocol.FeatureToolChoiceDowngrade: {
+		channelprotocol.ProtocolOpenAIChat,
+		channelprotocol.ProtocolOpenAIResponses,
+		channelprotocol.ProtocolAnthropicMessages,
+	},
+}
+
+// convertedRequestFeatureApplies 判断某请求侧特性是否可安全应用于目标协议转换后的请求体。
+func convertedRequestFeatureApplies(key, protocol string) bool {
+	for _, p := range convertedRequestFeatureKeys[key] {
+		if p == protocol {
+			return true
+		}
+	}
+	return false
+}
+
+// applyConvertedRequestFeatures 对转换后的请求体应用上述安全白名单内的渠道特性。
+// 是否适用由「特性 key → 目标协议集合」白名单判定；协议不在集合内即原样返回（无 error）。
+// 改写失败向上返回错误，由调用方按「本候选失败」处置：跳过该候选继续、并置
+// sawConvertSerializeFail，使全部候选失败时最终归为 500（本地构建失败）而非 503（上游不可用）。
+func applyConvertedRequestFeatures(body []byte, rt *channel.RuntimeChannel, protocol string) ([]byte, error) {
+	feats := requestFeaturesFor(protocolFeatures(rt))
+	if len(feats) == 0 {
+		return body, nil
+	}
+	req := UpstreamRequest{Body: body, Protocol: protocol}
+	for _, f := range feats {
+		if !convertedRequestFeatureApplies(f.Key(), protocol) {
+			continue
+		}
+		if err := f.RewriteRequest(&req); err != nil {
+			return body, err
+		}
+	}
+	return req.Body, nil
+}
+
+// thinkingRoundtripParams 是 thinking-roundtrip 特性的挂载参数：请求侧直通改写
+// （feature_thinking.go）与会话级推理缓存回填（reasoningDeclarationOf）共用同一解析口径，
+// 避免 enabled / field / onlyThinking 在两条路径上出现语义漂移。
+type thinkingRoundtripParams struct {
+	Enabled      bool   // 是否启用（缺省 false）
+	Field        string // 请求侧写入字段名（缺省 reasoning_content，已去空白）
+	OnlyThinking bool   // 是否仅对显式 thinking 模式的请求生效
+}
+
+// parseThinkingRoundtripParams 解析 thinking-roundtrip 挂载参数（字段名已归一）。
+func parseThinkingRoundtripParams(params map[string]any) thinkingRoundtripParams {
+	return thinkingRoundtripParams{
+		Enabled:      boolParam(params, "enabled", false),
+		Field:        normalizeReasoningField(stringParam(params, "field", reasoningResponseField)),
+		OnlyThinking: boolParam(params, "onlyThinking", false),
+	}
+}
+
+// reasoningDeclaration 是渠道对「推理内容回传」的声明（来自挂载的 thinking-roundtrip 参数）。
+type reasoningDeclaration struct {
+	Supported    bool   // 是否声明该上游支持推理内容回传（enabled=true）
+	Field        string // 请求侧写入字段名（缺省 reasoning_content，已去空白）
+	OnlyThinking bool   // 是否仅对显式 thinking 模式的请求生效
+}
+
+// reasoningDeclarationOf 单次遍历协议特性解析上述声明；未挂载该特性时返回「不支持 + 默认字段名」。
+func reasoningDeclarationOf(rt *channel.RuntimeChannel) reasoningDeclaration {
+	for _, f := range protocolFeatures(rt) {
+		if f.Key != channelprotocol.FeatureThinkingRoundtrip {
+			continue
+		}
+		p := parseThinkingRoundtripParams(f.Params)
+		return reasoningDeclaration{
+			Supported:    p.Enabled,
+			Field:        p.Field,
+			OnlyThinking: p.OnlyThinking,
+		}
+	}
+	return reasoningDeclaration{Field: reasoningResponseField}
+}
+
+// channelReasoningInject 返回本次请求实际生效的「推理注入/回填」选项：
+// 需渠道声明支持（thinking-roundtrip enabled=true）；若同时声明 onlyThinking=true，则仅当
+// 调用方以入站请求体判定请求处于 thinking 模式（thinking 布尔/对象、enable_thinking、
+// reasoning_effort，见 isThinkingRequestBody）后传入 true 时才生效。该判定与直通路径
+// thinking-roundtrip 的 onlyThinking 同源，三条路径（直通改写、转换注入、会话级缓存回填）语义一致。
+// 注意：判定只按请求体字段进行，不含「模型名隐含 thinking」（如 reasoner 类模型）；这类渠道应保持
+// onlyThinking=false（前端提示已注明），否则推理内容不会回传、上游仍会 400。
+// 未声明/未启用/不满足 onlyThinking 时返回零值：调用方据此既不注入也不回填，请求体逐字节不变。
+// thinking 标记与候选渠道无关（body 与 rewriteModel 后的 body 仅 model 字段不同），
+// 由调用方在候选循环外对原始入站请求体单次求值后传入，避免每个候选重复解析同一请求体。
+func channelReasoningInject(rt *channel.RuntimeChannel, thinking bool) protocolconv.SerializeOptions {
+	decl := reasoningDeclarationOf(rt)
+	if !decl.Supported {
+		return protocolconv.SerializeOptions{}
+	}
+	if decl.OnlyThinking && !thinking {
+		return protocolconv.SerializeOptions{}
+	}
+	return protocolconv.SerializeOptions{ReasoningContent: true, ReasoningField: decl.Field}
 }
 
 // boolParam 读取布尔参数（兼容 bool / 数字 / "true" 等字符串），缺失或类型不符返回 def。

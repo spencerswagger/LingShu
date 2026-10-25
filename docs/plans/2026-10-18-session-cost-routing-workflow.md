@@ -21,6 +21,12 @@ worktree: false
 > （`Engine.ConfirmSessionSwitch`）；新增 `routing.sample_profile` 补齐路由时刻样值三段；影子观测改为独立开关
 > `shadow_enabled`（默认 false）；起点择优 priority 恢复硬分层。以下步骤保留原始执行记录，语义以修正后为准。
 
+> **移除说明（2026-10-25）**：会话成本路由的**控制台观测面已移除**——Step 17 的后端面板接口、
+> Step 18–20 的前端参数面板 / 临界点图 / 分布 / 事件流（含 `SessionCostRouting.vue` 及其 API 与
+> 路由注册）均已删除；后端进程内事件存储 `SessionCostEventStore` 及其 `main.go` 装配、
+> `NewAsyncCostEventSink` 的可选 store 变参也一并移除。路由决策、`routing.session_cost` 配置与
+> asyncwrite 决策事件留痕保留不变。以下 Step 17–20 仅保留历史执行记录。
+
 - [x] **Step 1: 新增“会话成本路由”配置读取与默认安全态**
 action: 新建 `backend/internal/domain/router/cost_config.go`，定义 `type SessionCostConfig struct { Enabled bool; RemainingA float64; RemainingB float64; RemainingMin int; RemainingMax int; MinRemaining int; CooldownSec int }` 与 `func NewSessionCostProvider(src configSource) *SessionCostProvider`，从 `sys_configs` 键 `routing.session_cost` 读取（JSON 对象，缺省 `{Enabled:false, RemainingA:12, RemainingB:1, RemainingMin:1, RemainingMax:20, MinRemaining:1, CooldownSec:0}`），复用 `billing.ConfigProvider` 的缓存与失效代际机制。`Enabled=false` 为默认安全态（等价现状）。中文注释写明安全态语义。新增 `cost_config_test.go` 断言缺省值与解析。不改现有路由行为。
 loop: false

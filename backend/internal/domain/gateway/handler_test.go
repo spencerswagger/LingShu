@@ -688,6 +688,120 @@ func TestServeStreamDoneNoUsageEstimatesWithoutPunishingChannel(t *testing.T) {
 	}
 }
 
+// 流式「正常结束但 usage 缺失」（收到 [DONE] 无 usage，内容完整）也应写入会话级推理缓存，
+// 与「不惩罚渠道」的口径一致：该类上游忽略 include_usage，但推理内容已完整返回。
+func TestServeStreamDoneNoUsageRecordsReasoningCache(t *testing.T) {
+	streamBody := "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"reasoning_content\":\"思考\"," +
+		"\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"f\",\"arguments\":\"{}\"}}]}}]}\n\n" +
+		"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(streamBody))
+	}))
+	defer upstream.Close()
+
+	h := build(t, upstream.URL)
+	rec := doRequestH(t, h.gw, "/v1/chat/completions", "sk-gw-t",
+		`{"model":"gpt-4","stream":true}`, map[string]string{"x-session-id": "sess-cache"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200 (stream already responded), got %d", rec.Code)
+	}
+	h.gw.reasoning.mu.Lock()
+	n := len(h.gw.reasoning.entries)
+	h.gw.reasoning.mu.Unlock()
+	if n == 0 {
+		t.Fatalf("正常结束无 usage 也应写入推理缓存（内容完整）")
+	}
+}
+
+// 流式成功（返回 usage、内容完整）也应写入会话级推理缓存：这是缓存主写入路径（herr==nil 分支），
+// 防止 normalEnd 条件被误改成仅覆盖 usage 缺失场景。
+func TestServeStreamWithUsageRecordsReasoningCache(t *testing.T) {
+	streamBody := "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"reasoning_content\":\"思考\"," +
+		"\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"f\",\"arguments\":\"{}\"}}]}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n" +
+		"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(streamBody))
+	}))
+	defer upstream.Close()
+
+	h := build(t, upstream.URL)
+	rec := doRequestH(t, h.gw, "/v1/chat/completions", "sk-gw-t",
+		`{"model":"gpt-4","stream":true}`, map[string]string{"x-session-id": "sess-cache-ok"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200 (stream already responded), got %d", rec.Code)
+	}
+	h.gw.reasoning.mu.Lock()
+	n := len(h.gw.reasoning.entries)
+	h.gw.reasoning.mu.Unlock()
+	if n == 0 {
+		t.Fatalf("流式成功（含 usage）也应写入推理缓存")
+	}
+}
+
+// 转换流「正常结束但 usage 缺失」也应写入会话级推理缓存（anthropic 入站 → openai-chat 上游，
+// 上游忽略 include_usage）：与直通路径同口径，防止转换路径永远不写缓存导致下一轮回填 miss。
+func TestStreamConversionDoneNoUsageRecordsReasoningCache(t *testing.T) {
+	streamBody := "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"reasoning_content\":\"思考\"," +
+		"\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"f\",\"arguments\":\"{}\"}}]}}]}\n\n" +
+		"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(streamBody))
+	}))
+	defer upstream.Close()
+
+	h := build(t, upstream.URL)
+	// 模型仅可达 openai-chat → anthropic 入站需转换为 openai-chat 上游。
+	h.chans.mrt.Model.Protocols = channelprotocol.Protocols{channelprotocol.ProtocolOpenAIChat: {}}
+
+	rec := postWithHeaders(t, h.gw, "/v1/messages",
+		`{"model":"gpt-4","stream":true,"max_tokens":100,"messages":[{"role":"user","content":"ping"}]}`,
+		map[string]string{"x-api-key": "sk-gw-t", "x-session-id": "sess-conv-cache"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	h.gw.reasoning.mu.Lock()
+	n := len(h.gw.reasoning.entries)
+	h.gw.reasoning.mu.Unlock()
+	if n == 0 {
+		t.Fatalf("转换流正常结束无 usage 也应写入推理缓存")
+	}
+}
+
+// 上游流截断（未收到 [DONE] 即 EOF，内容可能半截）不得写入会话级推理缓存：
+// 半截推理回传会造成上游校验失败，与「计入健康失败」的处置口径一致。
+func TestServeStreamTruncatedDoesNotRecordReasoningCache(t *testing.T) {
+	streamBody := "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"reasoning_content\":\"半截\"," +
+		"\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"f\",\"arguments\":\"{}\"}}]}}]}\n\n"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(streamBody))
+	}))
+	defer upstream.Close()
+
+	h := build(t, upstream.URL)
+	rec := doRequestH(t, h.gw, "/v1/chat/completions", "sk-gw-t",
+		`{"model":"gpt-4","stream":true}`, map[string]string{"x-session-id": "sess-trunc"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200 (stream already responded), got %d", rec.Code)
+	}
+	h.gw.reasoning.mu.Lock()
+	n := len(h.gw.reasoning.entries)
+	h.gw.reasoning.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("流截断不应写入推理缓存, got %d 条", n)
+	}
+}
+
 // 流式响应未收到结束标记即 EOF（上游流被截断）：仍按估算计费，但计入渠道健康失败（不再禁用整条渠道）。
 func TestServeStreamTruncatedEstimatesAndFeedsHealthFailure(t *testing.T) {
 	streamBody := "data: {\"choices\":[{\"delta\":{\"content\":\"hello world\"}}]}\n\n" // 无 [DONE]

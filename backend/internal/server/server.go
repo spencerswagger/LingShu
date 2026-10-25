@@ -204,11 +204,6 @@ func (s *Server) routes() {
 	admin.HandleFunc("POST /api/v1/admin/sessions/kick", d.Console.HandleKickSessions)
 	admin.HandleFunc("PUT /api/v1/admin/sessions/{id}/name", d.Console.HandleRenameSession)
 
-	// 会话成本路由面板（Step 17）：配置 / 决策事件流 / 临界缓存读分布
-	admin.HandleFunc("GET /api/v1/admin/session-cost/config", d.Console.HandleSessionCostConfig)
-	admin.HandleFunc("GET /api/v1/admin/session-cost/events", d.Console.HandleSessionCostEvents)
-	admin.HandleFunc("GET /api/v1/admin/session-cost/distribution", d.Console.HandleSessionCostDistribution)
-
 	// announcements
 	admin.HandleFunc("GET /api/v1/admin/announcements", d.Announcement.HandleAdminList)
 	admin.HandleFunc("POST /api/v1/admin/announcements", d.Announcement.HandleAdminCreate)

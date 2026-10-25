@@ -581,6 +581,12 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 			"result":           "rejected",
 		}
 	}
+	// 入站请求体 thinking 标记的单次求值（供循环内 channelReasoningInject 的 onlyThinking 门控复用）：
+	// 该判定只依赖 thinking / enable_thinking / reasoning_effort 字段，与候选渠道无关；
+	// body 与循环内 rewriteModel 后的 rewritten 仅 model 字段不同（rewriteModel 只替换 model 键，
+	// 其余字段值字节级保留，顶层键序可能按字典序重排，不影响本判定），标记等价，
+	// 故在循环外以原始入站体求值一次，避免每个候选重复解析。
+	inboundThinking := isThinkingRequestBody(body)
 	for _, cr := range routes {
 		order := len(attempts) + 1
 		// 渠道/密钥名：渠道 ID 为雪花值，直接展示不具可读性，随候选一并回查落轨迹。
@@ -766,8 +772,15 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 		//   serialize：目标协议序列化失败，视同本地构建失败（未发出上游调用），跳过本候选继续，
 		//             若最终全候选失败则在终结分支回 500（而非 503 聚合）。
 		upstreamBody := rewritten
+		// 推理注入/回填声明的单次求值（挂载 thinking-roundtrip 且 enabled=true 才为非零值；
+		// 若同时声明 onlyThinking=true，则仅当入站请求处于 thinking 模式时生效——
+		// 该标记已在候选循环前由 isThinkingRequestBody(body) 单次求值，见 inboundThinking）：
+		// 同时供「转换时回填 assistant thinking」与「会话级推理缓存回填」两处门控，避免重复求值与语义分叉。
+		reasoningInject := channelReasoningInject(rt, inboundThinking)
 		if converted {
-			convBody, reqLossy, cerr := protocolconv.ConvertRequest(baseProtocol, upstreamProto, rewritten)
+			// 序列化选项由渠道协议声明：仅当挂载 thinking-roundtrip（enabled=true）时才把
+			// assistant thinking 回填为推理字段（字段名沿用该特性 field 参数）。
+			convBody, reqLossy, cerr := protocolconv.ConvertRequestWithOptions(baseProtocol, upstreamProto, rewritten, reasoningInject)
 			if cerr != nil {
 				if protocolconv.ConvertStage(cerr) == protocolconv.StageParse {
 					l.Error("convert request parse failed", "from", baseProtocol, "to", upstreamProto, "err", cerr)
@@ -792,12 +805,36 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 			convLossy.Merge(reqLossy)
 		}
 
+		// 转换后的请求体不再走渠道协议特性（特性按源协议字段编写），但只依赖目标协议标准字段
+		// 的特性（强制工具选择降级）对转换结果同样安全，单独应用；改写失败视同转换失败，
+		// 跳过本候选继续（与直通路径一致，不静默吞掉）。
+		if converted {
+			next, ferr := applyConvertedRequestFeatures(upstreamBody, rt, upstreamProto)
+			if ferr != nil {
+				l.Error("apply converted request features failed", "protocol", upstreamProto, "err", ferr)
+				sawConvertSerializeFail = true
+				attempts = append(attempts, skip("特性改写失败"))
+				continue
+			}
+			upstreamBody = next
+		}
+
 		// 平台计费依赖上游返回 usage：OpenAI Chat Completions 的流式请求幂等补
 		// stream_options.include_usage=true（客户端未显式请求时由网关补齐，其余 stream_options 键保留）。
 		// 仅限 chat/completions 端点：legacy completions/embeddings 与非 OpenAI 协议均不改写
 		// （legacy completions 未定义该参数，注入可能被上游按未知参数拒绝）。
 		if isStream {
 			upstreamBody = ensureIncludeUsage(upstreamBody, upstreamProto, provEndpoint)
+		}
+
+		// 会话级推理缓存回填：thinking 模式上游要求上一轮 assistant 的推理内容原样回传，
+		// 客户端多数不回传。按会话 + tool_call_id 命中网关自己记录的推理内容补齐（仅补缺失/空
+		// 字段，不改写已有内容）。
+		// 门控与转换注入同源（reasoningInject）：只有渠道显式声明「支持推理内容回传」时才回填，
+		// 避免向不认识该字段的上游注入；写入字段名为渠道声明的请求侧字段（缺省 reasoning_content）。
+		// 仅对 openai-chat 目标协议生效。
+		if sessionID != "" && upstreamProto == channelprotocol.ProtocolOpenAIChat && reasoningInject.ReasoningContent {
+			upstreamBody = g.reasoning.Backfill(sessionID, reasoningInject.ReasoningField, upstreamBody)
 		}
 
 		// 上游请求构造上下文：有效基址（协议级优先）/ 协议路径覆盖 / 头策略 / 上游协议 / 变量。
@@ -1212,6 +1249,11 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 		if !conv.converted {
 			raw = normalizeUpstreamBody(raw, rt)
 		}
+		// 会话级推理缓存：记录本轮 assistant 的推理内容（带 tool_calls 时），供同会话后续请求
+		// 回填客户端未回传的内容；读取按响应侧别名容错（见 reasoning.go 命名空间说明）。
+		if sessionID != "" && ureq.Protocol == channelprotocol.ProtocolOpenAIChat {
+			g.reasoning.RememberResponse(sessionID, raw)
+		}
 		// upstreamUsage：上游原始 usage（JSONB 值），随调用日志落库用于诊断渠道口径（见 rawusage.go）。
 		usage, upstreamUsage, uerr := prov.ExtractUsage(raw)
 		usageMissing := uerr != nil || usageZero(usage)
@@ -1565,6 +1607,14 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		// 客户端是否已离开必须先于 usage 缺失处置判定：客户端断开与上游 EOF 的竞态
 		// 不得被误判为上游 usage 缺失而惩罚渠道。
 		clientGone := errors.Is(herr, context.Canceled) || ctx.Err() != nil
+		// 会话级推理缓存：仅在流「正常结束」时记录本轮 assistant 的推理内容，避免把半截推理
+		// 写入缓存后回传给上游。「正常结束」含「收到 [DONE] 但 usage 缺失」（上游忽略平台注入的
+		// include_usage，内容完整，与下方不惩罚渠道的口径一致）；客户端断开、上游流截断、流内
+		// error（UsageMissingTruncated/UsageMissingErrorFrame）不计入。读取按响应侧别名容错。
+		normalEnd := herr == nil || (errors.Is(herr, ErrUsageMissing) && missingReason == UsageMissingDoneNoUsage)
+		if sessionID != "" && ureq.Protocol == channelprotocol.ProtocolOpenAIChat && !clientGone && normalEnd {
+			g.reasoning.RememberMessage(sessionID, assistantMsg)
+		}
 		// 内容已透传无法撤回，usage 缺失一律按可见内容估算计费（平台不能漏计费）；
 		// 是否惩罚渠道按缺失原因区分：仅「上游流被截断/流内 error/无法区分」计入健康失败，
 		// 「正常结束但无 usage」（上游忽略平台注入的 include_usage）与客户端断开不惩罚。
