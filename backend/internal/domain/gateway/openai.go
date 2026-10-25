@@ -222,13 +222,12 @@ func (p *OpenAIProvider) HandleStream(ctx context.Context, upstream *http.Respon
 // 平台按 usage 计费，客户端未显式请求 usage 时由网关补齐（平台必需参数）；已有该键为 true 时原样返回，
 // 其余 stream_options 键保留。仅限 chat/completions 端点：legacy completions/embeddings 未定义该参数
 // （注入可能被上游按未知参数拒绝），非 OpenAI 兼容协议同样不改写；解析失败时按原样返回。
+//
+// 取舍：判定「include_usage 已为 true」必须确认它是顶层 stream_options 的直接子键。
+// 字节级启发式无法可靠区分顶层与嵌套（正文/其它键里的同名字面量），宁可每个流式请求
+// 多花一次 json.Unmarshal，也不做无法保证层级的字节匹配（漏注入会让平台拿不到 usage）。
 func ensureIncludeUsage(body []byte, protocol, endpoint string) []byte {
 	if protocol != "openai-chat" || endpoint != EndpointChatCompletions {
-		return body
-	}
-	// 快路径：已显式请求 usage（include_usage=true）时原样下发，省掉每个流式请求的
-	// 两次反序列化 + 一次全量序列化；include_usage=false 仍走下方改写（平台必需参数语义不变）。
-	if hasIncludeUsageTrue(body) {
 		return body
 	}
 	var obj map[string]json.RawMessage
@@ -239,12 +238,10 @@ func ensureIncludeUsage(body []byte, protocol, endpoint string) []byte {
 		return body
 	}
 	rawOpts, hasOpts := obj["stream_options"]
-	if !hasOpts || len(rawOpts) == 0 {
+	if !hasOpts || len(bytes.TrimSpace(rawOpts)) == 0 {
 		// 无 stream_options：把新键直接插到对象尾部，其余字节原样保留（避免整包重序列化）。
 		return injectStreamOptions(body)
 	}
-	// null 与结构异常统一走「重建 opts → 一次 marshal」：直接尾部追加会产出两个
-	// stream_options 键（JSON 语义未定义，部分上游取首个会丢掉 include_usage）。
 	opts := make(map[string]json.RawMessage)
 	if err := json.Unmarshal(rawOpts, &opts); err != nil {
 		opts = make(map[string]json.RawMessage) // 结构异常：以平台必需参数为准重建
@@ -267,114 +264,6 @@ func ensureIncludeUsage(body []byte, protocol, endpoint string) []byte {
 		return body
 	}
 	return out
-}
-
-// hasIncludeUsageTrue 判断请求体是否已在 stream_options 对象内显式含 "include_usage": true。
-// 纯字节判定、零分配：先定位 stream_options 键（其值必须以 '{' 开头，避免把 prompt 正文里的
-// 同名字面量当成参数），再用字符串/转义感知的花括号配平确定该对象的 [start,end) 区间，
-// 仅当 include_usage=true 落在区间内才返回 true。任一畸形/找不到匹配右括号都返回 false，
-// 回落到 ensureIncludeUsage 的精确 JSON 路径（宁可重写，也不能漏注入导致平台拿不到 usage）。
-func hasIncludeUsageTrue(body []byte) bool {
-	const streamOptionsKey = `"stream_options"`
-	searchFrom := 0
-	for searchFrom < len(body) {
-		rel := bytes.Index(body[searchFrom:], []byte(streamOptionsKey))
-		if rel < 0 {
-			return false
-		}
-		keyEnd := searchFrom + rel + len(streamOptionsKey)
-		// 键后必须是冒号（跳过空白），否则是正文里的同名字面量。
-		rest := bytes.TrimLeft(body[keyEnd:], " \t\r\n")
-		if len(rest) == 0 || rest[0] != ':' {
-			searchFrom = keyEnd
-			continue
-		}
-		rest = bytes.TrimLeft(rest[1:], " \t\r\n")
-		// 值必须以对象开头；null/数组/标量都不是可注入的目标结构。
-		if len(rest) == 0 || rest[0] != '{' {
-			searchFrom = keyEnd
-			continue
-		}
-		start := len(body) - len(rest)
-		end, ok := matchObjectEnd(body, start)
-		if !ok {
-			return false
-		}
-		if includeUsageTrueIn(body[start:end]) {
-			return true
-		}
-		searchFrom = end
-	}
-	return false
-}
-
-// matchObjectEnd 从 start 处的 '{' 起做字符串/转义感知的花括号配平，返回匹配右括号之后的
-// 下标（[start,end) 即该对象区间）。字符串内的花括号与转义引号不参与配平；未闭合返回 false。
-func matchObjectEnd(body []byte, start int) (int, bool) {
-	depth := 0
-	inString := false
-	escaped := false
-	for i := start; i < len(body); i++ {
-		c := body[i]
-		if inString {
-			if escaped {
-				escaped = false
-				continue
-			}
-			switch c {
-			case '\\':
-				escaped = true
-			case '"':
-				inString = false
-			}
-			continue
-		}
-		switch c {
-		case '"':
-			inString = true
-		case '{':
-			depth++
-		case '}':
-			depth--
-			if depth == 0 {
-				return i + 1, true
-			}
-			if depth < 0 {
-				return 0, false
-			}
-		}
-	}
-	return 0, false
-}
-
-// includeUsageTrueIn 判断给定对象区间内是否出现键值对 "include_usage": true。
-// 只做字节级键值匹配（容忍空白与合法分隔符），不做反序列化，避免流式热路径的额外分配。
-func includeUsageTrueIn(obj []byte) bool {
-	key := []byte(`"include_usage"`)
-	from := 0
-	for from < len(obj) {
-		rel := bytes.Index(obj[from:], key)
-		if rel < 0 {
-			return false
-		}
-		keyEnd := from + rel + len(key)
-		rest := bytes.TrimLeft(obj[keyEnd:], " \t\r\n")
-		if len(rest) == 0 || rest[0] != ':' {
-			from = keyEnd
-			continue
-		}
-		rest = bytes.TrimLeft(rest[1:], " \t\r\n")
-		if !bytes.HasPrefix(rest, []byte("true")) {
-			from = keyEnd
-			continue
-		}
-		rest = bytes.TrimLeft(rest[len("true"):], " \t\r\n")
-		if len(rest) == 0 || rest[0] == ',' || rest[0] == '}' || rest[0] == ']' {
-			return true
-		}
-		from = keyEnd
-	}
-	return false
 }
 
 // injectStreamOptions 在请求体对象末尾插入 stream_options.include_usage=true（保持其余字节不变）。

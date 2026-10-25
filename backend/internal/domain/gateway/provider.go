@@ -44,7 +44,9 @@ type errorSummary struct {
 }
 
 // errorFrameDetail 从流内 error 帧的 error 值原文提取可读摘要：字符串直接返回；
-// 对象优先 type、其次 code，再拼 message；空值返回空串（无 error 帧）。
+// 对象优先 type、其次 code，再拼 message；空值返回空串。
+// 注意：`{"error":{}}` 这类无字段 error 帧同样返回空串，所以「返回空串」不等于「没有 error 帧」——
+// 调用方须以自己的帧类型判定（如 response.failed / EventError）来置位失败，不能只看摘要是否为空。
 // OpenAI / Anthropic / Responses 的 error 负载形状相近，故三协议共用同一解析。
 func errorFrameDetail(raw json.RawMessage) string {
 	t := bytes.TrimSpace(raw)

@@ -127,7 +127,11 @@ func (p *ResponsesProvider) HandleStream(ctx context.Context, upstream *http.Res
 				data := bytes.TrimSpace(trimmed[len("data:"):])
 				if len(data) > 0 && bytes.Equal(data, []byte("[DONE]")) {
 					// 部分 Responses 兼容上游仍以 [DONE] 收尾：与转换泵口径一致视为正常结束。
-					sawDone = true
+					// 但上游可能先报 response.failed 再补 [DONE]；此时 [DONE] 只是收口，
+					// 不能把失败洗成「正常结束无 usage」，否则渠道健康惩罚会丢失。
+					if !sawError {
+						sawDone = true
+					}
 				} else if len(data) > 0 {
 					var ev responsesStreamEvent
 					if json.Unmarshal(data, &ev) == nil {

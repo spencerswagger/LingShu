@@ -2080,7 +2080,7 @@ func usageMissingLogReason(reason string, clientGone bool, err error) string {
 	}
 	switch reason {
 	case UsageMissingDoneNoUsage:
-		return "上游流正常结束但未返回 usage（已注入 include_usage，按估算计费，不惩罚渠道）"
+		return "上游流正常结束但未返回 usage（按估算计费，不惩罚渠道）"
 	case UsageMissingTruncated:
 		return "上游流未收到结束标记即中断（按估算计费并计入渠道健康失败）"
 	case UsageMissingErrorFrame:

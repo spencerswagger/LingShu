@@ -774,6 +774,190 @@ func TestServeStreamNonOpenAINoUsageEndShape(t *testing.T) {
 	}
 }
 
+// responses 直通仅以 [DONE] 收尾（无 response.completed/usage）：按正常结束归因，
+// 估算计费且不惩罚渠道（reason=done_no_usage）。
+func TestServeResponsesDoneOnlyNoUsageNoPenalty(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	h := build(t, upstream.URL)
+	h.chans.rt.Channel.Protocol = channelprotocol.ProtocolOpenAIResponses
+	rec := doRequest(t, h.gw, "/v1/responses", "sk-gw-t", `{"model":"gpt-4","stream":true}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200 (stream already responded), got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(h.chans.feeds) != 0 {
+		t.Fatalf("正常结束无 usage 不应计入渠道健康失败, got %+v", h.chans.feeds)
+	}
+	if len(h.billing.reqs) != 1 || h.billing.reqs[0].Fail {
+		t.Fatalf("usage 缺失应按估算计费（成功账单）, got %+v", h.billing.reqs)
+	}
+	if len(h.clogs.inserted) == 0 {
+		t.Fatalf("缺少调用日志")
+	}
+	attempts := decisionAttempts(t, h.clogs.inserted[len(h.clogs.inserted)-1].Decision)
+	if len(attempts) == 0 || attempts[len(attempts)-1]["reason"] != "上游未返回usage(按估算计费)" {
+		t.Fatalf("done_no_usage 应归因为正常结束无 usage, got %+v", attempts)
+	}
+}
+
+// responses 直通先发 response.failed 再补 [DONE]：[DONE] 只能收口，不得把失败洗成正常结束；
+// 仍归因 error_frame，计入渠道健康失败且调用日志 failed。
+func TestServeResponsesDoneAfterFailedStaysErrorFrame(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: {\"type\":\"response.failed\",\"response\":{\"error\":" +
+			"{\"code\":\"server_error\",\"message\":\"boom\"}}}\n\ndata: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	h := build(t, upstream.URL)
+	h.chans.rt.Channel.Protocol = channelprotocol.ProtocolOpenAIResponses
+	rec := doRequest(t, h.gw, "/v1/responses", "sk-gw-t", `{"model":"gpt-4","stream":true}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200 (stream already responded), got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(h.chans.feeds) != 1 || h.chans.feeds[0].fb.IsSuccess {
+		t.Fatalf("error_frame 应计入渠道健康失败, got %+v", h.chans.feeds)
+	}
+	if len(h.clogs.inserted) == 0 {
+		t.Fatalf("缺少调用日志")
+	}
+	last := h.clogs.inserted[len(h.clogs.inserted)-1]
+	if last.Status != "failed" || last.RespKind != "stream" {
+		t.Fatalf("error_frame 应记 failed/stream 调用日志, got status=%q resp_kind=%q", last.Status, last.RespKind)
+	}
+	if !strings.Contains(last.ErrorMessage, "上游流式响应中断") {
+		t.Fatalf("调用日志应体现上游流式中断, got %q", last.ErrorMessage)
+	}
+	// usage 缺失仍按可见内容估算计费：账单不得是 failed。
+	if len(h.billing.reqs) != 1 || h.billing.reqs[0].Fail {
+		t.Fatalf("usage 缺失应按估算计费（成功账单）, got %+v", h.billing.reqs)
+	}
+}
+
+// cancelOnEOFBody 读到 EOF 时取消请求 ctx：模拟「上游流刚读完、请求侧才取消」的竞态。
+type cancelOnEOFBody struct {
+	r      io.Reader
+	cancel context.CancelFunc
+}
+
+func (b *cancelOnEOFBody) Read(p []byte) (int, error) {
+	n, err := b.r.Read(p)
+	if errors.Is(err, io.EOF) {
+		b.cancel()
+	}
+	return n, err
+}
+
+func (b *cancelOnEOFBody) Close() error { return nil }
+
+// roundTripFunc 让测试直接构造上游响应（无需真实网络），用于精确控制 body 读侧与 ctx 取消时序。
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// clientGone × usageMissing 竞态：请求 ctx 在上游流读完后才取消（上游也未给 usage），
+// 必须先判定客户端已离开——不得把「客户端断开」误归为上游 usage 缺失而惩罚渠道。
+func TestServeStreamClientGoneUsageMissingNoHealthFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	h := build(t, "http://unused")
+	h.gw.streamClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body: &cancelOnEOFBody{
+				r:      strings.NewReader("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"),
+				cancel: cancel,
+			},
+		}, nil
+	})}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"gpt-4","stream":true,"messages":[{"role":"user","content":"ping"}]}`)).WithContext(ctx)
+	req.Header.Set("Authorization", "Bearer sk-gw-t")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.gw.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200 (stream already responded), got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(h.chans.feeds) != 0 {
+		t.Fatalf("客户端已断开不应回喂渠道健康（无论成功或失败）, got %+v", h.chans.feeds)
+	}
+	if len(h.billing.reqs) != 1 || h.billing.reqs[0].Fail {
+		t.Fatalf("客户端断开仍应按估算计费（成功账单）, got %+v", h.billing.reqs)
+	}
+}
+
+// hasSession 不重排契约：既有会话命中时保持路由层候选顺序（即使「需转换在前、直通在后」），
+// 决策轨迹不得出现 passthrough_first / passthrough_fallback（直通重排只用于新会话）。
+func TestServeSessionHitKeepsCandidateOrder(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"msg1","type":"message","role":"assistant","model":"gpt-4-internal",` +
+			`"content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn",` +
+			`"usage":{"input_tokens":10,"output_tokens":5}}`))
+	}))
+	defer upstream.Close()
+
+	modelRuntime := func(rowID, channelID int64, protocols channelprotocol.Protocols) *channel.ModelRuntime {
+		return &channel.ModelRuntime{
+			Model:   channel.ChannelModel{ID: rowID, ChannelID: channelID, InternalModelID: "gpt-4-internal", Protocols: protocols},
+			Machine: channel.NewMachine(channel.DefaultMachineConfig()),
+			Limiter: channel.NewLimiter(1000, 1000000, 1.2),
+		}
+	}
+	// 与 TestServeDecisionPassthroughReorderMarkers 同一夹具：候选 1 需转换（兜底）、候选 2 直通。
+	convRoute := &router.ChannelRoute{ChannelID: 1, ChannelKeyID: 1, InternalModelID: "gpt-4-internal", ModelRowID: 7, ExternalModelID: 1}
+	directRoute := &router.ChannelRoute{ChannelID: 2, ChannelKeyID: 2, InternalModelID: "gpt-4-internal", ModelRowID: 8, ExternalModelID: 1}
+
+	h := build(t, upstream.URL)
+	h.rrouter.routes = []*router.ChannelRoute{convRoute, directRoute}
+	// 候选 2 的密钥不在运行时 → 被跳过，最终命中候选 1（两条轨迹都会落痕）。
+	h.chans.mrtByChannel = map[int64]*channel.ModelRuntime{
+		1: modelRuntime(7, 1, channelprotocol.Protocols{channelprotocol.ProtocolAnthropicMessages: {}}),
+		2: modelRuntime(8, 2, channelprotocol.Protocols{channelprotocol.ProtocolOpenAIChat: {}}),
+	}
+	h.rrouter.Sessions().Attach(&router.Session{
+		SessionID:       router.SessionID(7, 42, "gpt-4", "s-sticky"),
+		ChannelKeyID:    1,
+		InternalModelID: "gpt-4-internal",
+		ExpireAt:        h.clock.now().Add(time.Hour),
+	}, 16)
+
+	rec := doRequestH(t, h.gw, "/v1/chat/completions", "sk-gw-t",
+		`{"model":"gpt-4","stream":false,"messages":[{"role":"user","content":"ping"}]}`,
+		map[string]string{"x-session-id": "s-sticky"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(h.clogs.inserted) == 0 {
+		t.Fatalf("缺少调用日志")
+	}
+	attempts := decisionAttempts(t, h.clogs.inserted[len(h.clogs.inserted)-1].Decision)
+	if len(attempts) == 0 || attempts[0]["channel_id"] != "1" {
+		t.Fatalf("既有会话应保持路由层候选顺序（需转换在前，首个候选即命中）, got %+v", attempts)
+	}
+	for _, a := range attempts {
+		if _, ok := a["passthrough_first"]; ok {
+			t.Fatalf("既有会话命中不得出现 passthrough_first: %+v", attempts)
+		}
+		if _, ok := a["passthrough_fallback"]; ok {
+			t.Fatalf("既有会话命中不得出现 passthrough_fallback: %+v", attempts)
+		}
+	}
+}
+
 // 下游写失败不是上游故障：保持 interrupted（failed 调用日志）语义，但不得回喂渠道健康失败
 // （否则健康上游会被误判为故障、误杀熔断）。
 func TestServeStreamDownstreamWriteDoesNotFeedHealthFailure(t *testing.T) {
@@ -801,6 +985,9 @@ func TestServeStreamDownstreamWriteDoesNotFeedHealthFailure(t *testing.T) {
 	last := h.clogs.inserted[len(h.clogs.inserted)-1]
 	if last.Status != "failed" || last.RespKind != "error" {
 		t.Fatalf("下游写失败仍应保持 failed 调用日志语义, got status=%q resp_kind=%q", last.Status, last.RespKind)
+	}
+	if !strings.Contains(last.ErrorMessage, "下游写失败") {
+		t.Fatalf("下游写失败应使用区分于上游中断的归因文案, got %q", last.ErrorMessage)
 	}
 }
 
@@ -1005,6 +1192,27 @@ func TestEnsureIncludeUsage(t *testing.T) {
 			name: "嵌套对象里的 include_usage 不误判",
 			// 反例：include_usage=true 不在 stream_options 内，必须注入（否则平台拿不到 usage）。
 			body:     `{"stream":true,"stream_options":{},"extra":{"include_usage":true}}`,
+			protocol: "openai-chat", endpoint: EndpointChatCompletions,
+			wantInclude: true,
+		},
+		{
+			name: "顶层 include_usage=false 不得被嵌套同名字面量误判",
+			// stream_options 的直接子键才是有效配置；更深层的 include_usage=true 不能当作已请求 usage。
+			body:     `{"stream":true,"stream_options":{"include_usage":false,"foo":{"include_usage":true}}}`,
+			protocol: "openai-chat", endpoint: EndpointChatCompletions,
+			wantInclude: true,
+		},
+		{
+			name: "嵌套在其它键里的 stream_options 不算顶层配置",
+			// extra.stream_options 不是顶层 stream_options：顶层必须补齐，否则上游不会返回 usage。
+			body:     `{"stream":true,"extra":{"stream_options":{"include_usage":true}}}`,
+			protocol: "openai-chat", endpoint: EndpointChatCompletions,
+			wantInclude: true,
+		},
+		{
+			name: "重复 stream_options 键改写后只剩单键",
+			// 客户端自带重复键：map 反序列化取最后一个（false），改写后必须输出单个 stream_options。
+			body:     `{"stream":true,"stream_options":{"include_usage":true},"stream_options":{"include_usage":false}}`,
 			protocol: "openai-chat", endpoint: EndpointChatCompletions,
 			wantInclude: true,
 		},

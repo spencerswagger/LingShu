@@ -27,8 +27,9 @@ type canonicalToolCall struct {
 // 与各 Provider.HandleStream 的返回契约一致（usage、上游原始 usage JSONB、assistant 消息 JSON、error）：
 // 上游无 usage 时返回 UsageMissingError，并按流结束形态区分原因（[DONE]/终止事件 = 正常结束无 usage；
 // 未收到终止标记即 EOF = 截断）。流内 error 帧能否归因为 error_frame 取决于上游协议解码器：
-// anthropic / openai-responses 有 error 映射；openai-chat 无 error 映射，error 帧会落入 truncated
-// （两类原因都计入渠道健康惩罚，仅归因文案不同）。
+// anthropic 的 error 事件由 codec 映射为 EventError；openai-responses 在 codec 中没有对应映射，
+// 由泵内 responsesFailedFrame 按原文探测；openai-chat 无 error 映射，error 帧会落入 truncated
+// （truncated 与 error_frame 都计入渠道健康惩罚，仅归因文案不同）。
 func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Response, inboundProto, upstreamProto string, lossy *protocolconv.LossyReport, w http.ResponseWriter) (billing.Usage, []byte, []byte, error) {
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")

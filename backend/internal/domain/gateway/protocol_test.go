@@ -218,6 +218,16 @@ func TestHandleStreamUsageMissingReason(t *testing.T) {
 			wantDetail: "server_error: boom",
 		},
 		{
+			name:     "responses failed 后补 [DONE]",
+			provider: NewResponsesProvider(),
+			body: "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_error\"," +
+				"\"message\":\"boom\"}}}\n\ndata: [DONE]\n\n",
+			// [DONE] 只是收口标记：上游先报 failed 再补 [DONE] 时仍须归因 error_frame（惩罚不丢失）。
+			wantReason: UsageMissingErrorFrame,
+			wantPunish: true,
+			wantDetail: "server_error: boom",
+		},
+		{
 			name:       "openai 正常结束无 usage",
 			provider:   NewOpenAIProvider(EndpointChatCompletions),
 			body:       "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n",
