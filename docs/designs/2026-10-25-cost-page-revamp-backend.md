@@ -231,3 +231,49 @@ backend/scripts/demo-context-tiers.sql
   `/cost/curves`、`/cost/session` 一行没动）。
 - 新增内容全部为新增字段 / 新增端点；老调用方不传新参数时行为可预期（见 §2、§3 的默认值）。
 - 本轮**不做**（spencer 已定后置）：`billing_records` 加 ID 列与全量回填、会话成本按 user 轮重新定义。
+
+---
+
+## 6. 补丁：`/cost/session` 补失败轮（2026-10-25 追加）
+
+Gate 判「失败轮红点」为定稿要求里唯一未达成项，本节是后端补齐部分（前端接入在后面单独一棒）。
+
+### 6.1 变更点
+
+- 会话明细查询**不再**过滤 `status='completed'`：同会话的失败调用也出行。
+- 新增字段：`Status`（实际取值枚举只有 `completed` / `failed`，取自 `billing_records.status` 的 CHECK 约束）、
+  `Failed`（bool，= `Status=='failed'`，前端可直接判红点）、`TurnNo`（时间线序号）。
+- 新增响应元信息：`Total`（该会话账单总行数）、`Limit`（本次生效上限）、`Truncated`（是否被截断）。
+
+### 6.2 两个序号的语义（兼容关键）
+
+| 字段 | 语义 | 失败轮 |
+|---|---|---|
+| `Turn` | **成功调用序号**（1..N），沿用改造前的语义 | 恒为 0 |
+| `TurnNo` | **时间线序号**（1..M，含失败轮），前端 x 轴用它 | 占位，序号连续 |
+
+- 失败轮插在它所在的**时间位置**上，不会把后面的成功轮整体往后推：失败轮之后的第一个成功轮
+  `Turn` 仍是它原本的序号（例：success/fail/success → `Turn` 1,0,2；`TurnNo` 1,2,3）。
+- 没有失败轮时 `TurnNo` 恒等于 `Turn`，老调用方读到的 `Turn` 序列、行顺序、金额与改造前逐一相同。
+- 金额：失败轮 `CostCredits` / `SaleCredits` 一律 **0**（失败不产生成本积分），token 保留实际值；
+  `Totals` 仍只累加成功轮，口径不变。
+- ⚠️ 前端 x 轴请改用 `TurnNo`（`Turn` 在失败轮是 0，拿来当 x 会挤到最左边）。
+
+### 6.3 体量上限
+
+- `Limit` 参数：缺省 **500**，上限 **2000**，非数字 400，越界收敛。
+- 按 `call_time ASC, id ASC` 取最早的 N 行（从会话开头按时间正序，x 轴从 1 起）；
+  被截断时 `Truncated=true` 且 `Total` 给出真实行数。
+- 一次请求固定两条查询：`count(*) WHERE session_id=$1`（走 `idx_billing_session`）+ 明细（带 LIMIT）。
+
+### 6.4 顺带评估的两个脆弱点（**本轮不改行为**）
+
+1. **探测行剔除用 `display_name='system-probe'` 字符串匹配**（`u.is_system OR display_name=...`）：
+   结论：确实是脆弱点，但方向是「放宽」而不是「漏删」——系统密钥改名后仍能靠 `u.is_system` 命中；
+   副作用是「真实开发者把自己的密钥命名成 system-probe + 走 cost 模式 + 恰好没写 call_log」会被误剔。
+   建议：下批改成只认 `u.is_system`，或更彻底——在账单上加显式来源标记（`billing_records.source='probe'`
+   或独立探针账单表），不再靠「字符串 + 有没有 call_log」反推。
+2. **系统用户 + cost 模式 + call_log 写失败会误剔**：
+   结论：单独看几乎不可能发生——真实用户账单的 `user_id` 不是系统用户，第 2 个条件（token 属系统身份）就已经不成立；
+   只有当「真实用户的密钥被命名成 system-probe」同时成立时才会被卷进来，也就是与第 1 点是同一个根因。
+   建议：与第 1 点同批处理（显式标记），本轮保持现状（Gate 正在按现口径用 `compare.sql` 验金额，中途改谓词会打断比对）。

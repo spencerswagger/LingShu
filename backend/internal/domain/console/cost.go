@@ -12,6 +12,7 @@ package console
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -19,6 +20,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/team/llmgateway/internal/domain/billing"
 	"github.com/team/llmgateway/internal/pkg/decimalx"
 	"github.com/team/llmgateway/internal/pkg/resp"
 )
@@ -485,44 +487,100 @@ func hasNonZeroRates(rates map[string]float64) bool {
 	return false
 }
 
-// costSessionPoint 单会话逐轮成本点。
+// 单会话成本明细的上限策略：默认 500 行、最多 2000 行（按时间正序取最早的 N 行）。
+// 失败轮也占行，长会话反复失败时行数会涨，故必须设上限并在响应里回报 Total / Truncated。
+const (
+	costSessionDefaultLimit = 500
+	costSessionMaxLimit     = 2000
+)
+
+// costSessionPoint 单会话逐轮成本点（含失败轮）。
+//
+// 两个序号刻意分开（兼容 + 不错位）：
+//   - Turn：**成功调用**的序号（1..N），失败轮为 0。成功行的 Turn 与改造前逐一相同，
+//     老调用方按 Turn 读到的成功轮数据完全不变（失败轮不会把后面的成功轮整体往后推）。
+//   - TurnNo：**时间线**序号（1..M，含失败轮），前端 x 轴用这个，失败轮占位、轴不断裂。
+//     没有失败轮时 TurnNo 恒等于 Turn。
 type costSessionPoint struct {
 	Turn            int     `json:"Turn"`
+	TurnNo          int     `json:"TurnNo"`
+	Status          string  `json:"Status"` // completed | failed（billing_records.status 的实际取值）
+	Failed          bool    `json:"Failed"` // = Status=='failed'，供前端直接判红点
 	CallTime        string  `json:"CallTime"`
 	ChannelName     string  `json:"ChannelName"`
 	InternalModelID string  `json:"InternalModelID"`
 	InputTokens     int64   `json:"InputTokens"`
 	CacheReadTokens int64   `json:"CacheReadTokens"`
 	OutputTokens    int64   `json:"OutputTokens"`
-	CostCredits     float64 `json:"CostCredits"`
-	SaleCredits     float64 `json:"SaleCredits"`
+	CostCredits     float64 `json:"CostCredits"` // 失败轮恒为 0（失败不产生成本积分）
+	SaleCredits     float64 `json:"SaleCredits"` // 失败轮恒为 0
 }
 
-// costSessionTotals 单会话成本/售价合计。
+// costSessionTotals 单会话成本/售价合计（只累加成功轮，口径与改造前一致）。
 type costSessionTotals struct {
 	CostCredits float64 `json:"CostCredits"`
 	SaleCredits float64 `json:"SaleCredits"`
 }
 
-// HandleCostSession GET /api/v1/admin/cost/session/{id}
-// 返回指定会话按 call_time 升序的逐轮成本明细与合计（仅 status='completed'）；缺 id 返回 400。
+// parseCostSessionLimit 解析会话明细的 Limit：缺省 500，上限 2000，非法报错。
+func parseCostSessionLimit(raw string) (int, error) {
+	if raw == "" {
+		return costSessionDefaultLimit, nil
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, errors.New("Limit 必须为整数")
+	}
+	if v <= 0 {
+		return costSessionDefaultLimit, nil
+	}
+	if v > costSessionMaxLimit {
+		v = costSessionMaxLimit
+	}
+	return v, nil
+}
+
+// HandleCostSession GET /api/v1/admin/cost/session/{id}?Limit=
+// 返回指定会话按 call_time 升序的逐轮成本明细与合计，**含失败轮**（Status=failed、金额 0、TurnNo 占位）；
+// 缺 id 返回 400。总量受 Limit 约束（默认 500、最多 2000），超限时 Truncated=true 并回报 Total。
+//
+// 兼容性：成功行的字段值、相对顺序、金额口径与改造前完全一致；失败行是新增行，
+// 合计仍只累加成功轮，因此老调用方读 Totals 与读成功行的结果都不变。
 func (h *Admin) HandleCostSession(w http.ResponseWriter, r *http.Request) {
 	sid := r.PathValue("id")
 	if sid == "" {
 		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "缺少会话 ID")
 		return
 	}
+	limit, err := parseCostSessionLimit(r.URL.Query().Get("Limit"))
+	if err != nil {
+		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, err.Error())
+		return
+	}
 	points := make([]costSessionPoint, 0)
 	totals := costSessionTotals{}
 	if h.db == nil {
-		resp.OK(w, r, map[string]any{"SessionID": sid, "Points": points, "Totals": totals})
+		resp.OK(w, r, map[string]any{
+			"SessionID": sid, "Points": points, "Totals": totals,
+			"Total": 0, "Limit": limit, "Truncated": false,
+		})
 		return
 	}
+
+	// 总量：用于判断是否被 Limit 截断（按会话索引，代价很小）。
+	var total int64
+	if err := h.db.QueryRowContext(r.Context(),
+		`SELECT count(*) FROM billing_records WHERE session_id = $1`, sid).Scan(&total); err != nil {
+		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "查询会话成本失败")
+		return
+	}
+
 	sqlText := fmt.Sprintf(`
 SELECT b.call_time,
        COALESCE(c.name, '') AS channel_name,
        b.channel_key_id,
        b.internal_model_id,
+       b.status,
        %s AS input_tokens,
        %s AS cache_read_tokens,
        %s AS output_tokens,
@@ -531,20 +589,21 @@ SELECT b.call_time,
 FROM billing_records b
 LEFT JOIN channel_keys k ON k.id = b.channel_key_id
 LEFT JOIN channels c ON c.id = k.channel_id
-WHERE b.session_id = $1 AND b.status = 'completed'
-ORDER BY b.call_time ASC, b.id ASC`,
+WHERE b.session_id = $1
+ORDER BY b.call_time ASC, b.id ASC
+LIMIT $2`,
 		fmt.Sprintf(costTokenRowSQL, "input"),
 		fmt.Sprintf(costTokenRowSQL, "cache_read"),
 		fmt.Sprintf(costTokenRowSQL, "output"))
 
-	rowSet, err := h.db.QueryContext(r.Context(), sqlText, sid)
+	rowSet, err := h.db.QueryContext(r.Context(), sqlText, sid, limit)
 	if err != nil {
 		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "查询会话成本失败")
 		return
 	}
 	defer rowSet.Close()
 
-	turn := 0
+	successTurn, turnNo := 0, 0
 	for rowSet.Next() {
 		var (
 			callTime time.Time
@@ -552,24 +611,34 @@ ORDER BY b.call_time ASC, b.id ASC`,
 			keyID    sql.NullInt64
 			pt       costSessionPoint
 		)
-		if err := rowSet.Scan(&callTime, &chName, &keyID, &pt.InternalModelID,
+		if err := rowSet.Scan(&callTime, &chName, &keyID, &pt.InternalModelID, &pt.Status,
 			&pt.InputTokens, &pt.CacheReadTokens, &pt.OutputTokens,
 			&pt.CostCredits, &pt.SaleCredits); err != nil {
 			resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "查询会话成本失败")
 			return
 		}
-		turn++
-		pt.Turn = turn
+		turnNo++
+		pt.TurnNo = turnNo
 		pt.CallTime = callTime.Format(time.RFC3339)
 		pt.ChannelName = chName
 		if pt.ChannelName == "" && keyID.Valid {
 			// 渠道名缺失时回退渠道密钥 ID 字符串。
 			pt.ChannelName = strconv.FormatInt(keyID.Int64, 10)
 		}
-		pt.CostCredits = decimalx.Round5(pt.CostCredits)
-		pt.SaleCredits = decimalx.Round5(pt.SaleCredits)
-		totals.CostCredits += pt.CostCredits
-		totals.SaleCredits += pt.SaleCredits
+		if pt.Status == billing.StatusCompleted {
+			successTurn++
+			pt.Turn = successTurn
+			pt.CostCredits = decimalx.Round5(pt.CostCredits)
+			pt.SaleCredits = decimalx.Round5(pt.SaleCredits)
+			totals.CostCredits += pt.CostCredits
+			totals.SaleCredits += pt.SaleCredits
+		} else {
+			// 失败轮：如实标注，金额一律 0（失败不产生成本积分），Turn 不占成功序号。
+			pt.Failed = true
+			pt.Turn = 0
+			pt.CostCredits = 0
+			pt.SaleCredits = 0
+		}
 		points = append(points, pt)
 	}
 	if err := rowSet.Err(); err != nil {
@@ -579,7 +648,10 @@ ORDER BY b.call_time ASC, b.id ASC`,
 	totals.CostCredits = decimalx.Round5(totals.CostCredits)
 	totals.SaleCredits = decimalx.Round5(totals.SaleCredits)
 
-	resp.OK(w, r, map[string]any{"SessionID": sid, "Points": points, "Totals": totals})
+	resp.OK(w, r, map[string]any{
+		"SessionID": sid, "Points": points, "Totals": totals,
+		"Total": total, "Limit": limit, "Truncated": total > int64(len(points)),
+	})
 }
 
 // cacheHitRate 缓存命中率 = cache_read ÷ (input + cache_read)；分母为 0 返回 0。
