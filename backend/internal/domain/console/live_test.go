@@ -107,7 +107,7 @@ func TestParseStatsOptions_Granularity(t *testing.T) {
 		{"30 天按天", url.Values{}, 30 * 24 * time.Hour, statsGranularityDay, false},
 		{"显式 auto + 7 天按天", url.Values{"Granularity": {"auto"}}, 7 * 24 * time.Hour, statsGranularityDay, false},
 		{"显式 hour + 2 天", url.Values{"Granularity": {"hour"}}, 48 * time.Hour, statsGranularityHour, false},
-		{"显式 hour + 3 天报错", url.Values{"Granularity": {"hour"}}, 72 * time.Hour, "", true},
+		{"显式 hour + 3 天自动降级为天", url.Values{"Granularity": {"hour"}}, 72 * time.Hour, statsGranularityDay, false},
 		{"显式 day + 24h", url.Values{"Granularity": {"day"}}, 24 * time.Hour, statsGranularityDay, false},
 		{"非法粒度", url.Values{"Granularity": {"week"}}, 24 * time.Hour, "", true},
 	}
@@ -158,6 +158,17 @@ func TestParseStatsOptions_ClampAndDefaults(t *testing.T) {
 
 	if _, err := parseStatsOptions(url.Values{"CompareDays": {"x"}}, time.Hour); err == nil {
 		t.Fatalf("非数字 CompareDays 应报错")
+	}
+
+	// Window：缺省 exact（与前端标签一致），calendar 显式生效，非法值报错。
+	if opts, err := parseStatsOptions(url.Values{}, time.Hour); err != nil || opts.Window != statsWindowExact {
+		t.Fatalf("缺省应 exact: %+v %v", opts, err)
+	}
+	if opts, err := parseStatsOptions(url.Values{"Window": {"calendar"}}, time.Hour); err != nil || opts.Window != statsWindowCalendar {
+		t.Fatalf("calendar 应生效: %+v %v", opts, err)
+	}
+	if _, err := parseStatsOptions(url.Values{"Window": {"rolling"}}, time.Hour); err == nil {
+		t.Fatalf("非法 Window 应报错")
 	}
 }
 

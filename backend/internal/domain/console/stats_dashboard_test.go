@@ -64,7 +64,7 @@ func TestHandleStatsDashboard_HourlyComparePlaza(t *testing.T) {
 
 	store := billing.NewSqlStore(db)
 
-	// 1) 总计
+	// 1) 日界口径聚合（Usage 块）
 	mock.ExpectQuery(regexp.QuoteMeta(`COALESCE(sum((first_token_ms IS NOT NULL)::int),0)`)).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"input", "output", "cache_read", "credits", "calls", "failed",
@@ -95,6 +95,13 @@ func TestHandleStatsDashboard_HourlyComparePlaza(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"bucket", "n"}).AddRow("1-3s", int64(10)))
 	mock.ExpectQuery(regexp.QuoteMeta(`percentile_disc(0.5)`)).
 		WillReturnRows(sqlmock.NewRows([]string{"p50", "p90", "p95"}).AddRow(float64(200), float64(400), float64(500)))
+	// 1b) KPI 窗口口径（严格按请求区间，同一份 SQL 的第二跑）
+	mock.ExpectQuery(regexp.QuoteMeta(`COALESCE(sum((first_token_ms IS NOT NULL)::int),0)`)).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"input", "output", "cache_read", "credits", "calls", "failed",
+			"sumdur", "sumfirst", "okdur", "okfirst", "busyreq", "busytok", "busydur",
+		}).AddRow(int64(200), int64(50), int64(20), float64(20.5), int64(12), int64(2),
+			int64(200000), int64(500), int64(12), int64(12), int64(11), int64(200), int64(100000)))
 	// 10) 上期总量（环比）
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT count(*),`)).
 		WillReturnRows(sqlmock.NewRows([]string{"calls", "credits", "tokens"}).
@@ -109,15 +116,18 @@ func TestHandleStatsDashboard_HourlyComparePlaza(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"day", "hour", "calls", "failed", "credits", "tokens", "duration"}).
 			AddRow(time.Date(2026, 10, 25, 0, 0, 0, 0, time.UTC), 9, int64(4), int64(0), float64(5), int64(60), int64(800)).
 			AddRow(time.Date(2026, 10, 24, 0, 0, 0, 0, time.UTC), 9, int64(3), int64(0), float64(4), int64(50), int64(700)))
-	// 13) 模型广场
-	mock.ExpectQuery(regexp.QuoteMeta(`LEFT JOIN agg a ON a.model = em.external_name`)).
+	// 13) 模型广场（按实体归属）
+	mock.ExpectQuery(regexp.QuoteMeta(`LEFT JOIN agg a ON a.ext_id = em.id`)).
 		WillReturnRows(sqlmock.NewRows([]string{"model", "enabled", "calls", "failed", "credits", "tokens",
-			"busy_calls", "busy_tokens", "busy_ms", "avg_ms", "avg_first"}).
-			AddRow("gpt-4o", true, int64(10), int64(1), float64(12.5), int64(170), int64(9), int64(160), int64(120000), float64(1800), float64(40)).
-			AddRow("idle-model", true, int64(0), int64(0), float64(0), int64(0), int64(0), int64(0), int64(0), float64(0), float64(0)))
-	// 14) 目录总数 / 活跃数
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT (SELECT count(*) FROM external_models WHERE deleted_at IS NULL)`)).
-		WillReturnRows(sqlmock.NewRows([]string{"total", "active"}).AddRow(int64(2), int64(1)))
+			"busy_calls", "busy_tokens", "busy_ms", "dur_sum", "dur_n", "first_sum", "first_n"}).
+			AddRow("gpt-4o", true, int64(10), int64(1), float64(12.5), int64(170), int64(9), int64(160), int64(120000), int64(18000), int64(10), int64(400), int64(10)).
+			AddRow("idle-model", true, int64(0), int64(0), float64(0), int64(0), int64(0), int64(0), int64(0), int64(0), int64(0), int64(0), int64(0)))
+	// 14) 目录总数 / 活跃数 / 未匹配用量
+	mock.ExpectQuery(regexp.QuoteMeta(`FROM agg a`)).
+		WillReturnRows(sqlmock.NewRows([]string{"total", "active", "um_calls", "um_failed", "um_credits", "um_tokens",
+			"um_busy_calls", "um_busy_tokens", "um_busy_ms", "um_dur_sum", "um_dur_n", "um_first_sum", "um_first_n"}).
+			AddRow(int64(2), int64(1), int64(0), int64(0), float64(0), float64(0),
+				int64(0), float64(0), int64(0), int64(0), int64(0), int64(0), int64(0)))
 
 	q := url.Values{
 		"From":        {"2026-10-25T02:00:00+08:00"},
@@ -149,10 +159,19 @@ func TestHandleStatsDashboard_HourlyComparePlaza(t *testing.T) {
 				TotalRequests int64   `json:"TotalRequests"`
 				TotalTokens   int64   `json:"TotalTokens"`
 				TPM           float64 `json:"TPM"`
+				WindowFrom    string  `json:"WindowFrom"`
+				WindowTo      string  `json:"WindowTo"`
+				WindowMode    string  `json:"WindowMode"`
 			} `json:"KPI"`
 			Usage struct {
 				Granularity string `json:"Granularity"`
-				Daily       []struct {
+				Total       struct {
+					Input     int64 `json:"Input"`
+					Output    int64 `json:"Output"`
+					CacheRead int64 `json:"CacheRead"`
+				} `json:"Total"`
+				TotalCall int64 `json:"TotalCall"`
+				Daily     []struct {
 					Date string `json:"Date"`
 				} `json:"Daily"`
 				Hourly []struct {
@@ -186,11 +205,21 @@ func TestHandleStatsDashboard_HourlyComparePlaza(t *testing.T) {
 		t.Fatalf("unmarshal: %v body=%s", err, string(raw))
 	}
 
-	// 老字段：语义不变
-	if body.Data.Scope != "global" || body.Data.KPI.TotalRequests != 10 || body.Data.KPI.TotalTokens != 170 {
-		t.Fatalf("KPI 漂移: %+v", body.Data.KPI)
+	// KPI 走 **KPI 窗口**（严格按请求区间）：calls=12 / tokens=200+20+50=270。
+	if body.Data.Scope != "global" || body.Data.KPI.TotalRequests != 12 || body.Data.KPI.TotalTokens != 270 {
+		t.Fatalf("KPI 应取 KPI 窗口口径: %+v", body.Data.KPI)
+	}
+	if body.Data.KPI.WindowMode != "exact" ||
+		body.Data.KPI.WindowFrom != "2026-10-25T02:00:00+08:00" ||
+		body.Data.KPI.WindowTo != "2026-10-26T02:00:00+08:00" {
+		t.Fatalf("KPI 窗口元信息错: %+v", body.Data.KPI)
 	}
 	// Daily 仍是按天、且按归一区间补零（10-25 有数据 + 10-26 补零），老口径不动。
+	// Usage 块仍是日界归一口径（calls=10 / tokens=170），与 KPI 窗口刻意不同。
+	if body.Data.Usage.TotalCall != 10 ||
+		body.Data.Usage.Total.Input+body.Data.Usage.Total.Output+body.Data.Usage.Total.CacheRead != 170 {
+		t.Fatalf("Usage 应保持日界归一口径: %+v", body.Data.Usage)
+	}
 	if len(body.Data.Usage.Daily) != 2 || body.Data.Usage.Daily[0].Date != "2026-10-25" ||
 		body.Data.Usage.Daily[1].Date != "2026-10-26" {
 		t.Fatalf("Daily 应保持按天口径，got %+v", body.Data.Usage.Daily)

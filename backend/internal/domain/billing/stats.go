@@ -131,24 +131,31 @@ func InputTokensExpr(prefix string) string {
 		+ COALESCE(NULLIF(` + p + `->>'cache_read','')::bigint,0))`
 }
 
-// Dashboard 聚合统计页所需全部数据（一次调用）。
-func (s *SqlStore) Dashboard(ctx context.Context, from, to time.Time, userID *int64, limit int) (DashboardStats, error) {
-	var out DashboardStats
-	out.From = from.Format(time.RFC3339)
-	out.To = to.Format(time.RFC3339)
-	out.Days = daysBetween(from, to)
-	// 新增字段默认给空数组（不是 null），老调用方客户端不会因为 null 崩；粒度默认 day。
-	out.Granularity = "day"
-	out.Hourly = []DashHour{}
-	out.Compare = []DashSeries{}
-	if limit <= 0 {
-		limit = 10
-	}
+// WindowTotals 区间总量与速率（KPI 口径）。
+// 与 Dashboard 的区别：**严格按传入区间统计，不做任何日界归一** ——
+// 「近 24h」就是滚动 24 小时，前端标签与数字必须一致（PR #61 Owl P2）。
+// Dashboard 内部也走这套计算（同一套 SQL 与公式），只是它传入的是日界归一的区间。
+type WindowTotals struct {
+	Total          UsageSplit
+	Credits        float64
+	Calls          int64
+	Failed         int64
+	Success        float64 // 0~1
+	AvgMS          float64
+	AvgFirst       float64
+	AvgRPM         float64 // 墙钟平均：请求数 ÷ 区间分钟数
+	AvgTPM         float64 // 墙钟平均：Token ÷ 区间分钟数
+	BusyRequests   int64   // 忙时口径分子（成功且带耗时请求数）
+	BusyDurationMS int64   // 忙时口径分母（同批请求耗时之和，毫秒）
+	BusyRPM        float64 // 忙时口径：请求数 ÷ 耗时折算分钟
+	BusyTPM        float64 // 忙时口径：Token ÷ 耗时折算分钟
+	SumDurationMS  int64   // = BusyDurationMS（前端样本标注共用）
+}
 
-	// 1) 总计 / 成功率 / 平均延迟 / 吞吐量 / Token 构成
-	var total UsageSplit
-	var totalCred float64
-	var totalCall, failed int64
+// WindowTotals 统计 [from, to] 区间的总量与速率，**不做日界归一**。
+// KPI、小时趋势与模型广场必须用同一段区间调用它旁证，避免同一份数据出现两个数。
+func (s *SqlStore) WindowTotals(ctx context.Context, from, to time.Time, userID *int64) (WindowTotals, error) {
+	var out WindowTotals
 	var sumDur, sumFirst, okDur, okFirst int64
 	// 忙时口径专用的三个量（只统计成功且带耗时的行），与 sumDur/okDur（全部行，供 AvgMS 用）互不影响。
 	var busyRequests, busyTokens, busyDur int64
@@ -169,18 +176,14 @@ func (s *SqlStore) Dashboard(ctx context.Context, from, to time.Time, userID *in
 		    COALESCE(sum(duration_ms) FILTER (WHERE `+busyFilter+`),0)
 		 FROM billing_records `+dashWhere(""),
 		dashArgs(userID, from, to)...).
-		Scan(&total.Input, &total.Output, &total.CacheRead,
-			&totalCred, &totalCall, &failed, &sumDur, &sumFirst, &okDur, &okFirst,
+		Scan(&out.Total.Input, &out.Total.Output, &out.Total.CacheRead,
+			&out.Credits, &out.Calls, &out.Failed, &sumDur, &sumFirst, &okDur, &okFirst,
 			&busyRequests, &busyTokens, &busyDur)
 	if err != nil {
 		return out, err
 	}
-	out.Total = total
-	out.TotalCred = totalCred
-	out.TotalCall = totalCall
-	out.Failed = failed
-	if totalCall > 0 {
-		out.Success = float64(totalCall-failed) / float64(totalCall)
+	if out.Calls > 0 {
+		out.Success = float64(out.Calls-out.Failed) / float64(out.Calls)
 	}
 	if okDur > 0 {
 		out.AvgMS = float64(sumDur) / float64(okDur)
@@ -189,8 +192,8 @@ func (s *SqlStore) Dashboard(ctx context.Context, from, to time.Time, userID *in
 		out.AvgFirst = float64(sumFirst) / float64(okFirst)
 	}
 	if minutes := to.Sub(from).Minutes(); minutes > 0 {
-		out.AvgRPM = float64(totalCall) / minutes
-		out.AvgTPM = float64(total.Total()) / minutes
+		out.AvgRPM = float64(out.Calls) / minutes
+		out.AvgTPM = float64(out.Total.Total()) / minutes
 	}
 	// 忙时口径：分子分母都只取「成功且带耗时」的行（busyFilter），失败请求两侧同时剔除。
 	out.BusyRequests = busyRequests
@@ -198,6 +201,42 @@ func (s *SqlStore) Dashboard(ctx context.Context, from, to time.Time, userID *in
 	out.SumDurationMS = busyDur // 前端样本标注用同一口径（忙时分母）
 	out.BusyRPM = BusyRate(float64(busyRequests), busyDur)
 	out.BusyTPM = BusyRate(float64(busyTokens), busyDur)
+	return out, nil
+}
+
+// Dashboard 聚合统计页所需全部数据（一次调用）。
+func (s *SqlStore) Dashboard(ctx context.Context, from, to time.Time, userID *int64, limit int) (DashboardStats, error) {
+	var out DashboardStats
+	out.From = from.Format(time.RFC3339)
+	out.To = to.Format(time.RFC3339)
+	out.Days = daysBetween(from, to)
+	// 新增字段默认给空数组（不是 null），老调用方客户端不会因为 null 崩；粒度默认 day。
+	out.Granularity = "day"
+	out.Hourly = []DashHour{}
+	out.Compare = []DashSeries{}
+	if limit <= 0 {
+		limit = 10
+	}
+
+	// 1) 总计 / 成功率 / 平均延迟 / 吞吐量 / Token 构成（与 WindowTotals 共用同一份计算）
+	wt, err := s.WindowTotals(ctx, from, to, userID)
+	if err != nil {
+		return out, err
+	}
+	out.Total = wt.Total
+	out.TotalCred = wt.Credits
+	out.TotalCall = wt.Calls
+	out.Failed = wt.Failed
+	out.Success = wt.Success
+	out.AvgMS = wt.AvgMS
+	out.AvgFirst = wt.AvgFirst
+	out.AvgRPM = wt.AvgRPM
+	out.AvgTPM = wt.AvgTPM
+	out.BusyRequests = wt.BusyRequests
+	out.BusyDurationMS = wt.BusyDurationMS
+	out.SumDurationMS = wt.SumDurationMS
+	out.BusyRPM = wt.BusyRPM
+	out.BusyTPM = wt.BusyTPM
 
 	if err := s.dashboardDaily(ctx, from, to, userID, &out); err != nil {
 		return out, err
@@ -484,6 +523,20 @@ const MaxCompareDays = 7
 // MaxModelLimit 模型广场单次返回的最大行数（超出按排序截断，用 Total/Truncated 告知）。
 const MaxModelLimit = 200
 
+// DashModelUnmatchedKey 「未匹配」兜底行的模型键。
+// 前端应据 DashModelStat.Unmatched 识别，不必硬编码这个字符串。
+const DashModelUnmatchedKey = "__unmatched__"
+
+// modelEntityResolveBody 账单行 → channel_models 实体解析（模型广场用）。
+// 与成本页 /cost/stats 同一思路：用 (channel_id, internal_model_id) 反查 channel_models 拿到
+// external_model_id，再按 ID 归到对外模型——模型改名、用别名调用都不会把用量丢在目录外面。
+// 同一 (channel_id, internal_model_id) 多条配置（删除后重建）时优先未删除、再取 id 最大者；
+// 软删配置仍参与解析，历史账单不因配置下线而失去归属。
+const modelEntityResolveBody = `SELECT DISTINCT ON (cm.channel_id, cm.internal_model_id)
+           cm.channel_id, cm.internal_model_id, cm.external_model_id
+    FROM channel_models cm
+    ORDER BY cm.channel_id, cm.internal_model_id, (cm.deleted_at IS NULL) DESC, cm.id DESC`
+
 // 模型广场排序键（其它值按 tokens 处理）。
 const (
 	ModelSortTokens  = "tokens"  // 窗口内 Token 用量（默认）
@@ -533,6 +586,9 @@ type DashModelStat struct {
 	AvgMS      float64 `json:"AvgMS"`      // 全程平均耗时（有耗时行）
 	AvgFirstMS float64 `json:"AvgFirstMS"` // 首字平均耗时（有首字时间的行）
 	Active     bool    `json:"Active"`     // 窗口内是否有请求（Calls>0）
+	// Unmatched 该行是「无法归属到任何在册对外模型」的兜底行（改名/别名/无渠道导致解析不到）。
+	// 这类用量不再被静默丢掉，而是作为显式的一行出现；Model 固定为 DashModelUnmatchedKey。
+	Unmatched bool `json:"Unmatched"`
 }
 
 // ModelPlaza 模型广场聚合结果（List 已按 Sort 排序并截断到 Limit）。
@@ -679,7 +735,9 @@ func modelSortExpr(sortKey string) string {
 	case ModelSortFailed:
 		return `COALESCE(a.failed,0)`
 	case ModelSortLatency:
-		return `COALESCE(a.avg_ms,0)`
+		return `CASE WHEN COALESCE(a.dur_n,0) > 0
+		             THEN COALESCE(a.dur_sum,0)::float8 / a.dur_n
+		             ELSE 0 END`
 	default:
 		return `COALESCE(a.tokens,0)`
 	}
@@ -698,12 +756,16 @@ func NormalizeModelSort(sortKey string) string {
 // DashboardModels 模型广场：以「对外模型目录」为骨架 LEFT JOIN 窗口聚合，
 // 因此窗口内零用量的模型也会出现（Calls=0、Active=false），供前端折叠。
 //
+// 归属口径（PR #61 Owl P2 修正）：用量按**实体**归到对外模型，不再用账单里的模型名去撞目录名。
+// 账单行先用 (channel_id, internal_model_id) 反查 channel_models 拿到 external_model_id，再按 ID 归属，
+// 因此模型改名、用别名调用都仍归到对应模型。确实解析不到的用量不再被静默丢掉，
+// 而是汇总成一行显式「未匹配」条目（Unmatched=true、Model=DashModelUnmatchedKey），且不受 Limit 截断。
+// 守恒：List 各行的 Calls/Failed/Tokens 之和 == 同窗口总量（含未匹配行）。
+//
 // 三个吞吐口径不要混用（详见 docs/designs/2026-10-25-stats-dashboard-backend.md）：
 //   - 首屏 KPI.TPM = 全窗口忙时口径（BusyTPM）；
 //   - 本函数 TPM = **按模型**的忙时口径（同模型成功且带耗时请求的 Token ÷ 同批耗时折算分钟）；
 //   - 实时会话 / 在线用户的 TPM = 近 Window 分钟墙钟平均（见 console.live）。
-//
-// 已从目录删除的历史模型不出现（其历史用量仍在 Dashboard.ByModel 里）。
 func (s *SqlStore) DashboardModels(ctx context.Context, from, to time.Time, userID *int64, sortKey string, limit int) (ModelPlaza, error) {
 	sortKey = NormalizeModelSort(sortKey)
 	if limit <= 0 {
@@ -714,60 +776,118 @@ func (s *SqlStore) DashboardModels(ctx context.Context, from, to time.Time, user
 	}
 	out := ModelPlaza{Sort: sortKey, Limit: limit, List: make([]DashModelStat, 0, limit)}
 
-	rows, err := s.db.QueryContext(ctx,
-		`WITH agg AS (
-		    SELECT external_model_name AS model,
-		           count(*) AS calls,
-		           COALESCE(sum((status='failed')::int),0) AS failed,
-		           COALESCE(sum(credits_consumed),0) AS credits,
-		           COALESCE(sum(`+tokenSum("")+`),0) AS tokens,
-		           COALESCE(count(*) FILTER (WHERE `+busyFilter+`),0) AS busy_calls,
-		           COALESCE(sum(`+tokenSum("")+`) FILTER (WHERE `+busyFilter+`),0) AS busy_tokens,
-		           COALESCE(sum(duration_ms) FILTER (WHERE `+busyFilter+`),0) AS busy_ms,
-		           COALESCE(avg(duration_ms) FILTER (WHERE duration_ms IS NOT NULL),0) AS avg_ms,
-		           COALESCE(avg(first_token_ms) FILTER (WHERE first_token_ms IS NOT NULL),0) AS avg_first
-		      FROM billing_records `+dashWhere("")+`
-		     GROUP BY 1
-		 )
-		 SELECT em.external_name, em.enabled,
-		        COALESCE(a.calls,0), COALESCE(a.failed,0), COALESCE(a.credits,0), COALESCE(a.tokens,0),
-		        COALESCE(a.busy_calls,0), COALESCE(a.busy_tokens,0), COALESCE(a.busy_ms,0),
-		        COALESCE(a.avg_ms,0), COALESCE(a.avg_first,0)
-		   FROM external_models em
-		   LEFT JOIN agg a ON a.model = em.external_name
-		  WHERE em.deleted_at IS NULL
-		  ORDER BY (COALESCE(a.calls,0) > 0) DESC, `+modelSortExpr(sortKey)+` DESC, em.external_name ASC
-		  LIMIT $4`, dashArgs(userID, from, to, limit)...)
+	// 聚合按「解析出的 external_model_id」分组（0 = 解析不到），再与目录按 ID 对齐。
+	aggCTE := `WITH res AS (` + modelEntityResolveBody + `),
+agg AS (
+    SELECT COALESCE(r.external_model_id, 0) AS ext_id,
+           count(*) AS calls,
+           COALESCE(sum((b.status='failed')::int),0) AS failed,
+           COALESCE(sum(b.credits_consumed),0) AS credits,
+           COALESCE(sum(` + tokenSum("b.") + `),0) AS tokens,
+           COALESCE(count(*) FILTER (WHERE ` + busyFilterOn("b.") + `),0) AS busy_calls,
+           COALESCE(sum(` + tokenSum("b.") + `) FILTER (WHERE ` + busyFilterOn("b.") + `),0) AS busy_tokens,
+           COALESCE(sum(b.duration_ms) FILTER (WHERE ` + busyFilterOn("b.") + `),0) AS busy_ms,
+           COALESCE(sum(b.duration_ms) FILTER (WHERE b.duration_ms IS NOT NULL),0) AS dur_sum,
+           COALESCE(count(*) FILTER (WHERE b.duration_ms IS NOT NULL),0) AS dur_n,
+           COALESCE(sum(b.first_token_ms) FILTER (WHERE b.first_token_ms IS NOT NULL),0) AS first_sum,
+           COALESCE(count(*) FILTER (WHERE b.first_token_ms IS NOT NULL),0) AS first_n
+      FROM billing_records b
+      LEFT JOIN channel_keys k ON k.id = b.channel_key_id
+      LEFT JOIN (` + modelEntityResolveBody + `) r
+             ON r.channel_id = k.channel_id AND r.internal_model_id = b.internal_model_id
+      ` + dashWhere("b.") + `
+     GROUP BY 1
+)`
+
+	rows, err := s.db.QueryContext(ctx, aggCTE+`
+SELECT em.external_name, em.enabled,
+       COALESCE(a.calls,0), COALESCE(a.failed,0), COALESCE(a.credits,0), COALESCE(a.tokens,0),
+       COALESCE(a.busy_calls,0), COALESCE(a.busy_tokens,0), COALESCE(a.busy_ms,0),
+       COALESCE(a.dur_sum,0), COALESCE(a.dur_n,0), COALESCE(a.first_sum,0), COALESCE(a.first_n,0)
+  FROM external_models em
+  LEFT JOIN agg a ON a.ext_id = em.id
+ WHERE em.deleted_at IS NULL
+ ORDER BY (COALESCE(a.calls,0) > 0) DESC, `+modelSortExpr(sortKey)+` DESC, em.external_name ASC
+ LIMIT $4`, dashArgs(userID, from, to, limit)...)
 	if err != nil {
 		return out, err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var it DashModelStat
-		var busyTokens int64
+		var busyTokens, durSum, durN, firstSum, firstN int64
 		if err := rows.Scan(&it.Model, &it.Enabled, &it.Calls, &it.Failed, &it.Credits, &it.Tokens,
-			&it.BusyCalls, &busyTokens, &it.BusyMS, &it.AvgMS, &it.AvgFirstMS); err != nil {
+			&it.BusyCalls, &busyTokens, &it.BusyMS, &durSum, &durN, &firstSum, &firstN); err != nil {
 			return out, err
 		}
+		fillModelStat(&it, busyTokens, durSum, durN, firstSum, firstN)
 		it.Label = it.Model
-		it.Active = it.Calls > 0
-		if it.Calls > 0 {
-			it.FailRate = float64(it.Failed) / float64(it.Calls)
-		}
-		it.TPM = BusyRate(float64(busyTokens), it.BusyMS)
 		out.List = append(out.List, it)
 	}
 	if err := rows.Err(); err != nil {
 		return out, err
 	}
+	catalogRows := len(out.List)
 
-	// 目录总数 / 窗口内活跃模型数：与 List 分离统计，避免为拿计数而全量取行。
-	if err := s.db.QueryRowContext(ctx,
-		`SELECT (SELECT count(*) FROM external_models WHERE deleted_at IS NULL),
-		        (SELECT count(DISTINCT external_model_name) FROM billing_records `+dashWhere("")+`)`,
-		dashArgs(userID, from, to)...).Scan(&out.Total, &out.Active); err != nil {
+	// 目录总数 / 有用量的在册模型数 / 未匹配用量：一条查询拿齐（同一次窗口扫描）。
+	var umCalls, umFailed, umBusyCalls, umBusyMS int64
+	var umCredits, umTokens, umBusyTokens float64
+	var umDurSum, umDurN, umFirstSum, umFirstN int64
+	if err := s.db.QueryRowContext(ctx, aggCTE+`
+SELECT (SELECT count(*) FROM external_models WHERE deleted_at IS NULL),
+       count(*) FILTER (WHERE a.ext_id > 0
+           AND EXISTS (SELECT 1 FROM external_models em WHERE em.id = a.ext_id AND em.deleted_at IS NULL)),
+       COALESCE(sum(a.calls) FILTER (WHERE a.ext_id = 0),0),
+       COALESCE(sum(a.failed) FILTER (WHERE a.ext_id = 0),0),
+       COALESCE(sum(a.credits) FILTER (WHERE a.ext_id = 0),0),
+       COALESCE(sum(a.tokens) FILTER (WHERE a.ext_id = 0),0),
+       COALESCE(sum(a.busy_calls) FILTER (WHERE a.ext_id = 0),0),
+       COALESCE(sum(a.busy_tokens) FILTER (WHERE a.ext_id = 0),0),
+       COALESCE(sum(a.busy_ms) FILTER (WHERE a.ext_id = 0),0),
+       COALESCE(sum(a.dur_sum) FILTER (WHERE a.ext_id = 0),0),
+       COALESCE(sum(a.dur_n) FILTER (WHERE a.ext_id = 0),0),
+       COALESCE(sum(a.first_sum) FILTER (WHERE a.ext_id = 0),0),
+       COALESCE(sum(a.first_n) FILTER (WHERE a.ext_id = 0),0)
+  FROM agg a`, dashArgs(userID, from, to)...).
+		Scan(&out.Total, &out.Active,
+			&umCalls, &umFailed, &umCredits, &umTokens, &umBusyCalls, &umBusyTokens, &umBusyMS,
+			&umDurSum, &umDurN, &umFirstSum, &umFirstN); err != nil {
 		return out, err
 	}
-	out.Truncated = out.Total > len(out.List)
+
+	// 未匹配用量显式成行：不参与 Total/Active（那是目录口径），也不受 Limit 截断（否则就是静默丢量）。
+	if umCalls > 0 {
+		it := DashModelStat{
+			Model:     DashModelUnmatchedKey,
+			Label:     "未匹配模型",
+			Enabled:   false,
+			Calls:     umCalls,
+			Failed:    umFailed,
+			Credits:   umCredits,
+			Tokens:    int64(umTokens),
+			BusyCalls: umBusyCalls,
+			BusyMS:    umBusyMS,
+			Unmatched: true,
+		}
+		fillModelStat(&it, int64(umBusyTokens), umDurSum, umDurN, umFirstSum, umFirstN)
+		out.List = append(out.List, it)
+	}
+	out.Truncated = out.Total > catalogRows
 	return out, nil
+}
+
+// fillModelStat 由原始计数填派生指标（失败率 / 忙时 TPM / 平均耗时）。
+// 用「和 ÷ 次数」而不是 avg()，是为了让多组合并（改名/别名归并、未匹配汇总）后仍然精确。
+func fillModelStat(it *DashModelStat, busyTokens, durSum, durN, firstSum, firstN int64) {
+	it.Active = it.Calls > 0
+	if it.Calls > 0 {
+		it.FailRate = float64(it.Failed) / float64(it.Calls)
+	}
+	it.TPM = BusyRate(float64(busyTokens), it.BusyMS)
+	if durN > 0 {
+		it.AvgMS = float64(durSum) / float64(durN)
+	}
+	if firstN > 0 {
+		it.AvgFirstMS = float64(firstSum) / float64(firstN)
+	}
 }

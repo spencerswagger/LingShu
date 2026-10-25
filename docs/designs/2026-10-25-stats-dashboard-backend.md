@@ -26,13 +26,31 @@
 
 | 参数 | 取值 | 默认 | 说明 |
 |---|---|---|---|
-| `Granularity` | `auto` \| `hour` \| `day` | 缺省视为 `auto` | 出桶粒度。`auto`：跨度 ≤ 26 小时按小时，否则按天。显式 `hour` 时跨度 > 2 天返回 400（防止上千个小时桶）。显式 `day` = 老口径。 |
+| `Granularity` | `auto` \| `hour` \| `day` | 缺省视为 `auto` | 出桶粒度。`auto`：跨度 ≤ 26 小时按小时，否则按天。显式 `hour` 但跨度 > 2 天时**自动降级为 `day`（不报错）**——前端漏传 `From`/`To` 也不会拿到 400。显式 `day` = 老口径。 |
+| `Window` | `exact` \| `calendar` | `exact` | **KPI 窗口模式**（见 §2.0）。`exact`：首屏三个大数字 / 小时趋势 / 模型广场严格按 `From`~`To`（近 24h 就是滚动 24 小时）；`calendar`：退回日界归一（改造前行为，给需要旧数字的调用方）。 |
 | `CompareDays` | 0~7 | `0`（关闭） | 同期对比天数（含今天）。前端四线图传 `4`。 |
 | `ModelSort` | `tokens` \| `tpm` \| `failed` \| `latency` | `tokens` | 模型广场排序键。非法值回落 `tokens`（不报错）。 |
 | `ModelLimit` | 1~200 | `50` | 模型广场返回行数上限，超出按上限收敛。 |
 
 参数错误一律 400（`From`/`To` 格式、`Granularity` 非法、`CompareDays`/`ModelLimit` 非数字），
 越界数值直接收敛到上下限（不报错）。
+
+### 2.0 窗口口径（KPI / 趋势 / 模型广场同一窗口）
+
+**两套窗口刻意分开**（PR #61 Owl P2 修正）：
+
+| 窗口 | 覆盖范围 | 谁用 |
+|---|---|---|
+| **KPI 窗口** | 默认 = 请求的 `From`~`To` 原始区间（滚动窗口，不做日界归一） | 首屏三个大数字（`KPI`）、`Usage.Hourly`（趋势）、`ModelPlaza` |
+| **日界窗口** | `From`/`To` 按 Asia/Shanghai 归一整天（`00:00:00`~`23:59:59`） | `Usage.Daily` 与既有按天/维度聚合字段（`ByModel`/`ByKey`/…/延迟分位） |
+
+- 改造前首屏数字走日界窗口，标签写「近 24h」却覆盖最长 48 小时（同一请求出现过 36240 vs 23880）。
+  现在默认走 KPI 窗口，标签与数字一致；`Window=calendar` 可退回旧行为。
+- 自定义区间同理：`From`/`To` 传什么就算什么，不再偷偷扩到自然日边界。
+- 响应里新增 `KPI.WindowFrom` / `KPI.WindowTo` / `KPI.WindowMode`，标明这三个数字实际覆盖的区间——
+  前端窗口标签请直接读它们，不要自己拼。
+- 环比（`Delta*`）也改为「KPI 窗口等长的前一窗口」，与首屏数字同源。
+- 不带 `From`/`To` 时默认区间仍是「now 往前 29×24h」（与改造前默认跨度一致）；前端各预设都显式传 `From`/`To`。
 
 ### 2.1 `Usage` 块新增字段（老字段不动）
 
@@ -91,9 +109,27 @@
 | `BusyCalls` / `BusyMS` | int64 | 忙时口径的分子（成功且带耗时请求数）/ 分母（同批耗时之和） |
 | `AvgMS` / `AvgFirstMS` | float64 | 全程平均耗时 / 首字平均耗时 |
 | `Active` | bool | 窗口内是否有请求（`Calls>0`），**前端据此折叠空闲模型** |
+| `Unmatched` | bool | **新增**。该行是「解析不到归属」的兜底行（`Model="__unmatched__"`），见下方说明 |
 
 零用量模型（`Calls=0, Active=false`）排在有请求的模型之后。
-广场以「对外模型目录」为骨架：已从目录删除的历史模型不出现，其历史用量仍在 `Usage.ByModel`。
+
+**归属口径（PR #61 Owl P2 修正）**：用量按**实体**归到对外模型，不再拿账单里的模型名去撞目录名。
+账单行先用 `(channel_id, internal_model_id)` 反查 `channel_models` 拿到 `external_model_id`，再按 ID 归属——
+模型改名、用别名调用都仍归到对应模型（改造前这部分用量会在广场里整块消失）。
+
+确实解析不到的用量不会被丢掉，而是汇总成**一行显式条目**：
+
+| 字段 | 值 | 说明 |
+|---|---|---|
+| `Model` | `"__unmatched__"` | 固定哨兵串 |
+| `Label` | `"未匹配模型"` | 展示名 |
+| `Unmatched` | `true` | **新增字段**，前端据此识别（不必硬编码 Model 串） |
+| `Enabled` | `false` | 不对应任何在册模型 |
+
+- 未匹配行**不参与** `Total` / `Active`（那两个是「对外模型目录」口径），也**不受 `Limit` 截断**（否则就是静默丢量）；
+  它恒排在 `List` 末尾。
+- 守恒：`List` 各行 `Calls` / `Failed` / `Tokens` 之和 == 同窗口总量（含未匹配行）。
+  单测 `TestDashboardModels_UnmatchedRowAppended`、集成测试 `TestStats_WindowAndPlaza` 守这条。
 
 ---
 
@@ -207,7 +243,9 @@ DB 的 `sessions` 表是投影、不含 `Inflight`，**不能**用来判「正�
 | 无在用会话 | `Sessions=[]`、`Users=[]`、`SessionsTotal=0`、`UsersTotal=0`，不查 DB |
 | 会话注册表未装配 | 降级为空结果，不报错 |
 | DB 未装配 | 会话列表仍返回（带 `Inflight`），数值列为 0 |
-| 超大模型数 | `ModelLimit` 上限 200 + `Total`/`Truncated`；零用量模型排后面 |
+| 超大模型数 | `ModelLimit` 上限 200 + `Total`/`Truncated`；零用量模型排后面；「未匹配」行始终返回 |
+| 改名 / 别名调用 | 靠实体解析归到同一对外模型，不再丢量 |
+| 解析不到的用量 | 汇总成 `Unmatched=true` 的一行，不静默丢弃 |
 | 极高并发 | 单次参与聚合的请求中会话上限 500、在线用户上限 100（`UsersTruncated` 标记） |
 | 参数越界 | 数值收敛到上下限；格式/枚举错误 400 |
 
@@ -227,6 +265,10 @@ DB 的 `sessions` 表是投影、不含 `Inflight`，**不能**用来判「正�
 
 - 不传任何新参数：`Granularity` 按 `auto` 判定（跨度 ≤26h 会给小时桶，**新增字段**），
   `Compare` 为空数组，`ModelPlaza` 照常返回（新增顶层块）。
+- **口径变化（默认行为）**：`KPI`（首屏三个大数字）从「日界归一窗口」改为「请求区间严格窗口」，
+  数字可能与改造前不同（尤其区间首尾不在整点/日界时）。`Usage.Daily` 与各维度聚合字段口径不变；
+  需要旧数字的调用方传 `Window=calendar`。
+- `Granularity=hour` 遇长区间不再 400，改为自动按天（`Usage.Granularity` 会如实回报 `day`）。
   `KPI`、`Usage.Daily`、`Usage.ByModel/ByKey/ByUser/ByMode/Errors/Latency`、`Usage.Total*`、`Ops` 全部保持原语义，
   一条 SQL、一个计算公式都没改。
 - 旧前端忽略新字段即可继续工作；`Usage.Hourly`/`Usage.Compare` 在无数据时是 `[]` 而非 `null`，不会打崩渲染。

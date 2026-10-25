@@ -36,6 +36,12 @@ type statsKPI struct {
 	DeltaTokens   float64 `json:"DeltaTokens"` // 环比上期（比例，可为负）
 	DeltaCredits  float64 `json:"DeltaCredits"`
 	DeltaRequests float64 `json:"DeltaRequests"`
+	// 以下三个字段说明「首屏三个大数字实际覆盖的时间窗」：
+	// 默认窗口 = 请求原始区间（近 24h 就是滚动 24 小时），与趋势图、模型广场同一窗口；
+	// Usage.Daily 等「按自然日」字段仍是日界归一口径，两者刻意不同，别混用（PR #61 Owl P2）。
+	WindowFrom string `json:"WindowFrom"` // RFC3339
+	WindowTo   string `json:"WindowTo"`   // RFC3339
+	WindowMode string `json:"WindowMode"` // exact（默认）| calendar
 }
 
 // statsCounts 三态计数（密钥 / 内部模型共用）。
@@ -97,6 +103,10 @@ const (
 	statsHourHardSpan = 48 * time.Hour
 
 	statsDefaultModelLimit = 50
+
+	// KPI 窗口模式：exact = 严格按请求区间（默认，与前端标签一致）；calendar = 日界归一（旧行为）。
+	statsWindowExact    = "exact"
+	statsWindowCalendar = "calendar"
 )
 
 // parseRFC3339Lenient 解析 RFC3339 时间，并兼容查询串中未编码的 '+'：'2026-10-15T23:59:59+08:00'
@@ -166,8 +176,10 @@ func resolveGranularity(q url.Values, span time.Duration) (string, error) {
 	case statsGranularityAuto:
 		return autoGranularity(span), nil
 	case statsGranularityHour:
+		// 跨度过大时**自动降级为天**（不报错）：显式请求 hour 但没带 From/To（默认近 30 天）也照样可用，
+		// 避免前端因为少了两个参数就拿到 400。
 		if span > statsHourHardSpan {
-			return "", errors.New("Granularity=hour 仅支持跨度不超过 2 天的区间，更长区间请按天（day）")
+			return statsGranularityDay, nil
 		}
 		return statsGranularityHour, nil
 	case statsGranularityDay:
@@ -190,6 +202,7 @@ type statsQueryOptions struct {
 	CompareDays int    // 0=不返回同期对比
 	ModelSort   string // tokens | tpm | failed | latency
 	ModelLimit  int
+	Window      string // exact（默认）| calendar
 }
 
 // parseStatsOptions 解析增量可选参数。缺省：粒度按区间自动判定，不做同期对比，
@@ -203,6 +216,17 @@ func parseStatsOptions(q url.Values, span time.Duration) (statsQueryOptions, err
 		Granularity: granularity,
 		ModelSort:   billing.NormalizeModelSort(q.Get("ModelSort")),
 		ModelLimit:  statsDefaultModelLimit,
+		Window:      statsWindowExact,
+	}
+	switch w := q.Get("Window"); w {
+	case "":
+		// 默认严格按请求区间：标签写「近 24h」就必须是滚动 24 小时。
+	case statsWindowExact:
+		opts.Window = statsWindowExact
+	case statsWindowCalendar:
+		opts.Window = statsWindowCalendar
+	default:
+		return statsQueryOptions{}, errors.New("Window 取值应为 exact / calendar")
 	}
 	if v := q.Get("CompareDays"); v != "" {
 		n, err := strconv.Atoi(v)
@@ -250,49 +274,68 @@ func deltaRatio(cur, prev float64) float64 {
 	return (cur - prev) / prev
 }
 
-// buildKPI 由聚合结果 + 上期总量构造 KPI 块。
-func buildKPI(ds billing.DashboardStats, prevCalls int64, prevCredits, prevTokens float64) statsKPI {
+// buildKPI 由**KPI 窗口**的总量（billing.WindowTotals）+ 上期总量构造 KPI 块。
+// 注意：入参是 WindowTotals 而不是 DashboardStats —— 首屏数字必须与趋势图/模型广场同窗口，
+// 不能再用日界归一的聚合结果（PR #61 Owl P2）。
+func buildKPI(wt billing.WindowTotals, prevCalls int64, prevCredits, prevTokens float64) statsKPI {
 	return statsKPI{
-		TotalTokens:     ds.Total.Total(),
-		TotalCredits:    decimalx.Round5(ds.TotalCred),
-		TotalRequests:   ds.TotalCall,
-		FailedRequests:  ds.Failed,
-		SuccessRate:     ds.Success,
-		AvgDurationMS:   decimalx.Round2(ds.AvgMS),
-		AvgFirstTokenMS: decimalx.Round2(ds.AvgFirst),
-		// 长区间（统计页默认近 30 天）不用墙钟平均，改用忙时处理速率：请求数/Token ÷ 耗时之和折算的分钟数。
-		RPM:           decimalx.Round2(ds.BusyRPM),
-		TPM:           decimalx.Round2(ds.BusyTPM),
-		BusyRequests:  ds.BusyRequests,
-		SumDurationMS: ds.SumDurationMS,
-		DeltaTokens:   decimalx.Round5(deltaRatio(float64(ds.Total.Total()), prevTokens)),
-		DeltaCredits:  decimalx.Round5(deltaRatio(ds.TotalCred, prevCredits)),
-		DeltaRequests: decimalx.Round5(deltaRatio(float64(ds.TotalCall), float64(prevCalls))),
+		TotalTokens:     wt.Total.Total(),
+		TotalCredits:    decimalx.Round5(wt.Credits),
+		TotalRequests:   wt.Calls,
+		FailedRequests:  wt.Failed,
+		SuccessRate:     wt.Success,
+		AvgDurationMS:   decimalx.Round2(wt.AvgMS),
+		AvgFirstTokenMS: decimalx.Round2(wt.AvgFirst),
+		// 长区间不用墙钟平均，改用忙时处理速率：请求数/Token ÷ 耗时之和折算的分钟数。
+		RPM:           decimalx.Round2(wt.BusyRPM),
+		TPM:           decimalx.Round2(wt.BusyTPM),
+		BusyRequests:  wt.BusyRequests,
+		SumDurationMS: wt.SumDurationMS,
+		DeltaTokens:   decimalx.Round5(deltaRatio(float64(wt.Total.Total()), prevTokens)),
+		DeltaCredits:  decimalx.Round5(deltaRatio(wt.Credits, prevCredits)),
+		DeltaRequests: decimalx.Round5(deltaRatio(float64(wt.Calls), float64(prevCalls))),
 	}
 }
 
-// buildStatsUsage 拉取区间聚合 + 上期总量并组装响应（scope 由 userID 决定）。
-// 既有口径（KPI / Usage.Daily / 各 Top）完全沿用整天归一的 [rg.From, rg.To]；
-// 新增能力（小时桶 / 同期对比 / 模型广场）走 opts，缺省时行为与改动前一致。
+// buildStatsUsage 拉取区间聚合 + KPI 窗口总量并组装响应（scope 由 userID 决定）。
+//
+// 两套窗口刻意分开，别混用：
+//   - **KPI 窗口**（默认 = 请求原始区间）：首屏三个大数字、小时趋势、模型广场共用，
+//     所以「近 24h」就是滚动 24 小时，标签与数字一致（PR #61 Owl P2）；
+//   - **日界窗口**（rg.From/rg.To，按 Asia/Shanghai 归一整天）：仅供 `Usage.Daily` 与既有的
+//     按天/维度聚合字段使用，口径与改造前完全一致（前端另有用途）。
+//
+// Window=calendar 时 KPI 窗口退回日界窗口（等价改造前行为），供需要旧数字的调用方使用。
 func buildStatsUsage(ctx context.Context, store *billing.SqlStore, rg statsRange, userID *int64, scope string, opts statsQueryOptions) (statsResp, error) {
+	// 日界口径聚合（老字段：Usage.Daily / 各 Top / 延迟分位 等，语义不变）。
 	from, to := rg.From, rg.To
 	ds, err := store.Dashboard(ctx, from, to, userID, 10)
 	if err != nil {
 		return statsResp{}, err
 	}
-	// 上期：等长时间窗（紧邻当前区间之前）。
-	span := to.Sub(from)
-	prevFrom := from.Add(-span - time.Second)
-	prevTo := from.Add(-time.Second)
+
+	// KPI 窗口：默认严格用请求原始区间；calendar 模式才退回日界区间。
+	winFrom, winTo := rg.ExactFrom, rg.ExactTo
+	if opts.Window == statsWindowCalendar {
+		winFrom, winTo = from, to
+	}
+	wt, err := store.WindowTotals(ctx, winFrom, winTo, userID)
+	if err != nil {
+		return statsResp{}, err
+	}
+	// 环比上期：与 KPI 窗口等长、紧邻其前。
+	span := winTo.Sub(winFrom)
+	prevFrom := winFrom.Add(-span - time.Second)
+	prevTo := winFrom.Add(-time.Second)
 	prevCalls, prevCredits, prevTokens, err := store.RangeTotals(ctx, prevFrom, prevTo, userID)
 	if err != nil {
 		return statsResp{}, err
 	}
 
-	// 小时桶 / 同期对比用请求原始区间（不整天归一），否则「近 24h」会被拉长到最多 48 小时。
+	// 小时桶 / 同期对比 / 模型广场：全部落在同一个 KPI 窗口上。
 	ds.Granularity = opts.Granularity
 	if opts.Granularity == statsGranularityHour {
-		hourly, err := store.DashboardHourly(ctx, rg.ExactFrom, rg.ExactTo, userID)
+		hourly, err := store.DashboardHourly(ctx, winFrom, winTo, userID)
 		if err != nil {
 			return statsResp{}, err
 		}
@@ -301,7 +344,7 @@ func buildStatsUsage(ctx context.Context, store *billing.SqlStore, rg statsRange
 		}
 	}
 	if opts.CompareDays > 0 {
-		compare, err := store.DashboardCompare(ctx, rg.ExactTo, userID, opts.CompareDays)
+		compare, err := store.DashboardCompare(ctx, winTo, userID, opts.CompareDays)
 		if err != nil {
 			return statsResp{}, err
 		}
@@ -309,15 +352,19 @@ func buildStatsUsage(ctx context.Context, store *billing.SqlStore, rg statsRange
 			ds.Compare = compare
 		}
 	}
-	plaza, err := store.DashboardModels(ctx, from, to, userID, opts.ModelSort, opts.ModelLimit)
+	plaza, err := store.DashboardModels(ctx, winFrom, winTo, userID, opts.ModelSort, opts.ModelLimit)
 	if err != nil {
 		return statsResp{}, err
 	}
+	kpi := buildKPI(wt, prevCalls, prevCredits, float64(prevTokens))
+	kpi.WindowFrom = winFrom.Format(time.RFC3339)
+	kpi.WindowTo = winTo.Format(time.RFC3339)
+	kpi.WindowMode = opts.Window
 	return statsResp{
 		Scope:      scope,
 		From:       from.Format(time.RFC3339),
 		To:         to.Format(time.RFC3339),
-		KPI:        buildKPI(ds, prevCalls, prevCredits, float64(prevTokens)),
+		KPI:        kpi,
 		Usage:      ds,
 		ModelPlaza: plaza,
 	}, nil

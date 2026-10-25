@@ -89,6 +89,15 @@ func (s *SqlStore) ListRecords(ctx context.Context, f RecordFilter) ([]Record, i
 // 该常量是 RecordSummary 与 DashboardStats 两处忙时口径的唯一来源，避免两处漂移。
 const busyFilter = `status = 'completed' AND duration_ms IS NOT NULL`
 
+// busyFilterOn 返回带表别名的忙时过滤条件（busyFilter 的前缀版本，口径完全一致）。
+// 多表 JOIN 的查询（模型广场按实体聚合）必须限定别名，否则列名有歧义。
+func busyFilterOn(prefix string) string {
+	if prefix == "" {
+		return busyFilter
+	}
+	return prefix + `status = 'completed' AND ` + prefix + `duration_ms IS NOT NULL`
+}
+
 // RecordSummary 账单筛选聚合结果（统计栏）：请求数、总积分、总 token（三段求和）、总耗时、
 // 以及「忙时处理速率」口径的 RPM/TPM（见 BusyRPM/BusyTPM）。
 // 注：三段互斥（输入为纯输入、不含缓存读），总量统计直接求和 input/cache_read/output

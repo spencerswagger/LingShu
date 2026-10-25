@@ -216,18 +216,21 @@ func TestDashboardModels_SortZeroUsageAndTruncate(t *testing.T) {
 	from := time.Date(2026, 10, 25, 0, 0, 0, 0, time.UTC)
 	to := time.Date(2026, 10, 25, 23, 59, 59, 0, time.UTC)
 
-	mock.ExpectQuery(regexp.QuoteMeta(`LEFT JOIN agg a ON a.model = em.external_name`)).
-		WillReturnRows(sqlmock.NewRows([]string{"model", "enabled", "calls", "failed", "credits", "tokens",
-			"busy_calls", "busy_tokens", "busy_ms", "avg_ms", "avg_first"}).
-			// 活跃模型：10 次请求 1 次失败；忙时分母 60000ms → TPM = 300 / 1min = 300
+	mock.ExpectQuery(regexp.QuoteMeta(`LEFT JOIN agg a ON a.ext_id = em.id`)).
+		WillReturnRows(sqlmock.NewRows(modelRowCols()).
+			// 活跃模型：10 次请求 1 次失败；忙时分母 60000ms → TPM = 300 / 1min = 300；
+			// 耗时和 20000ms / 10 次 → AvgMS 2000；首字和 4000 / 10 → 400。
 			AddRow("gpt-4o", true, int64(10), int64(1), float64(12.5), int64(1000),
-				int64(9), int64(300), int64(60000), float64(2000), float64(400)).
+				int64(9), int64(300), int64(60000), int64(20000), int64(10), int64(4000), int64(10)).
 			// 空闲模型：零用量
 			AddRow("claude-3", true, int64(0), int64(0), float64(0), int64(0),
-				int64(0), int64(0), int64(0), float64(0), float64(0)))
+				int64(0), int64(0), int64(0), int64(0), int64(0), int64(0), int64(0)))
 
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT (SELECT count(*) FROM external_models WHERE deleted_at IS NULL)`)).
-		WillReturnRows(sqlmock.NewRows([]string{"total", "active"}).AddRow(int64(5), int64(1)))
+	mock.ExpectQuery(regexp.QuoteMeta(`FROM agg a`)).
+		WillReturnRows(sqlmock.NewRows(modelTotalsCols()).
+			AddRow(int64(5), int64(1),
+				int64(0), int64(0), float64(0), float64(0),
+				int64(0), float64(0), int64(0), int64(0), int64(0), int64(0), int64(0)))
 
 	out, err := store.DashboardModels(context.Background(), from, to, nil, ModelSortTPM, 200)
 	if err != nil {
@@ -270,11 +273,13 @@ func TestDashboardModels_DefaultSortAndLimit(t *testing.T) {
 	defer db.Close()
 	store := NewSqlStore(db)
 
-	mock.ExpectQuery(regexp.QuoteMeta(`LEFT JOIN agg a ON a.model = em.external_name`)).
-		WillReturnRows(sqlmock.NewRows([]string{"model", "enabled", "calls", "failed", "credits", "tokens",
-			"busy_calls", "busy_tokens", "busy_ms", "avg_ms", "avg_first"}))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT (SELECT count(*) FROM external_models WHERE deleted_at IS NULL)`)).
-		WillReturnRows(sqlmock.NewRows([]string{"total", "active"}).AddRow(int64(0), int64(0)))
+	mock.ExpectQuery(regexp.QuoteMeta(`LEFT JOIN agg a ON a.ext_id = em.id`)).
+		WillReturnRows(sqlmock.NewRows(modelRowCols()))
+	mock.ExpectQuery(regexp.QuoteMeta(`FROM agg a`)).
+		WillReturnRows(sqlmock.NewRows(modelTotalsCols()).
+			AddRow(int64(0), int64(0),
+				int64(0), int64(0), float64(0), float64(0),
+				int64(0), float64(0), int64(0), int64(0), int64(0), int64(0), int64(0)))
 
 	out, err := store.DashboardModels(context.Background(), time.Now(), time.Now(), nil, "", 0)
 	if err != nil {
@@ -288,5 +293,91 @@ func TestDashboardModels_DefaultSortAndLimit(t *testing.T) {
 	}
 	if out.Truncated {
 		t.Fatalf("空目录不应标记截断")
+	}
+}
+
+// modelRowCols 模型广场列表查询的列（顺序与实现一致）。
+func modelRowCols() []string {
+	return []string{"model", "enabled", "calls", "failed", "credits", "tokens",
+		"busy_calls", "busy_tokens", "busy_ms", "dur_sum", "dur_n", "first_sum", "first_n"}
+}
+
+// modelTotalsCols 模型广场总量查询的列（目录总数 / 活跃数 / 未匹配汇总）。
+func modelTotalsCols() []string {
+	return []string{"total", "active", "um_calls", "um_failed", "um_credits", "um_tokens",
+		"um_busy_calls", "um_busy_tokens", "um_busy_ms", "um_dur_sum", "um_dur_n", "um_first_sum", "um_first_n"}
+}
+
+// TestDashboardModels_UnmatchedRowAppended 断言解析不到的用量不会被静默丢掉：
+// 它作为显式一行（Unmatched=true）追加在列表末尾，且不参与 Total/Active。
+func TestDashboardModels_UnmatchedRowAppended(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+	store := NewSqlStore(db)
+
+	mock.ExpectQuery(regexp.QuoteMeta(`LEFT JOIN agg a ON a.ext_id = em.id`)).
+		WillReturnRows(sqlmock.NewRows(modelRowCols()).
+			AddRow("gpt-4o", true, int64(10), int64(1), float64(12.5), int64(1000),
+				int64(9), int64(300), int64(60000), int64(20000), int64(10), int64(4000), int64(10)))
+	mock.ExpectQuery(regexp.QuoteMeta(`FROM agg a`)).
+		WillReturnRows(sqlmock.NewRows(modelTotalsCols()).
+			AddRow(int64(3), int64(1),
+				int64(7), int64(2), float64(0.7), float64(70), // 未匹配：7 次请求 / 2 失败 / 70 token
+				int64(5), float64(50), int64(10000), int64(9000), int64(5), int64(1000), int64(5)))
+
+	out, err := store.DashboardModels(context.Background(), time.Now(), time.Now(), nil, ModelSortTokens, 50)
+	if err != nil {
+		t.Fatalf("DashboardModels: %v", err)
+	}
+	if len(out.List) != 2 {
+		t.Fatalf("行数=%d，want 2（1 个目录行 + 1 个未匹配行）", len(out.List))
+	}
+	um := out.List[1]
+	if !um.Unmatched || um.Model != DashModelUnmatchedKey || um.Label != "未匹配模型" {
+		t.Fatalf("未匹配行标记错: %+v", um)
+	}
+	if um.Calls != 7 || um.Failed != 2 || um.Tokens != 70 || !um.Active {
+		t.Fatalf("未匹配行用量错: %+v", um)
+	}
+	if um.FailRate != 2.0/7.0 {
+		t.Fatalf("未匹配行失败率=%v", um.FailRate)
+	}
+	if um.TPM != 300 { // 50 token / (10000ms/60000) = 300
+		t.Fatalf("未匹配行 TPM=%v，want 300", um.TPM)
+	}
+	if um.AvgMS != 1800 { // 9000/5
+		t.Fatalf("未匹配行 AvgMS=%v，want 1800", um.AvgMS)
+	}
+	if um.AvgFirstMS != 200 { // 1000/5
+		t.Fatalf("未匹配行 AvgFirstMS=%v，want 200", um.AvgFirstMS)
+	}
+	// 未匹配行不计入目录口径的 Total/Active。
+	if out.Total != 3 || out.Active != 1 {
+		t.Fatalf("目录口径错: Total=%d Active=%d", out.Total, out.Active)
+	}
+}
+
+// TestFillModelStat_MergedGroups 断言合并分组（改名/别名归并）后的派生指标仍精确：
+// 用「和 ÷ 次数」而不是 avg-of-avg。
+func TestFillModelStat_MergedGroups(t *testing.T) {
+	it := DashModelStat{Calls: 4, Failed: 1, BusyMS: 120000}
+	fillModelStat(&it, 600, 8000, 4, 1200, 4)
+	if it.FailRate != 0.25 {
+		t.Fatalf("失败率=%v want 0.25", it.FailRate)
+	}
+	if it.TPM != 300 { // 600 token / 2 分钟
+		t.Fatalf("TPM=%v want 300", it.TPM)
+	}
+	if it.AvgMS != 2000 || it.AvgFirstMS != 300 {
+		t.Fatalf("均值=%v/%v want 2000/300", it.AvgMS, it.AvgFirstMS)
+	}
+	// 分母为 0 时保持 0（不产生 Inf/NaN）。
+	zero := DashModelStat{}
+	fillModelStat(&zero, 0, 0, 0, 0, 0)
+	if zero.TPM != 0 || zero.AvgMS != 0 || zero.AvgFirstMS != 0 || zero.FailRate != 0 {
+		t.Fatalf("零样本应全 0: %+v", zero)
 	}
 }
