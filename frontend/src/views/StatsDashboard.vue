@@ -1,19 +1,28 @@
 <script setup lang="ts">
-// 统计页（admin 全局 / dev 本人共用），版式按 spencer 定稿 demo（stats-demo-pc / stats-demo）落地：
-//   ① 首屏 3 个大数字（总 Token / 总消费积分 / 吞吐量，各带窗口标签）
-//   ② 一条小指标行（总请求数 / 成功率 / 平均耗时 / 请求中会话 / 请求中用户）
-//   ③ 上下两张图：24h 用量趋势（今天/昨天/前天/大前天四线、按小时、缺数据断线）+ 模型广场
-//   ④ 底部实时会话区：我的会话 + 在线用户（30s 定时刷新框架）
+// 统计页（admin 全局 / dev 本人共用），版式按定稿 demo，数据接后端真实接口：
+//   ① 首屏 3 个大数字（总 Token / 总消费积分 / 吞吐量）+ 5 项小指标
+//   ② 24h 四日对比趋势（今天/昨天/前天/大前天，按 HourOfDay 对齐，缺桶断线）
+//   ③ 模型广场（后端已排序 + 截断，含零用量模型供折叠）
+//   ④ 实时区（/stats/live，30s 刷新）：我的会话 / 在线用户
 //
-// 本轮只做前端布局与组件结构，不接后端新接口：
-//   - 小时粒度趋势、按模型吞吐/首字/全程、实时会话/在线用户 均无接口 → 统一用「--」或骨架占位，
-//     绝不写死假数据冒充真实值；
-//   - 统计口径与接口契约不变（仍只调 /admin|/dev/stats/dashboard）。
+// 三个吞吐口径刻意区分（见 docs/designs/2026-10-25-stats-dashboard-backend.md §4）：
+//   首屏      = KPI.TPM            全窗口忙时口径（≈60÷同批请求平均耗时）
+//   模型广场  = List[].TPM         按模型忙时口径
+//   实时区    = Sessions/Users.TPM 近 60 分钟墙钟平均（含排队空转，天然更低）
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import type { EChartsCoreOption } from 'echarts/core'
 import { ElMessage } from 'element-plus'
 import { useAuthStore } from '@/stores/auth'
-import { getStatsDashboard, type StatsDashboard, type StatsTopItem } from '@/api/stats'
+import {
+  getStatsDashboard,
+  getStatsLive,
+  type StatsDashboard,
+  type StatsHour,
+  type StatsLive,
+  type StatsTopItem,
+  type StatsModelStat,
+  type StatsModelPlaza,
+} from '@/api/stats'
 import { listAnnouncements, type AdminAnnouncement } from '@/api/admin'
 import { listDevAnnouncements } from '@/api/dev'
 import { toRFC3339CN } from '@/utils/format'
@@ -29,10 +38,14 @@ const errInfo = ref<{ message: string; requestId: string }>({ message: '', reque
 const announcements = ref<AdminAnnouncement[]>([])
 
 // ===== 时间范围：近 24h / 7 / 30 / 90 天 / 自定义 =====
-// 聚合粒度仍由后端按天返回；粒度联动（小时）待接口。
+// 粒度映射：近 24h → hour；其余 → day（后端 Granularity 参数，缺省 auto 时也是这个规律）。
 type Preset = '24h' | '7' | '30' | '90' | 'custom'
 const preset = ref<Preset>('24h')
 const customRange = ref<[string, string] | null>(null)
+
+const granularity = computed<'hour' | 'day'>(() => (preset.value === '24h' ? 'hour' : 'day'))
+// 服务端实际生效粒度（回显用，可能与请求值不同的兜底：auto 判定）
+const effectiveGranularity = computed(() => data.value?.Usage?.Granularity || granularity.value)
 
 const rangeText = computed(() => {
   if (preset.value === 'custom' && customRange.value) {
@@ -69,20 +82,37 @@ function resolveRange(): { from: Date; to: Date } {
   return { from, to: end }
 }
 
-async function load() {
-  loading.value = true
+// ===== 模型广场排序（服务端排序，切排序会重取 dashboard）=====
+type ModelSort = 'tokens' | 'tpm' | 'failed' | 'latency'
+const modelSort = ref<ModelSort>('tokens')
+const MODEL_SORT_OPTIONS: { key: ModelSort; label: string; tip: string }[] = [
+  { key: 'tokens', label: 'Token', tip: '按窗口内 Token 消耗倒序' },
+  { key: 'tpm', label: '吞吐', tip: '按模型忙时口径 TPM 倒序' },
+  { key: 'failed', label: '失败', tip: '按窗口内失败请求数倒序' },
+  { key: 'latency', label: '延迟', tip: '按全程平均耗时（AvgMS）倒序' },
+]
+const MODEL_LIMIT = 50
+const COMPARE_DAYS = 4
+
+// silent：定时刷新用，不显示整页 loading
+async function load(opts: { silent?: boolean } = {}) {
+  if (!opts.silent) loading.value = true
   errInfo.value = { message: '', requestId: '' }
   try {
     const { from, to } = resolveRange()
     const res = await getStatsDashboard(auth.role, {
       From: toRFC3339CN(from),
       To: toRFC3339CN(to),
+      Granularity: granularity.value,
+      CompareDays: COMPARE_DAYS,
+      ModelSort: modelSort.value,
+      ModelLimit: MODEL_LIMIT,
     })
     data.value = res.Data
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
   } finally {
-    loading.value = false
+    if (!opts.silent) loading.value = false
   }
 }
 
@@ -95,54 +125,41 @@ async function loadAnnouncements() {
   }
 }
 
-// ===== 实时会话（30s 定时刷新框架）=====
-// 数据层待后端接口：本轮 liveSessions / liveUsers 恒为空集合，模板统一走骨架占位分支。
-// 定时器只在 onMounted 建一次、onUnmounted 清理；回调里不读写 preset / customRange / data，
-// 保证筛选条件变化（或定时触发）都不会重置用户选的范围。
-interface LiveRow {
-  id: string
-  name: string
-  ctx: string
-  round: string
-  tpm: string
-  spent: string
-  spark: string
-  ready: boolean
-}
-
-interface LiveSessionDTO {
-  ID: string
-  Name: string
-  ContextUsed: number
-  ContextLimit: number
-  RoundTokens: number
-  TPM: number
-  SpentCredits: number
-  Spark: number[]
-}
-
-interface LiveUserDTO {
-  ID: string
-  Name: string
-  TPM: number
-  Tokens: number
-  Spark: number[]
-}
-
-const liveSessions = ref<LiveSessionDTO[]>([])
-const liveUsers = ref<LiveUserDTO[]>([])
-const liveRefreshing = ref(false)
+// ===== 实时区（/stats/live，30s 刷新）=====
+const live = ref<StatsLive | null>(null)
+const liveLoading = ref(false)
+const liveErr = ref('')
+const liveTab = ref<'sessions' | 'users'>('sessions')
+const LIVE_WINDOW_MINUTES = 60
+const LIVE_SPARK_POINTS = 12
+const LIVE_LIMIT = 20
 const LIVE_REFRESH_MS = 30000
 
-async function loadRealtime() {
-  // TODO(后端实时接口就绪后)：取「请求中会话 / 在线用户」并写入 liveSessions / liveUsers。
-  // 刻意不触碰 preset / customRange / data。
-  liveRefreshing.value = true
+async function loadLive() {
+  liveLoading.value = true
   try {
-    // 接口未就绪：保留空集合 → 模板显示骨架占位。
+    const res = await getStatsLive(auth.role, {
+      Window: LIVE_WINDOW_MINUTES,
+      SparkPoints: LIVE_SPARK_POINTS,
+      Limit: LIVE_LIMIT,
+    })
+    live.value = res.Data
+    liveErr.value = ''
+  } catch (e: any) {
+    // 实时区失败不打断页面，也不清空上一次的数据（只标记失败）。
+    liveErr.value = e?.message || '实时数据获取失败'
   } finally {
-    liveRefreshing.value = false
+    liveLoading.value = false
   }
+}
+
+// 30s 定时刷新：重取实时区 + 当前筛选条件下的 dashboard（静默，不闪整页 loading）。
+// 该函数只「读」preset / customRange，从不写它们，所以刷新不会重置用户选的筛选条件；
+// 页面不可见时直接跳过，避免后台标签页白跑一轮聚合。
+async function refreshTick() {
+  if (document.visibilityState === 'hidden') return
+  await loadLive()
+  if (!loading.value) await load({ silent: true })
 }
 
 let liveTimer: number | undefined
@@ -150,7 +167,8 @@ let liveTimer: number | undefined
 onMounted(() => {
   load()
   loadAnnouncements()
-  liveTimer = window.setInterval(loadRealtime, LIVE_REFRESH_MS)
+  loadLive()
+  liveTimer = window.setInterval(refreshTick, LIVE_REFRESH_MS)
 })
 onUnmounted(() => {
   if (liveTimer !== undefined) window.clearInterval(liveTimer)
@@ -163,6 +181,7 @@ watch(preset, () => {
 watch(customRange, (v) => {
   if (preset.value === 'custom' && v && v[0] && v[1]) load()
 })
+watch(modelSort, () => load())
 
 // ===== 格式化 =====
 const fmtInt = (n: number) => Number(n || 0).toLocaleString('zh-CN')
@@ -182,22 +201,25 @@ const fmtCompact = (n: number) => {
   if (abs >= 1) return v.toFixed(abs >= 100 ? 0 : 1)
   return v.toFixed(2)
 }
+const fmtTPM = (n: number) => {
+  const v = Number(n || 0)
+  return v >= 100 ? Math.round(v).toString() : v.toFixed(1)
+}
 const fmtDelta = (n: number) => `${n >= 0 ? '▲' : '▼'} ${Math.abs(Number(n || 0) * 100).toFixed(1)}%`
+const fmtTime = (iso: string) => {
+  if (!iso) return ''
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return ''
+  return d.toLocaleTimeString('zh-CN', { hour12: false })
+}
 
 // ===== 图表主题 =====
-// 与定稿 demo 同源：主靛蓝 + 四代日线渐变。
 const C = {
   primary: '#4f46e5',
-  primarySoft: '#eef0ff',
   violet: '#7c3aed',
-  cyan: '#06b6d4',
   text: '#101828',
   sub: '#667085',
   grid: '#eef0f6',
-  ok: '#059669',
-  okSoft: '#ecfdf5',
-  info: '#0284c7',
-  infoSoft: '#f0f9ff',
   series: ['#4f46e5', '#8b5cf6', '#06b6d4', '#f79009', '#12b76a', '#f04438'],
 }
 const axisCommon = {
@@ -212,17 +234,8 @@ const tooltipCommon = {
   extraCssText: 'box-shadow:0 6px 20px rgba(16,24,40,0.12);border-radius:8px;',
 }
 
-// ===== ① 首屏大数字（每个都带窗口标签；三处吞吐量窗口刻意区分）=====
-// 窗口口径（定稿文案）：
-//   首屏吞吐量      = 近 1 分钟
-//   模型广场吞吐列  = 近 10 分钟
-//   会话/在线用户吞吐 = 近 60 分钟
-const TPM_WINDOW_KPI = '近 1 分钟'
-const TPM_WINDOW_MODEL = '近 10 分钟'
-const TPM_WINDOW_LIVE = '近 60 分钟'
-
-// 吞吐量（RPM/TPM）现有口径：分子 BusyRequests、分母 SumDurationMS 均只取「成功且带耗时」的请求。
-// 有数据即显示；样本少时只在副标灰字标注，不做硬门槛。
+// ===== ① 首屏大数字 =====
+// 吞吐量样本量判定：BusyRequests / SumDurationMS 是忙时口径的分子分母。
 const throughput = computed(() => {
   const k = data.value?.KPI
   return {
@@ -255,7 +268,7 @@ const bigStats = computed<BigStat[]>(() => {
       sub: `输入 ${fmtCompact(t?.Input ?? 0)} · 输出 ${fmtCompact(t?.Output ?? 0)}`,
       delta: k?.DeltaTokens,
       winLabel: rangeText.value,
-      winTip: '窗口 = 当前统计范围（含缓存读单列，输出含推理）',
+      winTip: '窗口 = 当前统计范围；输入为纯输入、缓存读单列、输出含推理',
     },
     {
       label: '总消费积分',
@@ -271,14 +284,14 @@ const bigStats = computed<BigStat[]>(() => {
       label: '吞吐量',
       glyph: '⚡',
       tone: 'info',
-      value: throughput.value.ready ? fmtCompact(k?.TPM ?? 0) : '--',
+      value: throughput.value.ready ? fmtTPM(k?.TPM ?? 0) : '--',
       unit: ' TPM',
       sub: throughput.value.ready
-        ? `请求 ${(k?.RPM ?? 0).toFixed(1)} RPM${throughput.value.lowSample ? ' · 样本较少' : ''}`
-        : '实时窗口接口待接入',
-      winLabel: TPM_WINDOW_KPI,
+        ? `区间 ${rangeText.value} · 请求 ${(k?.RPM ?? 0).toFixed(1)} RPM${throughput.value.lowSample ? ' · 样本较少' : ''}`
+        : '区间内没有成功且带耗时的请求',
+      winLabel: '忙时口径',
       winTip:
-        '窗口口径：近 1 分钟。当前展示统计区间内「成功且有耗时请求」的忙时折算值（≈60÷平均耗时），近 1 分钟实时窗口待接口',
+        '窗口 = 当前统计范围；忙时口径 = 成功且带耗时请求的 Token ÷ 同批耗时折算分钟数（≈60÷平均耗时）。与实时区的「近 60 分钟墙钟平均」不是同一口径',
     },
   ]
 })
@@ -289,58 +302,81 @@ interface MiniStat {
   value: string
   tone?: 'ok' | 'info'
   tip?: string
-  pending?: boolean
 }
 
 const miniStats = computed<MiniStat[]>(() => {
   const k = data.value?.KPI
+  const l = live.value
   return [
     { label: '总请求数', value: k ? fmtInt(k.TotalRequests) : '--' },
     { label: '成功率', value: k ? fmtPct(k.SuccessRate) : '--', tone: 'ok' },
     { label: '平均耗时', value: k ? fmtMs(k.AvgDurationMS) : '--' },
     {
       label: '请求中会话',
-      value: '--',
+      value: l ? fmtInt(l.SessionsTotal) : '…',
       tone: 'info',
-      pending: true,
-      tip: '实时会话接口待接入：本轮仅保留位与骨架占位',
+      tip: '实时区 /stats/live：请求中（Inflight>0）的会话数',
     },
     {
       label: '请求中用户',
-      value: '--',
+      value: l ? fmtInt(l.UsersTotal) : '…',
       tone: 'info',
-      pending: true,
-      tip: '实时在线用户接口待接入：本轮仅保留位与骨架占位',
+      tip: '实时区 /stats/live：有请求中会话的用户数',
     },
   ]
 })
 
-// ===== ③ 24h 用量趋势（四代日线 / 按小时 / 缺数据断线）=====
-const DAY_LEGEND = [
-  { name: '今天', color: '#4f46e5', width: 2.8 },
-  { name: '昨天', color: '#a5b4fc', width: 2 },
-  { name: '前天', color: '#c4b5fd', width: 2 },
-  { name: '大前天', color: '#e9d5ff', width: 2 },
-]
-const hourAxis = Array.from({ length: 25 }, (_, i) => `${String(i).padStart(2, '0')}:00`)
-const trendMetric = ref<'tokens' | 'credits' | 'calls'>('tokens')
-// 小时粒度接口未就绪：series 全 null，只画坐标轴与图例（占位，不编造曲线）。
-const hourlyPending = ref(true)
-
+// ===== ③ 24h 四日对比趋势 =====
+type TrendMetric = 'tokens' | 'credits' | 'calls'
+const trendMetric = ref<TrendMetric>('tokens')
 const trendMetricName = computed(() =>
   trendMetric.value === 'tokens' ? 'Token' : trendMetric.value === 'credits' ? '积分' : '请求数',
 )
+const HOUR_SLOTS = Array.from({ length: 24 }, (_, i) => `${String(i).padStart(2, '0')}:00`)
+// 颜色按 Offset 递增：今天的线最深，越往前越浅。
+const TREND_COLORS = ['#4f46e5', '#a5b4fc', '#c4b5fd', '#e9d5ff', '#94a3b8', '#cbd5e1', '#e2e8f0']
+
+interface TrendSeries {
+  label: string
+  offset: number
+  color: string
+  points: StatsHour[]
+}
+
+// Compare 为「今天/昨天/前天/大前天」四条按小时序列；后端无数据时回退单条 Hourly。
+const trendSeries = computed<TrendSeries[]>(() => {
+  const cmp = (data.value?.Usage.Compare ?? []).filter(Boolean)
+  if (cmp.length) {
+    return cmp.map((s, i) => ({
+      label: s.Label || `D-${s.Offset}`,
+      offset: s.Offset,
+      color: TREND_COLORS[i % TREND_COLORS.length],
+      points: s.Points ?? [],
+    }))
+  }
+  const hourly = data.value?.Usage.Hourly ?? []
+  if (hourly.length) {
+    return [{ label: '今天', offset: 0, color: TREND_COLORS[0], points: hourly }]
+  }
+  return []
+})
+
+function metricValue(p: StatsHour): number {
+  if (trendMetric.value === 'credits') return Number(p.Credits)
+  if (trendMetric.value === 'calls') return p.Calls
+  return p.Tokens
+}
 
 const trendOption = computed<EChartsCoreOption>(() => ({
   grid: { left: 8, right: 16, top: 28, bottom: 4, containLabel: true },
-  legend: { show: false },
+  legend: { show: false }, // 图例用卡片头部的 HTML 版（与定稿 demo 一致）
   tooltip: { ...tooltipCommon, trigger: 'axis' },
   xAxis: {
     type: 'category',
     boundaryGap: false,
-    data: hourAxis,
+    data: HOUR_SLOTS,
     ...axisCommon,
-    axisLabel: { color: C.sub, fontSize: 11, interval: 5 },
+    axisLabel: { color: C.sub, fontSize: 11, interval: 3 },
   },
   yAxis: {
     type: 'value',
@@ -349,77 +385,86 @@ const trendOption = computed<EChartsCoreOption>(() => ({
     splitLine: { lineStyle: { color: C.grid } },
     axisLabel: { color: C.sub, fontSize: 11, formatter: (v: number) => fmtCompact(v) },
   },
-  series: DAY_LEGEND.map((d) => ({
-    name: d.name,
-    type: 'line',
-    smooth: true,
-    showSymbol: false,
-    // 缺数据断线：接口就绪后把真实点填进来即可，null 处自动断开
-    connectNulls: false,
-    data: Array<number | null>(hourAxis.length).fill(null),
-    lineStyle: { width: d.width, color: d.color },
-    itemStyle: { color: d.color },
-  })),
+  series: trendSeries.value.map((s, i) => {
+    const byHour = new Map(s.points.map((p) => [p.HourOfDay, p]))
+    return {
+      name: s.label,
+      type: 'line',
+      smooth: true,
+      showSymbol: false,
+      // 缺桶断线：后端缺小时不出行，这里对齐不到就留 null（绝不补 0）
+      connectNulls: false,
+      data: HOUR_SLOTS.map((_, h) => {
+        const p = byHour.get(h)
+        return p ? metricValue(p) : null
+      }),
+      lineStyle: { width: i === 0 ? 2.8 : 2, color: s.color },
+      itemStyle: { color: s.color },
+    }
+  }),
 }))
 
 const trendNote = computed(() => {
-  const base = '按小时聚合待后端接口：本轮只渲染坐标轴与图例，不填充曲线（占位）。'
-  if (preset.value === '24h') return base
-  return `${base} 趋势图固定近 24h 窗口，暂不随「${rangeText.value}」联动。`
+  const parts: string[] = []
+  parts.push(`数据粒度：${effectiveGranularity.value === 'hour' ? '按小时' : '按天'}`)
+  if (effectiveGranularity.value === 'day') {
+    parts.push('四日对比仍是近 4 天 × 小时桶（Compare 接口口径），与筛选粒度解耦')
+  }
+  parts.push('缺小时断线，不补 0')
+  return parts.join(' · ')
 })
 
-// ===== ③ 模型广场 =====
-type ModelSort = 'tokens' | 'tpm' | 'first' | 'total'
-const modelSort = ref<ModelSort>('tokens')
-const modelSortOptions: { key: ModelSort; label: string; ready: boolean; tip: string }[] = [
-  { key: 'tokens', label: 'Token', ready: true, tip: '' },
-  { key: 'tpm', label: '吞吐', ready: false, tip: '按模型近 10 分钟吞吐待接口' },
-  { key: 'first', label: '首字', ready: false, tip: '按模型首字耗时待接口' },
-  { key: 'total', label: '全程', ready: false, tip: '按模型全程耗时待接口' },
-]
+// 四条序列都没有任何小时桶 = 窗口内确实没有用量 → 走空态，而不是画四条空线。
+const hasTrendData = computed(() => trendSeries.value.some((s) => s.points.length > 0))
 
-interface ModelRow {
-  name: string
-  tokens: number
-  calls: number
-  active: boolean
+// ===== ③ 模型广场 =====
+interface PlazaRow {
+  model: string
   tokensText: string
-  callsText: string
   tpmText: string
+  callsText: string
+  failText: string
   latencyText: string
   barPct: number
   color: string
+  active: boolean
+  enabled: boolean
 }
 
-const modelRows = computed<ModelRow[]>(() => {
-  const items = data.value?.Usage.ByModel ?? []
-  if (!items.length) return []
-  const max = Math.max(...items.map((i) => i.Tokens), 1)
-  return items.map((i, idx) => ({
-    name: i.Label || i.Key || '(未命名模型)',
-    tokens: i.Tokens,
-    calls: i.Calls,
-    active: i.Calls > 0,
-    tokensText: fmtCompact(i.Tokens),
-    callsText: `${fmtInt(i.Calls)} / ${fmtInt(i.Failed)}`,
-    // 按模型的吞吐 / 首字 / 全程：接口未就绪，占位（不填假值）
-    tpmText: '--',
-    latencyText: '-- / --',
-    barPct: Math.round((i.Tokens / max) * 100),
-    color: C.series[idx % C.series.length],
+const plaza = computed<StatsModelPlaza | null>(() => data.value?.ModelPlaza ?? null)
+
+const plazaRows = computed<PlazaRow[]>(() => {
+  const list: StatsModelStat[] = plaza.value?.List ?? []
+  if (!list.length) return []
+  const max = Math.max(...list.map((m) => m.Tokens), 1)
+  return list.map((m, i) => ({
+    model: m.Model || m.Label || '(未命名模型)',
+    tokensText: fmtCompact(m.Tokens),
+    // BusyMS=0（窗口内没有成功且带耗时的请求）时后端 TPM 为 0，这里显示 —
+    tpmText: m.BusyMS > 0 ? `${fmtTPM(m.TPM)} TPM` : '—',
+    callsText: `${fmtInt(m.Calls)} / ${fmtInt(m.Failed)}`,
+    failText: m.Calls > 0 ? fmtPct(m.FailRate) : '—',
+    latencyText:
+      m.AvgFirstMS > 0 || m.AvgMS > 0
+        ? `${m.AvgFirstMS > 0 ? fmtMs(m.AvgFirstMS) : '—'} / ${m.AvgMS > 0 ? fmtMs(m.AvgMS) : '—'}`
+        : '—',
+    barPct: Math.max(0, Math.round((m.Tokens / max) * 100)),
+    color: C.series[i % C.series.length],
+    active: m.Active,
+    enabled: m.Enabled,
   }))
 })
 
-const sortedModels = computed<ModelRow[]>(() => {
-  // 排序维度里只有 Token 有真实数据；吞吐 / 首字 / 全程 按钮置灰，
-  // 接口就绪后在此按 modelSort 分发真实排序 key（不必改模板）。
-  return modelRows.value.slice().sort((a, b) => b.tokens - a.tokens)
-})
-
-const activeModels = computed(() => sortedModels.value.filter((m) => m.active))
-const idleModels = computed(() => sortedModels.value.filter((m) => !m.active))
+const activeModels = computed(() => plazaRows.value.filter((m) => m.active))
+const idleModels = computed(() => plazaRows.value.filter((m) => !m.active))
 const idleExpanded = ref(false)
-const visibleModels = computed(() => (idleExpanded.value ? sortedModels.value : activeModels.value))
+const visibleModels = computed(() => (idleExpanded.value ? plazaRows.value : activeModels.value))
+
+const plazaTruncatedText = computed(() => {
+  const p = plaza.value
+  if (!p || !p.Truncated) return ''
+  return `仅显示前 ${p.Limit} 个模型（目录共 ${p.Total} 个，窗口内有请求 ${p.Active} 个）`
+})
 
 async function copyModelName(name: string) {
   try {
@@ -430,65 +475,85 @@ async function copyModelName(name: string) {
   }
 }
 
-// ===== ④ 实时会话行（骨架占位 → 接口就绪后替换数据源，不动模板）=====
-const SPARK_PLACEHOLDER = 'M2,20 L22,18 L42,19 L62,14 L82,16 L90,12'
-
+// ===== ④ 实时区 =====
 function sparkPath(vals: number[]): string {
-  if (!vals.length) return SPARK_PLACEHOLDER
+  const n = vals.length
+  if (n < 2) return ''
   const w = 90
-  const h = 26
+  const h = 24
   const max = Math.max(...vals)
   const min = Math.min(...vals)
   const span = max - min || 1
-  const step = vals.length > 1 ? w / (vals.length - 1) : w
+  const step = w / (n - 1)
   return vals
-    .map((v, i) => `${(2 + i * step).toFixed(1)},${(h - 3 - ((v - min) / span) * (h - 8)).toFixed(1)}`)
-    .join(' L')
-    .replace(/^/, 'M')
+    .map((v, i) => `${(i === 0 ? 'M' : 'L')}${(1 + i * step).toFixed(1)},${(h - 2 - ((v - min) / span) * (h - 6)).toFixed(1)}`)
+    .join(' ')
 }
 
-function placeholderRows(n: number): LiveRow[] {
-  return Array.from({ length: n }, (_, i) => ({
-    id: `ph-${i}`,
-    name: '——',
-    ctx: '--/--',
-    round: '--',
-    tpm: '--',
-    spent: '--',
-    spark: SPARK_PLACEHOLDER,
-    ready: false,
-  }))
+interface LiveSessionRow {
+  id: string
+  name: string
+  model: string
+  inflight: number
+  contextText: string
+  contextTip: string
+  roundText: string
+  callsText: string
+  tpmText: string
+  spentText: string
+  spark: string
+  lastActive: string
 }
 
-const mySessionRows = computed<LiveRow[]>(() => {
-  if (!liveSessions.value.length) return placeholderRows(2)
-  return liveSessions.value.map((s) => ({
-    id: s.ID,
-    name: s.Name,
-    ctx: `${fmtCompact(s.ContextUsed)}/${fmtCompact(s.ContextLimit)}`,
-    round: fmtCompact(s.RoundTokens),
-    tpm: `${s.TPM.toFixed(1)} TPM`,
-    spent: fmtMoney(s.SpentCredits),
-    spark: sparkPath(s.Spark),
-    ready: true,
-  }))
-})
+const sessionRows = computed<LiveSessionRow[]>(() =>
+  (live.value?.Sessions ?? []).map((s) => {
+    // ContextLimit 恒 0 = 平台未配置模型上限：只显示已用绝对值，不做除法、不造分母。
+    const hasLimit = s.ContextLimit > 0
+    return {
+      id: s.ID,
+      name: s.Name || s.ID.slice(0, 8),
+      model: s.Model,
+      inflight: s.Inflight,
+      contextText: hasLimit ? `${fmtCompact(s.ContextUsed)}/${fmtCompact(s.ContextLimit)}` : fmtCompact(s.ContextUsed),
+      contextTip: hasLimit ? '上下文已用 / 上限' : '仅显示上下文字数：平台未配置模型上限',
+      roundText: fmtCompact(s.RoundTokens),
+      callsText: fmtInt(s.Calls),
+      tpmText: `${fmtTPM(s.TPM)} TPM`,
+      spentText: fmtMoney(s.SpentCredits),
+      spark: sparkPath(s.Spark ?? []),
+      lastActive: fmtTime(s.LastActive),
+    }
+  }),
+)
 
-const onlineUserRows = computed<LiveRow[]>(() => {
-  if (!liveUsers.value.length) return placeholderRows(2)
-  return liveUsers.value.map((u) => ({
+interface LiveUserRow {
+  id: string
+  name: string
+  initial: string
+  sessions: number
+  tpmText: string
+  tokensText: string
+  spentText: string
+  spark: string
+}
+
+const userRows = computed<LiveUserRow[]>(() =>
+  (live.value?.Users ?? []).map((u) => ({
     id: u.ID,
-    name: u.Name,
-    ctx: '',
-    round: '',
-    tpm: `${u.TPM.toFixed(1)} TPM`,
-    spent: fmtCompact(u.Tokens),
-    spark: sparkPath(u.Spark),
-    ready: true,
-  }))
-})
+    name: u.Name || `用户 ${u.ID}`,
+    initial: (u.Name || '?').slice(0, 2),
+    sessions: u.Sessions,
+    tpmText: `${fmtTPM(u.TPM)} TPM`,
+    tokensText: fmtCompact(u.Tokens),
+    spentText: fmtMoney(u.SpentCredits),
+    spark: sparkPath(u.Spark ?? []),
+  })),
+)
 
-// ===== 更多维度（旧版用量分析里仍有效的部分，压低到最低层级、默认收起）=====
+const liveSampledAt = computed(() => fmtTime(live.value?.SampledAt || ''))
+const liveWindowMinutes = computed(() => live.value?.WindowMinutes ?? LIVE_WINDOW_MINUTES)
+
+// ===== 更多维度（旧版用量分析里仍有数据支撑的部分，默认收起）=====
 const moreOpen = ref<string[]>([])
 
 const compositionOption = computed<EChartsCoreOption>(() => {
@@ -592,12 +657,12 @@ const modeLabel = (m: string) =>
         end-placeholder="结束日期"
         style="width: 240px"
       />
-      <el-button size="small" :loading="loading" @click="load">刷新</el-button>
-      <span class="live-tag"><span class="dot-live" />每 30s 自动刷新</span>
+      <el-button size="small" :loading="loading" @click="load()">刷新</el-button>
+      <span class="live-tag"><span class="dot-live" />实时区每 30s 自动刷新</span>
     </div>
 
     <div v-loading="loading">
-      <!-- ① 首屏：3 个大数字，每个带窗口标签 -->
+      <!-- ① 首屏：3 个大数字，各自带窗口/口径标签 -->
       <div class="big-grid">
         <div v-for="s in bigStats" :key="s.label" class="big-card" :data-tone="s.tone">
           <div class="big-head">
@@ -625,22 +690,24 @@ const modeLabel = (m: string) =>
         <div v-for="m in miniStats" :key="m.label" class="mini-card">
           <span class="mini-label">{{ m.label }}</span>
           <el-tooltip v-if="m.tip" :content="m.tip" placement="top" :show-after="150">
-            <span class="mini-value" :data-tone="m.tone" :class="{ pending: m.pending }">{{ m.value }}</span>
+            <span class="mini-value" :data-tone="m.tone">{{ m.value }}</span>
           </el-tooltip>
           <span v-else class="mini-value" :data-tone="m.tone">{{ m.value }}</span>
         </div>
       </div>
 
-      <!-- ③ 两张图：24h 用量趋势 + 模型广场 -->
+      <!-- ③ 两张图：24h 四日对比 + 模型广场 -->
       <div class="chart-stack">
         <div class="card">
           <div class="card-head">
             <h3 class="card-title">用量趋势</h3>
-            <span class="win-chip">近 24h</span>
+            <span class="win-chip">近 24h · 四日对比</span>
+            <span class="gran-chip">{{ effectiveGranularity === 'hour' ? '按小时' : '按天' }}</span>
             <div class="trend-legend">
-              <span v-for="d in DAY_LEGEND" :key="d.name">
-                <i :style="{ background: d.color }" />{{ d.name }}
+              <span v-for="s in trendSeries" :key="s.label">
+                <i :style="{ background: s.color }" />{{ s.label }}
               </span>
+              <span v-if="!trendSeries.length" class="legend-empty">暂无数据</span>
             </div>
             <el-radio-group v-model="trendMetric" size="small" class="head-actions">
               <el-radio-button value="tokens">Token</el-radio-button>
@@ -648,22 +715,25 @@ const modeLabel = (m: string) =>
               <el-radio-button value="calls">请求数</el-radio-button>
             </el-radio-group>
           </div>
-          <VChart :option="trendOption" height="260px" />
-          <p v-if="hourlyPending" class="pending-note">{{ trendNote }}</p>
+          <VChart v-if="hasTrendData" :option="trendOption" height="260px" />
+          <el-empty v-else description="当前范围内没有用量数据" :image-size="70" />
+          <p class="pending-note">{{ trendNote }}</p>
         </div>
 
         <div class="card">
           <div class="card-head">
             <h3 class="card-title">模型广场</h3>
-            <span class="win-chip">{{ TPM_WINDOW_MODEL }}</span>
+            <el-tooltip
+              content="窗口 = 当前统计范围；按模型忙时口径（该模型成功且带耗时请求的 Token ÷ 同批耗时折算分钟数）"
+              placement="top"
+              :show-after="150"
+            >
+              <span class="win-chip">按模型忙时</span>
+            </el-tooltip>
             <div class="sort-group">
               <span class="sort-label">排序：</span>
-              <template v-for="o in modelSortOptions" :key="o.key">
-                <el-tooltip v-if="!o.ready" :content="o.tip" placement="top" :show-after="150">
-                  <button type="button" class="sort-chip off" disabled>{{ o.label }}</button>
-                </el-tooltip>
+              <el-tooltip v-for="o in MODEL_SORT_OPTIONS" :key="o.key" :content="o.tip" placement="top" :show-after="150">
                 <button
-                  v-else
                   type="button"
                   class="sort-chip"
                   :class="{ on: modelSort === o.key }"
@@ -671,96 +741,120 @@ const modeLabel = (m: string) =>
                 >
                   {{ o.label }}
                 </button>
-              </template>
-              <span class="sort-hint" v-if="modelSortOptions.some((o) => !o.ready)">吞吐/首字/全程待接口</span>
+              </el-tooltip>
             </div>
           </div>
-          <div v-if="visibleModels.length" class="model-grid">
-            <div v-for="m in visibleModels" :key="m.name" class="model-card">
-              <div class="model-head">
-                <span class="model-name">
-                  {{ m.name }}
-                  <button type="button" class="copy-btn" title="复制模型名" @click="copyModelName(m.name)">⧉</button>
-                </span>
-                <span class="model-state" :data-active="m.active">{{ m.active ? '活跃' : '空闲' }}</span>
+
+          <template v-if="plazaRows.length">
+            <div v-if="visibleModels.length" class="model-grid">
+              <div v-for="m in visibleModels" :key="m.model" class="model-card">
+                <div class="model-head">
+                  <span class="model-name">
+                    {{ m.model }}
+                    <button type="button" class="copy-btn" title="复制模型名" @click="copyModelName(m.model)">⧉</button>
+                  </span>
+                  <span class="model-state" :data-active="m.active">
+                    {{ m.active ? '活跃' : '空闲' }}{{ m.enabled ? '' : ' · 已停用' }}
+                  </span>
+                </div>
+                <div class="model-row"><span>Token 消耗</span><b>{{ m.tokensText }}</b></div>
+                <div class="model-row"><span>吞吐量（忙时）</span><b>{{ m.tpmText }}</b></div>
+                <div class="model-row">
+                  <span>请求 / 失败</span>
+                  <b>{{ m.callsText }}<em class="fail-rate">{{ m.failText }}</em></b>
+                </div>
+                <div class="model-row"><span>首字 / 全程</span><b>{{ m.latencyText }}</b></div>
+                <div class="model-bar"><i :style="{ width: m.barPct + '%', background: m.color }" /></div>
               </div>
-              <div class="model-row"><span>Token 消耗</span><b>{{ m.tokensText }}</b></div>
-              <div class="model-row">
-                <span>吞吐量</span><b class="pending">{{ m.tpmText }}</b>
-              </div>
-              <div class="model-row"><span>请求 / 失败</span><b>{{ m.callsText }}</b></div>
-              <div class="model-row">
-                <span>首字 / 全程</span><b class="pending">{{ m.latencyText }}</b>
-              </div>
-              <div class="model-bar"><i :style="{ width: m.barPct + '%', background: m.color }" /></div>
             </div>
-          </div>
-          <el-empty v-else description="暂无模型数据" :image-size="60" />
-          <div v-if="idleModels.length" class="idle-note">
-            另有 {{ idleModels.length }} 个模型当前无请求，
-            <button type="button" class="link-btn" @click="idleExpanded = !idleExpanded">
-              {{ idleExpanded ? '收起' : '已折叠' }}
-            </button>
-          </div>
+            <div class="idle-note">
+              <span v-if="!visibleModels.length && !idleExpanded">
+                当前窗口内没有模型请求，可展开查看模型目录
+              </span>
+              <span v-if="idleModels.length">
+                另有 {{ idleModels.length }} 个模型当前无请求，
+                <button type="button" class="link-btn" @click="idleExpanded = !idleExpanded">
+                  {{ idleExpanded ? '收起' : '展开查看' }}
+                </button>
+              </span>
+              <span v-if="plazaTruncatedText" class="trunc-note">{{ plazaTruncatedText }}</span>
+            </div>
+          </template>
+          <el-empty v-else description="模型目录为空：还没有对外模型" :image-size="70" />
         </div>
       </div>
 
-      <!-- ④ 实时会话区（数据待接口：骨架占位 + 30s 刷新框架） -->
+      <!-- ④ 实时区：/stats/live，30s 刷新 -->
       <section class="live-block">
         <div class="live-head">
           <h3 class="live-title">实时会话</h3>
           <span class="live-tag"><span class="dot-live" />每 30s 自动刷新 · 仅显示请求中</span>
-          <span v-if="liveRefreshing" class="live-window">刷新中…</span>
-          <span class="live-window">窗口 {{ TPM_WINDOW_LIVE }}</span>
+          <span class="live-window">
+            近 {{ liveWindowMinutes }} 分钟墙钟平均<span v-if="liveSampledAt"> · 采样 {{ liveSampledAt }}</span>
+            <span v-if="liveLoading" class="live-loading">刷新中…</span>
+          </span>
         </div>
-        <div class="live-grid">
-          <div class="live-card">
-            <div class="live-card-head">
-              <span class="live-card-title">我的会话</span>
-              <span class="live-card-count">
-                {{ liveSessions.length ? `${liveSessions.length} 个请求中` : '数据待接入' }}
-              </span>
-            </div>
-            <div v-for="r in mySessionRows" :key="r.id" class="srow">
-              <span class="srow-dot" :class="{ pending: !r.ready }" />
-              <span class="srow-name" :class="{ pending: !r.ready }">{{ r.name }}</span>
-              <span class="srow-stat">
-                <span>上下文 <b :class="{ pending: !r.ready }">{{ r.ctx }}</b></span>
-                <span>本轮 <b :class="{ pending: !r.ready }">{{ r.round }}</b></span>
-                <span>吞吐 <b :class="{ pending: !r.ready }">{{ r.tpm }}</b></span>
-                <span>已花 <b :class="{ pending: !r.ready }">{{ r.spent }}</b> 积分</span>
-              </span>
-              <svg class="spark" viewBox="0 0 96 26" preserveAspectRatio="none">
-                <path :d="r.spark" :class="{ 'spark-ph': !r.ready }" />
-              </svg>
-            </div>
-            <p v-if="!liveSessions.length" class="pending-note">
-              实时会话接口待接入：本轮只做版式与 30s 刷新框架。
-            </p>
-          </div>
 
-          <div v-if="isAdmin" class="live-card">
-            <div class="live-card-head">
-              <span class="live-card-title">在线用户</span>
-              <span class="live-card-count">
-                {{ liveUsers.length ? `${liveUsers.length} 个请求中` : '数据待接入' }}
-              </span>
-            </div>
-            <div v-for="r in onlineUserRows" :key="r.id" class="srow">
-              <span class="uavatar" :class="{ pending: !r.ready }">{{ r.ready ? r.name.slice(0, 2) : '?' }}</span>
-              <span class="srow-name" :class="{ pending: !r.ready }">{{ r.name }}</span>
+        <div class="live-tabs">
+          <el-radio-group v-model="liveTab" size="small">
+            <el-radio-button value="sessions">
+              我的会话{{ live ? ` · ${live.SessionsTotal}` : '' }}
+            </el-radio-button>
+            <el-radio-button v-if="isAdmin" value="users">
+              在线用户{{ live ? ` · ${live.UsersTotal}` : '' }}
+            </el-radio-button>
+          </el-radio-group>
+          <span v-if="liveErr" class="live-err">{{ liveErr }}</span>
+        </div>
+
+        <div v-if="liveTab === 'sessions'" class="live-card">
+          <template v-if="sessionRows.length">
+            <div v-for="s in sessionRows" :key="s.id" class="srow">
+              <span class="srow-dot" />
+              <span class="srow-name" :title="s.name">{{ s.name }}</span>
+              <span class="model-chip">{{ s.model }}</span>
               <span class="srow-stat">
-                <span>吞吐 <b :class="{ pending: !r.ready }">{{ r.tpm }}</b></span>
-                <span>消耗 <b :class="{ pending: !r.ready }">{{ r.spent }}</b></span>
+                <el-tooltip :content="s.contextTip" placement="top" :show-after="150">
+                  <span>上下文 <b>{{ s.contextText }}</b></span>
+                </el-tooltip>
+                <span>本轮 <b>{{ s.roundText }}</b></span>
+                <span>吞吐 <b>{{ s.tpmText }}</b></span>
+                <span>已花 <b>{{ s.spentText }}</b> 积分</span>
+                <span>累计 <b>{{ s.callsText }}</b> 次</span>
               </span>
-              <svg class="spark" viewBox="0 0 96 26" preserveAspectRatio="none">
-                <path :d="r.spark" :class="{ 'spark-ph': !r.ready }" />
+              <svg v-if="s.spark" class="spark" viewBox="0 0 92 24" preserveAspectRatio="none">
+                <path :d="s.spark" />
               </svg>
             </div>
-            <p v-if="!liveUsers.length" class="pending-note">
-              在线用户接口待接入：只汇总吞吐/消耗，不展示会话内容。
-            </p>
-          </div>
+            <div v-if="live?.Truncated" class="trunc-note">
+              仅显示前 {{ LIVE_LIMIT }} 个会话（共 {{ live?.SessionsTotal }} 个请求中）
+            </div>
+          </template>
+          <el-empty v-else-if="live" description="当前没有请求中的会话" :image-size="60" />
+          <el-empty v-else description="实时数据加载中" :image-size="60" />
+        </div>
+
+        <div v-else class="live-card">
+          <template v-if="userRows.length">
+            <div v-for="u in userRows" :key="u.id" class="srow">
+              <span class="uavatar">{{ u.initial }}</span>
+              <span class="srow-name" :title="u.name">{{ u.name }}</span>
+              <span class="srow-stat">
+                <span>会话 <b>{{ u.sessions }}</b></span>
+                <span>吞吐 <b>{{ u.tpmText }}</b></span>
+                <span>消耗 <b>{{ u.tokensText }}</b> Token</span>
+                <span>积分 <b>{{ u.spentText }}</b></span>
+              </span>
+              <svg v-if="u.spark" class="spark" viewBox="0 0 92 24" preserveAspectRatio="none">
+                <path :d="u.spark" />
+              </svg>
+            </div>
+            <div v-if="live?.UsersTruncated" class="trunc-note">
+              仅显示前 100 个在线用户（共 {{ live?.UsersTotal }} 个）
+            </div>
+          </template>
+          <el-empty v-else-if="live" description="当前没有在线用户" :image-size="60" />
+          <el-empty v-else description="实时数据加载中" :image-size="60" />
         </div>
       </section>
 
@@ -1055,15 +1149,16 @@ const modeLabel = (m: string) =>
   color: var(--color-text);
   margin-bottom: 10px;
 }
-.win-chip {
+.win-chip,
+.gran-chip {
   font-size: 10px;
   font-weight: 600;
   padding: 2px 9px;
   border-radius: 999px;
-  background: var(--brand-primary-soft);
-  color: var(--brand-primary);
   white-space: nowrap;
 }
+.win-chip { background: var(--brand-primary-soft); color: var(--brand-primary); }
+.gran-chip { background: #f2f4f7; color: var(--color-text-secondary); }
 .trend-legend {
   display: flex;
   gap: 12px;
@@ -1079,9 +1174,8 @@ const modeLabel = (m: string) =>
   margin-right: 4px;
   vertical-align: -1px;
 }
-.head-actions {
-  margin-left: auto;
-}
+.legend-empty { color: var(--color-text-tertiary); }
+.head-actions { margin-left: auto; }
 
 /* 模型广场 */
 .sort-group {
@@ -1108,11 +1202,6 @@ const modeLabel = (m: string) =>
 }
 .sort-chip:hover { color: var(--brand-primary); }
 .sort-chip.on { background: var(--brand-primary-soft); color: var(--brand-primary); }
-.sort-chip.off { cursor: not-allowed; opacity: 0.55; }
-.sort-hint {
-  font-size: 10px;
-  color: var(--color-text-tertiary);
-}
 .model-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -1169,6 +1258,13 @@ const modeLabel = (m: string) =>
   font-family: 'SF Mono', Consolas, monospace;
   white-space: nowrap;
 }
+.fail-rate {
+  margin-left: 5px;
+  font-style: normal;
+  font-weight: 500;
+  font-size: 11px;
+  color: var(--color-text-tertiary);
+}
 .model-bar {
   height: 5px;
   border-radius: 3px;
@@ -1197,6 +1293,10 @@ const modeLabel = (m: string) =>
 }
 .copy-btn:hover { background: var(--brand-primary); color: #fff; }
 .idle-note {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
   margin-top: 10px;
   font-size: 11px;
   color: var(--color-text-tertiary);
@@ -1210,8 +1310,13 @@ const modeLabel = (m: string) =>
   cursor: pointer;
   text-decoration: underline;
 }
+.trunc-note {
+  font-size: 11px;
+  color: var(--color-text-tertiary);
+  margin-top: 8px;
+}
 
-/* ===== ④ 实时会话区 ===== */
+/* ===== ④ 实时区 ===== */
 .live-block {
   background: linear-gradient(160deg, #eef0ff, #f8fafc);
   border: 1px solid #dde1f5;
@@ -1223,7 +1328,7 @@ const modeLabel = (m: string) =>
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-bottom: 12px;
+  margin-bottom: 10px;
   flex-wrap: wrap;
 }
 .live-title {
@@ -1237,10 +1342,17 @@ const modeLabel = (m: string) =>
   font-size: 12px;
   color: var(--color-text-tertiary);
 }
-.live-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 10px;
+.live-loading { margin-left: 8px; color: var(--brand-primary); }
+.live-tabs {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 10px;
+  flex-wrap: wrap;
+}
+.live-err {
+  font-size: 11px;
+  color: var(--color-danger);
 }
 .live-card {
   background: var(--color-surface);
@@ -1248,22 +1360,6 @@ const modeLabel = (m: string) =>
   border-radius: 10px;
   padding: 12px 14px;
   min-width: 0;
-}
-.live-card-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 8px;
-}
-.live-card-title {
-  font-size: 13px;
-  font-weight: 700;
-  color: var(--color-text);
-}
-.live-card-count {
-  margin-left: auto;
-  font-size: 11px;
-  color: var(--color-text-tertiary);
 }
 .srow {
   display: flex;
@@ -1283,11 +1379,6 @@ const modeLabel = (m: string) =>
   animation: livePulse 1.6s infinite;
   flex-shrink: 0;
 }
-.srow-dot.pending {
-  background: var(--color-border-strong);
-  box-shadow: none;
-  animation: none;
-}
 .uavatar {
   width: 26px;
   height: 26px;
@@ -1306,9 +1397,18 @@ const modeLabel = (m: string) =>
   font-weight: 600;
   color: var(--color-text);
   min-width: 110px;
-  max-width: 160px;
+  max-width: 170px;
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.model-chip {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--brand-primary-soft);
+  color: var(--brand-primary);
   white-space: nowrap;
 }
 .srow-stat {
@@ -1325,8 +1425,8 @@ const modeLabel = (m: string) =>
   font-family: 'SF Mono', Consolas, monospace;
 }
 .spark {
-  width: 90px;
-  height: 26px;
+  width: 92px;
+  height: 24px;
   flex-shrink: 0;
   margin-left: auto;
 }
@@ -1335,13 +1435,6 @@ const modeLabel = (m: string) =>
   stroke: var(--brand-primary);
   stroke-width: 1.8;
 }
-.spark path.spark-ph {
-  stroke: var(--color-border-strong);
-  stroke-dasharray: 3 3;
-}
-.pending { color: var(--color-text-tertiary) !important; }
-
-/* 占位说明（一眼可辨：本轮数据待接口，不是真实值） */
 .pending-note {
   margin: 8px 0 0;
   font-size: 11px;
@@ -1453,12 +1546,12 @@ const modeLabel = (m: string) =>
 }
 @media (max-width: 1000px) {
   .big-grid { grid-template-columns: 1fr; }
-  .live-grid { grid-template-columns: 1fr; }
   .grid { grid-template-columns: 1fr; }
 }
 @media (max-width: 760px) {
   .mini-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .model-grid { grid-template-columns: 1fr; }
   .head-actions, .sort-group { margin-left: 0; }
+  .live-window { margin-left: 0; }
 }
 </style>
