@@ -15,13 +15,17 @@ import (
 // 本特性把强制语义降级为 auto（模型仍可自行调用工具，但不再被强制），按协议形状分别改写：
 //   - openai-chat（字符串 / 对象混用）："required" → "auto"；
 //     {"type":"function"|"any"|"tool"} → "auto"（字符串）
+//   - openai-responses（字符串 / 扁平对象）："required" → "auto"；
+//     {"type":"function"|"custom","name":"..."} 与 {"type":"allowed_tools","mode":"required"}
+//     → "auto"（字符串）
 //   - anthropic-messages（恒为对象）：{"type":"any"} / {"type":"tool"}（可带 name）→ 仅把 type
 //     改为 auto 并移除仅对 type=tool 有意义的 name，保留 disable_parallel_tool_use 等其余合法键
 //
-// 两种形状不可混用：OpenAI 用字符串 "auto"，Anthropic 必须用对象 {"type":"auto"}，写错会
-// 破坏请求体，故按 req.Protocol 分支各自识别与改写（字符串在 anthropic 下不算强制形状）。
+// 三种形状不可混用：OpenAI 系（chat / responses）用字符串 "auto"，Anthropic 必须用对象
+// {"type":"auto"}，写错会破坏请求体，故按 req.Protocol 分支各自识别与改写（字符串在 anthropic
+// 下不算强制形状）。
 //
-// 已为 auto/none、对象 {"type":"auto"}/{"type":"none"}、null、缺省，或非上述两种协议时原样返回
+// 已为 auto/none、对象 {"type":"auto"}/{"type":"none"}、null、缺省，或非本特性覆盖的协议时原样返回
 // （逐字节一致）。跨协议转换后的请求体由 handler 在转换后单独应用本特性
 // （见 applyConvertedRequestFeatures）。
 //
@@ -67,6 +71,8 @@ func (f *toolChoiceDowngradeFeature) RewriteRequest(req *UpstreamRequest) error 
 	switch req.Protocol {
 	case channelprotocol.ProtocolOpenAIChat:
 		isForced, downgrade = isForcedOpenAIToolChoice, downgradeOpenAIToolChoice
+	case channelprotocol.ProtocolOpenAIResponses:
+		isForced, downgrade = isForcedResponsesToolChoice, downgradeOpenAIToolChoice
 	case channelprotocol.ProtocolAnthropicMessages:
 		isForced, downgrade = isForcedAnthropicToolChoice, downgradeAnthropicToolChoice
 	default:
@@ -96,8 +102,8 @@ func (f *toolChoiceDowngradeFeature) RewriteRequest(req *UpstreamRequest) error 
 	return nil
 }
 
-// downgradeOpenAIToolChoice 把强制语义整体替换为 OpenAI 的字符串 "auto"
-// （对象形态的指定函数一并丢弃，与 OpenAI 的 "required"/指定函数语义等价降级）。
+// downgradeOpenAIToolChoice 把强制语义整体替换为 OpenAI 系（chat / responses）的字符串 "auto"
+// （对象形态的指定函数一并丢弃，与 "required"/指定函数的语义等价降级）。
 func downgradeOpenAIToolChoice(json.RawMessage) (json.RawMessage, bool) {
 	return json.RawMessage(`"auto"`), true
 }
@@ -131,6 +137,33 @@ func isForcedOpenAIToolChoice(raw json.RawMessage) bool {
 		return s == "required"
 	}
 	return hasToolChoiceType(t, "function", "any", "tool")
+}
+
+// isForcedResponsesToolChoice 判断 openai-responses 形状的 tool_choice 是否表达「强制使用工具」语义：
+// 字符串 "required"，对象 {"type":"function"|"custom","name":"..."}（name 为顶层字段，无 function 嵌套），
+// 或约束型对象 {"type":"allowed_tools","mode":"required"}（要求模型必须从允许清单中选一个）。
+// allowed_tools 的 mode 为 auto/none 等值时模型可自行选择，不算强制，不改写。
+func isForcedResponsesToolChoice(raw json.RawMessage) bool {
+	t := bytes.TrimSpace(raw)
+	if len(t) == 0 || bytes.Equal(t, []byte("null")) {
+		return false
+	}
+	var s string
+	if json.Unmarshal(t, &s) == nil {
+		return s == "required"
+	}
+	if hasToolChoiceType(t, "function", "custom") {
+		return true
+	}
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(t, &obj) != nil {
+		return false
+	}
+	var typ, mode string
+	if json.Unmarshal(obj["type"], &typ) != nil || typ != "allowed_tools" {
+		return false
+	}
+	return json.Unmarshal(obj["mode"], &mode) == nil && mode == "required"
 }
 
 // isForcedAnthropicToolChoice 判断 anthropic-messages 形状的 tool_choice 是否表达「强制使用工具」语义：

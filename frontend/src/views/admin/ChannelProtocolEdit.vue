@@ -197,10 +197,16 @@ const featureForms = reactive<Record<string, FeatureForm>>({
   'tool-schema-normalize': { enabled: false, enabledParam: true, field: '', onlyThinking: false, schemaText: '' },
   'tool-choice-downgrade': { enabled: false, enabledParam: true, field: '', onlyThinking: false, schemaText: '' },
 })
-// 未在 UI 登记的特性（编辑态由 load() 回显）：后端/预设可能挂载尚未在表单登记的特性，
-// 原样保留（含其 params），避免「保存后静默丢失未展示配置」——静默丢弃 = 隐性数据丢失，
-// 违反项目「保存不得改动未展示配置」的约束。新建态保持空。
+// 未在 UI 登记的特性（编辑态由 load() 回显）：原样保留，避免保存时静默丢弃未展示配置。
 const unknownFeatures = ref<ProtocolFeature[]>([])
+// 已登记特性的原始 params（编辑态由 load() 回填）：表单字段覆盖同名键，未展示的键原样保留。
+// 约定：关闭特性再重新开启时不清空，未展示的隐藏键仍会透传（宁可保留也不静默丢弃配置）。
+const featureBaseParams = reactive<Record<string, Record<string, unknown>>>({})
+
+// 合并已登记特性的未展示参数：表单字段优先，其余键原样透传。
+function withBaseParams(key: string, own: Record<string, unknown>): Record<string, unknown> {
+  return { ...(featureBaseParams[key] || {}), ...own }
+}
 
 // 由表单组装后端 Features（挂载项才输出；schema 非空时解析为对象）。
 function buildFeatures(): ProtocolFeature[] {
@@ -209,12 +215,17 @@ function buildFeatures(): ProtocolFeature[] {
   if (tr.enabled) {
     out.push({
       key: 'thinking-roundtrip',
-      params: { enabled: tr.enabledParam, field: tr.field.trim() || 'reasoning_content', onlyThinking: tr.onlyThinking },
+      params: withBaseParams('thinking-roundtrip', {
+        enabled: tr.enabledParam,
+        field: tr.field.trim() || 'reasoning_content',
+        onlyThinking: tr.onlyThinking,
+      }),
     })
   }
   const ts = featureForms['tool-schema-normalize']
   if (ts.enabled) {
-    const params: Record<string, unknown> = {}
+    const params: Record<string, unknown> = { ...(featureBaseParams['tool-schema-normalize'] || {}) }
+    delete params.schema
     if (ts.schemaText.trim()) params.schema = JSON.parse(ts.schemaText)
     out.push({ key: 'tool-schema-normalize', params })
   }
@@ -222,13 +233,13 @@ function buildFeatures(): ProtocolFeature[] {
   if (tcd.enabled) {
     out.push({
       key: 'tool-choice-downgrade',
-      params: { enabled: tcd.enabledParam, onlyThinking: tcd.onlyThinking },
+      params: withBaseParams('tool-choice-downgrade', {
+        enabled: tcd.enabledParam,
+        onlyThinking: tcd.onlyThinking,
+      }),
     })
   }
-  // 未登记特性的原样保留：后端/预设可能挂载尚未在 UI 登记的特性，静默丢弃 = 隐性数据丢失，
-  // 违反项目「保存不得改动未展示配置」的约束，故原样输出（含其 params）。
-  // 只输出「key 不在 featureForms 内」的项：已登记 key 一律以表单为准（用户在本页可见可编辑），
-  // 避免同一 key 既按表单组装又按原始项输出造成重复。
+  // 已登记 key 一律以表单为准，未登记项原样输出，避免同一 key 重复。
   for (const f of unknownFeatures.value) {
     if (!featureForms[f.key]) out.push(f)
   }
@@ -353,11 +364,14 @@ async function load() {
       featureForms[key].onlyThinking = false
       featureForms[key].schemaText = ''
     }
+    for (const key of Object.keys(featureBaseParams)) delete featureBaseParams[key]
     for (const f of v.features || []) {
       const ff = featureForms[f.key]
       if (!ff) continue
       ff.enabled = true
       const p = (f.params || {}) as Record<string, any>
+      // 记录原始 params，保存时保留表单未展示的键。
+      featureBaseParams[f.key] = { ...p }
       if (f.key === 'thinking-roundtrip') {
         // 不变量：enabled 缺省必须为 false（与后端 boolParam(...,"enabled",false) 一致）。
         // 人工回归清单：① 后端返回无 enabled 参数的历史缺省配置，面板必须显示「关闭」；
@@ -367,10 +381,7 @@ async function load() {
         ff.field = typeof p.field === 'string' && p.field ? p.field : 'reasoning_content'
         ff.onlyThinking = !!p.onlyThinking
       } else if (f.key === 'tool-choice-downgrade') {
-        // 不变量：enabled 缺省必须为 false（与后端 boolParam(...,"enabled",false) 一致）。
-        // 人工回归清单：① 后端返回无 enabled 参数的历史缺省配置，面板必须显示「关闭」；
-        // ② 保存后重新加载，开关状态不得翻转；③ undefined→true 会让面板显示「开启」而运行
-        // 实际关闭 → 面板与行为分叉。
+        // 同 thinking-roundtrip：enabled 缺省必须为 false，避免面板与运行行为分叉。
         ff.enabledParam = p.enabled === undefined ? false : !!p.enabled
         ff.onlyThinking = !!p.onlyThinking
       } else if (f.key === 'tool-schema-normalize' && p.schema) {

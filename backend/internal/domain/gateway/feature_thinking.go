@@ -25,10 +25,11 @@ type thinkingRoundtripFeature struct {
 
 // newThinkingRoundtripFeature 依据挂载参数构造 thinking-roundtrip 特性。
 func newThinkingRoundtripFeature(params map[string]any) RequestFeature {
+	p := parseThinkingRoundtripParams(params)
 	return &thinkingRoundtripFeature{
-		enabled:      boolParam(params, "enabled", false),
-		field:        normalizeReasoningField(stringParam(params, "field", reasoningResponseField)),
-		onlyThinking: boolParam(params, "onlyThinking", false),
+		enabled:      p.Enabled,
+		field:        p.Field,
+		onlyThinking: p.OnlyThinking,
 	}
 }
 
@@ -134,7 +135,7 @@ func isThinkingRequestBody(body []byte) bool {
 }
 
 // isThinkingRequest 判断请求是否处于 thinking 模式（thinking 开启 / enable_thinking 为真 /
-// reasoning_effort 存在）。
+// reasoning_effort 存在 / openai-responses 的 reasoning.effort 存在）。
 func isThinkingRequest(m map[string]json.RawMessage) bool {
 	if raw, ok := m["thinking"]; ok {
 		var b bool
@@ -159,6 +160,21 @@ func isThinkingRequest(m map[string]json.RawMessage) bool {
 		t := bytes.TrimSpace(raw)
 		if len(t) > 0 && !bytes.Equal(t, []byte("null")) {
 			return true
+		}
+	}
+	if raw, ok := m["reasoning"]; ok {
+		// openai-responses 形状：{"reasoning":{"effort":"high",...}} 表示开启推理。
+		// 仅看 effort 键（summary 等不表达推理强度），与 reasoning_effort 同样忽略 null/空值；
+		// effort="none" 表示显式关闭推理，不算 thinking。
+		var obj map[string]json.RawMessage
+		if json.Unmarshal(raw, &obj) == nil {
+			t := bytes.TrimSpace(obj["effort"])
+			if len(t) > 0 && !bytes.Equal(t, []byte("null")) {
+				var effort string
+				if json.Unmarshal(t, &effort) != nil || !strings.EqualFold(effort, "none") {
+					return true
+				}
+			}
 		}
 	}
 	return false

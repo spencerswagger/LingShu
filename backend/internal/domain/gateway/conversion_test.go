@@ -286,10 +286,10 @@ func TestConvertedReasoningInjectReportsDroppedThinking(t *testing.T) {
 	const body = `{"model":"gpt-4","stream":false,"max_tokens":64,"messages":[` +
 		`{"role":"assistant","content":[{"type":"thinking","thinking":"CoT","signature":"s"},` +
 		`{"type":"text","text":"hi"}]}]}`
-	out, rep, err := protocolconv.ConvertRequest(
-		channelprotocol.ProtocolAnthropicMessages, channelprotocol.ProtocolOpenAIChat, []byte(body))
+	out, rep, err := protocolconv.ConvertRequestWithOptions(
+		channelprotocol.ProtocolAnthropicMessages, channelprotocol.ProtocolOpenAIChat, []byte(body), protocolconv.SerializeOptions{})
 	if err != nil {
-		t.Fatalf("ConvertRequest: %v", err)
+		t.Fatalf("ConvertRequestWithOptions: %v", err)
 	}
 	if strings.Contains(string(out), "reasoning_content") {
 		t.Fatalf("默认不应注入 reasoning_content: %s", out)
@@ -524,7 +524,7 @@ func TestStreamConversionToolOnlyAnthropicTarget(t *testing.T) {
 }
 
 // TestConvertParseFailureReturns400 断言 AC-P2-9：入站请求体「合法 JSON 且含 model，但对其声明协议不合法」
-// 时，ConvertRequest 解析失败应立即回 HTTP 400，且绝不发起上游调用（解析失败与候选无关，不 failover）。
+// 时，转换解析失败应立即回 HTTP 400，且绝不发起上游调用（解析失败与候选无关，不 failover）。
 func TestConvertParseFailureReturns400(t *testing.T) {
 	var calls int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -535,7 +535,7 @@ func TestConvertParseFailureReturns400(t *testing.T) {
 	defer upstream.Close()
 
 	h := build(t, upstream.URL)
-	// 模型仅可达 anthropic-messages → openai-chat 入站需转换（才会触发 ConvertRequest）。
+	// 模型仅可达 anthropic-messages → openai-chat 入站需转换（才会触发请求转换）。
 	h.chans.mrt.Model.Protocols = channelprotocol.Protocols{channelprotocol.ProtocolAnthropicMessages: {}}
 
 	// messages 为对象（非数组）→ 合法 JSON 且含 model，但 openai-chat 解析失败。

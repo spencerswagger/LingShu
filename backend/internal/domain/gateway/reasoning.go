@@ -24,7 +24,7 @@ import (
 //
 // 约束：
 //   - 仅内存、进程内（多实例部署不共享，缓存未命中时行为退化为改造前，不会报错）；
-//   - 有 TTL 与条目上限，超限按随机淘汰（缓存语义，丢失只会退回原行为）；
+//   - 有 TTL、条目上限与总字节上限，超限按随机淘汰（缓存语义，丢失只会退回原行为）；
 //   - 只回填缺失/为空的推理字段，已有内容一律不改写；
 //   - 只在目标上游协议为 openai-chat 时生效（其他协议的请求体形状不同）；
 //   - 回填由调用方按渠道声明门控（未声明支持推理回传的渠道不回填），缓存写入不做门控；
@@ -36,6 +36,9 @@ const (
 	reasoningCacheTTL = time.Hour
 	// reasoningCacheMax 是条目上限（按 tool_call_id 计），防止长驻进程内存无界增长。
 	reasoningCacheMax = 5000
+	// reasoningCacheMaxBytes 是缓存总字节上限（按 key + reasoning 长度估算），
+	// 防止少量超长推理或大量长推理在条目数未超限时仍撑爆内存。
+	reasoningCacheMaxBytes = 16 << 20
 	// reasoningCacheSweepInterval 是惰性清理过期条目的最小间隔（避免每次写入都全量扫描）。
 	reasoningCacheSweepInterval = time.Minute
 	// reasoningKeySeparator 分隔会话标识与 tool_call_id，避免跨会话串用。
@@ -56,17 +59,20 @@ type ReasoningCache struct {
 	entries   map[string]reasoningEntry
 	ttl       time.Duration
 	max       int
+	maxBytes  int
+	bytes     int
 	now       func() time.Time
 	lastSweep time.Time
 }
 
-// NewReasoningCache 创建会话级推理缓存（默认 TTL 与条目上限）。
+// NewReasoningCache 创建会话级推理缓存（默认 TTL、条目上限与总字节上限）。
 func NewReasoningCache() *ReasoningCache {
 	return &ReasoningCache{
-		entries: make(map[string]reasoningEntry, 64),
-		ttl:     reasoningCacheTTL,
-		max:     reasoningCacheMax,
-		now:     time.Now,
+		entries:  make(map[string]reasoningEntry, 64),
+		ttl:      reasoningCacheTTL,
+		max:      reasoningCacheMax,
+		maxBytes: reasoningCacheMaxBytes,
+		now:      time.Now,
 	}
 }
 
@@ -220,7 +226,7 @@ func (c *ReasoningCache) lookup(sessionID string, rawToolCalls json.RawMessage) 
 			continue
 		}
 		if !now.Before(e.expiresAt) {
-			delete(c.entries, key)
+			c.deleteLocked(key)
 			continue
 		}
 		return e.reasoning, true
@@ -245,7 +251,18 @@ func (c *ReasoningCache) insert(sessionID, reasoning string, ids []string) {
 		if id == "" {
 			continue
 		}
-		c.entries[reasoningKey(sessionID, id)] = reasoningEntry{reasoning: reasoning, expiresAt: exp}
+		key := reasoningKey(sessionID, id)
+		size := reasoningEntrySize(key, reasoning)
+		if c.maxBytes > 0 && size > c.maxBytes {
+			// 单条即超过总字节上限：写进去只会被 trim 立刻淘汰（可能连带挤掉既有可用条目），
+			// 故直接跳过写入，保留缓存中已有的推理内容。
+			continue
+		}
+		if _, ok := c.entries[key]; ok {
+			c.deleteLocked(key)
+		}
+		c.entries[key] = reasoningEntry{reasoning: reasoning, expiresAt: exp}
+		c.bytes += size
 	}
 	c.trimLocked()
 }
@@ -254,21 +271,42 @@ func (c *ReasoningCache) insert(sessionID, reasoning string, ids []string) {
 func (c *ReasoningCache) sweepLocked(now time.Time) {
 	for k, e := range c.entries {
 		if !now.Before(e.expiresAt) {
-			delete(c.entries, k)
+			c.deleteLocked(k)
 		}
 	}
 }
 
-// trimLocked 在条目超限时随机淘汰（调用方持锁；缓存语义，不保证 LRU）。
-func (c *ReasoningCache) trimLocked() {
-	if c.max <= 0 || len(c.entries) <= c.max {
-		return
+// deleteLocked 删除条目并同步扣减总字节（调用方持锁）。
+func (c *ReasoningCache) deleteLocked(key string) {
+	if e, ok := c.entries[key]; ok {
+		c.bytes -= reasoningEntrySize(key, e.reasoning)
+		delete(c.entries, key)
 	}
+}
+
+// reasoningEntrySize 估算单条缓存占用：键 + 推理文本长度。
+func reasoningEntrySize(key, reasoning string) int {
+	return len(key) + len(reasoning)
+}
+
+// withinLimitsLocked 判断当前是否仍在条目/字节上限内（0 或负值表示该维度不设限）。
+func (c *ReasoningCache) withinLimitsLocked() bool {
+	if c.max > 0 && len(c.entries) > c.max {
+		return false
+	}
+	if c.maxBytes > 0 && c.bytes > c.maxBytes {
+		return false
+	}
+	return true
+}
+
+// trimLocked 在条目或总字节超限时随机淘汰（调用方持锁；缓存语义，不保证 LRU）。
+func (c *ReasoningCache) trimLocked() {
 	for k := range c.entries {
-		if len(c.entries) <= c.max {
+		if c.withinLimitsLocked() {
 			return
 		}
-		delete(c.entries, k)
+		c.deleteLocked(k)
 	}
 }
 

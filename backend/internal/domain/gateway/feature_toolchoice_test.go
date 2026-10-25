@@ -34,7 +34,7 @@ func assertToolChoice(t *testing.T, body []byte, want string) {
 }
 
 // TestToolChoiceDowngradeFeature 覆盖强制工具选择降级为 auto 的语义与开关，
-// 分 openai-chat（字符串形状）与 anthropic-messages（对象形状）两种协议。
+// 分 openai-chat / openai-responses（字符串或扁平对象）与 anthropic-messages（对象）形状。
 func TestToolChoiceDowngradeFeature(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -120,10 +120,72 @@ func TestToolChoiceDowngradeFeature(t *testing.T) {
 			params: map[string]any{"enabled": true},
 			body:   `{"model":"m","tool_choice":1}`,
 		},
-		// 非本特性覆盖的协议：一律逐字节不改写。
+		// openai-responses 形状（字符串 / 扁平对象）：命中则降级为字符串 "auto"。
 		{
-			name:     "openai_responses_protocol_untouched",
+			name:     "responses_required_to_auto",
 			params:   map[string]any{"enabled": true},
+			protocol: channelprotocol.ProtocolOpenAIResponses,
+			body:     `{"model":"m","tool_choice":"required"}`,
+			want:     `"auto"`,
+		},
+		{
+			name:     "responses_function_to_auto",
+			params:   map[string]any{"enabled": true},
+			protocol: channelprotocol.ProtocolOpenAIResponses,
+			body:     `{"model":"m","tool_choice":{"type":"function","name":"f"}}`,
+			want:     `"auto"`,
+		},
+		{
+			name:     "responses_custom_to_auto",
+			params:   map[string]any{"enabled": true},
+			protocol: channelprotocol.ProtocolOpenAIResponses,
+			body:     `{"model":"m","tool_choice":{"type":"custom","name":"f"}}`,
+			want:     `"auto"`,
+		},
+		{
+			// allowed_tools 且 mode=required：强制从允许清单中选择，属强制语义。
+			name:     "responses_allowed_tools_required_to_auto",
+			params:   map[string]any{"enabled": true},
+			protocol: channelprotocol.ProtocolOpenAIResponses,
+			body:     `{"model":"m","tool_choice":{"type":"allowed_tools","mode":"required","tools":[]}}`,
+			want:     `"auto"`,
+		},
+		{
+			name:     "responses_auto_untouched",
+			params:   map[string]any{"enabled": true},
+			protocol: channelprotocol.ProtocolOpenAIResponses,
+			body:     `{"model":"m","tool_choice":"auto"}`,
+		},
+		{
+			// allowed_tools 的 mode 非 required（auto/none）时允许模型自选，不算强制语义。
+			name:     "responses_allowed_tools_auto_untouched",
+			params:   map[string]any{"enabled": true},
+			protocol: channelprotocol.ProtocolOpenAIResponses,
+			body:     `{"model":"m","tool_choice":{"type":"allowed_tools","mode":"auto","tools":[]}}`,
+		},
+		{
+			name:     "responses_allowed_tools_mode_absent_untouched",
+			params:   map[string]any{"enabled": true},
+			protocol: channelprotocol.ProtocolOpenAIResponses,
+			body:     `{"model":"m","tool_choice":{"type":"allowed_tools","tools":[]}}`,
+		},
+		{
+			// onlyThinking 的 responses 形状：reasoning.effort 存在即视为 thinking 模式。
+			name:     "responses_only_thinking_applies_with_reasoning_effort",
+			params:   map[string]any{"enabled": true, "onlyThinking": true},
+			protocol: channelprotocol.ProtocolOpenAIResponses,
+			body:     `{"model":"m","tool_choice":"required","reasoning":{"effort":"high"}}`,
+			want:     `"auto"`,
+		},
+		{
+			name:     "responses_only_thinking_skips_without_effort",
+			params:   map[string]any{"enabled": true, "onlyThinking": true},
+			protocol: channelprotocol.ProtocolOpenAIResponses,
+			body:     `{"model":"m","tool_choice":"required","reasoning":{"summary":"auto"}}`,
+		},
+		{
+			name:     "responses_disabled_by_default",
+			params:   map[string]any{},
 			protocol: channelprotocol.ProtocolOpenAIResponses,
 			body:     `{"model":"m","tool_choice":"required"}`,
 		},
@@ -262,8 +324,16 @@ func TestApplyConvertedRequestFeaturesDowngradesForcedToolChoice(t *testing.T) {
 		}
 	})
 
-	t.Run("protocol_not_in_whitelist_untouched", func(t *testing.T) {
+	t.Run("responses_target_downgraded", func(t *testing.T) {
 		out, err := applyConvertedRequestFeatures(body, rt(downgrade), channelprotocol.ProtocolOpenAIResponses)
+		if err != nil {
+			t.Fatalf("applyConvertedRequestFeatures: %v", err)
+		}
+		assertToolChoice(t, out, `"auto"`)
+	})
+
+	t.Run("protocol_not_in_whitelist_untouched", func(t *testing.T) {
+		out, err := applyConvertedRequestFeatures(body, rt(downgrade), "unknown-protocol")
 		if err != nil {
 			t.Fatalf("applyConvertedRequestFeatures: %v", err)
 		}
@@ -329,10 +399,10 @@ func TestConvertedAnthropicToolChoiceEndToEnd(t *testing.T) {
 			inbound := []byte(`{"model":"m","messages":[{"role":"user","content":"hi"}],` +
 				`"tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}],` +
 				`"tool_choice":` + tc.toolChoice + `}`)
-			conv, _, err := protocolconv.ConvertRequest(
-				channelprotocol.ProtocolOpenAIChat, channelprotocol.ProtocolAnthropicMessages, inbound)
+			conv, _, err := protocolconv.ConvertRequestWithOptions(
+				channelprotocol.ProtocolOpenAIChat, channelprotocol.ProtocolAnthropicMessages, inbound, protocolconv.SerializeOptions{})
 			if err != nil {
-				t.Fatalf("ConvertRequest: %v", err)
+				t.Fatalf("ConvertRequestWithOptions: %v", err)
 			}
 			// 前提：转换必须产出 anthropic 的强制形状，否则本特性分支在该链路上没有作用对象。
 			assertToolChoice(t, conv, tc.converted)
@@ -391,7 +461,8 @@ func TestChannelReasoningInject(t *testing.T) {
 
 // TestIsThinkingRequestBody 覆盖入站请求体 thinking 模式判定（供 channelReasoningInject 的
 // onlyThinking 门控使用，由调用方在候选循环外以原始入站请求体单次求值）：
-// thinking 布尔/对象（type=enabled）、enable_thinking、reasoning_effort 均视为 thinking 模式；
+// thinking 布尔/对象（type=enabled）、enable_thinking、reasoning_effort、
+// openai-responses 的 reasoning.effort 均视为 thinking 模式；
 // 仅模型名（无 thinking 字段）、显式关闭与非法 JSON 判定为否。
 func TestIsThinkingRequestBody(t *testing.T) {
 	cases := []struct {
@@ -404,6 +475,13 @@ func TestIsThinkingRequestBody(t *testing.T) {
 		{name: "thinking_object_enabled_with_budget", body: `{"model":"m","thinking":{"type":"enabled","budget_tokens":1024}}`, want: true},
 		{name: "enable_thinking_true", body: `{"model":"m","enable_thinking":true}`, want: true},
 		{name: "reasoning_effort_present", body: `{"model":"m","reasoning_effort":"high"}`, want: true},
+		{name: "responses_reasoning_effort_present", body: `{"model":"m","reasoning":{"effort":"high"}}`, want: true},
+		{name: "responses_reasoning_effort_with_summary", body: `{"model":"m","reasoning":{"effort":"low","summary":"auto"}}`, want: true},
+		{name: "responses_reasoning_summary_only", body: `{"model":"m","reasoning":{"summary":"auto"}}`, want: false},
+		{name: "responses_reasoning_empty_object", body: `{"model":"m","reasoning":{}}`, want: false},
+		{name: "responses_reasoning_effort_null", body: `{"model":"m","reasoning":{"effort":null}}`, want: false},
+		{name: "responses_reasoning_effort_none", body: `{"model":"m","reasoning":{"effort":"none"}}`, want: false},
+		{name: "responses_reasoning_string_shape", body: `{"model":"m","reasoning":"high"}`, want: false},
 		{name: "model_name_only", body: `{"model":"deepseek-reasoner"}`, want: false},
 		{name: "thinking_bool_false", body: `{"model":"m","thinking":false}`, want: false},
 		{name: "thinking_object_disabled", body: `{"model":"m","thinking":{"type":"disabled"}}`, want: false},

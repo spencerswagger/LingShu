@@ -2,6 +2,8 @@ package gateway
 
 import (
 	"encoding/json"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -173,6 +175,106 @@ func TestReasoningCacheCapacityLimit(t *testing.T) {
 	c.mu.Unlock()
 	if n > 2 {
 		t.Fatalf("entries = %d, want <= 2（容量上限）", n)
+	}
+}
+
+func TestReasoningCacheTotalBytesLimit(t *testing.T) {
+	c := NewReasoningCache()
+	c.maxBytes = 512
+	reasoning := strings.Repeat("x", 128)
+	for i := 0; i < 20; i++ {
+		c.RememberMessage("s1", []byte(fmt.Sprintf(
+			`{"role":"assistant","reasoning_content":"%s","tool_calls":[{"id":"call_%d"}]}`, reasoning, i)))
+	}
+	c.mu.Lock()
+	bytes, n := c.bytes, len(c.entries)
+	c.mu.Unlock()
+	if bytes > 512 {
+		t.Fatalf("bytes = %d, want <= 512（总字节上限）", bytes)
+	}
+	// 每条 size = key(9) + reasoning(128) = 137，512 / 137 = 3.7：
+	// 稳定态恰好保留 3 条（4 条最少 548 > 512），多于/少于 3 条都说明淘汰逻辑有偏差。
+	if n != 3 {
+		t.Fatalf("entries = %d, want 3（按字节上限恰好保留 3 条）", n)
+	}
+}
+
+// TestReasoningCacheSkipsOversizedEntry 覆盖单条推理超过总字节上限时跳过写入：
+// 既不写入该条，也不得连带淘汰缓存中已有的可用条目。
+func TestReasoningCacheSkipsOversizedEntry(t *testing.T) {
+	c := NewReasoningCache()
+	c.maxBytes = 64
+	oversized := strings.Repeat("x", 200)
+	oversizedMsg := []byte(`{"role":"assistant","reasoning_content":"` + oversized + `","tool_calls":[{"id":"call_big"}]}`)
+
+	// 空闲缓存写入超限条目：直接跳过，缓存保持为空。
+	c.RememberMessage("s1", oversizedMsg)
+	c.mu.Lock()
+	n, bytes := len(c.entries), c.bytes
+	c.mu.Unlock()
+	if n != 0 || bytes != 0 {
+		t.Fatalf("单条超限应跳过写入, got entries=%d bytes=%d", n, bytes)
+	}
+
+	// 已有可容纳的小条目时写入超限条目：小条目必须保留，且字节不变。
+	c.RememberMessage("s1", []byte(`{"role":"assistant","reasoning_content":"ok","tool_calls":[{"id":"call_small"}]}`))
+	c.RememberMessage("s1", oversizedMsg)
+	c.mu.Lock()
+	n, bytes = len(c.entries), c.bytes
+	_, smallOK := c.entries[reasoningKey("s1", "call_small")]
+	_, bigOK := c.entries[reasoningKey("s1", "call_big")]
+	c.mu.Unlock()
+	if n != 1 || !smallOK || bigOK {
+		t.Fatalf("超限条目不应写入也不应挤掉已有条目, got entries=%d small=%v big=%v", n, smallOK, bigOK)
+	}
+	if want := len(reasoningKey("s1", "call_small")) + len("ok"); bytes != want {
+		t.Fatalf("bytes = %d, want %d（超限条目不得计入）", bytes, want)
+	}
+}
+
+func TestReasoningCacheBytesTrackOverwrite(t *testing.T) {
+	c := NewReasoningCache()
+	key := reasoningKey("s1", "call_1")
+	remember := func(reasoning string) {
+		c.RememberMessage("s1", []byte(`{"role":"assistant","reasoning_content":"`+reasoning+`","tool_calls":[{"id":"call_1"}]}`))
+	}
+	assertBytes := func(want int) {
+		t.Helper()
+		c.mu.Lock()
+		got := c.bytes
+		c.mu.Unlock()
+		if got != want {
+			t.Fatalf("bytes = %d, want %d（覆盖写入应替换旧条目字节）", got, want)
+		}
+	}
+
+	remember("short")
+	assertBytes(len(key) + len("short"))
+	remember("a much longer reasoning text")
+	assertBytes(len(key) + len("a much longer reasoning text"))
+}
+
+func TestReasoningCacheBytesReleasedOnExpiry(t *testing.T) {
+	base := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
+	c := NewReasoningCache()
+	c.now = func() time.Time { return base }
+	c.RememberMessage("s1", []byte(`{"role":"assistant","reasoning_content":"会过期","tool_calls":[{"id":"call_1"}]}`))
+	c.mu.Lock()
+	before := c.bytes
+	c.mu.Unlock()
+	if before == 0 {
+		t.Fatalf("写入后 bytes 应大于 0")
+	}
+
+	c.now = func() time.Time { return base.Add(c.ttl + time.Second) }
+	body := []byte(`{"messages":[{"role":"assistant","tool_calls":[{"id":"call_1"}]}]}`)
+	c.Backfill("s1", "reasoning_content", body)
+
+	c.mu.Lock()
+	after := c.bytes
+	c.mu.Unlock()
+	if after != 0 {
+		t.Fatalf("过期条目被删除后 bytes 应归零, got %d", after)
 	}
 }
 

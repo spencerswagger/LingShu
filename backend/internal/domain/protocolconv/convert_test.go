@@ -85,9 +85,9 @@ func TestMatrix(t *testing.T) {
 					t.Fatalf("parse source request: %v", err)
 				}
 
-				out, _, err := ConvertRequest(from, to, []byte(matrixRequestSamples[from]))
+				out, _, err := ConvertRequestWithOptions(from, to, []byte(matrixRequestSamples[from]), SerializeOptions{})
 				if err != nil {
-					t.Fatalf("ConvertRequest: %v", err)
+					t.Fatalf("ConvertRequestWithOptions: %v", err)
 				}
 				gotReq, _, err := mustCodec(t, to).ParseRequest(out)
 				if err != nil {
@@ -264,7 +264,7 @@ func TestConvertBase64ImageRoundTrip(t *testing.T) {
 			]}
 		]
 	}`
-	anthropicOut, _, err := ConvertRequest(channelprotocol.ProtocolOpenAIChat, channelprotocol.ProtocolAnthropicMessages, []byte(openaiBody))
+	anthropicOut, _, err := ConvertRequestWithOptions(channelprotocol.ProtocolOpenAIChat, channelprotocol.ProtocolAnthropicMessages, []byte(openaiBody), SerializeOptions{})
 	if err != nil {
 		t.Fatalf("openai->anthropic: %v", err)
 	}
@@ -289,7 +289,7 @@ func TestConvertBase64ImageRoundTrip(t *testing.T) {
 			]}
 		]
 	}`
-	openaiOut, _, err := ConvertRequest(channelprotocol.ProtocolAnthropicMessages, channelprotocol.ProtocolOpenAIChat, []byte(anthropicBody))
+	openaiOut, _, err := ConvertRequestWithOptions(channelprotocol.ProtocolAnthropicMessages, channelprotocol.ProtocolOpenAIChat, []byte(anthropicBody), SerializeOptions{})
 	if err != nil {
 		t.Fatalf("anthropic->openai: %v", err)
 	}
@@ -324,9 +324,9 @@ func TestConvertAdjacentUserMergeToAnthropic(t *testing.T) {
 			{"role": "user", "content": "second"}
 		]
 	}`
-	out, _, err := ConvertRequest(channelprotocol.ProtocolOpenAIChat, channelprotocol.ProtocolAnthropicMessages, []byte(body))
+	out, _, err := ConvertRequestWithOptions(channelprotocol.ProtocolOpenAIChat, channelprotocol.ProtocolAnthropicMessages, []byte(body), SerializeOptions{})
 	if err != nil {
-		t.Fatalf("ConvertRequest: %v", err)
+		t.Fatalf("ConvertRequestWithOptions: %v", err)
 	}
 	req, _, err := anthropicCodec{}.ParseRequest(out)
 	if err != nil {
@@ -373,10 +373,11 @@ func TestResponsesFinishReasonVocabulary(t *testing.T) {
 // 非 ConvertError 与 nil 一律返回空串。
 func TestConvertRequestErrorStage(t *testing.T) {
 	// 合法 JSON 且含 model，但 messages 为对象（非数组）→ openai-chat 解析失败 → parse。
-	_, _, perr := ConvertRequest(
+	_, _, perr := ConvertRequestWithOptions(
 		channelprotocol.ProtocolOpenAIChat,
 		channelprotocol.ProtocolAnthropicMessages,
 		[]byte(`{"model":"m","messages":{"not":"an array"}}`),
+		SerializeOptions{},
 	)
 	if got := ConvertStage(perr); got != StageParse {
 		t.Fatalf("invalid inbound for its protocol: stage=%q want %q (err=%v)", got, StageParse, perr)
@@ -387,10 +388,11 @@ func TestConvertRequestErrorStage(t *testing.T) {
 	}
 
 	// 未知目标协议 → serialize。
-	_, _, serr := ConvertRequest(
+	_, _, serr := ConvertRequestWithOptions(
 		channelprotocol.ProtocolOpenAIChat,
 		"unknown-proto",
 		[]byte(matrixRequestSamples[channelprotocol.ProtocolOpenAIChat]),
+		SerializeOptions{},
 	)
 	if got := ConvertStage(serr); got != StageSerialize {
 		t.Fatalf("unknown target protocol: stage=%q want %q (err=%v)", got, StageSerialize, serr)
@@ -574,9 +576,9 @@ func TestConvertRequestAnthropicThinkingDefaultNotInjected(t *testing.T) {
 		`{"type":"thinking","thinking":"chain of thought","signature":"sig"},` +
 		`{"type":"text","text":"hi"}]}]}`
 
-	out, rep, err := ConvertRequest(channelprotocol.ProtocolAnthropicMessages, channelprotocol.ProtocolOpenAIChat, []byte(body))
+	out, rep, err := ConvertRequestWithOptions(channelprotocol.ProtocolAnthropicMessages, channelprotocol.ProtocolOpenAIChat, []byte(body), SerializeOptions{})
 	if err != nil {
-		t.Fatalf("ConvertRequest: %v", err)
+		t.Fatalf("ConvertRequestWithOptions: %v", err)
 	}
 	if strings.Contains(string(out), `"reasoning_content"`) {
 		t.Fatalf("默认不应注入 reasoning_content: %s", out)

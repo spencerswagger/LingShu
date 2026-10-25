@@ -118,13 +118,8 @@ func (o SerializeOptions) reasoningFieldName() string {
 	return o.ReasoningField
 }
 
-// ConvertRequest 将请求体从 from 协议转换为 to 协议：解析为规范请求后按目标协议序列化，并合并两侧损耗报告。
-// 以默认序列化选项（全部关闭）执行。
-func ConvertRequest(from, to string, body []byte) ([]byte, *LossyReport, error) {
-	return ConvertRequestWithOptions(from, to, body, SerializeOptions{})
-}
-
-// ConvertRequestWithOptions 与 ConvertRequest 相同，额外接受目标协议序列化选项。
+// ConvertRequestWithOptions 将请求体从 from 协议转换为 to 协议：解析为规范请求后按目标协议序列化，并合并两侧损耗报告。
+// opts 为默认零值时即全部关闭的安全态。
 func ConvertRequestWithOptions(from, to string, body []byte, opts SerializeOptions) ([]byte, *LossyReport, error) {
 	fromCodec, ok := codecFor(from)
 	if !ok {

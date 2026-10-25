@@ -142,6 +142,7 @@ func protocolFeatures(rt *channel.RuntimeChannel) []channelprotocol.Feature {
 var convertedRequestFeatureKeys = map[string][]string{
 	channelprotocol.FeatureToolChoiceDowngrade: {
 		channelprotocol.ProtocolOpenAIChat,
+		channelprotocol.ProtocolOpenAIResponses,
 		channelprotocol.ProtocolAnthropicMessages,
 	},
 }
@@ -177,6 +178,24 @@ func applyConvertedRequestFeatures(body []byte, rt *channel.RuntimeChannel, prot
 	return req.Body, nil
 }
 
+// thinkingRoundtripParams 是 thinking-roundtrip 特性的挂载参数：请求侧直通改写
+// （feature_thinking.go）与会话级推理缓存回填（reasoningDeclarationOf）共用同一解析口径，
+// 避免 enabled / field / onlyThinking 在两条路径上出现语义漂移。
+type thinkingRoundtripParams struct {
+	Enabled      bool   // 是否启用（缺省 false）
+	Field        string // 请求侧写入字段名（缺省 reasoning_content，已去空白）
+	OnlyThinking bool   // 是否仅对显式 thinking 模式的请求生效
+}
+
+// parseThinkingRoundtripParams 解析 thinking-roundtrip 挂载参数（字段名已归一）。
+func parseThinkingRoundtripParams(params map[string]any) thinkingRoundtripParams {
+	return thinkingRoundtripParams{
+		Enabled:      boolParam(params, "enabled", false),
+		Field:        normalizeReasoningField(stringParam(params, "field", reasoningResponseField)),
+		OnlyThinking: boolParam(params, "onlyThinking", false),
+	}
+}
+
 // reasoningDeclaration 是渠道对「推理内容回传」的声明（来自挂载的 thinking-roundtrip 参数）。
 type reasoningDeclaration struct {
 	Supported    bool   // 是否声明该上游支持推理内容回传（enabled=true）
@@ -190,10 +209,11 @@ func reasoningDeclarationOf(rt *channel.RuntimeChannel) reasoningDeclaration {
 		if f.Key != channelprotocol.FeatureThinkingRoundtrip {
 			continue
 		}
+		p := parseThinkingRoundtripParams(f.Params)
 		return reasoningDeclaration{
-			Supported:    boolParam(f.Params, "enabled", false),
-			Field:        normalizeReasoningField(stringParam(f.Params, "field", reasoningResponseField)),
-			OnlyThinking: boolParam(f.Params, "onlyThinking", false),
+			Supported:    p.Enabled,
+			Field:        p.Field,
+			OnlyThinking: p.OnlyThinking,
 		}
 	}
 	return reasoningDeclaration{Field: reasoningResponseField}
