@@ -27,6 +27,13 @@ type Codec interface {
 	StreamCodec
 }
 
+// serializeOptionsCodec 是目标协议序列化可选能力的扩展接口：实现该接口的 Codec
+// 可按 SerializeOptions 决定可选改写（如是否回填 reasoning_content）。
+// 未实现时按默认选项（全关闭）序列化。
+type serializeOptionsCodec interface {
+	SerializeRequestWithOptions(req *CanonicalRequest, opts SerializeOptions) ([]byte, *LossyReport, error)
+}
+
 // marshalJSONNoEscape 以禁用 HTML 转义的编码器序列化 JSON，避免工具 schema/参数中的 <、>、& 被转义。
 func marshalJSONNoEscape(v interface{}) ([]byte, error) {
 	var buf bytes.Buffer

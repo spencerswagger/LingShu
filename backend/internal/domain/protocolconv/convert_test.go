@@ -496,3 +496,127 @@ func responseThinkingText(resp *CanonicalResponse) string {
 	}
 	return ""
 }
+
+// TestConvertRequestAnthropicThinkingRoundTrip 断言 Anthropic 请求历史中的 thinking 块
+// 在渠道声明支持 reasoning 回传（SerializeOptions.ReasoningContent=true）时转换为
+// openai-chat 必须回填为 reasoning_content：DeepSeek 等 thinking 模型在多轮/tool 循环中
+// 要求回传上一轮推理内容，丢弃会导致
+// "The `reasoning_content` in the thinking mode must be passed back" 400。
+func TestConvertRequestAnthropicThinkingRoundTrip(t *testing.T) {
+	const reasoning = "chain of thought"
+	const body = `{"model":"m","max_tokens":64,"messages":[` +
+		`{"role":"assistant","content":[` +
+		`{"type":"thinking","thinking":"` + reasoning + `","signature":"sig"},` +
+		`{"type":"tool_use","id":"toolu_1","name":"f","input":{}}]},` +
+		`{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}]}`
+
+	out, rep, err := ConvertRequestWithOptions(
+		channelprotocol.ProtocolAnthropicMessages, channelprotocol.ProtocolOpenAIChat,
+		[]byte(body), SerializeOptions{ReasoningContent: true})
+	if err != nil {
+		t.Fatalf("ConvertRequestWithOptions: %v", err)
+	}
+	got := string(out)
+	if !strings.Contains(got, `"reasoning_content":"`+reasoning+`"`) {
+		t.Fatalf("assistant thinking 未回填 reasoning_content: %s", got)
+	}
+	if !strings.Contains(got, `"tool_calls"`) || !strings.Contains(got, `"tool_call_id":"toolu_1"`) {
+		t.Fatalf("tool 调用/结果未保留: %s", got)
+	}
+	for _, dropped := range rep.Dropped {
+		if dropped == "message.content.thinking" {
+			t.Fatalf("thinking 已回填，不应记为丢失: %v", rep.Dropped)
+		}
+	}
+}
+
+// TestConvertRequestAnthropicThinkingInjection 覆盖回填开启时的字段名与命中条件：
+// 字段名由渠道声明；assistant 无 thinking 时不注入；多 assistant 仅带 thinking 的那条注入。
+func TestConvertRequestAnthropicThinkingInjection(t *testing.T) {
+	const body = `{"model":"m","max_tokens":64,"messages":[` +
+		`{"role":"assistant","content":[{"type":"text","text":"无推理"}]},` +
+		`{"role":"assistant","content":[` +
+		`{"type":"thinking","thinking":"reasoned","signature":"sig"},` +
+		`{"type":"text","text":"hi"}]}]}`
+
+	out, rep, err := ConvertRequestWithOptions(
+		channelprotocol.ProtocolAnthropicMessages, channelprotocol.ProtocolOpenAIChat,
+		[]byte(body), SerializeOptions{ReasoningContent: true, ReasoningField: "reasoning"})
+	if err != nil {
+		t.Fatalf("ConvertRequestWithOptions: %v", err)
+	}
+	got := string(out)
+	if !strings.Contains(got, `"reasoning":"reasoned"`) {
+		t.Fatalf("应按渠道声明字段名注入推理内容: %s", got)
+	}
+	if strings.Contains(got, `"reasoning_content"`) {
+		t.Fatalf("不应写入未声明的默认字段名: %s", got)
+	}
+	if strings.Count(got, `"reasoning":"reasoned"`) != 1 {
+		t.Fatalf("仅带 thinking 的 assistant 应注入一次: %s", got)
+	}
+	found := false
+	for _, n := range rep.Notes {
+		if strings.Contains(n, "thinking → reasoning") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("注入发生时应记 note 提示语义转换: %v", rep.Notes)
+	}
+}
+
+// TestConvertRequestAnthropicThinkingDefaultNotInjected 断言默认序列化选项下不注入
+// reasoning_content（目标上游未声明支持时避免未知消息字段导致 400），并如实记 lossy。
+func TestConvertRequestAnthropicThinkingDefaultNotInjected(t *testing.T) {
+	const body = `{"model":"m","max_tokens":64,"messages":[` +
+		`{"role":"assistant","content":[` +
+		`{"type":"thinking","thinking":"chain of thought","signature":"sig"},` +
+		`{"type":"text","text":"hi"}]}]}`
+
+	out, rep, err := ConvertRequest(channelprotocol.ProtocolAnthropicMessages, channelprotocol.ProtocolOpenAIChat, []byte(body))
+	if err != nil {
+		t.Fatalf("ConvertRequest: %v", err)
+	}
+	if strings.Contains(string(out), `"reasoning_content"`) {
+		t.Fatalf("默认不应注入 reasoning_content: %s", out)
+	}
+	found := false
+	for _, dropped := range rep.Dropped {
+		if dropped == "message.content.thinking" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("默认丢弃 thinking 时应记 lossy: %v", rep.Dropped)
+	}
+}
+
+// TestConvertRequestAnthropicThinkingEmptyTextNotInjected 断言 thinking 文本为空白时，
+// 即使注入开启（SerializeOptions.ReasoningContent=true）也不回填 reasoning_content：
+// 空白内容无法满足上游「必须回传推理内容」的要求，视为丢弃并如实记 lossy，不得静默。
+func TestConvertRequestAnthropicThinkingEmptyTextNotInjected(t *testing.T) {
+	const body = `{"model":"m","max_tokens":64,"messages":[` +
+		`{"role":"assistant","content":[` +
+		`{"type":"thinking","thinking":"   ","signature":"sig"},` +
+		`{"type":"text","text":"hi"}]}]}`
+
+	out, rep, err := ConvertRequestWithOptions(
+		channelprotocol.ProtocolAnthropicMessages, channelprotocol.ProtocolOpenAIChat,
+		[]byte(body), SerializeOptions{ReasoningContent: true})
+	if err != nil {
+		t.Fatalf("ConvertRequestWithOptions: %v", err)
+	}
+	if strings.Contains(string(out), `"reasoning_content"`) {
+		t.Fatalf("空白 thinking 不应注入 reasoning_content: %s", out)
+	}
+	found := false
+	for _, dropped := range rep.Dropped {
+		if dropped == "message.content.thinking" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("空白 thinking 丢弃时应记 lossy: %v", rep.Dropped)
+	}
+}

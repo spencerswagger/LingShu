@@ -161,6 +161,7 @@ type ErrorDisposition struct {
 const (
 	FeatureThinkingRoundtrip   = "thinking-roundtrip"    // 请求侧按上游约定回传 reasoning_content
 	FeatureToolSchemaNormalize = "tool-schema-normalize" // 对齐工具 input_schema
+	FeatureToolChoiceDowngrade = "tool-choice-downgrade" // thinking 模型下把强制工具选择降级为 auto
 )
 
 // Feature 渠道协议上挂载的一项协议特性：Key 指定代码实现的特性，Params 为其参数（允许为空）。
@@ -172,7 +173,7 @@ type Feature struct {
 // IsValidFeatureKey 判断特性 key 是否为代码实现并注册的合法特性。
 func IsValidFeatureKey(key string) bool {
 	switch key {
-	case FeatureThinkingRoundtrip, FeatureToolSchemaNormalize:
+	case FeatureThinkingRoundtrip, FeatureToolSchemaNormalize, FeatureToolChoiceDowngrade:
 		return true
 	}
 	return false

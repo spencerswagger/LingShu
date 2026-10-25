@@ -98,8 +98,34 @@ func codecFor(protocol string) (Codec, bool) {
 	return nil, false
 }
 
+// SerializeOptions 是目标协议序列化阶段的可选行为开关（默认全关闭，保持安全态）。
+type SerializeOptions struct {
+	// ReasoningContent 为 true 时，anthropic-messages → openai-chat 转换会把 assistant
+	// 历史的 thinking 块回填为推理字段。仅当目标上游确实支持该字段时才可开启：
+	// DeepSeek 等 thinking 模型在多轮/tool 循环中要求回传，其余兼容实现可能按未知消息
+	// 字段拒绝（400），因此默认关闭，由渠道协议显式声明。
+	ReasoningContent bool
+	// ReasoningField 是 ReasoningContent 开启时写入的字段名（空 = reasoning_content）。
+	// 由渠道协议声明，与直通路径的回传字段保持一致，避免同一上游出现两种字段名。
+	ReasoningField string
+}
+
+// reasoningFieldName 返回实际写入的推理字段名（缺省 reasoning_content）。
+func (o SerializeOptions) reasoningFieldName() string {
+	if o.ReasoningField == "" {
+		return "reasoning_content"
+	}
+	return o.ReasoningField
+}
+
 // ConvertRequest 将请求体从 from 协议转换为 to 协议：解析为规范请求后按目标协议序列化，并合并两侧损耗报告。
+// 以默认序列化选项（全部关闭）执行。
 func ConvertRequest(from, to string, body []byte) ([]byte, *LossyReport, error) {
+	return ConvertRequestWithOptions(from, to, body, SerializeOptions{})
+}
+
+// ConvertRequestWithOptions 与 ConvertRequest 相同，额外接受目标协议序列化选项。
+func ConvertRequestWithOptions(from, to string, body []byte, opts SerializeOptions) ([]byte, *LossyReport, error) {
 	fromCodec, ok := codecFor(from)
 	if !ok {
 		return nil, nil, &ConvertError{Stage: StageSerialize, Err: fmt.Errorf("protocolconv: unknown source protocol %q", from)}
@@ -121,7 +147,13 @@ func ConvertRequest(from, to string, body []byte) ([]byte, *LossyReport, error) 
 		parseRep.Note("top-level extras dropped for anthropic target")
 		req.Extra = nil
 	}
-	out, serRep, err := toCodec.SerializeRequest(req)
+	var out []byte
+	var serRep *LossyReport
+	if oc, ok := toCodec.(serializeOptionsCodec); ok {
+		out, serRep, err = oc.SerializeRequestWithOptions(req, opts)
+	} else {
+		out, serRep, err = toCodec.SerializeRequest(req)
+	}
 	if err != nil {
 		return nil, serRep, &ConvertError{Stage: StageSerialize, Err: err}
 	}

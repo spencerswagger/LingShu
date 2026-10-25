@@ -154,6 +154,8 @@ type Gateway struct {
 	upstreamRespHeaders func() []string
 	// protocolConvEnabled 全局跨协议转换开关（nil=默认开启）。
 	protocolConvEnabled func() bool
+	// reasoning 会话级推理缓存：回填 thinking 模式客户端未回传的 reasoning_content。
+	reasoning *ReasoningCache
 }
 
 // ProtocolConversionEnabledKey 是全局跨协议转换开关在 sys_configs 中的键（默认开启）。
@@ -259,6 +261,7 @@ func NewGateway(cfg GatewayConfig) *Gateway {
 		streamClient:        cfg.StreamClient,
 		upstreamRespHeaders: respHeaders,
 		protocolConvEnabled: cfg.ProtocolConversionEnabled,
+		reasoning:           NewReasoningCache(),
 	}
 }
 

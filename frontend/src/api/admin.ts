@@ -317,7 +317,9 @@ export interface ErrorPolicy {
   disposition: ErrorDisposition
   note?: string
 }
-// 协议特性：Key 指定代码实现的特性（thinking-roundtrip / tool-schema-normalize），Params 为其参数（允许为空）。
+// 协议特性：Key 指定代码实现的特性（thinking-roundtrip / tool-schema-normalize /
+// tool-choice-downgrade），Params 为其参数（允许为空）。新增特性时需同步 ChannelProtocolEdit.vue 的
+// featureCatalog/featureForms，否则 UI 保存会丢弃未登记的特性。
 export interface ProtocolFeature {
   key: string
   params?: Record<string, unknown>

@@ -178,19 +178,29 @@ const featureCatalog = [
     label: 'tool-schema-normalize',
     desc: '为缺失/非法 schema 的工具补齐 input_schema（修复 web_search 类工具 422）',
   },
+  {
+    key: 'tool-choice-downgrade',
+    label: 'tool-choice-downgrade',
+    desc: '把强制工具选择（required / 指定函数 / any / tool）降级为 auto，修复 thinking 模型不支持强制选择的 400',
+  },
 ] as const
 
 type FeatureForm = {
   enabled: boolean // 是否挂载
-  enabledParam: boolean // thinking-roundtrip 参数：enabled
+  enabledParam: boolean // thinking-roundtrip / tool-choice-downgrade 参数：enabled
   field: string // thinking-roundtrip 参数：field
-  onlyThinking: boolean // thinking-roundtrip 参数：onlyThinking
+  onlyThinking: boolean // thinking-roundtrip / tool-choice-downgrade 参数：onlyThinking
   schemaText: string // tool-schema-normalize 参数：schema（JSON 文本，空 = 内置默认）
 }
 const featureForms = reactive<Record<string, FeatureForm>>({
   'thinking-roundtrip': { enabled: false, enabledParam: true, field: 'reasoning_content', onlyThinking: false, schemaText: '' },
   'tool-schema-normalize': { enabled: false, enabledParam: true, field: '', onlyThinking: false, schemaText: '' },
+  'tool-choice-downgrade': { enabled: false, enabledParam: true, field: '', onlyThinking: false, schemaText: '' },
 })
+// 未在 UI 登记的特性（编辑态由 load() 回显）：后端/预设可能挂载尚未在表单登记的特性，
+// 原样保留（含其 params），避免「保存后静默丢失未展示配置」——静默丢弃 = 隐性数据丢失，
+// 违反项目「保存不得改动未展示配置」的约束。新建态保持空。
+const unknownFeatures = ref<ProtocolFeature[]>([])
 
 // 由表单组装后端 Features（挂载项才输出；schema 非空时解析为对象）。
 function buildFeatures(): ProtocolFeature[] {
@@ -207,6 +217,20 @@ function buildFeatures(): ProtocolFeature[] {
     const params: Record<string, unknown> = {}
     if (ts.schemaText.trim()) params.schema = JSON.parse(ts.schemaText)
     out.push({ key: 'tool-schema-normalize', params })
+  }
+  const tcd = featureForms['tool-choice-downgrade']
+  if (tcd.enabled) {
+    out.push({
+      key: 'tool-choice-downgrade',
+      params: { enabled: tcd.enabledParam, onlyThinking: tcd.onlyThinking },
+    })
+  }
+  // 未登记特性的原样保留：后端/预设可能挂载尚未在 UI 登记的特性，静默丢弃 = 隐性数据丢失，
+  // 违反项目「保存不得改动未展示配置」的约束，故原样输出（含其 params）。
+  // 只输出「key 不在 featureForms 内」的项：已登记 key 一律以表单为准（用户在本页可见可编辑），
+  // 避免同一 key 既按表单组装又按原始项输出造成重复。
+  for (const f of unknownFeatures.value) {
+    if (!featureForms[f.key]) out.push(f)
   }
   return out
 }
@@ -335,13 +359,27 @@ async function load() {
       ff.enabled = true
       const p = (f.params || {}) as Record<string, any>
       if (f.key === 'thinking-roundtrip') {
-        ff.enabledParam = p.enabled === undefined ? true : !!p.enabled
+        // 不变量：enabled 缺省必须为 false（与后端 boolParam(...,"enabled",false) 一致）。
+        // 人工回归清单：① 后端返回无 enabled 参数的历史缺省配置，面板必须显示「关闭」；
+        // ② 保存后重新加载，开关状态不得翻转；③ 若误把 undefined 解析为 true，历史缺省
+        // 配置会显示「开启」而运行实际关闭 → 面板与行为分叉。
+        ff.enabledParam = p.enabled === undefined ? false : !!p.enabled
         ff.field = typeof p.field === 'string' && p.field ? p.field : 'reasoning_content'
+        ff.onlyThinking = !!p.onlyThinking
+      } else if (f.key === 'tool-choice-downgrade') {
+        // 不变量：enabled 缺省必须为 false（与后端 boolParam(...,"enabled",false) 一致）。
+        // 人工回归清单：① 后端返回无 enabled 参数的历史缺省配置，面板必须显示「关闭」；
+        // ② 保存后重新加载，开关状态不得翻转；③ undefined→true 会让面板显示「开启」而运行
+        // 实际关闭 → 面板与行为分叉。
+        ff.enabledParam = p.enabled === undefined ? false : !!p.enabled
         ff.onlyThinking = !!p.onlyThinking
       } else if (f.key === 'tool-schema-normalize' && p.schema) {
         ff.schemaText = JSON.stringify(p.schema, null, 2)
       }
     }
+    // 未登记特性的原样保留（编辑态）：不在表单登记范围内的特性（含其 params）原样带回，
+    // 使 buildFeatures() 在保存时得以原样输出；已登记 key 已被上面的循环接管，故排除。
+    unknownFeatures.value = (v.features || []).filter((f) => !featureForms[f.key])
     modelRows.value = Object.entries(v.Models || {}).map(([mid, ov]) => ({
       id: mid,
       protocols: Object.keys(ov?.protocols || {}),
@@ -923,7 +961,23 @@ async function onSubmit() {
                 </el-form-item>
                 <el-form-item label="仅 thinking 模式">
                   <el-switch v-model="featureForms[f.key].onlyThinking" />
-                  <span class="hint-inline">开启后仅在 thinking / reasoning 请求中回传</span>
+                  <span class="hint-inline">
+                    开启后仅当请求体显式带 thinking / enable_thinking / reasoning_effort 时才回传。
+                    若该渠道的思考由模型名隐含（如 reasoner 类）且请求不带这些字段，请保持关闭：开启会导致推理内容不回传，上游仍报 400。
+                  </span>
+                </el-form-item>
+              </template>
+              <template v-else-if="f.key === 'tool-choice-downgrade'">
+                <el-form-item label="启用改写">
+                  <el-switch v-model="featureForms[f.key].enabledParam" />
+                  <span class="hint-inline">关闭后挂载但不改写</span>
+                </el-form-item>
+                <el-form-item label="仅 thinking 模式">
+                  <el-switch v-model="featureForms[f.key].onlyThinking" />
+                  <span class="hint-inline">
+                    开启后仅当请求体显式带 thinking / enable_thinking / reasoning_effort 时才降级。
+                    仅在「跨协议转换为 anthropic 上游」时 thinking 会被丢弃导致该开关失效（该组合请保持关闭）；直通 anthropic 不受影响。
+                  </span>
                 </el-form-item>
               </template>
               <template v-else-if="f.key === 'tool-schema-normalize'">
