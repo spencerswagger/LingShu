@@ -131,3 +131,56 @@ func TestGetByBillingID_ScanDims(t *testing.T) {
 		t.Fatalf("mock expectations: %v", err)
 	}
 }
+
+// TestSummarize_BusyOnlyCountsCompletedWithDuration 断言忙时口径只统计「成功且带耗时」的行：
+//   - SQL 里 Busy* 的 FILTER 必须带 status='completed'（用 ExpectQuery 正则锁定，丢掉条件即失败）；
+//   - 返回值上 Requests 覆盖全部行（含失败），而 BusyRequests/BusyRPM 只按成功行计算，
+//     证明「失败哪怕带耗时也不计入忙时」。
+func TestSummarize_BusyOnlyCountsCompletedWithDuration(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	store := NewSqlStore(db)
+	// 正则同时锁定：count(*) FILTER 与 sum(duration_ms) FILTER 都带 completed 条件。
+	mock.ExpectQuery(regexp.QuoteMeta(`status = 'completed' AND duration_ms IS NOT NULL`)).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"requests", "credits", "tokens", "duration", "input", "cache_read",
+			"busyrequests", "busytokens", "busydur",
+		}).AddRow(int64(10), float64(1.25), int64(900), int64(30000), int64(300), int64(100),
+			int64(7), int64(700), int64(60000)))
+
+	out, err := store.Summarize(context.Background(), RecordFilter{})
+	if err != nil {
+		t.Fatalf("Summarize: %v", err)
+	}
+	// 总量口径不受 status 影响（10 条全部计数）。
+	if out.Requests != 10 || out.TokensTotal != 900 || out.DurationTotalMS != 30000 {
+		t.Fatalf("totals=%d/%d/%d, want 10/900/30000", out.Requests, out.TokensTotal, out.DurationTotalMS)
+	}
+	// 忙时口径只算 7 条成功请求、60000ms（=1 分钟）→ 7 RPM、700 TPM。
+	if out.BusyRequests != 7 || out.BusyTokens != 700 || out.BusyDurationMS != 60000 {
+		t.Fatalf("busy=%d/%d/%d, want 7/700/60000", out.BusyRequests, out.BusyTokens, out.BusyDurationMS)
+	}
+	if out.BusyRPM != 7 || out.BusyTPM != 700 {
+		t.Fatalf("busy_rpm=%v busy_tpm=%v, want 7/700", out.BusyRPM, out.BusyTPM)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("mock expectations: %v", err)
+	}
+}
+
+// TestBusyRate_ZeroDenominator 断言忙时分母 ≤0 时速率为 0（不产生 Inf/NaN）。
+func TestBusyRate_ZeroDenominator(t *testing.T) {
+	if v := BusyRate(5, 0); v != 0 {
+		t.Fatalf("BusyRate(5,0)=%v, want 0", v)
+	}
+	if v := BusyRate(5, -1); v != 0 {
+		t.Fatalf("BusyRate(5,-1)=%v, want 0", v)
+	}
+	if v := BusyRate(5, 60000); v != 5 {
+		t.Fatalf("BusyRate(5,60000)=%v, want 5", v)
+	}
+}

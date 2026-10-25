@@ -1,4 +1,4 @@
-// summary.go 开发端本人摘要：令牌数 / 在线会话数 / 当日·昨日·本月积分消耗 / 近 5 分钟 RPM·TPM。
+// summary.go 开发端本人摘要：令牌数 / 在线会话数 / 当日·昨日·本月积分消耗 / 近 1 分钟 RPM·TPM。
 package console
 
 import (
@@ -28,11 +28,15 @@ type timeRange struct {
 	To   time.Time
 }
 
-// summaryRanges 按北京时间口径计算今日 / 昨日 / 本月 / 近 5 分钟四个统计区间。
+// summaryWindow 本人摘要中 RPM/TPM 的统计窗口：近 1 分钟。
+// 短窗口（≤1 分钟）用墙钟窗口速率，不用忙时口径。
+const summaryWindow = time.Minute
+
+// summaryRanges 按北京时间口径计算今日 / 昨日 / 本月 / 近 1 分钟四个统计区间。
 //   - today     = [当日 00:00:00, 当日 23:59:59]
 //   - yesterday = [前一自然日 00:00:00, 前一自然日 23:59:59]
 //   - month     = [当月 1 日 00:00:00, 当日 23:59:59]
-//   - window    = [now-5m, now]
+//   - window    = [now-1m, now]
 func summaryRanges(now time.Time, loc *time.Location) (today, yesterday, month, window timeRange) {
 	n := now.In(loc)
 	dayStart := time.Date(n.Year(), n.Month(), n.Day(), 0, 0, 0, 0, loc)
@@ -49,7 +53,7 @@ func summaryRanges(now time.Time, loc *time.Location) (today, yesterday, month, 
 		From: time.Date(n.Year(), n.Month(), 1, 0, 0, 0, 0, loc),
 		To:   dayEnd,
 	}
-	window = timeRange{From: now.Add(-5 * time.Minute), To: now}
+	window = timeRange{From: now.Add(-summaryWindow), To: now}
 	return
 }
 
@@ -125,9 +129,10 @@ func (h *Dev) HandleMeSummary(w http.ResponseWriter, r *http.Request) {
 		TodayCredits:     todaySum.CreditsTotal,
 		YesterdayCredits: ySum.CreditsTotal,
 		MonthCredits:     mSum.CreditsTotal,
-		RPM:              float64(winSum.Requests) / 5.0,
-		TPM:              float64(winSum.TokensTotal) / 5.0,
-		InputTokens:      mSum.InputTokens,
-		CacheReadTokens:  mSum.CacheReadTokens,
+		// 短窗口口径：窗口内计数 ÷ 窗口分钟数（近 1 分钟即 ÷1.0），不用忙时口径。
+		RPM:             float64(winSum.Requests) / summaryWindow.Minutes(),
+		TPM:             float64(winSum.TokensTotal) / summaryWindow.Minutes(),
+		InputTokens:     mSum.InputTokens,
+		CacheReadTokens: mSum.CacheReadTokens,
 	})
 }

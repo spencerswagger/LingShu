@@ -237,7 +237,8 @@ func (h *Admin) HandleListBillings(w http.ResponseWriter, r *http.Request) {
 	resp.OK(w, r, map[string]any{"List": list, "Total": total, "Page": f.Page, "Size": f.Size})
 }
 
-// HandleBillingsStats GET /api/v1/admin/billings/stats 账单筛选聚合统计（总积分/token/平均 RPM·TPM 基础数据）。
+// HandleBillingsStats GET /api/v1/admin/billings/stats 账单筛选聚合统计（总积分/token/耗时合计，
+// 以及忙时口径的 RPM·TPM：分子与分母都只取 duration_ms 非空的行）。
 func (h *Admin) HandleBillingsStats(w http.ResponseWriter, r *http.Request) {
 	f, err := buildBillingsFilter(r.URL.Query())
 	if err != nil {
@@ -892,8 +893,8 @@ type sessionListItem struct {
 	Tokens       int64   `json:"Tokens"`       // 总消耗 Token（三段求和口径：输入+缓存读+输出）
 	Credits      float64 `json:"Credits"`      // 总消耗积分
 	ContextLen   int64   `json:"ContextLen"`   // 总输入 Token（输入+缓存读，取最近一次请求）
-	RPM          float64 `json:"RPM"`          // 近 5 分钟每分钟请求数
-	TPM          float64 `json:"TPM"`          // 近 5 分钟每分钟 Token 数
+	RPM          float64 `json:"RPM"`          // 近 1 分钟每分钟请求数（墙钟窗口速率）
+	TPM          float64 `json:"TPM"`          // 近 1 分钟每分钟 Token 数（墙钟窗口速率）
 	UserMsgs     int64   `json:"UserMsgs"`     // 用户消息次数
 	ToolCalls    int64   `json:"ToolCalls"`    // 工具调用次数
 	CacheHitRate float64 `json:"CacheHitRate"` // 缓存命中率（缓存读 ÷ 总输入(输入+缓存读)，0~1）
@@ -1217,8 +1218,9 @@ func (h *Admin) sessionNames(ctx context.Context, recs []billing.Record) map[str
 	return out
 }
 
-// sessionStatsWindow 会话「实时状态」中 RPM/TPM 的统计窗口（近 5 分钟）。
-const sessionStatsWindow = 5 * time.Minute
+// sessionStatsWindow 会话「实时状态」中 RPM/TPM 的统计窗口（近 1 分钟）。
+// 短窗口（≤1 分钟）用墙钟窗口速率：窗口内计数 ÷ 窗口分钟数。
+const sessionStatsWindow = time.Minute
 
 // sessionRuntime 会话实时聚合（按 session_id 汇总；来源 billing_records 与 call_logs）。
 type sessionRuntime struct {
@@ -1234,12 +1236,12 @@ type sessionRuntime struct {
 	ToolCalls   int64   // 工具调用次数（req_messages 中 role=tool 计数）
 }
 
-// RPM 窗口内每分钟平均请求数。
+// RPM 窗口内每分钟平均请求数（短窗口墙钟速率：窗口内计数 ÷ 窗口分钟数）。
 func (r sessionRuntime) RPM() float64 {
 	return float64(r.WinCalls) / sessionStatsWindow.Minutes()
 }
 
-// TPM 窗口内每分钟平均 Token 数。
+// TPM 窗口内每分钟平均 Token 数（短窗口墙钟速率：窗口内计数 ÷ 窗口分钟数）。
 func (r sessionRuntime) TPM() float64 {
 	return float64(r.WinTokens) / sessionStatsWindow.Minutes()
 }

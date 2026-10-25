@@ -39,7 +39,7 @@ func TestSummaryRanges_Shanghai(t *testing.T) {
 		time.Date(2026, 2, 28, 0, 0, 0, 0, loc), time.Date(2026, 2, 28, 23, 59, 59, 0, loc))
 	assertRange(t, "month", month,
 		time.Date(2026, 3, 1, 0, 0, 0, 0, loc), time.Date(2026, 3, 1, 23, 59, 59, 0, loc))
-	assertRange(t, "window", window, now.Add(-5*time.Minute), now)
+	assertRange(t, "window", window, now.Add(-time.Minute), now)
 
 	// 另取月中普通日，覆盖 month 起点固定为当月初。
 	now2 := time.Date(2026, 3, 15, 8, 0, 0, 0, loc)
@@ -50,7 +50,7 @@ func TestSummaryRanges_Shanghai(t *testing.T) {
 		time.Date(2026, 3, 14, 0, 0, 0, 0, loc), time.Date(2026, 3, 14, 23, 59, 59, 0, loc))
 	assertRange(t, "month2", m2,
 		time.Date(2026, 3, 1, 0, 0, 0, 0, loc), time.Date(2026, 3, 15, 23, 59, 59, 0, loc))
-	assertRange(t, "window2", w2, now2.Add(-5*time.Minute), now2)
+	assertRange(t, "window2", w2, now2.Add(-time.Minute), now2)
 }
 
 // stubTokenCounter 令牌计数桩（固定返回 count）。
@@ -69,9 +69,11 @@ func TestHandleMeSummary(t *testing.T) {
 	defer db.Close()
 
 	const summarySQL = `COALESCE(sum(credits_consumed), 0)`
+	// 列顺序与 Summarize 的 SELECT 一致：末尾三列是忙时口径（成功且带耗时的请求数、token、耗时之和）。
 	rows := func(requests int64, credits float64, tokens, input, cacheRead int64) *sqlmock.Rows {
-		return sqlmock.NewRows([]string{"count", "credits", "tokens", "duration", "input", "cache_read"}).
-			AddRow(requests, credits, tokens, int64(0), input, cacheRead)
+		return sqlmock.NewRows([]string{"count", "credits", "tokens", "duration", "input", "cache_read",
+			"busy_requests", "busy_tokens", "busy_duration"}).
+			AddRow(requests, credits, tokens, int64(0), input, cacheRead, requests, tokens, int64(0))
 	}
 	// 过滤参数：user_id=1；三档消耗带 status='completed'，吞吐窗口不带；
 	// 时间参数用 AnyArg（边界逻辑已由 TestSummaryRanges_Shanghai 覆盖）。
@@ -130,11 +132,11 @@ func TestHandleMeSummary(t *testing.T) {
 	if d.TodayCredits != 1.5 || d.YesterdayCredits != 2.5 || d.MonthCredits != 3.5 {
 		t.Fatalf("credits=%v/%v/%v, want 1.5/2.5/3.5", d.TodayCredits, d.YesterdayCredits, d.MonthCredits)
 	}
-	if d.RPM != 10 { // 50 requests / 5min
-		t.Fatalf("RPM=%v, want 10", d.RPM)
+	if d.RPM != 50 { // 50 requests / 1min（短窗口：墙钟窗口速率）
+		t.Fatalf("RPM=%v, want 50", d.RPM)
 	}
-	if d.TPM != 100 { // 500 tokens / 5min
-		t.Fatalf("TPM=%v, want 100", d.TPM)
+	if d.TPM != 500 { // 500 tokens / 1min
+		t.Fatalf("TPM=%v, want 500", d.TPM)
 	}
 	// 本月缓存口径：取自 month 那一次 Summarize（input=120、cache_read=30）。
 	if d.InputTokens != 120 || d.CacheReadTokens != 30 {
