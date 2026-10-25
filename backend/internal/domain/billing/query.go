@@ -83,7 +83,8 @@ func (s *SqlStore) ListRecords(ctx context.Context, f RecordFilter) ([]Record, i
 	return list, total, nil
 }
 
-// RecordSummary 账单筛选聚合结果（统计栏）：请求数、总积分、总 token（三段求和）、总耗时。
+// RecordSummary 账单筛选聚合结果（统计栏）：请求数、总积分、总 token（三段求和）、总耗时、
+// 以及「忙时处理速率」口径的 RPM/TPM（见 BusyRPM/BusyTPM）。
 // 注：三段互斥（输入为纯输入、不含缓存读），总量统计直接求和 input/cache_read/output
 // （与 stats.go UsageSplit.Total() 口径一致）；缓存命中率分母 = InputTokens + CacheReadTokens。
 type RecordSummary struct {
@@ -93,9 +94,28 @@ type RecordSummary struct {
 	DurationTotalMS int64   `json:"DurationTotalMS"`
 	InputTokens     int64   `json:"InputTokens"`
 	CacheReadTokens int64   `json:"CacheReadTokens"`
+	// 忙时口径（长区间不用墙钟平均，用「忙时处理速率」= 请求数 ÷ 这批请求的耗时之和 ≈ 1 ÷ 平均耗时）：
+	// BusyRequests/BusyTokens 只统计 duration_ms 非空的行，与 BusyRPM/BusyTPM 的分母（同批行的耗时之和）
+	// 严格同源，避免「分子含失败、分母不含失败」的口径错位。
+	BusyRequests int64   `json:"BusyRequests"`
+	BusyTokens   int64   `json:"BusyTokens"`
+	BusyRPM      float64 `json:"BusyRPM"`
+	BusyTPM      float64 `json:"BusyTPM"`
+}
+
+// BusyRate 由「计数 ÷ 忙时分母」得出忙时处理速率（每分钟）。
+// 忙时分母 = 这批请求的耗时之和折算成分钟（≈1 ÷ 平均耗时）；分母非正时返回 0。
+// 该函数是 RecordSummary 与 DashboardStats 两处忙时口径的唯一实现，避免两处漂移。
+func BusyRate(count float64, sumDurationMS int64) float64 {
+	if sumDurationMS <= 0 {
+		return 0
+	}
+	return count / (float64(sumDurationMS) / 60000.0)
 }
 
 // Summarize 按与列表完全相同的过滤条件聚合统计（不分页），供账单页统计栏展示。
+// 忙时口径：请求数与 token 都用 FILTER (WHERE duration_ms IS NOT NULL) 统计，
+// 与忙时分母（sum(duration_ms)，同样只累加非空行）同源；分母为 0 时 BusyRPM/BusyTPM 返回 0。
 func (s *SqlStore) Summarize(ctx context.Context, f RecordFilter) (RecordSummary, error) {
 	where, args := recordWhere(f)
 	var out RecordSummary
@@ -108,13 +128,22 @@ func (s *SqlStore) Summarize(ctx context.Context, f RecordFilter) (RecordSummary
 		            COALESCE(NULLIF(tokens->>'output','')::bigint, 0)), 0),
 		        COALESCE(sum(duration_ms), 0),
 		        COALESCE(sum(COALESCE(NULLIF(tokens->>'input','')::bigint, 0)), 0),
-		        COALESCE(sum(COALESCE(NULLIF(tokens->>'cache_read','')::bigint, 0)), 0)
+		        COALESCE(sum(COALESCE(NULLIF(tokens->>'cache_read','')::bigint, 0)), 0),
+		        COALESCE(count(*) FILTER (WHERE duration_ms IS NOT NULL), 0),
+		        COALESCE(sum(
+		            COALESCE(NULLIF(tokens->>'input','')::bigint, 0) +
+		            COALESCE(NULLIF(tokens->>'cache_read','')::bigint, 0) +
+		            COALESCE(NULLIF(tokens->>'output','')::bigint, 0)
+		        ) FILTER (WHERE duration_ms IS NOT NULL), 0)
 		 FROM billing_records `+where, args...).
 		Scan(&out.Requests, &out.CreditsTotal, &out.TokensTotal, &out.DurationTotalMS,
-			&out.InputTokens, &out.CacheReadTokens)
+			&out.InputTokens, &out.CacheReadTokens,
+			&out.BusyRequests, &out.BusyTokens)
 	if err != nil {
 		return out, fmt.Errorf("summarize billing records: %w", err)
 	}
+	out.BusyRPM = BusyRate(float64(out.BusyRequests), out.DurationTotalMS)
+	out.BusyTPM = BusyRate(float64(out.BusyTokens), out.DurationTotalMS)
 	return out, nil
 }
 

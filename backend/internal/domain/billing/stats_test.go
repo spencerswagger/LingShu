@@ -33,12 +33,13 @@ func TestDashboard_Aggregates(t *testing.T) {
 	limit := 10
 
 	// 1) 总计：input/output/cache_read（三段互斥求和）→ credits, calls, failed, sumdur, sumfirst, okdur, okfirst
+	// 末列 busytokens = duration_ms 非空行的 token 合计（忙时口径的分子，与分母 sumdur 同源）。
 	mock.ExpectQuery(regexp.QuoteMeta(`COALESCE(sum((first_token_ms IS NOT NULL)::int),0)`)).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"input", "output", "cache_read",
-			"credits", "calls", "failed", "sumdur", "sumfirst", "okdur", "okfirst",
+			"credits", "calls", "failed", "sumdur", "sumfirst", "okdur", "okfirst", "busytokens",
 		}).AddRow(int64(100), int64(50), int64(20),
-			float64(12.5), int64(10), int64(1), int64(2000), int64(400), int64(10), int64(10)))
+			float64(12.5), int64(10), int64(1), int64(2000), int64(400), int64(10), int64(10), int64(170)))
 
 	// 2) 按天（仅返回 1 天，另一天应补零）
 	mock.ExpectQuery(regexp.QuoteMeta(`date_trunc('day', call_time AT TIME ZONE 'Asia/Shanghai')::date`)).
@@ -94,6 +95,13 @@ func TestDashboard_Aggregates(t *testing.T) {
 	if out.AvgMS != 200 {
 		t.Fatalf("avg_ms=%v, want 200", out.AvgMS)
 	}
+	// 忙时口径：分母 = sumdur(2000ms) / 60000 = 0.03333 分钟 → 10 请求 = 300 RPM，170 token = 5100 TPM。
+	if out.SumDurationMS != 2000 {
+		t.Fatalf("sum_duration_ms=%d, want 2000", out.SumDurationMS)
+	}
+	if out.BusyRPM != 300 || out.BusyTPM != 5100 {
+		t.Fatalf("busy_rpm=%v busy_tpm=%v, want 300/5100", out.BusyRPM, out.BusyTPM)
+	}
 	if out.Days != 3 || len(out.Daily) != 3 {
 		t.Fatalf("days=%d daily=%d, want 3/3（含补零）", out.Days, len(out.Daily))
 	}
@@ -128,9 +136,9 @@ func TestDashboard_UserScope(t *testing.T) {
 		WithArgs(uid, from, to).
 		WillReturnRows(sqlmock.NewRows([]string{
 			"input", "output", "cache_read",
-			"credits", "calls", "failed", "sumdur", "sumfirst", "okdur", "okfirst",
+			"credits", "calls", "failed", "sumdur", "sumfirst", "okdur", "okfirst", "busytokens",
 		}).AddRow(int64(0), int64(0), int64(0),
-			float64(0), int64(0), int64(0), int64(0), int64(0), int64(0), int64(0)))
+			float64(0), int64(0), int64(0), int64(0), int64(0), int64(0), int64(0), int64(0)))
 
 	mock.ExpectQuery(regexp.QuoteMeta(`date_trunc('day', call_time AT TIME ZONE 'Asia/Shanghai')::date`)).
 		WillReturnRows(sqlmock.NewRows([]string{"d", "calls", "failed", "credits", "tokens", "duration"}))

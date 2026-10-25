@@ -53,28 +53,34 @@ type DashLatencyBucket struct {
 
 // DashboardStats 统计页单次聚合返回结构。
 type DashboardStats struct {
-	From      string              `json:"From"` // RFC3339
-	To        string              `json:"To"`
-	Days      int64               `json:"Days"`
-	Total     UsageSplit          `json:"Total"`
-	TotalCred float64             `json:"TotalCred"`
-	TotalCall int64               `json:"TotalCall"`
-	Failed    int64               `json:"Failed"`
-	Success   float64             `json:"Success"` // 0~1
-	AvgMS     float64             `json:"AvgMS"`
-	P50MS     float64             `json:"P50MS"`
-	P90MS     float64             `json:"P90MS"`
-	P95MS     float64             `json:"P95MS"`
-	AvgFirst  float64             `json:"AvgFirst"`
-	AvgRPM    float64             `json:"AvgRPM"`
-	AvgTPM    float64             `json:"AvgTPM"`
-	Daily     []DashDay           `json:"Daily"`
-	ByModel   []DashTopItem       `json:"ByModel"`
-	ByKey     []DashTopItem       `json:"ByKey"`
-	ByUser    []DashTopItem       `json:"ByUser"`
-	ByMode    []DashTopItem       `json:"ByMode"`
-	Errors    []DashTopItem       `json:"Errors"`
-	Latency   []DashLatencyBucket `json:"Latency"`
+	From      string     `json:"From"` // RFC3339
+	To        string     `json:"To"`
+	Days      int64      `json:"Days"`
+	Total     UsageSplit `json:"Total"`
+	TotalCred float64    `json:"TotalCred"`
+	TotalCall int64      `json:"TotalCall"`
+	Failed    int64      `json:"Failed"`
+	Success   float64    `json:"Success"` // 0~1
+	AvgMS     float64    `json:"AvgMS"`
+	P50MS     float64    `json:"P50MS"`
+	P90MS     float64    `json:"P90MS"`
+	P95MS     float64    `json:"P95MS"`
+	AvgFirst  float64    `json:"AvgFirst"`
+	AvgRPM    float64    `json:"AvgRPM"`
+	AvgTPM    float64    `json:"AvgTPM"`
+	// 忙时口径（长区间用它代替墙钟平均）：BusyRPM/BusyTPM = 忙时处理数 ÷ 忙时分母，
+	// 忙时分母 = 这批请求的耗时之和折算成分钟（≈1 ÷ 平均耗时）；分母为 0 时两者为 0。
+	// 分子与分母同源（都只取 duration_ms 非空的行），SumDurationMS 一并返回供前端做样本门槛。
+	BusyRPM       float64             `json:"BusyRPM"`
+	BusyTPM       float64             `json:"BusyTPM"`
+	SumDurationMS int64               `json:"SumDurationMS"`
+	Daily         []DashDay           `json:"Daily"`
+	ByModel       []DashTopItem       `json:"ByModel"`
+	ByKey         []DashTopItem       `json:"ByKey"`
+	ByUser        []DashTopItem       `json:"ByUser"`
+	ByMode        []DashTopItem       `json:"ByMode"`
+	Errors        []DashTopItem       `json:"Errors"`
+	Latency       []DashLatencyBucket `json:"Latency"`
 }
 
 // dashWhere 生成时间范围 + 可选用户过滤 WHERE 子句；prefix 为表别名前缀（如 "br."）。
@@ -117,7 +123,7 @@ func (s *SqlStore) Dashboard(ctx context.Context, from, to time.Time, userID *in
 	var total UsageSplit
 	var totalCred float64
 	var totalCall, failed int64
-	var sumDur, sumFirst, okDur, okFirst int64
+	var sumDur, sumFirst, okDur, okFirst, busyTokens int64
 	err := s.db.QueryRowContext(ctx,
 		`SELECT
 		    COALESCE(sum(COALESCE(NULLIF(tokens->>'input','')::bigint,0)),0),
@@ -129,11 +135,12 @@ func (s *SqlStore) Dashboard(ctx context.Context, from, to time.Time, userID *in
 		    COALESCE(sum(duration_ms),0),
 		    COALESCE(sum(first_token_ms),0),
 		    COALESCE(sum((duration_ms IS NOT NULL)::int),0),
-		    COALESCE(sum((first_token_ms IS NOT NULL)::int),0)
+		    COALESCE(sum((first_token_ms IS NOT NULL)::int),0),
+		    COALESCE(sum(`+tokenSum("")+`) FILTER (WHERE duration_ms IS NOT NULL),0)
 		 FROM billing_records `+dashWhere(""),
 		dashArgs(userID, from, to)...).
 		Scan(&total.Input, &total.Output, &total.CacheRead,
-			&totalCred, &totalCall, &failed, &sumDur, &sumFirst, &okDur, &okFirst)
+			&totalCred, &totalCall, &failed, &sumDur, &sumFirst, &okDur, &okFirst, &busyTokens)
 	if err != nil {
 		return out, err
 	}
@@ -154,6 +161,10 @@ func (s *SqlStore) Dashboard(ctx context.Context, from, to time.Time, userID *in
 		out.AvgRPM = float64(totalCall) / minutes
 		out.AvgTPM = float64(total.Total()) / minutes
 	}
+	// 忙时口径：分子只取 duration_ms 非空的行（与分母同源），分母 = 这些行的耗时之和。
+	out.SumDurationMS = sumDur
+	out.BusyRPM = BusyRate(float64(okDur), sumDur)
+	out.BusyTPM = BusyRate(float64(busyTokens), sumDur)
 
 	if err := s.dashboardDaily(ctx, from, to, userID, &out); err != nil {
 		return out, err

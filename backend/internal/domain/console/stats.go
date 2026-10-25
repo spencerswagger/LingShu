@@ -25,11 +25,13 @@ type statsKPI struct {
 	SuccessRate     float64 `json:"SuccessRate"` // 0~1
 	AvgDurationMS   float64 `json:"AvgDurationMS"`
 	AvgFirstTokenMS float64 `json:"AvgFirstTokenMS"`
-	RPM             float64 `json:"RPM"`
-	TPM             float64 `json:"TPM"`
-	DeltaTokens     float64 `json:"DeltaTokens"` // 环比上期（比例，可为负）
-	DeltaCredits    float64 `json:"DeltaCredits"`
-	DeltaRequests   float64 `json:"DeltaRequests"`
+	RPM             float64 `json:"RPM"` // 忙时口径（见 billing.DashboardStats.BusyRPM），文案仍叫 RPM
+	TPM             float64 `json:"TPM"` // 忙时口径（见 billing.DashboardStats.BusyTPM），文案仍叫 TPM
+	// SumDurationMS 忙时分母（这批请求的耗时之和，毫秒），供前端做「样本量/时长是否够」的门槛判断。
+	SumDurationMS int64   `json:"SumDurationMS"`
+	DeltaTokens   float64 `json:"DeltaTokens"` // 环比上期（比例，可为负）
+	DeltaCredits  float64 `json:"DeltaCredits"`
+	DeltaRequests float64 `json:"DeltaRequests"`
 }
 
 // statsCounts 三态计数（密钥 / 内部模型共用）。
@@ -139,11 +141,13 @@ func buildKPI(ds billing.DashboardStats, prevCalls int64, prevCredits, prevToken
 		SuccessRate:     ds.Success,
 		AvgDurationMS:   decimalx.Round2(ds.AvgMS),
 		AvgFirstTokenMS: decimalx.Round2(ds.AvgFirst),
-		RPM:             decimalx.Round2(ds.AvgRPM),
-		TPM:             decimalx.Round2(ds.AvgTPM),
-		DeltaTokens:     decimalx.Round5(deltaRatio(float64(ds.Total.Total()), prevTokens)),
-		DeltaCredits:    decimalx.Round5(deltaRatio(ds.TotalCred, prevCredits)),
-		DeltaRequests:   decimalx.Round5(deltaRatio(float64(ds.TotalCall), float64(prevCalls))),
+		// 长区间（统计页默认近 30 天）不用墙钟平均，改用忙时处理速率：请求数/Token ÷ 耗时之和折算的分钟数。
+		RPM:           decimalx.Round2(ds.BusyRPM),
+		TPM:           decimalx.Round2(ds.BusyTPM),
+		SumDurationMS: ds.SumDurationMS,
+		DeltaTokens:   decimalx.Round5(deltaRatio(float64(ds.Total.Total()), prevTokens)),
+		DeltaCredits:  decimalx.Round5(deltaRatio(ds.TotalCred, prevCredits)),
+		DeltaRequests: decimalx.Round5(deltaRatio(float64(ds.TotalCall), float64(prevCalls))),
 	}
 }
 
