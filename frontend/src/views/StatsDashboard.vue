@@ -1,20 +1,11 @@
 <script setup lang="ts">
-// 统一统计页：顶部关键指标带 + 「用量分析」「运维概览」两大块。
-// 同一组件同时服务 /admin/dashboard（全局）与 /dev/dashboard（本人），
-// 运维块与用户维度仅管理端可见（后续可按角色继续细化显隐）。
+// 统一统计页：首屏「静态总量 + 次级小指标」两段式，下接「用量分析」动态图表区。
+// 同一组件同时服务 /admin/dashboard（全局）与 /dev/dashboard（本人），用户维度仅管理端可见。
+// 运维类数据（渠道密钥 / 模型计数 / 成功率趋势 / 耗时分布 / 吞吐量）已随「运维概览」块移除，
+// 运维看状态页即可；统计口径不变。
 import { computed, onMounted, ref, watch } from 'vue'
 import type { EChartsCoreOption } from 'echarts/core'
-import {
-  Coin,
-  Cpu,
-  DataLine,
-  Key,
-  Odometer,
-  PieChart,
-  Timer,
-  TrendCharts,
-  CircleCheckFilled,
-} from '@element-plus/icons-vue'
+import { Coin, DataLine, Odometer } from '@element-plus/icons-vue'
 import { useAuthStore } from '@/stores/auth'
 import { getStatsDashboard, type StatsDashboard, type StatsTopItem } from '@/api/stats'
 import { listAnnouncements, type AdminAnnouncement } from '@/api/admin'
@@ -125,12 +116,10 @@ const fmtCompact = (n: number) => {
 const fmtDelta = (n: number) => `${n >= 0 ? '▲' : '▼'} ${Math.abs(Number(n || 0) * 100).toFixed(1)}%`
 
 // ===== 图表主题 =====
+// 只保留仍在用的色值：运维块（成功率/耗时/吞吐量图）移除后 success/warning/danger 已无引用。
 const C = {
   primary: '#5a5ce8',
   violet: '#8b5cf6',
-  success: '#12b76a',
-  warning: '#f79009',
-  danger: '#f04438',
   text: '#101828',
   sub: '#667085',
   grid: '#eef0f6',
@@ -164,13 +153,15 @@ function sparkPoints(vals: number[]): string {
     .join(' ')
 }
 
-// KPI 卡片：sub 为简要副标题；tip 存在时展示口径说明（tipTarget 指定挂在数值还是副标题上，默认副标题）。
-interface KpiCard {
+// 首屏分两段（动静分区）：
+//   ① leadCards  静态总量：总 Token / 总消费积分 / 总请求数 —— 主视觉大数字 + 迷你趋势线，一眼可读；
+//   ② miniMetrics 动态小指标：缓存命中率 / 成功率 / 平均耗时 / 吞吐量 —— 单行内联，弱化权重不与总量抢主位。
+// 两类都只是「展示口径」的变化，取数口径与后端字段完全不变。
+interface LeadCard {
   label: string
   value: string
   sub: string
   tip?: string
-  tipTarget?: 'value' | 'sub'
   // subMuted：副标用更浅的灰字（用于「样本较少」这类口径提示）
   subMuted?: boolean
   delta?: number
@@ -179,29 +170,44 @@ interface KpiCard {
   spark?: string
 }
 
-const kpiCards = computed<KpiCard[]>(() => {
+// 次级小指标：label + 数值为主，可选短副标与口径说明，不带图标/趋势线（刻意压低视觉层级）。
+interface MiniMetric {
+  label: string
+  value: string
+  sub?: string
+  tip?: string
+  subMuted?: boolean
+}
+
+// 吞吐量（RPM/TPM）为忙时口径：分子 BusyRequests、分母 SumDurationMS 都只取「成功且带耗时」的请求。
+// 有数据即显示（BusyRequests > 0 且忙时耗时 > 0）；样本少时只在副标灰字标注，不做硬门槛。
+const throughput = computed(() => {
   const k = data.value?.KPI
-  const calls = daily.value.map((d) => d.Calls)
-  const tokens = daily.value.map((d) => d.Tokens)
-  const credits = daily.value.map((d) => Number(d.Credits))
-  const totalIn = data.value?.Usage.Total.Input ?? 0
-  const cacheRead = data.value?.Usage.Total.CacheRead ?? 0
-  const totalInput = totalIn + cacheRead
-  const cacheHit = totalInput > 0 ? cacheRead / totalInput : 0
-  // 吞吐量（RPM/TPM）为忙时口径：分子 BusyRequests、分母 SumDurationMS 都只取「成功且带耗时」的请求。
-  // 有数据即显示（BusyRequests > 0 且忙时耗时 > 0）；样本少时只在副标灰字标注，不做硬门槛。
-  const throughputReady = !!k && (k.BusyRequests ?? 0) > 0 && (k.SumDurationMS ?? 0) > 0
-  const throughputLowSample = !!k && ((k.BusyRequests ?? 0) < 20 || (k.SumDurationMS ?? 0) < 30000)
+  return {
+    ready: !!k && (k.BusyRequests ?? 0) > 0 && (k.SumDurationMS ?? 0) > 0,
+    lowSample: !!k && ((k.BusyRequests ?? 0) < 20 || (k.SumDurationMS ?? 0) < 30000),
+  }
+})
+
+const totalIn = computed(() => data.value?.Usage.Total.Input ?? 0)
+const cacheRead = computed(() => data.value?.Usage.Total.CacheRead ?? 0)
+const cacheHit = computed(() => {
+  const base = totalIn.value + cacheRead.value
+  return base > 0 ? cacheRead.value / base : 0
+})
+
+const leadCards = computed<LeadCard[]>(() => {
+  const k = data.value?.KPI
   return [
     {
       label: '总 Token',
       value: k ? fmtCompact(k.TotalTokens) : '-',
-      sub: `输入 ${fmtCompact(totalIn)} · 输出 ${fmtCompact(data.value?.Usage.Total.Output ?? 0)}`,
+      sub: `输入 ${fmtCompact(totalIn.value)} · 输出 ${fmtCompact(data.value?.Usage.Total.Output ?? 0)}`,
       tip: '输入为纯输入、不含缓存读，缓存读单列，输出含推理',
       delta: k?.DeltaTokens,
       tone: 'primary',
       icon: DataLine,
-      spark: sparkPoints(tokens),
+      spark: sparkPoints(daily.value.map((d) => d.Tokens)),
     },
     {
       label: '总消费积分',
@@ -210,7 +216,7 @@ const kpiCards = computed<KpiCard[]>(() => {
       delta: k?.DeltaCredits,
       tone: 'violet',
       icon: Coin,
-      spark: sparkPoints(credits),
+      spark: sparkPoints(daily.value.map((d) => Number(d.Credits))),
     },
     {
       label: '总请求数',
@@ -219,47 +225,47 @@ const kpiCards = computed<KpiCard[]>(() => {
       delta: k?.DeltaRequests,
       tone: 'primary',
       icon: Odometer,
-      spark: sparkPoints(calls),
+      spark: sparkPoints(daily.value.map((d) => d.Calls)),
     },
+  ]
+})
+
+const miniMetrics = computed<MiniMetric[]>(() => {
+  const k = data.value?.KPI
+  return [
     {
       label: '缓存命中率',
-      value: fmtPct(cacheHit),
-      sub: `输入 ${fmtCompact(totalIn)} · 缓存读 ${fmtCompact(cacheRead)}`,
+      value: fmtPct(cacheHit.value),
       tip: '缓存读 ÷ (输入+缓存读)',
-      tipTarget: 'value',
-      tone: 'violet',
-      icon: PieChart,
     },
     {
       label: '成功率',
       value: k ? fmtPct(k.SuccessRate) : '-',
-      sub: `平均耗时 ${k ? fmtMs(k.AvgDurationMS) : '-'}`,
-      tone: 'success',
-      icon: CircleCheckFilled,
+      tip: '成功请求 ÷ 总请求数',
     },
     {
       label: '平均耗时',
       value: k ? fmtMs(k.AvgDurationMS) : '-',
       sub: `首字 ${k ? fmtMs(k.AvgFirstTokenMS) : '-'}`,
-      tone: 'warning',
-      icon: Timer,
     },
     {
       label: '吞吐量',
-      value: throughputReady ? `${fmtCompact(k?.TPM ?? 0)} TPM` : '—',
-      sub: throughputReady
-        ? `平均 ${(k?.RPM ?? 0).toFixed(2)} RPM${throughputLowSample ? ' · 样本较少' : ''}`
+      value: throughput.value.ready ? `${fmtCompact(k?.TPM ?? 0)} TPM` : '—',
+      sub: throughput.value.ready
+        ? `${(k?.RPM ?? 0).toFixed(2)} RPM${throughput.value.lowSample ? ' · 样本较少' : ''}`
         : '-',
-      subMuted: throughputReady && throughputLowSample,
+      subMuted: throughput.value.ready && throughput.value.lowSample,
       tip: '按成功请求处理耗时折算（≈60÷平均耗时），与渠道限流 RPM 不同口径；成功请求数 < 20 或耗时 < 30 秒时仅标注样本较少',
-      tone: 'primary',
-      icon: TrendCharts,
     },
   ]
 })
 
 // ===== 用量图表 =====
 const trendMetric = ref<'tokens' | 'credits' | 'calls'>('tokens')
+// 聚合粒度占位：本轮后端只有按天聚合，仅渲染「按天」；「近 24 小时」置灰等后端小时聚合接口就绪后接入。
+type Granularity = 'day' | 'hour'
+const granularity = ref<Granularity>('day')
+
 const trendOption = computed<EChartsCoreOption>(() => {
   const metric = trendMetric.value
   const name = metric === 'tokens' ? 'Token' : metric === 'credits' ? '积分' : '请求数'
@@ -372,138 +378,6 @@ const keyOption = computed<EChartsCoreOption>(() =>
   hbarOption(data.value?.Usage.ByKey ?? [], (i) => i.Tokens, C.violet),
 )
 
-// ===== 运维图表 =====
-const ops = computed(() => data.value?.Ops)
-
-const successOption = computed<EChartsCoreOption>(() => ({
-  grid: { left: 6, right: 16, top: 22, bottom: 4, containLabel: true },
-  tooltip: {
-    ...tooltipCommon,
-    trigger: 'axis',
-    valueFormatter: (v: number) => `${Number(v).toFixed(1)}%`,
-  },
-  xAxis: { type: 'category', boundaryGap: false, data: daily.value.map((d) => d.Date.slice(5)), ...axisCommon },
-  yAxis: {
-    type: 'value',
-    min: 0,
-    max: 100,
-    splitLine: { lineStyle: { color: C.grid } },
-    axisLabel: { color: C.sub, fontSize: 11, formatter: '{value}%' },
-  },
-  series: [
-    {
-      name: '成功率',
-      type: 'line',
-      smooth: true,
-      showSymbol: false,
-      data: daily.value.map((d) => Number((d.SuccessRate * 100).toFixed(1))),
-      lineStyle: { width: 2.4, color: C.success },
-      itemStyle: { color: C.success },
-      areaStyle: { color: 'rgba(18,183,106,0.10)' },
-    },
-  ],
-}))
-
-const latencyOption = computed<EChartsCoreOption>(() => {
-  const b = data.value?.Usage.Latency ?? []
-  return {
-    grid: { left: 6, right: 16, top: 22, bottom: 4, containLabel: true },
-    tooltip: { ...tooltipCommon, trigger: 'axis', axisPointer: { type: 'shadow' } },
-    xAxis: { type: 'category', data: b.map((x) => x.Bucket), ...axisCommon },
-    yAxis: {
-      type: 'value',
-      splitLine: { lineStyle: { color: C.grid } },
-      axisLabel: { color: C.sub, fontSize: 11 },
-    },
-    series: [
-      {
-        type: 'bar',
-        data: b.map((x) => x.Count),
-        barMaxWidth: 30,
-        itemStyle: { color: C.warning, borderRadius: [4, 4, 0, 0] },
-      },
-    ],
-  }
-})
-
-const throughputOption = computed<EChartsCoreOption>(() => ({
-  grid: { left: 6, right: 20, top: 30, bottom: 4, containLabel: true },
-  tooltip: { ...tooltipCommon, trigger: 'axis' },
-  legend: { top: 0, icon: 'circle', itemWidth: 8, textStyle: { color: C.sub, fontSize: 11 } },
-  xAxis: { type: 'category', data: daily.value.map((d) => d.Date.slice(5)), ...axisCommon },
-  yAxis: [
-    {
-      type: 'value',
-      name: 'Token',
-      nameTextStyle: { color: C.sub, fontSize: 11 },
-      splitLine: { lineStyle: { color: C.grid } },
-      axisLabel: { color: C.sub, fontSize: 11, formatter: (v: number) => fmtCompact(v) },
-    },
-    {
-      type: 'value',
-      name: '请求',
-      nameTextStyle: { color: C.sub, fontSize: 11 },
-      splitLine: { show: false },
-      axisLabel: { color: C.sub, fontSize: 11 },
-    },
-  ],
-  series: [
-    {
-      name: 'Token',
-      type: 'bar',
-      data: daily.value.map((d) => d.Tokens),
-      barMaxWidth: 16,
-      itemStyle: { color: 'rgba(90,92,232,0.75)', borderRadius: [4, 4, 0, 0] },
-    },
-    {
-      name: '请求数',
-      type: 'line',
-      yAxisIndex: 1,
-      smooth: true,
-      showSymbol: false,
-      data: daily.value.map((d) => d.Calls),
-      lineStyle: { width: 2.2, color: C.success },
-      itemStyle: { color: C.success },
-    },
-  ],
-}))
-
-// 运维计数卡
-const opsCounts = computed(() => {
-  const o = ops.value
-  if (!o) return []
-  return [
-    {
-      icon: Key,
-      title: '渠道密钥',
-      total: o.Keys.Total,
-      rows: [
-        { label: '健康', value: o.Keys.Normal, tone: 'success' },
-        { label: '排空', value: o.Keys.Drain, tone: 'warning' },
-        { label: '停用', value: o.Keys.Disabled, tone: 'danger' },
-      ],
-    },
-    {
-      icon: Cpu,
-      title: '对外模型',
-      total: o.Models.ExternalTotal,
-      rows: [
-        { label: '已启用', value: o.Models.ExternalEnabled, tone: 'success' },
-        { label: '未启用', value: o.Models.ExternalTotal - o.Models.ExternalEnabled, tone: 'info' },
-      ],
-    },
-    {
-      icon: DataLine,
-      title: '渠道内部模型',
-      total: o.Models.InternalTotal,
-      rows: [
-        { label: '正常', value: o.Models.InternalNormal, tone: 'success' },
-        { label: '异常', value: o.Models.InternalTotal - o.Models.InternalNormal, tone: 'warning' },
-      ],
-    },
-  ]
-})
-
 const levelType = (l: string) => (['danger', 'warning'].includes(l) ? l : 'primary')
 const modeLabel = (m: string) =>
   m === 'sale' ? '售价模式' : m === 'cost' ? '成本模式' : m === '' ? '其他（探测等）' : m
@@ -535,36 +409,38 @@ const modeLabel = (m: string) =>
     </div>
 
     <div v-loading="loading">
-      <!-- 顶部关键指标 -->
-      <div class="kpi-grid">
-        <div v-for="c in kpiCards" :key="c.label" class="kpi-card" :data-tone="c.tone">
-          <div class="kpi-top">
-            <span class="kpi-label">{{ c.label }}</span>
-            <el-icon class="kpi-ic"><component :is="c.icon" /></el-icon>
+      <!-- ① 首屏 · 静态总量（主视觉：大数字 + 迷你趋势，一眼可读） -->
+      <div class="lead-grid">
+        <div v-for="c in leadCards" :key="c.label" class="lead-card" :data-tone="c.tone">
+          <div class="lead-top">
+            <span class="lead-label">{{ c.label }}</span>
+            <el-icon class="lead-ic"><component :is="c.icon" /></el-icon>
           </div>
-          <div class="kpi-value">
-            <el-tooltip
-              v-if="c.tip && c.tipTarget === 'value'"
-              :content="c.tip"
-              placement="top"
-              :show-after="150"
-            >
-              <span>{{ c.value }}</span>
+          <div class="lead-value">{{ c.value }}</div>
+          <div class="lead-foot">
+            <el-tooltip v-if="c.tip" :content="c.tip" placement="top" :show-after="150">
+              <span class="lead-sub">{{ c.sub }}</span>
             </el-tooltip>
-            <span v-else>{{ c.value }}</span>
-          </div>
-          <div class="kpi-foot">
-            <el-tooltip v-if="c.tip && c.tipTarget !== 'value'" :content="c.tip" placement="top" :show-after="150">
-              <span class="kpi-sub" :class="{ muted: c.subMuted }">{{ c.sub }}</span>
-            </el-tooltip>
-            <span v-else class="kpi-sub" :class="{ muted: c.subMuted }">{{ c.sub }}</span>
-            <span v-if="c.delta !== undefined" class="kpi-delta" :class="c.delta >= 0 ? 'up' : 'down'">
+            <span v-else class="lead-sub">{{ c.sub }}</span>
+            <span v-if="c.delta !== undefined" class="lead-delta" :class="c.delta >= 0 ? 'up' : 'down'">
               {{ fmtDelta(c.delta as number) }}
             </span>
           </div>
-          <svg v-if="c.spark" class="kpi-spark" viewBox="0 0 100 28" preserveAspectRatio="none">
+          <svg v-if="c.spark" class="lead-spark" viewBox="0 0 100 28" preserveAspectRatio="none">
             <polyline :points="c.spark" />
           </svg>
+        </div>
+      </div>
+
+      <!-- ② 首屏 · 次级小指标（弱化：单行内联，只做补充阅读） -->
+      <div class="mini-strip">
+        <div v-for="m in miniMetrics" :key="m.label" class="mini-item">
+          <span class="mini-label">{{ m.label }}</span>
+          <el-tooltip v-if="m.tip" :content="m.tip" placement="top" :show-after="150">
+            <span class="mini-value mini-value--tip">{{ m.value }}</span>
+          </el-tooltip>
+          <span v-else class="mini-value">{{ m.value }}</span>
+          <span v-if="m.sub" class="mini-sub" :class="{ muted: m.subMuted }">{{ m.sub }}</span>
         </div>
       </div>
 
@@ -580,11 +456,25 @@ const modeLabel = (m: string) =>
         <div class="card span-2">
           <div class="block-title">
             用量趋势
-            <el-radio-group v-model="trendMetric" size="small" class="inline-switch">
-              <el-radio-button value="tokens">Token</el-radio-button>
-              <el-radio-button value="credits">积分</el-radio-button>
-              <el-radio-button value="calls">请求数</el-radio-button>
-            </el-radio-group>
+            <div class="title-actions">
+              <el-tooltip
+                content="按小时聚合待后端接口就绪后开放，当前为按天聚合"
+                placement="top"
+                :show-after="150"
+              >
+                <span class="granularity-wrap">
+                  <el-radio-group v-model="granularity" size="small" class="granularity-switch" disabled>
+                    <el-radio-button value="day">按天</el-radio-button>
+                    <el-radio-button value="hour">近 24 小时</el-radio-button>
+                  </el-radio-group>
+                </span>
+              </el-tooltip>
+              <el-radio-group v-model="trendMetric" size="small">
+                <el-radio-button value="tokens">Token</el-radio-button>
+                <el-radio-button value="credits">积分</el-radio-button>
+                <el-radio-button value="calls">请求数</el-radio-button>
+              </el-radio-group>
+            </div>
           </div>
           <VChart :option="trendOption" height="300px" />
         </div>
@@ -664,69 +554,6 @@ const modeLabel = (m: string) =>
         </div>
       </div>
 
-      <!-- 运维概览（仅管理端） -->
-      <template v-if="isAdmin">
-        <div class="section-head">
-          <span class="section-bar section-bar--ops" />
-          <h2 class="section-title">运维概览</h2>
-          <span class="section-en">OPERATIONS</span>
-          <span class="section-line" />
-          <span class="section-note">渠道密钥 / 模型 / 稳定性</span>
-        </div>
-
-        <div class="ops-count-grid">
-          <div v-for="g in opsCounts" :key="g.title" class="card ops-count-card">
-            <div class="ops-count-head">
-              <el-icon class="ops-count-ic"><component :is="g.icon" /></el-icon>
-              <span class="ops-count-title">{{ g.title }}</span>
-              <span class="ops-count-total">{{ g.total }}</span>
-            </div>
-            <div class="ops-count-rows">
-              <div v-for="r in g.rows" :key="r.label" class="ops-count-row">
-                <span class="ops-dot" :data-tone="r.tone" />
-                <span class="ops-count-label">{{ r.label }}</span>
-                <span class="ops-count-value">{{ r.value }}</span>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <div class="grid">
-          <div class="card span-2">
-            <div class="block-title">成功率趋势</div>
-            <VChart :option="successOption" height="280px" />
-          </div>
-          <div class="card">
-            <div class="block-title">
-              耗时分布
-              <span class="block-note">
-                P50 {{ fmtMs(data?.Usage.P50MS ?? 0) }} · P90
-                {{ fmtMs(data?.Usage.P90MS ?? 0) }} · P95
-                {{ fmtMs(data?.Usage.P95MS ?? 0) }}
-              </span>
-            </div>
-            <VChart :option="latencyOption" height="280px" />
-          </div>
-          <div class="card span-2">
-            <div class="block-title">吞吐量趋势</div>
-            <VChart :option="throughputOption" height="280px" />
-          </div>
-          <div class="card">
-            <div class="block-title">错误 Top</div>
-            <el-table :data="(data?.Usage.Errors ?? []).slice(0, 8)" size="small" empty-text="暂无失败记录">
-              <el-table-column label="错误信息" min-width="200">
-                <template #default="{ row }">
-                  <span class="cell-main">{{ row.Label }}</span>
-                </template>
-              </el-table-column>
-              <el-table-column label="次数" width="90" align="right">
-                <template #default="{ row }">{{ fmtInt(row.Calls) }}</template>
-              </el-table-column>
-            </el-table>
-          </div>
-        </div>
-      </template>
-
       <!-- 最近公告 -->
       <div v-if="announcements.length" class="section-head">
         <span class="section-bar section-bar--news" />
@@ -751,101 +578,153 @@ const modeLabel = (m: string) =>
 </template>
 
 <style scoped>
-/* ===== 顶部指标带 ===== */
-.kpi-grid {
+/* ===== 首屏 · 静态总量（主视觉） ===== */
+.lead-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-  gap: 14px;
-  margin-bottom: 22px;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 16px;
+  margin-bottom: 12px;
 }
-.kpi-card {
+.lead-card {
   position: relative;
   background: var(--color-surface);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-m);
-  padding: 14px 16px 30px;
+  padding: 16px 18px 32px;
   box-shadow: var(--shadow-card);
   transition: transform 0.18s ease, box-shadow 0.18s ease;
   overflow: hidden;
   min-width: 0;
 }
-.kpi-card:hover {
+.lead-card:hover {
   transform: translateY(-2px);
   box-shadow: var(--shadow-pop);
 }
-.kpi-card::before {
+.lead-card::before {
   content: '';
   position: absolute;
   inset: 0 auto 0 0;
   width: 3px;
   background: var(--brand-primary);
 }
-.kpi-card[data-tone='violet']::before { background: var(--brand-violet); }
-.kpi-card[data-tone='success']::before { background: var(--color-success); }
-.kpi-card[data-tone='warning']::before { background: var(--color-warning); }
-.kpi-top {
+.lead-card[data-tone='violet']::before { background: var(--brand-violet); }
+.lead-top {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 6px;
+  margin-bottom: 8px;
 }
-.kpi-label {
+.lead-label {
   font-size: 13px;
   color: var(--color-text-secondary);
 }
-.kpi-ic {
+.lead-ic {
   font-size: 16px;
   color: var(--color-text-tertiary);
 }
-.kpi-value {
-  font-size: 26px;
+.lead-value {
+  font-size: 30px;
   font-weight: 700;
-  line-height: 1.15;
+  line-height: 1.1;
   color: var(--color-text);
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.kpi-foot {
+.lead-foot {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-top: 6px;
+  margin-top: 8px;
   font-size: 12px;
   color: var(--color-text-secondary);
   min-width: 0;
 }
-.kpi-sub {
+.lead-sub {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.kpi-sub.muted { color: var(--color-text-tertiary); }
-.kpi-delta {
+.lead-delta {
   flex-shrink: 0;
   font-weight: 600;
 }
-.kpi-delta.up { color: var(--color-success); }
-.kpi-delta.down { color: var(--color-danger); }
-.kpi-spark {
+.lead-delta.up { color: var(--color-success); }
+.lead-delta.down { color: var(--color-danger); }
+.lead-spark {
   position: absolute;
   left: 0;
   right: 0;
   bottom: 0;
   width: 100%;
   height: 28px;
-  opacity: 0.5;
+  opacity: 0.45;
 }
-.kpi-spark polyline {
+.lead-spark polyline {
   fill: none;
   stroke: var(--brand-primary);
   stroke-width: 1.6;
   vector-effect: non-scaling-stroke;
 }
-.kpi-card[data-tone='violet'] .kpi-spark polyline { stroke: var(--brand-violet); }
-.kpi-card[data-tone='success'] .kpi-spark polyline { stroke: var(--color-success); }
-.kpi-card[data-tone='warning'] .kpi-spark polyline { stroke: var(--color-warning); }
+.lead-card[data-tone='violet'] .lead-spark polyline { stroke: var(--brand-violet); }
+
+/* ===== 首屏 · 次级小指标（弱化，单行内联） ===== */
+.mini-strip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 0;
+  margin: 0 0 22px;
+  padding: 10px 2px;
+  border-top: 1px solid var(--color-border);
+  border-bottom: 1px solid var(--color-border);
+}
+.mini-item {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 0 18px;
+  border-left: 1px solid var(--color-border);
+  min-width: 0;
+}
+.mini-item:first-child {
+  padding-left: 2px;
+  border-left: none;
+}
+.mini-label {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  white-space: nowrap;
+}
+.mini-value {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--color-text);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.mini-value--tip {
+  border-bottom: 1px dashed var(--color-border);
+  cursor: help;
+}
+.mini-sub {
+  font-size: 11px;
+  color: var(--color-text-secondary);
+  white-space: nowrap;
+}
+.mini-sub.muted { color: var(--color-text-tertiary); }
+@media (max-width: 1280px) {
+  .mini-item { padding: 0 12px; }
+}
+@media (max-width: 1000px) {
+  .mini-strip {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+  }
+  .mini-item { padding: 0; border-left: none; }
+}
 
 /* ===== 区块标题 ===== */
 .section-head {
@@ -860,7 +739,6 @@ const modeLabel = (m: string) =>
   border-radius: 3px;
   background: var(--brand-gradient);
 }
-.section-bar--ops { background: linear-gradient(135deg, #12b76a 0%, #0ea5e9 100%); }
 .section-bar--news { background: linear-gradient(135deg, #f79009 0%, #f04438 100%); }
 .section-title {
   margin: 0;
@@ -902,14 +780,20 @@ const modeLabel = (m: string) =>
 .card {
   padding: 16px 18px;
 }
-.block-note {
+/* 卡片标题右侧的操作区：聚合粒度 + 指标切换，右对齐成一行 */
+.title-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
   margin-left: auto;
-  font-size: 12px;
-  font-weight: 400;
-  color: var(--color-text-secondary);
+  flex-wrap: wrap;
 }
-.inline-switch {
-  margin-left: auto;
+/* 聚合粒度占位：本轮只有按天，整组置灰（禁用态不抢注意力，提示走 tooltip） */
+.granularity-wrap {
+  display: inline-flex;
+}
+.granularity-switch {
+  opacity: 0.75;
 }
 
 /* 计费模式分布 */
@@ -948,66 +832,6 @@ const modeLabel = (m: string) =>
   justify-content: space-between;
   font-size: 12px;
   color: var(--color-text-secondary);
-}
-
-/* 运维计数卡 */
-.ops-count-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: 16px;
-  margin-bottom: 16px;
-}
-.ops-count-card {
-  padding: 14px 16px;
-}
-.ops-count-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 10px;
-}
-.ops-count-ic {
-  font-size: 16px;
-  color: var(--brand-primary);
-}
-.ops-count-title {
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--color-text);
-}
-.ops-count-total {
-  margin-left: auto;
-  font-size: 22px;
-  font-weight: 700;
-  color: var(--color-text);
-  font-variant-numeric: tabular-nums;
-}
-.ops-count-rows {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px 18px;
-}
-.ops-count-row {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 12px;
-  color: var(--color-text-secondary);
-}
-.ops-dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--color-info);
-}
-.ops-dot[data-tone='success'] { background: var(--color-success); }
-.ops-dot[data-tone='warning'] { background: var(--color-warning); }
-.ops-dot[data-tone='danger'] { background: var(--color-danger); }
-.ops-dot[data-tone='info'] { background: var(--color-text-tertiary); }
-.ops-count-value {
-  font-weight: 600;
-  color: var(--color-text);
-  font-variant-numeric: tabular-nums;
 }
 
 /* 表格辅助 */
