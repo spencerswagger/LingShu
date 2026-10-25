@@ -758,9 +758,16 @@ func NormalizeModelSort(sortKey string) string {
 //
 // 归属口径（PR #61 Owl P2 修正）：用量按**实体**归到对外模型，不再用账单里的模型名去撞目录名。
 // 账单行先用 (channel_id, internal_model_id) 反查 channel_models 拿到 external_model_id，再按 ID 归属，
-// 因此模型改名、用别名调用都仍归到对应模型。确实解析不到的用量不再被静默丢掉，
-// 而是汇总成一行显式「未匹配」条目（Unmatched=true、Model=DashModelUnmatchedKey），且不受 Limit 截断。
-// 守恒：List 各行的 Calls/Failed/Tokens 之和 == 同窗口总量（含未匹配行）。
+// 因此模型改名、用别名调用都仍归到对应模型。
+//
+// 每条用量只有两个去处，没有第三条路（守恒）：
+//  1. 目录行：解析到的对外模型**仍在册**（in_catalog = true，`deleted_at IS NULL`）；
+//  2. 「未匹配」行：解析不到（ext_id=0）**或**解析到的模型已被软删（in_catalog = false）。
+//     判据是 `NOT in_catalog` 而不是 `ext_id = 0` —— 只兜 ext_id=0 会让「软删模型的历史用量」
+//     两头落空（目录 JOIN 滤掉了它，未匹配也不收），静默丢量。
+//
+// 未匹配行 Unmatched=true、Model=DashModelUnmatchedKey，不参与 Total/Active、不受 Limit 截断、恒排末位。
+// 守恒：List 各行的 Calls/Failed/Tokens 之和 == 同窗口总量（含未匹配行），差值为 0。
 //
 // 三个吞吐口径不要混用（详见 docs/designs/2026-10-25-stats-dashboard-backend.md）：
 //   - 首屏 KPI.TPM = 全窗口忙时口径（BusyTPM）；
@@ -780,6 +787,10 @@ func (s *SqlStore) DashboardModels(ctx context.Context, from, to time.Time, user
 	aggCTE := `WITH res AS (` + modelEntityResolveBody + `),
 agg AS (
     SELECT COALESCE(r.external_model_id, 0) AS ext_id,
+           -- in_catalog：解析到的对外模型是否仍是「在册（未删除）」实体。
+           -- 未匹配判定必须用它，而不是只看 ext_id = 0 —— 否则「解析到了、但该模型后来被软删」
+           -- 的用量会两头落空（既不在目录行里，也不进未匹配行），静默丢量（PR #61 Gate 复验）。
+           (cat.id IS NOT NULL) AS in_catalog,
            count(*) AS calls,
            COALESCE(sum((b.status='failed')::int),0) AS failed,
            COALESCE(sum(b.credits_consumed),0) AS credits,
@@ -795,8 +806,10 @@ agg AS (
       LEFT JOIN channel_keys k ON k.id = b.channel_key_id
       LEFT JOIN (` + modelEntityResolveBody + `) r
              ON r.channel_id = k.channel_id AND r.internal_model_id = b.internal_model_id
+      LEFT JOIN external_models cat
+             ON cat.id = r.external_model_id AND cat.deleted_at IS NULL
       ` + dashWhere("b.") + `
-     GROUP BY 1
+     GROUP BY 1, 2
 )`
 
 	rows, err := s.db.QueryContext(ctx, aggCTE+`
@@ -835,19 +848,18 @@ SELECT em.external_name, em.enabled,
 	var umDurSum, umDurN, umFirstSum, umFirstN int64
 	if err := s.db.QueryRowContext(ctx, aggCTE+`
 SELECT (SELECT count(*) FROM external_models WHERE deleted_at IS NULL),
-       count(*) FILTER (WHERE a.ext_id > 0
-           AND EXISTS (SELECT 1 FROM external_models em WHERE em.id = a.ext_id AND em.deleted_at IS NULL)),
-       COALESCE(sum(a.calls) FILTER (WHERE a.ext_id = 0),0),
-       COALESCE(sum(a.failed) FILTER (WHERE a.ext_id = 0),0),
-       COALESCE(sum(a.credits) FILTER (WHERE a.ext_id = 0),0),
-       COALESCE(sum(a.tokens) FILTER (WHERE a.ext_id = 0),0),
-       COALESCE(sum(a.busy_calls) FILTER (WHERE a.ext_id = 0),0),
-       COALESCE(sum(a.busy_tokens) FILTER (WHERE a.ext_id = 0),0),
-       COALESCE(sum(a.busy_ms) FILTER (WHERE a.ext_id = 0),0),
-       COALESCE(sum(a.dur_sum) FILTER (WHERE a.ext_id = 0),0),
-       COALESCE(sum(a.dur_n) FILTER (WHERE a.ext_id = 0),0),
-       COALESCE(sum(a.first_sum) FILTER (WHERE a.ext_id = 0),0),
-       COALESCE(sum(a.first_n) FILTER (WHERE a.ext_id = 0),0)
+       count(*) FILTER (WHERE a.in_catalog),
+       COALESCE(sum(a.calls) FILTER (WHERE NOT a.in_catalog),0),
+       COALESCE(sum(a.failed) FILTER (WHERE NOT a.in_catalog),0),
+       COALESCE(sum(a.credits) FILTER (WHERE NOT a.in_catalog),0),
+       COALESCE(sum(a.tokens) FILTER (WHERE NOT a.in_catalog),0),
+       COALESCE(sum(a.busy_calls) FILTER (WHERE NOT a.in_catalog),0),
+       COALESCE(sum(a.busy_tokens) FILTER (WHERE NOT a.in_catalog),0),
+       COALESCE(sum(a.busy_ms) FILTER (WHERE NOT a.in_catalog),0),
+       COALESCE(sum(a.dur_sum) FILTER (WHERE NOT a.in_catalog),0),
+       COALESCE(sum(a.dur_n) FILTER (WHERE NOT a.in_catalog),0),
+       COALESCE(sum(a.first_sum) FILTER (WHERE NOT a.in_catalog),0),
+       COALESCE(sum(a.first_n) FILTER (WHERE NOT a.in_catalog),0)
   FROM agg a`, dashArgs(userID, from, to)...).
 		Scan(&out.Total, &out.Active,
 			&umCalls, &umFailed, &umCredits, &umTokens, &umBusyCalls, &umBusyTokens, &umBusyMS,

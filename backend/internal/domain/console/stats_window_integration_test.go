@@ -262,3 +262,77 @@ func TestStats_ResponseJSONShape(t *testing.T) {
 		}
 	}
 }
+
+// TestStats_SoftDeletedModelGoesUnmatched 断言「解析到的目录模型后来被软删」时不会静默丢量：
+// 该模型的窗口用量必须落到显式的「未匹配」行，且广场汇总与 KPI 总量守恒（差值 0）。
+//
+// Gate 复现过的问题：agg 只兜 ext_id=0，而软删模型在目录 JOIN 里被 deleted_at IS NULL 滤掉，
+// 于是这批用量既不在目录行、也不进未匹配行（KPI 510/6 vs 广场 450/5）。
+func TestStats_SoftDeletedModelGoesUnmatched(t *testing.T) {
+	d := openStatsTempDB(t)
+	exec := func(sqlText string) {
+		t.Helper()
+		if _, err := d.Exec(sqlText); err != nil {
+			t.Fatalf("执行 SQL 失败: %v\nSQL: %s", err, sqlText)
+		}
+	}
+	exec(`INSERT INTO users(id, username, password_hash, role) VALUES (7,'dev','x','DEVELOPER')`)
+	exec(`INSERT INTO channels(id, name, base_url) VALUES (1,'渠道A','http://a'),(2,'渠道B','http://b')`)
+	exec(`INSERT INTO channel_keys(id, channel_id, name, credential_enc) VALUES (100,1,'k1','enc'),(200,2,'k2','enc')`)
+	// 701 稍后软删；702 保持在册。
+	exec(`INSERT INTO external_models(id, external_name) VALUES (701,'legacy-model'),(702,'gpt-4o')`)
+	exec(`INSERT INTO channel_models(id, channel_id, internal_model_id, external_model_id) VALUES
+	       (900,1,'legacy-int',701), (901,1,'gpt-4o-int',702)`)
+	exec(`INSERT INTO billing_records(id,billing_id,user_id,pricing_mode,external_model_name,internal_model_id,channel_key_id,r_value,tokens,credits_consumed,cost_credits,status,duration_ms,call_time) VALUES
+	 (1,'s1',7,'sale','gpt-4o','gpt-4o-int',100,1,'{"input":400,"cache_read":0,"output":0}'::jsonb,4.0,2.0,'completed',1000,'2026-10-25 09:00:00+08'),
+	 (2,'s2',7,'sale','gpt-4o','gpt-4o-int',100,1,'{"input":50,"cache_read":0,"output":0}'::jsonb,0.5,0.25,'completed',500,'2026-10-25 09:30:00+08'),
+	 (3,'s3',7,'sale','legacy-model','legacy-int',100,1,'{"input":60,"cache_read":0,"output":0}'::jsonb,0.6,0.3,'completed',600,'2026-10-25 10:00:00+08')`)
+	// 软删 701：历史账单仍在，实体解析仍能解析到 701（解析不看 deleted_at），但目录里它不算在册。
+	exec(`UPDATE external_models SET deleted_at = now() WHERE id = 701`)
+
+	store := billing.NewSqlStore(d)
+	now := time.Date(2026, 10, 25, 12, 0, 0, 0, cnLocation())
+	from := now.Add(-24 * time.Hour)
+	out := statsUsageForTest(t, store, "From="+url.QueryEscape(from.Format(time.RFC3339))+
+		"&To="+url.QueryEscape(now.Format(time.RFC3339)), now)
+
+	// 窗口内 3 条：400 + 50 + 60 = 510 token / 3 次。
+	if out.KPI.TotalTokens != 510 || out.KPI.TotalRequests != 3 {
+		t.Fatalf("KPI 应统计全部 3 条: tokens=%d calls=%d", out.KPI.TotalTokens, out.KPI.TotalRequests)
+	}
+
+	var gpt, unmatched *billing.DashModelStat
+	for i := range out.ModelPlaza.List {
+		switch {
+		case out.ModelPlaza.List[i].Unmatched:
+			unmatched = &out.ModelPlaza.List[i]
+		case out.ModelPlaza.List[i].Model == "gpt-4o":
+			gpt = &out.ModelPlaza.List[i]
+		}
+	}
+	if gpt == nil || gpt.Tokens != 450 || gpt.Calls != 2 {
+		t.Fatalf("在册模型的用量错: %+v", gpt)
+	}
+	if unmatched == nil {
+		t.Fatalf("软删模型的用量必须进「未匹配」行，实际行=%+v", out.ModelPlaza.List)
+	}
+	if unmatched.Tokens != 60 || unmatched.Calls != 1 {
+		t.Fatalf("未匹配行应只含软删模型那 60 token / 1 次: %+v", unmatched)
+	}
+	// 软删模型不计入目录口径。
+	if out.ModelPlaza.Total != 1 || out.ModelPlaza.Active != 1 {
+		t.Fatalf("目录口径错: Total=%d Active=%d（软删模型不算在册）", out.ModelPlaza.Total, out.ModelPlaza.Active)
+	}
+	// 守恒：广场各行汇总 == KPI 总量，差值必须为 0。
+	var tokens, calls, failed int64
+	for _, row := range out.ModelPlaza.List {
+		tokens += row.Tokens
+		calls += row.Calls
+		failed += row.Failed
+	}
+	if tokens != out.KPI.TotalTokens || calls != out.KPI.TotalRequests || failed != out.KPI.FailedRequests {
+		t.Fatalf("守恒失败：广场=%d/%d/%d KPI=%d/%d/%d（差值=%d/%d/%d）",
+			tokens, calls, failed, out.KPI.TotalTokens, out.KPI.TotalRequests, out.KPI.FailedRequests,
+			out.KPI.TotalTokens-tokens, out.KPI.TotalRequests-calls, out.KPI.FailedRequests-failed)
+	}
+}

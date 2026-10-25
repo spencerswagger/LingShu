@@ -3,6 +3,7 @@ package billing
 import (
 	"context"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -379,5 +380,47 @@ func TestFillModelStat_MergedGroups(t *testing.T) {
 	fillModelStat(&zero, 0, 0, 0, 0, 0)
 	if zero.TPM != 0 || zero.AvgMS != 0 || zero.AvgFirstMS != 0 || zero.FailRate != 0 {
 		t.Fatalf("零样本应全 0: %+v", zero)
+	}
+}
+
+// recordingMatcher 记录 sqlmock 实际收到的 SQL（同时按默认正则口径匹配）。
+type recordingMatcher struct{ got []string }
+
+func (m *recordingMatcher) Match(expectedSQL, actualSQL string) error {
+	m.got = append(m.got, actualSQL)
+	return sqlmock.QueryMatcherRegexp.Match(expectedSQL, actualSQL)
+}
+
+// TestDashboardModels_ConservationGuard 守护「未匹配」判据：必须是 `NOT in_catalog`，
+// 不能只看 `ext_id = 0` —— 否则「解析到但已软删」的模型用量会两头落空（静默丢量）。
+// 反向验证：把判据改回 ext_id = 0，本用例失败。
+func TestDashboardModels_ConservationGuard(t *testing.T) {
+	matcher := &recordingMatcher{}
+	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(matcher))
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+	store := NewSqlStore(db)
+
+	mock.ExpectQuery(regexp.QuoteMeta(`LEFT JOIN agg a ON a.ext_id = em.id`)).
+		WillReturnRows(sqlmock.NewRows(modelRowCols()))
+	mock.ExpectQuery(regexp.QuoteMeta(`FROM agg a`)).
+		WillReturnRows(sqlmock.NewRows(modelTotalsCols()).
+			AddRow(int64(0), int64(0),
+				int64(0), int64(0), float64(0), float64(0),
+				int64(0), float64(0), int64(0), int64(0), int64(0), int64(0), int64(0)))
+	if _, err := store.DashboardModels(context.Background(), time.Now(), time.Now(), nil, ModelSortTokens, 10); err != nil {
+		t.Fatalf("DashboardModels: %v", err)
+	}
+	all := strings.Join(matcher.got, "\n---\n")
+	if !regexp.MustCompile(`NOT a\.in_catalog`).MatchString(all) {
+		t.Fatalf("未匹配判据必须用 NOT in_catalog: %s", all)
+	}
+	if !regexp.MustCompile(`\(cat\.id IS NOT NULL\) AS in_catalog`).MatchString(all) {
+		t.Fatalf("agg 必须算出 in_catalog 列: %s", all)
+	}
+	if regexp.MustCompile(`a\.ext_id = 0`).MatchString(all) {
+		t.Fatalf("不得再用 a.ext_id = 0 作未匹配判据（会漏掉软删模型）: %s", all)
 	}
 }
