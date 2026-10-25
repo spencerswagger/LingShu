@@ -30,7 +30,7 @@ type statsKPI struct {
 	// BusyRequests 忙时口径的分子（有耗时请求数，与 RPM/TPM 的分母同源）。
 	// 前端判断「样本是否偏少」必须用它，不能用 TotalRequests（后者含无耗时的失败记录，不同源会误判）。
 	BusyRequests int64 `json:"BusyRequests"`
-	// SumDurationMS 忙时分母（这批请求的耗时之和，毫秒），供前端做「样本量/时长是否够」的标注。
+	// SumDurationMS 忙时分母（成功且带耗时请求的耗时之和，毫秒），供前端做「样本量/时长是否够」的标注。
 	SumDurationMS int64   `json:"SumDurationMS"`
 	DeltaTokens   float64 `json:"DeltaTokens"` // 环比上期（比例，可为负）
 	DeltaCredits  float64 `json:"DeltaCredits"`

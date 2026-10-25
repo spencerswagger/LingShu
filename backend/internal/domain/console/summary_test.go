@@ -69,11 +69,11 @@ func TestHandleMeSummary(t *testing.T) {
 	defer db.Close()
 
 	const summarySQL = `COALESCE(sum(credits_consumed), 0)`
-	// 列顺序与 Summarize 的 SELECT 一致：末尾两列是忙时口径（duration_ms 非空的请求数与 token）。
+	// 列顺序与 Summarize 的 SELECT 一致：末尾三列是忙时口径（成功且带耗时的请求数、token、耗时之和）。
 	rows := func(requests int64, credits float64, tokens, input, cacheRead int64) *sqlmock.Rows {
 		return sqlmock.NewRows([]string{"count", "credits", "tokens", "duration", "input", "cache_read",
-			"busy_requests", "busy_tokens"}).
-			AddRow(requests, credits, tokens, int64(0), input, cacheRead, requests, tokens)
+			"busy_requests", "busy_tokens", "busy_duration"}).
+			AddRow(requests, credits, tokens, int64(0), input, cacheRead, requests, tokens, int64(0))
 	}
 	// 过滤参数：user_id=1；三档消耗带 status='completed'，吞吐窗口不带；
 	// 时间参数用 AnyArg（边界逻辑已由 TestSummaryRanges_Shanghai 覆盖）。

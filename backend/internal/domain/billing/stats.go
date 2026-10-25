@@ -69,20 +69,22 @@ type DashboardStats struct {
 	AvgRPM    float64    `json:"AvgRPM"`
 	AvgTPM    float64    `json:"AvgTPM"`
 	// 忙时口径（长区间用它代替墙钟平均）：BusyRPM/BusyTPM = 忙时处理数 ÷ 忙时分母，
-	// 忙时分母 = 这批请求的耗时之和折算成分钟（≈1 ÷ 平均耗时）；分母为 0 时两者为 0。
-	// 分子与分母同源（都只取 duration_ms 非空的行），SumDurationMS 一并返回供前端做样本标注。
-	// BusyRequests 是忙时口径的分子（有耗时的请求数），前端判断样本量必须用它而不是 TotalCall。
-	BusyRequests  int64               `json:"BusyRequests"`
-	BusyRPM       float64             `json:"BusyRPM"`
-	BusyTPM       float64             `json:"BusyTPM"`
-	SumDurationMS int64               `json:"SumDurationMS"`
-	Daily         []DashDay           `json:"Daily"`
-	ByModel       []DashTopItem       `json:"ByModel"`
-	ByKey         []DashTopItem       `json:"ByKey"`
-	ByUser        []DashTopItem       `json:"ByUser"`
-	ByMode        []DashTopItem       `json:"ByMode"`
-	Errors        []DashTopItem       `json:"Errors"`
-	Latency       []DashLatencyBucket `json:"Latency"`
+	// 忙时分母 = 这批「成功且带耗时」请求的耗时之和折算成分钟（≈1 ÷ 平均耗时）；分母为 0 时两者为 0。
+	// 分子分母同源（busyFilter：status='completed' AND duration_ms IS NOT NULL），
+	// 失败请求哪怕带耗时也两侧同时剔除。BusyRequests 是忙时口径的分子，
+	// 前端判断样本量必须用它而不是 TotalCall。SumDurationMS 同为忙时口径（= BusyDurationMS）。
+	BusyRequests   int64               `json:"BusyRequests"`
+	BusyDurationMS int64               `json:"BusyDurationMS"`
+	BusyRPM        float64             `json:"BusyRPM"`
+	BusyTPM        float64             `json:"BusyTPM"`
+	SumDurationMS  int64               `json:"SumDurationMS"`
+	Daily          []DashDay           `json:"Daily"`
+	ByModel        []DashTopItem       `json:"ByModel"`
+	ByKey          []DashTopItem       `json:"ByKey"`
+	ByUser         []DashTopItem       `json:"ByUser"`
+	ByMode         []DashTopItem       `json:"ByMode"`
+	Errors         []DashTopItem       `json:"Errors"`
+	Latency        []DashLatencyBucket `json:"Latency"`
 }
 
 // dashWhere 生成时间范围 + 可选用户过滤 WHERE 子句；prefix 为表别名前缀（如 "br."）。
@@ -125,7 +127,9 @@ func (s *SqlStore) Dashboard(ctx context.Context, from, to time.Time, userID *in
 	var total UsageSplit
 	var totalCred float64
 	var totalCall, failed int64
-	var sumDur, sumFirst, okDur, okFirst, busyTokens int64
+	var sumDur, sumFirst, okDur, okFirst int64
+	// 忙时口径专用的三个量（只统计成功且带耗时的行），与 sumDur/okDur（全部行，供 AvgMS 用）互不影响。
+	var busyRequests, busyTokens, busyDur int64
 	err := s.db.QueryRowContext(ctx,
 		`SELECT
 		    COALESCE(sum(COALESCE(NULLIF(tokens->>'input','')::bigint,0)),0),
@@ -138,11 +142,14 @@ func (s *SqlStore) Dashboard(ctx context.Context, from, to time.Time, userID *in
 		    COALESCE(sum(first_token_ms),0),
 		    COALESCE(sum((duration_ms IS NOT NULL)::int),0),
 		    COALESCE(sum((first_token_ms IS NOT NULL)::int),0),
-		    COALESCE(sum(`+tokenSum("")+`) FILTER (WHERE duration_ms IS NOT NULL),0)
+		    COALESCE(count(*) FILTER (WHERE `+busyFilter+`),0),
+		    COALESCE(sum(`+tokenSum("")+`) FILTER (WHERE `+busyFilter+`),0),
+		    COALESCE(sum(duration_ms) FILTER (WHERE `+busyFilter+`),0)
 		 FROM billing_records `+dashWhere(""),
 		dashArgs(userID, from, to)...).
 		Scan(&total.Input, &total.Output, &total.CacheRead,
-			&totalCred, &totalCall, &failed, &sumDur, &sumFirst, &okDur, &okFirst, &busyTokens)
+			&totalCred, &totalCall, &failed, &sumDur, &sumFirst, &okDur, &okFirst,
+			&busyRequests, &busyTokens, &busyDur)
 	if err != nil {
 		return out, err
 	}
@@ -163,11 +170,12 @@ func (s *SqlStore) Dashboard(ctx context.Context, from, to time.Time, userID *in
 		out.AvgRPM = float64(totalCall) / minutes
 		out.AvgTPM = float64(total.Total()) / minutes
 	}
-	// 忙时口径：分子只取 duration_ms 非空的行（与分母同源），分母 = 这些行的耗时之和。
-	out.BusyRequests = okDur
-	out.SumDurationMS = sumDur
-	out.BusyRPM = BusyRate(float64(okDur), sumDur)
-	out.BusyTPM = BusyRate(float64(busyTokens), sumDur)
+	// 忙时口径：分子分母都只取「成功且带耗时」的行（busyFilter），失败请求两侧同时剔除。
+	out.BusyRequests = busyRequests
+	out.BusyDurationMS = busyDur
+	out.SumDurationMS = busyDur // 前端样本标注用同一口径（忙时分母）
+	out.BusyRPM = BusyRate(float64(busyRequests), busyDur)
+	out.BusyTPM = BusyRate(float64(busyTokens), busyDur)
 
 	if err := s.dashboardDaily(ctx, from, to, userID, &out); err != nil {
 		return out, err
