@@ -62,6 +62,81 @@ func TestThinkingRoundtrip(t *testing.T) {
 	if !bytes.Equal(req.Body, body) {
 		t.Errorf("非 thinking 模式且 onlyThinking=true 时不应改写，got %s", req.Body)
 	}
+
+	// field=reasoning 时：源字段只能取别名集合中不同于 field 的那个，不得把目标字段自身当源。
+	f = newThinkingRoundtripFeature(map[string]any{"enabled": true, "field": "reasoning"})
+	req = &UpstreamRequest{Body: append([]byte(nil), body...)}
+	if err := f.RewriteRequest(req); err != nil {
+		t.Fatalf("rewrite: %v", err)
+	}
+	var gotField struct {
+		Messages []map[string]any `json:"messages"`
+	}
+	if err := json.Unmarshal(req.Body, &gotField); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	// 该消息本来只有 reasoning=chain：目标是 reasoning 本身，应无源可搬 → 不改写（键不存在）。
+	if _, exists := gotField.Messages[1]["reasoning_content"]; exists {
+		t.Errorf("目标字段为 reasoning 时不应再从自身取源，got %v", gotField.Messages[1])
+	}
+
+	// field=reasoning 且消息带 reasoning_content：应搬为 reasoning。
+	aliasSrc := []byte(`{"model":"m","messages":[{"role":"assistant","reasoning_content":"chain"}]}`)
+	req = &UpstreamRequest{Body: append([]byte(nil), aliasSrc...)}
+	if err := f.RewriteRequest(req); err != nil {
+		t.Fatalf("rewrite: %v", err)
+	}
+	var gotAlias struct {
+		Messages []map[string]any `json:"messages"`
+	}
+	if err := json.Unmarshal(req.Body, &gotAlias); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if gotAlias.Messages[0]["reasoning"] != "chain" {
+		t.Errorf("应把别名 reasoning_content 搬为 reasoning，got %v", gotAlias.Messages[0])
+	}
+}
+
+// TestReasoningSourceSkipsTargetField 单测 reasoningSource 的「跳过目标字段自身」规则：
+// field 为别名集合成员时，只能从其余别名取源；无可取时返回 false（不凭空构造）。
+func TestReasoningSourceSkipsTargetField(t *testing.T) {
+	cases := []struct {
+		name    string
+		msg     string
+		field   string
+		want    string
+		wantHit bool
+	}{
+		{name: "target_is_reasoning_takes_canonical", msg: `{"reasoning_content":"a","reasoning":"b"}`, field: "reasoning", want: "a", wantHit: true},
+		{name: "target_is_canonical_takes_alias", msg: `{"reasoning":"b"}`, field: "reasoning_content", want: "b", wantHit: true},
+		{name: "target_is_reasoning_only_self_present", msg: `{"reasoning":"b"}`, field: "reasoning", wantHit: false},
+		// 目标字段自身即使有值也不能作为源（该值已在目标键上，无需搬运）。
+		{name: "empty_canonical_does_not_block_alias", msg: `{"reasoning_content":"","reasoning":"b"}`, field: "reasoning_content", want: "b", wantHit: true},
+		{name: "null_not_a_source", msg: `{"reasoning_content":null}`, field: "reasoning", wantHit: false},
+		{name: "no_alias_absent", msg: `{"content":"x"}`, field: "reasoning", wantHit: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var m map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(tc.msg), &m); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			got, ok := reasoningSource(m, tc.field)
+			if ok != tc.wantHit {
+				t.Fatalf("命中=%v, want %v", ok, tc.wantHit)
+			}
+			if !ok {
+				return
+			}
+			var s string
+			if err := json.Unmarshal(got, &s); err != nil {
+				t.Fatalf("源值应为字符串: %v", err)
+			}
+			if s != tc.want {
+				t.Fatalf("源值=%q, want %q", s, tc.want)
+			}
+		})
+	}
 }
 
 // Step 7 verify：tool-schema-normalize 为缺失/非法 schema 的工具补齐合法 schema。

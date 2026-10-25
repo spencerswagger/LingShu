@@ -215,6 +215,96 @@ func TestLossyDecision(t *testing.T) {
 	}
 }
 
+// TestConvertedReasoningInjectHonorsOnlyThinking 端到端覆盖转换链路的推理注入门控：
+// 入站 anthropic（带 thinking）→ 上游 openai-chat 时，assistant 历史的 thinking 应被回填为
+// reasoning_content；同一渠道、请求体不带任何 thinking 字段时，注入须整体关闭
+// （避免向非 thinking 请求注入推理字段）。
+// 说明：本用例覆盖端到端行为（门控 + 注入结果），不区分判定基准用的是入站体还是转换后请求体
+// （两者在本方向上都会保留 thinking 标记），该实现细节由 TestChannelReasoningInject 单测覆盖。
+func TestConvertedReasoningInjectHonorsOnlyThinking(t *testing.T) {
+	const assistantHistory = `{"role":"assistant","content":[` +
+		`{"type":"thinking","thinking":"CoT","signature":"s"},` +
+		`{"type":"tool_use","id":"toolu_1","name":"f","input":{}}]},` +
+		`{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}`
+
+	cases := []struct {
+		name       string
+		thinkingOn bool
+		wantInject bool
+	}{
+		{name: "thinking_request_injects", thinkingOn: true, wantInject: true},
+		{name: "plain_request_does_not_inject", thinkingOn: false, wantInject: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var upstreamBody []byte
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				upstreamBody, _ = io.ReadAll(r.Body)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"id":"x","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},` +
+					`"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`))
+			}))
+			defer upstream.Close()
+
+			h := build(t, upstream.URL)
+			// 模型仅可达 openai-chat → anthropic 入站需转换为 openai-chat 上游。
+			h.chans.mrt.Model.Protocols = channelprotocol.Protocols{channelprotocol.ProtocolOpenAIChat: {}}
+			// 渠道声明「支持推理回传」且仅在 thinking 请求下注入。
+			h.chans.rt.Protocol = &channelprotocol.ChannelProtocol{
+				Features: []channelprotocol.Feature{{
+					Key:    channelprotocol.FeatureThinkingRoundtrip,
+					Params: map[string]any{"enabled": true, "onlyThinking": true},
+				}},
+			}
+
+			thinkingField := ""
+			if tc.thinkingOn {
+				thinkingField = `"thinking":{"type":"enabled"},`
+			}
+			body := `{"model":"gpt-4","stream":false,"max_tokens":64,` + thinkingField +
+				`"messages":[` + assistantHistory + `]}`
+			rec := postWithHeaders(t, h.gw, "/v1/messages", body, map[string]string{"x-api-key": "sk-gw-t"})
+			if rec.Code != http.StatusOK {
+				t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
+			}
+			got := string(upstreamBody)
+			if !strings.Contains(got, `"messages"`) {
+				t.Fatalf("上游应收到 openai-chat 形状请求体, got %s", got)
+			}
+			injected := strings.Contains(got, `"reasoning_content":"CoT"`)
+			if injected != tc.wantInject {
+				t.Fatalf("reasoning_content 注入=%v, want %v；上游请求体: %s", injected, tc.wantInject, got)
+			}
+		})
+	}
+}
+
+// TestConvertedReasoningInjectReportsDroppedThinking 断言未注入时损耗报告如实记账：
+// 同一转换链路下不开注入选项，thinking 必须记为 message.content.thinking（不静默丢弃）。
+func TestConvertedReasoningInjectReportsDroppedThinking(t *testing.T) {
+	const body = `{"model":"gpt-4","stream":false,"max_tokens":64,"messages":[` +
+		`{"role":"assistant","content":[{"type":"thinking","thinking":"CoT","signature":"s"},` +
+		`{"type":"text","text":"hi"}]}]}`
+	out, rep, err := protocolconv.ConvertRequestWithOptions(
+		channelprotocol.ProtocolAnthropicMessages, channelprotocol.ProtocolOpenAIChat, []byte(body), protocolconv.SerializeOptions{})
+	if err != nil {
+		t.Fatalf("ConvertRequestWithOptions: %v", err)
+	}
+	if strings.Contains(string(out), "reasoning_content") {
+		t.Fatalf("默认不应注入 reasoning_content: %s", out)
+	}
+	found := false
+	for _, d := range rep.Dropped {
+		if d == "message.content.thinking" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("未注入时应记 lossy, got %v", rep.Dropped)
+	}
+}
+
 // TestNonStreamConversion 端到端：openai-chat 入站 → 模型仅可达 anthropic-messages →
 // 上游收到 anthropic 形状请求体（含 max_tokens），下游收到 openai-chat 形状响应体（含 choices）。
 func TestNonStreamConversion(t *testing.T) {
@@ -434,7 +524,7 @@ func TestStreamConversionToolOnlyAnthropicTarget(t *testing.T) {
 }
 
 // TestConvertParseFailureReturns400 断言 AC-P2-9：入站请求体「合法 JSON 且含 model，但对其声明协议不合法」
-// 时，ConvertRequest 解析失败应立即回 HTTP 400，且绝不发起上游调用（解析失败与候选无关，不 failover）。
+// 时，转换解析失败应立即回 HTTP 400，且绝不发起上游调用（解析失败与候选无关，不 failover）。
 func TestConvertParseFailureReturns400(t *testing.T) {
 	var calls int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -445,7 +535,7 @@ func TestConvertParseFailureReturns400(t *testing.T) {
 	defer upstream.Close()
 
 	h := build(t, upstream.URL)
-	// 模型仅可达 anthropic-messages → openai-chat 入站需转换（才会触发 ConvertRequest）。
+	// 模型仅可达 anthropic-messages → openai-chat 入站需转换（才会触发请求转换）。
 	h.chans.mrt.Model.Protocols = channelprotocol.Protocols{channelprotocol.ProtocolAnthropicMessages: {}}
 
 	// messages 为对象（非数组）→ 合法 JSON 且含 model，但 openai-chat 解析失败。

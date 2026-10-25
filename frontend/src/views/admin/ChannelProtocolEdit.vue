@@ -178,19 +178,35 @@ const featureCatalog = [
     label: 'tool-schema-normalize',
     desc: '为缺失/非法 schema 的工具补齐 input_schema（修复 web_search 类工具 422）',
   },
+  {
+    key: 'tool-choice-downgrade',
+    label: 'tool-choice-downgrade',
+    desc: '把强制工具选择（required / 指定函数 / any / tool）降级为 auto，修复 thinking 模型不支持强制选择的 400',
+  },
 ] as const
 
 type FeatureForm = {
   enabled: boolean // 是否挂载
-  enabledParam: boolean // thinking-roundtrip 参数：enabled
+  enabledParam: boolean // thinking-roundtrip / tool-choice-downgrade 参数：enabled
   field: string // thinking-roundtrip 参数：field
-  onlyThinking: boolean // thinking-roundtrip 参数：onlyThinking
+  onlyThinking: boolean // thinking-roundtrip / tool-choice-downgrade 参数：onlyThinking
   schemaText: string // tool-schema-normalize 参数：schema（JSON 文本，空 = 内置默认）
 }
 const featureForms = reactive<Record<string, FeatureForm>>({
   'thinking-roundtrip': { enabled: false, enabledParam: true, field: 'reasoning_content', onlyThinking: false, schemaText: '' },
   'tool-schema-normalize': { enabled: false, enabledParam: true, field: '', onlyThinking: false, schemaText: '' },
+  'tool-choice-downgrade': { enabled: false, enabledParam: true, field: '', onlyThinking: false, schemaText: '' },
 })
+// 未在 UI 登记的特性（编辑态由 load() 回显）：原样保留，避免保存时静默丢弃未展示配置。
+const unknownFeatures = ref<ProtocolFeature[]>([])
+// 已登记特性的原始 params（编辑态由 load() 回填）：表单字段覆盖同名键，未展示的键原样保留。
+// 约定：关闭特性再重新开启时不清空，未展示的隐藏键仍会透传（宁可保留也不静默丢弃配置）。
+const featureBaseParams = reactive<Record<string, Record<string, unknown>>>({})
+
+// 合并已登记特性的未展示参数：表单字段优先，其余键原样透传。
+function withBaseParams(key: string, own: Record<string, unknown>): Record<string, unknown> {
+  return { ...(featureBaseParams[key] || {}), ...own }
+}
 
 // 由表单组装后端 Features（挂载项才输出；schema 非空时解析为对象）。
 function buildFeatures(): ProtocolFeature[] {
@@ -199,14 +215,33 @@ function buildFeatures(): ProtocolFeature[] {
   if (tr.enabled) {
     out.push({
       key: 'thinking-roundtrip',
-      params: { enabled: tr.enabledParam, field: tr.field.trim() || 'reasoning_content', onlyThinking: tr.onlyThinking },
+      params: withBaseParams('thinking-roundtrip', {
+        enabled: tr.enabledParam,
+        field: tr.field.trim() || 'reasoning_content',
+        onlyThinking: tr.onlyThinking,
+      }),
     })
   }
   const ts = featureForms['tool-schema-normalize']
   if (ts.enabled) {
-    const params: Record<string, unknown> = {}
+    const params: Record<string, unknown> = { ...(featureBaseParams['tool-schema-normalize'] || {}) }
+    delete params.schema
     if (ts.schemaText.trim()) params.schema = JSON.parse(ts.schemaText)
     out.push({ key: 'tool-schema-normalize', params })
+  }
+  const tcd = featureForms['tool-choice-downgrade']
+  if (tcd.enabled) {
+    out.push({
+      key: 'tool-choice-downgrade',
+      params: withBaseParams('tool-choice-downgrade', {
+        enabled: tcd.enabledParam,
+        onlyThinking: tcd.onlyThinking,
+      }),
+    })
+  }
+  // 已登记 key 一律以表单为准，未登记项原样输出，避免同一 key 重复。
+  for (const f of unknownFeatures.value) {
+    if (!featureForms[f.key]) out.push(f)
   }
   return out
 }
@@ -329,19 +364,33 @@ async function load() {
       featureForms[key].onlyThinking = false
       featureForms[key].schemaText = ''
     }
+    for (const key of Object.keys(featureBaseParams)) delete featureBaseParams[key]
     for (const f of v.features || []) {
       const ff = featureForms[f.key]
       if (!ff) continue
       ff.enabled = true
       const p = (f.params || {}) as Record<string, any>
+      // 记录原始 params，保存时保留表单未展示的键。
+      featureBaseParams[f.key] = { ...p }
       if (f.key === 'thinking-roundtrip') {
-        ff.enabledParam = p.enabled === undefined ? true : !!p.enabled
+        // 不变量：enabled 缺省必须为 false（与后端 boolParam(...,"enabled",false) 一致）。
+        // 人工回归清单：① 后端返回无 enabled 参数的历史缺省配置，面板必须显示「关闭」；
+        // ② 保存后重新加载，开关状态不得翻转；③ 若误把 undefined 解析为 true，历史缺省
+        // 配置会显示「开启」而运行实际关闭 → 面板与行为分叉。
+        ff.enabledParam = p.enabled === undefined ? false : !!p.enabled
         ff.field = typeof p.field === 'string' && p.field ? p.field : 'reasoning_content'
+        ff.onlyThinking = !!p.onlyThinking
+      } else if (f.key === 'tool-choice-downgrade') {
+        // 同 thinking-roundtrip：enabled 缺省必须为 false，避免面板与运行行为分叉。
+        ff.enabledParam = p.enabled === undefined ? false : !!p.enabled
         ff.onlyThinking = !!p.onlyThinking
       } else if (f.key === 'tool-schema-normalize' && p.schema) {
         ff.schemaText = JSON.stringify(p.schema, null, 2)
       }
     }
+    // 未登记特性的原样保留（编辑态）：不在表单登记范围内的特性（含其 params）原样带回，
+    // 使 buildFeatures() 在保存时得以原样输出；已登记 key 已被上面的循环接管，故排除。
+    unknownFeatures.value = (v.features || []).filter((f) => !featureForms[f.key])
     modelRows.value = Object.entries(v.Models || {}).map(([mid, ov]) => ({
       id: mid,
       protocols: Object.keys(ov?.protocols || {}),
@@ -923,7 +972,23 @@ async function onSubmit() {
                 </el-form-item>
                 <el-form-item label="仅 thinking 模式">
                   <el-switch v-model="featureForms[f.key].onlyThinking" />
-                  <span class="hint-inline">开启后仅在 thinking / reasoning 请求中回传</span>
+                  <span class="hint-inline">
+                    开启后仅当请求体显式带 thinking / enable_thinking / reasoning_effort 时才回传。
+                    若该渠道的思考由模型名隐含（如 reasoner 类）且请求不带这些字段，请保持关闭：开启会导致推理内容不回传，上游仍报 400。
+                  </span>
+                </el-form-item>
+              </template>
+              <template v-else-if="f.key === 'tool-choice-downgrade'">
+                <el-form-item label="启用改写">
+                  <el-switch v-model="featureForms[f.key].enabledParam" />
+                  <span class="hint-inline">关闭后挂载但不改写</span>
+                </el-form-item>
+                <el-form-item label="仅 thinking 模式">
+                  <el-switch v-model="featureForms[f.key].onlyThinking" />
+                  <span class="hint-inline">
+                    开启后仅当请求体显式带 thinking / enable_thinking / reasoning_effort 时才降级。
+                    仅在「跨协议转换为 anthropic 上游」时 thinking 会被丢弃导致该开关失效（该组合请保持关闭）；直通 anthropic 不受影响。
+                  </span>
                 </el-form-item>
               </template>
               <template v-else-if="f.key === 'tool-schema-normalize'">

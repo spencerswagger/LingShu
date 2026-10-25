@@ -3,6 +3,7 @@ package protocolconv
 import (
 	"bytes"
 	"encoding/json"
+	"strings"
 
 	"github.com/team/llmgateway/internal/domain/billing"
 	"github.com/team/llmgateway/internal/domain/channelprotocol"
@@ -165,6 +166,12 @@ func (openAIChatCodec) ParseRequest(body []byte) (*CanonicalRequest, *LossyRepor
 }
 
 func (openAIChatCodec) SerializeRequest(req *CanonicalRequest) ([]byte, *LossyReport, error) {
+	return openAIChatCodec{}.SerializeRequestWithOptions(req, SerializeOptions{})
+}
+
+// SerializeRequestWithOptions 按序列化选项输出 openai-chat 请求体。
+// 默认不回填 reasoning_content（目标上游未声明支持时不注入未知消息字段）。
+func (openAIChatCodec) SerializeRequestWithOptions(req *CanonicalRequest, opts SerializeOptions) ([]byte, *LossyReport, error) {
 	rep := &LossyReport{}
 	if req == nil {
 		return nil, rep, nil
@@ -184,7 +191,7 @@ func (openAIChatCodec) SerializeRequest(req *CanonicalRequest) ([]byte, *LossyRe
 		}
 	}
 	for _, m := range req.Messages {
-		msgs = append(msgs, serializeOAIMessage(m, rep))
+		msgs = append(msgs, serializeOAIMessage(m, rep, opts))
 	}
 	out["messages"] = msgs
 
@@ -438,7 +445,7 @@ func toolCallToBlock(tc oaiToolCall, rep *LossyReport) ContentBlock {
 	return b
 }
 
-func serializeOAIMessage(m Message, rep *LossyReport) interface{} {
+func serializeOAIMessage(m Message, rep *LossyReport, opts SerializeOptions) interface{} {
 	if m.Role == oaiRoleTool {
 		msg := map[string]interface{}{"role": oaiRoleTool}
 		for _, b := range m.Blocks {
@@ -455,12 +462,16 @@ func serializeOAIMessage(m Message, rep *LossyReport) interface{} {
 
 	allText := true
 	hasToolUse := false
+	hasThinking := false
 	for _, b := range m.Blocks {
 		if b.Kind != BlockText {
 			allText = false
 		}
 		if b.Kind == BlockToolUse {
 			hasToolUse = true
+		}
+		if b.Kind == BlockThinking {
+			hasThinking = true
 		}
 	}
 
@@ -488,6 +499,8 @@ func serializeOAIMessage(m Message, rep *LossyReport) interface{} {
 				})
 				include = true
 			case BlockToolUse:
+			case BlockThinking:
+				// 是否丢失统一在下方按「最终是否真正回填」记账，避免与实际注入结果不一致。
 			default:
 				rep.Add("message.content." + b.Kind)
 			}
@@ -497,6 +510,25 @@ func serializeOAIMessage(m Message, rep *LossyReport) interface{} {
 		} else {
 			msg["content"] = nil
 		}
+	}
+
+	// assistant 历史的 thinking（Anthropic）仅在渠道声明支持时回填推理字段：
+	// DeepSeek 等 thinking 模型在多轮/tool 循环中要求回传上一轮推理内容，
+	// 丢弃会导致 400（The `reasoning_content` in the thinking mode must be passed back）；
+	// 其余 OpenAI 兼容上游可能按未知消息字段拒绝，故默认不注入。
+	injected := false
+	if opts.ReasoningContent && m.Role == oaiRoleAssistant {
+		if reasoning := blocksThinkingText(m.Blocks); reasoning != "" {
+			field := opts.reasoningFieldName()
+			msg[field] = reasoning
+			rep.Note("message.content.thinking → " + field)
+			injected = true
+		}
+	}
+	// thinking 块未被真正回填即视为丢失（未声明支持、非 assistant、thinking 文本为空三种情形），
+	// 保证损耗报告与「是否真正注入」一致，不出现「既未注入也未记 lossy」的静默丢弃。
+	if hasThinking && !injected {
+		rep.Add("message.content.thinking")
 	}
 
 	if hasToolUse {
@@ -526,6 +558,23 @@ func blocksText(blocks []ContentBlock) string {
 		if b.Kind == BlockText {
 			sb.WriteString(b.Text)
 		}
+	}
+	return sb.String()
+}
+
+// blocksThinkingText 拼接 assistant 消息中的 thinking 文本（多块按换行连接）。
+// 空白（含全空格）视为无内容，与直通路径 isNonEmptyReasoning 的 TrimSpace 判定一致，
+// 避免把空白 thinking 注入为 reasoning_content（对上游无意义且会被下游当内容计费）。
+func blocksThinkingText(blocks []ContentBlock) string {
+	var sb bytes.Buffer
+	for _, b := range blocks {
+		if b.Kind != BlockThinking || strings.TrimSpace(b.Text) == "" {
+			continue
+		}
+		if sb.Len() > 0 {
+			sb.WriteByte('\n')
+		}
+		sb.WriteString(b.Text)
 	}
 	return sb.String()
 }

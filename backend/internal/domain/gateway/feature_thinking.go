@@ -25,10 +25,11 @@ type thinkingRoundtripFeature struct {
 
 // newThinkingRoundtripFeature 依据挂载参数构造 thinking-roundtrip 特性。
 func newThinkingRoundtripFeature(params map[string]any) RequestFeature {
+	p := parseThinkingRoundtripParams(params)
 	return &thinkingRoundtripFeature{
-		enabled:      boolParam(params, "enabled", false),
-		field:        stringParam(params, "field", "reasoning_content"),
-		onlyThinking: boolParam(params, "onlyThinking", false),
+		enabled:      p.Enabled,
+		field:        p.Field,
+		onlyThinking: p.OnlyThinking,
 	}
 }
 
@@ -64,7 +65,10 @@ func (f *thinkingRoundtripFeature) RewriteRequest(req *UpstreamRequest) error {
 			continue
 		}
 		if _, exists := m[f.field]; exists {
-			continue // 已带上上游要求的字段
+			// 已带上上游要求的字段：键存在即跳过（含客户端显式传空串，保留其原始意图）。
+			// 注意与会话级推理缓存回填的差异：Backfill 把空串视为缺失并填充（见 reasoning.go），
+			// 因为空值无法满足上游「必须回传」的要求；两处判定有意不同。
+			continue
 		}
 		src, ok := reasoningSource(m, f.field)
 		if !ok {
@@ -89,10 +93,15 @@ func (f *thinkingRoundtripFeature) RewriteRequest(req *UpstreamRequest) error {
 	return nil
 }
 
+// reasoningAliases 是推理内容字段的别名集合（顺序即优先级）：reasoning_content 是 OpenAI 兼容
+// 上游的通用字段名，reasoning 是少数上游的替代名。请求侧回传（识别源字段）与响应侧捕获
+// （字段名容错）共用该集合，避免各处硬编码字段名。
+var reasoningAliases = []string{reasoningResponseField, "reasoning"}
+
 // reasoningSource 从消息中取可回传的推理内容：优先 field 之外的已知别名
 // （reasoning_content / reasoning），忽略空串与 null。
 func reasoningSource(m map[string]json.RawMessage, field string) (json.RawMessage, bool) {
-	for _, key := range []string{"reasoning_content", "reasoning"} {
+	for _, key := range reasoningAliases {
 		if key == field {
 			continue
 		}
@@ -116,8 +125,17 @@ func isNonEmptyReasoning(v json.RawMessage) bool {
 	return true
 }
 
+// isThinkingRequestBody 判断请求体是否显式处于 thinking 模式；解析失败视为否。
+func isThinkingRequestBody(body []byte) bool {
+	var m map[string]json.RawMessage
+	if json.Unmarshal(body, &m) != nil {
+		return false
+	}
+	return isThinkingRequest(m)
+}
+
 // isThinkingRequest 判断请求是否处于 thinking 模式（thinking 开启 / enable_thinking 为真 /
-// reasoning_effort 存在）。
+// reasoning_effort 存在 / openai-responses 的 reasoning.effort 存在）。
 func isThinkingRequest(m map[string]json.RawMessage) bool {
 	if raw, ok := m["thinking"]; ok {
 		var b bool
@@ -142,6 +160,21 @@ func isThinkingRequest(m map[string]json.RawMessage) bool {
 		t := bytes.TrimSpace(raw)
 		if len(t) > 0 && !bytes.Equal(t, []byte("null")) {
 			return true
+		}
+	}
+	if raw, ok := m["reasoning"]; ok {
+		// openai-responses 形状：{"reasoning":{"effort":"high",...}} 表示开启推理。
+		// 仅看 effort 键（summary 等不表达推理强度），与 reasoning_effort 同样忽略 null/空值；
+		// effort="none" 表示显式关闭推理，不算 thinking。
+		var obj map[string]json.RawMessage
+		if json.Unmarshal(raw, &obj) == nil {
+			t := bytes.TrimSpace(obj["effort"])
+			if len(t) > 0 && !bytes.Equal(t, []byte("null")) {
+				var effort string
+				if json.Unmarshal(t, &effort) != nil || !strings.EqualFold(effort, "none") {
+					return true
+				}
+			}
 		}
 	}
 	return false

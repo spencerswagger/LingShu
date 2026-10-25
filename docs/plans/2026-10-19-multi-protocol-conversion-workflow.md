@@ -43,7 +43,7 @@ verify: cd backend && go test ./internal/domain/protocolconv/ -run TestStream -v
 gate: auto
 
 - [x] **Step 6: 实现转换编排 convert.go（六方向矩阵）**
-action: 新建 `backend/internal/domain/protocolconv/convert.go`，实现 `SelectUpstreamProtocol(inbound string, supported channelprotocol.Protocols, override []string) (string, bool)`（固定优先序常量 openai-chat → anthropic-messages → openai-responses，override 有序列表优先）、`ConvertRequest(from, to string, body []byte) ([]byte, *LossyReport, error)`、`ConvertResponse(from, to string, body []byte) ([]byte, *LossyReport, error)`、以及流式事件解码/编码的导出入口 `DecodeStreamEvents` / `EncodeStreamEvents`。新建 `backend/internal/domain/protocolconv/convert_test.go`，参数化覆盖 6 个有序方向 × 请求/响应/事件三类往返。
+action: 新建 `backend/internal/domain/protocolconv/convert.go`，实现 `SelectUpstreamProtocol(inbound string, supported channelprotocol.Protocols, override []string) (string, bool)`（固定优先序常量 openai-chat → anthropic-messages → openai-responses，override 有序列表优先）、`ConvertRequest(from, to string, body []byte) ([]byte, *LossyReport, error)`（后续为承载序列化选项收敛为 `ConvertRequestWithOptions`，`ConvertRequest` 已删除）、`ConvertResponse(from, to string, body []byte) ([]byte, *LossyReport, error)`、以及流式事件解码/编码的导出入口 `DecodeStreamEvents` / `EncodeStreamEvents`。新建 `backend/internal/domain/protocolconv/convert_test.go`，参数化覆盖 6 个有序方向 × 请求/响应/事件三类往返。
 loop: until cd backend && go test ./internal/domain/protocolconv/ -run TestMatrix passes
 max_iterations: 3
 verify: cd backend && go test ./internal/domain/protocolconv/ -run TestMatrix -v

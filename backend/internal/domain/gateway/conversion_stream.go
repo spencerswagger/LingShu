@@ -49,6 +49,7 @@ func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Respon
 
 	started := false
 	sawToolCall := false
+	sawTerminal := false // 是否收到过终止事件（message_delta）：EOF 前收到过 = 正常结束，否则为流截断
 	anthropicDown := downstream == channelprotocol.ProtocolAnthropicMessages
 
 	// 下游 anthropic 的内容块状态：openBlocks 记录已开启的下游块下标；
@@ -161,6 +162,7 @@ func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Respon
 		}
 
 		if ev.Type == protocolconv.EventMessageDelta {
+			sawTerminal = true
 			if anthropicDown && !started {
 				started = true
 				if err := emit([]channelEvent{{Type: protocolconv.EventMessageStart}}); err != nil {
@@ -294,7 +296,13 @@ func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Respon
 	}
 
 	if !sawUsage {
-		return usage, rawUsageJSON(upstreamProto, rawParts), asm(), ErrUsageMissing
+		// 与 openai.go 同口径：按流的结束形态区分原因——收到过终止事件（message_delta）即正常结束
+		// （上游忽略 include_usage，内容完整，不惩罚渠道），否则视为流被截断。
+		reason := UsageMissingTruncated
+		if sawTerminal {
+			reason = UsageMissingDoneNoUsage
+		}
+		return usage, rawUsageJSON(upstreamProto, rawParts), asm(), &UsageMissingError{Reason: reason}
 	}
 	return usage, rawUsageJSON(upstreamProto, rawParts), asm(), nil
 }
