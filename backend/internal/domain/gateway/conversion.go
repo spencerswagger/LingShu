@@ -132,6 +132,10 @@ type convPlan struct {
 // 全部为空时返回 nil——纯直通且未重排的候选不新增任何键；
 // 转换时写入 converted/inbound_protocol/upstream_protocol，报告非空时再附 lossy/lossy_notes。
 func conversionAttemptFields(plan convPlan, rep *protocolconv.LossyReport) map[string]any {
+	// 纯直通且未重排：不产出任何字段，直接返回 nil（避免每次命中都白白分配 map）。
+	if !plan.converted && plan.reorder == "" {
+		return nil
+	}
 	m := make(map[string]any, 6)
 	if plan.converted {
 		m["converted"] = true

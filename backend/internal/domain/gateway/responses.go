@@ -125,7 +125,10 @@ func (p *ResponsesProvider) HandleStream(ctx context.Context, upstream *http.Res
 			trimmed := bytes.TrimSpace(line)
 			if bytes.HasPrefix(trimmed, []byte("data:")) {
 				data := bytes.TrimSpace(trimmed[len("data:"):])
-				if len(data) > 0 && !bytes.Equal(data, []byte("[DONE]")) {
+				if len(data) > 0 && bytes.Equal(data, []byte("[DONE]")) {
+					// 部分 Responses 兼容上游仍以 [DONE] 收尾：与转换泵口径一致视为正常结束。
+					sawDone = true
+				} else if len(data) > 0 {
 					var ev responsesStreamEvent
 					if json.Unmarshal(data, &ev) == nil {
 						switch ev.Type {
@@ -164,15 +167,8 @@ func (p *ResponsesProvider) HandleStream(ctx context.Context, upstream *http.Res
 	}
 
 	if !sawUsage {
-		reason := UsageMissingTruncated
-		switch {
-		case sawDone:
-			reason = UsageMissingDoneNoUsage
-		case sawError:
-			reason = UsageMissingErrorFrame
-		}
 		return usage, rawUsageJSON(p.Name(), rawParts), responsesAssistant(content),
-			&UsageMissingError{Reason: reason, Detail: errorFrame}
+			&UsageMissingError{Reason: usageMissingReasonOf(sawDone, sawError), Detail: errorFrame}
 	}
 	return usage, rawUsageJSON(p.Name(), rawParts), responsesAssistant(content), nil
 }

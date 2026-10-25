@@ -1,7 +1,9 @@
 package gateway
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -332,6 +334,126 @@ func TestStreamConversionDoneNoUsageNotPunished(t *testing.T) {
 	}
 	if len(h.chans.feeds) != 0 {
 		t.Fatalf("正常结束无 usage 不应计入渠道健康失败, got %+v", h.chans.feeds)
+	}
+}
+
+// 转换泵下游写失败：必须保持 failed/error 调用日志，且不得回喂渠道健康失败。
+// 若把泵内写错误改回直接返回原始 werr（不经 wrapDownstreamWrite），handler 会误判为上游故障
+// 并回喂失败，本用例即变红。
+func TestStreamConversionDownstreamWriteFailure(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(
+			"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"usage\":{\"input_tokens\":10}}}\n\n" +
+				"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n" +
+				"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n" +
+				"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"))
+	}))
+	defer upstream.Close()
+
+	h := build(t, upstream.URL)
+	// openai-chat 入站 → 模型仅可达 anthropic-messages → 走转换泵。
+	h.chans.mrt.Model.Protocols = channelprotocol.Protocols{channelprotocol.ProtocolAnthropicMessages: {}}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"gpt-4","stream":true,"messages":[{"role":"user","content":"ping"}]}`))
+	req.Header.Set("Authorization", "Bearer sk-gw-t")
+	req.Header.Set("Content-Type", "application/json")
+	h.gw.Handler().ServeHTTP(failWriteRecorder{httptest.NewRecorder()}, req)
+
+	if len(h.chans.feeds) != 0 {
+		t.Fatalf("下游写失败不得回喂渠道健康（无论成功或失败）, got %+v", h.chans.feeds)
+	}
+	if len(h.clogs.inserted) == 0 {
+		t.Fatalf("缺少调用日志")
+	}
+	last := h.clogs.inserted[len(h.clogs.inserted)-1]
+	if last.Status != "failed" || last.RespKind != "error" {
+		t.Fatalf("下游写失败仍应保持 failed/error 调用日志, got status=%q resp_kind=%q", last.Status, last.RespKind)
+	}
+	if !strings.Contains(last.ErrorMessage, "下游写失败") {
+		t.Fatalf("下游写失败应使用区分于上游中断的归因文案, got %q", last.ErrorMessage)
+	}
+}
+
+// 转换泵的流内 error 归因：openai-responses 的 response.failed 与 anthropic 的 error 事件
+// 都应返回 error_frame（计入渠道健康惩罚）；端到端调用日志记 failed，计费按估算成功。
+func TestStreamConversionErrorFrame(t *testing.T) {
+	tests := []struct {
+		name          string
+		upstreamProto string
+		sse           string
+		wantDetail    string
+	}{
+		{
+			name:          "openai-responses 上游 response.failed",
+			upstreamProto: channelprotocol.ProtocolOpenAIResponses,
+			sse: "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_error\"," +
+				"\"message\":\"boom\"}}}\n\n",
+			wantDetail: "server_error: boom",
+		},
+		{
+			name:          "anthropic 上游 error 事件",
+			upstreamProto: channelprotocol.ProtocolAnthropicMessages,
+			sse: "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m\"}}\n\n" +
+				"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"busy\"}}\n\n",
+			wantDetail: "busy",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// 泵级：归因与惩罚。
+			pg := build(t, "http://unused")
+			_, _, _, err := pg.gw.pumpConvertedStream(context.Background(), sseResponse(tt.sse),
+				channelprotocol.ProtocolOpenAIChat, tt.upstreamProto, &protocolconv.LossyReport{}, httptest.NewRecorder())
+			if !errors.Is(err, ErrUsageMissing) {
+				t.Fatalf("want ErrUsageMissing, got %v", err)
+			}
+			if got := usageMissingReason(err); got != UsageMissingErrorFrame {
+				t.Fatalf("reason want %q, got %q", UsageMissingErrorFrame, got)
+			}
+			if !usageMissingPunishable(usageMissingReason(err)) {
+				t.Fatalf("error_frame 应计入渠道健康惩罚")
+			}
+			var ue *UsageMissingError
+			if !errors.As(err, &ue) || ue.Detail != tt.wantDetail {
+				t.Fatalf("detail want %q, got %+v", tt.wantDetail, ue)
+			}
+
+			// 端到端：渠道健康与调用日志。
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(tt.sse))
+			}))
+			defer upstream.Close()
+
+			h := build(t, upstream.URL)
+			h.chans.mrt.Model.Protocols = channelprotocol.Protocols{tt.upstreamProto: {}}
+			rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t",
+				`{"model":"gpt-4","stream":true,"messages":[{"role":"user","content":"ping"}]}`)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("want 200 (stream already responded), got %d", rec.Code)
+			}
+			if len(h.chans.feeds) != 1 || h.chans.feeds[0].fb.IsSuccess {
+				t.Fatalf("error_frame 应计入渠道健康失败, got %+v", h.chans.feeds)
+			}
+			if len(h.clogs.inserted) == 0 {
+				t.Fatalf("缺少调用日志")
+			}
+			last := h.clogs.inserted[len(h.clogs.inserted)-1]
+			if last.Status != "failed" || last.RespKind != "stream" {
+				t.Fatalf("error_frame 应记 failed/stream 调用日志, got status=%q resp_kind=%q", last.Status, last.RespKind)
+			}
+			if !strings.Contains(last.ErrorMessage, "上游流式响应中断") {
+				t.Fatalf("调用日志应体现上游流式中断, got %q", last.ErrorMessage)
+			}
+			// usage 缺失按可见内容估算计费：账单不得是 failed。
+			if len(h.billing.reqs) != 1 || h.billing.reqs[0].Fail {
+				t.Fatalf("usage 缺失应按估算计费（成功账单）, got %+v", h.billing.reqs)
+			}
+		})
 	}
 }
 

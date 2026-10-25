@@ -177,15 +177,8 @@ func (p *AnthropicProvider) HandleStream(ctx context.Context, upstream *http.Res
 	}
 
 	if !sawUsage {
-		reason := UsageMissingTruncated
-		switch {
-		case sawStop:
-			reason = UsageMissingDoneNoUsage
-		case sawError:
-			reason = UsageMissingErrorFrame
-		}
 		return usage, rawUsageJSON(p.Name(), rawParts), responsesAssistant(content),
-			&UsageMissingError{Reason: reason, Detail: errorFrame}
+			&UsageMissingError{Reason: usageMissingReasonOf(sawStop, sawError), Detail: errorFrame}
 	}
 	return usage, rawUsageJSON(p.Name(), rawParts), responsesAssistant(content), nil
 }

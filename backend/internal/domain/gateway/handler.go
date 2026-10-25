@@ -1596,14 +1596,20 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		hardErr := herr != nil && !clientGone && !usageMissing
 		if hardErr {
 			out.interrupted = true // 语义上失败：内容被截断，请求级结论不得记为"成功"
+			// 下游写失败不是上游故障：kind 保持 stream_interrupted（响应已部分下发不可撤回），
+			// 但归因文案必须区分于「上游读侧中断」，避免把客户端断开误诊成上游故障。
+			reasonText := "流式传输中断"
+			if isDownstreamWriteErr(herr) {
+				reasonText = "下游写失败（传输错误或客户端断开）"
+			}
 			g.logError(rt.Channel.ID, "stream handle failed", herr)
 			g.logUpstreamErr(ctx, slog.LevelError, "stream interrupted", endpoint, ureq.Protocol, model, token, routeRes,
 				diagFromRequest(req, ureq.Protocol, ureq.Cred),
 				errInfo{kind: "stream_interrupted", stage: stage, status: up.StatusCode, attempt: attempt,
-					reason: "流式传输中断：" + herr.Error(), sessionID: sessionID, durationMs: *dur})
-			bid := g.recordFailure(billCtx, routeRes, model, token, pricingMode, sessionID, sessionName, "流式传输中断", dur)
+					reason: reasonText + "：" + herr.Error(), sessionID: sessionID, durationMs: *dur})
+			bid := g.recordFailure(billCtx, routeRes, model, token, pricingMode, sessionID, sessionName, reasonText, dur)
 			g.writeCallLogUsage(billCtx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-				"error", string(assistantMsg), "failed", "流式传输中断", upstreamUsage, dur, ft.firstTokenMs(start), dec("流式传输中断"))
+				"error", string(assistantMsg), "failed", reasonText, upstreamUsage, dur, ft.firstTokenMs(start), dec(reasonText))
 		}
 		if usageAnomaly {
 			out.interrupted = true // 上游流被截断：内容不完整，请求级结论不得记为"成功"
@@ -1646,7 +1652,8 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		// 渠道健康回喂：上游读侧中断计入密钥健康失败（窗口错误率达标才 DRAIN，探针可自愈），
 		// 不再「单次 usage 缺失即禁用整条渠道」；正常结束无 usage / 客户端断开不回喂失败。
 		// 下游写失败（客户端断开/传输错误）不是上游故障，既不回喂失败（健康上游会被误判为故障），
-		// 也不回喂成功（本次流并未完整送达），只由 interrupted 与调用日志留痕。
+		// 也不回喂成功（本次流并未完整送达），只由 interrupted 与调用日志留痕，
+		// 且失败归因文案为「下游写失败（传输错误或客户端断开）」，与上游读侧中断区分。
 		switch {
 		case isDownstreamWriteErr(herr):
 		case usageAnomaly, hardErr:

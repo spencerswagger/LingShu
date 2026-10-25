@@ -888,6 +888,65 @@ func TestServeCompletionsStreamDoesNotInjectIncludeUsage(t *testing.T) {
 	}
 }
 
+// duplicateJSONKeys 逐 token 扫描 JSON，返回所有对象层级中重复出现的键。
+// map 反序列化会静默保留最后一个同名键，无法发现重复；这里按 token 流校验，供改写结果断言使用。
+func duplicateJSONKeys(t *testing.T, raw []byte) []string {
+	t.Helper()
+	type frame struct {
+		isObject bool
+		keys     map[string]bool
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var stack []*frame
+	var dups []string
+	expectKey := false
+	for {
+		tok, err := dec.Token()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("扫描 JSON token 失败: %v (%s)", err, raw)
+		}
+		switch v := tok.(type) {
+		case json.Delim:
+			switch v {
+			case '{':
+				stack = append(stack, &frame{isObject: true, keys: map[string]bool{}})
+				expectKey = true
+			case '[':
+				stack = append(stack, &frame{})
+				expectKey = false
+			case '}', ']':
+				if len(stack) > 0 {
+					stack = stack[:len(stack)-1]
+				}
+				expectKey = len(stack) > 0 && stack[len(stack)-1].isObject
+			}
+		case string:
+			if len(stack) == 0 {
+				continue
+			}
+			top := stack[len(stack)-1]
+			if top.isObject && expectKey {
+				if top.keys[v] {
+					dups = append(dups, v)
+				}
+				top.keys[v] = true
+				expectKey = false
+			} else {
+				expectKey = top.isObject
+			}
+		default:
+			if len(stack) > 0 && stack[len(stack)-1].isObject {
+				expectKey = true
+			}
+		}
+	}
+	return dups
+}
+
 // ensureIncludeUsage 的重构契约：已是 true 时原样返回（快路径，不做任何解析/重序列化）；
 // include_usage=false 仍改写为 true；无 stream_options 时只插入新键、其余字节保持不变。
 func TestEnsureIncludeUsage(t *testing.T) {
@@ -931,6 +990,37 @@ func TestEnsureIncludeUsage(t *testing.T) {
 			wantInclude: true, wantOptions: map[string]any{"foo": "bar"},
 		},
 		{
+			name:     "stream_options 为 null 时重建为单键",
+			body:     `{"model":"m","stream":true,"stream_options":null}`,
+			protocol: "openai-chat", endpoint: EndpointChatCompletions,
+			wantInclude: true,
+		},
+		{
+			name:     "stream_options 为空对象时注入",
+			body:     `{"model":"m","stream":true,"stream_options":{}}`,
+			protocol: "openai-chat", endpoint: EndpointChatCompletions,
+			wantInclude: true,
+		},
+		{
+			name: "嵌套对象里的 include_usage 不误判",
+			// 反例：include_usage=true 不在 stream_options 内，必须注入（否则平台拿不到 usage）。
+			body:     `{"stream":true,"stream_options":{},"extra":{"include_usage":true}}`,
+			protocol: "openai-chat", endpoint: EndpointChatCompletions,
+			wantInclude: true,
+		},
+		{
+			name:     "messages 正文含同名字面量不误判",
+			body:     `{"model":"m","stream":true,"messages":[{"role":"user","content":"please set stream_options and include_usage"}]}`,
+			protocol: "openai-chat", endpoint: EndpointChatCompletions,
+			wantInclude: true,
+		},
+		{
+			name:     "非法 JSON 原样返回",
+			body:     `{"stream":true,`,
+			protocol: "openai-chat", endpoint: EndpointChatCompletions,
+			wantSame: true,
+		},
+		{
 			name:     "非流式不改写",
 			body:     `{"stream":false}`,
 			protocol: "openai-chat", endpoint: EndpointChatCompletions,
@@ -963,6 +1053,9 @@ func TestEnsureIncludeUsage(t *testing.T) {
 			}
 			if err := json.Unmarshal(got, &body); err != nil {
 				t.Fatalf("改写结果非法 JSON: %v (%s)", err, got)
+			}
+			if dups := duplicateJSONKeys(t, got); len(dups) > 0 {
+				t.Fatalf("改写结果不得含重复键 %v: %s", dups, got)
 			}
 			if body.StreamOptions["include_usage"] != tt.wantInclude {
 				t.Fatalf("include_usage want %v, got %s", tt.wantInclude, got)

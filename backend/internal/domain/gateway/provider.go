@@ -129,6 +129,20 @@ func usageMissingPunishable(reason string) bool {
 	}
 }
 
+// usageMissingReasonOf 统一各协议适配器的 usage 缺失归因：优先采信「收到终止标记」
+// （正常结束但上游忽略 include_usage），其次「流内 error」，其余按流被截断处理。
+// 各适配器的 sawDone/sawError 语义由自身协议定义，归因口径保持一致。
+func usageMissingReasonOf(sawDone, sawError bool) string {
+	switch {
+	case sawDone:
+		return UsageMissingDoneNoUsage
+	case sawError:
+		return UsageMissingErrorFrame
+	default:
+		return UsageMissingTruncated
+	}
+}
+
 // Provider 抽象一个上游基础协议适配器。基础协议为代码固定的 3 个：
 // openai-chat / openai-responses / anthropic-messages。
 //

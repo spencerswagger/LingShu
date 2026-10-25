@@ -26,7 +26,9 @@ type canonicalToolCall struct {
 // pumpConvertedStream 是跨协议流式转换泵：把上游 SSE 逐帧解码为规范事件，按入站协议重新编码后下发。
 // 与各 Provider.HandleStream 的返回契约一致（usage、上游原始 usage JSONB、assistant 消息 JSON、error）：
 // 上游无 usage 时返回 UsageMissingError，并按流结束形态区分原因（[DONE]/终止事件 = 正常结束无 usage；
-// 未收到终止标记即 EOF = 截断；流内 error 帧 = 上游报错）。
+// 未收到终止标记即 EOF = 截断）。流内 error 帧能否归因为 error_frame 取决于上游协议解码器：
+// anthropic / openai-responses 有 error 映射；openai-chat 无 error 映射，error 帧会落入 truncated
+// （两类原因都计入渠道健康惩罚，仅归因文案不同）。
 func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Response, inboundProto, upstreamProto string, lossy *protocolconv.LossyReport, w http.ResponseWriter) (billing.Usage, []byte, []byte, error) {
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
@@ -320,15 +322,8 @@ func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Respon
 	}
 
 	if !sawUsage {
-		reason := UsageMissingTruncated
-		switch {
-		case sawDone:
-			reason = UsageMissingDoneNoUsage
-		case sawError:
-			reason = UsageMissingErrorFrame
-		}
 		return usage, rawUsageJSON(upstreamProto, rawParts), asm(),
-			&UsageMissingError{Reason: reason, Detail: errorFrame}
+			&UsageMissingError{Reason: usageMissingReasonOf(sawDone, sawError), Detail: errorFrame}
 	}
 	return usage, rawUsageJSON(upstreamProto, rawParts), asm(), nil
 }
