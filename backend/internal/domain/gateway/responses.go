@@ -149,7 +149,10 @@ func (p *ResponsesProvider) HandleStream(ctx context.Context, upstream *http.Res
 							}
 						case "response.failed":
 							sawError = true
-							errorFrame = errorFrameDetail(ev.Response.Error)
+							// 摘要首个非空优先：后续空 error 负载不得清掉先前的诊断信息。
+							if d := errorFrameDetail(ev.Response.Error); d != "" && errorFrame == "" {
+								errorFrame = d
+							}
 						}
 					}
 				}

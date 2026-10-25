@@ -28,10 +28,14 @@ type canonicalToolCall struct {
 // 上游无 usage 时返回 UsageMissingError，归因由 usageMissingReasonOf 统一裁决，
 // error 帧优先于终止标记（error_frame > done_no_usage > truncated）——上游先报错再补 [DONE]/终止事件时，
 // 收口标记不能把失败洗成「正常结束无 usage」，否则渠道惩罚会丢失。
-// 流内 error 帧的探测方式取决于上游协议：anthropic 由 codec 映射为 EventError；
-// openai-responses 在 codec 中没有对应映射，由泵内 responsesFailedFrame 按原文探测（空 error 负载也算）；
-// openai-chat 无 error 映射，error 帧会落入 truncated（truncated 与 error_frame 都计入渠道健康惩罚，
-// 仅归因文案不同）。
+// 流内 error 帧的探测方式取决于上游协议：
+//   - anthropic 由 codec 映射为 EventError，泵内据此置 sawError；
+//   - openai-responses 在 codec 中没有对应映射，由泵内 responsesFailedFrame 按原文探测 response.failed；
+//   - openai-chat 的 codec DecodeEvent 没有 error 分支（error 帧解码为空事件），由泵内 openAIChatErrorFrame
+//     按顶层 error 键探测。
+//
+// 三种方式都以「帧本身是 error」置位 sawError，空 error 负载（{}）同样算，摘要可能为空串；
+// 因此不能靠摘要是否为空判断失败。
 func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Response, inboundProto, upstreamProto string, lossy *protocolconv.LossyReport, w http.ResponseWriter) (billing.Usage, []byte, []byte, error) {
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
@@ -52,6 +56,7 @@ func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Respon
 	var errorFrame string          // error 帧摘要（诊断用）
 	var rawParts []json.RawMessage // 上游原始 usage 分片（携带 usage 的事件原文）
 	upstreamResponses := channelprotocol.Canonical(upstreamProto) == channelprotocol.ProtocolOpenAIResponses
+	upstreamChat := channelprotocol.Canonical(upstreamProto) == channelprotocol.ProtocolOpenAIChat
 
 	var content, reasoning bytes.Buffer
 	toolCalls := map[int]*canonicalToolCall{}
@@ -281,7 +286,16 @@ func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Respon
 							if failed, detail := responsesFailedFrame(payload); failed {
 								// 只要出现 response.failed 就置位；error 负载为空不影响失败判定。
 								sawError = true
-								if detail != "" {
+								// 摘要首个非空优先：后续空负载不得清掉先前的诊断信息。
+								if detail != "" && errorFrame == "" {
+									errorFrame = detail
+								}
+							}
+						} else if upstreamChat {
+							if failed, detail := openAIChatErrorFrame(payload); failed {
+								// 顶层 error 键存在且非 null 即为失败帧，{"error":{}} 摘要为空也须置位。
+								sawError = true
+								if detail != "" && errorFrame == "" {
 									errorFrame = detail
 								}
 							}
@@ -355,6 +369,26 @@ func responsesFailedFrame(payload []byte) (bool, string) {
 	}
 	if d := errorFrameDetail(probe.Response.Error); d != "" {
 		return true, d
+	}
+	return true, errorFrameDetail(probe.Error)
+}
+
+// openAIChatErrorFrame 按原文探测 openai-chat 上游的顶层 error 帧：返回「是否出现 error 帧」与错误摘要。
+// openai-chat codec 的 DecodeEvent 没有 error 分支，该帧会解码为空事件，若不在此按原文探测，
+// 随后的 [DONE] 就会把失败归因成 done_no_usage（不惩罚渠道、调用日志记 completed）。
+// 判定只看顶层 error 键是否存在且非 null：{"error":{}} 也算失败帧，此时摘要为空串，
+// 调用方不得用摘要是否为空反推失败。
+func openAIChatErrorFrame(payload []byte) (bool, string) {
+	// 先按字节预筛：绝大多数正常帧不含 error 键，避免为每帧多做一次反序列化。
+	if !bytes.Contains(payload, []byte("\"error\"")) {
+		return false, ""
+	}
+	var probe struct {
+		Error json.RawMessage `json:"error"`
+	}
+	// isNullRaw 同时覆盖「键缺失」（RawMessage 为 nil）与显式 null。
+	if json.Unmarshal(payload, &probe) != nil || isNullRaw(probe.Error) {
+		return false, ""
 	}
 	return true, errorFrameDetail(probe.Error)
 }

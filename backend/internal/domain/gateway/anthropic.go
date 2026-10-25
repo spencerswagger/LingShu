@@ -135,7 +135,10 @@ func (p *AnthropicProvider) HandleStream(ctx context.Context, upstream *http.Res
 							sawStop = true
 						case "error":
 							sawError = true
-							errorFrame = errorFrameDetail(ev.Error)
+							// 摘要首个非空优先：后续空 error 负载不得清掉先前的诊断信息。
+							if d := errorFrameDetail(ev.Error); d != "" && errorFrame == "" {
+								errorFrame = d
+							}
 						case "message_start":
 							if len(ev.Message.Usage) > 0 {
 								if u, uerr := parseAnthropicUsage(ev.Message.Usage); uerr == nil {

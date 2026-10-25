@@ -474,6 +474,86 @@ func TestStreamConversionErrorFrame(t *testing.T) {
 	}
 }
 
+// 转换泵 + openai-chat 上游：openai-chat codec 的 DecodeEvent 没有 error 分支（error 帧解码为空事件），
+// 泵须按顶层 error 键原文探测，否则随后的 [DONE] 会把失败归因成 done_no_usage
+// （不回喂渠道健康、调用日志记 completed、下游收到空 200）。
+func TestStreamConversionErrorFrameOpenAIChatUpstream(t *testing.T) {
+	tests := []struct {
+		name       string
+		sse        string
+		wantDetail string
+	}{
+		{
+			// 修复前：error 帧解码为空事件，[DONE] 归因 done_no_usage → 不惩罚渠道（红）。
+			name:       "typed error 后补 [DONE]",
+			sse:        "data: {\"error\":{\"type\":\"server_error\",\"message\":\"boom\"}}\n\ndata: [DONE]\n\n",
+			wantDetail: "server_error: boom",
+		},
+		{
+			// 修复前：空 error 负载摘要为空，同样被 [DONE] 洗成 done_no_usage（红）。
+			name:       "空 error 后补 [DONE]",
+			sse:        "data: {\"error\":{}}\n\ndata: [DONE]\n\n",
+			wantDetail: "",
+		},
+		{
+			// 行为改变：修复前无 [DONE] 归因 truncated，现在按 error 帧归因 error_frame；
+			// 两者都惩罚渠道，仅诊断口径更准确。
+			name:       "仅 error 帧无 [DONE]",
+			sse:        "data: {\"error\":{\"type\":\"server_error\",\"message\":\"boom\"}}\n\n",
+			wantDetail: "server_error: boom",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// 泵级：归因与惩罚。
+			pg := build(t, "http://unused")
+			_, _, _, err := pg.gw.pumpConvertedStream(context.Background(), sseResponse(tt.sse),
+				channelprotocol.ProtocolOpenAIChat, channelprotocol.ProtocolOpenAIChat,
+				&protocolconv.LossyReport{}, httptest.NewRecorder())
+			if !errors.Is(err, ErrUsageMissing) {
+				t.Fatalf("want ErrUsageMissing, got %v", err)
+			}
+			if got := usageMissingReason(err); got != UsageMissingErrorFrame {
+				t.Fatalf("reason want %q, got %q", UsageMissingErrorFrame, got)
+			}
+			if !usageMissingPunishable(usageMissingReason(err)) {
+				t.Fatalf("error_frame 应计入渠道健康惩罚")
+			}
+			var ue *UsageMissingError
+			if !errors.As(err, &ue) || ue.Detail != tt.wantDetail {
+				t.Fatalf("detail want %q, got %+v", tt.wantDetail, ue)
+			}
+
+			// 端到端：anthropic 入站 → 模型仅可达 openai-chat → 转换泵真正被走到。
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(tt.sse))
+			}))
+			defer upstream.Close()
+
+			h := build(t, upstream.URL)
+			h.chans.mrt.Model.Protocols = channelprotocol.Protocols{channelprotocol.ProtocolOpenAIChat: {}}
+			rec := postWithHeaders(t, h.gw, "/v1/messages",
+				`{"model":"gpt-4","stream":true,"max_tokens":100,"messages":[{"role":"user","content":"ping"}]}`,
+				map[string]string{"x-api-key": "sk-gw-t"})
+			if rec.Code != http.StatusOK {
+				t.Fatalf("want 200 (stream already responded), got %d", rec.Code)
+			}
+			if len(h.chans.feeds) != 1 || h.chans.feeds[0].fb.IsSuccess {
+				t.Fatalf("error_frame 应计入渠道健康失败, got %+v", h.chans.feeds)
+			}
+			if len(h.clogs.inserted) == 0 {
+				t.Fatalf("缺少调用日志")
+			}
+			last := h.clogs.inserted[len(h.clogs.inserted)-1]
+			if last.Status != "failed" || last.RespKind != "stream" {
+				t.Fatalf("error_frame 应记 failed/stream 调用日志, got status=%q resp_kind=%q", last.Status, last.RespKind)
+			}
+		})
+	}
+}
+
 // TestStreamConversionMalformedFrameObserved 断言转换泵遇上游畸形帧时不再静默丢弃：
 // 流仍完整完成（200 + message_stop），且畸形帧经损耗诊断随调用日志决策轨迹的 lossy_notes 落痕。
 func TestStreamConversionMalformedFrameObserved(t *testing.T) {

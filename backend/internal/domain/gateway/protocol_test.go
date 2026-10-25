@@ -262,6 +262,50 @@ func TestHandleStreamUsageMissingReason(t *testing.T) {
 	}
 }
 
+// 直通路径的 error 帧摘要按「首个非空优先」聚合：上游可能先给出带详情的高价值 error，
+// 再补一个空负载 error 收尾；后者若无条件覆盖会把诊断信息清空。
+// 修复前 responses/anthropic 直接赋值，空摘要会清掉前一条，本用例即红。
+func TestHandleStreamErrorFrameKeepsFirstDetail(t *testing.T) {
+	tests := []struct {
+		name       string
+		provider   Provider
+		body       string
+		wantDetail string
+	}{
+		{
+			name:     "responses 连续 failed",
+			provider: NewResponsesProvider(),
+			body: "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_error\"," +
+				"\"message\":\"boom\"}}}\n\n" +
+				"data: {\"type\":\"response.failed\",\"response\":{\"error\":{}}}\n\n",
+			wantDetail: "server_error: boom",
+		},
+		{
+			name:     "anthropic 连续 error",
+			provider: NewAnthropicProvider(),
+			body: "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"," +
+				"\"message\":\"busy\"}}\n\n" +
+				"event: error\ndata: {\"type\":\"error\",\"error\":{}}\n\n",
+			wantDetail: "overloaded_error: busy",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, _, err := tt.provider.HandleStream(context.Background(), sseResponse(tt.body), httptest.NewRecorder())
+			if !errors.Is(err, ErrUsageMissing) {
+				t.Fatalf("want ErrUsageMissing, got %v", err)
+			}
+			if got := usageMissingReason(err); got != UsageMissingErrorFrame {
+				t.Fatalf("reason want %q, got %q", UsageMissingErrorFrame, got)
+			}
+			var ue *UsageMissingError
+			if !errors.As(err, &ue) || ue.Detail != tt.wantDetail {
+				t.Fatalf("detail want %q, got %+v", tt.wantDetail, ue)
+			}
+		})
+	}
+}
+
 // failWriteRecorder 包装 ResponseRecorder：响应头照常可写，但每次 Write 都失败（模拟下游断开）。
 type failWriteRecorder struct {
 	*httptest.ResponseRecorder
