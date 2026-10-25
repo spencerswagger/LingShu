@@ -49,6 +49,7 @@ const stats = ref<BillingStats>({
   CacheReadTokens: 0,
   BusyRequests: 0,
   BusyTokens: 0,
+  BusyDurationMS: 0,
   BusyRPM: 0,
   BusyTPM: 0,
 })
@@ -374,16 +375,22 @@ function tokenRate(row: AdminBillingItem): string {
   return `${Math.round((out / gen) * 1000)} tok/s`
 }
 
-// 统计栏：平均 RPM/TPM 采用后端忙时口径（分子只算有耗时的请求，分母是这批请求的耗时之和）。
-// 有数据即显示：BusyRequests>0 且耗时合计>0 才出数，否则显示 —；
-// 样本少（请求数 < 20 或耗时合计 < 30 秒）时照常显示数值，只在旁边灰字标注「样本较少」。
+// 统计栏：平均 RPM/TPM 采用后端忙时口径（分子只算成功且带耗时的请求，分母 BusyDurationMS 与之同源）。
+// 有数据即显示：BusyRequests>0 且忙时耗时>0 才出数，否则显示 —；
+// 样本少（成功请求数 < 20 或忙时耗时 < 30 秒）时照常显示数值，只在旁边灰字标注「样本较少」。
+// 说明：这是「忙时处理速率」，与渠道限流用的 RPM/TPM 不是同一个口径，tooltip 里点明。
+const BUSY_RATE_TIP = '按成功请求处理耗时折算（≈60÷平均耗时），与渠道限流 '
+
+function busyRateTip(kind: 'RPM' | 'TPM'): string {
+  return `${BUSY_RATE_TIP}${kind} 不同口径`
+}
 function busyRateReady(): boolean {
   const s = stats.value
-  return (s.BusyRequests || 0) > 0 && (s.DurationTotalMS || 0) > 0
+  return (s.BusyRequests || 0) > 0 && (s.BusyDurationMS || 0) > 0
 }
 const lowSample = computed(() => {
   const s = stats.value
-  return (s.BusyRequests || 0) < 20 || (s.DurationTotalMS || 0) < 30000
+  return (s.BusyRequests || 0) < 20 || (s.BusyDurationMS || 0) < 30000
 })
 function avgRPM(): string {
   if (!busyRateReady()) return '—'
@@ -463,14 +470,14 @@ function sessionLabel(s: AdminSession): string {
         <span class="stat-value">{{ cacheHitRate }}</span>
       </div>
       <div class="stat">
-        <span class="stat-label" title="每分钟平均请求数">平均 RPM</span>
+        <span class="stat-label" :title="`每分钟平均请求数；${busyRateTip('RPM')}`">平均 RPM</span>
         <span class="stat-line">
           <span class="stat-value">{{ avgRPM() }}</span>
           <span v-if="busyRateReady() && lowSample" class="stat-note">样本较少</span>
         </span>
       </div>
       <div class="stat">
-        <span class="stat-label" title="每分钟平均 Token 数">平均 TPM</span>
+        <span class="stat-label" :title="`每分钟平均 Token 数；${busyRateTip('TPM')}`">平均 TPM</span>
         <span class="stat-line">
           <span class="stat-value">{{ avgTPM() }}</span>
           <span v-if="busyRateReady() && lowSample" class="stat-note">样本较少</span>

@@ -188,8 +188,8 @@ const kpiCards = computed<KpiCard[]>(() => {
   const cacheRead = data.value?.Usage.Total.CacheRead ?? 0
   const totalInput = totalIn + cacheRead
   const cacheHit = totalInput > 0 ? cacheRead / totalInput : 0
-  // 吞吐量（RPM/TPM）为忙时口径，后端已按「有耗时请求的处理时长之和」折算。
-  // 有数据即显示（BusyRequests > 0 且总耗时 > 0）；样本少时只在副标灰字标注，不做硬门槛。
+  // 吞吐量（RPM/TPM）为忙时口径：分子 BusyRequests、分母 SumDurationMS 都只取「成功且带耗时」的请求。
+  // 有数据即显示（BusyRequests > 0 且忙时耗时 > 0）；样本少时只在副标灰字标注，不做硬门槛。
   const throughputReady = !!k && (k.BusyRequests ?? 0) > 0 && (k.SumDurationMS ?? 0) > 0
   const throughputLowSample = !!k && ((k.BusyRequests ?? 0) < 20 || (k.SumDurationMS ?? 0) < 30000)
   return [
@@ -251,7 +251,7 @@ const kpiCards = computed<KpiCard[]>(() => {
         ? `平均 ${(k?.RPM ?? 0).toFixed(2)} RPM${throughputLowSample ? ' · 样本较少' : ''}`
         : '-',
       subMuted: throughputReady && throughputLowSample,
-      tip: '忙时口径：按有耗时请求的处理时长折算的每分钟速率；请求数 < 20 或总耗时 < 30 秒时仅标注样本较少',
+      tip: '按成功请求处理耗时折算（≈60÷平均耗时），与渠道限流 RPM 不同口径；成功请求数 < 20 或耗时 < 30 秒时仅标注样本较少',
       tone: 'primary',
       icon: TrendCharts,
     },

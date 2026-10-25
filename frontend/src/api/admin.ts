@@ -903,7 +903,8 @@ export function listBillings(params: Record<string, unknown> = {}, base = '/admi
 }
 // 账单筛选聚合统计（与列表同 filter）：请求数/总积分/总 token/总耗时（统计栏用）。
 // InputTokens=纯输入（不含缓存读）总量，CacheReadTokens=缓存读命中量（缓存命中率 = 缓存读 ÷ (输入+缓存读)）。
-// Busy* 为忙时口径：分子只算有耗时的请求、分母为这批请求的耗时之和；DurationTotalMS 为 0 时 BusyRPM/BusyTPM 返回 0。
+// Busy* 为忙时口径：分子只算成功且带耗时的请求，分母 BusyDurationMS 为同批请求的耗时之和（严格同源）；
+// BusyDurationMS 为 0 时 BusyRPM/BusyTPM 返回 0。DurationTotalMS 为全部请求（含失败无耗时）的耗时合计。
 export interface BillingStats {
   Requests: number
   CreditsTotal: number
@@ -913,6 +914,7 @@ export interface BillingStats {
   CacheReadTokens: number
   BusyRequests: number
   BusyTokens: number
+  BusyDurationMS: number
   BusyRPM: number
   BusyTPM: number
 }
