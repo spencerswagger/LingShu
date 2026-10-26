@@ -133,6 +133,7 @@ func (s *Server) routes() {
 	admin.HandleFunc("GET /api/v1/admin/cost/stats", d.Console.HandleCostStats)
 	admin.HandleFunc("GET /api/v1/admin/cost/defaults", d.Console.HandleCostDefaults)
 	admin.HandleFunc("GET /api/v1/admin/cost/curves", d.Console.HandleCostCurves)
+	admin.HandleFunc("GET /api/v1/admin/cost/pricing-curve", d.Console.HandleCostPricingCurve)
 	admin.HandleFunc("GET /api/v1/admin/cost/session/{id}", d.Console.HandleCostSession)
 
 	// 渠道协议（channel_protocols·可复用接入模板）

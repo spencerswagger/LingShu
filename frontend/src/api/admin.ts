@@ -1118,13 +1118,19 @@ export function runSync() {
 }
 
 // ===== 成本（只读；字段名 = 后端 Go 结构体字段名）=====
-// 渠道 × 内部模型 维度的成本统计行：成本/售价（积分）、三段 token 与派生比率。
+// 成本统计行：按「当前实体」（渠道 × 内部模型 × 对外模型）聚合。
+// EntityKey 是稳定实体键（`cm:<channel_model_id>` 或 `name:<文本>#<内部模型ID>`），直接用作前端 row-key。
+// ExternalModelName 是「展示名」（解析成功取当前对外模型名，否则原文）；SnapshotNames 为历史上出现过的文本快照。
 // CacheHitRate 为 0~1 比率（缓存读 ÷ (输入+缓存读)）；InputOutputRatio = 输入 ÷ 输出。
 export interface CostStatRow {
+  EntityKey: string
+  ChannelModelID: number
+  ExternalModelID: number
   ChannelID: number
   ChannelName: string
   InternalModelID: string
   ExternalModelName: string
+  SnapshotNames: string[]
   CostCredits: number
   SaleCredits: number
   Requests: number
@@ -1182,9 +1188,16 @@ export function getCostCurves(params: {
 }) {
   return http.get<CostCurvesData, ApiRes<CostCurvesData>>('/admin/cost/curves', { params })
 }
-// 会话逐轮成本点（取历史实际 cost_credits / credits_consumed）
+// 会话逐轮成本点（取历史实际 cost_credits / credits_consumed，**含失败轮**）
+// 两个序号刻意分开：
+//   - Turn   成功调用序号（1..N），失败轮为 0 —— 老字段，兼容用；
+//   - TurnNo 时间线序号（1..M，含失败轮）—— 前端 x 轴用这个，失败轮占位、轴不断裂。
+// 失败轮 Status='failed'、Failed=true、金额恒 0，token 保留实际值。
 export interface SessionPoint {
   Turn: number
+  TurnNo: number
+  Status: string // completed | failed
+  Failed: boolean
   CallTime: string
   ChannelName: string
   InternalModelID: string
@@ -1198,7 +1211,98 @@ export interface CostSessionData {
   SessionID: string
   Points: SessionPoint[]
   Totals: { CostCredits: number; SaleCredits: number }
+  Total: number // 该会话账单总行数（含失败轮）
+  Limit: number // 本次生效上限（缺省 500、最多 2000）
+  Truncated: boolean // 是否被 Limit 截断
 }
 export function getCostSession(id: string) {
   return http.get<CostSessionData, ApiRes<CostSessionData>>(`/admin/cost/session/${id}`)
+}
+
+// ===== 模型定价曲线（按真实公式逐 token 出点，后端算、前端只渲染）=====
+// credits = Σ(段 token × 段费率) × timeCoeff × ctxCoeff ÷ R
+// 售价线用外部模型配置、成本线用渠道内部模型配置，两条一起画。
+export interface CostPricingRates {
+  Input: number
+  CacheRead: number
+  Output: number
+}
+export interface CostPricingTier {
+  Min: number
+  Max: number | null // null = 无上限
+  Coeff: number
+}
+export interface CostPricingPoint {
+  Tokens: number // 上下文长度（input + cache_read），横轴
+  InputTokens: number
+  CacheReadTokens: number
+  OutputTokens: number
+  CtxCoeff: number
+  Credits: number // 含系数（真实计费口径）
+  CreditsNoCoeff: number // 不含任何系数
+  OverTier: boolean // 落在分档之外：真实计费会失败，前端断线 + 红标
+}
+export interface CostPricingTierBreak {
+  Tokens: number
+  FromCoeff: number
+  ToCoeff: number
+}
+export interface CostPricingOverRange {
+  FromTokens: number
+  ToTokens: number
+}
+export interface CostPricingLine {
+  Available: boolean
+  Source: string // external_model | channel_model
+  Reason: string // Available=false 时的原因
+  Name: string
+  ExternalModelID: number
+  ChannelModelID: number
+  ChannelID: number
+  ChannelName: string
+  InternalModelID: string
+  Rates: CostPricingRates
+  TimeZone: string
+  TimeCoeff: number
+  TimeConfigSource: string // model | global
+  TierSource: string // model | global | none
+  Tiers: CostPricingTier[]
+  Points: CostPricingPoint[]
+  TierBreaks: CostPricingTierBreak[]
+  OverTier: CostPricingOverRange[]
+}
+export interface CostTimeOption {
+  Name: string
+  Start: string
+  End: string
+  Coeff: number
+}
+export interface CostPricingCurveData {
+  At: string
+  TimeZone: string
+  R: number
+  Step: number
+  MaxTokens: number
+  PointCount: number
+  HitRate: number
+  InOutRatio: number
+  TimeOptions: CostTimeOption[]
+  DefaultTimeCoeff: number
+  Sale: CostPricingLine
+  Cost: CostPricingLine
+}
+export interface CostPricingCurveParams {
+  ChannelModelID?: number
+  ExternalModelID?: number
+  ExternalModelName?: string
+  Step?: number
+  MaxTokens?: number
+  HitRate?: number
+  InOutRatio?: number
+  At?: string // RFC3339 或 HH:MM
+}
+export function getCostPricingCurve(params: CostPricingCurveParams = {}) {
+  return http.get<CostPricingCurveData, ApiRes<CostPricingCurveData>>('/admin/cost/pricing-curve', {
+    params,
+  })
 }

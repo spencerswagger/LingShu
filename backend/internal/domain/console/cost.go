@@ -12,12 +12,15 @@ package console
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
+	"sort"
 	"strconv"
 	"time"
 
+	"github.com/team/llmgateway/internal/domain/billing"
 	"github.com/team/llmgateway/internal/pkg/decimalx"
 	"github.com/team/llmgateway/internal/pkg/resp"
 )
@@ -38,20 +41,62 @@ const costTokenSumSQL = `COALESCE(SUM(CASE WHEN (b.tokens->>'%[1]s') ~ '^-?[0-9]
 // costTokenRowSQL 三段 token 的单行表达式（别名固定为 b）：正则守卫非法值/超长值按 0。
 const costTokenRowSQL = `CASE WHEN (b.tokens->>'%[1]s') ~ '^-?[0-9]{1,18}$' THEN (b.tokens->>'%[1]s')::bigint ELSE 0 END`
 
-// costStatsRow 「成本/售价对照」分组行。
+// costProbeExclusionSQL 排除「健康探测记账」行的行过滤条件（b 为 billing_records 别名）。
+//
+// 判定三个条件同时成立才算探测行（任一不成立即视为真实消耗，保留）：
+//  1. pricing_mode='cost'——探测以系统身份按成本价记账；
+//  2. token 属于系统探测身份（users.is_system，或 display_name='system-probe'）；
+//  3. 没有对应 call_log——真实请求必写 call_log，探测走 billing.Record 直记、不写 call_log。
+//
+// 口径变化（spencer 已拍板）：探测开销不再计入售价/统计口径。此前探测行混进统计，
+// 会把售价与请求数抬高（test 库此前虚高约 14.25%），属预期修正，不是回归。
+const costProbeExclusionSQL = `NOT (
+        b.pricing_mode = 'cost'
+        AND b.token_id IS NOT NULL
+        AND EXISTS (
+            SELECT 1 FROM tokens t JOIN users u ON u.id = t.user_id
+            WHERE t.id = b.token_id AND (u.is_system OR t.display_name = 'system-probe')
+        )
+        AND NOT EXISTS (SELECT 1 FROM call_logs cl WHERE cl.billing_id = b.billing_id)
+    )`
+
+// costEntityResolveBody 实体解析子查询体：把账单行解析到「渠道 + 内部模型」对应的 channel_models 行。
+// 查询期解析、不给 billing_records 加列（本轮明确不加）。
+// 同一 (channel_id, internal_model_id) 有多条配置（删除后重建）时：优先未删除，其次取 id 最大者，
+// 保证解析结果确定；已被软删的配置仍参与解析，历史账单不因配置下线而失去归属。
+const costEntityResolveBody = `SELECT DISTINCT ON (cm.channel_id, cm.internal_model_id)
+           cm.channel_id, cm.internal_model_id, cm.id AS cm_id, cm.external_model_id
+    FROM channel_models cm
+    ORDER BY cm.channel_id, cm.internal_model_id, (cm.deleted_at IS NULL) DESC, cm.id DESC`
+
+// costStatsRow 「成本/售价对照」分组行（按实体聚合）。
+//
+// 实体键口径：EntityKey 是这条行的稳定标识（前端 row-key），格式两种：
+//   - `cm:<channel_model_id>`：账单行解析到了 channel_models 行（渠道/对外模型由该行决定，键里不重复带）；
+//   - `name:<对外模型名>#<internal_model_id>@<channel_id>`：解析不到时按账单原始文本单独成桶。
+//     降级桶**按渠道分开**——同一文本在不同渠道下是两行，不同文本不合并、不丢弃；
+//     `internal_model_id` 为空时省略 `#<id>` 段（`name:<文本>@<channel_id>`）；
+//     无渠道（channel_key_id 为 NULL）时 `@0`。
+//
+// ExternalModelName 是**展示名**：解析成功的用当前对外模型名，解析不到的用账单原始文本；
+// 该实体历史上出现过的所有文本快照见 SnapshotNames（按字典序，供「曾用名」标注）。
 type costStatsRow struct {
-	ChannelID         int64   `json:"ChannelID"`
-	ChannelName       string  `json:"ChannelName"`
-	InternalModelID   string  `json:"InternalModelID"`
-	ExternalModelName string  `json:"ExternalModelName"`
-	CostCredits       float64 `json:"CostCredits"`
-	SaleCredits       float64 `json:"SaleCredits"`
-	Requests          int64   `json:"Requests"`
-	InputTokens       int64   `json:"InputTokens"`
-	CacheReadTokens   int64   `json:"CacheReadTokens"`
-	OutputTokens      int64   `json:"OutputTokens"`
-	CacheHitRate      float64 `json:"CacheHitRate"`
-	InputOutputRatio  float64 `json:"InputOutputRatio"`
+	EntityKey         string   `json:"EntityKey"`
+	ChannelID         int64    `json:"ChannelID"`
+	ChannelName       string   `json:"ChannelName"`
+	ChannelModelID    int64    `json:"ChannelModelID"`
+	ExternalModelID   int64    `json:"ExternalModelID"`
+	InternalModelID   string   `json:"InternalModelID"`
+	ExternalModelName string   `json:"ExternalModelName"`
+	SnapshotNames     []string `json:"SnapshotNames"`
+	CostCredits       float64  `json:"CostCredits"`
+	SaleCredits       float64  `json:"SaleCredits"`
+	Requests          int64    `json:"Requests"`
+	InputTokens       int64    `json:"InputTokens"`
+	CacheReadTokens   int64    `json:"CacheReadTokens"`
+	OutputTokens      int64    `json:"OutputTokens"`
+	CacheHitRate      float64  `json:"CacheHitRate"`
+	InputOutputRatio  float64  `json:"InputOutputRatio"`
 }
 
 // costStatsTotal 全表同口径聚合（不含渠道/模型维度字段）。
@@ -66,32 +111,58 @@ type costStatsTotal struct {
 	InputOutputRatio float64 `json:"InputOutputRatio"`
 }
 
+// costStatsQuerySQL 成本统计主查询（按实体聚合）。
+//
+// 实体 = (解析出的 channel_id, 解析出的 external_model_id, 解析出的 channel_models.id)；
+// 解析不到时降级为按「原始文本」的桶（见 costStatsRow.EntityKey 说明）。
+// 金额口径：SUM(cost_credits) / SUM(credits_consumed)，与改造前逐位相等——
+// 只是把行重新分组，没有过滤（除探测行）也没有重新计算；账单写入时金额已按 5 位小数落库，
+// 分组粒度不影响总和。
+const costStatsQuerySQL = `
+WITH res AS (` + costEntityResolveBody + `)
+SELECT CASE
+           WHEN r.cm_id IS NOT NULL THEN 'cm:' || r.cm_id::text
+           WHEN b.internal_model_id <> ''
+               THEN 'name:' || b.external_model_name || '#' || b.internal_model_id || '@' || COALESCE(k.channel_id, 0)::text
+           ELSE 'name:' || b.external_model_name || '@' || COALESCE(k.channel_id, 0)::text
+       END AS entity_key,
+       MAX(k.channel_id)                    AS channel_id,
+       MAX(COALESCE(c.name, ''))            AS channel_name,
+       MAX(COALESCE(r.cm_id, 0))            AS channel_model_id,
+       MAX(COALESCE(r.external_model_id, 0)) AS external_model_id,
+       MAX(b.internal_model_id)             AS internal_model_id,
+       MAX(COALESCE(em.external_name, b.external_model_name)) AS external_model_name,
+       COALESCE(SUM(b.cost_credits), 0)     AS cost_credits,
+       COALESCE(SUM(b.credits_consumed), 0) AS sale_credits,
+       COUNT(*)                             AS requests,
+       %s AS input_tokens,
+       %s AS cache_read_tokens,
+       %s AS output_tokens,
+       to_json(array_agg(DISTINCT b.external_model_name))::text AS snapshot_names
+FROM billing_records b
+LEFT JOIN channel_keys k ON k.id = b.channel_key_id
+LEFT JOIN (` + costEntityResolveBody + `) r
+       ON r.channel_id = k.channel_id AND r.internal_model_id = b.internal_model_id
+LEFT JOIN channels c ON c.id = k.channel_id
+LEFT JOIN external_models em ON em.id = r.external_model_id
+WHERE b.status = 'completed'
+  AND ` + costProbeExclusionSQL + `
+GROUP BY 1
+ORDER BY COALESCE(SUM(b.cost_credits), 0) DESC NULLS LAST, 1`
+
 // HandleCostStats GET /api/v1/admin/cost/stats
-// 按「渠道 + 内部模型 + 对外模型」分组统计成本/售价/请求数/三段 token 与派生比率；
-// 仅统计 status='completed' 的消耗（与 console/summary.go 一致）；Total 为全表同口径聚合。
+// 按**实体**（渠道 + 解析出的对外模型 + 解析出的渠道内部模型）聚合成本/售价/请求数/三段 token 与派生比率；
+// 仅统计 status='completed' 的消耗，且剔除健康探测记账行；Total 为全表同口径聚合。
+//
+// 与改造前相比：行数会变少（同一实体的历史文本快照合并成一行，见 SnapshotNames），
+// 金额不会变（分组变化不影响求和），探测行被剔除（预期修正，见 costProbeExclusionSQL）。
 func (h *Admin) HandleCostStats(w http.ResponseWriter, r *http.Request) {
 	rows := make([]costStatsRow, 0)
 	if h.db == nil {
 		resp.OK(w, r, map[string]any{"Rows": rows, "Total": costStatsTotal{}})
 		return
 	}
-	sqlText := fmt.Sprintf(`
-SELECT k.channel_id,
-       COALESCE(c.name, '') AS channel_name,
-       b.internal_model_id,
-       b.external_model_name,
-       COALESCE(SUM(b.cost_credits), 0)      AS cost_credits,
-       COALESCE(SUM(b.credits_consumed), 0)  AS sale_credits,
-       COUNT(*)                              AS requests,
-       %s AS input_tokens,
-       %s AS cache_read_tokens,
-       %s AS output_tokens
-FROM billing_records b
-LEFT JOIN channel_keys k ON k.id = b.channel_key_id
-LEFT JOIN channels c ON c.id = k.channel_id
-WHERE b.status = 'completed'
-GROUP BY k.channel_id, c.name, b.internal_model_id, b.external_model_name
-ORDER BY SUM(b.cost_credits) DESC NULLS LAST, k.channel_id, b.internal_model_id, b.external_model_name`,
+	sqlText := fmt.Sprintf(costStatsQuerySQL,
 		fmt.Sprintf(costTokenSumSQL, "input"),
 		fmt.Sprintf(costTokenSumSQL, "cache_read"),
 		fmt.Sprintf(costTokenSumSQL, "output"))
@@ -106,13 +177,14 @@ ORDER BY SUM(b.cost_credits) DESC NULLS LAST, k.channel_id, b.internal_model_id,
 	var total costStatsTotal
 	for rowSet.Next() {
 		var (
-			chID   sql.NullInt64
-			item   costStatsRow
-			chName string
+			chID      sql.NullInt64
+			item      costStatsRow
+			snapshots string
 		)
-		if err := rowSet.Scan(&chID, &chName, &item.InternalModelID, &item.ExternalModelName,
+		if err := rowSet.Scan(&item.EntityKey, &chID, &item.ChannelName, &item.ChannelModelID, &item.ExternalModelID,
+			&item.InternalModelID, &item.ExternalModelName,
 			&item.CostCredits, &item.SaleCredits, &item.Requests,
-			&item.InputTokens, &item.CacheReadTokens, &item.OutputTokens); err != nil {
+			&item.InputTokens, &item.CacheReadTokens, &item.OutputTokens, &snapshots); err != nil {
 			resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "查询成本统计失败")
 			return
 		}
@@ -120,8 +192,8 @@ ORDER BY SUM(b.cost_credits) DESC NULLS LAST, k.channel_id, b.internal_model_id,
 			item.ChannelID = chID.Int64
 		}
 		switch {
-		case chName != "":
-			item.ChannelName = chName
+		case item.ChannelName != "":
+			// 保持原样
 		case chID.Valid:
 			// 渠道名缺失时回退渠道 ID 字符串，避免前端展示空白。
 			item.ChannelName = strconv.FormatInt(chID.Int64, 10)
@@ -129,6 +201,7 @@ ORDER BY SUM(b.cost_credits) DESC NULLS LAST, k.channel_id, b.internal_model_id,
 			// channel_key_id 为 NULL（未进入渠道的拒绝类账单）→ 无渠道归属。
 			item.ChannelName = "(无渠道)"
 		}
+		item.SnapshotNames = parseSnapshotNames(snapshots)
 		item.CostCredits = decimalx.Round5(item.CostCredits)
 		item.SaleCredits = decimalx.Round5(item.SaleCredits)
 		item.CacheHitRate = decimalx.Round5(cacheHitRate(item.CacheReadTokens, item.InputTokens))
@@ -154,6 +227,31 @@ ORDER BY SUM(b.cost_credits) DESC NULLS LAST, k.channel_id, b.internal_model_id,
 	resp.OK(w, r, map[string]any{"Rows": rows, "Total": total})
 }
 
+// parseSnapshotNames 把 SQL 里 to_json(array_agg(DISTINCT ...)) 的 JSON 数组解析成有序字符串切片。
+// 解析失败/空值返回空切片（不返回 nil，避免 JSON 出 null）；结果按字典序排序，保证输出稳定。
+func parseSnapshotNames(raw string) []string {
+	out := make([]string, 0, 4)
+	if raw == "" || raw == "null" {
+		return out
+	}
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return make([]string, 0, 4)
+	}
+	if out == nil {
+		return make([]string, 0, 4)
+	}
+	// SQL 里已有 DISTINCT，这里再去一次重（防御：换查询时也不会输出重复的曾用名）。
+	sort.Strings(out)
+	deduped := out[:0]
+	for i, name := range out {
+		if i > 0 && name == out[i-1] {
+			continue
+		}
+		deduped = append(deduped, name)
+	}
+	return deduped
+}
+
 // costDefaultsResponse 默认参数响应（仅 token 口径，不含金额）。
 type costDefaultsResponse struct {
 	PerTurnInputTokens float64 `json:"PerTurnInputTokens"`
@@ -176,7 +274,8 @@ SELECT
     %s AS output_tokens,
     COUNT(*) AS requests
 FROM billing_records b
-WHERE b.status = 'completed'`,
+WHERE b.status = 'completed'
+  AND `+costProbeExclusionSQL,
 		fmt.Sprintf(costTokenSumSQL, "input"),
 		fmt.Sprintf(costTokenSumSQL, "cache_read"),
 		fmt.Sprintf(costTokenSumSQL, "output"))
@@ -391,44 +490,107 @@ func hasNonZeroRates(rates map[string]float64) bool {
 	return false
 }
 
-// costSessionPoint 单会话逐轮成本点。
+// 单会话成本明细的行数上限策略：
+//   - **缺省不截断**（Limit=0 → SQL 里 LIMIT NULL），保证超长会话的老调用方仍能拿到全部行；
+//   - 显式传 Limit 时生效，且超过 2000 按 2000 收敛（保护单次响应体量）。
+//
+// 被截断时响应里 Truncated=true 并回报 Total，调用方可据此翻页/提示。
+const (
+	costSessionDefaultLimit = 0    // 0 = 不截断（缺省放开，避免改变老调用方行为）
+	costSessionMaxLimit     = 2000 // 显式 Limit 的硬上限
+)
+
+// costSessionPoint 单会话逐轮成本点（含失败轮）。
+//
+// 两个序号刻意分开（兼容 + 不错位）：
+//   - Turn：**成功调用**的序号（1..N），失败轮为 0。成功行的 Turn 与改造前逐一相同，
+//     老调用方按 Turn 读到的成功轮数据完全不变（失败轮不会把后面的成功轮整体往后推）。
+//   - TurnNo：**时间线**序号（1..M，含失败轮），前端 x 轴用这个，失败轮占位、轴不断裂。
+//     没有失败轮时 TurnNo 恒等于 Turn。
 type costSessionPoint struct {
 	Turn            int     `json:"Turn"`
+	TurnNo          int     `json:"TurnNo"`
+	Status          string  `json:"Status"` // completed | failed（billing_records.status 的实际取值）
+	Failed          bool    `json:"Failed"` // = Status=='failed'，供前端直接判红点
 	CallTime        string  `json:"CallTime"`
 	ChannelName     string  `json:"ChannelName"`
 	InternalModelID string  `json:"InternalModelID"`
 	InputTokens     int64   `json:"InputTokens"`
 	CacheReadTokens int64   `json:"CacheReadTokens"`
 	OutputTokens    int64   `json:"OutputTokens"`
-	CostCredits     float64 `json:"CostCredits"`
-	SaleCredits     float64 `json:"SaleCredits"`
+	CostCredits     float64 `json:"CostCredits"` // 失败轮恒为 0（失败不产生成本积分）
+	SaleCredits     float64 `json:"SaleCredits"` // 失败轮恒为 0
 }
 
-// costSessionTotals 单会话成本/售价合计。
+// costSessionTotals 单会话成本/售价合计（只累加成功轮，口径与改造前一致）。
 type costSessionTotals struct {
 	CostCredits float64 `json:"CostCredits"`
 	SaleCredits float64 `json:"SaleCredits"`
 }
 
-// HandleCostSession GET /api/v1/admin/cost/session/{id}
-// 返回指定会话按 call_time 升序的逐轮成本明细与合计（仅 status='completed'）；缺 id 返回 400。
+// parseCostSessionLimit 解析会话明细的 Limit：
+// 缺省（或 ≤0）= 不截断（0）；显式值超过 2000 按 2000 收敛；非数字报错。
+func parseCostSessionLimit(raw string) (int, error) {
+	if raw == "" {
+		return costSessionDefaultLimit, nil
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, errors.New("Limit 必须为整数")
+	}
+	if v <= 0 {
+		return costSessionDefaultLimit, nil
+	}
+	if v > costSessionMaxLimit {
+		v = costSessionMaxLimit
+	}
+	return v, nil
+}
+
+// HandleCostSession GET /api/v1/admin/cost/session/{id}?Limit=
+// 返回指定会话按 call_time 升序的逐轮成本明细与合计，**含失败轮**（Status=failed、金额 0、TurnNo 占位）；
+// 缺 id 返回 400。
+//
+// 行数策略：**缺省不截断**（Limit 不传 → SQL `LIMIT NULL`），保证超长会话的老调用方行为与改造前一致；
+// 只有显式传 Limit 才省略尾部，且显式值超过 2000 按 2000 收敛；被截断时 Truncated=true 并回报 Total。
+//
+// 兼容性：成功行的字段值、相对顺序、金额口径与改造前完全一致；失败行是新增行，
+// 合计仍只累加成功轮，因此老调用方读 Totals 与读成功行的结果都不变。
 func (h *Admin) HandleCostSession(w http.ResponseWriter, r *http.Request) {
 	sid := r.PathValue("id")
 	if sid == "" {
 		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "缺少会话 ID")
 		return
 	}
+	limit, err := parseCostSessionLimit(r.URL.Query().Get("Limit"))
+	if err != nil {
+		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, err.Error())
+		return
+	}
 	points := make([]costSessionPoint, 0)
 	totals := costSessionTotals{}
 	if h.db == nil {
-		resp.OK(w, r, map[string]any{"SessionID": sid, "Points": points, "Totals": totals})
+		resp.OK(w, r, map[string]any{
+			"SessionID": sid, "Points": points, "Totals": totals,
+			"Total": 0, "Limit": limit, "Truncated": false,
+		})
 		return
 	}
+
+	// 总量：用于判断是否被 Limit 截断（按会话索引，代价很小）。
+	var total int64
+	if err := h.db.QueryRowContext(r.Context(),
+		`SELECT count(*) FROM billing_records WHERE session_id = $1`, sid).Scan(&total); err != nil {
+		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "查询会话成本失败")
+		return
+	}
+
 	sqlText := fmt.Sprintf(`
 SELECT b.call_time,
        COALESCE(c.name, '') AS channel_name,
        b.channel_key_id,
        b.internal_model_id,
+       b.status,
        %s AS input_tokens,
        %s AS cache_read_tokens,
        %s AS output_tokens,
@@ -437,20 +599,26 @@ SELECT b.call_time,
 FROM billing_records b
 LEFT JOIN channel_keys k ON k.id = b.channel_key_id
 LEFT JOIN channels c ON c.id = k.channel_id
-WHERE b.session_id = $1 AND b.status = 'completed'
-ORDER BY b.call_time ASC, b.id ASC`,
+WHERE b.session_id = $1
+ORDER BY b.call_time ASC, b.id ASC
+LIMIT $2`,
 		fmt.Sprintf(costTokenRowSQL, "input"),
 		fmt.Sprintf(costTokenRowSQL, "cache_read"),
 		fmt.Sprintf(costTokenRowSQL, "output"))
 
-	rowSet, err := h.db.QueryContext(r.Context(), sqlText, sid)
+	// limit<=0 → 传 NULL，Postgres 的 `LIMIT NULL` 等价于不限制。
+	var limitArg any
+	if limit > 0 {
+		limitArg = limit
+	}
+	rowSet, err := h.db.QueryContext(r.Context(), sqlText, sid, limitArg)
 	if err != nil {
 		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "查询会话成本失败")
 		return
 	}
 	defer rowSet.Close()
 
-	turn := 0
+	successTurn, turnNo := 0, 0
 	for rowSet.Next() {
 		var (
 			callTime time.Time
@@ -458,24 +626,34 @@ ORDER BY b.call_time ASC, b.id ASC`,
 			keyID    sql.NullInt64
 			pt       costSessionPoint
 		)
-		if err := rowSet.Scan(&callTime, &chName, &keyID, &pt.InternalModelID,
+		if err := rowSet.Scan(&callTime, &chName, &keyID, &pt.InternalModelID, &pt.Status,
 			&pt.InputTokens, &pt.CacheReadTokens, &pt.OutputTokens,
 			&pt.CostCredits, &pt.SaleCredits); err != nil {
 			resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "查询会话成本失败")
 			return
 		}
-		turn++
-		pt.Turn = turn
+		turnNo++
+		pt.TurnNo = turnNo
 		pt.CallTime = callTime.Format(time.RFC3339)
 		pt.ChannelName = chName
 		if pt.ChannelName == "" && keyID.Valid {
 			// 渠道名缺失时回退渠道密钥 ID 字符串。
 			pt.ChannelName = strconv.FormatInt(keyID.Int64, 10)
 		}
-		pt.CostCredits = decimalx.Round5(pt.CostCredits)
-		pt.SaleCredits = decimalx.Round5(pt.SaleCredits)
-		totals.CostCredits += pt.CostCredits
-		totals.SaleCredits += pt.SaleCredits
+		if pt.Status == billing.StatusCompleted {
+			successTurn++
+			pt.Turn = successTurn
+			pt.CostCredits = decimalx.Round5(pt.CostCredits)
+			pt.SaleCredits = decimalx.Round5(pt.SaleCredits)
+			totals.CostCredits += pt.CostCredits
+			totals.SaleCredits += pt.SaleCredits
+		} else {
+			// 失败轮：如实标注，金额一律 0（失败不产生成本积分），Turn 不占成功序号。
+			pt.Failed = true
+			pt.Turn = 0
+			pt.CostCredits = 0
+			pt.SaleCredits = 0
+		}
 		points = append(points, pt)
 	}
 	if err := rowSet.Err(); err != nil {
@@ -485,7 +663,10 @@ ORDER BY b.call_time ASC, b.id ASC`,
 	totals.CostCredits = decimalx.Round5(totals.CostCredits)
 	totals.SaleCredits = decimalx.Round5(totals.SaleCredits)
 
-	resp.OK(w, r, map[string]any{"SessionID": sid, "Points": points, "Totals": totals})
+	resp.OK(w, r, map[string]any{
+		"SessionID": sid, "Points": points, "Totals": totals,
+		"Total": total, "Limit": limit, "Truncated": total > int64(len(points)),
+	})
 }
 
 // cacheHitRate 缓存命中率 = cache_read ÷ (input + cache_read)；分母为 0 返回 0。

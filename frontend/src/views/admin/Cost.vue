@@ -1,61 +1,57 @@
 <script setup lang="ts">
-// 「成本」只读页（仅管理端）：三块能力——
-//   A. 渠道 × 内部模型 成本统计表（含 Total 汇总行，可排序）；
-//   B. 模型定价曲线（多选内部模型 + 三个参数 + 成本/售价/两者切换 + 同指标交点标注）；
-//   C. 会话成本曲线（选一场会话，逐轮绘制 成本 与 售价）。
-// 纯只读：全部走 GET，无任何写路径。
+// 「成本」只读页（仅管理端），三块能力：
+//   A. 成本统计表：按「当前实体」（渠道 × 内部模型 × 对外模型）聚合，row-key = EntityKey；
+//   B. 模型定价曲线：新接口 /admin/cost/pricing-curve，后端按真实公式逐 token 出点，前端只渲染
+//      （成本线 = 渠道内部模型配置、售价线 = 对外模型配置；分档拐点画竖线、超档断线标红）；
+//   C. 会话成本曲线：逐轮历史实际 cost_credits / credits_consumed（切换会话有请求序号守卫）。
+// 纯只读：全部走 GET，无任何写路径。桌面用表格、窄屏用「数字墙 + 实体行」单列表。
 import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Refresh } from '@element-plus/icons-vue'
 import * as echarts from 'echarts/core'
 import type { EChartsCoreOption } from 'echarts/core'
-import { MarkLineComponent, MarkPointComponent } from 'echarts/components'
+import { MarkAreaComponent, MarkLineComponent, MarkPointComponent } from 'echarts/components'
 import VChart from '@/components/VChart.vue'
 import ErrorBubble from '@/components/ErrorBubble.vue'
 import {
   getCostStats,
-  getCostDefaults,
-  getCostCurves,
+  getCostPricingCurve,
   getCostSession,
   listSessions,
+  type AdminSession,
+  type CostPricingCurveData,
+  type CostPricingCurveParams,
+  type CostPricingLine,
   type CostStatRow,
   type CostStatTotal,
-  type CurveItem,
   type SessionPoint,
-  type AdminSession,
 } from '@/api/admin'
 
-// 交点标注依赖 markPoint/markLine（VChart 未注册，这里按需补充注册）。
-echarts.use([MarkLineComponent, MarkPointComponent])
-
-// 模型曲线的轮次上限（后端契约含 turns 参数；本页固定 K=30）。
-const TURNS = 30
+// 拐点竖线（markLine）、超档红标（markPoint）、超档区间底色（markArea）按需注册。
+echarts.use([MarkLineComponent, MarkPointComponent, MarkAreaComponent])
 
 // ===== 通用格式化 =====
-function fmt2(v: number): string {
-  return Number.isFinite(v) ? v.toFixed(2) : '-'
-}
-function fmtPct(v: number): string {
-  return Number.isFinite(v) ? (v * 100).toFixed(2) + '%' : '-'
-}
-function fmtInt(v: number): string {
-  return Number.isFinite(v) ? v.toLocaleString('zh-CN') : '-'
-}
-function round2(v: number): number {
-  return Math.round(v * 100) / 100
-}
-function round4(v: number): number {
-  return Math.round(v * 10000) / 10000
+const fmt2 = (v: number) => (Number.isFinite(v) ? v.toFixed(2) : '-')
+const fmtPct = (v: number) => (Number.isFinite(v) ? (v * 100).toFixed(2) + '%' : '-')
+const fmtInt = (v: number) => (Number.isFinite(v) ? v.toLocaleString('zh-CN') : '-')
+const round4 = (v: number) => Math.round(v * 10000) / 10000
+
+// 窄屏（移动版）判定：图表高度、布局切换用。
+const NARROW_QUERY = '(max-width: 768px)'
+const isNarrow = ref(false)
+let mq: MediaQueryList | undefined
+function onMqChange(e: MediaQueryListEvent | MediaQueryList) {
+  isNarrow.value = e.matches
 }
 
-// ===== 全局状态 =====
+// ===== 全局错误 =====
 const errInfo = ref<{ message: string; requestId: string }>({ message: '', requestId: '' })
 function setErr(e: any) {
   errInfo.value = { message: e?.message || '', requestId: e?.requestId || '' }
 }
 
 // ===================================================================
-// A. 统计表
+// A. 成本统计表（按实体归一）
 // ===================================================================
 const loadingStats = ref(false)
 const statsRows = ref<CostStatRow[]>([])
@@ -65,8 +61,8 @@ async function loadStats() {
   loadingStats.value = true
   try {
     const res = await getCostStats()
-    statsRows.value = res.Data.Rows || []
-    statsTotal.value = res.Data.Total || null
+    statsRows.value = res.Data.Rows ?? []
+    statsTotal.value = res.Data.Total ?? null
   } catch (e: any) {
     setErr(e)
   } finally {
@@ -74,20 +70,23 @@ async function loadStats() {
   }
 }
 
-// 单元格展示格式化（保留原始数值用于排序）
-function cellCost(_row: CostStatRow, _col: unknown, v: number): string {
-  return fmt2(v)
+// 曾用名：SnapshotNames 去掉当前展示名后剩下的历史文本（长度 >1 才标注）。
+function oldNames(row: CostStatRow): string[] {
+  const all = row.SnapshotNames ?? []
+  return all.filter((n) => n && n !== row.ExternalModelName)
 }
-function cellInt(_row: CostStatRow, _col: unknown, v: number): string {
-  return fmtInt(v)
+function oldNamesTitle(row: CostStatRow): string {
+  const list = oldNames(row)
+  return list.length ? `曾用名：${list.join(' / ')}` : ''
 }
-function cellHit(_row: CostStatRow, _col: unknown, v: number): string {
-  return fmtPct(v)
-}
-function cellRatio(_row: CostStatRow, _col: unknown, v: number): string {
-  return fmt2(v)
-}
-// 汇总行：展示后端返回的 Total（全量口径），不随排序变化。
+
+// 表格单元格格式化（保留原始数值用于排序）
+const cellCost = (_r: CostStatRow, _c: unknown, v: number) => fmt2(v)
+const cellInt = (_r: CostStatRow, _c: unknown, v: number) => fmtInt(v)
+const cellHit = (_r: CostStatRow, _c: unknown, v: number) => fmtPct(v)
+const cellRatio = (_r: CostStatRow, _c: unknown, v: number) => fmt2(v)
+
+// 汇总行取后端 Total（全量口径，不随排序变化）。
 function sumSummary({ columns }: { columns: { property?: string }[] }): string[] {
   const t = statsTotal.value
   return columns.map((col, i) => {
@@ -116,235 +115,270 @@ function sumSummary({ columns }: { columns: { property?: string }[] }): string[]
   })
 }
 
-// ===================================================================
-// B. 模型定价曲线
-// ===================================================================
-const PALETTE = ['#5a5ce8', '#e6a23c', '#67c23a', '#f56c6c', '#36cfc9', '#b37feb', '#ff85c0', '#909399']
+const rowKey = (row: CostStatRow) => row.EntityKey
 
-const loadingCurves = ref(false)
-const curves = ref<CurveItem[]>([])
-const curveTurns = ref(TURNS)
-const selectedKeys = ref<string[]>([])
-const mode = ref<'cost' | 'sale' | 'both'>('both')
-
-// 参数：命中率以 0~1 存储（输入框按百分比展示）；与后端全平台 token 默认值对齐。
-const params = reactive({ perTurnInput: 10000, hitRate: 0, inOutRatio: 1 })
-// 命中率百分比视图（0~100 双向绑定到 params.hitRate）。
+// ===================================================================
+// B. 模型定价曲线（/admin/cost/pricing-curve）
+// ===================================================================
+const loadingCurve = ref(false)
+const curve = ref<CostPricingCurveData | null>(null)
+const curveEntity = ref('') // 选中的 EntityKey（模型来自统计表的实体行）
+// 采样参数：首次响应回填后端生效值，之后用户改动才带参重取。
+const curveParams = reactive({ step: 0, maxTokens: 0, hitRate: 0.9, inOutRatio: 10 })
+const paramsInited = ref(false)
+// 命中率按百分比展示（0~100），内部仍存 0~1。
 const hitRatePct = computed<number>({
-  get: () => round2(params.hitRate * 100),
+  get: () => round2(curveParams.hitRate * 100),
   set: (v: number) => {
-    params.hitRate = (Number.isFinite(v) ? v : 0) / 100
+    curveParams.hitRate = (Number.isFinite(v) ? v : 0) / 100
   },
 })
-
-function curveKey(c: CurveItem): string {
-  return `${c.ChannelID}|${c.InternalModelID}`
+function round2(v: number) {
+  return Math.round(v * 100) / 100
 }
-function curveLabel(c: CurveItem): string {
-  return `${c.ChannelName} / ${c.InternalModelID}`
+const useCoeff = ref(true) // 开 = Credits（含时段×分档系数）；关 = CreditsNoCoeff
+const curveMode = ref<'both' | 'cost' | 'sale'>('both')
+const timeOptionKey = ref('') // 选中的时段（Name|Start|End）
+const timeTouched = ref(false) // 用户是否手动选过时段
+
+const curveEntities = computed<CostStatRow[]>(() => statsRows.value)
+const currentEntity = computed(() => curveEntities.value.find((r) => r.EntityKey === curveEntity.value) || null)
+
+const timeOptions = computed(() => curve.value?.TimeOptions ?? [])
+function timeOptionLabel(t: { Name: string; Start: string; End: string; Coeff: number }) {
+  const span = t.Start && t.End ? `${t.Start}–${t.End}` : ''
+  return `${t.Name}${span ? ' ' + span : ''} ×${t.Coeff}`
 }
-
-async function loadDefaults() {
-  try {
-    const res = await getCostDefaults()
-    const d = res.Data
-    // 每轮输入 token 需 >0：缺失/非正时回退 10000，避免输入框出现 0/负数导致曲线退化。
-    params.perTurnInput = d.PerTurnInputTokens > 0 ? d.PerTurnInputTokens : 10000
-    params.hitRate = d.CacheHitRate
-    params.inOutRatio = d.InputOutputRatio
-  } catch {
-    /* 默认值获取失败不阻塞页面其余部分 */
-  }
+function timeOptionValue(t: { Name: string; Start: string; End: string }) {
+  return `${t.Name}|${t.Start}|${t.End}`
 }
-
-// 曲线请求自增序号：丢弃过期响应，避免旧响应覆盖新响应（竞态）。
-let curveReqSeq = 0
-
-async function loadCurves() {
-  const seq = ++curveReqSeq
-  loadingCurves.value = true
-  try {
-    const res = await getCostCurves({
-      perTurnInput: params.perTurnInput,
-      hitRate: params.hitRate,
-      inOutRatio: params.inOutRatio,
-      turns: TURNS,
-    })
-    if (seq !== curveReqSeq) return // 已有更新的请求发出，丢弃本次过期响应
-    curves.value = res.Data.Curves || []
-    curveTurns.value = res.Data.Turns || TURNS
-    const valid = new Set(curves.value.map(curveKey))
-    if (!selectedKeys.value.length) {
-      // 首次加载默认全选
-      selectedKeys.value = curves.value.map(curveKey)
-    } else {
-      // 剔除已不存在的选中项
-      selectedKeys.value = selectedKeys.value.filter((k) => valid.has(k))
-    }
-  } catch (e: any) {
-    if (seq !== curveReqSeq) return
-    setErr(e)
-  } finally {
-    if (seq === curveReqSeq) loadingCurves.value = false
-  }
-}
-
-// 参数变化 debounce(~300ms) 后重新拉取曲线。
-let debounceTimer: number | undefined
-function scheduleReload() {
-  if (debounceTimer !== undefined) window.clearTimeout(debounceTimer)
-  debounceTimer = window.setTimeout(() => {
-    debounceTimer = undefined
-    loadCurves()
-  }, 300)
-}
-
-const selectedCurves = computed<CurveItem[]>(() =>
-  curves.value.filter((c) => selectedKeys.value.includes(curveKey(c))),
+const currentTimeOption = computed(() =>
+  timeOptions.value.find((t) => timeOptionValue(t) === timeOptionKey.value) || null,
 )
 
-// 当前展示序列：每个所选模型按模式产出 成本 / 售价（成本实线、售价虚线，同色同模型）。
-// metric 标记指标类型（cost/sale），供交点计算仅在「同指标」内配对。
-interface BuildSeries {
+// 曲线请求序号：参数/模型快速切换时丢弃过期响应。
+let curveSeq = 0
+
+async function loadCurve() {
+  const seq = ++curveSeq
+  loadingCurve.value = true
+  try {
+    const row = currentEntity.value
+    const p: CostPricingCurveParams = {}
+    if (row?.ChannelModelID) p.ChannelModelID = row.ChannelModelID
+    if (row?.ExternalModelID) p.ExternalModelID = row.ExternalModelID
+    else if (row?.ExternalModelName) p.ExternalModelName = row.ExternalModelName
+    if (paramsInited.value) {
+      if (curveParams.step > 0) p.Step = curveParams.step
+      if (curveParams.maxTokens > 0) p.MaxTokens = curveParams.maxTokens
+      p.HitRate = curveParams.hitRate
+      p.InOutRatio = curveParams.inOutRatio
+    }
+    // 时段：用所选时段的起点作为 At，让后端按该时段算 timeCoeff。
+    if (timeTouched.value && currentTimeOption.value?.Start) p.At = currentTimeOption.value.Start
+
+    const res = await getCostPricingCurve(p)
+    if (seq !== curveSeq) return
+    curve.value = res.Data
+    if (!paramsInited.value) {
+      curveParams.step = res.Data.Step
+      curveParams.maxTokens = res.Data.MaxTokens
+      curveParams.hitRate = res.Data.HitRate
+      curveParams.inOutRatio = res.Data.InOutRatio
+      paramsInited.value = true
+    }
+    // 时段下拉默认高亮：按后端实际使用的 At 落在哪个时段。
+    if (!timeTouched.value) {
+      const hhmm = atHHMM(res.Data.At)
+      const hit = timeOptions.value.find((t) => inTimeRange(hhmm, t.Start, t.End))
+      timeOptionKey.value = hit ? timeOptionValue(hit) : (timeOptions.value[0] ? timeOptionValue(timeOptions.value[0]) : '')
+    }
+  } catch (e: any) {
+    if (seq !== curveSeq) return
+    setErr(e)
+  } finally {
+    if (seq === curveSeq) loadingCurve.value = false
+  }
+}
+
+// 从后端回显的 RFC3339 里取「北京时间 HH:MM」。
+// 直接切字符串而不用 Date.getHours()：浏览器的本地时区未必是 +08:00，转换会错位。
+function atHHMM(iso: string): string {
+  const m = /\d{2}:\d{2}(?=:\d{2}|[+Z])/.exec(iso || '')
+  if (m) return m[0]
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return ''
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+}
+function inTimeRange(hhmm: string, start: string, end: string): boolean {
+  if (!hhmm) return false
+  const toMin = (s: string) => {
+    const [h, m] = (s || '').split(':').map(Number)
+    return (h || 0) * 60 + (m || 0)
+  }
+  const cur = toMin(hhmm)
+  return cur >= toMin(start) && cur < (toMin(end) || 24 * 60)
+}
+
+function onTimeChange() {
+  timeTouched.value = true
+  loadCurve()
+}
+function onParamChange() {
+  loadCurve()
+}
+
+// 取数序列：同一批 Points，只按「系数开关」切字段（不自己乘）。
+function pointValue(p: { Credits: number; CreditsNoCoeff: number }): number {
+  return useCoeff.value ? p.Credits : p.CreditsNoCoeff
+}
+
+interface CurveSeries {
+  key: 'cost' | 'sale'
   name: string
   color: string
   dashed: boolean
-  metric: 'cost' | 'sale'
-  points: { t: number; y: number }[]
+  line: CostPricingLine
 }
-const displaySeries = computed<BuildSeries[]>(() => {
-  const out: BuildSeries[] = []
-  selectedCurves.value.forEach((c, idx) => {
-    const color = PALETTE[idx % PALETTE.length]
-    const label = curveLabel(c)
-    if (mode.value === 'cost' || mode.value === 'both') {
-      out.push({
-        name: mode.value === 'both' ? `${label} · 成本` : label,
-        color,
-        dashed: false,
-        metric: 'cost',
-        points: c.Cost.map((y, i) => ({ t: i + 1, y })),
-      })
-    }
-    if (mode.value === 'sale' || mode.value === 'both') {
-      // 售价曲线：后端在 sale_rates 缺失/全 0 时返回空数组，此处跳过空序列，避免画出误导的全 0 线。
-      if (!c.Sale.length) return
-      out.push({
-        name: mode.value === 'both' ? `${label} · 售价` : label,
-        color,
-        dashed: true,
-        metric: 'sale',
-        points: c.Sale.map((y, i) => ({ t: i + 1, y })),
-      })
-    }
-  })
+
+const availableLines = computed<CurveSeries[]>(() => {
+  const c = curve.value
+  if (!c) return []
+  const out: CurveSeries[] = []
+  if (c.Cost?.Available) out.push({ key: 'cost', name: '成本', color: '#5a5ce8', dashed: false, line: c.Cost })
+  if (c.Sale?.Available) out.push({ key: 'sale', name: '售价', color: '#e6a23c', dashed: true, line: c.Sale })
   return out
 })
 
-// 最小二乘线性拟合：y = m·t + c（用于求相邻曲线交点）。
-interface FitLine {
-  m: number
-  c: number
-}
-function linearFit(pts: { t: number; y: number }[]): FitLine {
-  const n = pts.length
-  if (n < 2) return { m: 0, c: pts[0]?.y ?? 0 }
-  let sx = 0
-  let sy = 0
-  let sxx = 0
-  let sxy = 0
-  for (const p of pts) {
-    sx += p.t
-    sy += p.y
-    sxx += p.t * p.t
-    sxy += p.t * p.y
-  }
-  const den = n * sxx - sx * sx
-  if (Math.abs(den) <= 1e-12) return { m: 0, c: sy / n }
-  const m = (n * sxy - sx * sy) / den
-  const c = (sy - m * sx) / n
-  return { m, c }
-}
+const shownLines = computed<CurveSeries[]>(() =>
+  availableLines.value.filter((l) =>
+    curveMode.value === 'both' ? true : curveMode.value === 'cost' ? l.key === 'cost' : l.key === 'sale',
+  ),
+)
 
-// 相邻两条 series 的交点：k = (c2 − c1) / (m1 − m2)，y = m·k + c。
-// 交点含义：在第 k 轮，两条「同指标」曲线（成本↔成本 或 售价↔售价）的每轮值相等——
-// 成本口径下代表两条渠道/模型在该轮成本持平，售价口径下代表售价持平；跨指标（成本×售价）无业务含义。
-interface Crossing {
-  t: number
-  y: number
-  tag: string
-  color: string
-}
-const crossings = computed<Crossing[]>(() => {
-  const ss = displaySeries.value
-  const out: Crossing[] = []
-  const maxT = Math.max(curveTurns.value, 2)
-  // 仅在「同指标」内两两求交：成本组之间、售价组之间分别配对；
-  // 禁止把 成本×售价 当作相邻对求交（两者语义/量纲虽同为积分但不可比）。
-  // 售价组内每条序列对应一个模型，天然去重（不会与自己求交）。
-  for (const metric of ['cost', 'sale'] as const) {
-    const group = ss.filter((s) => s.metric === metric)
-    for (let i = 0; i + 1 < group.length; i++) {
-      const a = group[i]
-      const b = group[i + 1]
-      const fa = linearFit(a.points)
-      const fb = linearFit(b.points)
-      const dm = fa.m - fb.m
-      if (Math.abs(dm) <= 1e-12) continue
-      const t = (fb.c - fa.c) / dm
-      const y = fa.m * t + fa.c
-      if (!Number.isFinite(t) || !Number.isFinite(y)) continue
-      if (t < 1 || t > maxT) continue
-      out.push({ t: round2(t), y: round4(y), tag: `${a.name} × ${b.name}`, color: a.color })
-    }
-  }
+// 不可用线的原因（Available=false 时按 Reason 明确提示，不画空线、不把 0 当价格）
+const unavailableHints = computed(() => {
+  const c = curve.value
+  if (!c) return []
+  const out: { name: string; reason: string }[] = []
+  if (!c.Cost?.Available) out.push({ name: '成本线', reason: c.Cost?.Reason || '不可用' })
+  if (!c.Sale?.Available) out.push({ name: '售价线', reason: c.Sale?.Reason || '不可用' })
   return out
 })
 
 const curveOption = computed<EChartsCoreOption>(() => {
-  const turns = Math.max(curveTurns.value, 2)
-  const series: Record<string, unknown>[] = displaySeries.value.map((s) => ({
-    name: s.name,
-    type: 'line',
-    showSymbol: true,
-    symbolSize: 4,
-    smooth: false,
-    lineStyle: { width: 2, type: s.dashed ? 'dashed' : 'solid', color: s.color },
-    itemStyle: { color: s.color },
-    data: s.points.map((p) => [p.t, p.y]),
-  }))
-  // 交点：独立 series 承载 markPoint（pin + 序号标签）。
-  if (crossings.value.length) {
-    series.push({
-      name: '交点',
+  const lines = shownLines.value
+  const series: Record<string, unknown>[] = []
+  let markLineDone = false
+  let markAreaDone = false
+
+  for (const s of lines) {
+    const points = s.line.Points ?? []
+    // 超档点：真实计费会失败 → 断线（y = null），并在下方补红标
+    const data = points.map((p) => [p.Tokens, p.OverTier ? null : pointValue(p)])
+    const item: Record<string, unknown> = {
+      name: s.name,
       type: 'line',
+      smooth: false,
       showSymbol: false,
-      silent: true,
-      lineStyle: { width: 0, opacity: 0 },
-      itemStyle: { color: '#e6a23c' },
-      markPoint: {
-        symbol: 'pin',
-        symbolSize: 40,
-        itemStyle: { color: '#e6a23c' },
-        label: { show: true, fontSize: 10, color: '#fff', formatter: (p: any) => p?.data?.name || '交点' },
-        data: crossings.value.map((c, i) => ({ name: `#${i + 1}`, coord: [c.t, c.y] })),
-      },
-      data: [],
+      connectNulls: false, // 超档 / 缺数据断线，不补 0
+      lineStyle: { width: s.key === 'cost' ? 2.6 : 2, type: s.dashed ? 'dashed' : 'solid', color: s.color },
+      itemStyle: { color: s.color },
+      data,
+    }
+    // 拐点竖线只挂一条序列，避免重复绘制
+    if (!markLineDone && (s.line.TierBreaks?.length ?? 0) > 0) {
+      markLineDone = true
+      item.markLine = {
+        silent: true,
+        symbol: 'none',
+        lineStyle: { color: '#f79009', type: 'dashed', width: 1.2 },
+        label: { formatter: (p: any) => `×${p?.data?.toCoeff ?? ''}`, color: '#f79009', fontSize: 10 },
+        data: (s.line.TierBreaks ?? []).map((b) => ({
+          xAxis: b.Tokens,
+          toCoeff: b.ToCoeff,
+        })),
+      }
+    }
+    // 超档区间底色
+    if (!markAreaDone && (s.line.OverTier?.length ?? 0) > 0) {
+      markAreaDone = true
+      item.markArea = {
+        silent: true,
+        itemStyle: { color: 'rgba(240,68,56,0.08)' },
+        data: (s.line.OverTier ?? []).map((r) => [{ xAxis: r.FromTokens }, { xAxis: r.ToTokens }]),
+      }
+    }
+    series.push(item)
+  }
+
+  // 超档红点（第一条可用线的超档区间起点）
+  const overPts: [number, number][] = []
+  for (const s of lines) {
+    for (const r of s.line.OverTier ?? []) overPts.push([r.FromTokens, 0])
+  }
+  if (lines.length) {
+    series.push({
+      name: '超档（计费失败）',
+      type: 'scatter',
+      symbolSize: 8,
+      itemStyle: { color: '#f04438' },
+      data: overPts,
       z: 10,
     })
   }
+
   return {
     tooltip: {
       trigger: 'axis',
       valueFormatter: (v: unknown) => (typeof v === 'number' ? String(round4(v)) : String(v)),
     },
-    legend: { type: 'scroll', top: 0 },
-    grid: { left: 56, right: 24, top: 48, bottom: 40 },
-    xAxis: { type: 'value', name: '轮次', nameLocation: 'middle', nameGap: 26, min: 1, max: turns, minInterval: 1 },
-    yAxis: { type: 'value', name: '每轮（积分）' },
+    legend: { show: false }, // 图例用页面下方 HTML 版（移动版也能读）
+    grid: { left: 12, right: 20, top: 28, bottom: 44, containLabel: true },
+    xAxis: {
+      type: 'value',
+      name: '上下文 token',
+      nameLocation: 'middle',
+      nameGap: 26,
+      axisLabel: { formatter: (v: number) => (v >= 1000 ? `${Math.round(v / 1000)}K` : String(v)) },
+      splitLine: { lineStyle: { color: '#eef0f6' } },
+    },
+    yAxis: {
+      type: 'value',
+      name: '积分',
+      axisLabel: { formatter: (v: number) => String(round4(v)) },
+      splitLine: { lineStyle: { color: '#eef0f6' } },
+    },
     series,
   }
 })
+
+const curveMeta = computed(() => {
+  const c = curve.value
+  if (!c) return ''
+  const parts = [
+    `R=${c.R}`,
+    `采样 ${c.PointCount} 点（步进 ${fmtInt(c.Step)} / 上限 ${fmtInt(c.MaxTokens)}）`,
+    `命中率 ${fmtPct(c.HitRate)} · 输入输出比 ${fmt2(c.InOutRatio)}`,
+  ]
+  const cost = c.Cost
+  if (cost?.Available) {
+    parts.push(`成本时段系数 ×${fmt2(cost.TimeCoeff)}（${cost.TimeConfigSource === 'model' ? '模型级' : '全局'}）`)
+    parts.push(`分档来源 ${cost.TierSource === 'none' ? '未配分档' : cost.TierSource === 'model' ? '模型级' : '全局'}`)
+  }
+  return parts.join(' · ')
+})
+
+// 模型下拉：优先用统计表实体（ChannelModelID 能直接喂给曲线接口）
+function entityLabel(r: CostStatRow) {
+  const parts = [r.ChannelName || '(无渠道)', r.InternalModelID, r.ExternalModelName]
+  return parts.filter(Boolean).join(' / ')
+}
+function onEntityChange() {
+  paramsInited.value = false // 换模型后重新吃后端给出的默认采样参数
+  timeTouched.value = false
+  loadCurve()
+}
 
 // ===================================================================
 // C. 会话成本曲线
@@ -355,67 +389,142 @@ const sessionId = ref('')
 const loadingSession = ref(false)
 const sessionPoints = ref<SessionPoint[]>([])
 const sessionTotals = ref<{ CostCredits: number; SaleCredits: number } | null>(null)
+const sessionMeta = ref<{ Total: number; Limit: number; Truncated: boolean } | null>(null)
 
-// 会话候选：复用既有会话列表接口（字段 SessionID / SessionName）。
+// 会话请求序号守卫：切换会话立即清空旧数据，并丢弃过期响应（防止旧响应后到覆盖新会话）。
+let sessionSeq = 0
+
 async function loadSessions() {
   loadingSessions.value = true
   try {
     const res = await listSessions({ Page: 1, Size: 200 })
-    sessions.value = res.Data.List || []
-    if (!sessionId.value && sessions.value.length) sessionId.value = sessions.value[0].SessionID
+    sessions.value = res.Data.List ?? []
+    if (!sessionId.value && sessions.value.length) {
+      sessionId.value = sessions.value[0].SessionID
+      await loadSession()
+    }
   } catch (e: any) {
     setErr(e)
   } finally {
     loadingSessions.value = false
   }
 }
+
+// 下拉标签：名字 · 用户 · 模型 · 时间 · N 次调用（长文本由 el-select 截断，title 给全文）
 function sessionLabel(s: AdminSession): string {
-  return s.SessionName ? `${s.SessionName}（${s.SessionID}）` : s.SessionID
+  const t = (s.LastActive || s.CreatedAt || '').slice(5, 16).replace('T', ' ')
+  const name = s.SessionName || s.SessionID.slice(0, 8)
+  const user = s.UserNickname || s.UserName || ''
+  return [name, user, s.Model, t, `${s.Calls ?? 0} 次调用`].filter(Boolean).join(' · ')
+}
+
+// 切换会话：先清空（不给用户看到上一个会话的残留数据），再带序号取新数据。
+function onSessionChange() {
+  sessionPoints.value = []
+  sessionTotals.value = null
+  sessionMeta.value = null
+  loadSession()
 }
 
 async function loadSession() {
+  const seq = ++sessionSeq
   if (!sessionId.value) return
   loadingSession.value = true
   try {
     const res = await getCostSession(sessionId.value)
-    sessionPoints.value = res.Data.Points || []
-    sessionTotals.value = res.Data.Totals || null
+    if (seq !== sessionSeq) return // 已切到别的会话，丢弃过期响应
+    sessionPoints.value = res.Data.Points ?? []
+    sessionTotals.value = res.Data.Totals ?? null
+    sessionMeta.value = {
+      Total: res.Data.Total ?? 0,
+      Limit: res.Data.Limit ?? 0,
+      Truncated: !!res.Data.Truncated,
+    }
   } catch (e: any) {
+    if (seq !== sessionSeq) return
     setErr(e)
   } finally {
-    loadingSession.value = false
+    if (seq === sessionSeq) loadingSession.value = false
   }
 }
 
+// 失败轮判定：后端直接给 Failed（= Status=='failed'），两个都给时取或。
+function isFailedPoint(p: SessionPoint): boolean {
+  return p.Failed === true || (p.Status || '').toLowerCase() === 'failed'
+}
+
+// x 轴用 TurnNo（时间线序号，含失败轮）：失败轮占位、后续点不错位。
+// Turn 是「成功轮序号」，失败轮为 0，拿它当 x 会挤到最左边，不再使用。
+const failedPoints = computed<SessionPoint[]>(() => sessionPoints.value.filter(isFailedPoint))
+const failedCount = computed(() => failedPoints.value.length)
+
+// 失败轮红点：叠在图上，y 固定 0（失败轮金额恒 0），不参与正常曲线连接。
+const sessionFailedCoords = computed<[number, number][]>(() =>
+  failedPoints.value.map((p) => [p.TurnNo, 0]),
+)
+
+const sessionTruncatedText = computed(() => {
+  const m = sessionMeta.value
+  if (!m?.Truncated) return ''
+  return `仅显示最早 ${fmtInt(m.Limit)} 行，共 ${fmtInt(m.Total)} 行（可用 Limit 参数最多取 2000 行）`
+})
+
 const sessionOption = computed<EChartsCoreOption>(() => {
   const pts = sessionPoints.value
+  // 失败轮 y 置 null → 曲线在该轮断开，不使用 0 参与连线（避免把失败点连成「成本骤降」的假曲线）
+  const costData = pts.map((p) => [p.TurnNo, isFailedPoint(p) ? null : p.CostCredits])
+  const saleData = pts.map((p) => [p.TurnNo, isFailedPoint(p) ? null : p.SaleCredits])
   return {
     tooltip: {
       trigger: 'axis',
       valueFormatter: (v: unknown) => (typeof v === 'number' ? String(round4(v)) : String(v)),
     },
-    legend: { type: 'scroll', top: 0, data: ['成本', '售价'] },
-    grid: { left: 56, right: 24, top: 48, bottom: 40 },
-    xAxis: { type: 'value', name: '轮次', nameLocation: 'middle', nameGap: 26, min: 1, minInterval: 1 },
-    yAxis: { type: 'value', name: '积分' },
+    legend: { show: false },
+    grid: { left: 12, right: 20, top: 24, bottom: 44, containLabel: true },
+    xAxis: {
+      type: 'value',
+      name: '调用序号',
+      nameLocation: 'middle',
+      nameGap: 26,
+      min: 1,
+      minInterval: 1,
+      splitLine: { lineStyle: { color: '#eef0f6' } },
+    },
+    yAxis: {
+      type: 'value',
+      name: '积分',
+      axisLabel: { formatter: (v: number) => String(round4(v)) },
+      splitLine: { lineStyle: { color: '#eef0f6' } },
+    },
     series: [
       {
         name: '成本',
         type: 'line',
         showSymbol: true,
         symbolSize: 5,
-        lineStyle: { width: 2, color: '#5a5ce8' },
+        connectNulls: false, // 失败轮断开，不连成正常曲线
+        lineStyle: { width: 2.4, color: '#5a5ce8' },
         itemStyle: { color: '#5a5ce8' },
-        data: pts.map((p) => [p.Turn, p.CostCredits]),
+        data: costData,
       },
       {
         name: '售价',
         type: 'line',
         showSymbol: true,
         symbolSize: 5,
-        lineStyle: { width: 2, color: '#e6a23c' },
+        connectNulls: false,
+        lineStyle: { width: 2, type: 'dashed', color: '#e6a23c' },
         itemStyle: { color: '#e6a23c' },
-        data: pts.map((p) => [p.Turn, p.SaleCredits]),
+        data: saleData,
+      },
+      {
+        // 失败轮单独一条红点散点：不带线、不参与连接，仅占位标注
+        name: '失败轮（未计费）',
+        type: 'scatter',
+        symbolSize: 9,
+        itemStyle: { color: '#f04438' },
+        data: sessionFailedCoords.value,
+        z: 10,
       },
     ],
   }
@@ -424,23 +533,32 @@ const sessionOption = computed<EChartsCoreOption>(() => {
 // ===================================================================
 // 加载编排
 // ===================================================================
-const loading = computed(() => loadingStats.value || loadingCurves.value || loadingSession.value)
+const loading = computed(() => loadingStats.value || loadingCurve.value || loadingSession.value)
 
 async function loadAll() {
   errInfo.value = { message: '', requestId: '' }
-  await Promise.all([loadStats(), loadDefaults(), loadSessions()])
-  await loadCurves()
-  await loadSession()
+  await loadStats()
+  if (!curveEntity.value && curveEntities.value.length) {
+    const prefer = curveEntities.value.find((r) => r.ChannelModelID > 0) || curveEntities.value[0]
+    curveEntity.value = prefer.EntityKey
+  }
+  await Promise.all([loadCurve(), loadSessions()])
 }
 
 async function onRefresh() {
+  paramsInited.value = false
   await loadAll()
   if (!errInfo.value.message) ElMessage.success('已刷新')
 }
 
-onMounted(loadAll)
+onMounted(() => {
+  mq = window.matchMedia(NARROW_QUERY)
+  onMqChange(mq)
+  mq.addEventListener('change', onMqChange)
+  loadAll()
+})
 onUnmounted(() => {
-  if (debounceTimer !== undefined) window.clearTimeout(debounceTimer)
+  mq?.removeEventListener('change', onMqChange)
 })
 </script>
 
@@ -453,106 +571,200 @@ onUnmounted(() => {
     </div>
 
     <div class="panel-stack">
-      <!-- A. 统计表 -->
+      <!-- A. 成本统计（按当前实体聚合） -->
       <div class="card">
         <div class="block-title">
           成本统计
-          <el-tag size="small" effect="plain" type="info">渠道 × 内部模型 × 对外模型</el-tag>
+          <el-tag size="small" effect="plain">按当前实体聚合</el-tag>
+          <el-tag size="small" effect="plain" type="info">曾用名标注</el-tag>
         </div>
         <div class="block-desc">
-          按「渠道 × 内部模型 × 对外模型」聚合（仅 completed 消耗）：成本 = Σcost_credits、售价 = Σcredits_consumed、请求数、三段 token（输入/缓存读/输出）；
-          缓存命中率 = 缓存读 ÷ (输入 + 缓存读)，输入输出比 = 输入 ÷ 输出。表尾为全量合计行（不随排序变化）。
+          按「渠道 × 内部模型 × 对外模型」<b>当前实体</b>聚合（仅 completed 消耗）：改名/换绑自动归一到当前实体，
+          历史文本快照以「曾用名」标注；健康探测记账已从统计中移除（口径已确认，售价数字下降属预期修正）。
+          表尾为全量合计（不随排序变化）。
         </div>
-        <el-table
-          v-loading="loadingStats"
-          :data="statsRows"
-          border
-          stripe
-          show-summary
-          :summary-method="sumSummary"
-          class="table-nowrap"
-        >
-          <el-table-column prop="ChannelName" label="渠道" min-width="150" sortable />
-          <el-table-column prop="InternalModelID" label="内部模型" min-width="170" sortable show-overflow-tooltip />
-          <el-table-column prop="ExternalModelName" label="对外模型" min-width="150" sortable show-overflow-tooltip />
-          <el-table-column prop="CostCredits" label="成本(积分)" min-width="120" align="right" sortable :formatter="cellCost" />
-          <el-table-column prop="SaleCredits" label="售价(积分)" min-width="120" align="right" sortable :formatter="cellCost" />
-          <el-table-column prop="CacheHitRate" label="缓存命中率(%)" min-width="140" align="right" sortable :formatter="cellHit" />
-          <el-table-column prop="InputOutputRatio" label="输入输出比" min-width="120" align="right" sortable :formatter="cellRatio" />
-          <el-table-column prop="Requests" label="请求数" min-width="100" align="right" sortable :formatter="cellInt" />
-          <el-table-column prop="InputTokens" label="输入token" min-width="120" align="right" sortable :formatter="cellInt" />
-          <el-table-column prop="CacheReadTokens" label="缓存读token" min-width="130" align="right" sortable :formatter="cellInt" />
-          <el-table-column prop="OutputTokens" label="输出token" min-width="120" align="right" sortable :formatter="cellInt" />
-        </el-table>
-        <el-empty v-if="!loadingStats && !statsRows.length" description="暂无成本数据" />
+
+        <!-- 桌面：表格 -->
+        <div class="desktop-only">
+          <el-table
+            v-loading="loadingStats"
+            :data="statsRows"
+            :row-key="rowKey"
+            border
+            stripe
+            show-summary
+            :summary-method="sumSummary"
+            class="table-nowrap"
+          >
+            <el-table-column prop="ChannelName" label="渠道" min-width="140" sortable />
+            <el-table-column prop="InternalModelID" label="内部模型" min-width="160" sortable show-overflow-tooltip />
+            <el-table-column prop="ExternalModelName" label="对外模型" min-width="170" sortable show-overflow-tooltip>
+              <template #default="{ row }">
+                <span>{{ row.ExternalModelName }}</span>
+                <el-tooltip v-if="oldNames(row).length" :content="oldNamesTitle(row)" placement="top" :show-after="150">
+                  <span class="oldname">曾用名 {{ oldNames(row).length }}</span>
+                </el-tooltip>
+              </template>
+            </el-table-column>
+            <el-table-column prop="CostCredits" label="成本(积分)" min-width="118" align="right" sortable :formatter="cellCost" />
+            <el-table-column prop="SaleCredits" label="售价(积分)" min-width="118" align="right" sortable :formatter="cellCost" />
+            <el-table-column prop="CacheHitRate" label="缓存命中率" min-width="120" align="right" sortable :formatter="cellHit" />
+            <el-table-column prop="InputOutputRatio" label="输入输出比" min-width="110" align="right" sortable :formatter="cellRatio" />
+            <el-table-column prop="Requests" label="请求数" min-width="96" align="right" sortable :formatter="cellInt" />
+            <el-table-column prop="InputTokens" label="输入token" min-width="110" align="right" sortable :formatter="cellInt" />
+            <el-table-column prop="CacheReadTokens" label="缓存读token" min-width="126" align="right" sortable :formatter="cellInt" />
+            <el-table-column prop="OutputTokens" label="输出token" min-width="110" align="right" sortable :formatter="cellInt" />
+          </el-table>
+          <el-empty v-if="!loadingStats && !statsRows.length" description="暂无成本数据" />
+        </div>
+
+        <!-- 窄屏：数字墙 + 实体行（单列、不横向滚动） -->
+        <div class="mobile-only">
+          <div class="sum-wall">
+            <div class="sum-item">
+              <b>{{ statsTotal ? fmt2(statsTotal.CostCredits) : '-' }}</b>
+              <span>总成本</span>
+            </div>
+            <div class="sum-item sale">
+              <b>{{ statsTotal ? fmt2(statsTotal.SaleCredits) : '-' }}</b>
+              <span>总售价</span>
+            </div>
+            <div class="sum-item">
+              <b>{{ statsTotal ? fmtInt(statsTotal.Requests) : '-' }}</b>
+              <span>请求</span>
+            </div>
+          </div>
+          <div v-for="r in statsRows" :key="r.EntityKey" class="entity-row">
+            <div class="entity-name">
+              <div class="n1">{{ r.ExternalModelName || r.InternalModelID || '(未知模型)' }}</div>
+              <div class="n2">
+                {{ r.ChannelName || '(无渠道)' }} · {{ r.InternalModelID }}
+                <span v-if="oldNames(r).length" class="oldname">曾用名 {{ oldNames(r).length }}</span>
+              </div>
+            </div>
+            <div class="entity-nums">
+              <div class="n-price">{{ fmt2(r.SaleCredits) }}</div>
+              <div class="n-sub">售价 · 成本 {{ fmt2(r.CostCredits) }}</div>
+              <div class="n-sub">请求 {{ fmtInt(r.Requests) }} · 命中 {{ fmtPct(r.CacheHitRate) }}</div>
+            </div>
+          </div>
+          <el-empty v-if="!loadingStats && !statsRows.length" description="暂无成本数据" :image-size="60" />
+        </div>
       </div>
 
       <!-- B. 模型定价曲线 -->
       <div class="card">
         <div class="block-title">
           模型定价曲线
-          <el-tag size="small" effect="plain">x = 轮次 1..{{ curveTurns }}</el-tag>
+          <el-tag size="small" effect="plain">含分档 × 分时段</el-tag>
         </div>
         <div class="block-desc">
-          每轮成本 = （缓存读×缓存读价 + 新输入×输入价 + 输出×输出价）÷ R（积分；R 默认 10000）；缓存读随轮次累计增长。
-          曲线用当前费率推算，与会话曲线的历史实际值口径不同。
+          每轮成本 =（输入×输入价 + 缓存读×缓存读价 + 输出×输出价）× 时段系数 × 分档系数 ÷ R；
+          成本线取渠道内部模型配置、售价线取对外模型配置。跨档画拐点竖线，超出分档上限的区段断线并标红
+          （真实请求会失败，不再画更贵的线）。
         </div>
+
         <div class="curve-toolbar">
           <span class="p-label">内部模型</span>
           <el-select
-            v-model="selectedKeys"
-            multiple
+            v-model="curveEntity"
             filterable
-            collapse-tags
-            collapse-tags-tooltip
-            placeholder="选择内部模型（可多选）"
+            placeholder="选择模型（来自成本统计实体）"
             class="curve-select"
+            @change="onEntityChange"
           >
-            <el-option v-for="c in curves" :key="curveKey(c)" :label="curveLabel(c)" :value="curveKey(c)" />
+            <el-option v-for="r in curveEntities" :key="r.EntityKey" :label="entityLabel(r)" :value="r.EntityKey">
+              <span class="opt-main">{{ entityLabel(r) }}</span>
+              <span class="opt-sub">{{ fmt2(r.CostCredits) }} / {{ fmt2(r.SaleCredits) }}</span>
+            </el-option>
           </el-select>
-          <span class="p-label">每轮新增输入token</span>
+
+          <span class="p-label">步进</span>
           <el-input-number
-            v-model="params.perTurnInput"
-            :min="0"
-            :step="1000"
+            v-model="curveParams.step"
+            :min="1"
+            :step="500"
+            :controls="!isNarrow"
             controls-position="right"
             class="curve-num"
-            @change="scheduleReload"
+            @change="onParamChange"
           />
-          <span class="p-label">缓存命中率(%)</span>
+          <span class="p-label">上限 token</span>
+          <el-input-number
+            v-model="curveParams.maxTokens"
+            :min="0"
+            :step="10000"
+            :controls="!isNarrow"
+            controls-position="right"
+            class="curve-num"
+            @change="onParamChange"
+          />
+          <span class="p-label">缓存命中率 %</span>
           <el-input-number
             v-model="hitRatePct"
             :min="0"
             :max="100"
-            :step="1"
+            :step="5"
+            :controls="!isNarrow"
             controls-position="right"
             class="curve-num"
-            @change="scheduleReload"
+            @change="onParamChange"
           />
           <span class="p-label">输入输出比</span>
           <el-input-number
-            v-model="params.inOutRatio"
+            v-model="curveParams.inOutRatio"
             :min="0"
-            :step="0.1"
+            :step="1"
+            :controls="!isNarrow"
             controls-position="right"
             class="curve-num"
-            @change="scheduleReload"
+            @change="onParamChange"
           />
-          <el-radio-group v-model="mode" class="curve-mode">
+          <span class="p-label">时段</span>
+          <el-select v-model="timeOptionKey" placeholder="时段" class="curve-time" @change="onTimeChange">
+            <el-option v-for="t in timeOptions" :key="timeOptionValue(t)" :label="timeOptionLabel(t)" :value="timeOptionValue(t)" />
+          </el-select>
+          <span class="switch-wrap">
+            <el-switch v-model="useCoeff" size="small" />
+            <span class="p-label">{{ useCoeff ? '含系数' : '不含系数' }}</span>
+          </span>
+          <el-radio-group v-model="curveMode" class="curve-mode">
+            <el-radio-button value="both">两条</el-radio-button>
             <el-radio-button value="cost">成本</el-radio-button>
             <el-radio-button value="sale">售价</el-radio-button>
-            <el-radio-button value="both">两者</el-radio-button>
           </el-radio-group>
         </div>
-        <VChart v-if="displaySeries.length" v-loading="loadingCurves" :option="curveOption" height="380px" />
-        <div v-else class="empty-hint">
-          {{ curves.length ? '请选择至少一个内部模型以绘制曲线。' : '暂无可绘制的模型曲线。' }}
+
+        <div v-loading="loadingCurve">
+          <VChart
+            v-if="shownLines.length"
+            :option="curveOption"
+            :height="isNarrow ? '240px' : '360px'"
+          />
+          <div v-else class="empty-hint">
+            {{ curve ? '所选模型没有可用曲线（见下方原因）。' : '暂无定价曲线数据。' }}
+          </div>
+          <div v-if="unavailableHints.length" class="unavailable">
+            <el-tag v-for="h in unavailableHints" :key="h.name" size="small" type="danger" effect="plain">
+              {{ h.name }}不可用：{{ h.reason }}
+            </el-tag>
+          </div>
         </div>
-        <div v-if="crossings.length" class="cross-list">
-          <span class="cross-title">同指标交点（成本↔成本 / 售价↔售价；轮次 · 积分）：</span>
-          <el-tag v-for="(c, i) in crossings" :key="i" size="small" type="warning" effect="plain" class="cross-tag">
-            #{{ i + 1 }} {{ c.tag }} ≈ 轮次 {{ fmt2(c.t) }} · {{ fmt2(c.y) }}
-          </el-tag>
+
+        <div class="legend">
+          <span v-for="l in shownLines" :key="l.key">
+            <i
+              class="line-mark"
+              :class="{ dashed: l.dashed }"
+              :style="l.dashed ? { borderColor: l.color } : { background: l.color }"
+            />{{ l.name }}
+          </span>
+          <span><i class="dot-mark tier" />升档拐点</span>
+          <span><i class="dot-mark over" />超档（计费失败）</span>
+        </div>
+        <div class="hint">{{ curveMeta }}</div>
+        <div class="hint">
+          时段系数按所选时段整笔计（跨时段不切分）；系数开关只切后端给的两套序列（含 / 不含系数），前端不做乘法。
         </div>
       </div>
 
@@ -560,12 +772,13 @@ onUnmounted(() => {
       <div class="card">
         <div class="block-title">
           会话成本曲线
-          <el-tag size="small" effect="plain" type="info">{{ sessionId || '未选择' }}</el-tag>
+          <el-tag size="small" effect="plain" type="info">切换防竞态</el-tag>
         </div>
         <div class="block-desc">
-          取该会话每一轮的历史实际 cost_credits / credits_consumed（含当时时段/分档系数），x = 轮次。
+          取该会话逐次调用的历史实际 cost_credits / credits_consumed（含当时时段/分档系数），x 轴 = 调用序号（含失败轮）。
+          切换会话时立即清空旧数据并丢弃过期响应。
         </div>
-        <div class="toolbar">
+        <div class="curve-toolbar">
           <span class="p-label">会话</span>
           <el-select
             v-model="sessionId"
@@ -573,19 +786,43 @@ onUnmounted(() => {
             :loading="loadingSessions"
             placeholder="选择会话"
             class="session-select"
-            @change="loadSession"
+            @change="onSessionChange"
           >
-            <el-option v-for="s in sessions" :key="s.SessionID" :label="sessionLabel(s)" :value="s.SessionID" />
+            <el-option v-for="s in sessions" :key="s.SessionID" :label="sessionLabel(s)" :value="s.SessionID">
+              <span class="opt-main" :title="sessionLabel(s)">{{ sessionLabel(s) }}</span>
+            </el-option>
           </el-select>
           <template v-if="sessionTotals">
-            <el-tag size="small" effect="plain" type="info">合计成本 {{ fmt2(sessionTotals.CostCredits) }}</el-tag>
-            <el-tag size="small" effect="plain" type="success">合计售价 {{ fmt2(sessionTotals.SaleCredits) }}</el-tag>
-            <span class="page-count">共 {{ sessionPoints.length }} 轮</span>
+            <el-tag size="small" effect="plain" type="info">成本 {{ fmt2(sessionTotals.CostCredits) }}</el-tag>
+            <el-tag size="small" effect="plain" type="warning">售价 {{ fmt2(sessionTotals.SaleCredits) }}</el-tag>
+            <span class="page-count">{{ sessionPoints.length }} 次调用</span>
+            <el-tag v-if="failedCount" size="small" type="danger" effect="plain">
+              含 {{ failedCount }} 次失败调用，未计费
+            </el-tag>
           </template>
         </div>
-        <VChart v-if="sessionPoints.length" v-loading="loadingSession" :option="sessionOption" height="340px" />
-        <div v-else class="empty-hint">
-          {{ sessionId ? '该会话暂无逐轮成本数据。' : '请选择一个会话以查看逐轮成本/售价曲线。' }}
+        <div v-if="sessionTruncatedText" class="trunc-notice">
+          <el-tag size="small" type="warning" effect="plain">已截断</el-tag>
+          <span>{{ sessionTruncatedText }}</span>
+        </div>
+        <div v-loading="loadingSession">
+          <VChart
+            v-if="sessionPoints.length"
+            :option="sessionOption"
+            :height="isNarrow ? '220px' : '320px'"
+          />
+          <div v-else class="empty-hint">
+            {{ sessionId ? '该会话暂无逐轮成本数据。' : '请选择一个会话以查看逐轮成本/售价曲线。' }}
+          </div>
+        </div>
+        <div class="legend">
+          <span><i class="line-mark" style="background: #5a5ce8" />成本</span>
+          <span><i class="line-mark dashed" style="border-color: #e6a23c" />售价</span>
+          <span><i class="dot-mark over" />失败轮（未计费）</span>
+        </div>
+        <div class="hint">
+          x 轴用调用序号（含失败轮，1..{{ sessionPoints.length }}）：失败轮打红点、金额按 0 呈现且不参与连线，后续轮次不左移。
+          合计只累加成功轮。
         </div>
       </div>
 
@@ -627,35 +864,213 @@ onUnmounted(() => {
   margin-bottom: 14px;
 }
 .curve-select {
-  min-width: 320px;
-  max-width: 520px;
+  min-width: 280px;
+  max-width: 460px;
+}
+.curve-time {
+  min-width: 200px;
 }
 .curve-num {
-  width: 140px;
+  width: 132px;
+}
+.switch-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 .curve-mode {
   margin-left: 4px;
 }
 .session-select {
-  width: 380px;
+  width: 420px;
+  max-width: 100%;
 }
-.cross-list {
-  margin-top: 12px;
+.opt-main {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.opt-sub {
+  float: right;
+  color: var(--color-text-tertiary);
+  font-size: 11px;
+  margin-left: 12px;
+}
+.oldname {
+  margin-left: 6px;
+  font-size: 11px;
+  color: var(--color-text-tertiary);
+  cursor: help;
+}
+.unavailable {
   display: flex;
   flex-wrap: wrap;
-  align-items: center;
   gap: 8px;
+  margin-top: 10px;
 }
-.cross-title {
-  font-size: 13px;
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  margin-top: 10px;
+  font-size: 12px;
   color: var(--color-text-secondary);
 }
-.cross-tag {
-  font-family: 'SF Mono', Menlo, Consolas, monospace;
+.line-mark {
+  display: inline-block;
+  width: 14px;
+  height: 3px;
+  border-radius: 2px;
+  margin-right: 5px;
+  vertical-align: 2px;
+}
+.line-mark.dashed {
+  height: 0;
+  border-top: 2px dashed currentColor;
+  background: transparent;
+  border-radius: 0;
+}
+.dot-mark {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+  margin-right: 5px;
+  vertical-align: 0;
+}
+.dot-mark.tier {
+  background: #f79009;
+}
+.dot-mark.over {
+  background: #f04438;
+  border-radius: 50%;
+}
+.hint {
+  margin-top: 6px;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--color-text-tertiary);
 }
 .empty-hint {
   font-size: 13px;
   color: var(--color-text-tertiary);
-  padding: 8px 4px;
+  padding: 10px 4px;
+}
+.trunc-notice {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 10px;
+  font-size: 12px;
+  color: var(--color-warning);
+}
+
+/* ===== 移动版：数字墙 + 实体行 ===== */
+.desktop-only {
+  display: block;
+}
+.mobile-only {
+  display: none;
+}
+.sum-wall {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.sum-item {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.sum-item b {
+  font-size: 18px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+  font-family: 'SF Mono', Consolas, monospace;
+  color: var(--color-text);
+}
+.sum-item span {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+.sum-item.sale b {
+  color: #b45309;
+}
+.entity-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 0;
+  border-bottom: 1px dashed var(--color-border);
+}
+.entity-row:last-of-type {
+  border-bottom: none;
+}
+.entity-name {
+  min-width: 0;
+  flex: 1;
+}
+.entity-name .n1 {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--color-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.entity-name .n2 {
+  font-size: 12px;
+  color: var(--color-text-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.entity-nums {
+  text-align: right;
+  flex-shrink: 0;
+}
+.entity-nums .n-price {
+  font-size: 15px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  font-family: 'SF Mono', Consolas, monospace;
+  color: var(--color-text);
+}
+.entity-nums .n-sub {
+  font-size: 11px;
+  color: var(--color-text-tertiary);
+}
+
+@media (max-width: 768px) {
+  .desktop-only {
+    display: none;
+  }
+  .mobile-only {
+    display: block;
+  }
+  .block-desc {
+    font-size: 14px;
+  }
+  .curve-toolbar {
+    gap: 8px;
+    align-items: stretch;
+  }
+  .curve-select,
+  .curve-time,
+  .session-select,
+  .curve-num {
+    width: 100%;
+    min-width: 0;
+    max-width: none;
+  }
+  .p-label {
+    font-size: 13px;
+  }
 }
 </style>
