@@ -6,6 +6,7 @@ import type { CallLogView } from '@/api/dev'
 import MessageBubbleGroup from '@/components/MessageBubbleGroup.vue'
 import CallResponseView from '@/components/CallResponseView.vue'
 import ReqParamsView from '@/components/ReqParamsView.vue'
+import MsgTruncatedNotice from '@/components/MsgTruncatedNotice.vue'
 import { asMessageList, fmtJson } from '@/utils/messageParts'
 import { hasClipping, toReqParamsView, type ReqParamsView as ReqParamsModel } from '@/utils/reqParams'
 import { asUpstreamUsage, fmtSeg, parseUsageSegments, segResolved } from '@/utils/usage'
@@ -251,6 +252,8 @@ function gotoRequest() {
 
     <!-- 会话详情形态：消息先按对话时间线铺开（用户右 / 助手左），其余信息折叠在下方 -->
     <div v-if="variant === 'timeline' && log" class="timeline">
+      <!-- 消息被按体积裁剪时先提示：提示紧贴消息区，避免把「被裁掉的历史」误读成「用户没发」 -->
+      <MsgTruncatedNotice :info="reqParams?.MessagesTruncated" />
       <div
         v-for="(m, i) in reqMsgs"
         :key="i"
@@ -313,8 +316,18 @@ function gotoRequest() {
         <template #title>
           <span>请求增量（{{ reqMsgs.length }} 条）</span>
           <span v-if="roleSummary" class="title-sub">{{ roleSummary }}</span>
+          <el-tag
+            v-if="reqParams?.MessagesTruncated"
+            size="small"
+            type="warning"
+            effect="plain"
+            class="title-tag"
+          >
+            已裁剪
+          </el-tag>
         </template>
         <template v-if="reqMsgs.length">
+          <MsgTruncatedNotice :info="reqParams?.MessagesTruncated" />
           <MessageBubbleGroup
             v-for="(m, i) in reqMsgs"
             :key="i"
@@ -324,7 +337,14 @@ function gotoRequest() {
             empty-text="（该条消息无文本内容）"
           />
           <el-collapse class="raw-collapse">
-            <el-collapse-item name="req-raw" title="原始 JSON（增量消息数组，完整不截断）">
+            <el-collapse-item
+              name="req-raw"
+              :title="
+                reqParams?.MessagesTruncated
+                  ? '原始 JSON（落库的增量消息数组，已按体积上限裁剪）'
+                  : '原始 JSON（增量消息数组，完整不截断）'
+              "
+            >
               <pre class="mono log-pre">{{ reqRaw }}</pre>
             </el-collapse-item>
           </el-collapse>

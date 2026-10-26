@@ -101,6 +101,8 @@ export interface BillingItem {
   CreditsConsumed: number
   Status: string // completed | failed
   CallTime: string
+  // 渠道显示名（后端 devBillingListItem 白名单内字段，非密钥）；缺失表示该账单无渠道映射
+  ChannelName?: string
   // 网关请求链路 ID：报给平台即可定位这一次请求（列表按 request_id 归并后取主行的 id）
   RequestID?: string
   // 该请求共产生的账单条数（>1 表示发生过候选/上游重试；列表已归并成一行）

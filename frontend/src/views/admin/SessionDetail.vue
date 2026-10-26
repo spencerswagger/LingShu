@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { listSessions, listSessionCalls, type AdminSession, type CallLogView } from '@/api/admin'
 import { fmtDateTime } from '@/utils/format'
@@ -24,7 +24,12 @@ const meta = ref<AdminSession | null>(null)
 const errInfo = ref<{ message: string; requestId: string }>({ message: '', requestId: '' })
 const calls = ref<CallLogView[]>([])
 
+// 请求序号守卫：离开路由或重复进入时，旧响应不得写入（会话详情一次并发两个请求）
+const alive = ref(true)
+let loadSeq = 0
+
 onMounted(async () => {
+  const my = ++loadSeq
   loading.value = true
   errInfo.value = { message: '', requestId: '' }
   try {
@@ -32,15 +37,22 @@ onMounted(async () => {
       listSessions({ Q: sessionId, Size: 1 }, isSelf.value ? '/dev' : '/admin'),
       listSessionCalls(sessionId, isSelf.value ? '/dev' : '/admin'),
     ])
+    if (!alive.value || my !== loadSeq) return
     meta.value = metaRes.Data.List?.[0] || null
     calls.value = callsRes.Data.List || []
     // 会话元信息缺失（已被清理等）：不阻塞调用记录展示
     if (!meta.value) errInfo.value = { message: '会话信息不可用（记录可能已被清理）', requestId: '' }
   } catch (e: any) {
+    if (!alive.value || my !== loadSeq) return
     errInfo.value = { message: e?.message, requestId: e?.requestId }
   } finally {
-    loading.value = false
+    if (alive.value && my === loadSeq) loading.value = false
   }
+})
+
+onBeforeUnmount(() => {
+  alive.value = false
+  loadSeq++
 })
 
 // 渠道/密钥/内部模型：优先 Decision.result，缺省回退 attempts 末条。

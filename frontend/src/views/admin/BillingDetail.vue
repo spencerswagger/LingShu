@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { getBilling } from '@/api/admin'
 import type { BillingDetail } from '@/api/dev'
@@ -41,17 +41,29 @@ function respKindType(kind: string) {
   return respKindTypes[kind] || 'info'
 }
 
+// 请求序号守卫：同一路由内快速切换（如详情→详情）或离开页面时，旧响应不得覆盖新数据。
+const alive = ref(true)
+let loadSeq = 0
+
 onMounted(async () => {
+  const my = ++loadSeq
   loading.value = true
   errInfo.value = { message: '', requestId: '' }
   try {
     const res = await getBilling(billingId, isSelf.value ? '/dev' : '/admin')
+    if (!alive.value || my !== loadSeq) return
     detail.value = res.Data
   } catch (e: any) {
+    if (!alive.value || my !== loadSeq) return
     errInfo.value = { message: e?.message, requestId: e?.requestId }
   } finally {
-    loading.value = false
+    if (alive.value && my === loadSeq) loading.value = false
   }
+})
+
+onBeforeUnmount(() => {
+  alive.value = false
+  loadSeq++
 })
 
 function fmt(n: number | undefined) {

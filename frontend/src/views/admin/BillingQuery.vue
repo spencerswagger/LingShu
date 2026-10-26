@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   listBillings,
@@ -149,11 +149,15 @@ async function loadChildren(row: AdminBillingItem) {
   childrenLoading.value = { ...childrenLoading.value, [row.BillingID]: true }
   try {
     const res = await listBillings({ RequestID: row.RequestID, Group: 0, Page: 1, Size: 50 }, base.value)
+    if (!alive.value) return
     childrenMap.value = { ...childrenMap.value, [row.BillingID]: res.Data.List || [] }
   } catch (e: any) {
+    if (!alive.value) return
     errInfo.value = { message: e?.message, requestId: e?.requestId }
   } finally {
-    childrenLoading.value = { ...childrenLoading.value, [row.BillingID]: false }
+    if (alive.value) {
+      childrenLoading.value = { ...childrenLoading.value, [row.BillingID]: false }
+    }
   }
 }
 
@@ -199,7 +203,17 @@ function openDetail(row: AdminBillingItem) {
   router.push(isSelf.value ? `/dev/billings/${row.BillingID}` : `/admin/billings/${row.BillingID}`)
 }
 
+// ===== 请求序号守卫（Owl 建议项）=====
+// 连点翻页 / 快速切筛选条件时，先发的请求可能后返回，把新结果覆盖成旧的。
+// 这里给每次 load 发一个自增序号，只有「当前最新序号」的响应才允许写入状态；
+// 组件卸载或路由离开时序号自增一次，把在途请求整体作废（避免离开后仍写旧数据）。
+// 选序号而不是 AbortController：load 里是 Promise.all 两个请求，序号守卫一处判定即可
+// 覆盖两个响应，也不用为每个请求维护自己的 controller 生命周期。
+let loadSeq = 0
+const alive = ref(true)
+
 async function load() {
+  const my = ++loadSeq
   loading.value = true
   errInfo.value = { message: '', requestId: '' }
   const params = buildParams({ Page: page.value, Size: size.value })
@@ -209,13 +223,17 @@ async function load() {
       listBillings(params, base.value),
       getBillingStats(statsParams, base.value),
     ])
+    // 过期响应直接丢弃（不写列表、不写统计、不动 loading）
+    if (!alive.value || my !== loadSeq) return
     list.value = billRes.Data.List
     total.value = billRes.Data.Total
     stats.value = statsRes.Data
   } catch (e: any) {
+    if (!alive.value || my !== loadSeq) return
     errInfo.value = { message: e?.message, requestId: e?.requestId }
   } finally {
-    loading.value = false
+    // 只有最新一次请求结束时才清 loading，否则旧请求返回会把新请求的 loading 关掉
+    if (alive.value && my === loadSeq) loading.value = false
   }
 }
 
@@ -446,6 +464,12 @@ onMounted(() => {
   load()
 })
 
+// 卸载/离开路由：作废在途请求（序号自增后，旧响应一律被判过期）
+onBeforeUnmount(() => {
+  alive.value = false
+  loadSeq++
+})
+
 // ===== 展示格式化 =====
 // token 用量两行展示：第一行 输入/输出，第二行 缓存读（第二行全 0 不显示）
 function tokenLine1(row: AdminBillingItem): string {
@@ -470,6 +494,13 @@ function keyLabel(row: AdminBillingItem): string {
 function fmtMs(ms?: number | null): string {
   if (ms == null) return '-'
   return ms >= 1000 ? `${(ms / 1000).toFixed(2)}s` : `${ms}ms`
+}
+
+// 渠道显示名：管理端缺失用 '-'；开发者端该字段在白名单内，缺失时明确「不展示」，
+// 不要留空让人以为「这次请求没走渠道」（也提示别为补字段去动别的接口）。
+function rowChannelLabel(row: AdminBillingItem): string {
+  if (row.ChannelName) return row.ChannelName
+  return isSelf.value ? '不展示' : '-'
 }
 
 // 生成速率：输出 token / (总耗时 - 首字耗时)（流式）；非流式无首字 → 输出 / 总耗时。
@@ -671,7 +702,7 @@ function sessionLabel(s: AdminSession): string {
                       <span v-if="!isSelf" class="sub-dim">{{ c.InternalModelID || '-' }}</span>
                     </td>
                     <td>
-                      {{ c.ChannelName || '-' }}
+                      {{ rowChannelLabel(c) }}
                       <span v-if="!isSelf" class="sub-dim">{{ c.KeyName || '-' }}</span>
                     </td>
                     <td class="r">{{ tokenLine1(c) }}</td>
@@ -848,7 +879,7 @@ function sessionLabel(s: AdminSession): string {
           </template>
           <template #default="{ row }">
             <div class="t-time">
-              <span class="t-date">{{ row.ChannelName || '-' }}</span>
+              <span class="t-date">{{ rowChannelLabel(row) }}</span>
               <span v-if="!isSelf" class="t-clock">{{ keyLabel(row) }}</span>
             </div>
           </template>
@@ -965,7 +996,7 @@ function sessionLabel(s: AdminSession): string {
             </el-tag>
           </div>
           <div class="bc-sub">
-            {{ row.ChannelName || '-' }}<template v-if="!isSelf && row.KeyName"> · {{ row.KeyName }}</template>
+            {{ rowChannelLabel(row) }}<template v-if="!isSelf && row.KeyName"> · {{ row.KeyName }}</template>
           </div>
           <div class="bc-sub">{{ tokenLine1(row) }}</div>
           <div class="bc-foot">

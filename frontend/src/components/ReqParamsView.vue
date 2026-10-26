@@ -19,6 +19,8 @@ const p = computed(() => props.params)
 
 const omittedCount = computed(() => (p.value?.Params || []).filter((r) => r.Status === 'omitted').length)
 const droppedCount = computed(() => (p.value?.Dropped || []).length)
+// 命中敏感键、值被后端置成 "redacted" 的参数（原文不落库）
+const redactedKeys = computed(() => (p.value?.Params || []).filter((r) => r.Status === 'redacted').map((r) => r.Key))
 
 // 值被「省略体积」的键名（不含 tools —— tools 本体就是摘要，单独展示）。
 // 以 params 里的 omitted:NB 占位为主；后端若把某个键记进 summarized 而值没换标记，
@@ -40,6 +42,7 @@ const paramsHint = computed(() => {
   const parts: string[] = []
   if (omittedCount.value) parts.push(`${omittedCount.value} 项值已省略`)
   if (droppedCount.value) parts.push(`${droppedCount.value} 项已裁剪`)
+  if (redactedKeys.value.length) parts.push(`${redactedKeys.value.length} 项已脱敏`)
   return parts.length ? `共 ${total} 项（${parts.join('，')}）` : `共 ${total} 项`
 })
 
@@ -68,7 +71,7 @@ function copy(text: string) {
         class="rp-alert"
         title="参数快照超出体积预算，非受保护参数已整体裁掉"
       />
-      <div v-if="p.Dropped.length || omittedKeys.length" class="rp-clip">
+      <div v-if="p.Dropped.length || omittedKeys.length || redactedKeys.length" class="rp-clip">
         <div v-if="omittedKeys.length" class="rp-clip-line">
           <span class="rp-clip-tag is-omitted">值已省略</span>
           <span class="rp-clip-text mono">{{ omittedKeys.join('、') }}</span>
@@ -77,6 +80,11 @@ function copy(text: string) {
           <span class="rp-clip-tag is-dropped">已裁剪</span>
           <span class="rp-clip-text mono">{{ p.Dropped.join('、') }}</span>
           <span class="rp-clip-hint">（超 8KB 预算被丢弃，键名保留）</span>
+        </div>
+        <div v-if="redactedKeys.length" class="rp-clip-line">
+          <span class="rp-clip-tag is-redacted">已脱敏</span>
+          <span class="rp-clip-text mono">{{ redactedKeys.join('、') }}</span>
+          <span class="rp-clip-hint">（命中敏感键，值不落库）</span>
         </div>
       </div>
 
@@ -103,7 +111,13 @@ function copy(text: string) {
           </div>
           <div class="rp-row">
             <span class="rp-key">消息条数</span>
-            <span class="rp-val">{{ p.MessageCount == null ? '—' : fmtNum(p.MessageCount) }}</span>
+            <span class="rp-val">
+              {{ p.MessageCount == null ? '—' : fmtNum(p.MessageCount) }}
+              <!-- 消息体超 256KB 时后端从最旧开始裁：条数是原始条数，实际落库的少于它 -->
+              <el-tag v-if="p.MessagesTruncated" size="small" effect="plain" type="warning">
+                已裁剪，实际保留 {{ p.MessagesTruncated.KeptCount ?? '?' }} 条
+              </el-tag>
+            </span>
           </div>
         </div>
 
@@ -139,6 +153,7 @@ function copy(text: string) {
               已省略 {{ row.OmittedBytes }}B
             </el-tag>
             <el-tag v-else-if="row.Status === 'dropped'" size="small" effect="plain" type="danger">已裁剪</el-tag>
+            <el-tag v-else-if="row.Status === 'redacted'" size="small" effect="plain" type="info">已脱敏</el-tag>
             <span v-else-if="row.Text.length > 1" class="rp-copy" role="button" title="复制该值" @click="copy(row.Text)">
               复制
             </span>
@@ -149,6 +164,9 @@ function copy(text: string) {
           </div>
           <div v-else-if="row.Status === 'omitted'" class="rp-param-val rp-muted">
             值超过单字段上限（2KB），落库时替换为 <span class="mono">{{ row.Text }}</span>，键本身保留
+          </div>
+          <div v-else-if="row.Status === 'redacted'" class="rp-param-val rp-muted">
+            该键命中敏感键黑名单（凭据/身份类），值已置为 <span class="mono">redacted</span>，原文不落库
           </div>
           <div v-else class="rp-param-val rp-muted">该字段因快照超出 8KB 预算被丢弃，仅保留键名</div>
         </div>
@@ -243,6 +261,10 @@ function copy(text: string) {
 .rp-clip-tag.is-dropped {
   background: #fcd5d2;
   color: #b42318;
+}
+.rp-clip-tag.is-redacted {
+  background: var(--el-color-info-light-9, #f0f1f4);
+  color: var(--color-text-secondary, #667085);
 }
 .rp-clip-text {
   word-break: break-all;
@@ -353,6 +375,10 @@ function copy(text: string) {
 .rp-param.st-dropped {
   border-color: var(--el-color-danger-light-5, #f79b94);
   background: var(--el-color-danger-light-9, #fef0ef);
+}
+.rp-param.st-redacted {
+  border-color: var(--color-border-strong, #dce1ea);
+  background: var(--el-fill-color-lighter, #fafbfd);
 }
 .rp-param-head {
   display: flex;
