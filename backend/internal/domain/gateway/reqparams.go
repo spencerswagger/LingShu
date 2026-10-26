@@ -353,14 +353,17 @@ func overBudget(snap reqParamsSnapshot) bool {
 const coreKVCount = 16
 
 // capCoreString 核心字段的长度截断（异常长的 URL/模型名不允许撑爆预算），被截断时记名。
+// 截断走 truncateUTF8（按字符边界），避免中文模型名/长 URL 被切成半个字符后
+// 被 JSON 编码成 U+FFFD（快照「变花」）。
 func capCoreString(v string, max int, name string, snap *reqParamsSnapshot) string {
-	if len(v) <= max {
+	out, truncated := truncateUTF8(v, max, "...")
+	if !truncated {
 		return v
 	}
 	if snap != nil {
 		snap.Summarized = append(snap.Summarized, name)
 	}
-	return v[:max] + "..."
+	return out
 }
 
 // capParamValue 单字段体积守卫：超过 reqParamsFieldMaxBytes 时把值替换成标记字符串，

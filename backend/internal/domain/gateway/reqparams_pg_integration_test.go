@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -8,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/team/llmgateway/internal/db"
 )
@@ -64,6 +66,7 @@ func TestReqParams_PgColumnSize(t *testing.T) {
 	cases := []struct {
 		name  string
 		body  []byte
+		model string // 非空时覆盖 model（用于触发核心字段的超长截断）
 		check func(t *testing.T, snap reqParamsSnapshot, n int)
 	}{
 		{
@@ -138,6 +141,23 @@ func TestReqParams_PgColumnSize(t *testing.T) {
 				}
 			},
 		},
+		{
+			// 超长中文模型名（>1024B）：核心字段截断必须按字符边界，且预算仍成立。
+			name:  "long_cjk_model_name",
+			body:  []byte(`{"model":"m","messages":[],"temperature":1,"max_tokens":1,"top_p":1,"response_format":{"type":"text"}}`),
+			model: strings.Repeat("长中文模型名", 400),
+			check: func(t *testing.T, snap reqParamsSnapshot, n int) {
+				if !utf8.ValidString(snap.Model) {
+					t.Fatalf("model 不是合法 UTF-8: %q", snap.Model)
+				}
+				if strings.ContainsRune(snap.Model, utf8.RuneError) {
+					t.Fatalf("model 含 U+FFFD: %q", snap.Model)
+				}
+				if len(snap.Model) > coreStringMax {
+					t.Fatalf("model 截断后 %d 字节 > %d", len(snap.Model), coreStringMax)
+				}
+			},
+		},
 	}
 
 	for _, c := range cases {
@@ -164,7 +184,7 @@ func TestReqParams_PgColumnSize(t *testing.T) {
 				UpstreamProtocol: "openai-chat",
 				UpstreamURL:      upstream,
 				TokenID:          42,
-				Model:            "gpt-4",
+				Model:            cmp.Or(c.model, "gpt-4"),
 				Stream:           true,
 			})
 			if raw == nil {
@@ -172,6 +192,10 @@ func TestReqParams_PgColumnSize(t *testing.T) {
 			}
 			if strings.Contains(string(raw), "sk-should-not-leak") {
 				t.Fatal("上游 URL 的 query 泄漏进快照")
+			}
+			// 截断必须按字符边界：落库文本永远是合法 UTF-8、不含 U+FFFD。
+			if !utf8.Valid(raw) || strings.ContainsRune(string(raw), utf8.RuneError) {
+				t.Fatalf("快照 JSON 含非法 UTF-8 / U+FFFD（截断切坏了字符）")
 			}
 			var snap reqParamsSnapshot
 			if err := json.Unmarshal(raw, &snap); err != nil {

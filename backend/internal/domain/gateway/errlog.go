@@ -9,7 +9,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/team/llmgateway/internal/domain/channelprotocol"
 	"github.com/team/llmgateway/internal/domain/identity"
@@ -615,15 +614,7 @@ func deref64(p *int64) int64 {
 // truncateLog 按 UTF-8 边界截断字符串：先按字节上限粗切，再退回合法 UTF-8 边界，
 // 避免产生非法 UTF-8 残字节（日志/采集链路对非法序列容错都不好）。
 func truncateLog(s string, maxBytes int) string {
-	if maxBytes <= 0 {
-		return ""
-	}
-	if len(s) <= maxBytes {
-		return s
-	}
-	b := s[:maxBytes]
-	for len(b) > 0 && !utf8.ValidString(b) {
-		b = b[:len(b)-1]
-	}
-	return b + "…"
+	// 统一走 truncateUTF8（按字符边界截断，且后缀计入上限）：网关内只有这一套截断实现。
+	out, _ := truncateUTF8(s, maxBytes, "…")
+	return out
 }
