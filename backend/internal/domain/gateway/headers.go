@@ -35,11 +35,7 @@ func buildUpstreamRequest(ctx context.Context, req UpstreamRequest, defaultPath,
 			return nil, err
 		}
 	}
-	path := strings.TrimSpace(req.Path)
-	if path == "" {
-		path = defaultPath
-	}
-	url := joinURL(req.BaseURL, path)
+	url := resolveUpstreamURL(req.BaseURL, req.Path, defaultPath)
 	hreq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(req.Body))
 	if err != nil {
 		return nil, err
@@ -54,6 +50,17 @@ func buildUpstreamRequest(ctx context.Context, req UpstreamRequest, defaultPath,
 	// 3) 覆盖(set)：最后应用，可覆盖协议隐含鉴权头（显式意图优先）。
 	channelprotocol.ApplySet(hreq.Header, req.HeaderPolicy.Set, req.Cred, req.Vars, req.DownstreamHeader)
 	return hreq, nil
+}
+
+// resolveUpstreamURL 求最终上游 URL：协议端点路径覆盖优先，空则用基础协议内置默认路径。
+// 这是「基址 + 路径」拼接的**唯一实现**：真实请求构造与请求参数快照（call_logs.req_params
+// 里的 upstream_url）共用它，避免快照记的地址与实际发出去的地址出现口径漂移。
+func resolveUpstreamURL(baseURL, pathOverride, defaultPath string) string {
+	path := strings.TrimSpace(pathOverride)
+	if path == "" {
+		path = defaultPath
+	}
+	return joinURL(baseURL, path)
 }
 
 // joinURL 拼接基址与路径：去基址尾部 /、去路径头部 /，避免重复斜杠。

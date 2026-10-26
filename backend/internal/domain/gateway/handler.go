@@ -150,6 +150,9 @@ func writeOpenAI(w http.ResponseWriter, v any) {
 // 避免把内部契约外泄给下游客户端。
 type openAIErrorBody struct {
 	Error openAIErrorDetail `json:"error"`
+	// RequestID 网关请求链路 ID（顶层，与响应头 x-request-id 同值）：
+	// 调用方拿到报错时可原样报给平台，直接用它在账单/调用日志里定位这一次请求。
+	RequestID string `json:"request_id,omitempty"`
 }
 
 type openAIErrorDetail struct {
@@ -160,14 +163,19 @@ type openAIErrorDetail struct {
 
 // writeOpenAIError 直接写出 OpenAI 标准错误体（不走内部统一壳 resp.Box），HTTP 状态码沿用业务语义。
 // type/code 依据 HTTP 状态码归类为 OpenAI 语义，确保下游客户端按 OpenAI 规范解析错误。
+// request_id 的取值来源：request id 中间件（WithRequestID）已把 id 写进响应头 x-request-id，
+// 这里直接读它，从而不必给 30+ 个错误出口逐个加参数（也避免漏掉某个分支就出现「有头无体」的不一致）。
 func writeOpenAIError(w http.ResponseWriter, status int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(openAIErrorBody{Error: openAIErrorDetail{
-		Message: msg,
-		Type:    openAIErrorType(status),
-		Code:    openAIErrorCode(status),
-	}})
+	_ = json.NewEncoder(w).Encode(openAIErrorBody{
+		Error: openAIErrorDetail{
+			Message: msg,
+			Type:    openAIErrorType(status),
+			Code:    openAIErrorCode(status),
+		},
+		RequestID: w.Header().Get("x-request-id"),
+	})
 }
 
 // openAIErrorType 依据 HTTP 状态码映射 OpenAI 错误 type。
@@ -253,6 +261,19 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 		writeOpenAIError(w, http.StatusBadRequest, "请求体必须包含 model 字段")
 		return
 	}
+
+	// 2.5) 请求参数快照（call_logs.req_params，见 reqparams.go）：入站体只解析一次，
+	// 先挂一份「请求级」快照到 context（候选未定，上游协议/URL 先留空），
+	// 候选真正组包时再覆盖为「候选级」快照（含实际上游协议与上游 URL）。
+	// 挂在 context 上而不是逐处传参：写入漏斗只有 writeCallLogUsage 一个，单点取用即不会漏、也不会各处口径不一致。
+	rpSrc := newReqParamsSource(body)
+	r = r.WithContext(withReqParams(r.Context(), rpSrc.buildReqParams(reqParamsInput{
+		Endpoint:        inboundPath(endpoint),
+		InboundProtocol: baseProtocol,
+		TokenID:         token.ID,
+		Model:           model,
+		Stream:          isStream,
+	})))
 
 	// 3) 令牌标签 → TagKV。
 	var tagKV map[string]string
@@ -861,6 +882,21 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 				"model": routeRes.InternalModelID,
 			},
 		}
+
+		// 候选级请求参数快照：此时「实际上游协议 + 上游 URL（路径覆盖/默认路径已定）」才确定，
+		// 覆盖请求级快照后再进入转发——失败分支写调用日志时拿到的就是这一次候选真实的落点。
+		r = r.WithContext(withReqParams(r.Context(), rpSrc.buildReqParams(reqParamsInput{
+			Endpoint:         inboundPath(endpoint),
+			InboundProtocol:  baseProtocol,
+			UpstreamProtocol: upstreamProto,
+			UpstreamURL: resolveUpstreamURL(ureq.BaseURL, ureq.Path,
+				defaultUpstreamPath(upstreamProto, provEndpoint)),
+			Converted:     converted,
+			TokenID:       token.ID,
+			Model:         model,
+			AutoModelName: autoName,
+			Stream:        isStream,
+		})))
 
 		// 进行中计数：包住整段上游转发（含流式全程），管理端「实时状态」据此判定「正在请求」。
 		if sessionID != "" {

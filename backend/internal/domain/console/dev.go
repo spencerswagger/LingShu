@@ -46,7 +46,8 @@ func (h *Dev) attachCallLog(ctx context.Context, bid string) *CallLogView {
 	if err != nil || cl == nil {
 		return nil
 	}
-	return toCallLogView(cl)
+	// 开发者端走脱敏投影（抹掉渠道密钥/内部模型 ID/成本；见 breakdown.go 的脱敏说明）。
+	return toDevCallLogView(cl)
 }
 
 func (h *Dev) currentUser(w http.ResponseWriter, r *http.Request) (int64, bool) {
@@ -58,6 +59,49 @@ func (h *Dev) currentUser(w http.ResponseWriter, r *http.Request) (int64, bool) 
 	return id, true
 }
 
+// devBillingListItem 开发者端账单列表项（脱敏 DTO）。
+// 与管理端 billingListItem 的关键差异（P1 安全项）：不含内部模型 ID、渠道密钥维度
+// （channel_key_id/key_name/channel_name）、成本相关字段（rates/RValue/系数），也不含其他用户维度。
+// 保留：自己的账单金额（积分）、三段用量、状态与耗时、request_id 与尝试次数（自助定位请求用）。
+type devBillingListItem struct {
+	BillingID       string            `json:"BillingID"`
+	ExternalModel   string            `json:"ExternalModel"`
+	AutoModelName   string            `json:"AutoModelName,omitempty"`
+	PricingMode     string            `json:"PricingMode"`
+	CreditsConsumed float64           `json:"CreditsConsumed"`
+	Status          string            `json:"Status"`
+	CallTime        time.Time         `json:"CallTime"`
+	SessionID       string            `json:"SessionID,omitempty"`
+	SessionName     string            `json:"SessionName,omitempty"`
+	Tokens          billing.WireUsage `json:"Tokens"`
+	ErrorMessage    string            `json:"ErrorMessage,omitempty"`
+	DurationMs      *int64            `json:"DurationMs,omitempty"`
+	FirstTokenMs    *int64            `json:"FirstTokenMs,omitempty"`
+	RequestID       string            `json:"RequestID,omitempty"`
+	Attempts        int               `json:"Attempts,omitempty"`
+}
+
+// toDevBillingListItem 由账单行组装开发者端列表项（字段白名单，新增字段必须显式加进来）。
+func toDevBillingListItem(rec *billing.Record) devBillingListItem {
+	return devBillingListItem{
+		BillingID:       rec.BillingID,
+		ExternalModel:   rec.ExternalModel,
+		AutoModelName:   rec.AutoModelName,
+		PricingMode:     rec.PricingMode,
+		CreditsConsumed: decimalx.Round5(rec.CreditsConsumed),
+		Status:          rec.Status,
+		CallTime:        rec.CallTime,
+		SessionID:       rec.SessionID,
+		SessionName:     rec.SessionName,
+		Tokens:          billing.WireUsage(rec.Tokens),
+		ErrorMessage:    rec.ErrorMessage,
+		DurationMs:      rec.DurationMs,
+		FirstTokenMs:    rec.FirstTokenMs,
+		RequestID:       rec.RequestID,
+		Attempts:        rec.Attempts,
+	}
+}
+
 // HandleListBillings GET /api/v1/dev/billings?page=&size=&from=&to= 查询本人账单。
 func (h *Dev) HandleListBillings(w http.ResponseWriter, r *http.Request) {
 	userID, ok := h.currentUser(w, r)
@@ -65,35 +109,25 @@ func (h *Dev) HandleListBillings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := r.URL.Query()
-	f := billing.RecordFilter{
-		UserID: &userID,
-		Page:   parsePage(q.Get("Page")),
-		Size:   parseSize(q.Get("Size")),
+	// 解析口径与管理端同源（buildBillingsFilter），只强制本人维度：
+	// 这样 RequestID/Model/Status/Group 这些过滤与归并语义在两端一致，不会再各写一份而漂移。
+	f, ferr := buildBillingsFilter(q)
+	if ferr != nil {
+		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, ferr.Error())
+		return
 	}
-	if v := q.Get("From"); v != "" {
-		t, err := parseRFC3339Lenient(v)
-		if err != nil {
-			resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "from 时间格式应为 RFC3339")
-			return
-		}
-		f.From = &t
-	}
-	if v := q.Get("To"); v != "" {
-		t, err := parseRFC3339Lenient(v)
-		if err != nil {
-			resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "to 时间格式应为 RFC3339")
-			return
-		}
-		f.To = &t
-	}
+	f.UserID = &userID // 强制覆盖：客户端传入的 UserID 一律忽略，杜绝越权
+	f.Page = parsePage(q.Get("Page"))
+	f.Size = parseSize(q.Get("Size"))
+
 	records, total, err := h.billing.ListRecords(r.Context(), f)
 	if err != nil {
 		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "查询账单失败")
 		return
 	}
-	list := make([]billingListItem, 0, len(records))
+	list := make([]devBillingListItem, 0, len(records))
 	for i := range records {
-		list = append(list, toListItem(&records[i]))
+		list = append(list, toDevBillingListItem(&records[i]))
 	}
 	resp.OK(w, r, map[string]any{"List": list, "Total": total, "Page": f.Page, "Size": f.Size})
 }
@@ -119,7 +153,8 @@ func (h *Dev) HandleGetBilling(w http.ResponseWriter, r *http.Request) {
 		resp.Err(w, r, http.StatusNotFound, resp.CodeNotFound, "账单不存在")
 		return
 	}
-	steps, routeDiff := buildBreakdown(rec)
+	// 开发者端拆解：cost 模式不展示明细（成本金额属内部信息，见 breakdown.go）。
+	steps, routeDiff := buildBreakdownDev(rec)
 	detail := BillingDetail{
 		BillingID:       rec.BillingID,
 		CallTime:        rec.CallTime.Format(time.RFC3339),
@@ -304,7 +339,8 @@ func (h *Dev) HandleListSessionCalls(w http.ResponseWriter, r *http.Request) {
 	}
 	list := make([]CallLogView, 0, len(logs))
 	for i := range logs {
-		if v := toCallLogView(&logs[i]); v != nil {
+		// 开发者端走脱敏投影（渠道密钥/内部模型 ID/成本一律不返回）。
+		if v := toDevCallLogView(&logs[i]); v != nil {
 			list = append(list, *v)
 		}
 	}

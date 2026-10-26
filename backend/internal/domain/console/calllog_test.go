@@ -207,14 +207,16 @@ func TestNewSQLCallLogStore_InsertAndQuery(t *testing.T) {
 	dur := int64(123)
 	// 上游原始 usage（诊断渠道口径）：落库值为 {"Protocol":...,"Usage":{...}}，见 gateway/rawusage.go。
 	upstreamUsage := []byte(`{"Protocol":"anthropic-messages","Usage":{"input_tokens":191,"cache_read_input_tokens":96896}}`)
+	// 请求参数快照（req_params）：定位「这次到底发了什么参数」用，见 gateway/reqparams.go。
+	reqParams := []byte(`{"endpoint":"/v1/chat/completions","model":"gpt-4","stream":true}`)
 	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO call_logs(id, billing_id, request_id, session_id, user_id, channel_id, channel_key_id,
 	internal_model_id, external_model_id, model, auto_model_name, pricing_mode, status, req_messages, resp_body, resp_kind,
-	decision, error_message, duration_ms, first_token_ms, created_at, upstream_usage)
-VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+	decision, error_message, duration_ms, first_token_ms, created_at, upstream_usage, req_params)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
 ON CONFLICT (billing_id) DO NOTHING`)).
 		WithArgs(sqlmock.AnyArg(), "bill-0001", "req-1", "sess-1", int64(7), int64(1), int64(2), "gpt-4-internal",
 			int64(1), "gpt-4", nil, "sale", "completed", []byte(`[{"role":"user","content":"a"}]`), `{"id":"x"}`,
-			"non_stream", []byte(`{"result":"success"}`), "", int64(123), nil, now, upstreamUsage).
+			"non_stream", []byte(`{"result":"success"}`), "", int64(123), nil, now, upstreamUsage, reqParams).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	if err := store.Insert(context.Background(), &gateway.CallLog{
 		BillingID: "bill-0001", RequestID: "req-1", SessionID: "sess-1",
@@ -222,7 +224,7 @@ ON CONFLICT (billing_id) DO NOTHING`)).
 		InternalModelID: "gpt-4-internal", Model: "gpt-4", PricingMode: "sale", Status: "completed",
 		ReqMessages: []json.RawMessage{json.RawMessage(`{"role":"user","content":"a"}`)},
 		RespBody:    `{"id":"x"}`, RespKind: "non_stream",
-		Decision: map[string]any{"result": "success"}, UpstreamUsage: upstreamUsage,
+		Decision: map[string]any{"result": "success"}, UpstreamUsage: upstreamUsage, ReqParams: reqParams,
 		DurationMs: &dur, FirstTokenMs: nil, CreatedAt: now,
 	}); err != nil {
 		t.Fatalf("insert: %v", err)
@@ -231,13 +233,13 @@ ON CONFLICT (billing_id) DO NOTHING`)).
 	// ListBySession 读取（ReqMessages/Decision/UpstreamUsage 为 JSONB bytes）。
 	rows := sqlmock.NewRows([]string{"billing_id", "request_id", "session_id", "user_id", "channel_id", "channel_key_id",
 		"internal_model_id", "external_model_id", "model", "auto_model_name", "pricing_mode", "status", "req_messages", "resp_body", "resp_kind",
-		"decision", "error_message", "duration_ms", "first_token_ms", "created_at", "upstream_usage"}).
+		"decision", "error_message", "duration_ms", "first_token_ms", "created_at", "upstream_usage", "req_params"}).
 		AddRow("bill-0001", "req-1", "sess-1", int64(7), int64(1), int64(2), "gpt-4-internal", int64(1), "gpt-4", nil,
 			"sale", "completed", []byte(`[{"role":"user","content":"a"}]`), `{"id":"x"}`, "non_stream",
-			[]byte(`{"result":"success"}`), "", int64(123), nil, now, upstreamUsage)
+			[]byte(`{"result":"success"}`), "", int64(123), nil, now, upstreamUsage, reqParams)
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT billing_id, request_id, session_id, user_id, channel_id, channel_key_id,
 	internal_model_id, external_model_id, model, auto_model_name, pricing_mode, status, req_messages, resp_body, resp_kind,
-	decision, error_message, duration_ms, first_token_ms, created_at, upstream_usage FROM call_logs WHERE session_id=$1 ORDER BY created_at ASC`)).
+	decision, error_message, duration_ms, first_token_ms, created_at, upstream_usage, req_params FROM call_logs WHERE session_id=$1 ORDER BY created_at ASC`)).
 		WithArgs("sess-1").WillReturnRows(rows)
 
 	logs, err := store.ListBySession(context.Background(), "sess-1")

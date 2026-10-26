@@ -64,8 +64,11 @@ type CallLogView struct {
 	FirstTokenMs  *int64 `json:"FirstTokenMs,omitempty"`
 	CallTime      string `json:"CallTime"`
 	ReqMessages   any    `json:"ReqMessages"` // JSONB 原始 value（可能 null）
-	RespBody      string `json:"RespBody"`
-	Decision      any    `json:"Decision"` // JSONB 原始 value（可能 null）
+	// ReqParams 入站请求参数快照（JSONB 反序列化结果：model/temperature/tools 摘要/端点/上游协议与
+	// 上游 URL/token_id 等；可能 null）。定位「这次到底发了什么参数」用，不含 messages（见 ReqMessages）。
+	ReqParams any    `json:"ReqParams"`
+	RespBody  string `json:"RespBody"`
+	Decision  any    `json:"Decision"` // JSONB 原始 value（可能 null）
 	// UpstreamUsage 上游原始 usage（JSONB 反序列化结果：{"Protocol":...,"Usage":{...}}，可能 null）：
 	// 诊断渠道 usage 口径用（billing_records.tokens 是归一化后的三段，看不出上游原文）。
 	UpstreamUsage any    `json:"UpstreamUsage"`
@@ -90,6 +93,12 @@ func toCallLogView(cl *gateway.CallLog) *CallLogView {
 			decision = v
 		}
 	}
+	var reqParams any
+	if len(cl.ReqParams) > 0 {
+		if err := json.Unmarshal(cl.ReqParams, &reqParams); err != nil {
+			reqParams = nil
+		}
+	}
 	var upstreamUsage any
 	if len(cl.UpstreamUsage) > 0 {
 		if err := json.Unmarshal(cl.UpstreamUsage, &upstreamUsage); err != nil {
@@ -109,6 +118,7 @@ func toCallLogView(cl *gateway.CallLog) *CallLogView {
 		FirstTokenMs:  cl.FirstTokenMs,
 		CallTime:      cl.CreatedAt.Format(time.RFC3339),
 		ReqMessages:   reqMsgs,
+		ReqParams:     reqParams,
 		RespBody:      cl.RespBody,
 		Decision:      decision,
 		UpstreamUsage: upstreamUsage,
@@ -190,3 +200,97 @@ func buildBreakdown(rec *billing.Record) ([]Step, *RouteDiff) {
 
 func formatInt(v int64) string     { return strconv.FormatInt(v, 10) }
 func formatFloat(v float64) string { return strconv.FormatFloat(v, 'f', -1, 64) }
+
+// ===== 开发者端脱敏（P1 安全项）=====
+//
+// 脱敏位置的选择：放在**视图/DTO 层**（console 包组装 CallLogView / billingListItem 的那一层），
+// 不放序列化层（不写自定义 MarshalJSON）、也不放存储层：
+//   - 存储层脱敏会让管理端也看不到原值（管理端需要排查渠道密钥维度的问题）；
+//   - 序列化层（MarshalJSON）脱敏会污染同一份结构的所有使用方，且难以被单测直接断言；
+//   - DTO 层「同一份数据、两个投影」最直白：admin 用 toCallLogView，dev 用 toDevCallLogView，
+//     谁能看到什么在类型上一目了然，也便于加断言防回归。
+//
+// 开发者端必须看不到：渠道密钥（id/名）、内部模型 ID 与映射、成本金额（含成本模式路由差异）。
+// 可以看：自己的账单金额（积分）、自己请求的消息与参数、上游协议与用量（便于自助排查）。
+
+// devMaskedKeys 开发者端必须抹掉的决策轨迹键（渠道密钥维度 / 内部模型维度 / 成本维度）。
+var devMaskedKeys = []string{
+	"channel_key_id",    // 渠道密钥维度
+	"channel_key_name",  // 渠道密钥名
+	"internal_model_id", // 内部模型 ID（上游模型名 = 映射关系）
+	"cost",              // 成本单价/金额
+	"cost_known",        // 成本是否已知（等同泄漏成本可得性）
+}
+
+// toDevCallLogView 开发者端调用日志视图：在共享视图基础上脱敏。
+// 返回新对象（不修改入参），避免同一份 CallLogView 被两个投影共享后互相污染。
+func toDevCallLogView(cl *gateway.CallLog) *CallLogView {
+	v := toCallLogView(cl)
+	if v == nil {
+		return nil
+	}
+	v.Decision = redactDecision(v.Decision)
+	v.ReqParams = redactReqParams(v.ReqParams)
+	return v
+}
+
+// redactDecision 抹掉决策轨迹里的密钥/内部模型/成本键（含 attempts 数组内每一项）。
+// 未知结构原样返回：脱敏只针对已知形状，绝不因为形状变化而泄漏。
+func redactDecision(v any) any {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return v
+	}
+	out := make(map[string]any, len(m))
+	for k, val := range m {
+		out[k] = val
+	}
+	for _, k := range devMaskedKeys {
+		delete(out, k)
+	}
+	if arr, ok := out["attempts"].([]any); ok {
+		cleaned := make([]any, 0, len(arr))
+		for _, item := range arr {
+			im, ok := item.(map[string]any)
+			if !ok {
+				cleaned = append(cleaned, item)
+				continue
+			}
+			cp := make(map[string]any, len(im))
+			for k, val := range im {
+				cp[k] = val
+			}
+			for _, k := range devMaskedKeys {
+				delete(cp, k)
+			}
+			cleaned = append(cleaned, cp)
+		}
+		out["attempts"] = cleaned
+	}
+	return out
+}
+
+// redactReqParams 抹掉开发者端不该看到的请求快照字段：目前是 upstream_url
+// （含部署名 → 等价于泄漏「内部模型 ↔ 上游部署」的映射；同时避免暴露供应商内网地址）。
+func redactReqParams(v any) any {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return v
+	}
+	out := make(map[string]any, len(m))
+	for k, val := range m {
+		out[k] = val
+	}
+	delete(out, "upstream_url")
+	return out
+}
+
+// buildBreakdownDev 开发者端账单拆解：sale 模式与 admin 同构（单价即售价）；
+// cost 模式不展示明细——成本金额属内部信息，展示即可反推平台采购价。
+func buildBreakdownDev(rec *billing.Record) ([]Step, *RouteDiff) {
+	if rec.PricingMode != "" && rec.PricingMode != "sale" {
+		return []Step{}, nil
+	}
+	steps, _ := buildBreakdown(rec) // 成本模式的路由差异（RouteDiff）恒不返回
+	return steps, nil
+}

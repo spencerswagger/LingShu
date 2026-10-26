@@ -120,6 +120,11 @@ type Record struct {
 	ErrorMessage    string
 	DurationMs      *int64 // 总耗时（毫秒）
 	FirstTokenMs    *int64 // 首字耗时（毫秒）
+	// RequestID 网关请求链路 ID（来自 call_logs.request_id，仅归并列表查询时填充）：
+	// 让一次请求在账单可被直接定位（多候选尝试共享同一 request_id）。
+	RequestID string
+	// Attempts 该请求共产生的账单条数（仅归并列表查询时填充；1=单次尝试，>1=发生过候选/上游重试）。
+	Attempts int
 }
 
 // RecordReq 是 Record 的入参（由路由/网关在调用完成后传入）。

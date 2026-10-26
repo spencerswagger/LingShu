@@ -59,11 +59,12 @@ func TestHandleDevListBillings_TimeRange(t *testing.T) {
 			// recordWhere 参数顺序：$1=user_id $2=channel_key_id $3=token_id
 			// $4=session_id $5=model $6=pricing_mode $7=status $8=from $9=to
 			countArgs := []driver.Value{int64(7), nil, nil, "", "", "", "", c.fromArg, c.toArg}
-			mock.ExpectQuery(`SELECT count\(\*\) FROM billing_records .*call_time >= \$8.*call_time <= \$9.*`).
+			// 列表默认按 request_id 归并（Group 缺省开启）：走 CTE grp，参数位与逐条查询一致。
+			mock.ExpectQuery(`SELECT count\(\*\) FROM \(\s*SELECT 1 FROM billing_records br LEFT JOIN call_logs cl .*call_time >= \$8.*call_time <= \$9.*GROUP BY COALESCE`).
 				WithArgs(countArgs...).
 				WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(0)))
 			listArgs := append(append([]driver.Value{}, countArgs...), 20, 0)
-			mock.ExpectQuery(`SELECT .* FROM billing_records .*call_time >= \$8.*call_time <= \$9.*ORDER BY id DESC LIMIT \$10 OFFSET \$11`).
+			mock.ExpectQuery(`WITH grp AS \(.*call_time >= \$8.*call_time <= \$9.*grp.rid, grp.cnt.*LIMIT \$10 OFFSET \$11`).
 				WithArgs(listArgs...).
 				WillReturnRows(sqlmock.NewRows([]string{"id"}))
 

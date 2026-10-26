@@ -32,6 +32,7 @@ type CallLog struct {
 	PricingMode     string // sale / cost
 	Status          string // completed / failed
 	ReqMessages     any    // 请求增量 JSONB 原始值（可为 nil/空数组）
+	ReqParams       []byte // 入站请求参数快照 JSONB 原始值（不含 messages，≤8KB，见 reqparams.go）
 	RespBody        string // 非流式完整响应体；流式为结构化提取的 assistant 增量 JSON
 	RespKind        string // non_stream / stream / error
 	Decision        any    // 决策轨迹 JSONB 原始值（候选渠道与原因、系数、预扣与结果）
@@ -62,15 +63,15 @@ func NewSQLCallLogStore(db *sql.DB) *SQLCallLogStore {
 // 迁移后的列顺序一致的查询列（不含 id/created_at 自动列的读侧拆分）。
 const callLogsCols = `billing_id, request_id, session_id, user_id, channel_id, channel_key_id,
 	internal_model_id, external_model_id, model, auto_model_name, pricing_mode, status, req_messages, resp_body, resp_kind,
-	decision, error_message, duration_ms, first_token_ms, created_at, upstream_usage`
+	decision, error_message, duration_ms, first_token_ms, created_at, upstream_usage, req_params`
 
 // insertCallLogSQL 写入一条调用日志。列与占位符必须一一对应（数量不等会让所有写日志失败），
 // 由 calllog_test.go 的 TestInsertCallLogSQL_ColumnPlaceholderCount 守卫。
 const insertCallLogSQL = `
 INSERT INTO call_logs(id, billing_id, request_id, session_id, user_id, channel_id, channel_key_id,
 	internal_model_id, external_model_id, model, auto_model_name, pricing_mode, status, req_messages, resp_body, resp_kind,
-	decision, error_message, duration_ms, first_token_ms, created_at, upstream_usage)
-VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+	decision, error_message, duration_ms, first_token_ms, created_at, upstream_usage, req_params)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
 ON CONFLICT (billing_id) DO NOTHING`
 
 // Insert 幂等插入一条调用日志：billing_id 冲突（ON CONFLICT DO NOTHING）静默跳过；
@@ -96,7 +97,8 @@ func (s *SQLCallLogStore) Insert(ctx context.Context, c *CallLog) error {
 		id, c.BillingID, c.RequestID, c.SessionID, nullableInt64(c.UserID), nullableInt64(c.ChannelID),
 		nullableInt64(c.ChannelKeyID), c.InternalModelID, nullableInt64(c.ExternalModelID), c.Model,
 		nullableString(c.AutoModelName), c.PricingMode, c.Status, reqRaw, c.RespBody, c.RespKind, decRaw, c.ErrorMessage,
-		nullableInt64(c.DurationMs), nullableInt64(c.FirstTokenMs), created, nullableBytes(c.UpstreamUsage))
+		nullableInt64(c.DurationMs), nullableInt64(c.FirstTokenMs), created, nullableBytes(c.UpstreamUsage),
+		nullableBytes(c.ReqParams))
 	return err
 }
 
@@ -190,10 +192,10 @@ func scanCallLog(row rowScanner) (*CallLog, error) {
 func scanCallLogInto(s rowScanner, c *CallLog) error {
 	var uid, chID, keyID, extID, dur, ft sql.NullInt64
 	var autoName sql.NullString
-	var reqRaw, decRaw, upRaw []byte
+	var reqRaw, decRaw, upRaw, rpRaw []byte
 	if err := s.Scan(&c.BillingID, &c.RequestID, &c.SessionID, &uid, &chID, &keyID,
 		&c.InternalModelID, &extID, &c.Model, &autoName, &c.PricingMode, &c.Status, &reqRaw, &c.RespBody, &c.RespKind,
-		&decRaw, &c.ErrorMessage, &dur, &ft, &c.CreatedAt, &upRaw); err != nil {
+		&decRaw, &c.ErrorMessage, &dur, &ft, &c.CreatedAt, &upRaw, &rpRaw); err != nil {
 		return err
 	}
 	c.AutoModelName = autoName.String
@@ -230,6 +232,9 @@ func scanCallLogInto(s rowScanner, c *CallLog) error {
 	if len(upRaw) > 0 {
 		c.UpstreamUsage = upRaw
 	}
+	if len(rpRaw) > 0 {
+		c.ReqParams = rpRaw
+	}
 	return nil
 }
 
@@ -257,42 +262,52 @@ func diffMessages(prev []string, msgs []json.RawMessage) []json.RawMessage {
 	return out
 }
 
-// fallbackReqIncrement 无上次指纹时的增量降级：取最后一条 user 消息；
-// 若其后紧随 tool 角色，则把最近的连续 tool 链一并收起（工具调用回传场景）。
-func fallbackReqIncrement(msgs []json.RawMessage) []json.RawMessage {
+// fullReqSnapshot 无上次指纹时的落库内容：**全量消息**（不截断、不抽样）。
+// 历史实现只取「最后一条 user 消息及其 tool 链」，导致首轮请求/新会话在调用日志里
+// 看不到 system 提示与前文的上下文——账单详情「当初到底发了什么」因此残缺。
+// 语义仍是「增量追加」：同一会话后续请求走 diffMessages 只补新增部分。
+func fullReqSnapshot(msgs []json.RawMessage) []json.RawMessage {
 	if len(msgs) == 0 {
 		return []json.RawMessage{}
 	}
-	lastUser := -1
-	for i := len(msgs) - 1; i >= 0; i-- {
-		var m struct {
-			Role string `json:"role"`
-		}
-		if json.Unmarshal(msgs[i], &m) != nil {
-			continue
-		}
-		if m.Role == "user" {
-			lastUser = i
-			break
-		}
-	}
-	if lastUser < 0 {
-		// 无 user 消息（纯系统提示等）：取最后一条。
-		return []json.RawMessage{msgs[len(msgs)-1]}
-	}
-	end := lastUser + 1
-	for end < len(msgs) {
-		var m struct {
-			Role string `json:"role"`
-		}
-		if json.Unmarshal(msgs[end], &m) != nil || m.Role != "tool" {
-			break
-		}
-		end++
-	}
-	out := make([]json.RawMessage, 0, end-lastUser)
-	out = append(out, msgs[lastUser:end]...)
+	out := make([]json.RawMessage, len(msgs))
+	copy(out, msgs)
 	return out
+}
+
+// parseRequestMessages 从入站请求体取出「消息列表」：
+//   - OpenAI/Anthropic 形状：顶层 messages 数组；
+//   - OpenAI Responses 形状：顶层 input（条目数组或纯字符串）；
+//   - 其它形状：无消息（返回 false）。
+//
+// Responses 入站过去一律取不到消息（只认 messages），调用日志因此缺失请求内容，这里补齐。
+func parseRequestMessages(body []byte) ([]json.RawMessage, bool) {
+	var req struct {
+		Messages []json.RawMessage `json:"messages"`
+		Input    json.RawMessage   `json:"input"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		return nil, false
+	}
+	if len(req.Messages) > 0 {
+		return req.Messages, true
+	}
+	if len(req.Input) == 0 {
+		return nil, false
+	}
+	var items []json.RawMessage
+	if err := json.Unmarshal(req.Input, &items); err == nil && len(items) > 0 {
+		return items, true
+	}
+	var text string
+	if err := json.Unmarshal(req.Input, &text); err == nil && text != "" {
+		msg, merr := json.Marshal(map[string]string{"role": "user", "content": text})
+		if merr != nil {
+			return nil, false
+		}
+		return []json.RawMessage{msg}, true
+	}
+	return nil, false
 }
 
 // captureReqIncrement 计算本次请求的增量消息与全量指纹：
@@ -300,21 +315,19 @@ func fallbackReqIncrement(msgs []json.RawMessage) []json.RawMessage {
 // 返回 (增量消息, 本次全量指纹)；body 解析失败返回 (nil, nil)。
 // 会更新 sessObj.LastMsgFingerprints 为本次全量指纹（新会话由调用方在 Attach 时设置）。
 func (g *Gateway) captureReqIncrement(sessObj *router.Session, body []byte) ([]json.RawMessage, []string) {
-	var req struct {
-		Messages []json.RawMessage `json:"messages"`
-	}
-	if err := json.Unmarshal(body, &req); err != nil || len(req.Messages) == 0 {
+	msgs, ok := parseRequestMessages(body)
+	if !ok || len(msgs) == 0 {
 		return nil, nil
 	}
-	fps := make([]string, len(req.Messages))
-	for i, m := range req.Messages {
+	fps := make([]string, len(msgs))
+	for i, m := range msgs {
 		fps[i] = msgFingerprint(m)
 	}
 	var incr []json.RawMessage
 	if sessObj != nil && len(sessObj.LastMsgFingerprints) > 0 {
-		incr = diffMessages(sessObj.LastMsgFingerprints, req.Messages)
+		incr = diffMessages(sessObj.LastMsgFingerprints, msgs)
 	} else {
-		incr = fallbackReqIncrement(req.Messages)
+		incr = fullReqSnapshot(msgs)
 	}
 	if sessObj != nil {
 		sessObj.LastMsgFingerprints = fps
@@ -412,8 +425,11 @@ func (g *Gateway) writeCallLogUsage(ctx context.Context, billingID, requestID st
 		requestID = logger.GetRequestID(ctx)
 	}
 	cl := &CallLog{
-		BillingID:     billingID,
-		RequestID:     requestID,
+		BillingID: billingID,
+		RequestID: requestID,
+		// 请求参数快照：在组包处一次性构造并挂到请求 context 上（见 reqparams.go），
+		// 这里作为唯一写入漏斗取出落库——避免各个失败/成功分支各写一份、字段口径漂移。
+		ReqParams:     reqParamsFromCtx(ctx),
 		SessionID:     sessionID,
 		Model:         model,
 		PricingMode:   pricingMode,
