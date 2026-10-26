@@ -29,6 +29,8 @@ const (
 	jsonbContainerOverhead = 256
 	// coreStringMax 核心字段（上游 URL/端点/模型名）的长度上限，异常长时截断并记名。
 	coreStringMax = 1024
+	// redactedValue 命中最敏感键时落库的占位值（原文一律不落库）。
+	redactedValue = `"redacted"`
 	// toolsNamesCap tools 摘要里保留的工具名条数上限（只留名字，不留 schema）。
 	toolsNamesCap = 20
 )
@@ -53,6 +55,8 @@ type reqParamsInput struct {
 	Model            string // 对外模型名（Auto 命中后为成员名）
 	AutoModelName    string // 请求的 Auto 名（非 Auto 请求为空）
 	Stream           bool   // 是否流式
+	// MessagesTruncated req_messages 因体积被裁剪时的标记（nil=未裁剪），见 calllog.go 的 msgTruncInfo。
+	MessagesTruncated *msgTruncInfo
 }
 
 // toolsSummary tools 摘要：只留数量与工具名，绝不落 schema（schema 是体积大头且对定位无价值）。
@@ -75,9 +79,13 @@ type reqParamsSnapshot struct {
 	MessageCount     int                        `json:"message_count,omitempty"`
 	Tools            *toolsSummary              `json:"tools,omitempty"`
 	Params           map[string]json.RawMessage `json:"params,omitempty"`
-	Summarized       []string                   `json:"summarized,omitempty"`
-	Dropped          []string                   `json:"dropped,omitempty"`
-	OverBudget       bool                       `json:"over_budget,omitempty"`
+	// Redacted 命中凭据/身份类敏感键的键名（值已置为 "redacted"，原文不落库）。
+	Redacted []string `json:"redacted,omitempty"`
+	// MessagesTruncated req_messages 的裁剪标记（体积超限时才有）：显式告诉排查者「看到的不是全量」。
+	MessagesTruncated *msgTruncInfo `json:"messages_truncated,omitempty"`
+	Summarized        []string      `json:"summarized,omitempty"`
+	Dropped           []string      `json:"dropped,omitempty"`
+	OverBudget        bool          `json:"over_budget,omitempty"`
 }
 
 // reqParamsSource 入站请求体的**一次性**解析结果，供每个候选复用（避免逐候选重复解析）。
@@ -85,6 +93,7 @@ type reqParamsSource struct {
 	top       map[string]json.RawMessage // 入站顶层字段（已剔除 messages/tools/model/stream）
 	tools     *toolsSummary
 	msgCount  int
+	redacted  []string // 命中敏感键、值已替换为 redacted 的键名（审计用）
 	dropOrder []string // 超预算时的裁剪顺序（已按优先级排好）
 }
 
@@ -117,6 +126,12 @@ func newReqParamsSource(body []byte) *reqParamsSource {
 			continue
 		case "tools", "functions":
 			src.tools = summarizeTools(v)
+			continue
+		}
+		if isSensitiveParamKey(k) {
+			// 敏感键：值一律不落库，只留占位 + 键名（便于审计「这里被脱敏过」）。
+			src.top[k] = json.RawMessage(redactedValue)
+			src.redacted = append(src.redacted, k)
 			continue
 		}
 		src.top[k] = v
@@ -203,6 +218,36 @@ func reqParamDropOrder(top map[string]json.RawMessage) []string {
 	return append(order, rest...)
 }
 
+// reqParamSensitiveKeys 入站参数里的**凭据/身份类键**：命中即整值替换为 "redacted" 并把键名记入
+// `redacted`（Owl PR #63 P2-2：注释写着「不含凭据」，但此前会把 metadata/user/api_key/token/
+// password 之类原样落库）。按**小写精确名 + 常见后缀**匹配，避免误伤 max_tokens/top_k/stop 一类正常参数。
+var reqParamSensitiveKeys = map[string]bool{
+	// 凭据
+	"api_key": true, "apikey": true, "api-key": true, "x-api-key": true,
+	"key": true, "access_key": true, "secret_key": true, "private_key": true,
+	"token": true, "access_token": true, "refresh_token": true, "id_token": true,
+	"session_token": true, "auth_token": true, "bearer": true,
+	"secret": true, "client_secret": true, "password": true, "passwd": true, "pwd": true,
+	"authorization": true, "auth": true, "credential": true, "credentials": true,
+	"cookie": true, "jwt": true,
+	// 身份/租户标识（可跨请求关联到人，按 Owl 意见一并脱敏）
+	"user": true, "metadata": true, "user_id": true, "tenant": true, "account": true,
+}
+
+// isSensitiveParamKey 判断入站参数名是否属敏感键（小写精确匹配 + 常见后缀模式）。
+func isSensitiveParamKey(key string) bool {
+	lk := strings.ToLower(strings.TrimSpace(key))
+	if reqParamSensitiveKeys[lk] {
+		return true
+	}
+	for _, suf := range []string{"_token", "_key", "_secret", "_password", "-token", "-key", "-secret", "-password"} {
+		if strings.HasSuffix(lk, suf) {
+			return true
+		}
+	}
+	return false
+}
+
 // protectedParamSet 受保护参数集合（见 reqParamsProtected）。
 func protectedParamSet() map[string]bool {
 	out := make(map[string]bool, len(reqParamsProtected))
@@ -230,17 +275,19 @@ func (s *reqParamsSource) buildReqParams(in reqParamsInput) []byte {
 		return nil
 	}
 	snap := reqParamsSnapshot{
-		Endpoint:         in.Endpoint,
-		InboundProtocol:  in.InboundProtocol,
-		UpstreamProtocol: in.UpstreamProtocol,
-		UpstreamURL:      sanitizeUpstreamURL(in.UpstreamURL),
-		Converted:        in.Converted,
-		TokenID:          in.TokenID,
-		Model:            in.Model,
-		AutoModelName:    in.AutoModelName,
-		Stream:           in.Stream,
-		MessageCount:     s.msgCount,
-		Tools:            s.tools,
+		Endpoint:          in.Endpoint,
+		InboundProtocol:   in.InboundProtocol,
+		UpstreamProtocol:  in.UpstreamProtocol,
+		UpstreamURL:       sanitizeUpstreamURL(in.UpstreamURL),
+		Converted:         in.Converted,
+		TokenID:           in.TokenID,
+		Model:             in.Model,
+		AutoModelName:     in.AutoModelName,
+		Stream:            in.Stream,
+		MessageCount:      s.msgCount,
+		Redacted:          s.redacted,
+		MessagesTruncated: in.MessagesTruncated,
+		Tools:             s.tools,
 	}
 	if s.tools != nil {
 		snap.Summarized = append(snap.Summarized, "tools")
@@ -325,8 +372,25 @@ func dropParam(snap *reqParamsSnapshot, dropped map[string]bool, key string) {
 		return
 	}
 	delete(snap.Params, key)
+	// 同一字段不允许既在 summarized（有标记）又在 dropped（已丢）：以 dropped 为准先摘掉 summarized，
+	// 保证「每个字段只有一个归属」、对账口径唯一（Owl PR #63 建议 1）。
+	removeFromSummarized(snap, key)
 	dropped[key] = true
 	snap.Dropped = append(snap.Dropped, key)
+}
+
+// removeFromSummarized 从 summarized 里摘掉某键（保持其余顺序不变）。
+func removeFromSummarized(snap *reqParamsSnapshot, key string) {
+	if len(snap.Summarized) == 0 {
+		return
+	}
+	out := snap.Summarized[:0]
+	for _, k := range snap.Summarized {
+		if k != key {
+			out = append(out, k)
+		}
+	}
+	snap.Summarized = out
 }
 
 // jsonbSizeBound 估算 `pg_column_size(<此 JSONB 值>)` 的上界。
@@ -350,7 +414,7 @@ func overBudget(snap reqParamsSnapshot) bool {
 
 // coreKVCount 核心字段的 KV 个数上界（endpoint/inbound/upstream/url/converted/token/model/
 // auto_model/stream/message_count/tools/params/summarized/dropped/over_budget）——取值偏大即偏安全。
-const coreKVCount = 16
+const coreKVCount = 17
 
 // capCoreString 核心字段的长度截断（异常长的 URL/模型名不允许撑爆预算），被截断时记名。
 // 截断走 truncateUTF8（按字符边界），避免中文模型名/长 URL 被切成半个字符后

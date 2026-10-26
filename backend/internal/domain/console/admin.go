@@ -1350,27 +1350,9 @@ GROUP BY session_id`, ids)
 }
 
 // channelNamesByKeyIDs 批量由渠道密钥 ID 反查所属渠道名；失败返回 nil（会话列表以空串兜底）。
+// channelNamesByKeyIDs 委托给包级共享实现（dev 列表也用它，避免两份 SQL/两套口径）。
 func (h *Admin) channelNamesByKeyIDs(ctx context.Context, keyIDs []int64) map[int64]string {
-	if h.db == nil || len(keyIDs) == 0 {
-		return nil
-	}
-	rows, err := h.db.QueryContext(ctx,
-		`SELECT k.id, c.name FROM channel_keys k JOIN channels c ON c.id = k.channel_id
-		 WHERE k.id = ANY('{`+int64List(keyIDs)+`}'::bigint[])`)
-	if err != nil {
-		return nil
-	}
-	defer rows.Close()
-	out := make(map[int64]string, len(keyIDs))
-	for rows.Next() {
-		var id int64
-		var name string
-		if err := rows.Scan(&id, &name); err != nil {
-			continue
-		}
-		out[id] = name
-	}
-	return out
+	return channelNamesByKeyIDs(ctx, h.db, keyIDs)
 }
 
 func collectSessionIDs(ss []*router.Session, get func(*router.Session) int64) []int64 {

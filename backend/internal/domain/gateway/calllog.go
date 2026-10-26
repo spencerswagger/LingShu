@@ -310,14 +310,30 @@ func parseRequestMessages(body []byte) ([]json.RawMessage, bool) {
 	return nil, false
 }
 
-// captureReqIncrement 计算本次请求的增量消息与全量指纹：
-// 会话已有上次指纹时按 diffMessages 对齐；否则降级取最后一条 user（及其 tool 链）。
-// 返回 (增量消息, 本次全量指纹)；body 解析失败返回 (nil, nil)。
+// reqMessagesMaxBytes req_messages 单条调用日志落库的总量上限（256KB）。
+// 超限时按「保 system + 保最新、裁最旧」的顺序裁剪，并在 req_params.messages_truncated 里显式标记——
+// 绝不回退成「只留最后一条 / 丢 system 与前文」（那是本次改造前的 bug）。
+const reqMessagesMaxBytes = 256 * 1024
+
+// msgTruncInfo req_messages 被裁剪时的显式标记（落到请求快照里，便于事后判断「看到的是不是全量」）。
+type msgTruncInfo struct {
+	Reason        string `json:"reason"`                // 固定 "size"（超出 reqMessagesMaxBytes）
+	LimitBytes    int    `json:"limit_bytes"`           // 上限
+	OriginalBytes int    `json:"original_bytes"`        // 原始增量消息的序列化字节数
+	OriginalCount int    `json:"original_count"`        // 原始条数
+	KeptCount     int    `json:"kept_count"`            // 实际落库条数
+	DroppedCount  int    `json:"dropped_count"`         // 被裁掉的条数（最旧的先裁，system 不裁）
+	ContentCut    int    `json:"content_cut,omitempty"` // 因单条过长被截断正文的条数
+}
+
+// captureReqIncrement 计算本次请求的增量消息、全量指纹与（必要时）裁剪标记：
+// 会话已有上次指纹时按 diffMessages 对齐；否则落全量消息（首轮不丢 system 与前文）。
+// 返回 (增量消息, 本次全量指纹, 裁剪标记)；body 解析失败返回 (nil, nil, nil)。
 // 会更新 sessObj.LastMsgFingerprints 为本次全量指纹（新会话由调用方在 Attach 时设置）。
-func (g *Gateway) captureReqIncrement(sessObj *router.Session, body []byte) ([]json.RawMessage, []string) {
+func (g *Gateway) captureReqIncrement(sessObj *router.Session, body []byte) ([]json.RawMessage, []string, *msgTruncInfo) {
 	msgs, ok := parseRequestMessages(body)
 	if !ok || len(msgs) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	fps := make([]string, len(msgs))
 	for i, m := range msgs {
@@ -335,7 +351,107 @@ func (g *Gateway) captureReqIncrement(sessObj *router.Session, body []byte) ([]j
 	if incr == nil {
 		incr = []json.RawMessage{}
 	}
-	return incr, fps
+	incr, trunc := capReqMessages(incr)
+	return incr, fps, trunc
+}
+
+// capReqMessages 给 req_messages 加总量上限（默认 256KB），超限时**按条裁剪**而不是整段丢弃：
+//  1. 单条正文过长（>单条上限）先按 rune 边界截断正文（避免一条长消息吃光预算）；
+//  2. 仍超总量则从**最旧的非 system 消息**开始丢，保留 system 与最新若干条；
+//  3. 任何裁剪都返回 msgTruncInfo（记原始/保留条数与字节数），由调用方落进请求快照。
+//
+// 之所以不直接丢整段：调用日志的价值就在「当初发了什么」，裁掉 system 或前文会让排查失真。
+func capReqMessages(msgs []json.RawMessage) ([]json.RawMessage, *msgTruncInfo) {
+	if len(msgs) == 0 {
+		return msgs, nil
+	}
+	total := 0
+	for _, m := range msgs {
+		total += len(m)
+	}
+	if total <= reqMessagesMaxBytes {
+		return msgs, nil
+	}
+	info := &msgTruncInfo{Reason: "size", LimitBytes: reqMessagesMaxBytes, OriginalBytes: total, OriginalCount: len(msgs)}
+
+	// 1) 单条上限：单条不超过总量的 1/8，超出则按 rune 边界截断正文。
+	perMsgCap := reqMessagesMaxBytes / 8
+	out := make([]json.RawMessage, len(msgs))
+	for i, m := range msgs {
+		if len(m) <= perMsgCap {
+			out[i] = m
+			continue
+		}
+		if cut, ok := truncateMessageContent(m, perMsgCap); ok {
+			out[i] = cut
+			info.ContentCut++
+			continue
+		}
+		out[i] = m
+	}
+	// 2) 仍超总量：从最旧的非 system 消息开始丢，system 与最新消息优先保留。
+	sum := 0
+	for _, m := range out {
+		sum += len(m)
+	}
+	for sum > reqMessagesMaxBytes {
+		idx := oldestDroppableMessage(out)
+		if idx < 0 {
+			break // 只剩 system（或单条超限无法再裁）：保留，避免丢光上下文
+		}
+		sum -= len(out[idx])
+		out = append(out[:idx], out[idx+1:]...)
+		info.DroppedCount++
+	}
+	info.KeptCount = len(out)
+	if info.DroppedCount == 0 && info.ContentCut == 0 {
+		return msgs, nil
+	}
+	return out, info
+}
+
+// oldestDroppableMessage 找最旧的可丢消息下标（跳过 system / developer 角色）。
+func oldestDroppableMessage(msgs []json.RawMessage) int {
+	for i, m := range msgs {
+		var head struct {
+			Role string `json:"role"`
+		}
+		if err := json.Unmarshal(m, &head); err != nil {
+			return i
+		}
+		if head.Role == "system" || head.Role == "developer" {
+			continue
+		}
+		return i
+	}
+	return -1
+}
+
+// truncateMessageContent 把单条消息的正文按 rune 边界截断到 maxBytes 以内，并打上省略标记。
+// 仅处理「content 为字符串」的常见形状；其余形状（多模态数组等）原样返回（交给上层按条裁剪）。
+func truncateMessageContent(raw json.RawMessage, maxBytes int) (json.RawMessage, bool) {
+	var msg map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &msg); err != nil {
+		return raw, false
+	}
+	var content string
+	if err := json.Unmarshal(msg["content"], &content); err != nil || content == "" {
+		return raw, false
+	}
+	if len(content) <= maxBytes/2 {
+		return raw, false
+	}
+	cut, _ := truncateUTF8(content, maxBytes/2, "…（正文过长已截断）")
+	enc, err := json.Marshal(cut)
+	if err != nil {
+		return raw, false
+	}
+	msg["content"] = enc
+	out, err := json.Marshal(msg)
+	if err != nil || len(out) >= len(raw) {
+		return raw, false
+	}
+	return out, true
 }
 
 // preCharge 预扣决策快照：预扣阶段（估算输入 token × 时段/分档系数 ÷ R）的关键参数，

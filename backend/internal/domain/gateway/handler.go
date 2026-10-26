@@ -267,13 +267,22 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 	// 候选真正组包时再覆盖为「候选级」快照（含实际上游协议与上游 URL）。
 	// 挂在 context 上而不是逐处传参：写入漏斗只有 writeCallLogUsage 一个，单点取用即不会漏、也不会各处口径不一致。
 	rpSrc := newReqParamsSource(body)
-	r = r.WithContext(withReqParams(r.Context(), rpSrc.buildReqParams(reqParamsInput{
-		Endpoint:        inboundPath(endpoint),
-		InboundProtocol: baseProtocol,
-		TokenID:         token.ID,
-		Model:           model,
-		Stream:          isStream,
-	})))
+	// attachReqParams 重建并挂上「请求级」快照（候选未定：上游协议/URL 留空）。
+	// 同时**刷新 ctx**：ctx 在 serve 开头就已取出（ctx := r.Context()），若不刷新，
+	// 本函数内后续的拒绝路径（503 无候选 / 429 全限流 / 协议不支持）写调用日志时拿到的还是
+	// 未挂快照的旧 ctx —— 那三类恰恰是最需要看请求参数现场的场景（Owl PR #63 P2-3）。
+	attachReqParams := func(trunc *msgTruncInfo) {
+		r = r.WithContext(withReqParams(r.Context(), rpSrc.buildReqParams(reqParamsInput{
+			Endpoint:          inboundPath(endpoint),
+			InboundProtocol:   baseProtocol,
+			TokenID:           token.ID,
+			Model:             model,
+			Stream:            isStream,
+			MessagesTruncated: trunc,
+		})))
+		ctx = r.Context()
+	}
+	attachReqParams(nil)
 
 	// 3) 令牌标签 → TagKV。
 	var tagKV map[string]string
@@ -436,12 +445,15 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 				reason = msgNoRoute
 			}
 			bid := g.recordGatewayReject(ctx, model, autoName, token, "", sessionID, reason)
-			// 路由层排除项（如排空）并入决策轨迹：既写调用日志，也让请求级结论带上 attempt_trail，
-			// 避免「仅因排空而无候选」在观测面上静默无记录（无排除项时行为完全不变）。
-			if exAttempts := excludedAttempts(excluded); len(exAttempts) > 0 {
+			// 调用日志**无条件**写：除「排空等排除项」外，无候选（503）/模型不存在（404）这类拒绝
+			// 过去完全不落 call_logs，于是最需要现场的请求反而没有 req_params 快照
+			// （Owl PR #63 P2-3）。无排除项时 attempts 为空数组，其它路径判定不受影响。
+			exAttempts := excludedAttempts(excluded)
+			g.writeCallLog(ctx, bid, "", token, &router.RouteResult{AutoModelName: autoName}, model, "", sessionID,
+				nil, "error", "", "failed", reason, msSince(start), nil, excludedRejectDecision(exAttempts))
+			// 请求级结论仍只在有排除项时输出（保持既有日志口径不变）。
+			if len(exAttempts) > 0 {
 				trail, failed := summarizeAttempts(exAttempts)
-				g.writeCallLog(ctx, bid, "", token, &router.RouteResult{AutoModelName: autoName}, model, "", sessionID,
-					nil, "error", "", "failed", reason, msSince(start), nil, excludedRejectDecision(exAttempts))
 				g.logOutcome(ctx, slog.LevelWarn, endpoint, model, reason, status, false, token, sessionID, exAttempts, trail, failed, msSince(start))
 			}
 			g.logReject(ctx, endpoint, model, reason, status, token, msSince(start))
@@ -580,7 +592,11 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 	}
 	// 请求增量 diff：计算本次请求的增量消息与全量指纹（call_log 采集用，
 	// 新会话也在此初始化指纹，由下方 Attach 写入会话）。
-	reqMsgs, msgFps := g.captureReqIncrement(sessObj, body)
+	reqMsgs, msgFps, msgTrunc := g.captureReqIncrement(sessObj, body)
+	// req_messages 若因体积被裁剪，把裁剪标记补进请求快照（裁剪发生在 capture 阶段，比首次挂载晚）。
+	if msgTrunc != nil {
+		attachReqParams(msgTrunc)
+	}
 	sawLimit := false                // 出现过限流类失败（本地限流 或 上游 429）
 	sawOther := false                // 出现过非限流类的可重试失败（上游 401/402/403/404/5xx、网络类）
 	sawUnsupported := false          // 出现过「入站协议 ∉ 模型可达 protocols」（AC-4）
@@ -891,11 +907,12 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 			UpstreamProtocol: upstreamProto,
 			UpstreamURL: resolveUpstreamURL(ureq.BaseURL, ureq.Path,
 				defaultUpstreamPath(upstreamProto, provEndpoint)),
-			Converted:     converted,
-			TokenID:       token.ID,
-			Model:         model,
-			AutoModelName: autoName,
-			Stream:        isStream,
+			Converted:         converted,
+			TokenID:           token.ID,
+			Model:             model,
+			AutoModelName:     autoName,
+			Stream:            isStream,
+			MessagesTruncated: msgTrunc,
 		})))
 
 		// 进行中计数：包住整段上游转发（含流式全程），管理端「实时状态」据此判定「正在请求」。

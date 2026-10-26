@@ -339,3 +339,92 @@ func TestBuildReqParams_AccountingInvariant(t *testing.T) {
 		})
 	}
 }
+
+// TestBuildReqParams_RedactsSensitiveKeys 是 Owl PR #63 P2-2 的回归：
+// 入站 body 里的凭据/身份类键（api_key/token/password/secret/authorization/metadata/user…）
+// 必须落成 "redacted"，原文零命中；正常参数不得被误伤。
+func TestBuildReqParams_RedactsSensitiveKeys(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-4","stream":true,"messages":[{"role":"user","content":"hi"}],
+		"temperature":0.7,"max_tokens":1024,"top_k":40,"max_completion_tokens":512,
+		"api_key":"sk-live-AAA","token":"tok-BBB","password":"pw-CCC","secret":"sec-DDD",
+		"client_secret":"cs-EEE","authorization":"Bearer ZZZ","access_token":"at-FFF",
+		"metadata":{"tenant":"acme","user":"bob"},"user":"alice","session_key":"sk-ggg",
+		"response_format":{"type":"json_object"}
+	}`)
+	src := newReqParamsSource(body)
+	raw := src.buildReqParams(reqParamsInput{
+		Endpoint: "/v1/chat/completions", InboundProtocol: "openai-chat", Model: "gpt-4", Stream: true,
+	})
+	text := string(raw)
+
+	// 1) 原文零命中（包括嵌套在 metadata 里的身份值）。
+	for _, leaked := range []string{"sk-live-AAA", "tok-BBB", "pw-CCC", "sec-DDD", "cs-EEE", "Bearer ZZZ", "at-FFF", "acme", "bob", "alice", "sk-ggg"} {
+		if strings.Contains(text, leaked) {
+			t.Fatalf("敏感原文泄漏 %q: %s", leaked, text)
+		}
+	}
+	var snap reqParamsSnapshot
+	if err := json.Unmarshal(raw, &snap); err != nil {
+		t.Fatalf("反序列化失败: %v", err)
+	}
+	// 2) 敏感键仍在（键名保留，值统一 redacted），并记入 redacted 列表。
+	wantRedacted := []string{"access_token", "api_key", "authorization", "client_secret", "metadata",
+		"password", "secret", "session_key", "token", "user"}
+	for _, k := range wantRedacted {
+		v, ok := snap.Params[k]
+		if !ok {
+			t.Fatalf("敏感键 %q 应保留键名（值 redacted），实际丢失: %v", k, snap.Params)
+		}
+		if string(v) != `"redacted"` {
+			t.Fatalf("敏感键 %q 值应为 redacted，实际 %s", k, v)
+		}
+	}
+	if len(snap.Redacted) != len(wantRedacted) {
+		t.Fatalf("redacted 列表=%v, want %v", snap.Redacted, wantRedacted)
+	}
+	// 3) 正常参数不得误伤。
+	for _, k := range []string{"temperature", "max_tokens", "top_k", "max_completion_tokens", "response_format"} {
+		if _, ok := snap.Params[k]; !ok {
+			t.Fatalf("正常参数 %q 被误伤: %v", k, snap.Params)
+		}
+	}
+	if strings.Contains(text, `"temperature":"redacted"`) {
+		t.Fatalf("temperature 被误判为敏感键: %s", text)
+	}
+	// 4) 可定位字段仍在（Owl 关心的 minimum set）。
+	if snap.Model != "gpt-4" || !snap.Stream || snap.MessageCount != 1 {
+		t.Fatalf("可定位字段缺失: %+v", snap)
+	}
+}
+
+// TestDropParam_RemovesFromSummarized Owl 建议 1 回归：同一字段不能既在 summarized（被标记）
+// 又在 dropped（被丢），否则对账出现两条互相矛盾的记录。
+func TestDropParam_RemovesFromSummarized(t *testing.T) {
+	snap := reqParamsSnapshot{
+		Params:     map[string]json.RawMessage{"response_format": json.RawMessage(`"omitted:3000B"`), "temperature": json.RawMessage(`1`)},
+		Summarized: []string{"tools", "response_format"},
+	}
+	dropped := map[string]bool{}
+	dropParam(&snap, dropped, "response_format")
+
+	if _, still := snap.Params["response_format"]; still {
+		t.Fatal("dropParam 后仍留在 params")
+	}
+	for _, k := range snap.Summarized {
+		if k == "response_format" {
+			t.Fatalf("被丢字段仍留在 summarized：%v", snap.Summarized)
+		}
+	}
+	if len(snap.Dropped) != 1 || snap.Dropped[0] != "response_format" {
+		t.Fatalf("dropped=%v, want [response_format]", snap.Dropped)
+	}
+	if len(snap.Summarized) != 1 || snap.Summarized[0] != "tools" {
+		t.Fatalf("summarized 其余项应保留：%v", snap.Summarized)
+	}
+	// 重复 drop 幂等（不产生重复条目）。
+	dropParam(&snap, dropped, "response_format")
+	if len(snap.Dropped) != 1 {
+		t.Fatalf("重复 drop 产生重复条目：%v", snap.Dropped)
+	}
+}

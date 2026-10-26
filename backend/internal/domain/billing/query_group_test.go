@@ -35,11 +35,12 @@ func TestListRecords_GroupByRequestMergesAttempts(t *testing.T) {
 	f := RecordFilter{GroupByRequest: true, Page: 1, Size: 20}
 
 	// 组数统计：count(*) FROM ( SELECT 1 FROM billing_records br LEFT JOIN call_logs cl ... GROUP BY ... )。
-	mock.ExpectQuery(`SELECT count\(\*\) FROM \(\s*SELECT 1 FROM billing_records br LEFT JOIN call_logs cl .*GROUP BY COALESCE\(NULLIF\(cl.request_id, ''\), br.billing_id\)\) grp`).
+	// 分组键带用户维度（防客户端可控 x-request-id 跨用户撞车）。
+	mock.ExpectQuery(`SELECT count\(\*\) FROM \(\s*SELECT 1 FROM billing_records br LEFT JOIN call_logs cl .*GROUP BY \(br.user_id::text \|\| ':' \|\| COALESCE\(NULLIF\(cl.request_id, ''\), br.billing_id\)\)\) grp`).
 		WithArgs(nil, nil, nil, "", "", "", "", nil, nil).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(3)))
 	// 主行选取：array_agg 按 (status='completed') DESC, id DESC 取第一，并带回 rid/cnt。
-	mock.ExpectQuery(`WITH grp AS \(\s*SELECT COALESCE\(NULLIF\(cl.request_id, ''\), br.billing_id\) AS g,.*array_agg\(br.billing_id ORDER BY \(br.status = 'completed'\) DESC, br.id DESC\)\)\[1\] AS main_bid,.*count\(\*\)::int AS cnt.*SELECT .*grp.rid, grp.cnt.*ORDER BY billing_records.id DESC LIMIT \$10 OFFSET \$11`).
+	mock.ExpectQuery(`WITH grp AS \(\s*SELECT \(br.user_id::text \|\| ':' \|\| COALESCE\(NULLIF\(cl.request_id, ''\), br.billing_id\)\) AS g,.*array_agg\(br.billing_id ORDER BY \(br.status = 'completed'\) DESC, br.id DESC\)\)\[1\] AS main_bid,.*count\(\*\)::int AS cnt.*SELECT .*grp.rid, grp.cnt.*ORDER BY billing_records.id DESC LIMIT \$10 OFFSET \$11`).
 		WithArgs(nil, nil, nil, "", "", "", "", nil, nil, 20, 0).
 		WillReturnRows(groupedRows(t, "req-1", 2))
 

@@ -86,6 +86,14 @@ func (h *Dev) HandleListBillings(w http.ResponseWriter, r *http.Request) {
 	for i := range records {
 		list = append(list, toDevBillingListItem(&records[i]))
 	}
+	// 渠道显示名（白名单内、非密钥）：批量回查，避免 N+1；与管理端共用同一份实现。
+	keyIDs := uniqueInt64(records, func(r billing.Record) int64 { return r.ChannelKeyID })
+	names := channelNamesByKeyIDs(r.Context(), h.db, keyIDs)
+	for i := range list {
+		if name := names[records[i].ChannelKeyID]; name != "" {
+			list[i].ChannelName = name
+		}
+	}
 	resp.OK(w, r, map[string]any{"List": list, "Total": total, "Page": f.Page, "Size": f.Size})
 }
 

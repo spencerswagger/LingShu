@@ -130,8 +130,18 @@ func (g groupedExtraCols) Scan(dest ...any) error {
 	return g.row.Scan(append(dest, g.rid, g.cnt)...)
 }
 
+// groupKeyExpr 归并分组键：**用户维度 + 请求维度**。
+//
+// 为什么必须带 user_id：request_id 来自客户端可控的 `x-request-id`（服务端只做格式校验），
+// 两个不同用户撞同一个 id 会被并成一行（Owl PR #63 P2-1：既串号、也让「一次请求一行」失真）。
+// 加用户维度后：不同用户永不并、同用户同 id 正常归并；无调用日志时退回 billing_id（其本身全局唯一）。
+// 归并在 **SQL 层**完成（GROUP BY + LIMIT/OFFSET，主行用 array_agg 取），不把全量账单拉进内存。
+func groupKeyExpr() string {
+	return `(br.user_id::text || ':' || COALESCE(NULLIF(cl.request_id, ''), br.billing_id))`
+}
+
 // listRecordsGrouped 按「一次请求一行」归并分页：
-// 分组键 = call_logs.request_id（无调用日志时退回 billing_id，保证每次请求独立成行）。
+// 分组键 = user_id + call_logs.request_id（见 groupKeyExpr；无调用日志时退回 billing_id）。
 // 主行选取：优先 status='completed' 的行，其次 id 最大（最新一次尝试）——即「成功的那次优先，
 // 全失败时展示最后一次失败的现场」。Attempts 为该请求产生的账单条数（多次候选/多次上游失败）。
 // 注意：金额类聚合仍走 Summarize（按行），归并只影响列表展示，不改变计费口径。
@@ -144,7 +154,7 @@ func (s *SqlStore) listRecordsGrouped(ctx context.Context, f RecordFilter) ([]Re
 	if err := s.db.QueryRowContext(ctx,
 		`SELECT count(*) FROM (
 		    SELECT 1`+base+`
-		    GROUP BY COALESCE(NULLIF(cl.request_id, ''), br.billing_id)) grp`, args...).Scan(&total); err != nil {
+		    GROUP BY `+groupKeyExpr()+`) grp`, args...).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("count grouped billing records: %w", err)
 	}
 
@@ -152,7 +162,7 @@ func (s *SqlStore) listRecordsGrouped(ctx context.Context, f RecordFilter) ([]Re
 	args = append(args, f.Size, offset)
 	rows, err := s.db.QueryContext(ctx,
 		`WITH grp AS (
-		    SELECT COALESCE(NULLIF(cl.request_id, ''), br.billing_id) AS g,
+		    SELECT `+groupKeyExpr()+` AS g,
 		           COALESCE(cl.request_id, '') AS rid,
 		           (array_agg(br.billing_id ORDER BY (br.status = 'completed') DESC, br.id DESC))[1] AS main_bid,
 		           count(*)::int AS cnt`+base+`

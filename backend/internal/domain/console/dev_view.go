@@ -235,6 +235,7 @@ type devBillingListItem struct {
 	Status          string            `json:"Status"`
 	CallTime        time.Time         `json:"CallTime"`
 	SessionID       string            `json:"SessionID,omitempty"`
+	ChannelName     string            `json:"ChannelName,omitempty"` // 渠道显示名（非密钥；白名单内）
 	SessionName     string            `json:"SessionName,omitempty"`
 	Tokens          billing.WireUsage `json:"Tokens"`
 	ErrorMessage    string            `json:"ErrorMessage,omitempty"`

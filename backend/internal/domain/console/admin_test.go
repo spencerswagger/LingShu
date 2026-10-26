@@ -165,7 +165,7 @@ func TestHandleListBillings_FilterParams(t *testing.T) {
 	)
 
 	// 列表默认按 request_id 归并（Group 缺省开启）：SQL 走 CTE grp，参数位不变。
-	mock.ExpectQuery(`SELECT count\(\*\) FROM \(\s*SELECT 1 FROM billing_records br LEFT JOIN call_logs cl .*channel_key_id = \$2.*session_id = \$4.*GROUP BY COALESCE`).
+	mock.ExpectQuery(`SELECT count\(\*\) FROM \(\s*SELECT 1 FROM billing_records br LEFT JOIN call_logs cl .*channel_key_id = \$2.*session_id = \$4.*GROUP BY \(br.user_id::text \|\| ':' \|\| COALESCE`).
 		WithArgs(nil, int64(3), nil, "sess-1", "", "", "", nil, nil).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(1)))
 	mock.ExpectQuery(`WITH grp AS \(.*grp.rid, grp.cnt.*LIMIT \$10 OFFSET \$11`).
