@@ -38,7 +38,7 @@ func (h *Dev) SetCallLogStore(s callLogReader) { h.callLogs = s }
 func (h *Dev) SetDB(db *sql.DB) { h.db = db }
 
 // attachCallLog 查 call_logs 并填充账单详情（未装配/无记录时为 nil）。
-func (h *Dev) attachCallLog(ctx context.Context, bid string) *CallLogView {
+func (h *Dev) attachCallLog(ctx context.Context, bid string) *DevCallLogView {
 	if h.callLogs == nil || bid == "" {
 		return nil
 	}
@@ -57,49 +57,6 @@ func (h *Dev) currentUser(w http.ResponseWriter, r *http.Request) (int64, bool) 
 		return 0, false
 	}
 	return id, true
-}
-
-// devBillingListItem 开发者端账单列表项（脱敏 DTO）。
-// 与管理端 billingListItem 的关键差异（P1 安全项）：不含内部模型 ID、渠道密钥维度
-// （channel_key_id/key_name/channel_name）、成本相关字段（rates/RValue/系数），也不含其他用户维度。
-// 保留：自己的账单金额（积分）、三段用量、状态与耗时、request_id 与尝试次数（自助定位请求用）。
-type devBillingListItem struct {
-	BillingID       string            `json:"BillingID"`
-	ExternalModel   string            `json:"ExternalModel"`
-	AutoModelName   string            `json:"AutoModelName,omitempty"`
-	PricingMode     string            `json:"PricingMode"`
-	CreditsConsumed float64           `json:"CreditsConsumed"`
-	Status          string            `json:"Status"`
-	CallTime        time.Time         `json:"CallTime"`
-	SessionID       string            `json:"SessionID,omitempty"`
-	SessionName     string            `json:"SessionName,omitempty"`
-	Tokens          billing.WireUsage `json:"Tokens"`
-	ErrorMessage    string            `json:"ErrorMessage,omitempty"`
-	DurationMs      *int64            `json:"DurationMs,omitempty"`
-	FirstTokenMs    *int64            `json:"FirstTokenMs,omitempty"`
-	RequestID       string            `json:"RequestID,omitempty"`
-	Attempts        int               `json:"Attempts,omitempty"`
-}
-
-// toDevBillingListItem 由账单行组装开发者端列表项（字段白名单，新增字段必须显式加进来）。
-func toDevBillingListItem(rec *billing.Record) devBillingListItem {
-	return devBillingListItem{
-		BillingID:       rec.BillingID,
-		ExternalModel:   rec.ExternalModel,
-		AutoModelName:   rec.AutoModelName,
-		PricingMode:     rec.PricingMode,
-		CreditsConsumed: decimalx.Round5(rec.CreditsConsumed),
-		Status:          rec.Status,
-		CallTime:        rec.CallTime,
-		SessionID:       rec.SessionID,
-		SessionName:     rec.SessionName,
-		Tokens:          billing.WireUsage(rec.Tokens),
-		ErrorMessage:    rec.ErrorMessage,
-		DurationMs:      rec.DurationMs,
-		FirstTokenMs:    rec.FirstTokenMs,
-		RequestID:       rec.RequestID,
-		Attempts:        rec.Attempts,
-	}
 }
 
 // HandleListBillings GET /api/v1/dev/billings?page=&size=&from=&to= 查询本人账单。
@@ -155,7 +112,7 @@ func (h *Dev) HandleGetBilling(w http.ResponseWriter, r *http.Request) {
 	}
 	// 开发者端拆解：cost 模式不展示明细（成本金额属内部信息，见 breakdown.go）。
 	steps, routeDiff := buildBreakdownDev(rec)
-	detail := BillingDetail{
+	detail := devBillingDetail{
 		BillingID:       rec.BillingID,
 		CallTime:        rec.CallTime.Format(time.RFC3339),
 		Model:           rec.ExternalModel,
@@ -311,7 +268,7 @@ func (h *Dev) HandleListSessionCalls(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if h.db == nil {
-		resp.OK(w, r, map[string]any{"List": []CallLogView{}, "Total": 0})
+		resp.OK(w, r, map[string]any{"List": []DevCallLogView{}, "Total": 0})
 		return
 	}
 	var owner int64
@@ -337,9 +294,9 @@ func (h *Dev) HandleListSessionCalls(w http.ResponseWriter, r *http.Request) {
 		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "查询调用日志失败")
 		return
 	}
-	list := make([]CallLogView, 0, len(logs))
+	list := make([]DevCallLogView, 0, len(logs))
 	for i := range logs {
-		// 开发者端走脱敏投影（渠道密钥/内部模型 ID/成本一律不返回）。
+		// 开发者端走白名单正向构造（渠道密钥/内部模型 ID/成本一律不返回）。
 		if v := toDevCallLogView(&logs[i]); v != nil {
 			list = append(list, *v)
 		}

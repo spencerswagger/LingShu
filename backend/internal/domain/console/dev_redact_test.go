@@ -9,6 +9,16 @@ import (
 	"github.com/team/llmgateway/internal/domain/gateway"
 )
 
+// assertNoSensitive 断言输出 JSON 里不含任何敏感键（三处共用 devSensitiveKeys 单一来源）。
+func assertNoSensitive(t *testing.T, out, surface string) {
+	t.Helper()
+	for _, banned := range devSensitiveKeys {
+		if strings.Contains(out, `"`+banned+`"`) {
+			t.Fatalf("%s 泄漏敏感键 %q: %s", surface, banned, out)
+		}
+	}
+}
+
 // TestToDevBillingListItem_MasksInternals 断言开发者端列表项是脱敏白名单：
 // 不含内部模型 ID、渠道密钥维度、成本/费率字段（P1 安全项），但保留 request_id/尝试次数与用量。
 func TestToDevBillingListItem_MasksInternals(t *testing.T) {
@@ -32,23 +42,26 @@ func TestToDevBillingListItem_MasksInternals(t *testing.T) {
 		t.Fatalf("marshal: %v", err)
 	}
 	out := string(raw)
-	for _, banned := range []string{"InternalModelID", "ChannelKeyID", "Rates", "RValue", "gpt-4-azure-prod", "CacheWrite"} {
-		if strings.Contains(out, banned) {
-			t.Fatalf("dev list item leaks %q: %s", banned, out)
+	assertNoSensitive(t, out, "dev 列表项")
+	for _, leak := range []string{"gpt-4-azure-prod", "CacheWrite", "0.3"} {
+		if strings.Contains(out, leak) {
+			t.Fatalf("dev 列表项泄漏 %q: %s", leak, out)
 		}
 	}
 	// 该给的仍要给：账单号、对外模型、积分、用量、request_id、尝试次数。
 	for _, want := range []string{`"BillingID":"bill-1"`, `"ExternalModel":"gpt-4"`, `"CreditsConsumed":1.5`, `"RequestID":"req-1"`, `"Attempts":2`} {
 		if !strings.Contains(out, want) {
-			t.Fatalf("dev list item missing %q: %s", want, out)
+			t.Fatalf("dev 列表项缺少 %q: %s", want, out)
 		}
 	}
 }
 
-// TestToDevCallLogView_MasksDecisionAndReqParams 断言开发者端调用日志脱敏：
-// 决策轨迹里的渠道密钥/内部模型 ID/成本键被抹掉（含 attempts 内每一项），
-// 请求快照里的上游 URL 被抹掉；其余诊断信息（状态、错误、用量、参数）保留。
-func TestToDevCallLogView_MasksDecisionAndReqParams(t *testing.T) {
+// TestToDevCallLogView_WhitelistOnly 断言开发者端调用日志是**白名单正向构造**：
+//   - 敏感键（密钥/内部模型/成本/上游 URL）不出现；
+//   - 决策轨迹与请求快照里**将来新增的未知键**同样不出现（这是「删键式黑名单」做不到的，
+//     也是 PR #63 验收 P3 的核心）；
+//   - 白名单内的键（含嵌套 params 里的采样参数）完整保留，JSON 键名与共享视图一致。
+func TestToDevCallLogView_WhitelistOnly(t *testing.T) {
 	cl := &gateway.CallLog{
 		BillingID: "bill-1",
 		RequestID: "req-1",
@@ -61,19 +74,25 @@ func TestToDevCallLogView_MasksDecisionAndReqParams(t *testing.T) {
 			"internal_model_id": "gpt-4-azure-prod",
 			"cost":              0.77,
 			"cost_known":        true,
+			"future_secret":     "should-never-leak", // 模拟将来新增的敏感字段
 			"attempts": []any{
 				map[string]any{
-					"order":             1,
-					"channel_name":      "azure-1",
-					"channel_key_id":    "88",
-					"channel_key_name":  "secret-key",
-					"internal_model_id": "gpt-4-azure-prod",
-					"cost":              0.77,
-					"reason":            "上游返回 400",
+					"order":              1,
+					"channel_name":       "azure-1",
+					"channel_key_id":     "88",
+					"channel_key_name":   "secret-key",
+					"internal_model_id":  "gpt-4-azure-prod",
+					"cost":               0.77,
+					"route_time_coeff":   1.2,
+					"future_attempt_key": "should-never-leak",
+					"reason":             "上游返回 400",
 				},
 			},
 		},
-		ReqParams: []byte(`{"endpoint":"/v1/chat/completions","model":"gpt-4","upstream_url":"https://r.openai.azure.com/openai/deployments/gpt4o/chat/completions","temperature":0.3}`),
+		ReqParams: []byte(`{"endpoint":"/v1/chat/completions","model":"gpt-4",
+			"upstream_url":"https://r.openai.azure.com/openai/deployments/gpt4o/chat/completions",
+			"future_param_key":"should-never-leak",
+			"params":{"temperature":0.3,"max_tokens":256}}`),
 	}
 	v := toDevCallLogView(cl)
 	if v == nil {
@@ -84,21 +103,70 @@ func TestToDevCallLogView_MasksDecisionAndReqParams(t *testing.T) {
 		t.Fatalf("marshal: %v", err)
 	}
 	out := string(raw)
-	for _, banned := range []string{"channel_key_id", "channel_key_name", "secret-key", "internal_model_id",
-		"gpt-4-azure-prod", `"cost"`, "cost_known", "upstream_url", "r.openai.azure.com"} {
+	assertNoSensitive(t, out, "dev 调用日志")
+	for _, banned := range []string{"secret-key", "gpt-4-azure-prod", "r.openai.azure.com",
+		"future_secret", "future_attempt_key", "future_param_key", "should-never-leak"} {
 		if strings.Contains(out, banned) {
-			t.Fatalf("dev call log leaks %q: %s", banned, out)
+			t.Fatalf("dev 调用日志泄漏 %q: %s", banned, out)
 		}
 	}
-	// 仍保留：状态、候选理由、请求参数、自有积分（pre_consumed）。
-	for _, want := range []string{`"Status":"failed"`, "上游返回 400", `"temperature":0.3`, `"pre_consumed":0.5`, `"channel_name":"azure-1"`} {
+	// 白名单内仍保留：状态、候选理由、渠道名、嵌套的采样参数、自有积分。
+	for _, want := range []string{`"Status":"failed"`, "上游返回 400", `"channel_name":"azure-1"`,
+		`"temperature":0.3`, `"max_tokens":256`, `"pre_consumed":0.5`, `"endpoint":"/v1/chat/completions"`} {
 		if !strings.Contains(out, want) {
-			t.Fatalf("dev call log missing %q: %s", want, out)
+			t.Fatalf("dev 调用日志缺少 %q: %s", want, out)
 		}
 	}
-	// 原对象不得被就地修改（两个投影共用一个 CallLog 时互不污染）。
+	// 原对象不得被就地修改（同一 CallLog 可能同时被 admin 视图使用）。
 	if _, ok := cl.Decision.(map[string]any)["internal_model_id"]; !ok {
-		t.Fatal("source decision must stay untouched (redaction works on a copy)")
+		t.Fatal("source decision must stay untouched (filtering works on a copy)")
+	}
+}
+
+// TestDevViewWhitelists_SingleSource 断言三处白名单口径不漂移：
+//   - 三份键白名单都**不收录**任何敏感键（敏感键定义是单一来源 devSensitiveKeys）；
+//   - 每份内部无重复；
+//   - 关键可诊断键仍在白名单里（避免以后误删导致前端丢字段），且 upstream_url 永不收录。
+func TestDevViewWhitelists_SingleSource(t *testing.T) {
+	sensitive := make(map[string]bool, len(devSensitiveKeys))
+	for _, k := range devSensitiveKeys {
+		sensitive[k] = true
+	}
+	check := func(name string, keys []string) {
+		seen := make(map[string]bool, len(keys))
+		for _, k := range keys {
+			if sensitive[k] {
+				t.Fatalf("%s 白名单收录了敏感键 %q", name, k)
+			}
+			if seen[k] {
+				t.Fatalf("%s 内部重复键 %q", name, k)
+			}
+			seen[k] = true
+		}
+	}
+	check("devDecisionKeys", devDecisionKeys)
+	check("devAttemptKeys", devAttemptKeys)
+	check("devReqParamsKeys", devReqParamsKeys)
+
+	// 关键项必须在白名单里（避免以后误删导致前端丢字段）。
+	for _, need := range []string{"result", "attempts", "pre_consumed"} {
+		if !containsStr(devDecisionKeys, need) {
+			t.Fatalf("devDecisionKeys 缺少 %q", need)
+		}
+	}
+	for _, need := range []string{"endpoint", "upstream_protocol", "params", "tools", "dropped"} {
+		if !containsStr(devReqParamsKeys, need) {
+			t.Fatalf("devReqParamsKeys 缺少 %q", need)
+		}
+	}
+	if containsStr(devReqParamsKeys, "upstream_url") {
+		t.Fatal("devReqParamsKeys 不得包含 upstream_url（含部署名/供应商地址）")
+	}
+	// 敏感键清单本身要覆盖三类红线（密钥 / 内部模型 / 成本），否则负向断言会形同虚设。
+	for _, need := range []string{"channel_key_id", "internal_model_id", "cost", "Rates", "upstream_url"} {
+		if !containsStr(devSensitiveKeys, need) {
+			t.Fatalf("devSensitiveKeys 缺少红线键 %q", need)
+		}
 	}
 }
 
@@ -135,4 +203,14 @@ func TestBuildBreakdownDev_HidesCostMode(t *testing.T) {
 	if len(steps2) == 0 || diff2 != nil {
 		t.Fatalf("sale mode steps=%d diff=%+v, want non-empty steps and nil diff", len(steps2), diff2)
 	}
+}
+
+// containsStr 判断切片里是否存在目标串（测试小工具）。
+func containsStr(list []string, want string) bool {
+	for _, s := range list {
+		if s == want {
+			return true
+		}
+	}
+	return false
 }

@@ -55,10 +55,18 @@ func recordWhereOn(prefix string, f RecordFilter) (string, []any) {
 	}
 	if f.RequestID != "" {
 		// 一次请求可能产生多条账单（多候选/多次上游失败），按 request_id 命中即整组一起返回。
+		//
+		// ⚠️ 关联列必须**限定到外层表**：子查询里 call_logs 也有 billing_id，
+		// 写成裸 `billing_id` 会解析到子查询自己的列，条件退化成 `clr.billing_id = clr.billing_id`
+		// 恒真（PR #63 验收 P1：按 request_id 搜索后展开子记录会返回别人的账单）。
+		outerBillingID := "billing_records.billing_id" // 无前缀时外层表名就是 billing_records
+		if prefix != "" {
+			outerBillingID = prefix + "billing_id"
+		}
 		args = append(args, f.RequestID)
 		where += fmt.Sprintf(` AND EXISTS (SELECT 1 FROM call_logs clr
-		            WHERE clr.billing_id = %[1]sbilling_id AND clr.request_id = $%[2]d)`,
-			prefix, len(args))
+		            WHERE clr.billing_id = %[1]s AND clr.request_id = $%[2]d)`,
+			outerBillingID, len(args))
 	}
 	return where, args
 }

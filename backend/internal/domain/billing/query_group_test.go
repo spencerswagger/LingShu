@@ -76,7 +76,7 @@ func TestListRecords_FilterByRequestID(t *testing.T) {
 	store := NewSqlStore(db)
 	f := RecordFilter{RequestID: "req-xyz", Page: 1, Size: 10}
 
-	mock.ExpectQuery(`SELECT count\(\*\) FROM billing_records .*AND EXISTS \(SELECT 1 FROM call_logs clr\s+WHERE clr.billing_id = billing_id AND clr.request_id = \$10\)`).
+	mock.ExpectQuery(`SELECT count\(\*\) FROM billing_records .*AND EXISTS \(SELECT 1 FROM call_logs clr\s+WHERE clr.billing_id = billing_records.billing_id AND clr.request_id = \$10\)`).
 		WithArgs(nil, nil, nil, "", "", "", "", nil, nil, "req-xyz").
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(1)))
 	mock.ExpectQuery(`SELECT .* FROM billing_records .*clr.request_id = \$10.*ORDER BY id DESC LIMIT \$11 OFFSET \$12`).
@@ -92,6 +92,34 @@ func TestListRecords_FilterByRequestID(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("mock expectations: %v", err)
+	}
+}
+
+// TestRecordWhere_RequestIDCorrelationQualified 是 P1 回归：request_id 子查询的关联列
+// **必须限定到外层表**。写成裸 `billing_id` 时，PostgreSQL 会把它解析到子查询自己的
+// call_logs.billing_id，条件退化成恒真（`clr.billing_id = clr.billing_id`）——
+// 表现为「按 request_id 搜索后展开子记录（Group=0）返回全表账单」。本用例在修复前失败。
+func TestRecordWhere_RequestIDCorrelationQualified(t *testing.T) {
+	cases := []struct {
+		prefix  string
+		outerID string
+	}{
+		{"", "billing_records.billing_id"}, // 逐条/展开路径：FROM billing_records（无别名）
+		{"br.", "br.billing_id"},           // 归并路径：FROM billing_records br
+	}
+	for _, c := range cases {
+		where, args := recordWhereOn(c.prefix, RecordFilter{RequestID: "req-1"})
+		if len(args) != 10 || args[9] != "req-1" {
+			t.Fatalf("prefix=%q args=%v, want 10 个参数且第 10 个为 req-1", c.prefix, args)
+		}
+		want := "clr.billing_id = " + c.outerID
+		if !containsAll(where, want) {
+			t.Fatalf("prefix=%q 关联列未限定到外层表，want 含 %q\n实际: %s", c.prefix, want, where)
+		}
+		// 反例守卫：子查询里绝不允许出现裸 billing_id 关联（恒真根因）。
+		if containsAll(where, "clr.billing_id = billing_id ") {
+			t.Fatalf("prefix=%q 出现裸 billing_id 关联（会导致条件恒真）: %s", c.prefix, where)
+		}
 	}
 }
 

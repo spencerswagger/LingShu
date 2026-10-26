@@ -25,6 +25,10 @@ const (
 	// reqParamsFieldMaxBytes 单个参数的体积上限（2KB）：超限字段不整体丢弃，而是把值替换成
 	// "omitted:NB" 标记并把字段名记入 summarized——保证「至少含哪些键」的契约不因体积而破坏。
 	reqParamsFieldMaxBytes = 2 * 1024
+	// jsonbContainerOverhead jsonb 二进制相对 JSON 文本的固定余量（容器头/对齐/实现细节）。
+	jsonbContainerOverhead = 256
+	// coreStringMax 核心字段（上游 URL/端点/模型名）的长度上限，异常长时截断并记名。
+	coreStringMax = 1024
 	// toolsNamesCap tools 摘要里保留的工具名条数上限（只留名字，不留 schema）。
 	toolsNamesCap = 20
 )
@@ -208,12 +212,19 @@ func protectedParamSet() map[string]bool {
 	return out
 }
 
-// buildReqParams 构造快照 JSON（≤8KB）。预算安排（先紧着关键字段）：
-//  1. 写核心字段（端点/协议/上游 URL/token/model/stream/消息数/tools 摘要）；
-//  2. 装受保护参数（体积超 reqParamsFieldMaxBytes 的字段把值换成 "omitted:NB" 标记，
-//     字段名进 summarized，键本身保留——满足「至少含哪些键」）；
-//  3. 再按体积升序装其余参数，装不下就进 dropped（按 dropOrder 顺序记录，绝不静默丢）；
-//  4. 极端情况（核心+受保护自身超 8KB）：清空非受保护参数并标记 over_budget。
+// buildReqParams 构造快照 JSON，保证落库后 `pg_column_size(req_params) ≤ 8192`。
+//
+// 预算口径：按 **jsonb 二进制**估算，而不是只看 JSON 文本长度（PR #63 验收校准项：
+// 文本压线时 jsonb 会因每条 KV 多两个 JEntry 而略超）。见 jsonbSizeBound。
+//
+// 装箱顺序（先紧着定位时要看的字段）：
+//  1. 核心字段（端点/协议/上游 URL/token/model/stream/消息数/tools 摘要）；
+//  2. 受保护参数（超单字段上限的换成 "omitted:NB" 标记，键保留、名字进 summarized）；
+//  3. 其余参数按体积升序装，装不下就丢并**记名**；
+//  4. 若仍超（时间/数量极端）：按 dropOrder 继续丢非受保护参数，再按保护优先级倒序丢受保护参数，
+//     **每丢一个都写进 dropped**——不再有「清空 params 但不记名」的静默路径。
+//
+// 可对账不变量：`len(params 里保留的键) + len(dropped) == 输入顶层参数个数`（summarized 的键仍在 params 里）。
 func (s *reqParamsSource) buildReqParams(in reqParamsInput) []byte {
 	if s == nil {
 		return nil
@@ -234,10 +245,17 @@ func (s *reqParamsSource) buildReqParams(in reqParamsInput) []byte {
 	if s.tools != nil {
 		snap.Summarized = append(snap.Summarized, "tools")
 	}
-	snap.Params = make(map[string]json.RawMessage, len(s.top))
+	// 核心字段也可能异常长（如超长上游 URL/模型名）：先截断并记名，保证预算一定可解。
+	snap.Endpoint = capCoreString(snap.Endpoint, coreStringMax, "endpoint", &snap)
+	snap.UpstreamURL = capCoreString(snap.UpstreamURL, coreStringMax, "upstream_url", &snap)
+	snap.Model = capCoreString(snap.Model, coreStringMax, "model", &snap)
+	snap.AutoModelName = capCoreString(snap.AutoModelName, coreStringMax, "auto_model_name", &snap)
 
+	snap.Params = make(map[string]json.RawMessage, len(s.top))
+	dropped := make(map[string]bool, len(s.top))
 	protect := protectedParamSet()
-	// 2) 受保护参数：先放（含单字段体积标记）。
+
+	// 2) 受保护参数先放（值超上限换标记）。
 	for _, k := range reqParamsProtected {
 		raw, ok := s.top[k]
 		if !ok {
@@ -245,7 +263,7 @@ func (s *reqParamsSource) buildReqParams(in reqParamsInput) []byte {
 		}
 		snap.Params[k] = capParamValue(k, raw, &snap)
 	}
-	// 3) 其余参数：体积升序装，装不下记 dropped。
+	// 3) 其余参数：体积升序装，装不下就丢并记名。
 	rest := make([]string, 0, len(s.top))
 	for k := range s.top {
 		if protect[k] {
@@ -260,37 +278,89 @@ func (s *reqParamsSource) buildReqParams(in reqParamsInput) []byte {
 		}
 		return rest[i] < rest[j]
 	})
-	dropped := make(map[string]bool, len(rest))
 	for _, k := range rest {
 		snap.Params[k] = capParamValue(k, s.top[k], &snap)
-		if marshalLen(snap) <= reqParamsMaxBytes {
+		if !overBudget(snap) {
 			continue
 		}
-		delete(snap.Params, k)
-		dropped[k] = true
+		dropParam(&snap, dropped, k)
 	}
+	// 4) 仍超预算：按 dropOrder（固定优先项 → 体积降序）继续丢非受保护参数，逐个记名。
 	for _, k := range s.dropOrder {
-		if dropped[k] {
-			snap.Dropped = append(snap.Dropped, k)
+		if !overBudget(snap) {
+			break
 		}
-	}
-	// 4) 仍然超预算：只保留受保护参数并标记。
-	if marshalLen(snap) > reqParamsMaxBytes {
-		for k := range snap.Params {
-			if !protect[k] {
-				delete(snap.Params, k)
-			}
+		if _, ok := snap.Params[k]; !ok {
+			continue
 		}
+		dropParam(&snap, dropped, k)
 	}
-	if marshalLen(snap) > reqParamsMaxBytes {
-		snap.Params = nil
+	// 5) 最后一层：受保护参数按「保护优先级倒序」丢（先丢 seed/n/stop/thinking 一类，最后才动
+	//    temperature/max_tokens/top_p/response_format），同样逐个记名 + 置 over_budget。
+	if overBudget(snap) {
 		snap.OverBudget = true
+		for i := len(reqParamsProtected) - 1; i >= 0; i-- {
+			if !overBudget(snap) {
+				break
+			}
+			k := reqParamsProtected[i]
+			if _, ok := snap.Params[k]; !ok {
+				continue
+			}
+			dropParam(&snap, dropped, k)
+		}
 	}
 	out, err := json.Marshal(snap)
 	if err != nil {
 		return nil
 	}
 	return out
+}
+
+// dropParam 删除一个参数并**立即**记名到 snap.Dropped。
+// 立即写（而不是先记 set 最后再补）是为了让预算判定把「被丢字段名」的字节也算进去——
+// 否则丢得越多、名字越多，最后一步补齐名字时体积会二次冲高（这正是旧实现压线超限的成因之一）。
+func dropParam(snap *reqParamsSnapshot, dropped map[string]bool, key string) {
+	if dropped[key] {
+		return
+	}
+	delete(snap.Params, key)
+	dropped[key] = true
+	snap.Dropped = append(snap.Dropped, key)
+}
+
+// jsonbSizeBound 估算 `pg_column_size(<此 JSONB 值>)` 的上界。
+//
+// 依据：jsonb 落盘 = varlena 头(4) + 根容器头(4) + 每个 KV 两个 JEntry(共 8B) + 键值字节；
+// JSON 文本里每条 KV 的标点（引号/冒号/逗号）约 3B，故净增 ≈ 5B/KV；嵌套的 params 容器再 +8B 头，
+// 另留 jsonbContainerOverhead 余量给实现细节（大小端/对齐/容器扩容）。
+// 另外 JSON 文本里的 `<>&` 会被转义成 6 字节而 jsonb 里只存 1 字节 → 文本长度本身已偏保守。
+func jsonbSizeBound(jsonText []byte, kvCount int) int {
+	return len(jsonText) + 8 + 5*kvCount + jsonbContainerOverhead
+}
+
+// overBudget 判断当前快照是否已超「落库后 pg_column_size ≤ reqParamsMaxBytes」的预算。
+func overBudget(snap reqParamsSnapshot) bool {
+	b, err := json.Marshal(snap)
+	if err != nil {
+		return false
+	}
+	return jsonbSizeBound(b, coreKVCount+len(snap.Params)+len(snap.Summarized)+len(snap.Dropped)) > reqParamsMaxBytes
+}
+
+// coreKVCount 核心字段的 KV 个数上界（endpoint/inbound/upstream/url/converted/token/model/
+// auto_model/stream/message_count/tools/params/summarized/dropped/over_budget）——取值偏大即偏安全。
+const coreKVCount = 16
+
+// capCoreString 核心字段的长度截断（异常长的 URL/模型名不允许撑爆预算），被截断时记名。
+func capCoreString(v string, max int, name string, snap *reqParamsSnapshot) string {
+	if len(v) <= max {
+		return v
+	}
+	if snap != nil {
+		snap.Summarized = append(snap.Summarized, name)
+	}
+	return v[:max] + "..."
 }
 
 // capParamValue 单字段体积守卫：超过 reqParamsFieldMaxBytes 时把值替换成标记字符串，
@@ -306,15 +376,6 @@ func capParamValue(key string, raw json.RawMessage, snap *reqParamsSnapshot) jso
 	}
 	snap.Summarized = append(snap.Summarized, key)
 	return marker
-}
-
-// marshalLen 返回快照序列化后的字节数（序列化失败按 0 计，避免死循环）。
-func marshalLen(snap reqParamsSnapshot) int {
-	b, err := json.Marshal(snap)
-	if err != nil {
-		return 0
-	}
-	return len(b)
 }
 
 // sanitizeUpstreamURL 上游 URL 脱敏：去掉 userinfo、query 与 fragment，只保留 scheme://host/path。

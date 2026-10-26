@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -266,5 +267,75 @@ func TestParseRequestMessages_FullAndResponsesShape(t *testing.T) {
 	out[0] = json.RawMessage(`{"role":"user","content":"changed"}`)
 	if strings.Contains(string(src[0]), "changed") {
 		t.Fatal("fullReqSnapshot must copy, not alias")
+	}
+}
+
+// TestBuildReqParams_AccountingInvariant 是 P2 回归：**不允许出现「没记名的失踪字段」**。
+// 断言：输入 N 个顶层参数 → `len(params) + len(dropped) == N`，且 dropped 里的键确实不在 params 里
+// （旧实现在「最后一层兜底」里直接 `snap.Params = nil` / 删非受保护键却不记名，本用例在修复前失败）。
+func TestBuildReqParams_AccountingInvariant(t *testing.T) {
+	// case 1：大量中等字段（每个 1.5KB，低于单字段上限）→ 必然触发「丢非受保护字段」。
+	// case 2：受保护字段自身超预算（12 × 1.9KB ≈ 22KB）→ 必然触发「丢受保护字段」那一层。
+	mk := func(protectedOnly bool) ([]byte, int) {
+		var sb strings.Builder
+		sb.WriteString(`{"model":"m","messages":[`)
+		sb.WriteString(`{"role":"user","content":"hi"}]`)
+		keys := []string{"temperature", "max_tokens", "max_completion_tokens", "top_p", "response_format",
+			"n", "seed", "stop", "tool_choice", "reasoning_effort", "thinking", "enable_thinking"}
+		n := 0
+		if protectedOnly {
+			for i, k := range keys {
+				blob := strings.Repeat("中", 630) + string(rune('a'+i)) // ~1.9KB
+				sb.WriteString(`, "` + k + `":"` + blob + `"`)
+				n++
+			}
+		} else {
+			for i := 0; i < 60; i++ {
+				blob := strings.Repeat("x", 1500) + string(rune('A'+i%26))
+				sb.WriteString(`, "u_` + string(rune('a'+i%26)) + strconv.Itoa(i) + `":"` + blob + `"`)
+				n++
+			}
+		}
+		sb.WriteString(`}`)
+		return []byte(sb.String()), n
+	}
+
+	for _, c := range []struct {
+		name          string
+		protectedOnly bool
+		wantOverBude  bool
+	}{
+		{"大量中等字段", false, false},
+		{"受保护字段超预算", true, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			body, n := mk(c.protectedOnly)
+			src := newReqParamsSource(body)
+			raw := src.buildReqParams(reqParamsInput{
+				Endpoint: "/v1/chat/completions", InboundProtocol: "openai-chat", UpstreamProtocol: "openai-chat",
+			})
+			var snap reqParamsSnapshot
+			if err := json.Unmarshal(raw, &snap); err != nil {
+				t.Fatalf("反序列化失败: %v", err)
+			}
+			if got := len(snap.Params) + len(snap.Dropped); got != n {
+				t.Fatalf("可对账不变量失败：params=%d + dropped=%d = %d, want %d（有字段没记名就消失）",
+					len(snap.Params), len(snap.Dropped), got, n)
+			}
+			for _, k := range snap.Dropped {
+				if _, still := snap.Params[k]; still {
+					t.Fatalf("字段 %q 同时出现在 params 与 dropped", k)
+				}
+			}
+			if len(snap.Dropped) == 0 {
+				t.Fatalf("该 case 必然要丢字段，dropped 却为空（静默丢弃）")
+			}
+			if snap.OverBudget != c.wantOverBude {
+				t.Fatalf("over_budget=%v, want %v", snap.OverBudget, c.wantOverBude)
+			}
+			if jsonbSizeBound(raw, coreKVCount+len(snap.Params)+len(snap.Summarized)+len(snap.Dropped)) > reqParamsMaxBytes {
+				t.Fatalf("预算超限：bound=%d > %d", jsonbSizeBound(raw, coreKVCount+len(snap.Params)+len(snap.Summarized)+len(snap.Dropped)), reqParamsMaxBytes)
+			}
+		})
 	}
 }
