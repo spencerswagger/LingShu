@@ -1,21 +1,19 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { listSessions, listSessionCalls, type AdminSession, type CallLogView } from '@/api/admin'
 import { fmtDateTime } from '@/utils/format'
 import ErrorBubble from '@/components/ErrorBubble.vue'
 import StatusTag from '@/components/StatusTag.vue'
-import MessageBubbleGroup from '@/components/MessageBubbleGroup.vue'
-import {
-  asMessageList,
-  parseRespBody,
-  contentOfBody,
-  type ChatMessage,
-  type RespInfo,
-} from '@/utils/messageParts'
+import CallLogPanel from '@/components/CallLogPanel.vue'
+import { useIsNarrow } from '@/composables/useIsNarrow'
 
+// 会话详情：元信息 + 逐次调用的完整详情。
+// 调用正文（请求参数快照 / 请求增量 / 响应 / 用量 / 决策轨迹 / 错误信息）不再在这里另写一套，
+// 而是复用账单详情同一个 CallLogPanel（variant='timeline'）——同一次调用在两个入口看到的口径必须一致。
 const props = withDefaults(defineProps<{ mode?: 'admin' | 'self' }>(), { mode: 'admin' })
 const isSelf = computed(() => props.mode === 'self')
+const isNarrow = useIsNarrow()
 
 const route = useRoute()
 const router = useRouter()
@@ -26,7 +24,12 @@ const meta = ref<AdminSession | null>(null)
 const errInfo = ref<{ message: string; requestId: string }>({ message: '', requestId: '' })
 const calls = ref<CallLogView[]>([])
 
+// 请求序号守卫：离开路由或重复进入时，旧响应不得写入（会话详情一次并发两个请求）
+const alive = ref(true)
+let loadSeq = 0
+
 onMounted(async () => {
+  const my = ++loadSeq
   loading.value = true
   errInfo.value = { message: '', requestId: '' }
   try {
@@ -34,121 +37,26 @@ onMounted(async () => {
       listSessions({ Q: sessionId, Size: 1 }, isSelf.value ? '/dev' : '/admin'),
       listSessionCalls(sessionId, isSelf.value ? '/dev' : '/admin'),
     ])
+    if (!alive.value || my !== loadSeq) return
     meta.value = metaRes.Data.List?.[0] || null
     calls.value = callsRes.Data.List || []
     // 会话元信息缺失（已被清理等）：不阻塞调用记录展示
     if (!meta.value) errInfo.value = { message: '会话信息不可用（记录可能已被清理）', requestId: '' }
   } catch (e: any) {
+    if (!alive.value || my !== loadSeq) return
     errInfo.value = { message: e?.message, requestId: e?.requestId }
   } finally {
-    loading.value = false
+    if (alive.value && my === loadSeq) loading.value = false
   }
 })
 
-// ===== 调用记录 =====
-interface TranscriptItem {
-  call: CallLogView
-  msgs: ChatMessage[]
-  resp: RespInfo
-  channel: { channel: string; key: string; model: string }
-}
+onBeforeUnmount(() => {
+  alive.value = false
+  loadSeq++
+})
 
-// 决策轨迹项（后端 CallLogView.Decision.attempts[]，字段可能随版本扩展，全部可选）。
-interface TrailAttempt {
-  order?: number
-  channel_id?: string
-  channel_name?: string
-  channel_key_id?: string
-  channel_key_name?: string
-  internal_model_id?: string
-  reason?: string
-  // 该候选未进入上游即被排除（排空/禁用/限流/会话满/协议不支持等）
-  skipped?: boolean
-  // 排除原因的运维动作提示（后端 key 为 hint；兼容 exclusionHint / exclusion_hint 别名）
-  hint?: string
-  exclusionHint?: string
-  exclusion_hint?: string
-  // 流式失败诊断（已送达/未送达、是否收到首字节、阶段耗时）
-  delivered?: boolean
-  first_byte_received?: boolean
-  elapsed_ms?: number
-  upstream_status?: number
-}
-// 流式失败诊断（可能挂在 decision 顶层，也可能挂在失败候选项上）
-interface TrailDiag {
-  delivered?: boolean
-  first_byte_received?: boolean
-  elapsed_ms?: number
-  upstream_status?: number
-}
-
-function decisionObj(cl: CallLogView): Record<string, any> | null {
-  const d = cl.Decision
-  return d && typeof d === 'object' ? (d as Record<string, any>) : null
-}
-
-// 决策轨迹尝试项：无 attempts（拒绝/旧数据）时返回空数组，未知字段不影响渲染。
-function callAttempts(cl: CallLogView): TrailAttempt[] {
-  const d = decisionObj(cl)
-  return d && Array.isArray(d.attempts) ? (d.attempts as TrailAttempt[]) : []
-}
-
-// 流式失败诊断：优先取 decision 顶层，缺省回退到失败候选项（仅取已存在字段，未知字段容错）。
-function callStreamDiag(cl: CallLogView): TrailDiag {
-  const d = decisionObj(cl)
-  if (!d) return {}
-  const atts = Array.isArray(d.attempts) ? (d.attempts as TrailAttempt[]) : []
-  const src: TrailDiag = {}
-  for (const row of atts) {
-    if (row.delivered != null) src.delivered = row.delivered
-    if (row.first_byte_received != null) src.first_byte_received = row.first_byte_received
-    if (row.elapsed_ms != null) src.elapsed_ms = row.elapsed_ms
-    if (row.upstream_status != null) src.upstream_status = row.upstream_status
-  }
-  const diag: TrailDiag = {}
-  if (d.delivered != null) diag.delivered = !!d.delivered
-  else if (src.delivered != null) diag.delivered = src.delivered
-  if (d.first_byte_received != null) diag.first_byte_received = !!d.first_byte_received
-  else if (src.first_byte_received != null) diag.first_byte_received = src.first_byte_received
-  if (d.elapsed_ms != null) diag.elapsed_ms = Number(d.elapsed_ms)
-  else if (src.elapsed_ms != null) diag.elapsed_ms = src.elapsed_ms
-  if (d.upstream_status != null) diag.upstream_status = Number(d.upstream_status)
-  else if (src.upstream_status != null) diag.upstream_status = src.upstream_status
-  return diag
-}
-
-// 稳定排除/失败原因 → 中文标签；未知原因原样回退（对后端新增枚举容错）。
-const REASON_LABELS: Record<string, string> = {
-  no_binding: '未绑定渠道',
-  tag_no_route: '标签无路由',
-  drained: '排空',
-  no_candidate: '无候选',
-  session_full: '会话已满',
-  rate_limited: '限流',
-  unsupported_protocol: '协议不支持',
-  credential_unavailable: '凭据不可用',
-  disabled: '已禁用',
-}
-function reasonLabel(reason?: string): string {
-  if (!reason) return '-'
-  return REASON_LABELS[reason] || reason
-}
-
-// 排除原因的运维动作提示：兼容后端 hint 及 exclusionHint/exclusion_hint 别名，未知字段容错。
-function attemptHint(row: TrailAttempt): string {
-  return row.hint || row.exclusionHint || row.exclusion_hint || ''
-}
-
-// skipped 行样式：未进入上游即被排除的候选弱化展示。
-function attemptRowClass({ row }: { row: TrailAttempt }): string {
-  return row.skipped ? 'skipped-row' : ''
-}
-
-function msgSide(role?: string) {
-  return role === 'user' ? 'right' : 'left'
-}
-
-// 渠道/密钥/内部模型：优先 Decision.result，缺省回退 attempts 末条
+// 渠道/密钥/内部模型：优先 Decision.result，缺省回退 attempts 末条。
+// 仅管理端展示（开发者端后端已脱敏，这些字段本就拿不到，不去猜）。
 function callChannel(cl: CallLogView): { channel: string; key: string; model: string } {
   const dash = { channel: '-', key: '-', model: '-' }
   const d = cl.Decision as Record<string, any> | null | undefined
@@ -175,14 +83,15 @@ function callChannel(cl: CallLogView): { channel: string; key: string; model: st
   return dash
 }
 
-const transcript = computed<TranscriptItem[]>(() =>
-  calls.value.map((c) => ({
-    call: c,
-    msgs: asMessageList(c.ReqMessages),
-    resp: parseRespBody(c.RespBody),
-    channel: callChannel(c),
-  })),
-)
+function callKey(cl: CallLogView, index: number): string {
+  return cl.BillingID || cl.RequestID || `${index}`
+}
+
+// 会话内既有成功也有失败时，顶部给一条汇总，避免逐卡翻找。
+const callStats = computed(() => {
+  const failed = calls.value.filter((c) => c.Status !== 'completed').length
+  return { total: calls.value.length, failed }
+})
 </script>
 
 <template>
@@ -195,9 +104,9 @@ const transcript = computed<TranscriptItem[]>(() =>
 
     <div v-loading="loading" class="card">
       <template v-if="meta">
-        <el-descriptions :column="2" border class="meta-box">
-          <el-descriptions-item label="会话名称" :span="2">{{ meta.SessionName || '未命名' }}</el-descriptions-item>
-          <el-descriptions-item label="会话 ID" :span="2">
+        <el-descriptions :column="isNarrow ? 1 : 2" border class="meta-box">
+          <el-descriptions-item label="会话名称" :span="isNarrow ? 1 : 2">{{ meta.SessionName || '未命名' }}</el-descriptions-item>
+          <el-descriptions-item label="会话 ID" :span="isNarrow ? 1 : 2">
             <span class="mono sid">{{ meta.SessionID }}</span>
           </el-descriptions-item>
           <el-descriptions-item label="状态">
@@ -209,7 +118,8 @@ const transcript = computed<TranscriptItem[]>(() =>
           <el-descriptions-item label="用户 / 令牌">
             {{ meta.UserNickname || meta.UserName || '-' }}{{ meta.UserNickname && meta.UserName ? ' @' + meta.UserName : '' }} · {{ meta.TokenName || '-' }}
           </el-descriptions-item>
-          <el-descriptions-item label="渠道-密钥">{{ meta.ChannelKeyName || '-' }}</el-descriptions-item>
+          <!-- 渠道-密钥属内部维度：开发者端不展示（后端 DTO 已抹掉） -->
+          <el-descriptions-item v-if="!isSelf" label="渠道-密钥">{{ meta.ChannelKeyName || '-' }}</el-descriptions-item>
           <el-descriptions-item label="创建时间">{{ fmtDateTime(meta.CreatedAt) }}</el-descriptions-item>
           <el-descriptions-item label="最近活跃">{{ fmtDateTime(meta.LastActive) }}</el-descriptions-item>
           <el-descriptions-item label="过期时间">{{ fmtDateTime(meta.ExpireAt) }}</el-descriptions-item>
@@ -221,128 +131,49 @@ const transcript = computed<TranscriptItem[]>(() =>
         :request-id="errInfo.requestId"
       />
 
-      <div class="calls-title">完整记录（{{ calls.length }} 次调用）</div>
+      <div class="calls-title">
+        完整记录（{{ callStats.total }} 次调用<template v-if="callStats.failed">，其中失败 {{ callStats.failed }} 次</template>）
+      </div>
       <el-empty
         v-if="!loading && !errInfo.message && !calls.length"
         description="该会话暂无调用记录"
       />
 
-      <div v-for="item in transcript" :key="item.call.BillingID || item.call.RequestID || item.call.CallTime" class="call-card">
+      <div v-for="(call, ci) in calls" :key="callKey(call, ci)" class="call-card">
         <div class="call-head">
           <div class="call-meta">
-            <span class="t-date mono">{{ fmtDateTime(item.call.CallTime) }}</span>
+            <span class="t-date mono">{{ fmtDateTime(call.CallTime) }}</span>
             <span class="t-clock">
-              {{ item.call.Model || '-' }}
-              <el-tag v-if="item.call.AutoModelName" size="small" effect="plain" type="success">Auto {{ item.call.AutoModelName }}</el-tag>
+              {{ call.Model || '-' }}
+              <el-tag v-if="call.AutoModelName" size="small" effect="plain" type="success">Auto {{ call.AutoModelName }}</el-tag>
             </span>
           </div>
+          <!-- 渠道显示名开发者端可见（后端白名单保留）；密钥/内部模型是管理端维度 -->
           <div class="call-meta call-channel" title="渠道信息">
-            <span class="t-clock">渠道 {{ item.channel.channel }} · 密钥 {{ item.channel.key }} · 内部模型 {{ item.channel.model }}</span>
+            <span class="t-clock">
+              <template v-if="isSelf">渠道 {{ callChannel(call).channel }}</template>
+              <template v-else>
+                渠道 {{ callChannel(call).channel }} · 密钥 {{ callChannel(call).key }} · 内部模型
+                {{ callChannel(call).model }}
+              </template>
+            </span>
           </div>
           <div class="call-state">
-            <StatusTag :value="item.call.Status" />
-            <el-tag :type="item.call.PricingMode === 'cost' ? 'warning' : 'primary'" size="small" effect="plain">
-              {{ item.call.PricingMode === 'cost' ? '按成本' : '按售价' }}
+            <StatusTag :value="call.Status" />
+            <el-tag :type="call.PricingMode === 'cost' ? 'warning' : 'primary'" size="small" effect="plain">
+              {{ call.PricingMode === 'cost' ? '按成本' : '按售价' }}
             </el-tag>
           </div>
         </div>
 
-        <div v-if="item.msgs.length || item.call.RespBody || item.call.ErrorMessage" class="msgs">
-          <div
-            v-for="(m, mi) in item.msgs"
-            :key="mi"
-            class="msg-row"
-            :class="msgSide(m.role) === 'right' ? 'is-user' : 'is-other'"
-          >
-            <div class="msg-cluster">
-              <MessageBubbleGroup
-                :role="m.role || 'message'"
-                :content="m.content"
-                :tone="m.role === 'user' ? 'user' : 'assistant'"
-                empty-text="（无文本内容）"
-              />
-            </div>
-          </div>
-
-          <div class="msg-row is-other">
-            <div class="msg-cluster">
-              <!-- 失败调用：错误原因 + 上游原始响应（若有），两者都不吞 -->
-              <template v-if="item.call.RespKind === 'error'">
-                <div v-if="item.call.ErrorMessage" class="resp-error">{{ item.call.ErrorMessage }}</div>
-                <MessageBubbleGroup
-                  v-if="item.call.RespBody"
-                  role="错误响应"
-                  :content="contentOfBody(item.call.RespBody)"
-                />
-              </template>
-              <MessageBubbleGroup
-                v-else-if="item.resp.text || item.resp.reasoning || item.resp.toolCalls.length"
-                role="assistant 响应"
-                :content="item.resp.text"
-                :reasoning="item.resp.reasoning"
-                :tool-calls="item.resp.toolCalls"
-              />
-              <MessageBubbleGroup
-                v-else
-                role="assistant 响应"
-                :content="contentOfBody(item.call.RespBody || '')"
-                empty-text="（无内容）"
-              />
-            </div>
-          </div>
-        </div>
-
-        <!-- 决策轨迹：含路由层排除项（排空等）与流式失败诊断，未知字段容错 -->
-        <div v-if="callAttempts(item.call).length" class="trail">
-          <div class="trail-head">
-            <span class="trail-title">决策轨迹</span>
-            <el-tag
-              v-if="callStreamDiag(item.call).delivered != null"
-              size="small"
-              :type="callStreamDiag(item.call).delivered ? 'danger' : 'info'"
-              effect="plain"
-            >
-              上游{{ callStreamDiag(item.call).delivered ? '已送达' : '未送达' }}
-            </el-tag>
-            <el-tag v-if="callStreamDiag(item.call).first_byte_received != null" size="small" effect="plain">
-              {{ callStreamDiag(item.call).first_byte_received ? '已收首字节' : '未收首字节' }}
-            </el-tag>
-            <el-tag v-if="callStreamDiag(item.call).elapsed_ms != null" size="small" effect="plain">
-              阶段耗时 {{ callStreamDiag(item.call).elapsed_ms }}ms
-            </el-tag>
-            <el-tag v-if="callStreamDiag(item.call).upstream_status != null" size="small" effect="plain">
-              上游状态 {{ callStreamDiag(item.call).upstream_status }}
-            </el-tag>
-          </div>
-          <el-table
-            :data="callAttempts(item.call)"
-            border
-            size="small"
-            class="trail-table"
-            :row-class-name="attemptRowClass"
-          >
-            <el-table-column label="顺序" width="64" align="center">
-              <template #default="{ row }">#{{ row.order }}</template>
-            </el-table-column>
-            <el-table-column label="渠道" min-width="140">
-              <template #default="{ row }">
-                <span :title="row.channel_id">{{ row.channel_name || row.channel_id || '-' }}</span>
-              </template>
-            </el-table-column>
-            <el-table-column label="内部模型" min-width="140">
-              <template #default="{ row }"><span class="mono">{{ row.internal_model_id || '-' }}</span></template>
-            </el-table-column>
-            <el-table-column label="原因" min-width="220">
-              <template #default="{ row }">
-                <span>{{ reasonLabel(row.reason) }}{{ row.skipped ? '（跳过）' : '' }}</span>
-                <!-- 排除原因的运维动作提示（如排空→查渠道/密钥状态或手动探测） -->
-                <el-tag v-if="attemptHint(row)" size="small" type="info" effect="plain" class="hint-tag">
-                  {{ attemptHint(row) }}
-                </el-tag>
-              </template>
-            </el-table-column>
-          </el-table>
-        </div>
+        <!-- 与账单详情同一个详情视图：请求参数快照 / 请求增量 / 响应 / 用量 / 决策轨迹 / 错误信息 -->
+        <CallLogPanel
+          :log="call"
+          :show-internal="!isSelf"
+          :billings-base="isSelf ? '/dev' : '/admin'"
+          variant="timeline"
+          title=""
+        />
       </div>
     </div>
   </div>
@@ -358,6 +189,7 @@ const transcript = computed<TranscriptItem[]>(() =>
 }
 .sid {
   word-break: break-all;
+  overflow-wrap: anywhere;
 }
 .calls-title {
   font-weight: 600;
@@ -376,6 +208,7 @@ const transcript = computed<TranscriptItem[]>(() =>
   justify-content: space-between;
   gap: 12px;
   margin-bottom: 10px;
+  flex-wrap: wrap;
 }
 .call-meta {
   display: flex;
@@ -394,6 +227,7 @@ const transcript = computed<TranscriptItem[]>(() =>
   color: var(--color-text-tertiary);
   font-variant-numeric: tabular-nums;
   word-break: break-all;
+  overflow-wrap: anywhere;
 }
 .call-state {
   display: flex;
@@ -401,60 +235,26 @@ const transcript = computed<TranscriptItem[]>(() =>
   gap: 6px;
   flex-shrink: 0;
 }
-.msgs {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-.msg-row {
-  display: flex;
-}
-.msg-row.is-user {
-  justify-content: flex-end;
-}
-.msg-row.is-other {
-  justify-content: flex-start;
-}
-.msg-cluster {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 6px;
-  max-width: 92%;
-  min-width: 0;
-}
-.msg-row.is-user .msg-cluster {
-  align-items: flex-end;
-}
-.resp-error {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--color-danger);
-  margin-bottom: 6px;
-}
-.trail {
-  margin-top: 10px;
-}
-.trail-head {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-bottom: 8px;
-}
-.trail-title {
-  font-weight: 600;
-  font-size: 13px;
-  color: var(--color-text-secondary);
-}
-.hint-tag {
-  margin-left: 6px;
-}
-/* skipped 行（未进入上游即被排除）：弱化展示，与真实失败候选区分 */
-.trail-table :deep(.skipped-row) {
-  color: var(--color-text-tertiary);
-}
-.trail-table :deep(.skipped-row td.el-table__cell) {
-  background: var(--color-primary-light-9);
+/* 窄屏：单列、正文 ≥14px、长串折行 */
+@media (max-width: 768px) {
+  .page-container {
+    padding: 12px 12px 20px;
+  }
+  .card {
+    padding: 14px 12px;
+  }
+  .call-card {
+    padding: 10px;
+  }
+  .call-head {
+    align-items: flex-start;
+  }
+  .t-date,
+  .t-clock {
+    font-size: 14px;
+  }
+  .calls-title {
+    font-size: 15px;
+  }
 }
 </style>

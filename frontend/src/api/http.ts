@@ -38,7 +38,9 @@ http.interceptors.response.use(
   (err) => {
     const body = err.response?.data
     const message = body?.Message || '网络异常，请稍后重试'
-    const requestId = body?.RequestID || ''
+    // 控制台统一壳用 RequestID；网关（OpenAI 兼容）错误体顶层用小写 request_id。
+    // 两者都认，避免「网关回了 id 但前端提示空白」。
+    const requestId = body?.RequestID || body?.request_id || ''
     // 40302：需先修改默认密码 → 置位 mustChange 并跳转改密页（放 401 处理之前）
     if (err.response?.status === 403 && body?.Code === 40302) {
       useAuthStore().setMustChange(true)

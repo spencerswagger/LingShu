@@ -91,7 +91,7 @@ export interface FlowItem {
   CreatedAt: string
 }
 
-// 账单列表项（后端 billingListItem：ExternalModel 为模型字段名）
+// 账单列表项（后端 billingListItem / devBillingListItem：ExternalModel 为模型字段名）
 export interface BillingItem {
   BillingID: string
   UserID: string
@@ -101,12 +101,35 @@ export interface BillingItem {
   CreditsConsumed: number
   Status: string // completed | failed
   CallTime: string
+  // 渠道显示名（后端 devBillingListItem 白名单内字段，非密钥）；缺失表示该账单无渠道映射
+  ChannelName?: string
+  // 网关请求链路 ID：报给平台即可定位这一次请求（列表按 request_id 归并后取主行的 id）
+  RequestID?: string
+  // 该请求共产生的账单条数（>1 表示发生过候选/上游重试；列表已归并成一行）
+  Attempts?: number
 }
 
-// 本人账单列表（支持时间区间 From/To，RFC3339）
-export function listDevBillings(params: { Page?: number; Size?: number; From?: string; To?: string } = {}) {
+// 本人账单列表（支持时间区间 From/To，RFC3339；RequestID 按请求链路 ID 定位，Group=0 展开逐条尝试）
+export function listDevBillings(
+  params: {
+    Page?: number
+    Size?: number
+    From?: string
+    To?: string
+    RequestID?: string
+    // Group=0：退回逐条展示（展开一次请求的多条候选/重试记录用）；默认按请求归并
+    Group?: number
+  } = {},
+) {
   return http.get<PageResult<BillingItem>, ApiRes<PageResult<BillingItem>>>('/dev/billings', {
-    params: { Page: params.Page ?? 1, Size: params.Size ?? 20, From: params.From, To: params.To },
+    params: {
+      Page: params.Page ?? 1,
+      Size: params.Size ?? 20,
+      From: params.From,
+      To: params.To,
+      RequestID: params.RequestID,
+      Group: params.Group,
+    },
   })
 }
 
@@ -129,6 +152,11 @@ export interface CallLogView {
   FirstTokenMs?: number
   CallTime: string
   ReqMessages: unknown // 请求增量 JSON（可能 null）
+  // 入站请求参数快照（可能 null）：{endpoint,inbound_protocol,upstream_protocol,upstream_url,converted,
+  // token_id,model,auto_model_name,stream,message_count,tools:{count,names},params,summarized,dropped,over_budget}
+  // 用于定位「这次到底发了什么参数」；不含 messages（见 ReqMessages），也不含任何凭据。
+  // 开发者端后端会抹掉 upstream_url（内部部署映射），前端按「未返回」处理，不要为此要求放开。
+  ReqParams?: unknown
   RespBody: string // 非流式完整响应体 / 流式 assistant 增量 JSON / 错误
   Decision: unknown // 决策轨迹 JSON（可能 null）：{attempts:[{order,channel_id,channel_key_id,internal_model_id,reason}], time_coeff, ctx_coeff, pre_consumed, result}
   // 上游原始 usage（可能 null）：{Protocol: 'openai-chat'|'openai-responses'|'anthropic-messages', Usage: {...上游原始键值...}}

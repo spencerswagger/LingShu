@@ -1,0 +1,430 @@
+package gateway
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"strings"
+	"testing"
+)
+
+// TestBuildReqParams_KeepsProtectedDropsRest 断言 8KB 预算下的裁剪策略：
+//   - 受保护参数（temperature/max_tokens/top_p/response_format…）优先保留；
+//   - 非受保护的大字段被裁掉并**记入 dropped**（不静默丢）；
+//   - 整体序列化 ≤ 8KB，核心字段（端点/协议/上游 URL/token_id/model/stream）始终在。
+func TestBuildReqParams_KeepsProtectedDropsRest(t *testing.T) {
+	// 每块 1500B（低于单字段 2KB 上限，不会被换成省略标记），8 块共 12KB > 8KB 预算，
+	// 因此必然触发「按优先级丢字段」的路径。
+	block := strings.Repeat("x", 1500)
+	var extra strings.Builder
+	for i := 0; i < 8; i++ {
+		extra.WriteString(`,"blob_`)
+		extra.WriteString(string(rune('a' + i)))
+		extra.WriteString(`":"` + block + `"`)
+	}
+	body := []byte(`{"model":"gpt-4","stream":true,"temperature":0.3,"max_tokens":1024,"top_p":0.9,
+		"response_format":{"type":"json_object"},"messages":[{"role":"user","content":"hi"}],
+		"tools":[{"type":"function","function":{"name":"get_weather"}}],
+		"metadata":{"k":"` + block + `"},"logit_bias":{"1":1}` + extra.String() + `}`)
+
+	src := newReqParamsSource(body)
+	raw := src.buildReqParams(reqParamsInput{
+		Endpoint:         "/v1/chat/completions",
+		InboundProtocol:  "openai-chat",
+		UpstreamProtocol: "openai-chat",
+		UpstreamURL:      "https://up.example.com/v1/chat/completions?api-version=2024-10-21",
+		TokenID:          42,
+		Model:            "gpt-4",
+		Stream:           true,
+	})
+	if raw == nil {
+		t.Fatal("snapshot is nil")
+	}
+	if len(raw) > reqParamsMaxBytes {
+		t.Fatalf("snapshot=%d bytes, want <= %d", len(raw), reqParamsMaxBytes)
+	}
+	var snap reqParamsSnapshot
+	if err := json.Unmarshal(raw, &snap); err != nil {
+		t.Fatalf("unmarshal snapshot: %v", err)
+	}
+	// 核心字段。
+	if snap.Endpoint != "/v1/chat/completions" || snap.InboundProtocol != "openai-chat" ||
+		snap.UpstreamProtocol != "openai-chat" || snap.TokenID != 42 || snap.Model != "gpt-4" || !snap.Stream {
+		t.Fatalf("core fields wrong: %+v", snap)
+	}
+	// 上游 URL 必须已脱敏（去 query）。
+	if snap.UpstreamURL != "https://up.example.com/v1/chat/completions" {
+		t.Fatalf("upstream_url=%q, want query stripped", snap.UpstreamURL)
+	}
+	// 消息体不进 params，只留计数。
+	if snap.MessageCount != 1 {
+		t.Fatalf("message_count=%d, want 1", snap.MessageCount)
+	}
+	if _, ok := snap.Params["messages"]; ok {
+		t.Fatal("messages must not be part of req_params")
+	}
+	// 受保护参数必须在。
+	for _, k := range []string{"temperature", "max_tokens", "top_p", "response_format"} {
+		if _, ok := snap.Params[k]; !ok {
+			t.Fatalf("protected param %q missing: %v", k, snap.Params)
+		}
+	}
+	// 大字段被裁且被标记（绝不静默丢）。
+	if len(snap.Dropped) == 0 {
+		t.Fatalf("want dropped fields recorded, got %+v", snap)
+	}
+	// tools 只留摘要。
+	if snap.Tools == nil || snap.Tools.Count != 1 || len(snap.Tools.Names) != 1 || snap.Tools.Names[0] != "get_weather" {
+		t.Fatalf("tools summary wrong: %+v", snap.Tools)
+	}
+	if _, ok := snap.Params["tools"]; ok {
+		t.Fatal("raw tools must not be stored (summary only)")
+	}
+}
+
+// TestBuildReqParams_FieldCapKeepsKey 断言单字段超 2KB 时「键保留、值换成省略标记」：
+// 这样「至少含 response_format」的契约不会因为该字段本身很大而破坏。
+func TestBuildReqParams_FieldCapKeepsKey(t *testing.T) {
+	hugeSchema := strings.Repeat("s", 5000)
+	body := []byte(`{"model":"gpt-4","messages":[],"response_format":{"json_schema":{"schema":"` + hugeSchema + `"}}}`)
+	src := newReqParamsSource(body)
+	raw := src.buildReqParams(reqParamsInput{Endpoint: "/v1/chat/completions", InboundProtocol: "openai-chat"})
+	var snap reqParamsSnapshot
+	if err := json.Unmarshal(raw, &snap); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	v, ok := snap.Params["response_format"]
+	if !ok {
+		t.Fatalf("response_format key must be kept, got %v", snap.Params)
+	}
+	if !strings.Contains(string(v), "omitted:") {
+		t.Fatalf("oversized value want omitted marker, got %s", v)
+	}
+	found := false
+	for _, k := range snap.Summarized {
+		if k == "response_format" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("summarized should list response_format, got %v", snap.Summarized)
+	}
+	if len(raw) > reqParamsMaxBytes {
+		t.Fatalf("snapshot=%d bytes, want <= %d", len(raw), reqParamsMaxBytes)
+	}
+}
+
+// TestBuildReqParams_NeverExceedsBudget 极端输入（多个受保护大字段）也不得超过 8KB：
+// 兜底路径会清空 params 并标记 over_budget，而不是写一条超限记录。
+func TestBuildReqParams_NeverExceedsBudget(t *testing.T) {
+	chunk := strings.Repeat("y", 1900)
+	body := []byte(`{"model":"m","messages":[],"temperature":1,"max_tokens":1,"top_p":1,
+		"response_format":{"a":"` + chunk + `"},"tool_choice":{"b":"` + chunk + `"},
+		"thinking":{"c":"` + chunk + `"},"stop":["` + chunk + `"]}`)
+	src := newReqParamsSource(body)
+	raw := src.buildReqParams(reqParamsInput{Endpoint: "/v1/messages", InboundProtocol: "anthropic-messages"})
+	if len(raw) > reqParamsMaxBytes {
+		t.Fatalf("snapshot=%d bytes, want <= %d", len(raw), reqParamsMaxBytes)
+	}
+	var snap reqParamsSnapshot
+	if err := json.Unmarshal(raw, &snap); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if snap.Endpoint != "/v1/messages" || snap.InboundProtocol != "anthropic-messages" {
+		t.Fatalf("core fields must survive over-budget path: %+v", snap)
+	}
+}
+
+// TestSanitizeUpstreamURL 断言上游 URL 脱敏：去 userinfo/query/fragment（query 可能带 api-key）。
+func TestSanitizeUpstreamURL(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"", ""},
+		{"https://up.example.com/v1/chat/completions", "https://up.example.com/v1/chat/completions"},
+		{"https://user:pass@up.example.com/v1/chat/completions?api-key=sk-1&api-version=2024", "https://up.example.com/v1/chat/completions"},
+		{"https://up.example.com/x#frag", "https://up.example.com/x"},
+		{"not a url", ""},
+	}
+	for _, c := range cases {
+		if got := sanitizeUpstreamURL(c.in); got != c.want {
+			t.Fatalf("sanitizeUpstreamURL(%q)=%q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// TestWriteOpenAIError_CarriesRequestID 断言网关错误体顶层带 request_id，
+// 取值来自响应头 x-request-id（与响应头同值，调用方可直接把 ID 报给平台）。
+func TestWriteOpenAIError_CarriesRequestID(t *testing.T) {
+	rec := httptest.NewRecorder()
+	rec.Header().Set("x-request-id", "req-abc-123")
+	writeOpenAIError(rec, http.StatusBadGateway, "上游服务暂时不可用")
+
+	var body struct {
+		Error struct {
+			Message string `json:"message"`
+			Code    string `json:"code"`
+		} `json:"error"`
+		RequestID string `json:"request_id"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if body.RequestID != "req-abc-123" {
+		t.Fatalf("request_id=%q, want req-abc-123; body=%s", body.RequestID, rec.Body.String())
+	}
+	if body.Error.Code == "" {
+		t.Fatalf("error.code must stay: %s", rec.Body.String())
+	}
+	if rec.Header().Get("x-request-id") != "req-abc-123" {
+		t.Fatal("response header x-request-id must be preserved")
+	}
+
+	// 无 request id 时省略字段（不写空串），保持既有客户端解析不受影响。
+	rec2 := httptest.NewRecorder()
+	writeOpenAIError(rec2, http.StatusBadRequest, "bad")
+	if strings.Contains(rec2.Body.String(), "request_id") {
+		t.Fatalf("empty request id should be omitted, got %s", rec2.Body.String())
+	}
+}
+
+// TestServe_WritesReqParams 端到端断言：真实转发路径写入的 call_logs.req_params 含
+// 端点 / 实际上游协议 / 上游 URL / token_id / model / stream 与入站采样参数。
+func TestServe_WritesReqParams(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"x","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`))
+	}))
+	defer upstream.Close()
+
+	h := build(t, upstream.URL)
+	body := `{"model":"gpt-4","stream":false,"temperature":0.3,"max_tokens":256,"top_p":0.9,
+		"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f1"}}]}`
+	if rec := doRequestH(t, h.gw, "/v1/chat/completions", "sk-gw-t", body, nil); rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(h.clogs.inserted) == 0 {
+		t.Fatal("no call log inserted")
+	}
+	raw := h.clogs.inserted[len(h.clogs.inserted)-1].ReqParams
+	if len(raw) == 0 {
+		t.Fatal("req_params not written")
+	}
+	var snap reqParamsSnapshot
+	if err := json.Unmarshal(raw, &snap); err != nil {
+		t.Fatalf("unmarshal req_params: %v", err)
+	}
+	if snap.Endpoint != "/v1/chat/completions" || snap.InboundProtocol != "openai-chat" || snap.UpstreamProtocol != "openai-chat" {
+		t.Fatalf("endpoint/protocol wrong: %+v", snap)
+	}
+	if snap.TokenID != 42 {
+		t.Fatalf("token_id=%d, want 42", snap.TokenID)
+	}
+	if snap.Model != "gpt-4" || snap.Stream {
+		t.Fatalf("model/stream wrong: %+v", snap)
+	}
+	if !strings.HasSuffix(snap.UpstreamURL, "/chat/completions") {
+		t.Fatalf("upstream_url=%q, want .../chat/completions", snap.UpstreamURL)
+	}
+	for _, k := range []string{"temperature", "max_tokens", "top_p"} {
+		if _, ok := snap.Params[k]; !ok {
+			t.Fatalf("param %q missing: %v", k, snap.Params)
+		}
+	}
+	if snap.Tools == nil || snap.Tools.Count != 1 || snap.Tools.Names[0] != "f1" {
+		t.Fatalf("tools summary wrong: %+v", snap.Tools)
+	}
+}
+
+// TestParseRequestMessages_FullAndResponsesShape 断言请求消息的取法：
+//   - OpenAI/Anthropic 形状取 messages 全量（不抽样）；
+//   - OpenAI Responses 形状取 input（条目数组 / 纯字符串），此前这类入站的调用日志是空的。
+func TestParseRequestMessages_FullAndResponsesShape(t *testing.T) {
+	// 1) messages 全量（含 system），首轮不再只留最后一条 user。
+	msgs, ok := parseRequestMessages([]byte(`{"messages":[{"role":"system","content":"s"},{"role":"user","content":"a"},{"role":"user","content":"b"}]}`))
+	if !ok || len(msgs) != 3 {
+		t.Fatalf("messages: ok=%v len=%d, want 3", ok, len(msgs))
+	}
+	// 2) Responses 数组形状。
+	msgs, ok = parseRequestMessages([]byte(`{"input":[{"role":"user","content":"hi"},{"role":"assistant","content":"yo"}]}`))
+	if !ok || len(msgs) != 2 {
+		t.Fatalf("responses array: ok=%v len=%d, want 2", ok, len(msgs))
+	}
+	// 3) Responses 字符串形状 → 归一成一条 user 消息。
+	msgs, ok = parseRequestMessages([]byte(`{"input":"hello"}`))
+	if !ok || len(msgs) != 1 || !strings.Contains(string(msgs[0]), `"role":"user"`) {
+		t.Fatalf("responses string: ok=%v msgs=%v", ok, msgs)
+	}
+	// 4) 无消息：返回 false（调用日志留空数组，而不是伪造内容）。
+	if _, ok = parseRequestMessages([]byte(`{"model":"x"}`)); ok {
+		t.Fatal("no messages should return false")
+	}
+	// 5) 全量快照是拷贝（修改返回值不影响入参）。
+	src := []json.RawMessage{json.RawMessage(`{"role":"user","content":"a"}`)}
+	out := fullReqSnapshot(src)
+	if len(out) != 1 {
+		t.Fatalf("fullReqSnapshot len=%d, want 1", len(out))
+	}
+	out[0] = json.RawMessage(`{"role":"user","content":"changed"}`)
+	if strings.Contains(string(src[0]), "changed") {
+		t.Fatal("fullReqSnapshot must copy, not alias")
+	}
+}
+
+// TestBuildReqParams_AccountingInvariant 是 P2 回归：**不允许出现「没记名的失踪字段」**。
+// 断言：输入 N 个顶层参数 → `len(params) + len(dropped) == N`，且 dropped 里的键确实不在 params 里
+// （旧实现在「最后一层兜底」里直接 `snap.Params = nil` / 删非受保护键却不记名，本用例在修复前失败）。
+func TestBuildReqParams_AccountingInvariant(t *testing.T) {
+	// case 1：大量中等字段（每个 1.5KB，低于单字段上限）→ 必然触发「丢非受保护字段」。
+	// case 2：受保护字段自身超预算（12 × 1.9KB ≈ 22KB）→ 必然触发「丢受保护字段」那一层。
+	mk := func(protectedOnly bool) ([]byte, int) {
+		var sb strings.Builder
+		sb.WriteString(`{"model":"m","messages":[`)
+		sb.WriteString(`{"role":"user","content":"hi"}]`)
+		keys := []string{"temperature", "max_tokens", "max_completion_tokens", "top_p", "response_format",
+			"n", "seed", "stop", "tool_choice", "reasoning_effort", "thinking", "enable_thinking"}
+		n := 0
+		if protectedOnly {
+			for i, k := range keys {
+				blob := strings.Repeat("中", 630) + string(rune('a'+i)) // ~1.9KB
+				sb.WriteString(`, "` + k + `":"` + blob + `"`)
+				n++
+			}
+		} else {
+			for i := 0; i < 60; i++ {
+				blob := strings.Repeat("x", 1500) + string(rune('A'+i%26))
+				sb.WriteString(`, "u_` + string(rune('a'+i%26)) + strconv.Itoa(i) + `":"` + blob + `"`)
+				n++
+			}
+		}
+		sb.WriteString(`}`)
+		return []byte(sb.String()), n
+	}
+
+	for _, c := range []struct {
+		name          string
+		protectedOnly bool
+		wantOverBude  bool
+	}{
+		{"大量中等字段", false, false},
+		{"受保护字段超预算", true, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			body, n := mk(c.protectedOnly)
+			src := newReqParamsSource(body)
+			raw := src.buildReqParams(reqParamsInput{
+				Endpoint: "/v1/chat/completions", InboundProtocol: "openai-chat", UpstreamProtocol: "openai-chat",
+			})
+			var snap reqParamsSnapshot
+			if err := json.Unmarshal(raw, &snap); err != nil {
+				t.Fatalf("反序列化失败: %v", err)
+			}
+			if got := len(snap.Params) + len(snap.Dropped); got != n {
+				t.Fatalf("可对账不变量失败：params=%d + dropped=%d = %d, want %d（有字段没记名就消失）",
+					len(snap.Params), len(snap.Dropped), got, n)
+			}
+			for _, k := range snap.Dropped {
+				if _, still := snap.Params[k]; still {
+					t.Fatalf("字段 %q 同时出现在 params 与 dropped", k)
+				}
+			}
+			if len(snap.Dropped) == 0 {
+				t.Fatalf("该 case 必然要丢字段，dropped 却为空（静默丢弃）")
+			}
+			if snap.OverBudget != c.wantOverBude {
+				t.Fatalf("over_budget=%v, want %v", snap.OverBudget, c.wantOverBude)
+			}
+			if jsonbSizeBound(raw, coreKVCount+len(snap.Params)+len(snap.Summarized)+len(snap.Dropped)) > reqParamsMaxBytes {
+				t.Fatalf("预算超限：bound=%d > %d", jsonbSizeBound(raw, coreKVCount+len(snap.Params)+len(snap.Summarized)+len(snap.Dropped)), reqParamsMaxBytes)
+			}
+		})
+	}
+}
+
+// TestBuildReqParams_RedactsSensitiveKeys 是 Owl PR #63 P2-2 的回归：
+// 入站 body 里的凭据/身份类键（api_key/token/password/secret/authorization/metadata/user…）
+// 必须落成 "redacted"，原文零命中；正常参数不得被误伤。
+func TestBuildReqParams_RedactsSensitiveKeys(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-4","stream":true,"messages":[{"role":"user","content":"hi"}],
+		"temperature":0.7,"max_tokens":1024,"top_k":40,"max_completion_tokens":512,
+		"api_key":"sk-live-AAA","token":"tok-BBB","password":"pw-CCC","secret":"sec-DDD",
+		"client_secret":"cs-EEE","authorization":"Bearer ZZZ","access_token":"at-FFF",
+		"metadata":{"tenant":"acme","user":"bob"},"user":"alice","session_key":"sk-ggg",
+		"response_format":{"type":"json_object"}
+	}`)
+	src := newReqParamsSource(body)
+	raw := src.buildReqParams(reqParamsInput{
+		Endpoint: "/v1/chat/completions", InboundProtocol: "openai-chat", Model: "gpt-4", Stream: true,
+	})
+	text := string(raw)
+
+	// 1) 原文零命中（包括嵌套在 metadata 里的身份值）。
+	for _, leaked := range []string{"sk-live-AAA", "tok-BBB", "pw-CCC", "sec-DDD", "cs-EEE", "Bearer ZZZ", "at-FFF", "acme", "bob", "alice", "sk-ggg"} {
+		if strings.Contains(text, leaked) {
+			t.Fatalf("敏感原文泄漏 %q: %s", leaked, text)
+		}
+	}
+	var snap reqParamsSnapshot
+	if err := json.Unmarshal(raw, &snap); err != nil {
+		t.Fatalf("反序列化失败: %v", err)
+	}
+	// 2) 敏感键仍在（键名保留，值统一 redacted），并记入 redacted 列表。
+	wantRedacted := []string{"access_token", "api_key", "authorization", "client_secret", "metadata",
+		"password", "secret", "session_key", "token", "user"}
+	for _, k := range wantRedacted {
+		v, ok := snap.Params[k]
+		if !ok {
+			t.Fatalf("敏感键 %q 应保留键名（值 redacted），实际丢失: %v", k, snap.Params)
+		}
+		if string(v) != `"redacted"` {
+			t.Fatalf("敏感键 %q 值应为 redacted，实际 %s", k, v)
+		}
+	}
+	if len(snap.Redacted) != len(wantRedacted) {
+		t.Fatalf("redacted 列表=%v, want %v", snap.Redacted, wantRedacted)
+	}
+	// 3) 正常参数不得误伤。
+	for _, k := range []string{"temperature", "max_tokens", "top_k", "max_completion_tokens", "response_format"} {
+		if _, ok := snap.Params[k]; !ok {
+			t.Fatalf("正常参数 %q 被误伤: %v", k, snap.Params)
+		}
+	}
+	if strings.Contains(text, `"temperature":"redacted"`) {
+		t.Fatalf("temperature 被误判为敏感键: %s", text)
+	}
+	// 4) 可定位字段仍在（Owl 关心的 minimum set）。
+	if snap.Model != "gpt-4" || !snap.Stream || snap.MessageCount != 1 {
+		t.Fatalf("可定位字段缺失: %+v", snap)
+	}
+}
+
+// TestDropParam_RemovesFromSummarized Owl 建议 1 回归：同一字段不能既在 summarized（被标记）
+// 又在 dropped（被丢），否则对账出现两条互相矛盾的记录。
+func TestDropParam_RemovesFromSummarized(t *testing.T) {
+	snap := reqParamsSnapshot{
+		Params:     map[string]json.RawMessage{"response_format": json.RawMessage(`"omitted:3000B"`), "temperature": json.RawMessage(`1`)},
+		Summarized: []string{"tools", "response_format"},
+	}
+	dropped := map[string]bool{}
+	dropParam(&snap, dropped, "response_format")
+
+	if _, still := snap.Params["response_format"]; still {
+		t.Fatal("dropParam 后仍留在 params")
+	}
+	for _, k := range snap.Summarized {
+		if k == "response_format" {
+			t.Fatalf("被丢字段仍留在 summarized：%v", snap.Summarized)
+		}
+	}
+	if len(snap.Dropped) != 1 || snap.Dropped[0] != "response_format" {
+		t.Fatalf("dropped=%v, want [response_format]", snap.Dropped)
+	}
+	if len(snap.Summarized) != 1 || snap.Summarized[0] != "tools" {
+		t.Fatalf("summarized 其余项应保留：%v", snap.Summarized)
+	}
+	// 重复 drop 幂等（不产生重复条目）。
+	dropParam(&snap, dropped, "response_format")
+	if len(snap.Dropped) != 1 {
+		t.Fatalf("重复 drop 产生重复条目：%v", snap.Dropped)
+	}
+}

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   listBillings,
@@ -24,6 +24,9 @@ import ColumnFilter from '@/components/ColumnFilter.vue'
 import FilterBar from '@/components/FilterBar.vue'
 import { fmtDate, fmtTime } from '@/utils/format'
 import { resolveBillingRange } from '@/utils/range'
+import { useIsNarrow } from '@/composables/useIsNarrow'
+import { ElMessage } from 'element-plus'
+import { Search } from '@element-plus/icons-vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -32,6 +35,8 @@ const router = useRouter()
 const props = withDefaults(defineProps<{ mode?: 'admin' | 'self' }>(), { mode: 'admin' })
 const isSelf = computed(() => props.mode === 'self')
 const base = computed(() => (isSelf.value ? '/dev' : '/admin'))
+// 窄屏：表格转卡片式列表（宽表在手机上必然横向撑破）
+const isNarrow = useIsNarrow()
 
 const loading = ref(false)
 const list = ref<AdminBillingItem[]>([])
@@ -72,6 +77,10 @@ const filters = reactive({
   session_id: undefined as string | undefined,
   model: undefined as string | undefined,
   status: undefined as string | undefined,
+  // 请求链路 ID：调用方把网关错误体里的 request_id 贴进来，直接定位这一次请求
+  request_id: (route.query.request_id ? String(route.query.request_id).trim() : undefined) as
+    | string
+    | undefined,
   range: null as [string, string] | null,
 })
 
@@ -86,6 +95,7 @@ const paramKeyMap: Record<string, string> = {
   session_id: 'SessionID',
   model: 'Model',
   status: 'Status',
+  request_id: 'RequestID',
 }
 
 function buildParams(extra: Record<string, unknown> = {}): Record<string, unknown> {
@@ -105,7 +115,105 @@ function buildParams(extra: Record<string, unknown> = {}): Record<string, unknow
   return p
 }
 
+// ===== request_id 搜索入口 =====
+// 调用方把网关错误体（或响应头 x-request-id）里的 ID 贴进来即可定位这一次请求。
+// 输入框单独持有 draft，避免边打字边发请求（回车/点「定位」才生效）。
+const requestIdInput = ref(filters.request_id || '')
+
+function applyRequestId() {
+  const v = requestIdInput.value.trim()
+  if (v === (filters.request_id || '')) {
+    // 值没变（例如重复回车）：手动重载一次，保证用户有「已执行」的反馈
+    if (v) {
+      page.value = 1
+      load()
+    }
+    return
+  }
+  filters.request_id = v || undefined
+}
+function clearRequestId() {
+  requestIdInput.value = ''
+  filters.request_id = undefined
+}
+
+// ===== 归并主行的子记录（Group=0：一次请求的多条候选/重试账单） =====
+// 列表默认按 request_id 归并成一条主行，Attempts>1 说明发生过候选切换或上游重试；
+// 展开时才按 RequestID + Group=0 拉子记录，避免列表默认查询变重。
+const childrenMap = ref<Record<string, AdminBillingItem[]>>({})
+const childrenLoading = ref<Record<string, boolean>>({})
+
+async function loadChildren(row: AdminBillingItem) {
+  if (!row.RequestID) return
+  if (childrenMap.value[row.BillingID]) return
+  childrenLoading.value = { ...childrenLoading.value, [row.BillingID]: true }
+  try {
+    const res = await listBillings({ RequestID: row.RequestID, Group: 0, Page: 1, Size: 50 }, base.value)
+    if (!alive.value) return
+    childrenMap.value = { ...childrenMap.value, [row.BillingID]: res.Data.List || [] }
+  } catch (e: any) {
+    if (!alive.value) return
+    errInfo.value = { message: e?.message, requestId: e?.requestId }
+  } finally {
+    if (alive.value) {
+      childrenLoading.value = { ...childrenLoading.value, [row.BillingID]: false }
+    }
+  }
+}
+
+function onExpand(row: AdminBillingItem, expanded: AdminBillingItem[]) {
+  // el-table 展开/收起都会回调：只在含本行（展开）时拉数据
+  if (expanded.some((r) => r.BillingID === row.BillingID)) loadChildren(row)
+}
+
+// 手机端：卡片内联展开（不用 el-table 的 expand 列）
+const openCards = ref<Record<string, boolean>>({})
+function toggleCard(row: AdminBillingItem) {
+  const key = row.BillingID
+  const next = !openCards.value[key]
+  openCards.value = { ...openCards.value, [key]: next }
+  if (next) loadChildren(row)
+}
+
+function childrenOf(row: AdminBillingItem): AdminBillingItem[] {
+  return childrenMap.value[row.BillingID] || []
+}
+function childLoading(row: AdminBillingItem): boolean {
+  return !!childrenLoading.value[row.BillingID]
+}
+function canExpand(row: AdminBillingItem): boolean {
+  return !!row.RequestID && (row.Attempts || 1) > 1
+}
+
+// 请求 ID 展示：完整 ID 32 位左右，列表里截断显示，悬浮看全量，点击复制。
+function shortReqId(id?: string): string {
+  if (!id) return '-'
+  return id.length > 14 ? `${id.slice(0, 8)}…${id.slice(-4)}` : id
+}
+async function copyReqId(id?: string) {
+  if (!id) return
+  try {
+    await navigator.clipboard.writeText(id)
+    ElMessage.success('请求 ID 已复制')
+  } catch {
+    ElMessage.warning('复制失败，请手动选择复制')
+  }
+}
+function openDetail(row: AdminBillingItem) {
+  router.push(isSelf.value ? `/dev/billings/${row.BillingID}` : `/admin/billings/${row.BillingID}`)
+}
+
+// ===== 请求序号守卫（Owl 建议项）=====
+// 连点翻页 / 快速切筛选条件时，先发的请求可能后返回，把新结果覆盖成旧的。
+// 这里给每次 load 发一个自增序号，只有「当前最新序号」的响应才允许写入状态；
+// 组件卸载或路由离开时序号自增一次，把在途请求整体作废（避免离开后仍写旧数据）。
+// 选序号而不是 AbortController：load 里是 Promise.all 两个请求，序号守卫一处判定即可
+// 覆盖两个响应，也不用为每个请求维护自己的 controller 生命周期。
+let loadSeq = 0
+const alive = ref(true)
+
 async function load() {
+  const my = ++loadSeq
   loading.value = true
   errInfo.value = { message: '', requestId: '' }
   const params = buildParams({ Page: page.value, Size: size.value })
@@ -115,13 +223,17 @@ async function load() {
       listBillings(params, base.value),
       getBillingStats(statsParams, base.value),
     ])
+    // 过期响应直接丢弃（不写列表、不写统计、不动 loading）
+    if (!alive.value || my !== loadSeq) return
     list.value = billRes.Data.List
     total.value = billRes.Data.Total
     stats.value = statsRes.Data
   } catch (e: any) {
+    if (!alive.value || my !== loadSeq) return
     errInfo.value = { message: e?.message, requestId: e?.requestId }
   } finally {
-    loading.value = false
+    // 只有最新一次请求结束时才清 loading，否则旧请求返回会把新请求的 loading 关掉
+    if (alive.value && my === loadSeq) loading.value = false
   }
 }
 
@@ -239,6 +351,7 @@ const activeTags = computed(() => {
   if (filters.session_id) out.push({ key: 'session_id', label: `会话: ${sessionTagLabel(filters.session_id)}` })
   if (filters.model) out.push({ key: 'model', label: `模型: ${filters.model}` })
   if (filters.status) out.push({ key: 'status', label: `状态: ${filters.status === 'completed' ? '成功' : '失败'}` })
+  if (filters.request_id) out.push({ key: 'request_id', label: `请求 ID: ${filters.request_id}` })
   return out
 })
 
@@ -271,6 +384,10 @@ function clearTag(key: string) {
     case 'status':
       filters.status = undefined
       break
+    case 'request_id':
+      filters.request_id = undefined
+      requestIdInput.value = ''
+      break
   }
 }
 
@@ -283,6 +400,7 @@ watch(
     session_id: filters.session_id,
     model: filters.model,
     status: filters.status,
+    request_id: filters.request_id,
     range: filters.range,
   }),
   () => {
@@ -294,11 +412,17 @@ watch(() => filters.user_id, loadTokensOfUser)
 
 // 同一页面内再次从用户面板跳转（URL query 变化）时同步筛选；上面的 filters watch 会自动刷新
 watch(
-  () => [route.query.range, route.query.user_id],
-  ([r, u]) => {
+  () => [route.query.range, route.query.user_id, route.query.request_id],
+  ([r, u, rid]) => {
     const rng = resolveBillingRange(r)
     if (rng) filters.range = rng
     filters.user_id = u ? String(u) : undefined
+    // 从会话详情/调用详情点「在账单中定位」跳过来时，直接把 request_id 填进搜索框
+    const nextRid = rid ? String(rid).trim() : ''
+    if (nextRid !== (filters.request_id || '')) {
+      filters.request_id = nextRid || undefined
+      requestIdInput.value = nextRid
+    }
   },
 )
 
@@ -311,6 +435,7 @@ function reset() {
     filters.session_id ||
     filters.model ||
     filters.status ||
+    filters.request_id ||
     filters.range
   )
   filters.user_id = undefined
@@ -320,6 +445,8 @@ function reset() {
   filters.session_id = undefined
   filters.model = undefined
   filters.status = undefined
+  filters.request_id = undefined
+  requestIdInput.value = ''
   filters.range = null
   channelKeys.value = []
   if (!wasActive) {
@@ -335,6 +462,12 @@ onMounted(() => {
   searchSessions('')
   loadTokensOfUser()
   load()
+})
+
+// 卸载/离开路由：作废在途请求（序号自增后，旧响应一律被判过期）
+onBeforeUnmount(() => {
+  alive.value = false
+  loadSeq++
 })
 
 // ===== 展示格式化 =====
@@ -361,6 +494,13 @@ function keyLabel(row: AdminBillingItem): string {
 function fmtMs(ms?: number | null): string {
   if (ms == null) return '-'
   return ms >= 1000 ? `${(ms / 1000).toFixed(2)}s` : `${ms}ms`
+}
+
+// 渠道显示名：管理端缺失用 '-'；开发者端该字段在白名单内，缺失时明确「不展示」，
+// 不要留空让人以为「这次请求没走渠道」（也提示别为补字段去动别的接口）。
+function rowChannelLabel(row: AdminBillingItem): string {
+  if (row.ChannelName) return row.ChannelName
+  return isSelf.value ? '不展示' : '-'
 }
 
 // 生成速率：输出 token / (总耗时 - 首字耗时)（流式）；非流式无首字 → 输出 / 总耗时。
@@ -492,15 +632,89 @@ function sessionLabel(s: AdminSession): string {
         @clear="clearTag"
         @reset="reset"
         @refresh="load"
-      />
+      >
+        <!-- request_id 搜索入口：贴上网关错误体里的 request_id 就能定位这一次请求 -->
+        <template #actions>
+          <div class="req-search">
+            <el-input
+              v-model="requestIdInput"
+              size="small"
+              clearable
+              placeholder="粘贴 request_id 定位请求"
+              @keyup.enter="applyRequestId"
+              @clear="clearRequestId"
+            >
+              <template #prefix>
+                <el-icon><Search /></el-icon>
+              </template>
+            </el-input>
+            <el-button size="small" type="primary" plain @click="applyRequestId">定位</el-button>
+          </div>
+        </template>
+      </FilterBar>
+
+      <!-- 桌面：表格（一次请求一行；Attempts>1 可展开子记录） -->
       <el-table
+        v-if="!isNarrow"
         :data="list"
         border
         stripe
         class="table-nowrap clickable-rows"
         row-key="BillingID"
-        @row-click="(row: AdminBillingItem) => router.push(isSelf ? `/dev/billings/${row.BillingID}` : `/admin/billings/${row.BillingID}`)"
+        @expand-change="onExpand"
+        @row-click="(row: AdminBillingItem) => openDetail(row)"
       >
+        <!-- 展开列：按 RequestID + Group=0 懒加载这一次请求的全部候选/重试账单 -->
+        <el-table-column type="expand" width="36">
+          <template #default="{ row }">
+            <div class="sub-wrap">
+              <div v-if="childLoading(row)" class="sub-loading">正在加载该请求的尝试记录…</div>
+              <div v-else-if="!childrenOf(row).length" class="sub-loading">
+                {{ canExpand(row) ? '该请求暂无子记录' : '该请求未记录 request_id，无法展开子记录' }}
+              </div>
+              <table v-else class="sub-table">
+                <thead>
+                  <tr>
+                    <th>时间</th>
+                    <th>状态</th>
+                    <th>模型 / 内部</th>
+                    <th>渠道</th>
+                    <th class="r">Token</th>
+                    <th class="r">积分</th>
+                    <th>失败原因</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr
+                    v-for="c in childrenOf(row)"
+                    :key="c.BillingID"
+                    class="sub-row"
+                    @click.stop="openDetail(c)"
+                  >
+                    <td>{{ fmtTime(c.CallTime) }}</td>
+                    <td>
+                      <span :class="['st', c.Status === 'completed' ? 'st-ok' : 'st-fail']">
+                        {{ c.Status === 'completed' ? '成功' : '失败' }}
+                      </span>
+                    </td>
+                    <td>
+                      {{ c.ExternalModel || '-' }}
+                      <span v-if="!isSelf" class="sub-dim">{{ c.InternalModelID || '-' }}</span>
+                    </td>
+                    <td>
+                      {{ rowChannelLabel(c) }}
+                      <span v-if="!isSelf" class="sub-dim">{{ c.KeyName || '-' }}</span>
+                    </td>
+                    <td class="r">{{ tokenLine1(c) }}</td>
+                    <td class="r">{{ c.CreditsConsumed ?? '-' }}</td>
+                    <td class="sub-reason">{{ c.ErrorMessage || '-' }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </template>
+        </el-table-column>
+
         <!-- 时间：筛选图标 → 浮窗时间段选择器 -->
         <el-table-column label="时间" min-width="130" align="center">
           <template #header>
@@ -526,6 +740,24 @@ function sessionLabel(s: AdminSession): string {
             <div class="t-time">
               <span class="t-date">{{ fmtDate(row.CallTime) }}</span>
               <span class="t-clock">{{ fmtTime(row.CallTime) }}</span>
+            </div>
+          </template>
+        </el-table-column>
+
+        <!-- 请求 ID：一次请求的唯一标识，点一下复制（调用方拿到它就能定位）；归并行显示尝试次数 -->
+        <el-table-column label="请求 ID" min-width="130">
+          <template #default="{ row }">
+            <div class="req-cell">
+              <span
+                class="mono req-id"
+                :title="row.RequestID ? `${row.RequestID}（点击复制）` : '该账单未记录 request_id'"
+                @click.stop="copyReqId(row.RequestID)"
+              >
+                {{ row.RequestID ? shortReqId(row.RequestID) : '-' }}
+              </span>
+              <el-tag v-if="(row.Attempts || 1) > 1" size="small" type="warning" effect="plain">
+                {{ row.Attempts }} 次尝试
+              </el-tag>
             </div>
           </template>
         </el-table-column>
@@ -572,8 +804,8 @@ function sessionLabel(s: AdminSession): string {
           </template>
         </el-table-column>
 
-        <!-- 模型 -->
-        <el-table-column label="模型 / 内部" min-width="140">
+        <!-- 模型 / 内部：内部模型 ID 仅管理端可见（开发者端 DTO 不返回，也不猜） -->
+        <el-table-column :label="isSelf ? '模型' : '模型 / 内部'" min-width="140">
           <template #header>
             <ColumnFilter
               label="模型 / 内部"
@@ -604,15 +836,18 @@ function sessionLabel(s: AdminSession): string {
                 {{ row.ExternalModel || '-' }}
                 <el-tag v-if="row.AutoModelName" size="small" effect="plain" type="success">Auto {{ row.AutoModelName }}</el-tag>
               </span>
-              <span class="t-clock">{{ row.InternalModelID || '-' }}</span>
+              <span v-if="!isSelf" class="t-clock">{{ row.InternalModelID || '-' }}</span>
             </div>
           </template>
         </el-table-column>
 
-        <!-- 渠道 / 密钥；self 模式不展示 -->
-        <el-table-column v-if="!isSelf" label="渠道 / 密钥" min-width="150">
+        <!-- 渠道 / 密钥：渠道显示名开发者端也可见（白名单），密钥维度仅管理端 -->
+        <el-table-column :label="isSelf ? '渠道' : '渠道 / 密钥'" min-width="150">
           <template #header>
+            <!-- 开发者端没有渠道/密钥列表接口（也无该维度权限），表头只留纯文本 -->
+            <span v-if="isSelf">渠道</span>
             <ColumnFilter
+              v-else
               label="渠道 / 密钥"
               :active="!!filters.channel_id || !!filters.channel_key_id"
 
@@ -644,8 +879,8 @@ function sessionLabel(s: AdminSession): string {
           </template>
           <template #default="{ row }">
             <div class="t-time">
-              <span class="t-date">{{ row.ChannelName || '-' }}</span>
-              <span class="t-clock">{{ keyLabel(row) }}</span>
+              <span class="t-date">{{ rowChannelLabel(row) }}</span>
+              <span v-if="!isSelf" class="t-clock">{{ keyLabel(row) }}</span>
             </div>
           </template>
         </el-table-column>
@@ -723,9 +958,7 @@ function sessionLabel(s: AdminSession): string {
               {{ row.Status === 'completed' ? '成功' : '失败' }}
             </span>
           </template>
-        </el-table-column>
-
-        <!-- 积分 -->
+        </el-table-column>        <!-- 积分 -->
         <el-table-column label="积分" min-width="90" align="right">
           <template #default="{ row }">
             <el-tooltip placement="top">
@@ -747,16 +980,67 @@ function sessionLabel(s: AdminSession): string {
         </el-table-column>
       </el-table>
 
+      <!-- 窄屏：卡片式列表（宽表在手机上必然横向撑破，这里换成单列卡片） -->
+      <div v-else class="bill-cards">
+        <div v-for="row in list" :key="row.BillingID" class="bill-card" @click="openDetail(row)">
+          <div class="bc-head">
+            <span class="bc-time">{{ fmtDate(row.CallTime) }} {{ fmtTime(row.CallTime) }}</span>
+            <span :class="['st', row.Status === 'completed' ? 'st-ok' : 'st-fail']">
+              {{ row.Status === 'completed' ? '成功' : '失败' }}
+            </span>
+          </div>
+          <div class="bc-line">
+            <span class="bc-model">{{ row.ExternalModel || '-' }}</span>
+            <el-tag v-if="row.AutoModelName" size="small" effect="plain" type="success">
+              Auto {{ row.AutoModelName }}
+            </el-tag>
+          </div>
+          <div class="bc-sub">
+            {{ rowChannelLabel(row) }}<template v-if="!isSelf && row.KeyName"> · {{ row.KeyName }}</template>
+          </div>
+          <div class="bc-sub">{{ tokenLine1(row) }}</div>
+          <div class="bc-foot">
+            <span class="credit" :class="{ fail: row.Status !== 'completed' }">
+              {{ row.CreditsConsumed ?? '-' }} 积分
+            </span>
+            <span class="bc-reqid mono" @click.stop="copyReqId(row.RequestID)">
+              {{ row.RequestID ? shortReqId(row.RequestID) : '-' }}
+            </span>
+          </div>
+          <div v-if="(row.Attempts || 1) > 1" class="bc-attempts" @click.stop="toggleCard(row)">
+            <el-tag size="small" type="warning" effect="plain">{{ row.Attempts }} 次尝试</el-tag>
+            <span class="bc-toggle">{{ openCards[row.BillingID] ? '收起' : '展开子记录' }}</span>
+          </div>
+          <div v-if="openCards[row.BillingID]" class="bc-children" @click.stop>
+            <div v-if="childLoading(row)" class="sub-loading">正在加载该请求的尝试记录…</div>
+            <div v-else-if="!childrenOf(row).length" class="sub-loading">该请求暂无子记录</div>
+            <div v-for="c in childrenOf(row)" :key="c.BillingID" class="bc-child" @click="openDetail(c)">
+              <span>{{ fmtTime(c.CallTime) }}</span>
+              <span :class="['st', c.Status === 'completed' ? 'st-ok' : 'st-fail']">
+                {{ c.Status === 'completed' ? '成功' : '失败' }}
+              </span>
+              <span class="bc-child-credit">{{ c.CreditsConsumed ?? '-' }}</span>
+            </div>
+          </div>
+        </div>
+        <el-empty v-if="!loading && !list.length" description="暂无账单" :image-size="60" />
+      </div>
+
       <div class="pager">
+        <!-- Total 语义已改为「请求数」（后端按 request_id 归并后计数），文案必须跟 -->
+        <span class="pager-total" title="按一次请求归并后的条数；展开主行可看该请求的多条尝试记录">
+          共 {{ total }} 个请求
+        </span>
         <el-pagination
-          layout="total, prev, pager, next"
+          layout="prev, pager, next"
           :total="total"
           :page-size="size"
           :current-page="page"
+          :small="isNarrow"
           @current-change="(p: number) => { page = p; load() }"
         />
       </div>
-      <el-empty v-if="!loading && !list.length" description="暂无账单" />
+      <el-empty v-if="!loading && !list.length && !isNarrow" description="暂无账单" />
       <ErrorBubble
         v-if="errInfo.message || errInfo.requestId"
         :message="errInfo.message"
@@ -800,7 +1084,9 @@ function sessionLabel(s: AdminSession): string {
 }
 .pager {
   display: flex;
+  align-items: center;
   justify-content: flex-end;
+  gap: 12px;
   margin-top: 12px;
 }
 /* 筛选浮窗内控件堆叠 */
@@ -850,6 +1136,216 @@ function sessionLabel(s: AdminSession): string {
 }
 .credit.fail {
   color: var(--color-text-tertiary);
+}
+/* ===== request_id 搜索入口 ===== */
+.req-search {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-right: 4px;
+}
+.req-search :deep(.el-input) {
+  width: 200px;
+}
+/* 请求 ID 单元格 */
+.req-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  align-items: flex-start;
+}
+.req-id {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  border-bottom: 1px dashed var(--color-border-strong);
+}
+.req-id:hover {
+  color: var(--brand-primary);
+}
+/* ===== 展开的子记录（同一请求的多条候选/重试账单） ===== */
+.sub-wrap {
+  padding: 6px 12px 10px 44px;
+  background: var(--color-primary-light-9, #eef0fe);
+}
+.sub-loading {
+  font-size: 12px;
+  color: var(--color-text-tertiary);
+  padding: 6px 2px;
+}
+.sub-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.sub-table th {
+  text-align: left;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--color-border);
+  white-space: nowrap;
+}
+.sub-table td {
+  padding: 5px 8px;
+  border-bottom: 1px dashed var(--color-border);
+  color: var(--color-text);
+  vertical-align: top;
+}
+.sub-table .r {
+  text-align: right;
+}
+.sub-row {
+  cursor: pointer;
+}
+.sub-row:hover td {
+  background: #fff;
+}
+.sub-dim {
+  display: block;
+  color: var(--color-text-tertiary);
+  font-size: 11px;
+}
+.sub-reason {
+  color: var(--color-danger);
+  max-width: 260px;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+/* ===== 窄屏卡片列表 ===== */
+.bill-cards {
+  display: grid;
+  gap: 10px;
+}
+.bill-card {
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  padding: 10px 12px;
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  cursor: pointer;
+}
+.bill-card:active {
+  background: var(--color-primary-light-9, #eef0fe);
+}
+.bc-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.bc-time {
+  font-size: 14px;
+  color: var(--color-text);
+  font-variant-numeric: tabular-nums;
+}
+.bc-line {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+.bc-model {
+  font-size: 14px;
+  font-weight: 600;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+.bc-sub {
+  font-size: 13px;
+  color: var(--color-text-tertiary);
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+.bc-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 14px;
+}
+.bc-reqid {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  border-bottom: 1px dashed var(--color-border-strong);
+}
+.bc-attempts {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.bc-toggle {
+  font-size: 13px;
+  color: var(--brand-primary);
+}
+.bc-children {
+  border-top: 1px dashed var(--color-border);
+  padding-top: 6px;
+  display: grid;
+  gap: 4px;
+}
+.bc-child {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+  color: var(--color-text-secondary);
+}
+.bc-child-credit {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+}
+.pager {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+  margin-top: 12px;
+}
+.pager-total {
+  font-size: 13px;
+  color: var(--color-text-secondary);
+}
+@media (max-width: 768px) {
+  .page-container {
+    padding: 12px 12px 20px;
+  }
+  .card {
+    padding: 14px 12px;
+  }
+  .stats-bar {
+    gap: 16px;
+    flex-wrap: wrap;
+    padding: 10px 12px;
+  }
+  .stat-value {
+    font-size: 16px;
+  }
+  .stat-label {
+    font-size: 12px;
+  }
+  .req-search :deep(.el-input) {
+    width: 100%;
+  }
+  .req-search {
+    width: 100%;
+  }
+  .pager {
+    justify-content: space-between;
+  }
+  .pager-total {
+    font-size: 14px;
+  }
+  /* 移动端正文字号不低于 14px（辅助信息同样抬到 14px，避免手机上读不清） */
+  .bc-sub,
+  .bc-reqid,
+  .bc-child,
+  .bc-toggle,
+  .sub-loading {
+    font-size: 14px;
+  }
 }
 :deep(.el-table__header th) {
   padding: 4px 6px;

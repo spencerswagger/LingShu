@@ -38,7 +38,7 @@ func (h *Dev) SetCallLogStore(s callLogReader) { h.callLogs = s }
 func (h *Dev) SetDB(db *sql.DB) { h.db = db }
 
 // attachCallLog 查 call_logs 并填充账单详情（未装配/无记录时为 nil）。
-func (h *Dev) attachCallLog(ctx context.Context, bid string) *CallLogView {
+func (h *Dev) attachCallLog(ctx context.Context, bid string) *DevCallLogView {
 	if h.callLogs == nil || bid == "" {
 		return nil
 	}
@@ -46,7 +46,8 @@ func (h *Dev) attachCallLog(ctx context.Context, bid string) *CallLogView {
 	if err != nil || cl == nil {
 		return nil
 	}
-	return toCallLogView(cl)
+	// 开发者端走脱敏投影（抹掉渠道密钥/内部模型 ID/成本；见 breakdown.go 的脱敏说明）。
+	return toDevCallLogView(cl)
 }
 
 func (h *Dev) currentUser(w http.ResponseWriter, r *http.Request) (int64, bool) {
@@ -65,35 +66,33 @@ func (h *Dev) HandleListBillings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := r.URL.Query()
-	f := billing.RecordFilter{
-		UserID: &userID,
-		Page:   parsePage(q.Get("Page")),
-		Size:   parseSize(q.Get("Size")),
+	// 解析口径与管理端同源（buildBillingsFilter），只强制本人维度：
+	// 这样 RequestID/Model/Status/Group 这些过滤与归并语义在两端一致，不会再各写一份而漂移。
+	f, ferr := buildBillingsFilter(q)
+	if ferr != nil {
+		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, ferr.Error())
+		return
 	}
-	if v := q.Get("From"); v != "" {
-		t, err := parseRFC3339Lenient(v)
-		if err != nil {
-			resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "from 时间格式应为 RFC3339")
-			return
-		}
-		f.From = &t
-	}
-	if v := q.Get("To"); v != "" {
-		t, err := parseRFC3339Lenient(v)
-		if err != nil {
-			resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "to 时间格式应为 RFC3339")
-			return
-		}
-		f.To = &t
-	}
+	f.UserID = &userID // 强制覆盖：客户端传入的 UserID 一律忽略，杜绝越权
+	f.Page = parsePage(q.Get("Page"))
+	f.Size = parseSize(q.Get("Size"))
+
 	records, total, err := h.billing.ListRecords(r.Context(), f)
 	if err != nil {
 		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "查询账单失败")
 		return
 	}
-	list := make([]billingListItem, 0, len(records))
+	list := make([]devBillingListItem, 0, len(records))
 	for i := range records {
-		list = append(list, toListItem(&records[i]))
+		list = append(list, toDevBillingListItem(&records[i]))
+	}
+	// 渠道显示名（白名单内、非密钥）：批量回查，避免 N+1；与管理端共用同一份实现。
+	keyIDs := uniqueInt64(records, func(r billing.Record) int64 { return r.ChannelKeyID })
+	names := channelNamesByKeyIDs(r.Context(), h.db, keyIDs)
+	for i := range list {
+		if name := names[records[i].ChannelKeyID]; name != "" {
+			list[i].ChannelName = name
+		}
 	}
 	resp.OK(w, r, map[string]any{"List": list, "Total": total, "Page": f.Page, "Size": f.Size})
 }
@@ -119,8 +118,9 @@ func (h *Dev) HandleGetBilling(w http.ResponseWriter, r *http.Request) {
 		resp.Err(w, r, http.StatusNotFound, resp.CodeNotFound, "账单不存在")
 		return
 	}
-	steps, routeDiff := buildBreakdown(rec)
-	detail := BillingDetail{
+	// 开发者端拆解：cost 模式不展示明细（成本金额属内部信息，见 breakdown.go）。
+	steps, routeDiff := buildBreakdownDev(rec)
+	detail := devBillingDetail{
 		BillingID:       rec.BillingID,
 		CallTime:        rec.CallTime.Format(time.RFC3339),
 		Model:           rec.ExternalModel,
@@ -276,7 +276,7 @@ func (h *Dev) HandleListSessionCalls(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if h.db == nil {
-		resp.OK(w, r, map[string]any{"List": []CallLogView{}, "Total": 0})
+		resp.OK(w, r, map[string]any{"List": []DevCallLogView{}, "Total": 0})
 		return
 	}
 	var owner int64
@@ -302,9 +302,10 @@ func (h *Dev) HandleListSessionCalls(w http.ResponseWriter, r *http.Request) {
 		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "查询调用日志失败")
 		return
 	}
-	list := make([]CallLogView, 0, len(logs))
+	list := make([]DevCallLogView, 0, len(logs))
 	for i := range logs {
-		if v := toCallLogView(&logs[i]); v != nil {
+		// 开发者端走白名单正向构造（渠道密钥/内部模型 ID/成本一律不返回）。
+		if v := toDevCallLogView(&logs[i]); v != nil {
 			list = append(list, *v)
 		}
 	}

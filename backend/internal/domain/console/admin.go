@@ -140,6 +140,10 @@ type billingListItem struct {
 	ErrorMessage    string            `json:"ErrorMessage,omitempty"`
 	DurationMs      *int64            `json:"DurationMs,omitempty"`
 	FirstTokenMs    *int64            `json:"FirstTokenMs,omitempty"`
+	// RequestID 网关请求链路 ID：调用方报 ID 即可在账单列表里定位到这一次请求。
+	RequestID string `json:"RequestID,omitempty"`
+	// Attempts 该请求共产生的账单条数（列表已按 request_id 归并成一行；>1 表示发生过候选/上游重试）。
+	Attempts int `json:"Attempts,omitempty"`
 }
 
 func toListItem(rec *billing.Record) billingListItem {
@@ -163,6 +167,8 @@ func toListItem(rec *billing.Record) billingListItem {
 		ErrorMessage:    rec.ErrorMessage,
 		DurationMs:      rec.DurationMs,
 		FirstTokenMs:    rec.FirstTokenMs,
+		RequestID:       rec.RequestID,
+		Attempts:        rec.Attempts,
 	}
 }
 
@@ -173,6 +179,9 @@ func buildBillingsFilter(q url.Values) (billing.RecordFilter, error) {
 		PricingMode: q.Get("PricingMode"),
 		Status:      q.Get("Status"),
 		SessionID:   q.Get("SessionID"),
+		RequestID:   q.Get("RequestID"),
+		// 列表默认按 request_id 归并（一次请求一行）；Group=0 时退回逐条展示（用于展开子记录）。
+		GroupByRequest: q.Get("Group") != "0",
 	}
 	if v := q.Get("UserID"); v != "" {
 		id, err := strconv.ParseInt(v, 10, 64)
@@ -1341,27 +1350,9 @@ GROUP BY session_id`, ids)
 }
 
 // channelNamesByKeyIDs 批量由渠道密钥 ID 反查所属渠道名；失败返回 nil（会话列表以空串兜底）。
+// channelNamesByKeyIDs 委托给包级共享实现（dev 列表也用它，避免两份 SQL/两套口径）。
 func (h *Admin) channelNamesByKeyIDs(ctx context.Context, keyIDs []int64) map[int64]string {
-	if h.db == nil || len(keyIDs) == 0 {
-		return nil
-	}
-	rows, err := h.db.QueryContext(ctx,
-		`SELECT k.id, c.name FROM channel_keys k JOIN channels c ON c.id = k.channel_id
-		 WHERE k.id = ANY('{`+int64List(keyIDs)+`}'::bigint[])`)
-	if err != nil {
-		return nil
-	}
-	defer rows.Close()
-	out := make(map[int64]string, len(keyIDs))
-	for rows.Next() {
-		var id int64
-		var name string
-		if err := rows.Scan(&id, &name); err != nil {
-			continue
-		}
-		out[id] = name
-	}
-	return out
+	return channelNamesByKeyIDs(ctx, h.db, keyIDs)
 }
 
 func collectSessionIDs(ss []*router.Session, get func(*router.Session) int64) []int64 {

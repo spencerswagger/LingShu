@@ -2,6 +2,7 @@ package billing
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"time"
 )
@@ -17,38 +18,70 @@ type RecordFilter struct {
 	Status       string // completed | failed
 	From         *time.Time
 	To           *time.Time
-	Page         int
-	Size         int
+	// RequestID 按网关请求链路 ID 过滤（billing_records 无该列，经 call_logs.request_id 关联）：
+	// 调用方报一个 request_id，就能在账单里直接定位到这一次请求（含其所有候选尝试）。
+	RequestID string
+	// GroupByRequest 列表按「一次请求一行」归并：一次请求若有多次候选尝试会产生多条账单，
+	// 归并后只展示主行（优先成功行，其次最新一次），Attempts 记该请求共产生几条账单。
+	// 统计（Summarize）不受影响，仍按行聚合（金额口径不变）。
+	GroupByRequest bool
+	Page           int
+	Size           int
 }
 
 // recordWhere 构建账单过滤 WHERE 子句与参数（ListRecords/Summarize 共用，避免两处漂移）。
 // Model 过滤同时匹配 external_model_name 与 auto_model_name：Auto 请求的账单
 // external_model_name 记命中成员名，用户按 Auto 名也应能搜到（见设计决策 #6）。
-func recordWhere(f RecordFilter) (string, []any) {
-	where := `WHERE ($1::bigint IS NULL OR user_id = $1)
-	          AND ($2::bigint IS NULL OR channel_key_id = $2)
-	          AND ($3::bigint IS NULL OR token_id = $3)
-	          AND ($4 = '' OR session_id = $4)
-	          AND ($5 = '' OR external_model_name = $5 OR auto_model_name = $5)
-	          AND ($6 = '' OR pricing_mode = $6)
-	          AND ($7 = '' OR status = $7)
-	          AND ($8::timestamptz IS NULL OR call_time >= $8)
-	          AND ($9::timestamptz IS NULL OR call_time <= $9)`
+func recordWhere(f RecordFilter) (string, []any) { return recordWhereOn("", f) }
+
+// recordWhereOn 与 recordWhere 相同，但给列名加表别名前缀（多表 JOIN 的归并查询必须限定别名，
+// 否则 call_logs 与 billing_records 的同名列会歧义）。prefix 形如 "br."，空串表示不限定。
+// RequestID 过滤只在非空时追加条件与参数：其余场景生成的 SQL 与参数位与历史完全一致
+// （不无谓平移占位符，避免既有 SQL 断言与执行计划漂移）。
+func recordWhereOn(prefix string, f RecordFilter) (string, []any) {
+	where := fmt.Sprintf(`WHERE ($1::bigint IS NULL OR %[1]suser_id = $1)
+	          AND ($2::bigint IS NULL OR %[1]schannel_key_id = $2)
+	          AND ($3::bigint IS NULL OR %[1]stoken_id = $3)
+	          AND ($4 = '' OR %[1]ssession_id = $4)
+	          AND ($5 = '' OR %[1]sexternal_model_name = $5 OR %[1]sauto_model_name = $5)
+	          AND ($6 = '' OR %[1]spricing_mode = $6)
+	          AND ($7 = '' OR %[1]sstatus = $7)
+	          AND ($8::timestamptz IS NULL OR %[1]scall_time >= $8)
+	          AND ($9::timestamptz IS NULL OR %[1]scall_time <= $9)`, prefix)
 	args := []any{
 		nullableInt64(f.UserID), nullableInt64(f.ChannelKeyID), nullableInt64(f.TokenID),
 		f.SessionID, f.Model, f.PricingMode, f.Status,
 		nullableTime(f.From), nullableTime(f.To),
 	}
+	if f.RequestID != "" {
+		// 一次请求可能产生多条账单（多候选/多次上游失败），按 request_id 命中即整组一起返回。
+		//
+		// ⚠️ 关联列必须**限定到外层表**：子查询里 call_logs 也有 billing_id，
+		// 写成裸 `billing_id` 会解析到子查询自己的列，条件退化成 `clr.billing_id = clr.billing_id`
+		// 恒真（PR #63 验收 P1：按 request_id 搜索后展开子记录会返回别人的账单）。
+		outerBillingID := "billing_records.billing_id" // 无前缀时外层表名就是 billing_records
+		if prefix != "" {
+			outerBillingID = prefix + "billing_id"
+		}
+		args = append(args, f.RequestID)
+		where += fmt.Sprintf(` AND EXISTS (SELECT 1 FROM call_logs clr
+		            WHERE clr.billing_id = %[1]s AND clr.request_id = $%[2]d)`,
+			outerBillingID, len(args))
+	}
 	return where, args
 }
 
 // ListRecords 分页查询账单记录，返回列表与总条数（Record 结构，字段已解析）。
+// f.GroupByRequest=true 时按「一次请求一行」归并（见 listRecordsGrouped）。
 func (s *SqlStore) ListRecords(ctx context.Context, f RecordFilter) ([]Record, int64, error) {
 	if f.Page < 1 {
 		f.Page = 1
 	}
 	if f.Size < 1 {
 		f.Size = 20
+	}
+	if f.GroupByRequest {
+		return s.listRecordsGrouped(ctx, f)
 	}
 	offset := int64((f.Page - 1) * f.Size)
 	where, args := recordWhere(f)
@@ -60,10 +93,11 @@ func (s *SqlStore) ListRecords(ctx context.Context, f RecordFilter) ([]Record, i
 		return nil, 0, fmt.Errorf("count billing records: %w", err)
 	}
 
+	limitArg, offsetArg := len(args)+1, len(args)+2
 	args = append(args, f.Size, offset)
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT `+recordCols+` FROM billing_records `+where+
-			` ORDER BY id DESC LIMIT $10 OFFSET $11`, args...)
+			fmt.Sprintf(` ORDER BY id DESC LIMIT $%d OFFSET $%d`, limitArg, offsetArg), args...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("list billing records: %w", err)
 	}
@@ -75,6 +109,82 @@ func (s *SqlStore) ListRecords(ctx context.Context, f RecordFilter) ([]Record, i
 		if err != nil {
 			return nil, 0, fmt.Errorf("scan billing record: %w", err)
 		}
+		list = append(list, *rec)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	return list, total, nil
+}
+
+// groupedExtraCols 把「归并附加列」（request_id、该请求的账单条数）接到 sqlScan 的扫描目标后面，
+// 从而复用同一个扫描实现（不复制 25 个列的扫描代码，避免两处漂移）。
+type groupedExtraCols struct {
+	row interface{ Scan(...any) error }
+	rid *sql.NullString
+	cnt *int
+}
+
+// Scan 实现扫描接口：先按 recordCols 顺序填 dest，再补两个附加列。
+func (g groupedExtraCols) Scan(dest ...any) error {
+	return g.row.Scan(append(dest, g.rid, g.cnt)...)
+}
+
+// groupKeyExpr 归并分组键：**用户维度 + 请求维度**。
+//
+// 为什么必须带 user_id：request_id 来自客户端可控的 `x-request-id`（服务端只做格式校验），
+// 两个不同用户撞同一个 id 会被并成一行（Owl PR #63 P2-1：既串号、也让「一次请求一行」失真）。
+// 加用户维度后：不同用户永不并、同用户同 id 正常归并；无调用日志时退回 billing_id（其本身全局唯一）。
+// 归并在 **SQL 层**完成（GROUP BY + LIMIT/OFFSET，主行用 array_agg 取），不把全量账单拉进内存。
+func groupKeyExpr() string {
+	return `(br.user_id::text || ':' || COALESCE(NULLIF(cl.request_id, ''), br.billing_id))`
+}
+
+// listRecordsGrouped 按「一次请求一行」归并分页：
+// 分组键 = user_id + call_logs.request_id（见 groupKeyExpr；无调用日志时退回 billing_id）。
+// 主行选取：优先 status='completed' 的行，其次 id 最大（最新一次尝试）——即「成功的那次优先，
+// 全失败时展示最后一次失败的现场」。Attempts 为该请求产生的账单条数（多次候选/多次上游失败）。
+// 注意：金额类聚合仍走 Summarize（按行），归并只影响列表展示，不改变计费口径。
+func (s *SqlStore) listRecordsGrouped(ctx context.Context, f RecordFilter) ([]Record, int64, error) {
+	offset := int64((f.Page - 1) * f.Size)
+	where, args := recordWhereOn("br.", f)
+	base := ` FROM billing_records br LEFT JOIN call_logs cl ON cl.billing_id = br.billing_id ` + where
+
+	var total int64
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT count(*) FROM (
+		    SELECT 1`+base+`
+		    GROUP BY `+groupKeyExpr()+`) grp`, args...).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("count grouped billing records: %w", err)
+	}
+
+	limitArg, offsetArg := len(args)+1, len(args)+2
+	args = append(args, f.Size, offset)
+	rows, err := s.db.QueryContext(ctx,
+		`WITH grp AS (
+		    SELECT `+groupKeyExpr()+` AS g,
+		           COALESCE(cl.request_id, '') AS rid,
+		           (array_agg(br.billing_id ORDER BY (br.status = 'completed') DESC, br.id DESC))[1] AS main_bid,
+		           count(*)::int AS cnt`+base+`
+		    GROUP BY 1, 2)
+		 SELECT `+recordCols+`, grp.rid, grp.cnt
+		 FROM grp JOIN billing_records ON billing_records.billing_id = grp.main_bid
+		 ORDER BY billing_records.id DESC `+fmt.Sprintf(`LIMIT $%d OFFSET $%d`, limitArg, offsetArg), args...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("list grouped billing records: %w", err)
+	}
+	defer rows.Close()
+
+	list := make([]Record, 0, f.Size)
+	for rows.Next() {
+		var rid sql.NullString
+		var cnt int
+		rec, err := sqlScan(groupedExtraCols{row: rows, rid: &rid, cnt: &cnt})
+		if err != nil {
+			return nil, 0, fmt.Errorf("scan grouped billing record: %w", err)
+		}
+		rec.RequestID = rid.String
+		rec.Attempts = cnt
 		list = append(list, *rec)
 	}
 	if err := rows.Err(); err != nil {

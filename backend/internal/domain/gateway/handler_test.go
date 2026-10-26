@@ -3059,11 +3059,15 @@ func TestServeCallLog_ReqIncrementDiff(t *testing.T) {
 	if len(h.clogs.inserted) != 2 {
 		t.Fatalf("call logs inserted %d, want 2", len(h.clogs.inserted))
 	}
-	// 第一次无上次指纹：降级取最后一条 user（1 条）。
+	// 第一次无上次指纹：必须落**全量消息**（不截断、不抽样）——历史实现只取最后一条 user，
+	// 导致首轮请求在调用日志里看不到 system 提示与前文（账单详情「当初发了什么」残缺）。
 	first := h.clogs.inserted[0]
 	firstMsgs, ok := first.ReqMessages.([]json.RawMessage)
-	if !ok || len(firstMsgs) != 1 {
-		t.Fatalf("first increment want 1 message, got %T len=%d (%v)", first.ReqMessages, len(firstMsgs), first.ReqMessages)
+	if !ok || len(firstMsgs) != 2 {
+		t.Fatalf("first snapshot want 2 messages (full), got %T len=%d (%v)", first.ReqMessages, len(firstMsgs), first.ReqMessages)
+	}
+	if !strings.Contains(string(firstMsgs[0]), `"role":"system"`) {
+		t.Errorf("first snapshot should keep system message, got %s", firstMsgs[0])
 	}
 	// 第二次与上次指纹对齐：仅返回新增的第 3 条。
 	second := h.clogs.inserted[1]

@@ -32,6 +32,7 @@ type CallLog struct {
 	PricingMode     string // sale / cost
 	Status          string // completed / failed
 	ReqMessages     any    // 请求增量 JSONB 原始值（可为 nil/空数组）
+	ReqParams       []byte // 入站请求参数快照 JSONB 原始值（不含 messages，≤8KB，见 reqparams.go）
 	RespBody        string // 非流式完整响应体；流式为结构化提取的 assistant 增量 JSON
 	RespKind        string // non_stream / stream / error
 	Decision        any    // 决策轨迹 JSONB 原始值（候选渠道与原因、系数、预扣与结果）
@@ -62,15 +63,15 @@ func NewSQLCallLogStore(db *sql.DB) *SQLCallLogStore {
 // 迁移后的列顺序一致的查询列（不含 id/created_at 自动列的读侧拆分）。
 const callLogsCols = `billing_id, request_id, session_id, user_id, channel_id, channel_key_id,
 	internal_model_id, external_model_id, model, auto_model_name, pricing_mode, status, req_messages, resp_body, resp_kind,
-	decision, error_message, duration_ms, first_token_ms, created_at, upstream_usage`
+	decision, error_message, duration_ms, first_token_ms, created_at, upstream_usage, req_params`
 
 // insertCallLogSQL 写入一条调用日志。列与占位符必须一一对应（数量不等会让所有写日志失败），
 // 由 calllog_test.go 的 TestInsertCallLogSQL_ColumnPlaceholderCount 守卫。
 const insertCallLogSQL = `
 INSERT INTO call_logs(id, billing_id, request_id, session_id, user_id, channel_id, channel_key_id,
 	internal_model_id, external_model_id, model, auto_model_name, pricing_mode, status, req_messages, resp_body, resp_kind,
-	decision, error_message, duration_ms, first_token_ms, created_at, upstream_usage)
-VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+	decision, error_message, duration_ms, first_token_ms, created_at, upstream_usage, req_params)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
 ON CONFLICT (billing_id) DO NOTHING`
 
 // Insert 幂等插入一条调用日志：billing_id 冲突（ON CONFLICT DO NOTHING）静默跳过；
@@ -96,7 +97,8 @@ func (s *SQLCallLogStore) Insert(ctx context.Context, c *CallLog) error {
 		id, c.BillingID, c.RequestID, c.SessionID, nullableInt64(c.UserID), nullableInt64(c.ChannelID),
 		nullableInt64(c.ChannelKeyID), c.InternalModelID, nullableInt64(c.ExternalModelID), c.Model,
 		nullableString(c.AutoModelName), c.PricingMode, c.Status, reqRaw, c.RespBody, c.RespKind, decRaw, c.ErrorMessage,
-		nullableInt64(c.DurationMs), nullableInt64(c.FirstTokenMs), created, nullableBytes(c.UpstreamUsage))
+		nullableInt64(c.DurationMs), nullableInt64(c.FirstTokenMs), created, nullableBytes(c.UpstreamUsage),
+		nullableBytes(c.ReqParams))
 	return err
 }
 
@@ -190,10 +192,10 @@ func scanCallLog(row rowScanner) (*CallLog, error) {
 func scanCallLogInto(s rowScanner, c *CallLog) error {
 	var uid, chID, keyID, extID, dur, ft sql.NullInt64
 	var autoName sql.NullString
-	var reqRaw, decRaw, upRaw []byte
+	var reqRaw, decRaw, upRaw, rpRaw []byte
 	if err := s.Scan(&c.BillingID, &c.RequestID, &c.SessionID, &uid, &chID, &keyID,
 		&c.InternalModelID, &extID, &c.Model, &autoName, &c.PricingMode, &c.Status, &reqRaw, &c.RespBody, &c.RespKind,
-		&decRaw, &c.ErrorMessage, &dur, &ft, &c.CreatedAt, &upRaw); err != nil {
+		&decRaw, &c.ErrorMessage, &dur, &ft, &c.CreatedAt, &upRaw, &rpRaw); err != nil {
 		return err
 	}
 	c.AutoModelName = autoName.String
@@ -230,6 +232,9 @@ func scanCallLogInto(s rowScanner, c *CallLog) error {
 	if len(upRaw) > 0 {
 		c.UpstreamUsage = upRaw
 	}
+	if len(rpRaw) > 0 {
+		c.ReqParams = rpRaw
+	}
 	return nil
 }
 
@@ -257,64 +262,88 @@ func diffMessages(prev []string, msgs []json.RawMessage) []json.RawMessage {
 	return out
 }
 
-// fallbackReqIncrement 无上次指纹时的增量降级：取最后一条 user 消息；
-// 若其后紧随 tool 角色，则把最近的连续 tool 链一并收起（工具调用回传场景）。
-func fallbackReqIncrement(msgs []json.RawMessage) []json.RawMessage {
+// fullReqSnapshot 无上次指纹时的落库内容：**全量消息**（不截断、不抽样）。
+// 历史实现只取「最后一条 user 消息及其 tool 链」，导致首轮请求/新会话在调用日志里
+// 看不到 system 提示与前文的上下文——账单详情「当初到底发了什么」因此残缺。
+// 语义仍是「增量追加」：同一会话后续请求走 diffMessages 只补新增部分。
+func fullReqSnapshot(msgs []json.RawMessage) []json.RawMessage {
 	if len(msgs) == 0 {
 		return []json.RawMessage{}
 	}
-	lastUser := -1
-	for i := len(msgs) - 1; i >= 0; i-- {
-		var m struct {
-			Role string `json:"role"`
-		}
-		if json.Unmarshal(msgs[i], &m) != nil {
-			continue
-		}
-		if m.Role == "user" {
-			lastUser = i
-			break
-		}
-	}
-	if lastUser < 0 {
-		// 无 user 消息（纯系统提示等）：取最后一条。
-		return []json.RawMessage{msgs[len(msgs)-1]}
-	}
-	end := lastUser + 1
-	for end < len(msgs) {
-		var m struct {
-			Role string `json:"role"`
-		}
-		if json.Unmarshal(msgs[end], &m) != nil || m.Role != "tool" {
-			break
-		}
-		end++
-	}
-	out := make([]json.RawMessage, 0, end-lastUser)
-	out = append(out, msgs[lastUser:end]...)
+	out := make([]json.RawMessage, len(msgs))
+	copy(out, msgs)
 	return out
 }
 
-// captureReqIncrement 计算本次请求的增量消息与全量指纹：
-// 会话已有上次指纹时按 diffMessages 对齐；否则降级取最后一条 user（及其 tool 链）。
-// 返回 (增量消息, 本次全量指纹)；body 解析失败返回 (nil, nil)。
-// 会更新 sessObj.LastMsgFingerprints 为本次全量指纹（新会话由调用方在 Attach 时设置）。
-func (g *Gateway) captureReqIncrement(sessObj *router.Session, body []byte) ([]json.RawMessage, []string) {
+// parseRequestMessages 从入站请求体取出「消息列表」：
+//   - OpenAI/Anthropic 形状：顶层 messages 数组；
+//   - OpenAI Responses 形状：顶层 input（条目数组或纯字符串）；
+//   - 其它形状：无消息（返回 false）。
+//
+// Responses 入站过去一律取不到消息（只认 messages），调用日志因此缺失请求内容，这里补齐。
+func parseRequestMessages(body []byte) ([]json.RawMessage, bool) {
 	var req struct {
 		Messages []json.RawMessage `json:"messages"`
+		Input    json.RawMessage   `json:"input"`
 	}
-	if err := json.Unmarshal(body, &req); err != nil || len(req.Messages) == 0 {
-		return nil, nil
+	if err := json.Unmarshal(body, &req); err != nil {
+		return nil, false
 	}
-	fps := make([]string, len(req.Messages))
-	for i, m := range req.Messages {
+	if len(req.Messages) > 0 {
+		return req.Messages, true
+	}
+	if len(req.Input) == 0 {
+		return nil, false
+	}
+	var items []json.RawMessage
+	if err := json.Unmarshal(req.Input, &items); err == nil && len(items) > 0 {
+		return items, true
+	}
+	var text string
+	if err := json.Unmarshal(req.Input, &text); err == nil && text != "" {
+		msg, merr := json.Marshal(map[string]string{"role": "user", "content": text})
+		if merr != nil {
+			return nil, false
+		}
+		return []json.RawMessage{msg}, true
+	}
+	return nil, false
+}
+
+// reqMessagesMaxBytes req_messages 单条调用日志落库的总量上限（256KB）。
+// 超限时按「保 system + 保最新、裁最旧」的顺序裁剪，并在 req_params.messages_truncated 里显式标记——
+// 绝不回退成「只留最后一条 / 丢 system 与前文」（那是本次改造前的 bug）。
+const reqMessagesMaxBytes = 256 * 1024
+
+// msgTruncInfo req_messages 被裁剪时的显式标记（落到请求快照里，便于事后判断「看到的是不是全量」）。
+type msgTruncInfo struct {
+	Reason        string `json:"reason"`                // 固定 "size"（超出 reqMessagesMaxBytes）
+	LimitBytes    int    `json:"limit_bytes"`           // 上限
+	OriginalBytes int    `json:"original_bytes"`        // 原始增量消息的序列化字节数
+	OriginalCount int    `json:"original_count"`        // 原始条数
+	KeptCount     int    `json:"kept_count"`            // 实际落库条数
+	DroppedCount  int    `json:"dropped_count"`         // 被裁掉的条数（最旧的先裁，system 不裁）
+	ContentCut    int    `json:"content_cut,omitempty"` // 因单条过长被截断正文的条数
+}
+
+// captureReqIncrement 计算本次请求的增量消息、全量指纹与（必要时）裁剪标记：
+// 会话已有上次指纹时按 diffMessages 对齐；否则落全量消息（首轮不丢 system 与前文）。
+// 返回 (增量消息, 本次全量指纹, 裁剪标记)；body 解析失败返回 (nil, nil, nil)。
+// 会更新 sessObj.LastMsgFingerprints 为本次全量指纹（新会话由调用方在 Attach 时设置）。
+func (g *Gateway) captureReqIncrement(sessObj *router.Session, body []byte) ([]json.RawMessage, []string, *msgTruncInfo) {
+	msgs, ok := parseRequestMessages(body)
+	if !ok || len(msgs) == 0 {
+		return nil, nil, nil
+	}
+	fps := make([]string, len(msgs))
+	for i, m := range msgs {
 		fps[i] = msgFingerprint(m)
 	}
 	var incr []json.RawMessage
 	if sessObj != nil && len(sessObj.LastMsgFingerprints) > 0 {
-		incr = diffMessages(sessObj.LastMsgFingerprints, req.Messages)
+		incr = diffMessages(sessObj.LastMsgFingerprints, msgs)
 	} else {
-		incr = fallbackReqIncrement(req.Messages)
+		incr = fullReqSnapshot(msgs)
 	}
 	if sessObj != nil {
 		sessObj.LastMsgFingerprints = fps
@@ -322,7 +351,107 @@ func (g *Gateway) captureReqIncrement(sessObj *router.Session, body []byte) ([]j
 	if incr == nil {
 		incr = []json.RawMessage{}
 	}
-	return incr, fps
+	incr, trunc := capReqMessages(incr)
+	return incr, fps, trunc
+}
+
+// capReqMessages 给 req_messages 加总量上限（默认 256KB），超限时**按条裁剪**而不是整段丢弃：
+//  1. 单条正文过长（>单条上限）先按 rune 边界截断正文（避免一条长消息吃光预算）；
+//  2. 仍超总量则从**最旧的非 system 消息**开始丢，保留 system 与最新若干条；
+//  3. 任何裁剪都返回 msgTruncInfo（记原始/保留条数与字节数），由调用方落进请求快照。
+//
+// 之所以不直接丢整段：调用日志的价值就在「当初发了什么」，裁掉 system 或前文会让排查失真。
+func capReqMessages(msgs []json.RawMessage) ([]json.RawMessage, *msgTruncInfo) {
+	if len(msgs) == 0 {
+		return msgs, nil
+	}
+	total := 0
+	for _, m := range msgs {
+		total += len(m)
+	}
+	if total <= reqMessagesMaxBytes {
+		return msgs, nil
+	}
+	info := &msgTruncInfo{Reason: "size", LimitBytes: reqMessagesMaxBytes, OriginalBytes: total, OriginalCount: len(msgs)}
+
+	// 1) 单条上限：单条不超过总量的 1/8，超出则按 rune 边界截断正文。
+	perMsgCap := reqMessagesMaxBytes / 8
+	out := make([]json.RawMessage, len(msgs))
+	for i, m := range msgs {
+		if len(m) <= perMsgCap {
+			out[i] = m
+			continue
+		}
+		if cut, ok := truncateMessageContent(m, perMsgCap); ok {
+			out[i] = cut
+			info.ContentCut++
+			continue
+		}
+		out[i] = m
+	}
+	// 2) 仍超总量：从最旧的非 system 消息开始丢，system 与最新消息优先保留。
+	sum := 0
+	for _, m := range out {
+		sum += len(m)
+	}
+	for sum > reqMessagesMaxBytes {
+		idx := oldestDroppableMessage(out)
+		if idx < 0 {
+			break // 只剩 system（或单条超限无法再裁）：保留，避免丢光上下文
+		}
+		sum -= len(out[idx])
+		out = append(out[:idx], out[idx+1:]...)
+		info.DroppedCount++
+	}
+	info.KeptCount = len(out)
+	if info.DroppedCount == 0 && info.ContentCut == 0 {
+		return msgs, nil
+	}
+	return out, info
+}
+
+// oldestDroppableMessage 找最旧的可丢消息下标（跳过 system / developer 角色）。
+func oldestDroppableMessage(msgs []json.RawMessage) int {
+	for i, m := range msgs {
+		var head struct {
+			Role string `json:"role"`
+		}
+		if err := json.Unmarshal(m, &head); err != nil {
+			return i
+		}
+		if head.Role == "system" || head.Role == "developer" {
+			continue
+		}
+		return i
+	}
+	return -1
+}
+
+// truncateMessageContent 把单条消息的正文按 rune 边界截断到 maxBytes 以内，并打上省略标记。
+// 仅处理「content 为字符串」的常见形状；其余形状（多模态数组等）原样返回（交给上层按条裁剪）。
+func truncateMessageContent(raw json.RawMessage, maxBytes int) (json.RawMessage, bool) {
+	var msg map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &msg); err != nil {
+		return raw, false
+	}
+	var content string
+	if err := json.Unmarshal(msg["content"], &content); err != nil || content == "" {
+		return raw, false
+	}
+	if len(content) <= maxBytes/2 {
+		return raw, false
+	}
+	cut, _ := truncateUTF8(content, maxBytes/2, "…（正文过长已截断）")
+	enc, err := json.Marshal(cut)
+	if err != nil {
+		return raw, false
+	}
+	msg["content"] = enc
+	out, err := json.Marshal(msg)
+	if err != nil || len(out) >= len(raw) {
+		return raw, false
+	}
+	return out, true
 }
 
 // preCharge 预扣决策快照：预扣阶段（估算输入 token × 时段/分档系数 ÷ R）的关键参数，
@@ -412,8 +541,11 @@ func (g *Gateway) writeCallLogUsage(ctx context.Context, billingID, requestID st
 		requestID = logger.GetRequestID(ctx)
 	}
 	cl := &CallLog{
-		BillingID:     billingID,
-		RequestID:     requestID,
+		BillingID: billingID,
+		RequestID: requestID,
+		// 请求参数快照：在组包处一次性构造并挂到请求 context 上（见 reqparams.go），
+		// 这里作为唯一写入漏斗取出落库——避免各个失败/成功分支各写一份、字段口径漂移。
+		ReqParams:     reqParamsFromCtx(ctx),
 		SessionID:     sessionID,
 		Model:         model,
 		PricingMode:   pricingMode,

@@ -878,6 +878,7 @@ export interface AdminBillingItem {
   UserNickname?: string
   TokenName?: string
   ExternalModel: string
+  AutoModelName?: string // 请求的 Auto 名（非 Auto 请求为空；后端 billingListItem.AutoModelName）
   PricingMode: string
   CreditsConsumed: number
   Status: string
@@ -896,7 +897,14 @@ export interface AdminBillingItem {
   ErrorMessage?: string
   DurationMs?: number | null
   FirstTokenMs?: number | null
+  // 网关请求链路 ID（列表默认按 request_id 归并成一行，取主行的 id）
+  RequestID?: string
+  // 该请求共产生的账单条数（>1 = 发生过候选/上游重试；Group=0 可展开子记录）
+  Attempts?: number
 }
+// 账单列表。语义变更（后端 PR #63 起，已拍板）：列表默认按 request_id 归并成「一次请求一行」，
+// 因此返回的 Total 是**请求数**（不是账单行数）；Group=0 退回逐条展示（展开子记录用），
+// RequestID 按请求链路 ID 过滤（命中即整组候选一起返回）。
 export function listBillings(params: Record<string, unknown> = {}, base = '/admin') {
   return http.get<PageResult<AdminBillingItem>, ApiRes<PageResult<AdminBillingItem>>>(
     `${base}/billings`,

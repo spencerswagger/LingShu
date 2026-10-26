@@ -64,8 +64,11 @@ type CallLogView struct {
 	FirstTokenMs  *int64 `json:"FirstTokenMs,omitempty"`
 	CallTime      string `json:"CallTime"`
 	ReqMessages   any    `json:"ReqMessages"` // JSONB 原始 value（可能 null）
-	RespBody      string `json:"RespBody"`
-	Decision      any    `json:"Decision"` // JSONB 原始 value（可能 null）
+	// ReqParams 入站请求参数快照（JSONB 反序列化结果：model/temperature/tools 摘要/端点/上游协议与
+	// 上游 URL/token_id 等；可能 null）。定位「这次到底发了什么参数」用，不含 messages（见 ReqMessages）。
+	ReqParams any    `json:"ReqParams"`
+	RespBody  string `json:"RespBody"`
+	Decision  any    `json:"Decision"` // JSONB 原始 value（可能 null）
 	// UpstreamUsage 上游原始 usage（JSONB 反序列化结果：{"Protocol":...,"Usage":{...}}，可能 null）：
 	// 诊断渠道 usage 口径用（billing_records.tokens 是归一化后的三段，看不出上游原文）。
 	UpstreamUsage any    `json:"UpstreamUsage"`
@@ -90,6 +93,12 @@ func toCallLogView(cl *gateway.CallLog) *CallLogView {
 			decision = v
 		}
 	}
+	var reqParams any
+	if len(cl.ReqParams) > 0 {
+		if err := json.Unmarshal(cl.ReqParams, &reqParams); err != nil {
+			reqParams = nil
+		}
+	}
 	var upstreamUsage any
 	if len(cl.UpstreamUsage) > 0 {
 		if err := json.Unmarshal(cl.UpstreamUsage, &upstreamUsage); err != nil {
@@ -109,6 +118,7 @@ func toCallLogView(cl *gateway.CallLog) *CallLogView {
 		FirstTokenMs:  cl.FirstTokenMs,
 		CallTime:      cl.CreatedAt.Format(time.RFC3339),
 		ReqMessages:   reqMsgs,
+		ReqParams:     reqParams,
 		RespBody:      cl.RespBody,
 		Decision:      decision,
 		UpstreamUsage: upstreamUsage,
@@ -190,3 +200,17 @@ func buildBreakdown(rec *billing.Record) ([]Step, *RouteDiff) {
 
 func formatInt(v int64) string     { return strconv.FormatInt(v, 10) }
 func formatFloat(v float64) string { return strconv.FormatFloat(v, 'f', -1, 64) }
+
+// ===== 开发者端可见性 =====
+//
+// 脱敏实现已迁到 `dev_view.go`（白名单正向构造：每个 dev 结构体逐字段列举，
+// Decision/ReqParams 用键白名单过滤）。本文件只保留「开发者端账单拆解」口径。
+// buildBreakdownDev 开发者端账单拆解：sale 模式与 admin 同构（单价即售价）；
+// cost 模式不展示明细——成本金额属内部信息，展示即可反推平台采购价。
+func buildBreakdownDev(rec *billing.Record) ([]Step, *RouteDiff) {
+	if rec.PricingMode != "" && rec.PricingMode != "sale" {
+		return []Step{}, nil
+	}
+	steps, _ := buildBreakdown(rec) // 成本模式的路由差异（RouteDiff）恒不返回
+	return steps, nil
+}
