@@ -6,6 +6,7 @@ import type { BillingDetail } from '@/api/dev'
 import StatusTag from '@/components/StatusTag.vue'
 import ErrorBubble from '@/components/ErrorBubble.vue'
 import CallLogPanel from '@/components/CallLogPanel.vue'
+import { useIsNarrow } from '@/composables/useIsNarrow'
 
 const route = useRoute()
 const billingId = String(route.params.id)
@@ -13,6 +14,8 @@ const billingId = String(route.params.id)
 // mode='self' 时复用为开发者自助账单详情页（API 走 /dev 前缀，隐藏 admin 字段）
 const props = withDefaults(defineProps<{ mode?: 'admin' | 'self' }>(), { mode: 'admin' })
 const isSelf = computed(() => props.mode === 'self')
+// 窄屏：描述列表回落单列（原来固定双列会把长 ID / 模型名挤成竖排）
+const isNarrow = useIsNarrow()
 
 const loading = ref(false)
 const detail = ref<BillingDetail | null>(null)
@@ -61,8 +64,8 @@ function fmt(n: number | undefined) {
     <div v-loading="loading" class="card me-edit">
       <el-empty v-if="!loading && !detail" description="账单不存在" />
       <template v-else-if="detail">
-        <el-descriptions :column="2" border>
-          <el-descriptions-item label="时间" :span="2">{{ detail.CallTime }}</el-descriptions-item>
+        <el-descriptions :column="isNarrow ? 1 : 2" border>
+          <el-descriptions-item label="时间" :span="isNarrow ? 1 : 2">{{ detail.CallTime }}</el-descriptions-item>
           <el-descriptions-item label="模型">
             {{ detail.Model }}
             <el-tag v-if="detail.AutoModelName" size="small" effect="plain" type="success">Auto {{ detail.AutoModelName }}</el-tag>
@@ -75,9 +78,6 @@ function fmt(n: number | undefined) {
             </el-tag>
           </el-descriptions-item>
           <el-descriptions-item label="状态"><StatusTag :value="detail.Status" /></el-descriptions-item>
-          <el-descriptions-item v-if="detail.CallLog" label="请求 ID" :span="2">
-            <span class="mono" style="word-break: break-all">{{ detail.CallLog.RequestID }}</span>
-          </el-descriptions-item>
           <el-descriptions-item v-if="detail.CallLog" label="响应类型">
             <el-tag :type="respKindType(detail.CallLog.RespKind)" size="small" effect="plain">
               {{ respKindLabel(detail.CallLog.RespKind) }}
@@ -85,8 +85,14 @@ function fmt(n: number | undefined) {
           </el-descriptions-item>
         </el-descriptions>
 
-        <!-- 计费计算公式 + 请求 / 响应 / 决策轨迹：合并为同一折叠组，样式统一 -->
-        <CallLogPanel :log="detail.CallLog" title="计费明细">
+        <!-- 计费计算公式 + 请求参数/请求增量/响应/用量/决策轨迹：统一由调用详情面板承载
+             （请求 ID 与一键复制在面板顶部，与下方各区块同一组件，避免两处口径漂移） -->
+        <CallLogPanel
+          :log="detail.CallLog"
+          :show-internal="!isSelf"
+          :billings-base="isSelf ? '/dev' : '/admin'"
+          title="计费明细"
+        >
           <template #prepend>
             <el-collapse-item name="calc" title="计费计算公式">
               <div class="calc-steps">
@@ -130,10 +136,6 @@ function fmt(n: number | undefined) {
 </template>
 
 <style scoped>
-.mono {
-  font-family: 'SF Mono', Menlo, Consolas, monospace;
-  font-size: 12px;
-}
 .calc-steps {
   display: grid;
   gap: 14px;
@@ -198,5 +200,38 @@ function fmt(n: number | undefined) {
   font-size: 12px;
   color: var(--color-text-secondary);
   margin-top: 8px;
+}
+/* 窄屏：单列、正文 ≥14px、长 ID/URL 不横向撑破 */
+@media (max-width: 768px) {
+  .page-container {
+    padding: 12px 12px 20px;
+  }
+  .card.me-edit {
+    padding: 14px 12px;
+  }
+  .step-line {
+    font-size: 14px;
+    gap: 12px;
+    align-items: baseline;
+  }
+  .line-label {
+    min-width: 0;
+    word-break: break-word;
+    overflow-wrap: anywhere;
+  }
+  .line-amount {
+    flex-shrink: 0;
+  }
+  .result-strip {
+    padding: 10px 12px;
+    font-size: 14px;
+  }
+  .result-value {
+    font-size: 20px;
+  }
+  .cost-note {
+    font-size: 13px;
+    line-height: 1.5;
+  }
 }
 </style>

@@ -8,15 +8,26 @@ const isImageUrl = computed(() => {
   const u = props.bubble.url || ''
   return /^(https?:\/\/|data:image\/)/i.test(u)
 })
-// 较长正文自动折叠，避免系统注入块占满页面
+// 较长正文自动折叠，避免系统注入块占满页面。
+// 折叠只是隐藏，**内容完整保留**（展开后全文可见，不做任何截断）：
+// 账单详情与会话详情要求「长消息可折叠但内容不截断」。
 const foldable = computed(() => props.bubble.text.length > 600)
+// 纯文本正文的折叠阈值更宽松（1500 字），短文本直接展开，避免气泡里到处都是折叠条。
+const longText = computed(() => props.bubble.kind === 'text' && props.bubble.text.length > 1500)
 const isToolLike = computed(() => props.bubble.kind === 'tool' || props.bubble.kind === 'json' || (props.bubble.kind === 'xml' && foldable.value))
 </script>
 
 <template>
   <div class="c-bubble" :class="`kind-${bubble.kind}`">
     <template v-if="bubble.kind === 'text'">
-      <div class="c-text">{{ bubble.text }}</div>
+      <div v-if="longText" class="c-fold">
+        <el-collapse>
+          <el-collapse-item name="text-0" :title="`正文（${bubble.text.length} 字，点击展开全文）`">
+            <div class="c-text c-text-full">{{ bubble.text }}</div>
+          </el-collapse-item>
+        </el-collapse>
+      </div>
+      <div v-else class="c-text">{{ bubble.text }}</div>
     </template>
 
     <template v-else-if="bubble.kind === 'xml'">
@@ -71,6 +82,11 @@ const isToolLike = computed(() => props.bubble.kind === 'tool' || props.bubble.k
   line-height: 1.6;
   white-space: pre-wrap;
   word-break: break-word;
+  overflow-wrap: anywhere;
+}
+.c-text-full {
+  max-height: 420px;
+  overflow: auto;
 }
 .c-tag {
   display: inline-block;
