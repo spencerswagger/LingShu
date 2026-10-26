@@ -1,22 +1,28 @@
 <script setup lang="ts">
-// 统一统计页：顶部关键指标带 + 「用量分析」「运维概览」两大块。
-// 同一组件同时服务 /admin/dashboard（全局）与 /dev/dashboard（本人），
-// 运维块与用户维度仅管理端可见（后续可按角色继续细化显隐）。
-import { computed, onMounted, ref, watch } from 'vue'
+// 统计页（admin 全局 / dev 本人共用），版式按定稿 demo，数据接后端真实接口：
+//   ① 首屏 3 个大数字（总 Token / 总消费积分 / 吞吐量）+ 5 项小指标
+//   ② 24h 四日对比趋势（今天/昨天/前天/大前天，按 HourOfDay 对齐，缺桶断线）
+//   ③ 模型广场（后端已排序 + 截断，含零用量模型供折叠）
+//   ④ 实时区（/stats/live，30s 刷新）：我的会话 / 在线用户
+//
+// 三个吞吐口径刻意区分（见 docs/designs/2026-10-25-stats-dashboard-backend.md §4）：
+//   首屏      = KPI.TPM            全窗口忙时口径（≈60÷同批请求平均耗时）
+//   模型广场  = List[].TPM         按模型忙时口径
+//   实时区    = Sessions/Users.TPM 近 60 分钟墙钟平均（含排队空转，天然更低）
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import type { EChartsCoreOption } from 'echarts/core'
-import {
-  Coin,
-  Cpu,
-  DataLine,
-  Key,
-  Odometer,
-  PieChart,
-  Timer,
-  TrendCharts,
-  CircleCheckFilled,
-} from '@element-plus/icons-vue'
+import { ElMessage } from 'element-plus'
 import { useAuthStore } from '@/stores/auth'
-import { getStatsDashboard, type StatsDashboard, type StatsTopItem } from '@/api/stats'
+import {
+  getStatsDashboard,
+  getStatsLive,
+  type StatsDashboard,
+  type StatsHour,
+  type StatsLive,
+  type StatsTopItem,
+  type StatsModelStat,
+  type StatsModelPlaza,
+} from '@/api/stats'
 import { listAnnouncements, type AdminAnnouncement } from '@/api/admin'
 import { listDevAnnouncements } from '@/api/dev'
 import { toRFC3339CN } from '@/utils/format'
@@ -31,15 +37,21 @@ const data = ref<StatsDashboard | null>(null)
 const errInfo = ref<{ message: string; requestId: string }>({ message: '', requestId: '' })
 const announcements = ref<AdminAnnouncement[]>([])
 
-// ===== 时间范围 =====
-type Preset = '7' | '30' | '90' | 'custom'
-const preset = ref<Preset>('30')
+// ===== 时间范围：近 24h / 7 / 30 / 90 天 / 自定义 =====
+// 粒度映射：近 24h → hour；其余 → day（后端 Granularity 参数，缺省 auto 时也是这个规律）。
+type Preset = '24h' | '7' | '30' | '90' | 'custom'
+const preset = ref<Preset>('24h')
 const customRange = ref<[string, string] | null>(null)
+
+const granularity = computed<'hour' | 'day'>(() => (preset.value === '24h' ? 'hour' : 'day'))
+// 服务端实际生效粒度（回显用，可能与请求值不同的兜底：auto 判定）
+const effectiveGranularity = computed(() => data.value?.Usage?.Granularity || granularity.value)
 
 const rangeText = computed(() => {
   if (preset.value === 'custom' && customRange.value) {
     return `${customRange.value[0]} ~ ${customRange.value[1]}`
   }
+  if (preset.value === '24h') return '近 24 小时'
   return `近 ${preset.value} 天`
 })
 
@@ -49,16 +61,20 @@ function parseYMD(s: string): Date {
   return new Date(y, (m || 1) - 1, d || 1)
 }
 
-// 解析为 [起始日 00:00:00, 结束日 23:59:59]
 function resolveRange(): { from: Date; to: Date } {
-  const now = new Date()
-  const end = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59)
   if (preset.value === 'custom' && customRange.value) {
     const from = parseYMD(customRange.value[0])
     const to = parseYMD(customRange.value[1])
     to.setHours(23, 59, 59)
     return { from, to }
   }
+  if (preset.value === '24h') {
+    const to = new Date()
+    const from = new Date(to.getTime() - 24 * 3600 * 1000)
+    return { from, to }
+  }
+  const now = new Date()
+  const end = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59)
   const days = Number(preset.value) || 30
   const from = new Date(end)
   from.setDate(from.getDate() - (days - 1))
@@ -66,20 +82,52 @@ function resolveRange(): { from: Date; to: Date } {
   return { from, to: end }
 }
 
-async function load() {
-  loading.value = true
+// ===== 模型广场排序（服务端排序，切排序会重取 dashboard）=====
+type ModelSort = 'tokens' | 'tpm' | 'failed' | 'latency'
+const modelSort = ref<ModelSort>('tokens')
+const MODEL_SORT_OPTIONS: { key: ModelSort; label: string; tip: string }[] = [
+  { key: 'tokens', label: 'Token', tip: '按窗口内 Token 消耗倒序' },
+  { key: 'tpm', label: '吞吐', tip: '按模型忙时口径 TPM 倒序' },
+  { key: 'failed', label: '失败', tip: '按窗口内失败请求数倒序' },
+  { key: 'latency', label: '延迟', tip: '按全程平均耗时（AvgMS）倒序' },
+]
+const MODEL_LIMIT = 50
+const COMPARE_DAYS = 4
+// 首屏 KPI / 小时趋势 / 模型广场都按「请求区间的严格滚动窗口」算（后端默认 exact）。
+const WINDOW_MODE: 'exact' | 'calendar' = 'exact'
+
+// 请求序号守卫：筛选切换、模型排序切换、手动刷新、30s 轮询可能在途交叠，
+// 只接受「最新一次」请求的响应，过期响应直接丢弃（不写 store、不闪界面）。
+let dashSeq = 0
+let dashInFlight = false
+
+// silent：定时刷新用，不显示整页 loading
+async function load(opts: { silent?: boolean } = {}) {
+  const seq = ++dashSeq
+  dashInFlight = true
+  if (!opts.silent) loading.value = true
   errInfo.value = { message: '', requestId: '' }
   try {
     const { from, to } = resolveRange()
     const res = await getStatsDashboard(auth.role, {
       From: toRFC3339CN(from),
       To: toRFC3339CN(to),
+      Granularity: granularity.value,
+      CompareDays: COMPARE_DAYS,
+      ModelSort: modelSort.value,
+      ModelLimit: MODEL_LIMIT,
+      Window: WINDOW_MODE,
     })
+    if (seq !== dashSeq) return // 已有更新的请求发出，丢弃本次过期响应
     data.value = res.Data
   } catch (e: any) {
+    if (seq !== dashSeq) return
     errInfo.value = { message: e?.message, requestId: e?.requestId }
   } finally {
-    loading.value = false
+    if (seq === dashSeq) {
+      dashInFlight = false
+      loading.value = false
+    }
   }
 }
 
@@ -92,9 +140,67 @@ async function loadAnnouncements() {
   }
 }
 
+// ===== 实时区（/stats/live，30s 刷新）=====
+const live = ref<StatsLive | null>(null)
+const liveLoading = ref(false)
+const liveErr = ref('')
+const liveTab = ref<'sessions' | 'users'>('sessions')
+const LIVE_WINDOW_MINUTES = 60
+const LIVE_SPARK_POINTS = 12
+const LIVE_LIMIT = 20
+const LIVE_REFRESH_MS = 30000
+
+// 实时区同样加序号守卫：轮询 / 手动刷新交叠时只认最新响应。
+let liveSeq = 0
+let liveInFlight = false
+
+async function loadLive() {
+  const seq = ++liveSeq
+  liveInFlight = true
+  liveLoading.value = true
+  try {
+    const res = await getStatsLive(auth.role, {
+      Window: LIVE_WINDOW_MINUTES,
+      SparkPoints: LIVE_SPARK_POINTS,
+      Limit: LIVE_LIMIT,
+    })
+    if (seq !== liveSeq) return // 过期响应直接丢弃
+    live.value = res.Data
+    liveErr.value = ''
+  } catch (e: any) {
+    if (seq !== liveSeq) return
+    // 实时区失败不打断页面，也不清空上一次的数据（只标记失败）。
+    liveErr.value = e?.message || '实时数据获取失败'
+  } finally {
+    if (seq === liveSeq) {
+      liveInFlight = false
+      liveLoading.value = false
+    }
+  }
+}
+
+// 30s 定时刷新：重取实时区 + 当前筛选条件下的 dashboard（静默，不闪整页 loading）。
+// 该函数只「读」preset / customRange，从不写它们，所以刷新不会重置用户选的筛选条件；
+// 页面不可见时直接跳过，避免后台标签页白跑一轮聚合。
+// 已有在途请求时本轮跳过（轮询与手动刷新不叠加），交叠时的响应由序号守卫裁决。
+async function refreshTick() {
+  if (document.visibilityState === 'hidden') return
+  if (liveInFlight || dashInFlight || loading.value) return
+  await loadLive()
+  await load({ silent: true })
+}
+
+let liveTimer: number | undefined
+
 onMounted(() => {
   load()
   loadAnnouncements()
+  loadLive()
+  liveTimer = window.setInterval(refreshTick, LIVE_REFRESH_MS)
+})
+onUnmounted(() => {
+  if (liveTimer !== undefined) window.clearInterval(liveTimer)
+  liveTimer = undefined
 })
 
 watch(preset, () => {
@@ -103,6 +209,7 @@ watch(preset, () => {
 watch(customRange, (v) => {
   if (preset.value === 'custom' && v && v[0] && v[1]) load()
 })
+watch(modelSort, () => load())
 
 // ===== 格式化 =====
 const fmtInt = (n: number) => Number(n || 0).toLocaleString('zh-CN')
@@ -122,19 +229,26 @@ const fmtCompact = (n: number) => {
   if (abs >= 1) return v.toFixed(abs >= 100 ? 0 : 1)
   return v.toFixed(2)
 }
+const fmtTPM = (n: number) => {
+  const v = Number(n || 0)
+  return v >= 100 ? Math.round(v).toString() : v.toFixed(1)
+}
 const fmtDelta = (n: number) => `${n >= 0 ? '▲' : '▼'} ${Math.abs(Number(n || 0) * 100).toFixed(1)}%`
+const fmtTime = (iso: string) => {
+  if (!iso) return ''
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return ''
+  return d.toLocaleTimeString('zh-CN', { hour12: false })
+}
 
 // ===== 图表主题 =====
 const C = {
-  primary: '#5a5ce8',
-  violet: '#8b5cf6',
-  success: '#12b76a',
-  warning: '#f79009',
-  danger: '#f04438',
+  primary: '#4f46e5',
+  violet: '#7c3aed',
   text: '#101828',
   sub: '#667085',
   grid: '#eef0f6',
-  series: ['#5a5ce8', '#8b5cf6', '#12b76a', '#f79009', '#f04438', '#0ea5e9'],
+  series: ['#4f46e5', '#8b5cf6', '#06b6d4', '#f79009', '#12b76a', '#f04438'],
 }
 const axisCommon = {
   axisLine: { lineStyle: { color: C.grid } },
@@ -148,156 +262,361 @@ const tooltipCommon = {
   extraCssText: 'box-shadow:0 6px 20px rgba(16,24,40,0.12);border-radius:8px;',
 }
 
-// ===== KPI =====
-const daily = computed(() => data.value?.Usage.Daily ?? [])
-
-function sparkPoints(vals: number[]): string {
-  if (!vals.length) return ''
-  const w = 100
-  const h = 28
-  const max = Math.max(...vals)
-  const min = Math.min(...vals)
-  const span = max - min || 1
-  const step = vals.length > 1 ? w / (vals.length - 1) : w
-  return vals
-    .map((v, i) => `${(i * step).toFixed(1)},${(h - 3 - ((v - min) / span) * (h - 6)).toFixed(1)}`)
-    .join(' ')
+// ===== ① 首屏大数字 =====
+// 首屏窗口标签直接跟后端 KPI 窗口走（不再硬编码「近 24h」）：
+//   WindowMode=exact    → 请求区间的严格滚动窗口（如「滚动 24 小时」）
+//   WindowMode=calendar → 北京时间自然日归一窗口（如「自然日 7 天」）
+// 后端把 KPI / Usage.Hourly / ModelPlaza 都算在这一个窗口内，所以标签与数字同源。
+function fmtWindowTs(iso: string): string {
+  // 直接切 RFC3339 里的墙钟（后端统一 +08:00），不用 Date 转换以免浏览器时区偏移
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(iso || '')
+  return m ? `${m[2]}-${m[3]} ${m[4]}:${m[5]}` : ''
 }
 
-// KPI 卡片：sub 为简要副标题；tip 存在时展示口径说明（tipTarget 指定挂在数值还是副标题上，默认副标题）。
-interface KpiCard {
-  label: string
-  value: string
-  sub: string
-  tip?: string
-  tipTarget?: 'value' | 'sub'
-  // subMuted：副标用更浅的灰字（用于「样本较少」这类口径提示）
-  subMuted?: boolean
-  delta?: number
-  tone: string
-  icon: any
-  spark?: string
-}
-
-const kpiCards = computed<KpiCard[]>(() => {
+const kpiWindow = computed(() => {
   const k = data.value?.KPI
-  const calls = daily.value.map((d) => d.Calls)
-  const tokens = daily.value.map((d) => d.Tokens)
-  const credits = daily.value.map((d) => Number(d.Credits))
-  const totalIn = data.value?.Usage.Total.Input ?? 0
-  const cacheRead = data.value?.Usage.Total.CacheRead ?? 0
-  const totalInput = totalIn + cacheRead
-  const cacheHit = totalInput > 0 ? cacheRead / totalInput : 0
-  // 吞吐量（RPM/TPM）为忙时口径：分子 BusyRequests、分母 SumDurationMS 都只取「成功且带耗时」的请求。
-  // 有数据即显示（BusyRequests > 0 且忙时耗时 > 0）；样本少时只在副标灰字标注，不做硬门槛。
-  const throughputReady = !!k && (k.BusyRequests ?? 0) > 0 && (k.SumDurationMS ?? 0) > 0
-  const throughputLowSample = !!k && ((k.BusyRequests ?? 0) < 20 || (k.SumDurationMS ?? 0) < 30000)
+  const mode = k?.WindowMode === 'calendar' ? '自然日' : '滚动'
+  const fromMs = Date.parse(k?.WindowFrom || '')
+  const toMs = Date.parse(k?.WindowTo || '')
+  if (!Number.isFinite(fromMs) || !Number.isFinite(toMs) || toMs <= fromMs) {
+    return { label: rangeText.value, tip: `窗口 = ${rangeText.value}（等待后端回传窗口）` }
+  }
+  const hours = Math.max(1, Math.round((toMs - fromMs) / 3600000))
+  const span = hours >= 48 ? `${Math.round(hours / 24)} 天` : `${hours} 小时`
+  return {
+    label: `${mode} ${span}`,
+    tip: `${mode}窗口 ${fmtWindowTs(k!.WindowFrom)} ~ ${fmtWindowTs(k!.WindowTo)}（${span}）；首屏数字 / 小时趋势 / 模型广场同源此窗口`,
+  }
+})
+
+// 吞吐量样本量判定：BusyRequests / SumDurationMS 是忙时口径的分子分母。
+const throughput = computed(() => {
+  const k = data.value?.KPI
+  return {
+    ready: !!k && (k.BusyRequests ?? 0) > 0 && (k.SumDurationMS ?? 0) > 0,
+    lowSample: !!k && ((k.BusyRequests ?? 0) < 20 || (k.SumDurationMS ?? 0) < 30000),
+  }
+})
+
+interface BigStat {
+  label: string
+  glyph: string
+  tone: 'brand' | 'violet' | 'info'
+  value: string
+  unit?: string
+  sub: string
+  delta?: number
+  winLabel: string
+  winTip?: string
+}
+
+const bigStats = computed<BigStat[]>(() => {
+  const k = data.value?.KPI
+  const t = data.value?.Usage.Total
   return [
     {
       label: '总 Token',
-      value: k ? fmtCompact(k.TotalTokens) : '-',
-      sub: `输入 ${fmtCompact(totalIn)} · 输出 ${fmtCompact(data.value?.Usage.Total.Output ?? 0)}`,
-      tip: '输入为纯输入、不含缓存读，缓存读单列，输出含推理',
+      glyph: 'T',
+      tone: 'brand',
+      value: k ? fmtCompact(k.TotalTokens) : '--',
+      sub: `输入 ${fmtCompact(t?.Input ?? 0)} · 输出 ${fmtCompact(t?.Output ?? 0)}`,
       delta: k?.DeltaTokens,
-      tone: 'primary',
-      icon: DataLine,
-      spark: sparkPoints(tokens),
+      winLabel: kpiWindow.value.label,
+      winTip: kpiWindow.value.tip,
     },
     {
       label: '总消费积分',
-      value: k ? fmtMoney(k.TotalCredits) : '-',
+      glyph: '¥',
+      tone: 'violet',
+      value: k ? fmtMoney(k.TotalCredits) : '--',
       sub: `日均 ${fmtMoney((k?.TotalCredits ?? 0) / Math.max(data.value?.Usage.Days ?? 1, 1))}`,
       delta: k?.DeltaCredits,
-      tone: 'violet',
-      icon: Coin,
-      spark: sparkPoints(credits),
-    },
-    {
-      label: '总请求数',
-      value: k ? fmtInt(k.TotalRequests) : '-',
-      sub: `失败 ${fmtInt(k?.FailedRequests ?? 0)} 次`,
-      delta: k?.DeltaRequests,
-      tone: 'primary',
-      icon: Odometer,
-      spark: sparkPoints(calls),
-    },
-    {
-      label: '缓存命中率',
-      value: fmtPct(cacheHit),
-      sub: `输入 ${fmtCompact(totalIn)} · 缓存读 ${fmtCompact(cacheRead)}`,
-      tip: '缓存读 ÷ (输入+缓存读)',
-      tipTarget: 'value',
-      tone: 'violet',
-      icon: PieChart,
-    },
-    {
-      label: '成功率',
-      value: k ? fmtPct(k.SuccessRate) : '-',
-      sub: `平均耗时 ${k ? fmtMs(k.AvgDurationMS) : '-'}`,
-      tone: 'success',
-      icon: CircleCheckFilled,
-    },
-    {
-      label: '平均耗时',
-      value: k ? fmtMs(k.AvgDurationMS) : '-',
-      sub: `首字 ${k ? fmtMs(k.AvgFirstTokenMS) : '-'}`,
-      tone: 'warning',
-      icon: Timer,
+      winLabel: kpiWindow.value.label,
+      winTip: kpiWindow.value.tip,
     },
     {
       label: '吞吐量',
-      value: throughputReady ? `${fmtCompact(k?.TPM ?? 0)} TPM` : '—',
-      sub: throughputReady
-        ? `平均 ${(k?.RPM ?? 0).toFixed(2)} RPM${throughputLowSample ? ' · 样本较少' : ''}`
-        : '-',
-      subMuted: throughputReady && throughputLowSample,
-      tip: '按成功请求处理耗时折算（≈60÷平均耗时），与渠道限流 RPM 不同口径；成功请求数 < 20 或耗时 < 30 秒时仅标注样本较少',
-      tone: 'primary',
-      icon: TrendCharts,
+      glyph: '⚡',
+      tone: 'info',
+      value: throughput.value.ready ? fmtTPM(k?.TPM ?? 0) : '--',
+      unit: ' TPM',
+      sub: throughput.value.ready
+        ? `${kpiWindow.value.label} · 请求 ${(k?.RPM ?? 0).toFixed(1)} RPM${throughput.value.lowSample ? ' · 样本较少' : ''}`
+        : '窗口内没有成功且带耗时的请求',
+      winLabel: '忙时口径',
+      winTip: `忙时口径 = 成功且带耗时请求的 Token ÷ 同批耗时折算分钟数（≈60÷平均耗时）。${kpiWindow.value.tip}`,
     },
   ]
 })
 
-// ===== 用量图表 =====
-const trendMetric = ref<'tokens' | 'credits' | 'calls'>('tokens')
-const trendOption = computed<EChartsCoreOption>(() => {
-  const metric = trendMetric.value
-  const name = metric === 'tokens' ? 'Token' : metric === 'credits' ? '积分' : '请求数'
-  const values = daily.value.map((d) =>
-    metric === 'tokens' ? d.Tokens : metric === 'credits' ? Number(d.Credits) : d.Calls,
-  )
-  return {
-    grid: { left: 6, right: 16, top: 22, bottom: 4, containLabel: true },
-    tooltip: {
-      ...tooltipCommon,
-      trigger: 'axis',
-      valueFormatter: (v: number) => (metric === 'credits' ? fmtMoney(v) : fmtInt(v)),
+// ===== ② 小指标行 =====
+interface MiniStat {
+  label: string
+  value: string
+  tone?: 'ok' | 'info'
+  tip?: string
+}
+
+const miniStats = computed<MiniStat[]>(() => {
+  const k = data.value?.KPI
+  const l = live.value
+  return [
+    { label: '总请求数', value: k ? fmtInt(k.TotalRequests) : '--' },
+    { label: '成功率', value: k ? fmtPct(k.SuccessRate) : '--', tone: 'ok' },
+    { label: '平均耗时', value: k ? fmtMs(k.AvgDurationMS) : '--' },
+    {
+      label: '请求中会话',
+      value: l ? fmtInt(l.SessionsTotal) : '…',
+      tone: 'info',
+      tip: '实时区 /stats/live：请求中（Inflight>0）的会话数',
     },
-    xAxis: {
-      type: 'category',
-      boundaryGap: false,
-      data: daily.value.map((d) => d.Date.slice(5)),
-      ...axisCommon,
+    {
+      label: '请求中用户',
+      value: l ? fmtInt(l.UsersTotal) : '…',
+      tone: 'info',
+      tip: '实时区 /stats/live：有请求中会话的用户数',
     },
-    yAxis: {
-      type: 'value',
-      splitLine: { lineStyle: { color: C.grid } },
-      axisLabel: { color: C.sub, fontSize: 11, formatter: (v: number) => fmtCompact(v) },
-    },
-    series: [
-      {
-        name,
-        type: 'line',
-        smooth: true,
-        showSymbol: false,
-        data: values,
-        lineStyle: { width: 2.4, color: C.primary },
-        itemStyle: { color: C.primary },
-        areaStyle: { color: 'rgba(90,92,232,0.12)' },
-      },
-    ],
-  }
+  ]
 })
+
+// ===== ③ 24h 四日对比趋势 =====
+type TrendMetric = 'tokens' | 'credits' | 'calls'
+const trendMetric = ref<TrendMetric>('tokens')
+const trendMetricName = computed(() =>
+  trendMetric.value === 'tokens' ? 'Token' : trendMetric.value === 'credits' ? '积分' : '请求数',
+)
+const HOUR_SLOTS = Array.from({ length: 24 }, (_, i) => `${String(i).padStart(2, '0')}:00`)
+// 颜色按 Offset 递增：今天的线最深，越往前越浅。
+const TREND_COLORS = ['#4f46e5', '#a5b4fc', '#c4b5fd', '#e9d5ff', '#94a3b8', '#cbd5e1', '#e2e8f0']
+
+interface TrendSeries {
+  label: string
+  offset: number
+  color: string
+  points: StatsHour[]
+}
+
+// Compare 为「今天/昨天/前天/大前天」四条按小时序列；后端无数据时回退单条 Hourly。
+const trendSeries = computed<TrendSeries[]>(() => {
+  const cmp = (data.value?.Usage.Compare ?? []).filter(Boolean)
+  if (cmp.length) {
+    return cmp.map((s, i) => ({
+      label: s.Label || `D-${s.Offset}`,
+      offset: s.Offset,
+      color: TREND_COLORS[i % TREND_COLORS.length],
+      points: s.Points ?? [],
+    }))
+  }
+  const hourly = data.value?.Usage.Hourly ?? []
+  if (hourly.length) {
+    return [{ label: '今天', offset: 0, color: TREND_COLORS[0], points: hourly }]
+  }
+  return []
+})
+
+function metricValue(p: StatsHour): number {
+  if (trendMetric.value === 'credits') return Number(p.Credits)
+  if (trendMetric.value === 'calls') return p.Calls
+  return p.Tokens
+}
+
+const trendOption = computed<EChartsCoreOption>(() => ({
+  grid: { left: 8, right: 16, top: 28, bottom: 4, containLabel: true },
+  legend: { show: false }, // 图例用卡片头部的 HTML 版（与定稿 demo 一致）
+  tooltip: { ...tooltipCommon, trigger: 'axis' },
+  xAxis: {
+    type: 'category',
+    boundaryGap: false,
+    data: HOUR_SLOTS,
+    ...axisCommon,
+    axisLabel: { color: C.sub, fontSize: 11, interval: 3 },
+  },
+  yAxis: {
+    type: 'value',
+    name: trendMetricName.value,
+    nameTextStyle: { color: C.sub, fontSize: 11, align: 'left' },
+    splitLine: { lineStyle: { color: C.grid } },
+    axisLabel: { color: C.sub, fontSize: 11, formatter: (v: number) => fmtCompact(v) },
+  },
+  series: trendSeries.value.map((s, i) => {
+    const byHour = new Map(s.points.map((p) => [p.HourOfDay, p]))
+    return {
+      name: s.label,
+      type: 'line',
+      smooth: true,
+      showSymbol: false,
+      // 缺桶断线：后端缺小时不出行，这里对齐不到就留 null（绝不补 0）
+      connectNulls: false,
+      data: HOUR_SLOTS.map((_, h) => {
+        const p = byHour.get(h)
+        return p ? metricValue(p) : null
+      }),
+      lineStyle: { width: i === 0 ? 2.8 : 2, color: s.color },
+      itemStyle: { color: s.color },
+    }
+  }),
+}))
+
+const trendNote = computed(() => {
+  const parts: string[] = []
+  parts.push(`数据粒度：${effectiveGranularity.value === 'hour' ? '按小时' : '按天'}`)
+  if (effectiveGranularity.value === 'day') {
+    parts.push('四日对比仍是近 4 天 × 小时桶（Compare 接口口径），与筛选粒度解耦')
+  }
+  parts.push('缺小时断线，不补 0')
+  return parts.join(' · ')
+})
+
+// 四条序列都没有任何小时桶 = 窗口内确实没有用量 → 走空态，而不是画四条空线。
+const hasTrendData = computed(() => trendSeries.value.some((s) => s.points.length > 0))
+
+// ===== ③ 模型广场 =====
+interface PlazaRow {
+  model: string
+  tokensText: string
+  tpmText: string
+  callsText: string
+  failText: string
+  latencyText: string
+  barPct: number
+  color: string
+  active: boolean
+  enabled: boolean
+  unmatched: boolean
+}
+
+const plaza = computed<StatsModelPlaza | null>(() => data.value?.ModelPlaza ?? null)
+
+const plazaRows = computed<PlazaRow[]>(() => {
+  const list: StatsModelStat[] = plaza.value?.List ?? []
+  if (!list.length) return []
+  const max = Math.max(...list.map((m) => m.Tokens), 1)
+  return list.map((m, i) => ({
+    model: m.Unmatched ? '未匹配模型' : m.Model || m.Label || '(未命名模型)',
+    tokensText: fmtCompact(m.Tokens),
+    // BusyMS=0（窗口内没有成功且带耗时的请求）时后端 TPM 为 0，这里显示 —
+    tpmText: m.BusyMS > 0 ? `${fmtTPM(m.TPM)} TPM` : '—',
+    callsText: `${fmtInt(m.Calls)} / ${fmtInt(m.Failed)}`,
+    failText: m.Calls > 0 ? fmtPct(m.FailRate) : '—',
+    latencyText:
+      m.AvgFirstMS > 0 || m.AvgMS > 0
+        ? `${m.AvgFirstMS > 0 ? fmtMs(m.AvgFirstMS) : '—'} / ${m.AvgMS > 0 ? fmtMs(m.AvgMS) : '—'}`
+        : '—',
+    barPct: Math.max(0, Math.round((m.Tokens / max) * 100)),
+    color: C.series[i % C.series.length],
+    active: m.Active,
+    enabled: m.Enabled,
+    unmatched: !!m.Unmatched,
+  }))
+})
+
+// 后端可能追加一行 Unmatched=true 的兜底行（改名/别名/无渠道导致归属不到的用量）。
+// 它不参与普通模型的排序与空模型折叠，单独渲染成「未匹配模型」区域（后端保证它不受 Limit 截断）。
+const plazaMatchedRows = computed(() => plazaRows.value.filter((m) => !m.unmatched))
+const unmatchedRow = computed(() => plazaRows.value.find((m) => m.unmatched) ?? null)
+
+const activeModels = computed(() => plazaMatchedRows.value.filter((m) => m.active))
+const idleModels = computed(() => plazaMatchedRows.value.filter((m) => !m.active))
+const idleExpanded = ref(false)
+const visibleModels = computed(() =>
+  idleExpanded.value ? plazaMatchedRows.value : activeModels.value,
+)
+
+const plazaTruncatedText = computed(() => {
+  const p = plaza.value
+  if (!p || !p.Truncated) return ''
+  return `仅显示前 ${p.Limit} 个模型（目录共 ${p.Total} 个，窗口内有请求 ${p.Active} 个）`
+})
+
+async function copyModelName(name: string) {
+  try {
+    await navigator.clipboard.writeText(name)
+    ElMessage.success(`已复制模型名：${name}`)
+  } catch {
+    ElMessage.warning('复制失败，请手动选择模型名')
+  }
+}
+
+// ===== ④ 实时区 =====
+function sparkPath(vals: number[]): string {
+  const n = vals.length
+  if (n < 2) return ''
+  const w = 90
+  const h = 24
+  const max = Math.max(...vals)
+  const min = Math.min(...vals)
+  const span = max - min || 1
+  const step = w / (n - 1)
+  return vals
+    .map((v, i) => `${(i === 0 ? 'M' : 'L')}${(1 + i * step).toFixed(1)},${(h - 2 - ((v - min) / span) * (h - 6)).toFixed(1)}`)
+    .join(' ')
+}
+
+interface LiveSessionRow {
+  id: string
+  name: string
+  model: string
+  inflight: number
+  contextText: string
+  contextTip: string
+  roundText: string
+  callsText: string
+  tpmText: string
+  spentText: string
+  spark: string
+  lastActive: string
+}
+
+const sessionRows = computed<LiveSessionRow[]>(() =>
+  (live.value?.Sessions ?? []).map((s) => {
+    // ContextLimit 恒 0 = 平台未配置模型上限：只显示已用绝对值，不做除法、不造分母。
+    const hasLimit = s.ContextLimit > 0
+    return {
+      id: s.ID,
+      name: s.Name || s.ID.slice(0, 8),
+      model: s.Model,
+      inflight: s.Inflight,
+      contextText: hasLimit ? `${fmtCompact(s.ContextUsed)}/${fmtCompact(s.ContextLimit)}` : fmtCompact(s.ContextUsed),
+      contextTip: hasLimit ? '上下文已用 / 上限' : '仅显示上下文字数：平台未配置模型上限',
+      roundText: fmtCompact(s.RoundTokens),
+      callsText: fmtInt(s.Calls),
+      tpmText: `${fmtTPM(s.TPM)} TPM`,
+      spentText: fmtMoney(s.SpentCredits),
+      spark: sparkPath(s.Spark ?? []),
+      lastActive: fmtTime(s.LastActive),
+    }
+  }),
+)
+
+interface LiveUserRow {
+  id: string
+  name: string
+  initial: string
+  sessions: number
+  tpmText: string
+  tokensText: string
+  spentText: string
+  spark: string
+}
+
+const userRows = computed<LiveUserRow[]>(() =>
+  (live.value?.Users ?? []).map((u) => ({
+    id: u.ID,
+    name: u.Name || `用户 ${u.ID}`,
+    initial: (u.Name || '?').slice(0, 2),
+    sessions: u.Sessions,
+    tpmText: `${fmtTPM(u.TPM)} TPM`,
+    tokensText: fmtCompact(u.Tokens),
+    spentText: fmtMoney(u.SpentCredits),
+    spark: sparkPath(u.Spark ?? []),
+  })),
+)
+
+const liveSampledAt = computed(() => fmtTime(live.value?.SampledAt || ''))
+const liveWindowMinutes = computed(() => live.value?.WindowMinutes ?? LIVE_WINDOW_MINUTES)
+
+// ===== 更多维度（旧版用量分析里仍有数据支撑的部分，默认收起）=====
+const moreOpen = ref<string[]>([])
 
 const compositionOption = computed<EChartsCoreOption>(() => {
   const t = data.value?.Usage.Total
@@ -329,8 +648,11 @@ const compositionOption = computed<EChartsCoreOption>(() => {
   }
 })
 
-// 横向柱状图（Top 维度通用）
-function hbarOption(items: StatsTopItem[], valueFn: (i: StatsTopItem) => number, color: string): EChartsCoreOption {
+function hbarOption(
+  items: StatsTopItem[],
+  valueFn: (i: StatsTopItem) => number,
+  color: string,
+): EChartsCoreOption {
   const rows = items.slice().reverse()
   return {
     grid: { left: 6, right: 28, top: 8, bottom: 4, containLabel: true },
@@ -365,144 +687,9 @@ function hbarOption(items: StatsTopItem[], valueFn: (i: StatsTopItem) => number,
     ],
   }
 }
-const modelOption = computed<EChartsCoreOption>(() =>
-  hbarOption(data.value?.Usage.ByModel ?? [], (i) => i.Tokens, C.primary),
-)
 const keyOption = computed<EChartsCoreOption>(() =>
   hbarOption(data.value?.Usage.ByKey ?? [], (i) => i.Tokens, C.violet),
 )
-
-// ===== 运维图表 =====
-const ops = computed(() => data.value?.Ops)
-
-const successOption = computed<EChartsCoreOption>(() => ({
-  grid: { left: 6, right: 16, top: 22, bottom: 4, containLabel: true },
-  tooltip: {
-    ...tooltipCommon,
-    trigger: 'axis',
-    valueFormatter: (v: number) => `${Number(v).toFixed(1)}%`,
-  },
-  xAxis: { type: 'category', boundaryGap: false, data: daily.value.map((d) => d.Date.slice(5)), ...axisCommon },
-  yAxis: {
-    type: 'value',
-    min: 0,
-    max: 100,
-    splitLine: { lineStyle: { color: C.grid } },
-    axisLabel: { color: C.sub, fontSize: 11, formatter: '{value}%' },
-  },
-  series: [
-    {
-      name: '成功率',
-      type: 'line',
-      smooth: true,
-      showSymbol: false,
-      data: daily.value.map((d) => Number((d.SuccessRate * 100).toFixed(1))),
-      lineStyle: { width: 2.4, color: C.success },
-      itemStyle: { color: C.success },
-      areaStyle: { color: 'rgba(18,183,106,0.10)' },
-    },
-  ],
-}))
-
-const latencyOption = computed<EChartsCoreOption>(() => {
-  const b = data.value?.Usage.Latency ?? []
-  return {
-    grid: { left: 6, right: 16, top: 22, bottom: 4, containLabel: true },
-    tooltip: { ...tooltipCommon, trigger: 'axis', axisPointer: { type: 'shadow' } },
-    xAxis: { type: 'category', data: b.map((x) => x.Bucket), ...axisCommon },
-    yAxis: {
-      type: 'value',
-      splitLine: { lineStyle: { color: C.grid } },
-      axisLabel: { color: C.sub, fontSize: 11 },
-    },
-    series: [
-      {
-        type: 'bar',
-        data: b.map((x) => x.Count),
-        barMaxWidth: 30,
-        itemStyle: { color: C.warning, borderRadius: [4, 4, 0, 0] },
-      },
-    ],
-  }
-})
-
-const throughputOption = computed<EChartsCoreOption>(() => ({
-  grid: { left: 6, right: 20, top: 30, bottom: 4, containLabel: true },
-  tooltip: { ...tooltipCommon, trigger: 'axis' },
-  legend: { top: 0, icon: 'circle', itemWidth: 8, textStyle: { color: C.sub, fontSize: 11 } },
-  xAxis: { type: 'category', data: daily.value.map((d) => d.Date.slice(5)), ...axisCommon },
-  yAxis: [
-    {
-      type: 'value',
-      name: 'Token',
-      nameTextStyle: { color: C.sub, fontSize: 11 },
-      splitLine: { lineStyle: { color: C.grid } },
-      axisLabel: { color: C.sub, fontSize: 11, formatter: (v: number) => fmtCompact(v) },
-    },
-    {
-      type: 'value',
-      name: '请求',
-      nameTextStyle: { color: C.sub, fontSize: 11 },
-      splitLine: { show: false },
-      axisLabel: { color: C.sub, fontSize: 11 },
-    },
-  ],
-  series: [
-    {
-      name: 'Token',
-      type: 'bar',
-      data: daily.value.map((d) => d.Tokens),
-      barMaxWidth: 16,
-      itemStyle: { color: 'rgba(90,92,232,0.75)', borderRadius: [4, 4, 0, 0] },
-    },
-    {
-      name: '请求数',
-      type: 'line',
-      yAxisIndex: 1,
-      smooth: true,
-      showSymbol: false,
-      data: daily.value.map((d) => d.Calls),
-      lineStyle: { width: 2.2, color: C.success },
-      itemStyle: { color: C.success },
-    },
-  ],
-}))
-
-// 运维计数卡
-const opsCounts = computed(() => {
-  const o = ops.value
-  if (!o) return []
-  return [
-    {
-      icon: Key,
-      title: '渠道密钥',
-      total: o.Keys.Total,
-      rows: [
-        { label: '健康', value: o.Keys.Normal, tone: 'success' },
-        { label: '排空', value: o.Keys.Drain, tone: 'warning' },
-        { label: '停用', value: o.Keys.Disabled, tone: 'danger' },
-      ],
-    },
-    {
-      icon: Cpu,
-      title: '对外模型',
-      total: o.Models.ExternalTotal,
-      rows: [
-        { label: '已启用', value: o.Models.ExternalEnabled, tone: 'success' },
-        { label: '未启用', value: o.Models.ExternalTotal - o.Models.ExternalEnabled, tone: 'info' },
-      ],
-    },
-    {
-      icon: DataLine,
-      title: '渠道内部模型',
-      total: o.Models.InternalTotal,
-      rows: [
-        { label: '正常', value: o.Models.InternalNormal, tone: 'success' },
-        { label: '异常', value: o.Models.InternalTotal - o.Models.InternalNormal, tone: 'warning' },
-      ],
-    },
-  ]
-})
 
 const levelType = (l: string) => (['danger', 'warning'].includes(l) ? l : 'primary')
 const modeLabel = (m: string) =>
@@ -511,10 +698,11 @@ const modeLabel = (m: string) =>
 
 <template>
   <div class="page-container">
-    <!-- 工具栏：时间范围 -->
+    <!-- 工具栏：统计范围 + 刷新 + 自动刷新提示 -->
     <div class="page-header">
       <span class="page-count">统计范围：{{ rangeText }}</span>
       <el-radio-group v-model="preset" size="small">
+        <el-radio-button value="24h">近 24h</el-radio-button>
         <el-radio-button value="7">近 7 天</el-radio-button>
         <el-radio-button value="30">近 30 天</el-radio-button>
         <el-radio-button value="90">近 90 天</el-radio-button>
@@ -531,209 +719,309 @@ const modeLabel = (m: string) =>
         end-placeholder="结束日期"
         style="width: 240px"
       />
-      <el-button size="small" :loading="loading" @click="load">刷新</el-button>
+      <el-button size="small" :loading="loading" @click="load()">刷新</el-button>
+      <span class="live-tag"><span class="dot-live" />实时区每 30s 自动刷新</span>
     </div>
 
     <div v-loading="loading">
-      <!-- 顶部关键指标 -->
-      <div class="kpi-grid">
-        <div v-for="c in kpiCards" :key="c.label" class="kpi-card" :data-tone="c.tone">
-          <div class="kpi-top">
-            <span class="kpi-label">{{ c.label }}</span>
-            <el-icon class="kpi-ic"><component :is="c.icon" /></el-icon>
-          </div>
-          <div class="kpi-value">
-            <el-tooltip
-              v-if="c.tip && c.tipTarget === 'value'"
-              :content="c.tip"
-              placement="top"
-              :show-after="150"
-            >
-              <span>{{ c.value }}</span>
+      <!-- ① 首屏：3 个大数字，各自带窗口/口径标签 -->
+      <div class="big-grid">
+        <div v-for="s in bigStats" :key="s.label" class="big-card" :data-tone="s.tone">
+          <div class="big-head">
+            <span class="big-glyph" :data-tone="s.tone">{{ s.glyph }}</span>
+            <span class="big-label">{{ s.label }}</span>
+            <el-tooltip v-if="s.winTip" :content="s.winTip" placement="top" :show-after="150">
+              <span class="win-tag" :data-tone="s.tone">{{ s.winLabel }}</span>
             </el-tooltip>
-            <span v-else>{{ c.value }}</span>
+            <span v-else class="win-tag" :data-tone="s.tone">{{ s.winLabel }}</span>
           </div>
-          <div class="kpi-foot">
-            <el-tooltip v-if="c.tip && c.tipTarget !== 'value'" :content="c.tip" placement="top" :show-after="150">
-              <span class="kpi-sub" :class="{ muted: c.subMuted }">{{ c.sub }}</span>
-            </el-tooltip>
-            <span v-else class="kpi-sub" :class="{ muted: c.subMuted }">{{ c.sub }}</span>
-            <span v-if="c.delta !== undefined" class="kpi-delta" :class="c.delta >= 0 ? 'up' : 'down'">
-              {{ fmtDelta(c.delta as number) }}
+          <div class="big-value">
+            {{ s.value }}<small v-if="s.unit">{{ s.unit }}</small>
+          </div>
+          <div class="big-foot">
+            <span class="big-sub">{{ s.sub }}</span>
+            <span v-if="s.delta !== undefined" class="big-delta" :class="s.delta >= 0 ? 'up' : 'down'">
+              {{ fmtDelta(s.delta as number) }}
             </span>
           </div>
-          <svg v-if="c.spark" class="kpi-spark" viewBox="0 0 100 28" preserveAspectRatio="none">
-            <polyline :points="c.spark" />
-          </svg>
         </div>
       </div>
 
-      <!-- 用量分析 -->
-      <div class="section-head">
-        <span class="section-bar" />
-        <h2 class="section-title">用量分析</h2>
-        <span class="section-en">USAGE</span>
-        <span class="section-line" />
-        <span class="section-note">多维度使用情况</span>
+      <!-- ② 小指标行 -->
+      <div class="mini-grid">
+        <div v-for="m in miniStats" :key="m.label" class="mini-card">
+          <span class="mini-label">{{ m.label }}</span>
+          <el-tooltip v-if="m.tip" :content="m.tip" placement="top" :show-after="150">
+            <span class="mini-value" :data-tone="m.tone">{{ m.value }}</span>
+          </el-tooltip>
+          <span v-else class="mini-value" :data-tone="m.tone">{{ m.value }}</span>
+        </div>
       </div>
-      <div class="grid">
-        <div class="card span-2">
-          <div class="block-title">
-            用量趋势
-            <el-radio-group v-model="trendMetric" size="small" class="inline-switch">
+
+      <!-- ③ 两张图：四日对比趋势 + 模型广场 -->
+      <div class="chart-stack">
+        <div class="card">
+          <div class="card-head">
+            <h3 class="card-title">用量趋势</h3>
+            <el-tooltip
+              content="四日对比：今天 / 昨天 / 前天 / 大前天 各一条按小时序列（与筛选粒度解耦）"
+              placement="top"
+              :show-after="150"
+            >
+              <span class="win-chip">四日对比</span>
+            </el-tooltip>
+            <span class="gran-chip">{{ effectiveGranularity === 'hour' ? '按小时' : '按天' }}</span>
+            <div class="trend-legend">
+              <span v-for="s in trendSeries" :key="s.label">
+                <i :style="{ background: s.color }" />{{ s.label }}
+              </span>
+              <span v-if="!trendSeries.length" class="legend-empty">暂无数据</span>
+            </div>
+            <el-radio-group v-model="trendMetric" size="small" class="head-actions">
               <el-radio-button value="tokens">Token</el-radio-button>
               <el-radio-button value="credits">积分</el-radio-button>
               <el-radio-button value="calls">请求数</el-radio-button>
             </el-radio-group>
           </div>
-          <VChart :option="trendOption" height="300px" />
+          <VChart v-if="hasTrendData" :option="trendOption" height="260px" />
+          <el-empty v-else description="当前范围内没有用量数据" :image-size="70" />
+          <p class="pending-note">{{ trendNote }}</p>
         </div>
 
         <div class="card">
-          <div class="block-title">Token 构成</div>
-          <VChart :option="compositionOption" height="300px" />
-        </div>
+          <div class="card-head">
+            <h3 class="card-title">模型广场</h3>
+            <el-tooltip
+              :content="`${kpiWindow.tip}；按模型忙时口径（该模型成功且带耗时请求的 Token ÷ 同批耗时折算分钟数）`"
+              placement="top"
+              :show-after="150"
+            >
+              <span class="win-chip">{{ kpiWindow.label }} · 按模型忙时</span>
+            </el-tooltip>
+            <div class="sort-group">
+              <span class="sort-label">排序：</span>
+              <el-tooltip v-for="o in MODEL_SORT_OPTIONS" :key="o.key" :content="o.tip" placement="top" :show-after="150">
+                <button
+                  type="button"
+                  class="sort-chip"
+                  :class="{ on: modelSort === o.key }"
+                  @click="modelSort = o.key"
+                >
+                  {{ o.label }}
+                </button>
+              </el-tooltip>
+            </div>
+          </div>
 
-        <div class="card">
-          <div class="block-title">Top 模型</div>
-          <VChart v-if="(data?.Usage.ByModel?.length ?? 0) > 0" :option="modelOption" height="260px" />
-          <el-empty v-else description="暂无数据" :image-size="60" />
-        </div>
-
-        <div class="card">
-          <div class="block-title">Top 渠道密钥</div>
-          <VChart v-if="(data?.Usage.ByKey?.length ?? 0) > 0" :option="keyOption" height="260px" />
-          <el-empty v-else description="暂无数据" :image-size="60" />
-        </div>
-
-        <div class="card">
-          <div class="block-title">计费模式分布</div>
-          <div class="mode-list">
-            <div v-for="m in data?.Usage.ByMode ?? []" :key="m.Key" class="mode-item">
-              <div class="mode-head">
-                <span class="mode-name">{{ modeLabel(m.Key) }}</span>
-                <span class="mode-calls">{{ fmtInt(m.Calls) }} 次</span>
-              </div>
-              <div class="mode-bar">
-                <div
-                  class="mode-bar-in"
-                  :style="{
-                    width:
-                      ((m.Calls / Math.max((data?.Usage.ByMode ?? []).reduce((s, x) => s + x.Calls, 0), 1)) *
-                        100).toFixed(1) + '%',
-                  }"
-                />
-              </div>
-              <div class="mode-foot">
-                <span>{{ fmtCompact(m.Tokens) }} Token</span>
-                <span>{{ fmtMoney(m.Credits) }} 积分</span>
+          <template v-if="plazaRows.length">
+            <div v-if="visibleModels.length" class="model-grid">
+              <div v-for="m in visibleModels" :key="m.model" class="model-card">
+                <div class="model-head">
+                  <span class="model-name">
+                    {{ m.model }}
+                    <button type="button" class="copy-btn" title="复制模型名" @click="copyModelName(m.model)">⧉</button>
+                  </span>
+                  <span class="model-state" :data-active="m.active">
+                    {{ m.active ? '活跃' : '空闲' }}{{ m.enabled ? '' : ' · 已停用' }}
+                  </span>
+                </div>
+                <div class="model-row"><span>Token 消耗</span><b>{{ m.tokensText }}</b></div>
+                <div class="model-row"><span>吞吐量（忙时）</span><b>{{ m.tpmText }}</b></div>
+                <div class="model-row">
+                  <span>请求 / 失败</span>
+                  <b>{{ m.callsText }}<em class="fail-rate">{{ m.failText }}</em></b>
+                </div>
+                <div class="model-row"><span>首字 / 全程</span><b>{{ m.latencyText }}</b></div>
+                <div class="model-bar"><i :style="{ width: m.barPct + '%', background: m.color }" /></div>
               </div>
             </div>
-            <el-empty v-if="!(data?.Usage.ByMode?.length ?? 0)" description="暂无数据" :image-size="60" />
-          </div>
-        </div>
+            <div class="idle-note">
+              <span v-if="!visibleModels.length && !idleExpanded">
+                当前窗口内没有模型请求，可展开查看模型目录
+              </span>
+              <span v-if="idleModels.length">
+                另有 {{ idleModels.length }} 个模型当前无请求，
+                <button type="button" class="link-btn" @click="idleExpanded = !idleExpanded">
+                  {{ idleExpanded ? '收起' : '展开查看' }}
+                </button>
+              </span>
+              <span v-if="plazaTruncatedText" class="trunc-note">{{ plazaTruncatedText }}</span>
+            </div>
 
-        <div v-if="isAdmin" class="card span-2">
-          <div class="block-title">Top 用户</div>
-          <el-table
-            :data="(data?.Usage.ByUser ?? []).slice(0, 8)"
-            size="small"
-            class="table-nowrap"
-            empty-text="暂无数据"
-          >
-            <el-table-column type="index" label="#" width="52" />
-            <el-table-column label="用户" min-width="140">
-              <template #default="{ row }">
-                <span class="cell-main">{{ row.Label }}</span>
-                <span v-if="row.SubLabel" class="cell-sub">{{ row.SubLabel }}</span>
-              </template>
-            </el-table-column>
-            <el-table-column label="请求数" align="right" min-width="100">
-              <template #default="{ row }">{{ fmtInt(row.Calls) }}</template>
-            </el-table-column>
-            <el-table-column label="失败" align="right" min-width="90">
-              <template #default="{ row }">{{ fmtInt(row.Failed) }}</template>
-            </el-table-column>
-            <el-table-column label="Token" align="right" min-width="110">
-              <template #default="{ row }">{{ fmtCompact(row.Tokens) }}</template>
-            </el-table-column>
-            <el-table-column label="积分" align="right" min-width="110">
-              <template #default="{ row }">{{ fmtMoney(row.Credits) }}</template>
-            </el-table-column>
-          </el-table>
+            <!-- 未匹配模型：后端兜底行（Unmatched=true），单独渲染、不参与排序与空模型折叠 -->
+            <div v-if="unmatchedRow" class="unmatched-row">
+              <div class="unmatched-head">
+                <span class="unmatched-name">未匹配模型</span>
+                <el-tooltip
+                  content="改名 / 别名 / 无渠道导致归属不到任何在册对外模型的用量：后端单列汇总，不计入目录数与条数上限"
+                  placement="top"
+                  :show-after="150"
+                >
+                  <span class="unmatched-tag">未归属</span>
+                </el-tooltip>
+              </div>
+              <div class="unmatched-stats">
+                <span>Token <b>{{ unmatchedRow.tokensText }}</b></span>
+                <span>请求 / 失败 <b>{{ unmatchedRow.callsText }}</b></span>
+                <span>吞吐（忙时）<b>{{ unmatchedRow.tpmText }}</b></span>
+                <span>首字 / 全程 <b>{{ unmatchedRow.latencyText }}</b></span>
+              </div>
+            </div>
+          </template>
+          <el-empty v-else description="模型目录为空：还没有对外模型" :image-size="70" />
         </div>
       </div>
 
-      <!-- 运维概览（仅管理端） -->
-      <template v-if="isAdmin">
-        <div class="section-head">
-          <span class="section-bar section-bar--ops" />
-          <h2 class="section-title">运维概览</h2>
-          <span class="section-en">OPERATIONS</span>
-          <span class="section-line" />
-          <span class="section-note">渠道密钥 / 模型 / 稳定性</span>
+      <!-- ④ 实时区：/stats/live，30s 刷新 -->
+      <section class="live-block">
+        <div class="live-head">
+          <h3 class="live-title">实时会话</h3>
+          <span class="live-tag"><span class="dot-live" />每 30s 自动刷新 · 仅显示请求中</span>
+          <span class="live-window">
+            近 {{ liveWindowMinutes }} 分钟墙钟平均<span v-if="liveSampledAt"> · 采样 {{ liveSampledAt }}</span>
+            <span v-if="liveLoading" class="live-loading">刷新中…</span>
+          </span>
         </div>
 
-        <div class="ops-count-grid">
-          <div v-for="g in opsCounts" :key="g.title" class="card ops-count-card">
-            <div class="ops-count-head">
-              <el-icon class="ops-count-ic"><component :is="g.icon" /></el-icon>
-              <span class="ops-count-title">{{ g.title }}</span>
-              <span class="ops-count-total">{{ g.total }}</span>
+        <div class="live-tabs">
+          <el-radio-group v-model="liveTab" size="small">
+            <el-radio-button value="sessions">
+              我的会话{{ live ? ` · ${live.SessionsTotal}` : '' }}
+            </el-radio-button>
+            <el-radio-button v-if="isAdmin" value="users">
+              在线用户{{ live ? ` · ${live.UsersTotal}` : '' }}
+            </el-radio-button>
+          </el-radio-group>
+          <span v-if="liveErr" class="live-err">{{ liveErr }}</span>
+        </div>
+
+        <div v-if="liveTab === 'sessions'" class="live-card">
+          <template v-if="sessionRows.length">
+            <div v-for="s in sessionRows" :key="s.id" class="srow">
+              <span class="srow-dot" />
+              <span class="srow-name" :title="s.name">{{ s.name }}</span>
+              <span class="model-chip">{{ s.model }}</span>
+              <span class="srow-stat">
+                <el-tooltip :content="s.contextTip" placement="top" :show-after="150">
+                  <span>上下文 <b>{{ s.contextText }}</b></span>
+                </el-tooltip>
+                <span>本轮 <b>{{ s.roundText }}</b></span>
+                <span>吞吐 <b>{{ s.tpmText }}</b></span>
+                <span>已花 <b>{{ s.spentText }}</b> 积分</span>
+                <span>累计 <b>{{ s.callsText }}</b> 次</span>
+              </span>
+              <svg v-if="s.spark" class="spark" viewBox="0 0 92 24" preserveAspectRatio="none">
+                <path :d="s.spark" />
+              </svg>
             </div>
-            <div class="ops-count-rows">
-              <div v-for="r in g.rows" :key="r.label" class="ops-count-row">
-                <span class="ops-dot" :data-tone="r.tone" />
-                <span class="ops-count-label">{{ r.label }}</span>
-                <span class="ops-count-value">{{ r.value }}</span>
+            <div v-if="live?.Truncated" class="trunc-note">
+              仅显示前 {{ LIVE_LIMIT }} 个会话（共 {{ live?.SessionsTotal }} 个请求中）
+            </div>
+          </template>
+          <el-empty v-else-if="live" description="当前没有请求中的会话" :image-size="60" />
+          <el-empty v-else description="实时数据加载中" :image-size="60" />
+        </div>
+
+        <div v-else class="live-card">
+          <template v-if="userRows.length">
+            <div v-for="u in userRows" :key="u.id" class="srow">
+              <span class="uavatar">{{ u.initial }}</span>
+              <span class="srow-name" :title="u.name">{{ u.name }}</span>
+              <span class="srow-stat">
+                <span>会话 <b>{{ u.sessions }}</b></span>
+                <span>吞吐 <b>{{ u.tpmText }}</b></span>
+                <span>消耗 <b>{{ u.tokensText }}</b> Token</span>
+                <span>积分 <b>{{ u.spentText }}</b></span>
+              </span>
+              <svg v-if="u.spark" class="spark" viewBox="0 0 92 24" preserveAspectRatio="none">
+                <path :d="u.spark" />
+              </svg>
+            </div>
+            <div v-if="live?.UsersTruncated" class="trunc-note">
+              仅显示前 100 个在线用户（共 {{ live?.UsersTotal }} 个）
+            </div>
+          </template>
+          <el-empty v-else-if="live" description="当前没有在线用户" :image-size="60" />
+          <el-empty v-else description="实时数据加载中" :image-size="60" />
+        </div>
+      </section>
+
+      <!-- 更多维度：旧版用量分析里仍有数据支撑的部分，压到最低层级、默认收起 -->
+      <el-collapse v-model="moreOpen" class="more-block">
+        <el-collapse-item name="more" title="更多维度（Token 构成 / Top 渠道密钥 / 计费模式 / Top 用户）">
+          <div class="grid">
+            <div class="card">
+              <div class="card-title-s">Token 构成</div>
+              <VChart :option="compositionOption" height="260px" />
+            </div>
+            <div class="card">
+              <div class="card-title-s">Top 渠道密钥</div>
+              <VChart v-if="(data?.Usage.ByKey?.length ?? 0) > 0" :option="keyOption" height="260px" />
+              <el-empty v-else description="暂无数据" :image-size="60" />
+            </div>
+            <div class="card">
+              <div class="card-title-s">计费模式分布</div>
+              <div class="mode-list">
+                <div v-for="m in data?.Usage.ByMode ?? []" :key="m.Key" class="mode-item">
+                  <div class="mode-head">
+                    <span class="mode-name">{{ modeLabel(m.Key) }}</span>
+                    <span class="mode-calls">{{ fmtInt(m.Calls) }} 次</span>
+                  </div>
+                  <div class="mode-bar">
+                    <div
+                      class="mode-bar-in"
+                      :style="{
+                        width:
+                          ((m.Calls /
+                            Math.max((data?.Usage.ByMode ?? []).reduce((s, x) => s + x.Calls, 0), 1)) *
+                            100).toFixed(1) + '%',
+                      }"
+                    />
+                  </div>
+                  <div class="mode-foot">
+                    <span>{{ fmtCompact(m.Tokens) }} Token</span>
+                    <span>{{ fmtMoney(m.Credits) }} 积分</span>
+                  </div>
+                </div>
+                <el-empty v-if="!(data?.Usage.ByMode?.length ?? 0)" description="暂无数据" :image-size="60" />
               </div>
             </div>
-          </div>
-        </div>
-
-        <div class="grid">
-          <div class="card span-2">
-            <div class="block-title">成功率趋势</div>
-            <VChart :option="successOption" height="280px" />
-          </div>
-          <div class="card">
-            <div class="block-title">
-              耗时分布
-              <span class="block-note">
-                P50 {{ fmtMs(data?.Usage.P50MS ?? 0) }} · P90
-                {{ fmtMs(data?.Usage.P90MS ?? 0) }} · P95
-                {{ fmtMs(data?.Usage.P95MS ?? 0) }}
-              </span>
+            <div v-if="isAdmin" class="card">
+              <div class="card-title-s">Top 用户</div>
+              <el-table
+                :data="(data?.Usage.ByUser ?? []).slice(0, 8)"
+                size="small"
+                class="table-nowrap"
+                empty-text="暂无数据"
+              >
+                <el-table-column type="index" label="#" width="52" />
+                <el-table-column label="用户" min-width="120">
+                  <template #default="{ row }">
+                    <span class="cell-main">{{ row.Label }}</span>
+                    <span v-if="row.SubLabel" class="cell-sub">{{ row.SubLabel }}</span>
+                  </template>
+                </el-table-column>
+                <el-table-column label="请求数" align="right" min-width="90">
+                  <template #default="{ row }">{{ fmtInt(row.Calls) }}</template>
+                </el-table-column>
+                <el-table-column label="失败" align="right" min-width="80">
+                  <template #default="{ row }">{{ fmtInt(row.Failed) }}</template>
+                </el-table-column>
+                <el-table-column label="Token" align="right" min-width="100">
+                  <template #default="{ row }">{{ fmtCompact(row.Tokens) }}</template>
+                </el-table-column>
+                <el-table-column label="积分" align="right" min-width="100">
+                  <template #default="{ row }">{{ fmtMoney(row.Credits) }}</template>
+                </el-table-column>
+              </el-table>
             </div>
-            <VChart :option="latencyOption" height="280px" />
           </div>
-          <div class="card span-2">
-            <div class="block-title">吞吐量趋势</div>
-            <VChart :option="throughputOption" height="280px" />
-          </div>
-          <div class="card">
-            <div class="block-title">错误 Top</div>
-            <el-table :data="(data?.Usage.Errors ?? []).slice(0, 8)" size="small" empty-text="暂无失败记录">
-              <el-table-column label="错误信息" min-width="200">
-                <template #default="{ row }">
-                  <span class="cell-main">{{ row.Label }}</span>
-                </template>
-              </el-table-column>
-              <el-table-column label="次数" width="90" align="right">
-                <template #default="{ row }">{{ fmtInt(row.Calls) }}</template>
-              </el-table-column>
-            </el-table>
-          </div>
-        </div>
-      </template>
+        </el-collapse-item>
+      </el-collapse>
 
       <!-- 最近公告 -->
-      <div v-if="announcements.length" class="section-head">
-        <span class="section-bar section-bar--news" />
-        <h2 class="section-title">最近公告</h2>
-        <span class="section-line" />
-      </div>
-      <div v-if="announcements.length" class="card announce-card">
+      <div v-if="announcements.length" class="announce-card">
+        <div class="card-title-s">最近公告</div>
         <div v-for="a in announcements" :key="a.ID" class="announce-item">
           <el-tag :type="(levelType(a.Level) as any)" size="small" effect="light">{{ a.Level }}</el-tag>
           <span class="announce-title">{{ a.Title }}</span>
@@ -751,168 +1039,561 @@ const modeLabel = (m: string) =>
 </template>
 
 <style scoped>
-/* ===== 顶部指标带 ===== */
-.kpi-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-  gap: 14px;
-  margin-bottom: 22px;
+/* ===== 顶部提示 ===== */
+.live-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-success);
+  background: #e8f8f0;
+  padding: 5px 12px;
+  border-radius: 999px;
 }
-.kpi-card {
+.dot-live {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--color-success);
+  box-shadow: 0 0 0 3px rgba(18, 183, 106, 0.18);
+  animation: livePulse 1.6s infinite;
+}
+@keyframes livePulse {
+  50% { opacity: 0.4; }
+}
+
+/* ===== ① 首屏大数字 ===== */
+.big-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+  margin-bottom: 14px;
+}
+.big-card {
   position: relative;
   background: var(--color-surface);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-m);
-  padding: 14px 16px 30px;
+  padding: 16px 18px;
   box-shadow: var(--shadow-card);
-  transition: transform 0.18s ease, box-shadow 0.18s ease;
   overflow: hidden;
   min-width: 0;
 }
-.kpi-card:hover {
-  transform: translateY(-2px);
-  box-shadow: var(--shadow-pop);
-}
-.kpi-card::before {
+.big-card::after {
   content: '';
   position: absolute;
-  inset: 0 auto 0 0;
-  width: 3px;
-  background: var(--brand-primary);
+  right: -22px;
+  top: -22px;
+  width: 96px;
+  height: 96px;
+  border-radius: 50%;
+  background: var(--brand-primary-soft);
+  opacity: 0.55;
+  pointer-events: none;
 }
-.kpi-card[data-tone='violet']::before { background: var(--brand-violet); }
-.kpi-card[data-tone='success']::before { background: var(--color-success); }
-.kpi-card[data-tone='warning']::before { background: var(--color-warning); }
-.kpi-top {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 6px;
-}
-.kpi-label {
-  font-size: 13px;
-  color: var(--color-text-secondary);
-}
-.kpi-ic {
-  font-size: 16px;
-  color: var(--color-text-tertiary);
-}
-.kpi-value {
-  font-size: 26px;
-  font-weight: 700;
-  line-height: 1.15;
-  color: var(--color-text);
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.kpi-foot {
+.big-head {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-top: 6px;
-  font-size: 12px;
+  margin-bottom: 8px;
+}
+.big-glyph {
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 700;
+  background: var(--brand-primary-soft);
+  color: var(--brand-primary);
+  flex-shrink: 0;
+}
+.big-glyph[data-tone='violet'] { background: #f5f3ff; color: #7c3aed; }
+.big-glyph[data-tone='info'] { background: #f0f9ff; color: #0284c7; }
+.big-label {
+  font-size: 13px;
   color: var(--color-text-secondary);
+  white-space: nowrap;
+}
+.win-tag {
+  margin-left: auto;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 9px;
+  border-radius: 999px;
+  background: var(--brand-primary-soft);
+  color: var(--brand-primary);
+  cursor: default;
+  white-space: nowrap;
+}
+.win-tag[data-tone='violet'] { background: #f5f3ff; color: #7c3aed; }
+.win-tag[data-tone='info'] { background: #f0f9ff; color: #0284c7; }
+.big-value {
+  font-size: 32px;
+  font-weight: 800;
+  line-height: 1.15;
+  color: var(--color-text);
+  font-variant-numeric: tabular-nums;
+  font-family: 'SF Mono', Consolas, monospace;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.big-value small {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+  margin-left: 2px;
+}
+.big-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--color-text-tertiary);
   min-width: 0;
 }
-.kpi-sub {
+.big-sub {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.kpi-sub.muted { color: var(--color-text-tertiary); }
-.kpi-delta {
+.big-delta {
   flex-shrink: 0;
   font-weight: 600;
 }
-.kpi-delta.up { color: var(--color-success); }
-.kpi-delta.down { color: var(--color-danger); }
-.kpi-spark {
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  width: 100%;
-  height: 28px;
-  opacity: 0.5;
-}
-.kpi-spark polyline {
-  fill: none;
-  stroke: var(--brand-primary);
-  stroke-width: 1.6;
-  vector-effect: non-scaling-stroke;
-}
-.kpi-card[data-tone='violet'] .kpi-spark polyline { stroke: var(--brand-violet); }
-.kpi-card[data-tone='success'] .kpi-spark polyline { stroke: var(--color-success); }
-.kpi-card[data-tone='warning'] .kpi-spark polyline { stroke: var(--color-warning); }
+.big-delta.up { color: var(--color-success); }
+.big-delta.down { color: var(--color-danger); }
 
-/* ===== 区块标题 ===== */
-.section-head {
+/* ===== ② 小指标行 ===== */
+.mini-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.mini-card {
   display: flex;
   align-items: center;
-  gap: 10px;
-  margin: 6px 0 14px;
+  justify-content: space-between;
+  gap: 8px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  padding: 10px 14px;
+  box-shadow: var(--shadow-card);
+  min-width: 0;
 }
-.section-bar {
-  width: 4px;
-  height: 18px;
-  border-radius: 3px;
-  background: var(--brand-gradient);
+.mini-label {
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  white-space: nowrap;
 }
-.section-bar--ops { background: linear-gradient(135deg, #12b76a 0%, #0ea5e9 100%); }
-.section-bar--news { background: linear-gradient(135deg, #f79009 0%, #f04438 100%); }
-.section-title {
-  margin: 0;
+.mini-value {
   font-size: 17px;
   font-weight: 700;
   color: var(--color-text);
+  font-variant-numeric: tabular-nums;
+  font-family: 'SF Mono', Consolas, monospace;
+  white-space: nowrap;
 }
-.section-en {
+.mini-value[data-tone='ok'] { color: var(--color-success); }
+.mini-value[data-tone='info'] { color: #0284c7; }
+
+/* ===== ③ 图表区 ===== */
+.chart-stack {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+.card {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-m);
+  padding: 14px 16px;
+  box-shadow: var(--shadow-card);
+}
+.card-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+.card-title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--color-text);
+}
+.card-title-s {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--color-text);
+  margin-bottom: 10px;
+}
+.win-chip,
+.gran-chip {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 9px;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+.win-chip { background: var(--brand-primary-soft); color: var(--brand-primary); }
+.gran-chip { background: #f2f4f7; color: var(--color-text-secondary); }
+.trend-legend {
+  display: flex;
+  gap: 12px;
   font-size: 11px;
-  letter-spacing: 0.14em;
   color: var(--color-text-tertiary);
-  text-transform: uppercase;
+  flex-wrap: wrap;
 }
-.section-line {
-  flex: 1;
-  height: 1px;
+.trend-legend i {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  margin-right: 4px;
+  vertical-align: -1px;
+}
+.legend-empty { color: var(--color-text-tertiary); }
+.head-actions { margin-left: auto; }
+
+/* 模型广场 */
+.sort-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  flex-wrap: wrap;
+}
+.sort-label {
+  font-size: 11px;
+  color: var(--color-text-tertiary);
+}
+.sort-chip {
+  border: none;
+  background: transparent;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--color-text-tertiary);
+  padding: 2px 8px;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+.sort-chip:hover { color: var(--brand-primary); }
+.sort-chip.on { background: var(--brand-primary-soft); color: var(--brand-primary); }
+.model-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+.model-card {
+  background: #fafbfd;
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  padding: 12px 14px;
+  min-width: 0;
+}
+.model-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.model-name {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--color-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.model-state {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: #f0f1f4;
+  color: var(--color-text-tertiary);
+  flex-shrink: 0;
+}
+.model-state[data-active='true'] {
+  background: #e8f8f0;
+  color: var(--color-success);
+}
+.model-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  padding: 3px 0;
+}
+.model-row b {
+  color: var(--color-text);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  font-family: 'SF Mono', Consolas, monospace;
+  white-space: nowrap;
+}
+.fail-rate {
+  margin-left: 5px;
+  font-style: normal;
+  font-weight: 500;
+  font-size: 11px;
+  color: var(--color-text-tertiary);
+}
+.model-bar {
+  height: 5px;
+  border-radius: 3px;
   background: var(--color-border);
+  margin-top: 8px;
+  overflow: hidden;
 }
-.section-note {
+.model-bar i {
+  display: block;
+  height: 100%;
+  border-radius: 3px;
+  transition: width 0.3s ease;
+}
+.copy-btn {
+  border: none;
+  margin-left: 5px;
+  width: 16px;
+  height: 16px;
+  border-radius: 4px;
+  background: var(--brand-primary-soft);
+  color: var(--brand-primary);
+  font-size: 10px;
+  line-height: 1;
+  cursor: pointer;
+  vertical-align: 1px;
+}
+.copy-btn:hover { background: var(--brand-primary); color: #fff; }
+.idle-note {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+  font-size: 11px;
+  color: var(--color-text-tertiary);
+}
+.link-btn {
+  border: none;
+  background: transparent;
+  padding: 0;
+  font-size: 11px;
+  color: var(--brand-primary);
+  cursor: pointer;
+  text-decoration: underline;
+}
+.trunc-note {
+  font-size: 11px;
+  color: var(--color-text-tertiary);
+  margin-top: 8px;
+}
+/* 未匹配模型：灰底虚线框，明显区别于普通模型卡 */
+.unmatched-row {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px dashed var(--color-border-strong);
+  border-radius: 10px;
+  background: #f7f8fa;
+}
+.unmatched-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.unmatched-name {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--color-text-secondary);
+}
+.unmatched-tag {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: #eef0f3;
+  color: var(--color-text-tertiary);
+  cursor: help;
+}
+.unmatched-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+.unmatched-stats b {
+  color: var(--color-text);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  font-family: 'SF Mono', Consolas, monospace;
+}
+
+/* ===== ④ 实时区 ===== */
+.live-block {
+  background: linear-gradient(160deg, #eef0ff, #f8fafc);
+  border: 1px solid #dde1f5;
+  border-radius: var(--radius-m);
+  padding: 14px 16px;
+  margin-bottom: 14px;
+}
+.live-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+  flex-wrap: wrap;
+}
+.live-title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--color-text);
+}
+.live-window {
+  margin-left: auto;
   font-size: 12px;
   color: var(--color-text-tertiary);
 }
+.live-loading { margin-left: 8px; color: var(--brand-primary); }
+.live-tabs {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 10px;
+  flex-wrap: wrap;
+}
+.live-err {
+  font-size: 11px;
+  color: var(--color-danger);
+}
+.live-card {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  padding: 12px 14px;
+  min-width: 0;
+}
+.srow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 0;
+  border-bottom: 1px dashed var(--color-border);
+  flex-wrap: wrap;
+}
+.srow:last-of-type { border-bottom: none; }
+.srow-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--color-success);
+  box-shadow: 0 0 0 3px rgba(18, 183, 106, 0.18);
+  animation: livePulse 1.6s infinite;
+  flex-shrink: 0;
+}
+.uavatar {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background: var(--brand-primary-soft);
+  color: var(--brand-primary);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+.srow-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-text);
+  min-width: 110px;
+  max-width: 170px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.model-chip {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--brand-primary-soft);
+  color: var(--brand-primary);
+  white-space: nowrap;
+}
+.srow-stat {
+  display: flex;
+  gap: 14px;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+  flex-wrap: wrap;
+}
+.srow-stat b {
+  color: var(--color-text);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  font-family: 'SF Mono', Consolas, monospace;
+}
+.spark {
+  width: 92px;
+  height: 24px;
+  flex-shrink: 0;
+  margin-left: auto;
+}
+.spark path {
+  fill: none;
+  stroke: var(--brand-primary);
+  stroke-width: 1.8;
+}
+.pending-note {
+  margin: 8px 0 0;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--color-text-tertiary);
+}
 
-/* ===== 网格与卡片 ===== */
+/* ===== 更多维度 ===== */
+.more-block {
+  border: none;
+  margin-bottom: 14px;
+}
+.more-block :deep(.el-collapse-item__header) {
+  background: transparent;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+  border-bottom: 1px solid var(--color-border);
+  padding-left: 2px;
+}
+.more-block :deep(.el-collapse-item__wrap) {
+  background: transparent;
+  border-bottom: none;
+  padding-top: 12px;
+}
 .grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 16px;
-  margin-bottom: 10px;
+  gap: 14px;
 }
-.grid .span-2 {
-  grid-column: 1 / -1;
-}
-@media (max-width: 1000px) {
-  .grid {
-    grid-template-columns: 1fr;
-  }
-}
-.card {
-  padding: 16px 18px;
-}
-.block-note {
-  margin-left: auto;
-  font-size: 12px;
-  font-weight: 400;
-  color: var(--color-text-secondary);
-}
-.inline-switch {
-  margin-left: auto;
-}
-
-/* 计费模式分布 */
 .mode-list {
   display: flex;
   flex-direction: column;
@@ -949,68 +1630,6 @@ const modeLabel = (m: string) =>
   font-size: 12px;
   color: var(--color-text-secondary);
 }
-
-/* 运维计数卡 */
-.ops-count-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: 16px;
-  margin-bottom: 16px;
-}
-.ops-count-card {
-  padding: 14px 16px;
-}
-.ops-count-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 10px;
-}
-.ops-count-ic {
-  font-size: 16px;
-  color: var(--brand-primary);
-}
-.ops-count-title {
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--color-text);
-}
-.ops-count-total {
-  margin-left: auto;
-  font-size: 22px;
-  font-weight: 700;
-  color: var(--color-text);
-  font-variant-numeric: tabular-nums;
-}
-.ops-count-rows {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px 18px;
-}
-.ops-count-row {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 12px;
-  color: var(--color-text-secondary);
-}
-.ops-dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--color-info);
-}
-.ops-dot[data-tone='success'] { background: var(--color-success); }
-.ops-dot[data-tone='warning'] { background: var(--color-warning); }
-.ops-dot[data-tone='danger'] { background: var(--color-danger); }
-.ops-dot[data-tone='info'] { background: var(--color-text-tertiary); }
-.ops-count-value {
-  font-weight: 600;
-  color: var(--color-text);
-  font-variant-numeric: tabular-nums;
-}
-
-/* 表格辅助 */
 .cell-main { color: var(--color-text); }
 .cell-sub {
   margin-left: 8px;
@@ -1018,9 +1637,14 @@ const modeLabel = (m: string) =>
   color: var(--color-text-tertiary);
 }
 
-/* 公告 */
+/* ===== 最近公告 ===== */
 .announce-card {
-  margin-bottom: 6px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-m);
+  padding: 14px 16px;
+  box-shadow: var(--shadow-card);
+  margin-bottom: 14px;
 }
 .announce-item {
   display: flex;
@@ -1029,9 +1653,7 @@ const modeLabel = (m: string) =>
   padding: 9px 0;
   border-bottom: 1px solid var(--color-border);
 }
-.announce-item:last-child {
-  border-bottom: none;
-}
+.announce-item:last-child { border-bottom: none; }
 .announce-title {
   flex: 1;
   font-weight: 500;
@@ -1042,5 +1664,23 @@ const modeLabel = (m: string) =>
 .announce-time {
   color: var(--color-text-secondary);
   font-size: 12px;
+}
+
+/* ===== 响应式 ===== */
+@media (max-width: 1280px) {
+  .model-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 1100px) {
+  .mini-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+@media (max-width: 1000px) {
+  .big-grid { grid-template-columns: 1fr; }
+  .grid { grid-template-columns: 1fr; }
+}
+@media (max-width: 760px) {
+  .mini-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .model-grid { grid-template-columns: 1fr; }
+  .head-actions, .sort-group { margin-left: 0; }
+  .live-window { margin-left: 0; }
 }
 </style>
