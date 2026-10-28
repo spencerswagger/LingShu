@@ -301,7 +301,7 @@
 
 1. 物化路径 `channel/service.go:379` 的 `materializeFromProtocol` 是 `CostRates: billing.Rates(mg.CostRates)` **直接落库**，这条路径**不调用** `billing.ValidateRates`。`ValidateRates`（`billing/rates.go:114`）的调用点全仓只有 4 处：`billing/engine.go:19`（`ComputeCredits` 内部）、`billing/engine.go:29`（`RawTotal` 内部）、`channel/model_service.go:43`（管理端保存成本）、`model/service.go:221`（管理端保存售价）。即「**计费计算时**」与「**管理端保存时**」才校验，落库时从不校验，因此错键会一路进 `channel_models.cost_rates`。
 2. 计费时 `ComputeCredits` 会因缺键报错，但**成本侧错误被吞**：`billing/service.go:300-302` 的 `if c, cerr := ComputeCredits(req.Tokens, req.CostRates, ...); cerr == nil { rec.CostCredits = c }` —— `cerr` 既不记日志也不告警，`cost_credits` **静默为 0**，成本/毛利曲线整段为空且没人会发现。
-3. 售价侧缺键不静默：售价是本单应付积分的计算依据，缺键时结算直接报错（非静默）——`ComputeCredits` 内的 `ValidateRates` 在 `billing/engine.go:19`，管理端保存侧在 `model/service.go:221`。
+3. 售价侧缺键不静默：售价是本单应付积分的计算依据，`billing/service.go:537` 的 `requestCredits` 直接把 `ComputeCredits` 的错误向上返回（结算失败，不是静默 0）；管理端保存侧同样会拦（`model/service.go:221`）。
 4. 唯一会「响」的是管理员在渠道模型页手工保存该行 → 400「cost_rates 非法」（`channel/model_service.go:43`）。
 
 ### 9.2 `cost`（v1 位）与 `costRates` 的关系
