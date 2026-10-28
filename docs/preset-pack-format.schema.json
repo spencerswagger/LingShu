@@ -1,0 +1,285 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lingshu.local/schemas/preset-pack-dataset-v0.2.json",
+  "title": "渠道预设包数据集（灵枢 · v0.2 草案）",
+  "description": "灵枢渠道预设包数据集的参考 JSON Schema（2020-12）。正本口径见 docs/preset-pack-format.md。兰台冻结版以兰台产出为准，字段口径冲突以文档为准。",
+  "$comment": "分层说明：本 schema 校验的是「兰台产出的数据集」，因此对生产方收紧；消费方（灵枢）对未知字段的容忍义务在文档第 10 节，两者不矛盾。若要用它校验 models.dev 原始 api.json：需去掉 provider.required 里的 gateway、放开 gatewayBlock 的 required，并把 costCurrency 改回 enum [CNY, USD]（缺省 USD）。",
+  "type": "object",
+  "minProperties": 1,
+  "additionalProperties": { "$ref": "#/$defs/provider" },
+
+  "$defs": {
+    "provider": {
+      "type": "object",
+      "required": ["id", "models", "gateway"],
+      "additionalProperties": true,
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "$comment": "必填非空；空则整包同步失败（V3）。同时是灵枢的 preset_source_id。"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "$comment": "可选；缺省回退 id。若非空则必须全局唯一（V6）。"
+        },
+        "env": {
+          "type": "array",
+          "items": { "type": "string" },
+          "$comment": "惰性：灵枢不消费，仅前端提示。"
+        },
+        "npm": { "type": "string", "$comment": "惰性字段。" },
+        "api": {
+          "type": ["string", "null"],
+          "$comment": "惰性字段；v1 无 ${ENV} 模板。上游地址以 gateway.baseUrl 为准。"
+        },
+        "doc": { "type": "string", "$comment": "惰性字段。" },
+        "models": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/model" }
+        },
+        "gateway": { "$ref": "#/$defs/gatewayBlock" }
+      }
+    },
+
+    "gatewayBlock": {
+      "type": "object",
+      "required": ["baseUrl", "protocols", "costCurrency"],
+      "additionalProperties": true,
+      "properties": {
+        "baseUrl": {
+          "type": "string",
+          "pattern": "^https?://",
+          "$comment": "必须 http(s):// 开头，否则整包同步失败（V4）。"
+        },
+        "protocols": { "$ref": "#/$defs/protocols" },
+        "requestHeaders": { "$ref": "#/$defs/headerPolicy" },
+        "costCurrency": {
+          "const": "CNY",
+          "$comment": "数据集层收紧为人民币。格式层允许 [CNY, USD]（缺省 USD，用于无损读取 models.dev api.json）。灵枢当前不解析该字段。"
+        },
+        "offers": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/offer" },
+          "$comment": "v0.1.0 先摆字段位，留空 []；0.2.0 再填内容。灵枢当前不解析，新增不影响解析（文档第 13 节）。"
+        },
+        "edited": { "type": "boolean", "$comment": "仅灵枢 export 时写出，数据集不要填。" },
+        "sourceStatus": {
+          "type": "string",
+          "enum": ["ACTIVE", "STALE"],
+          "$comment": "仅灵枢 export/import 承载；数据集不要填。sync 路径会强制写 ACTIVE。"
+        }
+      }
+    },
+
+    "protocols": {
+      "type": "object",
+      "propertyNames": {
+        "enum": ["openai-chat", "openai-responses", "anthropic-messages"],
+        "$comment": "灵枢消费方会静默丢弃未知协议键（容忍）；但生产方不该产出灵枢会丢的键，故在数据集层收紧为 3 个基础协议。"
+      },
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "baseUrl": { "type": "string", "pattern": "^https?://" },
+          "path": { "type": "string", "pattern": "^/" },
+          "default": { "type": "boolean" }
+        }
+      },
+      "$comment": "同一作用域内 default:true 至多一个（V7）。"
+    },
+
+    "headerPolicy": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "passthroughMode": {
+          "type": "string",
+          "enum": ["none", "whitelist", "blacklist", "all"],
+          "$comment": "封闭枚举（大小写不敏感）；非法值 → 400 并整包回滚（V5）。"
+        },
+        "whitelist": { "type": "array", "items": { "type": "string" } },
+        "blacklist": { "type": "array", "items": { "type": "string" } },
+        "set": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "$comment": "支持变量 {api_key} {session_id} {request_id} {model} {client_header:NAME}。"
+        }
+      }
+    },
+
+    "model": {
+      "type": "object",
+      "required": ["id", "name", "description", "gateway"],
+      "additionalProperties": true,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "$comment": "格式必填（v1 对齐），灵枢惰性。" },
+        "description": { "type": "string", "$comment": "格式必填（v1 对齐），灵枢惰性。" },
+        "family": { "type": "string" },
+        "cost": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "input": { "type": "number", "minimum": 0 },
+            "output": { "type": "number", "minimum": 0 },
+            "reasoning": { "type": "number", "minimum": 0 },
+            "cache_read": { "type": "number", "minimum": 0 },
+            "cache_write": { "type": "number", "minimum": 0 },
+            "input_audio": { "type": "number", "minimum": 0 },
+            "output_audio": { "type": "number", "minimum": 0 },
+            "tiers": { "type": "array" }
+          },
+          "$comment": "人民币元/百万 token（币种由 gateway.costCurrency 声明）。展示位：灵枢不解析、不计费；数值应与 gateway.costRates 一致。"
+        },
+        "limit": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "context": { "type": "integer", "minimum": 0 },
+            "input": { "type": "integer", "minimum": 0 },
+            "output": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "modalities": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "input": { "type": "array", "items": { "type": "string" } },
+            "output": { "type": "array", "items": { "type": "string" } }
+          },
+          "$comment": "开放枚举（v1 原文封闭）；灵枢惰性。"
+        },
+        "tool_call": { "type": "boolean" },
+        "reasoning": { "type": "boolean" },
+        "reasoning_options": { "type": "array", "items": { "type": "string" } },
+        "interleaved": {
+          "oneOf": [
+            { "type": "boolean" },
+            { "type": "object", "properties": { "field": { "type": "string" } }, "additionalProperties": true }
+          ]
+        },
+        "attachment": { "type": "boolean" },
+        "structured_output": { "type": "boolean" },
+        "temperature": { "type": "boolean" },
+        "open_weights": { "type": "boolean" },
+        "knowledge": { "type": "string" },
+        "release_date": { "type": "string" },
+        "last_updated": { "type": "string" },
+        "status": { "type": "string", "enum": ["alpha", "beta", "deprecated"] },
+        "type": { "type": "string", "$comment": "开放枚举；灵枢惰性。" },
+        "canonical_model_id": { "type": "string" },
+        "provider": { "type": "object", "$comment": "v1 字段，灵枢不消费，原样保留。" },
+        "experimental": { "type": "object", "$comment": "v1 字段，灵枢不消费，原样保留。" },
+        "gateway": { "$ref": "#/$defs/modelGateway" }
+      }
+    },
+
+    "modelGateway": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "protocols": { "$ref": "#/$defs/protocols" },
+        "baseUrl": { "type": "string", "pattern": "^https?://" },
+        "costRates": {
+          "type": "object",
+          "additionalProperties": { "type": "number", "minimum": 0 },
+          "oneOf": [
+            { "required": ["Input", "Output", "CacheRead"] },
+            { "required": ["input", "output", "cache_read"] }
+          ],
+          "$comment": "唯一计费载体：人民币元/百万 token 倍率。三段必须齐全（缺则成本积分静默不记）。优先 PascalCase。"
+        },
+        "externalModelID": {
+          "type": "string",
+          "pattern": "^[0-9]+$",
+          "$comment": "灵枢内部雪花 ID，字符串化。数据集不要填（兰台不可知）。"
+        },
+        "timeConfig": { "type": "object", "$comment": "时段系数；形如 { default_ttl_minutes, context_tiers, turn_tiers }。" },
+        "contextTiers": { "type": "array", "$comment": "上下文分档规则。" },
+        "convertEnabled": { "type": "boolean" },
+        "convertTargets": { "type": "array", "items": { "type": "string" } },
+        "costCurrency": { "enum": ["CNY", "USD"], "$comment": "模型级币种覆盖，一般不必填。" },
+        "offers": { "type": "array", "items": { "$ref": "#/$defs/offer" } }
+      },
+      "$comment": "本格模型若既无 protocols、又无 baseUrl、又无 externalModelID>0，会被灵枢整条丢弃（含价格）。模型级不支持 requestHeaders（会被静默忽略），请求头策略只能配在 provider 级。"
+    },
+
+    "offer": {
+      "type": "object",
+      "required": ["kind", "label", "effect"],
+      "additionalProperties": true,
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": ["first_purchase", "time_limited", "renewal", "invite_discount", "free_quota", "flash_sale"],
+          "$comment": "开放枚举：灵枢遇未知 kind 整条忽略、不报错。"
+        },
+        "label": { "type": "string", "minLength": 1 },
+        "eligible": { "type": "string", "enum": ["new_user", "existing_user", "invitee", "all"] },
+        "window": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "start": { "type": "string" },
+            "end": { "type": "string" }
+          },
+          "$comment": "日期 YYYY-MM-DD 或带时区时间戳。kind=time_limited/flash_sale 时 end 必填。"
+        },
+        "effect": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": true,
+          "properties": {
+            "priceOverride": {
+              "type": "object",
+              "additionalProperties": { "type": "number", "minimum": 0 },
+              "properties": {
+                "input": { "type": "number", "minimum": 0 },
+                "output": { "type": "number", "minimum": 0 },
+                "cache_read": { "type": "number", "minimum": 0 }
+              },
+              "$comment": "人民币元/百万 token，与 costRates 同口径，可直接替换 costRates。"
+            },
+            "discount": {
+              "type": "object",
+              "required": ["mode", "value"],
+              "additionalProperties": false,
+              "properties": {
+                "mode": { "type": "string", "enum": ["percent", "amount"] },
+                "value": { "type": "number", "minimum": 0 }
+              },
+              "$comment": "percent：折让百分比（50 = 五折）；amount：立减元。"
+            },
+            "quota": {
+              "type": "object",
+              "required": ["unit", "amount"],
+              "additionalProperties": false,
+              "properties": {
+                "unit": { "type": "string", "enum": ["token", "credit", "afp", "call"] },
+                "amount": { "type": "number", "minimum": 0 },
+                "period": { "type": "string", "enum": ["total", "day", "week", "month"] }
+              }
+            },
+            "priceOverrideTiers": { "type": "array", "$comment": "续费价分档（可选）。" }
+          },
+          "$comment": "四选一互斥，多给时按 priceOverride > discount > quota 优先。"
+        },
+        "limit": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "quantity": { "type": "integer", "minimum": 0 },
+            "remaining": { "type": "integer", "minimum": 0 }
+          },
+          "$comment": "限量抢购 / 名额上限。kind=flash_sale 时 quantity 必填。"
+        },
+        "note": { "type": "string" },
+        "source": { "type": "string", "$comment": "来源 URL，用于溯源。" },
+        "asOf": { "type": "string", "$comment": "该优惠信息的采信日，YYYY-MM-DD。" }
+      }
+    }
+  }
+}
