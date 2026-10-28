@@ -3,6 +3,7 @@
 > 交付人：Ark（架构）｜派工：hugo（夜班 P0-①，仅文档，不改代码不部署）
 > 正本：`docs/preset-pack-format.md`（字段口径）＋ `docs/preset-pack-format.schema.json`（JSON Schema 参考实现）
 > 本文档 = 四条结论的落地说明 + 兼容性验证证据 + 拉取验收勾选表。
+> **rev.1（2026-10-28）**：按 Core 只读核实结果修订 S2 / S5 相关口径，见 2.6。
 
 ---
 
@@ -10,8 +11,8 @@
 
 | # | 交付件 | 结论 |
 |---|---|---|
-| 1 | 数据集 schema | v0.2 草案定稿，四件套齐：字段表（含**必填性 / 灵枢是否消费**两列）、枚举容忍表、校验规则（必失败 V1–V7 / 静默出问题 S1–S7）、JSON Schema 参考实现。**兰台可直接冻结**。 |
-| 2 | 定价口径 | 数据集价格 = **人民币元/百万 token 倍率**；真正计费的载体是 `models.<m>.gateway.costRates`（**不是** v1 的 `cost`）；币种用 `gateway.costCurrency: "CNY"` 标注，**缺省按 USD**（保证无损读 models.dev 原包），数据集层强制 CNY。**不走 `billing.cny_rate`**。 |
+| 1 | 数据集 schema | v0.2 草案定稿，四件套齐：字段表（含**必填性 / 灵枢是否消费**两列）、枚举容忍表、校验规则（必失败 V1–V8 / 静默出问题 S1–S7）、JSON Schema 参考实现。**兰台可直接冻结**。 |
+| 2 | 定价口径 | 数据集价格 = **人民币元/百万 token 倍率**；真正计费的载体是 `models.<m>.gateway.costRates`（**不是** v1 的 `cost`）；币种用 `gateway.costCurrency: "CNY"` 标注——**该字段灵枢完全不消费（纯标注）**，数据集层强制 CNY 只为消歧，不写也不会改变任何金额；**真正要命的是数值本身必须是人民币字面量**。**不走 `billing.cny_rate`**。 |
 | 3 | 新字段兼容性 | **兼容**。灵枢全仓 0 处 `DisallowUnknownFields`，未知字段静默忽略。`offers` 放 `gateway.offers`，**0.1.0 先摆字段位留空 `[]`**，无需任何灵枢改造。 |
 | 4 | 验收清单 | 见第 4 节勾选表（12 项，含 2 个负向用例）。今晚只写不执行。 |
 
@@ -87,6 +88,32 @@ R = billing.r（默认 10000）
 | `sync.price_source_url` | **美元**/百万 token | 是，× `cny_rate`（6.8）|
 
 挂错 = 人民币数字被当美元、**放大 6.8 倍**，且会经「一键应用参考价」污染对外模型售价。必须写进兰台的发布纪律。
+
+**但要分两种形态说清（`flatten()` 要求 `cost.input` 与 `cost.output` 同时存在才收录）**：
+
+| 形态 | 数据集内容 | 实际后果 |
+|---|---|---|
+| a | 只带 `gateway.costRates`（本数据集正本） | 一个带 `cost` 的模型都解析不出来 → 参考价查不到、批量同步全 Skipped，**不报错也不放大**（静默无效，白挂） |
+| b | 同时带 v1 `cost`（哪怕填的是人民币数） | 被当美元 ×6.8 写进 `sale_rates` → **虚高 6.8 倍** |
+
+⇒ a 是「白挂」、b 是「错价」，两种都要挡。
+
+### 2.6 口径修正（Core 只读核实，2026-10-28）
+
+初稿有三处事实性错误，已按代码核实结果改到正本（`docs/preset-pack-format.md` 6.5 / 9.1 / 9.4 / 11.1 / 11.2 / 11.3）：
+
+| # | 初稿说法 | 核实结果 |
+|---|---|---|
+| 1 | 「PascalCase 与 snake 之间没有转换点」 | **错**。转换点就是 `billing.WireRates.UnmarshalJSON`（`Input/Output/CacheRead` ↔ `input/output/cache_read`），预设包正走这条路径，写 PascalCase 没问题。真正的坑是**拼错键**：未知键被原样保留、不报错；且物化路径**不调用** `ValidateRates` → 缺段/错键一路落库 |
+| 2 | 「缺 `costCurrency` → 把美元当人民币 → 虚低 6.8 倍」 | **不成立**。后端全仓 `currency` 出现 0 次，`GatewayBlock`/`ModelGateway` 都没有该键，落库与 `ComputeCredits` 都没有币种分支 → 写不写、写 CNY 还是 USD，**出账金额完全相同**。真正的风险是**数值填了美元数**（虚低 6.8 倍），属数值错不是标注错 |
+| 3 | 「挂错 `sync.price_source_url` 就会 6.8 倍错价」 | **只对一半**。只带 `costRates` 时该通道静默无效（一条都拉不到、不报错）；只有同时带 v1 `cost` 才会被 ×6.8 |
+
+两条新增的「会炸」事实：
+
+- **`externalModelID` 必须写成字符串**（字段是 `json:"externalModelID,string"`）。写数字会让 `fetchPack` 整包解析失败、整次 sync 回滚 → 已登记为 **V8**。数据集本来就不该填它。
+- **`cost_credits` 静默为 0 没人会发现**：`billing/service.go` 里 `if c, cerr := ComputeCredits(...); cerr == nil { rec.CostCredits = c }` —— 不记日志、不告警。
+
+现状：以上 5 个本该报错的点，代码里**都没有执法**（见正本 11.3 的建议清单，只登记未实现）。所以本数据集只能靠 **Schema 自检 + 第 4 节验收清单**挡住，不能指望同步时报错。
 
 ---
 
@@ -174,7 +201,7 @@ R = billing.r（默认 10000）
 | ☐ | `BaseURL` | = `gateway.baseUrl` | 不一致 = 字段名拼错（大小写） |
 | ☐ | `Protocols` 键集合 | ⊆ {openai-chat, openai-responses, anthropic-messages} 且与数据集交集一致 | 多出键 = 白名单过滤异常；缺失 = 键名拼错 |
 | ☐ | `Models` 键集合 | = 数据集中**带 `protocols`** 的模型（无协议的会被丢弃，属预期） | 有价格模型未出现 = 触发 S1 |
-| ☐ | 每模型 `costRates` 三段 | 与数据集**数值逐位一致**，且三段齐全 | 缺键 = 触发 S2（计费静默失效） |
+| ☐ | 每模型 `costRates` 三段 | 与数据集**数值逐位一致**，且三段齐全、键名只允许 `Input/Output/CacheRead`（或 snake） | 缺键 = 触发 S2（计费静默失效）；键名拼错（`cache`/`Cache_Read`）同样触发 S2，且**不会**被自动纠正 |
 | ☐ | `costRates` 数值 > 0（除非官网确实免费） | 与官网人民币价同值 | 出现 6.8 的倍数关系 = 挂错 URL 或用了美元价 |
 | ☐ | 模型 `protocols` | = 数据集模型级 `protocols` | 不一致 = 继承逻辑异常 |
 
@@ -204,7 +231,7 @@ R = billing.r（默认 10000）
 ## 5. 给兰台的落地清单（照做即可）
 
 1. 按 `docs/preset-pack-format.md` 第 4/5/6 节建数据集；每 provider 必带 `gateway{baseUrl, protocols, costCurrency:"CNY", offers:[]}`。
-2. 价格填`schema` 里的 `gateway.costRates`（PascalCase，三段齐全，人民币元/百万 token）；`cost` 同值填一份用于展示。
+2. 价格填 `schema` 里的 `gateway.costRates`（PascalCase，三段齐全，**数值必须是人民币元/百万 token 的字面量**；不许照抄 models.dev 的美元数，那会虚低 6.8 倍且代码不报错）；`cost` 同值填一份用于展示。
 3. **每个带价格的模型必须至少声明一个 `protocols` 键**，否则整条会被灵枢丢弃（数据白给）。
 4. `offers` 本轮一律 `[]`；0.2.0 再按第 6.6 节填（首购价 / 限时活动 / 续费价 / 邀请折扣 / 免费额度 / 限量抢购）。
 5. 用 `docs/preset-pack-format.schema.json` 自检通过后再发布；发布 URL 只给 `preset.pack_url`。

@@ -14,7 +14,7 @@
 2. 一个 provider 条目 = models.dev v1 形状 + 扩展块 `gateway`。**所有本项目自有字段只能放 `gateway` 内**。
 3. **价格一律人民币**：`models.<m>.gateway.costRates`（三段，元/百万 token 倍率）是唯一计费载体；`cost` 是展示位。数据集必须写 `gateway.costCurrency: "CNY"`。
 4. 灵枢**忽略一切未知字段**（不会因多字段报错），但**会因为 `passthroughMode` 非法 / provider 名重复 / baseUrl 非 http(s) 而整包同步失败**（第 11 节）。
-5. 数据集 URL 只挂 `preset.pack_url`；**绝不能**挂到 `sync.price_source_url`（第 9.4 节，会 6.8 倍错价）。
+5. 数据集 URL 只挂 `preset.pack_url`；**绝不能**挂到 `sync.price_source_url`（第 9.4 节）：若数据集同时带 v1 的 `cost`，会被当美元 ×6.8 写进售价；只带 `costRates` 则参考价这条通道静默无效（一条都拉不到，不报错）。
 
 ## 1. 目的
 
@@ -198,9 +198,13 @@
 
 - 作用域：声明**同一作用域内** `cost` 与 `gateway.costRates` 的币种。provider 级为默认，模型级可覆盖。
 - 取值：`"CNY"` | `"USD"`（开放枚举，消费方遇未知值按 `CNY` 处理）。
-- **缺省（不写）= `USD`** —— 这是 models.dev v1 的原义，用来保证「直接把 `https://models.dev/api.json` 当包读进来」时不会把美元误读成人民币。
+- **语义默认值 = `USD`**（不写即按 USD 理解）—— 这是 models.dev v1 的原义，用来保证「直接把 `https://models.dev/api.json` 当包读进来」时不会把美元误读成人民币。这是**文档层约定**，不是代码行为（见下条）。
 - **本数据集必须显式写 `"CNY"`**；兰台冻结的 JSON Schema 应把 `costCurrency` 设为 **required + `const: "CNY"`**（格式层宽容两种币种，数据集层收紧到只有人民币）。
-- 灵枢当前**不解析**该字段（惰性），因此写错也不报错——它的价值是消歧，不是校验。
+- **灵枢当前完全没有币种概念，该字段是纯标注**（代码核实，2026-10-28）：
+  - 后端全仓 `currency` / `Currency` 出现 **0 次**；`GatewayBlock`（`channelprotocol/source.go`）与 `ModelGateway`（`channelprotocol/model.go`）都没有该键 → 解码时按未知字段**直接丢弃**。
+  - 落库（`channel_models.cost_rates` 原值写入）与计费（`billing.ComputeCredits` = `tokens × rate ÷ R`）**都没有任何币种分支**。
+  - ⇒ 写不写、写 `"CNY"` 还是 `"USD"`，**落库数值与出账金额完全相同**。「缺 `costCurrency` → 把美元当人民币 → 虚低 6.8 倍」这条因果链在代码里不成立；真正的 6.8 只存在于 `sync.price_source_url` 那条链路（9.4）。
+  - ⇒ 因此：它是**消歧标注，不是计费风险点**，也没有任何执法点（不校验、不报错）。真正的风险是**数值币种填错**（把美元数当人民币填进 `costRates`），见 9.1「数值硬约束」。
 
 ### 6.6 `offers`（优惠方式，v0.2 新增字段位）
 
@@ -279,11 +283,22 @@
 | 项 | 规定 |
 |---|---|
 | 位置 | `models.<modelKey>.gateway.costRates` |
-| 键 | **PascalCase**：`Input` / `Output` / `CacheRead`（snake `input/output/cache_read` 也接受，兰台统一输出 PascalCase） |
+| 键 | **PascalCase**：`Input` / `Output` / `CacheRead`（snake `input/output/cache_read` 同样接受；兰台统一输出 PascalCase）。**只有这两套键名会被归一化，别的键原样保留、不报错**（见下方「键归一化」） |
 | 语义 | **人民币元 / 百万 token 的倍率**（无单位纯数字，照抄官网人民币价） |
-| 完整性 | **三段必须齐全**（缺任一 → 不报错，但成本积分静默不记，见 11.2） |
-| 取值 | 非负浮点；未知多余键允许（透传，不参与计费） |
+| 数值 | **必须是人民币元/百万 token 的字面量**（如 `0.8` / `2.8` / `0.23`）。代码不识别单位、不做任何换算：从 models.dev 照抄美元数进来，就会按人民币出账 → **虚低 6.8 倍**。这是**数值错，不是标注错**，当前无代码执法点 |
+| 完整性 | **三段必须齐全**（缺任一 → 不报错，但成本积分静默不记，见 11.2 S2） |
+| 取值 | 非负浮点；未知多余键允许（原样透传落库，不参与计费） |
 | 汇率 | **不乘任何汇率**，直接落 `channel_models.cost_rates` |
+
+**键归一化（唯一转换点）**：`billing.WireRates.UnmarshalJSON`（`backend/internal/domain/billing/rates.go`）把 `Input` / `Output` / `CacheRead` 归一为内部 `input` / `output` / `cache_read`，snake 键同样接受。预设包解的就是这条路径（`channelprotocol/model.go` 的 `CostRates billing.WireRates`）—— 所以「PascalCase 与 snake 之间没有转换点」是**错的**，按本格式写 PascalCase 不会出问题。
+真正的坑是**拼错键**：该函数对未知键「原样保留、不报错」，写 `cache` / `Cache_Read` / `inputTokens` 不会被纠正，只会让 `cache_read` 缺席 → 直接落进 S2。
+
+**为什么「缺段 / 拼错键」在同步阶段完全无感**（代码核实，2026-10-28）：
+
+1. 物化路径 `channel/service.go` 的 `materializeFromProtocol` 是 `CostRates: billing.Rates(mg.CostRates)` 直接落库，**从不调用 `billing.ValidateRates`**；`ValidateRates` 只在管理端 API 路径（`channel/model_service.go` 校验成本、`model/service.go` 校验售价）被调用。所以错键会一路进 `channel_models.cost_rates`。
+2. 计费时 `ComputeCredits` 会因缺键报错，但**成本侧错误被吞**：`billing/service.go` 里 `if c, cerr := ComputeCredits(...); cerr == nil { rec.CostCredits = c }` —— 既不记日志也不告警，`cost_credits` **静默为 0**，成本/毛利曲线整段为空且没人会发现。
+3. 售价侧缺键不静默：结算直接报错。
+4. 唯一会「响」的是管理员在渠道模型页手工保存该行 → 400「cost_rates 非法」。
 
 ### 9.2 `cost`（v1 位）与 `costRates` 的关系
 
@@ -316,9 +331,18 @@ R = billing.r（默认 10000）
 | `preset.pack_url` | **本数据集** | 人民币倍率 | 否 |
 | `sync.price_source_url` | models.dev `api.json` | **美元**/百万 token | 是：× `billing.cny_rate`（默认 6.8）|
 
-`sync.price_source_url` 拉到的 `cost` 会被当作美元，× cny_rate 后成为「参考价」，并可通过「一键应用参考价」写入对外模型的 `sale_rates`（售价倍率）。
+`sync.price_source_url` 拉到的 `cost` 会被当作美元，× cny_rate 后成为「参考价」，并可通过「一键应用参考价」写入对外模型的 `sale_rates`（售价倍率）；同一份 ×6.8 的数值也进价格变更告警基线（不落售价）。
 
-⇒ **把本数据集挂到 `sync.price_source_url` 会把人民币数字当美元、放大 6.8 倍，并可能污染售价。这是硬红线。**
+链路（代码核实，2026-10-28）：`internal/config` 的 `Sync.PriceSourceURL` → `cmd/server/main.go` 注入 `sync.NewSyncer` → `internal/domain/sync/source.go` 按 models.dev 形状解析 `cost.input/output/cache_read`，**硬编码按美元/百万 token 理解、无任何单位识别**；`priceRefAdapter.ReferencePrice` 里 `p.Pricing.Prompt × cny_rate`（默认 `6.8`，由 `internal/seeding/seed.go` 种下、`billing/service.go` 读配置）→ `model/service.go`（ApplyPrice / SyncPrices）→ `model/store.go` 的 `UPDATE external_models SET sale_rates`。
+
+**挂错 URL 的实际后果分两种，别混为一谈**（`flatten()` 要求 `cost.input` 与 `cost.output` **同时存在**才收录，否则跳过该模型）：
+
+| 形态 | 数据集内容 | 后果 |
+|---|---|---|
+| a | 只带 `gateway.costRates`（本数据集正本） | 一个带 `cost` 的模型都解析不出来 → 参考价永远查不到、批量同步全 Skipped。**不报错、也不放大**（静默无效，白挂） |
+| b | 同时带 v1 的 `cost`（哪怕填的是人民币数） | 被当美元 ×6.8 写进售价 → **虚高 6.8 倍**。这才是真正的放大 |
+
+⇒ 硬红线不变：**本数据集只能挂 `preset.pack_url`，绝不能挂 `sync.price_source_url`**。形态 a 是「白挂」，形态 b 是「错价」，两种都要在发布纪律里挡住。
 
 ### 9.5 完整样例：`glm-5.3-flash`
 
@@ -386,7 +410,7 @@ R = billing.r（默认 10000）
 | `models.*.type` / `modalities.*` | 开放（v1 原文封闭） | 不解析 | **不报错** |
 | `models.*.status` / `reasoning_options` | 开放 | 不解析 | **不报错** |
 | `gateway.offers[].kind` / `quota.unit` | 开放 | 不解析 | **不报错**（整条忽略） |
-| `gateway.costCurrency` | 开放 | 不解析 | **不报错**（当前无消费方；未来按 CNY 兜底） |
+| `gateway.costCurrency` | 开放 | **完全不解析**（`GatewayBlock` / `ModelGateway` 都无此键） | **不报错**，也不影响任何数值（见 6.5） |
 | **`gateway.requestHeaders.passthroughMode`** | **封闭** | 校验 | **400 + 整包同步回滚** |
 | **`gateway.sourceStatus`** | **封闭** | 校验（仅 import 路径） | **400**（sync 路径强制写 `ACTIVE`，不受影响） |
 | **基础协议名**（`gateway.protocols` 归一后） | **封闭（3 个）** | 校验（物化后） | 已被白名单过滤 → 实际不可达；但若走 CRUD/import 显式写非法协议则 **400** |
@@ -407,18 +431,33 @@ R = billing.r（默认 10000）
 | V5 | `gateway.requestHeaders.passthroughMode` 非法 | 400「passthroughMode 只支持 …」 |
 | V6 | 两个 provider 物化出同名（`name` 或 `id` 重复） | 唯一索引冲突，整次回滚 |
 | V7 | provider 级 `protocols` 里 `default: true` 多于一个 | 400「至多一个默认协议」 |
+| V8 | 把 `gateway.externalModelID` 写成**数字**（该字段是 `json:"externalModelID,string"`） | 整包 JSON 解析失败、sync 报错、全部回滚（`json: cannot unmarshal number into Go struct field ...`）。数据集本来就不该填它，此条防手滑 |
 
 ### 11.2 不报错但会静默出问题（验收时必须逐项核对）
 
 | # | 情况 | 后果 |
 |---|---|---|
 | S1 | 模型条目无 `protocols` 且无 `baseUrl` 且 `externalModelID ≤ 0` | 整条模型（含价格）被丢弃 |
-| S2 | `gateway.costRates` 缺三段中任一 | 落 `channel_models` 后成本积分**静默不记**；若管理员在渠道模型页手工保存则该行 400「cost_rates 非法」 |
-| S3 | `costRates` 数值为负 | 同上（`ValidateRates` 拒绝） |
+| S2 | `gateway.costRates` 缺三段中任一，或键拼错（`cache` / `Cache_Read` / `inputTokens`） | 键归一化只认 `Input/Output/CacheRead` 与 `input/output/cache_read`，其余键**原样保留、不报错**（`WireRates.UnmarshalJSON`）；物化路径**不调用** `ValidateRates`，所以同步阶段完全无感，缺段/错键一路落进 `channel_models.cost_rates`。计费时 `ComputeCredits` 报错但被 `cerr == nil` 吞掉（不记日志、不告警）→ **成本积分静默为 0，成本/毛利曲线整段为空**。售价侧缺键则在结算时直接报错（非静默）。唯一会响的是管理员在渠道模型页手工保存该行 → 400「cost_rates 非法」 |
+| S3 | `costRates` 数值为负 | 同步阶段同 S2 静默；手工保存时 `ValidateRates` 拒绝（400） |
 | S4 | `cost` 与 `costRates` 数字不一致 | 无报错，但两处读数打架，排障困难 |
-| S5 | 忘记写 `costCurrency` | 无报错，币种被按 `USD` 理解（仅影响人读/未来消费方） |
+| S5 | 忘记写 `costCurrency` / 写成 `"USD"` | **不影响计费**：后端全仓没有币种字段与换算分支（该键解码即丢弃），落库与出账完全相同。缺省或写错只影响人读/未来消费方。真正的风险是**数值币种填错**（把美元数当人民币写进 `costRates` → 虚低 6.8 倍），见 9.1「数值」行 |
 | S6 | provider 未写 `models` | 协议物化成功但零模型 |
 | S7 | `gateway` 整块缺失 | 协议物化成功但无 `baseUrl` / `protocols`，请求不可用 |
+
+### 11.3 建议补的代码执法点（本次只登记，未改代码）
+
+上表 S2 / S5 的共同问题：**数据集的错在同步阶段没有声音**。要把它们从「靠人核对」变成「V 类必失败」，需在代码侧补以下执法点（留给 Core 排期，本文档只定口径）：
+
+| # | 位置 | 建议 | 效果 |
+|---|---|---|---|
+| E1 | `channel/service.go` 的 `materializeFromProtocol` | 落库前调用 `billing.ValidateRates`，失败即 `return error`（外层 `channelprotocol/service.go` 已是 `store.WithTx`，可整包回滚） | 缺段/错键升为 V 类，同步即失败 |
+| E2 | `channelprotocol/model.go` 的 `ModelGateway` + `source.go` 的 `GatewayBlock` | 补 `CostCurrency string \`json:"costCurrency"\``，并在 `toChannelProtocol` 校验为空或 `"CNY"` | `costCurrency` 从标注变成执法点 |
+| E3 | `billing/rates.go` 的 `WireRates.UnmarshalJSON` | 只在**预设解析入口**加严（拒绝未知键），不动管理端兼容 | 拼错键立刻报错 |
+| E4 | `billing/service.go`（`ComputeCredits` 错误被 `cerr == nil` 吞掉） | 至少记一条 warn 日志（带 model / channel） | 成本静默 0 可被发现 |
+| E5 | `channelprotocol/source.go`（`toChannelProtocol` 里无协议的模型 `continue`） | 加一条 warn 日志 | 模型被静默丢弃可被发现 |
+
+> 现状口径：E1–E5 全部**未实现**。所以本数据集必须靠「Schema 自检 + 第 4 节验收清单」挡住 S2 / S5，不能指望代码报错。
 
 ## 12. 已知限制（数据集设计时必须绕开）
 
@@ -463,6 +502,7 @@ R = billing.r（默认 10000）
 |---|---|---|
 | v0.1 | 2026-10-16 | 首版：v1 对齐 + `gateway{baseUrl,protocols,requestHeaders}` |
 | v0.2 草案 | 2026-10-28 | ① 补 `gateway.costRates` 正式口径（此前代码已支持但文档缺失）与 `costCurrency`；② 定价改为**人民币**口径并给倍率→积分算式与样例；③ 新增 `gateway.offers` 优惠字段位（兼容性已验证，见 13）；④ 各字段补**必填性 / 灵枢消费性**两列；⑤ 新增枚举容忍表（10）、校验规则（11）、已知限制（12）；⑥ 明确数据集 URL 与 `sync.price_source_url` 分离（9.4） |
+| v0.2 草案 rev.1 | 2026-10-28 | 按 Core 只读核实结果修订三处**事实性错误**：① 9.1 更正「无大小写转换点」——`WireRates.UnmarshalJSON` 就是转换点，真正的坑是拼错键被原样保留 + 物化路径不校验；② 6.5 / S5 更正「缺 `costCurrency` → 虚低 6.8 倍」——代码全无币种概念，该字段纯标注；风险在**数值**填了美元（9.1 新增「数值」硬约束）；③ 9.4 补挂错 URL 的两种后果（静默无效 / 虚高 6.8）；④ 新增 V8（`externalModelID` 必须字符串，否则整包解析失败）与 11.3（5 个建议执法点，未实现） |
 
 **未变更**：v1 字段名与两级嵌套形状、`gateway` 命名空间、协议白名单、鉴权与请求头策略规则。
 

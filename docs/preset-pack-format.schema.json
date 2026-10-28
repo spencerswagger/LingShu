@@ -57,7 +57,7 @@
         "requestHeaders": { "$ref": "#/$defs/headerPolicy" },
         "costCurrency": {
           "const": "CNY",
-          "$comment": "数据集层收紧为人民币。格式层允许 [CNY, USD]（缺省 USD，用于无损读取 models.dev api.json）。灵枢当前不解析该字段。"
+          "$comment": "数据集层收紧为人民币。格式层允许 [CNY, USD]（缺省 USD，用于无损读取 models.dev api.json）。灵枢代码完全没有币种字段与换算分支，该字段是纯标注：不写/写错都不改变落库数值与出账（真正的风险是 costRates 的数值币种，见文档 9.1）。"
         },
         "offers": {
           "type": "array",
@@ -190,7 +190,7 @@
             { "required": ["Input", "Output", "CacheRead"] },
             { "required": ["input", "output", "cache_read"] }
           ],
-          "$comment": "唯一计费载体：人民币元/百万 token 倍率。三段必须齐全（缺则成本积分静默不记）。优先 PascalCase。"
+          "$comment": "唯一计费载体：人民币元/百万 token 倍率，数值必须是人民币字面量（照抄美元数会虚低 6.8 倍）。三段必须齐全（缺则成本积分静默为 0）。键名只归一 Input/Output/CacheRead 与 input/output/cache_read，拼错键（cache/Cache_Read）会被原样保留且不报错 → 见文档 9.1 与 11.2 S2。优先 PascalCase。"
         },
         "externalModelID": {
           "type": "string",
