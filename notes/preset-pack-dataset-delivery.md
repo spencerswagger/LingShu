@@ -14,7 +14,7 @@
 | 1 | 数据集 schema | v0.2 草案定稿，四件套齐：字段表（含**必填性 / 灵枢是否消费**两列）、枚举容忍表、校验规则（必失败 V1–V8 / 静默出问题 S1–S8）、JSON Schema 参考实现。**兰台可直接冻结**。 |
 | 2 | 定价口径 | 数据集价格 = **人民币元/百万 token 倍率**；真正计费的载体是 `models.<m>.gateway.costRates`（**不是** v1 的 `cost`）；币种用 `gateway.costCurrency: "CNY"` 标注——**该字段灵枢完全不消费（纯标注）**，数据集层强制 CNY 只为消歧，不写也不会改变任何金额；**真正要命的是数值本身必须是人民币字面量**。**不走 `billing.cny_rate`**。 |
 | 3 | 新字段兼容性 | **兼容**。灵枢全仓 0 处 `DisallowUnknownFields`，未知字段静默忽略。`offers` 放 `gateway.offers`，**0.1.0 先摆字段位留空 `[]`**，无需任何灵枢改造。 |
-| 4 | 验收清单 | 见第 4 节勾选表（24 项，含 2 个负向用例 + 1 条字段形态检查）。今晚只写不执行。 |
+| 4 | 验收清单 | 见第 4 节勾选表（25 项，含 2 个负向用例 + 1 条字段形态检查 + 1 条空包拦截）。今晚只写不执行。 |
 
 ---
 
@@ -190,6 +190,7 @@ R = billing.r（默认 10000）
 |---|---|---|---|
 | ☐ | `preset.pack_url` 已指向数据集 URL，且**不等于** `sync.price_source_url` | 两个 URL 不同 | 相同 = 红线违规，停止验收 |
 | ☐ | 数据集中已写入 `gateway.costCurrency: "CNY"` | 每个 provider 都有 | 缺失 = 币种歧义，退回兰台 |
+| ☐ | 数据集**非空包**：顶层 provider 数 ≥ 1 | ≥ 1 个 | 空包（`{}` 或 0 个 provider）**不是「无变化」**：sync 会把现有**全部 ACTIVE 协议翻成 `STALE`**（`channelprotocol/service.go:446-461`，正本 §11.1 V9）→ 阻断，不许 sync |
 | ☐ | 数据集能被 `GET` 到且返回 200 + `application/json` | 200 | 非 200 / HTML 错误页 = 阻断 |
 | ☐ | 数据集中**不出现** `externalModelID`（若出现必须是字符串） | 无该字段 | 写成数字 = 整包解析失败、sync 全回滚（V8，已实测） |
 | ☐ | 用 `docs/preset-pack-format.schema.json` 校验数据集 | 0 error | 有 error = 退回兰台修 |
