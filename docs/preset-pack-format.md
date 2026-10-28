@@ -15,6 +15,49 @@
 3. **价格一律人民币**：`models.<m>.gateway.costRates`（三段，元/百万 token 倍率）是唯一计费载体；`cost` 是展示位。数据集必须写 `gateway.costCurrency: "CNY"`，且**数值必须是人民币字面量**——代码不做任何单位/币种换算，把美元数填进来就按人民币出账（虚低 6.8 倍，第 9.1）。
 4. 灵枢**忽略一切未知字段**（不会因多字段报错），但**会因为 `passthroughMode` 非法 / provider 名重复 / baseUrl 非 http(s) / `externalModelID` 写成数字而整包同步失败**（第 11 节）。
 5. 数据集 URL 只挂 `preset.pack_url`；**绝不能**挂到 `sync.price_source_url`（第 9.4 节）：若数据集同时带 v1 的 `cost`，会被当美元 ×6.8 写进售价；只带 `costRates` 则参考价这条通道静默无效（一条都拉不到，不报错）。
+6. **兰台冻结 Schema 前必读 §0.1「冻结前 5 项规范」**：协议词表、模型必须内联、`pack_url` 是指针、providerId 命名、最小必备集——每条一个唯一结论。
+
+## 0.1 冻结前 5 项规范（兰台用 · 冻结 JSON Schema 前必读）
+
+> 每条一个唯一结论，不做选项讨论。标「约定」的属格式约定、**无代码执法**；标「代码」的可追到文件:行（2026-10-28 核实/实测）。
+
+### F1 协议词表（`gateway.protocols` 的键）
+
+- **允许的精确字符串全集（只有 3 个）**：`openai-chat`、`openai-responses`、`anthropic-messages`；另接受历史别名 `openai-compat`，归一为 `openai-chat`。
+- **大小写敏感、只做精确匹配**：`OpenAI-Chat`、`openai_chat`、`azure-openai` 均**不被接受**（实测归一后 `isBase=false`）。冻结时 `propertyNames` 收紧为上面 3 值枚举，别名**不要**写进 Schema（只在读旧包时容忍）。
+- **未知值的降级**：物化时**静默丢弃该键**（白名单过滤，不报错、也不回落到任何默认值）；若某 provider 的协议键被丢完 → 该协议物化为空协议集 → **不匹配任何入站协议**（等于不可用，但同步成功、无报错）。
+- 依据：`channelprotocol/model.go:19-21`（常量）、`model.go:29-44`（`Canonical` / `IsBaseProtocol`）、`source.go:78`（`canonicalProtocols` 白名单）、`gateway/protocol.go:187-189`（空协议集 `return nil`）。
+
+### F2 模型是内联还是引用
+
+- **唯一答案：内联完整对象。** 不允许 `$ref`，也不允许只写模型 id 字符串。
+- 依据（代码 + 实测）：`Models map[string]Model`（`channelprotocol/source.go:23`）。写字符串 → **整包解析失败、整次 sync 回滚**（`json: cannot unmarshal string into Go struct field … of type channelprotocol.Model`）；写 `{"$ref": …}` → 解析成零值 Model，再被保活规则（`source.go:63`）**静默丢弃**，模型凭空消失。
+- 冻结要求：模型值必须 `type: object`、`required: ["id"]`，**显式禁止** string 与 `$ref`。
+
+### F3 `pack_url` 是指针还是快照
+
+- **唯一答案：指针。** 每次 sync 都重新 GET（无 ETag / If-Modified-Since，只判 HTTP 200），因此**数据集永远代表"当前真相"，不是增量补丁**——兰台不要把包做成 diff。
+- 版本怎么体现：**靠 URL 路径**（如 `/v0.2/pack.json`）；包内写 `packVersion` 可以有，但灵枢**不读**（惰性字段）。**约定，非代码约束。**
+- 是否覆盖已落库：判据全在灵枢侧的 `edited` 标记，与版本无关——未编辑 → 直接覆盖；已编辑 → `confirm=false` 只返回 Pending 差异、`confirm=true` 才覆盖；预设中已消失的条目 → 标 `STALE` **不删除**。
+- 依据：`channelprotocol/source.go:115-119`（`fetchPack` 只校验状态码）、`channelprotocol/service.go:375+`（`Sync` 三分支）、`store.InitialSynced`（首启只跑一次）。
+
+### F4 providerId 命名约束 + 与 models.dev 冲突
+
+- **允许自定义，但必须全局唯一、非空**：它落 `channel_protocols.preset_source_id`，库上有部分唯一索引（`db/migrations/0008_*.sql`）。`id` 与顶层键请保持一致（不一致时以条目内 `id` 为准，重复会让整包因唯一索引冲突回滚）。
+- **约定（非代码约束）**：`^[a-z0-9][a-z0-9._-]{0,63}$`——**不用空格、不用中文**。中文技术上能落库（列是 TEXT），但会进导出键、日志、URL；展示用中文请放 `name`（`name` 允许中文/空格，但**必须全局唯一**，`0007_*.sql` 的 `uq_channel_protocols_active`）。
+- **与 models.dev 同名 provider：不存在冲突面，无需"覆盖还是跳过"**。灵枢没有内建 provider 表，数据集是 provider 的唯一来源；models.dev 的 provider 名只在 `sync.price_source_url` 那条价格目录链路里当展示名，两条链路不相交。⇒ 数据集 `id` 即权威。
+- 唯一的真实冲突：两个 provider 物化出**同一个 `name`** → 唯一索引冲突，**整包回滚**（V6）。
+
+### F5 最小必备集（缺哪个直接拒收）
+
+| 层级 | 最小必备 | 缺失后果 |
+|---|---|---|
+| 顶层 | ≥1 个 provider，值为对象 | 空对象 → 同步 0 条（不算错，但白跑） |
+| provider | `id`（非空）、`gateway.baseUrl`（`http(s)://` 开头）、`gateway.protocols`（≥1 个合法协议键） | `id` 与 `name` 同时空 → **400 整包回滚**（V3）；baseUrl 非 http(s) → **400 回滚**（V4）；protocols 缺/全被过滤 → 不报错但该协议**不可用**（F1）；`name` 与他条重复 → **回滚**（V6） |
+| 模型（要参与计价的） | `id`、`gateway.protocols`（≥1）、`gateway.costRates`（`Input/Output/CacheRead` 三段齐全、人民币字面量） | 缺协议 → **静默丢弃整条**（S1）；缺任一段/拼错键 → 成本积分**静默 0**（S2）；`externalModelID` 写成数字 → **整包解析失败回滚**（V8） |
+
+- 补充：`name` / `description` 是 models.dev v1 对齐要求，Schema 里设 `required`；但灵枢**不读**它们（惰性，见 §5）。
+- 真正会「整包拒收」的只有 4 条：V3（id+name 同时空）、V4（baseUrl 非 http）、V6（name 重复）、V8（`externalModelID` 非字符串）。其余缺失都是「不报错但不可用」，必须在验收清单逐项核对（`notes/preset-pack-dataset-delivery.md` §4）。
 
 ## 1. 目的
 
@@ -25,7 +68,7 @@
 1. **对齐 models.dev v1**：provider / model 的字段名、两级嵌套形状、单位一律沿用 v1，不另造同义字段；v1 字段即使灵枢不消费，也**原样保留**以保证可无损读入 `api.json`。
 2. **扩展隔离**：本项目自有字段统一放进 `gateway` 命名空间，避免与 models.dev 现有 / 未来字段冲突。
 3. **可覆盖**：包内值是「默认值」，渠道协议 / 渠道 / 渠道-模型可逐层覆盖。
-4. **开放枚举**：`modalities`、`type`、`gateway.protocols` 的键在本格式内按开放枚举处理，消费方遇未知值应**透传 / 忽略而非报错**。注意 v1 原文的 `modalities` / `type` 是封闭枚举，开放对待是本项目消费策略，非 v1 语义。
+4. **开放枚举**：`modalities`、`type`、`gateway.protocols` 的键在本格式内按开放枚举处理，消费方遇未知值应**透传 / 忽略而非报错**（`protocols` 的未知键是被**白名单丢弃**，不回落默认值，见 §0.1 F1）。注意 v1 原文的 `modalities` / `type` 是封闭枚举，开放对待是本项目消费策略，非 v1 语义。
 5. **币种单一（v0.2 新增）**：本格式的价格**只有人民币一种口径**，不含美元、不涉及汇率。`gateway.costCurrency` 是这一点的显式声明位。
 6. **未知字段必容忍（v0.2 新增）**：消费方对任何不认识的键一律忽略；新增字段**不得**要求消费方改代码才能读取旧数据集。反向也成立：兰台可在 `gateway` 内先行摆字段位（留空），不会影响灵枢。
 
@@ -509,6 +552,7 @@ R = billing.r（默认 10000）
 | v0.1 | 2026-10-16 | 首版：v1 对齐 + `gateway{baseUrl,protocols,requestHeaders}` |
 | v0.2 草案 | 2026-10-28 | ① 补 `gateway.costRates` 正式口径（此前代码已支持但文档缺失）与 `costCurrency`；② 定价改为**人民币**口径并给倍率→积分算式与样例；③ 新增 `gateway.offers` 优惠字段位（兼容性已验证，见 13）；④ 各字段补**必填性 / 灵枢消费性**两列；⑤ 新增枚举容忍表（10）、校验规则（11）、已知限制（12）；⑥ 明确数据集 URL 与 `sync.price_source_url` 分离（9.4） |
 | v0.2 草案 rev.1 | 2026-10-28 | 按 Core 只读核实结果修订三处**事实性错误**：① 9.1 更正「无大小写转换点」——`WireRates.UnmarshalJSON` 就是转换点，真正的坑是拼错键被原样保留 + 物化路径不校验；② 6.5 / S5 更正「缺 `costCurrency` → 虚低 6.8 倍」——代码全无币种概念，该字段纯标注；风险在**数值**填了美元（9.1 新增「数值」硬约束）；③ 9.4 补挂错 URL 的两种后果（静默无效 / 虚高 6.8）；④ 新增 V8（`externalModelID` 必须字符串，否则整包解析失败）与 11.3（5 个建议执法点，未实现） |
+| v0.2 草案 rev.3 | 2026-10-28 | 新增 **§0.1 冻结前 5 项规范（兰台用）**：协议词表精确全集与降级、模型必须内联（禁止 `$ref`/字符串）、`pack_url` 是指针且靠 URL 路径版本化、providerId 命名约定与「与 models.dev 无冲突面」、最小必备集与 4 条真拒收。全部结论挂文件:行或标「约定，非代码约束」 |
 | v0.2 草案 rev.2 | 2026-10-28 | 补齐 Core 的 4 条必写条款与「断言可追溯」：① 全篇「会报错 / 会放大 / 会静默」的断言统一补 `文件:行`（V8→`model.go:101`；S1→`source.go:63`；S2→`rates.go:93`+`service.go:379`+`billing/service.go:300-302`+`model_service.go:43`；9.4→`sync/source.go:46`+`main.go:744-766`；13.2 六条→行号）；② 更正两处**表述不精确**：`grep -i currency` 并非 0 命中（命中全是 `Concurrency`）、`ValidateRates` 并非「只在管理端被调用」（`billing/engine.go:19/29` 在计费计算时也调）；③ 新增 **S8**（数据集误挂 `price_source_url` 的两种静默形态）；④ V8 补**实测**错误串；⑤ 11.3 执法点按 Core 点名重排为 E1–E6（E5 = 本文档已落地的 4 条文档口径），并同步登记 `docs/pending-tasks.md` |
 
 **未变更**：v1 字段名与两级嵌套形状、`gateway` 命名空间、协议白名单、鉴权与请求头策略规则。

@@ -6,6 +6,10 @@
   "$comment": "分层说明：本 schema 校验的是「兰台产出的数据集」，因此对生产方收紧；消费方（灵枢）对未知字段的容忍义务在文档第 10 节，两者不矛盾。若要用它校验 models.dev 原始 api.json：需去掉 provider.required 里的 gateway、放开 gatewayBlock 的 required，并把 costCurrency 改回 enum [CNY, USD]（缺省 USD）。",
   "type": "object",
   "minProperties": 1,
+  "propertyNames": {
+    "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+    "$comment": "约定（非代码约束）：provider 键建议低字母+数字+. _ -，不放空格与中文，且与条目内 id 一致。中文技术上可落库（列为 TEXT），但会进导出键/日志/URL；展示用中文放 name。"
+  },
   "additionalProperties": { "$ref": "#/$defs/provider" },
 
   "$defs": {
