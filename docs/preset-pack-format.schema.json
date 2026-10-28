@@ -195,7 +195,7 @@
         "externalModelID": {
           "type": "string",
           "pattern": "^[0-9]+$",
-          "$comment": "灵枢内部雪花 ID，字符串化。数据集不要填（兰台不可知）。"
+          "$comment": "灵枢内部雪花 ID，必须以字符串给出：Go 侧 tag 是 json:\"externalModelID,string\"，写成数字会整包解析失败、整次 sync 回滚（文档 11.1 V8，已实测）。数据集本来就不该填它（兰台不可知）。"
         },
         "timeConfig": { "type": "object", "$comment": "时段系数；形如 { default_ttl_minutes, context_tiers, turn_tiers }。" },
         "contextTiers": { "type": "array", "$comment": "上下文分档规则。" },

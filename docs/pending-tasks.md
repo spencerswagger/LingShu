@@ -27,3 +27,24 @@
 - **交付记录**：
   - 后端：分支 `feat/billing-detail-request-trace`，PR #63（OPEN，等 spencer 合入）；实现笔记 `notes/billing-detail-reqparams.md`；
   - 已定口径：列表 `Total` = 请求数（前端文案同步）；开发者端保留 `channel_name` 显示名，但必须按白名单返回。
+
+---
+
+## [P1] 渠道预设包 · 5 个代码执法点待拍板（2026-10-28）
+
+- **背景**：`docs/preset-pack-format.md` v0.2（PR #64）已把数据集的字段口径写死，但其中「缺段 / 拼错键 / 数值填美元 / 误挂价格源」四类错在**同步阶段完全没有声音**（S2、S5、S8）。Core 只读核实后点名 5 个执法点；这份清单只登记，**今晚不写代码**，等 spencer 拍板后再排期。
+- **验收标准**（每条独立可验收）：
+  1. `channel/service.go:359-385` 的 `materializeFromProtocol` 在落库前调用 `billing.ValidateRates`，失败即 `return error` —— 因 `channelprotocol/service.go` 的 `Sync` 已在 `store.WithTx` 内，可整包回滚；效果：S2/S3 从静默升为同步失败。
+  2. `channelprotocol/source.go:36` 的 `GatewayBlock` 与 `channelprotocol/model.go:97` 的 `ModelGateway` 补 `costCurrency` 字段（`json:"costCurrency"`，字符串），并在 `toChannelProtocol` 校验空值 / 非 `"CNY"`；效果：`costCurrency` 由纯标注变为执法点。
+  3. `billing/rates.go:93` 的 `WireRates.UnmarshalJSON` **只在预设解析入口**对未知键加严（拒绝）；**不得**改动管理端既有 Pascal/snake 双向兼容；效果：拼错键（`Cache_Read` / `inputTokens`）立刻报错。
+  4. `billing/service.go:300-302` 的 `cerr`（`ComputeCredits` 成本侧错误被 `err == nil` 吞掉）补一条 warn 日志，带 model / channel；效果：成本积分静默为 0 可被发现。
+  5. 文档口径四条（V8 / S2 / S5 / S8 与 9.1「数值必须是人民币字面量」）已写进 `docs/preset-pack-format.md` v0.2，作为兰台冻结 Schema 的依据；本条无需改代码，仅确认口径。
+- **约束**：
+  - 纯后端改动，走特性分支 + PR；**不合入 main**（合入权在 spencer）。
+  - 第 3 条**只能**在预设解析入口加严，改动 `UnmarshalJSON` 本身会波及管理端与历史数据兼容，属回归高风险。
+  - 不改计费公式、不动 `billing.r` / `billing.cny_rate` 语义。
+- **状态**：待确认（需 spencer 拍板；今晚不写代码）
+- **负责人**：待定（Core 排期；口径由 Ark 维护）
+- **交付记录**：
+  - 口径正本：`docs/preset-pack-format.md` v0.2 §11.1 / §11.2 / §11.3，PR #64；
+  - 执法点编号对齐：E1≈第1条、E2≈第2条、E3≈第3条、E4≈第4条、E5≈第5条（文档）、E6=附带建议（无协议模型 `continue` 加 warn）。

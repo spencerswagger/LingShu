@@ -11,10 +11,10 @@
 
 | # | 交付件 | 结论 |
 |---|---|---|
-| 1 | 数据集 schema | v0.2 草案定稿，四件套齐：字段表（含**必填性 / 灵枢是否消费**两列）、枚举容忍表、校验规则（必失败 V1–V8 / 静默出问题 S1–S7）、JSON Schema 参考实现。**兰台可直接冻结**。 |
+| 1 | 数据集 schema | v0.2 草案定稿，四件套齐：字段表（含**必填性 / 灵枢是否消费**两列）、枚举容忍表、校验规则（必失败 V1–V8 / 静默出问题 S1–S8）、JSON Schema 参考实现。**兰台可直接冻结**。 |
 | 2 | 定价口径 | 数据集价格 = **人民币元/百万 token 倍率**；真正计费的载体是 `models.<m>.gateway.costRates`（**不是** v1 的 `cost`）；币种用 `gateway.costCurrency: "CNY"` 标注——**该字段灵枢完全不消费（纯标注）**，数据集层强制 CNY 只为消歧，不写也不会改变任何金额；**真正要命的是数值本身必须是人民币字面量**。**不走 `billing.cny_rate`**。 |
 | 3 | 新字段兼容性 | **兼容**。灵枢全仓 0 处 `DisallowUnknownFields`，未知字段静默忽略。`offers` 放 `gateway.offers`，**0.1.0 先摆字段位留空 `[]`**，无需任何灵枢改造。 |
-| 4 | 验收清单 | 见第 4 节勾选表（12 项，含 2 个负向用例）。今晚只写不执行。 |
+| 4 | 验收清单 | 见第 4 节勾选表（24 项，含 2 个负向用例 + 1 条字段形态检查）。今晚只写不执行。 |
 
 ---
 
@@ -105,15 +105,25 @@ R = billing.r（默认 10000）
 | # | 初稿说法 | 核实结果 |
 |---|---|---|
 | 1 | 「PascalCase 与 snake 之间没有转换点」 | **错**。转换点就是 `billing.WireRates.UnmarshalJSON`（`Input/Output/CacheRead` ↔ `input/output/cache_read`），预设包正走这条路径，写 PascalCase 没问题。真正的坑是**拼错键**：未知键被原样保留、不报错；且物化路径**不调用** `ValidateRates` → 缺段/错键一路落库 |
-| 2 | 「缺 `costCurrency` → 把美元当人民币 → 虚低 6.8 倍」 | **不成立**。后端全仓 `currency` 出现 0 次，`GatewayBlock`/`ModelGateway` 都没有该键，落库与 `ComputeCredits` 都没有币种分支 → 写不写、写 CNY 还是 USD，**出账金额完全相同**。真正的风险是**数值填了美元数**（虚低 6.8 倍），属数值错不是标注错 |
-| 3 | 「挂错 `sync.price_source_url` 就会 6.8 倍错价」 | **只对一半**。只带 `costRates` 时该通道静默无效（一条都拉不到、不报错）；只有同时带 v1 `cost` 才会被 ×6.8 |
+| 2 | 「缺 `costCurrency` → 把美元当人民币 → 虚低 6.8 倍」 | **不成立**。`grep -rn -i currency --include=*.go` 的命中**全是 `Concurrency`（并发限流）**，没有任何币种字段或换算分支；`GatewayBlock`/`ModelGateway` 都没有该键，落库与 `ComputeCredits` 都没有币种分支 → 写不写、写 CNY 还是 USD，**出账金额完全相同**。真正的风险是**数值填了美元数**（虚低 6.8 倍），属数值错不是标注错 |
+| 3 | 「挂错 `sync.price_source_url` 就会 6.8 倍错价」 | **只对一半**。只带 `costRates` 时该通道静默无效（`sync/source.go:46` 判空后逐条 `continue`，一条都拉不到、不报错）；只有同时带 v1 `cost` 才会被 ×6.8。已登记为 **S8** |
 
 两条新增的「会炸」事实：
 
-- **`externalModelID` 必须写成字符串**（字段是 `json:"externalModelID,string"`）。写数字会让 `fetchPack` 整包解析失败、整次 sync 回滚 → 已登记为 **V8**。数据集本来就不该填它。
-- **`cost_credits` 静默为 0 没人会发现**：`billing/service.go` 里 `if c, cerr := ComputeCredits(...); cerr == nil { rec.CostCredits = c }` —— 不记日志、不告警。
+- **`externalModelID` 必须写成字符串**（`channelprotocol/model.go:101`，tag 是 `json:"externalModelID,string"`）。写数字会让 `fetchPack` 整包解析失败、整次 sync 回滚 → 已登记为 **V8**。数据集本来就不该填它。
+- **`cost_credits` 静默为 0 没人会发现**：`billing/service.go:300-302` 里 `if c, cerr := ComputeCredits(...); cerr == nil { rec.CostCredits = c }` —— 不记日志、不告警。
 
-现状：以上 5 个本该报错的点，代码里**都没有执法**（见正本 11.3 的建议清单，只登记未实现）。所以本数据集只能靠 **Schema 自检 + 第 4 节验收清单**挡住，不能指望同步时报错。
+**两处已实测（2026-10-28，一次性 `go run`，未改仓库代码）**：
+
+| 实测项 | 输入 | 结果 |
+|---|---|---|
+| `externalModelID` 数字 vs 字符串 | `{"externalModelID":123}` | 报错 `json: cannot unmarshal number into Go struct field ….externalModelID of type int64` |
+| 同上 | `{"externalModelID":"123"}` | 正常，值 123 |
+| `costRates` 键归一化 | `{"Input":0.8,"Output":2.8,"CacheRead":0.23}` | 归一 `{input,output,cache_read}`，`ComputeCredits` 无错 |
+| Schema 复跑（ajv 2020-12，5 用例） | 合规 / 加未知字段 / `externalModelID` 数字 / `costRates` 缺两段 / `costCurrency:"USD"` | 依次 通过 / 通过 / 拒绝 / 拒绝 / 拒绝，全部符合预期 |
+| 拼错键 | `{"Input":0.8,"Output":2.8,"Cache_Read":0.23}` | unmarshal **不报错**、`Cache_Read` 原样保留；`ComputeCredits` 报 `计费单价缺少键 "cache_read"`（随后被 `billing/service.go:301` 吞掉） |
+
+现状：以上 5 个本该报错的点，代码里**都没有执法**（见正本 11.3 的 E1–E4/E6，只登记未实现；已同步登记 `docs/pending-tasks.md`，状态「待确认」，等 spencer 拍板）。所以本数据集只能靠 **Schema 自检 + 第 4 节验收清单**挡住，不能指望同步时报错。
 
 ---
 
@@ -181,13 +191,14 @@ R = billing.r（默认 10000）
 | ☐ | `preset.pack_url` 已指向数据集 URL，且**不等于** `sync.price_source_url` | 两个 URL 不同 | 相同 = 红线违规，停止验收 |
 | ☐ | 数据集中已写入 `gateway.costCurrency: "CNY"` | 每个 provider 都有 | 缺失 = 币种歧义，退回兰台 |
 | ☐ | 数据集能被 `GET` 到且返回 200 + `application/json` | 200 | 非 200 / HTML 错误页 = 阻断 |
+| ☐ | 数据集中**不出现** `externalModelID`（若出现必须是字符串） | 无该字段 | 写成数字 = 整包解析失败、sync 全回滚（V8，已实测） |
 | ☐ | 用 `docs/preset-pack-format.schema.json` 校验数据集 | 0 error | 有 error = 退回兰台修 |
 
 ### 4.2 同步调用
 
 | ☐ | 检查项 | 预期值 | 失败判定 |
 |---|---|---|---|
-| ☐ | `POST /api/v1/admin/channel-protocols/sync`，body **必须显式** `{"confirm":true}` | `Code=0` | 非 0 → 记录 `Message`，对照文档第 11 节 V1–V7 |
+| ☐ | `POST /api/v1/admin/channel-protocols/sync`，body **必须显式** `{"confirm":true}` | `Code=0` | 非 0 → 记录 `Message`，对照文档第 11 节 V1–V8 |
 | ☐ | 响应 `Data.Applied` | = 数据集 provider 数（首次） | 少于预期 = 有 provider 被静默丢弃 |
 | ☐ | 响应 `Data.Pending` | 首次应为空数组 | 非空 = 有单据被判定"已编辑"，需人工确认 |
 
