@@ -3,6 +3,7 @@
 // 负责 init / setOption / 自适应 / 销毁。
 // 自适应双保险：ResizeObserver 跟容器尺寸（侧栏折叠、卡片流式布局），
 // window resize 兜底（容器尺寸没变但视口变了，如浏览器缩放手势、旋屏）。
+// window 监听是模块级共享单例（utils/chartResize），同页多张图只挂一个监听。
 import { onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue'
 import * as echarts from 'echarts/core'
 import type { EChartsCoreOption } from 'echarts/core'
@@ -14,6 +15,7 @@ import {
   DataZoomComponent,
 } from 'echarts/components'
 import { CanvasRenderer } from 'echarts/renderers'
+import { subscribeWindowResize } from '@/utils/chartResize'
 
 echarts.use([
   LineChart,
@@ -31,16 +33,7 @@ const props = defineProps<{ option: EChartsCoreOption; height?: string }>()
 const el = ref<HTMLDivElement | null>(null)
 const chart = shallowRef<echarts.ECharts | null>(null)
 let ro: ResizeObserver | null = null
-let raf = 0
-
-// 视口 resize 兜底：用 rAF 合并同一帧内的多次触发，避免 resize 抖动时反复重排。
-function onWindowResize() {
-  if (raf) return
-  raf = requestAnimationFrame(() => {
-    raf = 0
-    chart.value?.resize()
-  })
-}
+let unsubscribeResize: (() => void) | null = null
 
 onMounted(() => {
   if (!el.value) return
@@ -48,7 +41,8 @@ onMounted(() => {
   chart.value.setOption(props.option)
   ro = new ResizeObserver(() => chart.value?.resize())
   ro.observe(el.value)
-  window.addEventListener('resize', onWindowResize)
+  // 共享监听：同页所有 VChart 共用一个 window resize，卸载时各自退订
+  unsubscribeResize = subscribeWindowResize(() => chart.value?.resize())
 })
 
 watch(
@@ -58,11 +52,8 @@ watch(
 )
 
 onBeforeUnmount(() => {
-  window.removeEventListener('resize', onWindowResize)
-  if (raf) {
-    cancelAnimationFrame(raf)
-    raf = 0
-  }
+  unsubscribeResize?.()
+  unsubscribeResize = null
   ro?.disconnect()
   ro = null
   chart.value?.dispose()

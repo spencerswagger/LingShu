@@ -372,12 +372,12 @@ const miniStats = computed<MiniStat[]>(() => {
       label: '缓存命中率',
       value: hitRate === null ? '—' : fmtPct(hitRate),
       tone: hitRate !== null && hitRate >= 0.5 ? 'ok' : 'info',
-      tip: '缓存读 ÷（输入 + 缓存读），取自首屏窗口的 Usage.Total；窗口内没有输入也没有缓存读时显示 —',
+      tip: '缓存读 ÷（输入 + 缓存读）。口径 = 所选范围的日累计用量（Usage.Total），与首屏大数字的滚动窗口不同源，两者不要互相换算；没有输入也没有缓存读时显示 —',
     },
     {
       label: '输入输出比',
       value: inOut === null ? '—' : `${fmtRatio(inOut)} : 1`,
-      tip: '输入 : 输出（纯前端由 Usage.Total 计算）；输出为 0 时显示 —',
+      tip: '输入 : 输出。同样来自所选范围的日累计用量（Usage.Total），不是首屏滚动窗口；输出为 0 时显示 —',
     },
   ]
 })
@@ -488,7 +488,9 @@ interface PlazaRow {
 const plaza = computed<StatsModelPlaza | null>(() => data.value?.ModelPlaza ?? null)
 
 const plazaRows = computed<PlazaRow[]>(() => {
-  const list: StatsModelStat[] = plaza.value?.List ?? []
+  // 后端仍会追加一行 Unmatched=true 的兜底行（Model 固定 "__unmatched__"、从不置 Active），
+  // v4 第 3 条已删掉「未匹配模型」区块，这里必须过滤掉，否则展开空闲区会露出明文 __unmatched__。
+  const list: StatsModelStat[] = (plaza.value?.List ?? []).filter((m) => !m.Unmatched)
   if (!list.length) return []
   return list.map((m) => ({
     model: m.Model || m.Label || '(未命名模型)',
@@ -928,6 +930,10 @@ const modeLabel = (m: string) =>
 
         <div v-else class="live-card">
           <template v-if="userRows.length">
+            <!-- 日序列区间是整组共享的，只在表头渲染一次，不在每张卡里重复 -->
+            <div v-if="dailyRangeText" class="grid-caption">
+              迷你曲线：{{ dailyRangeText }}活跃 · 无请求日按 0
+            </div>
             <div class="xcard-grid">
               <article v-for="u in userRows" :key="u.id" class="xcard">
                 <header class="xcard-head">
@@ -954,7 +960,6 @@ const modeLabel = (m: string) =>
                 <svg v-if="u.spark" class="spark xcard-spark" viewBox="0 0 92 24" preserveAspectRatio="none">
                   <path :d="u.spark" />
                 </svg>
-                <div class="xcard-foot">{{ dailyRangeText || '暂无日序列' }}</div>
               </article>
             </div>
             <div v-if="live?.UsersTruncated" class="trunc-note">
@@ -1520,6 +1525,12 @@ const modeLabel = (m: string) =>
 .xcard-foot {
   font-size: 11px;
   color: var(--color-text-tertiary);
+}
+/* 整组共享的表头说明（日序列区间等），避免每张卡重复同一行 */
+.grid-caption {
+  font-size: 11px;
+  color: var(--color-text-tertiary);
+  margin-bottom: 8px;
 }
 .srow-dot {
   width: 8px;
