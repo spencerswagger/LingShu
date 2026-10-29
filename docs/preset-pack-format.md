@@ -41,7 +41,7 @@
 - **唯一答案：指针。** 每次 sync 都重新 GET（无 ETag / If-Modified-Since，只判 HTTP 200），因此**数据集永远代表"当前真相"，不是增量补丁**——兰台不要把包做成 diff。
 - 版本怎么体现：**靠 URL 路径**（如 `/v0.2/pack.json`）；包内写 `packVersion` 可以有，但灵枢**不读**（惰性字段）。**约定，非代码约束。**
 - 是否覆盖已落库：判据全在灵枢侧的 `edited` 标记，与版本无关——未编辑 → 直接覆盖；已编辑 → `confirm=false` 只返回 Pending 差异、`confirm=true` 才覆盖；预设中已消失的条目 → 标 `STALE` **不删除**。
-- **`pack_url` 只能指向「包本体」**（顶层 = `providerId → provider 条目`），**不要指向返回 200 的清单/指针 JSON**（如 `{"latest":"v3","versions":[…]}`）。实测（2026-10-28）三种形态：① 键值是字符串/数组 → **解析报错**（安全失败，事务不开始、不会翻 STALE）；② 键值是对象但缺 `id`/`name` → **400 V3**（回滚）；③ **键值恰好带 `id`+`name` → 被当成真实 provider 物化**，而包里其余 provider 全不在 → **其余全部翻 STALE**（最危险）。**3xx 重定向可救**：`fetchPack` 用 `http.DefaultClient`，跟随 301/302/303/307/308（默认最多 10 跳），所以 `latest.json` 只有写成「**302 跳到包本体**」才可用。
+- **`pack_url` 只能指向「包本体」**（顶层 = `providerId → provider 条目`），**不要指向返回 200 的清单/指针 JSON**（如 `{"latest":"v3","versions":[…]}`）。实测（2026-10-28，本地脚本 + Gate 步骤 3 验收，证据 `notes/pack-step3-acceptance.md`）**四种形态**：① 键值是字符串/数组 → **解析报错**（安全失败，事务不开始、不会翻 STALE）；② 键值是对象但缺 `id`/`name` → **400 V3**（回滚）；③ **键值恰好带 `id`+`name` → 被当成真实 provider 物化**，而包里其余 provider 全不在 → **其余全部翻 STALE**（最危险）；④ **整页是文档站清单页（如 `latest.json` 实链）** → 解析失败被 `writeErr` 归成**裸 `500`「服务器内部错误」**（`channelprotocol/handler.go:49-56`）：状态安全、数据一行不动，但**错误不可读**，看不出"这不是包本体"。**3xx 重定向可救**：`fetchPack` 用 `http.DefaultClient`，跟随 301/302/303/307/308（默认最多 10 跳），所以 `latest.json` 只有写成「**302 跳到包本体**」才可用。
 - 依据：`channelprotocol/source.go:115-119`（`fetchPack` 只校验状态码）、`channelprotocol/service.go:74`（`client: http.DefaultClient`，全仓未设 `CheckRedirect`）、`channelprotocol/service.go:375+`（`Sync` 三分支）、`store.InitialSynced`（首启只跑一次）。
 
 ### F4 providerId 命名约束 + 与 models.dev 冲突
@@ -483,7 +483,7 @@ R = billing.r（默认 10000）
 | V6 | 两个 provider 物化出同名（`name` 或 `id` 重复） | 唯一索引冲突，整次回滚 |
 | V7 | provider 级 `protocols` 里 `default: true` 多于一个 | 400「至多一个默认协议」 |
 | V8 | 把 `gateway.externalModelID` 写成**数字**（该字段是 `json:"externalModelID,string"`，见 `channelprotocol/model.go:101`） | 整包 JSON 解析失败、sync 报错、全部回滚。实测（2026-10-28，一次性 `go run`）：`{"externalModelID":123}` → `json: cannot unmarshal number into Go struct field … externalModelID of type int64`；`{"externalModelID":"123"}` → 正常。数据集本来就不该填它，此条防手滑 |
-| **V9** | **⚠ 高危（不报错，但会改存量）：发布空包**——顶层 `{}`，或一个 provider 都没有 | **不是「无操作」**。`Sync` 的失效标记循环（`channelprotocol/service.go:446-461`）会把 `seen` 里缺失的**现有全部 ACTIVE 协议逐个翻成 `STALE`**：返回 `Code=0`、`Applied=0`，每条被翻的都会出现在 `Pending`（Diff「预设来源已失效（保留协议）」，`Stale=true`；本来就是 STALE 的会被跳过）。协议不删、渠道不断链，但管理端整屏显示「来源已失效」。**严禁发布空包**：要下线某个 provider 请只删那一条，不要发空包 |
+| **V9** | **⚠ 高危（不报错，但会改存量）：发布空包**——顶层 `{}`，或一个 provider 都没有 | **不是「无操作」**。`Sync` 的失效标记循环（`channelprotocol/service.go:446-461`）会把 `seen` 里缺失的**现有全部 ACTIVE 协议逐个翻成 `STALE`**：返回 `Code=0`、`Applied=0`，每条被翻的都会出现在 `Pending`（Diff「预设来源已失效（保留协议）」，`Stale=true`；本来就是 STALE 的会被跳过）。协议不删、渠道不断链，但管理端整屏显示「来源已失效」。**严禁发布空包**：要下线某个 provider 请只删那一条，不要发空包。**实测（2026-10-28，Gate 在 `lingshu_test` 跑步骤 3）**：发 `{}` → **HTTP 200 / Code=0 / Applied=0 / 40 条全部翻 STALE**（原为 40 条 ACTIVE），恢复真包后 40 条全回 `ACTIVE`；整条链路**全程无报错**，只有 `Pending` 里有痕迹。证据：`notes/pack-step3-acceptance.md` |
 
 > V9 与 V1–V8 性质不同：V1–V8 是「**失败**」（报错 + 回滚，数据不变），V9 是「**成功但改存量**」。空包唯一的安全场景是「一次都没同步过」（此时 `existing` 为空，循环不执行）。
 >
@@ -561,6 +561,7 @@ R = billing.r（默认 10000）
 | v0.1 | 2026-10-16 | 首版：v1 对齐 + `gateway{baseUrl,protocols,requestHeaders}` |
 | v0.2 草案 | 2026-10-28 | ① 补 `gateway.costRates` 正式口径（此前代码已支持但文档缺失）与 `costCurrency`；② 定价改为**人民币**口径并给倍率→积分算式与样例；③ 新增 `gateway.offers` 优惠字段位（兼容性已验证，见 13）；④ 各字段补**必填性 / 灵枢消费性**两列；⑤ 新增枚举容忍表（10）、校验规则（11）、已知限制（12）；⑥ 明确数据集 URL 与 `sync.price_source_url` 分离（9.4） |
 | v0.2 草案 rev.1 | 2026-10-28 | 按 Core 只读核实结果修订三处**事实性错误**：① 9.1 更正「无大小写转换点」——`WireRates.UnmarshalJSON` 就是转换点，真正的坑是拼错键被原样保留 + 物化路径不校验；② 6.5 / S5 更正「缺 `costCurrency` → 虚低 6.8 倍」——代码全无币种概念，该字段纯标注；风险在**数值**填了美元（9.1 新增「数值」硬约束）；③ 9.4 补挂错 URL 的两种后果（静默无效 / 虚高 6.8）；④ 新增 V8（`externalModelID` 必须字符串，否则整包解析失败）与 11.3（5 个建议执法点，未实现） |
+| v0.2 草案 rev.6 | 2026-10-28 | 步骤 3 测试环境拉取验收通过后回写实测：**V9 升级为实测**（空包 → 200 / Applied=0 / 40 条全翻 STALE，非推演）；**F3 增第 ④ 种形态**（`latest.json` 这类清单页当 `pack_url` → 裸 500「服务器内部错误」，状态安全但错误不可读）。同步把 Gate 的 3 条建议登记进 `docs/pending-tasks.md`（P1 空包 400 拦 / P1 `insertOn` 绕过校验口子 / P2 裸 500 包成 400）|
 | v0.2 草案 rev.5 | 2026-10-28 | 补 `pack_url` 目标形态（兰台发布卡点）：**必须指向包本体**；3xx 会被跟随（`http.DefaultClient`），所以 `latest.json` 只有 302 到包本体才可用；把「清单/指针 JSON 直出 200」的三种实测后果写进 F3，并在 V9 补"空包的另一种来源"；F5 明确 `externalModelID` 非必填 |
 | v0.2 草案 rev.4 | 2026-10-28 | 兰台发布前防误发：新增 **§11.1 V9**（发布空包 = 把现有全部 ACTIVE 协议翻 `STALE`，不是无操作），**§0.1 顶部加发布红线**、**F5 顶层行**改写为「严禁空包」；验收清单同步加一条「provider 数 ≥1」前置拦截 |
 | v0.2 草案 rev.3 | 2026-10-28 | 新增 **§0.1 冻结前 5 项规范（兰台用）**：协议词表精确全集与降级、模型必须内联（禁止 `$ref`/字符串）、`pack_url` 是指针且靠 URL 路径版本化、providerId 命名约定与「与 models.dev 无冲突面」、最小必备集与 4 条真拒收。全部结论挂文件:行或标「约定，非代码约束」 |

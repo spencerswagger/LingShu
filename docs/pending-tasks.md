@@ -48,3 +48,22 @@
 - **交付记录**：
   - 口径正本：`docs/preset-pack-format.md` v0.2 §11.1 / §11.2 / §11.3，PR #64；
   - 执法点编号对齐：E1≈第1条、E2≈第2条、E3≈第3条、E4≈第4条、E5≈第5条（文档）、E6=附带建议（无协议模型 `continue` 加 warn）。
+
+---
+
+## [P1] 步骤 3 验收回写的 3 个代码执法点（2026-10-28）
+
+- **背景**：Gate 在 `lingshu_test` 跑完步骤 3 拉取验收（通过：`sync {"confirm":true}` → 200 / Applied=40 / Pending=[] / Stale=0，二次 sync 幂等，`costRates` 与包逐位一致、无二次换算、无静默 0）。验收同时暴露 3 个代码侧问题，均为**只登记不修**；涉及 Go 改动，**今晚不写代码**，等 spencer 拍板。证据：`notes/pack-step3-acceptance.md`。
+- **验收标准**（可分别验收）：
+  1. **P1 空包直接 400 拦**：`POST /api/v1/admin/channel-protocols/sync` 在包解析出 **0 个 provider** 时返回 400 + 可读文案，**不得**进入 Sync 事务。现状实测：空包 `{}` → HTTP 200 / Code=0 / Applied=0 / 40 条 ACTIVE 全翻 `STALE`（正本 §11.1 V9 已按实测改写），只有 `Pending` 里能看到痕迹——对管理员等于"静默事故"。
+  2. **P1 `insertOn` 绕过校验（校验口子）**：新增 provider 走 `insertOn` 时不经过 `validate()`，带 `passthroughMode:"bogus"` 的**新条目能 200 落库**；只有**已存在条目**走 `overwriteFromPreset` 才会 400 并整包回滚。要求：新建与覆盖两条路径的校验口径一致（`channelprotocol/service.go` 的 Sync 分支 + `insertOn`）。
+  3. **P2 `pack_url` 指向非包 JSON 的错误可读性**：现在 `latest.json` 这类清单页会回**裸 500「服务器内部错误」**（`channelprotocol/handler.go:49-56` 的兜底分支，因为 `fetchPack` 返回的是普通 error 而非 `APIError`）。状态码安全（数据不动），但看不出原因。建议：包成 400 + 原文（如「解析预设包 JSON 失败：期望 provider 映射，实际是清单页」）。
+- **约束**：
+  - 第 1 条会改变 `Sync` 对空包的语义（从「成功但翻 STALE」变「拒绝」），需确认**首启空包**场景（`existing` 为空时无害）仍可放行或一并拒绝。
+  - 第 2 条修完要回归「已存在条目 400 回滚」不变（事务原子性不能退化）。
+  - 第 3 条只改错误包装，不改 HTTP 状态语义之外的行为。
+- **状态**：待确认（需 spencer 拍板；涉及代码改动，今晚不写代码）
+- **负责人**：待定（Core 排期；口径由 Ark 维护）
+- **交付记录**：
+  - 正本口径：`docs/preset-pack-format.md` §11.1 V9（实测）、§0.1 F3 第 ④ 种形态；
+  - 验收证据与全部细节：`notes/pack-step3-acceptance.md`（Gate 产出）。
