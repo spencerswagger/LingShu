@@ -1061,10 +1061,17 @@ export interface SessionExpirationData {
 }
 
 // ===== 系统配置（计费 + 会话过期 + 网关白名单，统一入口）=====
+// Console 为新增的**可选**块（成本页增强视图开关，默认 false）：
+//   MultichannelTrace=true 才允许「定价曲线多线对比」和「会话渠道轨迹」两个只读入口，
+//   关闭时这两个入口返回 403，旧接口零影响。键缺失/后端未装配时按 false 处理。
+export interface SystemConsoleData {
+  MultichannelTrace: boolean
+}
 export interface SystemConfigData {
   Billing: BillingConfigData
   SessionExpiration: SessionExpirationData
   UpstreamResponseHeaderWhitelist: string[]
+  Console?: SystemConsoleData
 }
 export function getSystemConfig() {
   return http.get<SystemConfigData, ApiRes<SystemConfigData>>('/admin/configs/system')
@@ -1079,6 +1086,8 @@ export function putSystemConfig(payload: {
   }
   SessionExpiration: SessionExpirationData
   UpstreamResponseHeaderWhitelist: string[]
+  // 不传 = 不写该开关（后端老行为完全不变）；传了才落 sys_configs。
+  Console?: { MultichannelTrace?: boolean }
 }) {
   return http.put<{ Affected: number }, ApiRes<{ Affected: number }>>('/admin/configs/system', payload)
 }
@@ -1298,19 +1307,142 @@ export interface CostPricingCurveData {
   DefaultTimeCoeff: number
   Sale: CostPricingLine
   Cost: CostPricingLine
+  // 多线对比（仅传了 ChannelModelIDs 时出现，否则该键整个不出现）：每项一个 (渠道, 渠道内部模型)。
+  // Available/Reason 取**成本线**判定；未传单线参数时顶层 Cost/Sale 是「未指定」的不可用线，
+  // 多线模式一律读 Lines，不读顶层。
+  Lines?: CostPricingMultiLine[]
+}
+// 多线对比里的一条线：LineIndex 为去重后的请求顺序下标（图例排序用）；
+// ChannelModelID 是请求里给的渠道内部模型 ID（模型不存在也原样回吐，方便前端对号）。
+export interface CostPricingMultiLine {
+  LineIndex: number
+  ChannelModelID: number
+  ChannelID: number
+  ChannelName: string
+  InternalModelID: string
+  ExternalModelID: number
+  ExternalModelName: string
+  Available: boolean
+  Reason: string
+  PointCount: number
+  Cost: CostPricingLine
+  Sale: CostPricingLine
 }
 export interface CostPricingCurveParams {
   ChannelModelID?: number
   ExternalModelID?: number
   ExternalModelName?: string
+  // 多渠道多线对比：逗号分隔的渠道内部模型 ID，最多 10 个（超过后端 400，不静默截断）。
+  // 不传（或空串）= 单线模式，响应与改造前逐字节一致。
+  ChannelModelIDs?: string
   Step?: number
   MaxTokens?: number
   HitRate?: number
   InOutRatio?: number
   At?: string // RFC3339 或 HH:MM
 }
-export function getCostPricingCurve(params: CostPricingCurveParams = {}) {
+// 第二个参数用于「开关未开 → 403 自己渲染」：silentStatuses 让全局拦截器不弹红条。
+export function getCostPricingCurve(
+  params: CostPricingCurveParams = {},
+  opts: { silentStatuses?: number[] } = {},
+) {
   return http.get<CostPricingCurveData, ApiRes<CostPricingCurveData>>('/admin/cost/pricing-curve', {
     params,
+    silentStatuses: opts.silentStatuses,
+  })
+}
+
+// ===== 会话渠道轨迹（只读，受 console.cost_multichannel_trace 开关控制；关闭时 403）=====
+// 数据源只有 billing_records：逐点渠道/模型/积分 → 连续段 → 真实切换点；从未真实切换过渠道时
+// 额外给一个**预测打平点**（Predicted=true，明确是预测而非事实）。
+// 口径：金额直接取账单落库值，不重算；Turn 只编成功轮，TurnNo 含失败轮（x 轴用 TurnNo）。
+export interface CostTracePoint {
+  Turn: number
+  TurnNo: number
+  Status: string // completed | failed
+  Failed: boolean
+  CallTime: string
+  ChannelID: number
+  ChannelName: string
+  ChannelModelID: number
+  InternalModelID: string
+  InputTokens: number
+  CacheReadTokens: number
+  OutputTokens: number
+  CostCredits: number
+  SaleCredits: number
+  CumulativeCostCredits: number
+  ChannelChanged: boolean // 真实切换点标记（本点渠道 ≠ 上一点渠道，第一点恒 false）
+}
+export interface CostTraceSegment {
+  Seq: number
+  ChannelID: number
+  ChannelName: string
+  ChannelModelID: number
+  InternalModelID: string
+  FromCallTime: string
+  ToCallTime: string
+  Points: number
+  SuccessPoints: number
+  CostCredits: number
+  SaleCredits: number
+  InputTokens: number
+  CacheReadTokens: number
+  OutputTokens: number
+}
+// 真实切换点：Kind 恒为 "actual"（枚举字面量由后端下发，前端不硬编码字符串）。
+export interface CostTraceSwitch {
+  Kind: string
+  Seq: number
+  TurnNo: number // 切换后第一轮的时间线序号
+  AtCallTime: string
+  FromChannelID: number
+  FromChannelName: string
+  FromChannelModelID: number
+  FromInternalModelID: string
+  ToChannelID: number
+  ToChannelName: string
+  ToChannelModelID: number
+  ToInternalModelID: string
+}
+// 预测打平点：Kind 恒为 "predicted" 且 Predicted 恒 true。
+// Matched=false 表示采样范围内没出现反超（Tokens 为 0，原因见 Reason）——前端如实展示，不自己补数。
+export interface CostTraceBreakEven {
+  Kind: string
+  Predicted: boolean
+  ChannelModelID: number
+  ChannelID: number
+  ChannelName: string
+  InternalModelID: string
+  AlternativeChannelModelID: number
+  AlternativeChannelID: number
+  AlternativeChannelName: string
+  Tokens: number // 打平点上下文长度（输入 + 缓存读）
+  Matched: boolean
+  Step: number
+  MaxTokens: number
+  Reason: string
+}
+export interface CostTraceData {
+  SessionID: string
+  Points: CostTracePoint[]
+  Segments: CostTraceSegment[]
+  ActualSwitches: CostTraceSwitch[]
+  // 为 null 的两种情形：① 已真实切换过渠道；② 算不出打平点。前端不占位、不补 0。
+  PredictedBreakEven: CostTraceBreakEven | null
+  Total: number
+  Limit: number
+  Truncated: boolean
+  SwitchKindActual: string
+  SwitchKindPredicted: string
+}
+export function getCostSessionTrace(
+  id: string,
+  params: { Limit?: number } = {},
+  opts: { silentStatuses?: number[] } = {},
+) {
+  return http.get<CostTraceData, ApiRes<CostTraceData>>(`/admin/cost/session/${id}/trace`, {
+    params,
+    silentStatuses: opts.silentStatuses,
   })
 }
