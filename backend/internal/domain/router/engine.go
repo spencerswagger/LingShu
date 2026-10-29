@@ -63,9 +63,10 @@ type RouteSpec struct {
 	// Enabled=false 时也不影响默认成本排序（零行为变化）。
 	// nil（或未设置）=回落 Sample / 全局 routing.cost_sample。
 	SessionTokens *billing.Usage
-	// SessionTurn 会话位置 k（本会话已完成轮数；0=起点/未知）。
-	// 仅用于决策产物的观测（事件 Turn 可回放）与「若改用经验式」时的输入；**不参与剩余轮数计算**
-	//（需求已定剩余轮数为固定值，见 SessionCostConfig.RemainingA/B）。网关经 SessionRegistry.Turns 组装。
+	// SessionTurn 会话位置 k（本会话已完成轮数；0=起点/未知）。网关经 SessionRegistry.Turns 组装。
+	// 用途：① 决策产物观测（事件 Turn 可回放）；② **参与剩余轮数计算**——
+	// remainingTurns 按 clamp(RemainingA − RemainingB×k, min, max) 递减（默认 10 − 1×k，夹到 1..20），
+	// 使长会话不会被一直判成「还有很多轮可回本」（见 SessionCostConfig.RemainingA/B 注释）。
 	SessionTurn int
 	// Now 本次路由时刻（零值=回落引擎时钟 e.now()）；供时段系数与决策轨迹求值。
 	Now time.Time

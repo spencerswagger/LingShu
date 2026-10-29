@@ -310,8 +310,8 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 	if sessionRaw != "" {
 		sessionID = router.SessionID(token.UserID, token.ID, model, sessionRaw)
 		sessionName = sessionNameFor(sessionRaw, body)
-		// 会话位置 k（已成功完成轮数）：仅用于决策产物的轮次观测（事件 Turn 可回放）。
-		// 剩余轮数按需求取固定值（routing.session_cost.remaining_a），不由 k 预测。
+		// 会话位置 k（已成功完成轮数）：用于决策产物的轮次观测（事件 Turn 可回放），
+		// 同时作为剩余轮数递减的输入（routing.session_cost 默认 remaining_a=10、remaining_b=1 → clamp(10−k,1,20)）。
 		sessionTurn = g.router.Sessions().Turns(sessionID)
 	}
 	// 会话成本路由样值（Step 10）：路由时刻仅能可靠得到「总输入 token」（由请求体估算）；
