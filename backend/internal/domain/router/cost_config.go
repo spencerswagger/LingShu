@@ -24,16 +24,18 @@ const cfgSessionCost = "routing.session_cost"
 // 避免配置异常被放大成路由行为异常；「配置里少写某字段」则用产品默认补齐。
 type SessionCostConfig struct {
 	Enabled bool `json:"enabled"`
-	// RemainingA/RemainingB/RemainingMin/RemainingMax 是「预计剩余轮数」参数。
-	// 需求已定：剩余轮数**不再按会话位置 k 预测**，取固定值——默认 RemainingA=10、RemainingB=0，
-	// 即 clamp(10 − 0×k, RemainingMin, RemainingMax) ≡ 10。参数保留仅供运维微调
-	//（如需恢复经验式预测，设 RemainingB>0 即可）。会话轮次 k 仅用于决策产物观测。
+	// RemainingA/RemainingB/RemainingMin/RemainingMax 是「预计剩余轮数」参数：
+	// 剩余 = clamp(RemainingA − RemainingB×k, RemainingMin, RemainingMax)，k = 会话已完成轮数。
+	// 默认 RemainingA=10、RemainingB=1 → 剩余按真实轮次递减（10,9,8…1），
+	// 不再写死 10（写死会让第 29 轮的会话仍被判「还有 10 轮可回本」，从而每轮都切、每切丢一次 prefix cache）。
 	RemainingA   float64 `json:"remaining_a"`
 	RemainingB   float64 `json:"remaining_b"`
 	RemainingMin int     `json:"remaining_min"`
 	RemainingMax int     `json:"remaining_max"`
 	MinRemaining int     `json:"min_remaining"`
-	CooldownSec  int     `json:"cooldown_sec"`
+	// CooldownSec 是同一会话两次切换之间的最小间隔（秒）：距上次切换不足该值则跳过。
+	// 默认 300（5 分钟）——每次切换都会丢上游 prefix cache，必须有冷却，否则会抖动。
+	CooldownSec int `json:"cooldown_sec"`
 	// ShadowEnabled 是「影子观测」的独立开关（P0），默认 false：
 	// 开启后，即便未启用切换（Enabled/MidSwitch 任一为 false），也在会话亲和命中且有更优候选时
 	// 产出「若启用则会切换」的假设节省事件（Shadow=true、渠道不变），供账实校准。
@@ -45,27 +47,34 @@ type SessionCostConfig struct {
 	// Enabled 为总开关，MidSwitch 为 P2 子开关（须 Enabled 与 MidSwitch 同时为 true 才启用中途切换）。
 	MidSwitch bool `json:"mid_switch"`
 	// MinImprove 是中途切换的滞回阈值（相对改善比例，0 ≤ x < 1）：仅当新渠道本轮成本相对当前渠道
-	// 的改善超过该比例才切换，抑制成本接近时来回横跳。默认 0 = 只要求新渠道严格更便宜（仍受回本门控约束）。
+	// 的改善**严格超过**该比例才切换，抑制成本接近时来回横跳。默认 0.05（改善 > 5% 才切）；0 = 只要更便宜就切。
 	MinImprove float64 `json:"min_improve"`
 }
 
-// defaultSessionCostConfig 返回**产品默认**配置（2026-10-30 spencer 定稿）：
-// 起点择优（Enabled）与会话中途切换（MidSwitch）默认开启，影子观测（ShadowEnabled）默认关闭。
+// defaultSessionCostConfig 返回**产品默认**配置（2026-10-30 spencer 定稿，Owl 复审补滞回）：
+// 起点择优（Enabled）与会话中途切换（MidSwitch）默认开启，影子观测（ShadowEnabled）默认关闭；
+// 同时**默认就带最小滞回**，否则「默认开」不安全：
+//   - RemainingB=1：剩余轮数按真实轮次递减（clamp(10−k, 1, 20)），不再恒为 10——
+//     否则第 29 轮的会话仍被当成「还有 10 轮可回本」，只要目标渠道回本快就每轮都切，每切一次丢一次上游 prefix cache；
+//   - CooldownSec=300：同会话两次切换至少间隔 5 分钟，避免来回横跳；
+//   - MinImprove=0.05：新渠道本轮成本相对当前渠道的改善必须超过 5% 才切（抑制成本接近时抖动）。
+//
 // 与种子 routing.session_cost 的默认值逐字段一致。
 //
 // 注意区分 safeSessionCostConfig：本函数是「配置里没写这个字段时该取什么」，
-// 而「配置根本读不到/解析不了时该取什么」必须用故障安全态（关闭），否则一次 DB 抖动就会
-// 凭默认值改变路由行为。
+// 而「配置根本读不到/解析不了/装配层没注入时该取什么」必须用故障安全态（关闭），
+// 否则一次 DB 抖动或装配遗漏就会凭默认值改变路由行为。
 func defaultSessionCostConfig() SessionCostConfig {
 	return SessionCostConfig{
 		Enabled:      true,
 		MidSwitch:    true,
 		RemainingA:   10,
-		RemainingB:   0,
+		RemainingB:   1, // 按真实轮次递减（原 0 = 恒 10，会把长会话一直判成「还能回本」）
 		RemainingMin: 1,
 		RemainingMax: 20,
 		MinRemaining: 1,
-		CooldownSec:  0,
+		CooldownSec:  300, // 5 分钟切换冷却
+		MinImprove:   0.05,
 	}
 }
 

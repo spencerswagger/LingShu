@@ -243,10 +243,14 @@ func (e *Engine) SetCostConfig(cfg CostConfig) { e.costCfg = cfg }
 // nil=缺省安全态（Enabled=false）：起点择优不生效，路由完全保持现状（会话亲和优先 / 原排序），渠道不变。
 func (e *Engine) SetSessionCostProvider(p *SessionCostProvider) { e.sessionCost = p }
 
-// sessionCostConfig 读取会话成本路由配置；未注入提供者时回退缺省安全态（Enabled=false）。
+// sessionCostConfig 读取会话成本路由配置；**未注入提供者时回退故障安全态（三态全关）**。
+//
+// 注意与「产品默认」的区别：产品默认（enabled/mid_switch=true）只在配置存在且能解析、只是少写了字段时生效。
+// 装配层漏注入提供者属**装配故障**，此时必须 fail-closed（渠道保持现状），不能凭产品默认静默打开
+// 起点择优与中途切换——否则一次装配遗漏就会让所有会话开始换渠道，且没有任何开关痕迹。
 func (e *Engine) sessionCostConfig() SessionCostConfig {
 	if e.sessionCost == nil {
-		return defaultSessionCostConfig()
+		return safeSessionCostConfig()
 	}
 	return e.sessionCost.Config()
 }

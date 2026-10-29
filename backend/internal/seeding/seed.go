@@ -43,13 +43,13 @@ var defaultSysConfigs = map[string]string{
 	// 估算缓存读与输出（纯输入 + 缓存读 = 总输入），供会话成本路由的成本比较使用。
 	// 默认值与 routing.cost_sample（10000/9000/1000）同源。
 	"routing.sample_profile": `{"cache_read_ratio":0.9,"output_ratio":0.1}`,
-	// 会话成本路由配置：**产品默认开启**（2026-10-30 spencer 定稿）——
+	// 会话成本路由配置：**产品默认开启**（2026-10-30 spencer 定稿，Owl 复审补最小滞回）——
 	// enabled=true（起点择优）、mid_switch=true（会话中途切换）、shadow_enabled=false（影子观测关闭）。
-	// 剩余轮数取固定值（remaining_a=10、remaining_b=0，即 clamp(10−0×k)≡10），不再按会话位置 k 预测；
-	// remaining_* 与门控阈值保留供运维微调。
-	// 回退：把本键的 enabled/mid_switch 置 false 即可（配置写入后有失效钩子，热生效、无需重启/重部署）。
-	// 注意 ON CONFLICT DO NOTHING：存量库已有的旧值（false）不会被本种子覆盖，需显式改一次。
-	"routing.session_cost": `{"enabled":true,"mid_switch":true,"shadow_enabled":false,"remaining_a":10,"remaining_b":0,"remaining_min":1,"remaining_max":20,"min_remaining":1,"cooldown_sec":0,"min_improve":0}`,
+	// 默认带滞回，保证「默认开」安全：remaining_b=1 按真实轮次递减（clamp(10−k,1,20)）、
+	// cooldown_sec=300（同会话两次切换至少隔 5 分钟）、min_improve=0.05（改善 >5% 才切）。
+	// 回退：把本键的 enabled 与 mid_switch 都置 false（配置写入有失效钩子，热生效、无需重启/重部署）。
+	// 注意 ON CONFLICT DO NOTHING：存量库已有的旧值不会被本种子覆盖，需在管理端显式开启/关闭。
+	"routing.session_cost": `{"enabled":true,"mid_switch":true,"shadow_enabled":false,"remaining_a":10,"remaining_b":1,"remaining_min":1,"remaining_max":20,"min_remaining":1,"cooldown_sec":300,"min_improve":0.05}`,
 	// 会话过期分档兜底与示例档位（双维度取较大者，且不低于兜底 5 分钟）。
 	"session.expiration": `{"default_ttl_minutes":5,"context_tiers":[{"max_tokens":2000,"ttl_minutes":5},{"max_tokens":8000,"ttl_minutes":30},{"max_tokens":32000,"ttl_minutes":180},{"max_tokens":128000,"ttl_minutes":1440}],"turn_tiers":[{"max_turns":2,"ttl_minutes":5},{"max_turns":10,"ttl_minutes":30},{"max_turns":50,"ttl_minutes":180},{"max_turns":200,"ttl_minutes":1440}]}`,
 	// 成本页增强视图开关（多线对比 / 会话渠道轨迹）：默认 false = 现状不变。

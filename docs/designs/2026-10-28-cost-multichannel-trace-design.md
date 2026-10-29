@@ -162,10 +162,21 @@ A/B/C 三家渠道上谁更便宜」，只能反复切换下拉、肉眼比对�
 
 - 产品默认改为 **`enabled=true`、`mid_switch=true`、`shadow_enabled=false`**：
   种子 `routing.session_cost` 与代码默认 `defaultSessionCostConfig()` 均已改；配置里少写字段也按此补齐。
-- **故障安全态不变**：配置读不到 / 解析失败 / 未装配配置源时仍回退三态全关（`safeSessionCostConfig`），
-  不凭默认值改变路由行为。
-- **回退方式**：改写 `sys_configs` 的 `routing.session_cost`（`enabled`/`mid_switch` 置 false）即可，
-  配置写入有失效钩子 → 热生效，**无需重启/重新部署**。注意种子是 `ON CONFLICT DO NOTHING`，
-  存量库已有的旧值不会被覆盖，需要显式改一次。
-- 当前 `routing.session_cost` **没有管理端点**（`/configs/system` 只覆盖 Billing / SessionExpiration /
-  上游白名单 / Console）：要 UI 或端点开关需另开任务；本轮只在 PR 说明写清「改哪个键、怎么生效」。
+- **默认同时带最小滞回**（Owl 复审必改 2，「默认开」必须自带抖动防护）：
+
+  | 参数 | 默认 | 含义 | 不改会怎样 |
+  | --- | --- | --- | --- |
+  | `remaining_a` / `remaining_b` | `10` / `1` | 剩余轮数 = clamp(`10 − 1×k`, 1, 20)，`k` = 会话已完成轮数 | 写死 `remaining_b=0` 时剩余恒为 10：第 29 轮仍被判「还有 10 轮可回本」，只要目标渠道回本快就每轮都切，每切一次丢一次上游 prefix cache |
+  | `cooldown_sec` | `300` | 同一会话两次切换的最小间隔（5 分钟） | 0 = 无冷却，成本接近时会来回横跳 |
+  | `min_improve` | `0.05` | 新渠道本轮成本相对当前渠道的改善**严格大于 5%** 才切 | 0 = 只要更便宜 1 分钱就切，抖动放大 |
+
+- **观测指标**（上线后按这四项判断滞回是否合适）：①会话切换次数/小时（预期显著低于无滞回时）与单会话切换次数分布；
+  ②上游缓存命中率（`tokens->>'cache_read'` 占输入比例，切换过多会掉）；③`min_improve` 拒绝率（决策事件里 Reason 为滞回拦截的占比）；
+  ④冷却拦截占比（Reason 为冷却的占比）。若切换过少可先降 `min_improve`（0.03）或 `cooldown_sec`（120），不建议动 `remaining_b`。
+- **故障安全态不变**：配置读不到 / 解析失败 / **装配层未注入提供者** → 回退三态全关（`safeSessionCostConfig`），
+  不凭默认值改变路由行为（`engine.sessionCostConfig()` 已改为 fail-closed：nil 提供者返回安全态而非产品默认）。
+- **回退方式（两条都要）**：改写 `sys_configs` 的 `routing.session_cost`，把 **`enabled` 与 `mid_switch` 都置 `false`**，
+  或使用管理端开关把该能力关掉；配置写入有失效钩子 → 热生效，**无需重启、无需重新部署**。
+  只置 `enabled=false` 也能停用（总开关），但两个都置 false 语义最干净。
+- 种子是 `ON CONFLICT DO NOTHING`：**新部署默认开启**；**存量库保持原有值**（通常是 false），
+  需要开启请在管理端显式打开（不做行为突袭、不动存量数据）。

@@ -68,6 +68,7 @@ func TestSessionCostConfigParsesAllFields(t *testing.T) {
 		RemainingMax: 30,
 		MinRemaining: 4,
 		CooldownSec:  15,
+		MinImprove:   0.05, // 未写该字段 → 用产品默认（5% 滞回）
 	}
 	if got != want {
 		t.Fatalf("解析结果不符: got=%+v want=%+v", got, want)
@@ -117,5 +118,38 @@ func TestSessionCostConfigInvalidateRefetches(t *testing.T) {
 	}
 	if n := src.callCount(); n != 2 {
 		t.Fatalf("Invalidate 后应回源 1 次, got=%d", n)
+	}
+}
+
+// TestEngineSessionCostConfig_NilProviderIsFailClosed 装配层漏注入提供者时必须 fail-closed：
+// 不能凭「产品默认＝开」把起点择优 / 中途切换静默打开（Owl 复审 必改 1）。
+func TestEngineSessionCostConfig_NilProviderIsFailClosed(t *testing.T) {
+	e := NewEngine(nil, nil, nil, nil)
+	got := e.sessionCostConfig()
+	if got.Enabled || got.MidSwitch || got.ShadowEnabled {
+		t.Fatalf("未注入提供者应回退三态全关（safe），got %+v", got)
+	}
+	if got != safeSessionCostConfig() {
+		t.Fatalf("应等于 safeSessionCostConfig：got=%+v want=%+v", got, safeSessionCostConfig())
+	}
+}
+
+// TestDefaultConfig_HasMinimumHysteresis 「默认开」必须自带最小滞回，否则长会话会每轮抖动切换。
+func TestDefaultConfig_HasMinimumHysteresis(t *testing.T) {
+	cfg := defaultSessionCostConfig()
+	if cfg.RemainingB <= 0 {
+		t.Fatalf("remaining_b 必须 >0（剩余轮数要按真实轮次递减），got %v", cfg.RemainingB)
+	}
+	if cfg.CooldownSec < 300 {
+		t.Fatalf("cooldown_sec 默认应 ≥300 秒，got %d", cfg.CooldownSec)
+	}
+	if cfg.MinImprove < 0.05 {
+		t.Fatalf("min_improve 默认应 ≥0.05，got %v", cfg.MinImprove)
+	}
+	if !cfg.Enabled || !cfg.MidSwitch {
+		t.Fatalf("默认仍应为开（enabled/mid_switch=true）: %+v", cfg)
+	}
+	if cfg.ShadowEnabled {
+		t.Fatalf("shadow_enabled 应保持 false: %+v", cfg)
 	}
 }
