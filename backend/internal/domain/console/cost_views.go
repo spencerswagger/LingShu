@@ -12,7 +12,9 @@ package console
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"strings"
 )
 
@@ -22,7 +24,11 @@ const costViewsSwitchKey = "console.cost_multichannel_trace"
 // costViewsSwitchDisabledMsg 关闭时对外的一句话原因（前端据此隐藏入口）。
 const costViewsSwitchDisabledMsg = "成本页增强视图（多线对比/渠道轨迹）未启用：请先在系统配置中打开 console.cost_multichannel_trace"
 
-// costViewsEnabled 读开关。键缺失 / 值非法 / 未装配 DB 一律按**关闭**处理（默认关闭 = 现状不变）。
+// costViewsEnabled 读开关，供**服务端门控**用。语义是「现在能不能用」，所以：
+//   - 键缺失 / 值非法 → false（默认关闭）；
+//   - 读取出错 / 未装配 DB → false（fail-closed：读不到就当没开，别放行）。
+//
+// 注意：下发给前端的**不要**用它（读错会退化成「看起来确实关着」），用 costViewsEnabledJSON。
 func (h *Admin) costViewsEnabled(ctx context.Context) bool {
 	if h.db == nil {
 		return false
@@ -34,9 +40,19 @@ func (h *Admin) costViewsEnabled(ctx context.Context) bool {
 	return parseConfigBool(raw)
 }
 
-// costViewsEnabledJSON 与 costViewsEnabled 同源，但直接返回可序列化的 JSON 原文（供系统配置 GET 下发）。
+// costViewsEnabledJSON 下发开关给配置页，**三态**（PR #65 Owl P2-4）：
+//   - `true` / `false`：确实读到了库里的值（含「键不存在」= 默认关，可安全回写）；
+//   - `null`：读取出错（DB 抖动 / 未装配），**未知**——前端见到 null 会跳过回写，
+//     避免管理员点一次保存就把本来是开的开关静默写成关。
 func (h *Admin) costViewsEnabledJSON(ctx context.Context) json.RawMessage {
-	b, _ := json.Marshal(h.costViewsEnabled(ctx))
+	raw, err := h.sysConfigRaw(ctx, costViewsSwitchKey)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return json.RawMessage(`false`) // 键缺失 = 没开过 = 默认关（这个 false 是可信的）
+		}
+		return json.RawMessage(`null`) // 未知：不下发具体值，前端不据此回写
+	}
+	b, _ := json.Marshal(parseConfigBool(raw))
 	return json.RawMessage(b)
 }
 

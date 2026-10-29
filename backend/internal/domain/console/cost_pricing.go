@@ -474,8 +474,10 @@ func (h *Admin) HandleCostPricingCurve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 功能开关：默认关闭。关闭时**只**拒绝新参数，不传该参数的旧请求完全不受影响。
+	// 检查顺序与 /cost/session/{id}/trace 一致：先校验参数（400），再判能力开关（403）。
+	// 「能力未启用」是预期内拒绝，不落异常日志（避免 4xx 告警把正常关开关算成故障）。
 	if len(multiIDs) > 0 && !h.costViewsEnabled(r.Context()) {
-		resp.Err(w, r, http.StatusForbidden, resp.CodeForbidden, costViewsSwitchDisabledMsg)
+		resp.ErrNoLog(w, r, http.StatusForbidden, resp.CodeForbidden, costViewsSwitchDisabledMsg)
 		return
 	}
 	externalName := q.Get("ExternalModelName")

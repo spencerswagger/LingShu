@@ -443,7 +443,9 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	sessExpiryProvider := router.NewSessionExpiryProvider(billStore)
 	// 会话成本路由配置 provider（sys_configs 键 routing.session_cost）：提供起点择优 / 中途切换的
 	// 开关与门控参数（Enabled/MidSwitch/RemainingA/B/MinRemaining/CooldownSec/MinImprove）。
-	// 默认 Enabled=false、MidSwitch=false 安全态——读取失败/缺失/解析失败同样回落安全态，渠道不变。
+	// 产品默认（2026-10-30 定稿）= Enabled/MidSwitch 开、ShadowEnabled 关（与种子一致）；
+	// 读取失败/解析失败时回退故障安全态（三态全关，渠道不变），不凭默认值放开路由。
+	// 回退方式：改本键的 enabled/mid_switch 即可（写钩子会 Invalidate，热生效、无需重启）。
 	sessionCostProvider := router.NewSessionCostProvider(billStore)
 	// 上游响应头白名单读缓存（单键 sys_configs，键 = gateway.UpstreamResponseHeaderWhitelistKey）：
 	// 网关每请求读取，console 低频写入；启用时命中零 DB，关闭时退回直查。

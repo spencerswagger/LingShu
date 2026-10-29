@@ -268,7 +268,7 @@ func sessionCostProvider(t *testing.T, enabled bool) *SessionCostProvider {
 	t.Helper()
 	raw := []byte(`{"enabled":false}`)
 	if enabled {
-		raw = []byte(`{"enabled":true,"remaining_a":12,"remaining_b":1,"remaining_min":1,"remaining_max":20,"min_remaining":1,"cooldown_sec":0}`)
+		raw = []byte(`{"enabled":true,"mid_switch":false,"remaining_a":12,"remaining_b":1,"remaining_min":1,"remaining_max":20,"min_remaining":1,"cooldown_sec":0}`)
 	}
 	return NewSessionCostProvider(newFakeConfigSource(map[string][]byte{cfgSessionCost: raw}))
 }
@@ -750,7 +750,7 @@ func TestMidSwitch_EngineKeepsAffinityWhenMidSwitchOff(t *testing.T) {
 	rates1, rates2 := midSwitchRates()
 	tok := startPickSample()
 
-	const offJSON = `{"enabled":true,"remaining_a":20,"remaining_b":0,"remaining_min":1,"remaining_max":20,"min_remaining":1,"cooldown_sec":0}`
+	const offJSON = `{"enabled":true,"mid_switch":false,"remaining_a":20,"remaining_b":0,"remaining_min":1,"remaining_max":20,"min_remaining":1,"cooldown_sec":0}`
 	e, sess := newMidSwitchEngine(t, offJSON, rates1, rates2, 100, 100, 1)
 	key := "s-off"
 	attachTo(t, sess, key, 21, "int2")
@@ -849,7 +849,7 @@ func TestShadow_EngineEmitsAssumptionWhenMidSwitchOff(t *testing.T) {
 	rates1, rates2 := midSwitchRates()
 	tok := startPickSample()
 
-	const offJSON = `{"enabled":true,"shadow_enabled":true,"remaining_a":20,"remaining_b":0,"remaining_min":1,"remaining_max":20,"min_remaining":1,"cooldown_sec":0}`
+	const offJSON = `{"enabled":true,"mid_switch":false,"shadow_enabled":true,"remaining_a":20,"remaining_b":0,"remaining_min":1,"remaining_max":20,"min_remaining":1,"cooldown_sec":0}`
 	e, sess := newMidSwitchEngine(t, offJSON, rates1, rates2, 100, 100, 1)
 	sink := &fakeCostEventSink{}
 	e.SetCostEventSink(sink)
@@ -933,7 +933,7 @@ func TestShadow_NotEmittedWhenNoWouldSwitch(t *testing.T) {
 	rates1, rates2 := midSwitchRates()
 	tok := startPickSample()
 
-	const offJSON = `{"enabled":true,"shadow_enabled":true,"remaining_a":20,"remaining_b":0,"remaining_min":1,"remaining_max":20,"min_remaining":1,"cooldown_sec":0}`
+	const offJSON = `{"enabled":true,"mid_switch":false,"shadow_enabled":true,"remaining_a":20,"remaining_b":0,"remaining_min":1,"remaining_max":20,"min_remaining":1,"cooldown_sec":0}`
 	e, sess := newMidSwitchEngine(t, offJSON, rates1, rates2, 100, 100, 1)
 	sink := &fakeCostEventSink{}
 	e.SetCostEventSink(sink)
@@ -960,7 +960,7 @@ func TestShadow_NotEmittedByDefault(t *testing.T) {
 	rates1, rates2 := midSwitchRates()
 	tok := startPickSample()
 
-	const offJSON = `{"enabled":true,"remaining_a":20,"remaining_b":0,"remaining_min":1,"remaining_max":20,"min_remaining":1,"cooldown_sec":0}`
+	const offJSON = `{"enabled":true,"mid_switch":false,"remaining_a":20,"remaining_b":0,"remaining_min":1,"remaining_max":20,"min_remaining":1,"cooldown_sec":0}`
 	e, sess := newMidSwitchEngine(t, offJSON, rates1, rates2, 100, 100, 1)
 	sink := &fakeCostEventSink{}
 	e.SetCostEventSink(sink)

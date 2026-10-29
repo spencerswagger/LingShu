@@ -593,6 +593,16 @@ const multiOption = computed<EChartsCoreOption>(() => {
   }
 })
 
+// 手动上限被后端收敛时的「实际生效」回显（Owl P3-4）：输入框里保留用户填的值，
+// 旁边如实显示后端真正用的值（多线按总点数上限自动收敛），避免「填 200000、实际用别的值」看不见。
+const maxTokensEffectiveHint = computed(() => {
+  const c = curve.value
+  if (!c || !manual.maxTokens || !curveParams.maxTokens) return ''
+  if (curveParams.maxTokens === c.MaxTokens) return ''
+  const n = multiLines.value.length
+  return `实际生效 ${fmtInt(c.MaxTokens)} token${n > 1 ? `（${n} 条线按总点数上限自动收敛）` : '（按总点数上限收敛）'}`
+})
+
 // 多线口径说明：上限一律显示**响应里的** MaxTokens（线多时后端自动下调，前端不硬编码）
 const multiMeta = computed(() => {
   const c = curve.value
@@ -1143,6 +1153,9 @@ onUnmounted(() => {
             class="curve-num"
             @change="onParamChange('maxTokens')"
           />
+          <span v-if="maxTokensEffectiveHint" class="hint" style="margin: 0 0 0 6px">
+            {{ maxTokensEffectiveHint }}
+          </span>
           <span class="p-label">缓存命中率 %</span>
           <el-input-number
             v-model="hitRatePct"

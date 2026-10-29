@@ -2,15 +2,27 @@ package router
 
 import "testing"
 
-func TestSessionCostConfigMissingFallsBackToDefault(t *testing.T) {
+func TestSessionCostConfigMissingFallsBackToSafe(t *testing.T) {
+	// 产品默认是「开」，但**读不到配置**时不能凭默认值放开路由：必须是故障安全态（全关）。
 	p := NewSessionCostProvider(newFakeConfigSource(nil))
 	got := p.Config()
-	want := defaultSessionCostConfig()
+	want := safeSessionCostConfig()
 	if got != want {
-		t.Fatalf("缺失配置应回退缺省值: got=%+v want=%+v", got, want)
+		t.Fatalf("缺失配置应回退故障安全态: got=%+v want=%+v", got, want)
 	}
-	if got.Enabled {
-		t.Fatalf("缺省安全态必须为 Enabled=false: %+v", got)
+	if got.Enabled || got.MidSwitch || got.ShadowEnabled {
+		t.Fatalf("故障安全态三态开关必须全关: %+v", got)
+	}
+}
+
+func TestSessionCostConfigProductDefaultIsOn(t *testing.T) {
+	// 2026-10-30 spencer 定稿：起点择优与中途切换默认开，影子观测默认关。
+	got := defaultSessionCostConfig()
+	if !got.Enabled || !got.MidSwitch {
+		t.Fatalf("产品默认应为 enabled=true / mid_switch=true: %+v", got)
+	}
+	if got.ShadowEnabled {
+		t.Fatalf("产品默认 shadow_enabled 应为 false: %+v", got)
 	}
 }
 
@@ -19,17 +31,17 @@ func TestSessionCostConfigMalformedFallsBackToDefault(t *testing.T) {
 		cfgSessionCost: []byte(`{not-json`),
 	})
 	got := NewSessionCostProvider(src).Config()
-	want := defaultSessionCostConfig()
+	want := safeSessionCostConfig()
 	if got != want {
-		t.Fatalf("非法 JSON 应回退缺省值: got=%+v want=%+v", got, want)
+		t.Fatalf("非法 JSON 应回退故障安全态: got=%+v want=%+v", got, want)
 	}
 }
 
 func TestSessionCostConfigNilSourceIsSafe(t *testing.T) {
 	p := NewSessionCostProvider(nil)
 	got := p.Config()
-	if got != defaultSessionCostConfig() {
-		t.Fatalf("nil 配置源应回退缺省值: %+v", got)
+	if got != safeSessionCostConfig() {
+		t.Fatalf("nil 配置源应回退故障安全态: %+v", got)
 	}
 	p.Invalidate()
 }
@@ -49,6 +61,7 @@ func TestSessionCostConfigParsesAllFields(t *testing.T) {
 	got := NewSessionCostProvider(src).Config()
 	want := SessionCostConfig{
 		Enabled:      true,
+		MidSwitch:    true, // 未写该字段 → 用产品默认（开）
 		RemainingA:   3.5,
 		RemainingB:   0.25,
 		RemainingMin: 2,

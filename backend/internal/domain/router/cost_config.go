@@ -11,15 +11,17 @@ const cfgSessionCost = "routing.session_cost"
 
 // SessionCostConfig 会话成本路由配置（routing.session_cost）。
 //
-// 安全态语义：Enabled=false 为默认安全态，门控的是「会话成本路由策略」
-// （起点择优 / 中途切换 / 闲忙时联动）；关闭 = 不启用这些策略。
+// 开关语义：Enabled 是「会话成本路由策略」总开关（起点择优 / 中途切换 / 闲忙时联动），
+// MidSwitch 是「会话中途切换」子开关；关闭 = 不启用这些策略、渠道保持亲和。
+// **产品默认（2026-10-30 定稿）：Enabled=true、MidSwitch=true、ShadowEnabled=false**，
+// 与种子 routing.session_cost 一致；配置读不到/解析失败时回退故障安全态（三态全关）。
 //
 // 注意：成本比较口径（三档成本价 × 时段系数 × 上下文分档系数，替代原「分档系数恒 1」）
 // 是 P0 既定新基线，**不由该开关回滚**；默认种子下模型级 context_tiers 为空、
 // 全局分档为空，故默认部署排序不变。该配置仍不改变对外售价计费与响应语义（成本价 ≠ 售价）。
 //
-// 只有在运维显式把 enabled 置为 true 后才允许后续步骤接入会话成本路由策略。
-// 配置缺失、读取失败或解析失败时同样回退到该安全态，避免配置异常放大为路由异常。
+// 配置读取失败或解析失败时回退故障安全态（safeSessionCostConfig，三态全关），
+// 避免配置异常被放大成路由行为异常；「配置里少写某字段」则用产品默认补齐。
 type SessionCostConfig struct {
 	Enabled bool `json:"enabled"`
 	// RemainingA/RemainingB/RemainingMin/RemainingMax 是「预计剩余轮数」参数。
@@ -37,8 +39,8 @@ type SessionCostConfig struct {
 	// 产出「若启用则会切换」的假设节省事件（Shadow=true、渠道不变），供账实校准。
 	// 默认关闭，保证安全态下不产生任何额外异步写（WAL/事件流）与可观测副作用。
 	ShadowEnabled bool `json:"shadow_enabled"`
-	// MidSwitch 是「会话中途切换」这一子阶段的独立开关（P2），默认 false 安全态：
-	// 即使 Enabled=true（P1 起点择优已放行），未显式开启本开关也会在中途保持会话亲和、渠道不变。
+	// MidSwitch 是「会话中途切换」这一子阶段的独立开关（P2），**产品默认 true**（2026-10-30 定稿）：
+	// 显式置 false 即可在中途保持会话亲和、渠道不变（与 Enabled 独立回退）。
 	// 与设计 D10「P0 影子只读 → P1 起点择优 → P2 中途切换，逐级开关、可独立回退」一致：
 	// Enabled 为总开关，MidSwitch 为 P2 子开关（须 Enabled 与 MidSwitch 同时为 true 才启用中途切换）。
 	MidSwitch bool `json:"mid_switch"`
@@ -47,10 +49,17 @@ type SessionCostConfig struct {
 	MinImprove float64 `json:"min_improve"`
 }
 
-// defaultSessionCostConfig 返回缺省配置：关闭（安全态）并带上默认阈值。
+// defaultSessionCostConfig 返回**产品默认**配置（2026-10-30 spencer 定稿）：
+// 起点择优（Enabled）与会话中途切换（MidSwitch）默认开启，影子观测（ShadowEnabled）默认关闭。
+// 与种子 routing.session_cost 的默认值逐字段一致。
+//
+// 注意区分 safeSessionCostConfig：本函数是「配置里没写这个字段时该取什么」，
+// 而「配置根本读不到/解析不了时该取什么」必须用故障安全态（关闭），否则一次 DB 抖动就会
+// 凭默认值改变路由行为。
 func defaultSessionCostConfig() SessionCostConfig {
 	return SessionCostConfig{
-		Enabled:      false,
+		Enabled:      true,
+		MidSwitch:    true,
 		RemainingA:   10,
 		RemainingB:   0,
 		RemainingMin: 1,
@@ -58,6 +67,16 @@ func defaultSessionCostConfig() SessionCostConfig {
 		MinRemaining: 1,
 		CooldownSec:  0,
 	}
+}
+
+// safeSessionCostConfig 返回**故障安全态**：配置读取失败 / 解析失败 / 未装配配置源时使用。
+// 三态开关一律关闭（渠道不变、无额外异步写），避免配置异常被放大成路由行为异常。
+func safeSessionCostConfig() SessionCostConfig {
+	cfg := defaultSessionCostConfig()
+	cfg.Enabled = false
+	cfg.MidSwitch = false
+	cfg.ShadowEnabled = false
+	return cfg
 }
 
 // SessionCostProvider 按需读取并缓存会话成本路由配置。
@@ -78,10 +97,12 @@ func NewSessionCostProvider(src configSource) *SessionCostProvider {
 	return &SessionCostProvider{src: src}
 }
 
-// Config 返回会话成本路由配置：缺失、读取失败或解析失败时回退缺省配置（Enabled=false 安全态）。
+// Config 返回会话成本路由配置。
+//   - 读到并且能解析 → 用配置值（缺字段用产品默认补：enabled/mid_switch=true）；
+//   - 未装配配置源 / 读取失败 / 解析失败 → 回退故障安全态（三态开关全关，渠道不变）。
 func (p *SessionCostProvider) Config() SessionCostConfig {
 	if p == nil {
-		return defaultSessionCostConfig()
+		return safeSessionCostConfig()
 	}
 
 	p.mu.RLock()
@@ -94,16 +115,16 @@ func (p *SessionCostProvider) Config() SessionCostConfig {
 		return *cached
 	}
 	if src == nil {
-		return defaultSessionCostConfig()
+		return safeSessionCostConfig()
 	}
 
 	raw, err := src.GetConfig(context.Background(), cfgSessionCost)
 	if err != nil {
-		return defaultSessionCostConfig()
+		return safeSessionCostConfig()
 	}
 	cfg, ok := parseSessionCostConfig(raw)
 	if !ok {
-		return defaultSessionCostConfig()
+		return safeSessionCostConfig()
 	}
 
 	p.mu.Lock()

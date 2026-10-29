@@ -136,14 +136,13 @@ type costTraceResponse struct {
 // Step / MaxTokens / HitRate / InOutRatio / At（可选，只影响预测打平点的采样，与定价曲线同源）。
 //
 // 受功能开关 console.cost_multichannel_trace 控制：关闭时返回 403（默认关闭 = 现状不变）。
+//
+// 检查顺序与定价曲线端点**保持一致**：先校验参数（400），再判能力开关（403）。
+// 这样同一个开关在两个端点上的表现统一（关闭 + 非法参数 = 400，不会一个 400 一个 403）。
 func (h *Admin) HandleCostSessionTrace(w http.ResponseWriter, r *http.Request) {
 	sid := r.PathValue("id")
 	if sid == "" {
 		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "缺少会话 ID")
-		return
-	}
-	if !h.costViewsEnabled(r.Context()) {
-		resp.Err(w, r, http.StatusForbidden, resp.CodeForbidden, costViewsSwitchDisabledMsg)
 		return
 	}
 	limit, err := parseCostSessionLimit(r.URL.Query().Get("Limit"))
@@ -154,6 +153,11 @@ func (h *Admin) HandleCostSessionTrace(w http.ResponseWriter, r *http.Request) {
 	params, err := parsePricingCurveParams(r.URL.Query(), h.now())
 	if err != nil {
 		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, err.Error())
+		return
+	}
+	// 「能力未启用」是预期内的拒绝，不落异常日志（否则 4xx 告警会把正常关开关算成故障）。
+	if !h.costViewsEnabled(r.Context()) {
+		resp.ErrNoLog(w, r, http.StatusForbidden, resp.CodeForbidden, costViewsSwitchDisabledMsg)
 		return
 	}
 
@@ -190,10 +194,37 @@ func (h *Admin) HandleCostSessionTrace(w http.ResponseWriter, r *http.Request) {
 	out.Truncated = total > int64(len(points))
 
 	// 预测打平点：只在「从未真实切换过渠道」且轨迹非空时给。
+	// 基准取第一条**成功且有渠道内部模型**的记录：首条常是拒绝/余额不足账单（无 channel_key_id），
+	// 拿它当基准会让整通会话误判成「配置缺失」，把主打能力整块废掉。
+	// 一条合格记录都没有时，predictBreakEven 会回一个 Matched=false + Reason 的对象（不是 null）。
 	if len(out.ActualSwitches) == 0 && len(points) > 0 {
-		out.PredictedBreakEven = h.predictBreakEven(r.Context(), points[0], params, h.resolveR())
+		base, _ := firstTraceAnchor(points)
+		out.PredictedBreakEven = h.predictBreakEven(r.Context(), base, params, h.resolveR())
+		// 轨迹被 Limit 截断时如实标注：切换点可能落在未加载的尾部，预测结论只覆盖已加载部分。
+		if out.Truncated && out.PredictedBreakEven != nil {
+			out.PredictedBreakEven.Reason = truncateReason(out.PredictedBreakEven.Reason, len(points), total)
+		}
 	}
 	resp.OK(w, r, out)
+}
+
+// firstTraceAnchor 取轨迹里第一条「成功且解析到渠道内部模型」的记录，作为**预测打平点**的基准。
+// 第二个返回值为 false 表示整段轨迹没有合格记录（全是失败/拒绝）。
+// 注意：切换判定用的基准更宽松（只要求「成功且有渠道」），见 buildTraceSegments。
+func firstTraceAnchor(points []costTracePoint) (costTracePoint, bool) {
+	for i := range points {
+		pt := points[i]
+		if !pt.Failed && pt.ChannelID > 0 && pt.ChannelModelID > 0 && pt.InternalModelID != "" {
+			return pt, true
+		}
+	}
+	return costTracePoint{}, false
+}
+
+// truncateReason 在预测原因后追加「基于前 N/M 条」的限定，避免把截断轨迹的结论说成整通会话的事实。
+func truncateReason(reason string, loaded int, total int64) string {
+	suffix := fmt.Sprintf("（注意：本次只加载了前 %d 条（共 %d 条），结论仅基于已加载部分）", loaded, total)
+	return reason + suffix
 }
 
 // loadTracePoints 取会话逐条账单并解析渠道/渠道内部模型。
@@ -236,6 +267,11 @@ LIMIT $2`,
 	out := make([]costTracePoint, 0, 16)
 	successTurn, turnNo := 0, 0
 	cumulative := 0.0
+	// 真实切换标记的基准 = 上一个「成功且有渠道」的点（不是上一个点）：
+	// 同一次请求内候选失败（429/401）与拒绝账单（ChannelID=0）都不代表会话换了渠道，
+	// 拿「上一个点」判会把请求内 failover 标成真实切换，还会算出 A→空→A 两次假切换。
+	// 与 buildTraceSegments 的切换判定用同一基准，保证 Points 标记与 ActualSwitches 对得上。
+	var anchorChannel int64
 	for rows.Next() {
 		var (
 			callTime time.Time
@@ -263,9 +299,12 @@ LIMIT $2`,
 		}
 		cumulative += pt.CostCredits
 		pt.CumulativeCostCredits = decimalx.Round5(cumulative)
-		// 真实切换点标记：与本点之前的**上一个点**比渠道（不是与段首比）。
-		if len(out) > 0 && out[len(out)-1].ChannelID != pt.ChannelID {
-			pt.ChannelChanged = true
+		// 真实切换标记：只在「成功且有渠道」的点上判定，基准是上一个这样的点（首点恒 false）。
+		if !pt.Failed && pt.ChannelID > 0 {
+			if anchorChannel > 0 && anchorChannel != pt.ChannelID {
+				pt.ChannelChanged = true
+			}
+			anchorChannel = pt.ChannelID
 		}
 		out = append(out, pt)
 	}
@@ -278,10 +317,16 @@ LIMIT $2`,
 // buildTraceSegments 把逐点轨迹压成连续段，并抽真实切换点。
 //
 // 分段键 = (渠道 ID, 渠道内部模型 ID, 内部模型 ID)：同渠道换模型也算新段（但**不是**渠道切换）。
-// 切换点判定只看 channel_id 变化（任务口径：相邻记录 channel 变化处），模型变化写进段与切换点的字段里。
+//
+// 切换点判定（与 Points[].ChannelChanged 同一基准）：
+//   - 基准是**上一个成功且有渠道的点**，不是「上一个点」；
+//   - 同一次请求内的候选失败重试（A 429 → B 成功）与无渠道的拒绝账单（ChannelID=0）
+//     都不构成会话级渠道切换，既不产生切换点，也不参与「从哪个渠道切过来」；
+//   - A(成功) → 空(拒绝失败) → A(成功) 恒为 0 次切换，不会出现空渠道名。
 func buildTraceSegments(points []costTracePoint) ([]costTraceSegment, []costTraceSwitch) {
 	segments := make([]costTraceSegment, 0, 4)
 	switches := make([]costTraceSwitch, 0, 2)
+	var anchorIdx = -1 // points 里上一个「成功且有渠道」的下标
 	for i := range points {
 		pt := points[i]
 		sameAsPrev := len(segments) > 0 &&
@@ -299,26 +344,6 @@ func buildTraceSegments(points []costTracePoint) ([]costTraceSegment, []costTrac
 				ToCallTime:      pt.CallTime,
 			}
 			segments = append(segments, seg)
-			// 渠道真的变了 → 真实切换点（同渠道换模型不算）。
-			if len(segments) > 1 {
-				prev := segments[len(segments)-2]
-				if prev.ChannelID != pt.ChannelID {
-					switches = append(switches, costTraceSwitch{
-						Kind:                traceKindActual,
-						Seq:                 len(switches) + 1,
-						TurnNo:              pt.TurnNo,
-						AtCallTime:          pt.CallTime,
-						FromChannelID:       prev.ChannelID,
-						FromChannelName:     prev.ChannelName,
-						FromChannelModelID:  prev.ChannelModelID,
-						FromInternalModelID: prev.InternalModelID,
-						ToChannelID:         pt.ChannelID,
-						ToChannelName:       pt.ChannelName,
-						ToChannelModelID:    pt.ChannelModelID,
-						ToInternalModelID:   pt.InternalModelID,
-					})
-				}
-			}
 		}
 		seg := &segments[len(segments)-1]
 		seg.ToCallTime = pt.CallTime
@@ -331,6 +356,31 @@ func buildTraceSegments(points []costTracePoint) ([]costTraceSegment, []costTrac
 		seg.InputTokens += pt.InputTokens
 		seg.CacheReadTokens += pt.CacheReadTokens
 		seg.OutputTokens += pt.OutputTokens
+
+		// 切换判定：只认成功且有渠道的点（失败/拒绝记录是「本轮换候选」，不是「会话换渠道」）。
+		if pt.Failed || pt.ChannelID <= 0 {
+			continue
+		}
+		if anchorIdx >= 0 {
+			from := points[anchorIdx]
+			if from.ChannelID != pt.ChannelID {
+				switches = append(switches, costTraceSwitch{
+					Kind:                traceKindActual,
+					Seq:                 len(switches) + 1,
+					TurnNo:              pt.TurnNo,
+					AtCallTime:          pt.CallTime,
+					FromChannelID:       from.ChannelID,
+					FromChannelName:     from.ChannelName,
+					FromChannelModelID:  from.ChannelModelID,
+					FromInternalModelID: from.InternalModelID,
+					ToChannelID:         pt.ChannelID,
+					ToChannelName:       pt.ChannelName,
+					ToChannelModelID:    pt.ChannelModelID,
+					ToInternalModelID:   pt.InternalModelID,
+				})
+			}
+		}
+		anchorIdx = i
 	}
 	for i := range segments {
 		segments[i].CostCredits = decimalx.Round5(segments[i].CostCredits)
@@ -361,7 +411,7 @@ func (h *Admin) predictBreakEven(ctx context.Context, first costTracePoint,
 		MaxTokens:       p.MaxTokens,
 	}
 	if first.ChannelModelID <= 0 || first.InternalModelID == "" {
-		out.Reason = "账单未解析到渠道内部模型，无法预测打平点"
+		out.Reason = "会话里没有「成功且解析到渠道内部模型」的记录（首条可能是拒绝/失败账单），无法预测打平点"
 		return out
 	}
 	if h.db == nil {
@@ -375,7 +425,7 @@ func (h *Admin) predictBreakEven(ctx context.Context, first costTracePoint,
 	}
 	globalTiers := h.loadGlobalContextTiers(ctx)
 
-	candidates, err := h.loadSiblingChannelModels(ctx, first.InternalModelID, globalTime, globalTiers)
+	candidates, err := h.loadSiblingChannelModels(ctx, first.InternalModelID, first.ChannelModelID, globalTime, globalTiers)
 	if err != nil {
 		out.Reason = "查询同模型其它渠道配置失败，无法预测打平点"
 		return out
@@ -388,7 +438,7 @@ func (h *Admin) predictBreakEven(ctx context.Context, first costTracePoint,
 		}
 	}
 	if current == nil {
-		out.Reason = "未找到会话实际渠道的内部模型配置（可能已删除），无法预测打平点"
+		out.Reason = "会话实际用的渠道内部模型配置已不存在，无法预测打平点"
 		return out
 	}
 	if len(candidates) < 2 {
@@ -516,16 +566,22 @@ func firstCrossTokens(current, alternative []pricingPoint) (int64, bool) {
 	return 0, false
 }
 
-// loadSiblingChannelModels 取同一内部模型在所有未删除渠道下的成本配置（预测打平点的候选线）。
-// 与 loadChannelModelConfig 的判定口径一致：费率全 0/缺失 → Available=false（不参与预测）。
-func (h *Admin) loadSiblingChannelModels(ctx context.Context, internalModelID string,
+// loadSiblingChannelModels 取同一内部模型在所有**当前可服务**渠道下的成本配置（预测打平点的候选线）。
+//
+// 过滤口径（PR #65 Owl P2-2）：
+//   - 渠道内部模型自身不能软删（`cm.deleted_at IS NULL`）；
+//   - 候选渠道必须没被软删、且不是 DISABLED（停用的渠道不可能承接切换，指过去就是误导性建议）；
+//   - **当前渠道那条始终保留**（`cm.id = $2`）：即使它已被删/停用，也要让它出现在候选里，
+//     否则 base 会被判成「配置不存在」，把真实原因掩盖成配置缺失。
+func (h *Admin) loadSiblingChannelModels(ctx context.Context, internalModelID string, keepChannelModelID int64,
 	globalTime billing.TimeCoeffConfig, globalTiers []billing.TierRule) ([]pricingModelConfig, error) {
 	rows, err := h.db.QueryContext(ctx, `
 SELECT cm.id, cm.channel_id, COALESCE(c.name, ''), cm.internal_model_id, cm.cost_rates, cm.time_config, cm.context_tiers
 FROM channel_models cm
 LEFT JOIN channels c ON c.id = cm.channel_id
 WHERE cm.deleted_at IS NULL AND cm.internal_model_id = $1
-ORDER BY cm.id`, internalModelID)
+  AND (cm.id = $2 OR (c.deleted_at IS NULL AND c.state <> 'DISABLED'))
+ORDER BY cm.id`, internalModelID, keepChannelModelID)
 	if err != nil {
 		return nil, err
 	}

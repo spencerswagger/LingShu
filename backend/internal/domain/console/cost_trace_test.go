@@ -10,6 +10,7 @@ package console
 //   - 多线响应结构（每线独立渠道/模型标识 + 成本与售价序列）。
 
 import (
+	"context"
 	"database/sql"
 	"database/sql/driver"
 	"encoding/json"
@@ -24,6 +25,29 @@ import (
 
 	"github.com/team/llmgateway/internal/domain/billing"
 )
+
+// traceRequest 构造 /trace 请求（path value 已设置），供返修用例复用。
+func traceRequest(sid, query string) *http.Request {
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/cost/session/"+sid+"/trace"+query, nil)
+	req.SetPathValue("id", sid)
+	return req
+}
+
+// decodeTrace 解出 {Code,Data} 壳里的 Data，并顺带断言 Code=0。
+func decodeTrace(t *testing.T, rec *httptest.ResponseRecorder) costTraceResponse {
+	t.Helper()
+	var body struct {
+		Code int               `json:"Code"`
+		Data costTraceResponse `json:"Data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v body=%s", err, rec.Body.String())
+	}
+	if body.Code != 0 {
+		t.Fatalf("Code=%d body=%s", body.Code, rec.Body.String())
+	}
+	return body.Data
+}
 
 // ---------- 纯函数：参数解析 ----------
 
@@ -469,7 +493,7 @@ func TestHandleCostSessionTrace_PredictedBreakEven(t *testing.T) {
 	expectGlobalTimeAndTiers(mock)
 	// 实际渠道 900：高峰 1.5、输入 1/输出 4/缓存 0.1；替代 901：输入 0.2（分档/时段相同 → 全程更便宜）。
 	mock.ExpectQuery(regexp.QuoteMeta(`WHERE cm.deleted_at IS NULL AND cm.internal_model_id = $1`)).
-		WithArgs("gpt-4o-int").
+		WithArgs("gpt-4o-int", int64(900)).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "channel_id", "name", "internal_model_id", "cost_rates", "time_config", "context_tiers"}).
 			AddRow(int64(900), int64(5), "渠道A", "gpt-4o-int", []byte(`{"input":1,"output":4,"cache_read":0.1}`), nil, nil).
 			AddRow(int64(901), int64(6), "渠道B", "gpt-4o-int", []byte(`{"input":0.2,"output":0.8,"cache_read":0.02}`), nil, nil))
@@ -533,7 +557,7 @@ func TestHandleCostSessionTrace_NoCrossing(t *testing.T) {
 			AddRow(traceRow(t, base, "completed", int64(5), "渠道A", int64(900), "gpt-4o-int", 1.5, 2.0)...))
 	expectGlobalTimeAndTiers(mock)
 	mock.ExpectQuery(regexp.QuoteMeta(`WHERE cm.deleted_at IS NULL AND cm.internal_model_id = $1`)).
-		WithArgs("gpt-4o-int").
+		WithArgs("gpt-4o-int", int64(900)).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "channel_id", "name", "internal_model_id", "cost_rates", "time_config", "context_tiers"}).
 			AddRow(int64(900), int64(5), "渠道A", "gpt-4o-int", []byte(`{"input":1,"output":4,"cache_read":0.1}`), nil, nil).
 			AddRow(int64(901), int64(6), "渠道B", "gpt-4o-int", []byte(`{"input":9,"output":40,"cache_read":1}`), nil, nil))
@@ -578,7 +602,7 @@ func TestHandleCostSessionTrace_SingleChannelOnly(t *testing.T) {
 			AddRow(traceRow(t, base, "completed", int64(5), "渠道A", int64(900), "gpt-4o-int", 1.5, 2.0)...))
 	expectGlobalTimeAndTiers(mock)
 	mock.ExpectQuery(regexp.QuoteMeta(`WHERE cm.deleted_at IS NULL AND cm.internal_model_id = $1`)).
-		WithArgs("gpt-4o-int").
+		WithArgs("gpt-4o-int", int64(900)).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "channel_id", "name", "internal_model_id", "cost_rates", "time_config", "context_tiers"}).
 			AddRow(int64(900), int64(5), "渠道A", "gpt-4o-int", []byte(`{"input":1,"output":4,"cache_read":0.1}`), nil, nil))
 
@@ -623,7 +647,7 @@ func TestHandleCostSessionTrace_Truncated(t *testing.T) {
 	// 截断后仍无切换 → 会进预测；给它准备最少的期望（同模型只有一条 → 直接给说明）。
 	expectGlobalTimeAndTiers(mock)
 	mock.ExpectQuery(regexp.QuoteMeta(`WHERE cm.deleted_at IS NULL AND cm.internal_model_id = $1`)).
-		WithArgs("m1").
+		WithArgs("m1", int64(900)).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "channel_id", "name", "internal_model_id", "cost_rates", "time_config", "context_tiers"}).
 			AddRow(int64(900), int64(5), "渠道A", "m1", []byte(`{"input":1,"output":4,"cache_read":0.1}`), nil, nil))
 
@@ -664,7 +688,7 @@ func TestHandleCostSessionTrace_NilDB(t *testing.T) {
 func TestPredictBreakEven_UnresolvedChannel(t *testing.T) {
 	h := NewAdmin(nil, nil, nil, nil)
 	got := h.predictBreakEven(t.Context(), costTracePoint{ChannelID: 5}, pricingCurveParams{Step: 1000}, 10000)
-	if got == nil || got.Matched || !contains(got.Reason, "未解析到渠道内部模型") {
+	if got == nil || got.Matched || !contains(got.Reason, "没有「成功且解析到渠道内部模型」的记录") {
 		t.Fatalf("应给出无法预测的原因: %+v", got)
 	}
 	if got.Kind != traceKindPredicted {
@@ -697,7 +721,7 @@ func TestHandleCostSessionTrace_BreakEvenAxisReported(t *testing.T) {
 		WithArgs("billing.context_tiers").
 		WillReturnRows(sqlmock.NewRows([]string{"value"}).AddRow([]byte(`[{"Min":0,"Max":128000,"Coeff":1.0}]`)))
 	mock.ExpectQuery(regexp.QuoteMeta(`WHERE cm.deleted_at IS NULL AND cm.internal_model_id = $1`)).
-		WithArgs("gpt-4o-int").
+		WithArgs("gpt-4o-int", int64(900)).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "channel_id", "name", "internal_model_id", "cost_rates", "time_config", "context_tiers"}).
 			AddRow(int64(900), int64(5), "渠道A", "gpt-4o-int", []byte(`{"input":1,"output":4,"cache_read":0.1}`), nil, nil).
 			AddRow(int64(901), int64(6), "渠道B", "gpt-4o-int", []byte(`{"input":0.2,"output":0.8,"cache_read":0.02}`), nil, nil))
@@ -757,6 +781,282 @@ func TestPredictBreakEven_AxisAlwaysReported(t *testing.T) {
 			}
 		})
 	}
+}
+
+// ---------- PR #65 Owl 返修用例（P2-1 ~ P2-4）----------
+
+// TestBuildTraceSegments_FailoverIsNotSwitch 请求内 failover（A 429 失败 → B 成功）不是会话级渠道切换。
+func TestBuildTraceSegments_FailoverIsNotSwitch(t *testing.T) {
+	points := []costTracePoint{
+		{TurnNo: 1, Failed: true, Status: billing.StatusFailed, ChannelID: 5, ChannelName: "渠道A", ChannelModelID: 900, InternalModelID: "m1"},
+		{TurnNo: 2, ChannelID: 6, ChannelName: "渠道B", ChannelModelID: 901, InternalModelID: "m1", CostCredits: 1},
+	}
+	_, switches := buildTraceSegments(points)
+	if len(switches) != 0 {
+		t.Fatalf("请求内 failover 不应算切换: %+v", switches)
+	}
+}
+
+// TestBuildTraceSegments_RejectInMiddleNoFakeSwitch A(成功) → 0(无渠道拒绝) → A(成功)：0 次切换、无空渠道名。
+func TestBuildTraceSegments_RejectInMiddleNoFakeSwitch(t *testing.T) {
+	points := []costTracePoint{
+		{TurnNo: 1, ChannelID: 5, ChannelName: "渠道A", ChannelModelID: 900, InternalModelID: "m1"},
+		{TurnNo: 2, Failed: true, Status: billing.StatusFailed, ChannelID: 0},
+		{TurnNo: 3, ChannelID: 5, ChannelName: "渠道A", ChannelModelID: 900, InternalModelID: "m1"},
+	}
+	_, switches := buildTraceSegments(points)
+	if len(switches) != 0 {
+		t.Fatalf("A→空→A 不应产生切换（旧实现会算 2 次假切换）: %+v", switches)
+	}
+}
+
+// TestBuildTraceSegments_SwitchAfterFailoverAtSuccessPoint 成功轮 A → (下一请求) B 失败 → B 成功：
+// 真实切换只有 1 次，且挂在**成功点**上（失败点只是同一次请求内的候选重试）。
+func TestBuildTraceSegments_SwitchAfterFailoverAtSuccessPoint(t *testing.T) {
+	points := []costTracePoint{
+		{TurnNo: 1, ChannelID: 5, ChannelName: "渠道A", ChannelModelID: 900, InternalModelID: "m1"},
+		{TurnNo: 2, Failed: true, Status: billing.StatusFailed, ChannelID: 6, ChannelName: "渠道B", ChannelModelID: 901, InternalModelID: "m1"},
+		{TurnNo: 3, ChannelID: 6, ChannelName: "渠道B", ChannelModelID: 901, InternalModelID: "m1"},
+	}
+	_, switches := buildTraceSegments(points)
+	if len(switches) != 1 {
+		t.Fatalf("应只有 1 次真实切换: %+v", switches)
+	}
+	sw := switches[0]
+	if sw.TurnNo != 3 || sw.FromChannelID != 5 || sw.ToChannelID != 6 {
+		t.Fatalf("切换点必须落在成功点（TurnNo=3）且带前后渠道: %+v", sw)
+	}
+}
+
+// TestHandleCostSessionTrace_IntraRequestFailover 断言接口层同时满足：
+// ① 请求内 failover 不产生切换点；② 失败点不带 ChannelChanged；③ 预测打平点照常下发。
+func TestHandleCostSessionTrace_IntraRequestFailover(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	expectSwitchOn(mock)
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT count(*) FROM billing_records WHERE session_id = $1`)).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(2)))
+	base := pricingTestAt(t)
+	mock.ExpectQuery(regexp.QuoteMeta(`FROM billing_records b`)).
+		WithArgs("sess-failover", nil).
+		WillReturnRows(sqlmock.NewRows(traceCols).
+			AddRow(traceRow(t, base, "failed", int64(5), "渠道A", int64(900), "gpt-4o-int", 1.5, 2.0)...).
+			AddRow(traceRow(t, base.Add(time.Second), "completed", int64(6), "渠道B", int64(901), "gpt-4o-int", 0.8, 2.0)...))
+	expectGlobalTimeAndTiers(mock)
+	mock.ExpectQuery(regexp.QuoteMeta(`WHERE cm.deleted_at IS NULL AND cm.internal_model_id = $1`)).
+		WithArgs("gpt-4o-int", int64(901)).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "channel_id", "name", "internal_model_id", "cost_rates", "time_config", "context_tiers"}).
+			AddRow(int64(901), int64(6), "渠道B", "gpt-4o-int", []byte(`{"input":1,"output":4,"cache_read":0.1}`), nil, nil).
+			AddRow(int64(900), int64(5), "渠道A", "gpt-4o-int", []byte(`{"input":0.2,"output":0.8,"cache_read":0.02}`), nil, nil))
+
+	h := NewAdmin(db, nil, nil, nil)
+	h.now = func() time.Time { return pricingTestAt(t) }
+	rec := httptest.NewRecorder()
+	h.HandleCostSessionTrace(rec, traceRequest("sess-failover", "?Step=1000&MaxTokens=20000&At=19:30"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	d := decodeTrace(t, rec)
+	if len(d.ActualSwitches) != 0 {
+		t.Fatalf("请求内 failover 不应算真实切换: %+v", d.ActualSwitches)
+	}
+	for i, pt := range d.Points {
+		if pt.ChannelChanged {
+			t.Fatalf("点 %d 不应带 ChannelChanged（同一请求内换候选）: %+v", i, d.Points)
+		}
+	}
+	if d.PredictedBreakEven == nil || !d.PredictedBreakEven.Matched {
+		t.Fatalf("failover 不应把预测打平点整块禁掉: %+v", d.PredictedBreakEven)
+	}
+	if d.PredictedBreakEven.ChannelModelID != 901 {
+		t.Fatalf("预测基准应取「成功且有渠道」的点（901），got %+v", d.PredictedBreakEven)
+	}
+}
+
+// TestHandleCostSessionTrace_RejectInMiddle 无渠道拒绝账单夹在中间：0 切换、不出现空渠道名、预测仍下发。
+func TestHandleCostSessionTrace_RejectInMiddle(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	expectSwitchOn(mock)
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT count(*) FROM billing_records WHERE session_id = $1`)).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(3)))
+	base := pricingTestAt(t)
+	mock.ExpectQuery(regexp.QuoteMeta(`FROM billing_records b`)).
+		WithArgs("sess-reject", nil).
+		WillReturnRows(sqlmock.NewRows(traceCols).
+			AddRow(traceRow(t, base, "completed", int64(5), "渠道A", int64(900), "gpt-4o-int", 1.5, 2.0)...).
+			AddRow(traceRow(t, base.Add(time.Second), "failed", int64(0), "", int64(0), "", 0, 0)...).
+			AddRow(traceRow(t, base.Add(2*time.Second), "completed", int64(5), "渠道A", int64(900), "gpt-4o-int", 1.5, 2.0)...))
+	expectGlobalTimeAndTiers(mock)
+	mock.ExpectQuery(regexp.QuoteMeta(`WHERE cm.deleted_at IS NULL AND cm.internal_model_id = $1`)).
+		WithArgs("gpt-4o-int", int64(900)).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "channel_id", "name", "internal_model_id", "cost_rates", "time_config", "context_tiers"}).
+			AddRow(int64(900), int64(5), "渠道A", "gpt-4o-int", []byte(`{"input":1,"output":4,"cache_read":0.1}`), nil, nil).
+			AddRow(int64(901), int64(6), "渠道B", "gpt-4o-int", []byte(`{"input":0.2,"output":0.8,"cache_read":0.02}`), nil, nil))
+
+	h := NewAdmin(db, nil, nil, nil)
+	h.now = func() time.Time { return pricingTestAt(t) }
+	rec := httptest.NewRecorder()
+	h.HandleCostSessionTrace(rec, traceRequest("sess-reject", "?Step=1000&MaxTokens=20000&At=19:30"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	d := decodeTrace(t, rec)
+	if len(d.ActualSwitches) != 0 {
+		t.Fatalf("A→空→A 不应有切换点: %+v", d.ActualSwitches)
+	}
+	for _, sw := range d.ActualSwitches {
+		if sw.FromChannelID == 0 || sw.ToChannelID == 0 || sw.ToChannelName == "" {
+			t.Fatalf("切换点里不应出现空渠道: %+v", sw)
+		}
+	}
+	for i, pt := range d.Points {
+		if pt.ChannelChanged {
+			t.Fatalf("点 %d 不应被标成切换: %+v", i, d.Points)
+		}
+	}
+	if d.PredictedBreakEven == nil || !d.PredictedBreakEven.Matched {
+		t.Fatalf("拒绝账单不应让预测失效: %+v", d.PredictedBreakEven)
+	}
+}
+
+// TestHandleCostSessionTrace_FirstRecordIsReject 首条是拒绝账单（无渠道/无模型）时仍需给出预测打平点。
+func TestHandleCostSessionTrace_FirstRecordIsReject(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	expectSwitchOn(mock)
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT count(*) FROM billing_records WHERE session_id = $1`)).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(2)))
+	base := pricingTestAt(t)
+	mock.ExpectQuery(regexp.QuoteMeta(`FROM billing_records b`)).
+		WithArgs("sess-first-reject", nil).
+		WillReturnRows(sqlmock.NewRows(traceCols).
+			AddRow(traceRow(t, base, "failed", int64(0), "", int64(0), "", 0, 0)...).
+			AddRow(traceRow(t, base.Add(time.Second), "completed", int64(5), "渠道A", int64(900), "gpt-4o-int", 1.5, 2.0)...))
+	expectGlobalTimeAndTiers(mock)
+	mock.ExpectQuery(regexp.QuoteMeta(`WHERE cm.deleted_at IS NULL AND cm.internal_model_id = $1`)).
+		WithArgs("gpt-4o-int", int64(900)).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "channel_id", "name", "internal_model_id", "cost_rates", "time_config", "context_tiers"}).
+			AddRow(int64(900), int64(5), "渠道A", "gpt-4o-int", []byte(`{"input":1,"output":4,"cache_read":0.1}`), nil, nil).
+			AddRow(int64(901), int64(6), "渠道B", "gpt-4o-int", []byte(`{"input":0.2,"output":0.8,"cache_read":0.02}`), nil, nil))
+
+	h := NewAdmin(db, nil, nil, nil)
+	h.now = func() time.Time { return pricingTestAt(t) }
+	rec := httptest.NewRecorder()
+	h.HandleCostSessionTrace(rec, traceRequest("sess-first-reject", "?Step=1000&MaxTokens=20000&At=19:30"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	be := decodeTrace(t, rec).PredictedBreakEven
+	if be == nil || !be.Matched || be.ChannelModelID != 900 {
+		t.Fatalf("首条是拒绝账单时，基准应取后面第一条成功记录（900）: %+v", be)
+	}
+	if contains(be.Reason, "配置缺失") {
+		t.Fatalf("不应把「首条是拒绝」误报成配置缺失: %q", be.Reason)
+	}
+}
+
+// TestLoadSiblingChannelModels_FiltersDeadChannels 候选渠道必须排除软删/停用渠道，但**当前渠道那条要保留**。
+func TestLoadSiblingChannelModels_FiltersDeadChannels(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery(regexp.QuoteMeta(`AND (cm.id = $2 OR (c.deleted_at IS NULL AND c.state <> 'DISABLED'))`)).
+		WithArgs("gpt-4o-int", int64(900)).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "channel_id", "name", "internal_model_id", "cost_rates", "time_config", "context_tiers"}).
+			AddRow(int64(900), int64(5), "渠道A（已停用但仍是当前渠道）", "gpt-4o-int", []byte(`{"input":1,"output":4,"cache_read":0.1}`), nil, nil))
+
+	h := NewAdmin(db, nil, nil, nil)
+	got, err := h.loadSiblingChannelModels(t.Context(), "gpt-4o-int", 900, billing.TimeCoeffConfig{Default: 1}, nil)
+	if err != nil {
+		t.Fatalf("loadSiblingChannelModels: %v", err)
+	}
+	if len(got) != 1 || got[0].ChannelModelID != 900 {
+		t.Fatalf("当前渠道那条应保留: %+v", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("查询期望未满足: %v", err)
+	}
+}
+
+// TestHandleGetSystemConfig_CostViewsSwitchReadError 读取失败 → 下发 null（未知），
+// 不能退化成 false 让前端照样回写（否则管理员一次保存就把开关静默关掉）。
+func TestHandleGetSystemConfig_CostViewsSwitchReadError(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+	admin := NewAdmin(db, billing.NewSqlStore(db), nil, nil)
+
+	expectConfigRow(mock, "billing.r", []byte(`10000`))
+	expectConfigRow(mock, "billing.cny_rate", []byte(`6.8`))
+	expectConfigRow(mock, "billing.context_tiers", []byte(`[]`))
+	expectConfigRow(mock, "billing.time_config", []byte(`{"Timezone":"Asia/Shanghai","Default":1}`))
+	expectConfigRow(mock, "routing.cost_sample", []byte(`{"input":10000,"cache_read":9000,"output":1000}`))
+	expectConfigRow(mock, "session.expiration", []byte(`{"default_ttl_minutes":5,"context_tiers":[],"turn_tiers":[]}`))
+	expectConfigRow(mock, "gateway.upstream_response_header_whitelist", []byte(`[]`))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT value FROM sys_configs WHERE key = $1`)).
+		WithArgs(costViewsSwitchKey).
+		WillReturnError(context.DeadlineExceeded) // 不是 sql.ErrNoRows：属「未知」
+
+	rec := httptest.NewRecorder()
+	admin.HandleGetSystemConfig(rec, httptest.NewRequest(http.MethodGet, "/api/v1/admin/configs/system", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if !contains(rec.Body.String(), `"MultichannelTrace":null`) {
+		t.Fatalf("读取失败应下发 null（前端跳过回写）: %s", rec.Body.String())
+	}
+}
+
+// TestCostViewsCheckOrderUnified 关闭开关时两个端点对「非法参数」都先返回 400（参数优先于能力开关），
+// 只有参数合法时才走 403，避免同一开关两种口径。
+func TestCostViewsCheckOrderUnified(t *testing.T) {
+	t.Run("trace 关闭+非法 Limit = 400", func(t *testing.T) {
+		db, _, err := sqlmock.New()
+		if err != nil {
+			t.Fatalf("sqlmock: %v", err)
+		}
+		defer db.Close()
+		h := NewAdmin(db, nil, nil, nil)
+		h.now = func() time.Time { return pricingTestAt(t) }
+		rec := httptest.NewRecorder()
+		h.HandleCostSessionTrace(rec, traceRequest("sess-x", "?Limit=abc"))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("关闭开关 + 非法 Limit 应 400（与 pricing-curve 统一），got %d body=%s", rec.Code, rec.Body.String())
+		}
+	})
+	t.Run("pricing-curve 关闭+非法 ChannelModelIDs = 400", func(t *testing.T) {
+		db, _, err := sqlmock.New()
+		if err != nil {
+			t.Fatalf("sqlmock: %v", err)
+		}
+		defer db.Close()
+		h := NewAdmin(db, nil, nil, nil)
+		h.now = func() time.Time { return pricingTestAt(t) }
+		rec := httptest.NewRecorder()
+		h.HandleCostPricingCurve(rec, httptest.NewRequest(http.MethodGet,
+			"/api/v1/admin/cost/pricing-curve?ChannelModelIDs=900,abc", nil))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("非法 ChannelModelIDs 应 400，got %d body=%s", rec.Code, rec.Body.String())
+		}
+	})
 }
 
 // ---------- 开关的读写（系统配置） ----------

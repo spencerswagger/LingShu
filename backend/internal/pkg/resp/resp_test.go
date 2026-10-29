@@ -47,6 +47,42 @@ func TestErrLogsAPIError(t *testing.T) {
 	}
 }
 
+// ErrNoLog 用于「能力未启用」这类预期内拒绝：写同样的响应壳，但**不落**异常日志（4xx 告警不误报）。
+// 序列化失败（真异常）仍应落 5xx 日志——这里用不可序列化的 Data 走不到，故只验正常路径。
+func TestErrNoLogWritesBodyWithoutLogging(t *testing.T) {
+	var buf bytes.Buffer
+	l := slog.New(slog.NewTextHandler(&buf, nil))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/cost/session/s1/trace", nil)
+	req = WithRequestID(req, "req-quiet-1")
+	req = req.WithContext(logger.WithLogger(req.Context(), l))
+
+	rec := httptest.NewRecorder()
+	ErrNoLog(rec, req, http.StatusForbidden, CodeForbidden, "能力未启用")
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("want 403, got %d", rec.Code)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("预期内拒绝不应落异常日志，实际：\n%s", buf.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `"Code":40301`) || !strings.Contains(body, "能力未启用") ||
+		!strings.Contains(body, `"RequestID":"req-quiet-1"`) {
+		t.Fatalf("响应体应与 Err 同构（含 Code/Message/RequestID）：%s", body)
+	}
+
+	// 对照：Err 同一场景必须落日志（证明差别只在日志，不在响应）。
+	rec = httptest.NewRecorder()
+	Err(rec, req, http.StatusForbidden, CodeForbidden, "能力未启用")
+	if !strings.Contains(buf.String(), "api error") {
+		t.Fatalf("Err 应落异常日志，实际：%s", buf.String())
+	}
+	if rec.Body.String() != body {
+		t.Fatalf("ErrNoLog 与 Err 的响应体应完全一致：\nquiet=%s\nlog=%s", body, rec.Body.String())
+	}
+}
+
 // 未注入 logger（未装配/单测直调）时只写响应，不得 panic。
 func TestErrWithoutLoggerDoesNotPanic(t *testing.T) {
 	rec := httptest.NewRecorder()
