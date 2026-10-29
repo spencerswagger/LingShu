@@ -509,7 +509,8 @@ func liveUserNames(ctx context.Context, db *sql.DB, ids []int64) map[int64]strin
 }
 
 // buildLiveStats 组装实时区数据。
-//   - reg 为 nil（未装配会话注册表）→ 返回空集合，不报错；
+//   - reg 为 nil（未装配会话注册表）→ **只有「我的会话」为空**，在线用户仍按 DB 口径照常返回
+//     （两套口径各自独立取数，不互相降级）；
 //   - db 为 nil（未装配 DB）→ 会话列表仍返回（含 Inflight），数值列为 0；在线用户为空；
 //   - userID 非 nil 时只统计该用户（开发端「我的会话」/「我」）。
 //
@@ -544,31 +545,32 @@ func buildLiveStats(ctx context.Context, db *sql.DB, reg *router.SessionRegistry
 		out.DailyFrom = dayKeys[0]
 		out.DailyTo = dayKeys[len(dayKeys)-1]
 	}
-	if reg == nil {
-		return out, nil
-	}
 
 	// 1) 我的会话：请求中 + 最近 5 分钟内有请求（注册表内存为准），最近活跃优先。
-	activeSince := now.Add(-liveActiveSessionLookback)
-	sessions := make([]*router.Session, 0, 16)
-	for _, s := range reg.ListAll() {
-		if s == nil || s.Closed {
-			continue
+	// 未装配注册表时只跳过这一段，**不**影响下一步的在线用户（DB 口径不需要注册表）。
+	var sessions []*router.Session
+	if reg != nil {
+		activeSince := now.Add(-liveActiveSessionLookback)
+		sessions = make([]*router.Session, 0, 16)
+		for _, s := range reg.ListAll() {
+			if s == nil || s.Closed {
+				continue
+			}
+			if s.Inflight <= 0 && s.LastActive.Before(activeSince) {
+				continue
+			}
+			if userID != nil && s.UserID != *userID {
+				continue
+			}
+			sessions = append(sessions, s)
 		}
-		if s.Inflight <= 0 && s.LastActive.Before(activeSince) {
-			continue
-		}
-		if userID != nil && s.UserID != *userID {
-			continue
-		}
-		sessions = append(sessions, s)
+		sort.Slice(sessions, func(i, j int) bool {
+			if !sessions[i].LastActive.Equal(sessions[j].LastActive) {
+				return sessions[i].LastActive.After(sessions[j].LastActive)
+			}
+			return sessions[i].SessionID < sessions[j].SessionID
+		})
 	}
-	sort.Slice(sessions, func(i, j int) bool {
-		if !sessions[i].LastActive.Equal(sessions[j].LastActive) {
-			return sessions[i].LastActive.After(sessions[j].LastActive)
-		}
-		return sessions[i].SessionID < sessions[j].SessionID
-	})
 	out.SessionsTotal = len(sessions)
 	if len(sessions) > liveMaxSessions {
 		sessions = sessions[:liveMaxSessions]

@@ -253,6 +253,48 @@ func TestBuildLiveStats_NoRegistry(t *testing.T) {
 	}
 }
 
+// TestBuildLiveStats_NoRegistryStillQueriesUsers 注册表未装配时**只**让「我的会话」为空，
+// 在线用户仍按 DB 口径返回（Owl 建议项：此前在查在线用户之前就提前返回，导致恒 0）。
+func TestBuildLiveStats_NoRegistryStillQueriesUsers(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery(regexp.QuoteMeta(`count(DISTINCT session_id)`)).
+		WillReturnRows(sqlmock.NewRows([]string{"user_id", "calls", "active_sessions",
+			"win_tokens", "win_credits", "range_tokens", "range_credits"}).
+			AddRow(int64(7), int64(3), int64(1), int64(600), float64(1.2), int64(4000), float64(6)))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, username, nickname FROM users`)).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "username", "nickname"}).
+			AddRow(int64(7), "dev", "开发者"))
+	mock.ExpectQuery(regexp.QuoteMeta(`date_trunc('minute'`)).
+		WillReturnRows(sqlmock.NewRows([]string{"user_id", "minute", "tokens"}))
+	mock.ExpectQuery(regexp.QuoteMeta(`date_trunc('day'`)).
+		WillReturnRows(sqlmock.NewRows([]string{"user_id", "day", "tokens"}).
+			AddRow(int64(7), liveNow(), int64(4000)))
+
+	p := liveParams{WindowMinutes: 60, Window: 60 * time.Minute, SparkPoints: 12, Limit: 20,
+		From: liveNow().Add(-24 * time.Hour), To: liveNow()}
+	out, err := buildLiveStats(context.Background(), db, nil, liveNow(), nil, "global", p)
+	if err != nil {
+		t.Fatalf("buildLiveStats: %v", err)
+	}
+	if out.SessionsTotal != 0 || len(out.Sessions) != 0 {
+		t.Fatalf("未装配注册表时「我的会话」应为空: %+v", out.Sessions)
+	}
+	if out.UsersTotal != 1 || len(out.Users) != 1 || out.Users[0].ID != "7" {
+		t.Fatalf("在线用户不应跟着降级为 0: total=%d users=%+v", out.UsersTotal, out.Users)
+	}
+	if out.Users[0].RangeTokens != 4000 || out.Users[0].Name != "开发者" {
+		t.Fatalf("用户行字段错: %+v", out.Users[0])
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("未满足的期望: %v", err)
+	}
+}
+
 // TestBuildLiveStats_SanitizedAndAggregates 断言：
 //  1. 会话/用户行的字段集与白名单**完全一致**（字段层面杜绝内容泄露）；
 //  2. 聚合值（上下文、本轮 Token、TPM、花费、曲线、日活跃序列）落到正确字段。
