@@ -345,6 +345,11 @@ func buildTraceSegments(points []costTracePoint) ([]costTraceSegment, []costTrac
 // 单点成本相等的处理：要求严格小于才算「反超」，相等继续往后找（避免把打平前的重合段当切换点）。
 func (h *Admin) predictBreakEven(ctx context.Context, first costTracePoint,
 	p pricingCurveParams, r int64) *costTraceBreakEven {
+	// 先把采样横轴定成「实际会用的值」：未显式传 MaxTokens 时按分档推导、再按点数上限收敛
+	// （与定价曲线接口同一套规则）。这样响应里的 Step/MaxTokens 永远是真实采样参数，
+	// 不会出现前端显示「上限 0」这种半成品——包括下面各条提前返回的分支。
+	requestedMax := p.MaxTokens // 记下调用方是否显式指定（0 = 未指定）
+	resolvePredictionAxis(&p, nil)
 	out := &costTraceBreakEven{
 		Kind:            traceKindPredicted,
 		Predicted:       true,
@@ -353,6 +358,7 @@ func (h *Admin) predictBreakEven(ctx context.Context, first costTracePoint,
 		ChannelName:     first.ChannelName,
 		InternalModelID: first.InternalModelID,
 		Step:            p.Step,
+		MaxTokens:       p.MaxTokens,
 	}
 	if first.ChannelModelID <= 0 || first.InternalModelID == "" {
 		out.Reason = "账单未解析到渠道内部模型，无法预测打平点"
@@ -390,6 +396,14 @@ func (h *Admin) predictBreakEven(ctx context.Context, first costTracePoint,
 		return out
 	}
 
+	// 拿到实际渠道的分档后定一次横轴：只有「调用方没显式指定 MaxTokens」时才按该模型的分档重推
+	// （显式值只做上限收敛，不被改大）；推导结果同时回吐到响应里，前端按值渲染即可。
+	if requestedMax <= 0 {
+		p.MaxTokens = resolveCurveMaxTokens(0, p.Step, current.Tiers)
+	}
+	out.Step = p.Step
+	out.MaxTokens = p.MaxTokens
+
 	curLine, err := buildPricingLine(*current, p, r)
 	if err != nil || !curLine.Available {
 		out.Reason = "会话实际渠道的成本费率缺失，无法预测打平点"
@@ -424,6 +438,7 @@ func (h *Admin) predictBreakEven(ctx context.Context, first costTracePoint,
 				Tokens:                    tokens,
 				Matched:                   true,
 				Step:                      p.Step,
+				MaxTokens:                 p.MaxTokens,
 				Reason:                    "会话从未切换渠道；该上下文长度起，替代渠道的单次成本开始低于实际渠道（按当前费率与分档推算）",
 			}
 		}
@@ -432,8 +447,31 @@ func (h *Admin) predictBreakEven(ctx context.Context, first costTracePoint,
 		out.Reason = "采样范围内（Step/MaxTokens）没有出现替代渠道更便宜的点，可放大 MaxTokens 或缩小 Step 再试"
 		return out
 	}
-	best.MaxTokens = p.MaxTokens
 	return best
+}
+
+// resolvePredictionAxis 把采样横轴定成「实际会用的值」：Step 缺省 1000；MaxTokens 未显式给时按分档推导
+// （defaultCurveMaxTokens），再按总点数上限 pricingCurveMaxPoints 收敛。
+//
+// 与 pricing-curve 接口的推导完全同规则，抽出来只给预测打平点用，避免两处口径漂移。
+func resolvePredictionAxis(p *pricingCurveParams, tiers []billing.TierRule) {
+	if p.Step <= 0 {
+		p.Step = pricingCurveDefaultStep
+	}
+	p.MaxTokens = resolveCurveMaxTokens(p.MaxTokens, p.Step, tiers)
+}
+
+// resolveCurveMaxTokens 把请求的横轴上限收敛成**实际使用的值**：
+// <=0（未指定）时按分档推导；再按点数上限收敛（Step 不变，点的 token 语义不变）。
+// 显式值小于上限时原样返回（不会被改大）。
+func resolveCurveMaxTokens(maxTokens, step int64, tiers []billing.TierRule) int64 {
+	if maxTokens <= 0 {
+		maxTokens = defaultCurveMaxTokens(tiers)
+	}
+	if step > 0 && maxTokens/step > pricingCurveMaxPoints {
+		maxTokens = step * pricingCurveMaxPoints
+	}
+	return maxTokens
 }
 
 // firstCrossTokens 在两条同轴成本曲线上找「替代线第一次严格低于实际线」的上下文长度（线性插值）。

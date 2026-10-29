@@ -672,6 +672,93 @@ func TestPredictBreakEven_UnresolvedChannel(t *testing.T) {
 	}
 }
 
+// TestHandleCostSessionTrace_BreakEvenAxisReported 断言**未显式传参**时预测点回吐真实生效的
+// Step/MaxTokens（按分档推导 + 点数上限收敛），不再是 0（前端会按响应值渲染，不该显示「上限 0」）。
+func TestHandleCostSessionTrace_BreakEvenAxisReported(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	expectSwitchOn(mock)
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT count(*) FROM billing_records WHERE session_id = $1`)).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(1)))
+	base := pricingTestAt(t)
+	mock.ExpectQuery(regexp.QuoteMeta(`FROM billing_records b`)).
+		WithArgs("sess-6", nil).
+		WillReturnRows(sqlmock.NewRows(traceCols).
+			AddRow(traceRow(t, base, "completed", int64(5), "渠道A", int64(900), "gpt-4o-int", 1.5, 2.0)...))
+	// 全局时段 + 分档：最高档上界 128000 → 未传 MaxTokens 时应推成 128000。
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT value FROM sys_configs WHERE key = $1`)).
+		WithArgs("billing.time_config").
+		WillReturnRows(sqlmock.NewRows([]string{"value"}).AddRow([]byte(`{"Timezone":"Asia/Shanghai","Default":1.0,"Periodic":[{"Name":"高峰","Start":"18:00","End":"22:00","Coeff":1.5}]}`)))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT value FROM sys_configs WHERE key = $1`)).
+		WithArgs("billing.context_tiers").
+		WillReturnRows(sqlmock.NewRows([]string{"value"}).AddRow([]byte(`[{"Min":0,"Max":128000,"Coeff":1.0}]`)))
+	mock.ExpectQuery(regexp.QuoteMeta(`WHERE cm.deleted_at IS NULL AND cm.internal_model_id = $1`)).
+		WithArgs("gpt-4o-int").
+		WillReturnRows(sqlmock.NewRows([]string{"id", "channel_id", "name", "internal_model_id", "cost_rates", "time_config", "context_tiers"}).
+			AddRow(int64(900), int64(5), "渠道A", "gpt-4o-int", []byte(`{"input":1,"output":4,"cache_read":0.1}`), nil, nil).
+			AddRow(int64(901), int64(6), "渠道B", "gpt-4o-int", []byte(`{"input":0.2,"output":0.8,"cache_read":0.02}`), nil, nil))
+
+	h := NewAdmin(db, nil, nil, nil)
+	h.now = func() time.Time { return pricingTestAt(t) }
+	// 只传 At：Step / MaxTokens 全走缺省推导。
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/cost/session/sess-6/trace?At=19:30", nil)
+	req.SetPathValue("id", "sess-6")
+	rec := httptest.NewRecorder()
+	h.HandleCostSessionTrace(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Data costTraceResponse `json:"Data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	be := body.Data.PredictedBreakEven
+	if be == nil || !be.Matched {
+		t.Fatalf("应当给出预测打平点: %+v", be)
+	}
+	if be.Step != pricingCurveDefaultStep || be.MaxTokens != 128000 {
+		t.Fatalf("应回吐实际生效的横轴：Step=%d MaxTokens=%d，want %d/128000",
+			be.Step, be.MaxTokens, pricingCurveDefaultStep)
+	}
+	if be.Tokens != 1000 {
+		t.Fatalf("替代渠道从第一个采样点就更便宜，Tokens 应为 1000，got %d", be.Tokens)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("查询期望未满足: %v", err)
+	}
+}
+
+// TestPredictBreakEven_AxisAlwaysReported 断言每条提前返回的分支都带上横轴（不会留 0）。
+func TestPredictBreakEven_AxisAlwaysReported(t *testing.T) {
+	cases := []struct {
+		name  string
+		first costTracePoint
+	}{
+		{"未解析到渠道内部模型", costTracePoint{ChannelID: 5}},
+		{"未装配数据库", costTracePoint{ChannelID: 5, ChannelModelID: 900, InternalModelID: "m1"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var h *Admin
+			if c.name == "未解析到渠道内部模型" {
+				h = NewAdmin(nil, nil, nil, nil)
+			} else {
+				h = NewAdmin(nil, nil, nil, nil) // db=nil 也会走提前返回
+			}
+			got := h.predictBreakEven(t.Context(), c.first, pricingCurveParams{}, 10000)
+			if got.Step != pricingCurveDefaultStep || got.MaxTokens != pricingCurveDefaultMaxToken {
+				t.Fatalf("提前返回也应回报缺省横轴：Step=%d MaxTokens=%d", got.Step, got.MaxTokens)
+			}
+		})
+	}
+}
+
 // ---------- 开关的读写（系统配置） ----------
 
 // TestHandleGetSystemConfig_CostViewsSwitch 断言系统配置 GET 下发 Console.MultichannelTrace，

@@ -445,7 +445,8 @@ func parseCurveAt(raw string, now time.Time) (time.Time, error) {
 //   - ChannelModelID：指定成本线模型（其对外模型在未显式指定售价模型时用于售价线）；
 //   - ChannelModelIDs：**多线对比**，逗号分隔的渠道内部模型 ID（最多 10 个）。传了就额外返回 Lines，
 //     每行一个 (渠道, 渠道内部模型) 各带自己的成本/售价曲线；不传时响应与改造前逐字节一致。
-//     受功能开关 console.cost_multichannel_trace 控制（默认关闭，关闭时传该参数返回 400）。
+//     受功能开关 console.cost_multichannel_trace 控制（默认关闭，关闭时传该参数返回 **403**：
+//     属「能力未启用」而非「参数写错」，前端据此隐藏入口）。
 //   - Step / MaxTokens / HitRate / InOutRatio：采样参数；
 //   - At：结算时刻（RFC3339 或 HH:MM），决定时段系数，缺省 now。
 //
