@@ -49,6 +49,9 @@ var defaultSysConfigs = map[string]string{
 	"routing.session_cost": `{"enabled":false,"mid_switch":false,"shadow_enabled":false,"remaining_a":10,"remaining_b":0,"remaining_min":1,"remaining_max":20,"min_remaining":1,"cooldown_sec":0,"min_improve":0}`,
 	// 会话过期分档兜底与示例档位（双维度取较大者，且不低于兜底 5 分钟）。
 	"session.expiration": `{"default_ttl_minutes":5,"context_tiers":[{"max_tokens":2000,"ttl_minutes":5},{"max_tokens":8000,"ttl_minutes":30},{"max_tokens":32000,"ttl_minutes":180},{"max_tokens":128000,"ttl_minutes":1440}],"turn_tiers":[{"max_turns":2,"ttl_minutes":5},{"max_turns":10,"ttl_minutes":30},{"max_turns":50,"ttl_minutes":180},{"max_turns":200,"ttl_minutes":1440}]}`,
+	// 成本页增强视图开关（多线对比 / 会话渠道轨迹）：默认 false = 现状不变。
+	// 只控制两个新增只读接口是否可用，不参与计费与路由。
+	"console.cost_multichannel_trace": `false`,
 }
 
 // systemUser / systemToken 常量：健康探测开销的归属身份（成本记账），用户侧界面隐藏。

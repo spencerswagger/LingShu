@@ -27,6 +27,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/team/llmgateway/internal/domain/billing"
@@ -44,6 +45,8 @@ const (
 	pricingCurveDefaultHitRate  = 0.9 // 缓存读占输入比例，与 routing.sample_profile 默认同源
 	pricingCurveDefaultInOut    = 10.0
 	pricingCurveMaxInOutRatio   = 1e6
+	// pricingCurveMaxLines ChannelModelIDs 单次最多几条线（超了直接 400，不静默截断）。
+	pricingCurveMaxLines = 10
 )
 
 // pricingCurveParams 曲线采样参数（已收敛到合法范围）。
@@ -111,6 +114,9 @@ type pricingLine struct {
 }
 
 // pricingCurveResponse 定价曲线响应。Sale/Cost 恒为对象（缺配置时 Available=false + Reason），不返回 null。
+//
+// Lines 只在传了 ChannelModelIDs 时出现（omitempty）：不传该参数时该字段**整个不出现**，
+// 响应与改造前逐字节一致（有 testdata 里的 golden 快照兜底）。
 type pricingCurveResponse struct {
 	At               string              `json:"At"`
 	TimeZone         string              `json:"TimeZone"`
@@ -124,6 +130,35 @@ type pricingCurveResponse struct {
 	DefaultTimeCoeff float64             `json:"DefaultTimeCoeff"`
 	Sale             pricingLine         `json:"Sale"`
 	Cost             pricingLine         `json:"Cost"`
+	// Lines 多渠道多线对比（可选）：每行一个 (渠道, 渠道内部模型)，各带自己的成本线与售价线。
+	// 缺省 nil → 序列化时整个键不出现（向后兼容的硬要求，见 TestHandleCostPricingCurve_GoldenUnchanged）。
+	Lines []pricingMultiLine `json:"Lines,omitempty"`
+}
+
+// pricingMultiLine 多线对比里的一条线。
+//
+// 键语义：ChannelModelID 是请求里给的渠道内部模型 ID（不存在也原样回吐，方便前端对号）；
+// Available/Reason 取**成本线**的判定（成本费率缺失=画不出成本线），售价线另看 Sale.Available。
+type pricingMultiLine struct {
+	LineIndex         int         `json:"LineIndex"` // 去重后的请求顺序下标，供前端图例排序
+	ChannelModelID    int64       `json:"ChannelModelID"`
+	ChannelID         int64       `json:"ChannelID"`
+	ChannelName       string      `json:"ChannelName"`
+	InternalModelID   string      `json:"InternalModelID"`
+	ExternalModelID   int64       `json:"ExternalModelID"`
+	ExternalModelName string      `json:"ExternalModelName"`
+	Available         bool        `json:"Available"`
+	Reason            string      `json:"Reason"`
+	PointCount        int         `json:"PointCount"`
+	Cost              pricingLine `json:"Cost"`
+	Sale              pricingLine `json:"Sale"`
+}
+
+// multiLineInputs 一条多线对比的原始配置（尚未出点）。
+type multiLineInputs struct {
+	LineIndex int
+	Cost      pricingModelConfig
+	Sale      pricingModelConfig
 }
 
 // pricingModelConfig 建线所需的模型配置（模型级已与全局合并完毕）。
@@ -408,6 +443,9 @@ func parseCurveAt(raw string, now time.Time) (time.Time, error) {
 // 参数（全部可选）：
 //   - ExternalModelID / ExternalModelName：指定售价线模型（二选一）；
 //   - ChannelModelID：指定成本线模型（其对外模型在未显式指定售价模型时用于售价线）；
+//   - ChannelModelIDs：**多线对比**，逗号分隔的渠道内部模型 ID（最多 10 个）。传了就额外返回 Lines，
+//     每行一个 (渠道, 渠道内部模型) 各带自己的成本/售价曲线；不传时响应与改造前逐字节一致。
+//     受功能开关 console.cost_multichannel_trace 控制（默认关闭，关闭时传该参数返回 400）。
 //   - Step / MaxTokens / HitRate / InOutRatio：采样参数；
 //   - At：结算时刻（RFC3339 或 HH:MM），决定时段系数，缺省 now。
 //
@@ -427,6 +465,16 @@ func (h *Admin) HandleCostPricingCurve(w http.ResponseWriter, r *http.Request) {
 	channelModelID, err := parseOptionalInt64(q.Get("ChannelModelID"))
 	if err != nil {
 		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "ChannelModelID 必须为数字")
+		return
+	}
+	multiIDs, err := parseChannelModelIDs(q.Get("ChannelModelIDs"))
+	if err != nil {
+		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, err.Error())
+		return
+	}
+	// 功能开关：默认关闭。关闭时**只**拒绝新参数，不传该参数的旧请求完全不受影响。
+	if len(multiIDs) > 0 && !h.costViewsEnabled(r.Context()) {
+		resp.Err(w, r, http.StatusForbidden, resp.CodeForbidden, costViewsSwitchDisabledMsg)
 		return
 	}
 	externalName := q.Get("ExternalModelName")
@@ -454,6 +502,16 @@ func (h *Admin) HandleCostPricingCurve(w http.ResponseWriter, r *http.Request) {
 	}
 	globalTiers := h.loadGlobalContextTiers(r.Context())
 	out.TimeOptions, out.DefaultTimeCoeff = timeOptions(globalTime)
+
+	// 多线对比：先装每条线的配置（只有传了新参数才进这里，旧请求的查询顺序与条数完全不变）。
+	var multiInputs []multiLineInputs
+	if len(multiIDs) > 0 {
+		multiInputs, err = h.loadMultiLines(r.Context(), multiIDs, globalTime, globalTiers)
+		if err != nil {
+			resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "查询渠道内部模型配置失败")
+			return
+		}
+	}
 
 	// 成本线（同时带出它的对外模型配置，供未显式指定售价模型时复用）。
 	costCfg := pricingModelConfig{
@@ -484,14 +542,30 @@ func (h *Admin) HandleCostPricingCurve(w http.ResponseWriter, r *http.Request) {
 
 	// 横轴上限：未指定时由分档推导；再按点数上限收敛（保证响应里回报的就是实际用的）。
 	if p.MaxTokens <= 0 {
-		tiers := costCfg.Tiers
-		if saleModel.Available || len(saleModel.Tiers) > 0 {
-			tiers = saleModel.Tiers
+		if len(multiInputs) > 0 {
+			// 多线：取所有线的最大推导值，避免某条线因别家分档更小被提前截断。
+			p.MaxTokens = multiLineMaxTokens(multiInputs)
+		} else {
+			tiers := costCfg.Tiers
+			if saleModel.Available || len(saleModel.Tiers) > 0 {
+				tiers = saleModel.Tiers
+			}
+			p.MaxTokens = defaultCurveMaxTokens(tiers)
 		}
-		p.MaxTokens = defaultCurveMaxTokens(tiers)
 	}
 	if p.Step > 0 && p.MaxTokens/p.Step > pricingCurveMaxPoints {
 		p.MaxTokens = p.Step * pricingCurveMaxPoints
+	}
+	// 多线模式的**总点数**上限仍是 pricingCurveMaxPoints：线多了就按线数等比下调横轴上限，
+	// 保证响应体量与单线模式同一量级；实际用的 MaxTokens 会在响应里回报，前端不用猜。
+	if n := len(multiInputs); n > 1 && p.Step > 0 {
+		perLine := int64(pricingCurveMaxPoints / n)
+		if perLine < 1 {
+			perLine = 1
+		}
+		if p.MaxTokens/p.Step > perLine {
+			p.MaxTokens = p.Step * perLine
+		}
 	}
 	out.MaxTokens = p.MaxTokens
 
@@ -511,6 +585,18 @@ func (h *Admin) HandleCostPricingCurve(w http.ResponseWriter, r *http.Request) {
 	}
 	out.Sale = saleLine
 	out.Cost = costLine
+	// 多线：与单线同一套采样参数出点；Lines 非空才会被序列化（omitempty）。
+	if len(multiInputs) > 0 {
+		lines, lerr := buildMultiLines(multiInputs, p, out.R)
+		if lerr != nil {
+			resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, lerr.Error())
+			return
+		}
+		out.Lines = lines
+		if len(lines) > 0 {
+			out.PointCount = lines[0].PointCount
+		}
+	}
 	resp.OK(w, r, out)
 }
 
@@ -520,6 +606,109 @@ func parseOptionalInt64(raw string) (int64, error) {
 		return 0, nil
 	}
 	return strconv.ParseInt(raw, 10, 64)
+}
+
+// parseChannelModelIDs 解析 ChannelModelIDs=a,b,c：空返回 nil（= 单线模式，行为不变）；
+// 去空白、去重（保序）、每项必须为正整数；超过 pricingCurveMaxLines 直接报错（不静默截断）。
+func parseChannelModelIDs(raw string) ([]int64, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]int64, 0, len(parts))
+	seen := make(map[int64]bool, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue // 容忍尾部/连续逗号，不当错误
+		}
+		v, err := strconv.ParseInt(part, 10, 64)
+		if err != nil || v <= 0 {
+			return nil, fmt.Errorf("ChannelModelIDs 含非法 ID：%q", part)
+		}
+		if seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	if len(out) > pricingCurveMaxLines {
+		return nil, fmt.Errorf("ChannelModelIDs 最多 %d 个（本次 %d 个）", pricingCurveMaxLines, len(out))
+	}
+	return out, nil
+}
+
+// loadMultiLines 按请求顺序装载每条线的成本配置与其对外模型的售价配置。
+//
+// 查询报错 → 整体返回错误（500）；「行不存在/费率缺失」不算错误，而是 Available=false + Reason，
+// 与单线模式口径一致（选了不存在的模型给一条不可用的线，而不是整个请求失败）。
+func (h *Admin) loadMultiLines(ctx context.Context, ids []int64,
+	globalTime billing.TimeCoeffConfig, globalTiers []billing.TierRule) ([]multiLineInputs, error) {
+	out := make([]multiLineInputs, 0, len(ids))
+	for i, id := range ids {
+		costCfg, err := h.loadChannelModelConfig(ctx, id, globalTime, globalTiers)
+		if err != nil {
+			return nil, err
+		}
+		saleCfg, err := h.loadSaleModelByChannelModel(ctx, id, globalTime, globalTiers)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, multiLineInputs{LineIndex: i, Cost: costCfg, Sale: saleCfg})
+	}
+	return out, nil
+}
+
+// multiLineMaxTokens 多线模式下的缺省横轴上限：取所有线（成本/售价两侧）分档推导值的最大值，
+// 避免任何一条线因别家的分档更小而提前被截断。
+func multiLineMaxTokens(inputs []multiLineInputs) int64 {
+	maxTokens := int64(0)
+	for _, in := range inputs {
+		if v := defaultCurveMaxTokens(in.Cost.Tiers); v > maxTokens {
+			maxTokens = v
+		}
+		if v := defaultCurveMaxTokens(in.Sale.Tiers); v > maxTokens {
+			maxTokens = v
+		}
+	}
+	if maxTokens <= 0 {
+		maxTokens = pricingCurveDefaultMaxToken
+	}
+	return maxTokens
+}
+
+// buildMultiLines 用同一套采样参数给每条线出点，装配多线响应。
+func buildMultiLines(inputs []multiLineInputs, p pricingCurveParams, r int64) ([]pricingMultiLine, error) {
+	out := make([]pricingMultiLine, 0, len(inputs))
+	for _, in := range inputs {
+		costLine, err := buildPricingLine(in.Cost, p, r)
+		if err != nil {
+			return nil, fmt.Errorf("计算成本曲线失败（ChannelModelID=%d）：%w", in.Cost.ChannelModelID, err)
+		}
+		saleLine, err := buildPricingLine(in.Sale, p, r)
+		if err != nil {
+			return nil, fmt.Errorf("计算售价曲线失败（ChannelModelID=%d）：%w", in.Cost.ChannelModelID, err)
+		}
+		line := pricingMultiLine{
+			LineIndex:         in.LineIndex,
+			ChannelModelID:    in.Cost.ChannelModelID,
+			ChannelID:         in.Cost.ChannelID,
+			ChannelName:       in.Cost.ChannelName,
+			InternalModelID:   in.Cost.InternalModelID,
+			ExternalModelID:   in.Sale.ExternalModelID,
+			ExternalModelName: in.Sale.Name,
+			Available:         costLine.Available,
+			Reason:            costLine.Reason,
+			PointCount:        len(costLine.Points),
+			Cost:              costLine,
+			Sale:              saleLine,
+		}
+		if line.Reason == "" {
+			line.Reason = saleLine.Reason
+		}
+		out = append(out, line)
+	}
+	return out, nil
 }
 
 // loadGlobalTimeConfig 读全局 billing.time_config；缺失/非法时回退「全天系数 1」。
