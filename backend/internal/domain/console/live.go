@@ -1,4 +1,4 @@
-// live.go 统计页「实时区」：请求中会话（我的会话）与在线用户。
+// live.go 统计页「实时区」：我的会话（请求中 + 最近 5 分钟活跃）与在线用户（所选范围内有请求）。
 //
 // 安全边界（**字段层面**收口，不靠前端自觉）：
 //   - 本文件只输出「运行态计数与聚合值」：会话 ID/名称、模型名、上下文长度、本轮 Token、
@@ -9,8 +9,14 @@
 // 数据来源：
 //   - 「请求中」以 router.SessionRegistry 内存计数为准（Inflight > 0，由网关在包住上游转发时
 //     +1/-1），DB 的 sessions 表是投影、不含该运行时字段，不能用来判「正在请求」。
+//   - 「最近 5 分钟内有请求」同样以注册表为准（LastActive，网关每次请求续期）：
+//     空闲会话仍留在注册表里直到 TTL 过期，不能只看 Inflight，否则刚发完请求就掉出列表。
+//   - 「在线用户」改为查 DB（billing_records）：所选范围（页面右上角 24h/7天/30天/90天/自定义）
+//     内有过请求的用户全集，`UsersTotal` 与 `Users` 列表**同一查询同源**（总数=未截断行数）。
+//     只看注册表会漏掉「范围内活跃但此刻空闲」的用户（v4 口径修正）。
 //   - Token / 积分 / 上下文来自 billing_records（一次请求完成才落一行），
-//     所以「本轮 Token」= 最近一次**已完成**请求的量，进行中的这一轮要等它落账才计入。
+//     所以「本轮 Token」= 最近一次**已完成**请求的量，进行中的这一轮要等它落账才计入；
+//     同理「在线用户」里也暂不包含「首次请求仍在进行中、尚未落账」的用户。
 //
 // 三个吞吐口径不混用（与模型广场、首屏 KPI 各自独立，详见接口文档）：
 // 本文件的 TPM = 近 Window 分钟（默认 60）窗口内的 Token ÷ 窗口墙钟分钟数。
@@ -47,6 +53,17 @@ const (
 	// 请求中的会话上一轮必然很近，取 7 天是为了兜住长时间空闲后又发起请求的会话，
 	// 同时避免按 session_id 扫出整段历史（重会话可达上万行）。
 	liveRecentLookback = 7 * 24 * time.Hour
+
+	// liveActiveSessionLookback 「我的会话」的第二类入选条件：最近 5 分钟内有请求。
+	// 与「请求中」（Inflight>0）取并集——只看 Inflight 会让刚发完一轮的会话立刻消失。
+	liveActiveSessionLookback = 5 * time.Minute
+	// liveDefaultRange 在线用户默认统计范围：对齐页面右上角默认预设「近 24h」。
+	liveDefaultRange = 24 * time.Hour
+	// liveMaxRangeSpan 在线用户统计范围上限（与 dashboard 一致，366 天）。
+	liveMaxRangeSpan = 366 * 24 * time.Hour
+	// liveMaxDailyPoints 每用户「日活跃序列」的最大点数（对齐 90 天预设 + 余量）。
+	// 自定义超长区间只回最近这么多天（`DailyFrom` 会如实回报序列起点），避免 30s 刷新扛大包。
+	liveMaxDailyPoints = 92
 )
 
 // liveParams 实时区查询参数（已收敛到合法范围）。
@@ -55,15 +72,22 @@ type liveParams struct {
 	Window        time.Duration
 	SparkPoints   int
 	Limit         int
+	// From/To 在线用户统计范围（页面右上角时间范围），默认近 24h。
+	// 与 Window 刻意分开：Window 是 TPM/消耗的滑动窗口，From/To 是「哪些用户算在线」的筛选范围。
+	From time.Time
+	To   time.Time
 }
 
-// parseLiveParams 解析 Window / SparkPoints / Limit。
-// 越界值一律收敛到 [1, 上限]（不报错，前端少一次失败）；非数字才报 400。
-func parseLiveParams(q url.Values) (liveParams, error) {
+// parseLiveParams 解析 Window / SparkPoints / Limit / From / To。
+// 越界值一律收敛到 [1, 上限]（不报错，前端少一次失败）；非数字/非法时间才报 400。
+// From/To 缺省 = 近 24h（对齐页面默认预设），跨度上限 366 天（与 dashboard 同口径）。
+func parseLiveParams(q url.Values, now time.Time) (liveParams, error) {
 	p := liveParams{
 		WindowMinutes: liveDefaultWindowMinutes,
 		SparkPoints:   liveDefaultSparkPoints,
 		Limit:         liveDefaultLimit,
+		To:            now,
+		From:          now.Add(-liveDefaultRange),
 	}
 	if v := q.Get("Window"); v != "" {
 		n, err := strconv.Atoi(v)
@@ -104,47 +128,85 @@ func parseLiveParams(q url.Values) (liveParams, error) {
 		}
 		p.Limit = n
 	}
+	if v := q.Get("To"); v != "" {
+		t, err := parseRFC3339Lenient(v)
+		if err != nil {
+			return p, errors.New("To 时间格式应为 RFC3339")
+		}
+		p.To = t
+	}
+	if v := q.Get("From"); v != "" {
+		t, err := parseRFC3339Lenient(v)
+		if err != nil {
+			return p, errors.New("From 时间格式应为 RFC3339")
+		}
+		p.From = t
+	}
+	if p.From.After(p.To) {
+		return p, errors.New("开始时间不能晚于结束时间")
+	}
+	if p.To.Sub(p.From) > liveMaxRangeSpan {
+		return p, errors.New("时间跨度不能超过 366 天")
+	}
 	p.Window = time.Duration(p.WindowMinutes) * time.Minute
 	return p, nil
 }
 
-// liveSessionItem 「我的会话」一行：请求中的会话及其运行态。
+// liveSessionItem 「我的会话」一行：请求中或最近 5 分钟活跃的会话及其运行态。
 // 刻意不含：消息、提示词、模型输入输出、原始 x-session-id、渠道密钥（前端不需要，也就不给）。
 type liveSessionItem struct {
 	ID           string  `json:"ID"`           // 会话指纹（不是客户端原始 x-session-id）
 	Name         string  `json:"Name"`         // 会话可读名（可能为空，前端用 ID 前缀兜底）
 	Model        string  `json:"Model"`        // 对外模型名
-	Inflight     int     `json:"Inflight"`     // 进行中请求数（>0 才会出现在列表里）
+	Inflight     int     `json:"Inflight"`     // 进行中请求数（0 = 本刻空闲，但 5 分钟内有过请求）
 	ContextUsed  int64   `json:"ContextUsed"`  // 上下文长度：最近一次请求的输入 Token（input+cache_read）
 	ContextLimit int64   `json:"ContextLimit"` // 上下文上限；平台未配置模型上限时恒为 0（= 未知）
 	RoundTokens  int64   `json:"RoundTokens"`  // 本轮 Token：最近一次已完成请求的总 Token（三段求和）
 	Calls        int64   `json:"Calls"`        // 会话累计请求数
+	TotalTokens  int64   `json:"TotalTokens"`  // 会话累计 Token（三段求和，用于卡片「累计」）
 	WindowTokens int64   `json:"WindowTokens"` // 近 Window 分钟 Token（TPM 的分子）
 	TPM          float64 `json:"TPM"`          // WindowTokens ÷ Window 分钟（墙钟窗口平均）
 	SpentCredits float64 `json:"SpentCredits"` // 会话累计消耗积分
+	CreatedAt    string  `json:"CreatedAt"`    // 会话创建时间（RFC3339；注册表未记录时为空串）
 	LastActive   string  `json:"LastActive"`   // 最近活跃时间（RFC3339）
 	Spark        []int64 `json:"Spark"`        // 最近 SparkPoints 次请求的 Token（时间正序，可能不足）
 }
 
-// liveUserItem 「在线用户」一行：只有汇总吞吐与消耗。
+// liveUserItem 「在线用户」一行：只有汇总吞吐与消耗（无任何会话级字段）。
 type liveUserItem struct {
-	ID           string  `json:"ID"`           // 用户 ID（字符串，避免 JS 大整数精度丢失）
-	Name         string  `json:"Name"`         // 昵称优先，空则登录名
-	Sessions     int     `json:"Sessions"`     // 该用户当前请求中的会话数
-	Tokens       int64   `json:"Tokens"`       // 近 Window 分钟 Token（仅统计请求中会话）
-	TPM          float64 `json:"TPM"`          // Tokens ÷ Window 分钟（墙钟窗口平均）
-	SpentCredits float64 `json:"SpentCredits"` // 近 Window 分钟消耗积分
-	Spark        []int64 `json:"Spark"`        // 近 SparkPoints 分钟逐分钟 Token（时间正序，缺分钟补 0）
+	ID   string `json:"ID"`   // 用户 ID（字符串，避免 JS 大整数精度丢失）
+	Name string `json:"Name"` // 昵称优先，空则登录名
+	// Sessions 该用户**当前请求中**的会话数（注册表内存计数；范围内活跃但此刻空闲的用户为 0）。
+	Sessions       int     `json:"Sessions"`
+	ActiveSessions int     `json:"ActiveSessions"` // 所选范围内有过请求的会话数（DB 去重）
+	Calls          int64   `json:"Calls"`          // 所选范围内请求数
+	Tokens         int64   `json:"Tokens"`         // 近 Window 分钟 Token（该用户全部会话）
+	TPM            float64 `json:"TPM"`            // Tokens ÷ Window 分钟（墙钟窗口平均）
+	SpentCredits   float64 `json:"SpentCredits"`   // 近 Window 分钟消耗积分
+	RangeTokens    int64   `json:"RangeTokens"`    // 所选范围内 Token 合计
+	RangeCredits   float64 `json:"RangeCredits"`   // 所选范围内消耗积分合计
+	Spark          []int64 `json:"Spark"`          // 近 SparkPoints 分钟逐分钟 Token（时间正序，缺分钟补 0）
+	// Daily 日活跃序列：`DailyFrom`~`DailyTo` 逐日 Token（时间正序，无请求日补 0），供用户卡迷你曲线。
+	Daily []int64 `json:"Daily"`
 }
 
 // liveResp 实时区响应（admin/dev 同构，Scope 区分）。
 type liveResp struct {
-	Scope          string            `json:"Scope"`          // global | self
-	SampledAt      string            `json:"SampledAt"`      // 采样时刻 RFC3339
-	WindowMinutes  int               `json:"WindowMinutes"`  // TPM / 消耗的统计窗口
-	SparkPoints    int               `json:"SparkPoints"`    // 曲线采样点数
-	SessionsTotal  int               `json:"SessionsTotal"`  // 请求中会话总数（未截断）
-	UsersTotal     int               `json:"UsersTotal"`     // 在线用户总数
+	Scope         string `json:"Scope"`         // global | self
+	SampledAt     string `json:"SampledAt"`     // 采样时刻 RFC3339
+	WindowMinutes int    `json:"WindowMinutes"` // TPM / 消耗的统计窗口
+	SparkPoints   int    `json:"SparkPoints"`   // 曲线采样点数
+	// RangeFrom/RangeTo 在线用户的筛选范围（= 页面右上角时间范围），回显实际生效值。
+	RangeFrom string `json:"RangeFrom"`
+	RangeTo   string `json:"RangeTo"`
+	// DailyFrom/DailyTo/DailyPoints 每用户日活跃序列的实际覆盖（超长区间只回最近 DailyPoints 天）。
+	DailyFrom   string `json:"DailyFrom"`
+	DailyTo     string `json:"DailyTo"`
+	DailyPoints int    `json:"DailyPoints"`
+	// SessionsTotal 我的会话总数（未截断）= 请求中 + 最近 5 分钟内有请求。
+	SessionsTotal int `json:"SessionsTotal"`
+	// UsersTotal 在线用户总数 = 所选范围内有过请求的用户数（**与 Users 列表同一查询同源**，未截断）。
+	UsersTotal     int               `json:"UsersTotal"`
 	Truncated      bool              `json:"Truncated"`      // 会话列表是否被 Limit 截断
 	UsersTruncated bool              `json:"UsersTruncated"` // 用户列表是否被上限截断
 	Sessions       []liveSessionItem `json:"Sessions"`
@@ -155,6 +217,7 @@ type liveResp struct {
 type liveSessionAgg struct {
 	Calls        int64
 	Credits      float64
+	TotalTokens  int64
 	WindowTokens int64
 	ContextUsed  int64
 	RoundTokens  int64
@@ -172,6 +235,7 @@ func liveSessionAggregates(ctx context.Context, db *sql.DB, ids []string, window
 SELECT session_id,
        count(*),
        COALESCE(sum(credits_consumed),0),
+       COALESCE(sum(`+billing.TokenSumExpr("")+`),0),
        COALESCE(sum(`+billing.TokenSumExpr("")+`) FILTER (WHERE call_time >= $2),0)
 FROM billing_records
 WHERE session_id = ANY(string_to_array($1, ','))
@@ -183,7 +247,7 @@ GROUP BY session_id`, joinIDs(ids), windowStart)
 	for rows.Next() {
 		var sid string
 		var a liveSessionAgg
-		if err := rows.Scan(&sid, &a.Calls, &a.Credits, &a.WindowTokens); err != nil {
+		if err := rows.Scan(&sid, &a.Calls, &a.Credits, &a.TotalTokens, &a.WindowTokens); err != nil {
 			continue
 		}
 		out[sid] = &a
@@ -234,43 +298,61 @@ ORDER BY session_id, rn DESC`, joinIDs(ids), sparkPoints, now.Add(-liveRecentLoo
 	return out
 }
 
-// liveUserAggregates 按用户聚合窗口内 Token / 积分，范围限定在给定会话集合内
-// （只算「请求中」的那部分会话，用户其它闲置会话不计入在线吞吐）。
-func liveUserAggregates(ctx context.Context, db *sql.DB, userIDs []int64, sessionIDs []string, windowStart time.Time) map[int64]*liveUserItem {
-	out := make(map[int64]*liveUserItem, len(userIDs))
-	if db == nil || len(userIDs) == 0 || len(sessionIDs) == 0 {
-		return out
+// liveUserAggregates 按用户聚合所选范围（p.From~p.To）内的用量，并顺带给出窗口用量。
+// **返回的行就是「在线用户」全集**（`UsersTotal` = 未截断行数，列表取其中前 liveMaxUsers 行），
+// 这样总数与列表天然同一口径，不会出现「总数一个口径、列表另一个口径」。
+//   - onlyUser 非 nil（开发端）→ 只统计本人；
+//   - 范围外无请求的用户不出行（= 不算在线）；
+//   - 窗口量（Tokens / SpentCredits）覆盖该用户**全部会话**，不限于请求中的那几个。
+func liveUserAggregates(ctx context.Context, db *sql.DB, from, to, windowStart time.Time, onlyUser *int64) ([]int64, map[int64]*liveUserItem) {
+	out := make(map[int64]*liveUserItem, 16)
+	if db == nil {
+		return nil, out
+	}
+	var u any
+	if onlyUser != nil {
+		u = *onlyUser
 	}
 	rows, err := db.QueryContext(ctx, `
 SELECT user_id,
+       count(*),
+       count(DISTINCT session_id) FILTER (WHERE session_id IS NOT NULL AND session_id <> ''),
        COALESCE(sum(`+billing.TokenSumExpr("")+`) FILTER (WHERE call_time >= $3),0),
-       COALESCE(sum(credits_consumed) FILTER (WHERE call_time >= $3),0)
+       COALESCE(sum(credits_consumed) FILTER (WHERE call_time >= $3),0),
+       COALESCE(sum(`+billing.TokenSumExpr("")+`),0),
+       COALESCE(sum(credits_consumed),0)
 FROM billing_records
-WHERE user_id = ANY(string_to_array($1, ',')::bigint[])
-  AND session_id = ANY(string_to_array($2, ','))
-GROUP BY user_id`, joinInt64IDs(userIDs), joinIDs(sessionIDs), windowStart)
+WHERE call_time >= $2 AND call_time <= $4
+  AND ($1::bigint IS NULL OR user_id = $1)
+GROUP BY user_id
+ORDER BY 6 DESC, 1`, u, from, windowStart, to)
 	if err != nil {
-		return out
+		return nil, out
 	}
 	defer rows.Close()
+	ids := make([]int64, 0, 16)
 	for rows.Next() {
 		var uid int64
 		var item liveUserItem
-		if err := rows.Scan(&uid, &item.Tokens, &item.SpentCredits); err != nil {
+		if err := rows.Scan(&uid, &item.Calls, &item.ActiveSessions,
+			&item.Tokens, &item.SpentCredits, &item.RangeTokens, &item.RangeCredits); err != nil {
 			continue
 		}
 		item.ID = strconv.FormatInt(uid, 10)
+		item.SpentCredits = decimalx.Round5(item.SpentCredits)
+		item.RangeCredits = decimalx.Round5(item.RangeCredits)
 		row := item
 		out[uid] = &row
+		ids = append(ids, uid)
 	}
-	return out
+	return ids, out
 }
 
-// liveUserSpark 逐分钟 Token（近 sparkPoints 分钟，按北京时间分钟界），返回 sutffed 到固定长度的序列。
+// liveUserSpark 逐分钟 Token（近 sparkPoints 分钟，按北京时间分钟界），返回补零到固定长度的序列。
 // 无请求的分钟补 0：这是采样曲线，缺分钟即「该分钟没用量」，与趋势图「缺数据断线」语义不同。
-func liveUserSpark(ctx context.Context, db *sql.DB, userIDs []int64, sessionIDs []string, now time.Time, sparkPoints int) map[int64][]int64 {
+func liveUserSpark(ctx context.Context, db *sql.DB, userIDs []int64, now time.Time, sparkPoints int) map[int64][]int64 {
 	out := make(map[int64][]int64, len(userIDs))
-	if db == nil || len(userIDs) == 0 || len(sessionIDs) == 0 {
+	if db == nil || len(userIDs) == 0 {
 		return out
 	}
 	loc := cnLocation()
@@ -286,9 +368,8 @@ SELECT user_id,
        COALESCE(sum(`+billing.TokenSumExpr("")+`),0)
 FROM billing_records
 WHERE user_id = ANY(string_to_array($1, ',')::bigint[])
-  AND session_id = ANY(string_to_array($2, ','))
-  AND call_time >= $3
-GROUP BY 1,2 ORDER BY 1,2`, joinInt64IDs(userIDs), joinIDs(sessionIDs), start)
+  AND call_time >= $2
+GROUP BY 1,2 ORDER BY 1,2`, joinInt64IDs(userIDs), start)
 	if err != nil {
 		return out
 	}
@@ -320,6 +401,86 @@ GROUP BY 1,2 ORDER BY 1,2`, joinInt64IDs(userIDs), joinIDs(sessionIDs), start)
 	return out
 }
 
+// liveDailyKeys 日活跃序列的日期键（北京时间自然日，时间正序）。
+// 超长区间只保留最近 liveMaxDailyPoints 天，避免 30s 刷新的响应用「上千天 × 上百用户」撑爆。
+func liveDailyKeys(from, to time.Time) []string {
+	loc := cnLocation()
+	fromCN, toCN := from.In(loc), to.In(loc)
+	start := time.Date(fromCN.Year(), fromCN.Month(), fromCN.Day(), 0, 0, 0, 0, loc)
+	end := time.Date(toCN.Year(), toCN.Month(), toCN.Day(), 0, 0, 0, 0, loc)
+	if end.Before(start) {
+		return []string{}
+	}
+	if days := int(end.Sub(start).Hours()/24) + 1; days > liveMaxDailyPoints {
+		start = end.AddDate(0, 0, -(liveMaxDailyPoints - 1))
+	}
+	keys := make([]string, 0, liveMaxDailyPoints)
+	for d := start; !d.After(end); d = d.AddDate(0, 0, 1) {
+		keys = append(keys, d.Format("2006-01-02"))
+	}
+	return keys
+}
+
+// liveUserDaily 每用户逐日 Token（北京自然日），按 dayKeys 补零成定长序列。
+// 缺日补 0：迷你曲线是「活跃度」，没请求就是 0，不是断线。
+func liveUserDaily(ctx context.Context, db *sql.DB, userIDs []int64, dayKeys []string, from, to time.Time) map[int64][]int64 {
+	out := make(map[int64][]int64, len(userIDs))
+	if db == nil || len(userIDs) == 0 || len(dayKeys) == 0 {
+		return out
+	}
+	loc := cnLocation()
+	start := mustParseDay(dayKeys[0]).In(loc)
+	if from.After(start) {
+		start = from
+	}
+	rows, err := db.QueryContext(ctx, `
+SELECT user_id,
+       date_trunc('day', call_time AT TIME ZONE 'Asia/Shanghai')::date,
+       COALESCE(sum(`+billing.TokenSumExpr("")+`),0)
+FROM billing_records
+WHERE user_id = ANY(string_to_array($1, ',')::bigint[])
+  AND call_time >= $2 AND call_time <= $3
+GROUP BY 1,2 ORDER BY 1,2`, joinInt64IDs(userIDs), start, to)
+	if err != nil {
+		return out
+	}
+	defer rows.Close()
+	buckets := make(map[int64]map[string]int64, len(userIDs))
+	for rows.Next() {
+		var uid int64
+		var day time.Time
+		var tokens int64
+		if err := rows.Scan(&uid, &day, &tokens); err != nil {
+			continue
+		}
+		m := buckets[uid]
+		if m == nil {
+			m = make(map[string]int64, len(dayKeys))
+			buckets[uid] = m
+		}
+		m[day.In(loc).Format("2006-01-02")] = tokens
+	}
+	for _, uid := range userIDs {
+		series := make([]int64, len(dayKeys))
+		if m := buckets[uid]; m != nil {
+			for i, k := range dayKeys {
+				series[i] = m[k]
+			}
+		}
+		out[uid] = series
+	}
+	return out
+}
+
+// mustParseDay 解析 YYYY-MM-DD（liveDailyKeys 的产物，格式自洽，不会失败）。
+func mustParseDay(day string) time.Time {
+	t, err := time.ParseInLocation("2006-01-02", day, cnLocation())
+	if err != nil {
+		return time.Time{}
+	}
+	return t
+}
+
 // liveUserNames 批量取用户展示名（昵称优先，空则登录名）；失败返回空 map（不阻断实时区）。
 func liveUserNames(ctx context.Context, db *sql.DB, ids []int64) map[int64]string {
 	out := make(map[int64]string, len(ids))
@@ -349,73 +510,89 @@ func liveUserNames(ctx context.Context, db *sql.DB, ids []int64) map[int64]strin
 
 // buildLiveStats 组装实时区数据。
 //   - reg 为 nil（未装配会话注册表）→ 返回空集合，不报错；
-//   - db 为 nil（未装配 DB）→ 会话列表仍返回（含 Inflight），数值列为 0；
+//   - db 为 nil（未装配 DB）→ 会话列表仍返回（含 Inflight），数值列为 0；在线用户为空；
 //   - userID 非 nil 时只统计该用户（开发端「我的会话」/「我」）。
+//
+// 「我的会话」与「在线用户」是**两套口径**，各自独立取数：
+//   - 我的会话：注册表里 未关闭 且（Inflight>0 或 最近 liveActiveSessionLookback 内有请求）；
+//   - 在线用户：billing_records 里所选范围（p.From~p.To）内有请求的用户全集（DB 为准）。
+//     两者不再互相推导——用户没有请求中的会话，只要范围内有请求，也仍然算在线。
 func buildLiveStats(ctx context.Context, db *sql.DB, reg *router.SessionRegistry, now time.Time,
 	userID *int64, scope string, p liveParams) (liveResp, error) {
+	if p.Window <= 0 {
+		p.Window = time.Duration(p.WindowMinutes) * time.Minute
+	}
+	if p.To.IsZero() {
+		p.To = now
+	}
+	if p.From.IsZero() {
+		p.From = p.To.Add(-liveDefaultRange)
+	}
+	dayKeys := liveDailyKeys(p.From, p.To)
 	out := liveResp{
 		Scope:         scope,
 		SampledAt:     now.Format(time.RFC3339),
 		WindowMinutes: p.WindowMinutes,
 		SparkPoints:   p.SparkPoints,
+		RangeFrom:     p.From.Format(time.RFC3339),
+		RangeTo:       p.To.Format(time.RFC3339),
+		DailyPoints:   len(dayKeys),
 		Sessions:      []liveSessionItem{},
 		Users:         []liveUserItem{},
+	}
+	if len(dayKeys) > 0 {
+		out.DailyFrom = dayKeys[0]
+		out.DailyTo = dayKeys[len(dayKeys)-1]
 	}
 	if reg == nil {
 		return out, nil
 	}
 
-	// 1) 请求中的会话（内存计数为准），最近活跃优先。
-	inflight := make([]*router.Session, 0, 16)
+	// 1) 我的会话：请求中 + 最近 5 分钟内有请求（注册表内存为准），最近活跃优先。
+	activeSince := now.Add(-liveActiveSessionLookback)
+	sessions := make([]*router.Session, 0, 16)
 	for _, s := range reg.ListAll() {
-		if s == nil || s.Closed || s.Inflight <= 0 {
+		if s == nil || s.Closed {
+			continue
+		}
+		if s.Inflight <= 0 && s.LastActive.Before(activeSince) {
 			continue
 		}
 		if userID != nil && s.UserID != *userID {
 			continue
 		}
-		inflight = append(inflight, s)
+		sessions = append(sessions, s)
 	}
-	sort.Slice(inflight, func(i, j int) bool {
-		if !inflight[i].LastActive.Equal(inflight[j].LastActive) {
-			return inflight[i].LastActive.After(inflight[j].LastActive)
+	sort.Slice(sessions, func(i, j int) bool {
+		if !sessions[i].LastActive.Equal(sessions[j].LastActive) {
+			return sessions[i].LastActive.After(sessions[j].LastActive)
 		}
-		return inflight[i].SessionID < inflight[j].SessionID
+		return sessions[i].SessionID < sessions[j].SessionID
 	})
-	out.SessionsTotal = len(inflight)
-	if len(inflight) > liveMaxSessions {
-		inflight = inflight[:liveMaxSessions]
+	out.SessionsTotal = len(sessions)
+	if len(sessions) > liveMaxSessions {
+		sessions = sessions[:liveMaxSessions]
 	}
-	if len(inflight) == 0 {
-		return out, nil
-	}
-
-	page := inflight
+	page := sessions
 	if len(page) > p.Limit {
 		page = page[:p.Limit]
 	}
 	out.Truncated = out.SessionsTotal > len(page)
 
-	// 2) 聚合（全量会话，避免展示上限把「在线用户」算偏）。
-	ids := make([]string, 0, len(inflight))
-	userIDs := make([]int64, 0, 8)
-	seenUser := make(map[int64]int, 8)
-	for _, s := range inflight {
+	// 2) 会话聚合（全量入选会话，避免展示上限把统计算偏）。
+	ids := make([]string, 0, len(sessions))
+	inflightByUser := make(map[int64]int, 8)
+	for _, s := range sessions {
 		if s.SessionID != "" {
 			ids = append(ids, s.SessionID)
 		}
-		if _, ok := seenUser[s.UserID]; !ok {
-			seenUser[s.UserID] = 0
-			userIDs = append(userIDs, s.UserID)
+		if s.Inflight > 0 {
+			inflightByUser[s.UserID]++
 		}
-		seenUser[s.UserID]++
 	}
 	windowStart := now.Add(-p.Window)
 	aggs := liveSessionAggregates(ctx, db, ids, windowStart)
 	recent := liveRecentCalls(ctx, db, ids, now, p.SparkPoints)
-	userAggs := liveUserAggregates(ctx, db, userIDs, ids, windowStart)
-	userSparks := liveUserSpark(ctx, db, userIDs, ids, now, p.SparkPoints)
-	names := liveUserNames(ctx, db, userIDs)
 
 	windowMinutes := p.WindowMinutes
 	for _, s := range page {
@@ -427,8 +604,12 @@ func buildLiveStats(ctx context.Context, db *sql.DB, reg *router.SessionRegistry
 			LastActive: s.LastActive.Format(time.RFC3339),
 			Spark:      []int64{},
 		}
+		if !s.CreatedAt.IsZero() {
+			item.CreatedAt = s.CreatedAt.Format(time.RFC3339)
+		}
 		if a := aggs[s.SessionID]; a != nil {
 			item.Calls = a.Calls
+			item.TotalTokens = a.TotalTokens
 			item.WindowTokens = a.WindowTokens
 			item.SpentCredits = decimalx.Round5(a.Credits)
 		}
@@ -443,36 +624,57 @@ func buildLiveStats(ctx context.Context, db *sql.DB, reg *router.SessionRegistry
 		out.Sessions = append(out.Sessions, item)
 	}
 
-	// 3) 在线用户汇总（只给吞吐与消耗）。
+	// 3) 在线用户：所选范围内有请求的用户全集（DB 为准，与列表同一查询同源）。
+	userIDs, userAggs := liveUserAggregates(ctx, db, p.From, p.To, windowStart, userID)
 	out.UsersTotal = len(userIDs)
 	out.UsersTruncated = len(userIDs) > liveMaxUsers
-	users := make([]liveUserItem, 0, len(userIDs))
-	for _, uid := range userIDs {
-		item := liveUserItem{
-			ID:       strconv.FormatInt(uid, 10),
-			Name:     names[uid],
-			Sessions: seenUser[uid],
-			Spark:    []int64{},
-		}
-		if a := userAggs[uid]; a != nil {
-			item.Tokens = a.Tokens
-			item.SpentCredits = decimalx.Round5(a.SpentCredits)
-		}
-		item.TPM = decimalx.Round2(ratePerMinute(float64(item.Tokens), windowMinutes))
-		if sp := userSparks[uid]; len(sp) > 0 {
-			item.Spark = sp
-		}
-		users = append(users, item)
+	if len(userIDs) == 0 {
+		return out, nil
 	}
-	// 吞吐高的排前面，同值按 ID 升序（稳定，避免刷新时行序抖动）。
-	sort.Slice(users, func(i, j int) bool {
-		if users[i].TPM != users[j].TPM {
-			return users[i].TPM > users[j].TPM
+	sort.Slice(userIDs, func(i, j int) bool {
+		a, b := userAggs[userIDs[i]], userAggs[userIDs[j]]
+		if a == nil || b == nil {
+			return userIDs[i] < userIDs[j]
 		}
-		return users[i].ID < users[j].ID
+		if a.RangeTokens != b.RangeTokens {
+			return a.RangeTokens > b.RangeTokens
+		}
+		if a.Tokens != b.Tokens {
+			return a.Tokens > b.Tokens
+		}
+		return userIDs[i] < userIDs[j]
 	})
-	if len(users) > liveMaxUsers {
-		users = users[:liveMaxUsers]
+	users := make([]liveUserItem, 0, len(userIDs))
+	shown := make([]int64, 0, len(userIDs))
+	for _, uid := range userIDs {
+		a := userAggs[uid]
+		if a == nil {
+			continue
+		}
+		item := *a
+		item.Sessions = inflightByUser[uid]
+		item.TPM = decimalx.Round2(ratePerMinute(float64(item.Tokens), windowMinutes))
+		item.Spark = []int64{}
+		item.Daily = []int64{}
+		users = append(users, item)
+		shown = append(shown, uid)
+		if len(users) >= liveMaxUsers {
+			break
+		}
+	}
+	// 曲线/序列只给要返回的行（前 liveMaxUsers 个），别为截断掉的行白算。
+	names := liveUserNames(ctx, db, shown)
+	userSparks := liveUserSpark(ctx, db, shown, now, p.SparkPoints)
+	userDailies := liveUserDaily(ctx, db, shown, dayKeys, p.From, p.To)
+	for i := range users {
+		uid := shown[i]
+		users[i].Name = names[uid]
+		if sp := userSparks[uid]; len(sp) > 0 {
+			users[i].Spark = sp
+		}
+		if dl := userDailies[uid]; len(dl) > 0 {
+			users[i].Daily = dl
+		}
 	}
 	out.Users = users
 	return out, nil
@@ -499,14 +701,16 @@ func joinInt64IDs(ids []int64) string {
 	return strings.Join(parts, ",")
 }
 
-// HandleStatsLive GET /api/v1/admin/stats/live?Window=&SparkPoints=&Limit= 管理端实时区（全局）。
+// HandleStatsLive GET /api/v1/admin/stats/live?Window=&SparkPoints=&Limit=&From=&To= 管理端实时区（全局）。
+// From/To = 在线用户的筛选范围（页面右上角时间范围），缺省近 24h。
 func (h *Admin) HandleStatsLive(w http.ResponseWriter, r *http.Request) {
-	p, err := parseLiveParams(r.URL.Query())
+	now := h.now()
+	p, err := parseLiveParams(r.URL.Query(), now)
 	if err != nil {
 		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, err.Error())
 		return
 	}
-	out, err := buildLiveStats(r.Context(), h.db, h.sessions, h.now(), nil, "global", p)
+	out, err := buildLiveStats(r.Context(), h.db, h.sessions, now, nil, "global", p)
 	if err != nil {
 		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "查询实时会话失败")
 		return
@@ -514,18 +718,19 @@ func (h *Admin) HandleStatsLive(w http.ResponseWriter, r *http.Request) {
 	resp.OK(w, r, out)
 }
 
-// HandleStatsLive GET /api/v1/dev/stats/live?Window=&SparkPoints=&Limit= 开发端实时区（仅本人）。
+// HandleStatsLive GET /api/v1/dev/stats/live?Window=&SparkPoints=&Limit=&From=&To= 开发端实时区（仅本人）。
 func (h *Dev) HandleStatsLive(w http.ResponseWriter, r *http.Request) {
 	userID, ok := h.currentUser(w, r)
 	if !ok {
 		return
 	}
-	p, err := parseLiveParams(r.URL.Query())
+	now := h.now()
+	p, err := parseLiveParams(r.URL.Query(), now)
 	if err != nil {
 		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, err.Error())
 		return
 	}
-	out, err := buildLiveStats(r.Context(), h.db, h.sessions, h.now(), &userID, "self", p)
+	out, err := buildLiveStats(r.Context(), h.db, h.sessions, now, &userID, "self", p)
 	if err != nil {
 		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "查询实时会话失败")
 		return

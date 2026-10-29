@@ -142,6 +142,11 @@
 
 ## 3. `/stats/live`（实时区）
 
+> **2026-10-29 v4 增补**：实时区口径与字段有更新（我的会话 = 请求中 + 5 分钟内活跃；在线用户改为
+> 查 DB 范围内活跃用户，`UsersTotal` 与列表同源；新增 `From`/`To` 与卡片字段 `TotalTokens`/`CreatedAt`/
+> `ActiveSessions`/`Calls`/`RangeTokens`/`RangeCredits`/`Daily`）。以
+> [`2026-10-29-stats-v4-live-backend.md`](./2026-10-29-stats-v4-live-backend.md) 为准，本节以下为改造前口径。
+
 | 参数 | 取值 | 默认 | 说明 |
 |---|---|---|---|
 | `Window` | 1~1440（分钟） | `60` | TPM 与消耗的统计窗口 |
