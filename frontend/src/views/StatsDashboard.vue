@@ -2,13 +2,14 @@
 // 统计页（admin 全局 / dev 本人共用），版式按定稿 demo，数据接后端真实接口：
 //   ① 首屏 3 个大数字（总 Token / 总消费积分 / 吞吐量）+ 5 项小指标
 //   ② 24h 四日对比趋势（今天/昨天/前天/大前天，按 HourOfDay 对齐，缺桶断线）
-//   ③ 模型广场（后端已排序 + 截断，含零用量模型供折叠）
-//   ④ 实时区（/stats/live，30s 刷新）：我的会话 / 在线用户
+//   ③ 模型广场（后端按 Token 倒序 + 截断，含零用量模型供折叠；无排序控件、无进度条）
+//   ④ 实时区（/stats/live，30s 刷新）：我的会话 / 在线用户，均为卡片网格
 //
 // 三个吞吐口径刻意区分（见 docs/designs/2026-10-25-stats-dashboard-backend.md §4）：
 //   首屏      = KPI.TPM            全窗口忙时口径（≈60÷同批请求平均耗时）
 //   模型广场  = List[].TPM         按模型忙时口径
 //   实时区    = Sessions/Users.TPM 近 60 分钟墙钟平均（含排队空转，天然更低）
+// 三处吞吐量与 RPM 一律走 @/utils/format 的 fmtCompact（K/M 缩写，同一实现）。
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import type { EChartsCoreOption } from 'echarts/core'
 import { ElMessage } from 'element-plus'
@@ -25,7 +26,7 @@ import {
 } from '@/api/stats'
 import { listAnnouncements, type AdminAnnouncement } from '@/api/admin'
 import { listDevAnnouncements } from '@/api/dev'
-import { toRFC3339CN } from '@/utils/format'
+import { fmtCompact, toRFC3339CN } from '@/utils/format'
 import VChart from '@/components/VChart.vue'
 import ErrorBubble from '@/components/ErrorBubble.vue'
 
@@ -82,21 +83,13 @@ function resolveRange(): { from: Date; to: Date } {
   return { from, to: end }
 }
 
-// ===== 模型广场排序（服务端排序，切排序会重取 dashboard）=====
-type ModelSort = 'tokens' | 'tpm' | 'failed' | 'latency'
-const modelSort = ref<ModelSort>('tokens')
-const MODEL_SORT_OPTIONS: { key: ModelSort; label: string; tip: string }[] = [
-  { key: 'tokens', label: 'Token', tip: '按窗口内 Token 消耗倒序' },
-  { key: 'tpm', label: '吞吐', tip: '按模型忙时口径 TPM 倒序' },
-  { key: 'failed', label: '失败', tip: '按窗口内失败请求数倒序' },
-  { key: 'latency', label: '延迟', tip: '按全程平均耗时（AvgMS）倒序' },
-]
+// ===== 模型广场（v4 第 3 条：去排序控件，后端固定按 Token 倒序）=====
 const MODEL_LIMIT = 50
 const COMPARE_DAYS = 4
 // 首屏 KPI / 小时趋势 / 模型广场都按「请求区间的严格滚动窗口」算（后端默认 exact）。
 const WINDOW_MODE: 'exact' | 'calendar' = 'exact'
 
-// 请求序号守卫：筛选切换、模型排序切换、手动刷新、30s 轮询可能在途交叠，
+// 请求序号守卫：筛选切换、手动刷新、30s 轮询可能在途交叠，
 // 只接受「最新一次」请求的响应，过期响应直接丢弃（不写 store、不闪界面）。
 let dashSeq = 0
 let dashInFlight = false
@@ -114,7 +107,6 @@ async function load(opts: { silent?: boolean } = {}) {
       To: toRFC3339CN(to),
       Granularity: granularity.value,
       CompareDays: COMPARE_DAYS,
-      ModelSort: modelSort.value,
       ModelLimit: MODEL_LIMIT,
       Window: WINDOW_MODE,
     })
@@ -159,7 +151,12 @@ async function loadLive() {
   liveInFlight = true
   liveLoading.value = true
   try {
+    // 在线用户按页面右上角时间范围筛选：必须带同一份 From/To，
+    // 否则后端退回默认近 24h，卡片与「统计范围」标签就对不上了。
+    const { from, to } = resolveRange()
     const res = await getStatsLive(auth.role, {
+      From: toRFC3339CN(from),
+      To: toRFC3339CN(to),
       Window: LIVE_WINDOW_MINUTES,
       SparkPoints: LIVE_SPARK_POINTS,
       Limit: LIVE_LIMIT,
@@ -204,35 +201,35 @@ onUnmounted(() => {
 })
 
 watch(preset, () => {
-  if (preset.value !== 'custom') load()
+  if (preset.value !== 'custom') {
+    load()
+    loadLive() // 在线用户范围跟页面时间范围走，筛选变了要重取
+  }
 })
 watch(customRange, (v) => {
-  if (preset.value === 'custom' && v && v[0] && v[1]) load()
+  if (preset.value === 'custom' && v && v[0] && v[1]) {
+    load()
+    loadLive()
+  }
 })
-watch(modelSort, () => load())
 
 // ===== 格式化 =====
 const fmtInt = (n: number) => Number(n || 0).toLocaleString('zh-CN')
 const fmtMoney = (n: number) =>
   Number(n || 0).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 const fmtPct = (n: number, digits = 1) => `${(Number(n || 0) * 100).toFixed(digits)}%`
+// 输入输出比：≥100 取整、≥10 一位小数、其余两位（避免 0.35 : 1 被压成 0 : 1）
+const fmtRatio = (n: number) => {
+  const v = Number(n || 0)
+  if (v >= 100) return v.toFixed(0)
+  if (v >= 10) return v.toFixed(1)
+  return v.toFixed(2)
+}
 const fmtMs = (n: number) => {
   const v = Number(n || 0)
   return v >= 1000 ? `${(v / 1000).toFixed(2)}s` : `${Math.round(v)}ms`
 }
-const fmtCompact = (n: number) => {
-  const v = Number(n || 0)
-  const abs = Math.abs(v)
-  if (abs >= 1e9) return `${(v / 1e9).toFixed(2)}B`
-  if (abs >= 1e6) return `${(v / 1e6).toFixed(2)}M`
-  if (abs >= 1e3) return `${(v / 1e3).toFixed(2)}K`
-  if (abs >= 1) return v.toFixed(abs >= 100 ? 0 : 1)
-  return v.toFixed(2)
-}
-const fmtTPM = (n: number) => {
-  const v = Number(n || 0)
-  return v >= 100 ? Math.round(v).toString() : v.toFixed(1)
-}
+// 吞吐量（TPM/RPM）与 Token 统一走 @/utils/format 的 fmtCompact（K/M 缩写，单一实现）
 const fmtDelta = (n: number) => `${n >= 0 ? '▲' : '▼'} ${Math.abs(Number(n || 0) * 100).toFixed(1)}%`
 const fmtTime = (iso: string) => {
   if (!iso) return ''
@@ -338,10 +335,10 @@ const bigStats = computed<BigStat[]>(() => {
       label: '吞吐量',
       glyph: '⚡',
       tone: 'info',
-      value: throughput.value.ready ? fmtTPM(k?.TPM ?? 0) : '--',
+      value: throughput.value.ready ? fmtCompact(k?.TPM ?? 0) : '--',
       unit: ' TPM',
       sub: throughput.value.ready
-        ? `${kpiWindow.value.label} · 请求 ${(k?.RPM ?? 0).toFixed(1)} RPM${throughput.value.lowSample ? ' · 样本较少' : ''}`
+        ? `${kpiWindow.value.label} · 请求 ${fmtCompact(k?.RPM ?? 0)} RPM${throughput.value.lowSample ? ' · 样本较少' : ''}`
         : '窗口内没有成功且带耗时的请求',
       winLabel: '忙时口径',
       winTip: `忙时口径 = 成功且带耗时请求的 Token ÷ 同批耗时折算分钟数（≈60÷平均耗时）。${kpiWindow.value.tip}`,
@@ -359,22 +356,28 @@ interface MiniStat {
 
 const miniStats = computed<MiniStat[]>(() => {
   const k = data.value?.KPI
-  const l = live.value
+  const t = data.value?.Usage.Total
+  // 两条都是纯前端从 Usage.Total 算：口径与首屏窗口同源，不额外取接口。
+  const input = Number(t?.Input ?? 0)
+  const output = Number(t?.Output ?? 0)
+  const cacheRead = Number(t?.CacheRead ?? 0)
+  const cacheDenom = input + cacheRead
+  const hitRate = cacheDenom > 0 ? cacheRead / cacheDenom : null
+  const inOut = output > 0 ? input / output : null
   return [
     { label: '总请求数', value: k ? fmtInt(k.TotalRequests) : '--' },
     { label: '成功率', value: k ? fmtPct(k.SuccessRate) : '--', tone: 'ok' },
     { label: '平均耗时', value: k ? fmtMs(k.AvgDurationMS) : '--' },
     {
-      label: '请求中会话',
-      value: l ? fmtInt(l.SessionsTotal) : '…',
-      tone: 'info',
-      tip: '实时区 /stats/live：请求中（Inflight>0）的会话数',
+      label: '缓存命中率',
+      value: hitRate === null ? '—' : fmtPct(hitRate),
+      tone: hitRate !== null && hitRate >= 0.5 ? 'ok' : 'info',
+      tip: '缓存读 ÷（输入 + 缓存读），取自首屏窗口的 Usage.Total；窗口内没有输入也没有缓存读时显示 —',
     },
     {
-      label: '请求中用户',
-      value: l ? fmtInt(l.UsersTotal) : '…',
-      tone: 'info',
-      tip: '实时区 /stats/live：有请求中会话的用户数',
+      label: '输入输出比',
+      value: inOut === null ? '—' : `${fmtRatio(inOut)} : 1`,
+      tip: '输入 : 输出（纯前端由 Usage.Total 计算）；输出为 0 时显示 —',
     },
   ]
 })
@@ -470,7 +473,7 @@ const trendNote = computed(() => {
 // 四条序列都没有任何小时桶 = 窗口内确实没有用量 → 走空态，而不是画四条空线。
 const hasTrendData = computed(() => trendSeries.value.some((s) => s.points.length > 0))
 
-// ===== ③ 模型广场 =====
+// ===== ③ 模型广场（v4 第 3 条：只留数据列 + 复制 + 空闲折叠）=====
 interface PlazaRow {
   model: string
   tokensText: string
@@ -478,11 +481,8 @@ interface PlazaRow {
   callsText: string
   failText: string
   latencyText: string
-  barPct: number
-  color: string
   active: boolean
   enabled: boolean
-  unmatched: boolean
 }
 
 const plaza = computed<StatsModelPlaza | null>(() => data.value?.ModelPlaza ?? null)
@@ -490,36 +490,27 @@ const plaza = computed<StatsModelPlaza | null>(() => data.value?.ModelPlaza ?? n
 const plazaRows = computed<PlazaRow[]>(() => {
   const list: StatsModelStat[] = plaza.value?.List ?? []
   if (!list.length) return []
-  const max = Math.max(...list.map((m) => m.Tokens), 1)
-  return list.map((m, i) => ({
-    model: m.Unmatched ? '未匹配模型' : m.Model || m.Label || '(未命名模型)',
+  return list.map((m) => ({
+    model: m.Model || m.Label || '(未命名模型)',
     tokensText: fmtCompact(m.Tokens),
     // BusyMS=0（窗口内没有成功且带耗时的请求）时后端 TPM 为 0，这里显示 —
-    tpmText: m.BusyMS > 0 ? `${fmtTPM(m.TPM)} TPM` : '—',
+    tpmText: m.BusyMS > 0 ? `${fmtCompact(m.TPM)} TPM` : '—',
     callsText: `${fmtInt(m.Calls)} / ${fmtInt(m.Failed)}`,
     failText: m.Calls > 0 ? fmtPct(m.FailRate) : '—',
     latencyText:
       m.AvgFirstMS > 0 || m.AvgMS > 0
         ? `${m.AvgFirstMS > 0 ? fmtMs(m.AvgFirstMS) : '—'} / ${m.AvgMS > 0 ? fmtMs(m.AvgMS) : '—'}`
         : '—',
-    barPct: Math.max(0, Math.round((m.Tokens / max) * 100)),
-    color: C.series[i % C.series.length],
     active: m.Active,
     enabled: m.Enabled,
-    unmatched: !!m.Unmatched,
   }))
 })
 
-// 后端可能追加一行 Unmatched=true 的兜底行（改名/别名/无渠道导致归属不到的用量）。
-// 它不参与普通模型的排序与空模型折叠，单独渲染成「未匹配模型」区域（后端保证它不受 Limit 截断）。
-const plazaMatchedRows = computed(() => plazaRows.value.filter((m) => !m.unmatched))
-const unmatchedRow = computed(() => plazaRows.value.find((m) => m.unmatched) ?? null)
-
-const activeModels = computed(() => plazaMatchedRows.value.filter((m) => m.active))
-const idleModels = computed(() => plazaMatchedRows.value.filter((m) => !m.active))
+const activeModels = computed(() => plazaRows.value.filter((m) => m.active))
+const idleModels = computed(() => plazaRows.value.filter((m) => !m.active))
 const idleExpanded = ref(false)
 const visibleModels = computed(() =>
-  idleExpanded.value ? plazaMatchedRows.value : activeModels.value,
+  idleExpanded.value ? plazaRows.value : activeModels.value,
 )
 
 const plazaTruncatedText = computed(() => {
@@ -556,11 +547,13 @@ interface LiveSessionRow {
   id: string
   name: string
   model: string
+  running: boolean
   inflight: number
   contextText: string
   contextTip: string
   roundText: string
-  callsText: string
+  totalText: string
+  totalTip: string
   tpmText: string
   spentText: string
   spark: string
@@ -571,16 +564,20 @@ const sessionRows = computed<LiveSessionRow[]>(() =>
   (live.value?.Sessions ?? []).map((s) => {
     // ContextLimit 恒 0 = 平台未配置模型上限：只显示已用绝对值，不做除法、不造分母。
     const hasLimit = s.ContextLimit > 0
+    // 累计 Token 用后端新字段 TotalTokens（三段求和），前端不自己拼 Calls × 均值。
+    const created = s.CreatedAt ? `始自 ${fmtTime(s.CreatedAt)}` : '创建时间未知'
     return {
       id: s.ID,
       name: s.Name || s.ID.slice(0, 8),
       model: s.Model,
+      running: s.Inflight > 0,
       inflight: s.Inflight,
       contextText: hasLimit ? `${fmtCompact(s.ContextUsed)}/${fmtCompact(s.ContextLimit)}` : fmtCompact(s.ContextUsed),
       contextTip: hasLimit ? '上下文已用 / 上限' : '仅显示上下文字数：平台未配置模型上限',
       roundText: fmtCompact(s.RoundTokens),
-      callsText: fmtInt(s.Calls),
-      tpmText: `${fmtTPM(s.TPM)} TPM`,
+      totalText: `${fmtCompact(s.TotalTokens)} Token`,
+      totalTip: `会话累计 Token（输入 + 缓存读 + 输出）· ${created} · 累计 ${fmtInt(s.Calls)} 次请求`,
+      tpmText: `${fmtCompact(s.TPM)} TPM`,
       spentText: fmtMoney(s.SpentCredits),
       spark: sparkPath(s.Spark ?? []),
       lastActive: fmtTime(s.LastActive),
@@ -595,9 +592,25 @@ interface LiveUserRow {
   sessions: number
   tpmText: string
   tokensText: string
+  tokensTip: string
   spentText: string
   spark: string
 }
+
+const liveSampledAt = computed(() => fmtTime(live.value?.SampledAt || ''))
+const liveWindowMinutes = computed(() => live.value?.WindowMinutes ?? LIVE_WINDOW_MINUTES)
+// 在线用户的实际生效范围读后端回显（RangeFrom / RangeTo），不用本地 preset 自猜
+const liveRangeText = computed(() => {
+  const l = live.value
+  if (!l?.RangeFrom || !l?.RangeTo) return ''
+  return `${fmtWindowTs(l.RangeFrom)} ~ ${fmtWindowTs(l.RangeTo)}`
+})
+// 日序列覆盖区间（DailyFrom + DailyPoints，北京时间日界）：迷你曲线的横轴说明。
+const dailyRangeText = computed(() => {
+  const l = live.value
+  if (!l?.DailyFrom || !l?.DailyTo) return ''
+  return `${l.DailyFrom.slice(5)} ~ ${l.DailyTo.slice(5)} 每日`
+})
 
 const userRows = computed<LiveUserRow[]>(() =>
   (live.value?.Users ?? []).map((u) => ({
@@ -605,15 +618,15 @@ const userRows = computed<LiveUserRow[]>(() =>
     name: u.Name || `用户 ${u.ID}`,
     initial: (u.Name || '?').slice(0, 2),
     sessions: u.Sessions,
-    tpmText: `${fmtTPM(u.TPM)} TPM`,
+    tpmText: `${fmtCompact(u.TPM)} TPM`,
     tokensText: fmtCompact(u.Tokens),
+    // 卡面看窗口用量（与吞吐同源），范围口径放 tooltip 里备查
+    tokensTip: `近 ${liveWindowMinutes.value} 分钟 Token；所选范围 ${fmtCompact(u.RangeTokens)} Token · ${fmtInt(u.Calls)} 次请求`,
     spentText: fmtMoney(u.SpentCredits),
-    spark: sparkPath(u.Spark ?? []),
+    // 迷你曲线优先读日活跃序列 Daily（无请求日后端补 0）；老响应无 Daily 时退回分钟 Spark
+    spark: sparkPath(u.Daily?.length ? u.Daily : u.Spark ?? []),
   })),
 )
-
-const liveSampledAt = computed(() => fmtTime(live.value?.SampledAt || ''))
-const liveWindowMinutes = computed(() => live.value?.WindowMinutes ?? LIVE_WINDOW_MINUTES)
 
 // ===== 更多维度（旧版用量分析里仍有数据支撑的部分，默认收起）=====
 const moreOpen = ref<string[]>([])
@@ -798,19 +811,7 @@ const modeLabel = (m: string) =>
             >
               <span class="win-chip">{{ kpiWindow.label }} · 按模型忙时</span>
             </el-tooltip>
-            <div class="sort-group">
-              <span class="sort-label">排序：</span>
-              <el-tooltip v-for="o in MODEL_SORT_OPTIONS" :key="o.key" :content="o.tip" placement="top" :show-after="150">
-                <button
-                  type="button"
-                  class="sort-chip"
-                  :class="{ on: modelSort === o.key }"
-                  @click="modelSort = o.key"
-                >
-                  {{ o.label }}
-                </button>
-              </el-tooltip>
-            </div>
+            <span class="gran-chip">按 Token 倒序</span>
           </div>
 
           <template v-if="plazaRows.length">
@@ -832,7 +833,6 @@ const modeLabel = (m: string) =>
                   <b>{{ m.callsText }}<em class="fail-rate">{{ m.failText }}</em></b>
                 </div>
                 <div class="model-row"><span>首字 / 全程</span><b>{{ m.latencyText }}</b></div>
-                <div class="model-bar"><i :style="{ width: m.barPct + '%', background: m.color }" /></div>
               </div>
             </div>
             <div class="idle-note">
@@ -847,38 +847,19 @@ const modeLabel = (m: string) =>
               </span>
               <span v-if="plazaTruncatedText" class="trunc-note">{{ plazaTruncatedText }}</span>
             </div>
-
-            <!-- 未匹配模型：后端兜底行（Unmatched=true），单独渲染、不参与排序与空模型折叠 -->
-            <div v-if="unmatchedRow" class="unmatched-row">
-              <div class="unmatched-head">
-                <span class="unmatched-name">未匹配模型</span>
-                <el-tooltip
-                  content="改名 / 别名 / 无渠道导致归属不到任何在册对外模型的用量：后端单列汇总，不计入目录数与条数上限"
-                  placement="top"
-                  :show-after="150"
-                >
-                  <span class="unmatched-tag">未归属</span>
-                </el-tooltip>
-              </div>
-              <div class="unmatched-stats">
-                <span>Token <b>{{ unmatchedRow.tokensText }}</b></span>
-                <span>请求 / 失败 <b>{{ unmatchedRow.callsText }}</b></span>
-                <span>吞吐（忙时）<b>{{ unmatchedRow.tpmText }}</b></span>
-                <span>首字 / 全程 <b>{{ unmatchedRow.latencyText }}</b></span>
-              </div>
-            </div>
           </template>
           <el-empty v-else description="模型目录为空：还没有对外模型" :image-size="70" />
         </div>
       </div>
 
-      <!-- ④ 实时区：/stats/live，30s 刷新 -->
+      <!-- ④ 实时区：/stats/live，30s 刷新；会话 / 在线用户均为卡片网格 -->
       <section class="live-block">
         <div class="live-head">
           <h3 class="live-title">实时会话</h3>
-          <span class="live-tag"><span class="dot-live" />每 30s 自动刷新 · 仅显示请求中</span>
+          <span class="live-tag"><span class="dot-live" />每 30s 自动刷新 · 请求中或近 5 分钟活跃</span>
           <span class="live-window">
-            近 {{ liveWindowMinutes }} 分钟墙钟平均<span v-if="liveSampledAt"> · 采样 {{ liveSampledAt }}</span>
+            吞吐窗口 近 {{ liveWindowMinutes }} 分钟墙钟平均<span v-if="liveSampledAt"> · 采样 {{ liveSampledAt }}</span>
+            <span v-if="liveRangeText"> · 在线用户范围 {{ liveRangeText }}</span>
             <span v-if="liveLoading" class="live-loading">刷新中…</span>
           </span>
         </div>
@@ -897,51 +878,90 @@ const modeLabel = (m: string) =>
 
         <div v-if="liveTab === 'sessions'" class="live-card">
           <template v-if="sessionRows.length">
-            <div v-for="s in sessionRows" :key="s.id" class="srow">
-              <span class="srow-dot" />
-              <span class="srow-name" :title="s.name">{{ s.name }}</span>
-              <span class="model-chip">{{ s.model }}</span>
-              <span class="srow-stat">
-                <el-tooltip :content="s.contextTip" placement="top" :show-after="150">
-                  <span>上下文 <b>{{ s.contextText }}</b></span>
-                </el-tooltip>
-                <span>本轮 <b>{{ s.roundText }}</b></span>
-                <span>吞吐 <b>{{ s.tpmText }}</b></span>
-                <span>已花 <b>{{ s.spentText }}</b> 积分</span>
-                <span>累计 <b>{{ s.callsText }}</b> 次</span>
-              </span>
-              <svg v-if="s.spark" class="spark" viewBox="0 0 92 24" preserveAspectRatio="none">
-                <path :d="s.spark" />
-              </svg>
+            <div class="xcard-grid">
+              <article v-for="s in sessionRows" :key="s.id" class="xcard" :data-idle="!s.running">
+                <header class="xcard-head">
+                  <span class="srow-dot" :data-idle="!s.running" />
+                  <span class="xcard-name" :title="s.name">{{ s.name }}</span>
+                  <span class="model-chip">{{ s.model }}</span>
+                  <span v-if="s.running" class="xcard-badge">请求中 {{ s.inflight }}</span>
+                </header>
+                <div class="xcard-stats">
+                  <el-tooltip :content="s.contextTip" placement="top" :show-after="150">
+                    <div class="xstat">
+                      <i>上下文</i>
+                      <b>{{ s.contextText }}</b>
+                    </div>
+                  </el-tooltip>
+                  <div class="xstat">
+                    <i>本轮</i>
+                    <b>{{ s.roundText }}</b>
+                  </div>
+                  <div class="xstat">
+                    <i>吞吐</i>
+                    <b>{{ s.tpmText }}</b>
+                  </div>
+                  <div class="xstat">
+                    <i>已花</i>
+                    <b>{{ s.spentText }}</b>
+                  </div>
+                  <el-tooltip :content="s.totalTip" placement="top" :show-after="150">
+                    <div class="xstat">
+                      <i>累计</i>
+                      <b>{{ s.totalText }}</b>
+                    </div>
+                  </el-tooltip>
+                </div>
+                <svg v-if="s.spark" class="spark xcard-spark" viewBox="0 0 92 24" preserveAspectRatio="none">
+                  <path :d="s.spark" />
+                </svg>
+                <div class="xcard-foot">最近活跃 {{ s.lastActive }}</div>
+              </article>
             </div>
             <div v-if="live?.Truncated" class="trunc-note">
-              仅显示前 {{ LIVE_LIMIT }} 个会话（共 {{ live?.SessionsTotal }} 个请求中）
+              仅显示前 {{ LIVE_LIMIT }} 个活跃会话（共 {{ live?.SessionsTotal }} 个）
             </div>
           </template>
-          <el-empty v-else-if="live" description="当前没有请求中的会话" :image-size="60" />
+          <el-empty v-else-if="live" description="当前没有活跃会话（请求中或近 5 分钟内有请求）" :image-size="60" />
           <el-empty v-else description="实时数据加载中" :image-size="60" />
         </div>
 
         <div v-else class="live-card">
           <template v-if="userRows.length">
-            <div v-for="u in userRows" :key="u.id" class="srow">
-              <span class="uavatar">{{ u.initial }}</span>
-              <span class="srow-name" :title="u.name">{{ u.name }}</span>
-              <span class="srow-stat">
-                <span>会话 <b>{{ u.sessions }}</b></span>
-                <span>吞吐 <b>{{ u.tpmText }}</b></span>
-                <span>消耗 <b>{{ u.tokensText }}</b> Token</span>
-                <span>积分 <b>{{ u.spentText }}</b></span>
-              </span>
-              <svg v-if="u.spark" class="spark" viewBox="0 0 92 24" preserveAspectRatio="none">
-                <path :d="u.spark" />
-              </svg>
+            <div class="xcard-grid">
+              <article v-for="u in userRows" :key="u.id" class="xcard">
+                <header class="xcard-head">
+                  <span class="uavatar">{{ u.initial }}</span>
+                  <span class="xcard-name" :title="u.name">{{ u.name }}</span>
+                  <span class="xcard-badge" :data-idle="u.sessions === 0">会话 {{ u.sessions }}</span>
+                </header>
+                <div class="xcard-stats">
+                  <div class="xstat">
+                    <i>吞吐</i>
+                    <b>{{ u.tpmText }}</b>
+                  </div>
+                  <el-tooltip :content="u.tokensTip" placement="top" :show-after="150">
+                    <div class="xstat">
+                      <i>消耗</i>
+                      <b>{{ u.tokensText }}</b>
+                    </div>
+                  </el-tooltip>
+                  <div class="xstat">
+                    <i>积分</i>
+                    <b>{{ u.spentText }}</b>
+                  </div>
+                </div>
+                <svg v-if="u.spark" class="spark xcard-spark" viewBox="0 0 92 24" preserveAspectRatio="none">
+                  <path :d="u.spark" />
+                </svg>
+                <div class="xcard-foot">{{ dailyRangeText || '暂无日序列' }}</div>
+              </article>
             </div>
             <div v-if="live?.UsersTruncated" class="trunc-note">
               仅显示前 100 个在线用户（共 {{ live?.UsersTotal }} 个）
             </div>
           </template>
-          <el-empty v-else-if="live" description="当前没有在线用户" :image-size="60" />
+          <el-empty v-else-if="live" description="所选范围内没有在线用户" :image-size="60" />
           <el-empty v-else description="实时数据加载中" :image-size="60" />
         </div>
       </section>
@@ -1266,30 +1286,6 @@ const modeLabel = (m: string) =>
 .head-actions { margin-left: auto; }
 
 /* 模型广场 */
-.sort-group {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  margin-left: auto;
-  flex-wrap: wrap;
-}
-.sort-label {
-  font-size: 11px;
-  color: var(--color-text-tertiary);
-}
-.sort-chip {
-  border: none;
-  background: transparent;
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--color-text-tertiary);
-  padding: 2px 8px;
-  border-radius: 999px;
-  cursor: pointer;
-  transition: background 0.15s ease, color 0.15s ease;
-}
-.sort-chip:hover { color: var(--brand-primary); }
-.sort-chip.on { background: var(--brand-primary-soft); color: var(--brand-primary); }
 .model-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -1353,19 +1349,6 @@ const modeLabel = (m: string) =>
   font-size: 11px;
   color: var(--color-text-tertiary);
 }
-.model-bar {
-  height: 5px;
-  border-radius: 3px;
-  background: var(--color-border);
-  margin-top: 8px;
-  overflow: hidden;
-}
-.model-bar i {
-  display: block;
-  height: 100%;
-  border-radius: 3px;
-  transition: width 0.3s ease;
-}
 .copy-btn {
   border: none;
   margin-left: 5px;
@@ -1402,47 +1385,6 @@ const modeLabel = (m: string) =>
   font-size: 11px;
   color: var(--color-text-tertiary);
   margin-top: 8px;
-}
-/* 未匹配模型：灰底虚线框，明显区别于普通模型卡 */
-.unmatched-row {
-  margin-top: 10px;
-  padding: 10px 12px;
-  border: 1px dashed var(--color-border-strong);
-  border-radius: 10px;
-  background: #f7f8fa;
-}
-.unmatched-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 6px;
-}
-.unmatched-name {
-  font-size: 13px;
-  font-weight: 700;
-  color: var(--color-text-secondary);
-}
-.unmatched-tag {
-  font-size: 10px;
-  font-weight: 600;
-  padding: 1px 8px;
-  border-radius: 999px;
-  background: #eef0f3;
-  color: var(--color-text-tertiary);
-  cursor: help;
-}
-.unmatched-stats {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px 18px;
-  font-size: 12px;
-  color: var(--color-text-secondary);
-}
-.unmatched-stats b {
-  color: var(--color-text);
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
-  font-family: 'SF Mono', Consolas, monospace;
 }
 
 /* ===== ④ 实时区 ===== */
@@ -1490,15 +1432,95 @@ const modeLabel = (m: string) =>
   padding: 12px 14px;
   min-width: 0;
 }
-.srow {
+/* 实时卡片网格：3 列 → 2 列 → 1 列（见文末响应式断点） */
+.xcard-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  transition: grid-template-columns 0.2s ease;
+}
+.xcard {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: #fafbfd;
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  padding: 12px 14px;
+  min-width: 0;
+  transition: border-color 0.18s ease, box-shadow 0.18s ease, background 0.18s ease;
+}
+.xcard:hover {
+  border-color: var(--color-border-strong);
+  box-shadow: var(--shadow-card);
+}
+.xcard[data-idle='true'] { background: #f7f8fa; }
+.xcard-head {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 9px 0;
-  border-bottom: 1px dashed var(--color-border);
-  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
 }
-.srow:last-of-type { border-bottom: none; }
+.xcard-name {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--color-text);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.xcard-badge {
+  margin-left: auto;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: #e8f8f0;
+  color: var(--color-success);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.xcard-badge[data-idle='true'] {
+  background: #f0f1f4;
+  color: var(--color-text-tertiary);
+}
+.xcard-stats {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px 10px;
+}
+.xstat {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 6px;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+.xstat i {
+  font-style: normal;
+  font-size: 11px;
+  color: var(--color-text-tertiary);
+  white-space: nowrap;
+}
+.xstat b {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-text);
+  font-variant-numeric: tabular-nums;
+  font-family: 'SF Mono', Consolas, monospace;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.xcard-spark { margin-left: 0; }
+.xcard-foot {
+  font-size: 11px;
+  color: var(--color-text-tertiary);
+}
 .srow-dot {
   width: 8px;
   height: 8px;
@@ -1507,6 +1529,12 @@ const modeLabel = (m: string) =>
   box-shadow: 0 0 0 3px rgba(18, 183, 106, 0.18);
   animation: livePulse 1.6s infinite;
   flex-shrink: 0;
+}
+/* 非请求中（仅近 5 分钟活跃）：灰点，不闪 */
+.srow-dot[data-idle='true'] {
+  background: var(--color-text-tertiary);
+  box-shadow: 0 0 0 3px rgba(102, 112, 133, 0.14);
+  animation: none;
 }
 .uavatar {
   width: 26px;
@@ -1521,16 +1549,6 @@ const modeLabel = (m: string) =>
   font-weight: 700;
   flex-shrink: 0;
 }
-.srow-name {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--color-text);
-  min-width: 110px;
-  max-width: 170px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
 .model-chip {
   font-size: 10px;
   font-weight: 600;
@@ -1539,19 +1557,9 @@ const modeLabel = (m: string) =>
   background: var(--brand-primary-soft);
   color: var(--brand-primary);
   white-space: nowrap;
-}
-.srow-stat {
-  display: flex;
-  gap: 14px;
-  font-size: 12px;
-  color: var(--color-text-secondary);
-  flex-wrap: wrap;
-}
-.srow-stat b {
-  color: var(--color-text);
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
-  font-family: 'SF Mono', Consolas, monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 60%;
 }
 .spark {
   width: 92px;
@@ -1669,6 +1677,7 @@ const modeLabel = (m: string) =>
 /* ===== 响应式 ===== */
 @media (max-width: 1280px) {
   .model-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .xcard-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 @media (max-width: 1100px) {
   .mini-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
@@ -1680,7 +1689,8 @@ const modeLabel = (m: string) =>
 @media (max-width: 760px) {
   .mini-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .model-grid { grid-template-columns: 1fr; }
-  .head-actions, .sort-group { margin-left: 0; }
+  .xcard-grid { grid-template-columns: 1fr; }
+  .head-actions { margin-left: 0; }
   .live-window { margin-left: 0; }
 }
 </style>

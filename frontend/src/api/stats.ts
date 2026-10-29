@@ -75,7 +75,7 @@ export interface StatsModelStat {
   AvgFirstMS: number
   Active: boolean // Calls>0；false = 空闲模型 → 折叠
   // 后端兜底行：无法归属到任何在册对外模型的用量（改名/别名/无渠道）。
-  // Model 固定为 "__unmatched__"，Frontend 应单独渲染，不计入目录数、不受 Limit 截断。
+  // Model 固定为 "__unmatched__"。v4 第 3 条已从页面移除该区块，前端不再渲染（字段保留向后兼容）。
   Unmatched: boolean
 }
 
@@ -195,7 +195,7 @@ export interface StatsDashboardParams {
   To?: string
   Granularity?: 'auto' | 'hour' | 'day'
   CompareDays?: number // 0~7，四线图传 4
-  ModelSort?: 'tokens' | 'tpm' | 'failed' | 'latency'
+  // ModelSort 已下线（v4 第 3 条）：后端固定按 Token 倒序，前端不再传排序参数。
   ModelLimit?: number // 1~200
   // exact（默认）= 严格按请求区间的滚动窗口；calendar = 北京时间自然日归一。
   // KPI / Hourly / ModelPlaza 跟这个窗口走，Usage.Daily 与其它维度聚合仍是日界口径。
@@ -215,6 +215,10 @@ export interface StatsLiveSession {
   WindowTokens: number
   TPM: number // 墙钟窗口平均（Token ÷ Window 分钟）
   SpentCredits: number
+  // 累计 Token（三段求和）：卡片「累计」用它，不含单位换算
+  TotalTokens: number
+  // 会话创建时间（RFC3339，注册表未记录时为空串）
+  CreatedAt: string
   LastActive: string
   Spark: number[] // 时间正序，可能不足 SparkPoints 个
 }
@@ -222,10 +226,17 @@ export interface StatsLiveSession {
 export interface StatsLiveUser {
   ID: string
   Name: string
-  Sessions: number
-  Tokens: number
+  Sessions: number // 仍只数 Inflight>0 的会话
+  Tokens: number // 该用户全部会话的近 Window 用量
   TPM: number // 墙钟窗口平均
   SpentCredits: number
+  // 所选时间范围内的活跃会话数 / 请求数 / Token / 积分（billing_records 同源）
+  ActiveSessions: number
+  Calls: number
+  RangeTokens: number
+  RangeCredits: number
+  // 逐日 Token 序列（长度 = DailyPoints，无请求日补 0，时间正序）→ 迷你曲线
+  Daily: number[]
   Spark: number[] // 时间正序，无请求分钟补 0
 }
 
@@ -234,8 +245,15 @@ export interface StatsLive {
   SampledAt: string
   WindowMinutes: number
   SparkPoints: number
-  SessionsTotal: number
-  UsersTotal: number
+  // 在线用户筛选范围（RFC3339）回显：页面时间范围标签读它，不要本地自拼
+  RangeFrom: string
+  RangeTo: string
+  // 每用户日活跃序列覆盖的日期（YYYY-MM-DD，北京时间日界）
+  DailyFrom: string
+  DailyTo: string
+  DailyPoints: number
+  SessionsTotal: number // 请求中 + 近 5 分钟活跃
+  UsersTotal: number // 所选范围内有过请求的用户数（与 Users 同源未截断）
   Truncated: boolean
   UsersTruncated: boolean
   Sessions: StatsLiveSession[] | null
@@ -243,6 +261,9 @@ export interface StatsLive {
 }
 
 export interface StatsLiveParams {
+  // 在线用户筛选范围；缺省 = 后端默认近 24h，跨度上限 366 天
+  From?: string // RFC3339
+  To?: string // RFC3339
   Window?: number // 1~1440 分钟，默认 60
   SparkPoints?: number // 1~60，默认 12
   Limit?: number // 1~100，默认 20
