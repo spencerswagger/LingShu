@@ -240,6 +240,17 @@ export interface StatsLiveUser {
   Spark: number[] // 时间正序，无请求分钟补 0
 }
 
+// 刚结束请求、正在淡出的会话（**纯展示**，不参与会话数/用户数与任何聚合）。
+// 语义：这些卡片已经从 Sessions 里出去，前端把它们标记为「离开中」播淡出动画，
+// 到 `ExitedAt + FadeWindowSeconds` 就从 DOM 移除（下一轮服务端也不会再返回）。
+export interface StatsLiveExited {
+  ID: string // 会话指纹
+  Name: string // 可能为空 → 前端用 ID 前缀兜底
+  Model: string
+  ExitedAt: string // 淡出起点（RFC3339）
+  Calls: number // 该会话累计请求数（仅卡片收尾展示）
+}
+
 export interface StatsLive {
   Scope: string // global | self
   SampledAt: string
@@ -252,12 +263,20 @@ export interface StatsLive {
   DailyFrom: string
   DailyTo: string
   DailyPoints: number
-  SessionsTotal: number // 请求中 + 近 5 分钟活跃
+  // 我的会话总数（未截断）= **仅请求中**（Inflight > 0）；刚结束的会话只在 RecentlyExited 里淡出，
+  // 不会抬高这个数字，前端也不要用 LastActive 再过滤一次。
+  SessionsTotal: number
   UsersTotal: number // 所选范围内有过请求的用户数（与 Users 同源未截断）
   Truncated: boolean
   UsersTruncated: boolean
+  // Sessions 由服务端保证「只有请求中的会话」（不要再用 LastActive 过滤）。
   Sessions: StatsLiveSession[] | null
   Users: StatsLiveUser[] | null
+  // 淡出窗口内刚结束请求的会话（上限 20，按最近活跃倒序）。**纯展示字段**：
+  // 不计入 SessionsTotal / UsersTotal，不参与任何排序与聚合。
+  RecentlyExited?: StatsLiveExited[] | null
+  // 淡出窗口秒数（当前 300）：卡片在 ExitedAt + 该值 之后从 DOM 移除。
+  FadeWindowSeconds?: number
 }
 
 export interface StatsLiveParams {

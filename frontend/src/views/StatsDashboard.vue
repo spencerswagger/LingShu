@@ -20,6 +20,7 @@ import {
   type StatsDashboard,
   type StatsHour,
   type StatsLive,
+  type StatsLiveExited,
   type StatsTopItem,
   type StatsModelStat,
   type StatsModelPlaza,
@@ -145,8 +146,15 @@ const LIVE_REFRESH_MS = 30000
 // 实时区同样加序号守卫：轮询 / 手动刷新交叠时只认最新响应。
 let liveSeq = 0
 let liveInFlight = false
+// 单飞 + 单份待取：「前一发未回不发下一个」，但期间来的请求只记一次「还欠一轮」，
+// 目前在飞的那发回来后立刻补取，既不并发也不丢最后一次请求（例如刚切了时间范围）。
+let livePending = false
 
 async function loadLive() {
+  if (liveInFlight) {
+    livePending = true
+    return
+  }
   const seq = ++liveSeq
   liveInFlight = true
   liveLoading.value = true
@@ -163,6 +171,8 @@ async function loadLive() {
     })
     if (seq !== liveSeq) return // 过期响应直接丢弃
     live.value = res.Data
+    // 淡出项与主列表同一批数据一起同步：该进来的进、已回到请求中的撤掉、过期的删掉
+    syncFading(res.Data?.RecentlyExited, res.Data?.FadeWindowSeconds)
     liveErr.value = ''
   } catch (e: any) {
     if (seq !== liveSeq) return
@@ -172,8 +182,122 @@ async function loadLive() {
     if (seq === liveSeq) {
       liveInFlight = false
       liveLoading.value = false
+      if (livePending) {
+        livePending = false
+        void loadLive()
+      }
     }
   }
+}
+
+// ===== 淡出（离开中）卡片 =====
+// 服务端口径：Sessions 只含**请求中**的会话；刚结束的会话进 RecentlyExited，只做淡出展示。
+// 前端做法：把淡出项与主列表**合并成同一个 keyed 列表**渲染（key 都是会话 ID），
+// 所以「从请求中消失 + 同时出现在 RecentlyExited」是同一个 DOM 节点就地变暗，
+// 不会出现「原地消失 + 别处新冒出一个」。淡出项到 ExitedAt + FadeWindowSeconds 就从 DOM 移除，
+// 不靠本地状态长期保留（服务端下一轮也不再返回）。
+const FADE_OUT_MS = 400 // 收尾淡出时长：到点前这 400ms 把不透明度降到底，随后移除节点
+const FADE_WINDOW_DEFAULT = 300
+
+interface FadingCard {
+  id: string
+  name: string
+  model: string
+  calls: number
+  exitedAtMs: number // ExitedAt 解析值（解析失败退化为收到响应的时刻）
+  deadline: number // exitedAtMs + FadeWindowSeconds（到点移除）
+  leaving: boolean // 进入最后 400ms：opacity → 0
+  leftText: string // 「4:12」剩余时间
+}
+
+const fadingCards = ref<FadingCard[]>([])
+// 淡出窗口秒数：读后端下发的 FadeWindowSeconds，缺省 300
+const fadeWindowSeconds = computed(() => {
+  const v = Number(live.value?.FadeWindowSeconds)
+  return Number.isFinite(v) && v > 0 ? v : FADE_WINDOW_DEFAULT
+})
+
+// 淡出卡片显示「最后一次实时那一版」的数据（快照），这样它变暗时看起来还是同一张卡，
+// 而不是统计值突然变成一堆「—」。快照只用于渲染，不参与任何计数。
+const lastLiveRows = new Map<string, LiveSessionRow>()
+
+function parseIsoMs(iso: string | undefined, fallback: number): number {
+  const t = iso ? Date.parse(iso) : NaN
+  return Number.isFinite(t) ? t : fallback
+}
+function fmtRemain(ms: number): string {
+  const s = Math.max(0, Math.ceil(ms / 1000))
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
+}
+
+// 每秒推进一次：更新剩余秒数、进入收尾淡出、到点移除。
+function tickFading(now = Date.now()) {
+  if (!fadingCards.value.length) return
+  const next: FadingCard[] = []
+  for (const c of fadingCards.value) {
+    const remain = c.deadline - now
+    if (remain <= 0) continue // 到点：直接移除（服务端也不再返回）
+    const leaving = remain <= FADE_OUT_MS
+    const leftText = fmtRemain(remain)
+    if (leaving === c.leaving && leftText === c.leftText) {
+      next.push(c) // 无变化就不换对象，少一次渲染
+      continue
+    }
+    next.push({ ...c, leaving, leftText })
+  }
+  fadingCards.value = next
+}
+
+// 每轮实时响应后同步淡出集合（幂等：同一份数据重复同步不会抖动）。
+function syncFading(list: StatsLiveExited[] | null | undefined, windowSeconds: number | undefined) {
+  const now = Date.now()
+  const winSec = Number(windowSeconds)
+  const winMs = (Number.isFinite(winSec) && winSec > 0 ? winSec : FADE_WINDOW_DEFAULT) * 1000
+  const liveIds = new Set((live.value?.Sessions ?? []).map((s) => s.ID))
+  const incoming = new Map<string, StatsLiveExited>()
+  for (const e of list ?? []) if (e?.ID) incoming.set(e.ID, e)
+
+  const next: FadingCard[] = []
+  for (const card of fadingCards.value) {
+    if (liveIds.has(card.id)) continue // 又回到请求中：撤掉淡出态，交给主列表（同一 key 复用节点）
+    if (now >= card.deadline) continue // 已过淡出窗口
+    const inc = incoming.get(card.id)
+    if (!inc) {
+      next.push(card) // 服务端这轮没返回：仍以本地 deadline 为准，到点移除，不长期保留
+      continue
+    }
+    const exitedAtMs = parseIsoMs(inc.ExitedAt, card.exitedAtMs)
+    next.push({
+      ...card,
+      name: inc.Name || card.name,
+      model: inc.Model || card.model,
+      calls: Number(inc.Calls) || card.calls,
+      exitedAtMs,
+      deadline: exitedAtMs + winMs, // 以服务端给的 ExitedAt 为准滚动
+    })
+  }
+  const known = new Set(next.map((c) => c.id))
+  for (const e of incoming.values()) {
+    if (liveIds.has(e.ID) || known.has(e.ID)) continue
+    const exitedAtMs = parseIsoMs(e.ExitedAt, now)
+    next.push({
+      id: e.ID,
+      name: e.Name || e.ID.slice(0, 8),
+      model: e.Model || '',
+      calls: Number(e.Calls) || 0,
+      exitedAtMs,
+      deadline: exitedAtMs + winMs,
+      leaving: false,
+      leftText: '',
+    })
+  }
+  // 顺序：按 ExitedAt 倒序（最近离开的在前），与主列表顺序互不影响，也不参与排序口径
+  next.sort((a, b) => b.exitedAtMs - a.exitedAtMs)
+  fadingCards.value = next
+  // 快照只留「当前请求中 + 正在淡出」的会话，避免长期开着页面时 Map 无限增长
+  const keep = new Set<string>([...liveIds, ...next.map((c) => c.id)])
+  for (const id of [...lastLiveRows.keys()]) if (!keep.has(id)) lastLiveRows.delete(id)
+  tickFading(now)
 }
 
 // 30s 定时刷新：重取实时区 + 当前筛选条件下的 dashboard（静默，不闪整页 loading）。
@@ -188,16 +312,21 @@ async function refreshTick() {
 }
 
 let liveTimer: number | undefined
+// 淡出倒计时用独立 1s 心跳：与 30s 轮询解耦，轮询不会重置淡出进度（不闪）。
+let fadeTimer: number | undefined
 
 onMounted(() => {
   load()
   loadAnnouncements()
   loadLive()
   liveTimer = window.setInterval(refreshTick, LIVE_REFRESH_MS)
+  fadeTimer = window.setInterval(() => tickFading(), 1000)
 })
 onUnmounted(() => {
   if (liveTimer !== undefined) window.clearInterval(liveTimer)
   liveTimer = undefined
+  if (fadeTimer !== undefined) window.clearInterval(fadeTimer)
+  fadeTimer = undefined
 })
 
 watch(preset, () => {
@@ -587,6 +716,45 @@ const sessionRows = computed<LiveSessionRow[]>(() =>
   }),
 )
 
+// 主列表（请求中）+ 淡出项合并成同一个 keyed 列表：key = 会话 ID。
+// 淡出卡片沿用「最后一次实时的那一版」快照，只有徽标/状态变暗，统计值不会突然清空。
+interface LiveCard {
+  row: LiveSessionRow
+  fading: boolean
+  leaving: boolean
+  leftText: string
+}
+
+const liveSessionCards = computed<LiveCard[]>(() => {
+  const out: LiveCard[] = sessionRows.value.map((row) => {
+    lastLiveRows.set(row.id, row) // 快照：供它随后淡出时沿用
+    return { row, fading: false, leaving: false, leftText: '' }
+  })
+  for (const c of fadingCards.value) {
+    const snap = lastLiveRows.get(c.id)
+    const row: LiveSessionRow = snap
+      ? { ...snap, running: false, inflight: 0 }
+      : {
+          id: c.id,
+          name: c.name,
+          model: c.model,
+          running: false,
+          inflight: 0,
+          contextText: '—',
+          contextTip: '会话已结束：只保留淡出占位',
+          roundText: '—',
+          totalText: '',
+          totalTip: '',
+          tpmText: '',
+          spentText: '',
+          spark: '',
+          lastActive: fmtTime(new Date(c.exitedAtMs).toISOString()),
+        }
+    out.push({ row, fading: true, leaving: c.leaving, leftText: c.leftText })
+  }
+  return out
+})
+
 interface LiveUserRow {
   id: string
   name: string
@@ -858,7 +1026,7 @@ const modeLabel = (m: string) =>
       <section class="live-block">
         <div class="live-head">
           <h3 class="live-title">实时会话</h3>
-          <span class="live-tag"><span class="dot-live" />每 30s 自动刷新 · 请求中或近 5 分钟活跃</span>
+          <span class="live-tag"><span class="dot-live" />每 30s 自动刷新 · 只显示请求中的会话</span>
           <span class="live-window">
             吞吐窗口 近 {{ liveWindowMinutes }} 分钟墙钟平均<span v-if="liveSampledAt"> · 采样 {{ liveSampledAt }}</span>
             <span v-if="liveRangeText"> · 在线用户范围 {{ liveRangeText }}</span>
@@ -879,52 +1047,76 @@ const modeLabel = (m: string) =>
         </div>
 
         <div v-if="liveTab === 'sessions'" class="live-card">
-          <template v-if="sessionRows.length">
+          <div v-if="fadingCards.length" class="live-fade-note">
+            刚结束请求的会话会在这里淡出（最长 {{ fadeWindowSeconds }} 秒），
+            <b>不计入</b>会话数与用户数，也不参与排序。
+          </div>
+          <template v-if="liveSessionCards.length">
             <div class="xcard-grid">
-              <article v-for="s in sessionRows" :key="s.id" class="xcard" :data-idle="!s.running">
+              <article
+                v-for="c in liveSessionCards"
+                :key="c.row.id"
+                class="xcard"
+                :class="{ 'is-fading': c.fading, 'is-leaving': c.leaving }"
+                :data-idle="!c.row.running"
+                :data-fading="c.fading"
+              >
                 <header class="xcard-head">
-                  <span class="srow-dot" :data-idle="!s.running" />
-                  <span class="xcard-name" :title="s.name">{{ s.name }}</span>
-                  <span class="model-chip">{{ s.model }}</span>
-                  <span v-if="s.running" class="xcard-badge">请求中 {{ s.inflight }}</span>
+                  <span class="srow-dot" :data-idle="!c.row.running" />
+                  <span class="xcard-name" :title="c.row.name">{{ c.row.name }}</span>
+                  <span class="model-chip">{{ c.row.model }}</span>
+                  <span v-if="c.fading" class="xcard-badge" data-fading="true">
+                    离开中 · {{ c.leftText }}
+                  </span>
+                  <span v-else-if="c.row.inflight > 0" class="xcard-badge">请求中 {{ c.row.inflight }}</span>
                 </header>
                 <div class="xcard-stats">
-                  <el-tooltip :content="s.contextTip" placement="top" :show-after="150">
+                  <el-tooltip :content="c.row.contextTip" placement="top" :show-after="150">
                     <div class="xstat">
                       <i>上下文</i>
-                      <b>{{ s.contextText }}</b>
+                      <b>{{ c.row.contextText }}</b>
                     </div>
                   </el-tooltip>
                   <div class="xstat">
                     <i>本轮</i>
-                    <b>{{ s.roundText }}</b>
+                    <b>{{ c.row.roundText }}</b>
                   </div>
                   <div class="xstat">
                     <i>吞吐</i>
-                    <b>{{ s.tpmText }}</b>
+                    <b>{{ c.row.tpmText }}</b>
                   </div>
                   <div class="xstat">
                     <i>已花</i>
-                    <b>{{ s.spentText }}</b>
+                    <b>{{ c.row.spentText }}</b>
                   </div>
-                  <el-tooltip :content="s.totalTip" placement="top" :show-after="150">
+                  <el-tooltip :content="c.row.totalTip" placement="top" :show-after="150">
                     <div class="xstat">
                       <i>累计</i>
-                      <b>{{ s.totalText }}</b>
+                      <b>{{ c.row.totalText }}</b>
                     </div>
                   </el-tooltip>
                 </div>
-                <svg v-if="s.spark" class="spark xcard-spark" viewBox="0 0 92 24" preserveAspectRatio="none">
-                  <path :d="s.spark" />
+                <svg v-if="c.row.spark" class="spark xcard-spark" viewBox="0 0 92 24" preserveAspectRatio="none">
+                  <path :d="c.row.spark" />
                 </svg>
-                <div class="xcard-foot">最近活跃 {{ s.lastActive }}</div>
+                <div class="xcard-foot">
+                  {{ c.fading ? '请求已结束' : '最近活跃' }} {{ c.row.lastActive }}
+                </div>
               </article>
             </div>
             <div v-if="live?.Truncated" class="trunc-note">
-              仅显示前 {{ LIVE_LIMIT }} 个活跃会话（共 {{ live?.SessionsTotal }} 个）
+              仅显示前 {{ LIVE_LIMIT }} 个请求中的会话（共 {{ live?.SessionsTotal }} 个）
             </div>
           </template>
-          <el-empty v-else-if="live" description="当前没有活跃会话（请求中或近 5 分钟内有请求）" :image-size="60" />
+          <el-empty
+            v-else-if="live"
+            :description="
+              fadingCards.length
+                ? '当前没有请求中的会话（刚结束的会话正在淡出）'
+                : '当前没有请求中的会话'
+            "
+            :image-size="60"
+          />
           <el-empty v-else description="实时数据加载中" :image-size="60" />
         </div>
 
@@ -1460,6 +1652,28 @@ const modeLabel = (m: string) =>
   box-shadow: var(--shadow-card);
 }
 .xcard[data-idle='true'] { background: #f7f8fa; }
+/* 离开中（淡出）卡片：同一节点就地变暗 + 虚线边，不参与计数；到 ExitedAt+FadeWindow 后节点被移除 */
+.xcard.is-fading {
+  opacity: 0.62;
+  background: #f8f9fb;
+  border-style: dashed;
+  filter: saturate(0.7);
+}
+.xcard.is-leaving {
+  opacity: 0;
+  transition: opacity 0.4s ease;
+}
+.xcard-badge[data-fading='true'] {
+  background: #fff4e5;
+  color: #b54708;
+}
+.live-fade-note {
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--color-text-tertiary);
+  margin-bottom: 8px;
+}
+.live-fade-note b { color: var(--color-text-secondary); }
 .xcard-head {
   display: flex;
   align-items: center;
@@ -1541,7 +1755,7 @@ const modeLabel = (m: string) =>
   animation: livePulse 1.6s infinite;
   flex-shrink: 0;
 }
-/* 非请求中（仅近 5 分钟活跃）：灰点，不闪 */
+/* 非请求中（已在淡出/已结束）：灰点，不闪 */
 .srow-dot[data-idle='true'] {
   background: var(--color-text-tertiary);
   box-shadow: 0 0 0 3px rgba(102, 112, 133, 0.14);
