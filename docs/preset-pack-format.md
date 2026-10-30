@@ -15,9 +15,9 @@
 3. **价格一律人民币**：`models.<m>.gateway.costRates`（三段，元/百万 token 倍率）是唯一计费载体；`cost` 是展示位。数据集必须写 `gateway.costCurrency: "CNY"`，且**数值必须是人民币字面量**——代码不做任何单位/币种换算，把美元数填进来就按人民币出账（虚低 6.8 倍，第 9.1）。
 4. 灵枢**忽略一切未知字段**（不会因多字段报错），但**会因为 `passthroughMode` 非法 / provider 名重复 / baseUrl 非 http(s) / `externalModelID` 写成数字而整包同步失败**（第 11 节）。
 5. 数据集 URL 只挂 `preset.pack_url`；**绝不能**挂到 `sync.price_source_url`（第 9.4 节）：若数据集同时带 v1 的 `cost`，会被当美元 ×6.8 写进售价；只带 `costRates` 则参考价这条通道静默无效（一条都拉不到，不报错）。
-6. **兰台冻结 Schema 前必读 §0.1「冻结前 5 项规范」**：协议词表、模型必须内联、`pack_url` 是指针、providerId 命名、最小必备集——每条一个唯一结论。
+6. **兰台冻结 Schema 前必读 §0.1「冻结前 6 项规范」**：协议词表、模型必须内联、`pack_url` 是指针、providerId 命名、最小必备集、同档多协议（F6，仅翻译型供应商）——每条一个唯一结论。
 
-## 0.1 冻结前 5 项规范（兰台用 · 冻结 JSON Schema 前必读）
+## 0.1 冻结前 6 项规范（兰台用 · 冻结 JSON Schema 前必读）
 
 > 每条一个唯一结论，不做选项讨论。标「约定」的属格式约定、**无代码执法**；标「代码」的可追到文件:行（2026-10-28 核实/实测）。
 >
@@ -68,10 +68,12 @@
 
 ### F6 同档多协议 = 同一套模型（「一档多入口」怎么填）
 
-- **结论：同档指「同一套模型，且每种协议都能访问」；不要按协议切分模型清单。**
-- 依据（官方一手，2026-10-30）：OpenCode v2 文档 `harnesses` 的「Base URLs」表给出 Pay-as-you-go `https://opencode.ai/inference`、Go `https://opencode.ai/inference/go`，路径 `/openai/v1/responses`、`/openai/v1/chat/completions`、`/anthropic/v1/messages`；同页原文「**Every API serves every paid and Go text model**: Console sends a request to the model's own endpoint when it speaks that API, and translates it otherwise.」（`https://opencode.ai/v2/docs/console/harnesses`）
-- ⇒ 数据集里「按协议分组列模型」**只是展示分组，不是能力边界**；灵枢按入站协议与 `protocols` 求交，同档模型在每个协议下都应可达，否则会人为收窄可用面。
-- **兰台照抄（OpenCode 现成例子：能合并就 2 条，不要 4 条）**：
+- **适用范围（关键前提）**：**只适用于「网关型 / 翻译型」供应商**（供应商自己把请求翻成上游原生协议的，OpenCode Console 属此类）。**原厂直连型供应商不适用**——它们每个模型只有一个原生 API family，模型清单与协议必须一一对应。
+- **结论（翻译型）**：同档指「同一套模型，且每种协议都能访问」；不要按协议切分模型清单，按协议分组在数据里**只是展示分组，不是能力边界**。
+- 依据（官方一手，2026-10-30）：`https://opencode.ai/v2/docs/console/harnesses` 原文「**Every API serves every paid and Go text model**: Console sends a request to the model's own endpoint when it speaks that API, and **translates it otherwise**」；同站 `api/inference` 页另一句「Each model is served by one API family」——两句合起来读才是完整语义：**每个模型有各自的原生 family，翻译由网关代劳**。Base URLs：Pay-as-you-go `https://opencode.ai/inference`、Go `…/inference/go`。
+- **结论（非翻译型）**：**只列该模型的原生协议**。把上游不原生的协议也列进 `protocols`，灵枢会按「命中即直通」把请求打到非原生端点（跨协议转换是按渠道/模型显式开启的，不能指望默认兜底），结果是请求必失败——比少列协议更糟。
+- ⚠ **`google` 家族当前不可表达**：Gemini 原生入口是 `/google/v1beta/models/<model>:generateContent`，灵枢的 3 个基础协议（`openai-chat` / `openai-responses` / `anthropic-messages`）**没有对应项**。这类模型**不要硬凑**成 openai/anthropic 协议；数据集里先不放，或等灵枢补 `google` 协议后再加（属代码改动，另议）。注意：若真写了 `"google": {}`，F1 的白名单会**静默丢弃该键**（200、看着像成功），排障时别被这一点骗。
+- **兰台照抄（翻译型现成例子：OpenCode，能合并就 2 条，不要 4 条）**：
 
 ```jsonc
 // Zen（Pay-as-you-go）
@@ -500,15 +502,21 @@ R = billing.r（默认 10000）
 
 ### 11.1 会让整包同步失败（事务整体回滚，一条不留）
 
+> **⚠ 先看适用情形：下表只对「已存在条目被覆盖」成立。**
+>
+> - **已存在条目更新**：走 `overwriteFromPreset` → 先 `validate`（`channelprotocol/service.go:575-587`），命中 V3/V4/V5/V7 任一条 → **400 + 整包回滚**（事务内一条不落）。
+> - **首次接入（新增 provider）**：走 `insertOn`（`channelprotocol/store.go:165-184`，直接 INSERT，**不经过 `validate()`**）→ 坏 `baseUrl` / `passthroughMode:"bogus"` / 多个 `default` 会 **200 落库**，只是这些数据本不该生效。这是**已知校验口子、尚未修复**，已登记 `docs/pending-tasks.md`（P1「`insertOn` 绕过校验」）；别把它当成「已修复」。
+> - 因此 V3/V4/V5/V7 下方标注「首次接入不拦」，V1/V2/V6/V8 两类情形都拦（解码层 / DB 唯一索引 / 解码层）。
+
 | # | 触发条件 | 表现 |
 |---|---|---|
 | V1 | JSON 语法错误 / 顶层不是对象 | 解析失败，sync 返回错误 |
 | V2 | `preset.pack_url` 拉取非 200 或超时 | sync 返回错误 |
-| V3 | 某 provider 的 `id` 与 `name` **同时为空** | 400「渠道协议名称不能为空」 |
-| V4 | provider 级 `gateway.baseUrl` 非空但非 `http(s)://` 开头 | 400「BaseURL 必须以 http:// 或 https:// 开头」 |
-| V5 | `gateway.requestHeaders.passthroughMode` 非法 | 400「passthroughMode 只支持 …」 |
+| V3 | 某 provider 的 `id` 与 `name` **同时为空** | 400「渠道协议名称不能为空」。**首次接入不拦**（`insertOn` 不解 `name`/不校验，空名会直接落库；见上注） |
+| V4 | provider 级 `gateway.baseUrl` 非空但非 `http(s)://` 开头 | 400「BaseURL 必须以 http:// 或 https:// 开头」。**首次接入不拦**（会 200 落库，随后请求阶段才炸） |
+| V5 | `gateway.requestHeaders.passthroughMode` 非法 | 400「passthroughMode 只支持 …」。**首次接入不拦**（已实测：新条目带 `"bogus"` 能 200 落库） |
 | V6 | 两个 provider 物化出同名（`name` 或 `id` 重复） | 唯一索引冲突，整次回滚 |
-| V7 | provider 级 `protocols` 里 `default: true` 多于一个 | 400「至多一个默认协议」 |
+| V7 | provider 级 `protocols` 里 `default: true` 多于一个 | 400「至多一个默认协议」。**首次接入不拦** |
 | V8 | 把 `gateway.externalModelID` 写成**数字**（该字段是 `json:"externalModelID,string"`，见 `channelprotocol/model.go:101`） | 整包 JSON 解析失败、sync 报错、全部回滚。实测（2026-10-28，一次性 `go run`）：`{"externalModelID":123}` → `json: cannot unmarshal number into Go struct field … externalModelID of type int64`；`{"externalModelID":"123"}` → 正常。数据集本来就不该填它，此条防手滑 |
 | **V9** | **⚠ 高危（不报错，但会改存量）：发布空包**——顶层 `{}`，或一个 provider 都没有 | **不是「无操作」**。`Sync` 的失效标记循环（`channelprotocol/service.go:446-461`）会把 `seen` 里缺失的**现有全部 ACTIVE 协议逐个翻成 `STALE`**：返回 `Code=0`、`Applied=0`，每条被翻的都会出现在 `Pending`（Diff「预设来源已失效（保留协议）」，`Stale=true`；本来就是 STALE 的会被跳过）。协议不删、渠道不断链，但管理端整屏显示「来源已失效」。**严禁发布空包**：要下线某个 provider 请只删那一条，不要发空包。**实测（2026-10-28，Gate 在 `lingshu_test` 跑步骤 3）**：发 `{}` → **HTTP 200 / Code=0 / Applied=0 / 40 条全部翻 STALE**（原为 40 条 ACTIVE），恢复真包后 40 条全回 `ACTIVE`；整条链路**全程无报错**，只有 `Pending` 里有痕迹。证据：`notes/pack-step3-acceptance.md` |
 
@@ -551,7 +559,17 @@ R = billing.r（默认 10000）
 3. **`externalModelID` 兰台不可填**：它是灵枢内部雪花 ID。因此数据集**无法**把价格自动落到 `channel_models`；正确链路是：
    `数据集 → sync 物化渠道协议（价格已在协议 JSON 里）→ 管理员在渠道协议页把模型绑定到对外模型（externalModelID）→ 保存 → 重物化 channel_models.cost_rates`。
 4. **不要把 `GET /api/v1/admin/channel-protocols/export` 的结果当数据集源**：export 只回写 `id` + `gateway`，会丢 `models.*.cost/limit/name/description`，且 `name`/`description` 会以空串输出。
-5. **`POST /import` 请求体形状**：必须外包一层 `{"Pack": { ... }}`；响应在 `{"Code":0,"Data":{...}}` 信封内。
+5. **`POST /import` 直接发裸包体**（`Pack` 本身就是 `map[string]Provider`，handler 解的就是裸 body：`channelprotocol/handler.go:177-181`，与 `fetchPack` 同形）。请求体**顶层就是 `{"<providerId>": { … }}`**，不要再包一层：
+
+   ```jsonc
+   // ✅ 请求体顶层就是 providerId → provider 条目（裸包体）
+   {
+     "opencode-zen": { "id": "opencode-zen", "name": "OpenCode Zen", "models": { /* … */ }, "gateway": { /* … */ } }
+   }
+   ```
+
+   - **误包成 `{"Pack": {…}}` 会怎样**（实测 2026-10-30）：解出来是一条键为 `"Pack"`、`id`/`name` 全空的 provider，`validate` 因「名称不能为空」不通过 → **计入 `Warnings` 并跳过**（`channelprotocol/service.go:548-551`）。响应仍是 **HTTP 200 / `Code=0`**，但 `Created=0`、`Warnings` 里出现「渠道协议 "": 渠道协议名称不能为空」——**看到这个文案就回来查是不是多包了一层**（不是 400）。
+   - 响应信封：`{"Code":0,"Message":"","RequestID":"…","Data":{"Created":N,"Skipped":M,"Warnings":[…]}}`。
 
 ## 13. 新字段兼容性结论（`offers`，spencer 要求验证）
 
@@ -588,12 +606,13 @@ R = billing.r（默认 10000）
 | v0.1 | 2026-10-16 | 首版：v1 对齐 + `gateway{baseUrl,protocols,requestHeaders}` |
 | v0.2 草案 | 2026-10-28 | ① 补 `gateway.costRates` 正式口径（此前代码已支持但文档缺失）与 `costCurrency`；② 定价改为**人民币**口径并给倍率→积分算式与样例；③ 新增 `gateway.offers` 优惠字段位（兼容性已验证，见 13）；④ 各字段补**必填性 / 灵枢消费性**两列；⑤ 新增枚举容忍表（10）、校验规则（11）、已知限制（12）；⑥ 明确数据集 URL 与 `sync.price_source_url` 分离（9.4） |
 | v0.2 草案 rev.1 | 2026-10-28 | 按 Core 只读核实结果修订三处**事实性错误**：① 9.1 更正「无大小写转换点」——`WireRates.UnmarshalJSON` 就是转换点，真正的坑是拼错键被原样保留 + 物化路径不校验；② 6.5 / S5 更正「缺 `costCurrency` → 虚低 6.8 倍」——代码全无币种概念，该字段纯标注；风险在**数值**填了美元（9.1 新增「数值」硬约束）；③ 9.4 补挂错 URL 的两种后果（静默无效 / 虚高 6.8）；④ 新增 V8（`externalModelID` 必须字符串，否则整包解析失败）与 11.3（5 个建议执法点，未实现） |
+| v0.2 草案 rev.9 | 2026-10-30 | Owl 复审 P2×3 + P3×1：① §12.5 更正 `POST /import` 为**裸包体**（原写「外包 `Pack`」是错的），并说明误包时的真实表现（200 + `Warnings`「名称不能为空」，非 400）；② §11.1 补适用情形——**已存在条目**走 `validate` 才 400 回滚，**首次接入**走 `insertOn` 绕过校验、坏 `baseUrl`/`passthroughMode`/多 `default` 会 200 落库（已知口子，未修复）；③ F6 限定为**翻译型/网关型供应商**，原厂直连只列原生协议，`google` 家族灵枢无对应协议不可硬凑；④ 计数 5 项 → **6 项**（历史条目保留原样并加注） |
 | v0.2 草案 rev.8 | 2026-10-30 | 官方端点更正（兰台冻结前）：新增 **§0.1 F6「同档多协议 = 同一套模型」**（官方「Every API serves every paid and Go text model」，含 OpenCode 2 条/4 条两种可照抄写法），**§15 示例 baseUrl** 由 `…/zen/v1` 改为 `…/inference/openai/v1`（并补 per-protocol baseUrl、`doc` 换 v2 链接），§6.1 `baseUrl` 行加交叉引用 |
 | v0.2 草案 rev.7 | 2026-10-28 | 兰台方案 A 的 302 指针链路实测回写：F3 新增 **✅ 可用形态（3xx 指针 URL）**（1 跳成功、sha256 与包本体逐字节一致、随后 sync 40/0/0）、**判定口诀**（`curl -I` 看 3xx 还是 200 清单）、**边界**（别填 `manifest.json`）；把第 ④ 形态的举例从 `latest.json` 改为 `manifest.json`（前者已改 302） |
 | v0.2 草案 rev.6 | 2026-10-28 | 步骤 3 测试环境拉取验收通过后回写实测：**V9 升级为实测**（空包 → 200 / Applied=0 / 40 条全翻 STALE，非推演）；**F3 增第 ④ 种形态**（`latest.json` 这类清单页当 `pack_url` → 裸 500「服务器内部错误」，状态安全但错误不可读）。同步把 Gate 的 3 条建议登记进 `docs/pending-tasks.md`（P1 空包 400 拦 / P1 `insertOn` 绕过校验口子 / P2 裸 500 包成 400）|
 | v0.2 草案 rev.5 | 2026-10-28 | 补 `pack_url` 目标形态（兰台发布卡点）：**必须指向包本体**；3xx 会被跟随（`http.DefaultClient`），所以 `latest.json` 只有 302 到包本体才可用；把「清单/指针 JSON 直出 200」的三种实测后果写进 F3，并在 V9 补"空包的另一种来源"；F5 明确 `externalModelID` 非必填 |
 | v0.2 草案 rev.4 | 2026-10-28 | 兰台发布前防误发：新增 **§11.1 V9**（发布空包 = 把现有全部 ACTIVE 协议翻 `STALE`，不是无操作），**§0.1 顶部加发布红线**、**F5 顶层行**改写为「严禁空包」；验收清单同步加一条「provider 数 ≥1」前置拦截 |
-| v0.2 草案 rev.3 | 2026-10-28 | 新增 **§0.1 冻结前 5 项规范（兰台用）**：协议词表精确全集与降级、模型必须内联（禁止 `$ref`/字符串）、`pack_url` 是指针且靠 URL 路径版本化、providerId 命名约定与「与 models.dev 无冲突面」、最小必备集与 4 条真拒收。全部结论挂文件:行或标「约定，非代码约束」 |
+| v0.2 草案 rev.3 | 2026-10-28 | 新增 **§0.1 冻结前 5 项规范（兰台用）**（rev.8 增 F6 后为 6 项）：协议词表精确全集与降级、模型必须内联（禁止 `$ref`/字符串）、`pack_url` 是指针且靠 URL 路径版本化、providerId 命名约定与「与 models.dev 无冲突面」、最小必备集与 4 条真拒收。全部结论挂文件:行或标「约定，非代码约束」 |
 | v0.2 草案 rev.2 | 2026-10-28 | 补齐 Core 的 4 条必写条款与「断言可追溯」：① 全篇「会报错 / 会放大 / 会静默」的断言统一补 `文件:行`（V8→`model.go:101`；S1→`source.go:63`；S2→`rates.go:93`+`service.go:379`+`billing/service.go:300-302`+`model_service.go:43`；9.4→`sync/source.go:46`+`main.go:744-766`；13.2 六条→行号）；② 更正两处**表述不精确**：`grep -i currency` 并非 0 命中（命中全是 `Concurrency`）、`ValidateRates` 并非「只在管理端被调用」（`billing/engine.go:19/29` 在计费计算时也调）；③ 新增 **S8**（数据集误挂 `price_source_url` 的两种静默形态）；④ V8 补**实测**错误串；⑤ 11.3 执法点按 Core 点名重排为 E1–E6（E5 = 本文档已落地的 4 条文档口径），并同步登记 `docs/pending-tasks.md` |
 
 **未变更**：v1 字段名与两级嵌套形状、`gateway` 命名空间、协议白名单、鉴权与请求头策略规则。
