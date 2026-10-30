@@ -66,6 +66,30 @@
 - 真正会「整包拒收」的只有 4 条：V3（id+name 同时空）、V4（baseUrl 非 http）、V6（name 重复）、V8（`externalModelID` 非字符串）。其余缺失都是「不报错但不可用」，必须在验收清单逐项核对（`notes/preset-pack-dataset-delivery.md` §4）。
 - 另有一条**不拒收但高危**：空包（顶层 0 个 provider）会把现有全部 ACTIVE 协议标 `STALE`，见 §11.1 **V9** —— 它不属于"拒收"，但绝对不允许发布。
 
+### F6 同档多协议 = 同一套模型（「一档多入口」怎么填）
+
+- **结论：同档指「同一套模型，且每种协议都能访问」；不要按协议切分模型清单。**
+- 依据（官方一手，2026-10-30）：OpenCode v2 文档 `harnesses` 的「Base URLs」表给出 Pay-as-you-go `https://opencode.ai/inference`、Go `https://opencode.ai/inference/go`，路径 `/openai/v1/responses`、`/openai/v1/chat/completions`、`/anthropic/v1/messages`；同页原文「**Every API serves every paid and Go text model**: Console sends a request to the model's own endpoint when it speaks that API, and translates it otherwise.」（`https://opencode.ai/v2/docs/console/harnesses`）
+- ⇒ 数据集里「按协议分组列模型」**只是展示分组，不是能力边界**；灵枢按入站协议与 `protocols` 求交，同档模型在每个协议下都应可达，否则会人为收窄可用面。
+- **兰台照抄（OpenCode 现成例子：能合并就 2 条，不要 4 条）**：
+
+```jsonc
+// Zen（Pay-as-you-go）
+"gateway": {
+  "baseUrl": "https://opencode.ai/inference/openai/v1",
+  "protocols": {
+    "openai-chat":        { "path": "/chat/completions" },
+    "openai-responses":   { "path": "/responses" },
+    "anthropic-messages": { "baseUrl": "https://opencode.ai/inference/anthropic", "path": "/v1/messages" }
+  }
+}
+// Go：把 opencode.ai/inference 整体换成 opencode.ai/inference/go，其余相同
+```
+
+- 坚持 4 条（每档 × 每协议一条）也可以，但 `baseUrl` 必须逐条对应：`…/inference/openai/v1`、`…/inference/anthropic`、`…/inference/go/openai/v1`、`…/inference/go/anthropic`；且**每条都要列全该档的全部模型**（官方对每个 API 都能访问全部付费/Go 文本模型）。
+- **旧端点作废**：`/zen`、`/zen/v1`、`/zen/go`、`/zen/go/v1` 均不在官方 v2 文档内（不是 SDK 前缀，也无重定向承诺），冻结时一律用 `inference` 前缀。
+
+
 ## 1. 目的
 
 约定「渠道预设包」（= 数据集）的 JSON 格式与字段，用于描述一个供应商的接入方式（base URL、特殊请求头、原生协议）及其模型清单（能力、**人民币价格**、对应基础协议、商业优惠）。格式对齐 models.dev v1，只做最小扩展，从而复用其模型能力数据。
@@ -147,7 +171,7 @@
 
 | 字段 | 类型 | 必填性 | 含义 |
 |---|---|---|---|
-| `baseUrl` | string | 业务必填 | 默认上游 base URL。**必须 `http://` 或 `https://` 开头，否则整包同步失败** |
+| `baseUrl` | string | 业务必填 | 默认上游 base URL。**必须 `http://` 或 `https://` 开头，否则整包同步失败**。一个档位有多种入站协议且入口不同时，用各协议自己的 `baseUrl`（见 §0.1 **F6**） |
 | `protocols` | object | 业务必填 | 该 provider 原生支持的上游基础协议集合；键即协议名，键存在 = 支持 |
 | `requestHeaders` | object | 可选 | 请求头策略（6.3） |
 | `costCurrency` | string | **数据集必填**（6.5） | 价格币种声明，本数据集恒为 `"CNY"` |
@@ -564,6 +588,7 @@ R = billing.r（默认 10000）
 | v0.1 | 2026-10-16 | 首版：v1 对齐 + `gateway{baseUrl,protocols,requestHeaders}` |
 | v0.2 草案 | 2026-10-28 | ① 补 `gateway.costRates` 正式口径（此前代码已支持但文档缺失）与 `costCurrency`；② 定价改为**人民币**口径并给倍率→积分算式与样例；③ 新增 `gateway.offers` 优惠字段位（兼容性已验证，见 13）；④ 各字段补**必填性 / 灵枢消费性**两列；⑤ 新增枚举容忍表（10）、校验规则（11）、已知限制（12）；⑥ 明确数据集 URL 与 `sync.price_source_url` 分离（9.4） |
 | v0.2 草案 rev.1 | 2026-10-28 | 按 Core 只读核实结果修订三处**事实性错误**：① 9.1 更正「无大小写转换点」——`WireRates.UnmarshalJSON` 就是转换点，真正的坑是拼错键被原样保留 + 物化路径不校验；② 6.5 / S5 更正「缺 `costCurrency` → 虚低 6.8 倍」——代码全无币种概念，该字段纯标注；风险在**数值**填了美元（9.1 新增「数值」硬约束）；③ 9.4 补挂错 URL 的两种后果（静默无效 / 虚高 6.8）；④ 新增 V8（`externalModelID` 必须字符串，否则整包解析失败）与 11.3（5 个建议执法点，未实现） |
+| v0.2 草案 rev.8 | 2026-10-30 | 官方端点更正（兰台冻结前）：新增 **§0.1 F6「同档多协议 = 同一套模型」**（官方「Every API serves every paid and Go text model」，含 OpenCode 2 条/4 条两种可照抄写法），**§15 示例 baseUrl** 由 `…/zen/v1` 改为 `…/inference/openai/v1`（并补 per-protocol baseUrl、`doc` 换 v2 链接），§6.1 `baseUrl` 行加交叉引用 |
 | v0.2 草案 rev.7 | 2026-10-28 | 兰台方案 A 的 302 指针链路实测回写：F3 新增 **✅ 可用形态（3xx 指针 URL）**（1 跳成功、sha256 与包本体逐字节一致、随后 sync 40/0/0）、**判定口诀**（`curl -I` 看 3xx 还是 200 清单）、**边界**（别填 `manifest.json`）；把第 ④ 形态的举例从 `latest.json` 改为 `manifest.json`（前者已改 302） |
 | v0.2 草案 rev.6 | 2026-10-28 | 步骤 3 测试环境拉取验收通过后回写实测：**V9 升级为实测**（空包 → 200 / Applied=0 / 40 条全翻 STALE，非推演）；**F3 增第 ④ 种形态**（`latest.json` 这类清单页当 `pack_url` → 裸 500「服务器内部错误」，状态安全但错误不可读）。同步把 Gate 的 3 条建议登记进 `docs/pending-tasks.md`（P1 空包 400 拦 / P1 `insertOn` 绕过校验口子 / P2 裸 500 包成 400）|
 | v0.2 草案 rev.5 | 2026-10-28 | 补 `pack_url` 目标形态（兰台发布卡点）：**必须指向包本体**；3xx 会被跟随（`http.DefaultClient`），所以 `latest.json` 只有 302 到包本体才可用；把「清单/指针 JSON 直出 200」的三种实测后果写进 F3，并在 V9 补"空包的另一种来源"；F5 明确 `externalModelID` 非必填 |
@@ -583,7 +608,7 @@ R = billing.r（默认 10000）
     "env": ["OPENCODE_API_KEY"],
     "npm": "@ai-sdk/opencode",
     "api": null,
-    "doc": "https://opencode.ai/docs/zen",
+    "doc": "https://opencode.ai/v2/docs/console/models",
     "models": {
       "claude-sonnet-4-5": {
         "id": "claude-sonnet-4-5",
@@ -617,10 +642,11 @@ R = billing.r（默认 10000）
       }
     },
     "gateway": {
-      "baseUrl": "https://opencode.ai/zen/v1",
+      "baseUrl": "https://opencode.ai/inference/openai/v1",
       "protocols": {
-        "anthropic-messages": { "path": "/messages" },
-        "openai-responses":   { "path": "/responses" }
+        "openai-chat":        { "path": "/chat/completions" },
+        "openai-responses":   { "path": "/responses" },
+        "anthropic-messages": { "baseUrl": "https://opencode.ai/inference/anthropic", "path": "/v1/messages" }
       },
       "requestHeaders": {
         "passthroughMode": "whitelist",
@@ -634,6 +660,10 @@ R = billing.r（默认 10000）
 ```
 
 > 示例中的数字是按 1 USD ≈ 6.8 CNY 折算后的**示意值**，只为演示形状；真实数据集必须填**官网人民币价**（9.1）。
+>
+> **模型级 `protocols` 说明**：上面两个模型各写了 `"gateway": {"protocols": {...}}`，那是「只准走这个协议」的**收窄**写法，只用于真实存在差异的场景；按 §0.1 F6，同一档位内每个模型应对全部协议可达，一般**不必**在模型级收窄。
+>
+> **端点口径（2026-10-30 更正）**：OpenCode 的 Pay-as-you-go 与 Go 两档按 `https://opencode.ai/inference` 与 `…/inference/go` 区分，协议前缀为 `/openai/v1`（`responses`、`chat/completions`）与 `/anthropic/v1`（`messages`）；**旧 `/zen*` 已过时**，不要再写进数据集（结构见 §0.1 **F6**）。
 
 ## 16. 许可与归属
 
