@@ -1,104 +1,194 @@
 # 渠道预设包 JSON 格式约定（v0.2 草案）
 
+- **状态**：草案。待兰台（LanTai）冻结为 JSON Schema 并发布成数据集 URL。
+- **修订**：2026-10-28（变更记录见第 14 节）
+- **正本**：本文件。机器可读参考实现：`docs/preset-pack-format.schema.json`
+  （兰台冻结版以兰台产出为准；**字段口径冲突时以本文件为准**）
+- **对齐**：models.dev v1（`https://models.dev/api.json`），只做最小扩展
+
+> 本文只对齐 models.dev **v1**，不消费 v2（`/experimental/v2.0/`，仍为实验态）。
+
+## 0. 一页速览（兰台先看这五条）
+
+1. 顶层是**多 provider 合并对象** `{ "<providerId>": {...} }`，不是数组。
+2. 一个 provider 条目 = models.dev v1 形状 + 扩展块 `gateway`。**所有本项目自有字段只能放 `gateway` 内**。
+3. **价格一律人民币**：`models.<m>.gateway.costRates`（三段，元/百万 token 倍率）是唯一计费载体；`cost` 是展示位。数据集必须写 `gateway.costCurrency: "CNY"`，且**数值必须是人民币字面量**——代码不做任何单位/币种换算，把美元数填进来就按人民币出账（虚低 6.8 倍，第 9.1）。
+4. 灵枢**忽略一切未知字段**（不会因多字段报错），但**会因为 `passthroughMode` 非法 / provider 名重复 / baseUrl 非 http(s) / `externalModelID` 写成数字而整包同步失败**（第 11 节）。
+5. 数据集 URL 只挂 `preset.pack_url`；**绝不能**挂到 `sync.price_source_url`（第 9.4 节）：若数据集同时带 v1 的 `cost`，会被当美元 ×6.8 写进售价；只带 `costRates` 则参考价这条通道静默无效（一条都拉不到，不报错）。
+6. **兰台冻结 Schema 前必读 §0.1「冻结前 6 项规范」**：协议词表、模型必须内联、`pack_url` 是指针、providerId 命名、最小必备集、同档多协议（F6，仅翻译型供应商）——每条一个唯一结论。
+
+## 0.1 冻结前 6 项规范（兰台用 · 冻结 JSON Schema 前必读）
+
+> 每条一个唯一结论，不做选项讨论。标「约定」的属格式约定、**无代码执法**；标「代码」的可追到文件:行（2026-10-28 核实/实测）。
+>
+> ⚠ **发布红线（兰台必看）**：**严禁发布空包**（顶层 `{}` 或 0 个 provider），**`pack_url` 也别挂清单/指针 JSON**——指向 `versions/{n}.json` 包本体，或让 `latest.json` **302 跳到包本体**。空包不会报错，但会把灵枢现有**全部 ACTIVE 协议翻成 `STALE`**（详见 §11.1 V9）。要下线某个 provider，只删那一条，不要发空包。
+
+### F1 协议词表（`gateway.protocols` 的键）
+
+- **允许的精确字符串全集（只有 3 个）**：`openai-chat`、`openai-responses`、`anthropic-messages`；另接受历史别名 `openai-compat`，归一为 `openai-chat`。
+- **大小写敏感、只做精确匹配**：`OpenAI-Chat`、`openai_chat`、`azure-openai` 均**不被接受**（实测归一后 `isBase=false`）。冻结时 `propertyNames` 收紧为上面 3 值枚举，别名**不要**写进 Schema（只在读旧包时容忍）。
+- **未知值的降级**：物化时**静默丢弃该键**（白名单过滤，不报错、也不回落到任何默认值）；若某 provider 的协议键被丢完 → 该协议物化为空协议集 → **不匹配任何入站协议**（等于不可用，但同步成功、无报错）。
+- 依据：`channelprotocol/model.go:19-21`（常量）、`model.go:29-44`（`Canonical` / `IsBaseProtocol`）、`source.go:78`（`canonicalProtocols` 白名单）、`gateway/protocol.go:187-189`（空协议集 `return nil`）。
+
+### F2 模型是内联还是引用
+
+- **唯一答案：内联完整对象。** 不允许 `$ref`，也不允许只写模型 id 字符串。
+- 依据（代码 + 实测）：`Models map[string]Model`（`channelprotocol/source.go:23`）。写字符串 → **整包解析失败、整次 sync 回滚**（`json: cannot unmarshal string into Go struct field … of type channelprotocol.Model`）；写 `{"$ref": …}` → 解析成零值 Model，再被保活规则（`source.go:63`）**静默丢弃**，模型凭空消失。
+- 冻结要求：模型值必须 `type: object`、`required: ["id"]`，**显式禁止** string 与 `$ref`。
+
+### F3 `pack_url` 是指针还是快照
+
+- **唯一答案：指针。** 每次 sync 都重新 GET（无 ETag / If-Modified-Since，只判 HTTP 200），因此**数据集永远代表"当前真相"，不是增量补丁**——兰台不要把包做成 diff。
+- 版本怎么体现：**靠 URL 路径**（如 `/v0.2/pack.json`）；包内写 `packVersion` 可以有，但灵枢**不读**（惰性字段）。**约定，非代码约束。**
+- 是否覆盖已落库：判据全在灵枢侧的 `edited` 标记，与版本无关——未编辑 → 直接覆盖；已编辑 → `confirm=false` 只返回 Pending 差异、`confirm=true` 才覆盖；预设中已消失的条目 → 标 `STALE` **不删除**。
+- **`pack_url` 最终必须落到「包本体」**（顶层 = `providerId → provider 条目`）。两种落地方式：**直接指向 `versions/{n}.json`**，或指向一个 **3xx 跳到包本体**的指针 URL（见下条 ✅）。**四种不可用形态**（实测 2026-10-28，本地脚本 + Gate 步骤 3 验收，证据 `notes/pack-step3-acceptance.md`）：① URL 返回 200 但键值是字符串/数组 → **解析报错**（安全失败，事务不开始、不会翻 STALE）；② 键值是对象但缺 `id`/`name` → **400 V3**（回滚）；③ **键值恰好带 `id`+`name` → 被当成真实 provider 物化**，而包里其余 provider 全不在 → **其余全部翻 STALE**（最危险）；④ **URL 返回 200 的清单/文档 JSON**（如原 `manifest.json`，形如 `{"latest":"v3","versions":[…]}`）→ 解析失败被 `writeErr` 归成**裸 `500`「服务器内部错误」**（`channelprotocol/handler.go:49-56`）：状态安全、数据一行不动，但**错误不可读**，看不出"这不是包本体"。
+- **✅ 可用形态：3xx 指针 URL（方案 A，已实测通过）**。`fetchPack` 用 `http.DefaultClient`，默认跟随 301/302/303/307/308（最多 10 跳，全仓未设 `CheckRedirect`），因此 `latest.json` 这类指针 **只要回 3xx 且 `Location` 指向包本体就可以当 `pack_url`**。实测：`latest.json` → **302**（`location: /channel-preset-pack/versions/1.json`，**相对地址**；首跳 `cache-control: max-age=60, must-revalidate`）→ **只跳 1 跳** → **200 / `application/json` / 52,163 B** / 末跳 `immutable`；body 以 `{"tencent-coding-plan":…` 开头、**sha256 与包本体逐字节相同**（无重复跳转、无 60s 旧包）。随后手工 sync → `HTTP 200 / Code=0 / Applied=40 / Pending=[] / Stale 0`，40 行、`STALE=0`、ID 与前一轮逐一相同。反向：若不跟随 302，会报「预设包返回非 200 状态码: 302」，实际未出现；`http.DefaultClient` **不做响应缓存**，`max-age=60` 对灵枢无影响。
+- **判定口诀（一条命令定生死）**：`curl -I <pack_url>` —— 看到 **3xx** 且 `Location` 指向包本体（或 `-L` 后 body 是 `{"providerId":{…}}`）→ **可用**；看到 **200** 但 body 不是 `{"providerId":{…}}` 形态（清单/文档页）→ **不可用**（走 ④ 裸 500，极端情况还会翻 STALE）。
+- **边界**：**别把原清单 `manifest.json` 填进 `pack_url`** —— 它返回 200 的清单 JSON，正好是第 ④ 形态（裸 500）；清单只在浏览器里给人看。
+- 依据：`channelprotocol/source.go:115-119`（`fetchPack` 只校验状态码）、`channelprotocol/service.go:74`（`client: http.DefaultClient`，全仓未设 `CheckRedirect`）、`channelprotocol/service.go:375+`（`Sync` 三分支）、`store.InitialSynced`（首启只跑一次）。
+
+### F4 providerId 命名约束 + 与 models.dev 冲突
+
+- **允许自定义，但必须全局唯一、非空**：它落 `channel_protocols.preset_source_id`，库上有部分唯一索引（`db/migrations/0008_*.sql`）。`id` 与顶层键请保持一致（不一致时以条目内 `id` 为准，重复会让整包因唯一索引冲突回滚）。
+- **约定（非代码约束）**：`^[a-z0-9][a-z0-9._-]{0,63}$`——**不用空格、不用中文**。中文技术上能落库（列是 TEXT），但会进导出键、日志、URL；展示用中文请放 `name`（`name` 允许中文/空格，但**必须全局唯一**，`0007_*.sql` 的 `uq_channel_protocols_active`）。
+- **与 models.dev 同名 provider：不存在冲突面，无需"覆盖还是跳过"**。灵枢没有内建 provider 表，数据集是 provider 的唯一来源；models.dev 的 provider 名只在 `sync.price_source_url` 那条价格目录链路里当展示名，两条链路不相交。⇒ 数据集 `id` 即权威。
+- 唯一的真实冲突：两个 provider 物化出**同一个 `name`** → 唯一索引冲突，**整包回滚**（V6）。
+
+### F5 最小必备集（缺哪个直接拒收）
+
+| 层级 | 最小必备 | 缺失后果 |
+|---|---|---|
+| 顶层 | ≥1 个 provider，值为对象 | **严禁空包**：空对象**不是「同步 0 条」**，而是把现有**全部 ACTIVE 协议标 `STALE`**（`channelprotocol/service.go:446-461`，见 §11.1 V9）——同步会成功、不报错，但整屏协议变「来源已失效」 |
+| provider | `id`（非空）、`gateway.baseUrl`（`http(s)://` 开头）、`gateway.protocols`（≥1 个合法协议键） | `id` 与 `name` 同时空 → **400 整包回滚**（V3）；baseUrl 非 http(s) → **400 回滚**（V4）；protocols 缺/全被过滤 → 不报错但该协议**不可用**（F1）；`name` 与他条重复 → **回滚**（V6） |
+| 模型（要参与计价的） | `id`、`gateway.protocols`（≥1）、`gateway.costRates`（`Input/Output/CacheRead` 三段齐全、人民币字面量）；`externalModelID` **非必填**（兰台不该填，只约束"写了必须是字符串"） | 缺协议 → **静默丢弃整条**（S1）；缺任一段/拼错键 → 成本积分**静默 0**（S2）；`externalModelID` 写成数字 → **整包解析失败回滚**（V8） |
+
+- 补充：`name` / `description` 是 models.dev v1 对齐要求，Schema 里设 `required`；但灵枢**不读**它们（惰性，见 §5）。
+- 真正会「整包拒收」的只有 4 条：V3（id+name 同时空）、V4（baseUrl 非 http）、V6（name 重复）、V8（`externalModelID` 非字符串）。其余缺失都是「不报错但不可用」，必须在验收清单逐项核对（`notes/preset-pack-dataset-delivery.md` §4）。
+- 另有一条**不拒收但高危**：空包（顶层 0 个 provider）会把现有全部 ACTIVE 协议标 `STALE`，见 §11.1 **V9** —— 它不属于"拒收"，但绝对不允许发布。
+
+### F6 同档多协议 = 同一套模型（「一档多入口」怎么填）
+
+- **适用范围（关键前提）**：**只适用于「网关型 / 翻译型」供应商**（供应商自己把请求翻成上游原生协议的，OpenCode Console 属此类）。**原厂直连型供应商不适用**——它们每个模型只有一个原生 API family，模型清单与协议必须一一对应。
+- **结论（翻译型）**：同档指「同一套模型，且每种协议都能访问」；不要按协议切分模型清单，按协议分组在数据里**只是展示分组，不是能力边界**。
+- 依据（官方一手，2026-10-30）：`https://opencode.ai/v2/docs/console/harnesses` 原文「**Every API serves every paid and Go text model**: Console sends a request to the model's own endpoint when it speaks that API, and **translates it otherwise**」；同站 `api/inference` 页另一句「Each model is served by one API family」——两句合起来读才是完整语义：**每个模型有各自的原生 family，翻译由网关代劳**。Base URLs：Pay-as-you-go `https://opencode.ai/inference`、Go `…/inference/go`。
+- **结论（非翻译型）**：**只列该模型的原生协议**。把上游不原生的协议也列进 `protocols`，灵枢会按「命中即直通」把请求打到非原生端点（跨协议转换是按渠道/模型显式开启的，不能指望默认兜底），结果是请求必失败——比少列协议更糟。
+- ⚠ **`google` 家族当前不可表达**：Gemini 原生入口是 `/google/v1beta/models/<model>:generateContent`，灵枢的 3 个基础协议（`openai-chat` / `openai-responses` / `anthropic-messages`）**没有对应项**。这类模型**不要硬凑**成 openai/anthropic 协议；数据集里先不放，或等灵枢补 `google` 协议后再加（属代码改动，另议）。注意：若真写了 `"google": {}`，F1 的白名单会**静默丢弃该键**（200、看着像成功），排障时别被这一点骗。
+- **兰台照抄（翻译型现成例子：OpenCode，能合并就 2 条，不要 4 条）**：
+
+```jsonc
+// Zen（Pay-as-you-go）
+"gateway": {
+  "baseUrl": "https://opencode.ai/inference/openai/v1",
+  "protocols": {
+    "openai-chat":        { "path": "/chat/completions" },
+    "openai-responses":   { "path": "/responses" },
+    "anthropic-messages": { "baseUrl": "https://opencode.ai/inference/anthropic", "path": "/v1/messages" }
+  }
+}
+// Go：把 opencode.ai/inference 整体换成 opencode.ai/inference/go，其余相同
+```
+
+- 坚持 4 条（每档 × 每协议一条）也可以，但 `baseUrl` 必须逐条对应：`…/inference/openai/v1`、`…/inference/anthropic`、`…/inference/go/openai/v1`、`…/inference/go/anthropic`；且**每条都要列全该档的全部模型**（官方对每个 API 都能访问全部付费/Go 文本模型）。
+- **旧端点作废**：`/zen`、`/zen/v1`、`/zen/go`、`/zen/go/v1` 均不在官方 v2 文档内（不是 SDK 前缀，也无重定向承诺），冻结时一律用 `inference` 前缀。
+
+
 ## 1. 目的
 
-约定「渠道预设包」的 JSON 格式与字段，用于描述一个供应商的接入方式（base URL、鉴权、特殊请求头）及其模型清单（能力、价格、对应基础协议）。格式**对齐 models.dev v1**（`https://models.dev/api.json`），只做最小扩展，从而复用其模型能力与价格数据。
-
-> 本格式**只对齐 v1**，不消费 v2（`/experimental/v2.0/`，仍为实验态）。
+约定「渠道预设包」（= 数据集）的 JSON 格式与字段，用于描述一个供应商的接入方式（base URL、特殊请求头、原生协议）及其模型清单（能力、**人民币价格**、对应基础协议、商业优惠）。格式对齐 models.dev v1，只做最小扩展，从而复用其模型能力数据。
 
 ## 2. 设计原则
 
-1. **对齐 models.dev v1**：provider / model 的字段名、两级嵌套形状、单位一律沿用 v1，不另造同义字段；v1 字段即使本网关不消费，也**原样保留**以保证可无损读入 `api.json`。
-2. **扩展隔离**：本网关专有字段统一放进 `gateway` 命名空间，避免与 models.dev 现有 / 未来字段冲突（models.dev schema 是 strict，未知键会校验失败）。
-3. **可覆盖**：包内值是「默认值」，渠道协议 / 渠道可逐层覆盖。
-4. **开放枚举（本格式自身）**：`modalities`、`type`、`protocols` 的键在本格式内按开放枚举处理，消费方遇未知值应透传 / 忽略而非报错。注意：**v1 原文的 `modalities` / `type` 是封闭枚举**，开放对待是本网关的消费策略，非 v1 语义。
+1. **对齐 models.dev v1**：provider / model 的字段名、两级嵌套形状、单位一律沿用 v1，不另造同义字段；v1 字段即使灵枢不消费，也**原样保留**以保证可无损读入 `api.json`。
+2. **扩展隔离**：本项目自有字段统一放进 `gateway` 命名空间，避免与 models.dev 现有 / 未来字段冲突。
+3. **可覆盖**：包内值是「默认值」，渠道协议 / 渠道 / 渠道-模型可逐层覆盖。
+4. **开放枚举**：`modalities`、`type`、`gateway.protocols` 的键在本格式内按开放枚举处理，消费方遇未知值应**透传 / 忽略而非报错**（`protocols` 的未知键是被**白名单丢弃**，不回落默认值，见 §0.1 F1）。注意 v1 原文的 `modalities` / `type` 是封闭枚举，开放对待是本项目消费策略，非 v1 语义。
+5. **币种单一（v0.2 新增）**：本格式的价格**只有人民币一种口径**，不含美元、不涉及汇率。`gateway.costCurrency` 是这一点的显式声明位。
+6. **未知字段必容忍（v0.2 新增）**：消费方对任何不认识的键一律忽略；新增字段**不得**要求消费方改代码才能读取旧数据集。反向也成立：兰台可在 `gateway` 内先行摆字段位（留空），不会影响灵枢。
 
 ## 3. 顶层结构
 
-一个 provider 的 JSON 对象（与 models.dev v1 `api.json` 中单个 provider 条目的形状一致，外加 `gateway` 块）：
+顶层为多 provider 合并对象，键 = provider ID（与条目内 `id` 一致）：
 
 ```jsonc
 {
-  "id": "anthropic",
-  "name": "Anthropic",
-  "env": ["ANTHROPIC_API_KEY"],
-  "npm": "@ai-sdk/anthropic",
-  "api": null,
-  "doc": "https://docs.anthropic.com/...",
-  "models": { "...": {} },
-  "gateway": { "...": {} }
+  "anthropic": { "id": "anthropic", "name": "Anthropic", "models": { "...": {} }, "gateway": { "...": {} } },
+  "zhipu":     { "id": "zhipu",     "name": "智谱",       "models": { "...": {} }, "gateway": { "...": {} } }
 }
 ```
 
-多 provider 合并后形状 = `{ "<providerId>": { ...上例... } }`（与 models.dev v1 `api.json` 一致）。
+- 顶层**只允许**「providerId → provider 条目」这一层映射；条目里不允许出现 provider 之外的键。
+- provider ID 必须**全局唯一**，且同时是灵枢物化后的 `preset_source_id`（用于同步认领、失效标记）。
 
 ## 4. Provider 字段
 
-| 字段 | 类型 | 含义 | 来源 |
-|---|---|---|---|
-| `id` | string | provider 唯一 ID | models.dev v1 |
-| `name` | string | 展示名 | models.dev v1 |
-| `env` | string[] | 该 provider 需要的 API Key 环境变量名 | models.dev v1 |
-| `npm` | string | 官方 AI SDK 包名 | models.dev v1 |
-| `api` | string \| null | OpenAI 兼容 base URL | models.dev v1 |
-| `doc` | string | 文档链接 | models.dev v1 |
-| `models` | map | 模型表（见第 5 节） | models.dev v1 |
-| `gateway` | object | **本网关扩展块**（见第 6 节） | 扩展 |
+| 字段 | 类型 | 必填性 | 灵枢消费 | 含义 |
+|---|---|---|---|---|
+| `id` | string | **格式必填**（空则整包同步失败） | 是（`preset_source_id`） | provider 唯一 ID |
+| `name` | string | 可选（空则回退 `id`） | 是（渠道协议名） | 展示名，**全局唯一**（重名整包失败） |
+| `models` | object | 业务必填（缺省 `{}` 不报错，但协议无模型） | 是 | 模型表（第 5 节） |
+| `gateway` | object | 业务必填（缺省不报错，但无上游地址） | 是 | 本项目扩展块（第 6 节） |
+| `env` | string[] | 可选 | **否（惰性）** | 该 provider 需要的 API Key 环境变量名 |
+| `npm` | string | 可选（v1 要求非空，本格式放宽） | **否（惰性）** | 官方 AI SDK 包名 |
+| `api` | string \| null | 可选 | **否（惰性）** | OpenAI 兼容 base URL（v1 无 `${ENV}` 模板；模板是 v2 特性） |
+| `doc` | string | 可选 | **否（惰性）** | 文档链接 |
 
 说明：
-- `env` / `npm`：**本网关运行时不消费**（忽略），仅为与 models.dev v1 **完整对齐**而保留。`env` 语义为「该供应商读取 API Key 的环境变量名」，可作**前端提示**；`npm` 语义为「官方 AI SDK 包名」，v1 为**必填非空**，本格式原样保留、不参与运行时。
-- `api`：v1 为**可选字符串**，**无 `${ENV}` 模板**（模板是 v2 特性，本格式不采用）。本网关实际使用的上游地址以 `gateway.baseUrl` / `gateway.protocols[*].baseUrl` 为准。
+- 上游地址以 `gateway.baseUrl` / `gateway.protocols[*].baseUrl` 为准；`api` 仅供展示与 v1 对齐。
+- `env` 语义为「该供应商读取 API Key 的环境变量名」，可作前端提示，不参与运行时。
 
 ## 5. Model 字段
 
-| 字段 | 类型 | 含义 | 来源 |
-|---|---|---|---|
-| `id` | string | 上游模型 ID | v1 |
-| `name` | string | 展示名 | v1 |
-| `description` | string | 模型描述（v1 **必填**） | v1 |
-| `family` | string | 模型家族 slug | v1 |
-| `cost` | object | 价格，USD / 百万 token：`input,output,reasoning,cache_read,cache_write,input_audio,output_audio,tiers` | v1 |
-| `limit` | object | `context,input,output` | v1 |
-| `modalities` | object | `{input:[], output:[]}`，取值 text / audio / image / video / pdf | v1 |
-| `tool_call` | bool | 支持工具调用 | v1 |
-| `reasoning` | bool | 支持推理 | v1 |
-| `reasoning_options` | array | provider 侧推理控制项：`toggle` / `effort` / `budget_tokens` | v1 |
-| `interleaved` | `true` \| object | 思维链侧信道；`{ "field": "reasoning_content" \| "reasoning_details" }` | v1 |
-| `attachment` | bool | 支持附件 | v1 |
-| `structured_output` | bool | 支持结构化输出 | v1 |
-| `temperature` | bool | 支持 temperature | v1 |
-| `knowledge` | string(date) | 知识截止 | v1 |
-| `release_date` / `last_updated` | string(date) | 发布 / 更新日期 | v1 |
-| `open_weights` | bool | 是否开源权重 | v1 |
-| `status` | string | `alpha` / `beta` / `deprecated` | v1 |
-| `type` | string | chat / image / video / embedding / reranking / decision / transcription / speech / realtime | v1 |
-| `canonical_model_id` | string | 溯源到 lab 模型 | v1 |
-| `provider` | object | 模型级端点覆盖：`{npm?, api?, shape?: "responses"\|"completions", body?, headers?}` | v1 |
-| `experimental` | object | `{ modes: { <name>: { cost?, provider?: { body, headers } } } }` | v1 |
-| `gateway` | object | 模型级扩展覆盖（可选，见第 6.4 节） | 扩展 |
+模型表键 = 上游模型 ID（与条目内 `id` 一致）。
+
+| 字段 | 类型 | 必填性 | 灵枢消费 | 含义 |
+|---|---|---|---|---|
+| `id` | string | **格式必填** | 是（模型键） | 上游模型 ID |
+| `name` | string | 格式必填（v1 对齐） | **否（惰性）** | 展示名 |
+| `description` | string | 格式必填（v1 对齐） | **否（惰性）** | 描述 |
+| `cost` | object | 可选 | **否（惰性，见 9.2）** | 价格：`input/output/reasoning/cache_read/cache_write/input_audio/output_audio/tiers`，人民币/百万 token |
+| `limit` | object | 可选 | **否（惰性）** | `context` / `input` / `output`（token） |
+| `modalities` | object | 可选 | **否（惰性）** | `{input:[], output:[]}`，取值 text/audio/image/video/pdf（开放枚举） |
+| `tool_call` | bool | 可选 | **否（惰性）** | 支持工具调用 |
+| `reasoning` | bool | 可选 | **否（惰性）** | 支持推理 |
+| `reasoning_options` | array | 可选 | **否（惰性）** | `toggle` / `effort` / `budget_tokens` |
+| `interleaved` | `true` \| object | 可选 | **否（惰性）** | 思维链侧信道：`{ "field": "reasoning_content" \| "reasoning_details" }` |
+| `attachment` / `structured_output` / `temperature` / `open_weights` | bool | 可选 | **否（惰性）** | v1 能力位 |
+| `knowledge` / `release_date` / `last_updated` | string(date) | 可选 | **否（惰性）** | `YYYY-MM` 或 `YYYY-MM-DD`（两种都产出，须容忍） |
+| `family` | string | 可选 | **否（惰性）** | 模型家族 slug |
+| `status` | string | 可选 | **否（惰性）** | `alpha` / `beta` / `deprecated` |
+| `type` | string | 可选 | **否（惰性）** | chat/image/video/embedding/reranking/decision/transcription/speech/realtime（开放枚举） |
+| `canonical_model_id` | string | 可选 | **否（惰性）** | 溯源到 lab 模型 |
+| `provider` | object | 可选 | **否（惰性）** | v1 模型级端点覆盖（npm/api/shape/body/headers），由本格式 `gateway` 表达 |
+| `experimental` | object | 可选 | **否（惰性）** | `{ modes: { <name>: { cost?, provider? } } }` |
+| `gateway` | object | 业务必填（见 6.4） | 是 | 模型级扩展覆盖 |
 
 说明：
-- **本格式不消费** `provider` 与 `experimental`（模型级端点/请求体覆盖由本格式的 `gateway` 表达），但**原样保留**以保证可无损读入 `api.json`。
-- `cost.context_over_200k`：v1 生成器的 **legacy 输出**（针对单档 ≥200k 的 tier）。消费方应**忽略 / 容忍**，计价统一走 `tiers`。
-- `type` / `modalities` 在 v1 为**封闭枚举**，本格式按开放枚举消费（见第 2 节第 4 条）。
+- **本格式不消费** `provider` 与 `experimental`，但原样保留以保证可无损读入 `api.json`。
+- `cost.context_over_200k` 是 v1 生成器的 legacy 输出（单档 ≥200k 的 tier），消费方应忽略；计价统一走 `tiers`。
+- ⚠ **模型条目保活规则（重要）**：灵枢物化时，若某模型条目既无 `gateway.protocols`、又无 `gateway.baseUrl`、又无 `gateway.externalModelID > 0`，该条目会被**整条静默丢弃**（含它的价格，判定见 `channelprotocol/source.go:63`）。因此**带价格的模型必须至少声明一个协议**。
 
 ## 6. `gateway` 扩展块
 
 ### 6.1 Provider 级 `gateway`（作为该 provider 下所有模型的默认值）
 
-| 字段 | 类型 | 含义 |
-|---|---|---|
-| `baseUrl` | string | 默认上游 base URL |
-| `protocols` | object | 该 provider **原生支持的上游基础协议集合**；键即协议名（`openai-chat` / `openai-responses` / `anthropic-messages`），键存在 = 支持。见下方说明。 |
-| `requestHeaders` | object | 特殊制式请求头，见 6.3 |
+| 字段 | 类型 | 必填性 | 含义 |
+|---|---|---|---|
+| `baseUrl` | string | 业务必填 | 默认上游 base URL。**必须 `http://` 或 `https://` 开头，否则整包同步失败**。一个档位有多种入站协议且入口不同时，用各协议自己的 `baseUrl`（见 §0.1 **F6**） |
+| `protocols` | object | 业务必填 | 该 provider 原生支持的上游基础协议集合；键即协议名，键存在 = 支持 |
+| `requestHeaders` | object | 可选 | 请求头策略（6.3） |
+| `costCurrency` | string | **数据集必填**（6.5） | 价格币种声明，本数据集恒为 `"CNY"` |
+| `offers` | array | 可选（v0.1.0 留空 `[]`） | 优惠方式（6.6） |
+| `edited` / `sourceStatus` | bool / string | **数据集不要填** | 仅供灵枢 export/import 承载编辑标记与来源状态；sync 路径强制写 `edited=false`、`sourceStatus=ACTIVE` |
 
 `protocols` 每一项可带：
 
 | 子字段 | 类型 | 含义 |
 |---|---|---|
-| `baseUrl` | string | 该协议专属 base URL（缺省回退到 provider 级 `baseUrl`） |
-| `path` | string | 该协议端点路径（缺省用基础协议内置默认路径，如 `/chat/completions`、`/responses`、`/v1/messages`） |
-| `default` | bool | 标记首选上游协议；同一作用域内**至多一个**。用途：二期跨协议转换的目标协议、网关自身内部调用（取第一个协议）。 |
+| `baseUrl` | string | 该协议专属 base URL（缺省回退 provider 级 `baseUrl`） |
+| `path` | string | 该协议端点路径（缺省用基础协议内置默认路径：`/chat/completions`、`/responses`、`/v1/messages`） |
+| `default` | bool | 标记首选上游协议；**同一作用域内至多一个**，多于一个则整包同步失败 |
+
+**基础协议仅三个，代码固定、不可由数据集新增**：`openai-chat` / `openai-responses` / `anthropic-messages`。
 
 ```jsonc
 "protocols": {
@@ -108,7 +198,9 @@
 }
 ```
 
-网关按**客户端入站协议**与该集合求交：命中即直通（零转换）；未命中则一期返回固定错误、二期再按 `default` 目标做转换。
+网关按**客户端入站协议**与该集合求交：命中即直通（零转换）；未命中则一期返回固定错误、二期按 `default` 目标做转换。
+
+**未知协议键的容忍方式**：物化时白名单过滤（`channelprotocol/source.go:78` `canonicalProtocols`，只保留上述三个基础协议的键），未知键**静默丢弃、不报错**。历史值 `openai-compat` 归一为 `openai-chat`。
 
 ### 6.2 鉴权（由基础协议隐含，无需配置）
 
@@ -132,8 +224,8 @@
 }
 ```
 
+- `passthroughMode` 是**封闭枚举**（大小写不敏感），非法值 → 400「passthroughMode 只支持 none / whitelist / blacklist / all」，**整包同步回滚**。
 - 变量见第 8 节。
-- **鉴权由基础协议隐含注入**（见 6.2）；`set` 在其之后应用，因此可显式覆盖鉴权头（用于协议以外的方式）。
 - 合并类头（如 `anthropic-beta`：客户端值 + 平台追加值需合并）由**基础协议适配器**处理，不靠 `set` 表达（`set` 是覆盖语义）。
 
 **内置强制黑名单（任何模式下都不透传）**：
@@ -151,15 +243,94 @@
 
 ### 6.4 模型级 `gateway`（可选，覆盖 provider 级）
 
-支持 `baseUrl`、`protocols`、`requestHeaders` 三项覆盖。
-
-模型级 `protocols` 与 provider 级**同形状**，但语义为**可达协议子集**：只有列出的键才是该模型可用的上游协议，值可再覆盖 `baseUrl` / `path` / `default`；未指定时继承 provider 级 `protocols`。
+| 字段 | 类型 | 灵枢消费 | 含义 |
+|---|---|---|---|
+| `protocols` | object | 是 | **可达协议子集**：只有列出的键是该模型可用的上游协议；未指定时继承 provider 级 |
+| `baseUrl` | string | 是 | 模型专属上游地址 |
+| `costRates` | object | **是（唯一计费载体）** | 三段成本倍率，人民币元/百万 token（见 9.1） |
+| `externalModelID` | string(numeric) | 是 | 绑定的对外模型 ID（雪花 ID，字符串化）。**>0 才参与物化为 `channel_models`** |
+| `timeConfig` | object | 是 | 时段系数（高峰/闲时） |
+| `contextTiers` | array | 是 | 上下文分档规则 |
+| `convertEnabled` | bool | 是 | 是否允许跨协议转换（缺省继承全局开关） |
+| `convertTargets` | string[] | 是 | 转换目标协议偏好顺序（空 = 默认偏好） |
+| `costCurrency` | string | 否（惰性，6.5） | 模型级币种覆盖（一般不必填，继承 provider） |
+| `offers` | array | 否（惰性，6.6） | 模型专属优惠 |
 
 ```jsonc
 "gateway": { "protocols": { "anthropic-messages": {} } }
 ```
 
 上例表示该模型**只经 `anthropic-messages`** 访问（典型场景：同一供应商下不同模型被强制走不同端点）。
+
+- 键名一律 camelCase（`costRates` 内部三段键用 PascalCase `Input/Output/CacheRead`，见 9.1）。
+- ⚠ **模型级不支持 `requestHeaders`**：`ModelGateway` 结构体没有该字段（旧版本文档曾写"支持三项覆盖"，与代码不符，v0.2 更正）。数据集在模型级写 `requestHeaders` **不会报错，但会被静默忽略**（`channelprotocol/model.go:97-111` 无此键）。请求头策略只能配在 provider 级。
+- ⚠ `externalModelID` 是**灵枢内部 ID**，兰台无法得知；数据集里**不要**填它（见 12.3）。
+
+### 6.5 `costCurrency`（币种声明，v0.2 新增）
+
+```jsonc
+"gateway": { "costCurrency": "CNY" }
+```
+
+- 作用域：声明**同一作用域内** `cost` 与 `gateway.costRates` 的币种。provider 级为默认，模型级可覆盖。
+- 取值：`"CNY"` | `"USD"`（开放枚举，消费方遇未知值按 `CNY` 处理）。
+- **语义默认值 = `USD`**（不写即按 USD 理解）—— 这是 models.dev v1 的原义，用来保证「直接把 `https://models.dev/api.json` 当包读进来」时不会把美元误读成人民币。这是**文档层约定**，不是代码行为（见下条）。
+- **本数据集必须显式写 `"CNY"`**；兰台冻结的 JSON Schema 应把 `costCurrency` 设为 **required + `const: "CNY"`**（格式层宽容两种币种，数据集层收紧到只有人民币）。
+- **灵枢当前完全没有币种概念，该字段是纯标注**（代码核实 + 实测，2026-10-28）：
+  - 后端 `grep -rn -i currency --include=*.go` 的**全部命中都是 `Concurrency`（并发限流）**，没有任何币种字段或换算分支；`GatewayBlock`（`channelprotocol/source.go:36`）与 `ModelGateway`（`channelprotocol/model.go:97`）都没有该键 → 解码时按未知字段**直接丢弃**。
+  - 落库（`channel_models.cost_rates` 原值写入，`channel/service.go:379`）与计费（`billing.ComputeCredits` = `tokens × rate ÷ R`，`billing/engine.go:15-27`）**都没有任何币种分支**。
+  - ⇒ 写不写、写 `"CNY"` 还是 `"USD"`，**落库数值与出账金额完全相同**。「缺 `costCurrency` → 把美元当人民币 → 虚低 6.8 倍」这条因果链在代码里不成立；真正的 6.8 只存在于 `sync.price_source_url` 那条链路（9.4）。
+  - ⇒ 因此：它是**消歧标注，不是计费风险点**，也没有任何执法点（不校验、不报错）。真正的风险是**数值币种填错**（把美元数当人民币填进 `costRates`），见 9.1「数值硬约束」。
+
+### 6.6 `offers`（优惠方式，v0.2 新增字段位）
+
+**结论：兼容，v0.1.0 先摆字段位（`"offers": []`），0.2.0 再填内容。** 判定依据见第 13 节。
+
+放置位置：`gateway.offers`（provider 级 = 供应商通用优惠；模型级 = 该模型专属优惠）。
+**合并语义 = 数组拼接**（provider 在前、模型在后），不覆盖、不去重；消费方按 `kind` + `label` 自行判重。理由：优惠是「事实集合」，覆盖会丢信息。
+
+```jsonc
+"offers": [
+  {
+    "kind": "time_limited",                    // 必填，见下方枚举
+    "label": "首发五折",                        // 必填，人读短句
+    "eligible": "all",                          // 可选：new_user | existing_user | invitee | all（默认 all）
+    "window": {                                 // 可选；kind=time_limited / flash_sale 必填 end
+      "start": "2026-08-26",
+      "end": "2026-09-09T24:00+08:00"           // 带时区；也可只写日期 YYYY-MM-DD
+    },
+    "effect": {                                 // 必填，下列之一（互斥）
+      "priceOverride": { "input": 0.4, "output": 1.4, "cache_read": 0.115 }  // 人民币元/百万 token
+      // "discount": { "mode": "percent", "value": 50 }                     // 折让百分比（50 = 五折）
+      // "discount": { "mode": "amount",  "value": 5 }                      // 立减金额（元）
+      // "quota":    { "unit": "token", "amount": 140000000, "period": "week" }
+    },
+    "limit": { "quantity": 1000, "remaining": 137 },   // 可选：限量抢购 / 名额上限
+    "note": "折扣截止 2026-09-09 24:00（UTC+8），到期回落标价",
+    "source": "https://open.bigmodel.cn/pricing",      // 可选，来源 URL
+    "asOf": "2026-10-28"                               // 可选，该优惠信息的采信日
+  }
+]
+```
+
+`kind` 枚举与必填搭配：
+
+| `kind` | 中文 | 必填项 | `effect` 允许形态 |
+|---|---|---|---|
+| `first_purchase` | 首购价 | `eligible: new_user` | `priceOverride` / `discount` |
+| `time_limited` | 限时活动 | `window.end` | `priceOverride` / `discount` |
+| `renewal` | 续费价 | — | `priceOverride`（分档用 `priceOverrideTiers`） |
+| `invite_discount` | 邀请折扣 | `eligible: invitee` | `discount` / `quota` |
+| `free_quota` | 免费额度 | — | `quota` |
+| `flash_sale` | 限量抢购 | `limit.quantity` + `window.end` | `priceOverride` / `discount` |
+
+`quota.unit` 开放枚举：`token` / `credit` / `afp` / `call`；`quota.period`：`total` / `day` / `week` / `month`。
+
+约束：
+- `effect` 内**只允许一种**形态（多给时按 `priceOverride > discount > quota` 优先，其余忽略）。
+- `priceOverride` 数值为**人民币元/百万 token**，与 `costRates` 同口径，可被消费方直接替换 `costRates`。
+- 未知 `kind` 值：**整条 offers 忽略，不报错**（开放枚举；`offers` 整块本就不在 `GatewayBlock`（`channelprotocol/source.go:36-44`）内，解码即丢）。
+- 时间只表达「有效区间」，**不做自动生效/失效调度**：灵枢不消费该字段，价格切换仍以数据集重新发布为准。
 
 ## 7. 继承与覆盖
 
@@ -168,6 +339,8 @@
 ```
 
 包里的 provider 条目被物化为一个**渠道协议**；渠道引用渠道协议，可覆盖 `baseUrl`、每个模型的 `protocols`、成本；渠道-模型可覆盖 `protocols`（未指定则取渠道协议中该模型的定义）。
+
+模型级 `gateway` 覆盖 provider 级同名字段；`offers` 例外（拼接而非覆盖）。
 
 ## 8. 变量（用于 `requestHeaders.set`）
 
@@ -179,66 +352,339 @@
 | `{model}` | 对外模型名 |
 | `{client_header:NAME}` | 下游原始请求头 |
 
-## 9. 单位与枚举约定
+## 9. 定价口径（人民币，v0.2 定稿）
 
-- 价格：**USD / 百万 token**（与 models.dev 一致）。若从 litellm（USD / token）导入，必须 ×1e6 换算。
-- 上下文 / 输出上限：整数 token。
-- 日期：`YYYY-MM` **或** `YYYY-MM-DD`（models.dev v1 两种都产出，消费方须容忍）。
-- 枚举（`modalities` / `type` / `protocols` 的键）在本格式内**开放**：消费方遇未知值透传 / 忽略，不报错。注意 v1 原文的 `modalities` / `type` 实为**封闭枚举**，只有 v2 才开放。
-- **版本对齐**：本格式只对齐 models.dev **v1**（`/api.json`）；**不消费** v2（`/experimental/v2.0/`）。若未来 v2 转正，再单独评估迁移。
+### 9.1 唯一计费载体：`gateway.costRates`
 
-## 10. 响应头（不在本格式内）
+| 项 | 规定 |
+|---|---|
+| 位置 | `models.<modelKey>.gateway.costRates` |
+| 键 | **PascalCase**：`Input` / `Output` / `CacheRead`（snake `input/output/cache_read` 同样接受；兰台统一输出 PascalCase）。**只有这两套键名会被归一化，别的键原样保留、不报错**（见下方「键归一化」） |
+| 语义 | **人民币元 / 百万 token 的倍率**（无单位纯数字，照抄官网人民币价） |
+| 数值 | **必须是人民币元/百万 token 的字面量**（如 `0.8` / `2.8` / `0.23`）。代码不识别单位、不做任何换算：从 models.dev 照抄美元数进来，就会按人民币出账 → **虚低 6.8 倍**。这是**数值错，不是标注错**，当前无代码执法点 |
+| 完整性 | **三段必须齐全**（缺任一 → 不报错，但成本积分静默不记，见 11.2 S2） |
+| 取值 | 非负浮点；未知多余键允许（原样透传落库，不参与计费） |
+| 汇率 | **不乘任何汇率**，直接落 `channel_models.cost_rates` |
 
-响应头由**入站基础协议硬编码**决定（`Content-Type`、SSE 形状、网关固定运维头如 `X-Request-Id` / `Retry-After`），另加一份**全局上游头白名单**（默认空、在系统菜单配置）。上游头默认不透传（维持渠道透明）。因此格式中**不设**响应头字段。
+**键归一化（唯一转换点）**：`billing.WireRates.UnmarshalJSON`（`backend/internal/domain/billing/rates.go:93`）把 `Input` / `Output` / `CacheRead` 归一为内部 `input` / `output` / `cache_read`，snake 键同样接受。预设包解的就是这条路径（`channelprotocol/model.go:102` `CostRates billing.WireRates`）—— 所以「PascalCase 与 snake 之间没有转换点」是**错的**，按本格式写 PascalCase 不会出问题。
+真正的坑是**拼错键**：该函数对未知键「原样保留、不报错」，写 `cache` / `Cache_Read` / `inputTokens` 不会被纠正，只会让 `cache_read` 缺席 → 直接落进 S2。
 
-## 11. 完整示例
+> 实测（2026-10-28，一次性脚本 `go run` 直调 `billing.WireRates`，未改仓库代码）：
+> `{"Input":0.8,"Output":2.8,"CacheRead":0.23}` → 归一 `{input:0.8, output:2.8, cache_read:0.23}`、无错；
+> `{"Input":0.8,"Output":2.8,"Cache_Read":0.23}` → 归一 `{input:0.8, output:2.8, Cache_Read:0.23}`（**错键原样保留**）、unmarshal 无错，但 `ComputeCredits` 报 `计费单价缺少键 "cache_read"`。
+
+**为什么「缺段 / 拼错键」在同步阶段完全无感**（代码核实 + 实测，2026-10-28）：
+
+1. 物化路径 `channel/service.go:379` 的 `materializeFromProtocol` 是 `CostRates: billing.Rates(mg.CostRates)` **直接落库**，这条路径**不调用** `billing.ValidateRates`。`ValidateRates`（`billing/rates.go:114`）的调用点全仓只有 4 处：`billing/engine.go:19`（`ComputeCredits` 内部）、`billing/engine.go:29`（`RawTotal` 内部）、`channel/model_service.go:43`（管理端保存成本）、`model/service.go:221`（管理端保存售价）。即「**计费计算时**」与「**管理端保存时**」才校验，落库时从不校验，因此错键会一路进 `channel_models.cost_rates`。
+2. 计费时 `ComputeCredits` 会因缺键报错，但**成本侧错误被吞**：`billing/service.go:300-302` 的 `if c, cerr := ComputeCredits(req.Tokens, req.CostRates, ...); cerr == nil { rec.CostCredits = c }` —— `cerr` 既不记日志也不告警，`cost_credits` **静默为 0**，成本/毛利曲线整段为空且没人会发现。
+3. 售价侧缺键不静默：售价是本单应付积分的计算依据，`billing/service.go:537` 的 `requestCredits` 直接把 `ComputeCredits` 的错误向上返回（结算失败，不是静默 0）；管理端保存侧同样会拦（`model/service.go:221`）。
+4. 唯一会「响」的是管理员在渠道模型页手工保存该行 → 400「cost_rates 非法」（`channel/model_service.go:43`）。
+
+### 9.2 `cost`（v1 位）与 `costRates` 的关系
+
+- `cost` 保留 models.dev v1 形状与字段名，但**语义按本格式改为人民币/百万 token**，并由同作用域 `gateway.costCurrency: "CNY"` 显式声明。
+- `cost` 是**展示/对照位**：灵枢当前**完全不解析**它（证据见 13.1），不产生任何计费影响。
+- 一致性要求：数据集内 `cost` 的数值应与 `costRates` **一致**（建议由 `costRates` 派生，避免两套数字打架）。
+
+### 9.3 倍率 → 积分（灵枢实际算式）
+
+灵枢计费引擎（`billing.ComputeCredits`）：
+
+```
+积分 = (输入token × Input + 输出token × Output + 缓存读token × CacheRead) × 时段系数 × 分档系数 ÷ R
+R = billing.r（默认 10000）
+```
+
+由此可推出兰台直接可用的两条速算：
+
+- **积分价值** 每 1 积分 = R ÷ 1,000,000 元 = **0.01 元**（R=10000）
+- **每百万 token 积分 = 倍率 × 100**
+
+价格落库**不经过** `billing.cny_rate`（那是美元→人民币的折算系数，只服务 9.4 的参考价路径）。
+
+### 9.4 边界：`cost` 绝不能喂给 `sync.price_source_url`
+
+灵枢有两条完全独立的 URL 配置：
+
+| 配置项 | 数据源 | 价格语义 | 是否折算 |
+|---|---|---|---|
+| `preset.pack_url` | **本数据集** | 人民币倍率 | 否 |
+| `sync.price_source_url` | models.dev `api.json` | **美元**/百万 token | 是：× `billing.cny_rate`（默认 6.8）|
+
+`sync.price_source_url` 拉到的 `cost` 会被当作美元，× cny_rate 后成为「参考价」，并可通过「一键应用参考价」写入对外模型的 `sale_rates`（售价倍率）；同一份 ×6.8 的数值也进价格变更告警基线（不落售价）。
+
+链路（代码核实，2026-10-28）：`internal/config` 的 `Sync.PriceSourceURL`（`backend/internal/config/config.go:77` 邻域）→ `cmd/server/main.go:391` 注入 → `internal/domain/sync/source.go` 按 models.dev 形状解析 `cost.input/output/cache_read`，**硬编码按美元/百万 token 理解、无任何单位识别**（`source.go:42-64` `flatten`）；`cmd/server/main.go:744-766` 的 `priceRefAdapter.ReferencePrice` 做 `p.Pricing.Prompt × cny_rate`（默认 `6.8`，`seeding/seed.go:28` 种下、`billing/service.go` 的 `CnyRate` 读配置）→ `model/service.go:421` `ApplyPrice` / `:476` `SyncPrices` → `model/store.go` 的 `UPDATE external_models SET sale_rates`。
+
+**挂错 URL 的实际后果分两种，别混为一谈**（`flatten()` 在 `backend/internal/domain/sync/source.go:46` 要求 `cost.input` 与 `cost.output` **同时存在**才收录，否则 `continue` 跳过该模型）：
+
+| 形态 | 数据集内容 | 后果 |
+|---|---|---|
+| a | 只带 `gateway.costRates`（本数据集正本） | 一条都过不了 `source.go:46` 的判空 → 参考价永远查不到、批量同步全 Skipped。**不报错、也不放大**（静默无效，白挂） |
+| b | 同时带 v1 的 `cost`（哪怕填的是人民币数） | 被当美元 ×6.8 写进售价 → **虚高 6.8 倍**。这才是真正的放大 |
+
+⇒ 硬红线不变：**本数据集只能挂 `preset.pack_url`，绝不能挂 `sync.price_source_url`**。形态 a 是「白挂」（见 11.2 S8），形态 b 是「错价」，两种都要在发布纪律里挡住。
+
+### 9.5 完整样例：`glm-5.3-flash`
+
+官网人民币价（智谱 BigModel 开放平台，`https://open.bigmodel.cn/pricing`，as_of **2026-10-28**）：
+
+| 项 | 官网人民币价（元/百万 token） | `costRates` | 每百万 token 积分（×100） |
+|---|---|---|---|
+| 输入 | 0.8 | `Input: 0.8` | **80** |
+| 输出 | 2.8 | `Output: 2.8` | **280** |
+| 缓存命中（缓存读） | 0.23 | `CacheRead: 0.23` | **23** |
+| 缓存存储 | 限时免费 | — | — |
+
+算式：
+
+- 100 万输入 token → `1,000,000 × 0.8 ÷ 10000 = 80` 积分
+- 一次调用（10 万输入 + 1 万输出、无缓存命中）→ `(100000 × 0.8 + 10000 × 2.8) ÷ 10000 = 108000 ÷ 10000 = ` **10.8 积分**
+- 交叉校验（积分价值 0.01 元）：`10.8 × 0.01 = 0.108 元`，与按量价 `0.08 + 0.028 = 0.108 元` **一致** ✓
+
+限时五折（官网 2026-08-26 起，至 **2026-09-09 24:00 UTC+8**，现已结束，仅作 `offers` 写法示例）：
+输入 0.4 / 输出 1.4 / 缓存命中 0.115 元 → `Input: 0.4` `Output: 1.4` `CacheRead: 0.115` → **40 / 140 / 11.5 积分每百万 token**。
+
+数据集片段：
 
 ```jsonc
 {
-  "id": "opencode-zen",
-  "name": "OpenCode Zen",
-  "env": ["OPENCODE_API_KEY"],
-  "npm": "@ai-sdk/opencode",     // 示意值；本项目不消费 npm，仅为对齐 v1 保留
-  "api": null,
-  "doc": "https://opencode.ai/docs/zen",
-  "models": {
-    "claude-sonnet-4-5": {
-      "id": "claude-sonnet-4-5",
-      "name": "Claude Sonnet 4.5",
-      "description": "Anthropic Claude Sonnet 4.5 via OpenCode Zen.",
-      "cost": { "input": 3, "output": 15, "cache_read": 0.3, "cache_write": 3.75 },
-      "limit": { "context": 200000, "output": 64000 },
-      "modalities": { "input": ["text", "image"], "output": ["text"] },
-      "tool_call": true,
-      "reasoning": true,
-      "reasoning_options": ["toggle", "budget_tokens"],
-      "gateway": { "protocols": { "anthropic-messages": {} } }
+  "zhipu": {
+    "id": "zhipu",
+    "name": "智谱 BigModel",
+    "env": ["ZHIPU_API_KEY"],
+    "npm": "@ai-sdk/openai-compatible",
+    "api": null,
+    "doc": "https://open.bigmodel.cn/pricing",
+    "models": {
+      "glm-5.3-flash": {
+        "id": "glm-5.3-flash",
+        "name": "GLM-5.3-Flash",
+        "description": "智谱原生多模态模型，1M 上下文，官网人民币计价。",
+        "cost": { "input": 0.8, "output": 2.8, "cache_read": 0.23 },
+        "limit": { "context": 1000000, "output": 128000 },
+        "modalities": { "input": ["text", "image", "video", "pdf"], "output": ["text"] },
+        "tool_call": true,
+        "reasoning": true,
+        "gateway": {
+          "protocols": { "openai-chat": {} },
+          "costRates": { "Input": 0.8, "Output": 2.8, "CacheRead": 0.23 },
+          "offers": []
+        }
+      }
     },
-    "gpt-5-codex": {
-      "id": "gpt-5-codex",
-      "name": "GPT-5 Codex",
-      "description": "OpenAI GPT-5 Codex via OpenCode Zen.",
-      "cost": { "input": 1.25, "output": 10 },
-      "limit": { "context": 400000, "output": 128000 },
-      "tool_call": true,
-      "reasoning": true,
-      "gateway": { "protocols": { "openai-responses": {} } }
-    }
-  },
-  "gateway": {
-    "baseUrl": "https://opencode.ai/zen/v1",
-    "protocols": {
-      "anthropic-messages": { "path": "/messages" },
-      "openai-responses":   { "path": "/responses" }
-    },
-    "requestHeaders": {
-      "passthroughMode": "whitelist",
-      "whitelist": ["x-opencode-session"]
+    "gateway": {
+      "baseUrl": "https://open.bigmodel.cn/api/paas/v4",
+      "protocols": { "openai-chat": { "path": "/chat/completions", "default": true } },
+      "costCurrency": "CNY",
+      "offers": []
     }
   }
 }
 ```
 
-## 12. 许可与归属
+## 10. 枚举与容忍规则
+
+| 枚举位置 | 性质 | 灵枢行为 | 未知值后果 |
+|---|---|---|---|
+| `gateway.protocols` 的键 | 开放 | 白名单过滤，`channelprotocol/source.go:78` | 静默丢弃条目键，**不报错** |
+| `models.*.type` / `modalities.*` | 开放（v1 原文封闭） | 不解析（`source.go:28-33` 无该字段） | **不报错** |
+| `models.*.status` / `reasoning_options` | 开放 | 不解析 | **不报错** |
+| `gateway.offers[].kind` / `quota.unit` | 开放 | 不解析（`source.go:36-44` 无 `offers`） | **不报错**（整条忽略） |
+| `gateway.costCurrency` | 开放 | **完全不解析**（`GatewayBlock` / `ModelGateway` 都无此键） | **不报错**，也不影响任何数值（见 6.5） |
+| **`gateway.requestHeaders.passthroughMode`** | **封闭** | `channelprotocol/service.go:158-162` 校验 | **400 + 整包同步回滚** |
+| **`gateway.sourceStatus`** | **封闭** | `service.go:165-169` 校验（仅 import 路径） | **400**（sync 路径强制写 `ACTIVE`，不受影响） |
+| **基础协议名**（`gateway.protocols` 归一后） | **封闭（3 个）** | 校验（物化后） | 已被白名单过滤 → 实际不可达；但若走 CRUD/import 显式写非法协议则 **400** |
+| `gateway.errorPolicy[].*` / `features[].key` | 封闭 | pack 路径不解析 | **不报错**（仅 CRUD 路径校验） |
+
+统一策略（对齐第 2 节原则 4/6）：**开放枚举遇未知值一律「丢掉该值、保留其余、继续处理」，不得整个包失败**；封闭枚举（仅 `passthroughMode` / `sourceStatus`）必须严格取值。
+
+## 11. 校验规则
+
+### 11.1 会让整包同步失败（事务整体回滚，一条不留）
+
+> **⚠ 先看适用情形：下表只对「已存在条目被覆盖」成立。**
+>
+> - **已存在条目更新**：走 `overwriteFromPreset` → 先 `validate`（`channelprotocol/service.go:575-587`），命中 V3/V4/V5/V7 任一条 → **400 + 整包回滚**（事务内一条不落）。
+> - **首次接入（新增 provider）**：走 `insertOn`（`channelprotocol/store.go:165-184`，直接 INSERT，**不经过 `validate()`**）→ 坏 `baseUrl` / `passthroughMode:"bogus"` / 多个 `default` 会 **200 落库**，只是这些数据本不该生效。这是**已知校验口子、尚未修复**，已登记 `docs/pending-tasks.md`（P1「`insertOn` 绕过校验」）；别把它当成「已修复」。
+> - 因此 V3/V4/V5/V7 下方标注「首次接入不拦」，V1/V2/V6/V8 两类情形都拦（解码层 / DB 唯一索引 / 解码层）。
+
+| # | 触发条件 | 表现 |
+|---|---|---|
+| V1 | JSON 语法错误 / 顶层不是对象 | 解析失败，sync 返回错误 |
+| V2 | `preset.pack_url` 拉取非 200 或超时 | sync 返回错误 |
+| V3 | 某 provider 的 `id` 与 `name` **同时为空** | 400「渠道协议名称不能为空」。**首次接入不拦**（`insertOn` 不解 `name`/不校验，空名会直接落库；见上注） |
+| V4 | provider 级 `gateway.baseUrl` 非空但非 `http(s)://` 开头 | 400「BaseURL 必须以 http:// 或 https:// 开头」。**首次接入不拦**（会 200 落库，随后请求阶段才炸） |
+| V5 | `gateway.requestHeaders.passthroughMode` 非法 | 400「passthroughMode 只支持 …」。**首次接入不拦**（已实测：新条目带 `"bogus"` 能 200 落库） |
+| V6 | 两个 provider 物化出同名（`name` 或 `id` 重复） | 唯一索引冲突，整次回滚 |
+| V7 | provider 级 `protocols` 里 `default: true` 多于一个 | 400「至多一个默认协议」。**首次接入不拦** |
+| V8 | 把 `gateway.externalModelID` 写成**数字**（该字段是 `json:"externalModelID,string"`，见 `channelprotocol/model.go:101`） | 整包 JSON 解析失败、sync 报错、全部回滚。实测（2026-10-28，一次性 `go run`）：`{"externalModelID":123}` → `json: cannot unmarshal number into Go struct field … externalModelID of type int64`；`{"externalModelID":"123"}` → 正常。数据集本来就不该填它，此条防手滑 |
+| **V9** | **⚠ 高危（不报错，但会改存量）：发布空包**——顶层 `{}`，或一个 provider 都没有 | **不是「无操作」**。`Sync` 的失效标记循环（`channelprotocol/service.go:446-461`）会把 `seen` 里缺失的**现有全部 ACTIVE 协议逐个翻成 `STALE`**：返回 `Code=0`、`Applied=0`，每条被翻的都会出现在 `Pending`（Diff「预设来源已失效（保留协议）」，`Stale=true`；本来就是 STALE 的会被跳过）。协议不删、渠道不断链，但管理端整屏显示「来源已失效」。**严禁发布空包**：要下线某个 provider 请只删那一条，不要发空包。**实测（2026-10-28，Gate 在 `lingshu_test` 跑步骤 3）**：发 `{}` → **HTTP 200 / Code=0 / Applied=0 / 40 条全部翻 STALE**（原为 40 条 ACTIVE），恢复真包后 40 条全回 `ACTIVE`；整条链路**全程无报错**，只有 `Pending` 里有痕迹。证据：`notes/pack-step3-acceptance.md` |
+
+> V9 与 V1–V8 性质不同：V1–V8 是「**失败**」（报错 + 回滚，数据不变），V9 是「**成功但改存量**」。空包唯一的安全场景是「一次都没同步过」（此时 `existing` 为空，循环不执行）。
+>
+> 空包的另一种来源：把**返回 200 的清单/指针 JSON** 挂到 `pack_url`（见 §0.1 F3 的四种不可用形态）——其中第 ③ 种「键值恰好带 `id`+`name`」会把清单条目物化成一条真协议，其余现有协议被当成"已从预设移除"而全部翻 STALE。注意：**3xx 跳到包本体的指针 URL 不属此列**（F3 ✅ 实测可用）。
+
+### 11.2 不报错但会静默出问题（验收时必须逐项核对）
+
+| # | 情况 | 后果 |
+|---|---|---|
+| S1 | 模型条目无 `protocols` 且无 `baseUrl` 且 `externalModelID ≤ 0`（判定见 `channelprotocol/source.go:63`） | 整条模型（含价格）被丢弃，无日志 |
+| S2 | `gateway.costRates` 缺三段中任一，或键拼错（`cache` / `Cache_Read` / `inputTokens`） | 键归一化只认 `Input/Output/CacheRead` 与 `input/output/cache_read`，其余键**原样保留、不报错**（`billing/rates.go:93` `WireRates.UnmarshalJSON`，已实测）；物化路径（`channel/service.go:379`）**不调用** `ValidateRates`，所以同步阶段完全无感，缺段/错键一路落进 `channel_models.cost_rates`。计费时 `ComputeCredits`（`billing/engine.go:19` 内校验）报错，但错误被 `billing/service.go:300-302` 的 `cerr == nil` 吞掉（不记日志、不告警）→ **成本积分静默为 0，成本/毛利曲线整段为空**。售价侧缺键则在结算时直接报错（非静默）。唯一会响的是管理员在渠道模型页手工保存该行 → 400「cost_rates 非法」（`channel/model_service.go:43`） |
+| S3 | `costRates` 数值为负 | 同步阶段同 S2 静默；手工保存时 `ValidateRates` 拒绝（400） |
+| S4 | `cost` 与 `costRates` 数字不一致 | 无报错，但两处读数打架，排障困难 |
+| S5 | 忘记写 `costCurrency` / 写成 `"USD"` | **不影响计费**：后端没有任何币种字段与换算分支（`grep -i currency` 的命中全是 `Concurrency`；该键解码即丢弃），落库与出账完全相同。缺省或写错只影响人读/未来消费方。真正的风险是**数值币种填错**（把美元数当人民币写进 `costRates` → 虚低 6.8 倍），见 9.1「数值」行 |
+| S6 | provider 未写 `models` | 协议物化成功但零模型 |
+| S7 | `gateway` 整块缺失 | 协议物化成功但无 `baseUrl` / `protocols`，请求不可用 |
+| S8 | **把本数据集挂到 `sync.price_source_url`** | 两种形态都无预警：只带 `costRates` → `sync/source.go:46` 判空后逐条 `continue`，参考价永远查不到（白挂）；同时带 v1 `cost` → 被当美元 ×`cny_rate`(6.8) 写入售价（错价）。详见 9.4 |
+
+### 11.3 建议补的代码执法点（本次只登记，未改代码）
+
+上表 S2 / S5 / S8 的共同问题：**数据集的错在同步阶段没有声音**。要把它们从「靠人核对」变成「V 类必失败」，需在代码侧补以下执法点（Core 已点名 4 项代码改动 + 文档口径 1 项，已登记到 `docs/pending-tasks.md`，等 spencer 拍板）：
+
+| # | 位置 | 建议 | 效果 |
+|---|---|---|---|
+| E1 | `channel/service.go:359-385` 的 `materializeFromProtocol` | 落库前调用 `billing.ValidateRates`，失败即 `return error`（外层 `channelprotocol/service.go` 的 `Sync` 已是 `store.WithTx`，可整包回滚） | 缺段/错键升为 V 类，同步即失败 |
+| E2 | `channelprotocol/source.go:36` 的 `GatewayBlock` + `channelprotocol/model.go:97` 的 `ModelGateway` | 补 `costCurrency` 字符串字段（`json:"costCurrency"`），并在 `toChannelProtocol` 校验空值/非 `"CNY"` | `costCurrency` 从标注变成执法点 |
+| E3 | `billing/rates.go:93` 的 `WireRates.UnmarshalJSON` | **只在预设解析入口**对未知键加严（拒绝），不动管理端兼容 | 拼错键立刻报错 |
+| E4 | `billing/service.go:300-302`（`cerr` 被吞） | 至少记一条 warn 日志（带 model / channel） | 成本静默 0 可被发现 |
+| E5 | （文档口径，非代码） | 第 11.1 V8 / 11.2 S2·S5·S8 / 9.1「数值」四条已写死进本格式 | 兰台冻结 Schema 时按此收紧 |
+| E6 | `channelprotocol/source.go:63`（无协议模型 `continue`） | 附带建议：加一条 warn 日志 | 模型被静默丢弃可被发现 |
+
+> 现状口径：E1–E4、E6 全部**未实现**；E5 已在本文档落地。所以本数据集必须靠「Schema 自检 + 第 4 节验收清单」挡住 S2 / S5 / S8，不能指望代码报错。
+
+## 12. 已知限制（数据集设计时必须绕开）
+
+1. **`cost` / `limit` / `modalities` / `type` 等 v1 能力位全部是惰性字段**：灵枢不解析、不入库、不影响路由与计费。数据集写它们只为人读与未来扩展。
+2. **模型条目必须「挂得住」**：见 S1，带价格的模型必须至少声明一个 `protocols` 键。
+3. **`externalModelID` 兰台不可填**：它是灵枢内部雪花 ID。因此数据集**无法**把价格自动落到 `channel_models`；正确链路是：
+   `数据集 → sync 物化渠道协议（价格已在协议 JSON 里）→ 管理员在渠道协议页把模型绑定到对外模型（externalModelID）→ 保存 → 重物化 channel_models.cost_rates`。
+4. **不要把 `GET /api/v1/admin/channel-protocols/export` 的结果当数据集源**：export 只回写 `id` + `gateway`，会丢 `models.*.cost/limit/name/description`，且 `name`/`description` 会以空串输出。
+5. **`POST /import` 直接发裸包体**（`Pack` 本身就是 `map[string]Provider`，handler 解的就是裸 body：`channelprotocol/handler.go:177-181`，与 `fetchPack` 同形）。请求体**顶层就是 `{"<providerId>": { … }}`**，不要再包一层：
+
+   ```jsonc
+   // ✅ 请求体顶层就是 providerId → provider 条目（裸包体）
+   {
+     "opencode-zen": { "id": "opencode-zen", "name": "OpenCode Zen", "models": { /* … */ }, "gateway": { /* … */ } }
+   }
+   ```
+
+   - **误包成 `{"Pack": {…}}` 会怎样**（实测 2026-10-30）：解出来是一条键为 `"Pack"`、`id`/`name` 全空的 provider，`validate` 因「名称不能为空」不通过 → **计入 `Warnings` 并跳过**（`channelprotocol/service.go:548-551`）。响应仍是 **HTTP 200 / `Code=0`**，但 `Created=0`、`Warnings` 里出现「渠道协议 "": 渠道协议名称不能为空」——**看到这个文案就回来查是不是多包了一层**（不是 400）。
+   - 响应信封（**成功路径 `Message` 恒为 `"ok"`**，见 `internal/pkg/resp/resp.go:86`）：`{"Code":0,"Message":"ok","RequestID":"…","Data":{"Created":N,"Skipped":M,"Warnings":[…]}}`。**可读的失败/跳过明细只在 `Warnings` 里**——典型就是上面那条「误包 = HTTP 200 + `Created=0` + `Warnings`『渠道协议名称不能为空』」：光看 `Message` 是看不出问题的。
+
+## 13. 新字段兼容性结论（`offers`，spencer 要求验证）
+
+### 13.1 结论
+
+**兼容。灵枢读到任何未知字段都不会报错。→ `offers` 在 0.1.0 先摆字段位（`"offers": []` 留空），0.2.0 再填内容，无需任何灵枢改造。**
+
+### 13.2 判定依据（代码位置）
+
+| # | 事实 | 位置 |
+|---|---|---|
+| E1 | 拉包解码用裸 `json.NewDecoder(...).Decode(&pack)`，**未开 `DisallowUnknownFields`** → 未知键静默忽略 | `channelprotocol/source.go:118-119`（`fetchPack`） |
+| E2 | import / sync 的请求体解码同样未开严格模式 | `channelprotocol/handler.go:32-33`（`decodeBody`） |
+| E3 | `Model` 结构体只有 `ID / Name / Description / Gateway` 四个字段——**连 v1 的 `cost` / `limit` 都没有**，说明「惰性字段」是既有设计惯例，不是例外 | `channelprotocol/source.go:28-33`（`type Model`） |
+| E4 | `GatewayBlock` 结构体只有 `baseUrl / protocols / requestHeaders / edited / sourceStatus`；新增 `offers` / `costCurrency` 都不在结构体内 → 忽略 | `channelprotocol/source.go:36-44` |
+| E5 | `offers` 位于 `gateway` 命名空间内 → 不污染 models.dev v1 顶层/模型级字段，不会与模型供应商未来字段撞名 | 第 2 节原则 2 |
+| E6 | `ValidateRates` 只校验 `input/output/cache_read` 三段，多余键「不参与校验、不影响计费」 | `billing/rates.go:114-125` |
+
+补充：整个仓库 `DisallowUnknownFields` 出现 **0 次**（`grep -r` 全仓无命中），即「严格解码」在本项目不存在，未知字段容忍是全局一致行为。同理 `grep -rn -i "currency" --include=*.go backend/` 的全部命中都是 `Concurrency`（并发），无任何币种分支。
+
+### 13.3 为什么判定「不兼容」不成立
+
+唯一的「严格」发生在**物化之后**的 `validate()`（`channelprotocol/service.go:137-177`）：它拒绝非法 `passthroughMode` / 非法 `sourceStatus` / 多于一个 `default`。但这些校验只针对**已被结构体接住的字段**；`offers` 根本进不了结构体，到不了 `validate()`。所以「加字段 → 报错」这条路径在 `offers` 上不存在。
+
+### 13.4 需要注意（不是报错，是语义）
+
+- `offers` 目前**没有任何消费方**（灵枢只把它当噪声丢掉）。因此它的价值是「先冻结契约、兰台先攒数据」，不能指望它影响计费。
+- 若未来灵枢要消费优惠价，正确做法是**由消费方在拉取后按 `window` + `effect.priceOverride` 覆盖 `costRates`**，而不是让数据集出现「同一个模型两个价」的歧义。这条等到真要实现时再单开设计。
+
+## 14. 变更记录
+
+| 版本 | 日期 | 变更 |
+|---|---|---|
+| v0.1 | 2026-10-16 | 首版：v1 对齐 + `gateway{baseUrl,protocols,requestHeaders}` |
+| v0.2 草案 | 2026-10-28 | ① 补 `gateway.costRates` 正式口径（此前代码已支持但文档缺失）与 `costCurrency`；② 定价改为**人民币**口径并给倍率→积分算式与样例；③ 新增 `gateway.offers` 优惠字段位（兼容性已验证，见 13）；④ 各字段补**必填性 / 灵枢消费性**两列；⑤ 新增枚举容忍表（10）、校验规则（11）、已知限制（12）；⑥ 明确数据集 URL 与 `sync.price_source_url` 分离（9.4） |
+| v0.2 草案 rev.1 | 2026-10-28 | 按 Core 只读核实结果修订三处**事实性错误**：① 9.1 更正「无大小写转换点」——`WireRates.UnmarshalJSON` 就是转换点，真正的坑是拼错键被原样保留 + 物化路径不校验；② 6.5 / S5 更正「缺 `costCurrency` → 虚低 6.8 倍」——代码全无币种概念，该字段纯标注；风险在**数值**填了美元（9.1 新增「数值」硬约束）；③ 9.4 补挂错 URL 的两种后果（静默无效 / 虚高 6.8）；④ 新增 V8（`externalModelID` 必须字符串，否则整包解析失败）与 11.3（5 个建议执法点，未实现） |
+| v0.2 草案 rev.10 | 2026-10-30 | Owl 复审 P3：§12.5 响应信封示例 `Message` 由 `""` 更正为 `"ok"`（`resp.OK` 实现即 `Message:"ok"`，`internal/pkg/resp/resp.go:86`），并补一句「成功路径 `Message` 恒为 `ok`，失败/跳过明细只看 `Warnings`」 |
+| v0.2 草案 rev.9 | 2026-10-30 | Owl 复审 P2×3 + P3×1：① §12.5 更正 `POST /import` 为**裸包体**（原写「外包 `Pack`」是错的），并说明误包时的真实表现（200 + `Warnings`「名称不能为空」，非 400）；② §11.1 补适用情形——**已存在条目**走 `validate` 才 400 回滚，**首次接入**走 `insertOn` 绕过校验、坏 `baseUrl`/`passthroughMode`/多 `default` 会 200 落库（已知口子，未修复）；③ F6 限定为**翻译型/网关型供应商**，原厂直连只列原生协议，`google` 家族灵枢无对应协议不可硬凑；④ 计数 5 项 → **6 项**（历史条目保留原样并加注） |
+| v0.2 草案 rev.8 | 2026-10-30 | 官方端点更正（兰台冻结前）：新增 **§0.1 F6「同档多协议 = 同一套模型」**（官方「Every API serves every paid and Go text model」，含 OpenCode 2 条/4 条两种可照抄写法），**§15 示例 baseUrl** 由 `…/zen/v1` 改为 `…/inference/openai/v1`（并补 per-protocol baseUrl、`doc` 换 v2 链接），§6.1 `baseUrl` 行加交叉引用 |
+| v0.2 草案 rev.7 | 2026-10-28 | 兰台方案 A 的 302 指针链路实测回写：F3 新增 **✅ 可用形态（3xx 指针 URL）**（1 跳成功、sha256 与包本体逐字节一致、随后 sync 40/0/0）、**判定口诀**（`curl -I` 看 3xx 还是 200 清单）、**边界**（别填 `manifest.json`）；把第 ④ 形态的举例从 `latest.json` 改为 `manifest.json`（前者已改 302） |
+| v0.2 草案 rev.6 | 2026-10-28 | 步骤 3 测试环境拉取验收通过后回写实测：**V9 升级为实测**（空包 → 200 / Applied=0 / 40 条全翻 STALE，非推演）；**F3 增第 ④ 种形态**（`latest.json` 这类清单页当 `pack_url` → 裸 500「服务器内部错误」，状态安全但错误不可读）。同步把 Gate 的 3 条建议登记进 `docs/pending-tasks.md`（P1 空包 400 拦 / P1 `insertOn` 绕过校验口子 / P2 裸 500 包成 400）|
+| v0.2 草案 rev.5 | 2026-10-28 | 补 `pack_url` 目标形态（兰台发布卡点）：**必须指向包本体**；3xx 会被跟随（`http.DefaultClient`），所以 `latest.json` 只有 302 到包本体才可用；把「清单/指针 JSON 直出 200」的三种实测后果写进 F3，并在 V9 补"空包的另一种来源"；F5 明确 `externalModelID` 非必填 |
+| v0.2 草案 rev.4 | 2026-10-28 | 兰台发布前防误发：新增 **§11.1 V9**（发布空包 = 把现有全部 ACTIVE 协议翻 `STALE`，不是无操作），**§0.1 顶部加发布红线**、**F5 顶层行**改写为「严禁空包」；验收清单同步加一条「provider 数 ≥1」前置拦截 |
+| v0.2 草案 rev.3 | 2026-10-28 | 新增 **§0.1 冻结前 5 项规范（兰台用）**（rev.8 增 F6 后为 6 项）：协议词表精确全集与降级、模型必须内联（禁止 `$ref`/字符串）、`pack_url` 是指针且靠 URL 路径版本化、providerId 命名约定与「与 models.dev 无冲突面」、最小必备集与 4 条真拒收。全部结论挂文件:行或标「约定，非代码约束」 |
+| v0.2 草案 rev.2 | 2026-10-28 | 补齐 Core 的 4 条必写条款与「断言可追溯」：① 全篇「会报错 / 会放大 / 会静默」的断言统一补 `文件:行`（V8→`model.go:101`；S1→`source.go:63`；S2→`rates.go:93`+`service.go:379`+`billing/service.go:300-302`+`model_service.go:43`；9.4→`sync/source.go:46`+`main.go:744-766`；13.2 六条→行号）；② 更正两处**表述不精确**：`grep -i currency` 并非 0 命中（命中全是 `Concurrency`）、`ValidateRates` 并非「只在管理端被调用」（`billing/engine.go:19/29` 在计费计算时也调）；③ 新增 **S8**（数据集误挂 `price_source_url` 的两种静默形态）；④ V8 补**实测**错误串；⑤ 11.3 执法点按 Core 点名重排为 E1–E6（E5 = 本文档已落地的 4 条文档口径），并同步登记 `docs/pending-tasks.md` |
+
+**未变更**：v1 字段名与两级嵌套形状、`gateway` 命名空间、协议白名单、鉴权与请求头策略规则。
+
+## 15. 完整示例（多 provider）
+
+```jsonc
+{
+  "opencode-zen": {
+    "id": "opencode-zen",
+    "name": "OpenCode Zen",
+    "env": ["OPENCODE_API_KEY"],
+    "npm": "@ai-sdk/opencode",
+    "api": null,
+    "doc": "https://opencode.ai/v2/docs/console/models",
+    "models": {
+      "claude-sonnet-4-5": {
+        "id": "claude-sonnet-4-5",
+        "name": "Claude Sonnet 4.5",
+        "description": "Anthropic Claude Sonnet 4.5 via OpenCode Zen.",
+        "cost": { "input": 20.4, "output": 102, "cache_read": 2.04, "cache_write": 25.5 },
+        "limit": { "context": 200000, "output": 64000 },
+        "modalities": { "input": ["text", "image"], "output": ["text"] },
+        "tool_call": true,
+        "reasoning": true,
+        "reasoning_options": ["toggle", "budget_tokens"],
+        "gateway": {
+          "protocols": { "anthropic-messages": {} },
+          "costRates": { "Input": 20.4, "Output": 102, "CacheRead": 2.04 },
+          "offers": []
+        }
+      },
+      "gpt-5-codex": {
+        "id": "gpt-5-codex",
+        "name": "GPT-5 Codex",
+        "description": "OpenAI GPT-5 Codex via OpenCode Zen.",
+        "cost": { "input": 8.5, "output": 68 },
+        "limit": { "context": 400000, "output": 128000 },
+        "tool_call": true,
+        "reasoning": true,
+        "gateway": {
+          "protocols": { "openai-responses": {} },
+          "costRates": { "Input": 8.5, "Output": 68, "CacheRead": 0 },
+          "offers": []
+        }
+      }
+    },
+    "gateway": {
+      "baseUrl": "https://opencode.ai/inference/openai/v1",
+      "protocols": {
+        "openai-chat":        { "path": "/chat/completions" },
+        "openai-responses":   { "path": "/responses" },
+        "anthropic-messages": { "baseUrl": "https://opencode.ai/inference/anthropic", "path": "/v1/messages" }
+      },
+      "requestHeaders": {
+        "passthroughMode": "whitelist",
+        "whitelist": ["x-opencode-session"]
+      },
+      "costCurrency": "CNY",
+      "offers": []
+    }
+  }
+}
+```
+
+> 示例中的数字是按 1 USD ≈ 6.8 CNY 折算后的**示意值**，只为演示形状；真实数据集必须填**官网人民币价**（9.1）。
+>
+> **模型级 `protocols` 说明**：上面两个模型各写了 `"gateway": {"protocols": {...}}`，那是「只准走这个协议」的**收窄**写法，只用于真实存在差异的场景；按 §0.1 F6，同一档位内每个模型应对全部协议可达，一般**不必**在模型级收窄。
+>
+> **端点口径（2026-10-30 更正）**：OpenCode 的 Pay-as-you-go 与 Go 两档按 `https://opencode.ai/inference` 与 `…/inference/go` 区分，协议前缀为 `/openai/v1`（`responses`、`chat/completions`）与 `/anthropic/v1`（`messages`）；**旧 `/zen*` 已过时**，不要再写进数据集（结构见 §0.1 **F6**）。
+
+## 16. 许可与归属
 
 若直接消费 / 内嵌 models.dev 数据，需保留其 MIT 许可与版权声明（models.dev, MIT, Copyright (c) 2025）。

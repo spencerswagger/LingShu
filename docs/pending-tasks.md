@@ -27,3 +27,57 @@
 - **交付记录**：
   - 后端：分支 `feat/billing-detail-request-trace`，PR #63（OPEN，等 spencer 合入）；实现笔记 `notes/billing-detail-reqparams.md`；
   - 已定口径：列表 `Total` = 请求数（前端文案同步）；开发者端保留 `channel_name` 显示名，但必须按白名单返回。
+
+---
+
+## [P0] 渠道预设包数据集（2026-10-28）
+
+- **背景**：spencer「灵枢渠道协议本来就设计了拉取功能，但一直没提供数据集。本次仅做测试，**不改灵枢代码和部署**」。范围：① 冻结数据集字段口径（schema / 币种 / 优惠字段 / 验收清单）→ ③ 测试环境拉取验收。
+- **验收标准**：数据集能被 `preset.pack_url` 拉取并物化为 40 条渠道协议；`costRates` 为人民币字面量、无二次换算、无静默 0；空包、清单页、302 指针等边界形态有明确结论。
+- **约束**：不改灵枢代码、不部署、不调灵枢库/网关真实数据；拒绝猜测，缺数据标「待定」。
+- **状态**：已完成（2026-10-28）
+- **负责人**：Ark（口径与正本）→ 兰台（数据集发布）→ Gate（步骤 3 验收）
+- **交付记录**：
+  - **步骤 1 口径**：`docs/preset-pack-format.md` v0.2（含 §0.1 冻结前 5 项规范）+ `docs/preset-pack-format.schema.json`（ajv 2020-12 用例通过），PR #64 **@ 0b2e1f4**（OPEN，待 Owl 评审、合入权在 spencer）。
+  - **步骤 3 验收**：**通过** —— `Applied=40 / Pending=[] / Stale=0`、`STALE=0`、重复各 0、`costRates` 与包差值 0、`latest.json` 走 302 可用；空包 `{}` 实测会把 40 条全翻 STALE。收口记录 `notes/p0-dataset-closeout-2026-10-28.md`。
+  - **遗留（均为代码改动，已另立待确认）**：空包改 400 拦、`insertOn` 绕过校验的口子、清单页裸 500 包成 400 —— 见本文件下方两段 P1。
+
+---
+
+## [P1] 渠道预设包 · 5 个代码执法点待拍板（2026-10-28）
+
+- **背景**：`docs/preset-pack-format.md` v0.2（PR #64）已把数据集的字段口径写死，但其中「缺段 / 拼错键 / 数值填美元 / 误挂价格源」四类错在**同步阶段完全没有声音**（S2、S5、S8）。Core 只读核实后点名 5 个执法点；这份清单只登记，**今晚不写代码**，等 spencer 拍板后再排期。
+- **验收标准**（每条独立可验收）：
+  1. `channel/service.go:359-385` 的 `materializeFromProtocol` 在落库前调用 `billing.ValidateRates`，失败即 `return error` —— 因 `channelprotocol/service.go` 的 `Sync` 已在 `store.WithTx` 内，可整包回滚；效果：S2/S3 从静默升为同步失败。
+  2. `channelprotocol/source.go:36` 的 `GatewayBlock` 与 `channelprotocol/model.go:97` 的 `ModelGateway` 补 `costCurrency` 字段（`json:"costCurrency"`，字符串），并在 `toChannelProtocol` 校验空值 / 非 `"CNY"`；效果：`costCurrency` 由纯标注变为执法点。
+  3. `billing/rates.go:93` 的 `WireRates.UnmarshalJSON` **只在预设解析入口**对未知键加严（拒绝）；**不得**改动管理端既有 Pascal/snake 双向兼容；效果：拼错键（`Cache_Read` / `inputTokens`）立刻报错。
+  4. `billing/service.go:300-302` 的 `cerr`（`ComputeCredits` 成本侧错误被 `err == nil` 吞掉）补一条 warn 日志，带 model / channel；效果：成本积分静默为 0 可被发现。
+  5. 文档口径四条（V8 / S2 / S5 / S8 与 9.1「数值必须是人民币字面量」）已写进 `docs/preset-pack-format.md` v0.2，作为兰台冻结 Schema 的依据；本条无需改代码，仅确认口径。
+- **约束**：
+  - 纯后端改动，走特性分支 + PR；**不合入 main**（合入权在 spencer）。
+  - 第 3 条**只能**在预设解析入口加严，改动 `UnmarshalJSON` 本身会波及管理端与历史数据兼容，属回归高风险。
+  - 不改计费公式、不动 `billing.r` / `billing.cny_rate` 语义。
+- **状态**：待确认（需 spencer 拍板；今晚不写代码）
+- **负责人**：待定（Core 排期；口径由 Ark 维护）
+- **交付记录**：
+  - 口径正本：`docs/preset-pack-format.md` v0.2 §11.1 / §11.2 / §11.3，PR #64；
+  - 执法点编号对齐：E1≈第1条、E2≈第2条、E3≈第3条、E4≈第4条、E5≈第5条（文档）、E6=附带建议（无协议模型 `continue` 加 warn）。
+
+---
+
+## [P1] 步骤 3 验收回写的 3 个代码执法点（2026-10-28）
+
+- **背景**：Gate 在 `lingshu_test` 跑完步骤 3 拉取验收（通过：`sync {"confirm":true}` → 200 / Applied=40 / Pending=[] / Stale=0，二次 sync 幂等，`costRates` 与包逐位一致、无二次换算、无静默 0）。验收同时暴露 3 个代码侧问题，均为**只登记不修**；涉及 Go 改动，**今晚不写代码**，等 spencer 拍板。证据：`notes/pack-step3-acceptance.md`。
+- **验收标准**（可分别验收）：
+  1. **P1 空包直接 400 拦**：`POST /api/v1/admin/channel-protocols/sync` 在包解析出 **0 个 provider** 时返回 400 + 可读文案，**不得**进入 Sync 事务。现状实测：空包 `{}` → HTTP 200 / Code=0 / Applied=0 / 40 条 ACTIVE 全翻 `STALE`（正本 §11.1 V9 已按实测改写），只有 `Pending` 里能看到痕迹——对管理员等于"静默事故"。
+  2. **P1 `insertOn` 绕过校验（校验口子）**：新增 provider 走 `insertOn` 时不经过 `validate()`，带 `passthroughMode:"bogus"` 的**新条目能 200 落库**；只有**已存在条目**走 `overwriteFromPreset` 才会 400 并整包回滚。要求：新建与覆盖两条路径的校验口径一致（`channelprotocol/service.go` 的 Sync 分支 + `insertOn`）。
+  3. **P2 `pack_url` 指向非包 JSON 的错误可读性**：现在 `latest.json` 这类清单页会回**裸 500「服务器内部错误」**（`channelprotocol/handler.go:49-56` 的兜底分支，因为 `fetchPack` 返回的是普通 error 而非 `APIError`）。状态码安全（数据不动），但看不出原因。建议：包成 400 + 原文（如「解析预设包 JSON 失败：期望 provider 映射，实际是清单页」）。
+- **约束**：
+  - 第 1 条会改变 `Sync` 对空包的语义（从「成功但翻 STALE」变「拒绝」），需确认**首启空包**场景（`existing` 为空时无害）仍可放行或一并拒绝。
+  - 第 2 条修完要回归「已存在条目 400 回滚」不变（事务原子性不能退化）。
+  - 第 3 条只改错误包装，不改 HTTP 状态语义之外的行为。
+- **状态**：待确认（需 spencer 拍板；涉及代码改动，今晚不写代码）
+- **负责人**：待定（Core 排期；口径由 Ark 维护）
+- **交付记录**：
+  - 正本口径：`docs/preset-pack-format.md` §11.1 V9（实测）、§0.1 F3 第 ④ 种形态；
+  - 验收证据与全部细节：`notes/pack-step3-acceptance.md`（Gate 产出）。
