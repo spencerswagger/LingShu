@@ -569,7 +569,7 @@ R = billing.r（默认 10000）
    ```
 
    - **误包成 `{"Pack": {…}}` 会怎样**（实测 2026-10-30）：解出来是一条键为 `"Pack"`、`id`/`name` 全空的 provider，`validate` 因「名称不能为空」不通过 → **计入 `Warnings` 并跳过**（`channelprotocol/service.go:548-551`）。响应仍是 **HTTP 200 / `Code=0`**，但 `Created=0`、`Warnings` 里出现「渠道协议 "": 渠道协议名称不能为空」——**看到这个文案就回来查是不是多包了一层**（不是 400）。
-   - 响应信封：`{"Code":0,"Message":"","RequestID":"…","Data":{"Created":N,"Skipped":M,"Warnings":[…]}}`。
+   - 响应信封（**成功路径 `Message` 恒为 `"ok"`**，见 `internal/pkg/resp/resp.go:86`）：`{"Code":0,"Message":"ok","RequestID":"…","Data":{"Created":N,"Skipped":M,"Warnings":[…]}}`。**可读的失败/跳过明细只在 `Warnings` 里**——典型就是上面那条「误包 = HTTP 200 + `Created=0` + `Warnings`『渠道协议名称不能为空』」：光看 `Message` 是看不出问题的。
 
 ## 13. 新字段兼容性结论（`offers`，spencer 要求验证）
 
@@ -606,6 +606,7 @@ R = billing.r（默认 10000）
 | v0.1 | 2026-10-16 | 首版：v1 对齐 + `gateway{baseUrl,protocols,requestHeaders}` |
 | v0.2 草案 | 2026-10-28 | ① 补 `gateway.costRates` 正式口径（此前代码已支持但文档缺失）与 `costCurrency`；② 定价改为**人民币**口径并给倍率→积分算式与样例；③ 新增 `gateway.offers` 优惠字段位（兼容性已验证，见 13）；④ 各字段补**必填性 / 灵枢消费性**两列；⑤ 新增枚举容忍表（10）、校验规则（11）、已知限制（12）；⑥ 明确数据集 URL 与 `sync.price_source_url` 分离（9.4） |
 | v0.2 草案 rev.1 | 2026-10-28 | 按 Core 只读核实结果修订三处**事实性错误**：① 9.1 更正「无大小写转换点」——`WireRates.UnmarshalJSON` 就是转换点，真正的坑是拼错键被原样保留 + 物化路径不校验；② 6.5 / S5 更正「缺 `costCurrency` → 虚低 6.8 倍」——代码全无币种概念，该字段纯标注；风险在**数值**填了美元（9.1 新增「数值」硬约束）；③ 9.4 补挂错 URL 的两种后果（静默无效 / 虚高 6.8）；④ 新增 V8（`externalModelID` 必须字符串，否则整包解析失败）与 11.3（5 个建议执法点，未实现） |
+| v0.2 草案 rev.10 | 2026-10-30 | Owl 复审 P3：§12.5 响应信封示例 `Message` 由 `""` 更正为 `"ok"`（`resp.OK` 实现即 `Message:"ok"`，`internal/pkg/resp/resp.go:86`），并补一句「成功路径 `Message` 恒为 `ok`，失败/跳过明细只看 `Warnings`」 |
 | v0.2 草案 rev.9 | 2026-10-30 | Owl 复审 P2×3 + P3×1：① §12.5 更正 `POST /import` 为**裸包体**（原写「外包 `Pack`」是错的），并说明误包时的真实表现（200 + `Warnings`「名称不能为空」，非 400）；② §11.1 补适用情形——**已存在条目**走 `validate` 才 400 回滚，**首次接入**走 `insertOn` 绕过校验、坏 `baseUrl`/`passthroughMode`/多 `default` 会 200 落库（已知口子，未修复）；③ F6 限定为**翻译型/网关型供应商**，原厂直连只列原生协议，`google` 家族灵枢无对应协议不可硬凑；④ 计数 5 项 → **6 项**（历史条目保留原样并加注） |
 | v0.2 草案 rev.8 | 2026-10-30 | 官方端点更正（兰台冻结前）：新增 **§0.1 F6「同档多协议 = 同一套模型」**（官方「Every API serves every paid and Go text model」，含 OpenCode 2 条/4 条两种可照抄写法），**§15 示例 baseUrl** 由 `…/zen/v1` 改为 `…/inference/openai/v1`（并补 per-protocol baseUrl、`doc` 换 v2 链接），§6.1 `baseUrl` 行加交叉引用 |
 | v0.2 草案 rev.7 | 2026-10-28 | 兰台方案 A 的 302 指针链路实测回写：F3 新增 **✅ 可用形态（3xx 指针 URL）**（1 跳成功、sha256 与包本体逐字节一致、随后 sync 40/0/0）、**判定口诀**（`curl -I` 看 3xx 还是 200 清单）、**边界**（别填 `manifest.json`）；把第 ④ 形态的举例从 `latest.json` 改为 `manifest.json`（前者已改 302） |
