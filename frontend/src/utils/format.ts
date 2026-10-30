@@ -60,3 +60,29 @@ export function toRFC3339CN(d: Date): string {
     d.getMinutes(),
   )}:${pad(d.getSeconds())}+08:00`
 }
+
+// 大额计数紧凑格式化（K/M/B）：统计页三处吞吐量（首屏 / 模型广场 / 实时区）与
+// 各处 Token 展示共用同一套规则，不要在各组件里各写一份。
+//   1234 → 1.23K   1234567 → 1.23M   865.4 → 865   12.34 → 12.3   0.5 → 0.50
+//   999.6 → 1.00K（四舍五入会进位到 1000 的值直接升档，不出现「1000」这种未缩写形态）
+export function fmtCompact(n: number): string {
+  const v = Number(n ?? 0)
+  if (!Number.isFinite(v)) return '—'
+  if (v === 0) return '0'
+  const abs = Math.abs(v)
+  if (abs < 999.5) {
+    if (abs >= 1) return v.toFixed(abs >= 100 ? 0 : 1)
+    return v.toFixed(2)
+  }
+  let base = 1e3
+  let suffix = 'K'
+  if (abs >= 999.5e3) {
+    base = 1e6
+    suffix = 'M'
+  }
+  if (abs >= 999.5e6) {
+    base = 1e9
+    suffix = 'B'
+  }
+  return `${(v / base).toFixed(2)}${suffix}`
+}
