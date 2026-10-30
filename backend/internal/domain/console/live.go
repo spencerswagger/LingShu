@@ -1,4 +1,7 @@
-// live.go 统计页「实时区」：我的会话（请求中 + 最近 5 分钟活跃）与在线用户（所选范围内有请求）。
+// live.go 统计页「实时区」：我的会话（**仅请求中**）与在线用户（所选范围内有请求）。
+//
+// 会话准入（spencer 拍板）：列表准入恒为 `Inflight > 0`。请求刚结束的会话只进
+// `RecentlyExited` 供前端做淡出过渡，**不进主列表、不进任何计数与聚合**。
 //
 // 安全边界（**字段层面**收口，不靠前端自觉）：
 //   - 本文件只输出「运行态计数与聚合值」：会话 ID/名称、模型名、上下文长度、本轮 Token、
@@ -9,8 +12,9 @@
 // 数据来源：
 //   - 「请求中」以 router.SessionRegistry 内存计数为准（Inflight > 0，由网关在包住上游转发时
 //     +1/-1），DB 的 sessions 表是投影、不含该运行时字段，不能用来判「正在请求」。
-//   - 「最近 5 分钟内有请求」同样以注册表为准（LastActive，网关每次请求续期）：
-//     空闲会话仍留在注册表里直到 TTL 过期，不能只看 Inflight，否则刚发完请求就掉出列表。
+//   - 「刚结束请求」同样以注册表为准（LastActive，网关每次请求续期）：空闲会话仍留在注册表里
+//     直到 TTL 过期，这里用它填 `RecentlyExited`（淡出窗口 liveFadeWindow）——**仅展示语义**，
+//     不改变准入，也不参与任何计数。
 //   - 「在线用户」改为查 DB（billing_records）：所选范围（页面右上角 24h/7天/30天/90天/自定义）
 //     内有过请求的用户全集，`UsersTotal` 与 `Users` 列表**同一查询同源**（总数=未截断行数）。
 //     只看注册表会漏掉「范围内活跃但此刻空闲」的用户（v4 口径修正）。
@@ -54,9 +58,12 @@ const (
 	// 同时避免按 session_id 扫出整段历史（重会话可达上万行）。
 	liveRecentLookback = 7 * 24 * time.Hour
 
-	// liveActiveSessionLookback 「我的会话」的第二类入选条件：最近 5 分钟内有请求。
-	// 与「请求中」（Inflight>0）取并集——只看 Inflight 会让刚发完一轮的会话立刻消失。
-	liveActiveSessionLookback = 5 * time.Minute
+	// liveFadeWindow 淡出窗口：请求结束后会话仍在注册表里保留一会儿，前端可据此做「淡出再消失」的
+	// 视觉过渡。**它只用于 `RecentlyExited` 这一展示数组，绝不是列表准入条件**——
+	// 「我的会话」准入恒为 `Inflight > 0`（spencer 拍板；口径与 main 一致）。
+	liveFadeWindow = 5 * time.Minute
+	// liveMaxRecentlyExited 淡出数组的行数上限：纯展示用途，不参与任何计数与聚合。
+	liveMaxRecentlyExited = 20
 	// liveDefaultRange 在线用户默认统计范围：对齐页面右上角默认预设「近 24h」。
 	liveDefaultRange = 24 * time.Hour
 	// liveMaxRangeSpan 在线用户统计范围上限（与 dashboard 一致，366 天）。
@@ -152,13 +159,13 @@ func parseLiveParams(q url.Values, now time.Time) (liveParams, error) {
 	return p, nil
 }
 
-// liveSessionItem 「我的会话」一行：请求中或最近 5 分钟活跃的会话及其运行态。
+// liveSessionItem 「我的会话」一行：**仅请求中**（`Inflight > 0`）的会话及其运行态。
 // 刻意不含：消息、提示词、模型输入输出、原始 x-session-id、渠道密钥（前端不需要，也就不给）。
 type liveSessionItem struct {
 	ID           string  `json:"ID"`           // 会话指纹（不是客户端原始 x-session-id）
 	Name         string  `json:"Name"`         // 会话可读名（可能为空，前端用 ID 前缀兜底）
 	Model        string  `json:"Model"`        // 对外模型名
-	Inflight     int     `json:"Inflight"`     // 进行中请求数（0 = 本刻空闲，但 5 分钟内有过请求）
+	Inflight     int     `json:"Inflight"`     // 进行中请求数（进列表即 > 0）
 	ContextUsed  int64   `json:"ContextUsed"`  // 上下文长度：最近一次请求的输入 Token（input+cache_read）
 	ContextLimit int64   `json:"ContextLimit"` // 上下文上限；平台未配置模型上限时恒为 0（= 未知）
 	RoundTokens  int64   `json:"RoundTokens"`  // 本轮 Token：最近一次已完成请求的总 Token（三段求和）
@@ -190,6 +197,19 @@ type liveUserItem struct {
 	Daily []int64 `json:"Daily"`
 }
 
+// liveExitedItem 刚刚结束请求、仍处于淡出窗口（liveFadeWindow）的会话。
+//
+// **纯展示字段，不是准入条件**：它只供前端把已经消失的卡片做「淡出再移除」的过渡。
+// 这一数组不参与 SessionsTotal / UsersTotal / Truncated / 用户聚合 / 任何金额与 Token 求和，
+// 也就是说「实时区有多少会话/多少用户」永远不会被淡出项抬高。
+type liveExitedItem struct {
+	ID       string `json:"ID"`       // 会话指纹
+	Name     string `json:"Name"`     // 会话可读名（可能为空）
+	Model    string `json:"Model"`    // 对外模型名
+	ExitedAt string `json:"ExitedAt"` // 淡出起点（= 该会话最近一次活跃/请求结束时刻，RFC3339）
+	Calls    int64  `json:"Calls"`    // 会话累计请求数（仅供卡片收尾展示，不参与任何合计）
+}
+
 // liveResp 实时区响应（admin/dev 同构，Scope 区分）。
 type liveResp struct {
 	Scope         string `json:"Scope"`         // global | self
@@ -203,7 +223,7 @@ type liveResp struct {
 	DailyFrom   string `json:"DailyFrom"`
 	DailyTo     string `json:"DailyTo"`
 	DailyPoints int    `json:"DailyPoints"`
-	// SessionsTotal 我的会话总数（未截断）= 请求中 + 最近 5 分钟内有请求。
+	// SessionsTotal 我的会话总数（未截断）= **仅请求中**（Inflight > 0）。
 	SessionsTotal int `json:"SessionsTotal"`
 	// UsersTotal 在线用户总数 = 所选范围内有过请求的用户数（**与 Users 列表同一查询同源**，未截断）。
 	UsersTotal     int               `json:"UsersTotal"`
@@ -211,6 +231,11 @@ type liveResp struct {
 	UsersTruncated bool              `json:"UsersTruncated"` // 用户列表是否被上限截断
 	Sessions       []liveSessionItem `json:"Sessions"`
 	Users          []liveUserItem    `json:"Users"`
+	// RecentlyExited 淡出窗口内已结束请求的会话（**纯展示，不参与任何计数/聚合**）。
+	// 前端用法：收到数组后把对应卡片标记为「淡出」，`ExitedAt + FadeWindowSeconds` 之后移除节点；
+	// 它们从来不在 Sessions 里，所以不要用它去算会话数或用户数。
+	RecentlyExited    []liveExitedItem `json:"RecentlyExited"`
+	FadeWindowSeconds int              `json:"FadeWindowSeconds"`
 }
 
 // liveSessionAgg 单个会话的聚合结果。
@@ -515,7 +540,8 @@ func liveUserNames(ctx context.Context, db *sql.DB, ids []int64) map[int64]strin
 //   - userID 非 nil 时只统计该用户（开发端「我的会话」/「我」）。
 //
 // 「我的会话」与「在线用户」是**两套口径**，各自独立取数：
-//   - 我的会话：注册表里 未关闭 且（Inflight>0 或 最近 liveActiveSessionLookback 内有请求）；
+//   - 我的会话：注册表里 未关闭 **且 Inflight > 0**（准入只看请求中，spencer 拍板）；
+//     刚结束请求的会话只进 RecentlyExited 做淡出展示，**不进列表、不进任何计数**；
 //   - 在线用户：billing_records 里所选范围（p.From~p.To）内有请求的用户全集（DB 为准）。
 //     两者不再互相推导——用户没有请求中的会话，只要范围内有请求，也仍然算在线。
 func buildLiveStats(ctx context.Context, db *sql.DB, reg *router.SessionRegistry, now time.Time,
@@ -531,38 +557,45 @@ func buildLiveStats(ctx context.Context, db *sql.DB, reg *router.SessionRegistry
 	}
 	dayKeys := liveDailyKeys(p.From, p.To)
 	out := liveResp{
-		Scope:         scope,
-		SampledAt:     now.Format(time.RFC3339),
-		WindowMinutes: p.WindowMinutes,
-		SparkPoints:   p.SparkPoints,
-		RangeFrom:     p.From.Format(time.RFC3339),
-		RangeTo:       p.To.Format(time.RFC3339),
-		DailyPoints:   len(dayKeys),
-		Sessions:      []liveSessionItem{},
-		Users:         []liveUserItem{},
+		Scope:             scope,
+		SampledAt:         now.Format(time.RFC3339),
+		WindowMinutes:     p.WindowMinutes,
+		SparkPoints:       p.SparkPoints,
+		RangeFrom:         p.From.Format(time.RFC3339),
+		RangeTo:           p.To.Format(time.RFC3339),
+		DailyPoints:       len(dayKeys),
+		Sessions:          []liveSessionItem{},
+		Users:             []liveUserItem{},
+		RecentlyExited:    []liveExitedItem{},
+		FadeWindowSeconds: int(liveFadeWindow / time.Second),
 	}
 	if len(dayKeys) > 0 {
 		out.DailyFrom = dayKeys[0]
 		out.DailyTo = dayKeys[len(dayKeys)-1]
 	}
 
-	// 1) 我的会话：请求中 + 最近 5 分钟内有请求（注册表内存为准），最近活跃优先。
+	// 1) 我的会话：**仅请求中**（Inflight > 0，注册表内存为准），最近活跃优先。
 	// 未装配注册表时只跳过这一段，**不**影响下一步的在线用户（DB 口径不需要注册表）。
 	var sessions []*router.Session
 	if reg != nil {
-		activeSince := now.Add(-liveActiveSessionLookback)
 		sessions = make([]*router.Session, 0, 16)
+		fadeSince := now.Add(-liveFadeWindow)
+		exited := make([]*router.Session, 0, 8)
 		for _, s := range reg.ListAll() {
 			if s == nil || s.Closed {
-				continue
-			}
-			if s.Inflight <= 0 && s.LastActive.Before(activeSince) {
 				continue
 			}
 			if userID != nil && s.UserID != *userID {
 				continue
 			}
-			sessions = append(sessions, s)
+			if s.Inflight > 0 {
+				sessions = append(sessions, s)
+				continue
+			}
+			// 已结束请求：只收进淡出数组（且必须落在淡出窗口内），绝不进 sessions。
+			if !s.LastActive.Before(fadeSince) {
+				exited = append(exited, s)
+			}
 		}
 		sort.Slice(sessions, func(i, j int) bool {
 			if !sessions[i].LastActive.Equal(sessions[j].LastActive) {
@@ -570,6 +603,24 @@ func buildLiveStats(ctx context.Context, db *sql.DB, reg *router.SessionRegistry
 			}
 			return sessions[i].SessionID < sessions[j].SessionID
 		})
+		sort.Slice(exited, func(i, j int) bool {
+			if !exited[i].LastActive.Equal(exited[j].LastActive) {
+				return exited[i].LastActive.After(exited[j].LastActive)
+			}
+			return exited[i].SessionID < exited[j].SessionID
+		})
+		if len(exited) > liveMaxRecentlyExited {
+			exited = exited[:liveMaxRecentlyExited]
+		}
+		out.RecentlyExited = make([]liveExitedItem, 0, len(exited))
+		for _, s := range exited {
+			out.RecentlyExited = append(out.RecentlyExited, liveExitedItem{
+				ID:       s.SessionID,
+				Name:     s.Name,
+				Model:    s.Model,
+				ExitedAt: s.LastActive.Format(time.RFC3339),
+			})
+		}
 	}
 	out.SessionsTotal = len(sessions)
 	if len(sessions) > liveMaxSessions {

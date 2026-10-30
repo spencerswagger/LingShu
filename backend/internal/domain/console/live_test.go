@@ -481,24 +481,111 @@ func TestBuildLiveStats_SessionRecencyWindow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildLiveStats: %v", err)
 	}
-	if out.SessionsTotal != 2 || len(out.Sessions) != 2 {
-		t.Fatalf("会话入选口径错: total=%d rows=%d", out.SessionsTotal, len(out.Sessions))
+	// 准入只看 Inflight>0：只有 inflight 进列表，计数也只算它。
+	if out.SessionsTotal != 1 || len(out.Sessions) != 1 {
+		t.Fatalf("会话准入应严格为 Inflight>0: total=%d rows=%d", out.SessionsTotal, len(out.Sessions))
 	}
 	got := map[string]int{}
 	for _, s := range out.Sessions {
 		got[s.ID] = s.Inflight
 	}
-	if _, ok := got["inflight"]; !ok {
-		t.Fatalf("请求中的会话应入选: %v", got)
+	if inflight, ok := got["inflight"]; !ok || inflight != 1 {
+		t.Fatalf("请求中的会话应入选且 Inflight=1: %v", got)
 	}
-	if inflight, ok := got["idle-4min"]; !ok || inflight != 0 {
-		t.Fatalf("5 分钟内活跃的空闲会话应入选且 Inflight=0: %v", got)
+	if _, ok := got["idle-4min"]; ok {
+		t.Fatalf("已结束请求的会话不得进入主列表（哪怕 5 分钟内活跃）: %v", got)
 	}
-	if _, ok := got["idle-6min"]; ok {
-		t.Fatalf("超过 5 分钟的空闲会话不应入选: %v", got)
+	// 淡出数组：只收淡出窗口内已结束请求的会话，且不计入任何计数。
+	faded := map[string]bool{}
+	for _, e := range out.RecentlyExited {
+		faded[e.ID] = true
+		if e.ExitedAt == "" {
+			t.Fatalf("淡出项必须带 ExitedAt: %+v", e)
+		}
 	}
-	if _, ok := got["closed"]; ok {
-		t.Fatalf("已关闭会话不应入选: %v", got)
+	if !faded["idle-4min"] {
+		t.Fatalf("4 分钟前结束的会话应进 RecentlyExited: %v", faded)
+	}
+	if faded["idle-6min"] {
+		t.Fatalf("超过淡出窗口的会话不应进 RecentlyExited: %v", faded)
+	}
+	if faded["inflight"] || faded["closed"] {
+		t.Fatalf("请求中/已关闭会话不应进 RecentlyExited: %v", faded)
+	}
+	if out.SessionsTotal != len(out.Sessions) {
+		t.Fatalf("SessionsTotal 必须等于主列表行数（不被淡出项抬高）: %d vs %d", out.SessionsTotal, len(out.Sessions))
+	}
+	if out.FadeWindowSeconds != int(liveFadeWindow/time.Second) {
+		t.Fatalf("FadeWindowSeconds=%d, want %d", out.FadeWindowSeconds, int(liveFadeWindow/time.Second))
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("未满足的期望: %v", err)
+	}
+}
+
+// TestBuildLiveStats_FadingNotAdmittedAndNotCounted 断言 spencer 拍板后的口径：
+// 准入严格 `Inflight > 0`；淡出窗口内的已结束会话只进 `RecentlyExited`，
+// **不进主列表、不进 SessionsTotal、不进会话聚合查询**（查询参数里只有 inflight 会话的 ID）。
+func TestBuildLiveStats_FadingNotAdmittedAndNotCounted(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+	cur := liveNow().Add(-10 * time.Minute)
+	reg := router.NewSessionRegistry(func() time.Time { return cur })
+
+	attach := func(id string, userID int64) {
+		if ok, _ := reg.Attach(&router.Session{
+			SessionID: id, UserID: userID, Model: "gpt-4o",
+			ExpireAt: liveNow().Add(time.Hour),
+		}, 100); !ok {
+			t.Fatalf("attach %s 失败", id)
+		}
+	}
+	attach("old", 7) // 10 分钟前结束 → 淡出窗口外，两个数组都不进
+	cur = liveNow().Add(-4 * time.Minute)
+	attach("fade-b", 8) // 4 分钟前结束 → 只进 RecentlyExited
+	cur = liveNow().Add(-2 * time.Minute)
+	attach("fade-a", 7) // 2 分钟前结束 → 只进 RecentlyExited（且排在 fade-b 前）
+	cur = liveNow()
+	attach("inflight", 7) // 请求中 → 唯一进主列表的会话
+	reg.BeginRequest("inflight")
+
+	// 会话聚合只允许收到 "inflight" 一个 ID：淡出项若混进来，WithArgs 会直接不匹配。
+	mock.ExpectQuery(regexp.QuoteMeta(`GROUP BY session_id`)).
+		WithArgs("inflight", sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"session_id", "calls", "credits", "total_tokens", "win_tokens"}).
+			AddRow("inflight", int64(1), float64(1), int64(100), int64(100)))
+	mock.ExpectQuery(regexp.QuoteMeta(`row_number() OVER (PARTITION BY session_id`)).
+		WithArgs("inflight", 12, sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"session_id", "rn", "tokens_total", "ctx_tokens"}).
+			AddRow("inflight", 1, int64(100), int64(80)))
+	mock.ExpectQuery(regexp.QuoteMeta(`count(DISTINCT session_id)`)).
+		WillReturnRows(sqlmock.NewRows([]string{"user_id", "calls", "active_sessions",
+			"win_tokens", "win_credits", "range_tokens", "range_credits"}).
+			AddRow(int64(7), int64(1), int64(1), int64(100), float64(1), int64(100), float64(1)))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, username, nickname FROM users`)).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "username", "nickname"}).AddRow(int64(7), "dev", ""))
+	mock.ExpectQuery(regexp.QuoteMeta(`date_trunc('minute'`)).
+		WillReturnRows(sqlmock.NewRows([]string{"user_id", "minute", "tokens"}))
+	mock.ExpectQuery(regexp.QuoteMeta(`date_trunc('day'`)).
+		WillReturnRows(sqlmock.NewRows([]string{"user_id", "day", "tokens"}))
+
+	p := liveParams{WindowMinutes: 60, Window: 60 * time.Minute, SparkPoints: 12, Limit: 20,
+		From: liveNow().Add(-24 * time.Hour), To: liveNow()}
+	out, err := buildLiveStats(context.Background(), db, reg, liveNow(), nil, "global", p)
+	if err != nil {
+		t.Fatalf("buildLiveStats: %v", err)
+	}
+	if out.SessionsTotal != 1 || len(out.Sessions) != 1 || out.Sessions[0].ID != "inflight" {
+		t.Fatalf("主列表只应有请求中的会话: total=%d rows=%+v", out.SessionsTotal, out.Sessions)
+	}
+	if len(out.RecentlyExited) != 2 || out.RecentlyExited[0].ID != "fade-a" || out.RecentlyExited[1].ID != "fade-b" {
+		t.Fatalf("淡出数组应只含窗口内两个已结束会话且按最近活跃倒序: %+v", out.RecentlyExited)
+	}
+	if len(out.Users) != 1 || out.Users[0].Sessions != 1 {
+		t.Fatalf("用户行的「请求中会话数」只数 inflight: %+v", out.Users)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("未满足的期望: %v", err)
