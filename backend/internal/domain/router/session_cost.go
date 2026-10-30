@@ -42,12 +42,14 @@ type SessionCostDecision struct {
 	Reason         string
 }
 
-// remainingTurns 预计剩余轮数。
+// remainingTurns 预计剩余轮数：clamp(RemainingA − RemainingB×k, RemainingMin, RemainingMax)，
+// k = 本会话已完成轮数（SessionRegistry.Turns）。
 //
-// 需求已定：**不再按会话位置 k 预测**，取固定值——默认配置 RemainingA=10、RemainingB=0，
-// 即 clamp(10 − 0×k, RemainingMin, RemainingMax) ≡ 10。参数保留以便运维微调，或将来恢复经验式
-// （把 RemainingB 设为正值即回到 clamp(a − b·k, min, max) 的语义）。
-// k 仅用于决策产物观测，不参与本函数的结果（RemainingB=0 时）。
+// 当前默认（SessionCostConfig / 种子 routing.session_cost）：RemainingA=10、RemainingB=1、RemainingMin=1、RemainingMax=20，
+// 即剩余轮数**按真实轮次递减**并夹到 1..20（k=0→10、k=5→5、k≥9→1），**不再恒等于 10**。
+// 为什么不再取固定值：写死 10 会让第 29 轮的会话仍被判「还有 10 轮可回本」，只要目标渠道回本快就每轮都切，
+// 每切一次丢一次上游 prefix cache（见 cost_config.go 的默认值注释与滞回说明）。
+// 参数仍可运维微调：把 RemainingB 设为 0 才会回到「恒定 RemainingA」的老语义。
 func remainingTurns(k int, cfg SessionCostConfig) int {
 	v := cfg.RemainingA - cfg.RemainingB*float64(k)
 	n := int(v)

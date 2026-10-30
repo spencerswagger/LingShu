@@ -30,8 +30,9 @@ type Session struct {
 	// 进程内存字段（不落库）：崩溃恢复后归零即冷却失效，属安全方向（宁可多切一次也不长期冻结）。
 	LastSwitchAt time.Time
 	// Turns 本会话已成功完成的轮数（Renew 时 +1；进程内存字段，不落库）。
-	// 用途：① 决策产物事件的 Turn 字段（可按轮次回放）；② 若将来恢复「按会话位置 k 预测剩余轮数」的经验式，
-	// 以此为输入。当前剩余轮数为固定值（SessionCostConfig.RemainingA/B），Turns 不参与门控计算。
+	// 用途：① 决策产物事件的 Turn 字段（可按轮次回放）；② 作为会话位置 k 参与剩余轮数计算
+	//（router.remainingTurns：clamp(RemainingA − RemainingB×k, 1, 20)，默认按真实轮次递减），
+	// 因此 Turns 会通过「剩余轮数 vs 回本轮数」间接影响中途切换门控。
 	Turns    int
 	Closed   bool       // 已关闭：不再被路由命中、释放并发槽，但保留在列表（管理可见）
 	ClosedAt *time.Time // 关闭时间（nil=未关闭）

@@ -268,7 +268,7 @@ func sessionCostProvider(t *testing.T, enabled bool) *SessionCostProvider {
 	t.Helper()
 	raw := []byte(`{"enabled":false}`)
 	if enabled {
-		raw = []byte(`{"enabled":true,"remaining_a":12,"remaining_b":1,"remaining_min":1,"remaining_max":20,"min_remaining":1,"cooldown_sec":0}`)
+		raw = []byte(`{"enabled":true,"mid_switch":false,"remaining_a":12,"remaining_b":1,"remaining_min":1,"remaining_max":20,"min_remaining":1,"cooldown_sec":0}`)
 	}
 	return NewSessionCostProvider(newFakeConfigSource(map[string][]byte{cfgSessionCost: raw}))
 }
@@ -750,7 +750,7 @@ func TestMidSwitch_EngineKeepsAffinityWhenMidSwitchOff(t *testing.T) {
 	rates1, rates2 := midSwitchRates()
 	tok := startPickSample()
 
-	const offJSON = `{"enabled":true,"remaining_a":20,"remaining_b":0,"remaining_min":1,"remaining_max":20,"min_remaining":1,"cooldown_sec":0}`
+	const offJSON = `{"enabled":true,"mid_switch":false,"remaining_a":20,"remaining_b":0,"remaining_min":1,"remaining_max":20,"min_remaining":1,"cooldown_sec":0}`
 	e, sess := newMidSwitchEngine(t, offJSON, rates1, rates2, 100, 100, 1)
 	key := "s-off"
 	attachTo(t, sess, key, 21, "int2")
@@ -849,7 +849,7 @@ func TestShadow_EngineEmitsAssumptionWhenMidSwitchOff(t *testing.T) {
 	rates1, rates2 := midSwitchRates()
 	tok := startPickSample()
 
-	const offJSON = `{"enabled":true,"shadow_enabled":true,"remaining_a":20,"remaining_b":0,"remaining_min":1,"remaining_max":20,"min_remaining":1,"cooldown_sec":0}`
+	const offJSON = `{"enabled":true,"mid_switch":false,"shadow_enabled":true,"remaining_a":20,"remaining_b":0,"remaining_min":1,"remaining_max":20,"min_remaining":1,"cooldown_sec":0}`
 	e, sess := newMidSwitchEngine(t, offJSON, rates1, rates2, 100, 100, 1)
 	sink := &fakeCostEventSink{}
 	e.SetCostEventSink(sink)
@@ -933,7 +933,7 @@ func TestShadow_NotEmittedWhenNoWouldSwitch(t *testing.T) {
 	rates1, rates2 := midSwitchRates()
 	tok := startPickSample()
 
-	const offJSON = `{"enabled":true,"shadow_enabled":true,"remaining_a":20,"remaining_b":0,"remaining_min":1,"remaining_max":20,"min_remaining":1,"cooldown_sec":0}`
+	const offJSON = `{"enabled":true,"mid_switch":false,"shadow_enabled":true,"remaining_a":20,"remaining_b":0,"remaining_min":1,"remaining_max":20,"min_remaining":1,"cooldown_sec":0}`
 	e, sess := newMidSwitchEngine(t, offJSON, rates1, rates2, 100, 100, 1)
 	sink := &fakeCostEventSink{}
 	e.SetCostEventSink(sink)
@@ -960,7 +960,7 @@ func TestShadow_NotEmittedByDefault(t *testing.T) {
 	rates1, rates2 := midSwitchRates()
 	tok := startPickSample()
 
-	const offJSON = `{"enabled":true,"remaining_a":20,"remaining_b":0,"remaining_min":1,"remaining_max":20,"min_remaining":1,"cooldown_sec":0}`
+	const offJSON = `{"enabled":true,"mid_switch":false,"remaining_a":20,"remaining_b":0,"remaining_min":1,"remaining_max":20,"min_remaining":1,"cooldown_sec":0}`
 	e, sess := newMidSwitchEngine(t, offJSON, rates1, rates2, 100, 100, 1)
 	sink := &fakeCostEventSink{}
 	e.SetCostEventSink(sink)
@@ -998,5 +998,87 @@ func TestSessionCost_DecisionCarriesPaybackLimit(t *testing.T) {
 	start := decideSessionCost(cfg, nil, cand, cr, newIn, out, 0)
 	if start.PaybackLimit != 0 {
 		t.Fatalf("起点无旧渠道，PaybackLimit 应为 0，got %v", start.PaybackLimit)
+	}
+}
+
+// ---- Owl 复审 必改 2：默认参数下的抖动防护（不再写死剩余 10 轮）----
+
+// TestDefaultConfig_RemainingDecaysSoLateTurnDoesNotSwitch 真实轮次递减：
+// 第 29 轮的会话剩余只有 1 轮，回本要 2.56 轮 → 不再被判「可回本」（旧默认 remaining_b=0 时剩余恒 10 → 会切）。
+func TestDefaultConfig_RemainingDecaysSoLateTurnDoesNotSwitch(t *testing.T) {
+	cfg := defaultSessionCostConfig()
+	if got := remainingTurns(0, cfg); got != 10 {
+		t.Fatalf("第 0 轮剩余应为 10，got %d", got)
+	}
+	if got := remainingTurns(5, cfg); got != 5 {
+		t.Fatalf("第 5 轮剩余应为 5，got %d", got)
+	}
+	if got := remainingTurns(29, cfg); got != cfg.RemainingMin {
+		t.Fatalf("第 29 轮剩余应被压到下限 %d，got %d", cfg.RemainingMin, got)
+	}
+
+	// 旧渠道缓存读 0.5 / 新渠道 0.05：回本 ≈ 2.56 轮（>1 且 ≤10，正好卡在「旧默认会切、新默认不切」之间）。
+	oldCh := ChannelCost{Name: "old", CacheRead: 0.5, Input: 1.2, Output: 8, TimeCoeff: 1, CtxCoeff: 1}
+	newCh := ChannelCost{Name: "new", CacheRead: 0.05, Input: 1.2, Output: 8, TimeCoeff: 1, CtxCoeff: 1}
+	const cacheRead, newInput, output = 20000, 1000, 500
+
+	d := decideSessionCost(cfg, &oldCh, newCh, cacheRead, newInput, output, 29)
+	if d.PaybackTurns <= 1 {
+		t.Fatalf("用例构造失败：回本轮数应 >1，got %v", d.PaybackTurns)
+	}
+	if d.Switch {
+		t.Fatalf("第 29 轮剩余 %d ≤ 回本 %.2f 轮，不应切换: %+v", d.RemainingTurns, d.PaybackTurns, d)
+	}
+	// 同一笔账放在第 0 轮（剩余 10 轮）则应当切换：证明「不切」来自剩余轮数递减，而不是回本判据被改坏。
+	if early := decideSessionCost(cfg, &oldCh, newCh, cacheRead, newInput, output, 0); !early.Switch {
+		t.Fatalf("第 0 轮剩余 10 > 回本 %.2f 轮，应切换: %+v", early.PaybackTurns, early)
+	}
+}
+
+// TestDefaultConfig_CooldownSuppressesSwitch 默认 cooldown_sec=300 生效：刚切换过的会话不再立刻再切。
+func TestDefaultConfig_CooldownSuppressesSwitch(t *testing.T) {
+	rates1, rates2 := midSwitchRates()
+	tok := startPickSample()
+
+	// 不写 cooldown_sec / min_improve → 用产品默认（300 秒 / 5%）。
+	const defaultHyst = `{"enabled":true,"mid_switch":true,"remaining_a":10,"remaining_b":1,"remaining_min":1,"remaining_max":20,"min_remaining":1}`
+	e, sess := newMidSwitchEngine(t, defaultHyst, rates1, rates2, 100, 100, 1)
+	key := "s-default-cd"
+	attachTo(t, sess, key, 21, "int2")
+	if s, ok := sess.Lookup(key); !ok {
+		t.Fatal("会话应存在")
+	} else {
+		s.LastSwitchAt = time.Now().Add(-60 * time.Second) // 1 分钟前切过 → 默认 5 分钟内应冷静
+	}
+
+	r, err := e.Route(context.Background(), RouteSpec{
+		ExternalModel: "qw-max", SessionKey: key, SessionTokens: &tok,
+	})
+	if err != nil {
+		t.Fatalf("route: %v", err)
+	}
+	if r.ChannelID != 2 {
+		t.Fatalf("默认冷却期内应保持亲和（ch2），got channel %d", r.ChannelID)
+	}
+}
+
+// TestDefaultConfig_MinImproveGate 默认 min_improve=0.05 生效：改善 ≤5% 不切，>5% 才切。
+func TestDefaultConfig_MinImproveGate(t *testing.T) {
+	cfg := defaultSessionCostConfig()
+	cases := []struct {
+		name      string
+		cur, nw   float64
+		wantAllow bool
+	}{
+		{"改善 3%（<5%）", 1.00, 0.97, false},
+		{"改善 4.9%（<5%）", 1.00, 0.951, false},
+		{"改善 6%（>5%）", 1.00, 0.94, true},
+		{"改善 10%", 1.00, 0.90, true},
+		{"新渠道不更便宜", 1.00, 1.00, false},
+	}
+	for _, c := range cases {
+		if got := hysteresisAllows(c.cur, c.nw, cfg.MinImprove); got != c.wantAllow {
+			t.Fatalf("%s：hysteresisAllows=%v want %v", c.name, got, c.wantAllow)
+		}
 	}
 }

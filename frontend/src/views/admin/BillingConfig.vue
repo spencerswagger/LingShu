@@ -42,6 +42,15 @@ const sessionExpiration = ref<SessionExpirationData>({ default_ttl_minutes: 5, c
 
 // 全局上游响应头白名单（sys_configs 键 gateway.upstream_response_header_whitelist）
 const whitelist = ref<string[]>([])
+
+// 成本页增强视图开关（sys_configs 键 console.cost_multichannel_trace，默认 false）。
+// 只影响成本页两个只读入口（定价曲线多线对比 / 会话渠道轨迹），不参与计费与路由。
+// 只有确实读到过配置（consoleLoaded=true）才会回写，避免一次失败的读取把开关写回 false。
+const multichannelTrace = ref(false)
+const consoleLoaded = ref(false)
+function consolePayload(): { Console?: { MultichannelTrace: boolean } } {
+  return consoleLoaded.value ? { Console: { MultichannelTrace: multichannelTrace.value } } : {}
+}
 // 建议透传的响应头候选（与预设包格式约定保持一致）
 const headerSuggestions = [
   'anthropic-version',
@@ -169,6 +178,11 @@ async function load() {
       turn_tiers: se?.turn_tiers || [],
     }
     whitelist.value = res.Data.UpstreamResponseHeaderWhitelist || []
+    // Console 块可选：老后端没有该块时按关闭处理，且不回写（consoleLoaded 保持 false）
+    if (res.Data.Console && typeof res.Data.Console.MultichannelTrace === 'boolean') {
+      multichannelTrace.value = res.Data.Console.MultichannelTrace
+      consoleLoaded.value = true
+    }
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
   } finally {
@@ -204,6 +218,7 @@ async function onSave() {
       },
       SessionExpiration: sessionExpiration.value,
       UpstreamResponseHeaderWhitelist: whitelist.value,
+      ...consolePayload(),
     })
     ElMessage.success('系统配置已保存')
     await load()
@@ -265,6 +280,7 @@ async function saveFallback() {
       },
       SessionExpiration: sessionExpiration.value,
       UpstreamResponseHeaderWhitelist: whitelist.value,
+      ...consolePayload(),
     })
     ElMessage.success('全局时段/分档默认值已保存')
     fallbackOpen.value = false
@@ -456,6 +472,32 @@ async function saveFallback() {
               <div class="hint">支持直接输入自定义头名回车添加；候选项为常见可透传头。</div>
             </el-form-item>
           </el-form>
+        </div>
+
+        <el-divider />
+
+        <div class="config-block">
+          <div class="block-title">
+            成本页增强视图
+            <el-tooltip
+              content="只控制「成本」页两个只读入口：定价曲线多渠道对比、会话渠道轨迹。关闭时旧接口与页面表现完全不变。"
+              placement="top"
+            >
+              <el-icon class="hint-icon"><QuestionFilled /></el-icon>
+            </el-tooltip>
+          </div>
+          <div class="block-desc">
+            打开后，「成本」页的定价曲线可同图对比多个「渠道 × 内部模型」
+            （接口参数 ChannelModelIDs），会话成本多一块渠道轨迹（真实切换点 + 预测打平点）。
+            该项**只读展示**，不参与计费公式、不参与路由决策；默认关闭。
+          </div>
+          <div class="form-row">
+            <span class="label">多渠道对比 / 渠道轨迹</span>
+            <el-switch v-model="multichannelTrace" active-text="开启" inactive-text="关闭" />
+            <span class="hint" style="margin-left: 8px">
+              键名 console.cost_multichannel_trace；保存本页后生效（未读到配置时不回写，避免误关）。
+            </span>
+          </div>
         </div>
 
         <el-divider />

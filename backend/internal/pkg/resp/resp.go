@@ -95,6 +95,15 @@ func Err(w http.ResponseWriter, r *http.Request, status, code int, msg string) {
 		logAPIError(r, http.StatusInternalServerError, CodeInternalError, "响应序列化失败："+err.Error())
 	}
 }
+
+// ErrNoLog 与 Err 等价，但**不落异常日志**：只给「预期内的拒绝」用（如功能开关未启用 → 403 / 能力降级）。
+// 这类响应是正常业务状态，落 Warn 会让 4xx 告警统计把「开关关着」误报成故障。
+// 序列化失败仍按 5xx 落日志（那是真异常）。除此之外的一切错误都必须走 Err。
+func ErrNoLog(w http.ResponseWriter, r *http.Request, status, code int, msg string) {
+	if err := Write(w, status, Body{Code: code, Message: msg, RequestID: RequestID(r)}); err != nil {
+		logAPIError(r, http.StatusInternalServerError, CodeInternalError, "响应序列化失败："+err.Error())
+	}
+}
 func RequestID(r *http.Request) string {
 	return logger.GetRequestID(r.Context())
 }

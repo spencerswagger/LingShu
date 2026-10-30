@@ -23,6 +23,16 @@ export interface ApiError {
   status?: number
 }
 
+// 逐请求错误提示配置（可选，默认行为不变）：
+//   silentStatuses 列出「由调用方自己渲染、不要弹全局红条」的 HTTP 状态码。
+//   典型用法：成本页新增只读入口在功能开关未开启时返回 403，页面要出「功能未开启」空态 + 引导，
+//   而不是弹一条红色报错。只影响提示，不影响错误对象（status/code 照常回传给调用方）。
+declare module 'axios' {
+  export interface AxiosRequestConfig {
+    silentStatuses?: number[]
+  }
+}
+
 export const http = axios.create({ baseURL: '/api/v1', timeout: 120000 })
 
 // 请求拦截：注入 Bearer token
@@ -55,12 +65,15 @@ http.interceptors.response.use(
         router.push('/login')
       }
     }
-    ElMessage.error(message)
+    // 调用方声明「该状态码自己渲染」时不弹全局红条（例如功能开关未开 → 403 走空态引导）。
+    const status = err.response?.status
+    const silent = typeof status === 'number' && (err.config?.silentStatuses ?? []).includes(status)
+    if (!silent) ElMessage.error(message)
     return Promise.reject<ApiError>({
       message,
       requestId,
       code: body?.Code,
-      status: err.response?.status,
+      status,
     })
   },
 )

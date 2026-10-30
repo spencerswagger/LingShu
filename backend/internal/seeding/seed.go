@@ -43,12 +43,23 @@ var defaultSysConfigs = map[string]string{
 	// 估算缓存读与输出（纯输入 + 缓存读 = 总输入），供会话成本路由的成本比较使用。
 	// 默认值与 routing.cost_sample（10000/9000/1000）同源。
 	"routing.sample_profile": `{"cache_read_ratio":0.9,"output_ratio":0.1}`,
-	// 会话成本路由配置：默认安全态（enabled=false、mid_switch=false、shadow_enabled=false，
-	// 渠道不变、无额外异步写）。剩余轮数取固定值（remaining_a=10、remaining_b=0，即 clamp(10−0×k)≡10），
-	// 不再按会话位置 k 预测；remaining_* 与门控阈值保留供运维微调。
-	"routing.session_cost": `{"enabled":false,"mid_switch":false,"shadow_enabled":false,"remaining_a":10,"remaining_b":0,"remaining_min":1,"remaining_max":20,"min_remaining":1,"cooldown_sec":0,"min_improve":0}`,
+	// 会话成本路由配置：**产品默认开启**（2026-10-30 spencer 定稿，Owl 复审补最小滞回）——
+	// enabled=true（起点择优）、mid_switch=true（会话中途切换）、shadow_enabled=false（影子观测关闭）。
+	// 默认带滞回，保证「默认开」安全：remaining_b=1 按真实轮次递减（clamp(10−k,1,20)）、
+	// cooldown_sec=300（同会话两次切换至少隔 5 分钟）、min_improve=0.05（改善 >5% 才切）。
+	// 回退：把本键的 enabled 与 mid_switch 都置 false。
+	// 生效方式要看写入路径（别一概按「热生效」理解）：
+	//   - 走应用内写入（billing.UpsertConfig，会触发配置写钩子）→ 缓存立即失效、立即生效；
+	//   - 直接改 sys_configs 表 → **必须重启进程**才生效：该配置缓存没有 TTL，只有写钩子会失效它。
+	// 注意：本键目前没有专用 HTTP 路由（/configs/system 只覆盖 Billing / SessionExpiration /
+	// 上游白名单 / Console），应用内唯一写入点就是本种子（ON CONFLICT DO NOTHING）。
+	// 注意 ON CONFLICT DO NOTHING：存量库已有的旧值不会被本种子覆盖，需显式开启/关闭。
+	"routing.session_cost": `{"enabled":true,"mid_switch":true,"shadow_enabled":false,"remaining_a":10,"remaining_b":1,"remaining_min":1,"remaining_max":20,"min_remaining":1,"cooldown_sec":300,"min_improve":0.05}`,
 	// 会话过期分档兜底与示例档位（双维度取较大者，且不低于兜底 5 分钟）。
 	"session.expiration": `{"default_ttl_minutes":5,"context_tiers":[{"max_tokens":2000,"ttl_minutes":5},{"max_tokens":8000,"ttl_minutes":30},{"max_tokens":32000,"ttl_minutes":180},{"max_tokens":128000,"ttl_minutes":1440}],"turn_tiers":[{"max_turns":2,"ttl_minutes":5},{"max_turns":10,"ttl_minutes":30},{"max_turns":50,"ttl_minutes":180},{"max_turns":200,"ttl_minutes":1440}]}`,
+	// 成本页增强视图开关（多线对比 / 会话渠道轨迹）：默认 false = 现状不变。
+	// 只控制两个新增只读接口是否可用，不参与计费与路由。
+	"console.cost_multichannel_trace": `false`,
 }
 
 // systemUser / systemToken 常量：健康探测开销的归属身份（成本记账），用户侧界面隐藏。

@@ -135,6 +135,8 @@ func (s *Server) routes() {
 	admin.HandleFunc("GET /api/v1/admin/cost/curves", d.Console.HandleCostCurves)
 	admin.HandleFunc("GET /api/v1/admin/cost/pricing-curve", d.Console.HandleCostPricingCurve)
 	admin.HandleFunc("GET /api/v1/admin/cost/session/{id}", d.Console.HandleCostSession)
+	// 会话渠道轨迹（只读，受开关 console.cost_multichannel_trace 控制，默认关闭 → 403）。
+	admin.HandleFunc("GET /api/v1/admin/cost/session/{id}/trace", d.Console.HandleCostSessionTrace)
 
 	// 渠道协议（channel_protocols·可复用接入模板）
 	if d.ChannelProto != nil {

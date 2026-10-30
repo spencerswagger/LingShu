@@ -635,7 +635,17 @@ func (h *Admin) HandleGetSystemConfig(w http.ResponseWriter, r *http.Request) {
 		"Billing":                         billingRaw,
 		"SessionExpiration":               h.readSessionExpirationRaw(ctx),
 		"UpstreamResponseHeaderWhitelist": h.readGatewayWhitelistRaw(ctx),
+		// 成本页增强视图开关（默认 false）：仅控制两个新增只读接口是否可用，不影响计费与路由。
+		"Console": h.costViewsConsoleJSON(ctx),
 	})
+}
+
+// costViewsConsoleJSON 组装 Console 配置块：{"MultichannelTrace": <开关>}。
+func (h *Admin) costViewsConsoleJSON(ctx context.Context) json.RawMessage {
+	raw, _ := json.Marshal(map[string]json.RawMessage{
+		"MultichannelTrace": h.costViewsEnabledJSON(ctx),
+	})
+	return raw
 }
 
 // HandlePutSystemConfig PUT /api/v1/admin/configs/system
@@ -651,6 +661,10 @@ func (h *Admin) HandlePutSystemConfig(w http.ResponseWriter, r *http.Request) {
 		} `json:"Billing"`
 		SessionExpiration               json.RawMessage `json:"SessionExpiration"`
 		UpstreamResponseHeaderWhitelist []string        `json:"UpstreamResponseHeaderWhitelist"`
+		// Console 为新增的**可选**块：不传 = 不写该开关（老客户端的 PUT 请求行为完全不变）。
+		Console *struct {
+			MultichannelTrace *bool `json:"MultichannelTrace"`
+		} `json:"Console"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "请求体格式错误")
@@ -726,6 +740,14 @@ func (h *Admin) HandlePutSystemConfig(w http.ResponseWriter, r *http.Request) {
 	if err := h.billing.UpsertConfig(ctx, gateway.UpstreamResponseHeaderWhitelistKey, whitelistRaw, operator); err != nil {
 		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "更新网关设置失败")
 		return
+	}
+	// 成本页增强视图开关：仅在请求显式携带该字段时写入（不传 = 保持库中现值）。
+	if req.Console != nil && req.Console.MultichannelTrace != nil {
+		flagRaw, _ := json.Marshal(*req.Console.MultichannelTrace)
+		if err := h.billing.UpsertConfig(ctx, costViewsSwitchKey, flagRaw, operator); err != nil {
+			resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "更新成本页开关失败（console.cost_multichannel_trace）")
+			return
+		}
 	}
 	resp.OK(w, r, map[string]any{"Affected": 1})
 }
