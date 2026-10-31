@@ -2061,6 +2061,51 @@ const modeLabel = (m: string) =>
   .big-value { font-size: 30px; }
   .mini-value { font-size: 18px; }
   :deep(.el-radio-button__inner) { font-size: 14px; }
+  /* 「更多维度 → Top 用户」表格：Element Plus 默认 12px（含表头/单元格），断点内提到 14px。
+     只在 ≤640 生效，桌面端观感不变。 */
+  :deep(.el-table) { font-size: 14px; }
+  :deep(.el-table .cell) { font-size: 14px; line-height: 1.5; }
+  /* 注记类小字（未匹配摘要 / 截断提示 / 图例 / 实时区说明）同样 ≥14px */
+  .unmatched-note,
+  .trunc-note,
+  .pending-note,
+  .trend-legend,
+  .live-tag,
+  .live-window,
+  .live-fade-note,
+  .idle-note,
+  .cell-sub,
+  .fail-rate,
+  .mini-pending {
+    font-size: 14px;
+  }
+  /* 小徽标（窗口/粒度标签）：不缩字号，单列后允许换行 */
+  .win-chip,
+  .gran-chip,
+  .win-tag {
+    font-size: 14px;
+    white-space: normal;
+  }
+  /* 其余内容级文本（范围标签、涨跌、模型名/状态、展开按钮、复制按钮）也统一到 14px；
+     纯装饰字形（big-glyph / 头像缩写）保持原样。 */
+  .page-count,
+  .big-delta,
+  .model-name,
+  .model-state,
+  .model-chip,
+  .link-btn,
+  .copy-btn,
+  .announce-title,
+  .announce-time,
+  .live-fade-note,
+  .xcard-badge {
+    font-size: 14px;
+  }
+  /* Element Plus 小号控件（工具栏按钮 / 折叠面板标题 / 标签）默认 12–13px，断点内一并提到 14px */
+  :deep(.el-button) { font-size: 14px; }
+  :deep(.el-collapse-item__header),
+  :deep(.el-collapse-item__title) { font-size: 14px; }
+  :deep(.el-tag) { font-size: 14px; }
   .plaza-sort { width: 100%; }
   .plaza-sort :deep(.el-radio-button) { flex: 1; }
   .plaza-sort :deep(.el-radio-button__inner) { width: 100%; padding-left: 4px; padding-right: 4px; }
