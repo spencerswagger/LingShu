@@ -36,20 +36,21 @@
 - **验收标准**：
   1. 删「运维概览」块；首屏 3 大数字 + 一排小指标（不做成本/毛利）。
   2. 中部上下两张图：用量趋势（今天/昨天/前天/大前天四线，按小时，缺数据断线）+ 模型广场（Token/吞吐/请求失败/首字全程四指标，可排序切换，空模型折叠）。
-  3. 底部实时会话：30s 自动刷新、**会话准入仅「请求中」**（`Inflight > 0`）、用户只做汇总；同一时刻只允许一个在飞请求。计数口径（**两套，不得互换**）：**`SessionsTotal` / `Truncated` / `UsersTotal` 严格按 `Inflight > 0`**（`UsersTotal` = 有 inflight 会话的用户数，即「请求中用户」）；**`RangeUsersTotal` = 所选范围内有过请求的用户数**（与 `RangeUsers[].Range*` 同源，即「范围内活跃用户」）。**淡出过渡不得改变上述任何计数**。前端两个数字分别按「请求中用户」/「范围内活跃用户」标注，**不得同名、不得合并展示**。
+  3. 底部实时会话：30s 自动刷新、**会话准入仅「请求中」**（`Inflight > 0`）、用户只做汇总；同一时刻只允许一个在飞请求。计数口径（**两套，不得互换**）：**`SessionsTotal` / `Truncated` / `UsersTotal` 严格按 `Inflight > 0`**（`UsersTotal` = 有 inflight 会话的用户数，即「请求中用户」）；**`RangeUsersTotal` = 所选范围内有过请求的用户数**（即「范围内活跃用户」，与范围用户行 `RangeUsers[]`（原 `Users[].Range*`）同源，**不是** inflight 口径）。**淡出过渡不得改变上述任何计数**。前端两个数字分别按「请求中用户」/「范围内活跃用户」标注，**不得同名、不得合并展示**。
   4. 窗口标签显性化（读 KPI.WindowFrom/WindowTo/WindowMode，前端不自拼）。
   5. 移动端 ≤640px 单列。
   6. 接口向后兼容：不传新参数时响应与 origin/main 逐字节一致（golden 快照固定）。
 - **✅ 两个用户数口径已定稿（Owl P2 对齐 #69，2026-10-30）**：
   - **请求中用户 = `UsersTotal`** —— 有 inflight 会话的用户数（#69 已恢复为 inflight 口径，已 READY）。
-  - **范围内活跃用户 = `RangeUsersTotal`** —— 所选范围内有过请求的用户数，与 `RangeUsers[].Range*` 同源。
-  - **两者是两套口径，不得互相换算，也不得同名展示**；首屏若同时展示，标签必须分别写「请求中用户」与「范围内活跃用户」。
+  - **范围内活跃用户 = `RangeUsersTotal`** —— 所选范围内有过请求的用户数，与范围用户行 `RangeUsers[]`（原 `Users[].Range*`）同源，**不是** inflight 口径。
+  - **两者不同源（一个是 inflight 会话、一个是范围内请求记录），不得互相换算，也不得同名展示**；首屏若同时展示，标签必须分别写「请求中用户」与「范围内活跃用户」。
 - **约束**：不改统计口径定义、不动状态页（ServiceStatus）、不改计费/路由决策逻辑、不引入新依赖。
 - **状态**：进行中（等 Owl：PR #66 / #67）
 - **负责人**：Core（后端）/ View（前端）/ Gate（验收）
 - **口径变更记录**：2026-10-30 Owl P2 —— 原写「`UsersTotal` = 范围内有过请求的用户数」与 #69 相反，已改为「`UsersTotal` = inflight 用户数（= 请求中用户）」，范围口径改名 `RangeUsersTotal`；原「待 Core 确认字段来源」一条随之作废并改为定稿结论。
+- **口径变更记录（二次校准，2026-10-30）**：Owl P2 措辞收口 —— 范围口径字段名统一写 `RangeUsersTotal` / 范围用户行 `RangeUsers[]`（注原 `Users[].Range*`）；「两套口径」改为「**不同源**，不得互相换算」；淡出条补明 `UsersTotal` 为 inflight 口径、`RangeUsersTotal` 与淡出无关；全文已无「`UsersTotal` = 范围内用户数」的残留。
 - **✅ 已拍板（spencer，2026-10-30）：实时会话口径定稿**
   - **准入 = 仅「请求中」**（`Inflight > 0`），与 main 现状、原派工一致。
   - 「最近 5 分钟活跃」**只作降级/淡出过渡**（请求结束后短暂停留再消失，前端视觉过渡），**不作准入条件**。
-  - 淡出项**不计入** `SessionsTotal` / `UsersTotal` / `Truncated`；若要给淡出提供数据，必须用**独立字段**（如 `Fading` / `RecentlyExited[]`），不得污染统计口径。
+  - 淡出项**不计入** `SessionsTotal` / `UsersTotal` / `Truncated`（`UsersTotal` 自 #69 起为 **inflight 口径**，淡出项不得抬高它；`RangeUsersTotal` 由范围内请求记录决定，与淡出无关）；若要给淡出提供数据，必须用**独立字段**（如 `Fading` / `RecentlyExited[]`），不得污染统计口径。
   - 实现口径：Core 按此改 PR #66（原 `Inflight > 0 || LastActive ≥ now-5min` 的准入写法作废）。
