@@ -2148,6 +2148,12 @@ const modeLabel = (m: string) =>
   .xcard-badge {
     font-size: 14px;
   }
+  /* 内容区里带字形的装饰块也一起到 14px（大数字前的 T/¥/⚡ 方框、用户头像缩写）：
+     它们是可见文本，若留 11px，「内容区最小字号 ≥14」就不成立。方框/圆点尺寸不变，只调字号。 */
+  .big-glyph,
+  .uavatar {
+    font-size: 14px;
+  }
   /* Element Plus 小号控件（工具栏按钮 / 折叠面板标题 / 标签）默认 12–13px，断点内一并提到 14px */
   :deep(.el-button) { font-size: 14px; }
   :deep(.el-collapse-item__header),
