@@ -522,7 +522,7 @@ const miniStats = computed<MiniStat[]>(() => {
     {
       // 与下方实时区同一口径：只数请求中（Inflight>0）的会话，淡出项不算
       label: '请求中会话',
-      value: live.value ? fmtInt(live.value.SessionsTotal) : '--',
+      value: !live.value ? '--' : inflightSessions.value === null ? '—' : fmtInt(inflightSessions.value),
       tip: '仅统计请求中（Inflight>0）的会话；刚结束的会话会短暂淡出但不计入。管理端=全站，开发端=本人（与下方实时区同源）',
     },
     {
@@ -530,11 +530,14 @@ const miniStats = computed<MiniStat[]>(() => {
       // 兼容期（响应里还没有 RangeUsers）UsersTotal 仍是范围口径、会偏大 → 先占位，
       // #69 合入后同一次响应带上 RangeUsers，本项自动切到真实值（开关式防御，不写死）。
       label: '请求中用户',
-      value: hasRangeUsers.value ? fmtInt(live.value?.UsersTotal ?? 0) : '—',
+      // 新口径且 UsersTotal 有值才显示数字；老口径（无 RangeUsers）或字段缺失/null → 「—」
+      value: inflightUsers.value === null ? '—' : fmtInt(inflightUsers.value),
       pending: !hasRangeUsers.value,
-      tip: hasRangeUsers.value
-        ? '有进行中会话的用户数（只算此刻 Inflight>0 的会话涉及的用户）。与下方「范围内活跃用户」是两套口径，不要互相换算'
-        : '当前响应里还没有 RangeUsers（#69 未合入），UsersTotal 仍是「所选范围内有请求的用户数」，会偏大；先占位，合入后自动显示真实值',
+      tip: !hasRangeUsers.value
+        ? '当前响应里还没有 RangeUsers（#69 未合入），UsersTotal 仍是「所选范围内有请求的用户数」，会偏大；先占位，合入后自动显示真实值'
+        : inflightUsers.value === null
+          ? '后端这次没返回 UsersTotal（字段缺失或为 null），按 — 显示，不猜数'
+          : '有进行中会话的用户数（只算此刻 Inflight>0 的会话涉及的用户）。与下方「范围内活跃用户」是两套口径，不要互相换算',
     },
   ]
 })
@@ -828,13 +831,33 @@ const dailyRangeText = computed(() => {
   return `${l.DailyFrom.slice(5)} ~ ${l.DailyTo.slice(5)} 每日`
 })
 
-// 兼容期判定：#69 之后才有 RangeUsers / RangeUsersTotal 这两个字段。
-// 有 → 用户区走「范围内活跃用户」新口径；没有（#69 未合入）→ 退回旧 Users/UsersTotal（当时是范围口径），
-// 标签也回到「在线用户」，绝不把旧字段当新口径展示（不混用两套数）。
+// 兼容期判定（唯一判据）：**`Array.isArray(RangeUsers)` 为真**才算 #69 新口径。
+//   - `null` / 缺键 / 其它非数组 → 老口径兜底（旧 Users/UsersTotal 当时就是范围口径）；
+//   - `[]` 仍是新口径（合法但范围内没有用户）→ 走空态，不回退旧字段。
 const hasRangeUsers = computed(() => Array.isArray(live.value?.RangeUsers))
+
+// 数字字段统一收口：null / undefined / 空串 / 非数 → null（调用方渲染「—」），绝不吐 NaN。
+function numOrNull(v: unknown): number | null {
+  if (v === null || v === undefined || v === '') return null
+  const n = Number(v)
+  return Number.isFinite(n) ? n : null
+}
+
 const usersTabLabel = computed(() => (hasRangeUsers.value ? '范围内活跃用户' : '在线用户'))
-const usersTabTotal = computed(() =>
-  hasRangeUsers.value ? Number(live.value?.RangeUsersTotal ?? 0) : Number(live.value?.UsersTotal ?? 0),
+// 页签总数：新口径 RangeUsersTotal / 老口径 UsersTotal；取不到就是 null → 显示「—」
+const usersTabTotal = computed<number | null>(() =>
+  hasRangeUsers.value ? numOrNull(live.value?.RangeUsersTotal) : numOrNull(live.value?.UsersTotal),
+)
+const usersTabTotalText = computed(() => (usersTabTotal.value === null ? '—' : fmtInt(usersTabTotal.value)))
+
+// 「请求中用户」= #69 的 UsersTotal（仅新口径下才是这个语义）：缺失/为 null → null（渲染「—」）
+const inflightUsers = computed<number | null>(() =>
+  hasRangeUsers.value ? numOrNull(live.value?.UsersTotal) : null,
+)
+// 「请求中会话」= SessionsTotal：缺失/为 null → null（渲染「—」）
+const inflightSessions = computed<number | null>(() => numOrNull(live.value?.SessionsTotal))
+const sessionsTabTotalText = computed(() =>
+  inflightSessions.value === null ? '—' : fmtInt(inflightSessions.value),
 )
 // 两套用户列表共用一个 UsersTruncated（#69：RangeUsers 同样受用户上限约束）
 const usersTruncated = computed(() => !!live.value?.UsersTruncated)
@@ -1122,10 +1145,10 @@ const modeLabel = (m: string) =>
         <div class="live-tabs">
           <el-radio-group v-model="liveTab" size="small">
             <el-radio-button value="sessions">
-              我的会话{{ live ? ` · ${live.SessionsTotal}` : '' }}
+              我的会话{{ live ? ` · ${sessionsTabTotalText}` : '' }}
             </el-radio-button>
             <el-radio-button v-if="isAdmin" value="users">
-              {{ usersTabLabel }}{{ live ? ` · ${usersTabTotal}` : '' }}
+              {{ usersTabLabel }}{{ live ? ` · ${usersTabTotalText}` : '' }}
             </el-radio-button>
           </el-radio-group>
           <span v-if="liveErr" class="live-err">{{ liveErr }}</span>
@@ -1252,7 +1275,7 @@ const modeLabel = (m: string) =>
               </article>
             </div>
             <div v-if="usersTruncated" class="trunc-note">
-              仅显示前 100 个{{ usersTabLabel }}（共 {{ usersTabTotal }} 个）
+              仅显示前 100 个{{ usersTabLabel }}（共 {{ usersTabTotalText }} 个）
             </div>
           </template>
           <el-empty v-else-if="live" :description="`所选范围内没有${usersTabLabel}`" :image-size="60" />

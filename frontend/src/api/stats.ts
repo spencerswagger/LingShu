@@ -258,13 +258,14 @@ export interface StatsLive {
   DailyTo: string
   DailyPoints: number
   // 我的会话总数（未截断）= **仅请求中**（Inflight > 0）；刚结束的会话只在 RecentlyExited 里淡出，
-  // 不会抬高这个数字，前端也不要用 LastActive 再过滤一次。
-  SessionsTotal: number
+  // 不会抬高这个数字，前端也不要用 LastActive 再过滤一次。允许 null（缺失时前端显示「—」）。
+  SessionsTotal?: number | null
   // 有请求中会话的用户数（#69 起回到 origin/main 语义，与 Users 行集同源未截断）。
-  UsersTotal: number
+  // 允许 null：后端异常/老版本可能不吐，前端用 numOrNull 收口后渲染「—」，不显示 null/NaN。
+  UsersTotal?: number | null
   // 所选范围内有过请求的用户数（#69 新字段，与 RangeUsers 同源未截断）。
-  // 兼容期：老响应没有这两个字段 → 前端把 UsersTotal/Users 当范围口径兜底（见 hasRangeUsers）。
-  RangeUsersTotal?: number
+  // 兼容判据只看 RangeUsers 是否数组；这个总数缺失时页签显示「—」。
+  RangeUsersTotal?: number | null
   Truncated: boolean
   UsersTruncated: boolean
   // Sessions 由服务端保证「只有请求中的会话」（不要再用 LastActive 过滤）。
