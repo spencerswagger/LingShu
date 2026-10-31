@@ -526,14 +526,15 @@ const miniStats = computed<MiniStat[]>(() => {
       tip: '仅统计请求中（Inflight>0）的会话；刚结束的会话会短暂淡出但不计入。管理端=全站，开发端=本人（与下方实时区同源）',
     },
     {
-      // UsersTotal 在 #69 之后才是「有请求中会话的用户数」。兼容期（响应里没有 RangeUsers/RangeUsersTotal）
-      // 它仍是范围口径，不能拿来顶替请求中用户 → 如实标「待后端合入」。
+      // 「请求中用户」= #69 的 UsersTotal（有进行中会话的用户数），**不需要后端再加字段**。
+      // 兼容期（响应里还没有 RangeUsers）UsersTotal 仍是范围口径、会偏大 → 先占位，
+      // #69 合入后同一次响应带上 RangeUsers，本项自动切到真实值（开关式防御，不写死）。
       label: '请求中用户',
       value: hasRangeUsers.value ? fmtInt(live.value?.UsersTotal ?? 0) : '—',
       pending: !hasRangeUsers.value,
       tip: hasRangeUsers.value
-        ? '有请求中会话的用户数（与 Users 行集同源；不含只有范围活跃、当前没有在途请求的用户）'
-        : '当前后端响应仍是范围口径：UsersTotal 是「所选范围内有请求的用户数」，不能顶替请求中用户。待 #69 合入后本项自动接上',
+        ? '有进行中会话的用户数（只算此刻 Inflight>0 的会话涉及的用户）。与下方「范围内活跃用户」是两套口径，不要互相换算'
+        : '当前响应里还没有 RangeUsers（#69 未合入），UsersTotal 仍是「所选范围内有请求的用户数」，会偏大；先占位，合入后自动显示真实值',
     },
   ]
 })
@@ -1009,7 +1010,7 @@ const modeLabel = (m: string) =>
           <el-tooltip v-if="m.tip" :content="m.tip" placement="top" :show-after="150">
             <span class="mini-value" :data-tone="m.tone" :data-pending="m.pending">
               {{ m.value }}
-              <em v-if="m.pending" class="mini-pending">待后端</em>
+              <em v-if="m.pending" class="mini-pending">待后端合入</em>
             </span>
           </el-tooltip>
           <span v-else class="mini-value" :data-tone="m.tone">{{ m.value }}</span>
