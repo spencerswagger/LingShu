@@ -21,6 +21,7 @@ import {
   type StatsHour,
   type StatsLive,
   type StatsLiveExited,
+  type StatsLiveRangeUser,
   type StatsModelSort,
   type StatsTopItem,
   type StatsModelStat,
@@ -831,10 +832,22 @@ const dailyRangeText = computed(() => {
   return `${l.DailyFrom.slice(5)} ~ ${l.DailyTo.slice(5)} 每日`
 })
 
-// 兼容期判定（唯一判据）：**`Array.isArray(RangeUsers)` 为真**才算 #69 新口径。
-//   - `null` / 缺键 / 其它非数组 → 老口径兜底（旧 Users/UsersTotal 当时就是范围口径）；
-//   - `[]` 仍是新口径（合法但范围内没有用户）→ 走空态，不回退旧字段。
-const hasRangeUsers = computed(() => Array.isArray(live.value?.RangeUsers))
+// 兼容期判定（唯一判据）：**响应里「有 RangeUsers 这个键」就算 #69 新口径**。
+//   - 键存在且是数组 → 新口径，按数组渲染；
+//   - 键存在但值是 `null` → 仍是新口径（显式声明了范围口径），按**空数组**渲染、走空态；
+//   - 键缺失（老后端）→ 老口径兜底（旧 Users/UsersTotal 当时就是范围口径）。
+// 这样 `RangeUsers: null` 不会被误判回「在线用户」老口径（Owl P3）。
+const hasRangeUsers = computed(() => {
+  const l = live.value
+  if (!l) return false
+  if (!Object.prototype.hasOwnProperty.call(l, 'RangeUsers')) return false
+  const v = l.RangeUsers
+  return v === null || Array.isArray(v)
+})
+// 行数据：null / 非数组一律当空数组（不抛错、不 undefined.map）
+const rangeUserRows = computed<StatsLiveRangeUser[]>(() =>
+  Array.isArray(live.value?.RangeUsers) ? (live.value!.RangeUsers as StatsLiveRangeUser[]) : [],
+)
 
 // 数字字段统一收口：null / undefined / 空串 / 非数 → null（调用方渲染「—」），绝不吐 NaN。
 function numOrNull(v: unknown): number | null {
@@ -868,7 +881,7 @@ const userRows = computed<LiveUserRow[]>(() => {
   if (hasRangeUsers.value) {
     // 新口径：RangeSessions/RangeCalls/RangeTokens/RangeCredits 是「所选范围」合计；
     // WindowTokens/SpentCredits 是「近 Window 分钟」——刻意不同名，卡面各就各位、不互相顶替。
-    return (l.RangeUsers ?? []).map((u) => ({
+    return rangeUserRows.value.map((u) => ({
       id: u.ID,
       name: u.Name || `用户 ${u.ID}`,
       initial: (u.Name || '?').slice(0, 2),
@@ -2105,7 +2118,12 @@ const modeLabel = (m: string) =>
   .grid-caption,
   .cell-sub,
   .fail-rate,
-  .mini-pending {
+  .mini-pending,
+  /* 用量按模式区块：标题行(mode-name/mode-calls) 与脚注(mode-foot 里的 Token / 积分) */
+  .mode-name,
+  .mode-calls,
+  .mode-foot,
+  .mode-foot span {
     font-size: 14px;
   }
   /* 小徽标（窗口/粒度标签）：不缩字号，单列后允许换行 */
