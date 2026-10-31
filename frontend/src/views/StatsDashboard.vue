@@ -21,6 +21,7 @@ import {
   type StatsHour,
   type StatsLive,
   type StatsLiveExited,
+  type StatsModelSort,
   type StatsTopItem,
   type StatsModelStat,
   type StatsModelPlaza,
@@ -84,11 +85,21 @@ function resolveRange(): { from: Date; to: Date } {
   return { from, to: end }
 }
 
-// ===== 模型广场（v4 第 3 条：去排序控件，后端固定按 Token 倒序）=====
+// ===== 模型广场（v4 第 3 条：只留数据列 + 复制 + 空闲折叠；排序仍可切，后端白名单 tokens|tpm|failed|latency）=====
 const MODEL_LIMIT = 50
 const COMPARE_DAYS = 4
 // 首屏 KPI / 小时趋势 / 模型广场都按「请求区间的严格滚动窗口」算（后端默认 exact）。
 const WINDOW_MODE: 'exact' | 'calendar' = 'exact'
+
+const modelSort = ref<StatsModelSort>('tokens')
+const MODEL_SORT_OPTIONS: { value: StatsModelSort; label: string }[] = [
+  { value: 'tokens', label: 'Token' },
+  { value: 'tpm', label: '吞吐' },
+  { value: 'failed', label: '失败' },
+  { value: 'latency', label: '耗时' },
+]
+// 排序切换只重取 dashboard（实时区不受影响），静默刷新不闪整页 loading。
+watch(modelSort, () => load({ silent: true }))
 
 // 请求序号守卫：筛选切换、手动刷新、30s 轮询可能在途交叠，
 // 只接受「最新一次」请求的响应，过期响应直接丢弃（不写 store、不闪界面）。
@@ -108,6 +119,7 @@ async function load(opts: { silent?: boolean } = {}) {
       To: toRFC3339CN(to),
       Granularity: granularity.value,
       CompareDays: COMPARE_DAYS,
+      ModelSort: modelSort.value,
       ModelLimit: MODEL_LIMIT,
       Window: WINDOW_MODE,
     })
@@ -481,6 +493,8 @@ interface MiniStat {
   value: string
   tone?: 'ok' | 'info'
   tip?: string
+  // 后端尚未提供的指标：如实标「待后端」，不自己造数
+  pending?: boolean
 }
 
 const miniStats = computed<MiniStat[]>(() => {
@@ -507,6 +521,20 @@ const miniStats = computed<MiniStat[]>(() => {
       label: '输入输出比',
       value: inOut === null ? '—' : `${fmtRatio(inOut)} : 1`,
       tip: '输入 : 输出。同样来自所选范围的日累计用量（Usage.Total），不是首屏滚动窗口；输出为 0 时显示 —',
+    },
+    {
+      // 与下方实时区同一口径：只数请求中（Inflight>0）的会话，淡出项不算
+      label: '请求中会话',
+      value: live.value ? fmtInt(live.value.SessionsTotal) : '--',
+      tip: '仅统计请求中（Inflight>0）的会话；刚结束的会话会短暂淡出但不计入。管理端=全站，开发端=本人（与下方实时区同源）',
+    },
+    {
+      // 后端当前**没有**「请求中用户」计数：UsersTotal 是所选范围内的活跃用户口径，不能拿来顶替。
+      // 等 Core 提供请求中用户字段（或 UsersTotal 恢复 inflight 语义）后接上，这里如实标缺。
+      label: '请求中用户',
+      value: '—',
+      pending: true,
+      tip: '后端当前未提供「请求中用户」计数（UsersTotal 是所选范围内有请求的用户数，口径不同，不能顶替）。待 Core 新增该字段后接入',
     },
   ]
 })
@@ -616,9 +644,27 @@ interface PlazaRow {
 
 const plaza = computed<StatsModelPlaza | null>(() => data.value?.ModelPlaza ?? null)
 
+// 实际生效的排序键：优先读响应回显（后端会把非法值回落成 tokens），没有回显时用本地选择。
+const plazaSortLabel = computed(() => {
+  const sortKey = ((plaza.value?.Sort as StatsModelSort | undefined) || modelSort.value) as StatsModelSort
+  return MODEL_SORT_OPTIONS.find((o) => o.value === sortKey)?.label || 'Token'
+})
+
+// 未匹配兜底行（Unmatched=true）：解析不到在册模型的用量。不再当普通模型卡片展示，
+// 但**不能丢**——用量信息以小字摘要挂在空闲折叠行里（后端不计入 Total/Active，前端也不参与排序）。
+const unmatchedRow = computed<StatsModelStat | null>(
+  () => (plaza.value?.List ?? []).find((m) => m.Unmatched) ?? null,
+)
+const unmatchedText = computed(() => {
+  const u = unmatchedRow.value
+  if (!u) return ''
+  return ['未匹配模型用量：Token ' + fmtCompact(u.Tokens), '请求 ' + fmtInt(u.Calls), '失败 ' + fmtInt(u.Failed)].join(' · ')
+})
+
 const plazaRows = computed<PlazaRow[]>(() => {
-  // 后端仍会追加一行 Unmatched=true 的兜底行（Model 固定 "__unmatched__"、从不置 Active），
-  // v4 第 3 条已删掉「未匹配模型」区块，这里必须过滤掉，否则展开空闲区会露出明文 __unmatched__。
+  // 后端仍会追加一行 Unmatched=true 的兜底行（Model 固定 "__unmatched__"、从不置 Active）：
+  // 不当模型卡片渲染（否则展开空闲区会露出明文 __unmatched__），但用量不丢——
+  // 由 unmatchedText 在空闲折叠行里单独列一句摘要。
   const list: StatsModelStat[] = (plaza.value?.List ?? []).filter((m) => !m.Unmatched)
   if (!list.length) return []
   return list.map((m) => ({
@@ -935,7 +981,10 @@ const modeLabel = (m: string) =>
         <div v-for="m in miniStats" :key="m.label" class="mini-card">
           <span class="mini-label">{{ m.label }}</span>
           <el-tooltip v-if="m.tip" :content="m.tip" placement="top" :show-after="150">
-            <span class="mini-value" :data-tone="m.tone">{{ m.value }}</span>
+            <span class="mini-value" :data-tone="m.tone" :data-pending="m.pending">
+              {{ m.value }}
+              <em v-if="m.pending" class="mini-pending">待后端</em>
+            </span>
           </el-tooltip>
           <span v-else class="mini-value" :data-tone="m.tone">{{ m.value }}</span>
         </div>
@@ -972,7 +1021,7 @@ const modeLabel = (m: string) =>
         </div>
 
         <div class="card">
-          <div class="card-head">
+          <div class="card-head plaza-head">
             <h3 class="card-title">模型广场</h3>
             <el-tooltip
               :content="`${kpiWindow.tip}；按模型忙时口径（该模型成功且带耗时请求的 Token ÷ 同批耗时折算分钟数）`"
@@ -981,7 +1030,12 @@ const modeLabel = (m: string) =>
             >
               <span class="win-chip">{{ kpiWindow.label }} · 按模型忙时</span>
             </el-tooltip>
-            <span class="gran-chip">按 Token 倒序</span>
+            <el-radio-group v-model="modelSort" size="small" class="head-actions plaza-sort">
+              <el-radio-button v-for="o in MODEL_SORT_OPTIONS" :key="o.value" :value="o.value">
+                {{ o.label }}
+              </el-radio-button>
+            </el-radio-group>
+            <span class="gran-chip">实际按{{ plazaSortLabel }}倒序</span>
           </div>
 
           <template v-if="plazaRows.length">
@@ -1016,6 +1070,9 @@ const modeLabel = (m: string) =>
                 </button>
               </span>
               <span v-if="plazaTruncatedText" class="trunc-note">{{ plazaTruncatedText }}</span>
+              <span v-if="unmatchedRow" class="unmatched-note" :title="unmatchedText">
+                {{ unmatchedText }}（无法归属到在册模型，单独列出、不参与上方排序）
+              </span>
             </div>
           </template>
           <el-empty v-else description="模型目录为空：还没有对外模型" :image-size="70" />
@@ -1389,7 +1446,8 @@ const modeLabel = (m: string) =>
 /* ===== ② 小指标行 ===== */
 .mini-grid {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  /* 项数会随口径增删（当前 7 项）：按最小宽度自适应换行，不写死列数 */
+  grid-template-columns: repeat(auto-fit, minmax(168px, 1fr));
   gap: 10px;
   margin-bottom: 14px;
 }
@@ -1420,6 +1478,28 @@ const modeLabel = (m: string) =>
 }
 .mini-value[data-tone='ok'] { color: var(--color-success); }
 .mini-value[data-tone='info'] { color: #0284c7; }
+/* 后端未提供的指标：值位显示 — + 「待后端」小标，不自己造数 */
+.mini-value[data-pending='true'] {
+  color: var(--color-text-tertiary);
+  font-weight: 600;
+}
+.mini-pending {
+  margin-left: 6px;
+  font-style: normal;
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 500;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: #f2f4f7;
+  color: var(--color-text-tertiary);
+}
+.unmatched-note {
+  display: inline-block;
+  color: var(--color-text-tertiary);
+  font-size: 11px;
+  line-height: 1.6;
+}
 
 /* ===== ③ 图表区 ===== */
 .chart-stack {
@@ -1917,5 +1997,33 @@ const modeLabel = (m: string) =>
   .xcard-grid { grid-template-columns: 1fr; }
   .head-actions { margin-left: 0; }
   .live-window { margin-left: 0; }
+  .plaza-head { row-gap: 8px; }
+}
+/* ≤640px：移动端铁律——单列 + 正文 ≥14px（辅助小标 12px 不在此限） */
+@media (max-width: 640px) {
+  .mini-grid { grid-template-columns: 1fr; }
+  .big-label,
+  .big-sub,
+  .mini-label,
+  .mini-value,
+  .model-row span,
+  .model-row b,
+  .xstat i,
+  .xstat b,
+  .card-title,
+  .live-title,
+  .xcard-name,
+  .xcard-foot,
+  .idle-note,
+  .pending-note,
+  .trend-legend {
+    font-size: 14px;
+  }
+  .big-value { font-size: 30px; }
+  .mini-value { font-size: 18px; }
+  :deep(.el-radio-button__inner) { font-size: 14px; }
+  .plaza-sort { width: 100%; }
+  .plaza-sort :deep(.el-radio-button) { flex: 1; }
+  .plaza-sort :deep(.el-radio-button__inner) { width: 100%; padding-left: 4px; padding-right: 4px; }
 }
 </style>

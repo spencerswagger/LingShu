@@ -144,32 +144,6 @@ export interface StatsKPI {
   DeltaRequests: number
 }
 
-export interface StatsCounts {
-  Total: number
-  Normal: number
-  Drain: number
-  Disabled: number
-}
-
-export interface StatsModelCounts {
-  ExternalTotal: number
-  ExternalEnabled: number
-  InternalTotal: number
-  InternalNormal: number
-}
-
-// 渠道无独立状态，仅总数（可用性见 Keys 三态）
-export interface StatsChannelCounts {
-  Total: number
-}
-
-// 运维块（仅管理端返回）
-export interface StatsOps {
-  Channels: StatsChannelCounts
-  Keys: StatsCounts
-  Models: StatsModelCounts
-}
-
 export interface StatsDashboard {
   Scope: string // global | self
   From: string
@@ -177,7 +151,7 @@ export interface StatsDashboard {
   KPI: StatsKPI
   Usage: StatsUsage
   ModelPlaza: StatsModelPlaza
-  Ops?: StatsOps
+  // 运维概览块已在 v4 删除：后端仍可能回 Ops 字段，前端不读、也不再建模（v4 第 1 条）
 }
 
 // 按角色选择端点：ADMIN → 全局；其余（DEVELOPER）→ 本人
@@ -190,12 +164,16 @@ export function getStatsDashboard(
 }
 
 // ===== 增量可选参数（不传 = 老行为，后端按 auto 判定粒度）=====
+// 模型广场排序键（后端白名单 tokens|tpm|failed|latency，非法值静默回落 tokens）。
+export type StatsModelSort = 'tokens' | 'tpm' | 'failed' | 'latency'
+
 export interface StatsDashboardParams {
   From?: string
   To?: string
   Granularity?: 'auto' | 'hour' | 'day'
   CompareDays?: number // 0~7，四线图传 4
-  // ModelSort 已下线（v4 第 3 条）：后端固定按 Token 倒序，前端不再传排序参数。
+  // 模型广场排序：tokens（默认）/tpm/failed/latency。响应里的 ModelPlaza.Sort 回显实际生效值。
+  ModelSort?: StatsModelSort
   ModelLimit?: number // 1~200
   // exact（默认）= 严格按请求区间的滚动窗口；calendar = 北京时间自然日归一。
   // KPI / Hourly / ModelPlaza 跟这个窗口走，Usage.Daily 与其它维度聚合仍是日界口径。
