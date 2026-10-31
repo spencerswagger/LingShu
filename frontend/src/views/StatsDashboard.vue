@@ -341,7 +341,7 @@ onUnmounted(() => {
 watch(preset, () => {
   if (preset.value !== 'custom') {
     load()
-    loadLive() // 在线用户范围跟页面时间范围走，筛选变了要重取
+    loadLive() // 用户统计范围（= 页面时间范围）变了要重取
   }
 })
 watch(customRange, (v) => {
@@ -815,7 +815,7 @@ interface LiveUserRow {
 
 const liveSampledAt = computed(() => fmtTime(live.value?.SampledAt || ''))
 const liveWindowMinutes = computed(() => live.value?.WindowMinutes ?? LIVE_WINDOW_MINUTES)
-// 在线用户的实际生效范围读后端回显（RangeFrom / RangeTo），不用本地 preset 自猜
+// 用户统计范围的实际生效值读后端回显（RangeFrom / RangeTo），不用本地 preset 自猜；两套用户口径共用
 const liveRangeText = computed(() => {
   const l = live.value
   if (!l?.RangeFrom || !l?.RangeTo) return ''
@@ -1113,7 +1113,8 @@ const modeLabel = (m: string) =>
           <span class="live-tag"><span class="dot-live" />每 30s 自动刷新 · 只显示请求中的会话</span>
           <span class="live-window">
             吞吐窗口 近 {{ liveWindowMinutes }} 分钟墙钟平均<span v-if="liveSampledAt"> · 采样 {{ liveSampledAt }}</span>
-            <span v-if="liveRangeText"> · 在线用户范围 {{ liveRangeText }}</span>
+            <!-- 口径中立：这是页面右上角时间筛选的范围回显，两套用户口径共用，别再写「在线用户范围」 -->
+            <span v-if="liveRangeText"> · 用户统计范围 {{ liveRangeText }}</span>
             <span v-if="liveLoading" class="live-loading">刷新中…</span>
           </span>
         </div>
@@ -2065,6 +2066,10 @@ const modeLabel = (m: string) =>
      只在 ≤640 生效，桌面端观感不变。 */
   :deep(.el-table) { font-size: 14px; }
   :deep(.el-table .cell) { font-size: 14px; line-height: 1.5; }
+  /* 单元格元素本身（td/th）也要显式给：EP 的 12px 落在这里，只改 .cell 量 td 仍是 12px */
+  :deep(.el-table td.el-table__cell),
+  :deep(.el-table th.el-table__cell) { font-size: 14px; }
+  :deep(.el-table__empty-text) { font-size: 14px; }
   /* 注记类小字（未匹配摘要 / 截断提示 / 图例 / 实时区说明）同样 ≥14px */
   .unmatched-note,
   .trunc-note,
@@ -2074,6 +2079,7 @@ const modeLabel = (m: string) =>
   .live-window,
   .live-fade-note,
   .idle-note,
+  .grid-caption,
   .cell-sub,
   .fail-rate,
   .mini-pending {
