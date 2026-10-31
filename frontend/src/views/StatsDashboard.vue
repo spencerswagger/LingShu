@@ -3,7 +3,7 @@
 //   ① 首屏 3 个大数字（总 Token / 总消费积分 / 吞吐量）+ 5 项小指标
 //   ② 24h 四日对比趋势（今天/昨天/前天/大前天，按 HourOfDay 对齐，缺桶断线）
 //   ③ 模型广场（后端按 Token 倒序 + 截断，含零用量模型供折叠；无排序控件、无进度条）
-//   ④ 实时区（/stats/live，30s 刷新）：我的会话 / 在线用户，均为卡片网格
+//   ④ 实时区（/stats/live，30s 刷新）：我的会话（仅请求中）/ 范围内活跃用户，均为卡片网格
 //
 // 三个吞吐口径刻意区分（见 docs/designs/2026-10-25-stats-dashboard-backend.md §4）：
 //   首屏      = KPI.TPM            全窗口忙时口径（≈60÷同批请求平均耗时）
@@ -215,7 +215,6 @@ interface FadingCard {
   id: string
   name: string
   model: string
-  calls: number
   exitedAtMs: number // ExitedAt 解析值（解析失败退化为收到响应的时刻）
   deadline: number // exitedAtMs + FadeWindowSeconds（到点移除）
   leaving: boolean // 进入最后 400ms：opacity → 0
@@ -283,7 +282,6 @@ function syncFading(list: StatsLiveExited[] | null | undefined, windowSeconds: n
       ...card,
       name: inc.Name || card.name,
       model: inc.Model || card.model,
-      calls: Number(inc.Calls) || card.calls,
       exitedAtMs,
       deadline: exitedAtMs + winMs, // 以服务端给的 ExitedAt 为准滚动
     })
@@ -296,7 +294,6 @@ function syncFading(list: StatsLiveExited[] | null | undefined, windowSeconds: n
       id: e.ID,
       name: e.Name || e.ID.slice(0, 8),
       model: e.Model || '',
-      calls: Number(e.Calls) || 0,
       exitedAtMs,
       deadline: exitedAtMs + winMs,
       leaving: false,
@@ -529,12 +526,14 @@ const miniStats = computed<MiniStat[]>(() => {
       tip: '仅统计请求中（Inflight>0）的会话；刚结束的会话会短暂淡出但不计入。管理端=全站，开发端=本人（与下方实时区同源）',
     },
     {
-      // 后端当前**没有**「请求中用户」计数：UsersTotal 是所选范围内的活跃用户口径，不能拿来顶替。
-      // 等 Core 提供请求中用户字段（或 UsersTotal 恢复 inflight 语义）后接上，这里如实标缺。
+      // UsersTotal 在 #69 之后才是「有请求中会话的用户数」。兼容期（响应里没有 RangeUsers/RangeUsersTotal）
+      // 它仍是范围口径，不能拿来顶替请求中用户 → 如实标「待后端合入」。
       label: '请求中用户',
-      value: '—',
-      pending: true,
-      tip: '后端当前未提供「请求中用户」计数（UsersTotal 是所选范围内有请求的用户数，口径不同，不能顶替）。待 Core 新增该字段后接入',
+      value: hasRangeUsers.value ? fmtInt(live.value?.UsersTotal ?? 0) : '—',
+      pending: !hasRangeUsers.value,
+      tip: hasRangeUsers.value
+        ? '有请求中会话的用户数（与 Users 行集同源；不含只有范围活跃、当前没有在途请求的用户）'
+        : '当前后端响应仍是范围口径：UsersTotal 是「所选范围内有请求的用户数」，不能顶替请求中用户。待 #69 合入后本项自动接上',
     },
   ]
 })
@@ -828,21 +827,48 @@ const dailyRangeText = computed(() => {
   return `${l.DailyFrom.slice(5)} ~ ${l.DailyTo.slice(5)} 每日`
 })
 
-const userRows = computed<LiveUserRow[]>(() =>
-  (live.value?.Users ?? []).map((u) => ({
+// 兼容期判定：#69 之后才有 RangeUsers / RangeUsersTotal 这两个字段。
+// 有 → 用户区走「范围内活跃用户」新口径；没有（#69 未合入）→ 退回旧 Users/UsersTotal（当时是范围口径），
+// 标签也回到「在线用户」，绝不把旧字段当新口径展示（不混用两套数）。
+const hasRangeUsers = computed(() => Array.isArray(live.value?.RangeUsers))
+const usersTabLabel = computed(() => (hasRangeUsers.value ? '范围内活跃用户' : '在线用户'))
+const usersTabTotal = computed(() =>
+  hasRangeUsers.value ? Number(live.value?.RangeUsersTotal ?? 0) : Number(live.value?.UsersTotal ?? 0),
+)
+// 两套用户列表共用一个 UsersTruncated（#69：RangeUsers 同样受用户上限约束）
+const usersTruncated = computed(() => !!live.value?.UsersTruncated)
+
+const userRows = computed<LiveUserRow[]>(() => {
+  const l = live.value
+  if (!l) return []
+  if (hasRangeUsers.value) {
+    // 新口径：RangeSessions/RangeCalls/RangeTokens/RangeCredits 是「所选范围」合计；
+    // WindowTokens/SpentCredits 是「近 Window 分钟」——刻意不同名，卡面各就各位、不互相顶替。
+    return (l.RangeUsers ?? []).map((u) => ({
+      id: u.ID,
+      name: u.Name || `用户 ${u.ID}`,
+      initial: (u.Name || '?').slice(0, 2),
+      sessions: u.RangeSessions,
+      tpmText: `${fmtCompact(u.TPM)} TPM`,
+      tokensText: fmtCompact(u.RangeTokens),
+      tokensTip: `所选范围 Token ${fmtCompact(u.RangeTokens)} · 近 ${liveWindowMinutes.value} 分钟 ${fmtCompact(u.WindowTokens)} · 范围内 ${fmtInt(u.RangeCalls)} 次请求 / ${fmtInt(u.RangeSessions)} 个会话`,
+      spentText: fmtMoney(u.RangeCredits),
+      spark: sparkPath(u.Daily?.length ? u.Daily : u.Spark ?? []),
+    }))
+  }
+  // 兼容兜底（#69 未合入时的老响应）：当时 Users 就是范围口径，字段名是 ActiveSessions/Calls/RangeTokens/RangeCredits
+  return (l.Users ?? []).map((u) => ({
     id: u.ID,
     name: u.Name || `用户 ${u.ID}`,
     initial: (u.Name || '?').slice(0, 2),
-    sessions: u.Sessions,
+    sessions: u.ActiveSessions ?? u.Sessions,
     tpmText: `${fmtCompact(u.TPM)} TPM`,
-    tokensText: fmtCompact(u.Tokens),
-    // 卡面看窗口用量（与吞吐同源），范围口径放 tooltip 里备查
-    tokensTip: `近 ${liveWindowMinutes.value} 分钟 Token；所选范围 ${fmtCompact(u.RangeTokens)} Token · ${fmtInt(u.Calls)} 次请求`,
-    spentText: fmtMoney(u.SpentCredits),
-    // 迷你曲线优先读日活跃序列 Daily（无请求日后端补 0）；老响应无 Daily 时退回分钟 Spark
+    tokensText: fmtCompact(u.RangeTokens ?? u.Tokens),
+    tokensTip: `所选范围 Token ${fmtCompact(u.RangeTokens ?? u.Tokens)} · 近 ${liveWindowMinutes.value} 分钟 ${fmtCompact(u.Tokens)} · 范围内 ${fmtInt(u.Calls ?? 0)} 次请求`,
+    spentText: fmtMoney(u.RangeCredits ?? u.SpentCredits),
     spark: sparkPath(u.Daily?.length ? u.Daily : u.Spark ?? []),
-  })),
-)
+  }))
+})
 
 // ===== 更多维度（旧版用量分析里仍有数据支撑的部分，默认收起）=====
 const moreOpen = ref<string[]>([])
@@ -1097,7 +1123,7 @@ const modeLabel = (m: string) =>
               我的会话{{ live ? ` · ${live.SessionsTotal}` : '' }}
             </el-radio-button>
             <el-radio-button v-if="isAdmin" value="users">
-              在线用户{{ live ? ` · ${live.UsersTotal}` : '' }}
+              {{ usersTabLabel }}{{ live ? ` · ${usersTabTotal}` : '' }}
             </el-radio-button>
           </el-radio-group>
           <span v-if="liveErr" class="live-err">{{ liveErr }}</span>
@@ -1188,7 +1214,13 @@ const modeLabel = (m: string) =>
                 <header class="xcard-head">
                   <span class="uavatar">{{ u.initial }}</span>
                   <span class="xcard-name" :title="u.name">{{ u.name }}</span>
-                  <span class="xcard-badge" :data-idle="u.sessions === 0">会话 {{ u.sessions }}</span>
+                  <el-tooltip
+                    :content="hasRangeUsers ? '所选范围内有过请求的会话数（去重）；此刻不一定在请求中' : '当前请求中的会话数'"
+                    placement="top"
+                    :show-after="150"
+                  >
+                    <span class="xcard-badge" :data-idle="u.sessions === 0">会话 {{ u.sessions }}</span>
+                  </el-tooltip>
                 </header>
                 <div class="xcard-stats">
                   <div class="xstat">
@@ -1201,21 +1233,27 @@ const modeLabel = (m: string) =>
                       <b>{{ u.tokensText }}</b>
                     </div>
                   </el-tooltip>
-                  <div class="xstat">
-                    <i>积分</i>
-                    <b>{{ u.spentText }}</b>
-                  </div>
+                  <el-tooltip
+                    :content="hasRangeUsers ? '所选范围内的消耗积分合计' : '近窗口消耗积分'"
+                    placement="top"
+                    :show-after="150"
+                  >
+                    <div class="xstat">
+                      <i>积分</i>
+                      <b>{{ u.spentText }}</b>
+                    </div>
+                  </el-tooltip>
                 </div>
                 <svg v-if="u.spark" class="spark xcard-spark" viewBox="0 0 92 24" preserveAspectRatio="none">
                   <path :d="u.spark" />
                 </svg>
               </article>
             </div>
-            <div v-if="live?.UsersTruncated" class="trunc-note">
-              仅显示前 100 个在线用户（共 {{ live?.UsersTotal }} 个）
+            <div v-if="usersTruncated" class="trunc-note">
+              仅显示前 100 个{{ usersTabLabel }}（共 {{ usersTabTotal }} 个）
             </div>
           </template>
-          <el-empty v-else-if="live" description="所选范围内没有在线用户" :image-size="60" />
+          <el-empty v-else-if="live" :description="`所选范围内没有${usersTabLabel}`" :image-size="60" />
           <el-empty v-else description="实时数据加载中" :image-size="60" />
         </div>
       </section>
