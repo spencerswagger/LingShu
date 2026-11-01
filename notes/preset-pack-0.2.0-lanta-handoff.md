@@ -6,6 +6,14 @@
 
 ---
 
+## ⚠ 顶部警示（比价更重要，先读这条）
+
+> **火山方舟 Agent Plan 两档（`volcengine-agentplan-personal` / `-enterprise`）的协议形态与 baseUrl，仅按官方公布的 Anthropic 形态填写。**
+> 官方「快速开始」页全文只有一个 URL：`https://ark.cn-beijing.volces.com/api/plan`，且原文强调「为专属 Base URL，**其他 Base URL 无法在 Agent Plan 中使用**」。
+> **在拿到「OpenAI 兼容 / Responses 形态」的官方证据之前：不得发布、不得自行补 `openai-chat` / `openai-responses` 协议、不得套用 Coding Plan 的 `/api/coding*`。** 协议或 baseUrl 填错不会报错，只会让该渠道**静默不可用**——这比价格错更隐蔽。
+
+---
+
 ## 0. 拼包前先知道的两件事
 
 1. **模型 key 与 `id` 一律不带档位后缀**（G1 硬约定）：`glm-5.3` 就是 `glm-5.3`，不要写 `glm-5.3@team`、`glm-5.3-personal`——带后缀会打不中上游模型。
@@ -17,8 +25,8 @@
 
 | # | `id`（providerId） | `name`（中文展示名，全局唯一） | `gateway.protocols` | 档位来源 |
 |---|---|---|---|---|
-| 1 | `volcengine-agentplan-personal` | 火山方舟 Agent Plan 个人版 | `openai-chat`、`anthropic-messages` | 元/百万 = 系数 × 0.2（1 AFP = ¥0.002） |
-| 2 | `volcengine-agentplan-enterprise` | 火山方舟 Agent Plan 企业版 | `openai-chat`、`anthropic-messages` | 元/百万 = 系数 × 0.3（1 AFP = ¥0.003） |
+| 1 | `volcengine-agentplan-personal` | 火山方舟 Agent Plan 个人版 | **仅 `anthropic-messages`** | 元/百万 = 系数 × 0.2（1 AFP = ¥0.002） |
+| 2 | `volcengine-agentplan-enterprise` | 火山方舟 Agent Plan 企业版 | **仅 `anthropic-messages`** | 元/百万 = 系数 × 0.3（1 AFP = ¥0.003） |
 | 3 | `tencent-tokenplan-lite` | 腾讯云 Token Plan Lite | `openai-chat`、`anthropic-messages` | 档位价（20 积分 = 1 元） |
 | 4 | `tencent-tokenplan-standard` | 腾讯云 Token Plan Standard | 同上 | 同上 |
 | 5 | `tencent-tokenplan-pro` | 腾讯云 Token Plan Pro | 同上 | 同上 |
@@ -29,12 +37,12 @@
 **每条 provider 的 `gateway` 里必须有的三项**：`"costCurrency": "CNY"`、`"offers": []`、`"protocols": {…}`。
 `protocols` 键名**精确小写**，只允许 `openai-chat` / `openai-responses` / `anthropic-messages`（`openai-compat` 是别名、会被归一，但别主动写；其他拼写会被白名单丢弃）。
 
-### 1.1 `gateway.baseUrl` 取值状态（**这里有一处必须补确认，别猜**）
+### 1.1 `gateway.baseUrl` 取值状态（火山已一手确认；其余三条按状态标，别猜）
 
 | provider | baseUrl | 状态 |
 |---|---|---|
-| 火山 Agent Plan（个人/企业） | **未取到官方原文** | ⚠ **待确认**：官方只说「以快速开始文档为准」。需要抓 `…/docs/agent-plan-personal-get-started`。**拿到前不要发布**（试拼可临时借用 Coding Plan 值，见下） |
-| 火山 Coding Plan（非本草案，仅供参考） | `https://ark.cn-beijing.volces.com/api/coding/v3`（OpenAI 兼容）、`https://ark.cn-beijing.volces.com/api/coding`（Anthropic 兼容） | ✅ 官方原文（**这是 Coding Plan 的，不要直接当 Agent Plan 用**） |
+| 火山 Agent Plan（个人/企业，两条同值） | `https://ark.cn-beijing.volces.com/api/plan` | ✅ **官方一手**（「快速开始」页唯一 URL；原文：专属 Base URL，其他 baseUrl 不可用）。**只支持 Anthropic 形态**；OpenAI 兼容 / Responses 形态官方未公布 |
+| 火山 Coding Plan（非本草案，仅供参考） | `https://ark.cn-beijing.volces.com/api/coding/v3`（OpenAI 兼容）、`https://ark.cn-beijing.volces.com/api/coding`（Anthropic 兼容） | ✅ 官方原文，但**这是 Coding Plan 的，不可当 Agent Plan 用** |
 | 腾讯 Token Plan（四条同） | `https://tokenhub.tencentmaas.com/plan/v3`（OpenAI 兼容）、`https://tokenhub.tencentmaas.com/plan/anthropic`（Anthropic） | ⚠ **第三方转述**（腾讯云社区文章），兰台请用官方「Token Plan 快速入门」页核一遍 |
 | 智谱 BigModel | `https://open.bigmodel.cn/api/paas/v4`（OpenAI 兼容） | ⚠ 需按官方接入页核对一次 |
 | 讯飞星辰 Astron | **未取到官方原文** | ⚠ **待确认**：官方只给了「兼容 OpenAI/Anthropic 协议接入地址」描述，未见具体域名 → 需抓订阅页/接入文档 |
@@ -47,8 +55,9 @@
 
 > 所有 `costRates` 数值 = **人民币元/百万 token 字面量**；火山两档的 `CacheRead` 一律 = `Input`（官方未公布缓存系数，按输入价保守计入，属**高估**、方向保守）。
 > `protocols` 每条模型都要有（带价模型若一个协议都不声明，整条含价格会被静默丢弃）。
+> **火山两档的模型条目 `protocols` 只写 `{"anthropic-messages": {}}`**——与 provider 级协议一致；不要写 `openai-chat`（官方未公布 OpenAI 兼容形态，见顶部警示）。
 
-### 2.1 `volcengine-agentplan-personal` / `-enterprise`（各 21 条）
+### 2.1 `volcengine-agentplan-personal` / `-enterprise`（各 21 条；模型 `protocols` 均只写 `anthropic-messages`）
 
 | 模型 key / `id` | personal Input / Output / CacheRead | enterprise Input / Output / CacheRead |
 |---|---|---|
@@ -146,28 +155,27 @@
       "glm-5.3": {
         "id": "glm-5.3",
         "name": "GLM-5.3",
-        "description": "火山方舟 Agent Plan 个人版，1 AFP = ¥0.002，系数 4.5 → 0.90 元/百万 token",
+        "description": "火山方舟 Agent Plan 个人版，1 AFP = ¥0.002，系数 4.5 → 0.90 元/百万 token；官方仅公布 Anthropic 形态专属 Base URL",
         "cost": { "input": 0.9, "output": 0.9, "cache_read": 0.9 },
         "gateway": {
-          "protocols": { "openai-chat": {} },
+          "protocols": { "anthropic-messages": {} },
           "costRates": { "Input": 0.9, "Output": 0.9, "CacheRead": 0.9 }
         }
       },
       "deepseek-v4-flash": {
         "id": "deepseek-v4-flash",
         "name": "DeepSeek-V4-Flash",
-        "description": "火山方舟 Agent Plan 个人版，系数 0.5 → 0.10 元/百万 token",
+        "description": "火山方舟 Agent Plan 个人版，系数 0.5 → 0.10 元/百万 token；官方仅公布 Anthropic 形态专属 Base URL",
         "cost": { "input": 0.1, "output": 0.1, "cache_read": 0.1 },
         "gateway": {
-          "protocols": { "openai-chat": {} },
+          "protocols": { "anthropic-messages": {} },
           "costRates": { "Input": 0.1, "Output": 0.1, "CacheRead": 0.1 }
         }
       }
     },
     "gateway": {
-      "baseUrl": "<TODO: 见 §1.1，需从 Agent Plan 快速开始页确认后替换，勿猜>",
+      "baseUrl": "https://ark.cn-beijing.volces.com/api/plan",
       "protocols": {
-        "openai-chat": { "path": "/chat/completions" },
         "anthropic-messages": { "path": "/v1/messages" }
       },
       "requestHeaders": { "passthroughMode": "none" },
@@ -182,6 +190,8 @@
 - `cost` 是 v1 展示位（灵枢不解析），但**必须与 `costRates` 同值**，否则两处读数打架。
 - `costRates` 三段**一个都不能少**；火山三段的 `CacheRead` 故意等于 `Input`（见 §2 抬头说明）。
 - `models` 的 key 与 `id` 一致、不带档位后缀；**不写 `externalModelID`**。
+- **`baseUrl` 是官方原值 `…/api/plan`，协议只有 `anthropic-messages`**；路径走 Anthropic 默认 `/v1/messages`（官方 base 到 `/api/plan` 为止，SDK 自行拼 `/v1/messages`）。
+- **鉴权不用配**：`anthropic-messages` 隐含注入 `x-api-key`，正好对应官方的 `ANTHROPIC_AUTH_TOKEN`（Agent Plan 专属 Key；方舟普通 Key、Coding Plan Key 都不能用）→ `requestHeaders.set` 不要写鉴权头。
 - `offers: []` 先留空（折扣见 §6）。
 
 ---
@@ -228,3 +238,41 @@
 | 4 | 火山 Agent Plan `baseUrl`、讯飞 `baseUrl` 官方原文未取到 | 影响 3 条 provider（火山 2 + 讯飞 1） | 见 §1.1，**拿到再发布**；试拼可临时用火山 Coding Plan 值验证链路，但不得上线 |
 
 > 前三项属「等 spencer 拍板」，第四项属「等 hugo 抓一页」——两类都**不阻塞兰台今天照骨架搭包**，只阻塞「正式发布」。
+
+---
+
+## 7. 给 hugo 的「待抓页面清单」（按优先级，抓不到就保持待定）
+
+> 只要 **URL + 要提取的字段 + 页面内定位关键词**；每条都写了「抓不到的预期结果」，避免白抓。
+> 判定口径：**只有官方页正文才算一手**；第三方转述只能维持「待核」状态。
+
+### ① 火山方舟 Agent Plan 接入页（最高优先：确认「是否真的只有 Anthropic 形态」）
+
+- URL：`https://docs.volcengine.com/docs/ark/agent-plan-personal-get-started`（或 `https://ark.volcengine.com/region:cn-beijing/docs/agent-plan-personal-get-started`）
+- 要提取：**是否存在「OpenAI 兼容 / Responses / 接入 AI 工具」章节**；若有，抓其中的 `base_url` 与支持协议；若没有，记录「全页 URL 只有 `/api/plan`」。
+- 定位关键词：`ANTHROPIC_BASE_URL`、`api/plan`、`OpenAI`、`Responses`、`arkcli auth login`。
+- **预期结果**：若确认只有 Anthropic 形态 → 本文件「火山只写 `anthropic-messages`」的结论**定稿**，兰台可发布；若发现 OpenAI 兼容形态 → 我再补 `openai-chat`（含 path）并更新 §1/§2。
+- 备注：hugo 已抓过一版，全篇只有 `/api/plan`；这一条只为**确认没有遗漏章节**，扫一遍「接入 AI 工具」目录即可，不必逐字读。
+
+### ② 讯飞星辰 Astron 接入页（当前完全空白）
+
+- URL：`https://www.xfyun.cn/doc/spark/TokenPlan.html`（同一文档内的「接入方式 / 调用示例」章节）
+- 要提取：**Token Plan 的 base URL（OpenAI 兼容与 Anthropic 兼容各是什么）+ 鉴权头形态**。
+- 定位关键词：`base_url`、`https://`、`OpenAI 兼容`、`Anthropic`、`apiKey`、`Authorization`。
+- **预期结果**：抓不到 → 该 provider 保持 `baseUrl` 留空、**不发布**；我不会用第三方转述填。
+
+### ③ 腾讯云 Token Plan 快速入门（把「第三方转述」升级成一手）
+
+- URL：`https://cloud.tencent.com/document/product/1823/130059`（Token Plan 个人版）→「快速开始 / API 使用说明」子页
+- 要提取：`Base URL`（OpenAI 兼容 `/plan/v3`、Anthropic `/plan/anthropic` 是否属实）+ 是否支持 Responses。
+- 定位关键词：`Base URL`、`/plan/v3`、`/plan/anthropic`、`Token Plan 专属`。
+- **预期结果**：若与转述一致 → 四条腾讯 provider 的 baseUrl 定稿；若不一致 → 以官方为准，我改 §1.1。
+
+### ④ 智谱 BigModel 接入页（核对 `api/paas/v4` 与 Anthropic 兼容入口）
+
+- URL：`https://docs.bigmodel.cn/cn/guide/start/quick-start`（或「接入指南 / API 参考」首节）
+- 要提取：OpenAI 兼容 `base_url`、Anthropic 兼容 `base_url`（若有）、是否支持 Responses。
+- 定位关键词：`base_url`、`open.bigmodel.cn`、`/api/paas/v4`、`/api/anthropic`。
+- **预期结果**：抓不到 → 保持「待核」，仍可按现值试拼（智谱不属 plan 渠道阻塞项）。
+
+> 一句话：**① 和 ② 是硬阻塞**（火山不确认不能发布、讯飞没 baseUrl 不能发布）；③④ 是「把待核变一手」，不阻塞搭包。
