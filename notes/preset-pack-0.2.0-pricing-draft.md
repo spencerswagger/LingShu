@@ -56,6 +56,7 @@
 ## 3. 火山方舟 Agent Plan（两条 provider，各 21 行；`CacheRead` 逐行显式填 = Input）
 
 **锚点（三处互证）**：个人版四档 40/20,000 = 200/100,000 = 500/250,000 = 1,000/500,000 = **¥0.002/AFP**；企业版四档 120/40,000 = … = **¥0.003/AFP**（价格 3 倍、额度 2 倍 ⇒ 单价 1.5 倍，已核非笔误）。
+**协议与 baseUrl（2026-10-30 更新，官方一手）**：官方「快速开始」页全文只有一个 URL `https://ark.cn-beijing.volces.com/api/plan`（原文：专属 Base URL，其他 baseUrl 不可用），**只公布 Anthropic 形态** ⇒ 两条 provider 与全部模型条目的 `protocols` **只写 `anthropic-messages`**，`openai-chat`/`openai-responses` 在拿到官方证据前**不得补**。详见 `notes/preset-pack-0.2.0-lanta-handoff.md` 顶部警示。
 **换算**：`AFP/百万 = 100 × 系数`；个人 `元/百万 = 系数 × 0.2`；企业 `= 系数 × 0.3`。
 **G3**：官方只公布输入=输出系数，**未公布缓存系数** → `CacheRead` 一律**显式填 `Input` 同价**，标注「官方未公布缓存系数，按输入价保守计入」。理由见 §8.1（这是**高估**、即保守方向；不填会静默记 0）。
 
