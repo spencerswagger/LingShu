@@ -81,3 +81,17 @@
 - **交付记录**：
   - 正本口径：`docs/preset-pack-format.md` §11.1 V9（实测）、§0.1 F3 第 ④ 种形态；
   - 验收证据与全部细节：`notes/pack-step3-acceptance.md`（Gate 产出）。
+
+---
+
+## [P1] 0.2.0 定价表达遗留（3 条格式缺口，2026-10-30）
+
+- **背景**：0.2.0 草案要把 plan 渠道实际价替进 `costRates`，暴露三处表达力缺口。**0.2.0 一律不加字段、不改代码**，先用正本 §0.2 的 G1/G2/G3 规避；三条缺口登记于此，等 spencer 拍板后再排期。
+- **验收标准**（每条独立可验收）：
+  1. **档位维度**：若将来允许「一个 provider 表达多档位价」，需给 `ModelGateway` 加档位维度（或新增 `tierRates`），并让渠道/渠道协议在物化时按档位选价（结构体 + 校验 + `toChannelProtocol` + 前端编辑面）。现状：档位靠拆 providerId 表达（正本 §0.2 G1），不占用代码。
+  2. **分段价矩阵**：若要精确表达「按 token 长度分段计价」，需新增 per-segment 价矩阵字段，并在计费侧按**实际上下文长度**取段（`billing.ComputeCredits` 现在只有单一 `ctxCoeff`）。现状：只收最高段单值（正本 §0.2 G2）。
+  3. **缓存价缺省回退**：若要让「`CacheRead` 缺省时回退 `Input`」，需在 `billing` 侧补回退 + 单测。现状：**数据侧必须显式填 `Input` 同价**（正本 §0.2 G3），正本**不写**未实现的回退。
+- **约束**：三条都会改动计费/物化路径或格式结构，**0.2.0 不做**；不得用文档描述一个代码没有的行为。
+- **状态**：待确认（需 spencer 拍板；0.2.0 不加）
+- **负责人**：待定（Ark 定口径 / Core 实现）
+- **交付记录**：口径正本 `docs/preset-pack-format.md` §0.2（分支 `docs/preset-pack-pricing-boundaries`）；0.2.0 草案 `notes/preset-pack-0.2.0-pricing-draft.md`（Spec）。
