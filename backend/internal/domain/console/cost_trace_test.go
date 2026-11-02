@@ -10,14 +10,11 @@ package console
 //   - 多线响应结构（每线独立渠道/模型标识 + 成本与售价序列）。
 
 import (
-	"context"
-	"database/sql"
 	"database/sql/driver"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
-	"strings"
 	"testing"
 	"time"
 
@@ -87,18 +84,6 @@ func TestParseChannelModelIDs(t *testing.T) {
 				}
 			}
 		})
-	}
-}
-
-func TestParseConfigBool(t *testing.T) {
-	cases := map[string]bool{
-		`true`: true, `false`: false, `"true"`: true, `"on"`: true,
-		`"1"`: true, `"no"`: false, ``: false, `null`: false, `1`: true, `乱码`: false,
-	}
-	for raw, want := range cases {
-		if got := parseConfigBool([]byte(raw)); got != want {
-			t.Fatalf("parseConfigBool(%q)=%v, want %v", raw, got, want)
-		}
 	}
 }
 
@@ -183,59 +168,10 @@ func TestBuildTraceSegments_NoSwitch(t *testing.T) {
 	}
 }
 
-// ---------- 开关 ----------
+// ---------- 通用查询期望 ----------
 
-func TestHandleCostPricingCurve_MultilineDisabled(t *testing.T) {
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("sqlmock: %v", err)
-	}
-	defer db.Close()
-	// 开关默认关闭：读不到键（sql.ErrNoRows）或值为 false 都按关闭处理。
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT value FROM sys_configs WHERE key = $1`)).
-		WithArgs(costViewsSwitchKey).
-		WillReturnRows(sqlmock.NewRows([]string{"value"}).AddRow([]byte(`false`)))
-
-	h := NewAdmin(db, nil, nil, nil)
-	h.now = func() time.Time { return pricingTestAt(t) }
-	rec := httptest.NewRecorder()
-	h.HandleCostPricingCurve(rec, httptest.NewRequest(http.MethodGet,
-		"/api/v1/admin/cost/pricing-curve?ChannelModelIDs=900,901", nil))
-	if rec.Code != http.StatusForbidden {
-		t.Fatalf("开关关闭时应 403，got %d body=%s", rec.Code, rec.Body.String())
-	}
-	if !contains(rec.Body.String(), "console.cost_multichannel_trace") {
-		t.Fatalf("403 文案应指明开关键: %s", rec.Body.String())
-	}
-}
-
-func TestHandleCostSessionTrace_Disabled(t *testing.T) {
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("sqlmock: %v", err)
-	}
-	defer db.Close()
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT value FROM sys_configs WHERE key = $1`)).
-		WithArgs(costViewsSwitchKey).
-		WillReturnRows(sqlmock.NewRows([]string{"value"}).AddRow([]byte(`false`)))
-
-	h := NewAdmin(db, nil, nil, nil)
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/cost/session/sess-1/trace", nil)
-	req.SetPathValue("id", "sess-1")
-	rec := httptest.NewRecorder()
-	h.HandleCostSessionTrace(rec, req)
-	if rec.Code != http.StatusForbidden {
-		t.Fatalf("开关关闭时应 403，got %d body=%s", rec.Code, rec.Body.String())
-	}
-}
-
-// ---------- 多线对比：接口层 ----------
-
-func expectSwitchOn(mock sqlmock.Sqlmock) {
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT value FROM sys_configs WHERE key = $1`)).
-		WithArgs(costViewsSwitchKey).
-		WillReturnRows(sqlmock.NewRows([]string{"value"}).AddRow([]byte(`true`)))
-}
+// expectSwitchOn 保留为空操作：门控已删除，两个只读接口恒可用（用例不再需要预置开关行）。
+func expectSwitchOn(mock sqlmock.Sqlmock) {}
 
 func expectGlobalTimeAndTiers(mock sqlmock.Sqlmock) {
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT value FROM sys_configs WHERE key = $1`)).
@@ -672,15 +608,24 @@ func TestHandleCostSessionTrace_Truncated(t *testing.T) {
 	}
 }
 
-// TestHandleCostSessionTrace_NilDB 未装配 DB：开关读不到 → 关闭 → 403（默认安全态）。
+// TestHandleCostSessionTrace_NilDB 未装配 DB 时仍返回 200 + 空轨迹（接口恒可用，不再有开关门控）。
 func TestHandleCostSessionTrace_NilDB(t *testing.T) {
 	h := NewAdmin(nil, nil, nil, nil)
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/cost/session/sess-x/trace", nil)
 	req.SetPathValue("id", "sess-x")
 	rec := httptest.NewRecorder()
 	h.HandleCostSessionTrace(rec, req)
-	if rec.Code != http.StatusForbidden {
-		t.Fatalf("无 DB 时开关按关闭处理，应 403，got %d", rec.Code)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("接口应恒可用（无门控），got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Data costTraceResponse `json:"Data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(body.Data.Points) != 0 || body.Data.Segments == nil || body.Data.ActualSwitches == nil {
+		t.Fatalf("空集合必须是 []，不能是 null: %+v", body.Data)
 	}
 }
 
@@ -993,208 +938,3 @@ func TestLoadSiblingChannelModels_FiltersDeadChannels(t *testing.T) {
 		t.Fatalf("查询期望未满足: %v", err)
 	}
 }
-
-// TestHandleGetSystemConfig_CostViewsSwitchReadError 读取失败 → 下发 null（未知），
-// 不能退化成 false 让前端照样回写（否则管理员一次保存就把开关静默关掉）。
-func TestHandleGetSystemConfig_CostViewsSwitchReadError(t *testing.T) {
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("sqlmock: %v", err)
-	}
-	defer db.Close()
-	admin := NewAdmin(db, billing.NewSqlStore(db), nil, nil)
-
-	expectConfigRow(mock, "billing.r", []byte(`10000`))
-	expectConfigRow(mock, "billing.cny_rate", []byte(`6.8`))
-	expectConfigRow(mock, "billing.context_tiers", []byte(`[]`))
-	expectConfigRow(mock, "billing.time_config", []byte(`{"Timezone":"Asia/Shanghai","Default":1}`))
-	expectConfigRow(mock, "routing.cost_sample", []byte(`{"input":10000,"cache_read":9000,"output":1000}`))
-	expectConfigRow(mock, "session.expiration", []byte(`{"default_ttl_minutes":5,"context_tiers":[],"turn_tiers":[]}`))
-	expectConfigRow(mock, "gateway.upstream_response_header_whitelist", []byte(`[]`))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT value FROM sys_configs WHERE key = $1`)).
-		WithArgs(costViewsSwitchKey).
-		WillReturnError(context.DeadlineExceeded) // 不是 sql.ErrNoRows：属「未知」
-
-	rec := httptest.NewRecorder()
-	admin.HandleGetSystemConfig(rec, httptest.NewRequest(http.MethodGet, "/api/v1/admin/configs/system", nil))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
-	}
-	if !contains(rec.Body.String(), `"MultichannelTrace":null`) {
-		t.Fatalf("读取失败应下发 null（前端跳过回写）: %s", rec.Body.String())
-	}
-}
-
-// TestCostViewsCheckOrderUnified 关闭开关时两个端点对「非法参数」都先返回 400（参数优先于能力开关），
-// 只有参数合法时才走 403，避免同一开关两种口径。
-func TestCostViewsCheckOrderUnified(t *testing.T) {
-	t.Run("trace 关闭+非法 Limit = 400", func(t *testing.T) {
-		db, _, err := sqlmock.New()
-		if err != nil {
-			t.Fatalf("sqlmock: %v", err)
-		}
-		defer db.Close()
-		h := NewAdmin(db, nil, nil, nil)
-		h.now = func() time.Time { return pricingTestAt(t) }
-		rec := httptest.NewRecorder()
-		h.HandleCostSessionTrace(rec, traceRequest("sess-x", "?Limit=abc"))
-		if rec.Code != http.StatusBadRequest {
-			t.Fatalf("关闭开关 + 非法 Limit 应 400（与 pricing-curve 统一），got %d body=%s", rec.Code, rec.Body.String())
-		}
-	})
-	t.Run("pricing-curve 关闭+非法 ChannelModelIDs = 400", func(t *testing.T) {
-		db, _, err := sqlmock.New()
-		if err != nil {
-			t.Fatalf("sqlmock: %v", err)
-		}
-		defer db.Close()
-		h := NewAdmin(db, nil, nil, nil)
-		h.now = func() time.Time { return pricingTestAt(t) }
-		rec := httptest.NewRecorder()
-		h.HandleCostPricingCurve(rec, httptest.NewRequest(http.MethodGet,
-			"/api/v1/admin/cost/pricing-curve?ChannelModelIDs=900,abc", nil))
-		if rec.Code != http.StatusBadRequest {
-			t.Fatalf("非法 ChannelModelIDs 应 400，got %d body=%s", rec.Code, rec.Body.String())
-		}
-	})
-}
-
-// ---------- 开关的读写（系统配置） ----------
-
-// TestHandleGetSystemConfig_CostViewsSwitch 断言系统配置 GET 下发 Console.MultichannelTrace，
-// 且库中值为 true 时如实返回 true。
-func TestHandleGetSystemConfig_CostViewsSwitch(t *testing.T) {
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("sqlmock: %v", err)
-	}
-	defer db.Close()
-	admin := NewAdmin(db, billing.NewSqlStore(db), nil, nil)
-
-	expectConfigRow(mock, "billing.r", []byte(`10000`))
-	expectConfigRow(mock, "billing.cny_rate", []byte(`6.8`))
-	expectConfigRow(mock, "billing.context_tiers", []byte(`[]`))
-	expectConfigRow(mock, "billing.time_config", []byte(`{"Timezone":"Asia/Shanghai","Default":1}`))
-	expectConfigRow(mock, "routing.cost_sample", []byte(`{"input":10000,"cache_read":9000,"output":1000}`))
-	expectConfigRow(mock, "session.expiration", []byte(`{"default_ttl_minutes":5,"context_tiers":[],"turn_tiers":[]}`))
-	expectConfigRow(mock, "gateway.upstream_response_header_whitelist", []byte(`[]`))
-	// 开关键最后读（Handler 里 Console 块在 map 字面量末尾求值）；
-	// 注意 sysConfigRaw 的 SQL 是 `key = $1`（带空格），与 admin_test 里的 helper 不同源。
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT value FROM sys_configs WHERE key = $1`)).
-		WithArgs(costViewsSwitchKey).
-		WillReturnRows(sqlmock.NewRows([]string{"value"}).AddRow([]byte(`true`)))
-
-	rec := httptest.NewRecorder()
-	admin.HandleGetSystemConfig(rec, httptest.NewRequest(http.MethodGet, "/api/v1/admin/configs/system", nil))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
-	}
-	var body struct {
-		Data struct {
-			Console struct {
-				MultichannelTrace bool `json:"MultichannelTrace"`
-			} `json:"Console"`
-		} `json:"Data"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if !body.Data.Console.MultichannelTrace {
-		t.Fatalf("库中为 true 时应下发 true: %s", rec.Body.String())
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("查询期望未满足: %v", err)
-	}
-}
-
-// TestHandleGetSystemConfig_CostViewsSwitchMissing 断言键缺失时默认 false（默认关闭 = 现状不变）。
-func TestHandleGetSystemConfig_CostViewsSwitchMissing(t *testing.T) {
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("sqlmock: %v", err)
-	}
-	defer db.Close()
-	admin := NewAdmin(db, billing.NewSqlStore(db), nil, nil)
-
-	expectConfigRow(mock, "billing.r", []byte(`10000`))
-	expectConfigRow(mock, "billing.cny_rate", []byte(`6.8`))
-	expectConfigRow(mock, "billing.context_tiers", []byte(`[]`))
-	expectConfigRow(mock, "billing.time_config", []byte(`{"Timezone":"Asia/Shanghai","Default":1}`))
-	expectConfigRow(mock, "routing.cost_sample", []byte(`{"input":10000,"cache_read":9000,"output":1000}`))
-	expectConfigRow(mock, "session.expiration", []byte(`{"default_ttl_minutes":5,"context_tiers":[],"turn_tiers":[]}`))
-	expectConfigRow(mock, "gateway.upstream_response_header_whitelist", []byte(`[]`))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT value FROM sys_configs WHERE key = $1`)).
-		WithArgs(costViewsSwitchKey).
-		WillReturnError(sql.ErrNoRows) // 缺失 → 默认关闭
-
-	rec := httptest.NewRecorder()
-	admin.HandleGetSystemConfig(rec, httptest.NewRequest(http.MethodGet, "/api/v1/admin/configs/system", nil))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
-	}
-	if contains(rec.Body.String(), `"MultichannelTrace":true`) {
-		t.Fatalf("缺失时应默认 false: %s", rec.Body.String())
-	}
-}
-
-// TestHandlePutSystemConfig_CostViewsSwitch 断言带 Console 块时按开关键落库，不带则完全不动（老客户端行为不变）。
-func TestHandlePutSystemConfig_CostViewsSwitch(t *testing.T) {
-	baseBody := `{"Billing":{"R":10000,"CnyRate":6.8,"ContextTiers":[],` +
-		`"TimeConfig":{"Timezone":"Asia/Shanghai","Default":1},` +
-		`"CostSample":{"input":12345,"cache_read":6000,"output":2000}},` +
-		`"SessionExpiration":{"default_ttl_minutes":5,"context_tiers":[{"max_tokens":2000,"ttl_minutes":5}],` +
-		`"turn_tiers":[{"max_turns":2,"ttl_minutes":5}]},` +
-		`"UpstreamResponseHeaderWhitelist":["traceparent"]}`
-
-	// ① 带 Console 块 → 多写一个开关键
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("sqlmock: %v", err)
-	}
-	defer db.Close()
-	admin := NewAdmin(db, billing.NewSqlStore(db), nil, testUserIDFrom)
-	for _, key := range []string{
-		"billing.r", "billing.cny_rate", "billing.context_tiers", "billing.time_config",
-		"routing.cost_sample", "session.expiration", "gateway.upstream_response_header_whitelist",
-		costViewsSwitchKey,
-	} {
-		mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO sys_configs(key, value, updated_by)`)).
-			WithArgs(key, sqlmock.AnyArg(), sqlmock.AnyArg()).
-			WillReturnResult(sqlmock.NewResult(0, 1))
-	}
-	body := strings.TrimSuffix(baseBody, "}") + `,"Console":{"MultichannelTrace":true}}`
-	rec := httptest.NewRecorder()
-	admin.HandlePutSystemConfig(rec, httptest.NewRequest(http.MethodPut, "/api/v1/admin/configs/system", strings.NewReader(body)))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("开关键未落库: %v", err)
-	}
-
-	// ② 不带 Console 块 → 只有原来的七个键（逐位兼容）
-	db2, mock2, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("sqlmock: %v", err)
-	}
-	defer db2.Close()
-	admin2 := NewAdmin(db2, billing.NewSqlStore(db2), nil, testUserIDFrom)
-	for _, key := range []string{
-		"billing.r", "billing.cny_rate", "billing.context_tiers", "billing.time_config",
-		"routing.cost_sample", "session.expiration", "gateway.upstream_response_header_whitelist",
-	} {
-		mock2.ExpectExec(regexp.QuoteMeta(`INSERT INTO sys_configs(key, value, updated_by)`)).
-			WithArgs(key, sqlmock.AnyArg(), sqlmock.AnyArg()).
-			WillReturnResult(sqlmock.NewResult(0, 1))
-	}
-	rec2 := httptest.NewRecorder()
-	admin2.HandlePutSystemConfig(rec2, httptest.NewRequest(http.MethodPut, "/api/v1/admin/configs/system", strings.NewReader(baseBody)))
-	if rec2.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s", rec2.Code, rec2.Body.String())
-	}
-	if err := mock2.ExpectationsWereMet(); err != nil {
-		t.Fatalf("老请求不应多写开关键: %v", err)
-	}
-}
-
-var _ = billing.Rates{}
