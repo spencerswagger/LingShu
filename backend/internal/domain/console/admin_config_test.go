@@ -392,7 +392,87 @@ func TestPutSystemConfig_HotReloadWithoutRestart(t *testing.T) {
 	}
 }
 
-// TestPutSystemConfig_ResponseAffectedCounts 老客户端提交全量字段时，Affected = 实际写入键数。
+// TestPutSystemConfig_AffectedCountsConfigRows 把 `Affected` 的口径钉死：
+// **= 本次实际写入 sys_configs 的配置行数（非字段数）**。四个场景逐一锁住：
+//
+//	① 同块两字段（SessionCost 内 enabled + remaining_a）        → 1
+//	② 跨两块同时改（Billing.R + SessionExpiration）             → 2
+//	③ 空请求体 {}                                               → 0（且零写入）
+//	④ 非法值 400                                                → 0（且零写入）
+func TestPutSystemConfig_AffectedCountsConfigRows(t *testing.T) {
+	validSessionExpiration := `{"default_ttl_minutes":5,"context_tiers":[],"turn_tiers":[]}`
+	cases := []struct {
+		name     string
+		body     string
+		wantCode int
+		want     float64
+		// expectKeys 为期望写入的配置键（顺序即调用顺序）；nil 表示不应有任何写入。
+		expectKeys []string
+		// base 为 SessionCost 合并基线的现有值（仅在请求带 Routing 时需要）。
+		base []byte
+	}{
+		{
+			name:       "同块两字段算一行",
+			body:       `{"Routing":{"SessionCost":{"enabled":false,"remaining_a":15}}}`,
+			wantCode:   http.StatusOK,
+			want:       1,
+			expectKeys: []string{router.SessionCostConfigKey},
+			base:       []byte(`{"enabled":true,"mid_switch":true,"remaining_a":10}`),
+		},
+		{
+			name:       "跨两块算两行",
+			body:       `{"Billing":{"R":10000},"SessionExpiration":` + validSessionExpiration + `}`,
+			wantCode:   http.StatusOK,
+			want:       2,
+			expectKeys: []string{"billing.r", "session.expiration"},
+		},
+		{
+			name:     "空请求体算零行",
+			body:     `{}`,
+			wantCode: http.StatusOK,
+			want:     0,
+		},
+		{
+			name:     "校验失败零行零写入",
+			body:     `{"Routing":{"SessionCost":{"min_improve":1.5}}}`,
+			wantCode: http.StatusBadRequest,
+			want:     0,
+			base:     nil,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatalf("sqlmock: %v", err)
+			}
+			defer db.Close()
+			admin := NewAdmin(db, billing.NewSqlStore(db), nil, testUserIDFrom)
+
+			if strings.Contains(c.body, `"SessionCost"`) {
+				expectSessionCostRow(mock, c.base) // 合并基线读取
+			}
+			for _, key := range c.expectKeys {
+				mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO sys_configs(key, value, updated_by)`)).
+					WithArgs(key, sqlmock.AnyArg(), sqlmock.AnyArg()).
+					WillReturnResult(sqlmock.NewResult(0, 1))
+			}
+
+			code, affected := putSystemConfig(t, admin, c.body)
+			if code != c.wantCode {
+				t.Fatalf("status=%d want=%d", code, c.wantCode)
+			}
+			if code == http.StatusOK && affected != c.want {
+				t.Fatalf("Affected=%v want=%v（口径=写入的配置行数）", affected, c.want)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatalf("写入键与期望不符（或多写了）: %v", err)
+			}
+		})
+	}
+}
+
+// TestPutSystemConfig_ResponseAffectedCounts 老客户端提交全量字段时，Affected = 实际写入的配置行数。
 func TestPutSystemConfig_ResponseAffectedCounts(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {

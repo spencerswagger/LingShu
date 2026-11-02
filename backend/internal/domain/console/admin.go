@@ -751,8 +751,14 @@ type systemConfigPutRouting struct {
 }
 
 // HandlePutSystemConfig PUT /api/v1/admin/configs/system
-// 只更新**请求体里出现的键**（缺失的键 / 整块保持库中现值）；响应 Affected = 实际写入的键数。
-// 任一出现字段校验失败返回 400 且不落库。
+//
+// 只更新**请求体里出现的键**：缺失的键、缺失的整块一律保持库中现值，绝不用默认值覆盖。
+// 任一出现字段校验失败返回 400 且**一个键都不写**。
+//
+// 响应 `Affected` = 本次**实际写入 sys_configs 的配置行数**（不是字段数）：
+//   - 一个配置块 = 一行（`Routing.SessionCost` 里改多个字段仍算 1 行）；
+//   - 独立标量键各算 1 行（`Billing.R`、`Billing.CNYRate`、白名单……各自一行）；
+//   - 请求体为空 = 0；校验失败（400）= 0 且零写入。
 func (h *Admin) HandlePutSystemConfig(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Billing *systemConfigPutBilling `json:"Billing"`
@@ -821,6 +827,8 @@ func (h *Admin) HandlePutSystemConfig(w http.ResponseWriter, r *http.Request) {
 
 	operator, _ := h.userIDFrom(r.Context())
 	ctx := r.Context()
+	// affected = 实际写入 sys_configs 的配置行数（非字段数；同块多字段算 1 行），
+	// 每次 UpsertConfig 成功 +1（一次调用落一行）。
 	affected := 0
 	upsert := func(key string, val []byte, failMsg string) bool {
 		if err := h.billing.UpsertConfig(ctx, key, val, operator); err != nil {
@@ -873,6 +881,7 @@ func (h *Admin) HandlePutSystemConfig(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// Affected = 写入的配置行数（非字段数）：同一块内改多个字段仍为 1。
 	resp.OK(w, r, map[string]any{"Affected": affected})
 }
 
@@ -1344,6 +1353,7 @@ func (h *Admin) HandleKickSessions(w http.ResponseWriter, r *http.Request) {
 	if req.UserID != 0 || req.TokenID != 0 || req.ChannelKeyID != 0 {
 		affected += h.sessions.CloseByFilter(req.UserID, req.TokenID, req.ChannelKeyID)
 	}
+	// Affected = 写入的配置行数（非字段数）：同一块内改多个字段仍为 1。
 	resp.OK(w, r, map[string]any{"Affected": affected})
 }
 
