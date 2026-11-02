@@ -6,8 +6,11 @@ import (
 	"sync"
 )
 
-// cfgSessionCost 会话成本路由配置在 sys_configs 中的键。
-const cfgSessionCost = "routing.session_cost"
+// SessionCostConfigKey 会话成本路由配置在 sys_configs 中的键（管理端读写用同一常量，避免两处漂移）。
+const SessionCostConfigKey = "routing.session_cost"
+
+// cfgSessionCost 包内别名（历史调用点保持不变）。
+const cfgSessionCost = SessionCostConfigKey
 
 // SessionCostConfig 会话成本路由配置（routing.session_cost）。
 //
@@ -77,6 +80,19 @@ func defaultSessionCostConfig() SessionCostConfig {
 		MinImprove:   0.05,
 	}
 }
+
+// DefaultSessionCostConfig 返回**产品默认**配置。
+//
+// 供管理端在「配置里少写了某字段」时按运行态回显；「配置读不到/解析不了」请用 SafeSessionCostConfig。
+func DefaultSessionCostConfig() SessionCostConfig { return defaultSessionCostConfig() }
+
+// SafeSessionCostConfig 返回**故障安全态**（三态开关全关 + 数值默认），供管理端在配置缺失/损坏时
+// 回显「运行时会怎么走」，与 SessionCostProvider.Config 的回退口径一致。
+func SafeSessionCostConfig() SessionCostConfig { return safeSessionCostConfig() }
+
+// ParseSessionCostConfig 解析 routing.session_cost：未提供的字段用产品默认补齐，JSON 非法返回 ok=false。
+// 与运行时读取共用同一实现，保证「面板上看到的就是运行时用的」。
+func ParseSessionCostConfig(raw []byte) (SessionCostConfig, bool) { return parseSessionCostConfig(raw) }
 
 // safeSessionCostConfig 返回**故障安全态**：配置读取失败 / 解析失败 / 未装配配置源时使用。
 // 三态开关一律关闭（渠道不变、无额外异步写），避免配置异常被放大成路由行为异常。

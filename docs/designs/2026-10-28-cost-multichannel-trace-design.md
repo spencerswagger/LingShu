@@ -72,15 +72,17 @@ A/B/C 三家渠道上谁更便宜」，只能反复切换下拉、肉眼比对�
 - `Step` / `MaxTokens` **永远回吐实际生效的采样参数**：未显式传时按该模型分档推导、
   再按点数上限收敛（与定价曲线同规则）；连提前返回的分支也带上，前端不会显示「上限 0」。
 
-## 3. 功能开关
+## 3. 功能开关（**已于 2026-11-02 移除**）
+
+> **rev.2（2026-11-02）**：服务端门控已删除——两个只读接口**恒可用**（`pricing-curve` 的
+> `ChannelModelIDs` 与 `session/{id}/trace` 不再有 403 分支），`Console` 请求/响应块与
+> `console.cost_multichannel_trace` 种子键一并清除。成本页的显示开关改由**前端 localStorage**
+> 承载（只影响读、不落库）。下面记录的是当初的设计，供追溯。
 
 - 键：`console.cost_multichannel_trace`，**默认 `false`**（`internal/seeding/seed.go` 种子）。
-- 读：`GET /api/v1/admin/configs/system` 的响应新增 `Console.MultichannelTrace`（键缺失/值非法/未装配 DB 一律 false）。
-- 写：`PUT /api/v1/admin/configs/system` 新增**可选** `Console` 块；**不传该块 = 不写该键**，
-  老客户端的三组全量 PUT 行为与写入顺序完全不变（有测试锁）。
-- 关闭时的表现：`pricing-curve` 传 `ChannelModelIDs` → **403**（`40301`，文案直接点出开关键名）；
-  `.../trace` → **403**。不传新参数的旧请求**完全不受影响**。
-- 为什么用 403 而不是 400：这是「能力未启用」而非「参数写错」，单独一个状态码，前端可据此隐藏入口。
+- 读：`GET /api/v1/admin/configs/system` 的响应曾新增 `Console.MultichannelTrace`。
+- 写：`PUT /api/v1/admin/configs/system` 曾新增**可选** `Console` 块。
+- 关闭时的表现（历史上）：`pricing-curve` 传 `ChannelModelIDs` → **403**；`.../trace` → **403**。
 
 ## 4. 明确不做
 
