@@ -144,32 +144,6 @@ export interface StatsKPI {
   DeltaRequests: number
 }
 
-export interface StatsCounts {
-  Total: number
-  Normal: number
-  Drain: number
-  Disabled: number
-}
-
-export interface StatsModelCounts {
-  ExternalTotal: number
-  ExternalEnabled: number
-  InternalTotal: number
-  InternalNormal: number
-}
-
-// 渠道无独立状态，仅总数（可用性见 Keys 三态）
-export interface StatsChannelCounts {
-  Total: number
-}
-
-// 运维块（仅管理端返回）
-export interface StatsOps {
-  Channels: StatsChannelCounts
-  Keys: StatsCounts
-  Models: StatsModelCounts
-}
-
 export interface StatsDashboard {
   Scope: string // global | self
   From: string
@@ -177,7 +151,7 @@ export interface StatsDashboard {
   KPI: StatsKPI
   Usage: StatsUsage
   ModelPlaza: StatsModelPlaza
-  Ops?: StatsOps
+  // 运维概览块已在 v4 删除：后端仍可能回 Ops 字段，前端不读、也不再建模（v4 第 1 条）
 }
 
 // 按角色选择端点：ADMIN → 全局；其余（DEVELOPER）→ 本人
@@ -190,12 +164,16 @@ export function getStatsDashboard(
 }
 
 // ===== 增量可选参数（不传 = 老行为，后端按 auto 判定粒度）=====
+// 模型广场排序键（后端白名单 tokens|tpm|failed|latency，非法值静默回落 tokens）。
+export type StatsModelSort = 'tokens' | 'tpm' | 'failed' | 'latency'
+
 export interface StatsDashboardParams {
   From?: string
   To?: string
   Granularity?: 'auto' | 'hour' | 'day'
   CompareDays?: number // 0~7，四线图传 4
-  // ModelSort 已下线（v4 第 3 条）：后端固定按 Token 倒序，前端不再传排序参数。
+  // 模型广场排序：tokens（默认）/tpm/failed/latency。响应里的 ModelPlaza.Sort 回显实际生效值。
+  ModelSort?: StatsModelSort
   ModelLimit?: number // 1~200
   // exact（默认）= 严格按请求区间的滚动窗口；calendar = 北京时间自然日归一。
   // KPI / Hourly / ModelPlaza 跟这个窗口走，Usage.Daily 与其它维度聚合仍是日界口径。
@@ -226,18 +204,34 @@ export interface StatsLiveSession {
 export interface StatsLiveUser {
   ID: string
   Name: string
-  Sessions: number // 仍只数 Inflight>0 的会话
-  Tokens: number // 该用户全部会话的近 Window 用量
+  // ↓ 旧字段（#69 起回到 origin/main 语义）：行集与聚合都只看**请求中会话**
+  Sessions: number // 该用户当前请求中的会话数
+  Tokens: number // 近 Window 分钟 Token（仅请求中会话）
   TPM: number // 墙钟窗口平均
-  SpentCredits: number
-  // 所选时间范围内的活跃会话数 / 请求数 / Token / 积分（billing_records 同源）
-  ActiveSessions: number
-  Calls: number
-  RangeTokens: number
-  RangeCredits: number
-  // 逐日 Token 序列（长度 = DailyPoints，无请求日补 0，时间正序）→ 迷你曲线
-  Daily: number[]
+  SpentCredits: number // 近 Window 分钟积分（仅请求中会话）
   Spark: number[] // 时间正序，无请求分钟补 0
+  // ↓ 以下四个是 #66 引入的旧范围字段，仅为兼容保留（#69 起范围口径请看 StatsLiveRangeUser）
+  ActiveSessions?: number
+  Calls?: number
+  RangeTokens?: number
+  RangeCredits?: number
+  Daily?: number[]
+}
+
+// 「范围内活跃用户」一行（#69 新口径，独立字段，与 StatsLiveUser 的请求中口径**刻意不同名**）。
+// 行集 = 所选范围 [From, To] 内有过请求的用户全集，包含「此刻没有请求中会话」的用户。
+export interface StatsLiveRangeUser {
+  ID: string
+  Name: string
+  RangeSessions: number // 范围内有过请求的会话数（去重）
+  RangeCalls: number // 范围内请求数
+  RangeTokens: number // 范围内 Token 合计（三段求和）
+  RangeCredits: number // 范围内消耗积分合计
+  WindowTokens: number // 近 Window 分钟 Token（覆盖其全部会话，别和 RangeTokens 混用）
+  SpentCredits: number // 近 Window 分钟积分
+  TPM: number // WindowTokens ÷ Window 分钟
+  Spark: number[]
+  Daily: number[] // 日活跃序列（DailyFrom~DailyTo，无请求日补 0）
 }
 
 // 刚结束请求、正在淡出的会话（**纯展示**，不参与会话数/用户数与任何聚合）。
@@ -248,7 +242,7 @@ export interface StatsLiveExited {
   Name: string // 可能为空 → 前端用 ID 前缀兜底
   Model: string
   ExitedAt: string // 淡出起点（RFC3339）
-  Calls: number // 该会话累计请求数（仅卡片收尾展示）
+  // #69 起后端不再下发 Calls：卡片收尾不展示请求数，前端别读这个字段。
 }
 
 export interface StatsLive {
@@ -264,14 +258,22 @@ export interface StatsLive {
   DailyTo: string
   DailyPoints: number
   // 我的会话总数（未截断）= **仅请求中**（Inflight > 0）；刚结束的会话只在 RecentlyExited 里淡出，
-  // 不会抬高这个数字，前端也不要用 LastActive 再过滤一次。
-  SessionsTotal: number
-  UsersTotal: number // 所选范围内有过请求的用户数（与 Users 同源未截断）
+  // 不会抬高这个数字，前端也不要用 LastActive 再过滤一次。允许 null（缺失时前端显示「—」）。
+  SessionsTotal?: number | null
+  // 有请求中会话的用户数（#69 起回到 origin/main 语义，与 Users 行集同源未截断）。
+  // 允许 null：后端异常/老版本可能不吐，前端用 numOrNull 收口后渲染「—」，不显示 null/NaN。
+  UsersTotal?: number | null
+  // 所选范围内有过请求的用户数（#69 新字段，与 RangeUsers 同源未截断）。
+  // 兼容判据只看 RangeUsers 是否数组；这个总数缺失时页签显示「—」。
+  RangeUsersTotal?: number | null
   Truncated: boolean
   UsersTruncated: boolean
   // Sessions 由服务端保证「只有请求中的会话」（不要再用 LastActive 过滤）。
   Sessions: StatsLiveSession[] | null
+  // 旧口径（仅请求中会话涉及的用户）
   Users: StatsLiveUser[] | null
+  // 新口径：范围内活跃用户（#69 才有的字段；老响应没有 → 走兼容兜底）
+  RangeUsers?: StatsLiveRangeUser[] | null
   // 淡出窗口内刚结束请求的会话（上限 20，按最近活跃倒序）。**纯展示字段**：
   // 不计入 SessionsTotal / UsersTotal，不参与任何排序与聚合。
   RecentlyExited?: StatsLiveExited[] | null

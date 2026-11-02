@@ -3,7 +3,7 @@
 //   ① 首屏 3 个大数字（总 Token / 总消费积分 / 吞吐量）+ 5 项小指标
 //   ② 24h 四日对比趋势（今天/昨天/前天/大前天，按 HourOfDay 对齐，缺桶断线）
 //   ③ 模型广场（后端按 Token 倒序 + 截断，含零用量模型供折叠；无排序控件、无进度条）
-//   ④ 实时区（/stats/live，30s 刷新）：我的会话 / 在线用户，均为卡片网格
+//   ④ 实时区（/stats/live，30s 刷新）：我的会话（仅请求中）/ 范围内活跃用户，均为卡片网格
 //
 // 三个吞吐口径刻意区分（见 docs/designs/2026-10-25-stats-dashboard-backend.md §4）：
 //   首屏      = KPI.TPM            全窗口忙时口径（≈60÷同批请求平均耗时）
@@ -21,6 +21,8 @@ import {
   type StatsHour,
   type StatsLive,
   type StatsLiveExited,
+  type StatsLiveRangeUser,
+  type StatsModelSort,
   type StatsTopItem,
   type StatsModelStat,
   type StatsModelPlaza,
@@ -84,11 +86,21 @@ function resolveRange(): { from: Date; to: Date } {
   return { from, to: end }
 }
 
-// ===== 模型广场（v4 第 3 条：去排序控件，后端固定按 Token 倒序）=====
+// ===== 模型广场（v4 第 3 条：只留数据列 + 复制 + 空闲折叠；排序仍可切，后端白名单 tokens|tpm|failed|latency）=====
 const MODEL_LIMIT = 50
 const COMPARE_DAYS = 4
 // 首屏 KPI / 小时趋势 / 模型广场都按「请求区间的严格滚动窗口」算（后端默认 exact）。
 const WINDOW_MODE: 'exact' | 'calendar' = 'exact'
+
+const modelSort = ref<StatsModelSort>('tokens')
+const MODEL_SORT_OPTIONS: { value: StatsModelSort; label: string }[] = [
+  { value: 'tokens', label: 'Token' },
+  { value: 'tpm', label: '吞吐' },
+  { value: 'failed', label: '失败' },
+  { value: 'latency', label: '耗时' },
+]
+// 排序切换只重取 dashboard（实时区不受影响），静默刷新不闪整页 loading。
+watch(modelSort, () => load({ silent: true }))
 
 // 请求序号守卫：筛选切换、手动刷新、30s 轮询可能在途交叠，
 // 只接受「最新一次」请求的响应，过期响应直接丢弃（不写 store、不闪界面）。
@@ -108,6 +120,7 @@ async function load(opts: { silent?: boolean } = {}) {
       To: toRFC3339CN(to),
       Granularity: granularity.value,
       CompareDays: COMPARE_DAYS,
+      ModelSort: modelSort.value,
       ModelLimit: MODEL_LIMIT,
       Window: WINDOW_MODE,
     })
@@ -203,7 +216,6 @@ interface FadingCard {
   id: string
   name: string
   model: string
-  calls: number
   exitedAtMs: number // ExitedAt 解析值（解析失败退化为收到响应的时刻）
   deadline: number // exitedAtMs + FadeWindowSeconds（到点移除）
   leaving: boolean // 进入最后 400ms：opacity → 0
@@ -271,7 +283,6 @@ function syncFading(list: StatsLiveExited[] | null | undefined, windowSeconds: n
       ...card,
       name: inc.Name || card.name,
       model: inc.Model || card.model,
-      calls: Number(inc.Calls) || card.calls,
       exitedAtMs,
       deadline: exitedAtMs + winMs, // 以服务端给的 ExitedAt 为准滚动
     })
@@ -284,7 +295,6 @@ function syncFading(list: StatsLiveExited[] | null | undefined, windowSeconds: n
       id: e.ID,
       name: e.Name || e.ID.slice(0, 8),
       model: e.Model || '',
-      calls: Number(e.Calls) || 0,
       exitedAtMs,
       deadline: exitedAtMs + winMs,
       leaving: false,
@@ -332,7 +342,7 @@ onUnmounted(() => {
 watch(preset, () => {
   if (preset.value !== 'custom') {
     load()
-    loadLive() // 在线用户范围跟页面时间范围走，筛选变了要重取
+    loadLive() // 用户统计范围（= 页面时间范围）变了要重取
   }
 })
 watch(customRange, (v) => {
@@ -481,6 +491,8 @@ interface MiniStat {
   value: string
   tone?: 'ok' | 'info'
   tip?: string
+  // 后端尚未提供的指标：如实标「待后端」，不自己造数
+  pending?: boolean
 }
 
 const miniStats = computed<MiniStat[]>(() => {
@@ -507,6 +519,26 @@ const miniStats = computed<MiniStat[]>(() => {
       label: '输入输出比',
       value: inOut === null ? '—' : `${fmtRatio(inOut)} : 1`,
       tip: '输入 : 输出。同样来自所选范围的日累计用量（Usage.Total），不是首屏滚动窗口；输出为 0 时显示 —',
+    },
+    {
+      // 与下方实时区同一口径：只数请求中（Inflight>0）的会话，淡出项不算
+      label: '请求中会话',
+      value: !live.value ? '--' : inflightSessions.value === null ? '—' : fmtInt(inflightSessions.value),
+      tip: '仅统计请求中（Inflight>0）的会话；刚结束的会话会短暂淡出但不计入。管理端=全站，开发端=本人（与下方实时区同源）',
+    },
+    {
+      // 「请求中用户」= #69 的 UsersTotal（有进行中会话的用户数），**不需要后端再加字段**。
+      // 兼容期（响应里还没有 RangeUsers）UsersTotal 仍是范围口径、会偏大 → 先占位，
+      // #69 合入后同一次响应带上 RangeUsers，本项自动切到真实值（开关式防御，不写死）。
+      label: '请求中用户',
+      // 新口径且 UsersTotal 有值才显示数字；老口径（无 RangeUsers）或字段缺失/null → 「—」
+      value: inflightUsers.value === null ? '—' : fmtInt(inflightUsers.value),
+      pending: !hasRangeUsers.value,
+      tip: !hasRangeUsers.value
+        ? '当前响应里还没有 RangeUsers（#69 未合入），UsersTotal 仍是「所选范围内有请求的用户数」，会偏大；先占位，合入后自动显示真实值'
+        : inflightUsers.value === null
+          ? '后端这次没返回 UsersTotal（字段缺失或为 null），按 — 显示，不猜数'
+          : '有进行中会话的用户数（只算此刻 Inflight>0 的会话涉及的用户）。与下方「范围内活跃用户」是两套口径，不要互相换算',
     },
   ]
 })
@@ -616,9 +648,27 @@ interface PlazaRow {
 
 const plaza = computed<StatsModelPlaza | null>(() => data.value?.ModelPlaza ?? null)
 
+// 实际生效的排序键：优先读响应回显（后端会把非法值回落成 tokens），没有回显时用本地选择。
+const plazaSortLabel = computed(() => {
+  const sortKey = ((plaza.value?.Sort as StatsModelSort | undefined) || modelSort.value) as StatsModelSort
+  return MODEL_SORT_OPTIONS.find((o) => o.value === sortKey)?.label || 'Token'
+})
+
+// 未匹配兜底行（Unmatched=true）：解析不到在册模型的用量。不再当普通模型卡片展示，
+// 但**不能丢**——用量信息以小字摘要挂在空闲折叠行里（后端不计入 Total/Active，前端也不参与排序）。
+const unmatchedRow = computed<StatsModelStat | null>(
+  () => (plaza.value?.List ?? []).find((m) => m.Unmatched) ?? null,
+)
+const unmatchedText = computed(() => {
+  const u = unmatchedRow.value
+  if (!u) return ''
+  return ['未匹配模型用量：Token ' + fmtCompact(u.Tokens), '请求 ' + fmtInt(u.Calls), '失败 ' + fmtInt(u.Failed)].join(' · ')
+})
+
 const plazaRows = computed<PlazaRow[]>(() => {
-  // 后端仍会追加一行 Unmatched=true 的兜底行（Model 固定 "__unmatched__"、从不置 Active），
-  // v4 第 3 条已删掉「未匹配模型」区块，这里必须过滤掉，否则展开空闲区会露出明文 __unmatched__。
+  // 后端仍会追加一行 Unmatched=true 的兜底行（Model 固定 "__unmatched__"、从不置 Active）：
+  // 不当模型卡片渲染（否则展开空闲区会露出明文 __unmatched__），但用量不丢——
+  // 由 unmatchedText 在空闲折叠行里单独列一句摘要。
   const list: StatsModelStat[] = (plaza.value?.List ?? []).filter((m) => !m.Unmatched)
   if (!list.length) return []
   return list.map((m) => ({
@@ -769,7 +819,7 @@ interface LiveUserRow {
 
 const liveSampledAt = computed(() => fmtTime(live.value?.SampledAt || ''))
 const liveWindowMinutes = computed(() => live.value?.WindowMinutes ?? LIVE_WINDOW_MINUTES)
-// 在线用户的实际生效范围读后端回显（RangeFrom / RangeTo），不用本地 preset 自猜
+// 用户统计范围的实际生效值读后端回显（RangeFrom / RangeTo），不用本地 preset 自猜；两套用户口径共用
 const liveRangeText = computed(() => {
   const l = live.value
   if (!l?.RangeFrom || !l?.RangeTo) return ''
@@ -782,21 +832,80 @@ const dailyRangeText = computed(() => {
   return `${l.DailyFrom.slice(5)} ~ ${l.DailyTo.slice(5)} 每日`
 })
 
-const userRows = computed<LiveUserRow[]>(() =>
-  (live.value?.Users ?? []).map((u) => ({
+// 兼容期判定（唯一判据）：**响应里「有 RangeUsers 这个键」就算 #69 新口径**。
+//   - 键存在且是数组 → 新口径，按数组渲染；
+//   - 键存在但值是 `null` → 仍是新口径（显式声明了范围口径），按**空数组**渲染、走空态；
+//   - 键缺失（老后端）→ 老口径兜底（旧 Users/UsersTotal 当时就是范围口径）。
+// 这样 `RangeUsers: null` 不会被误判回「在线用户」老口径（Owl P3）。
+const hasRangeUsers = computed(() => {
+  const l = live.value
+  if (!l) return false
+  if (!Object.prototype.hasOwnProperty.call(l, 'RangeUsers')) return false
+  const v = l.RangeUsers
+  return v === null || Array.isArray(v)
+})
+// 行数据：null / 非数组一律当空数组（不抛错、不 undefined.map）
+const rangeUserRows = computed<StatsLiveRangeUser[]>(() =>
+  Array.isArray(live.value?.RangeUsers) ? (live.value!.RangeUsers as StatsLiveRangeUser[]) : [],
+)
+
+// 数字字段统一收口：null / undefined / 空串 / 非数 → null（调用方渲染「—」），绝不吐 NaN。
+function numOrNull(v: unknown): number | null {
+  if (v === null || v === undefined || v === '') return null
+  const n = Number(v)
+  return Number.isFinite(n) ? n : null
+}
+
+const usersTabLabel = computed(() => (hasRangeUsers.value ? '范围内活跃用户' : '在线用户'))
+// 页签总数：新口径 RangeUsersTotal / 老口径 UsersTotal；取不到就是 null → 显示「—」
+const usersTabTotal = computed<number | null>(() =>
+  hasRangeUsers.value ? numOrNull(live.value?.RangeUsersTotal) : numOrNull(live.value?.UsersTotal),
+)
+const usersTabTotalText = computed(() => (usersTabTotal.value === null ? '—' : fmtInt(usersTabTotal.value)))
+
+// 「请求中用户」= #69 的 UsersTotal（仅新口径下才是这个语义）：缺失/为 null → null（渲染「—」）
+const inflightUsers = computed<number | null>(() =>
+  hasRangeUsers.value ? numOrNull(live.value?.UsersTotal) : null,
+)
+// 「请求中会话」= SessionsTotal：缺失/为 null → null（渲染「—」）
+const inflightSessions = computed<number | null>(() => numOrNull(live.value?.SessionsTotal))
+const sessionsTabTotalText = computed(() =>
+  inflightSessions.value === null ? '—' : fmtInt(inflightSessions.value),
+)
+// 两套用户列表共用一个 UsersTruncated（#69：RangeUsers 同样受用户上限约束）
+const usersTruncated = computed(() => !!live.value?.UsersTruncated)
+
+const userRows = computed<LiveUserRow[]>(() => {
+  const l = live.value
+  if (!l) return []
+  if (hasRangeUsers.value) {
+    // 新口径：RangeSessions/RangeCalls/RangeTokens/RangeCredits 是「所选范围」合计；
+    // WindowTokens/SpentCredits 是「近 Window 分钟」——刻意不同名，卡面各就各位、不互相顶替。
+    return rangeUserRows.value.map((u) => ({
+      id: u.ID,
+      name: u.Name || `用户 ${u.ID}`,
+      initial: (u.Name || '?').slice(0, 2),
+      sessions: u.RangeSessions,
+      tpmText: `${fmtCompact(u.TPM)} TPM`,
+      tokensText: fmtCompact(u.RangeTokens),
+      tokensTip: `所选范围 Token ${fmtCompact(u.RangeTokens)} · 近 ${liveWindowMinutes.value} 分钟 ${fmtCompact(u.WindowTokens)} · 范围内 ${fmtInt(u.RangeCalls)} 次请求 / ${fmtInt(u.RangeSessions)} 个会话`,
+      spentText: fmtMoney(u.RangeCredits),
+      spark: sparkPath(u.Daily?.length ? u.Daily : u.Spark ?? []),
+    }))
+  }
+  // 兼容兜底（#69 未合入时的老响应）：当时 Users 就是范围口径，字段名是 ActiveSessions/Calls/RangeTokens/RangeCredits
+  return (l.Users ?? []).map((u) => ({
     id: u.ID,
     name: u.Name || `用户 ${u.ID}`,
     initial: (u.Name || '?').slice(0, 2),
-    sessions: u.Sessions,
+    sessions: u.ActiveSessions ?? u.Sessions,
     tpmText: `${fmtCompact(u.TPM)} TPM`,
-    tokensText: fmtCompact(u.Tokens),
-    // 卡面看窗口用量（与吞吐同源），范围口径放 tooltip 里备查
-    tokensTip: `近 ${liveWindowMinutes.value} 分钟 Token；所选范围 ${fmtCompact(u.RangeTokens)} Token · ${fmtInt(u.Calls)} 次请求`,
-    spentText: fmtMoney(u.SpentCredits),
-    // 迷你曲线优先读日活跃序列 Daily（无请求日后端补 0）；老响应无 Daily 时退回分钟 Spark
+    tokensText: fmtCompact(u.RangeTokens ?? u.Tokens),
+    tokensTip: `所选范围 Token ${fmtCompact(u.RangeTokens ?? u.Tokens)} · 近 ${liveWindowMinutes.value} 分钟 ${fmtCompact(u.Tokens)} · 范围内 ${fmtInt(u.Calls ?? 0)} 次请求`,
+    spentText: fmtMoney(u.RangeCredits ?? u.SpentCredits),
     spark: sparkPath(u.Daily?.length ? u.Daily : u.Spark ?? []),
-  })),
-)
+  }))
+})
 
 // ===== 更多维度（旧版用量分析里仍有数据支撑的部分，默认收起）=====
 const moreOpen = ref<string[]>([])
@@ -935,7 +1044,10 @@ const modeLabel = (m: string) =>
         <div v-for="m in miniStats" :key="m.label" class="mini-card">
           <span class="mini-label">{{ m.label }}</span>
           <el-tooltip v-if="m.tip" :content="m.tip" placement="top" :show-after="150">
-            <span class="mini-value" :data-tone="m.tone">{{ m.value }}</span>
+            <span class="mini-value" :data-tone="m.tone" :data-pending="m.pending">
+              {{ m.value }}
+              <em v-if="m.pending" class="mini-pending">待后端合入</em>
+            </span>
           </el-tooltip>
           <span v-else class="mini-value" :data-tone="m.tone">{{ m.value }}</span>
         </div>
@@ -972,7 +1084,7 @@ const modeLabel = (m: string) =>
         </div>
 
         <div class="card">
-          <div class="card-head">
+          <div class="card-head plaza-head">
             <h3 class="card-title">模型广场</h3>
             <el-tooltip
               :content="`${kpiWindow.tip}；按模型忙时口径（该模型成功且带耗时请求的 Token ÷ 同批耗时折算分钟数）`"
@@ -981,7 +1093,12 @@ const modeLabel = (m: string) =>
             >
               <span class="win-chip">{{ kpiWindow.label }} · 按模型忙时</span>
             </el-tooltip>
-            <span class="gran-chip">按 Token 倒序</span>
+            <el-radio-group v-model="modelSort" size="small" class="head-actions plaza-sort">
+              <el-radio-button v-for="o in MODEL_SORT_OPTIONS" :key="o.value" :value="o.value">
+                {{ o.label }}
+              </el-radio-button>
+            </el-radio-group>
+            <span class="gran-chip">实际按{{ plazaSortLabel }}倒序</span>
           </div>
 
           <template v-if="plazaRows.length">
@@ -1016,6 +1133,9 @@ const modeLabel = (m: string) =>
                 </button>
               </span>
               <span v-if="plazaTruncatedText" class="trunc-note">{{ plazaTruncatedText }}</span>
+              <span v-if="unmatchedRow" class="unmatched-note" :title="unmatchedText">
+                {{ unmatchedText }}（无法归属到在册模型，单独列出、不参与上方排序）
+              </span>
             </div>
           </template>
           <el-empty v-else description="模型目录为空：还没有对外模型" :image-size="70" />
@@ -1029,7 +1149,8 @@ const modeLabel = (m: string) =>
           <span class="live-tag"><span class="dot-live" />每 30s 自动刷新 · 只显示请求中的会话</span>
           <span class="live-window">
             吞吐窗口 近 {{ liveWindowMinutes }} 分钟墙钟平均<span v-if="liveSampledAt"> · 采样 {{ liveSampledAt }}</span>
-            <span v-if="liveRangeText"> · 在线用户范围 {{ liveRangeText }}</span>
+            <!-- 口径中立：这是页面右上角时间筛选的范围回显，两套用户口径共用，别再写「在线用户范围」 -->
+            <span v-if="liveRangeText"> · 用户统计范围 {{ liveRangeText }}</span>
             <span v-if="liveLoading" class="live-loading">刷新中…</span>
           </span>
         </div>
@@ -1037,10 +1158,10 @@ const modeLabel = (m: string) =>
         <div class="live-tabs">
           <el-radio-group v-model="liveTab" size="small">
             <el-radio-button value="sessions">
-              我的会话{{ live ? ` · ${live.SessionsTotal}` : '' }}
+              我的会话{{ live ? ` · ${sessionsTabTotalText}` : '' }}
             </el-radio-button>
             <el-radio-button v-if="isAdmin" value="users">
-              在线用户{{ live ? ` · ${live.UsersTotal}` : '' }}
+              {{ usersTabLabel }}{{ live ? ` · ${usersTabTotalText}` : '' }}
             </el-radio-button>
           </el-radio-group>
           <span v-if="liveErr" class="live-err">{{ liveErr }}</span>
@@ -1131,7 +1252,13 @@ const modeLabel = (m: string) =>
                 <header class="xcard-head">
                   <span class="uavatar">{{ u.initial }}</span>
                   <span class="xcard-name" :title="u.name">{{ u.name }}</span>
-                  <span class="xcard-badge" :data-idle="u.sessions === 0">会话 {{ u.sessions }}</span>
+                  <el-tooltip
+                    :content="hasRangeUsers ? '所选范围内有过请求的会话数（去重）；此刻不一定在请求中' : '当前请求中的会话数'"
+                    placement="top"
+                    :show-after="150"
+                  >
+                    <span class="xcard-badge" :data-idle="u.sessions === 0">会话 {{ u.sessions }}</span>
+                  </el-tooltip>
                 </header>
                 <div class="xcard-stats">
                   <div class="xstat">
@@ -1144,21 +1271,27 @@ const modeLabel = (m: string) =>
                       <b>{{ u.tokensText }}</b>
                     </div>
                   </el-tooltip>
-                  <div class="xstat">
-                    <i>积分</i>
-                    <b>{{ u.spentText }}</b>
-                  </div>
+                  <el-tooltip
+                    :content="hasRangeUsers ? '所选范围内的消耗积分合计' : '近窗口消耗积分'"
+                    placement="top"
+                    :show-after="150"
+                  >
+                    <div class="xstat">
+                      <i>积分</i>
+                      <b>{{ u.spentText }}</b>
+                    </div>
+                  </el-tooltip>
                 </div>
                 <svg v-if="u.spark" class="spark xcard-spark" viewBox="0 0 92 24" preserveAspectRatio="none">
                   <path :d="u.spark" />
                 </svg>
               </article>
             </div>
-            <div v-if="live?.UsersTruncated" class="trunc-note">
-              仅显示前 100 个在线用户（共 {{ live?.UsersTotal }} 个）
+            <div v-if="usersTruncated" class="trunc-note">
+              仅显示前 100 个{{ usersTabLabel }}（共 {{ usersTabTotalText }} 个）
             </div>
           </template>
-          <el-empty v-else-if="live" description="所选范围内没有在线用户" :image-size="60" />
+          <el-empty v-else-if="live" :description="`所选范围内没有${usersTabLabel}`" :image-size="60" />
           <el-empty v-else description="实时数据加载中" :image-size="60" />
         </div>
       </section>
@@ -1389,7 +1522,8 @@ const modeLabel = (m: string) =>
 /* ===== ② 小指标行 ===== */
 .mini-grid {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  /* 项数会随口径增删（当前 7 项）：按最小宽度自适应换行，不写死列数 */
+  grid-template-columns: repeat(auto-fit, minmax(168px, 1fr));
   gap: 10px;
   margin-bottom: 14px;
 }
@@ -1420,6 +1554,28 @@ const modeLabel = (m: string) =>
 }
 .mini-value[data-tone='ok'] { color: var(--color-success); }
 .mini-value[data-tone='info'] { color: #0284c7; }
+/* 后端未提供的指标：值位显示 — + 「待后端」小标，不自己造数 */
+.mini-value[data-pending='true'] {
+  color: var(--color-text-tertiary);
+  font-weight: 600;
+}
+.mini-pending {
+  margin-left: 6px;
+  font-style: normal;
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 500;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: #f2f4f7;
+  color: var(--color-text-tertiary);
+}
+.unmatched-note {
+  display: inline-block;
+  color: var(--color-text-tertiary);
+  font-size: 11px;
+  line-height: 1.6;
+}
 
 /* ===== ③ 图表区 ===== */
 .chart-stack {
@@ -1917,5 +2073,94 @@ const modeLabel = (m: string) =>
   .xcard-grid { grid-template-columns: 1fr; }
   .head-actions { margin-left: 0; }
   .live-window { margin-left: 0; }
+  .plaza-head { row-gap: 8px; }
+}
+/* ≤640px：移动端铁律——单列 + 正文 ≥14px（辅助小标 12px 不在此限） */
+@media (max-width: 640px) {
+  .mini-grid { grid-template-columns: 1fr; }
+  .big-label,
+  .big-sub,
+  .mini-label,
+  .mini-value,
+  .model-row span,
+  .model-row b,
+  .xstat i,
+  .xstat b,
+  .card-title,
+  .live-title,
+  .xcard-name,
+  .xcard-foot,
+  .idle-note,
+  .pending-note,
+  .trend-legend {
+    font-size: 14px;
+  }
+  .big-value { font-size: 30px; }
+  .mini-value { font-size: 18px; }
+  :deep(.el-radio-button__inner) { font-size: 14px; }
+  /* 「更多维度 → Top 用户」表格：Element Plus 默认 12px（含表头/单元格），断点内提到 14px。
+     只在 ≤640 生效，桌面端观感不变。 */
+  :deep(.el-table) { font-size: 14px; }
+  :deep(.el-table .cell) { font-size: 14px; line-height: 1.5; }
+  /* 单元格元素本身（td/th）也要显式给：EP 的 12px 落在这里，只改 .cell 量 td 仍是 12px */
+  :deep(.el-table td.el-table__cell),
+  :deep(.el-table th.el-table__cell) { font-size: 14px; }
+  :deep(.el-table__empty-text) { font-size: 14px; }
+  /* 注记类小字（未匹配摘要 / 截断提示 / 图例 / 实时区说明）同样 ≥14px */
+  .unmatched-note,
+  .trunc-note,
+  .pending-note,
+  .trend-legend,
+  .live-tag,
+  .live-window,
+  .live-fade-note,
+  .idle-note,
+  .grid-caption,
+  .cell-sub,
+  .fail-rate,
+  .mini-pending,
+  /* 用量按模式区块：标题行(mode-name/mode-calls) 与脚注(mode-foot 里的 Token / 积分) */
+  .mode-name,
+  .mode-calls,
+  .mode-foot,
+  .mode-foot span {
+    font-size: 14px;
+  }
+  /* 小徽标（窗口/粒度标签）：不缩字号，单列后允许换行 */
+  .win-chip,
+  .gran-chip,
+  .win-tag {
+    font-size: 14px;
+    white-space: normal;
+  }
+  /* 其余内容级文本（范围标签、涨跌、模型名/状态、展开按钮、复制按钮）也统一到 14px；
+     纯装饰字形（big-glyph / 头像缩写）保持原样。 */
+  .page-count,
+  .big-delta,
+  .model-name,
+  .model-state,
+  .model-chip,
+  .link-btn,
+  .copy-btn,
+  .announce-title,
+  .announce-time,
+  .live-fade-note,
+  .xcard-badge {
+    font-size: 14px;
+  }
+  /* 内容区里带字形的装饰块也一起到 14px（大数字前的 T/¥/⚡ 方框、用户头像缩写）：
+     它们是可见文本，若留 11px，「内容区最小字号 ≥14」就不成立。方框/圆点尺寸不变，只调字号。 */
+  .big-glyph,
+  .uavatar {
+    font-size: 14px;
+  }
+  /* Element Plus 小号控件（工具栏按钮 / 折叠面板标题 / 标签）默认 12–13px，断点内一并提到 14px */
+  :deep(.el-button) { font-size: 14px; }
+  :deep(.el-collapse-item__header),
+  :deep(.el-collapse-item__title) { font-size: 14px; }
+  :deep(.el-tag) { font-size: 14px; }
+  .plaza-sort { width: 100%; }
+  .plaza-sort :deep(.el-radio-button) { flex: 1; }
+  .plaza-sort :deep(.el-radio-button__inner) { width: 100%; padding-left: 4px; padding-right: 4px; }
 }
 </style>
