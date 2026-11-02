@@ -1,4 +1,4 @@
-# 渠道预设包数据集 · P0 收口（2026-10-28）
+# 渠道预设包数据集 · 验收收口（2026-10-28）
 
 **结论**：步骤 3 拉取验收通过（含 `latest.json` 走 302 的方案 A）——数据集 → `preset.pack_url` → sync 链路可用。
 
@@ -8,6 +8,6 @@
 - 边界①：不跟随 302 会报「预设包返回非 200 状态码: 302」（本次未出现）。
 - 边界②：`http.DefaultClient` 不做响应缓存，`max-age=60` 无影响。
 - 边界③：`manifest.json` 这类返回 200 的清单 JSON **不可填进 `pack_url`**（走 F3 第 ④ 形态，裸 500）。
-- 复跑方式：`POST /api/v1/admin/channel-protocols/sync {"confirm":true}`；首启同步有 AC-12 已同步标记、会被跳过，**必须手工 sync**。
+- 复跑方式：`POST /api/v1/admin/channel-protocols/sync {"confirm":true}`；首启同步有「已同步」标记、会被跳过，**必须手工 sync**。
 
-口径正本：`docs/preset-pack-format.md` §0.1 F3 / §11.1 V9 —— PR #64 @ `0b2e1f4`（OPEN，待 Owl 评审与合入）。
+口径正本：`docs/preset-pack-format.md` §0.1 F3 / §11.1 V9。
