@@ -16,8 +16,8 @@
 |---|---|---|
 | 我的会话（**准入**） | **仅请求中**（`Inflight > 0`） | 注册表 `Inflight > 0 && Closed=false`；与 `origin/main` 一致 |
 | 我的会话（**淡出**） | 刚结束请求的会话最多停留 5 分钟，**只做视觉过渡** | 独立数组 `RecentlyExited[]`（`ExitedAt` + `FadeWindowSeconds`），上限 20 行 |
-| 在线用户 | 页面右上角时间范围内**所有有过请求的用户**（总计口径） | `billing_records` 按 `[From, To]` 分用户聚合 |
-| `UsersTotal` | 与 `Users` 列表**同一查询、同一口径** | `UsersTotal` = 该查询的未截断行数；列表取前 100 行（`UsersTruncated` 标记） |
+| 在线用户（**旧字段 `Users`/`UsersTotal`**） | **仅由「请求中会话」反推**（与 `origin/main` 一致） | 注册表内存计数；窗口用量只汇总请求中会话 |
+| 范围内活跃用户（**新字段 `RangeUsers`/`RangeUsersTotal`**） | 页面右上角时间范围内**所有有过请求的用户** | `billing_records` 按 `[From, To]` 分用户聚合；列表取前 100 行 |
 
 要点：
 
@@ -28,10 +28,12 @@
   这些会话**只**进 `RecentlyExited`（窗口常量 `liveFadeWindow`），供前端把卡片淡出再移除。
   它们**不进主列表、不进任何计数、不进任何金额/Token 求和、不进聚合 SQL**（单测用
   `WithArgs("inflight", …)` 锁死：查询参数里只有请求中的会话 ID）。
-- 在线用户**不再由「请求中会话」反推**（旧实现 `UsersTotal = 请求中会话的用户数`），改为直接查 DB。
-  否则「范围内活跃但此刻空闲」的用户全部隐身，且总数会随请求瞬时抖动。
-- 总数与列表同源是结构保证而非约定：一次 `GROUP BY user_id` 查询既出行也出总数，
-  不存在「总数一个口径、列表另一个口径」的可能。
+- **rev.3（spencer 拍板，向后兼容）**：`Users` / `UsersTotal` / `Users[].Tokens` / `Sessions` / `TPM` /
+  `Spark` **回到 `origin/main` 语义**（只由请求中会话反推），逐字节一致由 golden 快照锁住
+  （`testdata/live_compat_*.golden.json`，golden 是在 #66 合入前的代码上落盘的）。
+  「范围内活跃用户」那套口径**单列**到 `RangeUsers[]` / `RangeUsersTotal`，前端按需取用，两套不混。
+- 两套口径各自「总数与列表同源」：旧字段的用户集来自会话注册表，新字段来自一次 `GROUP BY user_id`
+  查询（既出行也出总数），各自都不会出现「总数一个口径、列表另一个口径」。
 - 在线用户以 `billing_records` 落账为准：首次请求仍在进行中、尚未落账的用户本轮不计入（下轮落账后进入）。
 
 ## 2. 新增查询参数（`/stats/live`）
@@ -57,6 +59,8 @@
 | `DailyPoints` | int | 日活跃序列点数（= 每个用户 `Daily` 的长度） |
 | `RecentlyExited` | object[] | **新增（rev.2）**：淡出窗口内已结束请求的会话，仅 `ID` / `Name` / `Model` / `ExitedAt`；**不参与任何计数与聚合** |
 | `FadeWindowSeconds` | int | **新增（rev.2）**：淡出窗口长度（秒，当前 300），前端据此排移除定时器 |
+| `RangeUsersTotal` | int | **新增（rev.3）**：范围内有过请求的用户数（未截断）；与 `RangeUsers` 同源 |
+| `RangeUsers` | object[] | **新增（rev.3）**：范围内活跃用户行（见下表） |
 
 `Sessions[]`（我的会话卡片）：
 
@@ -65,30 +69,42 @@
 | `TotalTokens` | int64 | **新增**：会话累计 Token（三段求和），补卡片「累计」缺项 |
 | `CreatedAt` | string | **新增**：会话创建时间 RFC3339（注册表未记录时为空串），卡片可算会话时长 |
 
-`Users[]`（在线用户卡片）：
+`Users[]`（在线用户卡片，**旧字段集与 `origin/main` 完全一致，rev.3 撤回全部新增字段**）：
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `ActiveSessions` | int | **新增**：所选范围内有过请求的会话数（`count(DISTINCT session_id)`） |
-| `Calls` | int64 | **新增**：所选范围内请求数 |
-| `RangeTokens` | int64 | **新增**：所选范围内 Token 合计 |
-| `RangeCredits` | float64 | **新增**：所选范围内消耗积分合计 |
-| `Daily` | `int64[]` | **新增**：日活跃序列（逐日 Token，长度 = `DailyPoints`，无请求日补 0，时间正序），供迷你曲线 |
-| `Sessions` / `Tokens` / `TPM` / `SpentCredits` / `Spark` | 原字段 | 见 §4 口径变更 |
+| `ID` / `Name` / `Sessions` / `Tokens` / `TPM` / `SpentCredits` / `Spark` | 原字段 | 语义与取值均与 main 逐字节一致（golden 锁定） |
 
-排序：`RangeTokens` 倒序 → `Tokens` 倒序 → 用户 ID 升序（刷新时行序稳定）。
+> rev.3：原先塞进 `Users[]` 的范围字段（`ActiveSessions` / `Calls` / `RangeTokens` / `RangeCredits` / `Daily`）
+> 已整体迁到新字段 `RangeUsers[]`（`RangeSessions` / `RangeCalls` / `RangeTokens` / `RangeCredits` / `Daily`）。
+
+排序（`RangeUsers`）：`RangeTokens` 倒序 → `WindowTokens` 倒序 → 用户 ID 升序（刷新时行序稳定）。
+
+`RangeUsers[]`（范围内活跃用户卡片，rev.3 单列）：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `ID` / `Name` | string | 同上 |
+| `RangeSessions` | int | 范围内有过请求的会话数（去重） |
+| `RangeCalls` | int64 | 范围内请求数 |
+| `RangeTokens` | int64 | 范围内 Token 合计 |
+| `RangeCredits` | float64 | 范围内消耗积分合计 |
+| `WindowTokens` / `SpentCredits` / `TPM` | int64 / float64 / float64 | 该用户**近 Window 分钟**用量（覆盖其全部会话） |
+| `Spark` | int64[] | 逐分钟 Token（长度 = `SparkPoints`，无用量分钟补 0） |
+| `Daily` | int64[] | 日活跃序列（长度 = `DailyPoints`，无请求日补 0） |
 
 ## 4. 老字段口径变更（**字段名与类型不变**，语义按 v4 要求更新）
 
 | 字段 | 旧口径 | 新口径 |
 |---|---|---|
 | `SessionsTotal` | 请求中会话数 | **保持不变**（仅 `Inflight>0`）；淡出项不计入 |
-| `UsersTotal` | 有请求中会话的用户数 | 所选范围内有过请求的用户数（与 `Users` 同源未截断） |
-| `Users[].Tokens` / `SpentCredits` / `Spark` | 只算该用户「请求中会话」的近 `Window` 用量 | 该用户**全部会话**的近 `Window` 用量（人群放宽，窗口口径不变） |
-| `Users[].Sessions` | 该用户请求中会话数 | 不变（仍只数 `Inflight>0` 的会话；范围内活跃但空闲的用户为 0） |
+| `UsersTotal` | 有请求中会话的用户数 | **保持不变**（rev.3 撤回范围口径，范围数据迁到 `RangeUsersTotal`） |
+| `Users[].Tokens` / `SpentCredits` / `Spark` | 只算该用户「请求中会话」的近 `Window` 用量 | **保持不变**（rev.3 撤回） |
+| `Users[].Sessions` | 该用户请求中会话数 | 不变 |
+| `Sessions[].TotalTokens` / `CreatedAt` | — | 纯新增字段（rev.1），不影响旧字段取值 |
 
-> 前端注意：只有 `UsersTotal` 会**变大**（改为范围口径，不是回归）；`SessionsTotal` 仍是「请求中会话数」，
-> 与 `Sessions.length`（截断前）一致。卡片上「请求中」相关文案请用 `Sessions[].Inflight`、`Users[].Sessions`。
+> 前端注意（rev.3）：旧字段**全部回到 main 语义**，本次是纯增量——新增 `RangeUsersTotal` / `RangeUsers[]`
+> 承载「范围内活跃用户」，新增 `RecentlyExited[]` 承载淡出。老页面不改也照常工作。
 
 ## 5. 性能与上限
 
@@ -108,7 +124,8 @@
 | 场景 | 行为 |
 |---|---|
 | 没有活跃会话 | `Sessions=[]`，但**仍查**在线用户（用户不再依赖会话） |
-| 范围内没有用户 | `Users=[]`、`UsersTotal=0`，不再执行名称/曲线/日序列查询 |
+| 范围内没有用户 | `RangeUsers=[]`、`RangeUsersTotal=0`，不再执行名称/曲线/日序列查询 |
+| 没有请求中会话 | `Users=[]`、`UsersTotal=0`（与 main 一致），但 `RangeUsers` 照常返回 |
 | 会话注册表未装配 | 降级为空结果（沿用）；`DailyPoints` / 范围仍回显 |
 | DB 未装配 | 会话列表仍返回（含 `Inflight`），数值列 0；在线用户为空 |
 | dev 端 | 只统计本人：`Scope=self`，`Users` 只有本人一行（范围内无请求则为空） |
@@ -122,8 +139,9 @@
 | `TestBuildLiveStats_SessionRecencyWindow` | 5 分钟窗口：请求中保留、4 分钟前保留、6 分钟前剔除、已关闭剔除 |
 | `TestBuildLiveStats_SessionRecencyWindow`（rev.2 重写） | 准入只认 `Inflight>0`：4 分钟前结束的会话**不进**主列表，只进 `RecentlyExited`；6 分钟前结束的两边都不进；`SessionsTotal == len(Sessions)` |
 | `TestBuildLiveStats_FadingNotAdmittedAndNotCounted`（rev.2 新增） | 淡出项绝不参与计数：会话聚合/最近请求两条 SQL 的 `WithArgs` 只接受 `"inflight"`；`RecentlyExited` 按最近活跃倒序、只含窗口内条目；`Users[].Sessions` 只数 inflight |
-| `TestBuildLiveStats_UsersFromDBRange` | 会话为空也有在线用户；`UsersTotal == len(Users)`；`Daily` 长度/补零/归位 |
-| `TestBuildLiveStats_UsersTruncated` | 101 用户 → `UsersTotal=101`、列表 100、`UsersTruncated=true` |
+| `TestLiveCompatGolden`（rev.3 新增） | **旧字段逐字节向后兼容**：三组场景（三个请求中会话 / 一个在途+两个刚结束 / 全空闲）的 `SessionsTotal`/`UsersTotal`/`Truncated`/`UsersTruncated`/`Users` 与 `Sessions`（投影到旧字段集）与 #66 合入前一致；golden 由改动前代码落盘 |
+| `TestBuildLiveStats_RangeUsersFromDBRange`（rev.3 改名） | 没有请求中会话时旧 `Users` 恒空/0；`RangeUsers` 来自 DB 范围、`RangeUsersTotal == len(RangeUsers)`；`Daily` 长度/补零/归位 |
+| `TestBuildLiveStats_RangeUsersTruncated`（rev.3 改名） | 101 个范围用户 → `RangeUsersTotal=101`、列表 100；旧 `Users` 不受影响 |
 | `TestBuildLiveStats_SanitizedAndAggregates` | 字段白名单（新增字段必须登记）+ 内容面字段零泄露 + 聚合值落位 |
 | `TestBuildLiveStats_DevScopeIsolation` | dev 端只看本人 |
 | `TestHandleStatsLive_HTTP` | 两端点 `{Code,Data}`、scope、范围回显、`Window` 与 `From/To` 非法值 400 |
@@ -136,6 +154,9 @@
 4. 会话卡「累计 Token」用 `TotalTokens`（累计积分仍是 `SpentCredits`）；`CreatedAt` 可算会话时长。
 5. `ContextLimit` 仍恒为 0（平台无模型上下文窗口配置来源，属已知缺口，另开任务）。
 6. `frontend/src/api/stats.ts` 的 `StatsLive*` 类型需补本节新字段（纯前端改动，归 View）。
-7. **淡出（rev.2）**：`Sessions[]` 只含请求中的会话；收到 `RecentlyExited[]` 时把这些卡片的节点
+7. **两套用户口径（rev.3）**：`Users[]` 是「此刻有请求中会话」的用户（旧字段，语义不变）；
+   `RangeUsers[]` 是「所选范围内活跃过」的用户（新字段）。要展示「范围内活跃」请读后者，
+   两者人数不同是正常的，别互相兜底。
+8. **淡出（rev.2）**：`Sessions[]` 只含请求中的会话；收到 `RecentlyExited[]` 时把这些卡片的节点
    标记为「离开中」并开始淡出动画，`ExitedAt + FadeWindowSeconds` 之后把它从 DOM 移除
    （服务端下一轮就不会再返回它）。**不要**把 `RecentlyExited` 计入会话数/用户数，也不要拿它做排序。

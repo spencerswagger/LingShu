@@ -30,10 +30,18 @@ func liveSessionKeys() []string {
 }
 
 // liveUserKeys 用户行的完整字段白名单（只允许汇总吞吐与消耗，不含会话级字段）。
+// 与 `origin/main` 一致：旧字段语义不变（spencer 拍板保持向后兼容）。
 func liveUserKeys() []string {
 	return []string{
-		"ID", "Name", "Sessions", "ActiveSessions", "Calls", "Tokens", "TPM", "SpentCredits",
-		"RangeTokens", "RangeCredits", "Spark", "Daily",
+		"ID", "Name", "Sessions", "Tokens", "TPM", "SpentCredits", "Spark",
+	}
+}
+
+// liveRangeUserKeys 「范围内活跃用户」行的字段白名单（新口径单列）。
+func liveRangeUserKeys() []string {
+	return []string{
+		"ID", "Name", "RangeSessions", "RangeCalls", "RangeTokens", "RangeCredits",
+		"WindowTokens", "SpentCredits", "TPM", "Spark", "Daily",
 	}
 }
 
@@ -253,9 +261,9 @@ func TestBuildLiveStats_NoRegistry(t *testing.T) {
 	}
 }
 
-// TestBuildLiveStats_NoRegistryStillQueriesUsers 注册表未装配时**只**让「我的会话」为空，
-// 在线用户仍按 DB 口径返回（Owl 建议项：此前在查在线用户之前就提前返回，导致恒 0）。
-func TestBuildLiveStats_NoRegistryStillQueriesUsers(t *testing.T) {
+// TestBuildLiveStats_NoRegistryStillQueriesRangeUsers 注册表未装配时**只**让「我的会话」与旧
+// `Users[]` 为空（它们只由请求中会话反推），范围内活跃用户仍按 DB 口径返回（新字段）。
+func TestBuildLiveStats_NoRegistryStillQueriesRangeUsers(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock: %v", err)
@@ -284,11 +292,16 @@ func TestBuildLiveStats_NoRegistryStillQueriesUsers(t *testing.T) {
 	if out.SessionsTotal != 0 || len(out.Sessions) != 0 {
 		t.Fatalf("未装配注册表时「我的会话」应为空: %+v", out.Sessions)
 	}
-	if out.UsersTotal != 1 || len(out.Users) != 1 || out.Users[0].ID != "7" {
-		t.Fatalf("在线用户不应跟着降级为 0: total=%d users=%+v", out.UsersTotal, out.Users)
+	// 旧字段：没有请求中会话 → 恒 0/空（与 main 一致）。
+	if out.UsersTotal != 0 || len(out.Users) != 0 {
+		t.Fatalf("旧字段只由请求中会话反推，应为 0/空: total=%d users=%+v", out.UsersTotal, out.Users)
 	}
-	if out.Users[0].RangeTokens != 4000 || out.Users[0].Name != "开发者" {
-		t.Fatalf("用户行字段错: %+v", out.Users[0])
+	// 新字段：范围内活跃用户照常返回。
+	if out.RangeUsersTotal != 1 || len(out.RangeUsers) != 1 || out.RangeUsers[0].ID != "7" {
+		t.Fatalf("范围内活跃用户不应跟着降级为 0: total=%d rows=%+v", out.RangeUsersTotal, out.RangeUsers)
+	}
+	if out.RangeUsers[0].RangeTokens != 4000 || out.RangeUsers[0].Name != "开发者" {
+		t.Fatalf("范围用户行字段错: %+v", out.RangeUsers[0])
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("未满足的期望: %v", err)
@@ -331,20 +344,32 @@ func TestBuildLiveStats_SanitizedAndAggregates(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"session_id", "rn", "tokens_total", "ctx_tokens"}).
 			AddRow("sess-1", 2, int64(100), int64(50)).
 			AddRow("sess-1", 1, int64(200), int64(900)))
-	// 3) 用户范围聚合（在线用户全集的唯一来源）
+	// 3) 旧字段：会话作用域的用户聚合（只汇总请求中会话）
+	mock.ExpectQuery(regexp.QuoteMeta(`AND session_id = ANY(string_to_array($2, ','))`)).
+		WillReturnRows(sqlmock.NewRows([]string{"user_id", "tokens", "credits"}).
+			AddRow(int64(7), int64(600), float64(3.5)))
+	// 4) 旧字段：会话作用域的用户逐分钟曲线（只给一分钟的数据，其余补 0）
+	mock.ExpectQuery(regexp.QuoteMeta(`date_trunc('minute'`)).
+		WillReturnRows(sqlmock.NewRows([]string{"user_id", "minute", "tokens"}).
+			AddRow(int64(7), liveNow().Truncate(time.Minute), int64(120)))
+	// 5) 用户展示名（旧字段与新字段共用同一条查询形状）
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, username, nickname FROM users`)).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "username", "nickname"}).
+			AddRow(int64(7), "dev", "开发者"))
+	// 6) 新字段：范围内用户聚合
 	mock.ExpectQuery(regexp.QuoteMeta(`count(DISTINCT session_id)`)).
 		WillReturnRows(sqlmock.NewRows([]string{"user_id", "calls", "active_sessions",
 			"win_tokens", "win_credits", "range_tokens", "range_credits"}).
 			AddRow(int64(7), int64(9), int64(3), int64(600), float64(3.5), int64(7000), float64(42)))
-	// 4) 用户展示名
+	// 7) 新字段：名称
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, username, nickname FROM users`)).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "username", "nickname"}).
 			AddRow(int64(7), "dev", "开发者"))
-	// 5) 用户逐分钟曲线（只给一分钟的数据，其余补 0）
+	// 8) 新字段：分钟曲线
 	mock.ExpectQuery(regexp.QuoteMeta(`date_trunc('minute'`)).
 		WillReturnRows(sqlmock.NewRows([]string{"user_id", "minute", "tokens"}).
 			AddRow(int64(7), liveNow().Truncate(time.Minute), int64(120)))
-	// 6) 用户日活跃序列（只给最后一天的数据，其余补 0）
+	// 9) 新字段：日活跃序列（只给最后一天的数据，其余补 0）
 	mock.ExpectQuery(regexp.QuoteMeta(`date_trunc('day'`)).
 		WillReturnRows(sqlmock.NewRows([]string{"user_id", "day", "tokens"}).
 			AddRow(int64(7), liveNow(), int64(7000)))
@@ -380,24 +405,31 @@ func TestBuildLiveStats_SanitizedAndAggregates(t *testing.T) {
 
 	user := out.Users[0]
 	if user.Name != "开发者" || user.Sessions != 1 || user.TPM != 10 || user.Tokens != 600 {
-		t.Fatalf("在线用户汇总错: %+v", user)
-	}
-	if user.Calls != 9 || user.ActiveSessions != 3 || user.RangeTokens != 7000 || user.RangeCredits != 42 {
-		t.Fatalf("在线用户范围聚合错: %+v", user)
+		t.Fatalf("在线用户汇总错（旧字段口径）: %+v", user)
 	}
 	if len(user.Spark) != 12 {
 		t.Fatalf("用户曲线应补齐到 SparkPoints 长度，got %d", len(user.Spark))
 	}
-	last := user.Spark[len(user.Spark)-1]
-	if last != 120 {
+	if last := user.Spark[len(user.Spark)-1]; last != 120 {
 		t.Fatalf("最后一分钟（当前分钟）应含 120，got %v", user.Spark)
 	}
-	// 近 7 天 → 8 个自然日（含今天与起点当天），最后一天是今天。
-	if len(user.Daily) != out.DailyPoints || out.DailyPoints != 8 {
-		t.Fatalf("日活跃序列长度错: len=%d dailyPoints=%d", len(user.Daily), out.DailyPoints)
+	// 新口径：范围内活跃用户单列，范围合计不走旧字段。
+	if out.RangeUsersTotal != 1 || len(out.RangeUsers) != 1 {
+		t.Fatalf("范围用户行数错: total=%d rows=%d", out.RangeUsersTotal, len(out.RangeUsers))
 	}
-	if user.Daily[len(user.Daily)-1] != 7000 || user.Daily[0] != 0 {
-		t.Fatalf("日活跃序列补零/归位错: %v", user.Daily)
+	ruser := out.RangeUsers[0]
+	if ruser.RangeCalls != 9 || ruser.RangeSessions != 3 || ruser.RangeTokens != 7000 || ruser.RangeCredits != 42 {
+		t.Fatalf("范围用户聚合错: %+v", ruser)
+	}
+	if ruser.WindowTokens != 600 || ruser.SpentCredits != 3.5 {
+		t.Fatalf("范围用户窗口用量错: %+v", ruser)
+	}
+	// 近 7 天 → 8 个自然日（含今天与起点当天），最后一天是今天。
+	if len(ruser.Daily) != out.DailyPoints || out.DailyPoints != 8 {
+		t.Fatalf("日活跃序列长度错: len=%d dailyPoints=%d", len(ruser.Daily), out.DailyPoints)
+	}
+	if ruser.Daily[len(ruser.Daily)-1] != 7000 || ruser.Daily[0] != 0 {
+		t.Fatalf("日活跃序列补零/归位错: %v", ruser.Daily)
 	}
 
 	// 字段层面脱敏：JSON 里不允许出现任何内容面字段。
@@ -406,14 +438,16 @@ func TestBuildLiveStats_SanitizedAndAggregates(t *testing.T) {
 		t.Fatalf("marshal: %v", err)
 	}
 	var decoded struct {
-		Sessions []map[string]json.RawMessage `json:"Sessions"`
-		Users    []map[string]json.RawMessage `json:"Users"`
+		Sessions   []map[string]json.RawMessage `json:"Sessions"`
+		Users      []map[string]json.RawMessage `json:"Users"`
+		RangeUsers []map[string]json.RawMessage `json:"RangeUsers"`
 	}
 	if err := json.Unmarshal(raw, &decoded); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
 	assertKeys(t, "会话行", decoded.Sessions[0], liveSessionKeys())
 	assertKeys(t, "用户行", decoded.Users[0], liveUserKeys())
+	assertKeys(t, "范围用户行", decoded.RangeUsers[0], liveRangeUserKeys())
 	for _, f := range forbiddenLiveFields() {
 		if strings.Contains(string(raw), `"`+f+`"`) {
 			t.Fatalf("响应里出现了内容面字段 %q: %s", f, string(raw))
@@ -592,9 +626,10 @@ func TestBuildLiveStats_FadingNotAdmittedAndNotCounted(t *testing.T) {
 	}
 }
 
-// TestBuildLiveStats_UsersFromDBRange 断言「在线用户」以 DB 范围为准：
-// 会话为空也照样返回范围内有请求的用户，UsersTotal == 列表行数（同源），且补齐曲线与日活跃序列。
-func TestBuildLiveStats_UsersFromDBRange(t *testing.T) {
+// TestBuildLiveStats_RangeUsersFromDBRange 断言「范围内活跃用户」（新字段）以 DB 范围为准：
+// 会话为空也照样返回范围内有请求的用户，RangeUsersTotal == 列表行数（同源），且补齐曲线与日活跃序列。
+// 同时锁住旧字段：没有请求中会话时 `Users`/`UsersTotal` 恒为空/0（与 main 一致）。
+func TestBuildLiveStats_RangeUsersFromDBRange(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock: %v", err)
@@ -627,36 +662,37 @@ func TestBuildLiveStats_UsersFromDBRange(t *testing.T) {
 	if out.SessionsTotal != 0 || len(out.Sessions) != 0 {
 		t.Fatalf("没有在用会话时应为空: %+v", out.Sessions)
 	}
-	if out.UsersTotal != 2 || len(out.Users) != 2 {
-		t.Fatalf("在线用户应来自 DB 范围（总数必须等于列表行数）: total=%d rows=%d", out.UsersTotal, len(out.Users))
+	// 旧字段：没有请求中会话 → 空（与 main 逐字节一致）。
+	if out.UsersTotal != 0 || len(out.Users) != 0 {
+		t.Fatalf("旧字段只由请求中会话反推，应为 0/空: total=%d rows=%d", out.UsersTotal, len(out.Users))
+	}
+	if out.RangeUsersTotal != 2 || len(out.RangeUsers) != 2 {
+		t.Fatalf("范围内活跃用户应来自 DB（总数必须等于列表行数）: total=%d rows=%d", out.RangeUsersTotal, len(out.RangeUsers))
 	}
 	// 排序：范围 Token 高的在前（用户 7）。
-	if out.Users[0].ID != "7" || out.Users[0].RangeTokens != 5000 || out.Users[0].Name != "阿七" {
-		t.Fatalf("用户行错: %+v", out.Users[0])
+	if out.RangeUsers[0].ID != "7" || out.RangeUsers[0].RangeTokens != 5000 || out.RangeUsers[0].Name != "阿七" {
+		t.Fatalf("范围用户行错: %+v", out.RangeUsers[0])
 	}
-	if out.Users[0].Sessions != 0 {
-		t.Fatalf("没有在用会话时 Sessions 应为 0，got %d", out.Users[0].Sessions)
+	if len(out.RangeUsers[0].Daily) != out.DailyPoints || out.DailyPoints != 31 {
+		t.Fatalf("日活跃序列长度应覆盖 30 天范围: len=%d points=%d", len(out.RangeUsers[0].Daily), out.DailyPoints)
 	}
-	if len(out.Users[0].Daily) != out.DailyPoints || out.DailyPoints != 31 {
-		t.Fatalf("日活跃序列长度应覆盖 30 天范围: len=%d points=%d", len(out.Users[0].Daily), out.DailyPoints)
+	if out.RangeUsers[0].Daily[len(out.RangeUsers[0].Daily)-1] != 5000 {
+		t.Fatalf("日活跃序列归位错: %v", out.RangeUsers[0].Daily)
 	}
-	if out.Users[0].Daily[len(out.Users[0].Daily)-1] != 5000 {
-		t.Fatalf("日活跃序列归位错: %v", out.Users[0].Daily)
+	if out.RangeUsers[1].Name != "b" || out.RangeUsers[1].TPM != 2 { // 120/60min
+		t.Fatalf("昵称为空应回落到登录名，并算 TPM: %+v", out.RangeUsers[1])
 	}
-	if out.Users[1].Name != "b" || out.Users[1].TPM != 2 { // 120/60min
-		t.Fatalf("昵称为空应回落到登录名，并算 TPM: %+v", out.Users[1])
-	}
-	if len(out.Users[1].Spark) != 12 || out.Users[1].Spark[len(out.Users[1].Spark)-1] != 120 {
-		t.Fatalf("用户曲线错: %v", out.Users[1].Spark)
+	if len(out.RangeUsers[1].Spark) != 12 || out.RangeUsers[1].Spark[len(out.RangeUsers[1].Spark)-1] != 120 {
+		t.Fatalf("范围用户曲线错: %v", out.RangeUsers[1].Spark)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("未满足的期望: %v", err)
 	}
 }
 
-// TestBuildLiveStats_UsersTruncated 断言用户超上限时：UsersTotal 仍是全集行数（同源未截断），
-// 列表截到上限并打 UsersTruncated。
-func TestBuildLiveStats_UsersTruncated(t *testing.T) {
+// TestBuildLiveStats_RangeUsersTruncated 断言范围内活跃用户超上限时：
+// RangeUsersTotal 仍是全集行数（同源未截断），列表截到上限。
+func TestBuildLiveStats_RangeUsersTruncated(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock: %v", err)
@@ -683,8 +719,13 @@ func TestBuildLiveStats_UsersTruncated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildLiveStats: %v", err)
 	}
-	if out.UsersTotal != liveMaxUsers+1 || len(out.Users) != liveMaxUsers || !out.UsersTruncated {
-		t.Fatalf("上限截断错: total=%d rows=%d truncated=%v", out.UsersTotal, len(out.Users), out.UsersTruncated)
+	if out.RangeUsersTotal != liveMaxUsers+1 || len(out.RangeUsers) != liveMaxUsers {
+		t.Fatalf("范围用户上限截断错: total=%d rows=%d", out.RangeUsersTotal, len(out.RangeUsers))
+	}
+	// 旧字段不受影响：没有请求中会话 → 0/空。
+	if out.UsersTotal != 0 || len(out.Users) != 0 || out.UsersTruncated {
+		t.Fatalf("旧字段不应被范围用户数量影响: total=%d rows=%d truncated=%v",
+			out.UsersTotal, len(out.Users), out.UsersTruncated)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("未满足的期望: %v", err)
@@ -719,6 +760,16 @@ func TestBuildLiveStats_DevScopeIsolation(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(`row_number() OVER (PARTITION BY session_id`)).
 		WillReturnRows(sqlmock.NewRows([]string{"session_id", "rn", "tokens_total", "ctx_tokens"}).
 			AddRow("mine", 1, int64(60), int64(30)))
+	// 旧字段：会话作用域聚合 + 曲线 + 名称
+	mock.ExpectQuery(regexp.QuoteMeta(`AND session_id = ANY(string_to_array($2, ','))`)).
+		WillReturnRows(sqlmock.NewRows([]string{"user_id", "tokens", "credits"}).
+			AddRow(int64(7), int64(60), float64(1)))
+	mock.ExpectQuery(regexp.QuoteMeta(`date_trunc('minute'`)).
+		WillReturnRows(sqlmock.NewRows([]string{"user_id", "minute", "tokens"}))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, username, nickname FROM users`)).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "username", "nickname"}).
+			AddRow(int64(7), "dev", ""))
+	// 新字段：范围聚合 + 名称 + 曲线 + 日序列
 	mock.ExpectQuery(regexp.QuoteMeta(`count(DISTINCT session_id)`)).
 		WillReturnRows(sqlmock.NewRows([]string{"user_id", "calls", "active_sessions",
 			"win_tokens", "win_credits", "range_tokens", "range_credits"}).
