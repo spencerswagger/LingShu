@@ -23,11 +23,13 @@ import ModelPricing from '@/components/ModelPricing.vue'
 import ErrorBubble from '@/components/ErrorBubble.vue'
 
 // ===== tab =====
-type TabKey = 'billing' | 'routing' | 'gateway'
+type TabKey = 'billing' | 'routing' | 'gateway' | 'ops'
 const TABS: { key: TabKey; label: string }[] = [
   { key: 'billing', label: '计费' },
   { key: 'routing', label: '路由' },
   { key: 'gateway', label: '网关' },
+  // 「运维」没有 sys_configs 字段，放的是非配置类能力（渠道协议备份/恢复），因此没有保存按钮
+  { key: 'ops', label: '运维' },
 ]
 const activeTab = ref<TabKey>('billing')
 const tabLabel = (k: TabKey) => TABS.find((t) => t.key === k)?.label || k
@@ -113,10 +115,14 @@ const gatewayPayload = computed(() => ({
   UpstreamResponseHeaderWhitelist: whitelist.value,
 }))
 
-const snap = ref<{ billing: string; routing: string; gateway: string }>({ billing: '', routing: '', gateway: '' })
-const payloadOf = (tab: TabKey) =>
+// 有配置字段的三个 tab（运维 tab 不写 sys_configs，不参与脏判定/保存）
+type ConfigTab = Exclude<TabKey, 'ops'>
+const isConfigTab = (t: TabKey): t is ConfigTab => t !== 'ops'
+
+const snap = ref<Record<ConfigTab, string>>({ billing: '', routing: '', gateway: '' })
+const payloadOf = (tab: ConfigTab) =>
   tab === 'billing' ? billingPayload.value : tab === 'routing' ? routingPayload.value : gatewayPayload.value
-const isDirty = (tab: TabKey) => JSON.stringify(payloadOf(tab)) !== snap.value[tab]
+const isDirty = (tab: TabKey) => (isConfigTab(tab) ? JSON.stringify(payloadOf(tab)) !== snap.value[tab] : false)
 const dirtyTabs = computed(() => TABS.filter((t) => isDirty(t.key)).map((t) => t.key))
 const anyDirty = computed(() => dirtyTabs.value.length > 0)
 
@@ -168,7 +174,7 @@ async function load() {
 onMounted(load)
 
 // ===== 每个 tab 独立保存（只提交本 tab 的字段）=====
-function validateTab(tab: TabKey): string | null {
+function validateTab(tab: ConfigTab): string | null {
   if (tab === 'billing') {
     if (!r.value || r.value <= 0) return 'R 值必须为正数'
     if (!cnyRate.value || cnyRate.value <= 0) return '汇率必须为正数'
@@ -189,6 +195,7 @@ function validateTab(tab: TabKey): string | null {
 }
 
 async function saveTab(tab: TabKey = activeTab.value) {
+  if (!isConfigTab(tab)) return // 运维 tab 没有可保存的配置字段
   const bad = validateTab(tab)
   if (bad) {
     ElMessage.warning(bad)
@@ -633,6 +640,27 @@ async function onFileChange(ev: Event) {
               <el-button type="primary" :loading="saving" @click="saveTab('gateway')">保存网关配置</el-button>
             </div>
           </el-tab-pane>
+
+          <!-- ④ 运维：非配置类能力（渠道协议备份/恢复），没有 sys_configs 字段、也没有保存按钮 -->
+          <el-tab-pane name="ops">
+            <template #label>
+              <span class="tab-label">运维</span>
+            </template>
+
+            <div class="config-block">
+              <div class="block-title">备份与恢复</div>
+              <div class="block-desc">
+                导出全部渠道协议为预设包 JSON，或从该文件导入。导入按名称/来源自动去重，仅新增不覆盖。
+                该能力不写系统配置，因此本页签没有「保存」按钮。
+              </div>
+              <div class="form-row">
+                <span class="label">渠道协议</span>
+                <el-button type="primary" :loading="exporting" @click="onExport">导出</el-button>
+                <el-button :loading="importing" @click="triggerImport">导入</el-button>
+                <input ref="fileInput" type="file" accept=".json,application/json" style="display: none" @change="onFileChange" />
+              </div>
+            </div>
+          </el-tab-pane>
         </el-tabs>
 
         <ErrorBubble
@@ -642,17 +670,6 @@ async function onFileChange(ev: Event) {
         />
       </div>
 
-      <!-- 渠道协议备份与恢复：不属于系统配置键，故放在 tab 外常驻 -->
-      <div class="card config-card backup-card">
-        <div class="block-title">备份与恢复</div>
-        <div class="block-desc">导出全部渠道协议为预设包 JSON，或从该文件导入。导入按名称/来源自动去重，仅新增不覆盖。</div>
-        <div class="form-row">
-          <span class="label">渠道协议</span>
-          <el-button type="primary" :loading="exporting" @click="onExport">导出</el-button>
-          <el-button :loading="importing" @click="triggerImport">导入</el-button>
-          <input ref="fileInput" type="file" accept=".json,application/json" style="display: none" @change="onFileChange" />
-        </div>
-      </div>
     </div>
 
     <!-- 全局时段/分档默认值 抽屉 -->
