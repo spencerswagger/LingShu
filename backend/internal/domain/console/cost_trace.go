@@ -135,10 +135,7 @@ type costTraceResponse struct {
 // 参数：Limit（可选，语义与 /cost/session/{id} 完全一致：缺省不截断、显式上限 2000）；
 // Step / MaxTokens / HitRate / InOutRatio / At（可选，只影响预测打平点的采样，与定价曲线同源）。
 //
-// 该接口为只读能力，**恒可用**（不做服务端开关门控）。
-//
-// 检查顺序与定价曲线端点**保持一致**：先校验参数（400），再判能力开关（403）。
-// 这样同一个开关在两个端点上的表现统一（关闭 + 非法参数 = 400，不会一个 400 一个 403）。
+// 该接口为只读能力，**恒可用**（无服务端开关门控）；参数非法一律 400。
 func (h *Admin) HandleCostSessionTrace(w http.ResponseWriter, r *http.Request) {
 	sid := r.PathValue("id")
 	if sid == "" {

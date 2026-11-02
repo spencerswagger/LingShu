@@ -648,22 +648,29 @@ type sessionCostView struct {
 	FallbackNote string `json:"fallback_note"`
 }
 
-// currentSessionCost 读**运行态**会话成本路由配置：
-//   - 键存在且可解析 → 配置值（缺字段用产品默认补齐，与运行时同一实现）；
-//   - 键缺失 / 解析失败 → 故障安全态（三态开关全关 + 数值默认），且**不回写库**。
+// currentSessionCost 读会话成本路由配置，三种情形分开处理（都不回写库）：
+//
+//  1. 键存在且可解析 → 配置值（缺字段用产品默认补齐，与路由侧同一解析实现）；
+//  2. **键缺失 = 配置未初始化** → 产品默认（enabled/mid_switch=true、shadow_enabled=false）。
+//     种子会写入该键，缺键只出现在手工建库/老实例；面板按产品默认回显，便于管理员确认后
+//     保存一次即落库。注意这与「运行时的缺失行为」不同：运行时读不到键按故障安全态（三态全关）走，
+//     两者差异会在保存后消失，因此不把它当成配置异常；
+//  3. **键存在但解析失败 = 配置异常** → 故障安全态（三态全关），与运行时回退一致。
 func (h *Admin) currentSessionCost(ctx context.Context) router.SessionCostConfig {
-	if h.billing == nil {
-		return router.SafeSessionCostConfig()
+	if h.db == nil {
+		return router.DefaultSessionCostConfig()
 	}
-	raw, err := h.billing.GetConfig(ctx, router.SessionCostConfigKey)
+	raw, err := h.sysConfigRaw(ctx, router.SessionCostConfigKey)
+	if errors.Is(err, sql.ErrNoRows) {
+		return router.DefaultSessionCostConfig() // 未初始化：按产品默认回显
+	}
 	if err != nil {
-		return router.SafeSessionCostConfig()
+		return router.SafeSessionCostConfig() // 读取出错：拿不准，按故障安全态
 	}
-	cfg, ok := router.ParseSessionCostConfig(raw)
-	if !ok {
-		return router.SafeSessionCostConfig()
+	if cfg, ok := router.ParseSessionCostConfig(raw); ok {
+		return cfg
 	}
-	return cfg
+	return router.SafeSessionCostConfig() // 解析失败：配置异常
 }
 
 // readSessionCostView 组装 `Routing.SessionCost`（含回退说明）。

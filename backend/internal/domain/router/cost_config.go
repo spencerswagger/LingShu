@@ -39,7 +39,9 @@ type SessionCostConfig struct {
 	// CooldownSec 是同一会话两次切换之间的最小间隔（秒）：距上次切换不足该值则跳过。
 	// 默认 300（5 分钟）——每次切换都会丢上游 prefix cache，必须有冷却，否则会抖动。
 	CooldownSec int `json:"cooldown_sec"`
-	// ShadowEnabled 是「影子观测」的独立开关（P0），默认 false：
+	// ShadowEnabled 是「影子观测」的独立开关（P0），**产品默认 false**：
+	// 影子模式会对同一批候选额外计算并产出「若切换则会怎样」的观测事件，带来额外的上游调用与成本
+	// 开销，因此默认关闭，待观测需求明确后再按需开启。
 	// 开启后，即便未启用切换（Enabled/MidSwitch 任一为 false），也在会话亲和命中且有更优候选时
 	// 产出「若启用则会切换」的假设节省事件（Shadow=true、渠道不变），供账实校准。
 	// 默认关闭，保证安全态下不产生任何额外异步写（WAL/事件流）与可观测副作用。
@@ -62,7 +64,10 @@ type SessionCostConfig struct {
 //   - CooldownSec=300：同会话两次切换至少间隔 5 分钟，避免来回横跳；
 //   - MinImprove=0.05：新渠道本轮成本相对当前渠道的改善必须超过 5% 才切（抑制成本接近时抖动）。
 //
-// 与种子 routing.session_cost 的默认值逐字段一致。
+// **三态开关的产品默认：Enabled=true、MidSwitch=true、ShadowEnabled=false**，
+// 与种子 `routing.session_cost` 的初始配置逐字段一致（种子由 seeding 写入，二者必须同源）。
+// 依据：会话成本路由（起点择优 + 中途切换）是默认启用的调度能力，关掉会直接回退成「渠道亲和」；
+// 影子观测默认关闭——它会产生额外的上游调用与成本，待观测需求明确后再开启。
 //
 // 注意区分 safeSessionCostConfig：本函数是「配置里没写这个字段时该取什么」，
 // 而「配置根本读不到/解析不了/装配层没注入时该取什么」必须用故障安全态（关闭），

@@ -8,6 +8,7 @@ package console
 //  4. 已删除的成本页开关不再出现在 GET/PUT 里。
 
 import (
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -50,6 +51,20 @@ func sessionCostOf(t *testing.T, data map[string]json.RawMessage) sessionCostVie
 	return routing.SessionCost
 }
 
+// expectSessionCostRow 会话成本路由配置的读取期望。
+// 注意 SQL 形式：`sysConfigRaw` 用的是 `key = $1`（带空格），与 billing.GetConfig 的 `key=$1` 不同。
+func expectSessionCostRow(mock sqlmock.Sqlmock, val []byte) {
+	if val == nil {
+		mock.ExpectQuery(regexp.QuoteMeta(`SELECT value FROM sys_configs WHERE key = $1`)).
+			WithArgs(router.SessionCostConfigKey).
+			WillReturnError(sql.ErrNoRows)
+		return
+	}
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT value FROM sys_configs WHERE key = $1`)).
+		WithArgs(router.SessionCostConfigKey).
+		WillReturnRows(sqlmock.NewRows([]string{"value"}).AddRow(val))
+}
+
 // expectSystemConfigReads 按 GET 的读取顺序登记期望（计费 5 键 → 路由 1 键 → 会话过期 → 白名单）。
 func expectSystemConfigReads(mock sqlmock.Sqlmock, sessionCost []byte) {
 	expectConfigRow(mock, "billing.r", []byte(`10000`))
@@ -57,14 +72,15 @@ func expectSystemConfigReads(mock sqlmock.Sqlmock, sessionCost []byte) {
 	expectConfigRow(mock, "billing.context_tiers", []byte(`[]`))
 	expectConfigRow(mock, "billing.time_config", []byte(`{"Timezone":"Asia/Shanghai","Default":1}`))
 	expectConfigRow(mock, "routing.cost_sample", []byte(`{"input":10000,"cache_read":9000,"output":1000}`))
-	expectConfigRow(mock, router.SessionCostConfigKey, sessionCost)
+	expectSessionCostRow(mock, sessionCost)
 	expectConfigRow(mock, "session.expiration", []byte(`{"default_ttl_minutes":5,"context_tiers":[],"turn_tiers":[]}`))
 	expectConfigRow(mock, "gateway.upstream_response_header_whitelist", []byte(`[]`))
 }
 
-// TestGetSystemConfig_RoutingSessionCostDefaults 键缺失 → 回退故障安全态（三态全关 + 数值默认），
-// 且带只读回退说明；同时确认 Console 块已从响应里消失。
-func TestGetSystemConfig_RoutingSessionCostDefaults(t *testing.T) {
+// TestGetSystemConfig_RoutingSessionCostUninitialized 键缺失（配置未初始化）→ **产品默认**
+// （enabled=true / mid_switch=true / shadow_enabled=false + 数值默认），且带只读回退说明；
+// 同时确认 Console 块已从响应里消失。注意这条**不是**「解析失败」那条（见下一个用例）。
+func TestGetSystemConfig_RoutingSessionCostUninitialized(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock: %v", err)
@@ -75,8 +91,8 @@ func TestGetSystemConfig_RoutingSessionCostDefaults(t *testing.T) {
 
 	data := systemConfigGet(t, admin)
 	sc := sessionCostOf(t, data)
-	if sc.Enabled || sc.MidSwitch || sc.ShadowEnabled {
-		t.Fatalf("配置缺失时三态开关必须全关: %+v", sc)
+	if !sc.Enabled || !sc.MidSwitch || sc.ShadowEnabled {
+		t.Fatalf("键缺失=未初始化，应回显产品默认 true/true/false: %+v", sc)
 	}
 	if sc.RemainingA != 10 || sc.RemainingB != 1 || sc.RemainingMin != 1 || sc.RemainingMax != 20 ||
 		sc.MinRemaining != 1 || sc.CooldownSec != 300 || sc.MinImprove != 0.05 {
@@ -115,7 +131,8 @@ func TestGetSystemConfig_RoutingSessionCostStored(t *testing.T) {
 	}
 }
 
-// TestGetSystemConfig_RoutingSessionCostCorrupt JSON 损坏 → 三态全关（与运行时回退一致），且不回写库。
+// TestGetSystemConfig_RoutingSessionCostCorrupt 键存在但解析失败 = **配置异常** → 故障安全态
+// （三态全关，与运行时回退一致），且不回写库。这条与「键缺失=未初始化」是两种语义，必须分开验。
 func TestGetSystemConfig_RoutingSessionCostCorrupt(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
@@ -165,7 +182,7 @@ func TestPutSystemConfig_SessionCostMergesFields(t *testing.T) {
 	admin := NewAdmin(db, billing.NewSqlStore(db), nil, testUserIDFrom)
 
 	// 现值（读一次）：b=2 / cooldown=60 / min_improve=0.2
-	expectConfigRow(mock, router.SessionCostConfigKey, []byte(`{"enabled":false,"mid_switch":true,
+	expectSessionCostRow(mock, []byte(`{"enabled":false,"mid_switch":true,
 		"remaining_a":7,"remaining_b":2,"remaining_min":2,"remaining_max":9,"min_remaining":3,
 		"cooldown_sec":60,"min_improve":0.2}`))
 	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO sys_configs(key, value, updated_by)`)).
@@ -217,7 +234,7 @@ func TestPutSystemConfig_SessionCostInvalid(t *testing.T) {
 			defer db.Close()
 			admin := NewAdmin(db, billing.NewSqlStore(db), nil, testUserIDFrom)
 			// 合并基线读取（现值）
-			expectConfigRow(mock, router.SessionCostConfigKey, nil)
+			expectSessionCostRow(mock, nil)
 
 			if code, _ := putSystemConfig(t, admin, body); code != http.StatusBadRequest {
 				t.Fatalf("非法取值应 400，got %d", code)
@@ -238,7 +255,7 @@ func TestPutSystemConfig_InvalidSessionCostWritesNothing(t *testing.T) {
 	}
 	defer db.Close()
 	admin := NewAdmin(db, billing.NewSqlStore(db), nil, testUserIDFrom)
-	expectConfigRow(mock, router.SessionCostConfigKey, nil) // 合并基线读取
+	expectSessionCostRow(mock, nil) // 合并基线读取
 
 	body := `{"Billing":{"R":10000},"Routing":{"SessionCost":{"min_improve":2}}}`
 	if code, _ := putSystemConfig(t, admin, body); code != http.StatusBadRequest {
@@ -311,6 +328,24 @@ func TestPutSystemConfig_WhitelistEmptyArray(t *testing.T) {
 	}
 }
 
+// TestPutSystemConfig_WhitelistNullIsNoop 显式传 null 等同「没传」（指针为 nil）：
+// 不写库、不把白名单清空——避免「想清空却传错 null」把配置静默改掉。
+func TestPutSystemConfig_WhitelistNullIsNoop(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+	admin := NewAdmin(db, billing.NewSqlStore(db), nil, testUserIDFrom)
+
+	if code, affected := putSystemConfig(t, admin, `{"UpstreamResponseHeaderWhitelist":null}`); code != http.StatusOK || affected != 0 {
+		t.Fatalf("null 应视为未传: code=%d affected=%v", code, affected)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("null 不应写库: %v", err)
+	}
+}
+
 // TestPutSystemConfig_HotReloadWithoutRestart 断言「保存即热生效、无需重启」的完整链路：
 // Provider 先读到旧值并缓存 → PUT 写库（触发 SetConfigWriteHook → Invalidate）→ 同一进程再读，
 // 必须**重新回源**拿到新值。若写钩子没接上，第二次读取会命中旧缓存、也不会发出第二次查询。
@@ -336,7 +371,7 @@ func TestPutSystemConfig_HotReloadWithoutRestart(t *testing.T) {
 
 	admin := NewAdmin(db, billStore, nil, testUserIDFrom)
 	// 2) 保存：读现值（合并基线）+ 写库
-	expectConfigRow(mock, router.SessionCostConfigKey, []byte(`{"enabled":false,"mid_switch":false}`))
+	expectSessionCostRow(mock, []byte(`{"enabled":false,"mid_switch":false}`))
 	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO sys_configs(key, value, updated_by)`)).
 		WithArgs(router.SessionCostConfigKey, sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(0, 1))
