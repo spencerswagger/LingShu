@@ -2,7 +2,7 @@
 import { computed, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { ArrowDown, Edit, SwitchButton } from '@element-plus/icons-vue'
+import { ArrowDown, Edit, Refresh, SwitchButton } from '@element-plus/icons-vue'
 import { useAuthStore } from '@/stores/auth'
 import ChangePasswordDialog from '@/components/account/ChangePasswordDialog.vue'
 import MfaDialog from '@/components/account/MfaDialog.vue'
@@ -17,18 +17,23 @@ const balanceText = computed(() =>
   auth.balanceLoaded ? Math.round(auth.balance).toLocaleString() : '--',
 )
 
-// ===== 摘要指标（悬停展开时按需拉取，5 分钟前端缓存 + 后台静默刷新） =====
+// ===== 摘要指标（悬停展开时按需拉取，5 分钟前端缓存；不做默认后台强刷） =====
 const summary = computed(() => auth.summary)
 
-async function loadSummary() {
-  // 先吐缓存（若有），再后台静默刷新一次拿最新
-  await auth.fetchSummary(false)
-  await auth.fetchSummary(true)
+function loadSummary() {
+  // 展开只在「无缓存 / 缓存超 5 分钟」时拉网络（fetchSummary 内部走 TTL），
+  // 5 分钟内反复展开不重复请求。强制刷新走刷新按钮（refreshSummary）。
+  auth.fetchSummary()
 }
 
 function onShow() {
   auth.fetchProfile()
   loadSummary()
+}
+
+// 明确的用户动作：点刷新按钮 → 忽略 TTL 强制拉最新
+function refreshNow() {
+  auth.refreshSummary()
 }
 
 function compact(v: number) {
@@ -160,6 +165,7 @@ function onLogout() {
       <div class="panel-head">
         <span class="panel-nick">{{ auth.displayName() }}</span>
         <el-tag size="small" effect="plain">{{ roleLabel }}</el-tag>
+        <el-icon class="edit-icon refresh-icon" title="刷新数据" @click="refreshNow"><Refresh /></el-icon>
         <el-icon class="edit-icon" @click="openNameDialog"><Edit /></el-icon>
       </div>
       <div class="panel-sub">@{{ auth.username }}</div>
@@ -281,6 +287,10 @@ function onLogout() {
   color: var(--color-text-tertiary);
   cursor: pointer;
   transition: color 0.15s;
+}
+
+.refresh-icon {
+  margin-left: auto;
 }
 
 .edit-icon:hover {

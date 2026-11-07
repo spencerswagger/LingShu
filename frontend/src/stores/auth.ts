@@ -3,8 +3,9 @@ import { getMe, getMeSummary, updateMeNickname, logout as logoutApi, type MeSumm
 
 // 认证信息仅存 token + 角色 + 用户名（由后端登录结果决定角色，前端不提供选择）。
 // profile 由 /auth/me 拉取（昵称/余额），用于右上角用户浮窗展示，可离线刷新。
-// 本人摘要在途请求去重（模块级，非响应式）：并发调用共享同一 Promise，杜绝重复请求。
-let summaryInFlight: Promise<MeSummary | null> | null = null
+// 本人摘要在途请求去重：绑定到发起请求时的 token（用户身份指纹），并发调用共享同一 Promise；
+// 登出/换账号后旧在途请求即使落地也不会写入新用户（写入前校验 token 未变）。
+let summaryInFlight: { token: string; promise: Promise<MeSummary | null> } | null = null
 
 export const useAuthStore = defineStore('auth', {
   state: () => ({
@@ -29,6 +30,10 @@ export const useAuthStore = defineStore('auth', {
       this.username = username
       this.mustChangePassword = mustChange
       this.totpEnabled = totpEnabled
+      // 换账号：旧在途摘要请求作废（其落地会因 token 不匹配而被丢弃）
+      summaryInFlight = null
+      this.summary = null
+      this.summaryLoadedAt = 0
       localStorage.setItem('token', token)
       localStorage.setItem('role', role)
       localStorage.setItem('username', username)
@@ -67,28 +72,47 @@ export const useAuthStore = defineStore('auth', {
         // 未登录 / 网络异常时静默，保持已有展示
       }
     },
-    // 本人摘要：带 5 分钟前端缓存 + 在途去重，同一份数据不重复请求。
-    // force=true 忽略缓存（面板打开时的后台静默刷新）；失败时不覆盖已有缓存。
-    async fetchSummary(force = false): Promise<MeSummary | null> {
+    // 本人摘要：带 5 分钟前端缓存 + 在途去重。
+    // 面板展开等「被动展示」调用默认走 TTL 缓存——无缓存或缓存超 5 分钟才拉网络，
+    // 5 分钟内不重复请求。想强制刷新走明确的用户动作（refreshSummary，点击刷新），
+    // 不要在展开里默认绕过 TTL。失败时不覆盖已有缓存。
+    async fetchSummary(): Promise<MeSummary | null> {
       const CACHE_MS = 5 * 60 * 1000
       if (!this.token) return null
-      if (!force && this.summary && Date.now() - this.summaryLoadedAt < CACHE_MS) {
+      if (this.summary && Date.now() - this.summaryLoadedAt < CACHE_MS) {
         return this.summary
       }
-      if (summaryInFlight) return summaryInFlight
-      summaryInFlight = (async () => {
+      return this.fetchSummaryRemote()
+    },
+    // 强制刷新（用户点「刷新」）：忽略 TTL 直接拉网络，仍走同一在途去重与身份校验。
+    async refreshSummary(): Promise<MeSummary | null> {
+      if (!this.token) return null
+      return this.fetchSummaryRemote()
+    },
+    // 私有：真正发请求，带 token 身份校验 + 在途去重。不对外直接调用。
+    async fetchSummaryRemote(): Promise<MeSummary | null> {
+      if (!this.token) return null
+      const token = this.token
+      // 在途：同一用户身份共享同一 Promise；不同 token 视为不同请求，互不串
+      if (summaryInFlight && summaryInFlight.token === token) return summaryInFlight.promise
+      const promise = (async () => {
         try {
           const res = await getMeSummary()
-          this.summary = res.Data
-          this.summaryLoadedAt = Date.now()
+          // 落地时校验身份未变：登出/换账号后旧响应不写入新用户
+          if (this.token === token) {
+            this.summary = res.Data
+            this.summaryLoadedAt = Date.now()
+            return this.summary
+          }
           return this.summary
         } catch {
           return this.summary
         } finally {
-          summaryInFlight = null
+          if (summaryInFlight?.token === token) summaryInFlight = null
         }
       })()
-      return summaryInFlight
+      summaryInFlight = { token, promise }
+      return promise
     },
     async changeNickname(nickname: string) {
       const res = await updateMeNickname(nickname)
@@ -110,6 +134,8 @@ export const useAuthStore = defineStore('auth', {
       this.balanceLoaded = false
       this.mustChangePassword = false
       this.totpEnabled = false
+      // 登出：作废在途摘要请求 + 清缓存，避免跨用户串数据
+      summaryInFlight = null
       this.summary = null
       this.summaryLoadedAt = 0
       localStorage.removeItem('token')
