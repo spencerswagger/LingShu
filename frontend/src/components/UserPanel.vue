@@ -4,7 +4,6 @@ import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { ArrowDown, Edit, SwitchButton } from '@element-plus/icons-vue'
 import { useAuthStore } from '@/stores/auth'
-import { getMeSummary, type MeSummary } from '@/api/auth'
 import ChangePasswordDialog from '@/components/account/ChangePasswordDialog.vue'
 import MfaDialog from '@/components/account/MfaDialog.vue'
 
@@ -18,16 +17,13 @@ const balanceText = computed(() =>
   auth.balanceLoaded ? Math.round(auth.balance).toLocaleString() : '--',
 )
 
-// ===== 摘要指标（悬停展开时拉取，失败静默置空） =====
-const summary = ref<MeSummary | null>(null)
+// ===== 摘要指标（悬停展开时按需拉取，5 分钟前端缓存 + 后台静默刷新） =====
+const summary = computed(() => auth.summary)
 
 async function loadSummary() {
-  try {
-    const res = await getMeSummary()
-    summary.value = res.Data
-  } catch {
-    summary.value = null
-  }
+  // 先吐缓存（若有），再后台静默刷新一次拿最新
+  await auth.fetchSummary(false)
+  await auth.fetchSummary(true)
 }
 
 function onShow() {

@@ -1,8 +1,11 @@
 import { defineStore } from 'pinia'
-import { getMe, updateMeNickname, logout as logoutApi } from '@/api/auth'
+import { getMe, getMeSummary, updateMeNickname, logout as logoutApi, type MeSummary } from '@/api/auth'
 
 // 认证信息仅存 token + 角色 + 用户名（由后端登录结果决定角色，前端不提供选择）。
 // profile 由 /auth/me 拉取（昵称/余额），用于右上角用户浮窗展示，可离线刷新。
+// 本人摘要在途请求去重（模块级，非响应式）：并发调用共享同一 Promise，杜绝重复请求。
+let summaryInFlight: Promise<MeSummary | null> | null = null
+
 export const useAuthStore = defineStore('auth', {
   state: () => ({
     token: localStorage.getItem('token') || '',
@@ -14,6 +17,10 @@ export const useAuthStore = defineStore('auth', {
     totpEnabled: localStorage.getItem('totp_enabled') === '1',
     balance: 0,
     balanceLoaded: false,
+    // 本人摘要（/me/summary）前端缓存：同一份数据 5 分钟内不重复请求。
+    // 仅右上角用户面板展开 / 统计页需要时按需拉取，切页不重取。
+    summary: null as MeSummary | null,
+    summaryLoadedAt: 0,
   }),
   actions: {
     setAuth(token: string, role: string, username: string, mustChange = false, totpEnabled = false) {
@@ -60,6 +67,29 @@ export const useAuthStore = defineStore('auth', {
         // 未登录 / 网络异常时静默，保持已有展示
       }
     },
+    // 本人摘要：带 5 分钟前端缓存 + 在途去重，同一份数据不重复请求。
+    // force=true 忽略缓存（面板打开时的后台静默刷新）；失败时不覆盖已有缓存。
+    async fetchSummary(force = false): Promise<MeSummary | null> {
+      const CACHE_MS = 5 * 60 * 1000
+      if (!this.token) return null
+      if (!force && this.summary && Date.now() - this.summaryLoadedAt < CACHE_MS) {
+        return this.summary
+      }
+      if (summaryInFlight) return summaryInFlight
+      summaryInFlight = (async () => {
+        try {
+          const res = await getMeSummary()
+          this.summary = res.Data
+          this.summaryLoadedAt = Date.now()
+          return this.summary
+        } catch {
+          return this.summary
+        } finally {
+          summaryInFlight = null
+        }
+      })()
+      return summaryInFlight
+    },
     async changeNickname(nickname: string) {
       const res = await updateMeNickname(nickname)
       this.nickname = res.Data.Nickname || ''
@@ -80,6 +110,8 @@ export const useAuthStore = defineStore('auth', {
       this.balanceLoaded = false
       this.mustChangePassword = false
       this.totpEnabled = false
+      this.summary = null
+      this.summaryLoadedAt = 0
       localStorage.removeItem('token')
       localStorage.removeItem('user_id')
       localStorage.removeItem('role')
