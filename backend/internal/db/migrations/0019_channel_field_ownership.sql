@@ -60,13 +60,20 @@ BEGIN
     ELSE
     -- ---------- (b) 归档并清空「引用协议」渠道的内联基址与协议类型 ----------
 
-    -- 只处理「引用了仍在生效的协议」的渠道：协议已软删的渠道保持原值不动——
-    -- 那种状态下运行时解析不到协议基址，清空只会丢掉唯一可恢复的地址（等人工修复，不是迁移的事）。
+    -- 只处理「引用了仍在生效的协议」的渠道（契约 S1）：协议已软删时，运行时会回落读
+    -- channels.base_url/protocol（lookupChannelProtocol 过滤 deleted_at → rt.Protocol=nil），
+    -- 这两个内联值此刻就是该渠道的**生效配置**，清空等于把渠道打向空地址。
+    --
+    -- 【不变量】归档与清空必须使用**逐字相同**的谓词（下面两段 WHERE 完全一致）：
+    --   归档集合 ≡ 清空集合 ⇒ 未归档 ⇒ 未被改动 ⇒ 回滚无损，且不依赖外部备份。
+    --   改动其中一条语句时必须同步另一条（db 测试 TestMigrate_0019_ArchiveEqualsClearSet 会拦住）。
     INSERT INTO channel_base_url_archive(channel_id, base_url, protocol)
     SELECT c.id, btrim(c.base_url), btrim(c.protocol)
     FROM channels c
-    JOIN channel_protocols cp ON cp.id = c.channel_protocol_id AND cp.deleted_at IS NULL
-    WHERE c.deleted_at IS NULL
+    CROSS JOIN channel_protocols cp
+    WHERE cp.id = c.channel_protocol_id
+      AND cp.deleted_at IS NULL
+      AND c.deleted_at IS NULL
       AND (btrim(c.base_url) <> '' OR btrim(c.protocol) <> '')
     ON CONFLICT (channel_id) DO NOTHING;
 

@@ -403,27 +403,41 @@ func idArrayLiteral(ids []int64) string {
 }
 
 // archiveChannelsSQL 留档被清空的内联基址/协议类型（裁定①：清空前先存一份，保证可无损回滚）。
-// 与迁移 (b) 同口径：只处理引用了**仍在生效**协议的渠道；协议已软删的渠道保持原值不动。
+// archivedChannelPredicate 是「归档」与「清空」必须**逐字相同**的谓词（契约 §6.1 不变量）。
+//
+// 为什么必须是同一个字符串：归档集合 ≡ 清空集合 ⇒ 「未归档 ⇒ 未被改动」，回滚才可能无损、
+// 且不依赖任何外部备份。若有人只给其中一条加条件（例如忘了 join 协议 deleted_at），
+// 回滚就会静默丢地址——所以这里用同一个常量拼两条语句，不给「改一处漏一处」留缝。
+//
+// 口径（§6.1 S1~S3）：只处理「引用了**仍在生效**协议」的渠道。协议已软删时运行时会
+// 回落读 channels.base_url/protocol（lookupChannelProtocol 过滤 deleted_at），
+// 这两个内联值此刻就是生效配置，清空等于把渠道打向空地址。
+const archivedChannelPredicate = `cp.id = c.channel_protocol_id
+  AND cp.deleted_at IS NULL
+  AND c.deleted_at IS NULL
+  AND (btrim(c.base_url) <> '' OR btrim(c.protocol) <> '')`
+
+// archivedChannelBatchFilter 批内主键过滤：两条语句共用同一份，保证批内集合也相等。
+const archivedChannelBatchFilter = `AND c.id = ANY($1::bigint[])`
+
+// archiveChannelsSQL 留档被清空的内联基址/协议类型（清空前先存一份，保证可无损回滚）。
 const archiveChannelsSQL = `
 INSERT INTO channel_base_url_archive(channel_id, base_url, protocol)
 SELECT c.id, btrim(c.base_url), btrim(c.protocol)
 FROM channels c
-JOIN channel_protocols cp ON cp.id = c.channel_protocol_id AND cp.deleted_at IS NULL
-WHERE c.id = ANY($1::bigint[])
-  AND c.deleted_at IS NULL
-  AND (btrim(c.base_url) <> '' OR btrim(c.protocol) <> '')
+CROSS JOIN channel_protocols cp
+WHERE ` + archivedChannelPredicate + `
+  ` + archivedChannelBatchFilter + `
 ON CONFLICT (channel_id) DO NOTHING`
 
-// clearChannelsSQL 清空「引用协议」渠道的内联基址与协议类型（该值不再参与解析）。
+// clearChannelsSQL 清空「引用生效协议」渠道的内联基址与协议类型（该值不再参与解析）。
+// 谓词与 archiveChannelsSQL 完全相同（见 archivedChannelPredicate）。
 const clearChannelsSQL = `
 UPDATE channels c
 SET base_url = '', protocol = '', updated_at = now()
 FROM channel_protocols cp
-WHERE cp.id = c.channel_protocol_id
-  AND cp.deleted_at IS NULL
-  AND c.id = ANY($1::bigint[])
-  AND c.deleted_at IS NULL
-  AND (btrim(c.base_url) <> '' OR btrim(c.protocol) <> '')`
+WHERE ` + archivedChannelPredicate + `
+  ` + archivedChannelBatchFilter
 
 // markDriftSQL 与迁移 (d) 段同口径：种子定义了的键 + 双方都有值 + 值不同 → edited=true。
 const markDriftSQL = `

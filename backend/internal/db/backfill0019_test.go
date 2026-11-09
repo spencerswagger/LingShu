@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -248,5 +249,20 @@ func TestBackfill0019_AfterMigrationIsNoop(t *testing.T) {
 	}
 	if res.ChannelsArchived != 0 || res.ModelsMarked != 0 {
 		t.Fatalf("空库回填应无写入，got %+v", res)
+	}
+}
+
+// 回填侧同样要守「归档集合 ≡ 清空集合」不变量：两条语句必须来自同一份谓词常量
+// （不像 .sql 那样只能靠源码级断言，这里结构上就不给「改一条漏一条」留缝）。
+func TestBackfill0019_ArchiveAndClearSharePredicate(t *testing.T) {
+	if !strings.Contains(archiveChannelsSQL, archivedChannelPredicate) {
+		t.Fatalf("归档语句未使用共享谓词")
+	}
+	if !strings.Contains(clearChannelsSQL, archivedChannelPredicate) {
+		t.Fatalf("清空语句未使用共享谓词")
+	}
+	if !strings.Contains(archiveChannelsSQL, archivedChannelBatchFilter) ||
+		!strings.Contains(clearChannelsSQL, archivedChannelBatchFilter) {
+		t.Fatalf("批内过滤条件也必须共用，否则批内集合会不相等")
 	}
 }

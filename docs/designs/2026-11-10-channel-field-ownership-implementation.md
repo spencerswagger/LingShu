@@ -45,12 +45,25 @@
 但 §6.1 的 SQL 里没有这一步。不补的话，凡是「实例 protocols 为空、靠种子回落」的模型行会突然丢掉
 模型级协议子集（行为回退）。迁移 0019 用 (c) 段补上，只写「实例为空」的行。
 
-### 2.3 归档范围：只处理「引用了仍在生效的协议」的渠道
+### 2.3 归档范围（契约 S1~S3）与「归档集合 ≡ 清空集合」不变量
 
-迁移 (b) 与回填的归档/清空语句都 `JOIN channel_protocols cp ON cp.id = c.channel_protocol_id
-AND cp.deleted_at IS NULL`：协议已被软删的渠道**保持原值不动**——那种状态下运行时解析不到协议基址，
-清空只会丢掉唯一可恢复的地址，属于要人工修复的脏数据，不是迁移该悄悄处理的范围。
-同理软删渠道不归档、`base_url` 与 `protocol` 都空的渠道不产生留档行。
+迁移 (b) 与回填的归档/清空都只处理「引用了**仍在生效**协议」的渠道，因为这不只是数据洁癖：
+
+> 协议被软删后，`lookupChannelProtocol`（`channel/manager.go`）用 `GetByID` 过滤 `deleted_at IS NULL`
+> → `rt.Protocol == nil` → 网关回落读 `channels.base_url` / `channels.protocol`（`gateway/protocol.go`）。
+> **这两个内联值此刻就是该渠道的生效配置**，清空等于把渠道打向空地址。
+
+所以 S1 是正确性问题，不是「可恢复性」问题。另两条：S2 软删渠道不归档（不接流量、日后恢复还带着原值）；
+S3 `base_url` 与 `protocol` 都空的渠道不产生留档（没东西可归档，写空行只会污染回滚集合）。
+
+**不变量**：归档语句与清空语句使用**逐字相同**的谓词 ⇒ 归档集合 ≡ 清空集合 ⇒ 未归档 ⇒ 未被改动，
+回滚无损且**不依赖任何外部备份**。实现上两处都做了结构保证：
+
+- `.sql` 里两段 WHERE 逐字相同 → `TestMigrate_0019_ArchiveEqualsClearSet` 既做源码级断言
+  （谓词必须出现且仅出现 2 次），又做行为级断言（C1~C5 五类渠道：归档集合 = 被清空集合、
+  未归档渠道原值逐字未变、不存在「被清空但未归档」）；
+- Go 侧两条语句由同一个常量 `archivedChannelPredicate` 拼出（批内过滤也用同一常量），
+  `TestBackfill0019_ArchiveAndClearSharePredicate` 守住这一点。
 
 ### 2.4 没有「渠道侧旧转换配置归并到协议」这一步，因为不存在渠道侧存储
 
@@ -120,6 +133,8 @@ AND cp.deleted_at IS NULL`：协议已被软删的渠道**保持原值不动**�
 
 已验证（PG17 真跑）：
 `TestMigrate_0019_ArchiveScope`（软删渠道/已空渠道/引用软删协议的渠道都不归档、原值不被清）、
+`TestMigrate_0019_ArchiveEqualsClearSet`（不变量：源码级谓词逐字相同 + 行为级集合相等/未归档即未改动）、
+`TestBackfill0019_ArchiveAndClearSharePredicate`（Go 侧两条语句共用同一谓词常量）、
 `TestBackfill0019_BeforeMigrationFailsReadably`（迁移前跑回填给出「请先执行迁移 0019」的可读错误）、
 `TestMigrate_0019_AfterBackfillIsIdempotent`（>5 万行：迁移→回填→再跑迁移，结果逐行不变且告警消失）、
 `TestBackfill0019_Idempotent`（跑两遍状态逐行一致、第二遍零写入）、
@@ -142,7 +157,9 @@ AND cp.deleted_at IS NULL`：协议已被软删的渠道**保持原值不动**�
 
 `lingshu_dev` 同为 0；`lingshu_staging` 无业务表。**生产数待 spencer 提供后修订本节**。
 采集入口：`psql "$DSN" -f backend/scripts/0019-preflight-audit.sql`（只读，一次给出：三表计数 +
-裁定①影响面清单 + 高危（协议无基址）+ 预估 `edited` 行数 + 回填路径建议）。
+`2)/2a)` 裁定①影响面 + `2b)` 高危（协议**任何**协议键都没配基址，判定用 `NOT EXISTS (jsonb_each …)`，
+不再只看 `openai-chat`）+ `2c)` 引用已软删协议的渠道（信息项，迁移不动，需人工修复引用）+
+`3)` 候选行数上界 + `5)` 回填路径建议）。各段的判读与处置见 README「预检输出怎么读」。
 
 ---
 

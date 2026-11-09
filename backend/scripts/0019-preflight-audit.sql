@@ -26,7 +26,7 @@ SELECT coalesce(channel_protocol_id, 0) AS protocol_id, count(*) AS channels
 FROM channels WHERE deleted_at IS NULL
 GROUP BY 1 ORDER BY 2 DESC;
 
-\echo '=== 2) 裁定①影响面：引用协议 + 内联 base_url/protocol 非空（迁移会归档并清空，生效地址变协议地址）==='
+\echo '=== 2) / 2a) 裁定①影响面：引用「生效中」协议 + 内联 base_url/protocol 非空（迁移会归档并清空，生效地址变协议地址）==='
 SELECT c.id,
        c.name,
        c.base_url                                        AS inline_base_url_to_be_archived,
@@ -40,16 +40,37 @@ WHERE c.deleted_at IS NULL
   AND (btrim(c.base_url) <> '' OR btrim(c.protocol) <> '')
 ORDER BY c.id;
 
-\echo '=== 2b) 高危：协议自身也没有基址（清空后无地址可打，必须先补协议或改回内联）==='
-SELECT c.id, c.name, c.base_url AS current_inline_base_url
+\echo '=== 2b) 高危：协议自身没有任何可用基址（清空后无地址可打，必须先补协议或改回内联）==='
+-- 判定口径：协议级 base_url 为空，且**任意**协议键都没有配 baseUrl（不能只看 openai-chat——
+-- 只给 anthropic-messages 配了基址的协议会被误报高危）。
+SELECT c.id, c.name, c.base_url AS current_inline_base_url, cp.name AS protocol_name
 FROM channels c
 JOIN channel_protocols cp ON cp.id = c.channel_protocol_id AND cp.deleted_at IS NULL
 WHERE c.deleted_at IS NULL
   AND btrim(cp.base_url) = ''
-  AND COALESCE(btrim(cp.protocols -> 'openai-chat' ->> 'baseUrl'), '') = ''
+  AND NOT EXISTS (
+      SELECT 1 FROM jsonb_each(cp.protocols) AS p(name, spec)
+      WHERE btrim(COALESCE(p.spec ->> 'baseUrl', '')) <> ''
+  )
 ORDER BY c.id;
 
-\echo '=== 3) 预估被标 edited=true 的模型行（种子定义了且双方都有值且不同）==='
+\echo '=== 2c) 信息项：引用「已软删协议」的渠道（迁移不动它们；需人工修复引用）==='
+-- S1 口径：协议软删后 lookupChannelProtocol 过滤 deleted_at → rt.Protocol=nil，
+-- 网关回落读 channels.base_url/protocol，因此这两个内联值此刻就是生效配置，迁移不清空、不归档。
+-- 这类渠道协议已不存在，属既有故障，需人工修复引用（重新激活/换协议，或确认改回内联）。
+SELECT c.id,
+       c.name,
+       c.channel_protocol_id                                  AS referenced_protocol_id,
+       btrim(c.base_url)                                      AS inline_base_url_kept,
+       btrim(c.protocol)                                      AS inline_protocol_kept,
+       cp.name                                                AS protocol_name,
+       cp.deleted_at                                           AS protocol_deleted_at
+FROM channels c
+JOIN channel_protocols cp ON cp.id = c.channel_protocol_id AND cp.deleted_at IS NOT NULL
+WHERE c.deleted_at IS NULL
+ORDER BY c.id;
+
+\echo '=== 3) 候选行数（上界）：种子定义了商业字段的模型行 ==='
 SELECT count(*) AS drift_rows_to_mark_edited
 FROM channel_models cm
 JOIN channels c ON c.id = cm.channel_id AND c.deleted_at IS NULL

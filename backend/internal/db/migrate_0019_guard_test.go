@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -405,5 +406,123 @@ func TestMigrate_0019_AfterBackfillIsIdempotent(t *testing.T) {
 	}
 	if msgs, err := PendingLargeBackfills(ctx, tempDB); err != nil || len(msgs) != 0 {
 		t.Fatalf("回填完成且迁移重跑后不应再有告警: %v / %v", msgs, err)
+	}
+}
+
+// 契约 §6.1 不变量（回滚正确性的唯一依赖）：**归档集合 ≡ 清空集合**，
+// 因而「未归档 ⇒ 未被改动」。这里同时守两层：
+//  1. 源码级：迁移 (b) 的归档与清空必须用逐字相同的谓词（防止只改一条语句）；
+//  2. 行为级：造 C1~C5 五类渠道，断言 归档集合 = 被清空集合，且未归档渠道**原值逐字未变**。
+func TestMigrate_0019_ArchiveEqualsClearSet(t *testing.T) {
+	// ---------- 1. 源码级：谓词必须逐字相同 ----------
+	migPath := filepath.Join(filepath.Dir(mustCallerFile(t)), "migrations", "0019_channel_field_ownership.sql")
+	raw, err := os.ReadFile(migPath)
+	if err != nil {
+		t.Fatalf("读取迁移失败: %v", err)
+	}
+	predicate := `cp.id = c.channel_protocol_id
+      AND cp.deleted_at IS NULL
+      AND c.deleted_at IS NULL
+      AND (btrim(c.base_url) <> '' OR btrim(c.protocol) <> '')`
+	if n := strings.Count(string(raw), predicate); n != 2 {
+		t.Fatalf("归档与清空的谓词必须逐字相同且各出现一次（实际命中 %d 次）；"+
+			"改了一条语句忘了另一条会破坏「未归档即未改动」", n)
+	}
+
+	// ---------- 2. 行为级：五类渠道 ----------
+	tempDB := openTempDB(t)
+	migDir := filepath.Dir(migPath)
+	applyMigrationsBelow(t, tempDB, migDir, "0019")
+	exec(t, tempDB, `INSERT INTO channel_protocols(id, name, base_url, models) VALUES (7,'live','https://live.example.com','{}'::jsonb)`)
+	exec(t, tempDB, `INSERT INTO channel_protocols(id, name, base_url, models, deleted_at)
+		VALUES (8,'gone','https://gone.example.com','{}'::jsonb, now())`)
+	exec(t, tempDB, `INSERT INTO channels(id, name, base_url, protocol, channel_protocol_id) VALUES
+		(1, 'C1-live-with-url', 'https://c1.example.com', 'openai-compat', 7),
+		(2, 'C2-live-empty',    '',                     '',              7),
+		(3, 'C3-soft-deleted',  'https://c3.example.com','openai-compat', 7),
+		(4, 'C4-refs-gone',     'https://c4.example.com','openai-compat', 8),
+		(5, 'C5-inline',        'https://c5.example.com','openai-chat',   NULL)`)
+	exec(t, tempDB, `UPDATE channels SET deleted_at = now() WHERE id = 3`)
+
+	// 迁移前的原值（用于断言「未归档即未改动」）。
+	type val struct{ base, proto string }
+	before := map[int64]val{}
+	rows, err := tempDB.Query(`SELECT id, base_url, protocol FROM channels ORDER BY id`)
+	if err != nil {
+		t.Fatalf("读取迁移前数据失败: %v", err)
+	}
+	for rows.Next() {
+		var id int64
+		var v val
+		if err := rows.Scan(&id, &v.base, &v.proto); err != nil {
+			t.Fatalf("扫描失败: %v", err)
+		}
+		before[id] = v
+	}
+	rows.Close()
+
+	runMigration(t, tempDB, migDir, migrationFile(t, migDir, "0019"))
+
+	// 迁移后：哪些被归档、哪些被清空。
+	archived := map[int64]bool{}
+	rows, err = tempDB.Query(`SELECT channel_id FROM channel_base_url_archive`)
+	if err != nil {
+		t.Fatalf("读取留档失败: %v", err)
+	}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			t.Fatalf("扫描留档失败: %v", err)
+		}
+		archived[id] = true
+	}
+	rows.Close()
+
+	after := map[int64]val{}
+	rows, err = tempDB.Query(`SELECT id, base_url, protocol FROM channels ORDER BY id`)
+	if err != nil {
+		t.Fatalf("读取迁移后数据失败: %v", err)
+	}
+	for rows.Next() {
+		var id int64
+		var v val
+		if err := rows.Scan(&id, &v.base, &v.proto); err != nil {
+			t.Fatalf("扫描失败: %v", err)
+		}
+		after[id] = v
+	}
+	rows.Close()
+
+	for id, b := range before {
+		cleared := after[id].base == "" && after[id].proto == ""
+		hadValue := b.base != "" || b.proto != ""
+		switch {
+		case archived[id]:
+			// 归档 ⇒ 必须被清空（否则留档表与库不一致）。
+			if hadValue && !cleared {
+				t.Fatalf("渠道 %d 已归档但未被清空（%q/%q）", id, after[id].base, after[id].proto)
+			}
+		default:
+			// 未归档 ⇒ 必须原值逐字未变（S1/S2/S3 + 内联渠道）。
+			if after[id] != b {
+				t.Fatalf("渠道 %d 未归档却被改动：before=%+v after=%+v（违反「未归档 ⇒ 未被改动」）", id, b, after[id])
+			}
+			if hadValue && cleared {
+				t.Fatalf("渠道 %d 出现「被清空但未归档」——回滚会丢地址", id)
+			}
+		}
+	}
+
+	// 具体集合：只有 C1 该被归档；C4（引用软删协议）必须原样保留。
+	if !archived[1] {
+		t.Fatalf("C1（引用生效协议 + 非空值）应被归档")
+	}
+	for _, id := range []int64{2, 3, 4, 5} {
+		if archived[id] {
+			t.Fatalf("渠道 %d 不应被归档（C2 空值 / C3 软删 / C4 引用软删协议 / C5 内联）", id)
+		}
+	}
+	if after[4].base != "https://c4.example.com" {
+		t.Fatalf("C4 引用已软删协议，内联值此刻就是生效配置，必须原样保留，got %q", after[4].base)
 	}
 }
