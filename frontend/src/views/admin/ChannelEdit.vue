@@ -81,8 +81,18 @@ const form = reactive({
   auth_fail_threshold: 3,
 })
 
-// 是否引用渠道协议：选中时内联 protocol/base_url 由协议承载，禁用内联编辑与校验
+// 是否引用渠道协议：选中后基址/协议类型由协议独占（契约 0019 裁定①），渠道不再能覆盖基址
 const usingProtocol = computed(() => !!form.channel_protocol_id)
+// 被引用协议的生效基址：优先用后端只读派生值 BaseURLEffective（运行时真源），
+// 协议下拉里没有时回落到 GET 回来的同名字段。
+const effectiveBaseUrl = computed(() => {
+  if (!usingProtocol.value) return form.base_url
+  return channel.value?.BaseURLEffective || ''
+})
+const selectedProtocolName = computed(() => {
+  const cid = form.channel_protocol_id
+  return protocolOptions.value.find((p) => p.ID === cid)?.Name || ''
+})
 
 const stateLabel: Record<string, string> = { NORMAL: '正常', DRAIN: '排空', DISABLED: '禁用' }
 
@@ -204,7 +214,8 @@ async function load() {
     }
     channel.value = row
     form.name = row.Name
-    form.protocol = row.Protocol
+    // 引用协议时后端把 protocol 落空（不参与解析）：切回内联模式要给个可用默认值，避免下拉空白
+    form.protocol = row.Protocol || 'openai-compat'
     form.base_url = row.BaseURL
     form.channel_protocol_id = row.ChannelProtocolID != null ? String(row.ChannelProtocolID) : ''
     form.tag_ids = row.TagIDs || []
@@ -397,8 +408,9 @@ async function onSubmit() {
   try {
     await updateChannel(id, {
       Name: form.name.trim(),
-      Protocol: form.protocol,
-      BaseURL: form.base_url.trim(),
+      // 引用协议时基址/协议类型由协议独占：两个字段一律提交空串，否则后端按契约 §5.1 400。
+      Protocol: usingProtocol.value ? '' : form.protocol,
+      BaseURL: usingProtocol.value ? '' : form.base_url.trim(),
       ChannelProtocolID: form.channel_protocol_id || null,
       TagIDs: form.tag_ids,
       Priority: form.priority,
@@ -432,6 +444,9 @@ async function onSubmit() {
     await load()
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
+    // 400 多为基址/协议归属校验：把后端 message 原样落到「基本信息」表单错误区（不显示成通用「保存失败」），
+    // 并把用户带回出错的 tab，否则错误提示会落在看不见的地方。
+    if (e?.status === 400) activeTab.value = 'base'
   } finally {
     saving.value = false
   }
@@ -453,19 +468,34 @@ async function onSubmit() {
                 <el-option label="不使用（内联配置）" value="" />
                 <el-option v-for="p in protocolOptions" :key="p.ID" :label="p.Name" :value="p.ID" />
               </el-select>
-              <div class="hint">选中后以渠道协议承载 protocol / base_url 等配置，下方内联字段将被禁用；不选则使用内联配置</div>
+              <div class="hint">引用协议后基址与协议类型由协议独占（渠道不可覆盖）；要改基址请改协议或新建一条协议</div>
             </el-form-item>
-            <el-form-item label="协议">
-              <el-select v-model="form.protocol" style="width: 100%" :disabled="usingProtocol">
-                <el-option label="openai-compat（OpenAI 兼容）" value="openai-compat" />
-                <el-option label="openai-responses" value="openai-responses" />
-                <el-option label="anthropic-messages" value="anthropic-messages" />
-              </el-select>
+            <template v-if="!usingProtocol">
+              <el-form-item label="协议">
+                <el-select v-model="form.protocol" style="width: 100%">
+                  <el-option label="openai-compat（OpenAI 兼容）" value="openai-compat" />
+                  <el-option label="openai-responses" value="openai-responses" />
+                  <el-option label="anthropic-messages" value="anthropic-messages" />
+                </el-select>
+              </el-form-item>
+              <el-form-item class="span-2" label="Base URL">
+                <el-input v-model="form.base_url" />
+                <div class="hint">上游供应商地址，网关请求将转发到该地址下的 /chat/completions 等路径</div>
+              </el-form-item>
+            </template>
+            <el-form-item v-else class="span-2" label="基址（随协议）">
+              <div class="ro-block">
+                <div class="ro-line">
+                  <span class="ro-label">引用协议</span>
+                  <span class="ro-value">{{ selectedProtocolName || '—' }}</span>
+                </div>
+                <div class="ro-line">
+                  <span class="ro-label">生效基址</span>
+                  <span class="ro-value">{{ effectiveBaseUrl || '（协议未配置基址）' }}</span>
+                </div>
+                <div class="hint">基址随协议，需改动请新建或改协议</div>
+              </div>
             </el-form-item>
-            <el-form-item class="span-2" label="Base URL">
-          <el-input v-model="form.base_url" :disabled="usingProtocol" />
-          <div class="hint">上游供应商地址，网关请求将转发到该地址下的 /chat/completions 等路径</div>
-        </el-form-item>
             <el-form-item class="span-2" label="标签">
               <el-select v-model="form.tag_ids" multiple filterable style="width: 100%"
                 placeholder="选择该渠道绑定的语义标签">
@@ -571,7 +601,7 @@ async function onSubmit() {
 
       <el-tab-pane label="模型" name="models">
         <div class="card">
-          <ChannelModels :channel-id="id" :readonly="false" />
+          <ChannelModels :channel-id="id" :readonly="false" :channel-protocol-id="form.channel_protocol_id" />
         </div>
       </el-tab-pane>
 
@@ -896,6 +926,30 @@ async function onSubmit() {
   font-size: 12px;
   line-height: 1.5;
   color: var(--color-text-secondary);
+}
+/* 引用协议时的只读「基址随协议」块：不给输入框，避免用户以为能改基址 */
+.ro-block {
+  width: 100%;
+  border: 1px solid #e4e9f2;
+  border-radius: 8px;
+  background: #fafbff;
+  padding: 8px 12px;
+}
+.ro-line {
+  display: flex;
+  gap: 10px;
+  line-height: 1.7;
+  font-size: 13px;
+}
+.ro-label {
+  flex-shrink: 0;
+  width: 68px;
+  color: var(--color-text-secondary);
+}
+.ro-value {
+  color: var(--color-text);
+  font-weight: 500;
+  word-break: break-all;
 }
 .with-unit {
   display: flex;

@@ -101,11 +101,12 @@ const passthroughOptions = [
 const enabledProtocols = computed(() => baseProtocols.filter((p) => protocols[p].enabled))
 
 // ===== 协议模型清单 =====
-// 每行一个内部模型：可绑定对外模型、配置成本定价、收窄可达协议子集、覆盖 BaseURL。
+// 每行一个内部模型：绑定对外模型（种子）、成本定价（种子）、收窄可达协议子集（种子）、跨协议转换（运行时真源）。
+// ⚠ 模型级 baseUrl 已废弃（契约 0019 字段 #4/裁定①）：后端无读取点，这里不再提供编辑入口。
+// 按协议区分基址请用「基础协议」页的 protocols[p].baseUrl。
 type ModelRow = {
   id: string
   protocols: string[]
-  baseUrl: string
   externalModelID: string | null
   pricing: Record<string, any>
   // 跨协议转换：undefined = 继承；true = 开启；false = 关闭
@@ -394,7 +395,6 @@ async function load() {
     modelRows.value = Object.entries(v.Models || {}).map(([mid, ov]) => ({
       id: mid,
       protocols: Object.keys(ov?.protocols || {}),
-      baseUrl: ov?.baseUrl || '',
       externalModelID: ov?.externalModelID ?? null,
       convertEnabled: ov?.convertEnabled,
       convertTargets: [...(ov?.convertTargets || [])],
@@ -448,14 +448,12 @@ const editingIndex = ref<number | null>(null) // null = 新增；否则为编辑
 const editingForm = ref<{
   id: string
   protocols: string[]
-  baseUrl: string
   externalModelID: string | null
   convertEnabled: string // inherit | true | false
   convertTargets: string[]
 }>({
   id: '',
   protocols: [],
-  baseUrl: '',
   externalModelID: null,
   convertEnabled: 'inherit',
   convertTargets: [],
@@ -466,7 +464,7 @@ const editingExternalPrev = ref<string | null>(null)
 function openCreateModel() {
   editingIndex.value = null
   editingExternalPrev.value = null
-  editingForm.value = { id: '', protocols: [], baseUrl: '', externalModelID: null, convertEnabled: 'inherit', convertTargets: [] }
+  editingForm.value = { id: '', protocols: [], externalModelID: null, convertEnabled: 'inherit', convertTargets: [] }
   editingPricing.value = emptyPricing()
   modelDrawerOpen.value = true
 }
@@ -476,7 +474,6 @@ function openEditModel(row: ModelRow, index: number) {
   editingForm.value = {
     id: row.id,
     protocols: [...row.protocols],
-    baseUrl: row.baseUrl,
     externalModelID: row.externalModelID,
     convertEnabled: row.convertEnabled == null ? 'inherit' : row.convertEnabled ? 'true' : 'false',
     convertTargets: [...row.convertTargets],
@@ -496,7 +493,6 @@ function saveModel() {
   const row: ModelRow = {
     id: mid,
     protocols: [...editingForm.value.protocols],
-    baseUrl: editingForm.value.baseUrl.trim(),
     externalModelID: editingForm.value.externalModelID,
     convertEnabled:
       editingForm.value.convertEnabled === 'inherit' ? undefined : editingForm.value.convertEnabled === 'true',
@@ -604,7 +600,7 @@ function onAddPulled() {
   let added = 0
   for (const p of pullChecked.value) {
     if (isAdded(p.ID)) continue
-    modelRows.value.push({ id: p.ID, protocols: [], baseUrl: '', externalModelID: null, convertTargets: [], pricing: emptyPricing() })
+    modelRows.value.push({ id: p.ID, protocols: [], externalModelID: null, convertTargets: [], pricing: emptyPricing() })
     added++
   }
   ElMessage.success(`已加入 ${added} 个模型（请在清单中绑定对外模型并配置成本）`)
@@ -659,15 +655,22 @@ function costDetail(row: ModelRow): string {
 function protocolNames(row: ModelRow): string {
   return row.protocols.map((p) => protocolLabels[p] || p).join('、')
 }
+// 跨协议转换的列表摘要（协议独占的运行时真源，渠道侧只读）
+function convertSummary(row: ModelRow): string {
+  if (row.convertEnabled === false) return '关闭'
+  const targets = (row.convertTargets || []).map((t) => protocolLabels[t] || t)
+  if (row.convertEnabled === true) return targets.length ? `开启（优先 ${targets.join(' → ')}）` : '开启'
+  return targets.length ? `继承（优先 ${targets.join(' → ')}）` : '继承默认'
+}
 
-// 由行数据组装后端 Models（{ [内部模型 ID]: { baseUrl?, protocols?, externalModelID?, costRates?, timeConfig?, contextTiers? } }）
+// 由行数据组装后端 Models（{ [内部模型 ID]: { protocols?, externalModelID?, costRates?, timeConfig?, contextTiers?, convertEnabled?, convertTargets? } }）
+// 不再产出模型级 baseUrl（契约 0019 已废弃该字段，后端导入/保存时会丢弃）。
 function buildModels(): Record<string, ChannelProtocolModelOverride> {
   const out: Record<string, ChannelProtocolModelOverride> = {}
   for (const r of modelRows.value) {
     const mid = r.id.trim()
     if (!mid) continue
     const ov: ChannelProtocolModelOverride = {}
-    if (r.baseUrl.trim()) ov.baseUrl = r.baseUrl.trim()
     if (r.protocols.length) {
       const p: Record<string, ProtocolOption> = {}
       for (const name of r.protocols) p[name] = {}
@@ -758,7 +761,7 @@ async function onSubmit() {
             </el-form-item>
             <el-form-item class="span-2" label="Base URL">
               <el-input v-model="form.base_url" placeholder="https://api.example.com/v1" />
-              <div class="hint">渠道协议级默认上游地址；各协议可单独覆盖</div>
+              <div class="hint">渠道协议级默认上游地址；各协议可单独覆盖。引用本协议的渠道基址完全跟随这里（渠道侧不可覆盖），要按协议区分地址请用下方「协议专属 BaseURL」</div>
             </el-form-item>
           </el-form>
 
@@ -812,7 +815,11 @@ async function onSubmit() {
       <el-tab-pane label="模型清单" name="models">
         <div class="card">
           <div class="model-head">
-            <div class="block-desc">列出该协议模板下的内部模型；可为每个模型绑定对外模型、配置成本定价、收窄可达协议子集并覆盖 BaseURL（留空 = 继承渠道协议级配置）。</div>
+            <div class="block-desc">
+              列出该协议模板下的内部模型。绑定对外模型 / 成本 / 时段 / 分档 / 可达协议子集是<strong>模板默认值</strong>：
+              只对「未改动过」的渠道模型生效（渠道模型被本地编辑后即冻结，不再随本模板同步，可在渠道页「重置为协议值」恢复）；
+              跨协议转换则不同——它是<strong>运行时真源</strong>，由协议定义、所有引用该协议的渠道共享，渠道不可差异化。
+            </div>
             <div class="model-toolbar">
               <el-tooltip v-if="!isEdit" content="保存协议后可用临时 ApiKey 从 models 端点拉取" placement="top">
                 <span><el-button :icon="RefreshRight" disabled>从 models 端点拉取</el-button></span>
@@ -848,8 +855,13 @@ async function onSubmit() {
             <el-table-column label="可达协议" min-width="180">
               <template #default="{ row }">{{ protocolNames(row) || '继承协议级' }}</template>
             </el-table-column>
-            <el-table-column label="BaseURL 覆盖" min-width="180" show-overflow-tooltip>
-              <template #default="{ row }">{{ row.baseUrl || '—' }}</template>
+            <el-table-column label="跨协议转换" min-width="170" show-overflow-tooltip>
+              <template #header>
+                <el-tooltip :content="'协议级运行时真源：所有引用本协议的渠道共享，渠道侧只读'" placement="top">
+                  <span>跨协议转换</span>
+                </el-tooltip>
+              </template>
+              <template #default="{ row }">{{ convertSummary(row) }}</template>
             </el-table-column>
             <el-table-column label="操作" width="110" align="right">
               <template #default="{ row, $index }">
@@ -1037,16 +1049,13 @@ async function onSubmit() {
             <el-option v-for="p in baseProtocols" :key="p" :label="protocolLabels[p]" :value="p" />
           </el-select>
         </el-form-item>
-        <el-form-item label="BaseURL 覆盖">
-          <el-input v-model="editingForm.baseUrl" placeholder="留空 = 继承协议级" />
-        </el-form-item>
         <el-form-item label="允许转换">
           <el-select v-model="editingForm.convertEnabled" style="width: 240px">
             <el-option label="继承（不写字段）" value="inherit" />
             <el-option label="开启" value="true" />
             <el-option label="关闭" value="false" />
           </el-select>
-          <div class="hint">跨协议转换开关；继承 = 沿用全局默认。</div>
+          <div class="hint">跨协议转换开关（协议级，所有引用本协议的渠道共享）；继承 = 沿用全局默认。</div>
         </el-form-item>
         <el-form-item label="目标协议优先序">
           <StringListEditor
@@ -1054,7 +1063,7 @@ async function onSubmit() {
             :suggestions="[...baseProtocols]"
             placeholder="目标协议（留空 = 继承全局默认顺序）"
           />
-          <div class="hint">按顺序尝试转换的目标协议；可选：openai-chat / anthropic-messages / openai-responses。留空 = 继承全局默认顺序。</div>
+          <div class="hint">按顺序尝试转换的目标协议（协议级共享）；可选：openai-chat / anthropic-messages / openai-responses。留空 = 继承全局默认顺序。</div>
         </el-form-item>
         <div class="span-2">
           <ModelPricing v-model="editingPricing" show-rates-key="CostRates" title="成本">
