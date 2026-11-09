@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io/fs"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -71,7 +72,7 @@ CREATE TABLE IF NOT EXISTS applied_migrations (
 		if err != nil {
 			return appliedCount, fmt.Errorf("begin tx for %s: %w", name, err)
 		}
-		if _, err := tx.ExecContext(ctx, string(body)); err != nil {
+		if _, err := tx.ExecContext(ctx, renderMigration(string(body))); err != nil {
 			_ = tx.Rollback()
 			return appliedCount, fmt.Errorf("exec migration %s: %w", name, err)
 		}
@@ -85,4 +86,16 @@ CREATE TABLE IF NOT EXISTS applied_migrations (
 		appliedCount++
 	}
 	return appliedCount, nil
+}
+
+// renderMigration 渲染迁移 SQL 里的占位符。
+//
+// 目前只有一个：{{backfill_threshold}} → Backfill0019InlineThreshold。
+// 目的是让「迁移内联回填的行数阈值」只有**一个开关**（Go 常量），
+// 避免同一数字同时写在 .sql 与 Go 两处、改一处漏一处。
+func renderMigration(body string) string {
+	if !strings.Contains(body, backfillThresholdToken) {
+		return body
+	}
+	return strings.ReplaceAll(body, backfillThresholdToken, strconv.FormatInt(Backfill0019InlineThreshold, 10))
 }

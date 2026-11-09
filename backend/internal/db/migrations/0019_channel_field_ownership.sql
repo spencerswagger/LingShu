@@ -41,106 +41,125 @@ CREATE TABLE IF NOT EXISTS channel_base_url_archive (
 COMMENT ON TABLE channel_base_url_archive IS
     '0019 留档：引用协议的渠道在「基址随协议」改造中被清空的内联 base_url / protocol（仅供回滚还原，无业务读取）';
 
--- ---------- (b) 归档并清空「引用协议」渠道的内联基址与协议类型 ----------
+-- ---------- (b)(c)(d) 数据段：受行数阈值守卫（方案 A）----------
+-- channel_models 未删除行数 > 阈值时：**只做 DDL，跳过数据段**，并显式告警；
+-- 数据段交给 scripts/backfill-0019（分批 5000 + backfill_checkpoints 断点续跑 + 幂等）执行。
+-- 原因：迁移框架每个 .sql 只包一个事务，>5 万行时无法分批/断点（契约 §10.2）。
+-- 阈值是**单一开关**：Go 侧常量 Backfill0019InlineThreshold，经 renderMigration() 替换占位符。
+-- 顺序不可调换：(b) 归档清空 → (c) 协议子集下移 → (d) 漂移标记。
+-- (c) 必须先于 (d)：否则「实例 protocols 为空」的行会先被判成漂移标 edited，下移被跳过，
+-- 模型级协议子集永久丢失且该行被冻结（契约 §6.1 顺序条款）。
+DO $$
+DECLARE
+    n         bigint;
+    threshold bigint := {{backfill_threshold}};
+BEGIN
+    SELECT count(*) INTO n FROM channel_models WHERE deleted_at IS NULL;
+    IF n > threshold THEN
+        RAISE WARNING '0019: channel_models 现有 % 行（内联回填阈值 %），迁移只做了 DDL，数据回填已跳过；请执行 cd backend && go run ./scripts/backfill-0019 -dsn "$DSN"（可中断重跑、幂等），完成前实例行缺少模型级协议子集。', n, threshold;
+    ELSE
+    -- ---------- (b) 归档并清空「引用协议」渠道的内联基址与协议类型 ----------
 
-INSERT INTO channel_base_url_archive(channel_id, base_url, protocol)
-SELECT id, btrim(base_url), btrim(protocol)
-FROM channels
-WHERE deleted_at IS NULL
-  AND channel_protocol_id IS NOT NULL
-  AND (btrim(base_url) <> '' OR btrim(protocol) <> '')
-ON CONFLICT (channel_id) DO NOTHING;
+    INSERT INTO channel_base_url_archive(channel_id, base_url, protocol)
+    SELECT id, btrim(base_url), btrim(protocol)
+    FROM channels
+    WHERE deleted_at IS NULL
+      AND channel_protocol_id IS NOT NULL
+      AND (btrim(base_url) <> '' OR btrim(protocol) <> '')
+    ON CONFLICT (channel_id) DO NOTHING;
 
-UPDATE channels
-SET base_url = '',
-    protocol = '',
-    updated_at = now()
-WHERE deleted_at IS NULL
-  AND channel_protocol_id IS NOT NULL
-  AND (btrim(base_url) <> '' OR btrim(protocol) <> '');
+    UPDATE channels
+    SET base_url = '',
+        protocol = '',
+        updated_at = now()
+    WHERE deleted_at IS NULL
+      AND channel_protocol_id IS NOT NULL
+      AND (btrim(base_url) <> '' OR btrim(protocol) <> '');
 
--- ---------- (c) 模型级协议子集下沉 ----------
--- 语义等价：旧运行时是「实例 protocols 为空 → 回落种子 models[m].protocols → 回落协议 protocols」，
--- 新运行时不读种子，因此这里把种子里有、实例里空的那一档复制过来。
--- 只写「实例为空」的行：实例已有的值就是本地显式配置，绝不覆盖。
-UPDATE channel_models cm
-SET protocols = cp.models -> cm.internal_model_id -> 'protocols',
-    updated_at = now()
-FROM channels c
-JOIN channel_protocols cp ON cp.id = c.channel_protocol_id AND cp.deleted_at IS NULL
-WHERE cm.channel_id = c.id
-  AND cm.deleted_at IS NULL
-  AND cp.models ? cm.internal_model_id
-  AND cp.models -> cm.internal_model_id ? 'protocols'
-  AND jsonb_typeof(cp.models -> cm.internal_model_id -> 'protocols') = 'object'
-  AND (cp.models -> cm.internal_model_id -> 'protocols') <> '{}'::jsonb
-  AND (cm.protocols IS NULL OR cm.protocols = '{}'::jsonb OR jsonb_typeof(cm.protocols) <> 'object');
+    -- ---------- (c) 模型级协议子集下沉 ----------
+    -- 语义等价：旧运行时是「实例 protocols 为空 → 回落种子 models[m].protocols → 回落协议 protocols」，
+    -- 新运行时不读种子，因此这里把种子里有、实例里空的那一档复制过来。
+    -- 只写「实例为空」的行：实例已有的值就是本地显式配置，绝不覆盖。
+    UPDATE channel_models cm
+    SET protocols = cp.models -> cm.internal_model_id -> 'protocols',
+        updated_at = now()
+    FROM channels c
+    JOIN channel_protocols cp ON cp.id = c.channel_protocol_id AND cp.deleted_at IS NULL
+    WHERE cm.channel_id = c.id
+      AND cm.deleted_at IS NULL
+      AND cp.models ? cm.internal_model_id
+      AND cp.models -> cm.internal_model_id ? 'protocols'
+      AND jsonb_typeof(cp.models -> cm.internal_model_id -> 'protocols') = 'object'
+      AND (cp.models -> cm.internal_model_id -> 'protocols') <> '{}'::jsonb
+      AND (cm.protocols IS NULL OR cm.protocols = '{}'::jsonb OR jsonb_typeof(cm.protocols) <> 'object');
 
--- ---------- (d) 漂移标记 edited ----------
--- 判定口径（裁定④「字段级置位」在 SQL 侧的对齐）：
---   * 只看种子里确实定义了的键（种子没定义的键与该行配置无关，不参与判定，否则会永久冻结同步）；
---   * 只看「双方都有值且不等」——实例侧为空说明还没被配置过，不算本地编辑（否则 B1 留下的
---     空成本行会被永久冻结，永远拿不到协议调价）；
---   * 成本比较必须做键名映射：种子 costRates 是 PascalCase（billing.WireRates），
---     实例 cost_rates 是 snake（billing.Rates），直接整体 IS DISTINCT FROM 恒为真会误标全表；
---   * 数值按 numeric 比较（1 与 1.0 不算差异），非数字脏值按「不参与比较」跳过，绝不让迁移中断。
-UPDATE channel_models cm
-SET edited = true
-FROM channels c
-JOIN channel_protocols cp ON cp.id = c.channel_protocol_id AND cp.deleted_at IS NULL
-WHERE cm.channel_id = c.id
-  AND cm.deleted_at IS NULL
-  AND cp.models ? cm.internal_model_id
-  AND cp.models -> cm.internal_model_id ?| ARRAY[
-        'externalModelID','protocols','costRates','timeConfig','contextTiers']
-  AND (
-    -- 对外模型绑定：种子有值、实例有值且不同。
-    (cp.models -> cm.internal_model_id ? 'externalModelID'
-     AND NULLIF(btrim(cp.models -> cm.internal_model_id ->> 'externalModelID'), '') IS NOT NULL
-     AND cm.external_model_id IS DISTINCT FROM
-         NULLIF(btrim(cp.models -> cm.internal_model_id ->> 'externalModelID'), '')::bigint)
-    -- 模型级协议子集：双方都有内容且不同（键序无关，jsonb 已归一）。
-    OR (cp.models -> cm.internal_model_id ? 'protocols'
-        AND jsonb_typeof(cp.models -> cm.internal_model_id -> 'protocols') = 'object'
-        AND (cp.models -> cm.internal_model_id -> 'protocols') <> '{}'::jsonb
-        AND cm.protocols IS NOT NULL
-        AND jsonb_typeof(cm.protocols) = 'object'
-        AND cm.protocols <> '{}'::jsonb
-        AND cm.protocols IS DISTINCT FROM (cp.models -> cm.internal_model_id -> 'protocols'))
-    -- 成本三段：逐键按 numeric 比较（仅比较种子定义了的键）。
-    OR (cp.models -> cm.internal_model_id ? 'costRates'
-        AND jsonb_typeof(cp.models -> cm.internal_model_id -> 'costRates') = 'object'
-        AND cm.cost_rates IS NOT NULL
-        AND jsonb_typeof(cm.cost_rates) = 'object'
-        AND cm.cost_rates <> '{}'::jsonb
-        AND (
-             (cp.models -> cm.internal_model_id -> 'costRates' ? 'Input'
-              AND (cp.models -> cm.internal_model_id -> 'costRates' ->> 'Input') ~ '^-?[0-9]+(\.[0-9]+)?$'
-              AND COALESCE((cm.cost_rates ->> 'input') ~ '^-?[0-9]+(\.[0-9]+)?$', false)
-              AND (cm.cost_rates ->> 'input')::numeric
-                  IS DISTINCT FROM (cp.models -> cm.internal_model_id -> 'costRates' ->> 'Input')::numeric)
-          OR (cp.models -> cm.internal_model_id -> 'costRates' ? 'Output'
-              AND (cp.models -> cm.internal_model_id -> 'costRates' ->> 'Output') ~ '^-?[0-9]+(\.[0-9]+)?$'
-              AND COALESCE((cm.cost_rates ->> 'output') ~ '^-?[0-9]+(\.[0-9]+)?$', false)
-              AND (cm.cost_rates ->> 'output')::numeric
-                  IS DISTINCT FROM (cp.models -> cm.internal_model_id -> 'costRates' ->> 'Output')::numeric)
-          OR (cp.models -> cm.internal_model_id -> 'costRates' ? 'CacheRead'
-              AND (cp.models -> cm.internal_model_id -> 'costRates' ->> 'CacheRead') ~ '^-?[0-9]+(\.[0-9]+)?$'
-              AND COALESCE((cm.cost_rates ->> 'cache_read') ~ '^-?[0-9]+(\.[0-9]+)?$', false)
-              AND (cm.cost_rates ->> 'cache_read')::numeric
-                  IS DISTINCT FROM (cp.models -> cm.internal_model_id -> 'costRates' ->> 'CacheRead')::numeric)
-        ))
-    -- 时段系数 / 上下文分档：双方都有内容且不同。
-    OR (cp.models -> cm.internal_model_id ? 'timeConfig'
-        AND jsonb_typeof(cp.models -> cm.internal_model_id -> 'timeConfig') = 'object'
-        AND cm.time_config IS NOT NULL
-        AND jsonb_typeof(cm.time_config) = 'object'
-        AND cm.time_config IS DISTINCT FROM (cp.models -> cm.internal_model_id -> 'timeConfig'))
-    OR (cp.models -> cm.internal_model_id ? 'contextTiers'
-        AND jsonb_typeof(cp.models -> cm.internal_model_id -> 'contextTiers') = 'array'
-        AND jsonb_array_length(cp.models -> cm.internal_model_id -> 'contextTiers') > 0
-        AND cm.context_tiers IS NOT NULL
-        AND jsonb_typeof(cm.context_tiers) = 'array'
-        AND jsonb_array_length(cm.context_tiers) > 0
-        AND cm.context_tiers IS DISTINCT FROM (cp.models -> cm.internal_model_id -> 'contextTiers'))
-  );
+    -- ---------- (d) 漂移标记 edited ----------
+    -- 判定口径（裁定④「字段级置位」在 SQL 侧的对齐）：
+    --   * 只看种子里确实定义了的键（种子没定义的键与该行配置无关，不参与判定，否则会永久冻结同步）；
+    --   * 只看「双方都有值且不等」——实例侧为空说明还没被配置过，不算本地编辑（否则 B1 留下的
+    --     空成本行会被永久冻结，永远拿不到协议调价）；
+    --   * 成本比较必须做键名映射：种子 costRates 是 PascalCase（billing.WireRates），
+    --     实例 cost_rates 是 snake（billing.Rates），直接整体 IS DISTINCT FROM 恒为真会误标全表；
+    --   * 数值按 numeric 比较（1 与 1.0 不算差异），非数字脏值按「不参与比较」跳过，绝不让迁移中断。
+    UPDATE channel_models cm
+    SET edited = true
+    FROM channels c
+    JOIN channel_protocols cp ON cp.id = c.channel_protocol_id AND cp.deleted_at IS NULL
+    WHERE cm.channel_id = c.id
+      AND cm.deleted_at IS NULL
+      AND cp.models ? cm.internal_model_id
+      AND cp.models -> cm.internal_model_id ?| ARRAY[
+            'externalModelID','protocols','costRates','timeConfig','contextTiers']
+      AND (
+        -- 对外模型绑定：种子有值、实例有值且不同。
+        (cp.models -> cm.internal_model_id ? 'externalModelID'
+         AND NULLIF(btrim(cp.models -> cm.internal_model_id ->> 'externalModelID'), '') IS NOT NULL
+         AND cm.external_model_id IS DISTINCT FROM
+             NULLIF(btrim(cp.models -> cm.internal_model_id ->> 'externalModelID'), '')::bigint)
+        -- 模型级协议子集：双方都有内容且不同（键序无关，jsonb 已归一）。
+        OR (cp.models -> cm.internal_model_id ? 'protocols'
+            AND jsonb_typeof(cp.models -> cm.internal_model_id -> 'protocols') = 'object'
+            AND (cp.models -> cm.internal_model_id -> 'protocols') <> '{}'::jsonb
+            AND cm.protocols IS NOT NULL
+            AND jsonb_typeof(cm.protocols) = 'object'
+            AND cm.protocols <> '{}'::jsonb
+            AND cm.protocols IS DISTINCT FROM (cp.models -> cm.internal_model_id -> 'protocols'))
+        -- 成本三段：逐键按 numeric 比较（仅比较种子定义了的键）。
+        OR (cp.models -> cm.internal_model_id ? 'costRates'
+            AND jsonb_typeof(cp.models -> cm.internal_model_id -> 'costRates') = 'object'
+            AND cm.cost_rates IS NOT NULL
+            AND jsonb_typeof(cm.cost_rates) = 'object'
+            AND cm.cost_rates <> '{}'::jsonb
+            AND (
+                 (cp.models -> cm.internal_model_id -> 'costRates' ? 'Input'
+                  AND (cp.models -> cm.internal_model_id -> 'costRates' ->> 'Input') ~ '^-?[0-9]+(\.[0-9]+)?$'
+                  AND COALESCE((cm.cost_rates ->> 'input') ~ '^-?[0-9]+(\.[0-9]+)?$', false)
+                  AND (cm.cost_rates ->> 'input')::numeric
+                      IS DISTINCT FROM (cp.models -> cm.internal_model_id -> 'costRates' ->> 'Input')::numeric)
+              OR (cp.models -> cm.internal_model_id -> 'costRates' ? 'Output'
+                  AND (cp.models -> cm.internal_model_id -> 'costRates' ->> 'Output') ~ '^-?[0-9]+(\.[0-9]+)?$'
+                  AND COALESCE((cm.cost_rates ->> 'output') ~ '^-?[0-9]+(\.[0-9]+)?$', false)
+                  AND (cm.cost_rates ->> 'output')::numeric
+                      IS DISTINCT FROM (cp.models -> cm.internal_model_id -> 'costRates' ->> 'Output')::numeric)
+              OR (cp.models -> cm.internal_model_id -> 'costRates' ? 'CacheRead'
+                  AND (cp.models -> cm.internal_model_id -> 'costRates' ->> 'CacheRead') ~ '^-?[0-9]+(\.[0-9]+)?$'
+                  AND COALESCE((cm.cost_rates ->> 'cache_read') ~ '^-?[0-9]+(\.[0-9]+)?$', false)
+                  AND (cm.cost_rates ->> 'cache_read')::numeric
+                      IS DISTINCT FROM (cp.models -> cm.internal_model_id -> 'costRates' ->> 'CacheRead')::numeric)
+            ))
+        -- 时段系数 / 上下文分档：双方都有内容且不同。
+        OR (cp.models -> cm.internal_model_id ? 'timeConfig'
+            AND jsonb_typeof(cp.models -> cm.internal_model_id -> 'timeConfig') = 'object'
+            AND cm.time_config IS NOT NULL
+            AND jsonb_typeof(cm.time_config) = 'object'
+            AND cm.time_config IS DISTINCT FROM (cp.models -> cm.internal_model_id -> 'timeConfig'))
+        OR (cp.models -> cm.internal_model_id ? 'contextTiers'
+            AND jsonb_typeof(cp.models -> cm.internal_model_id -> 'contextTiers') = 'array'
+            AND jsonb_array_length(cp.models -> cm.internal_model_id -> 'contextTiers') > 0
+            AND cm.context_tiers IS NOT NULL
+            AND jsonb_typeof(cm.context_tiers) = 'array'
+            AND jsonb_array_length(cm.context_tiers) > 0
+            AND cm.context_tiers IS DISTINCT FROM (cp.models -> cm.internal_model_id -> 'contextTiers'))
+      );
+    END IF;
+END $$;

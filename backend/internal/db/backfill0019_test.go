@@ -175,11 +175,11 @@ func TestBackfill0019_ResumeFromCheckpoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("第一轮（限批）失败: %v", err)
 	}
-	if part.Batches != 2 {
-		t.Fatalf("限批 1 时每阶段 1 批，两阶段共 2 批，got %d", part.Batches)
+	if part.Batches != 3 {
+		t.Fatalf("限批 1 时每阶段 1 批，三阶段（归档清空 / 下移 / 漂移）共 3 批，got %d", part.Batches)
 	}
 	// 断点已前进：不能还是 0（否则等于没做）。
-	for _, phase := range []string{Backfill0019PhaseChannels, Backfill0019PhaseModels} {
+	for _, phase := range []string{Backfill0019PhaseChannels, Backfill0019PhaseDownshift, Backfill0019PhaseModels} {
 		last, err := BackfillCheckpoint(ctx, partDB, phase)
 		if err != nil {
 			t.Fatalf("读取断点 %s 失败: %v", phase, err)

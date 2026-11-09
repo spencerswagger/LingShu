@@ -61,8 +61,11 @@
 |---|---|---|
 | (a) | 加 `edited` 列；建 `channel_base_url_archive` | 是（`IF NOT EXISTS`） |
 | (b) | 引用协议渠道：`base_url`/`protocol` 归档后清空 | 是（`ON CONFLICT DO NOTHING` + 仅命中非空） |
-| (c) | 种子的模型级 `protocols` 下沉到实例（仅实例为空时） | 是 |
+| (c) | 种子的模型级 `protocols` 下移到实例（仅实例为空时；下移必须在 (d) 之前） | 是 |
 | (d) | 漂移标记 `edited=true`（种子定义了 + 双方都有值 + 值不等；成本按 `Input/Output/CacheRead` → snake 逐键 numeric 比较） | 是 |
+
+(b)(c)(d) 三段整体包在 `DO $$ … END $$` 阈值守卫里（方案 A，见 §4）：若 `channel_models` 未删除行数超过
+`db.Backfill0019InlineThreshold`（默认 5 万），只执行 (a) 并 `RAISE WARNING`，数据段留给独立脚本。
 
 回滚：`backend/scripts/rollback-0019.sql`（纯 SQL）。
 从留档表还原 `base_url`/`protocol` → 删 `edited` 列 → 删留档表 → 清理 `applied_migrations` 记录 → 自检。
@@ -72,25 +75,44 @@
 
 ---
 
-## 4. 回填：两条路径
+## 4. 回填：两条路径 + 阈值守卫（方案 A，已落地）
 
 | 生产 `channel_models` 行数 | 路径 | 特点 |
 |---|---|---|
-| ≤ 5 万 | 迁移 0019 内单语句 | 单事务，JSONB 逐行比较通常 < 2s |
+| ≤ 5 万 | 迁移 0019 内联（单事务） | 单语句幂等，JSONB 逐行比较通常 < 2s |
 | > 5 万 | `go run ./scripts/backfill-0019 -dsn "$DSN"`（或 `db.Backfill0019`） | 主键游标、**单批 5000 行**、每批独立事务、进度写 `backfill_checkpoints(name,last_id)` |
+
+阈值守卫（**方案 A**）的落点：
+
+- **单一开关**：`db.Backfill0019InlineThreshold`（Go 常量）。迁移 SQL 里写的是占位符
+  `{{backfill_threshold}}`，由 `db.renderMigration()` 在执行前替换——同一个数字不会同时硬编码在
+  `.sql` 与 Go 两处。要退到方案 B（承认单事务全量回填），把这个常量调到极大（如 `math.MaxInt64`）
+  或删掉迁移里的 `DO $$ … END $$` 守卫即可，脚本仍保留为补救/演练工具。
+- **超阈值行为**：迁移只做 DDL（`edited` 列 + 留档表），数据段（b)(c)(d) 整段跳过并 `RAISE WARNING`；
+  `channel_models` 的 `edited` 列此时已存在，所以独立脚本才有执行窗口（这是原先的死角）。
+- **启动告警**：`main.go` 迁移后调 `db.PendingLargeBackfills`，未完成时打 **ERROR** 级日志，
+  文案包含「还差哪个阶段 + 具体命令」；**不阻止启动**（回填前网关仍可服务，实例行缺协议子集会
+  退化成协议级全集，属行为放大、不是崩溃）。
+- **三个阶段**（顺序即契约 §6.1 顺序，脚本与迁移同一套 SQL 常量）：
+  `0019_channels`（归档清空）→ `0019_protocols_downshift`（协议子集下移）→ `0019_channel_models`（漂移标记）。
+  下移必须在漂移之前，否则「实例 protocols 为空」的行会先被标 `edited`、下移再跳过，子集永久丢失。
 
 为什么分两条：`internal/db/migrate.go` 把**每个迁移文件包在一个事务里**，分批与断点在单事务内无法成立。
 
 幂等与续跑的实现口径：
 - 归档 `ON CONFLICT (channel_id) DO NOTHING`（同一渠道不会写第二份留档）；
 - 清空语句带非空条件（已清空的行不再命中）；
+- 下移只在「实例为空」时写（已下移的行不再命中）；
 - 漂移标记只把 `edited` 写成 true；
 - 游标只前进；崩在事务中则整批回滚，重启从 `last_id` 之后重做。
 - 想要从头重跑（演练）：`-reset`。
 
-已验证：`TestBackfill0019_Idempotent`（跑两遍状态完全一致、第二遍零写入）、
+已验证（PG17 真跑）：
+`TestBackfill0019_Idempotent`（跑两遍状态逐行一致、第二遍零写入）、
 `TestBackfill0019_ResumeFromCheckpoint`（限批模拟中断 → 断点前进 → 续跑后与一次跑完逐行一致）、
-`TestBackfill0019_AfterMigrationIsNoop`（迁移已跑过的库上安全空跑）。
+`TestBackfill0019_AfterMigrationIsNoop`、`TestBackfill0019_MatchesMigrationResult`（脚本三段结果与迁移逐行一致）、
+`TestMigrate_0019_ThresholdGuard`（超阈值只做 DDL + 告警 + 跑完脚本后告警消失）、
+`TestMigrate_0019_DriftBoundaries`（契约 §6.1(c)(d) 五条边界逐条断言）。
 
 ---
 

@@ -23,12 +23,28 @@ import (
 //   - 游标只前进不回退，checkpoint 里的 last_id 是「已提交的最大主键」。
 
 // 回填阶段名（写入 backfill_checkpoints.name；改名会让存量部署从头再跑一遍，别改）。
+//
+// 顺序即契约 §6.1 的顺序：先渠道基址归档清空 (b)，再模型级协议子集下移 (c)，最后漂移标记 (d)。
+// (c) 必须在 (d) 之前——否则「实例 protocols 为空」的行会先被判成漂移标 edited，
+// 下移再跳过，模型级协议子集永久丢失且该行被冻结。
 const (
-	Backfill0019PhaseChannels = "0019_channels"
-	Backfill0019PhaseModels   = "0019_channel_models"
+	Backfill0019PhaseChannels  = "0019_channels"
+	Backfill0019PhaseDownshift = "0019_protocols_downshift"
+	Backfill0019PhaseModels    = "0019_channel_models"
 )
 
-// defaultBackfillBatchSize 单批行数：单批 < 1s，10 万行时往返次数可控（契约 §10 的取舍）。
+// Backfill0019InlineThreshold 0019 **迁移内联**回填的行数阈值：
+// channel_models 未删除行数 > 该值时，迁移只做 DDL（加列 + 建留档表）并显式告警，
+// 数据段（归档清空 / 下移 / 漂移标记）交给 scripts/backfill-0019 分批完成。
+//
+// 这是**唯一开关**：SQL 侧不写死数字，迁移文件里是占位符 {{backfill_threshold}}，
+// 由 renderMigration() 用本常量渲染（见 migrate.go）。改这里即可同时改两条路径。
+const Backfill0019InlineThreshold int64 = 50000
+
+// backfillThresholdToken 迁移 SQL 里的阈值占位符。
+const backfillThresholdToken = "{{backfill_threshold}}"
+
+// defaultBackfillBatchSize 单批行数：单批 < 1s，10 万行时往返次数可控（契约 §10.2 的取舍）。
 const defaultBackfillBatchSize = 5000
 
 // Backfill0019Options 回填参数。
@@ -43,14 +59,19 @@ type Backfill0019Options struct {
 
 // Backfill0019Result 回填结果（计数口径：本阶段实际处理的行数，含幂等空跑）。
 type Backfill0019Result struct {
-	ChannelsScanned  int64 // 扫过的渠道行数
-	ChannelsArchived int64 // 本次新写入留档的渠道数（ON CONFLICT 命中不计）
-	ModelsScanned    int64 // 扫过的模型行数
-	ModelsMarked     int64 // 本次被标 edited=true 的行数
-	Batches          int   // 总批次数
+	ChannelsScanned   int64 // 扫过的渠道行数
+	ChannelsArchived  int64 // 本次新写入留档的渠道数（ON CONFLICT 命中不计）
+	ModelsScanned     int64 // 扫过的模型行数（下移阶段 + 漂移阶段各自累加）
+	ModelsDownshifted int64 // 下移后仍有 protocols 的行数（下移生效面）
+	ModelsMarked      int64 // 本次被标 edited=true 的行数
+	Batches           int   // 总批次数
 }
 
-// Backfill0019 执行 0019 的两段回填（渠道基址归档+清空、模型行漂移标记），可重复执行。
+// Backfill0019 执行 0019 的三段数据回填，顺序与迁移 0019 严格一致、可重复执行：
+//
+//	(b) 渠道内联基址归档并清空 → (c) 模型级协议子集下移 → (d) 漂移标记 edited。
+//
+// 与迁移共用同一套 SQL 常量与幂等条件；迁移因超阈值跳过 DML 时，本函数就是唯一的数据段执行者。
 func Backfill0019(ctx context.Context, d *sql.DB, opts Backfill0019Options) (Backfill0019Result, error) {
 	batch := opts.BatchSize
 	if batch <= 0 {
@@ -72,7 +93,6 @@ func Backfill0019(ctx context.Context, d *sql.DB, opts Backfill0019Options) (Bac
 		pick: `SELECT id FROM channels
 		       WHERE id > $1 AND deleted_at IS NULL AND channel_protocol_id IS NOT NULL
 		       ORDER BY id ASC LIMIT $2`,
-		before:  append([]string{archiveChannelsSQL}, nil...),
 		apply:   []string{archiveChannelsSQL, clearChannelsSQL},
 		measure: `SELECT count(*) FROM channel_base_url_archive WHERE channel_id = ANY($1::bigint[])`,
 	}, batch, opts.MaxBatchesPerPhase, logf)
@@ -82,6 +102,23 @@ func Backfill0019(ctx context.Context, d *sql.DB, opts Backfill0019Options) (Bac
 	res.ChannelsScanned = chanRes.scanned
 	res.ChannelsArchived = chanRes.measured
 	res.Batches += chanRes.batches
+
+	// (c) 模型级协议子集下移：必须在漂移标记之前（契约 §6.1 顺序条款）。
+	downRes, err := runBackfillPhase(ctx, d, backfillPhase{
+		name:  Backfill0019PhaseDownshift,
+		label: "模型级协议子集下移（种子 → 实例）",
+		pick: `SELECT id FROM channel_models
+		       WHERE id > $1 AND deleted_at IS NULL
+		       ORDER BY id ASC LIMIT $2`,
+		apply:   []string{downshiftProtocolsSQL},
+		measure: `SELECT count(*) FROM channel_models WHERE id = ANY($1::bigint[]) AND protocols IS NOT NULL`,
+	}, batch, opts.MaxBatchesPerPhase, logf)
+	if err != nil {
+		return res, err
+	}
+	res.ModelsScanned += downRes.scanned
+	res.ModelsDownshifted = downRes.measured
+	res.Batches += downRes.batches
 
 	modelRes, err := runBackfillPhase(ctx, d, backfillPhase{
 		name:  Backfill0019PhaseModels,
@@ -95,10 +132,96 @@ func Backfill0019(ctx context.Context, d *sql.DB, opts Backfill0019Options) (Bac
 	if err != nil {
 		return res, err
 	}
-	res.ModelsScanned = modelRes.scanned
+	res.ModelsScanned += modelRes.scanned
 	res.ModelsMarked = modelRes.measured
 	res.Batches += modelRes.batches
 	return res, nil
+}
+
+// PendingLargeBackfills 返回「迁移因超阈值跳过了内联回填、但独立回填尚未跑完」的告警文案（无待办返回空）。
+//
+// 供应用启动时打 ERROR 级日志（契约 §10.2 方案 A 的配套要求）：说清「还差什么 + 跑什么命令」，
+// 不阻止启动——回填完成前网关仍可服务；实例行缺 protocols 会退化成协议级全集，属行为放大、不是崩溃。
+func PendingLargeBackfills(ctx context.Context, d *sql.DB) ([]string, error) {
+	var live int64
+	if err := d.QueryRowContext(ctx,
+		`SELECT count(*) FROM channel_models WHERE deleted_at IS NULL`).Scan(&live); err != nil {
+		return nil, fmt.Errorf("count channel_models: %w", err)
+	}
+	if live <= Backfill0019InlineThreshold {
+		return nil, nil
+	}
+
+	// 断点表不存在 = 独立回填从未跑过。
+	var reg sql.NullString
+	if err := d.QueryRowContext(ctx, `SELECT to_regclass('public.backfill_checkpoints')::text`).Scan(&reg); err != nil {
+		return nil, fmt.Errorf("check backfill_checkpoints: %w", err)
+	}
+	// 每个阶段的游标域不同：渠道阶段走 channels.id，模型阶段走 channel_models.id。
+	// 用错域会永远判「未完成」（渠道 id 远小于模型 id）。
+	var maxModelID, maxChannelID sql.NullInt64
+	if err := d.QueryRowContext(ctx,
+		`SELECT max(id) FROM channel_models WHERE deleted_at IS NULL`).Scan(&maxModelID); err != nil {
+		return nil, fmt.Errorf("max channel_models id: %w", err)
+	}
+	if err := d.QueryRowContext(ctx,
+		`SELECT max(id) FROM channels WHERE deleted_at IS NULL AND channel_protocol_id IS NOT NULL`).Scan(&maxChannelID); err != nil {
+		return nil, fmt.Errorf("max channels id: %w", err)
+	}
+	if !maxModelID.Valid && !maxChannelID.Valid {
+		return nil, nil
+	}
+
+	done := map[string]int64{}
+	if reg.Valid {
+		rows, err := d.QueryContext(ctx, `SELECT name, last_id FROM backfill_checkpoints`)
+		if err != nil {
+			return nil, fmt.Errorf("read backfill_checkpoints: %w", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var name string
+			var lastID int64
+			if err := rows.Scan(&name, &lastID); err != nil {
+				return nil, fmt.Errorf("scan backfill_checkpoints: %w", err)
+			}
+			// 只要有一处的 last_id 达到该阶段的游标上界即视为完成；两个域都记一遍更宽松，
+			// 这里按阶段映射到对应域判断（见下方 phases 表）。
+			done[name] = lastID
+		}
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+	}
+
+	phases := []struct {
+		name     string
+		label    string
+		cursorTo int64
+		hasData  bool
+	}{
+		{Backfill0019PhaseChannels, "渠道内联基址归档并清空", maxChannelID.Int64, maxChannelID.Valid},
+		{Backfill0019PhaseDownshift, "模型级协议子集下移", maxModelID.Int64, maxModelID.Valid},
+		{Backfill0019PhaseModels, "模型行漂移标记 edited", maxModelID.Int64, maxModelID.Valid},
+	}
+	var pending []string
+	for _, ph := range phases {
+		if !ph.hasData {
+			continue // 该阶段没有可处理的行
+		}
+		last, seen := done[ph.name]
+		if !seen || last < ph.cursorTo {
+			pending = append(pending, ph.label)
+		}
+	}
+	if len(pending) == 0 {
+		return nil, nil
+	}
+	return []string{fmt.Sprintf(
+		"channel_models 现有 %d 行（内联回填阈值 %d），迁移 0019 只做了 DDL，数据回填未完成：%s。"+
+			"请执行 `cd backend && go run ./scripts/backfill-0019 -dsn \"$DSN\"`（可中断重跑、幂等）；"+
+			"完成前实例行缺少模型级协议子集，可达协议会退化为协议级全集。",
+		live, Backfill0019InlineThreshold, strings.Join(pending, "、"))}, nil
 }
 
 // EnsureBackfillCheckpoints 建断点表（幂等）。表结构刻意最小：一行一个阶段的已提交最大主键。
@@ -141,7 +264,6 @@ type backfillPhase struct {
 	name    string
 	label   string
 	pick    string   // 取下一批主键（$1=lastID, $2=limit）
-	before  []string // 在 apply 之前、测量之后执行的语句（当前仅用于可读性，允许为空）
 	apply   []string // 批次内执行的语句（$1=ids 数组字面量）
 	measure string   // 批后测量（$1=ids 数组字面量），用于统计「实际生效」行数
 }
@@ -331,3 +453,20 @@ WHERE cm.id = ANY($1::bigint[])
         AND jsonb_array_length(cm.context_tiers) > 0
         AND cm.context_tiers IS DISTINCT FROM (cp.models -> cm.internal_model_id -> 'contextTiers'))
   )`
+
+// downshiftProtocolsSQL 与迁移 0019 (c) 段同口径：种子有非空 object 且实例为空时下移，冲突不覆盖。
+// 「实例为空」= NULL / {} / 非 object —— 这三类都视为未设置，不是「本地显式配成空」。
+const downshiftProtocolsSQL = `
+UPDATE channel_models cm
+SET protocols = cp.models -> cm.internal_model_id -> 'protocols',
+    updated_at = now()
+FROM channels c
+JOIN channel_protocols cp ON cp.id = c.channel_protocol_id AND cp.deleted_at IS NULL
+WHERE cm.id = ANY($1::bigint[])
+  AND cm.channel_id = c.id
+  AND cm.deleted_at IS NULL
+  AND cp.models ? cm.internal_model_id
+  AND cp.models -> cm.internal_model_id ? 'protocols'
+  AND jsonb_typeof(cp.models -> cm.internal_model_id -> 'protocols') = 'object'
+  AND (cp.models -> cm.internal_model_id -> 'protocols') <> '{}'::jsonb
+  AND (cm.protocols IS NULL OR cm.protocols = '{}'::jsonb OR jsonb_typeof(cm.protocols) <> 'object')`

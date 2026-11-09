@@ -125,6 +125,10 @@ psql "$DSN" -f backend/scripts/rollback-0019.sql
 （语句幂等 + 归档表 `ON CONFLICT DO NOTHING`）。脚本与回滚的详细口径见
 `docs/designs/2026-11-10-channel-field-ownership-implementation.md`。
 
+> 阈值守卫（方案 A）：`channel_models` 超过 5 万行时，迁移只建列/建表并 `RAISE WARNING`，数据回填交给
+> 上面的脚本；应用启动日志会以 ERROR 级别提示「还差哪个阶段 + 该跑什么命令」（不阻止启动）。
+> 阈值是单一开关 `db.Backfill0019InlineThreshold`，迁移 SQL 里是占位符，不要在两处分别写数字。
+
 ## 本地开发（裸机运行）
 
 1. **起数据库**：本机安装 PostgreSQL 后建库与用户，例如：
