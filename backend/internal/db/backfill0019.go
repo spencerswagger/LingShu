@@ -141,7 +141,14 @@ func Backfill0019(ctx context.Context, d *sql.DB, opts Backfill0019Options) (Bac
 	return res, nil
 }
 
-// PendingLargeBackfills 返回「迁移因超阈值跳过了内联回填、但独立回填尚未跑完」的告警文案（无待办返回空）。
+// PendingLargeBackfills 返回「迁移因超阈值跳过了内联回填、且**数据确实还没就绪**」的告警文案（无待办返回空）。
+//
+// 判定口径：先看行数是否超过内联阈值，再用与 worker **完全相同**的条件逐阶段 EXISTS 探测
+// 「还有没有待处理的行」。
+//
+// 为什么不能只看断点表：迁移内联跑完、之后行数才涨过阈值的库，断点表压根不存在（或停在旧主键），
+// 只看断点会永久误报「回填未完成」，而实际每次跑都是空跑。用 pending-work 探测可以识别
+// 「数据已就绪」状态，避免无谓告警。
 //
 // 供应用启动时打 ERROR 级日志（契约 §10.2 方案 A 的配套要求）：说清「还差什么 + 跑什么命令」，
 // 不阻止启动——回填完成前网关仍可服务；实例行缺 protocols 会退化成协议级全集，属行为放大、不是崩溃。
@@ -154,74 +161,30 @@ func PendingLargeBackfills(ctx context.Context, d *sql.DB) ([]string, error) {
 	if live <= Backfill0019InlineThreshold {
 		return nil, nil
 	}
-
-	// 断点表不存在 = 独立回填从未跑过。
-	var reg sql.NullString
-	if err := d.QueryRowContext(ctx, `SELECT to_regclass('public.backfill_checkpoints')::text`).Scan(&reg); err != nil {
-		return nil, fmt.Errorf("check backfill_checkpoints: %w", err)
-	}
-	// 每个阶段的游标域不同：渠道阶段走 channels.id，模型阶段走 channel_models.id。
-	// 用错域会永远判「未完成」（渠道 id 远小于模型 id）。
-	var maxModelID, maxChannelID sql.NullInt64
-	if err := d.QueryRowContext(ctx,
-		`SELECT max(id) FROM channel_models WHERE deleted_at IS NULL`).Scan(&maxModelID); err != nil {
-		return nil, fmt.Errorf("max channel_models id: %w", err)
-	}
-	if err := d.QueryRowContext(ctx,
-		`SELECT max(id) FROM channels WHERE deleted_at IS NULL AND channel_protocol_id IS NOT NULL`).Scan(&maxChannelID); err != nil {
-		return nil, fmt.Errorf("max channels id: %w", err)
-	}
-	if !maxModelID.Valid && !maxChannelID.Valid {
+	// 结构未就绪（迁移还没跑）时不在这里报——那是迁移自身的事，别混进回填告警。
+	if err := EnsureBackfill0019Schema(ctx, d); err != nil {
 		return nil, nil
 	}
 
-	done := map[string]int64{}
-	if reg.Valid {
-		rows, err := d.QueryContext(ctx, `SELECT name, last_id FROM backfill_checkpoints`)
-		if err != nil {
-			return nil, fmt.Errorf("read backfill_checkpoints: %w", err)
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var name string
-			var lastID int64
-			if err := rows.Scan(&name, &lastID); err != nil {
-				return nil, fmt.Errorf("scan backfill_checkpoints: %w", err)
-			}
-			// 只要有一处的 last_id 达到该阶段的游标上界即视为完成；两个域都记一遍更宽松，
-			// 这里按阶段映射到对应域判断（见下方 phases 表）。
-			done[name] = lastID
-		}
-		if err := rows.Err(); err != nil {
-			return nil, err
-		}
-	}
-
-	phases := []struct {
-		name     string
-		label    string
-		cursorTo int64
-		hasData  bool
-	}{
-		{Backfill0019PhaseChannels, "渠道内联基址归档并清空", maxChannelID.Int64, maxChannelID.Valid},
-		{Backfill0019PhaseDownshift, "模型级协议子集下移", maxModelID.Int64, maxModelID.Valid},
-		{Backfill0019PhaseModels, "模型行漂移标记 edited", maxModelID.Int64, maxModelID.Valid},
+	chanWork, downWork, driftWork, err := backfillPendingWork(ctx, d)
+	if err != nil {
+		return nil, err
 	}
 	var pending []string
-	for _, ph := range phases {
-		if !ph.hasData {
-			continue // 该阶段没有可处理的行
-		}
-		last, seen := done[ph.name]
-		if !seen || last < ph.cursorTo {
-			pending = append(pending, ph.label)
-		}
+	if chanWork {
+		pending = append(pending, "渠道内联基址归档并清空")
+	}
+	if downWork {
+		pending = append(pending, "模型级协议子集下移")
+	}
+	if driftWork {
+		pending = append(pending, "模型行漂移标记 edited")
 	}
 	if len(pending) == 0 {
 		return nil, nil
 	}
 	return []string{fmt.Sprintf(
-		"channel_models 现有 %d 行（内联回填阈值 %d），迁移 0019 只做了 DDL，数据回填未完成：%s。"+
+		"channel_models 现有 %d 行（内联回填阈值 %d），仍有未回填的数据：%s。"+
 			"请执行 `cd backend && go run ./scripts/backfill-0019 -dsn \"$DSN\"`（可中断重跑、幂等）；"+
 			"完成前实例行缺少模型级协议子集，可达协议会退化为协议级全集。",
 		live, Backfill0019InlineThreshold, strings.Join(pending, "、"))}, nil
@@ -243,8 +206,15 @@ func EnsureBackfill0019Schema(ctx context.Context, d *sql.DB) error {
 		return fmt.Errorf("check channel_base_url_archive: %w", err)
 	}
 	if !hasColumn || !hasArchive {
-		return fmt.Errorf("0019 结构未就绪（channel_models.edited=%v, channel_base_url_archive=%v）："+
-			"请先执行迁移 0019（启动后端或 make migrate），再跑本回填", hasColumn, hasArchive)
+		missing := make([]string, 0, 2)
+		if !hasColumn {
+			missing = append(missing, "channel_models.edited 列")
+		}
+		if !hasArchive {
+			missing = append(missing, "channel_base_url_archive 留档表")
+		}
+		return fmt.Errorf("0019 结构未就绪（缺少：%s）：请先执行迁移 0019（启动后端或 make migrate），再跑本回填",
+			strings.Join(missing, "、"))
 	}
 	return nil
 }
@@ -439,25 +409,44 @@ FROM channel_protocols cp
 WHERE ` + archivedChannelPredicate + `
   ` + archivedChannelBatchFilter
 
-// markDriftSQL 与迁移 (d) 段同口径：种子定义了的键 + 双方都有值 + 值不同 → edited=true。
-const markDriftSQL = `
-UPDATE channel_models cm
-SET edited = true
-FROM channels c
-JOIN channel_protocols cp ON cp.id = c.channel_protocol_id AND cp.deleted_at IS NULL
-WHERE cm.id = ANY($1::bigint[])
-  AND cm.channel_id = c.id
+// ---- 模型行两个阶段（下移 / 漂移）----
+//
+// worker 语句与「是否还有待处理数据」的判定共用同一份 join 与条件常量：
+// 这样「启动告警说还差什么」与「脚本实际做什么」永远同口径，不会出现「判定说没做完、跑了却无事可做」。
+
+// seedModelJoin 实例行 × 所属渠道 × 生效协议的公共连接（下移与漂移共用）。
+const seedModelJoin = `FROM channels c
+JOIN channel_protocols cp ON cp.id = c.channel_protocol_id AND cp.deleted_at IS NULL`
+
+// seedModelProbeFrom 同 seedModelJoin，但把 channel_models 也放进 FROM——
+// 用于「还有没有待处理行」的 SELECT 探测（UPDATE 语句里 cm 已是目标表，不能重复出现在 FROM）。
+const seedModelProbeFrom = `FROM channel_models cm CROSS JOIN channels c
+JOIN channel_protocols cp ON cp.id = c.channel_protocol_id AND cp.deleted_at IS NULL`
+
+// downshiftCondition 下移阶段的判定条件（不含批内主键过滤）：种子有非空 object 且实例为空。
+const downshiftCondition = `cm.channel_id = c.id
   AND cm.deleted_at IS NULL
-  -- 只处理尚未标记的行：既保证 RowsAffected = 本次新标记数，也让重复执行成为空跑。
+  AND cp.models ? cm.internal_model_id
+  AND cp.models -> cm.internal_model_id ? 'protocols'
+  AND jsonb_typeof(cp.models -> cm.internal_model_id -> 'protocols') = 'object'
+  AND (cp.models -> cm.internal_model_id -> 'protocols') <> '{}'::jsonb
+  AND (cm.protocols IS NULL OR cm.protocols = '{}'::jsonb OR jsonb_typeof(cm.protocols) <> 'object')`
+
+// driftCondition 漂移标记的判定条件（不含批内主键过滤）。
+// 口径：种子定义了的键 + 双方都有值且都非空 + 值不等（成本逐键 numeric 比较）。
+// `cm.edited = false` 让 RowsAffected = 本次新标记数，重复执行即空跑。
+const driftCondition = `cm.channel_id = c.id
+  AND cm.deleted_at IS NULL
   AND cm.edited = false
   AND cp.models ? cm.internal_model_id
-  AND cp.models -> cm.internal_model_id ?| ARRAY[
-        'externalModelID','protocols','costRates','timeConfig','contextTiers']
+  AND cp.models -> cm.internal_model_id ?| ARRAY['externalModelID','protocols','costRates','timeConfig','contextTiers']
   AND (
+    -- 对外模型绑定：种子有值、实例有值且不同。
     (cp.models -> cm.internal_model_id ? 'externalModelID'
      AND NULLIF(btrim(cp.models -> cm.internal_model_id ->> 'externalModelID'), '') IS NOT NULL
      AND cm.external_model_id IS DISTINCT FROM
          NULLIF(btrim(cp.models -> cm.internal_model_id ->> 'externalModelID'), '')::bigint)
+    -- 模型级协议子集：双方都有内容（空对象=未设置）且不同（键序无关）。
     OR (cp.models -> cm.internal_model_id ? 'protocols'
         AND jsonb_typeof(cp.models -> cm.internal_model_id -> 'protocols') = 'object'
         AND (cp.models -> cm.internal_model_id -> 'protocols') <> '{}'::jsonb
@@ -465,6 +454,7 @@ WHERE cm.id = ANY($1::bigint[])
         AND jsonb_typeof(cm.protocols) = 'object'
         AND cm.protocols <> '{}'::jsonb
         AND cm.protocols IS DISTINCT FROM (cp.models -> cm.internal_model_id -> 'protocols'))
+    -- 成本三段：逐键按 numeric 比较（仅比较种子定义了的键）。
     OR (cp.models -> cm.internal_model_id ? 'costRates'
         AND jsonb_typeof(cp.models -> cm.internal_model_id -> 'costRates') = 'object'
         AND cm.cost_rates IS NOT NULL
@@ -487,14 +477,15 @@ WHERE cm.id = ANY($1::bigint[])
               AND (cm.cost_rates ->> 'cache_read')::numeric
                   IS DISTINCT FROM (cp.models -> cm.internal_model_id -> 'costRates' ->> 'CacheRead')::numeric)
         ))
+    -- 时段系数：双方都有内容（空对象=未设置）且不同。
     OR (cp.models -> cm.internal_model_id ? 'timeConfig'
         AND jsonb_typeof(cp.models -> cm.internal_model_id -> 'timeConfig') = 'object'
         AND (cp.models -> cm.internal_model_id -> 'timeConfig') <> '{}'::jsonb
         AND cm.time_config IS NOT NULL
         AND jsonb_typeof(cm.time_config) = 'object'
-        -- 空对象 = 未设置（与 cost_rates / protocols / context_tiers 同口径），不算漂移。
         AND cm.time_config <> '{}'::jsonb
         AND cm.time_config IS DISTINCT FROM (cp.models -> cm.internal_model_id -> 'timeConfig'))
+    -- 上下文分档：双方都有内容（空数组=未设置）且不同。
     OR (cp.models -> cm.internal_model_id ? 'contextTiers'
         AND jsonb_typeof(cp.models -> cm.internal_model_id -> 'contextTiers') = 'array'
         AND jsonb_array_length(cp.models -> cm.internal_model_id -> 'contextTiers') > 0
@@ -504,19 +495,56 @@ WHERE cm.id = ANY($1::bigint[])
         AND cm.context_tiers IS DISTINCT FROM (cp.models -> cm.internal_model_id -> 'contextTiers'))
   )`
 
-// downshiftProtocolsSQL 与迁移 0019 (c) 段同口径：种子有非空 object 且实例为空时下移，冲突不覆盖。
-// 「实例为空」= NULL / {} / 非 object —— 这三类都视为未设置，不是「本地显式配成空」。
+// markDriftSQL 与迁移 (d) 段同口径（条件见 driftCondition），按批处理。
+const markDriftSQL = `
+UPDATE channel_models cm
+SET edited = true
+` + seedModelJoin + `
+WHERE cm.id = ANY($1::bigint[])
+  AND ` + driftCondition
+
+// downshiftProtocolsSQL 与迁移 (c) 段同口径（条件见 downshiftCondition），按批处理。
 const downshiftProtocolsSQL = `
 UPDATE channel_models cm
 SET protocols = cp.models -> cm.internal_model_id -> 'protocols',
     updated_at = now()
-FROM channels c
-JOIN channel_protocols cp ON cp.id = c.channel_protocol_id AND cp.deleted_at IS NULL
+` + seedModelJoin + `
 WHERE cm.id = ANY($1::bigint[])
-  AND cm.channel_id = c.id
-  AND cm.deleted_at IS NULL
-  AND cp.models ? cm.internal_model_id
-  AND cp.models -> cm.internal_model_id ? 'protocols'
-  AND jsonb_typeof(cp.models -> cm.internal_model_id -> 'protocols') = 'object'
-  AND (cp.models -> cm.internal_model_id -> 'protocols') <> '{}'::jsonb
-  AND (cm.protocols IS NULL OR cm.protocols = '{}'::jsonb OR jsonb_typeof(cm.protocols) <> 'object')`
+  AND ` + downshiftCondition
+
+// backfillPendingWork 判断三阶段是否**还有待处理的数据**（数据已就绪则都没有）。
+//
+// 为什么不能只看断点表：迁移内联跑完之后行数才涨过阈值的库，断点表压根不存在，
+// 会永久误报「回填未完成」。这里直接用与 worker 相同的条件做 EXISTS 探测（命中 1 行即停），
+// 判定与「真跑一遍会不会改数据」严格一致。
+func backfillPendingWork(ctx context.Context, d *sql.DB) (channels, downshift, drift bool, err error) {
+	probe := func(query string) (bool, error) {
+		var hit bool
+		if err := d.QueryRowContext(ctx, query).Scan(&hit); err != nil {
+			return false, err
+		}
+		return hit, nil
+	}
+
+	channels, err = probe(`SELECT EXISTS (SELECT 1 FROM channels c CROSS JOIN channel_protocols cp
+		WHERE ` + archivedChannelPredicate + `)`)
+	if err != nil {
+		return false, false, false, fmt.Errorf("probe channels archive: %w", err)
+	}
+	downshift, err = probe(`SELECT EXISTS (SELECT 1 ` + seedModelProbeFrom + `
+		WHERE ` + downshiftCondition + `)`)
+	if err != nil {
+		return false, false, false, fmt.Errorf("probe protocols downshift: %w", err)
+	}
+	drift, err = probe(`SELECT EXISTS (SELECT 1 ` + seedModelProbeFrom + `
+		WHERE ` + driftCondition + `)`)
+	if err != nil {
+		return false, false, false, fmt.Errorf("probe drift marking: %w", err)
+	}
+	return channels, downshift, drift, nil
+}
+
+// Backfill0019Phases 返回三阶段的稳定顺序；脚本的 -reset 与调用方都从这里取，避免漏掉某个阶段。
+func Backfill0019Phases() []string {
+	return []string{Backfill0019PhaseChannels, Backfill0019PhaseDownshift, Backfill0019PhaseModels}
+}

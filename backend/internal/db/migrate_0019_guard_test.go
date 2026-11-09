@@ -526,3 +526,70 @@ func TestMigrate_0019_ArchiveEqualsClearSet(t *testing.T) {
 		t.Fatalf("C4 引用已软删协议，内联值此刻就是生效配置，必须原样保留，got %q", after[4].base)
 	}
 }
+
+// Gate 非阻断项 2：迁移**内联已完成**、之后行数才涨过阈值的库，不应永久误报「回填未完成」。
+// 判定从「看断点表」改为「用与 worker 相同的条件探测还有没有待处理行」，数据已就绪 → PENDING=0。
+func TestPendingLargeBackfills_InlineDoneThenGrows(t *testing.T) {
+	ctx := context.Background()
+	tempDB := openTempDB(t)
+	migDir := filepath.Join(filepath.Dir(mustCallerFile(t)), "migrations")
+	applyMigrationsBelow(t, tempDB, migDir, "0019")
+	seedOwnershipFixture(t, tempDB) // 少量数据：迁移会走内联路径
+
+	runMigration(t, tempDB, migDir, migrationFile(t, migDir, "0019"))
+	if msgs, err := PendingLargeBackfills(ctx, tempDB); err != nil || len(msgs) != 0 {
+		t.Fatalf("内联完成后行数还在阈值内，不应告警: %v / %v", msgs, err)
+	}
+
+	// 之后行数涨过阈值（模拟业务增长）：这些新行没有待回填的内容（无种子定义漂移），
+	// 断点表也不存在 —— 旧实现会永久误报。
+	exec(t, tempDB, `INSERT INTO channel_models(id, channel_id, internal_model_id, external_model_id, cost_rates, protocols)
+		SELECT 3000000 + i, 1, 'grown-' || i, 2, '{"input":1,"output":2,"cache_read":0.1}'::jsonb,
+		       '{"openai-chat":{}}'::jsonb
+		FROM generate_series(1, 50001) AS i`)
+	var live int64
+	if err := tempDB.QueryRow(`SELECT count(*) FROM channel_models WHERE deleted_at IS NULL`).Scan(&live); err != nil {
+		t.Fatalf("统计行数失败: %v", err)
+	}
+	if live <= Backfill0019InlineThreshold {
+		t.Fatalf("前置条件：行数 %d 未超过阈值", live)
+	}
+
+	msgs, err := PendingLargeBackfills(ctx, tempDB)
+	if err != nil {
+		t.Fatalf("PendingLargeBackfills 失败: %v", err)
+	}
+	if len(msgs) != 0 {
+		t.Fatalf("内联已完成的大库不应误报（数据已就绪），got %v", msgs)
+	}
+
+	// 反向验证：真造一条待回填的数据 → 必须报出来，且跑一次回填后消失。
+	exec(t, tempDB, `UPDATE channel_models SET protocols = NULL WHERE id = 101`)
+	msgs, err = PendingLargeBackfills(ctx, tempDB)
+	if err != nil {
+		t.Fatalf("PendingLargeBackfills 失败: %v", err)
+	}
+	if len(msgs) != 1 || !strings.Contains(msgs[0], "下移") {
+		t.Fatalf("存在待下移行时应报「协议子集下移」，got %v", msgs)
+	}
+	if _, err := Backfill0019(ctx, tempDB, Backfill0019Options{BatchSize: 25000}); err != nil {
+		t.Fatalf("回填失败: %v", err)
+	}
+	if msgs, err = PendingLargeBackfills(ctx, tempDB); err != nil || len(msgs) != 0 {
+		t.Fatalf("回填后不应再告警: %v / %v", msgs, err)
+	}
+}
+
+// Gate 非阻断项 1：-reset 必须能重置全部三个阶段（阶段列表单一来源）。
+func TestBackfill0019Phases_CoversAll(t *testing.T) {
+	phases := Backfill0019Phases()
+	want := []string{Backfill0019PhaseChannels, Backfill0019PhaseDownshift, Backfill0019PhaseModels}
+	if len(phases) != len(want) {
+		t.Fatalf("阶段数应为 %d（含下移），got %d: %v", len(want), len(phases), phases)
+	}
+	for i := range want {
+		if phases[i] != want[i] {
+			t.Fatalf("阶段顺序应与迁移一致（归档→下移→漂移），got %v", phases)
+		}
+	}
+}

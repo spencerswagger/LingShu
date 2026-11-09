@@ -57,12 +57,13 @@ func main() {
 	defer func() { _ = conn.Close() }()
 
 	if *reset {
-		for _, phase := range []string{db.Backfill0019PhaseChannels, db.Backfill0019PhaseModels} {
+		// 阶段列表从库里取（Backfill0019Phases），避免这里漏一个阶段导致演练重跑不完整。
+		for _, phase := range db.Backfill0019Phases() {
 			if err := db.ResetBackfillCheckpoint(ctx, conn, phase); err != nil {
-				log.Fatalf("重置断点失败: %v", err)
+				log.Fatalf("重置断点 %s 失败: %v", phase, err)
 			}
 		}
-		log.Printf("已清空 0019 回填断点（-reset）")
+		log.Printf("已清空 0019 回填断点（-reset，共 %d 个阶段）", len(db.Backfill0019Phases()))
 	}
 
 	res, err := db.Backfill0019(ctx, conn, db.Backfill0019Options{
