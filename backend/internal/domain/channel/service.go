@@ -94,38 +94,47 @@ func (s *Service) SetTagResolver(r TagResolver) { s.tagResolver = r }
 // SetChannelProtocolStore 注入渠道协议存储：引用渠道协议时校验其存在。
 func (s *Service) SetChannelProtocolStore(c *channelprotocol.Store) { s.cpStore = c }
 
-// validateBase 校验渠道基础约束：名称必填；引用渠道协议时 base_url/protocol 必须为空，
+// validateBase 校验渠道基础约束：名称必填；引用渠道协议时 base_url 必须为空、protocol 一律落空，
 // 未引用时要求内联 base_url + 基础协议。
 //
-// 基址归属（0019 契约 + 拍板）：**引用协议不覆盖基址**——基址只跟随被引用协议，
-// 需要独立地址就显式新建一条协议。因此引用协议时提交非空 BaseURL 一律 400
-// （宁可拦住，不要静默丢弃让人事后猜）。
+// 基址归属（0019 裁定①③）：**引用协议不覆盖基址**——基址只跟随被引用协议，需要独立地址就
+// 显式新建一条协议。因此引用协议时提交非空 BaseURL 一律 400，且错误文案要能指导操作
+// （说清「基址跟随哪条协议」+「要改就新建协议」），不做静默覆盖/静默忽略。
+//
+// Protocol 是例外（裁定③的边界）：老前端总会回传默认值 openai-compat，若也 400 会拦住一切正常保存；
+// 该值在引用模式下从不参与解析，因此**忽略并落空**，不报错。
 func (s *Service) validateBase(in ChannelInput) error {
 	if in.Name == "" {
 		return errBadRequest("渠道名称不能为空")
 	}
-	if b := in.BaseURL; b != "" {
-		if !strings.HasPrefix(b, "http://") && !strings.HasPrefix(b, "https://") {
-			return errBadRequest("BaseURL 必须以 http:// 或 https:// 开头")
-		}
-	}
 	if in.ChannelProtocolID != nil && *in.ChannelProtocolID > 0 {
-		if strings.TrimSpace(in.BaseURL) != "" {
-			return errBadRequest("引用渠道协议时不允许设置内联 BaseURL：基址跟随被引用协议，需要独立地址请新建一条协议")
-		}
+		name := ""
 		if s.cpStore != nil {
-			if _, err := s.cpStore.GetByID(context.Background(), *in.ChannelProtocolID); err != nil {
+			cp, err := s.cpStore.GetByID(context.Background(), *in.ChannelProtocolID)
+			if err != nil {
 				if errors.Is(err, sql.ErrNoRows) {
 					return errBadRequest("引用的渠道协议不存在")
 				}
 				return fmt.Errorf("check channel protocol: %w", err)
 			}
+			if cp != nil {
+				name = cp.Name
+			}
+		}
+		if strings.TrimSpace(in.BaseURL) != "" {
+			if name != "" {
+				return errBadRequest(fmt.Sprintf(
+					"引用了渠道协议时不允许设置内联 BaseURL：基址跟随被引用协议（%s）；如需独立基址，请新建一个渠道协议并在渠道中引用它。", name))
+			}
+			return errBadRequest("引用了渠道协议时不允许设置内联 BaseURL：基址跟随被引用协议；如需独立基址，请新建一个渠道协议并在渠道中引用它。")
 		}
 		return nil
 	}
 	// 内联配置：要求 base_url + 基础协议。
-	if in.BaseURL == "" {
+	if b := in.BaseURL; b == "" {
 		return errBadRequest("渠道 BaseURL 不能为空")
+	} else if !strings.HasPrefix(b, "http://") && !strings.HasPrefix(b, "https://") {
+		return errBadRequest("BaseURL 必须以 http:// 或 https:// 开头")
 	}
 	if in.Protocol == "" {
 		return errBadRequest("渠道协议不能为空")
@@ -134,6 +143,15 @@ func (s *Service) validateBase(in ChannelInput) error {
 		return errBadRequest("协议仅支持 openai-chat / openai-responses / anthropic-messages")
 	}
 	return nil
+}
+
+// inlineProtocol 返回应落库的 channels.protocol：引用协议时恒为空（该值不参与解析，
+// 老前端回传的默认值一律忽略并落空，见 validateBase 说明）。
+func inlineProtocol(in ChannelInput) string {
+	if in.ChannelProtocolID != nil && *in.ChannelProtocolID > 0 {
+		return ""
+	}
+	return in.Protocol
 }
 
 // fillDefaults 补齐默认值：priority=100、rate_limit/health_probe/reliability 默认。
@@ -179,7 +197,7 @@ func (s *Service) CreateChannel(ctx context.Context, in ChannelInput) (*Channel,
 
 	c := &Channel{
 		Name:              in.Name,
-		Protocol:          in.Protocol,
+		Protocol:          inlineProtocol(in),
 		BaseURL:           in.BaseURL,
 		ChannelProtocolID: in.ChannelProtocolID,
 	}
@@ -228,18 +246,14 @@ func (s *Service) UpdateChannel(ctx context.Context, id int64, in ChannelInput) 
 		resolved = r
 	}
 
-	// 基址归属（0019）：引用协议时基址只跟随协议，channels.base_url 是**历史遗留只读值**。
-	// 更新时保留原值不覆盖——运行时已忽略它，保留是为了「回滚老二进制即恢复原地址」，
-	// 不制造不可逆的数据丢失（清理/迁移由运维按 scripts/0019-preflight-audit.sql 处理）。
-	baseURL := in.BaseURL
-	if in.ChannelProtocolID != nil && *in.ChannelProtocolID > 0 {
-		baseURL = existing.BaseURL
-	}
+	// 基址归属（0019 裁定①）：引用协议时基址只跟随协议。
+	// 存量值已由迁移 0019 归档进 channel_base_url_archive 后清空，因此这里直接落空/落传入值：
+	// 引用协议时非空已被 validateBase 拦成 400，落库必然是 ''（不会产生「同协议两种基址」）。
 	c := &Channel{
 		ID:                id,
 		Name:              in.Name,
-		Protocol:          in.Protocol,
-		BaseURL:           baseURL,
+		Protocol:          inlineProtocol(in),
+		BaseURL:           in.BaseURL,
 		ChannelProtocolID: in.ChannelProtocolID,
 		Tags:              existing.Tags, // tags 列保持不变，不再从 input 设置
 		CreatedAt:         existing.CreatedAt,
@@ -376,15 +390,14 @@ func seedFromGateway(mg channelprotocol.ModelGateway) channelModelSeed {
 		TimeConfig:      mg.TimeConfig,
 		ContextTiers:    mg.ContextTiers,
 		Protocols:       mg.Protocols,
-		ConvertEnabled:  mg.ConvertEnabled,
-		ConvertTargets:  mg.ConvertTargets,
 	}
 }
 
 // materializeFromProtocol 按协议模型清单物化/更新该渠道的 channel_models（契约 §5.4）：
 //   - 仅处理 externalModelID>0 的行；按 (channel_id, internal_model_id) upsert；
 //   - 种子缺省的键不写（保留实例现值）——不会再把 cost_rates 写成 JSON null；
-//   - edited=true 的行不写商业字段（物化守卫），但转换配置照常刷新（按拍板：转换按协议定义）；
+//   - edited=true 的行不写商业字段（物化守卫）；
+//   - 转换配置（convertEnabled/convertTargets）不物化：裁定②「转换按协议定义」，运行时直接读协议；
 //   - 永不覆盖 state / rate_limit / health_probe / reliability，永不删除协议未列出的行。
 //
 // 返回实际处理的行数。
@@ -413,17 +426,11 @@ func (s *Service) materializeFromProtocol(ctx context.Context, channelID int64, 
 				cols = append(cols, seedColumn{"external_model_id", seed.ExternalModelID})
 			}
 			if existing.Edited {
-				// 守卫：本地编辑过的行商业字段保持不动。
+				// 守卫：本地编辑过的行商业字段保持不动（R6）。
 				cols = nil
 			}
 			if uerr := s.cmStore.updateSeedColumns(ctx, existing.ID, cols); uerr != nil {
 				return n, fmt.Errorf("update channel model %q: %w", internalID, uerr)
-			}
-			if existing.Edited {
-				// 转换配置是协议定义（渠道层无差异化写入），edited 行也要跟随协议。
-				if uerr := s.cmStore.UpdateSeedConvert(ctx, existing.ID, seed); uerr != nil {
-					return n, fmt.Errorf("update channel model convert %q: %w", internalID, uerr)
-				}
 			}
 			if fresh, ferr := s.cmStore.GetByID(ctx, existing.ID); ferr == nil && s.mgr != nil {
 				s.mgr.UpsertModel(fresh)

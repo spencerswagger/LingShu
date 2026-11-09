@@ -233,9 +233,6 @@ func (s *Service) UpdateChannelModel(ctx context.Context, channelID, mid int64, 
 		RateLimit:       existing.RateLimit,
 		HealthProbe:     existing.HealthProbe,
 		Reliability:     existing.Reliability,
-		// 转换配置按协议定义（渠道层无差异化写入路径）：沿用实例现值，不接受本次提交的改写。
-		ConvertEnabled: existing.ConvertEnabled,
-		ConvertTargets: existing.ConvertTargets,
 		// 物化守卫按「字段级」置位：只有商业字段真的变了才冻结与协议种子的同步；
 		// 只改限流/探测/可靠性，或提交值与现值等价（1 vs 1.0、键序不同）都不置位。
 		Edited: existing.Edited || commercialFieldsChanged(existing, in),

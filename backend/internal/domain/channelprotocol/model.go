@@ -249,6 +249,18 @@ func (cp *ChannelProtocol) EffectiveHeaderPolicy() HeaderPolicy {
 	return cp.RequestHeaders
 }
 
-// EffectiveModelConvert 已随 0019 契约删除：转换配置的运行时读点是
-// channel_models.convert_enabled / convert_targets（协议种子只做物化来源）。
-// 保留注释仅为说明为什么这里不再有该函数（调用方编译期即失败，便于定位漏改）。
+// EffectiveModelConvert 返回某内部模型的协议转换配置：
+// 模型存在于 Models 时返回其 ConvertEnabled/ConvertTargets；否则 (nil, nil) 表示继承全局默认。
+//
+// 0019 裁定②：跨协议转换**保持协议独占**（不新增 channel_models.convert_* 列），
+// 因此本函数仍是网关运行时唯一读点，渠道层无法差异化。
+func (cp *ChannelProtocol) EffectiveModelConvert(internalModelID string) (enabled *bool, targets []string) {
+	if cp == nil {
+		return nil, nil
+	}
+	mg, ok := cp.Models[internalModelID]
+	if !ok {
+		return nil, nil
+	}
+	return mg.ConvertEnabled, mg.ConvertTargets
+}

@@ -3,6 +3,8 @@ package channel
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"reflect"
 	"regexp"
 	"testing"
 	"time"
@@ -104,8 +106,9 @@ func TestValidateBase_RejectsInlineBaseURLWhenProtocolReferenced(t *testing.T) {
 	}
 }
 
-// 引用协议时更新渠道：channels.base_url 保留原值（回滚老二进制即恢复原地址，不制造不可逆丢失）。
-func TestUpdateChannel_PreservesLegacyBaseURLForProtocolReference(t *testing.T) {
+// 裁定①：引用协议时 channels.base_url / protocol 一律落空（存量值由迁移 0019 先归档再清空，
+// 因此不会产生「同协议两种基址」，且回滚可从留档表无损还原）。
+func TestUpdateChannel_ClearsInlineBaseURLForProtocolReference(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock: %v", err)
@@ -123,8 +126,9 @@ func TestUpdateChannel_PreservesLegacyBaseURLForProtocolReference(t *testing.T) 
 		WillReturnRows(channelRow(&Channel{ID: 1, Name: "c", BaseURL: "https://legacy.example.com",
 			ChannelProtocolID: &pid, Priority: 100, CreatedAt: now, UpdatedAt: now}))
 	mock.ExpectBegin()
+	// 老前端回传的 protocol 默认值（openai-compat）被忽略并落空，base_url 落空（不 400）。
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE channels SET`)).
-		WithArgs("c2", "", "https://legacy.example.com", sqlmock.AnyArg(), int64(100),
+		WithArgs("c2", "", "", sqlmock.AnyArg(), int64(100),
 			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), pid, int64(1)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM channel_tags WHERE channel_id = $1`)).
@@ -132,12 +136,15 @@ func TestUpdateChannel_PreservesLegacyBaseURLForProtocolReference(t *testing.T) 
 	mock.ExpectCommit()
 
 	c, err := svc.UpdateChannel(context.Background(), 1,
-		ChannelInput{Name: "c2", ChannelProtocolID: &pid})
+		ChannelInput{Name: "c2", ChannelProtocolID: &pid, Protocol: "openai-compat"})
 	if err != nil {
 		t.Fatalf("update: %v", err)
 	}
-	if c.BaseURL != "https://legacy.example.com" {
-		t.Fatalf("遗留 base_url 应被保留，got %q", c.BaseURL)
+	if c.BaseURL != "" {
+		t.Fatalf("引用协议时 base_url 应落空，got %q", c.BaseURL)
+	}
+	if c.Protocol != "" {
+		t.Fatalf("引用协议时 protocol 应落空（老前端默认值被忽略，不 400），got %q", c.Protocol)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("expectations: %v", err)
@@ -345,7 +352,7 @@ func TestUpdateChannelModel_EditedFlag(t *testing.T) {
 	in.CostRates = billing.Rates{"cache_read": 0.1, "output": 2, "input": 1, "cache_write": 3}
 	mock.ExpectExec(`UPDATE channel_models SET`).
 		WithArgs("qwen-max", int64(2), sqlmock.AnyArg(), nil, nil, nil, string(StateNormal),
-			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), nil, sqlmock.AnyArg(), false, int64(100)).
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), false, int64(100)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + cmCols + ` FROM channel_models WHERE id = $1 AND deleted_at IS NULL`)).WithArgs(int64(100)).
 		WillReturnRows(cmRow(&ChannelModel{ID: 100, ChannelID: 1, InternalModelID: "qwen-max", ExternalModelID: 2,
@@ -363,7 +370,7 @@ func TestUpdateChannelModel_EditedFlag(t *testing.T) {
 	changed.CostRates = billing.Rates{"input": 9, "output": 2, "cache_read": 0.1}
 	mock.ExpectExec(`UPDATE channel_models SET`).
 		WithArgs("qwen-max", int64(2), sqlmock.AnyArg(), nil, nil, nil, string(StateNormal),
-			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), nil, sqlmock.AnyArg(), true, int64(100)).
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), true, int64(100)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + cmCols + ` FROM channel_models WHERE id = $1 AND deleted_at IS NULL`)).WithArgs(int64(100)).
 		WillReturnRows(cmRow(&ChannelModel{ID: 100, ChannelID: 1, InternalModelID: "qwen-max", ExternalModelID: 2,
@@ -423,5 +430,27 @@ func TestResetModelFromProtocol_NotFound(t *testing.T) {
 		WillReturnError(sql.ErrNoRows)
 	if _, err := svc.ResetModelFromProtocol(context.Background(), 1, 404); err == nil {
 		t.Fatalf("不存在的模型行应返回 404")
+	}
+}
+
+// 裁定②的写入口防线：渠道模型接口**不接受**转换配置差异。
+// 结构性保证：channelModelRequest / ChannelModelInput 里没有 convert 字段，JSON 里带上也会被丢弃，
+// 因此「按渠道写转换差异」既无法落库、也无法影响网关（网关只读协议，见 gateway 的 conversion 用例）。
+func TestChannelModelRequest_DropsChannelLevelConvertFields(t *testing.T) {
+	const base = `"InternalModelID":"qwen-max","ExternalModelID":"2",
+		"CostRates":{"Input":1,"Output":2,"CacheRead":0.1}`
+
+	var withConvert channelModelRequest
+	if err := json.Unmarshal([]byte(`{`+base+`,"ConvertEnabled":false,"ConvertTargets":["openai-responses"]}`), &withConvert); err != nil {
+		t.Fatalf("解码（带转换字段）失败: %v", err)
+	}
+	var withoutConvert channelModelRequest
+	if err := json.Unmarshal([]byte(`{`+base+`}`), &withoutConvert); err != nil {
+		t.Fatalf("解码（不带转换字段）失败: %v", err)
+	}
+
+	got, want := withConvert.toInput(), withoutConvert.toInput()
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("渠道侧转换字段应被丢弃（转换由协议独占）；got=%+v want=%+v", got, want)
 	}
 }

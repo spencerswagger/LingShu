@@ -1,102 +1,120 @@
-# 渠道 / 渠道协议字段归属：实现说明与拍板落地（0019）
+# 渠道 / 渠道协议字段归属：实现说明（0019 · RULED-v2）
 
-> Status: IMPLEMENTED（代码 + 迁移 + 测试已落）
+> Status: IMPLEMENTED（代码 + 迁移 + 回填脚本 + 测试已落）
 > Date: 2026-11-10
-> 上游契约：`docs/designs/2026-11-10-channel-field-ownership-contract.md`（Ark，DRAFT-v1）
-> 本文只记「怎么落的、和 DRAFT-v1 差在哪、为什么差」——设计意图以契约为准，冲突处以拍板为准。
+> 上游契约：`docs/designs/2026-11-10-channel-field-ownership-contract.md`（Ark，**RULED-v2**，四项口径已裁定）
+> 本文只记「怎么落的、边界在哪、上线怎么走」；设计意图以契约为准。
 
 ---
 
-## 1. 拍板四条如何落地
+## 1. 落地结果一览
 
-| # | 拍板结论 | 落地位置 | 行为断言（测试） |
-|---|---|---|---|
-| ① | 引用协议**不覆盖基址**，要改就显式新建协议 | `channel/probe.go:effectiveProtocolBaseURL`、`gateway/protocol.go:effectiveBaseURL`（引用协议时只走协议链）；`channel/service.go:validateBase`（引用协议时提交非空 `BaseURL` → 400） | `TestEffectiveProtocolBaseURL_ProtocolReferenceIgnoresInlineLenacy`、`TestEffectiveBaseURL_ProtocolReferenceIgnoresInlineBaseURL`、`TestValidateBase_RejectsInlineBaseURLWhenProtocolReferenced` |
-| ② | 转换**按协议定义、不按渠道差异化** | 新增列 `channel_models.convert_enabled/convert_targets` 作为协议的**物化副本**；运行时读实例列（`gateway/conversion.go`），渠道层**没有**写入路径 | `TestService_Materialize_EditedRowSkipsCommercialButSyncsConvert`、`TestResolveUpstreamProtocol`（`model row disabled` / `model row target order`） |
-| ③ | 写入带非空 inner BaseURL → **400** | `channel/service.go:validateBase` | 同上 validateBase 用例 |
-| ④ | `edited` **字段级置位**：只有字段值真变才置位 | `channel/model_service.go:commercialFieldsChanged`（成本按三段数值比、协议名 canonical、时段/分档按结构比） | `TestCommercialFieldsChanged_FieldLevel`、`TestUpdateChannelModel_EditedFlag` |
+| 维度 | v1（DRAFT）设计 | 实际落地（RULED-v2） |
+|---|---|---|
+| 新增业务列 | 4（`base_url_override` / `convert_enabled` / `convert_targets` / `edited`） | **1**（`channel_models.edited`） |
+| 新增辅助表 | 无 | `channel_base_url_archive`（留档，使清空基址可无损回滚） |
+| 渠道级基址覆盖 | 允许（新列） | **不存在**：引用协议时基址完全跟随协议 |
+| 转换配置 | 下沉到实例列 | **保持协议独占**（不新增列，运行时仍读协议种子） |
+| 回填方式 | 迁移内单语句 | ≤5 万行：迁移内单语句；>5 万行：`scripts/backfill-0019`（分批 + 断点 + 幂等） |
+
+四项裁定的落点：
+
+| 裁定 | 落点 | 断言它的测试 |
+|---|---|---|
+| ① 引用协议不覆盖基址 | `channel/probe.go:effectiveProtocolBaseURL`、`gateway/protocol.go:effectiveBaseURL`（引用协议时只走协议链）；迁移 (b) 归档并清空 `channels.base_url`/`protocol` | `TestEffectiveProtocolBaseURL_ProtocolReferenceIgnoresInlineLenacy`、`TestEffectiveBaseURL_ProtocolReferenceIgnoresInlineBaseURL`、`TestMigrate_0019_FieldOwnership` |
+| ② 转换按协议定义 | `gateway/conversion.go` 仍读 `channel_protocols.models[m]`；`EffectiveModelConvert` 保留；无 convert 列 | `TestResolveUpstreamProtocol`（`per-model disabled` / `override target order`）、`TestChannelModelRequest_DropsChannelLevelConvertFields` |
+| ③ 非空 inner BaseURL → 400 | `channel/service.go:validateBase`（文案含协议名 + 「要改请新建协议」） | `TestValidateBase_RejectsInlineBaseURLWhenProtocolReferenced` |
+| ④ `edited` 字段级置位 | `channel/model_service.go:commercialFieldsChanged` | `TestCommercialFieldsChanged_FieldLevel`、`TestUpdateChannelModel_EditedFlag` |
 
 `edited` 的唯一出口：`POST /api/v1/admin/channels/{id}/models/{mid}/reset-from-protocol`
 （恢复种子值 + 置回 `edited=false`；种子未定义的键保持现值）。
 
 ---
 
-## 2. 与 DRAFT-v1 的差异（必须知道的三条）
+## 2. 两个必须知道的实现细节
 
-### 2.1 `base_url_override` 列**没有**加（拍板①）
+### 2.1 `Protocol` 不做 400，忽略并落空
 
-DRAFT-v1 设计的是「新增覆盖列、留空=继承」，理由是「完全禁止覆盖会改掉存量渠道实际地址」。
-拍板选了后者（备选方案），因此：
+老前端恒定回传 `protocol: "openai-compat"`；若和 `BaseURL` 一样 400，会拦住一切正常保存。
+该值在引用模式下从不参与解析，因此服务端**忽略并落空**（`inlineProtocol()`），迁移 (b) 也把存量值清空。
+只有「手工填了 BaseURL」才会 400。
 
-- 不加 `base_url_override`；新增列由 4 个变 **3 个**（`convert_enabled` / `convert_targets` / `edited`）。
-- **存量行为会变**：引用协议且 `channels.base_url` 非空的渠道，上线后走**协议地址**（不再是那列历史值）。
-- 迁移**不改写** `channels.base_url`：运行时忽略它，保留原值使「回滚老二进制即恢复原地址」成立（零数据破坏）。
-- 影响面必须在上线前盘点：`backend/scripts/0019-preflight-audit.sql`（第 2 段列出会变地址的渠道，
-  第 2b 段列出「协议也没配基址」的高危渠道——这些必须先建协议再上线）。
+### 2.2 迁移 (c) 是契约 §6.1 之外补的一步
 
-### 2.2 迁移补了 DRAFT-v1 §6.1 漏掉的一步（契约缺口）
-
-§5.2 承诺「迁移会把 `models[m].protocols` 复制进 `channel_models.protocols`，存量行为不变」，
-但 §6.1 的 SQL 里**没有**这一步。若不补，降级为种子后凡是「实例 protocols 为空、靠种子回落」的
-模型行会突然丢掉模型级协议子集（行为回退）。迁移 0019 用 (b) 段补上，只写「实例为空」的行，不覆盖本地值。
-
-### 2.3 `models[m].baseUrl` 废弃的落点（B3）
-
-包格式仍容忍该键（全仓无 `DisallowUnknownFields`），但 `channelprotocol.normalizeIn` 在落库前清空它，
-不再回显。原因：它从来没有运行时读点，存下来只会让管理员以为配了生效。
+契约 §5.2 承诺「迁移会把 `models[m].protocols` 复制进 `channel_models.protocols`，因此存量行为不变」，
+但 §6.1 的 SQL 里没有这一步。不补的话，凡是「实例 protocols 为空、靠种子回落」的模型行会突然丢掉
+模型级协议子集（行为回退）。迁移 0019 用 (c) 段补上，只写「实例为空」的行。
 
 ---
 
-## 3. 迁移 0019 的四段与回滚
+## 3. 迁移 0019 与回滚
 
-| 段 | 内容 | 幂等性 |
+| 段 | 内容 | 幂等 |
 |---|---|---|
-| (a) | 加 3 列（`IF NOT EXISTS`）；`convert_targets NOT NULL DEFAULT '[]'`、`edited NOT NULL DEFAULT false` | 是 |
-| (b) | 种子的模型级 `protocols` 下沉到实例（仅实例为空时） | 是 |
-| (c) | 种子的 `convertEnabled/convertTargets` 下沉（仅种子定义了的键） | 是 |
+| (a) | 加 `edited` 列；建 `channel_base_url_archive` | 是（`IF NOT EXISTS`） |
+| (b) | 引用协议渠道：`base_url`/`protocol` 归档后清空 | 是（`ON CONFLICT DO NOTHING` + 仅命中非空） |
+| (c) | 种子的模型级 `protocols` 下沉到实例（仅实例为空时） | 是 |
 | (d) | 漂移标记 `edited=true`（种子定义了 + 双方都有值 + 值不等；成本按 `Input/Output/CacheRead` → snake 逐键 numeric 比较） | 是 |
 
-回滚：`backend/scripts/rollback-0019.sql`（纯 SQL，可 psql 直接跑；**不在** `migrations/` 下）。
-回滚损失面：仅 `edited` 标记与两列副本（种子仍在协议里，可重建），`channels.base_url` 全程未动。
+回滚：`backend/scripts/rollback-0019.sql`（纯 SQL）。
+从留档表还原 `base_url`/`protocol` → 删 `edited` 列 → 删留档表 → 清理 `applied_migrations` 记录 → 自检。
+**有损点为零**：老代码用显式列清单查询，不读留档表。
 
-**已验证**：`TestMigrate_0019_FieldOwnership` 在本地 PG17 临时库真跑——搬迁、转换下沉、漂移标记、
-B1 不写 null、幂等二次执行、回滚脚本（删列 + 数据保真）逐条断言；`TestMigrate_FullChain` 保证全新库
-按序应用全链不冲突。
+已验证（PG17 真跑）：`TestMigrate_0019_FieldOwnership` 覆盖搬迁/漂移/幂等/回滚/B1；`TestMigrate_FullChain` 保证全新库全链无冲突。
 
 ---
 
-## 4. 存量计数（测试库快照，非生产）
+## 4. 回填：两条路径
 
-按拍板：「没有生产读权限，用 `lingshu_test` 计数并标清来源」。
-
-| 表 | 行数 | 来源 |
+| 生产 `channel_models` 行数 | 路径 | 特点 |
 |---|---|---|
-| `channels` | 0 | `lingshu_test` 快照（2026-11-10） |
-| `channel_protocols` | 0 | 同上 |
-| `channel_models` | 0 | 同上 |
-| `channel_keys` | 0 | 同上 |
+| ≤ 5 万 | 迁移 0019 内单语句 | 单事务，JSONB 逐行比较通常 < 2s |
+| > 5 万 | `go run ./scripts/backfill-0019 -dsn "$DSN"`（或 `db.Backfill0019`） | 主键游标、**单批 5000 行**、每批独立事务、进度写 `backfill_checkpoints(name,last_id)` |
 
-结论：本地三库皆空，回填与漂移标记只能在造数库上验证（已做）。**生产影响面待 spencer 提供**：
-把 `scripts/0019-preflight-audit.sql` 在只读账号上跑一次即可拿到「三表计数 + 会变地址的渠道清单 +
-预估被标 edited 的行数」。回填实现按「分批 + 断点 + 幂等」设计，不依赖生产量级：
-迁移是单事务的全表 UPDATE（PG 对已存在行加行锁），量级大时可先按 `channels.id % N` 分段执行 (b)(c)(d) 三段。
+为什么分两条：`internal/db/migrate.go` 把**每个迁移文件包在一个事务里**，分批与断点在单事务内无法成立。
+
+幂等与续跑的实现口径：
+- 归档 `ON CONFLICT (channel_id) DO NOTHING`（同一渠道不会写第二份留档）；
+- 清空语句带非空条件（已清空的行不再命中）；
+- 漂移标记只把 `edited` 写成 true；
+- 游标只前进；崩在事务中则整批回滚，重启从 `last_id` 之后重做。
+- 想要从头重跑（演练）：`-reset`。
+
+已验证：`TestBackfill0019_Idempotent`（跑两遍状态完全一致、第二遍零写入）、
+`TestBackfill0019_ResumeFromCheckpoint`（限批模拟中断 → 断点前进 → 续跑后与一次跑完逐行一致）、
+`TestBackfill0019_AfterMigrationIsNoop`（迁移已跑过的库上安全空跑）。
 
 ---
 
-## 5. 门禁
+## 5. 存量计数（**测试库快照，非生产**）
 
-- `gofmt`：本次改动文件干净（仓库既有 15 个历史不合规文件未动）。
+| 表 | 总行数 | 未删除 | 来源 |
+|---|---|---|---|
+| `channels` | 0 | 0 | `lingshu_test` 快照（2026-11-10） |
+| `channel_protocols` | 0 | 0 | 同上 |
+| `channel_models` | 0 | 0 | 同上 |
+| `channel_keys` | 0 | 0 | 同上 |
+
+`lingshu_dev` 同为 0；`lingshu_staging` 无业务表。**生产数待 spencer 提供后修订本节**。
+采集入口：`psql "$DSN" -f backend/scripts/0019-preflight-audit.sql`（只读，一次给出：三表计数 +
+裁定①影响面清单 + 高危（协议无基址）+ 预估 `edited` 行数 + 回填路径建议）。
+
+---
+
+## 6. 门禁
+
 - `go vet ./...`：通过。
-- `go test -race`（除 `tests/` e2e）：29 个包全绿；`internal/db` 的 3 个迁移集成测试在 PG17 上真跑通过。
-- `tests/` e2e 的 `TestE2E_GatewayBillingLoop` 失败**属既有问题**（CI 里该套件本就是
-  `continue-on-error` 的信息性步骤：脚手架未装配渠道密钥服务），与本次改动的包无交集。
+- `go test -race`（除 `tests/` e2e）：全绿；`internal/db` 的迁移与回填集成测试在 PG17 真跑通过。
+- `gofmt`：本次改动文件干净（仓库既有 15 个历史不合规文件未动）。
+- `tests/` e2e 的 `TestE2E_GatewayBillingLoop` 失败**属既有问题**（CI 中该套件本就是
+  `continue-on-error` 的信息性步骤：脚手架未装配渠道密钥服务），与本次改动无交集。
 
 ---
 
-## 6. 给下游的两条
+## 7. 给下游
 
-- **View**：`ChannelView` 新增只读派生 `BaseURLEffective`（最终生效地址）；`BaseURL` 在引用协议时是
-  历史遗留值（运行时忽略），**不要**再回传给后端（会 400）。模型行新增 `ConvertEnabled`（三态：null=继承/
-  true/false）、`ConvertTargets`、`Edited`（徽标 + 「重置为协议值」按钮调 `reset-from-protocol`）。
-- **Gate**：契约 §7.3 的用例 A「override=Y 打 Y」在拍板①下**不再成立**（改为「引用协议渠道的
-  `base_url` 被忽略，打协议地址」）；其余用例不变。
+- **View**：`ChannelView` 新增只读派生 `BaseURLEffective`；引用协议时 `BaseURL`/`Protocol` 恒为 `''`，
+  前端应隐藏这两个输入并展示「基址跟随协议：<协议名>（<BaseURLEffective>）」，提交时传 `''`。
+  模型行新增只读 `Edited`（徽标 + 「重置为协议值」调 `reset-from-protocol`）。转换配置仍在协议编辑页（标注协议级共享）。
+- **Gate**：契约 §7.3 的用例表可直接抄；注意「PUT `Protocol="openai-chat"`」的期望是**不报错且落库为 `''`**，
+  只有 `BaseURL` 非空才 400。回填相关另加两条：幂等（跑两遍一致）与断点续跑（限批中断后续做）。

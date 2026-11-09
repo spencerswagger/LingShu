@@ -2,7 +2,6 @@ package channel
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -20,22 +19,12 @@ import (
 func cmTestCols() []string {
 	return []string{"id", "channel_id", "internal_model_id", "external_model_id", "cost_rates",
 		"time_config", "context_tiers", "protocols", "state", "rate_limit", "health_probe", "reliability",
-		"created_at", "updated_at", "convert_enabled", "convert_targets", "edited"}
+		"created_at", "updated_at", "edited"}
 }
 
 func cmRow(m *ChannelModel, costJSON string) *sqlmock.Rows {
-	var convertEnabled any
-	if m.ConvertEnabled != nil {
-		convertEnabled = *m.ConvertEnabled
-	}
-	targets := []byte("[]")
-	if len(m.ConvertTargets) > 0 {
-		b, _ := json.Marshal(m.ConvertTargets)
-		targets = b
-	}
 	return sqlmock.NewRows(cmTestCols()).AddRow(m.ID, m.ChannelID, m.InternalModelID, m.ExternalModelID,
-		costJSON, nil, nil, nil, string(m.State), `{}`, `{}`, `{}`, m.CreatedAt, m.UpdatedAt,
-		convertEnabled, targets, m.Edited)
+		costJSON, nil, nil, nil, string(m.State), `{}`, `{}`, `{}`, m.CreatedAt, m.UpdatedAt, m.Edited)
 }
 
 func mockCMStore(t *testing.T) (*channelModelStore, sqlmock.Sqlmock) {
@@ -74,8 +63,7 @@ func TestChannelModelStore_ListByExternal(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(q)).
 		WithArgs(int64(2)).
 		WillReturnRows(cmRow(&ChannelModel{ID: 1, ChannelID: 1, InternalModelID: "qwen-max", ExternalModelID: 2, CreatedAt: now, UpdatedAt: now}, `{}`).
-			AddRow(2, 3, "qwen-plus", 2, `{}`, nil, nil, nil, "NORMAL", `{}`, `{}`, `{}`, now, now,
-				nil, `[]`, false))
+			AddRow(2, 3, "qwen-plus", 2, `{}`, nil, nil, nil, "NORMAL", `{}`, `{}`, `{}`, now, now, false))
 
 	list, err := s.ListByExternal(context.Background(), 2)
 	if err != nil {
@@ -86,16 +74,16 @@ func TestChannelModelStore_ListByExternal(t *testing.T) {
 	}
 }
 
-// cmJoinExtChannelRow 构造 JOIN 对外模型 + 渠道 的 19 列行（列顺序需与 cmColsJoinExtChannel / scanChannelModelJoinExtChannel 严格一致）。
+// cmJoinExtChannelRow 构造 JOIN 对外模型 + 渠道 的 17 列行（列顺序需与 cmColsJoinExtChannel / scanChannelModelJoinExtChannel 严格一致）。
 func cmJoinExtChannelRow(m *ChannelModel, costJSON string, timeJSON, tiersJSON any, externalName, channelName string) *sqlmock.Rows {
 	return sqlmock.NewRows([]string{
 		"id", "channel_id", "internal_model_id", "external_model_id", "cost_rates",
 		"time_config", "context_tiers", "protocols", "state", "rate_limit", "health_probe", "reliability",
-		"created_at", "updated_at", "convert_enabled", "convert_targets", "edited",
+		"created_at", "updated_at", "edited",
 		"external_name", "channel_name",
 	}).AddRow(m.ID, m.ChannelID, m.InternalModelID, m.ExternalModelID, costJSON,
 		timeJSON, tiersJSON, nil, string(m.State), `{}`, `{}`, `{}`, m.CreatedAt, m.UpdatedAt,
-		nil, `[]`, false, externalName, channelName)
+		m.Edited, externalName, channelName)
 }
 
 func TestChannelModelStore_ListAll(t *testing.T) {
@@ -111,7 +99,7 @@ func TestChannelModelStore_ListAll(t *testing.T) {
 		`{"input":1}`, nil, nil, "qwen-max-ext", "阿里云",
 	).AddRow(2, 3, "qwen-plus", 5, `{}`,
 		`{"peak":1.5}`, `[{"threshold":1000,"coeff":0.9}]`, nil, "NORMAL", `{}`, `{}`, `{}`, now, now,
-		nil, `[]`, false, "qwen-plus-ext", "智谱")
+		false, "qwen-plus-ext", "智谱")
 	mock.ExpectQuery(regexp.QuoteMeta(q)).WillReturnRows(rows)
 
 	list, err := s.ListAll(context.Background())
@@ -141,8 +129,8 @@ func TestChannelModelStore_ListAll(t *testing.T) {
 func TestChannelModelStore_Insert_Conflict(t *testing.T) {
 	s, mock := mockCMStore(t)
 	rates := billing.Rates{"input": 0.8, "output": 1.6, "cache_read": 0.05}
-	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO channel_models(id, channel_id, internal_model_id, external_model_id, cost_rates, time_config, context_tiers, protocols, state, rate_limit, health_probe, reliability, convert_enabled, convert_targets, edited) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING `+cmCols)).
-		WithArgs(sqlmock.AnyArg(), int64(1), "qwen-max", int64(2), sqlmock.AnyArg(), nil, nil, nil, "NORMAL", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), nil, []byte("[]"), false).
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO channel_models(id, channel_id, internal_model_id, external_model_id, cost_rates, time_config, context_tiers, protocols, state, rate_limit, health_probe, reliability, edited) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING `+cmCols)).
+		WithArgs(sqlmock.AnyArg(), int64(1), "qwen-max", int64(2), sqlmock.AnyArg(), nil, nil, nil, "NORMAL", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), false).
 		WillReturnError(&pgconn.PgError{Code: "23505"})
 
 	_, err := s.Insert(context.Background(), &ChannelModel{

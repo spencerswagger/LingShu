@@ -414,9 +414,9 @@ func TestService_Materialize_SeedWithoutCostRatesKeepsExistingCost(t *testing.T)
 	}
 }
 
-// 物化守卫（R6）+ 拍板②：edited=true 的行商业字段不再被种子覆盖，
-// 但转换配置按协议定义照常刷新（渠道层没有差异化写入路径）。
-func TestService_Materialize_EditedRowSkipsCommercialButSyncsConvert(t *testing.T) {
+// 物化守卫（R6）：edited=true 的行商业字段不再被种子覆盖。
+// 转换配置不在物化范围内（裁定②：转换由协议独占、运行时直接读协议种子），因此该行**没有任何写语句**。
+func TestService_Materialize_EditedRowSkipsAllWrites(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock: %v", err)
@@ -439,10 +439,7 @@ func TestService_Materialize_EditedRowSkipsCommercialButSyncsConvert(t *testing.
 		WillReturnRows(cmRow(&ChannelModel{ID: 100, ChannelID: 1, InternalModelID: "qwen-max", ExternalModelID: 2,
 			CostRates: billing.Rates{"input": 1, "output": 2, "cache_read": 0.1}, Edited: true,
 			State: StateNormal, CreatedAt: now, UpdatedAt: now}, `{"input":1,"output":2,"cache_read":0.1}`))
-	// 只刷新转换两列（成本保持本地值）。
-	mock.ExpectExec(regexp.QuoteMeta(`UPDATE channel_models SET convert_enabled=$1, convert_targets=$2, updated_at=now() WHERE id=$3`)).
-		WithArgs(false, sqlmock.AnyArg(), int64(100)).
-		WillReturnResult(sqlmock.NewResult(0, 1))
+	// 不该有任何写语句：商业字段被守卫挡住，转换配置根本不物化。
 
 	if err := svc.RematerializeProtocol(context.Background(), pid); err != nil {
 		t.Fatalf("rematerialize: %v", err)

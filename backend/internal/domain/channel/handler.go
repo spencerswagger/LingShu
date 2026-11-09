@@ -228,9 +228,6 @@ type viewChannelModel struct {
 	TimeConfig      *billing.TimeCoeffConfig  `json:"TimeConfig,omitempty"`
 	ContextTiers    []billing.TierRule        `json:"ContextTiers,omitempty"`
 	Protocols       channelprotocol.Protocols `json:"Protocols,omitempty"`
-	// ConvertEnabled/ConvertTargets 是协议定义的转换配置（物化副本）；渠道层只读，不提供差异化写入。
-	ConvertEnabled *bool    `json:"ConvertEnabled,omitempty"`
-	ConvertTargets []string `json:"ConvertTargets"`
 	// Edited 商业字段是否被本地编辑过（true=协议同步不再覆盖该行，可调 reset-from-protocol 恢复）。
 	Edited      bool              `json:"Edited"`
 	State       State             `json:"State"`
@@ -253,8 +250,6 @@ func toChannelModelView(m *ChannelModel) viewChannelModel {
 		TimeConfig:      m.TimeConfig,
 		ContextTiers:    m.ContextTiers,
 		Protocols:       m.Protocols,
-		ConvertEnabled:  m.ConvertEnabled,
-		ConvertTargets:  m.ConvertTargets,
 		Edited:          m.Edited,
 		State:           m.State,
 		RateLimit:       m.RateLimit,

@@ -1,50 +1,55 @@
 -- 0019 上线前预检（只读，不写库）：盘点存量与受影响面。
 --
--- 用途：
---   1) 给出「渠道 / 协议 / 模型」三张表的存量计数（评估回填影响面的分母）；
---   2) 列出 0019 会改变「有效上游基址」的渠道——按拍板「引用协议不覆盖基址」，
---      引用协议且 channels.base_url 非空的渠道，上线后走的是**协议地址**而不是
---      channels.base_url。这些渠道必须在上线前逐个确认：要么接受协议地址，
---      要么为它显式新建一条协议（基址写正确），改引新协议后再上线；
---   3) 预估 0019 会标记 edited=true 的行数（漂移行，同步不再覆盖）。
+-- 对应契约 RULED-v2 §10.3「上线前需要 spencer 给的三个数」，一次跑完拿全。
 --
--- 用法：psql "$DSN" -f scripts/0019-preflight-audit.sql
--- 建议在只读账号 / 只读事务下执行（全部语句是 SELECT）。
+-- 用途：
+--   1) 「渠道 / 协议 / 模型」三张表的存量计数（回填影响面的分母；本地 lingshu_test 快照为 0/0/0）；
+--   2) 裁定①的影响面：引用协议且内联 base_url / protocol 非空的渠道——迁移会**归档后清空**，
+--      这些渠道上线后的生效地址变成协议地址。需要独立地址的必须先显式新建协议再切引用；
+--   3) 协议也没配基址的渠道（迁移后会打空地址，高危，必须先处理）；
+--   4) 预估被标记 edited=true 的模型行数（首次同步的覆盖面）；
+--   5) 种子缺 costRates 但实例成本为空的行（B1 遗留，迁移后由协议调价自动补上）。
+--
+-- 用法：psql "$DSN" -f scripts/0019-preflight-audit.sql（建议只读账号 / 只读事务）
 
 \echo '=== 1) 存量计数（分母）==='
-SELECT 'channels' AS table_name, count(*) AS rows_live FROM channels WHERE deleted_at IS NULL
+SELECT 'channels' AS table_name, count(*) AS rows_all, count(*) FILTER (WHERE deleted_at IS NULL) AS rows_live FROM channels
 UNION ALL
-SELECT 'channel_protocols', count(*) FROM channel_protocols WHERE deleted_at IS NULL
+SELECT 'channel_protocols', count(*), count(*) FILTER (WHERE deleted_at IS NULL) FROM channel_protocols
 UNION ALL
-SELECT 'channel_models', count(*) FROM channel_models WHERE deleted_at IS NULL
+SELECT 'channel_models', count(*), count(*) FILTER (WHERE deleted_at IS NULL) FROM channel_models
 UNION ALL
-SELECT 'channel_keys', count(*) FROM channel_keys WHERE deleted_at IS NULL;
+SELECT 'channel_keys', count(*), count(*) FILTER (WHERE deleted_at IS NULL) FROM channel_keys;
 
-\echo '=== 2) 引用协议且内联 base_url 非空（上线后有效基址会变）==='
+\echo '=== 1b) 引用协议的渠道分布（按 channel_protocol_id 分组）==='
+SELECT coalesce(channel_protocol_id, 0) AS protocol_id, count(*) AS channels
+FROM channels WHERE deleted_at IS NULL
+GROUP BY 1 ORDER BY 2 DESC;
+
+\echo '=== 2) 裁定①影响面：引用协议 + 内联 base_url/protocol 非空（迁移会归档并清空，生效地址变协议地址）==='
 SELECT c.id,
        c.name,
-       c.base_url                              AS inline_base_url_ignored_after_0019,
-       cp.id                                   AS protocol_id,
-       cp.name                                 AS protocol_name,
-       cp.base_url                             AS protocol_base_url,
-       (cp.protocols -> 'openai-chat' ->> 'baseUrl') AS protocol_openai_chat_base_url
+       c.base_url                                        AS inline_base_url_to_be_archived,
+       c.protocol                                        AS inline_protocol_to_be_archived,
+       cp.id                                             AS protocol_id,
+       cp.name                                           AS protocol_name,
+       cp.base_url                                       AS protocol_base_url
 FROM channels c
 JOIN channel_protocols cp ON cp.id = c.channel_protocol_id AND cp.deleted_at IS NULL
 WHERE c.deleted_at IS NULL
-  AND btrim(c.base_url) <> ''
+  AND (btrim(c.base_url) <> '' OR btrim(c.protocol) <> '')
 ORDER BY c.id;
 
-\echo '=== 2b) 其中「协议也没配基址」的渠道（上线后会打空地址，必须先处理）==='
-SELECT c.id, c.name, c.base_url
+\echo '=== 2b) 高危：协议自身也没有基址（清空后无地址可打，必须先补协议或改回内联）==='
+SELECT c.id, c.name, c.base_url AS current_inline_base_url
 FROM channels c
 JOIN channel_protocols cp ON cp.id = c.channel_protocol_id AND cp.deleted_at IS NULL
 WHERE c.deleted_at IS NULL
-  AND btrim(c.base_url) <> ''
   AND btrim(cp.base_url) = ''
   AND COALESCE(btrim(cp.protocols -> 'openai-chat' ->> 'baseUrl'), '') = ''
 ORDER BY c.id;
 
-\echo '=== 3) 预估被标记 edited=true 的模型行（种子与实例双方都有值且不同）==='
+\echo '=== 3) 预估被标 edited=true 的模型行（种子定义了且双方都有值且不同）==='
 SELECT count(*) AS drift_rows_to_mark_edited
 FROM channel_models cm
 JOIN channels c ON c.id = cm.channel_id AND c.deleted_at IS NULL
@@ -54,7 +59,15 @@ WHERE cm.deleted_at IS NULL
   AND cp.models -> cm.internal_model_id ?| ARRAY[
         'externalModelID','protocols','costRates','timeConfig','contextTiers'];
 
-\echo '=== 4) 种子缺 costRates 但实例成本为空的行（B1 遗留，0019 后由协议调价自动补上）==='
+\echo '=== 3b) 协议里配了转换的模型数（裁定②：转换仍由协议独占，这里只做需求核对）==='
+SELECT count(*) AS protocols_with_convert
+FROM channel_protocols cp
+WHERE cp.deleted_at IS NULL
+  AND EXISTS (
+      SELECT 1 FROM jsonb_each(cp.models) AS m(key, value)
+      WHERE m.value ?| ARRAY['convertEnabled','convertTargets']);
+
+\echo '=== 4) 种子缺 costRates 但实例成本为空的行（B1 遗留，迁移后由协议调价自动补上）==='
 SELECT count(*) AS empty_cost_rows
 FROM channel_models cm
 JOIN channels c ON c.id = cm.channel_id AND c.deleted_at IS NULL
@@ -63,3 +76,10 @@ WHERE cm.deleted_at IS NULL
   AND cp.models ? cm.internal_model_id
   AND NOT (cp.models -> cm.internal_model_id ? 'costRates')
   AND (cm.cost_rates IS NULL OR cm.cost_rates = '{}'::jsonb);
+
+\echo '=== 5) 量级判断：>5 万行改用 scripts/backfill-0019（分批 + 断点 + 幂等）==='
+SELECT CASE WHEN count(*) > 50000
+            THEN '使用 scripts/backfill-0019（分批 5000 / 断点续跑）'
+            ELSE '直接跑迁移 0019（单语句幂等回填）' END AS recommended_path,
+       count(*) AS channel_models_live
+FROM channel_models WHERE deleted_at IS NULL;
