@@ -1,11 +1,11 @@
 # 渠道 / 渠道协议字段归属契约（唯一真源）
 
-> Status: **RULED-v3**（v2 之后按 Core 实现反馈补正：§6.1 补入「模型级协议子集下移」正式条款并修正漂移判定、新增 §6.4 上线前置预检、§10.2 标出「>5 万行路径无行使窗口」的实现缺口；四项裁定不变）
+> Status: **RULED-v4**（v3 之后补入 §6.1(b) 软删口径 S1~S3 + 「归档集合 ≡ 清空集合」不变量、§6.2 未归档渠道的还原路径、§6.4 预检 `2b)`/`2c)` 口径；四项裁定不变）
 > Date: 2026-11-10
 > Author: Ark（架构）
 > Scope: 契约与迁移口径。**不含实现代码**；Core / View 按本文落地。
 > 判据来源：`docs/preset-pack-format.md`（预设包格式，已冻结）、`docs/designs/2026-10-16-channel-protocol-gateway-fixes-design.md`（D1「引用协议自动物化」）。
-> 变更记录：v1 初稿 → v2（四项裁定落文、去掉渠道级基址覆盖与转换下沉）→ v3（本版，补正两处缺口 + 一处实现缺口）。
+> 变更记录：v1 初稿 → v2（四项裁定落文、去掉渠道级基址覆盖与转换下沉）→ v3（协议子集下移 + 上线预检 + >5 万路径缺口）→ v4（软删口径与回滚不变量）。
 
 ---
 
@@ -286,16 +286,22 @@ else 内联                        → { canonical(channels.protocol) }，非法
 ```sql
 -- (a) 加列 + 留档表（见 §4.1，幂等 IF NOT EXISTS）
 
--- (b) 存量：引用协议的渠道，原内联基址/协议类型先归档再清空（基址随协议，裁定 ①）
+-- (b) 存量：引用**生效中**协议的渠道，原内联基址/协议类型先归档再清空（基址随协议，裁定 ①）
+--     归档与清空必须用**完全相同的谓词**（见下方「集合相等」不变量）
 INSERT INTO channel_base_url_archive(channel_id, base_url, protocol)
-SELECT id, btrim(base_url), btrim(protocol) FROM channels
-WHERE deleted_at IS NULL AND channel_protocol_id IS NOT NULL
-  AND (btrim(base_url) <> '' OR btrim(protocol) <> '')
+SELECT c.id, btrim(c.base_url), btrim(c.protocol)
+FROM channels c
+JOIN channel_protocols cp ON cp.id = c.channel_protocol_id AND cp.deleted_at IS NULL
+WHERE c.deleted_at IS NULL
+  AND (btrim(c.base_url) <> '' OR btrim(c.protocol) <> '')
 ON CONFLICT (channel_id) DO NOTHING;
 
-UPDATE channels SET base_url = '', protocol = ''
-WHERE deleted_at IS NULL AND channel_protocol_id IS NOT NULL
-  AND (btrim(base_url) <> '' OR btrim(protocol) <> '');
+UPDATE channels c SET base_url = '', protocol = '', updated_at = now()
+FROM channel_protocols cp
+WHERE cp.id = c.channel_protocol_id
+  AND cp.deleted_at IS NULL
+  AND c.deleted_at IS NULL
+  AND (btrim(c.base_url) <> '' OR btrim(c.protocol) <> '');
 
 -- (c) 存量：种子里的「模型级协议子集」下移到实例（唯一运行时真源成立的前提）
 UPDATE channel_models cm
@@ -362,6 +368,18 @@ WHERE cm.channel_id = c.id AND cm.deleted_at IS NULL
   );
 ```
 
+#### (b) 的软删口径（三条，属契约）
+
+| # | 规则 | 理由 | 与裁定的关系 |
+|---|---|---|---|
+| S1 | 渠道引用的是**已软删协议**（`channel_protocols.deleted_at IS NOT NULL`）→ **保持原值，不清空、不归档** | 这不是"可恢复性"问题，是**正确性**问题：运行时 `lookupChannelProtocol`（`channel/manager.go:313-322`）用 `GetByID`（过滤 `deleted_at IS NULL`）解析协议，协议已软删 → `rt.Protocol == nil` → 网关回落读 `channels.base_url` / `channels.protocol`（`gateway/protocol.go:184/198`）。**这两个内联值此刻就是该渠道的生效配置**，清空等于把渠道打向空地址。 | 不与裁定 ① 冲突：裁定说的是「**引用协议**时基址随协议」；协议已不存在时渠道事实上处于内联态，适用内联规则。 |
+| S2 | **已软删渠道**（`channels.deleted_at IS NOT NULL`）→ 不产生留档、不处理 | 软删渠道不接流量，清空无收益；且它日后被恢复时还会带着原值。 | 与 R2（实例层）一致，无冲突。 |
+| S3 | 渠道**基址与协议均空** → 不产生留档 | 没有可归档的东西；写空行只会污染回滚集合。 | 无冲突。 |
+
+**不变量（回滚正确性的唯一依赖）**：`(b)` 的 `INSERT`（归档）与 `UPDATE`（清空）必须使用**逐字相同的谓词与连接**。由此得到 `归档集合 ≡ 清空集合`，于是「**未归档 ⇒ 未被改动**」，回滚才可能无损。这条要在测试里断言（见 §7.3）。
+
+> 更正记录：v3 草稿的 (b) 只写了 `channel_protocol_id IS NOT NULL`，没有 join 协议的 `deleted_at`，会把「引用已软删协议」的渠道一并清空——**按 S1 作废**，以 Core 实现（`b87e63d`）与本段为准。
+
 **(c) 是契约条款，不是实现方自行发明**，条款如下（Core 的 0019 与之一致）：
 
 | 项 | 口径 |
@@ -387,9 +405,11 @@ WHERE cm.channel_id = c.id AND cm.deleted_at IS NULL
 
 **v3 补正后复验（同一环境）**：§6.1(c)(d) 五条断言全过——实例 `protocols` 为 NULL → 下移写入种子值且不标 `edited`；实例有值且不同 → 不下移、标 `edited`；成本 `1` vs `1.0` → 不标；种子无 `costRates` → 不标；种子有 `timeConfig` 而实例 NULL → 不标。
 
+**v4 软删口径复验（同一环境，造 C1~C5 五类渠道）**：引用生效协议 + 非空值 → 归档并清空；引用**已软删协议** → 逐字不动且不进归档表；**已软删渠道** → 不归档、不清空；基址与协议均空 → 不归档；内联渠道 → 不动；**「被清空但未归档」的渠道数为 0**（集合相等）；回滚只还原归档过的渠道，S1 渠道不受影响。
+
 **Core 实现侧（PR #75 自测）**：迁移正反向、回填幂等（跑两遍逐行一致）、断点续跑（限批模拟中断后继续）均通过；四个裁定点各有用例。
 
-⚠ 由此确认一个实现细节：`channels.protocol` 有默认值 `'openai-compat'`，所以**归档表的行数 ≈ 引用协议的渠道数**（不止「基址非空」的那些）。这张表只做留档，体量等同渠道数，可忽略；`0020` 里凭 spencer 确认后清理即可。
+⚠ 由此确认一个实现细节：`channels.protocol` 有默认值 `'openai-compat'`，所以**归档表的行数 ≈ 引用「生效中」协议的渠道数**（不止「基址非空」的那些；引用已软删协议的渠道按 S1 不归档）。这张表只做留档，体量等同渠道数，可忽略；`0020` 里凭 spencer 确认后清理即可。
 
 Core 落地时把这段搬进 `db/migrate_test.go`（已有迁移测试骨架）。
 
@@ -414,12 +434,25 @@ DROP TABLE IF EXISTS channel_base_url_archive;
 **回滚后老代码仍可运行**：老二进制读 `channels` / `channel_models` 用的是显式列清单（`channelCols` `store.go:140`、`cmCols` `model_store.go:43`），多/少一个 `edited` 列不影响查询；基址与协议类型已按归档还原，行为等价于迁移前。**迁移有损点为零**（归档覆盖 `base_url` 与 `protocol` 两列）。
 **唯一"不回滚"的一项**：§6.1(c) 写进 `channel_models.protocols` 的值**不回滚**——它与旧解析链回落得到的值相同，回滚后行为逐项等价，留着无害（见 §6.1 下移条款「可回滚」行）。
 
+**未归档的渠道靠什么保证可还原**（按 §6.1 S1~S3 分三类，全部是「没被动过」，不需要还原）：
+
+| 类别 | 迁移期间发生了什么 | down 时的还原路径 | 风险 |
+|---|---|---|---|
+| 引用**已软删协议**的渠道（S1） | 什么都不做，`base_url`/`protocol` 原样保留 | **无需动作**（值从未被改）。回滚脚本是 `UPDATE channels … FROM channel_base_url_archive`，它不在归档表里 → 天然涉及不到 | 无 |
+| 已软删渠道（S2） | 不归档、不清空 | 无需动作 | 无 |
+| 基址与协议均空的渠道（S3） | 不归档（本来就没值） | 无需动作 | 无 |
+| 引用**生效中**协议、且内联值非空 | 归档 + 清空 | 归档表还原（脚本第 1 步） | 无（前提是 §6.1「集合相等」不变量成立） |
+
+> 由此，回滚的可还原性**不依赖任何外部备份**，只依赖一条不变量：**归档集合 ≡ 清空集合**。若将来有人只改其中一条语句的谓词（例如给 `UPDATE` 加了条件但忘了给 `INSERT` 加），回滚就会静默丢地址——所以 §7.3 把「两集合相等」列为 Gate 必测项。
+
 ### 6.3 老数据兼容与读写窗口
 
 | 场景 | 处理 |
 |---|---|
-| 引用协议 + `base_url` 非空（B2 存量） | 归档后清空；**生效基址改为协议基址**（裁定 ① 的直接后果，行为变更需在 PR 里列出受影响渠道清单） |
-| 引用协议 + `protocol` 非空（脏数据） | 清空（该值本来就不被读） |
+| 引用生效协议 + `base_url` 非空（B2 存量） | 归档后清空；**生效基址改为协议基址**（裁定 ① 的直接后果，行为变更需在 PR 里列出受影响渠道清单） |
+| 引用生效协议 + `protocol` 非空（脏数据） | 清空（该值本来就不被读） |
+| 引用**已软删协议** + 内联值非空 | **完全不动**（S1）：此时内联值就是生效配置，清了渠道就打空地址 |
+| 已软删渠道 / 基址协议全空 | 不归档、不处理（S2/S3） |
 | 内联渠道（未引用协议） | 完全不动 |
 | 实例行与种子不一致 | `edited=true`，**不再被同步覆盖**；需要恢复由新接口重置 |
 | 种子有模型级 `protocols`、实例为空 | 由 §6.1(c) 下移写入实例（值 = 旧解析链回落结果，回滚无需撤销） |
@@ -450,8 +483,9 @@ psql "$PROD_DSN" -v ON_ERROR_STOP=1 \
 |---|---|---|
 | `1) 存量计数` | 四张表的 `rows_all` / `rows_live` | 记下来，作为 §10 的分母；**若 `channel_models.rows_live > 50000` → 走 §10.2 的独立回填路径**，不要直接让迁移跑 |
 | `1b) 引用协议的渠道分布` | 每个协议被多少渠道引用 | 判断影响面集中度；单协议引用很多说明协议拆分成本高 |
-| `2) 裁定①影响面` | 引用协议**且**内联 `base_url`/`protocol` 非空的渠道清单（含 `inline_base_url_to_be_archived`、协议侧 `protocol_base_url`） | **非空就要逐条决策**（见下） |
-| `2b) 高危：协议自身无基址` | 清空后**没有可用地址**的渠道 | **阻断项**：必须先给协议补基址（或把渠道改回内联）。有任意一行都不允许跑迁移 |
+| `2) 裁定①影响面` | 引用**生效中**协议**且**内联 `base_url`/`protocol` 非空的渠道清单（含 `inline_base_url_to_be_archived`、协议侧 `protocol_base_url`） | **非空就要逐条决策**（见下）。口径已按 §6.1 S1 过滤 `cp.deleted_at IS NULL`：引用**已软删协议**的渠道**不会**出现在此段（它们保持原值，不需要处置） |
+| `2b) 高危：协议自身无基址` | 清空后**没有可用地址**的渠道 | **阻断项**：必须先给协议补基址（或把渠道改回内联）。有任意一行都不允许跑迁移。口径同样只看生效协议（`cp.deleted_at IS NULL`），软删协议渠道不计入——它们的内联值仍在生效，不受迁移影响 |
+| `2c) 引用已软删协议`（**待补**） | 引用了已删除协议、因此处于「内联兜底」状态的渠道 | **信息项，不阻断**：迁移不动它们。但这类渠道的协议已不存在，属于既有故障，需人工修复引用（重新激活/换协议，或确认改回内联） |
 | `3) 预估 edited 行数` | **候选行数上界**（种子定义了任一商业字段的行），不是「将标 `edited` 的确切行数」 | 只用来估首次同步覆盖面。要精确值就按 §6.1(d) 的 `WHERE` 条件跑 `select count(*)` |
 | `3b) 协议配了转换的模型数` | 裁定 ② 的现状核对 | 只做记录，不触发动作 |
 | `4) 空成本行` | 种子缺 `costRates` 且实例成本为空的行（B1 遗留） | 迁移后由协议调价自动补上；若 > 0，说明历史上这些模型**当前计费会报错**，需在上线后确认已恢复 |
@@ -472,6 +506,30 @@ psql "$PROD_DSN" -v ON_ERROR_STOP=1 \
 3. `channel_models.rows_live ≤ 50000`，或已改走 §10.2 的独立回填路径；
 4. 预检日志已留档（附在 PR 评论或运维记录里，**不含 DSN/口令**）。
 
+**预检脚本待改两处**（与 §6.1 S1 对齐；Core 改完后 `2b)` 的"必须 0 行"前提**不变**，只是集合更准）
+
+```sql
+-- 2c) 新增：引用「已软删协议」的渠道（信息项，不阻断；迁移不动它们，需人工修复引用）
+\echo '=== 2c) 引用已软删协议的渠道（保持内联兜底，迁移不动）==='
+SELECT c.id, c.name, c.channel_protocol_id,
+       btrim(c.base_url) AS inline_base_url, btrim(c.protocol) AS inline_protocol
+FROM channels c
+JOIN channel_protocols cp ON cp.id = c.channel_protocol_id AND cp.deleted_at IS NOT NULL
+WHERE c.deleted_at IS NULL
+ORDER BY c.id;
+
+-- 2b) 修正：判定「协议没有任何可用基址」要看全部协议键，不能只看 openai-chat
+--     （现写法会把「只给 anthropic-messages 配了 baseUrl」的协议误判为高危 → 假阳性阻断上线）
+WHERE c.deleted_at IS NULL
+  AND btrim(cp.base_url) = ''
+  AND NOT EXISTS (
+      SELECT 1 FROM jsonb_each(cp.protocols) e
+      WHERE btrim(COALESCE(e.value ->> 'baseUrl', '')) <> ''
+  )
+```
+
+`2b)` 的已知局限（可接受）：它是**粗筛**，只看协议是否一个基址都没有，不按该渠道实际可达协议逐项判定；更细的判定交给上线后的探测/联调，不放进上线阻断条件。
+
 **回滚触发**：只要发现「有渠道的请求打到了非预期地址」，按 §6.2 跑回滚脚本，归档表能把内联基址与协议类型原样还原。
 
 ---
@@ -488,7 +546,7 @@ psql "$PROD_DSN" -v ON_ERROR_STOP=1 \
 6. **出参**：`manager.go:190 ChannelView` + 两处构造（`manager.go:995`、`detail.go:96`）。
 7. **协议包**：`channelprotocol/source.go` 导入时丢弃 `models[m].baseUrl`（仍在 JSON 里容忍，不报错）。
 8. **回填路径（§10.2 缺口）**：按方案 A 给 0019 加阈值守卫；`scripts/backfill-0019` 补齐「协议子集下移」阶段，使三阶段（channels / protocols 下移 / drift 标记）与迁移内 DML 等价；启动时对未完成的 `backfill_checkpoints` 告警。
-9. **上线前置**：交付 `backend/scripts/0019-preflight-audit.sql`（已在 PR #75），口径见 §6.4；`3)` 的标题建议改成「候选行数（上界）」以免被读成精确值。
+9. **上线前置**：交付 `backend/scripts/0019-preflight-audit.sql`（已在 PR #75），口径见 §6.4；两处待改——① 补 `2c)`「引用已软删协议」清单（信息项）；② `2b)` 的基址判定改为 `NOT EXISTS (jsonb_each -> 'baseUrl' 非空)`，不再只看 `openai-chat`。`3)` 的标题建议改成「候选行数（上界）」以免被读成精确值。
 
 **必须保持的对外行为**（改坏了 Gate 会挂）：
 - `openai-compat` → `openai-chat` 归一（`channelprotocol/model.go:29`）继续生效。
@@ -532,6 +590,10 @@ psql "$PROD_DSN" -v ON_ERROR_STOP=1 \
    | 改 P 的 convertEnabled=false | 转换停用（仍读协议，`conversion.go`） |
    | `reset-from-protocol` | 该行恢复为种子值且 `edited=false` |
    | 种子有模型级 `protocols`、实例为空 | 迁移后实例值 = 种子值；**运行时可达协议集合与迁移前逐项相同**（下移生效） |
+   | 引用**已软删协议** + 内联值非空 | 迁移后 `base_url`/`protocol` **逐字不变**，且**不在** `channel_base_url_archive`（S1） |
+   | 已软删渠道 | 不产生留档行（S2） |
+   | 基址与协议均空的渠道 | 不产生留档行（S3） |
+   | 归档集合 ≡ 清空集合 | `select count(*) from channel_base_url_archive` 等于「本就该清空的渠道数」，且**不存在**「被清空但没归档」的渠道（回滚无损的唯一依赖） |
    | 种子有 `protocols`、实例有且不同 | 不下移、实例值不变、`edited=true`（冲突不覆盖） |
    | 种子有 `protocols`、实例为空但被先标 `edited` | **不允许发生**：断言 (c) 在 (d) 之前，且 (d) 的 `protocols` 分支要求实例非空 |
    | 成本 `1` vs 种子 `1.0` | 不标 `edited`（numeric 比较，裁定 ④） |
