@@ -103,6 +103,28 @@ docker compose down              # 停止（数据保留）
 docker compose down -v           # 停止并删除数据卷（含数据库与密钥，慎用）
 ```
 
+### 大表回填与迁移配套脚本
+
+迁移文件本身受「一个 `.sql` 只包一个事务」约束，无法分批/断点。数据量大的回填因此有独立入口
+（以 0019 渠道字段归属改造为例，脚本都在 `backend/scripts/`）：
+
+```bash
+# 1) 只读预检：存量计数 + 受影响清单 + 建议的回填路径（不写库）
+psql "$DSN" -f backend/scripts/0019-preflight-audit.sql
+
+# 2) 回填（>5 万行时用；≤5 万行由迁移内单语句完成，无需手工执行）
+cd backend && go run ./scripts/backfill-0019 -dsn "$DSN"            # 单批默认 5000 行
+cd backend && go run ./scripts/backfill-0019 -dsn "$DSN" -max-batches 2   # 限速/演练
+cd backend && go run ./scripts/backfill-0019 -dsn "$DSN" -reset     # 清断点后重跑（仅演练）
+
+# 3) 回滚某个迁移（手工执行，不放进 migrations/）
+psql "$DSN" -f backend/scripts/rollback-0019.sql
+```
+
+回填进度写在 `backfill_checkpoints(name, last_id)`：中断后重跑**自动续做**，重复执行**不会重复写**
+（语句幂等 + 归档表 `ON CONFLICT DO NOTHING`）。脚本与回滚的详细口径见
+`docs/designs/2026-11-10-channel-field-ownership-implementation.md`。
+
 ## 本地开发（裸机运行）
 
 1. **起数据库**：本机安装 PostgreSQL 后建库与用户，例如：

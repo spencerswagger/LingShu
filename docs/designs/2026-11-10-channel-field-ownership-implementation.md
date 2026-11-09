@@ -45,6 +45,14 @@
 但 §6.1 的 SQL 里没有这一步。不补的话，凡是「实例 protocols 为空、靠种子回落」的模型行会突然丢掉
 模型级协议子集（行为回退）。迁移 0019 用 (c) 段补上，只写「实例为空」的行。
 
+### 2.3 没有「渠道侧旧转换配置归并到协议」这一步，因为不存在渠道侧存储
+
+0019 之前，跨协议转换只存在于 `channel_protocols.models[m].convertEnabled/convertTargets`，
+`channel_models` 从来没有这两列（契约 §1.3 的盘点即如此）。因此裁定②落地时不需要
+「把渠道侧旧值归并回协议」——没有来源可归并，迁移也就不含该步骤；协议里的既有值原样保留、
+继续作运行时真源。将来若有人误加渠道侧转换列/字段，`TestChannelModelRequest_DropsChannelLevelConvertFields`
+会先失败。
+
 ---
 
 ## 3. 迁移 0019 与回滚
