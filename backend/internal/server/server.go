@@ -168,6 +168,7 @@ func (s *Server) routes() {
 	admin.HandleFunc("POST /api/v1/admin/channels/{id}/models/pull", d.Channel.HandlePullModels)
 	admin.HandleFunc("PUT /api/v1/admin/channels/{id}/models/{mid}", d.Channel.HandleUpdateChannelModel)
 	admin.HandleFunc("DELETE /api/v1/admin/channels/{id}/models/{mid}", d.Channel.HandleDeleteChannelModel)
+	admin.HandleFunc("POST /api/v1/admin/channels/{id}/models/{mid}/reset-from-protocol", d.Channel.HandleResetChannelModelFromProtocol)
 	admin.HandleFunc("POST /api/v1/admin/channels/{id}/models/{mid}/probe", d.Channel.HandleProbeModel)
 
 	// tags

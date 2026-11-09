@@ -17,9 +17,19 @@ import (
 	"github.com/team/llmgateway/internal/pkg/idgen"
 )
 
-// effectiveProtocolBaseURL 求渠道某基础协议的有效上游基址：渠道级 base_url 优先，
-// 回落所引用渠道协议（协议级 baseUrl 优先，再回落协议级 base_url）。仅引用协议时渠道内联 base_url 可为空。
+// effectiveProtocolBaseURL 求渠道某基础协议的有效上游基址。
+//
+// 归属（0019 契约 + 拍板「引用协议不覆盖基址」）：
+//   - 引用渠道协议（channel_protocol_id 非空）→ 基址**只**跟随协议（协议级 baseUrl 优先，回落协议 base_url）；
+//     channels.base_url 是历史遗留值，运行时一律忽略（否则「改协议 baseURL 不生效」的老缺陷会重现）；
+//   - 内联渠道 → channels.base_url。
 func effectiveProtocolBaseURL(rt *RuntimeChannel, protocol string) string {
+	if rt == nil {
+		return ""
+	}
+	if rt.Channel.ChannelProtocolID != nil && *rt.Channel.ChannelProtocolID > 0 {
+		return rt.Protocol.EffectiveBaseURL(protocol)
+	}
 	if s := strings.TrimSpace(rt.Channel.BaseURL); s != "" {
 		return s
 	}
@@ -27,6 +37,18 @@ func effectiveProtocolBaseURL(rt *RuntimeChannel, protocol string) string {
 		return rt.Protocol.EffectiveBaseURL(protocol)
 	}
 	return ""
+}
+
+// effectiveChannelBaseURL 返回渠道视图用的「最终生效基址」（展示口径，与转发/探测同一解析链）。
+func effectiveChannelBaseURL(rt *RuntimeChannel) string {
+	if rt == nil {
+		return ""
+	}
+	protocol := channelprotocol.ProtocolOpenAIChat
+	if rt.Protocol != nil {
+		protocol = rt.Protocol.PreferredProtocol()
+	}
+	return effectiveProtocolBaseURL(rt, protocol)
 }
 
 // effectiveProtocolPath 求某基础协议的有效端点路径：渠道协议 path 覆盖优先，回落内置默认。

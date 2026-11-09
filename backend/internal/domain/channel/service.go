@@ -94,8 +94,12 @@ func (s *Service) SetTagResolver(r TagResolver) { s.tagResolver = r }
 // SetChannelProtocolStore 注入渠道协议存储：引用渠道协议时校验其存在。
 func (s *Service) SetChannelProtocolStore(c *channelprotocol.Store) { s.cpStore = c }
 
-// validateBase 校验渠道基础约束：名称必填；引用渠道协议时 base_url/protocol 可省略，
+// validateBase 校验渠道基础约束：名称必填；引用渠道协议时 base_url/protocol 必须为空，
 // 未引用时要求内联 base_url + 基础协议。
+//
+// 基址归属（0019 契约 + 拍板）：**引用协议不覆盖基址**——基址只跟随被引用协议，
+// 需要独立地址就显式新建一条协议。因此引用协议时提交非空 BaseURL 一律 400
+// （宁可拦住，不要静默丢弃让人事后猜）。
 func (s *Service) validateBase(in ChannelInput) error {
 	if in.Name == "" {
 		return errBadRequest("渠道名称不能为空")
@@ -106,6 +110,9 @@ func (s *Service) validateBase(in ChannelInput) error {
 		}
 	}
 	if in.ChannelProtocolID != nil && *in.ChannelProtocolID > 0 {
+		if strings.TrimSpace(in.BaseURL) != "" {
+			return errBadRequest("引用渠道协议时不允许设置内联 BaseURL：基址跟随被引用协议，需要独立地址请新建一条协议")
+		}
 		if s.cpStore != nil {
 			if _, err := s.cpStore.GetByID(context.Background(), *in.ChannelProtocolID); err != nil {
 				if errors.Is(err, sql.ErrNoRows) {
@@ -221,11 +228,18 @@ func (s *Service) UpdateChannel(ctx context.Context, id int64, in ChannelInput) 
 		resolved = r
 	}
 
+	// 基址归属（0019）：引用协议时基址只跟随协议，channels.base_url 是**历史遗留只读值**。
+	// 更新时保留原值不覆盖——运行时已忽略它，保留是为了「回滚老二进制即恢复原地址」，
+	// 不制造不可逆的数据丢失（清理/迁移由运维按 scripts/0019-preflight-audit.sql 处理）。
+	baseURL := in.BaseURL
+	if in.ChannelProtocolID != nil && *in.ChannelProtocolID > 0 {
+		baseURL = existing.BaseURL
+	}
 	c := &Channel{
 		ID:                id,
 		Name:              in.Name,
 		Protocol:          in.Protocol,
-		BaseURL:           in.BaseURL,
+		BaseURL:           baseURL,
 		ChannelProtocolID: in.ChannelProtocolID,
 		Tags:              existing.Tags, // tags 列保持不变，不再从 input 设置
 		CreatedAt:         existing.CreatedAt,
@@ -353,9 +367,27 @@ func (s *Service) materializeForChannel(ctx context.Context, channelID int64, pr
 	_, _ = s.materializeFromProtocol(ctx, channelID, cp)
 }
 
-// materializeFromProtocol 按协议模型清单物化/更新该渠道的 channel_models：
-// 仅处理 externalModelID>0 的行；按 (channel_id, internal_model_id) upsert，保留既有 State 与
-// 运行参数（rate_limit/health_probe/reliability），不删除协议未列出的渠道模型。返回写入行数。
+// seedFromGateway 把协议种子（channel_protocols.models[m]）转成「只含种子定义了的键」的物化补丁。
+// 关键点：种子里没有的键在这里保持 nil/空，物化时不写该列（保留实例现值）——B1 的修法。
+func seedFromGateway(mg channelprotocol.ModelGateway) channelModelSeed {
+	return channelModelSeed{
+		ExternalModelID: mg.ExternalModelID,
+		CostRates:       billing.Rates(mg.CostRates),
+		TimeConfig:      mg.TimeConfig,
+		ContextTiers:    mg.ContextTiers,
+		Protocols:       mg.Protocols,
+		ConvertEnabled:  mg.ConvertEnabled,
+		ConvertTargets:  mg.ConvertTargets,
+	}
+}
+
+// materializeFromProtocol 按协议模型清单物化/更新该渠道的 channel_models（契约 §5.4）：
+//   - 仅处理 externalModelID>0 的行；按 (channel_id, internal_model_id) upsert；
+//   - 种子缺省的键不写（保留实例现值）——不会再把 cost_rates 写成 JSON null；
+//   - edited=true 的行不写商业字段（物化守卫），但转换配置照常刷新（按拍板：转换按协议定义）；
+//   - 永不覆盖 state / rate_limit / health_probe / reliability，永不删除协议未列出的行。
+//
+// 返回实际处理的行数。
 func (s *Service) materializeFromProtocol(ctx context.Context, channelID int64, cp *channelprotocol.ChannelProtocol) (int, error) {
 	if cp == nil || s.cmStore == nil || len(cp.Models) == 0 {
 		return 0, nil
@@ -372,32 +404,32 @@ func (s *Service) materializeFromProtocol(ctx context.Context, channelID int64, 
 		if mg.ExternalModelID <= 0 {
 			continue // 未绑定对外模型的行不物化（D5：channel_models.external_model_id NOT NULL）
 		}
-		m := &ChannelModel{
-			ChannelID:       channelID,
-			InternalModelID: internalID,
-			ExternalModelID: mg.ExternalModelID,
-			CostRates:       billing.Rates(mg.CostRates),
-			TimeConfig:      mg.TimeConfig,
-			ContextTiers:    mg.ContextTiers,
-			Protocols:       mg.Protocols,
-		}
+		seed := seedFromGateway(mg)
 		existing, err := s.cmStore.GetByChannelAndInternal(ctx, channelID, internalID)
 		switch {
 		case err == nil:
-			m.ID = existing.ID
-			m.State = existing.State // 保留渠道侧状态（状态机为权威）
-			m.RateLimit = existing.RateLimit
-			m.HealthProbe = existing.HealthProbe
-			m.Reliability = existing.Reliability
-			if uerr := s.cmStore.Update(ctx, m); uerr != nil {
+			cols := seed.commercial()
+			if existing.ExternalModelID != seed.ExternalModelID {
+				cols = append(cols, seedColumn{"external_model_id", seed.ExternalModelID})
+			}
+			if existing.Edited {
+				// 守卫：本地编辑过的行商业字段保持不动。
+				cols = nil
+			}
+			if uerr := s.cmStore.updateSeedColumns(ctx, existing.ID, cols); uerr != nil {
 				return n, fmt.Errorf("update channel model %q: %w", internalID, uerr)
 			}
-			if fresh, ferr := s.cmStore.GetByID(ctx, m.ID); ferr == nil && s.mgr != nil {
+			if existing.Edited {
+				// 转换配置是协议定义（渠道层无差异化写入），edited 行也要跟随协议。
+				if uerr := s.cmStore.UpdateSeedConvert(ctx, existing.ID, seed); uerr != nil {
+					return n, fmt.Errorf("update channel model convert %q: %w", internalID, uerr)
+				}
+			}
+			if fresh, ferr := s.cmStore.GetByID(ctx, existing.ID); ferr == nil && s.mgr != nil {
 				s.mgr.UpsertModel(fresh)
 			}
 		case errors.Is(err, sql.ErrNoRows):
-			m.State = StateNormal
-			created, cerr := s.cmStore.Insert(ctx, m)
+			created, cerr := s.cmStore.InsertFromSeed(ctx, channelID, internalID, seed)
 			if cerr != nil {
 				return n, fmt.Errorf("insert channel model %q: %w", internalID, cerr)
 			}
@@ -435,6 +467,66 @@ func (s *Service) RematerializeProtocol(ctx context.Context, protocolID int64) e
 		}
 	}
 	return nil
+}
+
+// ResetModelFromProtocol 把某条渠道模型行恢复为协议种子值，并清除 edited 标记。
+// 这是物化守卫（edited=true 后协议同步不再覆盖）的**唯一出口**，避免「标记后再也同步不了」。
+// 种子未定义的键保持现值（无从恢复），转换配置也按协议刷新。
+func (s *Service) ResetModelFromProtocol(ctx context.Context, channelID, mid int64) (*ChannelModel, error) {
+	if s.cmStore == nil {
+		return nil, errInternal()
+	}
+	m, err := s.cmStore.GetByID(ctx, mid)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, errNotFound("渠道内部模型不存在")
+		}
+		return nil, fmt.Errorf("get channel model: %w", err)
+	}
+	if m.ChannelID != channelID {
+		return nil, errBadRequest("内部模型不属于该渠道")
+	}
+	ch, err := s.store.Get(ctx, channelID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, errNotFound("渠道不存在")
+		}
+		return nil, fmt.Errorf("get channel: %w", err)
+	}
+	if ch.ChannelProtocolID == nil || *ch.ChannelProtocolID <= 0 {
+		return nil, errBadRequest("该渠道未引用渠道协议，没有可重置的协议值")
+	}
+	if s.cpStore == nil {
+		return nil, errInternal()
+	}
+	cp, err := s.cpStore.GetByID(ctx, *ch.ChannelProtocolID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, errBadRequest("渠道引用的协议已不存在，无法重置")
+		}
+		return nil, fmt.Errorf("get channel protocol: %w", err)
+	}
+	mg, ok := cp.Models[m.InternalModelID]
+	if !ok || mg.ExternalModelID <= 0 {
+		return nil, errBadRequest("协议中不存在该内部模型的配置，无法重置")
+	}
+	seed := seedFromGateway(mg)
+	cols := seed.commercial()
+	cols = append(cols, seedColumn{"external_model_id", mg.ExternalModelID})
+	if err := s.cmStore.updateSeedColumns(ctx, mid, cols); err != nil {
+		return nil, classifyCMServiceErr(err)
+	}
+	if err := s.cmStore.SetEdited(ctx, mid, false); err != nil {
+		return nil, classifyCMServiceErr(err)
+	}
+	fresh, err := s.cmStore.GetByID(ctx, mid)
+	if err != nil {
+		return nil, err
+	}
+	if s.mgr != nil {
+		s.mgr.UpsertModel(fresh)
+	}
+	return fresh, nil
 }
 
 // ModelForceState 手动设置内部模型状态（normal/drain/disable），写模型事件。

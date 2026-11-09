@@ -180,19 +180,22 @@ type ModelRuntime struct {
 // ChannelView 是 API 输出结构：附 LastErr/探测时间及有效配置（凭据已收敛到 channel_keys）。
 // 渠道无独立状态，逐密钥状态经 Channel.KeyStates 输出。
 type ChannelView struct {
-	ID          int64             `json:"ID,string"`
-	Name        string            `json:"Name"`
-	Protocol    string            `json:"Protocol"`
-	BaseURL     string            `json:"BaseURL"`
-	Tags        map[string]string `json:"Tags"`
-	BoundTags   []TagRef          `json:"BoundTags"`
-	Priority    int               `json:"Priority"`
-	LastErr     string            `json:"LastErr,omitempty"`
-	LastProbe   *time.Time        `json:"LastProbe,omitempty"`
-	RateLimit   RateLimitConfig   `json:"RateLimit"`
-	HealthProbe HealthProbeConfig `json:"HealthProbe"`
-	Reliability ReliabilityConfig `json:"Reliability"`
-	MaxSessions int               `json:"MaxSessions"`
+	ID       int64  `json:"ID,string"`
+	Name     string `json:"Name"`
+	Protocol string `json:"Protocol"`
+	BaseURL  string `json:"BaseURL"`
+	// BaseURLEffective 只读派生：最终生效的上游基址（引用协议时跟随协议，内联时等于 BaseURL）。
+	// 引用协议时 BaseURL 是历史遗留值（运行时忽略），展示请用本字段。
+	BaseURLEffective string            `json:"BaseURLEffective"`
+	Tags             map[string]string `json:"Tags"`
+	BoundTags        []TagRef          `json:"BoundTags"`
+	Priority         int               `json:"Priority"`
+	LastErr          string            `json:"LastErr,omitempty"`
+	LastProbe        *time.Time        `json:"LastProbe,omitempty"`
+	RateLimit        RateLimitConfig   `json:"RateLimit"`
+	HealthProbe      HealthProbeConfig `json:"HealthProbe"`
+	Reliability      ReliabilityConfig `json:"Reliability"`
+	MaxSessions      int               `json:"MaxSessions"`
 	// ChannelProtocolID 引用的渠道协议 ID（nil=内联配置）；雪花 ID 序列化为字符串。
 	ChannelProtocolID *int64    `json:"ChannelProtocolID,string,omitempty"`
 	CreatedAt         time.Time `json:"CreatedAt"`
@@ -993,19 +996,20 @@ func (m *Manager) Snapshot() []ChannelView {
 		btCp := make([]TagRef, len(srcRefs))
 		copy(btCp, srcRefs)
 		views = append(views, ChannelView{
-			ID:          c.ID,
-			Name:        c.Name,
-			Protocol:    c.Protocol,
-			BaseURL:     c.BaseURL,
-			Tags:        c.Tags,
-			BoundTags:   btCp,
-			Priority:    c.Priority,
-			LastErr:     rt.LastErr,
-			LastProbe:   lp,
-			RateLimit:   rl,
-			HealthProbe: normalizeHealthProbe(c.HealthProbe),
-			Reliability: normalizeReliability(c.Reliability),
-			MaxSessions: rl.MaxConcurrent,
+			ID:               c.ID,
+			Name:             c.Name,
+			Protocol:         c.Protocol,
+			BaseURL:          c.BaseURL,
+			BaseURLEffective: effectiveChannelBaseURL(rt),
+			Tags:             c.Tags,
+			BoundTags:        btCp,
+			Priority:         c.Priority,
+			LastErr:          rt.LastErr,
+			LastProbe:        lp,
+			RateLimit:        rl,
+			HealthProbe:      normalizeHealthProbe(c.HealthProbe),
+			Reliability:      normalizeReliability(c.Reliability),
+			MaxSessions:      rl.MaxConcurrent,
 			// ChannelProtocolID: 引用渠道协议 ID（渠道列表展示来源协议用）。
 			ChannelProtocolID: c.ChannelProtocolID,
 			CreatedAt:         c.CreatedAt,

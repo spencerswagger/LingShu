@@ -28,6 +28,12 @@ func TestResolveUpstreamProtocol(t *testing.T) {
 	mr := func() *channel.ModelRuntime {
 		return &channel.ModelRuntime{Model: channel.ChannelModel{InternalModelID: internalID}}
 	}
+	// mrWith 在模型行上叠加实例列覆盖（convert_enabled / convert_targets 是唯一运行时读点）。
+	mrWith := func(mod func(*channel.ChannelModel)) *channel.ModelRuntime {
+		m := &channel.ChannelModel{InternalModelID: internalID}
+		mod(m)
+		return &channel.ModelRuntime{Model: *m}
+	}
 	convDisabled := false
 
 	tests := []struct {
@@ -69,17 +75,15 @@ func TestResolveUpstreamProtocol(t *testing.T) {
 			wantOK:        true,
 		},
 		{
-			name: "per-model disabled",
+			// 0019：转换开关读实例列（协议种子的物化副本），不再回落读协议 Models。
+			name: "model row disabled",
 			gw:   NewGateway(GatewayConfig{}),
 			rt: rtWith(&channelprotocol.ChannelProtocol{
 				Protocols: channelprotocol.Protocols{
 					channelprotocol.ProtocolAnthropicMessages: {},
 				},
-				Models: map[string]channelprotocol.ModelGateway{
-					internalID: {ConvertEnabled: &convDisabled},
-				},
 			}),
-			mr:            mr(),
+			mr:            mrWith(func(m *channel.ChannelModel) { m.ConvertEnabled = &convDisabled }),
 			baseProtocol:  channelprotocol.ProtocolOpenAIChat,
 			endpoint:      EndpointChatCompletions,
 			wantUpstream:  "",
@@ -100,18 +104,17 @@ func TestResolveUpstreamProtocol(t *testing.T) {
 			wantOK:        false,
 		},
 		{
-			name: "override target order",
+			name: "model row target order",
 			gw:   NewGateway(GatewayConfig{}),
 			rt: rtWith(&channelprotocol.ChannelProtocol{
 				Protocols: channelprotocol.Protocols{
 					channelprotocol.ProtocolOpenAIChat:      {},
 					channelprotocol.ProtocolOpenAIResponses: {},
 				},
-				Models: map[string]channelprotocol.ModelGateway{
-					internalID: {ConvertTargets: []string{channelprotocol.ProtocolOpenAIResponses}},
-				},
 			}),
-			mr:            mr(),
+			mr: mrWith(func(m *channel.ChannelModel) {
+				m.ConvertTargets = []string{channelprotocol.ProtocolOpenAIResponses}
+			}),
 			baseProtocol:  channelprotocol.ProtocolAnthropicMessages,
 			endpoint:      EndpointMessages,
 			wantUpstream:  channelprotocol.ProtocolOpenAIResponses,

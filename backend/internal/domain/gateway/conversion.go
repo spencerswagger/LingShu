@@ -50,14 +50,13 @@ func (g *Gateway) resolveUpstreamProtocol(rt *channel.RuntimeChannel, mr *channe
 	if !g.conversionEnabled() {
 		return "", false, false
 	}
-	var targets []string
-	if rt.Protocol != nil {
-		enabled, t := rt.Protocol.EffectiveModelConvert(mr.Model.InternalModelID)
-		if enabled != nil && !*enabled {
-			return "", false, false
-		}
-		targets = t
+	// 转换配置读**实例列**（channel_models.convert_enabled / convert_targets，唯一运行时真源）。
+	// 这两列是协议种子的物化副本：按拍板「转换按协议定义、不按渠道差异化」，渠道层不提供
+	// 差异化写入，物化时不受 edited 守卫冻结。enabled=nil 表示继承全局开关。
+	if en := mr.Model.ConvertEnabled; en != nil && !*en {
+		return "", false, false
 	}
+	targets := mr.Model.ConvertTargets
 	supported := make([]string, 0, len(eff))
 	for name := range eff {
 		supported = append(supported, name)

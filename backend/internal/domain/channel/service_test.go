@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/team/llmgateway/internal/domain/billing"
 	"github.com/team/llmgateway/internal/domain/channelprotocol"
 	"github.com/team/llmgateway/internal/pkg/resp"
 )
@@ -338,7 +339,8 @@ func TestStore_ListByProtocol(t *testing.T) {
 	}
 }
 
-// RematerializeProtocol：仅物化 externalModelID>0 的行；已存在的按 (channel,internal) upsert 并保留 State。
+// RematerializeProtocol（0019 口径）：只物化 externalModelID>0 的行；已存在且种子没带该行任何
+// 可写列时不发 UPDATE（既避免 updated_at 抖动，也避免把缺省键写成 null —— B1 的修法）。
 func TestService_RematerializeProtocol_InsertsAndPreservesState(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
@@ -359,16 +361,121 @@ func TestService_RematerializeProtocol_InsertsAndPreservesState(t *testing.T) {
 		WillReturnRows(channelRow(&Channel{ID: 1, Name: "c", Protocol: "openai-chat", ChannelProtocolID: &pid, Priority: 100, CreatedAt: now, UpdatedAt: now}))
 
 	cmGetRe := `(?s)SELECT .* FROM channel_models WHERE channel_id=\$1 AND internal_model_id=\$2 AND deleted_at IS NULL ORDER BY id ASC LIMIT 1`
-	// qwen-max：不存在 → Insert（NORMAL）。
+	// qwen-max：不存在 → 按种子插入（状态 NORMAL，edited=false 由库默认）。
 	mock.ExpectQuery(cmGetRe).WithArgs(int64(1), "qwen-max").WillReturnError(sql.ErrNoRows)
-	mock.ExpectQuery(`INSERT INTO channel_models`).
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO channel_models(id, channel_id, internal_model_id, external_model_id, state, cost_rates, protocols) VALUES($1, $2, $3, $4, $5, $6, $7) RETURNING ` + cmCols)).
 		WillReturnRows(cmRow(&ChannelModel{ID: 100, ChannelID: 1, InternalModelID: "qwen-max", ExternalModelID: 2, State: StateNormal, CreatedAt: now, UpdatedAt: now}, `{}`))
-	// qwen-plus：已存在（DRAIN）→ Update 且 state 仍为 DRAIN。
+	// qwen-plus：已存在（DRAIN），但种子只给了 externalModelID（与现值一致）→ 没有可写列，不发 UPDATE。
+	// 状态仍由既有行持有（物化从不改 state）。
 	mock.ExpectQuery(cmGetRe).WithArgs(int64(1), "qwen-plus").
 		WillReturnRows(cmRow(&ChannelModel{ID: 9, ChannelID: 1, InternalModelID: "qwen-plus", ExternalModelID: 5, State: StateDrain, CreatedAt: now, UpdatedAt: now}, `{}`))
-	mock.ExpectExec(`UPDATE channel_models SET`).
-		WithArgs("qwen-plus", int64(5), sqlmock.AnyArg(), nil, nil, nil, "DRAIN", sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), int64(9)).
+
+	if err := svc.RematerializeProtocol(context.Background(), pid); err != nil {
+		t.Fatalf("rematerialize: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("expectations: %v", err)
+	}
+}
+
+// B1 回归（更新侧）：种子缺 costRates 时，已存在行的 cost_rates 不得被覆盖成 null。
+// 用「SQL 里根本不出现 cost_rates」当断言——这正是缺陷的成因（旧实现无条件全量写）。
+func TestService_Materialize_SeedWithoutCostRatesKeepsExistingCost(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+	svc := NewService(NewStore(db))
+	svc.SetChannelModelStore(NewChannelModelStore(db))
+	svc.SetChannelProtocolStore(channelprotocol.NewStore(db))
+	now := time.Now()
+	pid := int64(7)
+
+	modelsJSON := `{"qwen-max":{"externalModelID":"2","protocols":{"openai-chat":{}}}}`
+	mock.ExpectQuery(cpByIdRe).WithArgs(pid).WillReturnRows(cpProtoRow(7, "https://x.example.com", modelsJSON))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + channelCols + ` FROM channels WHERE channel_protocol_id = $1 AND deleted_at IS NULL ORDER BY id ASC`)).
+		WithArgs(pid).
+		WillReturnRows(channelRow(&Channel{ID: 1, Name: "c", Protocol: "openai-chat", ChannelProtocolID: &pid, Priority: 100, CreatedAt: now, UpdatedAt: now}))
+	mock.ExpectQuery(`(?s)SELECT .* FROM channel_models WHERE channel_id=\$1 AND internal_model_id=\$2 AND deleted_at IS NULL ORDER BY id ASC LIMIT 1`).
+		WithArgs(int64(1), "qwen-max").
+		WillReturnRows(cmRow(&ChannelModel{ID: 100, ChannelID: 1, InternalModelID: "qwen-max", ExternalModelID: 2,
+			CostRates: billing.Rates{"input": 1, "output": 2, "cache_read": 0.1}, State: StateNormal, CreatedAt: now, UpdatedAt: now}, `{"input":1,"output":2,"cache_read":0.1}`))
+	// 只有 protocols 被写；cost_rates 不出现。
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE channel_models SET protocols=$1, updated_at=now() WHERE id=$2`)).
+		WithArgs(sqlmock.AnyArg(), int64(100)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := svc.RematerializeProtocol(context.Background(), pid); err != nil {
+		t.Fatalf("rematerialize: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("expectations: %v", err)
+	}
+}
+
+// 物化守卫（R6）+ 拍板②：edited=true 的行商业字段不再被种子覆盖，
+// 但转换配置按协议定义照常刷新（渠道层没有差异化写入路径）。
+func TestService_Materialize_EditedRowSkipsCommercialButSyncsConvert(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+	svc := NewService(NewStore(db))
+	svc.SetChannelModelStore(NewChannelModelStore(db))
+	svc.SetChannelProtocolStore(channelprotocol.NewStore(db))
+	now := time.Now()
+	pid := int64(7)
+
+	modelsJSON := `{"qwen-max":{"externalModelID":"2","costRates":{"Input":9,"Output":9,"CacheRead":9},` +
+		`"convertEnabled":false,"convertTargets":["openai-responses"]}}`
+	mock.ExpectQuery(cpByIdRe).WithArgs(pid).WillReturnRows(cpProtoRow(7, "https://x.example.com", modelsJSON))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + channelCols + ` FROM channels WHERE channel_protocol_id = $1 AND deleted_at IS NULL ORDER BY id ASC`)).
+		WithArgs(pid).
+		WillReturnRows(channelRow(&Channel{ID: 1, Name: "c", Protocol: "openai-chat", ChannelProtocolID: &pid, Priority: 100, CreatedAt: now, UpdatedAt: now}))
+	mock.ExpectQuery(`(?s)SELECT .* FROM channel_models WHERE channel_id=\$1 AND internal_model_id=\$2 AND deleted_at IS NULL ORDER BY id ASC LIMIT 1`).
+		WithArgs(int64(1), "qwen-max").
+		WillReturnRows(cmRow(&ChannelModel{ID: 100, ChannelID: 1, InternalModelID: "qwen-max", ExternalModelID: 2,
+			CostRates: billing.Rates{"input": 1, "output": 2, "cache_read": 0.1}, Edited: true,
+			State: StateNormal, CreatedAt: now, UpdatedAt: now}, `{"input":1,"output":2,"cache_read":0.1}`))
+	// 只刷新转换两列（成本保持本地值）。
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE channel_models SET convert_enabled=$1, convert_targets=$2, updated_at=now() WHERE id=$3`)).
+		WithArgs(false, sqlmock.AnyArg(), int64(100)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	if err := svc.RematerializeProtocol(context.Background(), pid); err != nil {
+		t.Fatalf("rematerialize: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("expectations: %v", err)
+	}
+}
+
+// B1 回归（插入侧）：种子缺 costRates 的新行，INSERT 不得写 cost_rates 列（落库取默认价，而非 JSON null）。
+func TestService_Materialize_InsertWithoutSeedCostOmitsColumn(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+	svc := NewService(NewStore(db))
+	svc.SetChannelModelStore(NewChannelModelStore(db))
+	svc.SetChannelProtocolStore(channelprotocol.NewStore(db))
+	now := time.Now()
+	pid := int64(7)
+
+	modelsJSON := `{"qwen-max":{"externalModelID":"2"}}`
+	mock.ExpectQuery(cpByIdRe).WithArgs(pid).WillReturnRows(cpProtoRow(7, "https://x.example.com", modelsJSON))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + channelCols + ` FROM channels WHERE channel_protocol_id = $1 AND deleted_at IS NULL ORDER BY id ASC`)).
+		WithArgs(pid).
+		WillReturnRows(channelRow(&Channel{ID: 1, Name: "c", Protocol: "openai-chat", ChannelProtocolID: &pid, Priority: 100, CreatedAt: now, UpdatedAt: now}))
+	mock.ExpectQuery(`(?s)SELECT .* FROM channel_models WHERE channel_id=\$1 AND internal_model_id=\$2 AND deleted_at IS NULL ORDER BY id ASC LIMIT 1`).
+		WithArgs(int64(1), "qwen-max").WillReturnError(sql.ErrNoRows)
+	// 列清单里没有 cost_rates —— 严格匹配，写进去就会失败。
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO channel_models(id, channel_id, internal_model_id, external_model_id, state) VALUES($1, $2, $3, $4, $5) RETURNING `+cmCols)).
+		WithArgs(sqlmock.AnyArg(), int64(1), "qwen-max", int64(2), string(StateNormal)).
+		WillReturnRows(cmRow(&ChannelModel{ID: 100, ChannelID: 1, InternalModelID: "qwen-max", ExternalModelID: 2, State: StateNormal, CreatedAt: now, UpdatedAt: now}, `{"input":0.8,"output":1.6,"cache_read":0.05}`))
 
 	if err := svc.RematerializeProtocol(context.Background(), pid); err != nil {
 		t.Fatalf("rematerialize: %v", err)

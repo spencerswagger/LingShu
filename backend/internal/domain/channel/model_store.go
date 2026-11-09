@@ -27,8 +27,16 @@ type ChannelModel struct {
 	CostRates       billing.Rates
 	TimeConfig      *billing.TimeCoeffConfig
 	ContextTiers    []billing.TierRule
-	// Protocols 模型级可达协议子集：非空时收窄该模型可用的上游协议（覆盖渠道协议中同模型定义）。
-	Protocols    channelprotocol.Protocols
+	// Protocols 模型级可达协议子集：非空时收窄该模型可用的上游协议。
+	// 0019 起这是唯一运行时读点（不再回落 channel_protocols.models[m].protocols 种子）。
+	Protocols channelprotocol.Protocols
+	// ConvertEnabled 是否允许跨协议转换；nil=继承全局开关。
+	// 0019 起为协议种子的物化副本：按「转换按协议定义、不按渠道差异化」，渠道层不提供差异化写入。
+	ConvertEnabled *bool
+	// ConvertTargets 转换目标协议偏好顺序（空=按默认偏好）。
+	ConvertTargets []string
+	// Edited 商业字段是否被本地编辑过；true 时协议同步不再覆盖该行（reset-from-protocol 置回 false）。
+	Edited       bool
 	State        State
 	RateLimit    RateLimitConfig
 	HealthProbe  HealthProbeConfig
@@ -40,19 +48,31 @@ type ChannelModel struct {
 }
 
 // cmCols 列出 channel_models 表查询使用的列。
+// 注意：插入/更新语句与三个扫描器必须与之一致（漏一处会静默丢字段）。
 const cmCols = `id, channel_id, internal_model_id, external_model_id, cost_rates,
-	time_config, context_tiers, protocols, state, rate_limit, health_probe, reliability, created_at, updated_at`
+	time_config, context_tiers, protocols, state, rate_limit, health_probe, reliability, created_at, updated_at,
+	convert_enabled, convert_targets, edited`
 
 // scanChannelModel 将一行扫描到 *ChannelModel，解析 JSONB 列。
 func scanChannelModel(row interface{ Scan(...any) error }) (*ChannelModel, error) {
 	var m ChannelModel
-	var costRaw, timeRaw, tiersRaw, protocolsRaw, rlRaw, hpRaw, relRaw []byte
+	var costRaw, timeRaw, tiersRaw, protocolsRaw, rlRaw, hpRaw, relRaw, convertTargetsRaw []byte
 	var state string
+	var convertEnabled sql.NullBool
 	err := row.Scan(&m.ID, &m.ChannelID, &m.InternalModelID, &m.ExternalModelID,
 		&costRaw, &timeRaw, &tiersRaw, &protocolsRaw, &state, &rlRaw, &hpRaw, &relRaw,
-		&m.CreatedAt, &m.UpdatedAt)
+		&m.CreatedAt, &m.UpdatedAt, &convertEnabled, &convertTargetsRaw, &m.Edited)
 	if err != nil {
 		return nil, err
+	}
+	if convertEnabled.Valid {
+		v := convertEnabled.Bool
+		m.ConvertEnabled = &v
+	}
+	if len(convertTargetsRaw) > 0 && string(convertTargetsRaw) != "null" {
+		if err := json.Unmarshal(convertTargetsRaw, &m.ConvertTargets); err != nil {
+			return nil, fmt.Errorf("parse convert_targets: %w", err)
+		}
 	}
 	m.State = State(state)
 	if len(costRaw) > 0 {
@@ -109,17 +129,27 @@ func NewChannelModelStore(db *sql.DB) *channelModelStore {
 
 const cmColsJoinExt = `cm.id, cm.channel_id, cm.internal_model_id, cm.external_model_id,
 	cm.cost_rates, cm.time_config, cm.context_tiers, cm.protocols, cm.state, cm.rate_limit, cm.health_probe,
-	cm.reliability, cm.created_at, cm.updated_at, em.external_name`
+	cm.reliability, cm.created_at, cm.updated_at, cm.convert_enabled, cm.convert_targets, cm.edited, em.external_name`
 
 func scanChannelModelJoinExt(row interface{ Scan(...any) error }) (*ChannelModel, error) {
 	var m ChannelModel
-	var costRaw, timeRaw, tiersRaw, protocolsRaw, rlRaw, hpRaw, relRaw []byte
+	var costRaw, timeRaw, tiersRaw, protocolsRaw, rlRaw, hpRaw, relRaw, convertTargetsRaw []byte
 	var state string
+	var convertEnabled sql.NullBool
 	err := row.Scan(&m.ID, &m.ChannelID, &m.InternalModelID, &m.ExternalModelID,
 		&costRaw, &timeRaw, &tiersRaw, &protocolsRaw, &state, &rlRaw, &hpRaw, &relRaw,
-		&m.CreatedAt, &m.UpdatedAt, &m.ExternalName)
+		&m.CreatedAt, &m.UpdatedAt, &convertEnabled, &convertTargetsRaw, &m.Edited, &m.ExternalName)
 	if err != nil {
 		return nil, err
+	}
+	if convertEnabled.Valid {
+		v := convertEnabled.Bool
+		m.ConvertEnabled = &v
+	}
+	if len(convertTargetsRaw) > 0 && string(convertTargetsRaw) != "null" {
+		if err := json.Unmarshal(convertTargetsRaw, &m.ConvertTargets); err != nil {
+			return nil, fmt.Errorf("parse convert_targets: %w", err)
+		}
 	}
 	m.State = State(state)
 	if len(costRaw) > 0 {
@@ -165,18 +195,30 @@ func scanChannelModelJoinExt(row interface{ Scan(...any) error }) (*ChannelModel
 // cmColsJoinExtChannel 列出「JOIN 对外模型 + 渠道」查询使用的列（ListAll 用）。
 const cmColsJoinExtChannel = `cm.id, cm.channel_id, cm.internal_model_id, cm.external_model_id,
 	cm.cost_rates, cm.time_config, cm.context_tiers, cm.protocols, cm.state, cm.rate_limit, cm.health_probe,
-	cm.reliability, cm.created_at, cm.updated_at, em.external_name, ch.name`
+	cm.reliability, cm.created_at, cm.updated_at, cm.convert_enabled, cm.convert_targets, cm.edited,
+	em.external_name, ch.name`
 
 // scanChannelModelJoinExtChannel 将「JOIN 对外模型 + 渠道」的一行扫描到 *ChannelModel，解析 JSONB 列。
 func scanChannelModelJoinExtChannel(row interface{ Scan(...any) error }) (*ChannelModel, error) {
 	var m ChannelModel
-	var costRaw, timeRaw, tiersRaw, protocolsRaw, rlRaw, hpRaw, relRaw []byte
+	var costRaw, timeRaw, tiersRaw, protocolsRaw, rlRaw, hpRaw, relRaw, convertTargetsRaw []byte
 	var state string
+	var convertEnabled sql.NullBool
 	err := row.Scan(&m.ID, &m.ChannelID, &m.InternalModelID, &m.ExternalModelID,
 		&costRaw, &timeRaw, &tiersRaw, &protocolsRaw, &state, &rlRaw, &hpRaw, &relRaw,
-		&m.CreatedAt, &m.UpdatedAt, &m.ExternalName, &m.ChannelName)
+		&m.CreatedAt, &m.UpdatedAt, &convertEnabled, &convertTargetsRaw, &m.Edited,
+		&m.ExternalName, &m.ChannelName)
 	if err != nil {
 		return nil, err
+	}
+	if convertEnabled.Valid {
+		v := convertEnabled.Bool
+		m.ConvertEnabled = &v
+	}
+	if len(convertTargetsRaw) > 0 && string(convertTargetsRaw) != "null" {
+		if err := json.Unmarshal(convertTargetsRaw, &m.ConvertTargets); err != nil {
+			return nil, fmt.Errorf("parse convert_targets: %w", err)
+		}
 	}
 	m.State = State(state)
 	if len(costRaw) > 0 {
@@ -344,12 +386,12 @@ func (s *channelModelStore) Insert(ctx context.Context, m *ChannelModel) (*Chann
 		m.ID = idgen.New()
 	}
 	row := s.db.QueryRowContext(ctx,
-		`INSERT INTO channel_models(id, channel_id, internal_model_id, external_model_id, cost_rates, time_config, context_tiers, protocols, state, rate_limit, health_probe, reliability)
-		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING `+cmCols,
+		`INSERT INTO channel_models(id, channel_id, internal_model_id, external_model_id, cost_rates, time_config, context_tiers, protocols, state, rate_limit, health_probe, reliability, convert_enabled, convert_targets, edited)
+		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING `+cmCols,
 		m.ID, m.ChannelID, m.InternalModelID, m.ExternalModelID, cmJSON(m.CostRates),
 		cmNullableJSON(m.TimeConfig), cmNullableJSON(m.ContextTiers), cmNullableProtocols(m.Protocols),
 		string(m.State), marshalJSONB(m.RateLimit), marshalJSONB(m.HealthProbe),
-		marshalJSONB(m.Reliability))
+		marshalJSONB(m.Reliability), m.ConvertEnabled, cmConvertTargets(m.ConvertTargets), m.Edited)
 	created, err := scanChannelModel(row)
 	if err != nil {
 		return nil, classifyCMErr(err)
@@ -362,14 +404,138 @@ func (s *channelModelStore) Update(ctx context.Context, m *ChannelModel) error {
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE channel_models SET internal_model_id=$1, external_model_id=$2, cost_rates=$3,
 		        time_config=$4, context_tiers=$5, protocols=$6, state=$7, rate_limit=$8, health_probe=$9,
-		        reliability=$10, updated_at=now()
-		 WHERE id=$11`,
+		        reliability=$10, updated_at=now(), convert_enabled=$11, convert_targets=$12, edited=$13
+		 WHERE id=$14`,
 		m.InternalModelID, m.ExternalModelID, cmJSON(m.CostRates),
 		cmNullableJSON(m.TimeConfig), cmNullableJSON(m.ContextTiers), cmNullableProtocols(m.Protocols),
 		string(m.State), marshalJSONB(m.RateLimit), marshalJSONB(m.HealthProbe),
-		marshalJSONB(m.Reliability), m.ID)
+		marshalJSONB(m.Reliability), m.ConvertEnabled, cmConvertTargets(m.ConvertTargets), m.Edited, m.ID)
 	if err != nil {
 		return classifyCMErr(err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// ---- 协议种子物化（0019 起 channel_models 是唯一运行时真源）----
+
+// channelModelSeed 是协议种子（channel_protocols.models[m]）在某内部模型上的可物化值。
+// 约定：字段为 nil/空表示「种子未定义该键」→ 物化时**不写该列**，保留实例现值。
+// 这正是 B1 的修法：种子缺 costRates 时不再把 cost_rates 覆盖成 JSON null。
+type channelModelSeed struct {
+	ExternalModelID int64                     // >0 才物化（external_model_id NOT NULL）
+	CostRates       billing.Rates             // nil = 种子未定义
+	TimeConfig      *billing.TimeCoeffConfig  // nil = 种子未定义
+	ContextTiers    []billing.TierRule        // nil = 种子未定义
+	Protocols       channelprotocol.Protocols // 空 = 种子未定义
+	ConvertEnabled  *bool                     // nil = 种子未定义/显式 null（均不写）
+	ConvertTargets  []string                  // nil = 种子未定义
+}
+
+// seedColumn 一个「列名 = 值」的物化项；列名只来自本文件内的固定字面量（不拼接外部输入）。
+type seedColumn struct {
+	col string
+	val any
+}
+
+// commercial 返回种子定义的全部商业字段列（成本/时段/分档/协议子集/转换）。
+func (s channelModelSeed) commercial() []seedColumn {
+	out := make([]seedColumn, 0, 6)
+	if s.CostRates != nil {
+		out = append(out, seedColumn{"cost_rates", cmJSON(s.CostRates)})
+	}
+	if s.TimeConfig != nil {
+		out = append(out, seedColumn{"time_config", cmNullableJSON(s.TimeConfig)})
+	}
+	if s.ContextTiers != nil {
+		out = append(out, seedColumn{"context_tiers", cmNullableJSON(s.ContextTiers)})
+	}
+	if len(s.Protocols) > 0 {
+		out = append(out, seedColumn{"protocols", cmNullableProtocols(s.Protocols)})
+	}
+	out = append(out, s.convert()...)
+	return out
+}
+
+// convert 返回转换配置列。按拍板「转换按协议定义、不按渠道差异化」，
+// 这两列是协议的物化副本，对 edited=true 的行也要刷新（渠道层没有差异化写入路径）。
+func (s channelModelSeed) convert() []seedColumn {
+	out := make([]seedColumn, 0, 2)
+	if s.ConvertEnabled != nil {
+		out = append(out, seedColumn{"convert_enabled", *s.ConvertEnabled})
+	}
+	if s.ConvertTargets != nil {
+		out = append(out, seedColumn{"convert_targets", cmConvertTargets(s.ConvertTargets)})
+	}
+	return out
+}
+
+// InsertFromSeed 按种子插入一条实例行：只写种子定义了的列，其余列取库默认值
+// （cost_rates 缺省时不写 → 落库默认价，而不是 JSON null）。
+func (s *channelModelStore) InsertFromSeed(ctx context.Context, channelID int64, internalModelID string, seed channelModelSeed) (*ChannelModel, error) {
+	if seed.ExternalModelID <= 0 {
+		return nil, fmt.Errorf("insert channel model from seed: external model id missing")
+	}
+	id := idgen.New()
+	cols := []string{"id", "channel_id", "internal_model_id", "external_model_id", "state"}
+	holders := []string{"$1", "$2", "$3", "$4", "$5"}
+	args := []any{id, channelID, internalModelID, seed.ExternalModelID, string(StateNormal)}
+	for _, c := range seed.commercial() {
+		args = append(args, c.val)
+		cols = append(cols, c.col)
+		holders = append(holders, fmt.Sprintf("$%d", len(args)))
+	}
+	query := `INSERT INTO channel_models(` + strings.Join(cols, ", ") + `) VALUES(` +
+		strings.Join(holders, ", ") + `) RETURNING ` + cmCols
+	created, err := scanChannelModel(s.db.QueryRowContext(ctx, query, args...))
+	if err != nil {
+		return nil, classifyCMErr(err)
+	}
+	return created, nil
+}
+
+// UpdateSeedConvert 只刷新转换配置列（用于 edited=true 的行：转换按协议定义，不受 edited 冻结）。
+func (s *channelModelStore) UpdateSeedConvert(ctx context.Context, id int64, seed channelModelSeed) error {
+	cols := seed.convert()
+	if len(cols) == 0 {
+		return nil
+	}
+	return s.updateSeedColumns(ctx, id, cols)
+}
+
+// updateSeedColumns 执行「只改给定列」的 UPDATE；列清单为空时不发 SQL（避免无意义的 updated_at 抖动）。
+func (s *channelModelStore) updateSeedColumns(ctx context.Context, id int64, cols []seedColumn) error {
+	if len(cols) == 0 {
+		return nil
+	}
+	sets := make([]string, 0, len(cols)+2)
+	args := make([]any, 0, len(cols)+1)
+	for _, c := range cols {
+		args = append(args, c.val)
+		sets = append(sets, fmt.Sprintf("%s=$%d", c.col, len(args)))
+	}
+	sets = append(sets, "updated_at=now()")
+	args = append(args, id)
+	query := `UPDATE channel_models SET ` + strings.Join(sets, ", ") +
+		fmt.Sprintf(` WHERE id=$%d`, len(args))
+	res, err := s.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return classifyCMErr(err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// SetEdited 单独置位/清除物化守卫标记（reset-from-protocol 置回 false 后按种子重物化）。
+func (s *channelModelStore) SetEdited(ctx context.Context, id int64, edited bool) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE channel_models SET edited=$1, updated_at=now() WHERE id=$2`, edited, id)
+	if err != nil {
+		return err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return sql.ErrNoRows
@@ -547,6 +713,18 @@ func cmJSON(v billing.Rates) []byte {
 	b, _ := json.Marshal(v)
 	if b == nil {
 		b = []byte("{}")
+	}
+	return b
+}
+
+// cmConvertTargets 把转换目标协议列表序列化为 JSONB 数组：nil 写 '[]'（列 NOT NULL）。
+func cmConvertTargets(targets []string) []byte {
+	if targets == nil {
+		return []byte("[]")
+	}
+	b, err := json.Marshal(targets)
+	if err != nil {
+		return []byte("[]")
 	}
 	return b
 }

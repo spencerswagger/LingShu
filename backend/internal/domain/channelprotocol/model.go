@@ -7,6 +7,7 @@
 package channelprotocol
 
 import (
+	"sort"
 	"strings"
 	"time"
 
@@ -95,6 +96,11 @@ const (
 // 在渠道协议清单中的完整配置（对外模型绑定 / 成本 / 时段 / 分档）。
 // 追加字段均为 camelCase，向后兼容（旧数据无这些键时零值）。
 type ModelGateway struct {
+	// BaseURL 已废弃（0019）：模型级基址从来没有运行时读取点，配置了只会误导排障。
+	// 字段保留是因为预设包格式仍容忍该键（未知字段容忍是全局约定），落库前由 normalizeIn 清空；
+	// 需要按协议区分基址请用 Protocols[协议].baseUrl。
+	//
+	// Deprecated: 无运行时读点，写入口已关闭。
 	BaseURL   string    `json:"baseUrl,omitempty"`
 	Protocols Protocols `json:"protocols,omitempty"`
 	// ExternalModelID 该内部模型绑定的对外模型 ID；>0 才参与自动物化为 channel_models。
@@ -198,6 +204,31 @@ type ChannelProtocol struct {
 	UpdatedAt      time.Time `json:"UpdatedAt,omitempty"`
 }
 
+// PreferredProtocol 返回「用于展示生效基址」的协议键：标记 default 的优先，
+// 其次 openai-chat，最后按字典序取第一个；协议集为空时返回 openai-chat（回落协议级 base_url）。
+func (cp *ChannelProtocol) PreferredProtocol() string {
+	if cp == nil {
+		return ProtocolOpenAIChat
+	}
+	for name, spec := range cp.Protocols {
+		if spec.Default {
+			return Canonical(name)
+		}
+	}
+	if _, ok := cp.Protocols[ProtocolOpenAIChat]; ok {
+		return ProtocolOpenAIChat
+	}
+	names := make([]string, 0, len(cp.Protocols))
+	for name := range cp.Protocols {
+		names = append(names, name)
+	}
+	if len(names) == 0 {
+		return ProtocolOpenAIChat
+	}
+	sort.Strings(names)
+	return Canonical(names[0])
+}
+
 // EffectiveBaseURL 返回某基础协议的有效 baseURL：协议级 baseUrl 优先，回落渠道协议级 base_url。
 func (cp *ChannelProtocol) EffectiveBaseURL(protocol string) string {
 	if cp == nil {
@@ -218,30 +249,6 @@ func (cp *ChannelProtocol) EffectiveHeaderPolicy() HeaderPolicy {
 	return cp.RequestHeaders
 }
 
-// EffectiveModelProtocols 求某内部模型可达的上游协议集合：
-// 模型级覆盖（channel_models.protocols）优先，其次预设模型级定义，最后 provider 级协议集。
-func (cp *ChannelProtocol) EffectiveModelProtocols(internalModelID string, modelOverride Protocols) Protocols {
-	if len(modelOverride) > 0 {
-		return modelOverride
-	}
-	if cp == nil {
-		return nil
-	}
-	if mg, ok := cp.Models[internalModelID]; ok && len(mg.Protocols) > 0 {
-		return mg.Protocols
-	}
-	return cp.Protocols
-}
-
-// EffectiveModelConvert 返回某内部模型的协议转换配置：
-// 模型存在于 Models 时返回其 ConvertEnabled/ConvertTargets；否则 (nil, nil) 表示继承全局默认。
-func (cp *ChannelProtocol) EffectiveModelConvert(internalModelID string) (enabled *bool, targets []string) {
-	if cp == nil {
-		return nil, nil
-	}
-	mg, ok := cp.Models[internalModelID]
-	if !ok {
-		return nil, nil
-	}
-	return mg.ConvertEnabled, mg.ConvertTargets
-}
+// EffectiveModelConvert 已随 0019 契约删除：转换配置的运行时读点是
+// channel_models.convert_enabled / convert_targets（协议种子只做物化来源）。
+// 保留注释仅为说明为什么这里不再有该函数（调用方编译期即失败，便于定位漏改）。
