@@ -1,10 +1,11 @@
 # 渠道 / 渠道协议字段归属契约（唯一真源）
 
-> Status: **RULED-v2**（spencer 2026-11-10 已对四项口径裁定，见 §9；v1 的「渠道级基址覆盖」「转换下沉到实例」两处设计按裁定作废）
+> Status: **RULED-v3**（v2 之后按 Core 实现反馈补正：§6.1 补入「模型级协议子集下移」正式条款并修正漂移判定、新增 §6.4 上线前置预检、§10.2 标出「>5 万行路径无行使窗口」的实现缺口；四项裁定不变）
 > Date: 2026-11-10
 > Author: Ark（架构）
 > Scope: 契约与迁移口径。**不含实现代码**；Core / View 按本文落地。
 > 判据来源：`docs/preset-pack-format.md`（预设包格式，已冻结）、`docs/designs/2026-10-16-channel-protocol-gateway-fixes-design.md`（D1「引用协议自动物化」）。
+> 变更记录：v1 初稿 → v2（四项裁定落文、去掉渠道级基址覆盖与转换下沉）→ v3（本版，补正两处缺口 + 一处实现缺口）。
 
 ---
 
@@ -296,42 +297,97 @@ UPDATE channels SET base_url = '', protocol = ''
 WHERE deleted_at IS NULL AND channel_protocol_id IS NOT NULL
   AND (btrim(base_url) <> '' OR btrim(protocol) <> '');
 
--- (c) 存量：与种子不一致的实例行标记 edited=true（防止下一次同步静默覆盖既有配置）
+-- (c) 存量：种子里的「模型级协议子集」下移到实例（唯一运行时真源成立的前提）
+UPDATE channel_models cm
+SET protocols = cp.models -> cm.internal_model_id -> 'protocols'
+FROM channels c
+JOIN channel_protocols cp ON cp.id = c.channel_protocol_id AND cp.deleted_at IS NULL
+WHERE cm.channel_id = c.id
+  AND cm.deleted_at IS NULL
+  AND cp.models ? cm.internal_model_id
+  AND cp.models -> cm.internal_model_id ? 'protocols'
+  AND jsonb_typeof(cp.models -> cm.internal_model_id -> 'protocols') = 'object'
+  AND (cp.models -> cm.internal_model_id -> 'protocols') <> '{}'::jsonb
+  AND (cm.protocols IS NULL OR cm.protocols = '{}'::jsonb OR jsonb_typeof(cm.protocols) <> 'object');
+
+-- (d) 存量：实例行与种子「双方都有值且不一致」时标记 edited=true（物化守卫）
 UPDATE channel_models cm
 SET edited = true
 FROM channels c
 JOIN channel_protocols cp ON cp.id = c.channel_protocol_id AND cp.deleted_at IS NULL
 WHERE cm.channel_id = c.id AND cm.deleted_at IS NULL
   AND cp.models ? cm.internal_model_id
+  AND cp.models -> cm.internal_model_id ?| ARRAY['externalModelID','protocols','costRates','timeConfig','contextTiers']
   AND (
        (cp.models -> cm.internal_model_id ? 'externalModelID'
-        AND cm.external_model_id IS DISTINCT FROM NULLIF(cp.models -> cm.internal_model_id ->> 'externalModelID','')::bigint)
+        AND NULLIF(btrim(cp.models -> cm.internal_model_id ->> 'externalModelID'),'') IS NOT NULL
+        AND cm.external_model_id IS DISTINCT FROM NULLIF(btrim(cp.models -> cm.internal_model_id ->> 'externalModelID'),'')::bigint)
     OR (cp.models -> cm.internal_model_id ? 'protocols'
+        AND jsonb_typeof(cp.models -> cm.internal_model_id -> 'protocols') = 'object'
+        AND (cp.models -> cm.internal_model_id -> 'protocols') <> '{}'::jsonb
+        AND cm.protocols IS NOT NULL AND jsonb_typeof(cm.protocols) = 'object'
+        AND cm.protocols <> '{}'::jsonb
         AND cm.protocols IS DISTINCT FROM (cp.models -> cm.internal_model_id -> 'protocols'))
     OR (cp.models -> cm.internal_model_id ? 'costRates'
-        AND cm.cost_rates IS DISTINCT FROM jsonb_strip_nulls(jsonb_build_object(
-              'input',      (cp.models -> cm.internal_model_id -> 'costRates' ->> 'Input')::numeric,
-              'output',     (cp.models -> cm.internal_model_id -> 'costRates' ->> 'Output')::numeric,
-              'cache_read', (cp.models -> cm.internal_model_id -> 'costRates' ->> 'CacheRead')::numeric)))
+        AND jsonb_typeof(cp.models -> cm.internal_model_id -> 'costRates') = 'object'
+        AND cm.cost_rates IS NOT NULL AND jsonb_typeof(cm.cost_rates) = 'object'
+        AND cm.cost_rates <> '{}'::jsonb
+        AND (
+             (cp.models -> cm.internal_model_id -> 'costRates' ? 'Input'
+              AND (cp.models -> cm.internal_model_id -> 'costRates' ->> 'Input') ~ '^-?[0-9]+(\.[0-9]+)?$'
+              AND COALESCE((cm.cost_rates ->> 'input') ~ '^-?[0-9]+(\.[0-9]+)?$', false)
+              AND (cm.cost_rates ->> 'input')::numeric
+                  IS DISTINCT FROM (cp.models -> cm.internal_model_id -> 'costRates' ->> 'Input')::numeric)
+          OR (cp.models -> cm.internal_model_id -> 'costRates' ? 'Output'
+              AND (cp.models -> cm.internal_model_id -> 'costRates' ->> 'Output') ~ '^-?[0-9]+(\.[0-9]+)?$'
+              AND COALESCE((cm.cost_rates ->> 'output') ~ '^-?[0-9]+(\.[0-9]+)?$', false)
+              AND (cm.cost_rates ->> 'output')::numeric
+                  IS DISTINCT FROM (cp.models -> cm.internal_model_id -> 'costRates' ->> 'Output')::numeric)
+          OR (cp.models -> cm.internal_model_id -> 'costRates' ? 'CacheRead'
+              AND (cp.models -> cm.internal_model_id -> 'costRates' ->> 'CacheRead') ~ '^-?[0-9]+(\.[0-9]+)?$'
+              AND COALESCE((cm.cost_rates ->> 'cache_read') ~ '^-?[0-9]+(\.[0-9]+)?$', false)
+              AND (cm.cost_rates ->> 'cache_read')::numeric
+                  IS DISTINCT FROM (cp.models -> cm.internal_model_id -> 'costRates' ->> 'CacheRead')::numeric)
+        ))
     OR (cp.models -> cm.internal_model_id ? 'timeConfig'
+        AND jsonb_typeof(cp.models -> cm.internal_model_id -> 'timeConfig') = 'object'
+        AND cm.time_config IS NOT NULL AND jsonb_typeof(cm.time_config) = 'object'
         AND cm.time_config IS DISTINCT FROM (cp.models -> cm.internal_model_id -> 'timeConfig'))
     OR (cp.models -> cm.internal_model_id ? 'contextTiers'
+        AND jsonb_typeof(cp.models -> cm.internal_model_id -> 'contextTiers') = 'array'
+        AND jsonb_array_length(cp.models -> cm.internal_model_id -> 'contextTiers') > 0
+        AND cm.context_tiers IS NOT NULL AND jsonb_typeof(cm.context_tiers) = 'array'
+        AND jsonb_array_length(cm.context_tiers) > 0
         AND cm.context_tiers IS DISTINCT FROM (cp.models -> cm.internal_model_id -> 'contextTiers'))
   );
 ```
 
-(c) 的键大小写是**必须**的：种子 `costRates` 是 `billing.WireRates`（Pascal 键），实例 `cost_rates` 是 `billing.Rates`（snake 键），直接 `IS DISTINCT FROM` 恒为真 → 会把全部行误标为 edited。
+**(c) 是契约条款，不是实现方自行发明**，条款如下（Core 的 0019 与之一致）：
 
-(c) 另一条口径：**种子没定义的键不参与漂移判定**。例如种子里某模型只有 `externalModelID`、没有 `costRates`，则该行成本与种子无关，不得标 `edited`（否则会永久冻结协议同步）。
+| 项 | 口径 |
+|---|---|
+| 下移对象 | `channel_protocols.models[m].protocols`（模型级协议子集）→ `channel_models.protocols` |
+| 为什么必须 | 本任务删除了运行时对种子的回落读（`channelprotocol/model.go:223 EffectiveModelProtocols`）。若不落库，存量里「只配在协议模型级」的子集会在切换后消失，模型可用协议集合变回协议级全集 → **静默放大可达协议**（可能把请求发到上游并不支持的协议）。 |
+| 下移条件 | 种子该键存在且为**非空 object**；实例侧 `protocols` 为空（`NULL` / `{}` / 非 object）。逐行判断，不做跨行推断。 |
+| 冲突（实例已有值且不同） | **不下移、不覆盖**；(d) 会把它标 `edited=true`，此后协议同步不再碰该行。理由是实例值=本地显式配置，优先级高于模板。 |
+| 顺序 | (c) **必须在 (d) 之前**。否则「实例为空」的行会先在 (d) 里被判成漂移并标 `edited`，(c) 再跳过 → 子集丢失且永久冻结。 |
+| 可回滚 | **无需回滚**：下移写入的值 = 旧解析链回落得到的值，回滚到旧二进制后解析结果逐字节等价（旧：实例空→种子→协议级；新：实例=种子值）。因此 §6.2 回滚脚本不含本步；`protocols` 列留在原值是**无害**的。 |
 
-### 6.1.1 已验证（2026-11-10，Ark 本地）
+**(d) 的三条判定口径**（裁定 ④ 在 SQL 侧的对齐，与实现一致）：
 
-上述 (a)~(c)、归档/清空搬迁、漂移标记、以及 §6.2 回滚 SQL，已在 PostgreSQL 17（dev 库，`BEGIN … ROLLBACK`，不落库）按实跑断言通过：
-- 引用协议 + 非空 `base_url` → 归档 + 清空；
-- 引用协议 + 仅 `protocol` 非空（`openai-compat` 默认值）→ 同样归档 + 清空；
-- 内联渠道 → 不动；
-- 与种子一致的行不标 `edited`、成本偏离种子的行标 `edited`、种子无该键的行不标（B1 口径）；
-- 回滚 SQL 能从归档表还原 `base_url` 与 `protocol`。
+1. **只有种子定义了的键参与判定**。种子没定义该键 → 该行这项配置与种子无关，不得标 `edited`（否则会永久冻结协议同步）。
+2. **只有「双方都有值且不等」才算漂移**。实例侧为 `NULL` / `{}` / 空数组 = **未设置**（不是"本地改成了空"），不算漂移，留给 (c) 或后续物化填值。这条是 (c) 能生效的前提。
+3. **成本必须逐键按 numeric 比较**：种子 `costRates` 是 Pascal 键（`billing.WireRates`），实例 `cost_rates` 是 snake 键（`billing.Rates`），整体 `IS DISTINCT FROM` 恒为真会误标全表；`1` 与 `1.0` 不算差异；非数字脏值跳过（迁移不得中断）。
+
+> 更正记录：v2 草稿里 (c) 写的是整体 `jsonb_strip_nulls(...)` 比较且没有「实例非空」前置条件，会把「实例 `protocols` 为 NULL」的行误标 `edited`，从而让下移失效。**以本节为准，草稿作废**；Core 的实现是对的。
+
+### 6.1.1 已验证
+
+**Ark 本地（2026-11-10，PG17 dev 库，`BEGIN … ROLLBACK`，不落库）**：(a)(b)(d) 与 §6.2 回滚按断言跑通——引用协议 + 非空 `base_url` 归档并清空；仅 `protocol` 非空（默认值 `openai-compat`）同样归档并清空；内联渠道不动；与种子一致不标 `edited`、成本偏离的标、种子无该键的不标；回滚能从归档表还原 `base_url` 与 `protocol`。
+
+**v3 补正后复验（同一环境）**：§6.1(c)(d) 五条断言全过——实例 `protocols` 为 NULL → 下移写入种子值且不标 `edited`；实例有值且不同 → 不下移、标 `edited`；成本 `1` vs `1.0` → 不标；种子无 `costRates` → 不标；种子有 `timeConfig` 而实例 NULL → 不标。
+
+**Core 实现侧（PR #75 自测）**：迁移正反向、回填幂等（跑两遍逐行一致）、断点续跑（限批模拟中断后继续）均通过；四个裁定点各有用例。
 
 ⚠ 由此确认一个实现细节：`channels.protocol` 有默认值 `'openai-compat'`，所以**归档表的行数 ≈ 引用协议的渠道数**（不止「基址非空」的那些）。这张表只做留档，体量等同渠道数，可忽略；`0020` 里凭 spencer 确认后清理即可。
 
@@ -356,6 +412,7 @@ DROP TABLE IF EXISTS channel_base_url_archive;
 ```
 
 **回滚后老代码仍可运行**：老二进制读 `channels` / `channel_models` 用的是显式列清单（`channelCols` `store.go:140`、`cmCols` `model_store.go:43`），多/少一个 `edited` 列不影响查询；基址与协议类型已按归档还原，行为等价于迁移前。**迁移有损点为零**（归档覆盖 `base_url` 与 `protocol` 两列）。
+**唯一"不回滚"的一项**：§6.1(c) 写进 `channel_models.protocols` 的值**不回滚**——它与旧解析链回落得到的值相同，回滚后行为逐项等价，留着无害（见 §6.1 下移条款「可回滚」行）。
 
 ### 6.3 老数据兼容与读写窗口
 
@@ -365,12 +422,57 @@ DROP TABLE IF EXISTS channel_base_url_archive;
 | 引用协议 + `protocol` 非空（脏数据） | 清空（该值本来就不被读） |
 | 内联渠道（未引用协议） | 完全不动 |
 | 实例行与种子不一致 | `edited=true`，**不再被同步覆盖**；需要恢复由新接口重置 |
+| 种子有模型级 `protocols`、实例为空 | 由 §6.1(c) 下移写入实例（值 = 旧解析链回落结果，回滚无需撤销） |
 | 实例行与种子一致 | `edited=false`，继续跟随协议更新 |
 | 种子缺某商业键 | 物化不写该列（B1 修复），现值保留 |
 | 迁移期间旧后端仍在跑 | 旧后端仍读 `channels.base_url`（已清空）→ 引用协议的渠道回落到协议地址，与裁定一致。**旧前端保存渠道会把空值原样回传，不会触发 400**；只有「手工填了基址」才会 400。因此后端与迁移可同批发布。 |
 | 空库 | 全部语句幂等，无数据操作，可重复执行 |
 
 **新增接口**（Core 实现）：`POST /admin/channels/{id}/models/{mid}/reset-from-protocol` → `edited=false` + 重新物化该行（返回新的实例行）。这是 `edited` 的唯一出口，避免「标记后再也同步不了」。
+
+### 6.4 上线前置预检（可照做，不是"要注意"）
+
+**谁在什么时候跑**：由 **spencer 或其指定的生产运维** 执行；时点 = **0019 在生产库执行之前**（迁移随应用启动自动执行，所以要在此之前，或首次启动前先手工 `psql` 跑）。架构/Core **没有生产读权限，不代跑、不代读**。
+
+**第 1 步：执行（只读，脚本全是 SELECT）**
+
+```bash
+# 1) 建议先开只读事务，防止手滑
+PGOPTIONS='-c default_transaction_read_only=on' \
+psql "$PROD_DSN" -v ON_ERROR_STOP=1 \
+     -f backend/scripts/0019-preflight-audit.sql \
+     > 0019-preflight-$(date +%F-%H%M).log 2>&1
+```
+
+**第 2 步：读输出并处置**
+
+| 输出段 | 含义 | 判读与处置 |
+|---|---|---|
+| `1) 存量计数` | 四张表的 `rows_all` / `rows_live` | 记下来，作为 §10 的分母；**若 `channel_models.rows_live > 50000` → 走 §10.2 的独立回填路径**，不要直接让迁移跑 |
+| `1b) 引用协议的渠道分布` | 每个协议被多少渠道引用 | 判断影响面集中度；单协议引用很多说明协议拆分成本高 |
+| `2) 裁定①影响面` | 引用协议**且**内联 `base_url`/`protocol` 非空的渠道清单（含 `inline_base_url_to_be_archived`、协议侧 `protocol_base_url`） | **非空就要逐条决策**（见下） |
+| `2b) 高危：协议自身无基址` | 清空后**没有可用地址**的渠道 | **阻断项**：必须先给协议补基址（或把渠道改回内联）。有任意一行都不允许跑迁移 |
+| `3) 预估 edited 行数` | **候选行数上界**（种子定义了任一商业字段的行），不是「将标 `edited` 的确切行数」 | 只用来估首次同步覆盖面。要精确值就按 §6.1(d) 的 `WHERE` 条件跑 `select count(*)` |
+| `3b) 协议配了转换的模型数` | 裁定 ② 的现状核对 | 只做记录，不触发动作 |
+| `4) 空成本行` | 种子缺 `costRates` 且实例成本为空的行（B1 遗留） | 迁移后由协议调价自动补上；若 > 0，说明历史上这些模型**当前计费会报错**，需在上线后确认已恢复 |
+| `5) 量级判断` | 脚本最后打印的建议路径 | 与 §10.2 一致 |
+
+**第 3 步：`2)` 非空时逐条三选一**（每条渠道只选一种，结论写进上线记录）
+
+| 选项 | 适用 | 操作 |
+|---|---|---|
+| A. 改协议 | 这些渠道本来就该用同一个地址（旧内联值是历史残留） | 确认协议 `base_url` 正确 → 直接跑迁移（内联值被归档） |
+| B. 新建协议 | 渠道确实需要独立地址 | **迁移前**复制该协议为新协议（命名 `<协议名>-<渠道名>`）→ 改该渠道引用新协议 → 跑预检确认 `2)` 不再列出该渠道 → 跑迁移 |
+| C. 确认可切换 | 内联值已失效/等价于协议地址 | 无需操作，归档后自动指向协议地址；在执行记录里写「已确认」 |
+
+**第 4 步：放行条件**（四条同时满足才允许跑迁移）
+
+1. `2b)` 结果为 **0 行**；
+2. `2)` 的每一行都有 A/B/C 的结论且已执行；
+3. `channel_models.rows_live ≤ 50000`，或已改走 §10.2 的独立回填路径；
+4. 预检日志已留档（附在 PR 评论或运维记录里，**不含 DSN/口令**）。
+
+**回滚触发**：只要发现「有渠道的请求打到了非预期地址」，按 §6.2 跑回滚脚本，归档表能把内联基址与协议类型原样还原。
 
 ---
 
@@ -385,6 +487,8 @@ DROP TABLE IF EXISTS channel_base_url_archive;
 5. **删除模板回落**：`channelprotocol/model.go` 删 `EffectiveModelProtocols`(:223)，改 `gateway/protocol.go:172 effectiveProtocols`；**`EffectiveModelConvert` 不动**。
 6. **出参**：`manager.go:190 ChannelView` + 两处构造（`manager.go:995`、`detail.go:96`）。
 7. **协议包**：`channelprotocol/source.go` 导入时丢弃 `models[m].baseUrl`（仍在 JSON 里容忍，不报错）。
+8. **回填路径（§10.2 缺口）**：按方案 A 给 0019 加阈值守卫；`scripts/backfill-0019` 补齐「协议子集下移」阶段，使三阶段（channels / protocols 下移 / drift 标记）与迁移内 DML 等价；启动时对未完成的 `backfill_checkpoints` 告警。
+9. **上线前置**：交付 `backend/scripts/0019-preflight-audit.sql`（已在 PR #75），口径见 §6.4；`3)` 的标题建议改成「候选行数（上界）」以免被读成精确值。
 
 **必须保持的对外行为**（改坏了 Gate 会挂）：
 - `openai-compat` → `openai-chat` 归一（`channelprotocol/model.go:29`）继续生效。
@@ -427,6 +531,10 @@ DROP TABLE IF EXISTS channel_base_url_archive;
    | 只改模型限流、不动商业字段 | `edited` **仍为 false**（裁定 ④ 的边界） |
    | 改 P 的 convertEnabled=false | 转换停用（仍读协议，`conversion.go`） |
    | `reset-from-protocol` | 该行恢复为种子值且 `edited=false` |
+   | 种子有模型级 `protocols`、实例为空 | 迁移后实例值 = 种子值；**运行时可达协议集合与迁移前逐项相同**（下移生效） |
+   | 种子有 `protocols`、实例有且不同 | 不下移、实例值不变、`edited=true`（冲突不覆盖） |
+   | 种子有 `protocols`、实例为空但被先标 `edited` | **不允许发生**：断言 (c) 在 (d) 之前，且 (d) 的 `protocols` 分支要求实例非空 |
+   | 成本 `1` vs 种子 `1.0` | 不标 `edited`（numeric 比较，裁定 ④） |
 5. **三口径全绿**：`go vet ./...`、`go test -race ./...`、`npx vue-tsc --noEmit`。
 6. **不做的事**（防误伤）：不加 `DisallowUnknownFields`；不删 `channel_protocols.models` 列；不给渠道加基址覆盖列；不改计费公式与三段 usage 口径。
 
@@ -483,8 +591,41 @@ DROP TABLE IF EXISTS channel_base_url_archive;
 
 ⚠ **必须知道的一个限制**：`db/migrate.go:69` 把**每个迁移文件包在一个事务里**，所以「分批 + 断点」**无法写在 0019 的 .sql 里**（只能是一个大事务）。这是上面「≤5 万放迁移、>5 万走独立脚本」这条分界的原因，不是风格偏好。
 
-### 10.3 上线前需要 spencer 给的三个数
+#### ⚠ 实现缺口（Core 需改，否则 >5 万路径是空话）
 
-1. `channels` 总数，以及「引用协议 且 `base_url` 非空」的行数（决定裁定 ① 的影响面）；
-2. `channel_protocols` 总数，以及 `models` 里含 `convertEnabled/convertTargets` 的协议数（决定转换行为是否会被误判）；
-3. `channel_models` 总数，以及与协议种子不一致的行数（决定 `edited` 初始为 true 的比例，也就是首次同步的覆盖面）。
+**现状问题**：`0019_channel_field_ownership.sql` 里的 (b)(c)(d) 三个 `UPDATE` 是**无条件执行**的。也就是说无论行数多少，迁移都会在启动时用一个事务把全表跑完；`scripts/backfill-0019` 既不能在迁移前跑（那时 `edited` 列还不存在，`markDriftSQL` 直接报错），在迁移后跑也没有任何事可做。**「>5 万走脚本」目前没有行使窗口。**
+
+**契约要求（二选一，Core 定，写进 PR 说明）**：
+
+- **方案 A（推荐，改动小）**：`0019` 内用阈值守卫包住回填，超阈值时**跳过 DML 并显式告警**：
+
+```sql
+DO $$
+DECLARE n bigint;
+BEGIN
+    SELECT count(*) INTO n FROM channel_models WHERE deleted_at IS NULL;
+    IF n > 50000 THEN
+        RAISE WARNING '0019: channel_models 有 % 行（>50000），迁移内回填已跳过；'
+                      '请立刻执行 backend/scripts/backfill-0019 并在完成前不要接流量', n;
+    ELSE
+        -- 此处执行 (b)(c)(d) 三条 UPDATE（原语句不动）
+        NULL;
+    END IF;
+END $$;
+```
+
+  配套要求：
+  1. `backfill-0019` 必须补齐 (c) 的「协议子集下移」阶段（现在只有 channels + drift 两段，缺这段会让模型级协议子集丢失）；
+  2. 应用启动时读 `backfill_checkpoints`：`0019_channel_models` 未完成 → 启动日志 **ERROR** 级告警（是否拒绝启动由 spencer 定，见下"待确认"）；
+  3. 回填完成前，网关仍可服务（实例行缺 `protocols` 会退化成协议级全集，属行为放大，不是崩溃）。
+
+- **方案 B（更简单）**：删掉「>5 万走脚本」的说法，承认 0019 是**单事务全量回填**，>5 万时改为**停机维护窗口**执行；`backfill-0019` 仅保留为「迁移被手工跳过后的补救/演练」工具。文档与 README 同步改口径。
+
+**我的建议**：先按 A 落地（守卫 + 补齐下移阶段 + 启动告警），因为它同时修掉「脚本无窗口」和「下移遗漏」两个真问题；若 spencer 不想加启动告警，再退到 B。
+
+### 10.3 上线前要拿的数（由 §6.4 预检脚本一次产出）
+
+1. `channels` 总数，以及「引用协议 且 `base_url`/`protocol` 非空」的行数（裁定 ① 的影响面）→ 预检 `1)` / `2)`；
+2. `channel_protocols` 总数，以及 `models` 里含 `convertEnabled/convertTargets` 的协议数（裁定 ② 现状核对）→ 预检 `1)` / `3b)`；
+3. `channel_models` 总数，以及与种子不一致的行数（`edited` 初始比例）→ 预检 `1)` / `3)`；
+4. 协议自身无基址的高危渠道数 → 预检 `2b)`，**必须为 0** 才放行。
