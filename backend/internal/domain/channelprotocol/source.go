@@ -71,6 +71,9 @@ func (p Provider) toChannelProtocol() *ChannelProtocol {
 		mg.Protocols = canonicalProtocols(mg.Protocols)
 		cp.Models[key] = mg
 	}
+	// 与 admin 写路径（Create/Update）同口径：走同一套归一化，其中包含「模型级 baseUrl 废弃 →
+	// 落库前清空」。不调这里的话，预设同步会把 models[m].baseUrl 又写回库里，绕过归属收敛。
+	normalizeIn(cp)
 	return cp
 }
 

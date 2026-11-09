@@ -220,6 +220,7 @@ func (s *Service) CreateChannel(ctx context.Context, in ChannelInput) (*Channel,
 	}
 	// 引用协议时自动物化 channel_models（仅 externalModelID>0 的行）。
 	s.materializeForChannel(ctx, created.ID, in.ChannelProtocolID)
+	s.enrichBaseURLEffective(ctx, created)
 	return created, nil
 }
 
@@ -294,7 +295,46 @@ func (s *Service) UpdateChannel(ctx context.Context, id int64, in ChannelInput) 
 		s.mgr.SetBoundTags(c.ID, c.BoundTags)
 	}
 	s.materializeForChannel(ctx, c.ID, in.ChannelProtocolID)
+	s.enrichBaseURLEffective(ctx, c)
 	return c, nil
+}
+
+// enrichBaseURLEffective 填充只读派生字段 BaseURLEffective（列表 / 写操作回包统一口径）。
+//
+// 取值口径（契约 §5.1，与转发/探测共用同一条链，不分叉）：
+//   - 引用协议 → 协议基址（协议级 baseUrl 优先，回落协议 base_url）；channels.base_url 不参与；
+//   - 内联渠道 → 自身 base_url。
+//
+// 运行时就绪时直接读运行时快照（与热路径一致）；否则按同一规则用库里的协议计算（协议按 ID 缓存，避免 N 次查询）。
+func (s *Service) enrichBaseURLEffective(ctx context.Context, chs ...*Channel) {
+	if len(chs) == 0 {
+		return
+	}
+	cpCache := make(map[int64]*channelprotocol.ChannelProtocol, len(chs))
+	for _, c := range chs {
+		if c == nil {
+			continue
+		}
+		if s.mgr != nil {
+			if rt, ok := s.mgr.GetRuntime(c.ID); ok && rt != nil {
+				c.BaseURLEffective = effectiveChannelBaseURL(rt)
+				continue
+			}
+		}
+		if c.ChannelProtocolID == nil || *c.ChannelProtocolID <= 0 {
+			c.BaseURLEffective = strings.TrimSpace(c.BaseURL)
+			continue
+		}
+		pid := *c.ChannelProtocolID
+		cp, cached := cpCache[pid]
+		if !cached && s.cpStore != nil {
+			cp, _ = s.cpStore.GetByID(ctx, pid) // 协议已删/查询失败 → 保持空，不阻断列表
+			cpCache[pid] = cp
+		}
+		if cp != nil {
+			c.BaseURLEffective = cp.EffectiveBaseURL(cp.PreferredProtocol())
+		}
+	}
 }
 
 // ListChannels 查询全部渠道，并附带逐密钥聚合态 KeyStates。
@@ -333,6 +373,12 @@ func (s *Service) ListChannels(ctx context.Context) ([]Channel, error) {
 			}
 		}
 	}
+	// 只读派生：列表页/编辑页展示「生效基址」（此前只有 snapshot 有该字段，列表返回空）。
+	enriched := make([]*Channel, 0, len(chs))
+	for i := range chs {
+		enriched = append(enriched, &chs[i])
+	}
+	s.enrichBaseURLEffective(ctx, enriched...)
 	return chs, nil
 }
 

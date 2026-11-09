@@ -81,6 +81,9 @@ func Backfill0019(ctx context.Context, d *sql.DB, opts Backfill0019Options) (Bac
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
+	if err := EnsureBackfill0019Schema(ctx, d); err != nil {
+		return Backfill0019Result{}, err
+	}
 	if err := EnsureBackfillCheckpoints(ctx, d); err != nil {
 		return Backfill0019Result{}, err
 	}
@@ -93,8 +96,8 @@ func Backfill0019(ctx context.Context, d *sql.DB, opts Backfill0019Options) (Bac
 		pick: `SELECT id FROM channels
 		       WHERE id > $1 AND deleted_at IS NULL AND channel_protocol_id IS NOT NULL
 		       ORDER BY id ASC LIMIT $2`,
-		apply:   []string{archiveChannelsSQL, clearChannelsSQL},
-		measure: `SELECT count(*) FROM channel_base_url_archive WHERE channel_id = ANY($1::bigint[])`,
+		apply:       []string{archiveChannelsSQL, clearChannelsSQL},
+		countWrites: true,
 	}, batch, opts.MaxBatchesPerPhase, logf)
 	if err != nil {
 		return res, err
@@ -110,8 +113,8 @@ func Backfill0019(ctx context.Context, d *sql.DB, opts Backfill0019Options) (Bac
 		pick: `SELECT id FROM channel_models
 		       WHERE id > $1 AND deleted_at IS NULL
 		       ORDER BY id ASC LIMIT $2`,
-		apply:   []string{downshiftProtocolsSQL},
-		measure: `SELECT count(*) FROM channel_models WHERE id = ANY($1::bigint[]) AND protocols IS NOT NULL`,
+		apply:       []string{downshiftProtocolsSQL},
+		countWrites: true,
 	}, batch, opts.MaxBatchesPerPhase, logf)
 	if err != nil {
 		return res, err
@@ -126,8 +129,8 @@ func Backfill0019(ctx context.Context, d *sql.DB, opts Backfill0019Options) (Bac
 		pick: `SELECT id FROM channel_models
 		       WHERE id > $1 AND deleted_at IS NULL
 		       ORDER BY id ASC LIMIT $2`,
-		apply:   []string{markDriftSQL},
-		measure: `SELECT count(*) FROM channel_models WHERE id = ANY($1::bigint[]) AND edited`,
+		apply:       []string{markDriftSQL},
+		countWrites: true,
 	}, batch, opts.MaxBatchesPerPhase, logf)
 	if err != nil {
 		return res, err
@@ -224,6 +227,28 @@ func PendingLargeBackfills(ctx context.Context, d *sql.DB) ([]string, error) {
 		live, Backfill0019InlineThreshold, strings.Join(pending, "、"))}, nil
 }
 
+// EnsureBackfill0019Schema 校验 0019 的结构是否就绪（`channel_models.edited` 列 + 留档表）。
+//
+// 迁移**之前**跑回填会缺列，SQL 层面报的是 "column edited does not exist"，
+// 对运维不可读；这里提前拦住并说清「先跑迁移」。
+func EnsureBackfill0019Schema(ctx context.Context, d *sql.DB) error {
+	var hasColumn, hasArchive bool
+	if err := d.QueryRowContext(ctx,
+		`SELECT EXISTS (SELECT 1 FROM information_schema.columns
+		                WHERE table_name='channel_models' AND column_name='edited')`).Scan(&hasColumn); err != nil {
+		return fmt.Errorf("check channel_models.edited: %w", err)
+	}
+	if err := d.QueryRowContext(ctx,
+		`SELECT to_regclass('public.channel_base_url_archive') IS NOT NULL`).Scan(&hasArchive); err != nil {
+		return fmt.Errorf("check channel_base_url_archive: %w", err)
+	}
+	if !hasColumn || !hasArchive {
+		return fmt.Errorf("0019 结构未就绪（channel_models.edited=%v, channel_base_url_archive=%v）："+
+			"请先执行迁移 0019（启动后端或 make migrate），再跑本回填", hasColumn, hasArchive)
+	}
+	return nil
+}
+
 // EnsureBackfillCheckpoints 建断点表（幂等）。表结构刻意最小：一行一个阶段的已提交最大主键。
 func EnsureBackfillCheckpoints(ctx context.Context, d *sql.DB) error {
 	_, err := d.ExecContext(ctx, `
@@ -261,11 +286,14 @@ func ResetBackfillCheckpoint(ctx context.Context, d *sql.DB, phase string) error
 }
 
 type backfillPhase struct {
-	name    string
-	label   string
-	pick    string   // 取下一批主键（$1=lastID, $2=limit）
-	apply   []string // 批次内执行的语句（$1=ids 数组字面量）
-	measure string   // 批后测量（$1=ids 数组字面量），用于统计「实际生效」行数
+	name  string
+	label string
+	pick  string   // 取下一批主键（$1=lastID, $2=limit）
+	apply []string // 批次内执行的语句（$1=ids 数组字面量）
+	// 「本批生效行数」= 第一条 apply 语句的 RowsAffected（本次真正写入/标记的行数）。
+	// 不用「批内某表 count(*)」——那会把历史行也数进来，-reset 重跑会虚报。
+	// 前提：各阶段的第一条语句都只命中「尚未处理」的行（SQL 里带幂等条件）。
+	countWrites bool
 }
 
 type phaseResult struct {
@@ -322,15 +350,15 @@ func applyBackfillBatch(ctx context.Context, d *sql.DB, ph backfillPhase, anyArg
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	for _, stmt := range ph.apply {
-		if _, err := tx.ExecContext(ctx, stmt, anyArg); err != nil {
+	var measured int64
+	for i, stmt := range ph.apply {
+		res, err := tx.ExecContext(ctx, stmt, anyArg)
+		if err != nil {
 			return 0, fmt.Errorf("%s: exec batch: %w", ph.name, err)
 		}
-	}
-	var measured int64
-	if ph.measure != "" {
-		if err := tx.QueryRowContext(ctx, ph.measure, anyArg).Scan(&measured); err != nil {
-			return 0, fmt.Errorf("%s: measure batch: %w", ph.name, err)
+		if ph.countWrites && i == 0 {
+			// 只统计本次真正写入的行（幂等重放时 ON CONFLICT 命中的不算）。
+			measured, _ = res.RowsAffected()
 		}
 	}
 	if _, err := tx.ExecContext(ctx,
@@ -375,24 +403,27 @@ func idArrayLiteral(ids []int64) string {
 }
 
 // archiveChannelsSQL 留档被清空的内联基址/协议类型（裁定①：清空前先存一份，保证可无损回滚）。
+// 与迁移 (b) 同口径：只处理引用了**仍在生效**协议的渠道；协议已软删的渠道保持原值不动。
 const archiveChannelsSQL = `
 INSERT INTO channel_base_url_archive(channel_id, base_url, protocol)
-SELECT id, btrim(base_url), btrim(protocol)
-FROM channels
-WHERE id = ANY($1::bigint[])
-  AND deleted_at IS NULL
-  AND channel_protocol_id IS NOT NULL
-  AND (btrim(base_url) <> '' OR btrim(protocol) <> '')
+SELECT c.id, btrim(c.base_url), btrim(c.protocol)
+FROM channels c
+JOIN channel_protocols cp ON cp.id = c.channel_protocol_id AND cp.deleted_at IS NULL
+WHERE c.id = ANY($1::bigint[])
+  AND c.deleted_at IS NULL
+  AND (btrim(c.base_url) <> '' OR btrim(c.protocol) <> '')
 ON CONFLICT (channel_id) DO NOTHING`
 
 // clearChannelsSQL 清空「引用协议」渠道的内联基址与协议类型（该值不再参与解析）。
 const clearChannelsSQL = `
-UPDATE channels
+UPDATE channels c
 SET base_url = '', protocol = '', updated_at = now()
-WHERE id = ANY($1::bigint[])
-  AND deleted_at IS NULL
-  AND channel_protocol_id IS NOT NULL
-  AND (btrim(base_url) <> '' OR btrim(protocol) <> '')`
+FROM channel_protocols cp
+WHERE cp.id = c.channel_protocol_id
+  AND cp.deleted_at IS NULL
+  AND c.id = ANY($1::bigint[])
+  AND c.deleted_at IS NULL
+  AND (btrim(c.base_url) <> '' OR btrim(c.protocol) <> '')`
 
 // markDriftSQL 与迁移 (d) 段同口径：种子定义了的键 + 双方都有值 + 值不同 → edited=true。
 const markDriftSQL = `
@@ -403,6 +434,8 @@ JOIN channel_protocols cp ON cp.id = c.channel_protocol_id AND cp.deleted_at IS 
 WHERE cm.id = ANY($1::bigint[])
   AND cm.channel_id = c.id
   AND cm.deleted_at IS NULL
+  -- 只处理尚未标记的行：既保证 RowsAffected = 本次新标记数，也让重复执行成为空跑。
+  AND cm.edited = false
   AND cp.models ? cm.internal_model_id
   AND cp.models -> cm.internal_model_id ?| ARRAY[
         'externalModelID','protocols','costRates','timeConfig','contextTiers']
@@ -442,8 +475,11 @@ WHERE cm.id = ANY($1::bigint[])
         ))
     OR (cp.models -> cm.internal_model_id ? 'timeConfig'
         AND jsonb_typeof(cp.models -> cm.internal_model_id -> 'timeConfig') = 'object'
+        AND (cp.models -> cm.internal_model_id -> 'timeConfig') <> '{}'::jsonb
         AND cm.time_config IS NOT NULL
         AND jsonb_typeof(cm.time_config) = 'object'
+        -- 空对象 = 未设置（与 cost_rates / protocols / context_tiers 同口径），不算漂移。
+        AND cm.time_config <> '{}'::jsonb
         AND cm.time_config IS DISTINCT FROM (cp.models -> cm.internal_model_id -> 'timeConfig'))
     OR (cp.models -> cm.internal_model_id ? 'contextTiers'
         AND jsonb_typeof(cp.models -> cm.internal_model_id -> 'contextTiers') = 'array'

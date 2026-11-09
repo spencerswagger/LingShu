@@ -32,6 +32,7 @@ INSERT INTO channel_protocols(id, name, base_url, protocols, request_headers, mo
 VALUES (7, 'p7', 'https://proto.example.com', '{"openai-chat":{}}'::jsonb, '{"passthroughMode":"none"}'::jsonb,
         '{"qwen-max":{"externalModelID":"2","costRates":{"Input":1,"Output":2,"CacheRead":0.1}},
           "qwen-drift":{"externalModelID":"2","costRates":{"Input":3,"Output":4,"CacheRead":0.3}},
+          "qwen-subset":{"externalModelID":"2","protocols":{"anthropic-messages":{}}},
           "qwen-plus":{"externalModelID":"5"}}'::jsonb)`)
 
 	// 5 条引用协议的渠道（都有遗留基址）+ 1 条内联渠道（必须完全不动）。
@@ -41,11 +42,14 @@ VALUES (7, 'p7', 'https://proto.example.com', '{"openai-chat":{}}'::jsonb, '{"pa
 			i, "ref-"+itoa(i), "https://legacy-"+itoa(i)+".example.com")
 		// 每条渠道 3 个模型行：101/102/103 → drift、max、plus（id 唯一化）。
 		base := i * 10
+		// 每渠道 4 行：drift（成本偏离→标 edited）、max（与种子一致）、subset（种子有模型级协议
+		// 子集、实例为空→应被下移）、plus（种子无成本键）。
 		exec(t, tempDB, `INSERT INTO channel_models(id, channel_id, internal_model_id, external_model_id, cost_rates) VALUES
-			($1, $4, 'qwen-drift', 2, '{"input":1,"output":2,"cache_read":0.1}'::jsonb),
-			($2, $4, 'qwen-max',   2, '{"input":1,"output":2,"cache_read":0.1}'::jsonb),
-			($3, $4, 'qwen-plus',  5, '{"input":9,"output":9,"cache_read":9}'::jsonb)`,
-			base+1, base+2, base+3, i)
+			($1, $5, 'qwen-drift', 2, '{"input":1,"output":2,"cache_read":0.1}'::jsonb),
+			($2, $5, 'qwen-max',   2, '{"input":1,"output":2,"cache_read":0.1}'::jsonb),
+			($3, $5, 'qwen-subset', 2, '{"input":1,"output":2,"cache_read":0.1}'::jsonb),
+			($4, $5, 'qwen-plus',  5, '{"input":9,"output":9,"cache_read":9}'::jsonb)`,
+			base+1, base+2, base+3, base+4, i)
 	}
 	exec(t, tempDB, `INSERT INTO channels(id, name, base_url, protocol) VALUES (99, 'inline', 'https://inline.example.com', 'openai-chat')`)
 	exec(t, tempDB, `INSERT INTO channel_models(id, channel_id, internal_model_id, external_model_id, cost_rates)
@@ -141,13 +145,33 @@ func TestBackfill0019_Idempotent(t *testing.T) {
 	if first.ChannelsArchived != 5 {
 		t.Fatalf("期望新留档 5 条，got %d（result=%+v）", first.ChannelsArchived, first)
 	}
+	if first.ModelsDownshifted != 5 {
+		t.Fatalf("期望下移 5 行（每渠道 1 行 qwen-subset），got %d（result=%+v）", first.ModelsDownshifted, first)
+	}
 	if first.ModelsMarked != 5 {
 		t.Fatalf("期望标记 5 行 edited（每渠道 1 行 drift），got %d（result=%+v）", first.ModelsMarked, first)
 	}
 	// 第二遍：幂等空跑，不应再有新留档/新标记。
-	if second.ChannelsArchived != 0 || second.ModelsMarked != 0 {
+	if second.ChannelsArchived != 0 || second.ModelsMarked != 0 || second.ModelsDownshifted != 0 {
 		t.Fatalf("幂等重复执行不应再写入：%+v", second)
 	}
+	// -reset 重跑：留档不重复写，计数必须归零（此前统计「批内留档行数」会虚报）。
+	for _, phase := range []string{Backfill0019PhaseChannels, Backfill0019PhaseDownshift, Backfill0019PhaseModels} {
+		if err := ResetBackfillCheckpoint(ctx, tempDB, phase); err != nil {
+			t.Fatalf("重置断点 %s 失败: %v", phase, err)
+		}
+	}
+	third, err := Backfill0019(ctx, tempDB, Backfill0019Options{BatchSize: 2})
+	if err != nil {
+		t.Fatalf("重置后重跑失败: %v", err)
+	}
+	if third.ChannelsArchived != 0 {
+		t.Fatalf("-reset 重跑不应再计新增留档（幂等），got %d", third.ChannelsArchived)
+	}
+	if third.ModelsMarked != 0 {
+		t.Fatalf("-reset 重跑不应再计新标记的行（已标记过），got %d", third.ModelsMarked)
+	}
+
 	// 内联渠道必须未被触碰。
 	var inlineURL string
 	if err := tempDB.QueryRow(`SELECT base_url FROM channels WHERE id=99`).Scan(&inlineURL); err != nil {

@@ -2,6 +2,7 @@ package channelprotocol
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -97,5 +98,56 @@ func TestEffectiveBaseURL_Chain(t *testing.T) {
 	var nilCP *ChannelProtocol
 	if got := nilCP.EffectiveBaseURL(ProtocolOpenAIChat); got != "" {
 		t.Fatalf("nil 接收者应返回空串, got %q", got)
+	}
+}
+
+// P1-③：预设同步路径（toChannelProtocol）必须与 admin 写路径同口径——模型级 baseUrl 废弃后
+// 落库前清空，否则 sync 会把该键又写回库里，绕过归属收敛。
+func TestToChannelProtocol_DropsModelBaseURL(t *testing.T) {
+	p := Provider{
+		ID:   "prov",
+		Name: "Prov",
+		Models: map[string]Model{
+			"m1": {
+				ID: "m1",
+				Gateway: ModelGateway{
+					BaseURL:         "https://model-level.example.com",
+					ExternalModelID: 2,
+					Protocols:       Protocols{ProtocolOpenAIChat: {}},
+				},
+			},
+		},
+	}
+	cp := p.toChannelProtocol()
+	mg, ok := cp.Models["m1"]
+	if !ok {
+		t.Fatalf("模型条目应被物化: %+v", cp.Models)
+	}
+	if mg.BaseURL != "" {
+		t.Fatalf("同步路径应清空模型级 baseUrl, got %q", mg.BaseURL)
+	}
+	// 落库形态（channel_protocols.models JSONB）不得再出现该键。
+	raw, err := json.Marshal(cp.Models)
+	if err != nil {
+		t.Fatalf("marshal models: %v", err)
+	}
+	if strings.Contains(string(raw), "baseUrl") {
+		t.Fatalf("持久化形态仍含 baseUrl: %s", raw)
+	}
+	// 其它模型级字段照旧（不能顺手把成本/绑定也清掉）。
+	if mg.ExternalModelID != 2 || len(mg.Protocols) != 1 {
+		t.Fatalf("其余模型级字段应保留: %+v", mg)
+	}
+}
+
+// 同步路径同时保留 provider 级基址（模板基址是协议基址的唯一来源，不能被误清）。
+func TestToChannelProtocol_KeepsProviderBaseURL(t *testing.T) {
+	p := Provider{ID: "prov", Name: "Prov", Gateway: GatewayBlock{BaseURL: "https://provider.example.com"}}
+	cp := p.toChannelProtocol()
+	if cp.BaseURL != "https://provider.example.com" {
+		t.Fatalf("provider 级 baseUrl 应保留, got %q", cp.BaseURL)
+	}
+	if cp.PresetSourceID != "prov" || cp.SourceStatus != SourceActive || cp.Edited {
+		t.Fatalf("来源字段不应被归一化改掉: %+v", cp)
 	}
 }

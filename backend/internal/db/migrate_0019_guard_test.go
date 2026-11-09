@@ -31,7 +31,9 @@ VALUES (7, 'p7', 'https://proto.example.com', '{"openai-chat":{}}'::jsonb, '{"pa
    "m_conflict_protocols": {"externalModelID":"2","protocols":{"anthropic-messages":{}}},
    "m_cost_1_vs_1_0":      {"externalModelID":"2","costRates":{"Input":1,"Output":2,"CacheRead":0.1}},
    "m_seed_no_cost":       {"externalModelID":"5"},
-   "m_timecfg_null":       {"externalModelID":"2","timeConfig":{"Default":1.5}}
+   "m_timecfg_null":       {"externalModelID":"2","timeConfig":{"Default":1.5}},
+   "m_timecfg_empty":      {"externalModelID":"2","timeConfig":{"Default":2}},
+   "m_timecfg_diff":       {"externalModelID":"2","timeConfig":{"Default":3}}
  }'::jsonb)`)
 	exec(t, tempDB, `INSERT INTO channels(id, name, base_url, protocol, channel_protocol_id)
 		VALUES (1, 'ref', 'https://legacy.example.com', 'openai-compat', 7)`)
@@ -45,7 +47,13 @@ VALUES (7, 'p7', 'https://proto.example.com', '{"openai-chat":{}}'::jsonb, '{"pa
 		(104, 1, 'm_seed_no_cost',       5, '{"input":9,"output":9,"cache_read":9}'::jsonb, NULL),
 		(105, 1, 'm_timecfg_null',       2, '{"input":1,"output":2,"cache_read":0.1}'::jsonb, NULL),
 		(106, 1, 'm_seed_no_entry',      2, '{"input":5,"output":5,"cache_read":5}'::jsonb, NULL),
+		-- P1-① 回归：time_config 为空对象 = 未设置，不得标 edited（否则该行永久冻结）。
+		(107, 1, 'm_timecfg_empty',      2, '{"input":1,"output":2,"cache_read":0.1}'::jsonb, NULL),
+		-- 对照：双方都有值且不同 → 标 edited。
+		(108, 1, 'm_timecfg_diff',       2, '{"input":1,"output":2,"cache_read":0.1}'::jsonb, NULL),
 		(201, 2, 'inline-1',             2, '{"input":7,"output":7,"cache_read":7}'::jsonb, NULL)`)
+	exec(t, tempDB, `UPDATE channel_models SET time_config = '{}'::jsonb WHERE id = 107`)
+	exec(t, tempDB, `UPDATE channel_models SET time_config = '{"Default":9}'::jsonb WHERE id = 108`)
 }
 
 // ownershipSnapshot 取「迁移/回填结果」的可比快照：渠道基址、留档、模型行的 protocols/edited/成本/绑定。
@@ -183,6 +191,14 @@ func TestMigrate_0019_DriftBoundaries(t *testing.T) {
 	if timeRaw != nil {
 		t.Fatalf("105 下移/漂移都不该碰 time_config，got %s", timeRaw)
 	}
+	// 5b) P1-① 回归：实例 time_config = '{}' 属未设置，与 cost_rates='{}' 同口径，不标 edited。
+	if got[107].edited {
+		t.Fatalf("107 实例 time_config='{}' 属未设置，不应标 edited（否则该行永久冻结）, got %+v", got[107])
+	}
+	// 5c) 对照：实例 time_config 有值与种子不同 → 标 edited。
+	if !got[108].edited {
+		t.Fatalf("108 实例 time_config 与种子不同，应标 edited, got %+v", got[108])
+	}
 	// 6) 种子根本没有该模型 → 完全不动。
 	if got[106].edited {
 		t.Fatalf("106 不在协议种子内，不应标 edited, got %+v", got[106])
@@ -277,5 +293,117 @@ func TestMigrate_0019_ThresholdGuard(t *testing.T) {
 	}
 	if len(msgs) != 0 {
 		t.Fatalf("回填完成后不应再有告警, got %v", msgs)
+	}
+}
+
+// 归档范围边界：软删渠道不归档、已空渠道不产生留档行、引用「已软删协议」的渠道不归档（协议谓词带 deleted_at）。
+func TestMigrate_0019_ArchiveScope(t *testing.T) {
+	tempDB := openTempDB(t)
+	migDir := filepath.Join(filepath.Dir(mustCallerFile(t)), "migrations")
+	applyMigrationsBelow(t, tempDB, migDir, "0019")
+
+	exec(t, tempDB, `INSERT INTO channel_protocols(id, name, base_url, models) VALUES (7,'live','https://live.example.com','{}'::jsonb)`)
+	exec(t, tempDB, `INSERT INTO channel_protocols(id, name, base_url, models, deleted_at)
+		VALUES (8,'gone','https://gone.example.com','{}'::jsonb, now())`)
+	// 1 正常（应归档） / 2 已空（不产生留档） / 3 软删（不归档） / 4 引用软删协议（不归档） / 5 内联（不归档）
+	exec(t, tempDB, `INSERT INTO channels(id, name, base_url, protocol, channel_protocol_id) VALUES
+		(1, 'live-with-url',  'https://legacy-1.example.com', 'openai-compat', 7),
+		(2, 'live-empty-url', '', '', 7), -- base_url 与 protocol 都空：真正的「无需留档」
+		(3, 'soft-deleted',   'https://legacy-3.example.com', 'openai-compat', 7),
+		(4, 'refs-deleted',   'https://legacy-4.example.com', 'openai-compat', 8),
+		(5, 'inline',         'https://inline.example.com',   'openai-chat', NULL)`)
+	exec(t, tempDB, `UPDATE channels SET deleted_at = now() WHERE id = 3`)
+
+	runMigration(t, tempDB, migDir, migrationFile(t, migDir, "0019"))
+
+	archived := map[int64]bool{}
+	rows, err := tempDB.Query(`SELECT channel_id FROM channel_base_url_archive`)
+	if err != nil {
+		t.Fatalf("读取留档失败: %v", err)
+	}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			t.Fatalf("扫描留档失败: %v", err)
+		}
+		archived[id] = true
+	}
+	rows.Close()
+
+	if !archived[1] {
+		t.Fatalf("正常引用协议渠道应被归档")
+	}
+	if archived[2] {
+		t.Fatalf("基址/协议已空的渠道不应产生留档行")
+	}
+	if archived[3] {
+		t.Fatalf("软删渠道不应归档")
+	}
+	if archived[4] {
+		t.Fatalf("引用已软删协议的渠道不应归档（协议谓词须带 deleted_at IS NULL）")
+	}
+	if archived[5] {
+		t.Fatalf("内联渠道不应归档")
+	}
+
+	// 软删渠道的 base_url 也不能被清空（它可能被恢复）。
+	var url3 string
+	if err := tempDB.QueryRow(`SELECT base_url FROM channels WHERE id=3`).Scan(&url3); err != nil {
+		t.Fatalf("读取软删渠道失败: %v", err)
+	}
+	if url3 != "https://legacy-3.example.com" {
+		t.Fatalf("软删渠道的 base_url 不应被清空, got %q", url3)
+	}
+	// 引用已软删协议的渠道保持原值（迁移不碰它；rows_live 仍存在但协议谓词挡住）。
+	var url4 string
+	if err := tempDB.QueryRow(`SELECT base_url FROM channels WHERE id=4`).Scan(&url4); err != nil {
+		t.Fatalf("读取渠道 4 失败: %v", err)
+	}
+	if url4 != "https://legacy-4.example.com" {
+		t.Fatalf("引用软删协议的渠道不应被清空, got %q", url4)
+	}
+}
+
+// 迁移前跑回填：必须给出可读错误（先说清「先跑迁移」），而不是抛 column does not exist。
+func TestBackfill0019_BeforeMigrationFailsReadably(t *testing.T) {
+	tempDB := openTempDB(t)
+	migDir := filepath.Join(filepath.Dir(mustCallerFile(t)), "migrations")
+	applyMigrationsBelow(t, tempDB, migDir, "0019") // 只到 0018
+
+	_, err := Backfill0019(context.Background(), tempDB, Backfill0019Options{BatchSize: 10})
+	if err == nil {
+		t.Fatalf("迁移前跑回填应失败")
+	}
+	if !strings.Contains(err.Error(), "请先执行迁移") || !strings.Contains(err.Error(), "0019") {
+		t.Fatalf("错误信息应指导先跑迁移, got: %v", err)
+	}
+}
+
+// 回填跑完后再执行迁移 0019：幂等，结果不变（>5 万行的真实顺序）。
+func TestMigrate_0019_AfterBackfillIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	tempDB := openTempDB(t)
+	migDir := filepath.Join(filepath.Dir(mustCallerFile(t)), "migrations")
+	applyMigrationsBelow(t, tempDB, migDir, "0019")
+	seedOwnershipFixture(t, tempDB)
+	exec(t, tempDB, `INSERT INTO channel_models(id, channel_id, internal_model_id, external_model_id, cost_rates)
+		SELECT 2000000 + i, 1, 'bulk2-' || i, 2, '{"input":1,"output":2,"cache_read":0.1}'::jsonb
+		FROM generate_series(1, 50001) AS i`)
+
+	// 1) 迁移（超阈值 → 只做 DDL）。
+	runMigration(t, tempDB, migDir, migrationFile(t, migDir, "0019"))
+	// 2) 独立回填补齐数据段。
+	if _, err := Backfill0019(ctx, tempDB, Backfill0019Options{BatchSize: 25000}); err != nil {
+		t.Fatalf("回填失败: %v", err)
+	}
+	afterBackfill := ownershipSnapshot(t, tempDB)
+
+	// 3) 再跑一次迁移：内联回填此时仍会因超阈值跳过，但即便执行也必须是幂等空跑。
+	runMigration(t, tempDB, migDir, migrationFile(t, migDir, "0019"))
+	if got := ownershipSnapshot(t, tempDB); got != afterBackfill {
+		t.Fatalf("回填后再跑迁移改变了结果（应幂等）：\n--- before ---\n%s\n--- after ---\n%s", afterBackfill, got)
+	}
+	if msgs, err := PendingLargeBackfills(ctx, tempDB); err != nil || len(msgs) != 0 {
+		t.Fatalf("回填完成且迁移重跑后不应再有告警: %v / %v", msgs, err)
 	}
 }

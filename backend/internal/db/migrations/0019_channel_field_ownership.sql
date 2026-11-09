@@ -60,21 +60,25 @@ BEGIN
     ELSE
     -- ---------- (b) 归档并清空「引用协议」渠道的内联基址与协议类型 ----------
 
+    -- 只处理「引用了仍在生效的协议」的渠道：协议已软删的渠道保持原值不动——
+    -- 那种状态下运行时解析不到协议基址，清空只会丢掉唯一可恢复的地址（等人工修复，不是迁移的事）。
     INSERT INTO channel_base_url_archive(channel_id, base_url, protocol)
-    SELECT id, btrim(base_url), btrim(protocol)
-    FROM channels
-    WHERE deleted_at IS NULL
-      AND channel_protocol_id IS NOT NULL
-      AND (btrim(base_url) <> '' OR btrim(protocol) <> '')
+    SELECT c.id, btrim(c.base_url), btrim(c.protocol)
+    FROM channels c
+    JOIN channel_protocols cp ON cp.id = c.channel_protocol_id AND cp.deleted_at IS NULL
+    WHERE c.deleted_at IS NULL
+      AND (btrim(c.base_url) <> '' OR btrim(c.protocol) <> '')
     ON CONFLICT (channel_id) DO NOTHING;
 
-    UPDATE channels
+    UPDATE channels c
     SET base_url = '',
         protocol = '',
         updated_at = now()
-    WHERE deleted_at IS NULL
-      AND channel_protocol_id IS NOT NULL
-      AND (btrim(base_url) <> '' OR btrim(protocol) <> '');
+    FROM channel_protocols cp
+    WHERE cp.id = c.channel_protocol_id
+      AND cp.deleted_at IS NULL
+      AND c.deleted_at IS NULL
+      AND (btrim(c.base_url) <> '' OR btrim(c.protocol) <> '');
 
     -- ---------- (c) 模型级协议子集下沉 ----------
     -- 语义等价：旧运行时是「实例 protocols 为空 → 回落种子 models[m].protocols → 回落协议 protocols」，
@@ -150,8 +154,12 @@ BEGIN
         -- 时段系数 / 上下文分档：双方都有内容且不同。
         OR (cp.models -> cm.internal_model_id ? 'timeConfig'
             AND jsonb_typeof(cp.models -> cm.internal_model_id -> 'timeConfig') = 'object'
+            AND (cp.models -> cm.internal_model_id -> 'timeConfig') <> '{}'::jsonb
             AND cm.time_config IS NOT NULL
             AND jsonb_typeof(cm.time_config) = 'object'
+            -- 空对象 = 未设置（与 cost_rates / protocols / context_tiers 同口径），不算漂移；
+            -- 缺这一条会把 time_config='{}' 的行误标 edited，从而永久冻结协议同步。
+            AND cm.time_config <> '{}'::jsonb
             AND cm.time_config IS DISTINCT FROM (cp.models -> cm.internal_model_id -> 'timeConfig'))
         OR (cp.models -> cm.internal_model_id ? 'contextTiers'
             AND jsonb_typeof(cp.models -> cm.internal_model_id -> 'contextTiers') = 'array'

@@ -45,7 +45,14 @@
 但 §6.1 的 SQL 里没有这一步。不补的话，凡是「实例 protocols 为空、靠种子回落」的模型行会突然丢掉
 模型级协议子集（行为回退）。迁移 0019 用 (c) 段补上，只写「实例为空」的行。
 
-### 2.3 没有「渠道侧旧转换配置归并到协议」这一步，因为不存在渠道侧存储
+### 2.3 归档范围：只处理「引用了仍在生效的协议」的渠道
+
+迁移 (b) 与回填的归档/清空语句都 `JOIN channel_protocols cp ON cp.id = c.channel_protocol_id
+AND cp.deleted_at IS NULL`：协议已被软删的渠道**保持原值不动**——那种状态下运行时解析不到协议基址，
+清空只会丢掉唯一可恢复的地址，属于要人工修复的脏数据，不是迁移该悄悄处理的范围。
+同理软删渠道不归档、`base_url` 与 `protocol` 都空的渠道不产生留档行。
+
+### 2.4 没有「渠道侧旧转换配置归并到协议」这一步，因为不存在渠道侧存储
 
 0019 之前，跨协议转换只存在于 `channel_protocols.models[m].convertEnabled/convertTargets`，
 `channel_models` 从来没有这两列（契约 §1.3 的盘点即如此）。因此裁定②落地时不需要
@@ -62,7 +69,11 @@
 | (a) | 加 `edited` 列；建 `channel_base_url_archive` | 是（`IF NOT EXISTS`） |
 | (b) | 引用协议渠道：`base_url`/`protocol` 归档后清空 | 是（`ON CONFLICT DO NOTHING` + 仅命中非空） |
 | (c) | 种子的模型级 `protocols` 下移到实例（仅实例为空时；下移必须在 (d) 之前） | 是 |
-| (d) | 漂移标记 `edited=true`（种子定义了 + 双方都有值 + 值不等；成本按 `Input/Output/CacheRead` → snake 逐键 numeric 比较） | 是 |
+| (d) | 漂移标记 `edited=true`（种子定义了 + 双方都有值且**都非空** + 值不等；成本按 `Input/Output/CacheRead` → snake 逐键 numeric 比较） | 是 |
+
+> 「非空」守卫对四个字段一视同仁：`cost_rates='{}'`、`protocols='{}'`、`context_tiers='[]'`、
+> `time_config='{}'` 都视为**未设置**、不标 `edited`。漏掉 `time_config` 这一条会把该行永久冻结在
+> 协议同步之外（Gate P1-① 的回归点）。
 
 (b)(c)(d) 三段整体包在 `DO $$ … END $$` 阈值守卫里（方案 A，见 §4）：若 `channel_models` 未删除行数超过
 `db.Backfill0019InlineThreshold`（默认 5 万），只执行 (a) 并 `RAISE WARNING`，数据段留给独立脚本。
@@ -108,11 +119,15 @@
 - 想要从头重跑（演练）：`-reset`。
 
 已验证（PG17 真跑）：
+`TestMigrate_0019_ArchiveScope`（软删渠道/已空渠道/引用软删协议的渠道都不归档、原值不被清）、
+`TestBackfill0019_BeforeMigrationFailsReadably`（迁移前跑回填给出「请先执行迁移 0019」的可读错误）、
+`TestMigrate_0019_AfterBackfillIsIdempotent`（>5 万行：迁移→回填→再跑迁移，结果逐行不变且告警消失）、
 `TestBackfill0019_Idempotent`（跑两遍状态逐行一致、第二遍零写入）、
 `TestBackfill0019_ResumeFromCheckpoint`（限批模拟中断 → 断点前进 → 续跑后与一次跑完逐行一致）、
 `TestBackfill0019_AfterMigrationIsNoop`、`TestBackfill0019_MatchesMigrationResult`（脚本三段结果与迁移逐行一致）、
 `TestMigrate_0019_ThresholdGuard`（超阈值只做 DDL + 告警 + 跑完脚本后告警消失）、
-`TestMigrate_0019_DriftBoundaries`（契约 §6.1(c)(d) 五条边界逐条断言）。
+`TestMigrate_0019_DriftBoundaries`（契约 §6.1(c)(d) 边界逐条断言，含 `time_config='{}'` 不误标）。
+计数口径：三段都取语句的 `RowsAffected`（本次真正写入数），`-reset` 重跑计数归零。
 
 ---
 
@@ -143,7 +158,8 @@
 
 ## 7. 给下游
 
-- **View**：`ChannelView` 新增只读派生 `BaseURLEffective`；引用协议时 `BaseURL`/`Protocol` 恒为 `''`，
+- **View**：`ChannelView` **与 `GET /api/v1/admin/channels` 的 `Channel`** 都带只读派生 `BaseURLEffective`
+  （引用协议→协议基址；内联→自身 `base_url`；渠道列表页不再空白）；引用协议时 `BaseURL`/`Protocol` 恒为 `''`，
   前端应隐藏这两个输入并展示「基址跟随协议：<协议名>（<BaseURLEffective>）」，提交时传 `''`。
   模型行新增只读 `Edited`（徽标 + 「重置为协议值」调 `reset-from-protocol`）。转换配置仍在协议编辑页（标注协议级共享）。
 - **Gate**：契约 §7.3 的用例表可直接抄；注意「PUT `Protocol="openai-chat"`」的期望是**不报错且落库为 `''`**，
