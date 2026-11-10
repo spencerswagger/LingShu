@@ -368,6 +368,9 @@ func (s *Service) settleTx(ctx context.Context, rec *Record, req RecordReq, cred
 		// 真实写入失败：本次扣款已回滚（余额不变），退回非事务路径重试；其失败由重试队列兜底。
 		return nil, ierr, false
 	}
+	// 日级预聚合增量累加（统计派生数据）：与账单同事务，但用 SAVEPOINT 隔离——
+	// 聚合写失败只回滚到保存点，账单照常提交（下一轮启动回填按天覆盖补齐）。
+	_ = upsertDailyStatsTx(ctx, tx, rec)
 	if cerr := tx.Commit(); cerr != nil {
 		// 提交结果不确定（可能已提交）：不重投，避免重复扣款，直接报错。
 		return nil, fmt.Errorf("commit billing tx: %w", cerr), true
@@ -395,6 +398,11 @@ func (s *Service) settlePlain(ctx context.Context, rec *Record, req RecordReq, c
 		}
 		s.enqueueRetry(rec, err)
 		return nil, err
+	}
+	// 非事务路径：账单已落库，再累加日级预聚合（失败只记日志，不回滚账单）。
+	// 用可选能力接口探测，避免给 Store 接口加方法影响既有测试桩。
+	if u, ok := s.store.(dailyStatsUpserter); ok {
+		u.UpsertDailyStats(ctx, rec)
 	}
 	return rec, nil
 }
@@ -973,13 +981,16 @@ func (s *SqlStore) insertOn(ctx context.Context, ex dbx.Execer, rec *Record) (*R
 	err = ex.QueryRowContext(ctx,
 		`INSERT INTO billing_records(id, billing_id, user_id, pricing_mode, token_id, external_model_name,
 			auto_model_name, internal_model_id, channel_key_id, session_id, session_name, call_time, tokens, rates, coefficients, r_value,
-			raw_total, credits_consumed, cost_credits, balance_before, balance_after, status, error_message, duration_ms, first_token_ms)
-		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
+			raw_total, credits_consumed, cost_credits, balance_before, balance_after, status, error_message, duration_ms, first_token_ms,
+			input_tokens, cache_read_tokens, output_tokens)
+		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28)
 		 RETURNING id, created_at`,
 		rec.ID, rec.BillingID, rec.UserID, rec.PricingMode, tokenID, rec.ExternalModel, autoModelName,
 		rec.InternalModelID, channelKeyID, sessionID, sessionName, rec.CallTime, tokensRaw, ratesRaw, coeffRaw,
 		rec.RValue, rec.RawTotal, rec.CreditsConsumed, rec.CostCredits,
-		rec.BalanceBefore, rec.BalanceAfter, rec.Status, errMsg, durationMs, firstTokenMs).
+		rec.BalanceBefore, rec.BalanceAfter, rec.Status, errMsg, durationMs, firstTokenMs,
+		// 三段 token 同时落实体列（0020）：看板/统计不再逐行解析 JSONB 并跑正则守卫。
+		rec.Tokens.Input, rec.Tokens.CacheRead, rec.Tokens.Output).
 		Scan(&rec.ID, &created)
 	if err != nil {
 		return nil, err

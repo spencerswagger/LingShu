@@ -75,14 +75,15 @@ func TestHandleMeSummary(t *testing.T) {
 			"busy_requests", "busy_tokens", "busy_duration"}).
 			AddRow(requests, credits, tokens, int64(0), input, cacheRead, requests, tokens, int64(0))
 	}
-	// 过滤参数：user_id=1；三档消耗带 status='completed'，吞吐窗口不带；
-	// 时间参数用 AnyArg（边界逻辑已由 TestSummaryRanges_Shanghai 覆盖）。
-	argsCompleted := []driver.Value{int64(1), nil, nil, "", "", "", "completed", sqlmock.AnyArg(), sqlmock.AnyArg()}
+	// 三档消耗一次查询命中日级预聚合（user_daily_stats），行数=天数，与明细表行数无关；
+	// 时间参数用 AnyArg（日界逻辑已由 TestSummaryRanges_Shanghai 覆盖）。
+	rollup := sqlmock.NewRows([]string{"today", "yesterday", "month", "input", "cache_read"}).
+		AddRow(1.5, 2.5, 3.5, int64(120), int64(30))
+	mock.ExpectQuery(regexp.QuoteMeta(`FROM user_daily_stats`)).WithArgs(
+		int64(1), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
+	).WillReturnRows(rollup)
+	// 近 1 分钟吞吐窗口仍查明细（秒级口径不做缓存）：不带 status 过滤。
 	argsAll := []driver.Value{int64(1), nil, nil, "", "", "", "", sqlmock.AnyArg(), sqlmock.AnyArg()}
-	// 严格顺序：today、yesterday、month、window。
-	mock.ExpectQuery(regexp.QuoteMeta(summarySQL)).WithArgs(argsCompleted...).WillReturnRows(rows(10, 1.5, 100, 40, 10))
-	mock.ExpectQuery(regexp.QuoteMeta(summarySQL)).WithArgs(argsCompleted...).WillReturnRows(rows(20, 2.5, 200, 80, 20))
-	mock.ExpectQuery(regexp.QuoteMeta(summarySQL)).WithArgs(argsCompleted...).WillReturnRows(rows(30, 3.5, 300, 120, 30))
 	mock.ExpectQuery(regexp.QuoteMeta(summarySQL)).WithArgs(argsAll...).WillReturnRows(rows(50, 0.5, 500, 200, 50))
 
 	dev := NewDev(billing.NewSqlStore(db), func(context.Context) (int64, bool) { return 1, true })

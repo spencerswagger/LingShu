@@ -10,19 +10,23 @@
 package console
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/team/llmgateway/internal/domain/billing"
 	"github.com/team/llmgateway/internal/pkg/decimalx"
 	"github.com/team/llmgateway/internal/pkg/resp"
+	"github.com/team/llmgateway/internal/pkg/statscache"
 )
 
 // costRProvider 提供积分换算系数 R（billing.ConfigProvider 满足；窄接口避免过度耦合）。
@@ -34,12 +38,16 @@ type costRProvider interface {
 // costDefaultR 积分换算系数默认值（未装配配置源时的兜底，与 sys_configs billing.r 默认一致）。
 const costDefaultR = 10000
 
-// costTokenSumSQL 三段 token 之和的聚合表达式（别名固定为 b）：正则守卫非法值/超长值按 0。
-// 长度上限 18 位（含符号最多 19 字符）确保 ::bigint 不溢出（int64 上限约 9.2e18）。
-const costTokenSumSQL = `COALESCE(SUM(CASE WHEN (b.tokens->>'%[1]s') ~ '^-?[0-9]{1,18}$' THEN (b.tokens->>'%[1]s')::bigint ELSE 0 END), 0)`
+// costTokenSumSQL 三段 token 的聚合表达式（别名固定为 b）。
+//
+// 读 0020 新增的实体列 input_tokens / cache_read_tokens / output_tokens，不再逐行解析 tokens JSONB：
+// 原实现是「每行 × 三段 × 一次正则 + 一次 ::bigint」，30 万行量级就要几百毫秒，
+// 3000 万行下 3.5s 的耗时里大头就是这段（见 notes/stats-billing-perf.md 的对照实测）。
+// 列由写入路径落库、存量行由启动回填补齐，语义与「缺失/非法按 0」一致（列为 NOT NULL DEFAULT 0）。
+const costTokenSumSQL = `COALESCE(SUM(b.%[1]s_tokens), 0)`
 
-// costTokenRowSQL 三段 token 的单行表达式（别名固定为 b）：正则守卫非法值/超长值按 0。
-const costTokenRowSQL = `CASE WHEN (b.tokens->>'%[1]s') ~ '^-?[0-9]{1,18}$' THEN (b.tokens->>'%[1]s')::bigint ELSE 0 END`
+// costTokenRowSQL 三段 token 的单行表达式（别名固定为 b）。
+const costTokenRowSQL = `COALESCE(b.%[1]s_tokens, 0)`
 
 // costProbeExclusionSQL 排除「健康探测记账」行的行过滤条件（b 为 billing_records 别名）。
 //
@@ -50,12 +58,19 @@ const costTokenRowSQL = `CASE WHEN (b.tokens->>'%[1]s') ~ '^-?[0-9]{1,18}$' THEN
 //
 // 口径变化（spencer 已拍板）：探测开销不再计入售价/统计口径。此前探测行混进统计，
 // 会把售价与请求数抬高（test 库此前虚高约 14.25%），属预期修正，不是回归。
+//
+// 性能注记（2026-11-10，30M 行实测）：探测身份判定写成 `token_id IN (子查询)` 而不是
+// 相关子查询 `EXISTS (... WHERE t.id = b.token_id)`。语义相同（都是「这个 token 属于系统探测身份」），
+// 但后者是逐行执行的相关子计划，30M 行下每行都要进一次 tokens⋈users；写成 IN 后优化器生成
+// hashed SubPlan，只算一次，普通（sale 模式）行在前两个条件就短路、子计划根本不执行。
+// 注意：该接口的总耗时大头不在这里，而是 30 天窗口（≈1000 万行）的实体 join + array_agg 排序，
+// 单靠去正则/去相关子查询只能从 132s 降到 ~12s（jit 开）；要再快必须按「实体 × 天」预聚合。
 const costProbeExclusionSQL = `NOT (
         b.pricing_mode = 'cost'
         AND b.token_id IS NOT NULL
-        AND EXISTS (
-            SELECT 1 FROM tokens t JOIN users u ON u.id = t.user_id
-            WHERE t.id = b.token_id AND (u.is_system OR t.display_name = 'system-probe')
+        AND b.token_id IN (
+            SELECT t.id FROM tokens t JOIN users u ON u.id = t.user_id
+            WHERE u.is_system OR t.display_name = 'system-probe'
         )
         AND NOT EXISTS (SELECT 1 FROM call_logs cl WHERE cl.billing_id = b.billing_id)
     )`
@@ -146,31 +161,118 @@ LEFT JOIN (` + costEntityResolveBody + `) r
 LEFT JOIN channels c ON c.id = k.channel_id
 LEFT JOIN external_models em ON em.id = r.external_model_id
 WHERE b.status = 'completed'
+  AND b.call_time >= $1 AND b.call_time <= $2
   AND ` + costProbeExclusionSQL + `
 GROUP BY 1
 ORDER BY COALESCE(SUM(b.cost_credits), 0) DESC NULLS LAST, 1`
 
-// HandleCostStats GET /api/v1/admin/cost/stats
+// costStatsDefaultWindow 成本统计默认时间窗：近 30 天。
+//
+// 改造前该接口不带任何时间条件 = 全表扫（明细永久保留），行数越多越慢，且「Total」含义随数据量漂移。
+// 现在默认给 30 天窗口，`?From=&To=` 可显式指定（都是含端点的自然日），响应回带实际生效区间。
+const costStatsDefaultWindow = 30 * 24 * time.Hour
+
+// costStatsRange 本次统计实际生效的时间窗（响应回带，便于前端标注「统计区间」）。
+type costStatsRange struct {
+	From string `json:"From"`
+	To   string `json:"To"`
+}
+
+// costStatsResponse 成本统计响应（Rows/Total 与改造前同名同形，新增 Range）。
+type costStatsResponse struct {
+	Rows  []costStatsRow `json:"Rows"`
+	Total costStatsTotal `json:"Total"`
+	Range costStatsRange `json:"Range"`
+}
+
+// costStatsWindow 解析统计区间：缺省 = 近 30 天；From/To 支持 2006-01-02 或 RFC3339。
+// 返回按自然日归一的闭区间与原始请求键（缓存键用）。
+func costStatsWindow(now time.Time, q url.Values) (from, to time.Time, err error) {
+	loc := cnLocation()
+	to = now.In(loc)
+	from = to.Add(-costStatsDefaultWindow)
+	if v := strings.TrimSpace(q.Get("To")); v != "" {
+		to, err = parseStatsTime(v, loc)
+		if err != nil {
+			return time.Time{}, time.Time{}, fmt.Errorf("To 格式非法（支持 2006-01-02 或 RFC3339）")
+		}
+	}
+	if v := strings.TrimSpace(q.Get("From")); v != "" {
+		from, err = parseStatsTime(v, loc)
+		if err != nil {
+			return time.Time{}, time.Time{}, fmt.Errorf("From 格式非法（支持 2006-01-02 或 RFC3339）")
+		}
+	}
+	// 归一到自然日边界：from 取当日 00:00:00，to 取当日 23:59:59（闭区间）。
+	from = time.Date(from.In(loc).Year(), from.In(loc).Month(), from.In(loc).Day(), 0, 0, 0, 0, loc)
+	td := to.In(loc)
+	to = time.Date(td.Year(), td.Month(), td.Day(), 23, 59, 59, 0, loc)
+	if to.Before(from) {
+		return time.Time{}, time.Time{}, fmt.Errorf("To 不能早于 From")
+	}
+	return from, to, nil
+}
+
+// parseStatsTime 解析统计接口的时间参数（日期或 RFC3339，按北京时间解释）。
+func parseStatsTime(v string, loc *time.Location) (time.Time, error) {
+	if t, err := time.ParseInLocation("2006-01-02", v, loc); err == nil {
+		return t, nil
+	}
+	t, err := time.Parse(time.RFC3339, v)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return t.In(loc), nil
+}
+
+// HandleCostStats GET /api/v1/admin/cost/stats?From=&To=
 // 按**实体**（渠道 + 解析出的对外模型 + 解析出的渠道内部模型）聚合成本/售价/请求数/三段 token 与派生比率；
-// 仅统计 status='completed' 的消耗，且剔除健康探测记账行；Total 为全表同口径聚合。
+// 仅统计 status='completed' 的消耗，且剔除健康探测记账行；Total 为同一时间窗内的合计。
 //
 // 与改造前相比：行数会变少（同一实体的历史文本快照合并成一行，见 SnapshotNames），
-// 金额不会变（分组变化不影响求和），探测行被剔除（预期修正，见 costProbeExclusionSQL）。
+// 金额不会变（分组变化不影响求和），探测行被剔除（预期修正，见 costProbeExclusionSQL），
+// 统计区间默认收敛到近 30 天（可用 From/To 覆盖，响应回带 Range）。
+//
+// 结果套 5 分钟进程内缓存（键含区间）：成本看板是只读聚合，5 分钟滞后可接受，
+// 换来「多人同时打开成本页只打一次 DB」。
 func (h *Admin) HandleCostStats(w http.ResponseWriter, r *http.Request) {
-	rows := make([]costStatsRow, 0)
 	if h.db == nil {
-		resp.OK(w, r, map[string]any{"Rows": rows, "Total": costStatsTotal{}})
+		resp.OK(w, r, costStatsResponse{Rows: make([]costStatsRow, 0), Total: costStatsTotal{}})
 		return
 	}
+	from, to, werr := costStatsWindow(h.now(), r.URL.Query())
+	if werr != nil {
+		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, werr.Error())
+		return
+	}
+	key := fmt.Sprintf("cost-stats:%d:%d", from.Unix(), to.Unix())
+	out, fromCache, err := h.costStatsCache().Get(r.Context(), key,
+		func(ctx context.Context) (costStatsResponse, error) {
+			return h.queryCostStats(ctx, from, to)
+		})
+	if err != nil {
+		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "查询成本统计失败")
+		return
+	}
+	if fromCache {
+		w.Header().Set("x-stats-cache", "hit")
+	} else {
+		w.Header().Set("x-stats-cache", "miss")
+	}
+	resp.OK(w, r, out)
+}
+
+// queryCostStats 执行成本统计主查询并装配响应（缓存未命中时调用）。
+func (h *Admin) queryCostStats(ctx context.Context, from, to time.Time) (costStatsResponse, error) {
+	rows := make([]costStatsRow, 0)
 	sqlText := fmt.Sprintf(costStatsQuerySQL,
 		fmt.Sprintf(costTokenSumSQL, "input"),
 		fmt.Sprintf(costTokenSumSQL, "cache_read"),
 		fmt.Sprintf(costTokenSumSQL, "output"))
 
-	rowSet, err := h.db.QueryContext(r.Context(), sqlText)
+	rowSet, err := h.db.QueryContext(ctx, sqlText, from, to)
 	if err != nil {
-		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "查询成本统计失败")
-		return
+		return costStatsResponse{}, err
 	}
 	defer rowSet.Close()
 
@@ -185,8 +287,7 @@ func (h *Admin) HandleCostStats(w http.ResponseWriter, r *http.Request) {
 			&item.InternalModelID, &item.ExternalModelName,
 			&item.CostCredits, &item.SaleCredits, &item.Requests,
 			&item.InputTokens, &item.CacheReadTokens, &item.OutputTokens, &snapshots); err != nil {
-			resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "查询成本统计失败")
-			return
+			return costStatsResponse{}, err
 		}
 		if chID.Valid {
 			item.ChannelID = chID.Int64
@@ -216,15 +317,29 @@ func (h *Admin) HandleCostStats(w http.ResponseWriter, r *http.Request) {
 		rows = append(rows, item)
 	}
 	if err := rowSet.Err(); err != nil {
-		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "查询成本统计失败")
-		return
+		return costStatsResponse{}, err
 	}
 	total.CostCredits = decimalx.Round5(total.CostCredits)
 	total.SaleCredits = decimalx.Round5(total.SaleCredits)
 	total.CacheHitRate = decimalx.Round5(cacheHitRate(total.CacheReadTokens, total.InputTokens))
 	total.InputOutputRatio = decimalx.Round5(inputOutputRatio(total.InputTokens, total.OutputTokens))
 
-	resp.OK(w, r, map[string]any{"Rows": rows, "Total": total})
+	return costStatsResponse{
+		Rows:  rows,
+		Total: total,
+		Range: costStatsRange{From: from.Format("2006-01-02"), To: to.Format("2006-01-02")},
+	}, nil
+}
+
+// costStatsCache 懒初始化成本统计缓存（5 分钟 TTL，键含时间区间）。
+func (h *Admin) costStatsCache() *statscache.Cache[costStatsResponse] {
+	h.cacheOnce.Do(func() {
+		if h.costStatsTTL == 0 {
+			h.costStatsTTL = statscache.DefaultTTL
+		}
+		h.costStatsResultCache = statscache.New[costStatsResponse](h.costStatsTTL)
+	})
+	return h.costStatsResultCache
 }
 
 // parseSnapshotNames 把 SQL 里 to_json(array_agg(DISTINCT ...)) 的 JSON 数组解析成有序字符串切片。

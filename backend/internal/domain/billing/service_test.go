@@ -185,22 +185,23 @@ func TestRecord_Success(t *testing.T) {
 	mock.ExpectQuery(insertBill.String()).WithArgs(
 		sqlmock.AnyArg(), // id
 		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model", int64(1),
-		sqlmock.AnyArg(),                 // session_id
-		sqlmock.AnyArg(),                 // session_name
-		sqlmock.AnyArg(),                 // call_time
-		sqlmock.AnyArg(),                 // tokens
-		sqlmock.AnyArg(),                 // rates
-		[]byte(`{"time":1,"context":1}`), // coefficients
-		int64(10000),                     // r_value
-		sqlmock.AnyArg(),                 // raw_total
-		credits,                          // credits_consumed
-		sqlmock.AnyArg(),                 // cost_credits
-		before,                           // balance_before
-		after,                            // balance_after
-		"completed",                      // status
-		sqlmock.AnyArg(),                 // error_message
-		sqlmock.AnyArg(),                 // duration_ms
-		sqlmock.AnyArg(),                 // first_token_ms
+		sqlmock.AnyArg(),                                     // session_id
+		sqlmock.AnyArg(),                                     // session_name
+		sqlmock.AnyArg(),                                     // call_time
+		sqlmock.AnyArg(),                                     // tokens
+		sqlmock.AnyArg(),                                     // rates
+		[]byte(`{"time":1,"context":1}`),                     // coefficients
+		int64(10000),                                         // r_value
+		sqlmock.AnyArg(),                                     // raw_total
+		credits,                                              // credits_consumed
+		sqlmock.AnyArg(),                                     // cost_credits
+		before,                                               // balance_before
+		after,                                                // balance_after
+		"completed",                                          // status
+		sqlmock.AnyArg(),                                     // error_message
+		sqlmock.AnyArg(),                                     // duration_ms
+		sqlmock.AnyArg(),                                     // first_token_ms
+		sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), // input / cache_read / output
 	).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(1), time.Now()))
 
 	credit := &fakeCredit{before: before, after: after}
@@ -262,6 +263,7 @@ func TestRecord_ConsumeError_RecordsFailed(t *testing.T) {
 		sqlmock.AnyArg(), sqlmock.AnyArg(),
 		"failed", "计费结算失败",
 		sqlmock.AnyArg(), sqlmock.AnyArg(),
+		sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
 	).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(2), time.Now()))
 
 	credit := &fakeCredit{err: consumeErr}
@@ -363,6 +365,7 @@ func TestRecord_CostMode_RecordsCostCredits(t *testing.T) {
 		int64(10000), sqlmock.AnyArg(), credits, costCredits,
 		sqlmock.AnyArg(), sqlmock.AnyArg(), "completed", sqlmock.AnyArg(),
 		sqlmock.AnyArg(), sqlmock.AnyArg(),
+		sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
 	).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(3), time.Now()))
 
 	credit := &fakeCredit{before: 10, after: 10 - credits}
@@ -417,6 +420,7 @@ func TestRecord_SaleMode_CostCreditsDistinctFromCredits(t *testing.T) {
 		int64(10000), sqlmock.AnyArg(), credits, costCredits,
 		sqlmock.AnyArg(), sqlmock.AnyArg(), "completed", sqlmock.AnyArg(),
 		sqlmock.AnyArg(), sqlmock.AnyArg(),
+		sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
 	).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(4), time.Now()))
 
 	credit := &fakeCredit{before: 10, after: 10 - credits}
@@ -569,6 +573,8 @@ func txInsertArgs(credits, before, after float64, status string) []driver.Value 
 		sqlmock.AnyArg(),                 // error_message
 		sqlmock.AnyArg(),                 // duration_ms
 		sqlmock.AnyArg(),                 // first_token_ms
+		// 0020 新增三段 token 实体列（input / cache_read / output）
+		sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
 	}
 }
 
@@ -592,6 +598,14 @@ func TestRecord_TxPath_Success(t *testing.T) {
 	mock.ExpectBegin()
 	mock.ExpectQuery(insertBill.String()).WithArgs(txInsertArgs(credits, before, after, "completed")...).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(1), time.Now()))
+	// 日级预聚合在事务内用 SAVEPOINT 隔离累加（失败不回滚账单）。
+	mock.ExpectExec(`SAVEPOINT daily_stats`).WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(`INSERT INTO user_daily_stats`).WithArgs(
+		testUserID, sqlmock.AnyArg(), // day
+		sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), // 三段 token
+		sqlmock.AnyArg(), sqlmock.AnyArg(), // credits / cost_credits
+	).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`RELEASE SAVEPOINT daily_stats`).WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectCommit()
 
 	credit := &fakeCredit{before: before, after: after}
@@ -1195,6 +1209,7 @@ func TestRecord_ModelLevelOverride(t *testing.T) {
 		int64(10000), sqlmock.AnyArg(), credits, sqlmock.AnyArg(),
 		sqlmock.AnyArg(), sqlmock.AnyArg(), "completed", sqlmock.AnyArg(),
 		sqlmock.AnyArg(), sqlmock.AnyArg(),
+		sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
 	).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(7), time.Now()))
 
 	credit := &fakeCredit{before: 10, after: 9.7}
@@ -1244,21 +1259,22 @@ func TestRecord_Dimension(t *testing.T) {
 		sqlmock.AnyArg(), // id
 		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model", int64(42),
 		"sess-dim",
-		sqlmock.AnyArg(),                 // session_name
-		sqlmock.AnyArg(),                 // call_time
-		sqlmock.AnyArg(),                 // tokens
-		sqlmock.AnyArg(),                 // rates
-		[]byte(`{"time":1,"context":1}`), // coefficients
-		int64(10000),                     // r_value
-		sqlmock.AnyArg(),                 // raw_total
-		credits,                          // credits_consumed
-		sqlmock.AnyArg(),                 // cost_credits
-		sqlmock.AnyArg(),                 // balance_before
-		sqlmock.AnyArg(),                 // balance_after
-		"completed",                      // status
-		sqlmock.AnyArg(),                 // error_message
-		sqlmock.AnyArg(),                 // duration_ms
-		sqlmock.AnyArg(),                 // first_token_ms
+		sqlmock.AnyArg(),                                     // session_name
+		sqlmock.AnyArg(),                                     // call_time
+		sqlmock.AnyArg(),                                     // tokens
+		sqlmock.AnyArg(),                                     // rates
+		[]byte(`{"time":1,"context":1}`),                     // coefficients
+		int64(10000),                                         // r_value
+		sqlmock.AnyArg(),                                     // raw_total
+		credits,                                              // credits_consumed
+		sqlmock.AnyArg(),                                     // cost_credits
+		sqlmock.AnyArg(),                                     // balance_before
+		sqlmock.AnyArg(),                                     // balance_after
+		"completed",                                          // status
+		sqlmock.AnyArg(),                                     // error_message
+		sqlmock.AnyArg(),                                     // duration_ms
+		sqlmock.AnyArg(),                                     // first_token_ms
+		sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), // input / cache_read / output
 	).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(8), time.Now()))
 
 	credit := &fakeCredit{before: 10, after: 10 - credits}

@@ -7,12 +7,14 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/team/llmgateway/internal/domain/billing"
 	"github.com/team/llmgateway/internal/domain/router"
 	"github.com/team/llmgateway/internal/pkg/decimalx"
 	"github.com/team/llmgateway/internal/pkg/resp"
+	"github.com/team/llmgateway/internal/pkg/statscache"
 )
 
 // Dev 承载开发端控制台处理器。userID 从鉴权上下文取（userIDFrom 注入）。
@@ -24,6 +26,10 @@ type Dev struct {
 	sessions     *router.SessionRegistry // 会话注册表（经 SetSessions 注入；nil=未装配）
 	now          func() time.Time        // 时钟（测试可替换）
 	tokenCounter TokenCounter            // 令牌计数（经 SetTokenCounter 注入；nil=未装配）
+
+	// 本人摘要缓存：进程内 TTL（默认 5 分钟）+ 并发回源合并，按用户维度 key。
+	cacheOnce      sync.Once
+	meSummaryCache *statscache.Cache[billing.UserDayTotals]
 }
 
 // NewDev 创建开发端控制台处理器。

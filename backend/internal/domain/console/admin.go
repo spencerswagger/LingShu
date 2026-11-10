@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -23,6 +24,7 @@ import (
 	"github.com/team/llmgateway/internal/domain/router"
 	"github.com/team/llmgateway/internal/pkg/decimalx"
 	"github.com/team/llmgateway/internal/pkg/resp"
+	"github.com/team/llmgateway/internal/pkg/statscache"
 )
 
 // Admin 承载管理端控制台聚合查询处理器。
@@ -39,6 +41,11 @@ type Admin struct {
 	routeEng       routeEngine                                                      // 路由引擎（服务状态候选顺序来源；经 SetRouterEngine 注入；nil=不计算候选）
 	models         externalModelSource                                              // 对外模型只读枚举（经 SetModelSource 注入；nil=列表为空）
 	rProvider      costRProvider                                                    // 积分换算系数 R 来源（经 SetCostRProvider 注入；nil=未装配时成本曲线回退默认 10000）
+
+	// 成本统计结果缓存：进程内 5 分钟 TTL（键含时间区间），并发回源合并。
+	cacheOnce            sync.Once
+	costStatsTTL         time.Duration
+	costStatsResultCache *statscache.Cache[costStatsResponse]
 }
 
 // routeEngine 聚合端点所需的路由引擎能力（router.Engine 满足）。
