@@ -164,7 +164,7 @@ const router = createRouter({
   ],
 })
 
-router.beforeEach(async (to) => {
+router.beforeEach((to) => {
   const auth = useAuthStore()
   // 未登录：除登录页、注册页外均跳登录
   if (!auth.token && to.name !== 'login' && to.name !== 'register') {
@@ -174,12 +174,10 @@ router.beforeEach(async (to) => {
   if (auth.token && (to.name === 'login' || to.name === 'register')) {
     return auth.role === 'ADMIN' ? '/admin' : '/dev'
   }
-  // 已登录访问受保护页：先拉取最新用户信息，同步本地角色（堵住本地清 role 绕过，
-  // 并解决管理员降权后本地角色陈旧的问题——后端 /auth/me 始终返回权威角色）。
-  if (auth.token) {
-    await auth.fetchProfile()
-    if (!auth.token) return { name: 'login', query: { redirect: to.fullPath } }
-  }
+  // 已登录访问受保护页：不再每次导航拉取 /auth/me（150ms+ 的换页卡顿来源）。
+  // 登录态判断只用本地状态（store + token 有效性）；/auth/me 只在首屏（布局挂载）、
+  // 401 拦截器、用户面板/改密等手动刷新时拉取。token 与 role 始终由 setAuth 成对写入，
+  // 401 时由拦截器成对清空，故本地状态可信；角色降权在下次手动刷新时同步。
   // 角色校验：角色缺失或与页面要求不符一律拦截（不再用 `auth.role &&` 短路跳过）
   const need = to.meta.roles as string[] | undefined
   if (need && need.length && !need.includes(auth.role)) {
