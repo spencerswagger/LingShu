@@ -445,8 +445,7 @@ func parseCurveAt(raw string, now time.Time) (time.Time, error) {
 //   - ChannelModelID：指定成本线模型（其对外模型在未显式指定售价模型时用于售价线）；
 //   - ChannelModelIDs：**多线对比**，逗号分隔的渠道内部模型 ID（最多 10 个）。传了就额外返回 Lines，
 //     每行一个 (渠道, 渠道内部模型) 各带自己的成本/售价曲线；不传时响应与改造前逐字节一致。
-//     受功能开关 console.cost_multichannel_trace 控制（默认关闭，关闭时传该参数返回 **403**：
-//     属「能力未启用」而非「参数写错」，前端据此隐藏入口）。
+//     该参数恒可用（只读能力，不做服务端开关门控）。
 //   - Step / MaxTokens / HitRate / InOutRatio：采样参数；
 //   - At：结算时刻（RFC3339 或 HH:MM），决定时段系数，缺省 now。
 //
@@ -471,13 +470,6 @@ func (h *Admin) HandleCostPricingCurve(w http.ResponseWriter, r *http.Request) {
 	multiIDs, err := parseChannelModelIDs(q.Get("ChannelModelIDs"))
 	if err != nil {
 		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, err.Error())
-		return
-	}
-	// 功能开关：默认关闭。关闭时**只**拒绝新参数，不传该参数的旧请求完全不受影响。
-	// 检查顺序与 /cost/session/{id}/trace 一致：先校验参数（400），再判能力开关（403）。
-	// 「能力未启用」是预期内拒绝，不落异常日志（避免 4xx 告警把正常关开关算成故障）。
-	if len(multiIDs) > 0 && !h.costViewsEnabled(r.Context()) {
-		resp.ErrNoLog(w, r, http.StatusForbidden, resp.CodeForbidden, costViewsSwitchDisabledMsg)
 		return
 	}
 	externalName := q.Get("ExternalModelName")

@@ -1083,35 +1083,53 @@ export interface SessionExpirationData {
   turn_tiers: SessionExpirationTurnTier[]
 }
 
-// ===== 系统配置（计费 + 会话过期 + 网关白名单，统一入口）=====
-// Console 为新增的**可选**块（成本页增强视图开关，默认 false）：
-//   MultichannelTrace=true 才允许「定价曲线多线对比」和「会话渠道轨迹」两个只读入口，
-//   关闭时这两个入口返回 403，旧接口零影响。键缺失/后端未装配时按 false 处理。
-export interface SystemConsoleData {
-  MultichannelTrace: boolean
+// ===== 系统配置（四块：计费 / 路由 / 会话过期 / 网关白名单）=====
+// 后端语义：**只写请求体里出现的键**——没传的键/整块保持库中现值（「不传 = 不改」）；
+// 白名单 `[]` = 清空、不传 = 不改；`SessionExpiration` / 白名单显式 `null` 等同不传。
+// 响应 `Affected` = 实际写入的键数（不要按 1 判断成功）。
+// 成本页的多渠道对比 / 渠道轨迹开关已改为**本机 localStorage 偏好**，接口不再有 `Console` 块。
+export interface SessionCostConfig {
+  enabled: boolean // 开启会话成本路由（关掉即回退渠道亲和）
+  mid_switch: boolean // 允许会话中途切换渠道
+  shadow_enabled: boolean // 影子观测（会产生额外上游调用与成本，按需开启）
+  remaining_a: number // 剩余量权重 a
+  remaining_b: number // 剩余量权重 b
+  remaining_min: number // 剩余量归一化下界
+  remaining_max: number // 剩余量归一化上界
+  min_remaining: number // 低于该剩余量不再参与评分
+  cooldown_sec: number // 两次切换之间的冷却秒数
+  min_improve: number // 最小改善阈值 [0,1)
+  fallback_note: string // 回退说明（只读，PUT 时忽略）
+}
+export interface RoutingConfigData {
+  SessionCost: SessionCostConfig
 }
 export interface SystemConfigData {
   Billing: BillingConfigData
+  Routing: RoutingConfigData
   SessionExpiration: SessionExpirationData
   UpstreamResponseHeaderWhitelist: string[]
-  Console?: SystemConsoleData
 }
 export function getSystemConfig() {
   return http.get<SystemConfigData, ApiRes<SystemConfigData>>('/admin/configs/system')
 }
-export function putSystemConfig(payload: {
-  Billing: {
-    R: number | string
+// 每块都可选：前端按 tab 只提交本 tab 的字段（整块不传 = 不改该块）
+export interface SystemConfigPayload {
+  Billing?: {
+    R?: number | string
     CnyRate?: number | string
-    ContextTiers: ContextTier[]
-    TimeConfig: TimeCoeffConfig
+    ContextTiers?: ContextTier[]
+    TimeConfig?: TimeCoeffConfig
     CostSample?: CostSample
   }
-  SessionExpiration: SessionExpirationData
-  UpstreamResponseHeaderWhitelist: string[]
-  // 不传 = 不写该开关（后端老行为完全不变）；传了才落 sys_configs。
-  Console?: { MultichannelTrace?: boolean }
-}) {
+  Routing?: {
+    // 会话成本路由：字段级合并，没传的字段保持现值；fallback_note 只读、PUT 时忽略
+    SessionCost?: Partial<Omit<SessionCostConfig, 'fallback_note'>>
+  }
+  SessionExpiration?: SessionExpirationData
+  UpstreamResponseHeaderWhitelist?: string[]
+}
+export function putSystemConfig(payload: SystemConfigPayload) {
   return http.put<{ Affected: number }, ApiRes<{ Affected: number }>>('/admin/configs/system', payload)
 }
 
@@ -1375,7 +1393,7 @@ export function getCostPricingCurve(
   })
 }
 
-// ===== 会话渠道轨迹（只读，受 console.cost_multichannel_trace 开关控制；关闭时 403）=====
+// ===== 会话渠道轨迹（只读）=====
 // 数据源只有 billing_records：逐点渠道/模型/积分 → 连续段 → 真实切换点；从未真实切换过渠道时
 // 额外给一个**预测打平点**（Predicted=true，明确是预测而非事实）。
 // 口径：金额直接取账单落库值，不重算；Turn 只编成功轮，TurnNo 含失败轮（x 轴用 TurnNo）。
