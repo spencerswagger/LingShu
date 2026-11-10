@@ -34,6 +34,9 @@ async function onSubmit() {
     const res = await changeOwnPassword(form.oldPassword, form.newPassword)
     auth.setAuth(res.Data.Token, auth.role, auth.username, false, auth.totpEnabled)
     auth.setMustChange(false)
+    // 令牌已轮换（会话代数 +1）：旧 token 的在途/缓存数据一律作废并立刻重取，
+    // 否则余额/摘要会停留在旧身份的快照上。
+    void auth.reloadMe()
     ElMessage.success('密码修改成功')
     emit('success')
   } catch (e: any) {

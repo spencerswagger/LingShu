@@ -30,7 +30,7 @@ watch(visible, async (v) => {
   code.value = ''
   recoveryCodes.value = []
   qrDataUrl.value = ''
-  await auth.fetchProfile()
+  await auth.refreshProfile()
   enabled.value = auth.totpEnabled
 })
 

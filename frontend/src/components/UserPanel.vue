@@ -31,9 +31,10 @@ function onShow() {
   loadSummary()
 }
 
-// 明确的用户动作：点刷新按钮 → 忽略 TTL 强制拉最新
+// 明确的用户动作：点刷新按钮 → 作废缓存并同时重取「余额（/auth/me）」与「摘要（/me/summary）」。
+// 走 store 的 reloadMe()，别在这里各发各的请求。
 function refreshNow() {
-  auth.refreshSummary()
+  auth.reloadMe()
 }
 
 function compact(v: number) {
@@ -165,7 +166,14 @@ function onLogout() {
       <div class="panel-head">
         <span class="panel-nick">{{ auth.displayName() }}</span>
         <el-tag size="small" effect="plain">{{ roleLabel }}</el-tag>
-        <el-icon class="edit-icon refresh-icon" title="刷新数据" @click="refreshNow"><Refresh /></el-icon>
+        <el-icon
+          class="edit-icon refresh-icon"
+          :class="{ spinning: auth.meRefreshing }"
+          title="刷新数据"
+          @click="refreshNow"
+        >
+          <Refresh />
+        </el-icon>
         <el-icon class="edit-icon" @click="openNameDialog"><Edit /></el-icon>
       </div>
       <div class="panel-sub">@{{ auth.username }}</div>
@@ -291,6 +299,20 @@ function onLogout() {
 
 .refresh-icon {
   margin-left: auto;
+}
+
+/* 刷新在途：转圈提示（数据来自 store 的统一取数，不是本组件自己发请求） */
+.refresh-icon.spinning {
+  animation: panel-spin 0.8s linear infinite;
+}
+
+@keyframes panel-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .edit-icon:hover {

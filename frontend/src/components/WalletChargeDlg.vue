@@ -5,6 +5,7 @@
 import { computed, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { rechargeWallet, adjustWallet, setWallet } from '@/api/admin'
+import { useAuthStore } from '@/stores/auth'
 
 type OpMode = 'add' | 'sub' | 'set'
 
@@ -16,6 +17,8 @@ const props = defineProps<{
   balance: number
 }>()
 const emit = defineEmits<{ (e: 'update:modelValue', v: boolean): void; (e: 'success'): void }>()
+
+const auth = useAuthStore()
 
 const visible = computed({
   get: () => props.modelValue,
@@ -77,6 +80,10 @@ async function submit() {
     }
     ElMessage.success('操作成功')
     visible.value = false
+    // 余额变动类操作：若改的是「当前登录账号」自己，立刻作废并重取本人资料/摘要缓存，
+    // 否则右上角面板会一直显示充值前的旧余额（TTL 内不会自动重取）。
+    // 改别人不影响本人缓存（调用方的列表刷新走 emit('success')）。
+    if (props.userId && props.userId === auth.userId) void auth.reloadMe()
     emit('success')
   } catch (e: any) {
     ElMessage.error(e?.message || '操作失败')
