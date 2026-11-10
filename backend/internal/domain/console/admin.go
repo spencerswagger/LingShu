@@ -1497,17 +1497,11 @@ func sessionRuntimes(ctx context.Context, db *sql.DB, ids []string, windowStart 
 SELECT session_id,
        count(*),
        COALESCE(sum(credits_consumed), 0),
-       COALESCE(sum(
-           COALESCE(NULLIF(tokens->>'input','')::bigint, 0) +
-           COALESCE(NULLIF(tokens->>'cache_read','')::bigint, 0) +
-           COALESCE(NULLIF(tokens->>'output','')::bigint, 0)), 0),
-       COALESCE(sum(COALESCE(NULLIF(tokens->>'input','')::bigint, 0)), 0),
-       COALESCE(sum(COALESCE(NULLIF(tokens->>'cache_read','')::bigint, 0)), 0),
+       COALESCE(sum(input_tokens + cache_read_tokens + output_tokens), 0),
+       COALESCE(sum(input_tokens), 0),
+       COALESCE(sum(cache_read_tokens), 0),
        COALESCE(count(*) FILTER (WHERE call_time >= $2), 0),
-       COALESCE(sum(
-           COALESCE(NULLIF(tokens->>'input','')::bigint, 0) +
-           COALESCE(NULLIF(tokens->>'cache_read','')::bigint, 0) +
-           COALESCE(NULLIF(tokens->>'output','')::bigint, 0)) FILTER (WHERE call_time >= $2), 0)
+       COALESCE(sum(input_tokens + cache_read_tokens + output_tokens) FILTER (WHERE call_time >= $2), 0)
 FROM billing_records
 WHERE session_id = ANY($1)
 GROUP BY session_id`, ids, windowStart)
@@ -1526,7 +1520,7 @@ GROUP BY session_id`, ids, windowStart)
 	// 上下文长度：最近一次请求的总输入 Token 数（输入 + 缓存读，三段口径下二者互斥）。
 	crows, err := db.QueryContext(ctx, `
 SELECT DISTINCT ON (session_id) session_id,
-       COALESCE(NULLIF(tokens->>'input','')::bigint, 0) + COALESCE(NULLIF(tokens->>'cache_read','')::bigint, 0)
+       input_tokens + cache_read_tokens
 FROM billing_records
 WHERE session_id = ANY($1)
 ORDER BY session_id, call_time DESC, id DESC`, ids)

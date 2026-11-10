@@ -112,11 +112,11 @@ func dashArgs(userID *int64, from, to time.Time, extra ...any) []any {
 
 // tokenSum token 求和 SQL 表达式（prefix 为表别名前缀）。
 // 口径与 UsageSplit.Total() 一致：三段互斥（输入为纯输入、不含缓存读），求和 input/cache_read/output。
+//
+// 取数走 0020 的三段实体列（写入时落库、存量行由启动回填补齐），不再逐行解析 tokens JSONB：
+// 同一口径下省掉每行三次 ->@> 取值 + 类型转换，明细表上的聚合不再随行数放大常数因子。
 func tokenSum(prefix string) string {
-	p := prefix + "tokens"
-	return `(COALESCE(NULLIF(` + p + `->>'input','')::bigint,0)
-		+ COALESCE(NULLIF(` + p + `->>'cache_read','')::bigint,0)
-		+ COALESCE(NULLIF(` + p + `->>'output','')::bigint,0))`
+	return `(` + prefix + `input_tokens + ` + prefix + `cache_read_tokens + ` + prefix + `output_tokens)`
 }
 
 // TokenSumExpr 导出三段 Token 求和表达式（同一口径的唯一实现），
@@ -126,9 +126,7 @@ func TokenSumExpr(prefix string) string { return tokenSum(prefix) }
 // InputTokensExpr 输入 Token 表达式（input + cache_read，三段互斥口径），
 // 即「上下文长度」：一次请求送进模型的历史 + 本轮输入。
 func InputTokensExpr(prefix string) string {
-	p := prefix + "tokens"
-	return `(COALESCE(NULLIF(` + p + `->>'input','')::bigint,0)
-		+ COALESCE(NULLIF(` + p + `->>'cache_read','')::bigint,0))`
+	return `(` + prefix + `input_tokens + ` + prefix + `cache_read_tokens)`
 }
 
 // WindowTotals 区间总量与速率（KPI 口径）。
@@ -161,9 +159,9 @@ func (s *SqlStore) WindowTotals(ctx context.Context, from, to time.Time, userID 
 	var busyRequests, busyTokens, busyDur int64
 	err := s.db.QueryRowContext(ctx,
 		`SELECT
-		    COALESCE(sum(COALESCE(NULLIF(tokens->>'input','')::bigint,0)),0),
-		    COALESCE(sum(COALESCE(NULLIF(tokens->>'output','')::bigint,0)),0),
-		    COALESCE(sum(COALESCE(NULLIF(tokens->>'cache_read','')::bigint,0)),0),
+		    COALESCE(sum(input_tokens),0),
+		    COALESCE(sum(output_tokens),0),
+		    COALESCE(sum(cache_read_tokens),0),
 		    COALESCE(sum(credits_consumed),0),
 		    count(*),
 		    COALESCE(sum((status='failed')::int),0),
