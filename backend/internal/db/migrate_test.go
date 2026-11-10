@@ -220,7 +220,8 @@ func runMigration(t *testing.T, tempDB *sql.DB, dir, name string) {
 	if err != nil {
 		t.Fatalf("读取迁移 %s 失败: %v", name, err)
 	}
-	if _, err := tempDB.Exec(string(body)); err != nil {
+	// 与 db.Migrate 同路径渲染占位符（{{backfill_threshold}} 等），保证测试与生产看到同一份 SQL。
+	if _, err := tempDB.Exec(renderMigration(string(body))); err != nil {
 		t.Fatalf("执行迁移 %s 失败: %v", name, err)
 	}
 }

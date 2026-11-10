@@ -228,12 +228,14 @@ type viewChannelModel struct {
 	TimeConfig      *billing.TimeCoeffConfig  `json:"TimeConfig,omitempty"`
 	ContextTiers    []billing.TierRule        `json:"ContextTiers,omitempty"`
 	Protocols       channelprotocol.Protocols `json:"Protocols,omitempty"`
-	State           State                     `json:"State"`
-	RateLimit       RateLimitConfig           `json:"RateLimit"`
-	HealthProbe     HealthProbeConfig         `json:"HealthProbe"`
-	Reliability     ReliabilityConfig         `json:"Reliability"`
-	CreatedAt       time.Time                 `json:"CreatedAt"`
-	UpdatedAt       time.Time                 `json:"UpdatedAt"`
+	// Edited 商业字段是否被本地编辑过（true=协议同步不再覆盖该行，可调 reset-from-protocol 恢复）。
+	Edited      bool              `json:"Edited"`
+	State       State             `json:"State"`
+	RateLimit   RateLimitConfig   `json:"RateLimit"`
+	HealthProbe HealthProbeConfig `json:"HealthProbe"`
+	Reliability ReliabilityConfig `json:"Reliability"`
+	CreatedAt   time.Time         `json:"CreatedAt"`
+	UpdatedAt   time.Time         `json:"UpdatedAt"`
 }
 
 func toChannelModelView(m *ChannelModel) viewChannelModel {
@@ -248,6 +250,7 @@ func toChannelModelView(m *ChannelModel) viewChannelModel {
 		TimeConfig:      m.TimeConfig,
 		ContextTiers:    m.ContextTiers,
 		Protocols:       m.Protocols,
+		Edited:          m.Edited,
 		State:           m.State,
 		RateLimit:       m.RateLimit,
 		HealthProbe:     m.HealthProbe,
@@ -356,6 +359,26 @@ func (h *Handler) HandleUpdateChannelModel(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	m, err := h.svc.UpdateChannelModel(r.Context(), channelID, mid, req.toInput())
+	if err != nil {
+		writeServiceErr(w, r, err)
+		return
+	}
+	resp.OK(w, r, toChannelModelView(m))
+}
+
+// HandleResetChannelModelFromProtocol POST /api/v1/admin/channels/{id}/models/{mid}/reset-from-protocol
+// 把该模型行恢复为协议种子值并清除 edited 标记（物化守卫的唯一出口）。
+func (h *Handler) HandleResetChannelModelFromProtocol(w http.ResponseWriter, r *http.Request) {
+	channelID, ok := pathID(w, r)
+	if !ok {
+		return
+	}
+	mid, ok := pathMid(r.PathValue("mid"))
+	if !ok {
+		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "无效的渠道内部模型 ID")
+		return
+	}
+	m, err := h.svc.ResetModelFromProtocol(r.Context(), channelID, mid)
 	if err != nil {
 		writeServiceErr(w, r, err)
 		return

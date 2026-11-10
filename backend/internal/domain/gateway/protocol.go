@@ -167,15 +167,19 @@ func protocolForEndpoint(endpoint string) string {
 	}
 }
 
-// effectiveProtocols 求某模型可达的上游基础协议集合：
-// 渠道协议（含模型级覆盖）优先；无渠道协议时用渠道内联 protocol；模型级 protocols 覆盖一切。
+// effectiveProtocols 求某模型可达的上游基础协议集合（0019 契约 §5.2）：
+// 模型级 protocols（channel_models）非空即最高优先 → 引用协议时用协议协议集 → 内联渠道 protocol 归一。
+//
+// 注意：channel_protocols.models[m].protocols 已降级为**物化种子**，不在运行时链上
+// （迁移 0019 已把存量种子值复制进 channel_models.protocols，行为不变）。
 func effectiveProtocols(rt *channel.RuntimeChannel, mr *channel.ModelRuntime) channelprotocol.Protocols {
 	var base channelprotocol.Protocols
-	if rt.Protocol != nil {
-		base = rt.Protocol.EffectiveModelProtocols(mr.Model.InternalModelID, mr.Model.Protocols)
-	} else if len(mr.Model.Protocols) > 0 {
+	switch {
+	case len(mr.Model.Protocols) > 0:
 		base = mr.Model.Protocols
-	} else {
+	case rt.Protocol != nil:
+		base = rt.Protocol.Protocols
+	default:
 		// 内联渠道：渠道 protocol 归一化；空/非法值回落 openai-chat（否则会以 "" 为键，
 		// 导致全部入站协议被判为不支持，AC-4 错误外溢到所有请求）。
 		name := channelprotocol.Canonical(strings.TrimSpace(rt.Channel.Protocol))
@@ -194,15 +198,10 @@ func effectiveProtocols(rt *channel.RuntimeChannel, mr *channel.ModelRuntime) ch
 	return out
 }
 
-// effectiveBaseURL 求某基础协议的有效上游基址：渠道级 base_url 覆盖优先，回落渠道协议（协议级优先）。
+// effectiveBaseURL 求某基础协议的有效上游基址：委托 channel.EffectiveBaseURL（唯一实现），
+// 保证转发与探测/视图的解析链完全一致。
 func effectiveBaseURL(rt *channel.RuntimeChannel, protocol string) string {
-	if s := strings.TrimSpace(rt.Channel.BaseURL); s != "" {
-		return s
-	}
-	if rt.Protocol != nil {
-		return rt.Protocol.EffectiveBaseURL(protocol)
-	}
-	return ""
+	return channel.EffectiveBaseURL(rt, protocol)
 }
 
 // effectiveHeaderPolicy 求请求头策略：渠道协议读取，内联渠道缺省空策略（等效 none）。

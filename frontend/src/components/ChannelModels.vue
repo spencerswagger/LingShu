@@ -2,7 +2,7 @@
 // 渠道内部模型子表：承载该渠道支持哪些内部模型（InternalModelID + 成本定价 + 绑定对外模型）。
 // 编辑态（readonly=false）支持：新增/编辑（抽屉内 ModelPricing 成本模式）+ 拉取上游模型。
 // 只读态（readonly=true）：仅供详情页展示。
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, RefreshRight, Edit, Delete } from '@element-plus/icons-vue'
 import {
@@ -11,12 +11,15 @@ import {
   updateChannelModel,
   deleteChannelModel,
   pullChannelModels,
+  resetChannelModelFromProtocol,
+  getChannelProtocol,
   channelModelState,
   probeChannelModel,
   listExternalModels,
   createExternalModel,
   rateLabels,
   type ChannelModel,
+  type ChannelProtocolView,
   type ExternalModel,
   type PullModel,
 } from '@/api/admin'
@@ -29,6 +32,11 @@ import ErrorBubble from '@/components/ErrorBubble.vue'
 const props = defineProps<{
   channelId: string
   readonly?: boolean
+  // 该渠道引用的渠道协议 ID（空 = 内联渠道）。
+  // 有值时只做两件事：①只读展示协议独占的跨协议转换能力 ②提供「重置为协议值」入口。
+  // 模型级数据（绑定/成本/时段/分档/协议子集）一律取 channel_models，不从协议模板兜底
+  //（契约 0019 §5.2：channel_models 是唯一运行时真源）。
+  channelProtocolId?: string
 }>()
 
 const loading = ref(false)
@@ -99,7 +107,7 @@ async function load() {
   loading.value = true
   errInfo.value = { message: '', requestId: '' }
   try {
-    await loadModules(props.channelId)
+    await Promise.all([loadModules(props.channelId), loadProtocol()])
   } catch (e: any) {
     errInfo.value = { message: e?.message, requestId: e?.requestId }
   } finally {
@@ -107,6 +115,65 @@ async function load() {
   }
 }
 onMounted(load)
+watch(() => props.channelProtocolId, loadProtocol)
+
+// ===== 引用的渠道协议（只读）=====
+// 转换配置（convertEnabled / convertTargets）是**协议独占**的运行时真源（契约 0019 裁定②）：
+// 渠道页只读展示，不提供写入入口；写入入口在协议编辑页。
+const protocol = ref<ChannelProtocolView | null>(null)
+const usingProtocol = computed(() => !!props.channelProtocolId)
+async function loadProtocol() {
+  if (!props.channelProtocolId) {
+    protocol.value = null
+    return
+  }
+  try {
+    const res = await getChannelProtocol(props.channelProtocolId)
+    protocol.value = res.Data
+  } catch {
+    protocol.value = null
+  }
+}
+const protocolLabelMap: Record<string, string> = {
+  'openai-chat': 'openai-chat',
+  'openai-responses': 'openai-responses',
+  'anthropic-messages': 'anthropic-messages',
+}
+// 某模型在协议里声明的跨协议转换能力（只读文案）
+function convertLabel(m: ChannelModel): string {
+  const ov = protocol.value?.Models?.[m.InternalModelID]
+  if (!ov) return '协议未声明'
+  const targets = (ov.convertTargets || []).map((t) => protocolLabelMap[t] || t)
+  if (ov.convertEnabled === false) return '已关闭'
+  const tail = targets.length ? `（优先 ${targets.join(' → ')}）` : ''
+  if (ov.convertEnabled === true) return `开启${tail}`
+  return `按协议默认${tail}`
+}
+
+// 重置为协议值：edited=true 的唯一出口（契约 0019 §6.3）。mid 传 channel_models 行 ID。
+const resettingId = ref<string | null>(null)
+async function onResetFromProtocol(row: ChannelModel) {
+  try {
+    await ElMessageBox.confirm(
+      `将按协议「${protocol.value?.Name || ''}」的种子值重写模型「${row.InternalModelID}」的绑定/成本/时段/分档/协议子集，并清除「已改动」标记。确定继续？`,
+      '重置为协议值',
+      { type: 'warning', confirmButtonText: '重置', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  resettingId.value = row.ID
+  errInfo.value = { message: '', requestId: '' }
+  try {
+    await resetChannelModelFromProtocol(props.channelId, row.ID)
+    ElMessage.success(`模型「${row.InternalModelID}」已重置为协议值`)
+    await load()
+  } catch (e: any) {
+    errInfo.value = { message: e?.message, requestId: e?.requestId }
+  } finally {
+    resettingId.value = null
+  }
+}
 
 function fmtCost(m: ChannelModel, k: string): string {
   const v = (m.CostRates || {})[k]
@@ -535,12 +602,28 @@ function onRemoveRow(index: number) {
       </div>
     </div>
 
+    <div class="cm-hint" v-if="usingProtocol && protocol">
+      引用协议「{{ protocol.Name }}」：绑定/成本/时段/分档/协议子集以本表为运行时真源，
+      协议里同名字段只作新模型的种子；带<el-tag size="small" type="warning" effect="light" class="hint-tag">已改动</el-tag>的行不再随协议同步，可「重置为协议值」恢复。
+      跨协议转换由协议独占（所有引用它的渠道共享），此处只读。
+    </div>
+
     <div v-loading="loading">
       <el-table :data="list" border stripe class="table-nowrap">
         <el-table-column label="内部模型 ID" prop="InternalModelID" min-width="150" show-overflow-tooltip>
           <template #header>
             <el-tooltip :content="'上游模型名字（模型请求体中的 model 字段）。这个渠道收到该模型的调用时，使用此条的绑定与成本计费'" placement="top">
               <span>内部模型 ID</span>
+            </el-tooltip>
+          </template>
+          <template #default="{ row }">
+            <span class="cm-id">{{ row.InternalModelID }}</span>
+            <el-tooltip
+              v-if="row.Edited"
+              :content="'该行的商业字段被本地编辑过，协议同步不再覆盖它；需要跟随协议时点「重置为协议值」'"
+              placement="top"
+            >
+              <el-tag size="small" type="warning" effect="light" class="edited-tag">已改动</el-tag>
             </el-tooltip>
           </template>
         </el-table-column>
@@ -588,6 +671,16 @@ function onRemoveRow(index: number) {
             </el-tooltip>
           </template>
         </el-table-column>
+        <el-table-column v-if="usingProtocol" label="跨协议转换（协议）" min-width="180" show-overflow-tooltip>
+          <template #header>
+            <el-tooltip :content="'转换配置由渠道协议定义（协议独占，渠道不可差异化）。此处只读；要改请编辑协议'" placement="top">
+              <span>跨协议转换（协议）</span>
+            </el-tooltip>
+          </template>
+          <template #default="{ row }">
+            <span class="muted">{{ convertLabel(row) }}</span>
+          </template>
+        </el-table-column>
         <el-table-column label="状态" width="100" align="center">
           <template #default="{ row }">
             <el-popover v-if="!readonly" trigger="hover" placement="left" :width="170">
@@ -601,7 +694,7 @@ function onRemoveRow(index: number) {
             <StatusTag v-else :value="row.State" />
           </template>
         </el-table-column>
-        <el-table-column v-if="!readonly" label="操作" width="160" align="right">
+        <el-table-column v-if="!readonly" label="操作" width="200" align="right">
           <template #default="{ row }">
             <div class="op-cell" @click.stop>
               <el-button
@@ -611,6 +704,14 @@ function onRemoveRow(index: number) {
                 :loading="probingId === row.ID"
                 @click="onProbeModel(row)"
               >探测</el-button>
+              <el-button
+                v-if="usingProtocol"
+                size="small"
+                text
+                :disabled="!row.Edited"
+                :loading="resettingId === row.ID"
+                @click="onResetFromProtocol(row)"
+              >重置为协议值</el-button>
               <el-tooltip content="编辑" placement="top">
                 <el-icon class="op-icon" @click="openEdit(row)"><Edit /></el-icon>
               </el-tooltip>
@@ -890,6 +991,30 @@ function onRemoveRow(index: number) {
 }
 .added-tag {
   margin-left: 8px;
+}
+/* 引用协议时的口径说明条（只读） + 「已改动」徽标 */
+.cm-hint {
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--color-text-secondary);
+  background: #fafbff;
+  border: 1px solid #e4e9f2;
+  border-radius: 8px;
+  padding: 6px 12px;
+  margin-bottom: 10px;
+}
+.hint-tag {
+  margin: 0 2px;
+}
+.cm-id {
+  word-break: break-all;
+}
+.edited-tag {
+  margin-left: 8px;
+  flex-shrink: 0;
+}
+.muted {
+  color: var(--color-text-secondary);
 }
 .batch-tip {
   background: #f6f8ff;

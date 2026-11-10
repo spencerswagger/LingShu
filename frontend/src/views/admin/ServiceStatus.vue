@@ -968,7 +968,7 @@ onUnmounted(stopTimer)
                 <td class="cmp-field">接口地址</td>
                 <td class="cmp-muted">—</td>
                 <td class="cmp-muted">—</td>
-                <td class="cmp-sub-block">{{ selectedRow.channel.View.BaseURL }}</td>
+                <td class="cmp-sub-block">{{ selectedRow.channel.View.BaseURLEffective || selectedRow.channel.View.BaseURL }}</td>
                 <td class="cmp-muted">—</td>
               </tr>
               <tr>

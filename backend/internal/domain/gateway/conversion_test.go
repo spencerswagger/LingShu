@@ -69,6 +69,7 @@ func TestResolveUpstreamProtocol(t *testing.T) {
 			wantOK:        true,
 		},
 		{
+			// 0019 裁定②：转换配置仍由协议独占（不下沉到实例），渠道不可差异化。
 			name: "per-model disabled",
 			gw:   NewGateway(GatewayConfig{}),
 			rt: rtWith(&channelprotocol.ChannelProtocol{

@@ -103,6 +103,68 @@ docker compose down              # 停止（数据保留）
 docker compose down -v           # 停止并删除数据卷（含数据库与密钥，慎用）
 ```
 
+### 大表回填与迁移配套脚本
+
+迁移文件本身受「一个 `.sql` 只包一个事务」约束，无法分批/断点。数据量大的回填因此有独立入口
+（以 0019 渠道字段归属改造为例，脚本都在 `backend/scripts/`）：
+
+```bash
+# 1) 只读预检：存量计数 + 受影响清单 + 建议的回填路径（不写库）
+psql "$DSN" -f backend/scripts/0019-preflight-audit.sql
+# 2) 回填（>5 万行时用；≤5 万行由迁移内单语句完成，无需手工执行）
+cd backend && go run ./scripts/backfill-0019 -dsn "$DSN"            # 单批默认 5000 行
+cd backend && go run ./scripts/backfill-0019 -dsn "$DSN" -max-batches 2   # 限速/演练
+cd backend && go run ./scripts/backfill-0019 -dsn "$DSN" -reset     # 清断点后重跑（仅演练）
+
+# 3) 回滚某个迁移（手工执行，不放进 migrations/）
+psql "$DSN" -f backend/scripts/rollback-0019.sql
+
+# 4) 两条回填路径的等价性自检（可复现；自己建两个临时库、造数、比对、删库）
+cd backend && go run ./scripts/verify-0019-equivalence -dsn "$PG_TEST_DSN"
+```
+
+`verify-0019-equivalence` 的预期输出（`-rows` 默认 55000，退出码 0 表示一致）：
+
+```
+迁移目录: ../backend/internal/db/migrations
+行数: 55000
+
+指标                           结果
+--------------------------------------------------------------------------------
+channels                     A=3cf2c6340f4bf16beb055abafad4f8e0 B=3cf2c6340f4bf16beb055abafad4f8e0 一致
+channel_models               A=5690b842f53d23be73540b5c77e58aae B=5690b842f53d23be73540b5c77e58aae 一致
+archive                      A=a4542e50ffb490381e57cf6b97943423 B=a4542e50ffb490381e57cf6b97943423 一致
+edited 行数                    A=1002 B=1002 一致
+channel_models 行数            A=55000 B=55000
+耗时                           A=12.776538931s B=5.004661694s
+
+绝对期望（两路各自校验，不依赖互相比对）:
+  edited 行数              A=1002/1002 B=1002/1002
+  channel_models 行数      A=55000/55000 B=55000/55000
+  archive 行数             A=1/1 B=1/1
+  脏种子记录数                 A=1/1 B=1/1
+  渠道1 清空                 A=1/1 B=1/1
+  渠道3 保留内联值              A=1/1 B=1/1
+  m-subset 下移            A=1/1 B=1/1
+
+结论：两条路径结果完全一致（退出码 0）
+```
+
+A 路 = 超阈值（迁移只做 DDL + 独立回填三阶段）；B 路 = 强制内联（迁移自己跑完数据段）。
+
+**绝对期望值的来源**（与脚本的造数规则一一对应，脚本里逐条注释）：
+
+| 期望 | 值 | 依据 |
+|---|---|---|
+| `edited` 行数 | 1002 | 1000 条规模漂移（种子成本 1/2/0.1、实例 5/6/0.5）+ `m-drift` + `m-conflict-protocols`；`m-eq`（`1.0` vs `1`）与 `m-timecfg-empty`（`'{}'`）不算漂移，`m-dirty-seed` 跳过 |
+| `channel_models` 行数 | 55000 | 造数行数（`-rows`） |
+| `archive` 行数 | 1 | 只有渠道 1（引用生效协议 + 内联值非空）该归档；渠道 2 双空、渠道 3 引用已软删协议、渠道 4 已软删、渠道 5 内联 |
+| 脏种子记录数 | 1 | `m-dirty-seed` 的 `externalModelID="abc"` |
+| 渠道 1 清空 / 渠道 3 保留内联值 | 1 / 1 | 归档后清空；协议软删时内联值即生效配置，必须原样保留 |
+| `m-subset` 下移 | 1 | 种子有模型级协议子集、实例为空 → 下移写入 |
+
+只有「A == B」会掩盖两路同错，因此每条绝对期望单独校验，任一不满足即非零退出并打印差异。
+
 ## 本地开发（裸机运行）
 
 1. **起数据库**：本机安装 PostgreSQL 后建库与用户，例如：

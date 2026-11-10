@@ -146,6 +146,16 @@ func main() {
 		os.Exit(1)
 	}
 
+	// 大表回填未完成告警（0019 起）：迁移在超阈值时只做 DDL，数据段须独立脚本执行。
+	// 只告警不阻止启动——回填完成前网关仍可服务（实例行缺模型级协议子集会退化成协议级全集）。
+	if pending, perr := db.PendingLargeBackfills(ctx, d); perr != nil {
+		slog.Warn("backfill check failed", "error", perr)
+	} else {
+		for _, msg := range pending {
+			slog.Error("大表回填未完成", "action", msg)
+		}
+	}
+
 	if *migrateOnly {
 		slog.Info("migrations applied, exiting")
 		return

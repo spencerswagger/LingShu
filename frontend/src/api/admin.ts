@@ -176,8 +176,12 @@ export interface ChannelKeyState {
 export interface AdminChannel {
   ID: string
   Name: string
+  // Protocol / BaseURL 语义已收窄为「内联模式专用」（契约 0019 裁定①③）：
+  // 引用渠道协议时后端一律落空，展示请用 BaseURLEffective，不要读这两个字段。
   Protocol: string
   BaseURL: string
+  // BaseURLEffective 只读派生：最终生效的上游基址（引用协议时跟随协议，内联时等于 BaseURL）。
+  BaseURLEffective: string
   Tags: Record<string, string>
   TagIDs: string[]
   BoundTags: { ID: string; Name: string; KV: Record<string, string> }[]
@@ -191,6 +195,8 @@ export interface AdminChannel {
   UpdatedAt: string
 }
 // 渠道入参（创建/更新共用）
+// 基址归属（契约 0019 裁定①③）：引用协议时后端只允许 BaseURL=''（非空 → 400），Protocol 一律忽略并落空；
+// 前端提交时两个字段都要传 ''（老前端回传历史值会被 400 拦住）。
 export interface ChannelInput {
   Name: string
   Protocol: string
@@ -272,10 +278,11 @@ export interface ProtocolOption {
   path?: string
   default?: boolean // 标记首选协议；同一作用域内至多一个
 }
-// 模型级 gateway 覆盖：baseUrl / 可达协议子集（键存在 = 可达）/ 绑定对外模型 / 成本定价。
+// 模型级 gateway 覆盖：可达协议子集（键存在 = 可达）/ 绑定对外模型 / 成本定价。
 // 与渠道内部模型（channel_models）一致地承载外部模型绑定与成本侧计费（camelCase，向后兼容）。
+// ⚠ 模型级 baseUrl 已废弃（契约 0019 字段 #4）：后端无任何读取点，导入时容忍但丢弃，前端不再提供编辑入口。
+// 按协议区分基址请用协议级 `Protocols[p].baseUrl`。
 export interface ChannelProtocolModelOverride {
-  baseUrl?: string
   protocols?: Record<string, ProtocolOption>
   // 绑定的对外模型 ID（雪花字符串）；空 = 未绑定
   externalModelID?: string | null
@@ -542,7 +549,12 @@ export interface ChannelRuntimeView {
   ID: string
   Name: string
   Protocol: string
+  // 语义同 AdminChannel：引用协议时 BaseURL 恒为 ''，展示请用 BaseURLEffective
   BaseURL: string
+  // BaseURLEffective 只读派生：最终生效的上游基址（引用协议时跟随协议）
+  BaseURLEffective: string
+  // 引用了哪条渠道协议（空 = 内联配置；detail 视图此前漏传，后端 0019 已补）
+  ChannelProtocolID?: string | null
   Tags: Record<string, string>
   BoundTags: { ID: string; Name: string; KV?: Record<string, string> }[]
   Priority: number
@@ -812,6 +824,10 @@ export interface ChannelModel {
   CostRates: Record<string, number>
   TimeConfig: TimeCoeffConfig | null
   ContextTiers: ContextTier[] | null
+  // Edited 商业字段是否被本地编辑过（后端判定，只读回显）：
+  // true = 该行不再随协议同步（绑定/成本/时段/分档/协议子集），可用 resetChannelModelFromProtocol 恢复。
+  // 前端**不得**自行比较值推断该标记，只认后端返回值（契约 0019 裁定④）。
+  Edited?: boolean
   State: string // NORMAL | DRAIN | DISABLED
   RateLimit: RateLimitConfig
   HealthProbe: HealthProbeConfig
@@ -851,6 +867,13 @@ export function updateChannelModel(channelId: string, mid: string, payload: Chan
 export function deleteChannelModel(channelId: string, mid: string) {
   return http.delete<{ Affected: number }, ApiRes<{ Affected: number }>>(
     `/admin/channels/${channelId}/models/${mid}`,
+  )
+}
+// 重置为协议值：把该行按协议种子重新物化并清除 edited 标记（物化守卫的唯一出口，契约 0019 §6.3）。
+// 仅引用协议的渠道、且协议里能查到该内部模型时可用；否则后端 400。
+export function resetChannelModelFromProtocol(channelId: string, mid: string) {
+  return http.post<ChannelModel, ApiRes<ChannelModel>>(
+    `/admin/channels/${channelId}/models/${mid}/reset-from-protocol`,
   )
 }
 // 拉取渠道上游 /v1/models 列表（不落库），供管理员选择填入内部模型

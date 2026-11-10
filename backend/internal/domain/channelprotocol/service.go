@@ -254,6 +254,12 @@ func normalizeIn(cp *ChannelProtocol) {
 	if cp.Models == nil {
 		cp.Models = map[string]ModelGateway{}
 	}
+	// 模型级 baseUrl 已废弃（0019）：没有运行时读点，落库即清空——
+	// 包格式仍容忍该键（不改解码器），但不再存下来回显给管理员造成「配了但没生效」的误解。
+	for k, mg := range cp.Models {
+		mg.BaseURL = ""
+		cp.Models[k] = mg
+	}
 }
 
 // Create 手动新建渠道协议（提交即视为已编辑）。

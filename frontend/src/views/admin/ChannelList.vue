@@ -39,7 +39,7 @@ const displayList = computed(() => {
     return (
       !q ||
       (c.Name || '').toLowerCase().includes(q) ||
-      (c.BaseURL || '').toLowerCase().includes(q) ||
+      (c.BaseURLEffective || c.BaseURL || '').toLowerCase().includes(q) ||
       (c.Protocol || '').toLowerCase().includes(q)
     )
   })
@@ -72,10 +72,12 @@ async function onEditPriority(row: AdminChannel, v: number) {
   row.Priority = num
   savingId.value = row.ID
   try {
+    const referencing = row.ChannelProtocolID != null && String(row.ChannelProtocolID) !== ''
     await updateChannel(row.ID, {
       Name: row.Name,
-      Protocol: row.Protocol,
-      BaseURL: row.BaseURL,
+      // 引用协议时基址/协议类型由协议独占：不能再把历史内联值回传（后端会 400）
+      Protocol: referencing ? '' : row.Protocol,
+      BaseURL: referencing ? '' : row.BaseURL,
       Priority: num,
     })
     ElMessage.success('已更新优先级')
@@ -192,7 +194,7 @@ function onRowClick(row: AdminChannel, _column: unknown, event: Event) {
           <template #default="{ row }">
             <div class="t-time">
               <span class="t-date">{{ row.Name }}</span>
-              <span class="t-clock ellipsis">{{ row.BaseURL }}</span>
+              <span class="t-clock ellipsis">{{ row.BaseURLEffective || row.BaseURL }}</span>
             </div>
           </template>
         </el-table-column>

@@ -50,6 +50,8 @@ func (g *Gateway) resolveUpstreamProtocol(rt *channel.RuntimeChannel, mr *channe
 	if !g.conversionEnabled() {
 		return "", false, false
 	}
+	// 转换配置读**协议**（channel_protocols.models[m].convertEnabled/convertTargets）。
+	// 裁定②：转换按协议定义、不按渠道差异化——渠道只能选协议，要不同行为就新建协议。
 	var targets []string
 	if rt.Protocol != nil {
 		enabled, t := rt.Protocol.EffectiveModelConvert(mr.Model.InternalModelID)

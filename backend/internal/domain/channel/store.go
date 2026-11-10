@@ -97,10 +97,13 @@ type Channel struct {
 	Priority  int               `json:"Priority"`
 	// ChannelProtocolID 引用的渠道协议 ID；nil=使用渠道内联配置（protocol + base_url）。
 	// 雪花 ID 超出 JS 安全整数，序列化为字符串（与其它 ID 字段一致）。
-	ChannelProtocolID *int64            `json:"ChannelProtocolID,string,omitempty"`
-	RateLimit         RateLimitConfig   `json:"RateLimit"`
-	HealthProbe       HealthProbeConfig `json:"HealthProbe"`
-	Reliability       ReliabilityConfig `json:"Reliability"`
+	ChannelProtocolID *int64 `json:"ChannelProtocolID,string,omitempty"`
+	// BaseURLEffective 只读派生：最终生效的上游基址（引用协议→协议基址；内联→自身 base_url）。
+	// 不入库、不可写，由服务层在出参前填充（与转发/探测同一解析链）。
+	BaseURLEffective string            `json:"BaseURLEffective"`
+	RateLimit        RateLimitConfig   `json:"RateLimit"`
+	HealthProbe      HealthProbeConfig `json:"HealthProbe"`
+	Reliability      ReliabilityConfig `json:"Reliability"`
 
 	KeyStates []ChannelKeyState `json:"KeyStates"`
 	CreatedAt time.Time         `json:"CreatedAt"`

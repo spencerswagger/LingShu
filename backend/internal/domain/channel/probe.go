@@ -17,16 +17,45 @@ import (
 	"github.com/team/llmgateway/internal/pkg/idgen"
 )
 
-// effectiveProtocolBaseURL 求渠道某基础协议的有效上游基址：渠道级 base_url 优先，
-// 回落所引用渠道协议（协议级 baseUrl 优先，再回落协议级 base_url）。仅引用协议时渠道内联 base_url 可为空。
-func effectiveProtocolBaseURL(rt *RuntimeChannel, protocol string) string {
-	if s := strings.TrimSpace(rt.Channel.BaseURL); s != "" {
-		return s
+// EffectiveBaseURL 求渠道在某基础协议下的有效上游基址——**运行时唯一实现**，
+// 转发（gateway）、探测/模型拉取（probe）与视图派生（Channel/ChannelView）都走这里，不再各写一份。
+//
+// 解析链（与字段归属一致）：
+//  1. 引用渠道协议且协议可用（rt.Protocol != nil）→ **只**跟随协议：协议级 baseUrl 优先，回落协议 base_url。
+//     channels.base_url 此时是历史遗留值，运行时忽略（否则「改协议 baseURL 不生效」的老缺陷会重现）。
+//  2. 引用协议但协议已不可用（rt.Protocol == nil，例如协议被软删）→ 回落读渠道内联 base_url。
+//     该状态下运行时整体按内联渠道处理（effectiveProtocols / 请求头策略同样回落），
+//     所以内联值此刻就是生效配置；不回落的后果是把渠道打向空地址。
+//  3. 内联渠道（未引用协议）→ 自身 base_url。
+func EffectiveBaseURL(rt *RuntimeChannel, protocol string) string {
+	if rt == nil {
+		return ""
 	}
-	if rt.Protocol != nil {
+	referenced := rt.Channel.ChannelProtocolID != nil && *rt.Channel.ChannelProtocolID > 0
+	if referenced && rt.Protocol != nil {
+		// 引用协议且协议可用 → 只跟随协议（协议基址为空时返回空，由调用方按「未配置」处理，
+		// 不静默回落到可能过期的内联值）。
 		return rt.Protocol.EffectiveBaseURL(protocol)
 	}
-	return ""
+	// 未引用协议，或引用了但协议已不可用（软删/加载失败）——两种情况都按内联处理。
+	return strings.TrimSpace(rt.Channel.BaseURL)
+}
+
+// effectiveProtocolBaseURL 兼容旧调用名的薄封装（探测 / 模型拉取路径）。
+func effectiveProtocolBaseURL(rt *RuntimeChannel, protocol string) string {
+	return EffectiveBaseURL(rt, protocol)
+}
+
+// effectiveChannelBaseURL 返回渠道视图用的「最终生效基址」（展示口径，与转发/探测同一解析链）。
+func effectiveChannelBaseURL(rt *RuntimeChannel) string {
+	if rt == nil {
+		return ""
+	}
+	protocol := channelprotocol.ProtocolOpenAIChat
+	if rt.Protocol != nil {
+		protocol = rt.Protocol.PreferredProtocol()
+	}
+	return effectiveProtocolBaseURL(rt, protocol)
 }
 
 // effectiveProtocolPath 求某基础协议的有效端点路径：渠道协议 path 覆盖优先，回落内置默认。

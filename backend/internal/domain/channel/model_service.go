@@ -61,6 +61,87 @@ func validateCMInput(channelID int64, in ChannelModelInput) error {
 	return nil
 }
 
+// commercialFieldsChanged 判断人工提交的「商业字段」是否真的改了值（字段级口径）。
+//
+// 为什么需要它：edited=true 会冻结该行与协议种子的同步。若「任何一次保存」都置位，
+// 管理员只改限流/探测也会把协议调价永久挡在门外；而按字节比较又会把
+// 「1.0 vs 1」「键序不同」这类序列化差异误判成修改。故这里逐字段做**数值/语义**比较：
+//   - 成本：只比较计费用的三个键（input/output/cache_read），浮点直接比数值；
+//   - 时段/分档/协议子集：归一后按结构比较（协议名 canonical 化，忽略键序）。
+//
+// 运行策略（rate_limit/health_probe/reliability）与状态不在判定范围内。
+func commercialFieldsChanged(old *ChannelModel, in ChannelModelInput) bool {
+	if old == nil {
+		return true
+	}
+	if old.ExternalModelID != in.ExternalModelID {
+		return true
+	}
+	if !ratesEqual(old.CostRates, in.CostRates) {
+		return true
+	}
+	if !sqlJSONEqual(old.TimeConfig, in.TimeConfig) {
+		return true
+	}
+	if !tiersEqual(old.ContextTiers, in.ContextTiers) {
+		return true
+	}
+	return !protocolsEqual(old.Protocols, in.Protocols)
+}
+
+// rateKeysForCompare 计费实际使用的三段单价键（其余键不参与差异判定）。
+var rateKeysForCompare = []string{"input", "output", "cache_read"}
+
+// ratesEqual 按计费口径比较成本三段：缺失键视为 0，多写的键（历史 cache_write 等）不参与比较。
+func ratesEqual(a, b billing.Rates) bool {
+	for _, k := range rateKeysForCompare {
+		if a[k] != b[k] {
+			return false
+		}
+	}
+	return true
+}
+
+// tiersEqual 比较上下文分档（顺序有意义，按结构比较）。
+func tiersEqual(a, b []billing.TierRule) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// protocolsEqual 比较模型级协议子集：协议名 canonical 化后比较，键序无关。
+func protocolsEqual(a, b channelprotocol.Protocols) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for name, sa := range a {
+		sb, ok := b[channelprotocol.Canonical(name)]
+		if !ok {
+			return false
+		}
+		if sa != sb {
+			return false
+		}
+	}
+	return true
+}
+
+// sqlJSONEqual 比较两个可空 JSON 值（先序列化再比对，结构相同即相等）。
+func sqlJSONEqual(a, b any) bool {
+	ab, aerr := json.Marshal(a)
+	bb, berr := json.Marshal(b)
+	if aerr != nil || berr != nil {
+		return false
+	}
+	return string(ab) == string(bb)
+}
+
 func rateOrDefault(r billing.Rates) billing.Rates {
 	if r == nil {
 		return billing.Rates{"input": 0.8, "output": 1.6, "cache_read": 0.05}
@@ -92,6 +173,8 @@ func (s *Service) CreateChannelModel(ctx context.Context, channelID int64, in Ch
 		ContextTiers:    in.ContextTiers,
 		Protocols:       in.Protocols,
 		State:           StateNormal,
+		// 人工创建即视为本地编辑：之后协议同步不覆盖该行（reset-from-protocol 可恢复）。
+		Edited: true,
 	}
 	if in.RateLimit != nil {
 		m.RateLimit = *in.RateLimit
@@ -150,6 +233,9 @@ func (s *Service) UpdateChannelModel(ctx context.Context, channelID, mid int64, 
 		RateLimit:       existing.RateLimit,
 		HealthProbe:     existing.HealthProbe,
 		Reliability:     existing.Reliability,
+		// 物化守卫按「字段级」置位：只有商业字段真的变了才冻结与协议种子的同步；
+		// 只改限流/探测/可靠性，或提交值与现值等价（1 vs 1.0、键序不同）都不置位。
+		Edited: existing.Edited || commercialFieldsChanged(existing, in),
 	}
 	if in.RateLimit != nil {
 		m.RateLimit = *in.RateLimit
