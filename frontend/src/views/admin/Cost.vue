@@ -3,10 +3,10 @@
 //   A. 成本统计表：按「当前实体」（渠道 × 内部模型 × 对外模型）聚合，row-key = EntityKey；
 //   B. 模型定价曲线：新接口 /admin/cost/pricing-curve，后端按真实公式逐 token 出点，前端只渲染
 //      （成本线 = 渠道内部模型配置、售价线 = 对外模型配置；分档拐点画竖线、超档断线标红）；
-//      B+ 多线对比（受开关 console.cost_multichannel_trace 控制，默认关闭）：同图多条线、逐线显隐；
+//      B+ 多线对比（本机偏好开关，默认关闭）：同图多条线、逐线显隐；
 //   C. 会话成本曲线：逐轮历史实际 cost_credits / credits_consumed（切换会话有请求序号守卫）；
-//      C+ 会话渠道轨迹（同一开关）：逐轮渠道 + 连续段 + 真实切换点 + 预测打平点。
-// 纯只读：全部走 GET，无任何写路径（开关写入在「计费配置」页）。桌面用表格、窄屏用「数字墙 + 实体行」单列表。
+//      C+ 会话渠道轨迹（本机偏好开关）：逐轮渠道 + 连续段 + 真实切换点 + 预测打平点。
+// 纯只读：全部走 GET，无任何写路径（两个视图开关只写本机 localStorage）。桌面用表格、窄屏用数字墙 + 单列表。
 import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { Refresh } from '@element-plus/icons-vue'
@@ -20,7 +20,6 @@ import {
   getCostPricingCurve,
   getCostSession,
   getCostSessionTrace,
-  getSystemConfig,
   listSessions,
   type AdminSession,
   type CostPricingCurveData,
@@ -60,32 +59,56 @@ function setErr(e: any) {
 }
 
 // ===================================================================
-// 0. 增强视图开关（console.cost_multichannel_trace，默认 false）
+// 0. 增强视图开关（**仅本机偏好**：只写 localStorage，不落库、不影响他人）
 // ===================================================================
-// 一个开关同时管两个**只读**入口：定价曲线多线对比（ChannelModelIDs）与会话渠道轨迹（/trace）。
-// 关闭时这两个入口返回 403 —— 本页先读开关决定是否展示新入口；万一读不到（或读取后又被人关掉）
-// 而收到 403，走「功能未开启」提示，不弹红色报错、也不留空白。
-const featEnabled = ref(false)
-const featBlocked = ref('') // 403 时后端文案（开关未开启），用于行内引导
-const featLoaded = ref(false)
+// 后端已删除只读门控（配置页整改后接口不再有 Console 块、两个入口恒可用）：
+// 这两个开关只决定「本浏览器是否展示新视图」，默认关、刷新记住；关掉时页面与改造前完全一致。
+// 兼容期：老后端仍可能返回 403（门控未删），此时行内提示、不弹红条。
+const LS_MULTI = 'lingshu.console.costMultichannel' // 定价曲线·多渠道对比
+const LS_TRACE = 'lingshu.console.costTrace' // 会话渠道轨迹
 
-async function loadFeatureSwitch() {
+function readLocalFlag(key: string): boolean {
   try {
-    const res = await getSystemConfig()
-    featEnabled.value = !!res.Data?.Console?.MultichannelTrace
+    return localStorage.getItem(key) === '1'
   } catch {
-    // 读不到配置时按关闭处理：页面回到改造前的表现，不影响旧的统计/曲线/会话功能。
-    featEnabled.value = false
-  } finally {
-    featLoaded.value = true
+    return false // 隐私模式/禁用存储：退化为默认关
+  }
+}
+function writeLocalFlag(key: string, on: boolean): void {
+  try {
+    if (on) localStorage.setItem(key, '1')
+    else localStorage.removeItem(key)
+  } catch {
+    // 写不进去就只在本次会话生效，不打扰用户
   }
 }
 
-// 403 = 能力未启用（不是参数错误）：不再弹红条，改为行内空态 + 引导。
+const multiEnabled = ref(readLocalFlag(LS_MULTI)) // 定价曲线多渠道对比
+const traceEnabled = ref(readLocalFlag(LS_TRACE)) // 会话渠道轨迹
+const featureBlocked = ref('') // 老后端 403 时的行内提示
+
+function onToggleMulti(v: boolean) {
+  multiEnabled.value = v
+  writeLocalFlag(LS_MULTI, v)
+  if (!v) {
+    multiSelected.value = []
+    multiHidden.value = []
+  }
+  loadCurve()
+}
+function onToggleTrace(v: boolean) {
+  traceEnabled.value = v
+  writeLocalFlag(LS_TRACE, v)
+  if (v) void loadTrace()
+  else trace.value = null
+}
+
+// 403 = 老后端门控未删（不是参数错误）：不再弹红条，改为行内提示。
 function onFeatureForbidden(e: any): boolean {
   if (e?.status !== 403) return false
-  featEnabled.value = false
-  featBlocked.value = e?.message || '该功能未开启（console.cost_multichannel_trace）'
+  featureBlocked.value = e?.message || '后端未开启成本页增强视图（当前后端版本仍带只读门控）'
+  multiEnabled.value = false
+  traceEnabled.value = false
   return true
 }
 
@@ -203,10 +226,8 @@ let curveSeq = 0
 const manual = reactive({ step: false, maxTokens: false, hitRate: false, inOut: false })
 
 // ===== 多线对比（受开关控制）=====
-// multiMode       是否打开多线对比（关闭时页面行为与改造前完全一致）
 // multiSelected   选中的渠道内部模型 ID（顺序即图例顺序，最多 10 个）
 // multiHidden     逐线显隐：被隐藏的 ChannelModelID
-const multiMode = ref(false)
 const multiSelected = ref<number[]>([])
 const multiHidden = ref<number[]>([])
 const MULTI_LIMIT = 10
@@ -223,10 +244,6 @@ const multiOptions = computed<CostStatRow[]>(() => {
   return out
 })
 
-function onMultiModeChange() {
-  multiHidden.value = []
-  loadCurve()
-}
 function onMultiSelectChange() {
   multiHidden.value = multiHidden.value.filter((id) => multiSelected.value.includes(id))
   loadCurve()
@@ -245,7 +262,7 @@ async function loadCurve() {
     const p: CostPricingCurveParams = {}
     // 多线模式：只传 ChannelModelIDs（顶层 Cost/Sale 会是「未指定」的不可用线，多线渲染不读它）；
     // 没开多线、或一个都没选时，走改造前的单线参数。
-    const multi = featEnabled.value && multiMode.value && multiSelected.value.length > 0
+    const multi = multiEnabled.value && multiSelected.value.length > 0
     if (multi) {
       p.ChannelModelIDs = multiSelected.value.slice(0, MULTI_LIMIT).join(',')
     } else {
@@ -517,7 +534,7 @@ const multiLines = computed<MultiLineView[]>(() => {
 })
 
 const multiActive = computed(
-  () => featEnabled.value && multiMode.value && multiSelected.value.length > 0 && multiLines.value.length > 0,
+  () => multiEnabled.value && multiSelected.value.length > 0 && multiLines.value.length > 0,
 )
 const multiVisibleLines = computed(() =>
   multiLines.value.filter((l) => l.available && !multiHidden.value.includes(l.id)),
@@ -695,7 +712,7 @@ let traceSeq = 0
 
 async function loadTrace() {
   const seq = ++traceSeq
-  if (!sessionId.value || !featEnabled.value) {
+  if (!sessionId.value || !traceEnabled.value) {
     trace.value = null
     return
   }
@@ -977,9 +994,7 @@ const loading = computed(
 
 async function loadAll() {
   errInfo.value = { message: '', requestId: '' }
-  featBlocked.value = ''
-  // 先读开关：关闭时后面的一切与改造前完全一致（不发新参数、不请求 /trace）
-  await loadFeatureSwitch()
+  featureBlocked.value = ''
   await loadStats()
   if (!curveEntity.value && curveEntities.value.length) {
     const prefer = curveEntities.value.find((r) => r.ChannelModelID > 0) || curveEntities.value[0]
@@ -1016,12 +1031,12 @@ onUnmounted(() => {
     </div>
 
     <div class="panel-stack">
-      <!-- 开关未开启（含「读到开关是开的、请求时已被关掉」的 403）：行内引导，不弹红条、不留空白 -->
-      <div v-if="featBlocked" class="feat-notice">
+      <!-- 老后端门控未删时的 403：行内提示，不弹红条、不留空白 -->
+      <div v-if="featureBlocked" class="feat-notice">
         <el-tag size="small" type="info" effect="plain">增强视图未开启</el-tag>
-        <span class="feat-msg">{{ featBlocked }}</span>
+        <span class="feat-msg">{{ featureBlocked }}</span>
         <span class="feat-guide">
-          可在「计费配置 → 系统配置 → 成本页增强视图」打开后重试；关闭状态下本页其余功能不受影响。
+          当前后端版本仍带只读门控；升级后端后这两个入口即可直接使用。本页其余功能不受影响。
         </span>
       </div>
 
@@ -1192,13 +1207,17 @@ onUnmounted(() => {
           </el-radio-group>
         </div>
 
-        <!-- 多线对比（开关 console.cost_multichannel_trace 打开时才出现；不选 = 与改造前完全一致） -->
-        <div v-if="featEnabled" class="multi-bar">
+        <!-- 多渠道对比：**本机偏好**（localStorage，不落库）；关掉或一条都不选 = 与改造前完全一致 -->
+        <div class="multi-bar">
           <span class="switch-wrap">
-            <el-switch v-model="multiMode" size="small" @change="onMultiModeChange" />
+            <el-switch
+              :model-value="multiEnabled"
+              size="small"
+              @update:model-value="(v: any) => onToggleMulti(!!v)"
+            />
             <span class="p-label">多渠道对比</span>
           </span>
-          <template v-if="multiMode">
+          <template v-if="multiEnabled">
             <el-select
               v-model="multiSelected"
               multiple
@@ -1229,7 +1248,7 @@ onUnmounted(() => {
             :height="isNarrow ? '240px' : '360px'"
           />
           <div v-else class="empty-hint">
-            <template v-if="featEnabled && multiMode && !multiSelected.length">
+            <template v-if="multiEnabled && !multiSelected.length">
               已打开多渠道对比：请在上方选择 1~10 个「渠道 × 内部模型」（当前仍按单线展示）。
             </template>
             <template v-else-if="multiActive && multiUnavailable.length">
@@ -1290,7 +1309,7 @@ onUnmounted(() => {
         <div class="hint">{{ multiActive ? multiMeta : curveMeta }}</div>
         <div class="hint">
           时段系数按所选时段整笔计（跨时段不切分）；系数开关只切后端给的两套序列（含 / 不含系数），前端不做乘法。
-          <template v-if="featEnabled">
+          <template v-if="multiEnabled">
             多线模式下所有线共用一条横轴与一套采样参数，上限以上方响应回报的 MaxTokens 为准。
           </template>
         </div>
@@ -1307,6 +1326,14 @@ onUnmounted(() => {
           切换会话时立即清空旧数据并丢弃过期响应。
         </div>
         <div class="curve-toolbar">
+          <span class="switch-wrap trace-switch">
+            <el-switch
+              :model-value="traceEnabled"
+              size="small"
+              @update:model-value="(v: any) => onToggleTrace(!!v)"
+            />
+            <span class="p-label">渠道轨迹</span>
+          </span>
           <span class="p-label">会话</span>
           <el-select
             v-model="sessionId"
@@ -1354,7 +1381,7 @@ onUnmounted(() => {
         </div>
 
         <!-- C+ 会话渠道轨迹（同一开关；关闭时整块不出现） -->
-        <template v-if="featEnabled && sessionId">
+        <template v-if="traceEnabled && sessionId">
           <el-divider class="trace-divider">
             <span class="trace-divider-text">渠道轨迹</span>
           </el-divider>
