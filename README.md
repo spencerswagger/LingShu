@@ -118,7 +118,31 @@ cd backend && go run ./scripts/backfill-0019 -dsn "$DSN" -reset     # 清断点�
 
 # 3) 回滚某个迁移（手工执行，不放进 migrations/）
 psql "$DSN" -f backend/scripts/rollback-0019.sql
+
+# 4) 两条回填路径的等价性自检（可复现；自己建两个临时库、造数、比对、删库）
+cd backend && go run ./scripts/verify-0019-equivalence -dsn "$PG_TEST_DSN"
 ```
+
+`verify-0019-equivalence` 的预期输出（`-rows` 默认 55000，退出码 0 表示一致）：
+
+```
+迁移目录: ../backend/internal/db/migrations
+行数: 55000
+
+指标                           结果
+--------------------------------------------------------------------------------
+channels                     A=3cf2c6340f4bf16beb055abafad4f8e0 B=3cf2c6340f4bf16beb055abafad4f8e0 一致
+channel_models               A=5690b842f53d23be73540b5c77e58aae B=5690b842f53d23be73540b5c77e58aae 一致
+archive                      A=a4542e50ffb490381e57cf6b97943423 B=a4542e50ffb490381e57cf6b97943423 一致
+edited 行数                    A=1002 B=1002 一致
+channel_models 行数            A=55000 B=55000
+耗时                           A=16.180873305s B=7.581536364s
+
+结论：两条路径结果完全一致（退出码 0）
+```
+
+A 路 = 超阈值（迁移只做 DDL + 独立回填三阶段）；B 路 = 强制内联（迁移自己跑完数据段）。
+指纹随造数固定，因此可与本文对照；不一致时退出码 1 并逐项标出。
 
 回填进度写在 `backfill_checkpoints(name, last_id)`：中断后重跑**自动续做**，重复执行**不会重复写**
 （语句幂等 + 归档表 `ON CONFLICT DO NOTHING`）。脚本与回滚的详细口径见

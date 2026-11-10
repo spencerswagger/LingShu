@@ -197,8 +197,10 @@ func TestService_PullModels_HonorsChannelProtocol(t *testing.T) {
 	defer mock.Close()
 
 	mgr := NewManager(nil, nil, make([]byte, 16), nil, nil, nil)
+	protoID := int64(7)
 	rt := &RuntimeChannel{
-		Channel: Channel{ID: 1, Name: "p"},
+		// 引用渠道协议的运行时（Protocol 只在引用了协议时被装配）。
+		Channel: Channel{ID: 1, Name: "p", ChannelProtocolID: &protoID},
 		Protocol: &channelprotocol.ChannelProtocol{
 			BaseURL: mock.URL,
 			Protocols: channelprotocol.Protocols{

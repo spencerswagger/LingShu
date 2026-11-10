@@ -88,6 +88,9 @@ CREATE TABLE IF NOT EXISTS applied_migrations (
 	return appliedCount, nil
 }
 
+// RenderMigration 对外暴露迁移渲染（供校验脚本按与 db.Migrate 完全相同的规则应用 .sql 文件）。
+func RenderMigration(body string) string { return renderMigration(body) }
+
 // renderMigration 渲染迁移 SQL 里的占位符。
 //
 // 目前只有一个：{{backfill_threshold}} → Backfill0019InlineThreshold。

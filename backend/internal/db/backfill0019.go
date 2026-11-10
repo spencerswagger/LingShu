@@ -33,13 +33,14 @@ const (
 	Backfill0019PhaseModels    = "0019_channel_models"
 )
 
-// Backfill0019InlineThreshold 0019 **迁移内联**回填的行数阈值：
+// Backfill0019InlineThreshold 0019 **迁移内联**回填的行数阈值（变量而非常量，
+// 便于测试与校验脚本在同进程内临时调高以强制走内联路径；生产部署不要改这个默认值）：
 // channel_models 未删除行数 > 该值时，迁移只做 DDL（加列 + 建留档表）并显式告警，
 // 数据段（归档清空 / 下移 / 漂移标记）交给 scripts/backfill-0019 分批完成。
 //
 // 这是**唯一开关**：SQL 侧不写死数字，迁移文件里是占位符 {{backfill_threshold}}，
 // 由 renderMigration() 用本常量渲染（见 migrate.go）。改这里即可同时改两条路径。
-const Backfill0019InlineThreshold int64 = 50000
+var Backfill0019InlineThreshold int64 = 50000
 
 // backfillThresholdToken 迁移 SQL 里的阈值占位符。
 const backfillThresholdToken = "{{backfill_threshold}}"
@@ -442,10 +443,19 @@ const driftCondition = `cm.channel_id = c.id
   AND cp.models -> cm.internal_model_id ?| ARRAY['externalModelID','protocols','costRates','timeConfig','contextTiers']
   AND (
     -- 对外模型绑定：种子有值、实例有值且不同。
+    -- 脏种子守卫（与迁移同口径）：CASE 惰性求值，只有形如整数的值才会进 ::numeric/::bigint，
+    -- 非整数或超出 int64 的值不会抛错，而是「该模型跳过」（迁移侧会记入 channel_seed_skipped）。
     (cp.models -> cm.internal_model_id ? 'externalModelID'
-     AND NULLIF(btrim(cp.models -> cm.internal_model_id ->> 'externalModelID'), '') IS NOT NULL
+     AND (CASE WHEN btrim(cp.models -> cm.internal_model_id ->> 'externalModelID') ~ '^-?[0-9]+$'
+               THEN btrim(cp.models -> cm.internal_model_id ->> 'externalModelID')::numeric
+                    BETWEEN -9223372036854775808 AND 9223372036854775807
+               ELSE false END)
      AND cm.external_model_id IS DISTINCT FROM
-         NULLIF(btrim(cp.models -> cm.internal_model_id ->> 'externalModelID'), '')::bigint)
+         (CASE WHEN btrim(cp.models -> cm.internal_model_id ->> 'externalModelID') ~ '^-?[0-9]+$'
+                    AND btrim(cp.models -> cm.internal_model_id ->> 'externalModelID')::numeric
+                        BETWEEN -9223372036854775808 AND 9223372036854775807
+               THEN btrim(cp.models -> cm.internal_model_id ->> 'externalModelID')::bigint
+          END))
     -- 模型级协议子集：双方都有内容（空对象=未设置）且不同（键序无关）。
     OR (cp.models -> cm.internal_model_id ? 'protocols'
         AND jsonb_typeof(cp.models -> cm.internal_model_id -> 'protocols') = 'object'

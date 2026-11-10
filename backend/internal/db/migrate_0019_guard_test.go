@@ -593,3 +593,75 @@ func TestBackfill0019Phases_CoversAll(t *testing.T) {
 		}
 	}
 }
+
+// 脏种子守卫：externalModelID 出现非整数/空串/科学计数/超 int64 时，
+// 迁移必须走完（不回滚、不抛错），并在 channel_seed_skipped 里留下记录（该模型跳过）。
+func TestMigrate_0019_DirtySeedExternalModelID(t *testing.T) {
+	tempDB := openTempDB(t)
+	migDir := filepath.Join(filepath.Dir(mustCallerFile(t)), "migrations")
+	applyMigrationsBelow(t, tempDB, migDir, "0019")
+
+	exec(t, tempDB, `INSERT INTO external_models(id, external_name) VALUES (2,'ext-a')`)
+	exec(t, tempDB, `INSERT INTO channel_protocols(id, name, base_url, models) VALUES (7,'p7','https://proto.example.com','{
+		"m-nonnumeric":{"externalModelID":"abc"},
+		"m-empty":{"externalModelID":""},
+		"m-scientific":{"externalModelID":"1e5"},
+		"m-overflow":{"externalModelID":"9223372036854775808"},
+		"m-ok":{"externalModelID":"2","costRates":{"Input":1,"Output":2,"CacheRead":0.1}}
+	}'::jsonb)`)
+	exec(t, tempDB, `INSERT INTO channels(id, name, base_url, protocol, channel_protocol_id)
+		VALUES (1,'ref','','',7)`)
+	exec(t, tempDB, `INSERT INTO channel_models(id, channel_id, internal_model_id, external_model_id, cost_rates) VALUES
+		(1, 1, 'm-nonnumeric', 2, '{"input":1,"output":2,"cache_read":0.1}'::jsonb),
+		(2, 1, 'm-empty',      2, '{"input":1,"output":2,"cache_read":0.1}'::jsonb),
+		(3, 1, 'm-scientific', 2, '{"input":1,"output":2,"cache_read":0.1}'::jsonb),
+		(4, 1, 'm-overflow',   2, '{"input":1,"output":2,"cache_read":0.1}'::jsonb),
+		(5, 1, 'm-ok',         2, '{"input":9,"output":9,"cache_read":9}'::jsonb)`)
+
+	// 迁移必须整体成功（单个脏值不得回滚事务）。
+	runMigration(t, tempDB, migDir, migrationFile(t, migDir, "0019"))
+
+	rows, err := tempDB.Query(`SELECT internal_model_id, reason FROM channel_seed_skipped ORDER BY internal_model_id`)
+	if err != nil {
+		t.Fatalf("读取跳过记录失败: %v", err)
+	}
+	defer rows.Close()
+	skipped := map[string]string{}
+	for rows.Next() {
+		var id, reason string
+		if err := rows.Scan(&id, &reason); err != nil {
+			t.Fatalf("扫描跳过记录失败: %v", err)
+		}
+		skipped[id] = reason
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows.Err: %v", err)
+	}
+
+	for _, id := range []string{"m-nonnumeric", "m-empty", "m-scientific", "m-overflow"} {
+		if _, ok := skipped[id]; !ok {
+			t.Fatalf("脏种子 %s 应被记录为跳过，实际记录=%v", id, skipped)
+		}
+	}
+	if _, ok := skipped["m-ok"]; ok {
+		t.Fatalf("合法种子 m-ok 不应被跳过")
+	}
+	if !strings.Contains(skipped["m-overflow"], "超出 int64") {
+		t.Fatalf("超范围的原因应可区分, got %q", skipped["m-overflow"])
+	}
+	if !strings.Contains(skipped["m-empty"], "空串") {
+		t.Fatalf("空串的原因应可区分, got %q", skipped["m-empty"])
+	}
+	if !strings.Contains(skipped["m-nonnumeric"], "非整数") {
+		t.Fatalf("非整数的原因应可区分, got %q", skipped["m-nonnumeric"])
+	}
+
+	// 合法行照常参与漂移判定（成本偏离 → edited=true）；脏值行不因判定失败而中断。
+	var okEdited bool
+	if err := tempDB.QueryRow(`SELECT edited FROM channel_models WHERE internal_model_id='m-ok'`).Scan(&okEdited); err != nil {
+		t.Fatalf("读取 m-ok edited 失败: %v", err)
+	}
+	if !okEdited {
+		t.Fatalf("m-ok 成本偏离种子，应被标 edited")
+	}
+}

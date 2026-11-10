@@ -198,23 +198,10 @@ func effectiveProtocols(rt *channel.RuntimeChannel, mr *channel.ModelRuntime) ch
 	return out
 }
 
-// effectiveBaseURL 求某基础协议的有效上游基址。
-// 归属（0019 契约 + 拍板「引用协议不覆盖基址」）：引用协议时**只**跟随协议；
-// channels.base_url 仅内联渠道生效（引用协议时它是历史遗留值，运行时忽略）。
+// effectiveBaseURL 求某基础协议的有效上游基址：委托 channel.EffectiveBaseURL（唯一实现），
+// 保证转发与探测/视图的解析链完全一致。
 func effectiveBaseURL(rt *channel.RuntimeChannel, protocol string) string {
-	if rt == nil {
-		return ""
-	}
-	if rt.Channel.ChannelProtocolID != nil && *rt.Channel.ChannelProtocolID > 0 {
-		return rt.Protocol.EffectiveBaseURL(protocol)
-	}
-	if s := strings.TrimSpace(rt.Channel.BaseURL); s != "" {
-		return s
-	}
-	if rt.Protocol != nil {
-		return rt.Protocol.EffectiveBaseURL(protocol)
-	}
-	return ""
+	return channel.EffectiveBaseURL(rt, protocol)
 }
 
 // effectiveHeaderPolicy 求请求头策略：渠道协议读取，内联渠道缺省空策略（等效 none）。

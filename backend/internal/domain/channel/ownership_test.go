@@ -454,3 +454,126 @@ func TestChannelModelRequest_DropsChannelLevelConvertFields(t *testing.T) {
 		t.Fatalf("渠道侧转换字段应被丢弃（转换由协议独占）；got=%+v want=%+v", got, want)
 	}
 }
+
+// 探测/模型拉取路径的同一回落：协议不可用（软删）→ 用内联基址拼接探测目标。
+func TestProbeRequest_ProtocolDeletedFallsBackToInline(t *testing.T) {
+	protoID := int64(7)
+	rt := &RuntimeChannel{
+		Channel:  Channel{ID: 1, Name: "c1", ChannelProtocolID: &protoID, BaseURL: "https://inline.example.com"},
+		Protocol: nil,
+	}
+	m := newProbeTestManager()
+	target, header, value := m.probeRequest(rt, "sk-1")
+	if target != "https://inline.example.com/chat/completions" {
+		t.Fatalf("协议不可用时应回落到内联基址 + 内置 path, got %q", target)
+	}
+	if header != "Authorization" || value != "Bearer sk-1" {
+		t.Fatalf("鉴权应按 openai-chat 隐含注入, got %q/%q", header, value)
+	}
+}
+
+// 视图派生同样回落（列表/编辑页展示的「生效基址」必须与实际一致）。
+func TestEffectiveChannelBaseURL_ProtocolDeletedFallsBackToInline(t *testing.T) {
+	protoID := int64(7)
+	rt := &RuntimeChannel{
+		Channel:  Channel{ChannelProtocolID: &protoID, BaseURL: "https://inline.example.com"},
+		Protocol: nil,
+	}
+	if got := effectiveChannelBaseURL(rt); got != "https://inline.example.com" {
+		t.Fatalf("协议不可用时视图应展示内联基址, got %q", got)
+	}
+}
+
+// 校验与落库必须一致：提交带首尾空白的值时，落库的是归一后的值（不是原值）。
+// 此前用 TrimSpace 判空、却原样落库，" " 能过校验并写进库，与「引用协议时 BaseURL 恒为 ”」不符。
+func TestCreateChannel_NormalizesWhitespaceBeforeStore(t *testing.T) {
+	now := time.Now()
+	pid := int64(7)
+
+	t.Run("空白 URL 视为空 → 400", func(t *testing.T) {
+		for _, raw := range []string{" ", "\t\n"} {
+			svc := NewService(NewStore(nil))
+			if err := svc.validateBase(normalizeChannelInput(ChannelInput{Name: "c", Protocol: "openai-chat", BaseURL: raw})); err == nil {
+				t.Fatalf("内联渠道提交空白 BaseURL(%q) 应被拒绝", raw)
+			}
+		}
+	})
+
+	t.Run("非 URL 值即使去空白仍非法 → 400", func(t *testing.T) {
+		svc := NewService(NewStore(nil))
+		if err := svc.validateBase(normalizeChannelInput(ChannelInput{Name: "c", Protocol: "openai-chat", BaseURL: "  x  "})); err == nil {
+			t.Fatalf("非 http(s) 值应被拒绝")
+		}
+	})
+
+	t.Run("首尾空白被裁掉后落库", func(t *testing.T) {
+		db, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatalf("sqlmock: %v", err)
+		}
+		defer db.Close()
+		svc := NewService(NewStore(db))
+		mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + channelCols + ` FROM channels WHERE name = $1`)).
+			WithArgs("c1").WillReturnRows(sqlmock.NewRows(nil))
+		mock.ExpectBegin()
+		mock.ExpectQuery(regexp.QuoteMeta(insertChannelSQL)).
+			WillReturnRows(channelRow(&Channel{ID: 1, Name: "c1", Protocol: "openai-chat",
+				BaseURL: "https://inline.example.com", Priority: 100, CreatedAt: now, UpdatedAt: now}))
+		mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM channel_tags WHERE channel_id = $1`)).
+			WithArgs(int64(1)).WillReturnResult(sqlmock.NewResult(0, 0))
+		mock.ExpectCommit()
+
+		c, err := svc.CreateChannel(context.Background(), ChannelInput{Name: "c1",
+			Protocol: "  openai-chat  ", BaseURL: "  https://inline.example.com  "})
+		if err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		if c.BaseURL != "https://inline.example.com" {
+			t.Fatalf("落库值应是归一后的 BaseURL, got %q", c.BaseURL)
+		}
+		if c.Protocol != "openai-chat" {
+			t.Fatalf("落库值应是归一后的 Protocol, got %q", c.Protocol)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("expectations: %v", err)
+		}
+	})
+
+	t.Run("引用协议时恒为 ''：空白与协议名都被归一为空", func(t *testing.T) {
+		db, mock, err := sqlmock.New()
+		if err != nil {
+			t.Fatalf("sqlmock: %v", err)
+		}
+		defer db.Close()
+		svc := NewService(NewStore(db))
+		svc.SetChannelProtocolStore(channelprotocol.NewStore(db))
+		mock.ExpectQuery(cpByIdRe).WithArgs(pid).
+			WillReturnRows(cpProtoRow(pid, "https://proto.example.com", `{}`))
+		mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + channelCols + ` FROM channels WHERE name = $1`)).
+			WithArgs("c2").WillReturnRows(sqlmock.NewRows(nil))
+		mock.ExpectBegin()
+		mock.ExpectQuery(regexp.QuoteMeta(insertChannelSQL)).
+			WillReturnRows(channelRow(&Channel{ID: 2, Name: "c2", ChannelProtocolID: &pid,
+				Priority: 100, CreatedAt: now, UpdatedAt: now}))
+		mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM channel_tags WHERE channel_id = $1`)).
+			WithArgs(int64(2)).WillReturnResult(sqlmock.NewResult(0, 0))
+		mock.ExpectCommit()
+
+		in := normalizeChannelInput(ChannelInput{Name: "c2", ChannelProtocolID: &pid,
+			BaseURL: " \t\n ", Protocol: " openai-compat "})
+		if in.BaseURL != "" || in.Protocol != "" {
+			t.Fatalf("引用协议时归一化后应为空, got base_url=%q protocol=%q", in.BaseURL, in.Protocol)
+		}
+		c, err := svc.CreateChannel(context.Background(), ChannelInput{Name: "c2",
+			ChannelProtocolID: &pid, BaseURL: " \t\n ", Protocol: " openai-compat "})
+		if err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		if c.BaseURL != "" || c.Protocol != "" {
+			t.Fatalf("引用协议时落库必须为空串, got base_url=%q protocol=%q", c.BaseURL, c.Protocol)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Fatalf("expectations: %v", err)
+		}
+	})
+}

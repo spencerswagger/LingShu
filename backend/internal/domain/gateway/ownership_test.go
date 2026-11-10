@@ -93,3 +93,52 @@ func TestEffectiveProtocols_NoSeedModelFallback(t *testing.T) {
 		t.Fatalf("非法协议名应回落 openai-chat: %v", got4)
 	}
 }
+
+// 协议被软删（rt.Protocol == nil）时，运行时必须回落到渠道内联基址：
+// 该状态下网关整体按内联渠道处理，内联值此刻就是生效配置，不回落的后果是渠道被打向空地址。
+// 这条与迁移/预检脚本的 S1 口径一致（引用已软删协议的渠道保持内联值不动）。
+func TestEffectiveBaseURL_ProtocolDeletedFallsBackToInline(t *testing.T) {
+	protoID := int64(7)
+	rt := &channel.RuntimeChannel{
+		Channel:  channel.Channel{ID: 1, ChannelProtocolID: &protoID, BaseURL: "https://inline.example.com"},
+		Protocol: nil, // 协议已软删 / 加载失败
+	}
+	if got := effectiveBaseURL(rt, channelprotocol.ProtocolOpenAIChat); got != "https://inline.example.com" {
+		t.Fatalf("协议不可用时应回落到内联基址, got %q", got)
+	}
+	// 内联渠道（未引用协议）同样走内联值。
+	inline := &channel.RuntimeChannel{Channel: channel.Channel{BaseURL: "https://inline2.example.com"}}
+	if got := effectiveBaseURL(inline, channelprotocol.ProtocolOpenAIChat); got != "https://inline2.example.com" {
+		t.Fatalf("内联渠道应使用自身 base_url, got %q", got)
+	}
+	// 引用协议且协议可用 → 只跟随协议，内联值不参与（即便非空）。
+	live := &channel.RuntimeChannel{
+		Channel:  channel.Channel{ChannelProtocolID: &protoID, BaseURL: "https://stale.example.com"},
+		Protocol: &channelprotocol.ChannelProtocol{BaseURL: "https://proto.example.com"},
+	}
+	if got := effectiveBaseURL(live, channelprotocol.ProtocolOpenAIChat); got != "https://proto.example.com" {
+		t.Fatalf("协议可用时应只跟随协议, got %q", got)
+	}
+}
+
+// 转发与探测/视图必须同一实现：channel.EffectiveBaseURL 是唯一解析链，
+// gateway 侧只是委托（此断言防止又出现一份平行实现）。
+func TestEffectiveBaseURL_DelegatesToChannelPackage(t *testing.T) {
+	protoID := int64(7)
+	cases := []*channel.RuntimeChannel{
+		nil,
+		{Channel: channel.Channel{BaseURL: "https://inline.example.com"}},
+		{Channel: channel.Channel{ChannelProtocolID: &protoID, BaseURL: "https://fallback.example.com"}},
+		{
+			Channel:  channel.Channel{ChannelProtocolID: &protoID, BaseURL: "https://stale.example.com"},
+			Protocol: &channelprotocol.ChannelProtocol{BaseURL: "https://proto.example.com"},
+		},
+	}
+	for i, rt := range cases {
+		got := effectiveBaseURL(rt, channelprotocol.ProtocolOpenAIChat)
+		want := channel.EffectiveBaseURL(rt, channelprotocol.ProtocolOpenAIChat)
+		if got != want {
+			t.Fatalf("case %d：gateway 与 channel 包解析结果不一致 got=%q want=%q", i, got, want)
+		}
+	}
+}

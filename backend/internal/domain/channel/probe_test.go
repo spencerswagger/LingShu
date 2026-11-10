@@ -21,8 +21,10 @@ import (
 // 探测目标按渠道协议解析有效 baseURL/path；鉴权按 openai-chat 隐含注入（Bearer）。
 func TestProbeRequest_HonorsChannelProtocol(t *testing.T) {
 	m := newProbeTestManager()
+	protoID := int64(7)
 	rt := &RuntimeChannel{
-		Channel: Channel{ID: 1, Name: "c1"},
+		// 引用渠道协议的运行时：Protocol 仅在该渠道引用了协议时才会被装配（ChannelProtocolID 非空）。
+		Channel: Channel{ID: 1, Name: "c1", ChannelProtocolID: &protoID},
 		Protocol: &channelprotocol.ChannelProtocol{
 			BaseURL: "https://proto.example.com",
 			Protocols: channelprotocol.Protocols{

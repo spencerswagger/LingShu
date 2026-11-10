@@ -145,6 +145,21 @@ func (s *Service) validateBase(in ChannelInput) error {
 	return nil
 }
 
+// normalizeChannelInput 归一化可写字段：BaseURL / Protocol 一律去首尾空白后才校验与落库。
+//
+// 为什么必须归一后落库：校验用 TrimSpace 判空、落库却写原值，会允许 " " 这类值进库，
+// 与「引用协议时 BaseURL 恒为 ”」的契约不符，且让下游（拼接 URL、判空）各写一套兜底。
+// 引用协议时两个字段一律置空（非空已在 validateBase 拦成 400）。
+func normalizeChannelInput(in ChannelInput) ChannelInput {
+	in.BaseURL = strings.TrimSpace(in.BaseURL)
+	in.Protocol = strings.TrimSpace(in.Protocol)
+	if in.ChannelProtocolID != nil && *in.ChannelProtocolID > 0 {
+		in.BaseURL = ""
+		in.Protocol = ""
+	}
+	return in
+}
+
 // inlineProtocol 返回应落库的 channels.protocol：引用协议时恒为空（该值不参与解析，
 // 老前端回传的默认值一律忽略并落空，见 validateBase 说明）。
 func inlineProtocol(in ChannelInput) string {
@@ -176,6 +191,7 @@ func fillDefaults(c *Channel, in ChannelInput) {
 
 // CreateChannel 创建渠道：校验 + 唯一性 + 默认值。凭据由渠道密钥（channel_keys）承载，不在本层录入。
 func (s *Service) CreateChannel(ctx context.Context, in ChannelInput) (*Channel, error) {
+	in = normalizeChannelInput(in)
 	if err := s.validateBase(in); err != nil {
 		return nil, err
 	}
@@ -227,6 +243,7 @@ func (s *Service) CreateChannel(ctx context.Context, in ChannelInput) (*Channel,
 // UpdateChannel 更新渠道可写字段。
 // name 重复 → 40901；渠道不存在 → 40401。
 func (s *Service) UpdateChannel(ctx context.Context, id int64, in ChannelInput) (*Channel, error) {
+	in = normalizeChannelInput(in)
 	if err := s.validateBase(in); err != nil {
 		return nil, err
 	}
@@ -328,12 +345,16 @@ func (s *Service) enrichBaseURLEffective(ctx context.Context, chs ...*Channel) {
 		pid := *c.ChannelProtocolID
 		cp, cached := cpCache[pid]
 		if !cached && s.cpStore != nil {
-			cp, _ = s.cpStore.GetByID(ctx, pid) // 协议已删/查询失败 → 保持空，不阻断列表
+			cp, _ = s.cpStore.GetByID(ctx, pid)
 			cpCache[pid] = cp
 		}
 		if cp != nil {
 			c.BaseURLEffective = cp.EffectiveBaseURL(cp.PreferredProtocol())
+			continue
 		}
+		// 引用了协议但取不到（已软删/查询失败）：运行时此时按内联渠道处理，
+		// 视图也必须回落到内联 base_url，否则列表显示空白而实际打的是内联地址。
+		c.BaseURLEffective = strings.TrimSpace(c.BaseURL)
 	}
 }
 

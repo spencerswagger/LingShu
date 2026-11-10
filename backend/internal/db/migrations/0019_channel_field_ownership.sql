@@ -104,6 +104,41 @@ BEGIN
       AND (cp.models -> cm.internal_model_id -> 'protocols') <> '{}'::jsonb
       AND (cm.protocols IS NULL OR cm.protocols = '{}'::jsonb OR jsonb_typeof(cm.protocols) <> 'object');
 
+    -- 脏种子守卫：externalModelID 必须能安全转 bigint。用 CASE 保证惰性求值——
+    -- 只有「形如整数」的值才会进 ::numeric（PostgreSQL 只执行命中的 CASE 分支），
+    -- 因此 "abc"/""/"1e5"/超 int64 都不会抛错；这类行记入 channel_seed_skipped
+    -- （「该模型跳过 + 记录」），迁移其余部分照常完成，不会因单行脏值整体回滚。
+    CREATE TABLE IF NOT EXISTS channel_seed_skipped (
+        channel_id        BIGINT NOT NULL,
+        internal_model_id TEXT   NOT NULL,
+        reason            TEXT   NOT NULL,
+        raw_value         TEXT   NOT NULL,
+        skipped_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (channel_id, internal_model_id)
+    );
+
+    INSERT INTO channel_seed_skipped(channel_id, internal_model_id, reason, raw_value)
+    SELECT cm.channel_id,
+           cm.internal_model_id,
+           CASE WHEN btrim(cp.models -> cm.internal_model_id ->> 'externalModelID') = ''
+                     THEN 'externalModelID 为空串（视为未绑定，跳过）'
+                WHEN btrim(cp.models -> cm.internal_model_id ->> 'externalModelID') ~ '^-?[0-9]+$'
+                     THEN 'externalModelID 超出 int64 范围'
+                ELSE 'externalModelID 非整数字面量' END,
+           COALESCE(cp.models -> cm.internal_model_id ->> 'externalModelID', '')
+    FROM channel_models cm
+    JOIN channels c ON c.id = cm.channel_id AND c.deleted_at IS NULL
+    JOIN channel_protocols cp ON cp.id = c.channel_protocol_id AND cp.deleted_at IS NULL
+    WHERE cm.deleted_at IS NULL
+      AND cp.models ? cm.internal_model_id
+      AND cp.models -> cm.internal_model_id ? 'externalModelID'
+      -- 空串（显式写了 ""）也算「不可安全绑定」，一并记录；键本身不存在则完全不算脏值。
+      AND NOT (CASE WHEN btrim(cp.models -> cm.internal_model_id ->> 'externalModelID') ~ '^-?[0-9]+$'
+                    THEN btrim(cp.models -> cm.internal_model_id ->> 'externalModelID')::numeric
+                         BETWEEN -9223372036854775808 AND 9223372036854775807
+                    ELSE false END)
+    ON CONFLICT (channel_id, internal_model_id) DO NOTHING;
+
     -- ---------- (d) 漂移标记 edited ----------
     -- 判定口径（裁定④「字段级置位」在 SQL 侧的对齐）：
     --   * 只看种子里确实定义了的键（种子没定义的键与该行配置无关，不参与判定，否则会永久冻结同步）；
@@ -124,9 +159,16 @@ BEGIN
       AND (
         -- 对外模型绑定：种子有值、实例有值且不同。
         (cp.models -> cm.internal_model_id ? 'externalModelID'
-         AND NULLIF(btrim(cp.models -> cm.internal_model_id ->> 'externalModelID'), '') IS NOT NULL
+         AND (CASE WHEN btrim(cp.models -> cm.internal_model_id ->> 'externalModelID') ~ '^-?[0-9]+$'
+                   THEN btrim(cp.models -> cm.internal_model_id ->> 'externalModelID')::numeric
+                        BETWEEN -9223372036854775808 AND 9223372036854775807
+                   ELSE false END)
          AND cm.external_model_id IS DISTINCT FROM
-             NULLIF(btrim(cp.models -> cm.internal_model_id ->> 'externalModelID'), '')::bigint)
+             (CASE WHEN btrim(cp.models -> cm.internal_model_id ->> 'externalModelID') ~ '^-?[0-9]+$'
+                        AND btrim(cp.models -> cm.internal_model_id ->> 'externalModelID')::numeric
+                            BETWEEN -9223372036854775808 AND 9223372036854775807
+                   THEN btrim(cp.models -> cm.internal_model_id ->> 'externalModelID')::bigint
+              END))
         -- 模型级协议子集：双方都有内容且不同（键序无关，jsonb 已归一）。
         OR (cp.models -> cm.internal_model_id ? 'protocols'
             AND jsonb_typeof(cp.models -> cm.internal_model_id -> 'protocols') = 'object'
