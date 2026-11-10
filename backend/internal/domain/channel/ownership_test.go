@@ -559,10 +559,15 @@ func TestCreateChannel_NormalizesWhitespaceBeforeStore(t *testing.T) {
 			WithArgs(int64(2)).WillReturnResult(sqlmock.NewResult(0, 0))
 		mock.ExpectCommit()
 
+		// 归一化只去空白，**不能**在校验前抹掉（否则 400 分支不可达）；落空发生在校验通过之后。
 		in := normalizeChannelInput(ChannelInput{Name: "c2", ChannelProtocolID: &pid,
 			BaseURL: " \t\n ", Protocol: " openai-compat "})
+		if in.BaseURL != "" || in.Protocol != "openai-compat" {
+			t.Fatalf("归一化只应去空白, got base_url=%q protocol=%q", in.BaseURL, in.Protocol)
+		}
+		in = dropInlineForProtocolReference(in)
 		if in.BaseURL != "" || in.Protocol != "" {
-			t.Fatalf("引用协议时归一化后应为空, got base_url=%q protocol=%q", in.BaseURL, in.Protocol)
+			t.Fatalf("校验通过后引用协议应落空, got base_url=%q protocol=%q", in.BaseURL, in.Protocol)
 		}
 		c, err := svc.CreateChannel(context.Background(), ChannelInput{Name: "c2",
 			ChannelProtocolID: &pid, BaseURL: " \t\n ", Protocol: " openai-compat "})

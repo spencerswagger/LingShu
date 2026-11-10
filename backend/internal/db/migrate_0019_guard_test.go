@@ -665,3 +665,52 @@ func TestMigrate_0019_DirtySeedExternalModelID(t *testing.T) {
 		t.Fatalf("m-ok 成本偏离种子，应被标 edited")
 	}
 }
+
+// 加固项：>5 万行走独立回填时，脏种子也必须被记录（此前建表写在「未超阈值」分支里，
+// 超阈值路径跑完回填表根本不存在，脏种子零记录）。
+func TestBackfill0019_DirtySeedVisibleOnLargePath(t *testing.T) {
+	ctx := context.Background()
+	tempDB := openTempDB(t)
+	migDir := filepath.Join(filepath.Dir(mustCallerFile(t)), "migrations")
+	applyMigrationsBelow(t, tempDB, migDir, "0019")
+
+	exec(t, tempDB, `INSERT INTO external_models(id, external_name) VALUES (2,'ext-a')`)
+	exec(t, tempDB, `INSERT INTO channel_protocols(id, name, base_url, models) VALUES (7,'p7','https://proto.example.com',
+		'{"m-dirty":{"externalModelID":"abc"},"m-ok":{"externalModelID":"2"}}'::jsonb)`)
+	exec(t, tempDB, `INSERT INTO channels(id, name, base_url, protocol, channel_protocol_id)
+		VALUES (1,'ref','','',7)`)
+	exec(t, tempDB, `INSERT INTO channel_models(id, channel_id, internal_model_id, external_model_id, cost_rates) VALUES
+		(1, 1, 'm-dirty', 2, '{"input":1,"output":2,"cache_read":0.1}'::jsonb),
+		(2, 1, 'm-ok',    2, '{"input":1,"output":2,"cache_read":0.1}'::jsonb)`)
+	// 撑过阈值：总行数 50,007。
+	exec(t, tempDB, `INSERT INTO channel_models(id, channel_id, internal_model_id, external_model_id, cost_rates, protocols)
+		SELECT 5000000 + i, 1, 'bulk-' || i, 2, '{"input":1,"output":2,"cache_read":0.1}'::jsonb,
+		       '{"openai-chat":{}}'::jsonb
+		FROM generate_series(1, 50005) AS i`)
+
+	// 迁移只做 DDL（含无条件建表）；数据段交给回填。
+	runMigration(t, tempDB, migDir, migrationFile(t, migDir, "0019"))
+	if !tableExists(t, tempDB, "channel_seed_skipped") {
+		t.Fatalf("超阈值路径下留档表也必须存在（无条件 DDL）")
+	}
+	if _, err := Backfill0019(ctx, tempDB, Backfill0019Options{BatchSize: 25000}); err != nil {
+		t.Fatalf("独立回填失败: %v", err)
+	}
+
+	var reason string
+	if err := tempDB.QueryRow(
+		`SELECT reason FROM channel_seed_skipped WHERE channel_id=1 AND internal_model_id='m-dirty'`).Scan(&reason); err != nil {
+		t.Fatalf("超阈值路径的脏种子应被记录: %v", err)
+	}
+	if !strings.Contains(reason, "非整数") {
+		t.Fatalf("原因应可读, got %q", reason)
+	}
+	var okRecorded int
+	if err := tempDB.QueryRow(
+		`SELECT count(*) FROM channel_seed_skipped WHERE internal_model_id='m-ok'`).Scan(&okRecorded); err != nil {
+		t.Fatalf("统计失败: %v", err)
+	}
+	if okRecorded != 0 {
+		t.Fatalf("合法种子不应被记录")
+	}
+}

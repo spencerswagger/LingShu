@@ -145,14 +145,20 @@ func (s *Service) validateBase(in ChannelInput) error {
 	return nil
 }
 
-// normalizeChannelInput 归一化可写字段：BaseURL / Protocol 一律去首尾空白后才校验与落库。
+// normalizeChannelInput 归一化可写字段：BaseURL / Protocol 一律去首尾空白。
 //
-// 为什么必须归一后落库：校验用 TrimSpace 判空、落库却写原值，会允许 " " 这类值进库，
-// 与「引用协议时 BaseURL 恒为 ”」的契约不符，且让下游（拼接 URL、判空）各写一套兜底。
-// 引用协议时两个字段一律置空（非空已在 validateBase 拦成 400）。
+// **只做 TrimSpace，不在这里抹值**：校验必须看归一后的原始输入，否则「引用协议 + 非空 BaseURL
+// 应 400」的分支会变成不可达代码（先置空再判空 → 永不命中），配置被静默丢弃。
+// 引用协议时的落空发生在校验通过之后（见 dropInlineForProtocolReference）。
 func normalizeChannelInput(in ChannelInput) ChannelInput {
 	in.BaseURL = strings.TrimSpace(in.BaseURL)
 	in.Protocol = strings.TrimSpace(in.Protocol)
+	return in
+}
+
+// dropInlineForProtocolReference 在校验**通过之后**调用：引用协议时把内联字段落空，
+// 保证契约「引用协议时 BaseURL/Protocol 恒为 ”」。校验阶段必须仍能看到原值（否则 400 不可达）。
+func dropInlineForProtocolReference(in ChannelInput) ChannelInput {
 	if in.ChannelProtocolID != nil && *in.ChannelProtocolID > 0 {
 		in.BaseURL = ""
 		in.Protocol = ""
@@ -195,6 +201,7 @@ func (s *Service) CreateChannel(ctx context.Context, in ChannelInput) (*Channel,
 	if err := s.validateBase(in); err != nil {
 		return nil, err
 	}
+	in = dropInlineForProtocolReference(in)
 	// 名称唯一预检查（友好报错）；store 层 23505 兜底并发冲突。
 	if _, err := s.store.GetByName(ctx, in.Name); err == nil {
 		return nil, errConflict("渠道名称已存在")
@@ -247,6 +254,7 @@ func (s *Service) UpdateChannel(ctx context.Context, id int64, in ChannelInput) 
 	if err := s.validateBase(in); err != nil {
 		return nil, err
 	}
+	in = dropInlineForProtocolReference(in)
 	existing, err := s.store.Get(ctx, id)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {

@@ -38,6 +38,21 @@ CREATE TABLE IF NOT EXISTS channel_base_url_archive (
     archived_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- 脏种子留档：externalModelID 无法安全绑定（非整数/空串/超 int64）的种子行在回填时记一份，
+-- 供排障与人工修正。**无条件建表**（与 edited 列、留档表同处），因为 >5 万行走独立回填时
+-- 迁移的数据段被阈值守卫跳过，若建表写在数据段里，那条路径就没有表可记录。
+CREATE TABLE IF NOT EXISTS channel_seed_skipped (
+    channel_id        BIGINT NOT NULL,
+    internal_model_id TEXT   NOT NULL,
+    reason            TEXT   NOT NULL,
+    raw_value         TEXT   NOT NULL,
+    skipped_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (channel_id, internal_model_id)
+);
+
+COMMENT ON TABLE channel_seed_skipped IS
+    '0019 脏种子留档：externalModelID 不可安全绑定的种子行（迁移与独立回填两条路径都写）';
+
 COMMENT ON TABLE channel_base_url_archive IS
     '0019 留档：引用协议的渠道在「基址随协议」改造中被清空的内联 base_url / protocol（仅供回滚还原，无业务读取）';
 
@@ -104,19 +119,10 @@ BEGIN
       AND (cp.models -> cm.internal_model_id -> 'protocols') <> '{}'::jsonb
       AND (cm.protocols IS NULL OR cm.protocols = '{}'::jsonb OR jsonb_typeof(cm.protocols) <> 'object');
 
-    -- 脏种子守卫：externalModelID 必须能安全转 bigint。用 CASE 保证惰性求值——
+    -- 脏种子守卫（建表在无条件 DDL 段）：externalModelID 必须能安全转 bigint。用 CASE 保证惰性求值——
     -- 只有「形如整数」的值才会进 ::numeric（PostgreSQL 只执行命中的 CASE 分支），
     -- 因此 "abc"/""/"1e5"/超 int64 都不会抛错；这类行记入 channel_seed_skipped
     -- （「该模型跳过 + 记录」），迁移其余部分照常完成，不会因单行脏值整体回滚。
-    CREATE TABLE IF NOT EXISTS channel_seed_skipped (
-        channel_id        BIGINT NOT NULL,
-        internal_model_id TEXT   NOT NULL,
-        reason            TEXT   NOT NULL,
-        raw_value         TEXT   NOT NULL,
-        skipped_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
-        PRIMARY KEY (channel_id, internal_model_id)
-    );
-
     INSERT INTO channel_seed_skipped(channel_id, internal_model_id, reason, raw_value)
     SELECT cm.channel_id,
            cm.internal_model_id,

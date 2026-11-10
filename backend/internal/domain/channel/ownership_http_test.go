@@ -231,3 +231,158 @@ func TestService_enrichBaseURLEffective_CachesProtocolLookup(t *testing.T) {
 		t.Fatalf("协议查询应被缓存（只查一次）: %v", err)
 	}
 }
+
+// HTTP 级：引用协议 + 非空 BaseURL 必须 400（此前归一化在校验前把值抹空，400 成了不可达代码，
+// 真实 server 上返回 200 且配置被静默丢弃）。创建与更新各一条。
+func TestHandler_CreateChannel_ProtocolRefWithBaseURL_400(t *testing.T) {
+	h, mock := newOwnershipHandler(t)
+	pid := int64(7)
+	mock.ExpectQuery(cpByIdRe).WithArgs(pid).
+		WillReturnRows(cpProtoRow(pid, "https://proto.example.com", `{}`))
+
+	body := `{"Name":"c1","ChannelProtocolID":"7","BaseURL":"https://should-400.example.com"}`
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/channels", strings.NewReader(body))
+	h.HandleCreate(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("引用协议 + 非空 BaseURL 应 400, got %d; body=%s", rec.Code, rec.Body.String())
+	}
+	for _, want := range []string{"基址跟随被引用协议", "p", "新建"} {
+		if !strings.Contains(rec.Body.String(), want) {
+			t.Fatalf("400 文案缺少「%s」: %s", want, rec.Body.String())
+		}
+	}
+}
+
+func TestHandler_UpdateChannel_ProtocolRefWithBaseURL_400(t *testing.T) {
+	h, mock := newOwnershipHandler(t)
+	pid := int64(7)
+	mock.ExpectQuery(cpByIdRe).WithArgs(pid).
+		WillReturnRows(cpProtoRow(pid, "https://proto.example.com", `{}`))
+
+	body := `{"Name":"c1","ChannelProtocolID":"7","BaseURL":"https://should-400.example.com"}`
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/admin/channels/1", strings.NewReader(body))
+	req.SetPathValue("id", "1")
+	h.HandleUpdate(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("更新时引用协议 + 非空 BaseURL 应 400, got %d; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// HTTP 级：引用协议 + 纯空白 BaseURL → 放行（200），落库为 ”。
+func TestHandler_CreateChannel_ProtocolRefWithBlankBaseURL_200(t *testing.T) {
+	now := time.Now()
+	pid := int64(7)
+	h, mock := newOwnershipHandler(t)
+	mock.ExpectQuery(cpByIdRe).WithArgs(pid).
+		WillReturnRows(cpProtoRow(pid, "https://proto.example.com", `{}`))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + channelCols + ` FROM channels WHERE name = $1`)).
+		WithArgs("c1").WillReturnRows(sqlmock.NewRows(nil))
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta(insertChannelSQL)).
+		WithArgs(sqlmock.AnyArg(), "c1", "", "", sqlmock.AnyArg(), int64(100),
+			sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), pid).
+		WillReturnRows(channelRow(&Channel{ID: 1, Name: "c1", ChannelProtocolID: &pid,
+			Priority: 100, CreatedAt: now, UpdatedAt: now}))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM channel_tags WHERE channel_id = $1`)).
+		WithArgs(int64(1)).WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectCommit()
+
+	body := `{"Name":"c1","ChannelProtocolID":"7","BaseURL":" \t\n "}`
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/channels", strings.NewReader(body))
+	h.HandleCreate(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("引用协议 + 空白 BaseURL 应放行, got %d; body=%s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Data Channel `json:"Data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if out.Data.BaseURL != "" || out.Data.Protocol != "" {
+		t.Fatalf("引用协议时落库必须为空串, got base_url=%q protocol=%q", out.Data.BaseURL, out.Data.Protocol)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("落库值应为空串（server 端归一后再写）: %v", err)
+	}
+}
+
+func TestHandler_UpdateChannel_ProtocolRefWithBlankBaseURL_200(t *testing.T) {
+	now := time.Now()
+	pid := int64(7)
+	h, mock := newOwnershipHandler(t)
+	mock.ExpectQuery(cpByIdRe).WithArgs(pid).
+		WillReturnRows(cpProtoRow(pid, "https://proto.example.com", `{}`))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + channelCols + ` FROM channels WHERE id = $1 AND deleted_at IS NULL`)).
+		WithArgs(int64(1)).
+		WillReturnRows(channelRow(&Channel{ID: 1, Name: "c1", ChannelProtocolID: &pid,
+			Priority: 100, CreatedAt: now, UpdatedAt: now}))
+	mock.ExpectBegin()
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE channels SET`)).
+		WithArgs("c1", "", "", sqlmock.AnyArg(), int64(100), sqlmock.AnyArg(), sqlmock.AnyArg(),
+			sqlmock.AnyArg(), pid, int64(1)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM channel_tags WHERE channel_id = $1`)).
+		WithArgs(int64(1)).WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectCommit()
+
+	body := `{"Name":"c1","ChannelProtocolID":"7","BaseURL":"\t\n"}`
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPut, "/api/v1/admin/channels/1", strings.NewReader(body))
+	req.SetPathValue("id", "1")
+	h.HandleUpdate(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("更新时引用协议 + 空白 BaseURL 应放行, got %d; body=%s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Data Channel `json:"Data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if out.Data.BaseURL != "" || out.Data.Protocol != "" {
+		t.Fatalf("引用协议时落库必须为空串, got base_url=%q protocol=%q", out.Data.BaseURL, out.Data.Protocol)
+	}
+}
+
+// HTTP 级：内联渠道 + 合法非空 BaseURL → 200 且原值落库（不要被归一化误伤）。
+func TestHandler_CreateChannel_InlineWithBaseURL_200(t *testing.T) {
+	now := time.Now()
+	h, mock := newOwnershipHandler(t)
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + channelCols + ` FROM channels WHERE name = $1`)).
+		WithArgs("inline").WillReturnRows(sqlmock.NewRows(nil))
+	mock.ExpectBegin()
+	mock.ExpectQuery(regexp.QuoteMeta(insertChannelSQL)).
+		WithArgs(sqlmock.AnyArg(), "inline", "openai-chat", "https://inline.example.com", sqlmock.AnyArg(),
+			int64(100), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), nil).
+		WillReturnRows(channelRow(&Channel{ID: 2, Name: "inline", Protocol: "openai-chat",
+			BaseURL: "https://inline.example.com", Priority: 100, CreatedAt: now, UpdatedAt: now}))
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM channel_tags WHERE channel_id = $1`)).
+		WithArgs(int64(2)).WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectCommit()
+
+	body := `{"Name":"inline","Protocol":"openai-chat","BaseURL":"https://inline.example.com"}`
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/channels", strings.NewReader(body))
+	h.HandleCreate(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("内联渠道合法 BaseURL 应 200, got %d; body=%s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Data Channel `json:"Data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if out.Data.BaseURL != "https://inline.example.com" || out.Data.Protocol != "openai-chat" {
+		t.Fatalf("内联值应原样落库, got base_url=%q protocol=%q", out.Data.BaseURL, out.Data.Protocol)
+	}
+}

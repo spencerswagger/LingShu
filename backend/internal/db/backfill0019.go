@@ -130,7 +130,8 @@ func Backfill0019(ctx context.Context, d *sql.DB, opts Backfill0019Options) (Bac
 		pick: `SELECT id FROM channel_models
 		       WHERE id > $1 AND deleted_at IS NULL
 		       ORDER BY id ASC LIMIT $2`,
-		apply:       []string{markDriftSQL},
+		// 首条语句的 RowsAffected 用于计数（本次新标记行）；脏种子记录挂在其后，不影响计数。
+		apply:       []string{markDriftSQL, recordSkippedSeedsSQL},
 		countWrites: true,
 	}, batch, opts.MaxBatchesPerPhase, logf)
 	if err != nil {
@@ -196,6 +197,18 @@ func PendingLargeBackfills(ctx context.Context, d *sql.DB) ([]string, error) {
 // 迁移**之前**跑回填会缺列，SQL 层面报的是 "column edited does not exist"，
 // 对运维不可读；这里提前拦住并说清「先跑迁移」。
 func EnsureBackfill0019Schema(ctx context.Context, d *sql.DB) error {
+	// 脏种子留档表属于 0019 结构的一部分；补齐建表（幂等），使回填在任何一次 0019 之后都能记录。
+	if _, err := d.ExecContext(ctx, `
+CREATE TABLE IF NOT EXISTS channel_seed_skipped (
+    channel_id        BIGINT NOT NULL,
+    internal_model_id TEXT   NOT NULL,
+    reason            TEXT   NOT NULL,
+    raw_value         TEXT   NOT NULL,
+    skipped_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (channel_id, internal_model_id)
+)`); err != nil {
+		return fmt.Errorf("ensure channel_seed_skipped: %w", err)
+	}
 	var hasColumn, hasArchive bool
 	if err := d.QueryRowContext(ctx,
 		`SELECT EXISTS (SELECT 1 FROM information_schema.columns
@@ -558,3 +571,28 @@ func backfillPendingWork(ctx context.Context, d *sql.DB) (channels, downshift, d
 func Backfill0019Phases() []string {
 	return []string{Backfill0019PhaseChannels, Backfill0019PhaseDownshift, Backfill0019PhaseModels}
 }
+
+// recordSkippedSeedsSQL 与迁移同口径：把 externalModelID 不可安全绑定（非整数/空串/超 int64）
+// 的种子行记入 channel_seed_skipped，供排障。批量执行也写，保证 >5 万行走独立回填时同样可见。
+const recordSkippedSeedsSQL = `
+INSERT INTO channel_seed_skipped(channel_id, internal_model_id, reason, raw_value)
+SELECT cm.channel_id,
+       cm.internal_model_id,
+       CASE WHEN btrim(cp.models -> cm.internal_model_id ->> 'externalModelID') = ''
+                 THEN 'externalModelID 为空串（视为未绑定，跳过）'
+            WHEN btrim(cp.models -> cm.internal_model_id ->> 'externalModelID') ~ '^-?[0-9]+$'
+                 THEN 'externalModelID 超出 int64 范围'
+            ELSE 'externalModelID 非整数字面量' END,
+       COALESCE(cp.models -> cm.internal_model_id ->> 'externalModelID', '')
+FROM channel_models cm
+JOIN channels c ON c.id = cm.channel_id AND c.deleted_at IS NULL
+JOIN channel_protocols cp ON cp.id = c.channel_protocol_id AND cp.deleted_at IS NULL
+WHERE cm.id = ANY($1::bigint[])
+  AND cm.deleted_at IS NULL
+  AND cp.models ? cm.internal_model_id
+  AND cp.models -> cm.internal_model_id ? 'externalModelID'
+  AND NOT (CASE WHEN btrim(cp.models -> cm.internal_model_id ->> 'externalModelID') ~ '^-?[0-9]+$'
+                THEN btrim(cp.models -> cm.internal_model_id ->> 'externalModelID')::numeric
+                     BETWEEN -9223372036854775808 AND 9223372036854775807
+                ELSE false END)
+ON CONFLICT (channel_id, internal_model_id) DO NOTHING`

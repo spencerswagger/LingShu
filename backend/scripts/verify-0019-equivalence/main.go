@@ -87,6 +87,11 @@ func main() {
 	fmt.Printf("%-28s A=%d B=%d %s\n", "edited 行数", a.editedCount, b.editedCount, mark)
 	fmt.Printf("%-28s A=%d B=%d\n", "channel_models 行数", a.modelRows, b.modelRows)
 	fmt.Printf("%-28s A=%s B=%s\n", "耗时", a.elapsed, b.elapsed)
+	fmt.Println("\n绝对期望（两路各自校验，不依赖互相比对）:")
+	for i := range a.abs {
+		fmt.Printf("  %-22s A=%d/%d B=%d/%d\n", a.abs[i].desc, a.abs[i].got, a.abs[i].want,
+			b.abs[i].got, b.abs[i].want)
+	}
 
 	if !ok {
 		fmt.Println("\n结论：两条路径结果不一致（退出码 1）")
@@ -107,6 +112,12 @@ type pathResult struct {
 	editedCount int64
 	modelRows   int64
 	elapsed     time.Duration
+	// abs 绝对期望逐项（got/want），两路都满足才算通过（避免「两路同错」被判一致）。
+	abs []struct {
+		desc string
+		got  int64
+		want int64
+	}
 }
 
 func fingerprintKeys() []string {
@@ -189,7 +200,7 @@ func runPath(ctx context.Context, adminDSN, migDir string, rows int, mode pathMo
 		}
 	}
 
-	// 4) 取指纹。
+	// 4) 取指纹 + 绝对期望校验（两路同错时 A==B 仍会「一致」，所以必须有绝对断言）。
 	res := pathResult{fp: map[string]string{}, elapsed: time.Since(start)}
 	queries := map[string]string{
 		"channels": `SELECT md5(COALESCE(string_agg(id::text||'/'||base_url||'/'||protocol, '|' ORDER BY id), '')) FROM channels`,
@@ -213,7 +224,83 @@ func runPath(ctx context.Context, adminDSN, migDir string, rows int, mode pathMo
 		`SELECT count(*) FROM channel_models`).Scan(&res.modelRows); err != nil {
 		return pathResult{}, fmt.Errorf("统计行数: %w", err)
 	}
+	if err := checkAbsoluteExpectations(ctx, conn, &res, rows); err != nil {
+		return pathResult{}, err
+	}
 	return res, nil
+}
+
+// checkAbsoluteExpectations 断言与造数规则严格对应的绝对期望（不依赖 A/B 互相比对）。
+//
+// 期望值来源（与 seed() 一一对应，README 同步说明）：
+//   - edited 行数 = 1000（drift-N 成本 5/6/0.5 偏离种子 1/2/0.1）+ 1（m-drift）+ 1（m-conflict-protocols）
+//     = 1002；m-eq（1.0 vs 1）与 m-timecfg-empty（'{}'）不算漂移，m-dirty-seed 跳过。
+//   - archive 行数 = 1：只有渠道 1（引用生效协议 + 内联值非空）该归档；
+//     渠道 2 双空、渠道 3 引用已软删协议、渠道 4 已软删、渠道 5 内联，均不归档。
+//   - 渠道 1 的 base_url/protocol 归档后被清空；渠道 3 的内联值原样保留（协议软删时它是生效配置）。
+//   - m-subset 的 protocols 由种子下移写入实例；m-dirty-seed 记入 channel_seed_skipped。
+func checkAbsoluteExpectations(ctx context.Context, conn *sql.DB, res *pathResult, rows int) error {
+	const wantEdited = 1002
+	expect := []struct {
+		desc string
+		got  int64
+		want int64
+	}{
+		{"edited 行数", res.editedCount, wantEdited},
+		{"channel_models 行数", res.modelRows, int64(rows)},
+	}
+	var archiveRows, seedSkipped, channel1Cleared, channel3Kept, subsetDownshifted int64
+	queries := []struct {
+		desc string
+		q    string
+		out  *int64
+	}{
+		{"archive 行数", `SELECT count(*) FROM channel_base_url_archive`, &archiveRows},
+		{"脏种子记录数", `SELECT count(*) FROM channel_seed_skipped`, &seedSkipped},
+		{"渠道1 已清空", `SELECT count(*) FROM channels WHERE id=1 AND base_url='' AND protocol=''`, &channel1Cleared},
+		{"渠道3 保留内联值", `SELECT count(*) FROM channels WHERE id=3 AND base_url='https://kept-3.example.com'`, &channel3Kept},
+		{"m-subset 已下移", `SELECT count(*) FROM channel_models WHERE internal_model_id='m-subset'
+			AND protocols = '{"anthropic-messages": {}}'::jsonb`, &subsetDownshifted},
+	}
+	for _, it := range queries {
+		if err := conn.QueryRowContext(ctx, it.q).Scan(it.out); err != nil {
+			return fmt.Errorf("绝对期望探测（%s）: %w", it.desc, err)
+		}
+	}
+	expect = append(expect,
+		struct {
+			desc string
+			got  int64
+			want int64
+		}{"archive 行数", archiveRows, 1},
+		struct {
+			desc string
+			got  int64
+			want int64
+		}{"脏种子记录数", seedSkipped, 1},
+		struct {
+			desc string
+			got  int64
+			want int64
+		}{"渠道1 清空", channel1Cleared, 1},
+		struct {
+			desc string
+			got  int64
+			want int64
+		}{"渠道3 保留内联值", channel3Kept, 1},
+		struct {
+			desc string
+			got  int64
+			want int64
+		}{"m-subset 下移", subsetDownshifted, 1},
+	)
+	res.abs = expect
+	for _, e := range expect {
+		if e.got != e.want {
+			return fmt.Errorf("绝对期望不满足（%s）：got %d, want %d", e.desc, e.got, e.want)
+		}
+	}
+	return nil
 }
 
 // seed 写入与测试同构的造数：五类渠道 + 七类边界模型行 + 批量行，总数恰为 rows。
