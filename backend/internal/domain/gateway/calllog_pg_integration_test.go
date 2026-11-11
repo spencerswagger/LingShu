@@ -31,6 +31,16 @@ func TestCallLog_PgRoundTrip(t *testing.T) {
 	}
 	defer db.Close()
 
+	// 目标库没跑过迁移（如 CI 里 DSN 指向空库）时跳过：本用例要读写真正的 call_logs 表，
+	// 不负责建表；硬跑只会在 cleanup 阶段报 relation does not exist 把整条流水线打红。
+	var exists sql.NullString
+	if err := db.QueryRow(`SELECT to_regclass('public.call_logs')::text`).Scan(&exists); err != nil {
+		t.Fatalf("probe call_logs: %v", err)
+	}
+	if !exists.Valid || exists.String == "" {
+		t.Skip("目标库没有 call_logs（未执行迁移），跳过真库读写测试")
+	}
+
 	const bid = "bill-upstream-status-roundtrip"
 	if _, err := db.Exec(`DELETE FROM call_logs WHERE billing_id=$1`, bid); err != nil {
 		t.Fatalf("cleanup: %v", err)
