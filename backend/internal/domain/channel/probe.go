@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"slices"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/team/llmgateway/internal/domain/channelprotocol"
+	"github.com/team/llmgateway/internal/pkg/errbody"
 	"github.com/team/llmgateway/internal/pkg/idgen"
 )
 
@@ -105,6 +107,63 @@ type ProbeOutcome struct {
 	DurationMS int64  `json:"DurationMS"`
 	ModelID    string `json:"ModelID,omitempty"`
 	State      string `json:"State"`
+	// UpstreamStatus 上游 HTTP 状态码（0=本轮没打到上游：未配置 Base URL / 凭据为空 / 无可用密钥或模型）。
+	UpstreamStatus int `json:"UpstreamStatus,omitempty"`
+	// ErrorBody 上游错误响应体**原文**（运营侧可见）：逐字节保真，仅把本次实际使用的凭据原值
+	// 替换成 ***（拒绝按样式/白名单清洗，否则运营读不到 request-id、模型名等关键线索）；
+	// 超过 probeErrBodyMaxBytes 时截断并在**同一字段**标注。空=上游没返回错误体。
+	ErrorBody string `json:"ErrorBody,omitempty"`
+}
+
+// 探活链路的错误体读取/保存上限（与网关 call_logs.resp_body 同口径：读 64KB、存 32KB）。
+const (
+	// probeErrReadBytes 读取上游错误响应体的上限。必须显著大于保存上限，
+	// 否则超长报文在读取层就被静默切掉，既拿不到内容也无法诚实标注截断点。
+	probeErrReadBytes = 64 << 10
+	// probeErrBodyMaxBytes 探活结果（响应 + probe_logs.error_body）保存原文的字节上限。
+	probeErrBodyMaxBytes = 32 << 10
+)
+
+// probeExchange 一次探测请求的全部事实：状态机反馈 + token 开销 + 可读错误 + 上游原始错误报文。
+// UpstreamBody 仅「上游返回非 2xx」时有值（2xx 的成功响应体不进这里，避免把业务响应当错误存）。
+type probeExchange struct {
+	FB        Feedback
+	Usage     ProbeUsage
+	ErrMsg    string
+	Status    int    // 上游 HTTP 状态码；0=未拿到响应（连接失败/超时/未配置 Base URL）
+	ErrorBody string // 上游错误体原文（仅遮蔽本次凭据 + 截断标注）
+}
+
+// readProbeErrBody 读取上游错误响应体并转成运营可见原文：
+// 只遮蔽**本次实际使用的凭据**（精确子串），其余字节（含 <>&、中文、request-id、模型名）原样保留；
+// 超 probeErrBodyMaxBytes 时按 UTF-8 边界截断，标注与被截原文写在同一个字段。
+func readProbeErrBody(resp *http.Response, cred string) string {
+	if resp == nil || resp.Body == nil {
+		return ""
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, probeErrReadBytes+1))
+	if err != nil {
+		return ""
+	}
+	readTruncated := len(raw) > probeErrReadBytes
+	if readTruncated {
+		raw = raw[:probeErrReadBytes]
+	}
+	// 不 TrimSpace：首尾空白也算上游原文（只把「全是空白」当空体），否则「原文」就不是原文了。
+	s := errbody.MaskSecrets(string(raw), cred)
+	if strings.TrimSpace(s) == "" {
+		return ""
+	}
+	if len(s) <= probeErrBodyMaxBytes && !readTruncated {
+		return s
+	}
+	note := fmt.Sprintf("\n…（已截断：上游原文共 %d 字节，此处只保留前 %d 字节）", len(s), probeErrBodyMaxBytes)
+	if readTruncated {
+		note = fmt.Sprintf("\n…（已截断：上游原文超过读取上限 %d 字节，此处只保留前 %d 字节）",
+			probeErrReadBytes, probeErrBodyMaxBytes)
+	}
+	out, _ := errbody.TruncateUTF8(s, probeErrBodyMaxBytes, note)
+	return out
 }
 
 // nilOr 返回空串兜底。
@@ -201,17 +260,17 @@ func (m *Manager) keyProbeOnce(ctx context.Context, keyID int64) {
 	}
 	if kr.CredentialPlain == "" {
 		errMsg := "密钥凭据为空或解密失败，无法探测"
-		m.markKeyProbeResult(keyID, errMsg)
+		m.markKeyProbeResult(keyID, errMsg, 0, "")
 		m.feedKeyAndTransit(keyID, Feedback{IsSuccess: false, HasProbe: true, Now: m.now()})
-		m.recordProbe(ctx, keyID, "", "key", "", false, errMsg, ProbeUsage{}, 0)
+		m.recordProbe(ctx, keyID, "", "key", "", false, errMsg, ProbeUsage{}, 0, 0, "")
 		return
 	}
 	targets := m.pickKeyProbeTargets(kr)
 	if len(targets) == 0 {
 		errMsg := "无可用探测模型（全部禁用或无模型）"
-		m.markKeyProbeResult(keyID, errMsg)
+		m.markKeyProbeResult(keyID, errMsg, 0, "")
 		m.feedKeyAndTransit(keyID, Feedback{IsSuccess: false, HasProbe: true, Now: m.now()})
-		m.recordProbe(ctx, keyID, "", "key", "", false, errMsg, ProbeUsage{}, 0)
+		m.recordProbe(ctx, keyID, "", "key", "", false, errMsg, ProbeUsage{}, 0, 0, "")
 		return
 	}
 	for _, t := range targets {
@@ -289,19 +348,19 @@ func (m *Manager) probeOnce(ctx context.Context, keyID int64, probeModel, level 
 	policy := chRT.Protocol.EffectiveHeaderPolicy()
 
 	start := m.now()
-	fb, usage, errMsg := m.doProbeAuth(ctx, target, authHeader, authValue, probeModel, policy, kr.CredentialPlain, timeout)
+	ex := m.doProbeAuth(ctx, target, authHeader, authValue, probeModel, policy, kr.CredentialPlain, timeout)
 	dur := m.now().Sub(start).Milliseconds()
 
-	m.markKeyProbeResult(keyID, errMsg)
+	m.markKeyProbeResult(keyID, ex.ErrMsg, ex.Status, ex.ErrorBody)
 	m.markChannelProbeResult(kr.Key.ChannelID)
 	if modelRowID > 0 {
-		m.markModelProbeResult(kr.Key.ChannelID, modelRowID, errMsg)
+		m.markModelProbeResult(kr.Key.ChannelID, modelRowID, ex.ErrMsg)
 	}
-	m.feedKeyAndTransit(keyID, ProbeFeedback(fb))
+	m.feedKeyAndTransit(keyID, ProbeFeedback(ex.FB))
 	if modelRowID > 0 {
-		m.feedModelAndTransit(kr.Key.ChannelID, modelRowID, ProbeFeedback(fb))
+		m.feedModelAndTransit(kr.Key.ChannelID, modelRowID, ProbeFeedback(ex.FB))
 	}
-	m.recordProbe(ctx, keyID, probeModel, level, target, fb.IsSuccess, errMsg, usage, dur)
+	m.recordProbe(ctx, keyID, probeModel, level, target, ex.FB.IsSuccess, ex.ErrMsg, ex.Usage, dur, ex.Status, ex.ErrorBody)
 }
 
 // ProbeFeedback 用标记探测属性的反馈包装为普通反馈（保持语义一致）。
@@ -310,11 +369,15 @@ func ProbeFeedback(fb Feedback) Feedback { return fb }
 // doProbeAuth 构建并执行最小对话探测请求，解析响应 usage 与状态分类（鉴权头名/值可定制，
 // 以支持 x-api-key/raw 等渠道协议鉴权），并套用协议「覆盖(set)」请求头（与网关热路径同源）。
 // 2xx 成功；401/403 认证失败（→禁用）；429 上游限流；其余失败；超时标记 IsTimeout。
-func (m *Manager) doProbeAuth(ctx context.Context, url, authHeader, authValue, model string, policy channelprotocol.HeaderPolicy, cred string, timeout time.Duration) (Feedback, ProbeUsage, string) {
-	fb := Feedback{HasProbe: true, Now: m.now()}
-	var usage ProbeUsage
+//
+// 非 2xx 时**必须读响应体**：探活是运营新建密钥后的第一个动作，只回一个状态码等于让运营
+// 拿不到「上游到底拒绝在哪」（历史上这里从不读 resp.Body，错误体被整段丢弃）。
+func (m *Manager) doProbeAuth(ctx context.Context, url, authHeader, authValue, model string, policy channelprotocol.HeaderPolicy, cred string, timeout time.Duration) probeExchange {
+	ex := probeExchange{FB: Feedback{HasProbe: true, Now: m.now()}}
+	fb, usage := &ex.FB, &ex.Usage
 	if strings.TrimSpace(url) == "" {
-		return fb, usage, "渠道未配置 Base URL，无法探测"
+		ex.ErrMsg = "渠道未配置 Base URL，无法探测"
+		return ex
 	}
 	payload, err := json.Marshal(map[string]any{
 		"model":      model,
@@ -323,7 +386,8 @@ func (m *Manager) doProbeAuth(ctx context.Context, url, authHeader, authValue, m
 		"stream":     false,
 	})
 	if err != nil {
-		return fb, usage, err.Error()
+		ex.ErrMsg = err.Error()
+		return ex
 	}
 
 	cctx, cancel := context.WithTimeout(ctx, timeout)
@@ -331,7 +395,8 @@ func (m *Manager) doProbeAuth(ctx context.Context, url, authHeader, authValue, m
 
 	req, err := http.NewRequestWithContext(cctx, http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
-		return fb, usage, err.Error()
+		ex.ErrMsg = err.Error()
+		return ex
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if authValue != "" {
@@ -348,10 +413,12 @@ func (m *Manager) doProbeAuth(ctx context.Context, url, authHeader, authValue, m
 		} else if cctx.Err() != nil {
 			fb.IsTimeout = true
 		}
-		return fb, usage, err.Error()
+		ex.ErrMsg = err.Error()
+		return ex
 	}
 	defer resp.Body.Close()
 
+	ex.Status = resp.StatusCode
 	switch {
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
 		fb.IsSuccess = true
@@ -389,25 +456,34 @@ func (m *Manager) doProbeAuth(ctx context.Context, url, authHeader, authValue, m
 				usage.TotalTokens = input + cached + body.Usage.CompletionTokens
 			}
 		}
-		return fb, usage, ""
+		return ex
 	case resp.StatusCode == http.StatusTooManyRequests:
 		fb.Is429 = true
-		return fb, usage, fmt.Sprintf("probe http status: %d", resp.StatusCode)
+		ex.ErrorBody = readProbeErrBody(resp, cred)
+		ex.ErrMsg = fmt.Sprintf("probe http status: %d", resp.StatusCode)
+		return ex
 	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
 		fb.IsAuthFailure = true
-		return fb, usage, fmt.Sprintf("probe auth failure: %d（凭据失效）", resp.StatusCode)
+		ex.ErrorBody = readProbeErrBody(resp, cred)
+		ex.ErrMsg = fmt.Sprintf("probe auth failure: %d（凭据失效）", resp.StatusCode)
+		return ex
 	default:
-		return fb, usage, fmt.Sprintf("probe http status: %d", resp.StatusCode)
+		ex.ErrorBody = readProbeErrBody(resp, cred)
+		ex.ErrMsg = fmt.Sprintf("probe http status: %d", resp.StatusCode)
+		return ex
 	}
 }
 
-// markKeyProbeResult 更新该密钥的 lastProbe 与 LastErr（锁内写）。
-func (m *Manager) markKeyProbeResult(keyID int64, errMsg string) {
+// markKeyProbeResult 更新该密钥的 lastProbe / LastErr / 最近一次上游错误报文（锁内写）。
+// LastErr 走 DB/视图展示，只放短文案；原文（body）留在运行时供手动探活响应回传与 probe_logs 落库。
+func (m *Manager) markKeyProbeResult(keyID int64, errMsg string, status int, body string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if kr, ok := m.keys[keyID]; ok {
 		kr.lastProbe = m.now()
 		kr.Key.LastErr = errMsg
+		kr.lastProbeStatus = status
+		kr.lastProbeBody = body
 	}
 }
 
@@ -453,21 +529,25 @@ func (m *Manager) feedKeyAndTransit(keyID int64, fb Feedback) {
 
 // recordProbe 落库探测记录（密钥维度）并触发记账钩子（系统身份，见装配层）；两者失败仅记日志。
 // ProbeLog.ChannelKeyID 对应 probe_logs.channel_key_id（密钥维度）。
-func (m *Manager) recordProbe(ctx context.Context, keyID int64, modelID, level, target string, ok bool, errMsg string, usage ProbeUsage, durationMS int64) {
+// upStatus/upBody 是「上游原始错误」：状态码进 error 列的可读文案之外单独留痕，原文进 error_body，
+// 让运营事后翻探活历史时仍能看到上游到底回了什么（不只是「probe http status: 400」）。
+func (m *Manager) recordProbe(ctx context.Context, keyID int64, modelID, level, target string, ok bool, errMsg string, usage ProbeUsage, durationMS int64, upStatus int, upBody string) {
 	if m.cmStore != nil {
 		pctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		if err := m.cmStore.InsertProbeLog(pctx, &ProbeLog{
-			ChannelKeyID: keyID,
-			ModelID:      modelID,
-			Level:        level,
-			Target:       target,
-			OK:           ok,
-			Error:        errMsg,
-			InputTokens:  usage.InputTokens,
-			OutputTokens: usage.OutputTokens,
-			CachedTokens: usage.CachedTokens,
-			TotalTokens:  usage.TotalTokens,
-			DurationMS:   int(durationMS),
+			ChannelKeyID:   keyID,
+			ModelID:        modelID,
+			Level:          level,
+			Target:         target,
+			OK:             ok,
+			Error:          errMsg,
+			ErrorBody:      upBody,
+			UpstreamStatus: upStatus,
+			InputTokens:    usage.InputTokens,
+			OutputTokens:   usage.OutputTokens,
+			CachedTokens:   usage.CachedTokens,
+			TotalTokens:    usage.TotalTokens,
+			DurationMS:     int(durationMS),
 		}); err != nil {
 			m.logger.Error("insert probe log failed", "key_id", keyID, "err", err)
 		}
