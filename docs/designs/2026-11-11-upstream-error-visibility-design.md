@@ -24,11 +24,22 @@
 
 | 字段 | 来源 | 说明 |
 | --- | --- | --- |
-| `error.message` | **上游原文** | 上游返回非 2xx 时取上游报文里的 `error.message`（非 OpenAI 形状时取整段摘要）。做两件事：凭据样式清洗（上游可能在文案里回显它收到的 key）、按 UTF-8 边界截断到 512 字节。上游没给可读文案（空体/纯二进制）时回落到网关中文文案，**不返回空 message**。 |
-| `error.type` | **上游原文** | 上游报文里的 `error.type`；缺省按下游状态码归类（429 → `rate_limit_error`，5xx → `server_error`，其余 → `invalid_request_error`）。 |
+| `error.message` | **上游原文** | 上游返回非 2xx 时取上游报文里的 `error.message`（非 OpenAI 形状时取整段原文）。只做两件事：**精确遮蔽本次实际使用的渠道凭据**（`errbody.MaskSecrets`，其余字节原样）、按 UTF-8 边界截断到 512 字节。**不做样式清洗**——样式清洗会把 request-id、模型名里的高熵串一并抹掉，调用方读到的就不是原文（清洗只用于日志短字段，见 §1.2.1）。**401/402/403 也照旧透原文**，不按状态码区别对待。上游没给可读文案（空体/纯二进制）时回落网关中文文案，**不返回空 message**。 |
+| `error.type` | **上游原文**（待拍板，见文末「待拍板」） | 上游报文里的 `error.type`；缺省按下游状态码归类（429 → `rate_limit_error`，5xx → `server_error`，其余 → `invalid_request_error`）。契约复核建议改为网关归类（理由：上游 401 的 `type=authentication_error` 配对外 503 自相矛盾），与需求方口径冲突，**先按上游原文实现**，分歧见文末「待拍板」。 |
 | `error.code` | **网关归类** | 网关按下游状态码归类（`upstream_error` / `rate_limit_exceeded` / `service_unavailable` / `invalid_api_key` …），不透出上游业务码。 |
-| `error.upstream_status` | **上游真实状态码** | 仅「上游返回非 2xx」的失败体带上；网关自身拒绝（鉴权/余额/路由/协议不支持）不带。用于区分「网关拒绝」与「上游拒绝、网关转述」，并可按上游状态码查厂商文档。 |
+| `error.upstream_status` | **上游真实状态码** | 整型，**只在「上游确实返回了非 2xx」时出现**；**无上游码时不写该字段**（不是 `null`、也不是 0）——连接失败、已送达超时、网关自身拒绝都没有它。它是「上游转述 vs 网关判定」的唯一判别符（`contract_fields_test.go` 按「字段不存在」断言）。 |
 | `request_id` | 网关 | 与响应头 `x-request-id` 同值（客户端带了合法的 `x-request-id` 时沿用）。这是运营在账单页定位一次请求的唯一钥匙。 |
+
+### 1.2.1 凭据遮蔽：三处口径不同，别混用
+
+| 位置 | 口径 | 实现 |
+| --- | --- | --- |
+| 对外 `error.message` / `error.type` | 原文 + **只遮蔽本次实际使用的渠道凭据** | `errbody.MaskSecrets(text, ureq.Cred)` |
+| 运营侧 `call_logs.resp_body` / `error_message` | 同上（原文 + 精确遮蔽） | 同上（读取层已不再做样式清洗） |
+| 结构化日志短字段（`err_summary` / `err_type` / `err_code` / `reason`） | 按**样式**清洗（`sk-*` / Bearer / KV / 高熵长串 → `***`）+ 截断 | `sanitizeErrSummary`（`logErr` 内统一执行） |
+
+读取层（`readUpstreamErrBody`）只 `TrimSpace`、不做任何清洗：对外要原文、运营侧也要原文，
+清洗放在各自的出口按上表执行。样式清洗的代价是「原文被打成筛子」——它只配用于日志短字段。
 
 HTTP 状态码语义**不变**（本单只做可见性，不动既有映射）。**下表是 `origin/main` 的实测基线**
 （2026-11-11 用临时分支跑 12 个上游码 × 单/双候选 × 流式/非流式 = 48 组组合逐项测得，
@@ -36,25 +47,30 @@ HTTP 状态码语义**不变**（本单只做可见性，不动既有映射）�
 
 | 场景 | 对外状态码 | `error.code` |
 | --- | --- | --- |
-| 上游 4xx 且不可转移（400/409/413/422 等） | 502 | `upstream_error` |
+| 上游 4xx 且不可转移（400/409/413/422） | 502 | `upstream_error` |
 | 上游 504 / 524（网关类超时，不可转移） | 502 | `upstream_error` |
 | 上游可转移失败（401/402/403/404/5xx）但候选耗尽 | 503 | `service_unavailable` |
 | 全部候选被上游 429 限流 | 429 | `rate_limit_exceeded` |
-| 已送达后超时 | 504 | `internal_error` |
+| 已送达后超时（无上游状态码） | 502 | `upstream_error` |
+| 连接失败 / 构建失败 / 候选全被本地拦截（无上游状态码） | 503 | `service_unavailable` |
+| 下游客户端断开 | 499 | — |
+
+命中错误策略时按策略的 `downstreamStatus`。
 
 > 注意：main **不是**「4xx/5xx 一律 502」——可转移失败耗尽走 503、全限流走 429 都是既有行为。
 > 若要把它们统一成 502，属**改变既有映射**（会动到客户端重试语义与既有断言），不在本单范围内，
 > 需单独裁定。
-| 连接失败 / 构建失败 / 候选全被本地拦截 | 502 / 503 | `upstream_error` / `service_unavailable` |
-| 下游客户端断开 | 499 | — |
 
-命中错误策略时按策略的 `downstreamStatus`。**上游真实状态码**始终体现在 `error.upstream_status` 与
-`call_logs.upstream_status` 里；对外状态码不沿用上游（否则上游 401/402/403 原样透出会被调用方判成
-「我方 key 无效 / 我方余额不足」，实际是渠道密钥/余额问题）。
+**上游真实状态码**始终体现在 `error.upstream_status` 与 `call_logs.upstream_status` 里；
+对外状态码不沿用上游（否则上游 401/402/403 原样透出会被调用方判成「我方 key 无效 / 我方余额不足」，
+实际是渠道密钥/余额问题）。
 
 ### 透传的边界
 
 - 只透传「上游确实返回了非 2xx」的场景。连接失败、响应超时、网关自身拒绝没有上游报文，保持既有中文文案。
+- **对外状态码由失败终结方式决定，不是上游码的函数**：同一个上游 500 可能因为「还有候选可转移」而走到
+  503，也可能因为「命中错误策略」而按策略值；调用方要判断「上游说了什么」，看 `error.upstream_status`
+  与 `error.message`，不要用对外状态码反推上游码。
 - 候选可转移（failover）时，若最终全部候选都失败，终结响应（503 / 429）里带**最后一次**上游报文原文与状态码，
   不再只剩一句「无可用渠道」——否则 5xx 这类可转移失败的上游原因会彻底丢失。
 - 流式与非流式共用同一套错误分支代码：`stream=true` 时上游在 SSE 开始前返回非 2xx，走的就是这套透传；
@@ -149,10 +165,20 @@ usage 结算的 `completed` 记录，金额与既有口径一致；失败结论�
 | `TestCallLog_PgRoundTrip` / `TestCallLog_PgRoundTrip_InvalidUTF8Payload` | 真库用例改为**自建临时库 + 跑全部迁移**（`internal/testutil/pgtest`），CI 里不再「库里没表就跳过」假绿 |
 | `TestServeUpstreamError_DownstreamNeverSeesChannelCredential` | 上游回显渠道凭据时，对外响应与 `resp_body`/`error_message` 都不得出现该凭据，同时除凭据外内容仍可见 |
 | `TestServeUpstreamError_OutwardMessageHasNoUpstreamAddress` | 断网时对外文案不含主机名/IP/端口/URL；完整错误（含地址）留在调用日志供运营定位 |
+| `TestContract_UpstreamStatusOmittedWhenAbsent` | 连接失败 / 已送达超时 / 网关拒绝三条无上游码路径：`error.upstream_status` **字段不存在**（不是 `null`/0），顶层也没有 |
+| `TestContract_MessageExactMaskOnly` | 对外 message 只遮蔽本次凭据：request-id、模型名等高熵内容原样保留；401 也透原文 |
+| `TestContract_MessageTruncatedTo512` | 对外 message 按 UTF-8 边界截断到 512 字节 |
 `backend/internal/domain/gateway/stream_error_frame_test.go`（流内 `error` 帧的留痕口径）：
 | 用例 | 覆盖 |
 | --- | --- |
-| `TestServeStream_ErrorFrameWithUsageRecordedFailed` | error 帧 + usage（表驱动三种顺序：usage 在 error 帧前/后、无 `[DONE]`）：调用日志记 `failed`（此前误记 `completed`）、`error_message` 带上游原文、`upstream_status=200`；计费仍按上游实际 usage（10/5，不估算、不额外落 failed 账单）；下游 SSE 仍是上游 error 帧原文；请求级结论计为失败 |
+| `TestServeStream_ErrorFrameWithUsageRecordedFailed` | error 帧 + usage（表驱动四种顺序：usage 在 error 帧前/后 × 有无 `[DONE]`）：调用日志记 `failed`（此前误记 `completed`）、`error_message` 带上游原文、`upstream_status=200`；计费仍按上游实际 usage（10/5，不估算、不额外落 failed 账单）；下游 SSE 仍是上游 error 帧原文；请求级结论计为失败 |
 | `TestServeStream_ErrorFrameWithoutUsageKeepsUpstreamDetail` | error 帧 + 无 usage：记 `failed`、`error_message` 带出上游 error 帧原文（此前只有归因、没有原因）、`upstream_status=200`、下游仍是原文 |
 | `TestStreamConversionErrorFrameWithUsageRecordedFailed` | 转换泵（anthropic 入站 → openai-chat 上游）同一口径 |
 | `TestUpstreamErrorFrameError_Semantics` | 新错误类型可 `errors.As` 识别，且**不**被当成 usage 缺失（否则计费会从实际 usage 退化成估算） |
+
+## 待拍板（口径分歧，勿擅自改）
+
+| 项 | 现状（已实现） | 分歧 | 影响面 |
+| --- | --- | --- | --- |
+| `error.type` | **上游原文**（缺失时按对外状态码归类） | 契约复核建议改为**网关归类**：上游 401 的 `type=authentication_error` 配上对外 503 会自相矛盾（body 说鉴权错、状态码说服务不可用） | 改则客户端看到的错误大类与状态码一致；不改则严格「原文透出」。改一处需同步 `contract_*` 用例与本文档 |
+| 账单行是否也标 `failed` | 上游已 200 且产出内容的失败（流内报错/结算失败）账单仍是按实际 usage 结算的 `completed`，失败结论只在 `call_logs.status` | 运营按账单页筛「失败」时看不到这类请求 | 改则要动 `billing_records.status` 枚举语义与汇总口径（失败率 KPI、错误信息 TOP、对账口径、`credits_consumed` 的「有扣费却记失败」） |

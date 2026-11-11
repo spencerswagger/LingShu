@@ -14,6 +14,7 @@ import (
 
 	"github.com/team/llmgateway/internal/domain/channel"
 	"github.com/team/llmgateway/internal/domain/router"
+	"github.com/team/llmgateway/internal/pkg/errbody"
 	"github.com/team/llmgateway/internal/pkg/logger"
 )
 
@@ -262,18 +263,27 @@ func TestTruncateLogKeepsValidUTF8(t *testing.T) {
 
 // Fix 1：日志与落库共用的错误体读取必须清洗凭据——
 // 账单 error_message 与调用日志 resp_body 都取自它，漏清洗等于两条链路同时落明文。
-func TestReadUpstreamErrBodySanitizesCredentials(t *testing.T) {
+// 读取层只 TrimSpace、**不做样式清洗**（对外 message 与运营侧 resp_body 都要原文）；
+// 遮蔽由调用方按「本次实际使用的凭据」精确执行（`errbody.MaskSecrets`），
+// 这样既不会把 request-id/模型名等高熵内容一起抹掉，也不会把渠道凭据落库。
+func TestReadUpstreamErrBodyKeepsRawTextAndMaskingIsExact(t *testing.T) {
+	const cred = "sk-abc123456789"
 	resp := &http.Response{Body: io.NopCloser(strings.NewReader(
-		`{"error":{"message":"Incorrect API key provided: sk-abc123456789"}}`))}
+		`{"error":{"message":"Incorrect API key provided: ` + cred + `"}}`))}
 	body := readUpstreamErrBody(resp)
-	if strings.Contains(body, "sk-abc123456789") {
-		t.Errorf("上游错误体未清洗凭据: %q", body)
+	if !strings.Contains(body, cred) {
+		t.Fatalf("读取层不应做样式清洗（原文交给上层按需遮蔽）: %q", body)
 	}
-	if !strings.Contains(body, "***") {
-		t.Errorf("清洗标记缺失: %q", body)
+	// 运营侧视图：原文 + 只遮蔽本次凭据。
+	masked := errbody.MaskSecrets(body, cred)
+	if strings.Contains(masked, cred) {
+		t.Errorf("本次凭据必须被遮蔽: %q", masked)
 	}
-	// 同源链路：upstreamErrDetail 拼接的 errMsg 也不得含明文。
-	if detail := upstreamErrDetail(http.StatusUnauthorized, body); strings.Contains(detail, "sk-abc123456789") {
+	if !strings.Contains(masked, "***") || !strings.Contains(masked, "Incorrect API key provided") {
+		t.Errorf("遮蔽只替换凭据、其余原文保留: %q", masked)
+	}
+	// 摘要链路：先遮蔽再拼接，errMsg 不得含明文。
+	if detail := upstreamErrDetail(http.StatusUnauthorized, masked); strings.Contains(detail, cred) {
 		t.Errorf("errMsg 含凭据明文: %q", detail)
 	}
 }
