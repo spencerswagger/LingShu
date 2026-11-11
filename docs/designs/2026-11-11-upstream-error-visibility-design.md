@@ -211,6 +211,11 @@ usage 结算的 `completed` 记录，金额与既有口径一致；失败结论�
 落库列见迁移 `0020_probe_logs_error_body.sql`（`error_body TEXT`、`upstream_status SMALLINT`，
 `NULL`=没打到上游）。事后翻历史仍能看到上游原文，而不是只有「probe http status: 400」。
 
+列表受体积预算限制（见 3.4）：`ErrorBody` 只是 4KB 预览，且置 `ErrorBodyTruncated=true`；
+完整原文用 `GET /api/v1/admin/channels/{id}/probe-logs/{logID}` 取（SQL 里 JOIN `channel_keys` 限定
+`channel_id`，跨渠道读不到别人的报文）。**前端目前尚未消费这两个字段**，运营界面还看不到原文——
+本期只做到「API 与落库可见」，界面展示属后续单。
+
 ### 3.4 上限（三处一致）
 
 | 位置 | 读取上限 | 保存上限 | 超限行为 |
