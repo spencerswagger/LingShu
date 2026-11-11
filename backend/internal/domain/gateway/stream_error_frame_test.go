@@ -238,3 +238,11 @@ func isUpstreamErrorFrame(err error) bool {
 	var fe *UpstreamErrorFrameError
 	return errors.As(err, &fe)
 }
+
+// head 取字符串前 n 字节（失败信息展示用）。
+func head(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
+}
