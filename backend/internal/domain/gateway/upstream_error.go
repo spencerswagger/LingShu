@@ -277,6 +277,16 @@ func upstreamTransportNote(kind string, err error) (note string, timedOut bool) 
 	return "上游" + kind + reason, timedOut
 }
 
+// operatorErrDetail 拼「运营侧」的错误原因（落 call_logs.error_message / billing_records.error_message）：
+// 保留**完整错误文本**（含渠道地址、主机、端口），因为运营要据此判断是哪台机器/哪个域名出问题；
+// 只做凭据样式清洗与预算截断。与对外文案（buildFailureNote / upstreamTransportNote，一律打码）分开口径。
+func operatorErrDetail(prefix string, err error) string {
+	if err == nil {
+		return prefix
+	}
+	return prefix + "：" + truncateLog(sanitizeErrSummary(err.Error()), errDetailBodyMaxBytes)
+}
+
 // buildFailureNote 把「构建上游请求失败」转成对外可读原因。
 // 构建失败的错误文本里同样可能带出渠道地址（如 `parse "http://<基址>/chat/completions": invalid character…`），
 // 所以对外文案统一过 redactUpstreamAddr；完整错误仍进结构化日志与调用日志。

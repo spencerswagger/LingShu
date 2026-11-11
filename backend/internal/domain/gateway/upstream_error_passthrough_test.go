@@ -735,6 +735,13 @@ func TestServeUpstreamError_ConnectionFailureNoAddress(t *testing.T) {
 	if strings.Contains(rb.Error.Message, "127.0.0.1") || strings.Contains(rb.Error.Message, "http://") {
 		t.Fatalf("对外文案不得出现上游地址/端口: %q", rb.Error.Message)
 	}
+	// 反向：运营侧必须留得住**完整错误**（含地址），否则运营无法判断是哪台机器/哪个域名出问题。
+	if len(h.clogs.inserted) != 1 {
+		t.Fatalf("want 1 条调用日志, got %d", len(h.clogs.inserted))
+	}
+	if msg := h.clogs.inserted[0].ErrorMessage; !strings.Contains(msg, "127.0.0.1") || !strings.Contains(msg, "dial") {
+		t.Fatalf("调用日志 error_message 应保留完整错误（含地址）, got %q", msg)
+	}
 }
 
 // TestWriteUpstreamError_UpstreamStatusIsRealCode 响应体顶层的 upstream_status 必须是**上游真实状态码**，

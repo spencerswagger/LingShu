@@ -1322,11 +1322,12 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 			errInfo{kind: "build_failed", stage: stage, attempt: attempt,
 				retry: true, reason: "构建上游请求失败：" + err.Error(), sessionID: sessionID, durationMs: *msSince(start)})
 		g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, channel.Feedback{IsSuccess: false, Now: g.now()})
-		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "构建上游请求失败", msSince(start))
-		// 网关侧失败（未发出上游调用）：resp_body 留空，原因只落 error_message 与决策轨迹，
-		// 避免「请求增量/响应/决策原因」三处都是同一句文案。
+		// 网关侧失败（未发出上游调用）：resp_body 留空；error_message 记**完整错误**（含地址，运营侧需要），
+		// 对外文案则由 buildFailureNote 打码后给出。
+		buildMsg := operatorErrDetail("构建上游请求失败", err)
+		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, buildMsg, msSince(start))
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-			"error", "", "failed", "构建上游请求失败", msSince(start), nil, dec("上游请求构建失败"))
+			"error", "", "failed", buildMsg, msSince(start), nil, dec("上游请求构建失败"))
 		return &fwdOutcome{retry: true, failureNote: buildFailureNote(err)}
 	}
 	req, wrote, _ := withWriteTrace(req)
@@ -1351,10 +1352,12 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 		g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, channel.Feedback{IsSuccess: false, Now: g.now()})
 		if !wrote.Load() {
 			// 请求体未送达上游：上游不可能计费 → 可安全转移。
-			bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "上游连接失败", msSince(start))
-			// 连接失败：上游未返回任何响应体，resp_body 留空（原因见 error_message / 决策轨迹）。
+			// 连接失败：上游未返回任何响应体，resp_body 留空；error_message 记**完整错误**（含地址），
+			// 对外文案由 upstreamTransportNote 打码后给出。
+			connMsg := operatorErrDetail("上游连接失败", err)
+			bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, connMsg, msSince(start))
 			g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-				"error", "", "failed", "上游连接失败", msSince(start), nil, dec("上游连接失败"))
+				"error", "", "failed", connMsg, msSince(start), nil, dec("上游连接失败"))
 			note, timedOut := upstreamTransportNote("连接", err)
 			return &fwdOutcome{retry: true, failureNote: note, failureTimedOut: timedOut}
 		}
@@ -1659,10 +1662,11 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 			errInfo{kind: "build_failed", stage: stage, attempt: attempt,
 				retry: true, reason: "构建上游流式请求失败：" + err.Error(), sessionID: sessionID, durationMs: *msSince(start)})
 		g.channels.FeedResult(routeRes.ChannelKeyID, routeRes.ModelRowID, channel.Feedback{IsSuccess: false, Now: g.now()})
-		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "构建上游流式请求失败", msSince(start))
-		// 网关侧失败（未发出上游调用）：resp_body 留空，原因只落 error_message 与决策轨迹。
+		// 网关侧失败（未发出上游调用）：resp_body 留空；error_message 记完整错误（含地址），对外文案打码。
+		buildMsg := operatorErrDetail("构建上游流式请求失败", err)
+		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, buildMsg, msSince(start))
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-			"error", "", "failed", "构建上游流式请求失败", msSince(start), nil, dec("上游请求构建失败"))
+			"error", "", "failed", buildMsg, msSince(start), nil, dec("上游请求构建失败"))
 		return &fwdOutcome{retry: true, failureNote: buildFailureNote(err)}
 	}
 	req, wrote, gotFirstByte := withWriteTrace(req)
@@ -1707,10 +1711,11 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		}
 		if !delivered {
 			// 请求体未送达上游：上游不可能计费 → 可安全转移。
-			bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, "上游流式连接失败", msSince(start))
-			// 连接失败：上游未返回任何响应体，resp_body 留空（原因见 error_message / 决策轨迹）。
+			// 连接失败：上游未返回任何响应体，resp_body 留空；error_message 记完整错误（含地址），对外文案打码。
+			connMsg := operatorErrDetail("上游流式连接失败", err)
+			bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, connMsg, msSince(start))
 			g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-				"error", "", "failed", "上游流式连接失败", msSince(start), nil, streamDecision("上游连接失败"))
+				"error", "", "failed", connMsg, msSince(start), nil, streamDecision("上游连接失败"))
 			note, timedOut := upstreamTransportNote("流式连接", err)
 			return &fwdOutcome{retry: true, streamDiag: streamDiag, failureNote: note, failureTimedOut: timedOut}
 		}
