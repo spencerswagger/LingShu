@@ -1,0 +1,9 @@
+{"campaign": 1, "idx": 0, "mode": "hot", "endpoint": "cost", "ms": 220516.679879016, "status": 200, "cache": "", "bytes": 1604, "ts": 1794418039.3014991}
+{"campaign": 1, "idx": 1, "mode": "hot", "endpoint": "cost", "ms": 231330.27106997906, "status": 200, "cache": "", "bytes": 1604, "ts": 1794418270.6318169}
+{"campaign": 1, "idx": 2, "mode": "hot", "endpoint": "cost", "ms": 219897.6877759851, "status": 200, "cache": "", "bytes": 1604, "ts": 1794418490.5295484}
+{"campaign": 2, "idx": 0, "mode": "hot", "endpoint": "cost", "ms": 226383.20466398727, "status": 200, "cache": "", "bytes": 1604, "ts": 1794418936.8624864}
+{"campaign": 2, "idx": 1, "mode": "hot", "endpoint": "cost", "ms": 221387.71303801332, "status": 200, "cache": "", "bytes": 1604, "ts": 1794419158.2502754}
+{"campaign": 2, "idx": 2, "mode": "hot", "endpoint": "cost", "ms": 218427.47382100788, "status": 200, "cache": "", "bytes": 1604, "ts": 1794419376.6777916}
+{"campaign": 3, "idx": 0, "mode": "hot", "endpoint": "cost", "ms": 218105.52723001456, "status": 200, "cache": "", "bytes": 1604, "ts": 1794419816.494646}
+{"campaign": 3, "idx": 1, "mode": "hot", "endpoint": "cost", "ms": 221914.93163397536, "status": 200, "cache": "", "bytes": 1604, "ts": 1794420038.4096234}
+{"campaign": 3, "idx": 2, "mode": "hot", "endpoint": "cost", "ms": 216648.0462400068, "status": 200, "cache": "", "bytes": 1604, "ts": 1794420255.057724}
