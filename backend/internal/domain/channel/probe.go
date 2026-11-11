@@ -219,16 +219,20 @@ func (m *Manager) nextKeyProbeWait(keyID int64) (time.Duration, string, bool) {
 	}
 	// 模型层排空：即使密钥仍 NORMAL，也要按排空间隔代探（模型自身没有探测循环）。
 	//
-	// 只在「模型级探测」作用域内成立：显式配置 health_probe.probe_model 时每轮只做密钥级定向探测
-	// （pickKeyProbeTargets 返回 level='key'，不回喂模型状态机），渠道内模型的排空态既探不到也
-	// 恢复不了——拿它决定调度会变成永久秒级探测、永不回 cron。
-	if branch != branchDisabled && hp.ProbeModel == "" {
+	// 必须与 pickKeyProbeTargets 的选型同源——只统计「本轮真的会被探测的模型」：未配 probe_model 时是
+	// 全部非禁用模型；配了 probe_model 时只有该模型本身。作用域外的模型排空既探不到也恢复不了，
+	// 拿它决定调度会让该渠道全部密钥永久秒级探测、永不回 cron（反向用例的同型退化）。
+	if branch != branchDisabled {
 		for _, mr := range m.mrt[kr.Channel.ID] {
 			// 实体已禁用或状态机已禁用：pickKeyProbeTargets 不会选中它，不必按排空节奏代探。
 			if mr.Model.State == StateDisabled || mr.Machine.State() == StateDisabled {
 				continue
 			}
 			if mr.Machine.State() != StateDrain {
+				continue
+			}
+			// 探测作用域外的模型（配了 probe_model 时选型只探该模型）：不参与调度。
+			if hp.ProbeModel != "" && mr.Model.InternalModelID != hp.ProbeModel {
 				continue
 			}
 			iv := mergeHealthProbe(mr.Model.HealthProbe, kr.Channel.HealthProbe).DrainIntervalSeconds
@@ -300,12 +304,25 @@ type probeTarget struct {
 // pickKeyProbeTargets 密钥级探测目标选型（探测分两层，模型无独立探测循环）：
 //  1. 未配置 health_probe.probe_model：模型层全探——每轮探测该渠道全部 state!=DISABLED 的内部模型
 //     （level='model'；NORMAL 在前、DRAIN 次之，组内按模型 ID 稳定排序）；
-//  2. 显式配置 probe_model：密钥层定向探测——该密钥仅探测此模型（level='key'）；
+//  2. 显式配置 probe_model：密钥层定向探测——该密钥仅探测此模型（level='key'；能落到模型实体时
+//     同时回喂该模型状态机，见 probeTarget.ModelRowID）；
 //  3. 全部禁用/无模型 → 返回空切片，探测视为失败（不回退 GET /models）。
 func (m *Manager) pickKeyProbeTargets(kr *KeyRuntime) []probeTarget {
 	hp := normalizeHealthProbe(kr.Channel.HealthProbe)
 	if hp.ProbeModel != "" {
-		return []probeTarget{{Model: hp.ProbeModel, Level: "key"}}
+		// 定向探测：日志仍记 level='key'（沿用既有口径）。若该模型能落到 channel_models 行，
+		// 一并带上 ModelRowID——probeOnce 据此回喂该模型状态机；否则 probe_model 渠道里被排空的
+		// 目标模型即使探成功也无人接收，永久 DRAIN（调度按它算 15s 也没用）。
+		t := probeTarget{Model: hp.ProbeModel, Level: "key"}
+		m.mu.RLock()
+		for id, mr := range m.mrt[kr.Channel.ID] {
+			if mr.Model.InternalModelID == hp.ProbeModel {
+				t.ModelRowID = id
+				break
+			}
+		}
+		m.mu.RUnlock()
+		return []probeTarget{t}
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()

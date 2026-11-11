@@ -212,7 +212,7 @@ func TestManager_KeyProbeOnce_ProbesAllNormalModels(t *testing.T) {
 }
 
 // TestManager_PickKeyProbeTargets_MultiModelSorted 目标选型：未显式配置 probe_model 时返回全部非禁用模型
-// （NORMAL 组在前、DRAIN 次之，组内按模型 ID 升序稳定排列）；显式配置时仅返回该模型（level='model'）。
+// （NORMAL 组在前、DRAIN 次之，组内按模型 ID 升序稳定排列）；显式配置时仅返回该模型（level='key'，携带模型行 ID）。
 func TestManager_PickKeyProbeTargets_MultiModelSorted(t *testing.T) {
 	nowFn := func() time.Time { return time.Date(2026, 9, 27, 10, 0, 0, 0, time.UTC) }
 	mgr := NewManager(nil, nil, testSM4Key, nil, nil, nowFn, nil)
@@ -247,7 +247,9 @@ func TestManager_PickKeyProbeTargets_MultiModelSorted(t *testing.T) {
 
 	kr.Channel.HealthProbe.ProbeModel = "m1"
 	targets = mgr.pickKeyProbeTargets(kr)
-	wantExplicit := []probeTarget{{Model: "m1", Level: "key"}} // 密钥层定向探测
+	// 密钥层定向探测：日志仍记 level='key'，但带上模型行 ID 以便回喂该模型状态机
+	//（否则定向探测成功也恢复不了排空的目标模型）。
+	wantExplicit := []probeTarget{{Model: "m1", Level: "key", ModelRowID: 1}}
 	if !slices.Equal(targets, wantExplicit) {
 		t.Fatalf("explicit targets want %+v got %+v", wantExplicit, targets)
 	}

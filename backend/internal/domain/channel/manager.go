@@ -787,6 +787,8 @@ func (m *Manager) DropModel(channelID int64, modelRowID int64) {
 	if mm, ok := m.mrt[channelID]; ok {
 		delete(mm, modelRowID)
 	}
+	// 模型被删后同渠道的密钥循环要重算等待（它可能正是排空档的来源）。
+	m.wakeProbeScheduling()
 }
 
 // GetRuntime 返回渠道运行时；不存在返回 (nil, false)。
@@ -1487,6 +1489,9 @@ func newProbeWaker() *probeWaker { return &probeWaker{ch: make(chan struct{})} }
 // subscribe 取当前唤醒通道；必须在计算 wait 之前订阅，否则「算完 wait 再订阅」的窗口内发生的
 // 状态变化会被漏掉。
 func (w *probeWaker) subscribe() <-chan struct{} {
+	if w == nil {
+		return nil // nil 通道：select 永不就绪（等价「没有唤醒源」），由定时器与 ctx 决定结束
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.ch
@@ -1494,6 +1499,9 @@ func (w *probeWaker) subscribe() <-chan struct{} {
 
 // notify 广播一次「调度输入已变」。
 func (w *probeWaker) notify() {
+	if w == nil {
+		return
+	}
 	w.mu.Lock()
 	close(w.ch)
 	w.ch = make(chan struct{})

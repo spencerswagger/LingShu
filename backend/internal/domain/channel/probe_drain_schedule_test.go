@@ -381,10 +381,10 @@ func TestNextKeyProbeWait_ProbeModelScope(t *testing.T) {
 			wantBranch: branchCron, wantWait: cronWait,
 		},
 		{
-			name:       "配了 probe_model + 该模型自己 DRAIN → 仍回 cron（探测不回喂模型，探也白探）",
+			name:       "配了 probe_model + 排空的正是该模型 → 按模型排空间隔代探（探测会回喂它）",
 			probeModel: "m1",
 			keyState:   StateNormal, modelState: StateDrain,
-			wantBranch: branchCron, wantWait: cronWait,
+			wantBranch: branchModelDrain, wantWait: 15 * time.Second,
 		},
 		{
 			name:       "配了 probe_model + 密钥 DRAIN → 仍按密钥排空间隔",
@@ -454,8 +454,8 @@ func TestKeyProbeLoop_ProbeModelScopeStaysCron(t *testing.T) {
 	}
 }
 
-// TestKeyProbeOnce_ProbeModelIsKeyLevel 配了 probe_model 时探测记 level=key 且指向该模型，
-// 且不回喂模型状态机（这是「模型排空不参与调度」的事实依据，不是本次新引入的取舍）。
+// TestKeyProbeOnce_ProbeModelIsKeyLevel 配了 probe_model 时探测记 level=key 且指向该模型；
+// 该模型能落到 channel_models 行时同时回喂其状态机——否则定向探测成功也恢复不了排空的目标模型。
 func TestKeyProbeOnce_ProbeModelIsKeyLevel(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -498,7 +498,120 @@ func TestKeyProbeOnce_ProbeModelIsKeyLevel(t *testing.T) {
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("probe_model 探测应记 level=key 且 ModelID=探测模型：%v", err)
 	}
+	// 回喂目标模型状态机：RecoveryThreshold=1，一次成功即恢复 NORMAL。
+	if mr := mgr.mrt[1][21]; mr.Machine.State() != StateNormal {
+		t.Fatalf("probe_model 目标模型应由探测成功恢复 NORMAL，got %s", mr.Machine.State())
+	}
+}
+
+// TestKeyProbeLoop_ProbeModelTargetDrainRecovers 配了 probe_model 的渠道：被排空的正是该探测目标时，
+// 必须按排空间隔探测并由此恢复（修复不能退回「probe_model 渠道下模型排空永远不探」）。
+func TestKeyProbeLoop_ProbeModelTargetDrainRecovers(t *testing.T) {
+	c := &probeCounter{}
+	srv := httptest.NewServer(c.handler(true))
+	defer srv.Close()
+
+	frozen := time.Date(2026, 1, 2, 10, 30, 0, 0, time.UTC)
+	hp := HealthProbeConfig{
+		Interval: "0 0 * * * *", DrainIntervalSeconds: 1, TimeoutMS: 1000,
+		FailThreshold: 1, RecoveryThreshold: 1, ProbeModel: "m1", // m1 = 模型 21
+	}
+	mgr := newDrainScheduleTestManager(t, srv.URL, hp, func() time.Time { return frozen })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	mgr.Start(ctx)
+	defer func() {
+		cancel()
+		mgr.Stop()
+	}()
+	time.Sleep(200 * time.Millisecond)
+
+	if err := mgr.ManualSetModelState(1, 21, StateDrain); err != nil {
+		t.Fatalf("manual model drain: %v", err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && c.count() == 0 {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if c.count() == 0 {
+		t.Fatalf("排空的是 probe_model 目标模型时，3s 内应有探测（不能退化成永不探）")
+	}
+	if mr := mgr.mrt[1][21]; mr.Machine.State() != StateNormal {
+		t.Fatalf("定向探测成功应让目标模型恢复 NORMAL，got %s", mr.Machine.State())
+	}
+}
+
+// TestWaitUntilNextKeyProbe_CronResetAfterManualRecover 唤醒后必须按新状态重算截止：
+// 密钥从 DRAIN 手动恢复 NORMAL 时，旧的排空截止必须作废（否则会多出一次「排空遗留」的探测，
+// 即恢复后没有立刻回到 cron）。删除 waitUntilNextKeyProbe 里的 cron 重置分支，本用例必红。
+func TestWaitUntilNextKeyProbe_CronResetAfterManualRecover(t *testing.T) {
+	c := &probeCounter{}
+	srv := httptest.NewServer(c.handler(true))
+	defer srv.Close()
+
+	frozen := time.Date(2026, 1, 2, 10, 30, 0, 0, time.UTC)
+	hp := HealthProbeConfig{Interval: "0 0 * * * *", DrainIntervalSeconds: 1, TimeoutMS: 1000, FailThreshold: 1, RecoveryThreshold: 1}
+	mgr := newDrainScheduleTestManager(t, srv.URL, hp, func() time.Time { return frozen })
+	// 以 DRAIN 起步：循环首轮就排定一个 1s 的排空截止。
+	mgr.mu.Lock()
+	mgr.keys[11].Machine.transition(StateDrain, frozen, "")
+	mgr.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	mgr.Start(ctx)
+	defer func() {
+		cancel()
+		mgr.Stop()
+	}()
+	time.Sleep(200 * time.Millisecond) // 循环已在 1s 截止上等待
+
+	if err := mgr.ManualSetKeyState(11, "normal"); err != nil {
+		t.Fatalf("manual recover: %v", err)
+	}
+	time.Sleep(1500 * time.Millisecond)
+	if n := c.count(); n != 0 {
+		t.Fatalf("恢复 NORMAL 后不应残留排空探测（cron 截止未重算），got %d 次", n)
+	}
+	if _, branch, ok := mgr.nextKeyProbeWait(11); !ok || branch != branchCron {
+		t.Fatalf("恢复后分支应为 cron，got %q（ok=%v）", branch, ok)
+	}
+}
+
+// TestKeyProbeLoop_WakesOnRealTrafficDrain 真实调用把模型打到 DRAIN 时也必须唤醒探测循环：
+// 删除 feedAndTransit 里的广播，本用例必红（循环会一直睡到 cron 边界）。
+func TestKeyProbeLoop_WakesOnRealTrafficDrain(t *testing.T) {
+	c := &probeCounter{}
+	srv := httptest.NewServer(c.handler(true))
+	defer srv.Close()
+
+	frozen := time.Date(2026, 1, 2, 10, 30, 0, 0, time.UTC)
+	hp := HealthProbeConfig{Interval: "0 0 * * * *", DrainIntervalSeconds: 1, TimeoutMS: 1000, FailThreshold: 1, RecoveryThreshold: 1}
+	mgr := newDrainScheduleTestManager(t, srv.URL, hp, func() time.Time { return frozen })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	mgr.Start(ctx)
+	defer func() {
+		cancel()
+		mgr.Stop()
+	}()
+	time.Sleep(200 * time.Millisecond)
+	if n := c.count(); n != 0 {
+		t.Fatalf("常态不应探测，got %d 次", n)
+	}
+
+	// 真实调用连续失败达到 MinSamples（10）→ 可靠性窗口把模型（与密钥）打到 DRAIN。
+	for i := 0; i < 10; i++ {
+		mgr.FeedResult(11, 21, Feedback{IsSuccess: false})
+	}
 	if mr := mgr.mrt[1][21]; mr.Machine.State() != StateDrain {
-		t.Fatalf("level=key 探测不回喂模型状态机，模型应仍为 DRAIN，got %s", mr.Machine.State())
+		t.Fatalf("真实调用失败应把模型打到 DRAIN，got %s", mr.Machine.State())
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && c.count() == 0 {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if c.count() == 0 {
+		t.Fatalf("真实调用打到 DRAIN 后 3s 内应开始按排空间隔探测（真实流量唤醒缺失）")
 	}
 }
