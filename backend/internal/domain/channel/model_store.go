@@ -491,7 +491,11 @@ func (s *channelModelStore) ListProbeLogs(ctx context.Context, keyID int64, limi
 		return nil, fmt.Errorf("list probe logs: %w", err)
 	}
 	defer rows.Close()
-	return s.scanProbeLogs(rows)
+	list, err := s.scanProbeLogs(rows)
+	if err != nil {
+		return nil, err
+	}
+	return capProbeBodies(list), nil
 }
 
 // ListProbeLogsByKeys 查询一批密钥（某渠道全部未删 keyID）的探测历史（倒序、合并列表），
@@ -515,7 +519,11 @@ func (s *channelModelStore) ListProbeLogsByKeys(ctx context.Context, keyIDs []in
 		return nil, fmt.Errorf("list probe logs by keys: %w", err)
 	}
 	defer rows.Close()
-	return s.scanProbeLogs(rows)
+	list, err := s.scanProbeLogs(rows)
+	if err != nil {
+		return nil, err
+	}
+	return capProbeBodies(list), nil
 }
 
 // scanProbeLogs 扫描探测日志行集（ListProbeLogs/ListProbeLogsByKeys 共用）。
@@ -544,7 +552,7 @@ func (s *channelModelStore) scanProbeLogs(rows interface {
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	return capProbeBodies(list), nil
+	return list, nil
 }
 
 // capProbeBodies 把列表里每行 error_body 压到 probeListBodyMaxBytes 以内（同字段标注，指向落库的完整原文）。
@@ -559,8 +567,32 @@ func capProbeBodies(list []ProbeLog) []ProbeLog {
 			probeListBodyMaxBytes, len(body))
 		out, _ := errbody.TruncateUTF8(body, probeListBodyMaxBytes, note)
 		list[i].ErrorBody = out
+		list[i].ErrorBodyTruncated = true
 	}
 	return list
+}
+
+// GetProbeLog 取单条探测记录的**完整原文**（列表只给 4KB 预览，全量走这里）。
+// channelID 参与过滤：探测记录挂在密钥上，用 channel_key 归属校验，避免跨渠道读到别人的报文。
+// 不存在（或不属于该渠道）返回 sql.ErrNoRows。
+func (s *channelModelStore) GetProbeLog(ctx context.Context, channelID, logID int64) (*ProbeLog, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT p.id, p.channel_key_id, p.model_id, p.level, p.target, p.ok, p.error, p.upstream_status,
+		        p.error_body, p.input_tokens, p.output_tokens, p.cached_tokens, p.total_tokens, p.duration_ms, p.created_at
+		 FROM probe_logs p JOIN channel_keys k ON k.id = p.channel_key_id
+		 WHERE p.id = $1 AND k.channel_id = $2`, logID, channelID)
+	if err != nil {
+		return nil, fmt.Errorf("get probe log: %w", err)
+	}
+	defer rows.Close()
+	list, err := s.scanProbeLogs(rows)
+	if err != nil {
+		return nil, err
+	}
+	if len(list) == 0 {
+		return nil, sql.ErrNoRows
+	}
+	return &list[0], nil
 }
 
 // Delete 软删除单条渠道内部模型。不存在返回 sql.ErrNoRows。
