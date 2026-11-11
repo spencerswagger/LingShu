@@ -505,6 +505,8 @@ func serializeOAIMessage(m Message, rep *LossyReport, opts SerializeOptions) int
 			case BlockToolUse:
 			case BlockThinking:
 				// 是否丢失统一在下方按「最终是否真正回填」记账，避免与实际注入结果不一致。
+			case BlockRedactedThinking:
+				// 同上：统一在下方记账，避免此处 default 与后续 if 各记一条（重复）。
 			default:
 				rep.Add("message.content." + b.Kind)
 			}

@@ -235,10 +235,13 @@ func TestAnthropicCodec(t *testing.T) {
 		if err != nil {
 			t.Fatalf("serialize: %v", err)
 		}
+		// 官方消息结构只有 type + data，无 signature 字段：不得多发 signature。
 		if !strings.Contains(string(out), `"type":"redacted_thinking"`) ||
-			!strings.Contains(string(out), `"data":"opaque-cipher-text"`) ||
-			!strings.Contains(string(out), `"signature":"sig-redacted"`) {
-			t.Fatalf("redacted_thinking 应原样序列化: %s", out)
+			!strings.Contains(string(out), `"data":"opaque-cipher-text"`) {
+			t.Fatalf("redacted_thinking 应原样序列化（type + data）: %s", out)
+		}
+		if strings.Contains(string(out), "sig-redacted") {
+			t.Fatalf("redacted_thinking 不应携带 signature（官方结构无该字段）: %s", out)
 		}
 		req2, _, err := codec.ParseRequest(out)
 		if err != nil {

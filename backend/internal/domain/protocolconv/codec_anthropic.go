@@ -476,8 +476,8 @@ func parseAnthropicBlock(raw json.RawMessage, rep *LossyReport) (ContentBlock, b
 		return ContentBlock{Kind: BlockThinking, Text: b.Thinking, Signature: b.Signature}, true, nil
 	case BlockRedactedThinking:
 		// redacted_thinking 的 data 是 opaque 密文，必须原样保留（Anthropic 要求回传），
-		// 不能解明文；签名一并保留。
-		return ContentBlock{Kind: BlockRedactedThinking, RedactedData: b.Data, Signature: b.Signature}, true, nil
+		// 不能解明文；官方消息结构无 signature 字段，故只保留 data。
+		return ContentBlock{Kind: BlockRedactedThinking, RedactedData: b.Data}, true, nil
 	default:
 		rep.Add("content.block." + b.Type)
 		return ContentBlock{}, false, nil
@@ -617,15 +617,10 @@ func serializeAnthropicBlock(b ContentBlock, rep *LossyReport) interface{} {
 			"signature": sig,
 		}
 	case BlockRedactedThinking:
-		// redacted_thinking 原样回传（data 为 opaque 密文，signature 一并保留）。
-		sig := b.Signature
-		if sig == "" {
-			sig = OpaqueThinkingSignature(b.RedactedData)
-		}
+		// redacted_thinking 原样回传：官方消息结构只有 type + data，无 signature 字段。
 		return map[string]interface{}{
-			"type":      BlockRedactedThinking,
-			"data":      b.RedactedData,
-			"signature": sig,
+			"type": BlockRedactedThinking,
+			"data": b.RedactedData,
 		}
 	default:
 		rep.Add("content.block." + b.Kind)
@@ -729,15 +724,23 @@ func (anthropicCodec) DecodeEvent(data []byte) ([]CanonicalEvent, *LossyReport, 
 	case "content_block_start":
 		ev := CanonicalEvent{Type: EventContentBlockStart, Index: rawIntValue(top["index"])}
 		if raw, ok := top["content_block"]; ok && !isJSONNull(raw) {
+			// 保留 thinking 文本/签名与 redacted data：流式下也要能原样透传该块，
+			// 否则「原样往返」只在非流式成立。
 			var cb struct {
-				Type string `json:"type"`
-				ID   string `json:"id"`
-				Name string `json:"name"`
+				Type      string `json:"type"`
+				ID        string `json:"id"`
+				Name      string `json:"name"`
+				Thinking  string `json:"thinking"`
+				Signature string `json:"signature"`
+				Data      string `json:"data"`
 			}
 			_ = json.Unmarshal(raw, &cb)
 			ev.BlockKind = cb.Type
 			ev.ToolUseID = cb.ID
 			ev.ToolName = cb.Name
+			ev.Text = cb.Thinking
+			ev.Signature = cb.Signature
+			ev.RedactedData = cb.Data
 		}
 		return []CanonicalEvent{ev}, rep, nil
 	case "content_block_delta":
@@ -829,10 +832,18 @@ func (anthropicCodec) EncodeEvent(ev CanonicalEvent) ([][]byte, *LossyReport, er
 		})}, rep, nil
 	case EventContentBlockStart:
 		cb := map[string]interface{}{"type": ev.BlockKind}
-		if ev.BlockKind == BlockToolUse {
+		switch ev.BlockKind {
+		case BlockToolUse:
 			cb["id"] = ev.ToolUseID
 			cb["name"] = ev.ToolName
 			cb["input"] = map[string]interface{}{}
+		case BlockThinking:
+			// thinking 块 start 携带 thinking（通常为空串）与 signature，供流式原样往返。
+			cb["thinking"] = ev.Text
+			cb["signature"] = ev.Signature
+		case BlockRedactedThinking:
+			// 官方消息结构只有 type + data，无 signature 字段。
+			cb["data"] = ev.RedactedData
 		}
 		return [][]byte{anthropicFrame("content_block_start", map[string]interface{}{
 			"type":          "content_block_start",

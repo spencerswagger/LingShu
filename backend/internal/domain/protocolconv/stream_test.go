@@ -160,6 +160,36 @@ data: {"type":"content_block_stop","index":0}
 	}
 }
 
+// TestAnthropicRedactedThinkingStream 断言流式下 redacted_thinking 的 content_block_start
+// 能保留 data 并原样往返（官方结构只有 type + data，无 signature）：
+// 修正前解码丢弃 data，流式「原样透传」不成立。
+func TestAnthropicRedactedThinkingStream(t *testing.T) {
+	const sample = `event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"opaque-cipher-xyz"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+`
+	codec := anthropicCodec{}
+	evs := decodeSSE(t, codec, sample)
+	if len(evs) == 0 || evs[0].Type != EventContentBlockStart ||
+		evs[0].BlockKind != BlockRedactedThinking || evs[0].RedactedData != "opaque-cipher-xyz" {
+		t.Fatalf("应解码出 redacted_thinking 块并保留 data，events=%s", dumpEvents(evs))
+	}
+	frames := encodeFrames(t, codec, evs)
+	joined := string(bytes.Join(frames, nil))
+	if !strings.Contains(joined, `"type":"redacted_thinking"`) || !strings.Contains(joined, `"data":"opaque-cipher-xyz"`) {
+		t.Fatalf("编码回 anthropic 应保留 type + data，got %s", joined)
+	}
+	if strings.Contains(joined, `"signature"`) {
+		t.Fatalf("redacted_thinking 不应携带 signature（官方结构无该字段），got %s", joined)
+	}
+	// 往返稳定：再解码一次应与首次一致。
+	if second := decodeFrames(t, codec, frames); !reflect.DeepEqual(evs, second) {
+		t.Fatalf("redacted_thinking 流式往返不一致\nfirst:  %s\nsecond: %s", dumpEvents(evs), dumpEvents(second))
+	}
+}
+
 func TestEmptyStopReasonNotLeaking(t *testing.T) {
 	usageOnly := `{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}`
 	evs, _, err := openAIChatCodec{}.DecodeEvent([]byte(usageOnly))

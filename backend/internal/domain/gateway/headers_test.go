@@ -237,3 +237,26 @@ func TestInjectAnthropicProtocolDefaults(t *testing.T) {
 		t.Errorf("openai-chat 上游不应注入 anthropic-version，got %q", got)
 	}
 }
+
+// anthropic-beta 允许**多值**（如 interleaved-thinking-* + fine-grained-tool-streaming）：
+// 多值必须全量透传，不得被 Get+Set 截断成首行（本 PR 早期版本引入的回归）。
+func TestInjectAnthropicBetaMultiValue(t *testing.T) {
+	down := http.Header{}
+	down.Add("Anthropic-Beta", "interleaved-thinking-2025-01-15")
+	down.Add("Anthropic-Beta", "fine-grained-tool-streaming-2025-05-14")
+
+	// 场景 1：passthroughMode=none（默认）→ 由协议隐含默认头补全，必须两行都在。
+	req := buildReq(t, down, channelprotocol.HeaderPolicy{}, channelprotocol.ProtocolAnthropicMessages, "sk-raw", nil)
+	got := req.Header.Values("Anthropic-Beta")
+	if len(got) != 2 || got[0] != "interleaved-thinking-2025-01-15" || got[1] != "fine-grained-tool-streaming-2025-05-14" {
+		t.Fatalf("none 模式应全量透传两行 anthropic-beta，got %#v", got)
+	}
+
+	// 场景 2：passthroughMode=all（透传已带该头）→ 不得被默认补全覆写成单行/重复。
+	req = buildReq(t, down, channelprotocol.HeaderPolicy{PassthroughMode: channelprotocol.PassthroughAll},
+		channelprotocol.ProtocolAnthropicMessages, "sk-raw", nil)
+	got = req.Header.Values("Anthropic-Beta")
+	if len(got) != 2 || got[0] != "interleaved-thinking-2025-01-15" || got[1] != "fine-grained-tool-streaming-2025-05-14" {
+		t.Fatalf("all 模式应保留透传的两行 anthropic-beta（不得截断/重复），got %#v", got)
+	}
+}

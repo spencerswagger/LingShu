@@ -118,4 +118,7 @@ type CanonicalEvent struct {
 	// Signature 是 thinking 块的签名（Anthropic 严格客户端要求非空；流式在
 	// content_block_stop 前通过 signature_delta 下发，非流式直接写入块内）。
 	Signature string
+	// RedactedData 是 redacted_thinking 块的 opaque 密文（content_block_start 携带，
+	// 必须原样透传；官方消息结构无 signature 字段）。
+	RedactedData string
 }

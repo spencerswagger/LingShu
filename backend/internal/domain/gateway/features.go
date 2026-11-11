@@ -223,17 +223,20 @@ func reasoningDeclarationOf(rt *channel.RuntimeChannel) reasoningDeclaration {
 
 // channelReasoningInject 返回本次请求实际生效的「推理注入/回填」选项：
 //
-// 生效规则（2026-11-11 修复 anthropic 入站 thinking 多轮 400 后）：
+// 生效规则（2026-11-11 修订）：
 //   - 渠道协议**显式挂载** thinking-roundtrip：以挂载参数为准（enabled 缺省 false，仍须显式
 //     enabled=true 才启用；onlyThinking 同前）。显式挂载是运维的明确意图，保持「缺省关闭」语义不变，
 //     避免存量「挂载但未开 enabled」的渠道被悄悄改行为。
-//   - 渠道协议**未挂载**：采用全局默认（defaultEnabled，来自 sys_configs
-//     `gateway.thinking_roundtrip.default_enabled`，默认 true）。默认开启使未配置的渠道
-//     （Anthropic 入站 → openai-chat 上游的 thinking 多轮场景）不再丢 thinking → 消除上游 400；
-//     该默认受全局开关控制，关闭即回滚到改造前行为（未配置渠道 thinking 一律丢）。
-//     **安全边界**：转换注入只对 openai-chat 目标生效（SerializeOptions 仅 openai-chat 序列化器读取）；
-//     会话级缓存回填只在目标为 openai-chat 且缓存命中（网关曾从该上游看到 reasoning_content）时写入，
-//     即「上游确实是 thinking 模型」时才会真正改写请求体，不会向非 thinking 上游注入未知字段。
+//   - 渠道协议**未挂载**：当且仅当 defaultEnabled 为真时生效。defaultEnabled 由调用方传入
+//     `converted && 全局开关`（见 handler.serve 的 reasoningInject 求值）——
+//     **默认值只覆盖跨协议转换路径**（如 Anthropic 入站 → openai-chat 上游的 thinking 多轮），
+//     直通渠道（converted=false）即便全局开关为真也**不**默认回填，仍须显式挂载该特性。
+//
+// 为什么默认不覆盖直通：会话级推理缓存（reasoning.go）的键刻意只有 session + tool_call_id、
+// 跨渠道/跨模型共享（failover 与成本路由场景下同一会话会落到不同渠道/厂商）。对直通渠道默认回填
+// 会把 A 厂商上一轮 CoT 注入给 B 厂商，既可能泄漏推理内容，也依赖「上游忽略未知消息字段」这一
+// 未验证假设。收窄到转换路径后，「只有客户端确实缺少 thinking 块、且网关确有该会话推理」的
+// anthropic→openai 转换场景才默认生效，风险面最小。
 //
 // 未启用/不满足 onlyThinking 时返回零值：调用方据此既不注入也不回填，请求体逐字节不变。
 // thinking 标记与候选渠道无关（body 与 rewriteModel 后的 body 仅 model 字段不同），
@@ -241,8 +244,8 @@ func reasoningDeclarationOf(rt *channel.RuntimeChannel) reasoningDeclaration {
 func channelReasoningInject(rt *channel.RuntimeChannel, thinking bool, defaultEnabled bool) protocolconv.SerializeOptions {
 	decl := reasoningDeclarationOf(rt)
 	if !decl.Mounted {
-		// 未挂载该特性：回落到全局默认（defaultEnabled）。显式挂载（含 enabled=false）
-		// 是运维的明确意图，全局默认不覆盖。
+		// 未挂载该特性：仅当调用方允许默认（跨协议转换路径 + 全局开关开启）时回填。
+		// 显式挂载（含 enabled=false）是运维的明确意图，全局默认不覆盖。
 		if !defaultEnabled {
 			return protocolconv.SerializeOptions{}
 		}

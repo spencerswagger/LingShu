@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -333,6 +334,66 @@ func TestConvertedReasoningInjectDefaultEnabled(t *testing.T) {
 	}
 }
 
+// TestDirectChannelNoDefaultReasoningBackfill 断言默认回填边界收窄到「跨协议转换」路径：
+// 直通 openai-chat 渠道（converted=false）、未挂 thinking-roundtrip、全局开关开启时，
+// 上游请求体**逐字节不变**（不得注入上一轮缓存的 reasoning_content）。
+// 原因：会话级推理缓存键只有 session+tool_call_id、跨渠道/跨模型共享，直通默认注入会把
+// A 厂商 CoT 注给 B 厂商；直通渠道须显式挂载 thinking-roundtrip 才回填。
+func TestDirectChannelNoDefaultReasoningBackfill(t *testing.T) {
+	const assistantOnly = `{"role":"assistant","content":null,"tool_calls":[{"id":"toolu_1","type":"function","function":{"name":"get_weather","arguments":"{}"}}]},` +
+		`{"role":"tool","tool_call_id":"toolu_1","content":"ok"}`
+	const body = `{"model":"gpt-4","stream":false,"messages":[` + assistantOnly + `]}`
+
+	run := func(t *testing.T, mountFeature bool) []byte {
+		t.Helper()
+		var upstreamBody []byte
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			upstreamBody, _ = io.ReadAll(r.Body)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"id":"x","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},` +
+				`"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`))
+		}))
+		defer upstream.Close()
+
+		h := build(t, upstream.URL)
+		// 直通：入站与上游都是 openai-chat（不设置 mrt.Model.Protocols 时默认内联 openai-compat → openai-chat）。
+		h.gw.thinkingRoundtripDefault = func() bool { return true }
+		if mountFeature {
+			h.chans.rt.Protocol = &channelprotocol.ChannelProtocol{
+				// 显式挂渠道协议时须带可达协议集，否则该模型无可直通协议（与真实装配同口径）。
+				Protocols: channelprotocol.Protocols{channelprotocol.ProtocolOpenAIChat: {}},
+				Features: []channelprotocol.Feature{{
+					Key:    channelprotocol.FeatureThinkingRoundtrip,
+					Params: map[string]any{"enabled": true},
+				}},
+			}
+		}
+		// 预置缓存：网关曾从该上游看到本轮 assistant 的 reasoning_content（按 tool_call_id 命中）。
+		// 缓存键是网关按 user/token/model/x-session-id 派生的会话 ID（不是 header 原值）。
+		seedSession := router.SessionID(7, 42, "gpt-4", "sess-direct")
+		h.gw.reasoning.RememberMessage(seedSession, []byte(
+			`{"role":"assistant","reasoning_content":"CoT-A-vendor","tool_calls":[{"id":"toolu_1"}]}`))
+
+		rec := doRequestH(t, h.gw, "/v1/chat/completions", "sk-gw-t", body,
+			map[string]string{"x-session-id": "sess-direct"})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
+		}
+		return upstreamBody
+	}
+
+	// 未挂特性：即便全局默认开启、缓存命中，直通渠道也不得注入 reasoning_content。
+	if got := run(t, false); strings.Contains(string(got), `"reasoning_content"`) {
+		t.Fatalf("未挂特性的直通渠道不应默认注入 reasoning_content（请求体应逐字节不变），got %s", got)
+	}
+
+	// 显式挂载 thinking-roundtrip{enabled:true}：直通渠道按挂载回填（能力保留）。
+	if got := run(t, true); !strings.Contains(string(got), `"reasoning_content":"CoT-A-vendor"`) {
+		t.Fatalf("显式挂载 thinking-roundtrip 的直通渠道应回填 reasoning_content，got %s", got)
+	}
+}
+
 // TestConvertedReasoningInjectReportsDroppedThinking 断言未注入时损耗报告如实记账：
 // 同一转换链路下不开注入选项，thinking 必须记为 message.content.thinking（不静默丢弃）。
 func TestConvertedReasoningInjectReportsDroppedThinking(t *testing.T) {
@@ -445,11 +506,105 @@ func TestStreamConversion(t *testing.T) {
 	}
 }
 
+// decodeAnthropicSSE 把下游 anthropic SSE 文本反解为规范事件序列（用于形状断言，
+// 比字符串包含更严格：能校验 index→块类型、每帧 delta 归属、块串行与 signature 位置）。
+func decodeAnthropicSSE(t *testing.T, body string) []protocolconv.CanonicalEvent {
+	t.Helper()
+	var evs []protocolconv.CanonicalEvent
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if payload == "" || payload == "[DONE]" {
+			continue
+		}
+		got, _, err := protocolconv.DecodeStreamEvents(channelprotocol.ProtocolAnthropicMessages, []byte(payload))
+		if err != nil {
+			t.Fatalf("decode anthropic sse frame %q: %v", payload, err)
+		}
+		evs = append(evs, got...)
+	}
+	return evs
+}
+
+// assertAnthropicBlockSerial 校验下游 anthropic 流「块串行 + 类型归属 + 签名位置」：
+//   - content_block_start 只在无开启块时出现，content_block_stop 只关闭当前块，
+//     块内 delta 归属当前块下标（切块不串内容）；
+//   - 返回 index→块类型，供调用方断言具体块类型；
+//   - signature_delta 必须在所属块的 content_block_stop 之前。
+func assertAnthropicBlockSerial(t *testing.T, evs []protocolconv.CanonicalEvent) map[int]string {
+	t.Helper()
+	kinds := map[int]string{}
+	openIdx := -1
+	sigEmitted := map[int]bool{}
+	for _, ev := range evs {
+		switch ev.Type {
+		case protocolconv.EventContentBlockStart:
+			if openIdx >= 0 {
+				t.Fatalf("块未串行：块 %d 未 stop 就起新块 %d（事件序: %s）", openIdx, ev.Index, dumpEventTypes(evs))
+			}
+			openIdx = ev.Index
+			kinds[ev.Index] = ev.BlockKind
+		case protocolconv.EventContentBlockStop:
+			if openIdx != ev.Index {
+				t.Fatalf("块未串行：stop(%d) 与当前块 %d 不一致（事件序: %s）", ev.Index, openIdx, dumpEventTypes(evs))
+			}
+			openIdx = -1
+		case protocolconv.EventContentBlockDelta:
+			if openIdx != ev.Index {
+				t.Fatalf("delta 未归属当前块：delta(%d) 当前块 %d（事件序: %s）", ev.Index, openIdx, dumpEventTypes(evs))
+			}
+			// delta 类型必须与该块类型一致（thinking_delta 只在 thinking 块内）。
+			switch ev.DeltaKind {
+			case protocolconv.DeltaThinking, protocolconv.DeltaSignature:
+				if k := kinds[ev.Index]; k != protocolconv.BlockThinking {
+					t.Fatalf("thinking/signature delta 出现在 %q 块内（index=%d）", k, ev.Index)
+				}
+			case protocolconv.DeltaText:
+				if k := kinds[ev.Index]; k != protocolconv.BlockText {
+					t.Fatalf("text_delta 出现在 %q 块内（index=%d）", k, ev.Index)
+				}
+			}
+			if ev.DeltaKind == protocolconv.DeltaSignature {
+				sigEmitted[ev.Index] = true
+			}
+		}
+	}
+	// signature 必须在 stop 之前（序列校验已保证 delta 在块内，stop 之后不再有该块 delta）。
+	for idx, k := range kinds {
+		if k == protocolconv.BlockThinking && !sigEmitted[idx] {
+			t.Fatalf("thinking 块 %d 缺 signature_delta（事件序: %s）", idx, dumpEventTypes(evs))
+		}
+	}
+	return kinds
+}
+
+// dumpEventTypes 输出事件类型序列（失败信息用）。
+func dumpEventTypes(evs []protocolconv.CanonicalEvent) string {
+	parts := make([]string, 0, len(evs))
+	for _, ev := range evs {
+		switch ev.Type {
+		case protocolconv.EventContentBlockStart:
+			parts = append(parts, "start("+ev.BlockKind+","+strconv.Itoa(ev.Index)+")")
+		case protocolconv.EventContentBlockStop:
+			parts = append(parts, "stop("+strconv.Itoa(ev.Index)+")")
+		case protocolconv.EventContentBlockDelta:
+			parts = append(parts, "delta:"+ev.DeltaKind+"("+strconv.Itoa(ev.Index)+")")
+		default:
+			parts = append(parts, ev.Type)
+		}
+	}
+	return strings.Join(parts, " -> ")
+}
+
 // TestStreamConversionThinkingBlocks 端到端：openai-chat 上游流式返回 reasoning_content，
 // 下游 anthropic 必须下发「合法 thinking 块」：
 //   - 首块 content_block_start{type:"thinking"}（修复前被标成 text）；
-//   - thinking_delta 只出现在 thinking 块内；
-//   - signature_delta 在 content_block_stop 之前；
+//   - thinking_delta 只在 thinking 块内、text 只在 text 块内；
+//   - 块串行（start→delta*→stop 之后才起下一块）；
+//   - signature_delta 在所属块的 content_block_stop 之前；
 //   - text 与 thinking 独立分配下标（上游共用 Index:0，下游不得并进同一块）。
 func TestStreamConversionThinkingBlocks(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -473,37 +628,134 @@ func TestStreamConversionThinkingBlocks(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
 	}
-	body := rec.Body.String()
+	evs := decodeAnthropicSSE(t, rec.Body.String())
+	kinds := assertAnthropicBlockSerial(t, evs)
 
-	// 验收②：首块必须是 content_block_start{type:"thinking"}。
-	// 修复前 reasoning_content 被映射成 content_block_start{type:"text"}。
-	if !strings.Contains(body, `"content_block":{"type":"thinking"`) {
-		t.Fatalf("下游 anthropic 应有 content_block_start{type:thinking}，got %s", body)
+	// 首块必须是 thinking，text 独立成另一块。
+	if kinds[0] != protocolconv.BlockThinking {
+		t.Fatalf("index 0 块应为 thinking，got %q（事件序: %s）", kinds[0], dumpEventTypes(evs))
 	}
-	if strings.Contains(body, `"content_block":{"type":"text","signature"`) {
-		t.Fatalf("thinking 不应被映射成 text 块，got %s", body)
+	var textIdx = -1
+	for idx, k := range kinds {
+		if k == protocolconv.BlockText && textIdx < 0 {
+			textIdx = idx
+		}
 	}
-	// thinking_delta 只应在 thinking 块内（存在 thinking_delta 且不存在 text 块内 thinking_delta）。
-	if !strings.Contains(body, `"type":"thinking_delta"`) {
-		t.Fatalf("下游应有 thinking_delta，got %s", body)
+	if textIdx < 0 || textIdx == 0 {
+		t.Fatalf("text 应独立成块且下标不同于 thinking，got kinds=%+v", kinds)
 	}
-	// signature_delta 在 content_block_stop 之前。
-	deltaIdx := strings.Index(body, `"type":"signature_delta"`)
-	stopIdx := strings.Index(body, "event: content_block_stop")
-	if deltaIdx < 0 {
-		t.Fatalf("thinking 块应下发 signature_delta，got %s", body)
+}
+
+// TestStreamThinkingSignatureCoversFullText 断言流式签名按**整块全文**生成：
+// 推理分多片下发时，签名必须是 hash(全文)，不能只哈希首个分片（否则同一份推理因分片
+// 边界不同得到不同签名，与「同一份推理内容 → 同一签名」的声明不符）。
+func TestStreamThinkingSignatureCoversFullText(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(
+			"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"reasoning_content\":\"R1\"}}]}\n\n" +
+				"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"R2\"}}]}\n\n" +
+				"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3}}\n\n" +
+				"data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	h := build(t, upstream.URL)
+	h.chans.mrt.Model.Protocols = channelprotocol.Protocols{channelprotocol.ProtocolOpenAIChat: {}}
+
+	rec := postWithHeaders(t, h.gw, "/v1/messages",
+		`{"model":"gpt-4","stream":true,"max_tokens":100,"messages":[{"role":"user","content":"ping"}]}`,
+		map[string]string{"x-api-key": "sk-gw-t"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
 	}
-	if stopIdx >= 0 && deltaIdx > stopIdx {
-		t.Fatalf("signature_delta 应在 content_block_stop 之前，got %s", body)
+	var thinkingText, sig string
+	for _, ev := range decodeAnthropicSSE(t, rec.Body.String()) {
+		switch ev.DeltaKind {
+		case protocolconv.DeltaThinking:
+			thinkingText += ev.Text
+		case protocolconv.DeltaSignature:
+			sig = ev.Text
+		}
 	}
-	// text 与 thinking 独立下标：上游共用 Index:0，下游必须拆成两个块（index 0 = thinking，
-	// index 1 = text），否则客户端历史里没有合法 thinking 块。
-	if !strings.Contains(body, `"index":0`) || !strings.Contains(body, `"index":1`) {
-		t.Fatalf("text/thinking 应独立成块并分配不同下标，got %s", body)
+	if thinkingText != "R1R2" {
+		t.Fatalf("下游应拼接完整 thinking 文本 R1R2，got %q", thinkingText)
 	}
-	// 首块必须是 thinking（index 0），text 不得与 thinking 同块。
-	if idx0 := strings.Index(body, `"index":0`); idx0 < 0 || !strings.Contains(body[idx0:], "thinking") {
-		t.Fatalf("index 0 块应为 thinking，got %s", body)
+	if sig != protocolconv.OpaqueThinkingSignature("R1R2") {
+		t.Fatalf("签名应覆盖整块全文 R1R2，got %q（首片签名=%q）", sig, protocolconv.OpaqueThinkingSignature("R1"))
+	}
+}
+
+// TestAnthropicThinkingMultiturnSyntheticFixture 合成夹具 e2e（无需真实上游 key）：
+// 用一轮「thinking 模型 SSE（含 reasoning_content + tool_call）」回放，再发第二轮请求
+// （历史里 assistant 只带 tool_use、user 带 tool_result，模拟客户端历史缺 thinking 块），
+// 断言第二轮上游请求体带 reasoning_content（400 消失）。
+// 同时校验第一轮下游 SSE 的块形状（串行、类型归属、signature 在 stop 前）。
+func TestAnthropicThinkingMultiturnSyntheticFixture(t *testing.T) {
+	const sessionID = "sess-thinking-multiturn"
+	var turn int
+	var turn2Body []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		turn++
+		body, _ := io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if turn == 1 {
+			// 第一轮：先 reasoning_content，再 tool_call，最后 finish_reason=tool_calls。
+			_, _ = w.Write([]byte(
+				"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"reasoning_content\":\"R1R2\"}}]}\n\n" +
+					"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"toolu_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"Beijing\\\"}\"}}]}}]}\n\n" +
+					"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":7}}\n\n" +
+					"data: [DONE]\n\n"))
+			return
+		}
+		// 第二轮：普通回答。
+		turn2Body = body
+		_, _ = w.Write([]byte(
+			"data: {\"id\":\"c2\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"晴 26C\"}}]}\n\n" +
+				"data: {\"id\":\"c2\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":9}}\n\n" +
+				"data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	h := build(t, upstream.URL)
+	h.chans.mrt.Model.Protocols = channelprotocol.Protocols{channelprotocol.ProtocolOpenAIChat: {}}
+	hdr := map[string]string{"x-api-key": "sk-gw-t", "x-session-id": sessionID}
+
+	// 第一轮：anthropic 入站，thinking 模式 + tools。
+	rec1 := postWithHeaders(t, h.gw, "/v1/messages",
+		`{"model":"gpt-4","stream":true,"max_tokens":100,"thinking":{"type":"enabled"},`+
+			`"tools":[{"name":"get_weather","input_schema":{"type":"object"}}],`+
+			`"messages":[{"role":"user","content":"北京今天天气?"}]}`, hdr)
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("turn1 want 200, got %d: %s", rec1.Code, rec1.Body.String())
+	}
+	// 第一轮下游块形状：thinking 块独立、块串行、signature 在 stop 前。
+	evs1 := decodeAnthropicSSE(t, rec1.Body.String())
+	kinds1 := assertAnthropicBlockSerial(t, evs1)
+	if kinds1[0] != protocolconv.BlockThinking {
+		t.Fatalf("turn1 index 0 应为 thinking，got %+v（事件序: %s）", kinds1, dumpEventTypes(evs1))
+	}
+
+	// 第二轮：历史里 assistant 只带 tool_use（客户端未回传 thinking），user 带 tool_result。
+	rec2 := postWithHeaders(t, h.gw, "/v1/messages",
+		`{"model":"gpt-4","stream":true,"max_tokens":100,"thinking":{"type":"enabled"},`+
+			`"tools":[{"name":"get_weather","input_schema":{"type":"object"}}],`+
+			`"messages":[`+
+			`{"role":"user","content":"北京今天天气?"},`+
+			`{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"get_weather","input":{"city":"Beijing"}}]},`+
+			`{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"晴 26C"}]}]}`, hdr)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("turn2 want 200, got %d: %s", rec2.Code, rec2.Body.String())
+	}
+	// 核心断言：第二轮上游请求体带 reasoning_content（网关从第一轮缓存按 tool_call_id 回填），
+	// 上游不再因缺 reasoning_content 返回 400。
+	if !strings.Contains(string(turn2Body), `"reasoning_content":"R1R2"`) {
+		t.Fatalf("第二轮上游请求体应回填 reasoning_content，got %s", turn2Body)
+	}
+	if !strings.Contains(string(turn2Body), `"tool_call_id":"toolu_1"`) {
+		t.Fatalf("第二轮上游请求体应保留 tool_result→tool 消息，got %s", turn2Body)
 	}
 }
 

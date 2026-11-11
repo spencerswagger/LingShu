@@ -82,6 +82,18 @@ func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Respon
 	openBlocks := map[int]bool{}
 	blockIndexMap := map[string]int{}
 	nextBlockIndex := 0
+	// currentBlock 是当前正在下发的块下标。Anthropic 真实流是**块串行**的
+	// （start → delta* → stop 之后才起下一块）；按「当前块」归属 delta 的客户端若遇到
+	// 块未关闭就切到另一块，会把内容串到一起。故切块前必须先关旧块。
+	currentBlock := -1
+	// blockThinkingText 累积每个 thinking 块的**整块全文**：签名按全文生成，
+	// 只哈希首个分片会让同一份推理因分片边界不同而得到不同签名（与 signature.go 的
+	// 「同一份推理内容 → 同一签名」不符）。
+	blockThinkingText := map[int]*bytes.Buffer{}
+	// upstreamSignatureEmitted 记录「上游已显式下发 signature_delta」的块，避免重复生成签名。
+	// 当前 converted 路径下游为 anthropic 时上游必非 anthropic（否则不是跨协议转换），
+	// 故该分支实际不可达；保留作防御，若未来泵被复用于 anthropic→anthropic 仍正确。
+	upstreamSignatureEmitted := map[int]bool{}
 	blockClass := func(deltaKind string) string {
 		switch deltaKind {
 		case protocolconv.DeltaThinking, protocolconv.DeltaSignature:
@@ -94,12 +106,16 @@ func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Respon
 			return "text"
 		}
 	}
-	// blockClassForKind 按 content_block_start 的 BlockKind 归类（tool_use → tool，其余 → text）。
-	blockClassForKind := func(kind string) string {
-		if kind == protocolconv.BlockToolUse {
+	// blockClassOfKind 按 content_block_start 的 BlockKind 归类。
+	blockClassOfKind := func(kind string) string {
+		switch kind {
+		case protocolconv.BlockToolUse:
 			return "tool"
+		case protocolconv.BlockThinking, protocolconv.BlockRedactedThinking:
+			return "thinking"
+		default:
+			return "text"
 		}
-		return "text"
 	}
 	blockIndex := func(up int, class string) int {
 		if !anthropicDown {
@@ -114,12 +130,6 @@ func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Respon
 		nextBlockIndex++
 		return d
 	}
-	// 已开启的 thinking 块的签名（在 content_block_stop 前以 signature_delta 下发，
-	// Anthropic 严格要求签名非空；无签名会被严格客户端丢弃 → 下一轮不回传 → 上游 400）。
-	blockSignatures := map[int]string{}
-	// upstreamSignatureEmitted 记录「上游已显式下发 signature_delta」的块：此类块在
-	// content_block_stop 前不再重复生成签名（上游签名已透传）。
-	upstreamSignatureEmitted := map[int]bool{}
 
 	// 待下发的终止事件：合并 stop_reason 与 usage，保证每次流仅下发一个终止帧
 	// （openai include_usage 会把 finish_reason 与 usage 拆到两帧，需合并）。
@@ -171,10 +181,35 @@ func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Respon
 		return writeFrames(frames)
 	}
 
-	// closeOpenBlocks 为下游 anthropic 补出所有已开启块的 content_block_stop（升序、幂等）。
-	// thinking 块在 content_block_stop 之前补发 signature_delta（Anthropic 严格要求签名非空）。
+	// closeBlock 关闭单个已开启块：thinking 块先补 signature_delta（按整块全文生成，上游未给时），
+	// 再 content_block_stop。块串行语义要求「停旧块」与新块 start 之间不交错。
+	closeBlock := func(i int) error {
+		if !openBlocks[i] {
+			return nil
+		}
+		if !upstreamSignatureEmitted[i] {
+			if buf := blockThinkingText[i]; buf != nil {
+				sig := protocolconv.OpaqueThinkingSignature(buf.String())
+				if err := emit([]channelEvent{{Type: protocolconv.EventContentBlockDelta, Index: i, DeltaKind: protocolconv.DeltaSignature, Text: sig}}); err != nil {
+					return err
+				}
+			}
+		}
+		if err := emit([]channelEvent{{Type: protocolconv.EventContentBlockStop, Index: i}}); err != nil {
+			return err
+		}
+		delete(openBlocks, i)
+		delete(blockThinkingText, i)
+		delete(upstreamSignatureEmitted, i)
+		if currentBlock == i {
+			currentBlock = -1
+		}
+		return nil
+	}
+
+	// closeOpenBlocks 关闭全部仍开启的块（升序、幂等）：用于整条流收尾。
 	closeOpenBlocks := func() error {
-		if !anthropicDown || len(openBlocks) == 0 {
+		if !anthropicDown {
 			return nil
 		}
 		idxs := make([]int, 0, len(openBlocks))
@@ -183,19 +218,44 @@ func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Respon
 		}
 		sort.Ints(idxs)
 		for _, i := range idxs {
-			if sig := blockSignatures[i]; sig != "" && !upstreamSignatureEmitted[i] {
-				if err := emit([]channelEvent{{Type: protocolconv.EventContentBlockDelta, Index: i, DeltaKind: protocolconv.DeltaSignature, Text: sig}}); err != nil {
-					return err
-				}
-			}
-			if err := emit([]channelEvent{{Type: protocolconv.EventContentBlockStop, Index: i}}); err != nil {
+			if err := closeBlock(i); err != nil {
 				return err
 			}
 		}
-		openBlocks = map[int]bool{}
-		blockSignatures = map[int]string{}
-		upstreamSignatureEmitted = map[int]bool{}
 		return nil
+	}
+
+	// openBlock 开启一个下游块：先停当前块（块串行），再发 content_block_start。
+	// startEV 提供块类型与上游携带的元数据（tool id/name、thinking 文本/签名、redacted data），
+	// 使流式下 thinking/redacted_thinking 也能原样透传。
+	openBlock := func(idx int, kind string, startEV channelEvent) error {
+		if openBlocks[idx] && currentBlock == idx {
+			return nil // 已开且是当前块：不重复发 start
+		}
+		if currentBlock >= 0 && currentBlock != idx {
+			if err := closeBlock(currentBlock); err != nil {
+				return err
+			}
+		}
+		openBlocks[idx] = true
+		currentBlock = idx
+		startEV.Type = protocolconv.EventContentBlockStart
+		startEV.Index = idx
+		startEV.BlockKind = kind
+		if kind == protocolconv.BlockThinking {
+			buf := blockThinkingText[idx]
+			if buf == nil {
+				buf = &bytes.Buffer{}
+				blockThinkingText[idx] = buf
+			}
+			if startEV.Text != "" {
+				buf.WriteString(startEV.Text)
+			}
+			if startEV.Signature != "" {
+				upstreamSignatureEmitted[idx] = true
+			}
+		}
+		return emit([]channelEvent{startEV})
 	}
 
 	// flushTerminal 下发（若有）缓冲的终止事件；下游 anthropic 先关闭所有开启块再发 message_delta。
@@ -266,46 +326,51 @@ func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Respon
 		case protocolconv.EventMessageStart:
 			return emit([]channelEvent{ev})
 		case protocolconv.EventContentBlockStart:
-			// tool_use 的 content_block_start 由上游显式发出（BlockKind=tool_use），
-			// 无 DeltaKind；按 BlockKind 归类，与后续 tool_json delta 落到同一桶。
-			idx := blockIndex(ev.Index, blockClassForKind(ev.BlockKind))
-			openBlocks[idx] = true
-			ev.Index = idx
-			return emit([]channelEvent{ev})
+			// 上游显式发出的 content_block_start（典型为 tool_use；anthropic 上游还会有
+			// thinking / redacted_thinking，携带 thinking 文本/签名、redacted data —— 一并透传）。
+			idx := blockIndex(ev.Index, blockClassOfKind(ev.BlockKind))
+			return openBlock(idx, ev.BlockKind, channelEvent{
+				ToolUseID:    ev.ToolUseID,
+				ToolName:     ev.ToolName,
+				Text:         ev.Text,
+				Signature:    ev.Signature,
+				RedactedData: ev.RedactedData,
+			})
 		case protocolconv.EventContentBlockDelta:
 			idx := blockIndex(ev.Index, blockClass(ev.DeltaKind))
-			if !openBlocks[idx] {
+			if !openBlocks[idx] || currentBlock != idx {
 				// 下游 anthropic 的 content_block_start 必须与后续 delta 的块类型一致：
 				// 此前只把 DeltaToolJSON 映射为 tool_use，其余（含 DeltaThinking）一律 text，
 				// 导致客户端历史里没有合法 thinking 块（首块被标成 text，块内却是 thinking_delta，
 				// 协议上非法组合），下一轮不带 thinking → 上游 400。此处按 delta 类型映射块类型：
 				// thinking 增量 → thinking 块；tool_json → tool_use；其余 → text。
 				kind := protocolconv.BlockText
-				switch ev.DeltaKind {
-				case protocolconv.DeltaThinking:
+				switch blockClass(ev.DeltaKind) {
+				case "thinking":
 					kind = protocolconv.BlockThinking
-				case protocolconv.DeltaToolJSON:
+				case "tool":
 					kind = protocolconv.BlockToolUse
 				}
-				openBlocks[idx] = true
-				startEv := channelEvent{Type: protocolconv.EventContentBlockStart, Index: idx, BlockKind: kind}
+				startEV := channelEvent{}
 				if kind == protocolconv.BlockToolUse {
-					startEv.ToolUseID = ev.ToolUseID
-					startEv.ToolName = ev.ToolName
+					startEV.ToolUseID = ev.ToolUseID
+					startEV.ToolName = ev.ToolName
 				}
-				// thinking 块：预生成签名（在 content_block_stop 前以 signature_delta 下发）。
-				if kind == protocolconv.BlockThinking {
-					blockSignatures[idx] = protocolconv.OpaqueThinkingSignature(ev.Text)
-				}
-				if err := emit([]channelEvent{startEv}); err != nil {
+				if err := openBlock(idx, kind, startEV); err != nil {
 					return err
 				}
 			}
-			ev.Index = idx
-			// 上游显式下发的 signature_delta：透传并标记（closeOpenBlocks 不再重复生成）。
+			// thinking 增量：累积整块全文（签名按全文生成）。
+			if ev.DeltaKind == protocolconv.DeltaThinking {
+				if buf := blockThinkingText[idx]; buf != nil {
+					buf.WriteString(ev.Text)
+				}
+			}
+			// 上游显式下发的 signature_delta：标记（关闭时不再重复生成）。
 			if ev.DeltaKind == protocolconv.DeltaSignature {
 				upstreamSignatureEmitted[idx] = true
 			}
+			ev.Index = idx
 			return emit([]channelEvent{ev})
 		default:
 			return emit([]channelEvent{ev})
