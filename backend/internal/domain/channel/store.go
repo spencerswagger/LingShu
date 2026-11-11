@@ -121,27 +121,19 @@ type ChannelModelEvent struct {
 // ProbeLog 对应 probe_logs 表一行，记录一次健康探测（结果+开销，供后续统计）。
 // ChannelKeyID 对应 probe_logs.channel_key_id（密钥维度；level=key 时为密钥默认探测目标）。
 type ProbeLog struct {
-	ID           int64  `json:"ID,string"`
-	ChannelKeyID int64  `json:"ChannelKeyID,string"`
-	ModelID      string `json:"ModelID"` // 探测目标模型；空=渠道级探测
-	Level        string `json:"Level"`   // key=密钥级探测；model=模型级探测
-	Target       string `json:"Target"`
-	OK           bool   `json:"OK"`
-	Error        string `json:"Error,omitempty"`
-	// UpstreamStatus 本次探测拿到的上游 HTTP 状态码（0=没打到上游：连接失败/超时/无可用模型或密钥）。
-	UpstreamStatus int `json:"UpstreamStatus,omitempty"`
-	// ErrorBody 上游错误响应体**原文**（运营可见）：逐字节保真，仅遮蔽本次实际使用的凭据；
-	// 超 probeErrBodyMaxBytes 时截断并在同一字段标注。空=上游没返回错误体。
-	ErrorBody string `json:"ErrorBody,omitempty"`
-	// ErrorBodyTruncated 仅**列表**返回时为 true：受列表体积预算限制，ErrorBody 只是预览，
-	// 完整原文用 GET /api/v1/admin/channels/{id}/probe-logs/{logID} 取（落库列始终是完整值）。
-	ErrorBodyTruncated bool      `json:"ErrorBodyTruncated,omitempty"`
-	InputTokens        int       `json:"InputTokens"`
-	OutputTokens       int       `json:"OutputTokens"`
-	CachedTokens       int       `json:"CachedTokens"`
-	TotalTokens        int       `json:"TotalTokens"`
-	DurationMS         int       `json:"DurationMS"`
-	CreatedAt          time.Time `json:"CreatedAt"`
+	ID           int64     `json:"ID,string"`
+	ChannelKeyID int64     `json:"ChannelKeyID,string"`
+	ModelID      string    `json:"ModelID"` // 探测目标模型；空=渠道级探测
+	Level        string    `json:"Level"`   // key=密钥级探测；model=模型级探测
+	Target       string    `json:"Target"`
+	OK           bool      `json:"OK"`
+	Error        string    `json:"Error,omitempty"`
+	InputTokens  int       `json:"InputTokens"`
+	OutputTokens int       `json:"OutputTokens"`
+	CachedTokens int       `json:"CachedTokens"`
+	TotalTokens  int       `json:"TotalTokens"`
+	DurationMS   int       `json:"DurationMS"`
+	CreatedAt    time.Time `json:"CreatedAt"`
 }
 
 // channelCols 列出 channels 表查询时使用的全部列，保持各查询一致。

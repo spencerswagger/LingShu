@@ -153,11 +153,7 @@ type KeyRuntime struct {
 	Limiter         *Limiter // 密钥级限流窗口（渠道 rate_limit 配置）
 	// Reliability 密钥级可靠性窗口由 Machine 滑动窗口承载（窗口语义与阈值同源）。
 	lastProbe time.Time
-	// lastProbeStatus/lastProbeBody 最近一次探测拿到的上游状态码与错误体原文：
-	// 手动探活（ProbeKeyNow）要把「上游到底回了什么」原样回给运营，而 LastErr 只放短文案。
-	lastProbeStatus int
-	lastProbeBody   string
-	CreatedAt       time.Time
+	CreatedAt time.Time
 }
 
 // KeyRuntimeView 是密钥运行时输出视图：凭据仅暴露尾号，绝不回传明文或密文。
@@ -1245,12 +1241,10 @@ func (m *Manager) ProbeKeyNow(keyID int64) (ProbeOutcome, error) {
 	}
 	lastErr := kr.Key.LastErr
 	return ProbeOutcome{
-		OK:             lastErr == "",
-		Error:          lastErr,
-		DurationMS:     dur,
-		State:          string(kr.Machine.State()),
-		UpstreamStatus: kr.lastProbeStatus,
-		ErrorBody:      kr.lastProbeBody,
+		OK:         lastErr == "",
+		Error:      lastErr,
+		DurationMS: dur,
+		State:      string(kr.Machine.State()),
 	}, nil
 }
 
@@ -1290,14 +1284,14 @@ func (m *Manager) ProbeModelNow(channelID, modelRowID int64) (ProbeOutcome, erro
 
 	ctx := context.Background()
 	start := m.now()
-	ex := m.doProbeAuth(ctx, target, authHeader, authValue, modelID, policy, credential, timeout)
+	fb, usage, errMsg := m.doProbeAuth(ctx, target, authHeader, authValue, modelID, policy, credential, timeout)
 	dur := m.now().Sub(start).Milliseconds()
 
-	m.feedModelAndTransit(channelID, modelRowID, ProbeFeedback(ex.FB))
-	m.recordProbe(ctx, keyID, modelID, "model", target, ex.FB.IsSuccess, ex.ErrMsg, ex.Usage, dur, ex.Status, ex.ErrorBody)
+	m.feedModelAndTransit(channelID, modelRowID, ProbeFeedback(fb))
+	m.recordProbe(ctx, keyID, modelID, "model", target, fb.IsSuccess, errMsg, usage, dur)
 
 	// 手动探测成功且模型仍排空（连续成功阈值未满）时立即恢复：管理员显式动作视为已确认恢复。
-	if ex.ErrMsg == "" {
+	if errMsg == "" {
 		if mr2, ok := m.GetModelRuntime(channelID, modelRowID); ok && mr2.Machine.State() == StateDrain {
 			m.ForceModelNormal(channelID, modelRowID)
 		}
@@ -1308,13 +1302,11 @@ func (m *Manager) ProbeModelNow(channelID, modelRowID int64) (ProbeOutcome, erro
 		state = string(mr2.Machine.State())
 	}
 	return ProbeOutcome{
-		OK:             ex.ErrMsg == "",
-		Error:          ex.ErrMsg,
-		DurationMS:     dur,
-		ModelID:        modelID,
-		State:          state,
-		UpstreamStatus: ex.Status,
-		ErrorBody:      ex.ErrorBody,
+		OK:         errMsg == "",
+		Error:      errMsg,
+		DurationMS: dur,
+		ModelID:    modelID,
+		State:      state,
 	}, nil
 }
 

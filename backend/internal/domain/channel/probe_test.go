@@ -81,8 +81,7 @@ func TestDoProbe_AppliesHeaderOverride(t *testing.T) {
 			"Cookie":          "session=evil", // 强制黑名单：任何模式下都不得注入
 		},
 	}
-	ex := m.doProbeAuth(context.Background(), srv.URL+"/chat/completions", "Authorization", "Bearer key", "m1", policy, "key", 2*time.Second)
-	fb, errMsg := ex.FB, ex.ErrMsg
+	fb, _, errMsg := m.doProbeAuth(context.Background(), srv.URL+"/chat/completions", "Authorization", "Bearer key", "m1", policy, "key", 2*time.Second)
 	if errMsg != "" || !fb.IsSuccess {
 		t.Fatalf("probe failed: err=%q fb=%+v", errMsg, fb)
 	}
@@ -127,7 +126,7 @@ func TestProbeModelNow_AppliesHeaderOverride(t *testing.T) {
 	}
 
 	mock.ExpectExec(regexp.QuoteMeta(insertProbeLogSQL)).
-		WithArgs(sqlmock.AnyArg(), int64(11), "m1", "model", srv.URL+"/chat/completions", true, "", 200, "", 0, 0, 0, 1, sqlmock.AnyArg()).
+		WithArgs(sqlmock.AnyArg(), int64(11), "m1", "model", srv.URL+"/chat/completions", true, "", 0, 0, 0, 1, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	out, err := mgr.ProbeModelNow(1, 21)
@@ -167,7 +166,7 @@ func TestKeyProbeOnce_AppliesHeaderOverride(t *testing.T) {
 	}
 
 	mock.ExpectExec(regexp.QuoteMeta(insertProbeLogSQL)).
-		WithArgs(sqlmock.AnyArg(), int64(11), "m-default", "model", srv.URL+"/chat/completions", true, "", 200, "", 3, 4, 0, 7, sqlmock.AnyArg()).
+		WithArgs(sqlmock.AnyArg(), int64(11), "m-default", "model", srv.URL+"/chat/completions", true, "", 3, 4, 0, 7, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	mgr.keyProbeOnce(context.Background(), 11)
@@ -195,8 +194,7 @@ func TestDoProbe_MarksProbeFeedback(t *testing.T) {
 	defer srv.Close()
 
 	m := newProbeTestManager()
-	ex := m.doProbeAuth(context.Background(), srv.URL+"/chat/completions", "Authorization", "Bearer key", "m1", channelprotocol.HeaderPolicy{}, "key", 2*time.Second)
-	fb, usage, errMsg := ex.FB, ex.Usage, ex.ErrMsg
+	fb, usage, errMsg := m.doProbeAuth(context.Background(), srv.URL+"/chat/completions", "Authorization", "Bearer key", "m1", channelprotocol.HeaderPolicy{}, "key", 2*time.Second)
 	if errMsg != "" {
 		t.Fatalf("unexpected error: %s", errMsg)
 	}
@@ -219,8 +217,7 @@ func TestDoProbe_MarksTimeout(t *testing.T) {
 	defer srv.Close()
 
 	m := newProbeTestManager()
-	ex := m.doProbeAuth(context.Background(), srv.URL+"/chat/completions", "Authorization", "Bearer key", "m1", channelprotocol.HeaderPolicy{}, "key", 30*time.Millisecond)
-	fb, errMsg := ex.FB, ex.ErrMsg
+	fb, _, errMsg := m.doProbeAuth(context.Background(), srv.URL+"/chat/completions", "Authorization", "Bearer key", "m1", channelprotocol.HeaderPolicy{}, "key", 30*time.Millisecond)
 	if errMsg == "" {
 		t.Fatalf("expected timeout error, got nil, fb=%+v", fb)
 	}
@@ -268,8 +265,7 @@ func TestDoProbe_UsageThreeSegments(t *testing.T) {
 		defer srv.Close()
 
 		m := newProbeTestManager()
-		ex := m.doProbeAuth(context.Background(), srv.URL+"/chat/completions", "Authorization", "Bearer key", "m1", channelprotocol.HeaderPolicy{}, "key", 2*time.Second)
-		usage, errMsg := ex.Usage, ex.ErrMsg
+		_, usage, errMsg := m.doProbeAuth(context.Background(), srv.URL+"/chat/completions", "Authorization", "Bearer key", "m1", channelprotocol.HeaderPolicy{}, "key", 2*time.Second)
 		if errMsg != "" {
 			t.Fatalf("unexpected error: %s", errMsg)
 		}
@@ -286,8 +282,7 @@ func TestDoProbe_UsageThreeSegments(t *testing.T) {
 		defer srv.Close()
 
 		m := newProbeTestManager()
-		ex := m.doProbeAuth(context.Background(), srv.URL+"/chat/completions", "Authorization", "Bearer key", "m1", channelprotocol.HeaderPolicy{}, "key", 2*time.Second)
-		usage, errMsg := ex.Usage, ex.ErrMsg
+		_, usage, errMsg := m.doProbeAuth(context.Background(), srv.URL+"/chat/completions", "Authorization", "Bearer key", "m1", channelprotocol.HeaderPolicy{}, "key", 2*time.Second)
 		if errMsg != "" {
 			t.Fatalf("unexpected error: %s", errMsg)
 		}
@@ -303,8 +298,7 @@ func TestDoProbe_UsageThreeSegments(t *testing.T) {
 		defer srv.Close()
 
 		m := newProbeTestManager()
-		ex := m.doProbeAuth(context.Background(), srv.URL+"/chat/completions", "Authorization", "Bearer key", "m1", channelprotocol.HeaderPolicy{}, "key", 2*time.Second)
-		usage := ex.Usage
+		_, usage, _ := m.doProbeAuth(context.Background(), srv.URL+"/chat/completions", "Authorization", "Bearer key", "m1", channelprotocol.HeaderPolicy{}, "key", 2*time.Second)
 		// 上游未给 total_tokens → 按三段求和兜底 = 10 + 0 + 5 = 15。
 		if usage.InputTokens != 10 || usage.TotalTokens != 15 {
 			t.Fatalf("total 兜底错误: %+v", usage)
@@ -313,8 +307,8 @@ func TestDoProbe_UsageThreeSegments(t *testing.T) {
 }
 
 // insertProbeLogSQL 是 InsertProbeLog 的落库 SQL（密钥维度 channel_key_id，与 0001_init.sql 对齐）。
-const insertProbeLogSQL = `INSERT INTO probe_logs(id, channel_key_id, model_id, level, target, ok, error, upstream_status, error_body, input_tokens, output_tokens, cached_tokens, total_tokens, duration_ms)
-		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`
+const insertProbeLogSQL = `INSERT INTO probe_logs(id, channel_key_id, model_id, level, target, ok, error, input_tokens, output_tokens, cached_tokens, total_tokens, duration_ms)
+		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`
 
 // newKeyProbeTestManager 装载「1 渠道 + 若干内部模型 + cmStore」，返回 Manager 与 sqlmock。
 // keyStore 故意留空（nil）：探测测试不应触碰密钥持久化；探测记录经 cmStore.InsertProbeLog 落 probe_logs。
@@ -393,10 +387,10 @@ func TestKeyProbeOnce_DualKeys_RecordsPerKey(t *testing.T) {
 
 	target := srv.URL + "/chat/completions"
 	mock.ExpectExec(regexp.QuoteMeta(insertProbeLogSQL)).
-		WithArgs(sqlmock.AnyArg(), int64(11), "m-default", "model", target, true, "", 200, "", 3, 4, 0, 7, sqlmock.AnyArg()).
+		WithArgs(sqlmock.AnyArg(), int64(11), "m-default", "model", target, true, "", 3, 4, 0, 7, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectExec(regexp.QuoteMeta(insertProbeLogSQL)).
-		WithArgs(sqlmock.AnyArg(), int64(12), "m-default", "model", target, false, "probe http status: 500", 500, "", 0, 0, 0, 0, sqlmock.AnyArg()).
+		WithArgs(sqlmock.AnyArg(), int64(12), "m-default", "model", target, false, "probe http status: 500", 0, 0, 0, 0, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(2, 1))
 
 	mgr.keyProbeOnce(context.Background(), 11)
@@ -421,7 +415,7 @@ func TestKeyProbeOnce_EmptyCredentialFailsOnlyThatKey(t *testing.T) {
 	addKeyRuntime(t, mgr, 12, "", StateNormal)
 
 	mock.ExpectExec(regexp.QuoteMeta(insertProbeLogSQL)).
-		WithArgs(sqlmock.AnyArg(), int64(12), "", "key", "", false, "密钥凭据为空或解密失败，无法探测", nil, "", 0, 0, 0, 0, sqlmock.AnyArg()).
+		WithArgs(sqlmock.AnyArg(), int64(12), "", "key", "", false, "密钥凭据为空或解密失败，无法探测", 0, 0, 0, 0, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	mgr.keyProbeOnce(context.Background(), 12)
@@ -457,7 +451,7 @@ func TestKeyProbeOnce_AuthFailureDisablesOnlyThatKey(t *testing.T) {
 	addKeyRuntime(t, mgr, 12, testKeyBCred, StateNormal)
 
 	mock.ExpectExec(regexp.QuoteMeta(insertProbeLogSQL)).
-		WithArgs(sqlmock.AnyArg(), int64(11), "m1", "model", srv.URL+"/chat/completions", false, sqlmock.AnyArg(), 401, "", 0, 0, 0, 0, sqlmock.AnyArg()).
+		WithArgs(sqlmock.AnyArg(), int64(11), "m1", "model", srv.URL+"/chat/completions", false, sqlmock.AnyArg(), 0, 0, 0, 0, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	mgr.keyProbeOnce(context.Background(), 11)
@@ -492,7 +486,7 @@ func TestKeyProbeOnce_AllModelsDisabledFailsNoFallback(t *testing.T) {
 	addKeyRuntime(t, mgr, 11, testKeyACred, StateNormal)
 
 	mock.ExpectExec(regexp.QuoteMeta(insertProbeLogSQL)).
-		WithArgs(sqlmock.AnyArg(), int64(11), "", "key", "", false, "无可用探测模型（全部禁用或无模型）", nil, "", 0, 0, 0, 0, sqlmock.AnyArg()).
+		WithArgs(sqlmock.AnyArg(), int64(11), "", "key", "", false, "无可用探测模型（全部禁用或无模型）", 0, 0, 0, 0, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	mgr.keyProbeOnce(context.Background(), 11)
@@ -529,7 +523,7 @@ func TestKeyProbeOnce_ProbeModelTakesPriority(t *testing.T) {
 	addKeyRuntime(t, mgr, 11, testKeyACred, StateNormal)
 
 	mock.ExpectExec(regexp.QuoteMeta(insertProbeLogSQL)).
-		WithArgs(sqlmock.AnyArg(), int64(11), "explicit-m", "key", srv.URL+"/chat/completions", true, "", 200, "", 0, 0, 0, 1, sqlmock.AnyArg()).
+		WithArgs(sqlmock.AnyArg(), int64(11), "explicit-m", "key", srv.URL+"/chat/completions", true, "", 0, 0, 0, 1, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	mgr.keyProbeOnce(context.Background(), 11)
@@ -663,7 +657,7 @@ func TestKeyProbeOnceUnlessDisabled_DisabledKeySkipsProbe(t *testing.T) {
 
 	// 手动恢复 NORMAL：守卫放行，正常探测并落 probe_logs。
 	mock.ExpectExec(regexp.QuoteMeta(insertProbeLogSQL)).
-		WithArgs(sqlmock.AnyArg(), int64(11), "m1", "model", srv.URL+"/chat/completions", true, "", 200, "", 0, 0, 0, 1, sqlmock.AnyArg()).
+		WithArgs(sqlmock.AnyArg(), int64(11), "m1", "model", srv.URL+"/chat/completions", true, "", 0, 0, 0, 1, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	if err := mgr.ManualSetKeyState(11, "recover"); err != nil {
@@ -703,7 +697,7 @@ func TestProbeModelNow_SuccessKeepsNormal(t *testing.T) {
 
 	target := srv.URL + "/chat/completions"
 	mock.ExpectExec(regexp.QuoteMeta(insertProbeLogSQL)).
-		WithArgs(sqlmock.AnyArg(), int64(11), "m1", "model", target, true, "", 200, "", 0, 0, 0, 1, sqlmock.AnyArg()).
+		WithArgs(sqlmock.AnyArg(), int64(11), "m1", "model", target, true, "", 0, 0, 0, 1, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	out, err := mgr.ProbeModelNow(1, 21)
@@ -738,7 +732,7 @@ func TestProbeModelNow_FailureTransitionsDrain(t *testing.T) {
 
 	expectModelTransition(mock, 1, "m1", StateNormal, StateDrain, reasonProbeFail)
 	mock.ExpectExec(regexp.QuoteMeta(insertProbeLogSQL)).
-		WithArgs(sqlmock.AnyArg(), int64(11), "m1", "model", srv.URL+"/chat/completions", false, "probe http status: 500", 500, "", 0, 0, 0, 0, sqlmock.AnyArg()).
+		WithArgs(sqlmock.AnyArg(), int64(11), "m1", "model", srv.URL+"/chat/completions", false, "probe http status: 500", 0, 0, 0, 0, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(2, 1))
 
 	out, err := mgr.ProbeModelNow(1, 21)
@@ -772,7 +766,7 @@ func TestProbeModelNow_AuthFailureTransitionsDisabled(t *testing.T) {
 
 	expectModelTransition(mock, 1, "m1", StateNormal, StateDisabled, reasonAuthFailure)
 	mock.ExpectExec(regexp.QuoteMeta(insertProbeLogSQL)).
-		WithArgs(sqlmock.AnyArg(), int64(11), "m1", "model", srv.URL+"/chat/completions", false, sqlmock.AnyArg(), 401, "", 0, 0, 0, 0, sqlmock.AnyArg()).
+		WithArgs(sqlmock.AnyArg(), int64(11), "m1", "model", srv.URL+"/chat/completions", false, sqlmock.AnyArg(), 0, 0, 0, 0, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(3, 1))
 
 	out, err := mgr.ProbeModelNow(1, 21)
@@ -841,7 +835,7 @@ func TestProbeKeyNow_FailureTransitionsDrain(t *testing.T) {
 	addKeyRuntime(t, mgr, 11, testKeyACred, StateNormal)
 
 	mock.ExpectExec(regexp.QuoteMeta(insertProbeLogSQL)).
-		WithArgs(sqlmock.AnyArg(), int64(11), "m1", "model", srv.URL+"/chat/completions", false, "probe http status: 500", 500, "", 0, 0, 0, 0, sqlmock.AnyArg()).
+		WithArgs(sqlmock.AnyArg(), int64(11), "m1", "model", srv.URL+"/chat/completions", false, "probe http status: 500", 0, 0, 0, 0, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	out, err := mgr.ProbeKeyNow(11)
@@ -874,7 +868,7 @@ func TestProbeKeyNow_DrainRecoversToNormal(t *testing.T) {
 
 	target := srv.URL + "/chat/completions"
 	mock.ExpectExec(regexp.QuoteMeta(insertProbeLogSQL)).
-		WithArgs(sqlmock.AnyArg(), int64(11), "m1", "model", target, true, "", 200, "", 0, 0, 0, 1, sqlmock.AnyArg()).
+		WithArgs(sqlmock.AnyArg(), int64(11), "m1", "model", target, true, "", 0, 0, 0, 1, sqlmock.AnyArg()).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	out, err := mgr.ProbeKeyNow(11)

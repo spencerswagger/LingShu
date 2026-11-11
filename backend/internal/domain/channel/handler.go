@@ -483,26 +483,6 @@ func (h *Handler) HandleListProbeLogs(w http.ResponseWriter, r *http.Request) {
 	resp.OK(w, r, logs)
 }
 
-// HandleGetProbeLog GET /api/v1/admin/channels/{id}/probe-logs/{logID}
-// 列表只返回 error_body 的 4KB 预览（受响应体积预算限制），完整原文由本端点提供。
-func (h *Handler) HandleGetProbeLog(w http.ResponseWriter, r *http.Request) {
-	id, ok := pathID(w, r)
-	if !ok {
-		return
-	}
-	logID, err := strconv.ParseInt(r.PathValue("logID"), 10, 64)
-	if err != nil {
-		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "无效的探测记录 ID")
-		return
-	}
-	p, err := h.svc.GetProbeLog(r.Context(), id, logID)
-	if err != nil {
-		writeServiceErr(w, r, err)
-		return
-	}
-	resp.OK(w, r, p)
-}
-
 // ===== 渠道密钥（channel_keys）管理 =====
 
 // viewChannelKey 密钥管理 API 输出视图：凭据仅暴露明文尾号（KeyViews 已脱敏）。

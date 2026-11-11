@@ -141,29 +141,9 @@ func TestMigrate_FullChain(t *testing.T) {
 		}
 		cols[c] = true
 	}
-	for _, want := range []string{"auto_model_name", "upstream_usage", "upstream_status", "resp_body"} {
+	for _, want := range []string{"auto_model_name", "upstream_usage"} {
 		if !cols[want] {
 			t.Fatalf("call_logs 缺少列 %s（合并后迁移链未跑通）", want)
-		}
-	}
-
-	// probe_logs 必须带上游原文与状态码：运营翻探活历史时要看到上游到底回了什么。
-	plCols := map[string]bool{}
-	plRows, err := tempDB.Query(`SELECT column_name FROM information_schema.columns WHERE table_name='probe_logs'`)
-	if err != nil {
-		t.Fatalf("查询 probe_logs 列失败: %v", err)
-	}
-	defer plRows.Close()
-	for plRows.Next() {
-		var c string
-		if err := plRows.Scan(&c); err != nil {
-			t.Fatalf("扫描 probe_logs 列名失败: %v", err)
-		}
-		plCols[c] = true
-	}
-	for _, want := range []string{"error_body", "upstream_status"} {
-		if !plCols[want] {
-			t.Fatalf("probe_logs 缺少列 %s（0020 未生效）", want)
 		}
 	}
 

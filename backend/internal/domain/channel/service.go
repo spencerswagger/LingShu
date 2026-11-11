@@ -517,19 +517,3 @@ func (s *Service) ListProbeLogs(ctx context.Context, channelID int64, limit int)
 	}
 	return s.cmStore.ListProbeLogsByKeys(ctx, keyIDs, limit)
 }
-
-// GetProbeLog 取单条探测记录的完整原文（列表只返回 4KB 预览，全量走这里）。
-// 归属校验在 SQL 里做（JOIN channel_keys 限定 channel_id），跨渠道读不到别人的报文。
-func (s *Service) GetProbeLog(ctx context.Context, channelID, logID int64) (*ProbeLog, error) {
-	if s.cmStore == nil {
-		return nil, errInternal()
-	}
-	p, err := s.cmStore.GetProbeLog(ctx, channelID, logID)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, errNotFound("探测记录不存在")
-		}
-		return nil, fmt.Errorf("get probe log: %w", err)
-	}
-	return p, nil
-}

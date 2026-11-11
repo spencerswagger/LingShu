@@ -273,15 +273,15 @@ func TestService_ListProbeLogs_AggregatesChannelKeys(t *testing.T) {
 		WillReturnRows(channelKeyRow(&ChannelKey{ID: 10, ChannelID: 1, Name: "k1", CredentialEnc: "enc", State: StateNormal, CreatedAt: now, UpdatedAt: now}).
 			AddRow(int64(11), int64(1), "k2", "enc", string(StateNormal), "", nil, now, now))
 
-	probeLogsSQL := `SELECT id, channel_key_id, model_id, level, target, ok, error, upstream_status, error_body, input_tokens, output_tokens, cached_tokens, total_tokens, duration_ms, created_at
+	probeLogsSQL := `SELECT id, channel_key_id, model_id, level, target, ok, error, input_tokens, output_tokens, cached_tokens, total_tokens, duration_ms, created_at
 		 FROM probe_logs WHERE channel_key_id = ANY($1::bigint[]) ORDER BY id DESC LIMIT $2`
-	plCols := []string{"id", "channel_key_id", "model_id", "level", "target", "ok", "error", "upstream_status", "error_body",
+	plCols := []string{"id", "channel_key_id", "model_id", "level", "target", "ok", "error",
 		"input_tokens", "output_tokens", "cached_tokens", "total_tokens", "duration_ms", "created_at"}
 	mock.ExpectQuery(regexp.QuoteMeta(probeLogsSQL)).
 		WithArgs("{10,11}", 100).
 		WillReturnRows(sqlmock.NewRows(plCols).
-			AddRow(int64(1), int64(10), "m-default", "key", "https://a.example.com/chat/completions", true, "", 200, "", 2, 3, 0, 5, 12, now).
-			AddRow(int64(2), int64(11), "m1", "model", "", false, "boom", 400, `{"error":{"message":"boom"}}`, 0, 0, 0, 0, 0, now))
+			AddRow(int64(1), int64(10), "m-default", "key", "https://a.example.com/chat/completions", true, "", 2, 3, 0, 5, 12, now).
+			AddRow(int64(2), int64(11), "m1", "model", "", false, "boom", 0, 0, 0, 0, 0, now))
 
 	logs, err := svc.ListProbeLogs(context.Background(), 1, 0)
 	if err != nil {

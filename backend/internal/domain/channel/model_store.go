@@ -13,7 +13,6 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/team/llmgateway/internal/domain/billing"
 	"github.com/team/llmgateway/internal/domain/channelprotocol"
-	"github.com/team/llmgateway/internal/pkg/errbody"
 	"github.com/team/llmgateway/internal/pkg/idgen"
 )
 
@@ -442,67 +441,39 @@ func (s *channelModelStore) ListModelEvents(ctx context.Context, channelID int64
 	return list, nil
 }
 
-// InsertProbeLog 落库一次探测记录（结果 + token 开销 + 层级 + 上游原始错误）。
-// probe_logs 唯一写入口。ProbeLog.ChannelKeyID 对应 probe_logs.channel_key_id（密钥维度）。
+// InsertProbeLog 落库一次探测记录（结果 + token 开销 + 层级）。probe_logs 唯一写入口。
+// ProbeLog.ChannelKeyID 对应 probe_logs.channel_key_id（密钥维度）。
 func (s *channelModelStore) InsertProbeLog(ctx context.Context, p *ProbeLog) error {
 	if p.ID == 0 {
 		p.ID = idgen.New()
 	}
-	// 上游错误体是任意字节（GBK 错误页 / 0x00 / 截断的多字节字符）：原样写 PG text 列会整行 INSERT 失败，
-	// 于是「这次探活为什么失败」彻底不可见。落库前统一整理成合法 UTF-8（不可打印字节替换成可见占位符）。
-	errBody, _ := errbody.ToValidText(p.ErrorBody)
-	errText, _ := errbody.ToValidText(p.Error)
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO probe_logs(id, channel_key_id, model_id, level, target, ok, error, upstream_status, error_body, input_tokens, output_tokens, cached_tokens, total_tokens, duration_ms)
-		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
-		p.ID, p.ChannelKeyID, p.ModelID, p.Level, p.Target, p.OK, errText,
-		nullableInt(p.UpstreamStatus), errBody,
+		`INSERT INTO probe_logs(id, channel_key_id, model_id, level, target, ok, error, input_tokens, output_tokens, cached_tokens, total_tokens, duration_ms)
+		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+		p.ID, p.ChannelKeyID, p.ModelID, p.Level, p.Target, p.OK, p.Error,
 		p.InputTokens, p.OutputTokens, p.CachedTokens, p.TotalTokens, p.DurationMS)
 	return err
 }
 
-// nullableInt 把「0 = 没拿到上游状态码」写成 SQL NULL（与 call_logs.upstream_status 同口径：
-// NULL 表示本次没有上游状态码，0 不是合法 HTTP 状态码，混用会让「上游 0」这种假数据进库）。
-func nullableInt(v int) any {
-	if v == 0 {
-		return nil
-	}
-	return v
-}
-
-// probeListMaxRows 探活列表单次返回的最大行数（默认 100）。
-// 历史值 500 行 × 每行 error_body 上限 32KB ≈ 16MB，一个面板请求就能打出十几兆 JSON；
-// 列表是「最近若干次」的场景，100 行足够，配合下面每行原文的预览上限把**最坏**响应压到约 440KB
-// （100 行 × 4KB 预览 + JSON 开销，实测 444,341 字节；见 TestHandleListProbeLogs_BoundsPayload）。
-const probeListMaxRows = 100
-
-// probeListBodyMaxBytes 探活**列表**里每行 error_body 的预览上限（完整原文仍在 probe_logs.error_body）。
-// 列表接口只承载「这次探活为什么失败」的线索，长报文（HTML 错误页/堆栈）按 4KB 预览 + 同字段标注。
-const probeListBodyMaxBytes = 4 << 10
-
 // ListProbeLogs 查询某密钥的探测历史（倒序）。keyID 对应 probe_logs.channel_key_id。
 func (s *channelModelStore) ListProbeLogs(ctx context.Context, keyID int64, limit int) ([]ProbeLog, error) {
-	if limit <= 0 || limit > probeListMaxRows {
+	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, channel_key_id, model_id, level, target, ok, error, upstream_status, error_body, input_tokens, output_tokens, cached_tokens, total_tokens, duration_ms, created_at
+		`SELECT id, channel_key_id, model_id, level, target, ok, error, input_tokens, output_tokens, cached_tokens, total_tokens, duration_ms, created_at
 		 FROM probe_logs WHERE channel_key_id=$1 ORDER BY id DESC LIMIT $2`, keyID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list probe logs: %w", err)
 	}
 	defer rows.Close()
-	list, err := s.scanProbeLogs(rows)
-	if err != nil {
-		return nil, err
-	}
-	return capProbeBodies(list), nil
+	return s.scanProbeLogs(rows)
 }
 
 // ListProbeLogsByKeys 查询一批密钥（某渠道全部未删 keyID）的探测历史（倒序、合并列表），
 // 控制台按渠道聚合读路径使用：先取渠道全部 keyID，再 ANY 查询，避免把渠道 ID 当 key ID 查询恒为空。
 func (s *channelModelStore) ListProbeLogsByKeys(ctx context.Context, keyIDs []int64, limit int) ([]ProbeLog, error) {
-	if limit <= 0 || limit > probeListMaxRows {
+	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
 	if len(keyIDs) == 0 {
@@ -514,17 +485,13 @@ func (s *channelModelStore) ListProbeLogsByKeys(ctx context.Context, keyIDs []in
 	}
 	anyArg := "{" + strings.Join(parts, ",") + "}"
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, channel_key_id, model_id, level, target, ok, error, upstream_status, error_body, input_tokens, output_tokens, cached_tokens, total_tokens, duration_ms, created_at
+		`SELECT id, channel_key_id, model_id, level, target, ok, error, input_tokens, output_tokens, cached_tokens, total_tokens, duration_ms, created_at
 		 FROM probe_logs WHERE channel_key_id = ANY($1::bigint[]) ORDER BY id DESC LIMIT $2`, anyArg, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list probe logs by keys: %w", err)
 	}
 	defer rows.Close()
-	list, err := s.scanProbeLogs(rows)
-	if err != nil {
-		return nil, err
-	}
-	return capProbeBodies(list), nil
+	return s.scanProbeLogs(rows)
 }
 
 // scanProbeLogs 扫描探测日志行集（ListProbeLogs/ListProbeLogsByKeys 共用）。
@@ -536,14 +503,9 @@ func (s *channelModelStore) scanProbeLogs(rows interface {
 	list := make([]ProbeLog, 0, 16)
 	for rows.Next() {
 		var p ProbeLog
-		var upStatus sql.NullInt64
 		if err := rows.Scan(&p.ID, &p.ChannelKeyID, &p.ModelID, &p.Level, &p.Target, &p.OK, &p.Error,
-			&upStatus, &p.ErrorBody,
 			&p.InputTokens, &p.OutputTokens, &p.CachedTokens, &p.TotalTokens, &p.DurationMS, &p.CreatedAt); err != nil {
 			return nil, err
-		}
-		if upStatus.Valid {
-			p.UpstreamStatus = int(upStatus.Int64)
 		}
 		if p.Level == "" {
 			p.Level = "model" // 旧数据兜底
@@ -554,47 +516,6 @@ func (s *channelModelStore) scanProbeLogs(rows interface {
 		return nil, err
 	}
 	return list, nil
-}
-
-// capProbeBodies 把列表里每行 error_body 压到 probeListBodyMaxBytes 以内（同字段标注，指向落库的完整原文）。
-// 行数已经由 SQL LIMIT 收口，这里再收一层每行体积，避免「少量行 × 超大报文」把列表响应撑爆。
-func capProbeBodies(list []ProbeLog) []ProbeLog {
-	for i := range list {
-		body := list[i].ErrorBody
-		if len(body) <= probeListBodyMaxBytes {
-			continue
-		}
-		note := fmt.Sprintf("\n…（已截断：列表只展示前 %d 字节，完整原文 %d 字节请调用 "+
-			"GET /api/v1/admin/channels/{id}/probe-logs/{logID} 查看）",
-			probeListBodyMaxBytes, len(body))
-		out, _ := errbody.TruncateUTF8(body, probeListBodyMaxBytes, note)
-		list[i].ErrorBody = out
-		list[i].ErrorBodyTruncated = true
-	}
-	return list
-}
-
-// GetProbeLog 取单条探测记录的**完整原文**（列表只给 4KB 预览，全量走这里）。
-// channelID 参与过滤：探测记录挂在密钥上，用 channel_key 归属校验，避免跨渠道读到别人的报文。
-// 不存在（或不属于该渠道）返回 sql.ErrNoRows。
-func (s *channelModelStore) GetProbeLog(ctx context.Context, channelID, logID int64) (*ProbeLog, error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT p.id, p.channel_key_id, p.model_id, p.level, p.target, p.ok, p.error, p.upstream_status,
-		        p.error_body, p.input_tokens, p.output_tokens, p.cached_tokens, p.total_tokens, p.duration_ms, p.created_at
-		 FROM probe_logs p JOIN channel_keys k ON k.id = p.channel_key_id
-		 WHERE p.id = $1 AND k.channel_id = $2`, logID, channelID)
-	if err != nil {
-		return nil, fmt.Errorf("get probe log: %w", err)
-	}
-	defer rows.Close()
-	list, err := s.scanProbeLogs(rows)
-	if err != nil {
-		return nil, err
-	}
-	if len(list) == 0 {
-		return nil, sql.ErrNoRows
-	}
-	return &list[0], nil
 }
 
 // Delete 软删除单条渠道内部模型。不存在返回 sql.ErrNoRows。
