@@ -642,8 +642,16 @@ func TestPickKeyProbeTargets_DrainProbeRotationAndCap(t *testing.T) {
 		}
 		return out
 	}
-	first := drainTargets(mgr.pickKeyProbeTargetsFor(kr11, branchModelDrain))
-	second := drainTargets(mgr.pickKeyProbeTargetsFor(kr11, branchModelDrain))
+	pickRound := func() []probeTarget {
+		for _, kr := range []*KeyRuntime{kr11, kr12} {
+			if ts := drainTargets(mgr.pickKeyProbeTargetsFor(kr, branchModelDrain)); len(ts) > 0 {
+				return ts
+			}
+		}
+		return nil
+	}
+	first := pickRound()
+	second := pickRound()
 	if len(first) != 1 || len(second) != 1 {
 		t.Fatalf("每个间隔只能代探 1 个模型，got %d/%d", len(first), len(second))
 	}
@@ -653,8 +661,16 @@ func TestPickKeyProbeTargets_DrainProbeRotationAndCap(t *testing.T) {
 	if first[0].Level != "model" || first[0].ModelRowID == 0 {
 		t.Fatalf("代探应是模型级并带行 ID，got %+v", first[0])
 	}
-	if extra := drainTargets(mgr.pickKeyProbeTargetsFor(kr12, branchModelDrain)); len(extra) != 0 {
-		t.Fatalf("非代探密钥不应获得额外代探目标，got %+v", extra)
+	if elected, ok := mgr.ElectedDrainProbeKey(1); ok {
+		for _, id := range []int64{11, 12} {
+			if id == elected {
+				continue
+			}
+			other, _ := mgr.GetKeyRuntime(id)
+			if extra := drainTargets(mgr.pickKeyProbeTargetsFor(other, branchModelDrain)); len(extra) != 0 {
+				t.Fatalf("非当选密钥 %d 本轮不应获得额外代探目标，got %+v", id, extra)
+			}
+		}
 	}
 }
 
@@ -834,5 +850,71 @@ func TestDrainProbeKeyRotation_AcrossEpisodes(t *testing.T) {
 	defer mu.Unlock()
 	if len(borrowed) != 2 {
 		t.Fatalf("两次事件应各 1 次代探，got %d 次：%v", len(borrowed), borrowed)
+	}
+}
+
+// TestPickKeyProbeTargets_DrainProbeKeyRotation 代探密钥「优先 NORMAL 且轮换」：
+// ≥3 个 NORMAL 密钥 + 1 个排空模型，连续多轮代探时借用密钥按轮转变化（不是恒定最小 ID），
+// 且每轮只有 1 把密钥被借用（其余密钥本轮不产生任何排空代探目标）。
+func TestPickKeyProbeTargets_DrainProbeKeyRotation(t *testing.T) {
+	now := time.Date(2026, 1, 2, 10, 30, 0, 0, time.UTC)
+	hp := HealthProbeConfig{Interval: "0 0 0 * * *", DrainIntervalSeconds: 15, TimeoutMS: 1000,
+		FailThreshold: 1, RecoveryThreshold: 1, ProbeModel: "probe-only"}
+	mgr := newDrainScheduleTestManager(t, "http://up.example.com", hp, func() time.Time { return now })
+	addKeyRuntime(t, mgr, 12, testKeyBCred, StateNormal)
+	addKeyRuntime(t, mgr, 13, "sk-live-third-999888", StateNormal)
+	if err := mgr.ManualSetModelState(1, 21, StateDrain); err != nil {
+		t.Fatalf("manual model drain: %v", err)
+	}
+
+	drainTargetOf := func(kr *KeyRuntime) (probeTarget, bool) {
+		var out probeTarget
+		n := 0
+		for _, tg := range mgr.pickKeyProbeTargetsFor(kr, branchModelDrain) {
+			if tg.DrainOnly {
+				out = tg
+				n++
+			}
+		}
+		if n > 1 {
+			t.Fatalf("每个间隔只能代探 1 个模型，got %d", n)
+		}
+		return out, n == 1
+	}
+
+	// 一轮：先查当选密钥（只读），再确认其余密钥本轮没有代探目标，最后执行当选密钥这一轮。
+	round := func() int64 {
+		elected, ok := mgr.ElectedDrainProbeKey(1)
+		if !ok {
+			t.Fatalf("应选出代探密钥")
+		}
+		for _, id := range []int64{11, 12, 13} {
+			if id == elected {
+				continue
+			}
+			kr, _ := mgr.GetKeyRuntime(id)
+			if _, has := drainTargetOf(kr); has {
+				t.Fatalf("非当选密钥 %d 本轮不应有代探目标（每轮只借 1 把）", id)
+			}
+		}
+		kr, _ := mgr.GetKeyRuntime(elected)
+		if _, has := drainTargetOf(kr); !has {
+			t.Fatalf("当选密钥 %d 本轮应有代探目标", elected)
+		}
+		return elected
+	}
+
+	var seq []int64
+	for i := 0; i < 4; i++ {
+		seq = append(seq, round())
+	}
+	t.Logf("代探密钥轮转序列（4 轮）：%v", seq)
+	for i := 1; i < len(seq); i++ {
+		if seq[i] == seq[i-1] {
+			t.Fatalf("相邻两轮应为不同密钥（轮换），got 序列 %v", seq)
+		}
+	}
+	if seq[0] == seq[2%len(seq)] && len(seq) > 2 {
+		t.Fatalf("第 1、3 轮应轮到不同密钥（不是恒定最小 ID），got 序列 %v", seq)
 	}
 }
