@@ -1,9 +1,11 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
 	"unicode"
@@ -18,30 +21,36 @@ import (
 	"github.com/team/llmgateway/internal/pkg/errbody"
 )
 
-// 本文件定义「上游（渠道）返回非 2xx」时的对外错误处理，以及**运营侧**的上游原文可见性。
+// 本文件定义「上游（渠道）返回非 2xx」时的**对外错误透传**契约
+// （完整口径见 docs/designs/2026-11-11-upstream-error-visibility-design.md）：
 //
-// 对外契约（与既有网关语义一致，不做任何结构性变更）：
-//   - HTTP 状态码走**网关语义**：未转移的 4xx → 502（默认）；可转移失败耗尽 → 503；
-//     全部候选被上游 429 限流 → 429；已送达超时 → 504；协议策略显式 DownstreamStatus 时按策略值。
-//     上游真实码**只**落在运营侧（call_logs.upstream_status）与 error.message 的自由文本里。
-//   - 响应体只有 main 的既有形状：{"error":{"message","type","code"},"request_id"}。
-//     type/code 由对外状态码按 OpenAI 语义归类（见 openAIErrorType / openAIErrorCode）。
-//   - 上游原文（清洗后的可读文本）**只**出现在 error.message 这个自由文本字段里：
-//     客户端不应按 message 分支，因此不构成契约变更；内容是原文按 UTF-8 边界截断到 8KB。
-//   - 对外仍只遮蔽**本次实际使用的凭据**（与运营侧同一函数 errbody.MaskSecrets），
-//     其余内容（含第三方 token、request-id、模型名）原样保留。
+//  1. HTTP 状态码沿用上游：上游 4xx → 对外 4xx，上游 5xx → 对外 5xx。
+//     不再统一改写为 502/503/400（改写会让调用方误判「网关坏了」而放弃按厂商文档自救）。
+//  2. 错误内容完整保留，**只按响应体形状分支**（OpenAI 形状 / 其它 JSON / 非 JSON / 空体），
+//     绝不按文案、关键词、厂商名、白名单、状态码做特判或映射：
+//     - OpenAI 形状（顶层 error 为对象）→ 整段原样透传，只追加我们自己的**顶层**字段
+//       （request_id / upstream_status），不删改上游任何字段；
+//     - 其它 JSON 形状 → 原始 JSON 文本原样放进 error.message（结构与内容都在，不丢多字段/嵌套）；
+//     - 非 JSON（HTML 错误页 / 纯文本）→ 原文原样放进 error.message，绝不替换成中文通用文案；
+//     - 空体 → message 给出可读说明（没有内容可透传，但不能给空 message）。
+//  3. 超长只按**字节上限**截断（upstreamErrOutBytes），且截断标注与被截原文落在**同一字段**，
+//     调用方无需另查元数据即可判断完整性。
 //
-// 运营侧（账单/探活）见 operatorView：原文逐字节，只遮蔽本次凭据，32KB 上限 + 同字段标注。
+// 落库/日志仍走清洗后的视图（Clean）：上游可能在报文里回显它收到的凭据，
+// 「存储不落明文」是硬红线，与「对外透传原文」并不冲突——对外是还给同一个调用方。
 
 const (
 	// upstreamErrReadBytes 读取上游错误响应体的上限。
 	// 必须**显著大于**对外上限：否则超长报文在读取层就被静默切掉，对外既拿不到完整内容、
 	// 也无法诚实标注「已截断」（截断点会落在读不到的字节上）。
 	upstreamErrReadBytes = 64 << 10
-	// upstreamMsgMaxBytes error.message 里保留的上游原文字节上限（截断标注计入该预算）。
-	// 8KB 足以覆盖任何厂商的错误报文（含 HTML 错误页）；防的是「上游回吐几百 KB 日志/堆栈」
-	// 把下游客户端打挂。message 是自由文本，客户端不应据此分支，故不影响契约。
-	upstreamMsgMaxBytes = 8 << 10
+	// upstreamErrOutBytes 对外透传上游原文的字节上限（截断标注计入该预算）。
+	// 8KB 足以覆盖任何厂商的错误报文（含嵌套 details / HTML 错误页）；
+	// 防的是「上游回吐几百 KB 日志/堆栈」把下游客户端打挂。
+	upstreamErrOutBytes = 8 << 10
+	// upstreamErrCode 透传响应的 error.code：固定标识「本次失败由上游拒绝引起」，
+	// 不随状态码/文案变化（上游真实状态码在顶层 upstream_status，无需在此重复编码）。
+	upstreamErrCode = "upstream_error"
 	// callLogErrBodyMaxBytes 运营侧保存上游错误体原文（call_logs.resp_body）的字节上限。
 	// 对外的 8KB 是给客户端的预算，运营侧要能翻更长的原始报文（HTML 错误页 / 堆栈），
 	// 但也不能让单行无限膨胀（异步批量写库的内存与页面加载都会被拖垮），故给 32KB。
@@ -175,30 +184,114 @@ func readUpstreamErrBody(resp *http.Response) upstreamErrBody {
 	}
 }
 
-// upstreamTruncNote 截断标注。与截断后的原文写在**同一字段**（error.message）里，
-// 调用方不必另找元数据就能看出「内容不完整」。数字给的是**遮蔽前**的原始字节数。
+// upstreamTruncNote 截断标注。与截断后的原文写在**同一字段**里（error.message），
+// 调用方不必另找元数据就能看出「内容不完整」。数字给的是原始字节数，便于判断丢了多少。
 func upstreamTruncNote(total, limit int) string {
-	return fmt.Sprintf("\n…（已截断：上游原文共 %d 字节，超过 %d 字节上限）", total, limit)
+	return fmt.Sprintf("\n…（已截断：上游原文共 %d 字节，超过 %d 字节对外上限）", total, limit)
 }
 
-// upstreamErrMessage 组装对外 error.message：可读中文文案 + 「：」+ 上游原文（遮蔽本次凭据、按 8KB 截断）。
+// writeUpstreamError 把上游错误响应对外透传。
 //
-// 为什么原文只放 message：
-//   - 对外契约（状态码、error.type/code、字段集合）与既有网关语义保持一致，不做结构性变更；
-//   - message 是自由文本，客户端不应据此做分支判断，所以「把上游到底说了什么」放这里
-//     既能让调用方自救，又不改变任何可以被程序依赖的语义。
+// 两个状态码刻意分开传：
+//   - status：**对外**写的 HTTP 状态码（通常等于上游；协议策略显式 DownstreamStatus 时被覆盖；
+//     1xx/3xx 按 502 输出）；
+//   - upstreamStatus：**上游真实**状态码，写进响应体顶层 upstream_status。
 //
-// secrets 传本次转发实际使用的渠道凭据：上游偶尔会回显鉴权头，原样输出等于把**渠道密钥**
-// 交给任意持有自己令牌的租户；遮蔽规则与运营侧 operatorView 同一套（只替换已知凭据原值），
-// 因此除凭据外的每个字节仍逐字节保留。
-func upstreamErrMessage(base, raw, cred string) string {
-	if strings.TrimSpace(raw) == "" {
-		return base
+// 二者不能混用：策略把 422 覆盖成 418、或上游回 304 被改写成 502 时，
+// upstream_status 仍必须报上游真实码，否则字段语义（「上游真实状态码」）就是假的。
+func writeUpstreamError(w http.ResponseWriter, status, upstreamStatus int, raw, cred string) {
+	// 1xx/3xx 不属错误语义（且 304 禁带响应体），若上游回这类码则按网关错误输出，
+	// 否则调用方会拿到「有状态码没内容」或干脆看不到错误。4xx/5xx 一律沿用上游。
+	if status < http.StatusBadRequest {
+		status = http.StatusBadGateway
 	}
+	if upstreamStatus <= 0 {
+		upstreamStatus = status
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(upstreamErrorPayload(status, upstreamStatus, raw,
+		w.Header().Get("x-request-id"), cred))
+}
+
+// upstreamErrorPayload 组装对外错误体。返回 any：OpenAI 形状走「整段原样透传」（map），
+// 其余形状走网关错误壳（openAIErrorBody）。status=对外状态码，upstreamStatus=上游真实状态码。
+//
+// secrets：本次转发实际使用的渠道凭据。上游偶尔会把收到的鉴权头原样回显在错误体里，
+// 若不遮蔽就等于把**渠道密钥**转手发给下游 API 用户（拥有 token 的租户人人都能拿到）。
+// 遮蔽规则与运营侧 operatorView 同一套（internal/pkg/errbody.MaskSecrets：只替换已知凭据原值，
+// 不做样式/高熵清洗），因此除凭据外的每个字节仍逐字节透传。
+func upstreamErrorPayload(status, upstreamStatus int, raw, requestID string, secrets ...string) any {
+	// TrimSpace **只用于判空**，不用于改写：非 JSON 错误页的首尾空白同样是上游原文的一部分，
+	// 剪掉就和「Raw 不 TrimSpace」自相矛盾（逐字节口径）。
+	if strings.TrimSpace(raw) == "" {
+		return upstreamEnvelope(status, upstreamStatus,
+			fmt.Sprintf("上游返回 %d，响应体为空（无可透传的错误内容）", upstreamStatus), requestID)
+	}
+	// 截断标注里报**原文**字节数（遮蔽前后长度略有差异，不能让调用方看到「对不上账」的数字）。
 	origLen := len(raw)
-	masked := errbody.MaskSecrets(raw, cred)
-	text, _ := truncateUTF8(masked, upstreamMsgMaxBytes, upstreamTruncNote(origLen, upstreamMsgMaxBytes))
-	return base + "：" + text
+	raw = errbody.MaskSecrets(raw, secrets...)
+	// OpenAI 形状且未超上限 → 整段原样透传：顶层每个键（含 error 子对象的全部字段与嵌套）
+	// 都以 json.RawMessage 原值搬走，只追加我们自己的顶层字段。
+	if len(raw) <= upstreamErrOutBytes {
+		if doc, ok := openAIShapeDoc(raw); ok {
+			doc["upstream_status"] = json.RawMessage(strconv.Itoa(upstreamStatus))
+			if requestID != "" {
+				if _, exists := doc["request_id"]; !exists {
+					doc["request_id"] = json.RawMessage(strconv.Quote(requestID))
+				}
+			}
+			return doc
+		}
+	}
+	// 其余形状（其它 JSON / 非 JSON / 超长的 OpenAI 形状）：原文原样进 message，
+	// 超限时同字段前缀 + 截断标注。其它 JSON 也是原文本，结构与嵌套一并保留。
+	text, _ := truncateUTF8(raw, upstreamErrOutBytes, upstreamTruncNote(origLen, upstreamErrOutBytes))
+	return upstreamEnvelope(status, upstreamStatus, text, requestID)
+}
+
+// upstreamErrorEnvelope 非 OpenAI 形状时用的网关错误壳（message 里是原文，不做任何改写）。
+// upstream_status 放**顶层**：与 OpenAI 形状的整段透传保持同一位置（那种形状不允许改 error 子对象），
+// 调用方在两种形状下都用同一个路径取到上游状态码。
+type upstreamErrorEnvelope struct {
+	Error          openAIErrorDetail `json:"error"`
+	UpstreamStatus int               `json:"upstream_status"`
+	RequestID      string            `json:"request_id,omitempty"`
+}
+
+// upstreamEnvelope 组装网关错误壳（不含任何内容改写：message 由调用方给出原文）。
+// error.type 按**对外**状态码归类（客户端按它判错误大类），upstream_status 记上游真实码。
+func upstreamEnvelope(status, upstreamStatus int, message, requestID string) upstreamErrorEnvelope {
+	return upstreamErrorEnvelope{
+		Error: openAIErrorDetail{
+			Message: message,
+			Type:    openAIErrorType(status),
+			Code:    upstreamErrCode,
+		},
+		UpstreamStatus: upstreamStatus,
+		RequestID:      requestID,
+	}
+}
+
+// openAIShapeDoc 判定是否 OpenAI 错误形状（顶层为对象且 error 键的值是对象），
+// 是则返回顶层键值（保留每个值的原始字节）。
+// 只认形状、不看内容：error.message 里写什么、error 里还有哪些键，一律不参与判定。
+func openAIShapeDoc(raw string) (map[string]json.RawMessage, bool) {
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &doc); err != nil || doc == nil {
+		return nil, false
+	}
+	e, ok := doc["error"]
+	if !ok || !isJSONObject(e) {
+		return nil, false
+	}
+	return doc, true
+}
+
+// isJSONObject 判定一段 JSON 值是否为对象（只看首个非空白字节）。
+func isJSONObject(raw json.RawMessage) bool {
+	s := bytes.TrimSpace(raw)
+	return len(s) > 0 && s[0] == '{'
 }
 
 // upstreamTransportNote 把传输层失败（连接被拒/断连/超时）转成**可读原因**，
@@ -348,15 +441,21 @@ func isTimeoutErr(err error) bool {
 	return errors.Is(err, context.DeadlineExceeded) || os.IsTimeout(err)
 }
 
-// terminalFailure 为「候选全部失败」给出对外状态码与可读原因串。
-//
-// 对外状态码走**网关语义**、与既有行为一致：一律 503「无可用渠道」——上游真实码只落运营侧
-// （call_logs.upstream_status）与 message 的自由文本，不参与对外状态码判定。
-//   - 有上游报文（可转移的 4xx/5xx 耗尽）→ 503，原文进 message；
-//   - 连接失败/构建失败/超时/全部被本地拦截 → 503，原因串进 message。
+// terminalFailure 为「候选全部失败」的终结响应决定状态码与文案：
+//   - 有上游报文（lastUpstreamStatus>0）→ 状态码沿用上游、报文一并透出（见 writeUpstreamError）；
+//   - 没有报文但有传输层失败（连接被拒/断连/超时）→ 502；超时 → 504，文案点名原因；
+//   - 连传输层失败都没有（候选全被本地拦截：会话满/限流/凭据缺失/协议不支持）→ 503
+//     「无可用渠道」（这是网关侧没有可用容量，不是上游拒绝，也不是上游不可达）。
 func terminalFailure(lastUpstreamStatus int, failureNote string, timedOut bool, fallback string) (int, string) {
-	_ = lastUpstreamStatus
-	_ = timedOut
-	_ = failureNote
-	return http.StatusServiceUnavailable, fallback
+	if lastUpstreamStatus > 0 {
+		return lastUpstreamStatus, ""
+	}
+	if failureNote == "" {
+		return http.StatusServiceUnavailable, fallback
+	}
+	status := http.StatusBadGateway
+	if timedOut {
+		status = http.StatusGatewayTimeout
+	}
+	return status, "所有候选渠道均失败：" + failureNote
 }

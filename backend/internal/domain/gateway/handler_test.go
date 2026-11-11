@@ -588,13 +588,10 @@ func TestServeUpstream429(t *testing.T) {
 	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("want 429, got %d", rec.Code)
 	}
-	// 透传契约：对外状态码仍是网关语义 429；error.code 按网关归类为 rate_limit_exceeded，
-	// type 为 rate_limit_error（空上游体时 message 给出可读说明），上游真实码只落运营侧调用日志。
-	if rb := decodeOpenAIError(t, rec); rb.Error.Code != "rate_limit_exceeded" || rb.Error.Type != "rate_limit_error" || rb.Error.Message == "" {
-		t.Errorf("error want code=rate_limit_exceeded type=rate_limit_error 且 message 非空, got %+v", rb.Error)
-	}
-	if got := lastCallLogUpstreamStatus(t, h); got != http.StatusTooManyRequests {
-		t.Errorf("调用日志 upstream_status want 429, got %d", got)
+	// 透传契约：状态码沿用上游 429；error.code 固定 upstream_error（标识「上游拒绝」），
+	// type 按状态码归类为 rate_limit_error（空上游体时 message 给出可读说明）。
+	if rb := decodeOpenAIError(t, rec); rb.Error.Code != "upstream_error" || rb.Error.Type != "rate_limit_error" || rb.Error.Message == "" {
+		t.Errorf("error want code=upstream_error type=rate_limit_error 且 message 非空, got %+v", rb.Error)
 	}
 	if len(h.chans.feeds) == 0 || !h.chans.feeds[0].fb.Is429 {
 		t.Errorf("expected Is429 feedback, got %+v", h.chans.feeds)
@@ -1708,24 +1705,6 @@ func TestServeStreamBrokenBodyFeedsHealthFailure(t *testing.T) {
 	if len(h.chans.feeds) != 1 || h.chans.feeds[0].fb.IsSuccess {
 		t.Fatalf("上游传输中断应计入渠道健康失败, got %+v", h.chans.feeds)
 	}
-	// 这条失败发生在上游已回 200 之后：调用日志必须记上游真实码 200（此前漏传 → NULL，
-	// 与迁移 0019「NULL = 连接失败/超时/网关拒绝」的注释矛盾，运营会误判成「没有上游响应」）。
-	var streamErrLog *CallLog
-	for i := range h.clogs.inserted {
-		if h.clogs.inserted[i].RespKind == "error" {
-			streamErrLog = h.clogs.inserted[i]
-			break
-		}
-	}
-	if streamErrLog == nil {
-		t.Fatalf("流式中断应落一条 resp_kind=error 的调用日志, got %+v", h.clogs.inserted)
-	}
-	if streamErrLog.Status != "failed" {
-		t.Errorf("流式中断调用日志 want status=failed, got %q", streamErrLog.Status)
-	}
-	if streamErrLog.UpstreamStatus == nil || *streamErrLog.UpstreamStatus != http.StatusOK {
-		t.Errorf("流式中断发生在 200 之后，upstream_status 应为 200，got %v", streamErrLog.UpstreamStatus)
-	}
 }
 
 // 场景 8：GET /v1/models 返回启用模型列表（OpenAI 兼容格式）；未认证 → 401。
@@ -1973,13 +1952,9 @@ func TestServeUpstream401FeedsKeyChannelKey(t *testing.T) {
 	h.rrouter.result = &router.RouteResult{ChannelID: 1, ChannelKeyID: 2, ModelRowID: 7, InternalModelID: "gpt-4-internal", ExternalModelID: 1}
 
 	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t", `{"model":"gpt-4","stream":false}`)
-	// 401 属可转移失败：先转移下一候选；无更多候选 → 对外网关语义 503，
-	// 上游真实码 401 只落运营侧调用日志与 message（不透出 401，避免调用方误判「我方 key 无效」）。
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("want 503（网关语义）, got %d: %s", rec.Code, rec.Body.String())
-	}
-	if got := lastCallLogUpstreamStatus(t, h); got != http.StatusUnauthorized {
-		t.Fatalf("调用日志 upstream_status want 401, got %d", got)
+	// 401 属可转移失败：先转移下一候选；无更多候选 → 终结响应沿用最后一次上游状态码（401）。
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("want 401, got %d: %s", rec.Code, rec.Body.String())
 	}
 	found := false
 	for _, fe := range h.chans.feeds {
@@ -2468,12 +2443,9 @@ func TestServePreConsume_RefundsOnUpstreamFailure(t *testing.T) {
 
 	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t",
 		`{"model":"gpt-4","stream":false,"max_tokens":2000,"messages":[{"role":"user","content":"hello"}]}`)
-	// 上游 5xx 属可转移失败：单候选耗尽后对外网关语义 503，上游真实码 500 只落运营侧调用日志。
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("want 503（网关语义）, got %d: %s", rec.Code, rec.Body.String())
-	}
-	if got := lastCallLogUpstreamStatus(t, h); got != http.StatusInternalServerError {
-		t.Fatalf("调用日志 upstream_status want 500, got %d", got)
+	// 上游 5xx 属可转移失败：单候选耗尽后终结响应沿用上游状态码（500）。
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("want 500（沿用上游）, got %d: %s", rec.Code, rec.Body.String())
 	}
 	if len(fc.consumed) != 1 || len(fc.refunded) != 1 {
 		t.Fatalf("want pre-consume+full refund, consumed=%v refunded=%v", fc.consumed, fc.refunded)
@@ -2662,11 +2634,8 @@ func TestServeNoFailover_Upstream400(t *testing.T) {
 	addSecondKey(h, upstream.URL, "k2-secret")
 
 	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t", `{"model":"gpt-4","stream":false}`)
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("400 不转移应对外 502（网关语义）, got %d: %s", rec.Code, rec.Body.String())
-	}
-	if got := lastCallLogUpstreamStatus(t, h); got != http.StatusBadRequest {
-		t.Fatalf("调用日志 upstream_status want 400, got %d", got)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("400 不转移应直接沿用上游 400, got %d: %s", rec.Code, rec.Body.String())
 	}
 	// 只应有候选 1 的一次失败尝试；若发生转移会多出候选 2 的账单。
 	if len(h.billing.reqs) != 1 || !h.billing.reqs[0].Fail || h.billing.reqs[0].ChannelKeyID != 1 {
@@ -2685,11 +2654,8 @@ func TestServeNoFailover_Upstream504(t *testing.T) {
 	addSecondKey(h, upstream.URL, "k2-secret")
 
 	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t", `{"model":"gpt-4","stream":false}`)
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("504 不转移应对外 502（网关语义）, got %d: %s", rec.Code, rec.Body.String())
-	}
-	if got := lastCallLogUpstreamStatus(t, h); got != http.StatusGatewayTimeout {
-		t.Fatalf("调用日志 upstream_status want 504, got %d", got)
+	if rec.Code != http.StatusGatewayTimeout {
+		t.Fatalf("504 不转移应直接沿用上游 504, got %d: %s", rec.Code, rec.Body.String())
 	}
 	if len(h.billing.reqs) != 1 {
 		t.Fatalf("504 不应触发第二次上游调用, got %+v", h.billing.reqs)
@@ -2706,8 +2672,8 @@ func TestServeFailover_ConnectionError(t *testing.T) {
 	h := build(t, deadURL)
 	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t", `{"model":"gpt-4","stream":false}`)
 	// 连接失败可转移；单候选耗尽后对外 502，且必须点名「连接失败」原因。
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("连接失败应 503（单候选→无可用渠道）, got %d: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("连接失败应 502, got %d: %s", rec.Code, rec.Body.String())
 	}
 	if rb := decodeOpenAIError(t, rec); !strings.Contains(rb.Error.Message, "连接失败") {
 		t.Fatalf("应点名连接失败原因, got %q", rb.Error.Message)
@@ -3273,8 +3239,8 @@ func TestStreamDiag_NotDeliveredFields(t *testing.T) {
 	dump := withLogCapture(h)
 
 	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t", `{"model":"gpt-4","stream":true}`)
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("want 503（单候选流式连接失败转移后无可用渠道）, got %d: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("want 502（单候选流式连接失败转移后无可用渠道）, got %d: %s", rec.Code, rec.Body.String())
 	}
 	out := dump()
 	for _, want := range []string{"upstream call failed", "kind=connect_failed", "stage=stream",
@@ -3364,8 +3330,8 @@ func TestUpstreamExplicitError_StillRefundsFullPreConsume(t *testing.T) {
 
 	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t",
 		`{"model":"gpt-4","stream":false,"max_tokens":2000,"messages":[{"role":"user","content":"hello"}]}`)
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("want 502（网关语义）, got %d: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusGatewayTimeout {
+		t.Fatalf("want 504（沿用上游状态码）, got %d: %s", rec.Code, rec.Body.String())
 	}
 	if len(fc.consumed) != 1 || len(fc.refunded) != 1 || math.Abs(fc.consumed[0]-fc.refunded[0]) > 0.0001 {
 		t.Fatalf("上游明确报错必须整单退预扣, consumed=%v refunded=%v", fc.consumed, fc.refunded)
@@ -4055,18 +4021,4 @@ func TestMidSwitchGateway_MigrationFailureKeepsOldChannel(t *testing.T) {
 	if !ok || s.ChannelKeyID != 21 {
 		t.Fatalf("迁移失败时会话应保持原渠道 key 21，got %+v ok=%v", s, ok)
 	}
-}
-
-// lastCallLogUpstreamStatus 取最近一条调用日志里的上游状态码（0=没有）。
-// 对外响应已不再携带任何上游码字段（契约与既有网关语义一致），该事实只落在运营侧调用日志。
-func lastCallLogUpstreamStatus(t *testing.T, h *harness) int {
-	t.Helper()
-	if len(h.clogs.inserted) == 0 {
-		t.Fatal("没有调用日志")
-	}
-	cl := h.clogs.inserted[len(h.clogs.inserted)-1]
-	if cl.UpstreamStatus == nil {
-		return 0
-	}
-	return *cl.UpstreamStatus
 }
