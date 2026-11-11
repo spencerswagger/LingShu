@@ -426,6 +426,7 @@ func parseAnthropicBlock(raw json.RawMessage, rep *LossyReport) (ContentBlock, b
 		IsError   bool            `json:"is_error"`
 		Thinking  string          `json:"thinking"`
 		Signature string          `json:"signature"`
+		Data      string          `json:"data"`
 	}
 	if err := json.Unmarshal(raw, &b); err != nil {
 		return ContentBlock{}, false, err
@@ -473,6 +474,10 @@ func parseAnthropicBlock(raw json.RawMessage, rep *LossyReport) (ContentBlock, b
 		}, true, nil
 	case BlockThinking:
 		return ContentBlock{Kind: BlockThinking, Text: b.Thinking, Signature: b.Signature}, true, nil
+	case BlockRedactedThinking:
+		// redacted_thinking 的 data 是 opaque 密文，必须原样保留（Anthropic 要求回传），
+		// 不能解明文；签名一并保留。
+		return ContentBlock{Kind: BlockRedactedThinking, RedactedData: b.Data, Signature: b.Signature}, true, nil
 	default:
 		rep.Add("content.block." + b.Type)
 		return ContentBlock{}, false, nil
@@ -599,10 +604,28 @@ func serializeAnthropicBlock(b ContentBlock, rep *LossyReport) interface{} {
 	case BlockToolResult:
 		return serializeAnthropicToolResult(b, rep)
 	case BlockThinking:
+		// signature 恒空时生成不透明签名：从 openai-chat 转换来的 thinking（reasoning_content
+		// 无签名概念）若下发空签名，严格客户端会丢弃该块，下一轮不回传 → 上游 400。
+		// anthropic→anthropic 透传保留原始签名（非空，不走此分支）；生成的是稳定不透明串。
+		sig := b.Signature
+		if sig == "" {
+			sig = OpaqueThinkingSignature(b.Text)
+		}
 		return map[string]interface{}{
 			"type":      BlockThinking,
 			"thinking":  b.Text,
-			"signature": b.Signature,
+			"signature": sig,
+		}
+	case BlockRedactedThinking:
+		// redacted_thinking 原样回传（data 为 opaque 密文，signature 一并保留）。
+		sig := b.Signature
+		if sig == "" {
+			sig = OpaqueThinkingSignature(b.RedactedData)
+		}
+		return map[string]interface{}{
+			"type":      BlockRedactedThinking,
+			"data":      b.RedactedData,
+			"signature": sig,
 		}
 	default:
 		rep.Add("content.block." + b.Kind)
@@ -725,6 +748,7 @@ func (anthropicCodec) DecodeEvent(data []byte) ([]CanonicalEvent, *LossyReport, 
 				Text        string `json:"text"`
 				Thinking    string `json:"thinking"`
 				PartialJSON string `json:"partial_json"`
+				Signature   string `json:"signature"`
 			}
 			_ = json.Unmarshal(raw, &d)
 			switch d.Type {
@@ -734,6 +758,10 @@ func (anthropicCodec) DecodeEvent(data []byte) ([]CanonicalEvent, *LossyReport, 
 			case "thinking_delta":
 				ev.DeltaKind = DeltaThinking
 				ev.Text = d.Thinking
+			case "signature_delta":
+				ev.DeltaKind = DeltaSignature
+				ev.Signature = d.Signature
+				ev.Text = d.Signature
 			case "input_json_delta":
 				ev.DeltaKind = DeltaToolJSON
 				ev.Text = d.PartialJSON
@@ -820,6 +848,9 @@ func (anthropicCodec) EncodeEvent(ev CanonicalEvent) ([][]byte, *LossyReport, er
 		case DeltaThinking:
 			delta["type"] = "thinking_delta"
 			delta["thinking"] = ev.Text
+		case DeltaSignature:
+			delta["type"] = "signature_delta"
+			delta["signature"] = ev.Text
 		case DeltaToolJSON:
 			delta["type"] = "input_json_delta"
 			delta["partial_json"] = ev.Text

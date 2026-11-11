@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strconv"
 
 	"github.com/team/llmgateway/internal/domain/billing"
 	"github.com/team/llmgateway/internal/domain/channelprotocol"
@@ -69,23 +70,56 @@ func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Respon
 	sawToolCall := false
 	anthropicDown := downstream == channelprotocol.ProtocolAnthropicMessages
 
-	// 下游 anthropic 的内容块状态：openBlocks 记录已开启的下游块下标；
+	// 下游 anthropic 的内容块状态：openBlocks 记录已开启的下游块下标。
 	// blockIndex 把上游规范下标重映射为「下游连续、从 0 起始」的下标。
+	//
+	// 上游规范事件里 text 与 thinking 常共用同一上游下标（openai-chat 的 content 与
+	// reasoning_content 都用 Index:0；openai-responses 的 output_text.delta 与
+	// reasoning_text.delta 共用 output_index）。若按上游下标映射，两者会被并进同一个下游块
+	// （首块被标成 text、块内却是 thinking_delta，协议上非法），客户端历史因此没有合法
+	// thinking 块。故按「上游下标 × 块类别」分桶映射：text / thinking / tool 各自独立分配
+	// 下游下标，保证 thinking 独立成块、text 独立成块、tool 独立成块。
 	openBlocks := map[int]bool{}
-	blockIndexMap := map[int]int{}
+	blockIndexMap := map[string]int{}
 	nextBlockIndex := 0
-	blockIndex := func(up int) int {
+	blockClass := func(deltaKind string) string {
+		switch deltaKind {
+		case protocolconv.DeltaThinking, protocolconv.DeltaSignature:
+			// signature_delta 属于 thinking 块（Anthropic 在 content_block_stop 前下发），
+			// 与 thinking_delta 落入同一桶，避免被误判为 text 块。
+			return "thinking"
+		case protocolconv.DeltaToolJSON:
+			return "tool"
+		default:
+			return "text"
+		}
+	}
+	// blockClassForKind 按 content_block_start 的 BlockKind 归类（tool_use → tool，其余 → text）。
+	blockClassForKind := func(kind string) string {
+		if kind == protocolconv.BlockToolUse {
+			return "tool"
+		}
+		return "text"
+	}
+	blockIndex := func(up int, class string) int {
 		if !anthropicDown {
 			return up
 		}
-		if d, ok := blockIndexMap[up]; ok {
+		key := itoa(up) + "|" + class
+		if d, ok := blockIndexMap[key]; ok {
 			return d
 		}
 		d := nextBlockIndex
-		blockIndexMap[up] = d
+		blockIndexMap[key] = d
 		nextBlockIndex++
 		return d
 	}
+	// 已开启的 thinking 块的签名（在 content_block_stop 前以 signature_delta 下发，
+	// Anthropic 严格要求签名非空；无签名会被严格客户端丢弃 → 下一轮不回传 → 上游 400）。
+	blockSignatures := map[int]string{}
+	// upstreamSignatureEmitted 记录「上游已显式下发 signature_delta」的块：此类块在
+	// content_block_stop 前不再重复生成签名（上游签名已透传）。
+	upstreamSignatureEmitted := map[int]bool{}
 
 	// 待下发的终止事件：合并 stop_reason 与 usage，保证每次流仅下发一个终止帧
 	// （openai include_usage 会把 finish_reason 与 usage 拆到两帧，需合并）。
@@ -138,6 +172,7 @@ func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Respon
 	}
 
 	// closeOpenBlocks 为下游 anthropic 补出所有已开启块的 content_block_stop（升序、幂等）。
+	// thinking 块在 content_block_stop 之前补发 signature_delta（Anthropic 严格要求签名非空）。
 	closeOpenBlocks := func() error {
 		if !anthropicDown || len(openBlocks) == 0 {
 			return nil
@@ -148,11 +183,18 @@ func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Respon
 		}
 		sort.Ints(idxs)
 		for _, i := range idxs {
+			if sig := blockSignatures[i]; sig != "" && !upstreamSignatureEmitted[i] {
+				if err := emit([]channelEvent{{Type: protocolconv.EventContentBlockDelta, Index: i, DeltaKind: protocolconv.DeltaSignature, Text: sig}}); err != nil {
+					return err
+				}
+			}
 			if err := emit([]channelEvent{{Type: protocolconv.EventContentBlockStop, Index: i}}); err != nil {
 				return err
 			}
 		}
 		openBlocks = map[int]bool{}
+		blockSignatures = map[int]string{}
+		upstreamSignatureEmitted = map[int]bool{}
 		return nil
 	}
 
@@ -224,23 +266,46 @@ func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Respon
 		case protocolconv.EventMessageStart:
 			return emit([]channelEvent{ev})
 		case protocolconv.EventContentBlockStart:
-			idx := blockIndex(ev.Index)
+			// tool_use 的 content_block_start 由上游显式发出（BlockKind=tool_use），
+			// 无 DeltaKind；按 BlockKind 归类，与后续 tool_json delta 落到同一桶。
+			idx := blockIndex(ev.Index, blockClassForKind(ev.BlockKind))
 			openBlocks[idx] = true
 			ev.Index = idx
 			return emit([]channelEvent{ev})
 		case protocolconv.EventContentBlockDelta:
-			idx := blockIndex(ev.Index)
+			idx := blockIndex(ev.Index, blockClass(ev.DeltaKind))
 			if !openBlocks[idx] {
+				// 下游 anthropic 的 content_block_start 必须与后续 delta 的块类型一致：
+				// 此前只把 DeltaToolJSON 映射为 tool_use，其余（含 DeltaThinking）一律 text，
+				// 导致客户端历史里没有合法 thinking 块（首块被标成 text，块内却是 thinking_delta，
+				// 协议上非法组合），下一轮不带 thinking → 上游 400。此处按 delta 类型映射块类型：
+				// thinking 增量 → thinking 块；tool_json → tool_use；其余 → text。
 				kind := protocolconv.BlockText
-				if ev.DeltaKind == protocolconv.DeltaToolJSON {
+				switch ev.DeltaKind {
+				case protocolconv.DeltaThinking:
+					kind = protocolconv.BlockThinking
+				case protocolconv.DeltaToolJSON:
 					kind = protocolconv.BlockToolUse
 				}
 				openBlocks[idx] = true
-				if err := emit([]channelEvent{{Type: protocolconv.EventContentBlockStart, Index: idx, BlockKind: kind}}); err != nil {
+				startEv := channelEvent{Type: protocolconv.EventContentBlockStart, Index: idx, BlockKind: kind}
+				if kind == protocolconv.BlockToolUse {
+					startEv.ToolUseID = ev.ToolUseID
+					startEv.ToolName = ev.ToolName
+				}
+				// thinking 块：预生成签名（在 content_block_stop 前以 signature_delta 下发）。
+				if kind == protocolconv.BlockThinking {
+					blockSignatures[idx] = protocolconv.OpaqueThinkingSignature(ev.Text)
+				}
+				if err := emit([]channelEvent{startEv}); err != nil {
 					return err
 				}
 			}
 			ev.Index = idx
+			// 上游显式下发的 signature_delta：透传并标记（closeOpenBlocks 不再重复生成）。
+			if ev.DeltaKind == protocolconv.DeltaSignature {
+				upstreamSignatureEmitted[idx] = true
+			}
 			return emit([]channelEvent{ev})
 		default:
 			return emit([]channelEvent{ev})
@@ -456,6 +521,9 @@ func leadingResponsesFailed(payload []byte) bool {
 	return bytes.Equal(key, []byte("type")) && bytes.HasPrefix(val, []byte(`"response.failed"`))
 }
 
+// itoa 是 strconv.Itoa 的包内别名（blockIndex 键拼接用）。
+func itoa(n int) string { return strconv.Itoa(n) }
+
 // channelEvent 是 protocolconv.CanonicalEvent 的别名，便于在泵内构造事件字面量。
 type channelEvent = protocolconv.CanonicalEvent
 
@@ -489,6 +557,7 @@ func accumulateConvertedAssistant(content, reasoning *bytes.Buffer, toolCalls ma
 		case protocolconv.DeltaToolJSON:
 			ensureCanonicalToolCall(toolCalls, order, ev.Index).arguments += ev.Text
 		}
+		// DeltaSignature 不累积进正文/推理（签名是元数据，不是内容）。
 	case protocolconv.EventContentBlockStart:
 		if ev.BlockKind == protocolconv.BlockToolUse {
 			tc := ensureCanonicalToolCall(toolCalls, order, ev.Index)

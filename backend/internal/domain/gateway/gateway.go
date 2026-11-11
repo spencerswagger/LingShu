@@ -156,10 +156,17 @@ type Gateway struct {
 	protocolConvEnabled func() bool
 	// reasoning 会话级推理缓存：回填 thinking 模式客户端未回传的 reasoning_content。
 	reasoning *ReasoningCache
+	// thinkingRoundtripDefault 未挂载 thinking-roundtrip 的渠道默认是否回填推理内容
+	// （nil=默认开启；从 sys_configs `gateway.thinking_roundtrip.default_enabled` 读取）。
+	thinkingRoundtripDefault func() bool
 }
 
 // ProtocolConversionEnabledKey 是全局跨协议转换开关在 sys_configs 中的键（默认开启）。
 const ProtocolConversionEnabledKey = "gateway.protocol_conversion.enabled"
+
+// ThinkingRoundtripDefaultEnabledKey 是「未挂载 thinking-roundtrip 的渠道默认是否回填推理内容」
+// 在 sys_configs 中的键（默认 true）。关闭即回滚到改造前行为：未配置渠道的 thinking 一律丢。
+const ThinkingRoundtripDefaultEnabledKey = "gateway.thinking_roundtrip.default_enabled"
 
 // GatewayConfig 是 NewGateway 的入参。
 type GatewayConfig struct {
@@ -202,6 +209,10 @@ type GatewayConfig struct {
 	// ProtocolConversionEnabled 读取全局跨协议转换开关（sys_configs，默认开启）。
 	// 返回 false 时禁用非直通的协议转换；未配置/读取失败按开启处理。
 	ProtocolConversionEnabled func() bool
+	// ThinkingRoundtripDefaultEnabled 读取「未挂载 thinking-roundtrip 的渠道默认是否回填推理内容」
+	// （sys_configs，默认开启）。nil/读取失败按开启处理；返回 false 时未配置渠道的 thinking 一律丢
+	// （回滚到改造前行为）。该默认只对「目标协议为 openai-chat」的转换注入与会话级缓存回填生效。
+	ThinkingRoundtripDefaultEnabled func() bool
 }
 
 // NewGateway 构造网关。缺省项使用合理默认值。
@@ -237,32 +248,42 @@ func NewGateway(cfg GatewayConfig) *Gateway {
 		}
 	}
 	return &Gateway{
-		tokens:              cfg.Tokens,
-		router:              cfg.Router,
-		channels:            cfg.Channels,
-		billing:             cfg.Billing,
-		models:              cfg.Models,
-		channelModels:       cfg.ChannelModels,
-		protocols:           cfg.Protocols,
-		protocolStats:       cfg.ProtocolErrorStats,
-		tagKV:               cfg.TagKV,
-		auto:                cfg.Auto,
-		pricing:             cfg.Pricing,
-		balance:             cfg.Balance,
-		credit:              cfg.Credit,
-		providerFactory:     cfg.ProviderFactory,
-		sessionExpiry:       cfg.SessionExpiry,
-		touchLastUsed:       cfg.TouchLastUsed,
-		listEnabled:         cfg.ListEnabledModels,
-		listAutoModels:      cfg.ListAutoModels,
-		logger:              cfg.Logger,
-		now:                 cfg.Now,
-		client:              cfg.Client,
-		streamClient:        cfg.StreamClient,
-		upstreamRespHeaders: respHeaders,
-		protocolConvEnabled: cfg.ProtocolConversionEnabled,
-		reasoning:           NewReasoningCache(),
+		tokens:                   cfg.Tokens,
+		router:                   cfg.Router,
+		channels:                 cfg.Channels,
+		billing:                  cfg.Billing,
+		models:                   cfg.Models,
+		channelModels:            cfg.ChannelModels,
+		protocols:                cfg.Protocols,
+		protocolStats:            cfg.ProtocolErrorStats,
+		tagKV:                    cfg.TagKV,
+		auto:                     cfg.Auto,
+		pricing:                  cfg.Pricing,
+		balance:                  cfg.Balance,
+		credit:                   cfg.Credit,
+		providerFactory:          cfg.ProviderFactory,
+		sessionExpiry:            cfg.SessionExpiry,
+		touchLastUsed:            cfg.TouchLastUsed,
+		listEnabled:              cfg.ListEnabledModels,
+		listAutoModels:           cfg.ListAutoModels,
+		logger:                   cfg.Logger,
+		now:                      cfg.Now,
+		client:                   cfg.Client,
+		streamClient:             cfg.StreamClient,
+		upstreamRespHeaders:      respHeaders,
+		protocolConvEnabled:      cfg.ProtocolConversionEnabled,
+		reasoning:                NewReasoningCache(),
+		thinkingRoundtripDefault: cfg.ThinkingRoundtripDefaultEnabled,
 	}
+}
+
+// thinkingRoundtripDefaultEnabled 返回未挂载 thinking-roundtrip 渠道的默认回填开关：
+// 未装配/读取失败/解析失败一律按默认开启处理（与 protocolConvEnabled 同口径）。
+func (g *Gateway) thinkingRoundtripDefaultEnabled() bool {
+	if g.thinkingRoundtripDefault == nil {
+		return true
+	}
+	return g.thinkingRoundtripDefault()
 }
 
 // SetCallLogs 注入调用日志存储（nil=不采集调用日志；测试与未装配场景安全）。

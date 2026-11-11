@@ -1,6 +1,7 @@
 package protocolconv
 
 import (
+	"bytes"
 	"reflect"
 	"strconv"
 	"strings"
@@ -115,6 +116,48 @@ func TestStream(t *testing.T) {
 			t.Fatalf("cross-protocol mismatch\nfirst:  %s\nsecond: %s", dumpEvents(first), dumpEvents(second))
 		}
 	})
+}
+
+// TestAnthropicThinkingSignatureStream 断言 anthropic 流式的 thinking 块（thinking_delta +
+// signature_delta）在解码/编码往返后形状正确：signature_delta 解码为 DeltaSignature、
+// 编码回 anthropic 帧为 signature_delta（在 content_block_stop 之前）。
+func TestAnthropicThinkingSignatureStream(t *testing.T) {
+	const sample = `event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","signature":"sig-abc"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Let me think"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-abc"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+`
+	codec := anthropicCodec{}
+	evs := decodeSSE(t, codec, sample)
+	var sawThinking, sawSignature bool
+	for _, ev := range evs {
+		if ev.DeltaKind == DeltaThinking {
+			sawThinking = true
+		}
+		if ev.DeltaKind == DeltaSignature && ev.Signature == "sig-abc" {
+			sawSignature = true
+		}
+	}
+	if !sawThinking || !sawSignature {
+		t.Fatalf("应解码出 thinking_delta 与 signature_delta，events=%s", dumpEvents(evs))
+	}
+	// 编码回 anthropic：signature_delta 帧必须存在。
+	frames := encodeFrames(t, codec, evs)
+	joined := string(bytes.Join(frames, nil))
+	if !strings.Contains(joined, `"type":"signature_delta"`) || !strings.Contains(joined, `"signature":"sig-abc"`) {
+		t.Fatalf("编码回 anthropic 应含 signature_delta，got %s", joined)
+	}
+	// 帧序：signature_delta 在 content_block_stop 之前。
+	if idx := strings.Index(joined, `"type":"signature_delta"`); idx < 0 || strings.Index(joined, "content_block_stop") < idx {
+		t.Fatalf("signature_delta 应在 content_block_stop 之前，got %s", joined)
+	}
 }
 
 func TestEmptyStopReasonNotLeaking(t *testing.T) {

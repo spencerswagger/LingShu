@@ -57,6 +57,11 @@ var defaultSysConfigs = map[string]string{
 	"routing.session_cost": `{"enabled":true,"mid_switch":true,"shadow_enabled":false,"remaining_a":10,"remaining_b":1,"remaining_min":1,"remaining_max":20,"min_remaining":1,"cooldown_sec":300,"min_improve":0.05}`,
 	// 会话过期分档兜底与示例档位（双维度取较大者，且不低于兜底 5 分钟）。
 	"session.expiration": `{"default_ttl_minutes":5,"context_tiers":[{"max_tokens":2000,"ttl_minutes":5},{"max_tokens":8000,"ttl_minutes":30},{"max_tokens":32000,"ttl_minutes":180},{"max_tokens":128000,"ttl_minutes":1440}],"turn_tiers":[{"max_turns":2,"ttl_minutes":5},{"max_turns":10,"ttl_minutes":30},{"max_turns":50,"ttl_minutes":180},{"max_turns":200,"ttl_minutes":1440}]}`,
+	// 未挂载 thinking-roundtrip 的渠道默认回填推理内容（2026-11-11 修 anthropic 入站 thinking 多轮 400）：
+	// 默认 true（回填），置 false 即回滚到改造前（未配置渠道 thinking 一律丢）。
+	// 显式挂载 thinking-roundtrip 的渠道以挂载参数为准，本键只作用于未挂载渠道。
+	// 注意 ON CONFLICT DO NOTHING：存量库已有的旧值不会被本种子覆盖，需显式开启/关闭。
+	"gateway.thinking_roundtrip.default_enabled": `true`,
 }
 
 // systemUser / systemToken 常量：健康探测开销的归属身份（成本记账），用户侧界面隐藏。

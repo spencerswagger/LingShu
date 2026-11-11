@@ -282,6 +282,57 @@ func TestConvertedReasoningInjectHonorsOnlyThinking(t *testing.T) {
 	}
 }
 
+// TestConvertedReasoningInjectDefaultEnabled 验证「未挂载 thinking-roundtrip 的渠道默认回填」
+// （2026-11-11 修复 anthropic 入站 thinking 多轮 400 的第 4 条）：
+//   - 渠道未挂载任何特性（内联/引用协议 features 为空），全局默认开启 → 注入 reasoning_content；
+//   - 全局默认关闭 → 回滚到改造前（不注入）。
+func TestConvertedReasoningInjectDefaultEnabled(t *testing.T) {
+	const assistantHistory = `{"role":"assistant","content":[` +
+		`{"type":"thinking","thinking":"CoT","signature":"s"},` +
+		`{"type":"tool_use","id":"toolu_1","name":"f","input":{}}]},` +
+		`{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}`
+
+	cases := []struct {
+		name           string
+		defaultEnabled bool
+		wantInject     bool
+	}{
+		{name: "default_enabled_injects", defaultEnabled: true, wantInject: true},
+		{name: "default_disabled_rollback", defaultEnabled: false, wantInject: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var upstreamBody []byte
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				upstreamBody, _ = io.ReadAll(r.Body)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"id":"x","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},` +
+					`"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`))
+			}))
+			defer upstream.Close()
+
+			h := build(t, upstream.URL)
+			// 模型仅可达 openai-chat → anthropic 入站需转换为 openai-chat 上游。
+			h.chans.mrt.Model.Protocols = channelprotocol.Protocols{channelprotocol.ProtocolOpenAIChat: {}}
+			// 渠道未挂载任何协议特性（默认），全局默认开关按用例设置。
+			h.gw.thinkingRoundtripDefault = func() bool { return tc.defaultEnabled }
+
+			body := `{"model":"gpt-4","stream":false,"max_tokens":64,` +
+				`"thinking":{"type":"enabled"},"messages":[` + assistantHistory + `]}`
+			rec := postWithHeaders(t, h.gw, "/v1/messages", body, map[string]string{"x-api-key": "sk-gw-t"})
+			if rec.Code != http.StatusOK {
+				t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
+			}
+			got := string(upstreamBody)
+			injected := strings.Contains(got, `"reasoning_content":"CoT"`)
+			if injected != tc.wantInject {
+				t.Fatalf("reasoning_content 注入=%v, want %v；上游请求体: %s", injected, tc.wantInject, got)
+			}
+		})
+	}
+}
+
 // TestConvertedReasoningInjectReportsDroppedThinking 断言未注入时损耗报告如实记账：
 // 同一转换链路下不开注入选项，thinking 必须记为 message.content.thinking（不静默丢弃）。
 func TestConvertedReasoningInjectReportsDroppedThinking(t *testing.T) {
@@ -391,6 +442,68 @@ func TestStreamConversion(t *testing.T) {
 	// 计费用量取上游 openai usage（12/7）。
 	if len(h.billing.reqs) != 1 || h.billing.reqs[0].Tokens.Input != 12 || h.billing.reqs[0].Tokens.Output != 7 {
 		t.Fatalf("流式计费用量应取上游 openai usage, got %+v", h.billing.reqs)
+	}
+}
+
+// TestStreamConversionThinkingBlocks 端到端：openai-chat 上游流式返回 reasoning_content，
+// 下游 anthropic 必须下发「合法 thinking 块」：
+//   - 首块 content_block_start{type:"thinking"}（修复前被标成 text）；
+//   - thinking_delta 只出现在 thinking 块内；
+//   - signature_delta 在 content_block_stop 之前；
+//   - text 与 thinking 独立分配下标（上游共用 Index:0，下游不得并进同一块）。
+func TestStreamConversionThinkingBlocks(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(
+			"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"reasoning_content\":\"思考中\"}}]}\n\n" +
+				"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"回答正文\"}}]}\n\n" +
+				"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":7}}\n\n" +
+				"data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	h := build(t, upstream.URL)
+	// 模型仅可达 openai-chat → anthropic-messages 入站需转换为 openai-chat 上游。
+	h.chans.mrt.Model.Protocols = channelprotocol.Protocols{channelprotocol.ProtocolOpenAIChat: {}}
+
+	rec := postWithHeaders(t, h.gw, "/v1/messages",
+		`{"model":"gpt-4","stream":true,"max_tokens":100,"messages":[{"role":"user","content":"ping"}]}`,
+		map[string]string{"x-api-key": "sk-gw-t"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+
+	// 验收②：首块必须是 content_block_start{type:"thinking"}。
+	// 修复前 reasoning_content 被映射成 content_block_start{type:"text"}。
+	if !strings.Contains(body, `"content_block":{"type":"thinking"`) {
+		t.Fatalf("下游 anthropic 应有 content_block_start{type:thinking}，got %s", body)
+	}
+	if strings.Contains(body, `"content_block":{"type":"text","signature"`) {
+		t.Fatalf("thinking 不应被映射成 text 块，got %s", body)
+	}
+	// thinking_delta 只应在 thinking 块内（存在 thinking_delta 且不存在 text 块内 thinking_delta）。
+	if !strings.Contains(body, `"type":"thinking_delta"`) {
+		t.Fatalf("下游应有 thinking_delta，got %s", body)
+	}
+	// signature_delta 在 content_block_stop 之前。
+	deltaIdx := strings.Index(body, `"type":"signature_delta"`)
+	stopIdx := strings.Index(body, "event: content_block_stop")
+	if deltaIdx < 0 {
+		t.Fatalf("thinking 块应下发 signature_delta，got %s", body)
+	}
+	if stopIdx >= 0 && deltaIdx > stopIdx {
+		t.Fatalf("signature_delta 应在 content_block_stop 之前，got %s", body)
+	}
+	// text 与 thinking 独立下标：上游共用 Index:0，下游必须拆成两个块（index 0 = thinking，
+	// index 1 = text），否则客户端历史里没有合法 thinking 块。
+	if !strings.Contains(body, `"index":0`) || !strings.Contains(body, `"index":1`) {
+		t.Fatalf("text/thinking 应独立成块并分配不同下标，got %s", body)
+	}
+	// 首块必须是 thinking（index 0），text 不得与 thinking 同块。
+	if idx0 := strings.Index(body, `"index":0`); idx0 < 0 || !strings.Contains(body[idx0:], "thinking") {
+		t.Fatalf("index 0 块应为 thinking，got %s", body)
 	}
 }
 

@@ -198,12 +198,13 @@ func parseThinkingRoundtripParams(params map[string]any) thinkingRoundtripParams
 
 // reasoningDeclaration 是渠道对「推理内容回传」的声明（来自挂载的 thinking-roundtrip 参数）。
 type reasoningDeclaration struct {
+	Mounted      bool   // 渠道协议是否显式挂载 thinking-roundtrip 特性
 	Supported    bool   // 是否声明该上游支持推理内容回传（enabled=true）
 	Field        string // 请求侧写入字段名（缺省 reasoning_content，已去空白）
 	OnlyThinking bool   // 是否仅对显式 thinking 模式的请求生效
 }
 
-// reasoningDeclarationOf 单次遍历协议特性解析上述声明；未挂载该特性时返回「不支持 + 默认字段名」。
+// reasoningDeclarationOf 单次遍历协议特性解析上述声明；未挂载该特性时返回「未挂载 + 不支持 + 默认字段名」。
 func reasoningDeclarationOf(rt *channel.RuntimeChannel) reasoningDeclaration {
 	for _, f := range protocolFeatures(rt) {
 		if f.Key != channelprotocol.FeatureThinkingRoundtrip {
@@ -211,6 +212,7 @@ func reasoningDeclarationOf(rt *channel.RuntimeChannel) reasoningDeclaration {
 		}
 		p := parseThinkingRoundtripParams(f.Params)
 		return reasoningDeclaration{
+			Mounted:      true,
 			Supported:    p.Enabled,
 			Field:        p.Field,
 			OnlyThinking: p.OnlyThinking,
@@ -220,17 +222,32 @@ func reasoningDeclarationOf(rt *channel.RuntimeChannel) reasoningDeclaration {
 }
 
 // channelReasoningInject 返回本次请求实际生效的「推理注入/回填」选项：
-// 需渠道声明支持（thinking-roundtrip enabled=true）；若同时声明 onlyThinking=true，则仅当
-// 调用方以入站请求体判定请求处于 thinking 模式（thinking 布尔/对象、enable_thinking、
-// reasoning_effort，见 isThinkingRequestBody）后传入 true 时才生效。该判定与直通路径
-// thinking-roundtrip 的 onlyThinking 同源，三条路径（直通改写、转换注入、会话级缓存回填）语义一致。
-// 注意：判定只按请求体字段进行，不含「模型名隐含 thinking」（如 reasoner 类模型）；这类渠道应保持
-// onlyThinking=false（前端提示已注明），否则推理内容不会回传、上游仍会 400。
-// 未声明/未启用/不满足 onlyThinking 时返回零值：调用方据此既不注入也不回填，请求体逐字节不变。
+//
+// 生效规则（2026-11-11 修复 anthropic 入站 thinking 多轮 400 后）：
+//   - 渠道协议**显式挂载** thinking-roundtrip：以挂载参数为准（enabled 缺省 false，仍须显式
+//     enabled=true 才启用；onlyThinking 同前）。显式挂载是运维的明确意图，保持「缺省关闭」语义不变，
+//     避免存量「挂载但未开 enabled」的渠道被悄悄改行为。
+//   - 渠道协议**未挂载**：采用全局默认（defaultEnabled，来自 sys_configs
+//     `gateway.thinking_roundtrip.default_enabled`，默认 true）。默认开启使未配置的渠道
+//     （Anthropic 入站 → openai-chat 上游的 thinking 多轮场景）不再丢 thinking → 消除上游 400；
+//     该默认受全局开关控制，关闭即回滚到改造前行为（未配置渠道 thinking 一律丢）。
+//     **安全边界**：转换注入只对 openai-chat 目标生效（SerializeOptions 仅 openai-chat 序列化器读取）；
+//     会话级缓存回填只在目标为 openai-chat 且缓存命中（网关曾从该上游看到 reasoning_content）时写入，
+//     即「上游确实是 thinking 模型」时才会真正改写请求体，不会向非 thinking 上游注入未知字段。
+//
+// 未启用/不满足 onlyThinking 时返回零值：调用方据此既不注入也不回填，请求体逐字节不变。
 // thinking 标记与候选渠道无关（body 与 rewriteModel 后的 body 仅 model 字段不同），
 // 由调用方在候选循环外对原始入站请求体单次求值后传入，避免每个候选重复解析同一请求体。
-func channelReasoningInject(rt *channel.RuntimeChannel, thinking bool) protocolconv.SerializeOptions {
+func channelReasoningInject(rt *channel.RuntimeChannel, thinking bool, defaultEnabled bool) protocolconv.SerializeOptions {
 	decl := reasoningDeclarationOf(rt)
+	if !decl.Mounted {
+		// 未挂载该特性：回落到全局默认（defaultEnabled）。显式挂载（含 enabled=false）
+		// 是运维的明确意图，全局默认不覆盖。
+		if !defaultEnabled {
+			return protocolconv.SerializeOptions{}
+		}
+		decl = reasoningDeclaration{Supported: true, Field: reasoningResponseField}
+	}
 	if !decl.Supported {
 		return protocolconv.SerializeOptions{}
 	}
