@@ -99,13 +99,15 @@ func seedStatsWindowFixture(t *testing.T, d *sql.DB) {
 	exec(`INSERT INTO external_models(id, external_name) VALUES (31,'gpt-4o')`)
 	// 只有渠道 1 + gpt-4o-int 配了解析映射；ghost-int 在渠道 2 没有配置。
 	exec(`INSERT INTO channel_models(id, channel_id, internal_model_id, external_model_id) VALUES (900,1,'gpt-4o-int',31)`)
-	exec(`INSERT INTO billing_records(id,billing_id,user_id,pricing_mode,external_model_name,internal_model_id,channel_key_id,r_value,tokens,credits_consumed,cost_credits,status,duration_ms,call_time) VALUES
-	 (1,'w1',7,'sale','gpt-4o','gpt-4o-int',100,1,'{"input":100,"cache_read":0,"output":0}'::jsonb,1.0,0.5,'completed',1000,'2026-10-24 23:59:00+08'),
-	 (2,'w2',7,'sale','gpt-4o','gpt-4o-int',100,1,'{"input":200,"cache_read":0,"output":0}'::jsonb,2.0,1.0,'completed',2000,'2026-10-25 00:01:00+08'),
-	 (3,'w3',7,'sale','gpt-4o','gpt-4o-int',100,1,'{"input":400,"cache_read":0,"output":0}'::jsonb,4.0,2.0,'completed',4000,'2026-10-24 11:00:00+08'),
-	 (4,'w4',7,'sale','gpt-4o','gpt-4o-int',100,1,'{"input":800,"cache_read":0,"output":0}'::jsonb,8.0,4.0,'completed',8000,'2026-10-25 12:30:00+08'),
-	 (5,'w5',7,'sale','gpt-4o-legacy','gpt-4o-int',100,1,'{"input":50,"cache_read":0,"output":0}'::jsonb,0.5,0.25,'completed',500,'2026-10-25 09:00:00+08'),
-	 (6,'w6',7,'sale','ghost-model','ghost-int',200,1,'{"input":70,"cache_read":0,"output":0}'::jsonb,0.7,0.35,'completed',700,'2026-10-25 10:00:00+08')`)
+	// 0020 起统计/KPI 读三段 token 实体列（不再解析 tokens JSONB），
+	// 故夹具必须同时写实体列——只写 JSONB 会让 token 统计恒为 0（= 夹具与生产写入路径不一致）。
+	exec(`INSERT INTO billing_records(id,billing_id,user_id,pricing_mode,external_model_name,internal_model_id,channel_key_id,r_value,tokens,input_tokens,cache_read_tokens,output_tokens,credits_consumed,cost_credits,status,duration_ms,call_time) VALUES
+	 (1,'w1',7,'sale','gpt-4o','gpt-4o-int',100,1,'{"input":100,"cache_read":0,"output":0}'::jsonb,100,0,0,1.0,0.5,'completed',1000,'2026-10-24 23:59:00+08'),
+	 (2,'w2',7,'sale','gpt-4o','gpt-4o-int',100,1,'{"input":200,"cache_read":0,"output":0}'::jsonb,200,0,0,2.0,1.0,'completed',2000,'2026-10-25 00:01:00+08'),
+	 (3,'w3',7,'sale','gpt-4o','gpt-4o-int',100,1,'{"input":400,"cache_read":0,"output":0}'::jsonb,400,0,0,4.0,2.0,'completed',4000,'2026-10-24 11:00:00+08'),
+	 (4,'w4',7,'sale','gpt-4o','gpt-4o-int',100,1,'{"input":800,"cache_read":0,"output":0}'::jsonb,800,0,0,8.0,4.0,'completed',8000,'2026-10-25 12:30:00+08'),
+	 (5,'w5',7,'sale','gpt-4o-legacy','gpt-4o-int',100,1,'{"input":50,"cache_read":0,"output":0}'::jsonb,50,0,0,0.5,0.25,'completed',500,'2026-10-25 09:00:00+08'),
+	 (6,'w6',7,'sale','ghost-model','ghost-int',200,1,'{"input":70,"cache_read":0,"output":0}'::jsonb,70,0,0,0.7,0.35,'completed',700,'2026-10-25 10:00:00+08')`)
 }
 
 // statsUsageForTest 按给定查询串跑一次 buildStatsUsage（admin 口径、全局范围）。
@@ -283,10 +285,10 @@ func TestStats_SoftDeletedModelGoesUnmatched(t *testing.T) {
 	exec(`INSERT INTO external_models(id, external_name) VALUES (701,'legacy-model'),(702,'gpt-4o')`)
 	exec(`INSERT INTO channel_models(id, channel_id, internal_model_id, external_model_id) VALUES
 	       (900,1,'legacy-int',701), (901,1,'gpt-4o-int',702)`)
-	exec(`INSERT INTO billing_records(id,billing_id,user_id,pricing_mode,external_model_name,internal_model_id,channel_key_id,r_value,tokens,credits_consumed,cost_credits,status,duration_ms,call_time) VALUES
-	 (1,'s1',7,'sale','gpt-4o','gpt-4o-int',100,1,'{"input":400,"cache_read":0,"output":0}'::jsonb,4.0,2.0,'completed',1000,'2026-10-25 09:00:00+08'),
-	 (2,'s2',7,'sale','gpt-4o','gpt-4o-int',100,1,'{"input":50,"cache_read":0,"output":0}'::jsonb,0.5,0.25,'completed',500,'2026-10-25 09:30:00+08'),
-	 (3,'s3',7,'sale','legacy-model','legacy-int',100,1,'{"input":60,"cache_read":0,"output":0}'::jsonb,0.6,0.3,'completed',600,'2026-10-25 10:00:00+08')`)
+	exec(`INSERT INTO billing_records(id,billing_id,user_id,pricing_mode,external_model_name,internal_model_id,channel_key_id,r_value,tokens,input_tokens,cache_read_tokens,output_tokens,credits_consumed,cost_credits,status,duration_ms,call_time) VALUES
+	 (1,'s1',7,'sale','gpt-4o','gpt-4o-int',100,1,'{"input":400,"cache_read":0,"output":0}'::jsonb,400,0,0,4.0,2.0,'completed',1000,'2026-10-25 09:00:00+08'),
+	 (2,'s2',7,'sale','gpt-4o','gpt-4o-int',100,1,'{"input":50,"cache_read":0,"output":0}'::jsonb,50,0,0,0.5,0.25,'completed',500,'2026-10-25 09:30:00+08'),
+	 (3,'s3',7,'sale','legacy-model','legacy-int',100,1,'{"input":60,"cache_read":0,"output":0}'::jsonb,60,0,0,0.6,0.3,'completed',600,'2026-10-25 10:00:00+08')`)
 	// 软删 701：历史账单仍在，实体解析仍能解析到 701（解析不看 deleted_at），但目录里它不算在册。
 	exec(`UPDATE external_models SET deleted_at = now() WHERE id = 701`)
 
