@@ -70,11 +70,14 @@ type DevCallLogView struct {
 	Status        string `json:"Status"`
 	RespKind      string `json:"RespKind"`
 	ErrorMessage  string `json:"ErrorMessage"`
-	DurationMs    *int64 `json:"DurationMs,omitempty"`
-	FirstTokenMs  *int64 `json:"FirstTokenMs,omitempty"`
-	CallTime      string `json:"CallTime"`
-	ReqMessages   any    `json:"ReqMessages"`
-	RespBody      string `json:"RespBody"`
+	// UpstreamStatus 上游真实 HTTP 状态码（仅上游非 2xx 的失败记录有值）：
+	// 与共享 CallLogView 同键同义；不含渠道/密钥/内部模型信息，故不在 devSensitiveKeys 里。
+	UpstreamStatus *int   `json:"UpstreamStatus,omitempty"`
+	DurationMs     *int64 `json:"DurationMs,omitempty"`
+	FirstTokenMs   *int64 `json:"FirstTokenMs,omitempty"`
+	CallTime       string `json:"CallTime"`
+	ReqMessages    any    `json:"ReqMessages"`
+	RespBody       string `json:"RespBody"`
 	// Decision / ReqParams 为**白名单过滤后**的副本（未白名单的键不会出现）。
 	Decision      any    `json:"Decision"`
 	ReqParams     any    `json:"ReqParams"`
@@ -103,23 +106,24 @@ func toDevCallLogView(cl *gateway.CallLog) *DevCallLogView {
 	}
 	reqMsgs := decodeJSONValue(cl.ReqMessages)
 	return &DevCallLogView{
-		BillingID:     cl.BillingID,
-		RequestID:     cl.RequestID,
-		SessionID:     cl.SessionID,
-		Model:         cl.Model,
-		AutoModelName: cl.AutoModelName,
-		Status:        cl.Status,
-		RespKind:      cl.RespKind,
-		ErrorMessage:  cl.ErrorMessage,
-		DurationMs:    cl.DurationMs,
-		FirstTokenMs:  cl.FirstTokenMs,
-		CallTime:      cl.CreatedAt.Format(time.RFC3339),
-		ReqMessages:   reqMsgs,
-		RespBody:      cl.RespBody,
-		Decision:      filterDecisionForDev(decodeJSONValue(cl.Decision)),
-		ReqParams:     filterReqParamsForDev(decodeJSONValue(cl.ReqParams)),
-		UpstreamUsage: decodeUpstreamUsage(cl.UpstreamUsage),
-		PricingMode:   cl.PricingMode,
+		BillingID:      cl.BillingID,
+		RequestID:      cl.RequestID,
+		SessionID:      cl.SessionID,
+		Model:          cl.Model,
+		AutoModelName:  cl.AutoModelName,
+		Status:         cl.Status,
+		RespKind:       cl.RespKind,
+		ErrorMessage:   cl.ErrorMessage,
+		UpstreamStatus: cl.UpstreamStatus,
+		DurationMs:     cl.DurationMs,
+		FirstTokenMs:   cl.FirstTokenMs,
+		CallTime:       cl.CreatedAt.Format(time.RFC3339),
+		ReqMessages:    reqMsgs,
+		RespBody:       cl.RespBody,
+		Decision:       filterDecisionForDev(decodeJSONValue(cl.Decision)),
+		ReqParams:      filterReqParamsForDev(decodeJSONValue(cl.ReqParams)),
+		UpstreamUsage:  decodeUpstreamUsage(cl.UpstreamUsage),
+		PricingMode:    cl.PricingMode,
 	}
 }
 
