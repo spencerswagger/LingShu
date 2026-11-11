@@ -124,6 +124,7 @@ func (s *Server) routes() {
 	admin.HandleFunc("POST /api/v1/admin/channels/batch-delete", d.Channel.HandleBatchDelete)
 	admin.HandleFunc("GET /api/v1/admin/channels/{id}/model-events", d.Channel.HandleListModelEvents)
 	admin.HandleFunc("GET /api/v1/admin/channels/{id}/probe-logs", d.Channel.HandleListProbeLogs)
+	admin.HandleFunc("GET /api/v1/admin/channels/{id}/probe-logs/{logID}", d.Channel.HandleGetProbeLog)
 	admin.HandleFunc("GET /api/v1/admin/channels/cron-preview", d.Channel.HandleCronPreview)
 	admin.HandleFunc("PUT /api/v1/admin/channels/{id}/models/{mid}/state", d.Channel.HandleModelState)
 	admin.HandleFunc("GET /api/v1/admin/channels/snapshot", d.Console.HandleChannelSnapshot)

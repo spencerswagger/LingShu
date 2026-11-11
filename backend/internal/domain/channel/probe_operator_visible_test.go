@@ -500,7 +500,61 @@ func TestHandleListProbeLogs_BoundsPayload(t *testing.T) {
 	if !strings.Contains(got.Data[0].ErrorBody, "已截断") {
 		t.Fatalf("截断必须在同一字段标注, got %q", got.Data[0].ErrorBody[len(got.Data[0].ErrorBody)-80:])
 	}
+	if !got.Data[0].ErrorBodyTruncated {
+		t.Fatal("列表里的预览必须置 ErrorBodyTruncated=true（调用方据此去详情端点取全文）")
+	}
 	if len(rec.Body.Bytes()) > 64<<10 {
 		t.Fatalf("单次列表响应必须收口到 64KB 量级, got %d 字节", len(rec.Body.Bytes()))
+	}
+}
+
+// TestHandleGetProbeLog_ReturnsFullBody 列表只给 4KB 预览，完整原文必须能从单条记录端点取到
+// （否则「列表收口」等于把运营要看的长报文彻底藏起来）。
+func TestHandleGetProbeLog_ReturnsFullBody(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+	svc := NewService(NewStore(db))
+	svc.SetChannelModelStore(NewChannelModelStore(db))
+	h := NewHandler(svc)
+
+	now := time.Now()
+	full := strings.Repeat("x", 30<<10) // 30KB：列表里会被压成 4KB 预览，详情应为全文
+	cols := []string{"id", "channel_key_id", "model_id", "level", "target", "ok", "error",
+		"upstream_status", "error_body", "input_tokens", "output_tokens", "cached_tokens", "total_tokens",
+		"duration_ms", "created_at"}
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT p.id, p.channel_key_id, p.model_id, p.level, p.target, p.ok, p.error, p.upstream_status,
+		        p.error_body, p.input_tokens, p.output_tokens, p.cached_tokens, p.total_tokens, p.duration_ms, p.created_at
+		 FROM probe_logs p JOIN channel_keys k ON k.id = p.channel_key_id
+		 WHERE p.id = $1 AND k.channel_id = $2`)).
+		WithArgs(int64(7), int64(1)).
+		WillReturnRows(sqlmock.NewRows(cols).
+			AddRow(int64(7), int64(11), "m1", "model", "https://a.example.com/chat/completions",
+				false, "probe http status: 400", 400, full, 0, 0, 0, 0, 12, now))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/channels/1/probe-logs/7", nil)
+	req.SetPathValue("id", "1")
+	req.SetPathValue("logID", "7")
+	rec := httptest.NewRecorder()
+	h.HandleGetProbeLog(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var got struct {
+		Data ProbeLog `json:"Data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Data.ErrorBody != full {
+		t.Fatalf("详情必须返回完整原文（%d 字节），got %d 字节", len(full), len(got.Data.ErrorBody))
+	}
+	if got.Data.ErrorBodyTruncated {
+		t.Fatal("详情端点不应标记截断")
+	}
+	if got.Data.UpstreamStatus != 400 {
+		t.Fatalf("upstream_status want 400, got %d", got.Data.UpstreamStatus)
 	}
 }

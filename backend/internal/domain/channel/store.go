@@ -132,13 +132,16 @@ type ProbeLog struct {
 	UpstreamStatus int `json:"UpstreamStatus,omitempty"`
 	// ErrorBody 上游错误响应体**原文**（运营可见）：逐字节保真，仅遮蔽本次实际使用的凭据；
 	// 超 probeErrBodyMaxBytes 时截断并在同一字段标注。空=上游没返回错误体。
-	ErrorBody    string    `json:"ErrorBody,omitempty"`
-	InputTokens  int       `json:"InputTokens"`
-	OutputTokens int       `json:"OutputTokens"`
-	CachedTokens int       `json:"CachedTokens"`
-	TotalTokens  int       `json:"TotalTokens"`
-	DurationMS   int       `json:"DurationMS"`
-	CreatedAt    time.Time `json:"CreatedAt"`
+	ErrorBody string `json:"ErrorBody,omitempty"`
+	// ErrorBodyTruncated 仅**列表**返回时为 true：受列表体积预算限制，ErrorBody 只是预览，
+	// 完整原文用 GET /api/v1/admin/channels/{id}/probe-logs/{logID} 取（落库列始终是完整值）。
+	ErrorBodyTruncated bool      `json:"ErrorBodyTruncated,omitempty"`
+	InputTokens        int       `json:"InputTokens"`
+	OutputTokens       int       `json:"OutputTokens"`
+	CachedTokens       int       `json:"CachedTokens"`
+	TotalTokens        int       `json:"TotalTokens"`
+	DurationMS         int       `json:"DurationMS"`
+	CreatedAt          time.Time `json:"CreatedAt"`
 }
 
 // channelCols 列出 channels 表查询时使用的全部列，保持各查询一致。
