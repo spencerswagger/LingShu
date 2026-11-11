@@ -3,17 +3,13 @@ package gateway
 import (
 	"context"
 	"database/sql"
-	"fmt"
-	"net/url"
-	"os"
-	"regexp"
 	"testing"
 	"time"
 	"unicode/utf8"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
-	"github.com/team/llmgateway/internal/db"
+	"github.com/team/llmgateway/internal/testutil/pgtest"
 )
 
 // 本文件是 call_logs 读写链路的**真实 PG** 守卫：
@@ -97,48 +93,8 @@ func TestCallLog_PgRoundTrip_InvalidUTF8Payload(t *testing.T) {
 }
 
 // openCallLogTempDB 建一次性库并跑全部迁移（含 0019 upstream_status）；测试结束无条件删库。
-// 未设置 LLMGATEWAY_TEST_PG_DSN 时才跳过（本地无 PG 的机器）。
+// 只有「本机没有 PG」才跳过；CI 里 DSN 指向空库照样真跑（不再靠「库里没表」假装绿）。
 func openCallLogTempDB(t *testing.T) *sql.DB {
 	t.Helper()
-	dsn := os.Getenv("LLMGATEWAY_TEST_PG_DSN")
-	if dsn == "" {
-		t.Skip("未设置 LLMGATEWAY_TEST_PG_DSN，跳过 call_logs 真库读写测试")
-	}
-	admin, err := db.Open(dsn)
-	if err != nil {
-		t.Fatalf("打开管理连接失败: %v", err)
-	}
-	t.Cleanup(func() { _ = admin.Close() })
-	if err := admin.Ping(); err != nil {
-		t.Fatalf("管理连接 ping 失败（DSN 是否可达?）: %v", err)
-	}
-
-	name := fmt.Sprintf("llmgateway-calllog-%d", time.Now().UnixNano())
-	if !regexp.MustCompile(`^[a-z0-9-]+$`).MatchString(name) {
-		t.Fatalf("临时库名非法: %s", name)
-	}
-	if _, err := admin.Exec(`CREATE DATABASE "` + name + `"`); err != nil {
-		t.Fatalf("创建临时库 %s 失败: %v", name, err)
-	}
-	t.Cleanup(func() {
-		_, _ = admin.Exec(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1`, name)
-		if _, derr := admin.Exec(`DROP DATABASE IF EXISTS "` + name + `"`); derr != nil {
-			t.Logf("删除临时库 %s 失败: %v", name, derr)
-		}
-	})
-
-	tmpl, err := url.Parse(dsn)
-	if err != nil {
-		t.Fatalf("解析 DSN 失败: %v", err)
-	}
-	tmpl.Path = "/" + name
-	temp, err := db.Open(tmpl.String())
-	if err != nil {
-		t.Fatalf("打开临时库失败: %v", err)
-	}
-	t.Cleanup(func() { _ = temp.Close() })
-	if _, err := db.Migrate(context.Background(), temp); err != nil {
-		t.Fatalf("临时库迁移失败: %v", err)
-	}
-	return temp
+	return pgtest.OpenTempMigrated(t, "llmgateway-calllog")
 }

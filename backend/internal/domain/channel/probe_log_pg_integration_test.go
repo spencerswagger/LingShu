@@ -2,14 +2,13 @@ package channel
 
 import (
 	"context"
-	"database/sql"
 	"math/rand"
-	"os"
 	"testing"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
+	"github.com/team/llmgateway/internal/testutil/pgtest"
 	"github.com/team/llmgateway/internal/testutil/randbody"
 )
 
@@ -20,24 +19,8 @@ import (
 //	LLMGATEWAY_TEST_PG_DSN='postgres://user:pass@host:port/db?sslmode=disable' \
 //	  go test ./internal/domain/channel/ -run TestProbeLog_PgRoundTrip -v
 func TestProbeLog_PgRoundTrip(t *testing.T) {
-	dsn := os.Getenv("LLMGATEWAY_TEST_PG_DSN")
-	if dsn == "" {
-		t.Skip("未设置 LLMGATEWAY_TEST_PG_DSN，跳过 probe_logs 真库读写测试")
-	}
-	db, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	defer db.Close()
-
-	// 目标库没跑过迁移（如 CI 里 DSN 指向空库）时跳过——本用例不负责建表。
-	var exists sql.NullString
-	if err := db.QueryRow(`SELECT to_regclass('public.probe_logs')::text`).Scan(&exists); err != nil {
-		t.Fatalf("probe probe_logs: %v", err)
-	}
-	if !exists.Valid || exists.String == "" {
-		t.Skip("目标库没有 probe_logs（未执行迁移），跳过真库读写测试")
-	}
+	// 自建一次性库 + 跑全部迁移：CI 里 DSN 指向空库也真跑，不再「库里没表就跳过」假装绿。
+	db := pgtest.OpenTempMigrated(t, "llmgateway-probelog")
 
 	seed := time.Now().UnixNano()
 	rnd := rand.New(rand.NewSource(seed))
