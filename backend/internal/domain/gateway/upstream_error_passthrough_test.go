@@ -923,21 +923,91 @@ func TestServeUpstreamError_DownstreamNeverSeesChannelCredential(t *testing.T) {
 
 // TestServeUpstreamError_BuildFailureNoAddress 构建上游请求失败（如渠道 BaseURL 非法）时，
 // 对外文案同样不得带出渠道地址——构建错误的底层文本可能含 `parse "http://<基址>/chat/completions": …`。
+// 三种畸形 BaseURL（渠道接口只校验 `http(s)://` 前缀，这些值都能存进去）各跑一遍。
 func TestServeUpstreamError_BuildFailureNoAddress(t *testing.T) {
-	// 故意给一个含空格与端口的非法 BaseURL：http.NewRequest 会在解析阶段失败，错误文本里带完整 URL。
-	h := build(t, "http://bad host:18080")
-	rec := doRequestWithID(t, h.gw, "/v1/chat/completions", "sk-gw-t", streamFlagged(false), "req-build")
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("构建失败应 502, got %d: %s", rec.Code, rec.Body.String())
+	cases := []struct {
+		name       string
+		baseURL    string
+		wantReason string   // 原因类别必须可辨认（不许退回「服务暂时不可用」）
+		leaks      []string // 一律不得出现在对外 message 里
+	}{
+		{"主机名含空格", "http://bad host:18080", "构建失败", []string{"http://", "bad host", "18080", "/chat/completions"}},
+		{"非法转义", "http://internal-gw.local:18080/%zz", "构建失败", []string{"http://", "internal-gw", ".local", "18080", "/chat/completions"}},
+		// 端口越界的 BaseURL 能通过 http.NewRequest 的解析，打到传输层才失败 → 走传输层归一路径。
+		{"端口越界", "http://internal-gw.local:99999999/x", "连接失败", []string{"http://", "internal-gw", ".local", "/x"}},
 	}
-	rb := decodeOpenAIError(t, rec)
-	if !strings.Contains(rb.Error.Message, "构建失败") {
-		t.Fatalf("要点名构建失败, got %q", rb.Error.Message)
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			h := build(t, tc.baseURL)
+			rec := doRequestWithID(t, h.gw, "/v1/chat/completions", "sk-gw-t", streamFlagged(false), "req-build")
+			if rec.Code != http.StatusBadGateway {
+				t.Fatalf("构建失败应 502, got %d: %s", rec.Code, rec.Body.String())
+			}
+			rb := decodeOpenAIError(t, rec)
+			// 原因必须可辨认：看得出是哪一类失败，而不是通用文案。
+			if !strings.Contains(rb.Error.Message, tc.wantReason) {
+				t.Fatalf("要点名 %q, got %q", tc.wantReason, rb.Error.Message)
+			}
+			for _, leak := range tc.leaks {
+				if strings.Contains(rb.Error.Message, leak) {
+					t.Fatalf("对外文案不得出现渠道地址片段 %q: %q", leak, rb.Error.Message)
+				}
+			}
+			// 运营侧仍留完整错误（含地址），否则无法定位是哪条渠道配置写错了。
+			if len(h.clogs.inserted) != 1 {
+				t.Fatalf("want 1 条调用日志, got %d", len(h.clogs.inserted))
+			}
+			if msg := h.clogs.inserted[0].ErrorMessage; !strings.Contains(msg, "http://") {
+				t.Fatalf("调用日志 error_message 应保留完整地址, got %q", msg)
+			}
+		})
 	}
-	for _, leak := range []string{"http://", "bad host", "18080", "/chat/completions"} {
-		if strings.Contains(rb.Error.Message, leak) {
-			t.Fatalf("对外文案不得出现渠道地址片段 %q: %q", leak, rb.Error.Message)
-		}
+}
+
+// TestRedactUpstreamAddr_BlindSpots 打码规则的盲区守卫（只作用于「未归类错误 / 构建失败」的兜底文案）：
+//   - 裸主机名**无端口**（DNS 解析失败：`lookup internal-gw.local: no such host`）；
+//   - 非 ASCII 域名（`内部网关.公司:18080` / `内部网关.公司`）。
+//
+// 同时钉住「不误抹正常文本」：错误标识、模型名、状态码必须原样保留。
+func TestRedactUpstreamAddr_BlindSpots(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "裸主机名无端口",
+			in:   `dial tcp: lookup internal-gw.local: no such host`,
+			want: `dial tcp: lookup <地址>: no such host`,
+		},
+		{
+			name: "非ASCII域名带端口",
+			in:   `dial tcp 内部网关.公司:18080: connect: connection refused`,
+			want: `dial tcp <地址>: connect: connection refused`,
+		},
+		{
+			name: "非ASCII域名无端口",
+			in:   `dial tcp 内部网关.公司: no such host`,
+			want: `dial tcp <地址> no such host`,
+		},
+		{
+			name: "带scheme的非法URL",
+			in:   `parse "http://internal-gw.local:18080/%zz/chat/completions": invalid URL escape "%zz"`,
+			want: `parse "<地址>": invalid URL escape "%zz"`,
+		},
+		{
+			name: "正常文本不被误抹",
+			in:   `invalid_request_error rate_limit_error gpt-4-turbo-2024-04-09 429 400`,
+			want: `invalid_request_error rate_limit_error gpt-4-turbo-2024-04-09 429 400`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := redactUpstreamAddr(tc.in); got != tc.want {
+				t.Fatalf("redactUpstreamAddr(%q) want %q, got %q", tc.in, tc.want, got)
+			}
+		})
 	}
 }
 

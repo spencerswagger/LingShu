@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"unicode"
 
 	"github.com/team/llmgateway/internal/pkg/errbody"
 )
@@ -387,6 +388,13 @@ var (
 	// 主机名里带空格/下划线等非法字符，正则域名规则匹配不到）。要求「非空白串 + 冒号 + 端口」，
 	// 因此不会误伤正文里的「错误码 400」这类文本。
 	anyHostPortRe = regexp.MustCompile(`(?i)[^\s"'(\[{]+:\d{1,5}(?:/[^\s"')]*)?`)
+	// bareHostRe 裸主机名（**无端口**）：DNS 解析失败的错误文本形如
+	// `dial tcp: lookup internal-gw.local: no such host`——没有 scheme、没有端口，前面几条都匹配不到。
+	// 末尾要求「点 + ≥2 个字母」的 TLD 样式，避免误伤 `3.14`、`v1.23`、`Go 1.21` 这类文本。
+	bareHostRe = regexp.MustCompile(`(?i)\b(?:[a-z0-9](?:[a-z0-9\-]*[a-z0-9])?\.)+[a-z]{2,}\b`)
+	// nonASCIIHostRe 切出候选 token（含非 ASCII 的域名无法用 ASCII 域名规则表达），
+	// 再由 maskNonASCIIHost 判断「含点 + 含非 ASCII 字符」才替换。
+	nonASCIIHostRe = regexp.MustCompile(`[^\s"'()\[\]{}<>，。；：！？、]+`)
 )
 
 // redactUpstreamAddr 抹掉文本里的渠道地址（URL / IP / 带端口主机名），保留其余可读线索。
@@ -400,7 +408,28 @@ func redactUpstreamAddr(s string) string {
 	s = ipv4Re.ReplaceAllString(s, "<地址>")
 	s = hostPortRe.ReplaceAllString(s, "<地址>")
 	s = anyHostPortRe.ReplaceAllString(s, "<地址>")
+	s = bareHostRe.ReplaceAllString(s, "<地址>")
+	s = maskNonASCIIHost(s)
 	return s
+}
+
+// maskNonASCIIHost 抹掉「含点且含非 ASCII 字符」的 token（如 `内部网关.公司`、`内部网关.公司:18080`）。
+// 纯 ASCII token 一律原样返回（ASCII 场景已由前面的规则处理，避免重复替换把 `<地址>` 再切碎）。
+func maskNonASCIIHost(s string) string {
+	if s == "" {
+		return s
+	}
+	return nonASCIIHostRe.ReplaceAllStringFunc(s, func(tok string) string {
+		if !strings.Contains(tok, ".") {
+			return tok
+		}
+		for _, r := range tok {
+			if r > unicode.MaxASCII {
+				return "<地址>"
+			}
+		}
+		return tok
+	})
 }
 
 // isTimeoutErr 判定错误是否属于超时（含 context deadline）。

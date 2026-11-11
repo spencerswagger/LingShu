@@ -223,7 +223,7 @@ usage 结算的 `completed` 记录，金额与既有口径一致；失败结论�
 | 对外透传 `error.message` | 64KB | 8KB | 同字段追加「…（已截断：上游原文共 N 字节，超过 8192 字节对外上限）」 |
 | `call_logs.resp_body` | 64KB | 32KB | 同字段追加「…（已截断：上游原文共 N 字节，此处只保留前 32768 字节）」；读满 64KB 时如实写「超过读取上限 65536 字节」 |
 | `probe_logs.error_body` / `ProbeOutcome.ErrorBody` | 64KB | 32KB | 同上（同一套 `errbody.TruncateUTF8`） |
-| **探活历史列表** `GET .../probe-logs` | 64KB（落库时） | **100 行 × 每行 4KB 预览** | 列表只给「这次为什么失败」的线索：超出的行按 4KB 预览 + `ErrorBodyTruncated=true` + 同字段标注，标注里直接写出详情端点路径；行数上限 100（历史值 500 行 × 32KB ≈ 16MB 单次响应） |
+| **探活历史列表** `GET .../probe-logs` | 64KB（落库时） | **100 行 × 每行 4KB 预览（最坏响应约 440KB）** | 列表只给「这次为什么失败」的线索：超出的行按 4KB 预览 + `ErrorBodyTruncated=true` + 同字段标注，标注里直接写出详情端点路径；行数上限 100。历史值 500 行 × 32KB ≈ 16MB 单次响应；现最坏 100 行 × 4KB + JSON 开销，实测 444,341 字节 |
 | **会话调用列表** `GET .../sessions/{id}/calls` | 32KB（落库时） | **每行 4KB 预览** | 同上口径：`RespBodyTruncated=true` + 同字段标注，全文走该账单详情接口（一个会话上百次失败否则就是数 MB JSON） |
 
 读取上限必须**显著大于**保存上限：读取层静默截断会导致「既拿不到完整内容、也无法诚实标注」。
@@ -262,7 +262,7 @@ usage 结算的 `completed` 记录，金额与既有口径一致；失败结论�
 | `TestOperatorView_SanitizesInvalidUTF8` | 含非法 UTF-8 / `0x00` 的报文产出合法 UTF-8 并同字段标注；合法原文零改动 |
 | `TestCallLog_PgRoundTrip_InvalidUTF8Payload` | 真库：非法 UTF-8 + `0x00` 的错误体仍能落库并读回（清洗后不丢内容） |
 | `TestToValidText`（`internal/pkg/errbody`） | 整理规则：非法字节 → `U+FFFD`、`0x00` → `<0x00>`、合法内容逐字节不变 |
-| `TestHandleListProbeLogs_BoundsPayload` | 探活历史：`Limit=500` 收敛到 100 行、每行原文 ≤4KB 且同字段标注、整包响应 ≤64KB |
+| `TestHandleListProbeLogs_BoundsPayload` | 探活历史：喂满 **100 行 × 32KB** 原文，断言 `Limit=500` 收敛到 100 行、每行预览 ≤4KB 且同字段标注 + `ErrorBodyTruncated=true`、最坏响应 ≤100×4KB+64KB（实测 444,341 字节） |
 | `TestCallLog_PgRoundTrip` / `TestCallLog_PgRoundTrip_InvalidUTF8Payload` | 真库用例改为**自建临时库 + 跑全部迁移**，CI 里不再「库里没表就跳过」假绿 |
 
 `backend/internal/domain/gateway/stream_error_frame_test.go`（流内 `error` 帧的留痕口径）：

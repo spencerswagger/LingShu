@@ -472,7 +472,8 @@ func nullableInt(v int) any {
 
 // probeListMaxRows 探活列表单次返回的最大行数（默认 100）。
 // 历史值 500 行 × 每行 error_body 上限 32KB ≈ 16MB，一个面板请求就能打出十几兆 JSON；
-// 列表是「最近若干次」的场景，100 行足够，配合下面每行原文的预览上限把响应压到百 KB 量级。
+// 列表是「最近若干次」的场景，100 行足够，配合下面每行原文的预览上限把**最坏**响应压到约 440KB
+// （100 行 × 4KB 预览 + JSON 开销，实测 444,341 字节；见 TestHandleListProbeLogs_BoundsPayload）。
 const probeListMaxRows = 100
 
 // probeListBodyMaxBytes 探活**列表**里每行 error_body 的预览上限（完整原文仍在 probe_logs.error_body）。

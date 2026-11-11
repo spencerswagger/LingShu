@@ -495,13 +495,18 @@ func TestHandleListProbeLogs_BoundsPayload(t *testing.T) {
 	plCols := []string{"id", "channel_key_id", "model_id", "level", "target", "ok", "error",
 		"upstream_status", "error_body", "input_tokens", "output_tokens", "cached_tokens", "total_tokens",
 		"duration_ms", "created_at"}
-	hugeBody := strings.Repeat("x", 30<<10)
-	// Limit=500 必须被收敛到 100（否则 500 行 × 32KB ≈ 16MB）。
-	mock.ExpectQuery(regexp.QuoteMeta(probeLogsSQL)).
-		WithArgs("{11}", 100).
-		WillReturnRows(sqlmock.NewRows(plCols).
-			AddRow(int64(1), int64(11), "m1", "model", "https://a.example.com/chat/completions",
-				false, "probe http status: 400", 400, hugeBody, 0, 0, 0, 0, 12, now))
+
+	// 造**满额 100 行 × 每行 32KB 原文**（落库上限），这才是「最坏响应体」：
+	// 每行会被压成 4KB 预览，断言必须按 100 行算总量，不能只喂 1 行（否则行数上限根本没被断言到）。
+	const rows = probeListMaxRows
+	const perRow = probeErrBodyMaxBytes
+	hugeBody := strings.Repeat("x", perRow)
+	rowsData := sqlmock.NewRows(plCols)
+	for i := 0; i < rows; i++ {
+		rowsData.AddRow(int64(i+1), int64(11), "m1", "model", "https://a.example.com/chat/completions",
+			false, "probe http status: 400", 400, hugeBody, 0, 0, 0, 0, 12, now)
+	}
+	mock.ExpectQuery(regexp.QuoteMeta(probeLogsSQL)).WithArgs("{11}", 100).WillReturnRows(rowsData)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/channels/1/probe-logs?Limit=500", nil)
 	req.SetPathValue("id", "1")
@@ -516,20 +521,29 @@ func TestHandleListProbeLogs_BoundsPayload(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if len(got.Data) != 1 {
-		t.Fatalf("want 1 行, got %d", len(got.Data))
+	// ① Limit=500 必须被收敛到 100 行。
+	if len(got.Data) != rows {
+		t.Fatalf("want %d 行（Limit=500 收敛为 %d）, got %d", rows, rows, len(got.Data))
 	}
-	if n := len(got.Data[0].ErrorBody); n > probeListBodyMaxBytes {
-		t.Fatalf("列表里每行原文必须 ≤ %d 字节, got %d", probeListBodyMaxBytes, n)
+	for i := range got.Data {
+		if n := len(got.Data[i].ErrorBody); n > probeListBodyMaxBytes {
+			t.Fatalf("第 %d 行原文必须 ≤ %d 字节, got %d", i+1, probeListBodyMaxBytes, n)
+		}
+		if !got.Data[i].ErrorBodyTruncated {
+			t.Fatalf("第 %d 行预览必须置 ErrorBodyTruncated=true", i+1)
+		}
 	}
 	if !strings.Contains(got.Data[0].ErrorBody, "已截断") {
 		t.Fatalf("截断必须在同一字段标注, got %q", got.Data[0].ErrorBody[len(got.Data[0].ErrorBody)-80:])
 	}
-	if !got.Data[0].ErrorBodyTruncated {
-		t.Fatal("列表里的预览必须置 ErrorBodyTruncated=true（调用方据此去详情端点取全文）")
-	}
-	if len(rec.Body.Bytes()) > 64<<10 {
-		t.Fatalf("单次列表响应必须收口到 64KB 量级, got %d 字节", len(rec.Body.Bytes()))
+	// ② 最坏响应体：100 行 × 4KB 预览 + JSON 头/标点/其它字段开销。
+	// 实测约 440KB（每行 ~4.4KB）；上限取 100×4KB + 64KB 余量，防的是「把 100 行 32KB 全量回吐 ≈3.2MB」。
+	total := len(rec.Body.Bytes())
+	budget := rows*probeListBodyMaxBytes + (64 << 10)
+	t.Logf("最坏响应体实测 %d 字节（%d 行 × 每行 %d 字节预览；预算 %d 字节）",
+		total, rows, probeListBodyMaxBytes, budget)
+	if total > budget {
+		t.Fatalf("最坏列表响应 %d 字节超出预算 %d 字节", total, budget)
 	}
 }
 
