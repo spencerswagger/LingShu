@@ -116,15 +116,15 @@ func nilOr(s string) string {
 }
 
 // keyProbeLoop 密钥级探测循环（每密钥一个独立 goroutine）：
-// 按该密钥当前状态调度（正常态 cron、排空态秒级、禁用态跳探）；运行时被摘除则退出。
-// DISABLED 态不执行真实探测：sleepUntilNextKeyProbe 按 15s 周期复查内存 Machine.State()，
-// 醒后经 keyProbeOnceUnlessDisabled 校验仍为 DISABLED 则跳过（不产生 HTTP/不写 probe_logs/不记账）。
+// 按该密钥及其渠道内各内部模型的**当前状态**调度（正常态 cron、排空态秒级、禁用态跳探）；
+// 运行时被摘除则退出。睡眠期间只要出现状态/配置变化就会被唤醒并重算等待，
+// 因此排空可以发生在等待中途而不被漏探。
 func (m *Manager) keyProbeLoop(ctx context.Context, keyID int64) {
 	for {
 		if _, ok := m.GetKeyRuntime(keyID); !ok {
 			return
 		}
-		if !m.sleepUntilNextKeyProbe(ctx, keyID) {
+		if !m.waitUntilNextKeyProbe(ctx, keyID) {
 			return
 		}
 		m.keyProbeOnceUnlessDisabled(ctx, keyID)
@@ -141,40 +141,107 @@ func (m *Manager) keyProbeOnceUnlessDisabled(ctx context.Context, keyID int64) {
 	m.keyProbeOnce(ctx, keyID)
 }
 
-// sleepUntilNextKeyProbe 依据该密钥当前状态计算下一次探测时间并休眠；ctx 取消或密钥运行时消失返回 false。
-// 禁用：不探测（15s 复查是否被手动恢复）；排空：drain_interval_seconds；正常：渠道 health_probe.interval cron。
-// 探测配置（interval/drain/timeout）取自共享渠道配置模板，状态取自该密钥状态机。
-func (m *Manager) sleepUntilNextKeyProbe(ctx context.Context, keyID int64) bool {
+// disabledRecheckSeconds 禁用态复查周期：禁用期间不探测，只定期看一眼是否被手动恢复。
+const disabledRecheckSeconds = 15
+
+// 排空态调度分支（诊断/日志用）。
+const (
+	branchCron       = "cron"
+	branchKeyDrain   = "key_drain"
+	branchModelDrain = "model_drain"
+	branchDisabled   = "disabled"
+)
+
+// waitUntilNextKeyProbe 等待到下一次探测：到点返回 true；ctx 取消或密钥运行时消失返回 false。
+// 等待期间被唤醒（状态/配置变化）时**不重置整段等待**，而是重算截止时刻：
+//   - 排空/禁用分支只能提前、不能推后（沿用更早的旧截止），否则同渠道其它对象的流转会把本次
+//     探测一路推后，多密钥渠道的首探就会滑出排空间隔；
+//   - cron 分支从现在重算（cron 是绝对边界，重算结果一致）：恢复成 NORMAL 后立即回到 cron 语义，
+//     不会残留一次「排空遗留」的秒级探测。
+func (m *Manager) waitUntilNextKeyProbe(ctx context.Context, keyID int64) bool {
+	var deadline time.Time // 本轮探测的截止时刻，跨唤醒保留
+	for {
+		// 先订阅唤醒通道再算 wait：否则「算完 wait → 订阅」窗口内发生的状态变化会被漏掉。
+		wake := m.probeWake.subscribe()
+		wait, branch, ok := m.nextKeyProbeWait(keyID)
+		if !ok {
+			return false
+		}
+		if wait < time.Second {
+			wait = time.Second
+		}
+		next := time.Now().Add(wait)
+		if branch == branchCron || deadline.IsZero() || next.Before(deadline) {
+			deadline = next
+		}
+		remain := time.Until(deadline)
+		if remain <= 0 {
+			return true // 截止已过（例如上游探测耗时超过间隔）：立即探测
+		}
+		t := time.NewTimer(remain)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return false
+		case <-wake:
+			t.Stop()
+			m.logger.Debug("key probe wait rescheduled", "key_id", keyID, "branch", branch)
+		case <-t.C:
+			return true
+		}
+	}
+}
+
+// nextKeyProbeWait 计算该密钥下一次探测的等待时长，与调度分支。
+//
+// 分支取三档对象里「最紧急」的那个（这是排空恢复快慢的唯一决定点）：
+//   - 密钥 DISABLED：不探测，disabledRecheckSeconds 复查是否被手动恢复（禁用态不再看模型）；
+//   - 密钥 DRAIN：drain_interval_seconds；
+//   - 该渠道任一内部模型 DRAIN：该模型的排空间隔（模型级配置优先，缺省继承渠道）。
+//     模型没有独立探测循环，由密钥循环代探（见 pickKeyProbeTargets），所以只看密钥状态必然漏这批；
+//   - 都没有：渠道 health_probe.interval 的 cron。
+//
+// 密钥与模型同时排空时取最小间隔。运行时不存在返回 ok=false。
+func (m *Manager) nextKeyProbeWait(keyID int64) (time.Duration, string, bool) {
 	m.mu.RLock()
 	kr, ok := m.keys[keyID]
 	if !ok {
 		m.mu.RUnlock()
-		return false
+		return 0, "", false
 	}
 	hp := normalizeHealthProbe(kr.Channel.HealthProbe)
-	state := kr.Machine.State()
+	drainSeconds, branch := 0, branchCron
+	switch kr.Machine.State() {
+	case StateDisabled:
+		drainSeconds, branch = disabledRecheckSeconds, branchDisabled
+	case StateDrain:
+		drainSeconds, branch = hp.DrainIntervalSeconds, branchKeyDrain
+	}
+	// 模型层排空：即使密钥仍 NORMAL，也要按排空间隔代探（模型自身没有探测循环）。
+	if branch != branchDisabled {
+		for _, mr := range m.mrt[kr.Channel.ID] {
+			// 实体已禁用或状态机已禁用：pickKeyProbeTargets 不会选中它，不必按排空节奏代探。
+			if mr.Model.State == StateDisabled || mr.Machine.State() == StateDisabled {
+				continue
+			}
+			if mr.Machine.State() != StateDrain {
+				continue
+			}
+			iv := mergeHealthProbe(mr.Model.HealthProbe, kr.Channel.HealthProbe).DrainIntervalSeconds
+			if iv <= 0 {
+				iv = hp.DrainIntervalSeconds
+			}
+			if drainSeconds == 0 || iv < drainSeconds {
+				drainSeconds, branch = iv, branchModelDrain
+			}
+		}
+	}
 	m.mu.RUnlock()
 
-	var wait time.Duration
-	switch {
-	case state == StateDisabled:
-		wait = 15 * time.Second
-	case state == StateDrain:
-		wait = time.Duration(hp.DrainIntervalSeconds) * time.Second
-	default:
-		wait = cronWait(hp.Interval, m.now())
+	if drainSeconds > 0 {
+		return time.Duration(drainSeconds) * time.Second, branch, true
 	}
-	if wait < time.Second {
-		wait = time.Second
-	}
-	t := time.NewTimer(wait)
-	defer t.Stop()
-	select {
-	case <-ctx.Done():
-		return false
-	case <-t.C:
-		return true
-	}
+	return cronWait(hp.Interval, m.now()), branch, true
 }
 
 // cronWait 返回距下次 cron 匹配的时间；表达式非法时回退 60 秒。
@@ -445,6 +512,8 @@ func (m *Manager) feedKeyAndTransit(keyID int64, fb Feedback) {
 	m.mu.Unlock()
 
 	if tr != nil {
+		// 探测自身造成的流转（首次失败→DRAIN、连续成功→NORMAL）同样要让调度重算。
+		m.wakeProbeScheduling()
 		m.persistKeyTransition(keyID, tr.from, tr.to, tr.reason)
 		m.logger.Info("key state transition", "key_id", keyID,
 			"from", tr.from, "to", tr.to, "reason", tr.reason)
