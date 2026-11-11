@@ -313,3 +313,41 @@ func TestProbeWaker_WakesAllSubscribers(t *testing.T) {
 	default:
 	}
 }
+
+// TestKeyProbeLoop_NormalStateWakeDoesNotProbe 唤醒本身不产生探测：常态（cron 分支）下反复唤醒
+// 不得把探测频率抬到秒级（反向要求：常态渠道仍按 cron，不能被唤醒机制变成高频探测）。
+func TestKeyProbeLoop_NormalStateWakeDoesNotProbe(t *testing.T) {
+	c := &probeCounter{}
+	srv := httptest.NewServer(c.handler(true))
+	defer srv.Close()
+
+	// 冻结时钟 + 每小时整点 cron：自 10:30 起下次探测在 11:00（30 分钟），秒级窗口内不可能触发。
+	frozen := time.Date(2026, 1, 2, 10, 30, 0, 0, time.UTC)
+	hp := HealthProbeConfig{Interval: "0 0 * * * *", DrainIntervalSeconds: 1, TimeoutMS: 1000, FailThreshold: 1, RecoveryThreshold: 1}
+	mgr := newDrainScheduleTestManager(t, srv.URL, hp, func() time.Time { return frozen })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	mgr.Start(ctx)
+	defer func() {
+		cancel()
+		mgr.Stop()
+	}()
+	time.Sleep(200 * time.Millisecond)
+
+	// 模拟同渠道其它对象流转 / 配置刷新带来的连续唤醒。
+	for i := 0; i < 20; i++ {
+		mgr.wakeProbeScheduling()
+		time.Sleep(20 * time.Millisecond)
+	}
+	time.Sleep(500 * time.Millisecond)
+	if n := c.count(); n != 0 {
+		t.Fatalf("常态下仅唤醒不应产生探测，got %d 次（唤醒不得把常态抬成秒级探测）", n)
+	}
+	wait, branch, ok := mgr.nextKeyProbeWait(11)
+	if !ok || branch != branchCron {
+		t.Fatalf("常态分支应为 cron，got branch=%q ok=%v", branch, ok)
+	}
+	if wait <= 0 || wait > 30*time.Minute {
+		t.Fatalf("常态等待应指向 11:00 的 cron 边界（≤30min），got %v", wait)
+	}
+}
