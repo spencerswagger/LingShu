@@ -141,7 +141,9 @@ func TestMigrate_FullChain(t *testing.T) {
 		}
 		cols[c] = true
 	}
-	for _, want := range []string{"auto_model_name", "upstream_usage", "upstream_status", "resp_body"} {
+	// 注意：call_logs.upstream_status 属「上游错误可见性」单（迁移 0019），不在本单；
+	// 本单只保证 probe_logs 的 error_body / upstream_status（迁移 0020）。
+	for _, want := range []string{"auto_model_name", "upstream_usage", "resp_body"} {
 		if !cols[want] {
 			t.Fatalf("call_logs 缺少列 %s（合并后迁移链未跑通）", want)
 		}
