@@ -60,10 +60,13 @@ type CallLogView struct {
 	Status        string `json:"Status"`
 	RespKind      string `json:"RespKind"`
 	ErrorMessage  string `json:"ErrorMessage"`
-	DurationMs    *int64 `json:"DurationMs,omitempty"`
-	FirstTokenMs  *int64 `json:"FirstTokenMs,omitempty"`
-	CallTime      string `json:"CallTime"`
-	ReqMessages   any    `json:"ReqMessages"` // JSONB 原始 value（可能 null）
+	// UpstreamStatus 上游真实 HTTP 状态码（仅上游非 2xx 的失败记录有值，nil=无上游状态码）：
+	// 让「上游 400」与「网关 502」在账单详情里可区分，不必从 ErrorMessage 的中文里推断。
+	UpstreamStatus *int   `json:"UpstreamStatus,omitempty"`
+	DurationMs     *int64 `json:"DurationMs,omitempty"`
+	FirstTokenMs   *int64 `json:"FirstTokenMs,omitempty"`
+	CallTime       string `json:"CallTime"`
+	ReqMessages    any    `json:"ReqMessages"` // JSONB 原始 value（可能 null）
 	// ReqParams 入站请求参数快照（JSONB 反序列化结果：model/temperature/tools 摘要/端点/上游协议与
 	// 上游 URL/token_id 等；可能 null）。定位「这次到底发了什么参数」用，不含 messages（见 ReqMessages）。
 	ReqParams any    `json:"ReqParams"`
@@ -106,23 +109,24 @@ func toCallLogView(cl *gateway.CallLog) *CallLogView {
 		}
 	}
 	return &CallLogView{
-		BillingID:     cl.BillingID,
-		RequestID:     cl.RequestID,
-		SessionID:     cl.SessionID,
-		Model:         cl.Model,
-		AutoModelName: cl.AutoModelName,
-		Status:        cl.Status,
-		RespKind:      cl.RespKind,
-		ErrorMessage:  cl.ErrorMessage,
-		DurationMs:    cl.DurationMs,
-		FirstTokenMs:  cl.FirstTokenMs,
-		CallTime:      cl.CreatedAt.Format(time.RFC3339),
-		ReqMessages:   reqMsgs,
-		ReqParams:     reqParams,
-		RespBody:      cl.RespBody,
-		Decision:      decision,
-		UpstreamUsage: upstreamUsage,
-		PricingMode:   cl.PricingMode,
+		BillingID:      cl.BillingID,
+		RequestID:      cl.RequestID,
+		SessionID:      cl.SessionID,
+		Model:          cl.Model,
+		AutoModelName:  cl.AutoModelName,
+		Status:         cl.Status,
+		RespKind:       cl.RespKind,
+		ErrorMessage:   cl.ErrorMessage,
+		UpstreamStatus: cl.UpstreamStatus,
+		DurationMs:     cl.DurationMs,
+		FirstTokenMs:   cl.FirstTokenMs,
+		CallTime:       cl.CreatedAt.Format(time.RFC3339),
+		ReqMessages:    reqMsgs,
+		ReqParams:      reqParams,
+		RespBody:       cl.RespBody,
+		Decision:       decision,
+		UpstreamUsage:  upstreamUsage,
+		PricingMode:    cl.PricingMode,
 	}
 }
 

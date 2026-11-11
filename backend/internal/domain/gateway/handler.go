@@ -159,6 +159,10 @@ type openAIErrorDetail struct {
 	Message string `json:"message"`
 	Type    string `json:"type"`
 	Code    string `json:"code"`
+	// UpstreamStatus 上游真实 HTTP 状态码：仅「上游返回非 2xx」的失败体带上，
+	// 网关自身错误（鉴权/余额/路由等）不带。用途：调用方与运营能区分
+	// 「网关拒绝」与「上游拒绝、网关转述」，并按上游状态码查厂商文档（如区域未开通 → 400）。
+	UpstreamStatus int `json:"upstream_status,omitempty"`
 }
 
 // writeOpenAIError 直接写出 OpenAI 标准错误体（不走内部统一壳 resp.Box），HTTP 状态码沿用业务语义。
@@ -192,6 +196,50 @@ func openAIErrorType(status int) string {
 	}
 }
 
+// writeUpstreamError 写出「上游返回非 2xx」的对外错误体（契约见
+// docs/designs/2026-11-11-upstream-error-visibility-design.md）：
+//   - message：**上游原文**（OpenAI 兼容形状取 error.message，其余形状取整段摘要；
+//     与日志摘要同源，已做凭据样式清洗 + 按 UTF-8 边界截断到 errSummaryMaxBytes）；
+//     上游没给可读文案（空体/纯二进制）时回落到 fallbackMsg，不返回空 message。
+//   - type：上游原文（缺省按下游状态码归类）。
+//   - code：网关按下游状态码归类（不把上游业务码原样外泄，口径与 writeOpenAIError 一致）。
+//   - request_id：同 writeOpenAIError（响应头 x-request-id）。
+//   - upstream_status：上游真实状态码，便于「网关转述」与「网关拒绝」区分。
+//
+// 为什么不直接改 writeOpenAIError：网关自身错误（令牌/余额/路由）没有上游报文，
+// 统一替换成上游透传会把那些分支的既有文案与语义一起改掉；两个出口各自单一职责。
+func writeUpstreamError(w http.ResponseWriter, downstreamStatus, upstreamStatus int, upErr, fallbackMsg string) {
+	_, etype, _, msg := upstreamErrParts(upErr)
+	if msg == "" {
+		msg = fallbackMsg
+	}
+	if etype == "" {
+		etype = openAIErrorType(downstreamStatus)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(downstreamStatus)
+	_ = json.NewEncoder(w).Encode(openAIErrorBody{
+		Error: openAIErrorDetail{
+			Message:        msg,
+			Type:           etype,
+			Code:           openAIErrorCode(downstreamStatus),
+			UpstreamStatus: upstreamStatus,
+		},
+		RequestID: w.Header().Get("x-request-id"),
+	})
+}
+
+// writeAggregateError 写出「候选全部失败」的终结错误。
+// 有上游报文（候选失败过、且是上游返回的非 2xx）→ 透出上游原文（状态码仍取终结语义，如 503/429）；
+// 无上游报文（连接失败/响应超时/全部被本地拦截）→ 保持既有网关文案。
+func writeAggregateError(w http.ResponseWriter, status, upstreamStatus int, upstreamBody, fallbackMsg string) {
+	if upstreamStatus > 0 {
+		writeUpstreamError(w, status, upstreamStatus, upstreamBody, fallbackMsg)
+		return
+	}
+	writeOpenAIError(w, status, fallbackMsg)
+}
+
 // openAIErrorCode 依据 HTTP 状态码映射 OpenAI 错误 code（字符串，不泄漏内部业务码）。
 func openAIErrorCode(status int) string {
 	switch status {
@@ -213,6 +261,33 @@ func openAIErrorCode(status int) string {
 		}
 		return "invalid_request_error"
 	}
+}
+
+// rejectAndRespond 记录一次「未进入渠道转发（或未真正发出上游调用）的网关拒绝」，并写出对外错误。
+//
+// 三件事必须一起做，否则运营看不到这次失败：
+//  1. failed 账单（recordGatewayReject，0 积分，渠道维度留空）——「每次请求必有一条账单记录」；
+//  2. 调用日志（带 request_id / req_params）——账单页按 request_id 检索是**经 call_logs 关联**的
+//     （见 billing/query.go recordWhereOn 的 EXISTS 子查询）：只落账单不落调用日志时，
+//     调用方拿着 response 里的 request_id 在账单页搜不到这次失败；
+//  3. 异常日志（logReject，结构化现场）。
+//
+// 早前若干分支（请求体过大/格式错误/缺 model、标签解析失败、预扣失败、余额不足等）只做了 1 或 3，
+// 于是这些「用户明明收到了错误」的请求在账单/调用日志里完全消失。
+func (g *Gateway) rejectAndRespond(ctx context.Context, w http.ResponseWriter, start time.Time,
+	endpoint, model, autoName string, token *identity.Token, pricingMode, sessionID string,
+	reqMsgs []json.RawMessage, decision map[string]any, status int, reason, clientMsg string) {
+	bid := g.recordGatewayReject(ctx, model, autoName, token, pricingMode, sessionID, reason)
+	g.writeCallLog(ctx, bid, "", token, &router.RouteResult{AutoModelName: autoName}, model, pricingMode, sessionID,
+		reqMsgs, "error", "", "failed", reason, msSince(start), nil, decision)
+	g.logReject(ctx, endpoint, model, reason, status, token, msSince(start))
+	writeOpenAIError(w, status, clientMsg)
+}
+
+// rejectDecisionEarly 早期拒绝（请求体阶段，尚未收集候选轨迹）的决策记录：
+// 与 serve 内 rejectDecision 闭包同形状，避免前端在两种来源上解析分叉。
+func rejectDecisionEarly() map[string]any {
+	return map[string]any{"attempts": []map[string]any{}, "result": "rejected"}
 }
 
 // serve 是 /v1/{endpoint} 统一入口的核心热路径。baseProtocol 为入站端点对应的基础协议
@@ -246,19 +321,19 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 	// 2) 读取请求体（上限 maxBodyBytes=64MB，异常/恶意超大请求体兜底）并解析 model / stream。
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
 	if err != nil || int64(len(body)) > maxBodyBytes {
-		g.logReject(ctx, endpoint, "", "请求体过大或无法读取", http.StatusBadRequest, token, msSince(start))
-		writeOpenAIError(w, http.StatusBadRequest, "请求体过大或无法读取")
+		g.rejectAndRespond(ctx, w, start, endpoint, "", "", token, "", "", nil, rejectDecisionEarly(),
+			http.StatusBadRequest, "请求体过大或无法读取", "请求体过大或无法读取")
 		return
 	}
 	if err := requireJSONObject(body); err != nil {
-		g.logReject(ctx, endpoint, "", "请求体不是合法 JSON 对象："+err.Error(), http.StatusBadRequest, token, msSince(start))
-		writeOpenAIError(w, http.StatusBadRequest, "请求体格式错误")
+		g.rejectAndRespond(ctx, w, start, endpoint, "", "", token, "", "", nil, rejectDecisionEarly(),
+			http.StatusBadRequest, "请求体不是合法 JSON 对象："+err.Error(), "请求体格式错误")
 		return
 	}
 	model, isStream, err := parseRequestMeta(body)
 	if err != nil || model == "" {
-		g.logReject(ctx, endpoint, "", "请求体缺少 model 字段或解析失败", http.StatusBadRequest, token, msSince(start))
-		writeOpenAIError(w, http.StatusBadRequest, "请求体必须包含 model 字段")
+		g.rejectAndRespond(ctx, w, start, endpoint, "", "", token, "", "", nil, rejectDecisionEarly(),
+			http.StatusBadRequest, "请求体缺少 model 字段或解析失败", "请求体必须包含 model 字段")
 		return
 	}
 
@@ -290,8 +365,8 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 		kv, terr := g.tagKV(ctx, token.TagID)
 		if terr != nil {
 			l.Error("resolve tag kv failed", "user_id", token.UserID, "tag_id", token.TagID, "err", terr)
-			g.logReject(ctx, endpoint, model, "解析令牌标签失败："+terr.Error(), http.StatusInternalServerError, token, msSince(start))
-			writeOpenAIError(w, http.StatusInternalServerError, msgInternal)
+			g.rejectAndRespond(ctx, w, start, endpoint, model, "", token, "", "", nil, rejectDecisionEarly(),
+				http.StatusInternalServerError, "解析令牌标签失败："+terr.Error(), msgInternal)
 			return
 		}
 		tagKV = kv
@@ -336,8 +411,8 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 		members, isAuto, aerr := g.auto.ResolveMembers(ctx, requestedModel, &token.UserID)
 		if aerr != nil {
 			l.Error("resolve auto model failed", "model", requestedModel, "err", aerr)
-			g.logReject(ctx, endpoint, requestedModel, "解析 Auto 模型失败："+aerr.Error(), http.StatusInternalServerError, token, msSince(start))
-			writeOpenAIError(w, http.StatusInternalServerError, msgInternal)
+			g.rejectAndRespond(ctx, w, start, endpoint, requestedModel, "", token, "", sessionID, nil, rejectDecisionEarly(),
+				http.StatusInternalServerError, "解析 Auto 模型失败："+aerr.Error(), msgInternal)
 			return
 		}
 		if isAuto {
@@ -391,10 +466,10 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 			}
 			if model == "" {
 				// 全部成员均无可用候选（或成员对外模型均不可解析）→ 无可用渠道。
-				// 账单保留 auto 名（external_model_name 为空）便于按 Auto 排查。
-				g.recordGatewayReject(ctx, model, autoName, token, "", sessionID, msgNoAvailable)
-				g.logReject(ctx, endpoint, autoName, "Auto 模型全部成员均无可用候选："+msgNoAvailable, http.StatusServiceUnavailable, token, msSince(start))
-				writeOpenAIError(w, http.StatusServiceUnavailable, msgNoAvailable)
+				// 账单保留 auto 名（external_model_name 留空，model 此刻仍为空串）便于按 Auto 排查；
+				// 调用日志同样落一条，否则这条 503 在账单页按 request_id 搜不到。
+				g.rejectAndRespond(ctx, w, start, endpoint, model, autoName, token, "", sessionID, nil, rejectDecisionEarly(),
+					http.StatusServiceUnavailable, "Auto 模型全部成员均无可用候选："+msgNoAvailable, msgNoAvailable)
 				return
 			}
 		} else {
@@ -461,8 +536,8 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 			return
 		}
 		l.Error("route failed", "model", model, "err", err)
-		g.logReject(ctx, endpoint, model, "路由失败："+err.Error(), http.StatusInternalServerError, token, msSince(start))
-		writeOpenAIError(w, http.StatusInternalServerError, msgInternal)
+		g.rejectAndRespond(ctx, w, start, endpoint, model, autoName, token, "", sessionID, nil, rejectDecisionEarly(),
+			http.StatusInternalServerError, "路由失败："+err.Error(), msgInternal)
 		return
 	}
 
@@ -487,8 +562,8 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 			// 边界说明（口径已成文）：估算先于预扣，故「零余额 + 估算失败」返回 500（属网关内部
 			// 配置错误，如费率/系数非法），而非移除前置余额读之前该组合的 402。此变更经人工评审确认可接受。
 			l.Error("estimate preconsume failed", "user_id", token.UserID, "model", model, "err", eerr)
-			g.logReject(ctx, endpoint, model, "预扣金额估算失败："+eerr.Error(), http.StatusInternalServerError, token, msSince(start))
-			writeOpenAIError(w, http.StatusInternalServerError, msgInternal)
+			g.rejectAndRespond(ctx, w, start, endpoint, model, autoName, token, "", sessionID, nil, rejectDecisionEarly(),
+				http.StatusInternalServerError, "预扣金额估算失败："+eerr.Error(), msgInternal)
 			return
 		}
 		pc = est
@@ -504,9 +579,10 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 			// 对零余额场景，这是相对移除前置余额读之前的「空归属 + 原因串『账户余额为 0』」的变化；
 			// 但 failed 记录 CreditsConsumed=0、不参与扣减，对账金额不受影响，且与「余额不足」分支口径一致。
 			msg := fmt.Sprintf("积分余额不足，预扣需 %.6f 积分；公式：\n%s", pc.Credits, formula)
+			failRes := &router.RouteResult{AutoModelName: autoName}
 			if len(routes) > 0 {
 				r0 := routes[0]
-				g.recordFailure(ctx, &router.RouteResult{
+				failRes = &router.RouteResult{
 					ChannelID:       r0.ChannelID,
 					ChannelKeyID:    r0.ChannelKeyID,
 					InternalModelID: r0.InternalModelID,
@@ -514,8 +590,15 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 					ExternalModelID: r0.ExternalModelID,
 					AutoModelName:   autoName,
 					Revision:        r0.Revision,
-				}, model, token, pricingMode, sessionID, sessionName, msg, nil)
+				}
 			}
+			// 账单 + 调用日志必须成对：账单页按 request_id 检索经 call_logs 关联
+			// （billing/query.go recordWhereOn），只落账单时调用方拿 request_id 搜不到这次失败。
+			bid := g.recordFailure(ctx, failRes, model, token, pricingMode, sessionID, sessionName, msg, nil)
+			decision := rejectDecisionEarly()
+			decision["pre_consumed"] = pc.Credits
+			g.writeCallLog(ctx, bid, "", token, failRes, model, pricingMode, sessionID, nil,
+				"error", "", "failed", msg, msSince(start), nil, decision)
 			if isInsufficient(err) || isWalletMissing(err) {
 				// 余额不足/零余额，或钱包缺失（等价于余额为 0）：对外统一 402。
 				l.Warn("preconsume insufficient", "user_id", token.UserID, "need", pc.Credits, "err", err)
@@ -533,9 +616,8 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 		if berr != nil {
 			l.Warn("resolve balance failed, skip precheck", "user_id", token.UserID, "err", berr)
 		} else if bal <= 0 {
-			g.recordGatewayReject(ctx, model, autoName, token, pricingMode, sessionID, "积分余额不足（账户余额为 0）")
-			g.logReject(ctx, endpoint, model, "积分余额不足（账户余额为 0）", http.StatusPaymentRequired, token, msSince(start))
-			writeOpenAIError(w, http.StatusPaymentRequired, msgInsufficient)
+			g.rejectAndRespond(ctx, w, start, endpoint, model, autoName, token, pricingMode, sessionID, nil,
+				rejectDecisionEarly(), http.StatusPaymentRequired, "积分余额不足（账户余额为 0）", msgInsufficient)
 			return
 		}
 	}
@@ -545,6 +627,10 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 	//    - 模型级限流 → 渠道级限流，任一超限 → 下一候选
 	//    - 上游失败可安全转移（响应未写出且上游未计费，见 retryableUpstreamStatus / withWriteTrace）→ 下一候选
 	//    - 全部候选都失败 → 退还预扣并返回聚合错误
+	// 最近一次上游报文（候选可转移失败时暂存，供「全部候选失败」的终结响应透出上游原文）。
+	var lastUpstreamStatus int
+	var lastUpstreamBody string
+
 	sess := g.router.Sessions()
 	// 会话过期 TTL：按上下文长度（prompt token）与用户对话次数双维度分档取较大者，最低兜底 5 分钟。
 	// 仅在有会话标识时计算（Attach/Renew 均在 sessionID != "" 下发生），避免无状态请求白跑 token 计数。
@@ -981,6 +1067,11 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 			return
 		}
 		// retry：本次失败可安全转移（响应未写出、上游未计费），继续尝试下一候选。
+		// 顺带暂存「最近一次上游报文」：候选全部失败时终结响应要把它带给调用方，
+		// 否则可转移的 4xx/5xx 只剩一句「无可用渠道」，上游原因彻底丢失。
+		if out.upstreamStatus > 0 {
+			lastUpstreamStatus, lastUpstreamBody = out.upstreamStatus, out.upstreamBody
+		}
 		if out.is429 {
 			attempts = append(attempts, attempt("上游失败(429)"))
 			sawLimit = true
@@ -1016,7 +1107,7 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 				reqMsgs, "error", "", "failed", msgRateLimited, msSince(start), nil, rejectDecision())
 		}
 		g.logOutcome(ctx, slog.LevelWarn, endpoint, model, "全部候选限流（本地限流/上游 429）", http.StatusTooManyRequests, false, token, sessionID, attempts, trail, failed, msSince(start))
-		writeOpenAIError(w, http.StatusTooManyRequests, msgRateLimited)
+		writeAggregateError(w, http.StatusTooManyRequests, lastUpstreamStatus, lastUpstreamBody, msgRateLimited)
 		return
 	}
 	// AC-P2-9：全部候选失败且有候选因目标协议序列化失败被跳（未发出上游调用）→ 回 500，
@@ -1039,7 +1130,7 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 			reqMsgs, "error", "", "failed", msgNoAvailable, msSince(start), nil, rejectDecision())
 	}
 	g.logOutcome(ctx, slog.LevelError, endpoint, model, "全部候选均失败（无可用渠道）", http.StatusServiceUnavailable, false, token, sessionID, attempts, trail, failed, msSince(start))
-	writeOpenAIError(w, http.StatusServiceUnavailable, msgNoAvailable)
+	writeAggregateError(w, http.StatusServiceUnavailable, lastUpstreamStatus, lastUpstreamBody, msgNoAvailable)
 }
 
 // recordGatewayReject 记录一次未进入渠道的网关拒绝（零余额/未路由/候选全部被拦截等）为 failed 账单，
@@ -1204,6 +1295,12 @@ type fwdOutcome struct {
 	// upstreamFailed 已送达后上游失败/响应超时（无上游状态码）：已按估算输入用量结算、
 	// 不再整单退预扣（对齐 new-api「除非上游明确报错」）；请求级结论仍计为失败候选。
 	upstreamFailed bool
+	// upstreamStatus / upstreamBody 本次失败对应的上游状态码与错误体原文
+	// （仅「上游返回非 2xx」的分支有值；连接失败/超时没有上游报文，两者为零值）。
+	// 用途：候选可转移（retry）时由调用方暂存，候选全部失败后在终结响应里把**最后一次**
+	// 上游报文带给调用方——否则 5xx 这类可转移失败会退化成一句「无可用渠道」，上游原因全丢。
+	upstreamStatus int
+	upstreamBody   string
 	// streamDiag 流式上游失败诊断（仅排查用，随失败候选轨迹落调用日志）：
 	// delivered / first_byte_received / elapsed_ms（连接失败时无上游状态码，故不含 upstream_status）。
 	streamDiag map[string]any
@@ -1429,11 +1526,11 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 				reason: reason429, sessionID: sessionID, durationMs: *msSince(start)})
 		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, errMsg, msSince(start))
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-			"error", upErr, "failed", errMsg, msSince(start), nil, dec("上游限流(429)"))
+			"error", upErr, "failed", errMsg, msSince(start), nil, dec("上游限流(429)"), withUpstreamStatus(up.StatusCode))
 		if pol.failover {
-			return &fwdOutcome{retry: true, is429: true}
+			return &fwdOutcome{retry: true, is429: true, upstreamStatus: up.StatusCode, upstreamBody: upErr}
 		}
-		writeOpenAIError(w, pol.downstreamStatus, msgUpstreamDown)
+		writeUpstreamError(w, pol.downstreamStatus, up.StatusCode, upErr, msgUpstreamDown)
 		return &fwdOutcome{responded: true, refundPre: true, downstreamStatus: pol.downstreamStatus}
 	case up.StatusCode == http.StatusUnauthorized || up.StatusCode == http.StatusForbidden:
 		// 凭据可能失效：先转移下一候选；连续失败达阈值由状态机熔断（channel.Machine）。
@@ -1460,11 +1557,11 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 				reason: reasonAuth, sessionID: sessionID, durationMs: *msSince(start)})
 		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, errMsg, msSince(start))
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-			"error", upErr, "failed", errMsg, msSince(start), nil, dec("上游鉴权失败"))
+			"error", upErr, "failed", errMsg, msSince(start), nil, dec("上游鉴权失败"), withUpstreamStatus(up.StatusCode))
 		if pol.failover {
-			return &fwdOutcome{retry: true}
+			return &fwdOutcome{retry: true, upstreamStatus: up.StatusCode, upstreamBody: upErr}
 		}
-		writeOpenAIError(w, pol.downstreamStatus, msgUpstreamDown)
+		writeUpstreamError(w, pol.downstreamStatus, up.StatusCode, upErr, msgUpstreamDown)
 		return &fwdOutcome{responded: true, refundPre: true, downstreamStatus: pol.downstreamStatus}
 	default:
 		upErr := readUpstreamErrBody(up)
@@ -1486,11 +1583,11 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 				reason: errMsg, sessionID: sessionID, durationMs: *msSince(start)})
 		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, errMsg, msSince(start))
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-			"error", upErr, "failed", errMsg, msSince(start), nil, dec(errMsg))
+			"error", upErr, "failed", errMsg, msSince(start), nil, dec(errMsg), withUpstreamStatus(up.StatusCode))
 		if pol.failover {
-			return &fwdOutcome{retry: true}
+			return &fwdOutcome{retry: true, upstreamStatus: up.StatusCode, upstreamBody: upErr}
 		}
-		writeOpenAIError(w, pol.downstreamStatus, msgUpstreamDown)
+		writeUpstreamError(w, pol.downstreamStatus, up.StatusCode, upErr, msgUpstreamDown)
 		return &fwdOutcome{responded: true, refundPre: true, downstreamStatus: pol.downstreamStatus}
 	}
 }
@@ -1798,11 +1895,11 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 				reason: "上游限流(429)，已转入下一候选", sessionID: sessionID, durationMs: *msSince(start)})
 		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, errMsg, msSince(start))
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-			"error", upErr, "failed", errMsg, msSince(start), nil, dec("上游限流(429)"))
+			"error", upErr, "failed", errMsg, msSince(start), nil, dec("上游限流(429)"), withUpstreamStatus(up.StatusCode))
 		if pol.failover {
-			return &fwdOutcome{retry: true, is429: true}
+			return &fwdOutcome{retry: true, is429: true, upstreamStatus: up.StatusCode, upstreamBody: upErr}
 		}
-		writeOpenAIError(w, pol.downstreamStatus, msgUpstreamDown)
+		writeUpstreamError(w, pol.downstreamStatus, up.StatusCode, upErr, msgUpstreamDown)
 		return &fwdOutcome{responded: true, refundPre: true, downstreamStatus: pol.downstreamStatus}
 	case up.StatusCode == http.StatusUnauthorized || up.StatusCode == http.StatusForbidden:
 		// 凭据可能失效：先转移下一候选；连续失败达阈值由状态机熔断（channel.Machine）。
@@ -1825,11 +1922,11 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 				reason: "上游返回 401/403，已转入下一候选（该失败通常对下游不可见）", sessionID: sessionID, durationMs: *msSince(start)})
 		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, errMsg, msSince(start))
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-			"error", upErr, "failed", errMsg, msSince(start), nil, dec("上游鉴权失败"))
+			"error", upErr, "failed", errMsg, msSince(start), nil, dec("上游鉴权失败"), withUpstreamStatus(up.StatusCode))
 		if pol.failover {
-			return &fwdOutcome{retry: true}
+			return &fwdOutcome{retry: true, upstreamStatus: up.StatusCode, upstreamBody: upErr}
 		}
-		writeOpenAIError(w, pol.downstreamStatus, msgUpstreamDown)
+		writeUpstreamError(w, pol.downstreamStatus, up.StatusCode, upErr, msgUpstreamDown)
 		return &fwdOutcome{responded: true, refundPre: true, downstreamStatus: pol.downstreamStatus}
 	default:
 		upErr := readUpstreamErrBody(up)
@@ -1851,11 +1948,11 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 				reason: errMsg, sessionID: sessionID, durationMs: *msSince(start)})
 		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, errMsg, msSince(start))
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-			"error", upErr, "failed", errMsg, msSince(start), nil, dec(errMsg))
+			"error", upErr, "failed", errMsg, msSince(start), nil, dec(errMsg), withUpstreamStatus(up.StatusCode))
 		if pol.failover {
-			return &fwdOutcome{retry: true}
+			return &fwdOutcome{retry: true, upstreamStatus: up.StatusCode, upstreamBody: upErr}
 		}
-		writeOpenAIError(w, pol.downstreamStatus, msgUpstreamDown)
+		writeUpstreamError(w, pol.downstreamStatus, up.StatusCode, upErr, msgUpstreamDown)
 		return &fwdOutcome{responded: true, refundPre: true, downstreamStatus: pol.downstreamStatus}
 	}
 }
