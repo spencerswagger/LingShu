@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/team/llmgateway/internal/pkg/dbx"
+	"github.com/team/llmgateway/internal/pkg/errbody"
 	"github.com/team/llmgateway/internal/pkg/idgen"
 	"github.com/team/llmgateway/internal/pkg/money"
 )
@@ -961,7 +962,10 @@ func (s *SqlStore) insertOn(ctx context.Context, ex dbx.Execer, rec *Record) (*R
 	sessionName := any(rec.SessionName)
 	var errMsg any
 	if rec.ErrorMessage != "" {
-		errMsg = rec.ErrorMessage
+		// 上游报文可能是任意字节（GBK 错误页 / 0x00 / 截断的多字节字符）：原样写 PG text 列会让
+		// **整行 INSERT 失败**，一次上游报错就把这次请求的账单丢掉。落库前统一整理成合法 UTF-8。
+		msg, _ := errbody.ToValidText(rec.ErrorMessage)
+		errMsg = msg
 	}
 	durationMs := nullableInt64For(rec.DurationMs)
 	firstTokenMs := nullableInt64For(rec.FirstTokenMs)
