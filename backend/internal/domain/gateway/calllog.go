@@ -562,6 +562,10 @@ type callLogOpt func(*CallLog)
 // 流式「已回 200 后流内报错」的失败分支同样传 200（让「上游 HTTP 200 但内容层失败」可被区分）。
 func withUpstreamStatus(status int) callLogOpt {
 	return func(c *CallLog) {
+		// status<=0 表示本次没有上游状态码（断网/无响应/构建失败）：写 NULL，不写 0 也不编造 200。
+		if status <= 0 {
+			return
+		}
 		v := status
 		c.UpstreamStatus = &v
 	}

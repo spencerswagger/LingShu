@@ -160,6 +160,10 @@ type openAIErrorDetail struct {
 	Message string `json:"message"`
 	Type    string `json:"type"`
 	Code    string `json:"code"`
+	// UpstreamStatus 上游真实 HTTP 状态码（仅「上游返回非 2xx」的失败体带上，放 error 对象内；
+	// 网关自身错误不带）。对外 HTTP 状态码仍走网关语义（502/503/504），本字段只用于定位
+	// 「上游到底回了什么」——例如 failed + upstream_status=200 表示上游已 200、但流内报错。
+	UpstreamStatus int `json:"upstream_status,omitempty"`
 }
 
 // writeOpenAIError 直接写出 OpenAI 标准错误体（不走内部统一壳 resp.Box），HTTP 状态码沿用业务语义。
@@ -194,7 +198,7 @@ func openAIErrorType(status int) string {
 }
 
 // 上游错误透传的唯一出口见 upstream_error.go 的 writeUpstreamError / upstreamErrorPayload
-// （状态码沿用上游、响应体按形状完整透传、超长同字段截断标注）。
+// （对外状态码走网关语义、响应体按形状完整透传、上游真实码放 error.upstream_status、超长同字段截断标注）。
 
 // openAIErrorCode 依据 HTTP 状态码映射 OpenAI 错误 code（字符串，不泄漏内部业务码）。
 func openAIErrorCode(status int) string {
@@ -584,7 +588,7 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 	//    - 上游失败可安全转移（响应未写出且上游未计费，见 retryableUpstreamStatus / withWriteTrace）→ 下一候选
 	//    - 全部候选都失败 → 退还预扣并返回聚合错误
 	// 最近一次失败现场（候选可转移失败时暂存，供「全部候选失败」的终结响应使用）：
-	// 有上游报文就沿用上游状态码 + 报文；没有（连接失败/超时/构建失败）就点名原因并按 502/504 分档。
+	// 有上游报文就带出报文 + error.upstream_status（对外状态码仍是网关语义）；没有（连接失败/超时/构建失败）就点名原因并按 502/504 分档。
 	var lastUpstreamStatus int
 	var lastUpstreamBody string
 	var lastUpstreamCred string
@@ -1074,7 +1078,8 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 		// 上游 429 的报文同样要透出（调用方需要知道是配额还是速率、何时重试）；
 		// 全部为本地拦截（无上游报文）时保持网关文案，状态码仍是 429。
 		if lastUpstreamStatus > 0 {
-			writeUpstreamError(w, lastUpstreamStatus, lastUpstreamStatus, lastUpstreamBody, lastUpstreamCred)
+			// 对外状态码取终结语义 429（不沿用上游码），报文与 error.upstream_status 照常透出。
+			writeUpstreamError(w, http.StatusTooManyRequests, lastUpstreamStatus, lastUpstreamBody, lastUpstreamCred)
 			return
 		}
 		writeOpenAIError(w, http.StatusTooManyRequests, msgRateLimited)
@@ -1094,7 +1099,7 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 		return
 	}
 	g.refundAllPreConsume(ctx, token.UserID, pc.Credits, "请求失败退回（无可用渠道）")
-	// 终结响应：有上游报文（可转移的 4xx/5xx）→ 状态码与报文**一并沿用上游**；
+	// 终结响应：有上游报文（可转移的 4xx/5xx）→ 对外状态码仍是网关语义（503），报文与 upstream_status 一并透出；
 	// 没有（连接失败/超时/全部被本地拦截）→ 502，最后一次是超时则 504，并点名原因。
 	finalStatus, finalMsg := terminalFailure(lastUpstreamStatus, lastFailureNote, lastFailureTimedOut, msgNoAvailable)
 	if finalMsg == "" {
@@ -1822,8 +1827,11 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 				errInfo{kind: "stream_interrupted", stage: stage, status: up.StatusCode, attempt: attempt,
 					reason: reasonText + "：" + herr.Error(), sessionID: sessionID, durationMs: *dur})
 			bid := g.recordFailure(billCtx, routeRes, model, token, pricingMode, sessionID, sessionName, reasonText, dur)
+			// upstream_status 记上游真实码（流式已回 200 → 200）：与「连接失败/超时/网关拒绝」的 NULL 区分开，
+			// 也与迁移 0019 的注释口径一致（此前这条分支漏传，落库为 NULL，与注释矛盾）。
 			g.writeCallLogUsage(billCtx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-				"error", string(assistantMsg), "failed", reasonText, upstreamUsage, dur, ft.firstTokenMs(start), dec(reasonText))
+				"error", string(assistantMsg), "failed", reasonText, upstreamUsage, dur, ft.firstTokenMs(start),
+				dec(reasonText), withUpstreamStatus(up.StatusCode))
 		}
 		if usageAnomaly {
 			out.interrupted = true // 上游流被截断：内容不完整，请求级结论不得记为"成功"
@@ -1854,8 +1862,10 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		case hardErr:
 			// 失败分支已在上面记录（resp_kind=error）。
 		case out.billFailed:
+			// 同上：流式已回 200 的计费失败分支也要记上游真实码，避免 NULL 被误读成「没有上游响应」。
 			g.writeCallLogUsage(billCtx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-				"stream", string(assistantMsg), "failed", "流式计费失败", upstreamUsage, dur, ft.firstTokenMs(start), dec("计费失败"))
+				"stream", string(assistantMsg), "failed", "流式计费失败", upstreamUsage, dur, ft.firstTokenMs(start),
+				dec("计费失败"), withUpstreamStatus(up.StatusCode))
 		case upstreamErrFrame:
 			// 上游流内 error 帧 + usage 齐备：内容层失败，按上游实际 usage 计费（不估算），
 			// 调用日志记 failed 并把上游原文写进 error_message —— 运营按 request_id 才能看到上游到底报了什么。

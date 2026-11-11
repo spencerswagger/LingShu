@@ -135,12 +135,15 @@ func TestApplyErrorPolicyFailoverOverride(t *testing.T) {
 	}})
 
 	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t", `{"model":"gpt-4","stream":false}`)
-	// 转移耗尽后终结响应沿用**最后一次上游**的状态码与报文（不再聚合成 503）。
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("failover=true 应转移并在耗尽后回上游 400，got %d: %s", rec.Code, rec.Body.String())
+	// 转移耗尽后：对外状态码仍是网关语义 503，报文与 upstream_status 透出最后一次上游失败。
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("failover=true 应转移并在耗尽后回 503, got %d: %s", rec.Code, rec.Body.String())
 	}
 	if !strings.Contains(rec.Body.String(), "bad request") {
 		t.Fatalf("终结响应应带上游报文，got %s", rec.Body.String())
+	}
+	if rb := decodeOpenAIError(t, rec); rb.Error.UpstreamStatus != http.StatusBadRequest {
+		t.Fatalf("error.upstream_status want 400, got %d", rb.Error.UpstreamStatus)
 	}
 }
 
@@ -183,8 +186,11 @@ func TestApplyErrorPolicyStatsByCode(t *testing.T) {
 	}})
 
 	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t", `{"model":"gpt-4","stream":false}`)
-	if rec.Code != http.StatusUnprocessableEntity { // 未设 downstreamStatus → 沿用上游状态码
-		t.Fatalf("want 422, got %d", rec.Code)
+	if rec.Code != http.StatusBadGateway { // 未设 downstreamStatus → 网关语义 502
+		t.Fatalf("want 502, got %d", rec.Code)
+	}
+	if rb := decodeOpenAIError(t, rec); rb.Error.UpstreamStatus != http.StatusUnprocessableEntity {
+		t.Fatalf("error.upstream_status want 422, got %d", rb.Error.UpstreamStatus)
 	}
 	if len(stats.recs) != 1 || stats.recs[0].category != "code:context_length_exceeded" {
 		t.Fatalf("want category=code:context_length_exceeded, got %+v", stats.recs)
@@ -197,8 +203,11 @@ func TestApplyErrorPolicyDefaultSafety(t *testing.T) {
 	h := build(t, up.URL)
 
 	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t", `{"model":"gpt-4","stream":false}`)
-	if rec.Code != http.StatusGatewayTimeout {
-		t.Fatalf("default want 504（沿用上游）, got %d", rec.Code)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("default want 502（网关语义）, got %d", rec.Code)
+	}
+	if rb := decodeOpenAIError(t, rec); rb.Error.UpstreamStatus != http.StatusGatewayTimeout {
+		t.Fatalf("error.upstream_status want 504, got %d", rb.Error.UpstreamStatus)
 	}
 	if len(h.chans.feeds) != 1 {
 		t.Fatalf("default 应照常回喂健康一次, got %+v", h.chans.feeds)

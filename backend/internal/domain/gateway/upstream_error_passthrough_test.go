@@ -28,7 +28,7 @@ import (
 // 本文件钉住「上游错误对外透传」契约（设计见
 // docs/designs/2026-11-11-upstream-error-visibility-design.md），覆盖**形状**而不是文案：
 //
-//  1. 对外 HTTP 状态码沿用上游（4xx → 4xx、5xx → 5xx）；
+//  1. 对外 HTTP 状态码走网关语义（4xx → 502、可转移耗尽 → 503、429 → 429）；
 //  2. 上游错误体内容完整可见：OpenAI 形状整段原样（每键每值逐路径保留）、
 //     其它 JSON 的原文文本、非 JSON 的原文文本、超长的前缀 + 同字段「已截断」标注；
 //  3. 失败同样落账单 + 调用日志，按 request_id 可查，带上游状态码/错误体原文/渠道/模型/耗时；
@@ -64,7 +64,7 @@ func streamFlagged(stream bool) string {
 // upstreamErrCase 一种上游错误**形状**（不绑定文案，body 由随机生成器产出）。
 type upstreamErrCase struct {
 	name        string
-	status      int // 上游状态码（= 期望的对外状态码）
+	status      int // 上游状态码（对外状态码按网关语义推导，见 wantDownstreamStatus）
 	contentType string
 	body        string
 	// mode 决定「内容完整可见」的判据：
@@ -168,9 +168,11 @@ func TestServeUpstreamError_RandomShapes(t *testing.T) {
 				const rid = "req-shape"
 				rec := doRequestWithID(t, h.gw, "/v1/chat/completions", "sk-gw-t", streamFlagged(stream), rid)
 
-				// ① 状态码沿用上游（不再统一改写为 502/503/400）。
-				if rec.Code != tc.status {
-					t.Fatalf("对外状态码必须沿用上游 %d, got %d: %s", tc.status, rec.Code, rec.Body.String())
+				// ① 对外状态码走**网关语义**（不沿用上游：4xx 不可转移 → 502；可转移耗尽 → 503；
+				//    429 全部限流 → 429），上游真实码只出现在 error.upstream_status。
+				wantStatus := wantDownstreamStatus(tc.status)
+				if rec.Code != wantStatus {
+					t.Fatalf("对外状态码 want %d（网关语义）, got %d: %s", wantStatus, rec.Code, rec.Body.String())
 				}
 				var out map[string]any
 				if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
@@ -179,15 +181,18 @@ func TestServeUpstreamError_RandomShapes(t *testing.T) {
 				if out["request_id"] != rid {
 					t.Errorf("顶层 request_id want %q，got %v", rid, out["request_id"])
 				}
-				if got, ok := out["upstream_status"].(float64); !ok || int(got) != tc.status {
-					t.Errorf("顶层 upstream_status want %d，got %v", tc.status, out["upstream_status"])
+				if _, exists := out["upstream_status"]; exists {
+					t.Errorf("upstream_status 必须放在 error 对象内，不得出现在响应体顶层")
+				}
+				if got := errorUpstreamStatus(t, out); got != tc.status {
+					t.Errorf("error.upstream_status want %d，got %d", tc.status, got)
 				}
 				msg := errorMessage(t, out)
 
 				// ② 内容完整可见（按形状断言：只看形状，不看文案）。
 				switch tc.mode {
 				case "verbatim":
-					assertErrorSubtreeVerbatim(t, tc.body, out)
+					assertErrorSubtreeVerbatim(t, tc.body, out, tc.status, wantStatus)
 				case "rawtext":
 					if strings.TrimSpace(msg) != strings.TrimSpace(tc.body) {
 						t.Fatalf("原文必须完整进 message，want %q，got %q", tc.body, msg)
@@ -218,20 +223,42 @@ func TestServeUpstreamError_RandomShapes(t *testing.T) {
 	}
 }
 
-// assertErrorSubtreeVerbatim 断言「OpenAI 形状整段原样」：对外 error 子树与上游逐路径相等
-// （多字段、嵌套、未知字段一律不得丢改），且上游响应的其它顶层字段也照旧保留。
-func assertErrorSubtreeVerbatim(t *testing.T, upBody string, out map[string]any) {
+// assertErrorSubtreeVerbatim 断言「OpenAI 形状按字段原样」：除两个**网关口径字段**外，
+// 对外 error 子树与上游逐路径相等（多字段、嵌套、未知字段一律不得丢改），
+// 且上游响应的其它顶层字段也照旧保留。
+//
+// 两个例外（既定契约）：
+//   - error.code：改成网关按对外状态码归类的值（不透出上游业务码）；
+//   - error.upstream_status：网关新增字段，写上游真实状态码。
+//
+// 其余字段（message / type / param / 上游自定义键 / 嵌套结构）必须逐字节等价。
+func assertErrorSubtreeVerbatim(t *testing.T, upBody string, out map[string]any, upStatus, downStatus int) {
 	t.Helper()
 	var upDoc map[string]any
 	if err := json.Unmarshal([]byte(upBody), &upDoc); err != nil {
 		t.Fatalf("样本必须是 JSON: %v", err)
 	}
-	wantErr, ok := upDoc["error"]
+	wantErr, ok := upDoc["error"].(map[string]any)
 	if !ok {
 		t.Fatalf("样本必须是 OpenAI 形状: %s", upBody)
 	}
-	if !reflect.DeepEqual(out["error"], wantErr) {
-		t.Fatalf("error 子树必须原样透传（不许删改任何字段）\nwant %#v\ngot  %#v", wantErr, out["error"])
+	gotErr, ok := out["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("对外响应必须带 error 对象: %#v", out["error"])
+	}
+	for k, v := range wantErr {
+		if k == "code" {
+			continue // 见函数注释：code 由网关归类
+		}
+		if !reflect.DeepEqual(gotErr[k], v) {
+			t.Fatalf("error.%s 必须原样透传\nwant %#v\ngot  %#v", k, v, gotErr[k])
+		}
+	}
+	if got, _ := gotErr["code"].(string); got != openAIErrorCode(downStatus) {
+		t.Fatalf("error.code 必须是网关归类 %q，got %q", openAIErrorCode(downStatus), got)
+	}
+	if got, _ := gotErr["upstream_status"].(float64); int(got) != upStatus {
+		t.Fatalf("error.upstream_status want %d，got %v", upStatus, gotErr["upstream_status"])
 	}
 	for k, v := range upDoc {
 		if k == "error" {
@@ -241,6 +268,39 @@ func assertErrorSubtreeVerbatim(t *testing.T, upBody string, out map[string]any)
 			t.Errorf("上游顶层字段 %q 不得被丢弃/改写: want %#v got %#v", k, v, out[k])
 		}
 	}
+}
+
+// wantDownstreamStatus 由上游状态码推导**单候选**场景的对外状态码（网关语义）：
+//   - 429：全部候选限流 → 429；
+//   - 可转移（401/402/403/404/5xx 中除 504/524）：耗尽 → 503；
+//   - 其余 4xx（400/409/418/422 等）与 504/524、1xx/3xx：不可转移，直接 → 502。
+func wantDownstreamStatus(upstream int) int {
+	switch upstream {
+	case http.StatusTooManyRequests:
+		return http.StatusTooManyRequests
+	case http.StatusUnauthorized, http.StatusPaymentRequired, http.StatusForbidden, http.StatusNotFound:
+		return http.StatusServiceUnavailable
+	case http.StatusGatewayTimeout, 524:
+		return http.StatusBadGateway
+	}
+	if upstream >= 500 {
+		return http.StatusServiceUnavailable
+	}
+	return http.StatusBadGateway
+}
+
+// errorUpstreamStatus 取 error.upstream_status（两种形状同一路径）。
+func errorUpstreamStatus(t *testing.T, out map[string]any) int {
+	t.Helper()
+	e, ok := out["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("对外响应必须带 error 对象: %#v", out["error"])
+	}
+	v, ok := e["upstream_status"].(float64)
+	if !ok {
+		t.Fatalf("error.upstream_status 缺失: %#v", e)
+	}
+	return int(v)
 }
 
 // errorMessage 取对外错误体的 error.message（两种形状共用同一路径）。
@@ -360,8 +420,8 @@ func assertFailureTraced(t *testing.T, h *harness, rid string, upStatus int, upB
 const harnessCredential = "test-key"
 
 // TestServeUpstreamError_TerminalKeepsLastUpstream 可转移状态（401/403/404/429/5xx）在上游只有一个候选时
-// 会走到「候选全部失败」的终结分支：此时对外必须是**上游状态码 + 上游报文**，
-// 不能退化成 503「无可用渠道」聚合文案。
+// 会走到「候选全部失败」的终结分支：对外状态码是**网关语义 503**（不沿用上游），
+// 但报文与 error.upstream_status 必须带出最后一次上游失败，不能只剩「无可用渠道」一句。
 func TestServeUpstreamError_TerminalKeepsLastUpstream(t *testing.T) {
 	for _, stream := range []bool{false, true} {
 		name := "非流式"
@@ -380,14 +440,14 @@ func TestServeUpstreamError_TerminalKeepsLastUpstream(t *testing.T) {
 			h := build(t, up.URL)
 			const rid = "req-terminal"
 			rec := doRequestWithID(t, h.gw, "/v1/chat/completions", "sk-gw-t", streamFlagged(stream), rid)
-			if rec.Code != http.StatusInternalServerError {
-				t.Fatalf("终结响应必须沿用上游 500, got %d: %s", rec.Code, rec.Body.String())
+			if rec.Code != http.StatusServiceUnavailable {
+				t.Fatalf("终结响应应为网关语义 503, got %d: %s", rec.Code, rec.Body.String())
 			}
 			var out map[string]any
 			if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
 				t.Fatalf("decode: %v", err)
 			}
-			assertErrorSubtreeVerbatim(t, body, out)
+			assertErrorSubtreeVerbatim(t, body, out, http.StatusInternalServerError, http.StatusServiceUnavailable)
 			if out["request_id"] != rid {
 				t.Errorf("request_id want %q，got %v", rid, out["request_id"])
 			}
@@ -416,7 +476,7 @@ func TestServeUpstreamError_429TerminalKeepsUpstreamBody(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	assertErrorSubtreeVerbatim(t, body, out)
+	assertErrorSubtreeVerbatim(t, body, out, http.StatusTooManyRequests, http.StatusTooManyRequests)
 }
 
 // TestServeUpstreamError_ConnectionFailure 断网（连接被拒）：没有上游报文可透传，
@@ -744,7 +804,7 @@ func TestServeUpstreamError_ConnectionFailureNoAddress(t *testing.T) {
 	}
 }
 
-// TestWriteUpstreamError_UpstreamStatusIsRealCode 响应体顶层的 upstream_status 必须是**上游真实状态码**，
+// TestWriteUpstreamError_UpstreamStatusIsRealCode error 对象内的 upstream_status 必须是**上游真实状态码**，
 // 不是对外改写后的码：上游 304（对外按 502 输出）与「策略把 422 覆盖成 418」两种路径都要如实上报。
 func TestWriteUpstreamError_UpstreamStatusIsRealCode(t *testing.T) {
 	// 路径一：上游 304 → 对外 502，但 upstream_status 仍是 304。
@@ -758,8 +818,11 @@ func TestWriteUpstreamError_UpstreamStatusIsRealCode(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if got, _ := out["upstream_status"].(float64); int(got) != http.StatusNotModified {
-		t.Fatalf("upstream_status 必须是上游真实码 304, got %v", out["upstream_status"])
+	if got := errorUpstreamStatus(t, out); got != http.StatusNotModified {
+		t.Fatalf("upstream_status 必须是上游真实码 304, got %d", got)
+	}
+	if _, exists := out["upstream_status"]; exists {
+		t.Fatal("upstream_status 必须放在 error 对象内，不得出现在顶层")
 	}
 
 	// 路径二：协议策略把上游 422 覆盖成 418 → upstream_status 仍是 422。
@@ -782,8 +845,8 @@ func TestWriteUpstreamError_UpstreamStatusIsRealCode(t *testing.T) {
 	if err := json.Unmarshal(rec2.Body.Bytes(), &out2); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if got, _ := out2["upstream_status"].(float64); int(got) != http.StatusUnprocessableEntity {
-		t.Fatalf("策略覆盖时 upstream_status 必须仍是上游真实码 422, got %v", out2["upstream_status"])
+	if got := errorUpstreamStatus(t, out2); got != http.StatusUnprocessableEntity {
+		t.Fatalf("策略覆盖时 upstream_status 必须仍是上游真实码 422, got %d", got)
 	}
 }
 
@@ -1012,7 +1075,7 @@ func TestRedactUpstreamAddr_BlindSpots(t *testing.T) {
 }
 
 // TestServeUpstreamError_PolicyOverrideKeepsRealUpstreamStatus 上游 429 被错误策略覆盖成 418 时，
-// 对外 HTTP 状态码是 418，但响应体顶层 upstream_status 仍必须是上游真实的 429。
+// 对外 HTTP 状态码是 418（策略显式值），error.upstream_status 仍必须是上游真实的 429。
 func TestServeUpstreamError_PolicyOverrideKeepsRealUpstreamStatus(t *testing.T) {
 	up := upstreamErrServer(t, http.StatusTooManyRequests, `{"error":{"message":"slow down","type":"rate_limit_error"}}`)
 	h := build(t, up.URL)
@@ -1034,8 +1097,8 @@ func TestServeUpstreamError_PolicyOverrideKeepsRealUpstreamStatus(t *testing.T) 
 	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if got, _ := out["upstream_status"].(float64); int(got) != http.StatusTooManyRequests {
-		t.Fatalf("upstream_status 必须仍是上游真实码 429, got %v", out["upstream_status"])
+	if got := errorUpstreamStatus(t, out); got != http.StatusTooManyRequests {
+		t.Fatalf("upstream_status 必须仍是上游真实码 429, got %d", got)
 	}
 	// 错误体本身仍是上游原文（策略只改对外状态码与措辞，不改内容）。
 	e, _ := out["error"].(map[string]any)

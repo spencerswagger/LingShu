@@ -39,9 +39,13 @@ func TestUpstreamAuthRejectedLogsFullScene(t *testing.T) {
 
 	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-testtoken",
 		`{"model":"gpt-4","stream":false,"messages":[{"role":"user","content":"ping"}]}`)
-	// 单候选鉴权失败 → 终结响应沿用上游状态码（401），不再聚合成 503「无可用渠道」。
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("want 401（沿用上游）, got %d: %s", rec.Code, rec.Body.String())
+	// 单候选鉴权失败 → 对外是网关语义 503（不把上游 401 原样透出：那会让调用方误判「我方 key 无效」），
+	// 上游真实码只出现在 error.upstream_status 与调用日志里。
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("want 503（网关语义）, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if rb := decodeOpenAIError(t, rec); rb.Error.UpstreamStatus != http.StatusUnauthorized {
+		t.Fatalf("error.upstream_status want 401, got %d", rb.Error.UpstreamStatus)
 	}
 
 	out := dump()
