@@ -39,30 +39,33 @@ func streamSSE(frames ...string) string {
 	return b.String()
 }
 
-// sseWithErrorFrame 按「error 帧位置」拼出四种真实可能出现的顺序：
-// usage 在 error 帧之前 / 之后、有无 [DONE] 收尾。
+// errorFrameOrders 四种真实可能出现的帧顺序（usage 在 error 帧前/后 × 有无 [DONE] 收尾），逐一跑：
+// 顺序不同不得改变结论——只要出现过 error 帧且 usage 齐备，就必须记 failed。
+var errorFrameOrders = []string{"usage_before_error", "error_before_usage", "usage_after_error_no_done", "usage_before_error_no_done"}
+
+// sseWithErrorFrame 按「error 帧位置」拼出对应的 SSE。
 func sseWithErrorFrame(order string) string {
 	content := `data: {"choices":[{"index":0,"delta":{"content":"partial answer"}}]}`
 	usage := `data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`
 	errFrame := `data: ` + regionBlockedFrame
 	switch order {
-	case "usage_before_error":
-		return streamSSE(content, usage, errFrame, `data: [DONE]`)
-	case "error_before_usage":
+	case "error_before_usage": // error 帧先到、usage 随后、[DONE] 收尾
 		return streamSSE(content, errFrame, usage, `data: [DONE]`)
-	case "usage_no_done":
+	case "usage_after_error_no_done": // error 帧先到、usage 随后、无 [DONE]
+		return streamSSE(content, errFrame, usage)
+	case "usage_before_error_no_done": // usage 先到、error 帧收尾、无 [DONE]
 		return streamSSE(content, usage, errFrame)
-	default: // error_then_done：error 帧后只补一个 [DONE]（代理常见兜底），usage 已在前面给过
+	default: // usage_before_error：usage 先到、error 帧后到、[DONE] 收尾
 		return streamSSE(content, usage, errFrame, `data: [DONE]`)
 	}
 }
 
-// TestServeStream_ErrorFrameWithUsageRecordedFailed error 帧 + usage（四种顺序）：
+// TestServeStream_ErrorFrameWithUsageRecordedFailed error 帧 + usage（四种顺序，逐一跑）：
 //   - 调用日志记 failed（此前记 completed），error_message 含上游原文，upstream_status=200；
 //   - 计费按上游实际 usage（10/5），不估算、只有一条非 failed 账单；
 //   - 下游 SSE 里仍是上游 error 帧原文。
 func TestServeStream_ErrorFrameWithUsageRecordedFailed(t *testing.T) {
-	for _, order := range []string{"usage_before_error", "error_before_usage", "usage_no_done"} {
+	for _, order := range errorFrameOrders {
 		t.Run(order, func(t *testing.T) {
 			sse := sseWithErrorFrame(order)
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -245,4 +248,73 @@ func head(s string, n int) string {
 		return s
 	}
 	return s[:n]
+}
+
+// TestServeStream_HardErrKeepsUpstreamStatus 流式已回 200 后上游传输中断（如 Content-Length 虚高）：
+// 调用日志记 failed/resp_kind=error，且 upstream_status=200（此前漏传 → NULL，
+// 与迁移 0019「NULL = 连接失败/超时/网关拒绝」的注释矛盾）。
+func TestServeStream_HardErrKeepsUpstreamStatus(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Content-Length", "1000") // 声明长度远大于实际写入 → 客户端读到 unexpected EOF
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"))
+	}))
+	defer upstream.Close()
+
+	h := build(t, upstream.URL)
+	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t",
+		`{"model":"gpt-4","stream":true,"messages":[{"role":"user","content":"ping"}]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200（流式响应已下发）, got %d", rec.Code)
+	}
+	var streamErrLog *CallLog
+	for i := range h.clogs.inserted {
+		if h.clogs.inserted[i].RespKind == "error" {
+			streamErrLog = h.clogs.inserted[i]
+		}
+	}
+	if streamErrLog == nil {
+		t.Fatalf("流式中断应落一条 resp_kind=error 的调用日志, got %+v", h.clogs.inserted)
+	}
+	if streamErrLog.Status != "failed" {
+		t.Errorf("want status=failed, got %q", streamErrLog.Status)
+	}
+	if streamErrLog.UpstreamStatus == nil || *streamErrLog.UpstreamStatus != http.StatusOK {
+		t.Errorf("流式中断发生在 200 之后，upstream_status 应为 200，got %v", streamErrLog.UpstreamStatus)
+	}
+}
+
+// TestServeStream_BillingFailedKeepsUpstreamStatus 流式内容完整送达但结算失败：
+// 调用日志记 failed 且带上游真实码 200（此前该分支漏传 → NULL）。
+func TestServeStream_BillingFailedKeepsUpstreamStatus(t *testing.T) {
+	sse := streamSSE(
+		`data: {"choices":[{"index":0,"delta":{"content":"hi"}}]}`,
+		`data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}`,
+		`data: [DONE]`,
+	)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(sse))
+	}))
+	defer upstream.Close()
+
+	h := build(t, upstream.URL)
+	h.billing.err = errors.New("billing store down")
+	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t",
+		`{"model":"gpt-4","stream":true,"messages":[{"role":"user","content":"ping"}]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d", rec.Code)
+	}
+	if len(h.clogs.inserted) != 1 {
+		t.Fatalf("want 1 条调用日志, got %d", len(h.clogs.inserted))
+	}
+	cl := h.clogs.inserted[0]
+	if cl.Status != "failed" || cl.ErrorMessage != "流式计费失败" {
+		t.Fatalf("结算失败应记 failed/流式计费失败, got status=%q err=%q", cl.Status, cl.ErrorMessage)
+	}
+	if cl.UpstreamStatus == nil || *cl.UpstreamStatus != http.StatusOK {
+		t.Errorf("结算失败发生在 200 之后，upstream_status 应为 200，got %v", cl.UpstreamStatus)
+	}
 }

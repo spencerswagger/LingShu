@@ -30,9 +30,20 @@
 | `error.upstream_status` | **上游真实状态码** | 仅「上游返回非 2xx」的失败体带上；网关自身拒绝（鉴权/余额/路由/协议不支持）不带。用于区分「网关拒绝」与「上游拒绝、网关转述」，并可按上游状态码查厂商文档。 |
 | `request_id` | 网关 | 与响应头 `x-request-id` 同值（客户端带了合法的 `x-request-id` 时沿用）。这是运营在账单页定位一次请求的唯一钥匙。 |
 
-HTTP 状态码语义**不变**：上游 4xx/5xx 在未命中协议级错误策略时仍统一写 502（`code=upstream_error`），
-上游真实状态码体现在 `error.upstream_status` 与调用日志里；命中错误策略时按策略的 `downstreamStatus`。
-状态码本身不在本次改动范围内（改动它会影响客户端重试语义，属另一件事）。
+HTTP 状态码语义**不变**（本单只做可见性，不动既有映射）。未命中协议级错误策略时的实际取值：
+
+| 场景 | 对外状态码 | `error.code` |
+| --- | --- | --- |
+| 上游 4xx 且不可转移（400/422 等） | 502 | `upstream_error` |
+| 上游可转移失败（401/402/403/404/5xx）但候选耗尽 | 503 | `service_unavailable` |
+| 全部候选被上游 429 限流 | 429 | `rate_limit_exceeded` |
+| 已送达后超时 | 504 | `internal_error` |
+| 连接失败 / 构建失败 / 候选全被本地拦截 | 502 / 503 | `upstream_error` / `service_unavailable` |
+| 下游客户端断开 | 499 | — |
+
+命中错误策略时按策略的 `downstreamStatus`。**上游真实状态码**始终体现在 `error.upstream_status` 与
+`call_logs.upstream_status` 里；对外状态码不沿用上游（否则上游 401/402/403 原样透出会被调用方判成
+「我方 key 无效 / 我方余额不足」，实际是渠道密钥/余额问题）。
 
 ### 透传的边界
 
@@ -81,7 +92,7 @@ usage 结算的 `completed` 记录，金额与既有口径一致；失败结论�
 | 上游错误体 | `call_logs.resp_body` + `error_message` | 上游响应体截断到 4096 字节后落库（`error_message` 形如「上游返回 400: {上游报文}」） |
 | 渠道/密钥/模型 | `call_logs.channel_id / channel_key_id / internal_model_id / model` | 定位是哪条渠道哪次尝试 |
 | 时间 | `call_logs.created_at` | 落库时间 |
-| 金额 | `billing_records`（`status='failed'`、`credits_consumed=0`） | 失败不扣费，但必须有账 |
+| 金额 | `billing_records` | 分两类，**不要混读**：① 未产生上游内容的失败（上游 4xx/5xx、连接失败、网关拒绝）→ `status='failed'`、`credits_consumed=0`；② 上游已 200 并产出内容、只在流内报错或结算失败（见 §1.4）→ 账单行仍是按上游实际 usage 结算的 `completed`，失败结论只在 `call_logs.status='failed'`。判「算不算失败」看调用日志，判「扣了多少钱」看账单行 |
 
 调用日志的只读视图（admin `CallLogView` 与 dev `DevCallLogView`）都已输出 `UpstreamStatus`，
 账单详情页据此直接显示「上游 400」而不必从中文文案里推断。
@@ -101,6 +112,18 @@ usage 结算的 `completed` 记录，金额与既有口径一致；失败结论�
 未纳入：**鉴权失败（401）**——此时没有可信的用户身份，且该分支是外部可打的公开面，
 逐条落库会变成可被利用的写放大面；这类请求仍只有结构化异常日志。
 
+### 查询口径（按 request_id 定位时怎么读这几个字段）
+
+| `call_logs.status` | `upstream_status` | 含义 |
+| --- | --- | --- |
+| `failed` | 400 / 401 / 422 / 500 … | 上游返回非 2xx；对外 HTTP 状态码是网关语义（502/503），**不是**这一列的值 |
+| `failed` | **200** | **上游 HTTP 200、但流内下发 error 帧**（或流式中断/结算失败）。单看 200 像「上游成功」，必须结合 `status=failed` 与 `error_message` 一起读；结构化过滤可用 `decision.usage_reason=error_frame` / `decision.upstream_error_frame=true` |
+| `failed` | `NULL` | 没有上游状态码：连接失败、响应超时、构建失败，或网关自身拒绝（鉴权/余额/路由/协议不支持） |
+| `completed` | `NULL` | 成功；上游未返回 usage 时 `error_message` 标「按估算计费」 |
+
+> 一句话：**`upstream_status` 是上游真实 HTTP 码，不是本次请求的成败结论**；
+> 成败看 `call_logs.status`，扣费看 `billing_records`。
+
 ## 3. 验证
 
 `backend/internal/domain/gateway/upstream_error_passthrough_test.go`：
@@ -115,11 +138,10 @@ usage 结算的 `completed` 记录，金额与既有口径一致；失败结论�
 | `TestServeUpstreamError_TimeoutKeepsGenericMessage` | 超时（已送达）：502 + 网关文案 + 调用日志留痕 |
 | `TestServeUpstreamError_SuccessStaysSuccess` | 回归守卫：上游 2xx 不会被改成错误 |
 | `TestServeRejectPaths_RecordBillingAndCallLog` | 网关拒绝分支（格式错误/缺 model/余额不足/模型未配置）账单与调用日志成对、`billing_id` 1:1 |
-| `TestWriteUpstreamError_UpstreamStatusIsRealCode` | `upstream_status` 恒为上游真实码：上游 304（对外 502）、策略 422→418 两条路径都报 304 / 422 |
-| `TestOperatorView_SanitizesInvalidUTF8` | 含非法 UTF-8 / `0x00` 的报文产出合法 UTF-8 并同字段标注；合法原文零改动 |
 | `TestCallLog_PgRoundTrip_InvalidUTF8Payload` | 真库：非法 UTF-8 + `0x00` 的错误体仍能落库并读回（清洗后不丢内容） |
-| `TestToValidText`（`internal/pkg/errbody`） | 整理规则：非法字节 → `U+FFFD`、`0x00` → `<0x00>`、合法内容逐字节不变 |
-| `TestCallLog_PgRoundTrip` / `TestCallLog_PgRoundTrip_InvalidUTF8Payload` | 真库用例改为**自建临时库 + 跑全部迁移**，CI 里不再「库里没表就跳过」假绿 |
+| `TestCallLog_PgRoundTrip` / `TestCallLog_PgRoundTrip_InvalidUTF8Payload` | 真库用例改为**自建临时库 + 跑全部迁移**（`internal/testutil/pgtest`），CI 里不再「库里没表就跳过」假绿 |
+| `TestServeUpstreamError_DownstreamNeverSeesChannelCredential` | 上游回显渠道凭据时，对外响应与 `resp_body`/`error_message` 都不得出现该凭据，同时除凭据外内容仍可见 |
+| `TestServeUpstreamError_OutwardMessageHasNoUpstreamAddress` | 断网时对外文案不含主机名/IP/端口/URL；完整错误（含地址）留在调用日志供运营定位 |
 `backend/internal/domain/gateway/stream_error_frame_test.go`（流内 `error` 帧的留痕口径）：
 | 用例 | 覆盖 |
 | --- | --- |

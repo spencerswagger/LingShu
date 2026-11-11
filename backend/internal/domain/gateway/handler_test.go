@@ -3246,8 +3246,9 @@ func TestStreamDiag_NotDeliveredFields(t *testing.T) {
 		t.Fatalf("want call log for stream connect failure")
 	}
 	cl := h.clogs.inserted[0]
-	if cl.ErrorMessage != "上游流式连接失败" {
-		t.Errorf("文案应保持「上游流式连接失败」, got %q", cl.ErrorMessage)
+	// 文案保持「上游流式连接失败」前缀；后缀是完整底层错误（含地址），供运营定位是哪台机器/什么错。
+	if !strings.HasPrefix(cl.ErrorMessage, "上游流式连接失败") {
+		t.Errorf("文案应保持「上游流式连接失败」前缀, got %q", cl.ErrorMessage)
 	}
 	dec, ok := cl.Decision.(map[string]any)
 	if !ok {
@@ -3464,7 +3465,7 @@ func TestStreamDelivered_ConnectFailureFailsOver(t *testing.T) {
 	}
 	var connFailed *CallLog
 	for _, cl := range h.clogs.inserted {
-		if cl.ErrorMessage == "上游流式连接失败" {
+		if strings.HasPrefix(cl.ErrorMessage, "上游流式连接失败") {
 			connFailed = cl
 		}
 	}
