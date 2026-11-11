@@ -2,17 +2,24 @@ package gateway
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httptrace"
+	"net/url"
+	"os"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 	"unicode/utf8"
 
+	"github.com/team/llmgateway/internal/domain/channelprotocol"
 	"github.com/team/llmgateway/internal/domain/router"
 	"github.com/team/llmgateway/internal/pkg/resp"
 	"github.com/team/llmgateway/internal/testutil/randbody"
@@ -528,22 +535,22 @@ func TestServeUpstreamError_SuccessStaysSuccess(t *testing.T) {
 func TestUpstreamErrorPayload_Shapes(t *testing.T) {
 	// 截断后的 OpenAI 形状不再是合法 JSON → 退化为「原文文本进 message + 同字段标注」。
 	longBody := `{"error":{"message":"` + strings.Repeat("x", 9000) + `"}}`
-	payload, _ := upstreamErrorPayload(http.StatusBadRequest, longBody, "rid").(upstreamErrorEnvelope)
+	payload, _ := upstreamErrorPayload(http.StatusBadRequest, http.StatusBadRequest, longBody, "rid").(upstreamErrorEnvelope)
 	if !strings.Contains(payload.Error.Message, "已截断") || len(payload.Error.Message) > upstreamErrOutBytes {
 		t.Fatalf("超长必须在同一字段标注截断且不超上限, got len=%d", len(payload.Error.Message))
 	}
 	// 标量 JSON（非对象）→ 原文文本进 message。
-	payload, _ = upstreamErrorPayload(http.StatusBadRequest, `"plain string error"`, "rid").(upstreamErrorEnvelope)
+	payload, _ = upstreamErrorPayload(http.StatusBadRequest, http.StatusBadRequest, `"plain string error"`, "rid").(upstreamErrorEnvelope)
 	if payload.Error.Message != `"plain string error"` {
 		t.Fatalf("标量 JSON 应按原文文本透出, got %q", payload.Error.Message)
 	}
 	// error 是字符串（非 OpenAI 形状）→ 原文文本进 message，不硬解成 error 子对象。
-	payload, _ = upstreamErrorPayload(http.StatusBadRequest, `{"error":"boom"}`, "rid").(upstreamErrorEnvelope)
+	payload, _ = upstreamErrorPayload(http.StatusBadRequest, http.StatusBadRequest, `{"error":"boom"}`, "rid").(upstreamErrorEnvelope)
 	if payload.Error.Message != `{"error":"boom"}` {
 		t.Fatalf("非 OpenAI 形状应按原文文本透出, got %q", payload.Error.Message)
 	}
 	// OpenAI 形状且上游自带 request_id 时不覆盖上游的（只追加我们缺的字段）。
-	m, ok := upstreamErrorPayload(http.StatusBadRequest,
+	m, ok := upstreamErrorPayload(http.StatusBadRequest, http.StatusBadRequest,
 		`{"error":{"message":"x"},"request_id":"upstream-rid"}`, "gw-rid").(map[string]json.RawMessage)
 	if !ok {
 		t.Fatal("OpenAI 形状应走整段透传")
@@ -668,4 +675,128 @@ func tail(s string, n int) string {
 		return s
 	}
 	return s[len(s)-n:]
+}
+
+// TestUpstreamTransportNote_NoAddressLeak 传输层失败的对外文案**不得带渠道地址**（内网拓扑泄露），
+// 但仍要能看出「哪一类失败」——不能退回「服务暂时不可用」这种通用文案。
+func TestUpstreamTransportNote_NoAddressLeak(t *testing.T) {
+	opErr := &net.OpError{
+		Op:  "dial",
+		Net: "tcp",
+		Err: &os.SyscallError{Syscall: "connect", Err: syscall.ECONNREFUSED},
+	}
+	urlErr := &url.Error{Op: "Post", URL: "http://internal-gw.corp.local:18080/chat/completions", Err: opErr}
+	cases := []struct {
+		name     string
+		err      error
+		wantSub  string
+		timedOut bool
+	}{
+		{"连接被拒", urlErr, "连接被拒绝", false},
+		{"超时", &url.Error{Op: "Post", URL: "https://10.1.2.3:8443/v1", Err: timeoutErr{}}, "超时", true},
+		{"对端断开", &url.Error{Op: "Post", URL: "http://10.1.2.3:8443/v1", Err: io.ErrUnexpectedEOF}, "连接被上游中断", false},
+		{"DNS", &url.Error{Op: "Post", URL: "https://gw.internal:443/x", Err: &net.DNSError{Err: "no such host", Name: "gw.internal"}}, "域名解析失败", false},
+		{"未归类", errors.New(`Post "http://10.1.2.3:9000/v1/chat/completions": some weird transport failure`), "失败", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			note, timedOut := upstreamTransportNote("连接", tc.err)
+			if timedOut != tc.timedOut {
+				t.Errorf("timedOut want %v, got %v", tc.timedOut, timedOut)
+			}
+			if !strings.Contains(note, tc.wantSub) {
+				t.Errorf("原因必须可读（含 %q），got %q", tc.wantSub, note)
+			}
+			for _, leak := range []string{"internal-gw", "corp.local", "10.1.2.3", "18080", "8443", "9000", "http://", "https://", "gw.internal"} {
+				if strings.Contains(note, leak) {
+					t.Fatalf("对外文案泄露了渠道地址片段 %q: %q", leak, note)
+				}
+			}
+		})
+	}
+}
+
+// TestServeUpstreamError_ConnectionFailureNoAddress HTTP 级：断网时对外 message 不含上游地址/端口，
+// 但要点名「连接失败」。
+func TestServeUpstreamError_ConnectionFailureNoAddress(t *testing.T) {
+	dead := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	deadURL := dead.URL // http://127.0.0.1:<port>
+	dead.Close()
+
+	h := build(t, deadURL)
+	rec := doRequestWithID(t, h.gw, "/v1/chat/completions", "sk-gw-t", streamFlagged(false), "req-noleak")
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("want 502, got %d: %s", rec.Code, rec.Body.String())
+	}
+	rb := decodeOpenAIError(t, rec)
+	if !strings.Contains(rb.Error.Message, "连接失败") {
+		t.Fatalf("要点名连接失败, got %q", rb.Error.Message)
+	}
+	if strings.Contains(rb.Error.Message, "127.0.0.1") || strings.Contains(rb.Error.Message, "http://") {
+		t.Fatalf("对外文案不得出现上游地址/端口: %q", rb.Error.Message)
+	}
+}
+
+// TestWriteUpstreamError_UpstreamStatusIsRealCode 响应体顶层的 upstream_status 必须是**上游真实状态码**，
+// 不是对外改写后的码：上游 304（对外按 502 输出）与「策略把 422 覆盖成 418」两种路径都要如实上报。
+func TestWriteUpstreamError_UpstreamStatusIsRealCode(t *testing.T) {
+	// 路径一：上游 304 → 对外 502，但 upstream_status 仍是 304。
+	rec := httptest.NewRecorder()
+	rec.Header().Set("x-request-id", "rid-304")
+	writeUpstreamError(rec, http.StatusNotModified, http.StatusNotModified, `{"error":{"message":"not modified"}}`)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("304 应对外 502, got %d", rec.Code)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got, _ := out["upstream_status"].(float64); int(got) != http.StatusNotModified {
+		t.Fatalf("upstream_status 必须是上游真实码 304, got %v", out["upstream_status"])
+	}
+
+	// 路径二：协议策略把上游 422 覆盖成 418 → upstream_status 仍是 422。
+	up := upstreamErrServer(t, http.StatusUnprocessableEntity, errBody422)
+	h := build(t, up.URL)
+	no := false
+	withPolicy(h, 9, []channelprotocol.ErrorPolicy{{
+		Scope: channelprotocol.ErrorScopeChannel,
+		Match: channelprotocol.ErrorMatch{Status: http.StatusUnprocessableEntity},
+		Disposition: channelprotocol.ErrorDisposition{
+			Failover:         &no,
+			DownstreamStatus: http.StatusTeapot,
+		},
+	}})
+	rec2 := doRequestWithID(t, h.gw, "/v1/chat/completions", "sk-gw-t", streamFlagged(false), "rid-418")
+	if rec2.Code != http.StatusTeapot {
+		t.Fatalf("策略覆盖应对外 418, got %d: %s", rec2.Code, rec2.Body.String())
+	}
+	var out2 map[string]any
+	if err := json.Unmarshal(rec2.Body.Bytes(), &out2); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got, _ := out2["upstream_status"].(float64); int(got) != http.StatusUnprocessableEntity {
+		t.Fatalf("策略覆盖时 upstream_status 必须仍是上游真实码 422, got %v", out2["upstream_status"])
+	}
+}
+
+// TestOperatorView_SanitizesInvalidUTF8 上游报文含非法 UTF-8 / 0x00 时，
+// 运营视图必须产出合法 UTF-8（否则 PG text 列整行 INSERT 失败，这次失败的账与日志一起消失）。
+func TestOperatorView_SanitizesInvalidUTF8(t *testing.T) {
+	raw := "{\"error\":\"\xd6\xd0\xce\xc4\x00tail\"}"
+	view := upstreamErrBody{Raw: raw}.operatorView()
+	if !utf8.ValidString(view) {
+		t.Fatalf("运营视图必须是合法 UTF-8: %q", view)
+	}
+	if strings.ContainsRune(view, 0) {
+		t.Fatalf("不能含 NUL（PG text 存不了）: %q", view)
+	}
+	if !strings.Contains(view, "已替换") {
+		t.Fatalf("替换必须在同一字段标注出来: %q", view)
+	}
+	// 合法 UTF-8 且无 NUL 时零改动（不因清洗动到原文）。
+	clean := `{"error":"中文 ok"}`
+	if got := (upstreamErrBody{Raw: clean}).operatorView(); got != clean {
+		t.Fatalf("合法原文不得被改写: want=%q got=%q", clean, got)
+	}
 }

@@ -20,6 +20,13 @@
 - 连上游都没联系上（候选全被本地拦截：会话满/限流/凭据缺失/协议不支持）：503「无可用渠道」。
 - 1xx/3xx 不属错误语义（且 304 禁带响应体）：按 502 输出，保证错误内容可见。
 
+> **状态码有两个，不能混用**：对外 `status`（可能被策略覆盖、可能因 304 改成 502）与
+> 响应体顶层 `upstream_status`（**恒为上游真实码**）。策略把 422 覆盖成 418、或上游回 304 时，
+> `upstream_status` 仍报 422 / 304，否则字段名就是假的（`writeUpstreamError(status, upstreamStatus, body)`）。
+>
+> **错误策略里任何与内容相关的匹配（含 `MessageRegex`）只可能来自运维显式配置**，默认不启用；
+> 除非被显式配置，网关不按上游文案做任何分类或改写。
+
 ### 1.2 响应体：按**形状**透传，零内容特判
 
 判定只看响应体形状，不看文案、关键词、厂商、状态码——不存在「区域限制」「余额不足」这类分支，
@@ -60,6 +67,26 @@
   `…（已截断：上游原文共 12000 字节，超过 8192 字节对外上限）`——调用方无需另查元数据即可判断完整性。
 - 截断后不再是合法 JSON 的 OpenAI 形状，退化为「原文文本进 message + 标注」（内容不丢，只是不能逐字段解析）。
 
+### 1.3.1 传输层失败：可读，但不带渠道地址
+
+连接失败/超时/断连没有上游报文，对外要给「哪一类失败」，但**绝不能把渠道地址写进 message**：
+`net/http` 的原始错误形如
+`Post "http://internal-gw.corp.local:18080/chat/completions": dial tcp 10.0.3.7:18080: connect: connection refused`，
+原样透出等于把内网拓扑交给调用方。实现按 **Go 标准库错误类型与 errno** 分类（不读上游响应体，因此不属于按文案特判）：
+
+| 情形 | 对外文案（示例） | 对外状态码 |
+| --- | --- | --- |
+| `ECONNREFUSED` | 上游连接失败：连接被拒绝（connection refused） | 502 |
+| 超时（`net.Error.Timeout` / context deadline） | 上游请求超时（等不到上游响应） | 504 |
+| `ECONNRESET` / `EPIPE` | 上游连接失败：连接被上游重置（connection reset） | 502 |
+| `io.EOF` / `io.ErrUnexpectedEOF` | 上游连接失败：连接被上游中断（对端关闭连接） | 502 |
+| `net.DNSError` | 上游连接失败：域名解析失败（DNS） | 502 |
+| TLS / 证书类错误 | 上游连接失败：TLS 握手失败 | 502 |
+| 未归类 | 上游连接失败：<脱敏后的底层错误文本> | 502 |
+
+兜底路径还会把 URL / IPv4(:port) / `[IPv6](:port)` / 带端口主机名统一替换成 `<地址>`（`redactUpstreamAddr`），
+保证后续新增的未归类错误也不会把地址漏出去。
+
 ### 1.4 流式
 
 流式与非流式共用同一套错误分支代码：`stream=true` 且上游在 SSE 开始前返回非 2xx → 走本契约；
@@ -87,10 +114,16 @@
 > | --- | --- | --- |
 > | `Raw` | 对外透传 | 原文原样（含首尾空白），不遮蔽 |
 > | `Clean` | 日志短字段 / 错误分类 | 按**样式**清洗（`sk-*`/Bearer/KV/高熵长串 → `***`）+ 512B 截断 |
-> | `operatorView` | **运营落库**（`call_logs.resp_body`、`error_message`） | 原文逐字节，**只**把本次实际使用的凭据原值换成 `***`；超 32KB 同字段标注 |
+> | `operatorView` | **运营落库**（`call_logs.resp_body`、`error_message`） | 原文逐字节，**只**把本次实际使用的凭据原值换成 `***`；超 32KB 同字段标注；最后过 `errbody.ToValidText` → 非法 UTF-8 字节换成 `�`、`0x00` 换成 `<0x00>` |
 >
 > 这里刻意推翻了早期「落库走 Clean」的口径：按样式清洗会把上游报文里的 request-id、
 > 随机串、模型名一并抹成 `***`，运营读到的根本不是原文（实测一段报文从第 45 字节起整段消失）。
+>
+> **落库前还有一道「能否写进去」的闸**：上游报文是任意字节（GBK 错误页、截断的多字节字符、`0x00`），
+> 而 PG 的 `text` 列会拒绝非法 UTF-8 与 `0x00`，**整行 INSERT 失败**——一次上游报错就把这次请求的
+> 账单与调用日志一起丢掉。所以 `call_logs` / `billing_records` / `probe_logs` 的写入口都过
+> `errbody.ToValidText`（非法字节 → `U+FFFD`，`0x00` → `<0x00>`，并在同字段标注发生过替换），
+> 宁可「可辨认地不完整」，也不能整行消失。
 > 精确遮蔽（只知道我们发出去的那把 key）既能保证「存储不落明文凭据」，
 > 又能让除凭据外的每个字节保真——它比样式清洗更窄，也更准。
 
@@ -148,6 +181,7 @@
 | 对外透传 `error.message` | 64KB | 8KB | 同字段追加「…（已截断：上游原文共 N 字节，超过 8192 字节对外上限）」 |
 | `call_logs.resp_body` | 64KB | 32KB | 同字段追加「…（已截断：上游原文共 N 字节，此处只保留前 32768 字节）」；读满 64KB 时如实写「超过读取上限 65536 字节」 |
 | `probe_logs.error_body` / `ProbeOutcome.ErrorBody` | 64KB | 32KB | 同上（同一套 `errbody.TruncateUTF8`） |
+| **探活历史列表** `GET .../probe-logs` | 64KB（落库时） | **100 行 × 每行 4KB 预览** | 列表只给「这次为什么失败」的线索：超出的行按 4KB 预览 + 同字段标注「完整原文 N 字节见 error_body」；行数上限 100（历史值 500 行 × 32KB ≈ 16MB 单次响应） |
 
 读取上限必须**显著大于**保存上限：读取层静默截断会导致「既拿不到完整内容、也无法诚实标注」。
 
@@ -171,3 +205,11 @@
 | `TestServeUpstreamError_SuccessStaysSuccess` | 反向回归：200 JSON / 200 含厂商扩展字段 / 200 SSE 逐字节透传，`[DONE]` 保留，成功记录不写 `upstream_status` |
 | `TestUpstreamErrorPayload_Shapes` | 组装函数边界：截断后非法 JSON、标量 JSON、`error` 为字符串、上游自带 `request_id` 不被覆盖 |
 | `TestServeRejectPaths_RecordBillingAndCallLog` | 网关拒绝分支（格式错误/缺 model/余额不足/模型未配置）账单与调用日志成对、`billing_id` 1:1 |
+| `TestUpstreamTransportNote_NoAddressLeak` | 传输层失败分类：连接被拒/超时/断连/DNS/未归类各自可读，且文案**不含主机名/IP/端口/URL** |
+| `TestServeUpstreamError_ConnectionFailureNoAddress` | HTTP 级：断网时对外 502 + 点名连接失败，message 里没有 `127.0.0.1` / `http://` |
+| `TestWriteUpstreamError_UpstreamStatusIsRealCode` | `upstream_status` 恒为上游真实码：上游 304（对外 502）、策略 422→418 两条路径都报 304 / 422 |
+| `TestOperatorView_SanitizesInvalidUTF8` | 含非法 UTF-8 / `0x00` 的报文产出合法 UTF-8 并同字段标注；合法原文零改动 |
+| `TestCallLog_PgRoundTrip_InvalidUTF8Payload` | 真库：非法 UTF-8 + `0x00` 的错误体仍能落库并读回（清洗后不丢内容） |
+| `TestToValidText`（`internal/pkg/errbody`） | 整理规则：非法字节 → `U+FFFD`、`0x00` → `<0x00>`、合法内容逐字节不变 |
+| `TestHandleListProbeLogs_BoundsPayload` | 探活历史：`Limit=500` 收敛到 100 行、每行原文 ≤4KB 且同字段标注、整包响应 ≤64KB |
+| `TestCallLog_PgRoundTrip` / `TestCallLog_PgRoundTrip_InvalidUTF8Payload` | 真库用例改为**自建临时库 + 跑全部迁移**，CI 里不再「库里没表就跳过」假绿 |

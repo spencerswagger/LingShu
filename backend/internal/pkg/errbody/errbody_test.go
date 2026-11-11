@@ -80,3 +80,36 @@ func TestTruncateUTF8(t *testing.T) {
 		t.Fatalf("未超限必须原样返回: %q cut=%v", short, cut)
 	}
 }
+
+// TestToValidText 落库前的字节整理：非法 UTF-8 → U+FFFD、NUL → <0x00>，其余逐字节保真。
+// 这条守卫的存在理由：PG text 列拒绝非法字节序列与 0x00，原样写会让整行 INSERT 失败，
+// 于是一次上游报错就把这次请求的账单/调用日志整行弄丢。
+func TestToValidText(t *testing.T) {
+	cases := []struct {
+		name    string
+		in      string
+		want    string
+		changed bool
+	}{
+		{"合法中文原样", "上游返回 400：区域未开通 <b>&</b>", "上游返回 400：区域未开通 <b>&</b>", false},
+		{"空串", "", "", false},
+		{"非法UTF8字节", "\xd6\xd0", "\uFFFD\uFFFD", true},
+		{"NUL替换", "a\x00b", "a" + NULPlaceholder + "b", true},
+		{"截断的多字节字符（每个坏字节一个替换符）", "中\xe6\x96", "中\uFFFD\uFFFD", true},
+		{"emoji原样", "🙂", "🙂", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, changed := ToValidText(tc.in)
+			if got != tc.want {
+				t.Fatalf("ToValidText(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+			if changed != tc.changed {
+				t.Fatalf("changed = %v, want %v", changed, tc.changed)
+			}
+			if !utf8.ValidString(got) || strings.ContainsRune(got, 0) {
+				t.Fatalf("结果必须是合法 UTF-8 且无 NUL: %q", got)
+			}
+		})
+	}
+}
