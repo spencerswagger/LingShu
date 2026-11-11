@@ -7,11 +7,12 @@ import (
 )
 
 const (
-	BlockText       = "text"
-	BlockImage      = "image"
-	BlockToolUse    = "tool_use"
-	BlockToolResult = "tool_result"
-	BlockThinking   = "thinking"
+	BlockText             = "text"
+	BlockImage            = "image"
+	BlockToolUse          = "tool_use"
+	BlockToolResult       = "tool_result"
+	BlockThinking         = "thinking"
+	BlockRedactedThinking = "redacted_thinking"
 )
 
 type ContentBlock struct {
@@ -28,6 +29,9 @@ type ContentBlock struct {
 	IsError    bool
 
 	Signature string
+	// RedactedData 是 redacted_thinking 块的 opaque 密文（Anthropic 要求原样回传，
+	// 不能解明文；无明文可映射为 openai 的 reasoning_content，由会话级缓存兜底）。
+	RedactedData string
 }
 
 type Message struct {
@@ -93,9 +97,10 @@ const (
 )
 
 const (
-	DeltaText     = "text"
-	DeltaThinking = "thinking"
-	DeltaToolJSON = "tool_json"
+	DeltaText      = "text"
+	DeltaThinking  = "thinking"
+	DeltaToolJSON  = "tool_json"
+	DeltaSignature = "signature"
 )
 
 type CanonicalEvent struct {
@@ -110,4 +115,10 @@ type CanonicalEvent struct {
 	Usage      billing.Usage
 	HasUsage   bool
 	ErrMessage string
+	// Signature 是 thinking 块的签名（Anthropic 严格客户端要求非空；流式在
+	// content_block_stop 前通过 signature_delta 下发，非流式直接写入块内）。
+	Signature string
+	// RedactedData 是 redacted_thinking 块的 opaque 密文（content_block_start 携带，
+	// 必须原样透传；官方消息结构无 signature 字段）。
+	RedactedData string
 }

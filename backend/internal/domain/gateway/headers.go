@@ -47,9 +47,40 @@ func buildUpstreamRequest(ctx context.Context, req UpstreamRequest, defaultPath,
 	applyPassthrough(hreq.Header, req.DownstreamHeader, req.HeaderPolicy)
 	// 2) 协议隐含鉴权：openai-* → Authorization Bearer；anthropic-messages → x-api-key。
 	injectProtocolAuth(hreq, req.Protocol, req.Cred)
+	// 2.5) 协议隐含默认头（anthropic 直连必需，修复前缺失导致整链路 400/不可用）：
+	// anthropic-version 恒注入（可用「覆盖(set)」显式覆盖）；anthropic-beta 默认透传
+	//（interleaved thinking 等场景，客户端带来即上游，不带来也不强行注入）。
+	injectAnthropicProtocolDefaults(hreq, req)
 	// 3) 覆盖(set)：最后应用，可覆盖协议隐含鉴权头（显式意图优先）。
 	channelprotocol.ApplySet(hreq.Header, req.HeaderPolicy.Set, req.Cred, req.Vars, req.DownstreamHeader)
 	return hreq, nil
+}
+
+// injectAnthropicProtocolDefaults 为 anthropic-messages 上游注入协议隐含默认头：
+//   - anthropic-version（必填，缺省 2023-06-01）：直连渠道此前默认不带，anthropic 官方
+//     直接返回「anthropic-version: Field required」，整条链路不可用。用「覆盖(set)」可显式覆盖。
+//   - anthropic-beta（可选，默认透传）：interleaved thinking 等场景客户端须显式声明 beta 特性；
+//     anthropic-beta 允许**多值**（如 interleaved-thinking-* + fine-grained-tool-streaming），
+//     故按 Values 全量复刻、不做 Get+Set（Get 只取首行，会静默截断后续声明的特性）。
+//     仅当透传阶段未带上该头时才补（passthroughMode=all/whitelist 可能已复制）。
+//     客户端未带则不注入（注入未声明特性会被上游拒绝）。
+//
+// 仅对 anthropic-messages 目标协议生效（openai-* 上游无这些头，避免污染）。
+func injectAnthropicProtocolDefaults(hreq *http.Request, req UpstreamRequest) {
+	if channelprotocol.Canonical(req.Protocol) != channelprotocol.ProtocolAnthropicMessages {
+		return
+	}
+	versionKey := http.CanonicalHeaderKey("anthropic-version")
+	if hreq.Header.Get(versionKey) == "" {
+		hreq.Header.Set(versionKey, "2023-06-01")
+	}
+	betaKey := http.CanonicalHeaderKey("anthropic-beta")
+	if _, exists := hreq.Header[betaKey]; !exists {
+		if vals := req.DownstreamHeader.Values(betaKey); len(vals) > 0 {
+			// 直接赋值切片：保留全部行（Set 只留单值、Add 会与既有值叠加重复）。
+			hreq.Header[betaKey] = vals
+		}
+	}
 }
 
 // resolveUpstreamURL 求最终上游 URL：协议端点路径覆盖优先，空则用基础协议内置默认路径。

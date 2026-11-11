@@ -463,6 +463,7 @@ func serializeOAIMessage(m Message, rep *LossyReport, opts SerializeOptions) int
 	allText := true
 	hasToolUse := false
 	hasThinking := false
+	hasRedactedThinking := false
 	for _, b := range m.Blocks {
 		if b.Kind != BlockText {
 			allText = false
@@ -472,6 +473,9 @@ func serializeOAIMessage(m Message, rep *LossyReport, opts SerializeOptions) int
 		}
 		if b.Kind == BlockThinking {
 			hasThinking = true
+		}
+		if b.Kind == BlockRedactedThinking {
+			hasRedactedThinking = true
 		}
 	}
 
@@ -501,6 +505,8 @@ func serializeOAIMessage(m Message, rep *LossyReport, opts SerializeOptions) int
 			case BlockToolUse:
 			case BlockThinking:
 				// 是否丢失统一在下方按「最终是否真正回填」记账，避免与实际注入结果不一致。
+			case BlockRedactedThinking:
+				// 同上：统一在下方记账，避免此处 default 与后续 if 各记一条（重复）。
 			default:
 				rep.Add("message.content." + b.Kind)
 			}
@@ -529,6 +535,12 @@ func serializeOAIMessage(m Message, rep *LossyReport, opts SerializeOptions) int
 	// 保证损耗报告与「是否真正注入」一致，不出现「既未注入也未记 lossy」的静默丢弃。
 	if hasThinking && !injected {
 		rep.Add("message.content.thinking")
+	}
+	// redacted_thinking 是 opaque 密文，无法映射为明文 reasoning_content：请求侧丢弃
+	// （会话级缓存回填会在 handler 层按 tool_call_id 命中网关曾看到的 reasoning_content 兜底），
+	// 记 lossy 不得静默。
+	if hasRedactedThinking {
+		rep.Add("message.content.redacted_thinking")
 	}
 
 	if hasToolUse {

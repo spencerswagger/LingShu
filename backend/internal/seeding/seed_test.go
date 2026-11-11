@@ -5,6 +5,7 @@ package seeding
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/team/llmgateway/internal/domain/router"
@@ -40,5 +41,17 @@ func TestSeedSessionCostIsParsedAsProductDefault(t *testing.T) {
 	}
 	if got != router.DefaultSessionCostConfig() {
 		t.Fatalf("种子解析结果与产品默认不一致:\n got=%+v\n want=%+v", got, router.DefaultSessionCostConfig())
+	}
+}
+
+// TestSeedThinkingRoundtripDefault 断言「未挂载 thinking-roundtrip 的渠道默认回填推理内容」的
+// 种子为 true（2026-11-11 修 anthropic 入站 thinking 多轮 400：默认开启回填，关闭即回滚到改造前）。
+func TestSeedThinkingRoundtripDefault(t *testing.T) {
+	raw, ok := defaultSysConfigs["gateway.thinking_roundtrip.default_enabled"]
+	if !ok {
+		t.Fatalf("种子缺少 gateway.thinking_roundtrip.default_enabled")
+	}
+	if strings.TrimSpace(raw) != "true" {
+		t.Fatalf("种子应为 true（默认开启回填），got %q", raw)
 	}
 }

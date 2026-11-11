@@ -203,4 +203,76 @@ func TestAnthropicCodec(t *testing.T) {
 			t.Fatalf("round trip mismatch\nreq1=%+v\nreq2=%+v", req, req2)
 		}
 	})
+
+	t.Run("redacted_thinking_roundtrip", func(t *testing.T) {
+		// redacted_thinking 的 data 是 opaque 密文，必须原样往返（Anthropic 要求原样回传），
+		// 修复前该块类型不存在，解析落到 default 分支被静默丢弃。
+		const body = `{
+			"model": "claude-3-5-sonnet-20241022",
+			"max_tokens": 100,
+			"messages": [
+				{"role": "user", "content": "hi"},
+				{"role": "assistant", "content": [
+					{"type": "redacted_thinking", "data": "opaque-cipher-text", "signature": "sig-redacted"}
+				]}
+			]
+		}`
+		req1, rep, err := codec.ParseRequest([]byte(body))
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if len(req1.Messages) != 2 || len(req1.Messages[1].Blocks) != 1 ||
+			req1.Messages[1].Blocks[0].Kind != BlockRedactedThinking ||
+			req1.Messages[1].Blocks[0].RedactedData != "opaque-cipher-text" {
+			t.Fatalf("redacted_thinking 应解析为独立块且 data 原样保留: %+v", req1.Messages)
+		}
+		for _, d := range rep.Dropped {
+			if d == "content.block.redacted_thinking" {
+				t.Fatalf("redacted_thinking 不应被丢弃: %+v", rep.Dropped)
+			}
+		}
+		out, _, err := codec.SerializeRequest(req1)
+		if err != nil {
+			t.Fatalf("serialize: %v", err)
+		}
+		// 官方消息结构只有 type + data，无 signature 字段：整个 "signature" 键都不应出现
+		// （只断言「不含输入值」挡不住把空签名/生成签名加回去的变异）。
+		if !strings.Contains(string(out), `"type":"redacted_thinking"`) ||
+			!strings.Contains(string(out), `"data":"opaque-cipher-text"`) {
+			t.Fatalf("redacted_thinking 应原样序列化（type + data）: %s", out)
+		}
+		if strings.Contains(string(out), `"signature"`) {
+			t.Fatalf("redacted_thinking 不应出现 signature 键（官方结构无该字段）: %s", out)
+		}
+		req2, _, err := codec.ParseRequest(out)
+		if err != nil {
+			t.Fatalf("reparse: %v", err)
+		}
+		if !reflect.DeepEqual(req1, req2) {
+			t.Fatalf("redacted_thinking round trip mismatch\nreq1=%+v\nreq2=%+v", req1, req2)
+		}
+	})
+
+	t.Run("thinking_signature_generated_when_empty", func(t *testing.T) {
+		// 从 openai-chat 转换来的 thinking 无签名概念：序列化到 anthropic 必须生成
+		// 非空 signature（否则严格客户端丢弃该块 → 下一轮不回传 → 上游 400）。
+		const body = `{
+			"model": "claude-3-5-sonnet-20241022",
+			"max_tokens": 100,
+			"content": [
+				{"type": "thinking", "thinking": "chain of thought", "signature": ""}
+			]
+		}`
+		resp, _, err := codec.ParseResponse([]byte(body))
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		out, _, err := codec.SerializeResponse(resp)
+		if err != nil {
+			t.Fatalf("serialize: %v", err)
+		}
+		if !strings.Contains(string(out), `"signature":"lsig_`) {
+			t.Fatalf("空 signature 应生成不透明签名: %s", out)
+		}
+	})
 }

@@ -429,30 +429,54 @@ func TestChannelReasoningInject(t *testing.T) {
 	}
 
 	t.Run("undeclared_or_disabled_zero", func(t *testing.T) {
-		if got := channelReasoningInject(mk(map[string]any{}), true); got.ReasoningContent {
-			t.Fatalf("未启用时不应生效, got %+v", got)
+		// 显式挂载但未开 enabled：维持缺省关闭（显式挂载是运维意图，全局默认不覆盖）。
+		if got := channelReasoningInject(mk(map[string]any{}), true, true); got.ReasoningContent {
+			t.Fatalf("显式挂载未启用时不应生效, got %+v", got)
 		}
-		if got := channelReasoningInject(&channel.RuntimeChannel{}, true); got.ReasoningContent {
-			t.Fatalf("未挂载渠道协议时不应生效, got %+v", got)
+		// 无渠道协议且全局默认关闭：回滚到改造前（不回填）。
+		if got := channelReasoningInject(&channel.RuntimeChannel{}, true, false); got.ReasoningContent {
+			t.Fatalf("未挂载 + 默认关闭时不应生效, got %+v", got)
+		}
+	})
+
+	t.Run("unmounted_default_enabled", func(t *testing.T) {
+		// 未挂载特性 + 全局默认开启（默认）：应回填 reasoning_content。
+		got := channelReasoningInject(&channel.RuntimeChannel{}, false, true)
+		if !got.ReasoningContent || got.ReasoningField != "reasoning_content" {
+			t.Fatalf("未挂载 + 默认开启时应按默认回填, got %+v", got)
+		}
+	})
+
+	t.Run("unmounted_default_disabled_rollback", func(t *testing.T) {
+		// 未挂载特性 + 全局默认关闭：回滚到改造前（不回填）。
+		if got := channelReasoningInject(&channel.RuntimeChannel{}, false, false); got.ReasoningContent {
+			t.Fatalf("未挂载 + 默认关闭时应回滚到改造前（不回填）, got %+v", got)
+		}
+	})
+
+	t.Run("mounted_wins_over_default", func(t *testing.T) {
+		// 显式挂载 enabled=false + 全局默认开启：显式挂载优先，仍不回填。
+		if got := channelReasoningInject(mk(map[string]any{"enabled": false}), false, true); got.ReasoningContent {
+			t.Fatalf("显式挂载 enabled=false 应优先于全局默认, got %+v", got)
 		}
 	})
 
 	t.Run("enabled_without_only_thinking", func(t *testing.T) {
-		got := channelReasoningInject(mk(map[string]any{"enabled": true, "field": "reasoning"}), false)
+		got := channelReasoningInject(mk(map[string]any{"enabled": true, "field": "reasoning"}), false, true)
 		if !got.ReasoningContent || got.ReasoningField != "reasoning" {
 			t.Fatalf("非 onlyThinking 时应无条件生效并沿用字段名, got %+v", got)
 		}
 	})
 
 	t.Run("only_thinking_skips_plain_request", func(t *testing.T) {
-		got := channelReasoningInject(mk(map[string]any{"enabled": true, "onlyThinking": true}), false)
+		got := channelReasoningInject(mk(map[string]any{"enabled": true, "onlyThinking": true}), false, true)
 		if got.ReasoningContent {
 			t.Fatalf("onlyThinking 下非 thinking 请求不应生效, got %+v", got)
 		}
 	})
 
 	t.Run("only_thinking_applies_on_thinking_request", func(t *testing.T) {
-		got := channelReasoningInject(mk(map[string]any{"enabled": true, "onlyThinking": true}), true)
+		got := channelReasoningInject(mk(map[string]any{"enabled": true, "onlyThinking": true}), true, true)
 		if !got.ReasoningContent || got.ReasoningField != "reasoning_content" {
 			t.Fatalf("onlyThinking 下 thinking 请求应生效, got %+v", got)
 		}

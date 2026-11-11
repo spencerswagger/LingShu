@@ -1,6 +1,7 @@
 package protocolconv
 
 import (
+	"bytes"
 	"reflect"
 	"strconv"
 	"strings"
@@ -115,6 +116,109 @@ func TestStream(t *testing.T) {
 			t.Fatalf("cross-protocol mismatch\nfirst:  %s\nsecond: %s", dumpEvents(first), dumpEvents(second))
 		}
 	})
+}
+
+// TestAnthropicThinkingSignatureStream 断言 anthropic 流式的 thinking 块（thinking_delta +
+// signature_delta）在解码/编码往返后形状正确：signature_delta 解码为 DeltaSignature、
+// 编码回 anthropic 帧为 signature_delta（在 content_block_stop 之前）。
+func TestAnthropicThinkingSignatureStream(t *testing.T) {
+	const sample = `event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","signature":"sig-abc"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Let me think"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-abc"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+`
+	codec := anthropicCodec{}
+	evs := decodeSSE(t, codec, sample)
+	var sawThinking, sawSignature bool
+	for _, ev := range evs {
+		if ev.DeltaKind == DeltaThinking {
+			sawThinking = true
+		}
+		if ev.DeltaKind == DeltaSignature && ev.Signature == "sig-abc" {
+			sawSignature = true
+		}
+	}
+	if !sawThinking || !sawSignature {
+		t.Fatalf("应解码出 thinking_delta 与 signature_delta，events=%s", dumpEvents(evs))
+	}
+	// 编码回 anthropic：signature_delta 帧必须存在。
+	frames := encodeFrames(t, codec, evs)
+	joined := string(bytes.Join(frames, nil))
+	if !strings.Contains(joined, `"type":"signature_delta"`) || !strings.Contains(joined, `"signature":"sig-abc"`) {
+		t.Fatalf("编码回 anthropic 应含 signature_delta，got %s", joined)
+	}
+	// 帧序：signature_delta 在 content_block_stop 之前。
+	if idx := strings.Index(joined, `"type":"signature_delta"`); idx < 0 || strings.Index(joined, "content_block_stop") < idx {
+		t.Fatalf("signature_delta 应在 content_block_stop 之前，got %s", joined)
+	}
+}
+
+// TestAnthropicRedactedThinkingStream 断言流式下 redacted_thinking 的 content_block_start
+// 能保留 data 并原样往返（官方结构只有 type + data，无 signature）：
+// 修正前解码丢弃 data，流式「原样透传」不成立。
+func TestAnthropicRedactedThinkingStream(t *testing.T) {
+	const sample = `event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"opaque-cipher-xyz"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+`
+	codec := anthropicCodec{}
+	evs := decodeSSE(t, codec, sample)
+	if len(evs) == 0 || evs[0].Type != EventContentBlockStart ||
+		evs[0].BlockKind != BlockRedactedThinking || evs[0].RedactedData != "opaque-cipher-xyz" {
+		t.Fatalf("应解码出 redacted_thinking 块并保留 data，events=%s", dumpEvents(evs))
+	}
+	frames := encodeFrames(t, codec, evs)
+	joined := string(bytes.Join(frames, nil))
+	if !strings.Contains(joined, `"type":"redacted_thinking"`) || !strings.Contains(joined, `"data":"opaque-cipher-xyz"`) {
+		t.Fatalf("编码回 anthropic 应保留 type + data，got %s", joined)
+	}
+	if strings.Contains(joined, `"signature"`) {
+		t.Fatalf("redacted_thinking 不应携带 signature（官方结构无该字段），got %s", joined)
+	}
+	// 往返稳定：再解码一次应与首次一致。
+	if second := decodeFrames(t, codec, frames); !reflect.DeepEqual(evs, second) {
+		t.Fatalf("redacted_thinking 流式往返不一致\nfirst:  %s\nsecond: %s", dumpEvents(evs), dumpEvents(second))
+	}
+}
+
+// TestAnthropicThinkingStartOmitsEmptySignature 断言 thinking 块 content_block_start
+// 在签名为空时不下发 "signature":""（官方无该键，空值会被严格客户端当作非法签名）。
+func TestAnthropicThinkingStartOmitsEmptySignature(t *testing.T) {
+	frames, _, err := anthropicCodec{}.EncodeEvent(CanonicalEvent{
+		Type:      EventContentBlockStart,
+		Index:     0,
+		BlockKind: BlockThinking,
+		Signature: "",
+	})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	joined := string(bytes.Join(frames, nil))
+	if strings.Contains(joined, `"signature"`) {
+		t.Fatalf("签名空时不应下发 signature 键，got %s", joined)
+	}
+	// 非空签名仍须输出（不能把该键一律删掉）。
+	frames, _, err = anthropicCodec{}.EncodeEvent(CanonicalEvent{
+		Type:      EventContentBlockStart,
+		Index:     0,
+		BlockKind: BlockThinking,
+		Signature: "sig-abc",
+	})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if joined := string(bytes.Join(frames, nil)); !strings.Contains(joined, `"signature":"sig-abc"`) {
+		t.Fatalf("非空签名应下发，got %s", joined)
+	}
 }
 
 func TestEmptyStopReasonNotLeaking(t *testing.T) {

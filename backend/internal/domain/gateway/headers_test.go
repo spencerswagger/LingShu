@@ -198,3 +198,65 @@ func TestInjectProtocolAuth(t *testing.T) {
 		t.Errorf("无凭据不应注入鉴权头，got %q", got)
 	}
 }
+
+// anthropic 直连协议隐含默认头（修复前缺失导致整链路 400/不可用）：
+// anthropic-version 恒注入；anthropic-beta 仅当客户端带来时透传；openai-* 上游不受影响。
+func TestInjectAnthropicProtocolDefaults(t *testing.T) {
+	// anthropic-messages：默认注入 anthropic-version: 2023-06-01（必填头）。
+	req := buildReq(t, http.Header{}, channelprotocol.HeaderPolicy{},
+		channelprotocol.ProtocolAnthropicMessages, "sk-raw", nil)
+	if got := req.Header.Get("Anthropic-Version"); got != "2023-06-01" {
+		t.Errorf("anthropic 直连应默认注入 anthropic-version，got %q", got)
+	}
+	// 客户端带来 anthropic-beta：默认透传（interleaved thinking 等场景）。
+	down := http.Header{}
+	down.Set("Anthropic-Beta", "interleaved-thinking-2025-01-15")
+	req = buildReq(t, down, channelprotocol.HeaderPolicy{},
+		channelprotocol.ProtocolAnthropicMessages, "sk-raw", nil)
+	if got := req.Header.Get("Anthropic-Beta"); got != "interleaved-thinking-2025-01-15" {
+		t.Errorf("anthropic-beta 应透传客户端值，got %q", got)
+	}
+	// 客户端未带 beta：不强行注入（注入未声明特性会被上游拒绝）。
+	req = buildReq(t, http.Header{}, channelprotocol.HeaderPolicy{},
+		channelprotocol.ProtocolAnthropicMessages, "sk-raw", nil)
+	if got := req.Header.Get("Anthropic-Beta"); got != "" {
+		t.Errorf("客户端未带 anthropic-beta 时不应注入，got %q", got)
+	}
+	// 覆盖(set) 可显式覆盖 version。
+	req = buildReq(t, http.Header{}, channelprotocol.HeaderPolicy{
+		PassthroughMode: channelprotocol.PassthroughNone,
+		Set:             map[string]string{"Anthropic-Version": "2024-01-01"},
+	}, channelprotocol.ProtocolAnthropicMessages, "sk-raw", nil)
+	if got := req.Header.Get("Anthropic-Version"); got != "2024-01-01" {
+		t.Errorf("覆盖(set) 应能显式覆盖 anthropic-version，got %q", got)
+	}
+	// openai-chat 上游：不注入 anthropic 头。
+	req = buildReq(t, http.Header{}, channelprotocol.HeaderPolicy{},
+		channelprotocol.ProtocolOpenAIChat, "sk-abc", nil)
+	if got := req.Header.Get("Anthropic-Version"); got != "" {
+		t.Errorf("openai-chat 上游不应注入 anthropic-version，got %q", got)
+	}
+}
+
+// anthropic-beta 允许**多值**（如 interleaved-thinking-* + fine-grained-tool-streaming）：
+// 多值必须全量透传，不得被 Get+Set 截断成首行（本 PR 早期版本引入的回归）。
+func TestInjectAnthropicBetaMultiValue(t *testing.T) {
+	down := http.Header{}
+	down.Add("Anthropic-Beta", "interleaved-thinking-2025-01-15")
+	down.Add("Anthropic-Beta", "fine-grained-tool-streaming-2025-05-14")
+
+	// 场景 1：passthroughMode=none（默认）→ 由协议隐含默认头补全，必须两行都在。
+	req := buildReq(t, down, channelprotocol.HeaderPolicy{}, channelprotocol.ProtocolAnthropicMessages, "sk-raw", nil)
+	got := req.Header.Values("Anthropic-Beta")
+	if len(got) != 2 || got[0] != "interleaved-thinking-2025-01-15" || got[1] != "fine-grained-tool-streaming-2025-05-14" {
+		t.Fatalf("none 模式应全量透传两行 anthropic-beta，got %#v", got)
+	}
+
+	// 场景 2：passthroughMode=all（透传已带该头）→ 不得被默认补全覆写成单行/重复。
+	req = buildReq(t, down, channelprotocol.HeaderPolicy{PassthroughMode: channelprotocol.PassthroughAll},
+		channelprotocol.ProtocolAnthropicMessages, "sk-raw", nil)
+	got = req.Header.Values("Anthropic-Beta")
+	if len(got) != 2 || got[0] != "interleaved-thinking-2025-01-15" || got[1] != "fine-grained-tool-streaming-2025-05-14" {
+		t.Fatalf("all 模式应保留透传的两行 anthropic-beta（不得截断/重复），got %#v", got)
+	}
+}

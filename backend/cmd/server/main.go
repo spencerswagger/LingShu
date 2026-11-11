@@ -666,6 +666,31 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 			}
 			return true
 		},
+		// 未挂载 thinking-roundtrip 的渠道默认回填推理内容（sys_configs 键 =
+		// gateway.ThinkingRoundtripDefaultEnabledKey，默认开启）。缺省/空/解析失败按开启处理；
+		// 仅显式 false 才关闭（回滚到改造前：未配置渠道 thinking 一律丢）。
+		ThinkingRoundtripDefaultEnabled: func() bool {
+			raw, err := billStore.GetConfig(context.Background(), gateway.ThinkingRoundtripDefaultEnabledKey)
+			if err != nil {
+				return true
+			}
+			s := strings.TrimSpace(string(raw))
+			if s == "" {
+				return true
+			}
+			var b bool
+			if err := json.Unmarshal([]byte(s), &b); err == nil {
+				return b
+			}
+			var str string
+			if err := json.Unmarshal([]byte(s), &str); err == nil {
+				switch strings.ToLower(strings.TrimSpace(str)) {
+				case "false", "0":
+					return false
+				}
+			}
+			return true
+		},
 		Logger: logr,
 	})
 	// 调用日志采集注入（nil=不采集；生产装配 SQL 存储，与 console 只读共用）。

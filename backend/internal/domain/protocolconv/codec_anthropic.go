@@ -426,6 +426,7 @@ func parseAnthropicBlock(raw json.RawMessage, rep *LossyReport) (ContentBlock, b
 		IsError   bool            `json:"is_error"`
 		Thinking  string          `json:"thinking"`
 		Signature string          `json:"signature"`
+		Data      string          `json:"data"`
 	}
 	if err := json.Unmarshal(raw, &b); err != nil {
 		return ContentBlock{}, false, err
@@ -473,6 +474,10 @@ func parseAnthropicBlock(raw json.RawMessage, rep *LossyReport) (ContentBlock, b
 		}, true, nil
 	case BlockThinking:
 		return ContentBlock{Kind: BlockThinking, Text: b.Thinking, Signature: b.Signature}, true, nil
+	case BlockRedactedThinking:
+		// redacted_thinking 的 data 是 opaque 密文，必须原样保留（Anthropic 要求回传），
+		// 不能解明文；官方消息结构无 signature 字段，故只保留 data。
+		return ContentBlock{Kind: BlockRedactedThinking, RedactedData: b.Data}, true, nil
 	default:
 		rep.Add("content.block." + b.Type)
 		return ContentBlock{}, false, nil
@@ -599,10 +604,23 @@ func serializeAnthropicBlock(b ContentBlock, rep *LossyReport) interface{} {
 	case BlockToolResult:
 		return serializeAnthropicToolResult(b, rep)
 	case BlockThinking:
+		// signature 恒空时生成不透明签名：从 openai-chat 转换来的 thinking（reasoning_content
+		// 无签名概念）若下发空签名，严格客户端会丢弃该块，下一轮不回传 → 上游 400。
+		// anthropic→anthropic 透传保留原始签名（非空，不走此分支）；生成的是稳定不透明串。
+		sig := b.Signature
+		if sig == "" {
+			sig = OpaqueThinkingSignature(b.Text)
+		}
 		return map[string]interface{}{
 			"type":      BlockThinking,
 			"thinking":  b.Text,
-			"signature": b.Signature,
+			"signature": sig,
+		}
+	case BlockRedactedThinking:
+		// redacted_thinking 原样回传：官方消息结构只有 type + data，无 signature 字段。
+		return map[string]interface{}{
+			"type": BlockRedactedThinking,
+			"data": b.RedactedData,
 		}
 	default:
 		rep.Add("content.block." + b.Kind)
@@ -706,15 +724,23 @@ func (anthropicCodec) DecodeEvent(data []byte) ([]CanonicalEvent, *LossyReport, 
 	case "content_block_start":
 		ev := CanonicalEvent{Type: EventContentBlockStart, Index: rawIntValue(top["index"])}
 		if raw, ok := top["content_block"]; ok && !isJSONNull(raw) {
+			// 保留 thinking 文本/签名与 redacted data：流式下也要能原样透传该块，
+			// 否则「原样往返」只在非流式成立。
 			var cb struct {
-				Type string `json:"type"`
-				ID   string `json:"id"`
-				Name string `json:"name"`
+				Type      string `json:"type"`
+				ID        string `json:"id"`
+				Name      string `json:"name"`
+				Thinking  string `json:"thinking"`
+				Signature string `json:"signature"`
+				Data      string `json:"data"`
 			}
 			_ = json.Unmarshal(raw, &cb)
 			ev.BlockKind = cb.Type
 			ev.ToolUseID = cb.ID
 			ev.ToolName = cb.Name
+			ev.Text = cb.Thinking
+			ev.Signature = cb.Signature
+			ev.RedactedData = cb.Data
 		}
 		return []CanonicalEvent{ev}, rep, nil
 	case "content_block_delta":
@@ -725,6 +751,7 @@ func (anthropicCodec) DecodeEvent(data []byte) ([]CanonicalEvent, *LossyReport, 
 				Text        string `json:"text"`
 				Thinking    string `json:"thinking"`
 				PartialJSON string `json:"partial_json"`
+				Signature   string `json:"signature"`
 			}
 			_ = json.Unmarshal(raw, &d)
 			switch d.Type {
@@ -734,6 +761,10 @@ func (anthropicCodec) DecodeEvent(data []byte) ([]CanonicalEvent, *LossyReport, 
 			case "thinking_delta":
 				ev.DeltaKind = DeltaThinking
 				ev.Text = d.Thinking
+			case "signature_delta":
+				ev.DeltaKind = DeltaSignature
+				ev.Signature = d.Signature
+				ev.Text = d.Signature
 			case "input_json_delta":
 				ev.DeltaKind = DeltaToolJSON
 				ev.Text = d.PartialJSON
@@ -801,10 +832,22 @@ func (anthropicCodec) EncodeEvent(ev CanonicalEvent) ([][]byte, *LossyReport, er
 		})}, rep, nil
 	case EventContentBlockStart:
 		cb := map[string]interface{}{"type": ev.BlockKind}
-		if ev.BlockKind == BlockToolUse {
+		switch ev.BlockKind {
+		case BlockToolUse:
 			cb["id"] = ev.ToolUseID
 			cb["name"] = ev.ToolName
 			cb["input"] = map[string]interface{}{}
+		case BlockThinking:
+			// thinking 块 start 携带 thinking（通常为空串）与 signature，供流式原样往返。
+			// 官方无 signature 键时不下发空值（空键会被严格客户端当作非法签名）：
+			// 仅当签名非空时才输出，签名随后由 signature_delta 在 stop 前补发。
+			cb["thinking"] = ev.Text
+			if ev.Signature != "" {
+				cb["signature"] = ev.Signature
+			}
+		case BlockRedactedThinking:
+			// 官方消息结构只有 type + data，无 signature 字段。
+			cb["data"] = ev.RedactedData
 		}
 		return [][]byte{anthropicFrame("content_block_start", map[string]interface{}{
 			"type":          "content_block_start",
@@ -820,6 +863,9 @@ func (anthropicCodec) EncodeEvent(ev CanonicalEvent) ([][]byte, *LossyReport, er
 		case DeltaThinking:
 			delta["type"] = "thinking_delta"
 			delta["thinking"] = ev.Text
+		case DeltaSignature:
+			delta["type"] = "signature_delta"
+			delta["signature"] = ev.Text
 		case DeltaToolJSON:
 			delta["type"] = "input_json_delta"
 			delta["partial_json"] = ev.Text

@@ -813,7 +813,10 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 		// 若同时声明 onlyThinking=true，则仅当入站请求处于 thinking 模式时生效——
 		// 该标记已在候选循环前由 isThinkingRequestBody(body) 单次求值，见 inboundThinking）：
 		// 同时供「转换时回填 assistant thinking」与「会话级推理缓存回填」两处门控，避免重复求值与语义分叉。
-		reasoningInject := channelReasoningInject(rt, inboundThinking)
+		// 默认值只对**跨协议转换**路径生效：直通渠道（converted=false）仍必须显式挂载
+		// thinking-roundtrip 才回填。原因见 channelReasoningInject 注释（推理缓存跨渠道/跨厂商共享，
+		// 对直通渠道默认注入会把 A 厂商 CoT 注给 B 厂商）。
+		reasoningInject := channelReasoningInject(rt, inboundThinking, converted && g.thinkingRoundtripDefaultEnabled())
 		if converted {
 			// 序列化选项由渠道协议声明：仅当挂载 thinking-roundtrip（enabled=true）时才把
 			// assistant thinking 回填为推理字段（字段名沿用该特性 field 参数）。

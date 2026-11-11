@@ -1,0 +1,29 @@
+-- 0021_thinking_roundtrip_default：未挂载 thinking-roundtrip 的渠道默认回填推理内容。
+--
+-- 背景（2026-11-11 修复 anthropic 入站 thinking 多轮 400）：
+--   Anthropic 入站 → openai-chat 上游的 thinking 多轮场景，客户端（Claude Code）历史里若
+--   assistant 消息没有 reasoning_content，上游（DeepSeek/MiMo 一类 thinking 模型）会 400
+--   「reasoning_content must be passed back」。此前必须渠道协议显式挂载 thinking-roundtrip
+--   (enabled=true) 才回填，未配置渠道 thinking 一律丢 → 默认行为就是 400。
+--
+-- 本迁移引入全局开关 `gateway.thinking_roundtrip.default_enabled`（默认 true）：
+--   开启（默认）：未挂载 thinking-roundtrip 的渠道按「支持推理回传」处理——
+--     转换注入（anthropic→openai-chat 把 thinking 回填 reasoning_content）与会话级缓存回填生效。
+--     安全边界：回填只写目标协议为 openai-chat 的请求体；会话级缓存仅在网关曾从该上游看到
+--     reasoning_content 时命中，不会向非 thinking 上游注入未知字段。
+--   关闭：回滚到改造前行为（未配置渠道 thinking 一律丢，逐字节不变）。
+--
+-- 回滚路径（两个选择）：
+--   1) 迁移级回滚：本迁移只插入一条 sys_configs 记录，不改变任何已有行——
+--      回滚 = DELETE FROM sys_configs WHERE key='gateway.thinking_roundtrip.default_enabled'，
+--      代码默认值仍是 true（见 gateway.go ThinkingRoundtripDefaultEnabledKey），
+--      需同时把运行开关显式置 false 才彻底回到改造前。
+--   2) 运行级回退（推荐，无需迁移）：把该键置为 false（走应用内写入触发缓存失效，立即生效），
+--      或把具体渠道协议显式挂载 thinking-roundtrip{enabled:false}（显式挂载优先于全局默认）。
+--
+-- 显式挂载优先：渠道协议一旦挂载 thinking-roundtrip，以挂载参数为准（enabled 缺省 false），
+-- 全局默认只作用于「未挂载」的渠道。存量「挂载但未开 enabled」的渠道行为不变。
+--
+-- 注意 ON CONFLICT DO NOTHING：若运维已写入该键（如显式关闭），本迁移不改动其值。
+INSERT INTO sys_configs(key, value) VALUES ('gateway.thinking_roundtrip.default_enabled', 'true'::jsonb)
+ON CONFLICT (key) DO NOTHING;
