@@ -42,17 +42,44 @@ func TestMaskSecrets_BearerPrefixKept(t *testing.T) {
 	}
 }
 
-// 短凭据也必须遮蔽：值已知就不该按长度猜「像不像凭据」（`abc1234` 这类短密钥原样漏出去过）。
-func TestMaskSecrets_ShortValuesMasked(t *testing.T) {
-	body := "auth=abc1234 and again abc1234 for k-7"
-	got := MaskSecrets(body, "abc1234", "k-7")
-	if strings.Contains(got, "abc1234") || strings.Contains(got, "k-7") {
-		t.Fatalf("短凭据必须被遮蔽: %q", got)
+// 遮蔽门槛（MinSecretLen = 4）的双向约束：
+//   - 达到门槛的凭据必须全遮（含 `abc1234` 这类短密钥、含 32 字节真实 sk- 密钥）；
+//   - 低于门槛的值不参与替换——否则 1~3 字符的凭据会把原文打成筛子
+//     （凭据 `abc` + 原文 `invalid value for temperature abc in model abc-turbo`
+//     → `temperature *** in model ***-turbo`，运营再也读不出上游说了什么）。
+func TestMaskSecrets_LengthThreshold(t *testing.T) {
+	// ① 达到门槛：短密钥也必须遮。
+	body := "auth=abc1234 and again abc1234 for k-7x"
+	got := MaskSecrets(body, "abc1234", "k-7x")
+	if strings.Contains(got, "abc1234") || strings.Contains(got, "k-7x") {
+		t.Fatalf("达到门槛的凭据必须被遮蔽: %q", got)
 	}
 	if want := "auth=*** and again *** for ***"; got != want {
 		t.Fatalf("want %q, got %q", want, got)
 	}
-	// 空值/纯空白跳过：否则空串替换会把整段文本打空。
+
+	// ② 真实 32 字节 sk- 密钥：必须完整遮蔽（反向用例，防门槛把真凭据放过去）。
+	const realKey = "sk-live-0123456789abcdef01234567" // 32 字节
+	if len(realKey) != 32 {
+		t.Fatalf("样本密钥应为 32 字节, got %d", len(realKey))
+	}
+	text := `{"error":"Incorrect API key provided: ` + realKey + ` (…)"}`
+	masked := MaskSecrets(text, realKey)
+	if strings.Contains(masked, realKey) {
+		t.Fatalf("真实密钥必须被完整遮蔽: %q", masked)
+	}
+	if !strings.Contains(masked, "Incorrect API key provided: ***") {
+		t.Fatalf("遮蔽后其余原文必须保留: %q", masked)
+	}
+
+	// ③ 低于门槛（1~3 字符）：不替换，原文逐字节可读。
+	const tiny = "abc"
+	src := "invalid value for temperature abc in model abc-turbo"
+	if out := MaskSecrets(src, tiny); out != src {
+		t.Fatalf("低于门槛的值不得参与替换（否则原文被打成筛子）: %q", out)
+	}
+
+	// ④ 空值/纯空白永远跳过：否则空串替换会把整段文本打空。
 	if got := MaskSecrets(body, "", "   "); got != body {
 		t.Fatalf("空凭据不应参与替换: %q", got)
 	}

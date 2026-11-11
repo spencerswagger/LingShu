@@ -72,8 +72,9 @@ type CallLogView struct {
 	// 上游 URL/token_id 等；可能 null）。定位「这次到底发了什么参数」用，不含 messages（见 ReqMessages）。
 	ReqParams any    `json:"ReqParams"`
 	RespBody  string `json:"RespBody"`
-	// RespBodyTruncated 仅**列表**（会话调用记录）为 true：受响应体积预算限制，RespBody 只是预览，
-	// 完整原文走该账单的详情接口（那里不做预览截断）。
+	// RespBodyTruncated 仅**列表里的失败行**（resp_kind=error）可能为 true：受响应体积预算限制，
+	// 该行的 RespBody 只是预览，完整原文走该账单的详情接口（那里不做预览截断）。
+	// 成功行恒为 false：会话重放页直接用它的 RespBody 渲染回答正文，截了就是半截回答。
 	RespBodyTruncated bool `json:"RespBodyTruncated,omitempty"`
 	Decision          any  `json:"Decision"` // JSONB 原始 value（可能 null）
 	// UpstreamUsage 上游原始 usage（JSONB 反序列化结果：{"Protocol":...,"Usage":{...}}，可能 null）：
@@ -82,14 +83,23 @@ type CallLogView struct {
 	PricingMode   string `json:"PricingMode"`
 }
 
-// callListBodyPreviewBytes 会话调用**列表**里每行 resp_body 的预览上限。
-// 失败行的 resp_body 最长可达 32KB，一个会话上百次失败就是数 MB JSON；
+// callListBodyPreviewBytes 会话调用**列表**里**失败行** resp_body 的预览上限。
+// 失败行的 resp_body 是上游错误报文，最长可达 32KB，一个会话上百次失败就是数 MB JSON；
 // 列表只承载「这次为什么失败」的线索，要看完整原文去账单详情（详情接口不截断）。
 const callListBodyPreviewBytes = 4 << 10
 
-// previewCallLogBody 给列表里的 resp_body 做预览截断（同字段标注 + 指向详情接口）。
+// previewCallLogBody 只对**失败行**（resp_kind=error）的 resp_body 做预览截断。
+//
+// 为什么必须按行判：成功行的 resp_body 是真实的模型回答正文，前端会话重放页
+// （views/admin/SessionDetail.vue）**直接用它渲染** assistant 内容、不再另取详情，
+// 无差别截断会让超过 4KB 的回答在重放里显示成半截（实测 21,600 字节 → 4,094 字节）。
+// 成功行原样返回、RespBodyTruncated 恒为 false。
+//
 // 返回是否发生了截断，供视图层置 RespBodyTruncated。
-func previewCallLogBody(body string) (string, bool) {
+func previewCallLogBody(respKind, body string) (string, bool) {
+	if respKind != "error" {
+		return body, false
+	}
 	if len(body) <= callListBodyPreviewBytes {
 		return body, false
 	}

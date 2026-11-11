@@ -78,7 +78,8 @@ type DevCallLogView struct {
 	CallTime       string `json:"CallTime"`
 	ReqMessages    any    `json:"ReqMessages"`
 	RespBody       string `json:"RespBody"`
-	// RespBodyTruncated 仅**列表**为 true：RespBody 只是预览，完整原文走该账单详情接口。
+	// RespBodyTruncated 仅**列表里的失败行**可能为 true：RespBody 只是预览，完整原文走该账单详情接口；
+	// 成功行恒为 false（其 RespBody 是真实回答正文）。
 	RespBodyTruncated bool `json:"RespBodyTruncated,omitempty"`
 	// Decision / ReqParams 为**白名单过滤后**的副本（未白名单的键不会出现）。
 	Decision      any    `json:"Decision"`

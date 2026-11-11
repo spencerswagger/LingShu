@@ -635,33 +635,57 @@ func TestReadProbeErrBody_GBKStaysWithinLimit(t *testing.T) {
 	}
 }
 
-// TestProbeErrorBody_ShortCredentialMasked 短凭据（<8 字符）在探活链路同样必须遮蔽。
-func TestProbeErrorBody_ShortCredentialMasked(t *testing.T) {
-	const shortCred = "k-7"
-	body := `{"error":{"message":"bad key ` + shortCred + `"}}`
-	srv := newProbeBodyServer(t, http.StatusUnauthorized, body)
+// TestProbeErrorBody_ShortCredentialThreshold 探活链路同样遵守 errbody.MinSecretLen 门槛：
+//   - 达到门槛（≥4）的短凭据必须遮蔽（此前 8 字符门槛会让 `k-7x` 这类漏出去）；
+//   - 低于门槛（1~3）的值不参与替换，保证上游原文可读（否则 3 字符凭据会把整段报文打成筛子）。
+func TestProbeErrorBody_ShortCredentialThreshold(t *testing.T) {
+	cases := []struct {
+		name       string
+		cred       string
+		wantMasked bool
+	}{
+		{"4字符凭据-必须遮蔽", "k-7x", true},
+		{"3字符凭据-不参与替换", "k-7", false},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			body := `{"error":{"message":"bad key ` + tc.cred + `"}}`
+			srv := newProbeBodyServer(t, http.StatusUnauthorized, body)
 
-	mgr, mock := newKeyProbeTestManager(t, srv.URL, HealthProbeConfig{FailThreshold: 2, TimeoutMS: 2000},
-		[]ChannelModel{{ID: 21, InternalModelID: "m1", ExternalModelID: 1, State: StateNormal}})
-	addKeyRuntime(t, mgr, 11, shortCred, StateNormal)
-	expectModelTransition(mock, 1, "m1", StateNormal, StateDisabled, reasonAuthFailure)
-	var stored argString
-	mock.ExpectExec(regexp.QuoteMeta(insertProbeLogSQL)).
-		WithArgs(sqlmock.AnyArg(), int64(11), "m1", "model", srv.URL+"/chat/completions",
-			false, sqlmock.AnyArg(), http.StatusUnauthorized, &stored, 0, 0, 0, 0, sqlmock.AnyArg()).
-		WillReturnResult(sqlmock.NewResult(1, 1))
+			mgr, mock := newKeyProbeTestManager(t, srv.URL, HealthProbeConfig{FailThreshold: 2, TimeoutMS: 2000},
+				[]ChannelModel{{ID: 21, InternalModelID: "m1", ExternalModelID: 1, State: StateNormal}})
+			addKeyRuntime(t, mgr, 11, tc.cred, StateNormal)
+			expectModelTransition(mock, 1, "m1", StateNormal, StateDisabled, reasonAuthFailure)
+			var stored argString
+			mock.ExpectExec(regexp.QuoteMeta(insertProbeLogSQL)).
+				WithArgs(sqlmock.AnyArg(), int64(11), "m1", "model", srv.URL+"/chat/completions",
+					false, sqlmock.AnyArg(), http.StatusUnauthorized, &stored, 0, 0, 0, 0, sqlmock.AnyArg()).
+				WillReturnResult(sqlmock.NewResult(1, 1))
 
-	out, err := mgr.ProbeModelNow(1, 21)
-	if err != nil {
-		t.Fatalf("ProbeModelNow: %v", err)
-	}
-	if strings.Contains(out.ErrorBody, shortCred) {
-		t.Fatalf("探活返回泄漏短凭据: %q", out.ErrorBody)
-	}
-	if want := strings.ReplaceAll(body, shortCred, "***"); out.ErrorBody != want {
-		t.Fatalf("除短凭据外仍要逐字节保真\nwant=%q\ngot =%q", want, out.ErrorBody)
-	}
-	if stored.set && strings.Contains(stored.got, shortCred) {
-		t.Fatalf("probe_logs.error_body 泄漏短凭据: %q", headBytes(stored.got, 120))
+			out, err := mgr.ProbeModelNow(1, 21)
+			if err != nil {
+				t.Fatalf("ProbeModelNow: %v", err)
+			}
+			want := strings.ReplaceAll(body, tc.cred, "***")
+			if !tc.wantMasked {
+				want = body
+			}
+			if out.ErrorBody != want {
+				t.Fatalf("凭据 %q（wantMasked=%v）结果不符\nwant=%q\ngot =%q", tc.cred, tc.wantMasked, want, out.ErrorBody)
+			}
+			if tc.wantMasked && strings.Contains(out.ErrorBody, tc.cred) {
+				t.Fatalf("探活返回泄漏凭据: %q", out.ErrorBody)
+			}
+			if stored.set {
+				storedWant := strings.ReplaceAll(body, tc.cred, "***")
+				if !tc.wantMasked {
+					storedWant = body
+				}
+				if stored.got != storedWant {
+					t.Fatalf("probe_logs.error_body 不符\nwant=%q\ngot =%q", storedWant, headBytes(stored.got, 160))
+				}
+			}
+		})
 	}
 }

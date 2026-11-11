@@ -16,14 +16,26 @@ import (
 // MaskToken 是遮蔽后的占位符（与历史日志/落库口径一致，便于检索）。
 const MaskToken = "***"
 
+// MinSecretLen 参与遮蔽的凭据最短长度。
+//
+// 为什么要有下限（这是「原文可见」与「绝不落凭据」两条红线的交点）：
+//   - 门槛太高（历史值 8）会让 `abc1234`、`k-7x9` 这类真实短密钥原样漏进下游响应与账单 → 踩「绝不落凭据」；
+//   - 完全不设门槛（曾经的取值 0）会让 1~3 字符的凭据把**原文打成筛子**：
+//     凭据 `abc` + 上游原文 `invalid value for temperature abc in model abc-turbo`
+//     → `temperature *** in model ***-turbo`，运营再也读不出上游到底说了什么 → 踩「原文可见」。
+//
+// 取 4 的理由：1~3 字符的值在任何自然语言里都是高频子串（`abc`/`k-7`/`123`），
+// 遮蔽它们的代价是整段原文不可读；而任何厂商的真实密钥都远长于 4 字节，
+// 「≥4 才按精确值遮蔽」既保住原文可读性，也不会漏掉真实凭据（见 errbody 的单测双向用例）。
+const MinSecretLen = 4
+
 // MaskSecrets 把 s 里出现的**已知凭据原值**替换成 MaskToken。
 //
 // 规则（刻意做到最窄）：
-//   - 只按精确子串匹配 secrets 里给出的值，**没有最短长度门槛**——只要它是本次实际使用的凭据，
-//     一个字符也要挡住（历史实现设了 8 字符门槛，`abc1234` 这类短密钥会原样漏到下游与账单里；
-//     既然值已知，就不该再按长度猜「像不像凭据」）；
+//   - 只按精确子串匹配 secrets 里给出的值（长度 ≥ MinSecretLen，见该常量的取舍说明），
+//     不去猜「长得像凭据」的串：没有前缀规则、没有高熵兜底、没有字段白名单；
 //   - 去空白后为空的值跳过（空串替换会毁掉整段文本）；
-//   - 不去猜「长得像凭据」的串：没有前缀规则、没有高熵兜底、没有字段白名单；
+//   - 去空白后短于 MinSecretLen 的值也跳过（否则会把原文里同形的普通词一起打码）；
 //   - "Bearer <cred>" 里的 <cred> 会被替换，前缀 Bearer 原样保留（读起来仍是「用了什么鉴权方式」）。
 //
 // 因此除凭据本身外，上游原文（含 <>&、中文、随机 request-id、模型名、URL query）逐字节不变。
@@ -35,7 +47,7 @@ func MaskSecrets(s string, secrets ...string) string {
 	ordered := make([]string, 0, len(secrets))
 	for _, sec := range secrets {
 		sec = strings.TrimSpace(sec)
-		if sec != "" {
+		if len(sec) >= MinSecretLen {
 			ordered = append(ordered, sec)
 		}
 	}

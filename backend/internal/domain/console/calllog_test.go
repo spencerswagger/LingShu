@@ -272,9 +272,9 @@ ON CONFLICT (billing_id) DO NOTHING`)).
 
 func ptr64(v int64) *int64 { return &v }
 
-// TestAdminHandleListSessionCalls_PreviewBody 会话调用**列表**按预算返回 resp_body 预览：
+// TestAdminHandleListSessionCalls_PreviewBody 会话调用**列表**只对失败行按预算返回 resp_body 预览：
 // 失败行原文最长 32KB，一个会话上百次失败就是数 MB JSON；列表只给 4KB 预览 + 同字段标注 +
-// RespBodyTruncated，完整原文仍可从该账单的详情接口拿到。
+// RespBodyTruncated，完整原文仍可从该账单的详情接口拿到。成功行不截断（见下面的长成功行断言）。
 func TestAdminHandleListSessionCalls_PreviewBody(t *testing.T) {
 	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
 	bigBody := "upstream said: " + randbody.Text(rnd, 30000, 32000)
@@ -287,9 +287,12 @@ func TestAdminHandleListSessionCalls_PreviewBody(t *testing.T) {
 	defer db.Close()
 
 	admin := NewAdmin(db, billing.NewSqlStore(db), nil, nil)
+	// 长成功行：会话重放页直接用它渲染 assistant 回答（不另取详情），必须逐字节原样返回。
+	longAnswer := "assistant answer: " + randbody.Text(rnd, 21400, 21600)
 	admin.SetCallLogStore(&fakeCallLogStore{bySession: []gateway.CallLog{
 		{BillingID: "bill-big", SessionID: "sess-1", Status: "failed", RespKind: "error", RespBody: bigBody},
 		{BillingID: "bill-small", SessionID: "sess-1", Status: "completed", RespKind: "non_stream", RespBody: smallBody},
+		{BillingID: "bill-long", SessionID: "sess-1", Status: "completed", RespKind: "non_stream", RespBody: longAnswer},
 	}})
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/sessions/sess-1/calls", nil)
@@ -299,8 +302,11 @@ func TestAdminHandleListSessionCalls_PreviewBody(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
 	}
-	if len(rec.Body.Bytes()) > 32<<10 {
-		t.Fatalf("列表响应必须被收口（got %d 字节）", len(rec.Body.Bytes()))
+	// 收口口径：只有失败行被压到 4KB 预览；成功行是真实回答正文、按原样计入响应体。
+	// 所以没有「整包 ≤32KB」这种绝对上限，预算 = 成功行原文 + 失败行预览 + JSON 开销。
+	budget := len(longAnswer) + callListBodyPreviewBytes + (8 << 10) // 余量 = JSON 转义 + 其它字段
+	if n := len(rec.Body.Bytes()); n > budget {
+		t.Fatalf("列表响应超出预算 %d 字节（got %d 字节）", budget, n)
 	}
 	var got struct {
 		Data struct {
@@ -311,10 +317,10 @@ func TestAdminHandleListSessionCalls_PreviewBody(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 		t.Fatalf("decode: %v (%s)", err, rec.Body.String())
 	}
-	if got.Data.Total != 2 || len(got.Data.List) != 2 {
-		t.Fatalf("want 2 条, got %d/%d", got.Data.Total, len(got.Data.List))
+	if got.Data.Total != 3 || len(got.Data.List) != 3 {
+		t.Fatalf("want 3 条, got %d/%d", got.Data.Total, len(got.Data.List))
 	}
-	big, small := got.Data.List[0], got.Data.List[1]
+	big, small, longRow := got.Data.List[0], got.Data.List[1], got.Data.List[2]
 	if len(big.RespBody) > 4<<10 {
 		t.Fatalf("预览必须 ≤4KB，got %d", len(big.RespBody))
 	}
@@ -329,5 +335,49 @@ func TestAdminHandleListSessionCalls_PreviewBody(t *testing.T) {
 	}
 	if small.RespBody != smallBody || small.RespBodyTruncated {
 		t.Fatalf("短原文不得改动: %q truncated=%v", small.RespBody, small.RespBodyTruncated)
+	}
+	// 关键回归：**成功行超过 4KB 也必须逐字节原样返回**（否则会话重放里回答变半截）。
+	if longRow.RespBody != longAnswer {
+		t.Fatalf("成功行必须逐字节原样返回（want %d 字节，got %d 字节）", len(longAnswer), len(longRow.RespBody))
+	}
+	if longRow.RespBodyTruncated {
+		t.Fatal("成功行 RespBodyTruncated 必须恒为 false")
+	}
+}
+
+// TestPreviewCallLogBody_OnlyFailedRows 预览只作用于失败行（resp_kind=error），其余一律原样。
+func TestPreviewCallLogBody_OnlyFailedRows(t *testing.T) {
+	long := strings.Repeat("x", 21600)
+	cases := []struct {
+		name     string
+		respKind string
+		wantSame bool // 期望原样返回
+	}{
+		{"失败行超长-截断", "error", false},
+		{"失败行短-原样", "error", true},
+		{"成功行超长-原样", "non_stream", true},
+		{"成功流式超长-原样", "stream", true},
+		{"resp_kind 为空-原样", "", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := long
+			if tc.wantSame && tc.respKind == "error" {
+				body = "short"
+			}
+			got, truncated := previewCallLogBody(tc.respKind, body)
+			if tc.wantSame {
+				if got != body || truncated {
+					t.Fatalf("应原样返回, got %d 字节 truncated=%v", len(got), truncated)
+				}
+				return
+			}
+			if !truncated || len(got) > callListBodyPreviewBytes {
+				t.Fatalf("失败行超长应截断到 ≤%d 字节, got %d truncated=%v", callListBodyPreviewBytes, len(got), truncated)
+			}
+			if !strings.Contains(got, "已截断") {
+				t.Fatalf("截断必须同字段标注: %q", got[len(got)-80:])
+			}
+		})
 	}
 }
