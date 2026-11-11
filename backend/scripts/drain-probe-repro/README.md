@@ -79,6 +79,11 @@ go test ./internal/domain/channel -tags drainrepro -run 'TestDrainProbeRepro$/A'
   配了 `probe_model` 时作用域外模型排空不参与调度（回 cron、不狂探）；
 - `TestKeyProbeLoop_ProbeModelTargetDrainRecovers` / `TestKeyProbeOnce_ProbeModelIsKeyLevel`：排空的正是
   探测目标时仍按排空间隔代探，且探测结果回喂该模型状态机（日志层级仍为 `level=key`）；
+- `TestNextKeyProbeWait_OnlyElectedKeyProbesModelDrain`：模型排空只借 1 个密钥代探，其余密钥保持 cron；
+- `TestPickKeyProbeTargets_DrainProbeRotationAndCap`：多个模型同时排空时每间隔只代探 1 个并轮转；
+- `TestKeyProbeLoop_OutOfScopeModelDrainRecovers`：`probe_model` 渠道里作用域外模型排空由动态代探恢复，
+  且密钥保持 NORMAL（代探不回喂密钥）；
+- `TestKeyProbeLoop_DrainProbeBackoffReturnsToCron`：同一模型连续失败 3 次后退避回 cron；
 - `TestWaitUntilNextKeyProbe_CronResetAfterManualRecover`：手动恢复 NORMAL 后旧的排空截止必须作废（不留残余探测）；
 - `TestKeyProbeLoop_WakesOnRealTrafficDrain`：真实调用把模型打到 DRAIN 时同样要唤醒探测循环。
 

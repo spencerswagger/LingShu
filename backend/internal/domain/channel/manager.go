@@ -139,6 +139,9 @@ type RuntimeChannel struct {
 	LastErr   string
 	lastProbe time.Time
 	Keys      []*KeyRuntime // 该渠道全部密钥运行时视图（同一指针，KeyRuntime 独有状态机/限流器）
+	// drainProbeSeq 模型排空代探的轮转游标（每渠道一个）：每个 drain 间隔最多代探 1 个模型，
+	// 多个模型同时排空时按候选列表轮转。
+	drainProbeSeq int
 	// Protocol 该渠道引用的渠道协议快照（nil=渠道内联配置，使用 Channel.Protocol/BaseURL）。
 	Protocol *channelprotocol.ChannelProtocol
 }
@@ -175,6 +178,9 @@ type ModelRuntime struct {
 	Limiter   *Limiter
 	LastErr   string
 	lastProbe time.Time
+	// drainProbeFails 「排空态代探」连续失败次数：达 drainProbeBackoffFails 后退出 15s 轮转，
+	// 退回 cron 覆盖；任意一次成功或退出排空即清零。
+	drainProbeFails int
 }
 
 // ChannelView 是 API 输出结构：附 LastErr/探测时间及有效配置（凭据已收敛到 channel_keys）。
@@ -1198,6 +1204,9 @@ func (m *Manager) feedModelAndTransit(channelID, modelRowID int64, fb Feedback) 
 		if cur := mr.Machine.State(); cur != prev {
 			mTr = &pendingTransition{from: prev, to: cur, reason: mr.Machine.LastReason()}
 		}
+		if mr.Machine.State() != StateDrain {
+			mr.drainProbeFails = 0 // 退出排空：代探退避计数归零
+		}
 	}
 	m.mu.Unlock()
 
@@ -1353,6 +1362,9 @@ func (m *Manager) ManualSetModelState(channelID, modelRowID int64, st State) err
 		return fmt.Errorf("invalid state %q", st)
 	}
 	cur := mr.Machine.State()
+	if cur != StateDrain {
+		mr.drainProbeFails = 0
+	}
 	m.mu.Unlock()
 
 	// 排空/恢复后必须重算探测等待：否则模型已排空而探测循环还在按 cron（默认每天 00:00）睡。

@@ -375,10 +375,10 @@ func TestNextKeyProbeWait_ProbeModelScope(t *testing.T) {
 			wantBranch: branchModelDrain, wantWait: 15 * time.Second,
 		},
 		{
-			name:       "配了 probe_model + 作用域外模型 DRAIN → 回 cron（不代探、不狂探）",
+			name:       "配了 probe_model + 作用域外模型 DRAIN → 动态代探（按排空间隔，不是 cron）",
 			probeModel: "m-probe",
 			keyState:   StateNormal, modelState: StateDrain,
-			wantBranch: branchCron, wantWait: cronWait,
+			wantBranch: branchModelDrain, wantWait: 15 * time.Second,
 		},
 		{
 			name:       "配了 probe_model + 排空的正是该模型 → 按模型排空间隔代探（探测会回喂它）",
@@ -416,41 +416,6 @@ func TestNextKeyProbeWait_ProbeModelScope(t *testing.T) {
 				t.Errorf("wait want %v, got %v", tc.wantWait, wait)
 			}
 		})
-	}
-}
-
-// TestKeyProbeLoop_ProbeModelScopeStaysCron 配了 probe_model 的渠道：排空「作用域外模型」后
-// 不得进入秒级探测（该模型不在探测作用域内，探它等于永远探不到、永远回不了 cron）。
-func TestKeyProbeLoop_ProbeModelScopeStaysCron(t *testing.T) {
-	c := &probeCounter{}
-	srv := httptest.NewServer(c.handler(true))
-	defer srv.Close()
-
-	frozen := time.Date(2026, 1, 2, 10, 30, 0, 0, time.UTC)
-	hp := HealthProbeConfig{
-		Interval: "0 0 * * * *", DrainIntervalSeconds: 1, TimeoutMS: 1000,
-		FailThreshold: 1, RecoveryThreshold: 1, ProbeModel: "m-probe",
-	}
-	mgr := newDrainScheduleTestManager(t, srv.URL, hp, func() time.Time { return frozen })
-
-	ctx, cancel := context.WithCancel(context.Background())
-	mgr.Start(ctx)
-	defer func() {
-		cancel()
-		mgr.Stop()
-	}()
-	time.Sleep(200 * time.Millisecond)
-
-	// 排空「作用域外模型」：过去会让该渠道所有密钥恒按秒级探测。
-	if err := mgr.ManualSetModelState(1, 21, StateDrain); err != nil {
-		t.Fatalf("manual model drain: %v", err)
-	}
-	time.Sleep(1500 * time.Millisecond)
-	if n := c.count(); n != 0 {
-		t.Fatalf("probe_model 作用域外的模型排空不应触发探测，got %d 次", n)
-	}
-	if _, branch, ok := mgr.nextKeyProbeWait(11); !ok || branch != branchCron {
-		t.Fatalf("配了 probe_model 且模型排空时分支应为 cron，got %q（ok=%v）", branch, ok)
 	}
 }
 
@@ -613,5 +578,189 @@ func TestKeyProbeLoop_WakesOnRealTrafficDrain(t *testing.T) {
 	}
 	if c.count() == 0 {
 		t.Fatalf("真实调用打到 DRAIN 后 3s 内应开始按排空间隔探测（真实流量唤醒缺失）")
+	}
+}
+
+// addModelRuntime 测试辅助：追加一个内部模型运行时（同渠道 1）。
+func addModelRuntime(t *testing.T, mgr *Manager, id int64, internal string, st State) {
+	t.Helper()
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	cm := ChannelModel{ID: id, ChannelID: 1, InternalModelID: internal, ExternalModelID: id, State: st}
+	if mgr.mrt[1] == nil {
+		mgr.mrt[1] = map[int64]*ModelRuntime{}
+	}
+	mgr.mrt[1][id] = mgr.buildModelRuntime(&cm, mgr.rt[1])
+}
+
+// TestNextKeyProbeWait_OnlyElectedKeyProbesModelDrain 模型排空只借 1 个密钥代探：
+// 被选中的密钥按排空间隔，其余密钥保持 cron（不得把整渠道拖进秒级）。
+func TestNextKeyProbeWait_OnlyElectedKeyProbesModelDrain(t *testing.T) {
+	now := time.Date(2026, 1, 2, 10, 30, 0, 0, time.UTC)
+	hp := HealthProbeConfig{Interval: "0 0 0 * * *", DrainIntervalSeconds: 15, TimeoutMS: 1000,
+		FailThreshold: 1, RecoveryThreshold: 1, ProbeModel: "probe-only"}
+	mgr := newDrainScheduleTestManager(t, "http://up.example.com", hp, func() time.Time { return now })
+	addKeyRuntime(t, mgr, 12, testKeyBCred, StateNormal)
+	if err := mgr.ManualSetModelState(1, 21, StateDrain); err != nil {
+		t.Fatalf("manual model drain: %v", err)
+	}
+
+	wait11, branch11, _ := mgr.nextKeyProbeWait(11) // 最小 keyID = 代探密钥
+	if branch11 != branchModelDrain || wait11 != 15*time.Second {
+		t.Fatalf("代探密钥应走模型排空档，got branch=%q wait=%v", branch11, wait11)
+	}
+	wait12, branch12, _ := mgr.nextKeyProbeWait(12)
+	if branch12 != branchCron || wait12 <= time.Hour {
+		t.Fatalf("非代探密钥应保持 cron，got branch=%q wait=%v", branch12, wait12)
+	}
+}
+
+// TestPickKeyProbeTargets_DrainProbeRotationAndCap 多个模型同时排空：每个间隔只代探 1 个模型并轮转，
+// 且只有代探密钥带这个额外目标（每渠道每间隔最多 1 次，成本有上限）。
+func TestPickKeyProbeTargets_DrainProbeRotationAndCap(t *testing.T) {
+	now := time.Date(2026, 1, 2, 10, 30, 0, 0, time.UTC)
+	hp := HealthProbeConfig{Interval: "0 0 0 * * *", DrainIntervalSeconds: 15, TimeoutMS: 1000,
+		FailThreshold: 1, RecoveryThreshold: 1, ProbeModel: "probe-only"}
+	mgr := newDrainScheduleTestManager(t, "http://up.example.com", hp, func() time.Time { return now })
+	addKeyRuntime(t, mgr, 12, testKeyBCred, StateNormal)
+	addModelRuntime(t, mgr, 22, "m2", StateNormal)
+	for _, id := range []int64{21, 22} {
+		if err := mgr.ManualSetModelState(1, id, StateDrain); err != nil {
+			t.Fatalf("manual model drain %d: %v", id, err)
+		}
+	}
+	kr11, _ := mgr.GetKeyRuntime(11)
+	kr12, _ := mgr.GetKeyRuntime(12)
+
+	drainTargets := func(targets []probeTarget) []probeTarget {
+		var out []probeTarget
+		for _, tg := range targets {
+			if tg.DrainOnly {
+				out = append(out, tg)
+			}
+		}
+		return out
+	}
+	first := drainTargets(mgr.pickKeyProbeTargets(kr11))
+	second := drainTargets(mgr.pickKeyProbeTargets(kr11))
+	if len(first) != 1 || len(second) != 1 {
+		t.Fatalf("每个间隔只能代探 1 个模型，got %d/%d", len(first), len(second))
+	}
+	if first[0].Model == second[0].Model {
+		t.Fatalf("两个模型同时排空应轮转，got 同一目标 %q", first[0].Model)
+	}
+	if first[0].Level != "model" || first[0].ModelRowID == 0 {
+		t.Fatalf("代探应是模型级并带行 ID，got %+v", first[0])
+	}
+	if extra := drainTargets(mgr.pickKeyProbeTargets(kr12)); len(extra) != 0 {
+		t.Fatalf("非代探密钥不应获得额外代探目标，got %+v", extra)
+	}
+}
+
+// TestKeyProbeLoop_OutOfScopeModelDrainRecovers probe_model 渠道里「非探测目标模型」排空后，
+// 必须由动态代探在排空间隔内探到它并恢复（probe_model 是偏好，不是白名单）。
+func TestKeyProbeLoop_OutOfScopeModelDrainRecovers(t *testing.T) {
+	c := &probeCounter{}
+	srv := httptest.NewServer(c.handler(true))
+	defer srv.Close()
+
+	frozen := time.Date(2026, 1, 2, 10, 30, 0, 0, time.UTC)
+	hp := HealthProbeConfig{Interval: "0 0 * * * *", DrainIntervalSeconds: 1, TimeoutMS: 1000,
+		FailThreshold: 1, RecoveryThreshold: 1, ProbeModel: "probe-only"}
+	mgr := newDrainScheduleTestManager(t, srv.URL, hp, func() time.Time { return frozen })
+	addKeyRuntime(t, mgr, 12, testKeyBCred, StateNormal)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	mgr.Start(ctx)
+	defer func() {
+		cancel()
+		mgr.Stop()
+	}()
+	time.Sleep(200 * time.Millisecond)
+
+	if err := mgr.ManualSetModelState(1, 21, StateDrain); err != nil {
+		t.Fatalf("manual model drain: %v", err)
+	}
+	mr := mgr.mrt[1][21]
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) && mr.Machine.State() != StateNormal {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if mr.Machine.State() != StateNormal {
+		t.Fatalf("作用域外模型排空后应由代探恢复，got %s", mr.Machine.State())
+	}
+	// 代探不把密钥拖进 DRAIN。
+	for _, id := range []int64{11, 12} {
+		if kr, ok := mgr.GetKeyRuntime(id); ok && kr.Machine.State() != StateNormal {
+			t.Fatalf("代探不应改变密钥 %d 状态，got %s", id, kr.Machine.State())
+		}
+	}
+}
+
+// TestKeyProbeLoop_DrainProbeBackoffReturnsToCron 同一模型连续代探失败 3 次后退避回 cron：
+// 不再每间隔打它，密钥也保持 NORMAL（失败不牵连密钥）。
+func TestKeyProbeLoop_DrainProbeBackoffReturnsToCron(t *testing.T) {
+	var probes int32
+	// 只让「被排空的模型 m1」失败：静态 probe_model 探测成功 → 密钥保持 NORMAL，
+	// 这样退避后的调度分支才能干净地落回 cron（否则密钥自身排空会掩盖结论）。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&probes, 1)
+		var body struct {
+			Model string `json:"model"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body.Model == "m1" {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":{"message":"model broken"}}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"usage":{"total_tokens":1}}`))
+	}))
+	defer srv.Close()
+
+	frozen := time.Date(2026, 1, 2, 10, 30, 0, 0, time.UTC)
+	hp := HealthProbeConfig{Interval: "0 0 * * * *", DrainIntervalSeconds: 1, TimeoutMS: 1000,
+		FailThreshold: 1, RecoveryThreshold: 1, ProbeModel: "probe-only"}
+	mgr := newDrainScheduleTestManager(t, srv.URL, hp, func() time.Time { return frozen })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	mgr.Start(ctx)
+	defer func() {
+		cancel()
+		mgr.Stop()
+	}()
+	time.Sleep(200 * time.Millisecond)
+
+	if err := mgr.ManualSetModelState(1, 21, StateDrain); err != nil {
+		t.Fatalf("manual model drain: %v", err)
+	}
+	// 1s 排空间隔：等三次失败（退避阈值）落定。
+	deadline := time.Now().Add(6 * time.Second)
+	for time.Now().Before(deadline) {
+		mgr.mu.RLock()
+		fails := mgr.mrt[1][21].drainProbeFails
+		mgr.mu.RUnlock()
+		if fails >= drainProbeBackoffFails {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	mgr.mu.RLock()
+	fails := mgr.mrt[1][21].drainProbeFails
+	mgr.mu.RUnlock()
+	if fails < drainProbeBackoffFails {
+		t.Fatalf("连续失败应达退避阈值 %d，got %d", drainProbeBackoffFails, fails)
+	}
+	if _, branch, _ := mgr.nextKeyProbeWait(11); branch != branchCron {
+		t.Fatalf("退避后应回 cron，got %q", branch)
+	}
+	mark := int(atomic.LoadInt32(&probes))
+	time.Sleep(1500 * time.Millisecond)
+	if extra := int(atomic.LoadInt32(&probes)) - mark; extra != 0 {
+		t.Fatalf("退避后 1.5s 内不应再有探测，got %d 次", extra)
+	}
+	if kr, _ := mgr.GetKeyRuntime(11); kr.Machine.State() != StateNormal {
+		t.Fatalf("代探失败不应把密钥打成非 NORMAL，got %s", kr.Machine.State())
 	}
 }
