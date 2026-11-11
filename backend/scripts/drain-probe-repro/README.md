@@ -35,6 +35,8 @@ go test ./internal/domain/channel -tags drainrepro -run 'TestDrainProbeRepro$/A'
 | B | 内部模型（密钥保持 NORMAL） | 同上 |
 | C | 渠道：渠道下 2 个密钥同时排空 | 每个密钥各自满足：首次 ≤18s、间隔 ∈[12,18]、无 <10s、≥3 次、恢复 ≤18s |
 | 启动即排空 | 模型在 DB 里已是 DRAIN，进程刚起 | 首次探测 ≤18s |
+| E | `probe_model` 渠道 + 排空**作用域外**模型（2 个密钥） | 48s 内 0 次探测、分支=cron（不得放大成排空探测） |
+| F | `probe_model` 渠道 + 排空**探测目标**模型 | 首次 ≤18s、间隔 15±3、模型恢复 ≤18s（不能退化成永不探） |
 
 判定：任一不满足即 `t.Errorf/Fatalf`（报告里直接给出实测秒数）。
 

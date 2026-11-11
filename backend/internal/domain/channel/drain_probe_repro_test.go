@@ -128,6 +128,10 @@ type drainReproCase struct {
 	keys []int64
 	// enterDrain 让对应档位进入排空态。
 	enterDrain func(t *testing.T, mgr *Manager)
+	// probeModel 渠道 health_probe.probe_model（空=模型级全探）。
+	probeModel string
+	// wantQuiet 期望窗口内 0 次探测（作用域外模型排空：不放大成排空探测）。
+	wantQuiet bool
 	// states 打印三档当前状态。
 	states func(t *testing.T, mgr *Manager) string
 	// allRecovered 密钥与模型是否都已回 NORMAL（用于判定恢复成立）。
@@ -191,6 +195,31 @@ func TestDrainProbeRepro(t *testing.T) {
 			},
 			assertQuiet: true,
 		},
+		{
+			name:       "E-probe_model 渠道排空作用域外模型（不得放大成排空探测）",
+			keys:       []int64{11, 12},
+			probeModel: "probe-only", // 不在该渠道模型表里 → 选型只探它，模型 21 在作用域外
+			enterDrain: func(t *testing.T, mgr *Manager) {
+				if err := mgr.ManualSetModelState(1, 21, StateDrain); err != nil {
+					t.Fatalf("manual model drain: %v", err)
+				}
+			},
+			states:       keyStates,
+			allRecovered: func(mgr *Manager) bool { return true },
+			wantQuiet:    true,
+		},
+		{
+			name:       "F-probe_model 渠道排空探测目标模型（按排空间隔代探并恢复）",
+			keys:       []int64{11},
+			probeModel: "drain-m1", // = 模型 21 的内部模型 ID
+			enterDrain: func(t *testing.T, mgr *Manager) {
+				if err := mgr.ManualSetModelState(1, 21, StateDrain); err != nil {
+					t.Fatalf("manual model drain: %v", err)
+				}
+			},
+			states:       keyStates,
+			allRecovered: bothNormal,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -219,6 +248,7 @@ func runDrainReproCase(t *testing.T, tc drainReproCase) {
 		Reliability: ReliabilityConfig{WindowSeconds: 60, MinSamples: 10},
 		CreatedAt:   time.Now(), UpdatedAt: time.Now(),
 	}
+	ch.HealthProbe.ProbeModel = tc.probeModel
 	mgr.rt[1] = mgr.buildRuntime(ch)
 	mgr.mrt[1] = map[int64]*ModelRuntime{}
 	cm := ChannelModel{ID: 21, ChannelID: 1, InternalModelID: "drain-m1", ExternalModelID: 1, State: StateNormal}
@@ -258,6 +288,15 @@ func runDrainReproCase(t *testing.T, tc drainReproCase) {
 	}
 	perKey := rec.byAuth()
 	t.Logf("[%s] 观测 %v：探测 %d 次（%d 个密钥），末态 %s", tc.name, window, rec.total(), len(perKey), tc.states(t, mgr))
+	if tc.wantQuiet {
+		if rec.total() != 0 {
+			t.Errorf("[%s] 作用域外模型排空不应触发探测，实测 %d 次", tc.name, rec.total())
+		}
+		if _, branch, ok := mgr.nextKeyProbeWait(11); !ok || branch != branchCron {
+			t.Errorf("[%s] 分支应为 cron，got %q（ok=%v）", tc.name, branch, ok)
+		}
+		return
+	}
 	for auth, times := range perKey {
 		gs := gaps(times)
 		first := times[0].Sub(enterAt).Seconds()
