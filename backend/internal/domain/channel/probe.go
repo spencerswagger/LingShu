@@ -221,7 +221,7 @@ func (m *Manager) drainProbeKeyLocked(channelID int64) (int64, bool) {
 	}
 	slices.Sort(normal)
 	slices.Sort(drain)
-	// 轮换：同一轮只用 1 个密钥代探，每轮指针前移换一把（避免长期压在同一个密钥上）。
+	// 轮换：同一时刻只用 1 个密钥代探，但每次排空事件换一把（避免长期压在同一个密钥上）。
 	seq := 0
 	if rt := m.rt[channelID]; rt != nil {
 		seq = rt.drainProbeKeySeq
@@ -427,24 +427,12 @@ func (m *Manager) pickKeyProbeTargetsFor(kr *KeyRuntime, branch string) []probeT
 	if branch == branchModelDrain && hp.ProbeModel != "" {
 		if probeKey, ok := m.drainProbeKeyLocked(kr.Channel.ID); ok && probeKey == kr.Key.ID {
 			if cands := m.drainProbeCandidatesLocked(kr.Channel.ID); len(cands) > 0 {
-				idx, rotate := 0, false
+				idx := 0
 				if rt := m.rt[kr.Channel.ID]; rt != nil {
 					idx = rt.drainProbeSeq % len(cands)
 					rt.drainProbeSeq++
-					// 「一轮」= 把当前排空模型各探一遍。走完一整轮才前移代探密钥游标：
-					// 同一轮内只有 1 把密钥借用（其余密钥仍按自身 cron），轮次之间换一把
-					//（优先 NORMAL 且轮换，避免长期压在同一个密钥上）。
-					// 单模型排空时 len(cands)==1，等价于每轮轮换。
-					if idx+1 == len(cands) {
-						rt.drainProbeKeySeq++
-						rotate = true
-					}
 				}
 				if mr := m.mrt[kr.Channel.ID][cands[idx]]; mr != nil {
-					if rotate {
-						// 唤醒被新选中的密钥循环，让它立刻按排空间隔接棒（而不是睡到 cron 边界）。
-						defer m.wakeProbeScheduling()
-					}
 					return []probeTarget{{Model: mr.Model.InternalModelID, Level: "model",
 						ModelRowID: cands[idx], DrainOnly: true}}
 				}
@@ -545,15 +533,27 @@ func (m *Manager) probeOnce(ctx context.Context, keyID int64, probeModel, level 
 	}
 	if modelRowID > 0 {
 		m.feedModelAndTransit(kr.Key.ChannelID, modelRowID, ProbeFeedback(fb))
+		rotate := false
 		m.mu.Lock()
 		if mr := m.mrt[kr.Key.ChannelID][modelRowID]; mr != nil {
 			if fb.IsSuccess {
 				mr.drainProbeFails = 0
+				// 代探成功且渠道内已无排空模型 → 本次排空事件结束：代探密钥指针前移，
+				// 下一次排空换一把（同一事件内始终只有 1 个借用密钥）。
+				if drainOnly && len(m.drainedModelsLocked(kr.Key.ChannelID)) == 0 {
+					if rt := m.rt[kr.Key.ChannelID]; rt != nil {
+						rt.drainProbeKeySeq++
+						rotate = true
+					}
+				}
 			} else if drainOnly {
 				mr.drainProbeFails++
 			}
 		}
 		m.mu.Unlock()
+		if rotate {
+			m.wakeProbeScheduling()
+		}
 	}
 	m.recordProbe(ctx, keyID, probeModel, level, target, fb.IsSuccess, errMsg, usage, dur)
 }
