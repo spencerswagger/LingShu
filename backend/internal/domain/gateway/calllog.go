@@ -12,6 +12,7 @@ import (
 
 	"github.com/team/llmgateway/internal/domain/identity"
 	"github.com/team/llmgateway/internal/domain/router"
+	"github.com/team/llmgateway/internal/pkg/errbody"
 	"github.com/team/llmgateway/internal/pkg/idgen"
 	"github.com/team/llmgateway/internal/pkg/logger"
 )
@@ -97,10 +98,14 @@ func (s *SQLCallLogStore) Insert(ctx context.Context, c *CallLog) error {
 	if err != nil {
 		return err
 	}
+	// 上游报文是任意字节（GBK 错误页、0x00、截断的多字节字符），PG 的 text 列会直接拒绝整行 INSERT——
+	// 一次上游报错就把这次请求的账与日志一起丢掉，正是「查不到」的成因。落库前统一整理成合法 UTF-8。
+	respBody, _ := errbody.ToValidText(c.RespBody)
+	errMsg, _ := errbody.ToValidText(c.ErrorMessage)
 	_, err = s.db.ExecContext(ctx, insertCallLogSQL,
 		id, c.BillingID, c.RequestID, c.SessionID, nullableInt64(c.UserID), nullableInt64(c.ChannelID),
 		nullableInt64(c.ChannelKeyID), c.InternalModelID, nullableInt64(c.ExternalModelID), c.Model,
-		nullableString(c.AutoModelName), c.PricingMode, c.Status, reqRaw, c.RespBody, c.RespKind, decRaw, c.ErrorMessage,
+		nullableString(c.AutoModelName), c.PricingMode, c.Status, reqRaw, respBody, c.RespKind, decRaw, errMsg,
 		nullableInt64(c.DurationMs), nullableInt64(c.FirstTokenMs), created, nullableBytes(c.UpstreamUsage),
 		nullableBytes(c.ReqParams), nullableInt(c.UpstreamStatus))
 	return err
