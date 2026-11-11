@@ -139,6 +139,12 @@ type RuntimeChannel struct {
 	LastErr   string
 	lastProbe time.Time
 	Keys      []*KeyRuntime // 该渠道全部密钥运行时视图（同一指针，KeyRuntime 独有状态机/限流器）
+	// drainProbeSeq 模型排空代探的轮转游标（每渠道一个）：每个 drain 间隔最多代探 1 个模型，
+	// 多个模型同时排空时按候选列表轮转。
+	drainProbeSeq int
+	// drainProbeKeySeq 代探密钥的轮换游标：同一次排空事件内只借 1 个密钥（优先 NORMAL），
+	// 事件结束（渠道内已无排空模型）后指针前移，下一次排空换一把密钥，避免长期压在同一个密钥上。
+	drainProbeKeySeq int
 	// Protocol 该渠道引用的渠道协议快照（nil=渠道内联配置，使用 Channel.Protocol/BaseURL）。
 	Protocol *channelprotocol.ChannelProtocol
 }
@@ -175,6 +181,9 @@ type ModelRuntime struct {
 	Limiter   *Limiter
 	LastErr   string
 	lastProbe time.Time
+	// drainProbeFails 「排空态代探」连续失败次数：达 drainProbeBackoffFails 后退出 15s 轮转，
+	// 退回 cron 覆盖；任意一次成功或退出排空即清零。
+	drainProbeFails int
 }
 
 // ChannelView 是 API 输出结构：附 LastErr/探测时间及有效配置（凭据已收敛到 channel_keys）。
@@ -256,6 +265,9 @@ type Manager struct {
 
 	probeCtx     context.Context // Start 时保存的探测上下文；运行期新增密钥据此启动探测循环
 	probeRunning map[int64]bool  // 已启动探测循环的密钥 ID（避免重复 go）
+	// probeWake 探测调度唤醒广播：状态/配置变化时打断睡眠中的密钥探测循环，让它重算下一次等待。
+	// 没有它，`time.NewTimer(wait)` 是一次性的——排空发生在等待期间就漏探（默认 cron 为每天 00:00）。
+	probeWake *probeWaker
 }
 
 // NewManager 创建双运行时管理器。keyStore 为可选变参：不传（或 nil）表示密钥运行时未装配，
@@ -282,6 +294,7 @@ func NewManager(store *Store, cmStore *channelModelStore, sm4Key []byte, probeHT
 		keyOfCh:      make(map[int64]map[int64]bool),
 		boundTags:    make(map[int64][]TagRef),
 		probeRunning: make(map[int64]bool),
+		probeWake:    newProbeWaker(),
 		store:        store,
 		cmStore:      cmStore,
 		keyStore:     ks,
@@ -528,6 +541,8 @@ func (m *Manager) SyncFromDB(ctx context.Context) error {
 	}
 	count := len(m.rt)
 	m.mu.Unlock()
+	// 装载/热重载可能把渠道配置与排空态一起换掉：唤醒已存在的循环按新输入重算（启动即排空的实例据此入轨）。
+	m.wakeProbeScheduling()
 	m.logger.Info("synced channels from db", "count", count)
 	return nil
 }
@@ -672,6 +687,8 @@ func (m *Manager) Upsert(ch *Channel) {
 			m.rebuildChannelKeysLocked(ch.ID, keys)
 		}
 	}
+	// 渠道探测配置（interval / drain_interval_seconds）变化也要生效，不必等当前等待结束。
+	m.wakeProbeScheduling()
 }
 
 // UpsertKey 同步单个密钥到运行时（密钥 CRUD 后调用）：
@@ -699,6 +716,7 @@ func (m *Manager) UpsertKey(k ChannelKey) {
 	m.keyOfCh[k.ChannelID][k.ID] = true
 	m.syncChannelKeysViewLocked(k.ChannelID)
 	m.startKeyProbeIfNewLocked(k.ID)
+	m.wakeProbeScheduling()
 }
 
 // RemoveKey 摘除密钥运行时（密钥软删后调用）：删除 keys/search 索引与渠道视图引用。
@@ -716,6 +734,8 @@ func (m *Manager) RemoveKey(keyID int64) {
 	}
 	delete(m.probeRunning, keyID)
 	m.syncChannelKeysViewLocked(chID)
+	// 唤醒该密钥的探测循环，让它立刻复查运行时已消失并退出（否则要睡满当前等待才醒）。
+	m.wakeProbeScheduling()
 }
 
 // KeyOrderForRouting 返回该渠道未删密钥的 id 升序列表（只读、稳定、无副作用）。
@@ -765,6 +785,8 @@ func (m *Manager) UpsertModel(cm *ChannelModel) {
 		m.mrt[cm.ChannelID] = make(map[int64]*ModelRuntime)
 	}
 	m.mrt[cm.ChannelID][cm.ID] = mr
+	// 模型启用/排空/模型级排空间隔变化：让同渠道的密钥循环重算（模型由密钥循环代探）。
+	m.wakeProbeScheduling()
 }
 
 // DropModel 移除内部模型运行时（模型删除后调用）。
@@ -774,6 +796,8 @@ func (m *Manager) DropModel(channelID int64, modelRowID int64) {
 	if mm, ok := m.mrt[channelID]; ok {
 		delete(mm, modelRowID)
 	}
+	// 模型被删后同渠道的密钥循环要重算等待（它可能正是排空档的来源）。
+	m.wakeProbeScheduling()
 }
 
 // GetRuntime 返回渠道运行时；不存在返回 (nil, false)。
@@ -1053,6 +1077,8 @@ func (m *Manager) Drop(id int64) {
 		delete(m.probeRunning, keyID)
 	}
 	delete(m.keyOfCh, id)
+	// 渠道被删后其密钥循环必须尽快退出（同样靠唤醒，而不是睡满当前等待）。
+	m.wakeProbeScheduling()
 }
 
 // persistKeyTransition 锁外写库：更新 channel_keys.state（同步、权威）+ 记录密钥状态事件（可异步）。
@@ -1132,6 +1158,10 @@ func (m *Manager) feedAndTransit(keyID int64, modelRowID int64, fb Feedback) {
 	}
 	m.mu.Unlock()
 
+	if keyTr != nil || mTr != nil {
+		// 真实流量把密钥/模型打到 DRAIN（或探测恢复后回 NORMAL）也要重算探测等待。
+		m.wakeProbeScheduling()
+	}
 	if keyTr != nil {
 		m.persistKeyTransition(keyID, keyTr.from, keyTr.to, keyTr.reason)
 		m.logger.Info("channel key state transition", "key_id", keyID,
@@ -1177,10 +1207,14 @@ func (m *Manager) feedModelAndTransit(channelID, modelRowID int64, fb Feedback) 
 		if cur := mr.Machine.State(); cur != prev {
 			mTr = &pendingTransition{from: prev, to: cur, reason: mr.Machine.LastReason()}
 		}
+		if mr.Machine.State() != StateDrain {
+			mr.drainProbeFails = 0 // 退出排空：代探退避计数归零
+		}
 	}
 	m.mu.Unlock()
 
 	if mTr != nil {
+		m.wakeProbeScheduling()
 		if m.cmStore != nil {
 			m.persistModelTransition(channelID, modelID, mTr.from, mTr.to, mTr.reason)
 		}
@@ -1331,9 +1365,14 @@ func (m *Manager) ManualSetModelState(channelID, modelRowID int64, st State) err
 		return fmt.Errorf("invalid state %q", st)
 	}
 	cur := mr.Machine.State()
+	if cur != StateDrain {
+		mr.drainProbeFails = 0
+	}
 	m.mu.Unlock()
 
+	// 排空/恢复后必须重算探测等待：否则模型已排空而探测循环还在按 cron（默认每天 00:00）睡。
 	if prev != cur {
+		m.wakeProbeScheduling()
 		m.persistModelTransition(channelID, mr.Model.InternalModelID, prev, cur, mr.Machine.LastReason())
 	}
 	return nil
@@ -1349,11 +1388,12 @@ func (m *Manager) ManualSetKeyState(keyID int64, action string) error {
 		return fmt.Errorf("invalid action %q", action)
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	kr, ok := m.keys[keyID]
 	if !ok {
+		m.mu.Unlock()
 		return sql.ErrNoRows
 	}
+	prev := kr.Machine.State()
 	switch st {
 	case StateNormal:
 		kr.Machine.ForceNormal(m.now())
@@ -1361,6 +1401,12 @@ func (m *Manager) ManualSetKeyState(keyID int64, action string) error {
 		kr.Machine.ForceDrain(m.now())
 	case StateDisabled:
 		kr.Machine.ForceDisable(m.now())
+	}
+	changed := kr.Machine.State() != prev
+	m.mu.Unlock()
+	// 排空/恢复后重算探测等待：排空可能发生在循环按 cron 长睡期间（默认每天 00:00）。
+	if changed {
+		m.wakeProbeScheduling()
 	}
 	return nil
 }
@@ -1394,6 +1440,7 @@ func (m *Manager) ForceKeyState(_ context.Context, keyID int64, action string) e
 	cur := kr.Machine.State()
 	m.mu.Unlock()
 	if cur != prev {
+		m.wakeProbeScheduling()
 		tr = &pendingTransition{from: prev, to: cur, reason: keyActionReason[action]}
 		m.persistKeyTransition(keyID, tr.from, tr.to, tr.reason)
 	}
@@ -1414,6 +1461,7 @@ func (m *Manager) ForceKeyNormal(keyID int64) {
 	}
 	m.mu.Unlock()
 	if tr != nil {
+		m.wakeProbeScheduling()
 		m.persistKeyTransition(keyID, tr.from, tr.to, tr.reason)
 	}
 }
@@ -1434,11 +1482,53 @@ func (m *Manager) ForceModelNormal(channelID, modelRowID int64) {
 	}
 	m.mu.Unlock()
 	if tr != nil {
+		m.wakeProbeScheduling()
 		if m.cmStore != nil {
 			m.persistModelTransition(channelID, modelID, tr.from, tr.to, tr.reason)
 		}
 		m.logger.Info("model state transition", "channel_id", channelID,
 			"model", modelID, "from", tr.from, "to", tr.to, "reason", tr.reason)
+	}
+}
+
+// probeWaker 探测调度唤醒广播器：notify 关闭当前通道并换新通道，全部订阅者（每个密钥一个
+// 探测循环）立刻从 select 醒来重算等待。用「关闭并替换」而不是带缓冲 channel：一次变化要唤醒
+// 全部循环，且不能丢唤醒（buffered=1 只能唤醒一个订阅者）。
+type probeWaker struct {
+	mu sync.Mutex
+	ch chan struct{}
+}
+
+func newProbeWaker() *probeWaker { return &probeWaker{ch: make(chan struct{})} }
+
+// subscribe 取当前唤醒通道；必须在计算 wait 之前订阅，否则「算完 wait 再订阅」的窗口内发生的
+// 状态变化会被漏掉。
+func (w *probeWaker) subscribe() <-chan struct{} {
+	if w == nil {
+		return nil // nil 通道：select 永不就绪（等价「没有唤醒源」），由定时器与 ctx 决定结束
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.ch
+}
+
+// notify 广播一次「调度输入已变」。
+func (w *probeWaker) notify() {
+	if w == nil {
+		return
+	}
+	w.mu.Lock()
+	close(w.ch)
+	w.ch = make(chan struct{})
+	w.mu.Unlock()
+}
+
+// wakeProbeScheduling 状态/配置变化的统一出口：通知全部探测循环重算下一次等待。
+// 非阻塞：只关闭/替换唤醒通道，不等待任何循环；持 m.mu 时调用是安全的（被唤醒者只会排队等锁，
+// 不会回调 Manager），但本函数自身不得在持有 probeWaker.mu 时调用。
+func (m *Manager) wakeProbeScheduling() {
+	if m.probeWake != nil {
+		m.probeWake.notify()
 	}
 }
 
