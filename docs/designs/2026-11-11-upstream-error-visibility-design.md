@@ -75,14 +75,24 @@
 | --- | --- | --- |
 | `request_id` | `call_logs.request_id` | 与响应体 `request_id` 同源 |
 | 上游状态码 | `call_logs.upstream_status`（迁移 0019） | 结构化小整型；`NULL` = 无上游状态码（连接失败/超时/网关拒绝） |
-| 上游错误体 | `call_logs.resp_body` + `error_message` | 上游响应体（读取上限 64KB，落库前做凭据样式清洗）记录在 `resp_body`；`error_message` 形如「上游返回 400: {上游报文}」 |
+| 上游错误体 | `call_logs.resp_body` + `error_message` | `resp_body` = **上游原文逐字节**（上限 32KB，超限同字段标注）；`error_message` 形如「上游返回 400: {上游报文}」（摘要上限 4KB，超限标注指向 `resp_body`） |
 | 渠道/密钥/模型 | `call_logs.channel_id / channel_key_id / internal_model_id / model` | 定位是哪条渠道哪次尝试 |
 | 时间 | `call_logs.created_at` | 落库时间 |
 | 耗时 | `call_logs.duration_ms` | 本次请求耗时 |
 | 金额 | `billing_records`（`status='failed'`、`credits_consumed=0`） | 失败不扣费，但必须有账 |
 
-> 落库/日志用 `upstreamErrBody.Clean`（凭据样式清洗后），对外透传用 `upstreamErrBody.Raw`（原文）。
-> 两个视图分开是刻意的：「对外原文原样」与「存储不落明文凭据」要求相反，混用任何一个都会踩另一条红线。
+> **三个视图**（`upstreamErrBody`，混用任何一个都会踩另一条红线）：
+>
+> | 视图 | 用途 | 口径 |
+> | --- | --- | --- |
+> | `Raw` | 对外透传 | 原文原样（含首尾空白），不遮蔽 |
+> | `Clean` | 日志短字段 / 错误分类 | 按**样式**清洗（`sk-*`/Bearer/KV/高熵长串 → `***`）+ 512B 截断 |
+> | `operatorView` | **运营落库**（`call_logs.resp_body`、`error_message`） | 原文逐字节，**只**把本次实际使用的凭据原值换成 `***`；超 32KB 同字段标注 |
+>
+> 这里刻意推翻了早期「落库走 Clean」的口径：按样式清洗会把上游报文里的 request-id、
+> 随机串、模型名一并抹成 `***`，运营读到的根本不是原文（实测一段报文从第 45 字节起整段消失）。
+> 精确遮蔽（只知道我们发出去的那把 key）既能保证「存储不落明文凭据」，
+> 又能让除凭据外的每个字节保真——它比样式清洗更窄，也更准。
 
 ### 本次一并补齐的留痕缺口
 
@@ -99,13 +109,61 @@
 未纳入：**鉴权失败（401，网关自身）**——此时没有可信的用户身份，且该分支是外部可打的公开面，
 逐条落库会变成可被利用的写放大面；这类请求仍只有结构化异常日志。
 
-## 3. 验证
+## 3. 运营侧可见性（三个落点，缺一不可）
+
+本节的读者是**运营**，不是下游调用方：判断标准只有一条——后台能看到上游返回的原始错误体。
+
+### 3.1 调用日志 / 账单
+
+失败请求落 `call_logs`（+ 成对 `billing_records`），单条含 `request_id`、`upstream_status`、
+`resp_body`（上游原文）、`channel_id / channel_key_id / internal_model_id / model`、`created_at`、`duration_ms`；
+运营按 `request_id` 在账单详情查回（`console` 投影直接返回 `RespBody`/`UpstreamStatus`）。
+
+### 3.2 探活单次结果
+
+`POST /api/v1/admin/channels/{id}/keys/{kid}/probe` 与 `.../models/{mid}/probe` 的 `ProbeOutcome` 新增：
+
+```json
+{"OK": false, "Error": "probe http status: 400", "UpstreamStatus": 400,
+ "ErrorBody": "上游错误体原文（仅遮蔽本次凭据；>32KB 截断并同字段标注）", "State": "DRAIN"}
+```
+
+`Error` 仍是短文案（状态机 `LastErr` 也用它，不能塞 32KB）；原文在 `ErrorBody`。
+
+**根因修复**：`channel/probe.go` 的 `doProbeAuth` 历史上在非 2xx 三个分支（429 / 401-403 / 其它）
+只拼 `fmt.Sprintf("probe http status: %d", ...)`，**从不读 `resp.Body`**——上游报文被整段丢弃，
+运营新建密钥后点探活只能看到「失败」两个字。现在三个分支都读（上限 64KB），
+并带上游状态码，探活是运营建渠道后的第一个动作，必须自证。
+
+### 3.3 探活历史
+
+`GET /api/v1/admin/channels/{id}/probe-logs` 的每条 `ProbeLog` 新增 `ErrorBody` / `UpstreamStatus`，
+落库列见迁移 `0020_probe_logs_error_body.sql`（`error_body TEXT`、`upstream_status SMALLINT`，
+`NULL`=没打到上游）。事后翻历史仍能看到上游原文，而不是只有「probe http status: 400」。
+
+### 3.4 上限（三处一致）
+
+| 位置 | 读取上限 | 保存上限 | 超限行为 |
+| --- | --- | --- | --- |
+| 对外透传 `error.message` | 64KB | 8KB | 同字段追加「…（已截断：上游原文共 N 字节，超过 8192 字节对外上限）」 |
+| `call_logs.resp_body` | 64KB | 32KB | 同字段追加「…（已截断：上游原文共 N 字节，此处只保留前 32768 字节）」；读满 64KB 时如实写「超过读取上限 65536 字节」 |
+| `probe_logs.error_body` / `ProbeOutcome.ErrorBody` | 64KB | 32KB | 同上（同一套 `errbody.TruncateUTF8`） |
+
+读取上限必须**显著大于**保存上限：读取层静默截断会导致「既拿不到完整内容、也无法诚实标注」。
+
+## 5. 验证
 
 `backend/internal/domain/gateway/upstream_error_passthrough_test.go`：
 
 | 用例 | 覆盖 |
 | --- | --- |
-| `TestServeUpstreamError_ShapeTable` | **10 种形状 × 流式/非流式 20 条**：①OpenAI 标准 ②嵌套 details ③只有 message ④非 JSON 纯文本 ⑤HTML 错误页 ⑥空体 ⑦超长 12KB ⑧5xx ⑨401 鉴权错 ⑩顶层数组。每条断言「对外状态码 = 上游状态码」「形状对应判据下内容完整可见」「`request_id`/`upstream_status` 齐全」「账单 + 调用日志按 `request_id` 可查且带上游状态码/错误体/渠道/模型/耗时」 |
+| `TestServeUpstreamError_RandomShapes` | **随机驱动，不绑定任何固定样例文案**：≥10 组随机值 + 8 类形状（OpenAI 形状 / 深嵌套 JSON / 平铺 JSON / 顶层数组 / 纯文本 / HTML / 空体 / 超长）× 流式/非流式。每条断言「对外状态码 = 上游状态码」「形状对应判据下内容完整可见」「`request_id`/`upstream_status` 齐全」「**`resp_body` 与上游原文逐字节一致**（超长则前缀逐字节 + 同字段截断标注）」「`error_message` 原样保留原文」 |
+| `TestProbeModelNow_ExposesUpstreamRawBody` / `TestProbeKeyNow_ExposesUpstreamRawBody` | 同一套随机用例跑模型/密钥探测：`ProbeOutcome.ErrorBody` 逐字节等于上游原文，且与 `probe_logs.error_body` 一致 |
+| `TestHandleProbeEndpoints_ExposeUpstreamRawBody` | HTTP 级（走 `HandleProbeModel`/`HandleProbeKey` + `resp.Write` 序列化）：响应 `Data.ErrorBody` 逐字节等于上游原文 |
+| `TestHandleListProbeLogs_ReturnsStoredRawBody` | HTTP 级：探活历史返回 `probe_logs.error_body` 原文 + 上游状态码 |
+| `TestProbeErrorBody_MasksOnlyExactCredential` | 只遮蔽本次凭据：报文里的 request-id / 模型名 / URL query / `<>&` 一律保留 |
+| `TestReadUpstreamErrBodyViews` | 三视图口径：Clean 清洗、operatorView 仅遮蔽已知凭据 |
+| `TestProbeLog_PgRoundTrip` / `TestCallLog_PgRoundTrip` | 真库读写：上游原文（含中文/HTML/换行）逐字节存得进、读得出（无 DSN 跳过） |
 | `TestServeUpstreamError_TerminalKeepsLastUpstream` | 可转移状态在上游只有单候选时走到「全候选失败」终结分支：对外仍是上游 500 + 上游报文，不退化成 503 聚合文案 |
 | `TestServeUpstreamError_429TerminalKeepsUpstreamBody` | 上游 429 全候选限流：对外 429 + 上游报文 |
 | `TestServeUpstreamError_ConnectionFailure` | 断网：502 + 点名「连接失败」原因，不编造上游状态码，账单 + 调用日志留痕 |
