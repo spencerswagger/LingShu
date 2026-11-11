@@ -44,12 +44,21 @@ HTTP 状态码语义**不变**：上游 4xx/5xx 在未命中协议级错误策�
 
 **流内 `error` 帧的留痕口径**（响应已 200 下发，无法再改状态码，只能保证记录与原因准确）：
 
-| 情形 | 错误类型 | 计费 | 调用日志 | 渠道健康 |
-| --- | --- | --- | --- | --- |
-| error 帧 + **无** usage | `UsageMissingError{Reason: error_frame}` | 按可见内容估算（既有口径） | `failed`，`error_message` = 「上游流式响应中断（流内 error 帧，按估算计费）：<上游 error 帧摘要>」 | 计入失败（既有口径） |
-| error 帧 + **有** usage | `UpstreamErrorFrameError`（新增，**不**属于 usage 缺失） | 按上游**实际** usage 结算（不估算、不落额外 failed 账单） | `failed`，`error_message` = 「上游流式响应中断（流内 error 帧，按上游 usage 计费）：<上游 error 帧摘要>」 | 保持既有成功回喂（本单不改健康/选路口径） |
+| 情形 | 错误类型 | 计费 | 调用日志 | `upstream_status` | 渠道健康 |
+| --- | --- | --- | --- | --- | --- |
+| error 帧 + **无** usage | `UsageMissingError{Reason: error_frame}` | 按可见内容估算（既有口径） | `failed`，`error_message` = 「上游流式响应中断（流内 error 帧，按估算计费）：<上游 error 帧摘要>」 | 上游真实码（此路 200） | 计入失败（既有口径） |
+| error 帧 + **有** usage | `UpstreamErrorFrameError`（新增，**不**属于 usage 缺失） | 按上游**实际** usage 结算（不估算、不落额外 failed 账单） | `failed`，`error_message` = 「上游流式响应中断（流内 error 帧，按上游 usage 计费）：<上游 error 帧摘要>」 | 上游真实码（此路 200） | 保持既有成功回喂（本单不改健康/选路口径） |
 
-两种情形都落结构化标记：`decision.usage_reason=error_frame` / `decision.upstream_error_frame=true`。
+两种情形都落结构化标记：`decision.usage_reason=error_frame` / `decision.upstream_error_frame=true`；
+error 帧摘要落 `error_message` 前统一过 `errbody.MaskSecrets(…, ureq.Cred)`（上游可能在报文里回显它收到的凭据）。
+`upstream_status` 写上游真实 HTTP 码（流式已 200 → 写 200），使「上游 HTTP 200 但流内报错」与
+「上游 4xx/5xx」「网关拒绝」三者可区分。
+
+**账单行不变**（刻意的）：这类请求上游确实产出了内容并给了 usage，`billing_records` 仍是一条按实际
+usage 结算的 `completed` 记录，金额与既有口径一致；失败结论落在 `call_logs.status=failed`
+（账单详情页直接展示关联的调用日志）。若要求账单行也标 `failed`，等于改 `status` 枚举语义与
+汇总口径（影响：账单页成功/失败计数、失败率、对账口径、`credits_consumed` 的「有扣费却记失败」），
+需产品确认后再动，本单不做。
 
 > 「error 帧 + 有 usage」此前整条记 `completed`：上游明明用 error 帧宣告失败，
 > 却因为顺手给了 usage 而在调用日志/账单上完全消失（main 上既有缺陷，Gate 独立验收复现）。
@@ -114,7 +123,7 @@ HTTP 状态码语义**不变**：上游 4xx/5xx 在未命中协议级错误策�
 `backend/internal/domain/gateway/stream_error_frame_test.go`（流内 `error` 帧的留痕口径）：
 | 用例 | 覆盖 |
 | --- | --- |
-| `TestServeStream_ErrorFrameWithUsageRecordedFailed` | error 帧 + usage：调用日志记 `failed`（此前误记 `completed`）且 `error_message` 带上游原文；计费仍按上游实际 usage（10/5，不估算、不额外落 failed 账单）；请求级结论计为失败 |
-| `TestServeStream_ErrorFrameWithoutUsageKeepsUpstreamDetail` | error 帧 + 无 usage：记 `failed` 且 `error_message` 带出上游 error 帧原文（此前只有归因、没有原因） |
+| `TestServeStream_ErrorFrameWithUsageRecordedFailed` | error 帧 + usage（表驱动三种顺序：usage 在 error 帧前/后、无 `[DONE]`）：调用日志记 `failed`（此前误记 `completed`）、`error_message` 带上游原文、`upstream_status=200`；计费仍按上游实际 usage（10/5，不估算、不额外落 failed 账单）；下游 SSE 仍是上游 error 帧原文；请求级结论计为失败 |
+| `TestServeStream_ErrorFrameWithoutUsageKeepsUpstreamDetail` | error 帧 + 无 usage：记 `failed`、`error_message` 带出上游 error 帧原文（此前只有归因、没有原因）、`upstream_status=200`、下游仍是原文 |
 | `TestStreamConversionErrorFrameWithUsageRecordedFailed` | 转换泵（anthropic 入站 → openai-chat 上游）同一口径 |
 | `TestUpstreamErrorFrameError_Semantics` | 新错误类型可 `errors.As` 识别，且**不**被当成 usage 缺失（否则计费会从实际 usage 退化成估算） |

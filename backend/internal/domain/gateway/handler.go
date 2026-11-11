@@ -1860,8 +1860,11 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 			}
 			decision := dec("上游流内返回 error 帧")
 			decision["upstream_error_frame"] = true
+			// upstream_status 写上游真实码（此路恒为 200）：与「网关 502」「上游 4xx/5xx」可区分，
+			// 运营一眼能看出「上游 HTTP 200，但流内报错」。
 			g.writeCallLogUsage(billCtx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-				"stream", string(assistantMsg), "failed", reasonText, upstreamUsage, dur, ft.firstTokenMs(start), decision)
+				"stream", string(assistantMsg), "failed", reasonText, upstreamUsage, dur, ft.firstTokenMs(start),
+				decision, withUpstreamStatus(up.StatusCode))
 		case usageAnomaly:
 			// 上游流中断但内容已部分下发：估算计费已在上面完成，调用日志如实记失败。
 			// 文案按缺失原因区分，避免「补发标记掩盖截断」与「干脆没有结束标记」在日志上混为一谈；
@@ -1880,8 +1883,10 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 			}
 			decision := dec(decReason)
 			decision["usage_reason"] = missingReason
+			// 上游真实码照实落库（流式已 200 的场景写 200；无上游响应时为空）。
 			g.writeCallLogUsage(billCtx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-				"stream", string(assistantMsg), "failed", reasonText, upstreamUsage, dur, ft.firstTokenMs(start), decision)
+				"stream", string(assistantMsg), "failed", reasonText, upstreamUsage, dur, ft.firstTokenMs(start),
+				decision, withUpstreamStatus(up.StatusCode))
 		default:
 			reason := "success"
 			if usageMissing {

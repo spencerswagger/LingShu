@@ -39,8 +39,9 @@ type CallLog struct {
 	Decision        any    // 决策轨迹 JSONB 原始值（候选渠道与原因、系数、预扣与结果）
 	UpstreamUsage   []byte // 上游原始 usage（JSONB 值：{"Protocol":...,"Usage":{...}}，见 rawusage.go；nil=无）
 	ErrorMessage    string
-	// UpstreamStatus 上游真实 HTTP 状态码（仅「上游返回非 2xx」的失败路径写入；网关自身拒绝为空）：
-	// 运营按 request_id 找到这次失败后，要能直接看到「上游 400 还是网关 502」，
+	// UpstreamStatus 上游真实 HTTP 状态码（上游非 2xx 的失败路径写真实码；
+	// 流式已回 200 后流内报错也写 200；网关自身拒绝/连接失败/超时为空）：
+	// 运营按 request_id 找到这次失败后，要能直接看到「上游 400、上游 200 但流内报错、还是网关 502」，
 	// 而不是从 error_message 的中文里猜。空值表示无上游状态码（连接失败/超时/网关拒绝）。
 	UpstreamStatus *int
 	DurationMs     *int64
@@ -557,7 +558,8 @@ func (g *Gateway) writeCallLog(ctx context.Context, billingID, requestID string,
 // 且极易在某个分支漏传（漏传即静默丢字段）。
 type callLogOpt func(*CallLog)
 
-// withUpstreamStatus 记录上游真实 HTTP 状态码（仅「上游返回非 2xx」的失败分支传）。
+// withUpstreamStatus 记录上游真实 HTTP 状态码：上游返回非 2xx 的失败分支传真实码，
+// 流式「已回 200 后流内报错」的失败分支同样传 200（让「上游 HTTP 200 但内容层失败」可被区分）。
 func withUpstreamStatus(status int) callLogOpt {
 	return func(c *CallLog) {
 		v := status
