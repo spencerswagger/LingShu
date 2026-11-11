@@ -155,7 +155,7 @@ func readProbeErrBody(resp *http.Response, cred string) string {
 		return ""
 	}
 	if len(s) <= probeErrBodyMaxBytes && !readTruncated {
-		return s
+		return probeStorable(s, readTruncated)
 	}
 	note := fmt.Sprintf("\n…（已截断：上游原文共 %d 字节，此处只保留前 %d 字节）", len(s), probeErrBodyMaxBytes)
 	if readTruncated {
@@ -163,7 +163,18 @@ func readProbeErrBody(resp *http.Response, cred string) string {
 			probeErrReadBytes, probeErrBodyMaxBytes)
 	}
 	out, _ := errbody.TruncateUTF8(s, probeErrBodyMaxBytes, note)
-	return out
+	return probeStorable(out, readTruncated)
+}
+
+// probeStorable 把待落库的原文整理成 PG text 能接受的合法 UTF-8（非法字节 → U+FFFD、NUL → <0x00>）。
+// 上游错误页可能是任意字节（GBK/截断的多字节/0x00），原样写库会让这一行 probe_logs 直接 INSERT 失败，
+// 于是「探活失败的原因」彻底不可见——正是本任务要消灭的盲区。
+func probeStorable(s string, readTruncated bool) string {
+	out, changed := errbody.ToValidText(s)
+	if !changed || readTruncated {
+		return out
+	}
+	return out + "\n…（原文含非法 UTF-8 字节或 0x00，已替换为 �/<0x00> 以便落库）"
 }
 
 // nilOr 返回空串兜底。

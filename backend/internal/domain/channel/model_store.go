@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/team/llmgateway/internal/domain/billing"
 	"github.com/team/llmgateway/internal/domain/channelprotocol"
+	"github.com/team/llmgateway/internal/pkg/errbody"
 	"github.com/team/llmgateway/internal/pkg/idgen"
 )
 
@@ -447,11 +448,15 @@ func (s *channelModelStore) InsertProbeLog(ctx context.Context, p *ProbeLog) err
 	if p.ID == 0 {
 		p.ID = idgen.New()
 	}
+	// 上游错误体是任意字节（GBK 错误页 / 0x00 / 截断的多字节字符）：原样写 PG text 列会整行 INSERT 失败，
+	// 于是「这次探活为什么失败」彻底不可见。落库前统一整理成合法 UTF-8（不可打印字节替换成可见占位符）。
+	errBody, _ := errbody.ToValidText(p.ErrorBody)
+	errText, _ := errbody.ToValidText(p.Error)
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO probe_logs(id, channel_key_id, model_id, level, target, ok, error, upstream_status, error_body, input_tokens, output_tokens, cached_tokens, total_tokens, duration_ms)
 		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
-		p.ID, p.ChannelKeyID, p.ModelID, p.Level, p.Target, p.OK, p.Error,
-		nullableInt(p.UpstreamStatus), p.ErrorBody,
+		p.ID, p.ChannelKeyID, p.ModelID, p.Level, p.Target, p.OK, errText,
+		nullableInt(p.UpstreamStatus), errBody,
 		p.InputTokens, p.OutputTokens, p.CachedTokens, p.TotalTokens, p.DurationMS)
 	return err
 }
@@ -465,9 +470,18 @@ func nullableInt(v int) any {
 	return v
 }
 
+// probeListMaxRows 探活列表单次返回的最大行数（默认 100）。
+// 历史值 500 行 × 每行 error_body 上限 32KB ≈ 16MB，一个面板请求就能打出十几兆 JSON；
+// 列表是「最近若干次」的场景，100 行足够，配合下面每行原文的预览上限把响应压到百 KB 量级。
+const probeListMaxRows = 100
+
+// probeListBodyMaxBytes 探活**列表**里每行 error_body 的预览上限（完整原文仍在 probe_logs.error_body）。
+// 列表接口只承载「这次探活为什么失败」的线索，长报文（HTML 错误页/堆栈）按 4KB 预览 + 同字段标注。
+const probeListBodyMaxBytes = 4 << 10
+
 // ListProbeLogs 查询某密钥的探测历史（倒序）。keyID 对应 probe_logs.channel_key_id。
 func (s *channelModelStore) ListProbeLogs(ctx context.Context, keyID int64, limit int) ([]ProbeLog, error) {
-	if limit <= 0 || limit > 500 {
+	if limit <= 0 || limit > probeListMaxRows {
 		limit = 100
 	}
 	rows, err := s.db.QueryContext(ctx,
@@ -483,7 +497,7 @@ func (s *channelModelStore) ListProbeLogs(ctx context.Context, keyID int64, limi
 // ListProbeLogsByKeys 查询一批密钥（某渠道全部未删 keyID）的探测历史（倒序、合并列表），
 // 控制台按渠道聚合读路径使用：先取渠道全部 keyID，再 ANY 查询，避免把渠道 ID 当 key ID 查询恒为空。
 func (s *channelModelStore) ListProbeLogsByKeys(ctx context.Context, keyIDs []int64, limit int) ([]ProbeLog, error) {
-	if limit <= 0 || limit > 500 {
+	if limit <= 0 || limit > probeListMaxRows {
 		limit = 100
 	}
 	if len(keyIDs) == 0 {
@@ -530,7 +544,23 @@ func (s *channelModelStore) scanProbeLogs(rows interface {
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	return list, nil
+	return capProbeBodies(list), nil
+}
+
+// capProbeBodies 把列表里每行 error_body 压到 probeListBodyMaxBytes 以内（同字段标注，指向落库的完整原文）。
+// 行数已经由 SQL LIMIT 收口，这里再收一层每行体积，避免「少量行 × 超大报文」把列表响应撑爆。
+func capProbeBodies(list []ProbeLog) []ProbeLog {
+	for i := range list {
+		body := list[i].ErrorBody
+		if len(body) <= probeListBodyMaxBytes {
+			continue
+		}
+		note := fmt.Sprintf("\n…（已截断：列表只展示前 %d 字节，完整原文 %d 字节见探测记录落库字段 error_body）",
+			probeListBodyMaxBytes, len(body))
+		out, _ := errbody.TruncateUTF8(body, probeListBodyMaxBytes, note)
+		list[i].ErrorBody = out
+	}
+	return list
 }
 
 // Delete 软删除单条渠道内部模型。不存在返回 sql.ErrNoRows。
