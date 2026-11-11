@@ -23,6 +23,7 @@ import (
 	"github.com/team/llmgateway/internal/domain/identity"
 	"github.com/team/llmgateway/internal/domain/protocolconv"
 	"github.com/team/llmgateway/internal/domain/router"
+	"github.com/team/llmgateway/internal/pkg/errbody"
 	"github.com/team/llmgateway/internal/pkg/logger"
 	"github.com/team/llmgateway/internal/pkg/resp"
 )
@@ -1795,7 +1796,13 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 				errInfo{kind: "client_gone", stage: stage, status: up.StatusCode, attempt: attempt,
 					reason: reasonText, sessionID: sessionID, durationMs: *dur})
 		}
-		hardErr := herr != nil && !clientGone && !usageMissing
+		// 上游在流内下发 error 帧、但整条流仍带回了 usage（ErrUpstreamErrorFrame）：
+		// 内容层失败，必须记为 failed（Gate 独立验收在 main 上复现的既有缺陷：这类调用此前记 completed）。
+		// 与 hardErr 分开处理的原因：usage 齐备 → 计费按上游实际用量结算，**不估算、不落额外 failed 账单**，
+		// 只改调用日志的结论与原因（计费口径不动）。
+		var frameErr *UpstreamErrorFrameError
+		upstreamErrFrame := !usageMissing && !clientGone && errors.As(herr, &frameErr)
+		hardErr := herr != nil && !clientGone && !usageMissing && !upstreamErrFrame
 		if hardErr {
 			out.interrupted = true // 语义上失败：内容被截断，请求级结论不得记为"成功"
 			// 下游写失败不是上游故障：kind 保持 stream_interrupted（响应已部分下发不可撤回），
@@ -1815,6 +1822,14 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		}
 		if usageAnomaly {
 			out.interrupted = true // 上游流被截断：内容不完整，请求级结论不得记为"成功"
+		}
+		if upstreamErrFrame {
+			out.interrupted = true // 上游已宣告失败：请求级结论不得记为"成功"
+			g.logUpstreamErr(ctx, slog.LevelError, "upstream stream error frame", endpoint, ureq.Protocol, model, token, routeRes,
+				diagFromRequest(req, ureq.Protocol, ureq.Cred),
+				errInfo{kind: "upstream_error_frame", stage: stage, status: up.StatusCode, attempt: attempt,
+					reason:    "上游流内返回 error 帧（usage 齐备，按上游 usage 计费）：" + herr.Error(),
+					sessionID: sessionID, durationMs: *dur})
 		}
 		// 流结束后计费（预扣已在前置阶段完成；此处按实际/估算扣费，差额由 serve 结算退补）。
 		ch, bid, berr := g.recordBilling(billCtx, routeRes, model, token, usage, pricingMode, sessionID, sessionName, pc.Credits, dur, ft.firstTokenMs(start))
@@ -1836,13 +1851,32 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		case out.billFailed:
 			g.writeCallLogUsage(billCtx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
 				"stream", string(assistantMsg), "failed", "流式计费失败", upstreamUsage, dur, ft.firstTokenMs(start), dec("计费失败"))
+		case upstreamErrFrame:
+			// 上游流内 error 帧 + usage 齐备：内容层失败，按上游实际 usage 计费（不估算），
+			// 调用日志记 failed 并把上游原文写进 error_message —— 运营按 request_id 才能看到上游到底报了什么。
+			reasonText := "上游流式响应中断（流内 error 帧，按上游 usage 计费）"
+			if d := upstreamErrorFrameDetail(herr); d != "" {
+				reasonText += "：" + errbody.MaskSecrets(d, ureq.Cred)
+			}
+			decision := dec("上游流内返回 error 帧")
+			decision["upstream_error_frame"] = true
+			g.writeCallLogUsage(billCtx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
+				"stream", string(assistantMsg), "failed", reasonText, upstreamUsage, dur, ft.firstTokenMs(start), decision)
 		case usageAnomaly:
 			// 上游流中断但内容已部分下发：估算计费已在上面完成，调用日志如实记失败。
 			// 文案按缺失原因区分，避免「补发标记掩盖截断」与「干脆没有结束标记」在日志上混为一谈；
 			// 同时落结构化字段 usage_reason，供看板按归因聚合（不依赖中文文案匹配）。
 			reasonText, decReason := "上游流式响应中断（按估算计费）", "上游流式响应中断"
-			if missingReason == UsageMissingTerminatorOnly {
+			switch missingReason {
+			case UsageMissingTerminatorOnly:
 				reasonText, decReason = "上游流式响应中断（仅收到结束标记、内容层未见收尾证据，按估算计费）", "上游仅补发结束标记"
+			case UsageMissingErrorFrame:
+				// 上游 error 帧的原文（UsageMissingError.Detail）必须落进 error_message：
+				// 只留「上游流式响应中断」时，运营按 request_id 看不到上游到底报了什么（评审核出的必改）。
+				reasonText, decReason = "上游流式响应中断（流内 error 帧，按估算计费）", "上游流内返回 error"
+				if d := upstreamErrorFrameDetail(herr); d != "" {
+					reasonText += "：" + errbody.MaskSecrets(d, ureq.Cred)
+				}
 			}
 			decision := dec(decReason)
 			decision["usage_reason"] = missingReason

@@ -230,6 +230,12 @@ func (p *OpenAIProvider) HandleStream(ctx context.Context, upstream *http.Respon
 		return usage, rawUsageJSON(p.Name(), rawParts), asm.marshal(),
 			&UsageMissingError{Reason: usageMissingReasonOf(end, sawError), Detail: errorFrame}
 	}
+	if sawError {
+		// usage 齐备但上游已用 error 帧宣告失败：内容层失败必须留痕。
+		// 计费口径不变——仍按上游实际 usage 结算（不走估算），只把这次调用记为失败。
+		return usage, rawUsageJSON(p.Name(), rawParts), asm.marshal(),
+			&UpstreamErrorFrameError{Detail: errorFrame}
+	}
 	return usage, rawUsageJSON(p.Name(), rawParts), asm.marshal(), nil
 }
 

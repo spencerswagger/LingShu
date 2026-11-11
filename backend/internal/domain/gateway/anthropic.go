@@ -193,5 +193,10 @@ func (p *AnthropicProvider) HandleStream(ctx context.Context, upstream *http.Res
 		return usage, rawUsageJSON(p.Name(), rawParts), responsesAssistant(content),
 			&UsageMissingError{Reason: usageMissingReasonOf(end, sawError), Detail: errorFrame}
 	}
+	if sawError {
+		// usage 齐备但上游已下发 error 事件：内容层失败必须留痕（计费仍按上游实际 usage）。
+		return usage, rawUsageJSON(p.Name(), rawParts), responsesAssistant(content),
+			&UpstreamErrorFrameError{Detail: errorFrame}
+	}
 	return usage, rawUsageJSON(p.Name(), rawParts), responsesAssistant(content), nil
 }
