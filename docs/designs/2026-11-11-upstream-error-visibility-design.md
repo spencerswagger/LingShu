@@ -53,11 +53,24 @@
 
 | 字段 | 来源 | 说明 |
 | --- | --- | --- |
-| `error.message` | **上游原文** | 见上表；不做凭据清洗（原文原样还给**同一个**调用方），只按 UTF-8 边界截断 |
+| `error.message` | **上游原文** | 见上表；只按 UTF-8 边界截断。**唯一改写**：本次转发实际使用的渠道凭据原值 → `***`（见 §1.5） |
 | `error.type` | 网关 | 按对外状态码归类（429 → `rate_limit_error`，5xx → `server_error`，其余 → `invalid_request_error`）。OpenAI 形状整段透传时不生成此字段（上游自己的 `type` 原样保留） |
 | `error.code` | 网关 | 固定 `upstream_error`：标识「本次失败由上游拒绝引起」，不随状态码/文案变化 |
 | `upstream_status` | 上游真实状态码 | **顶层**字段，两种形状同一位置（OpenAI 形状不允许改 `error` 子对象，故不放里面） |
 | `request_id` | 网关 | 与响应头 `x-request-id` 同值；运营在账单页定位一次请求的唯一钥匙 |
+
+### 1.2.1 凭据遮蔽（对外同样遮蔽）
+
+上游偶尔会把收到的鉴权头原样回显在错误体里（如 `{"error":{"message":"invalid key sk-xxx"}}`）。
+对外透传若原样输出，等于把**渠道密钥**发给下游租户（任何持有自己 token 的用户都能拿到）——
+主干的旧实现是「一律替换成中文通用文案」，所以不泄漏；本 PR 改造后必须继续不泄漏。
+
+口径：对外与运营侧**共用同一套规则**（`internal/pkg/errbody.MaskSecrets`）——
+只把**本次实际使用的凭据原值**替换成 `***`（含 `Bearer <cred>` 里的 `<cred>` 一段），
+不做前缀/高熵/字段白名单清洗；因此除凭据那一处外仍逐字节透传。
+
+- 终结响应（候选全败）用的凭据随 `fwdOutcome.upstreamCred` 一路带过去，保证「最后一次上游报文」同样被遮蔽。
+- 截断标注里报的字节数是**遮蔽前**的原文长度（不能让调用方看到对不上账的数字）。
 
 ### 1.3 上限与截断
 
@@ -197,6 +210,7 @@
 | `TestHandleListProbeLogs_ReturnsStoredRawBody` | HTTP 级：探活历史返回 `probe_logs.error_body` 原文 + 上游状态码 |
 | `TestProbeErrorBody_MasksOnlyExactCredential` | 只遮蔽本次凭据：报文里的 request-id / 模型名 / URL query / `<>&` 一律保留 |
 | `TestReadUpstreamErrBodyViews` | 三视图口径：Clean 清洗、operatorView 仅遮蔽已知凭据 |
+| `TestServeUpstreamError_DownstreamNeverSeesChannelCredential` | 上游回显凭据（OpenAI 形状 / 纯文本终结 / 429 终结）：对外响应与 `resp_body`/`error_message` 都不得出现渠道凭据，同时除凭据外逐字节保留（`***` 只落在凭据那一处） |
 | `TestProbeLog_PgRoundTrip` / `TestCallLog_PgRoundTrip` | 真库读写：上游原文（含中文/HTML/换行）逐字节存得进、读得出（无 DSN 跳过） |
 | `TestServeUpstreamError_TerminalKeepsLastUpstream` | 可转移状态在上游只有单候选时走到「全候选失败」终结分支：对外仍是上游 500 + 上游报文，不退化成 503 聚合文案 |
 | `TestServeUpstreamError_429TerminalKeepsUpstreamBody` | 上游 429 全候选限流：对外 429 + 上游报文 |

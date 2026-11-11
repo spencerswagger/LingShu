@@ -743,7 +743,7 @@ func TestWriteUpstreamError_UpstreamStatusIsRealCode(t *testing.T) {
 	// 路径一：上游 304 → 对外 502，但 upstream_status 仍是 304。
 	rec := httptest.NewRecorder()
 	rec.Header().Set("x-request-id", "rid-304")
-	writeUpstreamError(rec, http.StatusNotModified, http.StatusNotModified, `{"error":{"message":"not modified"}}`)
+	writeUpstreamError(rec, http.StatusNotModified, http.StatusNotModified, `{"error":{"message":"not modified"}}`, "")
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("304 应对外 502, got %d", rec.Code)
 	}
@@ -798,5 +798,103 @@ func TestOperatorView_SanitizesInvalidUTF8(t *testing.T) {
 	clean := `{"error":"中文 ok"}`
 	if got := (upstreamErrBody{Raw: clean}).operatorView(); got != clean {
 		t.Fatalf("合法原文不得被改写: want=%q got=%q", clean, got)
+	}
+}
+
+// TestServeUpstreamError_DownstreamNeverSeesChannelCredential 上游把收到的鉴权头回显在错误体里时，
+// **对外响应**必须把渠道凭据遮蔽掉：下游 API 用户只持有自己的令牌，不该拿到我们调上游用的渠道密钥。
+//
+// 与运营侧共用同一套规则（internal/pkg/errbody.MaskSecrets：只替换本次实际使用的凭据原值），
+// 于是「凭据出不去」和「除凭据外原文逐字节可见」同时成立——两条都要断言，防止修一边坏另一边。
+func TestServeUpstreamError_DownstreamNeverSeesChannelCredential(t *testing.T) {
+	seed := time.Now().UnixNano()
+	rnd := rand.New(rand.NewSource(seed))
+	t.Logf("随机种子 seed=%d（失败可用它复现）", seed)
+
+	// 上游报文里同时出现：明文凭据（两次，含 Bearer 前缀）、随机 request-id、随机模型名、
+	// 以及随机正文——遮蔽只能命中凭据那两处。
+	reqID := strings.ToUpper(randbody.Word(rnd)) + "-" + randbody.Word(rnd)
+	modelName := randbody.Word(rnd) + "-" + randbody.Word(rnd)
+	noise := randbody.Text(rnd, 30, 200)
+
+	cases := []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{
+			name: "OpenAI形状-直接返回(401)", status: http.StatusUnauthorized,
+			body: randbody.JSONText(map[string]any{
+				"error": map[string]any{
+					"message": "upstream rejected credential Bearer " + harnessCredential + " for key " + modelName,
+					"echo":    "Bearer " + harnessCredential,
+					"noise":   noise,
+				},
+				"request_id": reqID,
+			}),
+		},
+		{
+			name: "纯文本-候选全败终结分支(500)", status: http.StatusInternalServerError,
+			body: "upstream failed: auth=" + harnessCredential + " rid=" + reqID + " model=" + modelName + " " + noise,
+		},
+		{
+			name: "非JSON对象-429终结分支", status: http.StatusTooManyRequests,
+			body: `[{"detail":"quota exhausted for ` + harnessCredential + `","rid":"` + reqID + `"}]`,
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer up.Close()
+
+			h := build(t, up.URL)
+			const rid = "req-leak"
+			rec := doRequestWithID(t, h.gw, "/v1/chat/completions", "sk-gw-t", streamFlagged(false), rid)
+
+			// ① 对外响应不得出现渠道凭据（这是本轮 Gate 的必改项）。
+			if strings.Contains(rec.Body.String(), harnessCredential) {
+				t.Fatalf("对外响应泄漏渠道凭据: %s", rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), "***") {
+				t.Fatalf("凭据位置应替换成 ***（而不是整段丢弃内容）: %s", rec.Body.String())
+			}
+			// ② 对外仍然逐字节透传（只有凭据那一段变成 ***）。
+			wantMasked := strings.ReplaceAll(tc.body, harnessCredential, "***")
+			var out map[string]any
+			if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			msg := errorMessage(t, out)
+			if !strings.Contains(wantMasked, msg) && msg != wantMasked {
+				t.Fatalf("对外内容必须等于原文（仅凭据遮蔽）\nwant 含=%q\ngot=%q", head(wantMasked, 300), head(msg, 300))
+			}
+			if !strings.Contains(rec.Body.String(), reqID) && !strings.Contains(msg, reqID) {
+				t.Fatalf("非凭据内容（request-id）必须保留: %q", head(msg, 300))
+			}
+
+			// ③ 运营侧同样不泄漏，但保留的仍是原文（不是把整段改写掉）。
+			if len(h.clogs.inserted) != 1 {
+				t.Fatalf("失败必须落 1 条调用日志, got %d", len(h.clogs.inserted))
+			}
+			cl := h.clogs.inserted[0]
+			if strings.Contains(cl.RespBody, harnessCredential) {
+				t.Fatalf("call_logs.resp_body 泄漏渠道凭据: %q", head(cl.RespBody, 300))
+			}
+			if strings.Contains(cl.ErrorMessage, harnessCredential) {
+				t.Fatalf("error_message 泄漏渠道凭据: %q", head(cl.ErrorMessage, 300))
+			}
+			if cl.RespBody != "" {
+				assertOperatorSeesExact(t, "调用日志 resp_body", cl.RespBody, tc.body, harnessCredential)
+			}
+			if !strings.Contains(cl.RespBody, reqID) {
+				t.Fatalf("运营侧不得因遮蔽丢掉非凭据内容（request-id）: %q", head(cl.RespBody, 300))
+			}
+		})
 	}
 }

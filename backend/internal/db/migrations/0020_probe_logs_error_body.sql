@@ -19,3 +19,20 @@ COMMENT ON COLUMN probe_logs.error_body IS
     '上游错误响应体原文（运营可见；仅遮蔽本次凭据值；>32KB 按 UTF-8 边界截断并同字段标注；空=上游无错误体）';
 COMMENT ON COLUMN probe_logs.upstream_status IS
     '本次探测的上游 HTTP 状态码；NULL=没打到上游（连接失败/超时/无可用模型或密钥）';
+
+-- 回滚路径（DOWN，手工执行；迁移框架只跑 up，每文件一事务，故回滚按下面的逆操作走）：
+--
+--   1) 只想「停用」而不丢数据（推荐，先回代码再回库）：
+--        ALTER TABLE probe_logs ALTER COLUMN error_body SET DEFAULT '';
+--        -- 代码回滚后即不再写入/读取这两列，列留着不影响旧版本（旧 INSERT 显式列出列名）。
+--
+--   2) 彻底移除（会丢掉历史原文，DROP 前请按需导出）：
+--        ALTER TABLE probe_logs DROP COLUMN IF EXISTS error_body;
+--        ALTER TABLE probe_logs DROP COLUMN IF EXISTS upstream_status;
+--        DELETE FROM applied_migrations WHERE name = '0020_probe_logs_error_body.sql';
+--
+--   3) 重放幂等：本文件全部是 ADD COLUMN IF NOT EXISTS，重复执行不报错、不改既有行
+--      （旧行保持 '' / NULL，新行写原文），所以「回滚后重放」不会破坏已有数据。
+--
+-- 不变量：本迁移只新增两列（带默认值），**不修改、不删除、不回填**任何既有列与既有行，
+-- 因此对既有数据语义零影响（旧行的 error_body=''、upstream_status=NULL 即为「当时没有记录」）。

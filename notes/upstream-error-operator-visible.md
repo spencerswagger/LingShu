@@ -64,3 +64,16 @@
 ## 6. 分支
 
 `fix/upstream-error-passthrough`（PR #77，同一特性分支上追加本组提交；未自行合入、未推 main）。
+
+## 7. Gate 复验后追加：对外不得泄漏渠道凭据（必改，已修）
+
+- 现象：上游 401 回显我们发过去的鉴权头时，**对外**响应把 `Bearer sk-...` 原样透出；
+  `main` 不泄漏（旧实现一律替换成中文通用文案）→ 属本 PR 新引入的安全回归。
+- 修法：`writeUpstreamError`/`upstreamErrorPayload` 增参接收本次 `ureq.Cred`，内容落盘/输出前
+  统一过 `errbody.MaskSecrets`（与运营侧 `operatorView` **同一函数、同一规则**：只遮蔽本次凭据原值）；
+  终结响应（候选全败）的凭据随 `fwdOutcome.upstreamCred` 带过去，保证最后一次上游报文也被遮蔽；
+  截断标注里的字节数取**遮蔽前**长度。
+- 回归测试：`TestServeUpstreamError_DownstreamNeverSeesChannelCredential`（OpenAI 形状直接返回 /
+  纯文本终结 / 429 终结三路）——同时断言「对外无凭据」与「除凭据外逐字节保留」，
+  防止遮蔽反向污染运营侧。已验证撤掉遮蔽即 FAIL（复现 Gate 的两行最小复现）。
+- 运营侧未受影响：`call_logs.resp_body`、`probe_logs.error_body`、探活响应仍是原文（仅凭据位置为 `***`）。

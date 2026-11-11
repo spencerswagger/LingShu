@@ -164,7 +164,7 @@ func upstreamTruncNote(total, limit int) string {
 //
 // 二者不能混用：策略把 422 覆盖成 418、或上游回 304 被改写成 502 时，
 // upstream_status 仍必须报上游真实码，否则字段语义（「上游真实状态码」）就是假的。
-func writeUpstreamError(w http.ResponseWriter, status, upstreamStatus int, raw string) {
+func writeUpstreamError(w http.ResponseWriter, status, upstreamStatus int, raw, cred string) {
 	// 1xx/3xx 不属错误语义（且 304 禁带响应体），若上游回这类码则按网关错误输出，
 	// 否则调用方会拿到「有状态码没内容」或干脆看不到错误。4xx/5xx 一律沿用上游。
 	if status < http.StatusBadRequest {
@@ -175,17 +175,26 @@ func writeUpstreamError(w http.ResponseWriter, status, upstreamStatus int, raw s
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(upstreamErrorPayload(status, upstreamStatus, raw, w.Header().Get("x-request-id")))
+	_ = json.NewEncoder(w).Encode(upstreamErrorPayload(status, upstreamStatus, raw,
+		w.Header().Get("x-request-id"), cred))
 }
 
 // upstreamErrorPayload 组装对外错误体。返回 any：OpenAI 形状走「整段原样透传」（map），
 // 其余形状走网关错误壳（openAIErrorBody）。status=对外状态码，upstreamStatus=上游真实状态码。
-func upstreamErrorPayload(status, upstreamStatus int, raw, requestID string) any {
+//
+// secrets：本次转发实际使用的渠道凭据。上游偶尔会把收到的鉴权头原样回显在错误体里，
+// 若不遮蔽就等于把**渠道密钥**转手发给下游 API 用户（拥有 token 的租户人人都能拿到）。
+// 遮蔽规则与运营侧 operatorView 同一套（internal/pkg/errbody.MaskSecrets：只替换已知凭据原值，
+// 不做样式/高熵清洗），因此除凭据外的每个字节仍逐字节透传。
+func upstreamErrorPayload(status, upstreamStatus int, raw, requestID string, secrets ...string) any {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return upstreamEnvelope(status, upstreamStatus,
 			fmt.Sprintf("上游返回 %d，响应体为空（无可透传的错误内容）", upstreamStatus), requestID)
 	}
+	// 截断标注里报**原文**字节数（遮蔽前后长度略有差异，不能让调用方看到「对不上账」的数字）。
+	origLen := len(raw)
+	raw = errbody.MaskSecrets(raw, secrets...)
 	// OpenAI 形状且未超上限 → 整段原样透传：顶层每个键（含 error 子对象的全部字段与嵌套）
 	// 都以 json.RawMessage 原值搬走，只追加我们自己的顶层字段。
 	if len(raw) <= upstreamErrOutBytes {
@@ -201,7 +210,7 @@ func upstreamErrorPayload(status, upstreamStatus int, raw, requestID string) any
 	}
 	// 其余形状（其它 JSON / 非 JSON / 超长的 OpenAI 形状）：原文原样进 message，
 	// 超限时同字段前缀 + 截断标注。其它 JSON 也是原文本，结构与嵌套一并保留。
-	text, _ := truncateUTF8(raw, upstreamErrOutBytes, upstreamTruncNote(len(raw), upstreamErrOutBytes))
+	text, _ := truncateUTF8(raw, upstreamErrOutBytes, upstreamTruncNote(origLen, upstreamErrOutBytes))
 	return upstreamEnvelope(status, upstreamStatus, text, requestID)
 }
 
