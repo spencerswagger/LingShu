@@ -198,3 +198,42 @@ func TestInjectProtocolAuth(t *testing.T) {
 		t.Errorf("无凭据不应注入鉴权头，got %q", got)
 	}
 }
+
+// anthropic 直连协议隐含默认头（修复前缺失导致整链路 400/不可用）：
+// anthropic-version 恒注入；anthropic-beta 仅当客户端带来时透传；openai-* 上游不受影响。
+func TestInjectAnthropicProtocolDefaults(t *testing.T) {
+	// anthropic-messages：默认注入 anthropic-version: 2023-06-01（必填头）。
+	req := buildReq(t, http.Header{}, channelprotocol.HeaderPolicy{},
+		channelprotocol.ProtocolAnthropicMessages, "sk-raw", nil)
+	if got := req.Header.Get("Anthropic-Version"); got != "2023-06-01" {
+		t.Errorf("anthropic 直连应默认注入 anthropic-version，got %q", got)
+	}
+	// 客户端带来 anthropic-beta：默认透传（interleaved thinking 等场景）。
+	down := http.Header{}
+	down.Set("Anthropic-Beta", "interleaved-thinking-2025-01-15")
+	req = buildReq(t, down, channelprotocol.HeaderPolicy{},
+		channelprotocol.ProtocolAnthropicMessages, "sk-raw", nil)
+	if got := req.Header.Get("Anthropic-Beta"); got != "interleaved-thinking-2025-01-15" {
+		t.Errorf("anthropic-beta 应透传客户端值，got %q", got)
+	}
+	// 客户端未带 beta：不强行注入（注入未声明特性会被上游拒绝）。
+	req = buildReq(t, http.Header{}, channelprotocol.HeaderPolicy{},
+		channelprotocol.ProtocolAnthropicMessages, "sk-raw", nil)
+	if got := req.Header.Get("Anthropic-Beta"); got != "" {
+		t.Errorf("客户端未带 anthropic-beta 时不应注入，got %q", got)
+	}
+	// 覆盖(set) 可显式覆盖 version。
+	req = buildReq(t, http.Header{}, channelprotocol.HeaderPolicy{
+		PassthroughMode: channelprotocol.PassthroughNone,
+		Set:             map[string]string{"Anthropic-Version": "2024-01-01"},
+	}, channelprotocol.ProtocolAnthropicMessages, "sk-raw", nil)
+	if got := req.Header.Get("Anthropic-Version"); got != "2024-01-01" {
+		t.Errorf("覆盖(set) 应能显式覆盖 anthropic-version，got %q", got)
+	}
+	// openai-chat 上游：不注入 anthropic 头。
+	req = buildReq(t, http.Header{}, channelprotocol.HeaderPolicy{},
+		channelprotocol.ProtocolOpenAIChat, "sk-abc", nil)
+	if got := req.Header.Get("Anthropic-Version"); got != "" {
+		t.Errorf("openai-chat 上游不应注入 anthropic-version，got %q", got)
+	}
+}
