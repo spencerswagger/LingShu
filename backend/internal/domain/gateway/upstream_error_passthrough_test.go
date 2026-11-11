@@ -898,3 +898,56 @@ func TestServeUpstreamError_DownstreamNeverSeesChannelCredential(t *testing.T) {
 		})
 	}
 }
+
+// TestServeUpstreamError_BuildFailureNoAddress 构建上游请求失败（如渠道 BaseURL 非法）时，
+// 对外文案同样不得带出渠道地址——构建错误的底层文本可能含 `parse "http://<基址>/chat/completions": …`。
+func TestServeUpstreamError_BuildFailureNoAddress(t *testing.T) {
+	// 故意给一个含空格与端口的非法 BaseURL：http.NewRequest 会在解析阶段失败，错误文本里带完整 URL。
+	h := build(t, "http://bad host:18080")
+	rec := doRequestWithID(t, h.gw, "/v1/chat/completions", "sk-gw-t", streamFlagged(false), "req-build")
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("构建失败应 502, got %d: %s", rec.Code, rec.Body.String())
+	}
+	rb := decodeOpenAIError(t, rec)
+	if !strings.Contains(rb.Error.Message, "构建失败") {
+		t.Fatalf("要点名构建失败, got %q", rb.Error.Message)
+	}
+	for _, leak := range []string{"http://", "bad host", "18080", "/chat/completions"} {
+		if strings.Contains(rb.Error.Message, leak) {
+			t.Fatalf("对外文案不得出现渠道地址片段 %q: %q", leak, rb.Error.Message)
+		}
+	}
+}
+
+// TestServeUpstreamError_PolicyOverrideKeepsRealUpstreamStatus 上游 429 被错误策略覆盖成 418 时，
+// 对外 HTTP 状态码是 418，但响应体顶层 upstream_status 仍必须是上游真实的 429。
+func TestServeUpstreamError_PolicyOverrideKeepsRealUpstreamStatus(t *testing.T) {
+	up := upstreamErrServer(t, http.StatusTooManyRequests, `{"error":{"message":"slow down","type":"rate_limit_error"}}`)
+	h := build(t, up.URL)
+	no := false
+	withPolicy(h, 9, []channelprotocol.ErrorPolicy{{
+		Scope: channelprotocol.ErrorScopeChannel,
+		Match: channelprotocol.ErrorMatch{Status: http.StatusTooManyRequests},
+		Disposition: channelprotocol.ErrorDisposition{
+			Failover:         &no,
+			DownstreamStatus: http.StatusTeapot,
+		},
+	}})
+
+	rec := doRequestWithID(t, h.gw, "/v1/chat/completions", "sk-gw-t", streamFlagged(false), "rid-429-418")
+	if rec.Code != http.StatusTeapot {
+		t.Fatalf("策略覆盖应对外 418, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var out map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got, _ := out["upstream_status"].(float64); int(got) != http.StatusTooManyRequests {
+		t.Fatalf("upstream_status 必须仍是上游真实码 429, got %v", out["upstream_status"])
+	}
+	// 错误体本身仍是上游原文（策略只改对外状态码与措辞，不改内容）。
+	e, _ := out["error"].(map[string]any)
+	if msg, _ := e["message"].(string); !strings.Contains(msg, "slow down") {
+		t.Fatalf("策略覆盖后错误体仍应是上游原文, got %q", msg)
+	}
+}

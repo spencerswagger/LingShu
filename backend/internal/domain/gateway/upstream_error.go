@@ -277,6 +277,16 @@ func upstreamTransportNote(kind string, err error) (note string, timedOut bool) 
 	return "上游" + kind + reason, timedOut
 }
 
+// buildFailureNote 把「构建上游请求失败」转成对外可读原因。
+// 构建失败的错误文本里同样可能带出渠道地址（如 `parse "http://<基址>/chat/completions": invalid character…`），
+// 所以对外文案统一过 redactUpstreamAddr；完整错误仍进结构化日志与调用日志。
+func buildFailureNote(err error) string {
+	if err == nil {
+		return "上游请求构建失败（无错误详情）"
+	}
+	return "上游请求构建失败：" + redactUpstreamAddr(truncateLog(sanitizeErrSummary(err.Error()), errSummaryMaxBytes))
+}
+
 // transportFailureReason 把一次传输层失败归一成「可读且不含地址」的原因。
 func transportFailureReason(err error) (reason string, timedOut bool) {
 	if isTimeoutErr(err) {
@@ -328,6 +338,10 @@ var (
 	ipv4Re     = regexp.MustCompile(`\b\d{1,3}(?:\.\d{1,3}){3}(?::\d{1,5})?\b`)
 	ipv6Re     = regexp.MustCompile(`\[[0-9a-fA-F:]+\](?::\d{1,5})?`)
 	hostPortRe = regexp.MustCompile(`(?i)\b(?:localhost|(?:[a-z0-9](?:[a-z0-9\-]*[a-z0-9])?\.)+[a-z]{2,}):\d{1,5}\b`)
+	// anyHostPortRe 兜住前面几条没料到的主机:端口写法（如 URL 解析失败时的 `bad host:18080/chat/completions`，
+	// 主机名里带空格/下划线等非法字符，正则域名规则匹配不到）。要求「非空白串 + 冒号 + 端口」，
+	// 因此不会误伤正文里的「错误码 400」这类文本。
+	anyHostPortRe = regexp.MustCompile(`(?i)[^\s"'(\[{]+:\d{1,5}(?:/[^\s"')]*)?`)
 )
 
 // redactUpstreamAddr 抹掉文本里的渠道地址（URL / IP / 带端口主机名），保留其余可读线索。
@@ -340,6 +354,7 @@ func redactUpstreamAddr(s string) string {
 	s = ipv6Re.ReplaceAllString(s, "<地址>")
 	s = ipv4Re.ReplaceAllString(s, "<地址>")
 	s = hostPortRe.ReplaceAllString(s, "<地址>")
+	s = anyHostPortRe.ReplaceAllString(s, "<地址>")
 	return s
 }
 

@@ -1327,7 +1327,7 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 		// 避免「请求增量/响应/决策原因」三处都是同一句文案。
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
 			"error", "", "failed", "构建上游请求失败", msSince(start), nil, dec("上游请求构建失败"))
-		return &fwdOutcome{retry: true, failureNote: "上游请求构建失败：" + truncateLog(sanitizeErrSummary(err.Error()), errSummaryMaxBytes)}
+		return &fwdOutcome{retry: true, failureNote: buildFailureNote(err)}
 	}
 	req, wrote, _ := withWriteTrace(req)
 	up, err := g.client.Do(req)
@@ -1663,7 +1663,7 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		// 网关侧失败（未发出上游调用）：resp_body 留空，原因只落 error_message 与决策轨迹。
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
 			"error", "", "failed", "构建上游流式请求失败", msSince(start), nil, dec("上游请求构建失败"))
-		return &fwdOutcome{retry: true, failureNote: "上游请求构建失败：" + truncateLog(sanitizeErrSummary(err.Error()), errSummaryMaxBytes)}
+		return &fwdOutcome{retry: true, failureNote: buildFailureNote(err)}
 	}
 	req, wrote, gotFirstByte := withWriteTrace(req)
 	up, err := g.streamClient.Do(req)
