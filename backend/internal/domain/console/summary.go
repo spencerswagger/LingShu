@@ -4,11 +4,13 @@ package console
 import (
 	"context"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/team/llmgateway/internal/domain/billing"
 	"github.com/team/llmgateway/internal/domain/router"
 	"github.com/team/llmgateway/internal/pkg/resp"
+	"github.com/team/llmgateway/internal/pkg/statscache"
 )
 
 // TokenCounter 令牌计数抽象（identity.TokenStore 满足；nil=未装配时取 0）。
@@ -73,6 +75,12 @@ type meSummaryResp struct {
 }
 
 // HandleMeSummary GET /api/v1/auth/me/summary 本人摘要。
+//
+// 数据来源（2026-11-10 改造）：
+//   - 今日 / 昨日 / 本月积分与本月三段 token 走日级预聚合 `user_daily_stats`（行数=天数，与明细行数无关），
+//     并套一层进程内 5 分钟 TTL 缓存（按用户 key，并发合并回源）；
+//   - 近 1 分钟 RPM/TPM 属于「秒级口径」，不做缓存、仍查明细（走 (user_id, call_time) 索引，只命中分钟级行数）；
+//   - 令牌数、在线会话数与上述无关，保持原实现。
 func (h *Dev) HandleMeSummary(w http.ResponseWriter, r *http.Request) {
 	userID, ok := h.currentUser(w, r)
 	if !ok {
@@ -81,24 +89,22 @@ func (h *Dev) HandleMeSummary(w http.ResponseWriter, r *http.Request) {
 	now := h.now()
 	today, y, m, win := summaryRanges(now, cnLocation())
 
-	// 查询顺序严格为 today、yesterday、month、window。
-	// 三档消耗按 status='completed' 统计，与既有「累计消费」（LoadLedger）口径一致；
-	// 吞吐窗口（RPM/TPM）不过滤状态，以反映真实请求速率。
-	todaySum, err := h.billing.Summarize(r.Context(), billing.RecordFilter{UserID: &userID, Status: "completed", From: &today.From, To: &today.To})
+	// 三档消耗走聚合表 + 缓存：同一用户 5 分钟内只回源一次，并发请求合并成一次 DB 查询。
+	totals, fromCache, err := h.summaryCache().Get(r.Context(), meSummaryCacheKey(userID),
+		func(ctx context.Context) (billing.UserDayTotals, error) {
+			return h.billing.UserDayTotals(ctx, userID, today.From, y.From, m.From)
+		})
 	if err != nil {
 		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "查询摘要失败")
 		return
 	}
-	ySum, err := h.billing.Summarize(r.Context(), billing.RecordFilter{UserID: &userID, Status: "completed", From: &y.From, To: &y.To})
-	if err != nil {
-		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "查询摘要失败")
-		return
+	if fromCache {
+		w.Header().Set("x-stats-cache", "hit")
+	} else {
+		w.Header().Set("x-stats-cache", "miss")
 	}
-	mSum, err := h.billing.Summarize(r.Context(), billing.RecordFilter{UserID: &userID, Status: "completed", From: &m.From, To: &m.To})
-	if err != nil {
-		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "查询摘要失败")
-		return
-	}
+
+	// 吞吐窗口（RPM/TPM）：近 1 分钟，不过滤状态，以反映真实请求速率。
 	winSum, err := h.billing.Summarize(r.Context(), billing.RecordFilter{UserID: &userID, From: &win.From, To: &win.To})
 	if err != nil {
 		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "查询摘要失败")
@@ -126,13 +132,37 @@ func (h *Dev) HandleMeSummary(w http.ResponseWriter, r *http.Request) {
 	resp.OK(w, r, meSummaryResp{
 		TokenCount:       tokenCount,
 		SessionCount:     sessionCount,
-		TodayCredits:     todaySum.CreditsTotal,
-		YesterdayCredits: ySum.CreditsTotal,
-		MonthCredits:     mSum.CreditsTotal,
+		TodayCredits:     totals.TodayCredits,
+		YesterdayCredits: totals.YesterdayCredits,
+		MonthCredits:     totals.MonthCredits,
 		// 短窗口口径：窗口内计数 ÷ 窗口分钟数（近 1 分钟即 ÷1.0），不用忙时口径。
 		RPM:             float64(winSum.Requests) / summaryWindow.Minutes(),
 		TPM:             float64(winSum.TokensTotal) / summaryWindow.Minutes(),
-		InputTokens:     mSum.InputTokens,
-		CacheReadTokens: mSum.CacheReadTokens,
+		InputTokens:     totals.MonthInput,
+		CacheReadTokens: totals.MonthCacheRead,
 	})
+}
+
+// meSummaryCacheKey 本人摘要缓存键：必须带用户 ID——
+// 键里少一个隔离维度就会把 A 的积分读给 B（单测 TestDevSummary_CacheIsolatesUsers 守着）。
+func meSummaryCacheKey(userID int64) string {
+	return "me-summary:" + strconv.FormatInt(userID, 10)
+}
+
+// summaryCache 懒初始化本人摘要缓存（5 分钟 TTL，进程内 map + singleflight）。
+func (h *Dev) summaryCache() *statscache.Cache[billing.UserDayTotals] {
+	h.cacheOnce.Do(func() {
+		if h.meSummaryCache == nil {
+			h.meSummaryCache = statscache.New[billing.UserDayTotals](statscache.DefaultTTL)
+		}
+	})
+	return h.meSummaryCache
+}
+
+// InvalidateMeSummary 主动失效某用户的摘要缓存（记账写入后由装配层挂到 billing 回调上）。
+func (h *Dev) InvalidateMeSummary(userID int64) {
+	if h.meSummaryCache == nil {
+		return
+	}
+	h.meSummaryCache.Invalidate(meSummaryCacheKey(userID))
 }

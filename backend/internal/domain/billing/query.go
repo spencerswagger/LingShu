@@ -242,25 +242,22 @@ func BusyRate(count float64, sumDurationMS int64) float64 {
 // Summarize 按与列表完全相同的过滤条件聚合统计（不分页），供账单页统计栏展示。
 // 忙时口径：请求数/token/耗时三者都用 FILTER (WHERE status='completed' AND duration_ms IS NOT NULL) 统计，
 // 分母为 0 时 BusyRPM/BusyTPM 返回 0（其余统计口径不受 status 影响）。
+//
+// 三段 token 读 0020 新增的实体列（input_tokens / cache_read_tokens / output_tokens），
+// 不再逐行解析 tokens JSONB——JSONB 取值 + 正则守卫在明细表上是每行三次的函数调用，
+// 是账单页统计栏在大数据量下的主要开销。存量行由启动回填（internal/db.BackfillStats）补齐。
 func (s *SqlStore) Summarize(ctx context.Context, f RecordFilter) (RecordSummary, error) {
 	where, args := recordWhere(f)
 	var out RecordSummary
 	err := s.db.QueryRowContext(ctx,
 		`SELECT count(*),
 		        COALESCE(sum(credits_consumed), 0),
-		        COALESCE(sum(
-		            COALESCE(NULLIF(tokens->>'input','')::bigint, 0) +
-		            COALESCE(NULLIF(tokens->>'cache_read','')::bigint, 0) +
-		            COALESCE(NULLIF(tokens->>'output','')::bigint, 0)), 0),
+		        COALESCE(sum(input_tokens + cache_read_tokens + output_tokens), 0),
 		        COALESCE(sum(duration_ms), 0),
-		        COALESCE(sum(COALESCE(NULLIF(tokens->>'input','')::bigint, 0)), 0),
-		        COALESCE(sum(COALESCE(NULLIF(tokens->>'cache_read','')::bigint, 0)), 0),
+		        COALESCE(sum(input_tokens), 0),
+		        COALESCE(sum(cache_read_tokens), 0),
 		        COALESCE(count(*) FILTER (WHERE `+busyFilter+`), 0),
-		        COALESCE(sum(
-		            COALESCE(NULLIF(tokens->>'input','')::bigint, 0) +
-		            COALESCE(NULLIF(tokens->>'cache_read','')::bigint, 0) +
-		            COALESCE(NULLIF(tokens->>'output','')::bigint, 0)
-		        ) FILTER (WHERE `+busyFilter+`), 0),
+		        COALESCE(sum(input_tokens + cache_read_tokens + output_tokens) FILTER (WHERE `+busyFilter+`), 0),
 		        COALESCE(sum(duration_ms) FILTER (WHERE `+busyFilter+`), 0)
 		 FROM billing_records `+where, args...).
 		Scan(&out.Requests, &out.CreditsTotal, &out.TokensTotal, &out.DurationTotalMS,

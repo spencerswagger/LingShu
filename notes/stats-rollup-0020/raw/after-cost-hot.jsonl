@@ -1,0 +1,15 @@
+{"campaign": 1, "idx": 0, "mode": "hot", "endpoint": "cost", "ms": 1.0387329966761172, "status": 200, "cache": "hit", "bytes": 1675, "ts": 1794421378.6988833}
+{"campaign": 1, "idx": 1, "mode": "hot", "endpoint": "cost", "ms": 0.8200760057661682, "status": 200, "cache": "hit", "bytes": 1675, "ts": 1794421378.699731}
+{"campaign": 1, "idx": 2, "mode": "hot", "endpoint": "cost", "ms": 0.8773980080150068, "status": 200, "cache": "hit", "bytes": 1675, "ts": 1794421378.7006347}
+{"campaign": 1, "idx": 3, "mode": "hot", "endpoint": "cost", "ms": 0.7729640055913478, "status": 200, "cache": "hit", "bytes": 1675, "ts": 1794421378.7014337}
+{"campaign": 1, "idx": 4, "mode": "hot", "endpoint": "cost", "ms": 0.7671540079172701, "status": 200, "cache": "hit", "bytes": 1675, "ts": 1794421378.7022235}
+{"campaign": 2, "idx": 0, "mode": "hot", "endpoint": "cost", "ms": 0.7000899931881577, "status": 200, "cache": "hit", "bytes": 1675, "ts": 1794421447.5339737}
+{"campaign": 2, "idx": 1, "mode": "hot", "endpoint": "cost", "ms": 0.5080839910078794, "status": 200, "cache": "hit", "bytes": 1675, "ts": 1794421447.5345075}
+{"campaign": 2, "idx": 2, "mode": "hot", "endpoint": "cost", "ms": 0.44095198973082006, "status": 200, "cache": "hit", "bytes": 1675, "ts": 1794421447.5349715}
+{"campaign": 2, "idx": 3, "mode": "hot", "endpoint": "cost", "ms": 0.5208940128795803, "status": 200, "cache": "hit", "bytes": 1675, "ts": 1794421447.5355306}
+{"campaign": 2, "idx": 4, "mode": "hot", "endpoint": "cost", "ms": 0.6255879998207092, "status": 200, "cache": "hit", "bytes": 1675, "ts": 1794421447.53618}
+{"campaign": 3, "idx": 0, "mode": "hot", "endpoint": "cost", "ms": 0.939293997362256, "status": 200, "cache": "hit", "bytes": 1675, "ts": 1794421517.2565346}
+{"campaign": 3, "idx": 1, "mode": "hot", "endpoint": "cost", "ms": 0.5320929922163486, "status": 200, "cache": "hit", "bytes": 1675, "ts": 1794421517.2571058}
+{"campaign": 3, "idx": 2, "mode": "hot", "endpoint": "cost", "ms": 0.5074029904790223, "status": 200, "cache": "hit", "bytes": 1675, "ts": 1794421517.2576363}
+{"campaign": 3, "idx": 3, "mode": "hot", "endpoint": "cost", "ms": 0.4615520010702312, "status": 200, "cache": "hit", "bytes": 1675, "ts": 1794421517.2581208}
+{"campaign": 3, "idx": 4, "mode": "hot", "endpoint": "cost", "ms": 0.4286710172891617, "status": 200, "cache": "hit", "bytes": 1675, "ts": 1794421517.2585716}

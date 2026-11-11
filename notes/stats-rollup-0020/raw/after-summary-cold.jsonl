@@ -1,0 +1,15 @@
+{"campaign": 1, "idx": 0, "mode": "cold", "endpoint": "summary", "ms": 7.071348984027281, "status": 200, "cache": "miss", "bytes": 249, "ts": 1794421517.5731773, "startup_s": 1794421517.0}
+{"campaign": 1, "idx": 1, "mode": "cold", "endpoint": "summary", "ms": 8.68696000543423, "status": 200, "cache": "miss", "bytes": 249, "ts": 1794421517.7933555, "startup_s": 1794421518.0}
+{"campaign": 1, "idx": 2, "mode": "cold", "endpoint": "summary", "ms": 5.473669007187709, "status": 200, "cache": "miss", "bytes": 249, "ts": 1794421518.0098379, "startup_s": 1794421518.0}
+{"campaign": 1, "idx": 3, "mode": "cold", "endpoint": "summary", "ms": 6.831532984506339, "status": 200, "cache": "miss", "bytes": 249, "ts": 1794421518.2280266, "startup_s": 1794421518.0}
+{"campaign": 1, "idx": 4, "mode": "cold", "endpoint": "summary", "ms": 8.065314003033563, "status": 200, "cache": "miss", "bytes": 249, "ts": 1794421518.4466667, "startup_s": 1794421518.0}
+{"campaign": 2, "idx": 0, "mode": "cold", "endpoint": "summary", "ms": 3.8480169896502048, "status": 200, "cache": "miss", "bytes": 249, "ts": 1794421518.7811723, "startup_s": 1794421519.0}
+{"campaign": 2, "idx": 1, "mode": "cold", "endpoint": "summary", "ms": 5.236772994976491, "status": 200, "cache": "miss", "bytes": 249, "ts": 1794421518.9978154, "startup_s": 1794421519.0}
+{"campaign": 2, "idx": 2, "mode": "cold", "endpoint": "summary", "ms": 3.7938349996693432, "status": 200, "cache": "miss", "bytes": 249, "ts": 1794421519.2141402, "startup_s": 1794421519.0}
+{"campaign": 2, "idx": 3, "mode": "cold", "endpoint": "summary", "ms": 3.918439004337415, "status": 200, "cache": "miss", "bytes": 249, "ts": 1794421519.4275265, "startup_s": 1794421519.0}
+{"campaign": 2, "idx": 4, "mode": "cold", "endpoint": "summary", "ms": 4.936644021654502, "status": 200, "cache": "miss", "bytes": 249, "ts": 1794421519.642368, "startup_s": 1794421519.0}
+{"campaign": 3, "idx": 0, "mode": "cold", "endpoint": "summary", "ms": 4.366859997389838, "status": 200, "cache": "miss", "bytes": 249, "ts": 1794421519.9693987, "startup_s": 1794421520.0}
+{"campaign": 3, "idx": 1, "mode": "cold", "endpoint": "summary", "ms": 5.1212290127296, "status": 200, "cache": "miss", "bytes": 249, "ts": 1794421520.1853404, "startup_s": 1794421520.0}
+{"campaign": 3, "idx": 2, "mode": "cold", "endpoint": "summary", "ms": 7.570632005808875, "status": 200, "cache": "miss", "bytes": 249, "ts": 1794421520.4026504, "startup_s": 1794421520.0}
+{"campaign": 3, "idx": 3, "mode": "cold", "endpoint": "summary", "ms": 4.25802799873054, "status": 200, "cache": "miss", "bytes": 249, "ts": 1794421520.616943, "startup_s": 1794421520.0}
+{"campaign": 3, "idx": 4, "mode": "cold", "endpoint": "summary", "ms": 4.375701013486832, "status": 200, "cache": "miss", "bytes": 249, "ts": 1794421520.832718, "startup_s": 1794421521.0}

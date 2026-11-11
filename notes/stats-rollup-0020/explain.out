@@ -1,0 +1,155 @@
+=== A. /auth/me/summary 三档（UserDayTotals，改造后）===
+                                                              QUERY PLAN                                                              
+--------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=38.91..38.92 rows=1 width=160) (actual time=0.059..0.065 rows=1 loops=1)
+   Buffers: shared hit=7
+   ->  Bitmap Heap Scan on user_daily_stats  (cost=4.43..38.63 rows=11 width=28) (actual time=0.040..0.044 rows=11 loops=1)
+         Recheck Cond: ((user_id = 900000000) AND (day >= '2026-11-01'::date) AND (day <= '2026-11-12'::date))
+         Heap Blocks: exact=2
+         Buffers: shared hit=7
+         ->  Bitmap Index Scan on user_daily_stats_pkey  (cost=0.00..4.42 rows=11 width=0) (actual time=0.026..0.026 rows=11 loops=1)
+               Index Cond: ((user_id = 900000000) AND (day >= '2026-11-01'::date) AND (day <= '2026-11-12'::date))
+               Buffers: shared hit=5
+ Planning:
+   Buffers: shared hit=146
+ Planning Time: 0.682 ms
+ Execution Time: 0.173 ms
+(13 rows)
+
+=== B. 同一份数据用旧写法（改造前 handler 的三次明细扫描，只取本月一段代表）===
+                                                                                                            QUERY PLAN                                                                                                            
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Finalize Aggregate  (cost=1919182.02..1919182.03 rows=1 width=32) (actual time=2439.841..2462.527 rows=1 loops=1)
+   Buffers: shared hit=2045 read=1664615
+   ->  Gather  (cost=1919181.79..1919182.00 rows=2 width=32) (actual time=2439.377..2462.491 rows=3 loops=1)
+         Workers Planned: 2
+         Workers Launched: 2
+         Buffers: shared hit=2045 read=1664615
+         ->  Partial Aggregate  (cost=1918181.79..1918181.80 rows=1 width=32) (actual time=2421.837..2421.838 rows=1 loops=3)
+               Buffers: shared hit=2045 read=1664615
+               ->  Parallel Seq Scan on billing_records  (cost=0.00..1916659.47 rows=608930 width=6) (actual time=230.678..2373.739 rows=487200 loops=3)
+                     Filter: ((call_time >= '2026-10-31 16:00:00+00'::timestamp with time zone) AND (call_time <= '2026-11-12 15:59:59+00'::timestamp with time zone) AND (user_id = 900000000) AND (status = 'completed'::text))
+                     Rows Removed by Filter: 9512800
+                     Buffers: shared hit=2045 read=1664615
+ Planning:
+   Buffers: shared hit=181
+ Planning Time: 0.613 ms
+ JIT:
+   Functions: 17
+   Options: Inlining true, Optimization true, Expressions true, Deforming true
+   Timing: Generation 2.377 ms (Deform 1.499 ms), Inlining 245.990 ms, Optimization 263.587 ms, Emission 147.524 ms, Total 659.478 ms
+ Execution Time: 2482.896 ms
+(20 rows)
+
+=== C. cost/stats（改造后：30 天窗口 + 实体列）===
+                                                                                                                                                                                                                            QUERY PLAN                                                                                                                                                                                                                             
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Sort  (cost=101967284.44..101968184.44 rows=360000 width=352) (actual time=75015.503..75015.517 rows=3 loops=1)
+   Sort Key: (COALESCE(sum(b.cost_credits), '0'::numeric)) DESC NULLS LAST, (CASE WHEN (r.cm_id IS NOT NULL) THEN ('cm:'::text || (r.cm_id)::text) WHEN (b.internal_model_id <> ''::text) THEN ((((('name:'::text || b.external_model_name) || '#'::text) || b.internal_model_id) || '@'::text) || (COALESCE(k.channel_id, '0'::bigint))::text) ELSE ((('name:'::text || b.external_model_name) || '@'::text) || (COALESCE(k.channel_id, '0'::bigint))::text) END)
+   Sort Method: quicksort  Memory: 25kB
+   Buffers: shared hit=1765707 read=8243532 written=2956, temp read=535731 written=536165
+   ->  GroupAggregate  (cost=101408460.17..101818392.69 rows=360000 width=352) (actual time=71046.442..75015.431 rows=3 loops=1)
+         Group Key: (CASE WHEN (r.cm_id IS NOT NULL) THEN ('cm:'::text || (r.cm_id)::text) WHEN (b.internal_model_id <> ''::text) THEN ((((('name:'::text || b.external_model_name) || '#'::text) || b.internal_model_id) || '@'::text) || (COALESCE(k.channel_id, '0'::bigint))::text) ELSE ((('name:'::text || b.external_model_name) || '@'::text) || (COALESCE(k.channel_id, '0'::bigint))::text) END)
+         Buffers: shared hit=1765701 read=8243532 written=2956, temp read=535731 written=536165
+         ->  Sort  (cost=101408460.17..101434049.00 rows=10235534 width=184) (actual time=68997.189..70985.871 rows=10000591 loops=1)
+               Sort Key: (CASE WHEN (r.cm_id IS NOT NULL) THEN ('cm:'::text || (r.cm_id)::text) WHEN (b.internal_model_id <> ''::text) THEN ((((('name:'::text || b.external_model_name) || '#'::text) || b.internal_model_id) || '@'::text) || (COALESCE(k.channel_id, '0'::bigint))::text) ELSE ((('name:'::text || b.external_model_name) || '@'::text) || (COALESCE(k.channel_id, '0'::bigint))::text) END), b.external_model_name
+               Sort Method: external merge  Disk: 1428632kB
+               Buffers: shared hit=1765701 read=8243532 written=2956, temp read=535731 written=536165
+               ->  Hash Left Join  (cost=68.92..97487868.01 rows=10235534 width=184) (actual time=846.459..53005.098 rows=10000591 loops=1)
+                     Hash Cond: (r.external_model_id = em.id)
+                     Buffers: shared hit=1765701 read=8243532 written=2956
+                     ->  Hash Left Join  (cost=51.72..97051205.33 rows=10235534 width=120) (actual time=846.431..49813.496 rows=10000591 loops=1)
+                           Hash Cond: (k.channel_id = c.id)
+                           Buffers: shared hit=1765700 read=8243532 written=2956
+                           ->  Hash Left Join  (cost=35.64..97023899.24 rows=10235534 width=88) (actual time=846.412..47534.665 rows=10000591 loops=1)
+                                 Hash Cond: ((k.channel_id = r.channel_id) AND (b.internal_model_id = r.internal_model_id))
+                                 Buffers: shared hit=1765699 read=8243532 written=2956
+                                 ->  Nested Loop Left Join  (cost=8.24..96970132.15 rows=10235534 width=72) (actual time=846.307..44116.275 rows=10000591 loops=1)
+                                       Buffers: shared hit=1765690 read=8243532 written=2956
+                                       ->  Index Scan using idx_billing_status_time on billing_records b  (cost=8.08..96714598.22 rows=10235534 width=72) (actual time=846.220..38402.836 rows=10000591 loops=1)
+                                             Index Cond: ((status = 'completed'::text) AND (call_time >= '2026-10-12 16:00:00+00'::timestamp with time zone) AND (call_time <= '2026-11-12 15:59:59+00'::timestamp with time zone))
+                                             Filter: ((pricing_mode <> 'cost'::text) OR (token_id IS NULL) OR (NOT (ANY (token_id = (hashed SubPlan 1).col1))) OR (ANY (billing_id = (hashed SubPlan 3).col1)))
+                                             Buffers: shared hit=1765685 read=8243531 written=2956
+                                             SubPlan 1
+                                               ->  Hash Join  (cost=4.25..7.51 rows=1 width=8) (never executed)
+                                                     Hash Cond: (t.user_id = u.id)
+                                                     Join Filter: (u.is_system OR (t.display_name = 'system-probe'::text))
+                                                     ->  Seq Scan on tokens t  (cost=0.00..3.00 rows=100 width=30) (never executed)
+                                                     ->  Hash  (cost=3.00..3.00 rows=100 width=9) (never executed)
+                                                           ->  Seq Scan on users u  (cost=0.00..3.00 rows=100 width=9) (never executed)
+                                             SubPlan 3
+                                               ->  Seq Scan on call_logs cl  (cost=0.00..11.40 rows=140 width=32) (never executed)
+                                       ->  Memoize  (cost=0.16..4.58 rows=1 width=16) (actual time=0.000..0.000 rows=1 loops=10000591)
+                                             Cache Key: b.channel_key_id
+                                             Cache Mode: logical
+                                             Hits: 10000588  Misses: 3  Evictions: 0  Overflows: 0  Memory Usage: 1kB
+                                             Buffers: shared hit=5 read=1
+                                             ->  Index Scan using channel_keys_pkey on channel_keys k  (cost=0.15..4.57 rows=1 width=16) (actual time=0.021..0.021 rows=1 loops=3)
+                                                   Index Cond: (id = b.channel_key_id)
+                                                   Buffers: shared hit=5 read=1
+                                 ->  Hash  (cost=24.41..24.41 rows=200 width=56) (actual time=0.087..0.090 rows=3 loops=1)
+                                       Buckets: 1024  Batches: 1  Memory Usage: 9kB
+                                       Buffers: shared hit=9
+                                       ->  Subquery Scan on r  (cost=20.76..24.41 rows=200 width=56) (actual time=0.077..0.082 rows=3 loops=1)
+                                             Buffers: shared hit=9
+                                             ->  Unique  (cost=20.76..22.41 rows=200 width=57) (actual time=0.074..0.079 rows=3 loops=1)
+                                                   Buffers: shared hit=9
+                                                   ->  Sort  (cost=20.76..21.31 rows=220 width=57) (actual time=0.074..0.075 rows=3 loops=1)
+                                                         Sort Key: cm.channel_id, cm.internal_model_id, ((cm.deleted_at IS NULL)) DESC, cm.id DESC
+                                                         Sort Method: quicksort  Memory: 25kB
+                                                         Buffers: shared hit=9
+                                                         ->  Seq Scan on channel_models cm  (cost=0.00..12.20 rows=220 width=57) (actual time=0.020..0.021 rows=3 loops=1)
+                                                               Buffers: shared hit=1
+                           ->  Hash  (cost=12.70..12.70 rows=270 width=40) (actual time=0.010..0.011 rows=3 loops=1)
+                                 Buckets: 1024  Batches: 1  Memory Usage: 9kB
+                                 Buffers: shared hit=1
+                                 ->  Seq Scan on channels c  (cost=0.00..12.70 rows=270 width=40) (actual time=0.007..0.008 rows=3 loops=1)
+                                       Buffers: shared hit=1
+                     ->  Hash  (cost=13.20..13.20 rows=320 width=40) (actual time=0.009..0.010 rows=3 loops=1)
+                           Buckets: 1024  Batches: 1  Memory Usage: 9kB
+                           Buffers: shared hit=1
+                           ->  Seq Scan on external_models em  (cost=0.00..13.20 rows=320 width=40) (actual time=0.006..0.007 rows=3 loops=1)
+                                 Buffers: shared hit=1
+ Planning:
+   Buffers: shared hit=600 read=10
+ Planning Time: 3.080 ms
+ JIT:
+   Functions: 78
+   Options: Inlining true, Optimization true, Expressions true, Deforming true
+   Timing: Generation 5.120 ms (Deform 2.436 ms), Inlining 37.032 ms, Optimization 496.932 ms, Emission 312.256 ms, Total 851.340 ms
+ Execution Time: 75462.817 ms
+(74 rows)
+
+=== D. cost/stats 旧写法（改造前：无时间窗 + 每行 3 次 JSONB 正则，取计划不 ANALYZE 以免跑几分钟）===
+                                                                                                                                                                                                                            QUERY PLAN                                                                                                                                                                                                                             
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Sort  (cost=5856029.81..5856929.81 rows=360000 width=168)
+   Sort Key: (COALESCE(sum(b.cost_credits), '0'::numeric)) DESC NULLS LAST, (CASE WHEN (r.cm_id IS NOT NULL) THEN ('cm:'::text || (r.cm_id)::text) WHEN (b.internal_model_id <> ''::text) THEN ((((('name:'::text || b.external_model_name) || '#'::text) || b.internal_model_id) || '@'::text) || (COALESCE(k.channel_id, '0'::bigint))::text) ELSE ((('name:'::text || b.external_model_name) || '@'::text) || (COALESCE(k.channel_id, '0'::bigint))::text) END)
+   ->  Finalize GroupAggregate  (cost=5640134.20..5763740.07 rows=360000 width=168)
+         Group Key: (CASE WHEN (r.cm_id IS NOT NULL) THEN ('cm:'::text || (r.cm_id)::text) WHEN (b.internal_model_id <> ''::text) THEN ((((('name:'::text || b.external_model_name) || '#'::text) || b.internal_model_id) || '@'::text) || (COALESCE(k.channel_id, '0'::bigint))::text) ELSE ((('name:'::text || b.external_model_name) || '@'::text) || (COALESCE(k.channel_id, '0'::bigint))::text) END)
+         ->  Gather Merge  (cost=5640134.20..5724140.07 rows=720000 width=168)
+               Workers Planned: 2
+               ->  Sort  (cost=5639134.18..5640034.18 rows=360000 width=168)
+                     Sort Key: (CASE WHEN (r.cm_id IS NOT NULL) THEN ('cm:'::text || (r.cm_id)::text) WHEN (b.internal_model_id <> ''::text) THEN ((((('name:'::text || b.external_model_name) || '#'::text) || b.internal_model_id) || '@'::text) || (COALESCE(k.channel_id, '0'::bigint))::text) ELSE ((('name:'::text || b.external_model_name) || '@'::text) || (COALESCE(k.channel_id, '0'::bigint))::text) END)
+                     ->  Partial HashAggregate  (cost=5085792.26..5546844.43 rows=360000 width=168)
+                           Group Key: CASE WHEN (r.cm_id IS NOT NULL) THEN ('cm:'::text || (r.cm_id)::text) WHEN (b.internal_model_id <> ''::text) THEN ((((('name:'::text || b.external_model_name) || '#'::text) || b.internal_model_id) || '@'::text) || (COALESCE(k.channel_id, '0'::bigint))::text) ELSE ((('name:'::text || b.external_model_name) || '@'::text) || (COALESCE(k.channel_id, '0'::bigint))::text) END
+                           Planned Partitions: 32
+                           ->  Hash Left Join  (cost=46.63..2421735.51 rows=12499973 width=116)
+                                 Hash Cond: ((k.channel_id = r.channel_id) AND (b.internal_model_id = r.internal_model_id))
+                                 ->  Hash Left Join  (cost=19.23..1856080.50 rows=12499973 width=118)
+                                       Hash Cond: (b.channel_key_id = k.id)
+                                       ->  Parallel Seq Scan on billing_records b  (cost=0.00..1822909.67 rows=12499973 width=118)
+                                             Filter: (status = 'completed'::text)
+                                       ->  Hash  (cost=14.10..14.10 rows=410 width=16)
+                                             ->  Seq Scan on channel_keys k  (cost=0.00..14.10 rows=410 width=16)
+                                 ->  Hash  (cost=24.41..24.41 rows=200 width=56)
+                                       ->  Subquery Scan on r  (cost=20.76..24.41 rows=200 width=56)
+                                             ->  Unique  (cost=20.76..22.41 rows=200 width=57)
+                                                   ->  Sort  (cost=20.76..21.31 rows=220 width=57)
+                                                         Sort Key: cm.channel_id, cm.internal_model_id, ((cm.deleted_at IS NULL)) DESC, cm.id DESC
+                                                         ->  Seq Scan on channel_models cm  (cost=0.00..12.20 rows=220 width=57)
+ JIT:
+   Functions: 31
+   Options: Inlining true, Optimization true, Expressions true, Deforming true
+(28 rows)
+

@@ -1,0 +1,15 @@
+{"campaign": 1, "idx": 0, "mode": "hot", "endpoint": "summary", "ms": 1.7756849993020296, "status": 200, "cache": "hit", "bytes": 249, "ts": 1794421521.1691828}
+{"campaign": 1, "idx": 1, "mode": "hot", "endpoint": "summary", "ms": 1.559749012812972, "status": 200, "cache": "hit", "bytes": 249, "ts": 1794421521.1707983}
+{"campaign": 1, "idx": 2, "mode": "hot", "endpoint": "summary", "ms": 1.6452110139653087, "status": 200, "cache": "hit", "bytes": 249, "ts": 1794421521.1724885}
+{"campaign": 1, "idx": 3, "mode": "hot", "endpoint": "summary", "ms": 1.0084859968628734, "status": 200, "cache": "hit", "bytes": 249, "ts": 1794421521.1735358}
+{"campaign": 1, "idx": 4, "mode": "hot", "endpoint": "summary", "ms": 1.0973369935527444, "status": 200, "cache": "hit", "bytes": 249, "ts": 1794421521.1746593}
+{"campaign": 2, "idx": 0, "mode": "hot", "endpoint": "summary", "ms": 1.1484090064186603, "status": 200, "cache": "hit", "bytes": 249, "ts": 1794421521.4826033}
+{"campaign": 2, "idx": 1, "mode": "hot", "endpoint": "summary", "ms": 1.1133080115541816, "status": 200, "cache": "hit", "bytes": 249, "ts": 1794421521.4837449}
+{"campaign": 2, "idx": 2, "mode": "hot", "endpoint": "summary", "ms": 1.3684850127901882, "status": 200, "cache": "hit", "bytes": 249, "ts": 1794421521.4851403}
+{"campaign": 2, "idx": 3, "mode": "hot", "endpoint": "summary", "ms": 1.6578619834035635, "status": 200, "cache": "hit", "bytes": 249, "ts": 1794421521.4868395}
+{"campaign": 2, "idx": 4, "mode": "hot", "endpoint": "summary", "ms": 1.6018500027712435, "status": 200, "cache": "hit", "bytes": 249, "ts": 1794421521.4884846}
+{"campaign": 3, "idx": 0, "mode": "hot", "endpoint": "summary", "ms": 1.424705988029018, "status": 200, "cache": "hit", "bytes": 249, "ts": 1794421521.8219626}
+{"campaign": 3, "idx": 1, "mode": "hot", "endpoint": "summary", "ms": 1.1526589805725962, "status": 200, "cache": "hit", "bytes": 249, "ts": 1794421521.8231487}
+{"campaign": 3, "idx": 2, "mode": "hot", "endpoint": "summary", "ms": 0.9439740097150207, "status": 200, "cache": "hit", "bytes": 249, "ts": 1794421521.8241236}
+{"campaign": 3, "idx": 3, "mode": "hot", "endpoint": "summary", "ms": 0.8947220048867166, "status": 200, "cache": "hit", "bytes": 249, "ts": 1794421521.8250442}
+{"campaign": 3, "idx": 4, "mode": "hot", "endpoint": "summary", "ms": 1.1370379943400621, "status": 200, "cache": "hit", "bytes": 249, "ts": 1794421521.8262072}

@@ -151,6 +151,18 @@ func main() {
 		return
 	}
 
+	// 统计改造（0020）的一次性历史回填：三段 token 实体列 + 日级预聚合。
+	// 幂等 + 断点续跑（重跑只补没做完的批），已完成则直接跳过；
+	// 失败不阻止启动——结算路径的实时累加照常工作，只是历史日的看板会缺数。
+	if rep, berr := db.BackfillStats(ctx, d, db.StatsBackfillOptions{Logger: slog.Default()}); berr != nil {
+		slog.Error("stats backfill failed（看板历史日可能缺数，可重跑 scripts/backfill-daily-stats 补齐）",
+			"error", berr)
+	} else if !rep.Skipped {
+		slog.Info("stats backfill done",
+			"token_rows", rep.TokenRows, "days", rep.Days,
+			"elapsed_ms", rep.Duration.Milliseconds())
+	}
+
 	if err := seeding.Seed(ctx, d); err != nil {
 		slog.Error("seed", "error", err)
 		os.Exit(1)
