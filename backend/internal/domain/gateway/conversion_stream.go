@@ -366,6 +366,11 @@ func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Respon
 		return usage, rawUsageJSON(upstreamProto, rawParts), asm(),
 			&UsageMissingError{Reason: usageMissingReasonOf(end, sawError), Detail: errorFrame}
 	}
+	if sawError {
+		// usage 齐备但上游已下发 error 帧：内容层失败必须留痕（计费仍按上游实际 usage）。
+		return usage, rawUsageJSON(upstreamProto, rawParts), asm(),
+			&UpstreamErrorFrameError{Detail: errorFrame}
+	}
 	return usage, rawUsageJSON(upstreamProto, rawParts), asm(), nil
 }
 

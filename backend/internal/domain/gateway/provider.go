@@ -128,6 +128,33 @@ func usageMissingReason(err error) string {
 	return ""
 }
 
+// ErrUpstreamErrorFrame 表示「上游在流内下发了 error 帧」，但整条流仍带回了 usage。
+//
+// 为什么必须与 ErrUsageMissing 分开：这类流的 usage 是齐备的，计费按上游实际用量结算，
+// 不能走「usage 缺失 → 按可见内容估算」那条路（计费口径不许变）。但**内容层确实失败了**——
+// 上游用 error 帧明确宣告本次生成失败，若因为「顺手还给了 usage」就整条记 completed，
+// 这次失败在调用日志/账单上完全消失（Gate 独立验收在 main 上复现的既有缺陷）。
+//
+// 与 UsageMissingError 的另一个区别是它**不携带** usage 缺失语义：
+// errors.Is(err, ErrUsageMissing) 为 false，handler 据此把它与 usage 缺失分支彻底分开。
+var ErrUpstreamErrorFrame = errors.New("upstream stream error frame")
+
+// UpstreamErrorFrameError 携带上游 error 帧摘要（可能为空串：空 error 负载 {"error":{}}）。
+type UpstreamErrorFrameError struct {
+	Detail string
+}
+
+// Error 实现 error。
+func (e *UpstreamErrorFrameError) Error() string {
+	if e.Detail != "" {
+		return "upstream stream error frame: " + e.Detail
+	}
+	return "upstream stream error frame"
+}
+
+// Unwrap 使 errors.Is(err, ErrUpstreamErrorFrame) 成立。
+func (e *UpstreamErrorFrameError) Unwrap() error { return ErrUpstreamErrorFrame }
+
 // usageMissingPunishable 判断 usage 缺失是否应计入渠道健康失败：
 // 仅「流被截断 / 只有结束标记没有内容收尾证据 / 流内 error / 无法区分」计入；
 // 「协议正常收尾但无 usage」（上游忽略 include_usage）与客户端断开不惩罚（后者由调用方先行判定）。
@@ -138,6 +165,23 @@ func usageMissingPunishable(reason string) bool {
 	default:
 		return true
 	}
+}
+
+// upstreamErrorFrameDetail 返回错误里携带的上游 error 帧摘要（无则空串）。
+// 两种来源都覆盖：usage 缺失（UsageMissingError.Detail）与 usage 齐备（UpstreamErrorFrameError.Detail）——
+// 前者是「error 帧导致流没有 usage」，后者是「error 帧但 usage 照给」，对运营是同一件事：
+// 上游到底报了什么。调用日志的 error_message 必须把它带出来，否则按 request_id 只能看到
+// 「上游流式响应中断」这种不含原因的结论。
+func upstreamErrorFrameDetail(err error) string {
+	var ue *UsageMissingError
+	if errors.As(err, &ue) {
+		return ue.Detail
+	}
+	var fe *UpstreamErrorFrameError
+	if errors.As(err, &fe) {
+		return fe.Detail
+	}
+	return ""
 }
 
 // streamEnd 汇总判断「流是否正常结束」的两类独立证据，供 usage 缺失归因交叉验证。
