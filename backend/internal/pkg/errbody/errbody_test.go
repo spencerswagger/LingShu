@@ -42,12 +42,19 @@ func TestMaskSecrets_BearerPrefixKept(t *testing.T) {
 	}
 }
 
-// 过短的值不参与遮蔽：真实凭据远长于此，而 3~7 字符的「凭据」（本地测试用）
-// 在正常文本里极易是无意义子串，遮蔽它会把原文打成筛子。
-func TestMaskSecrets_ShortValuesIgnored(t *testing.T) {
-	body := "key=abc and more abc"
-	if got := MaskSecrets(body, "abc"); got != body {
-		t.Fatalf("过短值不应参与遮蔽: %q", got)
+// 短凭据也必须遮蔽：值已知就不该按长度猜「像不像凭据」（`abc1234` 这类短密钥原样漏出去过）。
+func TestMaskSecrets_ShortValuesMasked(t *testing.T) {
+	body := "auth=abc1234 and again abc1234 for k-7"
+	got := MaskSecrets(body, "abc1234", "k-7")
+	if strings.Contains(got, "abc1234") || strings.Contains(got, "k-7") {
+		t.Fatalf("短凭据必须被遮蔽: %q", got)
+	}
+	if want := "auth=*** and again *** for ***"; got != want {
+		t.Fatalf("want %q, got %q", want, got)
+	}
+	// 空值/纯空白跳过：否则空串替换会把整段文本打空。
+	if got := MaskSecrets(body, "", "   "); got != body {
+		t.Fatalf("空凭据不应参与替换: %q", got)
 	}
 }
 

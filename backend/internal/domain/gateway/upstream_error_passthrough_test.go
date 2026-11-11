@@ -973,3 +973,113 @@ func TestServeUpstreamError_PolicyOverrideKeepsRealUpstreamStatus(t *testing.T) 
 		t.Fatalf("策略覆盖后错误体仍应是上游原文, got %q", msg)
 	}
 }
+
+// TestOperatorView_GBKBodyStaysWithinLimit 上游回 GBK 错误页（任意字节）时的落库体积守卫：
+// 非法字节会被替换成 3 字节的 U+FFFD，若「先判上限、后做替换」，32KB 的原文会落地成约 96KB，
+// 「32KB 上限」就名不副实（实测 32000 B → 96085 B）。正确顺序是「先整理、再判长度/截断」。
+func TestOperatorView_GBKBodyStaysWithinLimit(t *testing.T) {
+	raw := strings.Repeat("\xd6\xd0", 16000) // 32000 字节的 GBK「中」，整体非法 UTF-8
+	view := upstreamErrBody{Raw: raw}.operatorView(harnessCredential)
+	t.Logf("原文 %d 字节 → 落库文本 %d 字节（上限 %d）", len(raw), len(view), callLogErrBodyMaxBytes)
+	if len(view) > callLogErrBodyMaxBytes {
+		t.Fatalf("落库文本必须 ≤ %d 字节，got %d（非法字节让上限失效了）", callLogErrBodyMaxBytes, len(view))
+	}
+	if !utf8.ValidString(view) {
+		t.Fatalf("落库文本必须是合法 UTF-8: %q", head(view, 80))
+	}
+	if !strings.Contains(view, "已截断") || !strings.Contains(view, "已替换") {
+		t.Fatalf("截断与非法字节替换都必须同字段标注: %q", tail(view, 160))
+	}
+	// 标注里的「共 N 字节」报的是**遮蔽前**的上游原文长度（与对外口径一致）。
+	if !strings.Contains(view, fmt.Sprintf("共 %d 字节", len(raw))) {
+		t.Fatalf("标注必须给原始字节数 %d，got %q", len(raw), tail(view, 160))
+	}
+}
+
+// errAfterReadCloser 先返回 n 字节，再返回读错误（模拟上游写到一半断连）。
+type errAfterReadCloser struct {
+	data []byte
+	err  error
+	done bool
+}
+
+func (r *errAfterReadCloser) Read(p []byte) (int, error) {
+	if r.done {
+		return 0, r.err
+	}
+	r.done = true
+	n := copy(p, r.data)
+	return n, nil
+}
+
+func (r *errAfterReadCloser) Close() error { return nil }
+
+// TestReadUpstreamErrBody_InterruptedKeepsPrefix 读取中断不能把已读到的内容丢掉：
+// 丢掉就等于告诉运营「上游没返回内容」，恰好掩盖了上游真实回了什么。
+func TestReadUpstreamErrBody_InterruptedKeepsPrefix(t *testing.T) {
+	prefix := randbody.Text(rand.New(rand.NewSource(time.Now().UnixNano())), 40, 120)
+	body := readUpstreamErrBody(&http.Response{Body: &errAfterReadCloser{
+		data: []byte(prefix), err: errors.New("unexpected EOF"),
+	}})
+	if !body.ReadInterrupted {
+		t.Fatal("应标记读取中断")
+	}
+	if !strings.HasPrefix(body.Raw, prefix) {
+		t.Fatalf("已读前缀必须保留: want 前缀=%q got=%q", head(prefix, 60), head(body.Raw, 60))
+	}
+	view := body.operatorView(harnessCredential)
+	if !strings.Contains(view, "读取中断") || !strings.HasPrefix(view, prefix) {
+		t.Fatalf("运营视图必须保留前缀并标注读取中断: %q", head(view, 200))
+	}
+}
+
+// TestUpstreamErrorPayload_KeepsSurroundingWhitespace 非 JSON 原文的首尾空白也属原文，
+// 对外透传不得 TrimSpace（只把「全空白」当空体）。
+func TestUpstreamErrorPayload_KeepsSurroundingWhitespace(t *testing.T) {
+	raw := "\n\n  upstream said: " + "boom" + "  \t\n"
+	payload, ok := upstreamErrorPayload(http.StatusBadRequest, http.StatusBadRequest, raw, "rid").(upstreamErrorEnvelope)
+	if !ok {
+		t.Fatalf("非 JSON 应走网关错误壳, got %T", payload)
+	}
+	if payload.Error.Message != raw {
+		t.Fatalf("首尾空白必须原样保留\nwant=%q\ngot =%q", raw, payload.Error.Message)
+	}
+	// 全空白仍按空体处理（不能把空白当内容透出）。
+	empty, _ := upstreamErrorPayload(http.StatusBadRequest, http.StatusBadRequest, " \n\t ", "rid").(upstreamErrorEnvelope)
+	if !strings.Contains(empty.Error.Message, "响应体为空") {
+		t.Fatalf("全空白应视作空体, got %q", empty.Error.Message)
+	}
+}
+
+// TestServeUpstreamError_ShortCredentialStillMasked 短凭据同样必须遮蔽：
+// 值已知就不该按长度猜「像不像凭据」（历史实现设了 8 字符门槛，`abc1234` 这类会原样漏给下游与账单）。
+func TestServeUpstreamError_ShortCredentialStillMasked(t *testing.T) {
+	const shortCred = "abc1234" // 7 字符，低于历史门槛
+	body := `{"error":{"message":"invalid key ` + shortCred + `","type":"invalid_request_error"}}`
+
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(body))
+	}))
+	defer up.Close()
+
+	h := build(t, up.URL)
+	// 把该候选的凭据换成短凭据（其余装配不变）。
+	h.chans.keys[1].CredentialPlain = shortCred
+
+	rec := doRequestWithID(t, h.gw, "/v1/chat/completions", "sk-gw-t", streamFlagged(false), "req-short")
+	if strings.Contains(rec.Body.String(), shortCred) {
+		t.Fatalf("对外响应泄漏短凭据: %s", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "***") {
+		t.Fatalf("短凭据位置应替换成 ***: %s", rec.Body.String())
+	}
+	cl := h.clogs.inserted[0]
+	if strings.Contains(cl.RespBody, shortCred) || strings.Contains(cl.ErrorMessage, shortCred) {
+		t.Fatalf("运营落库泄漏短凭据: resp=%q err=%q", head(cl.RespBody, 120), head(cl.ErrorMessage, 120))
+	}
+	if want := strings.ReplaceAll(body, shortCred, "***"); cl.RespBody != want {
+		t.Fatalf("除短凭据外仍要逐字节保真\nwant=%q\ngot =%q", want, cl.RespBody)
+	}
+}

@@ -137,12 +137,17 @@ type probeExchange struct {
 // readProbeErrBody 读取上游错误响应体并转成运营可见原文：
 // 只遮蔽**本次实际使用的凭据**（精确子串），其余字节（含 <>&、中文、request-id、模型名）原样保留；
 // 超 probeErrBodyMaxBytes 时按 UTF-8 边界截断，标注与被截原文写在同一个字段。
+//
+// 顺序：遮蔽 → 整理成合法 UTF-8 → **再**判长度/截断。反过来的话，非法字节（GBK 错误页）
+// 在落库时每字节膨胀成 3 字节 U+FFFD，32KB 上限就形同虚设（实测 32000 B 存成约 96KB）。
 func readProbeErrBody(resp *http.Response, cred string) string {
 	if resp == nil || resp.Body == nil {
 		return ""
 	}
+	// 读取中断时 io.ReadAll 仍会返回已读到的前缀：保留它并标注，比丢弃后显示「没有原文」有用。
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, probeErrReadBytes+1))
-	if err != nil {
+	interrupted := err != nil
+	if interrupted && len(raw) == 0 {
 		return ""
 	}
 	readTruncated := len(raw) > probeErrReadBytes
@@ -150,31 +155,43 @@ func readProbeErrBody(resp *http.Response, cred string) string {
 		raw = raw[:probeErrReadBytes]
 	}
 	// 不 TrimSpace：首尾空白也算上游原文（只把「全是空白」当空体），否则「原文」就不是原文了。
+	origLen := len(raw)
 	s := errbody.MaskSecrets(string(raw), cred)
 	if strings.TrimSpace(s) == "" {
 		return ""
 	}
-	if len(s) <= probeErrBodyMaxBytes && !readTruncated {
-		return probeStorable(s, readTruncated)
+	text, replaced := errbody.ToValidText(s)
+	var suffix string
+	if readTruncated || len(text) > probeErrBodyMaxBytes {
+		suffix += storeTruncNoteLocal(origLen, readTruncated, replaced)
 	}
-	note := fmt.Sprintf("\n…（已截断：上游原文共 %d 字节，此处只保留前 %d 字节）", len(s), probeErrBodyMaxBytes)
-	if readTruncated {
-		note = fmt.Sprintf("\n…（已截断：上游原文超过读取上限 %d 字节，此处只保留前 %d 字节）",
-			probeErrReadBytes, probeErrBodyMaxBytes)
+	if interrupted {
+		suffix += fmt.Sprintf("\n…（读取中断：上游响应体只读到前 %d 字节）", len(text))
 	}
-	out, _ := errbody.TruncateUTF8(s, probeErrBodyMaxBytes, note)
-	return probeStorable(out, readTruncated)
+	if replaced {
+		suffix += "\n…（原文含非法 UTF-8 字节或 0x00，已替换为 �/<0x00> 以便落库）"
+	}
+	if suffix == "" {
+		return text
+	}
+	if len(text)+len(suffix) <= probeErrBodyMaxBytes {
+		return text + suffix
+	}
+	out, _ := errbody.TruncateUTF8(text, probeErrBodyMaxBytes, suffix)
+	return out
 }
 
-// probeStorable 把待落库的原文整理成 PG text 能接受的合法 UTF-8（非法字节 → U+FFFD、NUL → <0x00>）。
-// 上游错误页可能是任意字节（GBK/截断的多字节/0x00），原样写库会让这一行 probe_logs 直接 INSERT 失败，
-// 于是「探活失败的原因」彻底不可见——正是本任务要消灭的盲区。
-func probeStorable(s string, readTruncated bool) string {
-	out, changed := errbody.ToValidText(s)
-	if !changed || readTruncated {
-		return out
+// storeTruncNoteLocal 探活侧的截断标注（数字取**遮蔽前**的上游原文长度，与账单侧同口径）。
+func storeTruncNoteLocal(origLen int, readTruncated, replaced bool) string {
+	if readTruncated {
+		return fmt.Sprintf("\n…（已截断：上游原文超过读取上限 %d 字节，此处只保留前 %d 字节）",
+			probeErrReadBytes, probeErrBodyMaxBytes)
 	}
-	return out + "\n…（原文含非法 UTF-8 字节或 0x00，已替换为 �/<0x00> 以便落库）"
+	if replaced {
+		return fmt.Sprintf("\n…（已截断：上游原文共 %d 字节，其中非法字节替换为 � 后超出 %d 字节上限，"+
+			"此处只保留替换后文本的前 %d 字节）", origLen, probeErrBodyMaxBytes, probeErrBodyMaxBytes)
+	}
+	return fmt.Sprintf("\n…（已截断：上游原文共 %d 字节，此处只保留前 %d 字节）", origLen, probeErrBodyMaxBytes)
 }
 
 // nilOr 返回空串兜底。

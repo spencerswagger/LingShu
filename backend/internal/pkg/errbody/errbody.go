@@ -16,14 +16,13 @@ import (
 // MaskToken 是遮蔽后的占位符（与历史日志/落库口径一致，便于检索）。
 const MaskToken = "***"
 
-// minSecretLen 参与遮蔽的凭据最短长度：过短的"凭据"（如本地测试用的 3~7 字符）
-// 在正常文本里极易是无意义子串，遮蔽它反而会把原文打成筛子。真实渠道密钥远长于此。
-const minSecretLen = 8
-
 // MaskSecrets 把 s 里出现的**已知凭据原值**替换成 MaskToken。
 //
 // 规则（刻意做到最窄）：
-//   - 只按精确子串匹配 secrets 里给出的值（长度 ≥ minSecretLen，去空白）；
+//   - 只按精确子串匹配 secrets 里给出的值，**没有最短长度门槛**——只要它是本次实际使用的凭据，
+//     一个字符也要挡住（历史实现设了 8 字符门槛，`abc1234` 这类短密钥会原样漏到下游与账单里；
+//     既然值已知，就不该再按长度猜「像不像凭据」）；
+//   - 去空白后为空的值跳过（空串替换会毁掉整段文本）；
 //   - 不去猜「长得像凭据」的串：没有前缀规则、没有高熵兜底、没有字段白名单；
 //   - "Bearer <cred>" 里的 <cred> 会被替换，前缀 Bearer 原样保留（读起来仍是「用了什么鉴权方式」）。
 //
@@ -36,7 +35,7 @@ func MaskSecrets(s string, secrets ...string) string {
 	ordered := make([]string, 0, len(secrets))
 	for _, sec := range secrets {
 		sec = strings.TrimSpace(sec)
-		if len(sec) >= minSecretLen {
+		if sec != "" {
 			ordered = append(ordered, sec)
 		}
 	}

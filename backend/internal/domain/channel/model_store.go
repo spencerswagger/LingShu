@@ -563,7 +563,8 @@ func capProbeBodies(list []ProbeLog) []ProbeLog {
 		if len(body) <= probeListBodyMaxBytes {
 			continue
 		}
-		note := fmt.Sprintf("\n…（已截断：列表只展示前 %d 字节，完整原文 %d 字节见探测记录落库字段 error_body）",
+		note := fmt.Sprintf("\n…（已截断：列表只展示前 %d 字节，完整原文 %d 字节请调用 "+
+			"GET /api/v1/admin/channels/{id}/probe-logs/{logID} 查看）",
 			probeListBodyMaxBytes, len(body))
 		out, _ := errbody.TruncateUTF8(body, probeListBodyMaxBytes, note)
 		list[i].ErrorBody = out

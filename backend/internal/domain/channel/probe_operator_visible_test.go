@@ -12,10 +12,10 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/team/llmgateway/internal/pkg/crypto"
-	"github.com/team/llmgateway/internal/pkg/errbody"
 	"github.com/team/llmgateway/internal/testutil/randbody"
 )
 
@@ -102,7 +102,12 @@ func randomProbeCases(rnd *rand.Rand) []probeBodyCase {
 // assertProbeBodyVisible 断言运营可见的探活原文与上游原文**逐字节**一致（超长则前缀 + 显式标注）。
 func assertProbeBodyVisible(t *testing.T, what, got, upstream, cred string) {
 	t.Helper()
-	want := errbody.MaskSecrets(upstream, cred)
+	// 期望值用**独立实现**（strings.ReplaceAll）而不是被测的 MaskSecrets：
+	// 拿被测函数造期望只能抓「没遮蔽」，抓不到「遮蔽过头」。
+	want := upstream
+	if cred != "" {
+		want = strings.ReplaceAll(want, cred, "***")
+	}
 	if len(want) <= probeErrBodyMaxBytes {
 		if got != want {
 			t.Fatalf("%s 必须是上游原文（逐字节）\nwant(len=%d)=%q\ngot (len=%d)=%q",
@@ -576,5 +581,73 @@ func TestHandleGetProbeLog_ReturnsFullBody(t *testing.T) {
 	}
 	if got.Data.UpstreamStatus != 400 {
 		t.Fatalf("upstream_status want 400, got %d", got.Data.UpstreamStatus)
+	}
+}
+
+// TestReadProbeErrBody_GBKStaysWithinLimit 探活侧同样：先整理成合法 UTF-8，再判上限/截断。
+// 反过来（先判后整理）会让 GBK 错误页落地膨胀约 3 倍，32KB 上限形同虚设。
+func TestReadProbeErrBody_GBKStaysWithinLimit(t *testing.T) {
+	raw := strings.Repeat("\xd6\xd0", 16000) // 32000 字节非法 UTF-8
+	srv := newProbeBodyServer(t, http.StatusBadRequest, raw)
+
+	mgr, mock := newKeyProbeTestManager(t, srv.URL, HealthProbeConfig{FailThreshold: 2, TimeoutMS: 2000},
+		[]ChannelModel{{ID: 21, InternalModelID: "m1", ExternalModelID: 1, State: StateNormal}})
+	addKeyRuntime(t, mgr, 11, testKeyACred, StateNormal)
+	var stored argString
+	mock.ExpectExec(regexp.QuoteMeta(insertProbeLogSQL)).
+		WithArgs(sqlmock.AnyArg(), int64(11), "m1", "model", srv.URL+"/chat/completions",
+			false, sqlmock.AnyArg(), http.StatusBadRequest, &stored, 0, 0, 0, 0, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	out, err := mgr.ProbeModelNow(1, 21)
+	if err != nil {
+		t.Fatalf("ProbeModelNow: %v", err)
+	}
+	t.Logf("原文 %d 字节 → 探活原文 %d 字节（上限 %d）", len(raw), len(out.ErrorBody), probeErrBodyMaxBytes)
+	if len(out.ErrorBody) > probeErrBodyMaxBytes {
+		t.Fatalf("探活原文必须 ≤ %d 字节，got %d", probeErrBodyMaxBytes, len(out.ErrorBody))
+	}
+	if !utf8.ValidString(out.ErrorBody) {
+		t.Fatalf("必须是合法 UTF-8: %q", headBytes(out.ErrorBody, 80))
+	}
+	if !strings.Contains(out.ErrorBody, "已截断") || !strings.Contains(out.ErrorBody, "已替换") {
+		t.Fatalf("截断与替换都要同字段标注: %q", headBytes(out.ErrorBody, 400))
+	}
+	if !strings.Contains(out.ErrorBody, fmt.Sprintf("共 %d 字节", len(raw))) {
+		t.Fatalf("标注须给原始字节数 %d", len(raw))
+	}
+	if stored.set && len(stored.got) > probeErrBodyMaxBytes {
+		t.Fatalf("落库文本同样必须 ≤ %d 字节，got %d", probeErrBodyMaxBytes, len(stored.got))
+	}
+}
+
+// TestProbeErrorBody_ShortCredentialMasked 短凭据（<8 字符）在探活链路同样必须遮蔽。
+func TestProbeErrorBody_ShortCredentialMasked(t *testing.T) {
+	const shortCred = "k-7"
+	body := `{"error":{"message":"bad key ` + shortCred + `"}}`
+	srv := newProbeBodyServer(t, http.StatusUnauthorized, body)
+
+	mgr, mock := newKeyProbeTestManager(t, srv.URL, HealthProbeConfig{FailThreshold: 2, TimeoutMS: 2000},
+		[]ChannelModel{{ID: 21, InternalModelID: "m1", ExternalModelID: 1, State: StateNormal}})
+	addKeyRuntime(t, mgr, 11, shortCred, StateNormal)
+	expectModelTransition(mock, 1, "m1", StateNormal, StateDisabled, reasonAuthFailure)
+	var stored argString
+	mock.ExpectExec(regexp.QuoteMeta(insertProbeLogSQL)).
+		WithArgs(sqlmock.AnyArg(), int64(11), "m1", "model", srv.URL+"/chat/completions",
+			false, sqlmock.AnyArg(), http.StatusUnauthorized, &stored, 0, 0, 0, 0, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	out, err := mgr.ProbeModelNow(1, 21)
+	if err != nil {
+		t.Fatalf("ProbeModelNow: %v", err)
+	}
+	if strings.Contains(out.ErrorBody, shortCred) {
+		t.Fatalf("探活返回泄漏短凭据: %q", out.ErrorBody)
+	}
+	if want := strings.ReplaceAll(body, shortCred, "***"); out.ErrorBody != want {
+		t.Fatalf("除短凭据外仍要逐字节保真\nwant=%q\ngot =%q", want, out.ErrorBody)
+	}
+	if stored.set && strings.Contains(stored.got, shortCred) {
+		t.Fatalf("probe_logs.error_body 泄漏短凭据: %q", headBytes(stored.got, 120))
 	}
 }

@@ -5,9 +5,11 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,6 +17,7 @@ import (
 
 	"github.com/team/llmgateway/internal/domain/billing"
 	"github.com/team/llmgateway/internal/domain/gateway"
+	"github.com/team/llmgateway/internal/testutil/randbody"
 )
 
 // fakeCallLogStore 内存调用日志读取 fake（console 单测用，满足 callLogReader）。
@@ -268,3 +271,63 @@ ON CONFLICT (billing_id) DO NOTHING`)).
 }
 
 func ptr64(v int64) *int64 { return &v }
+
+// TestAdminHandleListSessionCalls_PreviewBody 会话调用**列表**按预算返回 resp_body 预览：
+// 失败行原文最长 32KB，一个会话上百次失败就是数 MB JSON；列表只给 4KB 预览 + 同字段标注 +
+// RespBodyTruncated，完整原文仍可从该账单的详情接口拿到。
+func TestAdminHandleListSessionCalls_PreviewBody(t *testing.T) {
+	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
+	bigBody := "upstream said: " + randbody.Text(rnd, 30000, 32000)
+	smallBody := "ok"
+
+	db, _, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	admin := NewAdmin(db, billing.NewSqlStore(db), nil, nil)
+	admin.SetCallLogStore(&fakeCallLogStore{bySession: []gateway.CallLog{
+		{BillingID: "bill-big", SessionID: "sess-1", Status: "failed", RespKind: "error", RespBody: bigBody},
+		{BillingID: "bill-small", SessionID: "sess-1", Status: "completed", RespKind: "non_stream", RespBody: smallBody},
+	}})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/sessions/sess-1/calls", nil)
+	req.SetPathValue("session_id", "sess-1")
+	rec := httptest.NewRecorder()
+	admin.HandleListSessionCalls(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(rec.Body.Bytes()) > 32<<10 {
+		t.Fatalf("列表响应必须被收口（got %d 字节）", len(rec.Body.Bytes()))
+	}
+	var got struct {
+		Data struct {
+			List  []CallLogView `json:"List"`
+			Total int           `json:"Total"`
+		} `json:"Data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v (%s)", err, rec.Body.String())
+	}
+	if got.Data.Total != 2 || len(got.Data.List) != 2 {
+		t.Fatalf("want 2 条, got %d/%d", got.Data.Total, len(got.Data.List))
+	}
+	big, small := got.Data.List[0], got.Data.List[1]
+	if len(big.RespBody) > 4<<10 {
+		t.Fatalf("预览必须 ≤4KB，got %d", len(big.RespBody))
+	}
+	if !big.RespBodyTruncated {
+		t.Fatal("截断标记必须置位（前端据此提示去看详情）")
+	}
+	if !strings.Contains(big.RespBody, "已截断") || !strings.Contains(big.RespBody, "详情") {
+		t.Fatalf("预览必须同字段标注并指向详情接口: %q", big.RespBody[max(0, len(big.RespBody)-120):])
+	}
+	if !strings.HasPrefix(bigBody, strings.SplitN(big.RespBody, "\n…（已截断", 2)[0]) {
+		t.Fatal("预览前缀必须与原文逐字节一致")
+	}
+	if small.RespBody != smallBody || small.RespBodyTruncated {
+		t.Fatalf("短原文不得改动: %q truncated=%v", small.RespBody, small.RespBodyTruncated)
+	}
+}

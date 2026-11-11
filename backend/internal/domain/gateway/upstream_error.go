@@ -61,18 +61,25 @@ const (
 	errDetailBodyMaxBytes = 4 << 10
 )
 
-// upstreamErrBody 一次上游错误响应体的两个视图：
-//   - Raw：原样（仅 TrimSpace，≤ upstreamErrReadBytes），供**对外透传**；
-//   - Clean：凭据样式清洗后（见 sanitizeErrSummary），供日志短字段与错误分类；
-//   - ReadTruncated：读取层已到上限（Raw 只是前缀，原始总字节数不可知）。
+// upstreamErrBody 一次上游错误响应体的多个视图：
+//   - Raw：原样（不做 TrimSpace，≤ upstreamErrReadBytes），供**对外透传**；
+//   - Clean：**日志短字段 / 错误分类专用，禁止用于任何面向人的展示**（见其注释）；
+//   - ReadTruncated：读取层已到上限（Raw 只是前缀，原始总字节数不可知）；
+//   - ReadInterrupted：读取中断（连接断了），Raw 是已读到的前缀。
 //
 // 分成多个视图而不是只留一个：对外要「原文原样」，日志短字段要「短且无凭据」，
 // 运营落库要「原文原样但绝不含本次凭据」——三处要求互不相同，混用任何一个都会踩另一条红线。
 // 运营视图见 operatorView（原文 + 精确遮蔽本次凭据 + 上限标注）。
 type upstreamErrBody struct {
-	Raw           string
-	Clean         string
-	ReadTruncated bool
+	Raw string
+	// Clean 是**按样式清洗**后的短文本（前缀/Bearer/KV/高熵长串 → ***），只给结构化日志的
+	// err_param/err_type/err_code/err_summary 与错误分类用。
+	//
+	// 禁止用于任何面向人的展示（账单、探活、对外响应）：它会把 request-id、模型名、
+	// 上游自造 id 一并抹掉，展示出来就不是原文了——展示一律走 operatorView。
+	Clean           string
+	ReadTruncated   bool
+	ReadInterrupted bool
 }
 
 // isEmpty 判定是否读到了内容（空体时两个视图都为空）。
@@ -94,35 +101,56 @@ func (b upstreamErrBody) operatorView(secrets ...string) string {
 	if b.isEmpty() {
 		return ""
 	}
-	masked := errbody.MaskSecrets(b.Raw, secrets...)
-	if len(masked) <= callLogErrBodyMaxBytes && !b.ReadTruncated {
-		return storableText(masked, b.ReadTruncated)
-	}
-	out, _ := errbody.TruncateUTF8(masked, callLogErrBodyMaxBytes, storeTruncNote(len(masked), b.ReadTruncated))
-	return storableText(out, b.ReadTruncated)
+	// 顺序很关键：先遮蔽、再把任意字节整理成合法 UTF-8，**然后**才做长度判定与截断。
+	// 反过来（先判定再整理）会让非法字节在落库时膨胀 3 倍（每个 GBK 字节 → 3 字节 U+FFFD），
+	// 实测 32000 B 的 GBK 报文落地约 96KB，「32KB 上限」名不副实。
+	text, replaced := errbody.ToValidText(errbody.MaskSecrets(b.Raw, secrets...))
+	return capOperatorText(text, replaced, len(b.Raw), b.ReadTruncated, b.ReadInterrupted)
 }
 
-// storableText 把准备落库的原文整理成 PG text 能接受的合法 UTF-8（非法字节 → U+FFFD、NUL → <0x00>）。
-// 真发生过替换时在同字段补一句说明：运营看到 U+FFFD 时不该以为是上游本来就发了这串字符。
-func storableText(s string, readTruncated bool) string {
-	out, changed := errbody.ToValidText(s)
-	if !changed {
-		return out
+// capOperatorText 把（已遮蔽、已整理成合法 UTF-8 的）运营侧文本按上限收口，并把各种「不完整」
+// 的原因写在**同一个字段**里：截断 / 读取上限 / 读取中断 / 非法字节替换。
+//   - origLen 是**遮蔽前**的上游原文长度：标注里的「共 N 字节」与对外的口径一致，
+//     不会因为遮蔽后少了几字节而对不上账；
+//   - suffix 计入字节预算，所以结果永远不会超过 callLogErrBodyMaxBytes。
+func capOperatorText(text string, replaced bool, origLen int, readTruncated, readInterrupted bool) string {
+	var suffix string
+	if readTruncated || len(text) > callLogErrBodyMaxBytes {
+		suffix += storeTruncNote(origLen, readTruncated, replaced)
 	}
-	note := "\n…（原文含非法 UTF-8 字节或 0x00，已替换为 �/<0x00> 以便落库）"
-	if readTruncated {
-		// 读取层已截断时不再追加，避免两条标注叠在一个字段里把原文挤掉。
-		return out
+	if readInterrupted {
+		suffix += fmt.Sprintf("\n…（读取中断：上游响应体只读到前 %d 字节）", len(text))
 	}
-	return out + note
+	if replaced {
+		suffix += illegalByteNote
+	}
+	if suffix == "" {
+		return text
+	}
+	// 放得下就直接拼（TruncateUTF8 只在真的超限时才会拼 suffix，未超限时原样返回——标注会丢）。
+	if len(text)+len(suffix) <= callLogErrBodyMaxBytes {
+		return text + suffix
+	}
+	out, _ := errbody.TruncateUTF8(text, callLogErrBodyMaxBytes, suffix)
+	return out
 }
 
-// storeTruncNote 运营侧截断标注。数字给的是落库原文的字节数，便于判断丢了多少。
+// illegalByteNote 非法字节替换的标注。运营看到 U+FFFD 时不该以为是上游本来就发了这串字符。
+const illegalByteNote = "\n…（原文含非法 UTF-8 字节或 0x00，已替换为 �/<0x00> 以便落库）"
+
+// storeTruncNote 运营侧截断标注。数字给的是**遮蔽前**的上游原文字节数（与对外同口径），
+// 便于判断丢了多少。
 // 读取层就到上限时（ReadTruncated）原始总长度不可知，如实说「超过读取上限」而不是编一个数。
-func storeTruncNote(total int, readTruncated bool) string {
+func storeTruncNote(total int, readTruncated, replaced bool) string {
 	if readTruncated {
 		return fmt.Sprintf("\n…（已截断：上游原文超过读取上限 %d 字节，此处只保留前 %d 字节）",
 			upstreamErrReadBytes, callLogErrBodyMaxBytes)
+	}
+	if replaced {
+		// 非法字节被替换成 3 字节的 U+FFFD 后会「膨胀」，此时的 32KB 是替换后文本的上限：
+		// 说清楚，否则「共 N 字节 / 只保留前 32768」两个数字看着对不上（原文可能只显示了三分之一）。
+		return fmt.Sprintf("\n…（已截断：上游原文共 %d 字节，其中非法字节替换为 � 后超出 %d 字节上限，"+
+			"此处只保留替换后文本的前 %d 字节）", total, callLogErrBodyMaxBytes, callLogErrBodyMaxBytes)
 	}
 	return fmt.Sprintf("\n…（已截断：上游原文共 %d 字节，此处只保留前 %d 字节）", total, callLogErrBodyMaxBytes)
 }
@@ -135,9 +163,12 @@ func readUpstreamErrBody(resp *http.Response) upstreamErrBody {
 	}
 	// 多读 1 字节用于判定「读取层是否已截断」——否则超长原始报文在读取处被静默切掉，
 	// 落库侧既拿不到完整内容、也无法诚实标注截断点。
+	// io.ReadAll 在出错时也会返回已读到的前缀：那部分内容对定位问题仍然有价值，
+	// 不能因为「没读完」就整段丢弃（丢弃=运营看到「响应体为空」，正好掩盖上游到底回了什么）。
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, upstreamErrReadBytes+1))
-	if err != nil {
-		return upstreamErrBody{}
+	interrupted := err != nil
+	if interrupted && len(raw) == 0 {
+		return upstreamErrBody{ReadInterrupted: true}
 	}
 	readTruncated := len(raw) > upstreamErrReadBytes
 	if readTruncated {
@@ -146,7 +177,10 @@ func readUpstreamErrBody(resp *http.Response) upstreamErrBody {
 	// Raw **不 TrimSpace**：首尾空白也是上游原文的一部分（截断/裁剪原文正是本任务要杜绝的）。
 	// 只有「全是空白」才视作空体（见 isEmpty）。
 	s := string(raw)
-	return upstreamErrBody{Raw: s, Clean: sanitizeErrSummary(strings.TrimSpace(s)), ReadTruncated: readTruncated}
+	return upstreamErrBody{
+		Raw: s, Clean: sanitizeErrSummary(strings.TrimSpace(s)),
+		ReadTruncated: readTruncated, ReadInterrupted: interrupted,
+	}
 }
 
 // upstreamTruncNote 截断标注。与截断后的原文写在**同一字段**里（error.message），
@@ -187,8 +221,9 @@ func writeUpstreamError(w http.ResponseWriter, status, upstreamStatus int, raw, 
 // 遮蔽规则与运营侧 operatorView 同一套（internal/pkg/errbody.MaskSecrets：只替换已知凭据原值，
 // 不做样式/高熵清洗），因此除凭据外的每个字节仍逐字节透传。
 func upstreamErrorPayload(status, upstreamStatus int, raw, requestID string, secrets ...string) any {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
+	// TrimSpace **只用于判空**，不用于改写：非 JSON 错误页的首尾空白同样是上游原文的一部分，
+	// 剪掉就和「Raw 不 TrimSpace」自相矛盾（逐字节口径）。
+	if strings.TrimSpace(raw) == "" {
 		return upstreamEnvelope(status, upstreamStatus,
 			fmt.Sprintf("上游返回 %d，响应体为空（无可透传的错误内容）", upstreamStatus), requestID)
 	}
