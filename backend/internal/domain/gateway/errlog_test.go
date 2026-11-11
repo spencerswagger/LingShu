@@ -39,8 +39,9 @@ func TestUpstreamAuthRejectedLogsFullScene(t *testing.T) {
 
 	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-testtoken",
 		`{"model":"gpt-4","stream":false,"messages":[{"role":"user","content":"ping"}]}`)
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("want 503（单候选鉴权失败后无可用渠道）, got %d: %s", rec.Code, rec.Body.String())
+	// 单候选鉴权失败 → 终结响应沿用上游状态码（401），不再聚合成 503「无可用渠道」。
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("want 401（沿用上游）, got %d: %s", rec.Code, rec.Body.String())
 	}
 
 	out := dump()
@@ -72,7 +73,7 @@ func TestUpstreamAuthRejectedLogsFullScene(t *testing.T) {
 	// 请求级结论：真实下游状态码 + 未被掩盖 + 会话维度可串联（Fix 2 / Fix 1 / Fix 7）。
 	for _, want := range []string{
 		"gateway request outcome",
-		"status=503",
+		"status=401",
 		"masked_by_failover=false",
 		"session_id=",
 	} {
@@ -262,18 +263,19 @@ func TestTruncateLogKeepsValidUTF8(t *testing.T) {
 
 // Fix 1：日志与落库共用的错误体读取必须清洗凭据——
 // 账单 error_message 与调用日志 resp_body 都取自它，漏清洗等于两条链路同时落明文。
+// 注意：对外透传用的是 Raw 视图（原文原样还给同一个调用方），清洗只约束 Clean 视图。
 func TestReadUpstreamErrBodySanitizesCredentials(t *testing.T) {
 	resp := &http.Response{Body: io.NopCloser(strings.NewReader(
 		`{"error":{"message":"Incorrect API key provided: sk-abc123456789"}}`))}
 	body := readUpstreamErrBody(resp)
-	if strings.Contains(body, "sk-abc123456789") {
-		t.Errorf("上游错误体未清洗凭据: %q", body)
+	if strings.Contains(body.Clean, "sk-abc123456789") {
+		t.Errorf("上游错误体未清洗凭据: %q", body.Clean)
 	}
-	if !strings.Contains(body, "***") {
-		t.Errorf("清洗标记缺失: %q", body)
+	if !strings.Contains(body.Clean, "***") {
+		t.Errorf("清洗标记缺失: %q", body.Clean)
 	}
 	// 同源链路：upstreamErrDetail 拼接的 errMsg 也不得含明文。
-	if detail := upstreamErrDetail(http.StatusUnauthorized, body); strings.Contains(detail, "sk-abc123456789") {
+	if detail := upstreamErrDetail(http.StatusUnauthorized, body.Clean); strings.Contains(detail, "sk-abc123456789") {
 		t.Errorf("errMsg 含凭据明文: %q", detail)
 	}
 }

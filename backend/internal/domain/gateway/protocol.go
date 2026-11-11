@@ -44,22 +44,23 @@ func (g *Gateway) policyForProtocol(rt *channel.RuntimeChannel, channelID int64,
 }
 
 // errorPolicyOutcome 一次「上游错误 → 错误策略」决策的结果。
-// 未命中策略时保持改造前行为（默认安全态）：
+// 未命中策略时（默认安全态）：
 //   - countIntoHealth=true（照常计入渠道健康）；
 //   - failover=retryableUpstreamStatus(status)（沿用既有可转移判定）；
-//   - downstreamStatus=502（默认网关错误）。
+//   - downstreamStatus=**上游状态码本身**：对外响应沿用上游 4xx/5xx，不再统一改写为 502
+//     （改写会让调用方误判「网关故障」而放弃按厂商文档自救，且丢失「是上游拒绝」这一事实）。
 type errorPolicyOutcome struct {
 	countIntoHealth  bool // 是否计入渠道健康错误率/429/鉴权计数
 	failover         bool // 是否转移到下一候选
-	downstreamStatus int  // 未转移时写出的下游状态码（命中 Disposition 时替代默认 502）
+	downstreamStatus int  // 未转移时写出的下游状态码（默认沿用上游；仅策略显式 Disposition.DownstreamStatus 时覆盖）
 }
 
 // applyErrorPolicy 对一次上游错误（status + errType/errCode/msg）做统一策略决策并执行副作用：
-//   - 未命中策略 → 默认安全态（见 errorPolicyOutcome 注释）；
+//   - 未命中策略 → 默认安全态（见 errorPolicyOutcome 注释，下游状态码沿用上游）；
 //   - CountIntoHealth=false → 调用方以 FeedResultGated(..., false) 回喂（完全不影响熔断）；
 //   - Failover 显式设置时按其值决定是否转移（未设置沿用 retryableUpstreamStatus）；
 //   - Action=drain|disable → 手动置密钥/内部模型状态（ForceKeyState/ManualSetModelState，均落库）；
-//   - DownstreamStatus≠0 → 替代默认 502；
+//   - DownstreamStatus≠0 → 覆盖「沿用上游状态码」的默认行为（运维显式配置，非按内容特判）；
 //   - 命中策略时按错误类别累加协议级错误统计（protocol_error_stats）。
 //
 // 非流式（serveNonStream）与流式（serveStream）内部错误分支共用本函数，保证两处语义完全一致；
@@ -68,9 +69,10 @@ func (g *Gateway) applyErrorPolicy(ctx context.Context, rt *channel.RuntimeChann
 	status int, errType, errCode, msg string) errorPolicyOutcome {
 
 	out := errorPolicyOutcome{
-		countIntoHealth:  true,
-		failover:         retryableUpstreamStatus(status),
-		downstreamStatus: http.StatusBadGateway,
+		countIntoHealth: true,
+		failover:        retryableUpstreamStatus(status),
+		// 默认沿用上游状态码（上游 4xx → 对外 4xx、5xx → 对外 5xx）。
+		downstreamStatus: status,
 	}
 	protocolID := protocolIDOf(rt)
 	pol, ok := g.policyForProtocol(rt, routeRes.ChannelID, routeRes.ModelRowID, status, errType, errCode, msg)
