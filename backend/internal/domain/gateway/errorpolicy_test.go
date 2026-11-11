@@ -142,8 +142,8 @@ func TestApplyErrorPolicyFailoverOverride(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "bad request") {
 		t.Fatalf("终结响应应带上游报文，got %s", rec.Body.String())
 	}
-	if rb := decodeOpenAIError(t, rec); rb.Error.UpstreamStatus != http.StatusBadRequest {
-		t.Fatalf("error.upstream_status want 400, got %d", rb.Error.UpstreamStatus)
+	if got := lastCallLogUpstreamStatus(t, h); got != http.StatusBadRequest {
+		t.Fatalf("调用日志 upstream_status want 400, got %d", got)
 	}
 }
 
@@ -189,8 +189,8 @@ func TestApplyErrorPolicyStatsByCode(t *testing.T) {
 	if rec.Code != http.StatusBadGateway { // 未设 downstreamStatus → 网关语义 502
 		t.Fatalf("want 502, got %d", rec.Code)
 	}
-	if rb := decodeOpenAIError(t, rec); rb.Error.UpstreamStatus != http.StatusUnprocessableEntity {
-		t.Fatalf("error.upstream_status want 422, got %d", rb.Error.UpstreamStatus)
+	if got := lastCallLogUpstreamStatus(t, h); got != http.StatusUnprocessableEntity {
+		t.Fatalf("调用日志 upstream_status want 422, got %d", got)
 	}
 	if len(stats.recs) != 1 || stats.recs[0].category != "code:context_length_exceeded" {
 		t.Fatalf("want category=code:context_length_exceeded, got %+v", stats.recs)
@@ -206,8 +206,8 @@ func TestApplyErrorPolicyDefaultSafety(t *testing.T) {
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("default want 502（网关语义）, got %d", rec.Code)
 	}
-	if rb := decodeOpenAIError(t, rec); rb.Error.UpstreamStatus != http.StatusGatewayTimeout {
-		t.Fatalf("error.upstream_status want 504, got %d", rb.Error.UpstreamStatus)
+	if got := lastCallLogUpstreamStatus(t, h); got != http.StatusGatewayTimeout {
+		t.Fatalf("调用日志 upstream_status want 504, got %d", got)
 	}
 	if len(h.chans.feeds) != 1 {
 		t.Fatalf("default 应照常回喂健康一次, got %+v", h.chans.feeds)
