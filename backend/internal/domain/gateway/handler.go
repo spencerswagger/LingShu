@@ -1071,7 +1071,7 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 		// 上游 429 的报文同样要透出（调用方需要知道是配额还是速率、何时重试）；
 		// 全部为本地拦截（无上游报文）时保持网关文案，状态码仍是 429。
 		if lastUpstreamStatus > 0 {
-			writeUpstreamError(w, lastUpstreamStatus, lastUpstreamBody)
+			writeUpstreamError(w, lastUpstreamStatus, lastUpstreamStatus, lastUpstreamBody)
 			return
 		}
 		writeOpenAIError(w, http.StatusTooManyRequests, msgRateLimited)
@@ -1104,7 +1104,8 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request, endpoint, basePr
 	}
 	g.logOutcome(ctx, slog.LevelError, endpoint, model, "全部候选均失败（无可用渠道）", finalStatus, false, token, sessionID, attempts, trail, failed, msSince(start))
 	if lastUpstreamStatus > 0 {
-		writeUpstreamError(w, finalStatus, lastUpstreamBody)
+		// 对外状态码取终结语义（=最后一次上游码），body 里的 upstream_status 也记上游真实码。
+		writeUpstreamError(w, finalStatus, lastUpstreamStatus, lastUpstreamBody)
 		return
 	}
 	writeOpenAIError(w, finalStatus, finalMsg)
@@ -1520,7 +1521,7 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 		if pol.failover {
 			return &fwdOutcome{retry: true, is429: true, upstreamStatus: up.StatusCode, upstreamBody: upErr.Raw}
 		}
-		writeUpstreamError(w, pol.downstreamStatus, upErr.Raw)
+		writeUpstreamError(w, pol.downstreamStatus, up.StatusCode, upErr.Raw)
 		return &fwdOutcome{responded: true, refundPre: true, downstreamStatus: pol.downstreamStatus}
 	case up.StatusCode == http.StatusUnauthorized || up.StatusCode == http.StatusForbidden:
 		// 凭据可能失效：先转移下一候选；连续失败达阈值由状态机熔断（channel.Machine）。
@@ -1554,7 +1555,7 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 		if pol.failover {
 			return &fwdOutcome{retry: true, upstreamStatus: up.StatusCode, upstreamBody: upErr.Raw}
 		}
-		writeUpstreamError(w, pol.downstreamStatus, upErr.Raw)
+		writeUpstreamError(w, pol.downstreamStatus, up.StatusCode, upErr.Raw)
 		return &fwdOutcome{responded: true, refundPre: true, downstreamStatus: pol.downstreamStatus}
 	default:
 		upErr := readUpstreamErrBody(up)
@@ -1583,7 +1584,7 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 		if pol.failover {
 			return &fwdOutcome{retry: true, upstreamStatus: up.StatusCode, upstreamBody: upErr.Raw}
 		}
-		writeUpstreamError(w, pol.downstreamStatus, upErr.Raw)
+		writeUpstreamError(w, pol.downstreamStatus, up.StatusCode, upErr.Raw)
 		return &fwdOutcome{responded: true, refundPre: true, downstreamStatus: pol.downstreamStatus}
 	}
 }
@@ -1896,7 +1897,7 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		if pol.failover {
 			return &fwdOutcome{retry: true, is429: true, upstreamStatus: up.StatusCode, upstreamBody: upErr.Raw}
 		}
-		writeUpstreamError(w, pol.downstreamStatus, upErr.Raw)
+		writeUpstreamError(w, pol.downstreamStatus, up.StatusCode, upErr.Raw)
 		return &fwdOutcome{responded: true, refundPre: true, downstreamStatus: pol.downstreamStatus}
 	case up.StatusCode == http.StatusUnauthorized || up.StatusCode == http.StatusForbidden:
 		// 凭据可能失效：先转移下一候选；连续失败达阈值由状态机熔断（channel.Machine）。
@@ -1926,7 +1927,7 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		if pol.failover {
 			return &fwdOutcome{retry: true, upstreamStatus: up.StatusCode, upstreamBody: upErr.Raw}
 		}
-		writeUpstreamError(w, pol.downstreamStatus, upErr.Raw)
+		writeUpstreamError(w, pol.downstreamStatus, up.StatusCode, upErr.Raw)
 		return &fwdOutcome{responded: true, refundPre: true, downstreamStatus: pol.downstreamStatus}
 	default:
 		upErr := readUpstreamErrBody(up)
@@ -1955,7 +1956,7 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		if pol.failover {
 			return &fwdOutcome{retry: true, upstreamStatus: up.StatusCode, upstreamBody: upErr.Raw}
 		}
-		writeUpstreamError(w, pol.downstreamStatus, upErr.Raw)
+		writeUpstreamError(w, pol.downstreamStatus, up.StatusCode, upErr.Raw)
 		return &fwdOutcome{responded: true, refundPre: true, downstreamStatus: pol.downstreamStatus}
 	}
 }

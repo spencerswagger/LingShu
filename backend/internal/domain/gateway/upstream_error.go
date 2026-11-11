@@ -3,6 +3,8 @@ package gateway
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,8 +12,10 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/team/llmgateway/internal/pkg/errbody"
 )
@@ -81,7 +85,9 @@ func (b upstreamErrBody) isEmpty() bool { return strings.TrimSpace(b.Raw) == "" 
 //     随机 request-id、模型名、URL query）都原样保留；
 //   - 只遮蔽已知凭据（精确子串），不猜形状：历史按样式清洗会把 request-id、
 //     高熵随机串一并抹掉，运营等于看不到原文；
-//   - 超过 callLogErrBodyMaxBytes 时截断，**标注与被截原文同字段**（storeTruncNote）。
+//   - 超过 callLogErrBodyMaxBytes 时截断，**标注与被截原文同字段**（storeTruncNote）；
+//   - 最后过一层 errbody.ToValidText：上游报文可能是任意字节（GBK 错误页、0x00），
+//     直接写 PG text 列会让**整行 INSERT 失败**，于是这次失败的账与日志一起消失。
 //
 // secrets 传本次转发实际使用的凭据（ureq.Cred）。
 func (b upstreamErrBody) operatorView(secrets ...string) string {
@@ -90,10 +96,25 @@ func (b upstreamErrBody) operatorView(secrets ...string) string {
 	}
 	masked := errbody.MaskSecrets(b.Raw, secrets...)
 	if len(masked) <= callLogErrBodyMaxBytes && !b.ReadTruncated {
-		return masked
+		return storableText(masked, b.ReadTruncated)
 	}
 	out, _ := errbody.TruncateUTF8(masked, callLogErrBodyMaxBytes, storeTruncNote(len(masked), b.ReadTruncated))
-	return out
+	return storableText(out, b.ReadTruncated)
+}
+
+// storableText 把准备落库的原文整理成 PG text 能接受的合法 UTF-8（非法字节 → U+FFFD、NUL → <0x00>）。
+// 真发生过替换时在同字段补一句说明：运营看到 U+FFFD 时不该以为是上游本来就发了这串字符。
+func storableText(s string, readTruncated bool) string {
+	out, changed := errbody.ToValidText(s)
+	if !changed {
+		return out
+	}
+	note := "\n…（原文含非法 UTF-8 字节或 0x00，已替换为 �/<0x00> 以便落库）"
+	if readTruncated {
+		// 读取层已截断时不再追加，避免两条标注叠在一个字段里把原文挤掉。
+		return out
+	}
+	return out + note
 }
 
 // storeTruncNote 运营侧截断标注。数字给的是落库原文的字节数，便于判断丢了多少。
@@ -134,33 +155,42 @@ func upstreamTruncNote(total, limit int) string {
 	return fmt.Sprintf("\n…（已截断：上游原文共 %d 字节，超过 %d 字节对外上限）", total, limit)
 }
 
-// writeUpstreamError 把上游错误响应对外透传：HTTP 状态码取 status（沿用上游，除非协议策略显式覆盖），
-// 响应体见 upstreamErrorPayload。与 writeOpenAIError 分开是因为后者服务「网关自身拒绝」
-// （令牌/余额/路由），那些分支没有上游报文，混在一起会把自有文案语义一起改坏。
-func writeUpstreamError(w http.ResponseWriter, status int, raw string) {
+// writeUpstreamError 把上游错误响应对外透传。
+//
+// 两个状态码刻意分开传：
+//   - status：**对外**写的 HTTP 状态码（通常等于上游；协议策略显式 DownstreamStatus 时被覆盖；
+//     1xx/3xx 按 502 输出）；
+//   - upstreamStatus：**上游真实**状态码，写进响应体顶层 upstream_status。
+//
+// 二者不能混用：策略把 422 覆盖成 418、或上游回 304 被改写成 502 时，
+// upstream_status 仍必须报上游真实码，否则字段语义（「上游真实状态码」）就是假的。
+func writeUpstreamError(w http.ResponseWriter, status, upstreamStatus int, raw string) {
 	// 1xx/3xx 不属错误语义（且 304 禁带响应体），若上游回这类码则按网关错误输出，
 	// 否则调用方会拿到「有状态码没内容」或干脆看不到错误。4xx/5xx 一律沿用上游。
 	if status < http.StatusBadRequest {
 		status = http.StatusBadGateway
 	}
+	if upstreamStatus <= 0 {
+		upstreamStatus = status
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(upstreamErrorPayload(status, raw, w.Header().Get("x-request-id")))
+	_ = json.NewEncoder(w).Encode(upstreamErrorPayload(status, upstreamStatus, raw, w.Header().Get("x-request-id")))
 }
 
 // upstreamErrorPayload 组装对外错误体。返回 any：OpenAI 形状走「整段原样透传」（map），
-// 其余形状走网关错误壳（openAIErrorBody）。
-func upstreamErrorPayload(status int, raw, requestID string) any {
+// 其余形状走网关错误壳（openAIErrorBody）。status=对外状态码，upstreamStatus=上游真实状态码。
+func upstreamErrorPayload(status, upstreamStatus int, raw, requestID string) any {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return upstreamEnvelope(status,
-			fmt.Sprintf("上游返回 %d，响应体为空（无可透传的错误内容）", status), requestID)
+		return upstreamEnvelope(status, upstreamStatus,
+			fmt.Sprintf("上游返回 %d，响应体为空（无可透传的错误内容）", upstreamStatus), requestID)
 	}
 	// OpenAI 形状且未超上限 → 整段原样透传：顶层每个键（含 error 子对象的全部字段与嵌套）
 	// 都以 json.RawMessage 原值搬走，只追加我们自己的顶层字段。
 	if len(raw) <= upstreamErrOutBytes {
 		if doc, ok := openAIShapeDoc(raw); ok {
-			doc["upstream_status"] = json.RawMessage(strconv.Itoa(status))
+			doc["upstream_status"] = json.RawMessage(strconv.Itoa(upstreamStatus))
 			if requestID != "" {
 				if _, exists := doc["request_id"]; !exists {
 					doc["request_id"] = json.RawMessage(strconv.Quote(requestID))
@@ -172,7 +202,7 @@ func upstreamErrorPayload(status int, raw, requestID string) any {
 	// 其余形状（其它 JSON / 非 JSON / 超长的 OpenAI 形状）：原文原样进 message，
 	// 超限时同字段前缀 + 截断标注。其它 JSON 也是原文本，结构与嵌套一并保留。
 	text, _ := truncateUTF8(raw, upstreamErrOutBytes, upstreamTruncNote(len(raw), upstreamErrOutBytes))
-	return upstreamEnvelope(status, text, requestID)
+	return upstreamEnvelope(status, upstreamStatus, text, requestID)
 }
 
 // upstreamErrorEnvelope 非 OpenAI 形状时用的网关错误壳（message 里是原文，不做任何改写）。
@@ -185,14 +215,15 @@ type upstreamErrorEnvelope struct {
 }
 
 // upstreamEnvelope 组装网关错误壳（不含任何内容改写：message 由调用方给出原文）。
-func upstreamEnvelope(status int, message, requestID string) upstreamErrorEnvelope {
+// error.type 按**对外**状态码归类（客户端按它判错误大类），upstream_status 记上游真实码。
+func upstreamEnvelope(status, upstreamStatus int, message, requestID string) upstreamErrorEnvelope {
 	return upstreamErrorEnvelope{
 		Error: openAIErrorDetail{
 			Message: message,
 			Type:    openAIErrorType(status),
 			Code:    upstreamErrCode,
 		},
-		UpstreamStatus: status,
+		UpstreamStatus: upstreamStatus,
 		RequestID:      requestID,
 	}
 }
@@ -221,16 +252,86 @@ func isJSONObject(raw json.RawMessage) bool {
 // upstreamTransportNote 把传输层失败（连接被拒/断连/超时）转成**可读原因**，
 // 供「所有候选都失败」的终结响应与已送达超时的收尾使用：调用方至少要能看出
 // 「连不上」还是「等超时」，而不是一句「服务暂时不可用」。
+//
+// **硬约束：绝不把渠道地址带出去**。`net/http` 的错误文本形如
+// `Post "http://internal-gw.local:18080/chat/completions": dial tcp 10.0.3.7:18080: connect: connection refused`，
+// 原样放进对外 message 等于把内网拓扑交给调用方。所以这里只输出「哪一类失败」+
+// 不含地址的底层线索（errno 名 / 脱敏后的兜底文本）。
+//
+// 分类依据是 Go 标准库的错误**类型与 errno**（不是上游响应体内容），因此不属于「按上游文案特判」。
 // timedOut 用于选择对外状态码（超时 → 504，其它 → 502）。
 func upstreamTransportNote(kind string, err error) (note string, timedOut bool) {
 	if err == nil {
 		return "上游" + kind + "失败（无错误详情）", false
 	}
-	detail := truncateLog(sanitizeErrSummary(err.Error()), errSummaryMaxBytes)
+	reason, timedOut := transportFailureReason(err)
+	return "上游" + kind + reason, timedOut
+}
+
+// transportFailureReason 把一次传输层失败归一成「可读且不含地址」的原因。
+func transportFailureReason(err error) (reason string, timedOut bool) {
 	if isTimeoutErr(err) {
-		return "上游" + kind + "超时：" + detail, true
+		return "超时（等不到上游响应）", true
 	}
-	return "上游" + kind + "失败：" + detail, false
+	switch {
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return "失败：连接被拒绝（connection refused）", false
+	case errors.Is(err, syscall.ECONNRESET), errors.Is(err, syscall.EPIPE):
+		return "失败：连接被上游重置（connection reset）", false
+	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+		return "失败：连接被上游中断（对端关闭连接）", false
+	case errors.Is(err, syscall.EHOSTUNREACH), errors.Is(err, syscall.ENETUNREACH):
+		return "失败：网络不可达（host/network unreachable）", false
+	case isDNSErr(err):
+		return "失败：域名解析失败（DNS）", false
+	case isTLSErr(err):
+		return "失败：TLS 握手失败", false
+	}
+	// 兜底：保留底层错误文本（URL / host:port / IP 一律抹掉），避免退回「服务暂时不可用」这类通用文案。
+	detail := redactUpstreamAddr(truncateLog(sanitizeErrSummary(err.Error()), errSummaryMaxBytes))
+	if detail == "" {
+		return "失败（无错误详情）", false
+	}
+	return "失败：" + detail, false
+}
+
+// isDNSErr 判定是否 DNS 解析失败。
+func isDNSErr(err error) bool {
+	var d *net.DNSError
+	return errors.As(err, &d)
+}
+
+// isTLSErr 判定是否 TLS 握手/证书类失败（按错误类型判定，不看文案）。
+func isTLSErr(err error) bool {
+	var (
+		verr   *tls.CertificateVerificationError
+		recErr tls.RecordHeaderError
+		unkErr x509.UnknownAuthorityError
+		hostE  x509.HostnameError
+	)
+	return errors.As(err, &verr) || errors.As(err, &recErr) || errors.As(err, &unkErr) || errors.As(err, &hostE)
+}
+
+// 地址类样式的兜底抹除规则：URL / IPv4(:port) / [IPv6](:port) / 带端口的主机名。
+// 只用于「未能归类」的兜底错误文本，正常路径压根不会走到这里（分类命中时不输出底层原文）。
+var (
+	urlLikeRe  = regexp.MustCompile(`(?i)[a-z][a-z0-9+.\-]*://[^\s"')]+`)
+	ipv4Re     = regexp.MustCompile(`\b\d{1,3}(?:\.\d{1,3}){3}(?::\d{1,5})?\b`)
+	ipv6Re     = regexp.MustCompile(`\[[0-9a-fA-F:]+\](?::\d{1,5})?`)
+	hostPortRe = regexp.MustCompile(`(?i)\b(?:localhost|(?:[a-z0-9](?:[a-z0-9\-]*[a-z0-9])?\.)+[a-z]{2,}):\d{1,5}\b`)
+)
+
+// redactUpstreamAddr 抹掉文本里的渠道地址（URL / IP / 带端口主机名），保留其余可读线索。
+// 这是「对外文案不出地址」的第二道闸：即使后续新增了未归类的传输错误，也不会把地址漏出去。
+func redactUpstreamAddr(s string) string {
+	if s == "" {
+		return s
+	}
+	s = urlLikeRe.ReplaceAllString(s, "<地址>")
+	s = ipv6Re.ReplaceAllString(s, "<地址>")
+	s = ipv4Re.ReplaceAllString(s, "<地址>")
+	s = hostPortRe.ReplaceAllString(s, "<地址>")
+	return s
 }
 
 // isTimeoutErr 判定错误是否属于超时（含 context deadline）。

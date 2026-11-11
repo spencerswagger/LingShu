@@ -84,3 +84,50 @@ func CutRunePrefix(s string, maxBytes int) string {
 	}
 	return s[:cut]
 }
+
+// NULPlaceholder 是 0x00 字节在 text 列里的可见占位符（PG 的 text 物理上不能存 NUL）。
+const NULPlaceholder = `<0x00>`
+
+// ToValidText 把任意字节串整理成 PostgreSQL `text` 列**一定能写入**的合法 UTF-8，返回替换后的文本与「是否发生过替换」。
+//
+// 为什么必须有这一层：上游错误体是**任意字节**，可能带非法 UTF-8 序列（GBK 错误页、截断的多字节字符）
+// 或 0x00。原样写库时 PG 会拒绝整行 INSERT（invalid byte sequence / invalid message format），
+// 于是一次「上游报错」把这次请求的账单与调用日志**整行弄丢**——正好是本任务要消灭的「查不到」。
+// 这里只做两件事，且都不静默：
+//   - 非法 UTF-8 字节序列 → U+FFFD（与 Go 标准库/浏览器同口径，调用方看得见「这里原本有坏字节」）；
+//   - NUL（0x00）→ `NULPlaceholder`（可见占位符），因为 text 列无法保存它。
+//
+// 其余每个字节（含 <>&、中文、随机串）原样保留——不做样式清洗、不做字段裁剪。
+func ToValidText(s string) (string, bool) {
+	if s == "" {
+		return s, false
+	}
+	// 快路径：合法且无 NUL 时零分配。
+	if utf8.ValidString(s) && !strings.ContainsRune(s, 0) {
+		return s, false
+	}
+	var b strings.Builder
+	b.Grow(len(s) + 16)
+	for i := 0; i < len(s); {
+		c := s[i]
+		if c == 0 {
+			b.WriteString(NULPlaceholder)
+			i++
+			continue
+		}
+		if c < utf8.RuneSelf {
+			b.WriteByte(c)
+			i++
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && size == 1 {
+			b.WriteRune(utf8.RuneError) // 非法字节 → U+FFFD
+			i++
+			continue
+		}
+		b.WriteString(s[i : i+size])
+		i += size
+	}
+	return b.String(), true
+}
