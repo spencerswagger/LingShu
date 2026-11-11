@@ -12,6 +12,7 @@ import (
 
 	"github.com/team/llmgateway/internal/domain/identity"
 	"github.com/team/llmgateway/internal/domain/router"
+	"github.com/team/llmgateway/internal/pkg/errbody"
 	"github.com/team/llmgateway/internal/pkg/idgen"
 	"github.com/team/llmgateway/internal/pkg/logger"
 )
@@ -38,9 +39,14 @@ type CallLog struct {
 	Decision        any    // 决策轨迹 JSONB 原始值（候选渠道与原因、系数、预扣与结果）
 	UpstreamUsage   []byte // 上游原始 usage（JSONB 值：{"Protocol":...,"Usage":{...}}，见 rawusage.go；nil=无）
 	ErrorMessage    string
-	DurationMs      *int64
-	FirstTokenMs    *int64
-	CreatedAt       time.Time
+	// UpstreamStatus 上游真实 HTTP 状态码（上游非 2xx 的失败路径写真实码；
+	// 流式已回 200 后流内报错也写 200；网关自身拒绝/连接失败/超时为空）：
+	// 运营按 request_id 找到这次失败后，要能直接看到「上游 400、上游 200 但流内报错、还是网关 502」，
+	// 而不是从 error_message 的中文里猜。空值表示无上游状态码（连接失败/超时/网关拒绝）。
+	UpstreamStatus *int
+	DurationMs     *int64
+	FirstTokenMs   *int64
+	CreatedAt      time.Time
 }
 
 // CallLogStore 调用日志写入抽象（SQLCallLogStore 满足），便于测试注入内存 fake。
@@ -63,15 +69,15 @@ func NewSQLCallLogStore(db *sql.DB) *SQLCallLogStore {
 // 迁移后的列顺序一致的查询列（不含 id/created_at 自动列的读侧拆分）。
 const callLogsCols = `billing_id, request_id, session_id, user_id, channel_id, channel_key_id,
 	internal_model_id, external_model_id, model, auto_model_name, pricing_mode, status, req_messages, resp_body, resp_kind,
-	decision, error_message, duration_ms, first_token_ms, created_at, upstream_usage, req_params`
+	decision, error_message, duration_ms, first_token_ms, created_at, upstream_usage, req_params, upstream_status`
 
 // insertCallLogSQL 写入一条调用日志。列与占位符必须一一对应（数量不等会让所有写日志失败），
 // 由 calllog_test.go 的 TestInsertCallLogSQL_ColumnPlaceholderCount 守卫。
 const insertCallLogSQL = `
 INSERT INTO call_logs(id, billing_id, request_id, session_id, user_id, channel_id, channel_key_id,
 	internal_model_id, external_model_id, model, auto_model_name, pricing_mode, status, req_messages, resp_body, resp_kind,
-	decision, error_message, duration_ms, first_token_ms, created_at, upstream_usage, req_params)
-VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
+	decision, error_message, duration_ms, first_token_ms, created_at, upstream_usage, req_params, upstream_status)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
 ON CONFLICT (billing_id) DO NOTHING`
 
 // Insert 幂等插入一条调用日志：billing_id 冲突（ON CONFLICT DO NOTHING）静默跳过；
@@ -93,12 +99,16 @@ func (s *SQLCallLogStore) Insert(ctx context.Context, c *CallLog) error {
 	if err != nil {
 		return err
 	}
+	// 上游报文是任意字节（GBK 错误页、0x00、截断的多字节字符），PG 的 text 列会直接拒绝整行 INSERT——
+	// 一次上游报错就把这次请求的账与日志一起丢掉，正是「查不到」的成因。落库前统一整理成合法 UTF-8。
+	respBody, _ := errbody.ToValidText(c.RespBody)
+	errMsg, _ := errbody.ToValidText(c.ErrorMessage)
 	_, err = s.db.ExecContext(ctx, insertCallLogSQL,
 		id, c.BillingID, c.RequestID, c.SessionID, nullableInt64(c.UserID), nullableInt64(c.ChannelID),
 		nullableInt64(c.ChannelKeyID), c.InternalModelID, nullableInt64(c.ExternalModelID), c.Model,
-		nullableString(c.AutoModelName), c.PricingMode, c.Status, reqRaw, c.RespBody, c.RespKind, decRaw, c.ErrorMessage,
+		nullableString(c.AutoModelName), c.PricingMode, c.Status, reqRaw, respBody, c.RespKind, decRaw, errMsg,
 		nullableInt64(c.DurationMs), nullableInt64(c.FirstTokenMs), created, nullableBytes(c.UpstreamUsage),
-		nullableBytes(c.ReqParams))
+		nullableBytes(c.ReqParams), nullableInt(c.UpstreamStatus))
 	return err
 }
 
@@ -120,6 +130,14 @@ func nullableString(s string) any {
 
 // nullableInt64 指针 int64 → 可空参数（nil → nil）。
 func nullableInt64(v *int64) any {
+	if v == nil {
+		return nil
+	}
+	return *v
+}
+
+// nullableInt 指针 int → 可空整型参数（nil → nil）。
+func nullableInt(v *int) any {
 	if v == nil {
 		return nil
 	}
@@ -190,13 +208,17 @@ func scanCallLog(row rowScanner) (*CallLog, error) {
 // scanCallLogInto 把一行 call_logs 扫描进结构体；user_id 等可空列用 sql.NullInt64，
 // JSONB 列读为 []byte 保留原始 value（查询侧再反序列化，null 给 nil）。
 func scanCallLogInto(s rowScanner, c *CallLog) error {
-	var uid, chID, keyID, extID, dur, ft sql.NullInt64
+	var uid, chID, keyID, extID, dur, ft, upStatus sql.NullInt64
 	var autoName sql.NullString
 	var reqRaw, decRaw, upRaw, rpRaw []byte
 	if err := s.Scan(&c.BillingID, &c.RequestID, &c.SessionID, &uid, &chID, &keyID,
 		&c.InternalModelID, &extID, &c.Model, &autoName, &c.PricingMode, &c.Status, &reqRaw, &c.RespBody, &c.RespKind,
-		&decRaw, &c.ErrorMessage, &dur, &ft, &c.CreatedAt, &upRaw, &rpRaw); err != nil {
+		&decRaw, &c.ErrorMessage, &dur, &ft, &c.CreatedAt, &upRaw, &rpRaw, &upStatus); err != nil {
 		return err
+	}
+	if upStatus.Valid {
+		v := int(upStatus.Int64)
+		c.UpstreamStatus = &v
 	}
 	c.AutoModelName = autoName.String
 	if uid.Valid {
@@ -525,15 +547,31 @@ func (g *Gateway) channelAndKeyNames(channelID, keyID int64) (string, string) {
 // 逐个补参数。
 func (g *Gateway) writeCallLog(ctx context.Context, billingID, requestID string, token *identity.Token,
 	routeRes *router.RouteResult, model, pricingMode, sessionID string, reqMsgs []json.RawMessage,
-	respKind, respBody, status, errMsg string, durationMs, firstTokenMs *int64, decision any) {
+	respKind, respBody, status, errMsg string, durationMs, firstTokenMs *int64, decision any,
+	opts ...callLogOpt) {
 	g.writeCallLogUsage(ctx, billingID, requestID, token, routeRes, model, pricingMode, sessionID, reqMsgs,
-		respKind, respBody, status, errMsg, nil, durationMs, firstTokenMs, decision)
+		respKind, respBody, status, errMsg, nil, durationMs, firstTokenMs, decision, opts...)
+}
+
+// callLogOpt 调用日志的可选字段填充器：给 writeCallLog/writeCallLogUsage 追加「只有个别分支才有」的
+// 字段（如上游状态码）时用它，而不是继续加必填参数——必填参数会让 20+ 个既有调用点全部改动，
+// 且极易在某个分支漏传（漏传即静默丢字段）。
+type callLogOpt func(*CallLog)
+
+// withUpstreamStatus 记录上游真实 HTTP 状态码：上游返回非 2xx 的失败分支传真实码，
+// 流式「已回 200 后流内报错」的失败分支同样传 200（让「上游 HTTP 200 但内容层失败」可被区分）。
+func withUpstreamStatus(status int) callLogOpt {
+	return func(c *CallLog) {
+		v := status
+		c.UpstreamStatus = &v
+	}
 }
 
 // writeCallLogUsage 同 writeCallLog，额外记录上游原始 usage（call_logs.upstream_usage，诊断渠道口径用）。
 func (g *Gateway) writeCallLogUsage(ctx context.Context, billingID, requestID string, token *identity.Token,
 	routeRes *router.RouteResult, model, pricingMode, sessionID string, reqMsgs []json.RawMessage,
-	respKind, respBody, status, errMsg string, upstreamUsage []byte, durationMs, firstTokenMs *int64, decision any) {
+	respKind, respBody, status, errMsg string, upstreamUsage []byte, durationMs, firstTokenMs *int64, decision any,
+	opts ...callLogOpt) {
 	if g.callLogs == nil {
 		return
 	}
@@ -580,6 +618,11 @@ func (g *Gateway) writeCallLogUsage(ctx context.Context, billingID, requestID st
 			cl.ExternalModelID = &v
 		}
 		cl.InternalModelID = routeRes.InternalModelID
+	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(cl)
+		}
 	}
 	// 日志采集脱离请求取消（流式结束/客户端断开后也要落日志），带超时兜底。
 	bctx, cancel := billingCtx(ctx)

@@ -588,8 +588,10 @@ func TestServeUpstream429(t *testing.T) {
 	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("want 429, got %d", rec.Code)
 	}
-	if rb := decodeOpenAIError(t, rec); rb.Error.Code != "rate_limit_exceeded" || rb.Error.Type != "rate_limit_error" {
-		t.Errorf("error want code=rate_limit_exceeded type=rate_limit_error, got %+v", rb.Error)
+	// 透传契约：状态码沿用上游 429；error.code 固定 upstream_error（标识「上游拒绝」），
+	// type 按状态码归类为 rate_limit_error（空上游体时 message 给出可读说明）。
+	if rb := decodeOpenAIError(t, rec); rb.Error.Code != "upstream_error" || rb.Error.Type != "rate_limit_error" || rb.Error.Message == "" {
+		t.Errorf("error want code=upstream_error type=rate_limit_error 且 message 非空, got %+v", rb.Error)
 	}
 	if len(h.chans.feeds) == 0 || !h.chans.feeds[0].fb.Is429 {
 		t.Errorf("expected Is429 feedback, got %+v", h.chans.feeds)
@@ -1950,9 +1952,9 @@ func TestServeUpstream401FeedsKeyChannelKey(t *testing.T) {
 	h.rrouter.result = &router.RouteResult{ChannelID: 1, ChannelKeyID: 2, ModelRowID: 7, InternalModelID: "gpt-4-internal", ExternalModelID: 1}
 
 	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t", `{"model":"gpt-4","stream":false}`)
-	// 401 属可转移失败：先转移下一候选；无更多候选 → 终结 503「无可用渠道」。
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("want 503, got %d: %s", rec.Code, rec.Body.String())
+	// 401 属可转移失败：先转移下一候选；无更多候选 → 终结响应沿用最后一次上游状态码（401）。
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("want 401, got %d: %s", rec.Code, rec.Body.String())
 	}
 	found := false
 	for _, fe := range h.chans.feeds {
@@ -2441,8 +2443,9 @@ func TestServePreConsume_RefundsOnUpstreamFailure(t *testing.T) {
 
 	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t",
 		`{"model":"gpt-4","stream":false,"max_tokens":2000,"messages":[{"role":"user","content":"hello"}]}`)
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("want 503, got %d: %s", rec.Code, rec.Body.String())
+	// 上游 5xx 属可转移失败：单候选耗尽后终结响应沿用上游状态码（500）。
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("want 500（沿用上游）, got %d: %s", rec.Code, rec.Body.String())
 	}
 	if len(fc.consumed) != 1 || len(fc.refunded) != 1 {
 		t.Fatalf("want pre-consume+full refund, consumed=%v refunded=%v", fc.consumed, fc.refunded)
@@ -2631,8 +2634,8 @@ func TestServeNoFailover_Upstream400(t *testing.T) {
 	addSecondKey(h, upstream.URL, "k2-secret")
 
 	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t", `{"model":"gpt-4","stream":false}`)
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("400 不转移应直接 502, got %d: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("400 不转移应直接沿用上游 400, got %d: %s", rec.Code, rec.Body.String())
 	}
 	// 只应有候选 1 的一次失败尝试；若发生转移会多出候选 2 的账单。
 	if len(h.billing.reqs) != 1 || !h.billing.reqs[0].Fail || h.billing.reqs[0].ChannelKeyID != 1 {
@@ -2651,8 +2654,8 @@ func TestServeNoFailover_Upstream504(t *testing.T) {
 	addSecondKey(h, upstream.URL, "k2-secret")
 
 	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t", `{"model":"gpt-4","stream":false}`)
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("504 不转移应直接 502, got %d: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusGatewayTimeout {
+		t.Fatalf("504 不转移应直接沿用上游 504, got %d: %s", rec.Code, rec.Body.String())
 	}
 	if len(h.billing.reqs) != 1 {
 		t.Fatalf("504 不应触发第二次上游调用, got %+v", h.billing.reqs)
@@ -2668,8 +2671,12 @@ func TestServeFailover_ConnectionError(t *testing.T) {
 
 	h := build(t, deadURL)
 	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t", `{"model":"gpt-4","stream":false}`)
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("连接失败应可转移（单候选→503）, got %d: %s", rec.Code, rec.Body.String())
+	// 连接失败可转移；单候选耗尽后对外 502，且必须点名「连接失败」原因。
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("连接失败应 502, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if rb := decodeOpenAIError(t, rec); !strings.Contains(rb.Error.Message, "连接失败") {
+		t.Fatalf("应点名连接失败原因, got %q", rb.Error.Message)
 	}
 	if len(h.billing.reqs) != 1 || !h.billing.reqs[0].Fail {
 		t.Fatalf("want 1 failed 账单, got %+v", h.billing.reqs)
@@ -3232,8 +3239,8 @@ func TestStreamDiag_NotDeliveredFields(t *testing.T) {
 	dump := withLogCapture(h)
 
 	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t", `{"model":"gpt-4","stream":true}`)
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("want 503（单候选流式连接失败转移后无可用渠道）, got %d: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("want 502（单候选流式连接失败转移后无可用渠道）, got %d: %s", rec.Code, rec.Body.String())
 	}
 	out := dump()
 	for _, want := range []string{"upstream call failed", "kind=connect_failed", "stage=stream",
@@ -3246,8 +3253,13 @@ func TestStreamDiag_NotDeliveredFields(t *testing.T) {
 		t.Fatalf("want call log for stream connect failure")
 	}
 	cl := h.clogs.inserted[0]
-	if cl.ErrorMessage != "上游流式连接失败" {
-		t.Errorf("文案应保持「上游流式连接失败」, got %q", cl.ErrorMessage)
+	// 运营侧 error_message 保留**完整错误**（含地址），供运营定位是哪台机器/哪个域名；
+	// 对外 message 才打码（见 TestServeUpstreamError_ConnectionFailureNoAddress）。
+	if !strings.HasPrefix(cl.ErrorMessage, "上游流式连接失败") {
+		t.Errorf("文案应保持「上游流式连接失败」前缀, got %q", cl.ErrorMessage)
+	}
+	if !strings.Contains(cl.ErrorMessage, "connection refused") && !strings.Contains(cl.ErrorMessage, "connect") {
+		t.Errorf("error_message 应保留底层错误原文, got %q", cl.ErrorMessage)
 	}
 	dec, ok := cl.Decision.(map[string]any)
 	if !ok {
@@ -3318,8 +3330,8 @@ func TestUpstreamExplicitError_StillRefundsFullPreConsume(t *testing.T) {
 
 	rec := doRequest(t, h.gw, "/v1/chat/completions", "sk-gw-t",
 		`{"model":"gpt-4","stream":false,"max_tokens":2000,"messages":[{"role":"user","content":"hello"}]}`)
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("want 502（默认网关错误）, got %d: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusGatewayTimeout {
+		t.Fatalf("want 504（沿用上游状态码）, got %d: %s", rec.Code, rec.Body.String())
 	}
 	if len(fc.consumed) != 1 || len(fc.refunded) != 1 || math.Abs(fc.consumed[0]-fc.refunded[0]) > 0.0001 {
 		t.Fatalf("上游明确报错必须整单退预扣, consumed=%v refunded=%v", fc.consumed, fc.refunded)
@@ -3464,7 +3476,7 @@ func TestStreamDelivered_ConnectFailureFailsOver(t *testing.T) {
 	}
 	var connFailed *CallLog
 	for _, cl := range h.clogs.inserted {
-		if cl.ErrorMessage == "上游流式连接失败" {
+		if strings.HasPrefix(cl.ErrorMessage, "上游流式连接失败") {
 			connFailed = cl
 		}
 	}

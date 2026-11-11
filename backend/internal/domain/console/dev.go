@@ -305,9 +305,13 @@ func (h *Dev) HandleListSessionCalls(w http.ResponseWriter, r *http.Request) {
 	list := make([]DevCallLogView, 0, len(logs))
 	for i := range logs {
 		// 开发者端走白名单正向构造（渠道密钥/内部模型 ID/成本一律不返回）。
-		if v := toDevCallLogView(&logs[i]); v != nil {
-			list = append(list, *v)
+		v := toDevCallLogView(&logs[i])
+		if v == nil {
+			continue
 		}
+		// 列表按预算给预览，完整原文走该账单的详情接口。
+		v.RespBody, v.RespBodyTruncated = previewCallLogBody(v.RespKind, v.RespBody)
+		list = append(list, *v)
 	}
 	resp.OK(w, r, map[string]any{"List": list, "Total": len(list)})
 }

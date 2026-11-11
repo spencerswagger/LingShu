@@ -5,9 +5,11 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,6 +17,7 @@ import (
 
 	"github.com/team/llmgateway/internal/domain/billing"
 	"github.com/team/llmgateway/internal/domain/gateway"
+	"github.com/team/llmgateway/internal/testutil/randbody"
 )
 
 // fakeCallLogStore 内存调用日志读取 fake（console 单测用，满足 callLogReader）。
@@ -151,7 +154,9 @@ func TestAdminHandleListSessionCalls(t *testing.T) {
 			RespBody: "", ReqMessages: json.RawMessage(`[{"role":"user","content":"b"}]`),
 			Decision: json.RawMessage(`{"result":"rejected"}`), PricingMode: "sale",
 			ErrorMessage: "无可用渠道",
-			CreatedAt:    time.Date(2026, 10, 1, 10, 2, 0, 0, time.UTC)},
+			// 上游非 2xx 的失败记录带结构化上游状态码：账单详情据此区分「上游 400」与「网关 502」。
+			UpstreamStatus: func() *int { v := 400; return &v }(),
+			CreatedAt:      time.Date(2026, 10, 1, 10, 2, 0, 0, time.UTC)},
 	}})
 
 	rec := httptest.NewRecorder()
@@ -178,6 +183,12 @@ func TestAdminHandleListSessionCalls(t *testing.T) {
 	}
 	if body.Data.List[1].Status != "failed" || body.Data.List[1].RespKind != "error" {
 		t.Errorf("second item should be failed/error, got %+v", body.Data.List[1])
+	}
+	if body.Data.List[1].UpstreamStatus == nil || *body.Data.List[1].UpstreamStatus != 400 {
+		t.Errorf("失败记录的 UpstreamStatus 应原样输出 400，got %v", body.Data.List[1].UpstreamStatus)
+	}
+	if body.Data.List[0].UpstreamStatus != nil {
+		t.Errorf("成功记录不应有 UpstreamStatus，got %v", *body.Data.List[0].UpstreamStatus)
 	}
 
 	// 空列表：未装配存储时返回 List=[]（非 null）+ Total=0。
@@ -209,14 +220,15 @@ func TestNewSQLCallLogStore_InsertAndQuery(t *testing.T) {
 	upstreamUsage := []byte(`{"Protocol":"anthropic-messages","Usage":{"input_tokens":191,"cache_read_input_tokens":96896}}`)
 	// 请求参数快照（req_params）：定位「这次到底发了什么参数」用，见 gateway/reqparams.go。
 	reqParams := []byte(`{"endpoint":"/v1/chat/completions","model":"gpt-4","stream":true}`)
+	// 上游状态码（upstream_status）：仅上游非 2xx 的失败记录有值，本用例为成功记录 → nil。
 	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO call_logs(id, billing_id, request_id, session_id, user_id, channel_id, channel_key_id,
 	internal_model_id, external_model_id, model, auto_model_name, pricing_mode, status, req_messages, resp_body, resp_kind,
-	decision, error_message, duration_ms, first_token_ms, created_at, upstream_usage, req_params)
-VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
+	decision, error_message, duration_ms, first_token_ms, created_at, upstream_usage, req_params, upstream_status)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
 ON CONFLICT (billing_id) DO NOTHING`)).
 		WithArgs(sqlmock.AnyArg(), "bill-0001", "req-1", "sess-1", int64(7), int64(1), int64(2), "gpt-4-internal",
 			int64(1), "gpt-4", nil, "sale", "completed", []byte(`[{"role":"user","content":"a"}]`), `{"id":"x"}`,
-			"non_stream", []byte(`{"result":"success"}`), "", int64(123), nil, now, upstreamUsage, reqParams).
+			"non_stream", []byte(`{"result":"success"}`), "", int64(123), nil, now, upstreamUsage, reqParams, nil).
 		WillReturnResult(sqlmock.NewResult(1, 1))
 	if err := store.Insert(context.Background(), &gateway.CallLog{
 		BillingID: "bill-0001", RequestID: "req-1", SessionID: "sess-1",
@@ -233,13 +245,14 @@ ON CONFLICT (billing_id) DO NOTHING`)).
 	// ListBySession 读取（ReqMessages/Decision/UpstreamUsage 为 JSONB bytes）。
 	rows := sqlmock.NewRows([]string{"billing_id", "request_id", "session_id", "user_id", "channel_id", "channel_key_id",
 		"internal_model_id", "external_model_id", "model", "auto_model_name", "pricing_mode", "status", "req_messages", "resp_body", "resp_kind",
-		"decision", "error_message", "duration_ms", "first_token_ms", "created_at", "upstream_usage", "req_params"}).
+		"decision", "error_message", "duration_ms", "first_token_ms", "created_at", "upstream_usage", "req_params",
+		"upstream_status"}).
 		AddRow("bill-0001", "req-1", "sess-1", int64(7), int64(1), int64(2), "gpt-4-internal", int64(1), "gpt-4", nil,
 			"sale", "completed", []byte(`[{"role":"user","content":"a"}]`), `{"id":"x"}`, "non_stream",
-			[]byte(`{"result":"success"}`), "", int64(123), nil, now, upstreamUsage, reqParams)
+			[]byte(`{"result":"success"}`), "", int64(123), nil, now, upstreamUsage, reqParams, nil)
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT billing_id, request_id, session_id, user_id, channel_id, channel_key_id,
 	internal_model_id, external_model_id, model, auto_model_name, pricing_mode, status, req_messages, resp_body, resp_kind,
-	decision, error_message, duration_ms, first_token_ms, created_at, upstream_usage, req_params FROM call_logs WHERE session_id=$1 ORDER BY created_at ASC`)).
+	decision, error_message, duration_ms, first_token_ms, created_at, upstream_usage, req_params, upstream_status FROM call_logs WHERE session_id=$1 ORDER BY created_at ASC`)).
 		WithArgs("sess-1").WillReturnRows(rows)
 
 	logs, err := store.ListBySession(context.Background(), "sess-1")
@@ -258,3 +271,113 @@ ON CONFLICT (billing_id) DO NOTHING`)).
 }
 
 func ptr64(v int64) *int64 { return &v }
+
+// TestAdminHandleListSessionCalls_PreviewBody 会话调用**列表**只对失败行按预算返回 resp_body 预览：
+// 失败行原文最长 32KB，一个会话上百次失败就是数 MB JSON；列表只给 4KB 预览 + 同字段标注 +
+// RespBodyTruncated，完整原文仍可从该账单的详情接口拿到。成功行不截断（见下面的长成功行断言）。
+func TestAdminHandleListSessionCalls_PreviewBody(t *testing.T) {
+	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
+	bigBody := "upstream said: " + randbody.Text(rnd, 30000, 32000)
+	smallBody := "ok"
+
+	db, _, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	admin := NewAdmin(db, billing.NewSqlStore(db), nil, nil)
+	// 长成功行：会话重放页直接用它渲染 assistant 回答（不另取详情），必须逐字节原样返回。
+	longAnswer := "assistant answer: " + randbody.Text(rnd, 21400, 21600)
+	admin.SetCallLogStore(&fakeCallLogStore{bySession: []gateway.CallLog{
+		{BillingID: "bill-big", SessionID: "sess-1", Status: "failed", RespKind: "error", RespBody: bigBody},
+		{BillingID: "bill-small", SessionID: "sess-1", Status: "completed", RespKind: "non_stream", RespBody: smallBody},
+		{BillingID: "bill-long", SessionID: "sess-1", Status: "completed", RespKind: "non_stream", RespBody: longAnswer},
+	}})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/sessions/sess-1/calls", nil)
+	req.SetPathValue("session_id", "sess-1")
+	rec := httptest.NewRecorder()
+	admin.HandleListSessionCalls(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	// 收口口径：只有失败行被压到 4KB 预览；成功行是真实回答正文、按原样计入响应体。
+	// 所以没有「整包 ≤32KB」这种绝对上限，预算 = 成功行原文 + 失败行预览 + JSON 开销。
+	budget := len(longAnswer) + callListBodyPreviewBytes + (8 << 10) // 余量 = JSON 转义 + 其它字段
+	if n := len(rec.Body.Bytes()); n > budget {
+		t.Fatalf("列表响应超出预算 %d 字节（got %d 字节）", budget, n)
+	}
+	var got struct {
+		Data struct {
+			List  []CallLogView `json:"List"`
+			Total int           `json:"Total"`
+		} `json:"Data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v (%s)", err, rec.Body.String())
+	}
+	if got.Data.Total != 3 || len(got.Data.List) != 3 {
+		t.Fatalf("want 3 条, got %d/%d", got.Data.Total, len(got.Data.List))
+	}
+	big, small, longRow := got.Data.List[0], got.Data.List[1], got.Data.List[2]
+	if len(big.RespBody) > 4<<10 {
+		t.Fatalf("预览必须 ≤4KB，got %d", len(big.RespBody))
+	}
+	if !big.RespBodyTruncated {
+		t.Fatal("截断标记必须置位（前端据此提示去看详情）")
+	}
+	if !strings.Contains(big.RespBody, "已截断") || !strings.Contains(big.RespBody, "详情") {
+		t.Fatalf("预览必须同字段标注并指向详情接口: %q", big.RespBody[max(0, len(big.RespBody)-120):])
+	}
+	if !strings.HasPrefix(bigBody, strings.SplitN(big.RespBody, "\n…（已截断", 2)[0]) {
+		t.Fatal("预览前缀必须与原文逐字节一致")
+	}
+	if small.RespBody != smallBody || small.RespBodyTruncated {
+		t.Fatalf("短原文不得改动: %q truncated=%v", small.RespBody, small.RespBodyTruncated)
+	}
+	// 关键回归：**成功行超过 4KB 也必须逐字节原样返回**（否则会话重放里回答变半截）。
+	if longRow.RespBody != longAnswer {
+		t.Fatalf("成功行必须逐字节原样返回（want %d 字节，got %d 字节）", len(longAnswer), len(longRow.RespBody))
+	}
+	if longRow.RespBodyTruncated {
+		t.Fatal("成功行 RespBodyTruncated 必须恒为 false")
+	}
+}
+
+// TestPreviewCallLogBody_OnlyFailedRows 预览只作用于失败行（resp_kind=error），其余一律原样。
+func TestPreviewCallLogBody_OnlyFailedRows(t *testing.T) {
+	long := strings.Repeat("x", 21600)
+	cases := []struct {
+		name     string
+		respKind string
+		wantSame bool // 期望原样返回
+	}{
+		{"失败行超长-截断", "error", false},
+		{"失败行短-原样", "error", true},
+		{"成功行超长-原样", "non_stream", true},
+		{"成功流式超长-原样", "stream", true},
+		{"resp_kind 为空-原样", "", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := long
+			if tc.wantSame && tc.respKind == "error" {
+				body = "short"
+			}
+			got, truncated := previewCallLogBody(tc.respKind, body)
+			if tc.wantSame {
+				if got != body || truncated {
+					t.Fatalf("应原样返回, got %d 字节 truncated=%v", len(got), truncated)
+				}
+				return
+			}
+			if !truncated || len(got) > callListBodyPreviewBytes {
+				t.Fatalf("失败行超长应截断到 ≤%d 字节, got %d truncated=%v", callListBodyPreviewBytes, len(got), truncated)
+			}
+			if !strings.Contains(got, "已截断") {
+				t.Fatalf("截断必须同字段标注: %q", got[len(got)-80:])
+			}
+		})
+	}
+}
