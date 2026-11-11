@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -268,3 +269,79 @@ ON CONFLICT (billing_id) DO NOTHING`)).
 }
 
 func ptr64(v int64) *int64 { return &v }
+
+// TestPreviewCallLogBody_OnlyFailedRows 列表预览**只**作用于失败行（resp_kind=error）：
+// 成功行的 resp_body 是真实模型回答正文，会话重放页直接渲染它，截了就是半截回答。
+func TestPreviewCallLogBody_OnlyFailedRows(t *testing.T) {
+	long := strings.Repeat("x", callListBodyPreviewBytes+100)
+	cases := []struct {
+		name         string
+		respKind     string
+		body         string
+		wantTruncate bool
+	}{
+		{name: "失败行-error-超长", respKind: "error", body: long, wantTruncate: true},
+		{name: "失败行-error-未超长", respKind: "error", body: "short", wantTruncate: false},
+		{name: "成功行-non_stream-超长", respKind: "non_stream", body: long, wantTruncate: false},
+		{name: "成功行-stream-超长", respKind: "stream", body: long, wantTruncate: false},
+		{name: "空-kind-超长", respKind: "", body: long, wantTruncate: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, truncated := previewCallLogBody(tc.respKind, tc.body)
+			if truncated != tc.wantTruncate {
+				t.Fatalf("truncated want %v, got %v", tc.wantTruncate, truncated)
+			}
+			if !tc.wantTruncate {
+				if out != tc.body {
+					t.Fatalf("非失败行必须逐字节原样返回（got %d 字节, want %d）", len(out), len(tc.body))
+				}
+				return
+			}
+			if len(out) > callListBodyPreviewBytes {
+				t.Fatalf("失败行预览应 ≤ %d 字节, got %d", callListBodyPreviewBytes, len(out))
+			}
+			if !strings.Contains(out, "已截断") || !strings.Contains(out, "详情接口") {
+				t.Fatalf("截断必须在同字段标注并指向详情接口: %q", out)
+			}
+		})
+	}
+}
+
+// TestAdminHandleListSessionCalls_SuccessRowNotTruncated HTTP 级：长成功行原样返回（truncated=false），
+// 长失败行被压到 4KB 预览（truncated=true）。
+func TestAdminHandleListSessionCalls_SuccessRowNotTruncated(t *testing.T) {
+	longAnswer := "assistant answer: " + strings.Repeat("回答正文", 3000) // > 4KB
+	longErr := "upstream said: " + strings.Repeat("e", 30000)
+	admin := NewAdmin(nil, nil, nil, nil)
+	admin.SetCallLogStore(&fakeCallLogStore{bySession: []gateway.CallLog{
+		{BillingID: "bill-ok", SessionID: "sess-1", Status: "completed", RespKind: "non_stream", RespBody: longAnswer},
+		{BillingID: "bill-fail", SessionID: "sess-1", Status: "failed", RespKind: "error", RespBody: longErr},
+	}})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/sessions/sess-1/calls", nil)
+	req.SetPathValue("session_id", "sess-1")
+	admin.HandleListSessionCalls(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200", rec.Code)
+	}
+	var body struct {
+		Data struct {
+			List []CallLogView `json:"List"`
+		} `json:"Data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(body.Data.List) != 2 {
+		t.Fatalf("want 2 行, got %d", len(body.Data.List))
+	}
+	ok, fail := body.Data.List[0], body.Data.List[1]
+	if ok.RespBody != longAnswer || ok.RespBodyTruncated {
+		t.Fatalf("成功行必须逐字节原样（truncated=false）：got %d 字节 truncated=%v", len(ok.RespBody), ok.RespBodyTruncated)
+	}
+	if !fail.RespBodyTruncated || len(fail.RespBody) > callListBodyPreviewBytes {
+		t.Fatalf("失败行应为 4KB 预览（truncated=true）：got %d 字节 truncated=%v", len(fail.RespBody), fail.RespBodyTruncated)
+	}
+}

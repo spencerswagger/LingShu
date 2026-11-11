@@ -9,6 +9,7 @@ import (
 	"github.com/team/llmgateway/internal/domain/billing"
 	"github.com/team/llmgateway/internal/domain/gateway"
 	"github.com/team/llmgateway/internal/pkg/decimalx"
+	"github.com/team/llmgateway/internal/pkg/errbody"
 )
 
 // Line 账单拆解的一行（如 "输入 1,234 × 1.0"）。
@@ -71,11 +72,41 @@ type CallLogView struct {
 	// 上游 URL/token_id 等；可能 null）。定位「这次到底发了什么参数」用，不含 messages（见 ReqMessages）。
 	ReqParams any    `json:"ReqParams"`
 	RespBody  string `json:"RespBody"`
-	Decision  any    `json:"Decision"` // JSONB 原始 value（可能 null）
+	// RespBodyTruncated 仅**列表里的失败行**（resp_kind=error）可能为 true：受响应体积预算限制，
+	// 该行的 RespBody 只是 4KB 预览，完整原文走该账单的详情接口（那里不截断）。
+	// 成功行恒为 false：会话重放页直接用 RespBody 渲染 assistant 回答正文，截了就是半截回答。
+	RespBodyTruncated bool `json:"RespBodyTruncated,omitempty"`
+	Decision          any  `json:"Decision"` // JSONB 原始 value（可能 null）
 	// UpstreamUsage 上游原始 usage（JSONB 反序列化结果：{"Protocol":...,"Usage":{...}}，可能 null）：
 	// 诊断渠道 usage 口径用（billing_records.tokens 是归一化后的三段，看不出上游原文）。
 	UpstreamUsage any    `json:"UpstreamUsage"`
 	PricingMode   string `json:"PricingMode"`
+}
+
+// callListBodyPreviewBytes 会话调用**列表**里**失败行** resp_body 的预览上限。
+// 失败行的 resp_body 是上游错误报文（最长 32KB），一个会话上百次失败就是数 MB JSON；
+// 列表只承载「这次为什么失败」的线索，要看完整原文去账单详情（详情接口不截断）。
+const callListBodyPreviewBytes = 4 << 10
+
+// previewCallLogBody 只对**失败行**（resp_kind=error）的 resp_body 做预览截断。
+//
+// 为什么必须按行判：成功行的 resp_body 是真实的模型回答正文，前端会话重放页
+// （views/admin/SessionDetail.vue）**直接用它渲染** assistant 内容、不再另取详情，
+// 无差别截断会让超过 4KB 的回答在重放里显示成半截（实测 21,600 字节 → 4,094 字节）。
+// 成功行原样返回、RespBodyTruncated 恒为 false。
+//
+// 返回是否发生了截断，供视图层置 RespBodyTruncated。
+func previewCallLogBody(respKind, body string) (string, bool) {
+	if respKind != "error" {
+		return body, false
+	}
+	if len(body) <= callListBodyPreviewBytes {
+		return body, false
+	}
+	note := fmt.Sprintf("\n…（已截断：列表只展示前 %d 字节，完整原文 %d 字节见该账单详情接口）",
+		callListBodyPreviewBytes, len(body))
+	out, _ := errbody.TruncateUTF8(body, callListBodyPreviewBytes, note)
+	return out, true
 }
 
 // toCallLogView 由存储层 CallLog 组装只读视图；ReqMessages/Decision 反序列化为 any，null 给 nil。

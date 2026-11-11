@@ -543,9 +543,14 @@ func (h *Admin) HandleListSessionCalls(w http.ResponseWriter, r *http.Request) {
 	}
 	list := make([]CallLogView, 0, len(logs))
 	for i := range logs {
-		if v := toCallLogView(&logs[i]); v != nil {
-			list = append(list, *v)
+		v := toCallLogView(&logs[i])
+		if v == nil {
+			continue
 		}
+		// 列表按预算给预览，完整原文走该账单的详情接口；**只有失败行**被预览，
+		// 成功行的 resp_body 是真实回答正文（会话重放页直接渲染，截了就是半截回答）。
+		v.RespBody, v.RespBodyTruncated = previewCallLogBody(v.RespKind, v.RespBody)
+		list = append(list, *v)
 	}
 	resp.OK(w, r, map[string]any{"List": list, "Total": len(list)})
 }

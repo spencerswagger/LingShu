@@ -78,6 +78,8 @@ type DevCallLogView struct {
 	CallTime       string `json:"CallTime"`
 	ReqMessages    any    `json:"ReqMessages"`
 	RespBody       string `json:"RespBody"`
+	// RespBodyTruncated 仅**列表里的失败行**可能为 true（4KB 预览）；成功行恒为 false。
+	RespBodyTruncated bool `json:"RespBodyTruncated,omitempty"`
 	// Decision / ReqParams 为**白名单过滤后**的副本（未白名单的键不会出现）。
 	Decision      any    `json:"Decision"`
 	ReqParams     any    `json:"ReqParams"`
