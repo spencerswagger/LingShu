@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -86,6 +87,19 @@ func TestCallLog_PgRoundTrip_InvalidUTF8Payload(t *testing.T) {
 	}
 	if !utf8.ValidString(out.RespBody) {
 		t.Fatalf("读回内容必须是合法 UTF-8: %q", out.RespBody)
+	}
+	// 「行确实写入」的最终判据：账单页是按 request_id 检索的（billing/query.go 的 EXISTS 子查询），
+	// 所以必须能用 request_id 直接查到这一行。
+	var byRequestID int
+	if err := d.QueryRow(`SELECT count(*) FROM call_logs WHERE request_id=$1`, "req-invalid").Scan(&byRequestID); err != nil {
+		t.Fatalf("按 request_id 查询失败: %v", err)
+	}
+	if byRequestID != 1 {
+		t.Fatalf("按 request_id 应查到 1 行, got %d", byRequestID)
+	}
+	// 清洗必须「可辨认」：GBK 片段变成 U+FFFD、NUL 变成可见占位符，而不是整段丢成空串。
+	if !strings.Contains(out.RespBody, "<0x00>") || !strings.Contains(out.RespBody, "\ufffd") {
+		t.Fatalf("清洗后应保留可辨认占位符, got %q", out.RespBody)
 	}
 	if out.RespBody == "" {
 		t.Fatal("清洗后不应丢成空串")

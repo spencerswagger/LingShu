@@ -36,3 +36,9 @@ COMMENT ON COLUMN probe_logs.upstream_status IS
 --
 -- 不变量：本迁移只新增两列（带默认值），**不修改、不删除、不回填**任何既有列与既有行，
 -- 因此对既有数据语义零影响（旧行的 error_body=''、upstream_status=NULL 即为「当时没有记录」）。
+--
+-- 为什么**不加索引**：两列都只用于「取某条/某批探测记录时一并读出」，唯一的检索维度是
+-- `probe_logs.channel_key_id`（已有索引）+ 主键 `id`，不存在按 `upstream_status` 或 `error_body`
+-- 过滤的查询；`error_body` 是大文本，建索引既无收益又会让写入放大（TOAST 写入 + 索引维护）。
+-- 列表接口已按「行数上限 100 + 每行 4KB 预览」收口响应体积（完整原文走单条详情端点），
+-- 因此也不需要为列表另建覆盖索引。
