@@ -218,7 +218,11 @@ func (m *Manager) nextKeyProbeWait(keyID int64) (time.Duration, string, bool) {
 		drainSeconds, branch = hp.DrainIntervalSeconds, branchKeyDrain
 	}
 	// 模型层排空：即使密钥仍 NORMAL，也要按排空间隔代探（模型自身没有探测循环）。
-	if branch != branchDisabled {
+	//
+	// 只在「模型级探测」作用域内成立：显式配置 health_probe.probe_model 时每轮只做密钥级定向探测
+	// （pickKeyProbeTargets 返回 level='key'，不回喂模型状态机），渠道内模型的排空态既探不到也
+	// 恢复不了——拿它决定调度会变成永久秒级探测、永不回 cron。
+	if branch != branchDisabled && hp.ProbeModel == "" {
 		for _, mr := range m.mrt[kr.Channel.ID] {
 			// 实体已禁用或状态机已禁用：pickKeyProbeTargets 不会选中它，不必按排空节奏代探。
 			if mr.Model.State == StateDisabled || mr.Machine.State() == StateDisabled {

@@ -59,7 +59,7 @@ func TestNextKeyProbeWait_ThreeTiers(t *testing.T) {
 	}{
 		{
 			name: "全 NORMAL → cron", keyState: StateNormal, modelState: StateNormal,
-			wantBranch: branchCron, wantWaitMin: time.Hour,
+			wantBranch: branchCron, wantWait: 13*time.Hour + 30*time.Minute, // 冻结在 10:30 → 次日 00:00
 		},
 		{
 			name: "密钥 DRAIN → drain_interval_seconds", keyState: StateDrain, modelState: StateNormal,
@@ -90,7 +90,7 @@ func TestNextKeyProbeWait_ThreeTiers(t *testing.T) {
 		{
 			name: "模型实体 DISABLED（即便状态机残留 DRAIN）→ 不代探，回 cron", keyState: StateNormal, modelState: StateDrain,
 			modelEnable: StateDisabled,
-			wantBranch:  branchCron, wantWaitMin: time.Hour,
+			wantBranch:  branchCron, wantWait: 13*time.Hour + 30*time.Minute,
 		},
 	}
 	for _, tc := range tests {
@@ -349,5 +349,156 @@ func TestKeyProbeLoop_NormalStateWakeDoesNotProbe(t *testing.T) {
 	}
 	if wait <= 0 || wait > 30*time.Minute {
 		t.Fatalf("常态等待应指向 11:00 的 cron 边界（≤30min），got %v", wait)
+	}
+}
+
+// TestNextKeyProbeWait_ProbeModelScope 探测作用域决定「模型排空」是否参与调度。
+// 未配 probe_model → 探测目标是模型级（level=model，回喂模型状态机），模型排空必须 15s 代探；
+// 配了 probe_model → 只做密钥级定向探测（level=key，不回喂模型状态机），模型排空态既探不到也
+// 恢复不了，不能拿它决定等待（否则该渠道全部密钥永久秒级探测、永不回 cron）。
+func TestNextKeyProbeWait_ProbeModelScope(t *testing.T) {
+	now := time.Date(2026, 1, 2, 10, 30, 0, 0, time.UTC)
+	const daily = "0 0 0 * * *"
+	const cronWait = 13*time.Hour + 30*time.Minute // 冻结在 10:30 → 次日 00:00
+
+	tests := []struct {
+		name       string
+		probeModel string
+		keyState   State
+		modelState State
+		wantBranch string
+		wantWait   time.Duration
+	}{
+		{
+			name:     "未配 probe_model + 模型 DRAIN → 按模型排空 15s 代探",
+			keyState: StateNormal, modelState: StateDrain,
+			wantBranch: branchModelDrain, wantWait: 15 * time.Second,
+		},
+		{
+			name:       "配了 probe_model + 作用域外模型 DRAIN → 回 cron（不代探、不狂探）",
+			probeModel: "m-probe",
+			keyState:   StateNormal, modelState: StateDrain,
+			wantBranch: branchCron, wantWait: cronWait,
+		},
+		{
+			name:       "配了 probe_model + 该模型自己 DRAIN → 仍回 cron（探测不回喂模型，探也白探）",
+			probeModel: "m1",
+			keyState:   StateNormal, modelState: StateDrain,
+			wantBranch: branchCron, wantWait: cronWait,
+		},
+		{
+			name:       "配了 probe_model + 密钥 DRAIN → 仍按密钥排空间隔",
+			probeModel: "m-probe",
+			keyState:   StateDrain, modelState: StateNormal,
+			wantBranch: branchKeyDrain, wantWait: 15 * time.Second,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			hp := HealthProbeConfig{
+				Interval: daily, DrainIntervalSeconds: 15, TimeoutMS: 1000,
+				FailThreshold: 1, RecoveryThreshold: 1, ProbeModel: tc.probeModel,
+			}
+			mgr := newDrainScheduleTestManager(t, "http://up.example.com", hp, func() time.Time { return now })
+			mgr.mu.Lock()
+			mgr.mrt[1][21].Machine.transition(tc.modelState, now, "")
+			mgr.keys[11].Machine.transition(tc.keyState, now, "")
+			mgr.mu.Unlock()
+
+			wait, branch, ok := mgr.nextKeyProbeWait(11)
+			if !ok {
+				t.Fatalf("运行时存在时 ok 必须为 true")
+			}
+			if branch != tc.wantBranch {
+				t.Errorf("branch want %q, got %q", tc.wantBranch, branch)
+			}
+			if wait != tc.wantWait {
+				t.Errorf("wait want %v, got %v", tc.wantWait, wait)
+			}
+		})
+	}
+}
+
+// TestKeyProbeLoop_ProbeModelScopeStaysCron 配了 probe_model 的渠道：排空「作用域外模型」后
+// 不得进入秒级探测（该模型不在探测作用域内，探它等于永远探不到、永远回不了 cron）。
+func TestKeyProbeLoop_ProbeModelScopeStaysCron(t *testing.T) {
+	c := &probeCounter{}
+	srv := httptest.NewServer(c.handler(true))
+	defer srv.Close()
+
+	frozen := time.Date(2026, 1, 2, 10, 30, 0, 0, time.UTC)
+	hp := HealthProbeConfig{
+		Interval: "0 0 * * * *", DrainIntervalSeconds: 1, TimeoutMS: 1000,
+		FailThreshold: 1, RecoveryThreshold: 1, ProbeModel: "m-probe",
+	}
+	mgr := newDrainScheduleTestManager(t, srv.URL, hp, func() time.Time { return frozen })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	mgr.Start(ctx)
+	defer func() {
+		cancel()
+		mgr.Stop()
+	}()
+	time.Sleep(200 * time.Millisecond)
+
+	// 排空「作用域外模型」：过去会让该渠道所有密钥恒按秒级探测。
+	if err := mgr.ManualSetModelState(1, 21, StateDrain); err != nil {
+		t.Fatalf("manual model drain: %v", err)
+	}
+	time.Sleep(1500 * time.Millisecond)
+	if n := c.count(); n != 0 {
+		t.Fatalf("probe_model 作用域外的模型排空不应触发探测，got %d 次", n)
+	}
+	if _, branch, ok := mgr.nextKeyProbeWait(11); !ok || branch != branchCron {
+		t.Fatalf("配了 probe_model 且模型排空时分支应为 cron，got %q（ok=%v）", branch, ok)
+	}
+}
+
+// TestKeyProbeOnce_ProbeModelIsKeyLevel 配了 probe_model 时探测记 level=key 且指向该模型，
+// 且不回喂模型状态机（这是「模型排空不参与调度」的事实依据，不是本次新引入的取舍）。
+func TestKeyProbeOnce_ProbeModelIsKeyLevel(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer srv.Close()
+
+	now := time.Date(2026, 1, 2, 10, 30, 0, 0, time.UTC)
+	hp := HealthProbeConfig{
+		Interval: "0 0 * * * *", DrainIntervalSeconds: 15, TimeoutMS: 1000,
+		FailThreshold: 1, RecoveryThreshold: 1, ProbeModel: "m1",
+	}
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+	mgr := NewManager(nil, NewChannelModelStore(db), testSM4Key, &http.Client{Timeout: 2 * time.Second},
+		slog.New(slog.NewTextHandler(io.Discard, nil)), func() time.Time { return now })
+	ch := &Channel{
+		ID: 1, Name: "c1", Protocol: ProtocolOpenAICompat, BaseURL: srv.URL,
+		RateLimit:   RateLimitConfig{MaxConcurrent: 8},
+		HealthProbe: hp,
+		Reliability: ReliabilityConfig{WindowSeconds: 60, MinSamples: 10},
+	}
+	mgr.rt[1] = mgr.buildRuntime(ch)
+	mgr.mrt[1] = map[int64]*ModelRuntime{}
+	cm := ChannelModel{ID: 21, ChannelID: 1, InternalModelID: "m1", ExternalModelID: 1, State: StateNormal}
+	mgr.mrt[1][21] = mgr.buildModelRuntime(&cm, mgr.rt[1])
+	addKeyRuntime(t, mgr, 11, testKeyACred, StateNormal)
+	if err := mgr.ManualSetModelState(1, 21, StateDrain); err != nil {
+		t.Fatalf("manual model drain: %v", err)
+	}
+
+	mock.ExpectExec(regexp.QuoteMeta(insertProbeLogSQL)).
+		WithArgs(sqlmock.AnyArg(), int64(11), "m1", "key", srv.URL+"/chat/completions", true, "", 1, 1, 0, 2, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+
+	mgr.keyProbeOnce(context.Background(), 11)
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("probe_model 探测应记 level=key 且 ModelID=探测模型：%v", err)
+	}
+	if mr := mgr.mrt[1][21]; mr.Machine.State() != StateDrain {
+		t.Fatalf("level=key 探测不回喂模型状态机，模型应仍为 DRAIN，got %s", mr.Machine.State())
 	}
 }

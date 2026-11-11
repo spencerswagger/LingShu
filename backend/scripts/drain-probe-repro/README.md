@@ -71,7 +71,11 @@ go test ./internal/domain/channel -tags drainrepro -run 'TestDrainProbeRepro$/A'
 - `TestKeyProbeLoop_WakesOnManualDrain`：排空发生在 cron 长睡中途也要被唤醒（1s 排空间隔，秒级判定）；
 - `TestKeyProbeLoop_ModelDrainRecoversThenBackToCron`：模型排空被探测恢复后，立刻停止秒级探测（回到 cron）；
 - `TestDrainProbe_FailureReasonRecorded`：排空探测失败原因（含上游状态码）落 `probe_logs`；
-- `TestProbeWaker_WakesAllSubscribers`：唤醒是广播语义（一次变化唤醒全部密钥循环）。
+- `TestProbeWaker_WakesAllSubscribers`：唤醒是广播语义（一次变化唤醒全部密钥循环）；
+- `TestKeyProbeLoop_NormalStateWakeDoesNotProbe`：常态下连续唤醒 20 次不产生探测、仍指向 cron 边界；
+- `TestNextKeyProbeWait_ProbeModelScope` / `TestKeyProbeLoop_ProbeModelScopeStaysCron` /
+  `TestKeyProbeOnce_ProbeModelIsKeyLevel`：配了 `probe_model` 时作用域外的模型排空不参与调度（回 cron），
+  该模式下的探测是 `level=key` 且不回喂模型状态机。
 
 ## 6. 观测到的一个相邻事实（不在本修复范围）
 
