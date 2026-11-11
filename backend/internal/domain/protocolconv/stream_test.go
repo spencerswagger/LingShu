@@ -190,6 +190,37 @@ data: {"type":"content_block_stop","index":0}
 	}
 }
 
+// TestAnthropicThinkingStartOmitsEmptySignature 断言 thinking 块 content_block_start
+// 在签名为空时不下发 "signature":""（官方无该键，空值会被严格客户端当作非法签名）。
+func TestAnthropicThinkingStartOmitsEmptySignature(t *testing.T) {
+	frames, _, err := anthropicCodec{}.EncodeEvent(CanonicalEvent{
+		Type:      EventContentBlockStart,
+		Index:     0,
+		BlockKind: BlockThinking,
+		Signature: "",
+	})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	joined := string(bytes.Join(frames, nil))
+	if strings.Contains(joined, `"signature"`) {
+		t.Fatalf("签名空时不应下发 signature 键，got %s", joined)
+	}
+	// 非空签名仍须输出（不能把该键一律删掉）。
+	frames, _, err = anthropicCodec{}.EncodeEvent(CanonicalEvent{
+		Type:      EventContentBlockStart,
+		Index:     0,
+		BlockKind: BlockThinking,
+		Signature: "sig-abc",
+	})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if joined := string(bytes.Join(frames, nil)); !strings.Contains(joined, `"signature":"sig-abc"`) {
+		t.Fatalf("非空签名应下发，got %s", joined)
+	}
+}
+
 func TestEmptyStopReasonNotLeaking(t *testing.T) {
 	usageOnly := `{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}`
 	evs, _, err := openAIChatCodec{}.DecodeEvent([]byte(usageOnly))

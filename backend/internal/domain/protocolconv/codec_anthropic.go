@@ -839,8 +839,12 @@ func (anthropicCodec) EncodeEvent(ev CanonicalEvent) ([][]byte, *LossyReport, er
 			cb["input"] = map[string]interface{}{}
 		case BlockThinking:
 			// thinking 块 start 携带 thinking（通常为空串）与 signature，供流式原样往返。
+			// 官方无 signature 键时不下发空值（空键会被严格客户端当作非法签名）：
+			// 仅当签名非空时才输出，签名随后由 signature_delta 在 stop 前补发。
 			cb["thinking"] = ev.Text
-			cb["signature"] = ev.Signature
+			if ev.Signature != "" {
+				cb["signature"] = ev.Signature
+			}
 		case BlockRedactedThinking:
 			// 官方消息结构只有 type + data，无 signature 字段。
 			cb["data"] = ev.RedactedData

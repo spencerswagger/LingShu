@@ -538,6 +538,7 @@ func assertAnthropicBlockSerial(t *testing.T, evs []protocolconv.CanonicalEvent)
 	t.Helper()
 	kinds := map[int]string{}
 	openIdx := -1
+	lastStartIdx := -1
 	sigEmitted := map[int]bool{}
 	for _, ev := range evs {
 		switch ev.Type {
@@ -545,6 +546,13 @@ func assertAnthropicBlockSerial(t *testing.T, evs []protocolconv.CanonicalEvent)
 			if openIdx >= 0 {
 				t.Fatalf("块未串行：块 %d 未 stop 就起新块 %d（事件序: %s）", openIdx, ev.Index, dumpEventTypes(evs))
 			}
+			// 官方流不复用 content_block index：下游下标必须严格单调递增，
+			// 否则按 index 归并的客户端会覆盖丢字或把两段签名拼在一起。
+			if ev.Index <= lastStartIdx {
+				t.Fatalf("下游 index 被复用：start(%d) 未大于上一个 start(%d)（事件序: %s）",
+					ev.Index, lastStartIdx, dumpEventTypes(evs))
+			}
+			lastStartIdx = ev.Index
 			openIdx = ev.Index
 			kinds[ev.Index] = ev.BlockKind
 		case protocolconv.EventContentBlockStop:
@@ -684,6 +692,70 @@ func TestStreamThinkingSignatureCoversFullText(t *testing.T) {
 	}
 	if sig != protocolconv.OpaqueThinkingSignature("R1R2") {
 		t.Fatalf("签名应覆盖整块全文 R1R2，got %q（首片签名=%q）", sig, protocolconv.OpaqueThinkingSignature("R1"))
+	}
+}
+
+// TestStreamConversionInterleavedNoIndexReuse 断言交错流（thinking → text → thinking）下
+// 下游 content_block index **严格单调递增、不复用**：官方流不复用 index，若第三块又回到
+// index 0，按 index 归并的客户端会覆盖丢字或把两段签名拼成 sig1sig2。
+// 该用例钉住 closeBlock 清理「上游下标×块类别→下游下标」映射的动作（删掉即变红）。
+func TestStreamConversionInterleavedNoIndexReuse(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(
+			"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"reasoning_content\":\"R1\"}}]}\n\n" +
+				"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"T1\"}}]}\n\n" +
+				"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"R2\"}}]}\n\n" +
+				"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3}}\n\n" +
+				"data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	h := build(t, upstream.URL)
+	h.chans.mrt.Model.Protocols = channelprotocol.Protocols{channelprotocol.ProtocolOpenAIChat: {}}
+
+	rec := postWithHeaders(t, h.gw, "/v1/messages",
+		`{"model":"gpt-4","stream":true,"max_tokens":100,"messages":[{"role":"user","content":"ping"}]}`,
+		map[string]string{"x-api-key": "sk-gw-t"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	evs := decodeAnthropicSSE(t, rec.Body.String())
+	// 通用校验（串行 + delta 归属 + 严格递增 index + thinking 必有 signature）。
+	kinds := assertAnthropicBlockSerial(t, evs)
+
+	// 三块：thinking / text / thinking，下标 0/1/2 严格递增。
+	var starts []int
+	for _, ev := range evs {
+		if ev.Type == protocolconv.EventContentBlockStart {
+			starts = append(starts, ev.Index)
+		}
+	}
+	if len(starts) != 3 || starts[0] != 0 || starts[1] != 1 || starts[2] != 2 {
+		t.Fatalf("交错流应下发 3 个块且 index 单调 0/1/2，got starts=%v（事件序: %s）", starts, dumpEventTypes(evs))
+	}
+	if kinds[0] != protocolconv.BlockThinking || kinds[1] != protocolconv.BlockText || kinds[2] != protocolconv.BlockThinking {
+		t.Fatalf("块类型应为 thinking/text/thinking，got %+v", kinds)
+	}
+	// 两段 thinking 各自独立成块、各带自己的签名（不得被拼成同一段）。
+	var thinkingTexts, sigs []string
+	var curText string
+	for _, ev := range evs {
+		switch ev.DeltaKind {
+		case protocolconv.DeltaThinking:
+			curText += ev.Text
+		case protocolconv.DeltaSignature:
+			sigs = append(sigs, ev.Text)
+			thinkingTexts = append(thinkingTexts, curText)
+			curText = ""
+		}
+	}
+	if len(thinkingTexts) != 2 || thinkingTexts[0] != "R1" || thinkingTexts[1] != "R2" {
+		t.Fatalf("两段 thinking 应各自成块（R1 / R2），got %v", thinkingTexts)
+	}
+	if len(sigs) != 2 || sigs[0] != protocolconv.OpaqueThinkingSignature("R1") || sigs[1] != protocolconv.OpaqueThinkingSignature("R2") {
+		t.Fatalf("两段 thinking 应各带自身签名，got %v", sigs)
 	}
 }
 

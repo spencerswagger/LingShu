@@ -235,13 +235,14 @@ func TestAnthropicCodec(t *testing.T) {
 		if err != nil {
 			t.Fatalf("serialize: %v", err)
 		}
-		// 官方消息结构只有 type + data，无 signature 字段：不得多发 signature。
+		// 官方消息结构只有 type + data，无 signature 字段：整个 "signature" 键都不应出现
+		// （只断言「不含输入值」挡不住把空签名/生成签名加回去的变异）。
 		if !strings.Contains(string(out), `"type":"redacted_thinking"`) ||
 			!strings.Contains(string(out), `"data":"opaque-cipher-text"`) {
 			t.Fatalf("redacted_thinking 应原样序列化（type + data）: %s", out)
 		}
-		if strings.Contains(string(out), "sig-redacted") {
-			t.Fatalf("redacted_thinking 不应携带 signature（官方结构无该字段）: %s", out)
+		if strings.Contains(string(out), `"signature"`) {
+			t.Fatalf("redacted_thinking 不应出现 signature 键（官方结构无该字段）: %s", out)
 		}
 		req2, _, err := codec.ParseRequest(out)
 		if err != nil {

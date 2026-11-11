@@ -81,6 +81,11 @@ func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Respon
 	// 下游下标，保证 thinking 独立成块、text 独立成块、tool 独立成块。
 	openBlocks := map[int]bool{}
 	blockIndexMap := map[string]int{}
+	// blockKeys 记录「下游下标 → blockIndexMap 键」的反向映射：块关闭时据此清掉映射，
+	// 使上游再次出现同一「上游下标 × 块类别」时分配**新的**下游下标。
+	// 官方流不复用 content_block index；若复用（如交错 thinking → text → thinking 又回到
+	// 同一桶），按 index 归并的客户端会覆盖丢字、或把两段签名拼成 sig1sig2。
+	blockKeys := map[int]string{}
 	nextBlockIndex := 0
 	// currentBlock 是当前正在下发的块下标。Anthropic 真实流是**块串行**的
 	// （start → delta* → stop 之后才起下一块）；按「当前块」归属 delta 的客户端若遇到
@@ -127,6 +132,7 @@ func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Respon
 		}
 		d := nextBlockIndex
 		blockIndexMap[key] = d
+		blockKeys[d] = key
 		nextBlockIndex++
 		return d
 	}
@@ -201,6 +207,13 @@ func (g *Gateway) pumpConvertedStream(ctx context.Context, upstream *http.Respon
 		delete(openBlocks, i)
 		delete(blockThinkingText, i)
 		delete(upstreamSignatureEmitted, i)
+		// 清掉「上游下标 × 块类别 → 下游下标」映射：官方流不复用 content_block index，
+		// 同一上游桶再次出现时必须分配新的下游下标（严格单调递增），否则客户端按 index
+		// 归并会覆盖丢字或拼接签名。
+		if key, ok := blockKeys[i]; ok {
+			delete(blockIndexMap, key)
+			delete(blockKeys, i)
+		}
 		if currentBlock == i {
 			currentBlock = -1
 		}
