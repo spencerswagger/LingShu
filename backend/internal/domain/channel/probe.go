@@ -124,21 +124,27 @@ func (m *Manager) keyProbeLoop(ctx context.Context, keyID int64) {
 		if _, ok := m.GetKeyRuntime(keyID); !ok {
 			return
 		}
-		if !m.waitUntilNextKeyProbe(ctx, keyID) {
+		fired, branch := m.waitUntilNextKeyProbe(ctx, keyID)
+		if !fired {
 			return
 		}
-		m.keyProbeOnceUnlessDisabled(ctx, keyID)
+		m.keyProbeOnceUnlessDisabledFor(ctx, keyID, branch)
 	}
 }
 
 // keyProbeOnceUnlessDisabled 禁用态守卫：仅当密钥当前为非 DISABLED 时才执行真实探测。
 // 手动恢复为 NORMAL/DRAIN 后（仅查内存 Machine.State()，不触库），下一轮正常探测。
 func (m *Manager) keyProbeOnceUnlessDisabled(ctx context.Context, keyID int64) {
+	m.keyProbeOnceUnlessDisabledFor(ctx, keyID, branchCron)
+}
+
+// keyProbeOnceUnlessDisabledFor 带本轮调度分支的禁用态守卫（排空轮次只探被排空的模型）。
+func (m *Manager) keyProbeOnceUnlessDisabledFor(ctx context.Context, keyID int64, branch string) {
 	kr, ok := m.GetKeyRuntime(keyID)
 	if !ok || kr.Machine.State() == StateDisabled {
 		return
 	}
-	m.keyProbeOnce(ctx, keyID)
+	m.keyProbeOnceWithBranch(ctx, keyID, branch)
 }
 
 // disabledRecheckSeconds 禁用态复查周期：禁用期间不探测，只定期看一眼是否被手动恢复。
@@ -162,14 +168,14 @@ const drainProbeBackoffFails = 3
 //     探测一路推后，多密钥渠道的首探就会滑出排空间隔；
 //   - cron 分支从现在重算（cron 是绝对边界，重算结果一致）：恢复成 NORMAL 后立即回到 cron 语义，
 //     不会残留一次「排空遗留」的秒级探测。
-func (m *Manager) waitUntilNextKeyProbe(ctx context.Context, keyID int64) bool {
+func (m *Manager) waitUntilNextKeyProbe(ctx context.Context, keyID int64) (bool, string) {
 	var deadline time.Time // 本轮探测的截止时刻，跨唤醒保留
 	for {
 		// 先订阅唤醒通道再算 wait：否则「算完 wait → 订阅」窗口内发生的状态变化会被漏掉。
 		wake := m.probeWake.subscribe()
 		wait, branch, ok := m.nextKeyProbeWait(keyID)
 		if !ok {
-			return false
+			return false, ""
 		}
 		if wait < time.Second {
 			wait = time.Second
@@ -180,18 +186,18 @@ func (m *Manager) waitUntilNextKeyProbe(ctx context.Context, keyID int64) bool {
 		}
 		remain := time.Until(deadline)
 		if remain <= 0 {
-			return true // 截止已过（例如上游探测耗时超过间隔）：立即探测
+			return true, branch // 截止已过（例如上游探测耗时超过间隔）：立即探测
 		}
 		t := time.NewTimer(remain)
 		select {
 		case <-ctx.Done():
 			t.Stop()
-			return false
+			return false, ""
 		case <-wake:
 			t.Stop()
 			m.logger.Debug("key probe wait rescheduled", "key_id", keyID, "branch", branch)
 		case <-t.C:
-			return true
+			return true, branch
 		}
 	}
 }
@@ -333,6 +339,13 @@ func cronWait(expr string, now time.Time) time.Duration {
 //   - 目标选型为空（全部禁用/无模型）→ 探测失败记录（level='key'，不回退 GET /models）；
 //   - 否则以该密钥明文凭据作 Bearer，向渠道 base_url 对全部可用模型逐一发起最小对话探测。
 func (m *Manager) keyProbeOnce(ctx context.Context, keyID int64) {
+	// 无分支上下文（手动探测等）：按常态口径选型（静态作用域 + 已退避模型的 cron 覆盖）。
+	m.keyProbeOnceWithBranch(ctx, keyID, branchCron)
+}
+
+// keyProbeOnceWithBranch 按本轮调度分支选型：排空档轮次只探「被排空的那个模型」，
+// 常态档轮次走静态作用域（含已退避模型的 cron 覆盖）。
+func (m *Manager) keyProbeOnceWithBranch(ctx context.Context, keyID int64, branch string) {
 	kr, ok := m.GetKeyRuntime(keyID)
 	if !ok {
 		return
@@ -344,7 +357,7 @@ func (m *Manager) keyProbeOnce(ctx context.Context, keyID int64) {
 		m.recordProbe(ctx, keyID, "", "key", "", false, errMsg, ProbeUsage{}, 0)
 		return
 	}
-	targets := m.pickKeyProbeTargets(kr)
+	targets := m.pickKeyProbeTargetsFor(kr, branch)
 	if len(targets) == 0 {
 		errMsg := "无可用探测模型（全部禁用或无模型）"
 		m.markKeyProbeResult(keyID, errMsg)
@@ -374,6 +387,11 @@ type probeTarget struct {
 //     同时回喂该模型状态机，见 probeTarget.ModelRowID）；
 //  3. 全部禁用/无模型 → 返回空切片，探测视为失败（不回退 GET /models）。
 func (m *Manager) pickKeyProbeTargets(kr *KeyRuntime) []probeTarget {
+	return m.pickKeyProbeTargetsFor(kr, branchCron)
+}
+
+// pickKeyProbeTargetsFor 按本轮调度分支选型（排空档只探被排空的模型；常态档走静态作用域）。
+func (m *Manager) pickKeyProbeTargetsFor(kr *KeyRuntime, branch string) []probeTarget {
 	hp := normalizeHealthProbe(kr.Channel.HealthProbe)
 	// 写锁：需要推进「每渠道每间隔最多 1 次代探」的轮转游标。
 	m.mu.Lock()
@@ -387,6 +405,27 @@ func (m *Manager) pickKeyProbeTargets(kr *KeyRuntime) []probeTarget {
 		}
 		seen[t.Model] = true
 		targets = append(targets, t)
+	}
+
+	// 排空档轮次：这一轮就是为「被排空的那个模型」而跑，只探它——静态作用域只在 cron 轮次出现，
+	// 否则 probe_model 渠道的常态对象会被顺带拖进排空节奏（成本与语义都不对）。
+	// 只对「配了 probe_model」的渠道收窄：这类渠道的静态作用域不包含作用域外模型，排空轮次必须专探它，
+	// 不能顺带把 probe_model 也拖进排空节奏。普通渠道的静态作用域本来就覆盖全部模型，保持原口径
+	//（每轮探全部非禁用模型，探测结果正常回喂密钥与模型，且不计退避）。
+	if branch == branchModelDrain && hp.ProbeModel != "" {
+		if probeKey, ok := m.drainProbeKeyLocked(kr.Channel.ID); ok && probeKey == kr.Key.ID {
+			if cands := m.drainProbeCandidatesLocked(kr.Channel.ID); len(cands) > 0 {
+				idx := 0
+				if rt := m.rt[kr.Channel.ID]; rt != nil {
+					idx = rt.drainProbeSeq % len(cands)
+					rt.drainProbeSeq++
+				}
+				if mr := m.mrt[kr.Channel.ID][cands[idx]]; mr != nil {
+					return []probeTarget{{Model: mr.Model.InternalModelID, Level: "model",
+						ModelRowID: cands[idx], DrainOnly: true}}
+				}
+			}
+		}
 	}
 
 	// 静态作用域（常态探测对象）。
@@ -426,16 +465,8 @@ func (m *Manager) pickKeyProbeTargets(kr *KeyRuntime) []probeTarget {
 	// 动态叠加：任何进入排空的模型都要被定向代探（probe_model 只是常态偏好，不是白名单）。
 	// 每渠道每个间隔最多 1 个模型，多个同时排空时轮转；只由「排空代探密钥」承担。
 	if probeKey, ok := m.drainProbeKeyLocked(kr.Channel.ID); ok && probeKey == kr.Key.ID {
-		if cands := m.drainProbeCandidatesLocked(kr.Channel.ID); len(cands) > 0 {
-			idx := 0
-			if rt := m.rt[kr.Channel.ID]; rt != nil {
-				idx = rt.drainProbeSeq % len(cands)
-				rt.drainProbeSeq++
-			}
-			if mr := m.mrt[kr.Channel.ID][cands[idx]]; mr != nil {
-				add(probeTarget{Model: mr.Model.InternalModelID, Level: "model", ModelRowID: cands[idx], DrainOnly: true})
-			}
-		} else if kr.Machine.State() == StateNormal {
+		// 常态轮次不代探（轮转只在排空轮次推进）；只有「候选全部退避」时才顺带覆盖一次。
+		if len(m.drainProbeCandidatesLocked(kr.Channel.ID)) == 0 && kr.Machine.State() == StateNormal {
 			// 全部退避：退回 cron 覆盖——密钥仍是常态节奏，只在自己的 cron 轮次顺带探一次，
 			// 保证上游恢复后仍能被自动发现。
 			for _, id := range m.drainedModelsLocked(kr.Channel.ID) {

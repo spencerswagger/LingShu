@@ -641,8 +641,8 @@ func TestPickKeyProbeTargets_DrainProbeRotationAndCap(t *testing.T) {
 		}
 		return out
 	}
-	first := drainTargets(mgr.pickKeyProbeTargets(kr11))
-	second := drainTargets(mgr.pickKeyProbeTargets(kr11))
+	first := drainTargets(mgr.pickKeyProbeTargetsFor(kr11, branchModelDrain))
+	second := drainTargets(mgr.pickKeyProbeTargetsFor(kr11, branchModelDrain))
 	if len(first) != 1 || len(second) != 1 {
 		t.Fatalf("每个间隔只能代探 1 个模型，got %d/%d", len(first), len(second))
 	}
@@ -652,7 +652,7 @@ func TestPickKeyProbeTargets_DrainProbeRotationAndCap(t *testing.T) {
 	if first[0].Level != "model" || first[0].ModelRowID == 0 {
 		t.Fatalf("代探应是模型级并带行 ID，got %+v", first[0])
 	}
-	if extra := drainTargets(mgr.pickKeyProbeTargets(kr12)); len(extra) != 0 {
+	if extra := drainTargets(mgr.pickKeyProbeTargetsFor(kr12, branchModelDrain)); len(extra) != 0 {
 		t.Fatalf("非代探密钥不应获得额外代探目标，got %+v", extra)
 	}
 }
