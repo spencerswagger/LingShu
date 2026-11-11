@@ -1492,7 +1492,10 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 
 	case up.StatusCode == http.StatusTooManyRequests:
 		upErr := readUpstreamErrBody(up)
-		errMsg := upstreamErrDetail(up.StatusCode, upErr.Clean)
+		// 落库/账单展示的文案用**运营视图**（原文逐字节保真，只遮蔽本次凭据），
+		// 分类仍用 Clean（短字段必须无凭据）。
+		opBody := upErr.operatorView(ureq.Cred)
+		errMsg := upstreamErrDetail(up.StatusCode, opBody)
 		param, etype, ecode, summary := upstreamErrParts(upErr.Clean)
 		// 协议级错误策略同样覆盖 429（含 catch-all 策略）：此前仅默认分支生效，导致 429 绕过策略。
 		// 未命中保持改造前行为（按 Is429 回喂健康 + 可转移）；命中则按策略处置。
@@ -1513,7 +1516,7 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 				reason: reason429, sessionID: sessionID, durationMs: *msSince(start)})
 		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, errMsg, msSince(start))
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-			"error", upErr.Clean, "failed", errMsg, msSince(start), nil, dec("上游限流(429)"), withUpstreamStatus(up.StatusCode))
+			"error", opBody, "failed", errMsg, msSince(start), nil, dec("上游限流(429)"), withUpstreamStatus(up.StatusCode))
 		if pol.failover {
 			return &fwdOutcome{retry: true, is429: true, upstreamStatus: up.StatusCode, upstreamBody: upErr.Raw}
 		}
@@ -1524,7 +1527,10 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 		// 注意：此处按状态码归类为「凭据失效」，但上游报文可能指向模型维度
 		//（日志字段 err_scope=model）；该字段仅用于事后分诊，不改变既有状态机判定。
 		upErr := readUpstreamErrBody(up)
-		errMsg := upstreamErrDetail(up.StatusCode, upErr.Clean)
+		// 落库/账单展示的文案用**运营视图**（原文逐字节保真，只遮蔽本次凭据），
+		// 分类仍用 Clean（短字段必须无凭据）。
+		opBody := upErr.operatorView(ureq.Cred)
+		errMsg := upstreamErrDetail(up.StatusCode, opBody)
 		param, etype, ecode, summary := upstreamErrParts(upErr.Clean)
 		// 协议级错误策略同样覆盖 401/403（此前绕过策略）；未命中保持改造前行为（按 IsAuthFailure 回喂 + 可转移）。
 		pol := g.applyErrorPolicy(ctx, rt, routeRes, up.StatusCode, etype, ecode, summary)
@@ -1544,7 +1550,7 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 				reason: reasonAuth, sessionID: sessionID, durationMs: *msSince(start)})
 		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, errMsg, msSince(start))
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-			"error", upErr.Clean, "failed", errMsg, msSince(start), nil, dec("上游鉴权失败"), withUpstreamStatus(up.StatusCode))
+			"error", opBody, "failed", errMsg, msSince(start), nil, dec("上游鉴权失败"), withUpstreamStatus(up.StatusCode))
 		if pol.failover {
 			return &fwdOutcome{retry: true, upstreamStatus: up.StatusCode, upstreamBody: upErr.Raw}
 		}
@@ -1552,7 +1558,10 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 		return &fwdOutcome{responded: true, refundPre: true, downstreamStatus: pol.downstreamStatus}
 	default:
 		upErr := readUpstreamErrBody(up)
-		errMsg := upstreamErrDetail(up.StatusCode, upErr.Clean)
+		// 落库/账单展示的文案用**运营视图**（原文逐字节保真，只遮蔽本次凭据），
+		// 分类仍用 Clean（短字段必须无凭据）。
+		opBody := upErr.operatorView(ureq.Cred)
+		errMsg := upstreamErrDetail(up.StatusCode, opBody)
 		param, etype, ecode, summary := upstreamErrParts(upErr.Clean)
 		// 协议级错误策略：命中则按其处置（是否计入健康 / 是否 failover / 动作 / 下游状态码），
 		// 未命中保持改造前行为（默认安全态）。非流式与流式共用同一决策函数，语义一致。
@@ -1570,7 +1579,7 @@ func (g *Gateway) serveNonStream(w http.ResponseWriter, r *http.Request, start t
 				reason: errMsg, sessionID: sessionID, durationMs: *msSince(start)})
 		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, errMsg, msSince(start))
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-			"error", upErr.Clean, "failed", errMsg, msSince(start), nil, dec(errMsg), withUpstreamStatus(up.StatusCode))
+			"error", opBody, "failed", errMsg, msSince(start), nil, dec(errMsg), withUpstreamStatus(up.StatusCode))
 		if pol.failover {
 			return &fwdOutcome{retry: true, upstreamStatus: up.StatusCode, upstreamBody: upErr.Raw}
 		}
@@ -1595,11 +1604,20 @@ func upstreamErrNote(status int) string {
 
 // upstreamErrDetail 拼接状态码说明与上游响应体（截断；无响应体时仅说明），
 // 供 billing_records.error_message 与 call_logs.error_message 落库，管理员据此定位上游故障。
+// upstreamErrDetail 拼接状态码说明与上游响应体原文（运营可见视图），
+// 供 billing_records.error_message 与 call_logs.error_message 落库，管理员据此定位上游故障。
+// body 已是 operatorView（原文 + 仅遮蔽本次凭据）；此处只按「摘要字段」的预算截断并同字段标注，
+// 完整原文在 call_logs.resp_body（32KB）。
 func upstreamErrDetail(status int, body string) string {
-	if body == "" {
+	if strings.TrimSpace(body) == "" {
 		return upstreamErrNote(status)
 	}
-	return upstreamErrNote(status) + ": " + body
+	text := body
+	if len(text) > errDetailBodyMaxBytes {
+		note := fmt.Sprintf("\n…（已截断：摘要只保留前 %d 字节，完整原文见调用日志 resp_body）", errDetailBodyMaxBytes)
+		text, _ = truncateUTF8(text, errDetailBodyMaxBytes, note)
+	}
+	return upstreamErrNote(status) + ": " + text
 }
 
 // msSince 从 start 至今的毫秒数。
@@ -1854,7 +1872,10 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		return out
 	case up.StatusCode == http.StatusTooManyRequests:
 		upErr := readUpstreamErrBody(up)
-		errMsg := upstreamErrDetail(up.StatusCode, upErr.Clean)
+		// 落库/账单展示的文案用**运营视图**（原文逐字节保真，只遮蔽本次凭据），
+		// 分类仍用 Clean（短字段必须无凭据）。
+		opBody := upErr.operatorView(ureq.Cred)
+		errMsg := upstreamErrDetail(up.StatusCode, opBody)
 		param, etype, ecode, summary := upstreamErrParts(upErr.Clean)
 		// 协议级错误策略同样覆盖 429（含 catch-all 策略）：此前仅默认分支生效，导致 429 绕过策略。
 		// 未命中保持改造前行为（按 Is429 回喂健康 + 可转移）；命中则按策略处置。
@@ -1871,7 +1892,7 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 				reason: "上游限流(429)，已转入下一候选", sessionID: sessionID, durationMs: *msSince(start)})
 		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, errMsg, msSince(start))
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-			"error", upErr.Clean, "failed", errMsg, msSince(start), nil, dec("上游限流(429)"), withUpstreamStatus(up.StatusCode))
+			"error", opBody, "failed", errMsg, msSince(start), nil, dec("上游限流(429)"), withUpstreamStatus(up.StatusCode))
 		if pol.failover {
 			return &fwdOutcome{retry: true, is429: true, upstreamStatus: up.StatusCode, upstreamBody: upErr.Raw}
 		}
@@ -1882,7 +1903,10 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		// 注意：此处按状态码归类为「凭据失效」，但上游报文可能指向模型维度
 		//（日志字段 err_scope=model）；该字段仅用于事后分诊，不改变既有状态机判定。
 		upErr := readUpstreamErrBody(up)
-		errMsg := upstreamErrDetail(up.StatusCode, upErr.Clean)
+		// 落库/账单展示的文案用**运营视图**（原文逐字节保真，只遮蔽本次凭据），
+		// 分类仍用 Clean（短字段必须无凭据）。
+		opBody := upErr.operatorView(ureq.Cred)
+		errMsg := upstreamErrDetail(up.StatusCode, opBody)
 		param, etype, ecode, summary := upstreamErrParts(upErr.Clean)
 		// 协议级错误策略同样覆盖 401/403（此前绕过策略）；未命中保持改造前行为（按 IsAuthFailure 回喂 + 可转移）。
 		pol := g.applyErrorPolicy(ctx, rt, routeRes, up.StatusCode, etype, ecode, summary)
@@ -1898,7 +1922,7 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 				reason: "上游返回 401/403，已转入下一候选（该失败通常对下游不可见）", sessionID: sessionID, durationMs: *msSince(start)})
 		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, errMsg, msSince(start))
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-			"error", upErr.Clean, "failed", errMsg, msSince(start), nil, dec("上游鉴权失败"), withUpstreamStatus(up.StatusCode))
+			"error", opBody, "failed", errMsg, msSince(start), nil, dec("上游鉴权失败"), withUpstreamStatus(up.StatusCode))
 		if pol.failover {
 			return &fwdOutcome{retry: true, upstreamStatus: up.StatusCode, upstreamBody: upErr.Raw}
 		}
@@ -1906,7 +1930,10 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 		return &fwdOutcome{responded: true, refundPre: true, downstreamStatus: pol.downstreamStatus}
 	default:
 		upErr := readUpstreamErrBody(up)
-		errMsg := upstreamErrDetail(up.StatusCode, upErr.Clean)
+		// 落库/账单展示的文案用**运营视图**（原文逐字节保真，只遮蔽本次凭据），
+		// 分类仍用 Clean（短字段必须无凭据）。
+		opBody := upErr.operatorView(ureq.Cred)
+		errMsg := upstreamErrDetail(up.StatusCode, opBody)
 		param, etype, ecode, summary := upstreamErrParts(upErr.Clean)
 		// 协议级错误策略：命中则按其处置（是否计入健康 / 是否 failover / 动作 / 下游状态码），
 		// 未命中保持改造前行为（默认安全态）。与 serveNonStream 共用同一决策函数，语义一致。
@@ -1924,7 +1951,7 @@ func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, start time
 				reason: errMsg, sessionID: sessionID, durationMs: *msSince(start)})
 		bid := g.recordFailure(ctx, routeRes, model, token, pricingMode, sessionID, sessionName, errMsg, msSince(start))
 		g.writeCallLog(ctx, bid, "", token, routeRes, model, pricingMode, sessionID, reqMsgs,
-			"error", upErr.Clean, "failed", errMsg, msSince(start), nil, dec(errMsg), withUpstreamStatus(up.StatusCode))
+			"error", opBody, "failed", errMsg, msSince(start), nil, dec(errMsg), withUpstreamStatus(up.StatusCode))
 		if pol.failover {
 			return &fwdOutcome{retry: true, upstreamStatus: up.StatusCode, upstreamBody: upErr.Raw}
 		}

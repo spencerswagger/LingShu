@@ -1,6 +1,6 @@
 package gateway
 
-import "unicode/utf8"
+import "github.com/team/llmgateway/internal/pkg/errbody"
 
 // truncateUTF8 按 **UTF-8 字符边界**把 s 截断到不超过 maxBytes 字节（含 suffix），
 // 返回 (结果, 是否发生截断)。
@@ -15,33 +15,8 @@ import "unicode/utf8"
 //   - 未截断时原样返回（零分配、零差异）；
 //   - suffix 本身比 maxBytes 还长时只保留 suffix 的合法前缀（极端防御，不返回超限串）。
 //
-// 这是网关内**唯一**的字符串截断实现（errlog 的 truncateLog 也走它），不要再写第二套按字节切的版本。
+// 实现收口在 internal/pkg/errbody：渠道探活（channel 包）同样要截断上游原文，
+// 两边共用一套，避免出现「按字节切」的第二套实现。
 func truncateUTF8(s string, maxBytes int, suffix string) (string, bool) {
-	if maxBytes <= 0 {
-		return "", len(s) > 0
-	}
-	if len(s) <= maxBytes {
-		return s, false
-	}
-	if len(suffix) >= maxBytes {
-		return cutRunePrefix(suffix, maxBytes), true
-	}
-	cut := cutRunePrefix(s, maxBytes-len(suffix))
-	return cut + suffix, true
-}
-
-// cutRunePrefix 返回 s 的最长前缀，其字节数 ≤ maxBytes 且以完整字符结尾。
-// 从 maxBytes 处往回退到最近的 UTF-8 起始字节，保证不会切出半个字符。
-func cutRunePrefix(s string, maxBytes int) string {
-	if maxBytes <= 0 {
-		return ""
-	}
-	if len(s) <= maxBytes {
-		return s
-	}
-	cut := maxBytes
-	for cut > 0 && !utf8.RuneStart(s[cut]) {
-		cut--
-	}
-	return s[:cut]
+	return errbody.TruncateUTF8(s, maxBytes, suffix)
 }

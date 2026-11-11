@@ -2,16 +2,20 @@ package gateway
 
 import (
 	"encoding/json"
+	"fmt"
+	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"net/http/httptrace"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/team/llmgateway/internal/domain/router"
 	"github.com/team/llmgateway/internal/pkg/resp"
+	"github.com/team/llmgateway/internal/testutil/randbody"
 )
 
 // 本文件钉住「上游错误对外透传」契约（设计见
@@ -25,10 +29,6 @@ import (
 //
 // 为什么必须走 HTTP 层：request_id 来自中间件（context + 响应头），透传发生在写出响应的最后一步，
 // 只调内部函数会绕过「响应头 x-request-id → 错误体 request_id」这条链路。
-
-// openCodeGoRegionErrBody 运营反馈过的真实上游报文（OpenCode Go 区域未开通），
-// 只当样本用：用例断言的是「形状」，不是这段文案。
-const openCodeGoRegionErrBody = `{"error":{"type":"invalid_request_error","message":"This OpenCode Go model is hosted outside Europe and the United States. Select Global at https://opencode.ai/console/xxx/settings/privacy#regions to use it."}}`
 
 // doRequestWithID 以「中间件已生效」的姿态发一次请求：request_id 同时进 context 与响应头
 // （对齐 server.WithRequestID 的真实行为），从而能断言错误体 request_id 与调用日志 request_id 同源。
@@ -54,7 +54,7 @@ func streamFlagged(stream bool) string {
 	return `{"model":"gpt-4","stream":false,"messages":[{"role":"user","content":"hi"}]}`
 }
 
-// upstreamErrCase 一种上游错误**形状**（不绑定文案）。
+// upstreamErrCase 一种上游错误**形状**（不绑定文案，body 由随机生成器产出）。
 type upstreamErrCase struct {
 	name        string
 	status      int // 上游状态码（= 期望的对外状态码）
@@ -68,56 +68,78 @@ type upstreamErrCase struct {
 	mode string
 }
 
-func TestServeUpstreamError_ShapeTable(t *testing.T) {
-	longText := strings.Repeat("a", 12000)
-	cases := []upstreamErrCase{
-		{
-			name: "①OpenAI标准error形状", status: http.StatusBadRequest, contentType: "application/json",
-			body: openCodeGoRegionErrBody, mode: "verbatim",
-		},
-		{
-			name: "②带嵌套details", status: http.StatusUnprocessableEntity, contentType: "application/json",
-			body: `{"error":{"message":"validation failed","type":"invalid_request_error","code":"invalid_value",` +
-				`"details":[{"field":"temperature","issue":"out_of_range"},` +
-				`{"field":"max_tokens","issue":"too_large","nested":{"limit":4096,"got":8192}}]}}`,
-			mode: "verbatim",
-		},
-		{
-			name: "③只有message无type", status: http.StatusBadRequest, contentType: "application/json",
-			body: `{"error":{"message":"model is not supported in this region"}}`, mode: "verbatim",
-		},
-		{
-			name: "④非JSON纯文本", status: http.StatusBadRequest, contentType: "text/plain",
-			body: "upstream rejected: quota exhausted for project p-123 (code 4021)", mode: "rawtext",
-		},
-		{
-			name: "⑤HTML错误页", status: http.StatusBadRequest, contentType: "text/html",
-			body: `<html><body><h1>502 Bad Gateway</h1><p id="req">ray-id: 8f2c</p></body></html>`, mode: "rawtext",
-		},
-		{
-			name: "⑥空body", status: http.StatusBadRequest, contentType: "application/json",
-			body: "", mode: "empty",
-		},
-		{
-			name: "⑦超长>8KB", status: http.StatusBadRequest, contentType: "application/json",
-			body: `{"error":{"message":"` + longText + `"}}`, mode: "truncated",
-		},
-		{
-			name: "⑧5xx", status: http.StatusServiceUnavailable, contentType: "application/json",
-			body: `{"error":{"type":"server_error","message":"upstream overloaded: retry after 30s"}}`, mode: "verbatim",
-		},
-		{
-			name: "⑨鉴权错401", status: http.StatusUnauthorized, contentType: "application/json",
-			body: `{"error":{"message":"Incorrect API key provided","type":"invalid_request_error","code":"invalid_api_key"}}`,
-			mode: "verbatim",
-		},
-		{
-			name: "⑩其它JSON(顶层数组)", status: http.StatusConflict, contentType: "application/json",
-			body: `[{"code":"conflict","detail":"duplicate request"}]`, mode: "rawtext",
-		},
+// randomErrCases 随机生成用例集：**不绑定任何固定样例文案**。
+//
+// 覆盖要求（本任务的验收口径）：
+//   - ≥10 组不同的随机值（每轮运行都不同，种子打印在日志里便于复现）；
+//   - 8 类响应体形状各至少一组：OpenAI 形状 / 深嵌套 JSON / 平铺 JSON / 顶层数组 /
+//     纯文本 / HTML / 空体 / 超长。
+//
+// 随机化的意义：只要实现里存在「按内容白名单/字段裁剪/文案映射」的特判，随机值就会让它露馅
+// （固定样例做不到这点）。
+func randomErrCases(rnd *rand.Rand, t *testing.T) []upstreamErrCase {
+	t.Helper()
+	cases := make([]upstreamErrCase, 0, 20)
+	appendCase := func(name string, status int, ct, body, mode string) {
+		cases = append(cases, upstreamErrCase{
+			name: fmt.Sprintf("%s#%s", name, randbody.Digest(body)), status: status,
+			contentType: ct, body: body, mode: mode,
+		})
 	}
 
-	for _, tc := range cases {
+	// ①-⑩ 十组不同的随机值（形状轮换，内容全随机）。
+	statuses := []int{http.StatusBadRequest, http.StatusUnprocessableEntity, http.StatusConflict,
+		http.StatusInternalServerError, http.StatusBadGateway, http.StatusNotFound,
+		http.StatusServiceUnavailable, http.StatusTeapot, http.StatusBadRequest, http.StatusConflict}
+	for i := 0; i < 10; i++ {
+		status := statuses[i%len(statuses)]
+		switch i % 5 {
+		case 0:
+			appendCase(fmt.Sprintf("随机OpenAI形状-%d", i), status, "application/json",
+				randbody.JSONText(randbody.OpenAIError(rnd)), "verbatim")
+		case 1:
+			appendCase(fmt.Sprintf("随机深嵌套JSON-%d", i), status, "application/json",
+				randbody.JSONText(randbody.Doc(rnd, 4)), "rawtext")
+		case 2:
+			appendCase(fmt.Sprintf("随机平铺JSON-%d", i), status, "application/json",
+				randbody.JSONText(map[string]any{randbody.Word(rnd): randbody.Text(rnd, 5, 60),
+					randbody.Word(rnd): rnd.Intn(9999)}), "rawtext")
+		case 3:
+			appendCase(fmt.Sprintf("随机纯文本-%d", i), status, "text/plain",
+				"upstream rejected: "+randbody.Text(rnd, 20, 400), "rawtext")
+		case 4:
+			appendCase(fmt.Sprintf("随机HTML-%d", i), status, "text/html", randbody.HTML(rnd), "rawtext")
+		}
+	}
+
+	// ⑪-⑱ 八类形状各一组（内容同样随机）。
+	appendCase("形状-OpenAI错误对象", http.StatusBadRequest, "application/json",
+		randbody.JSONText(randbody.OpenAIError(rnd)), "verbatim")
+	appendCase("形状-深嵌套JSON", http.StatusUnprocessableEntity, "application/json",
+		randbody.JSONText(randbody.Doc(rnd, 5)), "rawtext")
+	appendCase("形状-平铺JSON", http.StatusBadRequest, "application/json",
+		randbody.JSONText(map[string]any{randbody.Word(rnd): randbody.Text(rnd, 1, 40)}), "rawtext")
+	appendCase("形状-顶层数组", http.StatusConflict, "application/json",
+		randbody.JSONText([]any{randbody.Doc(rnd, 2), randbody.Text(rnd, 3, 30)}), "rawtext")
+	// 结尾刻意带换行：`Raw` 不做 TrimSpace，首尾空白也是原文的一部分。
+	appendCase("形状-纯文本(带首尾空白)", http.StatusBadRequest, "text/plain",
+		"\nupstream says: "+randbody.Text(rnd, 10, 200)+"\n", "rawtext")
+	appendCase("形状-HTML错误页", http.StatusBadGateway, "text/html", randbody.HTML(rnd), "rawtext")
+	appendCase("形状-空body", http.StatusBadRequest, "application/json", "", "empty")
+	appendCase("形状-超长", http.StatusBadRequest, "application/json",
+		randbody.JSONText(map[string]any{"error": map[string]any{
+			"message":          randbody.Text(rnd, 40000, 60000),
+			randbody.Word(rnd): randbody.Doc(rnd, 2),
+		}}), "truncated")
+	return cases
+}
+
+func TestServeUpstreamError_RandomShapes(t *testing.T) {
+	seed := time.Now().UnixNano()
+	rnd := rand.New(rand.NewSource(seed))
+	t.Logf("随机种子 seed=%d（失败可用它复现）", seed)
+
+	for _, tc := range randomErrCases(rnd, t) {
 		tc := tc
 		for _, stream := range []bool{false, true} {
 			stream := stream
@@ -139,7 +161,7 @@ func TestServeUpstreamError_ShapeTable(t *testing.T) {
 				const rid = "req-shape"
 				rec := doRequestWithID(t, h.gw, "/v1/chat/completions", "sk-gw-t", streamFlagged(stream), rid)
 
-				// ① 状态码沿用上游（不再统一改写为 502/503）。
+				// ① 状态码沿用上游（不再统一改写为 502/503/400）。
 				if rec.Code != tc.status {
 					t.Fatalf("对外状态码必须沿用上游 %d, got %d: %s", tc.status, rec.Code, rec.Body.String())
 				}
@@ -155,7 +177,7 @@ func TestServeUpstreamError_ShapeTable(t *testing.T) {
 				}
 				msg := errorMessage(t, out)
 
-				// ② 内容完整可见（按形状断言）。
+				// ② 内容完整可见（按形状断言：只看形状，不看文案）。
 				switch tc.mode {
 				case "verbatim":
 					assertErrorSubtreeVerbatim(t, tc.body, out)
@@ -170,9 +192,6 @@ func TestServeUpstreamError_ShapeTable(t *testing.T) {
 					if !utf8.ValidString(msg) {
 						t.Fatal("截断后的 message 必须是合法 UTF-8（不能切出半个字符）")
 					}
-					if !strings.Contains(msg, `"message":"`+longText[:4096]) {
-						t.Fatal("截断必须保留可辨认的原文前缀（≥4KB）")
-					}
 					if !strings.Contains(msg, "已截断") {
 						t.Fatalf("截断必须在**同一字段**里显式标注，got %q", tail(msg, 120))
 					}
@@ -185,8 +204,8 @@ func TestServeUpstreamError_ShapeTable(t *testing.T) {
 					}
 				}
 
-				// ③ 失败必须同样落账单 + 调用日志，且按 request_id 可查。
-				assertFailureTraced(t, h, rid, tc.status, contentOf(tc.body))
+				// ③ 失败必须落账单 + 调用日志，且**原文逐字节**在运营可见处。
+				assertFailureTraced(t, h, rid, tc.status, tc.body)
 			})
 		}
 	}
@@ -228,17 +247,58 @@ func errorMessage(t *testing.T, out map[string]any) string {
 	return m
 }
 
-// contentOf 取样本里「应出现在落库错误体」的稳定片段（超长样本只取前缀，落库有独立上限）。
-func contentOf(body string) string {
-	s := strings.TrimSpace(body)
-	if len(s) > 256 {
-		return s[:256]
+// assertOperatorSeesExact 断言**运营侧**（调用日志 resp_body，账单详情直接展示）拿到的就是上游原文：
+// 除「本次实际使用的凭据原值」外**逐字节**一致——不做字段挑选、不比对某个片段。
+//
+// 超长（> callLogErrBodyMaxBytes）时改为断言两件事：
+//  1. 保留的前缀与上游原文逐字节一致（不是「含有某段」）；
+//  2. 同一字段里有显式截断标注，且标注里的原始字节数正确。
+func assertOperatorSeesExact(t *testing.T, what, stored, upstream string, secrets ...string) {
+	t.Helper()
+	want := upstream
+	for _, sec := range secrets {
+		want = strings.ReplaceAll(want, sec, "***")
 	}
-	return s
+	if len(want) <= callLogErrBodyMaxBytes {
+		if stored != want {
+			t.Fatalf("%s 必须是上游原文（逐字节），len(want)=%d len(got)=%d\nwant=%q\ngot =%q",
+				what, len(want), len(stored), head(want, 400), head(stored, 400))
+		}
+		return
+	}
+	marker := "\n…（已截断"
+	idx := strings.Index(stored, marker)
+	if idx < 0 {
+		t.Fatalf("%s 超长必须带显式截断标注（同字段），got=%q", what, head(stored, 400))
+	}
+	kept := stored[:idx]
+	if !strings.HasPrefix(want, kept) {
+		t.Fatalf("%s 截断前缀必须与上游原文逐字节一致（kept=%d 字节）", what, len(kept))
+	}
+	if len(kept) < callLogErrBodyMaxBytes-512 {
+		t.Fatalf("%s 保留量过小（%d 字节），上限 %d 字节利用率不足", what, len(kept), callLogErrBodyMaxBytes)
+	}
+	// 标注必须给出**可核对**的原始规模：读侧未到上限时是精确字节数，到了读取上限就如实说「超过上限」
+	// （不能编一个数：超过 64KB 的报文我们根本没读完）。
+	wantNote := fmt.Sprintf("共 %d 字节", len(want))
+	if len(want) > upstreamErrReadBytes {
+		wantNote = fmt.Sprintf("超过读取上限 %d 字节", upstreamErrReadBytes)
+	}
+	if !strings.Contains(stored[idx:], wantNote) {
+		t.Fatalf("%s 截断标注必须说明原始规模（want 含 %q），got=%q", what, wantNote, stored[idx:])
+	}
 }
 
-// assertFailureTraced 账单 + 调用日志成对留痕：按 request_id 可查，带上游状态码/错误体/渠道/模型/耗时。
-func assertFailureTraced(t *testing.T, h *harness, rid string, upStatus int, bodyFragment string) {
+// head 取字符串前 n 字节（失败信息展示用）。
+func head(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
+}
+
+// assertFailureTraced 账单 + 调用日志成对留痕：按 request_id 可查，带上游状态码/原文/渠道/模型/耗时。
+func assertFailureTraced(t *testing.T, h *harness, rid string, upStatus int, upBody string) {
 	t.Helper()
 	if len(h.billing.reqs) != 1 || !h.billing.reqs[0].Fail {
 		t.Fatalf("失败必须落 1 条 failed 账单, got %+v", h.billing.reqs)
@@ -266,15 +326,31 @@ func assertFailureTraced(t *testing.T, h *harness, rid string, upStatus int, bod
 		t.Error("调用日志必须记耗时 duration_ms")
 	}
 	// created_at 由 SQLCallLogStore.Insert 在落库时补齐（内存 fake 拿不到），故此处只校验耗时字段。
-	if bodyFragment != "" {
-		if !strings.Contains(cl.RespBody, bodyFragment) {
-			t.Errorf("调用日志 resp_body 必须保留上游错误体原文片段 %q，got %q", bodyFragment, cl.RespBody)
+	if upBody == "" {
+		return
+	}
+	// 运营侧可见：resp_body 是原文（逐字节），error_message 保留同一原文（摘要上限内原样）。
+	assertOperatorSeesExact(t, "调用日志 resp_body", cl.RespBody, upBody, harnessCredential)
+	prefix := upstreamErrNote(upStatus) + ": "
+	if !strings.HasPrefix(cl.ErrorMessage, prefix) {
+		t.Fatalf("error_message 应以可读状态说明开头，got %q", head(cl.ErrorMessage, 120))
+	}
+	got := strings.TrimPrefix(cl.ErrorMessage, prefix)
+	if len(upBody) <= errDetailBodyMaxBytes {
+		if got != upBody {
+			t.Fatalf("error_message 必须原样保留上游原文，want=%q got=%q", head(upBody, 200), head(got, 200))
 		}
-		if !strings.Contains(cl.ErrorMessage, bodyFragment) {
-			t.Errorf("账单 error_message 必须保留上游错误体原文片段 %q，got %q", bodyFragment, cl.ErrorMessage)
-		}
+		return
+	}
+	kept := strings.SplitN(got, "\n…（已截断", 2)[0]
+	if !strings.HasPrefix(upBody, kept) {
+		t.Fatalf("error_message 截断前缀必须与原文逐字节一致（kept=%d 字节）", len(kept))
 	}
 }
+
+// harnessCredential 与 build() 里注入给密钥运行时的明文凭据一致：
+// 运营视图只允许遮蔽它（精确值），其它内容一律原样。
+const harnessCredential = "test-key"
 
 // TestServeUpstreamError_TerminalKeepsLastUpstream 可转移状态（401/403/404/429/5xx）在上游只有一个候选时
 // 会走到「候选全部失败」的终结分支：此时对外必须是**上游状态码 + 上游报文**，
@@ -308,7 +384,7 @@ func TestServeUpstreamError_TerminalKeepsLastUpstream(t *testing.T) {
 			if out["request_id"] != rid {
 				t.Errorf("request_id want %q，got %v", rid, out["request_id"])
 			}
-			assertFailureTraced(t, h, rid, http.StatusInternalServerError, "upstream overloaded")
+			assertFailureTraced(t, h, rid, http.StatusInternalServerError, body)
 		})
 	}
 }

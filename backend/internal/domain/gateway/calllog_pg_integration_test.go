@@ -3,11 +3,14 @@ package gateway
 import (
 	"context"
 	"database/sql"
+	"math/rand"
 	"os"
 	"testing"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
+
+	"github.com/team/llmgateway/internal/testutil/randbody"
 )
 
 // 本文件是 call_logs 读写链路的**真实 PG** 守卫（无 DSN 时跳过，CI 默认不跑）：
@@ -49,11 +52,18 @@ func TestCallLog_PgRoundTrip(t *testing.T) {
 		_, _ = db.Exec(`DELETE FROM call_logs WHERE billing_id=$1`, bid)
 	})
 
+	// 报文内容随机（含中文、<>&、换行）：TEXT 列必须逐字节存得进、读得出，
+	// 固定样例会掩盖「存储层按内容/长度裁剪」这类缺陷。
+	seed := time.Now().UnixNano()
+	rnd := rand.New(rand.NewSource(seed))
+	t.Logf("随机种子 seed=%d", seed)
+	body := "upstream says: " + randbody.Text(rnd, 100, 400)
+
 	upStatus := 400
 	in := &CallLog{
 		BillingID: bid, RequestID: "req-roundtrip", Model: "gpt-4", PricingMode: "sale",
-		Status: "failed", RespKind: "error", RespBody: openCodeGoRegionErrBody,
-		ErrorMessage: "上游返回 400: " + openCodeGoRegionErrBody, UpstreamStatus: &upStatus,
+		Status: "failed", RespKind: "error", RespBody: body,
+		ErrorMessage: "上游返回 400: " + body, UpstreamStatus: &upStatus,
 		CreatedAt: time.Now(),
 	}
 	store := NewSQLCallLogStore(db)
@@ -73,7 +83,7 @@ func TestCallLog_PgRoundTrip(t *testing.T) {
 	if out.RequestID != "req-roundtrip" || out.Status != "failed" || out.RespKind != "error" {
 		t.Fatalf("关键字段读回不符: %+v", out)
 	}
-	if out.RespBody != openCodeGoRegionErrBody {
-		t.Fatalf("上游错误体读回不符: %q", out.RespBody)
+	if out.RespBody != body {
+		t.Fatalf("上游错误体读回不符（必须逐字节一致）\nwant=%q\ngot =%q", body, out.RespBody)
 	}
 }

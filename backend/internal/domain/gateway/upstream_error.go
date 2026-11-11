@@ -12,6 +12,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/team/llmgateway/internal/pkg/errbody"
 )
 
 // 本文件定义「上游（渠道）返回非 2xx」时的**对外错误透传**契约
@@ -44,21 +46,65 @@ const (
 	// upstreamErrCode 透传响应的 error.code：固定标识「本次失败由上游拒绝引起」，
 	// 不随状态码/文案变化（上游真实状态码在顶层 upstream_status，无需在此重复编码）。
 	upstreamErrCode = "upstream_error"
+	// callLogErrBodyMaxBytes 运营侧保存上游错误体原文（call_logs.resp_body）的字节上限。
+	// 对外的 8KB 是给客户端的预算，运营侧要能翻更长的原始报文（HTML 错误页 / 堆栈），
+	// 但也不能让单行无限膨胀（异步批量写库的内存与页面加载都会被拖垮），故给 32KB。
+	// 超限**不静默**：截断标注与被截原文写在同一个字段（见 storeTruncNote）。
+	callLogErrBodyMaxBytes = 32 << 10
+	// errDetailBodyMaxBytes error_message（账单/调用日志的可读摘要）里保留的原文上限。
+	// 与 resp_body 分开：摘要字段是列表页/告警都在读的短字段，不能按 32KB 灌进去；
+	// 超限时同样同字段标注，并指向 resp_body 看完整原文。
+	errDetailBodyMaxBytes = 4 << 10
 )
 
 // upstreamErrBody 一次上游错误响应体的两个视图：
 //   - Raw：原样（仅 TrimSpace，≤ upstreamErrReadBytes），供**对外透传**；
-//   - Clean：凭据样式清洗后（见 sanitizeErrSummary），供日志与落库。
+//   - Clean：凭据样式清洗后（见 sanitizeErrSummary），供日志短字段与错误分类；
+//   - ReadTruncated：读取层已到上限（Raw 只是前缀，原始总字节数不可知）。
 //
-// 分成两个字段而不是只留一个：对外要「原文原样」，落盘要「绝无明文凭据」，
-// 两者要求相反，混用任何一个都会踩另一条红线。
+// 分成多个视图而不是只留一个：对外要「原文原样」，日志短字段要「短且无凭据」，
+// 运营落库要「原文原样但绝不含本次凭据」——三处要求互不相同，混用任何一个都会踩另一条红线。
+// 运营视图见 operatorView（原文 + 精确遮蔽本次凭据 + 上限标注）。
 type upstreamErrBody struct {
-	Raw   string
-	Clean string
+	Raw           string
+	Clean         string
+	ReadTruncated bool
 }
 
 // isEmpty 判定是否读到了内容（空体时两个视图都为空）。
-func (b upstreamErrBody) isEmpty() bool { return b.Raw == "" && b.Clean == "" }
+func (b upstreamErrBody) isEmpty() bool { return strings.TrimSpace(b.Raw) == "" }
+
+// operatorView 返回**运营可见**的上游原文（落 call_logs.resp_body，账单详情直接展示）：
+//
+//   - 逐字节保真：不做样式清洗、不看内容白名单、不裁字段、不做文案映射——
+//     除「本次实际使用的凭据原值」被替换成 *** 外，其余每个字节（含 <>&、中文、
+//     随机 request-id、模型名、URL query）都原样保留；
+//   - 只遮蔽已知凭据（精确子串），不猜形状：历史按样式清洗会把 request-id、
+//     高熵随机串一并抹掉，运营等于看不到原文；
+//   - 超过 callLogErrBodyMaxBytes 时截断，**标注与被截原文同字段**（storeTruncNote）。
+//
+// secrets 传本次转发实际使用的凭据（ureq.Cred）。
+func (b upstreamErrBody) operatorView(secrets ...string) string {
+	if b.isEmpty() {
+		return ""
+	}
+	masked := errbody.MaskSecrets(b.Raw, secrets...)
+	if len(masked) <= callLogErrBodyMaxBytes && !b.ReadTruncated {
+		return masked
+	}
+	out, _ := errbody.TruncateUTF8(masked, callLogErrBodyMaxBytes, storeTruncNote(len(masked), b.ReadTruncated))
+	return out
+}
+
+// storeTruncNote 运营侧截断标注。数字给的是落库原文的字节数，便于判断丢了多少。
+// 读取层就到上限时（ReadTruncated）原始总长度不可知，如实说「超过读取上限」而不是编一个数。
+func storeTruncNote(total int, readTruncated bool) string {
+	if readTruncated {
+		return fmt.Sprintf("\n…（已截断：上游原文超过读取上限 %d 字节，此处只保留前 %d 字节）",
+			upstreamErrReadBytes, callLogErrBodyMaxBytes)
+	}
+	return fmt.Sprintf("\n…（已截断：上游原文共 %d 字节，此处只保留前 %d 字节）", total, callLogErrBodyMaxBytes)
+}
 
 // readUpstreamErrBody 读取上游错误响应体（上限 upstreamErrReadBytes；读取失败返回空）。
 // 读取失败不阻断错误响应：对外仍有状态码与可读说明，落库仍有状态码字段。
@@ -66,12 +112,20 @@ func readUpstreamErrBody(resp *http.Response) upstreamErrBody {
 	if resp == nil || resp.Body == nil {
 		return upstreamErrBody{}
 	}
-	b, err := io.ReadAll(io.LimitReader(resp.Body, upstreamErrReadBytes))
+	// 多读 1 字节用于判定「读取层是否已截断」——否则超长原始报文在读取处被静默切掉，
+	// 落库侧既拿不到完整内容、也无法诚实标注截断点。
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, upstreamErrReadBytes+1))
 	if err != nil {
 		return upstreamErrBody{}
 	}
-	raw := strings.TrimSpace(string(b))
-	return upstreamErrBody{Raw: raw, Clean: sanitizeErrSummary(raw)}
+	readTruncated := len(raw) > upstreamErrReadBytes
+	if readTruncated {
+		raw = raw[:upstreamErrReadBytes]
+	}
+	// Raw **不 TrimSpace**：首尾空白也是上游原文的一部分（截断/裁剪原文正是本任务要杜绝的）。
+	// 只有「全是空白」才视作空体（见 isEmpty）。
+	s := string(raw)
+	return upstreamErrBody{Raw: s, Clean: sanitizeErrSummary(strings.TrimSpace(s)), ReadTruncated: readTruncated}
 }
 
 // upstreamTruncNote 截断标注。与截断后的原文写在**同一字段**里（error.message），
