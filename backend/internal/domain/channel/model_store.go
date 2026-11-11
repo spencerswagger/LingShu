@@ -441,18 +441,28 @@ func (s *channelModelStore) ListModelEvents(ctx context.Context, channelID int64
 	return list, nil
 }
 
-// InsertProbeLog 落库一次探测记录（结果 + token 开销 + 层级）。probe_logs 唯一写入口。
-// ProbeLog.ChannelKeyID 对应 probe_logs.channel_key_id（密钥维度）。
+// InsertProbeLog 落库一次探测记录（结果 + token 开销 + 层级 + 上游原始错误）。
+// probe_logs 唯一写入口。ProbeLog.ChannelKeyID 对应 probe_logs.channel_key_id（密钥维度）。
 func (s *channelModelStore) InsertProbeLog(ctx context.Context, p *ProbeLog) error {
 	if p.ID == 0 {
 		p.ID = idgen.New()
 	}
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO probe_logs(id, channel_key_id, model_id, level, target, ok, error, input_tokens, output_tokens, cached_tokens, total_tokens, duration_ms)
-		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+		`INSERT INTO probe_logs(id, channel_key_id, model_id, level, target, ok, error, upstream_status, error_body, input_tokens, output_tokens, cached_tokens, total_tokens, duration_ms)
+		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
 		p.ID, p.ChannelKeyID, p.ModelID, p.Level, p.Target, p.OK, p.Error,
+		nullableInt(p.UpstreamStatus), p.ErrorBody,
 		p.InputTokens, p.OutputTokens, p.CachedTokens, p.TotalTokens, p.DurationMS)
 	return err
+}
+
+// nullableInt 把「0 = 没拿到上游状态码」写成 SQL NULL（与 call_logs.upstream_status 同口径：
+// NULL 表示本次没有上游状态码，0 不是合法 HTTP 状态码，混用会让「上游 0」这种假数据进库）。
+func nullableInt(v int) any {
+	if v == 0 {
+		return nil
+	}
+	return v
 }
 
 // ListProbeLogs 查询某密钥的探测历史（倒序）。keyID 对应 probe_logs.channel_key_id。
@@ -461,7 +471,7 @@ func (s *channelModelStore) ListProbeLogs(ctx context.Context, keyID int64, limi
 		limit = 100
 	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, channel_key_id, model_id, level, target, ok, error, input_tokens, output_tokens, cached_tokens, total_tokens, duration_ms, created_at
+		`SELECT id, channel_key_id, model_id, level, target, ok, error, upstream_status, error_body, input_tokens, output_tokens, cached_tokens, total_tokens, duration_ms, created_at
 		 FROM probe_logs WHERE channel_key_id=$1 ORDER BY id DESC LIMIT $2`, keyID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list probe logs: %w", err)
@@ -485,7 +495,7 @@ func (s *channelModelStore) ListProbeLogsByKeys(ctx context.Context, keyIDs []in
 	}
 	anyArg := "{" + strings.Join(parts, ",") + "}"
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, channel_key_id, model_id, level, target, ok, error, input_tokens, output_tokens, cached_tokens, total_tokens, duration_ms, created_at
+		`SELECT id, channel_key_id, model_id, level, target, ok, error, upstream_status, error_body, input_tokens, output_tokens, cached_tokens, total_tokens, duration_ms, created_at
 		 FROM probe_logs WHERE channel_key_id = ANY($1::bigint[]) ORDER BY id DESC LIMIT $2`, anyArg, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list probe logs by keys: %w", err)
@@ -503,9 +513,14 @@ func (s *channelModelStore) scanProbeLogs(rows interface {
 	list := make([]ProbeLog, 0, 16)
 	for rows.Next() {
 		var p ProbeLog
+		var upStatus sql.NullInt64
 		if err := rows.Scan(&p.ID, &p.ChannelKeyID, &p.ModelID, &p.Level, &p.Target, &p.OK, &p.Error,
+			&upStatus, &p.ErrorBody,
 			&p.InputTokens, &p.OutputTokens, &p.CachedTokens, &p.TotalTokens, &p.DurationMS, &p.CreatedAt); err != nil {
 			return nil, err
+		}
+		if upStatus.Valid {
+			p.UpstreamStatus = int(upStatus.Int64)
 		}
 		if p.Level == "" {
 			p.Level = "model" // 旧数据兜底
