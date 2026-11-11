@@ -235,15 +235,24 @@ func TestProbeErrorBody_MasksOnlyExactCredential(t *testing.T) {
 	// 只用字母/数字：断言要按**字面量**比对，混入引号会让 JSON 转义参与进来，反而干扰判据。
 	reqID := strings.ToUpper(randbody.Word(rnd)) + "-" + randbody.Word(rnd)
 	modelName := randbody.Word(rnd) + "-" + randbody.Word(rnd)
+	// 非凭据的「像凭据的长串」（≥20 位大小写+数字混排）：运营要拿它对上游工单，
+	// 旧清洗规则正是把这类串整段抹成 ***，这里钉住「不许扩大遮蔽面」。
+	idLike := randbody.AlnumID(rnd, 20)
 	body := fmt.Sprintf(`{"error":{"message":"invalid api key %s","request_id":%q,"model":%q,`+
-		`"url":"https://api.example.com/v1/x?api-version=2024-10-01"}}`,
-		testKeyACred, reqID, modelName)
+		`"upstream_trace":%q,"url":"https://api.example.com/v1/x?api-version=2024-10-01"}}`,
+		testKeyACred, reqID, modelName, idLike)
 
 	srv := newProbeBodyServer(t, http.StatusUnauthorized, body)
 	mgr, mock := newKeyProbeTestManager(t, srv.URL, HealthProbeConfig{FailThreshold: 2, TimeoutMS: 2000},
 		[]ChannelModel{{ID: 21, InternalModelID: "m1", ExternalModelID: 1, State: StateNormal}})
 	addKeyRuntime(t, mgr, 11, testKeyACred, StateNormal)
-	mock.ExpectExec(regexp.QuoteMeta(insertProbeLogSQL)).WillReturnResult(sqlmock.NewResult(1, 1))
+	// 401 会驱动模型状态机 NORMAL → DISABLED（既有语义），先给它排队，避免污染后面的落库断言。
+	expectModelTransition(mock, 1, "m1", StateNormal, StateDisabled, reasonAuthFailure)
+	var stored argString
+	mock.ExpectExec(regexp.QuoteMeta(insertProbeLogSQL)).
+		WithArgs(sqlmock.AnyArg(), int64(11), "m1", "model", srv.URL+"/chat/completions",
+			false, sqlmock.AnyArg(), http.StatusUnauthorized, &stored, 0, 0, 0, 0, sqlmock.AnyArg()).
+		WillReturnResult(sqlmock.NewResult(1, 1))
 
 	out, err := mgr.ProbeModelNow(1, 21)
 	if err != nil {
@@ -257,10 +266,21 @@ func TestProbeErrorBody_MasksOnlyExactCredential(t *testing.T) {
 	if out.ErrorBody != want {
 		t.Fatalf("除凭据外必须逐字节保留原文\nwant=%q\ngot =%q", want, out.ErrorBody)
 	}
-	for _, keep := range []string{reqID, modelName, "api-version=2024-10-01"} {
+	for _, keep := range []string{reqID, modelName, idLike, "api-version=2024-10-01"} {
 		if !strings.Contains(out.ErrorBody, keep) {
 			t.Fatalf("不得按样式/白名单清洗：%q 被抹掉了（got=%q）", keep, out.ErrorBody)
 		}
+	}
+	// 落库侧（运营事后翻历史的那一份）同样原样保留，且与返回给运营的逐字节一致。
+	if !stored.set {
+		t.Fatal("probe_logs.error_body 未写入")
+	}
+	if stored.got != out.ErrorBody {
+		t.Fatalf("probe_logs.error_body 必须与探活返回一致\nresp=%q\nlogs=%q",
+			headBytes(out.ErrorBody, 200), headBytes(stored.got, 200))
+	}
+	if !strings.Contains(stored.got, idLike) {
+		t.Fatalf("probe_logs.error_body 不得按样式脱敏非凭据长串（%q 消失）: %q", idLike, headBytes(stored.got, 400))
 	}
 }
 

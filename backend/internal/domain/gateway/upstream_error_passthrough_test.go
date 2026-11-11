@@ -819,9 +819,10 @@ func TestServeUpstreamError_DownstreamNeverSeesChannelCredential(t *testing.T) {
 	t.Logf("随机种子 seed=%d（失败可用它复现）", seed)
 
 	// 上游报文里同时出现：明文凭据（两次，含 Bearer 前缀）、随机 request-id、随机模型名、
-	// 以及随机正文——遮蔽只能命中凭据那两处。
+	// 「像凭据的长标识」（≥20 位大小写+数字混排）、以及随机正文——遮蔽只能命中凭据那两处。
 	reqID := strings.ToUpper(randbody.Word(rnd)) + "-" + randbody.Word(rnd)
 	modelName := randbody.Word(rnd) + "-" + randbody.Word(rnd)
+	idLike := randbody.AlnumID(rnd, 20) // 非凭据的长字母数字串：下游与运营侧都必须原样可见
 	noise := randbody.Text(rnd, 30, 200)
 
 	cases := []struct {
@@ -835,6 +836,7 @@ func TestServeUpstreamError_DownstreamNeverSeesChannelCredential(t *testing.T) {
 				"error": map[string]any{
 					"message": "upstream rejected credential Bearer " + harnessCredential + " for key " + modelName,
 					"echo":    "Bearer " + harnessCredential,
+					"trace":   idLike,
 					"noise":   noise,
 				},
 				"request_id": reqID,
@@ -842,11 +844,13 @@ func TestServeUpstreamError_DownstreamNeverSeesChannelCredential(t *testing.T) {
 		},
 		{
 			name: "纯文本-候选全败终结分支(500)", status: http.StatusInternalServerError,
-			body: "upstream failed: auth=" + harnessCredential + " rid=" + reqID + " model=" + modelName + " " + noise,
+			body: "upstream failed: auth=" + harnessCredential + " rid=" + reqID + " model=" + modelName +
+				" upstream_trace=" + idLike + " " + noise,
 		},
 		{
 			name: "非JSON对象-429终结分支", status: http.StatusTooManyRequests,
-			body: `[{"detail":"quota exhausted for ` + harnessCredential + `","rid":"` + reqID + `"}]`,
+			body: `[{"detail":"quota exhausted for ` + harnessCredential + `","rid":"` + reqID +
+				`","trace":"` + idLike + `"}]`,
 		},
 	}
 
@@ -884,6 +888,10 @@ func TestServeUpstreamError_DownstreamNeverSeesChannelCredential(t *testing.T) {
 			if !strings.Contains(rec.Body.String(), reqID) && !strings.Contains(msg, reqID) {
 				t.Fatalf("非凭据内容（request-id）必须保留: %q", head(msg, 300))
 			}
+			// ②b 非凭据的「像凭据的长字母数字串」在下游侧必须原样可见（不许扩大遮蔽面）。
+			if !strings.Contains(rec.Body.String(), idLike) {
+				t.Fatalf("下游侧不得按样式脱敏非凭据长串（%q 消失）: %s", idLike, head(rec.Body.String(), 400))
+			}
 
 			// ③ 运营侧同样不泄漏，但保留的仍是原文（不是把整段改写掉）。
 			if len(h.clogs.inserted) != 1 {
@@ -901,6 +909,13 @@ func TestServeUpstreamError_DownstreamNeverSeesChannelCredential(t *testing.T) {
 			}
 			if !strings.Contains(cl.RespBody, reqID) {
 				t.Fatalf("运营侧不得因遮蔽丢掉非凭据内容（request-id）: %q", head(cl.RespBody, 300))
+			}
+			// ③b 同一条长串在运营侧也必须原样可见（运营要拿它去对上游工单）。
+			if !strings.Contains(cl.RespBody, idLike) {
+				t.Fatalf("运营侧不得按样式脱敏非凭据长串（%q 消失）: %q", idLike, head(cl.RespBody, 400))
+			}
+			if !strings.Contains(cl.ErrorMessage, idLike) {
+				t.Fatalf("error_message 不得按样式脱敏非凭据长串（%q 消失）: %q", idLike, head(cl.ErrorMessage, 400))
 			}
 		})
 	}

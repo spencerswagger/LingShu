@@ -47,6 +47,30 @@ func Word(rnd *rand.Rand) string {
 	return b.String()
 }
 
+// AlnumID 生成「看起来像凭据」的长标识：大小写字母 + 数字混排、长度 ≥ minLen（默认取 20 起）。
+// 用途是钉住「不得按样式脱敏」——历史清洗规则会把 ≥20 位、含数字与字母、且带大写（或 ≥32 位）
+// 的连续串整段替换成 ***；这类串在真实报文里通常是 request-id / 上游自造的 id / 第三方 token，
+// 运营和调用方都需要看到它。
+func AlnumID(rnd *rand.Rand, minLen int) string {
+	if minLen < 20 {
+		minLen = 20
+	}
+	const upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+	const lower = "abcdefghijklmnopqrstuvwxyz"
+	const digits = "0123456789"
+	n := minLen + rnd.Intn(12)
+	var b strings.Builder
+	// 前三位保证同时含大写、小写、数字，命中「混合串」的判定条件。
+	b.WriteByte(upper[rnd.Intn(len(upper))])
+	b.WriteByte(lower[rnd.Intn(len(lower))])
+	b.WriteByte(digits[rnd.Intn(len(digits))])
+	all := upper + lower + digits
+	for b.Len() < n {
+		b.WriteByte(all[rnd.Intn(len(all))])
+	}
+	return b.String()
+}
+
 // Value 生成随机 JSON 值：字符串/数字/布尔/null/数组/对象（递归深度受 depth 限制）。
 func Value(rnd *rand.Rand, depth int) any {
 	if depth <= 0 {
