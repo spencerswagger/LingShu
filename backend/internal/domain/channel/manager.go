@@ -142,6 +142,9 @@ type RuntimeChannel struct {
 	// drainProbeSeq 模型排空代探的轮转游标（每渠道一个）：每个 drain 间隔最多代探 1 个模型，
 	// 多个模型同时排空时按候选列表轮转。
 	drainProbeSeq int
+	// drainProbeKeySeq 代探密钥的轮换游标：同一次排空事件内只借 1 个密钥（优先 NORMAL），
+	// 事件结束（渠道内已无排空模型）后指针前移，下一次排空换一把密钥，避免长期压在同一个密钥上。
+	drainProbeKeySeq int
 	// Protocol 该渠道引用的渠道协议快照（nil=渠道内联配置，使用 Channel.Protocol/BaseURL）。
 	Protocol *channelprotocol.ChannelProtocol
 }

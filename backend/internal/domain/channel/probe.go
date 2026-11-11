@@ -221,11 +221,16 @@ func (m *Manager) drainProbeKeyLocked(channelID int64) (int64, bool) {
 	}
 	slices.Sort(normal)
 	slices.Sort(drain)
+	// 轮换：同一时刻只用 1 个密钥代探，但每次排空事件换一把（避免长期压在同一个密钥上）。
+	seq := 0
+	if rt := m.rt[channelID]; rt != nil {
+		seq = rt.drainProbeKeySeq
+	}
 	if len(normal) > 0 {
-		return normal[0], true
+		return normal[seq%len(normal)], true
 	}
 	if len(drain) > 0 {
-		return drain[0], true
+		return drain[seq%len(drain)], true
 	}
 	return 0, false
 }
@@ -521,15 +526,27 @@ func (m *Manager) probeOnce(ctx context.Context, keyID int64, probeModel, level 
 	}
 	if modelRowID > 0 {
 		m.feedModelAndTransit(kr.Key.ChannelID, modelRowID, ProbeFeedback(fb))
+		rotate := false
 		m.mu.Lock()
 		if mr := m.mrt[kr.Key.ChannelID][modelRowID]; mr != nil {
 			if fb.IsSuccess {
 				mr.drainProbeFails = 0
+				// 代探成功且渠道内已无排空模型 → 本次排空事件结束：代探密钥指针前移，
+				// 下一次排空换一把（同一事件内始终只有 1 个借用密钥）。
+				if drainOnly && len(m.drainedModelsLocked(kr.Key.ChannelID)) == 0 {
+					if rt := m.rt[kr.Key.ChannelID]; rt != nil {
+						rt.drainProbeKeySeq++
+						rotate = true
+					}
+				}
 			} else if drainOnly {
 				mr.drainProbeFails++
 			}
 		}
 		m.mu.Unlock()
+		if rotate {
+			m.wakeProbeScheduling()
+		}
 	}
 	m.recordProbe(ctx, keyID, probeModel, level, target, fb.IsSuccess, errMsg, usage, dur)
 }

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -762,5 +763,76 @@ func TestKeyProbeLoop_DrainProbeBackoffReturnsToCron(t *testing.T) {
 	}
 	if kr, _ := mgr.GetKeyRuntime(11); kr.Machine.State() != StateNormal {
 		t.Fatalf("代探失败不应把密钥打成非 NORMAL，got %s", kr.Machine.State())
+	}
+}
+
+// TestDrainProbeKeyRotation_AcrossEpisodes 代探密钥轮换：同一次排空事件只借 1 个密钥，
+// 事件结束（模型已恢复、渠道内无排空模型）后指针前移，下一次排空换另一把密钥。
+func TestDrainProbeKeyRotation_AcrossEpisodes(t *testing.T) {
+	var mu sync.Mutex
+	borrowed := []string{} // 每次探测命中的凭据
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		borrowed = append(borrowed, r.Header.Get("Authorization"))
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"usage":{"total_tokens":1}}`))
+	}))
+	defer srv.Close()
+
+	now := time.Date(2026, 1, 2, 10, 30, 0, 0, time.UTC)
+	hp := HealthProbeConfig{Interval: "0 0 0 * * *", DrainIntervalSeconds: 15, TimeoutMS: 1000,
+		FailThreshold: 1, RecoveryThreshold: 1, ProbeModel: "probe-only"}
+	mgr := newDrainScheduleTestManager(t, srv.URL, hp, func() time.Time { return now })
+	addKeyRuntime(t, mgr, 12, testKeyBCred, StateNormal)
+
+	drainOnce := func() string {
+		if err := mgr.ManualSetModelState(1, 21, StateDrain); err != nil {
+			t.Fatalf("manual model drain: %v", err)
+		}
+		kr11, _ := mgr.GetKeyRuntime(11)
+		kr12, _ := mgr.GetKeyRuntime(12)
+		// 只取被选中那把密钥的排空轮次目标，并执行它（等价探测循环的那一轮）。
+		for _, kr := range []*KeyRuntime{kr11, kr12} {
+			// 只认「带代探目标」的那把密钥：本轮它就是被选中的借用密钥。
+			var drainTargets []probeTarget
+			for _, tg := range mgr.pickKeyProbeTargetsFor(kr, branchModelDrain) {
+				if tg.DrainOnly {
+					drainTargets = append(drainTargets, tg)
+				}
+			}
+			if len(drainTargets) == 0 {
+				continue
+			}
+			if len(drainTargets) != 1 {
+				t.Fatalf("每个间隔只能代探 1 个模型，got %d", len(drainTargets))
+			}
+			for _, tg := range drainTargets {
+				mgr.probeOnce(context.Background(), kr.Key.ID, tg.Model, tg.Level, tg.ModelRowID, tg.DrainOnly)
+			}
+			break
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if len(borrowed) == 0 {
+			t.Fatalf("排空后应有代探请求")
+		}
+		last := borrowed[len(borrowed)-1]
+		return last
+	}
+
+	first := drainOnce()
+	if mr := mgr.mrt[1][21]; mr.Machine.State() != StateNormal {
+		t.Fatalf("首次代探成功应恢复模型，got %s", mr.Machine.State())
+	}
+	second := drainOnce()
+	if first == second {
+		t.Fatalf("两次排空事件应由不同密钥代探（轮换），got 都是 %q", first)
+	}
+	// 轮换不改变「只借 1 个密钥」：每次事件只出现 1 个凭据。
+	mu.Lock()
+	defer mu.Unlock()
+	if len(borrowed) != 2 {
+		t.Fatalf("两次事件应各 1 次代探，got %d 次：%v", len(borrowed), borrowed)
 	}
 }
