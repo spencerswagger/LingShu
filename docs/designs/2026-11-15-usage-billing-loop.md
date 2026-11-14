@@ -56,6 +56,27 @@ client → 灵枢 facade（准入）
 - 拉取失败 → 窗口记 `error`（下一窗自然重试）；未配 `magpie.admin_key` → 每窗记 `skipped`，
   让运维看得见「没在对账」而不是无记录。
 
+### 5.1 最小字段集与降级表（契约 §8.2）
+
+- 最小 9 项：逐笔键、带时区时间戳、caller key、model、in/out tokens、failed、retried（必需），
+  cache_read（可降级）。每次响应产出 `LedgerReport`（可见性 + 分页形态 + failed/retried 笔数），
+  随窗口落进 `detail.ledger_report`。
+- 缺任一必需项 / 时间戳不带时区 / 分页只有 offset 形式（或看不出来）/ 一条记录都没有（`no_samples`）
+  → 该窗口**不可对账**：`status='blocked'`、`detail.blocked='blocked: pending POC'`、
+  `detail.blocked_reasons=[...]`。既不算通过也不算不通过——未做 POC 就不许写通过。
+  本地比对仍照算，但只作参考放 `detail.local_comparison`；blocked 窗不累计 `alarm_streak`、不升级审计。
+- 分页不臆造 cursor：只有接口自己回了 `next_cursor` 之类的字段才认 cursor，否则按 offset 判不可对账。
+- `blocked` 与 `skipped` 的区别：`skipped` = 我方没接上账本；`blocked` = 接上了但字段不全，
+  两者的排查动作不同，故单列状态（迁移 `0020_reconcile_blocked_status.sql`）。
+- 报警逻辑不变：只比 token 三段 + 笔数，不比金额；超阈值只告警、连续 3 窗升级、**永不回写账单**。
+
+### 5.2 资金流水备注常量（契约 §8.3）
+
+- 本期不补 `billing_id`（二期随状态机做）。守恒断言按「`user_id` × 60s 窗口 × 备注类别」三条：
+  钱包守恒 / 账单对齐 / 单笔上限。
+- 备注文案即分组键，只能有一处来源：`billing.FlowRemarkReserve`（预扣）/ `FlowRemarkDelta`（差额）/
+  `FlowRemarkRefund`（退回）。有源码级用例扫全仓，禁止在调用点另写字面量。
+
 ## 6. 已知风险
 
 1. 不注入 `include_usage`（第②件刻意不做）→ OpenAI 系流式 usage 可能整段缺失，`estimated=true` 占比升高；
