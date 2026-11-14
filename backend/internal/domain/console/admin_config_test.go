@@ -4,8 +4,8 @@ package console
 //
 //  1. GET **只返回计费块**（路由/会话过期/上游白名单已随转发链迁出，不再返回）；
 //  2. PUT **只写请求体里出现的键**（配置页按 tab 分别保存的前提）；
-//  3. 请求体里出现已摘除的旧块（Routing / SessionExpiration / UpstreamResponseHeaderWhitelist）时忽略，
-//     不写入任何键（避免老前端把死配置写回库）；
+//  3. 请求体里出现已下线的旧块（Routing / SessionExpiration / UpstreamResponseHeaderWhitelist）时
+//     **返回 400**：不静默忽略（静默忽略 + 200 会让前端弹「已保存」而实际什么都没写）；
 //  4. 已删除的成本页开关不再出现在 GET/PUT 里。
 
 import (
@@ -125,8 +125,80 @@ func TestPutSystemConfig_EmptyBody(t *testing.T) {
 	}
 }
 
-// TestPutSystemConfig_LegacyBlocksIgnored 老前端仍提交 Routing / SessionExpiration / 白名单时忽略（零写入）。
-func TestPutSystemConfig_LegacyBlocksIgnored(t *testing.T) {
+// TestPutSystemConfig_RetiredBlocksRejected 老前端仍提交 Routing / SessionExpiration / 白名单时
+// **返回 400 且零写入**：不能静默忽略（静默忽略 + 200 会让前端弹「已保存」而实际丢配置）。
+//
+// 三种块分别提交 + 一起提交共四例；文案必须点名到具体块（调用方能定位），且不泄露内部组件名。
+func TestPutSystemConfig_RetiredBlocksRejected(t *testing.T) {
+	cases := []struct {
+		name      string
+		body      string
+		wantNamed []string
+	}{
+		{
+			name:      "路由块",
+			body:      `{"Routing":{"SessionCost":{"enabled":true}}}`,
+			wantNamed: []string{"Routing"},
+		},
+		{
+			name:      "会话过期块",
+			body:      `{"SessionExpiration":{"default_ttl_minutes":5,"context_tiers":[],"turn_tiers":[]}}`,
+			wantNamed: []string{"SessionExpiration"},
+		},
+		{
+			name:      "上游响应头白名单",
+			body:      `{"UpstreamResponseHeaderWhitelist":["traceparent"]}`,
+			wantNamed: []string{"UpstreamResponseHeaderWhitelist"},
+		},
+		{
+			name:      "三块一起提交",
+			body:      `{"Routing":{"SessionCost":{}},"SessionExpiration":{},"UpstreamResponseHeaderWhitelist":[]}`,
+			wantNamed: []string{"Routing", "SessionExpiration", "UpstreamResponseHeaderWhitelist"},
+		},
+		{
+			name:      "旧块与计费块同时提交（整体拒绝，不写计费）",
+			body:      `{"Billing":{"R":10000},"Routing":{"SessionCost":{}}}`,
+			wantNamed: []string{"Routing"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatalf("sqlmock: %v", err)
+			}
+			defer db.Close()
+			admin := NewAdmin(db, billing.NewSqlStore(db), testUserIDFrom)
+
+			rec := httptest.NewRecorder()
+			admin.HandlePutSystemConfig(rec, httptest.NewRequest(http.MethodPut, "/api/v1/admin/configs/system", strings.NewReader(c.body)))
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d, want 400（不允许假成功）; body=%s", rec.Code, rec.Body.String())
+			}
+			msg := rec.Body.String()
+			for _, name := range c.wantNamed {
+				if !strings.Contains(msg, name) {
+					t.Fatalf("文案应点名 %s，实际 %s", name, msg)
+				}
+			}
+			// 不泄露内部组件名/迁移去向（管理端口径同样保持中性）。
+			for _, banned := range []string{"magpie", "代理侧", "迁出"} {
+				if strings.Contains(msg, banned) {
+					t.Fatalf("文案不应出现 %q: %s", banned, msg)
+				}
+			}
+			// 拒绝先于任何写入。
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatalf("被拒绝的请求不得产生任何写库: %v", err)
+			}
+		})
+	}
+}
+
+// TestPutSystemConfig_NullRetiredBlocksAccepted 显式 null 视为「没传」，不计入拒绝（前端不会这么发，
+// 但契约上「出现 null」与「出现对象」要区分，避免误伤）。
+func TestPutSystemConfig_NullRetiredBlocksAccepted(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock: %v", err)
@@ -134,15 +206,12 @@ func TestPutSystemConfig_LegacyBlocksIgnored(t *testing.T) {
 	defer db.Close()
 	admin := NewAdmin(db, billing.NewSqlStore(db), testUserIDFrom)
 
-	body := `{"Routing":{"SessionCost":{"enabled":true}},` +
-		`"SessionExpiration":{"default_ttl_minutes":5,"context_tiers":[],"turn_tiers":[]},` +
-		`"UpstreamResponseHeaderWhitelist":["traceparent"]}`
-	code, affected := putSystemConfig(t, admin, body)
+	code, affected := putSystemConfig(t, admin, `{"Billing":null,"Routing":null,"SessionExpiration":null,"UpstreamResponseHeaderWhitelist":null}`)
 	if code != http.StatusOK || affected != 0 {
-		t.Fatalf("已摘除的配置块应被忽略: code=%d affected=%v", code, affected)
+		t.Fatalf("null 应视为未传：code=%d affected=%v", code, affected)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("已摘除的配置块不得写库: %v", err)
+		t.Fatalf("空请求不应写库: %v", err)
 	}
 }
 

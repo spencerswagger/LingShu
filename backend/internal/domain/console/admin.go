@@ -611,6 +611,32 @@ func mustJSON(v any) json.RawMessage {
 	return json.RawMessage(b)
 }
 
+// systemConfigPutRequest 是 PUT /configs/system 的请求体。
+//
+// Billing 之外的三块（Routing / SessionExpiration / UpstreamResponseHeaderWhitelist）在 V2 第一期已下线：
+// 用指针接住，仅用于「出现过（非 null）就拒绝」，不参与任何写入。
+type systemConfigPutRequest struct {
+	Billing                         *systemConfigPutBilling `json:"Billing"`
+	Routing                         *json.RawMessage        `json:"Routing"`
+	SessionExpiration               *json.RawMessage        `json:"SessionExpiration"`
+	UpstreamResponseHeaderWhitelist *json.RawMessage        `json:"UpstreamResponseHeaderWhitelist"`
+}
+
+// retiredBlocks 返回请求体里出现的已下线配置块名（保持稳定顺序，便于文案与用例断言）。
+func (r systemConfigPutRequest) retiredBlocks() []string {
+	var out []string
+	if r.Routing != nil {
+		out = append(out, "Routing")
+	}
+	if r.SessionExpiration != nil {
+		out = append(out, "SessionExpiration")
+	}
+	if r.UpstreamResponseHeaderWhitelist != nil {
+		out = append(out, "UpstreamResponseHeaderWhitelist")
+	}
+	return out
+}
+
 // systemConfigPut Billing 块（全部可选：不传＝不改）。
 type systemConfigPutBilling struct {
 	R            json.RawMessage `json:"R"`
@@ -629,14 +655,21 @@ type systemConfigPutBilling struct {
 //   - 独立标量键各算 1 行（`Billing.R`、`Billing.CNYRate`……各自一行）；
 //   - 请求体为空 = 0；校验失败（400）= 0 且零写入。
 //
-// V2 第一期只受理计费口径（Billing 块）；请求体里出现 Routing / SessionExpiration /
-// UpstreamResponseHeaderWhitelist 时忽略（不再有对应运行时代码，接了也无处生效）。
+// V2 第一期只受理计费口径（Billing 块）。已下线的配置块（Routing / SessionExpiration /
+// UpstreamResponseHeaderWhitelist）**出现即 400**：这些键没有对应运行时代码，接了也无处生效；
+// 若静默忽略并返回 200，前端会弹「已保存」而实际什么都没写（假成功），下一轮读取又把改动抹掉。
+// 明确拒绝比假成功好——调用方据此知道「这个配置项在本版本不可改」。
 func (h *Admin) HandlePutSystemConfig(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Billing *systemConfigPutBilling `json:"Billing"`
-	}
+	var req systemConfigPutRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "请求体格式错误")
+		return
+	}
+
+	// 已下线的配置块：出现即拒绝（零写入），并在文案里点名是哪个块。
+	if retired := req.retiredBlocks(); len(retired) > 0 {
+		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest,
+			fmt.Sprintf("配置项 %s 已停用，本版本不支持在线修改", strings.Join(retired, "、")))
 		return
 	}
 
