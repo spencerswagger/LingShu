@@ -39,8 +39,10 @@ type viewModel struct {
 	TimeConfig   *billing.TimeCoeffConfig `json:"TimeConfig,omitempty"`
 	ContextTiers []billing.TierRule       `json:"ContextTiers,omitempty"`
 	Aliases      []string                 `json:"Aliases,omitempty"`
-	CreatedAt    time.Time                `json:"CreatedAt"`
-	UpdatedAt    time.Time                `json:"UpdatedAt"`
+	// MagpieModel 为代理侧模型名；nil = 未映射（不转发）。前端无需展示，但管理端需要能读写。
+	MagpieModel *string   `json:"MagpieModel,omitempty"`
+	CreatedAt   time.Time `json:"CreatedAt"`
+	UpdatedAt   time.Time `json:"UpdatedAt"`
 }
 
 func toView(m *ExternalModel) viewModel {
@@ -53,6 +55,7 @@ func toView(m *ExternalModel) viewModel {
 		TimeConfig:   m.TimeConfig,
 		ContextTiers: m.ContextTiers,
 		Aliases:      m.Aliases,
+		MagpieModel:  m.MagpieModel,
 		CreatedAt:    m.CreatedAt,
 		UpdatedAt:    m.UpdatedAt,
 	}
@@ -66,6 +69,8 @@ type createModelRequest struct {
 	TimeConfig   *billing.TimeCoeffConfig `json:"TimeConfig"`
 	ContextTiers []billing.TierRule       `json:"ContextTiers"`
 	Aliases      []string                 `json:"Aliases"`
+	// MagpieModel 传空串或 null 表示「不映射」（不转发到代理侧）。
+	MagpieModel *string `json:"MagpieModel"`
 }
 
 func decodeBody(w http.ResponseWriter, r *http.Request, v any) bool {
@@ -85,6 +90,7 @@ func toInput(req *createModelRequest) ExternalModelInput {
 		TimeConfig:   req.TimeConfig,
 		ContextTiers: req.ContextTiers,
 		Aliases:      req.Aliases,
+		MagpieModel:  req.MagpieModel,
 	}
 }
 

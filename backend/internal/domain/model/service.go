@@ -72,6 +72,8 @@ type ExternalModelInput struct {
 	ContextTiers []billing.TierRule
 	// Aliases 为仅用于模型名解析的别名（不出现在 /v1/models）；空为无别名。
 	Aliases []string
+	// MagpieModel 为代理侧模型名；nil/空串 = 未映射（不转发）。写入前会 trim 并归一空串为 nil。
+	MagpieModel *string
 }
 
 // Service 承载对外模型 CRUD 与价格应用业务逻辑。
@@ -231,7 +233,43 @@ func (s *Service) validateInput(in ExternalModelInput) error {
 			return errBadRequest("context_tiers 非法：" + err.Error())
 		}
 	}
+	if err := validateMagpieModel(in.MagpieModel); err != nil {
+		return err
+	}
 	return nil
+}
+
+// validateMagpieModel 校验代理模型名：非空时必须是紧凑标识符（不含空白/控制字符），
+// 长度上限 128；不校验它是否在代理侧存在（那是代理侧的事实，灵枢不做二次真相源）。
+func validateMagpieModel(p *string) error {
+	if p == nil {
+		return nil
+	}
+	v := strings.TrimSpace(*p)
+	if v == "" {
+		return nil
+	}
+	if len(v) > 128 {
+		return errBadRequest("magpie_model 过长（上限 128 字节）")
+	}
+	for _, r := range v {
+		if r <= ' ' || r == 0x7f {
+			return errBadRequest("magpie_model 不能包含空白或控制字符")
+		}
+	}
+	return nil
+}
+
+// normalizeMagpieModel 归一化代理模型名：trim 后空串归一为 nil（「未映射」只有一种表示）。
+func normalizeMagpieModel(p *string) *string {
+	if p == nil {
+		return nil
+	}
+	v := strings.TrimSpace(*p)
+	if v == "" {
+		return nil
+	}
+	return &v
 }
 
 func normalizeEnabled(in *bool, def bool) bool {
@@ -287,10 +325,14 @@ func (s *Service) CreateModel(ctx context.Context, in ExternalModelInput) (*Exte
 		TimeConfig:   in.TimeConfig,
 		ContextTiers: in.ContextTiers,
 		Aliases:      aliases,
+		MagpieModel:  normalizeMagpieModel(in.MagpieModel),
 	})
 	if err != nil {
 		if errors.Is(err, ErrNameExists) {
 			return nil, errConflict("模型外部名已存在")
+		}
+		if errors.Is(err, ErrMagpieModelExists) {
+			return nil, errConflict("该代理模型已被其他对外模型映射")
 		}
 		return nil, fmt.Errorf("create external model: %w", err)
 	}
@@ -347,10 +389,14 @@ func (s *Service) UpdateModel(ctx context.Context, id int64, in ExternalModelInp
 		TimeConfig:   in.TimeConfig,
 		ContextTiers: in.ContextTiers,
 		Aliases:      aliases,
+		MagpieModel:  normalizeMagpieModel(in.MagpieModel),
 	}
 	if err := s.store.Update(ctx, m); err != nil {
 		if errors.Is(err, ErrNameExists) {
 			return nil, errConflict("模型外部名已存在")
+		}
+		if errors.Is(err, ErrMagpieModelExists) {
+			return nil, errConflict("该代理模型已被其他对外模型映射")
 		}
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, errNotFound("模型不存在")

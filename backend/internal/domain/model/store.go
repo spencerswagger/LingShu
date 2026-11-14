@@ -32,20 +32,25 @@ type ExternalModel struct {
 	TimeConfig   *billing.TimeCoeffConfig
 	ContextTiers []billing.TierRule
 	// Aliases 为仅用于模型名解析的别名列表（不出现在 GET /v1/models）；空为无别名。
-	Aliases   []string
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	Aliases []string
+	// MagpieModel 是代理侧模型名（V2 第一期新增列 external_models.magpie_model）：
+	// 非空表示该对外名可转发到代理侧，转发时由灵枢把请求里的 model 改写成它；
+	// nil / 空串表示未映射 —— 不转发（准入层直接拒绝）。
+	MagpieModel *string
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
 }
 
 // cols 列出 external_models 表查询使用的全部列。
-const cols = `id, external_name, description, enabled, sale_rates, time_config, context_tiers, aliases, created_at, updated_at`
+const cols = `id, external_name, description, enabled, sale_rates, time_config, context_tiers, aliases, magpie_model, created_at, updated_at`
 
 // scanExternal 将一行扫描到 *ExternalModel，解析 sale_rates/time_config/context_tiers/aliases JSONB。
 func scanExternal(row interface{ Scan(...any) error }) (*ExternalModel, error) {
 	var m ExternalModel
 	var saleRaw, timeRaw, tiersRaw, aliasesRaw []byte
+	var magpieModel sql.NullString
 	err := row.Scan(&m.ID, &m.ExternalName, &m.Description, &m.Enabled, &saleRaw,
-		&timeRaw, &tiersRaw, &aliasesRaw, &m.CreatedAt, &m.UpdatedAt)
+		&timeRaw, &tiersRaw, &aliasesRaw, &magpieModel, &m.CreatedAt, &m.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -65,6 +70,11 @@ func scanExternal(row interface{ Scan(...any) error }) (*ExternalModel, error) {
 		if err := json.Unmarshal(tiersRaw, &m.ContextTiers); err != nil {
 			return nil, fmt.Errorf("parse context_tiers: %w", err)
 		}
+	}
+	// magpie_model 可空：NULL 与空串都归一为 nil（「未映射」只有一种表示）。
+	if magpieModel.Valid && strings.TrimSpace(magpieModel.String) != "" {
+		v := strings.TrimSpace(magpieModel.String)
+		m.MagpieModel = &v
 	}
 	// aliases 恒为 JSONB NOT NULL；扫描结果统一为非 nil 切片（无别名为空切片）。
 	m.Aliases = []string{}
@@ -139,6 +149,10 @@ func cloneExternal(m *ExternalModel) *ExternalModel {
 		return nil
 	}
 	c := *m
+	if m.MagpieModel != nil {
+		v := *m.MagpieModel
+		c.MagpieModel = &v
+	}
 	if m.SaleRates != nil {
 		c.SaleRates = make(billing.Rates, len(m.SaleRates))
 		for k, v := range m.SaleRates {
@@ -314,21 +328,49 @@ func (s *Store) list(ctx context.Context, query string, args ...any) ([]External
 // ErrNameExists 表示对外名称唯一约束冲突（PG 23505）。
 var ErrNameExists = errors.New("external model name already exists")
 
+// ErrMagpieModelExists 表示代理模型名唯一约束冲突（uq_external_models_magpie_model）：
+// 两个对外名映射到同一代理模型会让用量归集/对账口径分叉，故由库层唯一索引挡住。
+var ErrMagpieModelExists = errors.New("magpie model already mapped by another external model")
+
+// mapUniqueViolation 把 23505 唯一约束冲突映射为语义化错误（nil 表示不是唯一冲突）。
+// 按约束/索引名区分：含 magpie 的走 ErrMagpieModelExists，其余走 ErrNameExists（对外名）。
+func mapUniqueViolation(err error) error {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "23505" {
+		return nil
+	}
+	if strings.Contains(pgErr.ConstraintName, "magpie") || strings.Contains(pgErr.Message, "magpie_model") {
+		return ErrMagpieModelExists
+	}
+	return ErrNameExists
+}
+
+// nullableText 把可空字符串指针转换为 sql 参数（nil → NULL，空串也归一为 NULL）。
+func nullableText(p *string) any {
+	if p == nil {
+		return nil
+	}
+	v := strings.TrimSpace(*p)
+	if v == "" {
+		return nil
+	}
+	return v
+}
+
 // Insert 插入对外模型并返回回填主键后的完整记录；external_name 冲突返回 ErrNameExists。
 func (s *Store) Insert(ctx context.Context, m *ExternalModel) (*ExternalModel, error) {
 	if m.ID == 0 {
 		m.ID = idgen.New()
 	}
 	row := s.db.QueryRowContext(ctx,
-		`INSERT INTO external_models(id, external_name, description, enabled, sale_rates, time_config, context_tiers, aliases)
-		 VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING `+cols,
+		`INSERT INTO external_models(id, external_name, description, enabled, sale_rates, time_config, context_tiers, aliases, magpie_model)
+		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING `+cols,
 		m.ID, m.ExternalName, m.Description, m.Enabled, jsonB(m.SaleRates),
-		nullableJSON(m.TimeConfig), nullableJSON(m.ContextTiers), jsonAliases(m.Aliases))
+		nullableJSON(m.TimeConfig), nullableJSON(m.ContextTiers), jsonAliases(m.Aliases), nullableText(m.MagpieModel))
 	created, err := scanExternal(row)
 	if err != nil {
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
-			return nil, ErrNameExists
+		if e := mapUniqueViolation(err); e != nil {
+			return nil, e
 		}
 		return nil, err
 	}
@@ -345,14 +387,15 @@ func (s *Store) Insert(ctx context.Context, m *ExternalModel) (*ExternalModel, e
 func (s *Store) Update(ctx context.Context, m *ExternalModel) error {
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE external_models SET external_name=$1, description=$2, enabled=$3,
-		        sale_rates=$4, time_config=$5, context_tiers=$6, aliases=$7, updated_at=now()
-		 WHERE id=$8`,
+		        sale_rates=$4, time_config=$5, context_tiers=$6, aliases=$7,
+		        magpie_model=$8, updated_at=now()
+		 WHERE id=$9`,
 		m.ExternalName, m.Description, m.Enabled, jsonB(m.SaleRates),
-		nullableJSON(m.TimeConfig), nullableJSON(m.ContextTiers), jsonAliases(m.Aliases), m.ID)
+		nullableJSON(m.TimeConfig), nullableJSON(m.ContextTiers), jsonAliases(m.Aliases),
+		nullableText(m.MagpieModel), m.ID)
 	if err != nil {
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
-			return ErrNameExists
+		if e := mapUniqueViolation(err); e != nil {
+			return e
 		}
 		return err
 	}
