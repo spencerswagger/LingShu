@@ -24,6 +24,7 @@ import (
 	"github.com/team/llmgateway/internal/domain/calllog"
 	"github.com/team/llmgateway/internal/domain/console"
 	"github.com/team/llmgateway/internal/domain/identity"
+	"github.com/team/llmgateway/internal/domain/magpie"
 	"github.com/team/llmgateway/internal/domain/model"
 	"github.com/team/llmgateway/internal/domain/router"
 	"github.com/team/llmgateway/internal/domain/sync"
@@ -353,8 +354,11 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	// 只读配置缓存开关：关闭时 R/context_tiers/时段/样值 均退回直查。
 	billCfgProvider.SetCacheEnabled(readCacheOn)
 	// 失效钩子：sys_configs 写入（console 经 billing.UpsertConfig）后清空计费配置读缓存，即时生效。
+	// 订阅池前缀名单（magpie.subscription_prefixes）：低频变更，读侧缓存，写入后失效即生效。
+	magpiePrefixes := magpie.NewPrefixProvider(billStore.GetConfig)
 	billStore.SetConfigWriteHook(func() {
 		billCfgProvider.InvalidateCostConfig()
+		magpiePrefixes.Invalidate()
 	})
 	billSvc := billing.NewService(billStore, billCfgProvider, creditSvc)
 	// 账单落库失败时的本地持久重试队列：DB 抖动不丢账单（billing_id 唯一索引保证重投幂等）。
@@ -403,6 +407,22 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 		cnyRate: billCfgProvider.CnyRate,
 	})
 
+	// 对外转发入口（/v1 与 /v1beta）：灵枢只做 facade，转发与协议互译在代理侧。
+	// 未配置 magpie.base_url 时 NewHandler 返回 nil，server 侧保持 410 停用口径。
+	// OnComplete 刻意不注入：扣费/退预扣属第③件，本件只产出 Result 事实。
+	magpieHandler := magpie.NewHandler(magpie.Deps{
+		Config:        magpie.FromApp(cfg),
+		Tokens:        tokenSvc,
+		Models:        modelSvc,
+		Keys:          magpie.NewKeyStore(d),
+		CredentialKey: sm4Key,
+		Prefixes:      magpiePrefixes,
+		Logger:        logr,
+	})
+	if magpieHandler == nil {
+		logr.Info("未配置 magpie.base_url：对外转发接口保持停用（410）")
+	}
+
 	return &app{
 		deps: server.Deps{
 			Identity:     identityHandler,
@@ -416,6 +436,7 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 			Console:      consoleAdmin,
 			DevConsole:   consoleDev,
 			SyncAdmin:    syncHandler,
+			Facade:       magpieHandler,
 		},
 		syncer:     syncer,
 		sess:       sess,

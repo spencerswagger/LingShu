@@ -12,6 +12,7 @@ import (
 	"github.com/team/llmgateway/internal/domain/audit"
 	"github.com/team/llmgateway/internal/domain/console"
 	"github.com/team/llmgateway/internal/domain/identity"
+	"github.com/team/llmgateway/internal/domain/magpie"
 	"github.com/team/llmgateway/internal/domain/model"
 	"github.com/team/llmgateway/internal/domain/sync"
 	"github.com/team/llmgateway/internal/domain/tag"
@@ -37,6 +38,9 @@ type Deps struct {
 	Console      *console.Admin
 	DevConsole   *console.Dev
 	SyncAdmin    *sync.Handler
+	// Facade 是代理侧转发入口（/v1 与 /v1beta）。nil = 未配置 magpie.base_url，
+	// 此时 /v1 保持 410 停用口径（不半残挂载：转发链与准入是一体的，缺一即不可用）。
+	Facade *magpie.Handler
 }
 
 // Server 汇聚 HTTP 服务所需依赖。
@@ -259,10 +263,16 @@ func (s *Server) routes() {
 		dev.HandleFunc(path, gonePublicHandler)
 	}
 
-	// ---- 对外转发入口（/v1、/v1beta）：本版本不提供安全落地的转发能力 ----
-	// 挂在**根 mux 且无鉴权**，因此只返回通用文案（不暴露内部组件名与迁移去向）。
-	s.mux.HandleFunc("/v1/", gonePublicHandler)
-	s.mux.HandleFunc("/v1beta/", gonePublicHandler)
+	// ---- 对外转发入口（/v1 与 /v1beta）----
+	// 配了转发组件（Facade 非 nil）时由它接管：鉴权 → 模型准入 → 改写 → 转发。
+	// 未配置时保持 410 停用，而不是 404 或「转发到空地址」。两条路都挂在**根 mux 且无鉴权**，
+	// 停用文案一律用公开口径（不暴露内部组件名与迁移去向）。
+	if d.Facade != nil {
+		d.Facade.Mount(s.mux)
+	} else {
+		s.mux.HandleFunc("/v1/", gonePublicHandler)
+		s.mux.HandleFunc("/v1beta/", gonePublicHandler)
+	}
 
 	s.mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)

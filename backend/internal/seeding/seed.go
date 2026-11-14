@@ -39,6 +39,10 @@ var defaultSysConfigs = map[string]string{
 	// 路由成本比较样值用量：新会话创建时以该样值代入渠道成本单价求和比较「谁更便宜」
 	//（不参与实际计费）。三段（输入/缓存读/输出）均可配置，缺省按 0 计。
 	"routing.cost_sample": `{"input":10000,"cache_read":9000,"output":1000}`,
+	// 订阅池渠道前缀名单（代理侧把订阅模型以 provider 前缀暴露在选择器里）。
+	// 命中即拒绝租户调用（403 model_not_allowed）——订阅类账号默认不对租户开放。
+	// 键与默认值由 magpie 包定义，此处保持一致（seeding 不反向依赖域包，见 defaults_test.go 的对齐断言）。
+	"magpie.subscription_prefixes": `["claude/","codex/","copilot/","gemini-code-assist/","antigravity/","grok/"]`,
 	// 路由样值补齐比例：路由时刻只有「输入 token」可知，按这两个「相对纯输入」的比例
 	// 估算缓存读与输出（纯输入 + 缓存读 = 总输入），供会话成本路由的成本比较使用。
 	// 默认值与 routing.cost_sample（10000/9000/1000）同源。

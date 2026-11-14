@@ -1,0 +1,74 @@
+---
+summary: "灵枢 V2 第一期 · magpie 转发链接入（facade）"
+read_when:
+  - 排查 /v1 转发问题
+---
+
+# magpie 转发链接入（灵枢只做 facade）
+
+第一期第二件：把灵枢的自制转发链换成「接代理侧」。灵枢负责**身份与钱**，代理侧负责**转发与协议**。
+
+```
+客户端 ──(灵枢令牌)──▶ 灵枢 /v1/* ──(callerKey + 改写后的 model)──▶ magpie ──▶ 上游
+                          │
+                          ├─ 鉴权（令牌 → 用户，缓存 + 失效钩子）
+                          ├─ 准入（资产白名单：enabled + magpie_model + 非订阅池）
+                          ├─ 改写（只换 model，其余字节不动）
+                          └─ 旁路读 usage → Result（第③件计费接入点）
+```
+
+## 1. 端点与协议
+
+| 入站（＝出站同形） | 协议 | model 改写落点 | 计费 |
+|---|---|---|---|
+| `POST /v1/chat/completions` | openai-chat | body.model | 是 |
+| `POST /v1/responses` | openai-responses | body.model | 是 |
+| `POST /v1/messages` | anthropic-messages | body.model | 是 |
+| `POST /v1/messages/count_tokens` | anthropic-messages | body.model | 否 |
+| `POST /v1beta/models/{m}:generateContent` | gemini | **path** 的 `models/{m}` 段 | 是 |
+| `POST /v1beta/models/{m}:streamGenerateContent` | gemini | **path** | 是 |
+| `POST /v1beta/models/{m}:countTokens` | gemini | **path** | 否 |
+| `GET /v1/models` | — | — | — |
+
+只认上表路径；其余路径/方法一律 404/405（不放宽成开放代理）。
+
+## 2. 「只换两样东西」的落地方式
+
+- **凭证头**：`magpie_keys`（UNIQUE(token_id)）→ SM4 解密 → 按 `magpie.auth_header`/`auth_scheme` 注入；
+  入站的 `Authorization`/`x-api-key`/`api-key` 一律丢弃（强制黑名单）。
+- **model**：`external_models.magpie_model`。用 `json.Decoder.InputOffset` 定位顶层 `model` 的**值区间**，
+  只替换这段字节（不重新序列化，键序/空白/数字写法/转义序列原样）。
+- **其余**：请求头按强制黑名单剔除后逐值透传，`Accept-Encoding` 固定 `identity`；响应头只丢 hop-by-hop；
+  响应体（含 SSE 分包、错误体）逐字节原样；**不注入 `include_usage`**。
+
+## 3. 准入（灵枢唯一的策略点）
+
+三条同时成立才放行：
+
+1. `external_models.enabled = true`；
+2. `magpie_model` 非空（未映射 = 不转发）；
+3. `magpie_model` 不命中订阅池前缀（`sys_configs['magpie.subscription_prefixes']`，
+   默认 `claude/ codex/ copilot/ gemini-code-assist/ antigravity/ grok/`）。
+
+命中第三条 → `403`，`code=model_not_allowed`，文案「模型未对租户开放（订阅池渠道默认不开放）」。
+配置读失败时回落代码默认名单：**失败方向是继续拦截**，不是放开。
+
+## 4. 失败与超时口径
+
+| 场景 | 下游 | 备注 |
+|---|---|---|
+| 连不上 magpie / 建连失败 / DNS | 503 | `Retry-After: 5` |
+| 首包超时（收不到响应头） | 504 | `TimedOut=true` |
+| 流空闲超时 | 中断连接 | 响应头已发出，无法改状态码 |
+| 上游 4xx/5xx | **原样** | 不二次包装（包装就改了上游错误体） |
+| 上游 204/304 | 原样状态码、不写 body | `NoContent=true` |
+| 客户端中途取消 | 已读到的 usage 保留 | `Canceled=true` |
+
+错误体按**入站协议形状**输出（OpenAI / Anthropic / Gemini 三套），状态码语义按上表。
+超时阈值全部可配（`magpie.*_ms`），默认：建连 10s、非流式 600s、流首包 30s、流空闲 120s、计数 30s。
+
+## 5. 与第③件的接缝
+
+`Proxy.Forward` 产出 `Result`（`Status`/`Usage`+`HasUsage`/`Streamed`/`Canceled`/`TimedOut`/`NoContent`/
+`Billable`/`CallerKeyName`），由 `OnComplete` 钩子消费。**本期不注入钩子**：
+不写 `billing_records`、不碰预扣/结算、不写 `call_logs`（第一期已停写）。
