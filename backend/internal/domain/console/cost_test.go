@@ -36,7 +36,7 @@ func decodeCostResp(t *testing.T, rec *httptest.ResponseRecorder) costAPIResp {
 
 // TestCostStats_NilDB_Empty 未装配 DB 时返回空结构而非报错。
 func TestCostStats_NilDB_Empty(t *testing.T) {
-	h := NewAdmin(nil, nil, nil, nil)
+	h := NewAdmin(nil, nil, nil)
 	rec := httptest.NewRecorder()
 	h.HandleCostStats(rec, httptest.NewRequest(http.MethodGet, "/api/v1/admin/cost/stats", nil))
 	if rec.Code != http.StatusOK {
@@ -59,7 +59,7 @@ func TestCostStats_NilDB_Empty(t *testing.T) {
 
 // TestCostDefaults_NilDB_Empty 未装配 DB 时返回零值默认参数。
 func TestCostDefaults_NilDB_Empty(t *testing.T) {
-	h := NewAdmin(nil, nil, nil, nil)
+	h := NewAdmin(nil, nil, nil)
 	rec := httptest.NewRecorder()
 	h.HandleCostDefaults(rec, httptest.NewRequest(http.MethodGet, "/api/v1/admin/cost/defaults", nil))
 	if rec.Code != http.StatusOK {
@@ -86,7 +86,7 @@ func TestCostCurves_NilDB_TurnsClamp(t *testing.T) {
 		{"", costCurveDefaultTurns},
 	}
 	for _, tc := range cases {
-		h := NewAdmin(nil, nil, nil, nil)
+		h := NewAdmin(nil, nil, nil)
 		url := "/api/v1/admin/cost/curves"
 		if tc.raw != "" {
 			url += "?turns=" + tc.raw
@@ -117,7 +117,7 @@ func TestCostCurves_InvalidParams_BadRequest(t *testing.T) {
 		"?turns=abc",
 	}
 	for _, qs := range cases {
-		h := NewAdmin(nil, nil, nil, nil)
+		h := NewAdmin(nil, nil, nil)
 		rec := httptest.NewRecorder()
 		h.HandleCostCurves(rec, httptest.NewRequest(http.MethodGet, "/api/v1/admin/cost/curves"+qs, nil))
 		if rec.Code != http.StatusBadRequest {
@@ -144,7 +144,7 @@ func TestCostCurves_HitRateClampAndR(t *testing.T) {
 		}).AddRow(int64(1), "ch-a", "m1", "gpt", []byte(`{"input":0,"output":0,"cache_read":10000}`), nil)
 		mock.ExpectQuery(`SELECT cm\.channel_id.*FROM channel_models cm.*`).WillReturnRows(rows)
 
-		h := NewAdmin(db, billing.NewSqlStore(db), nil, nil)
+		h := NewAdmin(db, billing.NewSqlStore(db), nil)
 		if rp != nil {
 			h.SetCostRProvider(rp)
 		}
@@ -193,7 +193,7 @@ func TestCostCurves_CostRatesInvalid_SkipRow(t *testing.T) {
 		AddRow(int64(2), "ch-b", "mB", "gpt-b", []byte(`{"input":1,"output":0,"cache_read":0}`), []byte(`{"input":0,"output":0,"cache_read":0}`))
 	mock.ExpectQuery(`SELECT cm\.channel_id.*FROM channel_models cm.*`).WillReturnRows(rows)
 
-	h := NewAdmin(db, billing.NewSqlStore(db), nil, nil)
+	h := NewAdmin(db, billing.NewSqlStore(db), nil)
 	rec := httptest.NewRecorder()
 	h.HandleCostCurves(rec, httptest.NewRequest(http.MethodGet,
 		"/api/v1/admin/cost/curves?perTurnInput=10000&hitRate=0&turns=3", nil))
@@ -220,7 +220,7 @@ func TestCostCurves_CostRatesInvalid_SkipRow(t *testing.T) {
 
 // TestCostSession_MissingID_BadRequest 缺会话 ID 返回 400。
 func TestCostSession_MissingID_BadRequest(t *testing.T) {
-	h := NewAdmin(nil, nil, nil, nil)
+	h := NewAdmin(nil, nil, nil)
 	rec := httptest.NewRecorder()
 	h.HandleCostSession(rec, httptest.NewRequest(http.MethodGet, "/api/v1/admin/cost/session/", nil))
 	if rec.Code != http.StatusBadRequest {
@@ -251,7 +251,7 @@ func TestCostStats_Aggregation_ChannelDim(t *testing.T) {
 	mock.ExpectQuery(`WITH res AS .*to_json\(array_agg\(DISTINCT b\.external_model_name\)\).*WHERE b\.status = 'completed'.*GROUP BY 1`).
 		WillReturnRows(rows)
 
-	h := NewAdmin(db, billing.NewSqlStore(db), nil, nil)
+	h := NewAdmin(db, billing.NewSqlStore(db), nil)
 	rec := httptest.NewRecorder()
 	h.HandleCostStats(rec, httptest.NewRequest(http.MethodGet, "/api/v1/admin/cost/stats", nil))
 	if rec.Code != http.StatusOK {

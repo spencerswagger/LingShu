@@ -811,7 +811,7 @@ func TestHandleStatsLive_HTTP(t *testing.T) {
 	}
 	defer db.Close()
 
-	admin := NewAdmin(db, nil, nil, nil)
+	admin := NewAdmin(db, nil, nil)
 	admin.now = liveNow
 	admin.SetSessions(router.NewSessionRegistry(liveNow))
 

@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"github.com/team/llmgateway/internal/domain/billing"
-	"github.com/team/llmgateway/internal/domain/gateway"
+	"github.com/team/llmgateway/internal/domain/calllog"
 )
 
 // assertNoSensitive 断言输出 JSON 里不含任何敏感键（三处共用 devSensitiveKeys 单一来源）。
@@ -62,7 +62,7 @@ func TestToDevBillingListItem_MasksInternals(t *testing.T) {
 //     也是 PR #63 验收 P3 的核心）；
 //   - 白名单内的键（含嵌套 params 里的采样参数）完整保留，JSON 键名与共享视图一致。
 func TestToDevCallLogView_WhitelistOnly(t *testing.T) {
-	cl := &gateway.CallLog{
+	cl := &calllog.CallLog{
 		BillingID: "bill-1",
 		RequestID: "req-1",
 		Status:    "failed",

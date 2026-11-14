@@ -34,7 +34,7 @@ func assertGolden(t *testing.T, name string, got []byte) {
 // 只按对外模型名、非法参数 400 —— 四种场景的响应体都必须与改造前完全相同。
 func TestHandleCostPricingCurve_GoldenUnchanged(t *testing.T) {
 	t.Run("nil_db_no_params", func(t *testing.T) {
-		h := NewAdmin(nil, nil, nil, nil)
+		h := NewAdmin(nil, nil, nil)
 		h.now = func() time.Time { return pricingTestAt(t) }
 		rec := httptest.NewRecorder()
 		h.HandleCostPricingCurve(rec, httptest.NewRequest(http.MethodGet, "/api/v1/admin/cost/pricing-curve", nil))
@@ -66,7 +66,7 @@ func TestHandleCostPricingCurve_GoldenUnchanged(t *testing.T) {
 			WillReturnRows(sqlmock.NewRows([]string{"external_model_id", "external_name", "sale_rates", "time_config", "context_tiers"}).
 				AddRow(int64(31), "gpt-4o", []byte(`{"input":1.5,"output":6,"cache_read":0.15}`), nil, nil))
 
-		h := NewAdmin(db, nil, nil, nil)
+		h := NewAdmin(db, nil, nil)
 		h.now = func() time.Time { return pricingTestAt(t) }
 		rec := httptest.NewRecorder()
 		h.HandleCostPricingCurve(rec, httptest.NewRequest(http.MethodGet,
@@ -98,7 +98,7 @@ func TestHandleCostPricingCurve_GoldenUnchanged(t *testing.T) {
 				AddRow(int64(31), "gpt-4o", []byte(`{"input":1.5,"output":6,"cache_read":0.15}`),
 					[]byte(`{"Timezone":"Asia/Shanghai","Default":1.0,"Periodic":[{"Name":"高峰","Start":"18:00","End":"22:00","Coeff":1.5}]}`), nil))
 
-		h := NewAdmin(db, nil, nil, nil)
+		h := NewAdmin(db, nil, nil)
 		h.now = func() time.Time { return pricingTestAt(t) }
 		rec := httptest.NewRecorder()
 		h.HandleCostPricingCurve(rec, httptest.NewRequest(http.MethodGet,
@@ -113,7 +113,7 @@ func TestHandleCostPricingCurve_GoldenUnchanged(t *testing.T) {
 	})
 
 	t.Run("bad_param", func(t *testing.T) {
-		h := NewAdmin(nil, nil, nil, nil)
+		h := NewAdmin(nil, nil, nil)
 		h.now = func() time.Time { return pricingTestAt(t) }
 		rec := httptest.NewRecorder()
 		h.HandleCostPricingCurve(rec, httptest.NewRequest(http.MethodGet, "/api/v1/admin/cost/pricing-curve?Step=abc", nil))
@@ -127,7 +127,7 @@ func TestHandleCostPricingCurve_GoldenUnchanged(t *testing.T) {
 // TestHandleCostPricingCurve_NoLinesKey 不传 ChannelModelIDs 时响应里根本不出现 Lines 键
 // （omitempty 生效；golden 已覆盖字节，这里再给一条可读的断言，失败信息更直白）。
 func TestHandleCostPricingCurve_NoLinesKey(t *testing.T) {
-	h := NewAdmin(nil, nil, nil, nil)
+	h := NewAdmin(nil, nil, nil)
 	h.now = func() time.Time { return pricingTestAt(t) }
 	rec := httptest.NewRecorder()
 	h.HandleCostPricingCurve(rec, httptest.NewRequest(http.MethodGet, "/api/v1/admin/cost/pricing-curve", nil))

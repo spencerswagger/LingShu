@@ -65,7 +65,7 @@ func TestHandleListSessions_FilterAndNames(t *testing.T) {
 	}
 	defer db.Close()
 
-	admin := NewAdmin(db, nil, nil, nil)
+	admin := NewAdmin(db, nil, nil)
 	admin.now = fixedNow
 	reg := router.NewSessionRegistry(fixedNow)
 	admin.SetSessions(reg)
@@ -175,7 +175,7 @@ func TestHandleListSessions_Pagination(t *testing.T) {
 	}
 	defer db.Close()
 
-	admin := NewAdmin(db, nil, nil, nil)
+	admin := NewAdmin(db, nil, nil)
 	admin.now = fixedNow
 	now := fixedNow()
 
@@ -206,7 +206,7 @@ func TestHandleListSessions_Pagination(t *testing.T) {
 
 // TestHandleKickSessions 断言多维度踢下线：session_ids 先杀 + 其它维度 KillByFilter 不重复计数 + AND 语义 + 空体 400。
 func TestHandleKickSessions(t *testing.T) {
-	admin := NewAdmin(nil, nil, nil, nil)
+	admin := NewAdmin(nil, nil, nil)
 	reg := router.NewSessionRegistry(fixedNow)
 	admin.SetSessions(reg)
 

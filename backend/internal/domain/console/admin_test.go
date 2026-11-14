@@ -78,7 +78,7 @@ func TestDecorateList_KeyName(t *testing.T) {
 	}
 	defer db.Close()
 
-	admin := NewAdmin(db, billing.NewSqlStore(db), nil, nil)
+	admin := NewAdmin(db, billing.NewSqlStore(db), nil)
 
 	recs := []billing.Record{
 		{BillingID: "b1", UserID: 1, ChannelKeyID: 1},
@@ -121,7 +121,7 @@ func TestChannelNameByKeyID(t *testing.T) {
 	}
 	defer db.Close()
 
-	admin := NewAdmin(db, billing.NewSqlStore(db), nil, nil)
+	admin := NewAdmin(db, billing.NewSqlStore(db), nil)
 
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT c.name FROM channels c JOIN channel_keys k ON k.channel_id = c.id WHERE k.id = $1`)).
 		WithArgs(int64(7)).WillReturnRows(sqlmock.NewRows([]string{"name"}).AddRow("渠道B"))
@@ -149,7 +149,7 @@ func TestHandleListBillings_FilterParams(t *testing.T) {
 	}
 	defer db.Close()
 
-	admin := NewAdmin(db, billing.NewSqlStore(db), nil, nil)
+	admin := NewAdmin(db, billing.NewSqlStore(db), nil)
 
 	rows := sqlmock.NewRows([]string{
 		"id", "billing_id", "user_id", "pricing_mode", "token_id", "external_model_name",
@@ -259,8 +259,8 @@ func expectConfigRow(mock sqlmock.Sqlmock, key string, val []byte) {
 		WillReturnRows(sqlmock.NewRows([]string{"value"}).AddRow(val))
 }
 
-// systemConfigPayload 从 GET /admin/configs/system 响应中提取三组配置原文。
-func systemConfigPayload(t *testing.T, rec *httptest.ResponseRecorder) (billing, session, whitelist json.RawMessage) {
+// systemConfigPayload 从 GET /admin/configs/system 响应中取出计费块原文。
+func systemConfigPayload(t *testing.T, rec *httptest.ResponseRecorder) (billing json.RawMessage) {
 	t.Helper()
 	var body struct {
 		Data map[string]json.RawMessage `json:"Data"`
@@ -268,12 +268,11 @@ func systemConfigPayload(t *testing.T, rec *httptest.ResponseRecorder) (billing,
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("unmarshal response: %v", err)
 	}
-	for _, key := range []string{"Billing", "SessionExpiration", "UpstreamResponseHeaderWhitelist"} {
-		if _, ok := body.Data[key]; !ok {
-			t.Fatalf("响应缺少 %s 键: %s", key, rec.Body.String())
-		}
+	raw, ok := body.Data["Billing"]
+	if !ok {
+		t.Fatalf("响应缺少 Billing 键: %s", rec.Body.String())
 	}
-	return body.Data["Billing"], body.Data["SessionExpiration"], body.Data["UpstreamResponseHeaderWhitelist"]
+	return raw
 }
 
 // costSampleFromBilling 从 Billing 原文中解析路由成本比较样值（三段口径：input/cache_read/output）。
@@ -292,27 +291,15 @@ func costSampleFromBilling(t *testing.T, billing json.RawMessage) (input, cacheR
 	return b.CostSample.Input, b.CostSample.CacheRead, b.CostSample.Output
 }
 
-// sessionExpirationView 会话过期配置的断言视图。
-type sessionExpirationView struct {
-	DefaultTTLMinutes int `json:"default_ttl_minutes"`
-	ContextTiers      []struct {
-		MaxTokens  int `json:"max_tokens"`
-		TTLMinutes int `json:"ttl_minutes"`
-	} `json:"context_tiers"`
-	TurnTiers []struct {
-		MaxTurns   int `json:"max_turns"`
-		TTLMinutes int `json:"ttl_minutes"`
-	} `json:"turn_tiers"`
-}
-
-// TestHandleGetSystemConfig_ReturnsAllGroups 断言统一读取接口返回三组配置，且计费含成本样值。
-func TestHandleGetSystemConfig_ReturnsAllGroups(t *testing.T) {
+// TestHandleGetSystemConfig_ReturnsBilling 断言统一读取接口只返回计费块（含成本样值），
+// 且已摘除的 Routing / SessionExpiration / UpstreamResponseHeaderWhitelist 不再出现。
+func TestHandleGetSystemConfig_ReturnsBilling(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock: %v", err)
 	}
 	defer db.Close()
-	admin := NewAdmin(db, billing.NewSqlStore(db), nil, nil)
+	admin := NewAdmin(db, billing.NewSqlStore(db), nil)
 
 	expectConfigRow(mock, "billing.r", []byte(`10000`))
 	expectConfigRow(mock, "billing.cny_rate", []byte(`6.8`))
@@ -320,9 +307,6 @@ func TestHandleGetSystemConfig_ReturnsAllGroups(t *testing.T) {
 	expectConfigRow(mock, "billing.time_config", []byte(`{"timezone":"Asia/Shanghai","default_coeff":1.0}`))
 	expectConfigRow(mock, "routing.cost_sample",
 		[]byte(`{"input":10000,"cache_read":9000,"output":1000}`))
-	expectConfigRow(mock, "session.expiration",
-		[]byte(`{"default_ttl_minutes":7,"context_tiers":[{"max_tokens":1000,"ttl_minutes":3}],"turn_tiers":[{"max_turns":3,"ttl_minutes":9}]}`))
-	expectConfigRow(mock, "gateway.upstream_response_header_whitelist", []byte(`["traceparent"]`))
 
 	rec := httptest.NewRecorder()
 	admin.HandleGetSystemConfig(rec, httptest.NewRequest(http.MethodGet, "/api/v1/admin/configs/system", nil))
@@ -330,7 +314,7 @@ func TestHandleGetSystemConfig_ReturnsAllGroups(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
-	billingRaw, sessionRaw, whitelistRaw := systemConfigPayload(t, rec)
+	billingRaw := systemConfigPayload(t, rec)
 	in, cr, out := costSampleFromBilling(t, billingRaw)
 	if in != 10000 || cr != 9000 || out != 1000 {
 		t.Fatalf("CostSample=%d/%d/%d, want 10000/9000/1000（三段口径）", in, cr, out)
@@ -338,41 +322,25 @@ func TestHandleGetSystemConfig_ReturnsAllGroups(t *testing.T) {
 	if bytes.Contains(billingRaw, []byte(`"reasoning"`)) || bytes.Contains(billingRaw, []byte(`"cache_write"`)) {
 		t.Fatalf("CostSample 不应含废弃键 reasoning/cache_write: %s", billingRaw)
 	}
-	var se sessionExpirationView
-	if err := json.Unmarshal(sessionRaw, &se); err != nil {
-		t.Fatalf("unmarshal SessionExpiration: %v", err)
-	}
-	if se.DefaultTTLMinutes != 7 {
-		t.Fatalf("default_ttl_minutes=%d, want 7", se.DefaultTTLMinutes)
-	}
-	var wl []string
-	if err := json.Unmarshal(whitelistRaw, &wl); err != nil {
-		t.Fatalf("unmarshal whitelist: %v", err)
-	}
-	if len(wl) != 1 || wl[0] != "traceparent" {
-		t.Fatalf("whitelist=%v, want [traceparent]", wl)
-	}
 	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("mock expectations: %v", err)
+		t.Fatalf("mock expectations（不应读取已摘除配置键）: %v", err)
 	}
 }
 
-// TestHandleGetSystemConfig_Fallbacks 断言样值 / 会话配置缺失时回退内置默认，白名单缺失回退空数组。
+// TestHandleGetSystemConfig_Fallbacks 断言样值缺失时回退内置默认。
 func TestHandleGetSystemConfig_Fallbacks(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock: %v", err)
 	}
 	defer db.Close()
-	admin := NewAdmin(db, billing.NewSqlStore(db), nil, nil)
+	admin := NewAdmin(db, billing.NewSqlStore(db), nil)
 
 	expectConfigRow(mock, "billing.r", []byte(`10000`))
 	expectConfigRow(mock, "billing.cny_rate", []byte(`6.8`))
 	expectConfigRow(mock, "billing.context_tiers", []byte(`[]`))
 	expectConfigRow(mock, "billing.time_config", []byte(`{"timezone":"Asia/Shanghai","default_coeff":1.0}`))
-	expectConfigRow(mock, "routing.cost_sample", nil)                        // 缺失 → 回退内置默认
-	expectConfigRow(mock, "session.expiration", nil)                         // 缺失 → 回退内置默认
-	expectConfigRow(mock, "gateway.upstream_response_header_whitelist", nil) // 缺失 → 回退空数组
+	expectConfigRow(mock, "routing.cost_sample", nil) // 缺失 → 回退内置默认
 
 	rec := httptest.NewRecorder()
 	admin.HandleGetSystemConfig(rec, httptest.NewRequest(http.MethodGet, "/api/v1/admin/configs/system", nil))
@@ -380,42 +348,27 @@ func TestHandleGetSystemConfig_Fallbacks(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
-	billingRaw, sessionRaw, whitelistRaw := systemConfigPayload(t, rec)
-	in, cr, out := costSampleFromBilling(t, billingRaw)
+	in, cr, out := costSampleFromBilling(t, systemConfigPayload(t, rec))
 	if in != 10000 || cr != 9000 || out != 1000 {
 		t.Fatalf("回退样值=%d/%d/%d, want 10000/9000/1000（三段口径）", in, cr, out)
-	}
-	if bytes.Contains(billingRaw, []byte(`"reasoning"`)) || bytes.Contains(billingRaw, []byte(`"cache_write"`)) {
-		t.Fatalf("回退样值不应含废弃键 reasoning/cache_write: %s", billingRaw)
-	}
-	var se sessionExpirationView
-	if err := json.Unmarshal(sessionRaw, &se); err != nil {
-		t.Fatalf("unmarshal SessionExpiration: %v", err)
-	}
-	if se.DefaultTTLMinutes != 5 || len(se.ContextTiers) == 0 || len(se.TurnTiers) == 0 {
-		t.Fatalf("回退会话配置异常: %+v", se)
-	}
-	if string(whitelistRaw) != "[]" {
-		t.Fatalf("回退白名单=%s, want []", string(whitelistRaw))
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("mock expectations: %v", err)
 	}
 }
 
-// TestHandlePutSystemConfig_RoundTrip 断言统一写入按固定顺序落库七个配置键。
+// TestHandlePutSystemConfig_RoundTrip 断言计费块写入按固定顺序落库五个配置键。
 func TestHandlePutSystemConfig_RoundTrip(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock: %v", err)
 	}
 	defer db.Close()
-	admin := NewAdmin(db, billing.NewSqlStore(db), nil, testUserIDFrom)
+	admin := NewAdmin(db, billing.NewSqlStore(db), testUserIDFrom)
 
 	// 写入顺序与实现一致。
 	for _, key := range []string{
-		"billing.r", "billing.cny_rate", "billing.context_tiers", "billing.time_config",
-		"routing.cost_sample", "session.expiration", "gateway.upstream_response_header_whitelist",
+		"billing.r", "billing.cny_rate", "billing.context_tiers", "billing.time_config", "routing.cost_sample",
 	} {
 		mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO sys_configs(key, value, updated_by)`)).
 			WithArgs(key, sqlmock.AnyArg(), sqlmock.AnyArg()).
@@ -424,11 +377,7 @@ func TestHandlePutSystemConfig_RoundTrip(t *testing.T) {
 
 	body := `{"Billing":{"R":10000,"CnyRate":6.8,"ContextTiers":[],` +
 		`"TimeConfig":{"Timezone":"Asia/Shanghai","Default":1},` +
-		`"CostSample":{"input":12345,"cache_read":6000,"output":2000}},` +
-		`"SessionExpiration":{"default_ttl_minutes":5,` +
-		`"context_tiers":[{"max_tokens":2000,"ttl_minutes":5}],` +
-		`"turn_tiers":[{"max_turns":2,"ttl_minutes":5}]},` +
-		`"UpstreamResponseHeaderWhitelist":["traceparent"]}`
+		`"CostSample":{"input":12345,"cache_read":6000,"output":2000}}}`
 	rec := httptest.NewRecorder()
 	admin.HandlePutSystemConfig(rec, httptest.NewRequest(http.MethodPut, "/api/v1/admin/configs/system", strings.NewReader(body)))
 
@@ -440,18 +389,17 @@ func TestHandlePutSystemConfig_RoundTrip(t *testing.T) {
 	}
 }
 
-// TestHandlePutSystemConfig_Invalid 断言任一字段非法即返回 400 且不落库。
+// TestHandlePutSystemConfig_Invalid 断言任一计费字段非法即返回 400 且不落库。
 func TestHandlePutSystemConfig_Invalid(t *testing.T) {
 	cases := []struct {
 		name string
 		body string
 	}{
-		{"r 为 0", `{"Billing":{"R":0,"CnyRate":6.8,"ContextTiers":[],"TimeConfig":{},"CostSample":{"input":1}},"SessionExpiration":{"default_ttl_minutes":5,"context_tiers":[],"turn_tiers":[]},"UpstreamResponseHeaderWhitelist":[]}`},
-		{"cny_rate 非正数", `{"Billing":{"R":10000,"CnyRate":0,"ContextTiers":[],"TimeConfig":{},"CostSample":{"input":1}},"SessionExpiration":{"default_ttl_minutes":5,"context_tiers":[],"turn_tiers":[]},"UpstreamResponseHeaderWhitelist":[]}`},
-		{"cost_sample 为负", `{"Billing":{"R":10000,"CnyRate":6.8,"ContextTiers":[],"TimeConfig":{},"CostSample":{"input":-1}},"SessionExpiration":{"default_ttl_minutes":5,"context_tiers":[],"turn_tiers":[]},"UpstreamResponseHeaderWhitelist":[]}`},
-		{"会话 TTL 为 0", `{"Billing":{"R":10000,"CnyRate":6.8,"ContextTiers":[],"TimeConfig":{},"CostSample":{"input":1}},"SessionExpiration":{"default_ttl_minutes":0,"context_tiers":[],"turn_tiers":[]},"UpstreamResponseHeaderWhitelist":[]}`},
-		{"会话分档非升序", `{"Billing":{"R":10000,"CnyRate":6.8,"ContextTiers":[],"TimeConfig":{},"CostSample":{"input":1}},"SessionExpiration":{"default_ttl_minutes":5,"context_tiers":[{"max_tokens":8000,"ttl_minutes":5},{"max_tokens":2000,"ttl_minutes":30}],"turn_tiers":[]},"UpstreamResponseHeaderWhitelist":[]}`},
-		{"响应头名非法", `{"Billing":{"R":10000,"CnyRate":6.8,"ContextTiers":[],"TimeConfig":{},"CostSample":{"input":1}},"SessionExpiration":{"default_ttl_minutes":5,"context_tiers":[],"turn_tiers":[]},"UpstreamResponseHeaderWhitelist":["bad header"]}`},
+		{"r 为 0", `{"Billing":{"R":0}}`},
+		{"cny_rate 非正数", `{"Billing":{"CnyRate":0}}`},
+		{"cost_sample 为负", `{"Billing":{"CostSample":{"input":-1}}}`},
+		{"context_tiers 非数组", `{"Billing":{"ContextTiers":{}}}`},
+		{"time_config 非对象", `{"Billing":{"TimeConfig":[]}}`},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -460,7 +408,7 @@ func TestHandlePutSystemConfig_Invalid(t *testing.T) {
 				t.Fatalf("sqlmock: %v", err)
 			}
 			defer db.Close()
-			admin := NewAdmin(db, billing.NewSqlStore(db), nil, testUserIDFrom)
+			admin := NewAdmin(db, billing.NewSqlStore(db), testUserIDFrom)
 
 			rec := httptest.NewRecorder()
 			admin.HandlePutSystemConfig(rec, httptest.NewRequest(http.MethodPut, "/api/v1/admin/configs/system", strings.NewReader(c.body)))

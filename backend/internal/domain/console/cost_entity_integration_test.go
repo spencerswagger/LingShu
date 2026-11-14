@@ -113,7 +113,7 @@ func TestCostStats_CrossChannelFallback(t *testing.T) {
 	 (3,'b3',7,'sale','ghost-model','ghost-int',100,1,'{"input":10,"cache_read":0,"output":0}'::jsonb,0.8,0.4,'completed','2026-10-20 10:02:00+08'),
 	 (4,'b4',7,'sale','ghost-model','ghost-int',NULL,1,'{"input":10,"cache_read":0,"output":0}'::jsonb,0.4,0.2,'completed','2026-10-20 10:03:00+08')`)
 
-	h := NewAdmin(d, nil, nil, nil)
+	h := NewAdmin(d, nil, nil)
 	rec := httptest.NewRecorder()
 	h.HandleCostStats(rec, httptest.NewRequest(http.MethodGet, "/api/v1/admin/cost/stats", nil))
 	if rec.Code != http.StatusOK {

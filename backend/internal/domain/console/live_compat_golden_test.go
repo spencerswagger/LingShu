@@ -251,7 +251,7 @@ func TestLiveCompatGolden(t *testing.T) {
 
 			expectLiveCompatSQL(t, mock, f, write)
 
-			h := NewAdmin(db, nil, nil, nil)
+			h := NewAdmin(db, nil, nil)
 			h.now = liveNow
 			h.SetSessions(reg)
 			rec := httptest.NewRecorder()

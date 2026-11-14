@@ -208,7 +208,7 @@ func TestHandleCostPricingCurve_Multiline(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"external_model_id", "external_name", "sale_rates", "time_config", "context_tiers"}).
 			AddRow(int64(31), "gpt-4o", []byte(`{"input":1.5,"output":6,"cache_read":0.15}`), nil, nil))
 
-	h := NewAdmin(db, nil, nil, nil)
+	h := NewAdmin(db, nil, nil)
 	h.now = func() time.Time { return pricingTestAt(t) }
 	rec := httptest.NewRecorder()
 	h.HandleCostPricingCurve(rec, httptest.NewRequest(http.MethodGet,
@@ -274,7 +274,7 @@ func TestHandleCostPricingCurve_MultilinePointCap(t *testing.T) {
 			WillReturnRows(sqlmock.NewRows([]string{"external_model_id", "external_name", "sale_rates", "time_config", "context_tiers"}).
 				AddRow(int64(31), "gpt-4o", []byte(`{"input":1.5,"output":6,"cache_read":0.15}`), nil, nil))
 	}
-	h := NewAdmin(db, nil, nil, nil)
+	h := NewAdmin(db, nil, nil)
 	h.now = func() time.Time { return pricingTestAt(t) }
 	rec := httptest.NewRecorder()
 	h.HandleCostPricingCurve(rec, httptest.NewRequest(http.MethodGet,
@@ -308,7 +308,7 @@ func TestHandleCostPricingCurve_MultilineMissingID(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT cm.external_model_id, em.external_name`)).
 		WillReturnRows(sqlmock.NewRows([]string{"external_model_id", "external_name", "sale_rates", "time_config", "context_tiers"}))
 
-	h := NewAdmin(db, nil, nil, nil)
+	h := NewAdmin(db, nil, nil)
 	h.now = func() time.Time { return pricingTestAt(t) }
 	rec := httptest.NewRecorder()
 	h.HandleCostPricingCurve(rec, httptest.NewRequest(http.MethodGet,
@@ -365,7 +365,7 @@ func TestHandleCostSessionTrace_ActualSwitch(t *testing.T) {
 		WithArgs("sess-1", nil).
 		WillReturnRows(rows)
 
-	h := NewAdmin(db, nil, nil, nil)
+	h := NewAdmin(db, nil, nil)
 	h.now = func() time.Time { return pricingTestAt(t) }
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/cost/session/sess-1/trace", nil)
 	req.SetPathValue("id", "sess-1")
@@ -434,7 +434,7 @@ func TestHandleCostSessionTrace_PredictedBreakEven(t *testing.T) {
 			AddRow(int64(900), int64(5), "渠道A", "gpt-4o-int", []byte(`{"input":1,"output":4,"cache_read":0.1}`), nil, nil).
 			AddRow(int64(901), int64(6), "渠道B", "gpt-4o-int", []byte(`{"input":0.2,"output":0.8,"cache_read":0.02}`), nil, nil))
 
-	h := NewAdmin(db, nil, nil, nil)
+	h := NewAdmin(db, nil, nil)
 	h.now = func() time.Time { return pricingTestAt(t) }
 	req := httptest.NewRequest(http.MethodGet,
 		"/api/v1/admin/cost/session/sess-2/trace?Step=1000&MaxTokens=20000&HitRate=0.5&At=19:30", nil)
@@ -498,7 +498,7 @@ func TestHandleCostSessionTrace_NoCrossing(t *testing.T) {
 			AddRow(int64(900), int64(5), "渠道A", "gpt-4o-int", []byte(`{"input":1,"output":4,"cache_read":0.1}`), nil, nil).
 			AddRow(int64(901), int64(6), "渠道B", "gpt-4o-int", []byte(`{"input":9,"output":40,"cache_read":1}`), nil, nil))
 
-	h := NewAdmin(db, nil, nil, nil)
+	h := NewAdmin(db, nil, nil)
 	h.now = func() time.Time { return pricingTestAt(t) }
 	req := httptest.NewRequest(http.MethodGet,
 		"/api/v1/admin/cost/session/sess-3/trace?Step=1000&MaxTokens=20000&At=19:30", nil)
@@ -542,7 +542,7 @@ func TestHandleCostSessionTrace_SingleChannelOnly(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"id", "channel_id", "name", "internal_model_id", "cost_rates", "time_config", "context_tiers"}).
 			AddRow(int64(900), int64(5), "渠道A", "gpt-4o-int", []byte(`{"input":1,"output":4,"cache_read":0.1}`), nil, nil))
 
-	h := NewAdmin(db, nil, nil, nil)
+	h := NewAdmin(db, nil, nil)
 	h.now = func() time.Time { return pricingTestAt(t) }
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/cost/session/sess-4/trace?MaxTokens=5000&At=19:30", nil)
 	req.SetPathValue("id", "sess-4")
@@ -587,7 +587,7 @@ func TestHandleCostSessionTrace_Truncated(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"id", "channel_id", "name", "internal_model_id", "cost_rates", "time_config", "context_tiers"}).
 			AddRow(int64(900), int64(5), "渠道A", "m1", []byte(`{"input":1,"output":4,"cache_read":0.1}`), nil, nil))
 
-	h := NewAdmin(db, nil, nil, nil)
+	h := NewAdmin(db, nil, nil)
 	h.now = func() time.Time { return pricingTestAt(t) }
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/cost/session/sess-5/trace?Limit=2&MaxTokens=5000&At=19:30", nil)
 	req.SetPathValue("id", "sess-5")
@@ -610,7 +610,7 @@ func TestHandleCostSessionTrace_Truncated(t *testing.T) {
 
 // TestHandleCostSessionTrace_NilDB 未装配 DB 时仍返回 200 + 空轨迹（接口恒可用，不再有开关门控）。
 func TestHandleCostSessionTrace_NilDB(t *testing.T) {
-	h := NewAdmin(nil, nil, nil, nil)
+	h := NewAdmin(nil, nil, nil)
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/cost/session/sess-x/trace", nil)
 	req.SetPathValue("id", "sess-x")
 	rec := httptest.NewRecorder()
@@ -631,7 +631,7 @@ func TestHandleCostSessionTrace_NilDB(t *testing.T) {
 
 // TestPredictBreakEven_UnresolvedChannel 账单没解析到渠道内部模型 → 明确说明，不瞎算。
 func TestPredictBreakEven_UnresolvedChannel(t *testing.T) {
-	h := NewAdmin(nil, nil, nil, nil)
+	h := NewAdmin(nil, nil, nil)
 	got := h.predictBreakEven(t.Context(), costTracePoint{ChannelID: 5}, pricingCurveParams{Step: 1000}, 10000)
 	if got == nil || got.Matched || !contains(got.Reason, "没有「成功且解析到渠道内部模型」的记录") {
 		t.Fatalf("应给出无法预测的原因: %+v", got)
@@ -671,7 +671,7 @@ func TestHandleCostSessionTrace_BreakEvenAxisReported(t *testing.T) {
 			AddRow(int64(900), int64(5), "渠道A", "gpt-4o-int", []byte(`{"input":1,"output":4,"cache_read":0.1}`), nil, nil).
 			AddRow(int64(901), int64(6), "渠道B", "gpt-4o-int", []byte(`{"input":0.2,"output":0.8,"cache_read":0.02}`), nil, nil))
 
-	h := NewAdmin(db, nil, nil, nil)
+	h := NewAdmin(db, nil, nil)
 	h.now = func() time.Time { return pricingTestAt(t) }
 	// 只传 At：Step / MaxTokens 全走缺省推导。
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/cost/session/sess-6/trace?At=19:30", nil)
@@ -716,9 +716,9 @@ func TestPredictBreakEven_AxisAlwaysReported(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			var h *Admin
 			if c.name == "未解析到渠道内部模型" {
-				h = NewAdmin(nil, nil, nil, nil)
+				h = NewAdmin(nil, nil, nil)
 			} else {
-				h = NewAdmin(nil, nil, nil, nil) // db=nil 也会走提前返回
+				h = NewAdmin(nil, nil, nil) // db=nil 也会走提前返回
 			}
 			got := h.predictBreakEven(t.Context(), c.first, pricingCurveParams{}, 10000)
 			if got.Step != pricingCurveDefaultStep || got.MaxTokens != pricingCurveDefaultMaxToken {
@@ -798,7 +798,7 @@ func TestHandleCostSessionTrace_IntraRequestFailover(t *testing.T) {
 			AddRow(int64(901), int64(6), "渠道B", "gpt-4o-int", []byte(`{"input":1,"output":4,"cache_read":0.1}`), nil, nil).
 			AddRow(int64(900), int64(5), "渠道A", "gpt-4o-int", []byte(`{"input":0.2,"output":0.8,"cache_read":0.02}`), nil, nil))
 
-	h := NewAdmin(db, nil, nil, nil)
+	h := NewAdmin(db, nil, nil)
 	h.now = func() time.Time { return pricingTestAt(t) }
 	rec := httptest.NewRecorder()
 	h.HandleCostSessionTrace(rec, traceRequest("sess-failover", "?Step=1000&MaxTokens=20000&At=19:30"))
@@ -847,7 +847,7 @@ func TestHandleCostSessionTrace_RejectInMiddle(t *testing.T) {
 			AddRow(int64(900), int64(5), "渠道A", "gpt-4o-int", []byte(`{"input":1,"output":4,"cache_read":0.1}`), nil, nil).
 			AddRow(int64(901), int64(6), "渠道B", "gpt-4o-int", []byte(`{"input":0.2,"output":0.8,"cache_read":0.02}`), nil, nil))
 
-	h := NewAdmin(db, nil, nil, nil)
+	h := NewAdmin(db, nil, nil)
 	h.now = func() time.Time { return pricingTestAt(t) }
 	rec := httptest.NewRecorder()
 	h.HandleCostSessionTrace(rec, traceRequest("sess-reject", "?Step=1000&MaxTokens=20000&At=19:30"))
@@ -897,7 +897,7 @@ func TestHandleCostSessionTrace_FirstRecordIsReject(t *testing.T) {
 			AddRow(int64(900), int64(5), "渠道A", "gpt-4o-int", []byte(`{"input":1,"output":4,"cache_read":0.1}`), nil, nil).
 			AddRow(int64(901), int64(6), "渠道B", "gpt-4o-int", []byte(`{"input":0.2,"output":0.8,"cache_read":0.02}`), nil, nil))
 
-	h := NewAdmin(db, nil, nil, nil)
+	h := NewAdmin(db, nil, nil)
 	h.now = func() time.Time { return pricingTestAt(t) }
 	rec := httptest.NewRecorder()
 	h.HandleCostSessionTrace(rec, traceRequest("sess-first-reject", "?Step=1000&MaxTokens=20000&At=19:30"))
@@ -926,7 +926,7 @@ func TestLoadSiblingChannelModels_FiltersDeadChannels(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"id", "channel_id", "name", "internal_model_id", "cost_rates", "time_config", "context_tiers"}).
 			AddRow(int64(900), int64(5), "渠道A（已停用但仍是当前渠道）", "gpt-4o-int", []byte(`{"input":1,"output":4,"cache_read":0.1}`), nil, nil))
 
-	h := NewAdmin(db, nil, nil, nil)
+	h := NewAdmin(db, nil, nil)
 	got, err := h.loadSiblingChannelModels(t.Context(), "gpt-4o-int", 900, billing.TimeCoeffConfig{Default: 1}, nil)
 	if err != nil {
 		t.Fatalf("loadSiblingChannelModels: %v", err)

@@ -17,8 +17,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/team/llmgateway/internal/domain/billing"
-	"github.com/team/llmgateway/internal/domain/channel"
-	"github.com/team/llmgateway/internal/domain/gateway"
+	"github.com/team/llmgateway/internal/domain/calllog"
 	"github.com/team/llmgateway/internal/domain/model"
 	"github.com/team/llmgateway/internal/domain/router"
 	"github.com/team/llmgateway/internal/pkg/decimalx"
@@ -26,26 +25,20 @@ import (
 )
 
 // Admin 承载管理端控制台聚合查询处理器。
+//
+// V2 第一期起渠道 / 渠道密钥 / 渠道内部模型的管理与运行时全部迁出（代理侧负责），
+// 本结构只保留账单、统计、成本、会话（历史只读）与系统配置（计费口径）能力。
 type Admin struct {
 	db             *sql.DB
 	billing        *billing.SqlStore
-	channelMgr     *channel.Manager
 	userIDFrom     func(ctx context.Context) (int64, bool)
 	now            func() time.Time
 	sessions       *router.SessionRegistry                                          // 会话管理 API（F1 经 SetSessions 注入）
-	keyNameByIDs   func(ctx context.Context, ids []int64) (map[int64]string, error) // 渠道密钥名批量反查钩子（F1 装配真实实现）
+	keyNameByIDs   func(ctx context.Context, ids []int64) (map[int64]string, error) // 渠道密钥名批量反查钩子（F1 装配真实实现；历史账单展示用）
 	sessionSetName func(ctx context.Context, sessionID, name string) (bool, error)  // 会话改名钩子（F1 装配 SessionStore.SetName）
 	callLogs       callLogReader                                                    // 调用日志只读查询（经 SetCallLogStore 注入；nil=未装配）
-	routeEng       routeEngine                                                      // 路由引擎（服务状态候选顺序来源；经 SetRouterEngine 注入；nil=不计算候选）
 	models         externalModelSource                                              // 对外模型只读枚举（经 SetModelSource 注入；nil=列表为空）
 	rProvider      costRProvider                                                    // 积分换算系数 R 来源（经 SetCostRProvider 注入；nil=未装配时成本曲线回退默认 10000）
-}
-
-// routeEngine 聚合端点所需的路由引擎能力（router.Engine 满足）。
-type routeEngine interface {
-	RouteAll(ctx context.Context, spec router.RouteSpec) ([]*router.ChannelRoute, error)
-	CostSample() billing.Usage
-	ActiveKeySessions(keyID int64) int
 }
 
 // externalModelSource 对外模型只读枚举（model.Service 满足）。
@@ -53,18 +46,17 @@ type externalModelSource interface {
 	ListModels(ctx context.Context, enabled *bool) ([]model.ExternalModel, error)
 }
 
-// callLogReader 调用日志只读查询抽象（gateway.SQLCallLogStore 满足；nil=未装配时查询为空）。
+// callLogReader 调用日志只读查询抽象（calllog.SQLStore 满足；nil=未装配时查询为空）。
 type callLogReader interface {
-	GetByBillingID(ctx context.Context, billingID string) (*gateway.CallLog, error)
-	ListBySession(ctx context.Context, sessionID string) ([]gateway.CallLog, error)
+	GetByBillingID(ctx context.Context, billingID string) (*calllog.CallLog, error)
+	ListBySession(ctx context.Context, sessionID string) ([]calllog.CallLog, error)
 }
 
 // NewAdmin 创建控制台聚合处理器。
-func NewAdmin(db *sql.DB, billingStore *billing.SqlStore, chMgr *channel.Manager, userIDFrom func(ctx context.Context) (int64, bool)) *Admin {
+func NewAdmin(db *sql.DB, billingStore *billing.SqlStore, userIDFrom func(ctx context.Context) (int64, bool)) *Admin {
 	return &Admin{
 		db:         db,
 		billing:    billingStore,
-		channelMgr: chMgr,
 		userIDFrom: userIDFrom,
 		now:        time.Now,
 	}
@@ -86,9 +78,6 @@ func (h *Admin) SetSessionNameSetter(fn func(ctx context.Context, sessionID, nam
 
 // SetCallLogStore 注入调用日志只读查询（nil=未装配：BillingDetail.CallLog 为 nil、会话调用列表为空）。
 func (h *Admin) SetCallLogStore(s callLogReader) { h.callLogs = s }
-
-// SetRouterEngine 注入路由引擎（服务状态候选顺序来源）。nil 时不计算候选、不报错。
-func (h *Admin) SetRouterEngine(e routeEngine) { h.routeEng = e }
 
 // SetModelSource 注入对外模型只读枚举。nil 时对外模型列表为空、不报错。
 func (h *Admin) SetModelSource(s externalModelSource) { h.models = s }
@@ -550,24 +539,14 @@ func (h *Admin) HandleListSessionCalls(w http.ResponseWriter, r *http.Request) {
 	resp.OK(w, r, map[string]any{"List": list, "Total": len(list)})
 }
 
-// HandleChannelSnapshot GET /api/v1/admin/channels/snapshot
-func (h *Admin) HandleChannelSnapshot(w http.ResponseWriter, r *http.Request) {
-	resp.OK(w, r, h.channelMgr.Snapshot())
-}
-
-// ===== 系统配置读写（计费 / 路由 / 会话过期 / 网关白名单 统一入口）=====
+// ===== 系统配置读写（计费口径统一入口）=====
 //
 // 写入语义（配置页按 tab 分别保存的前提）：**PUT 只更新请求体里出现的键**。
-// 缺失的键、缺失的整块一律保持库中现值，绝不用「零值/默认值」覆盖——
-// 这样「计费」「路由」「网关」「运维」四个 tab 各自提交本 tab 的字段时互不影响。
+// 缺失的键、缺失的整块一律保持库中现值，绝不用「零值/默认值」覆盖。
 // 老客户端提交全量字段时行为与改造前一致（每个键都会命中「出现」分支）。
-
-// sessionExpirationDefault 内置默认会话过期配置（与 seeding 的 session.expiration 种子一致），
-// 配置键缺失时回退，保证前端可展示与保存。
-const sessionExpirationDefault = `{"default_ttl_minutes":5,"context_tiers":[{"max_tokens":2000,"ttl_minutes":5},{"max_tokens":8000,"ttl_minutes":30},{"max_tokens":32000,"ttl_minutes":180},{"max_tokens":128000,"ttl_minutes":1440}],"turn_tiers":[{"max_turns":2,"ttl_minutes":5},{"max_turns":10,"ttl_minutes":30},{"max_turns":50,"ttl_minutes":180},{"max_turns":200,"ttl_minutes":1440}]}`
-
-// sessionCostFallbackNote 会话成本路由的回退说明（响应随块下发，前端直接展示，不需要回写）。
-const sessionCostFallbackNote = "两个开关（enabled / mid_switch）都关闭时=渠道亲和：不启用起点择优与中途切换，会话固定在原渠道"
+//
+// V2 第一期只保留计费口径（R / 汇率 / 上下文分档 / 时段 / 成本样值）；
+// 路由（会话成本）、会话过期、上游响应头白名单随转发链一并迁出，不再提供读写。
 
 // readBillingConfigRaw 读取计费配置各键原文，返回对外 PascalCase 键映射（CreditValue 由 R 派生）。
 func (h *Admin) readBillingConfigRaw(ctx context.Context) (map[string]json.RawMessage, error) {
@@ -607,93 +586,9 @@ func (h *Admin) readBillingConfigRaw(ctx context.Context) (map[string]json.RawMe
 	}, nil
 }
 
-// readSessionExpirationRaw 读取会话过期配置原文，缺失回退内置默认。
-func (h *Admin) readSessionExpirationRaw(ctx context.Context) json.RawMessage {
-	raw, err := h.billing.GetConfig(ctx, "session.expiration")
-	if err != nil {
-		return json.RawMessage(sessionExpirationDefault)
-	}
-	return json.RawMessage(raw)
-}
-
-// readGatewayWhitelistRaw 读取全局上游响应头白名单原文，缺失回退空数组。
-func (h *Admin) readGatewayWhitelistRaw(ctx context.Context) json.RawMessage {
-	list := []string{}
-	if raw, err := h.billing.GetConfig(ctx, gateway.UpstreamResponseHeaderWhitelistKey); err == nil {
-		_ = json.Unmarshal(raw, &list)
-	}
-	if list == nil {
-		list = []string{}
-	}
-	b, _ := json.Marshal(list)
-	return json.RawMessage(b)
-}
-
-// sessionCostView 是 `Routing.SessionCost` 的对外视图。
-//
-// 字段名与存储键（routing.session_cost）逐一对应，前端原样回写即可；
-// fallback_note 是只读说明，PUT 时忽略。
-type sessionCostView struct {
-	Enabled       bool    `json:"enabled"`
-	MidSwitch     bool    `json:"mid_switch"`
-	ShadowEnabled bool    `json:"shadow_enabled"`
-	RemainingA    float64 `json:"remaining_a"`
-	RemainingB    float64 `json:"remaining_b"`
-	RemainingMin  int     `json:"remaining_min"`
-	RemainingMax  int     `json:"remaining_max"`
-	MinRemaining  int     `json:"min_remaining"`
-	CooldownSec   int     `json:"cooldown_sec"`
-	MinImprove    float64 `json:"min_improve"`
-	// FallbackNote 回退说明（只读）：两开关都关 = 渠道亲和。
-	FallbackNote string `json:"fallback_note"`
-}
-
-// currentSessionCost 读会话成本路由配置，三种情形分开处理（都不回写库）：
-//
-//  1. 键存在且可解析 → 配置值（缺字段用产品默认补齐，与路由侧同一解析实现）；
-//  2. **键缺失 = 配置未初始化** → 产品默认（enabled/mid_switch=true、shadow_enabled=false）。
-//     种子会写入该键，缺键只出现在手工建库/老实例；面板按产品默认回显，便于管理员确认后
-//     保存一次即落库。注意这与「运行时的缺失行为」不同：运行时读不到键按故障安全态（三态全关）走，
-//     两者差异会在保存后消失，因此不把它当成配置异常；
-//  3. **键存在但解析失败 = 配置异常** → 故障安全态（三态全关），与运行时回退一致。
-func (h *Admin) currentSessionCost(ctx context.Context) router.SessionCostConfig {
-	if h.db == nil {
-		return router.DefaultSessionCostConfig()
-	}
-	raw, err := h.sysConfigRaw(ctx, router.SessionCostConfigKey)
-	if errors.Is(err, sql.ErrNoRows) {
-		return router.DefaultSessionCostConfig() // 未初始化：按产品默认回显
-	}
-	if err != nil {
-		return router.SafeSessionCostConfig() // 读取出错：拿不准，按故障安全态
-	}
-	if cfg, ok := router.ParseSessionCostConfig(raw); ok {
-		return cfg
-	}
-	return router.SafeSessionCostConfig() // 解析失败：配置异常
-}
-
-// readSessionCostView 组装 `Routing.SessionCost`（含回退说明）。
-func (h *Admin) readSessionCostView(ctx context.Context) sessionCostView {
-	cfg := h.currentSessionCost(ctx)
-	return sessionCostView{
-		Enabled:       cfg.Enabled,
-		MidSwitch:     cfg.MidSwitch,
-		ShadowEnabled: cfg.ShadowEnabled,
-		RemainingA:    cfg.RemainingA,
-		RemainingB:    cfg.RemainingB,
-		RemainingMin:  cfg.RemainingMin,
-		RemainingMax:  cfg.RemainingMax,
-		MinRemaining:  cfg.MinRemaining,
-		CooldownSec:   cfg.CooldownSec,
-		MinImprove:    cfg.MinImprove,
-		FallbackNote:  sessionCostFallbackNote,
-	}
-}
-
 // HandleGetSystemConfig GET /api/v1/admin/configs/system
-// 一次返回系统全部配置（前端按 tab 渲染）：计费 Billing、路由 Routing、会话过期 SessionExpiration、
-// 上游响应头白名单。
+// 一次返回系统全部配置（前端按 tab 渲染）。V2 第一期只保留计费口径（Billing）；
+// 路由（Routing）、会话过期（SessionExpiration）、上游响应头白名单随转发链迁出，不再返回。
 func (h *Admin) HandleGetSystemConfig(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	billingMap, err := h.readBillingConfigRaw(ctx)
@@ -702,14 +597,8 @@ func (h *Admin) HandleGetSystemConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	billingRaw, _ := json.Marshal(billingMap)
-	routingRaw, _ := json.Marshal(map[string]json.RawMessage{
-		"SessionCost": mustJSON(h.readSessionCostView(ctx)),
-	})
 	resp.OK(w, r, map[string]json.RawMessage{
-		"Billing":                         billingRaw,
-		"Routing":                         routingRaw,
-		"SessionExpiration":               h.readSessionExpirationRaw(ctx),
-		"UpstreamResponseHeaderWhitelist": h.readGatewayWhitelistRaw(ctx),
+		"Billing": billingRaw,
 	})
 }
 
@@ -731,41 +620,20 @@ type systemConfigPutBilling struct {
 	CostSample   json.RawMessage `json:"CostSample"`
 }
 
-// sessionCostPatch 会话成本路由的部分更新：指针用于区分「没传」与「传了 false/0」。
-type sessionCostPatch struct {
-	Enabled       *bool    `json:"enabled"`
-	MidSwitch     *bool    `json:"mid_switch"`
-	ShadowEnabled *bool    `json:"shadow_enabled"`
-	RemainingA    *float64 `json:"remaining_a"`
-	RemainingB    *float64 `json:"remaining_b"`
-	RemainingMin  *int     `json:"remaining_min"`
-	RemainingMax  *int     `json:"remaining_max"`
-	MinRemaining  *int     `json:"min_remaining"`
-	CooldownSec   *int     `json:"cooldown_sec"`
-	MinImprove    *float64 `json:"min_improve"`
-}
-
-// systemConfigPut Routing 块（全部可选）。
-type systemConfigPutRouting struct {
-	SessionCost *sessionCostPatch `json:"SessionCost"`
-}
-
 // HandlePutSystemConfig PUT /api/v1/admin/configs/system
 //
-// 只更新**请求体里出现的键**：缺失的键、缺失的整块一律保持库中现值，绝不用默认值覆盖。
+// 只更新**请求体里出现的键**：缺失的键一律保持库中现值，绝不用默认值覆盖。
 // 任一出现字段校验失败返回 400 且**一个键都不写**。
 //
 // 响应 `Affected` = 本次**实际写入 sys_configs 的配置行数**（不是字段数）：
-//   - 一个配置块 = 一行（`Routing.SessionCost` 里改多个字段仍算 1 行）；
-//   - 独立标量键各算 1 行（`Billing.R`、`Billing.CNYRate`、白名单……各自一行）；
+//   - 独立标量键各算 1 行（`Billing.R`、`Billing.CNYRate`……各自一行）；
 //   - 请求体为空 = 0；校验失败（400）= 0 且零写入。
+//
+// V2 第一期只受理计费口径（Billing 块）；请求体里出现 Routing / SessionExpiration /
+// UpstreamResponseHeaderWhitelist 时忽略（不再有对应运行时代码，接了也无处生效）。
 func (h *Admin) HandlePutSystemConfig(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Billing *systemConfigPutBilling `json:"Billing"`
-		Routing *systemConfigPutRouting `json:"Routing"`
-		// SessionExpiration / 白名单用指针以区分「没传」与「传了空」。
-		SessionExpiration               json.RawMessage `json:"SessionExpiration"`
-		UpstreamResponseHeaderWhitelist *[]string       `json:"UpstreamResponseHeaderWhitelist"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "请求体格式错误")
@@ -795,40 +663,10 @@ func (h *Admin) HandlePutSystemConfig(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if len(req.SessionExpiration) > 0 {
-		if err := validateSessionExpiration(req.SessionExpiration); err != nil {
-			resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, err.Error())
-			return
-		}
-	}
-	if req.UpstreamResponseHeaderWhitelist != nil {
-		for _, name := range *req.UpstreamResponseHeaderWhitelist {
-			if !validHeaderName(name) {
-				resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "非法的响应头名称："+name)
-				return
-			}
-		}
-	}
-	// 会话成本路由：先合并 + 校验（**早于任何写入**，避免「先写了计费块再 400」的半写状态）。
-	var sessionCostRaw []byte
-	if req.Routing != nil && req.Routing.SessionCost != nil {
-		merged := mergeSessionCost(h.currentSessionCost(r.Context()), *req.Routing.SessionCost)
-		if err := validateSessionCostConfig(merged); err != nil {
-			resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, err.Error())
-			return
-		}
-		raw, err := json.Marshal(merged)
-		if err != nil {
-			resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "序列化会话成本路由配置失败")
-			return
-		}
-		sessionCostRaw = raw
-	}
 
 	operator, _ := h.userIDFrom(r.Context())
 	ctx := r.Context()
-	// affected = 实际写入 sys_configs 的配置行数（非字段数；同块多字段算 1 行），
-	// 每次 UpsertConfig 成功 +1（一次调用落一行）。
+	// affected = 实际写入 sys_configs 的配置行数（非字段数），每次 UpsertConfig 成功 +1。
 	affected := 0
 	upsert := func(key string, val []byte, failMsg string) bool {
 		if err := h.billing.UpsertConfig(ctx, key, val, operator); err != nil {
@@ -857,154 +695,8 @@ func (h *Admin) HandlePutSystemConfig(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-
-	// 3) 路由块：会话成本路由配置（字段级合并，不传的字段保持现值；已在上一步校验过）。
-	if len(sessionCostRaw) > 0 {
-		if !upsert(router.SessionCostConfigKey, sessionCostRaw, "更新路由配置失败（routing.session_cost）") {
-			return
-		}
-	}
-
-	// 4) 其余两块：整块出现才写。
-	if len(req.SessionExpiration) > 0 {
-		if !upsert("session.expiration", req.SessionExpiration, "更新会话过期配置失败") {
-			return
-		}
-	}
-	if req.UpstreamResponseHeaderWhitelist != nil {
-		whitelist := *req.UpstreamResponseHeaderWhitelist
-		if whitelist == nil {
-			whitelist = []string{}
-		}
-		raw, _ := json.Marshal(whitelist)
-		if !upsert(gateway.UpstreamResponseHeaderWhitelistKey, raw, "更新网关设置失败") {
-			return
-		}
-	}
 	// Affected = 写入的配置行数（非字段数）：同一块内改多个字段仍为 1。
 	resp.OK(w, r, map[string]any{"Affected": affected})
-}
-
-// mergeSessionCost 把补丁合并到现值上：补丁里没出现的字段保持 base（现值）。
-func mergeSessionCost(base router.SessionCostConfig, patch sessionCostPatch) router.SessionCostConfig {
-	if patch.Enabled != nil {
-		base.Enabled = *patch.Enabled
-	}
-	if patch.MidSwitch != nil {
-		base.MidSwitch = *patch.MidSwitch
-	}
-	if patch.ShadowEnabled != nil {
-		base.ShadowEnabled = *patch.ShadowEnabled
-	}
-	if patch.RemainingA != nil {
-		base.RemainingA = *patch.RemainingA
-	}
-	if patch.RemainingB != nil {
-		base.RemainingB = *patch.RemainingB
-	}
-	if patch.RemainingMin != nil {
-		base.RemainingMin = *patch.RemainingMin
-	}
-	if patch.RemainingMax != nil {
-		base.RemainingMax = *patch.RemainingMax
-	}
-	if patch.MinRemaining != nil {
-		base.MinRemaining = *patch.MinRemaining
-	}
-	if patch.CooldownSec != nil {
-		base.CooldownSec = *patch.CooldownSec
-	}
-	if patch.MinImprove != nil {
-		base.MinImprove = *patch.MinImprove
-	}
-	return base
-}
-
-// validateSessionCostConfig 校验会话成本路由配置的取值区间（只拒绝明显非法值，不改任何默认口径）。
-func validateSessionCostConfig(cfg router.SessionCostConfig) error {
-	if cfg.RemainingA < 0 || cfg.RemainingB < 0 {
-		return errors.New("remaining_a / remaining_b 不能为负数")
-	}
-	if cfg.RemainingMin < 1 {
-		return errors.New("remaining_min 必须 ≥ 1")
-	}
-	if cfg.RemainingMax < cfg.RemainingMin {
-		return errors.New("remaining_max 不能小于 remaining_min")
-	}
-	if cfg.MinRemaining < 0 {
-		return errors.New("min_remaining 不能为负数")
-	}
-	if cfg.CooldownSec < 0 {
-		return errors.New("cooldown_sec 不能为负数")
-	}
-	if cfg.MinImprove < 0 || cfg.MinImprove >= 1 {
-		return errors.New("min_improve 必须在 [0,1) 区间")
-	}
-	return nil
-}
-
-// validHeaderName 校验是否为合法 HTTP 头字段名（RFC 7230 token，非空）。
-func validHeaderName(name string) bool {
-	if name == "" {
-		return false
-	}
-	for i := 0; i < len(name); i++ {
-		c := name[i]
-		switch {
-		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
-		case c == '!' || c == '#' || c == '$' || c == '%' || c == '&' || c == '\'' ||
-			c == '*' || c == '+' || c == '-' || c == '.' || c == '^' || c == '_' ||
-			c == '`' || c == '|' || c == '~':
-		default:
-			return false
-		}
-	}
-	return true
-}
-
-// validateSessionExpiration 校验会话过期配置，返回 nil 表示合法；否则返回具体的中文原因（不含技术细节）。
-func validateSessionExpiration(raw []byte) error {
-	if !isJSONObject(raw) {
-		return errors.New("会话过期配置必须是 JSON 对象")
-	}
-	var cfg struct {
-		DefaultTTLMinutes int `json:"default_ttl_minutes"`
-		ContextTiers      []struct {
-			MaxTokens  int `json:"max_tokens"`
-			TTLMinutes int `json:"ttl_minutes"`
-		} `json:"context_tiers"`
-		TurnTiers []struct {
-			MaxTurns   int `json:"max_turns"`
-			TTLMinutes int `json:"ttl_minutes"`
-		} `json:"turn_tiers"`
-	}
-	if err := json.Unmarshal(raw, &cfg); err != nil {
-		return errors.New("会话过期配置格式不合法")
-	}
-	if cfg.DefaultTTLMinutes <= 0 {
-		return errors.New("default_ttl_minutes 必须为正整数")
-	}
-	prevTokens := 0
-	for _, tier := range cfg.ContextTiers {
-		if tier.MaxTokens <= 0 || tier.TTLMinutes <= 0 {
-			return errors.New("context_tiers 的 max_tokens/ttl_minutes 必须为正整数")
-		}
-		if tier.MaxTokens <= prevTokens {
-			return errors.New("context_tiers 上界必须严格升序")
-		}
-		prevTokens = tier.MaxTokens
-	}
-	prevTurns := 0
-	for _, tier := range cfg.TurnTiers {
-		if tier.MaxTurns <= 0 || tier.TTLMinutes <= 0 {
-			return errors.New("turn_tiers 的 max_turns/ttl_minutes 必须为正整数")
-		}
-		if tier.MaxTurns <= prevTurns {
-			return errors.New("turn_tiers 上界必须严格升序")
-		}
-		prevTurns = tier.MaxTurns
-	}
-	return nil
 }
 
 // validCostSample 校验路由成本比较样值：JSON 对象且各段为非负数值（缺省段按 0 处理）。

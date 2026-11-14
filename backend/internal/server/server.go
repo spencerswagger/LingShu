@@ -10,38 +10,33 @@ import (
 
 	"github.com/team/llmgateway/internal/config"
 	"github.com/team/llmgateway/internal/domain/audit"
-	"github.com/team/llmgateway/internal/domain/automodel"
-	"github.com/team/llmgateway/internal/domain/channel"
-	"github.com/team/llmgateway/internal/domain/channelprotocol"
 	"github.com/team/llmgateway/internal/domain/console"
-	"github.com/team/llmgateway/internal/domain/gateway"
 	"github.com/team/llmgateway/internal/domain/identity"
 	"github.com/team/llmgateway/internal/domain/model"
 	"github.com/team/llmgateway/internal/domain/sync"
 	"github.com/team/llmgateway/internal/domain/tag"
 	"github.com/team/llmgateway/internal/pkg/jwtx"
 	"github.com/team/llmgateway/internal/pkg/reqmeta"
+	"github.com/team/llmgateway/internal/pkg/resp"
 	"github.com/team/llmgateway/internal/pkg/session"
 )
 
-// Deps 汇聚全量子处理器与可选网关 handler，由 main 装配后注入。
+// Deps 汇聚全量子处理器，由 main 装配后注入。
+//
+// V2 第一期起渠道/渠道协议/Auto 模型/网关转发链整体迁出，对应处理器字段一并移除；
+// 被摘接口在 routes() 中以 410 显式停用（见 goneHandler），不使用 404。
 type Deps struct {
 	Identity     *identity.Handler
 	AdminUser    *identity.AdminUserHandler
 	Credit       *identity.CreditHandler
 	TokenAdmin   *identity.TokenHandler
 	TokenDev     *identity.TokenHandler
-	Channel      *channel.Handler
-	ChannelProto *channelprotocol.Handler
 	Tag          *tag.Handler
 	Model        *model.Handler
-	// AutoModel 可选：Auto 模型管理（管理端 + 开发端）。
-	AutoModel    *automodel.Handler
 	Announcement *identity.AnnouncementHandler
 	Console      *console.Admin
 	DevConsole   *console.Dev
 	SyncAdmin    *sync.Handler
-	Gateway      http.Handler // 可选：挂载到 /v1/
 }
 
 // Server 汇聚 HTTP 服务所需依赖。
@@ -117,17 +112,63 @@ func (s *Server) routes() {
 	admin.HandleFunc("POST /api/v1/admin/tokens/batch-delete", d.TokenAdmin.HandleAdminBatchDelete)
 	admin.Handle("GET /api/v1/admin/tokens/{id}/secret", WithAuditSensitiveRead(s.audit, s.logger)(http.HandlerFunc(d.TokenAdmin.HandleAdminSecret)))
 
-	// channels
-	admin.HandleFunc("GET /api/v1/admin/channels", d.Channel.HandleList)
-	admin.HandleFunc("POST /api/v1/admin/channels", d.Channel.HandleCreate)
-	admin.HandleFunc("PUT /api/v1/admin/channels/{id}", d.Channel.HandleUpdate)
-	admin.HandleFunc("POST /api/v1/admin/channels/batch-delete", d.Channel.HandleBatchDelete)
-	admin.HandleFunc("GET /api/v1/admin/channels/{id}/model-events", d.Channel.HandleListModelEvents)
-	admin.HandleFunc("GET /api/v1/admin/channels/{id}/probe-logs", d.Channel.HandleListProbeLogs)
-	admin.HandleFunc("GET /api/v1/admin/channels/cron-preview", d.Channel.HandleCronPreview)
-	admin.HandleFunc("PUT /api/v1/admin/channels/{id}/models/{mid}/state", d.Channel.HandleModelState)
-	admin.HandleFunc("GET /api/v1/admin/channels/snapshot", d.Console.HandleChannelSnapshot)
-	admin.HandleFunc("GET /api/v1/admin/service-status", d.Console.HandleServiceStatus)
+	// ---- 已停用的渠道族接口（V2 第一期：渠道/密钥/模型/探测/协议整体迁出）----
+	// 统一 410 + 明确文案：前端页面本期不改，410 比 404 更能说明「接口存在但已停用」。
+	for _, path := range []string{
+		"GET /api/v1/admin/channels", "POST /api/v1/admin/channels",
+		"PUT /api/v1/admin/channels/{id}", "POST /api/v1/admin/channels/batch-delete",
+		"GET /api/v1/admin/channels/{id}/model-events",
+		"GET /api/v1/admin/channels/{id}/probe-logs",
+		"GET /api/v1/admin/channels/cron-preview",
+		"PUT /api/v1/admin/channels/{id}/models/{mid}/state",
+		"GET /api/v1/admin/channels/snapshot",
+		"GET /api/v1/admin/service-status",
+	} {
+		admin.HandleFunc(path, goneHandler)
+	}
+
+	// 渠道协议（channel_protocols·已停用）
+	for _, path := range []string{
+		"GET /api/v1/admin/channel-protocols", "POST /api/v1/admin/channel-protocols",
+		"POST /api/v1/admin/channel-protocols/sync", "GET /api/v1/admin/channel-protocols/export",
+		"POST /api/v1/admin/channel-protocols/import", "GET /api/v1/admin/channel-protocols/{id}",
+		"GET /api/v1/admin/channel-protocols/{id}/error-stats", "PUT /api/v1/admin/channel-protocols/{id}",
+		"DELETE /api/v1/admin/channel-protocols/{id}", "POST /api/v1/admin/channel-protocols/{id}/models/pull",
+	} {
+		admin.HandleFunc(path, goneHandler)
+	}
+
+	// 渠道密钥（channel_keys·已停用）
+	for _, path := range []string{
+		"GET /api/v1/admin/channels/{id}/keys", "POST /api/v1/admin/channels/{id}/keys",
+		"PUT /api/v1/admin/channels/{id}/keys/{kid}", "DELETE /api/v1/admin/channels/{id}/keys/{kid}",
+		"POST /api/v1/admin/channels/{id}/keys/{kid}/state",
+		"POST /api/v1/admin/channels/{id}/keys/{kid}/probe",
+		"GET /api/v1/admin/channels/{id}/keys/{kid}/events",
+	} {
+		admin.HandleFunc(path, goneHandler)
+	}
+
+	// 渠道内部模型（channel_models·已停用）
+	for _, path := range []string{
+		"GET /api/v1/admin/channel-models",
+		"GET /api/v1/admin/channels/{id}/models", "POST /api/v1/admin/channels/{id}/models",
+		"POST /api/v1/admin/channels/{id}/models/pull",
+		"PUT /api/v1/admin/channels/{id}/models/{mid}",
+		"DELETE /api/v1/admin/channels/{id}/models/{mid}",
+		"POST /api/v1/admin/channels/{id}/models/{mid}/probe",
+	} {
+		admin.HandleFunc(path, goneHandler)
+	}
+
+	// Auto 模型（ auto_models·已停用）
+	for _, path := range []string{
+		"GET /api/v1/admin/auto-models", "GET /api/v1/admin/auto-models/{id}",
+		"POST /api/v1/admin/auto-models", "PUT /api/v1/admin/auto-models/{id}",
+		"DELETE /api/v1/admin/auto-models/{id}",
+	} {
+		admin.HandleFunc(path, goneHandler)
+	}
 
 	// 成本（只读）：成本/售价对照、默认参数、成本曲线、单会话成本明细
 	admin.HandleFunc("GET /api/v1/admin/cost/stats", d.Console.HandleCostStats)
@@ -137,38 +178,6 @@ func (s *Server) routes() {
 	admin.HandleFunc("GET /api/v1/admin/cost/session/{id}", d.Console.HandleCostSession)
 	// 会话渠道轨迹（只读，恒可用）。
 	admin.HandleFunc("GET /api/v1/admin/cost/session/{id}/trace", d.Console.HandleCostSessionTrace)
-
-	// 渠道协议（channel_protocols·可复用接入模板）
-	if d.ChannelProto != nil {
-		admin.HandleFunc("GET /api/v1/admin/channel-protocols", d.ChannelProto.HandleList)
-		admin.HandleFunc("POST /api/v1/admin/channel-protocols", d.ChannelProto.HandleCreate)
-		admin.HandleFunc("POST /api/v1/admin/channel-protocols/sync", d.ChannelProto.HandleSync)
-		admin.HandleFunc("GET /api/v1/admin/channel-protocols/export", d.ChannelProto.HandleExport)
-		admin.HandleFunc("POST /api/v1/admin/channel-protocols/import", d.ChannelProto.HandleImport)
-		admin.HandleFunc("GET /api/v1/admin/channel-protocols/{id}", d.ChannelProto.HandleGet)
-		admin.HandleFunc("GET /api/v1/admin/channel-protocols/{id}/error-stats", d.ChannelProto.HandleErrorStats)
-		admin.HandleFunc("PUT /api/v1/admin/channel-protocols/{id}", d.ChannelProto.HandleUpdate)
-		admin.HandleFunc("DELETE /api/v1/admin/channel-protocols/{id}", d.ChannelProto.HandleDelete)
-		admin.HandleFunc("POST /api/v1/admin/channel-protocols/{id}/models/pull", d.ChannelProto.HandlePullModels)
-	}
-
-	// 渠道密钥（channel_keys 运行时实体）
-	admin.HandleFunc("GET /api/v1/admin/channels/{id}/keys", d.Channel.HandleListKeys)
-	admin.HandleFunc("POST /api/v1/admin/channels/{id}/keys", d.Channel.HandleCreateKey)
-	admin.HandleFunc("PUT /api/v1/admin/channels/{id}/keys/{kid}", d.Channel.HandleUpdateKey)
-	admin.HandleFunc("DELETE /api/v1/admin/channels/{id}/keys/{kid}", d.Channel.HandleDeleteKey)
-	admin.HandleFunc("POST /api/v1/admin/channels/{id}/keys/{kid}/state", d.Channel.HandleKeyState)
-	admin.HandleFunc("POST /api/v1/admin/channels/{id}/keys/{kid}/probe", d.Channel.HandleProbeKey)
-	admin.HandleFunc("GET /api/v1/admin/channels/{id}/keys/{kid}/events", d.Channel.HandleListKeyEvents)
-
-	// 渠道内部模型（双层模型）
-	admin.HandleFunc("GET /api/v1/admin/channel-models", d.Channel.HandleListAllChannelModels)
-	admin.HandleFunc("GET /api/v1/admin/channels/{id}/models", d.Channel.HandleListChannelModels)
-	admin.HandleFunc("POST /api/v1/admin/channels/{id}/models", d.Channel.HandleCreateChannelModel)
-	admin.HandleFunc("POST /api/v1/admin/channels/{id}/models/pull", d.Channel.HandlePullModels)
-	admin.HandleFunc("PUT /api/v1/admin/channels/{id}/models/{mid}", d.Channel.HandleUpdateChannelModel)
-	admin.HandleFunc("DELETE /api/v1/admin/channels/{id}/models/{mid}", d.Channel.HandleDeleteChannelModel)
-	admin.HandleFunc("POST /api/v1/admin/channels/{id}/models/{mid}/probe", d.Channel.HandleProbeModel)
 
 	// tags
 	admin.HandleFunc("GET /api/v1/admin/tags", d.Tag.HandleList)
@@ -185,15 +194,6 @@ func (s *Server) routes() {
 	admin.HandleFunc("POST /api/v1/admin/models/{id}/apply-price", d.Model.HandleApplyPrice)
 	admin.HandleFunc("POST /api/v1/admin/models/sync-prices", d.Model.HandleSyncPrices)
 	admin.HandleFunc("GET /api/v1/admin/models/price-catalog", d.Model.HandlePriceCatalog)
-
-	// auto-models（Auto 模型：对外模型之上的有序别名组）
-	if d.AutoModel != nil {
-		admin.HandleFunc("GET /api/v1/admin/auto-models", d.AutoModel.HandleList)
-		admin.HandleFunc("GET /api/v1/admin/auto-models/{id}", d.AutoModel.HandleGet)
-		admin.HandleFunc("POST /api/v1/admin/auto-models", d.AutoModel.HandleCreate)
-		admin.HandleFunc("PUT /api/v1/admin/auto-models/{id}", d.AutoModel.HandleUpdate)
-		admin.HandleFunc("DELETE /api/v1/admin/auto-models/{id}", d.AutoModel.HandleDelete)
-	}
 
 	// billings / stats / configs / sessions
 	admin.HandleFunc("GET /api/v1/admin/billings", d.Console.HandleListBillings)
@@ -250,24 +250,31 @@ func (s *Server) routes() {
 	dev.HandleFunc("GET /api/v1/dev/billings/{billing_id}", d.DevConsole.HandleGetBilling)
 	dev.HandleFunc("GET /api/v1/dev/announcements", d.Announcement.HandleDevList)
 
-	// auto-models（开发端：仅本人私有 Auto；服务端强制 scope=private + owner=当前用户）
-	if d.AutoModel != nil {
-		dev.HandleFunc("GET /api/v1/dev/auto-models", d.AutoModel.HandleDevList)
-		dev.HandleFunc("GET /api/v1/dev/auto-models/{id}", d.AutoModel.HandleDevGet)
-		dev.HandleFunc("POST /api/v1/dev/auto-models", d.AutoModel.HandleDevCreate)
-		dev.HandleFunc("PUT /api/v1/dev/auto-models/{id}", d.AutoModel.HandleDevUpdate)
-		dev.HandleFunc("DELETE /api/v1/dev/auto-models/{id}", d.AutoModel.HandleDevDelete)
+	// Auto 模型（dev·已停用）
+	for _, path := range []string{
+		"GET /api/v1/dev/auto-models", "GET /api/v1/dev/auto-models/{id}",
+		"POST /api/v1/dev/auto-models", "PUT /api/v1/dev/auto-models/{id}",
+		"DELETE /api/v1/dev/auto-models/{id}",
+	} {
+		dev.HandleFunc(path, goneHandler)
 	}
 
-	// ---- 网关 ----
-	if d.Gateway != nil {
-		s.mux.Handle(gateway.InboundPrefix, d.Gateway)
-	}
+	// ---- 网关（/v1/... 转发链已迁出灵枢，第一期不再挂载）----
+	s.mux.HandleFunc("/v1/", goneHandler)
 
 	s.mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
+}
+
+// goneHandler 已停用接口的统一响应：410 Gone + 明确文案。
+//
+// 用 410 而不是 404：这些路径确实存在过、且前端本期不改，410 表达「接口存在但已停用」，
+// 404 会被误读成路由写错或部署不全。渠道族能力（渠道/密钥/模型/探测/协议/转发）已迁出灵枢。
+func goneHandler(w http.ResponseWriter, r *http.Request) {
+	resp.Err(w, r, http.StatusGone, resp.CodeGone,
+		"接口已停用：渠道与转发能力已迁出灵枢，请改用代理侧接口")
 }
 
 // middlewareChain 组装全局中间件链（顺序敏感）。

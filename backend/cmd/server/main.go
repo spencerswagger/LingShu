@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -21,12 +20,9 @@ import (
 	"github.com/team/llmgateway/internal/config"
 	"github.com/team/llmgateway/internal/db"
 	"github.com/team/llmgateway/internal/domain/audit"
-	"github.com/team/llmgateway/internal/domain/automodel"
 	"github.com/team/llmgateway/internal/domain/billing"
-	"github.com/team/llmgateway/internal/domain/channel"
-	"github.com/team/llmgateway/internal/domain/channelprotocol"
+	"github.com/team/llmgateway/internal/domain/calllog"
 	"github.com/team/llmgateway/internal/domain/console"
-	"github.com/team/llmgateway/internal/domain/gateway"
 	"github.com/team/llmgateway/internal/domain/identity"
 	"github.com/team/llmgateway/internal/domain/model"
 	"github.com/team/llmgateway/internal/domain/router"
@@ -173,22 +169,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 预设渠道协议首次启动拉取（仅初始化时一次）：地址未设置则不拉取；失败仅日志、不阻塞启动（AC-12）。
-	// 须在装载渠道运行时之前完成，保证渠道引用的渠道协议在运行时可见。
-	app.cpSvc.InitialSync(ctx)
-
-	// 装载渠道运行态（内存权威状态），并启动健康探测与价格同步。
-	if err := app.mgr.SyncFromDB(ctx); err != nil {
-		slog.Error("sync channels from db", "error", err)
-		os.Exit(1)
-	}
 	// 会话持久化恢复：从 DB 加载未过期会话重建内存注册表（粘性路由/并发计数），
 	// 须在清扫循环启动前完成（ctx 取消前），避免把存活会话误判为过期。
 	if err := app.sess.LoadPersisted(ctx); err != nil {
 		slog.Error("load persisted sessions", "error", err)
 		os.Exit(1)
 	}
-	app.mgr.Start(ctx)
 	// 非资金异步持久化层启动：先重放上次崩溃遗留的 WAL，再开始接收新的异步写。
 	// 使用独立于信号 ctx 的上下文：退出时信号 ctx 已取消，若以之作 Exec 上下文会导致排空阶段
 	// 落库全部失败；其生命周期由下方 Shutdown（关闭队列 + stopCh）终结，排空完成后才 cancel。
@@ -208,7 +194,6 @@ func main() {
 	// 审计写入失败汇总：审计失效必须早于业务失效被发现，把进程内 expvar 计数
 	// 变成日志侧可告警信号（本服务不暴露 /debug/vars）。
 	go audit.ReportInsertFailures(ctx, logr, time.Minute)
-	defer app.mgr.Stop()
 	// 优雅退出：排空非资金异步写队列并最终 fsync，完成后释放 writer 上下文。
 	// 用独立超时上下文，避免信号 ctx 已取消导致 Shutdown 立即超时（丢队列）。
 	// 封装为闭包，便于在 os.Exit 路径（会跳过 defer）显式调用；Shutdown/取消均幂等，可重复调用。
@@ -235,8 +220,6 @@ func main() {
 type app struct {
 	deps       server.Deps
 	syncer     *sync.Syncer
-	mgr        *channel.Manager
-	cpSvc      *channelprotocol.Service
 	sess       *router.SessionRegistry
 	billSvc    *billing.Service
 	sessions   *session.Registry
@@ -253,22 +236,19 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	// 只读配置缓存总开关：默认启用；READ_CACHE_ENABLED / read_cache.enabled=false 时全部退回直查。
 	readCacheOn := cfg.ReadCacheEnabled()
 
-	// 非资金异步持久化层（asyncwrite）：统一承接会话投影、渠道状态事件、调用日志的写后异步落库。
-	// WALPath 复用账单重试队列所在目录（默认 data/），落 data/asyncwrite.wal；崩溃后由各类别重放函数恢复。
-	// AsyncKinds 仅启用四类需落盘的类别；KindTokenLastUsed 故意不启用（内存模式、不落 WAL，仅统计用途，允许丢失）。
+	// 非资金异步持久化层（asyncwrite）：承接会话投影的写后异步落库。
+	// WALPath 复用账单重试队列所在目录（默认 data/），落 data/asyncwrite.wal；崩溃后由类别重放函数恢复。
+	// AsyncKinds 只启用会话投影一类；KindTokenLastUsed 故意不启用（内存模式、不落 WAL，仅统计用途，允许丢失）。
+	// 渠道状态事件 / 调用日志 / 会话成本事件三类随转发链停写，不再登记（常量保留，见 asyncwrite/job.go）。
 	walPath := filepath.Join(filepath.Dir(cfg.Billing.RetryQueuePath), "asyncwrite.wal")
 	asyncWriter := asyncwrite.New(asyncwrite.Config{
 		WALPath: walPath,
 		AsyncKinds: map[asyncwrite.Kind]bool{
-			asyncwrite.KindSession:           true,
-			asyncwrite.KindChannelKeyEvent:   true,
-			asyncwrite.KindChannelModelEvent: true,
-			asyncwrite.KindCallLog:           true,
-			asyncwrite.KindSessionCostEvent:  true,
+			asyncwrite.KindSession: true,
 		},
 	})
 	// 配置了 WALPath 却打不开（目录不可写/磁盘满）时致命化启动：绝不静默降级为内存模式，
-	// 否则会话/渠道事件/调用日志将失去 WAL 兜底、崩溃即丢，违背「绝不静默丢弃」契约。
+	// 否则会话投影将失去 WAL 兜底、崩溃即丢，违背「绝不静默丢弃」契约。
 	if err := asyncWriter.Err(); err != nil {
 		return nil, fmt.Errorf("asyncwrite WAL 不可用（拒绝静默降级为内存模式）: %w", err)
 	}
@@ -309,20 +289,10 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	// 二次验证口令尝试限流：复用登录限流器（key 前缀 "sf:" 与登录计数隔离）。
 	identitySvc.SetRateLimiter(rl)
 
-	// 定价模式读缓存（键 = userID）：网关每请求解析计费模式，用户计费模式低频变更。
-	// 交付顺序（D9）：失效钩子先于缓存启用接线——先注册 SetUserWriteHook，缓存随后才被网关消费，
-	// 保证不存在「已读缓存但写路径未接失效」的窗口。
-	var pricingCache *pricingModeCache
-	if readCacheOn {
-		pricingCache = newPricingModeCache()
-	}
 	// 令牌鉴权读缓存的服务实例在下方装配（须晚于 d）；此处先声明以便失效钩子引用：
-	// 用户写路径（含口令重置）经同一钩子「同一代码点」同时失效计费模式缓存与令牌缓存，避免双缓存漂移。
+	// 用户写路径（含口令重置）经该钩子即时失效令牌鉴权缓存，避免鉴权读到旧态。
 	var tokenSvc *identity.TokenService
 	identitySvc.SetUserWriteHook(func(userID int64) {
-		if pricingCache != nil {
-			pricingCache.Invalidate(userID)
-		}
 		if tokenSvc != nil {
 			tokenSvc.InvalidateByUserID(userID)
 		}
@@ -362,75 +332,19 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	announceSvc := identity.NewAnnouncementService(announceStore)
 	announceHandler := identity.NewAnnouncementHandler(announceSvc, userIDFrom)
 
-	// channel（后端服务创建需 16 字节 SM4 密钥，取自安全配置）
-	chStore := channel.NewStore(d)
-	cmStore := channel.NewChannelModelStore(d)
-	keyStore := channel.NewKeyStore(d)
-	chMgr := channel.NewManager(chStore, cmStore, sm4Key, nil, logr, time.Now, keyStore)
-	// 渠道状态事件异步化：事件 INSERT 走 asyncwrite（预生成事件 ID 幂等可重放）；
-	// 状态列（channel_keys.state / channel_models.state）仍由 Manager 同步落库。
-	chMgr.SetEventSink(channel.NewAsyncEventSink(asyncWriter, keyStore, cmStore))
-	chSvc := channel.NewService(chStore)
-	chSvc.SetManager(chMgr)
-	chSvc.SetChannelModelStore(cmStore)
-	keySvc := channel.NewKeyService(keyStore, sm4Key)
-	chSvc.SetKeyService(keySvc)
-	chHandler := channel.NewHandler(chSvc)
-	chHandler.SetKeyDeps(keySvc, chMgr)
-
-	// 渠道协议（由外挂预设包物化的可复用接入模板）：首启拉取一次，后续管理员手动同步。
-	cpStore := channelprotocol.NewStore(d)
-	cpSvc := channelprotocol.NewService(cpStore)
-	cpSvc.SetPackURL(cfg.Preset.PackURL)
-	cpSvc.SetLogger(logr)
-	cpHandler := channelprotocol.NewHandler(cpSvc)
-	chMgr.SetChannelProtocolStore(cpStore)
-	chSvc.SetChannelProtocolStore(cpStore)
-	// 协议变更钩子：先定向重物化引用渠道的 channel_models，再全量重建运行时。
-	// 保证协议（含请求头策略）变更后引用渠道的模型与运行时即时生效（无重启、无渠道重存）。
-	cpSvc.SetChannelRefresher(func(ctx context.Context, protocolID int64) error {
-		if err := chSvc.RematerializeProtocol(ctx, protocolID); err != nil {
-			return err
-		}
-		return chMgr.SyncFromDB(ctx)
-	})
-
 	// tag / model
 	tagStore := tag.NewStore(d)
 	tagSvc := tag.NewService(tagStore)
 	tagSvc.SetReadCacheEnabled(readCacheOn)
-	chSvc.SetTagResolver(channelTagResolver{svc: tagSvc})
 	tagHandler := tag.NewHandler(tagSvc)
 	modelSvc := model.NewService(model.NewStore(d))
 	modelSvc.SetReadCacheEnabled(readCacheOn)
 	modelHandler := model.NewHandler(modelSvc)
 
-	// automodel（Auto 模型：对外模型之上的有序别名组）
-	autoStore := automodel.NewStore(d)
-	autoSvc := automodel.NewService(autoStore)
-	autoSvc.SetReadCacheEnabled(readCacheOn)
-	// 跨包缓存失效（P1-4）：外部模型写路径变更 external_name/enabled 后，automodel.ResolveMembers
-	// 的结果（含 JOIN 自 external_models 的 ExternalName/Enabled）会过期，故接线使其立即失效。
-	// 两服务均已构造，此处一次性接线（写钩子先于网关消费读缓存，无「已读缓存但未接失效」窗口）。
-	modelSvc.SetNameWriteHook(autoSvc.InvalidateReadCache)
-	autoHandler := automodel.NewHandler(autoSvc)
-	// 开发端接口需从 context 解析当前登录用户（server.UserIDFrom 由中间件写入）。
-	autoHandler.SetUserIDFrom(server.UserIDFrom)
-	// 跨表重名校验：Auto 名不得与任何 external_models.external_name 或别名重名。
-	// 用 NameTaken（忽略 enabled）判断「该名是否已被任何对外模型名/别名占用」——含未启用者与别名，
-	// 避免「先建停用模型或先配置别名 → 再建同名 Auto → 之后重新启用」绕过扁平命名空间约束。
-	autoSvc.SetExternalNameChecker(func(ctx context.Context, name string) (bool, error) {
-		return modelSvc.NameTaken(ctx, name)
-	})
-	// 反向跨表重名校验：对外模型名不得与任何 Auto 重名（与上方对称，堵住「先建 Auto 后建模型」）。
+	// 反向跨表重名校验：对外模型名不得与任何 Auto 重名。Auto 模型（auto_models 表）已随
+	// 转发链停用，表只读保留，此处恒返回「未被占用」。
 	modelSvc.SetAutoNameChecker(func(ctx context.Context, name string) (bool, error) {
-		if _, err := autoStore.GetByNameAny(ctx, name); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return false, nil
-			}
-			return false, err
-		}
-		return true, nil
+		return false, nil
 	})
 
 	// billing
@@ -438,31 +352,9 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	billCfgProvider := billing.NewConfigProvider(billStore)
 	// 只读配置缓存开关：关闭时 R/context_tiers/时段/样值 均退回直查。
 	billCfgProvider.SetCacheEnabled(readCacheOn)
-	// 会话过期分档配置 provider：读取 sys_configs 的 session.expiration，供 gateway 按
-	// 「上下文长度 + 用户对话次数」双维度计算会话 TTL。
-	sessExpiryProvider := router.NewSessionExpiryProvider(billStore)
-	// 会话成本路由配置 provider（sys_configs 键 routing.session_cost）：提供起点择优 / 中途切换的
-	// 开关与门控参数（Enabled/MidSwitch/RemainingA/B/MinRemaining/CooldownSec/MinImprove）。
-	// 产品默认（2026-10-30 定稿）= Enabled/MidSwitch 开、ShadowEnabled 关（与种子一致）；
-	// 读取失败/解析失败时回退故障安全态（三态全关，渠道不变），不凭默认值放开路由。
-	// 回退方式：改本键的 enabled/mid_switch 即可（写钩子会 Invalidate，热生效、无需重启）。
-	sessionCostProvider := router.NewSessionCostProvider(billStore)
-	// 上游响应头白名单读缓存（单键 sys_configs，键 = gateway.UpstreamResponseHeaderWhitelistKey）：
-	// 网关每请求读取，console 低频写入；启用时命中零 DB，关闭时退回直查。
-	var whitelistCache *configValueCache
-	if readCacheOn {
-		whitelistCache = newConfigValueCache(billStore, gateway.UpstreamResponseHeaderWhitelistKey)
-	}
-	// 交付顺序（D9）：失效钩子必须先于缓存启用接线——此处注册的写钩子会清空全部配置缓存
-	//（路由成本样值/全局时段/R/上下文分档 + 会话过期 + 上游白名单），保证不存在
-	// 「已读缓存但写路径未接失效」的窗口。sys_configs 写入（console 经 billing.UpsertConfig）后即时生效。
+	// 失效钩子：sys_configs 写入（console 经 billing.UpsertConfig）后清空计费配置读缓存，即时生效。
 	billStore.SetConfigWriteHook(func() {
 		billCfgProvider.InvalidateCostConfig()
-		sessExpiryProvider.Invalidate()
-		sessionCostProvider.Invalidate()
-		if whitelistCache != nil {
-			whitelistCache.Invalidate()
-		}
 	})
 	billSvc := billing.NewService(billStore, billCfgProvider, creditSvc)
 	// 账单落库失败时的本地持久重试队列：DB 抖动不丢账单（billing_id 唯一索引保证重投幂等）。
@@ -470,79 +362,16 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	// 「扣款 + 积分流水 + 账单」同事务提交：消灭「扣了钱没账单」。
 	billSvc.SetTxBeginner(d)
 
-	// 探测开销记账（系统身份）：健康探测的真实最小对话 usage 以系统用户/密钥记入 billing_records。
-	// 注：ProbeRecorder 首参为 channel_key_id（密钥维度）；记账前先由 keyID 反查所属渠道 ID，
-	// 再查 channel_models 成本单价；密钥不在运行时（未装载/已删除）时无渠道映射，直接跳过记账。
-	chMgr.SetProbeRecorder(func(ctx context.Context, keyID int64, modelID, target string, ok bool, errMsg string, usage channel.ProbeUsage, durMS int64) error {
-		if !ok || usage.TotalTokens == 0 {
-			return nil // 失败探测或零开销不入账
-		}
-		kr, kfound := chMgr.GetKeyRuntime(keyID)
-		if !kfound {
-			return nil // 无 key→channel 映射，跳过记账
-		}
-		sysUID, sysTID, err := seeding.SystemIdentity(ctx, d)
-		if err != nil {
-			return fmt.Errorf("resolve system identity: %w", err)
-		}
-		cm, err := cmStore.GetByChannelAndInternal(ctx, kr.Key.ChannelID, modelID)
-		if err != nil {
-			return fmt.Errorf("resolve channel model: %w", err)
-		}
-		ext, err := modelSvc.GetByID(ctx, cm.ExternalModelID)
-		if err != nil {
-			return fmt.Errorf("resolve external model: %w", err)
-		}
-		dur := durMS
-		// ProbeUsage 已按三段口径归一（InputTokens 为纯输入，缓存读单列），此处直接落库/记账。
-		_, err = billSvc.Record(ctx, billing.RecordReq{
-			UserID:          sysUID,
-			PricingMode:     identity.PricingModeCost,
-			TokenID:         &sysTID,
-			ExternalModel:   ext.ExternalName,
-			InternalModelID: cm.InternalModelID,
-			ChannelKeyID:    keyID, // 探测记账落 channel_key_id（ProbeRecorder 首参为密钥 ID）
-			Tokens: billing.Usage{
-				Input:     int64(usage.InputTokens),
-				Output:    int64(usage.OutputTokens),
-				CacheRead: int64(usage.CachedTokens),
-			},
-			Rates:      cm.CostRates,
-			Remark:     "健康探测",
-			DurationMs: &dur,
-		})
-		return err
-	})
-
-	// router（双层模型：对外模型 + 绑定渠道内部模型）
+	// router：仅保留会话注册表（历史会话只读展示 + 管理端改名/踢下线）。
+	// 路由决策/候选选择/成本择优已随转发链迁出，代理侧负责。
 	sessionStore := router.NewSessionStore(d)
 	sess := router.NewSessionRegistry(time.Now)
 	// 会话投影异步化：Upsert/Delete/SetClosed 走 asyncwrite（Key=session_id 保序、幂等可重放）；
 	// LoadActive 保持同步直读，供启动恢复即时重建内存注册表。
 	sess.SetStore(router.NewAsyncPersister(asyncWriter, sessionStore))
-	// 候选绑定改读 channel.Manager 内存快照（方案 A）：chMgr 实现了 router.channelModelSource，
-	// 每请求不再查询 channel_models 配置表；快照经既有 SyncFromDB/Upsert/UpsertModel/DropModel 钩子失效。
-	// 对外模型名称解析仍由 modelSvc（GetByExternalName）负责，未在此缓存。
-	routerEngine := router.NewEngine(modelSvc, chMgr, chMgr, sess)
-	// 新会话创建的成本比较依赖：样值用量（routing.cost_sample）+ 全局时段（billing.time_config）。
-	// billing.ConfigProvider 结构上满足 router.CostConfig，直接注入（router 不直接读库）。
-	routerEngine.SetCostConfig(billCfgProvider)
-	// 会话成本路由配置注入：起点择优（P1）/ 中途切换（P2）的开关与门控参数来源。
-	// 未装配时引擎读缺省安全态（Enabled=false）——开关永远读不到、无法生效；此处补齐装配后
-	// 运维把 routing.session_cost.enabled 置 true 才可能真正放行起点择优 / 中途切换。
-	routerEngine.SetSessionCostProvider(sessionCostProvider)
-	// 会话成本决策产物经 asyncwrite 落库（Key=session_id 保序、IdempotencyKey=session_id:Seq 幂等），
-	// WAL 复用 data/asyncwrite.wal（与其余类别同源，由上 asyncWriter 统一承接）。
-	routerEngine.SetCostEventSink(router.NewAsyncCostEventSink(asyncWriter))
-
-	// 密钥删除联动会话清理：路由注册表经 KillByFilter(channel_key_id=keyID) 踢下线该密钥全部存活会话
-	//（内存+DB 投影）。装配在 routerEngine 之后（SessionRegistry 已就绪）。
-	chHandler.SetSessionKiller(func(keyID int64) int {
-		return routerEngine.Sessions().KillByFilter(0, 0, keyID)
-	})
 
 	// console
-	consoleAdmin := console.NewAdmin(d, billStore, chMgr, userIDFrom)
+	consoleAdmin := console.NewAdmin(d, billStore, userIDFrom)
 	consoleAdmin.SetSessions(sess)
 	consoleAdmin.SetKeyNameResolver(keyNameResolver(d))
 	consoleAdmin.SetSessionNameSetter(sessionStore.SetName)
@@ -550,10 +379,9 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	consoleDev.SetDB(d)
 	consoleDev.SetSessions(sess)
 	consoleDev.SetTokenCounter(identity.NewTokenStore(d))
-	// 调用日志：网关写入 + 控制台只读查询共用同一存储（billing_id 1:1 关联）。
-	callLogStore := gateway.NewSQLCallLogStore(d)
+	// 调用日志：只保留历史数据只读查询（call_logs 已停写，表与数据保留）。
+	callLogStore := calllog.NewSQLStore(d)
 	consoleAdmin.SetCallLogStore(callLogStore)
-	consoleAdmin.SetRouterEngine(routerEngine)
 	consoleAdmin.SetModelSource(modelSvc)
 	// 成本曲线积分换算系数 R 来源（billing.ConfigProvider 满足，含 R() 方法）：曲线 Σ(token×费率) ÷ R 得积分。
 	consoleAdmin.SetCostRProvider(billCfgProvider)
@@ -575,104 +403,6 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 		cnyRate: billCfgProvider.CnyRate,
 	})
 
-	// gateway resolvers
-	// 渠道内部模型查询：启用读缓存时改读 channel.Manager 内存快照（零 DB 查询，
-	// 由 UpsertModel/DropModel/SyncFromDB 即时维护），否则退回 channelModelStore 直查（安全态）。
-	var channelModelsResolver gateway.ChannelModelResolver = cmStore
-	if readCacheOn {
-		channelModelsResolver = chMgr
-	}
-	gw := gateway.NewGateway(gateway.GatewayConfig{
-		Tokens:        tokenSvc,
-		Router:        routerEngine,
-		Channels:      chMgr,
-		Billing:       billSvc,
-		Models:        modelSvc,
-		ChannelModels: channelModelsResolver,
-		// Protocols 渠道协议查询：供网关读取协议级错误策略（error_policy）；默认安全态（未配置时行为不变）。
-		Protocols: cpStore,
-		// ProtocolErrorStats 协议级错误统计写入：命中错误策略时按错误类别累加当日计数。
-		ProtocolErrorStats: cpStore,
-		TagKV:              tagKVResolver(tagStore),
-		Auto:               autoSvc,
-		Pricing:            newPricingModeResolver(userStore, pricingCache),
-		// SessionExpiry 会话过期 TTL 分档计算（上下文长度 + 用户对话次数，取较大者，最低兜底 5 分钟）。
-		SessionExpiry: sessExpiryProvider,
-		// 三阶段计费（预扣/结算退补）：余额不足直接 402，请求后按实际多退少补。
-		Credit:          &creditOpsAdapter{svc: creditSvc},
-		Balance:         func(ctx context.Context, userID int64) (float64, error) { return creditSvc.GetWallet(ctx, userID) },
-		ProviderFactory: gateway.DefaultProviderFactory,
-		// 令牌「最后使用时间」：内存模式（KindTokenLastUsed 未列入 AsyncKinds，不落 WAL），
-		// 由 asyncwrite 安全模式同步执行；调用方已在独立 goroutine 中触发，不阻塞请求热路径。
-		// 该字段仅用于统计展示，进程异常退出或未 flush 时允许丢失，不影响鉴权与计费。
-		TouchLastUsed: func(ctx context.Context, tokenID int64) error {
-			return asyncWriter.Submit(asyncwrite.Job{
-				Kind: asyncwrite.KindTokenLastUsed,
-				Key:  strconv.FormatInt(tokenID, 10),
-				Exec: func(c context.Context) error {
-					return tokenSvc.TouchLastUsed(c, tokenID)
-				},
-			})
-		},
-		ListEnabledModels: func(ctx context.Context) ([]model.ExternalModel, error) {
-			enabled := true
-			return modelSvc.ListModels(ctx, &enabled)
-		},
-		// GET /v1/models 一并列出全局 Auto + 该令牌用户的私有 Auto（store.List 保证可见性）。
-		ListAutoModels: func(ctx context.Context, ownerUserID int64) ([]automodel.AutoModel, error) {
-			uid := ownerUserID
-			return autoSvc.List(ctx, "", &uid)
-		},
-		// 全局上游响应头白名单（sys_configs，默认空=不透传任何上游头）。
-		// 启用读缓存时走 whitelistCache（命中零 DB）；失效由 SetConfigWriteHook 触发（配置变更即时生效）。
-		UpstreamResponseHeaderWhitelist: func() ([]string, error) {
-			var raw []byte
-			var err error
-			if whitelistCache != nil {
-				raw, err = whitelistCache.Get(context.Background())
-			} else {
-				raw, err = billStore.GetConfig(context.Background(), gateway.UpstreamResponseHeaderWhitelistKey)
-			}
-			if err != nil {
-				return nil, err
-			}
-			var names []string
-			if err := json.Unmarshal(raw, &names); err != nil {
-				return nil, err
-			}
-			return names, nil
-		},
-		// 全局跨协议转换开关（sys_configs 键 = gateway.ProtocolConversionEnabledKey，默认开启）。
-		// 缺省/空/解析失败一律按开启处理；仅显式 false（JSON 布尔或字符串 "false"/"0"）才关闭。
-		ProtocolConversionEnabled: func() bool {
-			raw, err := billStore.GetConfig(context.Background(), gateway.ProtocolConversionEnabledKey)
-			if err != nil {
-				return true
-			}
-			s := strings.TrimSpace(string(raw))
-			if s == "" {
-				return true
-			}
-			var b bool
-			if err := json.Unmarshal([]byte(s), &b); err == nil {
-				return b
-			}
-			var str string
-			if err := json.Unmarshal([]byte(s), &str); err == nil {
-				switch strings.ToLower(strings.TrimSpace(str)) {
-				case "false", "0":
-					return false
-				}
-			}
-			return true
-		},
-		Logger: logr,
-	})
-	// 调用日志采集注入（nil=不采集；生产装配 SQL 存储，与 console 只读共用）。
-	// 写侧异步化：Insert 走 asyncwrite（Kind=KindCallLog，Key/幂等键=billing_id，底层 ON CONFLICT 幂等可重放），
-	// console 只读查询仍直读同一 SQL 存储。
-	gw.SetCallLogs(gateway.NewAsyncCallLogStore(asyncWriter, callLogStore))
-
 	return &app{
 		deps: server.Deps{
 			Identity:     identityHandler,
@@ -680,66 +410,20 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 			Credit:       creditHandler,
 			TokenAdmin:   tokenAdminHandler,
 			TokenDev:     tokenDevHandler,
-			Channel:      chHandler,
-			ChannelProto: cpHandler,
 			Tag:          tagHandler,
 			Model:        modelHandler,
-			AutoModel:    autoHandler,
 			Announcement: announceHandler,
 			Console:      consoleAdmin,
 			DevConsole:   consoleDev,
 			SyncAdmin:    syncHandler,
-			Gateway:      gw.Handler(),
 		},
 		syncer:     syncer,
-		mgr:        chMgr,
-		cpSvc:      cpSvc,
 		sess:       sess,
 		billSvc:    billSvc,
 		sessions:   sessions,
 		auditStore: auditStore,
 		writer:     asyncWriter,
 	}, nil
-}
-
-// channelTagResolver 把 tag.Service 适配为 channel.TagResolver。
-type channelTagResolver struct {
-	svc *tag.Service
-}
-
-func (a channelTagResolver) ResolveChannelTags(ctx context.Context, ids []int64) ([]channel.TagRef, error) {
-	tags, err := a.svc.Resolve(ctx, ids)
-	if err != nil {
-		return nil, err
-	}
-	refs := make([]channel.TagRef, 0, len(tags))
-	for i := range tags {
-		refs = append(refs, channel.TagRef{ID: tags[i].ID, Name: tags[i].Name, KV: tags[i].KVPairs})
-	}
-	return refs, nil
-}
-
-// creditOpsAdapter 把 identity.CreditService 适配为 gateway.CreditOps（三阶段计费预扣/退款）。
-type creditOpsAdapter struct {
-	svc *identity.CreditService
-}
-
-func (a *creditOpsAdapter) Balance(ctx context.Context, userID int64) (float64, error) {
-	return a.svc.GetWallet(ctx, userID)
-}
-
-func (a *creditOpsAdapter) PreConsume(ctx context.Context, userID int64, amount float64, billingID, sessionID, remark string) error {
-	_, _, err := a.svc.Consume(ctx, userID, amount, billingID, sessionID, remark)
-	return err
-}
-
-func (a *creditOpsAdapter) Settle(ctx context.Context, userID int64, delta float64, sessionID, remark string) error {
-	_, _, err := a.svc.SettleBalance(ctx, userID, delta, sessionID, remark)
-	return err
-}
-
-func (a *creditOpsAdapter) Refund(ctx context.Context, userID int64, amount float64, remark string) error {
-	return a.svc.Recharge(ctx, userID, 0, amount, remark)
 }
 
 // priceRefAdapter 把 sync.Syncer 适配为 model.PriceSource，供对外模型价格参考/应用售价接口使用。
@@ -789,26 +473,6 @@ func (a priceRefAdapter) SearchPrices(q string) []model.CatalogEntry {
 
 func (a priceRefAdapter) LastUpdated() time.Time {
 	return a.syncer.LastUpdated()
-}
-
-// tagKVResolver 由令牌 tag_id 解析其 KV 标签集合；tagID 为 nil 或标签不存在/停用时返回 nil。
-func tagKVResolver(store *tag.Store) gateway.TagKVResolver {
-	return func(ctx context.Context, tagID *int64) (map[string]string, error) {
-		if tagID == nil {
-			return nil, nil
-		}
-		t, err := store.GetByID(ctx, *tagID)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return nil, nil
-			}
-			return nil, err
-		}
-		if !t.Enabled {
-			return nil, nil
-		}
-		return t.KVPairs, nil
-	}
 }
 
 // keyNameResolver 装配渠道密钥名称批量反查钩子（console.Admin.SetKeyNameResolver）：

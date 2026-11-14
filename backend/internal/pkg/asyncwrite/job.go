@@ -12,15 +12,18 @@ const (
 	// KindSession 会话状态写入。
 	KindSession Kind = iota
 	// KindChannelKeyEvent 渠道 Key 事件写入。
+	//
+	// 已停用（V2 第一期）：渠道事件随渠道管理迁出灵枢，不再有写入方与重放函数。
+	// **编号刻意保留不重排**——WAL 记录里存的是 Kind 数值，重排会让旧 WAL 里的记录
+	// 错认成别的类别；旧记录因无重放函数会被丢弃并告警，不会误写业务表。
 	KindChannelKeyEvent
-	// KindChannelModelEvent 渠道模型事件写入。
+	// KindChannelModelEvent 渠道模型事件写入（已停用，编号保留，理由同上）。
 	KindChannelModelEvent
-	// KindCallLog 调用日志写入。
+	// KindCallLog 调用日志写入（已停用：调用日志改由代理侧落库，灵枢停写 call_logs）。
 	KindCallLog
 	// KindTokenLastUsed 令牌最后使用时间写入（通常可容忍少量丢失，适合内存模式）。
 	KindTokenLastUsed
-	// KindSessionCostEvent 会话成本决策产物事件写入（决策轨迹/审计留痕）。
-	// 注意：默认 AsyncKinds 不含本类别 → 未显式登记时同步执行（安全态），既有默认行为不变。
+	// KindSessionCostEvent 会话成本决策产物事件写入（已停用：会话成本路由随转发链迁出）。
 	KindSessionCostEvent
 )
 
