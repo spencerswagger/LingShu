@@ -124,11 +124,38 @@ func normalizePrefixes(in []string) []string {
 	return out
 }
 
-// isSubscriptionModel 判定代理模型名是否命中订阅池前缀。
+// isSubscriptionModel 判定代理模型名是否属于订阅池（默认不对租户开放）。
+//
+// 匹配是「按族」而不是「按字面前缀」：代理侧同一个订阅族既有 `claude/xxx` 写法，
+// 也有不带 provider 段的 `claude-sonnet-4`、`codex-latest`。只看字面前缀会让后者绕过。
+// 规则（族名 = 名单项去掉尾部 '/'）：
+//   - 带 provider 段时只看**第一段**：等于族名或以「族名-」「族名.」开头（`claude/claude-sonnet-4`）；
+//   - 不带 '/' 时看整串：等于族名或以「族名-」「族名.」开头（`claude-sonnet-4`、`codex-latest`）。
+//
+// 反例守卫（不得误拦）：`anthropic/claude-sonnet-4`（API 渠道，不是订阅池）、
+// `gemini/gemini-2.0-flash`（Gemini 官方渠道）、`claudette-x`（同前缀的别的模型）。
 func isSubscriptionModel(magpieModel string, prefixes []string) bool {
 	m := strings.ToLower(strings.TrimSpace(magpieModel))
-	for _, p := range prefixes {
+	if m == "" {
+		return false
+	}
+	head := m
+	if i := strings.IndexByte(m, '/'); i >= 0 {
+		head = m[:i] // 带 provider 段时只看第一段（订阅池按 provider 暴露）
+	}
+	for _, raw := range prefixes {
+		p := strings.ToLower(strings.TrimSpace(raw))
+		if p == "" {
+			continue
+		}
 		if strings.HasPrefix(m, p) {
+			return true
+		}
+		root := strings.TrimSuffix(p, "/")
+		if root == "" {
+			continue
+		}
+		if head == root || strings.HasPrefix(head, root+"-") || strings.HasPrefix(head, root+".") {
 			return true
 		}
 	}
@@ -162,14 +189,33 @@ func NewAdmitter(tokens TokenLookup, models ModelLookup, keys KeyLookup, credKey
 	return &Admitter{tokens: tokens, models: models, keys: keys, credKey: credKey, prefixes: prefixes}
 }
 
-// ExtractPlainToken 取调用凭据明文：Authorization: Bearer 优先，兼容 Anthropic 客户端的 x-api-key。
+// ExtractPlainToken 取调用凭据明文：Authorization: Bearer 优先，兼容 Anthropic 的 x-api-key
+// 与 Gemini 原生的 x-goog-api-key。
 func ExtractPlainToken(h http.Header) string {
 	if v, ok := strings.CutPrefix(strings.TrimSpace(h.Get("Authorization")), "Bearer "); ok {
 		if v = strings.TrimSpace(v); v != "" {
 			return v
 		}
 	}
-	return strings.TrimSpace(h.Get("x-api-key"))
+	for _, key := range []string{"x-api-key", "x-goog-api-key"} {
+		if v := strings.TrimSpace(h.Get(key)); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// ExtractRequestToken 取调用凭据，并报告是否来自 query（Gemini 原生 ?key=）。
+//
+// fromQuery=true 时调用方**必须**把该参数从转发查询串里剔除：否则租户令牌会被带到上游。
+func ExtractRequestToken(r *http.Request) (plain string, fromQuery bool) {
+	if v := ExtractPlainToken(r.Header); v != "" {
+		return v, false
+	}
+	if v := strings.TrimSpace(r.URL.Query().Get("key")); v != "" {
+		return v, true
+	}
+	return "", false
 }
 
 // Authenticate 只做令牌鉴权（GET /v1/models 这类不需要模型准入的端点使用）。
@@ -185,12 +231,23 @@ func (a *Admitter) Authenticate(ctx context.Context, plainToken string) (*identi
 	return tok, nil
 }
 
-// Admit 执行准入判定：令牌 → 模型白名单 → 订阅池 → callerKey。
+// Admit 执行准入判定（令牌 → 模型白名单 → 订阅池 → callerKey）。
 // 返回 (decision, nil) 为放行；(*Deny) 非空为拒绝（调用方直接按协议形状写出）。
+//
+// 转发入口不要用它：转发必须**先鉴权再读请求体**，所以入口先 Authenticate 再调 AdmitToken，
+// 否则未鉴权的调用方就能把请求体灌进内存（回归 P1-1）。
 func (a *Admitter) Admit(ctx context.Context, plainToken, inboundModel string) (*Decision, *Deny) {
 	tok, deny := a.Authenticate(ctx, plainToken)
 	if deny != nil {
 		return nil, deny
+	}
+	return a.AdmitToken(ctx, tok, inboundModel)
+}
+
+// AdmitToken 用已鉴权的令牌继续做模型白名单 → 订阅池 → callerKey 判定。
+func (a *Admitter) AdmitToken(ctx context.Context, tok *identity.Token, inboundModel string) (*Decision, *Deny) {
+	if tok == nil {
+		return nil, &Deny{Status: http.StatusUnauthorized, Code: CodeInvalidAPIKey, Message: "调用令牌无效或已过期"}
 	}
 	if strings.TrimSpace(inboundModel) == "" {
 		return nil, &Deny{Status: http.StatusBadRequest, Code: CodeInvalidRequest, Message: "请求缺少 model 字段"}

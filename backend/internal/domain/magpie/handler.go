@@ -31,6 +31,9 @@ type Prepared struct {
 	Body []byte
 	// StreamRequested 表示请求体声明了流式（body.stream=true）。
 	StreamRequested bool
+	// StripQueryKey 表示本次鉴权用的是 query 里的 key（Gemini 原生写法），
+	// 转发时该参数必须剔除：否则租户令牌会被带到上游。
+	StripQueryKey bool
 }
 
 // Deps 是入口装配依赖。
@@ -141,14 +144,26 @@ func (h *Handler) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	start := time.Now()
 
-	// 1) 读请求体（上限 64MB）。
+	// 1) 先鉴权、后才读请求体：未鉴权的调用方不得把请求体灌进内存
+	// （/v1 无限流，64MB 上限只保护「已鉴权」的调用方）。凭据来源含 Gemini 原生写法
+	// （x-goog-api-key 头 / ?key= query）。
+	plainToken, fromQuery := ExtractRequestToken(r)
+	tok, deny := h.admitter.Authenticate(r.Context(), plainToken)
+	if deny != nil {
+		h.logFor(r.Context()).Warn("代理鉴权拒绝",
+			"endpoint", route.Endpoint, "status", deny.Status, "code", deny.Code)
+		WriteDeny(w, route.Protocol, *deny)
+		return
+	}
+
+	// 2) 读请求体（上限 64MB）。
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
 	if err != nil || int64(len(body)) > maxBodyBytes {
 		WriteDeny(w, route.Protocol, Deny{Status: http.StatusBadRequest, Code: CodeInvalidRequest, Message: "请求体过大或无法读取"})
 		return
 	}
 
-	// 2) 取入站 model：OpenAI/Anthropic 在 body，Gemini 在 path。
+	// 3) 取入站 model：OpenAI/Anthropic 在 body，Gemini 在 path。
 	inboundModel := ""
 	if route.ModelInPath {
 		inboundModel = pathModel(r.URL.Path)
@@ -161,8 +176,8 @@ func (h *Handler) handleProxy(w http.ResponseWriter, r *http.Request) {
 		inboundModel = m
 	}
 
-	// 3) 准入：令牌 → 模型白名单 → 订阅池 → callerKey。
-	dec, deny := h.admitter.Admit(r.Context(), ExtractPlainToken(r.Header), inboundModel)
+	// 4) 准入：模型白名单 → 订阅池 → callerKey（令牌已在上一步鉴权）。
+	dec, deny := h.admitter.AdmitToken(r.Context(), tok, inboundModel)
 	if deny != nil {
 		h.logFor(r.Context()).Warn("代理准入拒绝",
 			"endpoint", route.Endpoint, "model", inboundModel, "status", deny.Status, "code", deny.Code)
@@ -170,7 +185,7 @@ func (h *Handler) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 4) 只改 model（其余字节原样）。
+	// 5) 只改 model（其余字节原样）。
 	prep := Prepared{
 		TokenID:       dec.Token.ID,
 		UserID:        dec.Token.UserID,
@@ -180,6 +195,7 @@ func (h *Handler) handleProxy(w http.ResponseWriter, r *http.Request) {
 		CallerKeyName: dec.KeyName,
 		UpstreamPath:  route.UpstreamPath,
 		Body:          body,
+		StripQueryKey: fromQuery,
 	}
 	if route.ModelInPath {
 		p, err := rewritePathModel(r.URL.Path, dec.MagpieModel)
@@ -198,7 +214,7 @@ func (h *Handler) handleProxy(w http.ResponseWriter, r *http.Request) {
 		prep.StreamRequested = StreamRequested(body)
 	}
 
-	// 5) 转发（响应字节原样回流）。
+	// 6) 转发（响应字节原样回流）。
 	res := h.proxy.Forward(w, r, route, prep)
 	if res.Err != nil {
 		h.logFor(r.Context()).Warn("代理转发失败",

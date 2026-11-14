@@ -16,6 +16,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -113,10 +114,16 @@ func (p *Proxy) Forward(w http.ResponseWriter, r *http.Request, route Route, pre
 		}
 	}()
 
-	// 1) 组出站请求：path 已按协议改写，query 原样保留。
+	// 1) 组出站请求：path 已按协议改写，query 原样保留——
+	// 唯一例外是「用作我们鉴权的 ?key=」：那是租户令牌，必须剔除，其余参数逐字保留。
 	u := p.cfg.BaseURL + prep.UpstreamPath
 	if q := r.URL.RawQuery; q != "" {
-		u += "?" + q
+		if prep.StripQueryKey {
+			q = stripQueryParam(q, "key")
+		}
+		if q != "" {
+			u += "?" + q
+		}
 	}
 
 	streaming := route.StreamHint || (!route.ModelInPath && prep.StreamRequested)
@@ -285,4 +292,28 @@ func isTimeoutError(err error) bool {
 // isEventStream 判定上游响应是否 SSE。
 func isEventStream(contentType string) bool {
 	return len(contentType) >= 17 && contentType[:17] == "text/event-stream"
+}
+
+// stripQueryParam 从原始 query 串里剔掉指定参数（按 & 切段、保持其余段原样，
+// 不重新编码：调用方可能依赖原始顺序/转义形式）。
+func stripQueryParam(raw, name string) string {
+	if raw == "" {
+		return ""
+	}
+	parts := strings.Split(raw, "&")
+	out := make([]string, 0, len(parts))
+	for _, seg := range parts {
+		if seg == "" {
+			continue
+		}
+		key := seg
+		if i := strings.IndexByte(seg, '='); i >= 0 {
+			key = seg[:i]
+		}
+		if key == name {
+			continue
+		}
+		out = append(out, seg)
+	}
+	return strings.Join(out, "&")
 }
