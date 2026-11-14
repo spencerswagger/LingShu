@@ -24,7 +24,7 @@ import (
 // Deps 汇聚全量子处理器，由 main 装配后注入。
 //
 // V2 第一期起渠道/渠道协议/Auto 模型/网关转发链整体迁出，对应处理器字段一并移除；
-// 被摘接口在 routes() 中以 410 显式停用（见 goneHandler），不使用 404。
+// 被摘接口在 routes() 中以 410 显式停用（见 goneHandler / gonePublicHandler），不使用 404。
 type Deps struct {
 	Identity     *identity.Handler
 	AdminUser    *identity.AdminUserHandler
@@ -256,11 +256,13 @@ func (s *Server) routes() {
 		"POST /api/v1/dev/auto-models", "PUT /api/v1/dev/auto-models/{id}",
 		"DELETE /api/v1/dev/auto-models/{id}",
 	} {
-		dev.HandleFunc(path, goneHandler)
+		dev.HandleFunc(path, gonePublicHandler)
 	}
 
-	// ---- 网关（/v1/... 转发链已迁出灵枢，第一期不再挂载）----
-	s.mux.HandleFunc("/v1/", goneHandler)
+	// ---- 对外转发入口（/v1、/v1beta）：本版本不提供安全落地的转发能力 ----
+	// 挂在**根 mux 且无鉴权**，因此只返回通用文案（不暴露内部组件名与迁移去向）。
+	s.mux.HandleFunc("/v1/", gonePublicHandler)
+	s.mux.HandleFunc("/v1beta/", gonePublicHandler)
 
 	s.mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -268,13 +270,21 @@ func (s *Server) routes() {
 	})
 }
 
-// goneHandler 已停用接口的统一响应：410 Gone + 明确文案。
+// 已停用接口统一 410 Gone。用 410 而不是 404：这些路径确实存在过、且前端本期不改，
+// 410 表达「接口存在但已停用」，404 会被误读成路由写错或部署不全。
 //
-// 用 410 而不是 404：这些路径确实存在过、且前端本期不改，410 表达「接口存在但已停用」，
-// 404 会被误读成路由写错或部署不全。渠道族能力（渠道/密钥/模型/探测/协议/转发）已迁出灵枢。
+// 两套文案，按**受众**区分，不按路径区分：
+//   - goneHandler：管理端（走 WithAuth(RoleAdmin)，受众是内部管理员），可以说明能力去了哪里；
+//   - gonePublicHandler：无鉴权的公开入口（/v1、/v1beta、开发端），只给通用文案——
+//     对公开 API 消费者不暴露内部组件名与架构变动，也不暗示「换个地址还能用」。
 func goneHandler(w http.ResponseWriter, r *http.Request) {
 	resp.Err(w, r, http.StatusGone, resp.CodeGone,
-		"接口已停用：渠道与转发能力已迁出灵枢，请改用代理侧接口")
+		"接口已停用：渠道与转发能力已迁出本服务，请改用代理侧接口（运维文档）")
+}
+
+// gonePublicHandler 公开入口的停用响应：通用文案，不带内部组件名、不提迁移去向。
+func gonePublicHandler(w http.ResponseWriter, r *http.Request) {
+	resp.Err(w, r, http.StatusGone, resp.CodeGone, "该接口已停用，请查阅最新接口文档")
 }
 
 // middlewareChain 组装全局中间件链（顺序敏感）。

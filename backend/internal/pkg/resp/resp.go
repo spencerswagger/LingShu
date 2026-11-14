@@ -54,7 +54,7 @@ const (
 	CodeMustChangePassword = 40302 // 需先修改默认密码
 	CodeNotFound           = 40401
 	CodeConflict           = 40901
-	CodeGone               = 41001 // 接口已停用（能力已迁出，见 server.goneHandler）
+	CodeGone               = 41001 // 接口已停用（见 server.goneHandler / gonePublicHandler）
 	CodeInsufficient       = 40201 // 余额不足
 	CodeRateLimited        = 42901
 	CodeNoRoute            = 50301 // 无匹配渠道
