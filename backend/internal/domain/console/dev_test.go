@@ -135,11 +135,11 @@ func TestHandleDevListBillings_ChannelName(t *testing.T) {
 		"auto_model_name", "internal_model_id", "channel_key_id", "session_id", "session_name", "call_time",
 		"tokens", "rates", "coefficients", "r_value", "raw_total", "credits_consumed", "cost_credits",
 		"balance_before", "balance_after", "status", "error_message", "duration_ms", "first_token_ms",
-		"rid", "cnt",
+		"magpie_key_name", "estimated", "upstream_usage", "rid", "cnt",
 	}).AddRow(
 		int64(1), "b1", int64(7), "sale", nil, "gpt-4", nil, "gpt-4-int", int64(99), "", "",
 		time.Now(), `{}`, `{}`, `{"time":1,"context":1}`, int64(10000),
-		nil, float64(0.5), nil, nil, nil, "completed", nil, nil, nil, "req-1", int64(1),
+		nil, float64(0.5), nil, nil, nil, "completed", nil, nil, nil, nil, false, nil, "req-1", int64(1),
 	)
 
 	mock.ExpectQuery(`SELECT count\(\*\) FROM \(\s*SELECT 1 FROM billing_records br LEFT JOIN call_logs cl .*GROUP BY \(br.user_id::text \|\| ':' \|\| COALESCE`).

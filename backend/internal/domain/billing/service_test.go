@@ -103,7 +103,7 @@ var recordColsForTest = []string{
 	"auto_model_name", "internal_model_id", "channel_key_id", "session_id", "session_name", "call_time", "tokens", "rates",
 	"coefficients", "r_value", "raw_total", "credits_consumed", "cost_credits",
 	"balance_before", "balance_after", "status", "error_message", "duration_ms",
-	"first_token_ms",
+	"first_token_ms", "magpie_key_name", "estimated", "upstream_usage",
 }
 
 func completedRow(t *testing.T) *sqlmock.Rows {
@@ -111,7 +111,7 @@ func completedRow(t *testing.T) *sqlmock.Rows {
 	return sqlmock.NewRows(recordColsForTest).AddRow(
 		int64(5), billingID, int64(7), "sale", nil, "ext-model", nil, "int-model", int64(1), nil, "",
 		time.Now(), `{}`, `{}`, []byte(`{"time":1,"context":1}`), int64(10000),
-		nil, nil, nil, nil, nil, "completed", nil, nil, nil,
+		nil, nil, nil, nil, nil, "completed", nil, nil, nil, nil, false, nil,
 	)
 }
 
@@ -201,6 +201,9 @@ func TestRecord_Success(t *testing.T) {
 		sqlmock.AnyArg(),                 // error_message
 		sqlmock.AnyArg(),                 // duration_ms
 		sqlmock.AnyArg(),                 // first_token_ms
+		sqlmock.AnyArg(),                 // magpie_key_name
+		false,                            // estimated
+		sqlmock.AnyArg(),                 // upstream_usage
 	).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(1), time.Now()))
 
 	credit := &fakeCredit{before: before, after: after}
@@ -262,6 +265,9 @@ func TestRecord_ConsumeError_RecordsFailed(t *testing.T) {
 		sqlmock.AnyArg(), sqlmock.AnyArg(),
 		"failed", "计费结算失败",
 		sqlmock.AnyArg(), sqlmock.AnyArg(),
+		sqlmock.AnyArg(), // magpie_key_name
+		false,            // estimated
+		sqlmock.AnyArg(), // upstream_usage
 	).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(2), time.Now()))
 
 	credit := &fakeCredit{err: consumeErr}
@@ -314,7 +320,7 @@ func TestRecord_FailedHistorical_NoDoubleConsume(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows(recordColsForTest).AddRow(
 			int64(9), billingID, testUserID, "sale", nil, "ext-model", nil, "int-model", int64(1), nil, "",
 			time.Now(), `{}`, `{}`, []byte(`{"time":1,"context":1}`), int64(10000),
-			nil, nil, nil, nil, nil, "failed", "40201: 余额不足", nil, nil,
+			nil, nil, nil, nil, nil, "failed", "40201: 余额不足", nil, nil, nil, false, nil,
 		))
 
 	credit := &fakeCredit{}
@@ -363,6 +369,9 @@ func TestRecord_CostMode_RecordsCostCredits(t *testing.T) {
 		int64(10000), sqlmock.AnyArg(), credits, costCredits,
 		sqlmock.AnyArg(), sqlmock.AnyArg(), "completed", sqlmock.AnyArg(),
 		sqlmock.AnyArg(), sqlmock.AnyArg(),
+		sqlmock.AnyArg(), // magpie_key_name
+		false,            // estimated
+		sqlmock.AnyArg(), // upstream_usage
 	).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(3), time.Now()))
 
 	credit := &fakeCredit{before: 10, after: 10 - credits}
@@ -417,6 +426,9 @@ func TestRecord_SaleMode_CostCreditsDistinctFromCredits(t *testing.T) {
 		int64(10000), sqlmock.AnyArg(), credits, costCredits,
 		sqlmock.AnyArg(), sqlmock.AnyArg(), "completed", sqlmock.AnyArg(),
 		sqlmock.AnyArg(), sqlmock.AnyArg(),
+		sqlmock.AnyArg(), // magpie_key_name
+		false,            // estimated
+		sqlmock.AnyArg(), // upstream_usage
 	).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(4), time.Now()))
 
 	credit := &fakeCredit{before: 10, after: 10 - credits}
@@ -548,7 +560,7 @@ func TestSqlStore_Insert_MarshalError(t *testing.T) {
 
 // ---- 事务路径：扣款 + 积分流水 + 账单同事务 ----
 
-// txInsertArgs 组装 insertBill 的完整 25 参数匹配（事务路径用例复用；首参为应用层雪花 ID）。
+// txInsertArgs 组装 insertBill 的完整 28 参数匹配（事务路径用例复用；首参为应用层雪花 ID）。
 func txInsertArgs(credits, before, after float64, status string) []driver.Value {
 	return []driver.Value{
 		sqlmock.AnyArg(), // id（应用层雪花 ID）
@@ -569,6 +581,9 @@ func txInsertArgs(credits, before, after float64, status string) []driver.Value 
 		sqlmock.AnyArg(),                 // error_message
 		sqlmock.AnyArg(),                 // duration_ms
 		sqlmock.AnyArg(),                 // first_token_ms
+		sqlmock.AnyArg(),                 // magpie_key_name
+		false,                            // estimated
+		sqlmock.AnyArg(),                 // upstream_usage
 	}
 }
 
@@ -1195,6 +1210,9 @@ func TestRecord_ModelLevelOverride(t *testing.T) {
 		int64(10000), sqlmock.AnyArg(), credits, sqlmock.AnyArg(),
 		sqlmock.AnyArg(), sqlmock.AnyArg(), "completed", sqlmock.AnyArg(),
 		sqlmock.AnyArg(), sqlmock.AnyArg(),
+		sqlmock.AnyArg(), // magpie_key_name
+		false,            // estimated
+		sqlmock.AnyArg(), // upstream_usage
 	).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(7), time.Now()))
 
 	credit := &fakeCredit{before: 10, after: 9.7}
@@ -1259,6 +1277,9 @@ func TestRecord_Dimension(t *testing.T) {
 		sqlmock.AnyArg(),                 // error_message
 		sqlmock.AnyArg(),                 // duration_ms
 		sqlmock.AnyArg(),                 // first_token_ms
+		sqlmock.AnyArg(),                 // magpie_key_name
+		false,                            // estimated
+		sqlmock.AnyArg(),                 // upstream_usage
 	).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(8), time.Now()))
 
 	credit := &fakeCredit{before: 10, after: 10 - credits}

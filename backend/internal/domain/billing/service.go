@@ -125,6 +125,12 @@ type Record struct {
 	RequestID string
 	// Attempts 该请求共产生的账单条数（仅归并列表查询时填充；1=单次尝试，>1=发生过候选/上游重试）。
 	Attempts int
+	// MagpieKeyName 是本次调用使用的代理侧 callerKey 名（对账分组维度；历史行为空）。
+	MagpieKeyName string
+	// Estimated 表示本次账单按请求体估算（上游未给出可用 usage）。
+	Estimated bool
+	// UpstreamUsage 是上游 usage 原文（仅留痕；estimated 单为 NULL）。
+	UpstreamUsage []byte
 }
 
 // RecordReq 是 Record 的入参（由路由/网关在调用完成后传入）。
@@ -156,6 +162,12 @@ type RecordReq struct {
 	// =0 时（健康探测/直接计费等无预扣场景）按全额扣减。
 	PreConsumed float64
 	Remark      string
+	// MagpieKeyName 是本次调用使用的代理侧 callerKey 名（对账分组维度）。
+	MagpieKeyName string
+	// Estimated 表示本次账单按请求体估算（上游未给出可用 usage）。
+	Estimated bool
+	// UpstreamUsage 是上游 usage 子树原文（JSONB 落库留痕；estimated 单不写）。
+	UpstreamUsage []byte
 }
 
 // CreditService 抽象钱包扣减/差额结算，由 identity 包实现。
@@ -224,6 +236,9 @@ func (s *Service) Record(ctx context.Context, req RecordReq) (*Record, error) {
 			SessionName:     req.SessionName,
 			CallTime:        req.CallTime,
 			Tokens:          req.Tokens,
+			MagpieKeyName:   req.MagpieKeyName,
+			Estimated:       req.Estimated,
+			UpstreamUsage:   req.UpstreamUsage,
 			Status:          StatusFailed,
 			ErrorMessage:    req.ErrorMessage,
 			DurationMs:      req.DurationMs,
@@ -288,11 +303,14 @@ func (s *Service) Record(ctx context.Context, req RecordReq) (*Record, error) {
 			Time    float64 `json:"time"`
 			Context float64 `json:"context"`
 		}{Time: timeCoeff, Context: ctxCoeff},
-		RValue:       r,
-		RawTotal:     rawTotal,
-		DurationMs:   req.DurationMs,
-		FirstTokenMs: req.FirstTokenMs,
-		ErrorMessage: req.ErrorMessage,
+		RValue:        r,
+		RawTotal:      rawTotal,
+		DurationMs:    req.DurationMs,
+		FirstTokenMs:  req.FirstTokenMs,
+		ErrorMessage:  req.ErrorMessage,
+		MagpieKeyName: req.MagpieKeyName,
+		Estimated:     req.Estimated,
+		UpstreamUsage: req.UpstreamUsage,
 	}
 	// 只要提供了成本单价就记录成本积分（仅展示/毛利差异，不参与扣减）：
 	// sale 模式 cost_credits 反映真实成本（区别于售价积分的毛利段），
@@ -887,7 +905,8 @@ func (s *SqlStore) SetConfigWriteHook(fn func()) {
 // recordCols 查询 billing_records 使用的全部列。
 const recordCols = `id, billing_id, user_id, pricing_mode, token_id, external_model_name,
 	auto_model_name, internal_model_id, channel_key_id, session_id, session_name, call_time, tokens, rates, coefficients, r_value,
-	raw_total, credits_consumed, cost_credits, balance_before, balance_after, status, error_message, duration_ms, first_token_ms`
+	raw_total, credits_consumed, cost_credits, balance_before, balance_after, status, error_message, duration_ms, first_token_ms,
+	magpie_key_name, estimated, upstream_usage`
 
 // GetConfig 读取 sys_configs 单键值；key 不存在返回错误。
 func (s *SqlStore) GetConfig(ctx context.Context, key string) ([]byte, error) {
@@ -965,6 +984,15 @@ func (s *SqlStore) insertOn(ctx context.Context, ex dbx.Execer, rec *Record) (*R
 	}
 	durationMs := nullableInt64For(rec.DurationMs)
 	firstTokenMs := nullableInt64For(rec.FirstTokenMs)
+	// magpie_key_name / upstream_usage 可空：历史行与 estimated 单不写（部分索引只覆盖非 NULL）。
+	var magpieKeyName any
+	if rec.MagpieKeyName != "" {
+		magpieKeyName = rec.MagpieKeyName
+	}
+	var upstreamUsage any
+	if len(rec.UpstreamUsage) > 0 {
+		upstreamUsage = rec.UpstreamUsage
+	}
 
 	var created time.Time
 	if rec.ID == 0 {
@@ -973,13 +1001,15 @@ func (s *SqlStore) insertOn(ctx context.Context, ex dbx.Execer, rec *Record) (*R
 	err = ex.QueryRowContext(ctx,
 		`INSERT INTO billing_records(id, billing_id, user_id, pricing_mode, token_id, external_model_name,
 			auto_model_name, internal_model_id, channel_key_id, session_id, session_name, call_time, tokens, rates, coefficients, r_value,
-			raw_total, credits_consumed, cost_credits, balance_before, balance_after, status, error_message, duration_ms, first_token_ms)
-		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
+			raw_total, credits_consumed, cost_credits, balance_before, balance_after, status, error_message, duration_ms, first_token_ms,
+			magpie_key_name, estimated, upstream_usage)
+		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28)
 		 RETURNING id, created_at`,
 		rec.ID, rec.BillingID, rec.UserID, rec.PricingMode, tokenID, rec.ExternalModel, autoModelName,
 		rec.InternalModelID, channelKeyID, sessionID, sessionName, rec.CallTime, tokensRaw, ratesRaw, coeffRaw,
 		rec.RValue, rec.RawTotal, rec.CreditsConsumed, rec.CostCredits,
-		rec.BalanceBefore, rec.BalanceAfter, rec.Status, errMsg, durationMs, firstTokenMs).
+		rec.BalanceBefore, rec.BalanceAfter, rec.Status, errMsg, durationMs, firstTokenMs,
+		magpieKeyName, rec.Estimated, upstreamUsage).
 		Scan(&rec.ID, &created)
 	if err != nil {
 		return nil, err
@@ -1007,13 +1037,14 @@ func sqlScan(row interface{ Scan(...any) error }) (*Record, error) {
 	var errMsg sql.NullString
 	var durationMs, firstTokenMs sql.NullInt64
 	var tokensRaw, ratesRaw, coeffRaw []byte
+	var magpieKeyName, upstreamUsage sql.NullString
 	var callTime time.Time
 
 	err := row.Scan(&rec.ID, &rec.BillingID, &rec.UserID, &rec.PricingMode, &tokenID,
 		&rec.ExternalModel, &autoModelName, &rec.InternalModelID, &channelKeyID, &sessionID, &sessionName, &callTime,
 		&tokensRaw, &ratesRaw, &coeffRaw, &rec.RValue,
 		&rawTotal, &consCred, &costCred, &balBefore, &balAfter, &rec.Status, &errMsg,
-		&durationMs, &firstTokenMs)
+		&durationMs, &firstTokenMs, &magpieKeyName, &rec.Estimated, &upstreamUsage)
 	if err != nil {
 		return nil, err
 	}
@@ -1051,6 +1082,10 @@ func sqlScan(row interface{ Scan(...any) error }) (*Record, error) {
 	rec.SessionID = sessionID.String
 	rec.SessionName = sessionName.String
 	rec.AutoModelName = autoModelName.String
+	rec.MagpieKeyName = magpieKeyName.String
+	if upstreamUsage.Valid {
+		rec.UpstreamUsage = []byte(upstreamUsage.String)
+	}
 	rec.CallTime = callTime
 	if len(tokensRaw) > 0 {
 		_ = json.Unmarshal(tokensRaw, &rec.Tokens)
