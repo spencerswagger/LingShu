@@ -119,50 +119,50 @@ func TestAdmit_Denies(t *testing.T) {
 	}{
 		{
 			name: "缺少凭据", tokens: &fakeTokens{tok: activeToken()}, modelName: "m",
-			models: &fakeModels{byName: map[string]*model.ExternalModel{"m": okModel}},
-			keys:   &fakeKeys{key: &Key{KeyCipher: cipher}},
+			models:   &fakeModels{byName: map[string]*model.ExternalModel{"m": okModel}},
+			keys:     &fakeKeys{key: &Key{KeyCipher: cipher}},
 			wantStat: 401, wantCode: CodeInvalidAPIKey,
 		},
 		{
 			name: "令牌无效", tokens: &fakeTokens{err: errors.New("no")}, token: "t", modelName: "m",
-			models: &fakeModels{byName: map[string]*model.ExternalModel{"m": okModel}},
-			keys:   &fakeKeys{key: &Key{KeyCipher: cipher}},
+			models:   &fakeModels{byName: map[string]*model.ExternalModel{"m": okModel}},
+			keys:     &fakeKeys{key: &Key{KeyCipher: cipher}},
 			wantStat: 401, wantCode: CodeInvalidAPIKey,
 		},
 		{
 			name: "模型不存在", tokens: &fakeTokens{tok: activeToken()}, token: "t", modelName: "nope",
-			models: &fakeModels{byName: map[string]*model.ExternalModel{"m": okModel}},
-			keys:   &fakeKeys{key: &Key{KeyCipher: cipher}},
+			models:   &fakeModels{byName: map[string]*model.ExternalModel{"m": okModel}},
+			keys:     &fakeKeys{key: &Key{KeyCipher: cipher}},
 			wantStat: 404, wantCode: CodeModelNotFound,
 		},
 		{
 			name: "模型未开放", tokens: &fakeTokens{tok: activeToken()}, token: "t", modelName: "d",
-			models: &fakeModels{byName: map[string]*model.ExternalModel{"d": disabled}},
-			keys:   &fakeKeys{key: &Key{KeyCipher: cipher}},
+			models:   &fakeModels{byName: map[string]*model.ExternalModel{"d": disabled}},
+			keys:     &fakeKeys{key: &Key{KeyCipher: cipher}},
 			wantStat: 403, wantCode: CodeModelNotAllowed,
 		},
 		{
 			name: "未映射代理模型", tokens: &fakeTokens{tok: activeToken()}, token: "t", modelName: "u",
-			models: &fakeModels{byName: map[string]*model.ExternalModel{"u": unmapped}},
-			keys:   &fakeKeys{key: &Key{KeyCipher: cipher}},
+			models:   &fakeModels{byName: map[string]*model.ExternalModel{"u": unmapped}},
+			keys:     &fakeKeys{key: &Key{KeyCipher: cipher}},
 			wantStat: 403, wantCode: CodeModelNotAllowed,
 		},
 		{
 			name: "订阅池前缀拦截", tokens: &fakeTokens{tok: activeToken()}, token: "t", modelName: "c",
-			models: &fakeModels{byName: map[string]*model.ExternalModel{"c": subPool}},
-			keys:   &fakeKeys{key: &Key{KeyCipher: cipher}},
+			models:   &fakeModels{byName: map[string]*model.ExternalModel{"c": subPool}},
+			keys:     &fakeKeys{key: &Key{KeyCipher: cipher}},
 			wantStat: 403, wantCode: CodeModelNotAllowed,
 		},
 		{
 			name: "令牌未开通代理访问", tokens: &fakeTokens{tok: activeToken()}, token: "t", modelName: "m",
-			models: &fakeModels{byName: map[string]*model.ExternalModel{"m": okModel}},
-			keys:   &fakeKeys{err: ErrKeyNotProvisioned},
+			models:   &fakeModels{byName: map[string]*model.ExternalModel{"m": okModel}},
+			keys:     &fakeKeys{err: ErrKeyNotProvisioned},
 			wantStat: 403, wantCode: CodeMagpieKeyMissing,
 		},
 		{
 			name: "凭据密文不可用", tokens: &fakeTokens{tok: activeToken()}, token: "t", modelName: "m",
-			models: &fakeModels{byName: map[string]*model.ExternalModel{"m": okModel}},
-			keys:   &fakeKeys{key: &Key{KeyCipher: ""}},
+			models:   &fakeModels{byName: map[string]*model.ExternalModel{"m": okModel}},
+			keys:     &fakeKeys{key: &Key{KeyCipher: ""}},
 			wantStat: 403, wantCode: CodeMagpieKeyMissing,
 		},
 	}
@@ -257,9 +257,9 @@ func TestExtractPlainToken(t *testing.T) {
 		return h
 	}
 	cases := []struct {
-		name     string
-		headers  map[string][]string
-		want     string
+		name    string
+		headers map[string][]string
+		want    string
 	}{
 		{name: "Bearer", headers: mk("Bearer abc", ""), want: "abc"},
 		{name: "Bearer 前置空白", headers: mk("Bearer   abc  ", ""), want: "abc"},
