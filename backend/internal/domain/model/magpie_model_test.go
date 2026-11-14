@@ -7,8 +7,10 @@ package model
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -151,5 +153,31 @@ func TestMapUniqueViolation_RoutesByConstraint(t *testing.T) {
 	}
 	if e := mapUniqueViolation(sql.ErrNoRows); e != nil {
 		t.Fatalf("非 23505 不应映射，得到 %v", e)
+	}
+}
+
+// TestViewModels_MagpieModelOnlyOnAdmin 断言「代理侧映射只给管理端」：
+// /api/v1/dev/models 复用同一服务，若对外视图带上 magpie_model 就把内部代号漏给租户。
+func TestViewModels_MagpieModelOnlyOnAdmin(t *testing.T) {
+	now := time.Now()
+	m := &ExternalModel{ID: 1, ExternalName: "tenant-gpt", Enabled: true,
+		SaleRates: map[string]float64{"input": 1}, MagpieModel: strPtr("openai/gpt-4o"), CreatedAt: now, UpdatedAt: now}
+
+	adminRaw, err := json.Marshal(toAdminView(m))
+	if err != nil {
+		t.Fatalf("marshal admin view: %v", err)
+	}
+	if !strings.Contains(string(adminRaw), "openai/gpt-4o") || !strings.Contains(string(adminRaw), `"MagpieModel"`) {
+		t.Fatalf("管理端视图应带代理映射: %s", adminRaw)
+	}
+
+	devRaw, err := json.Marshal(toView(m))
+	if err != nil {
+		t.Fatalf("marshal dev view: %v", err)
+	}
+	for _, leak := range []string{"openai/gpt-4o", "MagpieModel", "magpie_model", "magpie"} {
+		if strings.Contains(string(devRaw), leak) {
+			t.Fatalf("对外视图泄漏内部映射（%s）: %s", leak, devRaw)
+		}
 	}
 }

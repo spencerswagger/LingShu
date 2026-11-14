@@ -37,7 +37,9 @@ type Deps struct {
 	Announcement *identity.AnnouncementHandler
 	Console      *console.Admin
 	DevConsole   *console.Dev
-	SyncAdmin    *sync.Handler
+	// MagpieKey 是代理侧 callerKey 映射的管理端接口（nil = 不挂载）。
+	MagpieKey *magpie.KeyAdminHandler
+	SyncAdmin *sync.Handler
 	// Facade 是代理侧转发入口（/v1 与 /v1beta）。nil = 未配置 magpie.base_url，
 	// 此时 /v1 保持 410 停用口径（不半残挂载：转发链与准入是一体的，缺一即不可用）。
 	Facade *magpie.Handler
@@ -190,7 +192,12 @@ func (s *Server) routes() {
 	admin.HandleFunc("POST /api/v1/admin/tags/batch-delete", d.Tag.HandleBatchDelete)
 
 	// models（对外模型）
-	admin.HandleFunc("GET /api/v1/admin/models", d.Model.HandleList)
+	admin.HandleFunc("GET /api/v1/admin/models", d.Model.HandleListAdmin)
+	if d.MagpieKey != nil {
+		admin.HandleFunc("GET /api/v1/admin/tokens/{id}/magpie-key", d.MagpieKey.HandleGet)
+		admin.HandleFunc("PUT /api/v1/admin/tokens/{id}/magpie-key", d.MagpieKey.HandlePut)
+		admin.HandleFunc("DELETE /api/v1/admin/tokens/{id}/magpie-key", d.MagpieKey.HandleDelete)
+	}
 	admin.HandleFunc("POST /api/v1/admin/models", d.Model.HandleCreate)
 	admin.HandleFunc("PUT /api/v1/admin/models/{id}", d.Model.HandleUpdate)
 	admin.HandleFunc("POST /api/v1/admin/models/batch-delete", d.Model.HandleBatchDelete)
