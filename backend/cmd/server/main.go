@@ -29,6 +29,7 @@ import (
 	"github.com/team/llmgateway/internal/domain/router"
 	"github.com/team/llmgateway/internal/domain/sync"
 	"github.com/team/llmgateway/internal/domain/tag"
+	"github.com/team/llmgateway/internal/domain/usagebilling"
 	"github.com/team/llmgateway/internal/pkg/asyncwrite"
 	"github.com/team/llmgateway/internal/pkg/clientip"
 	"github.com/team/llmgateway/internal/pkg/idgen"
@@ -192,6 +193,10 @@ func main() {
 		slog.Info("billing retry queue has pending records", "pending", n)
 	}
 	go app.billSvc.RunRetryQueue(ctx, time.Duration(cfg.Billing.RetryIntervalSeconds)*time.Second)
+	// 用量对账：每 60 秒比一次 token 三段与请求笔数（只告警，绝不回写账单）。
+	if app.reconciler != nil {
+		go app.reconciler.Run(ctx)
+	}
 	// 审计写入失败汇总：审计失效必须早于业务失效被发现，把进程内 expvar 计数
 	// 变成日志侧可告警信号（本服务不暴露 /debug/vars）。
 	go audit.ReportInsertFailures(ctx, logr, time.Minute)
@@ -227,6 +232,8 @@ type app struct {
 	auditStore *audit.Store
 	// writer 是全局非资金异步持久化层（会话投影/渠道状态事件/调用日志），随进程优雅退出 flush。
 	writer *asyncwrite.Writer
+	// reconciler 是 60 秒对账器（nil = 未接入代理账本，不启动）。
+	reconciler *usagebilling.Reconciler
 }
 
 // buildApp 装配全部服务。
@@ -411,9 +418,12 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	// （灵枢不自行签发凭据；未绑定的令牌在转发时返回 403 magpie_key_missing）。
 	magpieKeyAdmin := magpie.NewKeyAdminHandler(magpie.NewKeyStore(d), sm4Key)
 
+	// 旁路 usage 计费闭环：转发前预扣（估算输入 token）→ 转发 → 按 usage 结算差额，
+	// 上游失败/超时退预扣，客户端取消且无 usage 也退预扣（不再按估算计费）。
+	usageBillSvc := usagebilling.NewService(billSvc, creditSvc, userStore, logr)
+
 	// 对外转发入口（/v1 与 /v1beta）：灵枢只做 facade，转发与协议互译在代理侧。
 	// 未配置 magpie.base_url 时 NewHandler 返回 nil，server 侧保持 410 停用口径。
-	// OnComplete 刻意不注入：扣费/退预扣属第③件，本件只产出 Result 事实。
 	magpieHandler := magpie.NewHandler(magpie.Deps{
 		Config:        magpie.FromApp(cfg),
 		Tokens:        tokenSvc,
@@ -421,10 +431,28 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 		Keys:          magpie.NewKeyStore(d),
 		CredentialKey: sm4Key,
 		Prefixes:      magpiePrefixes,
+		Reserve:       usageBillSvc.Reserve,
+		OnComplete:    usageBillSvc.Settle,
 		Logger:        logr,
 	})
 	if magpieHandler == nil {
 		logr.Info("未配置 magpie.base_url：对外转发接口保持停用（410）")
+	}
+
+	// 对账调度在代理侧启用后总是跑：配了 admin_key 就真比对，
+	// 没配就每窗落一条 skipped（让运维看得见「没在对账」，而不是静默无记录）。
+	var reconciler *usagebilling.Reconciler
+	if magpieHandler != nil {
+		resolved := cfg.ResolvedMagpie()
+		var ledger usagebilling.LedgerClient
+		if resolved.AdminKey == "" {
+			logr.Warn("未配置 magpie.admin_key：用量对账记 skipped（不比对）")
+		} else {
+			ledger = usagebilling.NewLedgerHTTP(resolved.BaseURL, resolved.AdminKey, resolved.AuthHeader, nil)
+		}
+		reconcileStore := usagebilling.NewSQLReconcileStore(d)
+		reconciler = usagebilling.NewReconciler(reconcileStore, ledger, &usagebilling.AuditSink{DB: d}, logr)
+		reconciler.SetLock(reconcileStore.TryAdvisoryLock)
 	}
 
 	return &app{
@@ -449,6 +477,7 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 		sessions:   sessions,
 		auditStore: auditStore,
 		writer:     asyncWriter,
+		reconciler: reconciler,
 	}, nil
 }
 
