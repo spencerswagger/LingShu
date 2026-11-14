@@ -114,14 +114,16 @@ func TestSQLReconcileStore_SaveWindowUpserts(t *testing.T) {
 }
 
 // advisory lock：拿不到锁返回 ok=false（多副本只让一个实例跑）。
+// 取锁/解锁必须在同一连接（sqlmock 层只验证语句形态；真 PG 行为见 reconcile_lock_pg_test.go）。
 func TestSQLReconcileStore_AdvisoryLock(t *testing.T) {
 	store, mock, db := newMockStore(t)
 	defer db.Close()
 
 	mock.ExpectQuery(advisoryLockSQL.String()).WithArgs(sqlmock.AnyArg()).
 		WillReturnRows(sqlmock.NewRows([]string{"locked"}).AddRow(true))
-	mock.ExpectExec(advisoryUnlockSQ.String()).WithArgs(sqlmock.AnyArg()).
-		WillReturnResult(sqlmock.NewResult(0, 0))
+	// 解锁改成走 QueryRow（要读回 unlocked 布尔值，确认真的解掉了）。
+	mock.ExpectQuery(advisoryUnlockSQ.String()).WithArgs(sqlmock.AnyArg()).
+		WillReturnRows(sqlmock.NewRows([]string{"unlocked"}).AddRow(true))
 
 	release, ok := store.TryAdvisoryLock(context.Background())
 	if !ok {
