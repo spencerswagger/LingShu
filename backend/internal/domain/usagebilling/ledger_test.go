@@ -15,7 +15,7 @@ func TestParseLedgerBody_Shapes(t *testing.T) {
 		"array": `[{"key":"k1","model":"m1","tokens":{"input":10,"cache_read":1,"output":5}},{"key":"k1","model":"m1","tokens":{"input":10,"cache_read":1,"output":5}}]`,
 	}
 	for name, body := range cases {
-		gs, err := parseLedgerBody([]byte(body))
+		gs, _, err := parseLedgerBody([]byte(body))
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
@@ -41,7 +41,7 @@ func TestParseLedgerBody_Shapes(t *testing.T) {
 
 // 未知形状必须报错（而不是静默当成 0，让整窗假绿）。
 func TestParseLedgerBody_UnknownShapeErrors(t *testing.T) {
-	if _, err := parseLedgerBody([]byte(`{"foo":"bar"}`)); err == nil {
+	if _, _, err := parseLedgerBody([]byte(`{"foo":"bar"}`)); err == nil {
 		t.Fatalf("未知形状应报错")
 	}
 }
@@ -67,7 +67,7 @@ func TestLedgerHTTP_BatchesByCallerKey(t *testing.T) {
 		keys = append(keys, "k")
 	}
 	l := NewLedgerHTTP(srv.URL, "admin-key", "", srv.Client())
-	if _, err := l.FetchWindow(t.Context(), time.Now().Add(-time.Minute), time.Now(), keys); err != nil {
+	if _, _, err := l.FetchWindow(t.Context(), time.Now().Add(-time.Minute), time.Now(), keys); err != nil {
 		t.Fatalf("FetchWindow: %v", err)
 	}
 	if len(batches) != 3 || batches[0] != 50 || batches[1] != 50 || batches[2] != 20 {
@@ -100,7 +100,7 @@ func TestLedgerHTTP_Non2xxErrors(t *testing.T) {
 	}))
 	defer srv.Close()
 	l := NewLedgerHTTP(srv.URL, "k", "", srv.Client())
-	if _, err := l.FetchWindow(t.Context(), time.Now(), time.Now(), []string{"k1"}); err == nil {
+	if _, _, err := l.FetchWindow(t.Context(), time.Now(), time.Now(), []string{"k1"}); err == nil {
 		t.Fatalf("5xx 应返回 error")
 	}
 }

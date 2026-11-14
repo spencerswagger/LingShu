@@ -145,15 +145,25 @@ func (f *fakeStore) SaveWindow(_ context.Context, w Window) error {
 
 type fakeLedger struct {
 	items []Group
-	err   error
-	from  time.Time
-	to    time.Time
-	keys  []string
+	// report 为零值时按「字段齐全 + cursor 分页」处理（既有用例的默认口径）。
+	report *LedgerReport
+	err    error
+	from   time.Time
+	to     time.Time
+	keys   []string
 }
 
-func (f *fakeLedger) FetchWindow(_ context.Context, from, to time.Time, keys []string) ([]Group, error) {
+func (f *fakeLedger) FetchWindow(_ context.Context, from, to time.Time, keys []string) ([]Group, LedgerReport, error) {
 	f.from, f.to, f.keys = from, to, keys
-	return f.items, f.err
+	if f.report != nil {
+		return f.items, *f.report, f.err
+	}
+	return f.items, fullyVerifiedReport(), f.err
+}
+
+// fullyVerifiedReport 是「9 项齐全 + cursor 分页」的报告（可进入主口径比对）。
+func fullyVerifiedReport() LedgerReport {
+	return LedgerReport{Items: 1, Records: 1, Paging: "cursor"}
 }
 
 type fakeAudit struct {
@@ -254,5 +264,70 @@ func TestRunOnce_PreviousStreakErrorDoesNotBlock(t *testing.T) {
 	r.RunOnce(context.Background())
 	if len(store.saved) != 1 || store.saved[0].Status != "ok" {
 		t.Fatalf("saved=%+v", store.saved)
+	}
+}
+
+// 契约 §8.2：字段不全 → 窗口标 blocked（既不算通过也不算不通过），
+// 本地比对只作参考留在 detail.local_comparison，且不参与连续告警升级。
+func TestRunOnce_BlockedWhenLedgerFieldsMissing(t *testing.T) {
+	store := &fakeStore{
+		// 本地侧确实有偏差（10 vs 100），但账本缺字段 → 不许判 alarm、也不许判 ok。
+		local: []Group{g("k1", "m1", 10, 200, 0, 100)},
+		keys:  []string{"k1"},
+		prev:  2,
+	}
+	ledger := &fakeLedger{items: []Group{g("k1", "m1", 10, 100, 0, 100)}}
+	ledger.report = &LedgerReport{Items: 1, Records: 1, Paging: "offset", Missing: []string{FieldRecordKey}}
+	audit := &fakeAudit{}
+	r := newReconciler(store, ledger, audit)
+	r.RunOnce(t.Context())
+
+	if len(store.saved) != 1 {
+		t.Fatalf("saved=%d", len(store.saved))
+	}
+	w := store.saved[0]
+	if w.Status != "blocked" {
+		t.Fatalf("status=%s（缺字段必须 blocked）", w.Status)
+	}
+	if w.AlarmStreak != 0 {
+		t.Fatalf("blocked 窗不该累计 alarm_streak: %d", w.AlarmStreak)
+	}
+	if w.Detail["blocked"] != BlockedPendingPOC {
+		t.Fatalf("detail.blocked=%v", w.Detail["blocked"])
+	}
+	reasons, _ := w.Detail["blocked_reasons"].([]string)
+	if len(reasons) == 0 {
+		t.Fatalf("必须留下不可对账原因: %v", w.Detail)
+	}
+	if _, ok := w.Detail["local_comparison"]; !ok {
+		t.Fatalf("本地比对结果应作为参考留在 detail: %v", w.Detail)
+	}
+	if _, ok := w.Detail["ledger_report"]; !ok {
+		t.Fatalf("账本字段可见性必须落 detail: %v", w.Detail)
+	}
+	if audit.calls != 0 {
+		t.Fatalf("blocked 窗不许升级审计: %d", audit.calls)
+	}
+}
+
+// 字段齐全但 cache_read 缺失：可降级 → 仍走主口径（ok/alarm 都能出现），
+// 且 detail 里显式记下缺失。
+func TestRunOnce_CacheReadMissingStillCompares(t *testing.T) {
+	store := &fakeStore{
+		local: []Group{g("k1", "m1", 10, 100, 0, 100)},
+		keys:  []string{"k1"},
+	}
+	ledger := &fakeLedger{items: []Group{g("k1", "m1", 10, 100, 0, 100)}}
+	ledger.report = &LedgerReport{Items: 1, Records: 1, Paging: "cursor", CacheReadMissing: true}
+	r := newReconciler(store, ledger, &fakeAudit{})
+	r.RunOnce(t.Context())
+
+	w := store.saved[0]
+	if w.Status != "ok" {
+		t.Fatalf("cache_read 缺失属可降级，仍应比对: %s (%v)", w.Status, w.Detail["blocked_reasons"])
+	}
+	rep, ok := w.Detail["ledger_report"].(LedgerReport)
+	if !ok || !rep.CacheReadMissing {
+		t.Fatalf("缺失声明必须落 detail: %v", w.Detail["ledger_report"])
 	}
 }

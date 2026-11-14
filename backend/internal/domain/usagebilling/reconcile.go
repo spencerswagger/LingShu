@@ -60,10 +60,10 @@ func (g Group) Tokens() int64 { return g.Input + g.CacheRead + g.Output }
 // groupKey 是分组键（callerKey + 模型）。
 func (g Group) groupKey() string { return g.CallerKey + "\x00" + g.Model }
 
-// LedgerClient 拉取代理侧账本。
+// LedgerClient 拉取代理侧账本。第二个返回值是字段可见性报告（契约 §8.2 降级表）：
+// 必需项缺失或分页只支持 offset → 该窗口不可对账（标 blocked: pending POC）。
 type LedgerClient interface {
-	// FetchWindow 拉 [from,to) 内这些 callerKey 的用量。
-	FetchWindow(ctx context.Context, from, to time.Time, callerKeys []string) ([]Group, error)
+	FetchWindow(ctx context.Context, from, to time.Time, callerKeys []string) ([]Group, LedgerReport, error)
 }
 
 // ReconcileStore 是对账落库依赖。
@@ -191,8 +191,9 @@ func (r *Reconciler) buildWindow(ctx context.Context, start, end time.Time) (Win
 		return Window{}, fmt.Errorf("取灵枢账单聚合: %w", err)
 	}
 	var magpie []Group
+	report := LedgerReport{Paging: "none"}
 	if len(keys) > 0 {
-		magpie, err = r.ledger.FetchWindow(ctx, start, end, keys)
+		magpie, report, err = r.ledger.FetchWindow(ctx, start, end, keys)
 		if err != nil {
 			return Window{}, fmt.Errorf("拉代理侧账本: %w", err)
 		}
@@ -201,10 +202,31 @@ func (r *Reconciler) buildWindow(ctx context.Context, start, end time.Time) (Win
 	if err != nil {
 		prev = 0 // 读不到上一窗按 0 处理（不阻断本窗）
 	}
-	return compareWindow(start, end, local, magpie, prev), nil
+	w := compareWindow(start, end, local, magpie, prev)
+
+	// 契约 §8.2：字段不全（或只有 offset 分页）→ 该窗口不可对账。
+	// 本地比对结果只作为「参考」留在 detail，状态既不算通过也不算不通过，且不参与连续告警升级。
+	if reasons := report.BlockedReasons(); len(reasons) > 0 {
+		w.Detail["local_comparison"] = map[string]any{
+			"status":           w.Status,
+			"dev_pct":          w.DevPct,
+			"alarm_groups":     w.Detail["alarm_groups"],
+			"token_sum_ls":     w.Detail["token_sum_ls"],
+			"token_sum_magpie": w.Detail["token_sum_magpie"],
+		}
+		w.Detail["blocked"] = BlockedPendingPOC
+		w.Detail["blocked_reasons"] = reasons
+		w.Status = "blocked"
+		w.AlarmStreak = 0
+	}
+	w.Detail["ledger_report"] = report
+	return w, nil
 }
 
 // saveSkipped 在账本未装配时留一条 skipped 记录（可观测「没在对账」）。
+//
+// 与 blocked 的区别：skipped = 我们自己没接上账本；blocked = 接上了但字段不全
+// （端到端未验，pending POC），两者都不改任何账单。
 func (r *Reconciler) saveSkipped(ctx context.Context, reason string) {
 	end := r.now()
 	start := end.Add(-r.interval)
