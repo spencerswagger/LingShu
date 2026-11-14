@@ -224,27 +224,28 @@ func (p *Proxy) Forward(w http.ResponseWriter, r *http.Request, route Route, pre
 	if needle != "" && !isSSE {
 		// 非流式：整段读，才知道是否命中——没命中要连 Content-Length 一起保持原样。
 		p.serveMaskedBuffered(w, body, collector, needle, route, &res)
-		return res
-	}
-	if needle != "" {
-		// 流式：长度可能变（遮蔽后变长），交 chunked，避免长度头与实际字节不符。
-		w.Header().Del("Content-Length")
-	}
-	w.WriteHeader(resp.StatusCode)
-
-	// 4) 旁路读 usage（只读原始字节：遮蔽只作用于下行，不能污染 usage 解析）。
-	if route.Billable {
-		if err := p.copyBody(w, body, collector, isSSE, cancel, r.Context(), &res, needle); err != nil {
+	} else {
+		if needle != "" {
+			// 流式：长度可能变（遮蔽后变长），交 chunked，避免长度头与实际字节不符。
+			w.Header().Del("Content-Length")
+		}
+		w.WriteHeader(resp.StatusCode)
+		// 旁路读 usage（只读原始字节：遮蔽只作用于下行，不能污染 usage 解析）；
+		// 计数端点不计费、不读 usage，直接透传避免无谓的内存与解析开销。
+		var c *usageCollector
+		if route.Billable {
+			c = collector
+		}
+		if err := p.copyBody(w, body, c, isSSE, cancel, r.Context(), &res, needle); err != nil {
 			res.Err = err
 		}
+	}
+
+	// 4) usage 汇总（两条路径共用，避免非流式遮蔽路径漏掉 usage 事实）。
+	if route.Billable {
 		collector.finish()
 		if u, ok := collector.Result(); ok {
 			res.Usage, res.HasUsage = u, true
-		}
-	} else {
-		// 计数端点不计费、不读 usage：直接透传，避免无谓的内存与解析开销。
-		if err := p.copyBody(w, body, nil, isSSE, cancel, r.Context(), &res, needle); err != nil {
-			res.Err = err
 		}
 	}
 	return res
@@ -276,13 +277,6 @@ func (p *Proxy) serveMaskedBuffered(w http.ResponseWriter, body io.Reader, colle
 		masked := maskCredentialEcho(raw, needle, res)
 		if _, werr := w.Write(masked); werr != nil {
 			res.Canceled = true
-			return
-		}
-		if collector != nil {
-			collector.finish()
-			if u, ok := collector.Result(); ok {
-				res.Usage, res.HasUsage = u, true
-			}
 		}
 		return
 	}
@@ -298,13 +292,6 @@ func (p *Proxy) serveMaskedBuffered(w http.ResponseWriter, body io.Reader, colle
 	w.WriteHeader(res.Status)
 	if _, werr := w.Write(masked); werr != nil {
 		res.Canceled = true
-		return
-	}
-	if collector != nil {
-		collector.finish()
-		if u, ok := collector.Result(); ok {
-			res.Usage, res.HasUsage = u, true
-		}
 	}
 }
 
