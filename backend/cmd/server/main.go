@@ -407,6 +407,10 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 		cnyRate: billCfgProvider.CnyRate,
 	})
 
+	// 代理侧 callerKey 映射的管理端入口：运维在 magpie 侧创建 callerKey 后录入灵枢
+	// （灵枢不自行签发凭据；未绑定的令牌在转发时返回 403 magpie_key_missing）。
+	magpieKeyAdmin := magpie.NewKeyAdminHandler(magpie.NewKeyStore(d), sm4Key)
+
 	// 对外转发入口（/v1 与 /v1beta）：灵枢只做 facade，转发与协议互译在代理侧。
 	// 未配置 magpie.base_url 时 NewHandler 返回 nil，server 侧保持 410 停用口径。
 	// OnComplete 刻意不注入：扣费/退预扣属第③件，本件只产出 Result 事实。
@@ -437,6 +441,7 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 			DevConsole:   consoleDev,
 			SyncAdmin:    syncHandler,
 			Facade:       magpieHandler,
+			MagpieKey:    magpieKeyAdmin,
 		},
 		syncer:     syncer,
 		sess:       sess,
