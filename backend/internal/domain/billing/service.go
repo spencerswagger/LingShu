@@ -423,14 +423,14 @@ func (s *Service) consumeInTx(ctx context.Context, ex dbx.Execer, rec *Record, r
 	if req.PreConsumed > 0 {
 		delta := credits - req.PreConsumed
 		if ex != nil {
-			return s.credit.SettleTx(ctx, ex, req.UserID, delta, req.SessionID, "实际调用差额")
+			return s.credit.SettleTx(ctx, ex, req.UserID, delta, req.SessionID, FlowRemarkDelta)
 		}
-		return s.credit.Settle(ctx, req.UserID, delta, req.SessionID, "实际调用差额")
+		return s.credit.Settle(ctx, req.UserID, delta, req.SessionID, FlowRemarkDelta)
 	}
 	if ex != nil {
-		return s.credit.ConsumeTx(ctx, ex, req.UserID, credits, rec.BillingID, req.SessionID, "实际调用差额")
+		return s.credit.ConsumeTx(ctx, ex, req.UserID, credits, rec.BillingID, req.SessionID, FlowRemarkDelta)
 	}
-	return s.credit.Consume(ctx, req.UserID, credits, rec.BillingID, req.SessionID, "实际调用差额")
+	return s.credit.Consume(ctx, req.UserID, credits, rec.BillingID, req.SessionID, FlowRemarkDelta)
 }
 
 // userMessageError 由业务错误实现：返回可直接落地展示的中文文案。

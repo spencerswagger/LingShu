@@ -141,7 +141,7 @@ func (s *Service) Reserve(ctx context.Context, in magpie.ReserveInput) (any, *ma
 	if credits <= 0 {
 		return rv, nil
 	}
-	if _, _, err := s.credit.Consume(ctx, in.UserID, credits, billingID, in.SessionID, "调用预扣"); err != nil {
+	if _, _, err := s.credit.Consume(ctx, in.UserID, credits, billingID, in.SessionID, billing.FlowRemarkReserve); err != nil {
 		// 余额不足 / 钱包缺失：契约口径是「拿不到钱就不发请求」。
 		s.logger.WarnContext(ctx, "预扣被拒", "user_id", in.UserID, "model", in.ExternalModel,
 			"credits", credits, "err", err.Error())
@@ -232,7 +232,7 @@ func (s *Service) Settle(ctx context.Context, res magpie.Result) {
 // refundAndFail 退回预扣并落一条 failed 账单（credits=0，无 usage）。
 func (s *Service) refundAndFail(ctx context.Context, rv *Reservation, req billing.RecordReq, reason string) {
 	if rv.PreConsumed > 0 {
-		if _, _, err := s.credit.Settle(ctx, rv.UserID, -rv.PreConsumed, rv.SessionID, "请求失败退回预扣"); err != nil {
+		if _, _, err := s.credit.Settle(ctx, rv.UserID, -rv.PreConsumed, rv.SessionID, billing.FlowRemarkRefund); err != nil {
 			// 退款失败必须显式告警：钱已经扣了但没退回去。
 			s.logger.ErrorContext(ctx, "退回预扣失败", "billing_id", rv.BillingID, "user_id", rv.UserID,
 				"pre_consumed", rv.PreConsumed, "err", err.Error())
