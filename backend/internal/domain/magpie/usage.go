@@ -23,6 +23,7 @@ package magpie
 
 import (
 	"encoding/json"
+	"unicode/utf8"
 )
 
 // Usage 是归一化后的三段用量（与 billing 的三段计费口径一致）。
@@ -52,6 +53,10 @@ type usageCollector struct {
 
 	usage Usage
 	seen  bool
+	// rawUsage 是最后一次解析到的 usage 子树（落 billing_records.upstream_usage 留痕）。
+	rawUsage map[string]json.RawMessage
+	// textRunes 是旁路累计的生成内容字符数（只用于「无 usage」时的输出估算）。
+	textRunes int
 	// 放弃标记：非流式超限 / 无效帧过多时置位，Result 恒返回未取到。
 	dropped bool
 }
@@ -107,8 +112,9 @@ func (c *usageCollector) finish() {
 		return
 	}
 	if u, found := extractUsage(c.protocol, obj); found {
-		c.merge(u)
+		c.merge(u, locateUsage(c.protocol, obj))
 	}
+	c.accumulateText(obj, 0)
 }
 
 // Result 返回归一化用量与是否取到（全零一律视为未取到）。
@@ -118,6 +124,21 @@ func (c *usageCollector) Result() (Usage, bool) {
 	}
 	return c.usage, true
 }
+
+// RawUsage 返回最后一次解析到的 usage 子树（重新序列化；仅供落库留痕，不回流响应）。
+func (c *usageCollector) RawUsage() []byte {
+	if len(c.rawUsage) == 0 {
+		return nil
+	}
+	b, err := json.Marshal(c.rawUsage)
+	if err != nil {
+		return nil
+	}
+	return b
+}
+
+// ObservedRunes 返回旁路累计的生成内容字符数（无 usage 时估算输出用）。
+func (c *usageCollector) ObservedRunes() int { return c.textRunes }
 
 // consumeSSELine 处理一行 SSE：只认 `data:` 行，忽略事件名/注释/空行。
 func (c *usageCollector) consumeSSELine(raw []byte) {
@@ -136,15 +157,16 @@ func (c *usageCollector) consumeSSELine(raw []byte) {
 	}
 	// usage 可能直接在事件里（OpenAI Chat / Gemini），也可能裹在 message（Anthropic）
 	// 或 response（OpenAI Responses）里，逐层下探。
+	c.accumulateText(obj, 0)
 	if u, found := extractUsage(c.protocol, obj); found {
-		c.merge(u)
+		c.merge(u, locateUsage(c.protocol, obj))
 		return
 	}
 	for _, wrapper := range []string{"message", "response"} {
 		if inner, ok := obj[wrapper]; ok {
 			if innerObj, ok := decodeObject(inner); ok {
 				if u, found := extractUsage(c.protocol, innerObj); found {
-					c.merge(u)
+					c.merge(u, locateUsage(c.protocol, innerObj))
 					return
 				}
 			}
@@ -152,9 +174,59 @@ func (c *usageCollector) consumeSSELine(raw []byte) {
 	}
 }
 
+// accumulateText 旁路累计「生成内容」字符数：只在已知的内容键上计数，
+// 避免把模型名/ID/时间戳等结构字段算进输出估算。
+func (c *usageCollector) accumulateText(obj map[string]json.RawMessage, depth int) {
+	if depth > 4 {
+		return
+	}
+	for _, key := range contentKeys {
+		if raw, ok := obj[key]; ok {
+			if s, ok := decodeString(raw); ok {
+				c.textRunes += utf8.RuneCountInString(s)
+			}
+		}
+	}
+	for _, v := range obj {
+		if inner, ok := decodeObject(v); ok {
+			c.accumulateText(inner, depth+1)
+			continue
+		}
+		// 数组（choices / content / parts / output）：逐元素下钻，
+		// 否则四协议的流式增量文本（choices[].delta.content 等）会被整段漏掉。
+		var arr []json.RawMessage
+		if err := json.Unmarshal(v, &arr); err != nil {
+			continue
+		}
+		for _, el := range arr {
+			if inner, ok := decodeObject(el); ok {
+				c.accumulateText(inner, depth+1)
+			}
+		}
+	}
+}
+
+// contentKeys 是四协议里承载「生成内容」的字段名（流式为增量，非流式为全量）。
+var contentKeys = []string{"content", "text", "thinking", "reasoning_content", "arguments", "output_text"}
+
+// decodeString 解析 JSON 字符串（非字符串返回 false）。
+func decodeString(raw json.RawMessage) (string, bool) {
+	if len(raw) == 0 || raw[0] != '"' {
+		return "", false
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return "", false
+	}
+	return s, true
+}
+
 // merge 合并一次解析结果：非零字段覆盖（流式为累计口径，最后一次最大最全）。
-func (c *usageCollector) merge(u Usage) {
+func (c *usageCollector) merge(u Usage, raw map[string]json.RawMessage) {
 	c.seen = true
+	if len(raw) > 0 {
+		c.rawUsage = raw
+	}
 	if u.Input != 0 {
 		c.usage.Input = u.Input
 	}
@@ -166,12 +238,25 @@ func (c *usageCollector) merge(u Usage) {
 	}
 }
 
+// locateUsage 定位 usage 子树（Gemini 是顶层 usageMetadata，其余是 usage）。
+func locateUsage(p Protocol, obj map[string]json.RawMessage) map[string]json.RawMessage {
+	key := "usage"
+	if p == ProtocolGemini {
+		key = "usageMetadata"
+	}
+	u, ok := objectField(obj, key)
+	if !ok {
+		return nil
+	}
+	return u
+}
+
 // extractUsage 从「已定位到 usage 所在层」的对象里取归一化用量。
 func extractUsage(p Protocol, obj map[string]json.RawMessage) (Usage, bool) {
 	switch p {
 	case ProtocolOpenAIChat:
-		u, ok := objectField(obj, "usage")
-		if !ok {
+		u := locateUsage(p, obj)
+		if u == nil {
 			return Usage{}, false
 		}
 		prompt := numField(u, "prompt_tokens")
@@ -185,8 +270,8 @@ func extractUsage(p Protocol, obj map[string]json.RawMessage) (Usage, bool) {
 		}
 		return Usage{Input: nonNegative(prompt - cached), CacheRead: cached, Output: completion}, true
 	case ProtocolOpenAIResponses:
-		u, ok := objectField(obj, "usage")
-		if !ok {
+		u := locateUsage(p, obj)
+		if u == nil {
 			return Usage{}, false
 		}
 		input := numField(u, "input_tokens")
@@ -197,8 +282,8 @@ func extractUsage(p Protocol, obj map[string]json.RawMessage) (Usage, bool) {
 		}
 		return Usage{Input: nonNegative(input - cached), CacheRead: cached, Output: output}, true
 	case ProtocolAnthropic:
-		u, ok := objectField(obj, "usage")
-		if !ok {
+		u := locateUsage(p, obj)
+		if u == nil {
 			return Usage{}, false
 		}
 		input := numField(u, "input_tokens")
@@ -210,8 +295,8 @@ func extractUsage(p Protocol, obj map[string]json.RawMessage) (Usage, bool) {
 		}
 		return Usage{Input: input + cacheWrite, CacheRead: cacheRead, Output: output}, true
 	case ProtocolGemini:
-		u, ok := objectField(obj, "usageMetadata")
-		if !ok {
+		u := locateUsage(p, obj)
+		if u == nil {
 			return Usage{}, false
 		}
 		prompt := numField(u, "promptTokenCount")

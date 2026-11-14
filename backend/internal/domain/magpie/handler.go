@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/team/llmgateway/internal/domain/billing"
 	"github.com/team/llmgateway/internal/pkg/logger"
 )
 
@@ -34,7 +35,36 @@ type Prepared struct {
 	// StripQueryKey 表示本次鉴权用的是 query 里的 key（Gemini 原生写法），
 	// 转发时该参数必须剔除：否则租户令牌会被带到上游。
 	StripQueryKey bool
+	// SessionID 来自入站 x-session-id（可空），仅供账单/流水维度使用。
+	SessionID string
+	// Reservation 是预扣钩子的返回值（magpie 不解释类型，原样交给结束回调）。
+	Reservation any
 }
+
+// ReserveInput 是「转发前预扣」的入参（契约 §3.5：请求前按估算预扣，拿不到钱就不发请求）。
+//
+// magpie 不关心金额与币种：由注入方按灵枢价目表算完再扣，返回的 handle 原样带回 Result。
+type ReserveInput struct {
+	Endpoint      string
+	Protocol      Protocol
+	TokenID       int64
+	UserID        int64
+	ExternalModel string
+	MagpieModel   string
+	CallerKeyName string
+	SessionID     string
+	// Body 是改写后的出站请求体（估算输入 token 用；与发给上游的字节一致）。
+	Body []byte
+	// Pricing 是本次命中的对外模型定价（售价 + 模型级时段/分档覆盖）。
+	// magpie 只搬运、不解释：价目表是灵枢的唯一价源，计算在注入方（计费）里做。
+	Rates        billing.Rates
+	TimeConfig   *billing.TimeCoeffConfig
+	ContextTiers []billing.TierRule
+}
+
+// ReserveFunc 是预扣钩子：返回 handle 交回 Result，或返回 Deny 直接拒绝（不发上游）。
+// 实现必须幂等于「同一请求只扣一次」，且不得在拒绝时留下任何账务副作用。
+type ReserveFunc func(ctx context.Context, in ReserveInput) (handle any, deny *Deny)
 
 // Deps 是入口装配依赖。
 type Deps struct {
@@ -46,6 +76,8 @@ type Deps struct {
 	CredentialKey []byte
 	// Prefixes 提供订阅池前缀名单；nil 时恒用默认名单。
 	Prefixes *PrefixProvider
+	// Reserve 是转发前预扣钩子（nil = 不预扣，结算时按全额扣）。
+	Reserve ReserveFunc
 	// OnComplete 是转发结束回调（第③件接入；nil = 不产生任何计费动作）。
 	OnComplete Hook
 	Logger     *slog.Logger
@@ -56,6 +88,7 @@ type Handler struct {
 	cfg      Config
 	admitter *Admitter
 	proxy    *Proxy
+	reserve  ReserveFunc
 	logger   *slog.Logger
 }
 
@@ -81,6 +114,7 @@ func NewHandler(d Deps) *Handler {
 		cfg:      cfg,
 		admitter: NewAdmitter(d.Tokens, d.Models, d.Keys, d.CredentialKey, prefixes),
 		proxy:    p,
+		reserve:  d.Reserve,
 		logger:   lg,
 	}
 }
@@ -212,6 +246,37 @@ func (h *Handler) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 		prep.Body = rewritten
 		prep.StreamRequested = StreamRequested(body)
+	}
+
+	// 5) 预扣（拿不到钱就不发上游；count_tokens 类不计费也不预扣）。
+	prep.SessionID = r.Header.Get("x-session-id")
+	var rates billing.Rates
+	if dec.External != nil {
+		rates = dec.External.SaleRates
+	}
+	if h.reserve != nil && route.Billable {
+		handle, deny := h.reserve(r.Context(), ReserveInput{
+			Endpoint:      route.Endpoint,
+			Protocol:      route.Protocol,
+			TokenID:       prep.TokenID,
+			UserID:        prep.UserID,
+			ExternalModel: prep.ExternalModel,
+			MagpieModel:   prep.MagpieModel,
+			CallerKeyName: prep.CallerKeyName,
+			SessionID:     prep.SessionID,
+			Body:          prep.Body,
+			Rates:         rates,
+			TimeConfig:    dec.External.TimeConfig,
+			ContextTiers:  dec.External.ContextTiers,
+		})
+		if deny != nil {
+			h.logFor(r.Context()).Warn("代理预扣拒绝",
+				"endpoint", route.Endpoint, "model", prep.MagpieModel,
+				"status", deny.Status, "code", deny.Code)
+			WriteDeny(w, route.Protocol, *deny)
+			return
+		}
+		prep.Reservation = handle
 	}
 
 	// 6) 转发（响应字节原样回流；唯一例外是凭据回显遮蔽，见 proxy.go）。

@@ -39,6 +39,18 @@ type Result struct {
 	// Usage/HasUsage 是旁路读到的归一化用量及其是否存在。
 	Usage    Usage
 	HasUsage bool
+	// UsageRaw 是上游 usage 子树（重新序列化；用于账单 upstream_usage 留痕）。
+	// 只存库、不回流：响应字节始终原样透传。
+	UsageRaw []byte
+	// ObservedTextRunes 是旁路累计的「生成内容」字符数（只用于无 usage 时的输出估算）。
+	ObservedTextRunes int
+
+	// RequestBody 是改写后的出站请求体（计费按请求体估算与拼装账单用）。
+	RequestBody []byte
+	// SessionID 来自入站 x-session-id 头（可空），仅用于账单/流水维度。
+	SessionID string
+	// Reservation 是转发前预扣钩子的返回值（magpie 不解释其类型，原样带回 Hook）。
+	Reservation any
 
 	Streamed bool
 	// Canceled 表示客户端中途断开（usage 仍可用于计费）。
@@ -115,11 +127,16 @@ func (p *Proxy) Forward(w http.ResponseWriter, r *http.Request, route Route, pre
 		MagpieModel:   prep.MagpieModel,
 		CallerKeyName: prep.CallerKeyName,
 		Billable:      route.Billable,
+		RequestBody:   prep.Body,
+		SessionID:     prep.SessionID,
+		Reservation:   prep.Reservation,
 	}
 	defer func() {
 		res.Duration = time.Since(start)
 		if p.hook != nil && route.Billable {
-			p.hook(r.Context(), res)
+			// 计费必须落库：客户端断开（r.Context() 被取消）时仍要结算/退款，
+			// 故用 WithoutCancel 保留 values（requestId）但去掉取消信号。
+			p.hook(context.WithoutCancel(r.Context()), res)
 		}
 	}()
 
@@ -247,6 +264,8 @@ func (p *Proxy) Forward(w http.ResponseWriter, r *http.Request, route Route, pre
 		if u, ok := collector.Result(); ok {
 			res.Usage, res.HasUsage = u, true
 		}
+		res.UsageRaw = collector.RawUsage()
+		res.ObservedTextRunes = collector.ObservedRunes()
 	}
 	return res
 }
