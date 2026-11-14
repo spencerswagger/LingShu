@@ -3,6 +3,7 @@ package usagebilling
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -42,6 +43,16 @@ type fakeCredit struct {
 	consumeErr error
 	consumed   []float64
 	settled    []float64
+	// settleErrs 按调用序号返回错误（用尽后返回 nil），用于「退款先失败后成功」。
+	settleErrs []error
+}
+
+// settleErrAt 取第 i 次 Settle 的错误（超出列表即成功）。
+func (f *fakeCredit) settleErrAt(i int) error {
+	if i < len(f.settleErrs) {
+		return f.settleErrs[i]
+	}
+	return nil
 }
 
 func (f *fakeCredit) Consume(_ context.Context, _ int64, amount float64, _, _, _ string) (float64, float64, error) {
@@ -53,7 +64,11 @@ func (f *fakeCredit) Consume(_ context.Context, _ int64, amount float64, _, _, _
 }
 
 func (f *fakeCredit) Settle(_ context.Context, _ int64, delta float64, _, _ string) (float64, float64, error) {
+	n := len(f.settled)
 	f.settled = append(f.settled, delta)
+	if err := f.settleErrAt(n); err != nil {
+		return 0, 0, err
+	}
 	return 0, 0, nil
 }
 
@@ -339,5 +354,122 @@ func TestSettle_WithoutReservationChargesFull(t *testing.T) {
 	}
 	if b.recs[0].PreConsumed != 0 || b.recs[0].MagpieKeyName != "key-a" {
 		t.Fatalf("无预扣账单=%+v", b.recs[0])
+	}
+}
+
+// ---- 结算失败（P1：钱必须退回去，账单必须自解释）----
+
+// fakeAnomalyAudit 收集资金异常审计（reconcile_test.go 已占用 fakeAudit 名）。
+type fakeAnomalyAudit struct {
+	details []map[string]any
+	err     error
+}
+
+func (f *fakeAnomalyAudit) InsertBillingAnomaly(_ context.Context, detail map[string]any) error {
+	f.details = append(f.details, detail)
+	return f.err
+}
+
+// 结算失败（差额扣不动 / 账单没落）→ 预扣整笔退回 + 落 failed 账单（credits=0 + 原因）。
+func TestSettle_RecordFailureRefundsPreConsumption(t *testing.T) {
+	b := &fakeBilling{estCredits: 2.0, recErr: errors.New("db down")}
+	c := &fakeCredit{}
+	svc := newSvc(b, c)
+
+	handle, deny := svc.Reserve(context.Background(), reserveInput(`{"model":"gpt-x","messages":[]}`))
+	if deny != nil || handle == nil {
+		t.Fatalf("预扣应成功: deny=%+v", deny)
+	}
+	rv := handle.(*Reservation)
+	if rv.PreConsumed != 2.0 {
+		t.Fatalf("预扣=%v", rv.PreConsumed)
+	}
+
+	svc.Settle(context.Background(), magpie.Result{
+		Billable: true, Status: 200, HasUsage: true, Usage: magpie.Usage{Input: 10, Output: 5},
+		Reservation: rv, UserID: 7, TokenID: 3, ExternalModel: "gpt-x",
+	})
+
+	// 预扣 2.0 必须被退回（负数差额）。
+	var refunded bool
+	for _, d := range c.settled {
+		if d == -2.0 {
+			refunded = true
+		}
+	}
+	if !refunded {
+		t.Fatalf("结算失败必须退回预扣，settled=%v", c.settled)
+	}
+	// 最后一次账单必须是 failed + 0 积分 + 自解释原因。
+	last := b.recs[len(b.recs)-1]
+	if !last.Fail || last.PreConsumed != 0 || last.Tokens.Input != 0 {
+		t.Fatalf("失败账单口径: %+v", last)
+	}
+	if !strings.Contains(last.ErrorMessage, "结算失败") || !strings.Contains(last.ErrorMessage, "退回") {
+		t.Fatalf("失败账单要能自解释（状态+金额+已退回）: %q", last.ErrorMessage)
+	}
+}
+
+// 退款最终失败：必须落审计（对账看不到这笔钱，只能靠审计与告警发现）+ 账单标注需人工核对。
+func TestSettle_RefundFailureLeavesAudit(t *testing.T) {
+	b := &fakeBilling{estCredits: 2.0, recErr: errors.New("db down")}
+	c := &fakeCredit{settleErrs: []error{errors.New("wallet locked"), errors.New("wallet locked"), errors.New("wallet locked")}}
+	audit := &fakeAnomalyAudit{}
+	svc := newSvc(b, c)
+	svc.SetAuditor(audit)
+
+	handle, _ := svc.Reserve(context.Background(), reserveInput(`{"model":"gpt-x","messages":[]}`))
+	rv := handle.(*Reservation)
+	svc.Settle(context.Background(), magpie.Result{
+		Billable: true, Status: 200, HasUsage: true, Usage: magpie.Usage{Input: 1, Output: 1},
+		Reservation: rv, UserID: 7, TokenID: 3, ExternalModel: "gpt-x",
+	})
+
+	if len(c.settled) != refundAttempts {
+		t.Fatalf("退款应重试 %d 次，实际 %d", refundAttempts, len(c.settled))
+	}
+	if len(audit.details) == 0 {
+		t.Fatal("退款最终失败必须落审计")
+	}
+	kind, _ := audit.details[0]["kind"].(string)
+	if kind != "settle_failed_refund_failed" {
+		t.Fatalf("审计类别=%q detail=%v", kind, audit.details[0])
+	}
+	last := b.recs[len(b.recs)-1]
+	if !strings.Contains(last.ErrorMessage, "人工") {
+		t.Fatalf("退款失败的账单要标注需人工核对: %q", last.ErrorMessage)
+	}
+}
+
+// 退款先失败后成功：重试生效（不许一次失败就放弃）。
+func TestRefundPreConsumed_RetriesUntilSuccess(t *testing.T) {
+	c := &fakeCredit{settleErrs: []error{errors.New("transient")}}
+	svc := newSvc(&fakeBilling{}, c)
+	rv := &Reservation{BillingID: "bill-x", UserID: 7, PreConsumed: 1.5}
+
+	if err := svc.refundPreConsumed(context.Background(), rv, "测试"); err != nil {
+		t.Fatalf("第二次应成功: %v", err)
+	}
+	if len(c.settled) != 2 || c.settled[0] != -1.5 || c.settled[1] != -1.5 {
+		t.Fatalf("重试与金额: %v", c.settled)
+	}
+}
+
+// 失败路径（上游 5xx）退款失败也要审计，不能只打日志。
+func TestRefundAndFail_AuditsRefundFailure(t *testing.T) {
+	b := &fakeBilling{estCredits: 1.0}
+	c := &fakeCredit{settleErrs: []error{errors.New("x"), errors.New("x"), errors.New("x")}}
+	audit := &fakeAnomalyAudit{}
+	svc := newSvc(b, c)
+	svc.SetAuditor(audit)
+
+	handle, _ := svc.Reserve(context.Background(), reserveInput(`{"model":"gpt-x","messages":[]}`))
+	rv := handle.(*Reservation)
+	svc.Settle(context.Background(), magpie.Result{
+		Billable: true, Status: 500, Reservation: rv, UserID: 7, TokenID: 3, ExternalModel: "gpt-x",
+	})
+
+	if len(audit.details) == 0 || audit.details[0]["kind"] != "refund_failed" {
+		t.Fatalf("上游失败时退款失败必须审计: %v", audit.details)
 	}
 }

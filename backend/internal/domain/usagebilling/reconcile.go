@@ -21,6 +21,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/team/llmgateway/internal/pkg/idgen"
@@ -109,7 +110,12 @@ type Reconciler struct {
 	interval time.Duration
 	// lock 是可选的多副本互斥（拿不到锁就跳过本窗）。
 	lock func(ctx context.Context) (release func(), ok bool)
+	// lockSkips 记录「本窗被其他实例占用」的次数（可观测：不能静默停摆）。
+	lockSkips atomic.Int64
 }
+
+// LockSkips 返回因其他实例持锁而跳过的窗口数（监控/自检用）。
+func (r *Reconciler) LockSkips() int64 { return r.lockSkips.Load() }
 
 // NewReconciler 装配对账器。ledger 为 nil 时窗口记 skipped（未接入账本不误报）。
 func NewReconciler(store ReconcileStore, ledger LedgerClient, audit Auditor, logger *slog.Logger) *Reconciler {
@@ -145,7 +151,12 @@ func (r *Reconciler) RunOnce(ctx context.Context) {
 	if r.lock != nil {
 		release, ok := r.lock(ctx)
 		if !ok {
-			return // 其他副本正在跑本窗
+			// 其他副本正在跑本窗：跳过但不静默——锁若长期拿不到（例如锁泄漏在别的会话上），
+			// 这一行日志 + 计数是唯一能让人发现「对账已停摆」的痕迹。
+			r.lockSkips.Add(1)
+			r.logger.WarnContext(ctx, "对账本窗被其他实例占用，跳过",
+				"window_end", r.now(), "lock_skips", r.lockSkips.Load())
+			return
 		}
 		defer release()
 	}
@@ -239,20 +250,20 @@ func (r *Reconciler) saveSkipped(ctx context.Context, reason string) {
 
 // compareWindow 是纯函数：两侧聚合 → 窗口结果（便于单测直接覆盖判定口径）。
 func compareWindow(start, end time.Time, local, magpie []Group, prevStreak int) Window {
-	localMap := indexGroups(local)
+	// 关键：local 侧同一 (key, model) 会返回 estimated=false/true 两行（SQL 按 estimated 分组），
+	// 必须先按维度切开再合并。曾经直接 indexGroups(local) 把两行并成一组并打上 estimated 标记，
+	// 结果整组被剔出主口径：估算单的少量 token 顶掉真实 token，灵枢真实用量永不参与比对，
+	// 代理侧全量进偏差分子 → 窗口过 1e4 就误报（Owl 实测 P1）。
+	localMain := indexGroupsWhere(local, false)
+	localEst := indexGroupsWhere(local, true)
 	magpieMap := indexGroups(magpie)
 
 	w := Window{WindowStart: start, WindowEnd: end, Detail: map[string]any{}}
 
-	// 主口径只比 estimated=false 的组（契约：estimated 单列一组，不计入主口径）。
-	estimatedGroups := 0
-	localMain := make(map[string]Group)
-	for k, g := range localMap {
-		if g.Estimated {
-			estimatedGroups++
-			continue
-		}
-		localMain[k] = g
+	estimatedGroups := len(localEst)
+	var estimatedTokens int64
+	for _, g := range localEst {
+		estimatedTokens += g.Tokens()
 	}
 
 	keys := make([]string, 0, len(localMain)+len(magpieMap))
@@ -336,6 +347,7 @@ func compareWindow(start, end time.Time, local, magpie []Group, prevStreak int) 
 		"absent_in_magpie":   absentGroups(localMain, magpieMap),
 		"absent_in_ls":       absentGroups(magpieMap, localMain),
 		"estimated_groups":   estimatedGroups,
+		"estimated_tokens":   estimatedTokens,
 		"req_count_mismatch": w.ReqCountLS != w.ReqCountMag,
 	}
 	return w
@@ -365,6 +377,17 @@ func segmentAlarm(ls, mg Group) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// indexGroupsWhere 只合并 estimated 与 want 相同的分组（主口径 = want=false）。
+func indexGroupsWhere(gs []Group, want bool) map[string]Group {
+	picked := make([]Group, 0, len(gs))
+	for _, g := range gs {
+		if g.Estimated == want {
+			picked = append(picked, g)
+		}
+	}
+	return indexGroups(picked)
 }
 
 func indexGroups(gs []Group) map[string]Group {
@@ -420,10 +443,23 @@ func absInt64(v int64) int64 {
 // ===== SQL 实现 =====
 
 // SQLReconcileStore 用 PostgreSQL 实现 ReconcileStore。
-type SQLReconcileStore struct{ db *sql.DB }
+type SQLReconcileStore struct {
+	db *sql.DB
+	// logger 用于取锁/解锁失败告警（nil 回落到 slog.Default）。
+	logger *slog.Logger
+}
 
 // NewSQLReconcileStore 装配对账落库。
-func NewSQLReconcileStore(db *sql.DB) *SQLReconcileStore { return &SQLReconcileStore{db: db} }
+func NewSQLReconcileStore(db *sql.DB) *SQLReconcileStore {
+	return &SQLReconcileStore{db: db, logger: slog.Default()}
+}
+
+// SetLogger 注入日志器（装配侧可换成带上下文的 logger）。
+func (s *SQLReconcileStore) SetLogger(l *slog.Logger) {
+	if l != nil {
+		s.logger = l
+	}
+}
 
 // LocalGroups 按 (callerKey, 代理模型) 聚合窗口内灵枢账单；estimated 单单独成组。
 //
@@ -518,15 +554,48 @@ func (s *SQLReconcileStore) SaveWindow(ctx context.Context, w Window) error {
 	return err
 }
 
+// errString 把可能为 nil 的 error 转字符串（日志字段安全）。
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+// reconcileLockKey 是对账用的会话级 advisory lock 键（"LSRCON"）。
+const reconcileLockKey = int64(0x4c5352434f4e)
+
 // TryAdvisoryLock 多副本只让一个实例跑对账（拿不到锁就跳过本窗）。
+//
+// 必须**固定在同一条连接**上取锁与解锁：pg_try_advisory_lock 是会话级锁，而 *sql.DB 是
+// 连接池——取锁走一条连接、解锁落到另一条时，pg_advisory_unlock 会返回 false 且锁仍留在
+// 原来那条会话上，后续连接/其他副本恒拿不到锁 → 对账每 60 秒静默停摆（Owl 真 PG 实测 P1）。
+// 因此这里用 db.Conn 取出独占连接，解锁之后才归还池。解锁失败当场打日志并归还连接
+// （连接关闭时 PG 会自动释放会话锁，但必须留下痕迹，不能静默）。
 func (s *SQLReconcileStore) TryAdvisoryLock(ctx context.Context) (release func(), ok bool) {
-	const lockKey = int64(0x4c5352434f4e) // "LSRCON"
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		s.logger.WarnContext(ctx, "对账取锁失败：无法获取独占连接", "err", err.Error())
+		return func() {}, false
+	}
 	var got bool
-	if err := s.db.QueryRowContext(ctx, `SELECT pg_try_advisory_lock($1)`, lockKey).Scan(&got); err != nil || !got {
+	if err := conn.QueryRowContext(ctx, `SELECT pg_try_advisory_lock($1)`, reconcileLockKey).Scan(&got); err != nil || !got {
+		if err != nil {
+			s.logger.WarnContext(ctx, "对账取锁失败：查询错误", "err", err.Error())
+		}
+		_ = conn.Close()
 		return func() {}, false
 	}
 	return func() {
-		_, _ = s.db.ExecContext(context.WithoutCancel(ctx), `SELECT pg_advisory_unlock($1)`, lockKey)
+		// 释放与解锁必须在同一连接（conn 独占，直到 Close 归还池）。
+		var unlocked bool
+		uerr := conn.QueryRowContext(context.WithoutCancel(ctx),
+			`SELECT pg_advisory_unlock($1)`, reconcileLockKey).Scan(&unlocked)
+		if uerr != nil || !unlocked {
+			s.logger.ErrorContext(ctx, "对账解锁失败（锁会由连接归还/关闭时释放）",
+				"unlocked", unlocked, "err", errString(uerr))
+		}
+		_ = conn.Close()
 	}, true
 }
 
@@ -544,6 +613,22 @@ func (a *AuditSink) InsertReconcileAlarm(ctx context.Context, detail map[string]
 	_, err = a.DB.ExecContext(ctx,
 		`INSERT INTO audit_logs(id, user_id, username, action, target_type, detail)
 		 VALUES ($1, NULL, 'system', 'reconcile_alarm_escalated', 'reconcile_window', $2)`,
+		idgen.New(), raw)
+	return err
+}
+
+// InsertBillingAnomaly 写一条资金异常审计（结算失败 / 退回预扣失败）。
+//
+// 与对账升级分开动作名：对账是「两侧数据不一致」，这里是「钱或账没落成」，
+// 运维看到 action 就知道该查哪条链路。
+func (a *AuditSink) InsertBillingAnomaly(ctx context.Context, detail map[string]any) error {
+	raw, err := json.Marshal(detail)
+	if err != nil {
+		return err
+	}
+	_, err = a.DB.ExecContext(ctx,
+		`INSERT INTO audit_logs(id, user_id, username, action, target_type, detail)
+		 VALUES ($1, NULL, 'system', 'billing_anomaly', 'billing_record', $2)`,
 		idgen.New(), raw)
 	return err
 }

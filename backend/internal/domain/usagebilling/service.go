@@ -62,6 +62,14 @@ type Reservation struct {
 	EstInputTokens int64
 }
 
+// AnomalyAuditor 写「资金异常」审计（结算失败、退回预扣失败）。
+//
+// 为什么必须落审计：这类故障只打日志时，运维与对账都看不见（对账只统计 completed），
+// 而它们的后果是「用户被扣钱但账单显示 0」，必须留下可检索的痕迹。
+type AnomalyAuditor interface {
+	InsertBillingAnomaly(ctx context.Context, detail map[string]any) error
+}
+
 // Service 把 magpie 的转发事实翻成账单。
 type Service struct {
 	billing Billing
@@ -69,7 +77,17 @@ type Service struct {
 	users   UserLookup
 	clock   func() time.Time
 	logger  *slog.Logger
+	audit   AnomalyAuditor
 }
+
+// SetAuditor 注入资金异常审计（nil = 只打日志，单测默认）。
+func (s *Service) SetAuditor(a AnomalyAuditor) { s.audit = a }
+
+// 退回预扣的重试节奏（结算失败/账单落不了库时，钱必须退回去）。
+const (
+	refundAttempts   = 3
+	refundRetryDelay = 50 * time.Millisecond
+)
 
 // NewService 装配计费闭环。users 可为 nil（全部按 sale 计）。
 func NewService(b Billing, c Credit, users UserLookup, logger *slog.Logger) *Service {
@@ -226,17 +244,91 @@ func (s *Service) Settle(ctx context.Context, res magpie.Result) {
 	if _, err := s.billing.Record(ctx, req); err != nil {
 		s.logger.ErrorContext(ctx, "账单结算失败", "billing_id", req.BillingID, "user_id", req.UserID,
 			"model", req.ExternalModel, "estimated", req.Estimated, "err", err.Error())
+		// 结算失败 = 差额没扣成/账单没落成，但预扣在 Reserve 就已经真扣了：
+		// 不退回去就是「用户被扣钱、账单显示 0、对账只统计 completed 看不到这笔钱」。
+		s.rollbackSettlement(ctx, rv, req, err)
+	}
+}
+
+// rollbackSettlement 是「结算失败」的收尾：退预扣 → 落一条 failed 账单（金额 0 + 原因）→ 落审计。
+//
+// 口径：钱优先退回（用户不该为一次失败的结算付钱）；账单要能自解释（failed + credits=0 +
+// error_message 说明是结算失败且已退回）。退款最终失败时写审计 + ERROR 日志，必须可被运维发现。
+func (s *Service) rollbackSettlement(ctx context.Context, rv *Reservation, req billing.RecordReq, cause error) {
+	refundErr := s.refundPreConsumed(ctx, rv, "结算失败")
+	if refundErr != nil {
+		s.auditAnomaly(ctx, map[string]any{
+			"kind": "settle_failed_refund_failed", "billing_id": req.BillingID, "user_id": rv.UserID,
+			"pre_consumed": rv.PreConsumed, "settle_error": cause.Error(), "refund_error": refundErr.Error(),
+		})
+	}
+	note := "结算失败（预扣已退回）"
+	if refundErr != nil {
+		note = "结算失败且退回预扣失败（需人工核对）"
+	}
+	failReq := req
+	failReq.Fail = true
+	failReq.PreConsumed = 0
+	failReq.Tokens = billing.Usage{}
+	failReq.Estimated = false
+	failReq.UpstreamUsage = nil
+	failReq.ErrorMessage = note
+	if _, ferr := s.billing.Record(ctx, failReq); ferr != nil {
+		s.logger.ErrorContext(ctx, "结算失败的 failed 账单落库失败",
+			"billing_id", req.BillingID, "err", ferr.Error())
+		s.auditAnomaly(ctx, map[string]any{
+			"kind": "settle_failed_bill_lost", "billing_id": req.BillingID, "user_id": rv.UserID,
+			"settle_error": cause.Error(), "record_error": ferr.Error(),
+		})
+	}
+}
+
+// refundPreConsumed 退回预扣（带重试）；返回非 nil 表示最终失败。
+func (s *Service) refundPreConsumed(ctx context.Context, rv *Reservation, reason string) error {
+	if rv.PreConsumed <= 0 {
+		return nil
+	}
+	var lastErr error
+	for i := 0; i < refundAttempts; i++ {
+		if i > 0 {
+			select {
+			case <-ctx.Done():
+				return lastErr
+			case <-time.After(refundRetryDelay):
+			}
+		}
+		_, _, err := s.credit.Settle(ctx, rv.UserID, -rv.PreConsumed, rv.SessionID, billing.FlowRemarkRefund)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		s.logger.WarnContext(ctx, "退回预扣失败，准备重试", "billing_id", rv.BillingID,
+			"user_id", rv.UserID, "pre_consumed", rv.PreConsumed, "attempt", i+1, "reason", reason, "err", err.Error())
+	}
+	s.logger.ErrorContext(ctx, "退回预扣最终失败（需人工核对）", "billing_id", rv.BillingID,
+		"user_id", rv.UserID, "pre_consumed", rv.PreConsumed, "reason", reason, "err", lastErr.Error())
+	return lastErr
+}
+
+// auditAnomaly 写资金异常审计（未注入时只打日志，但仍带 ERROR 级别与结构化字段）。
+func (s *Service) auditAnomaly(ctx context.Context, detail map[string]any) {
+	if s.audit == nil {
+		s.logger.ErrorContext(ctx, "资金异常（未装配审计）", "detail", fmt.Sprintf("%v", detail))
+		return
+	}
+	if err := s.audit.InsertBillingAnomaly(ctx, detail); err != nil {
+		s.logger.ErrorContext(ctx, "资金异常审计写入失败", "detail", fmt.Sprintf("%v", detail), "err", err.Error())
 	}
 }
 
 // refundAndFail 退回预扣并落一条 failed 账单（credits=0，无 usage）。
 func (s *Service) refundAndFail(ctx context.Context, rv *Reservation, req billing.RecordReq, reason string) {
-	if rv.PreConsumed > 0 {
-		if _, _, err := s.credit.Settle(ctx, rv.UserID, -rv.PreConsumed, rv.SessionID, billing.FlowRemarkRefund); err != nil {
-			// 退款失败必须显式告警：钱已经扣了但没退回去。
-			s.logger.ErrorContext(ctx, "退回预扣失败", "billing_id", rv.BillingID, "user_id", rv.UserID,
-				"pre_consumed", rv.PreConsumed, "err", err.Error())
-		}
+	if err := s.refundPreConsumed(ctx, rv, reason); err != nil {
+		// 退款最终失败：钱已经扣了但没退回去，必须留下可检索的审计（对账看不到这笔）。
+		s.auditAnomaly(ctx, map[string]any{
+			"kind": "refund_failed", "billing_id": rv.BillingID, "user_id": rv.UserID,
+			"pre_consumed": rv.PreConsumed, "reason": reason, "refund_error": err.Error(),
+		})
 	}
 	req.Fail = true
 	req.PreConsumed = 0

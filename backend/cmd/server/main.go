@@ -421,6 +421,8 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	// 旁路 usage 计费闭环：转发前预扣（估算输入 token）→ 转发 → 按 usage 结算差额，
 	// 上游失败/超时退预扣，客户端取消且无 usage 也退预扣（不再按估算计费）。
 	usageBillSvc := usagebilling.NewService(billSvc, creditSvc, userStore, logr)
+	// 资金异常（结算失败 / 退回预扣失败）落 audit_logs，运维与告警都能检索到。
+	usageBillSvc.SetAuditor(&usagebilling.AuditSink{DB: d})
 
 	// 对外转发入口（/v1 与 /v1beta）：灵枢只做 facade，转发与协议互译在代理侧。
 	// 未配置 magpie.base_url 时 NewHandler 返回 nil，server 侧保持 410 停用口径。
