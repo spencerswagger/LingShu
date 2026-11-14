@@ -2,12 +2,13 @@ package billing
 
 import (
 	"context"
+	crand "crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
-	"math/rand"
 	"strconv"
 	"strings"
 	"sync"
@@ -246,7 +247,8 @@ func (s *Service) Record(ctx context.Context, req RecordReq) (*Record, error) {
 		}
 		if _, err := s.store.Insert(ctx, rec); err != nil {
 			if isUniqueViolation(err) {
-				return rec, nil
+				// 该号已被占用：换号重试（绝不把别人的失败单当成本次结果返回）。
+				return nil, errBillingIDCollision
 			}
 			s.enqueueRetry(rec, err)
 			return nil, err
@@ -258,6 +260,11 @@ func (s *Service) Record(ctx context.Context, req RecordReq) (*Record, error) {
 	existing, err := s.store.GetByBillingID(ctx, req.BillingID)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
+	}
+	if existing != nil && !ownsRecord(existing, req) {
+		// 撞号：这个流水号已经属于别的请求 —— 换号重试，绝不返回他人账单。
+		req.BillingID = GenBillingID()
+		existing = nil
 	}
 	if existing != nil {
 		if existing.Status == StatusCompleted {
@@ -325,11 +332,20 @@ func (s *Service) Record(ctx context.Context, req RecordReq) (*Record, error) {
 	// 已预扣 → 只增减实际应付与预扣的差额（多退少补，不产生「结算退回」全额退款）；
 	// 无预扣 → 按全额扣减。
 	// 预扣（PreConsume/Refund）在候选循环之前执行、必须立即生效，不在此事务内。
-	rec, err = s.settleLedger(ctx, rec, req, credits)
-	if err != nil {
-		return nil, err
+	// 撞号换号重试：settleLedger 撞号时返回 nil 记录 + errBillingIDCollision，
+	// 这里保留构造好的 rec（指针），只换 billing_id 再落一次。
+	for attempt := 0; ; attempt++ {
+		out, serr := s.settleLedger(ctx, rec, req, credits)
+		if serr == nil {
+			return out, nil
+		}
+		if errors.Is(serr, errBillingIDCollision) && attempt < billingIDRetryLimit {
+			req.BillingID = GenBillingID()
+			rec.BillingID = req.BillingID
+			continue
+		}
+		return nil, serr
 	}
-	return rec, nil
 }
 
 // settleLedger 完成「钱包扣减 + 积分流水 + 账单落库」：
@@ -374,14 +390,11 @@ func (s *Service) settleTx(ctx context.Context, rec *Record, req RecordReq, cred
 
 	if _, ierr := s.store.InsertTx(ctx, tx, rec); ierr != nil {
 		_ = tx.Rollback()
-		// 并发竞态兜底：两个请求可能都通过幂等快速路径，billing_id 唯一索引保证其一写库成功、
-		// 另一侧撞唯一约束（23505）。撞库方本次扣款已随事务回滚（未重复扣），重查已落库记录返回。
+		// 唯一约束（23505）= 这个流水号已经被占用：本次扣款已随事务回滚（未重复扣），
+		// 但**绝不能**把该号上已存在的账单当成本次结果返回——那可能是别人的单（撞号），
+		// 返回它等于本单不扣钱、预扣不退、账单串账。交给调用方换号重试。
 		if isUniqueViolation(ierr) {
-			existing, gerr := s.store.GetByBillingID(ctx, rec.BillingID)
-			if gerr == nil && existing != nil && existing.Status == StatusCompleted {
-				return existing, nil, true
-			}
-			return nil, ierr, true
+			return nil, fmt.Errorf("%w: %v", errBillingIDCollision, ierr), true
 		}
 		// 真实写入失败：本次扣款已回滚（余额不变），退回非事务路径重试；其失败由重试队列兜底。
 		return nil, ierr, false
@@ -405,11 +418,8 @@ func (s *Service) settlePlain(ctx context.Context, rec *Record, req RecordReq, c
 	rec.BalanceAfter = after
 	if _, err := s.store.Insert(ctx, rec); err != nil {
 		if isUniqueViolation(err) {
-			if existing, gerr := s.store.GetByBillingID(ctx, rec.BillingID); gerr == nil &&
-				existing != nil && existing.Status == StatusCompleted {
-				return existing, nil
-			}
-			return nil, err
+			// 同上：撞号一律换号重试，不返回他人账单。
+			return nil, fmt.Errorf("%w: %v", errBillingIDCollision, err)
 		}
 		s.enqueueRetry(rec, err)
 		return nil, err
@@ -590,9 +600,48 @@ func isUniqueViolation(err error) bool {
 		strings.Contains(s, "already exists")
 }
 
-// GenBillingID 生成计费流水号 bill-YYYYMMDD-xxxxxx。
+// billingIDRandBytes 是流水号随机位长度（48 bit）。
+//
+// 6 位十进制（1e6）在单日 1 万单下按生日问题期望约 50 次碰撞，而本号从第③件起
+// 同时是钱包流水与账单的幂等键：撞一次就是后到者被当成幂等命中（不扣钱、不退款、串账）。
+// 48 bit 单日 1 万单的碰撞概率 <1e-7，反向碰撞足够低。
+const billingIDRandBytes = 6
+
+// billingIDRetryLimit 是撞号后的换号重试次数（极高概率第一次就成）。
+const billingIDRetryLimit = 3
+
+// errBillingIDCollision 表示「该流水号已被别的账单占用」——调用方必须换号重试，
+// 绝不能把它当成幂等命中把别人的账单返回给本次请求。
+var errBillingIDCollision = errors.New("billing id collision")
+
+// GenBillingID 生成计费流水号 bill-YYYYMMDD-<12 hex>。
 func GenBillingID() string {
-	return fmt.Sprintf("bill-%s-%06d", time.Now().Format("20060102"), rand.Intn(1000000))
+	var b [billingIDRandBytes]byte
+	if _, err := crand.Read(b[:]); err != nil {
+		// 熵源不可用时退化成纳秒时间戳（仍远优于 6 位十进制）。
+		return fmt.Sprintf("bill-%s-%012x", time.Now().Format("20060102"), time.Now().UnixNano()&0xffffffffffff)
+	}
+	return fmt.Sprintf("bill-%s-%s", time.Now().Format("20060102"), hex.EncodeToString(b[:]))
+}
+
+// ownsRecord 判定已存在的账单是否就是**本次请求自己**的单（幂等命中）。
+//
+// 撞号时 GetByBillingID 会取到别人的账单：只比 billing_id 相等就返回，等于把别人的
+// completed 单当成本次结果（不扣钱、预扣不退、账单串账）。因此必须校验归属。
+func ownsRecord(existing *Record, req RecordReq) bool {
+	if existing == nil {
+		return false
+	}
+	if existing.UserID != req.UserID {
+		return false
+	}
+	if req.TokenID != nil && existing.TokenID != nil && *req.TokenID != *existing.TokenID {
+		return false
+	}
+	if req.ExternalModel != "" && existing.ExternalModel != "" && req.ExternalModel != existing.ExternalModel {
+		return false
+	}
+	return true
 }
 
 // ===== ConfigProvider =====

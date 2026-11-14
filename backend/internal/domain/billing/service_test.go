@@ -457,27 +457,21 @@ func TestRecord_SaleMode_CostCreditsDistinctFromCredits(t *testing.T) {
 	}
 }
 
-func TestRecord_InsertUniqueViolation_ReturnsCompleted(t *testing.T) {
+// 撞号（23505）绝不能把该号上别人的 completed 账单当成本次结果返回：
+// 旧实现直接返回他人账单 → 本单不扣钱、预扣不退、账单串账（Owl 实测 P1）。
+// 新口径：换号重试，账单与流水都属于本次请求。
+func TestRecord_CollisionDoesNotReturnOthersBill(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock: %v", err)
 	}
 	defer db.Close()
 
-	usage := Usage{Input: 1234, Output: 567}
-	rates := fullRates()
-
-	// 快速路径未命中历史记录。
-	mock.ExpectQuery(selectByBillingID.String()).WithArgs(billingID).
-		WillReturnError(sql.ErrNoRows)
-
-	// Consume 成功后 Insert 撞唯一索引（并发竞态，另一请求已写库成功）。
-	mock.ExpectQuery(insertBill.String()).
-		WillReturnError(errors.New(`ERROR: duplicate key value violates unique constraint "billing_records_billing_id_key" (SQLSTATE 23505)`))
-
-	// 重查该 billing_id 的 completed 记录并返回成功。
-	mock.ExpectQuery(selectByBillingID.String()).WithArgs(billingID).
-		WillReturnRows(completedRow(t))
+	// 第一次：快速路径未命中 → 扣款后 Insert 撞唯一索引。
+	mock.ExpectQuery(selectByBillingID.String()).WithArgs(billingID).WillReturnError(sql.ErrNoRows)
+	mock.ExpectQuery(insertBill.String()).WillReturnError(errors.New(`ERROR: duplicate key value violates unique constraint "billing_records_billing_id_key" (SQLSTATE 23505)`))
+	// 换号后：直接在新号上落库成功（重试走的是 settleLedger，不再过快速路径）。
+	mock.ExpectQuery(insertBill.String()).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(5), time.Now()))
 
 	credit := &fakeCredit{before: 100, after: 90}
 	svc := newTestService(db, credit, newFakeConfig(), time.Now())
@@ -485,16 +479,83 @@ func TestRecord_InsertUniqueViolation_ReturnsCompleted(t *testing.T) {
 	rec, err := svc.Record(context.Background(), RecordReq{
 		BillingID: billingID, UserID: testUserID, PricingMode: "sale",
 		ExternalModel: "ext-model", InternalModelID: "int-model", ChannelKeyID: 1, SessionID: "sess-u",
-		Tokens: usage, Rates: rates,
+		Tokens: Usage{Input: 1234, Output: 567}, Rates: fullRates(),
 	})
 	if err != nil {
-		t.Fatalf("唯一索引冲突应重查并返回成功, got err=%v", err)
+		t.Fatalf("撞号应换号重试而不是报错: %v", err)
 	}
-	if rec == nil || rec.Status != StatusCompleted || rec.BillingID != billingID {
-		t.Fatalf("应返回已落库的 completed 记录, got %+v", rec)
+	if rec == nil || rec.Status != StatusCompleted {
+		t.Fatalf("应返回本次请求自己的 completed 记录: %+v", rec)
+	}
+	if rec.BillingID == billingID {
+		t.Fatalf("撞号后必须换新号（仍是旧号说明返回了别人的账单）: %s", rec.BillingID)
+	}
+	// 钱必须真的扣了（旧实现撞号时钱包分文未动）。
+	if credit.calls == 0 {
+		t.Fatal("撞号重试后必须真的扣过款")
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("mock expectations: %v", err)
+	}
+}
+
+// 同一请求的重试仍要幂等：快速路径查到**自己的** completed 账单 → 直接返回，不重复扣款。
+func TestRecord_FastPathIdempotentForOwnRecord(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery(selectByBillingID.String()).WithArgs(billingID).WillReturnRows(completedRow(t))
+
+	credit := &fakeCredit{before: 100, after: 90}
+	svc := newTestService(db, credit, newFakeConfig(), time.Now())
+
+	rec, err := svc.Record(context.Background(), RecordReq{
+		BillingID: billingID, UserID: testUserID, PricingMode: "sale",
+		ExternalModel: "ext-model", InternalModelID: "int-model", ChannelKeyID: 1,
+		Tokens: Usage{Input: 1234, Output: 567}, Rates: fullRates(),
+	})
+	if err != nil {
+		t.Fatalf("自己的历史账单应幂等返回: %v", err)
+	}
+	if rec.BillingID != billingID || rec.Status != StatusCompleted {
+		t.Fatalf("幂等命中口径变了: %+v", rec)
+	}
+	if credit.calls != 0 {
+		t.Fatalf("幂等命中不许再扣款: calls=%d", credit.calls)
+	}
+}
+
+// 撞号时若历史账单属于**别人**（同号不同用户），快速路径也必须换号而不是返回他人账单。
+func TestRecord_FastPathForeignRecordTriggersNewID(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	// 该号已属于另一个用户。
+	mock.ExpectQuery(selectByBillingID.String()).WithArgs(billingID).WillReturnRows(foreignCompletedRow(t))
+	mock.ExpectQuery(insertBill.String()).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(5), time.Now()))
+
+	credit := &fakeCredit{before: 100, after: 90}
+	svc := newTestService(db, credit, newFakeConfig(), time.Now())
+
+	rec, err := svc.Record(context.Background(), RecordReq{
+		BillingID: billingID, UserID: testUserID, PricingMode: "sale",
+		ExternalModel: "ext-model", InternalModelID: "int-model", ChannelKeyID: 1, SessionID: "sess-u",
+		Tokens: Usage{Input: 1234, Output: 567}, Rates: fullRates(),
+	})
+	if err != nil {
+		t.Fatalf("应换号重试: %v", err)
+	}
+	if rec.UserID != testUserID {
+		t.Fatalf("返回了别人的账单: %+v", rec)
+	}
+	if credit.calls == 0 {
+		t.Fatal("必须按本次请求重新扣款")
 	}
 }
 
@@ -721,8 +782,8 @@ func TestRecord_TxPath_InsertFailure_FallsBackToPlain(t *testing.T) {
 	}
 }
 
-// 事务路径撞唯一索引：Rollback（本次扣款不落库）后重查 completed 返回，不重复扣款。
-func TestRecord_TxPath_UniqueViolation_ReturnsCompleted(t *testing.T) {
+// 事务路径撞唯一索引：Rollback（本次扣款不落库）后**换号重试**，绝不返回该号上别人的账单。
+func TestRecord_TxPath_UniqueViolation_RetriesWithNewID(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock: %v", err)
@@ -734,7 +795,10 @@ func TestRecord_TxPath_UniqueViolation_ReturnsCompleted(t *testing.T) {
 	mock.ExpectQuery(insertBill.String()).
 		WillReturnError(errors.New(`ERROR: duplicate key value violates unique constraint "billing_records_billing_id_key" (SQLSTATE 23505)`))
 	mock.ExpectRollback()
-	mock.ExpectQuery(selectByBillingID.String()).WithArgs(billingID).WillReturnRows(completedRow(t))
+	// 换号后同一事务内重来一次。
+	mock.ExpectBegin()
+	mock.ExpectQuery(insertBill.String()).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(5), time.Now()))
+	mock.ExpectCommit()
 
 	credit := &fakeCredit{before: 100, after: 90}
 	svc := newTxTestService(db, credit, newFakeConfig(), time.Now())
@@ -745,13 +809,13 @@ func TestRecord_TxPath_UniqueViolation_ReturnsCompleted(t *testing.T) {
 		Tokens: Usage{Input: 1234, Output: 567}, Rates: fullRates(),
 	})
 	if err != nil {
-		t.Fatalf("唯一索引冲突应重查并返回成功, got err=%v", err)
+		t.Fatalf("撞号应换号重试成功, got err=%v", err)
 	}
-	if rec == nil || rec.Status != StatusCompleted || rec.BillingID != billingID {
-		t.Fatalf("应返回已落库的 completed 记录, got %+v", rec)
+	if rec == nil || rec.Status != StatusCompleted || rec.BillingID == billingID {
+		t.Fatalf("应返回新号上的 completed 记录, got %+v", rec)
 	}
-	if credit.txCalls != 1 || credit.calls != 0 {
-		t.Fatalf("撞库不应重复扣款, tx=%d plain=%d", credit.txCalls, credit.calls)
+	if credit.txSettleCalls+credit.txCalls == 0 {
+		t.Fatal("换号重试必须重新扣款")
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("mock expectations: %v", err)
@@ -1334,5 +1398,31 @@ func TestService_EstimateCredits_MatchesRecordFormula(t *testing.T) {
 	}
 	if est <= 0 {
 		t.Fatalf("estimate must be positive, got %v", est)
+	}
+}
+
+// foreignCompletedRow 返回另一个用户的 completed 行（用于撞号用例；testUserID=7）。
+func foreignCompletedRow(t *testing.T) *sqlmock.Rows {
+	t.Helper()
+	return sqlmock.NewRows(recordColsForTest).AddRow(
+		int64(9), billingID, int64(8), "sale", nil, "ext-model", nil, "int-model", int64(1), nil, "",
+		time.Now(), `{}`, `{}`, []byte(`{"time":1,"context":1}`), int64(10000),
+		nil, nil, nil, nil, nil, "completed", nil, nil, nil, nil, false, nil,
+	)
+}
+
+// 流水号必须低碰撞：旧实现 6 位十进制（1e6）单日 1 万单期望约 50 次撞号，
+// 而它同时是钱包流水与账单的幂等键（撞号 = 串账）。
+func TestGenBillingID_LowCollision(t *testing.T) {
+	seen := make(map[string]struct{}, 200000)
+	for i := 0; i < 200000; i++ {
+		id := GenBillingID()
+		if len(id) < 20 {
+			t.Fatalf("流水号太短（随机位不足）: %q", id)
+		}
+		if _, dup := seen[id]; dup {
+			t.Fatalf("20 万次生成出现重复: %q", id)
+		}
+		seen[id] = struct{}{}
 	}
 }
