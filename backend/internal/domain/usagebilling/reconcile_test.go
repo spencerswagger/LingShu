@@ -88,6 +88,66 @@ func TestCompareWindow_EstimatedGroupsExcluded(t *testing.T) {
 	}
 }
 
+// 同一 (key, model) 同时有估算单与正常单时，**不能混成一组**：
+// 旧实现把两行并成一组并打上 estimated，整组被剔出主口径 → 真实 token 不参与比对，
+// 代理侧全量进偏差分子 → 窗口过 1e4 即误报（Owl 实测 P1）。
+func TestCompareWindow_MixedEstimatedGroupKeepsRealTokens(t *testing.T) {
+	local := []Group{
+		{CallerKey: "k1", Model: "m1", Requests: 1, Input: 50, Output: 20, Estimated: true},
+		g("k1", "m1", 10, 1000, 0, 400),
+	}
+	magpie := []Group{g("k1", "m1", 10, 1000, 0, 400)}
+
+	w := compareWindow(wStart, wEnd, local, magpie, 0)
+	if w.Status != "ok" {
+		t.Fatalf("真实用量一致不应报警（旧实现这里会 alarm）: %+v", w.Detail)
+	}
+	if w.TokensLS.Input != 1000 || w.TokensLS.Output != 400 {
+		t.Fatalf("主口径必须只含真实单: %+v", w.TokensLS)
+	}
+	if w.TokensMag.Input != 1000 {
+		t.Fatalf("代理侧口径: %+v", w.TokensMag)
+	}
+	if w.Detail["estimated_groups"] != 1 || w.Detail["estimated_tokens"] != int64(70) {
+		t.Fatalf("估算单要单独记数: %+v", w.Detail)
+	}
+	if absent, _ := w.Detail["absent_in_ls"].([]string); len(absent) != 0 {
+		t.Fatalf("两侧都有该组，不应记成单侧缺账: %v", absent)
+	}
+	if w.Detail["token_sum_ls"] != int64(1400) || w.Detail["token_sum_magpie"] != int64(1400) {
+		t.Fatalf("窗口 token 合计只含真实单: %+v", w.Detail)
+	}
+}
+
+// 纯正常组：混合维度改造后照常参与比对（不许因切开维度而漏比）。
+func TestCompareWindow_PureNormalGroupStillCompared(t *testing.T) {
+	local := []Group{g("k1", "m1", 10, 200, 0, 100)}
+	magpie := []Group{g("k1", "m1", 10, 100, 0, 100)}
+	w := compareWindow(wStart, wEnd, local, magpie, 0)
+	if w.Status != "alarm" {
+		t.Fatalf("纯正常组偏差 100%% 必须 alarm: %+v", w.Detail)
+	}
+	if w.TokensLS.Input != 200 {
+		t.Fatalf("主口径 token=%+v", w.TokensLS)
+	}
+}
+
+// 只有估算单的组：记进 absent_in_ls（灵枢只有估算单），但不参与偏差判定。
+func TestCompareWindow_OnlyEstimatedGroupNotCompared(t *testing.T) {
+	local := []Group{{CallerKey: "k2", Model: "m2", Requests: 5, Input: 900, Estimated: true}}
+	magpie := []Group{g("k2", "m2", 5, 100, 0, 100)}
+	w := compareWindow(wStart, wEnd, local, magpie, 0)
+	if w.Status == "alarm" {
+		t.Fatalf("纯估算组不应报警: %+v", w.Detail)
+	}
+	if absent, _ := w.Detail["absent_in_ls"].([]string); len(absent) != 1 {
+		t.Fatalf("应记成灵枢缺真实账: %v", w.Detail["absent_in_ls"])
+	}
+	if w.TokensLS.Input != 0 {
+		t.Fatalf("主口径不含估算: %+v", w.TokensLS)
+	}
+}
+
 // 窗口整体阈值：加权偏差 >2% 且总量 ≥10000 才 alarm。
 func TestCompareWindow_WindowLevelThreshold(t *testing.T) {
 	// 每段偏差 3%，总量 ≥10000 → 窗口级 alarm（分组笔数不足门槛，故只可能由窗口触发）。
@@ -244,7 +304,7 @@ func TestRunOnce_NoLedgerSavesSkipped(t *testing.T) {
 	}
 }
 
-// 拿不到 advisory lock → 本窗跳过（多副本只跑一个）。
+// 拿不到 advisory lock → 本窗跳过（多副本只跑一个），但必须留可观测痕迹。
 func TestRunOnce_LockNotAcquiredSkips(t *testing.T) {
 	store := &fakeStore{}
 	ledger := &fakeLedger{}
@@ -253,6 +313,13 @@ func TestRunOnce_LockNotAcquiredSkips(t *testing.T) {
 	r.RunOnce(context.Background())
 	if len(store.saved) != 0 {
 		t.Fatalf("拿不到锁不该落库: %+v", store.saved)
+	}
+	if r.LockSkips() != 1 {
+		t.Fatalf("拿不到锁必须计数（否则停摆是静默的）: %d", r.LockSkips())
+	}
+	r.RunOnce(context.Background())
+	if r.LockSkips() != 2 {
+		t.Fatalf("连续跳过的窗口都要计: %d", r.LockSkips())
 	}
 }
 
