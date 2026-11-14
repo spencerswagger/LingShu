@@ -214,8 +214,14 @@ func (h *Handler) handleProxy(w http.ResponseWriter, r *http.Request) {
 		prep.StreamRequested = StreamRequested(body)
 	}
 
-	// 6) 转发（响应字节原样回流）。
+	// 6) 转发（响应字节原样回流；唯一例外是凭据回显遮蔽，见 proxy.go）。
 	res := h.proxy.Forward(w, r, route, prep)
+	if res.UnmaskableEncoding != "" {
+		// 上游无视 Accept-Encoding: identity 用了 stdlib 解不了的压缩编码：
+		// 只能按原字节透传，遮蔽豁免在该响应上不成立（边界见设计稿风险段）。
+		h.logFor(r.Context()).Warn("上游响应编码无法解码，未做凭据遮蔽",
+			"endpoint", route.Endpoint, "encoding", res.UnmaskableEncoding, "status", res.Status)
+	}
 	if res.Err != nil {
 		h.logFor(r.Context()).Warn("代理转发失败",
 			"endpoint", route.Endpoint, "model", prep.MagpieModel,

@@ -40,6 +40,13 @@ read_when:
   只替换这段字节（不重新序列化，键序/空白/数字写法/转义序列原样）。
 - **其余**：请求头按强制黑名单剔除后逐值透传，`Accept-Encoding` 固定 `identity`；响应头只丢 hop-by-hop；
   响应体（含 SSE 分包、错误体）逐字节原样；**不注入 `include_usage`**。
+- **唯一豁免（契约 §8.1）：凭据回显遮蔽**。上游常把我们的 callerKey（或 `Bearer <key>` 整段头）原样回显在
+  错误体里；直接透传等于把渠道凭据发给租户。因此转发层只做这一件事：把**本次请求实际用到的那把**凭据命中
+  的子串替换成 `<redacted>`，全部状态码生效，**无命中则零改动**（字节与 `Content-Length` 都不变）；
+  不做正则泛化（`sk-other-key` 之类原样保留），按子串语义（`caller-secret-2` 会连前缀一起遮，宁可多遮）。
+  非流式整段读后重算长度；流式用「尾部暂存」处理 SSE 分包切断，长度交 chunked；上游无视 `identity` 仍
+  gzip/deflate 时先解压再遮蔽并丢掉 `Content-Encoding`；stdlib 解不了的编码（如 `br`）只能按下行原字节透传，
+  `Result.UnmaskableEncoding` 标记 + 一条告警（这是本豁免的已知边界）。
 
 ## 3. 准入（灵枢唯一的策略点）
 
