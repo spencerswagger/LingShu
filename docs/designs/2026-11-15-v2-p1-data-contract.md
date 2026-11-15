@@ -21,11 +21,13 @@
 
 主库实测：`origin/main` 最大迁移是 `0018_call_logs_req_params.sql`。所以 0019 起号与主线**不撞号**（旧分支的 `0019_v2_facade.sql` / `0020_reconcile_blocked_status.sql` 未合入，作废、不 cherry-pick）。
 
+注意区分两件事：**编号不冲突 ≠ 幂等键安全**。`migrate.go` 的幂等键是**文件名**（`applied_migrations.name`），所以真正的风险是：① 同名不同内容 → 静默跳过、schema 缺列不报错；② 同编号不同名（旧分支）→ 两条都执行、DDL 撞车。执行前两条查询必做（§5 步骤 0）。
+
 | 编号 | 文件（`backend/internal/db/migrations/`） | 一句话职责 | 可回滚 | 幂等写法 |
 |---|---|---|---|---|
 | 0019 | `0019_v2_topology.sql` | 建四层图的三张表（`internal_models` / `model_links` / `subscriptions`）+ `external_models` 加绑定列 | 是（DROP 三表 / DROP 列） | `IF NOT EXISTS` / `ADD COLUMN IF NOT EXISTS` |
 | 0020 | `0020_v2_billing_attribution.sql` | `billing_records` 只加归因列与索引（7 列），**纯 ADD、零 DROP、零 DML** | 是 | 同上 |
-| 0021 | `0021_v2_drop_legacy.sql` | **唯一的 DROP 文件**：11 张退役表 + 3 个阻塞列 | **否**（必须走 §5 证据流程） | `DROP TABLE/COLUMN IF EXISTS` |
+| 0021 | `0021_v2_drop_legacy.sql` | **唯一的 DROP 文件**：**10 张实际退役表**（另 1 条 `channel_events` 是 0009 已删的空操作）+ 3 个阻塞列 | **否**（必须走 §5 证据流程） | `DROP TABLE/COLUMN IF EXISTS` |
 | 0022 | `0022_v2_ledger.sql` | 建 `ledger_entries`（账本最小九字段）与 `credit_holds`（预扣登记，阶段二启用） | 是（DROP 两表） | `IF NOT EXISTS` |
 | 0023 | `0023_v2_reconcile.sql` | 建 `reconcile_windows`（60s 对账窗口与告警连续计数） | 是（DROP 表） | `IF NOT EXISTS` |
 
@@ -166,11 +168,15 @@ ALTER TABLE tokens          DROP COLUMN IF EXISTS tag_id;           -- 引用 se
 
 ### 4.2 再删表（子表在前，顺序不可调）
 
+**实际删除 10 张**（子表 → 父表）：
+
 ```
 channel_tags → channel_model_events → channel_key_events → probe_logs
-→ channel_models → channel_keys → channel_events → channels
+→ channel_models → channel_keys → channels
 → auto_model_members → auto_models → semantic_tags
 ```
+
+文件里还有第 11 条 `DROP TABLE IF EXISTS channel_events`：**它在 `0009_drop_channel_state.sql` 就已经被删了**（该文件末句就是 `DROP TABLE IF EXISTS channel_events;`），所以永远是空操作。它留在文件里只为「清单读起来完整 + 手工恢复过该表的环境也能收拾干净」，**数表时按 10 张数，不要按 11 张数**（按 11 数会以为漏了一张而去找不存在的表）。
 
 全部 `DROP TABLE IF EXISTS`。**保留不删**：`channel_protocols`、`protocol_error_stats`（不在批准清单；无写入方后是孤岛表，等阶段二后单独拍板清理），`watchlist_items` / `price_change_alerts`（价格监控，未批准下架）。
 
@@ -178,11 +184,35 @@ channel_tags → channel_model_events → channel_key_events → probe_logs
 
 `migrate.go` 每文件一个事务（`internal/db/migrate.go:16-70`），PG 的 DDL 事务性 → 0021 中途失败会整体回滚，不需要手工 restore（严格结论与 dump 的实际作用见 §12-①）。把所有不可逆动作集中在**一个**文件，等于「备份 → 证据 → 执行」只走一次，回滚点只有一个。
 
+### 4.4 风险点与回滚（实测路径）
+
+两条风险，处置不同：
+
+| 风险 | 兜底 | 实测状态 |
+|---|---|---|
+| **跑一半**（0021 第 5 句报错） | 单文件事务自动回滚到 0018 状态，`applied_migrations` 不记 0021，重试安全；不需要 dump | 已实测：DDL 末尾注入 `SELECT 1/0` → 整份事务回滚、表与列原样 |
+| **已 commit 后发现删错 / 要取回历史渠道密钥名** | 用同一份 dump 整库还原回迁移前 | 已实测：同一 dump 还原后**行数 0 差异** |
+
+整库还原（已实测的命令形态，`$BK` 即步骤 1 的 dump）：
+
+```bash
+pg_terminate_backend_all $SRC_DB            # 先踢连接：生产上先把灵枢进程停掉
+dropdb --if-exists $SRC_DB                  # 或先 ALTER DATABASE ... RENAME TO ${SRC_DB}_broken 保底
+createdb -T template0 $SRC_DB
+pg_restore -d $SRC_DB --no-owner --no-privileges -j4 "$BK"   # 行数应与 before-all.txt 逐字相同
+```
+
+**这条回滚有窗口期限制**：dump 是 0021 执行「之前」的快照，所以还原会丢掉「迁移后 → 回滚前」写进库的增量（新账单、新账本条目、新用户）。因此回滚只适用于「迁移刚 commit 就发现错」的窗口；超过一个业务周期再回滚，正确做法是从 dump 把被删表的**历史数据单独抽出来**补，而不是整库覆盖。
+
 ---
 
 ## 5 0021 三步证据流程（可直接照抄）
 
 > 执行人：持有宿主 PG 的人（spencer / hugo）。**沙盒内 PG 拒连**（实测 `127.0.0.1:5432` Connection refused），且 `lingshu_dev` 无 `CREATEDB`（2026-11-10 实测），临时库必须由有权限的角色建。
+>
+> **本流程已在演练库完整跑过**（21 项全绿，A/B/C/D 四个判定点都构造出了红态，另加 `SELECT 1/0` 负向对照）。
+> **演练环境 ≠ 生产**：演练源库是按迁移脚本重建 + 合成造数的**等价物**，真实 `migrate.go` 触发路径（服务启动时自动迁移）未在演练中验证；
+> 正式执行必须在**有真实数据的宿主**上按同一脚本重跑，演练的行数/耗时数字不代表生产。
 
 先落两个 SQL 文件（动态精确计数：不写死表名，表多表少都对）：
 
@@ -220,9 +250,17 @@ STAMP=$(date +%Y%m%dT%H%M%S)
 BK=./backup/${SRC_DB}-${STAMP}.dump
 TMP_DB=lingshu_verify_${STAMP}
 
-# ── 步骤 0：撞号断言（必须 0018 结尾）─────────────
+# ── 步骤 0：执行前核对（幂等键是「文件名」，不是编号！）──
+#   migrate.go 用文件名做幂等键：**同名不同内容 → 静默跳过**（schema 缺列且不报错）；
+#   **同编号不同名**（旧分支的 0019_v2_facade.sql）→ 两条都执行 → DDL 直接撞车。
+#   远端目前仍有 3 个旧 v2 分支带 0019_v2_facade.sql，其中一个还带 0020_reconcile_blocked_status.sql。
 psql -d $SRC_DB -tAc "SELECT name FROM applied_migrations ORDER BY name DESC LIMIT 1"
-# 期望：0018_call_logs_req_params.sql，否则停手
+# 期望：0018_call_logs_req_params.sql
+
+psql -d $SRC_DB -tAc "SELECT name FROM applied_migrations WHERE name >= '0019' ORDER BY name"
+# 期望：0 行。
+# 有行 = 这个库被旧分支迁移过。库里**不存校验和**，无法证明「同名即同内容」→ 停手，
+# 逐个人工比对（git diff origin/main:<file> 与当时的旧分支 blob），对不上就不许执行。
 
 # ── 步骤 1：备份（自定义格式，带 CRC）─────────────
 pg_dump -Fc -Z6 -f "$BK" "$SRC_DB"; echo "dump_exit=$?"
@@ -246,6 +284,7 @@ psql -d $SRC_DB -tA -F'|' -f counts-retained.sql | sort > after-retained.txt
 diff before-retained.txt after-retained.txt && echo "RETAINED-OK"
 
 # ── 步骤 3d：删干净断言（期望空输出）────────────────
+#   10 张实际删除 + channel_events（0009 已删，留作第 11 条只为清单完整；断言同样要求 NULL）
 psql -d $SRC_DB -tAc "
 SELECT string_agg(t, ',') FROM unnest(ARRAY[
  'channels','channel_keys','channel_models','channel_events','probe_logs',
@@ -254,7 +293,7 @@ SELECT string_agg(t, ',') FROM unnest(ARRAY[
 WHERE to_regclass(t) IS NOT NULL"
 ```
 
-**要留的产物**：`*.dump`（文件名 + 大小 + sha256）、`before-all.txt` / `restored-all.txt` / `before-retained.txt` / `after-retained.txt`、三条命令退出码、3d 的空输出。全部贴进 PR 描述。
+**要留的产物**：`*.dump`（文件名 + 大小 + sha256）、`before-all.txt` / `restored-all.txt` / `before-retained.txt` / `after-retained.txt`、三条命令退出码、3d 的空输出；再加「步骤 0 两条查询」的输出（证明这个库没被旧分支碰过）。全部贴进 PR 描述。
 
 **失败即中止的判定点**：
 
@@ -262,8 +301,9 @@ WHERE to_regclass(t) IS NOT NULL"
 |---|---|---|
 | A | `dump_exit≠0`，或 dump 文件 < 1 KiB（空库除外） | **不执行迁移**，重跑备份 |
 | B | `createdb_exit≠0` 或 `restore_exit≠0`，或 `diff before-all.txt restored-all.txt` 非空 | **不执行迁移**（备份不可信 = 没备份） |
-| C | `RETAINED-OK` 不成立（保留表行数变少） | **立即中止**；若已 commit，用 dump 全量恢复 |
+| C | `RETAINED-OK` 不成立（保留表行数变少） | **立即中止**；若已 commit，用 §4.4 的整库还原 |
 | D | 3d 有输出（表还在） | 迁移未生效或部分执行 → 查 `applied_migrations` 后重跑 |
+| E | **负向对照**：在 0021 末尾注入 `SELECT 1/0` 后执行 | 整份事务回滚、表与列原样（已实测）→ 证明「跑一半能自动回滚」不是推断 |
 
 ---
 
@@ -415,6 +455,11 @@ CREATE INDEX IF NOT EXISTS idx_ledger_entries_account
 
 本轮（交付轮）**未新增冲突**：A / E / F 三条仍待负责人拍板；Core 的 `feat/lingshu-v2-sync-config` 已把基址/超时/降级放进 `sys_configs`、密钥一律不进 —— 与 E 的处置一致，口径无偏离。
 
+按测试实测**修订两条**（原表述作废，以本节后文 §4/§5 为准）：
+
+- **退役表是 10 张，不是 11 张**：`channel_events` 在 `0009_drop_channel_state.sql` 已被删除，0021 里那条是空操作。
+- **撞号的真实风险是「文件名幂等键」，不是 DDL 冲突**：同名异内容会被静默跳过（缺列不报错），同编号异名会两条都执行。执行前必须核对 `applied_migrations`（§5 步骤 0）。
+
 ---
 
 ## 11 阶段一执行顺序（数据层）
@@ -428,8 +473,8 @@ CREATE INDEX IF NOT EXISTS idx_ledger_entries_account
 
 ## 12 三条硬结论（一句话各一条，Gate 可直接写成断言）
 
-**① 0021 中途失败能自动回滚到迁移前，但只在文件的事务内。**
-`migrate.go:16-70` 把整份文件放进一个 `tx` 执行，PG 的 DDL 是事务性的（`DROP TABLE` / `DROP COLUMN` 可回滚），任一句报错 → `tx.Rollback()` → 库回到 0018，且 `applied_migrations` 不记 0021、重试安全；**dump 保护的不是「跑一半」，而是「文件已 commit 后发现删错/要取回历史渠道密钥名」这类事务之外的误判**——所以三步证据仍是必须的；反过来说，这五个文件里**不得出现** `CREATE INDEX CONCURRENTLY` / `VACUUM` / `CREATE DATABASE` 等不能在事务内执行的语句，否则迁移会直接失败（那才是真回滚不了）。
+**① 0021 中途失败能自动回滚到迁移前，但只在文件的事务内（已实测，非推断）。**
+`migrate.go:16-70` 把整份文件放进一个 `tx` 执行，PG 的 DDL 是事务性的（`DROP TABLE` / `DROP COLUMN` 可回滚），任一句报错 → `tx.Rollback()` → 库回到 0018，且 `applied_migrations` 不记 0021、重试安全；**dump 保护的不是「跑一半」，而是「文件已 commit 后发现删错/要取回历史渠道密钥名」这类事务之外的误判**——所以三步证据仍是必须的；反过来说，这五个文件里**不得出现** `CREATE INDEX CONCURRENTLY` / `VACUUM` / `CREATE DATABASE` 等不能在事务内执行的语句，否则迁移会直接失败（那才是真回滚不了）。实证：在 0021 末尾注入 `SELECT 1/0`，整份事务回滚、表与列原样——「跑一半」由事务兜住；同一份 dump 整库还原后行数 0 差异——「已 commit 后删错」由 dump 兜住。两者不是一回事，别拿其中一个当另一个。
 
 **② 窗口归属只按网关 `occurred_at` 切，两端时钟偏差必须 < 半窗（30s）。**
 账本条目一律落它自己的 `occurred_at`，不按灵枢落库时刻补正；一旦换机或漂移超过 30s，对账窗口映射就会把条目归到相邻窗，因此约束是「同机部署 + NTP 同源，偏差 ≥ 30s 时对账置 `status='error'` 并告警」——**宁可整窗报错，不许静默错窗**。
@@ -550,7 +595,7 @@ DROP TABLE IF EXISTS channel_key_events;
 DROP TABLE IF EXISTS probe_logs;
 DROP TABLE IF EXISTS channel_models;
 DROP TABLE IF EXISTS channel_keys;
-DROP TABLE IF EXISTS channel_events;
+DROP TABLE IF EXISTS channel_events;   -- 0009 已删 → 空操作（保留只为清单完整）
 DROP TABLE IF EXISTS channels;
 DROP TABLE IF EXISTS auto_model_members;
 DROP TABLE IF EXISTS auto_models;
