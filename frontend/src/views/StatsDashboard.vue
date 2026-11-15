@@ -909,6 +909,13 @@ const userRows = computed<LiveUserRow[]>(() => {
 
 // ===== 更多维度（旧版用量分析里仍有数据支撑的部分，默认收起）=====
 const moreOpen = ref<string[]>([])
+// 「Top 渠道密钥」属内部运维维度（渠道密钥名）：开发者端 DTO 口径本就不允许下发密钥维度，
+// 页面也不在开发者端呈现，标题按角色裁剪（不渲染 ≠ 前端字符串遮蔽，数据侧收口另需后端）。
+const moreTitle = computed(() =>
+  isAdmin.value
+    ? '更多维度（Token 构成 / Top 渠道密钥 / 计费模式 / Top 用户）'
+    : '更多维度（Token 构成 / 计费模式）',
+)
 
 const compositionOption = computed<EChartsCoreOption>(() => {
   const t = data.value?.Usage.Total
@@ -1298,13 +1305,14 @@ const modeLabel = (m: string) =>
 
       <!-- 更多维度：旧版用量分析里仍有数据支撑的部分，压到最低层级、默认收起 -->
       <el-collapse v-model="moreOpen" class="more-block">
-        <el-collapse-item name="more" title="更多维度（Token 构成 / Top 渠道密钥 / 计费模式 / Top 用户）">
+        <el-collapse-item name="more" :title="moreTitle">
           <div class="grid">
             <div class="card">
               <div class="card-title-s">Token 构成</div>
               <VChart :option="compositionOption" height="260px" />
             </div>
-            <div class="card">
+            <!-- 渠道密钥维度属内部运维面：仅管理端渲染（开发者端不给密钥名，见 DTO 白名单口径） -->
+            <div v-if="isAdmin" class="card">
               <div class="card-title-s">Top 渠道密钥</div>
               <VChart v-if="(data?.Usage.ByKey?.length ?? 0) > 0" :option="keyOption" height="260px" />
               <el-empty v-else description="暂无数据" :image-size="60" />
