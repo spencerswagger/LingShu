@@ -21,7 +21,7 @@ var ErrMissingModel = errors.New("请求体缺少 model 字段")
 // byteSpan 是请求体内的字节区间 [start, end)。
 type byteSpan struct{ start, end int }
 
-// stringSpans 定位顶层键 key 的**字符串值**区间（出现多次时全部返回，按 JSON「后者生效」口径一并替换）。
+// stringSpans 定位顶层键 key 的**字符串值**区间（出现多次时全部返回，按出现顺序）。
 // 非字符串取值（数字/对象/null）返回 ErrMissingModel 的变体（值类型不对同样无法改写）。
 func stringSpans(body []byte, key string) ([]byteSpan, error) {
 	dec := json.NewDecoder(bytes.NewReader(body))
@@ -88,7 +88,12 @@ func ModelFromJSON(body []byte) (string, error) {
 }
 
 // RewriteModelJSON 把顶层 model 的值替换为 magpieModel，其余字节逐字保留。
-// 返回新切片（不改入参），多次出现的 model 一并替换为同一值。
+// 返回新切片（不改入参）。
+//
+// 顶层出现**多个 model** 时只改**生效的那一处**（JSON 语义：重复键后者生效，与
+// ModelFromJSON 的取值口径一致）。此前是把每一处都替换掉：调用方写
+// `{"model":"a","model":"b"}` 会被改成两处都是代理模型名，等于擅自改写了请求体里
+// 一处语义上被忽略的字节，违反「除生效的 model 外逐字不动」的契约（矩阵 P-05）。
 func RewriteModelJSON(body []byte, magpieModel string) ([]byte, error) {
 	spans, err := stringSpans(body, "model")
 	if err != nil {
@@ -101,16 +106,12 @@ func RewriteModelJSON(body []byte, magpieModel string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	// 从后往前拼接，避免前面的替换移动后面区间的位置。
-	out := body
-	for i := len(spans) - 1; i >= 0; i-- {
-		s := spans[i]
-		next := make([]byte, 0, len(out)-(s.end-s.start)+len(quoted))
-		next = append(next, out[:s.start]...)
-		next = append(next, quoted...)
-		next = append(next, out[s.end:]...)
-		out = next
-	}
+	// 只替换最后一处（生效值）；其余出现的 model 逐字节保留。
+	s := spans[len(spans)-1]
+	out := make([]byte, 0, len(body)-(s.end-s.start)+len(quoted))
+	out = append(out, body[:s.start]...)
+	out = append(out, quoted...)
+	out = append(out, body[s.end:]...)
 	return out, nil
 }
 

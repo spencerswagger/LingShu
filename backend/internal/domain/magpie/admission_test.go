@@ -136,16 +136,16 @@ func TestAdmit_Denies(t *testing.T) {
 			wantStat: 404, wantCode: CodeModelNotFound,
 		},
 		{
-			name: "模型未开放", tokens: &fakeTokens{tok: activeToken()}, token: "t", modelName: "d",
+			name: "模型已停用（生产路径折叠成 ErrNotFound → 404）", tokens: &fakeTokens{tok: activeToken()}, token: "t", modelName: "d",
 			models:   &fakeModels{byName: map[string]*model.ExternalModel{"d": disabled}},
 			keys:     &fakeKeys{key: &Key{KeyCipher: cipher}},
-			wantStat: 403, wantCode: CodeModelNotAllowed,
+			wantStat: 404, wantCode: CodeModelNotFound,
 		},
 		{
 			name: "未映射代理模型", tokens: &fakeTokens{tok: activeToken()}, token: "t", modelName: "u",
 			models:   &fakeModels{byName: map[string]*model.ExternalModel{"u": unmapped}},
 			keys:     &fakeKeys{key: &Key{KeyCipher: cipher}},
-			wantStat: 403, wantCode: CodeModelNotAllowed,
+			wantStat: 404, wantCode: CodeModelNotFound,
 		},
 		{
 			name: "订阅池前缀拦截", tokens: &fakeTokens{tok: activeToken()}, token: "t", modelName: "c",

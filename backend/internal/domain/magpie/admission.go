@@ -162,6 +162,15 @@ func isSubscriptionModel(magpieModel string, prefixes []string) bool {
 	return false
 }
 
+// 拒绝文案（调用方按状态码 + error.code 分支，文案只做人类可读补充）：
+//
+//	modelUnavailableMessage  「不存在 / 已停用」共用一句：不区分「这个名字存在但被停用」；
+//	modelNotLinkedMessage    「已开放但未映射代理模型」：配置未完成，回答的是「为什么这个名字取不到」。
+const (
+	modelUnavailableMessage = "模型不存在或未对租户开放"
+	modelNotLinkedMessage   = "模型尚未接入转发服务"
+)
+
 // Decision 是准入通过后的转发所需事实。
 type Decision struct {
 	Token *identity.Token
@@ -260,16 +269,25 @@ func (a *Admitter) AdmitToken(ctx context.Context, tok *identity.Token, inboundM
 
 	ext, err := a.models.GetByExternalName(ctx, inboundModel)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, &Deny{Status: http.StatusNotFound, Code: CodeModelNotFound, Message: "模型不存在或未对租户开放"}
+		// 「模型不存在 / 已停用」是业务拒绝，不是服务故障：model.Service 把「查不到启用记录」
+		// 统一折叠成 model.ErrNotFound（未启用与不存在**对外不可区分**，避免泄漏「该名字存在但被停用」）。
+		// 旧实现只认 sql.ErrNoRows，于是 ErrNotFound 落到 internal_error → 500「服务内部错误」（矩阵 B-11）。
+		// sql.ErrNoRows 一并兜住，兼容别的查找实现。
+		if errors.Is(err, model.ErrNotFound) || errors.Is(err, sql.ErrNoRows) {
+			return nil, &Deny{Status: http.StatusNotFound, Code: CodeModelNotFound, Message: modelUnavailableMessage}
 		}
 		return nil, &Deny{Status: http.StatusInternalServerError, Code: CodeInternal, Message: "服务内部错误"}
 	}
 	if !ext.Enabled {
-		return nil, &Deny{Status: http.StatusForbidden, Code: CodeModelNotAllowed, Message: "模型未对租户开放"}
+		// 生产路径上停用模型已被 GetByExternalName 折叠成 ErrNotFound；这里兜住「别的实现返回了停用行」，
+		// 与上面同口径（404 + 同一句话），避免同一种情况两种响应。
+		return nil, &Deny{Status: http.StatusNotFound, Code: CodeModelNotFound, Message: modelUnavailableMessage}
 	}
 	if ext.MagpieModel == nil || strings.TrimSpace(*ext.MagpieModel) == "" {
-		return nil, &Deny{Status: http.StatusForbidden, Code: CodeModelNotAllowed, Message: "模型尚未接入代理转发"}
+		// 「已开放但尚未接入转发」是配置未完成，与「名字打错/未开放」用不同文案区分；
+		// 状态码与归类码统一到 404 model_not_found —— 它不是权限问题，不能和「未开通 callerKey」
+		// 的 403 model_not_allowed 混在一起（矩阵 P-10）。
+		return nil, &Deny{Status: http.StatusNotFound, Code: CodeModelNotFound, Message: modelNotLinkedMessage}
 	}
 	magpieModel := strings.TrimSpace(*ext.MagpieModel)
 	if isSubscriptionModel(magpieModel, a.prefixes.Prefixes(ctx)) {

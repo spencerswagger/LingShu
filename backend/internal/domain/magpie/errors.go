@@ -6,7 +6,8 @@
 //	连不上 magpie / 建连失败 / DNS      → 503 + Retry-After: 5
 //	首包超时 / 流空闲超时                → 504
 //	令牌无效                            → 401
-//	模型未开放（白名单/未映射/订阅池）    → 403（model_not_allowed）或 404（model_not_found）
+//	模型不存在 / 已停用 / 未映射代理模型  → 404（model_not_found，前者与后者文案不同）
+//	模型属订阅池 / 未对租户开放          → 403（model_not_allowed）
 //	令牌未开通代理访问（无 callerKey）    → 403（magpie_key_missing）
 //	请求体不合法 / 缺少 model            → 400
 package magpie

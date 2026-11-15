@@ -35,9 +35,9 @@ func TestRewriteModelJSON_PreservesAllOtherBytes(t *testing.T) {
 			want: `{"model":"up/m","metadata":{"model":"inner"},"stream":true}`,
 		},
 		{
-			name: "顶层重复 model（JSON 后者生效）→ 一并改写",
+			name: "顶层重复 model → 只改生效的那一处（后者生效）",
 			body: `{"model":"a","model":"b"}`,
-			want: `{"model":"up/x","model":"up/x"}`,
+			want: `{"model":"a","model":"up/x"}`,
 		},
 	}
 	for _, c := range cases {
