@@ -101,8 +101,8 @@ func ProbeLedgerOrder(ctx context.Context, src PageSource, w Window, pageSize in
 		}
 		if len(p2.Entries) == 0 && len(p1.Entries) == pageSize {
 			return ProbeResult{
-				Order: LedgerOrderUnverified,
-				Reason: "第一页已满但第二页为空，翻页语义不自洽，证不了排序",
+				Order:   LedgerOrderUnverified,
+				Reason:  "第一页已满但第二页为空，翻页语义不自洽，证不了排序",
 				Samples: len(all), CheckedAt: now(),
 			}
 		}

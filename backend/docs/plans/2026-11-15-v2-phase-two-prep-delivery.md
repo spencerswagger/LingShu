@@ -159,6 +159,10 @@
 - 全仓库仍有大量 `channel_key_id` / 渠道表引用（非测试 ~60 处），属 A 项同一件事。
 - **同步轮次仍未装配**：`PageSource` 的生产实现（`HTTPLedgerSource`）本轮补上了，但 `cmd/server` 里只装配了对账循环、**没有**装配 `Rounder`（ticker + 能力探测接线的活还没做）。因此 F9 的行为目前由用例保证，生产里还不会真的跑同步。
 - **上游排序能力仍未证实**：真实上游 POC 未执行 → 结论 `unverified` → 一旦接线，所有同步窗都会记 blocked 且不可清零，直到 POC 通过（`supported`）。这是裁定要的保守行为，不是 bug。
+- `upstream.*` 三个键**没有管理端写入口**：`PUT /admin/configs/system` 只处理既有几块，不含这三个键，目前只能直写 `sys_configs`。
+- `upstream.ConfigProvider.Invalidate()` **没有生产调用点**：`SetConfigWriteHook` 在 `upstreamCfg` 创建之前注册，钩子里没有它，而缓存无 TTL —— 改 `upstream.base_url` / 超时要重启才生效。
+- F8 的供应商名是**手工清单**（20 个常见上游名 + `provider/account/vendor/served/backend/worker/region` 身份类头名）：未收录的新供应商仍可能漏剥，新增上游时要同步追加。
+- 本文的三步证据在 **tip `5bf38b8`** 的树上取得；此后分支追加了 `0023b` 与 F6/F9 的收紧，未在新 head 上重跑三步证据。
 - 迁移编号新开了一个 `0023b`（幂等修形，排在 `0023` 与 `0024` 之间）：原因是**改过的 .sql 不会重放**，老环境必须有一条新迁移才能拿到最终形状。这不是复用 `0021` 空号。
 
 ## 4. 同一窗口重复写 `blocked` 的幂等性
