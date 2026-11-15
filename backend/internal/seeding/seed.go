@@ -57,6 +57,13 @@ var defaultSysConfigs = map[string]string{
 	"routing.session_cost": `{"enabled":true,"mid_switch":true,"shadow_enabled":false,"remaining_a":10,"remaining_b":1,"remaining_min":1,"remaining_max":20,"min_remaining":1,"cooldown_sec":300,"min_improve":0.05}`,
 	// 会话过期分档兜底与示例档位（双维度取较大者，且不低于兜底 5 分钟）。
 	"session.expiration": `{"default_ttl_minutes":5,"context_tiers":[{"max_tokens":2000,"ttl_minutes":5},{"max_tokens":8000,"ttl_minutes":30},{"max_tokens":32000,"ttl_minutes":180},{"max_tokens":128000,"ttl_minutes":1440}],"turn_tiers":[{"max_turns":2,"ttl_minutes":5},{"max_turns":10,"ttl_minutes":30},{"max_turns":50,"ttl_minutes":180},{"max_turns":200,"ttl_minutes":1440}]}`,
+	// 上游网关（代理侧）三项运行参数：基址 / 超时 / 降级开关。
+	// 键名与代码默认值由 upstream 包定义，此处保持一致（对齐断言见 defaults_test.go）。
+	// 红线：**只允许非敏感运行参数**——凭据类（admin key / callerKey / token / password）
+	// 永不进 sys_configs；上游鉴权由装配层逐请求注入。
+	"upstream.base_url":   `""`,
+	"upstream.timeout_ms": `30000`,
+	"upstream.degrade":    `false`,
 }
 
 // systemUser / systemToken 常量：健康探测开销的归属身份（成本记账），用户侧界面隐藏。
