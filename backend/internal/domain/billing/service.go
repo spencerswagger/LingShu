@@ -349,25 +349,26 @@ func (s *Service) Record(ctx context.Context, req RecordReq) (*Record, error) {
 }
 
 // settleLedger 完成「钱包扣减 + 积分流水 + 账单落库」：
-//   - txdb 已注入：三者放进同一事务提交，扣款成功但账单写入失败时整体回滚（余额不变），
+//   - txdb 已注入（生产）：三者放进同一事务提交，扣款成功但账单写入失败时整体回滚（余额不变），
 //     从根上消灭「扣了钱没账单」；
 //   - txdb 为 nil（单测/未装配）：按原非事务路径逐步执行，扣款与落库独立。
 func (s *Service) settleLedger(ctx context.Context, rec *Record, req RecordReq, credits float64) (*Record, error) {
 	if s.txdb == nil {
 		return s.settlePlain(ctx, rec, req, credits)
 	}
-	out, err, done := s.settleTx(ctx, rec, req, credits)
-	if done {
-		return out, err
-	}
-	// 事务在提交前失败（余额已随事务回滚、未扣款）：退回非事务路径，
-	// 保留「账单不丢」的本地重试队列兜底，行为与引入事务前一致。
-	return s.settlePlain(ctx, rec, req, credits)
+	// 注入事务后**绝不退回非事务路径**（复审 P2「settlePlain 双记账」）：
+	// 事务在提交前失败时余额已随回滚恢复，此时再走 settlePlain 会在事务外真扣一次；
+	// 而调用方（usagebilling）只知道「结算失败」，只会退预扣——这笔差额就成了
+	// 「钱扣了、账单是 failed/0、对账看不到」的双记账。失败一律上抛，由调用方
+	// 退预扣 + 落 failed 账单 + 写资金异常审计留痕。
+	out, err, _ := s.settleTx(ctx, rec, req, credits)
+	return out, err
 }
 
 // settleTx 事务路径：Begin → 扣款/结算（含积分流水）+ 账单 Insert → Commit。
-// done=false 表示事务在提交前失败且非业务错误（账单写入失败/BeginTx 失败），调用方应退回非事务路径；
+// done=false 表示事务在提交前失败且非业务错误（账单写入失败/BeginTx 失败）；
 // done=true 表示结果已确定（成功、钱包业务失败已落 failed 账单、并发撞库、提交结果不确定）。
+// 两个分支都由调用方上抛，**不再退回非事务路径**（见 settleLedger 的说明）。
 func (s *Service) settleTx(ctx context.Context, rec *Record, req RecordReq, credits float64) (out *Record, err error, done bool) {
 	tx, berr := s.txdb.BeginTx(ctx, nil)
 	if berr != nil {
@@ -396,7 +397,8 @@ func (s *Service) settleTx(ctx context.Context, rec *Record, req RecordReq, cred
 		if isUniqueViolation(ierr) {
 			return nil, fmt.Errorf("%w: %v", errBillingIDCollision, ierr), true
 		}
-		// 真实写入失败：本次扣款已回滚（余额不变），退回非事务路径重试；其失败由重试队列兜底。
+		// 真实写入失败：本次扣款已随事务回滚（余额不变），按失败上抛。
+		// 不退非事务路径重试：那条路会在事务外真扣一次，而调用方只退预扣 → 双记账。
 		return nil, ierr, false
 	}
 	if cerr := tx.Commit(); cerr != nil {

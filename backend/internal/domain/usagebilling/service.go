@@ -89,6 +89,13 @@ const (
 	refundRetryDelay = 50 * time.Millisecond
 )
 
+// settleTimeout 是单次结算（扣款/退款重试/审计）的总上限。
+//
+// Settle 由转发层在 defer 里调用，ctx 是 context.WithoutCancel(r.Context())——它保留 value
+// 但**连 deadline 一起去掉**（客户端断开后仍要把钱算完）。没有上限时，一旦数据库/连接池卡住，
+// 这条 goroutine 会永久挂在这里（每个请求一条），所以这里补一个明确上限。
+const settleTimeout = 30 * time.Second
+
 // NewService 装配计费闭环。users 可为 nil（全部按 sale 计）。
 func NewService(b Billing, c Credit, users UserLookup, logger *slog.Logger) *Service {
 	if logger == nil {
@@ -175,6 +182,9 @@ func (s *Service) Settle(ctx context.Context, res magpie.Result) {
 	if !res.Billable {
 		return
 	}
+	// 转发层传进来的是 WithoutCancel 的 ctx（没有 deadline）：补上限，避免卡死的 DB 拖住 goroutine。
+	ctx, cancel := context.WithTimeout(ctx, settleTimeout)
+	defer cancel()
 	rv, _ := res.Reservation.(*Reservation)
 	if rv == nil {
 		// 未经预扣（Reserve 未装配）：按全额扣，仍按 usage 计。

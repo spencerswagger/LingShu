@@ -286,7 +286,13 @@ func compareWindow(start, end time.Time, local, magpie []Group, prevStreak int) 
 		alarmGroups []map[string]any
 		sumLSTokens int64
 		sumMagToks  int64
+		// 窗口整体偏差只统计「双侧都有账」的可比分组（sumCmpMag / sumAbsDelta / cmpGroups）：
+		// 单侧缺账（含「灵枢只有估算单」）不参与偏差判定，只进 absent_in_*（设计稿 §5）。
+		// 旧实现把单侧组也算进分子/分母：只有估算单时 dev_pct=100、单侧缺账时 93.9%，
+		// 与「estimated 不计入主口径」「单侧缺账不做偏差判定」两条口径直接冲突（Owl 实测 P1）。
+		sumCmpMag   int64
 		sumAbsDelta int64
+		cmpGroups   int
 	)
 	for _, k := range keys {
 		ls := localMain[k]
@@ -295,13 +301,16 @@ func compareWindow(start, end time.Time, local, magpie []Group, prevStreak int) 
 		w.ReqCountMag += mg.Requests
 		sumLSTokens += ls.Tokens()
 		sumMagToks += mg.Tokens()
-		sumAbsDelta += absInt64(ls.Input-mg.Input) + absInt64(ls.CacheRead-mg.CacheRead) + absInt64(ls.Output-mg.Output)
 
 		// 只有两侧都有账单的分组才谈得上比对：单侧缺账（含灵枢只有估算单）
-		// 记进 absent_in_* 供人工定位，不做偏差报警。
+		// 记进 absent_in_* 供人工定位，不做偏差报警、也不进窗口偏差的分子/分母。
 		if ls.Requests == 0 || mg.Requests == 0 {
 			continue
 		}
+		cmpGroups++
+		sumCmpMag += mg.Tokens()
+		sumAbsDelta += absInt64(ls.Input-mg.Input) + absInt64(ls.CacheRead-mg.CacheRead) + absInt64(ls.Output-mg.Output)
+
 		// 分组判定：样本门槛 + 任一段相对偏差 > 5%（分母=代理侧）。
 		if mg.Requests < GroupMinRequests {
 			continue
@@ -319,13 +328,14 @@ func compareWindow(start, end time.Time, local, magpie []Group, prevStreak int) 
 	w.TokensLS = Group{Input: sumSeg(localMain, "input"), CacheRead: sumSeg(localMain, "cache_read"), Output: sumSeg(localMain, "output")}
 	w.TokensMag = Group{Input: sumSeg(magpieMap, "input"), CacheRead: sumSeg(magpieMap, "cache_read"), Output: sumSeg(magpieMap, "output")}
 
-	// 窗口整体加权偏差（%）：Σ|ls-magpie| / Σmagpie；分母为 0 时无从比较。
-	if sumMagToks > 0 {
-		pct := float64(sumAbsDelta) / float64(sumMagToks) * 100
+	// 窗口整体加权偏差（%）：Σ|ls-magpie| / Σmagpie，只在上面的**可比分组**上算；
+	// 分母为 0（没有任何双侧都有账的分组）时无从比较，DevPct 保持 nil。
+	if sumCmpMag > 0 {
+		pct := float64(sumAbsDelta) / float64(sumCmpMag) * 100
 		w.DevPct = &pct
 	}
 
-	windowAlarm := w.DevPct != nil && *w.DevPct > WindowThresholdPct && sumMagToks >= WindowMinTokens
+	windowAlarm := w.DevPct != nil && *w.DevPct > WindowThresholdPct && sumCmpMag >= WindowMinTokens
 	if len(alarmGroups) > 0 || windowAlarm {
 		w.Status = "alarm"
 		w.AlarmStreak = prevStreak + 1
@@ -340,15 +350,18 @@ func compareWindow(start, end time.Time, local, magpie []Group, prevStreak int) 
 			"window_pct": WindowThresholdPct, "window_min_tokens": WindowMinTokens,
 			"escalate_streak": EscalateStreak,
 		},
-		"window_alarm":       windowAlarm,
-		"alarm_groups":       alarmGroups,
-		"token_sum_magpie":   sumMagToks,
-		"token_sum_ls":       sumLSTokens,
-		"absent_in_magpie":   absentGroups(localMain, magpieMap),
-		"absent_in_ls":       absentGroups(magpieMap, localMain),
-		"estimated_groups":   estimatedGroups,
-		"estimated_tokens":   estimatedTokens,
-		"req_count_mismatch": w.ReqCountLS != w.ReqCountMag,
+		"window_alarm":     windowAlarm,
+		"alarm_groups":     alarmGroups,
+		"token_sum_magpie": sumMagToks,
+		"token_sum_ls":     sumLSTokens,
+		// 偏差口径可见性：分母只含可比分组，单侧缺账不参与（dev_pct 为 nil 时看这三项）。
+		"compared_groups":           cmpGroups,
+		"token_sum_magpie_compared": sumCmpMag,
+		"absent_in_magpie":          absentGroups(localMain, magpieMap),
+		"absent_in_ls":              absentGroups(magpieMap, localMain),
+		"estimated_groups":          estimatedGroups,
+		"estimated_tokens":          estimatedTokens,
+		"req_count_mismatch":        w.ReqCountLS != w.ReqCountMag,
 	}
 	return w
 }

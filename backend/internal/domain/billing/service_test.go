@@ -131,6 +131,13 @@ func newTxTestService(db *sql.DB, credit *fakeCredit, cfg ConfigProvider, now ti
 	return svc
 }
 
+// failingTxBeginner 模拟拿不到事务（连接池耗尽 / DB 不可用）。
+type failingTxBeginner struct{ err error }
+
+func (f failingTxBeginner) BeginTx(context.Context, *sql.TxOptions) (*sql.Tx, error) {
+	return nil, f.err
+}
+
 // ---- tests ----
 
 func TestRecord_Idempotent_AlreadyCompleted(t *testing.T) {
@@ -734,9 +741,10 @@ func TestRecord_TxPath_ConsumeError_RollsBackAndRecordsFailed(t *testing.T) {
 	}
 }
 
-// 事务路径账单写入失败：Rollback（扣款一并回滚，余额不变）后回退非事务路径，
-// 由重试队列兜底；本次只应扣款一次（事务内的那次已回滚）。
-func TestRecord_TxPath_InsertFailure_FallsBackToPlain(t *testing.T) {
+// 事务路径账单写入失败：Rollback（扣款一并回滚，余额不变）后**不再回退非事务路径**。
+// 旧行为是回退 settlePlain：那会在事务外真扣一次，而调用方只退预扣 →
+// 「钱扣了、账单 failed/0」的双记账（复审 P2）。现在一律上抛，由调用方退预扣 + 落 failed 账单 + 审计。
+func TestRecord_TxPath_InsertFailure_NoPlainFallback(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock: %v", err)
@@ -752,13 +760,10 @@ func TestRecord_TxPath_InsertFailure_FallsBackToPlain(t *testing.T) {
 	before, after := 10.0, 9.7632
 
 	mock.ExpectQuery(selectByBillingID.String()).WithArgs(billingID).WillReturnError(sql.ErrNoRows)
-	// 事务内账单写入失败 → 回滚。
 	mock.ExpectBegin()
 	mock.ExpectQuery(insertBill.String()).WillReturnError(errors.New("tx insert boom"))
 	mock.ExpectRollback()
-	// 回退非事务路径：扣款 + 账单 Insert 成功。
-	mock.ExpectQuery(insertBill.String()).WithArgs(txInsertArgs(credits, before, after, "completed")...).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(3), time.Now()))
+	_ = credits
 
 	credit := &fakeCredit{before: before, after: after}
 	svc := newTxTestService(db, credit, newFakeConfig(), time.Date(2026, 1, 2, 12, 0, 0, 0, shLocForTest(t)))
@@ -768,17 +773,41 @@ func TestRecord_TxPath_InsertFailure_FallsBackToPlain(t *testing.T) {
 		ExternalModel: "ext-model", InternalModelID: "int-model", ChannelKeyID: 1, SessionID: "sess-1",
 		Tokens: usage, Rates: rates,
 	})
-	if err != nil {
-		t.Fatalf("回退非事务路径后应成功, got %v", err)
+	if err == nil || rec != nil {
+		t.Fatalf("事务写库失败必须上抛, got rec=%+v err=%v", rec, err)
 	}
-	if rec.Status != StatusCompleted {
-		t.Fatalf("status=%s, want completed", rec.Status)
-	}
-	if credit.txCalls != 1 || credit.calls != 1 {
-		t.Fatalf("应事务一次 + 回退一次, tx=%d plain=%d", credit.txCalls, credit.calls)
+	if credit.txCalls != 1 || credit.calls != 0 {
+		t.Fatalf("不得退回非事务路径再扣一次: tx=%d plain=%d", credit.txCalls, credit.calls)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("mock expectations: %v", err)
+	}
+}
+
+// 注入事务后连 BeginTx 失败也不许退回非事务路径（否则同样在事务外扣一次钱）。
+func TestRecord_TxBeginFailure_NoPlainFallback(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	mock.ExpectQuery(selectByBillingID.String()).WithArgs(billingID).WillReturnError(sql.ErrNoRows)
+
+	credit := &fakeCredit{before: 10, after: 9}
+	svc := newTxTestService(db, credit, newFakeConfig(), time.Date(2026, 1, 2, 12, 0, 0, 0, shLocForTest(t)))
+	svc.SetTxBeginner(failingTxBeginner{err: errors.New("pool exhausted")})
+
+	rec, err := svc.Record(context.Background(), RecordReq{
+		BillingID: billingID, UserID: testUserID, PricingMode: "sale",
+		ExternalModel: "ext-model", InternalModelID: "int-model", ChannelKeyID: 1, SessionID: "sess-1",
+		Tokens: Usage{Input: 1234, Output: 567}, Rates: fullRates(),
+	})
+	if err == nil || rec != nil {
+		t.Fatalf("拿不到事务必须上抛, got rec=%+v err=%v", rec, err)
+	}
+	if credit.calls != 0 || credit.txCalls != 0 {
+		t.Fatalf("不得在事务外扣款: plain=%d tx=%d", credit.calls, credit.txCalls)
 	}
 }
 

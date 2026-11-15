@@ -326,11 +326,12 @@ func groupsFromItems(items []map[string]any, envelope map[string]json.RawMessage
 			rep.RetriedRecords++
 		}
 		g := Group{CallerKey: key, Model: model, Input: input, CacheRead: cacheRead, Output: output}
-		if !hasFailed && !hasRetried {
-			// 逐笔字段缺省时按「一笔一条」的旧形状处理（仍会被报告标成不可对账）。
-			g.Requests = 1
-		} else {
-			g.Requests = 1
+		// 笔数：逐笔形状默认 1 笔；**聚合形状**（一条 item 代表 N 笔）要取它自带的
+		// `requests`/`count`/`calls`。忽略它会让两臂都恒定 Requests=1 →
+		// 分组样本门槛（≥5 笔）永不满足、`req_count_mismatch` 恒真（复审 P2）。
+		g.Requests = 1
+		if n, ok := pickIntOK(it, "requests", "request_count", "count", "calls"); ok && n > 0 {
+			g.Requests = n
 		}
 		k := g.groupKey()
 		cur := agg[k]

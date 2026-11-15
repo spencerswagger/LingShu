@@ -132,6 +132,84 @@ func TestCompareWindow_PureNormalGroupStillCompared(t *testing.T) {
 	}
 }
 
+// 场景①：灵枢只有估算单、代理侧真实用量与估算值**完全一致** → 不得给出偏差结论、不报警。
+// 旧实现把「只有估算单」的组算进窗口分子/分母（localMain 空 → ls 侧全 0），
+// 实测 dev_pct=100 且 alarm，与设计稿「estimated 不计入主口径」直接冲突（复审 P1）。
+func TestCompareWindow_OnlyEstimatedLocalNoWindowDeviation(t *testing.T) {
+	local := []Group{{CallerKey: "k1", Model: "m1", Requests: 5, Input: 15000, Output: 5000, Estimated: true}}
+	magpie := []Group{g("k1", "m1", 5, 15000, 0, 5000)}
+
+	w := compareWindow(wStart, wEnd, local, magpie, 0)
+	if w.DevPct != nil {
+		t.Fatalf("只有估算单时不得给出偏差结论: dev_pct=%v", *w.DevPct)
+	}
+	if w.Status != "ok" || w.AlarmStreak != 0 {
+		t.Fatalf("不得报警: status=%s streak=%d detail=%+v", w.Status, w.AlarmStreak, w.Detail)
+	}
+	if w.Detail["compared_groups"] != 0 || w.Detail["token_sum_magpie_compared"] != int64(0) {
+		t.Fatalf("偏差口径的可比分组应为 0: %+v", w.Detail)
+	}
+	// 报告口径仍要看得见代理侧全量（否则运维会以为没数据）。
+	if w.Detail["token_sum_magpie"] != int64(20000) {
+		t.Fatalf("token_sum_magpie 应保留全量: %+v", w.Detail)
+	}
+	if absent, _ := w.Detail["absent_in_ls"].([]string); len(absent) != 1 {
+		t.Fatalf("应记成灵枢缺真实账: %v", w.Detail["absent_in_ls"])
+	}
+}
+
+// 场景②：单侧缺账（灵枢 16000 一组、代理侧 4000 另一组）→ 不出偏差结论、不报警；
+// 只记进 absent_in_*（设计稿「单侧缺账不做偏差判定」）。
+// 旧实现：分子 20000 / 分母 4000 → dev_pct=500%。
+func TestCompareWindow_SingleSideMissingNoWindowDeviation(t *testing.T) {
+	local := []Group{g("k1", "m1", 10, 16000, 0, 0)}
+	magpie := []Group{g("k2", "m2", 10, 4000, 0, 0)}
+
+	w := compareWindow(wStart, wEnd, local, magpie, 0)
+	if w.DevPct != nil {
+		t.Fatalf("单侧缺账不得给出偏差结论: dev_pct=%v", *w.DevPct)
+	}
+	if w.Status != "ok" {
+		t.Fatalf("status=%s（单侧缺账不该报警）: %+v", w.Status, w.Detail)
+	}
+	absentLS, _ := w.Detail["absent_in_ls"].([]string)
+	absentMag, _ := w.Detail["absent_in_magpie"].([]string)
+	if len(absentLS) != 1 || len(absentMag) != 1 {
+		t.Fatalf("两侧缺账都要留痕: ls=%v magpie=%v", absentLS, absentMag)
+	}
+	if w.Detail["compared_groups"] != 0 {
+		t.Fatalf("可比分组=%v", w.Detail["compared_groups"])
+	}
+}
+
+// 可比分组与单侧缺账混在一起：偏差只按可比分组算（单侧缺账不稀释也不放大分子/分母）。
+func TestCompareWindow_DeviationOnlyOverComparableGroups(t *testing.T) {
+	local := []Group{
+		g("k1", "m1", 10, 1000, 0, 1000), // 与代理侧一致
+		g("k9", "m9", 10, 16000, 0, 0),   // 代理侧没有 → 单侧缺账
+	}
+	magpie := []Group{
+		g("k1", "m1", 10, 1000, 0, 1000),
+		g("k8", "m8", 10, 4000, 0, 0), // 灵枢没有 → 单侧缺账
+	}
+	w := compareWindow(wStart, wEnd, local, magpie, 0)
+	if w.DevPct == nil {
+		t.Fatalf("可比分组完全一致时 dev_pct 应为 0，实际为 nil")
+	}
+	if *w.DevPct != 0 {
+		t.Fatalf("可比分组完全一致时 dev_pct 应为 0，实际 %v", *w.DevPct)
+	}
+	if w.Status != "ok" {
+		t.Fatalf("status=%s（旧实现这里是 alarm）", w.Status)
+	}
+	if w.Detail["compared_groups"] != 1 || w.Detail["token_sum_magpie_compared"] != int64(2000) {
+		t.Fatalf("偏差口径只看可比分组: %+v", w.Detail)
+	}
+	if w.Detail["token_sum_magpie"] != int64(6000) {
+		t.Fatalf("报告口径仍是全量: %+v", w.Detail)
+	}
+}
+
 // 只有估算单的组：记进 absent_in_ls（灵枢只有估算单），但不参与偏差判定。
 func TestCompareWindow_OnlyEstimatedGroupNotCompared(t *testing.T) {
 	local := []Group{{CallerKey: "k2", Model: "m2", Requests: 5, Input: 900, Estimated: true}}

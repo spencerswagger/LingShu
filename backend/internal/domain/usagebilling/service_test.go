@@ -24,6 +24,8 @@ type fakeBilling struct {
 	estCalls   []estCall
 	recs       []billing.RecordReq
 	recErr     error
+	// recBudget 记录每次 Record 收到的 ctx 还剩多少 deadline（0 = 没有 deadline）。
+	recBudget []time.Duration
 }
 
 func (f *fakeBilling) EstimateCredits(_ context.Context, req billing.RecordReq) (float64, error) {
@@ -31,7 +33,12 @@ func (f *fakeBilling) EstimateCredits(_ context.Context, req billing.RecordReq) 
 	return f.estCredits, f.estErr
 }
 
-func (f *fakeBilling) Record(_ context.Context, req billing.RecordReq) (*billing.Record, error) {
+func (f *fakeBilling) Record(ctx context.Context, req billing.RecordReq) (*billing.Record, error) {
+	if dl, ok := ctx.Deadline(); ok {
+		f.recBudget = append(f.recBudget, time.Until(dl))
+	} else {
+		f.recBudget = append(f.recBudget, 0)
+	}
 	f.recs = append(f.recs, req)
 	if f.recErr != nil {
 		return nil, f.recErr
@@ -242,6 +249,27 @@ func TestSettle_NoUsageMarksEstimated(t *testing.T) {
 	}
 	if rec.Tokens.Input <= 0 || rec.Tokens.Output != 200 {
 		t.Fatalf("估算 tokens=%+v", rec.Tokens)
+	}
+}
+
+// 结算必须有 deadline：转发层用 context.WithoutCancel 调 hook（连 deadline 一起去掉），
+// 一旦 DB 卡住这条 goroutine 会永久挂着（复审 P2）。
+func TestSettle_SetsDeadlineOnBillingCalls(t *testing.T) {
+	res := magpie.Result{
+		Status: 200, Usage: magpie.Usage{Input: 10, Output: 5}, HasUsage: true,
+	}
+	s, b, _, res := settlementFixture(t, res)
+	// 模拟转发层：WithoutCancel 之后没有 deadline。
+	s.Settle(context.WithoutCancel(context.Background()), res)
+
+	if len(b.recBudget) != 1 {
+		t.Fatalf("Record 调用次数=%d", len(b.recBudget))
+	}
+	if b.recBudget[0] <= 0 {
+		t.Fatalf("结算调用必须带 deadline（否则卡死的 DB 会永久挂住 goroutine）")
+	}
+	if b.recBudget[0] > settleTimeout {
+		t.Fatalf("deadline 超出上限: %s > %s", b.recBudget[0], settleTimeout)
 	}
 }
 

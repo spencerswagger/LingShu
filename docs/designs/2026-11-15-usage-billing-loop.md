@@ -102,3 +102,24 @@ client → 灵枢 facade（准入）
 4. **advisory lock 必须在同一连接**：会话级锁在连接池上取/解，解锁会落到别的连接 →
    锁泄漏、后续窗口恒拿不到 → 对账静默停摆。用 `db.Conn` 固定连接，解锁返回值显式检查；
    拿不到锁累计 `LockSkips` 并打 WARN（宁可噪声，也不能静默）。
+
+## 8. 第二轮复审（1 条 P1 + 4 条评估）
+
+1. **窗口偏差只算「可比分组」（P1，已修）**：`dev_pct` 的分子/分母只取**双侧都有账**的分组。
+   旧实现把单侧缺账的组也算进分子/分母，于是「灵枢只有估算单、代理侧真实用量与估算完全一致
+   （15000+5000）」算出 `dev_pct=100` 并告警；「单侧缺账」也会给出 90%+ 的假偏差——与本节
+   「estimated 不计入主口径」「单侧缺账不做偏差判定」两条直接冲突。
+   现状：`compared_groups` / `token_sum_magpie_compared` 进 `detail`（`dev_pct=null` 时可解释原因）；
+   报告口径 `token_sum_ls` / `token_sum_magpie` 仍是**全量**（运维要看得到代理侧有没有数据）。
+2. **账本聚合形状的笔数（已修）**：一条 item 自带 `requests` / `request_count` / `count` / `calls` 时
+   按它计数（默认 1 笔）。忽略它会让两臂都恒定 `Requests=1` → 分组样本门槛（≥5 笔）永不满足、
+   `req_count_mismatch` 恒真。
+3. **结算必须有 deadline（已修）**：`Settle` 由转发层以 `context.WithoutCancel` 调用（连 deadline
+   一起去掉），DB 卡住会永久占住一条 goroutine；入口补 `settleTimeout=30s`。
+4. **不再退回非事务结算（已修）**：注入事务后 `settleLedger` 一律走事务、失败直接上抛。
+   旧实现在事务提交前失败时退回 `settlePlain` —— 那条路会在事务外**真扣一次**，而调用方
+   （usagebilling）只知道「结算失败」、只退预扣 ⇒ 差额被扣走且账单是 failed/0 = 双记账。
+5. **`LocalGroups` 只取 completed（不改）**：与代理侧「failed 单不参与 token 对比」对称，
+   单侧改成计入 failed 会变成反向不一致；要动必须两侧同时改，属**口径变更**，需产品/架构拍板。
+   现存盲区：灵枢结算失败的请求（有 usage、被退款）代理侧算成功、灵枢不算 → 该组偏差会报到
+   `absent_in_ls`，属于「已知且可定位」，另有 `billing_anomaly` 审计兜底。
