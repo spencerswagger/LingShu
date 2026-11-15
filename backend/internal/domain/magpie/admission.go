@@ -208,12 +208,17 @@ func ExtractPlainToken(h http.Header) string {
 // ExtractRequestToken 取调用凭据，并报告是否来自 query（Gemini 原生 ?key=）。
 //
 // fromQuery=true 时调用方**必须**把该参数从转发查询串里剔除：否则租户令牌会被带到上游。
+//
+// 键名判定必须与剔除（stripQueryParam）走同一套解码口径：用 net/url 的 Query() 判定、
+// 按原始字面剔除，会让 `?ke%79=<令牌>` 这种编码变体「判定带了、实际剔不掉」（回归 P1-1）。
 func ExtractRequestToken(r *http.Request) (plain string, fromQuery bool) {
 	if v := ExtractPlainToken(r.Header); v != "" {
 		return v, false
 	}
-	if v := strings.TrimSpace(r.URL.Query().Get("key")); v != "" {
-		return v, true
+	if v, ok := queryParamValue(r.URL.RawQuery, "key"); ok {
+		if v = strings.TrimSpace(v); v != "" {
+			return v, true
+		}
 	}
 	return "", false
 }

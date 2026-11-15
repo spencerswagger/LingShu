@@ -31,8 +31,10 @@ type Prepared struct {
 	Body []byte
 	// StreamRequested 表示请求体声明了流式（body.stream=true）。
 	StreamRequested bool
-	// StripQueryKey 表示本次鉴权用的是 query 里的 key（Gemini 原生写法），
-	// 转发时该参数必须剔除：否则租户令牌会被带到上游。
+	// StripQueryKey 表示转发时必须剔除 query 里的 key 参数。
+	// 判定按**解码后键名**且与剔除同源（query.go）：无论本次鉴权用的是 query 里的 key
+	// （Gemini 原生写法）还是请求头，只要 query 里出现 key 就剔——头鉴权 + 同时带 ?key=
+	// 那条路曾经漏剔，租户令牌照样出境（回归 P1-1）。
 	StripQueryKey bool
 }
 
@@ -195,7 +197,7 @@ func (h *Handler) handleProxy(w http.ResponseWriter, r *http.Request) {
 		CallerKeyName: dec.KeyName,
 		UpstreamPath:  route.UpstreamPath,
 		Body:          body,
-		StripQueryKey: fromQuery,
+		StripQueryKey: fromQuery || hasQueryParam(r.URL.RawQuery, "key"),
 	}
 	if route.ModelInPath {
 		p, err := rewritePathModel(r.URL.Path, dec.MagpieModel)
