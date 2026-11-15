@@ -388,6 +388,12 @@ type RoundResult struct {
 	ScanStart time.Time
 	// ResumeOffset 是本轮开始时的 offset（0 = 从头拉；>0 = 上一轮 blocked 留下的位置）。
 	ResumeOffset int64
+	// Empty 表示本轮**一条都没拉到**（Fetched == Inserted == 0）。
+	//
+	// 这个字段存在的理由：以前「空轮」与「正常轮」返回值完全一样（0 行 + nil），
+	// 后台 ticker 每分钟静默空转，账本/计数列永远是 NULL 也没人知道。
+	// 现在空轮会打一条 WARN（sync.round empty）并置位，调用方可以据此做指标/告警。
+	Empty bool
 }
 
 // RounderOptions 是 NewRounder 的入参。
@@ -621,6 +627,17 @@ func (r *Rounder) RunOnce(ctx context.Context) (RoundResult, error) {
 				"scroll_offset", offset, "err", blockedErr.Error())
 			return result, blockedErr
 		}
+	}
+
+	// 空轮可观测（F9/P1 复验项）：0 行 + nil 不许静默。
+	// 首轮无水位线时空是正常的（上游本来就没数据），但稳态下每分钟都空说明上游没数据、
+	// 窗口没覆盖到、或凭据/端点错了——必须能在日志里看见，而不是「什么都没发生」。
+	if result.Fetched == 0 && result.Inserted == 0 {
+		result.Empty = true
+		log.Warn("本轮同步未拉到任何账本条目（空轮）",
+			"window", w.String(), "scan_start", scanStart.Format(time.RFC3339),
+			"pages", result.Pages, "resume_offset", result.ResumeOffset,
+			"hint", "上游无数据 / 窗口未覆盖 / 凭据或端点配置错误")
 	}
 
 	// 收尾：把最新窗口置 ok（推进水位线），并把 [ClearFrom, End) 里仍挂 blocked/error 的行

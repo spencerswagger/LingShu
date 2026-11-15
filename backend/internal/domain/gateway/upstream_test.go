@@ -329,16 +329,19 @@ func TestV2_F8_ResponseHeaderScrub(t *testing.T) {
 	cfg.Degrade = upstream.Degrade{PassthroughEnabled: true}
 	h := newV2Harness(t, cfg)
 	h.respHead = http.Header{
-		"Content-Type":                 []string{"application/json"},
-		"server":                       []string{"magpie/2.1"},
-		"x-magpie-route":               []string{"r-7"},
-		"x-magpie-account":             []string{"acct-1"},
-		"x-upstream-region":            []string{"cn-1"},
-		"x-provider":                   []string{"openai"},            // 头名带供应商
-		"x-served-by":                  []string{"edge-3"},            // 身份类头名
-		"x-note":                       []string{"powered by gemini"}, // 取值带供应商
-		"x-request-id":                 []string{"upstream-rid"},      // 必须被覆盖
-		"anthropic-ratelimit-requests": []string{"99"},                // 该透传
+		"Content-Type":          []string{"application/json"},
+		"server":                []string{"magpie/2.1"},
+		"x-magpie-route":        []string{"r-7"},
+		"x-magpie-account":      []string{"acct-1"},
+		"x-upstream-region":     []string{"cn-1"},
+		"x-provider":            []string{"openai"},            // 头名带供应商
+		"x-served-by":           []string{"edge-3"},            // 身份类头名
+		"x-note":                []string{"powered by gemini"}, // 取值带供应商
+		"x-request-id":          []string{"upstream-rid"},      // 必须被覆盖
+		"X-OpenAI-Organization": []string{"org-1"},             // Gate 漏点①
+		"OpenAI-Processing-Ms":  []string{"12"},                // Gate 漏点②
+		"OpenAI-Version":        []string{"2020-10-01"},        // Gate 漏点③
+		"x-ratelimit-limit":     []string{"99"},                // 通用限流头：该透传
 	}
 	h.respBody = []byte(`{"id":"x","choices":[]}`)
 
@@ -347,7 +350,8 @@ func TestV2_F8_ResponseHeaderScrub(t *testing.T) {
 		t.Fatalf("期望 200，got %d: %s", rec.Code, rec.Body.String())
 	}
 	for _, name := range []string{"server", "x-magpie-route", "x-magpie-account",
-		"x-upstream-region", "x-provider", "x-served-by", "x-note"} {
+		"x-upstream-region", "x-provider", "x-served-by", "x-note",
+		"X-OpenAI-Organization", "OpenAI-Processing-Ms", "OpenAI-Version"} {
 		if v := rec.Header().Get(name); v != "" {
 			t.Fatalf("F8：%s 不该到达客户端，仍收到 %q", name, v)
 		}
@@ -359,8 +363,8 @@ func TestV2_F8_ResponseHeaderScrub(t *testing.T) {
 	if got == "upstream-rid" {
 		t.Fatal("F8：上游的 x-request-id 不许透传")
 	}
-	if rec.Header().Get("anthropic-ratelimit-requests") != "99" {
-		t.Fatal("限流类可观测头不该被剥")
+	if rec.Header().Get("x-ratelimit-limit") != "99" {
+		t.Fatal("通用限流头不该被剥（证明不是一刀切）")
 	}
 }
 

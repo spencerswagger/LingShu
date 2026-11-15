@@ -61,6 +61,33 @@
   所有「本批内 0024 必须最后 / 只允许 0024 破坏性」的断言都以 `[0019, 0025)` 为界——后续批加 0025 不会把本批守卫打红。
 - F10 用 `NOT VALID`；F1 仍是**两键**（`stream_first_byte_ms` / `stream_idle_ms`）+ `connect 10s`、`request 600s` 作代码常量。
 
+## 0.2 Gate 复验（`e7d49ac`）后修三处（2026-11-15 深夜）
+
+### 改动清单（文件 → 改了什么 → 对应用例）
+
+| 文件 | 改了什么 | 用例 |
+| --- | --- | --- |
+| `internal/domain/magpie/headers.go` | **接线 `hasVendorToken`**：头名含供应商/渠道/账号名一律剔（子串、大小写不敏感），并把 `goog` 补进名单。此前 `hasVendorToken` 是死代码，`ShouldDropResponseHeader("OpenAI-Organization",…)` 返回 false | `TestShouldDropResponseHeader_F8Classes`（17 行判定表，含 Gate 漏的三类）、`TestForward_VendorIdentityHeadersDropped`、`TestV2_F8_ResponseHeaderScrub`（端到端） |
+| 同上 | 代价写进注释：`anthropic-ratelimit-*` 这类「供应商前缀 + 正常语义」的头也一并剥（身份泄漏不可逆，要改回来属新裁定）；通用 `x-ratelimit-limit` 仍透传，证明不是一刀切 | `TestForward_ResponseBytesIdentical`、`TestForward_VendorIdentityHeadersDropped` |
+| 同上 | 确认 `x-request-id` 归灵枢：上游即使发多个同名值（大小写混用）也只留我们那一个 | `TestForward_OurRequestIDWinsOverUpstream` |
+| `cmd/server/main.go` | **装配同步轮次**：`NewHTTPLedgerSource`（env `UPSTREAM_LEDGER_URL` / `UPSTREAM_ADMIN_KEY` / `UPSTREAM_ADMIN_AUTH_HEADER`）→ 启动时 `ProbeLedgerOrder`（最近 30 分钟、200 条样本）→ `NewRounder` → 60s ticker，`sync_enabled` 关闭时整轮跳过，单轮 panic 打日志不带走进程 | 编译 + `-race`（`cmd/server` 包）、`TestRounder_*` |
+| `internal/domain/upstream/window.go` | `RoundResult.Empty` 新增：`Fetched==Inserted==0` 时置位并打 WARN（`本轮同步未拉到任何账本条目（空轮）`，带 window/scan_start/pages/resume_offset/hint）。此前空轮「0 行 + nil」完全静默 | `TestRounder_EmptyRoundIsObservable` |
+| `internal/domain/billing/query_requestid_integration_test.go` | 两处夹具补 `cost_source='none'`（F10 跨列 CHECK 要求「无成本则来源恰好 none」） | `TestListRecords_RequestIDFilter_Integrated`、`TestListRecords_GroupByRequest_UserIsolation_Integrated` |
+| `internal/domain/billing/attribution_pg_test.go` | `TestBilling_DimensionFromCallLogs` 改成 0024 之后的口径：断言 `billing_records/sessions.channel_key_id` 已删、`call_logs.channel_key_id` 保留、渠道族四张表已删；**行为段显式 Skip**（写路径仍写被删列 → 42703，属 P0 代码债） | 该用例本身（3 条 schema 断言 + Skip） |
+
+### 复跑结果
+
+- `go vet ./...`：0 输出；`gofmt -l`（本轮改动文件）：空。
+- `go test ./... -count=1`（无 DSN）：35 包全绿。
+- `go test -race`（magpie / gateway / upstream / db / cmd-server，带真库 DSN）：全绿。
+- 真库门禁：`TestGate_F4/F10/F10b/F7` 四条 PASS；`TestRounder_RealSQL_Backlog4200_TwoRounds`、`TestSQLWindowStore_RealSQL_SkippedWritableAndCountsWritten`、`TestPOC_UpstreamLedgerOrder_Mock` PASS，真实上游 POC 仍 SKIP（无 URL/凭据）。
+- **带 DSN 全量：由 9 红降到 8 红**，且 8 条**全部**是 0024 代码债（预期内，本批不动）：
+  - `billing`（3）：`TestAttribution_RealSchema_WriteAndReadBack`（写路径仍写 `channel_key_id` → 42703）、`TestListRecords_RequestIDFilter_Integrated`、`TestListRecords_GroupByRequest_UserIsolation_Integrated`（`recordCols` 仍选该列 → 42703）。
+    ⚠️ 订正 Gate 的归因：这 2 条不只是 `cost_source` 夹具问题——夹具补齐后它们**继续红**，红点移到读/写路径仍引用被删列。夹具修复本身有效（不再是 23514）。
+  - `console`（5）：`TestCostStats_CrossChannelFallback`、`TestStats_WindowAndPlaza`、`TestStats_WindowCalendarMode`、`TestStats_ResponseJSONShape`、`TestStats_SoftDeletedModelGoesUnmatched`（`relation "channels" does not exist`）。
+  - `TestBilling_DimensionFromCallLogs`：由红转 **SKIP**（口径已改，行为段等代码债修好再补）。
+- 变异验证：把 `hasVendorToken` 判定掐掉 → `TestShouldDropResponseHeader_F8Classes`（3 个子例）、`TestForward_VendorIdentityHeadersDropped`、`TestV2_F8_ResponseHeaderScrub` 同时转红，报错直接点名 `X-OpenAI-Organization`。
+
 ## 1. 改动清单（文件 → 改了什么 → 对应裁定）
 
 ### 迁移链（F4 / F2 / F7 / F9 / F10 / D4）
@@ -135,6 +162,22 @@
   - 把能力闸门挪到翻页之后 → `TestRounder_OrderUnprovenBlocksWithoutFetching` 红。
 
 ## 3. 未完成项与已知缺口（登记，不承诺已解决）
+
+### 3.0 0024 代码债（P0，**等上级授权后**才开工，本轮只登记）
+
+Gate 复验确认：0024 一执行，以下 7 处代码仍在引用被删列/表，必须与「五处代码摘除」同批上线，否则分支不能上线：
+
+| # | 债 | 表现 |
+| --- | --- | --- |
+| 1 | 鉴权查询仍读 `tokens.tag_id` | 带令牌请求 42703 |
+| 2 | 账单写路径仍写 `billing_records.channel_key_id` | 每笔账单失败并退预扣 |
+| 3 | 会话写入仍写 `sessions.channel_key_id` | 会话创建失败 42703 |
+| 4 | 账单/成本/统计 JOIN `channels` / `channel_keys` | console 5 条用例 42P01 |
+| 5 | 标签查询 `semantic_tags` / `channel_tags` | 标签接口 42P01 |
+| 6 | `recordCols` 仍选 `billing_records.channel_key_id` | 账单列表/详情/汇总 42703（上面 billing 3 条红） |
+| 7 | 读维度仍回落本表列（本批保留的过渡期兜底） | 列删后该回落分支必须一并摘除 |
+
+摘除范围 = auth / billing 读写 / session / console / tag 五处；本批不动。
 
 **A. 0024 与现有代码冲突（本件最大的未解决项）**
 

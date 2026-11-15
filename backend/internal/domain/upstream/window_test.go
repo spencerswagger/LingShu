@@ -1,10 +1,12 @@
 package upstream
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -700,5 +702,52 @@ func TestPOC_UpstreamLedgerOrder_Real(t *testing.T) {
 	t.Logf("POC 结论：order=%s samples=%d reason=%s", res.Order, res.Samples, res.Reason)
 	if res.Order != LedgerOrderSupported {
 		t.Fatalf("上游排序能力未达标（%s）：%s —— 需按 F9 走「本窗 blocked 不可清零」分支", res.Order, res.Reason)
+	}
+}
+
+// TestRounder_EmptyRoundIsObservable 覆盖 P1 复验项：空轮不许「0 行 + nil」静默。
+//
+// 以前空轮与正常轮返回值完全一样，后台 ticker 每分钟静默空转、计数列永远 NULL 也没人知道。
+// 现在空轮必须置 Empty 并打一条 WARN（日志是唯一的可观测点，用例断言这条日志存在）。
+func TestRounder_EmptyRoundIsObservable(t *testing.T) {
+	now := time.Date(2026, 11, 15, 10, 0, 0, 0, time.UTC)
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	src := &fakePageSource{pages: []Page{{Entries: nil, HasMore: false}}}
+	wins := NewMemoryWindowStore()
+	r := NewRounder(RounderOptions{
+		Source: src, Ledger: newFakeLedger(), Windows: wins,
+		Now: func() time.Time { return now }, Logger: logger,
+		LedgerOrder: LedgerOrderSupported,
+	})
+	res, err := r.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("空轮不该报错，got %v", err)
+	}
+	if !res.Empty {
+		t.Fatalf("空轮必须置 Empty（调用方据此告警），got %+v", res)
+	}
+	if !strings.Contains(buf.String(), "空轮") {
+		t.Fatalf("空轮必须留一条 WARN，日志：%s", buf.String())
+	}
+
+	// 非空轮不该被误标。
+	src2 := &fakePageSource{pages: []Page{{Entries: entries("led-1"), HasMore: false}}}
+	buf.Reset()
+	r2 := NewRounder(RounderOptions{
+		Source: src2, Ledger: newFakeLedger(), Windows: wins,
+		Now: func() time.Time { return now.Add(WindowSize) }, Logger: logger,
+		LedgerOrder: LedgerOrderSupported,
+	})
+	res2, err := r2.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("非空轮失败: %v", err)
+	}
+	if res2.Empty {
+		t.Fatalf("非空轮不该标 Empty，got %+v", res2)
+	}
+	if strings.Contains(buf.String(), "空轮") {
+		t.Fatalf("非空轮不该打空轮告警，日志：%s", buf.String())
 	}
 }

@@ -89,7 +89,7 @@ var responseDroppedExactly = map[string]bool{
 // 为什么按「值」也要判：上游常把供应商标识放在通用头里（`x-provider: <name>`、
 // `x-served-by: <name>`、`set-cookie: ... <name> ...`），只按头名剥必然漏。
 var vendorTokens = []string{
-	"magpie", "openai", "anthropic", "google", "gemini", "vertex", "azure",
+	"magpie", "openai", "anthropic", "google", "goog", "gemini", "vertex", "azure",
 	"bedrock", "xai", "deepseek", "moonshot", "mistral", "cohere", "groq",
 	"together", "fireworks", "openrouter", "siliconflow", "qwen", "zhipu",
 }
@@ -133,10 +133,17 @@ func ShouldDropResponseHeader(name, value string) bool {
 			return true
 		}
 	}
-	// 头名里带供应商名时，只对「身份类」头名动手（provider/account/vendor/…）：
-	// `anthropic-ratelimit-*` 这类确实是 Anthropic 客户端的正常可观测头，
-	// 按名字一刀切会把限流信息也剥掉，属于过度剥除。
-	// `x-served-by` 这类头名本身就是身份声明（不含供应商字面量），按身份词单独剥。
+	// 头名里出现供应商/渠道/账号名：**一律丢**（F8 原意，子串匹配、大小写不敏感）。
+	// 典型漏点：`X-OpenAI-Organization` / `OpenAI-Processing-Ms` / `OpenAI-Version`
+	// —— 名字带供应商名，但既不是 `x-magpie-` 前缀，值里也没有供应商字面量，
+	// 早前版本只查了「值 + 身份类词」，这三类会原样漏给下游。
+	// 代价：`anthropic-ratelimit-*` 这类「供应商前缀 + 正常语义」的头也会被剥掉。
+	// 这是刻意的取舍——身份泄漏不可逆，限流信息可以从别的途径补；要改回来属新裁定。
+	if hasVendorToken(lower) {
+		return true
+	}
+	// 头名本身是身份声明但不含供应商字面量（`x-served-by` / `x-account-owner`）：
+	// 按身份词单独剥，否则供应商把名字换成区域/代号就绕过去了。
 	if hasIdentityToken(lower) {
 		return true
 	}

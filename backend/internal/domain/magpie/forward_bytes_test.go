@@ -122,7 +122,7 @@ func TestForward_ResponseBytesIdentical(t *testing.T) {
 					w.Header().Set("x-powered-by", "magpie")
 					w.Header().Set("x-provider-note", "served by magpie")
 					w.Header().Set("x-request-id", "upstream-rid")
-					w.Header().Set("anthropic-ratelimit-requests-limit", "50")
+					w.Header().Set("x-ratelimit-limit", "50")
 					w.WriteHeader(http.StatusTeapot)
 					_, _ = w.Write(body)
 				}))
@@ -158,9 +158,13 @@ func TestForward_ResponseBytesIdentical(t *testing.T) {
 						t.Fatalf("头 %s 应被剔除，got %q", h, v)
 					}
 				}
-				// 保留上游给的限流头（不是标识头，运营要看）。
-				if rec.Header().Get("anthropic-ratelimit-requests-limit") != "50" {
-					t.Fatalf("非标识头应透传")
+				// 通用限流头（头名不含供应商名）必须透传——证明不是「一刀切全剥」。
+				if rec.Header().Get("x-ratelimit-limit") != "50" {
+					t.Fatalf("通用限流头应透传")
+				}
+				// 供应商前缀的限流头按 F8 原意一并剥掉（身份泄漏不可逆，取舍见 headers.go）。
+				if v := rec.Header().Get("anthropic-ratelimit-requests-limit"); v != "" {
+					t.Fatalf("头名含供应商名的头应剔除，got %q", v)
 				}
 				// x-request-id 必须是灵枢自己的。
 				if got := rec.Header().Get("x-request-id"); got != "our-rid" {
@@ -385,11 +389,14 @@ func TestForward_VendorIdentityHeadersDropped(t *testing.T) {
 		h.Set("x-magpie-route", "r1")
 		h.Set("x-magpie-account", "acct")
 		h.Set("x-upstream-model", "m")
-		h.Set("x-provider", "openai")                     // 名带供应商
-		h.Set("x-served-by", "some-vendor")               // 值带供应商
-		h.Set("x-note", "powered by anthropic")           // 值带供应商
-		h.Set("x-account-owner", "acme")                  // 身份类头名
-		h.Set("anthropic-ratelimit-requests-limit", "50") // 该透传
+		h.Set("x-provider", "openai")           // 名带供应商
+		h.Set("x-served-by", "some-vendor")     // 值带供应商
+		h.Set("x-note", "powered by anthropic") // 值带供应商
+		h.Set("x-account-owner", "acme")        // 身份类头名
+		h.Set("x-ratelimit-limit", "50")        // 通用限流头：该透传
+		h.Set("X-OpenAI-Organization", "org-1") // 头名含供应商名：Gate 实测漏出的三类之一
+		h.Set("OpenAI-Processing-Ms", "12")
+		h.Set("OpenAI-Version", "2020-10-01")
 		h.Set("x-request-id", "up-rid")
 		h.Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{}`))
@@ -409,10 +416,84 @@ func TestForward_VendorIdentityHeadersDropped(t *testing.T) {
 			t.Fatalf("F8 要求剔除 %s，仍漏出 %q", h, v)
 		}
 	}
-	if rec.Header().Get("anthropic-ratelimit-requests-limit") != "50" {
-		t.Fatal("限流类可观测头不该被过度剥除")
+	if rec.Header().Get("x-ratelimit-limit") != "50" {
+		t.Fatal("通用限流头不该被剥（证明不是一刀切）")
+	}
+	for _, h := range []string{"anthropic-ratelimit-requests-limit", "X-OpenAI-Organization",
+		"OpenAI-Processing-Ms", "OpenAI-Version"} {
+		if v := rec.Header().Get(h); v != "" {
+			t.Fatalf("头名含供应商名的头必须剔除，%s 仍漏出 %q", h, v)
+		}
 	}
 	if rec.Header().Get("x-request-id") != "our-rid" {
 		t.Fatalf("x-request-id 必须是灵枢自己的，got %q", rec.Header().Get("x-request-id"))
+	}
+}
+
+// TestShouldDropResponseHeader_F8Classes 是 F8 的**判定级**守卫表：
+// 「头名或头值含供应商/渠道/账号名一律剔」（子串、大小写不敏感）。
+//
+// Gate 实测漏出的三类（`X-OpenAI-Organization` / `OpenAI-Processing-Ms` / `OpenAI-Version`）
+// 必须在这里被显式钉住：它们的值是普通串、也不是 `x-magpie-` 前缀，
+// 只按「值 + 身份词」判就会全放过（早前版本正是这样，`hasVendorToken` 写了没接线）。
+func TestShouldDropResponseHeader_F8Classes(t *testing.T) {
+	cases := []struct {
+		name  string
+		value string
+		want  bool
+		why   string
+	}{
+		{"X-OpenAI-Organization", "org-1", true, "头名含供应商名（Gate 漏点①）"},
+		{"OpenAI-Processing-Ms", "12", true, "头名含供应商名（Gate 漏点②）"},
+		{"OpenAI-Version", "2020-10-01", true, "头名含供应商名（Gate 漏点③）"},
+		{"openai-organization", "x", true, "大小写不敏感"},
+		{"X-ANTHROPIC-Trace", "t", true, "头名含供应商名（大写）"},
+		{"x-goog-request-id", "r", true, "渠道/供应商名前缀"},
+		{"x-magpie-route", "r", true, "上游标识前缀"},
+		{"x-upstream-model", "m", true, "上游标识前缀"},
+		{"x-served-by", "edge-1", true, "身份类头名（不含供应商字面量）"},
+		{"x-account-owner", "acme", true, "身份类头名"},
+		{"x-note", "powered by gemini", true, "取值含供应商名"},
+		{"server", "nginx", true, "实现泄漏"},
+		{"x-powered-by", "php", true, "实现泄漏"},
+		{"via", "1.1 proxy", true, "链路泄漏"},
+		{"x-request-id", "up-rid", true, "上游同名头必须先丢，再写我们的"},
+		{"content-type", "application/json", false, "普通头必须透传"},
+		{"x-ratelimit-limit", "50", false, "通用限流头透传（不一刀切）"},
+		{"cache-control", "no-store", false, "普通头必须透传"},
+		{"x-request-cost", "0.02", false, "不含身份信息的业务头透传"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := ShouldDropResponseHeader(c.name, c.value); got != c.want {
+				t.Fatalf("ShouldDropResponseHeader(%q,%q)=%v, want %v（%s）",
+					c.name, c.value, got, c.want, c.why)
+			}
+		})
+	}
+}
+
+// TestForward_OurRequestIDWinsOverUpstream 断言 x-request-id 归灵枢：
+// 上游即使发多个同名值（大小写混用会被规范化成同一个键的多个值），下游只能看到我们那一个。
+func TestForward_OurRequestIDWinsOverUpstream(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Add("x-request-id", "up-1")
+		w.Header().Add("X-Request-Id", "up-2")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer up.Close()
+
+	f := NewForwarder()
+	rec := httptest.NewRecorder()
+	if res := f.Forward(t.Context(), rec, ForwardRequest{
+		BaseURL: up.URL, Path: "/v1/chat/completions", Header: http.Header{},
+		Body: []byte(`{"model":"m"}`), RequestID: "ours-1", Protocol: ProtocolOpenAIChat,
+	}, Timeouts{StreamFirstByte: 5 * time.Second, StreamIdle: 5 * time.Second}); res.Err != nil {
+		t.Fatalf("转发失败: %v", res.Err)
+	}
+	vals := rec.Header().Values("x-request-id")
+	if len(vals) != 1 || vals[0] != "ours-1" {
+		t.Fatalf("下游只该看到灵枢自己的 x-request-id（ours-1），got %v", vals)
 	}
 }

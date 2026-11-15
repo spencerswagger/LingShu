@@ -714,6 +714,72 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 		},
 		Logger: logr,
 	})
+	// F9：账本同步轮次（拉上游用量 → 幂等落 ledger_entries）。
+	//
+	// 装配三件事，缺一件就等于「同步跑不起来但没人知道」：
+	//  ① 分页源（上游用量接口，offset 翻页）；
+	//  ② **启动时跑一次排序能力探测**：结论不是 supported 时每轮只记 blocked、不翻页
+	//     （不许自己造排序，见 upstream.ProbeLedgerOrder）；
+	//  ③ 60s ticker + 空轮告警（`RunOnce` 的 Empty 会打 WARN，不再 0 行 + nil 静默空转）。
+	syncSrc := upstream.NewHTTPLedgerSource(
+		strings.TrimSpace(os.Getenv("UPSTREAM_LEDGER_URL")),
+		strings.TrimSpace(os.Getenv("UPSTREAM_ADMIN_KEY")),
+		strings.TrimSpace(os.Getenv("UPSTREAM_ADMIN_AUTH_HEADER")),
+		nil,
+	)
+	// 能力探测：拿最近 30 分钟当样本窗（真有一批数据才证得出排序）。
+	var order upstream.LedgerOrder
+	var orderWhy string
+	if strings.TrimSpace(os.Getenv("UPSTREAM_LEDGER_URL")) != "" {
+		probeWin := upstream.Window{Start: time.Now().Add(-30 * time.Minute), End: time.Now()}
+		probe := upstream.ProbeLedgerOrder(context.Background(), syncSrc, probeWin, 200)
+		order, orderWhy = probe.Order, probe.Reason
+		logr.Info("上游账本排序能力探测完成",
+			"order", probe.Order.String(), "samples", probe.Samples, "reason", probe.Reason)
+	} else {
+		orderWhy = "未配置 UPSTREAM_LEDGER_URL，未做能力探测"
+		logr.Warn("未配置上游账本端点，同步轮次将只记 blocked（不翻页）",
+			"env", "UPSTREAM_LEDGER_URL")
+	}
+	rounder := upstream.NewRounder(upstream.RounderOptions{
+		Source:            syncSrc,
+		Ledger:            upstream.NewLedgerStore(d),
+		Windows:           windowStore,
+		Now:               time.Now,
+		Logger:            logr,
+		LedgerOrder:       order,
+		LedgerOrderReason: orderWhy,
+	})
+	go func() {
+		// 60s 一跳：与窗口宽度同量级。
+		t := time.NewTicker(time.Minute)
+		defer t.Stop()
+		for range t.C {
+			func() {
+				defer func() {
+					if rec := recover(); rec != nil {
+						logr.Error("账本同步轮次 panic", "panic", rec)
+					}
+				}()
+				// 降级开关：sync 关 = 停摆（沿用上期数据），不是失败。
+				if c, _ := upstreamCfg.Load(context.Background()); !c.SyncActive() {
+					return
+				}
+				res, err := rounder.RunOnce(context.Background())
+				switch {
+				case res.Empty && err == nil:
+					// RunOnce 内部已打 WARN（sync.round empty），这里只补一条可聚合的计数口径。
+					logr.Warn("账本同步空轮（计数器）", "sync_round_empty", 1,
+						"window", res.Window.String())
+				case err != nil:
+					logr.Warn("账本同步轮次未完成", "err", err,
+						"window", res.Window.String(), "pages", res.Pages,
+						"fetched", res.Fetched, "inserted", res.Inserted)
+				}
+			}()
+		}
+	}()
+
 	go func() {
 		// 60s 一跳：与窗口宽度同量级，窗口结束后下一跳就能被算上。
 		t := time.NewTicker(time.Minute)
