@@ -64,9 +64,12 @@
    `SELECT billing_id, channel_key_id FROM call_logs WHERE billing_id IN (…)` 回填。
    - 为什么不用 `recordCols` 里的标量子查询：`recordCols` 被三条查询复用（直查 / 归并 CTE / 详情），
      子查询要么处处给外层表起别名，要么在归并里落到错误的表上；批量回填只有一次往返。
-   - 缺 `call_logs` 行（拒绝类账单）→ 留 0，与历史「未进入渠道」语义一致。
+   - 回填 SQL 同样是 `COALESCE(cl.channel_key_id, br.channel_key_id)`：缺快照时回落本表列；
+     两边都没有（拒绝类账单）→ 留 0，与历史「未进入渠道」语义一致。
 3. **过滤**：`recordWhereOn` 的 `channel_key_id = $2` 改成
-   `EXISTS (SELECT 1 FROM call_logs clk WHERE clk.billing_id = <外层>.billing_id AND clk.channel_key_id = $2)`。
+   `COALESCE((SELECT clk.channel_key_id FROM call_logs clk WHERE clk.billing_id = <外层>.billing_id), <外层>.channel_key_id) = $2`
+   —— 快照优先、缺行回落到本表列（**复审 R5**：`call_logs` 是异步写，毫秒级窗口 + 重试耗尽会永久缺行，
+   只认快照会把「列里有值」的账单读回 0、按渠道也筛不到）。回落那一半标注「随 0021 同批删除」。
    - **关联列必须限定到外层表**：写裸 `billing_id` 会解析成 `clk.billing_id = clk.billing_id`（恒真，
      PR #63 踩过同类坑）。无别名时固定用 `billing_records.billing_id`。
    - 参数位一个不平移（仍是 9 个），既有 SQL 断言只改谓词形状。
@@ -81,9 +84,9 @@
 | --- | --- | --- |
 | `TestListRecords_RequestIDFilter_Integrated` | ❌ 42703 `column "channel_key_id" does not exist` | ✅ PASS |
 | `TestListRecords_GroupByRequest_UserIsolation_Integrated` | ❌ 42703 | ✅ PASS |
-| `TestAttribution_RealSchema_0021Conflict`（冲突地雷） | ❌ 固定失败 | 已改判为 `TestBilling_Post0021Schema_DimensionFromCallLogs` ✅ PASS |
+| `TestAttribution_RealSchema_0021Conflict`（冲突地雷，已随 0021 摘出本批一并删除） | ❌ 固定失败 | 由 `TestBilling_DimensionFromCallLogs` 承接（读走快照 + 缺快照回落本表列 + 双向过滤）✅ PASS |
 | `TestAttribution_RealSchema_WriteAndReadBack` | 靠 `ADD COLUMN` hack 才能跑 | 删掉 hack ✅ PASS |
-| `TestPost0021Schema_RemainingBlockers` | — | 断言 schema 事实后 SKIP（明示剩余两处控制面） |
+| `TestPost0021Schema_RemainingBlockers` | — | **已删除**（它靠 0021 已执行的前提）；控制面剩余两处改在本文档 §5.2 与迁移守卫用例里说明 |
 
 新用例断言的不变量：插入成功 / 列表回填 42 与缺日志行回填 0 / 详情回填 / **按该维度过滤双向**
 （命中 1 条、不存在的密钥 0 条）/ 汇总可跑。
@@ -153,3 +156,21 @@
 - 不动 `internal/domain/channel/*`、`tag/*`、`probe_logs` 相关代码（随域下线整包处理）。
 - 不动 `call_logs` 的列（0021 明确保留，账单维度的唯一留存来源）。
 - 不动任何迁移文件、不改 any 对外字段与统计口径、不加新依赖。
+## 7. 本批未修、已登记（PR 描述照抄此节，**不得写成已解决**）
+
+复审列出的 7 项技术债，本批**一个都没修**，按原样登记：
+
+1. **`reconcile_windows.status` 一列两写入方**：对账把窗口置 `error` 会与水位线推进抢同一列，
+   极端时序下水位线会被拽回上一窗（重复对账，不会漏账）。
+2. **`ledger.go` 的 `ON CONFLICT DO NOTHING` 不回收上游修正**：同一 `ledger_id` 上游后补正确数值时，
+   本地保留首次值（金额口径宁少不多，但不会自愈）。
+3. **对账速率 20×200 = 4000 条/轮**：上游若持续 >33 条/秒，首轮就取不满、窗口永久 `blocked`
+   （不会误判通过，但也不会自愈）。
+4. **七归因列暂无读取方**：`request_id`/`upstream_*`/`ledger_entry_id`/`cost_source` 已落库，
+   查询侧只做了 `request_id` 归并与筛选，其余五列要等展示面设计。
+5. **`float64` → `NUMERIC(20,5)` 静默四舍五入**：金额在第 6 位小数被截断，未做入账前校验或告警。
+6. **异常类跳过彻底静默**：`SkipError` 里「配置异常」与「正常跳过」只有 INFO 日志区分（含时钟回拨），
+   没有计数/告警指标。
+7. **`parseSize` 无上界**：配置里给超大值会被接受（无上限校验），后续按该值预分配会放大内存。
+
+以上均为**已知、已登记、本批不修**；PR 描述只写「已登记」，不要承诺已解决。

@@ -165,14 +165,14 @@ func TestHandleListBillings_FilterParams(t *testing.T) {
 	)
 
 	// 列表默认按 request_id 归并（Group 缺省开启）：SQL 走 CTE grp，参数位不变。
-	mock.ExpectQuery(`SELECT count\(\*\) FROM \(\s*SELECT 1 FROM billing_records br LEFT JOIN call_logs cl .*EXISTS \(SELECT 1 FROM call_logs clk.*clk.channel_key_id = \$2.*session_id = \$4.*GROUP BY \(br.user_id::text \|\| ':' \|\| COALESCE`).
+	mock.ExpectQuery(`SELECT count\(\*\) FROM \(\s*SELECT 1 FROM billing_records br LEFT JOIN call_logs cl .*COALESCE\(\(SELECT clk\.channel_key_id FROM call_logs clk.*\), br\.channel_key_id\) = \$2.*session_id = \$4.*GROUP BY \(br.user_id::text \|\| ':' \|\| COALESCE`).
 		WithArgs(nil, int64(3), nil, "sess-1", "", "", "", nil, nil).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(1)))
 	mock.ExpectQuery(`WITH grp AS \(.*grp.rid, grp.cnt.*LIMIT \$10 OFFSET \$11`).
 		WithArgs(nil, int64(3), nil, "sess-1", "", "", "", nil, nil, 20, 0).
 		WillReturnRows(rows)
 	// 渠道密钥维度回填（billing_records 已无该列，来自 call_logs 的 1:1 快照）。
-	mock.ExpectQuery(`SELECT billing_id, channel_key_id FROM call_logs`).
+	mock.ExpectQuery(`SELECT br.billing_id, COALESCE\(cl.channel_key_id, br.channel_key_id\)`).
 		WithArgs("b1").
 		WillReturnRows(sqlmock.NewRows([]string{"billing_id", "channel_key_id"}).AddRow("b1", int64(3)))
 	// decorateList 反查（空结果：用户名缺失、密钥缺失触发 #<id> 兜底）。

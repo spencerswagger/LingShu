@@ -133,7 +133,7 @@ func TestRecordWhere_RequestIDQualified(t *testing.T) {
 	if len(args) != 10 {
 		t.Fatalf("args=%d, want 10", len(args))
 	}
-	for _, frag := range []string{"br.user_id = $1", "clk.billing_id = br.billing_id", "clk.channel_key_id = $2", "br.status = $7", "clr.request_id = $10"} {
+	for _, frag := range []string{"br.user_id = $1", "clk.billing_id = br.billing_id", "br.channel_key_id) = $2", "br.status = $7", "clr.request_id = $10"} {
 		if !containsAll(where, frag) {
 			t.Fatalf("where missing %q: %s", frag, where)
 		}
@@ -144,8 +144,9 @@ func TestRecordWhere_RequestIDQualified(t *testing.T) {
 	if len(args2) != 9 {
 		t.Fatalf("args=%d, want 9", len(args2))
 	}
-	if !containsAll(where2, "clk.billing_id = billing_records.billing_id") {
-		t.Fatalf("无别名时密钥维度必须限定到 billing_records: %s", where2)
+	if !containsAll(where2, "clk.billing_id = billing_records.billing_id") ||
+		!containsAll(where2, "billing_records.channel_key_id) = $2") {
+		t.Fatalf("无别名时密钥维度必须限定到 billing_records（COALESCE 的回落半边也是）: %s", where2)
 	}
 	if containsAll(where2, "clr.request_id") {
 		t.Fatalf("no request id should not add the request_id EXISTS: %s", where2)

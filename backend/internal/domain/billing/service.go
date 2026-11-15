@@ -390,7 +390,14 @@ func (s *Service) settleLedger(ctx context.Context, rec *Record, req RecordReq, 
 func (s *Service) settleTx(ctx context.Context, rec *Record, req RecordReq, credits float64) (out *Record, err error, done bool) {
 	tx, berr := s.txdb.BeginTx(ctx, nil)
 	if berr != nil {
-		return nil, berr, false
+		// ⚠️ 资金底线（2026-11-15 复审 R3）：事务开不起来时**绝不退回非事务路径**——
+		// 那条路是「先 Consume 真扣钱、再 Insert 落账」，事务不可用往往伴随库不可用，
+		// 于是钱扣了、账单写不进去（重试队列对确定性错误永远重试不成功）。
+		// 取舍：宁可不成交（本次不扣款、不落账，请求报错），也不出现「扣了钱没账」。
+		// 这里不重试 BeginTx：连接层问题由上层请求重试/连接池负责，账单侧重试没有意义。
+		slog.ErrorContext(ctx, "billing tx begin failed, abort without charging",
+			"billing_id", rec.BillingID, "user_id", rec.UserID, "err", berr)
+		return nil, fmt.Errorf("begin billing tx: %w", berr), true
 	}
 	defer tx.Rollback() //nolint:errcheck // Commit 成功后 Rollback 是 no-op
 
@@ -1100,7 +1107,7 @@ func (s *SqlStore) insertOn(ctx context.Context, ex dbx.Execer, rec *Record) (*R
 	return rec, nil
 }
 
-// fillChannelKeys 用 call_logs 的 1:1 快照回填渠道密钥维度（billing_records.channel_key_id 已被 0021 删除）。
+// fillChannelKeys 用 call_logs 的 1:1 快照回填渠道密钥维度，快照缺失时回落到本表列（过渡期兜底）。
 //
 // 为什么不写成 recordCols 里的标量子查询：recordCols 会被多表 JOIN/归并查询复用，加子查询要么
 // 需要给外层表起别名（三处查询各一套），要么在归并 CTE 里落到错误的表上；批量回填只有一次查询，
@@ -1133,9 +1140,16 @@ func fillChannelKeys(ctx context.Context, ex dbx.Execer, recs []*Record) error {
 		marks[i] = fmt.Sprintf("$%d", i+1)
 		args[i] = id
 	}
+	// 过渡期兜底（复审 R5）：call_logs 是**异步写**，有毫秒级窗口、重试耗尽还会永久缺行，
+	// 只认快照会把「列里有值」的账单读回 0。所以两侧取 COALESCE(快照, 本表列)：
+	// 有快照用快照（0021 之后唯一来源），没快照回落到列（0021 之前写的账）。
+	// 「br.channel_key_id」这一半随 0021 同批删除（那批要同时改这里与 recordWhereOn）。
 	rows, err := ex.QueryContext(ctx,
-		`SELECT billing_id, channel_key_id FROM call_logs
-		  WHERE billing_id IN (`+strings.Join(marks, ", ")+`) AND channel_key_id IS NOT NULL`, args...)
+		`SELECT br.billing_id, COALESCE(cl.channel_key_id, br.channel_key_id)
+		   FROM billing_records br
+		   LEFT JOIN call_logs cl ON cl.billing_id = br.billing_id
+		  WHERE br.billing_id IN (`+strings.Join(marks, ", ")+`)
+		    AND COALESCE(cl.channel_key_id, br.channel_key_id) IS NOT NULL`, args...)
 	if err != nil {
 		return fmt.Errorf("读取调用日志的渠道密钥维度失败：%w", err)
 	}

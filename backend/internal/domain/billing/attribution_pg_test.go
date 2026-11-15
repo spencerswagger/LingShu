@@ -210,11 +210,11 @@ func TestAttribution_RealSchema_WriteAndReadBack(t *testing.T) {
 	}
 }
 
-// TestBilling_Post0021Schema_DimensionFromCallLogs 断言 0021 全量迁移（列已删）之后，
-// 账单的**写入与查询**都不再依赖 channel_key_id：
-//   - 插入成功（写路径已不碰该列）；
-//   - 列表/详情/汇总可跑，且渠道密钥维度由 call_logs 的 1:1 快照回填（值不变）；
-//   - 按该维度过滤仍可用（EXISTS 到 call_logs，不是恒真也不是恒不命中）。
+// TestBilling_DimensionFromCallLogs 断言本批 schema（0019/0020/0022/0023，列还在）下账单的
+// 渠道密钥维度口径：
+//   - **读**由 call_logs 的 1:1 快照供数，缺快照时回落到本表列（过渡期兜底，0021 前两者同值）；
+//   - **写**仍写该列（INSERT 第 9 位仍是 channel_key_id，0021 一执行就会 42703 —— 摘写随 0021 同批）；
+//   - 按该维度过滤可用，且两个方向都断言（命中 1 条 / 不存在的密钥 0 条），防止恒真或恒假。
 func TestBilling_DimensionFromCallLogs(t *testing.T) {
 	conn := openAttributionTempDB(t)
 	seedBillingUser(t, conn)
@@ -236,6 +236,7 @@ func TestBilling_DimensionFromCallLogs(t *testing.T) {
 	for _, stmt := range []string{
 		`INSERT INTO channels(id, name, base_url) VALUES (42, 'ch-42', 'http://upstream.local')`,
 		`INSERT INTO channel_keys(id, channel_id, name, credential_enc) VALUES (42, 42, 'k-42', 'enc')`,
+		`INSERT INTO channel_keys(id, channel_id, name, credential_enc) VALUES (77, 42, 'k-77', 'enc')`,
 	} {
 		if _, err := conn.ExecContext(ctx, stmt); err != nil {
 			t.Fatalf("造渠道/密钥行失败: %v", err)
@@ -267,7 +268,7 @@ func TestBilling_DimensionFromCallLogs(t *testing.T) {
 		t.Fatalf("迁移后查询账单列表失败: %v", err)
 	}
 	if total != 2 || len(list) != 2 {
-		t.Fatalf("total=%d len=%d, want 2/2", total, len(list))
+		t.Fatalf("total=%d len=%d, want 2/2（此处在插入第三条之前）", total, len(list))
 	}
 	byID := map[string]Record{}
 	for _, rec := range list {
@@ -316,12 +317,35 @@ func TestBilling_DimensionFromCallLogs(t *testing.T) {
 		t.Fatalf("不存在的密钥不应命中任何账单，got total=%d len=%d", missTotal, len(miss))
 	}
 
+	// 过渡期兜底（复审 R5）：call_logs 是**异步写**，可能暂无行；此时必须回落到本表列，
+	// 否则「列里有值」的账单会读回 0、按渠道筛选会筛不到（迁移前这两种都能工作）。
+	colOnly := newRealStoreRecord("bill-post-3")
+	colOnly.ChannelKeyID = 77
+	if _, err := store.Insert(ctx, colOnly); err != nil {
+		t.Fatalf("插入「只有列有值」的账单失败: %v", err)
+	}
+	lone, err := store.GetByBillingID(ctx, "bill-post-3")
+	if err != nil {
+		t.Fatalf("查询无调用日志的账单失败: %v", err)
+	}
+	if lone.ChannelKeyID != 77 {
+		t.Fatalf("无 call_logs 行时应回落到本表列读回 77，got %d", lone.ChannelKeyID)
+	}
+	key77 := int64(77)
+	found, foundTotal, err := store.ListRecords(ctx, RecordFilter{ChannelKeyID: &key77, Page: 1, Size: 20})
+	if err != nil {
+		t.Fatalf("按渠道密钥筛选失败: %v", err)
+	}
+	if foundTotal != 1 || len(found) != 1 || found[0].BillingID != "bill-post-3" {
+		t.Fatalf("无 call_logs 行的账单也该能被渠道筛选命中，got total=%d list=%+v", foundTotal, found)
+	}
+
 	// 汇总（统计口径不依赖被删列）。
 	sum, err := store.Summarize(ctx, RecordFilter{Page: 1, Size: 20})
 	if err != nil {
 		t.Fatalf("迁移后汇总失败: %v", err)
 	}
-	if sum.Requests != 2 {
-		t.Fatalf("汇总请求数=%d, want 2", sum.Requests)
+	if sum.Requests != 3 {
+		t.Fatalf("汇总请求数=%d, want 3", sum.Requests)
 	}
 }

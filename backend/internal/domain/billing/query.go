@@ -42,19 +42,23 @@ func recordWhereOn(prefix string, f RecordFilter) (string, []any) {
 	// 关联列必须限定到**外层**表：子查询里 call_logs 自己也有 billing_id，
 	// 写裸 billing_id 会解析成 clk.billing_id = clk.billing_id（恒真，PR #63 踩过的同类坑）。
 	outerBillingID := "billing_records.billing_id"
+	outerChannelKeyID := "billing_records.channel_key_id" // 随 0021 同批删除
 	if prefix != "" {
 		outerBillingID = prefix + "billing_id"
+		outerChannelKeyID = prefix + "channel_key_id"
 	}
+	// 过渡期兜底（复审 R5）：渠道维度以调用日志快照为准，快照缺行（异步写未落/重试耗尽）时
+	// 回落到本表列——否则这类账单按渠道筛选会筛不到。「%[4]s」这一半随 0021 同批删除。
 	where := fmt.Sprintf(`WHERE ($1::bigint IS NULL OR %[1]suser_id = $1)
-	          AND ($2::bigint IS NULL OR EXISTS (SELECT 1 FROM call_logs clk
-	                 WHERE clk.billing_id = %[3]s AND clk.channel_key_id = $2))
+	          AND ($2::bigint IS NULL OR COALESCE((SELECT clk.channel_key_id FROM call_logs clk
+	                 WHERE clk.billing_id = %[3]s), %[4]s) = $2)
 	          AND ($3::bigint IS NULL OR %[1]stoken_id = $3)
 	          AND ($4 = '' OR %[1]ssession_id = $4)
 	          AND ($5 = '' OR %[1]sexternal_model_name = $5 OR %[1]sauto_model_name = $5)
 	          AND ($6 = '' OR %[1]spricing_mode = $6)
 	          AND ($7 = '' OR %[1]sstatus = $7)
 	          AND ($8::timestamptz IS NULL OR %[1]scall_time >= $8)
-	          AND ($9::timestamptz IS NULL OR %[1]scall_time <= $9)`, prefix, nil, outerBillingID)
+	          AND ($9::timestamptz IS NULL OR %[1]scall_time <= $9)`, prefix, nil, outerBillingID, outerChannelKeyID)
 	args := []any{
 		nullableInt64(f.UserID), nullableInt64(f.ChannelKeyID), nullableInt64(f.TokenID),
 		f.SessionID, f.Model, f.PricingMode, f.Status,

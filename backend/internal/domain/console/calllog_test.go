@@ -74,7 +74,7 @@ func TestAdminHandleGetBilling_CallLog(t *testing.T) {
 	raw_total, credits_consumed, cost_credits, balance_before, balance_after, status, error_message, duration_ms, first_token_ms FROM billing_records WHERE billing_id=$1`)).
 		WithArgs("bill-0001").WillReturnRows(rows)
 	// 渠道密钥维度回填（billing_records 已无该列，读 call_logs 的 1:1 快照）。
-	mock.ExpectQuery(`SELECT billing_id, channel_key_id FROM call_logs`).
+	mock.ExpectQuery(`SELECT br.billing_id, COALESCE\(cl.channel_key_id, br.channel_key_id\)`).
 		WithArgs("bill-0001").
 		WillReturnRows(sqlmock.NewRows([]string{"billing_id", "channel_key_id"}).AddRow("bill-0001", int64(1)))
 	// 渠道名反查：密钥 id=1 无对应渠道行 → 空名（nil 影响展示）。
@@ -131,7 +131,7 @@ func TestAdminHandleGetBilling_CallLogNotInjected(t *testing.T) {
 	raw_total, credits_consumed, cost_credits, balance_before, balance_after, status, error_message, duration_ms, first_token_ms FROM billing_records WHERE billing_id=$1`)).
 		WithArgs("bill-0001").WillReturnRows(rows)
 	// 渠道密钥维度回填（billing_records 已无该列，读 call_logs 的 1:1 快照）。
-	mock.ExpectQuery(`SELECT billing_id, channel_key_id FROM call_logs`).
+	mock.ExpectQuery(`SELECT br.billing_id, COALESCE\(cl.channel_key_id, br.channel_key_id\)`).
 		WithArgs("bill-0001").
 		WillReturnRows(sqlmock.NewRows([]string{"billing_id", "channel_key_id"}).AddRow("bill-0001", int64(1)))
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT c.name FROM channels c JOIN channel_keys k ON k.channel_id = c.id WHERE k.id = $1`)).

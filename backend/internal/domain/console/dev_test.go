@@ -149,7 +149,7 @@ func TestHandleDevListBillings_ChannelName(t *testing.T) {
 		WithArgs(int64(7), nil, nil, "", "", "", "", nil, nil, 20, 0).
 		WillReturnRows(rows)
 	// 渠道密钥维度回填（billing_records 已无该列，读 call_logs 的 1:1 快照）。
-	mock.ExpectQuery(`SELECT billing_id, channel_key_id FROM call_logs`).
+	mock.ExpectQuery(`SELECT br.billing_id, COALESCE\(cl.channel_key_id, br.channel_key_id\)`).
 		WithArgs("b1").
 		WillReturnRows(sqlmock.NewRows([]string{"billing_id", "channel_key_id"}).AddRow("b1", int64(99)))
 	// 渠道显示名回查（channel_keys JOIN channels）：dev 列表据此填 ChannelName。

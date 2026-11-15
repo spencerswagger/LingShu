@@ -128,7 +128,7 @@ func expectChannelKeyFill(mock sqlmock.Sqlmock, pairs ...any) {
 		args = append(args, pairs[i])
 		rows.AddRow(pairs[i], pairs[i+1])
 	}
-	mock.ExpectQuery(`SELECT billing_id, channel_key_id FROM call_logs`).
+	mock.ExpectQuery(`SELECT br\.billing_id, COALESCE\(cl\.channel_key_id, br\.channel_key_id\)`).
 		WithArgs(args...).
 		WillReturnRows(rows)
 }
@@ -737,6 +737,54 @@ func TestRecord_TxPath_InsertFailure_FallsBackToPlain(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("mock expectations: %v", err)
+	}
+}
+
+// failingBeginner 模拟「事务开不起来」：BeginTx 直接失败（库不可用/连接池耗尽/只读副本）。
+type failingBeginner struct{ err error }
+
+func (f failingBeginner) BeginTx(context.Context, *sql.TxOptions) (*sql.Tx, error) {
+	return nil, f.err
+}
+
+// TestRecord_BeginTxFailure_NeverCharges 是复审 R3 的探针用例（资金底线的第二道活路）：
+// BeginTx 失败时**不得**退回 settlePlain —— 那条路先真扣钱、再落库，事务不可用往往意味着库也不可用，
+// 结果是「钱扣了账没落」，且确定性错误进重试队列永远重试不成功。
+// 断言：plain 扣款 0 次、事务扣款 0 次、返回错误、账单未写。
+func TestRecord_BeginTxFailure_NeverCharges(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	// 只允许幂等预检查这一次读；任何 Insert/Begin 都不该发生。
+	mock.ExpectQuery(selectByBillingID.String()).WithArgs(billingID).WillReturnError(sql.ErrNoRows)
+
+	credit := &fakeCredit{before: 10, after: 9.9}
+	svc := newTestService(db, credit, newFakeConfig(), time.Date(2026, 11, 15, 12, 0, 0, 0, shLocForTest(t)))
+	svc.SetTxBeginner(failingBeginner{err: errors.New("dial tcp: connection refused")})
+	svc.SetRetryQueue(NewRetryQueue(t.TempDir()+"/retry.json", slog.New(slog.NewTextHandler(io.Discard, nil))))
+
+	rec, err := svc.Record(context.Background(), RecordReq{
+		BillingID: billingID, UserID: testUserID, PricingMode: "sale",
+		ExternalModel: "ext-model", InternalModelID: "int-model", ChannelKeyID: 1, SessionID: "sess-1",
+		Tokens: Usage{Input: 100}, Rates: fullRates(),
+	})
+	if err == nil {
+		t.Fatal("事务开不起来应报错（本次不成交），不能静默成功")
+	}
+	if rec != nil {
+		t.Fatalf("不成交时应返回 nil 记录，got %+v", rec)
+	}
+	if credit.calls != 0 {
+		t.Fatalf("BeginTx 失败不得走非事务扣款路径：plain consume=%d, want 0", credit.calls)
+	}
+	if credit.txCalls != 0 || credit.settleCalls != 0 {
+		t.Fatalf("不应发生任何扣款：tx=%d settle=%d, want 0/0", credit.txCalls, credit.settleCalls)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("不应发生任何写入（账单未落库即无重试），mock expectations: %v", err)
 	}
 }
 
