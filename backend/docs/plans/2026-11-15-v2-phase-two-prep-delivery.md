@@ -94,6 +94,12 @@
 - 补 `0023c_v2_reconcile_counts_backfill.sql`：条件是 `detail->>'phase' = 'sync'` **且**四列全 0 → 归 NULL。判据用写入方标记（同步轮次写 `phase='sync'` 且从不写计数；对账写 `phase='reconcile'`），因此对账算过的 0（真没流量）与没有标记的行都不动；任一列非 0 也不动。
 - 用例 `TestGate_D4_SyncPlaceholderZeroBecomesNull`：四类行（同步占位 0 / 对账真 0 / blocked 占位 0 / 同步非 0）跑两遍验幂等，断言只有前两类中「该归 NULL 的」被归 NULL，对账真 0 保持 0、非 0 值不被抹。
 
+## 0.4 blocked 状态映射统一（Gate 复验 P2，2026-11-15）
+
+- 根因：`saveStatus` 收的是 `RoundResult` **值拷贝**，函数内改 `result.Status` 改的是副本 —— 库里落 blocked、调用方返回值仍是零值 ok。修成 `*RoundResult`（`window.go:693-699`），10 个调用点同步改 `&result`；blocked / error 分支的返回值从此与库记录、日志同源。
+- 空轮告警同步收窄：`Empty` 只在**成功收尾**（`Status==ok`）时才置位（`window.go:636-644`）——blocked 的 0 行是失败，由分支自己告警，不混进空轮 WARN。`cmd/server` 侧的 `res.Empty && err == nil` 分支语义不变。
+- 用例 `TestRounder_BlockedStatusConsistent`：三种 blocked 来源（排序未证实 / 已证否 / 页数超限）各断一次「返回值 Status=blocked + Reason 非空 + Empty=false + 库记录 blocked 带 reason + 日志写明 blocked 且无空轮告警」。
+
 ## 1. 改动清单（文件 → 改了什么 → 对应裁定）
 
 ### 迁移链（F4 / F2 / F7 / F9 / F10 / D4）
@@ -169,7 +175,9 @@
 
 ## 3. 未完成项与已知缺口（登记，不承诺已解决）
 
-### 3.0 0024 代码债（P0，**等上级授权后**才开工，本轮只登记）
+### 3.0 0024 代码债（P0，**等上级授权后**才开工，本轮只登记；⚠️ 是「启动即失败」不是「部分接口报错」）
+
+Gate 已实测：0024 应用后进程**启动即 `exit=1`**（console 装配阶段查询 `channels` 表 → 42P01，发生在首请求之前），因此未摘除五处代码前 0024 **连进程都起不来**，不存在「起得来、部分接口报错」的中间态。
 
 Gate 复验确认：0024 一执行，以下 7 处代码仍在引用被删列/表，必须与「五处代码摘除」同批上线，否则分支不能上线：
 

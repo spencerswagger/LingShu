@@ -551,7 +551,7 @@ func (r *Rounder) RunOnce(ctx context.Context) (RoundResult, error) {
 			reason = "排序能力未经证实"
 		}
 		unproven := &ErrLedgerOrderUnproven{Window: w, Order: order, Reason: reason}
-		r.saveStatus(ctx, result, WindowBlocked, unproven.Error(), 0, scanStart)
+		r.saveStatus(ctx, &result, WindowBlocked, unproven.Error(), 0, scanStart)
 		log.Error("上游同步跳过并记 blocked：账本排序能力未证实（本窗不可清零）",
 			"window", w.String(), "order", order.String(), "reason", reason)
 		return result, unproven
@@ -561,7 +561,7 @@ func (r *Rounder) RunOnce(ctx context.Context) (RoundResult, error) {
 	for {
 		page, ferr := r.source.FetchPage(ctx, w, offset, r.pageSize)
 		if ferr != nil {
-			r.saveStatus(ctx, result, WindowError, ferr.Error(), int64(offset), scanStart)
+			r.saveStatus(ctx, &result, WindowError, ferr.Error(), int64(offset), scanStart)
 			return result, fmt.Errorf("拉取同步窗口 %s（offset=%d）失败：%w", w, offset, ferr)
 		}
 		result.Pages++
@@ -571,13 +571,13 @@ func (r *Rounder) RunOnce(ctx context.Context) (RoundResult, error) {
 			// 一页一事务：本页账本 + 扫描起点的 offset 一起提交（断点必须代表「已落库」）。
 			tx, terr := r.ledger.Begin(ctx)
 			if terr != nil {
-				r.saveStatus(ctx, result, WindowError, terr.Error(), int64(offset), scanStart)
+				r.saveStatus(ctx, &result, WindowError, terr.Error(), int64(offset), scanStart)
 				return result, terr
 			}
 			n, uerr := tx.Upsert(ctx, page.Entries)
 			if uerr != nil {
 				_ = tx.Rollback()
-				r.saveStatus(ctx, result, WindowError, uerr.Error(), int64(offset), scanStart)
+				r.saveStatus(ctx, &result, WindowError, uerr.Error(), int64(offset), scanStart)
 				return result, uerr
 			}
 			if serr := r.windows.SaveTx(ctx, tx.Execer(), WindowRecord{
@@ -592,11 +592,11 @@ func (r *Rounder) RunOnce(ctx context.Context) (RoundResult, error) {
 				RecordedAt:   r.now(),
 			}); serr != nil {
 				_ = tx.Rollback()
-				r.saveStatus(ctx, result, WindowError, serr.Error(), int64(offset), scanStart)
+				r.saveStatus(ctx, &result, WindowError, serr.Error(), int64(offset), scanStart)
 				return result, fmt.Errorf("写分页断点失败（本页已回滚）：%w", serr)
 			}
 			if cerr := tx.Commit(); cerr != nil {
-				r.saveStatus(ctx, result, WindowError, cerr.Error(), int64(offset), scanStart)
+				r.saveStatus(ctx, &result, WindowError, cerr.Error(), int64(offset), scanStart)
 				return result, fmt.Errorf("提交分页事务失败：%w", cerr)
 			}
 			result.Inserted += n
@@ -610,7 +610,7 @@ func (r *Rounder) RunOnce(ctx context.Context) (RoundResult, error) {
 		if len(page.Entries) == 0 {
 			// 空页却声称还有更多：数据源的翻页语义有问题，必须报错而不是死循环。
 			reason := fmt.Sprintf("上游返回空页但标记 has_more（offset=%d）", offset)
-			r.saveStatus(ctx, result, WindowError, reason, int64(offset), scanStart)
+			r.saveStatus(ctx, &result, WindowError, reason, int64(offset), scanStart)
 			return result, fmt.Errorf("同步窗口 %s：%s", w, reason)
 		}
 		// 两个上限同源：页数（20）与条数（4000）。条数上限要单独判，因为 page_size 可配，
@@ -620,7 +620,7 @@ func (r *Rounder) RunOnce(ctx context.Context) (RoundResult, error) {
 				Window: w, Pages: result.Pages, Fetched: result.Fetched, ScrollOffset: int64(offset),
 			}
 			// 持久化 offset 是 blocked 与「失败」的区别：进度要留给下一轮，否则积压永不清零。
-			r.saveStatus(ctx, result, WindowBlocked, blockedErr.Error(), int64(offset), scanStart)
+			r.saveStatus(ctx, &result, WindowBlocked, blockedErr.Error(), int64(offset), scanStart)
 			log.Error("上游同步窗口 blocked（单轮上限）",
 				"window", w.String(), "pages", result.Pages, "max_pages", r.maxPages,
 				"max_rows", MaxRowsPerRound, "fetched", result.Fetched,
@@ -632,7 +632,9 @@ func (r *Rounder) RunOnce(ctx context.Context) (RoundResult, error) {
 	// 空轮可观测（F9/P1 复验项）：0 行 + nil 不许静默。
 	// 首轮无水位线时空是正常的（上游本来就没数据），但稳态下每分钟都空说明上游没数据、
 	// 窗口没覆盖到、或凭据/端点错了——必须能在日志里看见，而不是「什么都没发生」。
-	if result.Fetched == 0 && result.Inserted == 0 {
+	// 空轮仅在**成功收尾**（status=ok）时才算「空轮」；blocked/error 的 0 行是失败，
+	// 由对应分支自己告警，别在这条 WARN 里混报（Gate 复验：状态映射必须一致）。
+	if result.Status == WindowOK && result.Fetched == 0 && result.Inserted == 0 {
 		result.Empty = true
 		log.Warn("本轮同步未拉到任何账本条目（空轮）",
 			"window", w.String(), "scan_start", scanStart.Format(time.RFC3339),
@@ -644,7 +646,7 @@ func (r *Rounder) RunOnce(ctx context.Context) (RoundResult, error) {
 	// 一并置 ok + offset 归零 —— 这段区间本轮已拉完，不该留假告警。
 	tx, err := r.ledger.Begin(ctx)
 	if err != nil {
-		r.saveStatus(ctx, result, WindowError, err.Error(), int64(offset), scanStart)
+		r.saveStatus(ctx, &result, WindowError, err.Error(), int64(offset), scanStart)
 		return result, err
 	}
 	okRec := WindowRecord{
@@ -663,7 +665,7 @@ func (r *Rounder) RunOnce(ctx context.Context) (RoundResult, error) {
 		return result, fmt.Errorf("写同步窗口行失败（本轮已回滚）：%w", err)
 	}
 	if err := tx.Commit(); err != nil {
-		r.saveStatus(ctx, result, WindowError, err.Error(), int64(offset), scanStart)
+		r.saveStatus(ctx, &result, WindowError, err.Error(), int64(offset), scanStart)
 		return result, fmt.Errorf("提交窗口收尾事务失败：%w", err)
 	}
 	result.Status = WindowOK
@@ -690,7 +692,12 @@ func savedWindowFor(w Window) Window {
 //
 // 记在**扫描起点窗口**那一行上（不是最新窗口）：scroll_offset 的含义是「从扫描起点往后数第 N 条」，
 // 只有绑定起点窗口才能被下一轮正确续拉。
-func (r *Rounder) saveStatus(ctx context.Context, result RoundResult, status WindowStatus, reason string,
+// saveStatus 落库窗口状态并把**同一份** status/reason 写回 RoundResult。
+//
+// 这里曾经只写 result.Status 的**值拷贝**（Go 的参数是值传递），调用方手里的 result
+// 仍然是零值 ok —— 库里落 blocked、返回值却是 ok，调用方误判成功（Gate 复验 P2）。
+// 改为传指针后，所有 blocked/error 分支的返回值、库记录、日志三者天然同源。
+func (r *Rounder) saveStatus(ctx context.Context, result *RoundResult, status WindowStatus, reason string,
 	offset int64, scanStart time.Time) {
 	result.Status = status
 	result.Reason = reason

@@ -751,3 +751,72 @@ func TestRounder_EmptyRoundIsObservable(t *testing.T) {
 		t.Fatalf("非空轮不该打空轮告警，日志：%s", buf.String())
 	}
 }
+
+// TestRounder_BlockedStatusConsistent 覆盖 Gate 复验的 P2：
+// 窗口被判 blocked 时，**库记录、返回值、日志三者必须一致**，不许「库是 blocked、返回值是 ok」。
+//
+// 三种 blocked 来源都钉住：①排序能力未证实（capability gate）
+// ②排序已证否（unsupported）③页数超限（ErrWindowBlocked）。
+// 一致性 = Status==blocked && Reason 与日志同源 && Empty==false（失败不算空轮）。
+func TestRounder_BlockedStatusConsistent(t *testing.T) {
+	now := time.Date(2026, 11, 15, 10, 0, 0, 0, time.UTC)
+
+	run := func(name string, order LedgerOrder, src *fakePageSource) {
+		t.Run(name, func(t *testing.T) {
+			var buf bytes.Buffer
+			logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+			wins := NewMemoryWindowStore()
+			r := NewRounder(RounderOptions{
+				Source: src, Ledger: newFakeLedger(), Windows: wins,
+				Now: func() time.Time { return now }, Logger: logger,
+				LedgerOrder:       order,
+				LedgerOrderReason: "排序能力未经证实（测试注入）",
+			})
+			res, err := r.RunOnce(context.Background())
+			if err == nil {
+				t.Fatalf("blocked 必须以错误返回（调用方不得误判成功）")
+			}
+			if res.Status != WindowBlocked {
+				t.Fatalf("返回值 Status 必须是 blocked（库已落 blocked），got %s（reason=%s）", res.Status, res.Reason)
+			}
+			if res.Reason == "" {
+				t.Fatal("blocked 必须带 reason（与日志同源）")
+			}
+			if res.Empty {
+				t.Fatal("blocked 的 0 行是失败不是空轮，Empty 必须为 false")
+			}
+			// 库记录一致（PendingWindows 只返回 blocked/error 窗口——有记录即证明库里落了 blocked）。
+			recs, err := wins.PendingWindows(context.Background(), 10)
+			if err != nil || len(recs) == 0 {
+				t.Fatalf("库应留一条 blocked 窗口记录: %v", err)
+			}
+			last := recs[len(recs)-1]
+			if last.Status != WindowBlocked {
+				t.Fatalf("库记录 Status=%s, want blocked", last.Status)
+			}
+			if last.Reason == "" {
+				t.Fatal("库记录必须带 reason")
+			}
+			// 日志一致： WARN/ERROR 里必须点明 blocked 与原因，且不许打「空轮」。
+			if !strings.Contains(buf.String(), "blocked") {
+				t.Fatalf("日志必须写明 blocked，日志：%s", buf.String())
+			}
+			if strings.Contains(buf.String(), "空轮") {
+				t.Fatalf("blocked 不得打空轮告警，日志：%s", buf.String())
+			}
+		})
+	}
+
+	// ① 排序能力未证实（unverified：未探测）。
+	run("unverified-order", LedgerOrderUnverified,
+		&fakePageSource{pages: []Page{{Entries: entries("led-1"), HasMore: false}}})
+	// ② 已证否（unsupported）。
+	run("unsupported-order", LedgerOrderUnsupported,
+		&fakePageSource{pages: []Page{{Entries: entries("led-1"), HasMore: false}}})
+	// ③ 页数超限 blocked（supported，但页数上限被 20 页闸门拦住）。
+	many := make([]Page, 0, 30)
+	for i := 0; i < 30; i++ {
+		many = append(many, Page{Entries: entries(fmt.Sprintf("led-%d", i)), HasMore: i < 29})
+	}
+	run("page-limit", LedgerOrderSupported, &fakePageSource{pages: many})
+}
