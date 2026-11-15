@@ -132,12 +132,12 @@ func TestHandleDevListBillings_ChannelName(t *testing.T) {
 
 	rows := sqlmock.NewRows([]string{
 		"id", "billing_id", "user_id", "pricing_mode", "token_id", "external_model_name",
-		"auto_model_name", "internal_model_id", "channel_key_id", "session_id", "session_name", "call_time",
+		"auto_model_name", "internal_model_id", "session_id", "session_name", "call_time",
 		"tokens", "rates", "coefficients", "r_value", "raw_total", "credits_consumed", "cost_credits",
 		"balance_before", "balance_after", "status", "error_message", "duration_ms", "first_token_ms",
 		"rid", "cnt",
 	}).AddRow(
-		int64(1), "b1", int64(7), "sale", nil, "gpt-4", nil, "gpt-4-int", int64(99), "", "",
+		int64(1), "b1", int64(7), "sale", nil, "gpt-4", nil, "gpt-4-int", "", "",
 		time.Now(), `{}`, `{}`, `{"time":1,"context":1}`, int64(10000),
 		nil, float64(0.5), nil, nil, nil, "completed", nil, nil, nil, "req-1", int64(1),
 	)
@@ -148,6 +148,10 @@ func TestHandleDevListBillings_ChannelName(t *testing.T) {
 	mock.ExpectQuery(`WITH grp AS \(.*grp.rid, grp.cnt.*LIMIT \$10 OFFSET \$11`).
 		WithArgs(int64(7), nil, nil, "", "", "", "", nil, nil, 20, 0).
 		WillReturnRows(rows)
+	// 渠道密钥维度回填（billing_records 已无该列，读 call_logs 的 1:1 快照）。
+	mock.ExpectQuery(`SELECT billing_id, channel_key_id FROM call_logs`).
+		WithArgs("b1").
+		WillReturnRows(sqlmock.NewRows([]string{"billing_id", "channel_key_id"}).AddRow("b1", int64(99)))
 	// 渠道显示名回查（channel_keys JOIN channels）：dev 列表据此填 ChannelName。
 	mock.ExpectQuery(`SELECT k.id, c.name FROM channel_keys k JOIN channels c ON c.id = k.channel_id`).
 		WithArgs().

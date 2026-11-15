@@ -34,12 +34,14 @@ func (f *fakeCallLogStore) ListBySession(_ context.Context, _ string) ([]gateway
 // billingRecordRow 与 billing.SqlStore 的 recordCols 列顺序一致的一行 mock 数据。
 func billingRecordRow(t *testing.T) ([]string, *sqlmock.Rows) {
 	t.Helper()
+	// 列顺序与 billing.SqlStore 的 recordCols 一致：channel_key_id 已不在表里（0021 删除），
+	// 维度改由 call_logs 快照回填。
 	cols := []string{"id", "billing_id", "user_id", "pricing_mode", "token_id", "external_model_name",
-		"auto_model_name", "internal_model_id", "channel_key_id", "session_id", "session_name", "call_time", "tokens", "rates",
+		"auto_model_name", "internal_model_id", "session_id", "session_name", "call_time", "tokens", "rates",
 		"coefficients", "r_value", "raw_total", "credits_consumed", "cost_credits", "balance_before",
 		"balance_after", "status", "error_message", "duration_ms", "first_token_ms"}
 	rows := sqlmock.NewRows(cols).AddRow(
-		int64(1), "bill-0001", int64(7), "sale", nil, "gpt-4", nil, "gpt-4-internal", int64(1), nil, nil,
+		int64(1), "bill-0001", int64(7), "sale", nil, "gpt-4", nil, "gpt-4-internal", nil, nil,
 		time.Date(2026, 10, 1, 10, 0, 0, 0, time.UTC), []byte(`{"input":10}`), []byte(`{"input":1}`),
 		[]byte(`{"time":1,"context":1}`), int64(10000), 1.0, 1.0, 0.0, 100.0, 99.0, "completed", nil, nil, nil)
 	return cols, rows
@@ -68,9 +70,13 @@ func TestAdminHandleGetBilling_CallLog(t *testing.T) {
 
 	_, rows := billingRecordRow(t)
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, billing_id, user_id, pricing_mode, token_id, external_model_name,
-	auto_model_name, internal_model_id, channel_key_id, session_id, session_name, call_time, tokens, rates, coefficients, r_value,
+	auto_model_name, internal_model_id, session_id, session_name, call_time, tokens, rates, coefficients, r_value,
 	raw_total, credits_consumed, cost_credits, balance_before, balance_after, status, error_message, duration_ms, first_token_ms FROM billing_records WHERE billing_id=$1`)).
 		WithArgs("bill-0001").WillReturnRows(rows)
+	// 渠道密钥维度回填（billing_records 已无该列，读 call_logs 的 1:1 快照）。
+	mock.ExpectQuery(`SELECT billing_id, channel_key_id FROM call_logs`).
+		WithArgs("bill-0001").
+		WillReturnRows(sqlmock.NewRows([]string{"billing_id", "channel_key_id"}).AddRow("bill-0001", int64(1)))
 	// 渠道名反查：密钥 id=1 无对应渠道行 → 空名（nil 影响展示）。
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT c.name FROM channels c JOIN channel_keys k ON k.channel_id = c.id WHERE k.id = $1`)).
 		WithArgs(int64(1)).WillReturnError(sql.ErrNoRows)
@@ -121,9 +127,13 @@ func TestAdminHandleGetBilling_CallLogNotInjected(t *testing.T) {
 
 	_, rows := billingRecordRow(t)
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, billing_id, user_id, pricing_mode, token_id, external_model_name,
-	auto_model_name, internal_model_id, channel_key_id, session_id, session_name, call_time, tokens, rates, coefficients, r_value,
+	auto_model_name, internal_model_id, session_id, session_name, call_time, tokens, rates, coefficients, r_value,
 	raw_total, credits_consumed, cost_credits, balance_before, balance_after, status, error_message, duration_ms, first_token_ms FROM billing_records WHERE billing_id=$1`)).
 		WithArgs("bill-0001").WillReturnRows(rows)
+	// 渠道密钥维度回填（billing_records 已无该列，读 call_logs 的 1:1 快照）。
+	mock.ExpectQuery(`SELECT billing_id, channel_key_id FROM call_logs`).
+		WithArgs("bill-0001").
+		WillReturnRows(sqlmock.NewRows([]string{"billing_id", "channel_key_id"}).AddRow("bill-0001", int64(1)))
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT c.name FROM channels c JOIN channel_keys k ON k.channel_id = c.id WHERE k.id = $1`)).
 		WithArgs(int64(1)).WillReturnError(sql.ErrNoRows)
 

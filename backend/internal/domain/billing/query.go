@@ -39,15 +39,22 @@ func recordWhere(f RecordFilter) (string, []any) { return recordWhereOn("", f) }
 // RequestID 过滤只在非空时追加条件与参数：其余场景生成的 SQL 与参数位与历史完全一致
 // （不无谓平移占位符，避免既有 SQL 断言与执行计划漂移）。
 func recordWhereOn(prefix string, f RecordFilter) (string, []any) {
+	// 关联列必须限定到**外层**表：子查询里 call_logs 自己也有 billing_id，
+	// 写裸 billing_id 会解析成 clk.billing_id = clk.billing_id（恒真，PR #63 踩过的同类坑）。
+	outerBillingID := "billing_records.billing_id"
+	if prefix != "" {
+		outerBillingID = prefix + "billing_id"
+	}
 	where := fmt.Sprintf(`WHERE ($1::bigint IS NULL OR %[1]suser_id = $1)
-	          AND ($2::bigint IS NULL OR %[1]schannel_key_id = $2)
+	          AND ($2::bigint IS NULL OR EXISTS (SELECT 1 FROM call_logs clk
+	                 WHERE clk.billing_id = %[3]s AND clk.channel_key_id = $2))
 	          AND ($3::bigint IS NULL OR %[1]stoken_id = $3)
 	          AND ($4 = '' OR %[1]ssession_id = $4)
 	          AND ($5 = '' OR %[1]sexternal_model_name = $5 OR %[1]sauto_model_name = $5)
 	          AND ($6 = '' OR %[1]spricing_mode = $6)
 	          AND ($7 = '' OR %[1]sstatus = $7)
 	          AND ($8::timestamptz IS NULL OR %[1]scall_time >= $8)
-	          AND ($9::timestamptz IS NULL OR %[1]scall_time <= $9)`, prefix)
+	          AND ($9::timestamptz IS NULL OR %[1]scall_time <= $9)`, prefix, nil, outerBillingID)
 	args := []any{
 		nullableInt64(f.UserID), nullableInt64(f.ChannelKeyID), nullableInt64(f.TokenID),
 		f.SessionID, f.Model, f.PricingMode, f.Status,
@@ -114,7 +121,19 @@ func (s *SqlStore) ListRecords(ctx context.Context, f RecordFilter) ([]Record, i
 	if err := rows.Err(); err != nil {
 		return nil, 0, err
 	}
+	if err := fillChannelKeys(ctx, s.db, ptrsOfRecords(list)); err != nil {
+		return nil, 0, err
+	}
 	return list, total, nil
+}
+
+// ptrsOfRecords 取切片元素的指针（回填维度用，避免复制整行）。
+func ptrsOfRecords(list []Record) []*Record {
+	out := make([]*Record, len(list))
+	for i := range list {
+		out[i] = &list[i]
+	}
+	return out
 }
 
 // groupedExtraCols 把「归并附加列」（request_id、该请求的账单条数）接到 sqlScan 的扫描目标后面，
@@ -188,6 +207,9 @@ func (s *SqlStore) listRecordsGrouped(ctx context.Context, f RecordFilter) ([]Re
 		list = append(list, *rec)
 	}
 	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	if err := fillChannelKeys(ctx, s.db, ptrsOfRecords(list)); err != nil {
 		return nil, 0, err
 	}
 	return list, total, nil

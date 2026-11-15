@@ -90,6 +90,20 @@ type Store interface {
 	InsertTx(ctx context.Context, ex dbx.Execer, rec *Record) (*Record, error)
 }
 
+// idempotencyReader 是 SqlStore 提供的「只读本表、不回填展示维度」的读取能力。
+// 写路径的幂等预检查只关心「是否已存在、状态如何」，不该为展示维度多付一次 call_logs 查询。
+type idempotencyReader interface {
+	scanByBillingID(ctx context.Context, billingID string) (*Record, error)
+}
+
+// recordByBillingID 幂等预检查用：优先走不带展示维度的读取，其他 Store 实现回落 GetByBillingID。
+func (s *Service) recordByBillingID(ctx context.Context, billingID string) (*Record, error) {
+	if reader, ok := s.store.(idempotencyReader); ok {
+		return reader.scanByBillingID(ctx, billingID)
+	}
+	return s.store.GetByBillingID(ctx, billingID)
+}
+
 // Record 对应 billing_records 一行，携带一次调用的完整计费信息。
 type Record struct {
 	ID              int64
@@ -100,7 +114,7 @@ type Record struct {
 	ExternalModel   string
 	AutoModelName   string // 请求的 Auto 模型名（非 Auto 请求为空，落库为 NULL）
 	InternalModelID string
-	ChannelKeyID    int64  // 落 channel_key_id：渠道密钥维度（运行时实体）
+	ChannelKeyID    int64  // 渠道密钥维度（运行时实体）：不再落 billing_records，读取时由 call_logs 快照回填
 	SessionID       string // 落 session_id：请求携带 x-session-id 时的会话维度；失败记录同样携带
 	SessionName     string // 落 session_name：写入时的会话可读名快照（sessions 投影过期清理后仍可展示）
 	CallTime        time.Time
@@ -268,7 +282,7 @@ func (s *Service) Record(ctx context.Context, req RecordReq) (*Record, error) {
 	}
 
 	// 1) 幂等快速路径。
-	existing, err := s.store.GetByBillingID(ctx, req.BillingID)
+	existing, err := s.recordByBillingID(ctx, req.BillingID)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
 	}
@@ -395,7 +409,7 @@ func (s *Service) settleTx(ctx context.Context, rec *Record, req RecordReq, cred
 		// 并发竞态兜底：两个请求可能都通过幂等快速路径，billing_id 唯一索引保证其一写库成功、
 		// 另一侧撞唯一约束（23505）。撞库方本次扣款已随事务回滚（未重复扣），重查已落库记录返回。
 		if isUniqueViolation(ierr) {
-			existing, gerr := s.store.GetByBillingID(ctx, rec.BillingID)
+			existing, gerr := s.recordByBillingID(ctx, rec.BillingID)
 			if gerr == nil && existing != nil && existing.Status == StatusCompleted {
 				return existing, nil, true
 			}
@@ -423,7 +437,7 @@ func (s *Service) settlePlain(ctx context.Context, rec *Record, req RecordReq, c
 	rec.BalanceAfter = after
 	if _, err := s.store.Insert(ctx, rec); err != nil {
 		if isUniqueViolation(err) {
-			if existing, gerr := s.store.GetByBillingID(ctx, rec.BillingID); gerr == nil &&
+			if existing, gerr := s.recordByBillingID(ctx, rec.BillingID); gerr == nil &&
 				existing != nil && existing.Status == StatusCompleted {
 				return existing, nil
 			}
@@ -921,8 +935,12 @@ func (s *SqlStore) SetConfigWriteHook(fn func()) {
 }
 
 // recordCols 查询 billing_records 使用的全部列。
+//
+// ⚠️ 这里**不再有 channel_key_id**：0021_v2_drop_legacy 会删掉该列，读取它等于把查询绑在
+// 一张即将消失的列上（全量迁移后 42703）。维度改从 call_logs.channel_key_id 取
+// （call_logs 与账单按 billing_id 1:1，且该列由 0021 明确保留），见 fillChannelKeys。
 const recordCols = `id, billing_id, user_id, pricing_mode, token_id, external_model_name,
-	auto_model_name, internal_model_id, channel_key_id, session_id, session_name, call_time, tokens, rates, coefficients, r_value,
+	auto_model_name, internal_model_id, session_id, session_name, call_time, tokens, rates, coefficients, r_value,
 	raw_total, credits_consumed, cost_credits, balance_before, balance_after, status, error_message, duration_ms, first_token_ms`
 
 // GetConfig 读取 sys_configs 单键值；key 不存在返回错误。
@@ -939,14 +957,24 @@ func (s *SqlStore) GetConfig(ctx context.Context, key string) ([]byte, error) {
 }
 
 // GetByBillingID 按 billing_id 查询；无记录返回 sql.ErrNoRows。
+// 展示用的渠道密钥维度由 call_logs 快照回填（billing_records 已无该列）。
 func (s *SqlStore) GetByBillingID(ctx context.Context, billingID string) (*Record, error) {
-	row := s.db.QueryRowContext(ctx,
-		`SELECT `+recordCols+` FROM billing_records WHERE billing_id=$1`, billingID)
-	rec, err := sqlScan(row)
+	rec, err := s.scanByBillingID(ctx, billingID)
 	if err != nil {
 		return nil, err
 	}
+	if err := fillChannelKeys(ctx, s.db, []*Record{rec}); err != nil {
+		return nil, err
+	}
 	return rec, nil
+}
+
+// scanByBillingID 只读 billing_records 本表（不回填展示维度）。
+// 写路径的幂等预检查用它：那里只关心「是否已存在、状态如何」，不需要为了展示多查一次 call_logs。
+func (s *SqlStore) scanByBillingID(ctx context.Context, billingID string) (*Record, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT `+recordCols+` FROM billing_records WHERE billing_id=$1`, billingID)
+	return sqlScan(row)
 }
 
 // Insert 插入一条计费记录（billing_id 唯一约束冲突返回错误）。
@@ -979,11 +1007,6 @@ func (s *SqlStore) insertOn(ctx context.Context, ex dbx.Execer, rec *Record) (*R
 	if rec.TokenID != nil {
 		tokenID = *rec.TokenID
 	}
-	// 未进入渠道的拒绝类账单 channel_key_id 为 0 → 写 NULL（列可空，0 不满足外键）。
-	var channelKeyID any
-	if rec.ChannelKeyID > 0 {
-		channelKeyID = rec.ChannelKeyID
-	}
 	var sessionID any
 	if rec.SessionID != "" {
 		sessionID = rec.SessionID
@@ -1013,15 +1036,15 @@ func (s *SqlStore) insertOn(ctx context.Context, ex dbx.Execer, rec *Record) (*R
 	}
 	err = ex.QueryRowContext(ctx,
 		`INSERT INTO billing_records(id, billing_id, user_id, pricing_mode, token_id, external_model_name,
-			auto_model_name, internal_model_id, channel_key_id, session_id, session_name, call_time, tokens, rates, coefficients, r_value,
+			auto_model_name, internal_model_id, session_id, session_name, call_time, tokens, rates, coefficients, r_value,
 			raw_total, credits_consumed, cost_credits, balance_before, balance_after, status, error_message, duration_ms, first_token_ms,
 			request_id, upstream_provider, upstream_account, upstream_protocol, upstream_model, ledger_entry_id, cost_source)
-		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,
-			$26,$27,$28,$29,$30,$31,$32)
+		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,
+			$25,$26,$27,$28,$29,$30,$31)
 		 RETURNING id, created_at`,
 		append([]any{
 			rec.ID, rec.BillingID, rec.UserID, rec.PricingMode, tokenID, rec.ExternalModel, autoModelName,
-			rec.InternalModelID, channelKeyID, sessionID, sessionName, rec.CallTime, tokensRaw, ratesRaw, coeffRaw,
+			rec.InternalModelID, sessionID, sessionName, rec.CallTime, tokensRaw, ratesRaw, coeffRaw,
 			rec.RValue, rec.RawTotal, rec.CreditsConsumed, rec.CostCredits,
 			rec.BalanceBefore, rec.BalanceAfter, rec.Status, errMsg, durationMs, firstTokenMs,
 		}, attr...)...).
@@ -1030,6 +1053,59 @@ func (s *SqlStore) insertOn(ctx context.Context, ex dbx.Execer, rec *Record) (*R
 		return nil, err
 	}
 	return rec, nil
+}
+
+// fillChannelKeys 用 call_logs 的 1:1 快照回填渠道密钥维度（billing_records.channel_key_id 已被 0021 删除）。
+//
+// 为什么不写成 recordCols 里的标量子查询：recordCols 会被多表 JOIN/归并查询复用，加子查询要么
+// 需要给外层表起别名（三处查询各一套），要么在归并 CTE 里落到错误的表上；批量回填只有一次查询，
+// 且「值不变」这件事只在一个函数里说得清（迁移前 billing_records 与该快照同值）。
+// 缺 call_logs 行（拒绝类账单没有日志）时留 0，与历史「未进入渠道」的语义一致。
+func fillChannelKeys(ctx context.Context, ex dbx.Execer, recs []*Record) error {
+	if len(recs) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(recs))
+	pos := make(map[string][]int, len(recs))
+	for i, rec := range recs {
+		if rec == nil || rec.BillingID == "" {
+			continue
+		}
+		bid := rec.BillingID
+		if _, ok := pos[bid]; !ok {
+			ids = append(ids, bid)
+		}
+		pos[bid] = append(pos[bid], i)
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	// 用 IN($1..$n) 而不是 ANY($1::text[])：不依赖驱动对切片参数的编码，
+	// 也让用例（sqlmock）与生产（pgx）走同一条 SQL 形状。
+	marks := make([]string, len(ids))
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		marks[i] = fmt.Sprintf("$%d", i+1)
+		args[i] = id
+	}
+	rows, err := ex.QueryContext(ctx,
+		`SELECT billing_id, channel_key_id FROM call_logs
+		  WHERE billing_id IN (`+strings.Join(marks, ", ")+`) AND channel_key_id IS NOT NULL`, args...)
+	if err != nil {
+		return fmt.Errorf("读取调用日志的渠道密钥维度失败：%w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var bid string
+		var keyID int64
+		if err := rows.Scan(&bid, &keyID); err != nil {
+			return fmt.Errorf("扫描调用日志的渠道密钥维度失败：%w", err)
+		}
+		for _, i := range pos[bid] {
+			recs[i].ChannelKeyID = keyID
+		}
+	}
+	return rows.Err()
 }
 
 // nullableInt64For 把 *int64 转为可入库的 any（nil → nil）。
@@ -1044,7 +1120,6 @@ func nullableInt64For(v *int64) any {
 func sqlScan(row interface{ Scan(...any) error }) (*Record, error) {
 	var rec Record
 	var tokenID sql.NullInt64
-	var channelKeyID sql.NullInt64
 	var sessionID sql.NullString
 	var sessionName sql.NullString
 	var autoModelName sql.NullString
@@ -1055,7 +1130,7 @@ func sqlScan(row interface{ Scan(...any) error }) (*Record, error) {
 	var callTime time.Time
 
 	err := row.Scan(&rec.ID, &rec.BillingID, &rec.UserID, &rec.PricingMode, &tokenID,
-		&rec.ExternalModel, &autoModelName, &rec.InternalModelID, &channelKeyID, &sessionID, &sessionName, &callTime,
+		&rec.ExternalModel, &autoModelName, &rec.InternalModelID, &sessionID, &sessionName, &callTime,
 		&tokensRaw, &ratesRaw, &coeffRaw, &rec.RValue,
 		&rawTotal, &consCred, &costCred, &balBefore, &balAfter, &rec.Status, &errMsg,
 		&durationMs, &firstTokenMs)
@@ -1065,9 +1140,6 @@ func sqlScan(row interface{ Scan(...any) error }) (*Record, error) {
 	if tokenID.Valid {
 		v := tokenID.Int64
 		rec.TokenID = &v
-	}
-	if channelKeyID.Valid {
-		rec.ChannelKeyID = channelKeyID.Int64
 	}
 	if rawTotal.Valid {
 		rec.RawTotal = rawTotal.Float64
