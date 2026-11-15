@@ -427,3 +427,80 @@ func TestGate_F7_RetainedRowCountsDoNotDecrease(t *testing.T) {
 	}
 	fmt.Println("F7 保留表行数校验通过：", len(RetainedTables()), "张表")
 }
+
+// TestGate_D4_SyncPlaceholderZeroBecomesNull 守住计数列的 NULL 语义（Gate 复验项）：
+// 同步轮次写过（detail.phase='sync'）且四列全 0 的窗口 → 归一为 NULL（= 从没算过）；
+// 对账算过（detail.phase='reconcile'）的 0 → **保持 0**（= 算过且真没流量）。
+//
+// 这两者不可区分就等于「漏账不可见」，而一律归 NULL 又会让「真 0」消失，所以判据必须是写入方标记。
+func TestGate_D4_SyncPlaceholderZeroBecomesNull(t *testing.T) {
+	g, _ := newGateDB(t, "v2gate_d4counts")
+	ctx := context.Background()
+	if _, err := Migrate(ctx, g); err != nil {
+		t.Fatalf("迁移失败: %v", err)
+	}
+
+	// 三种行：同步占位 0 / 对账真 0 / 同步行但已有非 0 值（不许被覆盖）。
+	syncNonZero := "2026-11-15 12:03:00+00"
+	rows := []struct {
+		start, end, status, detail string
+	}{
+		{"2026-11-15 12:00:00+00", "2026-11-15 12:01:00+00", "ok", `{"phase":"sync","pages":1}`},
+		{"2026-11-15 12:01:00+00", "2026-11-15 12:02:00+00", "ok", `{"phase":"reconcile","dev_pct":0}`},
+		{"2026-11-15 12:02:00+00", "2026-11-15 12:03:00+00", "blocked", `{"phase":"sync","pages":20}`},
+		{"2026-11-15 12:03:00+00", "2026-11-15 12:04:00+00", "ok", `{"phase":"sync","pages":1}`},
+	}
+	for i, r := range rows {
+		// 计数显式写 0：模拟老库的「0 占位」（0023 之后新行默认是 NULL，不能靠默认值）。
+		if _, err := g.ExecContext(ctx,
+			`INSERT INTO reconcile_windows(window_start, window_end, status, detail,
+			     local_count, upstream_count, local_tokens, upstream_tokens)
+			 VALUES ($1,$2,$3,$4::jsonb,0,0,0,0)`, r.start, r.end, r.status, r.detail); err != nil {
+			t.Fatalf("插入第 %d 行失败: %v", i, err)
+		}
+	}
+	// 同步行带非 0 值时，0023c 的条件（四列全 0）不成立 → 不许动。
+	if _, err := g.ExecContext(ctx,
+		`UPDATE reconcile_windows SET local_count=5, local_tokens=500 WHERE window_start=$1`, syncNonZero); err != nil {
+		t.Fatalf("造非 0 同步行失败: %v", err)
+	}
+
+	body, err := os.ReadFile(filepath.Join("migrations", "0023c_v2_reconcile_counts_backfill.sql"))
+	if err != nil {
+		t.Fatalf("读 0023c 失败: %v", err)
+	}
+	for round := 0; round < 2; round++ { // 跑两遍验幂等
+		if _, err := g.ExecContext(ctx, string(body)); err != nil {
+			t.Fatalf("应用 0023c 失败（第 %d 遍）: %v", round+1, err)
+		}
+	}
+
+	read := func(start string) (lc, lt *int64) {
+		t.Helper()
+		if err := g.QueryRowContext(ctx,
+			`SELECT local_count, local_tokens FROM reconcile_windows WHERE window_start=$1`, start).
+			Scan(&lc, &lt); err != nil {
+			t.Fatalf("读 %s 失败: %v", start, err)
+		}
+		return lc, lt
+	}
+
+	// 1) 同步占位 0 → NULL（从没算过）。
+	if lc, lt := read("2026-11-15 12:00:00+00"); lc != nil || lt != nil {
+		t.Fatalf("同步占位 0 应归 NULL，got local_count=%v local_tokens=%v", lc, lt)
+	}
+	// 2) 对账真 0 → 保持 0（算过且确实没流量）。
+	lc, lt := read("2026-11-15 12:01:00+00")
+	if lc == nil || *lc != 0 || lt == nil || *lt != 0 {
+		t.Fatalf("对账写入的 0 必须保持 0，got local_count=%v local_tokens=%v", lc, lt)
+	}
+	// 3) blocked + 占位 0 → NULL（0023b 口径延续）。
+	if lc, lt := read("2026-11-15 12:02:00+00"); lc != nil || lt != nil {
+		t.Fatalf("blocked 占位 0 应归 NULL，got %v/%v", lc, lt)
+	}
+	// 4) 同步行里有非 0 值 → 不许被抹。
+	lc, lt = read(syncNonZero)
+	if lc == nil || *lc != 5 || lt == nil || *lt != 500 {
+		t.Fatalf("非 0 计数不许被覆盖，got local_count=%v local_tokens=%v", lc, lt)
+	}
+}

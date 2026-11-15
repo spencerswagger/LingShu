@@ -66,6 +66,7 @@ func V2MigrationFiles() []string {
 		"0022_v2_ledger.sql",
 		"0023_v2_reconcile.sql",
 		"0023b_v2_reconcile_repair.sql",
+		"0023c_v2_reconcile_counts_backfill.sql",
 		"0024_v2_drop_legacy.sql",
 	}
 }

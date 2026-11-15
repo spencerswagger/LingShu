@@ -88,6 +88,12 @@
   - `TestBilling_DimensionFromCallLogs`：由红转 **SKIP**（口径已改，行为段等代码债修好再补）。
 - 变异验证：把 `hasVendorToken` 判定掐掉 → `TestShouldDropResponseHeader_F8Classes`（3 个子例）、`TestForward_VendorIdentityHeadersDropped`、`TestV2_F8_ResponseHeaderScrub` 同时转红，报错直接点名 `X-OpenAI-Organization`。
 
+## 0.3 计数列 NULL 语义补洞（Gate 复验第 1 问，2026-11-15）
+
+- `0023b` **只**覆盖 `status IN ('blocked','error')` 且四列全 0 的行（`0023b_v2_reconcile_repair.sql:44-49`），**没有**处理老 `ok` 窗口的 0 占位 —— Gate 的复验是对的。
+- 补 `0023c_v2_reconcile_counts_backfill.sql`：条件是 `detail->>'phase' = 'sync'` **且**四列全 0 → 归 NULL。判据用写入方标记（同步轮次写 `phase='sync'` 且从不写计数；对账写 `phase='reconcile'`），因此对账算过的 0（真没流量）与没有标记的行都不动；任一列非 0 也不动。
+- 用例 `TestGate_D4_SyncPlaceholderZeroBecomesNull`：四类行（同步占位 0 / 对账真 0 / blocked 占位 0 / 同步非 0）跑两遍验幂等，断言只有前两类中「该归 NULL 的」被归 NULL，对账真 0 保持 0、非 0 值不被抹。
+
 ## 1. 改动清单（文件 → 改了什么 → 对应裁定）
 
 ### 迁移链（F4 / F2 / F7 / F9 / F10 / D4）
