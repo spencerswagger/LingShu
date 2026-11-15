@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/team/llmgateway/internal/pkg/dbx"
 	"github.com/team/llmgateway/internal/pkg/idgen"
 	"github.com/team/llmgateway/internal/pkg/money"
 )
@@ -76,6 +77,9 @@ type LedgerTx interface {
 	Upsert(ctx context.Context, entries []LedgerEntry) (int, error)
 	Commit() error
 	Rollback() error
+	// Execer 返回事务执行器：窗口行必须与账本同事务写（契约 §6.2），
+	// 通过它把「同步窗口状态」写进同一事务，而不是提交后再补一刀。
+	Execer() dbx.Execer
 }
 
 // LedgerTxBeginner 开一轮同步事务（*LedgerStore 满足）。
@@ -193,6 +197,9 @@ func (t *ledgerTx) Commit() error { return t.tx.Commit() }
 
 // Rollback 回滚整轮账本写入（已提交/已回滚时忽略错误）。
 func (t *ledgerTx) Rollback() error { return t.tx.Rollback() }
+
+// Execer 返回事务执行器（供窗口行同事务写入）。
+func (t *ledgerTx) Execer() dbx.Execer { return t.tx }
 
 // buildLedgerInsert 组装多行 INSERT（九列 + ON CONFLICT 幂等键）。
 func buildLedgerInsert(entries []LedgerEntry) (string, []any) {

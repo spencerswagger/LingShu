@@ -9,14 +9,15 @@ import (
 
 // V2 归因列口径（billing_records 纯 ADD，不改既有统计口径）。
 //
-// 六列：
+// 七列（列名/类型逐字对齐架构侧 0020，别自己加「更合理」的列）：
 //   - request_id       网关请求链路 ID（写入侧由网关传入；空 → NULL）
 //   - upstream_provider / upstream_account  上游回程头里的供应商与账号（取不到 → NULL，**不猜**）
 //   - upstream_protocol 上游协议，取值域见 upstream.AttributionProtocols()（空 → NULL）
 //   - upstream_model    上游真实模型名（空 → NULL）
+//   - ledger_entry_id   匹配到的账本条目 id（阶段一无匹配逻辑 → 恒 NULL，字段先留出）
 //   - cost_source       成本来源：ledger / amortized / none（空 → none）
 //
-// 迁移由架构侧 0019–0023 统一落地（ADD COLUMN + CHECK），本包只负责把值写进这六列。
+// 迁移由架构侧 0019–0023 统一落地（ADD COLUMN + CHECK），本包只负责把值写进这七列。
 const (
 	// CostSourceLedger 表示成本来自上游账本（真实对账口径）。
 	CostSourceLedger = "ledger"
@@ -79,6 +80,7 @@ func attributionArgs(rec *Record) ([]any, error) {
 		nullableText(rec.UpstreamAccount),
 		nullableText(rec.UpstreamProtocol),
 		nullableText(rec.UpstreamModel),
+		nullableText(rec.LedgerEntryID),
 		normalizeCostSource(rec.CostSource),
 	}, nil
 }

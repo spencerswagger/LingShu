@@ -19,13 +19,13 @@ func TestAttributionArgs_Normalization(t *testing.T) {
 	if err != nil {
 		t.Fatalf("空归因不应报错: %v", err)
 	}
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 6; i++ { // request_id / upstream_provider / upstream_account / upstream_protocol / upstream_model / ledger_entry_id
 		if args[i] != nil {
 			t.Fatalf("第 %d 列缺失时应写 NULL，got %v", i+1, args[i])
 		}
 	}
-	if args[5] != CostSourceNone {
-		t.Fatalf("cost_source 空值应归一为 none，got %v", args[5])
+	if args[6] != CostSourceNone {
+		t.Fatalf("cost_source 空值应归一为 none，got %v", args[6])
 	}
 
 	full := &Record{
@@ -35,13 +35,14 @@ func TestAttributionArgs_Normalization(t *testing.T) {
 		UpstreamAccount:  "acct-9",
 		UpstreamProtocol: "anthropic-messages",
 		UpstreamModel:    "claude-sonnet-4",
+		LedgerEntryID:    "led-9",
 		CostSource:       CostSourceLedger,
 	}
 	args, err = attributionArgs(full)
 	if err != nil {
 		t.Fatalf("合法归因不应报错: %v", err)
 	}
-	want := []any{"req-2", "anthropic", "acct-9", "anthropic-messages", "claude-sonnet-4", CostSourceLedger}
+	want := []any{"req-2", "anthropic", "acct-9", "anthropic-messages", "claude-sonnet-4", "led-9", CostSourceLedger}
 	for i := range want {
 		if args[i] != want[i] {
 			t.Fatalf("第 %d 列应为 %v，got %v", i+1, want[i], args[i])
@@ -80,7 +81,7 @@ func TestRecord_InsertsAttributionColumns(t *testing.T) {
 	args := txInsertArgs(credits, before, after, "completed")
 	// 末 6 位换成真实归因值（前 25 位沿用既有断言）。
 	args = append(append([]driver.Value{}, args[:25]...),
-		"req-attr-1", "openai", "acct-7", "openai-chat", "gpt-4o", CostSourceLedger)
+		"req-attr-1", "openai", "acct-7", "openai-chat", "gpt-4o", "led-attr-1", CostSourceLedger)
 	mock.ExpectQuery(insertBill.String()).WithArgs(args...).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(1), time.Now()))
 
@@ -97,6 +98,7 @@ func TestRecord_InsertsAttributionColumns(t *testing.T) {
 		UpstreamAccount:  "acct-7",
 		UpstreamProtocol: "openai-chat",
 		UpstreamModel:    "gpt-4o",
+		LedgerEntryID:    "led-attr-1",
 		CostSource:       CostSourceLedger,
 	})
 	if err != nil {

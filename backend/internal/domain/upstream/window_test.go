@@ -7,6 +7,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/team/llmgateway/internal/pkg/dbx"
 )
 
 // fakePageSource 按调用顺序返回预置分页，并记录每次请求的窗口与 offset。
@@ -86,6 +88,8 @@ func (t *fakeTx) Commit() error {
 	t.store.commits++
 	return nil
 }
+
+func (t *fakeTx) Execer() dbx.Execer { return nil }
 
 func (t *fakeTx) Rollback() error {
 	t.store.mu.Lock()

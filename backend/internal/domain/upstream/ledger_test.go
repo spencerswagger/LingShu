@@ -5,13 +5,9 @@ import (
 	"database/sql"
 	"fmt"
 	"math"
-	"net/url"
-	"os"
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/team/llmgateway/internal/db"
 )
 
 func validEntry(ledgerID string) LedgerEntry {
@@ -81,28 +77,10 @@ func TestBuildLedgerInsert_IdempotentShape(t *testing.T) {
 // 表由本用例按架构侧定稿的九字段在**临时库**里就地建——迁移文件归架构侧 0019–0023，
 // 本包不另写一套生产 DDL。
 func TestLedgerStore_UpsertIdempotent_DuplicateNotCounted(t *testing.T) {
-	conn := openLedgerTempDB(t)
+	conn := openMigratedTempDB(t)
 	ctx := context.Background()
 	if err := conn.PingContext(ctx); err != nil {
 		t.Fatalf("数据库 ping 失败: %v", err)
-	}
-
-	ddl := fmt.Sprintf(`CREATE TABLE %s (
-		id              BIGINT PRIMARY KEY,
-		ledger_id       TEXT NOT NULL,
-		provider        TEXT NOT NULL DEFAULT '',
-		provider_account TEXT NOT NULL DEFAULT '',
-		model           TEXT NOT NULL DEFAULT '',
-		tokens_in       BIGINT NOT NULL DEFAULT 0,
-		tokens_out      BIGINT NOT NULL DEFAULT 0,
-		cost_credits    NUMERIC(20,5) NOT NULL DEFAULT 0,
-		occurred_at     TIMESTAMPTZ NOT NULL
-	)`, LedgerTable)
-	if _, err := conn.ExecContext(ctx, ddl); err != nil {
-		t.Fatalf("建表失败: %v", err)
-	}
-	if _, err := conn.ExecContext(ctx, fmt.Sprintf(`CREATE UNIQUE INDEX %s_ledger_id_key ON %s(ledger_id)`, LedgerTable, LedgerTable)); err != nil {
-		t.Fatalf("建唯一索引失败: %v", err)
 	}
 
 	first := validEntry("led-same")
@@ -144,7 +122,7 @@ func TestLedgerStore_UpsertIdempotent_DuplicateNotCounted(t *testing.T) {
 		t.Fatalf("重复的 ledger_id 不应重复计数：应只插入 1 条，got %d", n)
 	}
 
-	// 库里总数 = 3（重复写入没有多出记录）。
+	// 库里总数 = 3（重复写入没有多出记录）；真实迁移建的 uq_ledger_entries_ledger_id 在守。
 	var total int
 	if err := conn.QueryRowContext(ctx, fmt.Sprintf(`SELECT count(*) FROM %s`, LedgerTable)).Scan(&total); err != nil {
 		t.Fatalf("统计失败: %v", err)
@@ -186,44 +164,4 @@ func TestLedgerStore_UnassembledDB(t *testing.T) {
 	if _, err := store.List(context.Background(), 0, 10); err == nil {
 		t.Fatal("未装配 db 时 List 应报错")
 	}
-}
-
-// openLedgerTempDB 以管理 DSN 建一个临时库（用例结束整体 DROP），
-// 与仓库既有「真实库用例自建临时库」口径一致：分页断言不会被历史残留行干扰。
-// 未设置 LLMGATEWAY_TEST_PG_DSN 或账号无 CREATEDB 权限时跳过。
-func openLedgerTempDB(t *testing.T) *sql.DB {
-	t.Helper()
-	dsn := os.Getenv("LLMGATEWAY_TEST_PG_DSN")
-	if dsn == "" {
-		t.Skip("未设置 LLMGATEWAY_TEST_PG_DSN，跳过账本真实库用例")
-	}
-	admin, err := db.Open(dsn)
-	if err != nil {
-		t.Fatalf("打开管理连接失败: %v", err)
-	}
-	t.Cleanup(func() { _ = admin.Close() })
-
-	name := fmt.Sprintf("v2_ledger_%d", time.Now().UnixNano())
-	if _, err := admin.ExecContext(context.Background(), "CREATE DATABASE "+name); err != nil {
-		t.Skipf("无法创建临时库（账号是否没有 CREATEDB 权限？）: %v", err)
-	}
-	t.Cleanup(func() {
-		// 用新连接执行 DROP：测试主体的连接可能已关闭。
-		if a, derr := db.Open(dsn); derr == nil {
-			_, _ = a.ExecContext(context.Background(), "DROP DATABASE IF EXISTS "+name+" WITH (FORCE)")
-			_ = a.Close()
-		}
-	})
-
-	u, err := url.Parse(dsn)
-	if err != nil {
-		t.Fatalf("解析 DSN 失败: %v", err)
-	}
-	u.Path = "/" + name
-	target, err := db.Open(u.String())
-	if err != nil {
-		t.Fatalf("打开临时库失败: %v", err)
-	}
-	t.Cleanup(func() { _ = target.Close() })
-	return target
 }

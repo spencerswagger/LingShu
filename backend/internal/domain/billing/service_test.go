@@ -203,7 +203,7 @@ func TestRecord_Success(t *testing.T) {
 		sqlmock.AnyArg(),                 // first_token_ms
 
 		// ===== V2 归因六列（未传值）：request_id/upstream_* 落 NULL，cost_source 归一 none =====
-		nil, nil, nil, nil, nil, CostSourceNone).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(1), time.Now()))
+		nil, nil, nil, nil, nil, nil, CostSourceNone).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(1), time.Now()))
 
 	credit := &fakeCredit{before: before, after: after}
 	now := time.Date(2026, 1, 2, 12, 0, 0, 0, shLocForTest(t))
@@ -266,7 +266,7 @@ func TestRecord_ConsumeError_RecordsFailed(t *testing.T) {
 		sqlmock.AnyArg(), sqlmock.AnyArg(),
 
 		// ===== V2 归因六列（未传值）：request_id/upstream_* 落 NULL，cost_source 归一 none =====
-		nil, nil, nil, nil, nil, CostSourceNone).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(2), time.Now()))
+		nil, nil, nil, nil, nil, nil, CostSourceNone).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(2), time.Now()))
 
 	credit := &fakeCredit{err: consumeErr}
 	svc := newTestService(db, credit, newFakeConfig(), time.Date(2026, 1, 2, 12, 0, 0, 0, shLocForTest(t)))
@@ -369,7 +369,7 @@ func TestRecord_CostMode_RecordsCostCredits(t *testing.T) {
 		sqlmock.AnyArg(), sqlmock.AnyArg(),
 
 		// ===== V2 归因六列（未传值）：request_id/upstream_* 落 NULL，cost_source 归一 none =====
-		nil, nil, nil, nil, nil, CostSourceNone).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(3), time.Now()))
+		nil, nil, nil, nil, nil, nil, CostSourceNone).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(3), time.Now()))
 
 	credit := &fakeCredit{before: 10, after: 10 - credits}
 	svc := newTestService(db, credit, newFakeConfig(), time.Date(2026, 1, 2, 12, 0, 0, 0, shLocForTest(t)))
@@ -425,7 +425,7 @@ func TestRecord_SaleMode_CostCreditsDistinctFromCredits(t *testing.T) {
 		sqlmock.AnyArg(), sqlmock.AnyArg(),
 
 		// ===== V2 归因六列（未传值）：request_id/upstream_* 落 NULL，cost_source 归一 none =====
-		nil, nil, nil, nil, nil, CostSourceNone).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(4), time.Now()))
+		nil, nil, nil, nil, nil, nil, CostSourceNone).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(4), time.Now()))
 
 	credit := &fakeCredit{before: 10, after: 10 - credits}
 	svc := newTestService(db, credit, newFakeConfig(), time.Date(2026, 1, 2, 12, 0, 0, 0, shLocForTest(t)))
@@ -578,12 +578,13 @@ func txInsertArgs(credits, before, after float64, status string) []driver.Value 
 		sqlmock.AnyArg(),                 // error_message
 		sqlmock.AnyArg(),                 // duration_ms
 		sqlmock.AnyArg(),                 // first_token_ms
-		// ===== V2 归因六列：未传值 → request_id/upstream_* 落 NULL，cost_source 归一为 none =====
+		// ===== V2 归因七列：未传值 → request_id/upstream_*/ledger_entry_id 落 NULL，cost_source 归一为 none =====
 		nil,            // request_id
 		nil,            // upstream_provider
 		nil,            // upstream_account
 		nil,            // upstream_protocol
 		nil,            // upstream_model
+		nil,            // ledger_entry_id
 		CostSourceNone, // cost_source
 	}
 }
@@ -1212,7 +1213,7 @@ func TestRecord_ModelLevelOverride(t *testing.T) {
 		sqlmock.AnyArg(), sqlmock.AnyArg(),
 
 		// ===== V2 归因六列（未传值）：request_id/upstream_* 落 NULL，cost_source 归一 none =====
-		nil, nil, nil, nil, nil, CostSourceNone).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(7), time.Now()))
+		nil, nil, nil, nil, nil, nil, CostSourceNone).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(7), time.Now()))
 
 	credit := &fakeCredit{before: 10, after: 9.7}
 	svc := newTestService(db, credit, newFakeConfig(), time.Date(2026, 1, 2, 12, 0, 0, 0, shLocForTest(t)))
@@ -1278,7 +1279,7 @@ func TestRecord_Dimension(t *testing.T) {
 		sqlmock.AnyArg(),                 // first_token_ms
 
 		// ===== V2 归因六列（未传值）：request_id/upstream_* 落 NULL，cost_source 归一 none =====
-		nil, nil, nil, nil, nil, CostSourceNone).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(8), time.Now()))
+		nil, nil, nil, nil, nil, nil, CostSourceNone).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(8), time.Now()))
 
 	credit := &fakeCredit{before: 10, after: 10 - credits}
 	svc := newTestService(db, credit, newFakeConfig(), time.Date(2026, 1, 2, 12, 0, 0, 0, shLocForTest(t)))

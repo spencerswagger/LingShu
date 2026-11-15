@@ -132,6 +132,8 @@ type Record struct {
 	UpstreamProtocol string
 	// UpstreamModel 上游真实模型名。
 	UpstreamModel string
+	// LedgerEntryID 匹配到的账本条目 id（阶段一没有匹配逻辑 → 恒空 → NULL）。
+	LedgerEntryID string
 	// CostSource 成本来源：ledger / amortized / none（空按 none 落库）。
 	CostSource string
 	// Attempts 该请求共产生的账单条数（仅归并列表查询时填充；1=单次尝试，>1=发生过候选/上游重试）。
@@ -173,6 +175,7 @@ type RecordReq struct {
 	UpstreamAccount  string
 	UpstreamProtocol string
 	UpstreamModel    string
+	LedgerEntryID    string
 	CostSource       string
 }
 
@@ -251,6 +254,7 @@ func (s *Service) Record(ctx context.Context, req RecordReq) (*Record, error) {
 			UpstreamAccount:  req.UpstreamAccount,
 			UpstreamProtocol: req.UpstreamProtocol,
 			UpstreamModel:    req.UpstreamModel,
+			LedgerEntryID:    req.LedgerEntryID,
 			CostSource:       req.CostSource,
 		}
 		if _, err := s.store.Insert(ctx, rec); err != nil {
@@ -323,6 +327,7 @@ func (s *Service) Record(ctx context.Context, req RecordReq) (*Record, error) {
 		UpstreamAccount:  req.UpstreamAccount,
 		UpstreamProtocol: req.UpstreamProtocol,
 		UpstreamModel:    req.UpstreamModel,
+		LedgerEntryID:    req.LedgerEntryID,
 		CostSource:       req.CostSource,
 	}
 	// 只要提供了成本单价就记录成本积分（仅展示/毛利差异，不参与扣减）：
@@ -996,7 +1001,7 @@ func (s *SqlStore) insertOn(ctx context.Context, ex dbx.Execer, rec *Record) (*R
 	}
 	durationMs := nullableInt64For(rec.DurationMs)
 	firstTokenMs := nullableInt64For(rec.FirstTokenMs)
-	// V2 归因六列：校验后按 NULL/none 归一（非法取值在写库前就报错，不留到 CHECK 约束里）。
+	// V2 归因七列：校验后按 NULL/none 归一（非法取值在写库前就报错，不留到 CHECK 约束里）。
 	attr, err := attributionArgs(rec)
 	if err != nil {
 		return nil, err
@@ -1010,9 +1015,9 @@ func (s *SqlStore) insertOn(ctx context.Context, ex dbx.Execer, rec *Record) (*R
 		`INSERT INTO billing_records(id, billing_id, user_id, pricing_mode, token_id, external_model_name,
 			auto_model_name, internal_model_id, channel_key_id, session_id, session_name, call_time, tokens, rates, coefficients, r_value,
 			raw_total, credits_consumed, cost_credits, balance_before, balance_after, status, error_message, duration_ms, first_token_ms,
-			request_id, upstream_provider, upstream_account, upstream_protocol, upstream_model, cost_source)
+			request_id, upstream_provider, upstream_account, upstream_protocol, upstream_model, ledger_entry_id, cost_source)
 		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,
-			$26,$27,$28,$29,$30,$31)
+			$26,$27,$28,$29,$30,$31,$32)
 		 RETURNING id, created_at`,
 		append([]any{
 			rec.ID, rec.BillingID, rec.UserID, rec.PricingMode, tokenID, rec.ExternalModel, autoModelName,
