@@ -11,7 +11,8 @@ import (
 //
 // 本批的边界（裁定后的口径，覆盖上一版「0021 必须被摘出去」）：
 //  1. 文件集合恰好是 0019 / 0020 / 0022 / 0023 / 0024，**没有 0021**（已更名 0024）；
-//  2. 0024 是目录里文件名最大的迁移 —— 字典序 = 执行序，破坏性动作一次启动里最后执行；
+//  2. 0024 是**本批（< 0025）**文件名最大的迁移 —— 字典序 = 执行序，破坏性动作在本批里最后执行；
+//     0025 起的迁移（token_scope 顺延 0025）属于后续批，本批探测右界是 <'0025'；
 //  3. 破坏性 DDL（DROP TABLE / DROP COLUMN）**只允许出现在 0024**；0019 起的其它文件必须纯 ADD。
 //     上一版只查文件名，被「把 0021 改名成 0024_*」直接绕过（复审 R1 实测 PASS），所以这里查内容；
 //  4. 两个裁定点必须在文件里（改回旧口径要红）：
@@ -35,9 +36,12 @@ func TestMigrationChain_V2Batch(t *testing.T) {
 			"（手工留两份会让同一份 DDL 跑两次、且 0021 会在 0023 之前执行）")
 	}
 
-	// 字典序 = 执行序：0024 必须是最后一个。
+	// 字典序 = 执行序：**本批内**（右界 < 0025）0024 必须是最后一个。
 	var last string
 	for name := range present {
+		if name >= V2MigrationRightBound {
+			continue // 后续批（0025+）不参与本批排序断言
+		}
 		if name > last {
 			last = name
 		}
@@ -48,8 +52,9 @@ func TestMigrationChain_V2Batch(t *testing.T) {
 	}
 
 	for name := range present {
-		// 0019 之前的迁移是历史（0005/0006/0009 等本来就含 DROP），不在本批约束范围。
-		if name < "0019" {
+		// 本批范围 = [0019, 0025)。0019 之前是历史（0005/0006/0009 等本来就含 DROP）；
+		// 0025 起是后续批（token_scope），本批不为它做保证。
+		if name < "0019" || name >= V2MigrationRightBound {
 			continue
 		}
 		body := readMigration(t, dir, name)

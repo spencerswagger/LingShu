@@ -63,9 +63,6 @@ type ForwardRequest struct {
 	Path string
 	// Query 是入站 query 原样（F6）；只有 asQueryKey 为 true 时才剔除 `key`。
 	Query string
-	// StripQueryKey 表示本次鉴权用的是 query 里的 `key`（Gemini 原生写法），
-	// 转发时必须剔除：否则把租户令牌带给上游。
-	StripQueryKey bool
 	// Header 是入站 header（本包负责按黑名单剔除后透传）。
 	Header http.Header
 	// Body 是改写后的请求体（除 model 外与入站逐字节一致）。
@@ -192,9 +189,10 @@ func (f *Forwarder) Forward(ctx context.Context, w http.ResponseWriter, req Forw
 	// 1) 组 URL：path 已由主链改写；query 原样（F6），唯一例外是 Gemini 的 `?key=`。
 	u := strings.TrimRight(req.BaseURL, "/") + req.Path
 	if q := req.Query; q != "" {
-		if req.StripQueryKey {
-			q = StripQueryParam(q, "key")
-		}
+		// F6（安全默认，2026-11-15 收紧）：**任何路径**上的 `key` 参数一律剔除，
+		// 不区分是不是 Gemini 原生鉴权写法。理由只有一条：租户令牌不得透传到上游。
+		// 其余参数逐字保留；剔完为空就不留尾部 `?`。
+		q = StripQueryParam(q, "key")
 		if q != "" {
 			u += "?" + q
 		}
@@ -389,6 +387,24 @@ func (r *idleReader) Read(p []byte) (int, error) {
 //
 // 不重新编码是刻意的：`?alt=sse&prettyPrint=false` 这类参数重新编码后可能变形状，
 // 上游按 query 做缓存/签名校验时会立刻暴露。
+// HasQueryParam 报告 raw query 里是否出现给定参数名（与 StripQueryParam 同一套切段规则）。
+// 调用方用它决定是否要告警：剔除是默认行为，告警才是可观测点。
+func HasQueryParam(raw, key string) bool {
+	if raw == "" || key == "" {
+		return false
+	}
+	for _, p := range strings.Split(raw, "&") {
+		name := p
+		if i := strings.Index(p, "="); i >= 0 {
+			name = p[:i]
+		}
+		if name == key {
+			return true
+		}
+	}
+	return false
+}
+
 func StripQueryParam(raw, key string) string {
 	if raw == "" || key == "" {
 		return raw

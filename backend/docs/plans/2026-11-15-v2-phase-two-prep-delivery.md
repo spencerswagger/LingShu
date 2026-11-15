@@ -22,6 +22,45 @@
 
 另按补充约束：**blocked/error 窗口的计数列必须 NULL，不许写 0**。已改成计数列可空（`NULL` = 未算过，`0` = 算过且真的没流量），`0023b` 把老库里 blocked/error 行的 0 占位归 NULL；对账服务拒绝对 blocked 行写计数（`ErrWindowNotReconcilable`）。计数列写入方按裁定补齐，**没有**扩到七列读取方。
 
+## 0.1 F6 收紧与 F9「先证后写」（2026-11-15 补）
+
+### F6：任何路径的 `?key=` 一律剔除
+
+- 口径：**租户令牌不得透传到上游**。不再有「Gemini 原生鉴权才剔」的例外；用 header 鉴权却在
+  query 里挂着令牌的调用方同样被剔（这种最该被看见），并留一条 WARN（日志只记 path 与「本次是否用 query 鉴权」，
+  **不记令牌原文**）。
+- 行为细节：其余参数（`alt=sse`、`prettyPrint` 等）**逐字原样**；剔完为空则上游 query 是空串，
+  **不留尾部 `?`**；参数名大小写敏感（`Key=` 不误剔）。
+- 实现：`magpie.ForwardRequest.StripQueryKey` 字段**删除**（布尔开关会让「忘了置 true」变成静默泄漏），
+  改为 `Forward` 内无条件 `StripQueryParam(q,"key")`；新增 `magpie.HasQueryParam` 供主链告警判据。
+- 用例：`TestForward_QueryPassthroughExceptKey`（6 条形状，含非 Gemini 路径、key 在中间、大小写）、
+  `TestV2_F6_AnyPathKeyParamStrippedAndWarned`（端到端：上游收到 `alt=sse`、日志有 WARN 且**不含令牌原文**、
+  只有 key 时上游 query 为空串）。
+- 文档口径只写一条理由：**租户令牌不得透传到上游**。
+
+### F9：上游排序能力先证后写（POC）
+
+- 新增能力探测 `upstream.ProbeLedgerOrder`：取相邻两页，验三条——页内按 `(occurred_at, ledger_id)` 非递减、
+  跨页不回退、样本 ≥2（只有一条 = 没证过）。三条结论：`supported` / `unsupported` / `unverified`。
+- 闸门在 `Rounder.RunOnce` 的**翻页之前**：`LedgerOrder != supported` → 本窗直接记 `blocked`
+  （Pages/Fetched/Inserted 为 0、`scroll_offset=0`、reason 写明「排序能力未证实」），
+  返回 `ErrLedgerOrderUnproven`，**一条都不拉、不写账本**。
+  为什么不在翻页中途发现再退：翻页一旦跑过，offset 就写进库了，等于用一个不可信的排序去证明进度。
+- POC 结果（本次）：
+  - 链路验证 **PASS**：`TestPOC_UpstreamLedgerOrder_Mock` 用真实 HTTP 分页源（`GET /v1/magpie/usage/requests`
+    + offset 翻页）对着同一 mock 上游的两种排序跑：升序判 `supported`、乱序判 `unsupported`。
+  - **真实上游未执行**：沙盒里没有上游地址/凭据（`TestPOC_UpstreamLedgerOrder_Real` 无 `UPSTREAM_LEDGER_URL` 时 SKIP）。
+    因此当前结论是 `unverified`，行为按裁定的保守分支：**本窗记 blocked、不可清零**。
+    复跑方式（有上游时一条命令）：`UPSTREAM_LEDGER_URL=… UPSTREAM_ADMIN_KEY=… go test ./internal/domain/upstream/ -run TestPOC_UpstreamLedgerOrder_Real -v`。
+- 新增 `upstream.HTTPLedgerSource`（`PageSource` 的生产实现，契约与 `usagebilling` 分支的 `LedgerPath` 同源）。
+  它**刻意不做本地排序**：在这里补一个 sort 会把「上游乱序」完全掩盖，探测永远返回 supported。
+
+### 迁移编号（已定项）
+
+- `drop_legacy` 占 **0024**；`token_scope` 顺延 **0025**；本批右界常量 `V2MigrationRightBound = "0025"`，
+  所有「本批内 0024 必须最后 / 只允许 0024 破坏性」的断言都以 `[0019, 0025)` 为界——后续批加 0025 不会把本批守卫打红。
+- F10 用 `NOT VALID`；F1 仍是**两键**（`stream_first_byte_ms` / `stream_idle_ms`）+ `connect 10s`、`request 600s` 作代码常量。
+
 ## 1. 改动清单（文件 → 改了什么 → 对应裁定）
 
 ### 迁移链（F4 / F2 / F7 / F9 / F10 / D4）
@@ -85,10 +124,15 @@
   - `TestRounder_RealSQL_Backlog4200_TwoRounds` PASS：见 §0 第 6 条。
   - `TestSQLWindowStore_RealSQL_SkippedWritableAndCountsWritten` PASS：真库可写 `skipped`；计数列落真实数字；blocked 行拒绝对账覆盖且计数为 NULL。
 - **带 DSN 全量**：与上一轮完全一致，仍只有那 9 个"退役 schema"用例红（见 §3-A），**没有新增红**。
+- 新增（本轮 F6/F9 补）：`TestForward_QueryPassthroughExceptKey`、`TestV2_F6_AnyPathKeyParamStrippedAndWarned`、
+  `TestRounder_OrderUnprovenBlocksWithoutFetching`（未证实/已证否两分支都不翻页、不写账本、offset 保持 0）、
+  `TestProbeLedgerOrder_Cases`（6 种排序形状）、`TestPOC_UpstreamLedgerOrder_Mock`（真实 HTTP 源 + 两种排序）。
 - 变异验证（删掉修复 → 用例变红，证明断言不是摆设）：
   - 删身份类头名的剥除分支 → `TestV2_F8_ResponseHeaderScrub` 红（`x-served-by` 漏出）；
   - 把续拉 offset 强制置 0 → `TestRounder_RealSQL_Backlog4200_TwoRounds` 红（第二轮仍 blocked，与基线现象同形）；
-  - 把 `IS NOT DISTINCT FROM` 换回 `=` → 新写「NULL + ledger」放行，`TestGate_F10` 红。
+  - 把 `IS NOT DISTINCT FROM` 换回 `=` → 新写「NULL + ledger」放行，`TestGate_F10` 红；
+  - 把 `key` 剔除条件改回「仅 Gemini 路径」→ `TestV2_F6_AnyPathKeyParamStrippedAndWarned` 红；
+  - 把能力闸门挪到翻页之后 → `TestRounder_OrderUnprovenBlocksWithoutFetching` 红。
 
 ## 3. 未完成项与已知缺口（登记，不承诺已解决）
 
@@ -113,7 +157,8 @@
 - 对账循环随进程起（60s），未做优雅退出等待、未做多副本互斥（单副本无碍）。
 - `external_models.bound_internal_ref` 已进入读模型，但**管理端没有编辑该字段的入口**（写入路径留给 V2 配置界面）。
 - 全仓库仍有大量 `channel_key_id` / 渠道表引用（非测试 ~60 处），属 A 项同一件事。
-- **同步轮次没有生产分页源**：`PageSource` 只有接口，`cmd/server` 里也只装配了对账循环、没装配 `Rounder`。本切片用遵守 offset 语义的测试源验证了 F9 行为，但"从上游用量接口拉账本"的 HTTP 实现仍是下一件的活（这也是基线红第 6 条的真实根因）。
+- **同步轮次仍未装配**：`PageSource` 的生产实现（`HTTPLedgerSource`）本轮补上了，但 `cmd/server` 里只装配了对账循环、**没有**装配 `Rounder`（ticker + 能力探测接线的活还没做）。因此 F9 的行为目前由用例保证，生产里还不会真的跑同步。
+- **上游排序能力仍未证实**：真实上游 POC 未执行 → 结论 `unverified` → 一旦接线，所有同步窗都会记 blocked 且不可清零，直到 POC 通过（`supported`）。这是裁定要的保守行为，不是 bug。
 - 迁移编号新开了一个 `0023b`（幂等修形，排在 `0023` 与 `0024` 之间）：原因是**改过的 .sql 不会重放**，老环境必须有一条新迁移才能拿到最终形状。这不是复用 `0021` 空号。
 
 ## 4. 同一窗口重复写 `blocked` 的幂等性

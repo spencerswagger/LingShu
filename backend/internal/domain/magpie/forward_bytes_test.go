@@ -227,8 +227,9 @@ func TestForward_StreamResponseBytesIdentical(t *testing.T) {
 	}
 }
 
-// TestForward_QueryPassthroughExceptGeminiKey 覆盖 F6：query 原样，只有 ?key= 被剔除。
-func TestForward_QueryPassthroughExceptGeminiKey(t *testing.T) {
+// TestForward_QueryPassthroughExceptKey 覆盖 F6（安全默収紧版）：query 逐字原样，
+// **任何路径**上的 `key` 参数一律剔除（不再对 Gemini 例外），剔完为空不留尾部 `?`。
+func TestForward_QueryPassthroughExceptKey(t *testing.T) {
 	var gotQuery string
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotQuery = r.URL.RawQuery
@@ -239,21 +240,23 @@ func TestForward_QueryPassthroughExceptGeminiKey(t *testing.T) {
 	f := NewForwarder()
 	cases := []struct {
 		name  string
+		path  string
 		query string
-		strip bool
 		want  string
 	}{
-		{"原样保留", "alt=sse&prettyPrint=false&x=%2F", false, "alt=sse&prettyPrint=false&x=%2F"},
-		{"剔 Gemini key", "key=secret&alt=sse", true, "alt=sse"},
-		{"只剔 key 本身", "key=secret", true, ""},
-		{"不 strip 时 key 也原样", "key=secret&alt=sse", false, "key=secret&alt=sse"},
+		{"原样保留", "/v1/chat/completions", "alt=sse&prettyPrint=false&x=%2F", "alt=sse&prettyPrint=false&x=%2F"},
+		{"Gemini 原生也剔", "/v1beta/models/m:generateContent", "key=secret&alt=sse", "alt=sse"},
+		{"只剔 key 本身（不留 ?）", "/v1beta/models/m:generateContent", "key=secret", ""},
+		{"非 Gemini 路径同样剔", "/v1/chat/completions", "key=secret&alt=sse", "alt=sse"},
+		{"key 在中间也剔", "/v1/messages", "a=1&key=secret&b=2", "a=1&b=2"},
+		{"大写 K 不是 key（不误剔）", "/v1/messages", "Key=secret", "Key=secret"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			rec := httptest.NewRecorder()
 			if res := f.Forward(t.Context(), rec, ForwardRequest{
-				BaseURL: up.URL, Path: "/v1beta/models/m:generateContent", Query: c.query,
-				StripQueryKey: c.strip, Header: http.Header{}, Body: []byte(`{}`),
+				BaseURL: up.URL, Path: c.path, Query: c.query,
+				Header: http.Header{}, Body: []byte(`{}`),
 				RequestID: "rid", Protocol: ProtocolGemini,
 			}, Timeouts{StreamFirstByte: 5 * time.Second, StreamIdle: 5 * time.Second}); res.Err != nil {
 				t.Fatalf("转发失败: %v", res.Err)

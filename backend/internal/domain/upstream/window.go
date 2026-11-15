@@ -399,6 +399,12 @@ type RounderOptions struct {
 	PageSize int
 	// MaxPages 为 0 时用 MaxPagesPerRound。
 	MaxPages int
+	// LedgerOrder 是上游账本排序能力的**实测结论**（见 ProbeLedgerOrder）。
+	// 零值 = LedgerOrderUnverified（未证过）：此时本轮直接记 blocked，不翻页。
+	// 依据 F9 裁定：证不了稳定升序就不许清零该窗，也不许自己造排序。
+	LedgerOrder LedgerOrder
+	// LedgerOrderReason 是探测依据（进窗 detail，便于排障）。
+	LedgerOrderReason string
 	// Now 为 nil 时用 time.Now（用例注入固定时钟）。
 	Now    func() time.Time
 	Logger *slog.Logger
@@ -413,6 +419,8 @@ type Rounder struct {
 	maxPages int
 	now      func() time.Time
 	log      *slog.Logger
+	order    LedgerOrder
+	orderWhy string
 }
 
 // NewRounder 创建同步轮次执行器。
@@ -441,6 +449,8 @@ func NewRounder(opts RounderOptions) *Rounder {
 		maxPages: maxPages,
 		now:      now,
 		log:      log,
+		order:    opts.LedgerOrder,
+		orderWhy: opts.LedgerOrderReason,
 	}
 }
 
@@ -524,6 +534,22 @@ func (r *Rounder) RunOnce(ctx context.Context) (RoundResult, error) {
 		resumeOffset = blocked[0].ScrollOffset
 	}
 	result.ResumeOffset = resumeOffset
+
+	// 能力闸门（F9「先证后写」）：排序能力未证实/已证否 → 本窗直接 blocked，**不翻页**。
+	// 为什么不在翻页中途发现再退：翻页一旦跑过，offset 已写进库，等于用一个不可信的
+	// 排序「证明」了进度；宁可停在 0，把「上游支持前不可清零」写在窗上。
+	if r.order != LedgerOrderSupported {
+		order := r.order
+		reason := r.orderWhy
+		if reason == "" {
+			reason = "排序能力未经证实"
+		}
+		unproven := &ErrLedgerOrderUnproven{Window: w, Order: order, Reason: reason}
+		r.saveStatus(ctx, result, WindowBlocked, unproven.Error(), 0, scanStart)
+		log.Error("上游同步跳过并记 blocked：账本排序能力未证实（本窗不可清零）",
+			"window", w.String(), "order", order.String(), "reason", reason)
+		return result, unproven
+	}
 
 	offset := int(resumeOffset)
 	for {

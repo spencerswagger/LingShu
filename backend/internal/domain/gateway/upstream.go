@@ -113,6 +113,13 @@ func (g *Gateway) serveUpstream(w http.ResponseWriter, r *http.Request) {
 
 	// 2) 鉴权：Bearer / x-api-key / x-goog-api-key / ?key=（Gemini 原生写法）。
 	plain, fromQuery := extractInboundToken(r)
+	// F6（安全默认）：任何路径上出现 `key` 参数都在转发前剔除并留一条 WARN。
+	// 告警的判据是「参数存在」，不是「这次用它鉴权了」——用 header 鉴权却把令牌挂在
+	// query 上的调用方同样会把令牌带出去，这种最该被看见。
+	if magpie.HasQueryParam(r.URL.RawQuery, "key") {
+		g.logFor(ctx).Warn("请求 query 带 key 参数，已剔除、不向上游透传（租户令牌不得透传到上游）",
+			"path", r.URL.Path, "auth_from_query", fromQuery)
+	}
 	if plain == "" {
 		writeUpstreamError(w, route.Protocol, http.StatusUnauthorized, msgInvalidToken)
 		return
@@ -194,7 +201,6 @@ func (g *Gateway) serveUpstream(w http.ResponseWriter, r *http.Request) {
 		BaseURL:            cfg.BaseURL,
 		Path:               upstreamPath,
 		Query:              r.URL.RawQuery,
-		StripQueryKey:      fromQuery,
 		Header:             r.Header.Clone(),
 		Body:               forwardBody,
 		Streaming:          route.StreamHint || (!route.ModelInPath && magpie.StreamRequested(body)),

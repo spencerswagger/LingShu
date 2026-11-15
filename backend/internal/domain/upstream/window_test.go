@@ -2,8 +2,13 @@ package upstream
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -124,6 +129,9 @@ func newTestRounder(t *testing.T, src PageSource, led *fakeLedger, wins *MemoryW
 		Windows: wins,
 		Now:     func() time.Time { return now },
 		Logger:  testLogger(),
+		// 用例假定上游已证过升序能力（F9 闸门的正向路径）；闸门本身另有专门用例。
+		LedgerOrder:       LedgerOrderSupported,
+		LedgerOrderReason: "用例假定",
 	})
 }
 
@@ -413,6 +421,7 @@ func TestRounder_RealSQL_Backlog4200_TwoRounds(t *testing.T) {
 	r := NewRounder(RounderOptions{
 		Source: src, Ledger: led, Windows: wins,
 		Now: func() time.Time { return clock }, Logger: testLogger(),
+		LedgerOrder: LedgerOrderSupported, LedgerOrderReason: "用例假定",
 	})
 
 	res1, err := r.RunOnce(ctx)
@@ -484,5 +493,212 @@ func TestRounder_RealSQL_Backlog4200_TwoRounds(t *testing.T) {
 	}
 	if cnt != nil {
 		t.Fatalf("同步轮次不该写计数列（应为 NULL），got %d", *cnt)
+	}
+}
+
+// TestRounder_OrderUnprovenBlocksWithoutFetching 覆盖 F9「先证后写」：
+// 排序能力未证实（或已证否）时，本窗直接记 blocked、一条都不拉、offset 保持 0。
+//
+// 为什么必须「先证」而不是「拉一半发现再退」：翻页一旦跑过，offset 就写进库了，
+// 等于用一个不可信的排序去证明进度；之后要么漏账（静默）要么永远补不平。
+func TestRounder_OrderUnprovenBlocksWithoutFetching(t *testing.T) {
+	for _, order := range []LedgerOrder{LedgerOrderUnverified, LedgerOrderUnsupported} {
+		t.Run(order.String(), func(t *testing.T) {
+			now := time.Date(2026, 11, 15, 10, 0, 0, 0, time.UTC)
+			src := &fakePageSource{pages: []Page{{Entries: entries("led-1"), HasMore: true}}}
+			led := newFakeLedger()
+			wins := NewMemoryWindowStore()
+			r := NewRounder(RounderOptions{
+				Source: src, Ledger: led, Windows: wins,
+				Now:               func() time.Time { return now },
+				Logger:            testLogger(),
+				LedgerOrder:       order,
+				LedgerOrderReason: "上游未提供稳定升序承诺",
+			})
+
+			_, err := r.RunOnce(context.Background())
+			if !IsLedgerOrderUnproven(err) {
+				t.Fatalf("应返回排序能力缺失的 blocked 错误，got %T %v", err, err)
+			}
+			if len(src.offsets) != 0 {
+				t.Fatalf("证不了排序就不许翻页，got offsets=%v", src.offsets)
+			}
+			if led.count() != 0 || led.commits != 0 {
+				t.Fatalf("不许写账本，got stored=%d commits=%d", led.count(), led.commits)
+			}
+			recs := wins.Records()
+			if len(recs) != 1 || recs[0].Status != WindowBlocked {
+				t.Fatalf("应落一条 blocked 窗口，got %+v", recs)
+			}
+			if recs[0].ScrollOffset != 0 {
+				t.Fatalf("不许假装有进度（offset 必须 0），got %d", recs[0].ScrollOffset)
+			}
+			if !strings.Contains(recs[0].Reason, "排序能力") {
+				t.Fatalf("blocked 原因要点名排序能力，got %q", recs[0].Reason)
+			}
+			if _, ok, _ := wins.LastSuccessEnd(context.Background()); ok {
+				t.Fatal("blocked 不许推进水位线")
+			}
+		})
+	}
+}
+
+// TestProbeLedgerOrder_Cases 覆盖能力探测本身的三种结论（含「样本不足 = 未证实」）。
+func TestProbeLedgerOrder_Cases(t *testing.T) {
+	base := time.Date(2026, 11, 15, 10, 0, 0, 0, time.UTC)
+	at := func(i int) time.Time { return base.Add(time.Duration(i) * time.Second) }
+	mkFrom := func(from int, ids ...string) []LedgerEntry {
+		out := make([]LedgerEntry, 0, len(ids))
+		for i, id := range ids {
+			out = append(out, LedgerEntry{LedgerID: id, OccurredAt: at(from + i)})
+		}
+		return out
+	}
+
+	cases := []struct {
+		name  string
+		pages []Page
+		want  LedgerOrder
+	}{
+		{
+			name:  "升序且跨页不回退 → 支持",
+			pages: []Page{{Entries: mkFrom(0, "a", "b"), HasMore: true}, {Entries: mkFrom(2, "c", "d"), HasMore: false}},
+			want:  LedgerOrderSupported,
+		},
+		{
+			name:  "同值按 ledger_id 升序 → 支持",
+			pages: []Page{{Entries: []LedgerEntry{{LedgerID: "a", OccurredAt: base}, {LedgerID: "b", OccurredAt: base}}, HasMore: true}, {Entries: []LedgerEntry{{LedgerID: "c", OccurredAt: base}}, HasMore: false}},
+			want:  LedgerOrderSupported,
+		},
+		{
+			name: "occurred_at 回退 → 不支持",
+			pages: []Page{
+				{Entries: []LedgerEntry{{LedgerID: "b", OccurredAt: at(1)}, {LedgerID: "a", OccurredAt: at(0)}}, HasMore: true},
+				{Entries: mkFrom(2, "c"), HasMore: false},
+			},
+			want: LedgerOrderUnsupported,
+		},
+		{
+			name:  "同值缺 tie-break（b 在 a 之前）→ 不支持",
+			pages: []Page{{Entries: []LedgerEntry{{LedgerID: "b", OccurredAt: base}, {LedgerID: "a", OccurredAt: base}}, HasMore: false}},
+			want:  LedgerOrderUnsupported,
+		},
+		{
+			name:  "跨页回退 → 不支持",
+			pages: []Page{{Entries: mkFrom(0, "a", "c"), HasMore: true}, {Entries: mkFrom(1, "b"), HasMore: false}},
+			want:  LedgerOrderUnsupported,
+		},
+		{
+			name:  "样本不足（1 条）→ 未证实",
+			pages: []Page{{Entries: mkFrom(0, "a"), HasMore: false}, {}},
+			want:  LedgerOrderUnverified,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := ProbeLedgerOrder(context.Background(), &fakePageSource{pages: c.pages},
+				Window{Start: base, End: base.Add(WindowSize)}, 10)
+			if got.Order != c.want {
+				t.Fatalf("探测结论不符：got %s (%s) want %s", got.Order, got.Reason, c.want)
+			}
+			if got.Reason == "" {
+				t.Fatal("结论必须带人能看懂的依据（要进窗 detail）")
+			}
+			if got.CheckedAt.IsZero() {
+				t.Fatal("探测结论必须带探测时刻")
+			}
+		})
+	}
+}
+
+// TestPOC_UpstreamLedgerOrder_Mock 是「先证后写」的 POC 本身：走真实 HTTP 分页源 +
+// 能力探测，对着**同一个 mock 上游**的两种排序跑一遍——升序判「支持」、乱序判「不支持」。
+//
+// 这一条的用途：证明探测链路（HTTP 源 → ProbeLedgerOrder → 结论）是通的、且能识别坏排序。
+// 真实上游的 POC 见 TestPOC_UpstreamLedgerOrder_Real（需 UPSTREAM_LEDGER_URL）。
+func TestPOC_UpstreamLedgerOrder_Mock(t *testing.T) {
+	base := time.Date(2026, 11, 15, 10, 0, 0, 0, time.UTC)
+	itemsAsc := []map[string]any{}
+	itemsDesc := []map[string]any{}
+	for i := 0; i < 5; i++ {
+		item := map[string]any{
+			"id":           fmt.Sprintf("rec-%d", i),
+			"occurred_at":  base.Add(time.Duration(i) * time.Second).Format(time.RFC3339Nano),
+			"model":        "m",
+			"input_tokens": 1, "output_tokens": 2,
+		}
+		itemsAsc = append(itemsAsc, item)
+	}
+	for i := 4; i >= 0; i-- {
+		itemsDesc = append(itemsDesc, itemsAsc[i])
+	}
+
+	serve := func(items []map[string]any) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != LedgerPath {
+				t.Errorf("POC 应打 %s，got %s", LedgerPath, r.URL.Path)
+			}
+			off, _ := strconv.Atoi(r.URL.Query().Get("offset"))
+			lim, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+			if lim <= 0 {
+				lim = 1000
+			}
+			end := off + lim
+			if end > len(items) {
+				end = len(items)
+			}
+			var out []map[string]any
+			if off < len(items) {
+				out = items[off:end]
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"items": out})
+		}))
+	}
+
+	w := Window{Start: base.Add(-time.Minute), End: base.Add(time.Hour)}
+	for _, c := range []struct {
+		name  string
+		items []map[string]any
+		want  LedgerOrder
+	}{
+		{"上游升序 → 支持", itemsAsc, LedgerOrderSupported},
+		{"上游乱序 → 不支持", itemsDesc, LedgerOrderUnsupported},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			srv := serve(c.items)
+			defer srv.Close()
+			src := NewHTTPLedgerSource(srv.URL, "admin-key", "", nil)
+			got := ProbeLedgerOrder(context.Background(), src, w, 3)
+			if got.Order != c.want {
+				t.Fatalf("POC 结论不符：got %s（%s）want %s", got.Order, got.Reason, c.want)
+			}
+			if got.Samples < 2 {
+				t.Fatalf("POC 必须真的比到数据，got samples=%d", got.Samples)
+			}
+		})
+	}
+}
+
+// TestPOC_UpstreamLedgerOrder_Real 是对真实上游的排序能力 POC（F9 裁定要求「先证后写」）。
+//
+// 运行方式（只在能连上上游时才有意义）：
+//
+//	UPSTREAM_LEDGER_URL=https://<上游基址> UPSTREAM_ADMIN_KEY=<管理端 key> \
+//	  go test ./internal/domain/upstream/ -run TestPOC_UpstreamLedgerOrder_Real -v
+//
+// 没有 URL 就跳过——沙盒里没有上游服务，跳过时结论只能是「未证实」，
+// 而「未证实」的默认行为是**本窗 blocked 且不可清零**（不许自己造排序）。
+func TestPOC_UpstreamLedgerOrder_Real(t *testing.T) {
+	baseURL := os.Getenv("UPSTREAM_LEDGER_URL")
+	if baseURL == "" {
+		t.Skip("未设置 UPSTREAM_LEDGER_URL：真实上游 POC 未执行 → 排序能力记为 unverified（本窗不可清零）")
+	}
+	src := NewHTTPLedgerSource(baseURL, os.Getenv("UPSTREAM_ADMIN_KEY"), "", nil)
+	w := Window{Start: time.Now().Add(-30 * time.Minute), End: time.Now()}
+	res := ProbeLedgerOrder(context.Background(), src, w, 50)
+	t.Logf("POC 结论：order=%s samples=%d reason=%s", res.Order, res.Samples, res.Reason)
+	if res.Order != LedgerOrderSupported {
+		t.Fatalf("上游排序能力未达标（%s）：%s —— 需按 F9 走「本窗 blocked 不可清零」分支", res.Order, res.Reason)
 	}
 }

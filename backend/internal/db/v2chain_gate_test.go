@@ -130,8 +130,17 @@ func TestGate_F4_OneStartupFullChain(t *testing.T) {
 			t.Fatalf("迁移目录里不该再有 0021（不可逆动作集中在 0024）: %s", n)
 		}
 	}
-	// 0024 必须是最后一个（否则「最后一步才不可逆」不成立）。
-	last := order[len(order)-1]
+	// 0024 必须是**本批（< 0025）**的最后一个：右界之后是后续批（token_scope 顺延 0025），
+	// 本批不为它做保证，也不许把 0025 塞进本批列表。
+	last := ""
+	for _, n := range order {
+		if n >= V2MigrationRightBound {
+			continue
+		}
+		if n > last {
+			last = n
+		}
+	}
 	if !strings.HasPrefix(last, "0024_") {
 		t.Fatalf("0024 必须排最后，实际最后一个 = %s", last)
 	}

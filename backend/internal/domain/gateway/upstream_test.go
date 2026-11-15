@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -44,12 +45,15 @@ type v2Harness struct {
 	respCode  int
 	respHead  http.Header
 	upstream  *httptest.Server
+	// logBuf 收集结构化日志（断言「剔除 key 会留 WARN」这类可观测行为）。
+	logBuf *bytes.Buffer
 }
 
 // newV2Harness 建一套 V2 转发测试装配。
 func newV2Harness(t *testing.T, cfg upstream.RuntimeConfig) *v2Harness {
 	t.Helper()
 	h := &v2Harness{
+		logBuf:  &bytes.Buffer{},
 		billing: &fakeBilling{},
 		credit:  &fakeCredit{balance: 100},
 		model: &model.ExternalModel{
@@ -95,7 +99,7 @@ func newV2Harness(t *testing.T, cfg upstream.RuntimeConfig) *v2Harness {
 		UpstreamConfig: &fakeRuntimeConfig{cfg: cfg},
 		UpstreamAuth:   func() (string, string) { return "Authorization", "Bearer up-secret" },
 		Now:            func() time.Time { return time.Date(2026, 11, 15, 10, 0, 0, 0, time.UTC) },
-		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Logger:         slog.New(slog.NewTextHandler(h.logBuf, nil)),
 	})
 	return h
 }
@@ -357,5 +361,37 @@ func TestV2_F8_ResponseHeaderScrub(t *testing.T) {
 	}
 	if rec.Header().Get("anthropic-ratelimit-requests") != "99" {
 		t.Fatal("限流类可观测头不该被剥")
+	}
+}
+
+// TestV2_F6_AnyPathKeyParamStrippedAndWarned 覆盖 F6 安全默认：
+// **任何路径**上的 `key` 参数都在转发前剔除（不再只对 Gemini 原生鉴权例外），
+// 并留一条 WARN；其余参数逐字保留；剔完为空则上游收到的 query 是空串（不留 `?`）。
+func TestV2_F6_AnyPathKeyParamStrippedAndWarned(t *testing.T) {
+	h := newV2Harness(t, upstream.DefaultRuntimeConfig())
+
+	// 非 Gemini 路径：用 header 鉴权，但调用方仍把令牌挂在 query 上。
+	rec := h.post(t, "/v1/chat/completions?key=tenant-secret&alt=sse",
+		`{"model":"public-model"}`, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("期望 200，got %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := h.gotQuery; got != "alt=sse" {
+		t.Fatalf("上游收到的 query 应为 alt=sse（key 已剔除、其余逐字保留），got %q", got)
+	}
+	if strings.Contains(h.logBuf.String(), "tenant-secret") {
+		t.Fatal("日志不许出现令牌原文")
+	}
+	if !strings.Contains(h.logBuf.String(), "key 参数") {
+		t.Fatalf("剔除 key 必须留一条 WARN，日志：%s", h.logBuf.String())
+	}
+
+	// 只有 key：剔完为空 → 上游 query 空串，不能留尾部 `?`。
+	h.logBuf.Reset()
+	if rec := h.post(t, "/v1/messages?key=tenant-secret", `{"model":"public-model"}`, nil); rec.Code == 0 {
+		t.Fatal("请求未被执行")
+	}
+	if got := h.gotQuery; got != "" {
+		t.Fatalf("剔完为空时上游 query 必须为空串（不留 `?`），got %q", got)
 	}
 }

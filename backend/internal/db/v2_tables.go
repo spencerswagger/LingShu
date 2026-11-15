@@ -53,6 +53,12 @@ func RetiredTables() []string {
 //
 // 0021_v2_drop_legacy 已按裁定更名为 0024 并排到最后：字典序 = 执行序，
 // 一次启动跑完整链，不做「手工分两批」。
+// V2MigrationRightBound 是本批迁移的**右界（不含）**：0024 是 `drop_legacy`，
+// 其后 `token_scope` 顺延 0025 —— 因此本批的范围是 [0019, 0025)，
+// 所有「本批内 0024 必须最后 / 只允许 0024 破坏性」的断言都以此为界，
+// 后续批新增 0025 不会把本批的守卫打红（也不许把 0025 塞进本批列表）。
+const V2MigrationRightBound = "0025"
+
 func V2MigrationFiles() []string {
 	return []string{
 		"0019_v2_topology.sql",
