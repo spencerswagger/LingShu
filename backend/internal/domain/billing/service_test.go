@@ -201,7 +201,9 @@ func TestRecord_Success(t *testing.T) {
 		sqlmock.AnyArg(),                 // error_message
 		sqlmock.AnyArg(),                 // duration_ms
 		sqlmock.AnyArg(),                 // first_token_ms
-	).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(1), time.Now()))
+
+		// ===== V2 归因六列（未传值）：request_id/upstream_* 落 NULL，cost_source 归一 none =====
+		nil, nil, nil, nil, nil, CostSourceNone).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(1), time.Now()))
 
 	credit := &fakeCredit{before: before, after: after}
 	now := time.Date(2026, 1, 2, 12, 0, 0, 0, shLocForTest(t))
@@ -262,7 +264,9 @@ func TestRecord_ConsumeError_RecordsFailed(t *testing.T) {
 		sqlmock.AnyArg(), sqlmock.AnyArg(),
 		"failed", "计费结算失败",
 		sqlmock.AnyArg(), sqlmock.AnyArg(),
-	).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(2), time.Now()))
+
+		// ===== V2 归因六列（未传值）：request_id/upstream_* 落 NULL，cost_source 归一 none =====
+		nil, nil, nil, nil, nil, CostSourceNone).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(2), time.Now()))
 
 	credit := &fakeCredit{err: consumeErr}
 	svc := newTestService(db, credit, newFakeConfig(), time.Date(2026, 1, 2, 12, 0, 0, 0, shLocForTest(t)))
@@ -363,7 +367,9 @@ func TestRecord_CostMode_RecordsCostCredits(t *testing.T) {
 		int64(10000), sqlmock.AnyArg(), credits, costCredits,
 		sqlmock.AnyArg(), sqlmock.AnyArg(), "completed", sqlmock.AnyArg(),
 		sqlmock.AnyArg(), sqlmock.AnyArg(),
-	).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(3), time.Now()))
+
+		// ===== V2 归因六列（未传值）：request_id/upstream_* 落 NULL，cost_source 归一 none =====
+		nil, nil, nil, nil, nil, CostSourceNone).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(3), time.Now()))
 
 	credit := &fakeCredit{before: 10, after: 10 - credits}
 	svc := newTestService(db, credit, newFakeConfig(), time.Date(2026, 1, 2, 12, 0, 0, 0, shLocForTest(t)))
@@ -417,7 +423,9 @@ func TestRecord_SaleMode_CostCreditsDistinctFromCredits(t *testing.T) {
 		int64(10000), sqlmock.AnyArg(), credits, costCredits,
 		sqlmock.AnyArg(), sqlmock.AnyArg(), "completed", sqlmock.AnyArg(),
 		sqlmock.AnyArg(), sqlmock.AnyArg(),
-	).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(4), time.Now()))
+
+		// ===== V2 归因六列（未传值）：request_id/upstream_* 落 NULL，cost_source 归一 none =====
+		nil, nil, nil, nil, nil, CostSourceNone).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(4), time.Now()))
 
 	credit := &fakeCredit{before: 10, after: 10 - credits}
 	svc := newTestService(db, credit, newFakeConfig(), time.Date(2026, 1, 2, 12, 0, 0, 0, shLocForTest(t)))
@@ -548,7 +556,8 @@ func TestSqlStore_Insert_MarshalError(t *testing.T) {
 
 // ---- 事务路径：扣款 + 积分流水 + 账单同事务 ----
 
-// txInsertArgs 组装 insertBill 的完整 25 参数匹配（事务路径用例复用；首参为应用层雪花 ID）。
+// txInsertArgs 组装 insertBill 的完整 31 参数匹配（事务路径用例复用；首参为应用层雪花 ID）。
+// 末 6 位是 V2 归因列（request_id / upstream_* / cost_source）：本用例经 RecordReq 不传 → 全 NULL/none。
 func txInsertArgs(credits, before, after float64, status string) []driver.Value {
 	return []driver.Value{
 		sqlmock.AnyArg(), // id（应用层雪花 ID）
@@ -569,6 +578,13 @@ func txInsertArgs(credits, before, after float64, status string) []driver.Value 
 		sqlmock.AnyArg(),                 // error_message
 		sqlmock.AnyArg(),                 // duration_ms
 		sqlmock.AnyArg(),                 // first_token_ms
+		// ===== V2 归因六列：未传值 → request_id/upstream_* 落 NULL，cost_source 归一为 none =====
+		nil,            // request_id
+		nil,            // upstream_provider
+		nil,            // upstream_account
+		nil,            // upstream_protocol
+		nil,            // upstream_model
+		CostSourceNone, // cost_source
 	}
 }
 
@@ -632,9 +648,8 @@ func TestRecord_TxPath_ConsumeError_RollsBackAndRecordsFailed(t *testing.T) {
 	mock.ExpectQuery(selectByBillingID.String()).WithArgs(billingID).WillReturnError(sql.ErrNoRows)
 	mock.ExpectBegin()
 	mock.ExpectRollback() // 扣款失败先回滚
-	mock.ExpectQuery(insertBill.String()).WithArgs(
-		txInsertArgs(0, 0, 0, "failed")...,
-	).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(2), time.Now()))
+	mock.ExpectQuery(insertBill.String()).WithArgs(txInsertArgs(0, 0, 0, "failed")...).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(2), time.Now()))
 
 	credit := &fakeCredit{err: consumeErr}
 	svc := newTxTestService(db, credit, newFakeConfig(), time.Date(2026, 1, 2, 12, 0, 0, 0, shLocForTest(t)))
@@ -1195,7 +1210,9 @@ func TestRecord_ModelLevelOverride(t *testing.T) {
 		int64(10000), sqlmock.AnyArg(), credits, sqlmock.AnyArg(),
 		sqlmock.AnyArg(), sqlmock.AnyArg(), "completed", sqlmock.AnyArg(),
 		sqlmock.AnyArg(), sqlmock.AnyArg(),
-	).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(7), time.Now()))
+
+		// ===== V2 归因六列（未传值）：request_id/upstream_* 落 NULL，cost_source 归一 none =====
+		nil, nil, nil, nil, nil, CostSourceNone).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(7), time.Now()))
 
 	credit := &fakeCredit{before: 10, after: 9.7}
 	svc := newTestService(db, credit, newFakeConfig(), time.Date(2026, 1, 2, 12, 0, 0, 0, shLocForTest(t)))
@@ -1259,7 +1276,9 @@ func TestRecord_Dimension(t *testing.T) {
 		sqlmock.AnyArg(),                 // error_message
 		sqlmock.AnyArg(),                 // duration_ms
 		sqlmock.AnyArg(),                 // first_token_ms
-	).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(8), time.Now()))
+
+		// ===== V2 归因六列（未传值）：request_id/upstream_* 落 NULL，cost_source 归一 none =====
+		nil, nil, nil, nil, nil, CostSourceNone).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(8), time.Now()))
 
 	credit := &fakeCredit{before: 10, after: 10 - credits}
 	svc := newTestService(db, credit, newFakeConfig(), time.Date(2026, 1, 2, 12, 0, 0, 0, shLocForTest(t)))

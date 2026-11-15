@@ -120,9 +120,20 @@ type Record struct {
 	ErrorMessage    string
 	DurationMs      *int64 // 总耗时（毫秒）
 	FirstTokenMs    *int64 // 首字耗时（毫秒）
-	// RequestID 网关请求链路 ID（来自 call_logs.request_id，仅归并列表查询时填充）：
+	// RequestID 网关请求链路 ID：写入侧落 billing_records.request_id（V2 归因列，空写 NULL），
+	// 列表查询侧仍按既有口径从 call_logs 归并（两者同值；统一读取口径属后续切片）。
 	// 让一次请求在账单可被直接定位（多候选尝试共享同一 request_id）。
 	RequestID string
+	// ===== V2 归因列（迁移由架构侧 ADD COLUMN；缺失留 NULL，不猜）=====
+	// UpstreamProvider / UpstreamAccount 来自上游回程头里的供应商与账号标识。
+	UpstreamProvider string
+	UpstreamAccount  string
+	// UpstreamProtocol 上游协议，取值域见 upstream.AttributionProtocols()。
+	UpstreamProtocol string
+	// UpstreamModel 上游真实模型名。
+	UpstreamModel string
+	// CostSource 成本来源：ledger / amortized / none（空按 none 落库）。
+	CostSource string
 	// Attempts 该请求共产生的账单条数（仅归并列表查询时填充；1=单次尝试，>1=发生过候选/上游重试）。
 	Attempts int
 }
@@ -156,6 +167,13 @@ type RecordReq struct {
 	// =0 时（健康探测/直接计费等无预扣场景）按全额扣减。
 	PreConsumed float64
 	Remark      string
+	// ===== V2 归因（由网关在调用完成后传入；未接线时全空 → 落 NULL / none）=====
+	RequestID        string
+	UpstreamProvider string
+	UpstreamAccount  string
+	UpstreamProtocol string
+	UpstreamModel    string
+	CostSource       string
 }
 
 // CreditService 抽象钱包扣减/差额结算，由 identity 包实现。
@@ -212,22 +230,28 @@ func (s *Service) Record(ctx context.Context, req RecordReq) (*Record, error) {
 	// 失败记录快速通道（上游/下游失败不扣积分）：直接落 failed 并携带原因。
 	if req.Fail {
 		rec := &Record{
-			BillingID:       req.BillingID,
-			UserID:          req.UserID,
-			PricingMode:     req.PricingMode,
-			TokenID:         req.TokenID,
-			ExternalModel:   req.ExternalModel,
-			AutoModelName:   req.AutoModelName,
-			InternalModelID: req.InternalModelID,
-			ChannelKeyID:    req.ChannelKeyID,
-			SessionID:       req.SessionID,
-			SessionName:     req.SessionName,
-			CallTime:        req.CallTime,
-			Tokens:          req.Tokens,
-			Status:          StatusFailed,
-			ErrorMessage:    req.ErrorMessage,
-			DurationMs:      req.DurationMs,
-			FirstTokenMs:    req.FirstTokenMs,
+			BillingID:        req.BillingID,
+			UserID:           req.UserID,
+			PricingMode:      req.PricingMode,
+			TokenID:          req.TokenID,
+			ExternalModel:    req.ExternalModel,
+			AutoModelName:    req.AutoModelName,
+			InternalModelID:  req.InternalModelID,
+			ChannelKeyID:     req.ChannelKeyID,
+			SessionID:        req.SessionID,
+			SessionName:      req.SessionName,
+			CallTime:         req.CallTime,
+			Tokens:           req.Tokens,
+			Status:           StatusFailed,
+			ErrorMessage:     req.ErrorMessage,
+			DurationMs:       req.DurationMs,
+			FirstTokenMs:     req.FirstTokenMs,
+			RequestID:        req.RequestID,
+			UpstreamProvider: req.UpstreamProvider,
+			UpstreamAccount:  req.UpstreamAccount,
+			UpstreamProtocol: req.UpstreamProtocol,
+			UpstreamModel:    req.UpstreamModel,
+			CostSource:       req.CostSource,
 		}
 		if _, err := s.store.Insert(ctx, rec); err != nil {
 			if isUniqueViolation(err) {
@@ -293,6 +317,13 @@ func (s *Service) Record(ctx context.Context, req RecordReq) (*Record, error) {
 		DurationMs:   req.DurationMs,
 		FirstTokenMs: req.FirstTokenMs,
 		ErrorMessage: req.ErrorMessage,
+
+		RequestID:        req.RequestID,
+		UpstreamProvider: req.UpstreamProvider,
+		UpstreamAccount:  req.UpstreamAccount,
+		UpstreamProtocol: req.UpstreamProtocol,
+		UpstreamModel:    req.UpstreamModel,
+		CostSource:       req.CostSource,
 	}
 	// 只要提供了成本单价就记录成本积分（仅展示/毛利差异，不参与扣减）：
 	// sale 模式 cost_credits 反映真实成本（区别于售价积分的毛利段），
@@ -965,6 +996,11 @@ func (s *SqlStore) insertOn(ctx context.Context, ex dbx.Execer, rec *Record) (*R
 	}
 	durationMs := nullableInt64For(rec.DurationMs)
 	firstTokenMs := nullableInt64For(rec.FirstTokenMs)
+	// V2 归因六列：校验后按 NULL/none 归一（非法取值在写库前就报错，不留到 CHECK 约束里）。
+	attr, err := attributionArgs(rec)
+	if err != nil {
+		return nil, err
+	}
 
 	var created time.Time
 	if rec.ID == 0 {
@@ -973,13 +1009,17 @@ func (s *SqlStore) insertOn(ctx context.Context, ex dbx.Execer, rec *Record) (*R
 	err = ex.QueryRowContext(ctx,
 		`INSERT INTO billing_records(id, billing_id, user_id, pricing_mode, token_id, external_model_name,
 			auto_model_name, internal_model_id, channel_key_id, session_id, session_name, call_time, tokens, rates, coefficients, r_value,
-			raw_total, credits_consumed, cost_credits, balance_before, balance_after, status, error_message, duration_ms, first_token_ms)
-		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
+			raw_total, credits_consumed, cost_credits, balance_before, balance_after, status, error_message, duration_ms, first_token_ms,
+			request_id, upstream_provider, upstream_account, upstream_protocol, upstream_model, cost_source)
+		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,
+			$26,$27,$28,$29,$30,$31)
 		 RETURNING id, created_at`,
-		rec.ID, rec.BillingID, rec.UserID, rec.PricingMode, tokenID, rec.ExternalModel, autoModelName,
-		rec.InternalModelID, channelKeyID, sessionID, sessionName, rec.CallTime, tokensRaw, ratesRaw, coeffRaw,
-		rec.RValue, rec.RawTotal, rec.CreditsConsumed, rec.CostCredits,
-		rec.BalanceBefore, rec.BalanceAfter, rec.Status, errMsg, durationMs, firstTokenMs).
+		append([]any{
+			rec.ID, rec.BillingID, rec.UserID, rec.PricingMode, tokenID, rec.ExternalModel, autoModelName,
+			rec.InternalModelID, channelKeyID, sessionID, sessionName, rec.CallTime, tokensRaw, ratesRaw, coeffRaw,
+			rec.RValue, rec.RawTotal, rec.CreditsConsumed, rec.CostCredits,
+			rec.BalanceBefore, rec.BalanceAfter, rec.Status, errMsg, durationMs, firstTokenMs,
+		}, attr...)...).
 		Scan(&rec.ID, &created)
 	if err != nil {
 		return nil, err
