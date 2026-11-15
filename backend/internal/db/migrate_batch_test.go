@@ -82,6 +82,18 @@ func TestMigrationChain_ReconcileShape(t *testing.T) {
 			t.Fatalf("0023 缺少 %q（D4/F9 裁定：status 增 skipped、offset 持久化）", want)
 		}
 	}
+	// 计数列必须可空（NULL = 还没算过；0 = 算过且真的没流量，两者不能混）。
+	flatBody := strings.Join(strings.Fields(body), " ")
+	if strings.Contains(flatBody, "local_count BIGINT NOT NULL") {
+		t.Fatalf("计数列不许 NOT NULL DEFAULT 0（blocked 窗会与「无流量」不可区分）")
+	}
+	// 空白不敏感比对：迁移文件里的对齐空格会变，断言不该跟着碎。
+	flat := strings.Join(strings.Fields(body), " ")
+	for _, col := range []string{"local_count", "upstream_count", "local_tokens", "upstream_tokens"} {
+		if !strings.Contains(flat, "ALTER COLUMN "+col+" DROP NOT NULL") {
+			t.Fatalf("0023 缺少 ALTER COLUMN %s DROP NOT NULL（老表补齐路径）", col)
+		}
+	}
 	// 四个计数列必须还在（对账服务要写它们；删了就退化成「解析 detail」）。
 	for _, col := range []string{"local_count", "upstream_count", "local_tokens", "upstream_tokens"} {
 		if !strings.Contains(body, col) {
@@ -97,13 +109,22 @@ func TestMigrationChain_BillingCostPresence(t *testing.T) {
 	if !strings.Contains(body, "ck_billing_cost_presence") {
 		t.Fatalf("0020 缺少跨列 CHECK ck_billing_cost_presence（F10：cost_credits IS NULL ⇒ cost_source = 'none'）")
 	}
-	if !strings.Contains(body, "cost_credits IS NOT NULL OR cost_source = 'none'") {
-		t.Fatalf("ck_billing_cost_presence 的表达式不是「cost_credits 非空 或 cost_source = none」——" +
-			"方向写反会让「有成本却标 none」的行合法、把真正要挡的组合放过去")
+	// 必须用 IS NOT DISTINCT FROM：写成 `cost_source = 'none'` 时「NULL+NULL」求值为 NULL，
+	// SQL 的 CHECK 把 NULL 当通过 → 约束形同虚设（实测放行过）。
+	if !strings.Contains(body, "cost_source IS NOT DISTINCT FROM 'none'") {
+		t.Fatalf("ck_billing_cost_presence 必须用 `cost_source IS NOT DISTINCT FROM 'none'`（`=` 会漏掉 NULL 组合）")
 	}
-	// 约束前必须有存量归一：不 UPDATE 的话存量 failed 行（成本 NULL + 来源 NULL）会让 ADD CONSTRAINT 直接失败。
-	if !strings.Contains(body, "SET cost_source = 'none'") {
-		t.Fatalf("0020 加跨列 CHECK 前必须先把存量 NULL 来源归一为 'none'，否则约束建不上")
+	// F10 补丁：约束必须是 NOT VALID（15 万存量行不许被扫一遍），且**不能**靠全表 UPDATE 归一
+	// （那个 UPDATE 本身就是被去掉的那次扫描）。
+	if !strings.Contains(body, "NOT VALID") {
+		t.Fatalf("跨列 CHECK 必须建成 NOT VALID（跳过存量扫描；新写入与 UPDATE 仍然强约束）")
+	}
+	if strings.Contains(body, "SET cost_source = 'none'\n WHERE") {
+		t.Fatalf("不许在迁移里做存量归一的 UPDATE（= 全表扫描）；用 NOT VALID 跳过存量")
+	}
+	// 回填 ledger_entry_id 的正确写法必须写在文件里（否则运维补单会踩 23514）。
+	if !strings.Contains(body, "COALESCE(cost_source, 'none')") {
+		t.Fatalf("0020 必须写明「回填 ledger_entry_id 时同时 COALESCE(cost_source,'none')」，否则补单会触发 23514")
 	}
 }
 

@@ -311,3 +311,51 @@ func TestV2_ModelsEndpointFiltersUnbound(t *testing.T) {
 		t.Fatalf("只该列启用且已绑定的模型，got %+v", payload.Data)
 	}
 }
+
+// TestV2_F8_ResponseHeaderScrub 是 F8 的**端到端**门禁（Gate 实测漏的四类头都在这里）：
+//  1. `server`
+//  2. `x-magpie-*`（上游身份/路由）
+//  3. 供应商名（头名身份类，或取值里带供应商名）
+//  4. `x-request-id` 必须被换成灵枢自己的值（不许透传上游的）
+//
+// 这条用例的判据不是「我的函数返回什么」，而是「客户端实际收到什么」——
+// 只有端到端才能抓住「钩子/剥头没接进主链」这类缺陷（单元级永远是绿的）。
+func TestV2_F8_ResponseHeaderScrub(t *testing.T) {
+	cfg := upstream.DefaultRuntimeConfig()
+	cfg.Degrade = upstream.Degrade{PassthroughEnabled: true}
+	h := newV2Harness(t, cfg)
+	h.respHead = http.Header{
+		"Content-Type":                 []string{"application/json"},
+		"server":                       []string{"magpie/2.1"},
+		"x-magpie-route":               []string{"r-7"},
+		"x-magpie-account":             []string{"acct-1"},
+		"x-upstream-region":            []string{"cn-1"},
+		"x-provider":                   []string{"openai"},            // 头名带供应商
+		"x-served-by":                  []string{"edge-3"},            // 身份类头名
+		"x-note":                       []string{"powered by gemini"}, // 取值带供应商
+		"x-request-id":                 []string{"upstream-rid"},      // 必须被覆盖
+		"anthropic-ratelimit-requests": []string{"99"},                // 该透传
+	}
+	h.respBody = []byte(`{"id":"x","choices":[]}`)
+
+	rec := h.post(t, "/v1/chat/completions", `{"model":"public-model"}`, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("期望 200，got %d: %s", rec.Code, rec.Body.String())
+	}
+	for _, name := range []string{"server", "x-magpie-route", "x-magpie-account",
+		"x-upstream-region", "x-provider", "x-served-by", "x-note"} {
+		if v := rec.Header().Get(name); v != "" {
+			t.Fatalf("F8：%s 不该到达客户端，仍收到 %q", name, v)
+		}
+	}
+	got := rec.Header().Get("x-request-id")
+	if got == "" {
+		t.Fatal("F8：客户端必须拿到灵枢自己的 x-request-id")
+	}
+	if got == "upstream-rid" {
+		t.Fatal("F8：上游的 x-request-id 不许透传")
+	}
+	if rec.Header().Get("anthropic-ratelimit-requests") != "99" {
+		t.Fatal("限流类可观测头不该被剥")
+	}
+}

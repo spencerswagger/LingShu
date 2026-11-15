@@ -61,8 +61,8 @@ const (
 
 // 超时边界：太小的超时会把正常长耗时接口打成失败，太大则一轮同步可能跨周期。
 const (
-	DefaultStreamFirstByte = 30 * time.Second
-	DefaultStreamIdle      = 120 * time.Second
+	DefaultStreamFirstByte = 30 * time.Second  // stream_first_byte_ms 默认 30000
+	DefaultStreamIdle      = 120 * time.Second // stream_idle_ms 默认 120000
 	MinTimeout             = time.Second
 	MaxTimeout             = 10 * time.Minute
 )
@@ -78,6 +78,27 @@ type Timeouts struct {
 	StreamFirstByte time.Duration
 	// StreamIdle 是流式中途「连续多久没有数据」的上限；超时只能断流（响应头已发出）。
 	StreamIdle time.Duration
+}
+
+// MarshalJSON 按**裁定的键名**输出两段超时（毫秒整数）。
+//
+// 为什么必须自己实现：结构体字段是 Go 命名 + time.Duration（秒），直接 json.Marshal 会得到
+// `{"StreamFirstByte":30000000000,...}` —— 既不是配置键名、单位也不是毫秒。
+// 管理端回显/写种子/静态检查都按这里的形状对账，别让它漂。
+func (t Timeouts) MarshalJSON() ([]byte, error) {
+	return json.Marshal(map[string]int64{
+		FieldStreamFirstByteMS: int64(t.StreamFirstByte / time.Millisecond),
+		FieldStreamIdleMS:      int64(t.StreamIdle / time.Millisecond),
+	})
+}
+
+// MarshalJSON 按裁定的键名输出三段降级开关。
+func (d Degrade) MarshalJSON() ([]byte, error) {
+	return json.Marshal(map[string]bool{
+		FieldPassthroughOn: d.PassthroughEnabled,
+		FieldLedgerOn:      d.LedgerEnabled,
+		FieldSyncOn:        d.SyncEnabled,
+	})
 }
 
 // Degrade 是三段降级开关（关 = 该段停摆并告警，不把错误抛给前端、不清已有数据）。

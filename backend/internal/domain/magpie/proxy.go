@@ -21,6 +21,8 @@ package magpie
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -28,8 +30,21 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
+)
+
+// 传输层的两个**代码常量**（裁定：不做配置键）。
+//
+// 为什么不做配置：连接超时与非流式总超时属于实现细节，配错只会变成「怎么调都打不出响应」
+// 的又一类事故面；运营真正会调的只有等响应头与流空闲那两段（见 Timeouts）。
+const (
+	// connectTimeout 是建连上限（含 TCP 握手 + TLS）。
+	connectTimeout = 10 * time.Second
+	// nonStreamRequestTimeout 是非流式请求的总时长上限（600s）；流式不设总超时，
+	// 靠首包 + 空闲两段夹住（长回答不能被总时长打断）。
+	nonStreamRequestTimeout = 600 * time.Second
 )
 
 // Timeouts 是转发链的两段超时（与 sys_configs 的 upstream.timeouts 同口径）。
@@ -65,10 +80,14 @@ type ForwardRequest struct {
 	Billable bool
 	// Protocol 决定 usage 字段路径。
 	Protocol Protocol
-	// OnUpstreamResponse 在回程头到达时调用（归因定稿；nil = 不关心）。
+	// OnUpstreamResponse 在**回程头到达、且任何字节写下游之前**同步调用一次（归因定稿）。
+	// Ark §9.2.2 的时序约束：① 同步调用，必须在首字节前返回；② 钩子内**不许碰 DB**；
+	// 需要落库的东西只能存进内存事实，等 OnComplete 再写。本包不提供异步/超时包装，
+	// 就是为了让「慢钩子会拖慢首字节」这件事在评审时一眼看得见。
 	OnUpstreamResponse func(ctx context.Context, f ResponseFacts)
-	// OnDone 在转发结束时调用一次（含失败；nil = 不关心）。
-	OnDone func(ctx context.Context, res Result)
+	// OnComplete 在转发结束时调用一次（含失败），是**唯一**允许落库的位置（Ark §9.2.2）。
+	// nil = 不关心。
+	OnComplete func(ctx context.Context, res Result)
 }
 
 // ResponseFacts 是回程头到达时的已知事实（D1：OnUpstreamResponse 交主链消费）。
@@ -101,6 +120,8 @@ type Result struct {
 	FirstByteMs *int64
 	// Duration 是整次转发耗时。
 	Duration time.Duration
+	// RequestID 是写给下游的链路 ID（灵枢自己的；上游的同名头一律丢弃）。
+	RequestID string
 	// Err 是传输层错误（nil = 拿到了上游响应）。
 	Err error
 }
@@ -126,7 +147,7 @@ func (f *Forwarder) client(t Timeouts) *http.Client {
 	if c, ok := f.clients[t]; ok {
 		return c
 	}
-	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	dialer := &net.Dialer{Timeout: connectTimeout, KeepAlive: 30 * time.Second}
 	c := &http.Client{Transport: &http.Transport{
 		DialContext:           dialer.DialContext,
 		ResponseHeaderTimeout: t.StreamFirstByte,
@@ -192,7 +213,8 @@ func (f *Forwarder) Forward(ctx context.Context, w http.ResponseWriter, req Forw
 		// 流式不设总超时：长输出靠「首包 + 读空闲」两头夹，总超时会把正常长回答打断。
 		upCtx, cancel = context.WithCancel(ctx)
 	} else {
-		upCtx, cancel = context.WithCancel(ctx)
+		// 非流式：总时长上限是代码常量（600s），与两段配置超时叠加生效。
+		upCtx, cancel = context.WithTimeout(ctx, nonStreamRequestTimeout)
 	}
 	defer cancel()
 
@@ -228,6 +250,10 @@ func (f *Forwarder) Forward(ctx context.Context, w http.ResponseWriter, req Forw
 	if fb := f.now().Sub(start).Milliseconds(); fb >= 0 {
 		res.FirstByteMs = &fb
 	}
+	// 下游的链路 ID 必须是灵枢自己的（F8）：ctx 里没有就现生成一个，
+	// 绝不能让上游的 x-request-id 顺流而下。
+	req.RequestID = ensureRequestID(req.RequestID)
+	res.RequestID = req.RequestID
 	if req.OnUpstreamResponse != nil {
 		req.OnUpstreamResponse(ctx, ResponseFacts{
 			Status:   res.Status,
@@ -238,6 +264,7 @@ func (f *Forwarder) Forward(ctx context.Context, w http.ResponseWriter, req Forw
 	}
 
 	// 4) 写响应头与状态码（按 F8 剥头 + 写入我们自己的 x-request-id）。
+	//    注意顺序：OnUpstreamResponse 已在上面同步返回，这里才开始写——先钩子、后首字节。
 	CopyResponseHeaders(w.Header(), resp.Header, req.RequestID)
 	if res.NoContent {
 		w.WriteHeader(resp.StatusCode)
@@ -291,12 +318,12 @@ func (f *Forwarder) Forward(ctx context.Context, w http.ResponseWriter, req Forw
 	return res
 }
 
-// done 收尾并回调 OnDone（调用已发生，计费不能因下游断开而丢）。
+// done 收尾并回调 OnComplete（调用已发生，计费不能因下游断开而丢）。
 func (f *Forwarder) done(ctx context.Context, req ForwardRequest, res *Result, start time.Time) {
 	res.Duration = f.now().Sub(start)
-	if req.OnDone != nil {
+	if req.OnComplete != nil {
 		// WithoutCancel：客户端断开时 ctx 已取消，结算/退款必须仍然落库。
-		req.OnDone(context.WithoutCancel(ctx), *res)
+		req.OnComplete(context.WithoutCancel(ctx), *res)
 	}
 	if res.Err != nil {
 		f.log().Warn("上游转发失败",
@@ -382,4 +409,20 @@ func StripQueryParam(raw, key string) string {
 		out = append(out, p)
 	}
 	return strings.Join(out, "&")
+}
+
+// ensureRequestID 在链路 ID 为空时生成一个（crypto/rand，16 hex）。
+//
+// 为什么兜底生成：F8 要求下游的 x-request-id 是灵枢自己的值。若 ctx 里没有（例如
+// 直接调 Forward 的批处理路径、或中间件没挂），留空等于下游拿不到链路 ID，
+// 而把上游的值透下去更糟（会让人拿它去上游查别人的单）。
+func ensureRequestID(id string) string {
+	if strings.TrimSpace(id) != "" {
+		return strings.TrimSpace(id)
+	}
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "ls-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	}
+	return "ls-" + hex.EncodeToString(b[:])
 }

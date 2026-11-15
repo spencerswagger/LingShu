@@ -3,6 +3,7 @@ package upstream
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -343,5 +344,145 @@ func TestRounder_EmptyPageWithHasMoreIsError(t *testing.T) {
 	// 空页没有可提交的账本，也就没有回滚；但必须落 error 行（否则静默死循环）。
 	if led.rolls != 0 || led.commits != 0 {
 		t.Fatalf("空页不应产生任何账本事务：rolls=%d commits=%d", led.rolls, led.commits)
+	}
+}
+
+// slicePageSource 是「遵守排序与 offset 语义」的分页源：按 occurred_at ASC 排序后切片。
+//
+// 为什么不用 fakePageSource：它按调用顺序返回预置页，**忽略 offset**，
+// 所以「offset 每轮从 0 重拉」这种缺陷在它上面是隐形的。本用例要抓的正是那个。
+type slicePageSource struct {
+	mu      sync.Mutex
+	all     []LedgerEntry
+	offsets []int
+}
+
+func (s *slicePageSource) FetchPage(_ context.Context, w Window, offset, limit int) (Page, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.offsets = append(s.offsets, offset)
+	if offset < 0 {
+		offset = 0
+	}
+	in := make([]LedgerEntry, 0, len(s.all))
+	for _, e := range s.all {
+		if !e.OccurredAt.Before(w.Start) && e.OccurredAt.Before(w.End) {
+			in = append(in, e)
+		}
+	}
+	if offset >= len(in) {
+		return Page{}, nil
+	}
+	end := offset + limit
+	hasMore := false
+	if end < len(in) {
+		hasMore = true
+	} else {
+		end = len(in)
+	}
+	return Page{Entries: in[offset:end], HasMore: hasMore}, nil
+}
+
+// TestRounder_RealSQL_Backlog4200_TwoRounds 复现 Gate 的基线红场景：
+// 账本积压 4200 条 → 第一轮必须落 4000 条 + blocked + offset=4000；
+// 第二轮必须**从 4000 续拉**（不是从 0 重拉）、补完 200 条、blocked 清零、offset 归零。
+//
+// 用真实迁移库（真实 ledger_entries / reconcile_windows），分页源换成遵守 offset 语义的实现。
+func TestRounder_RealSQL_Backlog4200_TwoRounds(t *testing.T) {
+	conn := openMigratedTempDB(t)
+	ctx := context.Background()
+
+	total := 4200
+	base := time.Date(2026, 11, 15, 10, 0, 0, 0, time.UTC)
+	all := make([]LedgerEntry, 0, total)
+	for i := 0; i < total; i++ {
+		all = append(all, LedgerEntry{
+			LedgerID:   fmt.Sprintf("backlog-%05d", i),
+			Provider:   "p",
+			Model:      "m",
+			TokensIn:   1,
+			TokensOut:  2,
+			OccurredAt: base.Add(time.Duration(i) * time.Millisecond),
+		})
+	}
+	src := &slicePageSource{all: all}
+
+	wins := NewSQLWindowStore(conn)
+	led := NewLedgerStore(conn)
+	clock := base.Add(WindowSize)
+	r := NewRounder(RounderOptions{
+		Source: src, Ledger: led, Windows: wins,
+		Now: func() time.Time { return clock }, Logger: testLogger(),
+	})
+
+	res1, err := r.RunOnce(ctx)
+	if !IsBlocked(err) {
+		t.Fatalf("4200 条积压第一轮必须 blocked，got %v (res=%+v)", err, res1)
+	}
+	if res1.Inserted != MaxRowsPerRound {
+		t.Fatalf("第一轮应落 %d 条，got %d", MaxRowsPerRound, res1.Inserted)
+	}
+	var rows int
+	if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM `+LedgerTable).Scan(&rows); err != nil {
+		t.Fatalf("统计账本失败: %v", err)
+	}
+	if rows != MaxRowsPerRound {
+		t.Fatalf("第一轮后库里应有 %d 条（断点代表已落库），got %d", MaxRowsPerRound, rows)
+	}
+	pending, err := wins.PendingWindows(ctx, blockedProbeLimit)
+	if err != nil {
+		t.Fatalf("读待补拉失败: %v", err)
+	}
+	if len(pending) != 1 || pending[0].Status != WindowBlocked {
+		t.Fatalf("应有一条 blocked 窗口，got %+v", pending)
+	}
+	if pending[0].ScrollOffset != MaxRowsPerRound {
+		t.Fatalf("blocked 行必须持久化 offset=%d，got %d", MaxRowsPerRound, pending[0].ScrollOffset)
+	}
+
+	clock = clock.Add(WindowSize)
+	res2, err := r.RunOnce(ctx)
+	if err != nil {
+		t.Fatalf("第二轮补拉应成功，got %v", err)
+	}
+	if len(src.offsets) < 2 || src.offsets[MaxPagesPerRound] != MaxRowsPerRound {
+		t.Fatalf("第二轮首个 offset 必须是 %d（不许从 0 重拉），got %v",
+			MaxRowsPerRound, src.offsets)
+	}
+	if res2.ResumeOffset != MaxRowsPerRound {
+		t.Fatalf("第二轮应从 blocked 行的 offset 续拉（%d），got %d", MaxRowsPerRound, res2.ResumeOffset)
+	}
+	if got := total - MaxRowsPerRound; res2.Inserted != got {
+		t.Fatalf("第二轮应补 %d 条，got %d", got, res2.Inserted)
+	}
+	if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM `+LedgerTable).Scan(&rows); err != nil {
+		t.Fatalf("统计账本失败: %v", err)
+	}
+	if rows != total {
+		t.Fatalf("两轮后账本应为 %d 条，got %d", total, rows)
+	}
+	pending, err = wins.PendingWindows(ctx, blockedProbeLimit)
+	if err != nil {
+		t.Fatalf("读待补拉失败: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("补平后不应再有 blocked/error 窗口，got %+v", pending)
+	}
+	var off int64
+	if err := conn.QueryRowContext(ctx,
+		`SELECT scroll_offset FROM reconcile_windows ORDER BY window_start DESC LIMIT 1`).Scan(&off); err != nil {
+		t.Fatalf("读 offset 失败: %v", err)
+	}
+	if off != 0 {
+		t.Fatalf("补平后 offset 必须归零，got %d", off)
+	}
+	// 计数列：同步轮次不写 → 必须仍是 NULL（不是 0）。
+	var cnt *int64
+	if err := conn.QueryRowContext(ctx,
+		`SELECT local_tokens FROM reconcile_windows ORDER BY window_start DESC LIMIT 1`).Scan(&cnt); err != nil {
+		t.Fatalf("读计数失败: %v", err)
+	}
+	if cnt != nil {
+		t.Fatalf("同步轮次不该写计数列（应为 NULL），got %d", *cnt)
 	}
 }

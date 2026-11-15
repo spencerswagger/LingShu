@@ -6,6 +6,22 @@
 > 但「0024 删渠道维度」与现有账单/统计代码冲突这件事没有解决**——9 个真库用例会红（见 §3）。
 > 本件登记为未完成项，不假装已解决。
 
+## 0. 测试侧基线红：逐条对账（2026-11-15 补）
+
+测试给的 7 条基线红，逐条处理结果如下（"根因"一列是**实际原因**，不是复述现象）：
+
+| # | 现象 | 根因 | 处理 |
+| --- | --- | --- | --- |
+| 1 | F8 四类头全漏 | ① 供应商名单只有 `magpie` 一个词，按头名整串匹配，`x-provider: openai` / `x-served-by` 全放过；② `x-request-id` 只在 ctx 有值时写，没有就**既不写也不生成** | `headers.go` 改三段判定：值含供应商名 / 头名属身份类（provider·account·vendor·served·backend·worker·region）/ `x-magpie-`·`x-upstream-` 前缀；链路 ID 缺省时**生成**（`ls-<16hex>`）。新增 `TestV2_F8_ResponseHeaderScrub`（端到端，直测客户端收到什么） |
+| 2 | `0023` 插 `skipped` 被 23514 拒 | 迁移框架按文件名记账，**改过的 .sql 不会重放**：基线库早已应用过旧版 0023（值域只有 ok\|alarm\|error\|blocked），改文件对它无效 | 新增 **`0023b_v2_reconcile_repair.sql`**（幂等修形：删旧自动命名 CHECK → 按固定名重建含 skipped）。Go 侧 `Validate` 本来就认 5 个值（已核对），DB 侧靠这条修形迁移补上。`TestGate_F10b` 用"旧形状库 + 应用修形"复现并验证 |
+| 3 | F1 三键静态检查 4 条红 | ① `Timeouts`/`Degrade` 没实现 `MarshalJSON`，直接序列化得到 `{"StreamFirstByte":30000000000}`（Go 字段名 + 纳秒）——"形状"根本不是裁定的键名；② 仓库里还留着已废弃的单值超时键名字面量 | 两个结构体补 `MarshalJSON`（毫秒 / 布尔、键名逐字按裁定）；配置键集断言 `ConfigKeys()` 恰为三键、超时块恰为两段；连接超时 10s 与非流式总超时 600s **改成代码常量**（`connectTimeout` / `nonStreamRequestTimeout`），不暴露为配置键；删掉残留废弃键名的用例 |
+| 4 | F10 `cost_credits IS NULL + ledger` 被放行 | 约束写成 `cost_source = 'none'`，PG 的 CHECK 把三值逻辑的 NULL 当**通过** → "NULL + NULL" 求值为 NULL，等于没有约束；另外加约束时的全表归一 UPDATE 就是那 15 万行扫描本身 | 改成 `cost_source IS NOT DISTINCT FROM 'none'` + `NOT VALID`（存量不扫、新写与 UPDATE 强约束）；删掉全表 UPDATE；文件里写明"回填 `ledger_entry_id` 必须同时 `COALESCE(cost_source,'none')`"并给出正反例 |
+| 5 | F4 0021 的 DROP 早于 0022/0023 | 归档迁移编号最小却做了最危险的事 | 改名 `0024_v2_drop_legacy.sql` 排字典序最后，`0021` 作空号**不复用**（已确认目录里没有 0021） |
+| 6 | F9 4200 积压两轮都 blocked、账本 0、offset 每轮从 0 重拉 | ⚠️ 关键发现：`PageSource` **只有接口没有生产实现**，而 fake 源**忽略 offset**（按调用顺序返页），所以"续拉"在单测里永远是绿的；真实库上没有可跑的源 | 新增真库用例 `TestRounder_RealSQL_Backlog4200_TwoRounds`：用真实 `ledger_entries`/`reconcile_windows` + **遵守 offset 语义**的分页源，断言第一轮 4000 条 + blocked + offset=4000，第二轮**从 4000 续拉**、补 200 条、blocked 清零、offset 归零。变异验证：把 `offset := int(resumeOffset)` 改成 0 → 用例立刻红（现象与基线一致：两轮都 blocked） |
+| 7 | D1 `OnComplete` 没接上 | 钩子名与语义没按 Ark §9.2.2 对齐（我把"结束回调"叫了 `OnDone`），主链侧的时序没有写在代码上 | 钩子改名 `OnComplete`；`OnUpstreamResponse` 增补时序约束注释（同步、首字节前返回、**钩子内不许碰 DB**）；主链注释写清"钩子只存内存事实、落库只在 OnComplete、且用 `WithoutCancel`"。新增 `TestForward_HookBeforeFirstByteAndRequestIDFallback`（钩子运行时下游字节数必须为 0） |
+
+另按补充约束：**blocked/error 窗口的计数列必须 NULL，不许写 0**。已改成计数列可空（`NULL` = 未算过，`0` = 算过且真的没流量），`0023b` 把老库里 blocked/error 行的 0 占位归 NULL；对账服务拒绝对 blocked 行写计数（`ErrWindowNotReconcilable`）。计数列写入方按裁定补齐，**没有**扩到七列读取方。
+
 ## 1. 改动清单（文件 → 改了什么 → 对应裁定）
 
 ### 迁移链（F4 / F2 / F7 / F9 / F10 / D4）
@@ -57,15 +73,22 @@
 
 ## 2. 门禁结果
 
-- `gofmt`：改动文件全干净（`gofmt -l` 空）。
+- `gofmt -l`（改动文件）：空。
 - `go vet ./...`：干净。
-- `go test ./...`：35 个包全绿（无 DSN 口径；DB 门控用例自动 skip）。
-- `go test -race`（改动涉及包 `magpie` / `gateway` / `upstream` / `reconcile` / `db` / `seeding` / `model`）：全绿。
-- **真库门禁**（自建 PG17，`LLMGATEWAY_TEST_PG_DSN` 指向空库）：
-  - `TestGate_F4_OneStartupFullChain` PASS：一次 `Migrate` 应用全部迁移；`0020` 早于 `0024`；`0024` 排最后；目录里无 `0021`；15 张保留表 `to_regclass` 非空；10 张退役表不存在；`billing_records.channel_key_id` 已删除。
-  - `TestGate_F10_ExistingNullRowsNormalizedAndChecked` PASS：存量 NULL 成本行被归一成 `'none'`，跨列 CHECK 拦住「0 成本 + ledger」。
-  - `TestGate_F7_RetainedRowCountsDoNotDecrease` PASS：0024 前后 15 张保留表行数一条不减，账单/账本/对外模型各 1 行仍在。
-  - `TestReconciler_RealSQL_WritesCounts`、`TestSQLWindowStore_BlockedSurvivesRestart` 在真库上 PASS（此前无 DSN 时被 skip，属"假绿"口径，已实跑）。
+- `go test ./... -count=1`（无 DSN）：35 个包全绿。
+- `go test -race`（`magpie` / `gateway` / `upstream` / `reconcile` / `db` / `seeding` / `model`，带真库 DSN）：全绿。
+- **真库门禁**（自建 PG17，DSN 指向空库，用例各自建临时库 + 真实迁移）：
+  - `TestGate_F4_OneStartupFullChain` PASS：一次 `Migrate` 跑全链；`0020` 早于 `0023b` 早于 `0024`；`0024` 排最后；目录无 `0021`；15 张保留表在、10 张退役表不在；`billing_records.channel_key_id` 已删。
+  - `TestGate_F10_NotValidSkipsLegacyRowsButEnforcesNewWrites` PASS：存量 NULL 行不被扫描也不被改写；新写「无成本 + ledger」被拒；存量行 UPDATE 只补 `ledger_entry_id` 被拒（23514），同时 `COALESCE(cost_source,'none')` 则通过。
+  - `TestGate_F10b_RepairMigrationFixesAlreadyAppliedDB` PASS：**精确复现基线红**——先把库退回旧形状（值域无 skipped、计数列 NOT NULL DEFAULT 0、无 F10 约束），确认旧形状确实拒 `skipped`，再应用 `0023b`：`skipped` 可写、计数默认 NULL、blocked 的 0 占位归 NULL、跨列 CHECK 生效。
+  - `TestGate_F7_RetainedRowCountsDoNotDecrease` PASS：`0024` 前后 15 张保留表行数一条不减。
+  - `TestRounder_RealSQL_Backlog4200_TwoRounds` PASS：见 §0 第 6 条。
+  - `TestSQLWindowStore_RealSQL_SkippedWritableAndCountsWritten` PASS：真库可写 `skipped`；计数列落真实数字；blocked 行拒绝对账覆盖且计数为 NULL。
+- **带 DSN 全量**：与上一轮完全一致，仍只有那 9 个"退役 schema"用例红（见 §3-A），**没有新增红**。
+- 变异验证（删掉修复 → 用例变红，证明断言不是摆设）：
+  - 删身份类头名的剥除分支 → `TestV2_F8_ResponseHeaderScrub` 红（`x-served-by` 漏出）；
+  - 把续拉 offset 强制置 0 → `TestRounder_RealSQL_Backlog4200_TwoRounds` 红（第二轮仍 blocked，与基线现象同形）；
+  - 把 `IS NOT DISTINCT FROM` 换回 `=` → 新写「NULL + ledger」放行，`TestGate_F10` 红。
 
 ## 3. 未完成项与已知缺口（登记，不承诺已解决）
 
@@ -90,6 +113,8 @@
 - 对账循环随进程起（60s），未做优雅退出等待、未做多副本互斥（单副本无碍）。
 - `external_models.bound_internal_ref` 已进入读模型，但**管理端没有编辑该字段的入口**（写入路径留给 V2 配置界面）。
 - 全仓库仍有大量 `channel_key_id` / 渠道表引用（非测试 ~60 处），属 A 项同一件事。
+- **同步轮次没有生产分页源**：`PageSource` 只有接口，`cmd/server` 里也只装配了对账循环、没装配 `Rounder`。本切片用遵守 offset 语义的测试源验证了 F9 行为，但"从上游用量接口拉账本"的 HTTP 实现仍是下一件的活（这也是基线红第 6 条的真实根因）。
+- 迁移编号新开了一个 `0023b`（幂等修形，排在 `0023` 与 `0024` 之间）：原因是**改过的 .sql 不会重放**，老环境必须有一条新迁移才能拿到最终形状。这不是复用 `0021` 空号。
 
 ## 4. 同一窗口重复写 `blocked` 的幂等性
 

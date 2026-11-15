@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -236,5 +237,75 @@ func TestSQLWindowStore_RejectsMisalignedWindow(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "ck_reconcile_window_len") {
 		t.Fatalf("应是窗口长度约束报错，got %v", err)
+	}
+}
+
+// TestSQLWindowStore_RealSQL_SkippedWritableAndCountsWritten 是真库用例（D4 的两处必须同步改）：
+//  1. status='skipped' 必须能写进库（老 0023 的 CHECK 值域会 23514 拒掉，靠 0023b 修形）；
+//  2. 计数列由对账方写，写入后是**真实数字**而不是 0；
+//  3. blocked 行不许被对账覆盖（返回 ErrWindowNotReconcilable），计数保持 NULL。
+func TestSQLWindowStore_RealSQL_SkippedWritableAndCountsWritten(t *testing.T) {
+	conn := openMigratedTempDB(t)
+	ctx := context.Background()
+	wins := NewSQLWindowStore(conn)
+
+	start := time.Date(2026, 11, 15, 11, 0, 0, 0, time.UTC)
+	rec := WindowRecord{
+		Start: start, End: start.Add(WindowSize), Status: WindowSkipped,
+		Reason: "账本侧关闭（对账按口径不比）", RecordedAt: start.Add(time.Minute),
+	}
+	if err := wins.Save(ctx, rec); err != nil {
+		t.Fatalf("写入 skipped 窗口失败（DB CHECK 是否缺 skipped？）: %v", err)
+	}
+	pending, err := wins.PendingWindows(ctx, blockedProbeLimit)
+	if err != nil {
+		t.Fatalf("读待补拉失败: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("skipped 不是待补拉状态，got %+v", pending)
+	}
+
+	// 计数列：对账方写入 → 真实值。
+	if err := wins.SaveCounts(ctx, WindowCounts{
+		Start: start, End: start.Add(WindowSize), Status: WindowSkipped,
+		LocalCount: 2, UpstreamCount: 3, LocalTokens: 100, UpstreamTokens: 120,
+		Detail:    map[string]any{"reason": "账本关闭，仅记灵枢侧"},
+		CheckedAt: start.Add(time.Minute),
+	}); err != nil {
+		t.Fatalf("写计数失败: %v", err)
+	}
+	var lc, oc, lt, ut int64
+	if err := conn.QueryRowContext(ctx,
+		`SELECT local_count, upstream_count, local_tokens, upstream_tokens
+		   FROM reconcile_windows WHERE window_start=$1`, start).
+		Scan(&lc, &oc, &lt, &ut); err != nil {
+		t.Fatalf("读计数失败: %v", err)
+	}
+	if lc != 2 || oc != 3 || lt != 100 || ut != 120 {
+		t.Fatalf("计数列应落真实数字，got %d/%d/%d/%d", lc, oc, lt, ut)
+	}
+
+	// blocked 窗口：对账不许覆盖。
+	blockedStart := start.Add(WindowSize)
+	if err := wins.Save(ctx, WindowRecord{
+		Start: blockedStart, End: blockedStart.Add(WindowSize), Status: WindowBlocked,
+		Reason: "单轮上限未拉完", ScrollOffset: 4000, RecordedAt: blockedStart.Add(time.Minute),
+	}); err != nil {
+		t.Fatalf("写入 blocked 窗口失败: %v", err)
+	}
+	if err := wins.SaveCounts(ctx, WindowCounts{
+		Start: blockedStart, End: blockedStart.Add(WindowSize), Status: WindowOK,
+		LocalCount: 1, UpstreamCount: 1,
+		CheckedAt: blockedStart.Add(time.Minute),
+	}); !errors.Is(err, ErrWindowNotReconcilable) {
+		t.Fatalf("对账不该覆盖 blocked 窗口，got %v", err)
+	}
+	var cnt *int64
+	if err := conn.QueryRowContext(ctx,
+		`SELECT local_count FROM reconcile_windows WHERE window_start=$1`, blockedStart).Scan(&cnt); err != nil {
+		t.Fatalf("读 blocked 计数失败: %v", err)
+	}
+	if cnt != nil {
+		t.Fatalf("blocked 窗口的计数必须是 NULL（未算过），got %d", *cnt)
 	}
 }

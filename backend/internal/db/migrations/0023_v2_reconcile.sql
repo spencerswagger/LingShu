@@ -10,8 +10,9 @@
 --
 -- ── 四个计数列的写入方（D4 裁定，唯一）──────────────────────────────────
 --   local_count / upstream_count / local_tokens / upstream_tokens **由对账服务在每窗结束时
---   统一写入**（internal/domain/upstream/reconcile.go 的 Store.SaveCounts），不许恒 0，
---   也不许「先写 0 等以后再补」。detail JSON 只兜底（分组明细、原因、页码），
+--   统一写入**（internal/domain/upstream/reconcile.go 的 Store.SaveCounts）；
+--   **未算过的窗口必须是 NULL，不许写 0**——0 表示「算过了，这一窗真的没有流量」，
+--   用 0 当占位会让「漏账」与「无流量」在查询里长得一模一样（F10 之后最容易踩的一处）。detail JSON 只兜底（分组明细、原因、页码），
 --   任何**判定用**的数字都必须落在计数列上——查历史时不能再靠解析 detail。
 --   同步轮次（window.go 的 Rounder）因此只写 status / detail / checked_at / scroll_offset。
 --
@@ -59,10 +60,12 @@
 CREATE TABLE IF NOT EXISTS reconcile_windows (
     window_start    TIMESTAMPTZ PRIMARY KEY,              -- 供 ON CONFLICT (window_start)
     window_end      TIMESTAMPTZ NOT NULL,
-    local_count     BIGINT NOT NULL DEFAULT 0,            -- 灵枢账单笔数（对账服务写）
-    upstream_count  BIGINT NOT NULL DEFAULT 0,            -- 账本笔数（对账服务写）
-    local_tokens    BIGINT NOT NULL DEFAULT 0,            -- 三段合计（对账服务写）
-    upstream_tokens BIGINT NOT NULL DEFAULT 0,            -- in+out 合计（对账服务写）
+    -- 四列可空：NULL = **本窗还没算过**（blocked/error/刚建行），0 = 算过且真的是 0。
+    -- 写成 NOT NULL DEFAULT 0 会让「没流量」和「没算过」变成同一个 0，漏账从此不可见。
+    local_count     BIGINT,                               -- 灵枢账单笔数（对账服务写）
+    upstream_count  BIGINT,                               -- 账本笔数（对账服务写）
+    local_tokens    BIGINT,                               -- 三段合计（对账服务写）
+    upstream_tokens BIGINT,                               -- in+out 合计（对账服务写）
     status          TEXT NOT NULL DEFAULT 'ok',
     alarm_streak    SMALLINT NOT NULL DEFAULT 0,
     scroll_offset   BIGINT NOT NULL DEFAULT 0,            -- 下次补拉该窗的 offset（ok 后归 0）
@@ -73,6 +76,17 @@ CREATE TABLE IF NOT EXISTS reconcile_windows (
 
 -- 旧表补齐新列（CREATE 被 IF NOT EXISTS 跳过时这一句才是真正生效的那句）。
 ALTER TABLE reconcile_windows ADD COLUMN IF NOT EXISTS scroll_offset BIGINT NOT NULL DEFAULT 0;
+
+-- 计数列可空（同上：旧表里它们曾是 NOT NULL DEFAULT 0，会与「无流量」混淆）。
+-- DROP NOT NULL 幂等；DROP DEFAULT 之后未指定计数的插入落 NULL（= 未算过）。
+ALTER TABLE reconcile_windows ALTER COLUMN local_count     DROP NOT NULL;
+ALTER TABLE reconcile_windows ALTER COLUMN local_count     DROP DEFAULT;
+ALTER TABLE reconcile_windows ALTER COLUMN upstream_count  DROP NOT NULL;
+ALTER TABLE reconcile_windows ALTER COLUMN upstream_count  DROP DEFAULT;
+ALTER TABLE reconcile_windows ALTER COLUMN local_tokens    DROP NOT NULL;
+ALTER TABLE reconcile_windows ALTER COLUMN local_tokens    DROP DEFAULT;
+ALTER TABLE reconcile_windows ALTER COLUMN upstream_tokens DROP NOT NULL;
+ALTER TABLE reconcile_windows ALTER COLUMN upstream_tokens DROP DEFAULT;
 
 -- 值域：删掉列内联 CHECK（自动命名）后按固定名重建，追加 'skipped'。
 ALTER TABLE reconcile_windows DROP CONSTRAINT IF EXISTS reconcile_windows_status_check;

@@ -203,7 +203,7 @@ func (g *Gateway) serveUpstream(w http.ResponseWriter, r *http.Request) {
 		Billable:           route.Billable,
 		Protocol:           route.Protocol,
 		OnUpstreamResponse: func(_ context.Context, f magpie.ResponseFacts) { facts = f },
-		OnDone: func(callbackCtx context.Context, r magpie.Result) {
+		OnComplete: func(callbackCtx context.Context, r magpie.Result) {
 			if settled {
 				return
 			}

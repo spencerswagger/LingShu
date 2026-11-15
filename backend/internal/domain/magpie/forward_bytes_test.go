@@ -290,7 +290,7 @@ func TestForward_HooksOrderAndAttribution(t *testing.T) {
 			facts = ff
 			order = append(order, "response")
 		},
-		OnDone: func(_ context.Context, r Result) {
+		OnComplete: func(_ context.Context, r Result) {
 			final = r
 			order = append(order, "done")
 		},
@@ -328,4 +328,88 @@ func firstDiff(a, b []byte) int {
 		return n
 	}
 	return -1
+}
+
+// TestForward_HookBeforeFirstByteAndRequestIDFallback 覆盖 Ark §9.2.2 的时序：
+// OnUpstreamResponse 必须在**任何字节写下游之前**同步返回；且 ctx 没链路 ID 时也要写我们自己的。
+func TestForward_HookBeforeFirstByteAndRequestIDFallback(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("x-request-id", "upstream-rid")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer up.Close()
+
+	f := NewForwarder()
+	rec := httptest.NewRecorder()
+	hookSawWritten := -1
+	res := f.Forward(t.Context(), rec, ForwardRequest{
+		BaseURL: up.URL, Path: "/v1/chat/completions", Header: http.Header{},
+		Body: []byte(`{"model":"m"}`), Billable: false, Protocol: ProtocolOpenAIChat,
+		// RequestID 故意留空：模拟 ctx 没有链路 ID 的情形。
+		OnUpstreamResponse: func(_ context.Context, _ ResponseFacts) {
+			hookSawWritten = rec.Body.Len() // 钩子运行时下游必须还没有任何字节
+			if rec.Code != http.StatusOK {
+				// 记录器在 WriteHeader 前 Code 默认 200，用 body 长度作为「是否已写」的判据。
+				return
+			}
+		},
+	}, Timeouts{StreamFirstByte: 5 * time.Second, StreamIdle: 5 * time.Second})
+
+	if res.Err != nil {
+		t.Fatalf("转发失败: %v", res.Err)
+	}
+	if hookSawWritten != 0 {
+		t.Fatalf("首字节钩子必须在写下游之前同步返回，钩子内已写 %d 字节", hookSawWritten)
+	}
+	got := rec.Header().Get("x-request-id")
+	if got == "" {
+		t.Fatal("ctx 无链路 ID 时也必须给下游生成一个（不能留空、更不许透传上游值）")
+	}
+	if got == "upstream-rid" {
+		t.Fatal("上游的 x-request-id 不许透传")
+	}
+	if res.RequestID != got {
+		t.Fatalf("Result.RequestID 应与下游一致：got %q want %q", res.RequestID, got)
+	}
+}
+
+// TestForward_VendorIdentityHeadersDropped 是 F8 四类头的单元级覆盖（端到端在 gateway 包）。
+func TestForward_VendorIdentityHeadersDropped(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("server", "magpie/1.0")
+		h.Set("x-magpie-route", "r1")
+		h.Set("x-magpie-account", "acct")
+		h.Set("x-upstream-model", "m")
+		h.Set("x-provider", "openai")                     // 名带供应商
+		h.Set("x-served-by", "some-vendor")               // 值带供应商
+		h.Set("x-note", "powered by anthropic")           // 值带供应商
+		h.Set("x-account-owner", "acme")                  // 身份类头名
+		h.Set("anthropic-ratelimit-requests-limit", "50") // 该透传
+		h.Set("x-request-id", "up-rid")
+		h.Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer up.Close()
+
+	f := NewForwarder()
+	rec := httptest.NewRecorder()
+	f.Forward(t.Context(), rec, ForwardRequest{
+		BaseURL: up.URL, Path: "/v1/chat/completions", Header: http.Header{},
+		Body: []byte(`{"model":"m"}`), RequestID: "our-rid", Protocol: ProtocolOpenAIChat,
+	}, Timeouts{StreamFirstByte: 5 * time.Second, StreamIdle: 5 * time.Second})
+
+	for _, h := range []string{"server", "x-magpie-route", "x-magpie-account", "x-upstream-model",
+		"x-provider", "x-served-by", "x-note", "x-account-owner"} {
+		if v := rec.Header().Get(h); v != "" {
+			t.Fatalf("F8 要求剔除 %s，仍漏出 %q", h, v)
+		}
+	}
+	if rec.Header().Get("anthropic-ratelimit-requests-limit") != "50" {
+		t.Fatal("限流类可观测头不该被过度剥除")
+	}
+	if rec.Header().Get("x-request-id") != "our-rid" {
+		t.Fatalf("x-request-id 必须是灵枢自己的，got %q", rec.Header().Get("x-request-id"))
+	}
 }

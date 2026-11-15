@@ -83,9 +83,16 @@ var responseDroppedExactly = map[string]bool{
 
 // vendorTokens 是「供应商/上游产品名」清单（F8 第 4 条）。
 //
-// 只用于**丢弃**回程头，不参与任何对外文案。新增上游产品名时追加到这里，
-// 别在别处另写一份（这是 §10-F 允许的唯一字面量位置）。
-var vendorTokens = []string{"magpie"}
+// 只用于**丢弃**名字或取值里带供应商名的回程头，不参与任何对外文案、不进日志字段。
+// 新增上游产品名时只追加到这里，别在别处另写一份——这是 §10-F 允许的唯一字面量位置。
+//
+// 为什么按「值」也要判：上游常把供应商标识放在通用头里（`x-provider: <name>`、
+// `x-served-by: <name>`、`set-cookie: ... <name> ...`），只按头名剥必然漏。
+var vendorTokens = []string{
+	"magpie", "openai", "anthropic", "google", "gemini", "vertex", "azure",
+	"bedrock", "xai", "deepseek", "moonshot", "mistral", "cohere", "groq",
+	"together", "fireworks", "openrouter", "siliconflow", "qwen", "zhipu",
+}
 
 // CopyRequestHeaders 把入站 header 带到出站请求上：
 //  1. 命中强制黑名单的一律不带（凭据由调用方注入）；
@@ -119,11 +126,19 @@ func ShouldDropResponseHeader(name, value string) bool {
 			return true
 		}
 	}
-	// 名或值里出现供应商名：`x-provider: magpie`、`set-cookie: ... magpie ...` 都挡住。
+	// 取值里出现供应商名：`x-served-by: <name>`、`x-note: powered by <name>` 一律挡住。
+	// 按值判是必要的一刀——上游经常把供应商标识塞进通用头名里。
 	for _, token := range vendorTokens {
-		if strings.Contains(lower, token) || containsFold(value, token) {
+		if containsFold(value, token) {
 			return true
 		}
+	}
+	// 头名里带供应商名时，只对「身份类」头名动手（provider/account/vendor/…）：
+	// `anthropic-ratelimit-*` 这类确实是 Anthropic 客户端的正常可观测头，
+	// 按名字一刀切会把限流信息也剥掉，属于过度剥除。
+	// `x-served-by` 这类头名本身就是身份声明（不含供应商字面量），按身份词单独剥。
+	if hasIdentityToken(lower) {
+		return true
 	}
 	return false
 }
@@ -131,6 +146,8 @@ func ShouldDropResponseHeader(name, value string) bool {
 // CopyResponseHeaders 透传上游响应头，按 F8 规则剔除，并写入灵枢自己的 x-request-id。
 //
 // Content-Length 保留（本链路不改写响应体，长度仍然成立）；流式没有长度头，走 chunked。
+// ourRequestID 为空时由调用方保证已生成（不能留空：留空等于下游没有链路 ID，
+// 排障时对不上号，而 F8 要求「x-request-id 是灵枢自己的」）。
 func CopyResponseHeaders(dst, src http.Header, ourRequestID string) {
 	for name, values := range src {
 		drop := false
@@ -190,6 +207,30 @@ func ReadAttribution(h http.Header) Attribution {
 		Account:  pick(attributionHeaderCandidates.Account),
 		Model:    pick(attributionHeaderCandidates.Model),
 	}
+}
+
+// identityNameTokens 是「上游身份类」头名的特征词（小写比较）。
+// 注意别把 CORS 的 `access-control-allow-origin` 之类的头也带进来（"origin" 故意不在列表里）。
+var identityNameTokens = []string{"provider", "account", "vendor", "served", "backend", "worker", "region"}
+
+// hasVendorToken 报告小写头名里是否出现供应商名。
+func hasVendorToken(lower string) bool {
+	for _, token := range vendorTokens {
+		if strings.Contains(lower, token) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasIdentityToken 报告小写头名里是否出现身份类特征词。
+func hasIdentityToken(lower string) bool {
+	for _, token := range identityNameTokens {
+		if strings.Contains(lower, token) {
+			return true
+		}
+	}
+	return false
 }
 
 // containsFold 是大小写不敏感的子串判断（不引入额外依赖）。

@@ -63,30 +63,48 @@ CREATE INDEX IF NOT EXISTS idx_billing_request
 
 -- ── F10：跨列 CHECK（成本缺失必须标明「没有成本口径」）────────────────────
 --
--- 口径：`cost_credits IS NULL` ⇒ `cost_source = 'none'`。写成「列组合不许自相矛盾」而不是
--- 「cost_source 必填」：存量行（0020 之前写入的）本来就没有值，硬填 NOT NULL 会逼所有人
--- 编一个假的成本来源；要的是**可判别**——空成本的行不许再声称成本来自账本/摊销。
+-- 口径：`cost_credits IS NULL` ⇒ `cost_source` 必须**恰好**是 'none'。写成「列组合不许自相矛盾」
+-- 而不是「cost_source 必填」：存量行硬填 NOT NULL 会逼所有人编一个假的成本来源；
+-- 要的是**可判别**——空成本的行不许再声称成本来自账本/摊销。
+--
+-- 为什么用 `IS NOT DISTINCT FROM` 而不是 `=`：SQL 的 CHECK 把**三值逻辑的 NULL 当成通过**，
+-- 写成 `cost_source = 'none'` 时「成本 NULL + 来源 NULL」求值为 NULL → 约束形同不存在
+-- （实测就是这样被放行的）。`IS NOT DISTINCT FROM` 返回布尔值，NULL 也判 false → 真正拦住。
 --
 -- 为什么必须在 DB 层而不是只在 Go 里（attributionArgs 已经归一）：写入口不止一个
 -- （账单快速失败通道、重试队列、运维补单），任何一条漏归一都会让「0 成本 + ledger 来源」
 -- 这种自相矛盾的行进库，报表按 cost_source 聚合直接失真。约束是最后一道闸。
 --
--- 顺序：先归一存量（UPDATE），再加约束。不这么做，存量 failed 行（cost_credits NULL、
--- cost_source NULL）会让 ADD CONSTRAINT 直接失败 —— 报错信息还会误导成「约束写错」。
--- UPDATE 只动 `cost_credits IS NULL AND cost_source IS NULL` 的行，幂等、可重复执行。
-UPDATE billing_records
-   SET cost_source = 'none'
- WHERE cost_credits IS NULL
-   AND cost_source IS NULL;
+-- 顺序与形态（F10 补丁，2026-11-15）：**不做存量扫描的 UPDATE**，直接把约束建成
+-- `NOT VALID`。
+--   · 生产库里 15 万量级的存量行是 cost_credits NULL + cost_source NULL（0020 之前写的），
+--     加约束时若做全表校验要扫一遍大表，把一个纯 ADD 的迁移变成停机风险点；
+--   · `NOT VALID` 的语义刚好够用：**已存在的行不校验**（跳过扫描），
+--     **新写入与任何 UPDATE 一律强约束**。想补齐历史数据可以后面单独跑运维脚本（V2 之后再说）。
+--   · 因此这里不需要「先归一再加约束」的 UPDATE：加了它反而是那一次 15 万行扫描本身。
+--
+-- 重放/修形：约束名固定，先 DROP 再建，保证「老库上已存在一条定义不对的同名约束」也能被纠正
+-- （`ADD CONSTRAINT IF NOT EXISTS` 在 PG 里不存在；DO 判存会把错定义留在原地 → 见 0023b 的说明）。
+ALTER TABLE billing_records DROP CONSTRAINT IF EXISTS ck_billing_cost_presence;
+ALTER TABLE billing_records ADD CONSTRAINT ck_billing_cost_presence
+  CHECK (cost_credits IS NOT NULL OR cost_source IS NOT DISTINCT FROM 'none') NOT VALID;
 
-DO $$
-BEGIN
-  IF NOT EXISTS (
-      SELECT 1 FROM pg_constraint
-      WHERE conname = 'ck_billing_cost_presence'
-        AND conrelid = 'billing_records'::regclass
-  ) THEN
-    ALTER TABLE billing_records ADD CONSTRAINT ck_billing_cost_presence
-      CHECK (cost_credits IS NOT NULL OR cost_source = 'none');
-  END IF;
-END $$;
+-- ── 回填 ledger_entry_id 时必须一起给成本来源（否则 23514）──────────────────
+--
+-- `NOT VALID` 只放过**已存在**的行；任何 UPDATE 都会重新校验整行。所以给历史行补
+-- ledger_entry_id 时，必须同一句里把 cost_source 定下来，默认按「没有成本口径」写：
+--
+--     UPDATE billing_records
+--        SET ledger_entry_id = $1,
+--            cost_source     = COALESCE(cost_source, 'none')
+--      WHERE billing_id = $2;
+--
+-- 只有确认该行确实记了成本（cost_credits IS NOT NULL）时，才允许写 'ledger'：
+--
+--     UPDATE billing_records
+--        SET ledger_entry_id = $1,
+--            cost_source     = COALESCE(cost_source, 'ledger')
+--      WHERE billing_id = $2 AND cost_credits IS NOT NULL;
+--
+-- 反例（会炸 23514）：只 SET ledger_entry_id，而该行 cost_credits 为 NULL、cost_source 还是 NULL
+--   → `NULL IS NOT NULL` 为假、`NULL = 'none'` 为 NULL → 整行被判违反。

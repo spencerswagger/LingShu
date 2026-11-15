@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -93,27 +94,57 @@ func TestConfigProvider_TolerantFormats(t *testing.T) {
 	}
 }
 
-// TestConfigProvider_LegacyTimeoutKeyIgnored 断言单值 `upstream.timeout_ms` 已不再被读取。
+// TestConfigProvider_KeySetIsExactlyRuled 断言配置键集**恰好**是裁定的三键，
+// 且超时块里**恰好**只有两段（首包 30000 / 空闲 120000）。
 //
-// 这条是「删键」的守卫：老库里那个键还在（种子 ON CONFLICT DO NOTHING 不会删它），
-// 只要代码还在读它，就会出现「控制台改了没效果」——两种配置来源打架，比没有配置更难查。
-func TestConfigProvider_LegacyTimeoutKeyIgnored(t *testing.T) {
-	src := &fakeConfigSource{vals: map[string]string{
-		ConfigKeyBaseURL:      `"http://gw:3425"`,
-		"upstream.timeout_ms": `9000`,
-		ConfigKeyTimeouts:     `{"stream_first_byte_ms":20000,"stream_idle_ms":60000}`,
-		ConfigKeyDegrade:      `{"passthrough_enabled":true,"ledger_enabled":true,"sync_enabled":true}`,
-	}}
-	cfg, problems := p0(src)
-	if len(problems) != 0 {
-		t.Fatalf("不读旧键不应报问题：%v", problems)
+// 这条替代了早前「旧单值超时键被忽略」的守卫：键一旦从代码里彻底消失，
+// 再写一条「不读它」的用例等于把废弃键名又留在仓库里（静态检查会照红）。
+func TestConfigProvider_KeySetIsExactlyRuled(t *testing.T) {
+	want := []string{"upstream.base_url", "upstream.timeouts", "upstream.degrade"}
+	got := ConfigKeys()
+	if len(got) != len(want) {
+		t.Fatalf("配置键必须恰好 %d 个（%v），got %v", len(want), want, got)
 	}
-	if cfg.Timeouts.StreamFirstByte != 20*time.Second {
-		t.Fatalf("超时应只来自 upstream.timeouts，got %s（旧键被读了？）", cfg.Timeouts.StreamFirstByte)
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("配置键不符：got %v want %v", got, want)
+		}
 	}
-	for _, k := range src.keys {
-		if k == "upstream.timeout_ms" {
-			t.Fatalf("配置读取不该再碰 upstream.timeout_ms（F1 已删该键）")
+
+	// 超时块只有两段：连接超时 / 非流式总超时是代码常量，不许变成配置键。
+	raw, err := json.Marshal(DefaultRuntimeConfig().Timeouts)
+	if err != nil {
+		t.Fatalf("序列化默认超时失败: %v", err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatalf("解析默认超时失败: %v", err)
+	}
+	if len(fields) != 2 {
+		t.Fatalf("超时块必须恰好两段，got %v", fields)
+	}
+	if v, ok := fields[FieldStreamFirstByteMS]; !ok || v.(float64) != 30000 {
+		t.Fatalf("默认首包超时必须 30000ms，got %v", fields)
+	}
+	if v, ok := fields[FieldStreamIdleMS]; !ok || v.(float64) != 120000 {
+		t.Fatalf("默认空闲超时必须 120000ms，got %v", fields)
+	}
+
+	// 降级块同理：三个开关、键名按裁定，不许出现 Go 风格字段名。
+	rawDeg, err := json.Marshal(DefaultRuntimeConfig().Degrade)
+	if err != nil {
+		t.Fatalf("序列化默认降级失败: %v", err)
+	}
+	var deg map[string]any
+	if err := json.Unmarshal(rawDeg, &deg); err != nil {
+		t.Fatalf("解析默认降级失败: %v", err)
+	}
+	if len(deg) != 3 {
+		t.Fatalf("降级块必须恰好三个开关，got %v", deg)
+	}
+	for _, k := range []string{FieldPassthroughOn, FieldLedgerOn, FieldSyncOn} {
+		if _, ok := deg[k]; !ok {
+			t.Fatalf("降级块缺少键 %s，got %v", k, deg)
 		}
 	}
 }

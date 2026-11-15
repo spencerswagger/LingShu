@@ -62,7 +62,7 @@ var defaultSysConfigs = map[string]string{
 	// 红线：**只允许非敏感运行参数**——凭据类（admin key / callerKey / token / password）
 	// 永不进 sys_configs；上游鉴权由装配层逐请求注入。
 	// 三键形态（F1 裁定，对齐 Ark §9.4）：基址 / 两段超时 / 三段开关。
-	// 上一版的单值 `upstream.timeout_ms` 已删除：转发链的超时分两段（等响应头、流空闲），
+	// 转发链超时只种子两段（等响应头、流空闲）；连接/非流式总超时是代码常量，不进配置表。
 	// 一个数只能表达其中一段，另一段就成了看不见的代码默认值。
 	"upstream.base_url": `""`,
 	// 两段超时：首包（等响应头）30s、流空闲 120s。

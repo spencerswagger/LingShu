@@ -167,12 +167,13 @@ func TestGate_F4_OneStartupFullChain(t *testing.T) {
 	}
 }
 
-// TestGate_F10_ExistingNullRowsNormalizedAndChecked 断言存量行归一 + 跨列 CHECK 生效。
-func TestGate_F10_ExistingNullRowsNormalizedAndChecked(t *testing.T) {
+// TestGate_F10_NotValidSkipsLegacyRowsButEnforcesNewWrites 断言 F10 补丁口径：
+// 存量行不被扫描（NOT VALID），但新写入与任何 UPDATE 都被强约束。
+func TestGate_F10_NotValidSkipsLegacyRowsButEnforcesNewWrites(t *testing.T) {
 	g, _ := newGateDB(t, "v2gate_f10")
 	ctx := context.Background()
 
-	// 1) 只应用 0001–0019，模拟「上线前的存量库」。
+	// 1) 只应用 0001–0019，模拟「上线前已有 15 万存量行」的库。
 	for _, name := range migrationFiles(t) {
 		if name >= "0020" {
 			break
@@ -185,12 +186,11 @@ func TestGate_F10_ExistingNullRowsNormalizedAndChecked(t *testing.T) {
 			t.Fatalf("应用 %s 失败: %v", name, err)
 		}
 	}
-	// 2) 先建一个用户（账单有 user_id 外键），再写一行「无成本口径」的历史账单
-	//（此时 cost_source 列还不存在）。
 	if _, err := g.ExecContext(ctx,
 		`INSERT INTO users(id, username, password_hash, role) VALUES (1,'u1','x','DEVELOPER')`); err != nil {
 		t.Fatalf("插入用户失败: %v", err)
 	}
+	// 存量行：成本 NULL（0020 之前写的账单就是这样）。
 	if _, err := g.ExecContext(ctx,
 		`INSERT INTO billing_records(id, billing_id, user_id, pricing_mode, external_model_name,
 		     internal_model_id, r_value, tokens, call_time, cost_credits)
@@ -198,36 +198,145 @@ func TestGate_F10_ExistingNullRowsNormalizedAndChecked(t *testing.T) {
 		t.Fatalf("插入历史账单失败: %v", err)
 	}
 
-	// 3) 跑 0020：加列 → 归一 → 加约束。
+	// 2) 跑 0020（NOT VALID：不扫存量，所以这一步不该因为存量行失败）。
 	body, err := os.ReadFile(filepath.Join("migrations", "0020_v2_billing_attribution.sql"))
 	if err != nil {
 		t.Fatalf("读 0020 失败: %v", err)
 	}
 	if _, err := g.ExecContext(ctx, string(body)); err != nil {
-		t.Fatalf("应用 0020 失败（存量行会让 ADD CONSTRAINT 失败）: %v", err)
+		t.Fatalf("应用 0020 失败（NOT VALID 应当跳过存量扫描）: %v", err)
 	}
 
-	var source *string
-	if err := g.QueryRowContext(ctx, `SELECT cost_source FROM billing_records WHERE id=1`).Scan(&source); err != nil {
-		t.Fatalf("读归一结果失败: %v", err)
+	// 3) 存量行原样保留（不被归一、也没被删）——这就是「不扫存量」的代价与证据。
+	var legacy *string
+	if err := g.QueryRowContext(ctx, `SELECT cost_source FROM billing_records WHERE id=1`).Scan(&legacy); err != nil {
+		t.Fatalf("读存量行失败: %v", err)
 	}
-	if source == nil || *source != "none" {
-		t.Fatalf("存量行应被归一成 none，got %v", source)
+	if legacy != nil {
+		t.Fatalf("NOT VALID 不该改写存量行，got cost_source=%v", *legacy)
 	}
 
-	// 4) 跨列 CHECK 必须拦「0 成本 + 声称来自账本」。
+	// 4) 新写入：无成本却声称 ledger → 必须被拒。
 	if _, err := g.ExecContext(ctx,
 		`INSERT INTO billing_records(id, billing_id, user_id, pricing_mode, external_model_name,
 		     internal_model_id, r_value, tokens, call_time, cost_credits, cost_source)
 		 VALUES (2,'bad-1',1,'sale','m','im',1,'{"input":1,"output":1}'::jsonb, now(), NULL, 'ledger')`); err == nil {
-		t.Fatal("跨列 CHECK 应拦住「无成本 + ledger 来源」")
+		t.Fatal("新写入「无成本 + ledger」必须被 CHECK 拒掉")
 	}
-	// 而「无成本 + none」要放行。
 	if _, err := g.ExecContext(ctx,
 		`INSERT INTO billing_records(id, billing_id, user_id, pricing_mode, external_model_name,
 		     internal_model_id, r_value, tokens, call_time, cost_credits, cost_source)
 		 VALUES (3,'ok-1',1,'sale','m','im',1,'{"input":1,"output":1}'::jsonb, now(), NULL, 'none')`); err != nil {
 		t.Fatalf("无成本 + none 应放行: %v", err)
+	}
+
+	// 5) UPDATE 同样被强约束：只补 ledger_entry_id 不改成本来源 → 23514。
+	if _, err := g.ExecContext(ctx,
+		`UPDATE billing_records SET ledger_entry_id='led-1' WHERE id=1`); err == nil {
+		t.Fatal("存量行 UPDATE 时也必须满足跨列约束（NOT VALID 只放过未改动的行）")
+	}
+	// 按 0020 文件里写明的正确写法（同时 COALESCE 成本来源）→ 通过。
+	if _, err := g.ExecContext(ctx,
+		`UPDATE billing_records SET ledger_entry_id='led-1', cost_source=COALESCE(cost_source,'none') WHERE id=1`); err != nil {
+		t.Fatalf("同时给成本来源的回填应通过: %v", err)
+	}
+}
+
+// TestGate_F10b_RepairMigrationFixesAlreadyAppliedDB 复现 Gate 的基线红：
+// 老环境里 0020/0023 已按旧内容应用过（applied_migrations 有记录，改文件不会重放），
+// 靠 0023b 把形状推到最终态：'skipped' 可写、计数列可空、跨列 CHECK 生效。
+func TestGate_F10b_RepairMigrationFixesAlreadyAppliedDB(t *testing.T) {
+	g, _ := newGateDB(t, "v2gate_f10b")
+	ctx := context.Background()
+
+	// 1) 应用到 0023（不含 0023b/0024），再把 reconcile_windows 退回**旧形状**。
+	for _, name := range migrationFiles(t) {
+		if name >= "0023b" {
+			break
+		}
+		body, err := os.ReadFile(filepath.Join("migrations", name))
+		if err != nil {
+			t.Fatalf("读 %s 失败: %v", name, err)
+		}
+		if _, err := g.ExecContext(ctx, string(body)); err != nil {
+			t.Fatalf("应用 %s 失败: %v", name, err)
+		}
+	}
+	oldShape := []string{
+		`DROP TABLE reconcile_windows`,
+		`CREATE TABLE reconcile_windows (
+		    window_start TIMESTAMPTZ PRIMARY KEY,
+		    window_end TIMESTAMPTZ NOT NULL,
+		    local_count BIGINT NOT NULL DEFAULT 0,
+		    upstream_count BIGINT NOT NULL DEFAULT 0,
+		    local_tokens BIGINT NOT NULL DEFAULT 0,
+		    upstream_tokens BIGINT NOT NULL DEFAULT 0,
+		    status TEXT NOT NULL DEFAULT 'ok' CHECK (status IN ('ok','alarm','error','blocked')),
+		    alarm_streak SMALLINT NOT NULL DEFAULT 0,
+		    detail JSONB NOT NULL DEFAULT '{}'::jsonb,
+		    checked_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+		    CONSTRAINT ck_reconcile_window_len CHECK (window_end = window_start + interval '60 seconds')
+		)`,
+		// 老版本的 blocked 行走「写 0 占位」。
+		`INSERT INTO reconcile_windows(window_start, window_end, status)
+		 VALUES (now()-interval '1 minute', now(), 'blocked')`,
+		// 老版本没有 F10 约束。
+		`ALTER TABLE billing_records DROP CONSTRAINT IF EXISTS ck_billing_cost_presence`,
+	}
+	for _, q := range oldShape {
+		if _, err := g.ExecContext(ctx, q); err != nil {
+			t.Fatalf("退回旧形状失败: %v\nSQL: %s", err, q)
+		}
+	}
+	// 前置确认：旧形状确实写不进 'skipped'（这就是 Gate 看到的那条红）。
+	if _, err := g.ExecContext(ctx,
+		`INSERT INTO reconcile_windows(window_start, window_end, status)
+		 VALUES (now()-interval '2 minute', now()-interval '1 minute', 'skipped')`); err == nil {
+		t.Fatal("旧形状本应拒绝 skipped（前置条件不成立，用例失去意义）")
+	}
+
+	// 2) 应用修形迁移。
+	body, err := os.ReadFile(filepath.Join("migrations", "0023b_v2_reconcile_repair.sql"))
+	if err != nil {
+		t.Fatalf("读 0023b 失败: %v", err)
+	}
+	if _, err := g.ExecContext(ctx, string(body)); err != nil {
+		t.Fatalf("应用 0023b 失败: %v", err)
+	}
+
+	// 3) 'skipped' 可写。
+	if _, err := g.ExecContext(ctx,
+		`INSERT INTO reconcile_windows(window_start, window_end, status)
+		 VALUES (now()-interval '3 minute', now()-interval '2 minute', 'skipped')`); err != nil {
+		t.Fatalf("修形后 skipped 应可写: %v", err)
+	}
+	// 4) 计数列可空：不指定计数插入 → NULL。
+	var lc *int64
+	if err := g.QueryRowContext(ctx,
+		`SELECT local_count FROM reconcile_windows WHERE status='skipped'`).Scan(&lc); err != nil {
+		t.Fatalf("读计数失败: %v", err)
+	}
+	if lc != nil {
+		t.Fatalf("未算过的窗口计数必须是 NULL（0 会与「无流量」混淆），got %d", *lc)
+	}
+	// 5) 老的 blocked 占位 0 被归 NULL。
+	if err := g.QueryRowContext(ctx,
+		`SELECT local_tokens FROM reconcile_windows WHERE status='blocked'`).Scan(&lc); err != nil {
+		t.Fatalf("读 blocked 计数失败: %v", err)
+	}
+	if lc != nil {
+		t.Fatalf("blocked 行的 0 占位应被归成 NULL，got %d", *lc)
+	}
+	// 6) 跨列 CHECK 也补上了。
+	if _, err := g.ExecContext(ctx,
+		`INSERT INTO users(id, username, password_hash, role) VALUES (1,'u1','x','DEVELOPER')`); err != nil {
+		t.Fatalf("插入用户失败: %v", err)
+	}
+	if _, err := g.ExecContext(ctx,
+		`INSERT INTO billing_records(id, billing_id, user_id, pricing_mode, external_model_name,
+		     internal_model_id, r_value, tokens, call_time, cost_credits, cost_source)
+		 VALUES (1,'bad',1,'sale','m','im',1,'{"input":1}'::jsonb, now(), NULL, 'ledger')`); err == nil {
+		t.Fatal("修形后「无成本 + ledger」必须被拒")
 	}
 }
 
@@ -256,8 +365,8 @@ func TestGate_F7_RetainedRowCountsDoNotDecrease(t *testing.T) {
 		`INSERT INTO users(id, username, password_hash, role) VALUES (1,'u1','x','DEVELOPER')`,
 		`INSERT INTO external_models(id, external_name) VALUES (1,'m1')`,
 		`INSERT INTO billing_records(id, billing_id, user_id, pricing_mode, external_model_name,
-		    internal_model_id, r_value, tokens, call_time)
-		 VALUES (1,'b1',1,'sale','m1','im',1,'{"input":1,"output":1}'::jsonb, now())`,
+		    internal_model_id, r_value, tokens, call_time, cost_source)
+		 VALUES (1,'b1',1,'sale','m1','im',1,'{"input":1,"output":1}'::jsonb, now(), 'none')`,
 		`INSERT INTO ledger_entries(id, ledger_id, provider, provider_account, model, tokens_in, tokens_out, cost_credits, occurred_at)
 		 VALUES (1,'l1','p','a','m',1,1,1, now())`,
 		`INSERT INTO reconcile_windows(window_start, window_end, status) VALUES (now() - interval '1 minute', now(), 'ok')`,
