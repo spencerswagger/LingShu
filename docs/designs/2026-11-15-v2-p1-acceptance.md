@@ -23,15 +23,19 @@
 
 ---
 
+> 勘误（随 Ark `7b4a86d`）：0021 实际删 **10 张**表，`channel_events` 早在
+> `0009_drop_channel_state.sql` 就已删除、0021 里那条是空操作（保留只为清单完整）。
+> M1/M3/M6 的「11」按「10 张实删 + 1 条空操作」读；按 11 张去找会误以为漏了一张。
+
 ## 1 迁移 0019–0023（6 条）
 
 | # | 判据 | 通过条件 | 失败条件 | 证据形式 | 级别 |
 |---|---|---|---|---|---|
 | M1 | 编号合规 + 唯一 DROP 文件 | `SELECT name FROM applied_migrations ORDER BY name DESC LIMIT 1` = `0018_call_logs_req_params.sql`；`migrations/` 下存在 0019/0020/0021/0022/0023 五个文件、**不存在** `0019_v2_facade.sql`、`0020_reconcile_blocked_status.sql`；`grep -nE '^[[:space:]]*DROP|CONCURRENTLY|VACUUM|CREATE DATABASE'` 只在 0021 命中（11 条 DROP TABLE + 3 条 DROP COLUMN） | 撞号 / 五个文件外还有改动 / 非 0021 文件出现 DROP / 出现事务内不可执行语句 | 两条命令原文输出 + `ls migrations \| tail -6` | P0 |
 | M2 | 全链一次跑通 + 二次幂等 | 空库 `go test ./internal/db -run TestMigrate_FullChain -v`（带 `LLMGATEWAY_TEST_PG_DSN`）绿，日志「已按序应用 N 个迁移」；已到 0018 的存量库启动一次 → 新增 5 条；再启动 → 新增 0 条（`SELECT count(*) FROM applied_migrations` 前后相同） | 任一步报错 / 二次执行又新增 / 需要手工分次执行才能过 | 测试输出 + 两次 `applied_migrations` 计数 + migrate 返回计数日志 | P0 |
-| M3 | 0021 中途失败自动回滚（事务性） | 临时库里先建 `CREATE VIEW v_dep AS SELECT id FROM channels`，再跑 migrate：0021 报 `cannot drop table channels because other objects depend on it`；断言 (a) `applied_migrations` 无 0021；(b) 11 张退役表 `to_regclass` 全非空；(c) `billing_records.channel_key_id`/`sessions.channel_key_id`/`tokens.tag_id` 仍在；(d) 删 view 后重跑 → 0021 成功（证明可重试） | 任一张表/列已消失（= 部分执行、回滚未生效）；或重跑报错 | 一次失败输出 + 四项 SQL 结果 + 重跑输出 | P0 |
+| M3 | 0021 中途失败自动回滚（事务性） | 临时库里先建 `CREATE VIEW v_dep AS SELECT id FROM channels`，再跑 migrate：0021 报 `cannot drop table channels because other objects depend on it`；断言 (a) `applied_migrations` 无 0021；(b) 10 张实删表 + 空操作的 `channel_events` 共 11 条 `to_regclass` 全非空；(c) `billing_records.channel_key_id`/`sessions.channel_key_id`/`tokens.tag_id` 仍在；(d) 删 view 后重跑 → 0021 成功（证明可重试） | 任一张表/列已消失（= 部分执行、回滚未生效）；或重跑报错 | 一次失败输出 + 四项 SQL 结果 + 重跑输出 | P0 |
 | M4 | 三步证据「最小充分」 | ① `pg_dump -Fc` exit 0 且文件 >1 KiB，记录文件名/大小/sha256；② `pg_restore` 到**临时库** exit 0，且 `diff before-all.txt restored-all.txt` 为空（全表行数一致）；③ 迁移后 `diff before-retained.txt after-retained.txt` 为空 + 3d 删干净查询为空输出；④ **还原出的 dump 里 `billing_records.channel_key_id` 非空行数 > 0**（证明唯一永久损失可取证） | dump 缺失/sha256 未记 / restore 失败或行数不一致 / dump 里 channel_key_id 已无数据（= 备份不能取回历史渠道密钥名） | 四类产物原文（dump 元信息、两个 diff 的空输出、3d 空输出、④ 的 count）+ 三条命令退出码 | P0 |
-| M5 | 保留表行数不许变少 | 集合 = 0021 **前** public 下所有表 − 11 张退役表（当前 15 张，**含 `watchlist_items`、`price_change_alerts`**）；基线在服务停止时取、复检在 0021 后取；逐表 `after >= before`，停服前提下 `after == before` | 任一表 `after < before`（数据丢失）→ 立即中止；若已 commit，用 M4 的 dump 全量恢复 | `counts-retained.sql` 两次输出 + `diff` 结果 + 取数时的停服说明 | P0 |
+| M5 | 保留表行数不许变少 | 集合 = 0021 **前** public 下所有表 − 10 张实删表（当前 15 张，**含 `watchlist_items`、`price_change_alerts`**）；基线在服务停止时取、复检在 0021 后取；逐表 `after >= before`，停服前提下 `after == before` | 任一表 `after < before`（数据丢失）→ 立即中止；若已 commit，用 M4 的 dump 全量恢复 | `counts-retained.sql` 两次输出 + `diff` 结果 + 取数时的停服说明 | P0 |
 | M6 | 删除断言 + 反向断言（防多删） | 3d 查询空输出；`information_schema.columns` 查上面 3 列 = 0 行；`pg_indexes` 无 `idx_billing_key_time`/`idx_sessions_key`；**反向**：`call_logs` 仍有 `channel_id`/`channel_key_id`/`auto_model_name`，`channel_protocols`/`protocol_error_stats`/`watchlist_items`/`price_change_alerts` 仍在 | 有表/列残留（迁移未生效）；或 `call_logs` 三列被误删、保留表被误删 | 两个 SELECT 的输出（前者空、后者为清单）+ `\d call_logs` | P0 |
 
 ---
