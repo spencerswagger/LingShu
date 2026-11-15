@@ -11,6 +11,7 @@ import (
 	"github.com/team/llmgateway/internal/domain/channel"
 	"github.com/team/llmgateway/internal/domain/channelprotocol"
 	"github.com/team/llmgateway/internal/domain/identity"
+	"github.com/team/llmgateway/internal/domain/magpie"
 	"github.com/team/llmgateway/internal/domain/model"
 	"github.com/team/llmgateway/internal/domain/router"
 )
@@ -156,6 +157,13 @@ type Gateway struct {
 	protocolConvEnabled func() bool
 	// reasoning 会话级推理缓存：回填 thinking 模式客户端未回传的 reasoning_content。
 	reasoning *ReasoningCache
+	// upstreamCfg 是 V2 转发链的运行参数来源（upstream.ConfigProvider）。
+	// 非 nil 时 /v1 由 V2 主链接管（upstream.go），V1 的渠道路由/协议互译不再参与。
+	upstreamCfg RuntimeConfigSource
+	// upstreamAuth 注入上游鉴权头（装配层持有凭据：不进配置表、不进日志）。
+	upstreamAuth func() (name, value string)
+	// fwd 是转发执行器（懒建）。
+	fwd *magpie.Forwarder
 }
 
 // ProtocolConversionEnabledKey 是全局跨协议转换开关在 sys_configs 中的键（默认开启）。
@@ -196,6 +204,11 @@ type GatewayConfig struct {
 	// ListAutoModels 可选：返回对某用户可见的启用 Auto（全局 + 该用户私有），
 	// 用于 GET /v1/models 一并列出。nil 时不列 Auto。
 	ListAutoModels func(ctx context.Context, ownerUserID int64) ([]automodel.AutoModel, error)
+	// UpstreamConfig 可选：V2 转发链的运行参数来源（upstream.ConfigProvider）。
+	// 装配后 /v1 转由 V2 主链接管（渠道路由与协议互译不再参与，见 upstream.go）。
+	UpstreamConfig RuntimeConfigSource
+	// UpstreamAuth 可选：注入上游鉴权头（凭据只在装配层持有）。
+	UpstreamAuth func() (name, value string)
 	// UpstreamResponseHeaderWhitelist 读取全局上游响应头白名单（sys_configs，默认空）。
 	// 未配置/读取失败按空处理（不透传任何上游头，维持渠道透明）。
 	UpstreamResponseHeaderWhitelist func() ([]string, error)
@@ -262,6 +275,8 @@ func NewGateway(cfg GatewayConfig) *Gateway {
 		upstreamRespHeaders: respHeaders,
 		protocolConvEnabled: cfg.ProtocolConversionEnabled,
 		reasoning:           NewReasoningCache(),
+		upstreamCfg:         cfg.UpstreamConfig,
+		upstreamAuth:        cfg.UpstreamAuth,
 	}
 }
 
@@ -311,6 +326,12 @@ const InboundPrefix = "/v1/"
 //   - POST /v1/responses         (openai-responses)
 //   - POST /v1/messages          (anthropic-messages)
 func (g *Gateway) Handler() http.Handler {
+	// V2：装配了上游运行参数时，/v1 由转发主链接管（upstream.go）。
+	// V1 的「选渠道 → Provider 分组 → 协议互译」在新口径下不再参与转发（D1/F5）；
+	// 它的代码仍在（渠道/标签域下线与 V1 摘除属另一片，见交付说明的未完成项）。
+	if g.upstreamCfg != nil {
+		return g.upstreamHandler()
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET "+InboundPrefix+"models", g.handleModels)
 	mux.HandleFunc("POST "+InboundPrefix+EndpointChatCompletions, g.serveWith(EndpointChatCompletions))

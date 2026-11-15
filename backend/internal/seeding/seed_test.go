@@ -77,7 +77,7 @@ func TestSeedUpstreamConfigMatchesCodeDefault(t *testing.T) {
 	if cfg.Enabled() {
 		t.Fatal("种子基址应为空（未接入）：新库不应默认向上游发流量")
 	}
-	if cfg.Degraded {
-		t.Fatal("种子降级开关应为 false")
+	if !cfg.Degrade.PassthroughEnabled || !cfg.Degrade.LedgerEnabled || !cfg.Degrade.SyncEnabled {
+		t.Fatalf("种子三段开关应为全开（true = 该段可用），got %+v", cfg.Degrade)
 	}
 }

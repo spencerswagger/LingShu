@@ -133,7 +133,7 @@ func TestSQLWindowStore_BlockedSurvivesRestart(t *testing.T) {
 		Status:     WindowBlocked,
 		Pages:      MaxPagesPerRound,
 		Fetched:    4000,
-		Reason:     "20 页上限内未拉完：积压需扩页上限或人工介入",
+		Reason:     "单轮上限内未拉完（积压），下一轮从 offset 续拉",
 		RecordedAt: blockedStart.Add(WindowSize),
 	}
 	if err := wins.Save(ctx, blockedRec); err != nil {
@@ -142,7 +142,7 @@ func TestSQLWindowStore_BlockedSurvivesRestart(t *testing.T) {
 
 	// 重启：新实例 + 新连接池语义（这里换实例即可；库里才是状态本体）。
 	restarted := NewSQLWindowStore(conn)
-	pending, err := restarted.BlockedWindows(ctx, 10)
+	pending, err := restarted.PendingWindows(ctx, 10)
 	if err != nil {
 		t.Fatalf("重启后读取 blocked 失败: %v", err)
 	}
@@ -185,7 +185,7 @@ func TestSQLWindowStore_BlockedSurvivesRestart(t *testing.T) {
 	if err := wins.Save(ctx, okRec); err != nil {
 		t.Fatalf("写 ok 窗口失败: %v", err)
 	}
-	pending, err = wins.BlockedWindows(ctx, 10)
+	pending, err = wins.PendingWindows(ctx, 10)
 	if err != nil {
 		t.Fatalf("补平后读取 blocked 失败: %v", err)
 	}

@@ -32,20 +32,25 @@ type ExternalModel struct {
 	TimeConfig   *billing.TimeCoeffConfig
 	ContextTiers []billing.TierRule
 	// Aliases 为仅用于模型名解析的别名列表（不出现在 GET /v1/models）；空为无别名。
-	Aliases   []string
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	Aliases []string
+	// BoundInternalRef 是绑定的网关内部模型引用（provider/model 或 group/名称）。
+	// NULL/空 = 未绑定 = 不售卖（V2 转发与对账的唯一绑定真源，见迁移 0019）。
+	BoundInternalRef string
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
 }
 
 // cols 列出 external_models 表查询使用的全部列。
-const cols = `id, external_name, description, enabled, sale_rates, time_config, context_tiers, aliases, created_at, updated_at`
+const cols = `id, external_name, description, enabled, sale_rates, time_config, context_tiers, aliases, bound_internal_ref, created_at, updated_at`
 
 // scanExternal 将一行扫描到 *ExternalModel，解析 sale_rates/time_config/context_tiers/aliases JSONB。
 func scanExternal(row interface{ Scan(...any) error }) (*ExternalModel, error) {
 	var m ExternalModel
 	var saleRaw, timeRaw, tiersRaw, aliasesRaw []byte
+	var bound sql.NullString
 	err := row.Scan(&m.ID, &m.ExternalName, &m.Description, &m.Enabled, &saleRaw,
-		&timeRaw, &tiersRaw, &aliasesRaw, &m.CreatedAt, &m.UpdatedAt)
+		&timeRaw, &tiersRaw, &aliasesRaw, &bound, &m.CreatedAt, &m.UpdatedAt)
+	m.BoundInternalRef = bound.String
 	if err != nil {
 		return nil, err
 	}

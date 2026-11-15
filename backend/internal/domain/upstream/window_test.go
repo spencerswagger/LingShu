@@ -228,7 +228,11 @@ func TestRounder_OffsetPagingBoundary(t *testing.T) {
 	}
 }
 
-// TestRounder_MaxPagesBlocks 断言单轮 20 页上限：超限即整轮回滚 + 窗口置 blocked + 告警错误。
+// TestRounder_MaxPagesBlocks 断言单轮上限：超限即 blocked + 告警错误，并把 offset 持久化。
+//
+// 本切片的**有意变更**（F9）：不再「整轮回滚」，而是「每页一事务 + 同页持久化断点」。
+// 理由：整轮回滚 + 持久化 offset 会自相矛盾 —— 数据被擦掉了、断点却说「拉到第 N 条」，
+// 下一轮从 N 继续就把前 N 条永久跳过（静默漏账）。断点必须代表**已落库**的进度。
 func TestRounder_MaxPagesBlocks(t *testing.T) {
 	now := time.Date(2026, 11, 15, 10, 0, 0, 0, time.UTC)
 	var pages []Page
@@ -247,30 +251,50 @@ func TestRounder_MaxPagesBlocks(t *testing.T) {
 	if len(src.offsets) != MaxPagesPerRound {
 		t.Fatalf("应恰好翻 %d 页就停，got %d", MaxPagesPerRound, len(src.offsets))
 	}
-	if led.rolls != 1 {
-		t.Fatalf("blocked 应回滚整轮账本事务（rolls=1），got %d", led.rolls)
+	// 一页一事务：已翻的页已提交（断点代表已落库），本轮没有整轮回滚。
+	if led.commits != MaxPagesPerRound || led.count() != MaxPagesPerRound {
+		t.Fatalf("已翻的页应逐页提交：commits=%d stored=%d want %d",
+			led.commits, led.count(), MaxPagesPerRound)
 	}
-	if led.commits != 0 || led.count() != 0 {
-		t.Fatalf("blocked 不许提交任何账本：commits=%d stored=%d", led.commits, led.count())
+	if led.rolls != 0 {
+		t.Fatalf("blocked 不该回滚已提交的页（rolls=%d）", led.rolls)
 	}
 	recs := wins.Records()
 	if len(recs) != 1 || recs[0].Status != WindowBlocked {
 		t.Fatalf("窗口应落一条 blocked 记录，got %+v", recs)
 	}
-	if !strings.Contains(recs[0].Reason, "20") {
-		t.Fatalf("blocked 原因应点名页数上限，got %q", recs[0].Reason)
+	if !strings.Contains(recs[0].Reason, "单轮上限") {
+		t.Fatalf("blocked 原因应点名单轮上限，got %q", recs[0].Reason)
+	}
+	if recs[0].ScrollOffset != MaxPagesPerRound {
+		t.Fatalf("blocked 行应持久化 offset=%d，got %d", MaxPagesPerRound, recs[0].ScrollOffset)
 	}
 	// blocked 不推进水位线：下一轮继续补这段窗口。
 	if _, ok, _ := wins.LastSuccessEnd(context.Background()); ok {
 		t.Fatal("blocked 不应推进水位线")
 	}
 
+	// 下一轮必须从 offset 续拉（不是从 0 重拉）：这才是「积压自愈、不需要人工介入」。
+	src2 := &fakePageSource{pages: []Page{{Entries: entries("led-tail"), HasMore: false}}}
+	if _, err := newTestRounder(t, src2, led, wins, now.Add(WindowSize)).RunOnce(context.Background()); err != nil {
+		t.Fatalf("补拉轮应成功，got %v", err)
+	}
+	if len(src2.offsets) == 0 || src2.offsets[0] != MaxPagesPerRound {
+		t.Fatalf("补拉轮应从 blocked 行的 offset 起（%d），got %v", MaxPagesPerRound, src2.offsets)
+	}
+	// 补平后 blocked 清成 ok 且 offset 归零。
+	for _, rec := range wins.Records() {
+		if rec.Status == WindowBlocked {
+			t.Fatalf("补平后不应再有 blocked，records=%+v", wins.Records())
+		}
+	}
+
 	// 未超限（20 页正好拉完）不算 blocked。
-	src2 := &fakePageSource{pages: append(pages[:MaxPagesPerRound-1:MaxPagesPerRound-1],
+	src3 := &fakePageSource{pages: append(pages[:MaxPagesPerRound-1:MaxPagesPerRound-1],
 		Page{Entries: entries("led-last"), HasMore: false})}
-	led2 := newFakeLedger()
-	wins2 := NewMemoryWindowStore()
-	res, err := newTestRounder(t, src2, led2, wins2, now).RunOnce(context.Background())
+	led3 := newFakeLedger()
+	wins3 := NewMemoryWindowStore()
+	res, err := newTestRounder(t, src3, led3, wins3, now).RunOnce(context.Background())
 	if err != nil {
 		t.Fatalf("20 页拉完不应报错，got %v", err)
 	}
@@ -279,8 +303,9 @@ func TestRounder_MaxPagesBlocks(t *testing.T) {
 	}
 }
 
-// TestRounder_FetchErrorRollsBack 断言拉取失败：整轮回滚 + 窗口记 error + 不推进水位线。
-func TestRounder_FetchErrorRollsBack(t *testing.T) {
+// TestRounder_FetchErrorKeepsCommittedPages 断言拉取中途失败：已提交的页留下（不丢数据）、
+// 窗口记 error 并带上断点 offset、水位线不动。
+func TestRounder_FetchErrorKeepsCommittedPages(t *testing.T) {
 	now := time.Date(2026, 11, 15, 10, 0, 0, 0, time.UTC)
 	boom := errors.New("上游 502")
 	src := &fakePageSource{
@@ -293,12 +318,16 @@ func TestRounder_FetchErrorRollsBack(t *testing.T) {
 	if !errors.Is(err, boom) {
 		t.Fatalf("应透传拉取错误，got %v", err)
 	}
-	if led.rolls != 1 || led.count() != 0 {
-		t.Fatalf("失败应回滚且不落账：rolls=%d stored=%d", led.rolls, led.count())
+	if led.count() != 1 || led.commits != 1 {
+		t.Fatalf("已提交的第 1 页必须留下（否则断点会跳过它）：commits=%d stored=%d",
+			led.commits, led.count())
 	}
 	recs := wins.Records()
 	if len(recs) != 1 || recs[0].Status != WindowError {
 		t.Fatalf("窗口应落 error 记录，got %+v", recs)
+	}
+	if recs[0].ScrollOffset != 1 {
+		t.Fatalf("error 行应带上已落库的位置（1），got %d", recs[0].ScrollOffset)
 	}
 }
 
@@ -311,7 +340,8 @@ func TestRounder_EmptyPageWithHasMoreIsError(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "has_more") {
 		t.Fatalf("空页 + has_more 应报错，got %v", err)
 	}
-	if led.rolls != 1 {
-		t.Fatalf("应回滚，got rolls=%d", led.rolls)
+	// 空页没有可提交的账本，也就没有回滚；但必须落 error 行（否则静默死循环）。
+	if led.rolls != 0 || led.commits != 0 {
+		t.Fatalf("空页不应产生任何账本事务：rolls=%d commits=%d", led.rolls, led.commits)
 	}
 }

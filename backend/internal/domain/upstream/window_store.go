@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -14,16 +15,20 @@ import (
 //
 //	window_start TIMESTAMPTZ PK · window_end TIMESTAMPTZ（CHECK = start + 60s）·
 //	local_count/upstream_count · local_tokens/upstream_tokens ·
-//	status TEXT CHECK (ok|alarm|error|blocked) · alarm_streak · detail JSONB · checked_at
+//	status TEXT CHECK (ok|alarm|error|blocked|skipped) · alarm_streak ·
+//	scroll_offset BIGINT（补拉断点）· detail JSONB · checked_at
 //
-// 本包只写 status / detail / checked_at：
-// 四个计数列是「灵枢账单 vs 账本」的对账结果，由对账作业写；同步轮次拿它当计数会污染对账口径。
-// detail 用 `||` 合并而不是覆盖，避免把对账作业写进去的分组明细抹掉。
+// 本包只写 status / detail / checked_at / scroll_offset：
+// 四个计数列是「灵枢账单 vs 账本」的对账结果，由对账服务在每窗结束时统一写（D4，见 reconcile.go）；
+// 同步轮次拿它当计数会污染对账口径。
+// detail 用 `||` 合并而不是覆盖，避免把对账服务写进去的分组明细抹掉。
 const (
 	// ReconcileWindowsTable 是窗口表名（0023 口径）。
 	ReconcileWindowsTable = "reconcile_windows"
-	// windowDetailPhase 是 detail 里标记写入方来源的键。
+	// windowDetailPhase 是 detail 里标记写入方来源的键（同步轮次）。
 	windowDetailPhase = "sync"
+	// windowDetailPhaseReconcile 是对账服务写 detail 时的来源标记。
+	windowDetailPhaseReconcile = "reconcile"
 )
 
 // SQLWindowStore 是 WindowStore 的 PostgreSQL 实现（reconcile_windows）。
@@ -35,6 +40,7 @@ type SQLWindowStore struct {
 func NewSQLWindowStore(db *sql.DB) *SQLWindowStore { return &SQLWindowStore{db: db} }
 
 var _ WindowStore = (*SQLWindowStore)(nil)
+var _ CountWriter = (*SQLWindowStore)(nil)
 
 // LastSuccessEnd 返回最后一次成功窗口的结束时刻。
 //
@@ -56,8 +62,11 @@ func (s *SQLWindowStore) LastSuccessEnd(ctx context.Context) (time.Time, bool, e
 	return end.Time, true, nil
 }
 
-// BlockedWindows 返回仍未补平的 blocked 窗口（按起点升序）。
-func (s *SQLWindowStore) BlockedWindows(ctx context.Context, limit int) ([]WindowRecord, error) {
+// PendingWindows 返回仍未补平的行（blocked / error，按起点升序），并带上 scroll_offset。
+//
+// 两个状态合在一起查：error 行可能已经有「已提交的页」（一页一事务），
+// 只认 blocked 会让那段数据永久缺口（它已经在水位线之后，不会再被重叠区间覆盖）。
+func (s *SQLWindowStore) PendingWindows(ctx context.Context, limit int) ([]WindowRecord, error) {
 	if s == nil || s.db == nil {
 		return nil, fmt.Errorf("窗口存储未装配数据库连接")
 	}
@@ -65,13 +74,13 @@ func (s *SQLWindowStore) BlockedWindows(ctx context.Context, limit int) ([]Windo
 		limit = blockedProbeLimit
 	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT window_start, window_end, checked_at, detail
+		`SELECT window_start, window_end, scroll_offset, checked_at, detail, status
 		   FROM `+ReconcileWindowsTable+`
-		  WHERE status = 'blocked'
+		  WHERE status IN ('blocked','error')
 		  ORDER BY window_start
 		  LIMIT $1`, limit)
 	if err != nil {
-		return nil, fmt.Errorf("读取 blocked 窗口失败：%w", err)
+		return nil, fmt.Errorf("读取待补拉窗口失败：%w", err)
 	}
 	defer rows.Close()
 
@@ -81,17 +90,18 @@ func (s *SQLWindowStore) BlockedWindows(ctx context.Context, limit int) ([]Windo
 			rec     WindowRecord
 			detail  []byte
 			checked time.Time
+			status  string
 		)
-		if err := rows.Scan(&rec.Start, &rec.End, &checked, &detail); err != nil {
-			return nil, fmt.Errorf("扫描 blocked 窗口失败：%w", err)
+		if err := rows.Scan(&rec.Start, &rec.End, &rec.ScrollOffset, &checked, &detail, &status); err != nil {
+			return nil, fmt.Errorf("扫描待补拉窗口失败：%w", err)
 		}
-		rec.Status = WindowBlocked
+		rec.Status = WindowStatus(status)
 		rec.RecordedAt = checked
 		rec.Reason = decodeWindowDetail(detail)
 		out = append(out, rec)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("遍历 blocked 窗口失败：%w", err)
+		return nil, fmt.Errorf("遍历待补拉窗口失败：%w", err)
 	}
 	return out, nil
 }
@@ -132,14 +142,15 @@ func (s *SQLWindowStore) save(ctx context.Context, ex dbx.Execer, rec WindowReco
 	}
 	if _, err := ex.ExecContext(ctx,
 		`INSERT INTO `+ReconcileWindowsTable+`
-		    (window_start, window_end, status, detail, checked_at)
-		 VALUES ($1, $2, $3, $4::jsonb, $5)
+		    (window_start, window_end, status, scroll_offset, detail, checked_at)
+		 VALUES ($1, $2, $3, $4, $5::jsonb, $6)
 		 ON CONFLICT (window_start) DO UPDATE
-		    SET window_end = EXCLUDED.window_end,
-		        status     = EXCLUDED.status,
-		        detail     = `+ReconcileWindowsTable+`.detail || EXCLUDED.detail,
-		        checked_at = EXCLUDED.checked_at`,
-		rec.Start, rec.End, string(rec.Status), string(detail), recordedAt); err != nil {
+		    SET window_end    = EXCLUDED.window_end,
+		        status        = EXCLUDED.status,
+		        scroll_offset = EXCLUDED.scroll_offset,
+		        detail        = `+ReconcileWindowsTable+`.detail || EXCLUDED.detail,
+		        checked_at    = EXCLUDED.checked_at`,
+		rec.Start, rec.End, string(rec.Status), rec.ScrollOffset, string(detail), recordedAt); err != nil {
 		return fmt.Errorf("写入窗口行（%s→%s，%s）失败：%w",
 			rec.Start.Format(time.RFC3339), rec.End.Format(time.RFC3339), rec.Status, err)
 	}
@@ -147,8 +158,8 @@ func (s *SQLWindowStore) save(ctx context.Context, ex dbx.Execer, rec WindowReco
 	if rec.Status == WindowOK && !rec.ClearFrom.IsZero() {
 		if _, err := ex.ExecContext(ctx,
 			`UPDATE `+ReconcileWindowsTable+`
-			    SET status = 'ok', checked_at = $3
-			  WHERE status = 'blocked'
+			    SET status = 'ok', scroll_offset = 0, checked_at = $3
+			  WHERE status IN ('blocked','error')
 			    AND window_start >= $1
 			    AND window_start < $2`,
 			rec.ClearFrom, rec.End, recordedAt); err != nil {
@@ -156,6 +167,117 @@ func (s *SQLWindowStore) save(ctx context.Context, ex dbx.Execer, rec WindowReco
 		}
 	}
 	return nil
+}
+
+// SaveCounts 写对账的四个计数列 + 判定结果（D4：计数列的唯一写入方）。
+//
+// 三件事必须一起做（分开写会出现「计数新、状态旧」或反过来的半套状态）：
+//  1. 四个计数列 + status + alarm_streak + checked_at；
+//  2. detail 用 `||` 合并（同步轮次写的 pages/fetched 不抹掉），并写入对账自己的偏差率；
+//  3. **不碰 scroll_offset**：那是同步轮次的断点，对账写它等于把补拉位置重置。
+//
+// 防呆：blocked / error 由同步轮次持有，对账服务不许覆盖（覆盖 = 把「该拉没拉完」洗成 ok，
+// 漏账从此隐身）。所以 SQL 里带 `AND status NOT IN ('blocked','error')`，
+// 影响 0 行时返回 ErrWindowNotReconcilable，让调用方知道这一窗本轮没算成。
+func (s *SQLWindowStore) SaveCounts(ctx context.Context, c WindowCounts) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("窗口存储未装配数据库连接")
+	}
+	if err := c.Validate(); err != nil {
+		return err
+	}
+	checkedAt := c.CheckedAt
+	if checkedAt.IsZero() {
+		checkedAt = time.Now()
+	}
+	detail := map[string]any{"phase": windowDetailPhaseReconcile}
+	for k, v := range c.Detail {
+		detail[k] = v
+	}
+	raw, err := json.Marshal(detail)
+	if err != nil {
+		return fmt.Errorf("序列化对账明细失败：%w", err)
+	}
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE `+ReconcileWindowsTable+`
+		    SET local_count     = $2,
+		        local_tokens    = $3,
+		        upstream_count  = $4,
+		        upstream_tokens = $5,
+		        status          = $6,
+		        alarm_streak    = $7,
+		        detail          = detail || $8::jsonb,
+		        checked_at      = $9
+		  WHERE window_start = $1
+		    AND status NOT IN ('blocked','error')`,
+		c.Start, c.LocalCount, c.LocalTokens, c.UpstreamCount, c.UpstreamTokens,
+		string(c.Status), int16(c.AlarmStreak), string(raw), checkedAt)
+	if err != nil {
+		return fmt.Errorf("写入对账计数失败（%s）：%w", c.Start.Format(time.RFC3339), err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("读取对账行数失败：%w", err)
+	}
+	if n == 0 {
+		return ErrWindowNotReconcilable
+	}
+	return nil
+}
+
+// ErrWindowNotReconcilable 表示该窗口行当前由同步轮次持有（blocked/error），对账不得覆盖。
+var ErrWindowNotReconcilable = errors.New("窗口处于 blocked/error，对账本轮跳过（等同步补平）")
+
+// WindowStates 读取 [from, to) 内各窗口的当前状态（对账前先看，避免覆盖同步轮次的状态）。
+func (s *SQLWindowStore) WindowStates(ctx context.Context, from, to time.Time) (map[time.Time]WindowStatus, error) {
+	if s == nil || s.db == nil {
+		return nil, fmt.Errorf("窗口存储未装配数据库连接")
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT window_start, status FROM `+ReconcileWindowsTable+`
+		  WHERE window_start >= $1 AND window_start < $2`, from, to)
+	if err != nil {
+		return nil, fmt.Errorf("读取窗口状态失败：%w", err)
+	}
+	defer rows.Close()
+	out := make(map[time.Time]WindowStatus)
+	for rows.Next() {
+		var (
+			start  time.Time
+			status string
+		)
+		if err := rows.Scan(&start, &status); err != nil {
+			return nil, fmt.Errorf("扫描窗口状态失败：%w", err)
+		}
+		out[start] = WindowStatus(status)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历窗口状态失败：%w", err)
+	}
+	return out, nil
+}
+
+// LastAlarmStreak 返回某窗口之前最近一次告警的连续窗数（无告警返回 0）。
+func (s *SQLWindowStore) LastAlarmStreak(ctx context.Context, before time.Time) (int16, error) {
+	if s == nil || s.db == nil {
+		return 0, fmt.Errorf("窗口存储未装配数据库连接")
+	}
+	var streak sql.NullInt64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT alarm_streak FROM `+ReconcileWindowsTable+`
+		  WHERE window_start < $1
+		  ORDER BY window_start DESC
+		  LIMIT 1`, before).Scan(&streak)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("读取上一窗的告警连击失败：%w", err)
+	}
+	if !streak.Valid {
+		return 0, nil
+	}
+	return int16(streak.Int64), nil
 }
 
 // decodeWindowDetail 从 detail 里取回上次记录的原因（排障用；取不到不算错）。

@@ -27,14 +27,14 @@ func (f *fakeCMSource) ListByExternal(_ context.Context, _ int64) ([]channel.Cha
 // extRow 构造 external_models 查询返回行。
 func extRow(id int64, name string) *sqlmock.Rows {
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	return sqlmock.NewRows([]string{"id", "external_name", "description", "enabled", "sale_rates", "time_config", "context_tiers", "aliases", "created_at", "updated_at"}).
+	return sqlmock.NewRows([]string{"id", "external_name", "description", "enabled", "sale_rates", "time_config", "context_tiers", "aliases", "bound_internal_ref", "created_at", "updated_at"}).
 		AddRow(id, name, "", true,
 			`{"input":1.0,"output":2.0,"cache_read":0.1}`,
-			nil, nil, `[]`, now, now)
+			nil, nil, `[]`, nil, now, now)
 }
 
 // extNameQuery 与 model.Store.GetByExternalName 一致（含别名包含判定 + 确定性排序）。
-const extNameQuery = `SELECT id, external_name, description, enabled, sale_rates, time_config, context_tiers, aliases, created_at, updated_at FROM external_models WHERE (external_name = $1 OR aliases @> to_jsonb(ARRAY[$1::text])) AND enabled = true AND deleted_at IS NULL ORDER BY (external_name = $1) DESC, id ASC LIMIT 1`
+const extNameQuery = `SELECT id, external_name, description, enabled, sale_rates, time_config, context_tiers, aliases, bound_internal_ref, created_at, updated_at FROM external_models WHERE (external_name = $1 OR aliases @> to_jsonb(ARRAY[$1::text])) AND enabled = true AND deleted_at IS NULL ORDER BY (external_name = $1) DESC, id ASC LIMIT 1`
 
 // newModelService 构造可用的 model.Service（expectTimes 次外部查询）。
 func newModelService(t *testing.T, times int) (*model.Service, sqlmock.Sqlmock) {

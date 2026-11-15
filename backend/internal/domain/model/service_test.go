@@ -23,7 +23,7 @@ func saleRates() billing.Rates {
 }
 
 // extCols 与 store.cols 一致，供构造 mock 行。
-var extCols = []string{"id", "external_name", "description", "enabled", "sale_rates", "time_config", "context_tiers", "aliases", "created_at", "updated_at"}
+var extCols = []string{"id", "external_name", "description", "enabled", "sale_rates", "time_config", "context_tiers", "aliases", "bound_internal_ref", "created_at", "updated_at"}
 
 // extNameQuery 与 store.GetByExternalName 一致（含别名包含判定 + 确定性排序），供构造 mock 期望。
 const extNameQuery = `SELECT ` + cols + ` FROM external_models WHERE (external_name = $1 OR aliases @> to_jsonb(ARRAY[$1::text])) AND enabled = true AND deleted_at IS NULL ORDER BY (external_name = $1) DESC, id ASC LIMIT 1`
@@ -47,8 +47,16 @@ func extRow(m *ExternalModel, saleJSON string) *sqlmock.Rows {
 		}
 	}
 	rows := sqlmock.NewRows(extCols).
-		AddRow(m.ID, m.ExternalName, m.Description, m.Enabled, saleJSON, nil, nil, aliasesJSON, m.CreatedAt, m.UpdatedAt)
+		AddRow(m.ID, m.ExternalName, m.Description, m.Enabled, saleJSON, nil, nil, aliasesJSON, boundRef(m), m.CreatedAt, m.UpdatedAt)
 	return rows
+}
+
+// boundRef 把绑定引用转成驱动值（空 = NULL；与 store.scanExternal 的 sql.NullString 同口径）。
+func boundRef(m *ExternalModel) any {
+	if m.BoundInternalRef == "" {
+		return nil
+	}
+	return m.BoundInternalRef
 }
 
 func mockService(t *testing.T) (*Service, sqlmock.Sqlmock) {
@@ -390,7 +398,7 @@ func TestService_SyncPrices_InvalidatesEvenOnError(t *testing.T) {
 	now := time.Now()
 	listQ := `SELECT ` + cols + ` FROM external_models WHERE deleted_at IS NULL ORDER BY id ASC`
 	rows := extRow(&ExternalModel{ID: 1, ExternalName: "a", CreatedAt: now, UpdatedAt: now}, `{"input":1}`)
-	rows.AddRow(int64(2), "b", "", true, `{"input":1}`, nil, nil, `[]`, now, now)
+	rows.AddRow(int64(2), "b", "", true, `{"input":1}`, nil, nil, `[]`, nil, now, now)
 	mock.ExpectQuery(regexp.QuoteMeta(listQ)).WillReturnRows(rows)
 	// 第 1 行成功写入。
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE external_models SET sale_rates=$1, updated_at=now() WHERE id=$2`)).
@@ -428,8 +436,8 @@ func TestService_SyncPrices_SuccessInvalidatesOnce(t *testing.T) {
 	now := time.Now()
 	listQ := `SELECT ` + cols + ` FROM external_models WHERE deleted_at IS NULL ORDER BY id ASC`
 	rows := extRow(&ExternalModel{ID: 1, ExternalName: "a", CreatedAt: now, UpdatedAt: now}, `{"input":1}`)
-	rows.AddRow(int64(2), "b", "", true, `{"input":1}`, nil, nil, `[]`, now, now)
-	rows.AddRow(int64(3), "c", "", true, `{"input":1}`, nil, nil, `[]`, now, now)
+	rows.AddRow(int64(2), "b", "", true, `{"input":1}`, nil, nil, `[]`, nil, now, now)
+	rows.AddRow(int64(3), "c", "", true, `{"input":1}`, nil, nil, `[]`, nil, now, now)
 	mock.ExpectQuery(regexp.QuoteMeta(listQ)).WillReturnRows(rows)
 
 	// 两行成功写入（a/b）；c 无参考价不触发写。
@@ -476,7 +484,7 @@ func TestService_SyncPrices_AllSkippedNoInvalidate(t *testing.T) {
 	now := time.Now()
 	listQ := `SELECT ` + cols + ` FROM external_models WHERE deleted_at IS NULL ORDER BY id ASC`
 	rows := extRow(&ExternalModel{ID: 1, ExternalName: "a", CreatedAt: now, UpdatedAt: now}, `{"input":1}`)
-	rows.AddRow(int64(2), "b", "", true, `{"input":1}`, nil, nil, `[]`, now, now)
+	rows.AddRow(int64(2), "b", "", true, `{"input":1}`, nil, nil, `[]`, nil, now, now)
 	mock.ExpectQuery(regexp.QuoteMeta(listQ)).WillReturnRows(rows)
 
 	// 预置缓存条目：全部跳过时不得被清空。

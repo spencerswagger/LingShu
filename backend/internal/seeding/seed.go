@@ -61,9 +61,14 @@ var defaultSysConfigs = map[string]string{
 	// 键名与代码默认值由 upstream 包定义，此处保持一致（对齐断言见 defaults_test.go）。
 	// 红线：**只允许非敏感运行参数**——凭据类（admin key / callerKey / token / password）
 	// 永不进 sys_configs；上游鉴权由装配层逐请求注入。
-	"upstream.base_url":   `""`,
-	"upstream.timeout_ms": `30000`,
-	"upstream.degrade":    `false`,
+	// 三键形态（F1 裁定，对齐 Ark §9.4）：基址 / 两段超时 / 三段开关。
+	// 上一版的单值 `upstream.timeout_ms` 已删除：转发链的超时分两段（等响应头、流空闲），
+	// 一个数只能表达其中一段，另一段就成了看不见的代码默认值。
+	"upstream.base_url": `""`,
+	// 两段超时：首包（等响应头）30s、流空闲 120s。
+	"upstream.timeouts": `{"stream_first_byte_ms":30000,"stream_idle_ms":120000}`,
+	// 三段开关：**true = 该段可用**（名字从 degraded 改成 enabled，避免「写 true 是停还是跑」）。
+	"upstream.degrade": `{"passthrough_enabled":true,"ledger_enabled":true,"sync_enabled":true}`,
 }
 
 // systemUser / systemToken 常量：健康探测开销的归属身份（成本记账），用户侧界面隐藏。

@@ -12,12 +12,19 @@ import (
 	"github.com/team/llmgateway/internal/pkg/logger"
 )
 
-// 同步窗口口径（已批准，见 docs/designs/2026-11-15-v2-p1-data-contract.md §6.2）：
+// 同步窗口口径（已批准，见 docs/designs/2026-11-15-v2-p1-data-contract.md §6.2；
+// offset 持久化与补拉口径按 2026-11-15 裁定 F9 修订）：
 //   - 窗口长度固定 60s（与 0023 的 reconcile_windows 同一口径，库里有 CHECK 断言）；
 //   - 迟到数据用「重叠 2 窗」吸收：本轮拉取区间 = [上次成功结束 - 120s, now)；
-//   - offset 翻页但**不持久化**：每轮从 offset=0 重新翻，翻不完不许把 offset 存起来当进度
-//     （存量 offset 一旦漂移会把同一条账算两次、或永久跳过一条）；
-//   - 单轮 ≤ 20 页；20 页还没拉完 → 本轮置 `blocked` 并告警（积压要么扩页上限，要么人工介入）；
+//   - 翻页**显式按 occurred_at ASC, ledger_id ASC**（数据源契约，见 PageSource），offset 从 0 起；
+//   - offset **持久化**在 reconcile_windows.scroll_offset（按「本轮扫描起点所在窗口」那一行记）：
+//     blocked 后下一轮从该 window_start + 该 offset 继续拉，直到把窗口清成 ok。
+//     幂等靠 ledger_entries.ledger_id 的 ON CONFLICT 兜住，所以「重拉一段」不会重复计账；
+//     持久化 offset 只省掉「已确认那段的重复拉取」，不承担正确性（正确性在幂等键上）。
+//     上一版是「offset 不持久化 + 靠人工介入」，结果是积压窗口永远清不完（每轮都从 0 翻、
+//     每轮都撞上限）——这就是 F9 要改掉的那条；
+//   - 单轮 ≤ 20 页 / ≤ 4000 条（两个上限同源，任一命中即 blocked）：超限记 `blocked` + 告警，
+//     **不引入人工介入**，下一轮自动从 scroll_offset 继续补拉，直到清零；
 //   - 整轮一个事务：账本条目与窗口行**同事务**写（契约 §6.2「随后同事务写窗口行」）。
 const (
 	// WindowSize 是同步窗口长度（库层 CHECK 写死为 60s）。
@@ -28,6 +35,8 @@ const (
 	DefaultPageSize = 200
 	// MaxPagesPerRound 是单轮页数上限；超出即 blocked。
 	MaxPagesPerRound = 20
+	// MaxRowsPerRound 是单轮条数上限（4000 = 20 页 × 200 条，两个上限同源；F9 保留该上限）。
+	MaxRowsPerRound = MaxPagesPerRound * DefaultPageSize
 	// blockedProbeLimit 是一轮开始时读取「未补平 blocked 窗口」的条数上限。
 	blockedProbeLimit = 50
 )
@@ -74,27 +83,44 @@ type Page struct {
 
 // PageSource 按窗口 + offset 拉取一页账本（实现方通常是网关的用量查询接口）。
 //
-// offset **不持久化**：每次调用都是「本轮第 N 页」的 N，从 0 开始；不要把它写成游标。
+// **排序契约（F9）**：实现方必须显式 `ORDER BY occurred_at ASC, ledger_id ASC`，再按
+// offset/limit 切页。不写 ORDER BY 靠数据库默认顺序翻页，同一条记录可能出现在两页里
+// （重复被幂等键吃掉，不算错）或**完全不出现**（漏账，而且是静默的）——offset 一旦
+// 持久化，漏页就不会自愈，所以排序必须写死在这里。
+//
+// offset 语义：本轮相对「扫描起点窗口」的第 N 条，从 0 开始；持久化在
+// reconcile_windows.scroll_offset，blocked 后下一轮从这里继续。
 type PageSource interface {
 	FetchPage(ctx context.Context, w Window, offset, limit int) (Page, error)
 }
 
-// WindowStatus 是窗口处理结果（取值域逐字等于 0023 的 CHECK）。
+// WindowStatus 是窗口处理结果（取值域逐字等于 0023 的 CHECK：ok/alarm/error/blocked/skipped）。
+//
+// 同步轮次只写 ok / blocked / error；alarm / skipped 由对账服务写（D4），
+// 但 Validate 必须认全部五个值——同一个 Store 同时承担两边写入。
 type WindowStatus string
 
 const (
 	// WindowOK 表示窗口内数据已全部落库。
 	WindowOK WindowStatus = "ok"
-	// WindowBlocked 表示 20 页上限内没拉完（积压），本轮已回滚。
+	// WindowBlocked 表示单轮上限（4000 条 / 20 页）内没拉完（积压），本轮已回滚，
+	// 下一轮从 scroll_offset 继续补拉。
 	WindowBlocked WindowStatus = "blocked"
-	// WindowError 表示拉取/写入失败，本轮已回滚。
+	// WindowError 表示拉取/写入失败，本轮已回滚。与 blocked 的区别：
+	// error 是「这次没跑成」，blocked 是「该拉的数据比单轮上限多」。
 	WindowError WindowStatus = "error"
+	// WindowAlarm 表示对账 token 偏差超阈（对账服务写）。
+	WindowAlarm WindowStatus = "alarm"
+	// WindowSkipped 表示本窗不参与比对（账本关闭/降级；对账服务写）。
+	// 与 blocked 区分：skipped 是「按口径不比」，blocked 是「该比但没拉完」。
+	WindowSkipped WindowStatus = "skipped"
 )
 
 // WindowRecord 是一条窗口行（落库到 0023 的 reconcile_windows）。
 //
-// 只写 status / detail / checked_at，**不写** local_count / upstream_* 这些对账计数：
-// 那是「灵枢账单 vs 账本」比对的结果，由对账作业写；同步轮次拿它当计数会污染对账口径。
+// 只写 status / detail / checked_at / scroll_offset，**不写** local_count / upstream_* 这些对账计数：
+// 那是「灵枢账单 vs 账本」比对的结果，由对账服务在每窗结束时统一写（见 CountWriter /
+// reconcile.go）；同步轮次拿它当计数会污染对账口径（一个是「拉了多少条」，一个是「两边各多少笔」）。
 type WindowRecord struct {
 	// Start 是 60s 对齐的窗口起点（reconcile_windows.window_start 主键）。
 	Start time.Time
@@ -108,6 +134,9 @@ type WindowRecord struct {
 	Inserted int
 	// Reason 是 blocked/error 的原文原因（写进 detail）。
 	Reason string
+	// ScrollOffset 是该行对应窗口的下次补拉 offset（F9：持久化，ok 后归 0）。
+	// 语义：本轮扫描起点 = 本行 window_start 时，下一次从第 ScrollOffset 条开始拉。
+	ScrollOffset int64
 	// RecordedAt 写 checked_at。
 	RecordedAt time.Time
 	// ClearFrom 仅在 status=ok 时有意义：把 [ClearFrom, End) 内仍为 blocked 的窗口一并置 ok
@@ -128,9 +157,12 @@ func (r WindowRecord) Validate() error {
 			r.Start.Format(time.RFC3339), r.End.Format(time.RFC3339))
 	}
 	switch r.Status {
-	case WindowOK, WindowBlocked, WindowError:
+	case WindowOK, WindowBlocked, WindowError, WindowAlarm, WindowSkipped:
 	default:
-		return fmt.Errorf("窗口状态 %q 不在取值域（ok/blocked/error）", r.Status)
+		return fmt.Errorf("窗口状态 %q 不在取值域（ok/alarm/error/blocked/skipped）", r.Status)
+	}
+	if r.ScrollOffset < 0 {
+		return fmt.Errorf("窗口行 scroll_offset 为负（%d）", r.ScrollOffset)
 	}
 	return nil
 }
@@ -141,13 +173,68 @@ func (r WindowRecord) Validate() error {
 type WindowStore interface {
 	// LastSuccessEnd 返回最后一次成功窗口的结束时刻（无记录时 ok=false）。
 	LastSuccessEnd(ctx context.Context) (time.Time, bool, error)
-	// BlockedWindows 返回仍未补平的 blocked 窗口（按 window_start 升序）。
-	// 重启后要靠它「不静默」：积压要重拉且要告警，不许当没发生。
-	BlockedWindows(ctx context.Context, limit int) ([]WindowRecord, error)
+	// PendingWindows 返回仍未补平的行（status IN ('blocked','error')，按 window_start 升序），
+	// 带上各自的 scroll_offset 作为续拉位置。
+	//
+	// 为什么把 error 也算进来：error 行可能已经有「已提交的页」（本切片一页一事务），
+	// 它的位置在水位线之后就不会再被重叠区间覆盖 —— 只认 blocked 会让这段数据永久缺口。
+	PendingWindows(ctx context.Context, limit int) ([]WindowRecord, error)
 	// Save 独立写一条窗口行（blocked/error 用：此时账本事务已回滚，只能另写一条）。
 	Save(ctx context.Context, rec WindowRecord) error
 	// SaveTx 在同一事务里写窗口行（成功路径用，契约 §6.2）。
 	SaveTx(ctx context.Context, ex dbx.Execer, rec WindowRecord) error
+}
+
+// WindowCounts 是一次对账的落库形态（D4：四个计数列由对账服务在每窗结束时统一写）。
+//
+// 与 WindowRecord 的分工：
+//   - WindowRecord 由**同步轮次**写（status/scroll_offset/detail：拉了多少、补到哪）；
+//   - WindowCounts 由**对账服务**写（四个计数列 + 判定结果：两边各多少、是否偏差）。
+//
+// 两者写同一张表的不同列，各有各的调用点，别混用一个结构（混用必踩「谁覆盖谁」）。
+type WindowCounts struct {
+	Start time.Time
+	End   time.Time
+	// LocalCount / LocalTokens 是灵枢侧（billing_records）的笔数与三段 token 合计。
+	LocalCount  int64
+	LocalTokens int64
+	// UpstreamCount / UpstreamTokens 是账本侧（ledger_entries）的笔数与 in+out 合计。
+	UpstreamCount  int64
+	UpstreamTokens int64
+	// Status 是判定结果：ok / alarm / skipped（blocked / error 由同步轮次持有，对账不得覆盖）。
+	Status WindowStatus
+	// AlarmStreak 是连续告警窗数（>=3 升级审计；ok 归 0）。
+	AlarmStreak int16
+	// Detail 是兜底明细（分组/原因/偏差率）。**判定必须落在计数列上**，
+	// detail 只为排障；查历史不许靠解析它。
+	Detail map[string]any
+	// CheckedAt 写 checked_at。
+	CheckedAt time.Time
+}
+
+// Validate 校验对账落库形状。
+func (c WindowCounts) Validate() error {
+	if c.Start.IsZero() || c.End.IsZero() {
+		return fmt.Errorf("对账窗口缺少起止时刻")
+	}
+	if !c.End.Equal(c.Start.Add(WindowSize)) {
+		return fmt.Errorf("对账窗口必须是整 60s（%s → %s）",
+			c.Start.Format(time.RFC3339), c.End.Format(time.RFC3339))
+	}
+	switch c.Status {
+	case WindowOK, WindowAlarm, WindowSkipped:
+	default:
+		return fmt.Errorf("对账状态 %q 非法（只允许 ok/alarm/skipped；blocked/error 归同步轮次）", c.Status)
+	}
+	if c.LocalCount < 0 || c.UpstreamCount < 0 || c.LocalTokens < 0 || c.UpstreamTokens < 0 {
+		return fmt.Errorf("对账计数出现负数：%+v", c)
+	}
+	return nil
+}
+
+// CountWriter 写对账计数（实现方是 SQLWindowStore；对账服务只依赖这个窄接口）。
+type CountWriter interface {
+	SaveCounts(ctx context.Context, c WindowCounts) error
 }
 
 // MemoryWindowStore 是进程内实现，作单测替身（重启丢状态，真实运行请用 SQLWindowStore）。
@@ -155,6 +242,7 @@ type MemoryWindowStore struct {
 	mu      sync.Mutex
 	lastEnd time.Time
 	records []WindowRecord
+	counts  []WindowCounts
 }
 
 // NewMemoryWindowStore 创建内存窗口存储。
@@ -172,13 +260,13 @@ func (m *MemoryWindowStore) LastSuccessEnd(_ context.Context) (time.Time, bool, 
 	return m.lastEnd, true, nil
 }
 
-// BlockedWindows 实现 WindowStore。
-func (m *MemoryWindowStore) BlockedWindows(_ context.Context, limit int) ([]WindowRecord, error) {
+// PendingWindows 实现 WindowStore。
+func (m *MemoryWindowStore) PendingWindows(_ context.Context, limit int) ([]WindowRecord, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var out []WindowRecord
 	for _, rec := range m.records {
-		if rec.Status != WindowBlocked {
+		if rec.Status != WindowBlocked && rec.Status != WindowError {
 			continue
 		}
 		out = append(out, rec)
@@ -219,12 +307,40 @@ func (m *MemoryWindowStore) SaveTx(_ context.Context, _ dbx.Execer, rec WindowRe
 	if rec.Status == WindowOK && !rec.ClearFrom.IsZero() {
 		for i := range m.records {
 			r := &m.records[i]
-			if r.Status == WindowBlocked && !r.Start.Before(rec.ClearFrom) && r.Start.Before(rec.End) {
+			if (r.Status == WindowBlocked || r.Status == WindowError) &&
+				!r.Start.Before(rec.ClearFrom) && r.Start.Before(rec.End) {
 				r.Status = WindowOK
+				r.ScrollOffset = 0
 			}
 		}
 	}
 	return nil
+}
+
+// SaveCounts 实现 CountWriter：内存实现把计数挂在对应窗口行上（用例断言用）。
+func (m *MemoryWindowStore) SaveCounts(_ context.Context, c WindowCounts) error {
+	if err := c.Validate(); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.records {
+		if m.records[i].Start.Equal(c.Start) {
+			m.records[i].Status = c.Status
+			m.counts = append(m.counts, c)
+			return nil
+		}
+	}
+	m.records = append(m.records, WindowRecord{Start: c.Start, End: c.End, Status: c.Status})
+	m.counts = append(m.counts, c)
+	return nil
+}
+
+// Counts 返回已写入的对账结果（用例断言用）。
+func (m *MemoryWindowStore) Counts() []WindowCounts {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]WindowCounts(nil), m.counts...)
 }
 
 // Records 返回已保存的窗口记录（排障与用例断言用）。
@@ -240,14 +356,17 @@ type ErrWindowBlocked struct {
 	Pages  int
 	// Fetched 是本轮已拉到的条数（回滚后不落库，仅供排障）。
 	Fetched int
+	// ScrollOffset 是下一轮继续拉的位置（持久化进 reconcile_windows.scroll_offset）。
+	ScrollOffset int64
 }
 
 func (e *ErrWindowBlocked) Error() string {
 	if e == nil {
 		return "同步窗口 blocked"
 	}
-	return fmt.Sprintf("同步窗口 %s 在 %d 页上限内未拉完（已拉 %d 条，本轮已回滚）：积压需扩页上限或人工介入",
-		e.Window, e.Pages, e.Fetched)
+	return fmt.Sprintf("同步窗口 %s 在单轮上限（%d 页 / %d 条）内未拉完（已拉 %d 条），本轮已回滚；"+
+		"下一轮从 scroll_offset=%d 继续补拉，直到清零（不引入人工介入）",
+		e.Window, MaxPagesPerRound, MaxRowsPerRound, e.Fetched, e.ScrollOffset)
 }
 
 // RoundResult 是一轮同步的结果（也用于日志/排障）。
@@ -264,6 +383,11 @@ type RoundResult struct {
 	Reason   string
 	// BlockedPending 是本轮开始时仍未补平的 blocked 窗口数（>0 表示上一轮/重启前的积压还在）。
 	BlockedPending int
+	// ScanStart 是本轮扫描起点的窗口（60s 对齐）：blocked/error 行记在这一行上，
+	// 它的 scroll_offset 就是下次补拉的位置。
+	ScanStart time.Time
+	// ResumeOffset 是本轮开始时的 offset（0 = 从头拉；>0 = 上一轮 blocked 留下的位置）。
+	ResumeOffset int64
 }
 
 // RounderOptions 是 NewRounder 的入参。
@@ -322,12 +446,18 @@ func NewRounder(opts RounderOptions) *Rounder {
 
 // RunOnce 执行一轮同步。
 //
-// 事务边界：**整轮一事务**——所有页 + 窗口行写在同一个事务里，成功才提交；任何失败或超限整轮回滚。
-// 半提交的窗口会让「水位线」与「已落库数据」不一致，下一轮重叠补不回来（漏账）。
+// ── 事务边界（本切片按 F9 修订，与契约 §6.2「整轮一事务」不同，属**有意变更**）──────
+// 每一页一个事务：`Upsert(本页) + 写扫描起点窗口行的 scroll_offset` 同事务提交。
+// 为什么放弃「整轮一事务」：offset 一旦要持久化当断点，整轮回滚就与断点语义冲突——
+// 回滚把本页数据擦掉了，断点却记着「拉到第 N 条」，下一轮从 N 继续 = 把前 N 条永久跳过
+// （静默漏账，比 blocked 更糟）。要么不做断点，要么让断点**代表已落库的进度**，这里选后者。
+// 代价：单轮中途失败会留下「已提交的若干页 + 未完成的窗口状态」，但窗口状态仍是 blocked/error
+// （水位线不前进），下一轮重叠重拉且 ledger_id 幂等，不会重复计账也不会漏。
 //
-// blocked 口径：单轮翻页达到上限且上游仍有下一页 → 回滚 + 落 blocked 状态 + ERROR 告警。
-// 注意 offset 不持久化，所以积压不会自愈：每轮都从 offset=0 重新翻，仍然撞上限。
-// 这正是要告警的原因（扩页上限或人工介入，而不是偷偷记个 offset 假装有进度）。
+// blocked 口径（F9）：单轮达到上限（4000 条 / 20 页）且上游仍有下一页 → 落 blocked + ERROR 告警，
+// 并把**本次到达的 offset** 持久化进扫描起点窗口行的 scroll_offset。
+// 下一轮从那个 window_start + scroll_offset 继续拉，直到清零——积压会自愈，不需要人工介入。
+// 幂等前提：账本写入按 ledger_id ON CONFLICT DO NOTHING，所以「同一条被拉两次」不会重复计账。
 func (r *Rounder) RunOnce(ctx context.Context) (RoundResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -338,9 +468,9 @@ func (r *Rounder) RunOnce(ctx context.Context) (RoundResult, error) {
 	if err != nil {
 		return RoundResult{}, fmt.Errorf("读取同步水位线失败：%w", err)
 	}
-	blocked, err := r.windows.BlockedWindows(ctx, blockedProbeLimit)
+	blocked, err := r.windows.PendingWindows(ctx, blockedProbeLimit)
 	if err != nil {
-		return RoundResult{}, fmt.Errorf("读取 blocked 窗口失败：%w", err)
+		return RoundResult{}, fmt.Errorf("读取待补拉窗口失败：%w", err)
 	}
 
 	now := r.now()
@@ -376,57 +506,104 @@ func (r *Rounder) RunOnce(ctx context.Context) (RoundResult, error) {
 
 	saved := savedWindowFor(w)
 	result.Saved = saved
-
-	tx, err := r.ledger.Begin(ctx)
-	if err != nil {
-		r.saveStatus(ctx, result, WindowError, err.Error())
-		return result, err
+	// 扫描起点窗口：blocked/error 行与 scroll_offset 都记在这一行上（F9）。
+	// 为什么不是记在 saved（最新那一格）：offset 是「从扫描起点往后数第 N 条」，
+	// 只有和起点窗口绑在一起才有意义；记在最新窗口上，下一轮从最新窗口 + 旧 offset 起步
+	// 会跳过中间那段（漏账），这是最容易写错的一处。
+	scanStart := w.Start.Truncate(WindowSize)
+	result.ScanStart = scanStart
+	// ClearFrom 必须能盖住扫描起点那一行：w.Start 可能落在窗口中间（比 scanStart 晚），
+	// 用 w.Start 当清理下界会漏掉自己刚写的 blocked 行（永远清不掉）。
+	if scanStart.Before(clearFrom) {
+		clearFrom = scanStart
 	}
 
-	offset := 0
+	// 断点续拉：从最旧 blocked 窗口留下的 offset 起（该窗口之外的部分还没有 offset 语义）。
+	var resumeOffset int64
+	if len(blocked) > 0 {
+		resumeOffset = blocked[0].ScrollOffset
+	}
+	result.ResumeOffset = resumeOffset
+
+	offset := int(resumeOffset)
 	for {
 		page, ferr := r.source.FetchPage(ctx, w, offset, r.pageSize)
 		if ferr != nil {
-			_ = tx.Rollback()
-			r.saveStatus(ctx, result, WindowError, ferr.Error())
+			r.saveStatus(ctx, result, WindowError, ferr.Error(), int64(offset), scanStart)
 			return result, fmt.Errorf("拉取同步窗口 %s（offset=%d）失败：%w", w, offset, ferr)
 		}
+		result.Pages++
+
 		if len(page.Entries) > 0 {
+			next := offset + len(page.Entries)
+			// 一页一事务：本页账本 + 扫描起点的 offset 一起提交（断点必须代表「已落库」）。
+			tx, terr := r.ledger.Begin(ctx)
+			if terr != nil {
+				r.saveStatus(ctx, result, WindowError, terr.Error(), int64(offset), scanStart)
+				return result, terr
+			}
 			n, uerr := tx.Upsert(ctx, page.Entries)
 			if uerr != nil {
 				_ = tx.Rollback()
-				r.saveStatus(ctx, result, WindowError, uerr.Error())
+				r.saveStatus(ctx, result, WindowError, uerr.Error(), int64(offset), scanStart)
 				return result, uerr
+			}
+			if serr := r.windows.SaveTx(ctx, tx.Execer(), WindowRecord{
+				Start:        scanStart,
+				End:          scanStart.Add(WindowSize),
+				Status:       WindowBlocked, // 未跑完前不把它标成 ok：水位线只能由完整轮次推进。
+				Pages:        result.Pages,
+				Fetched:      result.Fetched + len(page.Entries),
+				Inserted:     result.Inserted + n,
+				Reason:       "分页进行中（本页已提交，下一轮从 scroll_offset 续拉）",
+				ScrollOffset: int64(next),
+				RecordedAt:   r.now(),
+			}); serr != nil {
+				_ = tx.Rollback()
+				r.saveStatus(ctx, result, WindowError, serr.Error(), int64(offset), scanStart)
+				return result, fmt.Errorf("写分页断点失败（本页已回滚）：%w", serr)
+			}
+			if cerr := tx.Commit(); cerr != nil {
+				r.saveStatus(ctx, result, WindowError, cerr.Error(), int64(offset), scanStart)
+				return result, fmt.Errorf("提交分页事务失败：%w", cerr)
 			}
 			result.Inserted += n
 			result.Fetched += len(page.Entries)
-			offset += len(page.Entries)
+			offset = next
 		}
-		result.Pages++
 
 		if !page.HasMore {
 			break
 		}
 		if len(page.Entries) == 0 {
 			// 空页却声称还有更多：数据源的翻页语义有问题，必须报错而不是死循环。
-			_ = tx.Rollback()
 			reason := fmt.Sprintf("上游返回空页但标记 has_more（offset=%d）", offset)
-			r.saveStatus(ctx, result, WindowError, reason)
+			r.saveStatus(ctx, result, WindowError, reason, int64(offset), scanStart)
 			return result, fmt.Errorf("同步窗口 %s：%s", w, reason)
 		}
-		if result.Pages >= r.maxPages {
-			_ = tx.Rollback()
-			blockedErr := &ErrWindowBlocked{Window: w, Pages: result.Pages, Fetched: result.Fetched}
-			r.saveStatus(ctx, result, WindowBlocked, blockedErr.Error())
-			// 告警：这是「数据积压」不是「偶发失败」，重试同一轮不会变好。
-			log.Error("上游同步窗口 blocked（页数上限）",
+		// 两个上限同源：页数（20）与条数（4000）。条数上限要单独判，因为 page_size 可配，
+		// 调大 page_size 时「20 页 = 4000 条」不再成立，只判页数会偷偷放大单轮负载。
+		if result.Pages >= r.maxPages || result.Fetched >= MaxRowsPerRound {
+			blockedErr := &ErrWindowBlocked{
+				Window: w, Pages: result.Pages, Fetched: result.Fetched, ScrollOffset: int64(offset),
+			}
+			// 持久化 offset 是 blocked 与「失败」的区别：进度要留给下一轮，否则积压永不清零。
+			r.saveStatus(ctx, result, WindowBlocked, blockedErr.Error(), int64(offset), scanStart)
+			log.Error("上游同步窗口 blocked（单轮上限）",
 				"window", w.String(), "pages", result.Pages, "max_pages", r.maxPages,
-				"fetched", result.Fetched, "err", blockedErr.Error())
+				"max_rows", MaxRowsPerRound, "fetched", result.Fetched,
+				"scroll_offset", offset, "err", blockedErr.Error())
 			return result, blockedErr
 		}
 	}
 
-	// 成功路径：窗口行与账本**同事务**写（契约 §6.2）。
+	// 收尾：把最新窗口置 ok（推进水位线），并把 [ClearFrom, End) 里仍挂 blocked/error 的行
+	// 一并置 ok + offset 归零 —— 这段区间本轮已拉完，不该留假告警。
+	tx, err := r.ledger.Begin(ctx)
+	if err != nil {
+		r.saveStatus(ctx, result, WindowError, err.Error(), int64(offset), scanStart)
+		return result, err
+	}
 	okRec := WindowRecord{
 		Start:      saved.Start,
 		End:        saved.End,
@@ -443,8 +620,8 @@ func (r *Rounder) RunOnce(ctx context.Context) (RoundResult, error) {
 		return result, fmt.Errorf("写同步窗口行失败（本轮已回滚）：%w", err)
 	}
 	if err := tx.Commit(); err != nil {
-		r.saveStatus(ctx, result, WindowError, err.Error())
-		return result, fmt.Errorf("提交账本事务失败：%w", err)
+		r.saveStatus(ctx, result, WindowError, err.Error(), int64(offset), scanStart)
+		return result, fmt.Errorf("提交窗口收尾事务失败：%w", err)
 	}
 	result.Status = WindowOK
 	log.Info("上游同步窗口完成",
@@ -465,27 +642,32 @@ func savedWindowFor(w Window) Window {
 	return Window{Start: end.Add(-WindowSize), End: end}
 }
 
-// saveStatus 落 blocked/error 状态（此时账本事务已回滚，只能另写一条；失败只告警，
-// 不能因为「记录状态失败」把已经回滚的轮次判成另一种失败）。
-func (r *Rounder) saveStatus(ctx context.Context, result RoundResult, status WindowStatus, reason string) {
+// saveStatus 落 blocked/error 状态（账本页已提交或未开始；本行写入失败只告警，
+// 不能因为「记录状态失败」把已经落库的页判成另一种失败）。
+//
+// 记在**扫描起点窗口**那一行上（不是最新窗口）：scroll_offset 的含义是「从扫描起点往后数第 N 条」，
+// 只有绑定起点窗口才能被下一轮正确续拉。
+func (r *Rounder) saveStatus(ctx context.Context, result RoundResult, status WindowStatus, reason string,
+	offset int64, scanStart time.Time) {
 	result.Status = status
 	result.Reason = reason
-	saved := result.Saved
-	if saved.End.IsZero() {
-		saved = savedWindowFor(result.Window)
+	start := scanStart
+	if start.IsZero() {
+		start = result.Window.Start.Truncate(WindowSize)
 	}
 	rec := WindowRecord{
-		Start:      saved.Start,
-		End:        saved.End,
-		Status:     status,
-		Pages:      result.Pages,
-		Fetched:    result.Fetched,
-		Inserted:   result.Inserted,
-		Reason:     reason,
-		RecordedAt: r.now(),
+		Start:        start,
+		End:          start.Add(WindowSize),
+		Status:       status,
+		Pages:        result.Pages,
+		Fetched:      result.Fetched,
+		Inserted:     result.Inserted,
+		Reason:       reason,
+		ScrollOffset: offset,
+		RecordedAt:   r.now(),
 	}
 	if err := r.windows.Save(ctx, rec); err != nil {
-		r.log.Error("写入同步窗口状态失败", "window", saved.String(), "status", status, "err", err)
+		r.log.Error("写入同步窗口状态失败", "window", rec.Start.Format(time.RFC3339), "status", status, "err", err)
 	}
 }
 

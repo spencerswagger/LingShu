@@ -29,9 +29,11 @@ import (
 	"github.com/team/llmgateway/internal/domain/gateway"
 	"github.com/team/llmgateway/internal/domain/identity"
 	"github.com/team/llmgateway/internal/domain/model"
+	"github.com/team/llmgateway/internal/domain/reconcile"
 	"github.com/team/llmgateway/internal/domain/router"
 	"github.com/team/llmgateway/internal/domain/sync"
 	"github.com/team/llmgateway/internal/domain/tag"
+	"github.com/team/llmgateway/internal/domain/upstream"
 	"github.com/team/llmgateway/internal/pkg/asyncwrite"
 	"github.com/team/llmgateway/internal/pkg/clientip"
 	"github.com/team/llmgateway/internal/pkg/idgen"
@@ -582,6 +584,23 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	if readCacheOn {
 		channelModelsResolver = chMgr
 	}
+	// V2 转发链运行参数（F1 三键：基址 / 两段超时 / 三开关）。凭据不进配置表：
+	// 上游鉴权头由环境变量注入，只在装配层持有。
+	upstreamCfg := upstream.NewConfigProvider(billStore)
+	upCfg, upProblems := upstreamCfg.Load(context.Background())
+	for _, p := range upProblems {
+		logr.Warn("上游配置有问题（已按字段回落默认值）", "problem", p)
+	}
+	var upstreamSource gateway.RuntimeConfigSource
+	if upCfg.BaseURL != "" {
+		upstreamSource = upstreamCfg
+		logr.Info("V2 转发链接管 /v1", "base_url", upCfg.BaseURL,
+			"stream_first_byte_ms", upCfg.Timeouts.StreamFirstByte.Milliseconds(),
+			"stream_idle_ms", upCfg.Timeouts.StreamIdle.Milliseconds())
+	} else {
+		logr.Warn("未配置 upstream.base_url，/v1 仍走 V1 渠道路由（V2 转发未接入）")
+	}
+
 	gw := gateway.NewGateway(gateway.GatewayConfig{
 		Tokens:        tokenSvc,
 		Router:        routerEngine,
@@ -666,12 +685,53 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 			}
 			return true
 		},
+		// V2 转发链（nil = 保持 V1 行为；非 nil = /v1 由转发主链接管）。
+		UpstreamConfig: upstreamSource,
+		// 上游鉴权头：仅从环境变量取（配置表与代码里都不许出现凭据）。
+		UpstreamAuth: func() (string, string) {
+			return strings.TrimSpace(os.Getenv("UPSTREAM_AUTH_HEADER")),
+				strings.TrimSpace(os.Getenv("UPSTREAM_AUTH_VALUE"))
+		},
 		Logger: logr,
 	})
 	// 调用日志采集注入（nil=不采集；生产装配 SQL 存储，与 console 只读共用）。
 	// 写侧异步化：Insert 走 asyncwrite（Kind=KindCallLog，Key/幂等键=billing_id，底层 ON CONFLICT 幂等可重放），
 	// console 只读查询仍直读同一 SQL 存储。
 	gw.SetCallLogs(gateway.NewAsyncCallLogStore(asyncWriter, callLogStore))
+
+	// D4：对账窗口的四列计数由对账服务在窗口结束时写入（四个 0 等于「漏账不可见」）。
+	// 只落计数与状态；七列归因的读取方属阶段二（本期不做）。
+	windowStore := upstream.NewSQLWindowStore(d)
+	recon := reconcile.NewReconciler(reconcile.Options{
+		Local:    reconcile.NewLocalSource(d),
+		Upstream: reconcile.NewUpstreamSource(d),
+		Counts:   windowStore,
+		States:   windowStore,
+		Streaks:  windowStore,
+		LedgerEnabled: func() bool {
+			c, _ := upstreamCfg.Load(context.Background())
+			return c.Degrade.LedgerEnabled
+		},
+		Logger: logr,
+	})
+	go func() {
+		// 60s 一跳：与窗口宽度同量级，窗口结束后下一跳就能被算上。
+		t := time.NewTicker(time.Minute)
+		defer t.Stop()
+		for range t.C {
+			func() {
+				// 单轮 panic 不许带走进程（对账是后台任务，崩了应告警继续）。
+				defer func() {
+					if rec := recover(); rec != nil {
+						logr.Error("对账轮次 panic", "panic", rec)
+					}
+				}()
+				if _, err := recon.RunOnce(context.Background()); err != nil {
+					logr.Warn("对账轮次失败（窗口保持待重算）", "err", err)
+				}
+			}()
+		}
+	}()
 
 	return &app{
 		deps: server.Deps{

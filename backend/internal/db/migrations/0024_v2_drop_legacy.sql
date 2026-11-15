@@ -1,0 +1,142 @@
+-- 0024_v2_drop_legacy：删退役的渠道/标签/Auto 体系（本批最后一个）。
+--
+-- ── 为什么叫 0024（原 0021）────────────────────────────────────────────
+--   裁定：迁移保持「一次启动跑完整链」，**字典序 = 执行序**，不许手工分两次跑。
+--   所以破坏性动作排在编号最大的文件（0024）里，执行器按文件名升序自然把它放到最后：
+--     0019 topology → 0020 billing attribution → 0022 ledger → 0023 reconcile → 0024 drop legacy
+--   上一版把这份文件编成 0021 并从本批摘出去手工跑，结果是「另一批」永远不确定什么时候跑、
+--   跑之前和跑之后的库状态说不清；现在改成一条链，跑完即终态。
+--   附带约束：本文件必须是目录里**文件名最大**的迁移（改名/加号会让它提前执行，
+--   `TestMigrationChain_OrderAndDestructiveScope` 会红）。
+--
+-- ⚠️ 本文件是整条链里**唯一含 DROP、唯一不可回滚**的迁移。
+--    执行前必须完成「执行前核对 + 三步证据」（下附），否则不许执行。
+--
+-- ── 数表：实际删 10 张，不是 11 张 ──────────────────────────────────────
+--    本文件有 11 条 DROP TABLE，其中 channel_events 在 0009_drop_channel_state.sql
+--    （该文件末句：DROP TABLE IF EXISTS channel_events;）就已经删掉了，
+--    这里那条**永远是空操作**。保留它只为清单完整 + 收拾「手工恢复过该表」的环境。
+--    按 11 张去数会以为漏了一张而去找不存在的表 —— 按 10 张数。
+--
+-- ── 保留表：15 张（迁移前后行数不得变少，见 F7 判据）──────────────────────
+--    users, tokens, billing_records, credit_wallets, credit_flows, sessions, call_logs,
+--    external_models, sys_configs, announcements, audit_logs, channel_protocols,
+--    protocol_error_stats, watchlist_items, price_change_alerts
+--    （最后两张是价格监控表：未批准下架，必须原样保留。）
+--    判据是「行数不得变少」，不要求迁移前后逐字相同：迁移期间有新写入（新账单/新流水/新会话）
+--    是正常的，为「逐字相同」去停机不划算。清单的唯一来源是代码常量
+--    db.RetainedTables()（用例与运维脚本共用，别在这里另抄一份数字）。
+--
+-- ── 顺序不可调（两个层次都不可调）────────────────────────────────────────
+-- ① 先删列，再删表：billing_records / sessions / tokens 上的外键列必须先摘掉，
+--    否则 DROP TABLE 会被外键挡住（sessions.channel_key_id 还是 NOT NULL）。
+-- ② 表按「子表 → 父表」删：channel_tags、channel_model_events、channel_key_events
+--    引用 channels/channel_keys/semantic_tags；auto_model_members 引用 auto_models；
+--    channel_tags 同时引用 channels 与 semantic_tags。顺序颠倒会报
+--    "cannot drop table X because other objects depend on it"。
+--    改这条顺序的人要先看 pg_depend，不要按字母序重排。
+--
+-- ── 执行前探测：**四条** SQL 缺一不可（不能只信 applied_migrations）────────────
+--    migrate.go 以**文件名**为幂等键。实测（真实旧库）：在一个跑过旧分支的库上执行本版
+--    迁移链，多个文件逐条 exit 0、applied_migrations 记满、**零报错**，但库是坏的
+--    —— reconcile_windows 被 CREATE TABLE IF NOT EXISTS 整段跳过（缺列/PK/CHECK），
+--    直到首次写窗口才炸 "column local_count does not exist"。记录表记的是「文件跑过」，
+--    不是「对象建对」。
+--
+--    ① 记录层（**排除式**；别写 name >= '0019' 裸条件——本链跑完后它永远非空、每次误报）：
+--       SELECT name FROM applied_migrations WHERE name >= '0019'
+--         AND name NOT IN ('0019_v2_topology.sql','0020_v2_billing_attribution.sql',
+--                          '0022_v2_ledger.sql','0023_v2_reconcile.sql',
+--                          '0024_v2_drop_legacy.sql');
+--       → 期望 0 行
+--    ② 对象层（旧分支独有对象，只是技术探测串，不得进任何界面文案）：
+--       to_regclass('public.magpie_keys') 非空，或 external_models.magpie_model /
+--       billing_records.magpie_key_name / estimated / upstream_usage 任一列存在
+--       → 期望 0 行
+--    ③ 形状层：reconcile_windows 的列清单
+--       → 期望 0 行（未建）或列齐全（含 scroll_offset / 四计数列）；缺 local_count 即「被跳过」
+--    ④ 反查（**S4 专用，前三条判不出来**）：按已记文件名核它该建的对象是否真的在 ——
+--       0019 → internal_models / model_links / subscriptions / external_models.bound_internal_ref；
+--       0020 → billing_records.upstream_provider / cost_source；
+--       0022 → ledger_entries；0023 → reconcile_windows；
+--       0024 → channels / channel_keys / semantic_tags 必须已不存在。
+--       期望 0 行；有输出 = 记录在、对象/列缺（S4，实测 9 行）。
+--       ⚠️ 它只 JOIN 本链文件名：旧分支记录名（0019_v2_facade.sql 等）匹配不到，
+--          所以 **S1/S2 的 ④ 是 0 行**（判定靠 ①②）。SQL 见定稿文档 §5.1 probe-4。
+--       ⚠️ 它只看「对象/列在不在」：**约束/索引不对它看不出**（S5b，见 §5.2）。
+--    任一条不符：按定稿文档 §5.2 的状态矩阵判 —— S0 直接执行；S1/S2/S3/S4/S5a/S5b **一律走 R-2**
+--    （回干净基线；实测 schema 0 差异），紧要用 R-1（只修窗口表）。
+--    ⚠️ S5b（记录在、列齐、**只是约束不符**）实测四条探测全净 → 会被当成 S0 放行。
+--       执行前必须跑 §5.1 的「键约束确认」查询（期望 PRIMARY KEY (window_start) + 60s CHECK）；
+--       本版 0023 已把 status 值域与 scroll_offset 用 DROP/ADD + DO 块补齐，那两路能自愈，
+--       **PK 与 60s CHECK 自愈不了**（CREATE 被整段跳过时它们根本没建），仍靠这条手工查询。
+--    S4 的 R-2 有效性有实测：清记录后重跑，internal_models / ledger_entries / reconcile_windows
+--    全部建出。**不要徒手补 DDL** —— 手工对象与迁移文件长期脱节，下次真实迁移又会被静默跳过。
+--    R-2 的 DELETE 必须**逐条列名**（含旧分支 0019_v2_facade / 0020_reconcile_blocked_status），
+--    不许 name >= '0019' 裸条件。
+--    详见 docs/designs/2026-11-15-v2-p1-data-contract.md §5.1 / §5.2。
+--
+-- ── 执行方式：手工跑必须 -1 + ON_ERROR_STOP=1（实测三档）────────────────
+--    psql -f 不带 ON_ERROR_STOP      → 出错仍 exit 0，且已执行语句各自提交 = 半套状态
+--    psql -f 只带 ON_ERROR_STOP      → 出错 exit 3，但出错前语句已落库 = 仍是半套
+--    psql -X -1 -v ON_ERROR_STOP=1   → 等价 migrate.go 的「每文件一个事务」= 原子（用这个）
+--    生产走真实执行器（server -migrate-only）；两条路径的 pg_dump -s 实测 1030 行 0 差异。
+--    比对 schema 前先过滤 17.11 的随机 \restrict / \unrestrict 行，否则 diff 必误报。
+--
+-- ── 执行前的三步证据（产物贴进 PR 描述）─────────────────────────────────
+--   1) 备份：pg_dump -Fc -Z6 -f backup/<db>-<stamp>.dump <db>；退出码必须 0，文件必须 >1KiB。
+--   2) 还原：createdb -T template0 <tmp_db> && pg_restore -d <tmp_db> --no-owner --no-privileges -j4 <dump>；
+--      再用同一份「全表精确计数」SQL 在源库与临时库各跑一次，diff 必须为空。
+--   3) 比对：迁移前存一份「15 张保留表计数」基线，迁移后再跑一次 —— 判据是
+--      **「行数不得变少」**（before <= after 逐表成立），不要求逐字相同（见文件头 F7）。
+--      并断言 10 张实际退役表（+ 空操作的 channel_events）to_regclass 全为 NULL。
+--    判定点：备份失败/还原失败/任一张保留表行数变少/退役表仍存在 —— 任一命中即中止。
+--    负向对照（已实测）：在本文件末尾注入 SELECT 1/0 → 整份事务回滚、表与列原样。
+--    这条是「跑一半也能回滚」的证据，不是推断；正式执行前建议再跑一次这个对照。
+--
+-- ── 中途失败能不能自动回滚？结论：能，但只在「本文件的事务内」────────────
+--    migrate.go（internal/db/migrate.go:16-70）把整个文件放在一个 tx 里执行，PG 的 DDL 是
+--    事务性的（DROP TABLE / DROP COLUMN 均可回滚）。任一句报错 → tx.Rollback() → 库回到
+--    上一个文件的终态，且 applied_migrations 不会记本文件，重试是安全的。
+--    所以 dump 保护的不是「迁移跑到一半」——那由事务兜住；dump 保护的是「文件已 commit、
+--    但事后发现删错了/需要取回历史渠道密钥名」这类**事务之外**的误判。
+--    推论：本链所有迁移文件里都不得出现 CREATE INDEX CONCURRENTLY / VACUUM / CREATE DATABASE
+--    这类不能在事务内执行的语句，否则迁移会直接失败（那才是真回滚不了）。
+--
+-- ── 已 commit 之后发现删错了：整库还原（已实测）──────────────────────────
+--    用步骤 1 的同一份 dump 还原：dropdb --if-exists <db> → createdb -T template0 <db>
+--    → pg_restore -d <db> --no-owner --no-privileges -j4 <dump>，行数与 before-all.txt 应 0 差异。
+--    窗口期限制：dump 是执行**之前**的快照，还原会丢掉「迁移后 → 回滚前」的增量
+--    （新账单/新账本条目/新用户）。超过一个业务周期才回滚，正确做法是从 dump 单独抽被删表的历史
+--    数据补回，而不是整库覆盖。
+--
+-- ── 保留不删（别顺手清）───────────────────────────────────────────────
+--    channel_protocols / protocol_error_stats：不在批准清单内，等阶段二后单独拍板。
+--    watchlist_items / price_change_alerts：价格监控，未批准下架。
+--    call_logs.channel_id / channel_key_id / auto_model_name：无外键、不阻塞，
+--    且是历史日志快照——删了就没有第二份证据可查。
+--
+-- ── 已知缺口（不假装已解决）─────────────────────────────────────────────
+--    执行完本文件后，代码侧仍有一批读写方指向被删的列/表（sessions.channel_key_id 的写入、
+--    tokens.tag_id、console 的渠道名反查、billing/stats 的按密钥聚合等）。这些摘除属阶段二，
+--    本切片只保证迁移链能一次跑通、字典序=执行序；**上线前必须先摘代码**（登记在交付说明里）。
+--
+-- 幂等：全部 DROP ... IF EXISTS，重复执行不报错（但已删的数据取不回）。
+
+-- ① 先删阻塞列
+ALTER TABLE billing_records DROP COLUMN IF EXISTS channel_key_id;   -- 连带 idx_billing_key_time
+ALTER TABLE sessions        DROP COLUMN IF EXISTS channel_key_id;   -- NOT NULL，必须删；连带 idx_sessions_key
+ALTER TABLE tokens          DROP COLUMN IF EXISTS tag_id;           -- 引用 semantic_tags
+
+-- ② 再删表（子表在前，顺序不可调）
+DROP TABLE IF EXISTS channel_tags;            -- 引用 channels + semantic_tags
+DROP TABLE IF EXISTS channel_model_events;    -- 引用 channels
+DROP TABLE IF EXISTS channel_key_events;      -- 引用 channel_keys
+DROP TABLE IF EXISTS probe_logs;              -- 引用 channel_keys
+DROP TABLE IF EXISTS channel_models;          -- 引用 channels + external_models
+DROP TABLE IF EXISTS channel_keys;            -- 引用 channels
+DROP TABLE IF EXISTS channel_events;          -- 0009 已删 → 空操作（保留只为清单完整；不做实际删除）
+DROP TABLE IF EXISTS channels;                -- 引用 channel_protocols（出向，不挡）
+DROP TABLE IF EXISTS auto_model_members;      -- 引用 auto_models + external_models
+DROP TABLE IF EXISTS auto_models;             -- 引用 users
+DROP TABLE IF EXISTS semantic_tags;           -- 引用 users
