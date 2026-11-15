@@ -31,11 +31,12 @@ func AttributionProtocols() []string {
 
 // ValidAttributionProtocol 判断协议取值是否合法；空串合法（表示缺失 → 落 NULL）。
 func ValidAttributionProtocol(v string) bool {
-	if strings.TrimSpace(v) == "" {
+	t := strings.TrimSpace(v)
+	if t == "" {
 		return true
 	}
 	for _, p := range AttributionProtocols() {
-		if v == p {
+		if t == p {
 			return true
 		}
 	}

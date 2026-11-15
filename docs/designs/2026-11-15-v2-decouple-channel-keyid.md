@@ -33,9 +33,32 @@
 | 日志面 · `call_logs` 自有列（网关 6 处 + 调用日志装配 2 处） | 8 | **保留不动** | 无：0021 明确保留 `call_logs.channel_id/channel_key_id` |
 | 渠道域自身（`channel/*` 8 处、`tag/store.go` 等） | 18 | 随域整包下线 | 接口整体 410（上一刀已定） |
 
+## 2.5 本批边界（2026-11-15 预审后收敛）
+
+**0021_v2_drop_legacy 摘出本批**，本批迁移只含 `0019 / 0020 / 0022 / 0023`（并且这四个文件与
+`docs/designs/2026-11-15-v2-p1-data-contract.md` 一律取自架构分支，本分支不留副本）。
+新增 `internal/db/migrate_batch_test.go::TestMigrationBatch_V2Phase1` 守住这条边界：
+以后再有人把 0021 塞回来，包级用例立刻红，而不是等有 DSN 的环境才炸。
+
+连带口径修正（**采样方法：`grep -rn` 全仓 .go**）：
+
+| 度量 | 实测 |
+| --- | --- |
+| `channel_key_id` | 135 处 / 48 文件（**非测试 61 处 / 22 文件**） |
+| `tag_id` | 37 处 / 11 文件（**非测试 20 处 / 6 文件**） |
+
+上一轮报的「56 处 / 21 文件」是把「列名 + 少量上下文」当成了全量，低估了一半以上。
+0021 一执行等于**渠道域整体功能下线**（仪表盘、成本页、会话、调用日志、渠道域全挂），
+不是「schema 清理」——这也正是它必须单独成批、且要同时改代码的原因。
+
+**写路径恢复**（重要）：本批不含 0021，`billing_records.channel_key_id` 还在。若这轮就把写入摘掉，
+既有统计/成本页会在这批新数据上丢渠道维度（`billing/stats.go` 的按密钥 TOP 是 INNER JOIN
+`channel_keys`，新行会直接消失；`console/cost.go` 的实体解析会退化成 `channel_id=0`）——那是**改统计口径**。
+所以：**读/过滤**切到 `call_logs` 快照（已证等价），**写**保留；摘写路径与 0021 同批进行。
+
 ## 3. Step 1 改了什么（可合入、行为不变）
 
-1. **写路径**：`billing/service.go` 的 INSERT 列清单与参数去掉 `channel_key_id`（32 → 31 参）。
+1. **写路径**：本批**保留**写 `channel_key_id`（见 §2.5）；摘它随 0021 同批（该改动已在历史提交里备好）。
 2. **读路径**：`recordCols` 去掉该列（25 → 24 列），`sqlScan` 同步；新增 `fillChannelKeys`，
    在 `ListRecords` / 归并列表 / `GetByBillingID` 之后用**一条**批量查询
    `SELECT billing_id, channel_key_id FROM call_logs WHERE billing_id IN (…)` 回填。
@@ -77,6 +100,22 @@
 `billing` / `router` / `identity` / `gateway` / `upstream` / `tag` / `channel` 等全部 ok；
 **只剩 console 的 5 个用例失败，且全部是 `relation "channels" does not exist`（42P01）**——
 即 §2 的 C 类（表已删的展示面），不是列级问题。
+
+### 4.35 止血批（2026-11-15 预审 P0×1 + P1×2 + P2×1）
+
+| 项 | 修复前实测（我自己复跑，不是转述） | 修复后 |
+| --- | --- | --- |
+| P0 0021 在本批 | 带 DSN 实跑：`billing` 2 条红（42703 列不存在 / 写路径撞已删列）、`console` **5 条红（`relation "channels" does not exist` 42P01）**；不设 DSN 时这 7 条全 skip、包级显示 ok（**假绿来源**） | 0021 摘出本批：两个包 + `db` 带 DSN `-count=1` 全绿 |
+| P1 归因枚举报错 → 扣钱不落账 | 变异实测：`plain consume=1`（非事务路径**又扣一次**），事务内也扣过 1 次 → 钱扣了、账单丢了 | 归因非法值**归一**（协议 → NULL、cost_source → none）并 WARN，绝不抛错；`isDeterministicWriteError` 让约束类失败**不回退**非事务路径（断言 `txCalls=1 / plain calls=0`） |
+| P1 跳过被当故障 | 变异实测：`calls=4`（5s/20s/60s 空转 85s），错误被 `Join` 吞成 nil | `backoff.Stop` 终止态：`calls=1`、零退避、整轮全跳过时返回 `*SkipError`（**不是 nil**），日志带 `skipped/total` |
+| P2 `RunOnce` panic | panic 穿透 `Start` goroutine 打挂进程 | `recover` 转 `上游同步轮次 panic: …`（带栈），串行标记照常释放，下一轮可跑 |
+| 空白枚举 | `" openai-chat "` 被判非法（只对空值 trim） | trim 后判合法、并按 trim 后的枚举落库（CHECK 只认枚举本身） |
+
+对应新/改用例：`TestAttributionArgs_Normalization`（含空白与非法值归一）、
+`TestAttribution_RealSchema_WriteAndReadBack`（非法归因**不阻断写入**、trim 后落库）、
+`TestRecord_TxPath_DeterministicInsertError_NoPlainFallback`（资金底线）、
+`TestSyncer_StepSkipIsTerminal_NoRetryNoBackoff`、`TestSyncer_PanicInStepIsRecovered`、
+`backoff.TestDo_StopReturnsImmediately`、`db.TestMigrationBatch_V2Phase1`。
 
 ### 4.4 门禁（未设 DSN 的默认口径）
 

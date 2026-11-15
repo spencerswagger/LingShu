@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"errors"
+	"io"
+	"log/slog"
 	"math"
 	"path/filepath"
 	"regexp"
@@ -12,6 +14,8 @@ import (
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/jackc/pgx/v5/pgconn"
+
 	"github.com/team/llmgateway/internal/pkg/dbx"
 )
 
@@ -198,7 +202,7 @@ func TestRecord_Success(t *testing.T) {
 	// Insert completed（断言关键字段）。
 	mock.ExpectQuery(insertBill.String()).WithArgs(
 		sqlmock.AnyArg(), // id
-		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model",
+		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model", sqlmock.AnyArg(),
 		sqlmock.AnyArg(),                 // session_id
 		sqlmock.AnyArg(),                 // session_name
 		sqlmock.AnyArg(),                 // call_time
@@ -272,7 +276,7 @@ func TestRecord_ConsumeError_RecordsFailed(t *testing.T) {
 	// 失败 → Insert failed；内部错误细节只进日志，落库统一为中文业务文案。
 	mock.ExpectQuery(insertBill.String()).WithArgs(
 		sqlmock.AnyArg(), // id
-		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model",
+		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model", sqlmock.AnyArg(),
 		sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), []byte(`{"time":1,"context":1}`),
 		int64(10000), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
 		sqlmock.AnyArg(), sqlmock.AnyArg(),
@@ -376,7 +380,7 @@ func TestRecord_CostMode_RecordsCostCredits(t *testing.T) {
 	// cost 模式：cost_credits 记录成本积分。
 	mock.ExpectQuery(insertBill.String()).WithArgs(
 		sqlmock.AnyArg(), // id
-		billingID, testUserID, "cost", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model",
+		billingID, testUserID, "cost", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model", sqlmock.AnyArg(),
 		sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), []byte(`{"time":1,"context":1}`),
 		int64(10000), sqlmock.AnyArg(), credits, costCredits,
 		sqlmock.AnyArg(), sqlmock.AnyArg(), "completed", sqlmock.AnyArg(),
@@ -432,7 +436,7 @@ func TestRecord_SaleMode_CostCreditsDistinctFromCredits(t *testing.T) {
 	// sale 模式：credits_consumed 按售价扣，cost_credits 记录成本（与售价不同）。
 	mock.ExpectQuery(insertBill.String()).WithArgs(
 		sqlmock.AnyArg(), // id
-		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model",
+		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model", sqlmock.AnyArg(),
 		sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), []byte(`{"time":1,"context":1}`),
 		int64(10000), sqlmock.AnyArg(), credits, costCredits,
 		sqlmock.AnyArg(), sqlmock.AnyArg(), "completed", sqlmock.AnyArg(),
@@ -575,7 +579,7 @@ func TestSqlStore_Insert_MarshalError(t *testing.T) {
 func txInsertArgs(credits, before, after float64, status string) []driver.Value {
 	return []driver.Value{
 		sqlmock.AnyArg(), // id（应用层雪花 ID）
-		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model",
+		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model", sqlmock.AnyArg(),
 		sqlmock.AnyArg(),                 // session_id
 		sqlmock.AnyArg(),                 // session_name
 		sqlmock.AnyArg(),                 // call_time
@@ -688,8 +692,8 @@ func TestRecord_TxPath_ConsumeError_RollsBackAndRecordsFailed(t *testing.T) {
 	}
 }
 
-// 事务路径账单写入失败：Rollback（扣款一并回滚，余额不变）后回退非事务路径，
-// 由重试队列兜底；本次只应扣款一次（事务内的那次已回滚）。
+// 事务路径账单写入失败（**可重投类**：连接/驱动层错误）：Rollback（扣款一并回滚，余额不变）
+// 后回退非事务路径，由重试队列兜底；本次只应扣款一次（事务内的那次已回滚）。
 func TestRecord_TxPath_InsertFailure_FallsBackToPlain(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
@@ -706,9 +710,9 @@ func TestRecord_TxPath_InsertFailure_FallsBackToPlain(t *testing.T) {
 	before, after := 10.0, 9.7632
 
 	mock.ExpectQuery(selectByBillingID.String()).WithArgs(billingID).WillReturnError(sql.ErrNoRows)
-	// 事务内账单写入失败 → 回滚。
+	// 事务内账单写入失败（驱动层坏连接，属可重投类）→ 回滚。
 	mock.ExpectBegin()
-	mock.ExpectQuery(insertBill.String()).WillReturnError(errors.New("tx insert boom"))
+	mock.ExpectQuery(insertBill.String()).WillReturnError(driver.ErrBadConn)
 	mock.ExpectRollback()
 	// 回退非事务路径：扣款 + 账单 Insert 成功。
 	mock.ExpectQuery(insertBill.String()).WithArgs(txInsertArgs(credits, before, after, "completed")...).
@@ -730,6 +734,48 @@ func TestRecord_TxPath_InsertFailure_FallsBackToPlain(t *testing.T) {
 	}
 	if credit.txCalls != 1 || credit.calls != 1 {
 		t.Fatalf("应事务一次 + 回退一次, tx=%d plain=%d", credit.txCalls, credit.calls)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("mock expectations: %v", err)
+	}
+}
+
+// TestRecord_TxPath_DeterministicInsertError_NoPlainFallback 是预审 P1（资金事故）的回归用例：
+// 账单写入失败属于**确定性**错误（约束冲突/非法值）时，绝不回退到非事务路径——
+// 那条路会先真扣钱、再落库失败，结果是「钱扣了账没落」。断言：只扣一次事务款且整体回滚。
+func TestRecord_TxPath_DeterministicInsertError_NoPlainFallback(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	rec := newRealStoreRecord(billingID) // 复用真库用例的构造器（归因值齐全）
+	checkViolation := &pgconn.PgError{Code: "23514", Message: `new row violates check constraint "billing_records_cost_source_check"`}
+
+	mock.ExpectQuery(selectByBillingID.String()).WithArgs(billingID).WillReturnError(sql.ErrNoRows)
+	mock.ExpectBegin()
+	mock.ExpectQuery(insertBill.String()).WillReturnError(checkViolation)
+	mock.ExpectRollback()
+
+	credit := &fakeCredit{before: 10, after: 9.9999}
+	svc := newTxTestService(db, credit, newFakeConfig(), time.Date(2026, 11, 15, 12, 0, 0, 0, shLocForTest(t)))
+	svc.SetRetryQueue(NewRetryQueue(t.TempDir()+"/retry.json", slog.New(slog.NewTextHandler(io.Discard, nil))))
+
+	_, err = svc.Record(context.Background(), RecordReq{
+		BillingID: rec.BillingID, UserID: rec.UserID, PricingMode: rec.PricingMode,
+		ExternalModel: rec.ExternalModel, InternalModelID: rec.InternalModelID,
+		Tokens: rec.Tokens, Rates: rec.Rates, CallTime: rec.CallTime,
+	})
+	if err == nil {
+		t.Fatal("确定性写入失败应报错（不吞）")
+	}
+	// 资金底线：只发生过一次「事务内扣款」，且**没有**走非事务路径再扣一次。
+	if credit.txCalls != 1 {
+		t.Fatalf("事务内扣款次数=%d, want 1", credit.txCalls)
+	}
+	if credit.calls != 0 || credit.settleCalls != 0 {
+		t.Fatalf("不得回退非事务路径：plain consume=%d plain settle=%d, want 0/0", credit.calls, credit.settleCalls)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("mock expectations: %v", err)
@@ -1220,7 +1266,7 @@ func TestRecord_ModelLevelOverride(t *testing.T) {
 		WillReturnError(sql.ErrNoRows)
 	mock.ExpectQuery(insertBill.String()).WithArgs(
 		sqlmock.AnyArg(), // id
-		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model",
+		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model", sqlmock.AnyArg(),
 		sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), []byte(`{"time":1.5,"context":2}`),
 		int64(10000), sqlmock.AnyArg(), credits, sqlmock.AnyArg(),
 		sqlmock.AnyArg(), sqlmock.AnyArg(), "completed", sqlmock.AnyArg(),
@@ -1274,7 +1320,7 @@ func TestRecord_Dimension(t *testing.T) {
 	// 关键断言：channel_key_id=42，session_id="sess-dim"（auto_model_name 插入后列位后移一位）。
 	mock.ExpectQuery(insertBill.String()).WithArgs(
 		sqlmock.AnyArg(), // id
-		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model",
+		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model", int64(42),
 		"sess-dim",
 		sqlmock.AnyArg(),                 // session_name
 		sqlmock.AnyArg(),                 // call_time
@@ -1308,8 +1354,11 @@ func TestRecord_Dimension(t *testing.T) {
 	if err != nil {
 		t.Fatalf("record: %v", err)
 	}
-	// billing_records 已不再有 channel_key_id（0021 删除）：返回值里的密钥维度来自请求本身，
-	// 持久化只靠 call_logs 的 1:1 快照；会话维度仍落库。
+	// 写路径仍写 channel_key_id（0021 不在本批），读路径已改由 call_logs 快照回填；
+	// 两个维度都要落库/回传。
+	if rec.ChannelKeyID != 42 {
+		t.Fatalf("渠道密钥维度未落库: channel_key_id=%d", rec.ChannelKeyID)
+	}
 	if rec.SessionID != "sess-dim" {
 		t.Fatalf("会话维度未落库: session_id=%q", rec.SessionID)
 	}

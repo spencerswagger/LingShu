@@ -15,6 +15,13 @@
 -- 交错/错位窗口不许写同一行起点（ON CONFLICT (window_start) 只接受整一分钟），
 -- 「断言进库里」比写在文档里可靠。
 --
+-- ── 已知边界：本表的 CREATE 是 IF NOT EXISTS（会被同名旧表整段跳过）──────
+--    若同名的旧表（旧分支遗留）已存在，本句**整段跳过且不报错**：新列 / PK / 60s CHECK 全缺，
+--    直到首次写窗口才炸（实测：column "local_count" does not exist；只写两键时
+--    ON CONFLICT (window_start) 报 no unique or exclusion constraint matching ...，旧表 PK 是 id）。
+--    防线因此放在**执行前的探测**（定稿文档 §5.1 ③ 看形状、④ 按记录反查对象），不在本文件。
+--    是否在本文件里插「形状断言（DO 块）」待负责人确认，草案见定稿文档 §15；未确认前不插入。
+--
 -- 幂等：IF NOT EXISTS；写入用 ON CONFLICT (window_start) DO UPDATE。
 -- 可回滚：DROP 表（纯派生数据，回滚无损失）。
 

@@ -21,6 +21,11 @@
 
 主库实测：`origin/main` 最大迁移是 `0018_call_logs_req_params.sql`。所以 0019 起号与主线**不撞号**（旧分支的 `0019_v2_facade.sql` / `0020_reconcile_blocked_status.sql` 未合入，作废、不 cherry-pick）。
 
+> **唯一来源（合并冲突按这条裁）**：0019–0023 五个迁移文件与本文的**唯一来源是本分支 `docs/lingshu-v2-p1-data-contract`**。
+> 代码分支 `feat/lingshu-v2-sync-config` 里那份同名副本是早期 cherry-pick 的旧版（文件头探测还是裸条件，会永远误报），
+> `git merge-tree` 实测三处 add/add 冲突。合并时以本分支为准、整份丢弃另一份：
+> `git checkout origin/docs/lingshu-v2-p1-data-contract -- backend/internal/db/migrations/00{19,20,21,22,23}_*.sql docs/designs/2026-11-15-v2-p1-data-contract.md`
+
 注意区分两件事：**编号不冲突 ≠ 幂等键安全**。`migrate.go` 的幂等键是**文件名**（`applied_migrations.name`），所以真正的风险是：① 同名不同内容 → 静默跳过、schema 缺列不报错；② 同编号不同名（旧分支）→ 两条都执行、DDL 撞车。执行前两条查询必做（§5 步骤 0）。
 
 | 编号 | 文件（`backend/internal/db/migrations/`） | 一句话职责 | 可回滚 | 幂等写法 |
@@ -206,7 +211,7 @@ pg_restore -d $SRC_DB --no-owner --no-privileges -j4 "$BK"   # 行数应与 befo
 
 ---
 
-## 5 0021 三步证据流程（可直接照抄）
+## 5 0021 执行手册（探测 → 状态矩阵 → 证据 → 判定）
 
 > 执行人：持有宿主 PG 的人（spencer / hugo）。**沙盒内 PG 拒连**（实测 `127.0.0.1:5432` Connection refused），且 `lingshu_dev` 无 `CREATEDB`（2026-11-10 实测），临时库必须由有权限的角色建。
 >
@@ -214,7 +219,152 @@ pg_restore -d $SRC_DB --no-owner --no-privileges -j4 "$BK"   # 行数应与 befo
 > **演练环境 ≠ 生产**：演练源库是按迁移脚本重建 + 合成造数的**等价物**，真实 `migrate.go` 触发路径（服务启动时自动迁移）未在演练中验证；
 > 正式执行必须在**有真实数据的宿主**上按同一脚本重跑，演练的行数/耗时数字不代表生产。
 
-先落两个 SQL 文件（动态精确计数：不写死表名，表多表少都对）：
+### 5.1 执行前探测：三条 SQL，缺一不可（**不能只信 `applied_migrations`**）
+
+实测背景（测试环境用真实提交复跑）：三个旧分支的 `0019_v2_facade.sql` 逐字节相同（sha256 `23ddc9d2…`，4930 B）。在一个**跑过旧分支**的库上执行本版 0019–0023，**五个文件逐条 `exit 0`、`applied_migrations` 记到 0023、零报错**，但库是坏的：
+
+- `reconcile_windows` 被 `CREATE TABLE IF NOT EXISTS` 整段跳过（新列 / PK / 60s CHECK 全缺），与干净基线差 **96 行**；
+- 旧表 `magpie_keys` + 4 个旧列 + 2 个旧索引遗留；
+- 第一次写窗口才炸：`column "local_count" does not exist`；只写两键时 `ON CONFLICT (window_start)` 报 `no unique or exclusion constraint matching the ON CONFLICT specification`（旧表主键是 `id`）。
+
+⇒ 记录表记的是「**文件跑过**」，不是「**对象建对**」。**四条**探测缺一不可：
+
+```bash
+cat > probe-1-record.sql <<'SQL'
+-- ① 记录层：0019+ 的记录里，除本版五个文件名之外的任何一条都算旧分支污染。
+--    注意不要写 name >= '0019' 裸条件 —— 本版跑完后它永远非空，会每次都误报。
+-- 区间必须**有右界**（name < '0024'）：将来加 0024 后裸 >= 会自己误报
+SELECT name FROM applied_migrations
+WHERE name >= '0019' AND name < '0024'
+  AND name NOT IN ('0019_v2_topology.sql','0020_v2_billing_attribution.sql',
+                   '0021_v2_drop_legacy.sql','0022_v2_ledger.sql','0023_v2_reconcile.sql')
+ORDER BY name;
+SQL
+cat > probe-2-object.sql <<'SQL'
+-- ② 对象层：旧分支独有对象（表 / 列）。这些名字只是技术探测串，不得出现在任何界面文案里。
+SELECT 'magpie_keys' AS legacy_object WHERE to_regclass('public.magpie_keys') IS NOT NULL
+UNION ALL
+SELECT c.table_name || '.' || c.column_name
+FROM information_schema.columns c
+WHERE c.table_schema = 'public'
+  AND (c.table_name, c.column_name) IN
+      (('external_models','magpie_model'), ('billing_records','magpie_key_name'),
+       ('billing_records','estimated'),    ('billing_records','upstream_usage'));
+SQL
+cat > probe-3-shape.sql <<'SQL'
+-- ③ 形状层：窗口表列清单（0 行 = 尚未建，正常；非空则必须十列齐全）
+SELECT column_name FROM information_schema.columns
+WHERE table_schema = 'public' AND table_name = 'reconcile_windows'
+ORDER BY 1;
+SQL
+cat > probe-4-objects-by-record.sql <<'SQL'
+-- ④ 反查：按「已记文件名 → 它该建的对象」核对对象**真的存在**。
+--    专治 S4（记录在、对象缺）：这种库里 ①②③ 全 0 行，判不出任何异常，
+--    执行后五个文件逐条 exit 0、零报错，但一个对象都没建。
+--    对「同名不同内容」同样有效：0019/0020/0022 的对象形状，①②③ 完全没有信号。
+WITH want(file, kind, obj) AS (VALUES
+    ('0019_v2_topology.sql',           'table', 'internal_models'),
+    ('0019_v2_topology.sql',           'table', 'model_links'),
+    ('0019_v2_topology.sql',           'table', 'subscriptions'),
+    ('0019_v2_topology.sql',           'column','external_models.bound_internal_ref'),
+    ('0020_v2_billing_attribution.sql','column','billing_records.upstream_provider'),
+    ('0020_v2_billing_attribution.sql','column','billing_records.cost_source'),
+    ('0022_v2_ledger.sql',             'table', 'ledger_entries'),
+    ('0022_v2_ledger.sql',             'table', 'credit_holds'),
+    ('0023_v2_reconcile.sql',          'table', 'reconcile_windows'),
+    ('0021_v2_drop_legacy.sql',        'gone',  'channels'),
+    ('0021_v2_drop_legacy.sql',        'gone',  'channel_keys'),
+    ('0021_v2_drop_legacy.sql',        'gone',  'semantic_tags')
+), rec AS (
+    SELECT name FROM applied_migrations
+    WHERE name IN ('0019_v2_topology.sql','0020_v2_billing_attribution.sql',
+                   '0021_v2_drop_legacy.sql','0022_v2_ledger.sql','0023_v2_reconcile.sql')
+)
+SELECT w.file || ' → ' || w.obj || '（' || w.kind || '）' AS suspicious
+FROM want w JOIN rec ON rec.name = w.file
+WHERE CASE w.kind
+        WHEN 'table' THEN to_regclass('public.' || w.obj) IS NULL
+        WHEN 'gone'  THEN to_regclass('public.' || w.obj) IS NOT NULL
+        ELSE NOT EXISTS (
+            SELECT 1 FROM information_schema.columns ic
+            WHERE ic.table_schema = 'public'
+              AND ic.table_name   = split_part(w.obj, '.', 1)
+              AND ic.column_name  = split_part(w.obj, '.', 2))
+      END
+ORDER BY 1;
+SQL
+```
+
+判定：① 0 行 + ② 0 行 + ③ 空 + **④ 0 行** → 干净（S0，可执行）；③ 非空但缺 `local_count` → **一定被跳过**（旧分支遗留或历史手工建表）；③ 十列齐全但 ①/② 非空 → 功能可用、schema 不干净；**④ 非空 → 记录说建过、对象却不在（S4）或对象形状不符（同名异内容）**，两条都按 §5.2 处置。
+
+**为什么必须四条**：S4（记录在、对象缺）这种库里 ①②③ 恰好全是 0 行 —— 旧写法「S4 靠 ①+② 组合判」是错的，这两格在 S4 都给不出任何信号；只有 ④ 能判。
+
+可选补充（键约束确认）：
+
+```sql
+SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint
+WHERE conrelid = to_regclass('public.reconcile_windows') AND contype IN ('p','u','c');
+```
+期望看到 `PRIMARY KEY (window_start)` 与含 `60 seconds` 的 CHECK。
+
+### 5.2 宿主状态矩阵（S0–S5）与处置
+
+| 状态 | ① 记录层 | ② 对象层 | ③ 形状层 | ④ 反查（记录→对象） | 含义 | 处置 |
+|---|---|---|---|---|---|---|
+| **S0** | 0 行 | 0 行 | 空 / 正形状 | **0 行** | 干净（含全新库） | 直接执行 |
+| **S1** | 命中 `0019_v2_facade.sql` | 有残留 | 旧形状 | 有输出 | 跑过旧 0019 | **不可直接继续** → R-1 或 R-2 |
+| **S2** | 同上 + `0020_reconcile_blocked_status.sql` | 有残留 | 旧形状 | 有输出 | 跑过旧 0019+0020 | 同上 |
+| **S3** | 0 行（记录被手工删过） | 有残留 | 旧形状 | 0 行（没记录就没得反查） | 记录与对象脱节 | **以对象层为准** → R-2 |
+| **S4** | 0 行（本版五个文件名被排除） | 0 行 | 0 行 | **有输出** | 记录在、对象缺 | **R-2**（实测：清记录后重跑，三个对象全部建出） |
+| **S5** | 0 行 | 0 行 | 正形状 | 有输出 | 记录在、对象**形状**不符（同名异内容） | **R-2** |
+
+> **S4/S5 只有 ④ 能给信号**：这个库里 ①②③ 全是 0 行，旧写法「S4 靠 ①+② 组合判」判不出来。
+> **不要徒手补 DDL**：手工建的对象与迁移文件长期脱节，下次真实迁移里 `IF NOT EXISTS` 又会静默跳过。
+> 「重跑无效」只对**不清记录的 naive 重跑**成立；R-2 自带 `DELETE`，所以重跑是有效的（实测）。
+
+**R-1（应急：只修窗口表；实测可用，但 schema 不干净）**
+
+```bash
+psql -d $DB -c "\copy (SELECT * FROM reconcile_windows) TO 'reconcile_windows_old.csv' CSV HEADER"
+psql -d $DB -1 -v ON_ERROR_STOP=1 -c "DROP TABLE IF EXISTS reconcile_windows; DELETE FROM applied_migrations WHERE name = '0023_v2_reconcile.sql';"
+# 再重跑迁移（只补 0023）
+```
+结果：窗口表可写；`magpie_keys` 与 4 个旧列仍在，与干净基线仍有差异。
+
+**R-2（回干净基线；实测 schema 与干净基线 0 差异）**
+
+```bash
+# 前置：表存在才导数据（S4 库里这些表可能压根不存在，\copy 会失败）
+psql -d $DB -tAc "SELECT to_regclass('public.magpie_keys'), to_regclass('public.reconcile_windows')"
+# 存在哪个就导哪个，例如：
+psql -d $DB -c "\copy (SELECT * FROM reconcile_windows) TO 'reconcile_windows_old.csv' CSV HEADER"
+
+cat > r2.sql <<'SQL'
+DROP TABLE IF EXISTS magpie_keys;        -- 旧分支残留（S1/S2/S3）
+DROP TABLE IF EXISTS reconcile_windows;  -- 旧形状或坏形状
+ALTER TABLE external_models DROP COLUMN IF EXISTS magpie_model;
+ALTER TABLE billing_records  DROP COLUMN IF EXISTS magpie_key_name,
+                             DROP COLUMN IF EXISTS estimated,
+                             DROP COLUMN IF EXISTS upstream_usage;
+-- 故意的：只清记录，让 0019–0023 整套重跑。已建对的走 IF NOT EXISTS 是 no-op；
+-- 被 DROP / 从来没建的 reconcile_windows 会按新形状真正建出来（S4 修复的关键）。
+-- ⚠️ 必须逐条列出、写死区间，**不许** name >= '0019'：0024 落地后那条会把 0024 记录一起删掉，
+--    导致下次迁移把 0024 当未执行重跑（虽然幂等，但记录语义已乱）。
+DELETE FROM applied_migrations WHERE name IN (
+    '0019_v2_topology.sql','0020_v2_billing_attribution.sql','0021_v2_drop_legacy.sql',
+    '0022_v2_ledger.sql','0023_v2_reconcile.sql',
+    '0019_v2_facade.sql','0020_reconcile_blocked_status.sql'   -- 旧分支记录，一并清
+);
+SQL
+psql -d $DB -X -1 -v ON_ERROR_STOP=1 -f r2.sql
+# 再重跑迁移，然后复验 §5.1 **四条**探测 + schema diff（1030 行 0 差异）
+```
+
+**R-2 覆盖 S4 的实测依据**：S4 库里执行同一份 `DELETE` 后重跑，`internal_models` / `ledger_entries` / `reconcile_windows` 三个对象全部建出。所以 §5.2 把 S4 的处置从「人工补 DDL」改成 R-2 —— 徒手补 DDL 只在「不想清记录」时才有诱惑，而它会造成手工 DDL 与迁移文件长期不一致。
+
+### 5.3 三步证据（脚本）
+
+先落两个计数 SQL 文件（动态精确计数：不写死表名，表多表少都对）：
 
 ```bash
 mkdir -p ./backup
@@ -250,17 +400,13 @@ STAMP=$(date +%Y%m%dT%H%M%S)
 BK=./backup/${SRC_DB}-${STAMP}.dump
 TMP_DB=lingshu_verify_${STAMP}
 
-# ── 步骤 0：执行前核对（幂等键是「文件名」，不是编号！）──
-#   migrate.go 用文件名做幂等键：**同名不同内容 → 静默跳过**（schema 缺列且不报错）；
-#   **同编号不同名**（旧分支的 0019_v2_facade.sql）→ 两条都执行 → DDL 直接撞车。
-#   远端目前仍有 3 个旧 v2 分支带 0019_v2_facade.sql，其中一个还带 0020_reconcile_blocked_status.sql。
-psql -d $SRC_DB -tAc "SELECT name FROM applied_migrations ORDER BY name DESC LIMIT 1"
-# 期望：0018_call_logs_req_params.sql
-
-psql -d $SRC_DB -tAc "SELECT name FROM applied_migrations WHERE name >= '0019' ORDER BY name"
-# 期望：0 行。
-# 有行 = 这个库被旧分支迁移过。库里**不存校验和**，无法证明「同名即同内容」→ 停手，
-# 逐个人工比对（git diff origin/main:<file> 与当时的旧分支 blob），对不上就不许执行。
+# ── 步骤 0：执行前探测（**四条**，缺一不可；见 §5.1）──────
+#   只信 applied_migrations 会漏：它记的是「文件跑过」，不是「对象建对」。
+psql -d $SRC_DB -tA -f probe-1-record.sql   # 期望 0 行（区间有右界，不受将来 0024 影响）
+psql -d $SRC_DB -tA -f probe-2-object.sql   # 期望 0 行
+psql -d $SRC_DB -tA -f probe-3-shape.sql    # 期望 0 行 或 十列齐全（缺 local_count 即被跳过）
+psql -d $SRC_DB -tA -f probe-4-objects-by-record.sql   # 期望 0 行（非空 = S4 或同名异内容）
+# 任一条不符 → 按 §5.2 矩阵判状态，S1–S4 一律走 R-1 或 R-2（S4 也走 R-2）；都不许直接执行。
 
 # ── 步骤 1：备份（自定义格式，带 CRC）─────────────
 pg_dump -Fc -Z6 -f "$BK" "$SRC_DB"; echo "dump_exit=$?"
@@ -293,9 +439,9 @@ SELECT string_agg(t, ',') FROM unnest(ARRAY[
 WHERE to_regclass(t) IS NOT NULL"
 ```
 
-**要留的产物**：`*.dump`（文件名 + 大小 + sha256）、`before-all.txt` / `restored-all.txt` / `before-retained.txt` / `after-retained.txt`、三条命令退出码、3d 的空输出；再加「步骤 0 两条查询」的输出（证明这个库没被旧分支碰过）。全部贴进 PR 描述。
+**要留的产物**：`*.dump`（文件名 + 大小 + sha256）、`before-all.txt` / `restored-all.txt` / `before-retained.txt` / `after-retained.txt`、三条命令退出码、3d 的空输出；再加**步骤 0 四条探测**的输出（证明这个库既没被旧分支碰过、对象也确实建对了）+ 判定出的状态码（S0–S5）。全部贴进 PR 描述。
 
-**失败即中止的判定点**：
+### 5.4 判定点（任一命中即中止）
 
 | 点 | 条件 | 动作 |
 |---|---|---|
@@ -304,6 +450,18 @@ WHERE to_regclass(t) IS NOT NULL"
 | C | `RETAINED-OK` 不成立（保留表行数变少） | **立即中止**；若已 commit，用 §4.4 的整库还原 |
 | D | 3d 有输出（表还在） | 迁移未生效或部分执行 → 查 `applied_migrations` 后重跑 |
 | E | **负向对照**：在 0021 末尾注入 `SELECT 1/0` 后执行 | 整份事务回滚、表与列原样（已实测）→ 证明「跑一半能自动回滚」不是推断 |
+
+### 5.5 执行方式与比对口径（三条实测坑，写进手册别只写「用 psql 执行」）
+
+| 坑 | 事实 | 正确做法 |
+|---|---|---|
+| `psql -f` 静默成功 | 不加 `ON_ERROR_STOP` 时语句出错仍 **exit 0**，出错前的语句已各自提交 → 半套状态 | 必须带 `-v ON_ERROR_STOP=1` |
+| 只加 `ON_ERROR_STOP` 仍半套 | 出错 **exit 3**，但出错前语句已落库（自动提交）→ 仍是半套 | 必须同时带 `-1`（单事务） |
+| `-1` + `ON_ERROR_STOP=1` | 与 `migrate.go` 的「每文件一个事务」等价；实测逐文件 `psql -1` 路径 910 ms | `psql -X -1 -v ON_ERROR_STOP=1 -f 0019_v2_topology.sql`（五个文件逐个跑） |
+
+- **生产走真实执行器**：`server -migrate-only`（24 个迁移 289 ms，实测）。两条路径的 `pg_dump -s` 均 1030 行、**0 差异**，所以演练用 psql 路径是可信的。
+- **schema diff 前必须先过滤 `\restrict`**：`pg_dump -s` 在 17.11 会写随机 `\restrict` / `\unrestrict` 行，直接 `diff` 必误报。
+  `pg_dump -s db | grep -vE '^\\(un)?restrict' | sort > schema.txt`，两边同样过滤后再比。
 
 ---
 
@@ -455,10 +613,13 @@ CREATE INDEX IF NOT EXISTS idx_ledger_entries_account
 
 本轮（交付轮）**未新增冲突**：A / E / F 三条仍待负责人拍板；Core 的 `feat/lingshu-v2-sync-config` 已把基址/超时/降级放进 `sys_configs`、密钥一律不进 —— 与 E 的处置一致，口径无偏离。
 
-按测试实测**修订两条**（原表述作废，以本节后文 §4/§5 为准）：
+按测试实测**修订五条**（原表述作废，以本节后文 §4/§5 为准）：
 
 - **退役表是 10 张，不是 11 张**：`channel_events` 在 `0009_drop_channel_state.sql` 已被删除，0021 里那条是空操作。
-- **撞号的真实风险是「文件名幂等键」，不是 DDL 冲突**：同名异内容会被静默跳过（缺列不报错），同编号异名会两条都执行。执行前必须核对 `applied_migrations`（§5 步骤 0）。
+- **撞号的真实风险是「文件名幂等键」，不是 DDL 冲突**：同名异内容会被静默跳过（缺列不报错），同编号异名会两条都执行。执行前必须核对 `applied_migrations`（§5.3 步骤 0）。
+- **同编号异名在真实旧库上是「静默损坏」，不是报错**：实测五个文件逐条 exit 0、记录记到 0023，而 `reconcile_windows` 被 `CREATE TABLE IF NOT EXISTS` 整段跳过（缺列/PK/CHECK），直到首次写窗口才炸。⇒ 执行前探测改成**记录层 + 对象层 + 形状层三条**（§5.1），宿主状态按 **S0–S5** 处置（§5.2）；手工执行必须 `psql -1 -v ON_ERROR_STOP=1`（§5.5）。迁移文件本身不改（`IF NOT EXISTS` 语义如此），防线在探测。
+- **S4（记录在、对象缺）用前三条判不出来，且原处置是错的**：这种库里 ①②③ **全是 0 行**，会被判成 S0，执行后五个文件逐条 exit 0、零报错，而 `internal_models`/`ledger_entries`/`reconcile_windows` 一个都没建。修正：加**第 ④ 条探测「按已记文件名反查其对象」**（§5.1，对「同名异内容」同样有效）；S4 处置改为 **R-2** —— 实测同一库 `DELETE` 记录后重跑，三个对象全部建出，「重跑无效」只对不清记录的 naive 重跑成立。手册里的「徒手补 DDL」已**删除**（会造成手工 DDL 与迁移文件长期不一致）。
+- **区间必须带右界、唯一来源只能一份**：探测① 与 R-2 的 `>= '0019'` 在 0024 落地后会误报/误删记录 → 改成 `name < '0024'` 与**逐条列名**；0024 已定稿（§16）。另：迁移与本文的**唯一来源是本分支**，`feat/lingshu-v2-sync-config` 里那份同名副本是旧版（探测还是裸条件），合并时整份丢弃（见 §0 声明）。
 
 ---
 
@@ -491,6 +652,7 @@ CREATE INDEX IF NOT EXISTS idx_ledger_entries_account
 
 > 注意：PG 不支持 `ADD CONSTRAINT IF NOT EXISTS`，所以 0020 的枚举约束用 `DO $$ … pg_constraint …$$` 包一层保证幂等；
 > 其余全部 `IF NOT EXISTS` / `ADD COLUMN IF NOT EXISTS`。
+> 本附录与仓库里的五个实体文件一致；§15 的「形状断言」尚未落地，未批准前不要手工加进来。
 
 ### 0019_v2_topology.sql
 
@@ -657,3 +819,99 @@ CREATE TABLE IF NOT EXISTS reconcile_windows (
 );
 CREATE INDEX IF NOT EXISTS idx_reconcile_status ON reconcile_windows(status, window_start DESC);
 ```
+
+---
+
+## 15 待负责人确认：0023 是否加「形状断言」（评估 + DDL 草案）
+
+**结论：建议加；只加断言，不动任何 `CREATE` 语义。**
+
+理由（三条，都对着实测）：
+
+1. 被跳过的失败点落在「首次写窗口」，可能离迁移几小时到几天，报错还是 `column "local_count" does not exist` 这种与病因无关的文案；断言把它提前到迁移当场，并直接点出处置入口。
+2. 断言只读元数据（`to_regclass` + `information_schema.columns` + `pg_constraint`），**不依赖 `applied_migrations` 是否存在** → `TestMigrate_FullChain`（直接按文件名执行 SQL、可能不建追踪表）路径安全：全新库里表不存在 → 直接 `RETURN` → 正常建表。
+3. 幂等重跑不误伤：在册文件不会重跑；即便手工重跑，判定用「**必要列是超集**」而非「列集合完全相等」，将来 0024 给窗口表加列也不会打红。
+
+两个刻意的不做：
+
+- **不校验 60s CHECK**：`pg_constraint` 只能靠 `pg_get_constraintdef` 文本匹配，换个写法就误报；「十列齐全 + `window_start` 单列唯一约束」已足以识别旧形状（旧表主键是 `id`）。
+- **不探测 `magpie_keys` 等旧对象**：那属于「schema 不干净」而非功能故障；把旧对象名写进迁移代码不值得，探测留在执行手册 §5.1 ②。
+
+残余风险（说清）：只能拦「0023 执行这一刻表已存在但形状不对」（S1/S2/S3/S5）；
+**S4（记录在、对象缺）它拦不住**——表不存在时断言按设计直接放行（否则全新库装不了）。
+S4 的防线是 §5.1 **第 ④ 条探测**（按已记文件名反查对象），不是这条断言。
+
+**DDL 草案 v2**（插在 0023 的 `CREATE TABLE IF NOT EXISTS reconcile_windows` **之前**）。
+
+v1 草案有一个实测误报：列检查用 `current_schema()`、PK 检查用 `'reconcile_windows'::regclass`，**两套 schema 解析口径**。
+当 `search_path=app,public` 而表只在 `public` 时，`current_schema()` 返回 `app` → 列查询 0 行 → 误报「缺十列」。
+v2 改成：**开头只解析一次 `v_oid regclass`，后面列检查与约束检查全部挂在 `v_oid` 上**，不再出现任何 schema 字符串。
+
+```sql
+DO $$
+DECLARE
+    v_oid   regclass := to_regclass('reconcile_windows');  -- 唯一一次 schema 解析（跟着 search_path 走）
+    missing text;
+BEGIN
+    -- 表不存在 = 干净库（含全新安装 / 迁移测试），直接放行
+    IF v_oid IS NULL THEN
+        RETURN;
+    END IF;
+
+    -- 必要列（超集判定：多余列不算错，缺列才算）；用 pg_attribute 而不是 information_schema
+    SELECT string_agg(t.col, ', ' ORDER BY t.col) INTO missing
+    FROM unnest(ARRAY['window_start','window_end','local_count','upstream_count',
+                      'local_tokens','upstream_tokens','status','alarm_streak',
+                      'detail','checked_at']) AS t(col)
+    WHERE NOT EXISTS (
+        SELECT 1 FROM pg_attribute a
+        WHERE a.attrelid = v_oid
+          AND a.attname  = t.col
+          AND a.attnum > 0
+          AND NOT a.attisdropped
+    );
+    IF missing IS NOT NULL THEN
+        RAISE EXCEPTION '0023 形状校验失败：reconcile_windows 已存在但缺列 [%]。'
+            '这是「同名旧表 + CREATE TABLE IF NOT EXISTS 整段跳过」造成的，不是本次迁移写错；'
+            '停手，按设计文档 §5.2 的 R-2 处置后再执行。', missing;
+    END IF;
+
+    -- ON CONFLICT (window_start) 的前置条件：window_start 上有单列主键/唯一约束
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint p
+        WHERE p.conrelid = v_oid
+          AND p.contype IN ('p','u')
+          AND array_length(p.conkey, 1) = 1
+          AND p.conkey[1] = (SELECT a.attnum FROM pg_attribute a
+                             WHERE a.attrelid = v_oid
+                               AND a.attname  = 'window_start'
+                               AND NOT a.attisdropped)
+    ) THEN
+        RAISE EXCEPTION '0023 形状校验失败：reconcile_windows 的 window_start 上没有主键/唯一约束，'
+            '首次写入会报 no unique or exclusion constraint matching the ON CONFLICT specification。'
+            '按设计文档 §5.2 的 R-2 处置后再执行。';
+    END IF;
+END $$;
+```
+
+已实测的五种场景（v2 口径）：**全新库放行 / 正形状放行 / 缺列报错 / PK 在 `id` 上报错 / 复合唯一不含 `window_start` 报错**；
+`search_path=app,public` + 表只在 `public` 的场景不再误报。
+
+若负责人点头，落地要求：
+
+- 只动 `0023_v2_reconcile.sql`（文件头说明 + 这段 `DO` 块），**`CREATE` / `INDEX` 语句逐字不动** → 不算语义变更。
+- 必须补两条用例：① 先按旧形状建表（缺 `local_count`、PK 在 `id`）→ 执行 0023 必须报错且消息含「形状校验失败」；② 全新库执行 0023 → 正常建表（`TestMigrate_FullChain` 已覆盖这条路径）。
+- 报错文案不出现第三方产品名：只说「同名旧表」，具体是谁由执行手册 §5.1 ② 定位。
+- **断言不能替代 §5.1 第 ④ 条探测**：S4（记录在、对象缺）时表不存在，断言按设计放行。两者互补，缺一不可。
+
+---
+
+## 16 令牌模型范围与会话归属（0024 预告，全文见另一文档）
+
+被 0021 删掉的两列决定路由行为，不能只删；替代模型已单独定稿：
+`docs/designs/2026-11-15-v2-token-scope-session-owner.md`。结论三行：
+
+1. **准入**：`tokens.model_scope ∈ {ALL, LIST}` + 新表 `token_models(token_id, external_model_id)`，`LIST` 空表 = 全禁（fail-closed）；旧 tag 的 KV 匹配语义不保留（能力收缩，待点头）。
+2. **归属**：`sessions` **不补** provider/account 列；会话归属一律按 `billing_records` 的 `upstream_*`（`idx_billing_session` 已在 0001），`sessions.internal_model_id` 降级为绑定结果快照，禁止用于归属聚合。
+3. **落位**：新开 **`0024_v2_token_scope.sql`**（纯 ADD），**不改 0019–0023** —— 已执行过的迁移文件改内容会命中「同名异内容静默跳过」（§5.1）；0024 只引用 `tokens` / `external_models`，与 0021 无依赖，排第 6 位安全。本文件编号 0024 为预留，**尚未落地**（等派工）。
+

@@ -3,6 +3,7 @@ package billing
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/team/llmgateway/internal/pkg/dbx"
 	"github.com/team/llmgateway/internal/pkg/idgen"
@@ -415,7 +418,16 @@ func (s *Service) settleTx(ctx context.Context, rec *Record, req RecordReq, cred
 			}
 			return nil, ierr, true
 		}
-		// 真实写入失败：本次扣款已回滚（余额不变），退回非事务路径重试；其失败由重试队列兜底。
+		// 非「可重投」类写入失败（约束/非法值等确定性错误）：事务已回滚、余额不变，
+		// **不许**退回非事务路径——那条路会先真扣钱再落库，一失败就变成「钱扣了账没落」。
+		// 交回调用方按失败处理（含重试队列），不再二次扣款。
+		if isDeterministicWriteError(ierr) {
+			slog.ErrorContext(ctx, "billing insert rejected, no retry on non-transactional path",
+				"billing_id", rec.BillingID, "user_id", rec.UserID, "err", ierr)
+			return nil, ierr, true
+		}
+		// 其它写入失败（连接/超时等）：本次扣款已回滚（余额不变），退回非事务路径重试；
+		// 其失败由重试队列兜底。
 		return nil, ierr, false
 	}
 	if cerr := tx.Commit(); cerr != nil {
@@ -423,6 +435,33 @@ func (s *Service) settleTx(ctx context.Context, rec *Record, req RecordReq, cred
 		return nil, fmt.Errorf("commit billing tx: %w", cerr), true
 	}
 	return rec, nil, true
+}
+
+// isDeterministicWriteError 判断账单写入失败是否属于「重投也没用」的确定性错误：
+// 约束冲突（23514 CHECK / 23503 外键 / 23502 NOT NULL / 22xxx 数据类型）与一切非连接类错误。
+//
+// 为什么单独判：事务路径回滚后有一条「退回非事务路径」的保底，那条路会**重新扣一次钱**。
+// 对确定性错误重投必然再失败，等于把「扣了钱没账单」做实（预审 P1 资金事故）。
+func isDeterministicWriteError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// 连接类（可重投）：坏连接 / 连接已关 / 上下文取消超时 / PG 的 08 连接异常、57 运维中断、53 资源不足。
+	if errors.Is(err, driver.ErrBadConn) || errors.Is(err, sql.ErrConnDone) ||
+		errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		switch {
+		case strings.HasPrefix(pgErr.Code, "08"),
+			strings.HasPrefix(pgErr.Code, "57"),
+			strings.HasPrefix(pgErr.Code, "53"):
+			return false
+		}
+	}
+	// 其余（约束冲突 23xxx、数据异常 22xxx、编码/参数/校验类）：确定性错误，重投必然再失败。
+	return true
 }
 
 // settlePlain 非事务路径（txdb 未注入）：扣款与落库独立执行，语义与历史行为一致。
@@ -936,9 +975,10 @@ func (s *SqlStore) SetConfigWriteHook(fn func()) {
 
 // recordCols 查询 billing_records 使用的全部列。
 //
-// ⚠️ 这里**不再有 channel_key_id**：0021_v2_drop_legacy 会删掉该列，读取它等于把查询绑在
-// 一张即将消失的列上（全量迁移后 42703）。维度改从 call_logs.channel_key_id 取
-// （call_logs 与账单按 billing_id 1:1，且该列由 0021 明确保留），见 fillChannelKeys。
+// ⚠️ 这里**不再有 channel_key_id**：读路径已改从 call_logs.channel_key_id 取
+// （call_logs 与账单按 billing_id 1:1，该列在 0021 之后仍保留），见 fillChannelKeys。
+// 写路径**仍写**该列：0021_v2_drop_legacy 不在本批（见迁移目录），列还在时若不写，
+// 既有统计/成本页会在这批新数据上丢渠道维度（=改统计口径）。摘写路径随 0021 同批进行。
 const recordCols = `id, billing_id, user_id, pricing_mode, token_id, external_model_name,
 	auto_model_name, internal_model_id, session_id, session_name, call_time, tokens, rates, coefficients, r_value,
 	raw_total, credits_consumed, cost_credits, balance_before, balance_after, status, error_message, duration_ms, first_token_ms`
@@ -1024,11 +1064,16 @@ func (s *SqlStore) insertOn(ctx context.Context, ex dbx.Execer, rec *Record) (*R
 	}
 	durationMs := nullableInt64For(rec.DurationMs)
 	firstTokenMs := nullableInt64For(rec.FirstTokenMs)
-	// V2 归因七列：校验后按 NULL/none 归一（非法取值在写库前就报错，不留到 CHECK 约束里）。
-	attr, err := attributionArgs(rec)
-	if err != nil {
-		return nil, err
+	// 未进入渠道的拒绝类账单 channel_key_id 为 0 → 写 NULL（列可空，0 不满足外键）。
+	// ⚠️ 0021_v2_drop_legacy 一落地本列就会被删；摘写路径随 0021 同批（见 recordCols 的注释）。
+	var channelKeyID any
+	if rec.ChannelKeyID > 0 {
+		channelKeyID = rec.ChannelKeyID
 	}
+
+	// V2 归因七列：写库前归一（非法协议 → NULL、非法 cost_source → none + WARN）。
+	// 归因是解释性字段，**不许**因为它的取值问题让账单写不进去（会让扣款与落账不一致）。
+	attr := attributionArgs(ctx, rec)
 
 	var created time.Time
 	if rec.ID == 0 {
@@ -1036,15 +1081,15 @@ func (s *SqlStore) insertOn(ctx context.Context, ex dbx.Execer, rec *Record) (*R
 	}
 	err = ex.QueryRowContext(ctx,
 		`INSERT INTO billing_records(id, billing_id, user_id, pricing_mode, token_id, external_model_name,
-			auto_model_name, internal_model_id, session_id, session_name, call_time, tokens, rates, coefficients, r_value,
+			auto_model_name, internal_model_id, channel_key_id, session_id, session_name, call_time, tokens, rates, coefficients, r_value,
 			raw_total, credits_consumed, cost_credits, balance_before, balance_after, status, error_message, duration_ms, first_token_ms,
 			request_id, upstream_provider, upstream_account, upstream_protocol, upstream_model, ledger_entry_id, cost_source)
-		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,
-			$25,$26,$27,$28,$29,$30,$31)
+		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,
+			$26,$27,$28,$29,$30,$31,$32)
 		 RETURNING id, created_at`,
 		append([]any{
 			rec.ID, rec.BillingID, rec.UserID, rec.PricingMode, tokenID, rec.ExternalModel, autoModelName,
-			rec.InternalModelID, sessionID, sessionName, rec.CallTime, tokensRaw, ratesRaw, coeffRaw,
+			rec.InternalModelID, channelKeyID, sessionID, sessionName, rec.CallTime, tokensRaw, ratesRaw, coeffRaw,
 			rec.RValue, rec.RawTotal, rec.CreditsConsumed, rec.CostCredits,
 			rec.BalanceBefore, rec.BalanceAfter, rec.Status, errMsg, durationMs, firstTokenMs,
 		}, attr...)...).

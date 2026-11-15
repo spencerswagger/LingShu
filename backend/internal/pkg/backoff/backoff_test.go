@@ -197,3 +197,37 @@ func TestPolicy_Normalized(t *testing.T) {
 		t.Fatalf("负重试次数应收敛为 0，got %d", got)
 	}
 }
+
+// TestDo_StopReturnsImmediately 断言终止态（Stop）不等待、不重试、不被包 ExhaustedError：
+// 「本轮跳过」这类结论走这条路（修复前会空转 5s+20s+60s 三次）。
+func TestDo_StopReturnsImmediately(t *testing.T) {
+	skip := errors.New("本轮跳过：未配置")
+	var calls int
+	var waits []time.Duration
+	err := Do(context.Background(), "step", Default(), func(_ context.Context, d time.Duration) error {
+		waits = append(waits, d)
+		return nil
+	}, func(context.Context, int) error {
+		calls++
+		return Stop(skip)
+	})
+	if calls != 1 {
+		t.Fatalf("终止态应只调用 1 次，got %d", calls)
+	}
+	if len(waits) != 0 {
+		t.Fatalf("终止态不应退避，got %v", waits)
+	}
+	if !errors.Is(err, skip) {
+		t.Fatalf("应原样返回终止原因，got %v", err)
+	}
+	var ex *ExhaustedError
+	if errors.As(err, &ex) {
+		t.Fatalf("终止态不该被包成 ExhaustedError，got %v", err)
+	}
+	if !IsStop(Stop(skip)) {
+		t.Fatal("IsStop 应识别终止态")
+	}
+	if Stop(nil) != nil {
+		t.Fatal("Stop(nil) 应为 nil")
+	}
+}

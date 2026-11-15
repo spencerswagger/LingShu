@@ -1,7 +1,8 @@
 package billing
 
 import (
-	"fmt"
+	"context"
+	"log/slog"
 	"strings"
 
 	"github.com/team/llmgateway/internal/domain/upstream"
@@ -33,12 +34,14 @@ func CostSources() []string {
 }
 
 // validCostSource 判断取值是否合法；空串合法（落库归一为 none）。
+// 比对前先去掉首尾空白：`" ledger "` 是同一个枚举，不该被判非法（与协议侧同口径）。
 func validCostSource(v string) bool {
-	if strings.TrimSpace(v) == "" {
+	t := strings.TrimSpace(v)
+	if t == "" {
 		return true
 	}
 	for _, s := range CostSources() {
-		if v == s {
+		if t == s {
 			return true
 		}
 	}
@@ -61,18 +64,29 @@ func nullableText(v string) any {
 	return v
 }
 
-// attributionArgs 校验并返回六个归因列的入库参数（顺序与 INSERT 列清单一致）。
+// attributionArgs 归一化并返回七个归因列的入库参数（顺序与 INSERT 列清单一致）。
 //
-// 校验放在写入前：非法协议/成本来源会撞迁移里的 CHECK 约束，那时只剩一条 PG 错误码，
-// 排障要多跳一次；这里直接给出「哪个字段、什么值」。
-func attributionArgs(rec *Record) ([]any, error) {
+// ⚠️ **这里不返回 error，是刻意的**（2026-11-15 预审 P1 资金事故）：
+// 归因列是「解释性字段」，它非法绝不能让账单写不进去。曾经的实现把非法枚举当写入错误往上抛，
+// 于是 settleTx 判「真实写入失败」→ 回滚 → 退回非事务路径**先真扣钱** → Insert 再失败 →
+// 只剩一条 record lost，钱扣了账没落。现在改为**写库前归一**：非法协议 → NULL（0020 的
+// CHECK 允许 NULL）、非法 cost_source → none，并各打一条 WARN 点名字段与原始值。
+func attributionArgs(ctx context.Context, rec *Record) []any {
+	// 先 trim 再判合法、并且**按 trim 后的值落库**：枚举列有 CHECK 约束，带空白的原文写不进去；
+	// 带空白本身不是错误（上游头里常见 " openai-chat "），归一而不是拒收。
+	rec.UpstreamProtocol = strings.TrimSpace(rec.UpstreamProtocol)
+	rec.CostSource = strings.TrimSpace(rec.CostSource)
 	if !upstream.ValidAttributionProtocol(rec.UpstreamProtocol) {
-		return nil, fmt.Errorf("账单 %s 的 upstream_protocol 非法：%q（取值域 %v）",
-			rec.BillingID, rec.UpstreamProtocol, upstream.AttributionProtocols())
+		slog.WarnContext(ctx, "账单归因值非法，按 NULL 落库",
+			"billing_id", rec.BillingID, "field", "upstream_protocol",
+			"value", rec.UpstreamProtocol, "allowed", upstream.AttributionProtocols())
+		rec.UpstreamProtocol = ""
 	}
 	if !validCostSource(rec.CostSource) {
-		return nil, fmt.Errorf("账单 %s 的 cost_source 非法：%q（取值域 %v）",
-			rec.BillingID, rec.CostSource, CostSources())
+		slog.WarnContext(ctx, "账单归因值非法，按 none 落库",
+			"billing_id", rec.BillingID, "field", "cost_source",
+			"value", rec.CostSource, "allowed", CostSources())
+		rec.CostSource = ""
 	}
 	return []any{
 		nullableText(rec.RequestID),
@@ -82,5 +96,5 @@ func attributionArgs(rec *Record) ([]any, error) {
 		nullableText(rec.UpstreamModel),
 		nullableText(rec.LedgerEntryID),
 		normalizeCostSource(rec.CostSource),
-	}, nil
+	}
 }

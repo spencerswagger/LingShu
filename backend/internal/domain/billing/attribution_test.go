@@ -4,21 +4,19 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
 )
 
-// TestAttributionArgs_Normalization 断言六列的归一/校验口径：
-// 缺失留 NULL（不猜）、cost_source 空归 none、非法枚举在写库前就报错（不留到 CHECK 约束里）。
+// TestAttributionArgs_Normalization 断言七列的归一口径：
+// 缺失留 NULL（不猜）、cost_source 空归 none、**非法枚举一律归一而非报错**
+// （2026-11-15 预审 P1：归因非法曾经让账单写不进去 → 扣了钱没账）。
 func TestAttributionArgs_Normalization(t *testing.T) {
+	ctx := context.Background()
 	rec := &Record{BillingID: "bill-1"}
-	args, err := attributionArgs(rec)
-	if err != nil {
-		t.Fatalf("空归因不应报错: %v", err)
-	}
+	args := attributionArgs(ctx, rec)
 	for i := 0; i < 6; i++ { // request_id / upstream_provider / upstream_account / upstream_protocol / upstream_model / ledger_entry_id
 		if args[i] != nil {
 			t.Fatalf("第 %d 列缺失时应写 NULL，got %v", i+1, args[i])
@@ -38,10 +36,7 @@ func TestAttributionArgs_Normalization(t *testing.T) {
 		LedgerEntryID:    "led-9",
 		CostSource:       CostSourceLedger,
 	}
-	args, err = attributionArgs(full)
-	if err != nil {
-		t.Fatalf("合法归因不应报错: %v", err)
-	}
+	args = attributionArgs(ctx, full)
 	want := []any{"req-2", "anthropic", "acct-9", "anthropic-messages", "claude-sonnet-4", "led-9", CostSourceLedger}
 	for i := range want {
 		if args[i] != want[i] {
@@ -49,13 +44,24 @@ func TestAttributionArgs_Normalization(t *testing.T) {
 		}
 	}
 
-	bad := &Record{BillingID: "bill-3", UpstreamProtocol: "openai-embeddings"}
-	if _, err := attributionArgs(bad); err == nil || !strings.Contains(err.Error(), "upstream_protocol") {
-		t.Fatalf("非法协议应报错并点名字段，got %v", err)
+	// 非法协议 → NULL（不报错），非法成本来源 → none（不报错）。
+	bad := &Record{BillingID: "bill-3", UpstreamProtocol: "openai-embeddings", CostSource: "invoice"}
+	got := attributionArgs(ctx, bad)
+	if got[3] != nil {
+		t.Fatalf("非法协议应归一为 NULL，got %v", got[3])
 	}
-	bad = &Record{BillingID: "bill-4", CostSource: "invoice"}
-	if _, err := attributionArgs(bad); err == nil || !strings.Contains(err.Error(), "cost_source") {
-		t.Fatalf("非法成本来源应报错并点名字段，got %v", err)
+	if got[6] != CostSourceNone {
+		t.Fatalf("非法成本来源应归一为 none，got %v", got[6])
+	}
+
+	// 带首尾空白的合法值：trim 后判合法，并按 trim 后的枚举落库（CHECK 约束只认枚举本身）。
+	spaced := &Record{BillingID: "bill-5", UpstreamProtocol: " openai-chat ", CostSource: " ledger "}
+	gotSpaced := attributionArgs(ctx, spaced)
+	if gotSpaced[3] != "openai-chat" {
+		t.Fatalf("带空白的合法协议应按 trim 后落库，got %v", gotSpaced[3])
+	}
+	if gotSpaced[6] != "ledger" {
+		t.Fatalf("带空白的合法成本来源应按 trim 后落库，got %v", gotSpaced[6])
 	}
 }
 
@@ -80,7 +86,7 @@ func TestRecord_InsertsAttributionColumns(t *testing.T) {
 
 	args := txInsertArgs(credits, before, after, "completed")
 	// 末 6 位换成真实归因值（前 25 位沿用既有断言）。
-	args = append(append([]driver.Value{}, args[:24]...),
+	args = append(append([]driver.Value{}, args[:25]...),
 		"req-attr-1", "openai", "acct-7", "openai-chat", "gpt-4o", "led-attr-1", CostSourceLedger)
 	mock.ExpectQuery(insertBill.String()).WithArgs(args...).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(1), time.Now()))

@@ -171,6 +171,40 @@ func (e *CanceledError) Unwrap() []error {
 	return out
 }
 
+// StopError 表示「fn 判定这是终止态，不要再重试」。
+//
+// 用途：把「本轮跳过」「配置缺失」这类**非故障**结论从重试里摘出来——否则它会按 5s/20s/60s
+// 空转三次（一轮 85s），最后被包成 ExhaustedError，调用方再靠 errors.As 穿透才知道其实是跳过。
+// Do 见到它立即把内部原始错误原样返回（不包 ExhaustedError、不再等待）。
+type StopError struct {
+	// Err 是真实的终止原因（逐字保留，可用 errors.Is/As 追踪）。
+	Err error
+}
+
+func (e *StopError) Error() string {
+	if e == nil || e.Err == nil {
+		return "backoff: 终止"
+	}
+	return e.Err.Error()
+}
+
+// Unwrap 让 errors.Is/As 穿透到原始错误。
+func (e *StopError) Unwrap() error { return e.Err }
+
+// Stop 把 err 标记为终止态（err 为 nil 时原样返回 nil）。
+func Stop(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &StopError{Err: err}
+}
+
+// IsStop 判断错误是否被打上终止态标记。
+func IsStop(err error) bool {
+	var s *StopError
+	return errors.As(err, &s)
+}
+
 // Do 以 p 的节奏执行 fn，返回 nil 或最后失败原因。
 //
 //   - fn 的 attempt 从 1 开始（首次尝试 = 1），便于日志区分「第一次就成功」与「重试成功」；
@@ -196,6 +230,11 @@ func Do(ctx context.Context, op string, p Policy, sleep SleepFunc, fn func(ctx c
 		last = fn(ctx, attempt)
 		if last == nil {
 			return nil
+		}
+		// 终止态（如「本轮跳过」）：不等待、不重试、不包 ExhaustedError，原样返回原因。
+		var stop *StopError
+		if errors.As(last, &stop) {
+			return stop.Err
 		}
 		if ctx.Err() != nil {
 			return &CanceledError{Op: op, Attempts: attempt, Last: last, Cause: ctx.Err()}

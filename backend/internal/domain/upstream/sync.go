@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -153,10 +154,18 @@ func (s *Syncer) Steps() []string {
 //   - 每个步骤独立重试（一个步骤耗尽不影响后续步骤，避免一个接口故障拖死整轮）；
 //   - 每次尝试都按 backoff 的统一节奏，耗尽后记 ERROR（步骤名/实际尝试次数/退避序列/原始错误）；
 //   - 闸门返回 *SkipError 时本轮**不执行任何步骤**，原样返回该跳过原因。
-func (s *Syncer) RunOnce(ctx context.Context) error {
+func (s *Syncer) RunOnce(ctx context.Context) (err error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	// panic 兜底：RunOnce 由 Start 的 goroutine 调用，panic 会打挂整个进程；
+	// 而串行标记（running）已经由下面的 defer 释放，这里只需把 panic 变成一个可诊断的错误。
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("上游同步轮次 panic", "panic", r, "stack", string(debug.Stack()))
+			err = fmt.Errorf("上游同步轮次 panic: %v", r)
+		}
+	}()
 	if s.gate != nil {
 		if err := s.gate(ctx); err != nil {
 			return err
@@ -169,6 +178,7 @@ func (s *Syncer) RunOnce(ctx context.Context) error {
 
 	steps := s.snapshot()
 	var errs []error
+	skipped := 0
 	for _, step := range steps {
 		if err := ctx.Err(); err != nil {
 			errs = append(errs, fmt.Errorf("上游同步中止（%s 未执行）：%w", step.Name(), err))
@@ -180,12 +190,18 @@ func (s *Syncer) RunOnce(ctx context.Context) error {
 			if attempt > 1 {
 				s.log.Warn("上游同步重试", "step", name, "attempt", attempt)
 			}
-			return step.Run(ctx)
+			rerr := step.Run(ctx)
+			// 「本轮跳过」是结论不是故障：标记终止态，让 backoff 立即返回（不再空转 85s）。
+			if IsSkip(rerr) {
+				return backoff.Stop(rerr)
+			}
+			return rerr
 		})
 		switch {
 		case err == nil:
 			s.log.Info("上游同步完成", "step", name, "cost_ms", time.Since(started).Milliseconds())
 		case IsSkip(err):
+			skipped++
 			s.log.Info("上游同步跳过", "step", name, "reason", err.Error())
 		default:
 			var ex *backoff.ExhaustedError
@@ -202,6 +218,15 @@ func (s *Syncer) RunOnce(ctx context.Context) error {
 			}
 			errs = append(errs, err)
 		}
+	}
+	// 全部步骤都被跳过时**不能返回 nil**：nil 等于「本轮成功」，会让上层把「降级/未配置」
+	// 当成同步正常。返回一个 SkipError，调用方按 IsSkip 记 INFO（Start 已如此处理）。
+	if len(errs) == 0 && skipped > 0 && skipped == len(steps) {
+		s.log.Info("上游同步整轮跳过", "steps", skipped, "total", len(steps))
+		return &SkipError{Op: "上游同步", Reason: fmt.Sprintf("本轮全部 %d 个步骤均跳过", skipped)}
+	}
+	if skipped > 0 {
+		s.log.Info("上游同步跳过计数", "skipped", skipped, "total", len(steps), "failed", len(errs))
 	}
 	return errors.Join(errs...)
 }

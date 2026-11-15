@@ -6,19 +6,18 @@ import (
 	"fmt"
 	"net/url"
 	"os"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/team/llmgateway/internal/db"
 )
 
-// 这两个用例跑**真实迁移**（架构侧 0019–0023），不手搓 DDL：手搓只能证明「能写进自己造的表」。
+// 这些用例跑**真实迁移**（本批只含 0019/0020/0022/0023；0021_v2_drop_legacy 已摘出单独一批），
+// 不手搓 DDL：手搓只能证明「能写进自己造的表」。
 //
-// 0021_v2_drop_legacy 会删掉 billing_records.channel_key_id / sessions.channel_key_id /
-// tokens.tag_id 并 DROP 渠道域 10 张表。写路径已不再写该列（渠道密钥维度改由 call_logs 的
-// 1:1 快照供数），所以这里**不再需要补列 hack**；渠道域与 sessions/tokens 两处控制面列的
-// 下线属下一刀，本文件只用 schema 级事实把「还没摘的部分」钉住（见 TestPost0021Schema_RemainingBlockers）。
+// 分工：账单侧的渠道密钥维度**读**已改由 call_logs 的 1:1 快照供数（写入仍写列，等 0021 同批再摘写）；
+// 0021 一旦落地，sessions.channel_key_id / tokens.tag_id 的写路径仍会 42703——
+// 那一刀属控制面（改路由行为），需负责人点头，见 docs/designs/2026-11-15-v2-decouple-channel-keyid.md。
 
 // openAttributionTempDB 建临时库并应用 0001–0023 真实迁移（含 0021 的删列/删表）。
 func openAttributionTempDB(t *testing.T) *sql.DB {
@@ -184,17 +183,30 @@ func TestAttribution_RealSchema_WriteAndReadBack(t *testing.T) {
 		t.Fatalf("改价后归因列不应变化：before=%+v after=%+v", got, after)
 	}
 
-	// 非法协议：写库前报错并点名字段（不留到 CHECK 约束里）。
+	// 非法归因：**不许**让账单写不进去（否则扣了钱没账），归一后照常落库并打 WARN。
 	bad := newRealStoreRecord("bill-real-3")
 	bad.UpstreamProtocol = "openai-embeddings"
-	if _, err := store.Insert(ctx, bad); err == nil || !strings.Contains(err.Error(), "upstream_protocol") {
-		t.Fatalf("非法协议应写库前报错并点名字段，got %v", err)
+	bad.CostSource = "invoice"
+	if _, err := store.Insert(ctx, bad); err != nil {
+		t.Fatalf("非法归因不该导致写入失败（归一后应落库）: %v", err)
 	}
-	// 非法 cost_source 同理。
-	bad2 := newRealStoreRecord("bill-real-4")
-	bad2.CostSource = "invoice"
-	if _, err := store.Insert(ctx, bad2); err == nil || !strings.Contains(err.Error(), "cost_source") {
-		t.Fatalf("非法 cost_source 应写库前报错并点名字段，got %v", err)
+	gotBad := readAttr("bill-real-3")
+	if gotBad.protocol.Valid {
+		t.Fatalf("非法协议应归一为 NULL，got %q", gotBad.protocol.String)
+	}
+	if !gotBad.costSource.Valid || gotBad.costSource.String != CostSourceNone {
+		t.Fatalf("非法 cost_source 应归一为 none，got %+v", gotBad.costSource)
+	}
+
+	// 带首尾空白的合法值：trim 后判合法，按 trim 后的枚举落库（CHECK 只认枚举本身）。
+	spaced := newRealStoreRecord("bill-real-5")
+	spaced.UpstreamProtocol = " openai-chat "
+	spaced.CostSource = " ledger "
+	if _, err := store.Insert(ctx, spaced); err != nil {
+		t.Fatalf("带空白的合法归因不该被判非法: %v", err)
+	}
+	if gotSp := readAttr("bill-real-5"); !gotSp.protocol.Valid || gotSp.protocol.String != "openai-chat" {
+		t.Fatalf("带空白的合法协议应 trim 后落库，got %+v", gotSp.protocol)
 	}
 }
 
@@ -203,24 +215,37 @@ func TestAttribution_RealSchema_WriteAndReadBack(t *testing.T) {
 //   - 插入成功（写路径已不碰该列）；
 //   - 列表/详情/汇总可跑，且渠道密钥维度由 call_logs 的 1:1 快照回填（值不变）；
 //   - 按该维度过滤仍可用（EXISTS 到 call_logs，不是恒真也不是恒不命中）。
-func TestBilling_Post0021Schema_DimensionFromCallLogs(t *testing.T) {
+func TestBilling_DimensionFromCallLogs(t *testing.T) {
 	conn := openAttributionTempDB(t)
 	seedBillingUser(t, conn)
 	store := NewSqlStore(conn)
 	ctx := context.Background()
 
+	// 本批（0019/0020/0022/0023）里列还在；写路径仍写它，等 0021 同批再摘。
 	var exists bool
 	if err := conn.QueryRowContext(ctx,
 		`SELECT EXISTS (SELECT 1 FROM information_schema.columns
 		                 WHERE table_name='billing_records' AND column_name='channel_key_id')`).Scan(&exists); err != nil {
 		t.Fatalf("查询列存在性失败: %v", err)
 	}
-	if exists {
-		t.Fatalf("0021 应已删掉 billing_records.channel_key_id（迁移没跑全？）")
+	if !exists {
+		t.Fatalf("本批不含 0021，billing_records.channel_key_id 应仍存在（0021 被误加回本批？）")
+	}
+
+	// 本批 FK 还在（0021 会删表）：先造渠道 + 密钥行，账单才能引用。
+	for _, stmt := range []string{
+		`INSERT INTO channels(id, name, base_url) VALUES (42, 'ch-42', 'http://upstream.local')`,
+		`INSERT INTO channel_keys(id, channel_id, name, credential_enc) VALUES (42, 42, 'k-42', 'enc')`,
+	} {
+		if _, err := conn.ExecContext(ctx, stmt); err != nil {
+			t.Fatalf("造渠道/密钥行失败: %v", err)
+		}
 	}
 
 	// 两条账单：一条有调用日志（密钥 42），一条没有（拒绝类场景）。
-	if _, err := store.Insert(ctx, newRealStoreRecord("bill-post-1")); err != nil {
+	withKey := newRealStoreRecord("bill-post-1")
+	withKey.ChannelKeyID = 42
+	if _, err := store.Insert(ctx, withKey); err != nil {
 		t.Fatalf("迁移后插入账单失败（写路径仍依赖 channel_key_id？）: %v", err)
 	}
 	if _, err := store.Insert(ctx, newRealStoreRecord("bill-post-2")); err != nil {
@@ -250,6 +275,15 @@ func TestBilling_Post0021Schema_DimensionFromCallLogs(t *testing.T) {
 	}
 	if got := byID["bill-post-1"].ChannelKeyID; got != 42 {
 		t.Fatalf("有调用日志的账单应回填密钥 42，got %d", got)
+	}
+	// 两侧一致：写路径仍写列，读路径走快照 —— 同一账单必须是同一个值。
+	var columnValue sql.NullInt64
+	if err := conn.QueryRowContext(ctx,
+		`SELECT channel_key_id FROM billing_records WHERE billing_id = 'bill-post-1'`).Scan(&columnValue); err != nil {
+		t.Fatalf("反查列值失败: %v", err)
+	}
+	if !columnValue.Valid || columnValue.Int64 != 42 {
+		t.Fatalf("写路径应仍把密钥 42 写进列（0021 不在本批），got %+v", columnValue)
 	}
 	if got := byID["bill-post-2"].ChannelKeyID; got != 0 {
 		t.Fatalf("无调用日志的账单应为 0，got %d", got)
@@ -290,49 +324,4 @@ func TestBilling_Post0021Schema_DimensionFromCallLogs(t *testing.T) {
 	if sum.Requests != 2 {
 		t.Fatalf("汇总请求数=%d, want 2", sum.Requests)
 	}
-}
-
-// TestPost0021Schema_RemainingBlockers 记录 0021 全量迁移后**仍未摘**的部分（schema 级事实）：
-// sessions.channel_key_id（粘性路由状态）与 tokens.tag_id（标签路由输入）都已被删，
-// 但 router.SessionStore / identity.TokenStore 的 SQL 仍按列名读写它们 → 上线后是 42703。
-//
-// 为什么这一刀不能顺手做：这两列是**控制面**（会话粘性/切换判定、令牌默认路由），
-// 摘掉等于改路由行为，必须与「渠道/标签域下线」同一批处理，需负责人点头。
-// 所以这里先断言 schema 事实，再 skip 说明——它不参与门禁变绿，也不会被误当成已解决。
-func TestPost0021Schema_RemainingBlockers(t *testing.T) {
-	conn := openAttributionTempDB(t)
-	seedBillingUser(t, conn)
-	ctx := context.Background()
-
-	for _, tc := range []struct{ table, column string }{
-		{"sessions", "channel_key_id"},
-		{"tokens", "tag_id"},
-		{"billing_records", "channel_key_id"},
-	} {
-		var exists bool
-		if err := conn.QueryRowContext(ctx,
-			`SELECT EXISTS (SELECT 1 FROM information_schema.columns
-			                 WHERE table_name=$1 AND column_name=$2)`, tc.table, tc.column).Scan(&exists); err != nil {
-			t.Fatalf("查询 %s.%s 存在性失败: %v", tc.table, tc.column, err)
-		}
-		if exists {
-			t.Fatalf("0021 后 %s.%s 不该存在", tc.table, tc.column)
-		}
-	}
-
-	// 日志表保留渠道维度（历史快照），这是账单维度能继续供数的前提。
-	for _, col := range []string{"channel_id", "channel_key_id"} {
-		var exists bool
-		if err := conn.QueryRowContext(ctx,
-			`SELECT EXISTS (SELECT 1 FROM information_schema.columns
-			                 WHERE table_name='call_logs' AND column_name=$1)`, col).Scan(&exists); err != nil {
-			t.Fatalf("查询 call_logs.%s 失败: %v", col, err)
-		}
-		if !exists {
-			t.Fatalf("call_logs.%s 应保留（账单维度的唯一留存来源）", col)
-		}
-	}
-
-	t.Skip("控制面剩余两处（sessions.channel_key_id / tokens.tag_id）的写路径仍引用已删列；" +
-		"0021 不能单独上线，摘它们会改路由行为，需负责人点头后与渠道/标签域下线同批处理")
 }

@@ -201,6 +201,60 @@ func TestSyncer_GateSkipsWithoutCallingSteps(t *testing.T) {
 	}
 }
 
+// TestSyncer_StepSkipIsTerminal_NoRetryNoBackoff 是预审 P1 的回归用例：
+// 步骤自己返回「本轮跳过」时，**不得**被当成故障重试（修复前 calls=4、waits=[5s 20s 60s]、
+// 且错误被 Join 吞成 nil → 一轮空转 85s 后看起来「成功」）。
+// 断言：只调用 1 次、不退避、RunOnce 返回可识别的跳过错误（不是 nil）。
+func TestSyncer_StepSkipIsTerminal_NoRetryNoBackoff(t *testing.T) {
+	sleep := &fakeSleep{}
+	s := NewSyncer(SyncerOptions{Logger: testLogger(), Sleep: sleep.sleep})
+	var calls int32
+	if err := s.Register(StepFunc{N: "ledger", F: func(context.Context) error {
+		atomic.AddInt32(&calls, 1)
+		return &SkipError{Op: "ledger", Reason: "未配置 admin_key"}
+	}}); err != nil {
+		t.Fatalf("注册步骤失败: %v", err)
+	}
+
+	err := s.RunOnce(context.Background())
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("跳过是结论不是故障：应只调用 1 次，got %d", got)
+	}
+	if waits := sleep.recorded(); len(waits) != 0 {
+		t.Fatalf("跳过不应退避，got %v", waits)
+	}
+	if err == nil {
+		t.Fatal("整轮跳过不能返回 nil（nil = 同步成功，会让降级/未配置被当成正常）")
+	}
+	if !IsSkip(err) {
+		t.Fatalf("整轮跳过应返回可识别的跳过错误，got %T %v", err, err)
+	}
+}
+
+// TestSyncer_PanicInStepIsRecovered 断言步骤 panic 不会打挂进程（RunOnce 有 recover），
+// 且串行标记已释放（下一轮能正常跑）。
+func TestSyncer_PanicInStepIsRecovered(t *testing.T) {
+	s := NewSyncer(SyncerOptions{Logger: testLogger(), Sleep: (&fakeSleep{}).sleep})
+	var first int32
+	if err := s.Register(StepFunc{N: "models", F: func(context.Context) error {
+		if atomic.AddInt32(&first, 1) == 1 {
+			panic("boom")
+		}
+		return nil
+	}}); err != nil {
+		t.Fatalf("注册步骤失败: %v", err)
+	}
+
+	err := s.RunOnce(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "panic") {
+		t.Fatalf("panic 应转成可诊断错误，got %v", err)
+	}
+	// 串行标记必须已释放：第二轮能进入并成功。
+	if err := s.RunOnce(context.Background()); err != nil {
+		t.Fatalf("panic 后串行标记应已释放，第二轮应成功，got %v", err)
+	}
+}
+
 // TestSyncer_StartNeverOverlaps 断言定时循环也不会并发（「跑完再等」，不堆积 tick）。
 func TestSyncer_StartNeverOverlaps(t *testing.T) {
 	s := NewSyncer(SyncerOptions{Logger: testLogger(), Sleep: (&fakeSleep{}).sleep})
