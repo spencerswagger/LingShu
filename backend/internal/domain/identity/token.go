@@ -1,6 +1,7 @@
 // token.go 令牌（API Key）领域实现：SM3 哈希、CRUD、滚动、开关，以及对应 HTTP 处理器。
 // 令牌明文以 SM4 加密后落库（secret_cipher），支持随时查看/复制；校验仍走 SM3 哈希。
-// 令牌可空的 tag_id 用于默认路由（nil = 默认路由）。
+// 令牌的标签路由能力已随 0024 下线（tokens.tag_id 与 semantic_tags 一并删除）：
+// Token.TagID 字段保留但恒为 nil，仅用于 API 结构兼容。
 package identity
 
 import (
@@ -53,24 +54,23 @@ type TokenInfo struct {
 }
 
 // tokenCols 列出 tokens 表查询使用的全部列。
-const tokenCols = `id, token_hash, token_display, user_id, display_name, tag_id, expires_at, last_used_at, status, created_at`
+//
+// ⚠️ 0024 已删 tokens.tag_id（它引用被一并删除的 semantic_tags）：查询里不再取该列，
+// Token.TagID 恒为 nil（字段保留供 API 结构兼容，语义是「标签路由能力已下线」）。
+const tokenCols = `id, token_hash, token_display, user_id, display_name, expires_at, last_used_at, status, created_at`
 
 // tokenInfoCols 列出列表 JOIN users 后使用的全部列（tokens 列 + users.username + users.nickname）。
 // 注意：拼接进 JOIN 查询的 SELECT 列表，列必须带 t. 前缀，避免与 users 的 id 等列歧义。
-const tokenInfoCols = `t.id, t.token_hash, t.token_display, t.user_id, t.display_name, t.tag_id, t.expires_at, t.last_used_at, t.status, t.created_at, u.username, u.nickname`
+const tokenInfoCols = `t.id, t.token_hash, t.token_display, t.user_id, t.display_name, t.expires_at, t.last_used_at, t.status, t.created_at, u.username, u.nickname`
 
 // scanToken 将一行扫描到 *Token。
 func scanToken(row interface{ Scan(...any) error }) (*Token, error) {
 	var t Token
-	var tagID sql.NullInt64
 	var expiresAt, lastUsedAt sql.NullTime
 	err := row.Scan(&t.ID, &t.TokenHash, &t.TokenDisplay, &t.UserID, &t.DisplayName,
-		&tagID, &expiresAt, &lastUsedAt, &t.Status, &t.CreatedAt)
+		&expiresAt, &lastUsedAt, &t.Status, &t.CreatedAt)
 	if err != nil {
 		return nil, err
-	}
-	if tagID.Valid {
-		t.TagID = &tagID.Int64
 	}
 	if expiresAt.Valid {
 		t.ExpiresAt = &expiresAt.Time
@@ -141,10 +141,10 @@ func (s *TokenStore) CreateToken(ctx context.Context, t *Token) error {
 		t.ID = idgen.New()
 	}
 	row := s.db.QueryRowContext(ctx,
-		`INSERT INTO tokens(id, token_hash, token_display, secret_cipher, user_id, display_name, tag_id, expires_at)
-		 VALUES($1, $2, $3, $4, $5, $6, $7, $8)
+		`INSERT INTO tokens(id, token_hash, token_display, secret_cipher, user_id, display_name, expires_at)
+		 VALUES($1, $2, $3, $4, $5, $6, $7)
 		 RETURNING id, created_at`,
-		t.ID, t.TokenHash, t.TokenDisplay, nullString(t.SecretCipher), t.UserID, t.DisplayName, t.TagID, t.ExpiresAt)
+		t.ID, t.TokenHash, t.TokenDisplay, nullString(t.SecretCipher), t.UserID, t.DisplayName, t.ExpiresAt)
 	var id int64
 	var createdAt time.Time
 	if err := row.Scan(&id, &createdAt); err != nil {
@@ -264,14 +264,12 @@ func (s *TokenStore) CountByUser(ctx context.Context, userID int64) (int64, erro
 func scanTokenInfo(row interface{ Scan(...any) error }) (*TokenInfo, error) {
 	var t Token
 	var username, nickname string
-	var tagID sql.NullInt64
 	var expiresAt, lastUsedAt sql.NullTime
 	err := row.Scan(&t.ID, &t.TokenHash, &t.TokenDisplay, &t.UserID, &t.DisplayName,
-		&tagID, &expiresAt, &lastUsedAt, &t.Status, &t.CreatedAt, &username, &nickname)
+		&expiresAt, &lastUsedAt, &t.Status, &t.CreatedAt, &username, &nickname)
 	if err != nil {
 		return nil, err
 	}
-	t.TagID = nullToPtr(tagID)
 	t.ExpiresAt = nullToTimePtr(expiresAt)
 	t.LastUsedAt = nullToTimePtr(lastUsedAt)
 	return &TokenInfo{Token: t, Username: username, Nickname: nickname}, nil

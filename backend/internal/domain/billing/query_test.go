@@ -23,10 +23,10 @@ func TestListRecords_FilterByKeyAndSession(t *testing.T) {
 	keyID := int64(3)
 	f := RecordFilter{ChannelKeyID: &keyID, SessionID: "sess-1", Page: 1, Size: 10}
 
-	mock.ExpectQuery(`SELECT count\(\*\) FROM billing_records .*COALESCE\(\(SELECT clk\.channel_key_id FROM call_logs clk.*\), billing_records\.channel_key_id\) = \$2.*token_id = \$3.*session_id = \$4.*`).
+	mock.ExpectQuery(`SELECT count\(\*\) FROM billing_records .*\(SELECT clk\.channel_key_id FROM call_logs clk.*billing_records\.billing_id\) = \$2.*token_id = \$3.*session_id = \$4.*`).
 		WithArgs(nil, int64(3), nil, "sess-1", "", "", "", nil, nil).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(1)))
-	mock.ExpectQuery(`SELECT .* FROM billing_records .*COALESCE\(\(SELECT clk\.channel_key_id FROM call_logs clk.*billing_records\.channel_key_id\) = \$2.*token_id = \$3.*session_id = \$4.*ORDER BY id DESC LIMIT \$10 OFFSET \$11`).
+	mock.ExpectQuery(`SELECT .* FROM billing_records .*\(SELECT clk\.channel_key_id FROM call_logs clk.*billing_records\.billing_id\) = \$2.*token_id = \$3.*session_id = \$4.*ORDER BY id DESC LIMIT \$10 OFFSET \$11`).
 		WithArgs(nil, int64(3), nil, "sess-1", "", "", "", nil, nil, 10, 0).
 		WillReturnRows(completedRow(t))
 	// 维度由 call_logs 快照回填（第 1 条账单对应密钥 1）。
@@ -88,7 +88,7 @@ func TestListRecords_NoFilter(t *testing.T) {
 	defer db.Close()
 
 	store := NewSqlStore(db)
-	mock.ExpectQuery(`SELECT count\(\*\) FROM billing_records .*COALESCE\(\(SELECT clk\.channel_key_id FROM call_logs clk`).
+	mock.ExpectQuery(`SELECT count\(\*\) FROM billing_records .*\(SELECT clk\.channel_key_id FROM call_logs clk`).
 		WithArgs(nil, nil, nil, "", "", "", "", nil, nil).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(0)))
 	mock.ExpectQuery(`SELECT .* FROM billing_records .*LIMIT \$10 OFFSET \$11`).

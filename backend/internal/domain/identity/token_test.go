@@ -13,8 +13,9 @@ import (
 
 const userStatusSQL = `SELECT role, status FROM users WHERE id = $1`
 
-const insertTokenSQL = `INSERT INTO tokens(id, token_hash, token_display, secret_cipher, user_id, display_name, tag_id, expires_at)
-			 VALUES($1, $2, $3, $4, $5, $6, $7, $8)
+// tag_id 随 0024 下线（semantic_tags 已删），令牌 INSERT 不再写该列。
+const insertTokenSQL = `INSERT INTO tokens(id, token_hash, token_display, secret_cipher, user_id, display_name, expires_at)
+			 VALUES($1, $2, $3, $4, $5, $6, $7)
 			 RETURNING id, created_at`
 
 const getTokenByHashSQL = `SELECT ` + tokenCols + ` FROM tokens WHERE token_hash = $1`
@@ -23,11 +24,8 @@ const countByUserSQL = `SELECT count(*) FROM tokens WHERE user_id = $1 AND delet
 
 func tokenRow(tok *Token) *sqlmock.Rows {
 	// 列顺序与 tokenCols 一致：id, token_hash, token_display, user_id, display_name,
-	// tag_id, expires_at, last_used_at, status, created_at
-	var tagID, expiresAt, lastUsedAt any = nil, nil, nil
-	if tok.TagID != nil {
-		tagID = *tok.TagID
-	}
+	// expires_at, last_used_at, status, created_at（tag_id 已随 0024 下线）
+	var expiresAt, lastUsedAt any = nil, nil
 	if tok.ExpiresAt != nil {
 		expiresAt = *tok.ExpiresAt
 	}
@@ -35,9 +33,9 @@ func tokenRow(tok *Token) *sqlmock.Rows {
 		lastUsedAt = *tok.LastUsedAt
 	}
 	return sqlmock.NewRows([]string{"id", "token_hash", "token_display", "user_id", "display_name",
-		"tag_id", "expires_at", "last_used_at", "status", "created_at"}).
+		"expires_at", "last_used_at", "status", "created_at"}).
 		AddRow(tok.ID, tok.TokenHash, tok.TokenDisplay, tok.UserID, tok.DisplayName,
-			tagID, expiresAt, lastUsedAt, tok.Status, tok.CreatedAt)
+			expiresAt, lastUsedAt, tok.Status, tok.CreatedAt)
 }
 
 func TestToken_CreateAndLookupByPlain_Success(t *testing.T) {
@@ -52,9 +50,9 @@ func TestToken_CreateAndLookupByPlain_Success(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(userStatusSQL)).
 		WithArgs(int64(1)).
 		WillReturnRows(sqlmock.NewRows([]string{"role", "status"}).AddRow(RoleDeveloper, StatusActive))
-	// 插入：secret_cipher 空串（未注入 SM4 密钥）+ hash/display 动态，user=1、name、tag=nil、expires=nil。
+	// 插入：secret_cipher 空串（未注入 SM4 密钥）+ hash/display 动态，user=1、name、expires=nil。
 	mock.ExpectQuery(regexp.QuoteMeta(insertTokenSQL)).
-		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), nil, int64(1), "dev-key", nil, nil).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), nil, int64(1), "dev-key", nil).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(100), now))
 
 	svc := NewTokenService(NewTokenStore(db))
@@ -97,6 +95,8 @@ func TestToken_CreateAndLookupByPlain_Success(t *testing.T) {
 	}
 }
 
+// TestToken_Create_TagIDNil_InsertsNull 0024 后 tag_id 已不在表里：调用方仍可传 tagID 参数，
+// 但不再落库（传 nil 与传值都不影响 SQL），这里锁的是「传 nil 不报错」这条契约。
 func TestToken_Create_TagIDNil_InsertsNull(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
@@ -107,9 +107,9 @@ func TestToken_Create_TagIDNil_InsertsNull(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(userStatusSQL)).
 		WithArgs(int64(2)).
 		WillReturnRows(sqlmock.NewRows([]string{"role", "status"}).AddRow(RoleDeveloper, StatusActive))
-	// tag_id 与 expires_at 传 nil，落库即 NULL。
+	// expires_at 传 nil，落库即 NULL。
 	mock.ExpectQuery(regexp.QuoteMeta(insertTokenSQL)).
-		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), nil, int64(2), "名-key", nil, nil).
+		WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), nil, int64(2), "名-key", nil).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(1), time.Now()))
 
 	svc := NewTokenService(NewTokenStore(db))

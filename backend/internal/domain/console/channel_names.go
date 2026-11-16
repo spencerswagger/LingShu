@@ -5,30 +5,20 @@ import (
 	"database/sql"
 )
 
-// channelNamesByKeyIDs 批量把 channel_key_id 映射为「渠道显示名」（channel_keys JOIN channels）。
+// channelNamesByKeyIDs 批量把 channel_key_id 映射为「渠道显示名」。
 //
-// 单独抽出来的原因：管理端列表（decorateList）与开发者端列表都要展示渠道显示名，
-// 两处若各写一份 SQL，口径与脱敏边界会漂移（Owl PR #63 建议 3：dev 列表缺 ChannelName 列）。
-// 注意：这里只取**渠道显示名**——渠道密钥名（key name）仍属开发者端不可见字段。
+// ⚠️ **渠道体系已下线**（迁移 0024_v2_drop_legacy 删掉了 channels / channel_keys /
+// billing_records.channel_key_id），已经没有任何地方能提供「渠道显示名」：
+// 这个函数现在恒返回 nil，调用方（管理端账单列表 / 开发者端列表 / 会话列表）拿到的是空串，
+// 前端按空串渲染即可（响应结构不变，不用特判字段是否存在）。
+//
+// 历史账单的渠道名**永久取不回**：当时没有给账单留渠道名快照，表一删就没有第二份来源。
+// 这是下线渠道体系的既定代价，不是本函数的选择。
+//
+// 保留函数签名只为不打断调用点；后续若确认没人再传 keyIDs，可连同调用点一起删除。
 func channelNamesByKeyIDs(ctx context.Context, db *sql.DB, keyIDs []int64) map[int64]string {
-	if db == nil || len(keyIDs) == 0 {
-		return nil
-	}
-	rows, err := db.QueryContext(ctx,
-		`SELECT k.id, c.name FROM channel_keys k JOIN channels c ON c.id = k.channel_id
-		 WHERE k.id = ANY('{`+int64List(keyIDs)+`}'::bigint[])`)
-	if err != nil {
-		return nil
-	}
-	defer rows.Close()
-	out := make(map[int64]string, len(keyIDs))
-	for rows.Next() {
-		var id int64
-		var name string
-		if err := rows.Scan(&id, &name); err != nil {
-			continue
-		}
-		out[id] = name
-	}
-	return out
+	_ = ctx
+	_ = db
+	_ = keyIDs
+	return nil
 }

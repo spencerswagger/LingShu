@@ -32,7 +32,6 @@ import (
 	"github.com/team/llmgateway/internal/domain/reconcile"
 	"github.com/team/llmgateway/internal/domain/router"
 	"github.com/team/llmgateway/internal/domain/sync"
-	"github.com/team/llmgateway/internal/domain/tag"
 	"github.com/team/llmgateway/internal/domain/upstream"
 	"github.com/team/llmgateway/internal/pkg/asyncwrite"
 	"github.com/team/llmgateway/internal/pkg/clientip"
@@ -338,11 +337,9 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	announceSvc := identity.NewAnnouncementService(announceStore)
 	announceHandler := identity.NewAnnouncementHandler(announceSvc, userIDFrom)
 
-	// tag / model
-	tagStore := tag.NewStore(d)
-	tagSvc := tag.NewService(tagStore)
-	tagSvc.SetReadCacheEnabled(readCacheOn)
-	tagHandler := tag.NewHandler(tagSvc)
+	// model
+	// 标签域（tag）随 0024 下线：semantic_tags / channel_tags / tokens.tag_id 均已删除，
+	// 对应接口在 server.routes() 里以 410 显式停用（不再装配 Service/Handler）。
 	modelSvc := model.NewService(model.NewStore(d))
 	modelSvc.SetReadCacheEnabled(readCacheOn)
 	modelHandler := model.NewHandler(modelSvc)
@@ -663,7 +660,6 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 			Credit:       creditHandler,
 			TokenAdmin:   tokenAdminHandler,
 			TokenDev:     tokenDevHandler,
-			Tag:          tagHandler,
 			Model:        modelHandler,
 			Announcement: announceHandler,
 			Console:      consoleAdmin,
@@ -767,28 +763,16 @@ func (a priceRefAdapter) LastUpdated() time.Time {
 	return a.syncer.LastUpdated()
 }
 
-// keyNameResolver 装配渠道密钥名称批量反查钩子（console.Admin.SetKeyNameResolver）：
-// 会话列表/账单展示的 channel_key_name 由任一 channel_keys 批量查询填充；空列表直接返回。
+// keyNameResolver 装配渠道密钥名称批量反查钩子（console.Admin.SetKeyNameResolver）。
+//
+// ⚠️ 渠道体系已下线（0024 删了 channel_keys）：**没有来源了**，恒返回空 map，
+// 于是 channel_key_name 在各列表/详情里恒为空串（前端按空串渲染，结构不变）。
+// 保留装配点是为了让 console 的既有调用链不变；后续可连同钩子一起删。
 func keyNameResolver(db *sql.DB) func(ctx context.Context, ids []int64) (map[int64]string, error) {
+	_ = db
 	return func(ctx context.Context, ids []int64) (map[int64]string, error) {
-		if len(ids) == 0 {
-			return nil, nil
-		}
-		rows, err := db.QueryContext(ctx,
-			`SELECT id, name FROM channel_keys WHERE id = ANY($1)`, ids)
-		if err != nil {
-			return nil, err
-		}
-		defer rows.Close()
-		out := make(map[int64]string, len(ids))
-		for rows.Next() {
-			var id int64
-			var name string
-			if err := rows.Scan(&id, &name); err != nil {
-				return nil, err
-			}
-			out[id] = name
-		}
-		return out, rows.Err()
+		_ = ctx
+		_ = ids
+		return nil, nil
 	}
 }

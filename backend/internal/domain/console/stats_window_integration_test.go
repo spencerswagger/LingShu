@@ -83,8 +83,8 @@ func openStatsTempDB(t *testing.T) *sql.DB {
 //	2  10-25 00:01  gpt-4o         gpt-4o-int   200 token   ← 跨日边界后一条，落入滚动窗口
 //	3  10-24 11:00  gpt-4o         gpt-4o-int   400 token   ← 早于滚动窗口，只在日界窗口里
 //	4  10-25 12:30  gpt-4o         gpt-4o-int   800 token   ← 晚于滚动窗口，只在日界窗口里
-//	5  10-25 09:00  gpt-4o-legacy  gpt-4o-int    50 token   ← 改名前的旧文本，靠实体解析归到 gpt-4o
-//	6  10-25 10:00  ghost-model    ghost-int     70 token   ← 渠道 2 没配内部模型 → 未匹配
+//	5  10-25 09:00  gpt-4o-legacy  gpt-4o-int    50 token   ← 改名前的旧文本（0024 后无从解析）→ 未匹配
+//	6  10-25 10:00  ghost-model    ghost-int     70 token   ← 目录里没有这个名字 → 未匹配
 func seedStatsWindowFixture(t *testing.T, d *sql.DB) {
 	t.Helper()
 	exec := func(sqlText string, args ...any) {
@@ -94,18 +94,15 @@ func seedStatsWindowFixture(t *testing.T, d *sql.DB) {
 		}
 	}
 	exec(`INSERT INTO users(id, username, password_hash, role) VALUES (7,'dev','x','DEVELOPER')`)
-	exec(`INSERT INTO channels(id, name, base_url) VALUES (1,'渠道A','http://a'),(2,'渠道B','http://b')`)
-	exec(`INSERT INTO channel_keys(id, channel_id, name, credential_enc) VALUES (100,1,'k1','enc'),(200,2,'k2','enc')`)
+	// 渠道族表已随 0024 删除：归属只看账单里的对外模型文本是否命中目录。
 	exec(`INSERT INTO external_models(id, external_name) VALUES (31,'gpt-4o')`)
-	// 只有渠道 1 + gpt-4o-int 配了解析映射；ghost-int 在渠道 2 没有配置。
-	exec(`INSERT INTO channel_models(id, channel_id, internal_model_id, external_model_id) VALUES (900,1,'gpt-4o-int',31)`)
-	exec(`INSERT INTO billing_records(id,billing_id,user_id,pricing_mode,external_model_name,internal_model_id,channel_key_id,r_value,tokens,credits_consumed,cost_credits,status,duration_ms,call_time) VALUES
-	 (1,'w1',7,'sale','gpt-4o','gpt-4o-int',100,1,'{"input":100,"cache_read":0,"output":0}'::jsonb,1.0,0.5,'completed',1000,'2026-10-24 23:59:00+08'),
-	 (2,'w2',7,'sale','gpt-4o','gpt-4o-int',100,1,'{"input":200,"cache_read":0,"output":0}'::jsonb,2.0,1.0,'completed',2000,'2026-10-25 00:01:00+08'),
-	 (3,'w3',7,'sale','gpt-4o','gpt-4o-int',100,1,'{"input":400,"cache_read":0,"output":0}'::jsonb,4.0,2.0,'completed',4000,'2026-10-24 11:00:00+08'),
-	 (4,'w4',7,'sale','gpt-4o','gpt-4o-int',100,1,'{"input":800,"cache_read":0,"output":0}'::jsonb,8.0,4.0,'completed',8000,'2026-10-25 12:30:00+08'),
-	 (5,'w5',7,'sale','gpt-4o-legacy','gpt-4o-int',100,1,'{"input":50,"cache_read":0,"output":0}'::jsonb,0.5,0.25,'completed',500,'2026-10-25 09:00:00+08'),
-	 (6,'w6',7,'sale','ghost-model','ghost-int',200,1,'{"input":70,"cache_read":0,"output":0}'::jsonb,0.7,0.35,'completed',700,'2026-10-25 10:00:00+08')`)
+	exec(`INSERT INTO billing_records(id,billing_id,user_id,pricing_mode,external_model_name,internal_model_id,r_value,tokens,credits_consumed,cost_credits,status,duration_ms,call_time) VALUES
+	 (1,'w1',7,'sale','gpt-4o','gpt-4o-int',1,'{"input":100,"cache_read":0,"output":0}'::jsonb,1.0,0.5,'completed',1000,'2026-10-24 23:59:00+08'),
+	 (2,'w2',7,'sale','gpt-4o','gpt-4o-int',1,'{"input":200,"cache_read":0,"output":0}'::jsonb,2.0,1.0,'completed',2000,'2026-10-25 00:01:00+08'),
+	 (3,'w3',7,'sale','gpt-4o','gpt-4o-int',1,'{"input":400,"cache_read":0,"output":0}'::jsonb,4.0,2.0,'completed',4000,'2026-10-24 11:00:00+08'),
+	 (4,'w4',7,'sale','gpt-4o','gpt-4o-int',1,'{"input":800,"cache_read":0,"output":0}'::jsonb,8.0,4.0,'completed',8000,'2026-10-25 12:30:00+08'),
+	 (5,'w5',7,'sale','gpt-4o-legacy','gpt-4o-int',1,'{"input":50,"cache_read":0,"output":0}'::jsonb,0.5,0.25,'completed',500,'2026-10-25 09:00:00+08'),
+	 (6,'w6',7,'sale','ghost-model','ghost-int',1,'{"input":70,"cache_read":0,"output":0}'::jsonb,0.7,0.35,'completed',700,'2026-10-25 10:00:00+08')`)
 }
 
 // statsUsageForTest 按给定查询串跑一次 buildStatsUsage（admin 口径、全局范围）。
@@ -133,7 +130,7 @@ func statsUsageForTest(t *testing.T, store *billing.SqlStore, query string, now 
 // TestStats_WindowAndPlaza 覆盖 PR #61 Owl P2 的四条校验：
 //  1. 滚动 24h 边界（跨自然日 00:00 前后各一条都在窗口内；窗口外的两条都不在）；
 //  2. KPI 与小时趋势同窗口（趋势各桶之和 == KPI 总量）；
-//  3. 改名/别名用量不丢（旧文本靠实体解析归到同一模型）+ 无法解析的进「未匹配」行；
+//  3. 认得出的进目录行、认不出的进「未匹配」行（0024 后归属只看对外模型文本，改名前的旧文本算未匹配）；
 //  4. 广场各行汇总与同窗口总量守恒（差值为 0）。
 func TestStats_WindowAndPlaza(t *testing.T) {
 	d := openStatsTempDB(t)
@@ -149,7 +146,7 @@ func TestStats_WindowAndPlaza(t *testing.T) {
 	out := statsUsageForTest(t, store, query, now)
 
 	// ---- ① 滚动 24h 边界 ----
-	// 窗口内 4 条：100 + 200 + 50(改名) + 70(未匹配) = 420；请求 4 次。
+	// 窗口内 4 条：100 + 200 + 50(旧名) + 70(未匹配) = 420；请求 4 次。
 	if out.KPI.TotalTokens != 420 || out.KPI.TotalRequests != 4 {
 		t.Fatalf("KPI 窗口口径错: tokens=%d calls=%d，want 420/4（窗口外的 400+800 不得计入）",
 			out.KPI.TotalTokens, out.KPI.TotalRequests)
@@ -174,7 +171,7 @@ func TestStats_WindowAndPlaza(t *testing.T) {
 			hourlyTokens, hourlyCalls, out.KPI.TotalTokens, out.KPI.TotalRequests)
 	}
 
-	// ---- ③ 改名/别名不丢 + 未匹配兜底 ----
+	// ---- ③ 目录归属 + 未匹配兜底 ----
 	var gpt, unmatched *billing.DashModelStat
 	for i := range out.ModelPlaza.List {
 		switch {
@@ -187,15 +184,16 @@ func TestStats_WindowAndPlaza(t *testing.T) {
 	if gpt == nil {
 		t.Fatalf("广场缺少 gpt-4o 行: %+v", out.ModelPlaza.List)
 	}
-	// 改名前的 gpt-4o-legacy 用量必须仍归到 gpt-4o：100+200+50=350，3 次请求。
-	if gpt.Tokens != 350 || gpt.Calls != 3 {
-		t.Fatalf("改名用量丢了：gpt-4o tokens=%d calls=%d，want 350/3", gpt.Tokens, gpt.Calls)
+	// 只有名字命中目录的两条归到 gpt-4o：100+200=300，2 次请求。
+	// （改名前的 gpt-4o-legacy 在 0024 后没有解析依据 → 落到未匹配行，见下一条断言。）
+	if gpt.Tokens != 300 || gpt.Calls != 2 {
+		t.Fatalf("gpt-4o tokens=%d calls=%d，want 300/2", gpt.Tokens, gpt.Calls)
 	}
 	if unmatched == nil {
 		t.Fatalf("缺少「未匹配」行: %+v", out.ModelPlaza.List)
 	}
-	if unmatched.Calls != 1 || unmatched.Tokens != 70 {
-		t.Fatalf("未匹配行用量错: %+v", unmatched)
+	if unmatched.Calls != 2 || unmatched.Tokens != 120 {
+		t.Fatalf("未匹配行应含「旧名 50」+「目录里没有的 70」共 120 token / 2 次: %+v", unmatched)
 	}
 	// 未匹配行不计入目录口径。
 	if out.ModelPlaza.Total != 1 || out.ModelPlaza.Active != 1 {
@@ -277,17 +275,13 @@ func TestStats_SoftDeletedModelGoesUnmatched(t *testing.T) {
 		}
 	}
 	exec(`INSERT INTO users(id, username, password_hash, role) VALUES (7,'dev','x','DEVELOPER')`)
-	exec(`INSERT INTO channels(id, name, base_url) VALUES (1,'渠道A','http://a'),(2,'渠道B','http://b')`)
-	exec(`INSERT INTO channel_keys(id, channel_id, name, credential_enc) VALUES (100,1,'k1','enc'),(200,2,'k2','enc')`)
-	// 701 稍后软删；702 保持在册。
+	// 701 稍后软删；702 保持在册。（渠道族表已随 0024 删除，归属只看对外模型文本。）
 	exec(`INSERT INTO external_models(id, external_name) VALUES (701,'legacy-model'),(702,'gpt-4o')`)
-	exec(`INSERT INTO channel_models(id, channel_id, internal_model_id, external_model_id) VALUES
-	       (900,1,'legacy-int',701), (901,1,'gpt-4o-int',702)`)
-	exec(`INSERT INTO billing_records(id,billing_id,user_id,pricing_mode,external_model_name,internal_model_id,channel_key_id,r_value,tokens,credits_consumed,cost_credits,status,duration_ms,call_time) VALUES
-	 (1,'s1',7,'sale','gpt-4o','gpt-4o-int',100,1,'{"input":400,"cache_read":0,"output":0}'::jsonb,4.0,2.0,'completed',1000,'2026-10-25 09:00:00+08'),
-	 (2,'s2',7,'sale','gpt-4o','gpt-4o-int',100,1,'{"input":50,"cache_read":0,"output":0}'::jsonb,0.5,0.25,'completed',500,'2026-10-25 09:30:00+08'),
-	 (3,'s3',7,'sale','legacy-model','legacy-int',100,1,'{"input":60,"cache_read":0,"output":0}'::jsonb,0.6,0.3,'completed',600,'2026-10-25 10:00:00+08')`)
-	// 软删 701：历史账单仍在，实体解析仍能解析到 701（解析不看 deleted_at），但目录里它不算在册。
+	exec(`INSERT INTO billing_records(id,billing_id,user_id,pricing_mode,external_model_name,internal_model_id,r_value,tokens,credits_consumed,cost_credits,status,duration_ms,call_time) VALUES
+	 (1,'s1',7,'sale','gpt-4o','gpt-4o-int',1,'{"input":400,"cache_read":0,"output":0}'::jsonb,4.0,2.0,'completed',1000,'2026-10-25 09:00:00+08'),
+	 (2,'s2',7,'sale','gpt-4o','gpt-4o-int',1,'{"input":50,"cache_read":0,"output":0}'::jsonb,0.5,0.25,'completed',500,'2026-10-25 09:30:00+08'),
+	 (3,'s3',7,'sale','legacy-model','legacy-int',1,'{"input":60,"cache_read":0,"output":0}'::jsonb,0.6,0.3,'completed',600,'2026-10-25 10:00:00+08')`)
+	// 软删 701：历史账单仍在，但目录里它不算在册 → 用量必须落到「未匹配」行（不许静默丢）。
 	exec(`UPDATE external_models SET deleted_at = now() WHERE id = 701`)
 
 	store := billing.NewSqlStore(d)
