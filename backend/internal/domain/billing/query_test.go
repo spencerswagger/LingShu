@@ -10,7 +10,7 @@ import (
 )
 
 // TestListRecords_FilterByKeyAndSession 断言 ListRecords 按渠道密钥 / 会话维度过滤：
-// WHERE 的密钥维度取 COALESCE(调用日志快照, 本表列)（列这一半随 0021 同批删除），
+// WHERE 的密钥维度取 COALESCE(调用日志快照, 本表列)（列这一半随 0024 已删除，见 0024_v2_drop_legacy.sql），
 // session_id 等其余条件与参数位不变。
 func TestListRecords_FilterByKeyAndSession(t *testing.T) {
 	db, mock, err := sqlmock.New()
