@@ -421,7 +421,19 @@ func (s *Service) settleTx(ctx context.Context, rec *Record, req RecordReq, cred
 	}
 	defer tx.Rollback() //nolint:errcheck // Commit 成功后 Rollback 是 no-op
 
-	before, after, err := s.consumeInTx(ctx, tx, rec, req, credits)
+	// 预扣终结必须与本次结算同事务、且**先于扣款**（Owl 复审 P1，2026-11-16）：
+	// 旧写法把终结放在事务尾、且丢弃 owned=false，于是「请求活过 15 分钟 → ExpireHolds 已全额退回
+	// 预扣 → 本次结算又按 credits-PreConsumed 减一次预扣」= **重复退款**（实测 credits=12/预扣 10
+	// 时余额多出 10）。先抢终结权后，未被终结（owned=false）说明预扣已经退过，本次必须按全额扣。
+	holdOwned, herr := closeHoldInTx(ctx, tx, req.Hold)
+	if herr != nil {
+		_ = tx.Rollback()
+		slog.ErrorContext(ctx, "billing tx rolled back: hold close failed",
+			"billing_id", rec.BillingID, "user_id", rec.UserID, "err", herr)
+		return nil, herr, true
+	}
+
+	before, after, err := s.consumeInTx(ctx, tx, rec, req, credits, holdOwned)
 	if err != nil {
 		// 扣款失败（40201 余额不足 / 40401 钱包缺失等）：先回滚，再在事务外落 failed 账单
 		// （否则 failed 记录会随回滚一起丢掉），并透传原始错误（网关据此映射 402）。
@@ -457,15 +469,6 @@ func (s *Service) settleTx(ctx context.Context, rec *Record, req RecordReq, cred
 		// 其失败由重试队列兜底。
 		return nil, ierr, false
 	}
-	// 预扣终结必须与本次结算同事务（Owl 复审 P1）：
-	// 分两次写会出现「账单 completed + 余额已动，但 hold 仍 held」→ 过期扫描全额退回 = 白送一笔。
-	// 终结失败就整体回滚（账单没落、余额没动），调用方按失败处理并走退款路径。
-	if err := closeHoldInTx(ctx, tx, req.Hold); err != nil {
-		_ = tx.Rollback()
-		slog.ErrorContext(ctx, "billing tx rolled back: hold close failed",
-			"billing_id", rec.BillingID, "user_id", rec.UserID, "err", err)
-		return nil, err, true
-	}
 	if cerr := tx.Commit(); cerr != nil {
 		// 提交结果不确定（可能已提交）：不重投，避免重复扣款，直接报错。
 		return nil, fmt.Errorf("commit billing tx: %w", cerr), true
@@ -473,15 +476,19 @@ func (s *Service) settleTx(ctx context.Context, rec *Record, req RecordReq, cred
 	return rec, nil, true
 }
 
-// closeHoldInTx 在结算事务内终结预扣登记（req 为 nil 或无 Closer 时是空操作）。
-func closeHoldInTx(ctx context.Context, ex dbx.Execer, req *HoldCloseReq) error {
+// closeHoldInTx 在结算事务内终结预扣登记，返回「本次是否真的由我终结」。
+//
+// req 为 nil 或无 Closer 时返回 true：调用方没有预扣登记（如历史 V1 链路），
+// 扣款按「有预扣」的差额口径走（保持既有行为），不因缺 hold 而多扣。
+func closeHoldInTx(ctx context.Context, ex dbx.Execer, req *HoldCloseReq) (bool, error) {
 	if req == nil || req.Closer == nil {
-		return nil
+		return true, nil
 	}
-	if _, err := req.Closer.CloseHoldTx(ctx, ex, req.BillingID, req.Status, req.LedgerEntryID); err != nil {
-		return fmt.Errorf("结算事务内终结预扣失败：%w", err)
+	owned, err := req.Closer.CloseHoldTx(ctx, ex, req.BillingID, req.Status, req.LedgerEntryID)
+	if err != nil {
+		return false, fmt.Errorf("结算事务内终结预扣失败：%w", err)
 	}
-	return nil
+	return owned, nil
 }
 
 // isDeterministicWriteError 判断账单写入失败是否属于「重投也没用」的确定性错误：
@@ -513,7 +520,15 @@ func isDeterministicWriteError(err error) bool {
 
 // settlePlain 非事务路径（txdb 未注入）：扣款与落库独立执行，语义与历史行为一致。
 func (s *Service) settlePlain(ctx context.Context, rec *Record, req RecordReq, credits float64) (*Record, error) {
-	before, after, err := s.consumeInTx(ctx, nil, rec, req, credits)
+	// 非事务路径没有原子性可言（仅测试/未装配 txdb 时走到这里）：终结与扣款无法同事务，
+	// 但仍要先终结再扣款 —— 只有先拿到 owned 才能判断「预扣是否已被过期扫描退回」。
+	// 失败不阻断（历史行为），但要留下 ERROR 级痕迹，别让「钱扣了 hold 还 held」静默发生。
+	holdOwned, herr := closeHoldInTx(ctx, nil, req.Hold)
+	if herr != nil {
+		slog.ErrorContext(ctx, "hold close failed on non-transactional path",
+			"billing_id", rec.BillingID, "err", herr)
+	}
+	before, after, err := s.consumeInTx(ctx, nil, rec, req, credits, holdOwned)
 	if err != nil {
 		return s.insertFailedOutOfTx(ctx, rec, err)
 	}
@@ -532,24 +547,28 @@ func (s *Service) settlePlain(ctx context.Context, rec *Record, req RecordReq, c
 		s.enqueueRetry(rec, err)
 		return nil, err
 	}
-	// 非事务路径（txdb 未注入，仅测试/未装配）：没有事务可用，终结只能after-the-fact 做，
-	// 不能提供原子保证 —— 生产装配必须注入 txdb（cmd/server 已注入）。
-	if err := closeHoldInTx(ctx, nil, req.Hold); err != nil {
-		slog.ErrorContext(ctx, "hold close failed on non-transactional path",
-			"billing_id", rec.BillingID, "err", err)
-	}
 	return rec, nil
 }
 
 // consumeInTx 执行钱包扣减/差额结算：ex 为 nil 时走非事务版本（无 Tx 能力的 credit 桩）。
 // 返回扣减前后的余额。
-func (s *Service) consumeInTx(ctx context.Context, ex dbx.Execer, rec *Record, req RecordReq, credits float64) (before, after float64, err error) {
-	if req.PreConsumed > 0 {
+// holdOwned 表示「预扣登记是本次结算终结的」（见 closeHoldInTx）。
+//
+// false 的语义是**预扣已经不在 held 状态**：最典型的是请求活超过 15 分钟、
+// ExpireHolds 已把整笔预扣全额退回钱包。此时再按 credits-PreConsumed 结算
+// 等于把已经退过的预扣又减一次（重复退款），所以必须按全额扣。
+func (s *Service) consumeInTx(ctx context.Context, ex dbx.Execer, rec *Record, req RecordReq, credits float64, holdOwned bool) (before, after float64, err error) {
+	if req.PreConsumed > 0 && holdOwned {
 		delta := credits - req.PreConsumed
 		if ex != nil {
 			return s.credit.SettleTx(ctx, ex, req.UserID, delta, req.SessionID, "实际调用差额")
 		}
 		return s.credit.Settle(ctx, req.UserID, delta, req.SessionID, "实际调用差额")
+	}
+	if req.PreConsumed > 0 {
+		// 预扣已被别的路径终结（过期退回）：按全额扣，绝不再退预扣。
+		slog.WarnContext(ctx, "pre-consumed hold already closed before settle, charging full amount",
+			"billing_id", rec.BillingID, "user_id", req.UserID, "pre_consumed", req.PreConsumed, "credits", credits)
 	}
 	if ex != nil {
 		return s.credit.ConsumeTx(ctx, ex, req.UserID, credits, rec.BillingID, req.SessionID, "实际调用差额")

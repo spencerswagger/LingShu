@@ -38,7 +38,7 @@ type ExternalModel struct {
 	// nil / 空串表示未映射 —— 不转发（准入层直接拒绝）。
 	MagpieModel *string
 	// BoundInternalRef 是绑定的内部模型 ref（0019_topology 的绑定真源，0024 保留）：
-	// nil = 未绑定。当前**只读**（管理端列表展示与「未绑定不售卖」提示用），
+	// nil = 未绑定。当前**只读**（管理端列表展示绑定状态用；本期不拦截，见 0019 头部事实校正），
 	// 写入口属阶段三 T5（PUT /admin/models/{id}/binding），尚未实现。
 	BoundInternalRef *string
 	CreatedAt        time.Time
@@ -47,7 +47,7 @@ type ExternalModel struct {
 
 // cols 列出 external_models 表查询使用的全部列。
 // bound_internal_ref（0019_topology，绑定真源、0024 保留）**只读**：管理端列表要展示它，
-// 否则前端「未绑定 · 不售卖」横幅永远不触发（列表拿不到字段）。写入仍是阶段三 T5 的事。
+// 否则前端「未绑定」提醒条永远不触发（列表拿不到字段）。写入仍是阶段三 T5 的事。
 const cols = `id, external_name, description, enabled, sale_rates, time_config, context_tiers, aliases, magpie_model, bound_internal_ref, created_at, updated_at`
 
 // scanExternal 将一行扫描到 *ExternalModel，解析 sale_rates/time_config/context_tiers/aliases JSONB。
@@ -66,7 +66,7 @@ func scanExternal(row interface{ Scan(...any) error }) (*ExternalModel, error) {
 		m.MagpieModel = &v
 	}
 	// bound_internal_ref 可空：NULL 与空串都归一为 nil（「未绑定」只有一种表示，
-	// 前端据此渲染红色「未绑定 · 不售卖」，别用空串冒充已绑定）。
+	// 前端据此渲染「未绑定」提醒，别用空串冒充已绑定）。
 	if boundRef.Valid && strings.TrimSpace(boundRef.String) != "" {
 		v := strings.TrimSpace(boundRef.String)
 		m.BoundInternalRef = &v

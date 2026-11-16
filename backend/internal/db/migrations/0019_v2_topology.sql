@@ -39,7 +39,11 @@ CREATE INDEX IF NOT EXISTS idx_internal_models_provider ON internal_models(provi
 CREATE INDEX IF NOT EXISTS idx_internal_models_kind     ON internal_models(kind);
 CREATE INDEX IF NOT EXISTS idx_internal_models_live     ON internal_models(last_seen_at) WHERE stale = false;
 
--- 绑定真源（唯一）：NULL = 未绑定 = 不售卖（对外模型列表按 enabled AND bound_internal_ref IS NOT NULL 过滤）。
+-- 绑定真源（唯一）：NULL = 未绑定。
+--   ⚠️ 事实校正（2026-11-16）：未绑定的模型**当前仍可被调用**——`/v1/models` 可见性与转发准入
+--   的判据仍是 `enabled` + `magpie_model` 非空，**没有**按 bound_internal_ref 过滤。
+--   本期只做「登记 + 管理端展示绑定状态（含前端未绑定提醒）」，不做拦截；
+--   「未绑定即不售卖」是待产品拍板的售卖规则变更，成文后再改判据，别照这行注释去推断现有行为。
 ALTER TABLE external_models ADD COLUMN IF NOT EXISTS bound_internal_ref TEXT;
 CREATE INDEX IF NOT EXISTS idx_external_models_bound
     ON external_models(bound_internal_ref) WHERE bound_internal_ref IS NOT NULL;

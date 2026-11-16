@@ -133,7 +133,7 @@ func expectChannelKeyFill(mock sqlmock.Sqlmock, pairs ...any) {
 		WillReturnRows(rows)
 }
 
-func newTestService(db *sql.DB, credit *fakeCredit, cfg ConfigProvider, now time.Time) *Service {
+func newTestService(db *sql.DB, credit CreditService, cfg ConfigProvider, now time.Time) *Service {
 	return &Service{
 		store:  NewSqlStore(db),
 		cfg:    cfg,
@@ -143,7 +143,7 @@ func newTestService(db *sql.DB, credit *fakeCredit, cfg ConfigProvider, now time
 }
 
 // newTxTestService 装配事务路径的 Service（txdb 注入 *sql.DB）。
-func newTxTestService(db *sql.DB, credit *fakeCredit, cfg ConfigProvider, now time.Time) *Service {
+func newTxTestService(db *sql.DB, credit CreditService, cfg ConfigProvider, now time.Time) *Service {
 	svc := newTestService(db, credit, cfg, now)
 	svc.SetTxBeginner(db)
 	return svc
