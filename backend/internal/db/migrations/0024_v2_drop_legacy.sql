@@ -55,11 +55,24 @@
 --       ⚠️ 旧分支的两个文件名若出现过，**不在这里排掉**（0019_v2_facade.sql /
 --          0020_reconcile_blocked_status.sql）——它们正是「这个库跑过旧链」的信号。
 --    ② 对象层（旧分支独有对象，只是技术探测串，不得进任何界面文案）：
---       billing_records.magpie_key_name / estimated / upstream_usage 任一列存在 → 期望 0 行
---       ⚠️ **不许再把 magpie_keys / external_models.magpie_model 当信号**：按 #81 的裁定（走方案 A）
+--       ⚠️ **口径变更（2026-11-16 裁定）**：`billing_records` 的 magpie_key_name / estimated /
+--          upstream_usage 三列**存在，不再是异常**。本期不动这三列（0019b 对 billing_records
+--          保持零改动），它们只随阶段二的新形处理。因此探测② 不再用「列存在」判红 ——
+--          存在与不存在都继续执行。原来那条「任一列存在 → 期望 0 行」与 0019b 的「零改动」
+--          自相矛盾（互斥口径，复审指出），已作废。
+--          改守两条**可验证事实**：
+--          a) 写入/引用为 0（代码级）：`TestBilling_LegacyColumnsHaveNoWriter` 扫非测试源码，
+--             账单域出现这三列名（注释除外）即红；另有真实库用例在「三列存在」的库上插入
+--             一条账单，断言三列仍为 NULL。
+--             ⚠️ 列还在 → 误写会**静默成功**：不报错、账单照出，只有这两道守卫拦得住。
+--          b) 无新数据（数据级）：
+--             SELECT count(*) FROM billing_records
+--              WHERE magpie_key_name IS NOT NULL OR estimated IS NOT NULL OR upstream_usage IS NOT NULL
+--             → 历史库若已被旧分支写过，属历史数据、不算本批缺陷；**本批上线后新增行必须为 0**。
+--       ⚠️ 仍**不许**把 magpie_keys / external_models.magpie_model 当信号**：按 #81 的裁定（走方案 A）
 --          这两样是被转发链代码使用的正式对象，已由 0019b_v2_passthrough_credentials.sql 收回本链，
 --          它们存在是**正常**的（把它们判成「旧分支遗留」会永远误报，并把该删的会话/令牌写路径带偏）。
---          真正标记旧链的是 facade 独有的账单三列与旧形状的窗口表（见 ③）。
+--       旧链的另一路信号是**旧形状的窗口表**（见 ③）与记录层里旧文件名（见 ①）。
 --    ③ 形状层：reconcile_windows 的列清单
 --       → 期望 0 行（未建）或列齐全（含 scroll_offset / 四计数列）；缺 local_count 即「被跳过」
 --    ④ 反查（**S4 专用，前三条判不出来**）：按已记文件名核它该建的对象是否真的在 ——
