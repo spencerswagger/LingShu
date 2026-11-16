@@ -233,3 +233,19 @@ DOM 走查 `/data/pv/v2-auto-removal-check.mjs`（模型页无 Auto 切换、6 �
 
 走查脚本 `/data/pv/v2-owl-p2-check.mjs`（11 项：模型页无「不售卖」/「404」字样、横幅与 tag 措辞、Pnl 缺两段时显示「未测算」且合计未被 0 污染）全绿；另 4 个既有脚本（13 页基线 / 对齐 38 断言 / 渠道摘除 / Auto 摘除）复跑仍全绿。
 
+### 8.3 盈亏页按后端契约收敛到单一 `Uncosted` 口径（2026-11-16，Core 确认后小改）
+
+**契约事实（Core 确认）**：PnL 只返回 `Uncosted` 一个口径；`Unconfigured` / `NoneCost` **从来不返回**，且当前 schema 下**无法区分** —— 约束 `ck_billing_cost_presence` 强制「`cost_credits IS NULL` ⇒ `cost_source = 'none'`」，所以「历史未配置（`cost_source IS NULL`）」这种行不存在。是有意不返回，不是漏字段。
+
+改法（撤掉占位，不造状态）：
+
+| 项 | 处理 |
+|---|---|
+| `PnlView.Unconfigured` / `NoneCost` | **从类型与归一化里删除**（连同上一版为它们写的 `number \| null` / 「未测算」渲染），前端不再虚构两段拆分 |
+| 统计卡提示 | 只讲 `Uncosted`：「N 笔请求成本为空（`cost_source=none`）→ 只计收入不计成本，毛利虚高」 |
+| 提示条文案 | 明写「当前 schema 下必定 `cost_source=none`，后端只提供这一个合计口径、不拆历史」；跳转筛选改 `?cost_source=none`（原来指向不存在的 `unconfigured`） |
+| 合计口径 | 不变：收入 / 成本 / 毛利 / 毛利率只取后端 `Revenue` / `Cost` / `Margin` / `MarginPct`，恒等式自检逻辑未动 |
+| mock | `mock/pnl.ts` 删掉 `Unconfigured` / `NoneCost`（演示态同样只有 `Uncosted`） |
+
+**顺带修掉一个显示缺陷**：`el-alert` 同时给 `:description` 和 `#default` 插槽时，Element Plus 用插槽内容顶掉 description —— 该提示条的说明文字此前**根本没渲染**（页面上只剩标题和按钮）。现把说明移进默认插槽（`.uncosted-body`），实测可见。全仓 V2 页面扫过，只有这一处是「`description` + 默认插槽」并存。
+
