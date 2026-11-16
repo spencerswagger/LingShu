@@ -139,12 +139,11 @@ export interface PnlView {
   Cost: number
   Margin: number
   MarginPct: number | null
-  // Uncosted = 没有成本口径的请求总数（M5 要求拆成两段，语义不同，页面不许合并成 0）
+  // Uncosted = 没有成本口径的请求数（成本为空），> 0 时毛利偏高，页面必须显式提示。
+  // 契约事实（Core 2026-11-16 确认）：只有这一个口径，**没有**「历史未配置 / 明确无口径」两段拆分——
+  // 约束 ck_billing_cost_presence 强制「cost_credits IS NULL ⇒ cost_source='none'」，
+  // 「cost_source IS NULL 的行」在当前 schema 下不存在，故后端有意不返回拆分，前端也不得虚构。
   Uncosted: number
-  // Unconfigured = cost_source IS NULL（历史行，口径未知）
-  Unconfigured: number
-  // NoneCost = cost_source='none'（明确没有成本口径）
-  NoneCost: number
   Groups: PnlRow[]
   Truncated: boolean
 }
@@ -161,8 +160,6 @@ export function normalizePnl(raw: Record<string, unknown>): PnlView {
     Margin: num(pick(raw, 'Margin', 'margin')),
     MarginPct: numOrNull(pick(raw, 'MarginPct', 'margin_pct')),
     Uncosted: num(pick(raw, 'Uncosted', 'uncosted')),
-    Unconfigured: num(pick(raw, 'Unconfigured', 'unconfigured')),
-    NoneCost: num(pick(raw, 'NoneCost', 'none_cost')),
     Truncated: Boolean(pick(raw, 'Truncated', 'truncated')),
     Groups: arr(pick(raw, 'Groups', 'groups')).map((g) => ({
       Key: str(pick(g, 'Key', 'key')),

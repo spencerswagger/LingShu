@@ -212,3 +212,40 @@ DOM 走查 `/data/pv/v2-auto-removal-check.mjs`（模型页无 Auto 切换、6 �
 
 **未动（明确不属本轮）**：令牌 `callerKey`（前端本无绑定入口，不新做）、模型「内部模型绑定」列（后端列表接口未返回该字段，属 Core 侧契约缺口，前端不造假数据）。
 
+### 8.2 Owl 复审两处 P2 修正（2026-11-16）
+
+**① 「未绑定」文案改为与事实一致（不再承诺拦截）**
+
+裁定事实：本批**不拦截**；绑定能力**尚未上线**——全仓 0 处写 `bound_internal_ref`（只有迁移建列 + 部分索引，注释写明只读），`/admin/topology`、`/admin/internal-models`、`/admin/subscriptions` 均 404，`internal_models`/`model_links`/`subscriptions` 无生产写入；自建库 10 个未绑定模型全部可正常调用（100% 未拦）。
+
+统一改法（三处一种说法）：**「未绑定」+ 「绑定能力尚未上线，当前不拦截」**，任何页面不再出现「不售卖」「`/v1/models` 不可见」「请求 404」，也不出现「上线前置项要求这个数为 0」这类隐含拦截承诺。
+
+| 位置 | 改法 |
+|---|---|
+| `ModelList.vue` 横幅 | 标题「…未绑定内部模型（**仅提示，不拦截**）」；描述「N 个：绑定能力尚未上线，当前不拦截、不影响调用；等绑定功能上线后再要求这个数为 0」 |
+| `ModelList.vue` 绑定列标记 | 红色 tag「未绑定 · 不售卖」→ 中性 info tag「**未绑定**」，tooltip「未绑定内部模型：绑定能力尚未上线，当前不拦截」 |
+| `Topology.vue` 统计块 hint | 「未绑定 = 不售卖（客户端请求 404）」→「绑定能力尚未上线，当前不拦截；此处只作事实展示」 |
+| `api/admin.ts` 字段注释 | `null = 已上线但未绑定（绑定能力未上线，当前不拦截）` |
+
+**② 盈亏页缺失值不再渲染成 0**
+
+`PnlView.Unconfigured / NoneCost` 改为 `number | null`（`numOrNull` 归一化），页面用 `count()` 统一渲染：`null → 「未测算」`，绝不落 0；`uncostedHint()` 里任一段缺失即写「未测算」并追加「缺失项未计入任何合计」。两段只解释 `Uncosted` 的构成，**不参与收入/成本/毛利任何加总**（合计只认后端返回的 `Revenue/Cost/Margin/MarginPct`）。
+
+走查脚本 `/data/pv/v2-owl-p2-check.mjs`（11 项：模型页无「不售卖」/「404」字样、横幅与 tag 措辞、Pnl 缺两段时显示「未测算」且合计未被 0 污染）全绿；另 4 个既有脚本（13 页基线 / 对齐 38 断言 / 渠道摘除 / Auto 摘除）复跑仍全绿。
+
+### 8.3 盈亏页按后端契约收敛到单一 `Uncosted` 口径（2026-11-16，Core 确认后小改）
+
+**契约事实（Core 确认）**：PnL 只返回 `Uncosted` 一个口径；`Unconfigured` / `NoneCost` **从来不返回**，且当前 schema 下**无法区分** —— 约束 `ck_billing_cost_presence` 强制「`cost_credits IS NULL` ⇒ `cost_source = 'none'`」，所以「历史未配置（`cost_source IS NULL`）」这种行不存在。是有意不返回，不是漏字段。
+
+改法（撤掉占位，不造状态）：
+
+| 项 | 处理 |
+|---|---|
+| `PnlView.Unconfigured` / `NoneCost` | **从类型与归一化里删除**（连同上一版为它们写的 `number \| null` / 「未测算」渲染），前端不再虚构两段拆分 |
+| 统计卡提示 | 只讲 `Uncosted`：「N 笔请求成本为空（`cost_source=none`）→ 只计收入不计成本，毛利虚高」 |
+| 提示条文案 | 明写「当前 schema 下必定 `cost_source=none`，后端只提供这一个合计口径、不拆历史」；跳转筛选改 `?cost_source=none`（原来指向不存在的 `unconfigured`） |
+| 合计口径 | 不变：收入 / 成本 / 毛利 / 毛利率只取后端 `Revenue` / `Cost` / `Margin` / `MarginPct`，恒等式自检逻辑未动 |
+| mock | `mock/pnl.ts` 删掉 `Unconfigured` / `NoneCost`（演示态同样只有 `Uncosted`） |
+
+**顺带修掉一个显示缺陷**：`el-alert` 同时给 `:description` 和 `#default` 插槽时，Element Plus 用插槽内容顶掉 description —— 该提示条的说明文字此前**根本没渲染**（页面上只剩标题和按钮）。现把说明移进默认插槽（`.uncosted-body`），实测可见。全仓 V2 页面扫过，只有这一处是「`description` + 默认插槽」并存。
+

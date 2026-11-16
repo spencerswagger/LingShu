@@ -45,8 +45,6 @@ export function mockPnl(groupBy: 'provider' | 'account' | 'model' = 'provider'):
     Margin: 800,
     MarginPct: 0.4,
     Uncosted: 900,
-    Unconfigured: 900,
-    NoneCost: 0,
     Groups: groups,
     Truncated: false,
   }

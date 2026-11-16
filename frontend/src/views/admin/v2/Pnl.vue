@@ -5,7 +5,11 @@
 //   收入 = Σ credits_consumed（用户售价口径）
 //   成本 = Σ cost_credits，按 cost_source 拆「账本实付（变动）+ 订阅摊销（固定）」
 //   毛利 = 收入 − 成本；收入 ≤ 0 时毛利率返回 null（后端刻意不返回 0，前端不许显示成 0%）
-//   Uncosted = 成本为 NULL 的请求数：> 0 表示这批账单还没有成本口径，毛利偏高 → 必须提示
+//   Uncosted = 成本为空的请求数：> 0 表示这批账单还没有成本口径，毛利偏高 → 必须提示。
+//   契约事实（Core 2026-11-16 确认）：**只有 Uncosted 一个口径**，后端有意不返回「拆分」——
+//   ck_billing_cost_presence 强制「cost_credits IS NULL ⇒ cost_source='none'」，
+//   「历史未配置（cost_source IS NULL）」这类行在当前 schema 下不存在。所以页面不设拆分占位，
+//   也不许把一个恒空的块画成「未测算」长期挂着（比不显示更误导）。
 import { computed, onMounted, ref } from 'vue'
 import { getPnl, type PnlGroupBy, type PnlView } from '@/api/v2'
 import { mockPnl } from '@/mock/pnl'
@@ -49,6 +53,11 @@ function money(v: number | null): string {
 }
 function pct(v: number | null): string {
   return v == null ? '—' : `${(v * 100).toFixed(2)}%`
+}
+// 无成本口径的提示语：只有 Uncosted 一个口径，不做拆分（后端不返回、schema 也分不出来）
+function uncostedHint(d: PnlView): string {
+  if (d.Uncosted <= 0) return '全部请求都有成本口径'
+  return `${fmtCompact(d.Uncosted)} 笔请求成本为空（cost_source=none）→ 只计收入不计成本，毛利虚高`
 }
 
 // 依赖徽标：拿到真实数据才标「已定型」，避免接口没上线时给出错误预期
@@ -119,10 +128,7 @@ const stats = computed<StatItem[]>(() => {
       label: '无成本口径请求',
       value: fmtCompact(d.Uncosted),
       tone: uncostedTone,
-      hint:
-        d.Uncosted > 0
-          ? `其中「历史未配置」${fmtCompact(d.Unconfigured)} 笔（cost_source IS NULL）、「明确无口径」${fmtCompact(d.NoneCost)} 笔（none）→ 毛利虚高`
-          : '全部请求都有成本口径',
+      hint: uncostedHint(d),
     },
   ]
 })
@@ -189,13 +195,17 @@ const chartOption = computed(() => {
         :closable="false"
         show-icon
         title="毛利偏高：存在没有成本口径的请求"
-        :description="`${fmtCompact(data.Uncosted)} 笔请求的 cost_credits 为空（历史未配置 ${fmtCompact(data.Unconfigured)} / 明确无口径 ${fmtCompact(data.NoneCost)}）。这些请求只计收入、不计成本，算出来的毛利不能当真实毛利。点右侧按钮按「成本来源=未配置」筛账单。`"
       >
-        <template #default>
-          <el-button size="small" @click="$router.push('/admin/billings?cost_source=unconfigured')">
-            去看这批账单
+        <!-- 说明文案放默认插槽：el-alert 同时给 :description 和默认插槽时，description 会被插槽顶掉（说明就看不见了） -->
+        <div class="uncosted-body">
+          <span>
+            {{ fmtCompact(data.Uncosted) }} 笔请求的 cost_credits 为空（当前 schema 下必定 cost_source=none，
+            后端只提供这一个合计口径、不拆历史）。这些请求只计收入、不计成本，算出来的毛利不能当真实毛利。
+          </span>
+          <el-button size="small" @click="$router.push('/admin/billings?cost_source=none')">
+            去看这批账单（按成本来源=无口径）
           </el-button>
-        </template>
+        </div>
       </el-alert>
       <el-alert
         v-if="data.Truncated"
@@ -263,6 +273,14 @@ const chartOption = computed(() => {
 </template>
 
 <style scoped>
+.uncosted-body {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  font-size: 13px;
+  line-height: 1.6;
+}
 .card {
   background: var(--color-surface);
   border: 1px solid var(--color-border);
