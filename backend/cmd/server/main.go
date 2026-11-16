@@ -28,6 +28,7 @@ import (
 	"github.com/team/llmgateway/internal/domain/console"
 	"github.com/team/llmgateway/internal/domain/gateway"
 	"github.com/team/llmgateway/internal/domain/identity"
+	"github.com/team/llmgateway/internal/domain/ledgersettle"
 	"github.com/team/llmgateway/internal/domain/model"
 	"github.com/team/llmgateway/internal/domain/reconcile"
 	"github.com/team/llmgateway/internal/domain/router"
@@ -801,6 +802,38 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 				}
 				if res.Expired > 0 {
 					logr.Info("退回超时未结算的预扣", "holds", res.Expired, "credits", res.Amount)
+				}
+			}()
+		}
+	}()
+
+	// 阶段二 A3：账本结算（账本条目 → 账单成本列 + 预扣登记）。
+	// 与同步轮次分开的 60s 循环：同步负责「拉」，结算负责「挂」，两者失败互不影响。
+	settler := ledgersettle.NewMatcher(ledgersettle.Options{
+		Store:  ledgersettle.NewSQLStore(d),
+		Now:    time.Now,
+		Logger: logr,
+	})
+	go func() {
+		t := time.NewTicker(time.Minute)
+		defer t.Stop()
+		for range t.C {
+			func() {
+				defer func() {
+					if rec := recover(); rec != nil {
+						logr.Error("账本结算轮次 panic", "panic", rec)
+					}
+				}()
+				res, err := settler.RunOnce(context.Background())
+				if err != nil {
+					logr.Warn("账本结算轮次失败（窗口保留待下轮）", "err", err)
+					return
+				}
+				if res.Linked > 0 || res.UnmatchedBilling > 0 || res.UnmatchedLedger > 0 {
+					logr.Info("账本结算轮次完成",
+						"linked", res.Linked, "skipped", res.Skipped,
+						"unmatched_billing", res.UnmatchedBilling,
+						"unmatched_ledger", res.UnmatchedLedger, "cost", res.Cost)
 				}
 			}()
 		}
