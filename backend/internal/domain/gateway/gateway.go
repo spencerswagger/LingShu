@@ -119,6 +119,18 @@ type CreditOps interface {
 	Refund(ctx context.Context, userID int64, amount float64, remark string) error
 }
 
+// HoldOps 是可选的「预扣登记」能力（阶段二 A1，V2 主链使用）。
+//
+// 为什么单独一个接口而不是塞进 CreditOps：V1 不用它（V1 的预扣-退款是既成路径，
+// 动它等于把线上主链路一起改），而 V2 需要「扣了钱有登记、进程死了能退回」。
+// 实现方是 identity.CreditService（PreConsumeHold / CloseHold）。
+type HoldOps interface {
+	// ReserveHold 建预扣登记并原子扣款；billingID 用网关的 request_id（一请求一登记）。
+	ReserveHold(ctx context.Context, billingID string, userID, tokenID int64, amount float64, sessionID, remark string) error
+	// CloseHold 终结登记（settled / refunded）；返回 false 表示已被终结过（幂等）。
+	CloseHold(ctx context.Context, billingID, status, ledgerEntryID string) (bool, error)
+}
+
 // ProviderFactory 依据渠道协议 + 端点创建 Provider。
 type ProviderFactory func(protocol, endpoint string) (Provider, bool)
 
@@ -164,6 +176,8 @@ type Gateway struct {
 	upstreamAuth func() (name, value string)
 	// fwd 是转发执行器（懒建）。
 	fwd *magpie.Forwarder
+	// holds 是预扣登记能力（可选；nil = V2 退回「直接扣款 + 失败退回」的旧口径）。
+	holds HoldOps
 }
 
 // ProtocolConversionEnabledKey 是全局跨协议转换开关在 sys_configs 中的键（默认开启）。
@@ -188,7 +202,9 @@ type GatewayConfig struct {
 	// Balance 可选：余额前置检查（余额 <=0 时拒绝发起上游调用）。nil 时不检查（兼容旧装配）。
 	Balance BalanceResolver
 	// Credit 可选：三阶段计费（预扣/退款）。装配后启用「预扣-结算-退补」；nil 时退化为 balance 检查。
-	Credit          CreditOps
+	Credit CreditOps
+	// Holds 可选：预扣登记（阶段二 A1）。只有 V2 主链用它；nil = 不建登记（退回旧口径）。
+	Holds           HoldOps
 	ProviderFactory ProviderFactory
 	// SessionExpiry 可选：会话过期 TTL 计算（上下文长度 + 用户对话次数双维度分档）。
 	// nil 时 handler 使用内置兜底时长。
@@ -263,6 +279,7 @@ func NewGateway(cfg GatewayConfig) *Gateway {
 		pricing:             cfg.Pricing,
 		balance:             cfg.Balance,
 		credit:              cfg.Credit,
+		holds:               cfg.Holds,
 		providerFactory:     cfg.ProviderFactory,
 		sessionExpiry:       cfg.SessionExpiry,
 		touchLastUsed:       cfg.TouchLastUsed,
@@ -282,6 +299,9 @@ func NewGateway(cfg GatewayConfig) *Gateway {
 
 // SetCallLogs 注入调用日志存储（nil=不采集调用日志；测试与未装配场景安全）。
 func (g *Gateway) SetCallLogs(s CallLogStore) { g.callLogs = s }
+
+// SetCreditHolds 注入预扣登记能力（阶段二 A1；nil = 不启用）。
+func (g *Gateway) SetCreditHolds(h HoldOps) { g.holds = h }
 
 // upstreamHeaders 返回全局上游响应头白名单（未配置/读取失败返回 nil=不透传任何上游头）。
 func (g *Gateway) upstreamHeaders() []string {

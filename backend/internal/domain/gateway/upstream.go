@@ -177,7 +177,12 @@ func (g *Gateway) serveUpstream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 6) 预扣（主链职责；magpie 碰不到钱）。
+	//
+	// 阶段二 A1：装配了预扣登记（holds）就「登记 + 扣款同一事务」，
+	// 登记键用 request_id —— 进程崩了/请求上下文丢了，过期扫描器还能把钱退回；
+	// 未装配时退回旧口径（直接扣、失败退），行为与阶段一一致。
 	sessionID := strings.TrimSpace(r.Header.Get("x-session-id"))
+	reqID := logger.GetRequestID(ctx)
 	var pre float64
 	if route.Billable && g.credit != nil {
 		pc, _, perr := g.estimatePreConsumeCost(ctx, modelName, body)
@@ -185,7 +190,7 @@ func (g *Gateway) serveUpstream(w http.ResponseWriter, r *http.Request) {
 			g.logFor(ctx).Warn("预扣估算失败", "model", modelName, "err", perr)
 		}
 		if pc.Credits > 0 {
-			if cerr := g.credit.PreConsume(ctx, token.UserID, pc.Credits, "", sessionID, "预扣费"); cerr != nil {
+			if cerr := g.reservePreConsume(ctx, token, reqID, pc.Credits, sessionID); cerr != nil {
 				writeUpstreamError(w, route.Protocol, http.StatusPaymentRequired, msgCreditsInsufficient)
 				return
 			}
@@ -194,7 +199,6 @@ func (g *Gateway) serveUpstream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 7) 转发（magpie 上手，主链只收事实）。
-	reqID := logger.GetRequestID(ctx)
 	var facts magpie.ResponseFacts
 	settled := false
 	res := g.forwarder().Forward(ctx, w, magpie.ForwardRequest{
@@ -217,7 +221,7 @@ func (g *Gateway) serveUpstream(w http.ResponseWriter, r *http.Request) {
 			g.settleV2(callbackCtx, settleInput{
 				token: token, model: ext, modelName: modelName, route: route,
 				pre: pre, sessionID: sessionID, facts: facts, result: r, start: start,
-				body: body, requestID: reqID,
+				body: body, requestID: reqID, holdID: holdKeyOf(pre, reqID),
 			})
 		},
 	}, timeoutsOf(cfg))
@@ -247,6 +251,50 @@ type settleInput struct {
 	start     time.Time
 	body      []byte
 	requestID string
+	// holdID 是预扣登记的键（= request_id）；空 = 本次没建登记（零金额/未装配/无请求 ID）。
+	holdID string
+}
+
+// holdKeyOf 返回预扣登记的键：只有「真的扣了钱」且拿得到请求 ID 时才有登记。
+func holdKeyOf(pre float64, requestID string) string {
+	if pre > 0 && requestID != "" {
+		return requestID
+	}
+	return ""
+}
+
+// reservePreConsume 预扣（有登记能力时走登记，否则退回旧口径）。
+func (g *Gateway) reservePreConsume(ctx context.Context, token *identity.Token, requestID string, amount float64, sessionID string) error {
+	if g.holds != nil && requestID != "" {
+		if err := g.holds.ReserveHold(ctx, requestID, token.UserID, token.ID, amount, sessionID, "预扣费"); err != nil {
+			g.logFor(ctx).Warn("预扣失败（已登记路径）", "err", err, "amount", amount)
+			return err
+		}
+		return nil
+	}
+	if err := g.credit.PreConsume(ctx, token.UserID, amount, "", sessionID, "预扣费"); err != nil {
+		g.logFor(ctx).Warn("预扣失败", "err", err, "amount", amount)
+		return err
+	}
+	return nil
+}
+
+// closeHold 终结预扣登记（结算/退款后调用；失败只记日志——钱已经在账上动过了，
+// 登记终结失败会让过期扫描器稍后再退一次吗？不会：扫描器只退 'held'，
+// 而退款成功后登记必须是 refunded，所以这里失败要显式告警，靠人核对，不许静默）。
+func (g *Gateway) closeHold(ctx context.Context, holdID, status string) {
+	if g.holds == nil || holdID == "" {
+		return
+	}
+	closed, err := g.holds.CloseHold(ctx, holdID, status, "")
+	if err != nil {
+		g.logFor(ctx).Error("终结预扣登记失败（需要人工核对 credit_holds）",
+			"hold", holdID, "status", status, "err", err)
+		return
+	}
+	if !closed {
+		g.logFor(ctx).Warn("预扣登记已被终结过（幂等跳过）", "hold", holdID, "status", status)
+	}
 }
 
 // settleV2 按转发事实结算：成功按实际 usage（缺 usage 则估算），失败退预扣 + 落 failed 账单。
@@ -263,7 +311,12 @@ func (g *Gateway) settleV2(ctx context.Context, in settleInput) {
 	if !delivered {
 		// 失败：先退预扣（钱不能吞），再落一条 failed 账单留痕（credits=0）。
 		if in.pre > 0 && g.credit != nil {
-			g.refundPreConsume(ctx, in.token.UserID, in.pre, "请求失败退回预扣")
+			if err := g.refundPreConsumeErr(ctx, in.token.UserID, in.pre, "请求失败退回预扣"); err != nil {
+				// 退款失败时**不许**把登记终结成 refunded：留着 held 让过期扫描器兜底重试。
+				g.logFor(ctx).Error("失败请求退回预扣失败，登记保留待过期扫描", "err", err, "hold", in.holdID)
+			} else {
+				g.closeHold(ctx, in.holdID, identity.HoldRefunded)
+			}
 		}
 		reason := "上游失败"
 		if res.TimedOut {
@@ -334,9 +387,31 @@ func (g *Gateway) recordV2(ctx context.Context, in settleInput, usage billing.Us
 	if _, err := g.billing.Record(ctx, rec); err != nil {
 		g.logFor(ctx).Error("账单写入失败", "model", in.modelName, "err", err)
 		if pre > 0 && g.credit != nil {
-			g.refundPreConsume(ctx, in.token.UserID, pre, "账单写入失败退回预扣")
+			if rerr := g.refundPreConsumeErr(ctx, in.token.UserID, pre, "账单写入失败退回预扣"); rerr != nil {
+				g.logFor(ctx).Error("账单写入失败且退回预扣失败，登记保留待过期扫描", "err", rerr, "hold", in.holdID)
+			} else {
+				g.closeHold(ctx, in.holdID, identity.HoldRefunded)
+			}
 		}
+		return
 	}
+	if rec.Fail {
+		// 失败账单：预扣在上游失败分支里已经退回并终结过（refunded），
+		// 这里再终结一次会把它改写成 settled —— 登记状态与事实相反，过期扫描器也不会再兜底。
+		return
+	}
+	// 账单落库成功 = 预扣已按差额结算完毕 → 登记终结为 settled。
+	g.closeHold(ctx, in.holdID, identity.HoldSettled)
+}
+
+// refundPreConsumeErr 是 refundPreConsume 的「带错误返回」版本（V2 主链要据此决定登记怎么终结）。
+func (g *Gateway) refundPreConsumeErr(ctx context.Context, userID int64, amount float64, remark string) error {
+	if g.credit == nil || amount <= 0 {
+		return nil
+	}
+	ctx, cancel := billingCtx(ctx)
+	defer cancel()
+	return g.credit.Refund(ctx, userID, amount, remark)
 }
 
 // upstreamCredential 在出站请求上注入上游鉴权头。

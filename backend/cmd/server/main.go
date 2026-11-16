@@ -618,7 +618,9 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 		// SessionExpiry 会话过期 TTL 分档计算（上下文长度 + 用户对话次数，取较大者，最低兜底 5 分钟）。
 		SessionExpiry: sessExpiryProvider,
 		// 三阶段计费（预扣/结算退补）：余额不足直接 402，请求后按实际多退少补。
-		Credit:          &creditOpsAdapter{svc: creditSvc},
+		Credit: &creditOpsAdapter{svc: creditSvc},
+		// 阶段二 A1：预扣登记（V2 主链用）。扣款与登记同事务，进程崩了由过期扫描器退回。
+		Holds:           &creditHoldAdapter{svc: creditSvc},
 		Balance:         func(ctx context.Context, userID int64) (float64, error) { return creditSvc.GetWallet(ctx, userID) },
 		ProviderFactory: gateway.DefaultProviderFactory,
 		// 令牌「最后使用时间」：内存模式（KindTokenLastUsed 未列入 AsyncKinds，不落 WAL），
@@ -780,6 +782,30 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 		}
 	}()
 
+	// 阶段二 A1：预扣过期扫描（15 分钟未终结 → 全额退回）。
+	// 一跳 60s：过期点是「15 分钟 + 最多 1 分钟」，对资金回收足够；单轮走一个事务 + SKIP LOCKED，多副本安全。
+	go func() {
+		t := time.NewTicker(time.Minute)
+		defer t.Stop()
+		for range t.C {
+			func() {
+				defer func() {
+					if rec := recover(); rec != nil {
+						logr.Error("预扣过期扫描 panic", "panic", rec)
+					}
+				}()
+				res, err := creditSvc.ExpireHolds(context.Background(), time.Now(), 200)
+				if err != nil {
+					logr.Warn("预扣过期扫描失败（下轮重试）", "err", err)
+					return
+				}
+				if res.Expired > 0 {
+					logr.Info("退回超时未结算的预扣", "holds", res.Expired, "credits", res.Amount)
+				}
+			}()
+		}
+	}()
+
 	go func() {
 		// 60s 一跳：与窗口宽度同量级，窗口结束后下一跳就能被算上。
 		t := time.NewTicker(time.Minute)
@@ -866,6 +892,32 @@ func (a *creditOpsAdapter) Settle(ctx context.Context, userID int64, delta float
 
 func (a *creditOpsAdapter) Refund(ctx context.Context, userID int64, amount float64, remark string) error {
 	return a.svc.Recharge(ctx, userID, 0, amount, remark)
+}
+
+// creditHoldAdapter 把 identity.CreditService 的预扣登记能力适配为 gateway.HoldOps（阶段二 A1）。
+type creditHoldAdapter struct {
+	svc *identity.CreditService
+}
+
+func (a *creditHoldAdapter) ReserveHold(ctx context.Context, billingID string, userID, tokenID int64, amount float64, sessionID, remark string) error {
+	var tid *int64
+	if tokenID != 0 {
+		id := tokenID
+		tid = &id
+	}
+	_, err := a.svc.PreConsumeHold(ctx, identity.HoldRequest{
+		BillingID: billingID,
+		UserID:    userID,
+		TokenID:   tid,
+		Amount:    amount,
+		SessionID: sessionID,
+		Remark:    remark,
+	})
+	return err
+}
+
+func (a *creditHoldAdapter) CloseHold(ctx context.Context, billingID, status, ledgerEntryID string) (bool, error) {
+	return a.svc.CloseHold(ctx, billingID, status, ledgerEntryID)
 }
 
 // priceRefAdapter 把 sync.Syncer 适配为 model.PriceSource，供对外模型价格参考/应用售价接口使用。
