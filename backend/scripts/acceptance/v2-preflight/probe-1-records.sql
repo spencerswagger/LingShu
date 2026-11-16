@@ -11,6 +11,7 @@
 --
 -- <v2-migration-whitelist>
 --   0019_v2_topology.sql
+--   0019b_v2_passthrough_credentials.sql
 --   0020_v2_billing_attribution.sql
 --   0022_v2_ledger.sql
 --   0023_v2_reconcile.sql
@@ -25,6 +26,7 @@ WHERE name >= '0019'
   AND name < '0025'                       -- = db.V2MigrationRightBound
   AND name NOT IN (
     '0019_v2_topology.sql',
+    '0019b_v2_passthrough_credentials.sql',
     '0020_v2_billing_attribution.sql',
     '0022_v2_ledger.sql',
     '0023_v2_reconcile.sql',
