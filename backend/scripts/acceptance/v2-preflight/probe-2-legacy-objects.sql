@@ -25,6 +25,13 @@
 -- 用 `= 3` 时只剩 1~2 列会**静默不查询**（复审实测：只补 magpie_key_name 并写入值，探测仍 0 行）。
 -- psql 自动提交模式下每条语句各自成事务，所以**不能**用 ON COMMIT DROP（临时表会立刻消失）；
 -- 用 DROP IF EXISTS 保证可重复执行。
+--
+-- ⚠️ 本文件是四条探测里**唯一带 DDL** 的一条：`DROP TABLE IF EXISTS` 会往 stderr 打
+--    `NOTICE: table "_probe2" does not exist, skipping`。run.sh 用「输出非空行数」判干净/脏，
+--    这条 NOTICE 会让**干净库**被判成异常（复审实测：4 行标签 + 1 行 NOTICE = 5 行）。
+--    所以这里显式压掉 NOTICE，run.sh 侧同时用 `-q` 压掉命令标签 —— 两处都要，缺一处仍剩几行。
+SET client_min_messages = warning;
+
 DROP TABLE IF EXISTS _probe2;
 CREATE TEMP TABLE _probe2(verdict text, n bigint);
 

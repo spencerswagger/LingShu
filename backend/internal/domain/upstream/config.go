@@ -485,3 +485,66 @@ func parseBoolText(s string) (bool, error) {
 func parseInt64(s string) (int64, error) {
 	return strconv.ParseInt(s, 10, 64)
 }
+
+// ── 热生效的降级开关读取器 ─────────────────────────────────────────────
+//
+// 为什么需要这一层（复审 P1，真机复现）：`ConfigProvider.Load` 的缓存**没有 TTL**
+// （config.go 的 `if cached != nil { return }`），`Invalidate()` 今天**没有任何生产调用点**
+// （`PUT /admin/configs/system` 只写 billing.*，不写 upstream.* 三键）。所以装配层如果每请求
+// 直接 `Load`，拿到的是**启动时冻结的值**：运维把 `passthrough_enabled` 关掉、不重启，转发照旧；
+// 改回来也一样 —— 双向冻结，等于开关是假的。
+//
+// 修法是在 Load 之上加一层 TTL：到期先 `Invalidate()` 再 `Load()`，于是每个 TTL 周期
+// **至多一次** DB 读，改动在 TTL 内生效（默认 5s，够运维用，也不至于把配置表打成热点）。
+//
+// 注意：这不是「把配置做成可热更」的完整方案（那要接写钩子）；它只保证
+// **开关这类安全相关的值不会永远停在启动值**。
+type DegradeGate struct {
+	p   *ConfigProvider
+	ttl time.Duration
+	now func() time.Time
+
+	mu     sync.Mutex
+	at     time.Time
+	loaded bool
+	cfg    RuntimeConfig
+}
+
+// NewDegradeGate 创建读取器；ttl <= 0 时每次调用都重新读（测试与「宁可多读」的场景）。
+func NewDegradeGate(p *ConfigProvider, ttl time.Duration) *DegradeGate {
+	return &DegradeGate{p: p, ttl: ttl, now: time.Now}
+}
+
+// read 返回 TTL 内有效的配置快照。
+func (g *DegradeGate) read(ctx context.Context) RuntimeConfig {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.loaded && g.ttl > 0 && g.now().Sub(g.at) < g.ttl {
+		return g.cfg
+	}
+	if g.p != nil {
+		// 到期先作废缓存再读：否则拿到的还是启动时那份。
+		g.p.Invalidate()
+		cfg, _ := g.p.Load(ctx)
+		g.cfg = cfg
+	} else {
+		g.cfg = DefaultRuntimeConfig()
+	}
+	g.at = g.now()
+	g.loaded = true
+	return g.cfg
+}
+
+// Passthrough 报告转发是否允许（只看开关，**不看** upstream.base_url：那是账本基址，
+// 未配置属正常态，拿它当门会把所有 /v1 关成 503）。
+func (g *DegradeGate) Passthrough(ctx context.Context) bool {
+	return g.read(ctx).Degrade.PassthroughEnabled
+}
+
+// LedgerActive 报告账本拉取是否可用（基址已配 && 开关开）。
+//
+// 必须用这个而不是裸 `Degrade.LedgerEnabled`：基址默认空串且没有管理端写入口，
+// 只看开关会让每轮「成功跑完 0 笔」并把窗口写成 ok / 0 对 0 —— 漏账看起来像正常。
+func (g *DegradeGate) LedgerActive(ctx context.Context) bool {
+	return g.read(ctx).LedgerActive()
+}

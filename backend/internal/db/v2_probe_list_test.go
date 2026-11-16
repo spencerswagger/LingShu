@@ -204,3 +204,22 @@ func TestV2Probe_LegacyProbeHandlesPartialColumns(t *testing.T) {
 		t.Fatalf("探测② 必须按实际存在的列动态拼条件（string_agg + format + EXECUTE）")
 	}
 }
+
+// TestV2Probe_RunScriptQuietOutput 断言 run.sh 用 `-q` 且探测② 压掉 NOTICE。
+//
+// 为什么这条是硬性要求（复审实测）：探测② 是四条里唯一带 DDL 的，psql 会把命令标签
+// （DROP TABLE / CREATE TABLE / DO）打进 stdout、把 `NOTICE: table "_probe2" does not exist`
+// 打进 stderr；run.sh 按「非空行数」判干净/脏 → **干净库被判成 5 行异常**，运维于是去跑 R-2。
+// 两次之后就会开始无视这个工具，比没有工具更糟。实测组合：只加 -q 剩 1 行 NOTICE、
+// 只加 SET 剩 4 行标签，两者齐才是 0 行。
+func TestV2Probe_RunScriptQuietOutput(t *testing.T) {
+	// ⚠️ 只判 `-q ` 会被注释里的「-q 必须带上」蒙混过去（首版就是这么假绿的），
+	// 必须钉**整条命令行**。
+	if !strings.Contains(readProbe(t, "run.sh"), `-X -q -v ON_ERROR_STOP=1`) {
+		t.Fatalf("run.sh 的 psql 必须带 -q（`-tA` 去不掉命令标签，干净库会被判成 5 行异常）")
+	}
+	probe2 := stripSQLComments(readProbe(t, "probe-2-legacy-objects.sql"))
+	if !strings.Contains(probe2, "SET client_min_messages = warning") {
+		t.Fatalf("probe-2 必须 SET client_min_messages = warning（-q 压不住 DROP IF EXISTS 的 NOTICE）")
+	}
+}

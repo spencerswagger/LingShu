@@ -273,12 +273,19 @@ psql "$DSN" -tA -f scripts/acceptance/v2-preflight/probe-4-objects-by-record.sql
 - ③ 形状层：`reconcile_windows` 未建或列齐全（含 `scroll_offset` 与四计数列），缺 `local_count` 即「被跳过」；
 - ④ 反查：按已记文件名核对象是否真在（专治 S4）。
 
-**判读口径（照抄实测，别自己简化）**：
+**判读口径（以入库脚本为准；2026-11-16 复审后已与脚本同步）**：
 
-- **③ 输出的是「列清单」，不是判定**：实测 S1/S2/S3 给 12 行、S5b 给 11 行（S5a 少于 10 行）。所以**不能只判「③ 空/非空」**——那样会把 S1–S3 读成「还行」。必须拿清单与十列集合**逐项比对**（`window_start, window_end, local_count, upstream_count, local_tokens, upstream_tokens, status, alarm_streak, detail, checked_at`），缺任何一列即形状不对。
-- **④ 只 JOIN「本版五个文件名」**：旧分支的记录名（`0019_v2_facade.sql` / `0020_reconcile_blocked_status.sql`）根本匹配不到，所以 **S1/S2 的 ④ 是 0 行**（实测），它们的判定靠 ①②，不靠 ④。
+- **③ 输出的是「判定行」，不是列清单**（脚本已改成直接判）：缺列 / 多余列 / 约束不符都会各自输出一行，
+  所以「③ 非空」本身就是信号，不需要人拿列清单心算。期望列是 **11 列**：
+  `window_start, window_end, local_count, upstream_count, local_tokens, upstream_tokens,
+  status, alarm_streak, detail, checked_at, scroll_offset`。
+- **④ 只 JOIN「本链 8 个文件名」**（`db.V2MigrationFiles()`）：旧分支的记录名
+  （`0019_v2_facade.sql` / `0020_reconcile_blocked_status.sql`）匹配不到，所以 **S1/S2 的 ④ 是 0 行**，
+  它们的判定靠 ①②，不靠 ④。
 - **④ 有输出 → 记录说建过、对象却不在（S4）**，按 §5.2 走 R-2。
-- **四条全净（0 / 0 / 空 / 0）≠ 一定可以执行**：S5b（十列齐、约束不符）实测就是 `0 / 0 / 11 / 0`，见 §5.2 —— 这种库只有 v2 断言能拦。
+- **四条全净（0 / 0 / 0 / 0）≠ 一定可以执行**：S5b（列齐、**约束不符**）在 ③ 改成判定行之前是
+  `0 / 0 / 11 / 0`；现在 ③ 会直接报出来。但「协议层之外的约束」仍建议跑下面那条键约束确认。
+- `run.sh` 的行为是**跑完四条再合计**并给判定行（不是「任一非空即停」），退出码 0 = S0、1 = 非 S0。
 
 **为什么必须四条**：S4（记录在、对象缺）这种库里 ①②③ 恰好全是 0 行 —— 旧写法「S4 靠 ①+② 组合判」是错的，这两格在 S4 都给不出任何信号；只有 ④ 能判（实测 S4 上 ④ 输出 9 行，逐条点名缺失对象）。
 

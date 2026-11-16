@@ -24,12 +24,17 @@ fi
 PSQL=${PSQL:-psql}
 total=0
 for f in probe-1-records.sql probe-2-legacy-objects.sql probe-3-window-shape.sql probe-4-objects-by-record.sql; do
-  out=$("$PSQL" -X -v ON_ERROR_STOP=1 -tA -d "$DB" -f "$DIR/$f" 2>&1) || {
+  # `-q` 必须带上：探测② 里有 DROP/CREATE/DO，psql 会把命令标签（DROP TABLE / CREATE TABLE / DO）
+  # 打进 stdout；`-tA` 只去表头/对齐，去不掉标签 —— 不加 -q 时干净库会被判成「5 行异常」，
+  # 运维照这条判定就去「回基线」，比没有工具更糟（复审实测）。
+  out=$("$PSQL" -X -q -v ON_ERROR_STOP=1 -tA -d "$DB" -f "$DIR/$f" 2>&1) || {
     echo "FAIL | $f 执行报错："
     echo "$out" | sed 's/^/       /'
     exit 1
   }
-  out=$(printf '%s' "$out" | sed '/^$/d')
+  # 双保险：NOTICE 走 stderr（`DROP TABLE IF EXISTS` 的 skipping 提示），-q 也压不住，
+  # 探测② 里已用 `SET client_min_messages = warning` 关掉；这里再兜一层，免得换 PG 版本又冒出来。
+  out=$(printf '%s' "$out" | sed -e '/^NOTICE:/d' -e '/^psql:.*NOTICE/d' | sed '/^$/d')
   n=0
   [ -n "$out" ] && n=$(printf '%s\n' "$out" | wc -l | tr -d ' ')
   total=$((total + n))

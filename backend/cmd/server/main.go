@@ -464,16 +464,19 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 			"stream_idle_ms", upCfg.Timeouts.StreamIdle.Milliseconds())
 	}
 
+	// 降级开关的热生效读取器（TTL 5s）：`ConfigProvider.Load` 的缓存**没有 TTL**，
+	// `Invalidate()` 今天没有生产调用点（`/admin/configs/system` 不写 upstream.* 三键），
+	// 所以每请求直接 Load 拿到的是**启动时冻结的值** —— 运维关掉开关不重启就无效（真机复现过）。
+	// 这层每 TTL 周期至多一次 DB 读，改动 5s 内生效。
+	gate := upstream.NewDegradeGate(upstreamCfg, 5*time.Second)
+
 	// 转发降级开关（sys_configs：upstream.degrade.passthrough_enabled）。
 	//
 	// 只读开关本身，**不看** upstream.base_url：那个基址只服务账本同步/对账，
 	// 未配置（默认空串）是正常态，拿它当门会把所有 /v1 请求关成 503。
 	// 开关关 → /v1 与 /v1beta 返回 503 + 明确文案（不代理、不计费、不落账单）。
 	if magpieHandler != nil {
-		magpieHandler.SetGate(func() bool {
-			c, _ := upstreamCfg.Load(context.Background())
-			return c.Degrade.PassthroughEnabled
-		})
+		magpieHandler.SetGate(func() bool { return gate.Passthrough(context.Background()) })
 	}
 
 	// D4：对账窗口的四列计数由对账服务在窗口结束时写入（四个 0 等于「漏账不可见」）。
@@ -485,15 +488,13 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 		Counts:   windowStore,
 		States:   windowStore,
 		Streaks:  windowStore,
-		// ⚠️ 必须用 LedgerActive()（= 基址已配 && 开关开），不是裸的 Degrade.LedgerEnabled：
+		// ⚠️ 必须用 LedgerActive（= 基址已配 && 开关开），不是裸的账本开关字段：
 		// `upstream.base_url` 默认是空串（且没有管理端写入口），只看开关的话每轮都会「成功跑完
 		// 0 笔」并把窗口写成 status=ok / 0 对 0 —— 漏账从此看起来像正常，正是 0023/D4 要防的那种假绿。
 		// 基址没配 ⇒ 账本拉取停摆 ⇒ 窗口落 skipped（不是 blocked，不冒充「已对平」）。
-		LedgerEnabled: func() bool {
-			c, _ := upstreamCfg.Load(context.Background())
-			return c.LedgerActive()
-		},
-		Logger: logr,
+		// 走 gate（TTL 5s）而不是每请求 Load：后者拿到的是启动时冻结的配置。
+		LedgerEnabled: func() bool { return gate.LedgerActive(context.Background()) },
+		Logger:        logr,
 	})
 	// F9：账本同步轮次（拉上游用量 → 幂等落 ledger_entries）。
 	//
