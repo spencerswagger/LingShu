@@ -5,7 +5,7 @@ import (
 	"time"
 
 	"github.com/team/llmgateway/internal/domain/billing"
-	"github.com/team/llmgateway/internal/domain/gateway"
+	"github.com/team/llmgateway/internal/domain/calllog"
 	"github.com/team/llmgateway/internal/pkg/decimalx"
 )
 
@@ -97,7 +97,7 @@ type devBillingDetail struct {
 }
 
 // toDevCallLogView 由存储层 CallLog 组装开发者端视图（白名单正向构造）。
-func toDevCallLogView(cl *gateway.CallLog) *DevCallLogView {
+func toDevCallLogView(cl *calllog.CallLog) *DevCallLogView {
 	if cl == nil {
 		return nil
 	}

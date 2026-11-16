@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/team/llmgateway/internal/domain/billing"
-	"github.com/team/llmgateway/internal/domain/gateway"
+	"github.com/team/llmgateway/internal/domain/calllog"
 	"github.com/team/llmgateway/internal/pkg/decimalx"
 )
 
@@ -76,7 +76,7 @@ type CallLogView struct {
 }
 
 // toCallLogView 由存储层 CallLog 组装只读视图；ReqMessages/Decision 反序列化为 any，null 给 nil。
-func toCallLogView(cl *gateway.CallLog) *CallLogView {
+func toCallLogView(cl *calllog.CallLog) *CallLogView {
 	if cl == nil {
 		return nil
 	}

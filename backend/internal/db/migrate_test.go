@@ -287,3 +287,83 @@ func mustCallerFile(t *testing.T) string {
 	}
 	return file
 }
+
+// TestMigrate_0019_V2Facade 验证 V2 第一期唯一迁移 0019_v2_facade.sql：
+//  1. **纯新增**：文件正文不含任何 DROP / RENAME / DELETE / UPDATE / TRUNCATE（源码级守卫，
+//     不让「顺手清数据」混进本期迁移）；
+//  2. 全新库按序应用后可落地，两张新表 / 四列 / 两个部分索引齐全；
+//  3. 可重复执行（全部 IF NOT EXISTS），重跑不报错、不改变结果。
+func TestMigrate_0019_V2Facade(t *testing.T) {
+	tempDB := openTempDB(t)
+	migDir := filepath.Join(filepath.Dir(mustCallerFile(t)), "migrations")
+	name := migrationFile(t, migDir, "0019")
+
+	// 1) 源码级守卫：去掉注释后不得出现破坏性关键字。
+	body, err := os.ReadFile(filepath.Join(migDir, name))
+	if err != nil {
+		t.Fatalf("读取迁移 %s 失败: %v", name, err)
+	}
+	var code strings.Builder
+	for _, line := range strings.Split(string(body), "\n") {
+		if i := strings.Index(line, "--"); i >= 0 {
+			line = line[:i]
+		}
+		code.WriteString(line)
+		code.WriteString("\n")
+	}
+	upper := strings.ToUpper(code.String())
+	for _, forbidden := range []string{"DROP ", "RENAME", "DELETE ", "UPDATE ", "TRUNCATE", "ALTER COLUMN"} {
+		if strings.Contains(upper, forbidden) {
+			t.Fatalf("0019 迁移禁止出现破坏性语句 %q（本期口径：零 DROP / 零 rename / 零 DML）", forbidden)
+		}
+	}
+
+	// 2) 全链应用（0019 之前的历史迁移建表）。
+	for _, n := range migrationNames(t, migDir) {
+		runMigration(t, tempDB, migDir, n)
+	}
+
+	assertColumn := func(table, column string) {
+		t.Helper()
+		var got int
+		if err := tempDB.QueryRow(
+			`SELECT count(*) FROM information_schema.columns WHERE table_name=$1 AND column_name=$2`,
+			table, column).Scan(&got); err != nil {
+			t.Fatalf("查询列 %s.%s 失败: %v", table, column, err)
+		}
+		if got != 1 {
+			t.Fatalf("%s 缺少列 %s（0019 未落地）", table, column)
+		}
+	}
+	assertTable := func(table string) {
+		t.Helper()
+		var got int
+		if err := tempDB.QueryRow(
+			`SELECT count(*) FROM information_schema.tables WHERE table_name=$1`, table).Scan(&got); err != nil {
+			t.Fatalf("查询表 %s 失败: %v", table, err)
+		}
+		if got != 1 {
+			t.Fatalf("缺少表 %s（0019 未落地）", table)
+		}
+	}
+
+	assertTable("magpie_keys")
+	assertTable("reconcile_windows")
+	assertColumn("external_models", "magpie_model")
+	assertColumn("billing_records", "magpie_key_name")
+	assertColumn("billing_records", "estimated")
+	assertColumn("billing_records", "upstream_usage")
+
+	var idx int
+	if err := tempDB.QueryRow(
+		`SELECT count(*) FROM pg_indexes WHERE indexname IN ('uq_external_models_magpie_model','idx_billing_magpie_key_time')`).
+		Scan(&idx); err != nil {
+		t.Fatalf("查询索引失败: %v", err)
+	}
+	if idx != 2 {
+		t.Fatalf("0019 的两个部分索引应齐全, got %d", idx)
+	}
+
+	// 3) 幂等：重跑同一迁移不报错（全部 IF NOT EXISTS）。
+	runMigration(t, tempDB, migDir, name)
+}

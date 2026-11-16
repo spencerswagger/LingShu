@@ -23,7 +23,7 @@ func saleRates() billing.Rates {
 }
 
 // extCols 与 store.cols 一致，供构造 mock 行。
-var extCols = []string{"id", "external_name", "description", "enabled", "sale_rates", "time_config", "context_tiers", "aliases", "created_at", "updated_at"}
+var extCols = []string{"id", "external_name", "description", "enabled", "sale_rates", "time_config", "context_tiers", "aliases", "magpie_model", "created_at", "updated_at"}
 
 // extNameQuery 与 store.GetByExternalName 一致（含别名包含判定 + 确定性排序），供构造 mock 期望。
 const extNameQuery = `SELECT ` + cols + ` FROM external_models WHERE (external_name = $1 OR aliases @> to_jsonb(ARRAY[$1::text])) AND enabled = true AND deleted_at IS NULL ORDER BY (external_name = $1) DESC, id ASC LIMIT 1`
@@ -46,8 +46,12 @@ func extRow(m *ExternalModel, saleJSON string) *sqlmock.Rows {
 			aliasesJSON = string(b)
 		}
 	}
+	var magpie any
+	if m.MagpieModel != nil {
+		magpie = *m.MagpieModel
+	}
 	rows := sqlmock.NewRows(extCols).
-		AddRow(m.ID, m.ExternalName, m.Description, m.Enabled, saleJSON, nil, nil, aliasesJSON, m.CreatedAt, m.UpdatedAt)
+		AddRow(m.ID, m.ExternalName, m.Description, m.Enabled, saleJSON, nil, nil, aliasesJSON, magpie, m.CreatedAt, m.UpdatedAt)
 	return rows
 }
 
@@ -71,8 +75,8 @@ func TestService_CreateModel(t *testing.T) {
 		WillReturnError(sql.ErrNoRows)
 	// 反向命名空间：对外名未撞他人别名。
 	expectAliasOtherNone(mock, "qw-max", 0)
-	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO external_models(id, external_name, description, enabled, sale_rates, time_config, context_tiers, aliases) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING `+cols)).
-		WithArgs(sqlmock.AnyArg(), "qw-max", "", true, sqlmock.AnyArg(), nil, nil, sqlmock.AnyArg()).
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO external_models(id, external_name, description, enabled, sale_rates, time_config, context_tiers, aliases, magpie_model) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING `+cols)).
+		WithArgs(sqlmock.AnyArg(), "qw-max", "", true, sqlmock.AnyArg(), nil, nil, sqlmock.AnyArg(), nil).
 		WillReturnRows(extRow(&ExternalModel{ID: 1, ExternalName: "qw-max", Enabled: true, CreatedAt: now, UpdatedAt: now}, `{"input":1}`))
 
 	m, err := s.CreateModel(context.Background(), ExternalModelInput{
@@ -159,8 +163,8 @@ func TestService_UpdateModel(t *testing.T) {
 		WithArgs(int64(1)).
 		WillReturnRows(extRow(&ExternalModel{ID: 1, ExternalName: "qw-max", Enabled: true, CreatedAt: now, UpdatedAt: now}, `{}`))
 	// external 未变，跳过唯一性预检查
-	mock.ExpectExec(regexp.QuoteMeta(`UPDATE external_models SET external_name=$1, description=$2, enabled=$3, sale_rates=$4, time_config=$5, context_tiers=$6, aliases=$7, updated_at=now() WHERE id=$8`)).
-		WithArgs("qw-max", "desc", true, sqlmock.AnyArg(), nil, nil, sqlmock.AnyArg(), int64(1)).
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE external_models SET external_name=$1, description=$2, enabled=$3, sale_rates=$4, time_config=$5, context_tiers=$6, aliases=$7, magpie_model=$8, updated_at=now() WHERE id=$9`)).
+		WithArgs("qw-max", "desc", true, sqlmock.AnyArg(), nil, nil, sqlmock.AnyArg(), nil, int64(1)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + cols + ` FROM external_models WHERE id = $1`)).
 		WithArgs(int64(1)).
@@ -353,8 +357,8 @@ func TestService_NameWriteHookFired(t *testing.T) {
 		WithArgs("qw-max").
 		WillReturnError(sql.ErrNoRows)
 	expectAliasOtherNone(mock, "qw-max", 0)
-	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO external_models(id, external_name, description, enabled, sale_rates, time_config, context_tiers, aliases) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING `+cols)).
-		WithArgs(sqlmock.AnyArg(), "qw-max", "", true, sqlmock.AnyArg(), nil, nil, sqlmock.AnyArg()).
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO external_models(id, external_name, description, enabled, sale_rates, time_config, context_tiers, aliases, magpie_model) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING `+cols)).
+		WithArgs(sqlmock.AnyArg(), "qw-max", "", true, sqlmock.AnyArg(), nil, nil, sqlmock.AnyArg(), nil).
 		WillReturnRows(extRow(&ExternalModel{ID: 1, ExternalName: "qw-max", Enabled: true, CreatedAt: now, UpdatedAt: now}, `{"input":1}`))
 
 	if _, err := s.CreateModel(context.Background(), ExternalModelInput{ExternalName: "qw-max", SaleRates: saleRates()}); err != nil {
@@ -390,7 +394,7 @@ func TestService_SyncPrices_InvalidatesEvenOnError(t *testing.T) {
 	now := time.Now()
 	listQ := `SELECT ` + cols + ` FROM external_models WHERE deleted_at IS NULL ORDER BY id ASC`
 	rows := extRow(&ExternalModel{ID: 1, ExternalName: "a", CreatedAt: now, UpdatedAt: now}, `{"input":1}`)
-	rows.AddRow(int64(2), "b", "", true, `{"input":1}`, nil, nil, `[]`, now, now)
+	rows.AddRow(int64(2), "b", "", true, `{"input":1}`, nil, nil, `[]`, nil, now, now)
 	mock.ExpectQuery(regexp.QuoteMeta(listQ)).WillReturnRows(rows)
 	// 第 1 行成功写入。
 	mock.ExpectExec(regexp.QuoteMeta(`UPDATE external_models SET sale_rates=$1, updated_at=now() WHERE id=$2`)).
@@ -428,8 +432,8 @@ func TestService_SyncPrices_SuccessInvalidatesOnce(t *testing.T) {
 	now := time.Now()
 	listQ := `SELECT ` + cols + ` FROM external_models WHERE deleted_at IS NULL ORDER BY id ASC`
 	rows := extRow(&ExternalModel{ID: 1, ExternalName: "a", CreatedAt: now, UpdatedAt: now}, `{"input":1}`)
-	rows.AddRow(int64(2), "b", "", true, `{"input":1}`, nil, nil, `[]`, now, now)
-	rows.AddRow(int64(3), "c", "", true, `{"input":1}`, nil, nil, `[]`, now, now)
+	rows.AddRow(int64(2), "b", "", true, `{"input":1}`, nil, nil, `[]`, nil, now, now)
+	rows.AddRow(int64(3), "c", "", true, `{"input":1}`, nil, nil, `[]`, nil, now, now)
 	mock.ExpectQuery(regexp.QuoteMeta(listQ)).WillReturnRows(rows)
 
 	// 两行成功写入（a/b）；c 无参考价不触发写。
@@ -476,7 +480,7 @@ func TestService_SyncPrices_AllSkippedNoInvalidate(t *testing.T) {
 	now := time.Now()
 	listQ := `SELECT ` + cols + ` FROM external_models WHERE deleted_at IS NULL ORDER BY id ASC`
 	rows := extRow(&ExternalModel{ID: 1, ExternalName: "a", CreatedAt: now, UpdatedAt: now}, `{"input":1}`)
-	rows.AddRow(int64(2), "b", "", true, `{"input":1}`, nil, nil, `[]`, now, now)
+	rows.AddRow(int64(2), "b", "", true, `{"input":1}`, nil, nil, `[]`, nil, now, now)
 	mock.ExpectQuery(regexp.QuoteMeta(listQ)).WillReturnRows(rows)
 
 	// 预置缓存条目：全部跳过时不得被清空。
@@ -856,8 +860,8 @@ func TestStore_Insert_AliasInvalidate(t *testing.T) {
 	// 预置别名与规范名的负缓存。
 	s.store.cacheExternalName("cc-1", nil, s.store.extNameCache.Generation())
 	s.store.cacheExternalName("real", nil, s.store.extNameCache.Generation())
-	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO external_models(id, external_name, description, enabled, sale_rates, time_config, context_tiers, aliases) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING `+cols)).
-		WithArgs(sqlmock.AnyArg(), "real", "", true, sqlmock.AnyArg(), nil, nil, sqlmock.AnyArg()).
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO external_models(id, external_name, description, enabled, sale_rates, time_config, context_tiers, aliases, magpie_model) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING `+cols)).
+		WithArgs(sqlmock.AnyArg(), "real", "", true, sqlmock.AnyArg(), nil, nil, sqlmock.AnyArg(), nil).
 		WillReturnRows(extRow(&ExternalModel{ID: 1, ExternalName: "real", Enabled: true, Aliases: []string{"cc-1"}, CreatedAt: now, UpdatedAt: now}, `{"input":1}`))
 
 	if _, err := s.store.Insert(context.Background(), &ExternalModel{
@@ -898,8 +902,8 @@ func TestService_UpdateModel_AliasInvalidate(t *testing.T) {
 	// validateAliases 逐个 GetByName 新别名，并做别名↔别名互斥校验。
 	expectGetByNameNoRows(mock, "new-a")
 	expectAliasExistsForOtherNoRows(mock, "new-a", 1)
-	mock.ExpectExec(regexp.QuoteMeta(`UPDATE external_models SET external_name=$1, description=$2, enabled=$3, sale_rates=$4, time_config=$5, context_tiers=$6, aliases=$7, updated_at=now() WHERE id=$8`)).
-		WithArgs("old", "", true, sqlmock.AnyArg(), nil, nil, sqlmock.AnyArg(), int64(1)).
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE external_models SET external_name=$1, description=$2, enabled=$3, sale_rates=$4, time_config=$5, context_tiers=$6, aliases=$7, magpie_model=$8, updated_at=now() WHERE id=$9`)).
+		WithArgs("old", "", true, sqlmock.AnyArg(), nil, nil, sqlmock.AnyArg(), nil, int64(1)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + cols + ` FROM external_models WHERE id = $1`)).WithArgs(int64(1)).
 		WillReturnRows(extRow(&ExternalModel{ID: 1, ExternalName: "old", Enabled: true, Aliases: []string{"new-a"}, CreatedAt: now, UpdatedAt: now}, `{}`))

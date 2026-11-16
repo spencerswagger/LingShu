@@ -14,20 +14,20 @@ import (
 	"github.com/DATA-DOG/go-sqlmock"
 
 	"github.com/team/llmgateway/internal/domain/billing"
-	"github.com/team/llmgateway/internal/domain/gateway"
+	"github.com/team/llmgateway/internal/domain/calllog"
 )
 
 // fakeCallLogStore 内存调用日志读取 fake（console 单测用，满足 callLogReader）。
 type fakeCallLogStore struct {
-	byBilling map[string]*gateway.CallLog
-	bySession []gateway.CallLog
+	byBilling map[string]*calllog.CallLog
+	bySession []calllog.CallLog
 }
 
-func (f *fakeCallLogStore) GetByBillingID(_ context.Context, bid string) (*gateway.CallLog, error) {
+func (f *fakeCallLogStore) GetByBillingID(_ context.Context, bid string) (*calllog.CallLog, error) {
 	return f.byBilling[bid], nil
 }
 
-func (f *fakeCallLogStore) ListBySession(_ context.Context, _ string) ([]gateway.CallLog, error) {
+func (f *fakeCallLogStore) ListBySession(_ context.Context, _ string) ([]calllog.CallLog, error) {
 	return f.bySession, nil
 }
 
@@ -54,8 +54,8 @@ func TestAdminHandleGetBilling_CallLog(t *testing.T) {
 	}
 	defer db.Close()
 
-	admin := NewAdmin(db, billing.NewSqlStore(db), nil, nil)
-	admin.SetCallLogStore(&fakeCallLogStore{byBilling: map[string]*gateway.CallLog{
+	admin := NewAdmin(db, billing.NewSqlStore(db), nil)
+	admin.SetCallLogStore(&fakeCallLogStore{byBilling: map[string]*calllog.CallLog{
 		"bill-0001": {
 			BillingID: "bill-0001", RequestID: "req-1", SessionID: "sess-1",
 			Model: "gpt-4", Status: "completed", RespKind: "non_stream",
@@ -117,7 +117,7 @@ func TestAdminHandleGetBilling_CallLogNotInjected(t *testing.T) {
 	}
 	defer db.Close()
 
-	admin := NewAdmin(db, billing.NewSqlStore(db), nil, nil) // 不注入 callLogStore
+	admin := NewAdmin(db, billing.NewSqlStore(db), nil) // 不注入 callLogStore
 
 	_, rows := billingRecordRow(t)
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, billing_id, user_id, pricing_mode, token_id, external_model_name,
@@ -141,8 +141,8 @@ func TestAdminHandleGetBilling_CallLogNotInjected(t *testing.T) {
 
 // TestAdminHandleListSessionCalls 断言 GET /api/v1/admin/sessions/{id}/calls 返回 {List, Total}（升序全量）。
 func TestAdminHandleListSessionCalls(t *testing.T) {
-	admin := NewAdmin(nil, nil, nil, nil)
-	admin.SetCallLogStore(&fakeCallLogStore{bySession: []gateway.CallLog{
+	admin := NewAdmin(nil, nil, nil)
+	admin.SetCallLogStore(&fakeCallLogStore{bySession: []calllog.CallLog{
 		{BillingID: "bill-0001", SessionID: "sess-1", Model: "gpt-4", Status: "completed", RespKind: "non_stream",
 			RespBody: `{"id":"x"}`, ReqMessages: json.RawMessage(`[{"role":"user","content":"a"}]`),
 			Decision: json.RawMessage(`{"attempts":[]}`), PricingMode: "sale",
@@ -181,7 +181,7 @@ func TestAdminHandleListSessionCalls(t *testing.T) {
 	}
 
 	// 空列表：未装配存储时返回 List=[]（非 null）+ Total=0。
-	empty := NewAdmin(nil, nil, nil, nil)
+	empty := NewAdmin(nil, nil, nil)
 	rec2 := httptest.NewRecorder()
 	emptyReq := httptest.NewRequest(http.MethodGet, "/api/v1/admin/sessions/sess-x/calls", nil)
 	emptyReq.SetPathValue("session_id", "sess-x")
@@ -193,68 +193,3 @@ func TestAdminHandleListSessionCalls(t *testing.T) {
 		t.Errorf("empty list want List=[]/Total=0, got %s", rec2.Body.String())
 	}
 }
-
-// TestNewSQLCallLogStore_InsertAndQuery 用 sqlmock 验证 SQLCallLogStore 的 Insert（ON CONFLICT 幂等）与 ListBySession 读取。
-func TestNewSQLCallLogStore_InsertAndQuery(t *testing.T) {
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("sqlmock: %v", err)
-	}
-	defer db.Close()
-
-	store := gateway.NewSQLCallLogStore(db)
-	now := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
-	dur := int64(123)
-	// 上游原始 usage（诊断渠道口径）：落库值为 {"Protocol":...,"Usage":{...}}，见 gateway/rawusage.go。
-	upstreamUsage := []byte(`{"Protocol":"anthropic-messages","Usage":{"input_tokens":191,"cache_read_input_tokens":96896}}`)
-	// 请求参数快照（req_params）：定位「这次到底发了什么参数」用，见 gateway/reqparams.go。
-	reqParams := []byte(`{"endpoint":"/v1/chat/completions","model":"gpt-4","stream":true}`)
-	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO call_logs(id, billing_id, request_id, session_id, user_id, channel_id, channel_key_id,
-	internal_model_id, external_model_id, model, auto_model_name, pricing_mode, status, req_messages, resp_body, resp_kind,
-	decision, error_message, duration_ms, first_token_ms, created_at, upstream_usage, req_params)
-VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
-ON CONFLICT (billing_id) DO NOTHING`)).
-		WithArgs(sqlmock.AnyArg(), "bill-0001", "req-1", "sess-1", int64(7), int64(1), int64(2), "gpt-4-internal",
-			int64(1), "gpt-4", nil, "sale", "completed", []byte(`[{"role":"user","content":"a"}]`), `{"id":"x"}`,
-			"non_stream", []byte(`{"result":"success"}`), "", int64(123), nil, now, upstreamUsage, reqParams).
-		WillReturnResult(sqlmock.NewResult(1, 1))
-	if err := store.Insert(context.Background(), &gateway.CallLog{
-		BillingID: "bill-0001", RequestID: "req-1", SessionID: "sess-1",
-		ChannelID: ptr64(1), ChannelKeyID: ptr64(2), UserID: ptr64(7), ExternalModelID: ptr64(1),
-		InternalModelID: "gpt-4-internal", Model: "gpt-4", PricingMode: "sale", Status: "completed",
-		ReqMessages: []json.RawMessage{json.RawMessage(`{"role":"user","content":"a"}`)},
-		RespBody:    `{"id":"x"}`, RespKind: "non_stream",
-		Decision: map[string]any{"result": "success"}, UpstreamUsage: upstreamUsage, ReqParams: reqParams,
-		DurationMs: &dur, FirstTokenMs: nil, CreatedAt: now,
-	}); err != nil {
-		t.Fatalf("insert: %v", err)
-	}
-
-	// ListBySession 读取（ReqMessages/Decision/UpstreamUsage 为 JSONB bytes）。
-	rows := sqlmock.NewRows([]string{"billing_id", "request_id", "session_id", "user_id", "channel_id", "channel_key_id",
-		"internal_model_id", "external_model_id", "model", "auto_model_name", "pricing_mode", "status", "req_messages", "resp_body", "resp_kind",
-		"decision", "error_message", "duration_ms", "first_token_ms", "created_at", "upstream_usage", "req_params"}).
-		AddRow("bill-0001", "req-1", "sess-1", int64(7), int64(1), int64(2), "gpt-4-internal", int64(1), "gpt-4", nil,
-			"sale", "completed", []byte(`[{"role":"user","content":"a"}]`), `{"id":"x"}`, "non_stream",
-			[]byte(`{"result":"success"}`), "", int64(123), nil, now, upstreamUsage, reqParams)
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT billing_id, request_id, session_id, user_id, channel_id, channel_key_id,
-	internal_model_id, external_model_id, model, auto_model_name, pricing_mode, status, req_messages, resp_body, resp_kind,
-	decision, error_message, duration_ms, first_token_ms, created_at, upstream_usage, req_params FROM call_logs WHERE session_id=$1 ORDER BY created_at ASC`)).
-		WithArgs("sess-1").WillReturnRows(rows)
-
-	logs, err := store.ListBySession(context.Background(), "sess-1")
-	if err != nil {
-		t.Fatalf("list by session: %v", err)
-	}
-	if len(logs) != 1 {
-		t.Fatalf("list len want 1, got %d", len(logs))
-	}
-	if string(logs[0].UpstreamUsage) != string(upstreamUsage) {
-		t.Fatalf("UpstreamUsage=%s, want %s", logs[0].UpstreamUsage, upstreamUsage)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("mock expectations: %v", err)
-	}
-}
-
-func ptr64(v int64) *int64 { return &v }

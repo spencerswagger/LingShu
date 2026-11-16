@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/team/llmgateway/internal/domain/billing"
-	"github.com/team/llmgateway/internal/domain/channel"
 	"github.com/team/llmgateway/internal/pkg/decimalx"
 	"github.com/team/llmgateway/internal/pkg/resp"
 )
@@ -398,30 +397,12 @@ func (h *Admin) HandleStatsDashboard(w http.ResponseWriter, r *http.Request) {
 	resp.OK(w, r, out)
 }
 
-// buildOps 汇总运维块：渠道总数 + 密钥运行时三态 + 对外模型、渠道内部模型计数。
+// buildOps 汇总运维块：对外模型计数（DB）。
+//
+// 渠道 / 渠道密钥 / 渠道内部模型的运行时三态已随渠道管理整体迁出灵枢，
+// 本进程不再持有这些实体，故对应计数恒为 0（字段保留，前端契约不变）。
 func (h *Admin) buildOps(ctx context.Context) (*statsOps, error) {
 	ops := &statsOps{}
-	// 渠道总数（渠道无独立状态，可用性由密钥/模型三态体现）
-	ops.Channels.Total = len(h.channelMgr.Snapshot())
-	// 密钥运行时三态
-	for st, n := range h.channelMgr.KeyStateCounts() {
-		ops.Keys.Total += n
-		switch st {
-		case channel.StateNormal:
-			ops.Keys.Normal += n
-		case channel.StateDrain:
-			ops.Keys.Drain += n
-		case channel.StateDisabled:
-			ops.Keys.Disabled += n
-		}
-	}
-	// 渠道内部模型运行时三态
-	for st, n := range h.channelMgr.ModelStateCounts() {
-		ops.Models.InternalTotal += n
-		if st == channel.StateNormal {
-			ops.Models.InternalNormal += n
-		}
-	}
 	// 对外模型计数（DB）
 	if err := h.db.QueryRowContext(ctx,
 		`SELECT count(*), COALESCE(sum(enabled::int),0)

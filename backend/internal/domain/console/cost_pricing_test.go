@@ -332,7 +332,7 @@ func TestHandleCostStats_EntityRows(t *testing.T) {
 		t.Fatalf("sqlmock: %v", err)
 	}
 	defer db.Close()
-	admin := NewAdmin(db, nil, nil, nil)
+	admin := NewAdmin(db, nil, nil)
 	admin.now = func() time.Time { return time.Date(2026, 10, 25, 15, 30, 0, 0, cnLocation()) }
 
 	mock.ExpectQuery(regexp.QuoteMeta(`to_json(array_agg(DISTINCT b.external_model_name))::text AS snapshot_names`)).
@@ -440,7 +440,7 @@ func contains(s, sub string) bool {
 
 // TestHandleCostPricingCurve_NilDB 断言未装配 DB 时返回 200 + 两条不可用线（不报错、不返 null）。
 func TestHandleCostPricingCurve_NilDB(t *testing.T) {
-	h := NewAdmin(nil, nil, nil, nil)
+	h := NewAdmin(nil, nil, nil)
 	h.now = func() time.Time { return pricingTestAt(t) }
 	rec := httptest.NewRecorder()
 	h.HandleCostPricingCurve(rec, httptest.NewRequest(http.MethodGet, "/api/v1/admin/cost/pricing-curve", nil))
@@ -468,7 +468,7 @@ func TestHandleCostPricingCurve_NilDB(t *testing.T) {
 
 // TestHandleCostPricingCurve_BadParam 断言非法参数返回 400。
 func TestHandleCostPricingCurve_BadParam(t *testing.T) {
-	h := NewAdmin(nil, nil, nil, nil)
+	h := NewAdmin(nil, nil, nil)
 	for _, q := range []string{"?Step=abc", "?MaxTokens=x", "?HitRate=NaN", "?At=昨天", "?ChannelModelID=abc"} {
 		rec := httptest.NewRecorder()
 		h.HandleCostPricingCurve(rec, httptest.NewRequest(http.MethodGet, "/api/v1/admin/cost/pricing-curve"+q, nil))
@@ -507,7 +507,7 @@ func TestHandleCostPricingCurve_WithChannelModel(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"external_model_id", "external_name", "sale_rates", "time_config", "context_tiers"}).
 			AddRow(int64(31), "gpt-4o", []byte(`{"input":1.5,"output":6,"cache_read":0.15}`), nil, nil))
 
-	h := NewAdmin(db, nil, nil, nil)
+	h := NewAdmin(db, nil, nil)
 	h.now = func() time.Time { return pricingTestAt(t) }
 	rec := httptest.NewRecorder()
 	h.HandleCostPricingCurve(rec, httptest.NewRequest(http.MethodGet,

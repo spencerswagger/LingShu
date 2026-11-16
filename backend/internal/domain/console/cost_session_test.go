@@ -72,7 +72,7 @@ func TestHandleCostSession_FailedRounds(t *testing.T) {
 		WithArgs("s-1", nil).
 		WillReturnRows(rows)
 
-	h := NewAdmin(db, nil, nil, nil)
+	h := NewAdmin(db, nil, nil)
 	rec := httptest.NewRecorder()
 	h.HandleCostSession(rec, sessionReq("s-1", ""))
 	if rec.Code != http.StatusOK {
@@ -142,7 +142,7 @@ func TestHandleCostSession_OldCallerCompat(t *testing.T) {
 			AddRow(mustTime(t, "2026-10-25T10:01:00+08:00"), "", nil, "m", "completed", int64(20), int64(0), int64(5), 0.00002, 0.00003).
 			AddRow(mustTime(t, "2026-10-25T10:02:00+08:00"), "", nil, "m", "completed", int64(30), int64(0), int64(5), 0.00003, 0.00004))
 
-	h := NewAdmin(db, nil, nil, nil)
+	h := NewAdmin(db, nil, nil)
 	rec := httptest.NewRecorder()
 	h.HandleCostSession(rec, sessionReq("s-2", ""))
 	if rec.Code != http.StatusOK {
@@ -188,7 +188,7 @@ func TestHandleCostSession_Truncated(t *testing.T) {
 			AddRow(mustTime(t, "2026-10-25T10:00:00+08:00"), "c", nil, "m", "completed", int64(1), int64(0), int64(1), 0.1, 0.2).
 			AddRow(mustTime(t, "2026-10-25T10:01:00+08:00"), "c", nil, "m", "failed", int64(1), int64(0), int64(0), 0, 0))
 
-	h := NewAdmin(db, nil, nil, nil)
+	h := NewAdmin(db, nil, nil)
 	rec := httptest.NewRecorder()
 	h.HandleCostSession(rec, sessionReq("s-3", "?Limit=2"))
 	if rec.Code != http.StatusOK {
@@ -245,7 +245,7 @@ func TestCostSessionQuery_IncludesFailed(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(`ORDER BY b.call_time ASC, b.id ASC`)).
 		WillReturnRows(sqlmock.NewRows(costSessionRowCols()))
 
-	h := NewAdmin(db, nil, nil, nil)
+	h := NewAdmin(db, nil, nil)
 	rec := httptest.NewRecorder()
 	h.HandleCostSession(rec, sessionReq("s-4", ""))
 	if rec.Code != http.StatusOK {
@@ -283,7 +283,7 @@ func TestHandleCostSession_DefaultNoLimit(t *testing.T) {
 		WithArgs("s-long", nil).
 		WillReturnRows(rows)
 
-	h := NewAdmin(db, nil, nil, nil)
+	h := NewAdmin(db, nil, nil)
 	rec := httptest.NewRecorder()
 	h.HandleCostSession(rec, sessionReq("s-long", ""))
 	if rec.Code != http.StatusOK {
@@ -319,7 +319,7 @@ func TestHandleCostSession_ExplicitLimitOverCap(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows(costSessionRowCols()).
 			AddRow(mustTime(t, "2026-10-25T10:00:00+08:00"), "c", nil, "m", "completed", int64(1), int64(0), int64(1), 0.1, 0.2))
 
-	h := NewAdmin(db, nil, nil, nil)
+	h := NewAdmin(db, nil, nil)
 	rec := httptest.NewRecorder()
 	h.HandleCostSession(rec, sessionReq("s-huge", "?Limit=99999"))
 	if rec.Code != http.StatusOK {

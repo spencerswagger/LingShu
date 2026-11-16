@@ -29,7 +29,10 @@ func NewHandler(svc *Service) *Handler {
 	return &Handler{svc: svc}
 }
 
-// viewModel 是对外模型的对外展示结构（PascalCase 契约）。
+// viewModel 是**租户/开发者可见**的模型视图（PascalCase 契约）。
+//
+// 不包含代理侧映射（magpie_model）：那是内部代号，只给管理端看——
+// /api/v1/dev/models 复用同一处理器，若带上就等于把上游映射漏给租户。
 type viewModel struct {
 	ID           int64                    `json:"ID,string"`
 	ExternalName string                   `json:"ExternalName"`
@@ -41,6 +44,13 @@ type viewModel struct {
 	Aliases      []string                 `json:"Aliases,omitempty"`
 	CreatedAt    time.Time                `json:"CreatedAt"`
 	UpdatedAt    time.Time                `json:"UpdatedAt"`
+}
+
+// adminViewModel 是管理端视图：在对外视图之上补代理侧映射（仅管理端可达）。
+type adminViewModel struct {
+	viewModel
+	// MagpieModel 为代理侧模型名；nil = 未映射（不转发）。
+	MagpieModel *string `json:"MagpieModel"`
 }
 
 func toView(m *ExternalModel) viewModel {
@@ -58,6 +68,11 @@ func toView(m *ExternalModel) viewModel {
 	}
 }
 
+// toAdminView 在对外视图上补代理侧映射（只用于管理端响应）。
+func toAdminView(m *ExternalModel) adminViewModel {
+	return adminViewModel{viewModel: toView(m), MagpieModel: m.MagpieModel}
+}
+
 type createModelRequest struct {
 	ExternalName string                   `json:"ExternalName"`
 	Description  string                   `json:"Description"`
@@ -66,6 +81,8 @@ type createModelRequest struct {
 	TimeConfig   *billing.TimeCoeffConfig `json:"TimeConfig"`
 	ContextTiers []billing.TierRule       `json:"ContextTiers"`
 	Aliases      []string                 `json:"Aliases"`
+	// MagpieModel 传空串或 null 表示「不映射」（不转发到代理侧）。
+	MagpieModel *string `json:"MagpieModel"`
 }
 
 func decodeBody(w http.ResponseWriter, r *http.Request, v any) bool {
@@ -85,11 +102,38 @@ func toInput(req *createModelRequest) ExternalModelInput {
 		TimeConfig:   req.TimeConfig,
 		ContextTiers: req.ContextTiers,
 		Aliases:      req.Aliases,
+		MagpieModel:  req.MagpieModel,
 	}
 }
 
-// HandleList GET /api/v1/admin/models（可选 ?Enabled=true|false）
+// HandleList GET /api/v1/dev/models —— 租户/开发者可见的模型列表（不含代理侧映射）。
 func (h *Handler) HandleList(w http.ResponseWriter, r *http.Request) {
+	models, ok := h.listForResponse(w, r)
+	if !ok {
+		return
+	}
+	list := make([]viewModel, 0, len(models))
+	for i := range models {
+		list = append(list, toView(&models[i]))
+	}
+	resp.OK(w, r, list)
+}
+
+// HandleListAdmin GET /api/v1/admin/models —— 管理端列表（含代理侧映射，可读写配置）。
+func (h *Handler) HandleListAdmin(w http.ResponseWriter, r *http.Request) {
+	models, ok := h.listForResponse(w, r)
+	if !ok {
+		return
+	}
+	list := make([]adminViewModel, 0, len(models))
+	for i := range models {
+		list = append(list, toAdminView(&models[i]))
+	}
+	resp.OK(w, r, list)
+}
+
+// listForResponse 解析 ?Enabled= 并取模型（两个列表入口共用）。
+func (h *Handler) listForResponse(w http.ResponseWriter, r *http.Request) ([]ExternalModel, bool) {
 	var enabled *bool
 	if v := r.URL.Query().Get("Enabled"); v != "" {
 		b := v == "true"
@@ -98,13 +142,9 @@ func (h *Handler) HandleList(w http.ResponseWriter, r *http.Request) {
 	models, err := h.svc.ListModels(r.Context(), enabled)
 	if err != nil {
 		writeServiceErr(w, r, err)
-		return
+		return nil, false
 	}
-	list := make([]viewModel, 0, len(models))
-	for i := range models {
-		list = append(list, toView(&models[i]))
-	}
-	resp.OK(w, r, list)
+	return models, true
 }
 
 // HandleCreate POST /api/v1/admin/models
@@ -118,7 +158,7 @@ func (h *Handler) HandleCreate(w http.ResponseWriter, r *http.Request) {
 		writeServiceErr(w, r, err)
 		return
 	}
-	resp.OK(w, r, toView(m))
+	resp.OK(w, r, toAdminView(m))
 }
 
 func pathID(w http.ResponseWriter, r *http.Request) (int64, bool) {
@@ -145,7 +185,7 @@ func (h *Handler) HandleUpdate(w http.ResponseWriter, r *http.Request) {
 		writeServiceErr(w, r, err)
 		return
 	}
-	resp.OK(w, r, toView(m))
+	resp.OK(w, r, toAdminView(m))
 }
 
 type batchDeleteRequest struct {
@@ -198,7 +238,7 @@ func (h *Handler) HandleApplyPrice(w http.ResponseWriter, r *http.Request) {
 		writeServiceErr(w, r, err)
 		return
 	}
-	resp.OK(w, r, toView(m))
+	resp.OK(w, r, toAdminView(m))
 }
 
 // HandleSyncPrices POST /api/v1/admin/models/sync-prices
