@@ -1,11 +1,13 @@
 package magpie
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -495,5 +497,210 @@ func TestForward_OurRequestIDWinsOverUpstream(t *testing.T) {
 	vals := rec.Header().Values("x-request-id")
 	if len(vals) != 1 || vals[0] != "ours-1" {
 		t.Fatalf("下游只该看到灵枢自己的 x-request-id（ours-1），got %v", vals)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// SSE 流式路径的响应头防线（缺口的回归用例：此前没有任何用例钉住 hop-by-hop 剔除）。
+//
+// 为什么用裸 TCP 上游而不是 httptest.NewServer：Go 的 http.Server 会自己吞掉/改写
+// Transfer-Encoding、Content-Length 等头，测不出「上游/中间层把响应头整包拷来、没剔除」
+// 时的真实穿透。实测（2026-11-16）：Go 传输层**不**替你剥 hop-by-hop ——
+// resp.Header 里 Connection / Keep-Alive / Proxy-Connection / TE / Trailer / Upgrade 全在，
+// 最外层唯一防线就是本包的 responseHopByHop + ShouldDropResponseHeader。
+// ---------------------------------------------------------------------------
+
+// rawHeaderUpstream 起一个只应答一次的裸 TCP 上游，手写响应行/头/体。
+// chunked=true 时用 chunked 框架（真实 SSE 的传输形态，且不带 Content-Length）。
+func rawHeaderUpstream(t *testing.T, headers [][2]string, body []byte, chunked bool) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("裸上游监听失败: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		br := bufio.NewReader(conn)
+		for { // 吃掉请求头，读到空行为止
+			line, rerr := br.ReadString('\n')
+			if rerr != nil {
+				return
+			}
+			if line == "\r\n" || line == "\n" {
+				break
+			}
+		}
+		var b strings.Builder
+		b.WriteString("HTTP/1.1 200 OK\r\n")
+		for _, h := range headers {
+			b.WriteString(h[0] + ": " + h[1] + "\r\n")
+		}
+		if chunked {
+			b.WriteString("Transfer-Encoding: chunked\r\n\r\n")
+			b.WriteString(fmt.Sprintf("%x\r\n", len(body)))
+			b.Write(body)
+			b.WriteString("\r\n0\r\n\r\n")
+		} else {
+			b.WriteString(fmt.Sprintf("Content-Length: %d\r\n\r\n", len(body)))
+			b.Write(body)
+		}
+		_, _ = conn.Write([]byte(b.String()))
+	}()
+	return "http://" + ln.Addr().String()
+}
+
+// sseBodyWithUsage 是一段最小 SSE：两个内容帧 + 一个 usage 帧 + [DONE]。
+func sseBodyWithUsage() []byte {
+	return []byte("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{\"content\":\"there\"}}]}\n\n" +
+		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7}}\n\n" +
+		"data: [DONE]\n\n")
+}
+
+// TestForward_StreamResponseHeadersFiltered 是「拷贝头但不剔除」的端到端回归用例：
+// 上游/中间层把响应头整包拷过来（含 hop-by-hop），下游只许看到经本包过滤后的结果。
+//
+// 两个方向都要钉：
+//   - 正向：hop-by-hop 一律不许穿透（漏一个就是连接级语义跨代理：可能把上游连接头 /
+//     内部路由头亮给租户，或让下游按错误的分帧方式读流）；
+//   - 反向：SSE 语义头（Content-Type: text/event-stream、Cache-Control）与普通通用头
+//     （X-Accel-Buffering、X-RateLimit-*）必须保留，过滤不能退化成「一刀切全剥」。
+func TestForward_StreamResponseHeadersFiltered(t *testing.T) {
+	body := sseBodyWithUsage()
+
+	cases := []struct {
+		name, value string
+		drop        bool   // true=下游必须看不到；false=下游必须原值看到
+		why         string // 判定依据（漏了要能一眼看出违反了哪条口径）
+	}{
+		{"Connection", "keep-alive", true, "hop-by-hop（RFC 7230 §6.1）"},
+		{"Keep-Alive", "timeout=5", true, "hop-by-hop"},
+		{"Proxy-Connection", "keep-alive", true, "hop-by-hop（非标但中间层常发）"},
+		{"TE", "trailers", true, "hop-by-hop"},
+		{"Trailer", "X-Sum", true, "hop-by-hop"},
+		{"Upgrade", "h2c", true, "hop-by-hop（协议切换不能跨代理）"},
+		{"Content-Type", "text/event-stream; charset=utf-8", false, "SSE 语义头：掉了下游就不是流"},
+		{"Cache-Control", "no-cache", false, "SSE 语义头（禁缓存）"},
+		{"X-Accel-Buffering", "no", false, "反代不缓冲 SSE 的语义头"},
+		{"X-RateLimit-Limit", "50", false, "普通通用头：陪跑，证明不是一刀切"},
+	}
+
+	// 单个上游一次发出全部头，更接近「整包拷贝」；再加一个由 Connection 点名的自定义头。
+	headers := make([][2]string, 0, len(cases)+1)
+	for _, c := range cases {
+		headers = append(headers, [2]string{c.name, c.value})
+	}
+	headers = append(headers, [2]string{"X-Internal-Hop", "secret-route"})
+
+	f := NewForwarder()
+	rec := httptest.NewRecorder()
+	res := f.Forward(t.Context(), rec, ForwardRequest{
+		BaseURL: rawHeaderUpstream(t, headers, body, false),
+		Path:    "/v1/chat/completions", Header: http.Header{},
+		Body: []byte(`{"model":"m","stream":true}`), RequestID: "our-rid",
+		Streaming: true, Billable: true, Protocol: ProtocolOpenAIChat,
+	}, Timeouts{StreamFirstByte: 5 * time.Second, StreamIdle: 5 * time.Second})
+	if res.Err != nil {
+		t.Fatalf("转发失败: %v", res.Err)
+	}
+	// 过滤只动头、不动体：字节仍须逐字节相等，usage 仍须旁路读到。
+	if !bytes.Equal(rec.Body.Bytes(), body) {
+		t.Fatalf("SSE 响应体必须逐字节相等：got %d want %d（首差异 %d）",
+			rec.Body.Len(), len(body), firstDiff(rec.Body.Bytes(), body))
+	}
+	if !res.HasUsage || res.Usage.Input != 11 || res.Usage.Output != 7 {
+		t.Fatalf("usage 应仍被旁路读到：%+v has=%v", res.Usage, res.HasUsage)
+	}
+	if got := rec.Header().Get("x-request-id"); got != "our-rid" {
+		t.Fatalf("x-request-id 仍是灵枢自己的，got %q", got)
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := rec.Header().Get(c.name)
+			if c.drop {
+				if got != "" {
+					t.Fatalf("%s 必须剔除（%s），下游却收到 %q", c.name, c.why, got)
+				}
+				return
+			}
+			if got != c.value {
+				t.Fatalf("%s 必须保留 %q（%s），got %q", c.name, c.value, c.why, got)
+			}
+		})
+	}
+
+}
+
+// TestForward_StreamConnectionTokenHeadersNotCopied 单列「Connection 点名的头」这一类：
+// RFC 7230 §6.1 第 2 段规定 `Connection: X-Route` 里点名的字段同样是 hop-by-hop，必须一并丢。
+// 上游/中间层常把内部路由头写进 Connection，只按静态表匹配头名就会把它原样漏给租户。
+//
+// 与上面那条用例分开，是为了让「既有防线」和「已知缺口」各自可判：
+// 本条红 = 缺口未修；上面那条红 = 已生效的防线被改坏。
+func TestForward_StreamConnectionTokenHeadersNotCopied(t *testing.T) {
+	body := sseBodyWithUsage()
+	headers := [][2]string{
+		{"Content-Type", "text/event-stream; charset=utf-8"},
+		{"Connection", "keep-alive, x-internal-hop"},
+		{"X-Internal-Hop", "secret-route"},
+	}
+
+	f := NewForwarder()
+	rec := httptest.NewRecorder()
+	if res := f.Forward(t.Context(), rec, ForwardRequest{
+		BaseURL: rawHeaderUpstream(t, headers, body, false),
+		Path:    "/v1/chat/completions", Header: http.Header{},
+		Body: []byte(`{"model":"m","stream":true}`), RequestID: "our-rid",
+		Streaming: true, Billable: true, Protocol: ProtocolOpenAIChat,
+	}, Timeouts{StreamFirstByte: 5 * time.Second, StreamIdle: 5 * time.Second}); res.Err != nil {
+		t.Fatalf("转发失败: %v", res.Err)
+	}
+	if got := rec.Header().Get("X-Internal-Hop"); got != "" {
+		t.Fatalf("Connection 点名的 X-Internal-Hop 属 hop-by-hop（RFC 7230 §6.1），必须剔除，下游却收到 %q", got)
+	}
+	// 反向：Connection 本身被丢，不影响 SSE 语义头。
+	if got := rec.Header().Get("Content-Type"); !strings.Contains(got, "text/event-stream") {
+		t.Fatalf("SSE 语义头必须保留，got %q", got)
+	}
+}
+
+// TestShouldDropResponseHeader_HopByHop 是把 hop-by-hop 口径钉在判定函数上的表：
+// 端到端用例保证链路生效，这里保证口径本身不被悄悄放宽（例如为了「少剥几个头」
+// 把某一行从 responseHopByHop 里删掉）。
+func TestShouldDropResponseHeader_HopByHop(t *testing.T) {
+	cases := []struct {
+		name, value string
+		want        bool
+		why         string
+	}{
+		{"Connection", "keep-alive", true, "hop-by-hop"},
+		{"Keep-Alive", "timeout=5", true, "hop-by-hop"},
+		{"Proxy-Connection", "keep-alive", true, "hop-by-hop"},
+		{"TE", "trailers", true, "hop-by-hop"},
+		{"Trailer", "X-Sum", true, "hop-by-hop"},
+		{"Transfer-Encoding", "chunked", true, "hop-by-hop（分帧由本链路自己决定）"},
+		{"Upgrade", "h2c", true, "hop-by-hop"},
+		{"Content-Type", "text/event-stream; charset=utf-8", false, "SSE 语义头"},
+		{"Cache-Control", "no-cache", false, "SSE 语义头"},
+		{"X-Accel-Buffering", "no", false, "反代不缓冲"},
+		// 现状记录，不是「正确性」断言：本链路不改写响应体，长度仍然成立，headers.go 注释
+		// 明确保留 Content-Length。SSE 口径若要改成「流式不得带长度」，改实现时这一行同步变红，
+		// 逼一次显式决策（而不是悄悄放宽/收紧）。
+		{"Content-Length", "134", false, "现状：长度成立故保留（口径待定，见 headers.go 注释）"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := ShouldDropResponseHeader(c.name, c.value); got != c.want {
+				t.Fatalf("ShouldDropResponseHeader(%q,%q)=%v, want %v（%s）",
+					c.name, c.value, got, c.want, c.why)
+			}
+		})
 	}
 }
