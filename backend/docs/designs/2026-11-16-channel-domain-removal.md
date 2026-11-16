@@ -1,7 +1,7 @@
 # 渠道域读取代码摘除（与迁移 0024 同批）
 
 日期：2026-11-16
-分支：`feat/lingshu-v2-drop-channel-reads`（基于 `feat/lingshu-v2-converge`）
+分支：已并入 `feat/lingshu-v2-converge`（原 `feat/lingshu-v2-drop-channel-reads`），随 PR #84 与 0024 同批交付
 状态：实现完成，**必须与 `0024_v2_drop_legacy.sql` 同一发布批次上线**
 
 ## 1. 为什么必须同批
