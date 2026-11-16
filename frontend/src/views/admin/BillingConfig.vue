@@ -10,21 +10,18 @@ import { QuestionFilled } from '@element-plus/icons-vue'
 import {
   getSystemConfig,
   putSystemConfig,
-  exportChannelProtocols,
-  importChannelProtocols,
   type BillingConfigData,
   type CostSample,
   type SessionCostConfig,
   type SessionExpirationData,
   type SystemConfigPayload,
   type UpstreamConfigData,
-  type ChannelProtocolPack,
 } from '@/api/admin'
 import ModelPricing from '@/components/ModelPricing.vue'
 import ErrorBubble from '@/components/ErrorBubble.vue'
 
 // ===== tab =====
-type TabKey = 'billing' | 'routing' | 'gateway' | 'upstream' | 'ops'
+type TabKey = 'billing' | 'routing' | 'gateway' | 'upstream'
 const TABS: { key: TabKey; label: string }[] = [
   { key: 'billing', label: '计费' },
   { key: 'routing', label: '路由' },
@@ -32,8 +29,6 @@ const TABS: { key: TabKey; label: string }[] = [
   // 「上游（V2）」目前只读：三个键（base_url / timeouts / degrade 三开关 + 订阅池前缀）
   // 的写入白名单还没在后端开放，先只读展示，避免「填了保存成功但其实没写」。
   { key: 'upstream', label: '上游（V2）' },
-  // 「运维」没有 sys_configs 字段，放的是非配置类能力（渠道协议备份/恢复），因此没有保存按钮
-  { key: 'ops', label: '运维' },
 ]
 const activeTab = ref<TabKey>('billing')
 const tabLabel = (k: TabKey) => TABS.find((t) => t.key === k)?.label || k
@@ -123,10 +118,9 @@ const gatewayPayload = computed(() => ({
   UpstreamResponseHeaderWhitelist: whitelist.value,
 }))
 
-// 有配置字段的三个 tab（运维 tab 不写 sys_configs，不参与脏判定/保存）
-// 有 sys_configs 字段、可保存的页签（upstream / ops 目前只读）
-type ConfigTab = Exclude<TabKey, 'ops' | 'upstream'>
-const isConfigTab = (t: TabKey): t is ConfigTab => t !== 'ops' && t !== 'upstream'
+// 有 sys_configs 字段、可保存的页签（upstream 目前只读）
+type ConfigTab = Exclude<TabKey, 'upstream'>
+const isConfigTab = (t: TabKey): t is ConfigTab => t !== 'upstream'
 
 const snap = ref<Record<ConfigTab, string>>({ billing: '', routing: '', gateway: '' })
 const payloadOf = (tab: ConfigTab) =>
@@ -205,7 +199,7 @@ function validateTab(tab: ConfigTab): string | null {
 }
 
 async function saveTab(tab: TabKey = activeTab.value) {
-  if (!isConfigTab(tab)) return // 运维 / 上游(V2) 页签当前没有可保存的配置字段
+  if (!isConfigTab(tab)) return // 上游(V2) 页签当前没有可保存的配置字段
   const bad = validateTab(tab)
   if (bad) {
     ElMessage.warning(bad)
@@ -333,63 +327,6 @@ async function saveFallback() {
   }
 }
 
-// ===== 渠道协议备份与恢复（与配置无关，常驻在 tab 下方）=====
-const fileInput = ref<HTMLInputElement | null>(null)
-const exporting = ref(false)
-const importing = ref(false)
-
-function formatTs(d = new Date()) {
-  const p = (n: number) => String(n).padStart(2, '0')
-  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`
-}
-
-async function onExport() {
-  exporting.value = true
-  errInfo.value = { message: '', requestId: '' }
-  try {
-    const res = await exportChannelProtocols()
-    const blob = new Blob([JSON.stringify(res.Data, null, 2)], { type: 'application/json' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `channel-protocols-${formatTs()}.json`
-    a.click()
-    URL.revokeObjectURL(url)
-  } catch (e: any) {
-    errInfo.value = { message: e?.message, requestId: e?.requestId }
-  } finally {
-    exporting.value = false
-  }
-}
-
-function triggerImport() {
-  fileInput.value?.click()
-}
-
-async function onFileChange(ev: Event) {
-  const input = ev.target as HTMLInputElement
-  const file = input.files?.[0]
-  if (!file) return
-  try {
-    const raw = await file.text()
-    if (!raw) return
-    let parsed: ChannelProtocolPack
-    try {
-      parsed = JSON.parse(raw)
-    } catch {
-      ElMessage.error('文件不是合法的 JSON')
-      return
-    }
-    importing.value = true
-    await importChannelProtocols(parsed)
-    ElMessage.success('渠道协议已导入')
-  } catch (e: any) {
-    errInfo.value = { message: e?.message, requestId: e?.requestId }
-  } finally {
-    importing.value = false
-    input.value = '' // 允许再次选同一个文件
-  }
-}
 </script>
 
 <template>
@@ -710,26 +647,6 @@ async function onFileChange(ev: Event) {
             </div>
           </el-tab-pane>
 
-          <!-- ④ 运维：非配置类能力（渠道协议备份/恢复），没有 sys_configs 字段、也没有保存按钮 -->
-          <el-tab-pane name="ops">
-            <template #label>
-              <span class="tab-label">运维</span>
-            </template>
-
-            <div class="config-block">
-              <div class="block-title">备份与恢复</div>
-              <div class="block-desc">
-                导出全部渠道协议为预设包 JSON，或从该文件导入。导入按名称/来源自动去重，仅新增不覆盖。
-                该能力不写系统配置，因此本页签没有「保存」按钮。
-              </div>
-              <div class="form-row">
-                <span class="label">渠道协议</span>
-                <el-button type="primary" :loading="exporting" @click="onExport">导出</el-button>
-                <el-button :loading="importing" @click="triggerImport">导入</el-button>
-                <input ref="fileInput" type="file" accept=".json,application/json" style="display: none" @change="onFileChange" />
-              </div>
-            </div>
-          </el-tab-pane>
         </el-tabs>
 
         <ErrorBubble

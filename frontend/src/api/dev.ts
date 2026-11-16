@@ -7,7 +7,6 @@ export interface DevToken {
   ID: string
   TokenDisplay: string
   DisplayName: string
-  TagID: string | null
   ExpiresAt: string | null
   LastUsedAt: string | null
   Status: string // ACTIVE | DISABLED
@@ -38,7 +37,6 @@ export function listDevTokens(page = 1, size = 20, status = '') {
 // 创建本人令牌
 export function createDevToken(payload: {
   DisplayName: string
-  TagID: string | null
   ExpiresAt: string | null
 }) {
   return http.post<CreatedToken, ApiRes<CreatedToken>>('/dev/tokens', payload)
@@ -59,23 +57,6 @@ export function getDevTokenSecret(id: string, password: string) {
   return http.get<CreatedToken, ApiRes<CreatedToken>>(`/dev/tokens/${id}/secret`, {
     headers: { 'X-Current-Password': password },
   })
-}
-
-// 启用中的语义标签（令牌创建时可选；enabled=true 过滤）
-export function listDevTags() {
-  return http.get<DevTag[], ApiRes<DevTag[]>>('/dev/tags', {
-    params: { Enabled: true },
-  })
-}
-
-export interface DevTag {
-  ID: string
-  Name: string
-  Description: string
-  KVPairs: Record<string, string>
-  Enabled: boolean
-  CreatedBy: string
-  CreatedAt: string
 }
 
 // ===== 开发端·钱包/用量/账单/公告 =====

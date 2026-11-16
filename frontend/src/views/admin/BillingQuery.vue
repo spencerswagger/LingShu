@@ -4,18 +4,14 @@ import { useRoute, useRouter } from 'vue-router'
 import {
   listBillings,
   getBillingStats,
-  listChannels,
-  listChannelKeys,
   listExternalModels,
   listAutoModels,
   listSessions,
   listTokens,
   type AdminBillingItem,
-  type AdminChannel,
   type AdminSession,
   type AdminToken,
   type BillingStats,
-  type ChannelKey,
   type ExternalModel,
 } from '@/api/admin'
 import ErrorBubble from '@/components/ErrorBubble.vue'
@@ -66,8 +62,8 @@ const stats = ref<BillingStats>({
 })
 
 // ===== 列头筛选选项数据 =====
-const channels = ref<AdminChannel[]>([])
-const channelKeys = ref<ChannelKey[]>([])
+// 渠道 / 渠道密钥在 V2 整体下线（后端接口 410、表已删 0024）：不再加载候选，也不再提供这两个筛选项。
+// 账单行上的 channel_name / key_name 字段仍由后端返回（结构不删），拿到就显示，拿不到显示 '-'。
 const models = ref<ExternalModel[]>([])
 const autoNames = ref<string[]>([])
 const tokens = ref<AdminToken[]>([])
@@ -78,8 +74,6 @@ const userName = ref('')
 const filters = reactive({
   user_id: (route.query.user_id ? String(route.query.user_id) : undefined) as string | undefined,
   token_id: undefined as string | undefined,
-  channel_id: undefined as string | undefined,
-  channel_key_id: undefined as string | undefined,
   session_id: undefined as string | undefined,
   model: undefined as string | undefined,
   status: undefined as string | undefined,
@@ -97,7 +91,6 @@ filters.range = resolveBillingRange(route.query.range)
 const paramKeyMap: Record<string, string> = {
   user_id: 'UserID',
   token_id: 'TokenID',
-  channel_key_id: 'ChannelKeyID',
   session_id: 'SessionID',
   model: 'Model',
   status: 'Status',
@@ -108,7 +101,6 @@ function buildParams(extra: Record<string, unknown> = {}): Record<string, unknow
   const p: Record<string, unknown> = { ...extra }
   for (const [k, v] of Object.entries(filters)) {
     if (v === undefined || v === null || v === '') continue
-    if (k === 'channel_id') continue // 后端按 channel_key_id 过滤，渠道仅作级联
     if (k === 'range') {
       if (filters.range) {
         p.From = filters.range[0]
@@ -244,16 +236,6 @@ async function load() {
 }
 
 // ===== 选项加载 =====
-async function loadChannels() {
-  // self 模式仅服务端只读接口（无 /dev/channels），直接跳过，避免 403 噪音。
-  if (isSelf.value) return
-  if (channels.value.length) return
-  try {
-    channels.value = (await listChannels()).Data || []
-  } catch {
-    channels.value = []
-  }
-}
 async function loadModels() {
   if (models.value.length) return
   try {
@@ -296,37 +278,12 @@ async function searchSessions(q: string) {
     sessions.value = []
   }
 }
-async function onChannelChange(id?: string) {
-  filters.channel_key_id = undefined
-  channelKeys.value = []
-  if (!id) return
-  try {
-    channelKeys.value = (await listChannelKeys(id)).Data || []
-  } catch {
-    channelKeys.value = []
-  }
-}
-
 // 列头浮窗「清除」：还原对应筛选条件并保持级联下拉一致。
 function clearUserKey() {
   filters.user_id = undefined
   filters.token_id = undefined
 }
-function clearChannelKey() {
-  filters.channel_id = undefined
-  filters.channel_key_id = undefined
-  channelKeys.value = []
-}
-
 // ===== 生效筛选标签 =====
-function channelLabel(id?: string) {
-  if (!id) return ''
-  return channels.value.find((c) => c.ID === id)?.Name || id
-}
-function channelKeyLabel(id?: string) {
-  if (!id) return ''
-  return channelKeys.value.find((k) => k.ID === id)?.Name || id
-}
 function tokenTagLabel(id?: string) {
   if (!id) return ''
   const tk = tokens.value.find((x) => x.ID === id)
@@ -348,12 +305,6 @@ const activeTags = computed(() => {
   }
   if (filters.user_id) out.push({ key: 'user_id', label: `用户: ${userName.value || filters.user_id}` })
   if (filters.token_id) out.push({ key: 'token_id', label: `密钥: ${tokenTagLabel(filters.token_id)}` })
-  if (filters.channel_key_id) {
-    const parts = [channelLabel(filters.channel_id), channelKeyLabel(filters.channel_key_id)].filter(Boolean).join(' · ')
-    out.push({ key: 'channel_key_id', label: `渠道密钥: ${parts || filters.channel_key_id}` })
-  } else if (filters.channel_id) {
-    out.push({ key: 'channel_id', label: `渠道: ${channelLabel(filters.channel_id)}` })
-  }
   if (filters.session_id) out.push({ key: 'session_id', label: `会话: ${sessionTagLabel(filters.session_id)}` })
   if (filters.model) out.push({ key: 'model', label: `模型: ${filters.model}` })
   if (filters.status) out.push({ key: 'status', label: `状态: ${filters.status === 'completed' ? '成功' : '失败'}` })
@@ -372,14 +323,6 @@ function clearTag(key: string) {
       break
     case 'token_id':
       filters.token_id = undefined
-      break
-    case 'channel_id':
-      filters.channel_id = undefined
-      break
-    case 'channel_key_id':
-      filters.channel_id = undefined
-      filters.channel_key_id = undefined
-      channelKeys.value = []
       break
     case 'session_id':
       filters.session_id = undefined
@@ -402,7 +345,6 @@ watch(
   () => ({
     user_id: filters.user_id,
     token_id: filters.token_id,
-    channel_key_id: filters.channel_key_id,
     session_id: filters.session_id,
     model: filters.model,
     status: filters.status,
@@ -437,7 +379,6 @@ function reset() {
   const wasActive = !!(
     filters.user_id ||
     filters.token_id ||
-    filters.channel_key_id ||
     filters.session_id ||
     filters.model ||
     filters.status ||
@@ -446,15 +387,12 @@ function reset() {
   )
   filters.user_id = undefined
   filters.token_id = undefined
-  filters.channel_id = undefined
-  filters.channel_key_id = undefined
   filters.session_id = undefined
   filters.model = undefined
   filters.status = undefined
   filters.request_id = undefined
   requestIdInput.value = ''
   filters.range = null
-  channelKeys.value = []
   if (!wasActive) {
     page.value = 1
     load()
@@ -462,7 +400,6 @@ function reset() {
 }
 
 onMounted(() => {
-  loadChannels()
   loadModels()
   loadAutoNames()
   searchSessions('')
@@ -847,41 +784,14 @@ function sessionLabel(s: AdminSession): string {
           </template>
         </el-table-column>
 
-        <!-- 渠道 / 密钥：渠道显示名开发者端也可见（白名单），密钥维度仅管理端 -->
+        <!-- 渠道 / 密钥：V2 已下线渠道族（0024 删表、接口 410）。
+             列保留、不再提供筛选项（已无法筛）；历史行有值就显示，新行恒空显示 '-'。
+             按上游维度筛单请用右侧「归因 / 成本来源」列（upstream_provider/account）。 -->
         <el-table-column :label="isSelf ? '渠道' : '渠道 / 密钥'" min-width="150">
           <template #header>
-            <!-- 开发者端没有渠道/密钥列表接口（也无该维度权限），表头只留纯文本 -->
-            <span v-if="isSelf">渠道</span>
-            <ColumnFilter
-              v-else
-              label="渠道 / 密钥"
-              :active="!!filters.channel_id || !!filters.channel_key_id"
-
-              @clear="clearChannelKey"
-            >
-              <div class="f-stack">
-                <el-select
-                  v-model="filters.channel_id"
-                  placeholder="渠道"
-                  filterable
-                  clearable
-                  size="small"
-                  @change="onChannelChange"
-                >
-                  <el-option v-for="c in channels" :key="c.ID" :label="c.Name" :value="c.ID" />
-                </el-select>
-                <el-select
-                  v-model="filters.channel_key_id"
-                  placeholder="密钥"
-                  filterable
-                  clearable
-                  size="small"
-                  :disabled="!filters.channel_id"
-                >
-                  <el-option v-for="k in channelKeys" :key="k.ID" :label="k.Name" :value="k.ID" />
-                </el-select>
-              </div>
-            </ColumnFilter>
+            <el-tooltip content="渠道族已在 V2 下线：历史行可能仍有值，新账单恒空；按上游维度筛请用「归因 / 成本来源」列" placement="top">
+              <span>{{ isSelf ? '渠道' : '渠道 / 密钥（已下线）' }}</span>
+            </el-tooltip>
           </template>
           <template #default="{ row }">
             <div class="t-time">

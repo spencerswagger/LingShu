@@ -34,16 +34,13 @@ const router = createRouter({
         { path: 'ledger', name: 'admin-ledger', component: () => import('@/views/admin/v2/Ledger.vue'), meta: { title: '账本' } },
         { path: 'reconcile', name: 'admin-reconcile', component: () => import('@/views/admin/v2/Reconcile.vue'), meta: { title: '对账' } },
         { path: 'pnl', name: 'admin-pnl', component: () => import('@/views/admin/v2/Pnl.vue'), meta: { title: '盈亏' } },
-        // 渠道（列表内含「渠道 / 渠道协议」页内切换）
-        { path: 'channels', name: 'admin-channels', component: () => import('@/views/admin/ChannelsPage.vue'), meta: { title: '渠道' } },
-        { path: 'channels/create', name: 'admin-channel-create', component: () => import('@/views/admin/ChannelCreate.vue'), meta: { title: '新建渠道' } },
-        { path: 'channels/:id', name: 'admin-channel-edit', component: () => import('@/views/admin/ChannelEdit.vue'), meta: { title: '渠道' } },
-        // 渠道协议（列表已并入「渠道」页内切换，这里仅保留新建/编辑子页）
-        { path: 'channel-protocols', redirect: '/admin/channels' },
-        { path: 'channel-protocols/create', name: 'admin-channel-protocol-create', component: () => import('@/views/admin/ChannelProtocolEdit.vue'), meta: { title: '新建渠道协议' } },
-        { path: 'channel-protocols/:id/edit', name: 'admin-channel-protocol-edit', component: () => import('@/views/admin/ChannelProtocolEdit.vue'), meta: { title: '编辑渠道协议' } },
-        // 状态（渠道侧通路矩阵；菜单排在「统计」下方）
-        { path: 'service-status', name: 'admin-service-status', component: () => import('@/views/admin/ServiceStatus.vue'), meta: { title: '状态' } },
+        // 渠道族（渠道 / 渠道协议 / 渠道密钥 / 渠道模型）与标签、服务状态页在 V2 整体下线：
+        // 后端接口 410、表已删（0024），页面文件已删除。这里只保留 **1 行老书签兜底**，
+        // 让历史链接落到「上游拓扑」而不是撞登录页（无页面、无接口调用）。
+        { path: 'channels/:pathMatch(.*)*', redirect: '/admin/topology' },
+        { path: 'channel-protocols/:pathMatch(.*)*', redirect: '/admin/topology' },
+        { path: 'tags/:pathMatch(.*)*', redirect: '/admin/topology' },
+        { path: 'service-status', redirect: '/admin/topology' },
         // 模型（列表内含「模型 / Auto 模型」页内切换）
         { path: 'models', name: 'admin-models', component: () => import('@/views/admin/ModelsPage.vue'), meta: { title: '模型' } },
         { path: 'models/create', name: 'admin-model-create', component: () => import('@/views/admin/ModelCreate.vue'), meta: { title: '新建模型' } },
@@ -52,10 +49,6 @@ const router = createRouter({
         { path: 'auto-models', redirect: '/admin/models' },
         { path: 'auto-models/create', name: 'admin-auto-model-create', component: () => import('@/views/admin/AutoModelCreate.vue'), meta: { title: '新建 Auto 模型' } },
         { path: 'auto-models/:id/edit', name: 'admin-auto-model-edit', component: () => import('@/views/admin/AutoModelEdit.vue'), meta: { title: '编辑 Auto 模型' } },
-        // 语义标签
-        { path: 'tags', name: 'admin-tags', component: () => import('@/views/admin/TagList.vue'), meta: { title: '标签' } },
-        { path: 'tags/create', name: 'admin-tag-create', component: () => import('@/views/admin/TagCreate.vue'), meta: { title: '新建标签' } },
-        { path: 'tags/:id/edit', name: 'admin-tag-edit', component: () => import('@/views/admin/TagEdit.vue'), meta: { title: '编辑标签' } },
         // 用户管理
         { path: 'users', name: 'admin-users', component: () => import('@/views/admin/UserList.vue'), meta: { title: '用户' } },
         { path: 'users/create', name: 'admin-user-create', component: () => import('@/views/admin/UserCreate.vue'), meta: { title: '新建用户' } },

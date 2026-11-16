@@ -160,3 +160,33 @@
 | 6 | P01 统计口径改造 | Core（M1/M2） | 合入后按 Spec P01 五条验收逐条过（成本来源四段 / 无会话词 / 收入 0 毛利率「—」） |
 
 > 本分支只推送自己的分支，未向 `main` / `v2` 发起任何 PR/MR；v2 收敛 PR 由 Core 开。
+
+---
+
+## 8 渠道族 / 标签接口摘除（2026-11-16，同批修，不延到阶段三）
+
+后端在 v2 收敛里把渠道族（渠道 / 渠道协议 / 渠道密钥 / 渠道模型）与标签接口整体下线，
+前端不再是「点进去一串 410」，而是**物理删除 + 依赖渠道维度的展示降级**。
+
+| 项 | 数量 | 明细 |
+|---|---|---|
+| 请求封装删除 | **38 处** | 渠道 22（含 cron-preview / probe-logs / model-events / 密钥与模型子路径）· 渠道协议 10 · 标签 5（管理端 4 + 开发端 1） |
+| 类型定义删除 | 渠道族与标签相关全部 DTO | `AdminChannel / ChannelInput / ChannelKey / ChannelKeyState / ChannelModel / ChannelModelInput / ChannelModelEvent / ChannelProtocolView / ChannelProtocolInput / ChannelProtocolPack / AdminTag / TagInput / DevTag / ProbeLog / ProbeOutcome / ServiceStatusView / MachineMetrics / ChannelRuntimeView / ModelRuntimeView` 等；令牌 DTO 去掉 `TagID` |
+| 页面删除 | **11 个文件** | `ChannelList / ChannelCreate / ChannelEdit / ChannelProtocolList / ChannelProtocolEdit / ChannelsPage / TagList / TagCreate / TagEdit / ServiceStatus` + 组件 `ChannelModels.vue` |
+| 路由节点 | 10 条页面路由删除 | 渠道 3 / 渠道协议 3 / 标签 3 / 状态 1；替换为 **4 条老书签兜底**（`channels/*`、`channel-protocols/*`、`tags/*`、`service-status` → `/admin/topology`），无页面、无接口调用 |
+| 菜单入口 | 3 个删除 | 渠道 / 标签 / 状态（含 activeMenu 高亮映射与图标 import） |
+
+**依赖渠道维度的展示（按「结构不删、渠道维度恒空」降级）**
+
+| 位置 | 处理 |
+|---|---|
+| 账单查询「渠道 / 密钥」列 | 列保留、表头改「渠道 / 密钥（已下线）」并附 tooltip；**筛选控件与候选加载全部删除**（`listChannels` / `listChannelKeys` 不再调用）；历史行有值就显示，新行 `-` |
+| 账单详情 / 调用日志 / 会话详情 | `ChannelName / KeyName / channel_*` 仍按后端返回显示（历史行可能非空），无值显示 `-`，**不做任何推导或补数据** |
+| 系统页「运维」页签 | 整块删除（渠道协议备份/恢复），页面不再请求 `/admin/channel-protocols/export|import` |
+| 模型编辑「从内部模型同步定价」 | 删除（原本读 `channel_models.CostRates`，该表 0024 已删）；售价维护保留「手填 / 从 models.dev 取参考价」两条路 |
+| 开发端令牌「路由 / 语义标签」 | 列表列、筛选项、创建表单项、详情块全部删除；`TagID` 不再出现在任何请求体 |
+
+**保持现状（不属渠道族，别顺手删）**：模型页「内部模型绑定」列与未绑定横幅、令牌页 callerKey 相关能力、模型页绑定入口（禁用待 T5）。
+
+**自查**：`grep -rn "/admin/channels\|/admin/channel-protocols\|/admin/tags\|/dev/tags" frontend/src --include=*.ts --include=*.vue` → **0 命中**。
+DOM 走查：`/data/pv/v2-channel-removal-check.mjs`（菜单 18 项、老路径 4 条兜底、账单列降级、模型/系统/令牌残留、全程零渠道接口请求）全绿；`vue-tsc` 零错、`vite build` 通过。
