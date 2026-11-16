@@ -38,7 +38,11 @@ read_when:
   入站的 `Authorization`/`x-api-key`/`api-key` 一律丢弃（强制黑名单）。
 - **model**：`external_models.magpie_model`。用 `json.Decoder.InputOffset` 定位顶层 `model` 的**值区间**，
   只替换这段字节（不重新序列化，键序/空白/数字写法/转义序列原样）。
-- **其余**：请求头按强制黑名单剔除后逐值透传，`Accept-Encoding` 固定 `identity`；响应头只丢 hop-by-hop；
+- **其余**：请求头按强制黑名单剔除后逐值透传，`Accept-Encoding` 固定 `identity`；响应头在 hop-by-hop
+  之外按口径②剔除——灵枢/代理内部标识（`x-magpie-*` 前缀）、上游实现暴露（`server`/`x-powered-by`）、
+  头名或任一取值含供应商名/身份类特征词的头（`X-Vendor-Trace`/`x-provider: openai` 等，供应商名清单见
+  `headers.go` 的 `vendorTokens`，宁可收紧）；`x-request-id` 保留灵枢链路 ID（外层中间件已写入，
+  上游同名头不得并成第二值；中间件未挂载时原样透传不误删）；
   响应体（含 SSE 分包、错误体）逐字节原样；**不注入 `include_usage`**。
 - **唯一豁免（契约 §8.1）：凭据回显遮蔽**。上游常把我们的 callerKey（或 `Bearer <key>` 整段头）原样回显在
   错误体里；直接透传等于把渠道凭据发给租户。因此转发层只做这一件事：把**本次请求实际用到的那把**凭据命中
