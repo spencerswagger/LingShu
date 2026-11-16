@@ -7,16 +7,19 @@ import (
 )
 
 // sessionCols 列出 sessions 表查询使用列，与 DDL 一致。
-const sessionCols = `session_id, user_id, token_id, model, session_raw, channel_key_id, internal_model_id, created_at, last_active, expire_at, COALESCE(name, ''), COALESCE(closed, false), COALESCE(closed_at, NULL)`
+//
+// ⚠️ 0024 已删 sessions.channel_key_id：查询/写入都不再碰该列，
+// Session.ChannelKeyID 恒为 0（会话粘性的渠道维度随渠道体系一起下线）。
+const sessionCols = `session_id, user_id, token_id, model, session_raw, internal_model_id, created_at, last_active, expire_at, COALESCE(name, ''), COALESCE(closed, false), COALESCE(closed_at, NULL)`
 
 // sessionUpsertSQL 创建/续期会话的 UPSERT：冲突（session_id）时刷新运行时列并把会话复位为活跃态
 // （closed=false、closed_at=NULL）——Upsert 只由 Attach（新建/迁移/重新激活）与 Renew（仅未关闭会话）触发，
 // 因此复位不会覆盖「关闭」：Renew 对已关闭会话直接返回，不会走到这里。
 // user/model/name 等归属仅在新建行时写入；改名走 SetName。
 const sessionUpsertSQL = `
-INSERT INTO sessions(session_id, user_id, token_id, model, session_raw, channel_key_id, internal_model_id, name, created_at, last_active, expire_at, closed)
-VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,false)
-ON CONFLICT (session_id) DO UPDATE SET last_active=$10, expire_at=$11, channel_key_id=$6, internal_model_id=$7, closed=false, closed_at=NULL`
+INSERT INTO sessions(session_id, user_id, token_id, model, session_raw, internal_model_id, name, created_at, last_active, expire_at, closed)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,false)
+ON CONFLICT (session_id) DO UPDATE SET last_active=$9, expire_at=$10, internal_model_id=$6, closed=false, closed_at=NULL`
 
 // SessionStore 提供 sessions 表数据访问（内存为主、DB 为持久化投影，最终一致）。
 type SessionStore struct {
@@ -36,14 +39,16 @@ func nullableID(v int64) any {
 	return v
 }
 
-// Upsert 创建或更新会话行；冲突键为 session_id。channel_key_id 取 ChannelKeyID（唯一维度）。
+// Upsert 创建或更新会话行；冲突键为 session_id。
+//
+// ⚠️ 0024 删了 sessions.channel_key_id：会话不再记渠道维度（ChannelKeyID 不落库）。
 func (s *SessionStore) Upsert(ctx context.Context, sess *Session) error {
 	if sess == nil {
 		return nil
 	}
 	_, err := s.db.ExecContext(ctx, sessionUpsertSQL,
 		sess.SessionID, sess.UserID, nullableID(sess.TokenID), sess.Model, sess.SessionRaw,
-		sess.ChannelKeyID, sess.InternalModelID, sess.Name, sess.CreatedAt, sess.LastActive, sess.ExpireAt)
+		sess.InternalModelID, sess.Name, sess.CreatedAt, sess.LastActive, sess.ExpireAt)
 	return err
 }
 
@@ -82,7 +87,7 @@ func (s *SessionStore) DeleteMany(ctx context.Context, ids []string) error {
 
 // LoadActive 查询启动恢复所需会话：仅未过期且未关闭的会话（粘性路由 + 并发计数）。
 // 已关闭会话不再载入内存：会话列表已改读 sessions 表，关闭的会话既不参与路由也不需要留在内存。
-// sessions 表无 channel_id 列，会话维度只有 channel_key_id（含 internal_model_id）。
+// sessions 表已无渠道维度列（0024）：只回填 internal_model_id 等运行时列。
 func (s *SessionStore) LoadActive(ctx context.Context, now time.Time) ([]*Session, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT `+sessionCols+` FROM sessions WHERE expire_at > $1 AND NOT closed`, now)
@@ -97,7 +102,7 @@ func (s *SessionStore) LoadActive(ctx context.Context, now time.Time) ([]*Sessio
 		var token sql.NullInt64
 		var closedAt sql.NullTime
 		if err := rows.Scan(&sess.SessionID, &sess.UserID, &token, &sess.Model, &sess.SessionRaw,
-			&sess.ChannelKeyID, &sess.InternalModelID, &sess.CreatedAt, &sess.LastActive, &sess.ExpireAt,
+			&sess.InternalModelID, &sess.CreatedAt, &sess.LastActive, &sess.ExpireAt,
 			&sess.Name, &sess.Closed, &closedAt); err != nil {
 			return nil, err
 		}

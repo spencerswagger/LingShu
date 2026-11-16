@@ -268,7 +268,7 @@ func TestTokenInvalidate_WritePaths(t *testing.T) {
 				mock.ExpectQuery(regexp.QuoteMeta(userStatusSQL)).WithArgs(int64(7)).
 					WillReturnRows(sqlmock.NewRows([]string{"role", "status"}).AddRow(RoleDeveloper, StatusActive))
 				mock.ExpectQuery(regexp.QuoteMeta(insertTokenSQL)).
-					WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), nil, int64(7), "n", nil, nil).
+					WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), nil, int64(7), "n", nil).
 					WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(200), time.Now()))
 			},
 			call: func(t *testing.T, svc *TokenService) {
@@ -307,7 +307,7 @@ func TestTokenInvalidate_WritePaths(t *testing.T) {
 				mock.ExpectQuery(regexp.QuoteMeta(userStatusSQL)).WithArgs(int64(7)).
 					WillReturnRows(sqlmock.NewRows([]string{"role", "status"}).AddRow(RoleDeveloper, StatusActive))
 				mock.ExpectQuery(regexp.QuoteMeta(insertTokenSQL)).
-					WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), nil, int64(7), "n", nil, nil).
+					WithArgs(sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), nil, int64(7), "n", nil).
 					WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(201), time.Now()))
 			},
 			call: func(t *testing.T, svc *TokenService) {

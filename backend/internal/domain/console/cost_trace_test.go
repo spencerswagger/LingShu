@@ -89,41 +89,6 @@ func TestParseChannelModelIDs(t *testing.T) {
 
 // ---------- 纯函数：打平点插值 ----------
 
-func TestFirstCrossTokens(t *testing.T) {
-	// 实际线恒定 1.0；替代线从 2.0 线性降到 0.0（在第 3 个点反超）。
-	cur := []pricingPoint{{Tokens: 1000, Credits: 1.0}, {Tokens: 2000, Credits: 1.0}, {Tokens: 3000, Credits: 1.0}}
-	alt := []pricingPoint{{Tokens: 1000, Credits: 2.0}, {Tokens: 2000, Credits: 1.0}, {Tokens: 3000, Credits: 0.0}}
-	got, ok := firstCrossTokens(cur, alt)
-	if !ok {
-		t.Fatalf("应当找到交叉点")
-	}
-	// diff: +1.0 → 0 → -1.0；在 [2000,3000] 内插值 frac=0/(0+1)=0 → 2000… 但段起点 diff=0 不算「严格更便宜」，
-	// 因此交叉落在 2000 与 3000 之间且 frac=0 → 2000。
-	if got != 2000 {
-		t.Fatalf("got %d, want 2000", got)
-	}
-
-	// 起点就更便宜 → 取曲线左端。
-	cur2 := []pricingPoint{{Tokens: 1000, Credits: 5.0}, {Tokens: 2000, Credits: 5.0}}
-	alt2 := []pricingPoint{{Tokens: 1000, Credits: 1.0}, {Tokens: 2000, Credits: 1.0}}
-	if got, ok := firstCrossTokens(cur2, alt2); !ok || got != 1000 {
-		t.Fatalf("起点更便宜应返回左端 1000，got %d ok=%v", got, ok)
-	}
-
-	// 全程更贵 → 没有交叉点。
-	alt3 := []pricingPoint{{Tokens: 1000, Credits: 9.0}, {Tokens: 2000, Credits: 9.0}, {Tokens: 3000, Credits: 9.0}}
-	if _, ok := firstCrossTokens(cur, alt3); ok {
-		t.Fatalf("全程更贵不应有交叉点")
-	}
-
-	// 超档段打断插值：任一侧 OverTier 一律跳过。
-	cur4 := []pricingPoint{{Tokens: 1000, Credits: 1.0}, {Tokens: 2000, Credits: 1.0, OverTier: true}, {Tokens: 3000, Credits: 1.0}}
-	alt4 := []pricingPoint{{Tokens: 1000, Credits: 2.0}, {Tokens: 2000, Credits: 0.1}, {Tokens: 3000, Credits: 0.1}}
-	if got, ok := firstCrossTokens(cur4, alt4); !ok || got != 3000 {
-		t.Fatalf("超档点应被跳过，交叉落在 3000，got %d ok=%v", got, ok)
-	}
-}
-
 // ---------- 分段与真实切换点 ----------
 
 func TestBuildTraceSegments_ActualSwitch(t *testing.T) {
@@ -182,158 +147,6 @@ func expectGlobalTimeAndTiers(mock sqlmock.Sqlmock) {
 		WillReturnRows(sqlmock.NewRows([]string{"value"}).AddRow([]byte(`[]`)))
 }
 
-// TestHandleCostPricingCurve_Multiline 断言：两条线各带自己的渠道/模型标识与成本、售价序列，
-// 且 PointCount、MaxTokens 在多线下按线数收敛到总点数上限以内。
-func TestHandleCostPricingCurve_Multiline(t *testing.T) {
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("sqlmock: %v", err)
-	}
-	defer db.Close()
-
-	expectSwitchOn(mock)
-	expectGlobalTimeAndTiers(mock)
-	// 第 1 条线：成本配置 + 反查对外模型
-	mock.ExpectQuery(regexp.QuoteMeta(`FROM channel_models cm`)).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "channel_id", "name", "internal_model_id", "cost_rates", "time_config", "context_tiers"}).
-			AddRow(int64(900), int64(5), "渠道A", "gpt-4o-int", []byte(`{"input":1,"output":4,"cache_read":0.1}`), nil, nil))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT cm.external_model_id, em.external_name`)).
-		WillReturnRows(sqlmock.NewRows([]string{"external_model_id", "external_name", "sale_rates", "time_config", "context_tiers"}).
-			AddRow(int64(31), "gpt-4o", []byte(`{"input":1.5,"output":6,"cache_read":0.15}`), nil, nil))
-	// 第 2 条线：更便宜的另一家渠道
-	mock.ExpectQuery(regexp.QuoteMeta(`FROM channel_models cm`)).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "channel_id", "name", "internal_model_id", "cost_rates", "time_config", "context_tiers"}).
-			AddRow(int64(901), int64(6), "渠道B", "gpt-4o-int", []byte(`{"input":0.5,"output":2,"cache_read":0.05}`), nil, nil))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT cm.external_model_id, em.external_name`)).
-		WillReturnRows(sqlmock.NewRows([]string{"external_model_id", "external_name", "sale_rates", "time_config", "context_tiers"}).
-			AddRow(int64(31), "gpt-4o", []byte(`{"input":1.5,"output":6,"cache_read":0.15}`), nil, nil))
-
-	h := NewAdmin(db, nil, nil)
-	h.now = func() time.Time { return pricingTestAt(t) }
-	rec := httptest.NewRecorder()
-	h.HandleCostPricingCurve(rec, httptest.NewRequest(http.MethodGet,
-		"/api/v1/admin/cost/pricing-curve?ChannelModelIDs=900,901&Step=1000&MaxTokens=200000&HitRate=0&InOutRatio=10&At=19:30", nil))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
-	}
-	var body struct {
-		Code int                  `json:"Code"`
-		Data pricingCurveResponse `json:"Data"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	d := body.Data
-	if len(d.Lines) != 2 {
-		t.Fatalf("应当两条线，got %d: %s", len(d.Lines), rec.Body.String())
-	}
-	// 多线总点数上限 2000：两条线 → 每条最多 1000 点 → MaxTokens=1000×1000=1e6 但原值 200000 更小，
-	// 200000/1000=200 点/线 < 1000，所以 MaxTokens 保持 200000。
-	if d.MaxTokens != 200000 || d.PointCount != 200 {
-		t.Fatalf("MaxTokens=%d PointCount=%d，want 200000/200", d.MaxTokens, d.PointCount)
-	}
-	if d.Lines[0].ChannelModelID != 900 || d.Lines[0].ChannelName != "渠道A" || d.Lines[0].InternalModelID != "gpt-4o-int" {
-		t.Fatalf("第 1 条线标识错: %+v", d.Lines[0])
-	}
-	if d.Lines[1].ChannelModelID != 901 || d.Lines[1].ChannelName != "渠道B" {
-		t.Fatalf("第 2 条线标识错: %+v", d.Lines[1])
-	}
-	if d.Lines[1].LineIndex != 1 || d.Lines[0].LineIndex != 0 {
-		t.Fatalf("LineIndex 应保持请求顺序: %+v", d.Lines)
-	}
-	if d.Lines[0].ExternalModelID != 31 || d.Lines[0].ExternalModelName != "gpt-4o" {
-		t.Fatalf("对外模型标识错: %+v", d.Lines[0])
-	}
-	// 同一横轴上渠道 B 更便宜：第 1 点成本应当更低。
-	if !(d.Lines[1].Cost.Points[0].Credits < d.Lines[0].Cost.Points[0].Credits) {
-		t.Fatalf("渠道B 应更便宜: A=%v B=%v",
-			d.Lines[0].Cost.Points[0].Credits, d.Lines[1].Cost.Points[0].Credits)
-	}
-	if d.Lines[0].Cost.Source != "channel_model" || !d.Lines[0].Available {
-		t.Fatalf("线内成本线字段错: %+v", d.Lines[0].Cost)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("查询期望未满足: %v", err)
-	}
-}
-
-// TestHandleCostPricingCurve_MultilinePointCap 线数多时按线数等比下调 MaxTokens（总点数不超上限）。
-func TestHandleCostPricingCurve_MultilinePointCap(t *testing.T) {
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("sqlmock: %v", err)
-	}
-	defer db.Close()
-	expectSwitchOn(mock)
-	expectGlobalTimeAndTiers(mock)
-	for _, id := range []int64{900, 901, 902, 903} {
-		mock.ExpectQuery(regexp.QuoteMeta(`FROM channel_models cm`)).
-			WillReturnRows(sqlmock.NewRows([]string{"id", "channel_id", "name", "internal_model_id", "cost_rates", "time_config", "context_tiers"}).
-				AddRow(id, int64(5), "渠道", "m1", []byte(`{"input":1,"output":4,"cache_read":0.1}`), nil, nil))
-		mock.ExpectQuery(regexp.QuoteMeta(`SELECT cm.external_model_id, em.external_name`)).
-			WillReturnRows(sqlmock.NewRows([]string{"external_model_id", "external_name", "sale_rates", "time_config", "context_tiers"}).
-				AddRow(int64(31), "gpt-4o", []byte(`{"input":1.5,"output":6,"cache_read":0.15}`), nil, nil))
-	}
-	h := NewAdmin(db, nil, nil)
-	h.now = func() time.Time { return pricingTestAt(t) }
-	rec := httptest.NewRecorder()
-	h.HandleCostPricingCurve(rec, httptest.NewRequest(http.MethodGet,
-		"/api/v1/admin/cost/pricing-curve?ChannelModelIDs=900,901,902,903&Step=1000&MaxTokens=500000&HitRate=0&At=19:30", nil))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
-	}
-	var body struct {
-		Data pricingCurveResponse `json:"Data"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	// 4 条线 → 每条最多 500 点 → MaxTokens = 1000×500 = 500000，恰好等于请求值。
-	if body.Data.MaxTokens != 500000 || len(body.Data.Lines) != 4 {
-		t.Fatalf("MaxTokens=%d lines=%d", body.Data.MaxTokens, len(body.Data.Lines))
-	}
-}
-
-// TestHandleCostPricingCurve_MultilineMissingID 不存在的 ID 给一条不可用线（不 500）。
-func TestHandleCostPricingCurve_MultilineMissingID(t *testing.T) {
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("sqlmock: %v", err)
-	}
-	defer db.Close()
-	expectSwitchOn(mock)
-	expectGlobalTimeAndTiers(mock)
-	mock.ExpectQuery(regexp.QuoteMeta(`FROM channel_models cm`)).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "channel_id", "name", "internal_model_id", "cost_rates", "time_config", "context_tiers"}))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT cm.external_model_id, em.external_name`)).
-		WillReturnRows(sqlmock.NewRows([]string{"external_model_id", "external_name", "sale_rates", "time_config", "context_tiers"}))
-
-	h := NewAdmin(db, nil, nil)
-	h.now = func() time.Time { return pricingTestAt(t) }
-	rec := httptest.NewRecorder()
-	h.HandleCostPricingCurve(rec, httptest.NewRequest(http.MethodGet,
-		"/api/v1/admin/cost/pricing-curve?ChannelModelIDs=999&Step=1000&MaxTokens=5000&At=19:30", nil))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
-	}
-	var body struct {
-		Data pricingCurveResponse `json:"Data"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if len(body.Data.Lines) != 1 {
-		t.Fatalf("应当 1 条线，got %d", len(body.Data.Lines))
-	}
-	line := body.Data.Lines[0]
-	if line.Available || line.ChannelModelID != 999 {
-		t.Fatalf("不存在的 ID 应给不可用线并回吐 ID: %+v", line)
-	}
-	if line.Reason == "" || len(line.Cost.Points) != 0 {
-		t.Fatalf("不可用线应有 Reason 且无点: %+v", line)
-	}
-}
-
 // ---------- 会话渠道轨迹：接口层 ----------
 
 var traceCols = []string{"call_time", "status", "channel_id", "channel_name", "channel_model_id",
@@ -343,136 +156,6 @@ func traceRow(t *testing.T, at time.Time, status string, chID int64, chName stri
 	cost, sale float64) []driver.Value {
 	t.Helper()
 	return []driver.Value{at, status, chID, chName, cmID, model, int64(1000), int64(0), int64(100), cost, sale}
-}
-
-// TestHandleCostSessionTrace_ActualSwitch 断言：真实切换过的会话给出切换点，且不预测打平点。
-func TestHandleCostSessionTrace_ActualSwitch(t *testing.T) {
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("sqlmock: %v", err)
-	}
-	defer db.Close()
-
-	expectSwitchOn(mock)
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT count(*) FROM billing_records WHERE session_id = $1`)).
-		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(3)))
-	base := pricingTestAt(t)
-	rows := sqlmock.NewRows(traceCols).
-		AddRow(traceRow(t, base, "completed", int64(5), "渠道A", int64(900), "gpt-4o-int", 1.5, 2.0)...).
-		AddRow(traceRow(t, base.Add(time.Minute), "completed", int64(5), "渠道A", int64(900), "gpt-4o-int", 1.5, 2.0)...).
-		AddRow(traceRow(t, base.Add(2*time.Minute), "completed", int64(6), "渠道B", int64(901), "gpt-4o-int", 0.8, 2.0)...)
-	mock.ExpectQuery(regexp.QuoteMeta(`FROM billing_records b`)).
-		WithArgs("sess-1", nil).
-		WillReturnRows(rows)
-
-	h := NewAdmin(db, nil, nil)
-	h.now = func() time.Time { return pricingTestAt(t) }
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/cost/session/sess-1/trace", nil)
-	req.SetPathValue("id", "sess-1")
-	rec := httptest.NewRecorder()
-	h.HandleCostSessionTrace(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
-	}
-	var body struct {
-		Data costTraceResponse `json:"Data"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	d := body.Data
-	if len(d.Points) != 3 || d.Total != 3 || d.Truncated {
-		t.Fatalf("点/合计错: points=%d total=%d trunc=%v", len(d.Points), d.Total, d.Truncated)
-	}
-	if len(d.Segments) != 2 {
-		t.Fatalf("应当 2 段: %+v", d.Segments)
-	}
-	if len(d.ActualSwitches) != 1 || d.ActualSwitches[0].Kind != traceKindActual {
-		t.Fatalf("应当 1 个真实切换点: %+v", d.ActualSwitches)
-	}
-	if d.PredictedBreakEven != nil {
-		t.Fatalf("已真实切换过就不应再给预测点: %+v", d.PredictedBreakEven)
-	}
-	if !d.Points[2].ChannelChanged || d.Points[1].ChannelChanged {
-		t.Fatalf("ChannelChanged 标记错: %+v", d.Points)
-	}
-	if d.Points[2].CumulativeCostCredits != 3.8 {
-		t.Fatalf("累计成本=%v，want 3.8", d.Points[2].CumulativeCostCredits)
-	}
-	if d.SwitchKindActual != "actual" || d.SwitchKindPredicted != "predicted" {
-		t.Fatalf("枚举字段错: %+v", d)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("查询期望未满足: %v", err)
-	}
-}
-
-// TestHandleCostSessionTrace_PredictedBreakEven 断言：从未切换过 → 给预测打平点（Kind=predicted），
-// 且打平点来自「替代渠道更便宜」的交叉位置。
-func TestHandleCostSessionTrace_PredictedBreakEven(t *testing.T) {
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("sqlmock: %v", err)
-	}
-	defer db.Close()
-
-	expectSwitchOn(mock)
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT count(*) FROM billing_records WHERE session_id = $1`)).
-		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(2)))
-	base := pricingTestAt(t)
-	mock.ExpectQuery(regexp.QuoteMeta(`FROM billing_records b`)).
-		WithArgs("sess-2", nil).
-		WillReturnRows(sqlmock.NewRows(traceCols).
-			AddRow(traceRow(t, base, "completed", int64(5), "渠道A", int64(900), "gpt-4o-int", 1.5, 2.0)...).
-			AddRow(traceRow(t, base.Add(time.Minute), "completed", int64(5), "渠道A", int64(900), "gpt-4o-int", 1.5, 2.0)...))
-	// 打平点计算：全局时段/分档 → 同模型所有渠道
-	expectGlobalTimeAndTiers(mock)
-	// 实际渠道 900：高峰 1.5、输入 1/输出 4/缓存 0.1；替代 901：输入 0.2（分档/时段相同 → 全程更便宜）。
-	mock.ExpectQuery(regexp.QuoteMeta(`WHERE cm.deleted_at IS NULL AND cm.internal_model_id = $1`)).
-		WithArgs("gpt-4o-int", int64(900)).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "channel_id", "name", "internal_model_id", "cost_rates", "time_config", "context_tiers"}).
-			AddRow(int64(900), int64(5), "渠道A", "gpt-4o-int", []byte(`{"input":1,"output":4,"cache_read":0.1}`), nil, nil).
-			AddRow(int64(901), int64(6), "渠道B", "gpt-4o-int", []byte(`{"input":0.2,"output":0.8,"cache_read":0.02}`), nil, nil))
-
-	h := NewAdmin(db, nil, nil)
-	h.now = func() time.Time { return pricingTestAt(t) }
-	req := httptest.NewRequest(http.MethodGet,
-		"/api/v1/admin/cost/session/sess-2/trace?Step=1000&MaxTokens=20000&HitRate=0.5&At=19:30", nil)
-	req.SetPathValue("id", "sess-2")
-	rec := httptest.NewRecorder()
-	h.HandleCostSessionTrace(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
-	}
-	var body struct {
-		Data costTraceResponse `json:"Data"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	d := body.Data
-	if len(d.ActualSwitches) != 0 {
-		t.Fatalf("没切过就不应有真实切换点: %+v", d.ActualSwitches)
-	}
-	be := d.PredictedBreakEven
-	if be == nil {
-		t.Fatalf("没切过应当给预测打平点: %s", rec.Body.String())
-	}
-	if be.Kind != traceKindPredicted || !be.Predicted {
-		t.Fatalf("预测点必须与真实切换点区分: %+v", be)
-	}
-	if be.ChannelModelID != 900 || be.AlternativeChannelModelID != 901 {
-		t.Fatalf("打平点两端渠道错: %+v", be)
-	}
-	if !be.Matched || be.Tokens != 1000 {
-		t.Fatalf("替代渠道从第一个采样点就更便宜 → Tokens 应为 1000: %+v", be)
-	}
-	if be.MaxTokens != 20000 || be.Step != 1000 {
-		t.Fatalf("采样参数应回吐: %+v", be)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("查询期望未满足: %v", err)
-	}
 }
 
 // TestHandleCostSessionTrace_NoCrossing 断言：没有更便宜的替代渠道时 Matched=false 且 Reason 有值。
@@ -517,49 +200,6 @@ func TestHandleCostSessionTrace_NoCrossing(t *testing.T) {
 	be := body.Data.PredictedBreakEven
 	if be == nil || be.Matched || be.Tokens != 0 || be.Reason == "" {
 		t.Fatalf("无交叉点应 Matched=false 且有 Reason: %+v", be)
-	}
-}
-
-// TestHandleCostSessionTrace_SingleChannelOnly 只有一个渠道配置 → 无对比对象，Reason 说明。
-func TestHandleCostSessionTrace_SingleChannelOnly(t *testing.T) {
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("sqlmock: %v", err)
-	}
-	defer db.Close()
-
-	expectSwitchOn(mock)
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT count(*) FROM billing_records WHERE session_id = $1`)).
-		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(1)))
-	base := pricingTestAt(t)
-	mock.ExpectQuery(regexp.QuoteMeta(`FROM billing_records b`)).
-		WithArgs("sess-4", nil).
-		WillReturnRows(sqlmock.NewRows(traceCols).
-			AddRow(traceRow(t, base, "completed", int64(5), "渠道A", int64(900), "gpt-4o-int", 1.5, 2.0)...))
-	expectGlobalTimeAndTiers(mock)
-	mock.ExpectQuery(regexp.QuoteMeta(`WHERE cm.deleted_at IS NULL AND cm.internal_model_id = $1`)).
-		WithArgs("gpt-4o-int", int64(900)).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "channel_id", "name", "internal_model_id", "cost_rates", "time_config", "context_tiers"}).
-			AddRow(int64(900), int64(5), "渠道A", "gpt-4o-int", []byte(`{"input":1,"output":4,"cache_read":0.1}`), nil, nil))
-
-	h := NewAdmin(db, nil, nil)
-	h.now = func() time.Time { return pricingTestAt(t) }
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/cost/session/sess-4/trace?MaxTokens=5000&At=19:30", nil)
-	req.SetPathValue("id", "sess-4")
-	rec := httptest.NewRecorder()
-	h.HandleCostSessionTrace(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
-	}
-	var body struct {
-		Data costTraceResponse `json:"Data"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	be := body.Data.PredictedBreakEven
-	if be == nil || be.Matched || !contains(be.Reason, "只有一条渠道") {
-		t.Fatalf("单渠道应给出无对比对象的说明: %+v", be)
 	}
 }
 
@@ -629,105 +269,7 @@ func TestHandleCostSessionTrace_NilDB(t *testing.T) {
 	}
 }
 
-// TestPredictBreakEven_UnresolvedChannel 账单没解析到渠道内部模型 → 明确说明，不瞎算。
-func TestPredictBreakEven_UnresolvedChannel(t *testing.T) {
-	h := NewAdmin(nil, nil, nil)
-	got := h.predictBreakEven(t.Context(), costTracePoint{ChannelID: 5}, pricingCurveParams{Step: 1000}, 10000)
-	if got == nil || got.Matched || !contains(got.Reason, "没有「成功且解析到渠道内部模型」的记录") {
-		t.Fatalf("应给出无法预测的原因: %+v", got)
-	}
-	if got.Kind != traceKindPredicted {
-		t.Fatalf("Kind 必须是 predicted: %+v", got)
-	}
-}
-
-// TestHandleCostSessionTrace_BreakEvenAxisReported 断言**未显式传参**时预测点回吐真实生效的
-// Step/MaxTokens（按分档推导 + 点数上限收敛），不再是 0（前端会按响应值渲染，不该显示「上限 0」）。
-func TestHandleCostSessionTrace_BreakEvenAxisReported(t *testing.T) {
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("sqlmock: %v", err)
-	}
-	defer db.Close()
-
-	expectSwitchOn(mock)
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT count(*) FROM billing_records WHERE session_id = $1`)).
-		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(1)))
-	base := pricingTestAt(t)
-	mock.ExpectQuery(regexp.QuoteMeta(`FROM billing_records b`)).
-		WithArgs("sess-6", nil).
-		WillReturnRows(sqlmock.NewRows(traceCols).
-			AddRow(traceRow(t, base, "completed", int64(5), "渠道A", int64(900), "gpt-4o-int", 1.5, 2.0)...))
-	// 全局时段 + 分档：最高档上界 128000 → 未传 MaxTokens 时应推成 128000。
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT value FROM sys_configs WHERE key = $1`)).
-		WithArgs("billing.time_config").
-		WillReturnRows(sqlmock.NewRows([]string{"value"}).AddRow([]byte(`{"Timezone":"Asia/Shanghai","Default":1.0,"Periodic":[{"Name":"高峰","Start":"18:00","End":"22:00","Coeff":1.5}]}`)))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT value FROM sys_configs WHERE key = $1`)).
-		WithArgs("billing.context_tiers").
-		WillReturnRows(sqlmock.NewRows([]string{"value"}).AddRow([]byte(`[{"Min":0,"Max":128000,"Coeff":1.0}]`)))
-	mock.ExpectQuery(regexp.QuoteMeta(`WHERE cm.deleted_at IS NULL AND cm.internal_model_id = $1`)).
-		WithArgs("gpt-4o-int", int64(900)).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "channel_id", "name", "internal_model_id", "cost_rates", "time_config", "context_tiers"}).
-			AddRow(int64(900), int64(5), "渠道A", "gpt-4o-int", []byte(`{"input":1,"output":4,"cache_read":0.1}`), nil, nil).
-			AddRow(int64(901), int64(6), "渠道B", "gpt-4o-int", []byte(`{"input":0.2,"output":0.8,"cache_read":0.02}`), nil, nil))
-
-	h := NewAdmin(db, nil, nil)
-	h.now = func() time.Time { return pricingTestAt(t) }
-	// 只传 At：Step / MaxTokens 全走缺省推导。
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/cost/session/sess-6/trace?At=19:30", nil)
-	req.SetPathValue("id", "sess-6")
-	rec := httptest.NewRecorder()
-	h.HandleCostSessionTrace(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
-	}
-	var body struct {
-		Data costTraceResponse `json:"Data"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	be := body.Data.PredictedBreakEven
-	if be == nil || !be.Matched {
-		t.Fatalf("应当给出预测打平点: %+v", be)
-	}
-	if be.Step != pricingCurveDefaultStep || be.MaxTokens != 128000 {
-		t.Fatalf("应回吐实际生效的横轴：Step=%d MaxTokens=%d，want %d/128000",
-			be.Step, be.MaxTokens, pricingCurveDefaultStep)
-	}
-	if be.Tokens != 1000 {
-		t.Fatalf("替代渠道从第一个采样点就更便宜，Tokens 应为 1000，got %d", be.Tokens)
-	}
-	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("查询期望未满足: %v", err)
-	}
-}
-
 // TestPredictBreakEven_AxisAlwaysReported 断言每条提前返回的分支都带上横轴（不会留 0）。
-func TestPredictBreakEven_AxisAlwaysReported(t *testing.T) {
-	cases := []struct {
-		name  string
-		first costTracePoint
-	}{
-		{"未解析到渠道内部模型", costTracePoint{ChannelID: 5}},
-		{"未装配数据库", costTracePoint{ChannelID: 5, ChannelModelID: 900, InternalModelID: "m1"}},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			var h *Admin
-			if c.name == "未解析到渠道内部模型" {
-				h = NewAdmin(nil, nil, nil)
-			} else {
-				h = NewAdmin(nil, nil, nil) // db=nil 也会走提前返回
-			}
-			got := h.predictBreakEven(t.Context(), c.first, pricingCurveParams{}, 10000)
-			if got.Step != pricingCurveDefaultStep || got.MaxTokens != pricingCurveDefaultMaxToken {
-				t.Fatalf("提前返回也应回报缺省横轴：Step=%d MaxTokens=%d", got.Step, got.MaxTokens)
-			}
-		})
-	}
-}
-
 // ---------- PR #65 Owl 返修用例（P2-1 ~ P2-4）----------
 
 // TestBuildTraceSegments_FailoverIsNotSwitch 请求内 failover（A 429 失败 → B 成功）不是会话级渠道切换。
@@ -773,168 +315,68 @@ func TestBuildTraceSegments_SwitchAfterFailoverAtSuccessPoint(t *testing.T) {
 	}
 }
 
-// TestHandleCostSessionTrace_IntraRequestFailover 断言接口层同时满足：
-// ① 请求内 failover 不产生切换点；② 失败点不带 ChannelChanged；③ 预测打平点照常下发。
-func TestHandleCostSessionTrace_IntraRequestFailover(t *testing.T) {
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("sqlmock: %v", err)
-	}
-	defer db.Close()
-
-	expectSwitchOn(mock)
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT count(*) FROM billing_records WHERE session_id = $1`)).
-		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(2)))
-	base := pricingTestAt(t)
-	mock.ExpectQuery(regexp.QuoteMeta(`FROM billing_records b`)).
-		WithArgs("sess-failover", nil).
-		WillReturnRows(sqlmock.NewRows(traceCols).
-			AddRow(traceRow(t, base, "failed", int64(5), "渠道A", int64(900), "gpt-4o-int", 1.5, 2.0)...).
-			AddRow(traceRow(t, base.Add(time.Second), "completed", int64(6), "渠道B", int64(901), "gpt-4o-int", 0.8, 2.0)...))
-	expectGlobalTimeAndTiers(mock)
-	mock.ExpectQuery(regexp.QuoteMeta(`WHERE cm.deleted_at IS NULL AND cm.internal_model_id = $1`)).
-		WithArgs("gpt-4o-int", int64(901)).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "channel_id", "name", "internal_model_id", "cost_rates", "time_config", "context_tiers"}).
-			AddRow(int64(901), int64(6), "渠道B", "gpt-4o-int", []byte(`{"input":1,"output":4,"cache_read":0.1}`), nil, nil).
-			AddRow(int64(900), int64(5), "渠道A", "gpt-4o-int", []byte(`{"input":0.2,"output":0.8,"cache_read":0.02}`), nil, nil))
-
-	h := NewAdmin(db, nil, nil)
-	h.now = func() time.Time { return pricingTestAt(t) }
-	rec := httptest.NewRecorder()
-	h.HandleCostSessionTrace(rec, traceRequest("sess-failover", "?Step=1000&MaxTokens=20000&At=19:30"))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
-	}
-	d := decodeTrace(t, rec)
-	if len(d.ActualSwitches) != 0 {
-		t.Fatalf("请求内 failover 不应算真实切换: %+v", d.ActualSwitches)
-	}
-	for i, pt := range d.Points {
-		if pt.ChannelChanged {
-			t.Fatalf("点 %d 不应带 ChannelChanged（同一请求内换候选）: %+v", i, d.Points)
-		}
-	}
-	if d.PredictedBreakEven == nil || !d.PredictedBreakEven.Matched {
-		t.Fatalf("failover 不应把预测打平点整块禁掉: %+v", d.PredictedBreakEven)
-	}
-	if d.PredictedBreakEven.ChannelModelID != 901 {
-		t.Fatalf("预测基准应取「成功且有渠道」的点（901），got %+v", d.PredictedBreakEven)
-	}
-}
-
-// TestHandleCostSessionTrace_RejectInMiddle 无渠道拒绝账单夹在中间：0 切换、不出现空渠道名、预测仍下发。
-func TestHandleCostSessionTrace_RejectInMiddle(t *testing.T) {
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("sqlmock: %v", err)
-	}
-	defer db.Close()
-
-	expectSwitchOn(mock)
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT count(*) FROM billing_records WHERE session_id = $1`)).
-		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(3)))
-	base := pricingTestAt(t)
-	mock.ExpectQuery(regexp.QuoteMeta(`FROM billing_records b`)).
-		WithArgs("sess-reject", nil).
-		WillReturnRows(sqlmock.NewRows(traceCols).
-			AddRow(traceRow(t, base, "completed", int64(5), "渠道A", int64(900), "gpt-4o-int", 1.5, 2.0)...).
-			AddRow(traceRow(t, base.Add(time.Second), "failed", int64(0), "", int64(0), "", 0, 0)...).
-			AddRow(traceRow(t, base.Add(2*time.Second), "completed", int64(5), "渠道A", int64(900), "gpt-4o-int", 1.5, 2.0)...))
-	expectGlobalTimeAndTiers(mock)
-	mock.ExpectQuery(regexp.QuoteMeta(`WHERE cm.deleted_at IS NULL AND cm.internal_model_id = $1`)).
-		WithArgs("gpt-4o-int", int64(900)).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "channel_id", "name", "internal_model_id", "cost_rates", "time_config", "context_tiers"}).
-			AddRow(int64(900), int64(5), "渠道A", "gpt-4o-int", []byte(`{"input":1,"output":4,"cache_read":0.1}`), nil, nil).
-			AddRow(int64(901), int64(6), "渠道B", "gpt-4o-int", []byte(`{"input":0.2,"output":0.8,"cache_read":0.02}`), nil, nil))
-
-	h := NewAdmin(db, nil, nil)
-	h.now = func() time.Time { return pricingTestAt(t) }
-	rec := httptest.NewRecorder()
-	h.HandleCostSessionTrace(rec, traceRequest("sess-reject", "?Step=1000&MaxTokens=20000&At=19:30"))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
-	}
-	d := decodeTrace(t, rec)
-	if len(d.ActualSwitches) != 0 {
-		t.Fatalf("A→空→A 不应有切换点: %+v", d.ActualSwitches)
-	}
-	for _, sw := range d.ActualSwitches {
-		if sw.FromChannelID == 0 || sw.ToChannelID == 0 || sw.ToChannelName == "" {
-			t.Fatalf("切换点里不应出现空渠道: %+v", sw)
-		}
-	}
-	for i, pt := range d.Points {
-		if pt.ChannelChanged {
-			t.Fatalf("点 %d 不应被标成切换: %+v", i, d.Points)
-		}
-	}
-	if d.PredictedBreakEven == nil || !d.PredictedBreakEven.Matched {
-		t.Fatalf("拒绝账单不应让预测失效: %+v", d.PredictedBreakEven)
-	}
-}
-
-// TestHandleCostSessionTrace_FirstRecordIsReject 首条是拒绝账单（无渠道/无模型）时仍需给出预测打平点。
-func TestHandleCostSessionTrace_FirstRecordIsReject(t *testing.T) {
-	db, mock, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("sqlmock: %v", err)
-	}
-	defer db.Close()
-
-	expectSwitchOn(mock)
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT count(*) FROM billing_records WHERE session_id = $1`)).
-		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(2)))
-	base := pricingTestAt(t)
-	mock.ExpectQuery(regexp.QuoteMeta(`FROM billing_records b`)).
-		WithArgs("sess-first-reject", nil).
-		WillReturnRows(sqlmock.NewRows(traceCols).
-			AddRow(traceRow(t, base, "failed", int64(0), "", int64(0), "", 0, 0)...).
-			AddRow(traceRow(t, base.Add(time.Second), "completed", int64(5), "渠道A", int64(900), "gpt-4o-int", 1.5, 2.0)...))
-	expectGlobalTimeAndTiers(mock)
-	mock.ExpectQuery(regexp.QuoteMeta(`WHERE cm.deleted_at IS NULL AND cm.internal_model_id = $1`)).
-		WithArgs("gpt-4o-int", int64(900)).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "channel_id", "name", "internal_model_id", "cost_rates", "time_config", "context_tiers"}).
-			AddRow(int64(900), int64(5), "渠道A", "gpt-4o-int", []byte(`{"input":1,"output":4,"cache_read":0.1}`), nil, nil).
-			AddRow(int64(901), int64(6), "渠道B", "gpt-4o-int", []byte(`{"input":0.2,"output":0.8,"cache_read":0.02}`), nil, nil))
-
-	h := NewAdmin(db, nil, nil)
-	h.now = func() time.Time { return pricingTestAt(t) }
-	rec := httptest.NewRecorder()
-	h.HandleCostSessionTrace(rec, traceRequest("sess-first-reject", "?Step=1000&MaxTokens=20000&At=19:30"))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
-	}
-	be := decodeTrace(t, rec).PredictedBreakEven
-	if be == nil || !be.Matched || be.ChannelModelID != 900 {
-		t.Fatalf("首条是拒绝账单时，基准应取后面第一条成功记录（900）: %+v", be)
-	}
-	if contains(be.Reason, "配置缺失") {
-		t.Fatalf("不应把「首条是拒绝」误报成配置缺失: %q", be.Reason)
-	}
-}
-
 // TestLoadSiblingChannelModels_FiltersDeadChannels 候选渠道必须排除软删/停用渠道，但**当前渠道那条要保留**。
-func TestLoadSiblingChannelModels_FiltersDeadChannels(t *testing.T) {
+
+// TestHandleCostSessionTrace_ChannelRetired 会话轨迹在「渠道体系下线」后的口径（0024）：
+//   - 逐条点不带渠道维度（channel_id / channel_name / channel_model_id 恒 0/空）；
+//   - 因此不可能再出现「渠道切换」事件；
+//   - 预测打平点必须回一个**显式不可用 + 原因**的对象（不是 null，也不是 0）。
+func TestHandleCostSessionTrace_ChannelRetired(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock: %v", err)
 	}
 	defer db.Close()
 
-	mock.ExpectQuery(regexp.QuoteMeta(`AND (cm.id = $2 OR (c.deleted_at IS NULL AND c.state <> 'DISABLED'))`)).
-		WithArgs("gpt-4o-int", int64(900)).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "channel_id", "name", "internal_model_id", "cost_rates", "time_config", "context_tiers"}).
-			AddRow(int64(900), int64(5), "渠道A（已停用但仍是当前渠道）", "gpt-4o-int", []byte(`{"input":1,"output":4,"cache_read":0.1}`), nil, nil))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT count(*) FROM billing_records WHERE session_id = $1`)).
+		WithArgs("sess-r").
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(2)))
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT b.call_time`)).
+		WithArgs("sess-r", nil).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"call_time", "status", "channel_id", "channel_name", "channel_model_id", "internal_model_id",
+			"input_tokens", "cache_read_tokens", "output_tokens", "cost_credits", "sale_credits",
+		}).
+			AddRow(time.Date(2026, 10, 25, 10, 0, 0, 0, time.UTC), "completed", int64(0), "", int64(0), "gpt-4o-int",
+				int64(10), int64(0), int64(5), 0.1, 0.2).
+			AddRow(time.Date(2026, 10, 25, 10, 1, 0, 0, time.UTC), "completed", int64(0), "", int64(0), "gpt-4o-int",
+				int64(20), int64(0), int64(10), 0.2, 0.4))
 
 	h := NewAdmin(db, nil, nil)
-	got, err := h.loadSiblingChannelModels(t.Context(), "gpt-4o-int", 900, billing.TimeCoeffConfig{Default: 1}, nil)
-	if err != nil {
-		t.Fatalf("loadSiblingChannelModels: %v", err)
+	rec := httptest.NewRecorder()
+	traceReq := httptest.NewRequest(http.MethodGet, "/api/v1/admin/cost/session/sess-r/trace", nil)
+	traceReq.SetPathValue("id", "sess-r")
+	h.HandleCostSessionTrace(rec, traceReq)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	if len(got) != 1 || got[0].ChannelModelID != 900 {
-		t.Fatalf("当前渠道那条应保留: %+v", got)
+	var body struct {
+		Data costTraceResponse `json:"Data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(body.Data.Points) != 2 {
+		t.Fatalf("points=%d, want 2", len(body.Data.Points))
+	}
+	for i, pt := range body.Data.Points {
+		if pt.ChannelID != 0 || pt.ChannelName != "" || pt.ChannelModelID != 0 {
+			t.Fatalf("第 %d 点不应带渠道维度（表已删）: %+v", i, pt)
+		}
+	}
+	if len(body.Data.ActualSwitches) != 0 {
+		t.Fatalf("渠道已下线，不可能有切换事件: %+v", body.Data.ActualSwitches)
+	}
+	if body.Data.PredictedBreakEven == nil {
+		t.Fatalf("预测打平点必须是显式对象（前端要能展示原因），不能是 null")
+	}
+	if body.Data.PredictedBreakEven.Predicted {
+		t.Fatalf("预测打平点不可计算，Predicted 必须为 false: %+v", body.Data.PredictedBreakEven)
+	}
+	if body.Data.PredictedBreakEven.Reason == "" {
+		t.Fatalf("不可用的预测必须带原因: %+v", body.Data.PredictedBreakEven)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("查询期望未满足: %v", err)
+		t.Fatalf("unmet expectations: %v", err)
 	}
 }

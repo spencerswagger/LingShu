@@ -15,7 +15,6 @@ import (
 	"github.com/team/llmgateway/internal/domain/magpie"
 	"github.com/team/llmgateway/internal/domain/model"
 	"github.com/team/llmgateway/internal/domain/sync"
-	"github.com/team/llmgateway/internal/domain/tag"
 	"github.com/team/llmgateway/internal/pkg/jwtx"
 	"github.com/team/llmgateway/internal/pkg/reqmeta"
 	"github.com/team/llmgateway/internal/pkg/resp"
@@ -32,7 +31,6 @@ type Deps struct {
 	Credit       *identity.CreditHandler
 	TokenAdmin   *identity.TokenHandler
 	TokenDev     *identity.TokenHandler
-	Tag          *tag.Handler
 	Model        *model.Handler
 	Announcement *identity.AnnouncementHandler
 	Console      *console.Admin
@@ -185,11 +183,13 @@ func (s *Server) routes() {
 	// 会话渠道轨迹（只读，恒可用）。
 	admin.HandleFunc("GET /api/v1/admin/cost/session/{id}/trace", d.Console.HandleCostSessionTrace)
 
-	// tags
-	admin.HandleFunc("GET /api/v1/admin/tags", d.Tag.HandleList)
-	admin.HandleFunc("POST /api/v1/admin/tags", d.Tag.HandleCreate)
-	admin.HandleFunc("PUT /api/v1/admin/tags/{id}", d.Tag.HandleUpdate)
-	admin.HandleFunc("POST /api/v1/admin/tags/batch-delete", d.Tag.HandleBatchDelete)
+	// 标签（semantic_tags / channel_tags·已停用）：0024 已删这两张表，标签路由能力整体下线。
+	for _, path := range []string{
+		"GET /api/v1/admin/tags", "POST /api/v1/admin/tags",
+		"PUT /api/v1/admin/tags/{id}", "POST /api/v1/admin/tags/batch-delete",
+	} {
+		admin.HandleFunc(path, goneHandler)
+	}
 
 	// models（对外模型）
 	admin.HandleFunc("GET /api/v1/admin/models", d.Model.HandleListAdmin)
@@ -246,7 +246,8 @@ func (s *Server) routes() {
 	dev.HandleFunc("POST /api/v1/dev/tokens/{id}/rotate", d.TokenDev.HandleDevRotate)
 	dev.HandleFunc("POST /api/v1/dev/tokens/{id}/toggle", d.TokenDev.HandleDevToggle)
 	dev.Handle("GET /api/v1/dev/tokens/{id}/secret", WithAuditSensitiveRead(s.audit, s.logger)(http.HandlerFunc(d.TokenDev.HandleDevSecret)))
-	dev.HandleFunc("GET /api/v1/dev/tags", d.Tag.HandleList) // 列表过滤由 query enabled=true 控制
+	// 标签（语义标签·已停用；0024 删表）
+	dev.HandleFunc("GET /api/v1/dev/tags", gonePublicHandler)
 	// 只读“可用模型”：服务端强制仅返回启用项，忽略客户端 ?Enabled= 覆盖。
 	dev.HandleFunc("GET /api/v1/dev/models", func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()

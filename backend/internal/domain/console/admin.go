@@ -275,9 +275,8 @@ func (h *Admin) decorateList(ctx context.Context, list []billingListItem, recs [
 				list[i].ChannelName = name
 			}
 		}
-		if list[i].KeyName == "" {
-			list[i].KeyName = fmt.Sprintf("#%d", list[i].ChannelKeyID)
-		}
+		// ⚠️ 渠道体系已下线（0024）：不再用 `#<id>` 兜底显示「密钥名」——
+		// 那个 id 指向的行早就没了，`#42` 只会让运营以为渠道还在。留空，前端按空串渲染。
 		if list[i].BillingID != "" {
 			list[i].TokenName = tokenNames[list[i].BillingID]
 		}
@@ -290,28 +289,13 @@ type keyInfo struct {
 	Name      string
 }
 
-// keyInfos 批量查询 channel_key_id -> {所属渠道, 密钥名}；失败返回空 map。
+// keyInfos 批量查询 channel_key_id -> {所属渠道, 密钥名}。
+//
+// ⚠️ 渠道体系已下线（0024 删了 channel_keys / channels）：**没有可查的来源了**，恒返回空 map。
+// 于是账单列表/详情的 ChannelKeyName / ChannelName 恒为空 —— 前端按空串渲染（结构不变）。
+// 保留函数是为了不打断调用点与用例；后续清理可整块删除。
 func (h *Admin) keyInfos(ctx context.Context, recs []billing.Record) map[int64]keyInfo {
-	ids := uniqueInt64(recs, func(r billing.Record) int64 { return r.ChannelKeyID })
-	if len(ids) == 0 {
-		return nil
-	}
-	rows, err := h.db.QueryContext(ctx,
-		`SELECT id, channel_id, name FROM channel_keys WHERE id = ANY('{`+int64List(ids)+`}'::bigint[])`)
-	if err != nil {
-		return nil
-	}
-	defer rows.Close()
-	out := make(map[int64]keyInfo, len(ids))
-	for rows.Next() {
-		var id, channelID int64
-		var name string
-		if err := rows.Scan(&id, &channelID, &name); err != nil {
-			continue
-		}
-		out[id] = keyInfo{ChannelID: channelID, Name: name}
-	}
-	return out
+	return nil
 }
 
 // collectChannelIDs 提取密钥信息中的渠道 ID 去重列表。
@@ -331,38 +315,18 @@ func collectChannelIDs(infos map[int64]keyInfo) []int64 {
 	return ids
 }
 
-// channelNames 批量查询渠道 ID -> 名称；失败返回空 map。
+// channelNames 批量查询渠道 ID -> 名称。
+//
+// ⚠️ channels 已被 0024 删除：恒返回空 map（调用方按空串兜底）。
 func (h *Admin) channelNames(ctx context.Context, ids []int64) map[int64]string {
-	if len(ids) == 0 {
-		return nil
-	}
-	rows, err := h.db.QueryContext(ctx,
-		`SELECT id, name FROM channels WHERE id = ANY('{`+int64List(ids)+`}'::bigint[])`)
-	if err != nil {
-		return nil
-	}
-	defer rows.Close()
-	out := make(map[int64]string, len(ids))
-	for rows.Next() {
-		var id int64
-		var name string
-		if err := rows.Scan(&id, &name); err != nil {
-			continue
-		}
-		out[id] = name
-	}
-	return out
+	return nil
 }
 
-// channelNameByKeyID 由密钥 ID 反查所属渠道名（账单详情展示）；密钥/渠道不存在返回空串。
+// channelNameByKeyID 由密钥 ID 反查所属渠道名（账单详情展示）。
+//
+// ⚠️ channels / channel_keys 已被 0024 删除：恒返回空串（详情页该字段为空，结构不变）。
 func (h *Admin) channelNameByKeyID(ctx context.Context, keyID int64) string {
-	var name string
-	if err := h.db.QueryRowContext(ctx,
-		`SELECT c.name FROM channels c JOIN channel_keys k ON k.channel_id = c.id WHERE k.id = $1`, keyID).
-		Scan(&name); err != nil {
-		return ""
-	}
-	return name
+	return ""
 }
 
 // tokenNames 批量查询令牌 display_name：BillingID -> 令牌名（billing_records 通过 token_id 关联 tokens）。
@@ -848,7 +812,9 @@ type sessionListItem struct {
 }
 
 // sessionListCols 会话列表查询列（与 router.sessionCols 对齐；token_id 可空单独处理）。
-const sessionListCols = `session_id, user_id, token_id, model, session_raw, channel_key_id, internal_model_id, created_at, last_active, expire_at, COALESCE(name, ''), COALESCE(closed, false)`
+// ⚠️ 0024 删了 sessions.channel_key_id：查询里不再取该列（Session.ChannelKeyID 恒 0），
+// 对应的 ChannelKeyID 过滤条件也随之失效（见 sessionListWhere 的注释）。
+const sessionListCols = `session_id, user_id, token_id, model, session_raw, internal_model_id, created_at, last_active, expire_at, COALESCE(name, ''), COALESCE(closed, false)`
 
 // sessionListWhere 构建会话列表过滤 WHERE 子句与参数（prepared 绑定，避免注入）。
 // expiredMode=active 仅未过期、expired 仅已过期；closedMode="1" 仅已关闭、"0" 仅未关闭；空串不过滤。
@@ -867,7 +833,9 @@ func sessionListWhere(userID, tokenID, keyID int64, prefix, expiredMode, closedM
 		conds = append(conds, "token_id = "+bind(tokenID))
 	}
 	if keyID != 0 {
-		conds = append(conds, "channel_key_id = "+bind(keyID))
+		// ⚠️ 渠道体系已下线（0024 删了 sessions.channel_key_id）：这个过滤条件**不再有列可查**。
+		// 保留参数解析（旧前端仍可能传，非法值照样 400），但不再参与 WHERE —— 等价于「该条件不生效」。
+		_ = keyID
 	}
 	if prefix != "" {
 		conds = append(conds, "starts_with(session_id, "+bind(prefix)+")")
@@ -955,7 +923,7 @@ func (h *Admin) HandleListSessions(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var s router.Session
 		var tok sql.NullInt64
-		if err := rows.Scan(&s.SessionID, &s.UserID, &tok, &s.Model, &s.SessionRaw, &s.ChannelKeyID,
+		if err := rows.Scan(&s.SessionID, &s.UserID, &tok, &s.Model, &s.SessionRaw,
 			&s.InternalModelID, &s.CreatedAt, &s.LastActive, &s.ExpireAt, &s.Name, &s.Closed); err != nil {
 			resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "查询会话失败")
 			return

@@ -1047,10 +1047,8 @@ func (s *SqlStore) SetConfigWriteHook(fn func()) {
 
 // recordCols 查询 billing_records 使用的全部列。
 //
-// ⚠️ 这里**不再有 channel_key_id**：读路径已改从 call_logs.channel_key_id 取
-// （call_logs 与账单按 billing_id 1:1，该列在 0021 之后仍保留），见 fillChannelKeys。
-// 写路径**仍写**该列：0021_v2_drop_legacy 不在本批（见迁移目录），列还在时若不写，
-// 既有统计/成本页会在这批新数据上丢渠道维度（=改统计口径）。摘写路径随 0021 同批进行。
+// ⚠️ 这里**不再有 channel_key_id**：0024 已删该列；渠道维度只剩 call_logs 的历史快照
+// （call_logs 与账单按 billing_id 1:1），见 fillChannelKeys。写路径同样不再写该列。
 const recordCols = `id, billing_id, user_id, pricing_mode, token_id, external_model_name,
 	auto_model_name, internal_model_id, session_id, session_name, call_time, tokens, rates, coefficients, r_value,
 	raw_total, credits_consumed, cost_credits, balance_before, balance_after, status, error_message, duration_ms, first_token_ms`
@@ -1136,12 +1134,9 @@ func (s *SqlStore) insertOn(ctx context.Context, ex dbx.Execer, rec *Record) (*R
 	}
 	durationMs := nullableInt64For(rec.DurationMs)
 	firstTokenMs := nullableInt64For(rec.FirstTokenMs)
-	// 未进入渠道的拒绝类账单 channel_key_id 为 0 → 写 NULL（列可空，0 不满足外键）。
-	// ⚠️ 0021_v2_drop_legacy 一落地本列就会被删；摘写路径随 0021 同批（见 recordCols 的注释）。
-	var channelKeyID any
-	if rec.ChannelKeyID > 0 {
-		channelKeyID = rec.ChannelKeyID
-	}
+	// ⚠️ 0024_v2_drop_legacy 已删 billing_records.channel_key_id：这里**不再写**该列。
+	// 渠道维度只剩 call_logs.channel_key_id 的历史快照（读路径见 fillChannelKeys），
+	// 新账单的渠道维度恒为空 —— 这是「渠道体系下线」的必然结果，不是丢数据。
 
 	// V2 归因七列：写库前归一（非法协议 → NULL、非法 cost_source → none + WARN）。
 	// 归因是解释性字段，**不许**因为它的取值问题让账单写不进去（会让扣款与落账不一致）。
@@ -1153,15 +1148,15 @@ func (s *SqlStore) insertOn(ctx context.Context, ex dbx.Execer, rec *Record) (*R
 	}
 	err = ex.QueryRowContext(ctx,
 		`INSERT INTO billing_records(id, billing_id, user_id, pricing_mode, token_id, external_model_name,
-			auto_model_name, internal_model_id, channel_key_id, session_id, session_name, call_time, tokens, rates, coefficients, r_value,
+			auto_model_name, internal_model_id, session_id, session_name, call_time, tokens, rates, coefficients, r_value,
 			raw_total, credits_consumed, cost_credits, balance_before, balance_after, status, error_message, duration_ms, first_token_ms,
 			request_id, upstream_provider, upstream_account, upstream_protocol, upstream_model, ledger_entry_id, cost_source)
-		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,
-			$26,$27,$28,$29,$30,$31,$32)
+		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,
+			$25,$26,$27,$28,$29,$30,$31)
 		 RETURNING id, created_at`,
 		append([]any{
 			rec.ID, rec.BillingID, rec.UserID, rec.PricingMode, tokenID, rec.ExternalModel, autoModelName,
-			rec.InternalModelID, channelKeyID, sessionID, sessionName, rec.CallTime, tokensRaw, ratesRaw, coeffRaw,
+			rec.InternalModelID, sessionID, sessionName, rec.CallTime, tokensRaw, ratesRaw, coeffRaw,
 			rec.RValue, rec.RawTotal, rec.CreditsConsumed, rec.CostCredits,
 			rec.BalanceBefore, rec.BalanceAfter, rec.Status, errMsg, durationMs, firstTokenMs,
 		}, attr...)...).
@@ -1172,7 +1167,7 @@ func (s *SqlStore) insertOn(ctx context.Context, ex dbx.Execer, rec *Record) (*R
 	return rec, nil
 }
 
-// fillChannelKeys 用 call_logs 的 1:1 快照回填渠道密钥维度，快照缺失时回落到本表列（过渡期兜底）。
+// fillChannelKeys 用 call_logs 的 1:1 历史快照回填渠道密钥维度（0024 之后**唯一**来源）。
 //
 // 为什么不写成 recordCols 里的标量子查询：recordCols 会被多表 JOIN/归并查询复用，加子查询要么
 // 需要给外层表起别名（三处查询各一套），要么在归并 CTE 里落到错误的表上；批量回填只有一次查询，
@@ -1205,16 +1200,13 @@ func fillChannelKeys(ctx context.Context, ex dbx.Execer, recs []*Record) error {
 		marks[i] = fmt.Sprintf("$%d", i+1)
 		args[i] = id
 	}
-	// 过渡期兜底（复审 R5）：call_logs 是**异步写**，有毫秒级窗口、重试耗尽还会永久缺行，
-	// 只认快照会把「列里有值」的账单读回 0。所以两侧取 COALESCE(快照, 本表列)：
-	// 有快照用快照（0021 之后唯一来源），没快照回落到列（0021 之前写的账）。
-	// 「br.channel_key_id」这一半随 0021 同批删除（那批要同时改这里与 recordWhereOn）。
+	// 0024 之后 billing_records 已无 channel_key_id，快照（call_logs）是唯一来源：
+	// 新账单（call_logs 停写之后）恒查不到 → 渠道维度留 0，符合「渠道体系下线」的口径。
 	rows, err := ex.QueryContext(ctx,
-		`SELECT br.billing_id, COALESCE(cl.channel_key_id, br.channel_key_id)
-		   FROM billing_records br
-		   LEFT JOIN call_logs cl ON cl.billing_id = br.billing_id
-		  WHERE br.billing_id IN (`+strings.Join(marks, ", ")+`)
-		    AND COALESCE(cl.channel_key_id, br.channel_key_id) IS NOT NULL`, args...)
+		`SELECT cl.billing_id, cl.channel_key_id
+		   FROM call_logs cl
+		  WHERE cl.billing_id IN (`+strings.Join(marks, ", ")+`)
+		    AND cl.channel_key_id IS NOT NULL`, args...)
 	if err != nil {
 		return fmt.Errorf("读取调用日志的渠道密钥维度失败：%w", err)
 	}

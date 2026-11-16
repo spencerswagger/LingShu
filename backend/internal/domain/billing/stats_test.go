@@ -55,10 +55,7 @@ func TestDashboard_Aggregates(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows([]string{"model", "calls", "failed", "credits", "tokens"}).
 			AddRow("gpt-4o", int64(10), int64(1), float64(12.5), int64(150)))
 
-	// 4) 按渠道密钥
-	mock.ExpectQuery(regexp.QuoteMeta(`JOIN channel_keys ck ON ck.id = br.channel_key_id`)).
-		WillReturnRows(sqlmock.NewRows([]string{"key", "channel", "calls", "failed", "credits", "tokens"}).
-			AddRow("主密钥", "openai", int64(10), int64(1), float64(12.5), int64(150)))
+	// 4) 按渠道密钥：渠道体系已下线 → 不发查询、结果恒空（见 stats.go 的说明）。
 
 	// 5) 按用户（userID=nil → 执行）
 	mock.ExpectQuery(regexp.QuoteMeta(`JOIN users u ON u.id = br.user_id`)).
@@ -156,8 +153,7 @@ func TestDashboard_UserScope(t *testing.T) {
 
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT external_model_name,`)).
 		WillReturnRows(sqlmock.NewRows([]string{"model", "calls", "failed", "credits", "tokens"}))
-	mock.ExpectQuery(regexp.QuoteMeta(`JOIN channel_keys ck ON ck.id = br.channel_key_id`)).
-		WillReturnRows(sqlmock.NewRows([]string{"key", "channel", "calls", "failed", "credits", "tokens"}))
+	// 按渠道密钥：不发查询（渠道体系已下线）
 	// 无按用户查询（userID != nil）
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT pricing_mode,`)).
 		WillReturnRows(sqlmock.NewRows([]string{"mode", "calls", "failed", "credits", "tokens"}))

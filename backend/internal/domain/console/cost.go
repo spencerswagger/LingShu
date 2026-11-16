@@ -60,23 +60,16 @@ const costProbeExclusionSQL = `NOT (
         AND NOT EXISTS (SELECT 1 FROM call_logs cl WHERE cl.billing_id = b.billing_id)
     )`
 
-// costEntityResolveBody 实体解析子查询体：把账单行解析到「渠道 + 内部模型」对应的 channel_models 行。
-// 查询期解析、不给 billing_records 加列（本轮明确不加）。
-// 同一 (channel_id, internal_model_id) 有多条配置（删除后重建）时：优先未删除，其次取 id 最大者，
-// 保证解析结果确定；已被软删的配置仍参与解析，历史账单不因配置下线而失去归属。
-const costEntityResolveBody = `SELECT DISTINCT ON (cm.channel_id, cm.internal_model_id)
-           cm.channel_id, cm.internal_model_id, cm.id AS cm_id, cm.external_model_id
-    FROM channel_models cm
-    ORDER BY cm.channel_id, cm.internal_model_id, (cm.deleted_at IS NULL) DESC, cm.id DESC`
+// ⚠️ 0024 之后 channels / channel_keys / channel_models 全部删除，「渠道 × 内部模型」这个实体维度
+// 在库里**已经不存在**了。成本页的实体口径因此收敛为「对外模型 × 内部模型」：
+// 渠道维度字段（ChannelID / ChannelName / ChannelModelID）保留在响应里但恒为空/0，
+// 前端不用改结构，看到就是「没有渠道这个概念」。
+// 历史账单的渠道归属同样取不回（表已删，没有留档）——这是下线渠道体系的既定代价。
 
 // costStatsRow 「成本/售价对照」分组行（按实体聚合）。
 //
-// 实体键口径：EntityKey 是这条行的稳定标识（前端 row-key），格式两种：
-//   - `cm:<channel_model_id>`：账单行解析到了 channel_models 行（渠道/对外模型由该行决定，键里不重复带）；
-//   - `name:<对外模型名>#<internal_model_id>@<channel_id>`：解析不到时按账单原始文本单独成桶。
-//     降级桶**按渠道分开**——同一文本在不同渠道下是两行，不同文本不合并、不丢弃；
-//     `internal_model_id` 为空时省略 `#<id>` 段（`name:<文本>@<channel_id>`）；
-//     无渠道（channel_key_id 为 NULL）时 `@0`。
+// 实体键口径：EntityKey 是这条行的稳定标识（前端 row-key）：`name:<对外模型名>#<internal_model_id>`。
+// 内部模型为空时省略 `#<id>` 段（`name:<文本>`）。不再带 `@<channel_id>` 段——渠道维度已下线。
 //
 // ExternalModelName 是**展示名**：解析成功的用当前对外模型名，解析不到的用账单原始文本；
 // 该实体历史上出现过的所有文本快照见 SnapshotNames（按字典序，供「曾用名」标注）。
@@ -113,23 +106,20 @@ type costStatsTotal struct {
 
 // costStatsQuerySQL 成本统计主查询（按实体聚合）。
 //
-// 实体 = (解析出的 channel_id, 解析出的 external_model_id, 解析出的 channel_models.id)；
-// 解析不到时降级为按「原始文本」的桶（见 costStatsRow.EntityKey 说明）。
+// 实体 = (账单原始对外模型文本 / 当期对外模型名, internal_model_id)（渠道维度已下线）。
 // 金额口径：SUM(cost_credits) / SUM(credits_consumed)，与改造前逐位相等——
 // 只是把行重新分组，没有过滤（除探测行）也没有重新计算；账单写入时金额已按 5 位小数落库，
 // 分组粒度不影响总和。
 const costStatsQuerySQL = `
-WITH res AS (` + costEntityResolveBody + `)
 SELECT CASE
-           WHEN r.cm_id IS NOT NULL THEN 'cm:' || r.cm_id::text
            WHEN b.internal_model_id <> ''
-               THEN 'name:' || b.external_model_name || '#' || b.internal_model_id || '@' || COALESCE(k.channel_id, 0)::text
-           ELSE 'name:' || b.external_model_name || '@' || COALESCE(k.channel_id, 0)::text
+               THEN 'name:' || b.external_model_name || '#' || b.internal_model_id
+           ELSE 'name:' || b.external_model_name
        END AS entity_key,
-       MAX(k.channel_id)                    AS channel_id,
-       MAX(COALESCE(c.name, ''))            AS channel_name,
-       MAX(COALESCE(r.cm_id, 0))            AS channel_model_id,
-       MAX(COALESCE(r.external_model_id, 0)) AS external_model_id,
+       0::bigint                            AS channel_id,
+       ''::text                             AS channel_name,
+       0::bigint                            AS channel_model_id,
+       MAX(COALESCE(em.id, 0))              AS external_model_id,
        MAX(b.internal_model_id)             AS internal_model_id,
        MAX(COALESCE(em.external_name, b.external_model_name)) AS external_model_name,
        COALESCE(SUM(b.cost_credits), 0)     AS cost_credits,
@@ -140,11 +130,7 @@ SELECT CASE
        %s AS output_tokens,
        to_json(array_agg(DISTINCT b.external_model_name))::text AS snapshot_names
 FROM billing_records b
-LEFT JOIN channel_keys k ON k.id = b.channel_key_id
-LEFT JOIN (` + costEntityResolveBody + `) r
-       ON r.channel_id = k.channel_id AND r.internal_model_id = b.internal_model_id
-LEFT JOIN channels c ON c.id = k.channel_id
-LEFT JOIN external_models em ON em.id = r.external_model_id
+LEFT JOIN external_models em ON em.external_name = b.external_model_name
 WHERE b.status = 'completed'
   AND ` + costProbeExclusionSQL + `
 GROUP BY 1
@@ -191,16 +177,7 @@ func (h *Admin) HandleCostStats(w http.ResponseWriter, r *http.Request) {
 		if chID.Valid {
 			item.ChannelID = chID.Int64
 		}
-		switch {
-		case item.ChannelName != "":
-			// 保持原样
-		case chID.Valid:
-			// 渠道名缺失时回退渠道 ID 字符串，避免前端展示空白。
-			item.ChannelName = strconv.FormatInt(chID.Int64, 10)
-		default:
-			// channel_key_id 为 NULL（未进入渠道的拒绝类账单）→ 无渠道归属。
-			item.ChannelName = "(无渠道)"
-		}
+		// 渠道维度：0024 已删 channels/channel_keys，ChannelName 恒为空（结构保留供前端不特判）。
 		item.SnapshotNames = parseSnapshotNames(snapshots)
 		item.CostCredits = decimalx.Round5(item.CostCredits)
 		item.SaleCredits = decimalx.Round5(item.SaleCredits)
@@ -385,18 +362,19 @@ func (h *Admin) HandleCostCurves(w http.ResponseWriter, r *http.Request) {
 
 	rValue := h.resolveR()
 
+	// 渠道体系下线后成本价（channel_models.cost_rates）没有存储了：真实成本改由账本
+	// （billing_records.cost_credits / ledger_entries，见 /api/v1/admin/ops/pnl）提供。
+	// 这里只出「售价曲线」：每个对外模型一条，成本侧字段留空由前端置灰。
 	rowSet, err := h.db.QueryContext(r.Context(), `
-SELECT cm.channel_id,
-       COALESCE(c.name, '') AS channel_name,
-       cm.internal_model_id,
-       COALESCE(em.external_name, '') AS external_name,
-       cm.cost_rates,
+SELECT 0::bigint      AS channel_id,
+       ''::text       AS channel_name,
+       ''::text       AS internal_model_id,
+       em.external_name,
+       NULL::jsonb    AS cost_rates,
        em.sale_rates
-FROM channel_models cm
-LEFT JOIN channels c ON c.id = cm.channel_id
-JOIN external_models em ON em.id = cm.external_model_id
-WHERE cm.deleted_at IS NULL
-ORDER BY cm.channel_id, cm.internal_model_id`)
+FROM external_models em
+WHERE em.enabled
+ORDER BY em.external_name`)
 	if err != nil {
 		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "查询成本曲线失败")
 		return
@@ -408,7 +386,6 @@ ORDER BY cm.channel_id, cm.internal_model_id`)
 			item    costCurveItem
 			costRaw []byte
 			saleRaw []byte
-			prices  map[string]float64
 			sales   map[string]float64
 		)
 		if err := rowSet.Scan(&item.ChannelID, &item.ChannelName, &item.InternalModelID, &item.ExternalModelName,
@@ -416,23 +393,16 @@ ORDER BY cm.channel_id, cm.internal_model_id`)
 			resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "查询成本曲线失败")
 			return
 		}
-		if len(costRaw) > 0 && string(costRaw) != "null" {
-			_ = json.Unmarshal(costRaw, &prices)
-		}
-		// cost_rates 缺失/三段全 0 视为「成本未知」，跳过该行（对齐 router/engine.go 的 hasValidCost 口径）。
-		if !hasNonZeroRates(prices) {
-			continue
-		}
-		saleValid := false
+		_ = costRaw // 成本价已无配置源（见上）：恒不画成本线
 		if len(saleRaw) > 0 && string(saleRaw) != "null" {
 			_ = json.Unmarshal(saleRaw, &sales)
 		}
-		// sale_rates 缺失/三段全 0 → 不画售价曲线（避免误导的全 0 线）。
-		if hasNonZeroRates(sales) {
-			saleValid = true
+		// sale_rates 缺失/三段全 0 → 这行没有可画的东西，跳过（避免一条空曲线）。
+		if !hasNonZeroRates(sales) {
+			continue
 		}
 
-		item.Cost = make([]float64, 0, turns)
+		item.Cost = make([]float64, 0, turns) // 恒空：成本线需账本口径，不在本接口
 		item.Sale = make([]float64, 0, turns)
 		output := 0.0
 		if inOutRatio > 0 {
@@ -441,12 +411,8 @@ ORDER BY cm.channel_id, cm.internal_model_id`)
 		for k := 1; k <= turns; k++ {
 			newInput := perTurnInput
 			cacheRead := hitRate * perTurnInput * float64(k-1)
-			costK := (cacheRead*prices["cache_read"] + newInput*prices["input"] + output*prices["output"]) / float64(rValue)
-			item.Cost = append(item.Cost, decimalx.Round5(costK))
-			if saleValid {
-				saleK := (cacheRead*sales["cache_read"] + newInput*sales["input"] + output*sales["output"]) / float64(rValue)
-				item.Sale = append(item.Sale, decimalx.Round5(saleK))
-			}
+			saleK := (cacheRead*sales["cache_read"] + newInput*sales["input"] + output*sales["output"]) / float64(rValue)
+			item.Sale = append(item.Sale, decimalx.Round5(saleK))
 		}
 		out.Curves = append(out.Curves, item)
 	}
@@ -587,8 +553,8 @@ func (h *Admin) HandleCostSession(w http.ResponseWriter, r *http.Request) {
 
 	sqlText := fmt.Sprintf(`
 SELECT b.call_time,
-       COALESCE(c.name, '') AS channel_name,
-       b.channel_key_id,
+       ''::text AS channel_name,   -- 渠道体系已下线（0024 删了 channels/channel_keys）
+       NULL::bigint AS channel_key_id,   -- 历史快照走 call_logs，本期明细不再回填
        b.internal_model_id,
        b.status,
        %s AS input_tokens,
@@ -597,8 +563,6 @@ SELECT b.call_time,
        COALESCE(b.cost_credits, 0)     AS cost_credits,
        COALESCE(b.credits_consumed, 0) AS sale_credits
 FROM billing_records b
-LEFT JOIN channel_keys k ON k.id = b.channel_key_id
-LEFT JOIN channels c ON c.id = k.channel_id
 WHERE b.session_id = $1
 ORDER BY b.call_time ASC, b.id ASC
 LIMIT $2`,

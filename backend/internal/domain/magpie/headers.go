@@ -224,11 +224,17 @@ func copyRequestHeaders(dst, src http.Header) {
 //     退化成 chunked，下游流式库要重算长度、HTTP/1.0 客户端甚至拿不到长度。
 //     真正需要改长度的场合由转发层显式处理（见下一条与 proxy.go 的遮蔽分支）。
 //   - `Content-Encoding`（**强制 gzip 时**）：不属于「透传决策」，由转发层按实际字节决定。
-//     上游无视 `Accept-Encoding: identity` 仍压缩 → 为了遮蔽凭据必须先解压，此时
-//     **Content-Encoding 必须剥掉**（body 已经是明文，留着等于让下游再解一次 → 解不开报错），
-//     `Content-Length` 也一并剥掉（压缩前长度对解压后的字节不成立，让 Go 用 chunked 或重算）。
-//     反之解不开的编码（br 等）按**原字节透传**：此时 Content-Encoding **必须保留**，否则下游
-//     会把压缩字节当明文。处置点在 proxy.go（decoded / UnmaskableEncoding 两条分支），
+//     判据是**头与体自洽**，不是「头该不该透传」——体是什么，头就必须说什么。三态：
+//     ① 解压成功（上游无视 `Accept-Encoding: identity` 仍压缩）→ **剥编码头**（body 已是明文，
+//     留着等于让下游再解一次 → `gzip: invalid header`），`Content-Length` 一并剥（压缩前长度
+//     对解压后的字节不成立，交 Go 重算/chunked）；
+//     ② 解码器在**读头部时**就拒绝（`gzip.NewReader` 只看魔数，失败即证明这些字节不是该编码，
+//     典型是中间层硬加 `Content-Encoding: gzip` 而体已被它解压）→ **剥编码头**、原字节转发、
+//     `Content-Length` 保留（转发的是上游原字节，长度成立）；
+//     ③ 解不开也**不该解**（br 等 stdlib 不支持的编码）或**头合法但解到中途失败**（截断）→
+//     **保留编码头**，原字节透传 + 记 `UnmaskableEncoding` 告警（剥头会让下游把压缩字节当明文，
+//     比「下游解压报错」更糟）。
+//     处置点全在 proxy.go（decoded / stripEncoding / UnmaskableEncoding 三条分支），
 //     本函数不碰这两个头。
 func copyResponseHeaders(dst, src http.Header) {
 	named := connectionNamedHeaders(src)
