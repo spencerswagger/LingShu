@@ -8,11 +8,9 @@ import {
   Cpu,
   User,
   Key,
-  ChatDotRound,
   Tickets,
   Setting,
   Bell,
-  Coin,
   Share,
   Box,
   Notebook,
@@ -24,22 +22,20 @@ const route = useRoute()
 const router = useRouter()
 const auth = useAuthStore()
 
-// 管理端菜单
-// V2 新增五项（内部模型 / 订阅 / 账本 / 对账 / 盈亏）紧跟「统计」：运营日常入口，且不依赖渠道族。
-// 渠道 / 渠道协议 / 标签 / 状态四项已整体下线（接口 410、表已删，页面文件已删除），菜单同步摘除。
+// 管理端菜单（对齐已确认原型：运营 / 系统两组）
+// 会话页与 V1 成本页在 V2 下线（Spec §1.2：新链路不写 sessions；成本由盈亏页取代），菜单摘除，
+// 路由保留 redirect 兜底老书签。渠道族 / 标签 / Auto 模型 / 服务状态同理（页面文件已删）。
 const menus = [
   { path: '/admin/dashboard', title: '统计', icon: Odometer },
-  { path: '/admin/topology', title: '内部模型', icon: Share },
+  { path: '/admin/topology', title: '拓扑', icon: Share },
   { path: '/admin/models', title: '模型', icon: Cpu },
   { path: '/admin/subscriptions', title: '订阅', icon: Box },
   { path: '/admin/ledger', title: '账本', icon: Notebook },
-  { path: '/admin/reconcile', title: '对账', icon: DataAnalysis },
-  { path: '/admin/pnl', title: '盈亏', icon: TrendCharts },
   { path: '/admin/users', title: '用户', icon: User },
   { path: '/admin/tokens', title: '令牌', icon: Key },
-  { path: '/admin/sessions', title: '会话', icon: ChatDotRound },
   { path: '/admin/billings', title: '账单', icon: Tickets },
-  { path: '/admin/cost', title: '成本', icon: Coin },
+  { path: '/admin/pnl', title: '盈亏与对账', icon: TrendCharts },
+  { path: '/admin/reconcile', title: '对账', icon: DataAnalysis },
   { path: '/admin/announcements', title: '公告', icon: Bell },
   { path: '/admin/system', title: '系统', icon: Setting },
 ]

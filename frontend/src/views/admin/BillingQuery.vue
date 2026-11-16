@@ -5,10 +5,8 @@ import {
   listBillings,
   getBillingStats,
   listExternalModels,
-  listSessions,
   listTokens,
   type AdminBillingItem,
-  type AdminSession,
   type AdminToken,
   type BillingStats,
   type ExternalModel,
@@ -65,14 +63,12 @@ const stats = ref<BillingStats>({
 // 账单行上的 channel_name / key_name 字段仍由后端返回（结构不删），拿到就显示，拿不到显示 '-'。
 const models = ref<ExternalModel[]>([])
 const tokens = ref<AdminToken[]>([])
-const sessions = ref<AdminSession[]>([])
 // 当前所选用户名（用于筛选标签展示）
 const userName = ref('')
 
 const filters = reactive({
   user_id: (route.query.user_id ? String(route.query.user_id) : undefined) as string | undefined,
   token_id: undefined as string | undefined,
-  session_id: undefined as string | undefined,
   model: undefined as string | undefined,
   status: undefined as string | undefined,
   // 请求链路 ID：调用方把网关错误体里的 request_id 贴进来，直接定位这一次请求
@@ -89,7 +85,6 @@ filters.range = resolveBillingRange(route.query.range)
 const paramKeyMap: Record<string, string> = {
   user_id: 'UserID',
   token_id: 'TokenID',
-  session_id: 'SessionID',
   model: 'Model',
   status: 'Status',
   request_id: 'RequestID',
@@ -257,14 +252,6 @@ async function loadTokensOfUser() {
     tokens.value = []
   }
 }
-async function searchSessions(q: string) {
-  try {
-    const res = await listSessions({ Q: q, Page: 1, Size: 50 }, base.value)
-    sessions.value = res.Data.List || []
-  } catch {
-    sessions.value = []
-  }
-}
 // 列头浮窗「清除」：还原对应筛选条件并保持级联下拉一致。
 function clearUserKey() {
   filters.user_id = undefined
@@ -275,11 +262,6 @@ function tokenTagLabel(id?: string) {
   if (!id) return ''
   const tk = tokens.value.find((x) => x.ID === id)
   return tk ? tk.DisplayName || tk.TokenDisplay : id
-}
-function sessionTagLabel(id?: string) {
-  if (!id) return ''
-  const s = sessions.value.find((x) => x.SessionID === id)
-  return s ? sessionLabel(s) : id
 }
 
 const activeTags = computed(() => {
@@ -292,7 +274,6 @@ const activeTags = computed(() => {
   }
   if (filters.user_id) out.push({ key: 'user_id', label: `用户: ${userName.value || filters.user_id}` })
   if (filters.token_id) out.push({ key: 'token_id', label: `密钥: ${tokenTagLabel(filters.token_id)}` })
-  if (filters.session_id) out.push({ key: 'session_id', label: `会话: ${sessionTagLabel(filters.session_id)}` })
   if (filters.model) out.push({ key: 'model', label: `模型: ${filters.model}` })
   if (filters.status) out.push({ key: 'status', label: `状态: ${filters.status === 'completed' ? '成功' : '失败'}` })
   if (filters.request_id) out.push({ key: 'request_id', label: `请求 ID: ${filters.request_id}` })
@@ -310,9 +291,6 @@ function clearTag(key: string) {
       break
     case 'token_id':
       filters.token_id = undefined
-      break
-    case 'session_id':
-      filters.session_id = undefined
       break
     case 'model':
       filters.model = undefined
@@ -332,7 +310,6 @@ watch(
   () => ({
     user_id: filters.user_id,
     token_id: filters.token_id,
-    session_id: filters.session_id,
     model: filters.model,
     status: filters.status,
     request_id: filters.request_id,
@@ -366,7 +343,6 @@ function reset() {
   const wasActive = !!(
     filters.user_id ||
     filters.token_id ||
-    filters.session_id ||
     filters.model ||
     filters.status ||
     filters.request_id ||
@@ -374,7 +350,6 @@ function reset() {
   )
   filters.user_id = undefined
   filters.token_id = undefined
-  filters.session_id = undefined
   filters.model = undefined
   filters.status = undefined
   filters.request_id = undefined
@@ -388,7 +363,6 @@ function reset() {
 
 onMounted(() => {
   loadModels()
-  searchSessions('')
   loadTokensOfUser()
   load()
 })
@@ -516,10 +490,6 @@ function creditLines(row: AdminBillingItem): string[] {
   ]
 }
 
-// 会话选项展示：名称优先，缺失用「未命名」。
-function sessionLabel(s: AdminSession): string {
-  return s.SessionName || '未命名'
-}
 </script>
 
 <template>
@@ -796,33 +766,7 @@ function sessionLabel(s: AdminSession): string {
           </template>
         </el-table-column>
 
-        <!-- 会话（带搜索下拉） -->
-        <el-table-column label="会话" min-width="120">
-          <template #header>
-            <ColumnFilter
-              label="会话"
-              :active="!!filters.session_id"
-
-              @clear="() => (filters.session_id = undefined)"
-            >
-              <el-select
-                :model-value="filters.session_id ?? undefined"
-                placeholder="搜索会话"
-                filterable
-                remote
-                clearable
-                size="small"
-                :remote-method="(q: string) => searchSessions(q)"
-                @update:model-value="(v: any) => (filters.session_id = v ?? undefined)"
-              >
-                <el-option v-for="s in sessions" :key="s.SessionID" :label="sessionLabel(s)" :value="s.SessionID" />
-              </el-select>
-            </ColumnFilter>
-          </template>
-          <template #default="{ row }">
-            <span class="tok">{{ row.SessionName || '-' }}</span>
-          </template>
-        </el-table-column>
+        <!-- 会话列在 V2 下线（Spec §1.2：新链路不写 sessions，这一列永远是空）；要按上游定位请用「归因 / 成本来源」 -->
 
         <!-- Token（双行：输入/输出 + 缓存读） -->
         <el-table-column label="Token" min-width="150" align="right">

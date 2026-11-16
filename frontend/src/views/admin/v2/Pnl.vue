@@ -54,10 +54,14 @@ function money(v: number | null): string {
 function pct(v: number | null): string {
   return v == null ? '—' : `${(v * 100).toFixed(2)}%`
 }
+// 请求数这类**计数**一律显示精确整数（3 不该长成 3.0）；token 才用 K/M 缩写。
+function count(n: number): string {
+  return (n || 0).toLocaleString('zh-CN')
+}
 // 无成本口径的提示语：只有 Uncosted 一个口径，不做拆分（后端不返回、schema 也分不出来）
 function uncostedHint(d: PnlView): string {
   if (d.Uncosted <= 0) return '全部请求都有成本口径'
-  return `${fmtCompact(d.Uncosted)} 笔请求成本为空（cost_source=none）→ 只计收入不计成本，毛利虚高`
+  return `${count(d.Uncosted)} 笔请求成本为空（cost_source=none）→ 只计收入不计成本，毛利虚高`
 }
 
 // 依赖徽标：拿到真实数据才标「已定型」，避免接口没上线时给出错误预期
@@ -122,11 +126,11 @@ const stats = computed<StatItem[]>(() => {
       value: money(amortizedCost.value),
       hint: 'cost_source=amortized，A5 月费行级分摊',
     },
-    { label: '请求数', value: fmtCompact(d.Requests) },
+    { label: '请求数', value: count(d.Requests) },
     { label: 'Token（三段合计）', value: fmtCompact(d.Tokens) },
     {
       label: '无成本口径请求',
-      value: fmtCompact(d.Uncosted),
+      value: count(d.Uncosted),
       tone: uncostedTone,
       hint: uncostedHint(d),
     },
@@ -199,7 +203,7 @@ const chartOption = computed(() => {
         <!-- 说明文案放默认插槽：el-alert 同时给 :description 和默认插槽时，description 会被插槽顶掉（说明就看不见了） -->
         <div class="uncosted-body">
           <span>
-            {{ fmtCompact(data.Uncosted) }} 笔请求的 cost_credits 为空（当前 schema 下必定 cost_source=none，
+            {{ count(data.Uncosted) }} 笔请求的 cost_credits 为空（当前 schema 下必定 cost_source=none，
             后端只提供这一个合计口径、不拆历史）。这些请求只计收入、不计成本，算出来的毛利不能当真实毛利。
           </span>
           <el-button size="small" @click="$router.push('/admin/billings?cost_source=none')">
@@ -233,7 +237,7 @@ const chartOption = computed(() => {
           <el-table :data="data.Groups" size="small" border stripe empty-text="区间内没有账单">
             <el-table-column prop="Key" label="分组" min-width="180" show-overflow-tooltip />
             <el-table-column label="请求数" width="100" align="right">
-              <template #default="{ row }">{{ fmtCompact(row.Requests) }}</template>
+              <template #default="{ row }">{{ count(row.Requests) }}</template>
             </el-table-column>
             <el-table-column label="Token" width="110" align="right">
               <template #default="{ row }">{{ fmtCompact(row.Tokens) }}</template>
@@ -258,7 +262,7 @@ const chartOption = computed(() => {
             <el-table-column label="无成本口径" width="120" align="right">
               <template #default="{ row }">
                 <el-tag v-if="row.Uncosted > 0" type="warning" size="small" effect="plain">
-                  {{ fmtCompact(row.Uncosted) }}
+                  {{ count(row.Uncosted) }}
                 </el-tag>
                 <span v-else class="sub">0</span>
               </template>

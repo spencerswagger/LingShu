@@ -54,9 +54,8 @@ const router = createRouter({
         { path: 'users/:id', name: 'admin-user-detail', component: () => import('@/views/admin/UserDetail.vue'), meta: { title: '用户详情' } },
         // 令牌管理
         { path: 'tokens', name: 'admin-tokens', component: () => import('@/views/admin/AdminTokenList.vue'), meta: { title: '令牌' } },
-        // 会话管理
-        { path: 'sessions', name: 'admin-sessions', component: () => import('@/views/admin/SessionList.vue'), meta: { title: '会话' } },
-        { path: 'sessions/:id', name: 'admin-session-detail', component: () => import('@/views/admin/SessionDetail.vue'), meta: { title: '会话详情' } },
+        // 会话管理（V2 下线：新链路不写 sessions，Spec §1.2）——只留老书签兜底，菜单已摘除。
+        { path: 'sessions/:pathMatch(.*)*', redirect: '/admin/dashboard' },
         // 账单
         { path: 'billings', name: 'admin-billings', component: () => import('@/views/admin/BillingQuery.vue'), meta: { title: '账单' } },
         { path: 'billings/:id', name: 'admin-billing-detail', component: () => import('@/views/admin/BillingDetail.vue'), meta: { title: '账单详情' } },
@@ -64,8 +63,9 @@ const router = createRouter({
         { path: 'system', name: 'admin-system', component: () => import('@/views/admin/BillingConfig.vue'), meta: { title: '系统' } },
         { path: 'system/config', redirect: '/admin/system' },
         { path: 'system/gateway', redirect: '/admin/system' },
-        // 成本（只读：成本统计 + 定价曲线 + 会话成本曲线）
-        { path: 'cost', name: 'admin-cost', component: () => import('@/views/admin/Cost.vue'), meta: { title: '成本' } },
+        // 成本（V1 页 JOIN channel_keys/channels，0024 后必 500）：由盈亏页取代（Spec §1.2），
+        // 老书签兜底到盈亏，菜单已摘除。
+        { path: 'cost/:pathMatch(.*)*', redirect: '/admin/pnl' },
         // 公告
         { path: 'announcements', name: 'admin-announcements', component: () => import('@/views/admin/AnnouncementList.vue'), meta: { title: '公告' } },
         { path: 'announcements/create', name: 'admin-announcement-create', component: () => import('@/views/admin/AnnouncementEdit.vue'), meta: { title: '新建公告' } },
@@ -105,20 +105,8 @@ const router = createRouter({
         },
         // Auto 模型族整体下线（同管理端）：老书签兜底到模型列表。
         { path: 'auto-models/:pathMatch(.*)*', redirect: '/dev/models' },
-        {
-          path: 'sessions',
-          name: 'dev-sessions',
-          component: () => import('@/views/admin/SessionList.vue'),
-          meta: { title: '会话' },
-          props: { mode: 'self' },
-        },
-        {
-          path: 'sessions/:id',
-          name: 'dev-session-detail',
-          component: () => import('@/views/admin/SessionDetail.vue'),
-          meta: { title: '会话详情' },
-          props: { mode: 'self' },
-        },
+        // 会话页在 V2 下线（Spec §1.2）：老书签兜底到统计，菜单已摘除。
+        { path: 'sessions/:pathMatch(.*)*', redirect: '/dev/dashboard' },
         {
           path: 'billings',
           name: 'dev-billings',

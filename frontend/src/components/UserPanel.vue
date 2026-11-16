@@ -81,13 +81,7 @@ const metrics = computed<MetricItem[]>(() => {
       click: () => router.push(isAdmin.value ? '/admin/tokens' : '/dev/tokens'),
     },
   ]
-  if (isAdmin.value) {
-    items.push({
-      label: '会话总数',
-      value: fmt(s?.SessionCount),
-      click: () => router.push('/admin/sessions'),
-    })
-  }
+  // V2 起不再展示「会话总数」（Spec §1.2 会话页下线；接口即便返回 SessionCount 也不渲染）
   items.push(
     { label: '今日消耗', value: fmt(s?.TodayCredits), click: () => goBilling('today') },
     { label: '昨日消耗', value: fmt(s?.YesterdayCredits), click: () => goBilling('yesterday') },
