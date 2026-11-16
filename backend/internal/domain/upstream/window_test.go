@@ -694,7 +694,15 @@ func TestPOC_UpstreamLedgerOrder_Mock(t *testing.T) {
 func TestPOC_UpstreamLedgerOrder_Real(t *testing.T) {
 	baseURL := os.Getenv("UPSTREAM_LEDGER_URL")
 	if baseURL == "" {
-		t.Skip("未设置 UPSTREAM_LEDGER_URL：真实上游 POC 未执行 → 排序能力记为 unverified（本窗不可清零）")
+		// 仍成立的跳过：本仓库没有可连的真实代理侧上游（POC 需要凭据与真实账本端点），
+		// 所以「上游账本是否有序」这件事至今**未被证实**。当前事实是：
+		//   - `cmd/server` 启动时同样按 UPSTREAM_LEDGER_URL 做能力探测，未配置时日志明确写
+		//     `order=unverified`（见 main.go 的 orderWhy「未配置 UPSTREAM_LEDGER_URL，未做能力探测」）；
+		//   - 未证实 → 保守分支生效：每轮 `status=blocked`、计数列留 NULL、水位线不前进，
+		//     直到有人提供上游地址并真跑出 supported。
+		// 因此本用例的 Skip 是「结论未证实」的记录，不是「已知通过」。
+		t.Skip("未设置 UPSTREAM_LEDGER_URL：上游账本排序能力至今未证实（unverified）；" +
+			"保守分支下每轮 blocked、计数列 NULL、水位线不前进，需真实上游地址才能转 supported")
 	}
 	src := NewHTTPLedgerSource(baseURL, os.Getenv("UPSTREAM_ADMIN_KEY"), "", nil)
 	w := Window{Start: time.Now().Add(-30 * time.Minute), End: time.Now()}
