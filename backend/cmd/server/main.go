@@ -20,6 +20,7 @@ import (
 
 	"github.com/team/llmgateway/internal/config"
 	"github.com/team/llmgateway/internal/db"
+	"github.com/team/llmgateway/internal/domain/amortize"
 	"github.com/team/llmgateway/internal/domain/audit"
 	"github.com/team/llmgateway/internal/domain/automodel"
 	"github.com/team/llmgateway/internal/domain/billing"
@@ -834,6 +835,39 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 						"linked", res.Linked, "skipped", res.Skipped,
 						"unmatched_billing", res.UnmatchedBilling,
 						"unmatched_ledger", res.UnmatchedLedger, "cost", res.Cost)
+				}
+			}()
+		}
+	}()
+
+	// 阶段二 A5：订阅月费分摊（固定成本摊到当期账单）。
+	// 5 分钟一跳：账本条目迟到会让某些行从「可摊」变成「已挂账本」，重算即收敛；
+	// 写的是 SET 不是累加，频率高低都不影响结果。
+	amortizer := amortize.NewAllocator(amortize.Options{
+		Store:  amortize.NewSQLStore(d),
+		Now:    time.Now,
+		Logger: logr,
+	})
+	go func() {
+		t := time.NewTicker(5 * time.Minute)
+		defer t.Stop()
+		for range t.C {
+			func() {
+				defer func() {
+					if rec := recover(); rec != nil {
+						logr.Error("月费分摊轮次 panic", "panic", rec)
+					}
+				}()
+				res, err := amortizer.RunOnce(context.Background())
+				if err != nil {
+					logr.Warn("月费分摊轮次失败（下轮重试）", "err", err)
+					return
+				}
+				if res.Updated > 0 || res.Unallocated > 0 {
+					logr.Info("月费分摊轮次完成",
+						"subscriptions", res.Subscriptions, "skipped", res.Skipped,
+						"updated", res.Updated, "allocated", res.Allocated,
+						"unallocated", res.Unallocated)
 				}
 			}()
 		}

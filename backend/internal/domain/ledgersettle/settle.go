@@ -312,7 +312,8 @@ var _ Store = (*SQLStore)(nil)
 // 过滤条件三条：
 //   - ledger_entry_id IS NULL：已挂过的不再匹配（幂等）；
 //   - upstream_provider IS NOT NULL：没有归因的账单匹配不了（历史行）；
-//   - cost_source 只允许空/none：账本成本不许覆盖订阅摊销（amortized）——两者是不同成本口径。
+//   - cost_source 只允许空/none/amortized：账本成本是变动成本的真源，**可以覆盖**订阅摊销
+//     （amortize 会在下一轮把被覆盖的行剔出分母重算，两边都是 SET 不是 ADD，能收敛）。
 func (s *SQLStore) UnmatchedBilling(ctx context.Context, from, to time.Time) ([]BillingRow, error) {
 	if s == nil || s.db == nil {
 		return nil, fmt.Errorf("账本结算存储未装配数据库连接")
@@ -329,7 +330,7 @@ func (s *SQLStore) UnmatchedBilling(ctx context.Context, from, to time.Time) ([]
 		  WHERE call_time >= $1 AND call_time < $2
 		    AND ledger_entry_id IS NULL
 		    AND upstream_provider IS NOT NULL
-		    AND (cost_source IS NULL OR cost_source = 'none')
+		    AND (cost_source IS NULL OR cost_source IN ('none','amortized'))
 		  ORDER BY call_time, billing_id`, from, to)
 	if err != nil {
 		return nil, fmt.Errorf("读取待结算账单失败：%w", err)

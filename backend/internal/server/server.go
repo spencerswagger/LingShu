@@ -198,6 +198,9 @@ func (s *Server) routes() {
 	// billings / stats / configs / sessions
 	admin.HandleFunc("GET /api/v1/admin/billings", d.Console.HandleListBillings)
 	admin.HandleFunc("GET /api/v1/admin/billings/stats", d.Console.HandleBillingsStats)
+	// 阶段二 A6：盈亏（收入 vs 成本）与对账窗口（漏账可见）。
+	admin.HandleFunc("GET /api/v1/admin/ops/pnl", d.Console.HandlePnL)
+	admin.HandleFunc("GET /api/v1/admin/ops/reconcile-windows", d.Console.HandleReconcileWindows)
 	admin.HandleFunc("GET /api/v1/admin/billings/{billing_id}", d.Console.HandleGetBilling)
 	admin.HandleFunc("GET /api/v1/admin/stats/dashboard", d.Console.HandleStatsDashboard)
 	admin.HandleFunc("GET /api/v1/admin/stats/live", d.Console.HandleStatsLive)
