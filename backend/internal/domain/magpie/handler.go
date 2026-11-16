@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/team/llmgateway/internal/pkg/logger"
@@ -31,6 +32,12 @@ type Prepared struct {
 	Body []byte
 	// StreamRequested 表示请求体声明了流式（body.stream=true）。
 	StreamRequested bool
+	// SessionID 是入站会话标识（x-session-id 原值；空 = 无会话）。只做计费/日志归属，
+	// 不参与路由判断（选路已迁到代理侧）。
+	SessionID string
+	// Reservation 是入口预扣句柄（OnReserve 的返回值，原样交回 OnComplete）。
+	// nil = 本次未预扣（未注入 OnReserve 或非计费端点）。
+	Reservation any
 	// StripQueryKey 表示转发时必须剔除 query 里的 key 参数。
 	// 判定按**解码后键名**且与剔除同源（query.go）：无论本次鉴权用的是 query 里的 key
 	// （Gemini 原生写法）还是请求头，只要 query 里出现 key 就剔——头鉴权 + 同时带 ?key=
@@ -48,7 +55,10 @@ type Deps struct {
 	CredentialKey []byte
 	// Prefixes 提供订阅池前缀名单；nil 时恒用默认名单。
 	Prefixes *PrefixProvider
-	// OnComplete 是转发结束回调（第③件接入；nil = 不产生任何计费动作）。
+	// OnReserve 是转发**前**的预扣钩子（准入 + 改写之后调用）：返回预扣句柄交给 OnComplete，
+	// 或返回 Deny 直接拒绝（余额不足）。nil = 不预扣。
+	OnReserve ReserveHook
+	// OnComplete 是转发结束回调（计费结算/退预扣的落点；nil = 不产生任何计费动作）。
 	OnComplete Hook
 	Logger     *slog.Logger
 }
@@ -58,6 +68,7 @@ type Handler struct {
 	cfg      Config
 	admitter *Admitter
 	proxy    *Proxy
+	reserve  ReserveHook
 	logger   *slog.Logger
 }
 
@@ -79,10 +90,14 @@ func NewHandler(d Deps) *Handler {
 	if d.OnComplete != nil {
 		p.SetOnComplete(d.OnComplete)
 	}
+	if d.OnReserve != nil {
+		p.SetOnReserve(d.OnReserve)
+	}
 	return &Handler{
 		cfg:      cfg,
 		admitter: NewAdmitter(d.Tokens, d.Models, d.Keys, d.CredentialKey, prefixes),
 		proxy:    p,
+		reserve:  d.OnReserve,
 		logger:   lg,
 	}
 }
@@ -198,6 +213,7 @@ func (h *Handler) handleProxy(w http.ResponseWriter, r *http.Request) {
 		UpstreamPath:  route.UpstreamPath,
 		Body:          body,
 		StripQueryKey: fromQuery || hasQueryParam(r.URL.RawQuery, "key"),
+		SessionID:     strings.TrimSpace(r.Header.Get("X-Session-Id")),
 	}
 	if route.ModelInPath {
 		p, err := rewritePathModel(r.URL.Path, dec.MagpieModel)
@@ -214,6 +230,28 @@ func (h *Handler) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 		prep.Body = rewritten
 		prep.StreamRequested = StreamRequested(body)
+	}
+
+	// 5.5) 预扣：准入 + 改写之后、发上游之前（此时才知道命中模型的售价与实际请求体）。
+	//      拒绝即不透传；句柄随请求带到结算回调，No-usage 时整笔退回（口径见 facadebill）。
+	if h.reserve != nil && route.Billable {
+		handle, deny := h.reserve(r.Context(), ReserveInput{
+			UserID:        prep.UserID,
+			TokenID:       prep.TokenID,
+			ExternalModel: prep.ExternalModel,
+			Protocol:      string(route.Protocol),
+			Endpoint:      route.Endpoint,
+			SessionID:     prep.SessionID,
+			RequestBody:   prep.Body,
+		})
+		if deny != nil {
+			h.logFor(r.Context()).Warn("代理预扣拒绝",
+				"endpoint", route.Endpoint, "model", prep.ExternalModel,
+				"status", deny.Status, "code", deny.Code)
+			WriteDeny(w, route.Protocol, *deny)
+			return
+		}
+		prep.Reservation = handle
 	}
 
 	// 6) 转发（响应字节原样回流；唯一例外是凭据回显遮蔽，见 proxy.go）。

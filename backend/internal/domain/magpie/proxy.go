@@ -58,18 +58,40 @@ type Result struct {
 
 	Duration time.Duration
 	Err      error
+
+	// RequestBody 是**改写后**的请求体（只给计费预扣估算输入规模用；只读，不许改写）。
+	RequestBody []byte
+	// SessionID 是入站会话标识（空 = 无会话）。
+	SessionID string
+	// Reservation 是入口预扣句柄（OnReserve 产出，原样带回给 OnComplete）。
+	Reservation any
 }
 
-// Hook 是转发结束回调（第③件的接入点：计费/退预扣/对账在这里接）。
-// 本件不注入（nil），因此不会产生任何账单或扣费动作。
+// ReserveInput 是预扣输入（准入 + 改写之后才拿得到：售价来自命中模型，规模来自实际请求体）。
+type ReserveInput struct {
+	UserID        int64
+	TokenID       int64
+	ExternalModel string
+	Protocol      string
+	Endpoint      string
+	SessionID     string
+	RequestBody   []byte
+}
+
+// ReserveHook 是预扣钩子：返回句柄（原样交回 Hook）或 Deny（拒绝转发）。
+type ReserveHook func(ctx context.Context, in ReserveInput) (any, *Deny)
+
+// Hook 是转发结束回调（计费结算 / 退预扣的落点）。
+// 注入 nil 时不产生任何账单或扣费动作。
 type Hook func(ctx context.Context, res Result)
 
 // Proxy 是无状态的转发执行器（并发安全）。
 type Proxy struct {
-	cfg   Config
-	plain *http.Client
-	sse   *http.Client
-	hook  Hook
+	cfg     Config
+	plain   *http.Client
+	sse     *http.Client
+	hook    Hook
+	reserve ReserveHook
 }
 
 // NewProxy 装配转发执行器：两个 client 只在「响应头超时」上不同
@@ -98,8 +120,11 @@ func NewProxy(cfg Config) *Proxy {
 	}
 }
 
-// SetOnComplete 注入转发结束回调（第③件使用；本件保持 nil）。
+// SetOnComplete 注入转发结束回调（计费结算 / 退预扣）。
 func (p *Proxy) SetOnComplete(fn Hook) { p.hook = fn }
+
+// SetOnReserve 注入预扣钩子（由 handler 在改写后调用，句柄经 Result 带回）。
+func (p *Proxy) SetOnReserve(fn ReserveHook) { p.reserve = fn }
 
 // Forward 执行一次转发。prep 是准入/改写后的产物。
 //
@@ -115,6 +140,9 @@ func (p *Proxy) Forward(w http.ResponseWriter, r *http.Request, route Route, pre
 		MagpieModel:   prep.MagpieModel,
 		CallerKeyName: prep.CallerKeyName,
 		Billable:      route.Billable,
+		RequestBody:   prep.Body,
+		SessionID:     prep.SessionID,
+		Reservation:   prep.Reservation,
 	}
 	defer func() {
 		res.Duration = time.Since(start)

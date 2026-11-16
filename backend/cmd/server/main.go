@@ -24,6 +24,7 @@ import (
 	"github.com/team/llmgateway/internal/domain/billing"
 	"github.com/team/llmgateway/internal/domain/calllog"
 	"github.com/team/llmgateway/internal/domain/console"
+	"github.com/team/llmgateway/internal/domain/facadebill"
 	"github.com/team/llmgateway/internal/domain/identity"
 	"github.com/team/llmgateway/internal/domain/ledgersettle"
 	"github.com/team/llmgateway/internal/domain/magpie"
@@ -411,6 +412,25 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 		cnyRate: billCfgProvider.CnyRate,
 	})
 
+	// facade 计费钩子（预扣 → 结算 / 退预扣）。口径：**无 usage 一律不计费**（整笔退预扣 +
+	// failed/no-usage 账单），估算只用于预扣，绝不出估算账。依赖不全时返回 nil → 不产生计费动作。
+	facadeBiller := facadebill.New(facadebill.Options{
+		Ledger: billSvc,
+		Wallet: creditSvc,
+		Pricer: facadeSaleRates{svc: modelSvc},
+		Logger: logr,
+	})
+	var (
+		facadeReserve  magpie.ReserveHook
+		facadeComplete magpie.Hook
+	)
+	if facadeBiller != nil {
+		facadeReserve = facadeBiller.Reserve
+		facadeComplete = facadeBiller.OnComplete
+	} else {
+		logr.Warn("facade 计费钩子未装配：/v1 转发不会产生账单与扣费")
+	}
+
 	// 代理侧 callerKey 映射的管理端入口：运维在 magpie 侧创建 callerKey 后录入灵枢
 	// （灵枢不自行签发凭据；未绑定的令牌在转发时返回 403 magpie_key_missing）。
 	magpieKeyAdmin := magpie.NewKeyAdminHandler(magpie.NewKeyStore(d), sm4Key)
@@ -425,6 +445,8 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 		Keys:          magpie.NewKeyStore(d),
 		CredentialKey: sm4Key,
 		Prefixes:      magpiePrefixes,
+		OnReserve:     facadeReserve,
+		OnComplete:    facadeComplete,
 		Logger:        logr,
 	})
 	if magpieHandler == nil {
@@ -683,6 +705,17 @@ func (a *creditHoldAdapter) ReserveHold(ctx context.Context, billingID string, u
 
 func (a *creditHoldAdapter) CloseHold(ctx context.Context, billingID, status, ledgerEntryID string) (bool, error) {
 	return a.svc.CloseHold(ctx, billingID, status, ledgerEntryID)
+}
+
+// facadeSaleRates 把 model.Service 适配为 facadebill.Pricer（售价 + 模型级时段/分档）。
+type facadeSaleRates struct{ svc *model.Service }
+
+func (a facadeSaleRates) SaleRatesFor(ctx context.Context, externalModel string) (billing.Rates, *billing.TimeCoeffConfig, []billing.TierRule, error) {
+	m, err := a.svc.GetByExternalName(ctx, externalModel)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return m.SaleRates, m.TimeConfig, m.ContextTiers, nil
 }
 
 // priceRefAdapter 把 sync.Syncer 适配为 model.PriceSource，供对外模型价格参考/应用售价接口使用。
