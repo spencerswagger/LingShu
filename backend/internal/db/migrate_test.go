@@ -295,8 +295,9 @@ func mustCallerFile(t *testing.T) string {
 //     这两样是被代码使用的对象，不是「旧分支遗留、期望 0 行」）；
 //  3. reconcile_windows 由 0023 持有：形状必须是 0023 的（PK=window_start + 四计数列），
 //     不是 0019b 建的（本文件不许出现这张表）；
-//  4. billing_records 三列**不在本批**：magpie_key_name / estimated / upstream_usage 必须缺失
-//     （无 usage 不计费、不做估算 → 没有写入方，加列只会让「没人写」看起来像「功能已在」）；
+//  4. billing_records 三列**不由本文件处理**（正文不出现 magpie_key_name / estimated / upstream_usage）。
+//     口径（2026-11-16 裁定）：本期**保留列、禁止写入** —— 历史库上这三列可能存在，那**不是缺陷**，
+//     「有没有写入方」由 TestBilling_LegacyColumnsHaveNoWriter 守；这里只断言 0019b 自己不去动它们；
 //  5. 可重复执行，重跑不报错、不改变结果。
 func TestMigrate_0019b_PassthroughCredentials(t *testing.T) {
 	tempDB := openTempDB(t)
@@ -374,10 +375,23 @@ func TestMigrate_0019b_PassthroughCredentials(t *testing.T) {
 		t.Fatalf("reconcile_windows 主键不是 (window_start)：0019_v2_facade 的旧形状又回来了？")
 	}
 
-	// 4) 账单三列不在本批。
-	assertColumn("billing_records", "magpie_key_name", 0)
-	assertColumn("billing_records", "estimated", 0)
-	assertColumn("billing_records", "upstream_usage", 0)
+	// 4) 账单三列：0019b 正文不许出现它们。
+	//    口径（2026-11-16 裁定）：本期保留列、禁止写入 —— 库上「列存在」不再是缺陷（旧分支可能已建，
+	//    阶段二按新形处理），所以这里不再断言「全链跑完必须缺列」，只断言本文件不去动 billing_records。
+	// 只看**非注释**正文：文件头部的注释会解释「这三列本期不用」，那是说明而不是改动。
+	var executable []string
+	for _, line := range strings.Split(string(body), "\n") {
+		if trimmed := strings.TrimSpace(line); strings.HasPrefix(trimmed, "--") {
+			continue
+		}
+		executable = append(executable, line)
+	}
+	stmtBody := strings.Join(executable, "\n")
+	for _, col := range []string{"magpie_key_name", "estimated", "upstream_usage"} {
+		if strings.Contains(stmtBody, col) {
+			t.Fatalf("0019b 必须对 billing_records 零改动，可执行正文却出现列名 %s", col)
+		}
+	}
 
 	var idx int
 	if err := tempDB.QueryRow(
