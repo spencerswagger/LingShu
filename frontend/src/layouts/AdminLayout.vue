@@ -16,6 +16,11 @@ import {
   Setting,
   Bell,
   Coin,
+  Share,
+  Box,
+  Notebook,
+  DataAnalysis,
+  TrendCharts,
 } from '@element-plus/icons-vue'
 
 const route = useRoute()
@@ -23,11 +28,19 @@ const router = useRouter()
 const auth = useAuthStore()
 
 // 管理端菜单
+// 管理端菜单
+// V2 新增五项（内部模型 / 订阅 / 账本 / 对账 / 盈亏）排在「统计」与「渠道」之间：
+// 它们是运营日常入口，且不依赖渠道族（渠道族在 V2 摘除）。
 const menus = [
   { path: '/admin/dashboard', title: '统计', icon: Odometer },
+  { path: '/admin/topology', title: '内部模型', icon: Share },
+  { path: '/admin/models', title: '模型', icon: Cpu },
+  { path: '/admin/subscriptions', title: '订阅', icon: Box },
+  { path: '/admin/ledger', title: '账本', icon: Notebook },
+  { path: '/admin/reconcile', title: '对账', icon: DataAnalysis },
+  { path: '/admin/pnl', title: '盈亏', icon: TrendCharts },
   { path: '/admin/service-status', title: '状态', icon: Monitor },
   { path: '/admin/channels', title: '渠道', icon: Connection },
-  { path: '/admin/models', title: '模型', icon: Cpu },
   { path: '/admin/tags', title: '标签', icon: PriceTag },
   { path: '/admin/users', title: '用户', icon: User },
   { path: '/admin/tokens', title: '令牌', icon: Key },
@@ -41,7 +54,21 @@ const menus = [
 function activeMenu() {
   // 子页（新建/编辑/详情）高亮所属列表菜单
   const p = route.path
-  for (const m of ['/admin/channels', '/admin/service-status', '/admin/models', '/admin/tags', '/admin/users', '/admin/tokens', '/admin/billings', '/admin/announcements']) {
+  for (const m of [
+    '/admin/channels',
+    '/admin/service-status',
+    '/admin/models',
+    '/admin/topology',
+    '/admin/subscriptions',
+    '/admin/ledger',
+    '/admin/reconcile',
+    '/admin/pnl',
+    '/admin/tags',
+    '/admin/users',
+    '/admin/tokens',
+    '/admin/billings',
+    '/admin/announcements',
+  ]) {
     if (p.startsWith(m)) return m
   }
   // 渠道协议为「渠道」页内切换的视图，归入「渠道」菜单高亮

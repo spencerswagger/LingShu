@@ -704,6 +704,9 @@ export interface ExternalModel {
   ContextTiers: ContextTier[] | null
   // 别名：仅用于模型名解析（请求命中任一别名即路由到本模型），不出现在 /v1/models
   Aliases?: string[]
+  // V2 绑定：绑定真源（external_models.bound_internal_ref，0019 加列）。
+  // undefined = 后端还没返回该列（V2 未上线）；null = 已上线但未绑定 → 不售卖。
+  BoundInternalRef?: string | null
   CreatedAt: string
   UpdatedAt: string
 }
@@ -901,6 +904,15 @@ export interface AdminBillingItem {
   RequestID?: string
   // 该请求共产生的账单条数（>1 = 发生过候选/上游重试；Group=0 可展开子记录）
   Attempts?: number
+  // ===== V2 归因（0020 加列；老后端不返回 → undefined）=====
+  // 渠道维度在 V2 被 upstream_provider/upstream_account 取代：渠道族表在 0024 删除，
+  // 历史行这两列为 null（不猜），前端显示「未归因」而不是留空或填 0。
+  UpstreamProvider?: string | null
+  UpstreamAccount?: string | null
+  UpstreamProtocol?: string | null
+  UpstreamModel?: string | null
+  // 成本来源：ledger（账本实付）| amortized（订阅摊销）| none（无口径）；历史行为 null
+  CostSource?: string | null
 }
 // 账单列表。语义变更（后端 PR #63 起，已拍板）：列表默认按 request_id 归并成「一次请求一行」，
 // 因此返回的 Total 是**请求数**（不是账单行数）；Group=0 退回逐条展示（展开子记录用），
@@ -1081,11 +1093,21 @@ export interface SessionCostConfig {
 export interface RoutingConfigData {
   SessionCost: SessionCostConfig
 }
+// V2 上游三键（sys_configs）：base_url / timeouts / degrade.{passthrough,ledger,sync}
+// + 订阅池前缀名单。老后端不返回该块 → undefined（页面显示「V2 配置未上线」，不显示 0/false）。
+export interface UpstreamConfigData {
+  base_url?: string
+  timeouts?: { stream_first_byte_ms?: number; stream_idle_ms?: number }
+  degrade?: { passthrough_enabled?: boolean; ledger_enabled?: boolean; sync_enabled?: boolean }
+  subscription_prefixes?: string[]
+}
+
 export interface SystemConfigData {
   Billing: BillingConfigData
   Routing: RoutingConfigData
   SessionExpiration: SessionExpirationData
   UpstreamResponseHeaderWhitelist: string[]
+  Upstream?: UpstreamConfigData
 }
 export function getSystemConfig() {
   return http.get<SystemConfigData, ApiRes<SystemConfigData>>('/admin/configs/system')

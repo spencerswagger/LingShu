@@ -17,17 +17,21 @@ import {
   type SessionCostConfig,
   type SessionExpirationData,
   type SystemConfigPayload,
+  type UpstreamConfigData,
   type ChannelProtocolPack,
 } from '@/api/admin'
 import ModelPricing from '@/components/ModelPricing.vue'
 import ErrorBubble from '@/components/ErrorBubble.vue'
 
 // ===== tab =====
-type TabKey = 'billing' | 'routing' | 'gateway' | 'ops'
+type TabKey = 'billing' | 'routing' | 'gateway' | 'upstream' | 'ops'
 const TABS: { key: TabKey; label: string }[] = [
   { key: 'billing', label: '计费' },
   { key: 'routing', label: '路由' },
   { key: 'gateway', label: '网关' },
+  // 「上游（V2）」目前只读：三个键（base_url / timeouts / degrade 三开关 + 订阅池前缀）
+  // 的写入白名单还没在后端开放，先只读展示，避免「填了保存成功但其实没写」。
+  { key: 'upstream', label: '上游（V2）' },
   // 「运维」没有 sys_configs 字段，放的是非配置类能力（渠道协议备份/恢复），因此没有保存按钮
   { key: 'ops', label: '运维' },
 ]
@@ -69,6 +73,10 @@ const sessionCost = ref<SessionCostConfig>({
   fallback_note: '',
 })
 const advancedOpen = ref<string[]>([]) // 「高级参数」折叠区，默认收起
+
+// ===== 上游（V2）tab：只读 =====
+// undefined = 后端还没返回该块（V2 键未上线）；空对象 = 上线了但没配过。
+const upstream = ref<UpstreamConfigData | null | undefined>(undefined)
 
 // ===== 网关 tab（会话过期 + 上游响应头白名单）=====
 const sessionExpiration = ref<SessionExpirationData>({ default_ttl_minutes: 5, context_tiers: [], turn_tiers: [] })
@@ -116,8 +124,9 @@ const gatewayPayload = computed(() => ({
 }))
 
 // 有配置字段的三个 tab（运维 tab 不写 sys_configs，不参与脏判定/保存）
-type ConfigTab = Exclude<TabKey, 'ops'>
-const isConfigTab = (t: TabKey): t is ConfigTab => t !== 'ops'
+// 有 sys_configs 字段、可保存的页签（upstream / ops 目前只读）
+type ConfigTab = Exclude<TabKey, 'ops' | 'upstream'>
+const isConfigTab = (t: TabKey): t is ConfigTab => t !== 'ops' && t !== 'upstream'
 
 const snap = ref<Record<ConfigTab, string>>({ billing: '', routing: '', gateway: '' })
 const payloadOf = (tab: ConfigTab) =>
@@ -158,6 +167,7 @@ async function load() {
       turn_tiers: se?.turn_tiers || [],
     }
     whitelist.value = res.Data.UpstreamResponseHeaderWhitelist || []
+    upstream.value = res.Data.Upstream ?? null
 
     // 快照必须在状态写完后再取，否则首屏就被判成「有改动」
     snap.value = {
@@ -195,7 +205,7 @@ function validateTab(tab: ConfigTab): string | null {
 }
 
 async function saveTab(tab: TabKey = activeTab.value) {
-  if (!isConfigTab(tab)) return // 运维 tab 没有可保存的配置字段
+  if (!isConfigTab(tab)) return // 运维 / 上游(V2) 页签当前没有可保存的配置字段
   const bad = validateTab(tab)
   if (bad) {
     ElMessage.warning(bad)
@@ -641,6 +651,65 @@ async function onFileChange(ev: Event) {
             </div>
           </el-tab-pane>
 
+          <!-- ④ 上游（V2）：只读展示三个键 + 订阅池前缀名单（写入白名单待 Core 开放） -->
+          <el-tab-pane name="upstream">
+            <template #label>
+              <span class="tab-label">上游（V2）</span>
+            </template>
+
+            <div class="config-block">
+              <div class="block-title">上游接入</div>
+              <div class="block-desc">
+                运行期唯一数据源是这三个键（不读应用配置文件/环境变量）。凭据不落在这里——上游鉴权头值由装配层逐请求注入。
+              </div>
+
+              <el-alert
+                type="info"
+                :closable="false"
+                show-icon
+                title="本页签当前只读"
+                description="写入白名单（upstream.base_url / upstream.timeouts / upstream.degrade.*）还没在后端开放，先只读展示；开放后在此直接编辑。"
+              />
+
+              <template v-if="upstream">
+                <div class="form-row">
+                  <span class="label">网关基址</span>
+                  <code class="ro-value">{{ upstream.base_url || '未配置（未配置时 /v1 保持 410）' }}</code>
+                </div>
+                <div class="form-row">
+                  <span class="label">流式首包上限</span>
+                  <code class="ro-value">{{ upstream.timeouts?.stream_first_byte_ms ?? '—' }} ms</code>
+                </div>
+                <div class="form-row">
+                  <span class="label">流式空闲上限</span>
+                  <code class="ro-value">{{ upstream.timeouts?.stream_idle_ms ?? '—' }} ms</code>
+                </div>
+                <div class="form-row">
+                  <span class="label">降级开关</span>
+                  <span class="ro-tags">
+                    <el-tag :type="upstream.degrade?.passthrough_enabled ? 'success' : 'danger'" size="small" effect="plain">
+                      透传 {{ upstream.degrade?.passthrough_enabled ? '开' : '停' }}
+                    </el-tag>
+                    <el-tag :type="upstream.degrade?.ledger_enabled ? 'success' : 'danger'" size="small" effect="plain">
+                      账本 {{ upstream.degrade?.ledger_enabled ? '开' : '停' }}
+                    </el-tag>
+                    <el-tag :type="upstream.degrade?.sync_enabled ? 'success' : 'danger'" size="small" effect="plain">
+                      同步 {{ upstream.degrade?.sync_enabled ? '开' : '停' }}
+                    </el-tag>
+                  </span>
+                </div>
+                <div class="form-row">
+                  <span class="label">订阅池前缀</span>
+                  <span class="ro-tags">
+                    <el-tag v-for="p in upstream.subscription_prefixes || []" :key="p" size="small" effect="plain">{{ p }}</el-tag>
+                    <span v-if="!(upstream.subscription_prefixes || []).length" class="ro-empty">未配置（回落默认名单，方向是继续拦截）</span>
+                  </span>
+                </div>
+              </template>
+              <el-empty v-else description="V2 上游配置块未返回：后端该块未上线" :image-size="60" />
+            </div>
+          </el-tab-pane>
+
           <!-- ④ 运维：非配置类能力（渠道协议备份/恢复），没有 sys_configs 字段、也没有保存按钮 -->
           <el-tab-pane name="ops">
             <template #label>
@@ -696,6 +765,23 @@ async function onFileChange(ev: Event) {
   display: flex;
   flex-direction: column;
   min-height: 100%;
+}
+.ro-value {
+  font-size: 13px;
+  color: var(--color-text);
+  background: #f7f8fb;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-s);
+  padding: 2px 8px;
+}
+.ro-tags {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.ro-empty {
+  font-size: 12px;
+  color: var(--color-text-tertiary);
 }
 .system-body {
   flex: 1;

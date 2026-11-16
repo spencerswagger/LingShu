@@ -23,6 +23,13 @@ const list = ref<ExternalModel[]>([])
 const errInfo = ref<{ message: string; requestId: string }>({ message: '', requestId: '' })
 const selected = ref<ExternalModel[]>([])
 
+// V2 绑定列是否可用：后端返回了 BoundInternalRef 才渲染（未上线时不新增列，页面保持原样）。
+// 口径：NULL = 未绑定 = 不售卖（`/v1/models` 不可见、请求 404），所以未绑定的启用行必须显式提示。
+const hasBinding = computed(() => list.value.some((m) => m.BoundInternalRef !== undefined))
+const unboundEnabled = computed(
+  () => list.value.filter((m) => m.Enabled && m.BoundInternalRef !== undefined && !m.BoundInternalRef).length,
+)
+
 const filters = reactive({
   q: '',
   enabled: undefined as string | undefined,
@@ -176,6 +183,16 @@ async function onSyncPrices() {
       <el-button v-if="!isSelf" type="primary" @click="router.push('/admin/models/create')">新建</el-button>
     </div>
 
+    <el-alert
+      v-if="hasBinding && unboundEnabled > 0"
+      class="bind-alert"
+      type="error"
+      :closable="false"
+      show-icon
+      title="有启用中的对外模型未绑定内部模型"
+      :description="`${unboundEnabled} 个：V2 契约按「启用且已绑定」过滤，未绑定的模型不会出现在 /v1/models，客户端请求直接 404。上线前置项要求这个数为 0。`"
+    />
+
     <div v-loading="loading" class="card">
       <el-table
         :data="displayList"
@@ -204,6 +221,14 @@ async function onSyncPrices() {
               <span class="t-date">{{ row.ExternalName }}</span>
               <span class="t-clock ellipsis">{{ row.Description || '-' }}</span>
             </div>
+          </template>
+        </el-table-column>
+        <el-table-column v-if="hasBinding" label="内部模型绑定" min-width="180">
+          <template #default="{ row }">
+            <span v-if="row.BoundInternalRef" class="bound-ref">{{ row.BoundInternalRef }}</span>
+            <el-tag v-else type="danger" size="small" effect="plain" title="未绑定 = 不售卖：/v1/models 不可见，请求 404">
+              未绑定 · 不售卖
+            </el-tag>
           </template>
         </el-table-column>
         <el-table-column label="售价·输入" width="110" align="right">

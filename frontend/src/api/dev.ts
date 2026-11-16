@@ -107,6 +107,14 @@ export interface BillingItem {
   RequestID?: string
   // 该请求共产生的账单条数（>1 表示发生过候选/上游重试；列表已归并成一行）
   Attempts?: number
+  // ===== V2 归因（0020 加列；老后端不返回这些键 → undefined，页面据此决定是否渲染）=====
+  // upstream_*：回程头/账本读到的上游身份，缺失为 null（不猜）；历史行全为 null。
+  UpstreamProvider?: string | null
+  UpstreamAccount?: string | null
+  UpstreamProtocol?: string | null
+  UpstreamModel?: string | null
+  // 成本来源：ledger | amortized | none；历史行为 null（口径未知，禁止用 0 填充）
+  CostSource?: string | null
 }
 
 // 本人账单列表（支持时间区间 From/To，RFC3339；RequestID 按请求链路 ID 定位，Group=0 展开逐条尝试）
@@ -182,6 +190,14 @@ export interface BillingDetail {
   RouteDiff?: RouteDiff | null
   InternalModelID?: string
   ChannelName?: string
+  // V2 归因与成本来源（0020 加列，老后端不返回 → undefined）
+  UpstreamProvider?: string | null
+  UpstreamAccount?: string | null
+  UpstreamProtocol?: string | null
+  UpstreamModel?: string | null
+  CostSource?: string | null
+  // 账本关联：ledger_entries.ledger_id（一对一，部分唯一索引保证）
+  LedgerEntryID?: string | null
   CallLog?: CallLogView | null
 }
 

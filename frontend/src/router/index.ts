@@ -27,6 +27,13 @@ const router = createRouter({
           component: () => import('@/views/StatsDashboard.vue'),
           meta: { title: '统计' },
         },
+        // ===== V2 运营台（阶段三）=====
+        // 与阶段二后端接口一一对应；接口未上线时页面自行出空态（不弹红条、不显示 0）。
+        { path: 'topology', name: 'admin-topology', component: () => import('@/views/admin/v2/Topology.vue'), meta: { title: '内部模型' } },
+        { path: 'subscriptions', name: 'admin-subscriptions', component: () => import('@/views/admin/v2/Subscriptions.vue'), meta: { title: '订阅' } },
+        { path: 'ledger', name: 'admin-ledger', component: () => import('@/views/admin/v2/Ledger.vue'), meta: { title: '账本' } },
+        { path: 'reconcile', name: 'admin-reconcile', component: () => import('@/views/admin/v2/Reconcile.vue'), meta: { title: '对账' } },
+        { path: 'pnl', name: 'admin-pnl', component: () => import('@/views/admin/v2/Pnl.vue'), meta: { title: '盈亏' } },
         // 渠道（列表内含「渠道 / 渠道协议」页内切换）
         { path: 'channels', name: 'admin-channels', component: () => import('@/views/admin/ChannelsPage.vue'), meta: { title: '渠道' } },
         { path: 'channels/create', name: 'admin-channel-create', component: () => import('@/views/admin/ChannelCreate.vue'), meta: { title: '新建渠道' } },

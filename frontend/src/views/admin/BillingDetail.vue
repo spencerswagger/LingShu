@@ -4,6 +4,7 @@ import { useRoute } from 'vue-router'
 import { getBilling } from '@/api/admin'
 import type { BillingDetail } from '@/api/dev'
 import StatusTag from '@/components/StatusTag.vue'
+import StatusPill from '@/components/v2/StatusPill.vue'
 import ErrorBubble from '@/components/ErrorBubble.vue'
 import CallLogPanel from '@/components/CallLogPanel.vue'
 import { useIsNarrow } from '@/composables/useIsNarrow'
@@ -89,7 +90,19 @@ function fmt(n: number | undefined) {
               {{ detail.PricingMode === 'cost' ? '按成本' : '按售价' }}
             </el-tag>
           </el-descriptions-item>
-          <el-descriptions-item label="状态"><StatusTag :value="detail.Status" /></el-descriptions-item>
+          <el-descriptions-item label="状态"><StatusTag :value="detail.Status" /></el-descriptions-item>          <!-- V2 归因（0020 加列）：后端返回了才展示；历史行 upstream_* 为 null → 显示「未归因」，
+               不填 0、不推断。渠道族表在 0024 删除，这一块取代老的「渠道」维度。 -->
+          <template v-if="detail.UpstreamProvider !== undefined || detail.CostSource !== undefined">
+            <el-descriptions-item label="上游供应商">{{ detail.UpstreamProvider || '未归因' }}</el-descriptions-item>
+            <el-descriptions-item label="上游账号">{{ detail.UpstreamAccount || '未归因' }}</el-descriptions-item>
+            <el-descriptions-item label="上游协议">{{ detail.UpstreamProtocol || '—' }}</el-descriptions-item>
+            <el-descriptions-item label="成本来源">
+              <StatusPill domain="costSource" :value="detail.CostSource || 'none'" />
+              <span v-if="!detail.CostSource" class="attr-hint">历史行无成本口径，不要与新区间同图比较</span>
+            </el-descriptions-item>
+            <el-descriptions-item label="账本条目">{{ detail.LedgerEntryID || '未关联' }}</el-descriptions-item>
+          </template>
+
           <el-descriptions-item v-if="detail.CallLog" label="响应类型">
             <el-tag :type="respKindType(detail.CallLog.RespKind)" size="small" effect="plain">
               {{ respKindLabel(detail.CallLog.RespKind) }}
@@ -148,6 +161,11 @@ function fmt(n: number | undefined) {
 </template>
 
 <style scoped>
+.attr-hint {
+  margin-left: 8px;
+  font-size: 12px;
+  color: var(--color-text-tertiary);
+}
 .calc-steps {
   display: grid;
   gap: 14px;

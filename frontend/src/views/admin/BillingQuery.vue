@@ -22,6 +22,7 @@ import ErrorBubble from '@/components/ErrorBubble.vue'
 import UserSelect from '@/components/UserSelect.vue'
 import ColumnFilter from '@/components/ColumnFilter.vue'
 import FilterBar from '@/components/FilterBar.vue'
+import StatusPill from '@/components/v2/StatusPill.vue'
 import { fmtDate, fmtTime } from '@/utils/format'
 import { resolveBillingRange } from '@/utils/range'
 import { useIsNarrow } from '@/composables/useIsNarrow'
@@ -44,6 +45,11 @@ const total = ref(0)
 const page = ref(1)
 const size = ref(20)
 const errInfo = ref<{ message: string; requestId: string }>({ message: '', requestId: '' })
+
+// V2 归因列是否渲染：后端返回了 UpstreamProvider / CostSource 才出现（老后端页面保持原样）
+const hasAttribution = computed(() =>
+  list.value.some((r) => r.UpstreamProvider !== undefined || r.CostSource !== undefined),
+)
 
 const stats = ref<BillingStats>({
   Requests: 0,
@@ -881,6 +887,21 @@ function sessionLabel(s: AdminSession): string {
             <div class="t-time">
               <span class="t-date">{{ rowChannelLabel(row) }}</span>
               <span v-if="!isSelf" class="t-clock">{{ keyLabel(row) }}</span>
+            </div>
+          </template>
+        </el-table-column>
+
+        <!-- V2 归因：渠道族在 0024 删除后，渠道/密钥维度由 upstream_provider/account 取代 -->
+        <el-table-column v-if="hasAttribution" label="归因 / 成本来源" min-width="180">
+          <template #default="{ row }">
+            <div class="t-time">
+              <span class="t-date">
+                <template v-if="row.UpstreamProvider">
+                  {{ row.UpstreamProvider }}<template v-if="row.UpstreamAccount"> / {{ row.UpstreamAccount }}</template>
+                </template>
+                <span v-else class="t-clock">未归因</span>
+              </span>
+              <span class="t-clock"><StatusPill domain="costSource" :value="row.CostSource || 'none'" /></span>
             </div>
           </template>
         </el-table-column>
