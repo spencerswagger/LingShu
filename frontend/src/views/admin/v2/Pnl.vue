@@ -6,6 +6,8 @@
 //   成本 = Σ cost_credits，按 cost_source 拆「账本实付（变动）+ 订阅摊销（固定）」
 //   毛利 = 收入 − 成本；收入 ≤ 0 时毛利率返回 null（后端刻意不返回 0，前端不许显示成 0%）
 //   Uncosted = 成本为 NULL 的请求数：> 0 表示这批账单还没有成本口径，毛利偏高 → 必须提示
+//   Unconfigured / NoneCost 是它的两段拆分，后端可能不返回 → 页面显式「未测算」，**不许渲染成 0**；
+//   两段只解释构成，不参与收入/成本/毛利的任何加总（合计只认后端返回的 Revenue/Cost/Margin）。
 import { computed, onMounted, ref } from 'vue'
 import { getPnl, type PnlGroupBy, type PnlView } from '@/api/v2'
 import { mockPnl } from '@/mock/pnl'
@@ -49,6 +51,19 @@ function money(v: number | null): string {
 }
 function pct(v: number | null): string {
   return v == null ? '—' : `${(v * 100).toFixed(2)}%`
+}
+// 缺失值计数：后端不返回该拆分时显式「未测算」，绝不渲染成 0（0 笔 ≠ 未测算）
+function count(v: number | null): string {
+  return v == null ? '未测算' : fmtCompact(v)
+}
+// 拆分明细的提示语：任一段缺失就明确说「未测算」，不参与加总（两者只是 Uncosted 的构成说明，不进毛利计算）
+function uncostedHint(d: PnlView): string {
+  if (d.Uncosted <= 0) return '全部请求都有成本口径'
+  const parts: string[] = []
+  parts.push(d.Unconfigured == null ? '「历史未配置」未测算' : `「历史未配置」${count(d.Unconfigured)} 笔（cost_source IS NULL）`)
+  parts.push(d.NoneCost == null ? '「明确无口径」未测算' : `「明确无口径」${count(d.NoneCost)} 笔（none）`)
+  const missing = d.Unconfigured == null || d.NoneCost == null
+  return `${parts.join('、')}${missing ? '；缺失项未计入任何合计' : ''} → 毛利虚高`
 }
 
 // 依赖徽标：拿到真实数据才标「已定型」，避免接口没上线时给出错误预期
@@ -119,10 +134,7 @@ const stats = computed<StatItem[]>(() => {
       label: '无成本口径请求',
       value: fmtCompact(d.Uncosted),
       tone: uncostedTone,
-      hint:
-        d.Uncosted > 0
-          ? `其中「历史未配置」${fmtCompact(d.Unconfigured)} 笔（cost_source IS NULL）、「明确无口径」${fmtCompact(d.NoneCost)} 笔（none）→ 毛利虚高`
-          : '全部请求都有成本口径',
+      hint: uncostedHint(d),
     },
   ]
 })
@@ -189,7 +201,7 @@ const chartOption = computed(() => {
         :closable="false"
         show-icon
         title="毛利偏高：存在没有成本口径的请求"
-        :description="`${fmtCompact(data.Uncosted)} 笔请求的 cost_credits 为空（历史未配置 ${fmtCompact(data.Unconfigured)} / 明确无口径 ${fmtCompact(data.NoneCost)}）。这些请求只计收入、不计成本，算出来的毛利不能当真实毛利。点右侧按钮按「成本来源=未配置」筛账单。`"
+        :description="`${fmtCompact(data.Uncosted)} 笔请求的 cost_credits 为空（历史未配置 ${count(data.Unconfigured)} / 明确无口径 ${count(data.NoneCost)}）。这些请求只计收入、不计成本，算出来的毛利不能当真实毛利。点右侧按钮按「成本来源=未配置」筛账单。`"
       >
         <template #default>
           <el-button size="small" @click="$router.push('/admin/billings?cost_source=unconfigured')">

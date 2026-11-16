@@ -141,10 +141,11 @@ export interface PnlView {
   MarginPct: number | null
   // Uncosted = 没有成本口径的请求总数（M5 要求拆成两段，语义不同，页面不许合并成 0）
   Uncosted: number
-  // Unconfigured = cost_source IS NULL（历史行，口径未知）
-  Unconfigured: number
-  // NoneCost = cost_source='none'（明确没有成本口径）
-  NoneCost: number
+  // Unconfigured = cost_source IS NULL（历史行，口径未知）。
+  // null = 后端未返回该拆分（未测算）——**不许当 0 渲染**，否则「未测算」看起来像「成本为零」。
+  Unconfigured: number | null
+  // NoneCost = cost_source='none'（明确没有成本口径）；同样可能是 null（未测算）。
+  NoneCost: number | null
   Groups: PnlRow[]
   Truncated: boolean
 }
@@ -161,8 +162,8 @@ export function normalizePnl(raw: Record<string, unknown>): PnlView {
     Margin: num(pick(raw, 'Margin', 'margin')),
     MarginPct: numOrNull(pick(raw, 'MarginPct', 'margin_pct')),
     Uncosted: num(pick(raw, 'Uncosted', 'uncosted')),
-    Unconfigured: num(pick(raw, 'Unconfigured', 'unconfigured')),
-    NoneCost: num(pick(raw, 'NoneCost', 'none_cost')),
+    Unconfigured: numOrNull(pick(raw, 'Unconfigured', 'unconfigured')),
+    NoneCost: numOrNull(pick(raw, 'NoneCost', 'none_cost')),
     Truncated: Boolean(pick(raw, 'Truncated', 'truncated')),
     Groups: arr(pick(raw, 'Groups', 'groups')).map((g) => ({
       Key: str(pick(g, 'Key', 'key')),

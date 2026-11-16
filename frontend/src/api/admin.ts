@@ -162,7 +162,7 @@ export interface ExternalModel {
   // 别名：仅用于模型名解析（请求命中任一别名即路由到本模型），不出现在 /v1/models
   Aliases?: string[]
   // V2 绑定：绑定真源（external_models.bound_internal_ref，0019 加列）。
-  // undefined = 后端还没返回该列（V2 未上线）；null = 已上线但未绑定 → 不售卖。
+  // undefined = 后端还没返回该列（V2 未上线）；null = 已上线但未绑定（绑定能力未上线，当前不拦截）。
   BoundInternalRef?: string | null
   CreatedAt: string
   UpdatedAt: string

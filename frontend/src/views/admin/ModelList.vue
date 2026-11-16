@@ -24,7 +24,10 @@ const errInfo = ref<{ message: string; requestId: string }>({ message: '', reque
 const selected = ref<ExternalModel[]>([])
 
 // V2 绑定列是否可用：后端返回了 BoundInternalRef 才渲染（未上线时不新增列，页面保持原样）。
-// 口径：NULL = 未绑定 = 不售卖（`/v1/models` 不可见、请求 404），所以未绑定的启用行必须显式提示。
+// 口径（2026-11-16 Owl 复审裁定）：本批**不拦截**，且绑定能力**尚未上线**——全仓 0 处写
+// `bound_internal_ref`（只有迁移建列 + 部分索引，注释写明只读）。因此页面只能说事实：
+// 「未绑定」，不写「不售卖 / 请求 404」，也不承诺系统会拦；否则运维分不清
+// 「真没绑」和「绑定功能还没做」。
 const hasBinding = computed(() => list.value.some((m) => m.BoundInternalRef !== undefined))
 const unboundEnabled = computed(
   () => list.value.filter((m) => m.Enabled && m.BoundInternalRef !== undefined && !m.BoundInternalRef).length,
@@ -189,8 +192,8 @@ async function onSyncPrices() {
       type="error"
       :closable="false"
       show-icon
-      title="有启用中的对外模型未绑定内部模型"
-      :description="`${unboundEnabled} 个：V2 契约按「启用且已绑定」过滤，未绑定的模型不会出现在 /v1/models，客户端请求直接 404。上线前置项要求这个数为 0。`"
+      title="有启用中的对外模型未绑定内部模型（仅提示，不拦截）"
+      :description="`${unboundEnabled} 个：绑定能力尚未上线，当前不拦截、不影响调用；等绑定功能上线后再要求这个数为 0。`"
     />
 
     <div v-loading="loading" class="card">
@@ -226,8 +229,8 @@ async function onSyncPrices() {
         <el-table-column v-if="hasBinding" label="内部模型绑定" min-width="180">
           <template #default="{ row }">
             <span v-if="row.BoundInternalRef" class="bound-ref">{{ row.BoundInternalRef }}</span>
-            <el-tag v-else type="danger" size="small" effect="plain" title="未绑定 = 不售卖：/v1/models 不可见，请求 404">
-              未绑定 · 不售卖
+            <el-tag v-else type="info" size="small" effect="plain" title="未绑定内部模型：绑定能力尚未上线，当前不拦截">
+              未绑定
             </el-tag>
           </template>
         </el-table-column>

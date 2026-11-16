@@ -54,7 +54,7 @@ const stats = computed<StatItem[]>(() => {
       label: '未绑定内部模型的对外模型',
       value: fmtCompact(d.UnboundExternal),
       tone: d.UnboundExternal > 0 ? 'danger' : 'ok',
-      hint: '未绑定 = 不售卖（客户端请求 404）',
+      hint: '绑定能力尚未上线，当前不拦截；此处只作事实展示',
     },
     { label: '最后同步', value: d.SyncedAt ? fmtDateTime(d.SyncedAt) : '—', hint: '镜像每轮同步刷新 last_seen_at' },
   ]
