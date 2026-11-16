@@ -5,10 +5,7 @@ import { useAuthStore } from '@/stores/auth'
 import UserPanel from '@/components/UserPanel.vue'
 import {
   Odometer,
-  Connection,
-  Monitor,
   Cpu,
-  PriceTag,
   User,
   Key,
   ChatDotRound,
@@ -16,6 +13,11 @@ import {
   Setting,
   Bell,
   Coin,
+  Share,
+  Box,
+  Notebook,
+  DataAnalysis,
+  TrendCharts,
 } from '@element-plus/icons-vue'
 
 const route = useRoute()
@@ -23,12 +25,16 @@ const router = useRouter()
 const auth = useAuthStore()
 
 // 管理端菜单
+// V2 新增五项（内部模型 / 订阅 / 账本 / 对账 / 盈亏）紧跟「统计」：运营日常入口，且不依赖渠道族。
+// 渠道 / 渠道协议 / 标签 / 状态四项已整体下线（接口 410、表已删，页面文件已删除），菜单同步摘除。
 const menus = [
   { path: '/admin/dashboard', title: '统计', icon: Odometer },
-  { path: '/admin/service-status', title: '状态', icon: Monitor },
-  { path: '/admin/channels', title: '渠道', icon: Connection },
+  { path: '/admin/topology', title: '内部模型', icon: Share },
   { path: '/admin/models', title: '模型', icon: Cpu },
-  { path: '/admin/tags', title: '标签', icon: PriceTag },
+  { path: '/admin/subscriptions', title: '订阅', icon: Box },
+  { path: '/admin/ledger', title: '账本', icon: Notebook },
+  { path: '/admin/reconcile', title: '对账', icon: DataAnalysis },
+  { path: '/admin/pnl', title: '盈亏', icon: TrendCharts },
   { path: '/admin/users', title: '用户', icon: User },
   { path: '/admin/tokens', title: '令牌', icon: Key },
   { path: '/admin/sessions', title: '会话', icon: ChatDotRound },
@@ -41,13 +47,21 @@ const menus = [
 function activeMenu() {
   // 子页（新建/编辑/详情）高亮所属列表菜单
   const p = route.path
-  for (const m of ['/admin/channels', '/admin/service-status', '/admin/models', '/admin/tags', '/admin/users', '/admin/tokens', '/admin/billings', '/admin/announcements']) {
+  for (const m of [
+    '/admin/models',
+    '/admin/topology',
+    '/admin/subscriptions',
+    '/admin/ledger',
+    '/admin/reconcile',
+    '/admin/pnl',
+    '/admin/users',
+    '/admin/tokens',
+    '/admin/billings',
+    '/admin/announcements',
+  ]) {
     if (p.startsWith(m)) return m
   }
-  // 渠道协议为「渠道」页内切换的视图，归入「渠道」菜单高亮
-  if (p.startsWith('/admin/channel-protocols')) return '/admin/channels'
-  // Auto 模型为「模型」页内切换的视图，归入「模型」菜单高亮
-  if (p.startsWith('/admin/auto-models')) return '/admin/models'
+  // Auto 模型族已下线（老书签由路由 redirect 兜底到模型列表），无需再映射高亮
   if (p.startsWith('/admin/system')) return '/admin/system'
   return p
 }

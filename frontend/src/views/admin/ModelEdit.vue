@@ -1,15 +1,11 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import {
   listExternalModels,
   updateExternalModel,
-  listAllChannelModels,
-  rateKeys,
-  rateLabels,
   type ExternalModel,
-  type ChannelModel,
 } from '@/api/admin'
 import ModelPricing from '@/components/ModelPricing.vue'
 import ModelPriceCatalog from '@/components/ModelPriceCatalog.vue'
@@ -44,50 +40,10 @@ function onApplyCatalog(partial: Record<string, number>) {
   pricing.SaleRates = { ...pricing.SaleRates, ...partial }
 }
 
-// ---- 从内部模型同步定价（售价 / 时段 / 分档） ----
-const syncOpen = ref(false)
-const syncLoading = ref(false)
-const channelModels = ref<ChannelModel[]>([])
-const syncOnlyBound = ref(true) // 仅显示本对外模型绑定的内部模型
-const syncSourceId = ref<string | null>(null)
-
-// 绑定到当前对外模型的内部模型
-const boundItems = computed(() =>
-  channelModels.value.filter((i) => String(i.ExternalModelID) === String(id)),
-)
-// 候选来源：优先本对外模型绑定的内部模型；该模型未绑定时回退全部内部模型
-const sourceOptions = computed(() => (syncOnlyBound.value ? boundItems.value : channelModels.value))
-const syncSource = computed(() => sourceOptions.value.find((i) => i.ID === syncSourceId.value) || null)
-
-function fmtRate(v: number | undefined): string {
-  return v == null ? '-' : String(Math.round(Number(v) * 1e6) / 1e6)
-}
-
-async function openSyncFromInternal() {
-  syncOpen.value = true
-  syncLoading.value = true
-  syncSourceId.value = null
-  try {
-    const res = await listAllChannelModels()
-    channelModels.value = res.Data || []
-    // 未绑定任何内部模型时：控件置灰并自动切换为「全部内部模型」
-    syncOnlyBound.value = boundItems.value.length > 0
-  } catch (e: any) {
-    ElMessage.error(e?.message || '加载内部模型失败')
-  } finally {
-    syncLoading.value = false
-  }
-}
-
-function onSyncFromInternal() {
-  const src = sourceOptions.value.find((i) => i.ID === syncSourceId.value)
-  if (!src) return ElMessage.warning('请选择要同步的内部模型')
-  pricing.SaleRates = { ...(src.CostRates || {}) }
-  pricing.TimeConfig = src.TimeConfig ? JSON.parse(JSON.stringify(src.TimeConfig)) : null
-  pricing.ContextTiers = src.ContextTiers ? JSON.parse(JSON.stringify(src.ContextTiers)) : null
-  syncOpen.value = false
-  ElMessage.success('已用内部模型定价覆盖售价、时段与分档')
-}
+// ---- 「从内部模型同步定价」能力已下线 ----
+// 原实现读 `channel_models.CostRates`（渠道族成本层，0024 已删表、接口 410）。
+// V2 的成本口径只有 ledger / amortized / none，不再有「按渠道成本同步售价」这一套；
+// 售价维护改为：手填 / 「从 models.dev 获取参考价」两条路。
 
 onMounted(async () => {
   loading.value = true
@@ -169,9 +125,6 @@ async function onSubmit() {
               <el-button size="small" @click="catalogRef?.open()">
                 从 models.dev 获取参考价
               </el-button>
-              <el-button size="small" @click="openSyncFromInternal">
-                从内部模型同步定价
-              </el-button>
             </template>
           </ModelPricing>
         </div>
@@ -197,50 +150,6 @@ async function onSubmit() {
       @apply="onApplyCatalog"
     />
 
-    <!-- 从内部模型同步定价：售价 / 时段 / 分档整体覆盖 -->
-    <el-dialog v-model="syncOpen" title="从内部模型同步定价" width="720px">
-      <div v-loading="syncLoading" class="sync-body">
-        <el-alert
-          v-if="!syncLoading && !boundItems.length"
-          type="info"
-          :closable="false"
-          show-icon
-          title="该对外模型尚未绑定任何内部模型，已切换为全部内部模型"
-          style="margin-bottom: 12px"
-        />
-        <div class="sync-row">
-          <el-checkbox v-model="syncOnlyBound" :disabled="!boundItems.length">
-            仅显示本对外模型绑定的内部模型
-          </el-checkbox>
-        </div>
-        <div class="sync-row">
-          <span class="sync-label">同步来源</span>
-          <el-select v-model="syncSourceId" filterable placeholder="选择要同步的内部模型" style="width: 100%">
-            <el-option
-              v-for="i in sourceOptions"
-              :key="i.ID"
-              :label="`${i.ChannelName || '渠道#' + i.ChannelID} / ${i.InternalModelID}`"
-              :value="i.ID"
-            />
-          </el-select>
-        </div>
-        <div v-if="syncSource" class="sync-preview">
-          <div class="sp-title">将要覆盖的内容预览</div>
-          <div class="sp-rates">
-            <span v-for="k in rateKeys" :key="k" class="sp-rate">
-              {{ rateLabels[k] }}：{{ fmtRate((syncSource.CostRates || {})[k]) }}
-            </span>
-          </div>
-          <div class="sp-meta">
-            时段段数：{{ syncSource.TimeConfig?.Periodic?.length || 0 }} 段 · 分档条数：{{ syncSource.ContextTiers?.length || 0 }} 条
-          </div>
-        </div>
-      </div>
-      <template #footer>
-        <el-button @click="syncOpen = false">取消</el-button>
-        <el-button type="primary" @click="onSyncFromInternal">同步到售价</el-button>
-      </template>
-    </el-dialog>
   </div>
 </template>
 

@@ -2,7 +2,7 @@
 import { onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Delete, Key, Link, Plus } from '@element-plus/icons-vue'
-import { listTokens, batchDeleteTokens, createToken, getTokenSecret, listTags, type AdminToken, type AdminTag } from '@/api/admin'
+import { listTokens, batchDeleteTokens, createToken, getTokenSecret, type AdminToken } from '@/api/admin'
 import { fmtDate, fmtTime } from '@/utils/format'
 import ErrorBubble from '@/components/ErrorBubble.vue'
 import UserSelect from '@/components/UserSelect.vue'
@@ -24,8 +24,7 @@ const selected = ref<AdminToken[]>([])
 const createOpen = ref(false)
 const createSaving = ref(false)
 const createErr = ref<{ message: string; requestId: string }>({ message: '', requestId: '' })
-const createForm = ref({ UserID: null as string | null, DisplayName: '', TagID: null as string | null, ExpiresAt: null as string | null })
-const tags = ref<AdminTag[]>([])
+const createForm = ref({ UserID: null as string | null, DisplayName: '', ExpiresAt: null as string | null })
 const createdPlain = ref<{ Plain: string; Display: string } | null>(null)
 
 // 查看密钥弹窗
@@ -58,14 +57,13 @@ watch(() => `${filters.user_id}|${filters.status}`, (v, o) => {
 })
 onMounted(() => {
   load()
-  listTags({ Enabled: true }).then((r) => (tags.value = (r.Data || []).filter((t) => t.Enabled))).catch(() => (tags.value = []))
 })
 
 // ---- 新建令牌（弹窗） ----
 function openCreate() {
   createOpen.value = true
   createdPlain.value = null
-  createForm.value = { UserID: null, DisplayName: '', TagID: null, ExpiresAt: null }
+  createForm.value = { UserID: null, DisplayName: '', ExpiresAt: null }
   createErr.value = { message: '', requestId: '' }
 }
 
@@ -79,7 +77,6 @@ async function submitCreate() {
     const res = await createToken({
       UserID: uid,
       DisplayName: createForm.value.DisplayName.trim(),
-      TagID: createForm.value.TagID,
       ExpiresAt: createForm.value.ExpiresAt,
     })
     createdPlain.value = res.Data
@@ -303,11 +300,8 @@ function copyBaseUrl() {
         <el-form-item label="令牌名称" required>
           <el-input v-model="createForm.DisplayName" maxlength="64" placeholder="如 生产环境" />
         </el-form-item>
-        <el-form-item label="语义标签">
-          <el-select v-model="createForm.TagID" placeholder="默认路由" clearable style="width: 100%">
-            <el-option v-for="t in tags" :key="t.ID" :label="t.Name" :value="t.ID" />
-          </el-select>
-        </el-form-item>
+        <!-- V2 起删除「语义标签」：0024 删 semantic_tags / channel_tags 与 tokens.tag_id，
+             标签不再影响路由（Spec P11 / M9）。这里连入口一起去掉，避免提交后 42703。 -->
         <el-form-item label="过期时间">
           <el-date-picker
             v-model="createForm.ExpiresAt"
