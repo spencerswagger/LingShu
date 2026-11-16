@@ -2,7 +2,7 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Edit, Delete } from '@element-plus/icons-vue'
+import { Link, Edit, Delete } from '@element-plus/icons-vue'
 import {
   listExternalModels,
   batchDeleteExternalModels,
@@ -267,9 +267,14 @@ async function onSyncPrices() {
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column v-if="!isSelf" label="操作" width="90" align="right" fixed="right">
+        <el-table-column v-if="!isSelf" label="操作" width="130" align="right" fixed="right">
           <template #default="{ row }">
             <div class="op-cell" @click.stop>
+              <!-- 绑定能力的唯一真源是 external_models.bound_internal_ref，写入口是 T5（PUT /admin/models/{id}/binding）；
+                   T4/T5 未上线前按钮禁用并说明，不做「点了没反应」。 -->
+              <el-tooltip :content="hasBinding ? '绑定内部模型（T5 /models/{id}/binding 待上线）' : '绑定内部模型（后端未返回 bound_internal_ref，接口待上线）'" placement="top">
+                <el-icon class="op-icon is-disabled"><Link /></el-icon>
+              </el-tooltip>
               <el-tooltip content="编辑" placement="top">
                 <el-icon class="op-icon" @click="router.push(`/admin/models/${row.ID}/edit`)"><Edit /></el-icon>
               </el-tooltip>

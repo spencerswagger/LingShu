@@ -45,7 +45,7 @@ const bannerKind = computed(() => {
       <div class="v2-head-main">
         <h2 class="v2-title">
           {{ title }}
-          <el-tag v-if="state === 'demo'" type="warning" size="small" effect="dark" class="tag">演示数据</el-tag>
+          <el-tag v-if="state === 'demo'" type="warning" size="small" effect="dark" class="tag">演示数据 · 接口待接入</el-tag>
         </h2>
         <p v-if="intro" class="v2-intro">{{ intro }}</p>
         <div v-if="deps.length" class="v2-deps">
@@ -65,7 +65,9 @@ const bannerKind = computed(() => {
 
     <div v-if="bannerKind === 'demo'" class="v2-banner is-demo">
       <el-icon><Warning /></el-icon>
-      <span>当前显示的是<strong>演示数据</strong>，不是真实账务结果，不能用于对账、结算或对外汇报。</span>
+      <span>
+        <strong>演示数据 · 接口待接入</strong>：当前数字不是真实账务结果，不能用于对账、结算或对外汇报。
+      </span>
       <el-button size="small" text @click="emit('exitDemo')">退出预览</el-button>
     </div>
 

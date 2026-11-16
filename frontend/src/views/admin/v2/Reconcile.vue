@@ -9,7 +9,7 @@
 //   - 只比 token 与笔数，**不比金额**（账本币种与积分不等价，比金额必然误报）。
 import { computed, onMounted, ref } from 'vue'
 import { getReconcileWindows, type ReconcileView, type ReconcileWindow } from '@/api/v2'
-import { mockReconcile } from '@/api/v2.mock'
+import { mockReconcile } from '@/mock/reconcile'
 import { useV2Load } from '@/composables/useV2Load'
 import V2Page from '@/components/v2/V2Page.vue'
 import StatCards from '@/components/v2/StatCards.vue'
@@ -25,6 +25,26 @@ const RANGES = [
 
 const minutes = ref(60)
 const limit = ref(500)
+// 状态筛选（Spec P06 关键交互）；默认「全部」
+const statusFilter = ref<'' | 'ok' | 'alarm' | 'error' | 'blocked' | 'skipped'>('')
+
+// skipped 的原因必须给出中文文案（Spec P06 验收 3：只显示状态词等于没说）
+const SKIP_TEXT: Record<string, string> = {
+  ledger_disabled: '账本拉取已关闭',
+  ledger_unavailable: '账本不可用（拉取失败/未就绪）',
+  fetch_blocked: '本窗仍 blocked，未拉完',
+  service_down: '同步服务未运行',
+}
+const skipText = (code: string) => SKIP_TEXT[code] || code || '未给出原因'
+
+const STATUS_OPTIONS = [
+  { label: '全部状态', value: '' },
+  { label: 'ok 已对账', value: 'ok' },
+  { label: 'alarm 偏差超阈', value: 'alarm' },
+  { label: 'error 没拉完', value: 'error' },
+  { label: 'blocked 待补拉', value: 'blocked' },
+  { label: 'skipped 无结论', value: 'skipped' },
+] as const
 
 function rangeParams() {
   const to = new Date()
@@ -52,6 +72,23 @@ const deps = computed<V2Dep[]>(() => [
 
 const items = computed<ReconcileWindow[]>(() => data.value?.Items || [])
 
+// 按当前页聚合（O1 汇总接口是可延后项：未就绪时页面必须标注「按当前页统计」，不许冒充全量）
+const streakMax = computed(() => items.value.reduce((m, r) => Math.max(m, r.AlarmStreak), 0))
+const overThreshold = computed(() => items.value.filter((r) => Math.abs(r.DeviationRate ?? 0) > 0.02).length)
+const pendingPull = computed(() => items.value.filter((r) => r.Status === 'blocked' || r.ScrollOffset > 0).length)
+
+// 展示行：状态筛选 + 连续告警优先（alarm_streak≥3 要能一眼看到并排在前面，Spec P06 验收 4）
+const rows = computed<ReconcileWindow[]>(() => {
+  const list = statusFilter.value
+    ? items.value.filter((r) => r.Status === statusFilter.value)
+    : [...items.value]
+  return list.sort((a, b) => b.AlarmStreak - a.AlarmStreak || (a.WindowStart < b.WindowStart ? 1 : -1))
+})
+
+function rowClass({ row }: { row: ReconcileWindow }): string {
+  return row.AlarmStreak >= 3 ? 'is-critical' : ''
+}
+
 const stats = computed<StatItem[]>(() => {
   const rows = items.value
   const alarm = rows.filter((r) => r.Status === 'alarm').length
@@ -67,6 +104,9 @@ const stats = computed<StatItem[]>(() => {
     { label: '无结论（skipped）', value: fmtCompact(skipped), hint: '账本关闭/不可用/仍 blocked → 不当作「对上了」' },
     { label: '计数列为空', value: fmtCompact(noCount), tone: noCount > 0 ? 'warn' : 'default', hint: '空 = 对账作业还没写这四列，不是 0 笔' },
     { label: '最大偏差率', value: maxDev ? `${(maxDev * 100).toFixed(2)}%` : '—', tone: maxDev > 0.02 ? 'danger' : 'default', hint: '|本窗本地 token − 上游 token| ÷ 上游 token' },
+    { label: '最长连续告警', value: String(streakMax.value), tone: streakMax.value >= 3 ? 'danger' : 'default', hint: '≥3 窗升级为回退判据' },
+    { label: '偏差 >2% 窗口', value: String(overThreshold.value), tone: overThreshold.value > 0 ? 'warn' : 'ok' },
+    { label: '待补拉窗口', value: String(pendingPull.value), tone: pendingPull.value > 0 ? 'warn' : 'ok', hint: 'blocked 或 scroll_offset>0' },
   ]
 })
 
@@ -102,6 +142,9 @@ function devClass(v: number | null): string {
     @exit-demo="exitDemo"
   >
     <template #actions>
+      <el-select v-model="statusFilter" size="small" style="width: 150px">
+        <el-option v-for="o in STATUS_OPTIONS" :key="o.value" :label="o.label" :value="o.value" />
+      </el-select>
       <el-select v-model="minutes" size="small" style="width: 130px" @change="reload">
         <el-option v-for="r in RANGES" :key="r.minutes" :label="r.label" :value="r.minutes" />
       </el-select>
@@ -115,6 +158,11 @@ function devClass(v: number | null): string {
     <template v-if="data">
       <StatCards :items="stats" :columns="3" />
 
+      <div class="agg-note">
+        顶部数字为<strong>按当前页统计</strong>（O1 汇总接口 /ops/reconcile-summary 未就绪）：区间内共 {{ items.length }} 个窗口，
+        最长连续告警 {{ streakMax }} 窗，偏差 &gt;2% 共 {{ overThreshold }} 窗，待补拉 {{ pendingPull }} 窗。最长可查 24h。
+      </div>
+
       <el-alert
         type="info"
         :closable="false"
@@ -125,7 +173,20 @@ function devClass(v: number | null): string {
 
       <div class="card">
         <div class="table-wrap">
-          <el-table :data="items" size="small" border stripe empty-text="区间内没有对账窗口">
+          <el-table :data="rows" size="small" border stripe :row-class-name="rowClass" empty-text="区间内没有对账窗口">
+            <!-- 行展开只作排障（detail 的 sync.* / reconcile.*），不参与判定 -->
+            <el-table-column type="expand" width="34">
+              <template #default="{ row }">
+                <div class="detail">
+                  <div class="detail-row">
+                    <span class="detail-label">skip_reason</span>
+                    <span>{{ row.SkipReason ? `${row.SkipReason}（${skipText(row.SkipReason)}）` : '—' }}</span>
+                  </div>
+                  <pre class="detail-json">{{ JSON.stringify(row.Detail || {}, null, 2) }}</pre>
+                  <p class="detail-hint">detail 只用于排查「为什么这个窗口没结论」，不参与对账判定；只有笔数与 token 参与。</p>
+                </div>
+              </template>
+            </el-table-column>
             <el-table-column label="窗口" min-width="150">
               <template #default="{ row }">
                 <div class="cell-strong">{{ fmtDateTime(row.WindowStart) }}</div>
@@ -164,8 +225,12 @@ function devClass(v: number | null): string {
                 <span v-else class="sub">—</span>
               </template>
             </el-table-column>
-            <el-table-column label="最后写入" width="150">
-              <template #default="{ row }">{{ fmtDateTime(row.CheckedAt) }}</template>
+            <el-table-column label="原因 / 最后写入" width="210">
+              <template #default="{ row }">
+                <div v-if="row.Status === 'skipped'" class="skip-reason">{{ skipText(row.SkipReason) }}</div>
+                <div v-if="row.Status === 'error'" class="skip-reason">拉取失败，看展开里的 last_error</div>
+                <div class="sub">{{ fmtDateTime(row.CheckedAt) }}</div>
+              </template>
             </el-table-column>
           </el-table>
         </div>
@@ -194,6 +259,47 @@ function devClass(v: number | null): string {
   display: block;
   font-size: 11px;
   color: var(--color-text-tertiary);
+}
+.agg-note {
+  font-size: 13px;
+  color: var(--color-text-secondary);
+  line-height: 1.7;
+}
+.detail {
+  padding: 4px 12px 10px;
+}
+.detail-row {
+  display: flex;
+  gap: 8px;
+  font-size: 13px;
+  margin-bottom: 6px;
+}
+.detail-label {
+  color: var(--color-text-tertiary);
+}
+.detail-json {
+  margin: 0;
+  padding: 8px 10px;
+  background: #f7f8fb;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-s);
+  font-size: 12px;
+  line-height: 1.6;
+  max-height: 220px;
+  overflow: auto;
+}
+.detail-hint {
+  margin: 6px 0 0;
+  font-size: 12px;
+  color: var(--color-text-tertiary);
+}
+.skip-reason {
+  font-size: 12px;
+  color: #d97706;
+  margin-bottom: 2px;
+}
+:deep(.el-table .is-critical) {
+  --el-table-tr-bg-color: #fef6f6;
 }
 .neg {
   color: var(--color-danger);

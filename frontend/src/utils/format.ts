@@ -86,3 +86,10 @@ export function fmtCompact(n: number): string {
   }
   return `${(v / base).toFixed(2)}${suffix}`
 }
+
+// 积分金额：后端 NUMERIC(20,5)。展示最多 5 位、最少 2 位（0.5 → 0.50，0.12345 原样），
+// null 显示「—」——「未计算/未配置」不许被渲染成 0.00。
+export function fmtCredits(v?: number | null): string {
+  if (v == null || !Number.isFinite(v)) return '—'
+  return v.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 5 })
+}

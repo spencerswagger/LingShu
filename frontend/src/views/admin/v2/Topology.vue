@@ -7,8 +7,8 @@
 //   2. `model_links` 只存画布坐标，**不是关系真源**。缺行 = 用自动布局，不影响售卖与计费；
 //      绑定真源是 `external_models.bound_internal_ref`。
 import { computed, onMounted, ref } from 'vue'
-import { getInternalModels, type InternalModel, type InternalModelView } from '@/api/v2'
-import { mockInternalModels } from '@/api/v2.mock'
+import { getTopology, type InternalModel, type InternalModelView } from '@/api/v2'
+import { mockTopology } from '@/mock/topology'
 import { useV2Load } from '@/composables/useV2Load'
 import V2Page from '@/components/v2/V2Page.vue'
 import StatCards from '@/components/v2/StatCards.vue'
@@ -20,13 +20,15 @@ import { fmtCompact, fmtDateTime } from '@/utils/format'
 const tab = ref<'snapshot' | 'canvas'>('snapshot')
 const keyword = ref('')
 
-const { state, data, error, load, showDemo, exitDemo } = useV2Load<InternalModelView>(getInternalModels, mockInternalModels)
+const { state, data, error, load, showDemo, exitDemo } = useV2Load<InternalModelView>(getTopology, mockTopology)
 
 onMounted(() => void load())
 
 const deps = computed<V2Dep[]>(() => [
-  { path: 'GET /admin/internal-models', state: state.value === 'live' || state.value === 'demo' ? 'ready' : 'pending' },
-  { path: 'PUT /admin/model-links', state: 'pending' },
+  { path: 'GET /admin/topology', state: state.value === 'live' ? 'ready' : 'pending' },
+  { path: 'POST /admin/topology/sync', state: 'pending' },
+  // 坐标保存是可延后项（T2）：未就绪时自动布局、坐标不持久化，不影响售卖与计费
+  { path: 'PUT /admin/topology/links', state: 'pending' },
 ])
 
 const rows = computed<InternalModel[]>(() => {
@@ -56,6 +58,28 @@ const stats = computed<StatItem[]>(() => {
     },
     { label: '最后同步', value: d.SyncedAt ? fmtDateTime(d.SyncedAt) : '—', hint: '镜像每轮同步刷新 last_seen_at' },
   ]
+})
+
+// 供应商层（四层里的第 1–2 层）：T1 会带 provider / account 聚合；未上线时用内部模型的 provider_ref 现算，
+// 保证「供应商 → 内部模型」这两层的计数在页面上永远和列表条数对得上（Spec P02 验收 1）。
+const providerRows = computed(() => {
+  const map = new Map<string, { provider: string; models: number; stale: number }>()
+  for (const m of data.value?.Items || []) {
+    const p = m.ProviderRef || '(未知)'
+    const cur = map.get(p) || { provider: p, models: 0, stale: 0 }
+    cur.models += 1
+    if (m.Stale) cur.stale += 1
+    map.set(p, cur)
+  }
+  return [...map.values()].sort((a, b) => b.models - a.models)
+})
+
+const syncState = computed(() => data.value?.Sync || null)
+const syncTone = computed(() => {
+  const st = syncState.value?.State
+  if (st === 'ok') return 'ok'
+  if (st === 'failed') return 'danger'
+  return 'warn'
 })
 
 // 画布：内部模型节点（按 kind 上色）+ 已落位的外部模型节点 + 连线。
@@ -140,23 +164,59 @@ const canvasOption = computed(() => {
 
 <template>
   <V2Page
-    title="内部模型与拓扑"
-    intro="内部模型是网关同步过来的只读镜像（ref / 供应商 / 组或直通 / 能力 / 牌价）；拓扑画布只存落位坐标，不承载绑定关系。"
+    title="上游拓扑"
+    intro="网关侧「供应商 → 账号 → 内部模型 → 对外模型」四层关系与同步新鲜度。内部模型是只读镜像，拓扑画布只存落位坐标，不承载绑定关系。"
     source="数据层契约 §2.1–§2.3（internal_models / model_links）"
     :deps="deps"
     :state="state"
     :error="error"
-    pending-hint="内部模型与拓扑接口属阶段一同步器交付，读取端点未上线。快照与画布已按 0019 表结构就位，接口上线即接真数据。"
+    pending-hint="拓扑聚合（T1）、手动同步（T3）、坐标保存（T2）待 Core 上线。快照/画布/同步状态条已按 0019 表结构就位，接口上线即接真数据。"
     @reload="load()"
     @demo="showDemo"
     @exit-demo="exitDemo"
   >
     <template #actions>
       <el-input v-model="keyword" size="small" placeholder="搜索 ref / 供应商" clearable style="width: 180px" />
+      <!-- T3 未上线：禁用 + 说明，不做点了没反应的按钮（Spec §5 规则 5） -->
+      <el-tooltip content="接口 T3（POST /admin/topology/sync）待上线；当前由后台定时同步" placement="top">
+        <span><el-button size="small" disabled>立即同步</el-button></span>
+      </el-tooltip>
     </template>
 
     <template v-if="data">
+      <!-- 同步状态条：最后同步时间 / 结果 / 新增 / 失效。失败时**不清空**已有快照（Spec P02 验收 3） -->
+      <div class="sync-bar" :class="`is-${syncTone}`">
+        <span class="sync-item">
+          最后成功
+          <strong>{{ syncState?.LastSuccessAt ? fmtDateTime(syncState.LastSuccessAt) : '从未同步' }}</strong>
+        </span>
+        <span class="sync-item">
+          同步结果
+          <el-tag :type="syncTone === 'ok' ? 'success' : syncTone === 'danger' ? 'danger' : 'warning'" size="small" effect="plain">
+            {{ syncState?.State === 'ok' ? '成功' : syncState?.State === 'failed' ? '失败' : '未运行' }}
+          </el-tag>
+          <span v-if="syncState?.Message" class="sync-msg">{{ syncState.Message }}</span>
+        </span>
+        <span class="sync-item">本轮新增 <strong>{{ syncState?.Created ?? 0 }}</strong></span>
+        <span class="sync-item">本轮失效 <strong>{{ syncState?.Stale ?? 0 }}</strong></span>
+        <span class="sync-item sub">同步失败时保留旧快照，不空白；手动同步接口（T3）上线后本按钮启用</span>
+      </div>
+
       <StatCards :items="stats" :columns="4" />
+
+      <!-- 供应商层 -->
+      <div class="card">
+        <div class="card-title">供应商（{{ providerRows.length }}）</div>
+        <div class="provider-strip">
+          <div v-for="p in providerRows" :key="p.provider" class="provider-chip">
+            <span class="pv-name">{{ p.provider }}</span>
+            <span class="pv-meta">{{ p.models }} 个内部模型<template v-if="p.stale"> · {{ p.stale }} 个本轮未见</template></span>
+          </div>
+        </div>
+        <p class="foot">
+          四层视图 = 供应商 → 账号 → 内部模型 → 对外模型。账号层需要 T1 的 account 聚合，接口上线后在这一段补一列；当前账号维度只在订阅页维护。
+        </p>
+      </div>
 
       <el-tabs v-model="tab">
         <el-tab-pane label="快照" name="snapshot">
@@ -215,6 +275,57 @@ const canvasOption = computed(() => {
   border-radius: var(--radius-m);
   box-shadow: var(--shadow-card);
   padding: 12px 14px;
+}
+.sync-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 14px;
+  padding: 8px 12px;
+  border-radius: var(--radius-s);
+  border: 1px solid var(--color-border);
+  background: #fafbfd;
+  font-size: 13px;
+}
+.sync-bar.is-warn {
+  background: #fff8e6;
+  border-color: #ffe0a3;
+}
+.sync-bar.is-danger {
+  background: #fef3f2;
+  border-color: #fecdca;
+}
+.sync-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.sync-msg {
+  color: #b42318;
+  font-size: 12px;
+}
+.provider-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.provider-chip {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-s);
+  background: #fff;
+  min-width: 150px;
+}
+.pv-name {
+  font-weight: 600;
+  font-size: 13px;
+}
+.pv-meta {
+  font-size: 12px;
+  color: var(--color-text-tertiary);
 }
 .card-title {
   font-size: 13px;

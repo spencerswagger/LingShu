@@ -198,7 +198,29 @@ export interface BillingDetail {
   CostSource?: string | null
   // 账本关联：ledger_entries.ledger_id（一对一，部分唯一索引保证）
   LedgerEntryID?: string | null
+  // 资金轨迹（M8）：一请求一预扣 + 结算差额 + 退款 + 钱包流水。
+  // 三者都由后端给出，前端只显示恒等式结果，不自己算「应该扣多少」。
+  Hold?: BillingHold | null
+  Flows?: BillingFlow[]
   CallLog?: CallLogView | null
+}
+
+export interface BillingHold {
+  Amount: number
+  Status: string // held | settled | refunded | expired
+  ExpiresAt?: string | null
+  SettledAmount?: number | null
+  RefundedAmount?: number | null
+  ClosedAt?: string | null
+}
+
+export interface BillingFlow {
+  FlowID?: string
+  Kind: string // charge | refund | adjust
+  Amount: number
+  BalanceAfter?: number | null
+  Note?: string | null
+  CreatedAt?: string | null
 }
 
 export interface Step {

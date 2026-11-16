@@ -8,7 +8,7 @@
 //   Uncosted = 成本为 NULL 的请求数：> 0 表示这批账单还没有成本口径，毛利偏高 → 必须提示
 import { computed, onMounted, ref } from 'vue'
 import { getPnl, type PnlGroupBy, type PnlView } from '@/api/v2'
-import { mockPnl } from '@/api/v2.mock'
+import { mockPnl } from '@/mock/pnl'
 import { useV2Load } from '@/composables/useV2Load'
 import V2Page from '@/components/v2/V2Page.vue'
 import StatCards from '@/components/v2/StatCards.vue'
@@ -53,8 +53,33 @@ function pct(v: number | null): string {
 
 // 依赖徽标：拿到真实数据才标「已定型」，避免接口没上线时给出错误预期
 const deps = computed<V2Dep[]>(() => [
-  { path: 'GET /admin/ops/pnl', state: state.value === 'live' || state.value === 'demo' ? 'ready' : 'pending' },
+  { path: 'GET /admin/ops/pnl', state: state.value === 'live' ? 'ready' : 'pending' },
+  // O2 趋势（收入/成本/毛利时间序列）是 P0 但尚未上线：趋势块先出空态，不自造一条前端折线
+  { path: 'GET /admin/ops/pnl/trend', state: 'pending' },
 ])
+
+// 变动成本 / 固定成本：从分组行聚合（后端汇总块只给 Cost 合计，M5 要求两段可核对）
+const ledgerCost = computed(() => Math.round((data.value?.Groups || []).reduce((s, g) => s + g.LedgerCost, 0) * 1e5) / 1e5)
+const amortizedCost = computed(
+  () => Math.round((data.value?.Groups || []).reduce((s, g) => s + g.AmortizedCost, 0) * 1e5) / 1e5,
+)
+
+// 恒等式自检（Spec P07 验收 1/3）：收入 − 成本 = 毛利；变动 + 固定 = 成本。
+// 分币级容差 1e-4（5 位小数四舍五入）。不成立就红字点出来，别让运营拿错的数去汇报。
+const EPS = 1e-4
+const identity = computed(() => {
+  const d = data.value
+  if (!d) return null
+  const marginOk = Math.abs(d.Revenue - d.Cost - d.Margin) <= EPS
+  const splitOk = Math.abs(ledgerCost.value + amortizedCost.value - d.Cost) <= EPS
+  return {
+    marginOk,
+    splitOk,
+    ok: marginOk && splitOk,
+    marginDelta: Math.round((d.Revenue - d.Cost - d.Margin) * 1e5) / 1e5,
+    splitDelta: Math.round((ledgerCost.value + amortizedCost.value - d.Cost) * 1e5) / 1e5,
+  }
+})
 
 const stats = computed<StatItem[]>(() => {
   const d = data.value
@@ -78,13 +103,26 @@ const stats = computed<StatItem[]>(() => {
       value: pct(d.MarginPct),
       hint: d.MarginPct == null ? '收入 ≤ 0，后端不返回毛利率' : '毛利 ÷ 收入',
     },
+    {
+      label: '变动成本（账本实付）',
+      value: money(ledgerCost.value),
+      hint: 'cost_source=ledger，随流量变化',
+    },
+    {
+      label: '固定成本（订阅摊销）',
+      value: money(amortizedCost.value),
+      hint: 'cost_source=amortized，A5 月费行级分摊',
+    },
     { label: '请求数', value: fmtCompact(d.Requests) },
     { label: 'Token（三段合计）', value: fmtCompact(d.Tokens) },
     {
       label: '无成本口径请求',
       value: fmtCompact(d.Uncosted),
       tone: uncostedTone,
-      hint: d.Uncosted > 0 ? '这批账单成本为 NULL（账本没拉到 / 订阅没配）→ 毛利虚高' : '全部请求都有成本口径',
+      hint:
+        d.Uncosted > 0
+          ? `其中「历史未配置」${fmtCompact(d.Unconfigured)} 笔（cost_source IS NULL）、「明确无口径」${fmtCompact(d.NoneCost)} 笔（none）→ 毛利虚高`
+          : '全部请求都有成本口径',
     },
   ]
 })
@@ -134,14 +172,31 @@ const chartOption = computed(() => {
     <template v-if="data">
       <StatCards :items="stats" :columns="4" />
 
+      <!-- 恒等式自检：不成立就红字点出来（Spec P07 验收 1/3） -->
+      <div v-if="identity" class="identity" :class="identity.ok ? 'is-ok' : 'is-bad'">
+        <span>
+          收入 − 成本 = 毛利：<strong>{{ identity.marginOk ? '成立' : `不成立（差 ${identity.marginDelta}）` }}</strong>
+        </span>
+        <span>
+          变动 + 固定 = 成本：<strong>{{ identity.splitOk ? '成立' : `不成立（差 ${identity.splitDelta}）` }}</strong>
+        </span>
+        <span class="sub">分币级容差 1e-4；不成立说明后端聚合有偏差，先报 Core，不要把这张表发出去。</span>
+      </div>
+
       <el-alert
         v-if="data.Uncosted > 0"
         type="warning"
         :closable="false"
         show-icon
         title="毛利偏高：存在没有成本口径的请求"
-        :description="`${fmtCompact(data.Uncosted)} 笔请求的 cost_credits 为空（账本没拉到或订阅未录入）。这些请求只计收入、不计成本，算出来的毛利不能当真实毛利。`"
-      />
+        :description="`${fmtCompact(data.Uncosted)} 笔请求的 cost_credits 为空（历史未配置 ${fmtCompact(data.Unconfigured)} / 明确无口径 ${fmtCompact(data.NoneCost)}）。这些请求只计收入、不计成本，算出来的毛利不能当真实毛利。点右侧按钮按「成本来源=未配置」筛账单。`"
+      >
+        <template #default>
+          <el-button size="small" @click="$router.push('/admin/billings?cost_source=unconfigured')">
+            去看这批账单
+          </el-button>
+        </template>
+      </el-alert>
       <el-alert
         v-if="data.Truncated"
         type="info"
@@ -157,6 +212,12 @@ const chartOption = computed(() => {
       </div>
 
       <div class="card">
+        <div class="card-title">趋势（按小时 / 按天）</div>
+        <!-- O2 未就绪：不拿分组数据折一条假趋势线（Spec §5 规则 4：不许用 mock/假数据通过验收） -->
+        <el-empty :image-size="54" description="趋势接口（O2 /admin/ops/pnl/trend）待 Core 上线；接口就绪后此块显示收入/成本/毛利三条线，可切小时/天粒度。" />
+      </div>
+
+      <div class="card">
         <div class="card-title">分组明细（{{ data.Groups.length }} 组）</div>
         <div class="table-wrap">
           <el-table :data="data.Groups" size="small" border stripe empty-text="区间内没有账单">
@@ -167,7 +228,7 @@ const chartOption = computed(() => {
             <el-table-column label="Token" width="110" align="right">
               <template #default="{ row }">{{ fmtCompact(row.Tokens) }}</template>
             </el-table-column>
-            <el-table-column label="收入" width="120" align="right">
+            <el-table-column label="收入" width="130" align="right" sortable prop="Revenue">
               <template #default="{ row }">{{ money(row.Revenue) }}</template>
             </el-table-column>
             <el-table-column label="成本" width="190" align="right">
@@ -176,7 +237,7 @@ const chartOption = computed(() => {
                 <span class="sub">账本 {{ money(row.LedgerCost) }} / 摊销 {{ money(row.AmortizedCost) }}</span>
               </template>
             </el-table-column>
-            <el-table-column label="毛利" width="120" align="right">
+            <el-table-column label="毛利" width="130" align="right" sortable prop="Margin">
               <template #default="{ row }">
                 <span :class="row.Margin < 0 ? 'neg' : ''">{{ money(row.Margin) }}</span>
               </template>
@@ -222,6 +283,25 @@ const chartOption = computed(() => {
   display: block;
   font-size: 11px;
   color: var(--color-text-tertiary);
+}
+.identity {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  padding: 8px 12px;
+  border-radius: var(--radius-s);
+  font-size: 13px;
+  border: 1px solid var(--color-border);
+  background: #fafbfd;
+}
+.identity.is-ok {
+  border-color: #b7ebc6;
+  background: #f2fcf5;
+}
+.identity.is-bad {
+  border-color: #fecdca;
+  background: #fef3f2;
+  color: #b42318;
 }
 .neg {
   color: var(--color-danger);

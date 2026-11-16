@@ -87,6 +87,29 @@ export async function v2Get<T>(
   }
 }
 
+/**
+ * v2Post：写一个 V2 端点（当前只有订阅录入 S2 用到）。
+ * 与 v2Get 的区别：400/409/422 是**业务结果**（字段非法 / 重复订阅 / 汇率未配），
+ * 必须把 code 与 message 原样交给页面做字段级定位与分支，不能进全局红条后就丢掉。
+ */
+export async function v2Post<T>(
+  path: string,
+  body: unknown,
+  normalize: (raw: Record<string, unknown>) => T,
+): Promise<V2Load<T>> {
+  try {
+    const res = await http.post<{ Data?: unknown }, { Data?: unknown }>(path, body, {
+      silentStatuses: [...PENDING_STATUSES, 400, 409, 422],
+    })
+    return { state: 'live', data: normalize(obj(res?.Data)) }
+  } catch (e) {
+    const err = e as ApiError
+    const status = err?.status ?? 0
+    if (PENDING_STATUSES.includes(status)) return { state: 'pending', data: null, error: err }
+    return { state: 'error', data: null, error: err }
+  }
+}
+
 // ===== 盈亏（GET /admin/ops/pnl，已定型） =====
 // 语义：收入 = Σ credits_consumed（售价口径）；成本 = Σ cost_credits（账本实付 + 订阅摊销）；
 // 毛利 = 收入 − 成本；MarginPct 在收入 ≤ 0 时为 null（后端刻意不返回 0）。
@@ -116,7 +139,12 @@ export interface PnlView {
   Cost: number
   Margin: number
   MarginPct: number | null
+  // Uncosted = 没有成本口径的请求总数（M5 要求拆成两段，语义不同，页面不许合并成 0）
   Uncosted: number
+  // Unconfigured = cost_source IS NULL（历史行，口径未知）
+  Unconfigured: number
+  // NoneCost = cost_source='none'（明确没有成本口径）
+  NoneCost: number
   Groups: PnlRow[]
   Truncated: boolean
 }
@@ -133,6 +161,8 @@ export function normalizePnl(raw: Record<string, unknown>): PnlView {
     Margin: num(pick(raw, 'Margin', 'margin')),
     MarginPct: numOrNull(pick(raw, 'MarginPct', 'margin_pct')),
     Uncosted: num(pick(raw, 'Uncosted', 'uncosted')),
+    Unconfigured: num(pick(raw, 'Unconfigured', 'unconfigured')),
+    NoneCost: num(pick(raw, 'NoneCost', 'none_cost')),
     Truncated: Boolean(pick(raw, 'Truncated', 'truncated')),
     Groups: arr(pick(raw, 'Groups', 'groups')).map((g) => ({
       Key: str(pick(g, 'Key', 'key')),
@@ -170,6 +200,10 @@ export interface ReconcileWindow {
   DeviationRate: number | null
   ScrollOffset: number
   CheckedAt: string
+  // skipped 必须有原因（M4）：只显示状态词等于没说，页面要翻译成中文
+  SkipReason: string
+  // 排障用的原始 detail（sync.* / reconcile.*），不参与判定
+  Detail: Record<string, unknown>
 }
 
 export interface ReconcileView {
@@ -195,6 +229,8 @@ export function normalizeReconcile(raw: Record<string, unknown>): ReconcileView 
       DeviationRate: numOrNull(pick(w, 'DeviationRate', 'deviation_rate')),
       ScrollOffset: num(pick(w, 'ScrollOffset', 'scroll_offset')),
       CheckedAt: str(pick(w, 'CheckedAt', 'checked_at')),
+      SkipReason: str(pick(w, 'SkipReason', 'skip_reason')) || str(pick(obj(pick(w, 'Detail', 'detail')), 'skip_reason')),
+      Detail: obj(pick(w, 'Detail', 'detail')),
     }
   })
   return { From: str(pick(raw, 'From', 'from')), To: str(pick(raw, 'To', 'to')), Items: items }
@@ -246,16 +282,47 @@ export function normalizeLedger(raw: Record<string, unknown>): LedgerView {
   }
 }
 
+// 新鲜度卡（L2）：滞后>180s 橙「账本不新鲜」，>15min 红「对账不可用」。
+export interface LedgerStatus {
+  LastOccurredAt: string
+  LastSuccessAt: string
+  LagSeconds: number | null
+  BlockedWindows: number
+  ErrorWindows: number
+  PendingOffset: number
+  BudgetExhausted: boolean
+  LedgerEnabled: boolean
+}
+
+export function normalizeLedgerStatus(raw: Record<string, unknown>): LedgerStatus {
+  return {
+    LastOccurredAt: str(pick(raw, 'LastOccurredAt', 'last_occurred_at')),
+    LastSuccessAt: str(pick(raw, 'LastSuccessAt', 'last_success_at')),
+    LagSeconds: numOrNull(pick(raw, 'LagSeconds', 'lag_seconds')),
+    BlockedWindows: num(pick(raw, 'BlockedWindows', 'blocked_windows')),
+    ErrorWindows: num(pick(raw, 'ErrorWindows', 'error_windows')),
+    PendingOffset: num(pick(raw, 'PendingOffset', 'pending_offset')),
+    BudgetExhausted: Boolean(pick(raw, 'BudgetExhausted', 'budget_exhausted')),
+    LedgerEnabled: pick(raw, 'LedgerEnabled', 'ledger_enabled') !== false,
+  }
+}
+
+export function getLedgerStatus() {
+  return v2Get('/admin/ledger/status', undefined, normalizeLedgerStatus)
+}
+
 export function getLedger(params: {
   From?: string
   To?: string
   Provider?: string
   Account?: string
   Model?: string
+  // ledger_id 精确查（Spec P05 关键交互）
+  LedgerID?: string
   Limit?: number
   Offset?: number
 }) {
-  return v2Get('/admin/ledger', params, normalizeLedger)
+  return v2Get('/admin/ledger/entries', params, normalizeLedger)
 }
 
 // ===== 预扣登记（GET /admin/credit-holds，待 Core；阶段二启用） =====
@@ -332,12 +399,36 @@ export interface ModelLink {
   PosY: number
 }
 
+// 同步状态（T1 的同步块）：`State` 取 ok/failed/never，`Message` 是失败原因原文。
+// 同步失败时页面**保留旧快照**并显示失败原因与上次成功时间，不清空（Spec P02 验收 3）。
+export interface TopologySync {
+  LastSuccessAt: string
+  LastRunAt: string
+  State: 'ok' | 'failed' | 'never' | ''
+  Message: string
+  Created: number
+  Stale: number
+}
+
 export interface InternalModelView {
   Items: InternalModel[]
   Links: ModelLink[]
   StaleCount: number
   UnboundExternal: number
   SyncedAt: string
+  Sync: TopologySync
+}
+
+function normalizeTopologySync(raw: Record<string, unknown>): TopologySync {
+  const st = str(pick(raw, 'State', 'state'))
+  return {
+    LastSuccessAt: str(pick(raw, 'LastSuccessAt', 'last_success_at')),
+    LastRunAt: str(pick(raw, 'LastRunAt', 'last_run_at')),
+    State: st === 'ok' || st === 'failed' || st === 'never' ? st : '',
+    Message: str(pick(raw, 'Message', 'message')),
+    Created: num(pick(raw, 'Created', 'created')),
+    Stale: num(pick(raw, 'Stale', 'stale')),
+  }
 }
 
 export function normalizeInternalModels(raw: Record<string, unknown>): InternalModelView {
@@ -364,71 +455,277 @@ export function normalizeInternalModels(raw: Record<string, unknown>): InternalM
     StaleCount: num(pick(raw, 'StaleCount', 'stale_count')) || items.filter((i) => i.Stale).length,
     UnboundExternal: num(pick(raw, 'UnboundExternal', 'unbound_external')),
     SyncedAt: str(pick(raw, 'SyncedAt', 'synced_at')),
+    Sync: normalizeTopologySync(obj(pick(raw, 'Sync', 'sync'))),
   }
+}
+
+// 页面取的是 T1（四层聚合：providers / internal models / bindings / 同步状态）；
+// T4（`/admin/internal-models`）是 P03 的绑定候选接口，形状是同一个 normalizer。
+export function getTopology() {
+  return v2Get('/admin/topology', undefined, normalizeInternalModels)
 }
 
 export function getInternalModels() {
   return v2Get('/admin/internal-models', undefined, normalizeInternalModels)
 }
 
-// ===== 订阅（GET /admin/subscriptions，录入标准待 Spec 定稿；字段来自数据层契约 §2.4） =====
+// 手动同步（T3）：与后台定时同步共用实现，返回拉取数/新增/失效。
+export function syncTopology() {
+  return v2Post('/admin/topology/sync', {}, (raw) => ({
+    Fetched: num(pick(raw, 'Fetched', 'fetched')),
+    Created: num(pick(raw, 'Created', 'created')),
+    Stale: num(pick(raw, 'Stale', 'stale')),
+    Message: str(pick(raw, 'Message', 'message')),
+  }))
+}
+
+// ===== 订阅（P04；接口 S1/S2/S7）=====
+// 字段与校验口径的唯一依据：`docs/designs/2026-11-16-subscription-entry-standard.md`（Spec 2026-11-16 生效版）。
+// 最容易写错的一条：录入端收「元/美元」，落库 `price_amount` 是**积分**
+// （后端 × 1,000,000 ÷ R，USD 先 × cny_rate），所以列表与表单都要同时给「原币」和 `PriceCredits`。
 export type PriceCurrency = 'CNY' | 'USD'
-export type BillingCycle = 'month' | 'year' | 'once'
+export type PricingCycle = 'month' | 'year' | 'once'
+
+// 派生状态（不落列，优先级从上到下，标准 §2.3）
+export type SubscriptionStatus = 'stopped' | 'once' | 'missing_cycle' | 'pending' | 'expired' | 'active'
+
+// 「摊 0 笔」原因码（标准 §5.2）——页面逐条翻译成运营能看懂的文案与处置动作
+export type BlockReasonCode =
+  | 'share_off'
+  | 'price_zero'
+  | 'cycle_once'
+  | 'cycle_missing'
+  | 'cycle_expired'
+  | 'no_billing_rows'
+  | 'no_attribution'
+  | 'account_mismatch'
+  | 'ledger_taken'
+  | 'unknown'
+
+export interface SubscriptionWarning {
+  Code: string
+  Message: string
+}
 
 export interface Subscription {
   ID: string
-  ProviderRef: string
-  AccountRef: string
-  PriceAmount: number
-  PriceCurrency: PriceCurrency
-  BillingCycle: BillingCycle
+  Provider: string
+  Account: string
+  // Price = 原币金额（元 / 美元），仅录入与展示用
+  Price: number
+  Currency: PriceCurrency
+  // PriceCredits = 折算后的积分；null = 后端未折算或缺 R（不要用 0 冒充）
+  PriceCredits: number | null
+  Cycle: PricingCycle
   PayDay: number
   ShareCost: boolean
   CycleStart: string
   Note: string
+  Status: SubscriptionStatus
+  // WillAmortize 只判 C1–C4（静态条件）；C5/C6 是运行时事实，靠本期分摊明细回显
+  WillAmortize: boolean
+  BlockReasons: BlockReasonCode[]
+  Warnings: SubscriptionWarning[]
+  // 本期已摊 / 未摊出（S4 聚合；null = 还没算过）
+  CycleAllocated: number | null
+  CycleUnallocated: number | null
   CreatedAt: string
   UpdatedAt: string
 }
 
+// 录入入参（字段名与标准 §2.1 的「API 字段」一致）
+export interface SubscriptionInput {
+  Provider: string
+  Account: string
+  Price: number
+  Currency: PriceCurrency
+  Cycle: PricingCycle
+  PayDay: number
+  ShareCost: boolean
+  CycleStart: string
+  Note: string
+}
+
+// 录入页候选（S7）：provider 只能从镜像里选，账号是软候选（可手输但要提示风险）
+export interface SubscriptionFormOptions {
+  Providers: string[]
+  Accounts: string[]
+  // 汇率可用性：USD 录入的前置条件（缺 → 422 rate_not_configured）
+  CnyRate: number | null
+  R: number | null
+}
+
 export interface SubscriptionView {
   Items: Subscription[]
-  MonthlyTotal: number
-  UnstartedCount: number
+  Total: number
 }
 
 const CURRENCIES: PriceCurrency[] = ['CNY', 'USD']
-const CYCLES: BillingCycle[] = ['month', 'year', 'once']
+const CYCLES: PricingCycle[] = ['month', 'year', 'once']
+const STATUSES: SubscriptionStatus[] = ['stopped', 'once', 'missing_cycle', 'pending', 'expired', 'active']
+const BLOCK_CODES: BlockReasonCode[] = [
+  'share_off',
+  'price_zero',
+  'cycle_once',
+  'cycle_missing',
+  'cycle_expired',
+  'no_billing_rows',
+  'no_attribution',
+  'account_mismatch',
+  'ledger_taken',
+  'unknown',
+]
+
+function codeList(v: unknown): BlockReasonCode[] {
+  if (!Array.isArray(v)) return []
+  return (v as unknown[]).map((x) => String(x) as BlockReasonCode).filter((x) => BLOCK_CODES.includes(x))
+}
+
+function parseDay(v: string): Date | null {
+  // 只接受 YYYY-MM-DD（标准 §3.1 的录入格式），其余按「没填」处理
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(v)) return null
+  const d = new Date(`${v}T00:00:00`)
+  return isNaN(d.getTime()) ? null : d
+}
+
+function ymd(d: Date): string {
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
+}
+
+// cycleEnd：账期窗口右端（不含）。month +1 月、year +1 年、once 视为当天结束。
+export function cycleEnd(cycleStart: string, cycle: PricingCycle): Date | null {
+  const start = parseDay(cycleStart)
+  if (!start) return null
+  if (cycle === 'once') return new Date(start.getTime() + 86400_000)
+  const d = new Date(start.getTime())
+  if (cycle === 'year') d.setFullYear(d.getFullYear() + 1)
+  else d.setMonth(d.getMonth() + 1)
+  return d
+}
+
+// deriveSubscriptionStatus：前端也按同一优先级算一次（列表标签/排序要用）。
+// 口径与标准 §2.3 逐条一致，后端返回 Status 时以返回值为准。
+export function deriveSubscriptionStatus(
+  s: Pick<Subscription, 'ShareCost' | 'Cycle' | 'CycleStart'>,
+  today = new Date(),
+): SubscriptionStatus {
+  if (!s.ShareCost) return 'stopped'
+  if (s.Cycle === 'once') return 'once'
+  if (!s.CycleStart) return 'missing_cycle'
+  const t = new Date(today.getFullYear(), today.getMonth(), today.getDate())
+  const start = parseDay(s.CycleStart)
+  if (!start) return 'missing_cycle'
+  if (start.getTime() > t.getTime()) return 'pending'
+  const end = cycleEnd(s.CycleStart, s.Cycle)
+  if (!end) return 'missing_cycle'
+  if (t.getTime() >= end.getTime()) return 'expired'
+  return 'active'
+}
+
+// willAmortize：只判 C1–C4（标准 §5.1）。C5/C6 不许在这里承诺。
+export function staticAmortizeVerdict(
+  s: Pick<Subscription, 'ShareCost' | 'Cycle' | 'CycleStart' | 'Price'>,
+  priceCredits: number | null,
+  today = new Date(),
+): { will: boolean; reasons: BlockReasonCode[] } {
+  const reasons: BlockReasonCode[] = []
+  if (!s.ShareCost) reasons.push('share_off')
+  const credits = priceCredits == null ? s.Price : priceCredits
+  if (!(credits > 0)) reasons.push('price_zero')
+  if (s.Cycle === 'once') reasons.push('cycle_once')
+  if (s.ShareCost && s.Cycle !== 'once') {
+    if (!s.CycleStart) reasons.push('cycle_missing')
+    else if (deriveSubscriptionStatus(s, today) === 'expired') reasons.push('cycle_expired')
+    else if (deriveSubscriptionStatus(s, today) === 'pending') return { will: false, reasons }
+  }
+  return { will: reasons.length === 0, reasons }
+}
 
 export function normalizeSubscriptions(raw: Record<string, unknown>): SubscriptionView {
   const items = arr(pick(raw, 'Items', 'items')).map((s): Subscription => {
-    const cur = str(pick(s, 'PriceCurrency', 'price_currency')) as PriceCurrency
-    const cyc = str(pick(s, 'BillingCycle', 'billing_cycle')) as BillingCycle
+    const cur = str(pick(s, 'Currency', 'PriceCurrency', 'price_currency')) as PriceCurrency
+    const cyc = str(pick(s, 'Cycle', 'BillingCycle', 'billing_cycle')) as PricingCycle
+    const cycle: PricingCycle = CYCLES.includes(cyc) ? cyc : 'month'
+    const shareCost = pick(s, 'ShareCost', 'share_cost') !== false
+    const cycleStart = str(pick(s, 'CycleStart', 'cycle_start'))
+    const price = num(pick(s, 'Price', 'PriceAmount', 'price_amount'))
+    const base = { ShareCost: shareCost, Cycle: cycle, CycleStart: cycleStart, Price: price }
+    const creditsRaw = pick(s, 'PriceCredits', 'price_credits')
+    const priceCredits = creditsRaw === undefined ? null : numOrNull(creditsRaw)
+    const statusRaw = str(pick(s, 'Status', 'status')) as SubscriptionStatus
+    const derived = staticAmortizeVerdict(base, priceCredits)
+    const reasonsRaw = pick(s, 'BlockReasons', 'block_reasons')
     return {
       ID: str(pick(s, 'ID', 'id')),
-      ProviderRef: str(pick(s, 'ProviderRef', 'provider_ref')),
-      AccountRef: str(pick(s, 'AccountRef', 'account_ref')),
-      PriceAmount: num(pick(s, 'PriceAmount', 'price_amount')),
-      PriceCurrency: CURRENCIES.includes(cur) ? cur : 'CNY',
-      BillingCycle: CYCLES.includes(cyc) ? cyc : 'month',
+      Provider: str(pick(s, 'Provider', 'ProviderRef', 'provider_ref')),
+      Account: str(pick(s, 'Account', 'AccountRef', 'account_ref')),
+      Price: price,
+      Currency: CURRENCIES.includes(cur) ? cur : 'CNY',
+      PriceCredits: priceCredits,
+      Cycle: cycle,
       PayDay: num(pick(s, 'PayDay', 'pay_day')) || 1,
-      ShareCost: pick(s, 'ShareCost', 'share_cost') !== false,
-      CycleStart: str(pick(s, 'CycleStart', 'cycle_start')),
+      ShareCost: shareCost,
+      CycleStart: cycleStart,
       Note: str(pick(s, 'Note', 'note')),
+      Status: STATUSES.includes(statusRaw) ? statusRaw : deriveSubscriptionStatus(base),
+      WillAmortize: pick(s, 'WillAmortize', 'will_amortize') === undefined ? derived.will : Boolean(pick(s, 'WillAmortize', 'will_amortize')),
+      BlockReasons: reasonsRaw === undefined ? derived.reasons : codeList(reasonsRaw),
+      Warnings: arr(pick(s, 'Warnings', 'warnings')).map((w) => ({
+        Code: str(pick(w, 'Code', 'code')),
+        Message: str(pick(w, 'Message', 'message')),
+      })),
+      CycleAllocated: numOrNull(pick(s, 'CycleAllocated', 'cycle_allocated')),
+      CycleUnallocated: numOrNull(pick(s, 'CycleUnallocated', 'cycle_unallocated')),
       CreatedAt: str(pick(s, 'CreatedAt', 'created_at')),
       UpdatedAt: str(pick(s, 'UpdatedAt', 'updated_at')),
     }
   })
-  return {
-    Items: items,
-    // 月费合计只做「同币种可加」的粗算：CNY 直接累加，USD 不换算（换算只在成本侧一次，前端不引第二套汇率）。
-    MonthlyTotal:
-      Math.round(
-        items.filter((i) => i.PriceCurrency === 'CNY' && i.BillingCycle === 'month').reduce((s, i) => s + i.PriceAmount, 0) * 1e5,
-      ) / 1e5,
-    UnstartedCount: items.filter((i) => !i.CycleStart).length,
-  }
+  return { Items: items, Total: num(pick(raw, 'Total', 'total')) || items.length }
 }
 
-export function getSubscriptions() {
-  return v2Get('/admin/subscriptions', undefined, normalizeSubscriptions)
+export function getSubscriptions(params: {
+  Provider?: string
+  Account?: string
+  Status?: SubscriptionStatus
+  ShareCost?: boolean
+  Page?: number
+  Size?: number
+} = {}) {
+  return v2Get('/admin/subscriptions', params, normalizeSubscriptions)
 }
+
+export function getSubscriptionFormOptions() {
+  return v2Get('/admin/subscriptions/form-options', undefined, (raw): SubscriptionFormOptions => {
+    const providers = Array.isArray(pick(raw, 'Providers', 'providers')) ? (pick(raw, 'Providers', 'providers') as unknown[]) : []
+    const accounts = Array.isArray(pick(raw, 'Accounts', 'accounts')) ? (pick(raw, 'Accounts', 'accounts') as unknown[]) : []
+    return {
+      Providers: providers.map((p) => String(p)),
+      Accounts: accounts.map((a) => String(a)),
+      CnyRate: numOrNull(pick(raw, 'CnyRate', 'cny_rate')),
+      R: numOrNull(pick(raw, 'R', 'r')),
+    }
+  })
+}
+
+// 新建（S2）。本期**不写库**，页面拿它做「接口就绪后即可接通」的接线点；
+// 409 的 ExistingID 由页面用 (Provider, Account) 在本地列表里反查——不额外造一遍请求。
+export function createSubscription(input: SubscriptionInput) {
+  return v2Post('/admin/subscriptions', input, (raw) => normalizeSubscriptions({ Items: [raw] }).Items[0])
+}
+
+// 折算积分：录入页实时显示「≈ N 积分」。与后端同源公式（× 1e6 ÷ R，USD 先 × cny_rate）。
+// 缺 R / 缺汇率时返回 null（页面显示「—」，不许显示 0 让人以为不花钱）。
+export function priceToCredits(price: number, currency: PriceCurrency, cnyRate: number | null, r: number | null): number | null {
+  if (!r || r <= 0) return null
+  if (!Number.isFinite(price) || price < 0) return null
+  let cny = price
+  if (currency === 'USD') {
+    if (!cnyRate || cnyRate <= 0) return null
+    cny = price * cnyRate
+  }
+  // 后端落 NUMERIC(20,5)：这里按 5 位小数四舍五入，保证页面上「≈ N 积分」和落库值看到的是同一个数量级
+  return Math.round(((cny * 1_000_000) / r) * 1e5) / 1e5
+}
+
+export { ymd as formatYmd }

@@ -1,6 +1,7 @@
 import { ref, type Ref } from 'vue'
 import type { V2Load } from '@/api/v2'
 import type { V2PageState } from '@/components/v2/types'
+import { MOCK_ENABLED } from '@/mock'
 
 // V2 页面统一取数：三态（live / pending / error）+ 演示数据开关。
 //
@@ -29,6 +30,13 @@ export function useV2Load<T>(loader: () => Promise<V2Load<T>>, demo: () => T) {
     }
     data.value = null
     if (res.state === 'pending') {
+      // `VITE_MOCK=1`（演示环境）：接口未就绪直接上 `src/mock/<page>.ts` 的数据，
+      // 页面顶部照旧挂「演示数据 · 接口待接入」条——演示环境不该看到空态。
+      // 生产/联调不设该变量：仍是空态 + 用户主动点「预览演示数据」。
+      if (MOCK_ENABLED) {
+        showDemo()
+        return
+      }
       state.value = 'pending'
       return
     }
