@@ -38,7 +38,7 @@ func TestScanExternal_MagpieModelNormalization(t *testing.T) {
 			s, mock := mockService(t)
 			mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + cols + ` FROM external_models WHERE id = $1`)).WithArgs(int64(1)).
 				WillReturnRows(sqlmock.NewRows(extCols).
-					AddRow(int64(1), "m", "", true, `{"input":1}`, nil, nil, `[]`, c.raw, now, now))
+					AddRow(int64(1), "m", "", true, `{"input":1}`, nil, nil, `[]`, c.raw, nil, now, now))
 			m, err := s.store.GetByID(context.Background(), 1)
 			if err != nil {
 				t.Fatalf("get by id: %v", err)
@@ -178,6 +178,121 @@ func TestViewModels_MagpieModelOnlyOnAdmin(t *testing.T) {
 	for _, leak := range []string{"openai/gpt-4o", "MagpieModel", "magpie_model", "magpie"} {
 		if strings.Contains(string(devRaw), leak) {
 			t.Fatalf("对外视图泄漏内部映射（%s）: %s", leak, devRaw)
+		}
+	}
+}
+
+// TestAdminView_BoundInternalRefAlwaysPresent 是「内部模型绑定」列的契约守门用例。
+//
+// 背景：`external_models.bound_internal_ref` 是 0019 加的绑定真源（0024 保留、索引也在），
+// 但管理端模型列表一度**不返回该字段**（cols 里没有它）→ 前端 `hasBinding` 判 false，
+// 「内部模型绑定」列与「未绑定 · 不售卖」红色横幅永不出现，未绑定模型会被当成正常售卖。
+//
+// 两条不变量：
+//  1. 字段必须**始终存在**（未绑定给 null，不是省略）—— 前端靠「字段存在」决定渲不渲染；
+//  2. 未绑定与已绑定必须可区分（null vs ref 字符串），空串按未绑定归一。
+func TestAdminView_BoundInternalRefAlwaysPresent(t *testing.T) {
+	base := func() *ExternalModel {
+		return &ExternalModel{ID: 1, ExternalName: "tenant-gpt", Enabled: true,
+			SaleRates: map[string]float64{"input": 1}, MagpieModel: strPtr("openai/gpt-4o")}
+	}
+
+	// 已绑定：回 ref 原文。
+	bound := base()
+	bound.BoundInternalRef = strPtr("openai/gpt-4o")
+	raw, err := json.Marshal(toAdminView(bound))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if v, ok := got["BoundInternalRef"]; !ok || v != "openai/gpt-4o" {
+		t.Fatalf("已绑定的管理端视图应带 BoundInternalRef=openai/gpt-4o，实际 %v（键存在=%v）", v, ok)
+	}
+
+	// 未绑定：字段必须在，值为 null。
+	rawUnbound, err := json.Marshal(toAdminView(base()))
+	if err != nil {
+		t.Fatalf("marshal unbound: %v", err)
+	}
+	var gotUnbound map[string]any
+	if err := json.Unmarshal(rawUnbound, &gotUnbound); err != nil {
+		t.Fatalf("unmarshal unbound: %v", err)
+	}
+	if v, ok := gotUnbound["BoundInternalRef"]; !ok {
+		t.Fatalf("未绑定时字段也必须存在（前端靠字段存在决定是否渲染该列），实际缺失: %s", rawUnbound)
+	} else if v != nil {
+		t.Fatalf("未绑定时应为 null，实际 %v", v)
+	}
+
+	// 对外视图仍然不带该字段：绑定是内部拓扑，属管理端信息。
+	devRaw, err := json.Marshal(toView(bound))
+	if err != nil {
+		t.Fatalf("marshal dev view: %v", err)
+	}
+	if strings.Contains(string(devRaw), "BoundInternalRef") || strings.Contains(string(devRaw), "bound_internal_ref") {
+		t.Fatalf("对外视图不该出现内部绑定字段: %s", devRaw)
+	}
+}
+
+// TestScanExternal_BoundInternalRefNormalization 断言 DB 值到模型字段的归一：
+// NULL / 空串 / 纯空白 → nil（未绑定只有一种表示），有值则 trim 后保留。
+func TestScanExternal_BoundInternalRefNormalization(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  any
+		want *string
+	}{
+		{name: "null", raw: nil, want: nil},
+		{name: "empty", raw: "", want: nil},
+		{name: "blank", raw: "   ", want: nil},
+		{name: "value", raw: " anthropic/claude-sonnet-4 ", want: strPtr("anthropic/claude-sonnet-4")},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			db, mock, err := sqlmock.New()
+			if err != nil {
+				t.Fatalf("sqlmock: %v", err)
+			}
+			defer db.Close()
+			now := time.Now()
+			mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + cols + ` FROM external_models WHERE id = $1`)).WithArgs(int64(1)).
+				WillReturnRows(sqlmock.NewRows(extCols).
+					AddRow(int64(1), "m", "", true, `{"input":1}`, nil, nil, `[]`, nil, c.raw, now, now))
+
+			store := NewStore(db)
+			got, err := store.GetByID(context.Background(), 1)
+			if err != nil {
+				t.Fatalf("GetByID: %v", err)
+			}
+			if c.want == nil {
+				if got.BoundInternalRef != nil {
+					t.Fatalf("%s：应为「未绑定」(nil)，实际 %q", c.name, *got.BoundInternalRef)
+				}
+				return
+			}
+			if got.BoundInternalRef == nil || *got.BoundInternalRef != *c.want {
+				t.Fatalf("%s：应归一为 %q，实际 %v", c.name, *c.want, got.BoundInternalRef)
+			}
+		})
+	}
+}
+
+// TestColsMatchExtCols 是「SELECT 列清单 ↔ 扫描目标 ↔ 测试行构造」三方对齐的护栏。
+//
+// cols 是拼进 SQL 的字符串、scanExternal 是逐个目标 Scan、extCols 是 sqlmock 的行列名，
+// 三处各自维护；漏改一处时单测可能因为「sqlmock 用同一个 cols 拼期望」而侥幸全绿，
+// 到真库才 42703/列错位。这里把「列数」这一维固定下来。
+func TestColsMatchExtCols(t *testing.T) {
+	parts := strings.Split(cols, ",")
+	if len(parts) != len(extCols) {
+		t.Fatalf("cols 有 %d 列，extCols 有 %d 列 —— 两处必须同步（否则真库列错位）", len(parts), len(extCols))
+	}
+	for i, p := range parts {
+		if got, want := strings.TrimSpace(p), extCols[i]; got != want {
+			t.Fatalf("第 %d 列不一致：cols=%q extCols=%q", i+1, got, want)
 		}
 	}
 }
