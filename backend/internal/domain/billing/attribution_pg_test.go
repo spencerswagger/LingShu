@@ -210,15 +210,19 @@ func TestAttribution_RealSchema_WriteAndReadBack(t *testing.T) {
 	}
 }
 
-// TestBilling_DimensionFromCallLogs 在 0024 之后的 schema 上断言维度口径。
+// TestBilling_DimensionFromCallLogs 在 0024 之后的 schema 上断言维度口径（schema + 行为）。
 //
 // 口径已变（0024 把渠道族删了）：`billing_records.channel_key_id` 与 `sessions.channel_key_id`
 // 都不再存在，维度只可能来自 `call_logs.channel_key_id`（1:1 快照，0024 明确保留该列）。
 //
-// 本用例只断言**schema 事实**（列在/列不在），行为断言（列表回填、按维度过滤、详情回填）
-// 依赖「写路径不再写被删列」的代码摘除——那是 P0 代码债（见交付文档未完成项），
-// 在它修好之前 store.Insert 会 42703，行为无法在这个 schema 上验证。
-// 所以这里显式 Skip 行为段，而不是把断言改成「永远通过」：绿不能假装成验证过。
+// 本用例曾显式 Skip 行为段，理由是「写路径仍写被删列 → 42703；console 仍 JOIN 已删表 → 42P01」。
+// 那两笔债随渠道域代码摘除一并清掉了（账单 INSERT 不再写该列、过滤改走 call_logs 的 EXISTS
+// 子查询、详情/列表由 fillChannelKeys 回填），所以行为段已恢复真跑：
+//
+//   - 写：带维度的账单能落库（不再 42703）；
+//   - 回填：详情按 call_logs 快照回填 42；无快照行留 0（不是错误、不猜值）；
+//   - 过滤：按维度筛选命中快照值，不命中旁值（证明 EXISTS 子查询限定的是外层 billing_records.billing_id，
+//     不是子查询自己的列——PR #63 踩过「裸 billing_id 恒真」的同类坑）。
 func TestBilling_DimensionFromCallLogs(t *testing.T) {
 	conn := openAttributionTempDB(t)
 	ctx := context.Background()
@@ -256,6 +260,75 @@ func TestBilling_DimensionFromCallLogs(t *testing.T) {
 		}
 	}
 
-	t.Skip("维度读写的端到端验证等 P0 代码债（写路径仍写被删列 → 42703；" +
-		"console 仍 JOIN 已删表 → 42P01）修好后补：见交付文档「未完成项」")
+	// ── 行为段（原来 Skip 的部分）：写 → 快照 → 回填 → 过滤 ────────────────
+	store := NewSqlStore(conn)
+	seedBillingUser(t, conn)
+
+	// 1) 写：请求里带维度值，落库不许失败（此前 INSERT 写被删列 → 42703）。
+	dim := newRealStoreRecord("bill-dim-1")
+	dim.ChannelKeyID = 42
+	if _, err := store.Insert(ctx, dim); err != nil {
+		t.Fatalf("0024 + 代码摘除之后账单写入必须成功（不再写被删列）: %v", err)
+	}
+	if _, err := store.Insert(ctx, newRealStoreRecord("bill-dim-2")); err != nil {
+		t.Fatalf("无维度账单写入失败: %v", err)
+	}
+
+	// 2) 快照：call_logs.channel_key_id 是维度唯一来源（billing_id 唯一，1:1）。
+	if _, err := conn.ExecContext(ctx,
+		`INSERT INTO call_logs(id, billing_id, request_id, channel_key_id, status)
+		 VALUES (900001, 'bill-dim-1', 'req-dim-1', 42, 'completed')`); err != nil {
+		t.Fatalf("插入 call_logs 维度快照失败: %v", err)
+	}
+
+	// 3) 详情回填：有快照 → 42；无快照 → 0（不是错误，也不许拿 NULL 猜）。
+	got1, err := store.GetByBillingID(ctx, "bill-dim-1")
+	if err != nil {
+		t.Fatalf("按 billing_id 查详情失败: %v", err)
+	}
+	if got1.ChannelKeyID != 42 {
+		t.Fatalf("详情维度应由 call_logs 快照回填为 42，got %d", got1.ChannelKeyID)
+	}
+	got2, err := store.GetByBillingID(ctx, "bill-dim-2")
+	if err != nil {
+		t.Fatalf("查无快照账单失败（无快照不是错误）: %v", err)
+	}
+	if got2.ChannelKeyID != 0 {
+		t.Fatalf("无快照行的维度应留 0（渠道体系下线后的既定语义），got %d", got2.ChannelKeyID)
+	}
+
+	// 4) 过滤：按维度筛命中快照值，且不命中旁值。
+	uid := int64(7)
+	hit, totalHit, err := store.ListRecords(ctx, RecordFilter{UserID: &uid, ChannelKeyID: &dim.ChannelKeyID, Size: 10})
+	if err != nil {
+		t.Fatalf("按维度过滤失败（SQL 里若是裸 billing_id 会恒真/报错）: %v", err)
+	}
+	if totalHit != 1 || len(hit) != 1 || hit[0].BillingID != "bill-dim-1" {
+		t.Fatalf("按维度 42 过滤应只命中 bill-dim-1，got total=%d len=%d %v", totalHit, len(hit), billingIDs(hit))
+	}
+	other := int64(43)
+	miss, totalMiss, err := store.ListRecords(ctx, RecordFilter{UserID: &uid, ChannelKeyID: &other, Size: 10})
+	if err != nil {
+		t.Fatalf("按旁值维度过滤失败: %v", err)
+	}
+	if totalMiss != 0 || len(miss) != 0 {
+		t.Fatalf("按维度 43 过滤不应命中任何账单，got total=%d %v", totalMiss, billingIDs(miss))
+	}
+	// 不过滤维度时两条都在：证明上一步的「不命中」是过滤生效，不是查询本身坏了。
+	all, totalAll, err := store.ListRecords(ctx, RecordFilter{UserID: &uid, Size: 10})
+	if err != nil {
+		t.Fatalf("无维度过滤查询失败: %v", err)
+	}
+	if totalAll != 2 || len(all) != 2 {
+		t.Fatalf("不过滤时应看到 2 条账单，got total=%d %v", totalAll, billingIDs(all))
+	}
+}
+
+// billingIDs 把记录列表压成 id 串，便于失败信息一眼看出命中了谁。
+func billingIDs(recs []Record) []string {
+	out := make([]string, 0, len(recs))
+	for i := range recs {
+		out = append(out, recs[i].BillingID)
+	}
+	return out
 }
