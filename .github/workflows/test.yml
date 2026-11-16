@@ -7,8 +7,12 @@
 name: Test
 
 on:
+  # 特性分支直接跑同一套门禁（内容与 main 完全一致，不增不减）：
+  # V2 一期两条分支的 PR 基线不是 main（#82 堆在 #81 之上），主干 pull_request 的
+  # branches 过滤只认 base=main，这类分支推送原本不会产出任何检查。此处仅补触发范围，
+  # 分支合并后该通配可移除。
   push:
-    branches: [main]
+    branches: [main, 'feat/lingshu-v2-p1-*']
   pull_request:
     branches: [main]
   workflow_dispatch:
