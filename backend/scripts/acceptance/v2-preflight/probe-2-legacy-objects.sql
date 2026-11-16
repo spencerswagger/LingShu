@@ -20,10 +20,27 @@
 --
 -- 期望输出：0 行。
 
-SELECT 'billing_records 存在本批新增的旧口径数据' AS verdict,
-       count(*) AS rows_with_legacy_values
-  FROM billing_records
- WHERE magpie_key_name IS NOT NULL
-    OR estimated IS NOT NULL
-    OR upstream_usage IS NOT NULL
-HAVING count(*) > 0;
+-- 三列可能**整体不存在**（干净库就是这个状态，且是正常的）：所以先判列，再动态查数据，
+-- 不能让「列不存在」把探测本身打成 SQL 错误。
+-- psql 自动提交模式下每条语句各自成事务，所以**不能**用 ON COMMIT DROP（临时表会立刻消失）；
+-- 用 DROP IF EXISTS 保证可重复执行。
+DROP TABLE IF EXISTS _probe2;
+CREATE TEMP TABLE _probe2(verdict text, n bigint);
+
+DO $probe2$
+BEGIN
+    IF (SELECT count(*) FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'billing_records'
+           AND column_name IN ('magpie_key_name', 'estimated', 'upstream_usage')) = 3 THEN
+        EXECUTE $q$INSERT INTO _probe2
+                  SELECT 'billing_records 存在本批新增的旧口径数据', count(*)
+                    FROM billing_records
+                   WHERE magpie_key_name IS NOT NULL
+                      OR estimated IS NOT NULL
+                      OR upstream_usage IS NOT NULL$q$;
+    END IF;
+END
+$probe2$;
+
+SELECT verdict, n AS rows_with_legacy_values FROM _probe2 WHERE n > 0;
+DROP TABLE IF EXISTS _probe2;
