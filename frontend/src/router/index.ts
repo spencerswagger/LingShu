@@ -41,14 +41,13 @@ const router = createRouter({
         { path: 'channel-protocols/:pathMatch(.*)*', redirect: '/admin/topology' },
         { path: 'tags/:pathMatch(.*)*', redirect: '/admin/topology' },
         { path: 'service-status', redirect: '/admin/topology' },
-        // 模型（列表内含「模型 / Auto 模型」页内切换）
-        { path: 'models', name: 'admin-models', component: () => import('@/views/admin/ModelsPage.vue'), meta: { title: '模型' } },
+        // 模型（Auto 模型族已与渠道族同批退役：页内切换与 Auto 页一并删除，这里只剩对外模型列表）
+        { path: 'models', name: 'admin-models', component: () => import('@/views/admin/ModelList.vue'), meta: { title: '模型' } },
         { path: 'models/create', name: 'admin-model-create', component: () => import('@/views/admin/ModelCreate.vue'), meta: { title: '新建模型' } },
         { path: 'models/:id/edit', name: 'admin-model-edit', component: () => import('@/views/admin/ModelEdit.vue'), meta: { title: '编辑模型' } },
-        // Auto 模型（列表已并入「模型」页内切换，这里仅保留新建/编辑子页）
-        { path: 'auto-models', redirect: '/admin/models' },
-        { path: 'auto-models/create', name: 'admin-auto-model-create', component: () => import('@/views/admin/AutoModelCreate.vue'), meta: { title: '新建 Auto 模型' } },
-        { path: 'auto-models/:id/edit', name: 'admin-auto-model-edit', component: () => import('@/views/admin/AutoModelEdit.vue'), meta: { title: '编辑 Auto 模型' } },
+        // Auto 模型（auto_models / auto_model_members，0024 删表、接口 410）整体下线：
+        // 与渠道族同一套「1 行老书签兜底」，落到对外模型列表，不留死链。
+        { path: 'auto-models/:pathMatch(.*)*', redirect: '/admin/models' },
         // 用户管理
         { path: 'users', name: 'admin-users', component: () => import('@/views/admin/UserList.vue'), meta: { title: '用户' } },
         { path: 'users/create', name: 'admin-user-create', component: () => import('@/views/admin/UserCreate.vue'), meta: { title: '新建用户' } },
@@ -100,26 +99,12 @@ const router = createRouter({
         {
           path: 'models',
           name: 'dev-model-list',
-          component: () => import('@/views/admin/ModelsPage.vue'),
+          component: () => import('@/views/admin/ModelList.vue'),
           meta: { title: '模型' },
           props: { mode: 'self' },
         },
-        // Auto 模型（开发者端：global 只读 + 本人 private 可写；列表已并入「模型」页内切换）
-        { path: 'auto-models', redirect: '/dev/models' },
-        {
-          path: 'auto-models/create',
-          name: 'dev-auto-model-create',
-          component: () => import('@/views/admin/AutoModelCreate.vue'),
-          meta: { title: '新建 Auto 模型' },
-          props: { mode: 'self' },
-        },
-        {
-          path: 'auto-models/:id/edit',
-          name: 'dev-auto-model-edit',
-          component: () => import('@/views/admin/AutoModelEdit.vue'),
-          meta: { title: '编辑 Auto 模型' },
-          props: { mode: 'self' },
-        },
+        // Auto 模型族整体下线（同管理端）：老书签兜底到模型列表。
+        { path: 'auto-models/:pathMatch(.*)*', redirect: '/dev/models' },
         {
           path: 'sessions',
           name: 'dev-sessions',

@@ -5,7 +5,6 @@ import {
   listBillings,
   getBillingStats,
   listExternalModels,
-  listAutoModels,
   listSessions,
   listTokens,
   type AdminBillingItem,
@@ -65,7 +64,6 @@ const stats = ref<BillingStats>({
 // 渠道 / 渠道密钥在 V2 整体下线（后端接口 410、表已删 0024）：不再加载候选，也不再提供这两个筛选项。
 // 账单行上的 channel_name / key_name 字段仍由后端返回（结构不删），拿到就显示，拿不到显示 '-'。
 const models = ref<ExternalModel[]>([])
-const autoNames = ref<string[]>([])
 const tokens = ref<AdminToken[]>([])
 const sessions = ref<AdminSession[]>([])
 // 当前所选用户名（用于筛选标签展示）
@@ -244,17 +242,6 @@ async function loadModels() {
     models.value = []
   }
 }
-// Auto 名一并作为模型筛选项：Auto 请求的账单 external_model_name 记命中成员名，
-// 但用户按 Auto 名也应能搜到（后端 Model 过滤同时匹配 auto_model_name）。
-async function loadAutoNames() {
-  if (autoNames.value.length) return
-  try {
-    const res = await listAutoModels({}, base.value)
-    autoNames.value = (res.Data || []).map((a) => a.Name)
-  } catch {
-    autoNames.value = []
-  }
-}
 async function loadTokensOfUser() {
   // self 模式无 admin 令牌接口，跳过，避免 403 噪音。
   if (isSelf.value) return
@@ -401,7 +388,6 @@ function reset() {
 
 onMounted(() => {
   loadModels()
-  loadAutoNames()
   searchSessions('')
   loadTokensOfUser()
   load()
@@ -764,12 +750,6 @@ function sessionLabel(s: AdminSession): string {
                 size="small"
               >
                 <el-option v-for="m in models" :key="m.ID" :label="m.ExternalName" :value="m.ExternalName" />
-                <el-option
-                  v-for="n in autoNames"
-                  :key="'auto-' + n"
-                  :label="n + '（Auto）'"
-                  :value="n"
-                />
               </el-select>
             </ColumnFilter>
           </template>

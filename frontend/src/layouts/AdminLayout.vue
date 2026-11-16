@@ -61,8 +61,7 @@ function activeMenu() {
   ]) {
     if (p.startsWith(m)) return m
   }
-  // Auto 模型为「模型」页内切换的视图，归入「模型」菜单高亮
-  if (p.startsWith('/admin/auto-models')) return '/admin/models'
+  // Auto 模型族已下线（老书签由路由 redirect 兜底到模型列表），无需再映射高亮
   if (p.startsWith('/admin/system')) return '/admin/system'
   return p
 }

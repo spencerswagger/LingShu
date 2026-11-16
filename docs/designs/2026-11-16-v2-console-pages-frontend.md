@@ -190,3 +190,25 @@
 
 **自查**：`grep -rn "/admin/channels\|/admin/channel-protocols\|/admin/tags\|/dev/tags" frontend/src --include=*.ts --include=*.vue` → **0 命中**。
 DOM 走查：`/data/pv/v2-channel-removal-check.mjs`（菜单 18 项、老路径 4 条兜底、账单列降级、模型/系统/令牌残留、全程零渠道接口请求）全绿；`vue-tsc` 零错、`vite build` 通过。
+
+### 8.1 Auto 模型族同批摘除（2026-11-16 追加，Gate 复核提出）
+
+Auto 模型（`auto_models` / `auto_model_members`）与渠道族是同一批退役的表（0024 删表、接口 410），
+前端原先仍有 10 处调用（5 个封装 × 管理端/开发者端两套 base），且「新建 / 编辑 Auto 模型」两页能点进去、保存必报错。
+
+| 项 | 处理 |
+|---|---|
+| 请求封装 | 删 5 个（`listAutoModels` / `getAutoModel` / `createAutoModel` / `updateAutoModel` / `deleteAutoModel`）= **10 处端点调用**（`/admin/auto-models*` 与 `/dev/auto-models*`） |
+| DTO | 删 `AutoModel` / `AutoModelMember` / `AutoModelInput` |
+| 页面 | 删 4 个：`AutoModelList.vue` / `AutoModelCreate.vue` / `AutoModelEdit.vue` / `ModelsPage.vue`（原「模型 / Auto 模型」页内切换壳），组件删 `AutoModelMembers.vue` |
+| 路由 | 删 6 条节点（管理端 3 + 开发者端 3），按既有规则留 **2 条老书签兜底** redirect：`auto-models/:pathMatch(.*)*` → `/admin/models` 与 `/dev/models`；模型页直接挂 `ModelList.vue`（不再有页内切换） |
+| 菜单高亮 | 两个 Layout 里「auto 归入模型高亮」的映射删除（路径已被 redirect 吃掉，映射成死代码） |
+| 账单页 | 模型筛选不再合并 Auto 名（不再请求 `/admin/auto-models`）；账单行上的 `AutoModelName` 属响应字段，**结构保留、照后端返回显示** |
+
+**为什么不退成只读**：Auto 模型表与成员表都已删除，没有任何可展示的数据来源，「只读页」会是一片空壳；因此整体下线 + 兜底跳转，与渠道族处理一致。
+
+**自查**：`grep -rn "auto-models\|AutoModel\|ModelsPage" frontend/src --include=*.ts --include=*.vue` → 仅剩 2 条 redirect（`AutoModelName` 是账单响应字段，不算残留）。
+DOM 走查 `/data/pv/v2-auto-removal-check.mjs`（模型页无 Auto 切换、6 条老路径兜底且无保存按钮、账单不请求 auto-models、零运行时错误）16 项全绿。
+
+**未动（明确不属本轮）**：令牌 `callerKey`（前端本无绑定入口，不新做）、模型「内部模型绑定」列（后端列表接口未返回该字段，属 Core 侧契约缺口，前端不造假数据）。
+
