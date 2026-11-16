@@ -46,13 +46,21 @@ var _ CountWriter = (*SQLWindowStore)(nil)
 //
 // 只认 status=ok：alarm 也算「已拉完但对不上账」，进度可以推进；blocked/error 没拉完，
 // 推进水位线就等于把没落库的数据永久跳过。
+//
+// ⚠️ 还必须只认**同步轮次写过的行**（`detail ? 'fetched'`）：对账服务现在会在「同步没跑过」
+// 的窗口上自行建行（SaveCounts 用 upsert），那些行同样是 status='ok'/'skipped'。
+// 若把它们算进水位线，同步下一轮就会从「对账刚建的窗」之后开始拉 —— 中间那段账本从来没拉过，
+// 却因为水位线越过它而永久丢失（这是比漏账更难发现的一类数据丢失）。
+// 同步轮次每行必写 `fetched`（见 save 的 detail），对账不写这个键，所以它是「同步所有」的可靠标记；
+// 不用 `phase` 判：对账会把自己的 phase 合并进同步行，那个键会变。
 func (s *SQLWindowStore) LastSuccessEnd(ctx context.Context) (time.Time, bool, error) {
 	if s == nil || s.db == nil {
 		return time.Time{}, false, fmt.Errorf("窗口存储未装配数据库连接")
 	}
 	var end sql.NullTime
 	err := s.db.QueryRowContext(ctx,
-		`SELECT max(window_end) FROM `+ReconcileWindowsTable+` WHERE status IN ('ok','alarm')`).Scan(&end)
+		`SELECT max(window_end) FROM `+ReconcileWindowsTable+`
+		  WHERE status IN ('ok','alarm') AND detail ? 'fetched'`).Scan(&end)
 	if err != nil {
 		return time.Time{}, false, fmt.Errorf("读取窗口水位线失败：%w", err)
 	}
@@ -177,8 +185,15 @@ func (s *SQLWindowStore) save(ctx context.Context, ex dbx.Execer, rec WindowReco
 //  3. **不碰 scroll_offset**：那是同步轮次的断点，对账写它等于把补拉位置重置。
 //
 // 防呆：blocked / error 由同步轮次持有，对账服务不许覆盖（覆盖 = 把「该拉没拉完」洗成 ok，
-// 漏账从此隐身）。所以 SQL 里带 `AND status NOT IN ('blocked','error')`，
+// 漏账从此隐身）。冲突分支的 `WHERE w.status NOT IN ('blocked','error')` 表达这条；
 // 影响 0 行时返回 ErrWindowNotReconcilable，让调用方知道这一窗本轮没算成。
+//
+// ⚠️ 必须是 **upsert**（2026-11-16 修，P0 半成品）：同步轮次只在自己真的拉过数据的窗口上建行，
+// 而 OLD 实现是 UPDATE-only —— 于是「同步没跑/降级/刚重启」的时间段**一行都没有**，
+// 对账每轮算完写不进去、静默返回 ErrWindowNotReconcilable，四个计数列永远 NULL：
+// 漏账在这条路径上是完全不可见的（正是裁定要防的事）。
+// 现在：有行就更新（受 blocked/error 保护），没行就**由对账建行**（ls/up 两侧计数照样落）。
+// 内存实现 MemoryWindowStore.SaveCounts 本来就是建行的，两边语义由此对齐。
 func (s *SQLWindowStore) SaveCounts(ctx context.Context, c WindowCounts) error {
 	if s == nil || s.db == nil {
 		return fmt.Errorf("窗口存储未装配数据库连接")
@@ -199,18 +214,22 @@ func (s *SQLWindowStore) SaveCounts(ctx context.Context, c WindowCounts) error {
 		return fmt.Errorf("序列化对账明细失败：%w", err)
 	}
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE `+ReconcileWindowsTable+`
-		    SET local_count     = $2,
-		        local_tokens    = $3,
-		        upstream_count  = $4,
-		        upstream_tokens = $5,
-		        status          = $6,
-		        alarm_streak    = $7,
-		        detail          = detail || $8::jsonb,
-		        checked_at      = $9
-		  WHERE window_start = $1
-		    AND status NOT IN ('blocked','error')`,
-		c.Start, c.LocalCount, c.LocalTokens, c.UpstreamCount, c.UpstreamTokens,
+		`INSERT INTO `+ReconcileWindowsTable+` AS w
+		        (window_start, window_end, local_count, local_tokens,
+		         upstream_count, upstream_tokens, status, alarm_streak, detail, checked_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10)
+		 ON CONFLICT (window_start) DO UPDATE
+		    SET window_end      = EXCLUDED.window_end,
+		        local_count     = EXCLUDED.local_count,
+		        local_tokens    = EXCLUDED.local_tokens,
+		        upstream_count  = EXCLUDED.upstream_count,
+		        upstream_tokens = EXCLUDED.upstream_tokens,
+		        status          = EXCLUDED.status,
+		        alarm_streak    = EXCLUDED.alarm_streak,
+		        detail          = w.detail || EXCLUDED.detail,
+		        checked_at      = EXCLUDED.checked_at
+		  WHERE w.status NOT IN ('blocked','error')`,
+		c.Start, c.End, c.LocalCount, c.LocalTokens, c.UpstreamCount, c.UpstreamTokens,
 		string(c.Status), int16(c.AlarmStreak), string(raw), checkedAt)
 	if err != nil {
 		return fmt.Errorf("写入对账计数失败（%s）：%w", c.Start.Format(time.RFC3339), err)
