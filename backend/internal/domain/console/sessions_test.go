@@ -53,7 +53,7 @@ type sessionListBody struct {
 
 // sessionListColsForTest sessions 列表查询列名（与 sessionListCols 顺序一致，供 sqlmock 构造行）。
 func sessionListColsForTest() []string {
-	return []string{"session_id", "user_id", "token_id", "model", "session_raw", "channel_key_id",
+	return []string{"session_id", "user_id", "token_id", "model", "session_raw",
 		"internal_model_id", "created_at", "last_active", "expire_at", "name", "closed"}
 }
 
@@ -82,9 +82,9 @@ func TestHandleListSessions_FilterAndNames(t *testing.T) {
 
 	now := fixedNow()
 	rows := sqlmock.NewRows(sessionListColsForTest()).
-		AddRow("alpha-0001", int64(1), int64(10), "gpt-4", "raw-alpha-0001", int64(100), "gpt-4-int",
+		AddRow("alpha-0001", int64(1), int64(10), "gpt-4", "raw-alpha-0001", "gpt-4-int",
 			now.Add(-time.Hour), now, now.Add(2*time.Hour), "会话一", false).
-		AddRow("alpha-0002", int64(1), nil, "gpt-4", "raw-alpha-0002", int64(100), "gpt-4-int",
+		AddRow("alpha-0002", int64(1), nil, "gpt-4", "raw-alpha-0002", "gpt-4-int",
 			now.Add(-3*time.Hour), now.Add(-2*time.Hour), now.Add(-time.Hour), "", false)
 
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT count(*) FROM sessions WHERE user_id = $1`)).
@@ -114,21 +114,26 @@ func TestHandleListSessions_FilterAndNames(t *testing.T) {
 	if a1.SessionID != "alpha-0001" || a1.SessionName != "会话一" || a1.UserID != 1 || a1.TokenID != 10 {
 		t.Fatalf("item1=%+v", a1)
 	}
-	if a1.UserName != "u1" || a1.TokenName != "tok-a" || a1.ChannelKeyName != "密钥A" {
+	// 渠道密钥名/渠道名已无来源（0024 删表）→ 恒空；用户名/令牌名照常反查。
+	if a1.UserName != "u1" || a1.TokenName != "tok-a" {
 		t.Fatalf("item1 names=%+v", a1)
+	}
+	if a1.ChannelKeyName != "" || a1.ChannelName != "" {
+		t.Fatalf("渠道相关名称必须为空（表已删）: %+v", a1)
 	}
 	if a1.Inflight != 1 {
 		t.Fatalf("alpha-0001 进行中请求数应为 1，got %d", a1.Inflight)
 	}
-	if a1.Expired || a1.ChannelKeyID != 100 || a1.Model != "gpt-4" || a1.SessionRaw != "raw-alpha-0001" {
+	if a1.Expired || a1.Model != "gpt-4" || a1.SessionRaw != "raw-alpha-0001" {
 		t.Fatalf("item1 fields: %+v", a1)
 	}
 	// 历史会话（不在内存）：Expired=true、TokenID=0、Inflight=0。
 	if a2.SessionID != "alpha-0002" || !a2.Expired || a2.TokenID != 0 || a2.Inflight != 0 {
 		t.Fatalf("item2 fields: %+v", a2)
 	}
-	if len(resolvedKeys) != 1 || resolvedKeys[0] != 100 {
-		t.Fatalf("keyNameByIDs 应仅查询展示项的 keyID=%d, got %v", 100, resolvedKeys)
+	// sessions 表已无 channel_key_id：不再有按展示项反查密钥名的动作。
+	if len(resolvedKeys) != 0 {
+		t.Fatalf("渠道体系已下线，不应再反查密钥名，got %v", resolvedKeys)
 	}
 }
 
@@ -145,7 +150,8 @@ func TestSessionListWhere(t *testing.T) {
 		{name: "no-filter", wantWhere: "", wantArgs: 0},
 		{name: "by-user", user: 1, wantWhere: " WHERE user_id = $1", wantArgs: 1},
 		{name: "by-token", tok: 10, wantWhere: " WHERE token_id = $1", wantArgs: 1},
-		{name: "by-key", k: 100, wantWhere: " WHERE channel_key_id = $1", wantArgs: 1},
+		// 渠道体系已下线（0024 删了 sessions.channel_key_id）：该参数仍被解析，但不再参与过滤。
+		{name: "by-key-ignored", k: 100, wantWhere: "", wantArgs: 0},
 		{name: "by-prefix", prefix: "abc", wantWhere: " WHERE starts_with(session_id, $1)", wantArgs: 1},
 		{name: "active", exp: "active", wantWhere: " WHERE expire_at > $1", wantArgs: 1},
 		{name: "expired", exp: "expired", wantWhere: " WHERE expire_at <= $1", wantArgs: 1},
@@ -184,7 +190,7 @@ func TestHandleListSessions_Pagination(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT `+sessionListCols+` FROM sessions ORDER BY last_active DESC, session_id ASC LIMIT $1 OFFSET $2`)).
 		WithArgs(1, 1).
 		WillReturnRows(sqlmock.NewRows(sessionListColsForTest()).
-			AddRow("a2", int64(1), nil, "gpt-4", "raw-a2", int64(100), "gpt-4-int",
+			AddRow("a2", int64(1), nil, "gpt-4", "raw-a2", "gpt-4-int",
 				now.Add(-time.Hour), now, now.Add(time.Hour), "", false))
 
 	rec := httptest.NewRecorder()

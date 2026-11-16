@@ -79,9 +79,7 @@ func TestHandleStatsDashboard_HourlyComparePlaza(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT external_model_name,`)).
 		WillReturnRows(sqlmock.NewRows([]string{"model", "calls", "failed", "credits", "tokens"}).
 			AddRow("gpt-4o", int64(10), int64(1), float64(12.5), int64(170)))
-	mock.ExpectQuery(regexp.QuoteMeta(`JOIN channel_keys ck ON ck.id = br.channel_key_id`)).
-		WillReturnRows(sqlmock.NewRows([]string{"key", "channel", "calls", "failed", "credits", "tokens"}).
-			AddRow("主密钥", "openai", int64(10), int64(1), float64(12.5), int64(170)))
+	// 渠道/密钥维度 Top 已随 0024 下线（dashboardTop 的 ByKey 恒 nil，不再发查询）。
 	mock.ExpectQuery(regexp.QuoteMeta(`JOIN users u ON u.id = br.user_id`)).
 		WillReturnRows(sqlmock.NewRows([]string{"username", "nickname", "calls", "failed", "credits", "tokens"}).
 			AddRow("dev", "开发者", int64(10), int64(1), float64(12.5), int64(170)))

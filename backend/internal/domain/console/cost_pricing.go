@@ -498,37 +498,24 @@ func (h *Admin) HandleCostPricingCurve(w http.ResponseWriter, r *http.Request) {
 	globalTiers := h.loadGlobalContextTiers(r.Context())
 	out.TimeOptions, out.DefaultTimeCoeff = timeOptions(globalTime)
 
-	// 多线对比：先装每条线的配置（只有传了新参数才进这里，旧请求的查询顺序与条数完全不变）。
+	// ⚠️ 渠道体系已下线（0024 删了 channels / channel_keys / channel_models）：
+	//   - **多线对比**依赖「同一内部模型在多个渠道的成本配置」→ 没有这个对象了，`ChannelModelIDs` 忽略；
+	//   - **成本线**的成本价唯一来源是 channel_models.cost_rates → 没有配置源了，成本线置为不可用，
+	//     真实成本改由账本提供（billing_records.cost_credits / ledger_entries，见 /admin/ops/pnl）；
+	//   - 售价线照常：来自 external_models.sale_rates。
 	var multiInputs []multiLineInputs
-	if len(multiIDs) > 0 {
-		multiInputs, err = h.loadMultiLines(r.Context(), multiIDs, globalTime, globalTiers)
-		if err != nil {
-			resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "查询渠道内部模型配置失败")
-			return
-		}
-	}
-
-	// 成本线（同时带出它的对外模型配置，供未显式指定售价模型时复用）。
+	_ = multiIDs // 旧前端可能还在传：接受但不再参与计算
 	costCfg := pricingModelConfig{
-		Source: "channel_model", Reason: "未指定渠道内部模型",
+		Source: "channel_model", Reason: "渠道体系已下线：成本价无配置源，成本请以账本口径为准",
+		Available: false, ChannelModelID: channelModelID,
 		TimeConfig: globalTime, Tiers: globalTiers, TimeConfigSource: "global", TierSource: tierSource(globalTiers),
 	}
-	if channelModelID > 0 {
-		costCfg, err = h.loadChannelModelConfig(r.Context(), channelModelID, globalTime, globalTiers)
-		if err != nil {
-			resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "查询渠道内部模型配置失败")
-			return
-		}
-	}
 
-	// 售价线：显式指定优先，否则用成本线的对外模型。
+	// 售价线：显式指定优先；渠道内部模型参数不再能反查对外模型（channel_models 已删）。
 	saleModel := pricingModelConfig{Source: "external_model", Reason: "未指定对外模型",
 		TimeConfig: globalTime, Tiers: globalTiers, TimeConfigSource: "global", TierSource: tierSource(globalTiers)}
-	switch {
-	case externalID > 0 || externalName != "":
+	if externalID > 0 || externalName != "" {
 		saleModel, err = h.loadSaleModelConfig(r.Context(), externalID, externalName, globalTime, globalTiers)
-	case channelModelID > 0:
-		saleModel, err = h.loadSaleModelByChannelModel(r.Context(), channelModelID, globalTime, globalTiers)
 	}
 	if err != nil {
 		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "查询对外模型配置失败")
@@ -629,27 +616,6 @@ func parseChannelModelIDs(raw string) ([]int64, error) {
 	}
 	if len(out) > pricingCurveMaxLines {
 		return nil, fmt.Errorf("ChannelModelIDs 最多 %d 个（本次 %d 个）", pricingCurveMaxLines, len(out))
-	}
-	return out, nil
-}
-
-// loadMultiLines 按请求顺序装载每条线的成本配置与其对外模型的售价配置。
-//
-// 查询报错 → 整体返回错误（500）；「行不存在/费率缺失」不算错误，而是 Available=false + Reason，
-// 与单线模式口径一致（选了不存在的模型给一条不可用的线，而不是整个请求失败）。
-func (h *Admin) loadMultiLines(ctx context.Context, ids []int64,
-	globalTime billing.TimeCoeffConfig, globalTiers []billing.TierRule) ([]multiLineInputs, error) {
-	out := make([]multiLineInputs, 0, len(ids))
-	for i, id := range ids {
-		costCfg, err := h.loadChannelModelConfig(ctx, id, globalTime, globalTiers)
-		if err != nil {
-			return nil, err
-		}
-		saleCfg, err := h.loadSaleModelByChannelModel(ctx, id, globalTime, globalTiers)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, multiLineInputs{LineIndex: i, Cost: costCfg, Sale: saleCfg})
 	}
 	return out, nil
 }
@@ -784,85 +750,6 @@ func (h *Admin) loadSaleModelConfig(ctx context.Context, id int64, name string,
 	if out.Reason == "" {
 		out.Available = true
 	}
-	return out, nil
-}
-
-// loadSaleModelByChannelModel 由渠道内部模型反查它的对外模型（成本线已选、售价线未选时用）。
-func (h *Admin) loadSaleModelByChannelModel(ctx context.Context, channelModelID int64,
-	globalTime billing.TimeCoeffConfig, globalTiers []billing.TierRule) (pricingModelConfig, error) {
-	out := pricingModelConfig{Source: "external_model"}
-	var (
-		externalID                  sql.NullInt64
-		ratesRaw, timeRaw, tiersRaw []byte
-		name                        sql.NullString
-	)
-	err := h.db.QueryRowContext(ctx, `
-SELECT cm.external_model_id, em.external_name, em.sale_rates, em.time_config, em.context_tiers
-FROM channel_models cm
-LEFT JOIN external_models em ON em.id = cm.external_model_id
-WHERE cm.id = $1`, channelModelID).Scan(&externalID, &name, &ratesRaw, &timeRaw, &tiersRaw)
-	if errors.Is(err, sql.ErrNoRows) {
-		out.Reason = "渠道内部模型不存在"
-		out.TimeConfig = globalTime
-		out.Tiers = globalTiers
-		out.TimeConfigSource = "global"
-		out.TierSource = tierSource(globalTiers)
-		return out, nil
-	}
-	if err != nil {
-		return out, err
-	}
-	out.ExternalModelID = externalID.Int64
-	out.Name = name.String
-	out.Rates = parseRates(ratesRaw)
-	out.TimeConfig, out.TimeConfigSource = mergeTimeConfig(timeRaw, globalTime)
-	out.Tiers, out.TierSource = mergeTiers(tiersRaw, globalTiers)
-	switch {
-	case !externalID.Valid:
-		out.Reason = "渠道内部模型未绑定对外模型"
-	case !hasNonZeroRates(out.Rates):
-		out.Reason = "对外模型未配置售价费率"
-	default:
-		out.Available = true
-	}
-	return out, nil
-}
-
-// loadChannelModelConfig 加载渠道内部模型（成本）配置。
-func (h *Admin) loadChannelModelConfig(ctx context.Context, channelModelID int64,
-	globalTime billing.TimeCoeffConfig, globalTiers []billing.TierRule) (pricingModelConfig, error) {
-	out := pricingModelConfig{Source: "channel_model", ChannelModelID: channelModelID}
-	var (
-		ratesRaw, timeRaw, tiersRaw []byte
-		channelName                 sql.NullString
-	)
-	err := h.db.QueryRowContext(ctx, `
-SELECT cm.id, cm.channel_id, c.name, cm.internal_model_id, cm.cost_rates, cm.time_config, cm.context_tiers
-FROM channel_models cm
-LEFT JOIN channels c ON c.id = cm.channel_id
-WHERE cm.id = $1 AND cm.deleted_at IS NULL`, channelModelID).
-		Scan(&out.ChannelModelID, &out.ChannelID, &channelName, &out.InternalModelID, &ratesRaw, &timeRaw, &tiersRaw)
-	if errors.Is(err, sql.ErrNoRows) {
-		out.Reason = "渠道内部模型不存在或已删除"
-		out.TimeConfig = globalTime
-		out.Tiers = globalTiers
-		out.TimeConfigSource = "global"
-		out.TierSource = tierSource(globalTiers)
-		return out, nil
-	}
-	if err != nil {
-		return out, err
-	}
-	out.ChannelName = channelName.String
-	out.Name = out.InternalModelID
-	out.Rates = parseRates(ratesRaw)
-	out.TimeConfig, out.TimeConfigSource = mergeTimeConfig(timeRaw, globalTime)
-	out.Tiers, out.TierSource = mergeTiers(tiersRaw, globalTiers)
-	if !hasNonZeroRates(out.Rates) {
-		out.Reason = "渠道内部模型未配置成本费率"
-		return out, nil
-	}
-	out.Available = true
 	return out, nil
 }
 

@@ -85,8 +85,8 @@ func TestRecord_InsertsAttributionColumns(t *testing.T) {
 	mock.ExpectQuery(selectByBillingID.String()).WithArgs(billingID).WillReturnError(sql.ErrNoRows)
 
 	args := txInsertArgs(credits, before, after, "completed")
-	// 末 6 位换成真实归因值（前 25 位沿用既有断言）。
-	args = append(append([]driver.Value{}, args[:25]...),
+	// 末 7 位换成真实归因值（前 24 位沿用既有断言；0024 删了 channel_key_id，比历史少一列）。
+	args = append(append([]driver.Value{}, args[:24]...),
 		"req-attr-1", "openai", "acct-7", "openai-chat", "gpt-4o", "led-attr-1", CostSourceLedger)
 	mock.ExpectQuery(insertBill.String()).WithArgs(args...).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(1), time.Now()))

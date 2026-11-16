@@ -128,7 +128,7 @@ func expectChannelKeyFill(mock sqlmock.Sqlmock, pairs ...any) {
 		args = append(args, pairs[i])
 		rows.AddRow(pairs[i], pairs[i+1])
 	}
-	mock.ExpectQuery(`SELECT br\.billing_id, COALESCE\(cl\.channel_key_id, br\.channel_key_id\)`).
+	mock.ExpectQuery(`SELECT cl\.billing_id, cl\.channel_key_id`).
 		WithArgs(args...).
 		WillReturnRows(rows)
 }
@@ -202,7 +202,7 @@ func TestRecord_Success(t *testing.T) {
 	// Insert completed（断言关键字段）。
 	mock.ExpectQuery(insertBill.String()).WithArgs(
 		sqlmock.AnyArg(), // id
-		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model", sqlmock.AnyArg(),
+		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model",
 		sqlmock.AnyArg(),                 // session_id
 		sqlmock.AnyArg(),                 // session_name
 		sqlmock.AnyArg(),                 // call_time
@@ -276,7 +276,7 @@ func TestRecord_ConsumeError_RecordsFailed(t *testing.T) {
 	// 失败 → Insert failed；内部错误细节只进日志，落库统一为中文业务文案。
 	mock.ExpectQuery(insertBill.String()).WithArgs(
 		sqlmock.AnyArg(), // id
-		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model", sqlmock.AnyArg(),
+		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model",
 		sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), []byte(`{"time":1,"context":1}`),
 		int64(10000), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
 		sqlmock.AnyArg(), sqlmock.AnyArg(),
@@ -380,7 +380,7 @@ func TestRecord_CostMode_RecordsCostCredits(t *testing.T) {
 	// cost 模式：cost_credits 记录成本积分。
 	mock.ExpectQuery(insertBill.String()).WithArgs(
 		sqlmock.AnyArg(), // id
-		billingID, testUserID, "cost", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model", sqlmock.AnyArg(),
+		billingID, testUserID, "cost", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model",
 		sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), []byte(`{"time":1,"context":1}`),
 		int64(10000), sqlmock.AnyArg(), credits, costCredits,
 		sqlmock.AnyArg(), sqlmock.AnyArg(), "completed", sqlmock.AnyArg(),
@@ -436,7 +436,7 @@ func TestRecord_SaleMode_CostCreditsDistinctFromCredits(t *testing.T) {
 	// sale 模式：credits_consumed 按售价扣，cost_credits 记录成本（与售价不同）。
 	mock.ExpectQuery(insertBill.String()).WithArgs(
 		sqlmock.AnyArg(), // id
-		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model", sqlmock.AnyArg(),
+		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model",
 		sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), []byte(`{"time":1,"context":1}`),
 		int64(10000), sqlmock.AnyArg(), credits, costCredits,
 		sqlmock.AnyArg(), sqlmock.AnyArg(), "completed", sqlmock.AnyArg(),
@@ -574,12 +574,12 @@ func TestSqlStore_Insert_MarshalError(t *testing.T) {
 
 // ---- 事务路径：扣款 + 积分流水 + 账单同事务 ----
 
-// txInsertArgs 组装 insertBill 的完整 31 参数匹配（事务路径用例复用；首参为应用层雪花 ID）。
+// txInsertArgs 组装 insertBill 的完整 31 参数匹配（0024 删了 channel_key_id，故比历史少一列）（事务路径用例复用；首参为应用层雪花 ID）。
 // 末 6 位是 V2 归因列（request_id / upstream_* / cost_source）：本用例经 RecordReq 不传 → 全 NULL/none。
 func txInsertArgs(credits, before, after float64, status string) []driver.Value {
 	return []driver.Value{
 		sqlmock.AnyArg(), // id（应用层雪花 ID）
-		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model", sqlmock.AnyArg(),
+		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model",
 		sqlmock.AnyArg(),                 // session_id
 		sqlmock.AnyArg(),                 // session_name
 		sqlmock.AnyArg(),                 // call_time
@@ -1314,7 +1314,7 @@ func TestRecord_ModelLevelOverride(t *testing.T) {
 		WillReturnError(sql.ErrNoRows)
 	mock.ExpectQuery(insertBill.String()).WithArgs(
 		sqlmock.AnyArg(), // id
-		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model", sqlmock.AnyArg(),
+		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model",
 		sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), []byte(`{"time":1.5,"context":2}`),
 		int64(10000), sqlmock.AnyArg(), credits, sqlmock.AnyArg(),
 		sqlmock.AnyArg(), sqlmock.AnyArg(), "completed", sqlmock.AnyArg(),
@@ -1365,10 +1365,10 @@ func TestRecord_Dimension(t *testing.T) {
 	mock.ExpectQuery(selectByBillingID.String()).WithArgs(billingID).
 		WillReturnError(sql.ErrNoRows)
 
-	// 关键断言：channel_key_id=42，session_id="sess-dim"（auto_model_name 插入后列位后移一位）。
+	// 关键断言：session_id="sess-dim" 落库；（0024 删了 channel_key_id，Req 里传 42 也不会写）
 	mock.ExpectQuery(insertBill.String()).WithArgs(
 		sqlmock.AnyArg(), // id
-		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model", int64(42),
+		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model",
 		"sess-dim",
 		sqlmock.AnyArg(),                 // session_name
 		sqlmock.AnyArg(),                 // call_time
@@ -1402,11 +1402,9 @@ func TestRecord_Dimension(t *testing.T) {
 	if err != nil {
 		t.Fatalf("record: %v", err)
 	}
-	// 写路径仍写 channel_key_id（0021 不在本批），读路径已改由 call_logs 快照回填；
-	// 两个维度都要落库/回传。
-	if rec.ChannelKeyID != 42 {
-		t.Fatalf("渠道密钥维度未落库: channel_key_id=%d", rec.ChannelKeyID)
-	}
+	// 0024 已删 billing_records.channel_key_id：写路径不再写该列（Req 里传 42 也不会进 INSERT，
+	// 上面 WithArgs 的列位已证明这点）；渠道维度只剩 call_logs 历史快照（读路径回填）。
+	// 返回值是入参回显（不是库里的值），所以这里只断言会话维度照常落库。
 	if rec.SessionID != "sess-dim" {
 		t.Fatalf("会话维度未落库: session_id=%q", rec.SessionID)
 	}

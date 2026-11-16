@@ -49,7 +49,7 @@ func TestSessionStoreUpsert(t *testing.T) {
 	}
 
 	mock.ExpectExec(regexp.QuoteMeta(sessionUpsertSQL)).
-		WithArgs("abc", int64(1), int64(2), "qw-max", "sess", int64(7), "int1", "", now, now, now.Add(time.Hour)).
+		WithArgs("abc", int64(1), int64(2), "qw-max", "sess", "int1", "", now, now, now.Add(time.Hour)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	if err := store.Upsert(ctx, sess); err != nil {
@@ -76,7 +76,7 @@ func TestSessionStoreUpsert_NullableToken(t *testing.T) {
 	}
 
 	mock.ExpectExec(regexp.QuoteMeta(sessionUpsertSQL)).
-		WithArgs("abc", int64(1), nil, "qw-max", "", int64(7), "int1", "", now, now, now.Add(time.Hour)).
+		WithArgs("abc", int64(1), nil, "qw-max", "", "int1", "", now, now, now.Add(time.Hour)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	if err := store.Upsert(ctx, sess); err != nil {
@@ -104,7 +104,7 @@ func TestSessionStoreUpsert_UsesChannelKeyOnly(t *testing.T) {
 	}
 
 	mock.ExpectExec(regexp.QuoteMeta(sessionUpsertSQL)).
-		WithArgs("abc", int64(1), nil, "qw-max", "", int64(7), "int1", "", now, now, now.Add(time.Hour)).
+		WithArgs("abc", int64(1), nil, "qw-max", "", "int1", "", now, now, now.Add(time.Hour)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	if err := store.Upsert(ctx, sess); err != nil {
@@ -164,9 +164,9 @@ func TestSessionStoreLoadActive(t *testing.T) {
 
 	// sqlmock 固定返回以下行，用于覆盖 closed / closed_at 的扫描路径（与实际 SQL 过滤无关）。
 	rows := sqlmock.NewRows([]string{"session_id", "user_id", "token_id", "model", "session_raw",
-		"channel_key_id", "internal_model_id", "created_at", "last_active", "expire_at", "name", "closed", "closed_at"}).
-		AddRow("abc", int64(1), int64(2), "qw-max", "sess", int64(7), "int1", now, now, now.Add(time.Hour), "今天的会话", false, nil).
-		AddRow("def", int64(2), nil, "qw-max", "", int64(8), "int2", now, now, now.Add(2*time.Hour), "", true, now)
+		"internal_model_id", "created_at", "last_active", "expire_at", "name", "closed", "closed_at"}).
+		AddRow("abc", int64(1), int64(2), "qw-max", "sess", "int1", now, now, now.Add(time.Hour), "今天的会话", false, nil).
+		AddRow("def", int64(2), nil, "qw-max", "", "int2", now, now, now.Add(2*time.Hour), "", true, now)
 
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + sessionCols + ` FROM sessions WHERE expire_at > $1 AND NOT closed`)).
 		WithArgs(now).WillReturnRows(rows)
@@ -178,11 +178,11 @@ func TestSessionStoreLoadActive(t *testing.T) {
 	if len(list) != 2 {
 		t.Fatalf("expect 2 rows, got %d", len(list))
 	}
-	if list[0].SessionID != "abc" || list[0].TokenID != 2 || list[0].ChannelKeyID != 7 || list[0].InternalModelID != "int1" || list[0].Closed || list[0].ClosedAt != nil {
+	if list[0].SessionID != "abc" || list[0].TokenID != 2 || list[0].InternalModelID != "int1" || list[0].Closed || list[0].ClosedAt != nil {
 		t.Fatalf("unexpected first session: %+v", list[0])
 	}
-	// D3：Session 无 ChannelID/KeyID() 回退，LoadActive 不产生误导性渠道值，会话维度只有 channel_key_id。
-	if list[1].SessionID != "def" || list[1].TokenID != 0 || list[1].ChannelKeyID != 8 || !list[1].Closed || list[1].ClosedAt == nil {
+	// sessions.channel_key_id 随 0024 下线：会话行不再携带渠道密钥维度。
+	if list[1].SessionID != "def" || list[1].TokenID != 0 || !list[1].Closed || list[1].ClosedAt == nil {
 		t.Fatalf("unexpected second session: %+v", list[1])
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
