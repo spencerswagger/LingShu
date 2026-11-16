@@ -29,6 +29,7 @@ import (
 	"github.com/team/llmgateway/internal/domain/billing"
 	"github.com/team/llmgateway/internal/domain/identity"
 	"github.com/team/llmgateway/internal/domain/magpie"
+	"github.com/team/llmgateway/internal/pkg/dbx"
 	"github.com/team/llmgateway/internal/pkg/idgen"
 	"github.com/team/llmgateway/internal/pkg/resp"
 )
@@ -51,12 +52,19 @@ type Ledger interface {
 	Record(ctx context.Context, req billing.RecordReq) (*billing.Record, error)
 }
 
-// Wallet 是资金侧（identity.CreditService 的子集）：预扣登记 + 退回。
+// Wallet 是资金侧（identity.CreditService 的子集）。
+//
+// ⚠️ 这里**没有**「单独退钱」和「单独终结」两个入口，只有两种原子终结方式（Owl 复审 P1）：
+//   - SettleHold：终结登记 + 改余额 + 写流水，**一个事务**（失败/取消路径用）；
+//   - CloseHoldTx：把终结塞进 billing 的结算事务（成功路径用，钱与登记同生共死）。
+//
+// 旧的 `Settle` + `CloseHold` 组合会让「钱动了、登记没落」成为可能，过期扫描随后再退一次。
 type Wallet interface {
 	PreConsumeHold(ctx context.Context, req identity.HoldRequest) (identity.Hold, error)
-	CloseHold(ctx context.Context, billingID, status, ledgerEntryID string) (bool, error)
-	// Settle 结算差额（负数为退回）。
-	Settle(ctx context.Context, userID int64, delta float64, sessionID, remark string) (before, after float64, err error)
+	// SettleHold 同一事务内终结登记并按 Delta 多退少补；false = 已被别的路径终结（不动钱）。
+	SettleHold(ctx context.Context, req identity.SettleHoldRequest) (bool, error)
+	// CloseHoldTx 在调用方事务内终结登记（billing.Record 的结算事务会调用它）。
+	CloseHoldTx(ctx context.Context, ex dbx.Execer, billingID, status, ledgerEntryID string) (bool, error)
 }
 
 // Pricer 提供命中模型的售价（三段单价 + 模型级时段/分档）。
@@ -200,9 +208,8 @@ func (s *Service) OnComplete(ctx context.Context, res magpie.Result) {
 	if !hasUsage(res) {
 		// 口径①：无 usage 一律不计费 —— 整笔退预扣，落 failed/no-usage，绝不出估算金额。
 		reason := reasonOf(res)
-		s.refund(ctx, handle, reason)
+		s.refundAndClose(ctx, handle, reason)
 		s.recordFailure(ctx, handle, res, reason)
-		s.closeHold(ctx, handle, identity.HoldRefunded)
 		return
 	}
 
@@ -210,16 +217,16 @@ func (s *Service) OnComplete(ctx context.Context, res magpie.Result) {
 	credits, err := s.settle(ctx, handle, res)
 	if err != nil {
 		// 结算失败不能装作成功：退预扣 + failed 账单（原因里带真实错误，运维可查）。
+		// 结算事务已整体回滚（含 hold 终结），所以这里 hold 仍是 held，退款路径能抢到终结权。
 		s.logger.Error("结算失败，改为退预扣", "billing_id", handle.billingID, "err", err.Error())
-		s.refund(ctx, handle, ReasonUpstreamError)
+		s.refundAndClose(ctx, handle, ReasonUpstreamError)
 		s.recordFailureWith(ctx, handle, res, "settle-failed: "+err.Error())
-		s.closeHold(ctx, handle, identity.HoldRefunded)
 		return
 	}
+	// 登记已由结算事务一并终结（billing.Record 的 Hold 参数），这里不再单独 close。
 	s.logger.Info("facade 转发已结算",
 		"billing_id", handle.billingID, "model", handle.extModel,
 		"credits", credits, "pre", handle.pre, "endpoint", handle.endpoint)
-	s.closeHold(ctx, handle, identity.HoldSettled)
 }
 
 // settle 按真实 usage 落账单（PreConsumed = 预扣额，只结算差额），返回本次实际积分。
@@ -236,6 +243,7 @@ func (s *Service) settle(ctx context.Context, h *reservation, res magpie.Result)
 		TimeConfig:       h.timeConfig,
 		ContextTiers:     h.tiers,
 		PreConsumed:      h.pre,
+		Hold:             s.holdClose(h, identity.HoldSettled),
 		Remark:           "facade 转发结算",
 		UpstreamProtocol: h.protocol,
 		UpstreamModel:    res.MagpieModel,
@@ -282,19 +290,35 @@ func (s *Service) recordFailureWith(ctx context.Context, h *reservation, res mag
 	}
 }
 
-// refund 整笔退回预扣（负数差额结算），失败重试 3 次。
-func (s *Service) refund(ctx context.Context, h *reservation, reason string) {
+// refundAndClose 整笔退回预扣，并在**同一个事务**里把登记终结为 refunded（失败重试 3 次）。
+//
+// 为什么不能拆成「Settle + CloseHold」：Owl 复审 P1 实测过，两步之间失败或进程中断
+// 会让 hold 停在 held，15 分钟后过期扫描再全额退一次（双份预扣）。
+// 重试耗尽也不是灾难：hold 仍是 held，过期扫描会退（那次也是原子的），不会重复。
+func (s *Service) refundAndClose(ctx context.Context, h *reservation, reason string) {
 	if h.pre <= 0 {
 		return
 	}
 	var last error
 	for i := 0; i < 3; i++ {
-		if _, _, err := s.wallet.Settle(ctx, h.userID, -h.pre, h.sessionID, "请求失败退回预扣（"+reason+"）"); err == nil {
-			s.logger.Info("已退回预扣", "billing_id", h.billingID, "credits", h.pre, "reason", reason)
+		owned, err := s.wallet.SettleHold(ctx, identity.SettleHoldRequest{
+			BillingID: h.billingID,
+			UserID:    h.userID,
+			Delta:     -h.pre,
+			SessionID: h.sessionID,
+			Remark:    "请求失败退回预扣（" + reason + "）",
+			Status:    identity.HoldRefunded,
+		})
+		if err == nil {
+			if owned {
+				s.logger.Info("已退回预扣", "billing_id", h.billingID, "credits", h.pre, "reason", reason)
+			} else {
+				// 已被别的路径终结（例如过期扫描先到）：那笔钱不该再退，这里什么都不做。
+				s.logger.Warn("预扣登记已被终结，跳过退款", "billing_id", h.billingID, "reason", reason)
+			}
 			return
-		} else {
-			last = err
 		}
+		last = err
 		select {
 		case <-ctx.Done():
 			s.logger.Error("退回预扣未完成（上下文结束）", "billing_id", h.billingID, "credits", h.pre, "err", last.Error())
@@ -306,14 +330,12 @@ func (s *Service) refund(ctx context.Context, h *reservation, reason string) {
 		"billing_id", h.billingID, "credits", h.pre, "err", last.Error())
 }
 
-func (s *Service) closeHold(ctx context.Context, h *reservation, status string) {
-	if h.pre <= 0 {
-		return
+// holdClose 生成「本单要在结算事务内终结的预扣登记」；免费模型（pre<=0）没有登记，返回 nil。
+func (s *Service) holdClose(h *reservation, status string) *billing.HoldCloseReq {
+	if h == nil || h.pre <= 0 {
+		return nil
 	}
-	if _, err := s.wallet.CloseHold(ctx, h.billingID, status, ""); err != nil {
-		s.logger.Warn("预扣登记终结失败（过期扫描会兜底）",
-			"billing_id", h.billingID, "status", status, "err", err.Error())
-	}
+	return &billing.HoldCloseReq{BillingID: h.billingID, Status: status, Closer: s.wallet}
 }
 
 // hasUsage 判定「有真实 usage」：HasUsage 为真且三段非全零。

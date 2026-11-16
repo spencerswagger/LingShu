@@ -3,12 +3,14 @@ package facadebill
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/team/llmgateway/internal/domain/billing"
 	"github.com/team/llmgateway/internal/domain/identity"
 	"github.com/team/llmgateway/internal/domain/magpie"
+	"github.com/team/llmgateway/internal/pkg/dbx"
 	"github.com/team/llmgateway/internal/pkg/resp"
 )
 
@@ -30,22 +32,35 @@ func (f *fakeLedger) EstimateCredits(_ context.Context, req billing.RecordReq) (
 	return f.estCredits, nil
 }
 
+// Record 模拟 billing.Service.Record：注入事务时**在同一事务内**调 req.Hold.Closer.CloseHoldTx，
+// 事务失败（recordErr）则终结随之回滚 —— 这正是「钱与登记同生共死」的行为，用例要能在 fake 上复现。
 func (f *fakeLedger) Record(_ context.Context, req billing.RecordReq) (*billing.Record, error) {
 	f.records = append(f.records, req)
 	if f.recordErr != nil {
+		// 结算事务回滚：hold 终结也一并撤销（所以 hold 仍 held，调用方可以走退款路径）。
 		return nil, f.recordErr
+	}
+	if req.Hold != nil && req.Hold.Closer != nil {
+		if _, err := req.Hold.Closer.CloseHoldTx(context.Background(), nil, req.Hold.BillingID, req.Hold.Status, req.Hold.LedgerEntryID); err != nil {
+			return nil, err
+		}
 	}
 	return &billing.Record{BillingID: req.BillingID, CreditsConsumed: 0}, nil
 }
 
-// fakeWallet 记录预扣 / 退回 / 终结。
+// fakeWallet 记录预扣 / 原子终结（SettleHold）/ 事务内终结（CloseHoldTx）。
 type fakeWallet struct {
-	preErr    error
-	settleErr error
+	preErr error
+	// settleErrs 按调用次序返回错误（用尽后一律成功），用于「重试耗尽」用例。
+	settleErrs []error
+	// settleOwnedSet + settleOwned=false 模拟「hold 已被别的路径终结」（过期扫描先到）。
+	settleOwnedSet bool
+	settleOwned    bool
 
-	holds   []identity.HoldRequest
-	settles []float64
-	closes  []string
+	holds        []identity.HoldRequest
+	settleHolds  []identity.SettleHoldRequest
+	closes       []string
+	closeHoldTxs []string
 }
 
 func (f *fakeWallet) PreConsumeHold(_ context.Context, req identity.HoldRequest) (identity.Hold, error) {
@@ -56,17 +71,25 @@ func (f *fakeWallet) PreConsumeHold(_ context.Context, req identity.HoldRequest)
 	return identity.Hold{BillingID: req.BillingID, Amount: req.Amount, Status: identity.HoldHeld}, nil
 }
 
-func (f *fakeWallet) CloseHold(_ context.Context, billingID, status, _ string) (bool, error) {
-	f.closes = append(f.closes, status)
-	return true, nil
+func (f *fakeWallet) SettleHold(_ context.Context, req identity.SettleHoldRequest) (bool, error) {
+	f.settleHolds = append(f.settleHolds, req)
+	if n := len(f.settleHolds); n <= len(f.settleErrs) {
+		if err := f.settleErrs[n-1]; err != nil {
+			return false, err
+		}
+	}
+	owned := true
+	if !f.settleOwned && f.settleOwnedSet {
+		owned = false
+	}
+	f.closes = append(f.closes, req.Status)
+	return owned, nil
 }
 
-func (f *fakeWallet) Settle(_ context.Context, _ int64, delta float64, _, _ string) (float64, float64, error) {
-	f.settles = append(f.settles, delta)
-	if f.settleErr != nil {
-		return 0, 0, f.settleErr
-	}
-	return 0, 0, nil
+func (f *fakeWallet) CloseHoldTx(_ context.Context, _ dbx.Execer, _, status, _ string) (bool, error) {
+	f.closeHoldTxs = append(f.closeHoldTxs, status)
+	f.closes = append(f.closes, status)
+	return true, nil
 }
 
 // fakePricer 返回固定售价；err 非空时模拟「模型没配价」。
@@ -170,8 +193,8 @@ func TestOnComplete_NoUsage_RefundsEverythingAndNeverEstimates(t *testing.T) {
 		Billable: true, Status: 200, Reservation: handle,
 	})
 
-	if len(wallet.settles) != 1 || wallet.settles[0] != -4 {
-		t.Fatalf("应整笔退回 -4，实际 %v", wallet.settles)
+	if len(wallet.settleHolds) != 1 || wallet.settleHolds[0].Delta != -4 {
+		t.Fatalf("应整笔退回 -4，实际 %+v", wallet.settleHolds)
 	}
 	if len(ledger.records) != 1 {
 		t.Fatalf("应落 1 条 failed 账单，实际 %d", len(ledger.records))
@@ -206,8 +229,8 @@ func TestOnComplete_ZeroUsageTreatedAsMissing(t *testing.T) {
 		HasUsage: true, Usage: magpie.Usage{}, Reservation: handle,
 	})
 
-	if len(wallet.settles) != 1 || wallet.settles[0] != -2 {
-		t.Fatalf("全零 usage 应整笔退回，实际 %v", wallet.settles)
+	if len(wallet.settleHolds) != 1 || wallet.settleHolds[0].Delta != -2 {
+		t.Fatalf("全零 usage 应整笔退回，实际 %+v", wallet.settleHolds)
 	}
 	if len(ledger.records) != 1 || !ledger.records[0].Fail {
 		t.Fatalf("全零 usage 应落 failed 账单")
@@ -228,8 +251,8 @@ func TestOnComplete_WithUsage_SettlesActual(t *testing.T) {
 		Reservation: handle,
 	})
 
-	if len(wallet.settles) != 0 {
-		t.Fatalf("有 usage 时不许退预扣，实际 %v", wallet.settles)
+	if len(wallet.settleHolds) != 0 {
+		t.Fatalf("有 usage 时不许退预扣，实际 %+v", wallet.settleHolds)
 	}
 	if len(ledger.records) != 1 {
 		t.Fatalf("应落 1 条账单，实际 %d", len(ledger.records))
@@ -244,8 +267,12 @@ func TestOnComplete_WithUsage_SettlesActual(t *testing.T) {
 	if rec.PreConsumed != 5 {
 		t.Fatalf("结算应带上预扣额（只结算差额），实际 %v", rec.PreConsumed)
 	}
-	if len(wallet.closes) != 1 || wallet.closes[0] != identity.HoldSettled {
-		t.Fatalf("预扣登记应终结为 settled，实际 %v", wallet.closes)
+	// 终结发生在账单事务内（CloseHoldTx），不是事后再单独 close。
+	if len(wallet.closeHoldTxs) != 1 || wallet.closeHoldTxs[0] != identity.HoldSettled {
+		t.Fatalf("预扣登记应在结算事务内终结为 settled，实际 %v", wallet.closeHoldTxs)
+	}
+	if len(wallet.settleHolds) != 0 {
+		t.Fatalf("成功路径不许另起事务终结预扣，实际 %+v", wallet.settleHolds)
 	}
 }
 
@@ -261,8 +288,8 @@ func TestOnComplete_UpstreamError_Refunds(t *testing.T) {
 		Err: errors.New("upstream unreachable"), Reservation: handle,
 	})
 
-	if len(wallet.settles) != 1 || wallet.settles[0] != -3 {
-		t.Fatalf("上游失败应整笔退回，实际 %v", wallet.settles)
+	if len(wallet.settleHolds) != 1 || wallet.settleHolds[0].Delta != -3 {
+		t.Fatalf("上游失败应整笔退回，实际 %+v", wallet.settleHolds)
 	}
 	if len(ledger.records) != 1 || ledger.records[0].ErrorMessage != ReasonUpstreamError {
 		t.Fatalf("失败原因应为 %q，实际 %+v", ReasonUpstreamError, ledger.records)
@@ -281,8 +308,8 @@ func TestOnComplete_SettleFailure_RefundsInsteadOfLosing(t *testing.T) {
 		HasUsage: true, Usage: magpie.Usage{Input: 10, Output: 5}, Reservation: handle,
 	})
 
-	if len(wallet.settles) != 1 || wallet.settles[0] != -3 {
-		t.Fatalf("结算失败必须退回预扣，实际 %v", wallet.settles)
+	if len(wallet.settleHolds) != 1 || wallet.settleHolds[0].Delta != -3 {
+		t.Fatalf("结算失败必须退回预扣，实际 %+v", wallet.settleHolds)
 	}
 	if len(wallet.closes) != 1 || wallet.closes[0] != identity.HoldRefunded {
 		t.Fatalf("预扣登记应终结为 refunded，实际 %v", wallet.closes)
@@ -296,7 +323,7 @@ func TestOnComplete_NonBillableIgnored(t *testing.T) {
 	s := newTestService(t, ledger, wallet)
 
 	s.OnComplete(context.Background(), magpie.Result{Billable: false, Status: 200})
-	if len(ledger.records) != 0 || len(wallet.settles) != 0 {
+	if len(ledger.records) != 0 || len(wallet.settleHolds) != 0 {
 		t.Fatalf("非计费端点不许有任何账单/资金动作")
 	}
 }
@@ -318,5 +345,102 @@ func TestStatusFor(t *testing.T) {
 	}
 	if got := StatusFor(magpie.Result{Status: 503}); got != "failed:upstream-error" {
 		t.Fatalf("5xx 应为 failed:upstream-error，实际 %q", got)
+	}
+}
+
+// TestOnComplete_RefundRetryExhausted_LeavesHoldForExpiry Owl 复审 P1 的反向守门：
+// 退款（SettleHold）重试耗尽时**不许**再去单独 close hold —— 一旦「登记终结了、钱没退」，
+// 过期扫描就不会再介入，用户的预扣永远冻着；留着 held 反而能靠过期扫描兜底（那次也是原子的）。
+func TestOnComplete_RefundRetryExhausted_LeavesHoldForExpiry(t *testing.T) {
+	ledger := &fakeLedger{estCredits: 3}
+	boom := errors.New("db down")
+	wallet := &fakeWallet{settleErrs: []error{boom, boom, boom}}
+	s := newTestService(t, ledger, wallet)
+	handle, _ := s.Reserve(context.Background(), reserveInput())
+
+	s.OnComplete(context.Background(), magpie.Result{
+		UserID: 7, ExternalModel: "tenant-gpt", Billable: true, Status: 200,
+		HasUsage: true, Usage: magpie.Usage{Input: 10}, Reservation: handle,
+	})
+
+	// 注意：这里 Record 成功（有 usage 且 fake 无错），所以不涉及退款；改用结算失败场景。
+	if len(wallet.settleHolds) != 0 {
+		t.Fatalf("结算成功时不该发生退款，实际 %+v", wallet.settleHolds)
+	}
+
+	// 场景二：结算失败 → 退款重试耗尽。
+	ledger2 := &fakeLedger{estCredits: 3, recordErr: errors.New("write failed")}
+	wallet2 := &fakeWallet{settleErrs: []error{boom, boom, boom}}
+	s2 := newTestService(t, ledger2, wallet2)
+	handle2, _ := s2.Reserve(context.Background(), reserveInput())
+	s2.OnComplete(context.Background(), magpie.Result{
+		UserID: 7, ExternalModel: "tenant-gpt", Billable: true, Status: 200,
+		HasUsage: true, Usage: magpie.Usage{Input: 10}, Reservation: handle2,
+	})
+
+	if len(wallet2.settleHolds) != 3 {
+		t.Fatalf("退款应重试 3 次，实际 %d 次", len(wallet2.settleHolds))
+	}
+	if len(wallet2.closeHoldTxs) != 0 || len(wallet2.closes) != 0 {
+		t.Fatalf("退款失败后不许单独终结 hold（否则过期扫描再也兜不住），实际 closeTxs=%v closes=%v",
+			wallet2.closeHoldTxs, wallet2.closes)
+	}
+	// 失败账单仍要留痕（钱没退、账要能查）：第一条是结算尝试，最后一条才是失败账单。
+	last := ledger2.records[len(ledger2.records)-1]
+	if !last.Fail || !strings.HasPrefix(last.ErrorMessage, "settle-failed:") {
+		t.Fatalf("退款失败也要落 failed 账单，实际 %+v", ledger2.records)
+	}
+}
+
+// TestOnComplete_HoldAlreadyClosed_NoDoubleRefund 过期扫描先到（hold 已被终结）：
+// SettleHold 返回 false → 不再动钱（否则就是第二次退预扣）。
+func TestOnComplete_HoldAlreadyClosed_NoDoubleRefund(t *testing.T) {
+	ledger := &fakeLedger{estCredits: 2}
+	wallet := &fakeWallet{settleOwnedSet: true, settleOwned: false}
+	s := newTestService(t, ledger, wallet)
+	handle, _ := s.Reserve(context.Background(), reserveInput())
+
+	s.OnComplete(context.Background(), magpie.Result{
+		UserID: 7, ExternalModel: "tenant-gpt", Billable: true, Status: 504,
+		Err: errors.New("timeout"), Reservation: handle,
+	})
+
+	if len(wallet.settleHolds) != 1 {
+		t.Fatalf("应只尝试一次退款，实际 %d 次", len(wallet.settleHolds))
+	}
+	if len(wallet.closeHoldTxs) != 0 {
+		t.Fatalf("已被终结的登记不许再终结，实际 %v", wallet.closeHoldTxs)
+	}
+	if len(ledger.records) != 1 || ledger.records[0].ErrorMessage != ReasonUpstreamError {
+		t.Fatalf("仍要落 failed 账单，实际 %+v", ledger.records)
+	}
+}
+
+// TestOnComplete_FreeModelNoHold 免费模型（pre=0）没有预扣登记：成功路径不许伪造 Hold 参数。
+func TestOnComplete_FreeModelNoHold(t *testing.T) {
+	ledger := &fakeLedger{estCredits: 0}
+	wallet := &fakeWallet{}
+	s := newTestService(t, ledger, wallet)
+	handle, deny := s.Reserve(context.Background(), reserveInput())
+	if deny != nil {
+		t.Fatalf("免费模型不该被拒: %+v", deny)
+	}
+	if len(wallet.holds) != 0 {
+		t.Fatalf("零预扣不该建登记，实际 %+v", wallet.holds)
+	}
+
+	s.OnComplete(context.Background(), magpie.Result{
+		UserID: 7, ExternalModel: "tenant-gpt", Billable: true, Status: 200,
+		HasUsage: true, Usage: magpie.Usage{Input: 5}, Reservation: handle,
+	})
+
+	if len(ledger.records) != 1 {
+		t.Fatalf("仍要落账单，实际 %d", len(ledger.records))
+	}
+	if ledger.records[0].Hold != nil {
+		t.Fatalf("没有预扣登记时不许传 Hold 参数，实际 %+v", ledger.records[0].Hold)
+	}
+	if len(wallet.closeHoldTxs) != 0 || len(wallet.settleHolds) != 0 {
+		t.Fatalf("零预扣不该有任何资金动作")
 	}
 }

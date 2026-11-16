@@ -186,6 +186,10 @@ type RecordReq struct {
 	// =0 时（健康探测/直接计费等无预扣场景）按全额扣减。
 	PreConsumed float64
 	Remark      string
+	// Hold 非 nil 时，在**结算事务内**顺带终结对应的预扣登记（通常 status=settled）。
+	// 见 HoldCloseReq 的注释：终结与结算必须同一个事务，否则「钱已结算、hold 未落」
+	// 会被过期扫描当成未结算、把整笔预扣再退一次。
+	Hold *HoldCloseReq
 	// ===== V2 归因（由网关在调用完成后传入；未接线时全空 → 落 NULL / none）=====
 	RequestID        string
 	UpstreamProvider string
@@ -203,6 +207,22 @@ type CreditService interface {
 	// Tx 变体：在调用方事务内完成扣减/差额结算与积分流水写入，供 Record 同事务提交。
 	ConsumeTx(ctx context.Context, ex dbx.Execer, userID int64, amount float64, billingID, sessionID, remark string) (before, after float64, err error)
 	SettleTx(ctx context.Context, ex dbx.Execer, userID int64, delta float64, sessionID, remark string) (before, after float64, err error)
+}
+
+// HoldCloser 是「在给定事务内终结预扣登记」的能力（identity.CreditService 实现）。
+//
+// 单独抽出来的理由：billing 不认识 credit_holds 表，也不该认识；它只需要一个能在
+// 自己的结算事务里被调用的终结入口。
+type HoldCloser interface {
+	CloseHoldTx(ctx context.Context, ex dbx.Execer, billingID, status, ledgerEntryID string) (bool, error)
+}
+
+// HoldCloseReq 描述「这次结算要顺带终结哪条预扣登记」。
+type HoldCloseReq struct {
+	BillingID     string // 预扣登记的键（与账单同号）
+	Status        string // settled / refunded
+	LedgerEntryID string
+	Closer        HoldCloser
 }
 
 // Service 计费服务：记账 + 钱包扣减 + 幂等。
@@ -437,11 +457,31 @@ func (s *Service) settleTx(ctx context.Context, rec *Record, req RecordReq, cred
 		// 其失败由重试队列兜底。
 		return nil, ierr, false
 	}
+	// 预扣终结必须与本次结算同事务（Owl 复审 P1）：
+	// 分两次写会出现「账单 completed + 余额已动，但 hold 仍 held」→ 过期扫描全额退回 = 白送一笔。
+	// 终结失败就整体回滚（账单没落、余额没动），调用方按失败处理并走退款路径。
+	if err := closeHoldInTx(ctx, tx, req.Hold); err != nil {
+		_ = tx.Rollback()
+		slog.ErrorContext(ctx, "billing tx rolled back: hold close failed",
+			"billing_id", rec.BillingID, "user_id", rec.UserID, "err", err)
+		return nil, err, true
+	}
 	if cerr := tx.Commit(); cerr != nil {
 		// 提交结果不确定（可能已提交）：不重投，避免重复扣款，直接报错。
 		return nil, fmt.Errorf("commit billing tx: %w", cerr), true
 	}
 	return rec, nil, true
+}
+
+// closeHoldInTx 在结算事务内终结预扣登记（req 为 nil 或无 Closer 时是空操作）。
+func closeHoldInTx(ctx context.Context, ex dbx.Execer, req *HoldCloseReq) error {
+	if req == nil || req.Closer == nil {
+		return nil
+	}
+	if _, err := req.Closer.CloseHoldTx(ctx, ex, req.BillingID, req.Status, req.LedgerEntryID); err != nil {
+		return fmt.Errorf("结算事务内终结预扣失败：%w", err)
+	}
+	return nil
 }
 
 // isDeterministicWriteError 判断账单写入失败是否属于「重投也没用」的确定性错误：
@@ -491,6 +531,12 @@ func (s *Service) settlePlain(ctx context.Context, rec *Record, req RecordReq, c
 		}
 		s.enqueueRetry(rec, err)
 		return nil, err
+	}
+	// 非事务路径（txdb 未注入，仅测试/未装配）：没有事务可用，终结只能after-the-fact 做，
+	// 不能提供原子保证 —— 生产装配必须注入 txdb（cmd/server 已注入）。
+	if err := closeHoldInTx(ctx, nil, req.Hold); err != nil {
+		slog.ErrorContext(ctx, "hold close failed on non-transactional path",
+			"billing_id", rec.BillingID, "err", err)
 	}
 	return rec, nil
 }

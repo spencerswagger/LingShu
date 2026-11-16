@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/team/llmgateway/internal/pkg/dbx"
 	"github.com/team/llmgateway/internal/pkg/decimalx"
 	"github.com/team/llmgateway/internal/pkg/idgen"
 	"github.com/team/llmgateway/internal/pkg/money"
@@ -126,6 +127,9 @@ func (s *CreditService) PreConsumeHold(ctx context.Context, req HoldRequest) (Ho
 
 // CloseHold 终结一条预扣登记（settled / refunded）。返回 false 表示它已被终结过（幂等）。
 //
+// ⚠️ 只终结登记、**不动钱**。凡「要动钱 + 要终结」的场景必须用 SettleHold（同一事务），
+// 否则会出现 Owl 复审指出的资金缺口：钱先退、登记没落 → 过期扫描再退一次（双份预扣）。
+//
 // 只允许 held → settled/refunded：并发下「结算」与「过期扫描」抢同一行时，
 // 条件 UPDATE 保证只有一方成功，另一方拿到 false（不会既退钱又结算）。
 func (s *CreditService) CloseHold(ctx context.Context, billingID, status, ledgerEntryID string) (bool, error) {
@@ -138,7 +142,32 @@ func (s *CreditService) CloseHold(ctx context.Context, billingID, status, ledger
 	if billingID == "" {
 		return false, fmt.Errorf("预扣终结缺少 billing_id")
 	}
-	res, err := s.store.db.ExecContext(ctx,
+	return s.closeHoldOn(ctx, s.store.db, billingID, status, ledgerEntryID)
+}
+
+// CloseHoldTx 在调用方事务里终结预扣登记（供「账单结算事务」顺带关闭 hold）。
+//
+// ex 必须是**调用方已经在跑的事务**；传 nil 等同 CloseHold（自开连接、非原子），
+// 仅供未装配事务能力的测试路径使用。
+func (s *CreditService) CloseHoldTx(ctx context.Context, ex dbx.Execer, billingID, status, ledgerEntryID string) (bool, error) {
+	if s == nil || s.store == nil || s.store.db == nil {
+		return false, fmt.Errorf("积分服务未装配数据库连接")
+	}
+	if status != HoldSettled && status != HoldRefunded {
+		return false, fmt.Errorf("预扣终结状态只能是 settled/refunded（收到 %q）", status)
+	}
+	if billingID == "" {
+		return false, fmt.Errorf("预扣终结缺少 billing_id")
+	}
+	if ex == nil {
+		return s.closeHoldOn(ctx, s.store.db, billingID, status, ledgerEntryID)
+	}
+	return s.closeHoldOn(ctx, ex, billingID, status, ledgerEntryID)
+}
+
+// closeHoldOn 条件 UPDATE，返回「本次是否真的由我终结」（false = 已被别的路径终结）。
+func (s *CreditService) closeHoldOn(ctx context.Context, ex dbx.Execer, billingID, status, ledgerEntryID string) (bool, error) {
+	res, err := ex.ExecContext(ctx,
 		`UPDATE credit_holds
 		    SET status = $2,
 		        ledger_entry_id = COALESCE(NULLIF($3, ''), ledger_entry_id),
@@ -153,6 +182,63 @@ func (s *CreditService) CloseHold(ctx context.Context, billingID, status, ledger
 		return false, fmt.Errorf("读取预扣终结行数失败：%w", err)
 	}
 	return n > 0, nil
+}
+
+// SettleHoldRequest 是「同事务终结预扣」的入参。
+//
+// Delta 的下标约定与 Settle 一致：>0 补扣（需余额充足）、<0 退回、0 不动钱。
+type SettleHoldRequest struct {
+	BillingID     string
+	UserID        int64
+	Delta         float64
+	SessionID     string
+	Remark        string
+	Status        string // HoldSettled / HoldRefunded
+	LedgerEntryID string
+}
+
+// SettleHold 是**预扣终结的唯一原子入口**：终结登记 + 改余额 + 写流水在同一个事务里。
+//
+// 为什么必须原子（Owl 复审 P1）：旧写法是「先 Settle 真动钱、再 CloseHold 一条独立 UPDATE」。
+// 后者失败或进程中断时 hold 仍是 held，15 分钟后 ExpireHolds 会再全额退一次 —— 双份预扣；
+// 成功路径同病：账单已结算但 hold 没 settled，过期扫描把整笔预扣退回。
+//
+// 返回 false 表示「这条 hold 已被别的路径终结」，此时**不动钱**（幂等，防重复退）。
+// 注意顺序：先抢终结权（条件 UPDATE 锁行），抢到才动钱 —— 反过来的话过期扫描可能与退款并发。
+func (s *CreditService) SettleHold(ctx context.Context, req SettleHoldRequest) (bool, error) {
+	if s == nil || s.store == nil || s.store.db == nil {
+		return false, fmt.Errorf("积分服务未装配数据库连接")
+	}
+	if req.BillingID == "" {
+		return false, fmt.Errorf("预扣终结缺少 billing_id")
+	}
+	if req.Status != HoldSettled && req.Status != HoldRefunded {
+		return false, fmt.Errorf("预扣终结状态只能是 settled/refunded（收到 %q）", req.Status)
+	}
+
+	tx, err := s.store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("begin settle hold tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	owned, err := s.closeHoldOn(ctx, tx, req.BillingID, req.Status, req.LedgerEntryID)
+	if err != nil {
+		return false, err
+	}
+	if !owned {
+		// 已终结（结算/退款/过期任一方先到）→ 不动钱。
+		return false, nil
+	}
+	if req.Delta != 0 {
+		if _, _, err := s.settleOn(ctx, tx, req.UserID, req.Delta, req.SessionID, req.Remark); err != nil {
+			return false, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit settle hold tx: %w", err)
+	}
+	return true, nil
 }
 
 // ExpireResult 是一轮过期扫描的结果。
