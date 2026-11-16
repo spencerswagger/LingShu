@@ -464,6 +464,18 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 			"stream_idle_ms", upCfg.Timeouts.StreamIdle.Milliseconds())
 	}
 
+	// 转发降级开关（sys_configs：upstream.degrade.passthrough_enabled）。
+	//
+	// 只读开关本身，**不看** upstream.base_url：那个基址只服务账本同步/对账，
+	// 未配置（默认空串）是正常态，拿它当门会把所有 /v1 请求关成 503。
+	// 开关关 → /v1 与 /v1beta 返回 503 + 明确文案（不代理、不计费、不落账单）。
+	if magpieHandler != nil {
+		magpieHandler.SetGate(func() bool {
+			c, _ := upstreamCfg.Load(context.Background())
+			return c.Degrade.PassthroughEnabled
+		})
+	}
+
 	// D4：对账窗口的四列计数由对账服务在窗口结束时写入（四个 0 等于「漏账不可见」）。
 	// 只落计数与状态；七列归因的读取方属阶段二（本期不做）。
 	windowStore := upstream.NewSQLWindowStore(d)
@@ -473,9 +485,13 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 		Counts:   windowStore,
 		States:   windowStore,
 		Streaks:  windowStore,
+		// ⚠️ 必须用 LedgerActive()（= 基址已配 && 开关开），不是裸的 Degrade.LedgerEnabled：
+		// `upstream.base_url` 默认是空串（且没有管理端写入口），只看开关的话每轮都会「成功跑完
+		// 0 笔」并把窗口写成 status=ok / 0 对 0 —— 漏账从此看起来像正常，正是 0023/D4 要防的那种假绿。
+		// 基址没配 ⇒ 账本拉取停摆 ⇒ 窗口落 skipped（不是 blocked，不冒充「已对平」）。
 		LedgerEnabled: func() bool {
 			c, _ := upstreamCfg.Load(context.Background())
-			return c.Degrade.LedgerEnabled
+			return c.LedgerActive()
 		},
 		Logger: logr,
 	})

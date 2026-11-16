@@ -70,6 +70,10 @@ type Handler struct {
 	proxy    *Proxy
 	reserve  ReserveHook
 	logger   *slog.Logger
+	// gate 是转发降级开关（nil = 常开）。返回 false 时 /v1、/v1beta 一律 503，
+	// 不发上游、不扣费、不写账单 —— 对应 sys_configs 的 upstream.degrade.passthrough_enabled。
+	// 只读这个开关，不看 upstream.base_url：那个基址只服务账本同步，没配属正常态。
+	gate func() bool
 }
 
 // NewHandler 装配入口；Config 未配置基址时返回 nil（调用方保持 410 停用口径）。
@@ -118,9 +122,31 @@ func (h *Handler) logFor(ctx context.Context) *slog.Logger {
 //	POST /v1/...     四类协议端点（其余方法/路径一律 405/404，不做开放代理）
 //	POST /v1beta/... Gemini（model 在 path）
 func (h *Handler) Mount(mux *http.ServeMux) {
-	mux.HandleFunc("GET /v1/models", h.handleModels)
-	mux.HandleFunc("/v1/", h.handleProxy)
-	mux.HandleFunc("/v1beta/", h.handleProxy)
+	mux.HandleFunc("GET /v1/models", h.guard(h.handleModels))
+	mux.HandleFunc("/v1/", h.guard(h.handleProxy))
+	mux.HandleFunc("/v1beta/", h.guard(h.handleProxy))
+}
+
+// SetGate 注入转发降级开关（见 Handler.gate）。装配层在 sys_configs 变化时热生效。
+func (h *Handler) SetGate(gate func() bool) { h.gate = gate }
+
+// guard 把降级开关套在入口上：关掉时返回 503 + 明确文案（不代理、不计费、不落账单）。
+//
+// 为什么必须有这个消费方：`upstream.degrade.passthrough_enabled` 写进 sys_configs 后
+// 如果没人读，运维关掉开关却照旧转发 —— 开关变成假的。
+func (h *Handler) guard(next http.HandlerFunc) http.HandlerFunc {
+	// gate 在**请求时**才读（不是 Mount 时快照）：运维改开关要立即生效，不必重启。
+	return func(w http.ResponseWriter, r *http.Request) {
+		if h.gate != nil && !h.gate() {
+			WriteDeny(w, ProtocolOpenAIChat, Deny{
+				Status:  http.StatusServiceUnavailable,
+				Code:    CodeServiceUnavailable,
+				Message: "转发服务已暂停（运维降级开关）",
+			})
+			return
+		}
+		next(w, r)
+	}
 }
 
 // handleModels 返回租户可见的模型列表（OpenAI list 形状，与既有 /v1/models 兼容）。

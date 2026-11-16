@@ -188,3 +188,19 @@ func assertSameSet(t *testing.T, what string, got, want []string) {
 			"多出 → 干净库误报污染；缺少 → 真污染漏判。加迁移文件时三处要一起改", what, extra, missing)
 	}
 }
+
+// TestV2Probe_LegacyProbeHandlesPartialColumns 断言探测② 不把“三列齐全”当查询开关。
+//
+// 半迁移库里 `billing_records` 可能只多出 1~2 列（手工加过 / 迁移中途失败）。旧写法
+// `count(...) = 3 THEN ...` 在这种库上**静默不查询**，探测输出 0 行看着干净；
+// 复审实测：只补 `magpie_key_name` 并写入值，探测仍然 0 行。
+func TestV2Probe_LegacyProbeHandlesPartialColumns(t *testing.T) {
+	body := stripSQLComments(readProbe(t, "probe-2-legacy-objects.sql"))
+	if strings.Contains(body, "= 3") {
+		t.Fatalf("探测② 不许用 `= 3` 当查询开关：只剩 1~2 列的半迁移库会被静默跳过；" +
+			"应按实际存在的列动态拼条件")
+	}
+	if !strings.Contains(body, "string_agg") {
+		t.Fatalf("探测② 必须按实际存在的列动态拼条件（string_agg + format + EXECUTE）")
+	}
+}

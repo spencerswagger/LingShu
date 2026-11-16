@@ -49,6 +49,12 @@ type Result struct {
 	NoContent bool
 	// Billable 表示该端点参与计费（count_tokens 类为 false）。
 	Billable bool
+	// DownstreamBytes 是**已经写给下游**的响应体字节数（不含状态行/头，含 SSE 帧）。
+	//
+	// 为什么要有它：无 usage 时本网关不计费（整笔退预扣），于是「上游没给 usage 但确实
+	// 吐了内容」对租户是白送。只有 `error_message='no-usage'` 这一条线索时，连
+	// 「白送了多少」都量不出来 —— 这个字段是那条链路的唯一度量（落 WARN 日志）。
+	DownstreamBytes int64
 	// CredentialMasked 表示响应体命中了「本次凭据回显」并已替换为 <redacted>
 	// （契约 §8.1 的唯一豁免项；未命中时字节完全不变）。
 	CredentialMasked bool
@@ -393,6 +399,7 @@ func (p *Proxy) serveMaskedBuffered(w http.ResponseWriter, body io.Reader, colle
 				res.Canceled = true
 				return
 			}
+			res.DownstreamBytes += int64(len(out))
 		}
 		buf := make([]byte, 32*1024)
 		for {
@@ -406,6 +413,7 @@ func (p *Proxy) serveMaskedBuffered(w http.ResponseWriter, body io.Reader, colle
 						res.Canceled = true
 						return
 					}
+					res.DownstreamBytes += int64(len(out))
 				}
 			}
 			if rerr != nil {
@@ -413,6 +421,8 @@ func (p *Proxy) serveMaskedBuffered(w http.ResponseWriter, body io.Reader, colle
 					if tail := masker.flush(); len(tail) > 0 {
 						if _, werr := w.Write(tail); werr != nil {
 							res.Canceled = true
+						} else {
+							res.DownstreamBytes += int64(len(tail))
 						}
 					}
 					if masker.replaced {
@@ -438,6 +448,8 @@ func (p *Proxy) serveMaskedBuffered(w http.ResponseWriter, body io.Reader, colle
 	w.WriteHeader(res.Status)
 	if _, werr := w.Write(masked); werr != nil {
 		res.Canceled = true
+	} else {
+		res.DownstreamBytes += int64(len(masked))
 	}
 }
 
@@ -565,6 +577,7 @@ func (p *Proxy) copyBody(w http.ResponseWriter, body io.Reader, collector *usage
 					cancel()
 					return nil
 				}
+				res.DownstreamBytes += int64(len(out))
 			}
 			if isSSE && flusher != nil {
 				flusher.Flush()
@@ -579,6 +592,7 @@ func (p *Proxy) copyBody(w http.ResponseWriter, body io.Reader, collector *usage
 						cancel()
 						return nil
 					}
+					res.DownstreamBytes += int64(len(tail))
 					if isSSE && flusher != nil {
 						flusher.Flush()
 					}

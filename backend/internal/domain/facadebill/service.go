@@ -200,7 +200,9 @@ func (s *Service) OnComplete(ctx context.Context, res magpie.Result) {
 	if handle == nil {
 		// 没预扣（未装配 OnReserve / 免费路径没句柄）：没有可退的钱，只补一条失败账单留痕。
 		if !hasUsage(res) {
-			s.recordFailure(ctx, nil, res, reasonOf(res))
+			reason := reasonOf(res)
+			s.recordFailure(ctx, nil, res, reason)
+			s.warnNoUsage(res, "", reason)
 		}
 		return
 	}
@@ -210,6 +212,7 @@ func (s *Service) OnComplete(ctx context.Context, res magpie.Result) {
 		reason := reasonOf(res)
 		s.refundAndClose(ctx, handle, reason)
 		s.recordFailure(ctx, handle, res, reason)
+		s.warnNoUsage(res, handle.billingID, reason)
 		return
 	}
 
@@ -227,6 +230,27 @@ func (s *Service) OnComplete(ctx context.Context, res magpie.Result) {
 	s.logger.Info("facade 转发已结算",
 		"billing_id", handle.billingID, "model", handle.extModel,
 		"credits", credits, "pre", handle.pre, "endpoint", handle.endpoint)
+}
+
+// warnNoUsage 把「不给 usage 就不计费」这条口径的**代价**打成可观测事实（Owl 复审 P1-4）。
+//
+// 风险原样说清：流式请求若上游不回 usage，本次内容对租户是**白送**（预扣整笔退回、账单元）。
+// 现在只在 `billing_records.error_message='no-usage'` 里留一条事后线索，量不出规模，
+// 所以这里补三样东西：下行字节数（真的送出多少）、是否流式、上游状态码。
+// 要不要再加「占比告警 / 注入 include_usage / 按 max_tokens 保留预扣」属计费口径变更，
+// 需产品拍板，本批不做（登记在交付说明的未修项里）。
+func (s *Service) warnNoUsage(res magpie.Result, billingID, reason string) {
+	if s.logger == nil || reason != ReasonNoUsage {
+		return
+	}
+	s.logger.Warn("上游未返回 usage：本次不计费（预扣已整笔退回）",
+		"billing_id", billingID,
+		"model", res.ExternalModel,
+		"endpoint", res.Endpoint,
+		"stream", res.Streamed,
+		"status", res.Status,
+		"downstream_bytes", res.DownstreamBytes,
+		"duration_ms", res.Duration.Milliseconds())
 }
 
 // settle 按真实 usage 落账单（PreConsumed = 预扣额，只结算差额），返回本次实际积分。

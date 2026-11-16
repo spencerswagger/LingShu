@@ -20,24 +20,29 @@
 --
 -- 期望输出：0 行。
 
--- 三列可能**整体不存在**（干净库就是这个状态，且是正常的）：所以先判列，再动态查数据，
--- 不能让「列不存在」把探测本身打成 SQL 错误。
+-- 三列可能**整体不存在**（干净库就是这个状态，且是正常的）、也可能**只存在其中一两列**
+-- （半迁移 / 有人手工加过一列）：所以按「实际存在哪些列」动态拼条件，不能用 `= 3` 当开关 ——
+-- 用 `= 3` 时只剩 1~2 列会**静默不查询**（复审实测：只补 magpie_key_name 并写入值，探测仍 0 行）。
 -- psql 自动提交模式下每条语句各自成事务，所以**不能**用 ON COMMIT DROP（临时表会立刻消失）；
 -- 用 DROP IF EXISTS 保证可重复执行。
 DROP TABLE IF EXISTS _probe2;
 CREATE TEMP TABLE _probe2(verdict text, n bigint);
 
 DO $probe2$
+DECLARE
+    cond text;
 BEGIN
-    IF (SELECT count(*) FROM information_schema.columns
-         WHERE table_schema = 'public' AND table_name = 'billing_records'
-           AND column_name IN ('magpie_key_name', 'estimated', 'upstream_usage')) = 3 THEN
-        EXECUTE $q$INSERT INTO _probe2
+    -- 只拼**实际存在**的列；一列都没有（干净库）时 cond 为 NULL，整段跳过。
+    SELECT string_agg(quote_ident(column_name) || ' IS NOT NULL', ' OR ' ORDER BY column_name)
+      INTO cond
+      FROM information_schema.columns
+     WHERE table_schema = 'public' AND table_name = 'billing_records'
+       AND column_name IN ('magpie_key_name', 'estimated', 'upstream_usage');
+    IF cond IS NOT NULL THEN
+        EXECUTE format($q$INSERT INTO _probe2
                   SELECT 'billing_records 存在本批新增的旧口径数据', count(*)
                     FROM billing_records
-                   WHERE magpie_key_name IS NOT NULL
-                      OR estimated IS NOT NULL
-                      OR upstream_usage IS NOT NULL$q$;
+                   WHERE %s$q$, cond);
     END IF;
 END
 $probe2$;

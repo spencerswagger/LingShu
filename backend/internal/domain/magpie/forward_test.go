@@ -35,6 +35,7 @@ func (c *capturedRequest) snapshot() capturedRequest {
 type testEnv struct {
 	upstream *httptest.Server
 	gateway  *httptest.Server
+	handler  *Handler
 	captured *capturedRequest
 	results  []Result
 	mu       sync.Mutex
@@ -80,6 +81,7 @@ func newTestEnv(t *testing.T, cfg Config, models map[string]*model.ExternalModel
 	}
 	mux := http.NewServeMux()
 	h.Mount(mux)
+	env.handler = h
 	env.gateway = httptest.NewServer(mux)
 	t.Cleanup(env.gateway.Close)
 	return env

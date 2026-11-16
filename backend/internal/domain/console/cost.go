@@ -130,7 +130,9 @@ SELECT CASE
        %s AS output_tokens,
        to_json(array_agg(DISTINCT b.external_model_name))::text AS snapshot_names
 FROM billing_records b
-LEFT JOIN external_models em ON em.external_name = b.external_model_name
+-- 必须带 deleted_at IS NULL：uq_external_models_active 是「活跃行」部分唯一索引，
+-- 「删掉再用同名建一个」是合法数据；不加这条会 JOIN 出两行，本页所有金额（含合计）翻倍。
+LEFT JOIN external_models em ON em.external_name = b.external_model_name AND em.deleted_at IS NULL
 WHERE b.status = 'completed'
   AND ` + costProbeExclusionSQL + `
 GROUP BY 1
@@ -295,6 +297,21 @@ type costCurvesResponse struct {
 	Curves []costCurveItem `json:"Curves"`
 }
 
+// costCurvesQuerySQL 是售价曲线的取数（渠道体系下线后只剩售价线）。
+//
+// `deleted_at IS NULL` 与成本统计同口径：同名「删了再建」会留下多行，不过滤就会出两条重复曲线。
+const costCurvesQuerySQL = `
+SELECT 0::bigint      AS channel_id,
+       ''::text       AS channel_name,
+       ''::text       AS internal_model_id,
+       em.external_name,
+       NULL::jsonb    AS cost_rates,
+       em.sale_rates
+FROM external_models em
+WHERE em.enabled
+  AND em.deleted_at IS NULL
+ORDER BY em.external_name`
+
 // HandleCostCurves GET /api/v1/admin/cost/curves
 // 依据每轮输入/缓存命中率/输入输出比模拟各渠道多轮累计成本与售价曲线。
 // rate 单位「人民币每百万 token 价」（纯数字）；每轮值 = Σ(token×rate) ÷ R，与账单积分同量纲
@@ -365,16 +382,7 @@ func (h *Admin) HandleCostCurves(w http.ResponseWriter, r *http.Request) {
 	// 渠道体系下线后成本价（channel_models.cost_rates）没有存储了：真实成本改由账本
 	// （billing_records.cost_credits / ledger_entries，见 /api/v1/admin/ops/pnl）提供。
 	// 这里只出「售价曲线」：每个对外模型一条，成本侧字段留空由前端置灰。
-	rowSet, err := h.db.QueryContext(r.Context(), `
-SELECT 0::bigint      AS channel_id,
-       ''::text       AS channel_name,
-       ''::text       AS internal_model_id,
-       em.external_name,
-       NULL::jsonb    AS cost_rates,
-       em.sale_rates
-FROM external_models em
-WHERE em.enabled
-ORDER BY em.external_name`)
+	rowSet, err := h.db.QueryContext(r.Context(), costCurvesQuerySQL)
 	if err != nil {
 		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "查询成本曲线失败")
 		return

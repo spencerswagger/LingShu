@@ -139,10 +139,30 @@
 --    call_logs.channel_id / channel_key_id / auto_model_name：无外键、不阻塞，
 --    且是历史日志快照——删了就没有第二份证据可查。
 --
--- ── 已知缺口（不假装已解决）─────────────────────────────────────────────
---    执行完本文件后，代码侧仍有一批读写方指向被删的列/表（sessions.channel_key_id 的写入、
---    tokens.tag_id、console 的渠道名反查、billing/stats 的按密钥聚合等）。这些摘除属阶段二，
---    本切片只保证迁移链能一次跑通、字典序=执行序；**上线前必须先摘代码**（登记在交付说明里）。
+-- ── 代码侧同批摘除（已做，不是缺口）──────────────────────────────────────
+--    曾经列在这里的「sessions.channel_key_id 写入 / tokens.tag_id / console 渠道名反查 /
+--    billing/stats 按密钥聚合」等读写方**已在本批同一条分支里摘掉**（11 个摘除点见
+--    docs/designs/2026-11-16-channel-domain-removal.md）。判据不是「测试变绿」，而是：
+--    清空迁移后的终态库上服务能**正常启动**并跑通 /healthz + 业务接口（42P01 / 42703 计数 0）。
+--    ⚠️ 本文件与代码摘除是**一个原子单元**：只上迁移 = 进程启动即 exit 1（不是部分接口报错），
+--       只上代码 = 表/列还在但没人用（死代码）。两者只能同批上线。
+--
+-- ── 历史渠道维度：已评估，产品决定不留 ──────────────────────────────────
+--    这三列（channel_key_id × 2、tag_id）与 10 张表删掉后，「历史账单的渠道名/密钥名」**永久取不回**。
+--    评估过的低成本补救（建 retired_channel_names 快照表 / 把 name 回填进 call_logs 两列）**不做**：
+--    渠道体系整体下线后这些名字不再对应任何可操作对象，留着只会让运营以为渠道还在。
+--    要留证据的窗口是「执行前」：pg_dump（步骤 1）就是唯一历史证据，按备份保留期管理即可。
+--    call_logs.channel_id / channel_key_id / auto_model_name 三个**日志快照列**则保留（见上）。
+--
+-- ── ⚠️ 跑过旧 facade 的库会多留 4 个对象（阶段二必须先 DROP 再 ADD）─────────
+--    旧分支（`0019_v2_facade.sql`，已作废）建过 billing_records 的
+--    `magpie_key_name` / `estimated` / `upstream_usage` 三列与 `idx_billing_magpie_key_time`。
+--    本文件**刻意不删**它们（本批对 billing_records 零改动），所以这种库的 schema 会比全新库
+--    正好多这 4 个对象 —— 今天无害，但**阶段二落这三列时不许写 `ADD COLUMN IF NOT EXISTS`
+--    / `CREATE INDEX IF NOT EXISTS`**：那会对这种库静默跳过（列在但形状/默认值可能不同），
+--    重演「记录说跑过、对象却建错」的同一类事故。阶段二写成「先 DROP COLUMN/INDEX IF EXISTS,
+--    再 ADD」，或按新形另起列名。守卫：TestMigrationChain 之外，运维脚本比对 schema 时
+--    把这 4 行列为「已知差异」，别当成漂移去追。
 --
 -- 幂等：全部 DROP ... IF EXISTS，重复执行不报错（但已删的数据取不回）。
 

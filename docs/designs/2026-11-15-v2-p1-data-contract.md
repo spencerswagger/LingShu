@@ -5,15 +5,28 @@
 > 本文是阶段一后端实现的**唯一数据层依据**：表结构、字段、枚举、写入时机、证据流程。
 > 与已批准计划有出入的地方集中在 §10，均给出理由，其中 3 条需负责人一句话拍板（A / E / F）。
 
+> ## ⚠️ 本文的 SQL 与清单已过期，执行一律以代码为准
+>
+> 本文写于 2026-11-15、编号还是 `0019–0023`（DROP 文件叫 `0021_v2_drop_legacy`）。之后的裁定是：
+> DROP 文件更名 **`0024_v2_drop_legacy`**、`0019_v2_facade` 拆成 **`0019b_v2_passthrough_credentials`**、
+> 补了 `0023b` / `0023c` 两个幂等修形迁移。**照本文 §5 / §4 / §14 的 SQL 直接跑会造出坏库**
+> （最典型：R-2 的 DELETE 清单里留着不存在的 `0021_v2_drop_legacy.sql`、缺 `0019b/0023b/0023c`，
+> 跑完再迁移时 `0019b` 被跳过 → `magpie_keys` 与 `external_models.magpie_model` 永久消失，启动即 42P01/42703）。
+>
+> **唯一可执行来源**（本文只作设计意图与状态矩阵的解释）：
+> 1. `backend/internal/db/migrations/0024_v2_drop_legacy.sql` 文件头的四条探测与处置；
+> 2. `backend/scripts/acceptance/v2-preflight/`（`probe-1..4.sql` + `run.sh`，与 `db.V2MigrationFiles()` 同源，有源码级用例守）；
+> 3. `backend/docs/plans/2026-11-15-v2-0024-preflight-evidence.md`（三步证据实测）。
+
 ---
 
 ## 0 结论先行
 
-1. 编号从 **0019** 重新起号，五个文件各管一件事，**唯一允许出现 DROP 的文件是 0021**。
+1. 编号从 **0019** 重新起号（落地后共 **8 个**文件，见 §1 表），**唯一允许出现 DROP 的文件是 `0024_v2_drop_legacy.sql`**（原 `0021` 更名）。
 2. 账本先落 **9 列（8 业务字段 + 1 本地主键）**，分页按 **窗口内 offset**，**不持久化游标**；幂等靠 `ledger_id` 唯一键。
 3. 归因统一 `upstream_*` 命名，**全仓不出现第三方产品名**；唯一例外是「回程剥头」的匹配前缀（见 §10-F）。
 4. 四协议透传落在**入站 handler 与出站 client 之间的适配层**，网关侧零改动；Gemini 现网**没有路由**，必须新增两条（见 §6）。
-5. 0021 的 DROP 绑定「pg_dump → 临时库还原 → 三份行数比对」，**判定点 A/B/C 任一不过即中止**。
+5. `0024` 的 DROP 绑定「pg_dump → 临时库还原 → 行数比对」，**判定点 A/B/C 任一不过即中止**（实测数据见 `backend/docs/plans/2026-11-15-v2-0024-preflight-evidence.md`）。
 
 ---
 
@@ -32,7 +45,10 @@
 |---|---|---|---|---|
 | 0019 | `0019_v2_topology.sql` | 建四层图的三张表（`internal_models` / `model_links` / `subscriptions`）+ `external_models` 加绑定列 | 是（DROP 三表 / DROP 列） | `IF NOT EXISTS` / `ADD COLUMN IF NOT EXISTS` |
 | 0020 | `0020_v2_billing_attribution.sql` | `billing_records` 只加归因列与索引（7 列），**纯 ADD、零 DROP、零 DML** | 是 | 同上 |
-| 0021 | `0021_v2_drop_legacy.sql` | **唯一的 DROP 文件**：**10 张实际退役表**（另 1 条 `channel_events` 是 0009 已删的空操作）+ 3 个阻塞列 | **否**（必须走 §5 证据流程） | `DROP TABLE/COLUMN IF EXISTS` |
+| ~~0021~~ | ~~`0021_v2_drop_legacy.sql`~~ → **`0024_v2_drop_legacy.sql`** | **唯一的 DROP 文件**：**10 张实际退役表**（另 1 条 `channel_events` 是 0009 已删的空操作）+ 3 个阻塞列 | **否**（必须走 §5 证据流程） | `DROP TABLE/COLUMN IF EXISTS` |
+| 0019b | `0019b_v2_passthrough_credentials.sql` | 从已删除的 `0019_v2_facade` 拆出**仍被代码使用**的对象：`magpie_keys` + `external_models.magpie_model` + 部分唯一索引 | 是 | `IF NOT EXISTS` |
+| 0023b | `0023b_v2_reconcile_repair.sql` | 老库修形（窗口状态放开 `skipped`、`scroll_offset`、账单成本 CHECK 改 `IS NOT DISTINCT FROM`） | 是（幂等） | 全部幂等写法 |
+| 0023c | `0023c_v2_reconcile_counts_backfill.sql` | 把同步写过的「0 占位」计数归 NULL（0 只表示算过且真的没流量） | 是（幂等） | `UPDATE ... WHERE` |
 | 0022 | `0022_v2_ledger.sql` | 建 `ledger_entries`（账本最小九字段）与 `credit_holds`（预扣登记，阶段二启用） | 是（DROP 两表） | `IF NOT EXISTS` |
 | 0023 | `0023_v2_reconcile.sql` | 建 `reconcile_windows`（60s 对账窗口与告警连续计数） | 是（DROP 表） | `IF NOT EXISTS` |
 
@@ -159,7 +175,12 @@ CREATE INDEX IF NOT EXISTS idx_billing_request
 
 ---
 
-## 4 0021_v2_drop_legacy.sql（唯一不可回滚文件）
+> **§4 已过期**：DROP 文件现名 `0024_v2_drop_legacy.sql`，正文以迁移文件为准（含 10 张表 + 3 列的完整清单、删除顺序与外键说明）。
+> 本节保留的只是「为什么先删列再删表」的推理，**不要照抄 SQL**。
+
+## 4 ~~0021~~ → 0024_v2_drop_legacy.sql（唯一不可回滚文件）
+
+> 下文提到「0021」的地方一律读作「`0024_v2_drop_legacy.sql`」（仅编号/文件名改了，删表删列的内容与顺序不变）。
 
 ### 4.1 先删列（解除外键/非空阻塞）
 
@@ -185,7 +206,7 @@ channel_tags → channel_model_events → channel_key_events → probe_logs
 
 全部 `DROP TABLE IF EXISTS`。**保留不删**：`channel_protocols`、`protocol_error_stats`（不在批准清单；无写入方后是孤岛表，等阶段二后单独拍板清理），`watchlist_items` / `price_change_alerts`（价格监控，未批准下架）。
 
-### 4.3 为什么 0021 是唯一 DROP 文件
+### 4.3 为什么 DROP 只出现在一个文件（原 0021 → 现 0024）
 
 `migrate.go` 每文件一个事务（`internal/db/migrate.go:16-70`），PG 的 DDL 事务性 → 0021 中途失败会整体回滚，不需要手工 restore（严格结论与 dump 的实际作用见 §12-①）。把所有不可逆动作集中在**一个**文件，等于「备份 → 证据 → 执行」只走一次，回滚点只有一个。
 
@@ -211,7 +232,11 @@ pg_restore -d $SRC_DB --no-owner --no-privileges -j4 "$BK"   # 行数应与 befo
 
 ---
 
-## 5 0021 执行手册（探测 → 状态矩阵 → 证据 → 判定）
+## 5 DROP 文件执行手册（探测 → 状态矩阵 → 证据 → 判定）
+
+> ⚠️ 本节只讲**判定逻辑**（状态矩阵与 R-1/R-2 的取舍）；**可执行的探测 SQL 已移到**
+> `backend/scripts/acceptance/v2-preflight/`（与 `db.V2MigrationFiles()` 同源、有源码级用例守漂移），
+> 本文不再重复贴 SQL（贴一份就会漂一份）。
 
 > 执行人：持有宿主 PG 的人（spencer / hugo）。**沙盒内 PG 拒连**（实测 `127.0.0.1:5432` Connection refused），且 `lingshu_dev` 无 `CREATEDB`（2026-11-10 实测），临时库必须由有权限的角色建。
 >
@@ -229,73 +254,24 @@ pg_restore -d $SRC_DB --no-owner --no-privileges -j4 "$BK"   # 行数应与 befo
 
 ⇒ 记录表记的是「**文件跑过**」，不是「**对象建对**」。**四条**探测缺一不可：
 
+四个探测**不要手抄**，用入库的可执行版本（与 `db.V2MigrationFiles()` 同源，有 `TestV2Probe_RecordWhitelistMatchesMigrationFiles` 等用例守漂移）：
+
 ```bash
-cat > probe-1-record.sql <<'SQL'
--- ① 记录层：0019+ 的记录里，除本版五个文件名之外的任何一条都算旧分支污染。
---    注意不要写 name >= '0019' 裸条件 —— 本版跑完后它永远非空，会每次都误报。
--- 区间必须**有右界**（name < '0024'）：将来加 0024 后裸 >= 会自己误报
-SELECT name FROM applied_migrations
-WHERE name >= '0019' AND name < '0024'
-  AND name NOT IN ('0019_v2_topology.sql','0020_v2_billing_attribution.sql',
-                   '0021_v2_drop_legacy.sql','0022_v2_ledger.sql','0023_v2_reconcile.sql')
-ORDER BY name;
-SQL
-cat > probe-2-object.sql <<'SQL'
--- ② 对象层：旧分支独有对象（表 / 列）。这些名字只是技术探测串，不得出现在任何界面文案里。
-SELECT 'magpie_keys' AS legacy_object WHERE to_regclass('public.magpie_keys') IS NOT NULL
-UNION ALL
-SELECT c.table_name || '.' || c.column_name
-FROM information_schema.columns c
-WHERE c.table_schema = 'public'
-  AND (c.table_name, c.column_name) IN
-      (('external_models','magpie_model'), ('billing_records','magpie_key_name'),
-       ('billing_records','estimated'),    ('billing_records','upstream_usage'));
-SQL
-cat > probe-3-shape.sql <<'SQL'
--- ③ 形状层：窗口表列清单（0 行 = 尚未建，正常；非空则必须十列齐全）
-SELECT column_name FROM information_schema.columns
-WHERE table_schema = 'public' AND table_name = 'reconcile_windows'
-ORDER BY 1;
-SQL
-cat > probe-4-objects-by-record.sql <<'SQL'
--- ④ 反查：按「已记文件名 → 它该建的对象」核对对象**真的存在**。
---    专治 S4（记录在、对象缺）：这种库里 ①②③ 全 0 行，判不出任何异常，
---    执行后五个文件逐条 exit 0、零报错，但一个对象都没建。
---    对「同名不同内容」也有效：0019/0020/0022 的对象/列在不在，①②③ 完全没有信号。
---    但它只看「对象/列在不在」——**约束、索引对不对它看不出**（那种库 ④ 也是 0 行，
---    靠 §15 的 v2 断言或「键约束确认」查询兜）。
-WITH want(file, kind, obj) AS (VALUES
-    ('0019_v2_topology.sql',           'table', 'internal_models'),
-    ('0019_v2_topology.sql',           'table', 'model_links'),
-    ('0019_v2_topology.sql',           'table', 'subscriptions'),
-    ('0019_v2_topology.sql',           'column','external_models.bound_internal_ref'),
-    ('0020_v2_billing_attribution.sql','column','billing_records.upstream_provider'),
-    ('0020_v2_billing_attribution.sql','column','billing_records.cost_source'),
-    ('0022_v2_ledger.sql',             'table', 'ledger_entries'),
-    ('0022_v2_ledger.sql',             'table', 'credit_holds'),
-    ('0023_v2_reconcile.sql',          'table', 'reconcile_windows'),
-    ('0021_v2_drop_legacy.sql',        'gone',  'channels'),
-    ('0021_v2_drop_legacy.sql',        'gone',  'channel_keys'),
-    ('0021_v2_drop_legacy.sql',        'gone',  'semantic_tags')
-), rec AS (
-    SELECT name FROM applied_migrations
-    WHERE name IN ('0019_v2_topology.sql','0020_v2_billing_attribution.sql',
-                   '0021_v2_drop_legacy.sql','0022_v2_ledger.sql','0023_v2_reconcile.sql')
-)
-SELECT w.file || ' → ' || w.obj || '（' || w.kind || '）' AS suspicious
-FROM want w JOIN rec ON rec.name = w.file
-WHERE CASE w.kind
-        WHEN 'table' THEN to_regclass('public.' || w.obj) IS NULL
-        WHEN 'gone'  THEN to_regclass('public.' || w.obj) IS NOT NULL
-        ELSE NOT EXISTS (
-            SELECT 1 FROM information_schema.columns ic
-            WHERE ic.table_schema = 'public'
-              AND ic.table_name   = split_part(w.obj, '.', 1)
-              AND ic.column_name  = split_part(w.obj, '.', 2))
-      END
-ORDER BY 1;
-SQL
+cd backend
+sh scripts/acceptance/v2-preflight/run.sh "$DSN"     # 依次跑 ①记录 ②对象 ③形状 ④反查，任一非空即停
+# 单跑某一项：
+psql "$DSN" -tA -f scripts/acceptance/v2-preflight/probe-1-records.sql
+psql "$DSN" -tA -f scripts/acceptance/v2-preflight/probe-2-legacy-objects.sql
+psql "$DSN" -tA -f scripts/acceptance/v2-preflight/probe-3-window-shape.sql
+psql "$DSN" -tA -f scripts/acceptance/v2-preflight/probe-4-objects-by-record.sql
 ```
+
+口径要点（脚本里逐条写了原因，这里只列结论）：
+- ① 记录层**排除式 + 有右界**，白名单必须等于 `db.V2MigrationFiles()`（当前 8 个文件：0019 / 0019b / 0020 / 0022 / 0023 / 0023b / 0023c / 0024）；
+- ② 对象层**不再把 `magpie_keys` / `magpie_model` 当残留**——它们是 0019b 收回本链的现役对象；
+  只剩「账单三列**有数据**」这一条可验证事实（列存在不算异常，源码零写入由用例守）；
+- ③ 形状层：`reconcile_windows` 未建或列齐全（含 `scroll_offset` 与四计数列），缺 `local_count` 即「被跳过」；
+- ④ 反查：按已记文件名核对象是否真在（专治 S4）。
 
 **判读口径（照抄实测，别自己简化）**：
 
@@ -349,19 +325,22 @@ psql -d $DB -tAc "SELECT to_regclass('public.magpie_keys'), to_regclass('public.
 psql -d $DB -c "\copy (SELECT * FROM reconcile_windows) TO 'reconcile_windows_old.csv' CSV HEADER"
 
 cat > r2.sql <<'SQL'
-DROP TABLE IF EXISTS magpie_keys;        -- 旧分支残留（S1/S2/S3）
-DROP TABLE IF EXISTS reconcile_windows;  -- 旧形状或坏形状
-ALTER TABLE external_models DROP COLUMN IF EXISTS magpie_model;
-ALTER TABLE billing_records  DROP COLUMN IF EXISTS magpie_key_name,
-                             DROP COLUMN IF EXISTS estimated,
-                             DROP COLUMN IF EXISTS upstream_usage;
--- 故意的：只清记录，让 0019–0023 整套重跑。已建对的走 IF NOT EXISTS 是 no-op；
+-- ⚠️ **不许 DROP `magpie_keys` / `external_models.magpie_model`**：
+--    它们是 0019b 收回本链的**现役对象**（转发链与准入在用）。旧版 R-2 让删这两样、
+--    同时又把 0019b 的记录漏在 DELETE 清单外，于是重跑时 CREATE ... IF NOT EXISTS 全部跳过、
+--    对象永久消失，进程启动即 42P01/42703（已在真库上复现过这条坏库路径）。
+DROP TABLE IF EXISTS reconcile_windows;  -- 旧形状或坏形状（纯派生数据，不迁行）
+-- 账单三列（magpie_key_name / estimated / upstream_usage）属「阶段二按新形处理」：
+-- 本链不建也不删，留着不影响；不许在这里顺手 DROP（阶段二会 ADD COLUMN IF NOT EXISTS 静默跳过）。
+--
+-- 故意的：只清记录，让本链整套重跑。已建对的走 IF NOT EXISTS 是 no-op；
 -- 被 DROP / 从来没建的 reconcile_windows 会按新形状真正建出来（S4 修复的关键）。
--- ⚠️ 必须逐条列出、写死区间，**不许** name >= '0019'：0024 落地后那条会把 0024 记录一起删掉，
---    导致下次迁移把 0024 当未执行重跑（虽然幂等，但记录语义已乱）。
+-- ⚠️ 必须逐条列名，**不许** name >= '0019'（0024 落地后那条会把 0024 记录一起删掉）。
 DELETE FROM applied_migrations WHERE name IN (
-    '0019_v2_topology.sql','0020_v2_billing_attribution.sql','0021_v2_drop_legacy.sql',
-    '0022_v2_ledger.sql','0023_v2_reconcile.sql',
+    '0019_v2_topology.sql','0019b_v2_passthrough_credentials.sql',
+    '0020_v2_billing_attribution.sql','0022_v2_ledger.sql',
+    '0023_v2_reconcile.sql','0023b_v2_reconcile_repair.sql',
+    '0023c_v2_reconcile_counts_backfill.sql',
     '0019_v2_facade.sql','0020_reconcile_blocked_status.sql'   -- 旧分支记录，一并清
 );
 SQL
@@ -610,7 +589,7 @@ CREATE INDEX IF NOT EXISTS idx_ledger_entries_account
 
 | # | 冲突点 | 我的裁定 | 为什么 |
 |---|---|---|---|
-| A | 「旧分支关掉」 | **尚未关掉**：远端仍有 3 个 V2 分支（`feat/lingshu-v2-p1-usage-billing`、`-slim-migrate`、`-magpie-passthrough`），三个都含 `0019_v2_facade.sql`，usage-billing 另含 `0020_reconcile_blocked_status.sql` | main 只到 0018，编号**不冲突**；但「关掉」这个动作没人做。需要 hugo/spencer 删远端分支，并明确旧 0019/0020 永久作废。我不动远端分支 |
+| A | 「旧分支关掉」 | **已关掉（2026-11-16）**：`feat/lingshu-v2-p1-usage-billing` / `-magpie-passthrough` / `docs/lingshu-v2-p1-data-contract` 等含 `0019_v2_facade.sql` 的分支已删除（本分支的迁移副本一并作废），PR #82 / #83 / #85 均已关闭，内容并入 #84 | 旧 0019/0020 永久作废；`0019b` 只保留仍被代码使用的对象 |
 | B | 计划写「0020 摘 channel 维度」 | 摘列移到 0021，0020 纯 ADD | 不可回滚动作只应出现在一个文件，备份/证据流程只走一次 |
 | C | 计划写「`pricing_mode` 扩 sale·subscription·usage」 | **不扩**，用户侧仍 `sale`/`cost`；成本来源另立 `cost_source` | `pricing_mode` 在现有代码里是**用户售价**口径（`users.pricing_mode` 同义）；把上游成本口径塞进去，盈亏页与账单页会读出两种含义 |
 | D | 旧契约金额用「BIGINT 微元」 | 账本金额用 `NUMERIC(20,5)` 积分 | 与 `billing_records.cost_credits` / `credit_wallets.balance` 同型同精度，报表可直接加减；不引第二套金额单位（旧契约已作废） |
@@ -751,7 +730,7 @@ CREATE INDEX IF NOT EXISTS idx_billing_request
     ON billing_records(request_id) WHERE request_id IS NOT NULL;
 ```
 
-### 0021_v2_drop_legacy.sql
+### ~~0021~~ → 0024_v2_drop_legacy.sql
 
 ```sql
 -- ① 先删阻塞列（顺序不可调）
