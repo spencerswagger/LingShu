@@ -212,6 +212,10 @@ func (p *Proxy) Forward(w http.ResponseWriter, r *http.Request, route Route, pre
 	needle := prep.CallerKey
 	body := io.Reader(resp.Body)
 	decoded := false
+	// stripEncoding 只在「声明的编码被解码器在**读取头部时**就拒绝」时置真：
+	// 那些字节根本不是该编码（典型：中间层硬加 `Content-Encoding: gzip`，而体已被它解压成明文）。
+	// 此时体按原字节转发，编码头必须剥掉，否则下游按 gzip 解一段明文直接报错（见下面的响应头段）。
+	stripEncoding := false
 	isSSE := isEventStream(resp.Header.Get("Content-Type"))
 	// decodeReplay 非空表示「解码器坐在快照 reader 上」：解码失败（无论 NewReader 就失败，
 	// 还是读到中途失败，如声称 gzip 但流被截断）都还能从快照回退到上游原始字节。
@@ -233,8 +237,11 @@ func (p *Proxy) Forward(w http.ResponseWriter, r *http.Request, route Route, pre
 				// 一段字节读走，直接回空壳等于把整段响应丢光（实测 1500 字节 → 0 字节）。
 				// 回退到「已消费前缀 + 剩余」的原始字节（不丢字节），
 				// 遮蔽豁免在该响应上不成立 → 记 UnmaskableEncoding 让 handler 落告警。
+				// 同时判定「头与体不自洽」（NewReader 只读前 10 字节的魔数就失败，
+				// 说明这些字节根本不是 gzip）→ 剥 Content-Encoding，见下方响应头段。
 				body = rr.replay()
 				res.UnmaskableEncoding = enc
+				stripEncoding = true
 			}
 		case "deflate":
 			rr := &replayReader{r: resp.Body}
@@ -246,6 +253,7 @@ func (p *Proxy) Forward(w http.ResponseWriter, r *http.Request, route Route, pre
 			} else {
 				body = rr.replay()
 				res.UnmaskableEncoding = enc
+				stripEncoding = true
 			}
 		default:
 			res.UnmaskableEncoding = enc
@@ -262,6 +270,15 @@ func (p *Proxy) Forward(w http.ResponseWriter, r *http.Request, route Route, pre
 		// 已解压：编码头与压缩前长度都不再成立。
 		w.Header().Del("Content-Encoding")
 		w.Header().Del("Content-Length")
+	}
+	if stripEncoding {
+		// 声明的编码被解码器在**读头部时**就拒绝（这些字节根本不是该编码）：
+		// 体按上游原始字节转发（未解压，也没改写），留着编码头会让下游按 gzip 解一段明文
+		// → `gzip: invalid header`，客户端侧表现为「流断了」（最难查的一类）。
+		// 只删编码头：转发的是原字节，Content-Length 仍然成立，不动。
+		// 与「头合法但解压中途失败（如截断）」区分：那条路保留编码头（字节确实是该编码），
+		// 见 serveMaskedBuffered 的回退分支——那条路上剥头会让下游把 gzip 字节当明文。
+		w.Header().Del("Content-Encoding")
 	}
 	if res.NoContent {
 		w.WriteHeader(resp.StatusCode)
