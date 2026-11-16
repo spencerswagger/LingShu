@@ -1,0 +1,256 @@
+package db
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// TestMigrationChain_V2Batch 守住 V2 这批迁移的形状（不需要 DSN，纯源码级）。
+//
+// 本批的边界（裁定后的口径，覆盖上一版「0021 必须被摘出去」）：
+//  1. 文件集合恰好是 0019 / 0020 / 0022 / 0023 / 0024，**没有 0021**（已更名 0024）；
+//  2. 0024 是**本批（< 0025）**文件名最大的迁移 —— 字典序 = 执行序，破坏性动作在本批里最后执行；
+//     0025 起的迁移（token_scope 顺延 0025）属于后续批，本批探测右界是 <'0025'；
+//  3. 破坏性 DDL（DROP TABLE / DROP COLUMN）**只允许出现在 0024**；0019 起的其它文件必须纯 ADD。
+//     上一版只查文件名，被「把 0021 改名成 0024_*」直接绕过（复审 R1 实测 PASS），所以这里查内容；
+//  4. 两个裁定点必须在文件里（改回旧口径要红）：
+//     - 0023 的 status 值域含 'skipped'、且有 scroll_offset 列；
+//     - 0020 有跨列 CHECK（cost_credits IS NULL ⇒ cost_source = 'none'）。
+//
+// 注释行先剔除：0020 / 0024 的文件头大量出现 "DROP COLUMN"/"DROP TABLE" 的说明文字，
+// 不剔必误报。
+func TestMigrationChain_V2Batch(t *testing.T) {
+	dir := migrationDir(t)
+	present := migrationFileNames(t, dir)
+
+	want := V2MigrationFiles()
+	for _, name := range want {
+		if !present[name] {
+			t.Fatalf("本批应包含 %s（迁移只从架构分支取，别自己改）", name)
+		}
+	}
+	if present["0021_v2_drop_legacy.sql"] {
+		t.Fatalf("本批不得再有 0021_v2_drop_legacy.sql：已按裁定更名为 0024 并排到最后" +
+			"（手工留两份会让同一份 DDL 跑两次、且 0021 会在 0023 之前执行）")
+	}
+
+	// 字典序 = 执行序：**本批内**（右界 < 0025）0024 必须是最后一个。
+	var last string
+	for name := range present {
+		if name >= V2MigrationRightBound {
+			continue // 后续批（0025+）不参与本批排序断言
+		}
+		if name > last {
+			last = name
+		}
+	}
+	if last != "0024_v2_drop_legacy.sql" {
+		t.Fatalf("最大的迁移文件是 %s，期望 0024_v2_drop_legacy.sql —— "+
+			"破坏性迁移必须排在链尾，否则它之后的文件跑在被删掉的列/表上", last)
+	}
+
+	for name := range present {
+		// 本批范围 = [0019, 0025)。0019 之前是历史（0005/0006/0009 等本来就含 DROP）；
+		// 0025 起是后续批（token_scope），本批不为它做保证。
+		if name < "0019" || name >= V2MigrationRightBound {
+			continue
+		}
+		body := readMigration(t, dir, name)
+		stmts := destructiveStatements(body)
+		if len(stmts) > 0 {
+			if name != "0024_v2_drop_legacy.sql" {
+				for _, stmt := range stmts {
+					// 唯一例外：0023 顶部「同名旧表自愈」——旧形状（PK=id、无 local_count）的
+					// reconcile_windows 必须 DROP 后重建，否则 CREATE 被整段跳过、直到首次写窗口才炸。
+					// 只放行**这一张表**：它是纯派生数据，且 0023 就是它的持有者。
+					if name == "0023_v2_reconcile.sql" && stmt == "DROP TABLE reconcile_windows" {
+						continue
+					}
+					t.Fatalf("%s 含有破坏性 DDL（%s）：只允许 0024 删列/删表，"+
+						"其余迁移必须纯 ADD（0023 的窗口表自愈是唯一例外，改名前缀也绕不过内容检查）", name, stmt)
+				}
+			}
+			continue
+		}
+		if name == "0024_v2_drop_legacy.sql" {
+			t.Fatalf("0024 应含破坏性 DDL（删退役渠道/标签/Auto 体系），实际没有——" +
+				"是不是被误改成了纯 ADD？")
+		}
+	}
+}
+
+// TestMigrationChain_ReconcileShape 断言 0023 的两个裁定点（status 值域 + offset 列）。
+func TestMigrationChain_ReconcileShape(t *testing.T) {
+	body := readMigration(t, migrationDir(t), "0023_v2_reconcile.sql")
+
+	for _, want := range []string{
+		"scroll_offset",
+		"'skipped'",
+		"ck_reconcile_status",
+		// 旧内联 CHECK 必须先删：留着它仍旧会拒 'skipped'。
+		"DROP CONSTRAINT IF EXISTS reconcile_windows_status_check",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("0023 缺少 %q（D4/F9 裁定：status 增 skipped、offset 持久化）", want)
+		}
+	}
+	// 计数列必须可空（NULL = 还没算过；0 = 算过且真的没流量，两者不能混）。
+	flatBody := strings.Join(strings.Fields(body), " ")
+	if strings.Contains(flatBody, "local_count BIGINT NOT NULL") {
+		t.Fatalf("计数列不许 NOT NULL DEFAULT 0（blocked 窗会与「无流量」不可区分）")
+	}
+	// 空白不敏感比对：迁移文件里的对齐空格会变，断言不该跟着碎。
+	flat := strings.Join(strings.Fields(body), " ")
+	for _, col := range []string{"local_count", "upstream_count", "local_tokens", "upstream_tokens"} {
+		if !strings.Contains(flat, "ALTER COLUMN "+col+" DROP NOT NULL") {
+			t.Fatalf("0023 缺少 ALTER COLUMN %s DROP NOT NULL（老表补齐路径）", col)
+		}
+	}
+	// 四个计数列必须还在（对账服务要写它们；删了就退化成「解析 detail」）。
+	for _, col := range []string{"local_count", "upstream_count", "local_tokens", "upstream_tokens"} {
+		if !strings.Contains(body, col) {
+			t.Fatalf("0023 缺少计数列 %s：四个计数列是对账判定的唯一来源，不许改成只写 detail", col)
+		}
+	}
+}
+
+// TestMigrationChain_BillingCostPresence 断言 0020 的跨列 CHECK（F10）。
+func TestMigrationChain_BillingCostPresence(t *testing.T) {
+	body := readMigration(t, migrationDir(t), "0020_v2_billing_attribution.sql")
+
+	if !strings.Contains(body, "ck_billing_cost_presence") {
+		t.Fatalf("0020 缺少跨列 CHECK ck_billing_cost_presence（F10：cost_credits IS NULL ⇒ cost_source = 'none'）")
+	}
+	// 必须用 IS NOT DISTINCT FROM：写成 `cost_source = 'none'` 时「NULL+NULL」求值为 NULL，
+	// SQL 的 CHECK 把 NULL 当通过 → 约束形同虚设（实测放行过）。
+	if !strings.Contains(body, "cost_source IS NOT DISTINCT FROM 'none'") {
+		t.Fatalf("ck_billing_cost_presence 必须用 `cost_source IS NOT DISTINCT FROM 'none'`（`=` 会漏掉 NULL 组合）")
+	}
+	// F10 补丁：约束必须是 NOT VALID（15 万存量行不许被扫一遍），且**不能**靠全表 UPDATE 归一
+	// （那个 UPDATE 本身就是被去掉的那次扫描）。
+	if !strings.Contains(body, "NOT VALID") {
+		t.Fatalf("跨列 CHECK 必须建成 NOT VALID（跳过存量扫描；新写入与 UPDATE 仍然强约束）")
+	}
+	if strings.Contains(body, "SET cost_source = 'none'\n WHERE") {
+		t.Fatalf("不许在迁移里做存量归一的 UPDATE（= 全表扫描）；用 NOT VALID 跳过存量")
+	}
+	// 回填 ledger_entry_id 的正确写法必须写在文件里（否则运维补单会踩 23514）。
+	if !strings.Contains(body, "COALESCE(cost_source, 'none')") {
+		t.Fatalf("0020 必须写明「回填 ledger_entry_id 时同时 COALESCE(cost_source,'none')」，否则补单会触发 23514")
+	}
+}
+
+// TestMigrationChain_TableLists 断言保留/退役表清单的数量与成员（F2）。
+func TestMigrationChain_TableLists(t *testing.T) {
+	retained := RetainedTables()
+	if len(retained) != 15 {
+		t.Fatalf("保留表应为 15 张，got %d: %v", len(retained), retained)
+	}
+	for _, want := range []string{"watchlist_items", "price_change_alerts"} {
+		found := false
+		for _, name := range retained {
+			if name == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("保留表缺少 %s（价格监控表未批准下架，别被「渠道域全删」顺手带走）", want)
+		}
+	}
+
+	retired := RetiredTables()
+	if len(retired) != 10 {
+		t.Fatalf("退役表应为 10 张（channel_events 在 0009 已删，不计入），got %d: %v", len(retired), retired)
+	}
+	// 交叉断言：退役表不许同时出现在保留清单里（两份清单打架 = 迁移会删掉「保留」的东西）。
+	for _, r := range retired {
+		for _, k := range retained {
+			if r == k {
+				t.Fatalf("%s 同时在退役与保留清单里", r)
+			}
+		}
+	}
+	// 退役表必须真的在 0024 里被 DROP（清单写了、SQL 没写等于没删干净）。
+	body := readMigration(t, migrationDir(t), "0024_v2_drop_legacy.sql")
+	for _, r := range retired {
+		if !strings.Contains(body, "DROP TABLE IF EXISTS "+r+";") {
+			t.Fatalf("0024 没有 DROP TABLE IF EXISTS %s;（与 RetiredTables() 不一致）", r)
+		}
+	}
+}
+
+// migrationDir 返回内嵌迁移的源码目录（tests 与 db.Migrate 用同一批文件）。
+func migrationDir(t *testing.T) string {
+	t.Helper()
+	return filepath.Join(filepath.Dir(mustCallerFile(t)), "migrations")
+}
+
+// migrationFileNames 返回目录下 .sql 文件名集合。
+func migrationFileNames(t *testing.T, dir string) map[string]bool {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("读取迁移目录失败: %v", err)
+	}
+	out := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".sql") {
+			continue
+		}
+		out[e.Name()] = true
+	}
+	return out
+}
+
+// readMigration 读取单个迁移文件正文。
+func readMigration(t *testing.T, dir, name string) string {
+	t.Helper()
+	body, err := os.ReadFile(filepath.Join(dir, name))
+	if err != nil {
+		t.Fatalf("读取迁移 %s 失败: %v", name, err)
+	}
+	return string(body)
+}
+
+// destructiveStatements 剔除 `--` 注释后，返回所有破坏性 DDL 的语句片段（去分号、去多余空白）。
+// 逐条返回而不是只报第一处：0023 的自愈 DROP 需要被单独放行，混在别的 DROP 里必须报错。
+func destructiveStatements(body string) []string {
+	var kept []string
+	for _, line := range strings.Split(body, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "--") {
+			continue // 注释里的说明不算
+		}
+		// 行尾注释去掉，避免 `ALTER TABLE t DROP COLUMN c; -- 说明` 之类误判/漏判。
+		if i := strings.Index(trimmed, "--"); i >= 0 {
+			trimmed = strings.TrimSpace(trimmed[:i])
+		}
+		if trimmed != "" {
+			kept = append(kept, trimmed)
+		}
+	}
+	sql := strings.Join(kept, "\n")
+	var out []string
+	for _, kw := range []string{"DROP TABLE", "DROP COLUMN"} {
+		idx := 0
+		for {
+			i := strings.Index(sql[idx:], kw)
+			if i < 0 {
+				break
+			}
+			i += idx
+			// 语句右界：分号或换行。
+			end := len(sql)
+			if j := strings.IndexAny(sql[i:], ";\n"); j >= 0 {
+				end = i + j
+			}
+			stmt := strings.Join(strings.Fields(sql[i:end]), " ")
+			out = append(out, stmt)
+			idx = i + len(kw)
+		}
+	}
+	return out
+}

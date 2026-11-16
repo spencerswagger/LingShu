@@ -153,24 +153,28 @@ func TestHandleListBillings_FilterParams(t *testing.T) {
 
 	rows := sqlmock.NewRows([]string{
 		"id", "billing_id", "user_id", "pricing_mode", "token_id", "external_model_name",
-		"auto_model_name", "internal_model_id", "channel_key_id", "session_id", "session_name", "call_time", "tokens", "rates",
+		"auto_model_name", "internal_model_id", "session_id", "session_name", "call_time", "tokens", "rates",
 		"coefficients", "r_value", "raw_total", "credits_consumed", "cost_credits",
 		"balance_before", "balance_after", "status", "error_message", "duration_ms",
 		"first_token_ms", "rid", "cnt",
 	}).AddRow(
-		int64(1), "b1", int64(1), "sale", nil, "ext", nil, "int", int64(3), "sess-1", "",
+		int64(1), "b1", int64(1), "sale", nil, "ext", nil, "int", "sess-1", "",
 		time.Now(), `{}`, `{}`, `{"time":1,"context":1}`, int64(10000),
 		nil, nil, nil, nil, nil, "completed", nil, nil, nil,
 		"req-1", int64(1),
 	)
 
 	// 列表默认按 request_id 归并（Group 缺省开启）：SQL 走 CTE grp，参数位不变。
-	mock.ExpectQuery(`SELECT count\(\*\) FROM \(\s*SELECT 1 FROM billing_records br LEFT JOIN call_logs cl .*channel_key_id = \$2.*session_id = \$4.*GROUP BY \(br.user_id::text \|\| ':' \|\| COALESCE`).
+	mock.ExpectQuery(`SELECT count\(\*\) FROM \(\s*SELECT 1 FROM billing_records br LEFT JOIN call_logs cl .*COALESCE\(\(SELECT clk\.channel_key_id FROM call_logs clk.*\), br\.channel_key_id\) = \$2.*session_id = \$4.*GROUP BY \(br.user_id::text \|\| ':' \|\| COALESCE`).
 		WithArgs(nil, int64(3), nil, "sess-1", "", "", "", nil, nil).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(1)))
 	mock.ExpectQuery(`WITH grp AS \(.*grp.rid, grp.cnt.*LIMIT \$10 OFFSET \$11`).
 		WithArgs(nil, int64(3), nil, "sess-1", "", "", "", nil, nil, 20, 0).
 		WillReturnRows(rows)
+	// 渠道密钥维度回填（billing_records 已无该列，来自 call_logs 的 1:1 快照）。
+	mock.ExpectQuery(`SELECT br.billing_id, COALESCE\(cl.channel_key_id, br.channel_key_id\)`).
+		WithArgs("b1").
+		WillReturnRows(sqlmock.NewRows([]string{"billing_id", "channel_key_id"}).AddRow("b1", int64(3)))
 	// decorateList 反查（空结果：用户名缺失、密钥缺失触发 #<id> 兜底）。
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, username, nickname FROM users WHERE id = ANY('{1}'::bigint[])`)).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "username", "nickname"}))

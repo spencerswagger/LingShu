@@ -42,6 +42,8 @@ type ExternalModel struct {
 }
 
 // cols 列出 external_models 表查询使用的全部列。
+// 收敛说明：external_models 另有 bound_internal_ref（0019_topology，阶段三的绑定真源），
+// 本期**无读写方**（转发准入仍以 magpie_model 非空为唯一判据），因此不进本列清单。
 const cols = `id, external_name, description, enabled, sale_rates, time_config, context_tiers, aliases, magpie_model, created_at, updated_at`
 
 // scanExternal 将一行扫描到 *ExternalModel，解析 sale_rates/time_config/context_tiers/aliases JSONB。
@@ -53,6 +55,11 @@ func scanExternal(row interface{ Scan(...any) error }) (*ExternalModel, error) {
 		&timeRaw, &tiersRaw, &aliasesRaw, &magpieModel, &m.CreatedAt, &m.UpdatedAt)
 	if err != nil {
 		return nil, err
+	}
+	// magpie_model 可空：NULL 与空串都归一为 nil（「未映射」只有一种表示）。
+	if magpieModel.Valid && strings.TrimSpace(magpieModel.String) != "" {
+		v := strings.TrimSpace(magpieModel.String)
+		m.MagpieModel = &v
 	}
 	if len(saleRaw) > 0 {
 		if err := json.Unmarshal(saleRaw, &m.SaleRates); err != nil {

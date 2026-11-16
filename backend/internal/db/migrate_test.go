@@ -288,15 +288,20 @@ func mustCallerFile(t *testing.T) string {
 	return file
 }
 
-// TestMigrate_0019_V2Facade 验证 V2 第一期唯一迁移 0019_v2_facade.sql：
-//  1. **纯新增**：文件正文不含任何 DROP / RENAME / DELETE / UPDATE / TRUNCATE（源码级守卫，
-//     不让「顺手清数据」混进本期迁移）；
-//  2. 全新库按序应用后可落地，两张新表 / 四列 / 两个部分索引齐全；
-//  3. 可重复执行（全部 IF NOT EXISTS），重跑不报错、不改变结果。
-func TestMigrate_0019_V2Facade(t *testing.T) {
+// TestMigrate_0019b_PassthroughCredentials 验证 #81 拆包后的最小对象集（0019b）：
+//  1. **纯新增**：正文不含 DROP / RENAME / DELETE / UPDATE / TRUNCATE / ALTER COLUMN；
+//  2. 全链应用后：magpie_keys 在、external_models.magpie_model 在、唯一索引在 —— 且
+//     **104 号之后的 0024 跑完它们仍然在**（这是 #81 走方案 A 的核心断言：
+//     这两样是被代码使用的对象，不是「旧分支遗留、期望 0 行」）；
+//  3. reconcile_windows 由 0023 持有：形状必须是 0023 的（PK=window_start + 四计数列），
+//     不是 0019b 建的（本文件不许出现这张表）；
+//  4. billing_records 三列**不在本批**：magpie_key_name / estimated / upstream_usage 必须缺失
+//     （无 usage 不计费、不做估算 → 没有写入方，加列只会让「没人写」看起来像「功能已在」）；
+//  5. 可重复执行，重跑不报错、不改变结果。
+func TestMigrate_0019b_PassthroughCredentials(t *testing.T) {
 	tempDB := openTempDB(t)
 	migDir := filepath.Join(filepath.Dir(mustCallerFile(t)), "migrations")
-	name := migrationFile(t, migDir, "0019")
+	name := migrationFile(t, migDir, "0019b")
 
 	// 1) 源码级守卫：去掉注释后不得出现破坏性关键字。
 	body, err := os.ReadFile(filepath.Join(migDir, name))
@@ -314,16 +319,19 @@ func TestMigrate_0019_V2Facade(t *testing.T) {
 	upper := strings.ToUpper(code.String())
 	for _, forbidden := range []string{"DROP ", "RENAME", "DELETE ", "UPDATE ", "TRUNCATE", "ALTER COLUMN"} {
 		if strings.Contains(upper, forbidden) {
-			t.Fatalf("0019 迁移禁止出现破坏性语句 %q（本期口径：零 DROP / 零 rename / 零 DML）", forbidden)
+			t.Fatalf("0019b 迁移禁止出现破坏性语句 %q（本期口径：纯 ADD、零 DML）", forbidden)
 		}
 	}
+	if strings.Contains(upper, "RECONCILE_WINDOWS") {
+		t.Fatalf("0019b 不许出现 reconcile_windows：同名对象只允许 0023 持有（两份 CREATE 只有第一份生效）")
+	}
 
-	// 2) 全链应用（0019 之前的历史迁移建表）。
+	// 2) 全链应用（含 0024 删退役体系）。
 	for _, n := range migrationNames(t, migDir) {
 		runMigration(t, tempDB, migDir, n)
 	}
 
-	assertColumn := func(table, column string) {
+	assertColumn := func(table, column string, want int) {
 		t.Helper()
 		var got int
 		if err := tempDB.QueryRow(
@@ -331,8 +339,8 @@ func TestMigrate_0019_V2Facade(t *testing.T) {
 			table, column).Scan(&got); err != nil {
 			t.Fatalf("查询列 %s.%s 失败: %v", table, column, err)
 		}
-		if got != 1 {
-			t.Fatalf("%s 缺少列 %s（0019 未落地）", table, column)
+		if got != want {
+			t.Fatalf("%s.%s 存在性 = %d，期望 %d", table, column, got, want)
 		}
 	}
 	assertTable := func(table string) {
@@ -343,27 +351,43 @@ func TestMigrate_0019_V2Facade(t *testing.T) {
 			t.Fatalf("查询表 %s 失败: %v", table, err)
 		}
 		if got != 1 {
-			t.Fatalf("缺少表 %s（0019 未落地）", table)
+			t.Fatalf("缺少表 %s（0019b 未落地，或 0024 把它当遗留对象删了）", table)
 		}
 	}
 
 	assertTable("magpie_keys")
+	assertColumn("external_models", "magpie_model", 1)
+
+	// 3) reconcile_windows 归 0023：形状必须是 0023 的那一份。
 	assertTable("reconcile_windows")
-	assertColumn("external_models", "magpie_model")
-	assertColumn("billing_records", "magpie_key_name")
-	assertColumn("billing_records", "estimated")
-	assertColumn("billing_records", "upstream_usage")
+	assertColumn("reconcile_windows", "local_count", 1)
+	assertColumn("reconcile_windows", "scroll_offset", 1)
+	var pk int
+	if err := tempDB.QueryRow(`
+		SELECT count(*) FROM pg_constraint c
+		 JOIN pg_class t ON t.oid = c.conrelid
+		WHERE t.relname = 'reconcile_windows' AND c.contype = 'p'
+		  AND pg_get_constraintdef(c.oid) LIKE '%(window_start)%'`).Scan(&pk); err != nil {
+		t.Fatalf("查询主键失败: %v", err)
+	}
+	if pk != 1 {
+		t.Fatalf("reconcile_windows 主键不是 (window_start)：0019_v2_facade 的旧形状又回来了？")
+	}
+
+	// 4) 账单三列不在本批。
+	assertColumn("billing_records", "magpie_key_name", 0)
+	assertColumn("billing_records", "estimated", 0)
+	assertColumn("billing_records", "upstream_usage", 0)
 
 	var idx int
 	if err := tempDB.QueryRow(
-		`SELECT count(*) FROM pg_indexes WHERE indexname IN ('uq_external_models_magpie_model','idx_billing_magpie_key_time')`).
-		Scan(&idx); err != nil {
+		`SELECT count(*) FROM pg_indexes WHERE indexname = 'uq_external_models_magpie_model'`).Scan(&idx); err != nil {
 		t.Fatalf("查询索引失败: %v", err)
 	}
-	if idx != 2 {
-		t.Fatalf("0019 的两个部分索引应齐全, got %d", idx)
+	if idx != 1 {
+		t.Fatalf("0019b 的唯一索引 uq_external_models_magpie_model 缺失, got %d", idx)
 	}
 
-	// 3) 幂等：重跑同一迁移不报错（全部 IF NOT EXISTS）。
+	// 5) 幂等：重跑同一迁移不报错（全部 IF NOT EXISTS）。
 	runMigration(t, tempDB, migDir, name)
 }

@@ -19,16 +19,20 @@ import (
 
 	"github.com/team/llmgateway/internal/config"
 	"github.com/team/llmgateway/internal/db"
+	"github.com/team/llmgateway/internal/domain/amortize"
 	"github.com/team/llmgateway/internal/domain/audit"
 	"github.com/team/llmgateway/internal/domain/billing"
 	"github.com/team/llmgateway/internal/domain/calllog"
 	"github.com/team/llmgateway/internal/domain/console"
 	"github.com/team/llmgateway/internal/domain/identity"
+	"github.com/team/llmgateway/internal/domain/ledgersettle"
 	"github.com/team/llmgateway/internal/domain/magpie"
 	"github.com/team/llmgateway/internal/domain/model"
+	"github.com/team/llmgateway/internal/domain/reconcile"
 	"github.com/team/llmgateway/internal/domain/router"
 	"github.com/team/llmgateway/internal/domain/sync"
 	"github.com/team/llmgateway/internal/domain/tag"
+	"github.com/team/llmgateway/internal/domain/upstream"
 	"github.com/team/llmgateway/internal/pkg/asyncwrite"
 	"github.com/team/llmgateway/internal/pkg/clientip"
 	"github.com/team/llmgateway/internal/pkg/idgen"
@@ -427,6 +431,209 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 		logr.Info("未配置 magpie.base_url：对外转发接口保持停用（410）")
 	}
 
+	// V2 运行参数（F1 三键：基址 / 两段超时 / 三开关）。凭据不进配置表：
+	// 上游鉴权头只在装配层从环境变量取，转发链逐请求注入。
+	// 注：/v1 转发基址由 magpie.* 配置提供；upstream.* 只服务账本同步 / 对账 / 结算三条后台链。
+	upstreamCfg := upstream.NewConfigProvider(billStore)
+	if upCfg, problems := upstreamCfg.Load(context.Background()); true {
+		for _, pb := range problems {
+			logr.Warn("上游配置有问题（已按字段回落默认值）", "problem", pb)
+		}
+		logr.Info("账本同步运行参数",
+			"base_url_set", upCfg.BaseURL != "",
+			"stream_first_byte_ms", upCfg.Timeouts.StreamFirstByte.Milliseconds(),
+			"stream_idle_ms", upCfg.Timeouts.StreamIdle.Milliseconds())
+	}
+
+	// D4：对账窗口的四列计数由对账服务在窗口结束时写入（四个 0 等于「漏账不可见」）。
+	// 只落计数与状态；七列归因的读取方属阶段二（本期不做）。
+	windowStore := upstream.NewSQLWindowStore(d)
+	recon := reconcile.NewReconciler(reconcile.Options{
+		Local:    reconcile.NewLocalSource(d),
+		Upstream: reconcile.NewUpstreamSource(d),
+		Counts:   windowStore,
+		States:   windowStore,
+		Streaks:  windowStore,
+		LedgerEnabled: func() bool {
+			c, _ := upstreamCfg.Load(context.Background())
+			return c.Degrade.LedgerEnabled
+		},
+		Logger: logr,
+	})
+	// F9：账本同步轮次（拉上游用量 → 幂等落 ledger_entries）。
+	//
+	// 装配三件事，缺一件就等于「同步跑不起来但没人知道」：
+	//  ① 分页源（上游用量接口，offset 翻页）；
+	//  ② **启动时跑一次排序能力探测**：结论不是 supported 时每轮只记 blocked、不翻页
+	//     （不许自己造排序，见 upstream.ProbeLedgerOrder）；
+	//  ③ 60s ticker + 空轮告警（`RunOnce` 的 Empty 会打 WARN，不再 0 行 + nil 静默空转）。
+	syncSrc := upstream.NewHTTPLedgerSource(
+		strings.TrimSpace(os.Getenv("UPSTREAM_LEDGER_URL")),
+		strings.TrimSpace(os.Getenv("UPSTREAM_ADMIN_KEY")),
+		strings.TrimSpace(os.Getenv("UPSTREAM_ADMIN_AUTH_HEADER")),
+		nil,
+	)
+	// 能力探测：拿最近 30 分钟当样本窗（真有一批数据才证得出排序）。
+	var order upstream.LedgerOrder
+	var orderWhy string
+	if strings.TrimSpace(os.Getenv("UPSTREAM_LEDGER_URL")) != "" {
+		probeWin := upstream.Window{Start: time.Now().Add(-30 * time.Minute), End: time.Now()}
+		probe := upstream.ProbeLedgerOrder(context.Background(), syncSrc, probeWin, 200)
+		order, orderWhy = probe.Order, probe.Reason
+		logr.Info("上游账本排序能力探测完成",
+			"order", probe.Order.String(), "samples", probe.Samples, "reason", probe.Reason)
+	} else {
+		orderWhy = "未配置 UPSTREAM_LEDGER_URL，未做能力探测"
+		logr.Warn("未配置上游账本端点，同步轮次将只记 blocked（不翻页）",
+			"env", "UPSTREAM_LEDGER_URL")
+	}
+	rounder := upstream.NewRounder(upstream.RounderOptions{
+		Source:            syncSrc,
+		Ledger:            upstream.NewLedgerStore(d),
+		Windows:           windowStore,
+		Now:               time.Now,
+		Logger:            logr,
+		LedgerOrder:       order,
+		LedgerOrderReason: orderWhy,
+	})
+	go func() {
+		// 60s 一跳：与窗口宽度同量级。
+		t := time.NewTicker(time.Minute)
+		defer t.Stop()
+		for range t.C {
+			func() {
+				defer func() {
+					if rec := recover(); rec != nil {
+						logr.Error("账本同步轮次 panic", "panic", rec)
+					}
+				}()
+				// 降级开关：sync 关 = 停摆（沿用上期数据），不是失败。
+				if c, _ := upstreamCfg.Load(context.Background()); !c.SyncActive() {
+					return
+				}
+				res, err := rounder.RunOnce(context.Background())
+				switch {
+				case res.Empty && err == nil:
+					// RunOnce 内部已打 WARN（sync.round empty），这里只补一条可聚合的计数口径。
+					logr.Warn("账本同步空轮（计数器）", "sync_round_empty", 1,
+						"window", res.Window.String())
+				case err != nil:
+					logr.Warn("账本同步轮次未完成", "err", err,
+						"window", res.Window.String(), "pages", res.Pages,
+						"fetched", res.Fetched, "inserted", res.Inserted)
+				}
+			}()
+		}
+	}()
+
+	// 阶段二 A1：预扣过期扫描（15 分钟未终结 → 全额退回）。
+	// 一跳 60s：过期点是「15 分钟 + 最多 1 分钟」，对资金回收足够；单轮走一个事务 + SKIP LOCKED，多副本安全。
+	go func() {
+		t := time.NewTicker(time.Minute)
+		defer t.Stop()
+		for range t.C {
+			func() {
+				defer func() {
+					if rec := recover(); rec != nil {
+						logr.Error("预扣过期扫描 panic", "panic", rec)
+					}
+				}()
+				res, err := creditSvc.ExpireHolds(context.Background(), time.Now(), 200)
+				if err != nil {
+					logr.Warn("预扣过期扫描失败（下轮重试）", "err", err)
+					return
+				}
+				if res.Expired > 0 {
+					logr.Info("退回超时未结算的预扣", "holds", res.Expired, "credits", res.Amount)
+				}
+			}()
+		}
+	}()
+
+	// 阶段二 A3：账本结算（账本条目 → 账单成本列 + 预扣登记）。
+	// 与同步轮次分开的 60s 循环：同步负责「拉」，结算负责「挂」，两者失败互不影响。
+	settler := ledgersettle.NewMatcher(ledgersettle.Options{
+		Store:  ledgersettle.NewSQLStore(d),
+		Now:    time.Now,
+		Logger: logr,
+	})
+	go func() {
+		t := time.NewTicker(time.Minute)
+		defer t.Stop()
+		for range t.C {
+			func() {
+				defer func() {
+					if rec := recover(); rec != nil {
+						logr.Error("账本结算轮次 panic", "panic", rec)
+					}
+				}()
+				res, err := settler.RunOnce(context.Background())
+				if err != nil {
+					logr.Warn("账本结算轮次失败（窗口保留待下轮）", "err", err)
+					return
+				}
+				if res.Linked > 0 || res.UnmatchedBilling > 0 || res.UnmatchedLedger > 0 {
+					logr.Info("账本结算轮次完成",
+						"linked", res.Linked, "skipped", res.Skipped,
+						"unmatched_billing", res.UnmatchedBilling,
+						"unmatched_ledger", res.UnmatchedLedger, "cost", res.Cost)
+				}
+			}()
+		}
+	}()
+
+	// 阶段二 A5：订阅月费分摊（固定成本摊到当期账单）。
+	// 5 分钟一跳：账本条目迟到会让某些行从「可摊」变成「已挂账本」，重算即收敛；
+	// 写的是 SET 不是累加，频率高低都不影响结果。
+	amortizer := amortize.NewAllocator(amortize.Options{
+		Store:  amortize.NewSQLStore(d),
+		Now:    time.Now,
+		Logger: logr,
+	})
+	go func() {
+		t := time.NewTicker(5 * time.Minute)
+		defer t.Stop()
+		for range t.C {
+			func() {
+				defer func() {
+					if rec := recover(); rec != nil {
+						logr.Error("月费分摊轮次 panic", "panic", rec)
+					}
+				}()
+				res, err := amortizer.RunOnce(context.Background())
+				if err != nil {
+					logr.Warn("月费分摊轮次失败（下轮重试）", "err", err)
+					return
+				}
+				if res.Updated > 0 || res.Unallocated > 0 {
+					logr.Info("月费分摊轮次完成",
+						"subscriptions", res.Subscriptions, "skipped", res.Skipped,
+						"updated", res.Updated, "allocated", res.Allocated,
+						"unallocated", res.Unallocated)
+				}
+			}()
+		}
+	}()
+
+	go func() {
+		// 60s 一跳：与窗口宽度同量级，窗口结束后下一跳就能被算上。
+		t := time.NewTicker(time.Minute)
+		defer t.Stop()
+		for range t.C {
+			func() {
+				// 单轮 panic 不许带走进程（对账是后台任务，崩了应告警继续）。
+				defer func() {
+					if rec := recover(); rec != nil {
+						logr.Error("对账轮次 panic", "panic", rec)
+					}
+				}()
+				if _, err := recon.RunOnce(context.Background()); err != nil {
+					logr.Warn("对账轮次失败（窗口保持待重算）", "err", err)
+				}
+			}()
+		}
+	}()
+
 	return &app{
 		deps: server.Deps{
 			Identity:     identityHandler,
@@ -450,6 +657,32 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 		auditStore: auditStore,
 		writer:     asyncWriter,
 	}, nil
+}
+
+// creditHoldAdapter 把 identity.CreditService 的预扣登记能力适配为 gateway.HoldOps（阶段二 A1）。
+type creditHoldAdapter struct {
+	svc *identity.CreditService
+}
+
+func (a *creditHoldAdapter) ReserveHold(ctx context.Context, billingID string, userID, tokenID int64, amount float64, sessionID, remark string) error {
+	var tid *int64
+	if tokenID != 0 {
+		id := tokenID
+		tid = &id
+	}
+	_, err := a.svc.PreConsumeHold(ctx, identity.HoldRequest{
+		BillingID: billingID,
+		UserID:    userID,
+		TokenID:   tid,
+		Amount:    amount,
+		SessionID: sessionID,
+		Remark:    remark,
+	})
+	return err
+}
+
+func (a *creditHoldAdapter) CloseHold(ctx context.Context, billingID, status, ledgerEntryID string) (bool, error) {
+	return a.svc.CloseHold(ctx, billingID, status, ledgerEntryID)
 }
 
 // priceRefAdapter 把 sync.Syncer 适配为 model.PriceSource，供对外模型价格参考/应用售价接口使用。
