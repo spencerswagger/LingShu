@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/team/llmgateway/internal/pkg/dbx"
@@ -106,6 +107,7 @@ func (s *SQLWindowStore) PendingWindows(ctx context.Context, limit int) ([]Windo
 		rec.Status = WindowStatus(status)
 		rec.RecordedAt = checked
 		rec.Reason = decodeWindowDetail(detail)
+		rec.LedgerCursor = decodeWindowCursor(detail)
 		out = append(out, rec)
 	}
 	if err := rows.Err(); err != nil {
@@ -138,13 +140,21 @@ func (s *SQLWindowStore) save(ctx context.Context, ex dbx.Execer, rec WindowReco
 	if recordedAt.IsZero() {
 		recordedAt = time.Now()
 	}
-	detail, err := json.Marshal(map[string]any{
+	detailMap := map[string]any{
 		"phase":    windowDetailPhase,
 		"pages":    rec.Pages,
 		"fetched":  rec.Fetched,
 		"inserted": rec.Inserted,
 		"reason":   rec.Reason,
-	})
+	}
+	// 只有 cursor feed 模式才写；空串不写，避免把已有的断点游标覆盖成空。
+	if c := strings.TrimSpace(rec.LedgerCursor); c != "" {
+		detailMap["ledger_cursor"] = c
+		// 游标的写入时刻：LastLedgerCursor 靠它判「哪一行的游标更新」。
+		// 不能按 window_start 排序 —— blocked 断点行可能落在比上次成功行更早的窗口里。
+		detailMap["ledger_cursor_at"] = recordedAt.UTC().Format(time.RFC3339Nano)
+	}
+	detail, err := json.Marshal(detailMap)
 	if err != nil {
 		return fmt.Errorf("序列化窗口明细失败：%w", err)
 	}
@@ -297,6 +307,46 @@ func (s *SQLWindowStore) LastAlarmStreak(ctx context.Context, before time.Time) 
 		return 0, nil
 	}
 	return int16(streak.Int64), nil
+}
+
+// LastLedgerCursor 返回最近一条带 ledger_cursor 的窗口行的游标（cursor feed 断点）。
+//
+// 只认详情里的 `ledger_cursor` 键：对账服务建的行没有该键，不会被误当成同步进度。
+func (s *SQLWindowStore) LastLedgerCursor(ctx context.Context) (string, bool, error) {
+	if s == nil || s.db == nil {
+		return "", false, fmt.Errorf("窗口存储未装配数据库连接")
+	}
+	var cursor sql.NullString
+	err := s.db.QueryRowContext(ctx,
+		`SELECT detail->>'ledger_cursor' FROM `+ReconcileWindowsTable+`
+		  WHERE detail ? 'ledger_cursor'
+		    AND COALESCE(detail->>'ledger_cursor','') <> ''
+		  ORDER BY (NULLIF(detail->>'ledger_cursor_at',''))::timestamptz DESC NULLS LAST,
+		           window_start DESC
+		  LIMIT 1`).Scan(&cursor)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("读取账本续读游标失败：%w", err)
+	}
+	if !cursor.Valid || strings.TrimSpace(cursor.String) == "" {
+		return "", false, nil
+	}
+	return cursor.String, true, nil
+}
+
+// decodeWindowCursor 从 detail 里取回 cursor feed 的续读游标（取不到返回空串）。
+func decodeWindowCursor(raw []byte) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return ""
+	}
+	c, _ := m["ledger_cursor"].(string)
+	return c
 }
 
 // decodeWindowDetail 从 detail 里取回上次记录的原因（排障用；取不到不算错）。

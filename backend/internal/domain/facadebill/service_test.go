@@ -346,6 +346,125 @@ func TestStatusFor(t *testing.T) {
 	if got := StatusFor(magpie.Result{Status: 503}); got != "failed:upstream-error" {
 		t.Fatalf("5xx 应为 failed:upstream-error，实际 %q", got)
 	}
+	// 上游 4xx 也是上游错误，不是「上游说没有 usage」。
+	if got := StatusFor(magpie.Result{Status: 400}); got != "failed:upstream-error" {
+		t.Fatalf("4xx 应为 failed:upstream-error，实际 %q", got)
+	}
+	if got := StatusFor(magpie.Result{Status: 429}); got != "failed:upstream-error" {
+		t.Fatalf("429 应为 failed:upstream-error，实际 %q", got)
+	}
+	if got := StatusFor(magpie.Result{Status: 499, Canceled: true}); got != "failed:client-canceled" {
+		t.Fatalf("499 客户端取消应保持 client-canceled，实际 %q", got)
+	}
+}
+
+// TestOnComplete_Upstream4xxRecordsUpstreamError 是本次口径变更的核心用例：
+// 上游 4xx 仍退预扣 + 金额 0，但账单状态必须是 upstream_error 并保留状态码与错误体摘要，
+// 不能再落成 failed/no-usage（运营会误读成「上游没给用量」）。
+func TestOnComplete_Upstream4xxRecordsUpstreamError(t *testing.T) {
+	ledger := &fakeLedger{estCredits: 3}
+	wallet := &fakeWallet{}
+	s := newTestService(t, ledger, wallet)
+	handle, deny := s.Reserve(context.Background(), reserveInput())
+	if deny != nil {
+		t.Fatalf("预扣不该被拒: %+v", deny)
+	}
+
+	s.OnComplete(context.Background(), magpie.Result{
+		UserID: 7, ExternalModel: "tenant-gpt", Billable: true, Status: 400,
+		UpstreamErrorSummary: "invalid_request_error: model not found",
+		Reservation:          handle,
+	})
+
+	if len(wallet.settleHolds) != 1 {
+		t.Fatalf("上游 4xx 仍要整笔退预扣，实际退款 %d 次", len(wallet.settleHolds))
+	}
+	if len(ledger.records) != 1 {
+		t.Fatalf("应落一条账单，实际 %d 条", len(ledger.records))
+	}
+	rec := ledger.records[0]
+	if rec.Status != billing.StatusUpstreamError {
+		t.Fatalf("状态应为 %q，实际 %q", billing.StatusUpstreamError, rec.Status)
+	}
+	if rec.Fail != true || rec.ErrorMessage != ReasonUpstreamError {
+		t.Fatalf("仍应标记失败并带 upstream-error 原因，实际 fail=%v reason=%q", rec.Fail, rec.ErrorMessage)
+	}
+	if rec.UpstreamStatus == nil || *rec.UpstreamStatus != 400 {
+		t.Fatalf("必须保留上游状态码 400，实际 %+v", rec.UpstreamStatus)
+	}
+	if rec.UpstreamErrorSummary != "invalid_request_error: model not found" {
+		t.Fatalf("必须保留错误体摘要，实际 %q", rec.UpstreamErrorSummary)
+	}
+}
+
+// TestOnComplete_Upstream4xxWithUsageNotSettled 上游 4xx 即使带了 usage 也不结算：
+// 错误响应上的 usage 不可信，旧口径会把「上游拒付」伪装成已计费成功。
+func TestOnComplete_Upstream4xxWithUsageNotSettled(t *testing.T) {
+	ledger := &fakeLedger{estCredits: 3}
+	wallet := &fakeWallet{}
+	s := newTestService(t, ledger, wallet)
+	handle, _ := s.Reserve(context.Background(), reserveInput())
+
+	s.OnComplete(context.Background(), magpie.Result{
+		UserID: 7, ExternalModel: "tenant-gpt", Billable: true, Status: 400,
+		HasUsage: true, Usage: magpie.Usage{Input: 100, Output: 50},
+		UpstreamErrorSummary: "internal_error: upstream exploded",
+		Reservation:          handle,
+	})
+
+	if len(wallet.settleHolds) != 1 {
+		t.Fatalf("4xx/5xx 带 usage 也必须整笔退预扣，实际退款 %d 次", len(wallet.settleHolds))
+	}
+	rec := ledger.records[len(ledger.records)-1]
+	if rec.Status != billing.StatusUpstreamError || rec.UpstreamStatus == nil || *rec.UpstreamStatus != 400 {
+		t.Fatalf("应落 upstream_error + 400，实际 status=%q up=%v", rec.Status, rec.UpstreamStatus)
+	}
+	if !rec.Fail {
+		t.Fatalf("上游错误账单必须标记 Fail（不扣积分）")
+	}
+}
+
+// TestOnComplete_TransportFailureRecordsUpstreamError 连接失败/超时：状态码为 0 → 落 NULL，
+// 账单状态仍是 upstream_error（不是 no-usage，也不是 client-canceled）。
+func TestOnComplete_TransportFailureRecordsUpstreamError(t *testing.T) {
+	ledger := &fakeLedger{estCredits: 3}
+	wallet := &fakeWallet{}
+	s := newTestService(t, ledger, wallet)
+	handle, _ := s.Reserve(context.Background(), reserveInput())
+
+	s.OnComplete(context.Background(), magpie.Result{
+		UserID: 7, ExternalModel: "tenant-gpt", Billable: true, Status: 0,
+		Err: errors.New("dial tcp: connection refused"), Reservation: handle,
+	})
+
+	rec := ledger.records[len(ledger.records)-1]
+	if rec.Status != billing.StatusUpstreamError {
+		t.Fatalf("传输失败应为 %q，实际 %q", billing.StatusUpstreamError, rec.Status)
+	}
+	if rec.UpstreamStatus != nil {
+		t.Fatalf("没收到响应时状态码必须为 NULL，实际 %d", *rec.UpstreamStatus)
+	}
+}
+
+// TestOnComplete_2xxNoUsageStaysFailed 只有「上游 2xx 但没有 usage」才落 failed/no-usage，
+// 且不带上游错误状态码/摘要（避免把 200 误读成错误）。
+func TestOnComplete_2xxNoUsageStaysFailed(t *testing.T) {
+	ledger := &fakeLedger{estCredits: 3}
+	wallet := &fakeWallet{}
+	s := newTestService(t, ledger, wallet)
+	handle, _ := s.Reserve(context.Background(), reserveInput())
+
+	s.OnComplete(context.Background(), magpie.Result{
+		UserID: 7, ExternalModel: "tenant-gpt", Billable: true, Status: 200, Reservation: handle,
+	})
+
+	rec := ledger.records[0]
+	if rec.Status != billing.StatusFailed || rec.ErrorMessage != ReasonNoUsage {
+		t.Fatalf("2xx 无 usage 应为 failed/no-usage，实际 status=%q reason=%q", rec.Status, rec.ErrorMessage)
+	}
+	if rec.UpstreamStatus != nil || rec.UpstreamErrorSummary != "" {
+		t.Fatalf("2xx 行不该带上游错误字段，实际 %+v %q", rec.UpstreamStatus, rec.UpstreamErrorSummary)
+	}
 }
 
 // TestOnComplete_RefundRetryExhausted_LeavesHoldForExpiry Owl 复审 P1 的反向守门：
@@ -442,5 +561,29 @@ func TestOnComplete_FreeModelNoHold(t *testing.T) {
 	}
 	if len(wallet.closeHoldTxs) != 0 || len(wallet.settleHolds) != 0 {
 		t.Fatalf("零预扣不该有任何资金动作")
+	}
+}
+
+// TestFailureStatus_ClientCancelStaysFailed 钉住：499（客户端取消）落 failed，不是 upstream_error。
+// 这条曾经被 failureStatus 里多余的 `|| Status >= 400` 归错（取消被算成上游错误）。
+func TestFailureStatus_ClientCancelStaysFailed(t *testing.T) {
+	cases := []struct {
+		name string
+		res  magpie.Result
+		want string
+	}{
+		{"499_canceled", magpie.Result{Status: 499, Canceled: true}, billing.StatusFailed},
+		{"400_upstream", magpie.Result{Status: 400}, billing.StatusUpstreamError},
+		{"429_upstream", magpie.Result{Status: 429}, billing.StatusUpstreamError},
+		{"503_upstream", magpie.Result{Status: 503}, billing.StatusUpstreamError},
+		{"0_transport", magpie.Result{Status: 0, Err: context.DeadlineExceeded}, billing.StatusUpstreamError},
+		{"200_no_usage", magpie.Result{Status: 200}, billing.StatusFailed},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := failureStatus(tc.res); got != tc.want {
+				t.Fatalf("failureStatus(%+v) = %q, want %q", tc.res, got, tc.want)
+			}
+		})
 	}
 }

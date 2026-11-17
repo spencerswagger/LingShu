@@ -80,7 +80,7 @@ export interface BillingItem {
   AutoModelName?: string // 请求的 Auto 名（非 Auto 请求为空）
   PricingMode: string // sale | cost
   CreditsConsumed: number
-  Status: string // completed | failed
+  Status: string // completed | failed | upstream_error（上游 4xx/5xx，金额 0）
   CallTime: string
   // 渠道显示名（后端 devBillingListItem 白名单内字段，非密钥）；缺失表示该账单无渠道映射
   ChannelName?: string

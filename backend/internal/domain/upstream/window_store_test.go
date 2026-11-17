@@ -309,3 +309,75 @@ func TestSQLWindowStore_RealSQL_SkippedWritableAndCountsWritten(t *testing.T) {
 		t.Fatalf("blocked 窗口的计数必须是 NULL（未算过），got %d", *cnt)
 	}
 }
+
+// TestSQLWindowStore_LedgerCursorRoundTrip 是真实库用例：
+// cursor feed 的续读位置要能跨重启读回（存在 detail->>'ledger_cursor'，不是 scroll_offset）。
+func TestSQLWindowStore_LedgerCursorRoundTrip(t *testing.T) {
+	conn := openMigratedTempDB(t)
+	ctx := context.Background()
+	wins := NewSQLWindowStore(conn)
+
+	base := time.Date(2026, 11, 17, 10, 0, 0, 0, time.UTC)
+	if err := wins.Save(ctx, WindowRecord{
+		Start: base, End: base.Add(WindowSize), Status: WindowBlocked,
+		Reason: "cursor feed 分页进行中", LedgerCursor: "c1", RecordedAt: base.Add(WindowSize),
+	}); err != nil {
+		t.Fatalf("写 blocked 失败: %v", err)
+	}
+
+	// 重启语义：新实例读同库。
+	restarted := NewSQLWindowStore(conn)
+	if c, ok, err := restarted.LastLedgerCursor(ctx); err != nil || !ok || c != "c1" {
+		t.Fatalf("LastLedgerCursor 应读回 c1，got ok=%v cursor=%q err=%v", ok, c, err)
+	}
+	pending, err := restarted.PendingWindows(ctx, 10)
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("应有一条 blocked，got %d err=%v", len(pending), err)
+	}
+	if pending[0].LedgerCursor != "c1" {
+		t.Fatalf("PendingWindows 必须带出游标 c1，got %q", pending[0].LedgerCursor)
+	}
+
+	// 成功轮写新游标 + 清 blocked：旧 blocked 行置 ok 但 detail 合并后 cursor 仍是 c1，
+	// 新窗口的 c2 应该是「最近一条」。
+	next := base.Add(WindowSize)
+	if err := wins.Save(ctx, WindowRecord{
+		Start: next, End: next.Add(WindowSize), Status: WindowOK, LedgerCursor: "c2",
+		RecordedAt: next.Add(WindowSize), ClearFrom: base,
+	}); err != nil {
+		t.Fatalf("写 ok 失败: %v", err)
+	}
+	if c, ok, err := restarted.LastLedgerCursor(ctx); err != nil || !ok || c != "c2" {
+		t.Fatalf("最近游标应为 c2，got ok=%v cursor=%q err=%v", ok, c, err)
+	}
+	if pending, _ := restarted.PendingWindows(ctx, 10); len(pending) != 0 {
+		t.Fatalf("假告警应被清掉，仍有 %d 条 blocked", len(pending))
+	}
+}
+
+// TestSQLWindowStore_LastLedgerCursorUsesWriteTime 钉住「按写入时刻、不按窗口起点」：
+// 分页断点可能落在比上次成功行**更早**的窗口里，按 window_start 取会退回旧游标，
+// 下一轮重放已拉过的区间（幂等但浪费），严重时会把 blocked 断点丢掉。
+func TestSQLWindowStore_LastLedgerCursorUsesWriteTime(t *testing.T) {
+	conn := openMigratedTempDB(t)
+	ctx := context.Background()
+	wins := NewSQLWindowStore(conn)
+
+	base := time.Date(2026, 11, 17, 11, 0, 0, 0, time.UTC)
+	if err := wins.Save(ctx, WindowRecord{
+		Start: base.Add(WindowSize), End: base.Add(2 * WindowSize), Status: WindowOK,
+		LedgerCursor: "c2", RecordedAt: base.Add(2 * WindowSize),
+	}); err != nil {
+		t.Fatalf("写成功轮失败: %v", err)
+	}
+	// 更晚写入、但窗口起点更早的分页断点。
+	if err := wins.Save(ctx, WindowRecord{
+		Start: base, End: base.Add(WindowSize), Status: WindowBlocked,
+		LedgerCursor: "c3", RecordedAt: base.Add(3 * WindowSize),
+	}); err != nil {
+		t.Fatalf("写分页断点失败: %v", err)
+	}
+	if c, ok, err := wins.LastLedgerCursor(ctx); err != nil || !ok || c != "c3" {
+		t.Fatalf("应取最近写入的 c3，got ok=%v cursor=%q err=%v", ok, c, err)
+	}
+}

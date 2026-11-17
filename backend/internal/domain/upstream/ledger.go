@@ -73,8 +73,12 @@ func (e LedgerEntry) Validate() error {
 
 // LedgerTx 是一轮同步的事务边界：跨页写入同一事务，失败/超限整轮回滚（不留半条账）。
 type LedgerTx interface {
-	// Upsert 幂等写入一批账本（ON CONFLICT (ledger_id) DO NOTHING），返回实际插入条数。
+	// Upsert 幂等写入一批账本（ON CONFLICT (ledger_id) DO UPDATE；同 id 高 seq 覆盖旧值），
+	// 返回受影响的条数（新插入 + 覆盖；仅用于观测，不参与正确性判断）。
 	Upsert(ctx context.Context, entries []LedgerEntry) (int, error)
+	// Delete 按代理侧 deleted 列表删除账本 id（行被合并/清除时必须同步删除，否则重复计数）。
+	// 返回实际删除条数。
+	Delete(ctx context.Context, ledgerIDs []string) (int, error)
 	Commit() error
 	Rollback() error
 	// Execer 返回事务执行器：窗口行必须与账本同事务写（契约 §6.2），
@@ -192,6 +196,40 @@ func (t *ledgerTx) Upsert(ctx context.Context, entries []LedgerEntry) (int, erro
 	return inserted, nil
 }
 
+// Delete 按代理侧 deleted 列表删除账本 id（同事务，与 upsert 一起提交）。
+//
+// 用 IN($1..$n) 而不是 ANY($1::text[])：不依赖驱动对切片参数的编码，sqlmock 也能断言。
+func (t *ledgerTx) Delete(ctx context.Context, ledgerIDs []string) (int, error) {
+	if len(ledgerIDs) == 0 {
+		return 0, nil
+	}
+	deleted := 0
+	for start := 0; start < len(ledgerIDs); start += ledgerBatchRows {
+		end := start + ledgerBatchRows
+		if end > len(ledgerIDs) {
+			end = len(ledgerIDs)
+		}
+		ids := ledgerIDs[start:end]
+		marks := make([]string, len(ids))
+		args := make([]any, len(ids))
+		for i, id := range ids {
+			marks[i] = "$" + strconv.Itoa(i+1)
+			args[i] = id
+		}
+		res, err := t.tx.ExecContext(ctx,
+			`DELETE FROM `+LedgerTable+` WHERE ledger_id IN (`+strings.Join(marks, ", ")+`)`, args...)
+		if err != nil {
+			return deleted, fmt.Errorf("删除账本失败（%s 起 %d 条）：%w", ids[0], len(ids), err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return deleted, fmt.Errorf("读取账本删除行数失败：%w", err)
+		}
+		deleted += int(n)
+	}
+	return deleted, nil
+}
+
 // Commit 提交整轮账本写入。
 func (t *ledgerTx) Commit() error { return t.tx.Commit() }
 
@@ -222,6 +260,15 @@ func buildLedgerInsert(entries []LedgerEntry) (string, []any) {
 		args = append(args, e.ID, e.LedgerID, e.Provider, e.ProviderAccount, e.Model,
 			e.TokensIn, e.TokensOut, e.CostCredits, e.OccurredAt)
 	}
-	b.WriteString(` ON CONFLICT (ledger_id) DO NOTHING`)
+	// 同一 id 以更高 seq 再次出现 = 代理侧这一行被改过（例如成本补齐、账号修正），
+	// 必须覆盖；DO NOTHING 会让灵枢永久保留第一次读到的旧值。
+	b.WriteString(` ON CONFLICT (ledger_id) DO UPDATE SET
+		provider = EXCLUDED.provider,
+		provider_account = EXCLUDED.provider_account,
+		model = EXCLUDED.model,
+		tokens_in = EXCLUDED.tokens_in,
+		tokens_out = EXCLUDED.tokens_out,
+		cost_credits = EXCLUDED.cost_credits,
+		occurred_at = EXCLUDED.occurred_at`)
 	return b.String(), args
 }

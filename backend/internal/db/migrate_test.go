@@ -405,3 +405,68 @@ func TestMigrate_0019b_PassthroughCredentials(t *testing.T) {
 	// 5) 幂等：重跑同一迁移不报错（全部 IF NOT EXISTS）。
 	runMigration(t, tempDB, migDir, name)
 }
+
+// TestMigrate_0025_BillingUpstreamError 断言 0025 的三件事：
+//  1. 状态值域放开 `upstream_error`，且旧的 0001 内联 CHECK 已被替换（不是两份约束并存）；
+//  2. 上游状态码/错误体摘要两列存在；
+//  3. 迁移可重复执行（DROP IF EXISTS + ADD + ADD COLUMN IF NOT EXISTS）。
+func TestMigrate_0025_BillingUpstreamError(t *testing.T) {
+	tempDB := openTempDB(t)
+	migDir := filepath.Join(filepath.Dir(mustCallerFile(t)), "migrations")
+	for _, n := range migrationNames(t, migDir) {
+		runMigration(t, tempDB, migDir, n)
+	}
+
+	var status string
+	if err := tempDB.QueryRow(
+		`SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname='ck_billing_status'`).Scan(&status); err != nil {
+		t.Fatalf("缺少 ck_billing_status 约束: %v", err)
+	}
+	if !strings.Contains(status, "upstream_error") {
+		t.Fatalf("ck_billing_status 未放开 upstream_error: %s", status)
+	}
+	var oldCheck int
+	if err := tempDB.QueryRow(
+		`SELECT count(*) FROM pg_constraint WHERE conname='billing_records_status_check'`).Scan(&oldCheck); err != nil {
+		t.Fatalf("查询旧约束失败: %v", err)
+	}
+	if oldCheck != 0 {
+		t.Fatalf("0001 的 billing_records_status_check 仍存在，会挡住 upstream_error")
+	}
+
+	var cols int
+	if err := tempDB.QueryRow(
+		`SELECT count(*) FROM information_schema.columns
+		  WHERE table_name='billing_records' AND column_name IN ('upstream_status','upstream_error_summary')`).Scan(&cols); err != nil {
+		t.Fatalf("查询列失败: %v", err)
+	}
+	if cols != 2 {
+		t.Fatalf("upstream_status/upstream_error_summary 应各有 1 列，实际 %d", cols)
+	}
+
+	if _, err := tempDB.Exec(
+		`INSERT INTO users(id, username, password_hash, role) VALUES (1,'u','h','DEVELOPER') ON CONFLICT DO NOTHING`); err != nil {
+		t.Fatalf("插入用户失败: %v", err)
+	}
+	if _, err := tempDB.Exec(
+		`INSERT INTO billing_records(id, billing_id, user_id, pricing_mode, external_model_name, internal_model_id,
+		                            r_value, status, upstream_status, upstream_error_summary, cost_source)
+		 VALUES (101, 'bill-ue-1', 1, 'sale', 'ext', 'int', 10000, 'upstream_error', 429, 'rate_limit: too many requests', 'none')`); err != nil {
+		t.Fatalf("upstream_error 应可写入: %v", err)
+	}
+	if _, err := tempDB.Exec(
+		`INSERT INTO billing_records(id, billing_id, user_id, pricing_mode, external_model_name, internal_model_id, r_value, status, cost_source)
+		 VALUES (102, 'bill-ue-2', 1, 'sale', 'ext', 'int', 10000, 'bogus', 'none')`); err == nil {
+		t.Fatalf("非法状态必须被 CHECK 拒绝")
+	}
+
+	// 幂等：同一文件再跑一次不报错、不重复建约束。
+	runMigration(t, tempDB, migDir, "0025_v2_billing_upstream_error.sql")
+	var rows int
+	if err := tempDB.QueryRow(`SELECT count(*) FROM billing_records WHERE status='upstream_error'`).Scan(&rows); err != nil {
+		t.Fatalf("统计失败: %v", err)
+	}
+	if rows != 1 {
+		t.Fatalf("重跑后 upstream_error 行数应仍为 1，实际 %d", rows)
+	}
+}

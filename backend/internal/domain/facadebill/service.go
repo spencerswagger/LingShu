@@ -207,8 +207,11 @@ func (s *Service) OnComplete(ctx context.Context, res magpie.Result) {
 		return
 	}
 
-	if !hasUsage(res) {
+	if !hasUsage(res) || upstreamFailedResponse(res) {
 		// 口径①：无 usage 一律不计费 —— 整笔退预扣，落 failed/no-usage，绝不出估算金额。
+		// 补充：上游 4xx/5xx **即使带了 usage 也不结算**（错误响应上的 usage 不可信，
+		// 且旧口径会把上游拒付伪装成「已计费成功」）；499 客户端取消仍按 hasUsage 走，
+		// 内容真的产出了就按实际用量结算。
 		reason := reasonOf(res)
 		s.refundAndClose(ctx, handle, reason)
 		s.recordFailure(ctx, handle, res, reason)
@@ -287,14 +290,20 @@ func (s *Service) recordFailure(ctx context.Context, h *reservation, res magpie.
 }
 
 func (s *Service) recordFailureWith(ctx context.Context, h *reservation, res magpie.Result, reason string) {
+	status := failureStatus(res)
 	req := billing.RecordReq{
 		UserID:           res.UserID,
 		Fail:             true,
+		Status:           status,
 		CallTime:         s.now(),
 		ErrorMessage:     reason,
 		ExternalModel:    res.ExternalModel,
 		UpstreamProtocol: string(res.Protocol),
 		UpstreamModel:    res.MagpieModel,
+	}
+	if status == billing.StatusUpstreamError {
+		req.UpstreamStatus = upstreamStatusPtr(res)
+		req.UpstreamErrorSummary = res.UpstreamErrorSummary
 	}
 	if h != nil {
 		req.BillingID = h.billingID
@@ -362,6 +371,11 @@ func (s *Service) holdClose(h *reservation, status string) *billing.HoldCloseReq
 	return &billing.HoldCloseReq{BillingID: h.billingID, Status: status, Closer: s.wallet}
 }
 
+// upstreamFailedResponse 表示上游明确返回了错误响应（4xx/5xx，499 客户端取消除外）。
+func upstreamFailedResponse(res magpie.Result) bool {
+	return res.Status >= 400 && !(res.Status == 499 && res.Canceled)
+}
+
 // hasUsage 判定「有真实 usage」：HasUsage 为真且三段非全零。
 // 全零与「没取到」同口径（`"usage":{}` 不许当成 0 token 出账）。
 func hasUsage(res magpie.Result) bool {
@@ -383,9 +397,35 @@ func reasonOf(res magpie.Result) string {
 		return ReasonUpstreamError
 	case res.Canceled:
 		return ReasonCanceled
-	default:
+	case res.Status >= 400:
+		// 上游 4xx（除 499 已在上面归为取消）：凭据/参数/限流/模型不存在，都属上游错误。
+		// 旧实现把 4xx 落到 default 的 no-usage，运营看到「没用量」，实际是上游拒了。
+		return ReasonUpstreamError
+	case res.Status >= 200 && res.Status < 300:
 		return ReasonNoUsage
+	default:
+		// 1xx/3xx 等异常码：没拿到可结算的 2xx 响应，归上游错误（不是「上游说没用量」）。
+		return ReasonUpstreamError
 	}
+}
+
+// failureStatus 把失败原因映射成账单状态：上游 4xx/5xx/传输失败 → upstream_error，其余 → failed。
+func failureStatus(res magpie.Result) string {
+	// 只按 reasonOf 判：499 + Canceled 走 canceled（客户端取消不是上游错误），
+	// 这里不能再加 `Status >= 400`，否则会把取消重新归成 upstream_error。
+	if reasonOf(res) == ReasonUpstreamError {
+		return billing.StatusUpstreamError
+	}
+	return billing.StatusFailed
+}
+
+// upstreamStatusPtr 只在真有上游状态码（>=100）时返回指针；传输失败/超时落 NULL。
+func upstreamStatusPtr(res magpie.Result) *int {
+	if res.Status < 100 {
+		return nil
+	}
+	v := res.Status
+	return &v
 }
 
 // estimateInputTokens 按请求体字节数粗估输入 token（**只用于预扣**，4 字节 ≈ 1 token）。

@@ -239,29 +239,35 @@ type devBillingListItem struct {
 	SessionName     string            `json:"SessionName,omitempty"`
 	Tokens          billing.WireUsage `json:"Tokens"`
 	ErrorMessage    string            `json:"ErrorMessage,omitempty"`
-	DurationMs      *int64            `json:"DurationMs,omitempty"`
-	FirstTokenMs    *int64            `json:"FirstTokenMs,omitempty"`
-	RequestID       string            `json:"RequestID,omitempty"`
-	Attempts        int               `json:"Attempts,omitempty"`
+	// 上游失败的定位信息（与 admin 同源）：ErrorMessage 只是归类词（upstream-error），
+	// 真正能排障的是状态码 + 上游错误体摘要。
+	UpstreamStatus       *int   `json:"UpstreamStatus,omitempty"`
+	UpstreamErrorSummary string `json:"UpstreamErrorSummary,omitempty"`
+	DurationMs           *int64 `json:"DurationMs,omitempty"`
+	FirstTokenMs         *int64 `json:"FirstTokenMs,omitempty"`
+	RequestID            string `json:"RequestID,omitempty"`
+	Attempts             int    `json:"Attempts,omitempty"`
 }
 
 // toDevBillingListItem 由账单行组装开发者端列表项（字段白名单，新增字段必须显式加进来）。
 func toDevBillingListItem(rec *billing.Record) devBillingListItem {
 	return devBillingListItem{
-		BillingID:       rec.BillingID,
-		ExternalModel:   rec.ExternalModel,
-		AutoModelName:   rec.AutoModelName,
-		PricingMode:     rec.PricingMode,
-		CreditsConsumed: decimalx.Round5(rec.CreditsConsumed),
-		Status:          rec.Status,
-		CallTime:        rec.CallTime,
-		SessionID:       rec.SessionID,
-		SessionName:     rec.SessionName,
-		Tokens:          billing.WireUsage(rec.Tokens),
-		ErrorMessage:    rec.ErrorMessage,
-		DurationMs:      rec.DurationMs,
-		FirstTokenMs:    rec.FirstTokenMs,
-		RequestID:       rec.RequestID,
-		Attempts:        rec.Attempts,
+		BillingID:            rec.BillingID,
+		ExternalModel:        rec.ExternalModel,
+		AutoModelName:        rec.AutoModelName,
+		PricingMode:          rec.PricingMode,
+		CreditsConsumed:      decimalx.Round5(rec.CreditsConsumed),
+		Status:               rec.Status,
+		CallTime:             rec.CallTime,
+		SessionID:            rec.SessionID,
+		SessionName:          rec.SessionName,
+		Tokens:               billing.WireUsage(rec.Tokens),
+		ErrorMessage:         rec.ErrorMessage,
+		UpstreamStatus:       rec.UpstreamStatus,
+		UpstreamErrorSummary: rec.UpstreamErrorSummary,
+		DurationMs:           rec.DurationMs,
+		FirstTokenMs:         rec.FirstTokenMs,
+		RequestID:            rec.RequestID,
+		Attempts:             rec.Attempts,
 	}
 }

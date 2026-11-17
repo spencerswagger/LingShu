@@ -60,12 +60,13 @@ func newFakeLedger() *fakeLedger {
 }
 
 func (f *fakeLedger) Begin(context.Context) (LedgerTx, error) {
-	return &fakeTx{store: f, pending: map[string]LedgerEntry{}}, nil
+	return &fakeTx{store: f, pending: map[string]LedgerEntry{}, deleted: map[string]struct{}{}}, nil
 }
 
 type fakeTx struct {
 	store   *fakeLedger
 	pending map[string]LedgerEntry
+	deleted map[string]struct{}
 }
 
 func (t *fakeTx) Upsert(_ context.Context, entries []LedgerEntry) (int, error) {
@@ -75,9 +76,12 @@ func (t *fakeTx) Upsert(_ context.Context, entries []LedgerEntry) (int, error) {
 			return inserted, err
 		}
 		if _, exists := t.store.rows[e.LedgerID]; exists {
-			continue // ON CONFLICT (ledger_id) DO NOTHING
+			// 同 id 高 seq 覆盖：值更新，但不计入「新插入」。
+			t.pending[e.LedgerID] = e
+			continue
 		}
 		if _, dup := t.pending[e.LedgerID]; dup {
+			t.pending[e.LedgerID] = e
 			continue
 		}
 		t.pending[e.LedgerID] = e
@@ -86,9 +90,27 @@ func (t *fakeTx) Upsert(_ context.Context, entries []LedgerEntry) (int, error) {
 	return inserted, nil
 }
 
+func (t *fakeTx) Delete(_ context.Context, ids []string) (int, error) {
+	n := 0
+	for _, id := range ids {
+		if _, ok := t.deleted[id]; ok {
+			continue
+		}
+		t.deleted[id] = struct{}{}
+		delete(t.pending, id)
+		if _, ok := t.store.rows[id]; ok {
+			n++
+		}
+	}
+	return n, nil
+}
+
 func (t *fakeTx) Commit() error {
 	t.store.mu.Lock()
 	defer t.store.mu.Unlock()
+	for k := range t.deleted {
+		delete(t.store.rows, k)
+	}
 	for k, v := range t.pending {
 		t.store.rows[k] = v
 	}
@@ -103,6 +125,7 @@ func (t *fakeTx) Rollback() error {
 	t.store.mu.Lock()
 	defer t.store.mu.Unlock()
 	t.pending = map[string]LedgerEntry{}
+	t.deleted = map[string]struct{}{}
 	t.store.rolls++
 	return nil
 }

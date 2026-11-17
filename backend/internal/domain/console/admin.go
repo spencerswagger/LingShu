@@ -127,8 +127,12 @@ type billingListItem struct {
 	CoeffContext    float64           `json:"CoeffContext,omitempty"`
 	RValue          int64             `json:"RValue,omitempty"`
 	ErrorMessage    string            `json:"ErrorMessage,omitempty"`
-	DurationMs      *int64            `json:"DurationMs,omitempty"`
-	FirstTokenMs    *int64            `json:"FirstTokenMs,omitempty"`
+	// UpstreamStatus / UpstreamErrorSummary 只在上游失败（status=upstream_error）时有值：
+	// 前者是上游 HTTP 码（0 不落，故为指针），后者是错误体摘要（已遮蔽凭据、截断 512B）。
+	UpstreamStatus       *int   `json:"UpstreamStatus,omitempty"`
+	UpstreamErrorSummary string `json:"UpstreamErrorSummary,omitempty"`
+	DurationMs           *int64 `json:"DurationMs,omitempty"`
+	FirstTokenMs         *int64 `json:"FirstTokenMs,omitempty"`
 	// RequestID 网关请求链路 ID：调用方报 ID 即可在账单列表里定位到这一次请求。
 	RequestID string `json:"RequestID,omitempty"`
 	// Attempts 该请求共产生的账单条数（列表已按 request_id 归并成一行；>1 表示发生过候选/上游重试）。
@@ -137,27 +141,29 @@ type billingListItem struct {
 
 func toListItem(rec *billing.Record) billingListItem {
 	return billingListItem{
-		BillingID:       rec.BillingID,
-		UserID:          rec.UserID,
-		ExternalModel:   rec.ExternalModel,
-		AutoModelName:   rec.AutoModelName,
-		PricingMode:     rec.PricingMode,
-		CreditsConsumed: decimalx.Round5(rec.CreditsConsumed),
-		Status:          rec.Status,
-		CallTime:        rec.CallTime,
-		InternalModelID: rec.InternalModelID,
-		ChannelKeyID:    rec.ChannelKeyID,
-		SessionID:       rec.SessionID,
-		Tokens:          billing.WireUsage(rec.Tokens),
-		Rates:           billing.WireRates(rec.Rates),
-		CoeffTime:       rec.Coefficients.Time,
-		CoeffContext:    rec.Coefficients.Context,
-		RValue:          rec.RValue,
-		ErrorMessage:    rec.ErrorMessage,
-		DurationMs:      rec.DurationMs,
-		FirstTokenMs:    rec.FirstTokenMs,
-		RequestID:       rec.RequestID,
-		Attempts:        rec.Attempts,
+		BillingID:            rec.BillingID,
+		UserID:               rec.UserID,
+		ExternalModel:        rec.ExternalModel,
+		AutoModelName:        rec.AutoModelName,
+		PricingMode:          rec.PricingMode,
+		CreditsConsumed:      decimalx.Round5(rec.CreditsConsumed),
+		Status:               rec.Status,
+		CallTime:             rec.CallTime,
+		InternalModelID:      rec.InternalModelID,
+		ChannelKeyID:         rec.ChannelKeyID,
+		SessionID:            rec.SessionID,
+		Tokens:               billing.WireUsage(rec.Tokens),
+		Rates:                billing.WireRates(rec.Rates),
+		CoeffTime:            rec.Coefficients.Time,
+		CoeffContext:         rec.Coefficients.Context,
+		RValue:               rec.RValue,
+		ErrorMessage:         rec.ErrorMessage,
+		UpstreamStatus:       rec.UpstreamStatus,
+		UpstreamErrorSummary: rec.UpstreamErrorSummary,
+		DurationMs:           rec.DurationMs,
+		FirstTokenMs:         rec.FirstTokenMs,
+		RequestID:            rec.RequestID,
+		Attempts:             rec.Attempts,
 	}
 }
 

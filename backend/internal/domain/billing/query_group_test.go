@@ -8,14 +8,14 @@ import (
 	"github.com/DATA-DOG/go-sqlmock"
 )
 
-// groupedRows 构造归并查询的返回行：recordCols（24 列）+ rid + cnt。
+// groupedRows 构造归并查询的返回行：recordCols（26 列，含 0025 两列）+ rid + cnt。
 func groupedRows(t *testing.T, rid string, cnt int) *sqlmock.Rows {
 	t.Helper()
 	cols := append(append([]string{}, recordColsForTest...), "rid", "cnt")
 	return sqlmock.NewRows(cols).AddRow(
 		int64(9), "bill-main", int64(7), "sale", nil, "ext-model", nil, "int-model", nil, "",
 		time.Now(), `{}`, `{}`, []byte(`{"time":1,"context":1}`), int64(10000),
-		nil, nil, nil, nil, nil, "completed", nil, nil, nil,
+		nil, nil, nil, nil, nil, "completed", nil, nil, nil, nil, nil,
 		rid, int64(cnt),
 	)
 }

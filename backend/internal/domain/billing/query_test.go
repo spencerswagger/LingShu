@@ -122,7 +122,7 @@ func TestGetByBillingID_ScanDims(t *testing.T) {
 		WillReturnRows(sqlmock.NewRows(recordColsForTest).AddRow(
 			int64(5), billingID, int64(7), "sale", nil, "ext-model", nil, "int-model", "sess-x", "会话A",
 			time.Now(), `{}`, `{}`, []byte(`{"time":1,"context":1}`), int64(10000),
-			nil, nil, nil, nil, nil, "completed", nil, nil, nil,
+			nil, nil, nil, nil, nil, "completed", nil, nil, nil, nil, nil,
 		))
 	expectChannelKeyFill(mock, billingID, int64(1))
 
