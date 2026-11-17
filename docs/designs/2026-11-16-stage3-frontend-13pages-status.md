@@ -48,3 +48,20 @@
 - 类型与构建：`cd frontend && npx vue-tsc --noEmit && npm run build`。
 - DOM 走查：`vite dev`（5199）+ puppeteer 拦 `/api/v1/**` 回桩，跑真实路由（管理端 12 条 + 开发端 7 条），断言 49 项：未上线文案 / `null` 不落 0 / 成本来源两文案不同 / 开发者端无成本列 / 「按成本」禁选 / 菜单禁用词 / 390px 无横向溢出。
 - 脚本为一次性，不入仓库（沙盒内位置：`/data/pv/stage3-check.mjs`）。
+
+## 5 Owl II 返修（PR #87，2 项必改）
+
+1. **P02 路由组层永不渲染**。组的 `ProviderRef` 是空串（跨供应商聚合层，`source.go` `parseGroups` 恒给 `""`）。原实现按「供应商归属」遍历组：既把组聚成一张空的「(未知)」供应商卡，又因组节点 id 取自 `ProviderRef` 而整层不出现。修法：`deriveProviders` 跳过 `Kind==='group'`；画布把组当独立一层、用组自身 ref 出节点（`g:<ref>`）。
+2. **T3 失败显示成假成功**。`POST /admin/topology/sync` 失败也回 200（业务结果），原 normalizer 丢了 `State` → 绿字「同步完成」。修法：`syncTopology()` 收 `State`（ok/failed/never/''），页面按它分色，失败同样重拉 T1。
+
+## 6 与后端 #88 的字段口径对齐（PR #87 返修，2026-11-17）
+
+后端拓扑 T1/T3（PR #88，`d60d992`）合入 v2 后，本条是本 PR 唯一必改项：**前端 `api/v2.ts` 的拓扑类型是照表结构自己推的，跟真报文对不上**。
+
+- 症状：把 #88 真报文喂进旧 normalizer，`Providers` 全 `Ref=""`（画布两张卡同 id `p:`）、`Accounts` 全 `a::`、画布只剩一张空卡。
+- 真字段（`backend/internal/domain/topology/handler.go` 的 view，PascalCase）：
+  - `Providers[] {Provider, Models, Stale, Accounts}` —— **没有 ref**；`Stale` 是条数不是布尔；`Provider=""` 是组那一行，前端必须丢。
+  - `Accounts[] {Provider, Account, Subscribed, LastSeenAt}` —— **没有 ref**；没有额度窗口/最近调用时间。
+  - `Externals[] {ID, ExternalName, Enabled, BoundInternalRef, InternalModelHit}` —— 没有 Name/Price 档；`InternalModelHit=false` 且有绑定 = 悬空。
+- 改法：类型、normalizer、mock 全部照真字段；节点身份在前端派生（`p:${Provider}` / `a:${Provider}:${Account}` / `g:${Ref}` / `x:${ID}`），并在 `2026-11-16-topology-vue-flow-frontend.md` §2 写成表。画布顺带补两处事实：悬空绑定打橙标不画线、供应商卡显示「本轮未见 N」（条数），价格档不显示（T1 不给，不拿 0 冒充）。
+- 回归：`/data/pv/topology-t1-check.mjs` 回桩真报文，断言 3 供应商卡 / 3 账号 / 1 路由组 / 3 对外模型 / 连线 6（账号→供应商 3 + 内部模型·组→对外模型 3）、无重复或空身份节点 id、无「(未知)」卡、账号页签走真字段、T3 failed 红字、390px 无溢出；`vue-tsc --noEmit` + `npm run build` 全绿。
