@@ -26,21 +26,42 @@ func (f *fakeSource) Fetch(ctx context.Context) ([]Node, error) {
 
 // fakeStore 记录同步器对它做了什么（Replace 有没有被调用是「失败不清空快照」的直接证据）。
 type fakeStore struct {
-	mu        sync.Mutex
-	replaceN  int
-	nodes     []Node
-	links     []Link
-	counts    Counts
-	lastSeen  time.Time
-	hasSeen   bool
-	state     SyncState
-	replaceFn func(nodes []Node, runAt time.Time) (int, int, error)
-	saveErr   error
+	mu          sync.Mutex
+	replaceN    int
+	nodes       []Node
+	links       []Link
+	providers   []Provider
+	accounts    []Account
+	externals   []External
+	counts      Counts
+	lastSeen    time.Time
+	hasSeen     bool
+	state       SyncState
+	replaceFn   func(nodes []Node, runAt time.Time) (int, int, error)
+	savedLinks  []Link
+	saveLinkN   int
+	saveLinkErr error
+	saveErr     error
 }
 
 func (f *fakeStore) Nodes(ctx context.Context) ([]Node, error)  { return f.nodes, nil }
 func (f *fakeStore) Links(ctx context.Context) ([]Link, error)  { return f.links, nil }
 func (f *fakeStore) Counts(ctx context.Context) (Counts, error) { return f.counts, nil }
+
+func (f *fakeStore) Providers(ctx context.Context) ([]Provider, error) { return f.providers, nil }
+func (f *fakeStore) Accounts(ctx context.Context) ([]Account, error)   { return f.accounts, nil }
+func (f *fakeStore) Externals(ctx context.Context) ([]External, error) { return f.externals, nil }
+
+func (f *fakeStore) SaveLinks(ctx context.Context, links []Link) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.saveLinkN++
+	if f.saveLinkErr != nil {
+		return 0, f.saveLinkErr
+	}
+	f.savedLinks = append(f.savedLinks, links...)
+	return len(links), nil
+}
 func (f *fakeStore) LastSeenAt(ctx context.Context) (time.Time, bool, error) {
 	return f.lastSeen, f.hasSeen, nil
 }

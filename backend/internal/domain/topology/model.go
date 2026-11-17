@@ -45,6 +45,10 @@ var (
 	// 这不是「同步失败」而是「没得同步」：仍写 failed 状态 + 明确原因，页面据此指路。
 	ErrSourceNotConfigured = errors.New("未配置网关拓扑源")
 
+	// ErrLinkTargetMissing 表示画布落位指向了不存在的节点（内部模型或对外模型）。
+	// 直接让外键报 23503 会把「填错了 ref」显示成 500，所以先查存在性再写。
+	ErrLinkTargetMissing = errors.New("画布落位指向的节点不存在")
+
 	// ErrEmptySnapshot 表示本轮一个节点都没取到。**不能**按「网关现在没有任何模型」处理：
 	// 那会把全部存量节点标成 stale（页面集体变灰），而真实原因通常是网关地址配错或网关侧异常。
 	ErrEmptySnapshot = errors.New("本轮未取到任何内部模型")
@@ -71,6 +75,40 @@ type Link struct {
 	ExternalModelID int64
 	PosX            float64
 	PosY            float64
+}
+
+// Provider 是四层图第 1 层（供应商）的一行：由 internal_models 聚合出来，
+// Accounts 由 handler 用第 2 层的账号清单回填（不在 SQL 里交叉聚合，避免一条查询算两件事）。
+type Provider struct {
+	Provider string
+	Models   int
+	Stale    int
+	// Accounts 是「该供应商下出现过账号」的计数，由 Accounts 段回填。
+	Accounts int
+}
+
+// Account 是四层图第 2 层（上游账号）的一行。
+//
+// 为什么账号没有镜像表：V2 的账号只存在于账单/账本/订阅里（网关侧账号清单不是稳定契约），
+// 所以这一层是**现算**的：三处来源并集，按 (provider, account) 去重。
+type Account struct {
+	Provider string
+	Account  string
+	// Subscribed 表示这个账号已录入订阅（= 有固定月费，参与分摊）。
+	Subscribed bool
+	// LastSeenAt 是最近一次在账单/账本里出现的时刻；订阅来源没有则为零值。
+	LastSeenAt time.Time
+}
+
+// External 是四层图第 4 层（对外模型）的一行，同时承载「绑定」这条边。
+//
+// 绑定真源只有 external_models.bound_internal_ref 一处，所以这一层**就是**绑定边：
+// 画布据此画「对外模型 ← 内部模型」，不靠 model_links（那张表只存坐标）。
+type External struct {
+	ID               int64
+	ExternalName     string
+	Enabled          bool
+	BoundInternalRef string // 空串 = 未绑定
 }
 
 // Counts 是 T1 顶部状态条的两个计数（各一条 SQL，不合成大查询）。

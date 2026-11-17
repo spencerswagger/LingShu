@@ -26,9 +26,9 @@ onMounted(() => void load())
 
 const deps = computed<V2Dep[]>(() => [
   { path: 'GET /admin/topology', state: state.value === 'live' ? 'ready' : 'pending' },
-  { path: 'POST /admin/topology/sync', state: 'pending' },
-  // 坐标保存是可延后项（T2）：未就绪时自动布局、坐标不持久化，不影响售卖与计费
-  { path: 'PUT /admin/topology/links', state: 'pending' },
+  { path: 'POST /admin/topology/sync', state: state.value === 'live' ? 'ready' : 'pending' },
+  // 坐标保存（T2）：缺行时自动布局，不影响售卖与计费
+  { path: 'PUT /admin/topology/links', state: 'ready' },
 ])
 
 const rows = computed<InternalModel[]>(() => {
@@ -63,16 +63,36 @@ const stats = computed<StatItem[]>(() => {
 // 供应商层（四层里的第 1–2 层）：T1 会带 provider / account 聚合；未上线时用内部模型的 provider_ref 现算，
 // 保证「供应商 → 内部模型」这两层的计数在页面上永远和列表条数对得上（Spec P02 验收 1）。
 const providerRows = computed(() => {
-  const map = new Map<string, { provider: string; models: number; stale: number }>()
+  // 后端 T1 直接给 Providers（含账号计数）；老响应/演示数据没有这一段时按 Items 现算，
+  // 保证「供应商 → 内部模型」两层的计数在页面上永远和列表条数对得上（Spec P02 验收 1）。
+  const fromApi = data.value?.Providers || []
+  if (fromApi.length > 0) {
+    return fromApi
+      .map((p) => ({ provider: p.Provider || '(未知)', models: p.Models, stale: p.Stale, accounts: p.Accounts }))
+      .sort((a, b) => b.models - a.models)
+  }
+  const map = new Map<string, { provider: string; models: number; stale: number; accounts: number }>()
   for (const m of data.value?.Items || []) {
     const p = m.ProviderRef || '(未知)'
-    const cur = map.get(p) || { provider: p, models: 0, stale: 0 }
+    const cur = map.get(p) || { provider: p, models: 0, stale: 0, accounts: 0 }
     cur.models += 1
     if (m.Stale) cur.stale += 1
     map.set(p, cur)
   }
   return [...map.values()].sort((a, b) => b.models - a.models)
 })
+
+// 账号层（第 2 层）：账单/账本/订阅里出现过的上游账号；Subscribed = 已录入订阅（有固定月费）。
+const accountRows = computed(() =>
+  [...(data.value?.Accounts || [])].sort(
+    (a, b) => a.Provider.localeCompare(b.Provider) || a.Account.localeCompare(b.Account),
+  ),
+)
+
+// 绑定边：真源是 external_models.bound_internal_ref（不是 model_links —— 那张表只存坐标）。
+const bindingEdges = computed(() =>
+  (data.value?.Externals || []).filter((e) => e.BoundInternalRef !== ''),
+)
 
 const syncState = computed(() => data.value?.Sync || null)
 const syncTone = computed(() => {
@@ -88,6 +108,7 @@ const canvasOption = computed(() => {
   const d = data.value
   const items = d?.Items || []
   const links = d?.Links || []
+  const externals = d?.Externals || []
   const positions = new Map<string, { x: number; y: number }>()
   items.forEach((m, i) => {
     const auto = m.PosX === 0 && m.PosY === 0
@@ -96,6 +117,9 @@ const canvasOption = computed(() => {
       y: auto ? 80 + Math.sin((i / Math.max(items.length, 1)) * Math.PI * 2) * 200 : m.PosY,
     })
   })
+  // 坐标只来自 model_links（按下标落位）；缺行 = 落在所绑定内部模型的右侧。
+  const coordOf = new Map<string, { x: number; y: number }>()
+  for (const l of links) coordOf.set(`${l.InternalRef}|${l.ExternalModelID}`, { x: l.PosX, y: l.PosY })
 
   const internalPts = items.map((m) => {
     const p = positions.get(m.Ref) || { x: 0, y: 0 }
@@ -108,23 +132,36 @@ const canvasOption = computed(() => {
     }
   })
 
-  const externalPts = links.map((l) => {
-    const base = positions.get(l.InternalRef) || { x: 0, y: 0 }
+  // 第 4 层：对外模型。未绑定的按列排在右下方（一眼看出「这些还没接内部模型」）。
+  let unboundIdx = 0
+  const externalPts = externals.map((e) => {
+    const base = (e.BoundInternalRef && positions.get(e.BoundInternalRef)) || null
+    const coord = coordOf.get(`${e.BoundInternalRef}|${e.ID}`)
+    let value: [number, number]
+    if (coord) value = [coord.x, coord.y]
+    else if (base) value = [base.x + 140, base.y + 70]
+    else value = [520, 60 + unboundIdx++ * 60]
     return {
-      name: `对外模型 #${l.ExternalModelID}`,
-      // 外部模型的画布坐标同样来自 model_links；缺失时落在内部模型节点右侧
-      value: [l.PosX || base.x + 120, l.PosY || base.y + 90],
-      itemStyle: { color: '#12b76a' },
+      name: e.ExternalName || `对外模型 #${e.ID}`,
+      value,
+      itemStyle: {
+        color: e.Enabled ? '#12b76a' : '#98a2b3',
+        opacity: e.InternalModelHit || !e.BoundInternalRef ? 1 : 0.4,
+      },
     }
   })
 
-  const linkLines = links.map((l) => {
-    const base = positions.get(l.InternalRef) || { x: 0, y: 0 }
+  // 绑定边：只画真实存在的绑定（bound_internal_ref 非空），不是「画布落位」。
+  const linkLines = bindingEdges.value.map((e) => {
+    const base = positions.get(e.BoundInternalRef) || { x: 0, y: 0 }
+    const coord = coordOf.get(`${e.BoundInternalRef}|${e.ID}`)
+    const target = coord ? { x: coord.x, y: coord.y } : { x: base.x + 140, y: base.y + 70 }
     return {
       coords: [
         [base.x, base.y],
-        [l.PosX || base.x + 120, l.PosY || base.y + 90],
+        [target.x, target.y],
       ],
+      lineStyle: e.InternalModelHit ? undefined : { type: 'dashed', color: '#f04438' },
     }
   })
 
@@ -150,7 +187,7 @@ const canvasOption = computed(() => {
         data: externalPts,
       },
       {
-        name: '绑定',
+        name: '绑定（悬空为红色虚线）',
         type: 'lines',
         coordinateSystem: 'cartesian2d',
         lineStyle: { color: '#c1c2f8', width: 1, curveness: 0.1 },
@@ -204,17 +241,36 @@ const canvasOption = computed(() => {
 
       <StatCards :items="stats" :columns="4" />
 
-      <!-- 供应商层 -->
+      <!-- 第 1 层：供应商 -->
       <div class="card">
         <div class="card-title">供应商（{{ providerRows.length }}）</div>
         <div class="provider-strip">
           <div v-for="p in providerRows" :key="p.provider" class="provider-chip">
             <span class="pv-name">{{ p.provider }}</span>
-            <span class="pv-meta">{{ p.models }} 个内部模型<template v-if="p.stale"> · {{ p.stale }} 个本轮未见</template></span>
+            <span class="pv-meta">
+              {{ p.models }} 个内部模型<template v-if="p.accounts"> · {{ p.accounts }} 个账号</template>
+              <template v-if="p.stale"> · {{ p.stale }} 个本轮未见</template>
+            </span>
           </div>
         </div>
+      </div>
+
+      <!-- 第 2 层：上游账号（账单/账本/订阅三处并集；已录订阅的才有固定月费） -->
+      <div class="card">
+        <div class="card-title">上游账号（{{ accountRows.length }}）</div>
+        <div v-if="accountRows.length" class="account-strip">
+          <div v-for="a in accountRows" :key="`${a.Provider}/${a.Account}`" class="provider-chip">
+            <span class="pv-name">{{ a.Account }}</span>
+            <span class="pv-meta">
+              {{ a.Provider }}
+              <template v-if="a.Subscribed"> · <el-tag type="success" size="small" effect="plain">已录订阅</el-tag></template>
+              <template v-if="a.LastSeenAt"> · 最近 {{ fmtDateTime(a.LastSeenAt) }}</template>
+            </span>
+          </div>
+        </div>
+        <p v-else class="foot">还没有账号痕迹：账单/账本/订阅都没有该供应商下的账号。</p>
         <p class="foot">
-          四层视图 = 供应商 → 账号 → 内部模型 → 对外模型。账号层需要 T1 的 account 聚合，接口上线后在这一段补一列；当前账号维度只在订阅页维护。
+          账号层是现算的（账单 ∪ 账本 ∪ 订阅），没有独立镜像表；「已录订阅」= 该账号有固定月费，参与 A5 分摊。
         </p>
       </div>
 
@@ -252,12 +308,14 @@ const canvasOption = computed(() => {
         <el-tab-pane label="拓扑" name="canvas">
           <div class="card">
             <div class="card-title">
-              落位关系（{{ data.Items.length }} 个内部模型 / {{ data.Links.length }} 条落位）
+              四层关系（{{ data.Items.length }} 个内部模型 / {{ bindingEdges.length }} 条绑定 /
+              {{ data.Externals.length }} 个对外模型）
             </div>
             <VChart :option="canvasOption" height="360px" />
             <p class="foot">
-              绿点 = 已落位的外部模型，连线只表达「画布位置」；缺行时自动布局，不影响售卖与计费。画布拖拽落位等
-              <code>PUT /admin/model-links</code> 上线后开放。
+              绿点 = 对外模型，连线 = 绑定（真源 <code>external_models.bound_internal_ref</code>）；
+              绑定目标已不在镜像里时画红色虚线（悬空绑定）。坐标来自 <code>model_links</code>（
+              <code>PUT /admin/topology/links</code>），缺行时自动布局，不影响售卖与计费。
             </p>
           </div>
         </el-tab-pane>
@@ -304,7 +362,8 @@ const canvasOption = computed(() => {
   color: #b42318;
   font-size: 12px;
 }
-.provider-strip {
+.provider-strip,
+.account-strip {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;

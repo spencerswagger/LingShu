@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/team/llmgateway/internal/pkg/resp"
@@ -59,14 +60,64 @@ type syncView struct {
 	Stale         int    `json:"Stale"`
 }
 
-// view 是 T1 的响应体。
+// providerView 是四层图第 1 层（供应商）。
+type providerView struct {
+	Provider string `json:"Provider"`
+	Models   int    `json:"Models"`
+	Stale    int    `json:"Stale"`
+	Accounts int    `json:"Accounts"`
+}
+
+// accountView 是四层图第 2 层（上游账号）。
+type accountView struct {
+	Provider   string `json:"Provider"`
+	Account    string `json:"Account"`
+	Subscribed bool   `json:"Subscribed"`
+	LastSeenAt string `json:"LastSeenAt"`
+}
+
+// externalView 是四层图第 4 层（对外模型）+ 绑定边。
+//
+// BoundInternalRef 用**不带 omitempty** 的字段下发：null/空串都表示未绑定，
+// 前端靠「字段在不在」判断会漏掉「绑定功能未上线」这条事实。
+type externalView struct {
+	ID               string `json:"ID"` // 雪花以字符串下发（超出 JS 安全整数）
+	ExternalName     string `json:"ExternalName"`
+	Enabled          bool   `json:"Enabled"`
+	BoundInternalRef string `json:"BoundInternalRef"`
+	InternalModelHit bool   `json:"InternalModelHit"` // 绑定目标是否仍在镜像里（false = 绑定悬空）
+}
+
+// view 是 T1 的响应体：四层（供应商 → 账号 → 内部模型 → 对外模型）+ 同步状态。
+//
+// 四层必须一起返回：只给 Items 时页面画不出「账号层」与「绑定边」，
+// 四层图会退化成供应商卡片 + 内部模型散点（View 的 Topology.vue 也按这四段取值）。
 type view struct {
-	Items           []nodeView `json:"Items"`
-	Links           []linkView `json:"Links"`
-	StaleCount      int        `json:"StaleCount"`
-	UnboundExternal int        `json:"UnboundExternal"`
-	SyncedAt        string     `json:"SyncedAt"`
-	Sync            syncView   `json:"Sync"`
+	Providers []providerView `json:"Providers"`
+	Accounts  []accountView  `json:"Accounts"`
+	Items     []nodeView     `json:"Items"`
+	Externals []externalView `json:"Externals"`
+	Links     []linkView     `json:"Links"`
+
+	StaleCount      int      `json:"StaleCount"`
+	UnboundExternal int      `json:"UnboundExternal"`
+	SyncedAt        string   `json:"SyncedAt"`
+	Sync            syncView `json:"Sync"`
+}
+
+// linksInput 是 T2 的入参：一批画布落位（坐标只影响观感，不影响售卖与计费）。
+type linksInput struct {
+	Items []struct {
+		InternalRef     string  `json:"InternalRef"`
+		ExternalModelID string  `json:"ExternalModelID"` // 字符串：雪花超出 JS 安全整数
+		PosX            float64 `json:"PosX"`
+		PosY            float64 `json:"PosY"`
+	} `json:"Items"`
+}
+
+// linksResult 是 T2 的响应体。
+type linksResult struct {
+	Saved int `json:"Saved"`
 }
 
 // syncResult 是 T3 的响应体。
@@ -98,6 +149,21 @@ func (h *Handler) HandleGet(w http.ResponseWriter, r *http.Request) {
 		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, err.Error())
 		return
 	}
+	providers, err := h.store.Providers(ctx)
+	if err != nil {
+		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, err.Error())
+		return
+	}
+	accounts, err := h.store.Accounts(ctx)
+	if err != nil {
+		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, err.Error())
+		return
+	}
+	externals, err := h.store.Externals(ctx)
+	if err != nil {
+		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, err.Error())
+		return
+	}
 	counts, err := h.store.Counts(ctx)
 	if err != nil {
 		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, err.Error())
@@ -115,11 +181,50 @@ func (h *Handler) HandleGet(w http.ResponseWriter, r *http.Request) {
 	}
 
 	out := view{
+		Providers:       make([]providerView, 0, len(providers)),
+		Accounts:        make([]accountView, 0, len(accounts)),
 		Items:           make([]nodeView, 0, len(nodes)),
+		Externals:       make([]externalView, 0, len(externals)),
 		Links:           make([]linkView, 0, len(links)),
 		StaleCount:      counts.Stale,
 		UnboundExternal: counts.UnboundExternal,
 		Sync:            syncViewOf(st),
+	}
+
+	// 供应商层的账号计数从账号层回填：一条 SQL 只算一件事，避免交叉聚合写错 join。
+	accountCount := make(map[string]int, len(providers))
+	for _, a := range accounts {
+		accountCount[a.Provider]++
+	}
+	for _, p := range providers {
+		out.Providers = append(out.Providers, providerView{
+			Provider: p.Provider, Models: p.Models, Stale: p.Stale, Accounts: accountCount[p.Provider],
+		})
+	}
+	for _, a := range accounts {
+		out.Accounts = append(out.Accounts, accountView{
+			Provider: a.Provider, Account: a.Account, Subscribed: a.Subscribed,
+			LastSeenAt: fmtTime(a.LastSeenAt),
+		})
+	}
+	// 绑定目标是否仍在镜像里：悬空绑定（目标已从网关下线/改名）必须在页面上看得出来，
+	// 否则运营会以为「绑定还在、只是没画线」。
+	nodeRefs := make(map[string]struct{}, len(nodes))
+	for _, n := range nodes {
+		nodeRefs[n.Ref] = struct{}{}
+	}
+	for _, e := range externals {
+		hit := false
+		if e.BoundInternalRef != "" {
+			_, hit = nodeRefs[e.BoundInternalRef]
+		}
+		out.Externals = append(out.Externals, externalView{
+			ID:               strconv.FormatInt(e.ID, 10),
+			ExternalName:     e.ExternalName,
+			Enabled:          e.Enabled,
+			BoundInternalRef: e.BoundInternalRef,
+			InternalModelHit: hit,
+		})
 	}
 	if hasSynced {
 		out.SyncedAt = fmtTime(synced)
@@ -177,6 +282,62 @@ func (h *Handler) HandleSync(w http.ResponseWriter, r *http.Request) {
 	}
 	resp.OK(w, r, syncResult{Fetched: res.Fetched, Created: res.Created, Stale: res.Stale,
 		State: StateOK, Message: ""})
+}
+
+// links输入上限：画布是人工（或前端自动布局）落位，几百个节点足够；
+// 不设上限等于给一个「一次写十万行」的免费放大器。
+const maxLinkItems = 500
+
+// HandlePutLinks 保存画布落位（T2 PUT /api/v1/admin/topology/links）。
+//
+// 只写坐标，**不写绑定**：绑定真源是 external_models.bound_internal_ref（T5 的事）。
+// 把绑定也塞进这张表会造出两个可写源，谁后写谁生效 —— 拓扑与售卖必然漂移。
+func (h *Handler) HandlePutLinks(w http.ResponseWriter, r *http.Request) {
+	if h == nil || h.store == nil {
+		resp.Err(w, r, http.StatusServiceUnavailable, resp.CodeInternalError, "拓扑服务未装配")
+		return
+	}
+	var in linksInput
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&in); err != nil {
+		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "请求体不是合法 JSON："+err.Error())
+		return
+	}
+	if len(in.Items) == 0 {
+		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "Items 不能为空（至少一条画布落位）")
+		return
+	}
+	if len(in.Items) > maxLinkItems {
+		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest,
+			"一次最多保存 500 条画布落位，请分批提交")
+		return
+	}
+	links := make([]Link, 0, len(in.Items))
+	for i, it := range in.Items {
+		ref := strings.TrimSpace(it.InternalRef)
+		if ref == "" {
+			resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest,
+				"第 "+strconv.Itoa(i+1)+" 条缺少 InternalRef")
+			return
+		}
+		id, err := strconv.ParseInt(strings.TrimSpace(it.ExternalModelID), 10, 64)
+		if err != nil || id <= 0 {
+			resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest,
+				"第 "+strconv.Itoa(i+1)+" 条的 ExternalModelID 不是合法的模型 id")
+			return
+		}
+		links = append(links, Link{InternalRef: ref, ExternalModelID: id, PosX: it.PosX, PosY: it.PosY})
+	}
+	saved, err := h.store.SaveLinks(r.Context(), links)
+	if errors.Is(err, ErrLinkTargetMissing) {
+		// 400 而不是 500：运营填错 ref 是输入问题，且报文里点名了是哪一条。
+		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, err.Error())
+		return
+	}
+	if err != nil {
+		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, err.Error())
+		return
+	}
+	resp.OK(w, r, linksResult{Saved: saved})
 }
 
 // syncViewOf 把落库状态映射成视图；零值 = 从未同步（State=never，不是 failed）。

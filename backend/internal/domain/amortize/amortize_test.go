@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
+
+	"github.com/team/llmgateway/internal/pkg/billingday"
 )
 
 // TestAllocateShares_ProRataAndExactTotal：按 token 比例摊，且合计严格等于订阅价。
@@ -81,18 +83,18 @@ func TestAllocateShares_EmptyRows(t *testing.T) {
 	}
 }
 
-// TestCycleEnd：月费 +1 月、年费 +1 年、未知按 1 月。
+// TestCycleEnd：月费 +1 月、年费 +1 年、未知按 1 月（账期右界唯一实现在 billingday）。
 func TestCycleEnd(t *testing.T) {
-	start := time.Date(2026, 1, 31, 0, 0, 0, 0, time.UTC)
-	if got := cycleEnd(start, CycleMonth); !got.Equal(time.Date(2026, 3, 3, 0, 0, 0, 0, time.UTC)) {
-		// Go 的 AddDate 会把 1/31 + 1 月归一到 3/3（2 月没有 31 日）——这是可接受的口径，
-		// 重要的是「不会跨过一整年」。这里显式锁定行为，改动时会红。
+	start := time.Date(2026, 1, 31, 0, 0, 0, 0, billingday.Location())
+	// 月末**截断**到 2-28，与 SQL 侧 `cycle_start + interval '1 month'` 同语义。
+	// （Go 原生 AddDate 会给 3-3，那样分摊窗口比列表长 3 天：3-01~3-03 的账单分摊算进来、列表不认。）
+	if got := billingday.CycleEnd(start, CycleMonth); !got.Equal(time.Date(2026, 2, 28, 0, 0, 0, 0, billingday.Location())) {
 		t.Fatalf("月费右界口径变了：%s", got)
 	}
-	if got := cycleEnd(start, CycleYear); !got.Equal(time.Date(2027, 1, 31, 0, 0, 0, 0, time.UTC)) {
+	if got := billingday.CycleEnd(start, CycleYear); !got.Equal(time.Date(2027, 1, 31, 0, 0, 0, 0, billingday.Location())) {
 		t.Fatalf("年费应 +1 年，got %s", got)
 	}
-	if got := cycleEnd(start, "unknown"); !got.Equal(cycleEnd(start, CycleMonth)) {
+	if got := billingday.CycleEnd(start, "unknown"); !got.Equal(billingday.CycleEnd(start, CycleMonth)) {
 		t.Fatalf("未知账期应按 1 月，got %s", got)
 	}
 }
@@ -104,6 +106,7 @@ type fakeStore struct {
 	blocked map[string]bool
 	err     error
 	calls   []string
+	windows []window
 }
 
 func (f *fakeStore) Subscriptions(context.Context) ([]Subscription, error) {
@@ -113,11 +116,19 @@ func (f *fakeStore) Subscriptions(context.Context) ([]Subscription, error) {
 	return f.subs, nil
 }
 
-func (f *fakeStore) CycleRows(_ context.Context, provider, account string, _, _ time.Time) ([]Row, error) {
+func (f *fakeStore) CycleRows(_ context.Context, provider, account string, from, to time.Time) ([]Row, error) {
 	if f.err != nil {
 		return nil, f.err
 	}
+	f.windows = append(f.windows, window{Key: provider + "/" + account, From: from, To: to})
 	return f.rows[provider+"/"+account], nil
+}
+
+// window 记录 CycleRows 收到的账期（用于断言窗口起点是账期日 0 点，不是 UTC 0 点）。
+type window struct {
+	Key  string
+	From time.Time
+	To   time.Time
 }
 
 func (f *fakeStore) Allocate(_ context.Context, billingID string, cost float64) (bool, error) {
@@ -154,6 +165,38 @@ func TestAllocator_RunOnce_AllocatesAndCounts(t *testing.T) {
 	}
 	if res.Unallocated != 0 {
 		t.Fatalf("不该有摊不出去的钱：%v", res.Unallocated)
+	}
+}
+
+// #88 ①：账期窗口必须从「账期日 0 点（北京）」开始，而不是 DATE 扫出来的 UTC 0 点。
+//
+// 旧实现的窗口起点 = 2026-11-01T00:00Z（= 北京 08:00），于是账期首日 00:00–08:00 的账单
+// 被摊到上一期（甚至根本不摊）—— 与 S1 列表的窗口差 8 小时。
+func TestAllocator_RunOnce_WindowStartsAtBillingDay(t *testing.T) {
+	loc := billingday.Location()
+	fs := &fakeStore{
+		subs: []Subscription{{
+			Provider: "p", Account: "a", Price: 30, Cycle: CycleMonth,
+			CycleStart: time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC), // DATE 列扫出来的样子
+		}},
+		rows:    map[string][]Row{"p/a": {{BillingID: "b1", Tokens: 10}}},
+		blocked: map[string]bool{},
+	}
+	a := NewAllocator(Options{Store: fs})
+	if _, err := a.RunOnce(context.Background()); err != nil {
+		t.Fatalf("分摊轮次：%v", err)
+	}
+	if len(fs.windows) != 1 {
+		t.Fatalf("CycleRows 调用次数 = %d", len(fs.windows))
+	}
+	wantFrom := time.Date(2026, 11, 1, 0, 0, 0, 0, loc)
+	wantTo := time.Date(2026, 12, 1, 0, 0, 0, 0, loc)
+	if !fs.windows[0].From.Equal(wantFrom) {
+		t.Fatalf("窗口起点 = %s，期望 %s（账期日 0 点，不是 UTC 0 点）",
+			fs.windows[0].From, wantFrom)
+	}
+	if !fs.windows[0].To.Equal(wantTo) {
+		t.Fatalf("窗口右界 = %s，期望 %s", fs.windows[0].To, wantTo)
 	}
 }
 
@@ -233,6 +276,62 @@ func TestSQLStore_Allocate_Guards(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("mock 期望未满足：%v", err)
+	}
+}
+
+// #88 ①：真库上的账期边界必须是「账期日 0 点（北京）」，不是 DATE 扫出来的 UTC 0 点。
+//
+// 造两笔账单：账期首日北京 01:00（= 10-31T17:00Z，属于本期）与账期前北京 23:00
+// （= 10-31T15:00Z，不属于本期）。旧实现窗口从 11-01T00:00Z 起 → 前一笔被漏掉，摊 0 笔。
+func TestAmortize_RealSQL_BillingDayBoundary(t *testing.T) {
+	conn := openMigratedTempDB(t)
+	ctx := context.Background()
+	loc := billingday.Location()
+
+	if _, err := conn.ExecContext(ctx,
+		`INSERT INTO users(id, username, password_hash, role) VALUES (1, 'u1', 'x', 'DEVELOPER')`); err != nil {
+		t.Fatalf("造用户失败：%v", err)
+	}
+	insertBill := `INSERT INTO billing_records
+		(id, billing_id, user_id, pricing_mode, external_model_name, internal_model_id,
+		 call_time, tokens, r_value, upstream_provider, upstream_account, upstream_model, cost_source)
+		VALUES ($1, $2, 1, 'sale', 'm', 'g/m', $3, '{"input":10}'::jsonb, 1, 'p', 'a', 'up', 'none')`
+	if _, err := conn.ExecContext(ctx, insertBill, int64(1), "edge-in",
+		time.Date(2026, 11, 1, 1, 0, 0, 0, loc)); err != nil {
+		t.Fatalf("造边界内账单失败：%v", err)
+	}
+	if _, err := conn.ExecContext(ctx, insertBill, int64(2), "edge-out",
+		time.Date(2026, 10, 31, 23, 0, 0, 0, loc)); err != nil {
+		t.Fatalf("造边界外账单失败：%v", err)
+	}
+	if _, err := conn.ExecContext(ctx,
+		`INSERT INTO subscriptions(id, provider_ref, account_ref, price_amount, billing_cycle, cycle_start)
+		 VALUES (1, 'p', 'a', 12, 'month', DATE '2026-11-01')`); err != nil {
+		t.Fatalf("造订阅失败：%v", err)
+	}
+
+	res, err := NewAllocator(Options{Store: NewSQLStore(conn)}).RunOnce(ctx)
+	if err != nil {
+		t.Fatalf("分摊轮次：%v", err)
+	}
+	if res.Updated != 1 || res.Allocated != 12 {
+		t.Fatalf("只有边界内那笔该被摊：%+v", res)
+	}
+	var inCost float64
+	if err := conn.QueryRowContext(ctx,
+		`SELECT cost_credits FROM billing_records WHERE billing_id='edge-in'`).Scan(&inCost); err != nil {
+		t.Fatalf("读边界内账单失败：%v", err)
+	}
+	if inCost != 12 {
+		t.Fatalf("边界内账单成本 = %v，期望 12", inCost)
+	}
+	var outSrc sql.NullString
+	if err := conn.QueryRowContext(ctx,
+		`SELECT cost_source FROM billing_records WHERE billing_id='edge-out'`).Scan(&outSrc); err != nil {
+		t.Fatalf("读边界外账单失败：%v", err)
+	}
+	if outSrc.String == "amortized" {
+		t.Fatal("账期外账单被写成了 amortized（窗口起点算错）")
 	}
 }
 

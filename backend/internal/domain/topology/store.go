@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -17,6 +18,15 @@ type Store interface {
 	Links(ctx context.Context) ([]Link, error)
 	// Counts 返回 stale 节点数与「未绑定对外模型」数。
 	Counts(ctx context.Context) (Counts, error)
+	// Providers 返回第 1 层：供应商及其内部模型计数（由镜像聚合，不落单独的表）。
+	Providers(ctx context.Context) ([]Provider, error)
+	// Accounts 返回第 2 层：账单/账本/订阅里出现过的上游账号（并集去重）。
+	Accounts(ctx context.Context) ([]Account, error)
+	// Externals 返回第 4 层：未软删的对外模型 + 绑定目标（绑定边即出自这里）。
+	Externals(ctx context.Context) ([]External, error)
+	// SaveLinks 覆写画布落位（T2）：按 (internal_ref, external_model_id) upsert。
+	// 返回实际写入行数；目标不存在（内部模型或对外模型）时返回 ErrLinkTargetMissing。
+	SaveLinks(ctx context.Context, links []Link) (int, error)
 	// LastSeenAt 返回最近一次同步命中的时间（没有任何节点时 ok=false）。
 	LastSeenAt(ctx context.Context) (time.Time, bool, error)
 	// Replace 在一轮同步内整批 upsert 节点，并把本轮未命中的老节点置 stale。
@@ -125,6 +135,185 @@ func (s *SQLStore) Counts(ctx context.Context) (Counts, error) {
 		return Counts{}, fmt.Errorf("读取拓扑计数失败：%w", err)
 	}
 	return c, nil
+}
+
+// Providers 读第 1 层：镜像里按 provider_ref 聚合的模型计数。
+//
+// 空 provider_ref 不丢弃（显示成「(未知)」由前端决定）：同步器可能在网关未给 provider 时留空，
+// 静默丢行会让「供应商层条数之和 ≠ 内部模型条数」。
+func (s *SQLStore) Providers(ctx context.Context) ([]Provider, error) {
+	if s == nil || s.db == nil {
+		return nil, errors.New("拓扑存储未装配数据库连接")
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT provider_ref,
+		        count(*)                        AS models,
+		        count(*) FILTER (WHERE stale)   AS stale
+		   FROM internal_models
+		  GROUP BY provider_ref
+		  ORDER BY count(*) DESC, provider_ref`)
+	if err != nil {
+		return nil, fmt.Errorf("读取供应商聚合失败：%w", err)
+	}
+	defer rows.Close()
+
+	out := make([]Provider, 0, 8)
+	for rows.Next() {
+		var p Provider
+		if err := rows.Scan(&p.Provider, &p.Models, &p.Stale); err != nil {
+			return nil, fmt.Errorf("扫描供应商聚合失败：%w", err)
+		}
+		out = append(out, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历供应商聚合失败：%w", err)
+	}
+	return out, nil
+}
+
+// Accounts 读第 2 层：账单 / 账本 / 订阅三处的账号并集。
+//
+// 三处都要：只查账单会漏「账本已到、账单还没归因」的账号；漏订阅会把「有固定月费但本期没流量」
+// 的账号从图上抹掉（运营正好要找它）。
+//
+// 成本：账单侧是一次 (provider, account) 聚合，走 0020 的部分索引 idx_billing_upstream_time
+// （WHERE upstream_provider IS NOT NULL，正是这里的谓词），不回落堆表。
+// 该查询的规模由「distinct 账号数」决定、与账单行数无关；账单表继续长大时这一条会变成 T1 的主要开销，
+// 届时改成物化视图（本批不加迁移：迁移右界仍是 0025，且没有第二处写它）。
+func (s *SQLStore) Accounts(ctx context.Context) ([]Account, error) {
+	if s == nil || s.db == nil {
+		return nil, errors.New("拓扑存储未装配数据库连接")
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`WITH src AS (
+		    SELECT upstream_provider    AS provider,
+		           upstream_account     AS account,
+		           max(call_time)       AS last_seen,
+		           false                AS subscribed
+		      FROM billing_records
+		     -- 谓词与 0020 的部分索引 idx_billing_upstream_time 逐字一致，否则规划器用不上它
+		     WHERE upstream_provider IS NOT NULL
+		       AND upstream_account IS NOT NULL AND btrim(upstream_account) <> ''
+		     GROUP BY 1, 2
+		    UNION ALL
+		    SELECT provider, provider_account, max(occurred_at), false
+		      FROM ledger_entries
+		     WHERE btrim(provider_account) <> ''
+		     GROUP BY 1, 2
+		    UNION ALL
+		    SELECT provider_ref, account_ref, NULL::timestamptz, true
+		      FROM subscriptions
+		 )
+		 SELECT provider, account,
+		        bool_or(subscribed)    AS subscribed,   -- PG 没有 max(boolean)
+		        max(last_seen)         AS last_seen
+		   FROM src
+		  GROUP BY 1, 2
+		  ORDER BY 1, 2`)
+	if err != nil {
+		return nil, fmt.Errorf("读取账号层失败：%w", err)
+	}
+	defer rows.Close()
+
+	out := make([]Account, 0, 32)
+	for rows.Next() {
+		var (
+			a        Account
+			lastSeen sql.NullTime
+		)
+		if err := rows.Scan(&a.Provider, &a.Account, &a.Subscribed, &lastSeen); err != nil {
+			return nil, fmt.Errorf("扫描账号层失败：%w", err)
+		}
+		if lastSeen.Valid {
+			a.LastSeenAt = lastSeen.Time
+		}
+		out = append(out, a)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历账号层失败：%w", err)
+	}
+	return out, nil
+}
+
+// Externals 读第 4 层：未软删的对外模型 + 绑定目标（绑定边出自这一列）。
+func (s *SQLStore) Externals(ctx context.Context) ([]External, error) {
+	if s == nil || s.db == nil {
+		return nil, errors.New("拓扑存储未装配数据库连接")
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, external_name, enabled, COALESCE(bound_internal_ref, '')
+		   FROM external_models
+		  WHERE deleted_at IS NULL
+		  ORDER BY external_name, id`)
+	if err != nil {
+		return nil, fmt.Errorf("读取对外模型层失败：%w", err)
+	}
+	defer rows.Close()
+
+	out := make([]External, 0, 32)
+	for rows.Next() {
+		var e External
+		if err := rows.Scan(&e.ID, &e.ExternalName, &e.Enabled, &e.BoundInternalRef); err != nil {
+			return nil, fmt.Errorf("扫描对外模型层失败：%w", err)
+		}
+		e.BoundInternalRef = strings.TrimSpace(e.BoundInternalRef)
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历对外模型层失败：%w", err)
+	}
+	return out, nil
+}
+
+// SaveLinks 覆写画布落位（T2）。
+//
+// 一句话口径：**model_links 只存坐标**，绝不在这里建立/修改绑定关系（真源是
+// external_models.bound_internal_ref）。所以这里只 upsert 坐标，不写任何语义。
+//
+// 存在性检查放在 SQL 的 WHERE 里：不满足则 0 行，映射成 ErrLinkTargetMissing（400），
+// 而不是让外键退化成 23503（500）—— 运营改错一个 ref 不该像服务端崩了。
+func (s *SQLStore) SaveLinks(ctx context.Context, links []Link) (int, error) {
+	if s == nil || s.db == nil {
+		return 0, errors.New("拓扑存储未装配数据库连接")
+	}
+	if len(links) == 0 {
+		return 0, nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("开启画布落位事务失败：%w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	saved := 0
+	for _, l := range links {
+		res, err := tx.ExecContext(ctx,
+			`INSERT INTO model_links(internal_ref, external_model_id, pos_x, pos_y, updated_at)
+			 SELECT $1, $2, $3, $4, now()
+			  WHERE EXISTS (SELECT 1 FROM internal_models WHERE ref = $1)
+			    AND EXISTS (SELECT 1 FROM external_models WHERE id = $2 AND deleted_at IS NULL)
+			 ON CONFLICT (internal_ref, external_model_id) DO UPDATE SET
+			     pos_x      = EXCLUDED.pos_x,
+			     pos_y      = EXCLUDED.pos_y,
+			     updated_at = EXCLUDED.updated_at`,
+			l.InternalRef, l.ExternalModelID, l.PosX, l.PosY)
+		if err != nil {
+			return 0, fmt.Errorf("写入画布落位失败（%s）：%w", l.InternalRef, err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return 0, fmt.Errorf("读取画布落位写入行数失败：%w", err)
+		}
+		if n == 0 {
+			return 0, fmt.Errorf("%w：internal_ref=%s external_model_id=%d",
+				ErrLinkTargetMissing, l.InternalRef, l.ExternalModelID)
+		}
+		saved += int(n)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("提交画布落位事务失败：%w", err)
+	}
+	return saved, nil
 }
 
 // LastSeenAt 读最近一次命中的时间。

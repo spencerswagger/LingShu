@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/team/llmgateway/internal/domain/audit"
+	"github.com/team/llmgateway/internal/pkg/billingday"
 )
 
 type fakeStore struct {
@@ -23,6 +24,13 @@ type fakeStore struct {
 	allocatedErr error
 	list         []ListRow
 	listErr      error
+	allocWindow  []allocWindow
+}
+
+// allocWindow 是 Allocated 收到的账期窗口（断言窗口起点是账期日 0 点，不是 UTC 0 点）。
+type allocWindow struct {
+	From time.Time
+	To   time.Time
 }
 
 func (f *fakeStore) Providers(ctx context.Context) ([]string, error) {
@@ -60,6 +68,8 @@ func (f *fakeStore) GetByNaturalKey(ctx context.Context, provider, account strin
 }
 
 func (f *fakeStore) Allocated(ctx context.Context, provider, account string, from, to time.Time) (float64, error) {
+	// 记录窗口：S2（单条）与 S1（列表）必须是同一个账期窗口（#88 ①）。
+	f.allocWindow = append(f.allocWindow, allocWindow{From: from, To: to})
 	return f.allocated, f.allocatedErr
 }
 
@@ -248,5 +258,39 @@ func TestView_AllocatedErrorKeepsNull(t *testing.T) {
 	}
 	if view.CycleAllocated != nil || view.CycleUnallocated != nil {
 		t.Fatalf("读失败时必须是 null：%v / %v", view.CycleAllocated, view.CycleUnallocated)
+	}
+}
+
+// #88 ①：单条（S2）查询已摊的窗口必须从「账期日 0 点（北京）」起，且右界同源。
+//
+// 旧实现用 dayStart(UTC 0 点) → 窗口 11-01T00:00Z ~ 12-01T00:00Z，比列表晚 8 小时，
+// 于是账期首日凌晨的账单在单条上算不到（列表算得到）。
+func TestView_AllocatedWindowStartsAtBillingDay(t *testing.T) {
+	loc := billingday.Location()
+	st := &fakeStore{providers: []string{"acme"}, existing: &Row{
+		ID: 1, Provider: "acme", Account: "acct-1", PriceCredits: 10000, Currency: "CNY",
+		Cycle: CycleMonth, PayDay: 5, ShareCost: true,
+		// DATE 列扫出来的样子：UTC 0 点
+		CycleStart: func() *time.Time { v := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC); return &v }(),
+		CreatedAt:  time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC),
+		UpdatedAt:  time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC),
+	}}
+	svc := newTestService(st, &fakeConfig{r: 10000}, &fakeAudit{})
+	svc.now = func() time.Time { return time.Date(2026, 11, 16, 12, 0, 0, 0, loc) }
+
+	if _, berr := svc.Create(context.Background(), validInput()); berr != nil {
+		t.Fatalf("意外错误：%+v", berr)
+	}
+	if len(st.allocWindow) != 1 {
+		t.Fatalf("Allocated 调用次数 = %d", len(st.allocWindow))
+	}
+	wantFrom := time.Date(2026, 11, 1, 0, 0, 0, 0, loc)
+	wantTo := time.Date(2026, 12, 1, 0, 0, 0, 0, loc)
+	if !st.allocWindow[0].From.Equal(wantFrom) {
+		t.Fatalf("单条窗口起点 = %s，期望 %s（账期日 0 点，不是 UTC 0 点）",
+			st.allocWindow[0].From, wantFrom)
+	}
+	if !st.allocWindow[0].To.Equal(wantTo) {
+		t.Fatalf("单条窗口右界 = %s，期望 %s", st.allocWindow[0].To, wantTo)
 	}
 }

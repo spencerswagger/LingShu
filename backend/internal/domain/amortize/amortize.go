@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/team/llmgateway/internal/domain/billing"
+	"github.com/team/llmgateway/internal/pkg/billingday"
 	"github.com/team/llmgateway/internal/pkg/decimalx"
 )
 
@@ -180,8 +181,10 @@ func (a *Allocator) RunOnce(ctx context.Context) (Result, error) {
 			res.Skipped++
 			continue
 		}
-		from := s.CycleStart
-		to := cycleEnd(from, s.Cycle)
+		// 账期日界只在 billingday 一处定义：`cycle_start` 是 DATE（扫出来是 UTC 0 点），
+		// 直接拿去当 timestamptz 窗口会让分摊比列表晚 8 小时（同一笔账单两个账期）。
+		from := billingday.CivilDay(s.CycleStart)
+		to := billingday.CycleEnd(from, s.Cycle)
 		rows, err := a.store.CycleRows(ctx, s.Provider, s.Account, from, to)
 		if err != nil {
 			return res, err
@@ -210,16 +213,6 @@ func (a *Allocator) RunOnce(ctx context.Context) (Result, error) {
 		res.Subscriptions++
 	}
 	return res, nil
-}
-
-// cycleEnd 算账期右界（左闭右开）。未知账期按 1 个月处理（宁可摊窄，也不摊到一年）。
-func cycleEnd(start time.Time, cycle string) time.Time {
-	switch cycle {
-	case CycleYear:
-		return start.AddDate(1, 0, 0)
-	default:
-		return start.AddDate(0, 1, 0)
-	}
 }
 
 // SQLStore 是 Store 的 PostgreSQL 实现。

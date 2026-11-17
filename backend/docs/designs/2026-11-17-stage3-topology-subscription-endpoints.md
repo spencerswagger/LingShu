@@ -12,7 +12,7 @@
 | S7 | `GET /api/v1/admin/subscriptions/form-options` | 本批落地 |
 | S2 | `POST /api/v1/admin/subscriptions` | 本批落地 |
 | S6 | `POST /api/v1/admin/subscriptions/amortize/run` | 本批落地 |
-| T2 | `PUT /admin/topology/links`（画布坐标） | **未做**（前端暂不落坐标） |
+| T2 | `PUT /api/v1/admin/topology/links`（画布坐标） | 本批落地（复审补：原「未做」导致 `model_links` 零写入方） |
 | S3/S4/S5 | 编辑 / 分摊明细 / 手工结转 | **未做**（下一批） |
 
 无新增迁移：拓扑同步状态存 `sys_configs['topology.sync_state']`，订阅表结构沿用 `0019_v2_topology.sql`。
@@ -42,7 +42,33 @@
 `sys_configs['topology.sync_state']`（JSON）。**不建新表**：一个几十字节的状态不值得占一个迁移号，
 也不该为此把 `V2MigrationRightBound` 往前推。
 
-### 1.3 定时轮
+### 1.3 T1 的响应必须是**四层**，不是一层
+
+四层 = 供应商 → 上游账号 → 内部模型 → 对外模型。只下发 `Items`（内部模型）时，
+页面画不出第 2 层的账号、也画不出「内部模型 ↔ 对外模型」的绑定边 —— 四层图退化成
+「供应商卡片 + 内部模型散点」（#88 ②）。
+
+| 段 | 来源 | 说明 |
+| --- | --- | --- |
+| `Providers[]` | `internal_models` 聚合 | `Provider / Models / Stale / Accounts`；`Accounts` 由 handler 用账号段回填（一条 SQL 只算一件事） |
+| `Accounts[]` | `billing_records.upstream_account` ∪ `ledger_entries.provider_account` ∪ `subscriptions.account_ref` | 现算，无镜像表；`Subscribed=true` = 有固定月费。三处都要：只查账单会漏「账本已到、账单未归因」，漏订阅会把「有月费但本期没流量」的账号抹掉 |
+| `Items[]` | `internal_models` | 原有段（含 stale） |
+| `Externals[]` | `external_models`（未软删） | `ID / ExternalName / Enabled / BoundInternalRef / InternalModelHit`。**绑定边只出自这里**（`bound_internal_ref` 是唯一真源）；`InternalModelHit=false` = 绑定悬空（目标已从网关下线/改名），页面画红色虚线 |
+
+`bool_or(subscribed)` 而不是 `max(subscribed)`：PG 没有 `max(boolean)`，写错会在真库上直接 500。
+
+### 1.4 T2：`model_links` 的写入方
+
+`PUT /api/v1/admin/topology/links`，body `{"Items":[{InternalRef, ExternalModelID(字符串), PosX, PosY}]}`。
+
+- **只写坐标，不写绑定**：绑定真源是 `external_models.bound_internal_ref`（改它属 T5）。
+  把绑定也塞进这张表会造出两个可写源，谁后写谁生效 —— 拓扑与售卖必然漂移（数据契约 §1.7-G）。
+- 因此在线条上：绑定边来自 `Externals[].BoundInternalRef`，坐标来自 `model_links`；缺坐标 = 自动布局。
+- 校验：`Items` 非空、≤500 条、`InternalRef` 非空、`ExternalModelID` 可解析为正整数；
+  落库时用 `INSERT ... SELECT ... WHERE EXISTS(内部模型) AND EXISTS(对外模型未软删) ON CONFLICT DO UPDATE`，
+  0 行 → `ErrLinkTargetMissing` → **400**（点名哪一条），而不是让外键退化成 23503（500）。
+
+### 1.5 定时轮
 
 `cmd/server` 里 10 分钟一跳（拓扑变动远慢于账单），带单轮 `recover`。
 手动 T3 与定时轮走**同一份** `Syncer.RunOnce`，不存在两套实现。
@@ -118,10 +144,40 @@ C5/C6（本期有没有可摊账单、是否已被账本占用）是运行时事
 `subscription.amortize.run`（含本轮统计与错误）。审计失败不回滚业务（数据已落库）但打 ERROR，
 不静默丢审计。
 
+### 2.9 账期日界（时区口径，唯一实现在 `internal/pkg/billingday`）
+
+`subscriptions.cycle_start` 是 **`DATE`**（没有时区语义），而 pgx 把它扫成 `UTC 0 点`；
+进程日界是北京时间（UTC+8）。两者直接比较就出两个真事故（#88 ①）：
+
+1. **「今天起账」在北京时间 00:00–08:00 被判成 `pending`**：
+   `2026-11-17 00:00Z` 晚于 `2026-11-17 00:00+08:00`（= 11-16T16:00Z），于是 `WillAmortize=false`，
+   摊销要等到第二天才「生效」；
+2. **S2 单条的已摊窗口比 S1 列表晚 8 小时**：Go 侧把 UTC 0 点当窗口起点，SQL 侧
+   `b.call_time >= s.cycle_start` 又让 PG 按**会话时区**把 DATE 转成时刻 —— 同一个账期两个窗口。
+
+口径（不许绕过）：
+
+- `billingday.CivilDay(t)`：DATE 值 → 账期日 0 点（只取 Y/M/D，丢掉驱动给的 UTC 时区）；
+- `billingday.DayStart(t)`：瞬时 → 所在账期日 0 点；
+- `billingday.CycleEnd(day, cycle)`：账期右界（month +1 月 / year +1 年 / once +1 天）；
+- SQL 里一律显式 `AT TIME ZONE $1`（$1 = `billingday.Name()`），**不依赖会话 TimeZone**；
+- 写 `DATE` 列一律用 `YYYY-MM-DD` 文本（`billingday.Date`），不传 `time.Time`
+  （否则会先「按会话时区取日期」，在非 UTC+8 连接上整整差一天）。
+
+回归用例（真库）：`subscription/store_pg_test.go` 的
+`TestSQLStore_AllocatedWindowMatchesListWindow`（两个窗口同值）、
+`TestSQLStore_ListWindowIgnoresSessionTimezone`（把库级时区改成 America/New_York 后同值）、
+`TestSQLStore_CreateCycleStartIsDateLiteral`（纽约会话下写 11-17 仍是 11-17）；
+`amortize` 的 `TestAmortize_RealSQL_BillingDayBoundary`（账期首日北京 01:00 的账单必须被摊到）。
+
 ## 3. 契约（与 `frontend/src/api/v2.ts` 逐字对齐，PascalCase）
 
-- T1 `Data`：`Items[]`（Ref/ProviderRef/Kind=group|direct/DisplayName/ContextLen/PosX/PosY/LastSeenAt/Stale）、
+- T1 `Data`：`Providers[]`（Provider/Models/Stale/Accounts）、
+  `Accounts[]`（Provider/Account/Subscribed/LastSeenAt）、
+  `Items[]`（Ref/ProviderRef/Kind=group|direct/DisplayName/ContextLen/PosX/PosY/LastSeenAt/Stale）、
+  `Externals[]`（ID **字符串**/ExternalName/Enabled/BoundInternalRef/InternalModelHit）、
   `Links[]`（InternalRef/ExternalModelID **字符串**/PosX/PosY）、`StaleCount`、`UnboundExternal`、`SyncedAt`、`Sync`。
+- T2 `Data`：`Saved`（实际写入行数）。
 - `Sync`：`LastSuccessAt` / `LastRunAt` / `State(ok|failed|never|'')` / `Message` / `Created` / `Stale`；
   空时间一律空串（不出现 `0001-01-01`）。
 - T3 `Data`：`Fetched` / `Created` / `Stale` / `State` / `Message`。
@@ -131,7 +187,8 @@ C5/C6（本期有没有可摊账单、是否已被账本占用）是运行时事
 
 ## 4. 已知边界（本批不修）
 
-1. S3（编辑）/ S4（分摊明细）/ S5（手工结转）/ T2（画布坐标）未实现 —— 前端对应入口会是 pending 空态。
+1. S3（编辑）/ S4（分摊明细）/ S5（手工结转）/ T5（绑定写入）未实现 —— 前端对应入口会是 pending 空态。
+   `bound_internal_ref` 仍是只读：绑定边能画（真源已存在），但「建立绑定」要等 T5。
 2. S6 限流是**单实例**进程内：多副本时每副本各 1 次/10 秒（仍远低于打爆库的量级）。要全局配额需上 Redis。
 3. `Providers` 候选来自拓扑镜像，镜像为空时录入一律 409 `topology_not_synced` —— 首次部署必须先同步一次。
 4. 拓扑定时轮固定 10 分钟，未做成 `sys_configs` 可配。

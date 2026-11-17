@@ -22,6 +22,7 @@ func TestStage3Routes_AdminOnly(t *testing.T) {
 	adminPaths := []struct{ method, path string }{
 		{http.MethodGet, "/api/v1/admin/topology"},
 		{http.MethodPost, "/api/v1/admin/topology/sync"},
+		{http.MethodPut, "/api/v1/admin/topology/links"},
 		{http.MethodGet, "/api/v1/admin/subscriptions"},
 		{http.MethodGet, "/api/v1/admin/subscriptions/form-options"},
 		{http.MethodPost, "/api/v1/admin/subscriptions"},
@@ -59,9 +60,9 @@ func TestStage3Routes_NoDevMirror(t *testing.T) {
 			t.Errorf("阶段三端点必须挂在 /api/v1/admin 下：%s", trimmed)
 		}
 	}
-	// 防空转：路由表里只应剩这 4 条（T1/T3/S2/S6）；数量变了说明有人加了端点，
+	// 防空转：路由表里只应剩这 7 条（T1/T2/T3 + S1/S2/S6/S7）；数量变了说明有人加了端点，
 	// 那也该重新按 Spec 复核一遍权限与成本口径。
-	if checked != 6 {
-		t.Fatalf("扫描到 %d 条阶段三路由注册，期望 6 条（T1/T3/S1/S7/S2/S6）", checked)
+	if checked != 7 {
+		t.Fatalf("扫描到 %d 条阶段三路由注册，期望 7 条（T1/T2/T3/S1/S2/S6/S7）", checked)
 	}
 }

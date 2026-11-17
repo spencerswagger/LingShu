@@ -25,7 +25,18 @@ func TestHandler_HandleGet_Shape(t *testing.T) {
 			ContextLen: 128000, Caps: json.RawMessage(`{"tools":true}`), ListPrice: json.RawMessage(`{"input":1}`),
 			LastSeenAt: seen, Stale: false,
 		}},
-		links:    []Link{{InternalRef: "acme/gpt-x", ExternalModelID: 300, PosX: 240, PosY: 190}},
+		links:     []Link{{InternalRef: "acme/gpt-x", ExternalModelID: 300, PosX: 240, PosY: 190}},
+		providers: []Provider{{Provider: "acme", Models: 1, Stale: 1}},
+		accounts: []Account{
+			{Provider: "acme", Account: "acct-1", Subscribed: true, LastSeenAt: seen},
+			{Provider: "acme", Account: "acct-2"},
+			{Provider: "borealis", Account: "acct-3"},
+		},
+		externals: []External{
+			{ID: 300, ExternalName: "gpt-x", Enabled: true, BoundInternalRef: "acme/gpt-x"},
+			{ID: 301, ExternalName: "gpt-y", Enabled: true, BoundInternalRef: "acme/gone"},
+			{ID: 302, ExternalName: "gpt-z", Enabled: false},
+		},
 		counts:   Counts{Stale: 1, UnboundExternal: 2},
 		lastSeen: seen, hasSeen: true,
 		state: SyncState{LastRunAt: seen, LastSuccessAt: lastOK, State: StateOK, Created: 2, Stale: 1},
@@ -54,6 +65,25 @@ func TestHandler_HandleGet_Shape(t *testing.T) {
 				ExternalModelID string
 				PosX            float64
 			}
+			Providers []struct {
+				Provider string
+				Models   int
+				Stale    int
+				Accounts int
+			}
+			Accounts []struct {
+				Provider   string
+				Account    string
+				Subscribed bool
+				LastSeenAt string
+			}
+			Externals []struct {
+				ID               string
+				ExternalName     string
+				Enabled          bool
+				BoundInternalRef string
+				InternalModelHit bool
+			}
 			StaleCount      int
 			UnboundExternal int
 			SyncedAt        string
@@ -80,6 +110,30 @@ func TestHandler_HandleGet_Shape(t *testing.T) {
 	if len(d.Links) != 1 || d.Links[0].ExternalModelID != "300" {
 		t.Fatalf("Links = %+v（雪花必须以字符串下发）", d.Links)
 	}
+	// 四层必须一起下发：只给 Items 时页面画不出账号层与绑定边（Owl #88 ②）。
+	if len(d.Providers) != 1 || d.Providers[0].Provider != "acme" || d.Providers[0].Models != 1 ||
+		d.Providers[0].Stale != 1 || d.Providers[0].Accounts != 2 {
+		t.Fatalf("Providers = %+v（账号计数应由账号层回填）", d.Providers)
+	}
+	if len(d.Accounts) != 3 || d.Accounts[0].LastSeenAt != "2026-11-16T09:30:00Z" {
+		t.Fatalf("Accounts = %+v", d.Accounts)
+	}
+	if !d.Accounts[0].Subscribed || d.Accounts[1].Subscribed {
+		t.Errorf("Subscribed 必须逐行透出：%+v", d.Accounts)
+	}
+	if len(d.Externals) != 3 || d.Externals[0].ID != "300" {
+		t.Fatalf("Externals = %+v（雪花必须以字符串下发）", d.Externals)
+	}
+	if !d.Externals[0].InternalModelHit {
+		t.Error("绑定目标在镜像里时 InternalModelHit 应为 true")
+	}
+	if d.Externals[1].InternalModelHit {
+		t.Error("绑定目标已不在镜像里时必须标出悬空绑定（false）")
+	}
+	if d.Externals[2].BoundInternalRef != "" {
+		t.Errorf("未绑定的对外模型必须下发空串：%+v", d.Externals[2])
+	}
+
 	if d.StaleCount != 1 || d.UnboundExternal != 2 {
 		t.Errorf("计数 = %d/%d", d.StaleCount, d.UnboundExternal)
 	}
@@ -178,5 +232,90 @@ func TestHandler_HandleSync_NotConfigured(t *testing.T) {
 	got := rec.Body.String()
 	if !strings.Contains(got, "topology_source_not_configured") || !strings.Contains(got, "未配置") {
 		t.Fatalf("响应缺少原因：%s", got)
+	}
+}
+
+// T2：画布落位保存成功 → 200 + Saved，且**只写坐标**（不碰绑定）。
+func TestHandler_HandlePutLinks_OK(t *testing.T) {
+	st := &fakeStore{}
+	h := newTestHandler(st, &fakeSource{})
+
+	body := `{"Items":[{"InternalRef":"acme/gpt-x","ExternalModelID":"300","PosX":240,"PosY":190}]}`
+	rec := httptest.NewRecorder()
+	h.HandlePutLinks(rec, httptest.NewRequest(http.MethodPut, "/api/v1/admin/topology/links", strings.NewReader(body)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d，body=%s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		Data struct{ Saved int }
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("解析响应失败：%v", err)
+	}
+	if out.Data.Saved != 1 {
+		t.Fatalf("Saved = %d", out.Data.Saved)
+	}
+	if len(st.savedLinks) != 1 || st.savedLinks[0].ExternalModelID != 300 ||
+		st.savedLinks[0].PosX != 240 || st.savedLinks[0].InternalRef != "acme/gpt-x" {
+		t.Fatalf("落库的落位 = %+v（雪花字符串必须解析成 int64）", st.savedLinks)
+	}
+}
+
+// T2 输入校验：空 Items / 缺 ref / 坏 id / 超上限 一律 400，且不落库。
+func TestHandler_HandlePutLinks_Validation(t *testing.T) {
+	cases := []struct{ name, body string }{
+		{"空 Items", `{"Items":[]}`},
+		{"缺 InternalRef", `{"Items":[{"ExternalModelID":"300"}]}`},
+		{"坏 ExternalModelID", `{"Items":[{"InternalRef":"a","ExternalModelID":"abc"}]}`},
+		{"负 id", `{"Items":[{"InternalRef":"a","ExternalModelID":"-1"}]}`},
+		{"不是 JSON", `not-json`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := &fakeStore{}
+			h := newTestHandler(st, &fakeSource{})
+			rec := httptest.NewRecorder()
+			h.HandlePutLinks(rec, httptest.NewRequest(http.MethodPut, "/api/v1/admin/topology/links",
+				strings.NewReader(tc.body)))
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d，期望 400，body=%s", rec.Code, rec.Body.String())
+			}
+			if st.saveLinkN != 0 {
+				t.Fatalf("校验失败时不许落库，saveLinkN = %d", st.saveLinkN)
+			}
+		})
+	}
+
+	// 超上限必须拒（一次 500 条上限，防止被当成批量写放大器）。
+	items := make([]string, 0, maxLinkItems+1)
+	for i := 0; i <= maxLinkItems; i++ {
+		items = append(items, `{"InternalRef":"a","ExternalModelID":"1"}`)
+	}
+	st := &fakeStore{}
+	h := newTestHandler(st, &fakeSource{})
+	rec := httptest.NewRecorder()
+	h.HandlePutLinks(rec, httptest.NewRequest(http.MethodPut, "/api/v1/admin/topology/links",
+		strings.NewReader(`{"Items":[`+strings.Join(items, ",")+`]}`)))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("超上限 status = %d，期望 400", rec.Code)
+	}
+	if st.saveLinkN != 0 {
+		t.Fatalf("超上限时不许落库，saveLinkN = %d", st.saveLinkN)
+	}
+}
+
+// T2：指向不存在的节点 → 400（输入问题），不是 500。
+func TestHandler_HandlePutLinks_TargetMissing(t *testing.T) {
+	st := &fakeStore{saveLinkErr: ErrLinkTargetMissing}
+	h := newTestHandler(st, &fakeSource{})
+
+	rec := httptest.NewRecorder()
+	h.HandlePutLinks(rec, httptest.NewRequest(http.MethodPut, "/api/v1/admin/topology/links",
+		strings.NewReader(`{"Items":[{"InternalRef":"nope","ExternalModelID":"300"}]}`)))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d，期望 400，body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "不存在") {
+		t.Errorf("文案应点名原因：%s", rec.Body.String())
 	}
 }

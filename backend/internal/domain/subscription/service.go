@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/team/llmgateway/internal/domain/audit"
+	"github.com/team/llmgateway/internal/pkg/billingday"
 	"github.com/team/llmgateway/internal/pkg/decimalx"
 	"github.com/team/llmgateway/internal/pkg/idgen"
 )
@@ -247,7 +248,9 @@ func (s *Service) allocatedFor(ctx context.Context, row *Row) *float64 {
 	case StatusPending, StatusMissingCycle:
 		return nil
 	}
-	from := dayStart(*row.CycleStart)
+	// 账期窗口与 S1 列表同源（billingday）：DATE 值先还原成账期日，
+	// 否则这里会比列表晚 8 小时，同一条订阅在「单条」与「列表」上已摊金额不同。
+	from := billingday.CivilDay(*row.CycleStart)
 	allocated, err := s.store.Allocated(ctx, row.Provider, row.Account, from, cycleWindow(from, row.Cycle))
 	if err != nil {
 		// 读失败回 null（不冒充 0），并留下日志：这是「页面显示 —」的真实原因。
@@ -291,5 +294,5 @@ func cycleStartText(t *time.Time) string {
 	if t == nil {
 		return ""
 	}
-	return t.Format("2006-01-02")
+	return billingday.Date(*t)
 }

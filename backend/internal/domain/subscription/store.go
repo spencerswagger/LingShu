@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
+
+	"github.com/team/llmgateway/internal/pkg/billingday"
 )
 
 // Store 是订阅的读写端口（单测注入 fake，生产用 SQLStore）。
@@ -110,13 +112,15 @@ func (s *SQLStore) Create(ctx context.Context, row *Row) error {
 	if s == nil || s.db == nil {
 		return errors.New("订阅存储未装配数据库连接")
 	}
+	// DATE 列只收 `YYYY-MM-DD` 文本：传 time.Time 会先经「按会话时区取日期」，
+	// 在非 UTC+8 的连接上整整差一天（billingday 包注释里有完整说明）。
 	var start any
 	if row.CycleStart != nil {
-		start = *row.CycleStart
+		start = billingday.Date(*row.CycleStart)
 	}
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO subscriptions(`+subscriptionCols+`)
-		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,now(),now())`,
+		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::date,$10,now(),now())`,
 		row.ID, row.Provider, row.Account, row.PriceCredits, row.Currency,
 		row.Cycle, row.PayDay, row.ShareCost, start, row.Note)
 	if err != nil {
@@ -185,6 +189,9 @@ func scanRow(row interface{ Scan(...any) error }) (*Row, error) {
 // 本期窗口按每行自己的 cycle_start 与 billing_cycle 现算（LATERAL 子查询），
 // 所以不能用一条固定区间的 GROUP BY —— 各订阅账期起点不同，固定区间会把别的账期的钱算进来。
 // cycle_start 为空的行（状态 missing_cycle）窗口无意义，用 NULL 过滤掉 → Allocated=0 且 HasCycle=false。
+// 时区口径：`cycle_start` 是 DATE，直接与 timestamptz 比较时 PG 会按**会话的 TimeZone** 把
+// DATE 转成时刻 —— 会话时区不是 China/Asia 时，窗口整体错位（列表与分摊各算一个期）。
+// 所以显式 `AT TIME ZONE $1`（$1 = billingday.Name()），与 Go 侧窗口同源，不依赖会话设置。
 const listSQL = `
 SELECT s.id, s.provider_ref, s.account_ref, s.price_amount, s.price_currency,
        s.billing_cycle, s.pay_day, s.share_cost, s.cycle_start, s.note,
@@ -198,12 +205,12 @@ SELECT s.id, s.provider_ref, s.account_ref, s.price_amount, s.price_currency,
          WHERE b.upstream_provider = s.provider_ref
            AND b.upstream_account = s.account_ref
            AND b.cost_source = 'amortized'
-           AND b.call_time >= s.cycle_start
-           AND b.call_time < CASE s.billing_cycle
-                               WHEN 'year' THEN s.cycle_start + interval '1 year'
-                               WHEN 'once' THEN s.cycle_start + interval '1 day'
-                               ELSE s.cycle_start + interval '1 month'
-                             END
+           AND b.call_time >= (s.cycle_start::timestamp AT TIME ZONE $1)
+           AND b.call_time <  ((CASE s.billing_cycle
+                                 WHEN 'year' THEN s.cycle_start + interval '1 year'
+                                 WHEN 'once' THEN s.cycle_start + interval '1 day'
+                                 ELSE s.cycle_start + interval '1 month'
+                               END) AT TIME ZONE $1)
        ) a ON true
  ORDER BY s.created_at DESC, s.id DESC`
 
@@ -212,7 +219,7 @@ func (s *SQLStore) List(ctx context.Context) ([]ListRow, error) {
 	if s == nil || s.db == nil {
 		return nil, errors.New("订阅存储未装配数据库连接")
 	}
-	rows, err := s.db.QueryContext(ctx, listSQL)
+	rows, err := s.db.QueryContext(ctx, listSQL, billingday.Name())
 	if err != nil {
 		return nil, fmt.Errorf("读取订阅列表失败：%w", err)
 	}

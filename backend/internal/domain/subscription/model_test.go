@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/team/llmgateway/internal/pkg/billingday"
 )
 
 func ptrInt(v int) *int    { return &v }
@@ -119,9 +121,15 @@ func TestPriceFor(t *testing.T) {
 }
 
 // 派生状态优先级（标准 §2.3）：stopped → once → missing_cycle → pending → expired → active。
+//
+// 时区口径（#88 ①）：`cycle_start` 是 DATE，pgx 扫出来是 **UTC 0 点**；进程日界是北京时间。
+// 所以用例必须按真实现场造数据：today 用北京时区的瞬时，start 用 DATE 列扫出来的
+// `time.Time`（UTC 0 点）。两边都用 UTC 的老写法是「空转」——它永远发现不了 8 小时错位。
 func TestStatusOf(t *testing.T) {
-	today := time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
-	start := func(y int, m time.Month, d int) *time.Time {
+	loc := billingday.Location()
+	today := time.Date(2026, 11, 17, 12, 0, 0, 0, loc) // 北京 11-17 12:00
+	// dateFromDB 模拟 pgx 对 DATE 列的行为：Y/M/D 对，时区是 UTC。
+	dateFromDB := func(y int, m time.Month, d int) *time.Time {
 		v := time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
 		return &v
 	}
@@ -133,12 +141,14 @@ func TestStatusOf(t *testing.T) {
 		want      string
 	}{
 		{"停摊优先于一切", false, CycleOnce, nil, StatusStopped},
-		{"一次性", true, CycleOnce, start(2026, 11, 1), StatusOnce},
+		{"一次性", true, CycleOnce, dateFromDB(2026, 11, 1), StatusOnce},
 		{"缺账期起点", true, CycleMonth, nil, StatusMissingCycle},
-		{"未生效", true, CycleMonth, start(2026, 12, 1), StatusPending},
-		{"已过期（满 1 月）", true, CycleMonth, start(2026, 10, 16), StatusExpired},
-		{"账期首日算生效", true, CycleMonth, start(2026, 11, 16), StatusActive},
-		{"年付未过期", true, CycleYear, start(2026, 1, 1), StatusActive},
+		{"未生效（明天起账）", true, CycleMonth, dateFromDB(2026, 11, 18), StatusPending},
+		// 这条是 #88 ① 的回归点：旧实现把 UTC 0 点与北京 0 点相比 → 今天起账被判 pending。
+		{"账期首日起账（今天）", true, CycleMonth, dateFromDB(2026, 11, 17), StatusActive},
+		{"已过期（满 1 月）", true, CycleMonth, dateFromDB(2026, 10, 16), StatusExpired},
+		{"昨天起账仍在期内", true, CycleMonth, dateFromDB(2026, 11, 16), StatusActive},
+		{"年付未过期", true, CycleYear, dateFromDB(2026, 1, 1), StatusActive},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -149,16 +159,46 @@ func TestStatusOf(t *testing.T) {
 	}
 }
 
+// #88 ① 的核心回归：北京时间 00:00–08:00 之间，「今天起账」不能被判成 pending。
+//
+// 现场：进程 now = 北京 11-17 02:00（= 11-16T18:00Z），DB 里 cycle_start = DATE '2026-11-17'
+// → pgx 扫成 11-17T00:00Z。旧实现：11-17T00:00Z > 11-17T00:00+08:00(=11-16T16:00Z) → pending。
+func TestStatusOf_TodayStartBeforeEightAM(t *testing.T) {
+	loc := billingday.Location()
+	start := time.Date(2026, 11, 17, 0, 0, 0, 0, time.UTC) // DATE '2026-11-17' 扫出来的样子
+	for _, hh := range []int{0, 1, 7, 8, 12, 23} {
+		now := time.Date(2026, 11, 17, hh, 30, 0, 0, loc)
+		if got := statusOf(true, CycleMonth, &start, now); got != StatusActive {
+			t.Fatalf("北京 %02d:30 起账当天必须是 active，got %s", hh, got)
+		}
+		// 同一时刻，明天起账必须仍是 pending（不能为了修 bug 把 pending 抹平）。
+		tomorrow := time.Date(2026, 11, 18, 0, 0, 0, 0, time.UTC)
+		if got := statusOf(true, CycleMonth, &tomorrow, now); got != StatusPending {
+			t.Fatalf("北京 %02d:30 明天起账必须是 pending，got %s", hh, got)
+		}
+	}
+}
+
 // 静态判定只覆盖 C1–C4：C5/C6 是运行时事实，不许在录入响应里承诺（标准 §5.3）。
+// 时区口径同 TestStatusOf：today 用北京瞬时，cycle_start 用 DATE 扫出来的 UTC 0 点。
 func TestStaticVerdict(t *testing.T) {
-	today := time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)
-	active := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
-	expired := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
-	pending := time.Date(2026, 12, 1, 0, 0, 0, 0, time.UTC)
+	loc := billingday.Location()
+	today := time.Date(2026, 11, 17, 12, 0, 0, 0, loc)
+	dateFromDB := func(y int, m time.Month, d int) time.Time {
+		return time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
+	}
+	active := dateFromDB(2026, 11, 1)
+	expired := dateFromDB(2026, 9, 1)
+	pending := dateFromDB(2026, 12, 1)
+	todayStart := dateFromDB(2026, 11, 17)
 
 	will, reasons := staticVerdict(true, 10000, CycleMonth, &active, today)
 	if !will || len(reasons) != 0 {
 		t.Fatalf("生效中的订阅应会摊：will=%v reasons=%v", will, reasons)
+	}
+	// #88 ①：今天起账必须「会摊」（旧实现给 cycle_pending + WillAmortize=false）。
+	if will, reasons = staticVerdict(true, 10000, CycleMonth, &todayStart, today); !will || len(reasons) != 0 {
+		t.Fatalf("今天起账应会摊：will=%v reasons=%v", will, reasons)
 	}
 	will, reasons = staticVerdict(false, 0, CycleOnce, nil, today)
 	if will {

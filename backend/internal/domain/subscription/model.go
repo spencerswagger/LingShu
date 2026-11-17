@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/team/llmgateway/internal/pkg/billingday"
 	"github.com/team/llmgateway/internal/pkg/decimalx"
 )
 
@@ -303,21 +304,12 @@ func priceFor(credits float64, currency string, cnyRate float64, r int64) float6
 	return decimalx.Round2(cny)
 }
 
-// cycleWindow 返回账期窗口 [start, end)。month = +1 月，year = +1 年，once = 当天结束。
+// cycleWindow 返回账期右界（左闭右开）。month = +1 月，year = +1 年，once = 当天结束。
+//
+// 账期日界只在 billingday 一处定义（时区口径见该包注释）：这里**不许**自己 AddDate，
+// 也不许用 t.Location()，否则 DATE 列扫出来的 UTC 0 点会让窗口与列表差 8 小时。
 func cycleWindow(start time.Time, cycle string) time.Time {
-	switch cycle {
-	case CycleYear:
-		return start.AddDate(1, 0, 0)
-	case CycleOnce:
-		return start.AddDate(0, 0, 1)
-	default:
-		return start.AddDate(0, 1, 0)
-	}
-}
-
-// dayStart 抹掉时分秒（账期是「日」粒度，比较必须按自然日）。
-func dayStart(t time.Time) time.Time {
-	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, t.Location())
+	return billingday.CycleEnd(start, cycle)
 }
 
 // statusOf 现算派生状态（标准 §2.3，优先级从上到下）。
@@ -331,8 +323,9 @@ func statusOf(shareCost bool, cycle string, cycleStart *time.Time, today time.Ti
 	if cycleStart == nil {
 		return StatusMissingCycle
 	}
-	d := dayStart(today)
-	st := dayStart(*cycleStart)
+	// today 是瞬时、cycleStart 是 DATE 值：两者先各自归到「账期日」再比较（billingday 注释里有踩点）。
+	d := billingday.DayStart(today)
+	st := billingday.CivilDay(*cycleStart)
 	if st.After(d) {
 		return StatusPending
 	}

@@ -222,6 +222,8 @@ func (s *Server) routes() {
 	if d.Topology != nil {
 		admin.HandleFunc("GET /api/v1/admin/topology", d.Topology.HandleGet)
 		admin.HandleFunc("POST /api/v1/admin/topology/sync", d.Topology.HandleSync)
+		// T2：画布落位（只写坐标，不写绑定 —— 绑定真源是 external_models.bound_internal_ref）。
+		admin.HandleFunc("PUT /api/v1/admin/topology/links", d.Topology.HandlePutLinks)
 	}
 	// 阶段三 S2/S6：订阅录入（A5 月费分摊的唯一入口）与手工重算。
 	// 成本侧数据只给 ADMIN：整段已由 /api/v1/admin 前缀守卫，不提供 /dev 同义端点。
