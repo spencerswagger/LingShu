@@ -72,6 +72,8 @@ const REASON_TEXT: Record<BlockReasonCode, { text: string; fix: string }> = {
   price_zero: { text: '费用为 0，不参与分摊', fix: '改价' },
   cycle_once: { text: '一次性费用不分摊（设计如此）', fix: '无需处理' },
   cycle_missing: { text: '缺账期起点', fix: '补账期起点' },
+  // 账期起点在未来 = 未生效，不是异常（标准 §5.2 的处置就是「无需处理」）
+  cycle_pending: { text: '账期起点还没到（未生效）', fix: '无需处理' },
   cycle_expired: { text: '账期已结束，未结转', fix: '点「结转到本期」' },
   no_billing_rows: { text: '本期该账号没有账单', fix: '确认是否有流量' },
   no_attribution: { text: '有账单但缺归因（upstream_account 为空）', fix: '找 Core 查归因写入' },

@@ -31,7 +31,9 @@ import (
 	"github.com/team/llmgateway/internal/domain/model"
 	"github.com/team/llmgateway/internal/domain/reconcile"
 	"github.com/team/llmgateway/internal/domain/router"
+	"github.com/team/llmgateway/internal/domain/subscription"
 	"github.com/team/llmgateway/internal/domain/sync"
+	"github.com/team/llmgateway/internal/domain/topology"
 	"github.com/team/llmgateway/internal/domain/upstream"
 	"github.com/team/llmgateway/internal/pkg/asyncwrite"
 	"github.com/team/llmgateway/internal/pkg/clientip"
@@ -670,20 +672,79 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 		}
 	}()
 
+	// 阶段三 T1/T3：上游拓扑（internal_models 镜像）。
+	//
+	// 真源在网关：模型清单 `/v1/models` + 组清单 `/api/groups`（口径见《2026-11-15-v2-upgrade》）。
+	// 基址默认取 magpie 基址，可用 TOPOLOGY_SOURCE_URL / TOPOLOGY_SOURCE_KEY 覆盖
+	// （网关与转发口不同源时用得上；密钥永远来自环境变量，不进 sys_configs）。
+	topoURL := strings.TrimSpace(os.Getenv("TOPOLOGY_SOURCE_URL"))
+	if topoURL == "" {
+		topoURL = cfg.Magpie.BaseURL
+	}
+	topoKey := strings.TrimSpace(os.Getenv("TOPOLOGY_SOURCE_KEY"))
+	if topoKey == "" {
+		topoKey = cfg.Magpie.AdminKey
+	}
+	topoStore := topology.NewSQLStore(d)
+	topoSource := topology.NewHTTPGatewaySource(topoURL, topoKey, cfg.Magpie.AuthHeader, nil)
+	topoSyncer := topology.NewSyncer(topology.SyncerOptions{
+		Source: topoSource,
+		Store:  topoStore,
+		Now:    time.Now,
+		Logger: logr,
+	})
+	topologyHandler := topology.NewHandler(topoStore, topoSyncer)
+	if topoSource.Configured() {
+		// 10 分钟一跳：拓扑变动（上/下线模型）远慢于账单；手动 T3 随时可触发同一份实现。
+		go func() {
+			t := time.NewTicker(10 * time.Minute)
+			defer t.Stop()
+			for range t.C {
+				func() {
+					defer func() {
+						if rec := recover(); rec != nil {
+							logr.Error("拓扑同步轮次 panic", "panic", rec)
+						}
+					}()
+					if _, err := topoSyncer.RunOnce(context.Background()); err != nil {
+						logr.Warn("拓扑同步轮次失败（保留上期快照）", "err", err)
+					}
+				}()
+			}
+		}()
+	} else {
+		// 不静默：没配基址时 T3 会明确报 topology_source_not_configured，
+		// 这里再留一条启动日志，免得运维以为是同步器坏了。
+		logr.Warn("未配置网关拓扑源（magpie.base_url / TOPOLOGY_SOURCE_URL）：拓扑同步不可用",
+			"topology", "disabled")
+	}
+
+	// 阶段三 S2/S6：订阅录入（A5 月费分摊的唯一入口）+ 手工重算。
+	// 录入端收「元/美元」，落库 price_amount 是积分（×1e6÷R，USD 先 × cny_rate）。
+	subscriptionSvc := subscription.NewService(subscription.Options{
+		Store:  subscription.NewSQLStore(d),
+		Config: billCfgProvider,
+		Audit:  auditStore,
+		Logger: logr,
+	})
+	subscriptionHandler := subscription.NewHandler(subscriptionSvc, amortizer, auditStore, logr)
+
 	return &app{
 		deps: server.Deps{
-			Identity:     identityHandler,
-			AdminUser:    adminUserHandler,
-			Credit:       creditHandler,
-			TokenAdmin:   tokenAdminHandler,
-			TokenDev:     tokenDevHandler,
-			Model:        modelHandler,
-			Announcement: announceHandler,
-			Console:      consoleAdmin,
-			DevConsole:   consoleDev,
-			SyncAdmin:    syncHandler,
-			Facade:       magpieHandler,
-			MagpieKey:    magpieKeyAdmin,
+			Identity:      identityHandler,
+			AdminUser:     adminUserHandler,
+			Credit:        creditHandler,
+			TokenAdmin:    tokenAdminHandler,
+			TokenDev:      tokenDevHandler,
+			Model:         modelHandler,
+			Announcement:  announceHandler,
+			Console:       consoleAdmin,
+			DevConsole:    consoleDev,
+			SyncAdmin:     syncHandler,
+			Facade:        magpieHandler,
+			MagpieKey:     magpieKeyAdmin,
+			Topology:      topologyHandler,
+			Subscriptions: subscriptionHandler,
 		},
 		syncer:     syncer,
 		sess:       sess,

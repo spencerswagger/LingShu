@@ -13,6 +13,10 @@ type Body struct {
 	Message   string      `json:"Message"`
 	RequestID string      `json:"RequestID"`
 	Data      interface{} `json:"Data,omitempty"`
+	// Reason 是机器可读的细分原因键（如 invalid_field / duplicate_subscription / stale_object）。
+	// 契约来源：《2026-11-16-subscription-entry-standard》§6.2 —— Code 只用来判大类，
+	// 前端按 Reason 分支定位字段/弹窗；不另立一套错误码体系。omitempty 保证既有接口响应逐字节不变。
+	Reason string `json:"Reason,omitempty"`
 }
 
 // logAPIError 落一条内部 API 异常日志：method/path/status/业务码/文案 + requestId。
@@ -93,6 +97,29 @@ func OK(w http.ResponseWriter, r *http.Request, data interface{}) {
 func Err(w http.ResponseWriter, r *http.Request, status, code int, msg string) {
 	logAPIError(r, status, code, msg)
 	if err := Write(w, status, Body{Code: code, Message: msg, RequestID: RequestID(r)}); err != nil {
+		logAPIError(r, http.StatusInternalServerError, CodeInternalError, "响应序列化失败："+err.Error())
+	}
+}
+
+// ErrReason 写出带细分原因键的错误响应（Reason + 可选 Data，供前端定位字段/带出现有行）。
+//
+// 与 Err 的唯一差别是多两个字段；日志口径完全一致（仍走 logAPIError，异常日志不缺）。
+func ErrReason(w http.ResponseWriter, r *http.Request, status, code int, reason, msg string, data interface{}) {
+	logAPIError(r, status, code, msg)
+	if err := Write(w, status, Body{
+		Code:      code,
+		Message:   msg,
+		RequestID: RequestID(r),
+		Data:      data,
+		Reason:    reason,
+	}); err != nil {
+		logAPIError(r, http.StatusInternalServerError, CodeInternalError, "响应序列化失败："+err.Error())
+	}
+}
+
+// Created 写出 201（新建成功）。语义见订阅录入标准 §6.2。
+func Created(w http.ResponseWriter, r *http.Request, data interface{}) {
+	if err := Write(w, http.StatusCreated, Body{Code: CodeOK, Message: "ok", RequestID: RequestID(r), Data: data}); err != nil {
 		logAPIError(r, http.StatusInternalServerError, CodeInternalError, "响应序列化失败："+err.Error())
 	}
 }

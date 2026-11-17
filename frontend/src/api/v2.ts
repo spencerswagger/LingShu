@@ -110,6 +110,26 @@ export async function v2Post<T>(
   }
 }
 
+// v2Put：PUT 语义的写接口（目前只有画布落位 T2）。与 v2Post 同口径：
+// 404/405/501/403 归一成 pending，400/409/422 是业务拒绝（state=error，页面展示原因）。
+export async function v2Put<T>(
+  path: string,
+  body: unknown,
+  normalize: (raw: Record<string, unknown>) => T,
+): Promise<V2Load<T>> {
+  try {
+    const res = await http.put<{ Data?: unknown }, { Data?: unknown }>(path, body, {
+      silentStatuses: [...PENDING_STATUSES, 400, 409, 422],
+    })
+    return { state: 'live', data: normalize(obj(res?.Data)) }
+  } catch (e) {
+    const err = e as ApiError
+    const status = err?.status ?? 0
+    if (PENDING_STATUSES.includes(status)) return { state: 'pending', data: null, error: err }
+    return { state: 'error', data: null, error: err }
+  }
+}
+
 // ===== 盈亏（GET /admin/ops/pnl，已定型） =====
 // 语义：收入 = Σ credits_consumed（售价口径）；成本 = Σ cost_credits（账本实付 + 订阅摊销）；
 // 毛利 = 收入 − 成本；MarginPct 在收入 ≤ 0 时为 null（后端刻意不返回 0）。
@@ -407,8 +427,38 @@ export interface TopologySync {
   Stale: number
 }
 
+// 四层图的另外三层（后端 T1 一并返回；只给 Items 时页面画不出账号层与绑定边）
+export interface TopologyProvider {
+  Provider: string
+  Models: number
+  Stale: number
+  Accounts: number
+}
+
+export interface TopologyAccount {
+  Provider: string
+  Account: string
+  // Subscribed = 该账号已录入订阅（有固定月费，参与分摊）
+  Subscribed: boolean
+  LastSeenAt: string
+}
+
+// 对外模型 = 四层图第 4 层，同时承载绑定边（真源 external_models.bound_internal_ref）
+export interface TopologyExternal {
+  ID: string
+  ExternalName: string
+  Enabled: boolean
+  // 空串 = 未绑定（后端不带 omitempty 下发，null/空串同义）
+  BoundInternalRef: string
+  // 绑定目标是否仍在镜像里：false = 绑定悬空（目标已从网关下线），页面要标出来
+  InternalModelHit: boolean
+}
+
 export interface InternalModelView {
+  Providers: TopologyProvider[]
+  Accounts: TopologyAccount[]
   Items: InternalModel[]
+  Externals: TopologyExternal[]
   Links: ModelLink[]
   StaleCount: number
   UnboundExternal: number
@@ -446,8 +496,30 @@ export function normalizeInternalModels(raw: Record<string, unknown>): InternalM
     PosX: num(pick(l, 'PosX', 'pos_x')),
     PosY: num(pick(l, 'PosY', 'pos_y')),
   }))
+  const providers = arr(pick(raw, 'Providers', 'providers')).map((p): TopologyProvider => ({
+    Provider: str(pick(p, 'Provider', 'provider')),
+    Models: num(pick(p, 'Models', 'models')),
+    Stale: num(pick(p, 'Stale', 'stale')),
+    Accounts: num(pick(p, 'Accounts', 'accounts')),
+  }))
+  const accounts = arr(pick(raw, 'Accounts', 'accounts')).map((a): TopologyAccount => ({
+    Provider: str(pick(a, 'Provider', 'provider')),
+    Account: str(pick(a, 'Account', 'account')),
+    Subscribed: Boolean(pick(a, 'Subscribed', 'subscribed')),
+    LastSeenAt: str(pick(a, 'LastSeenAt', 'last_seen_at')),
+  }))
+  const externals = arr(pick(raw, 'Externals', 'externals')).map((e): TopologyExternal => ({
+    ID: str(pick(e, 'ID', 'id')),
+    ExternalName: str(pick(e, 'ExternalName', 'external_name')),
+    Enabled: Boolean(pick(e, 'Enabled', 'enabled')),
+    BoundInternalRef: str(pick(e, 'BoundInternalRef', 'bound_internal_ref')),
+    InternalModelHit: Boolean(pick(e, 'InternalModelHit', 'internal_model_hit')),
+  }))
   return {
+    Providers: providers,
+    Accounts: accounts,
     Items: items,
+    Externals: externals,
     Links: links,
     StaleCount: num(pick(raw, 'StaleCount', 'stale_count')) || items.filter((i) => i.Stale).length,
     UnboundExternal: num(pick(raw, 'UnboundExternal', 'unbound_external')),
@@ -464,6 +536,14 @@ export function getTopology() {
 
 export function getInternalModels() {
   return v2Get('/admin/internal-models', undefined, normalizeInternalModels)
+}
+
+// 画布落位（T2 PUT /admin/topology/links）：**只存坐标**，不建立绑定
+// （绑定真源是 external_models.bound_internal_ref，改动属 T5）
+export function saveTopologyLinks(items: Array<Pick<ModelLink, 'InternalRef' | 'ExternalModelID' | 'PosX' | 'PosY'>>) {
+  return v2Put<{ Saved: number }>('/admin/topology/links', { Items: items }, (raw) => ({
+    Saved: num(pick(raw, 'Saved', 'saved')),
+  }))
 }
 
 // 手动同步（T3）：与后台定时同步共用实现，返回拉取数/新增/失效。
@@ -492,6 +572,8 @@ export type BlockReasonCode =
   | 'price_zero'
   | 'cycle_once'
   | 'cycle_missing'
+  // 账期起点还没到（今天起账 = active，不是 pending）
+  | 'cycle_pending'
   | 'cycle_expired'
   | 'no_billing_rows'
   | 'no_attribution'
@@ -565,6 +647,7 @@ const BLOCK_CODES: BlockReasonCode[] = [
   'price_zero',
   'cycle_once',
   'cycle_missing',
+  'cycle_pending',
   'cycle_expired',
   'no_billing_rows',
   'no_attribution',
@@ -634,7 +717,7 @@ export function staticAmortizeVerdict(
   if (s.ShareCost && s.Cycle !== 'once') {
     if (!s.CycleStart) reasons.push('cycle_missing')
     else if (deriveSubscriptionStatus(s, today) === 'expired') reasons.push('cycle_expired')
-    else if (deriveSubscriptionStatus(s, today) === 'pending') return { will: false, reasons }
+    else if (deriveSubscriptionStatus(s, today) === 'pending') reasons.push('cycle_pending')
   }
   return { will: reasons.length === 0, reasons }
 }
