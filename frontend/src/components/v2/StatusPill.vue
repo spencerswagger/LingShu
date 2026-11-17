@@ -38,6 +38,9 @@ const COST_SOURCE: Record<string, Meta> = {
   ledger: { label: '账本实付', tone: 'success', title: '成本取自上游账本条目（变动成本）' },
   amortized: { label: '订阅摊销', tone: 'warning', title: '成本由订阅月费按窗口摊销（固定成本）' },
   none: { label: '无成本口径', tone: 'danger', title: '成本为空：账本没拉到或订阅没配 → 毛利此刻是虚高的' },
+  // 空值不是 'none'：Spec P08/G2 要求「历史行（口径未记录）」与「明确无口径」文案与颜色都不相同，
+  // 用 `|| 'none'` 兜底会把两种账务结论合成一种。
+  '': { label: '历史未知', tone: 'info', title: 'cost_source 为空：这条账单没有成本口径记录，别当成「无成本口径」' },
 }
 
 const KIND: Record<string, Meta> = {

@@ -96,7 +96,9 @@ function fmt(n: number | undefined) {
 <template>
   <div class="page-container">
     <div v-loading="loading" class="card me-edit">
-      <el-empty v-if="!loading && !detail" description="账单不存在" />
+      <el-empty v-if="!loading && !detail" :description="errInfo.message ? '账单不存在或已被清理' : '没有数据'">
+        <el-button @click="$router.push(isSelf ? '/dev/billings' : '/admin/billings')">返回账单列表</el-button>
+      </el-empty>
       <template v-else-if="detail">
         <el-descriptions :column="isNarrow ? 1 : 2" border>
           <el-descriptions-item label="时间" :span="isNarrow ? 1 : 2">{{ detail.CallTime }}</el-descriptions-item>
@@ -113,15 +115,23 @@ function fmt(n: number | undefined) {
           </el-descriptions-item>
           <el-descriptions-item label="状态"><StatusTag :value="detail.Status" /></el-descriptions-item>          <!-- V2 归因（0020 加列）：后端返回了才展示；历史行 upstream_* 为 null → 显示「未归因」，
                不填 0、不推断。渠道族表在 0024 删除，这一块取代老的「渠道」维度。 -->
-          <template v-if="detail.UpstreamProvider !== undefined || detail.CostSource !== undefined">
+          <!-- 归因/成本是管理端字段：开发者端即使后端误返也不渲染（Spec P09 负向断言） -->
+          <template v-if="!isSelf && (detail.UpstreamProvider !== undefined || detail.CostSource !== undefined)">
             <el-descriptions-item label="上游供应商">{{ detail.UpstreamProvider || '未归因' }}</el-descriptions-item>
             <el-descriptions-item label="上游账号">{{ detail.UpstreamAccount || '未归因' }}</el-descriptions-item>
             <el-descriptions-item label="上游协议">{{ detail.UpstreamProtocol || '—' }}</el-descriptions-item>
             <el-descriptions-item label="成本来源">
-              <StatusPill domain="costSource" :value="detail.CostSource || 'none'" />
-              <span v-if="!detail.CostSource" class="attr-hint">历史行无成本口径，不要与新区间同图比较</span>
+              <!-- 不做 `|| 'none'` 兜底：null（历史未知）与 none（明确无成本口径）是两种结论（G2） -->
+              <StatusPill domain="costSource" :value="detail.CostSource ?? ''" />
+              <span v-if="!detail.CostSource" class="attr-hint">历史行无成本口径记录，不要与新区间同图比较</span>
             </el-descriptions-item>
-            <el-descriptions-item label="账本条目">{{ detail.LedgerEntryID || '未关联' }}</el-descriptions-item>
+            <el-descriptions-item label="账本条目">
+              <!-- 匹配上 → 可跳账本页按 ledger_id 精确查；没匹配 → 「待结算」，不是 0 也不是「无成本」 -->
+              <router-link v-if="detail.LedgerEntryID" :to="`/admin/ledger?ledger_id=${detail.LedgerEntryID}`" class="mono">
+                {{ detail.LedgerEntryID }}
+              </router-link>
+              <span v-else class="attr-hint">待结算（账本条目还没匹配上）</span>
+            </el-descriptions-item>
           </template>
 
           <el-descriptions-item v-if="detail.CallLog" label="响应类型">
@@ -272,6 +282,13 @@ function fmt(n: number | undefined) {
   margin-left: 8px;
   font-size: 12px;
   color: var(--color-text-tertiary);
+}
+/* 账本条目 ID 用等宽字体：32 位 ID 复制/比对时字符易混 */
+.mono {
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+  font-size: 12px;
+  color: var(--color-primary);
+  word-break: break-all;
 }
 .calc-steps {
   display: grid;

@@ -61,10 +61,15 @@ async function onSubmit() {
           </el-radio-group>
         </el-form-item>
         <el-form-item label="计价模式">
-          <el-select v-model="form.pricing_mode" style="width: 200px">
-            <el-option label="按售价" value="sale" />
-            <el-option label="按成本" value="cost" />
-          </el-select>
+          <!-- 口径 D-1（Spec P10）：V2 没有成本单价真源，`cost` 模式不可选。
+               历史 cost 用户在列表页有明确标注；新用户一律按售价创建。 -->
+          <el-radio-group v-model="form.pricing_mode">
+            <el-radio-button label="sale">按售价</el-radio-button>
+            <el-radio-button label="cost" disabled>按成本（已停用）</el-radio-button>
+          </el-radio-group>
+          <div class="field-hint">
+            成本模式已停用：V2 无成本单价真源（口径 D-1），已有 cost 用户的新请求会被拒绝。
+          </div>
         </el-form-item>
         <el-form-item>
           <el-button type="primary" :loading="saving" @click="onSubmit">保存</el-button>
@@ -80,3 +85,12 @@ async function onSubmit() {
     </div>
   </div>
 </template>
+
+<style scoped>
+.field-hint {
+  margin-top: 4px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--color-text-tertiary);
+}
+</style>

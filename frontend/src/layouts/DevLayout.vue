@@ -1,41 +1,74 @@
 <script setup lang="ts">
-import { computed, onMounted } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import UserPanel from '@/components/UserPanel.vue'
+import { listDevAnnouncements, type DevAnnouncement } from '@/api/dev'
 import {
   Odometer,
   Key,
   Cpu,
-  ChatDotRound,
   Tickets,
+  Bell,
 } from '@element-plus/icons-vue'
 
 const route = useRoute()
 const router = useRouter()
 const auth = useAuthStore()
 
-// 开发者端菜单
+// 开发者端菜单（对齐已确认原型：统计 / 令牌 / 模型（只读）/ 账单）
+// 会话页在 V2 下线（Spec §1.2），菜单摘除，路由保留 redirect 兜底老书签。
+// 公告不占菜单：按 Spec P13「无公告 → 不显示入口」，改成顶栏铃铛（有公告才出现），
+// 否则会出现一个永远空着的菜单项，运营以为坏了。
 const menus = [
   { path: '/dev/dashboard', title: '统计', icon: Odometer },
   { path: '/dev/tokens', title: '令牌', icon: Key },
   { path: '/dev/models', title: '模型', icon: Cpu },
-  { path: '/dev/sessions', title: '会话', icon: ChatDotRound },
   { path: '/dev/billings', title: '账单', icon: Tickets },
 ]
+
+// ===== 顶栏公告铃铛（P13 开发者端阅读入口）=====
+// 只发一个 GET；失败静默——公告是辅助信息，不该因为接口抖动在顶栏弹红条。
+const SEEN_KEY = 'lingshu.dev.announceSeenAt'
+const announcements = ref<DevAnnouncement[]>([])
+const seenAt = ref<number>(Number(localStorage.getItem(SEEN_KEY) || 0))
+
+const unread = computed(() => {
+  if (!seenAt.value) return announcements.value.length
+  return announcements.value.filter((a) => {
+    const t = new Date(a.PublishAt || a.CreatedAt).getTime()
+    return Number.isFinite(t) && t > seenAt.value
+  }).length
+})
+
+async function loadAnnouncements() {
+  try {
+    const res = await listDevAnnouncements()
+    announcements.value = res.Data?.List || []
+  } catch {
+    announcements.value = []
+  }
+}
+
+function openAnnouncements() {
+  // 点开即视为已读（本地时间水位线；不落库，纯前端体验层）
+  seenAt.value = Date.now()
+  localStorage.setItem(SEEN_KEY, String(seenAt.value))
+  router.push('/dev/announcements')
+}
 
 function activeMenu() {
   const p = route.path
   if (p.startsWith('/dev/tokens')) return '/dev/tokens'
   if (p.startsWith('/dev/models')) return '/dev/models'
   // Auto 模型族已下线（老书签由路由 redirect 兜底到模型列表），无需再映射高亮
-  if (p.startsWith('/dev/sessions')) return '/dev/sessions'
   if (p.startsWith('/dev/billings')) return '/dev/billings'
   return p
 }
 
 onMounted(() => {
   auth.fetchProfile()
+  void loadAnnouncements()
 })
 
 // 子页（新建/编辑/详情）时，当前页标题可作为「返回父列表」的链接
@@ -75,6 +108,16 @@ const crumbBack = computed(() => {
           <span v-else class="crumb-cur">{{ route.meta.title || '' }}</span>
         </div>
         <div class="user-box">
+          <el-badge
+            v-if="announcements.length"
+            :value="unread"
+            :hidden="unread === 0"
+            class="notice-badge"
+          >
+            <button class="notice-btn" title="公告" aria-label="公告" @click="openAnnouncements">
+              <el-icon><Bell /></el-icon>
+            </button>
+          </el-badge>
           <UserPanel />
         </div>
       </el-header>
@@ -206,6 +249,29 @@ const crumbBack = computed(() => {
 .user-box {
   display: flex;
   align-items: center;
+  gap: 10px;
+}
+
+/* 顶栏公告铃铛：只在有公告时出现（Spec P13「无公告不显示入口」） */
+.notice-badge {
+  line-height: 1;
+}
+.notice-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: 1px solid var(--color-border);
+  border-radius: 50%;
+  background: var(--color-surface);
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  padding: 0;
+}
+.notice-btn:hover {
+  color: var(--color-primary);
+  border-color: var(--color-primary);
 }
 
 .main {

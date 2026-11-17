@@ -394,9 +394,14 @@ export function getCreditHolds(params: { Status?: HoldStatus; Limit?: number }) 
   return v2Get('/admin/credit-holds', params, normalizeHolds)
 }
 
-// ===== 内部模型 / 拓扑（GET /admin/internal-models、GET /admin/model-links，待 Core） =====
-// 字段与 0019_v2_topology.sql 一一对应；绑定真源是 external_models.bound_internal_ref，
-// model_links 只存画布坐标（不是关系真源），所以 Links 缺失不影响售卖与计费。
+// ===== 内部模型 / 拓扑（T1 GET /admin/topology、T4 GET /admin/internal-models、T3 sync、T2 links） =====
+// 字段名以 `backend/internal/domain/topology/handler.go` 的 view 为准（PR #88 已合入 v2，PascalCase 逐字对齐）：
+//   Providers[] {Provider, Models, Stale, Accounts}         ← **没有 ref 字段**：供应商身份就是 Provider 名，
+//                                                             和 Items[].ProviderRef 是同一套取值
+//   Accounts[]  {Provider, Account, Subscribed, LastSeenAt} ← **没有 ref 字段**：账号身份 = (Provider, Account)
+//   Items[]     {Ref, ProviderRef, Kind, …}                 ← Kind=group 时 ProviderRef 恒空（组是跨供应商聚合层）
+//   Externals[] {ID, ExternalName, Enabled, BoundInternalRef, InternalModelHit}
+// 绑定真源是 external_models.bound_internal_ref；model_links 只存画布坐标（不是关系真源）。
 export interface InternalModel {
   Ref: string
   ProviderRef: string
@@ -416,6 +421,36 @@ export interface ModelLink {
   PosY: number
 }
 
+// 第 1 层（供应商）：由 internal_models 聚合，`Accounts` 是「该供应商下出现过账号」的计数。
+// `Stale` 是**本轮未见的条数**（不是布尔）：别拿它当 true/false 用，节点标灰以 Items[].Stale 为准。
+export interface TopologyProvider {
+  Provider: string
+  Models: number
+  Stale: number
+  Accounts: number
+}
+
+// 第 2 层（上游账号）：V2 没有账号镜像表，这一层是「账单 / 账本 / 订阅三处来源并集」现算的。
+// 后端只给这四个字段——没有额度窗口、没有最近调用时间；页面缺就留空，不要自己编。
+export interface TopologyAccount {
+  Provider: string
+  Account: string
+  // Subscribed = 该账号已录入订阅（有固定月费，参与分摊）
+  Subscribed: boolean
+  LastSeenAt: string
+}
+
+// 第 4 层（对外模型）：同时承载绑定边。
+// `BoundInternalRef` 空串 = 未绑定（后端不带 omitempty 下发，null/空串同义）；
+// `InternalModelHit=false` 且绑定了目标 = **绑定悬空**（目标已从网关下线/改名），页面必须标出来。
+export interface TopologyExternal {
+  ID: string
+  ExternalName: string
+  Enabled: boolean
+  BoundInternalRef: string
+  InternalModelHit: boolean
+}
+
 // 同步状态（T1 的同步块）：`State` 取 ok/failed/never，`Message` 是失败原因原文。
 // 同步失败时页面**保留旧快照**并显示失败原因与上次成功时间，不清空（Spec P02 验收 3）。
 export interface TopologySync {
@@ -427,39 +462,12 @@ export interface TopologySync {
   Stale: number
 }
 
-// 四层图的另外三层（后端 T1 一并返回；只给 Items 时页面画不出账号层与绑定边）
-export interface TopologyProvider {
-  Provider: string
-  Models: number
-  Stale: number
-  Accounts: number
-}
-
-export interface TopologyAccount {
-  Provider: string
-  Account: string
-  // Subscribed = 该账号已录入订阅（有固定月费，参与分摊）
-  Subscribed: boolean
-  LastSeenAt: string
-}
-
-// 对外模型 = 四层图第 4 层，同时承载绑定边（真源 external_models.bound_internal_ref）
-export interface TopologyExternal {
-  ID: string
-  ExternalName: string
-  Enabled: boolean
-  // 空串 = 未绑定（后端不带 omitempty 下发，null/空串同义）
-  BoundInternalRef: string
-  // 绑定目标是否仍在镜像里：false = 绑定悬空（目标已从网关下线），页面要标出来
-  InternalModelHit: boolean
-}
-
 export interface InternalModelView {
+  Items: InternalModel[]
+  Links: ModelLink[]
   Providers: TopologyProvider[]
   Accounts: TopologyAccount[]
-  Items: InternalModel[]
   Externals: TopologyExternal[]
-  Links: ModelLink[]
   StaleCount: number
   UnboundExternal: number
   SyncedAt: string
@@ -467,11 +475,10 @@ export interface InternalModelView {
 }
 
 function normalizeTopologySync(raw: Record<string, unknown>): TopologySync {
-  const st = str(pick(raw, 'State', 'state'))
   return {
     LastSuccessAt: str(pick(raw, 'LastSuccessAt', 'last_success_at')),
     LastRunAt: str(pick(raw, 'LastRunAt', 'last_run_at')),
-    State: st === 'ok' || st === 'failed' || st === 'never' ? st : '',
+    State: normalizeSyncState(pick(raw, 'State', 'state')),
     Message: str(pick(raw, 'Message', 'message')),
     Created: num(pick(raw, 'Created', 'created')),
     Stale: num(pick(raw, 'Stale', 'stale')),
@@ -496,36 +503,76 @@ export function normalizeInternalModels(raw: Record<string, unknown>): InternalM
     PosX: num(pick(l, 'PosX', 'pos_x')),
     PosY: num(pick(l, 'PosY', 'pos_y')),
   }))
-  const providers = arr(pick(raw, 'Providers', 'providers')).map((p): TopologyProvider => ({
-    Provider: str(pick(p, 'Provider', 'provider')),
-    Models: num(pick(p, 'Models', 'models')),
-    Stale: num(pick(p, 'Stale', 'stale')),
-    Accounts: num(pick(p, 'Accounts', 'accounts')),
-  }))
-  const accounts = arr(pick(raw, 'Accounts', 'accounts')).map((a): TopologyAccount => ({
-    Provider: str(pick(a, 'Provider', 'provider')),
-    Account: str(pick(a, 'Account', 'account')),
-    Subscribed: Boolean(pick(a, 'Subscribed', 'subscribed')),
-    LastSeenAt: str(pick(a, 'LastSeenAt', 'last_seen_at')),
-  }))
-  const externals = arr(pick(raw, 'Externals', 'externals')).map((e): TopologyExternal => ({
-    ID: str(pick(e, 'ID', 'id')),
-    ExternalName: str(pick(e, 'ExternalName', 'external_name')),
-    Enabled: Boolean(pick(e, 'Enabled', 'enabled')),
-    BoundInternalRef: str(pick(e, 'BoundInternalRef', 'bound_internal_ref')),
-    InternalModelHit: Boolean(pick(e, 'InternalModelHit', 'internal_model_hit')),
-  }))
+
+  // 供应商层：T1 给了就用 T1 的（Models / Stale / Accounts 三个计数）；没给就按 Items 的 ProviderRef 现算。
+  // 供应商身份的取值口径在两条路径上必须一致（`Provider` === `Items[].ProviderRef`），否则卡里会一行模型都挂不上。
+  const providersRaw = arr(pick(raw, 'Providers', 'providers'))
+  const providers: TopologyProvider[] = providersRaw.length
+    ? providersRaw
+        .map((p) => ({
+          Provider: str(pick(p, 'Provider', 'provider')),
+          Models: num(pick(p, 'Models', 'models')),
+          Stale: num(pick(p, 'Stale', 'stale')),
+          Accounts: num(pick(p, 'Accounts', 'accounts')),
+        }))
+        .filter((p) => p.Provider !== '')
+    : deriveProviders(items)
+
+  // 账号层：(Provider, Account) 就是唯一键，后端不给 ref。缺这个块就空着——账号没有镜像表，编不出来。
+  const accounts = arr(pick(raw, 'Accounts', 'accounts'))
+    .map((a): TopologyAccount => ({
+      Provider: str(pick(a, 'Provider', 'provider')),
+      Account: str(pick(a, 'Account', 'account')),
+      Subscribed: Boolean(pick(a, 'Subscribed', 'subscribed')),
+      LastSeenAt: str(pick(a, 'LastSeenAt', 'last_seen_at')),
+    }))
+    .filter((a) => a.Account !== '')
+
+  // 对外模型（售卖面）：绑定真源是 bound_internal_ref；空串 = 未绑定。
+  // T1 只给「绑定状态」，不给价格档（价格在模型编辑页），所以这里没有 PriceIn/PriceOut——不要凭空补 0。
+  const externals = arr(pick(raw, 'Externals', 'externals')).map(
+    (e): TopologyExternal => ({
+      ID: str(pick(e, 'ID', 'id')),
+      ExternalName: str(pick(e, 'ExternalName', 'external_name', 'Name', 'name')),
+      Enabled: pick(e, 'Enabled', 'enabled') === undefined ? true : Boolean(pick(e, 'Enabled', 'enabled')),
+      BoundInternalRef: str(pick(e, 'BoundInternalRef', 'bound_internal_ref')),
+      InternalModelHit: Boolean(pick(e, 'InternalModelHit', 'internal_model_hit')),
+    }),
+  )
+
+  // 计数以 T1 为准；T1 没给这一段（老响应）时才按 Items/Externals 现算。
+  // 用「字段在不在」判断而不是 `||`：后端真给 0 时不能被现算顶掉（0 条未绑定 ≠ 没这项）。
+  const staleCountRaw = pick(raw, 'StaleCount', 'stale_count')
+  const unboundRaw = pick(raw, 'UnboundExternal', 'unbound_external')
+
   return {
+    Items: items,
+    Links: links,
     Providers: providers,
     Accounts: accounts,
-    Items: items,
     Externals: externals,
-    Links: links,
-    StaleCount: num(pick(raw, 'StaleCount', 'stale_count')) || items.filter((i) => i.Stale).length,
-    UnboundExternal: num(pick(raw, 'UnboundExternal', 'unbound_external')),
+    StaleCount: staleCountRaw === undefined ? items.filter((i) => i.Stale).length : num(staleCountRaw),
+    UnboundExternal:
+      unboundRaw === undefined ? externals.filter((e) => !e.BoundInternalRef).length : num(unboundRaw),
     SyncedAt: str(pick(raw, 'SyncedAt', 'synced_at')),
     Sync: normalizeTopologySync(obj(pick(raw, 'Sync', 'sync'))),
   }
+}
+
+// deriveProviders：没有 T1 的 Providers 块时的降级聚合（只到「供应商 → 模型数 / 未见条数」，账号计数无从得知）。
+// 路由组**不参与**聚合：网关侧组是跨供应商的聚合层，后端对组恒给 `ProviderRef=''`
+// （backend/internal/domain/topology/source.go `parseGroups`），算进来就会凭空多一张空的「(未知)」供应商卡。
+function deriveProviders(items: InternalModel[]): TopologyProvider[] {
+  const map = new Map<string, TopologyProvider>()
+  for (const m of items) {
+    if (m.Kind === 'group') continue
+    const ref = m.ProviderRef || '(未知)'
+    const cur = map.get(ref) || { Provider: ref, Models: 0, Stale: 0, Accounts: 0 }
+    cur.Models += 1
+    if (m.Stale) cur.Stale += 1
+    map.set(ref, cur)
+  }
+  return [...map.values()].sort((a, b) => b.Models - a.Models)
 }
 
 // 页面取的是 T1（四层聚合：providers / internal models / bindings / 同步状态）；
@@ -546,12 +593,30 @@ export function saveTopologyLinks(items: Array<Pick<ModelLink, 'InternalRef' | '
   }))
 }
 
-// 手动同步（T3）：与后台定时同步共用实现，返回拉取数/新增/失效。
+// 手动同步（T3）：与后台定时同步共用实现，返回拉取数 / 新增 / 失效 + 业务结果 `State`。
+// ⚠️ 失败也回 **200**（业务结果而非客户端错误，见 backend/.../topology/handler.go `HandleSync`）：
+// 只按 HTTP 状态判断会把 `State=failed` 渲染成绿字「同步完成」= 假成功。所以 `State` 是必读字段。
+export type TopologySyncState = 'ok' | 'failed' | 'never' | ''
+
+export interface TopologySyncResult {
+  Fetched: number
+  Created: number
+  Stale: number
+  State: TopologySyncState
+  Message: string
+}
+
+function normalizeSyncState(v: unknown): TopologySyncState {
+  const st = str(v)
+  return st === 'ok' || st === 'failed' || st === 'never' ? st : ''
+}
+
 export function syncTopology() {
-  return v2Post('/admin/topology/sync', {}, (raw) => ({
+  return v2Post<TopologySyncResult>('/admin/topology/sync', {}, (raw) => ({
     Fetched: num(pick(raw, 'Fetched', 'fetched')),
     Created: num(pick(raw, 'Created', 'created')),
     Stale: num(pick(raw, 'Stale', 'stale')),
+    State: normalizeSyncState(pick(raw, 'State', 'state')),
     Message: str(pick(raw, 'Message', 'message')),
   }))
 }
