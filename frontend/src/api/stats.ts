@@ -142,6 +142,23 @@ export interface StatsKPI {
   DeltaTokens: number
   DeltaCredits: number
   DeltaRequests: number
+  // ===== 成本侧（P01 期望的 M1 改造：收入/成本/毛利率 + 成本来源四段）=====
+  // 事实：v2 阶段二后端**没有**给 /stats/dashboard 加这几个字段，只有 /admin/ops/pnl 有。
+  // 这里全部按可选建模：后端哪天补上就自动显示，没补就显示「成本侧未就绪 → 去盈亏页」，
+  // 前端不自行用 Credits 反推成本（那会把售价当成本，毛利全错）。
+  Revenue?: number | null
+  Cost?: number | null
+  Margin?: number | null
+  MarginPct?: number | null
+  LedgerCost?: number | null
+  AmortizedCost?: number | null
+  Uncosted?: number | null
+  CostSources?: {
+    Ledger?: number
+    Amortized?: number
+    None?: number
+    Unconfigured?: number
+  } | null
 }
 
 export interface StatsDashboard {

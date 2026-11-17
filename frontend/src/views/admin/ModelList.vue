@@ -289,7 +289,10 @@ async function onSyncPrices() {
         </el-table-column>
       </el-table>
 
-      <el-empty v-if="!loading && !displayList.length" description="暂无对外模型" />
+      <!-- 空态分两种人（Spec P03）：开发者端「暂无可用模型，请联系管理员」；管理端先去同步拓扑 -->
+      <el-empty v-if="!loading && !displayList.length" :description="isSelf ? '暂无可用模型，请联系管理员' : '还没有对外模型'">
+        <el-button v-if="!isSelf" @click="router.push('/admin/topology')">先去同步上游拓扑</el-button>
+      </el-empty>
       <ErrorBubble
         v-if="errInfo.message || errInfo.requestId"
         :message="errInfo.message"

@@ -16,10 +16,17 @@ import V2Page from '@/components/v2/V2Page.vue'
 import StatCards from '@/components/v2/StatCards.vue'
 import type { StatItem, V2Dep } from '@/components/v2/types'
 import { fmtCompact, fmtDateTime } from '@/utils/format'
+import { useRoute } from 'vue-router'
+
+const route = useRoute()
 
 const hours = ref(24)
-const filters = ref({ provider: '', account: '', model: '', ledgerId: '' })
+// `?ledger_id=…` 直达（P09 账单详情「账本条目」点过来就是这个）；有精确键时时间窗自动放大到 30 天，
+// 否则默认 24 小时会让「查一条三天前的账」永远查不到。
+const deepLedgerId = typeof route.query.ledger_id === 'string' ? route.query.ledger_id.trim() : ''
+const filters = ref({ provider: '', account: '', model: '', ledgerId: deepLedgerId })
 const dateRange = ref<[string, string] | null>(null)
+if (deepLedgerId) hours.value = 24 * 30
 
 function rangeParams() {
   if (dateRange.value && dateRange.value.length === 2) {

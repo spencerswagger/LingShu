@@ -107,6 +107,14 @@ const router = createRouter({
         { path: 'auto-models/:pathMatch(.*)*', redirect: '/dev/models' },
         // 会话页在 V2 下线（Spec §1.2）：老书签兜底到统计，菜单已摘除。
         { path: 'sessions/:pathMatch(.*)*', redirect: '/dev/dashboard' },
+        // 公告：开发者端**只读**一页（Spec P13 / A-5 —— 之前只有 api/dev.ts 的封装，
+        // 路由与入口都没有，导致「发布后开发端可见」在页面上不可达）。
+        {
+          path: 'announcements',
+          name: 'dev-announcements',
+          component: () => import('@/views/dev/AnnouncementList.vue'),
+          meta: { title: '公告' },
+        },
         {
           path: 'billings',
           name: 'dev-billings',

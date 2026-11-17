@@ -279,6 +279,8 @@ function copyBaseUrl() {
             </template>
           </el-input>
           <div class="plain-tip">密钥可随时反复查看/复制。如怀疑泄露，可轮换或删除后新建。</div>
+          <!-- Spec P11：查看密钥留审计（后端敏感读包装已记一条），页面明示 -->
+          <div class="plain-tip is-audit">本次查看已记入审计日志（操作人、令牌、时间）。</div>
         </template>
         <el-empty v-else-if="!secretLoading" description="该令牌未备份密钥，可轮换后查看新密钥" :image-size="60" />
       </div>
@@ -323,6 +325,9 @@ function copyBaseUrl() {
   font-size: 12px;
   color: var(--color-text-secondary);
   margin-top: 8px;
+}
+.plain-tip.is-audit {
+  color: var(--color-text-tertiary);
 }
 .form-tip {
   font-size: 12px;

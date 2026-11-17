@@ -68,9 +68,10 @@ const userName = ref('')
 
 const filters = reactive({
   user_id: (route.query.user_id ? String(route.query.user_id) : undefined) as string | undefined,
-  token_id: undefined as string | undefined,
-  model: undefined as string | undefined,
-  status: undefined as string | undefined,
+  // 下列各项同样从 URL 还原（G4：刷新/分享/后退结果一致）
+  token_id: (route.query.token_id ? String(route.query.token_id) : undefined) as string | undefined,
+  model: (route.query.model ? String(route.query.model) : undefined) as string | undefined,
+  status: (route.query.status ? String(route.query.status) : undefined) as string | undefined,
   // 请求链路 ID：调用方把网关错误体里的 request_id 贴进来，直接定位这一次请求
   request_id: (route.query.request_id ? String(route.query.request_id).trim() : undefined) as
     | string
@@ -78,8 +79,19 @@ const filters = reactive({
   range: null as [string, string] | null,
 })
 
-// URL 带 range（today|yesterday|month）时据此设置时间区间初值（Asia/Shanghai），首次 load 即生效
-filters.range = resolveBillingRange(route.query.range)
+// URL 带 range（today|yesterday|month）或 from/to（RFC3339）时据此设置时间区间初值
+// （Asia/Shanghai），首次 load 即生效。G4：筛选条件必须可还原——刷新 / 分享 / 后退结果一致。
+filters.range = rangeFromQuery(route.query)
+
+function rangeFromQuery(q: Record<string, unknown>): [string, string] | null {
+  const named = resolveBillingRange(q.range)
+  if (named) return named
+  // 自定义区间用 from/to 存 URL（分享一个时间窗不会因为「今天」变成明天就漂移）
+  if (typeof q.from === 'string' && typeof q.to === 'string' && q.from && q.to) {
+    return [q.from, q.to]
+  }
+  return null
+}
 
 // 前端筛选态键 → 后端 query 参数键（PascalCase 契约）
 const paramKeyMap: Record<string, string> = {
@@ -305,7 +317,42 @@ function clearTag(key: string) {
   }
 }
 
-// ===== 筛选变化自动刷新 =====
+// ===== G4：筛选条件写回 URL（刷新 / 分享 / 后退结果一致）=====
+// 只写「可还原」的六项；旧链接里的 channel_key_id / channel_id 等已下线参数一律不读不写
+// （不带进请求，后端不会因为旧参数报 400/500）。
+const QUERY_KEYS = ['user_id', 'token_id', 'model', 'status', 'request_id', 'from', 'to'] as const
+
+function desiredQuery(): Record<string, string> {
+  const q: Record<string, string> = {}
+  if (filters.user_id) q.user_id = filters.user_id
+  if (filters.token_id) q.token_id = filters.token_id
+  if (filters.model) q.model = filters.model
+  if (filters.status) q.status = filters.status
+  if (filters.request_id) q.request_id = filters.request_id
+  if (filters.range) {
+    q.from = filters.range[0]
+    q.to = filters.range[1]
+  }
+  return q
+}
+
+function currentQuery(): Record<string, string> {
+  const q: Record<string, string> = {}
+  for (const k of QUERY_KEYS) {
+    const v = route.query[k]
+    if (typeof v === 'string' && v) q[k] = v
+  }
+  return q
+}
+
+function syncQuery() {
+  const next = desiredQuery()
+  // 值相同就不写，避免「写 URL → 触发路由 watch → 再写」的抖动
+  if (JSON.stringify(next) === JSON.stringify(currentQuery())) return
+  void router.replace({ query: next })
+}
+
+// 筛选变化自动刷新
 watch(
   () => ({
     user_id: filters.user_id,
@@ -317,20 +364,23 @@ watch(
   }),
   () => {
     page.value = 1
+    syncQuery()
     load()
   },
 )
 watch(() => filters.user_id, loadTokensOfUser)
 
-// 同一页面内再次从用户面板跳转（URL query 变化）时同步筛选；上面的 filters watch 会自动刷新
+// 同一页面内再次从用户面板跳转（URL query 变化）时同步筛选；上面的 filters watch 会自动刷新。
+// 逐项**比过值再赋值**：否则把自己写回 URL 的动作当成「外部跳转」，会多打一次接口。
 watch(
-  () => [route.query.range, route.query.user_id, route.query.request_id],
-  ([r, u, rid]) => {
-    const rng = resolveBillingRange(r)
-    if (rng) filters.range = rng
-    filters.user_id = u ? String(u) : undefined
+  () => route.query,
+  (q) => {
+    const rng = rangeFromQuery(q)
+    if (JSON.stringify(rng) !== JSON.stringify(filters.range)) filters.range = rng
+    const nextUser = typeof q.user_id === 'string' && q.user_id ? q.user_id : undefined
+    if (nextUser !== filters.user_id) filters.user_id = nextUser
     // 从会话详情/调用详情点「在账单中定位」跳过来时，直接把 request_id 填进搜索框
-    const nextRid = rid ? String(rid).trim() : ''
+    const nextRid = typeof q.request_id === 'string' ? q.request_id.trim() : ''
     if (nextRid !== (filters.request_id || '')) {
       filters.request_id = nextRid || undefined
       requestIdInput.value = nextRid
@@ -751,8 +801,9 @@ function creditLines(row: AdminBillingItem): string[] {
           </template>
         </el-table-column>
 
-        <!-- V2 归因：渠道族在 0024 删除后，渠道/密钥维度由 upstream_provider/account 取代 -->
-        <el-table-column v-if="hasAttribution" label="归因 / 成本来源" min-width="180">
+        <!-- 归因 / 成本来源：成本侧字段（CostSource / UpstreamAccount）在开发者端属敏感键，
+             开发者端整列不渲染（Spec P08 负向断言：无 Cost / CostSource / UpstreamAccount）。 -->
+        <el-table-column v-if="hasAttribution && !isSelf" label="归因 / 成本来源" min-width="180">
           <template #default="{ row }">
             <div class="t-time">
               <span class="t-date">
@@ -761,7 +812,8 @@ function creditLines(row: AdminBillingItem): string[] {
                 </template>
                 <span v-else class="t-clock">未归因</span>
               </span>
-              <span class="t-clock"><StatusPill domain="costSource" :value="row.CostSource || 'none'" /></span>
+              <!-- 不加 `|| 'none'` 兜底：null（历史未知）与 none（明确无成本口径）是两种账务结论（Spec P08/G2） -->
+              <span class="t-clock"><StatusPill domain="costSource" :value="row.CostSource ?? ''" /></span>
             </div>
           </template>
         </el-table-column>
