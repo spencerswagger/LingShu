@@ -160,6 +160,81 @@ func TestLedgerStore_UpsertIdempotent_DuplicateNotCounted(t *testing.T) {
 	}
 }
 
+// TestLedgerStore_TruncateReplacesWholeLedger 是真实库用例：游标失效重放时「整段替换」的语义 ——
+// 同一事务里先 DELETE 全表再写入重放结果；回滚时旧账本原样保留（不能留下「清空了但没重放」的空账）。
+func TestLedgerStore_TruncateReplacesWholeLedger(t *testing.T) {
+	conn := openMigratedTempDB(t)
+	ctx := context.Background()
+	store := NewLedgerStore(conn)
+
+	stale := validEntry("u_session")
+	keep := validEntry("u_gateway")
+	keep.OccurredAt = stale.OccurredAt.Add(time.Second)
+	tx, err := store.Begin(ctx)
+	if err != nil {
+		t.Fatalf("开事务失败: %v", err)
+	}
+	if _, err := tx.Upsert(ctx, []LedgerEntry{stale, keep}); err != nil {
+		t.Fatalf("预置账本失败: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("提交失败: %v", err)
+	}
+
+	// 回滚路径：清空必须跟着事务一起回滚。
+	tx, err = store.Begin(ctx)
+	if err != nil {
+		t.Fatalf("开事务失败: %v", err)
+	}
+	if _, err := tx.Truncate(ctx); err != nil {
+		t.Fatalf("清空失败: %v", err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("回滚失败: %v", err)
+	}
+	if got := countLedgerRows(t, ctx, conn); got != 2 {
+		t.Fatalf("回滚后旧账本必须原样保留，got %d 条", got)
+	}
+
+	// 提交路径：清空 + 只写重放回来的那一行 → 代理侧已删除的旧 id 不再残留。
+	tx, err = store.Begin(ctx)
+	if err != nil {
+		t.Fatalf("开事务失败: %v", err)
+	}
+	removed, err := tx.Truncate(ctx)
+	if err != nil {
+		t.Fatalf("清空失败: %v", err)
+	}
+	if removed != 2 {
+		t.Fatalf("应报告清空 2 条，got %d", removed)
+	}
+	if _, err := tx.Upsert(ctx, []LedgerEntry{keep}); err != nil {
+		t.Fatalf("重放写入失败: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("提交失败: %v", err)
+	}
+	if got := countLedgerRows(t, ctx, conn); got != 1 {
+		t.Fatalf("整段替换后应只剩重放回来的 1 条，got %d", got)
+	}
+	var left string
+	if err := conn.QueryRowContext(ctx, fmt.Sprintf(`SELECT ledger_id FROM %s`, LedgerTable)).Scan(&left); err != nil {
+		t.Fatalf("读取剩余行失败: %v", err)
+	}
+	if left != keep.LedgerID {
+		t.Fatalf("残留的应是重放回来的 %s，got %s", keep.LedgerID, left)
+	}
+}
+
+func countLedgerRows(t *testing.T, ctx context.Context, conn *sql.DB) int {
+	t.Helper()
+	var n int
+	if err := conn.QueryRowContext(ctx, fmt.Sprintf(`SELECT count(*) FROM %s`, LedgerTable)).Scan(&n); err != nil {
+		t.Fatalf("统计账本行数失败: %v", err)
+	}
+	return n
+}
+
 // TestLedgerStore_UnassembledDB 断言未装配数据库时返回错误而不是 panic。
 func TestLedgerStore_UnassembledDB(t *testing.T) {
 	store := NewLedgerStore((*sql.DB)(nil))

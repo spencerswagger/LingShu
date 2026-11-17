@@ -66,20 +66,31 @@ func TestDecide_Cases(t *testing.T) {
 		wantStreak int16
 	}{
 		{
-			name: "完全对上", local: Agg{Count: 10, Tokens: 1000}, up: Agg{Count: 10, Tokens: 1000},
+			name: "完全对上", local: Agg{Count: 10, Tokens: 100000}, up: Agg{Count: 10, Tokens: 100000},
 			ledgerOn: true, wantStatus: upstream.WindowOK, wantStreak: 0,
 		},
 		{
-			name: "偏差 5% 超阈", local: Agg{Count: 10, Tokens: 1050}, up: Agg{Count: 10, Tokens: 1000},
+			name: "偏差 5% 超阈", local: Agg{Count: 10, Tokens: 105000}, up: Agg{Count: 10, Tokens: 100000},
 			prevStreak: 1, ledgerOn: true, wantStatus: upstream.WindowAlarm, wantStreak: 2,
 		},
 		{
-			name: "偏差 0.5% 在阈值内", local: Agg{Count: 10, Tokens: 1005}, up: Agg{Count: 10, Tokens: 1000},
+			name: "偏差 0.5% 在阈值内", local: Agg{Count: 10, Tokens: 100500}, up: Agg{Count: 10, Tokens: 100000},
 			ledgerOn: true, wantStatus: upstream.WindowOK, wantStreak: 0,
 		},
 		{
 			// 账本侧 0 token（本窗没有账本条目）不是「对上」：分母按 1 算，任何灵枢 token 都会超阈。
-			name: "账本侧为空", local: Agg{Count: 3, Tokens: 300}, up: Agg{},
+			name: "账本侧为空", local: Agg{Count: 3, Tokens: 30000}, up: Agg{},
+			ledgerOn: true, wantStatus: upstream.WindowAlarm, wantStreak: 1,
+		},
+		{
+			// 小样本门槛：440 vs 200 差 120%，但量级只有几百个 token —— 估算/取整必然超 1%，
+			// 这种窗口告警等于噪声（Owl 实测开缓存的租户每窗必红就是这么来的）。
+			name: "小样本不告警", local: Agg{Count: 2, Tokens: 440}, up: Agg{Count: 2, Tokens: 200},
+			prevStreak: 2, ledgerOn: true, wantStatus: upstream.WindowOK, wantStreak: 0,
+		},
+		{
+			// 门槛只看两侧较大者：本地有量、账本整段缺失必须告出来（不能被 up=0 挡在门槛外）。
+			name: "账本整段缺失且本地有量", local: Agg{Count: 9, Tokens: 1200}, up: Agg{},
 			ledgerOn: true, wantStatus: upstream.WindowAlarm, wantStreak: 1,
 		},
 		{
@@ -99,6 +110,40 @@ func TestDecide_Cases(t *testing.T) {
 				t.Fatalf("detail 应带灵枢侧 token：%+v", detail)
 			}
 		})
+	}
+}
+
+// TestDecide_MinTokenThreshold 锁定「最小 token 门槛」：门槛以下无论偏差多大都不告警（连击归零、
+// detail 标注 below_min_tokens），门槛之上照旧按偏差率判定。
+func TestDecide_MinTokenThreshold(t *testing.T) {
+	// 门槛以下：本地有量、账本一条没有（偏差 100%），也不许告警。
+	status, streak, detail := decide(
+		Agg{Count: 2, Tokens: MinAlarmTokens - 1}, Agg{}, 2, true, DefaultTolerance)
+	if status != upstream.WindowOK || streak != 0 {
+		t.Fatalf("门槛以下不该告警：status=%s streak=%d", status, streak)
+	}
+	if detail["below_min_tokens"] != true {
+		t.Fatalf("门槛以下必须在 detail 标注 below_min_tokens：%+v", detail)
+	}
+	if detail["min_tokens"] != MinAlarmTokens {
+		t.Fatalf("detail 必须带门槛值（排障要知道为什么没告警）：%+v", detail)
+	}
+
+	// 门槛之上 0.5%：不告警。
+	at := int64(MinAlarmTokens)
+	up := at - at/200
+	status, _, detail = decide(Agg{Tokens: at}, Agg{Tokens: up}, 0, true, DefaultTolerance)
+	if status != upstream.WindowOK {
+		t.Fatalf("门槛之上 0.5%% 应 ok，got %s（detail=%+v）", status, detail)
+	}
+	if _, ok := detail["below_min_tokens"]; ok {
+		t.Fatalf("门槛之上不该标 below_min_tokens：%+v", detail)
+	}
+
+	// 门槛之上 5%：告警。
+	status, _, _ = decide(Agg{Tokens: at + at/20}, Agg{Tokens: at}, 0, true, DefaultTolerance)
+	if status != upstream.WindowAlarm {
+		t.Fatalf("门槛之上 5%% 应告警，got %s", status)
 	}
 }
 

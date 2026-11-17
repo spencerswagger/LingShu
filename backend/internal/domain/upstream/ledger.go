@@ -45,7 +45,12 @@ type LedgerEntry struct {
 	ProviderAccount string
 	// Model 是上游模型名；缺失为空串。
 	Model string
-	// TokensIn / TokensOut 是上游口径的输入/输出 token 数。
+	// TokensIn / TokensOut 是**提示词侧总量 / 输出**。
+	//
+	// TokensIn 不是代理侧的 `in` 原值，而是 `in + cache_read + cache_write`（缓存并入输入侧）：
+	// 灵枢 billing_records 的三段口径是纯输入（含 cache_write）+ cache_read + output，
+	// 只有把缓存并进 tokens_in，`tokens_in + tokens_out` 才与 `billing.TokenSumExpr` 同口径
+	// （代理侧 `in` 不含缓存）。适配层的合并点见 magpie_ledger.go 的 mapMagpieFeedRow。
 	TokensIn  int64
 	TokensOut int64
 	// CostCredits 是上游口径的成本积分（NUMERIC(20,5)）。
@@ -79,6 +84,14 @@ type LedgerTx interface {
 	// Delete 按代理侧 deleted 列表删除账本 id（行被合并/清除时必须同步删除，否则重复计数）。
 	// 返回实际删除条数。
 	Delete(ctx context.Context, ledgerIDs []string) (int, error)
+	// Truncate 清空本地账本（返回删除条数）。
+	//
+	// 只在**游标失效重放**时用：代理侧 `cursor=start` 返回的是「账本现在的样子」，且明确
+	// 「不给 deleted 列表」（docs/reference.md：Reading with `cursor=start` lists the ledger as
+	// it is and no deleted ids）。只 upsert 的话，代理侧已经删掉/合并掉的旧 id 会永久留在本地，
+	// 与重放出来的新 id 并存 → 同一通调用被计两次（实测 u_session 与 u_gateway 并存）。
+	// 所以 reset 语义是「整段替换」：同一个事务里先 Truncate 再 Upsert。
+	Truncate(ctx context.Context) (int64, error)
 	Commit() error
 	Rollback() error
 	// Execer 返回事务执行器：窗口行必须与账本同事务写（契约 §6.2），
@@ -228,6 +241,22 @@ func (t *ledgerTx) Delete(ctx context.Context, ledgerIDs []string) (int, error) 
 		deleted += int(n)
 	}
 	return deleted, nil
+}
+
+// Truncate 清空本地账本（游标失效重放时用，见 LedgerTx.Truncate 的说明）。
+//
+// 与 Upsert 同事务：先删后写要么都生效、要么都不生效 —— 中途失败时旧账本原样保留，
+// 不会留下「清空了但没重放」的空账（那会让对账把整段流量当成年账本侧缺失）。
+func (t *ledgerTx) Truncate(ctx context.Context) (int64, error) {
+	res, err := t.tx.ExecContext(ctx, `DELETE FROM `+LedgerTable)
+	if err != nil {
+		return 0, fmt.Errorf("清空本地账本失败：%w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("读取清空账本行数失败：%w", err)
+	}
+	return n, nil
 }
 
 // Commit 提交整轮账本写入。

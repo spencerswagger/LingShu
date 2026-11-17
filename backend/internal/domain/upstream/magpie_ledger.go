@@ -6,6 +6,10 @@
 //   - 字段名：行数组是 `rows`（不是 items/data/requests/list）；时间 `t`；token `in`/`out`；
 //     订阅账号 `providerAccount`（camelCase；`callerKeyName` 是网关调用方 key，不是账号）；
 //     成本 `cost`（USD，`priced=false` 时无意义）；模型 `model`。
+//   - token 口径：`in` 是**未缓存输入**，缓存读/写是独立字段 `cache_read`/`cache_write`
+//     （代理侧 docs/reference.md：tokens counted are a call's uncached input, output and
+//     cache writes, plus cache reads）。灵枢账单侧是「input（含 cache_write）+ cache_read + output」，
+//     所以账本侧必须把缓存并进 `tokens_in`，否则两侧合计永远不等（见 mapMagpieFeedRow）。
 //   - 排序：offset 账本是**最新在前**（newest first），不是 `occurred_at ASC`。
 //     cursor feed 是「按 seq 的变更流」，本身不承诺业务时间序。
 //   - 幂等键：`id`（u_…）是代理侧自己的行 id，跨读取/重启不变；`original_ids.request_id`
@@ -328,6 +332,12 @@ func mapMagpieFeedRow(row magpieFeedRow, convert CostConverter) (LedgerEntry, bo
 	if row.Out < 0 {
 		row.Out = 0
 	}
+	if row.CacheRead < 0 {
+		row.CacheRead = 0
+	}
+	if row.CacheWrite < 0 {
+		row.CacheWrite = 0
+	}
 
 	cost := 0.0
 	if row.Priced {
@@ -353,12 +363,21 @@ func mapMagpieFeedRow(row magpieFeedRow, convert CostConverter) (LedgerEntry, bo
 		// 代理侧的 served 是上游回包自报的模型 id；仅在 model 缺失时兜底（不覆盖正常值）。
 		model = strings.TrimSpace(row.Served)
 	}
+	// tokens_in 存**提示词侧总量** = in + cache_read + cache_write。
+	//
+	// 为什么合并而不是原样搬 `in`：灵枢 billing_records 的三段口径是「纯输入（含 cache_write）
+	// + cache_read + output」，对账/结算都按 `billing.TokenSumExpr` 求和。代理侧的 `in`
+	// **不含**缓存（缓存读/写是独立字段），原样搬会让账本侧恒小于本地（真库实测 10200 vs 20440），
+	// 对账每窗误判 alarm。合并后两侧合计同口径，且账本表仍是九字段（不新增缓存列）。
+	// `cache_write_1h` 是 `cache_write` 按 TTL 的**拆分**（子集），不能重复相加；
+	// `reasoning` 已经包含在 `out` 里，也不再另加。
+	promptTokens := row.In + row.CacheRead + row.CacheWrite
 	return LedgerEntry{
 		LedgerID:        id,
 		Provider:        strings.TrimSpace(row.Provider),
 		ProviderAccount: strings.TrimSpace(row.ProviderAccount),
 		Model:           model,
-		TokensIn:        row.In,
+		TokensIn:        promptTokens,
 		TokensOut:       row.Out,
 		CostCredits:     decimalx.Round5(cost),
 		OccurredAt:      occurred,

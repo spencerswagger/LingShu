@@ -42,8 +42,17 @@
 - `cursor=start`：从头读；`cursor=now`：只取此刻之后；
 - 同一 `id` 以更高 `seq` 再次出现 = 这一行被改过 → **覆盖**（SQL `ON CONFLICT (ledger_id) DO UPDATE`）；
 - `deleted` 里的 id **必须从本地删除**（行被合并/清除，不删会重复计数）；
-- `410 cursor_expired/cursor_reset`、`400 cursor_invalid/cursor_filter_changed` → 从 `start` **全量重放一次**；
-  重放仍失败就报错（不死循环）；重放是幂等的（按 id upsert + deleted），不会重复计账；
+- `410 cursor_expired/cursor_reset`、`400 cursor_invalid/cursor_filter_changed` → 从 `start` **重放一次**，
+  语义是**整段替换**而不是「只 upsert」：代理侧 `cursor=start` 明确「不给 deleted 列表」
+  （`Reading with cursor=start lists the ledger as it is and no deleted ids`），只 upsert 会让
+  代理侧已经删掉/合并掉的旧 id 永久留在本地，与重放出来的新 id 并存 → 同一通调用被计两次
+  （实测 `u_session` 与 `u_gateway` 并存）。实现：重放第一页的事务里先 `Truncate` 再 `Upsert`
+  （清空与第一页同事务，失败整页回滚、旧账本原样保留）；重放跨轮时只清空一次；
+  重放仍失败就报错（不死循环）；
+  **已知边界**：重放跨轮期间本地账本是「部分重建」状态（最旧的先回来，最近的最后回来），
+  这段窗口里对账可能看到账本侧偏少而告警；`alarm_streak` 要到 3 才升级，重放完成后
+  下一轮对账会把该窗重算成 ok。`billing_records.ledger_entry_id` 是文本留痕，
+  账本行被代理侧删掉时不会级联删除（也不该级联）。
 - `has_more=true` 但没有 `next_cursor` → 显式报错（否则原地死循环）；
 - `limit` 夹到 500；`rows` 缺失 → 显式报错（不许静默 0 行，那正是 F9 要防的「空轮假绿」）。
 
@@ -55,7 +64,7 @@
 | `provider` | `provider` | |
 | `provider_account` | **`providerAccount`** | camelCase；**不是** `callerKeyName`（那是网关调用方 key） |
 | `model` | `model` | 缺失才回落 `served`（上游自报模型） |
-| `tokens_in` | **`in`** | 不是 `input_tokens` |
+| `tokens_in` | **`in` + `cache_read` + `cache_write`** | 提示词侧总量。代理侧 `in` 是「未缓存输入」，缓存读/写是独立字段；灵枢账单侧是 `input（含 cache_write）+ cache_read + output`，只有并进来两侧合计才同口径（见 §1.3.1）。`cache_write_1h` 是 `cache_write` 的 TTL 拆分（子集），不重复加；`reasoning` 已含在 `out` 里 |
 | `tokens_out` | **`out`** | 不是 `output_tokens` |
 | `occurred_at` | **`t`** | RFC3339（可带纳秒/时区偏移）；缺失或解析失败的行**跳过**（不许 now() 兜底） |
 | `cost_credits` | `cost`（USD，仅 `priced=true`） | 走注入的换算函数，见 §1.4 |
@@ -72,6 +81,24 @@
 token 仍会计入代理侧总计。灵枢账本按「一条请求一行」使用，因此跳过 handed_on 行（避免笔数虚高）；
 若代理侧的最终行没有合并这次尝试的 token，账本成本会略低。要精确到尝试级需要给 `ledger_entries`
 加 `attempt` 维度，属后续裁定。
+
+### 1.3.1 token 口径（两侧必须同源，2026-11-17 复审修正）
+
+代理侧一行有四个 token 字段：`in`（**未缓存**输入）、`out`、`cache_read`、`cache_write`
+（`cache_write_1h` 是 `cache_write` 按 TTL 的拆分，子集）。灵枢账单侧是三段互斥口径：
+`input`（含 Anthropic 的 cache creation，即 cache write）+ `cache_read` + `output`，
+合计的唯一实现是 `billing.TokenSumExpr`。
+
+所以账本侧的合计必须是 `in + cache_read + cache_write + out`。`ledger_entries` 本期仍是九字段
+（不加缓存列），因此在适配层把 `cache_read + cache_write` 并进 `tokens_in`（提示词侧总量），
+`tokens_in + tokens_out` 即与 `TokenSumExpr` 同口径 —— 对账（`reconcile`）与账本结算
+（`ledgersettle` 的 `TokenDelta`）都读这一处，改一处两边同时对齐。
+
+配套改动：对账 `alarm` 增加**最小 token 门槛** `reconcile.MinAlarmTokens = 1000`
+（两侧较大者低于它不告警，detail 记 `below_min_tokens`）。理由：窗口只有几十到几百 token 时，
+1% 只有零点几个 token，「无 usage 走估算」与取整噪声必然超阈；门槛只看两侧较大者，
+所以「本地有量、账本整段缺失」照样告警。本期清空/上量的边界：V2 还没上线，历史行不存在回填问题；
+已写入的账本行会在该 id 下次以更高 `seq` 出现时被覆盖成新口径。
 
 ### 1.4 成本单位（必须显式声明）
 
@@ -161,6 +188,12 @@ token 仍会计入代理侧总计。灵枢账本按「一条请求一行」使�
 ## 3. 验证
 
 - 无 DSN：`go test ./...` 全绿（真库用例按惯例 skip，skip ≠ 通过）。
+- 复审两条修正的锚点用例（都不需要 DSN）：
+  - `TestParseMagpieFeed_PromptSideTokensIncludeCache`（tokens_in = in + cache_read + cache_write，
+    `cache_write_1h` 不重复加、`reasoning` 不另加）；
+  - `TestDecide_MinTokenThreshold`（门槛以下不告警且 detail 标注；门槛之上照旧按 1% 判定）；
+  - `TestRounder_CursorFeed_CursorResetReplacesLocalLedger`（410 后旧 id 不残留、`Replaced` 可观测）、
+    `TestRounder_CursorFeed_ResetTruncatesEvenOnEmptyFirstPage`（空首屏也要清空）。
 - 带 DSN（自建 PG17 + 真实迁移链到 0025）：
   - `internal/db`（含 `TestMigrate_0025_BillingUpstreamError`：值域/两列/幂等/非法状态被拒）；
   - `internal/domain/upstream`（含 `TestSQLWindowStore_LedgerCursorRoundTrip`：游标跨重启、清 blocked）；

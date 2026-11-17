@@ -143,8 +143,10 @@ func TestMagpieLedgerSource_FetchFeed_RealSample(t *testing.T) {
 	if e.Provider != "anthropic" || e.ProviderAccount != "alice@example.com" {
 		t.Fatalf("维度映射错误：provider=%q account=%q（不能用 callerKeyName）", e.Provider, e.ProviderAccount)
 	}
-	if e.Model != "claude-sonnet-4-20250514" || e.TokensIn != 1200 || e.TokensOut != 345 {
-		t.Fatalf("模型/token 映射错误：%+v", e)
+	if e.Model != "claude-sonnet-4-20250514" || e.TokensIn != 2000 || e.TokensOut != 345 {
+		// TokensIn = in(1200) + cache_read(800) + cache_write(0)：代理侧 `in` 不含缓存，
+		// 灵枢账单侧合计是 input+cache_read+output，不并进来两侧永远不相等（Owl 实测 10200 vs 20440）。
+		t.Fatalf("模型/token 映射错误：%+v（tokens_in 应为 提示词侧总量 = in + cache_read + cache_write）", e)
 	}
 	if e.CostCredits != 0.42 {
 		t.Fatalf("cost 应经换算（0.0042×100=0.42），实际 %v", e.CostCredits)
@@ -280,7 +282,7 @@ func TestMagpieLedgerSource_ConversionErrorSurfaces(t *testing.T) {
 func TestParseMagpieFeed_Defaults(t *testing.T) {
 	payload := `{"rows":[{"id":"u_1","t":"2026-11-17T10:00:00Z",
 		"provider":"openai","model":"","served":"gpt-4o-served","callerKeyName":"tenant-key",
-		"in":-5,"out":-1,"priced":false}],"has_more":false}`
+		"in":-5,"out":-1,"cache_read":-7,"cache_write":-3,"priced":false}],"has_more":false}`
 	page, err := parseMagpieFeed([]byte(payload), nil)
 	if err != nil {
 		t.Fatalf("parse: %v", err)
@@ -293,7 +295,33 @@ func TestParseMagpieFeed_Defaults(t *testing.T) {
 		t.Fatalf("providerAccount 缺失应为空，实际 %q（不能用 callerKeyName 兜底）", e.ProviderAccount)
 	}
 	if e.TokensIn != 0 || e.TokensOut != 0 {
-		t.Fatalf("负 token 应夹到 0，实际 in=%d out=%d", e.TokensIn, e.TokensOut)
+		t.Fatalf("负 token 应夹到 0（in/out/cache_read/cache_write 各自夹），实际 in=%d out=%d", e.TokensIn, e.TokensOut)
+	}
+}
+
+// TestParseMagpieFeed_PromptSideTokensIncludeCache 锁定 token 口径：
+// tokens_in = in + cache_read + cache_write（代理侧 `in` 是未缓存输入；cache_write_1h 是
+// cache_write 的 TTL 拆分，子集，不能重复加），否则对账/结算两侧合计不同口径。
+func TestParseMagpieFeed_PromptSideTokensIncludeCache(t *testing.T) {
+	payload := `{"rows":[
+		{"id":"u_cache","t":"2026-11-17T10:00:00Z","provider":"anthropic",
+		 "providerAccount":"acct","model":"claude-sonnet-4",
+		 "in":1200,"out":340,"cache_read":9000,"cache_write":600,"cache_write_1h":400,
+		 "reasoning":120,"priced":false}],"has_more":false}`
+	page, err := parseMagpieFeed([]byte(payload), nil)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(page.Entries) != 1 {
+		t.Fatalf("应解析 1 条，实际 %d", len(page.Entries))
+	}
+	e := page.Entries[0]
+	if want := int64(1200 + 9000 + 600); e.TokensIn != want {
+		t.Fatalf("tokens_in = %d，期望 %d（in + cache_read + cache_write；cache_write_1h 不重复加）",
+			e.TokensIn, want)
+	}
+	if e.TokensOut != 340 {
+		t.Fatalf("tokens_out = %d，期望 340（reasoning 已含在 out 里，不再另加）", e.TokensOut)
 	}
 }
 

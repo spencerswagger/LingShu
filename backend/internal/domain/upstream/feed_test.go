@@ -171,6 +171,82 @@ func TestRounder_CursorFeed_CursorResetTwiceFails(t *testing.T) {
 	}
 }
 
+// TestRounder_CursorFeed_CursorResetReplacesLocalLedger 断言 410 之后的语义是「整段替换」而不是
+// 「只 upsert」：代理侧的 cursor=start **不返回 deleted 列表**，所以本地那些代理侧已经删掉/合并掉的
+// 旧 id 只能靠 reset 时清空来去掉。只 upsert 的旧实现会让 u_session 与 u_gateway 并存 → 同一通调用
+// 被计两次（对账每窗虚高、实际漏账看不见）。
+func TestRounder_CursorFeed_CursorResetReplacesLocalLedger(t *testing.T) {
+	now := time.Date(2026, 11, 17, 12, 7, 30, 0, time.UTC)
+	store := NewMemoryWindowStore()
+	base := now.Add(-2 * time.Minute).Truncate(WindowSize)
+	if err := store.Save(context.Background(), WindowRecord{
+		Start: base, End: base.Add(WindowSize), Status: WindowOK, RecordedAt: base.Add(WindowSize),
+		LedgerCursor: "old",
+	}); err != nil {
+		t.Fatalf("预置游标失败: %v", err)
+	}
+	led := newFakeLedger()
+	// 本地存量：一条是代理侧已合并掉的 u_session（start 不会再有它），一条是重放也会给的新 id。
+	led.rows["u_session"] = feedEntry("u_session")
+	led.rows["u_gateway"] = feedEntry("u_gateway")
+
+	feed := &fakeFeed{
+		errs: map[int]error{0: &MagpieCursorError{StatusCode: 410, Code: "cursor_reset"}},
+		pages: []FeedPage{{
+			Entries:    []LedgerEntry{feedEntry("u_gateway")},
+			NextCursor: "c-new", HasMore: false,
+		}},
+	}
+	r := feedTestRounder(feed, led, store, now)
+
+	res, err := r.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if res.Replaced != 2 {
+		t.Fatalf("应报告清空了 2 条本地账本，实际 %d", res.Replaced)
+	}
+	if led.truncates != 1 {
+		t.Fatalf("reset 必须做且只做一次整段替换，实际 %d 次", led.truncates)
+	}
+	led.mu.Lock()
+	defer led.mu.Unlock()
+	if _, exists := led.rows["u_session"]; exists {
+		t.Fatalf("重放后本地不许残留代理侧已删除的旧 id（u_session）")
+	}
+	if len(led.rows) != 1 {
+		t.Fatalf("本地账本应只剩重放回来的 1 条，实际 %d 条：%+v", len(led.rows), led.rows)
+	}
+}
+
+// TestRounder_CursorFeed_ResetTruncatesEvenOnEmptyFirstPage 断言重放第一页为空也要执行清空：
+// 代理侧账本已经空了（或这一页恰好没有行），不清空就等于「旧 id 永久残留」。
+func TestRounder_CursorFeed_ResetTruncatesEvenOnEmptyFirstPage(t *testing.T) {
+	now := time.Date(2026, 11, 17, 12, 8, 30, 0, time.UTC)
+	store := NewMemoryWindowStore()
+	base := now.Add(-2 * time.Minute).Truncate(WindowSize)
+	if err := store.Save(context.Background(), WindowRecord{
+		Start: base, End: base.Add(WindowSize), Status: WindowOK, RecordedAt: base.Add(WindowSize),
+		LedgerCursor: "old",
+	}); err != nil {
+		t.Fatalf("预置游标失败: %v", err)
+	}
+	led := newFakeLedger()
+	led.rows["u_stale"] = feedEntry("u_stale")
+
+	feed := &fakeFeed{
+		errs:  map[int]error{0: &MagpieCursorError{StatusCode: 410, Code: "cursor_reset"}},
+		pages: []FeedPage{{Entries: nil, NextCursor: "", HasMore: false}},
+	}
+	r := feedTestRounder(feed, led, store, now)
+	if _, err := r.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if led.count() != 0 {
+		t.Fatalf("代理侧账本为空时本地必须被清空，实际还剩 %d 条", led.count())
+	}
+}
+
 // TestRounder_CursorFeed_DeletesRows 断言代理侧 deleted 列表真的删本地账本
 // （不删就会把已合并/清除的行继续计入对账）。
 func TestRounder_CursorFeed_DeletesRows(t *testing.T) {

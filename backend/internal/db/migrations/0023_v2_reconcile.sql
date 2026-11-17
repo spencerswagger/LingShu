@@ -6,7 +6,10 @@
 -- 比金额必然误报。笔数不一致写进 detail，不单独告警；告警只看 token 偏差。
 --   灵枢侧合计 = billing_records.tokens 三段（input + cache_read + output）
 --   账本侧合计 = ledger_entries.tokens_in + tokens_out
---   这样绕开「账本的 tokens_in 含不含缓存读」的口径未知问题（求和不受该差异影响）。
+--   两列同口径：代理侧的 `in` 是「未缓存输入」，缓存读/写是独立字段，所以适配层把
+--   cache_read + cache_write 并进 tokens_in（提示词侧总量）。早期注释假设「tokens_in 含不含缓存读
+--   未知、求和不受影响」是错的 —— 不并进来账本侧恒小于本地（真库实测 10200 vs 20440），
+--   开缓存的租户每窗误判 alarm。详见 upstream/magpie_ledger.go 的 mapMagpieFeedRow。
 --
 -- ── 四个计数列的写入方（D4 裁定，唯一）──────────────────────────────────
 --   local_count / upstream_count / local_tokens / upstream_tokens **由对账服务在每窗结束时

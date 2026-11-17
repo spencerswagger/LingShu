@@ -48,11 +48,12 @@ func (f *fakePageSource) FetchPage(_ context.Context, w Window, offset, limit in
 // fakeLedger 是内存账本：把「同一事务内多页写入 + 幂等键去重 + 提交/回滚」的语义模拟出来，
 // 让 Rounder 的行为（尤其 blocked 回滚）可断言。
 type fakeLedger struct {
-	mu       sync.Mutex
-	rows     map[string]LedgerEntry
-	commits  int
-	rolls    int
-	upserted int
+	mu        sync.Mutex
+	rows      map[string]LedgerEntry
+	commits   int
+	rolls     int
+	upserted  int
+	truncates int
 }
 
 func newFakeLedger() *fakeLedger {
@@ -67,6 +68,18 @@ type fakeTx struct {
 	store   *fakeLedger
 	pending map[string]LedgerEntry
 	deleted map[string]struct{}
+	// truncated 表示本事务要求「先清空再写」（游标失效重放的整段替换）：提交时清空内存账本。
+	truncated bool
+}
+
+// Truncate 模拟 `DELETE FROM ledger_entries`：标记本事务整段替换，提交时清空存量。
+func (t *fakeTx) Truncate(context.Context) (int64, error) {
+	t.store.mu.Lock()
+	defer t.store.mu.Unlock()
+	t.truncated = true
+	t.pending = map[string]LedgerEntry{}
+	t.deleted = map[string]struct{}{}
+	return int64(len(t.store.rows)), nil
 }
 
 func (t *fakeTx) Upsert(_ context.Context, entries []LedgerEntry) (int, error) {
@@ -108,6 +121,10 @@ func (t *fakeTx) Delete(_ context.Context, ids []string) (int, error) {
 func (t *fakeTx) Commit() error {
 	t.store.mu.Lock()
 	defer t.store.mu.Unlock()
+	if t.truncated {
+		t.store.rows = map[string]LedgerEntry{}
+		t.store.truncates++
+	}
 	for k := range t.deleted {
 		delete(t.store.rows, k)
 	}

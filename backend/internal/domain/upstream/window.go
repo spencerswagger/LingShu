@@ -209,7 +209,8 @@ type WindowCounts struct {
 	// LocalCount / LocalTokens 是灵枢侧（billing_records）的笔数与三段 token 合计。
 	LocalCount  int64
 	LocalTokens int64
-	// UpstreamCount / UpstreamTokens 是账本侧（ledger_entries）的笔数与 in+out 合计。
+	// UpstreamCount / UpstreamTokens 是账本侧（ledger_entries）的笔数与 tokens_in+tokens_out 合计
+	// （tokens_in 已含 cache_read/cache_write，与本地三段合计同口径）。
 	UpstreamCount  int64
 	UpstreamTokens int64
 	// Status 是判定结果：ok / alarm / skipped（blocked / error 由同步轮次持有，对账不得覆盖）。
@@ -437,6 +438,11 @@ type RoundResult struct {
 	ResumeOffset int64
 	// Cursor 是 cursor feed 模式本轮的续读游标（空 = 未使用 feed 模式）。
 	Cursor string
+	// Replaced 是「游标失效重放」时清掉的本地账本条数（0 = 本轮没发生整段替换）。
+	//
+	// 这个数字必须可观测：一次 410 会把本地账本清空再按代理侧重建，运营/排障要能从日志与
+	// 返回值里看出「哪一轮把账本换了」，而不是只看到一下少了多少行。
+	Replaced int64
 	// Empty 表示本轮**一条都没拉到**（Fetched == Inserted == 0）。
 	//
 	// 这个字段存在的理由：以前「空轮」与「正常轮」返回值完全一样（0 行 + nil），
@@ -827,6 +833,9 @@ func (r *Rounder) runFeedOnce(ctx context.Context) (RoundResult, error) {
 	result.Cursor = cursor
 
 	resetUsed := false
+	// replacing 表示「本次 reset 的整段替换还没做」：重放的第一页提交时先清空本地账本，
+	// 之后各页只 upsert（重放可能跨轮，清空只能发生一次，否则会把已重放的页一起删掉）。
+	replacing := false
 	for {
 		page, ferr := r.feed.FetchFeed(ctx, cursor, r.pageSize)
 		if ferr != nil {
@@ -837,8 +846,10 @@ func (r *Rounder) runFeedOnce(ctx context.Context) (RoundResult, error) {
 					return result, fmt.Errorf("代理侧账本游标反复失效（已从 start 重放一次仍失败）：%w", ferr)
 				}
 				resetUsed = true
-				log.Warn("代理侧账本游标失效，从 start 全量重放（按 id 幂等，不会重复计账）",
-					"err", ferr.Error(), "old_cursor", cursor)
+				replacing = true
+				log.Warn("代理侧账本游标失效，从 start 重放并整段替换本地账本",
+					"err", ferr.Error(), "old_cursor", cursor,
+					"why", "cursor=start 不返回 deleted 列表，只 upsert 会让已删除/合并的旧 id 永久残留并双计")
 				cursor = MagpieCursorStart
 				result.Cursor = cursor
 				continue
@@ -852,7 +863,7 @@ func (r *Rounder) runFeedOnce(ctx context.Context) (RoundResult, error) {
 				"skipped", page.Skipped, "cursor", cursor)
 		}
 
-		if len(page.Entries) > 0 || len(page.Deleted) > 0 {
+		if len(page.Entries) > 0 || len(page.Deleted) > 0 || replacing {
 			nextCursor := strings.TrimSpace(page.NextCursor)
 			if nextCursor == "" {
 				// 空 cursor 写进去会把断点抹成「从头开始」，下一轮重放整本账。
@@ -863,6 +874,17 @@ func (r *Rounder) runFeedOnce(ctx context.Context) (RoundResult, error) {
 			if terr != nil {
 				r.saveStatus(ctx, &result, WindowError, terr.Error(), 0, scanStart)
 				return result, terr
+			}
+			if replacing {
+				removed, rerr := tx.Truncate(ctx)
+				if rerr != nil {
+					_ = tx.Rollback()
+					r.saveStatus(ctx, &result, WindowError, rerr.Error(), 0, scanStart)
+					return result, fmt.Errorf("游标失效重放：清空本地账本失败（本页未写）：%w", rerr)
+				}
+				result.Replaced = removed
+				log.Warn("游标失效重放：本地账本已整段清空，按重放结果重建",
+					"removed", removed, "cursor", cursor)
 			}
 			n, uerr := tx.Upsert(ctx, page.Entries)
 			if uerr != nil {
@@ -895,6 +917,8 @@ func (r *Rounder) runFeedOnce(ctx context.Context) (RoundResult, error) {
 				r.saveStatus(ctx, &result, WindowError, cerr.Error(), 0, scanStart)
 				return result, fmt.Errorf("提交游标分页事务失败：%w", cerr)
 			}
+			// 清空与第一页在同一事务里提交成功后才解除标记：之后各页只 upsert。
+			replacing = false
 			result.Inserted += n
 			result.Fetched += len(page.Entries) + len(page.Deleted)
 			log.Debug("代理侧账本分页已提交",

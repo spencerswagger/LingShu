@@ -55,7 +55,10 @@ type BillingRow struct {
 	Tokens int64
 }
 
-// LedgerRow 是一条账本条目（上游口径）。
+// LedgerRow 是一条账本条目。
+//
+// TokensIn 是**提示词侧总量**（代理侧 `in` + cache_read + cache_write，见 upstream.LedgerEntry），
+// 所以 TokensIn+TokensOut 与账单侧的三段合计同口径；TokenDelta 才有意义。
 type LedgerRow struct {
 	LedgerID   string
 	Provider   string
