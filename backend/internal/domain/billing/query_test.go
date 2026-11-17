@@ -10,7 +10,8 @@ import (
 )
 
 // TestListRecords_FilterByKeyAndSession 断言 ListRecords 按渠道密钥 / 会话维度过滤：
-// WHERE 使用 channel_key_id=$2、session_id=$3，参数顺序随索引平移。
+// WHERE 的密钥维度取 COALESCE(调用日志快照, 本表列)（列这一半随 0024 已删除，见 0024_v2_drop_legacy.sql），
+// session_id 等其余条件与参数位不变。
 func TestListRecords_FilterByKeyAndSession(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
@@ -22,12 +23,14 @@ func TestListRecords_FilterByKeyAndSession(t *testing.T) {
 	keyID := int64(3)
 	f := RecordFilter{ChannelKeyID: &keyID, SessionID: "sess-1", Page: 1, Size: 10}
 
-	mock.ExpectQuery(`SELECT count\(\*\) FROM billing_records .*channel_key_id = \$2.*token_id = \$3.*session_id = \$4.*`).
+	mock.ExpectQuery(`SELECT count\(\*\) FROM billing_records .*\(SELECT clk\.channel_key_id FROM call_logs clk.*billing_records\.billing_id\) = \$2.*token_id = \$3.*session_id = \$4.*`).
 		WithArgs(nil, int64(3), nil, "sess-1", "", "", "", nil, nil).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(1)))
-	mock.ExpectQuery(`SELECT .* FROM billing_records .*channel_key_id = \$2.*token_id = \$3.*session_id = \$4.*ORDER BY id DESC LIMIT \$10 OFFSET \$11`).
+	mock.ExpectQuery(`SELECT .* FROM billing_records .*\(SELECT clk\.channel_key_id FROM call_logs clk.*billing_records\.billing_id\) = \$2.*token_id = \$3.*session_id = \$4.*ORDER BY id DESC LIMIT \$10 OFFSET \$11`).
 		WithArgs(nil, int64(3), nil, "sess-1", "", "", "", nil, nil, 10, 0).
 		WillReturnRows(completedRow(t))
+	// 维度由 call_logs 快照回填（第 1 条账单对应密钥 1）。
+	expectChannelKeyFill(mock, billingID, int64(1))
 
 	list, total, err := store.ListRecords(context.Background(), f)
 	if err != nil {
@@ -62,6 +65,7 @@ func TestListRecords_FilterByModelMatchesAutoName(t *testing.T) {
 	mock.ExpectQuery(`SELECT .* FROM billing_records .*external_model_name = \$5 OR auto_model_name = \$5.*LIMIT \$10 OFFSET \$11`).
 		WithArgs(nil, nil, nil, "", "auto", "", "", nil, nil, 10, 0).
 		WillReturnRows(completedRow(t))
+	expectChannelKeyFill(mock, billingID, int64(4))
 
 	_, total, err := store.ListRecords(context.Background(), f)
 	if err != nil {
@@ -84,7 +88,7 @@ func TestListRecords_NoFilter(t *testing.T) {
 	defer db.Close()
 
 	store := NewSqlStore(db)
-	mock.ExpectQuery(`SELECT count\(\*\) FROM billing_records .*channel_key_id = \$2`).
+	mock.ExpectQuery(`SELECT count\(\*\) FROM billing_records .*\(SELECT clk\.channel_key_id FROM call_logs clk`).
 		WithArgs(nil, nil, nil, "", "", "", "", nil, nil).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(0)))
 	mock.ExpectQuery(`SELECT .* FROM billing_records .*LIMIT \$10 OFFSET \$11`).
@@ -103,7 +107,8 @@ func TestListRecords_NoFilter(t *testing.T) {
 	}
 }
 
-// TestGetByBillingID_ScanDims 断言 GetByBillingID 能扫描带 channel_key_id/session_id 的行。
+// TestGetByBillingID_ScanDims 断言 GetByBillingID 能扫描 session_id，且渠道密钥维度由
+// call_logs 快照回填（billing_records 已无该列）。
 func TestGetByBillingID_ScanDims(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
@@ -115,10 +120,11 @@ func TestGetByBillingID_ScanDims(t *testing.T) {
 	mock.ExpectQuery(regexp.MustCompile(`SELECT .* FROM billing_records WHERE billing_id=\$1`).String()).
 		WithArgs(billingID).
 		WillReturnRows(sqlmock.NewRows(recordColsForTest).AddRow(
-			int64(5), billingID, int64(7), "sale", nil, "ext-model", nil, "int-model", int64(1), "sess-x", "会话A",
+			int64(5), billingID, int64(7), "sale", nil, "ext-model", nil, "int-model", "sess-x", "会话A",
 			time.Now(), `{}`, `{}`, []byte(`{"time":1,"context":1}`), int64(10000),
 			nil, nil, nil, nil, nil, "completed", nil, nil, nil,
 		))
+	expectChannelKeyFill(mock, billingID, int64(1))
 
 	rec, err := store.GetByBillingID(context.Background(), billingID)
 	if err != nil {

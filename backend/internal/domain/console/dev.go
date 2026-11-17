@@ -197,7 +197,7 @@ func (h *Dev) HandleListSessions(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var s router.Session
 		var tok sql.NullInt64
-		if err := rows.Scan(&s.SessionID, &s.UserID, &tok, &s.Model, &s.SessionRaw, &s.ChannelKeyID,
+		if err := rows.Scan(&s.SessionID, &s.UserID, &tok, &s.Model, &s.SessionRaw,
 			&s.InternalModelID, &s.CreatedAt, &s.LastActive, &s.ExpireAt, &s.Name, &s.Closed); err != nil {
 			resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "查询会话失败")
 			return

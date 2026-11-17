@@ -118,8 +118,9 @@ func TestHandleDevListBillings_InvalidTimeRange(t *testing.T) {
 	}
 }
 
-// TestHandleDevListBillings_ChannelName 是 Owl PR #63 建议 3 的回归：
-// 开发者端列表要展示**渠道显示名**（非密钥，属白名单内），且与管理端共用同一份回查实现。
+// TestHandleDevListBillings_ChannelName（0024 后的口径）：
+// 渠道体系已下线，渠道显示名不再有来源 → 开发者端列表里 ChannelName 恒为空，
+// 同时**仍不得**泄漏密钥维度 / 内部模型 ID（白名单口径不变）。
 func TestHandleDevListBillings_ChannelName(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
@@ -132,12 +133,12 @@ func TestHandleDevListBillings_ChannelName(t *testing.T) {
 
 	rows := sqlmock.NewRows([]string{
 		"id", "billing_id", "user_id", "pricing_mode", "token_id", "external_model_name",
-		"auto_model_name", "internal_model_id", "channel_key_id", "session_id", "session_name", "call_time",
+		"auto_model_name", "internal_model_id", "session_id", "session_name", "call_time",
 		"tokens", "rates", "coefficients", "r_value", "raw_total", "credits_consumed", "cost_credits",
 		"balance_before", "balance_after", "status", "error_message", "duration_ms", "first_token_ms",
 		"rid", "cnt",
 	}).AddRow(
-		int64(1), "b1", int64(7), "sale", nil, "gpt-4", nil, "gpt-4-int", int64(99), "", "",
+		int64(1), "b1", int64(7), "sale", nil, "gpt-4", nil, "gpt-4-int", "", "",
 		time.Now(), `{}`, `{}`, `{"time":1,"context":1}`, int64(10000),
 		nil, float64(0.5), nil, nil, nil, "completed", nil, nil, nil, "req-1", int64(1),
 	)
@@ -148,10 +149,11 @@ func TestHandleDevListBillings_ChannelName(t *testing.T) {
 	mock.ExpectQuery(`WITH grp AS \(.*grp.rid, grp.cnt.*LIMIT \$10 OFFSET \$11`).
 		WithArgs(int64(7), nil, nil, "", "", "", "", nil, nil, 20, 0).
 		WillReturnRows(rows)
-	// 渠道显示名回查（channel_keys JOIN channels）：dev 列表据此填 ChannelName。
-	mock.ExpectQuery(`SELECT k.id, c.name FROM channel_keys k JOIN channels c ON c.id = k.channel_id`).
-		WithArgs().
-		WillReturnRows(sqlmock.NewRows([]string{"id", "name"}).AddRow(int64(99), "azure-东区"))
+	// 渠道密钥维度回填（billing_records 已无该列，读 call_logs 的 1:1 快照）。
+	mock.ExpectQuery(`SELECT cl\.billing_id, cl\.channel_key_id`).
+		WithArgs("b1").
+		WillReturnRows(sqlmock.NewRows([]string{"billing_id", "channel_key_id"}).AddRow("b1", int64(99)))
+	// 渠道显示名回查已随 0024 下线：不再发查询，ChannelName 恒空。
 
 	rec := httptest.NewRecorder()
 	dev.HandleListBillings(rec, httptest.NewRequest(http.MethodGet, "/api/v1/dev/billings", nil))
@@ -169,8 +171,9 @@ func TestHandleDevListBillings_ChannelName(t *testing.T) {
 	if len(body.Data.List) != 1 {
 		t.Fatalf("list len=%d, want 1", len(body.Data.List))
 	}
-	if got := body.Data.List[0]["ChannelName"]; got != "azure-东区" {
-		t.Fatalf("ChannelName=%v, want azure-东区", got)
+	// 空值可能整键省略（omitempty）也可能显式空串，两者都算「为空」。
+	if got, ok := body.Data.List[0]["ChannelName"]; ok && got != nil && got != "" {
+		t.Fatalf("渠道体系已下线，ChannelName 必须为空, got %v", got)
 	}
 	// 仍不得出现密钥维度/内部模型 ID（白名单口径不变）。
 	raw := rec.Body.String()

@@ -330,34 +330,11 @@ func (s *SqlStore) dashboardTop(ctx context.Context, from, to time.Time, userID 
 	}
 	rows.Close()
 
-	// 按渠道密钥（密钥名 + 渠道名）
-	rows, err = s.db.QueryContext(ctx,
-		`SELECT ck.name, ch.name,
-		        count(*), COALESCE(sum((br.status='failed')::int),0),
-		        COALESCE(sum(br.credits_consumed),0),
-		        COALESCE(sum(`+tokenSum("br.")+`),0) AS tokens
-		 FROM billing_records br
-		 JOIN channel_keys ck ON ck.id = br.channel_key_id
-		 JOIN channels ch ON ch.id = ck.channel_id
-		 `+dashWhere("br.")+`
-		 GROUP BY 1,2 ORDER BY tokens DESC LIMIT $4`, dashArgs(userID, from, to, limit)...)
-	if err != nil {
-		return err
-	}
-	for rows.Next() {
-		var it DashTopItem
-		if err := rows.Scan(&it.Key, &it.SubLabel, &it.Calls, &it.Failed, &it.Credits, &it.Tokens); err != nil {
-			rows.Close()
-			return err
-		}
-		it.Label = it.Key
-		out.ByKey = append(out.ByKey, it)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return err
-	}
-	rows.Close()
+	// 按渠道密钥（密钥名 + 渠道名）：**渠道体系已下线**（0024 删了 channels / channel_keys，
+	// billing_records.channel_key_id 也一并删除），新账单没有任何渠道维度可聚合。
+	// 这里返回空列表而不是报错：前端拿到的就是一个空的分组，不需要为「没有这个概念」加特判。
+	// 历史账单的渠道名同样取不回（表已删）——这是下线渠道体系的必然代价，不是本函数的选择。
+	out.ByKey = nil
 
 	// 按用户（仅全局视角）
 	if userID == nil {
@@ -527,15 +504,17 @@ const MaxModelLimit = 200
 // 前端应据 DashModelStat.Unmatched 识别，不必硬编码这个字符串。
 const DashModelUnmatchedKey = "__unmatched__"
 
-// modelEntityResolveBody 账单行 → channel_models 实体解析（模型广场用）。
-// 与成本页 /cost/stats 同一思路：用 (channel_id, internal_model_id) 反查 channel_models 拿到
-// external_model_id，再按 ID 归到对外模型——模型改名、用别名调用都不会把用量丢在目录外面。
-// 同一 (channel_id, internal_model_id) 多条配置（删除后重建）时优先未删除、再取 id 最大者；
-// 软删配置仍参与解析，历史账单不因配置下线而失去归属。
-const modelEntityResolveBody = `SELECT DISTINCT ON (cm.channel_id, cm.internal_model_id)
-           cm.channel_id, cm.internal_model_id, cm.external_model_id
-    FROM channel_models cm
-    ORDER BY cm.channel_id, cm.internal_model_id, (cm.deleted_at IS NULL) DESC, cm.id DESC`
+// modelEntityResolveBody 账单行 → 对外模型实体解析（模型广场用）。
+//
+// ⚠️ 口径变更（迁移 0024 删掉 channels / channel_keys / channel_models 之后）：
+// 原先用 (channel_id, internal_model_id) 反查 channel_models 拿 external_model_id，
+// 现在没有这张表了，改为**按账单里的对外模型文本**匹配 `external_models.external_name`
+// （与成本页 /cost/stats 完全同一口径）。
+//
+// 代价（已知、已登记）：模型改名前写下的历史账单文本匹配不到目录 → 落到「未匹配」行，
+// 不再归到新名下。金额与总量不受影响（守恒口径不变：只有目录行与未匹配行两个去处）。
+const modelEntityResolveBody = `SELECT em.id AS external_model_id, em.external_name
+    FROM external_models em`
 
 // 模型广场排序键（其它值按 tokens 处理）。
 const (
@@ -784,9 +763,8 @@ func (s *SqlStore) DashboardModels(ctx context.Context, from, to time.Time, user
 	out := ModelPlaza{Sort: sortKey, Limit: limit, List: make([]DashModelStat, 0, limit)}
 
 	// 聚合按「解析出的 external_model_id」分组（0 = 解析不到），再与目录按 ID 对齐。
-	aggCTE := `WITH res AS (` + modelEntityResolveBody + `),
-agg AS (
-    SELECT COALESCE(r.external_model_id, 0) AS ext_id,
+	aggCTE := `WITH agg AS (
+    SELECT COALESCE(cat.id, 0) AS ext_id,
            -- in_catalog：解析到的对外模型是否仍是「在册（未删除）」实体。
            -- 未匹配判定必须用它，而不是只看 ext_id = 0 —— 否则「解析到了、但该模型后来被软删」
            -- 的用量会两头落空（既不在目录行里，也不进未匹配行），静默丢量（PR #61 Gate 复验）。
@@ -803,11 +781,8 @@ agg AS (
            COALESCE(sum(b.first_token_ms) FILTER (WHERE b.first_token_ms IS NOT NULL),0) AS first_sum,
            COALESCE(count(*) FILTER (WHERE b.first_token_ms IS NOT NULL),0) AS first_n
       FROM billing_records b
-      LEFT JOIN channel_keys k ON k.id = b.channel_key_id
-      LEFT JOIN (` + modelEntityResolveBody + `) r
-             ON r.channel_id = k.channel_id AND r.internal_model_id = b.internal_model_id
       LEFT JOIN external_models cat
-             ON cat.id = r.external_model_id AND cat.deleted_at IS NULL
+             ON cat.external_name = b.external_model_name AND cat.deleted_at IS NULL
       ` + dashWhere("b.") + `
      GROUP BY 1, 2
 )`

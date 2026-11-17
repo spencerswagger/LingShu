@@ -3,7 +3,7 @@ import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { RefreshRight, Key, Link, Plus } from '@element-plus/icons-vue'
-import { listDevTokens, toggleDevToken, rotateDevToken, createDevToken, getDevTokenSecret, listDevTags, type DevToken, type DevTag } from '@/api/dev'
+import { listDevTokens, toggleDevToken, rotateDevToken, createDevToken, getDevTokenSecret, type DevToken } from '@/api/dev'
 import ErrorBubble from '@/components/ErrorBubble.vue'
 
 const router = useRouter()
@@ -14,15 +14,11 @@ const page = ref(1)
 const size = ref(20)
 const errInfo = ref<{ message: string; requestId: string }>({ message: '', requestId: '' })
 
-// 标签名映射：tag_id → name（令牌列表展示用）
-const tagNameMap = ref<Record<string, string>>({})
-
 // 新建令牌弹窗
 const createOpen = ref(false)
 const createSaving = ref(false)
 const createErr = ref<{ message: string; requestId: string }>({ message: '', requestId: '' })
-const tagOptions = ref<{ value: string | null; label: string }[]>([{ value: null, label: '不选择（走默认路由）' }])
-const createForm = ref({ DisplayName: '', TagID: null as string | null, ExpiresAt: null as string | null })
+const createForm = ref({ DisplayName: '', ExpiresAt: null as string | null })
 const createdPlain = ref<{ Plain: string; Display: string } | null>(null)
 
 // 查看密钥弹窗
@@ -35,25 +31,6 @@ const secretName = ref('')
 const rotateDialog = ref(false)
 const rotatePlain = ref('')
 const rotateDisplay = ref('')
-
-async function loadTags() {
-  try {
-    const res = await listDevTags()
-    const tags: DevTag[] = res.Data || []
-    tagNameMap.value = Object.fromEntries(tags.map((t) => [t.ID, t.Name]))
-    tagOptions.value = [
-      { value: null, label: '不选择（走默认路由）' },
-      ...tags.filter((t) => t.Enabled !== false).map((t) => ({ value: t.ID, label: t.Name })),
-    ]
-  } catch {
-    // 忽略，仅影响标签列展示
-  }
-}
-
-function tagLabel(row: DevToken): string {
-  if (!row.TagID) return '默认路由'
-  return tagNameMap.value[row.TagID] ? `标签：${tagNameMap.value[row.TagID]}` : '标签'
-}
 
 async function load() {
   loading.value = true
@@ -71,7 +48,6 @@ async function load() {
 
 onMounted(() => {
   load()
-  loadTags()
 })
 
 // 行内状态切换（实时反馈，无需刷新整页）
@@ -129,7 +105,7 @@ async function onViewSecret(row: DevToken) {
 function openCreate() {
   createOpen.value = true
   createdPlain.value = null
-  createForm.value = { DisplayName: '', TagID: null, ExpiresAt: null }
+  createForm.value = { DisplayName: '', ExpiresAt: null }
   createErr.value = { message: '', requestId: '' }
 }
 
@@ -140,7 +116,6 @@ async function submitCreate() {
   try {
     const res = await createDevToken({
       DisplayName: createForm.value.DisplayName.trim(),
-      TagID: createForm.value.TagID,
       ExpiresAt: createForm.value.ExpiresAt,
     })
     createdPlain.value = res.Data
@@ -198,12 +173,6 @@ function copyBaseUrl() {
             <el-tooltip :content="row.TokenDisplay" placement="top">
               <span class="mono">{{ row.TokenDisplay }}</span>
             </el-tooltip>
-          </template>
-        </el-table-column>
-        <el-table-column label="路由" min-width="120">
-          <template #default="{ row }">
-            <el-tag v-if="!row.TagID" size="small" type="info" effect="plain">默认路由</el-tag>
-            <el-tag v-else size="small" effect="plain">{{ tagLabel(row) }}</el-tag>
           </template>
         </el-table-column>
         <el-table-column label="状态" width="90" align="center">
@@ -274,17 +243,7 @@ function copyBaseUrl() {
         <el-form-item label="名称" required>
           <el-input v-model="createForm.DisplayName" placeholder="例：生产环境 Key" maxlength="50" show-word-limit />
         </el-form-item>
-        <el-form-item label="语义标签">
-          <el-select v-model="createForm.TagID" placeholder="选择标签" style="width: 100%">
-            <el-option
-              v-for="opt in tagOptions"
-              :key="String(opt.value)"
-              :label="opt.label"
-              :value="opt.value"
-            />
-          </el-select>
-          <div class="form-tip">未选择时令牌走默认路由。</div>
-        </el-form-item>
+        <!-- V2 起删除「语义标签」：0024 删 semantic_tags / channel_tags 与 tokens.tag_id，标签不再影响路由 -->
         <el-form-item label="过期时间">
           <el-date-picker
             v-model="createForm.ExpiresAt"

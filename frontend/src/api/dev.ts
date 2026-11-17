@@ -7,7 +7,6 @@ export interface DevToken {
   ID: string
   TokenDisplay: string
   DisplayName: string
-  TagID: string | null
   ExpiresAt: string | null
   LastUsedAt: string | null
   Status: string // ACTIVE | DISABLED
@@ -38,7 +37,6 @@ export function listDevTokens(page = 1, size = 20, status = '') {
 // 创建本人令牌
 export function createDevToken(payload: {
   DisplayName: string
-  TagID: string | null
   ExpiresAt: string | null
 }) {
   return http.post<CreatedToken, ApiRes<CreatedToken>>('/dev/tokens', payload)
@@ -59,23 +57,6 @@ export function getDevTokenSecret(id: string, password: string) {
   return http.get<CreatedToken, ApiRes<CreatedToken>>(`/dev/tokens/${id}/secret`, {
     headers: { 'X-Current-Password': password },
   })
-}
-
-// 启用中的语义标签（令牌创建时可选；enabled=true 过滤）
-export function listDevTags() {
-  return http.get<DevTag[], ApiRes<DevTag[]>>('/dev/tags', {
-    params: { Enabled: true },
-  })
-}
-
-export interface DevTag {
-  ID: string
-  Name: string
-  Description: string
-  KVPairs: Record<string, string>
-  Enabled: boolean
-  CreatedBy: string
-  CreatedAt: string
 }
 
 // ===== 开发端·钱包/用量/账单/公告 =====
@@ -107,6 +88,14 @@ export interface BillingItem {
   RequestID?: string
   // 该请求共产生的账单条数（>1 表示发生过候选/上游重试；列表已归并成一行）
   Attempts?: number
+  // ===== V2 归因（0020 加列；老后端不返回这些键 → undefined，页面据此决定是否渲染）=====
+  // upstream_*：回程头/账本读到的上游身份，缺失为 null（不猜）；历史行全为 null。
+  UpstreamProvider?: string | null
+  UpstreamAccount?: string | null
+  UpstreamProtocol?: string | null
+  UpstreamModel?: string | null
+  // 成本来源：ledger | amortized | none；历史行为 null（口径未知，禁止用 0 填充）
+  CostSource?: string | null
 }
 
 // 本人账单列表（支持时间区间 From/To，RFC3339；RequestID 按请求链路 ID 定位，Group=0 展开逐条尝试）
@@ -182,7 +171,37 @@ export interface BillingDetail {
   RouteDiff?: RouteDiff | null
   InternalModelID?: string
   ChannelName?: string
+  // V2 归因与成本来源（0020 加列，老后端不返回 → undefined）
+  UpstreamProvider?: string | null
+  UpstreamAccount?: string | null
+  UpstreamProtocol?: string | null
+  UpstreamModel?: string | null
+  CostSource?: string | null
+  // 账本关联：ledger_entries.ledger_id（一对一，部分唯一索引保证）
+  LedgerEntryID?: string | null
+  // 资金轨迹（M8）：一请求一预扣 + 结算差额 + 退款 + 钱包流水。
+  // 三者都由后端给出，前端只显示恒等式结果，不自己算「应该扣多少」。
+  Hold?: BillingHold | null
+  Flows?: BillingFlow[]
   CallLog?: CallLogView | null
+}
+
+export interface BillingHold {
+  Amount: number
+  Status: string // held | settled | refunded | expired
+  ExpiresAt?: string | null
+  SettledAmount?: number | null
+  RefundedAmount?: number | null
+  ClosedAt?: string | null
+}
+
+export interface BillingFlow {
+  FlowID?: string
+  Kind: string // charge | refund | adjust
+  Amount: number
+  BalanceAfter?: number | null
+  Note?: string | null
+  CreatedAt?: string | null
 }
 
 export interface Step {

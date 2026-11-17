@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/team/llmgateway/internal/pkg/logger"
@@ -31,6 +32,12 @@ type Prepared struct {
 	Body []byte
 	// StreamRequested 表示请求体声明了流式（body.stream=true）。
 	StreamRequested bool
+	// SessionID 是入站会话标识（x-session-id 原值；空 = 无会话）。只做计费/日志归属，
+	// 不参与路由判断（选路已迁到代理侧）。
+	SessionID string
+	// Reservation 是入口预扣句柄（OnReserve 的返回值，原样交回 OnComplete）。
+	// nil = 本次未预扣（未注入 OnReserve 或非计费端点）。
+	Reservation any
 	// StripQueryKey 表示转发时必须剔除 query 里的 key 参数。
 	// 判定按**解码后键名**且与剔除同源（query.go）：无论本次鉴权用的是 query 里的 key
 	// （Gemini 原生写法）还是请求头，只要 query 里出现 key 就剔——头鉴权 + 同时带 ?key=
@@ -48,7 +55,10 @@ type Deps struct {
 	CredentialKey []byte
 	// Prefixes 提供订阅池前缀名单；nil 时恒用默认名单。
 	Prefixes *PrefixProvider
-	// OnComplete 是转发结束回调（第③件接入；nil = 不产生任何计费动作）。
+	// OnReserve 是转发**前**的预扣钩子（准入 + 改写之后调用）：返回预扣句柄交给 OnComplete，
+	// 或返回 Deny 直接拒绝（余额不足）。nil = 不预扣。
+	OnReserve ReserveHook
+	// OnComplete 是转发结束回调（计费结算/退预扣的落点；nil = 不产生任何计费动作）。
 	OnComplete Hook
 	Logger     *slog.Logger
 }
@@ -58,7 +68,12 @@ type Handler struct {
 	cfg      Config
 	admitter *Admitter
 	proxy    *Proxy
+	reserve  ReserveHook
 	logger   *slog.Logger
+	// gate 是转发降级开关（nil = 常开）。返回 false 时 /v1、/v1beta 一律 503，
+	// 不发上游、不扣费、不写账单 —— 对应 sys_configs 的 upstream.degrade.passthrough_enabled。
+	// 只读这个开关，不看 upstream.base_url：那个基址只服务账本同步，没配属正常态。
+	gate func() bool
 }
 
 // NewHandler 装配入口；Config 未配置基址时返回 nil（调用方保持 410 停用口径）。
@@ -79,10 +94,14 @@ func NewHandler(d Deps) *Handler {
 	if d.OnComplete != nil {
 		p.SetOnComplete(d.OnComplete)
 	}
+	if d.OnReserve != nil {
+		p.SetOnReserve(d.OnReserve)
+	}
 	return &Handler{
 		cfg:      cfg,
 		admitter: NewAdmitter(d.Tokens, d.Models, d.Keys, d.CredentialKey, prefixes),
 		proxy:    p,
+		reserve:  d.OnReserve,
 		logger:   lg,
 	}
 }
@@ -103,9 +122,31 @@ func (h *Handler) logFor(ctx context.Context) *slog.Logger {
 //	POST /v1/...     四类协议端点（其余方法/路径一律 405/404，不做开放代理）
 //	POST /v1beta/... Gemini（model 在 path）
 func (h *Handler) Mount(mux *http.ServeMux) {
-	mux.HandleFunc("GET /v1/models", h.handleModels)
-	mux.HandleFunc("/v1/", h.handleProxy)
-	mux.HandleFunc("/v1beta/", h.handleProxy)
+	mux.HandleFunc("GET /v1/models", h.guard(h.handleModels))
+	mux.HandleFunc("/v1/", h.guard(h.handleProxy))
+	mux.HandleFunc("/v1beta/", h.guard(h.handleProxy))
+}
+
+// SetGate 注入转发降级开关（见 Handler.gate）。装配层在 sys_configs 变化时热生效。
+func (h *Handler) SetGate(gate func() bool) { h.gate = gate }
+
+// guard 把降级开关套在入口上：关掉时返回 503 + 明确文案（不代理、不计费、不落账单）。
+//
+// 为什么必须有这个消费方：`upstream.degrade.passthrough_enabled` 写进 sys_configs 后
+// 如果没人读，运维关掉开关却照旧转发 —— 开关变成假的。
+func (h *Handler) guard(next http.HandlerFunc) http.HandlerFunc {
+	// gate 在**请求时**才读（不是 Mount 时快照）：运维改开关要立即生效，不必重启。
+	return func(w http.ResponseWriter, r *http.Request) {
+		if h.gate != nil && !h.gate() {
+			WriteDeny(w, ProtocolOpenAIChat, Deny{
+				Status:  http.StatusServiceUnavailable,
+				Code:    CodeServiceUnavailable,
+				Message: "转发服务已暂停（运维降级开关）",
+			})
+			return
+		}
+		next(w, r)
+	}
 }
 
 // handleModels 返回租户可见的模型列表（OpenAI list 形状，与既有 /v1/models 兼容）。
@@ -198,6 +239,7 @@ func (h *Handler) handleProxy(w http.ResponseWriter, r *http.Request) {
 		UpstreamPath:  route.UpstreamPath,
 		Body:          body,
 		StripQueryKey: fromQuery || hasQueryParam(r.URL.RawQuery, "key"),
+		SessionID:     strings.TrimSpace(r.Header.Get("X-Session-Id")),
 	}
 	if route.ModelInPath {
 		p, err := rewritePathModel(r.URL.Path, dec.MagpieModel)
@@ -214,6 +256,28 @@ func (h *Handler) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 		prep.Body = rewritten
 		prep.StreamRequested = StreamRequested(body)
+	}
+
+	// 5.5) 预扣：准入 + 改写之后、发上游之前（此时才知道命中模型的售价与实际请求体）。
+	//      拒绝即不透传；句柄随请求带到结算回调，No-usage 时整笔退回（口径见 facadebill）。
+	if h.reserve != nil && route.Billable {
+		handle, deny := h.reserve(r.Context(), ReserveInput{
+			UserID:        prep.UserID,
+			TokenID:       prep.TokenID,
+			ExternalModel: prep.ExternalModel,
+			Protocol:      string(route.Protocol),
+			Endpoint:      route.Endpoint,
+			SessionID:     prep.SessionID,
+			RequestBody:   prep.Body,
+		})
+		if deny != nil {
+			h.logFor(r.Context()).Warn("代理预扣拒绝",
+				"endpoint", route.Endpoint, "model", prep.ExternalModel,
+				"status", deny.Status, "code", deny.Code)
+			WriteDeny(w, route.Protocol, *deny)
+			return
+		}
+		prep.Reservation = handle
 	}
 
 	// 6) 转发（响应字节原样回流；唯一例外是凭据回显遮蔽，见 proxy.go）。

@@ -3,6 +3,7 @@ package billing
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/team/llmgateway/internal/pkg/dbx"
 	"github.com/team/llmgateway/internal/pkg/idgen"
@@ -90,6 +93,20 @@ type Store interface {
 	InsertTx(ctx context.Context, ex dbx.Execer, rec *Record) (*Record, error)
 }
 
+// idempotencyReader 是 SqlStore 提供的「只读本表、不回填展示维度」的读取能力。
+// 写路径的幂等预检查只关心「是否已存在、状态如何」，不该为展示维度多付一次 call_logs 查询。
+type idempotencyReader interface {
+	scanByBillingID(ctx context.Context, billingID string) (*Record, error)
+}
+
+// recordByBillingID 幂等预检查用：优先走不带展示维度的读取，其他 Store 实现回落 GetByBillingID。
+func (s *Service) recordByBillingID(ctx context.Context, billingID string) (*Record, error) {
+	if reader, ok := s.store.(idempotencyReader); ok {
+		return reader.scanByBillingID(ctx, billingID)
+	}
+	return s.store.GetByBillingID(ctx, billingID)
+}
+
 // Record 对应 billing_records 一行，携带一次调用的完整计费信息。
 type Record struct {
 	ID              int64
@@ -100,7 +117,7 @@ type Record struct {
 	ExternalModel   string
 	AutoModelName   string // 请求的 Auto 模型名（非 Auto 请求为空，落库为 NULL）
 	InternalModelID string
-	ChannelKeyID    int64  // 落 channel_key_id：渠道密钥维度（运行时实体）
+	ChannelKeyID    int64  // 渠道密钥维度（运行时实体）：不再落 billing_records，读取时由 call_logs 快照回填
 	SessionID       string // 落 session_id：请求携带 x-session-id 时的会话维度；失败记录同样携带
 	SessionName     string // 落 session_name：写入时的会话可读名快照（sessions 投影过期清理后仍可展示）
 	CallTime        time.Time
@@ -120,9 +137,22 @@ type Record struct {
 	ErrorMessage    string
 	DurationMs      *int64 // 总耗时（毫秒）
 	FirstTokenMs    *int64 // 首字耗时（毫秒）
-	// RequestID 网关请求链路 ID（来自 call_logs.request_id，仅归并列表查询时填充）：
+	// RequestID 网关请求链路 ID：写入侧落 billing_records.request_id（V2 归因列，空写 NULL），
+	// 列表查询侧仍按既有口径从 call_logs 归并（两者同值；统一读取口径属后续切片）。
 	// 让一次请求在账单可被直接定位（多候选尝试共享同一 request_id）。
 	RequestID string
+	// ===== V2 归因列（迁移由架构侧 ADD COLUMN；缺失留 NULL，不猜）=====
+	// UpstreamProvider / UpstreamAccount 来自上游回程头里的供应商与账号标识。
+	UpstreamProvider string
+	UpstreamAccount  string
+	// UpstreamProtocol 上游协议，取值域见 upstream.AttributionProtocols()。
+	UpstreamProtocol string
+	// UpstreamModel 上游真实模型名。
+	UpstreamModel string
+	// LedgerEntryID 匹配到的账本条目 id（阶段一没有匹配逻辑 → 恒空 → NULL）。
+	LedgerEntryID string
+	// CostSource 成本来源：ledger / amortized / none（空按 none 落库）。
+	CostSource string
 	// Attempts 该请求共产生的账单条数（仅归并列表查询时填充；1=单次尝试，>1=发生过候选/上游重试）。
 	Attempts int
 }
@@ -156,6 +186,18 @@ type RecordReq struct {
 	// =0 时（健康探测/直接计费等无预扣场景）按全额扣减。
 	PreConsumed float64
 	Remark      string
+	// Hold 非 nil 时，在**结算事务内**顺带终结对应的预扣登记（通常 status=settled）。
+	// 见 HoldCloseReq 的注释：终结与结算必须同一个事务，否则「钱已结算、hold 未落」
+	// 会被过期扫描当成未结算、把整笔预扣再退一次。
+	Hold *HoldCloseReq
+	// ===== V2 归因（由网关在调用完成后传入；未接线时全空 → 落 NULL / none）=====
+	RequestID        string
+	UpstreamProvider string
+	UpstreamAccount  string
+	UpstreamProtocol string
+	UpstreamModel    string
+	LedgerEntryID    string
+	CostSource       string
 }
 
 // CreditService 抽象钱包扣减/差额结算，由 identity 包实现。
@@ -165,6 +207,22 @@ type CreditService interface {
 	// Tx 变体：在调用方事务内完成扣减/差额结算与积分流水写入，供 Record 同事务提交。
 	ConsumeTx(ctx context.Context, ex dbx.Execer, userID int64, amount float64, billingID, sessionID, remark string) (before, after float64, err error)
 	SettleTx(ctx context.Context, ex dbx.Execer, userID int64, delta float64, sessionID, remark string) (before, after float64, err error)
+}
+
+// HoldCloser 是「在给定事务内终结预扣登记」的能力（identity.CreditService 实现）。
+//
+// 单独抽出来的理由：billing 不认识 credit_holds 表，也不该认识；它只需要一个能在
+// 自己的结算事务里被调用的终结入口。
+type HoldCloser interface {
+	CloseHoldTx(ctx context.Context, ex dbx.Execer, billingID, status, ledgerEntryID string) (bool, error)
+}
+
+// HoldCloseReq 描述「这次结算要顺带终结哪条预扣登记」。
+type HoldCloseReq struct {
+	BillingID     string // 预扣登记的键（与账单同号）
+	Status        string // settled / refunded
+	LedgerEntryID string
+	Closer        HoldCloser
 }
 
 // Service 计费服务：记账 + 钱包扣减 + 幂等。
@@ -212,22 +270,29 @@ func (s *Service) Record(ctx context.Context, req RecordReq) (*Record, error) {
 	// 失败记录快速通道（上游/下游失败不扣积分）：直接落 failed 并携带原因。
 	if req.Fail {
 		rec := &Record{
-			BillingID:       req.BillingID,
-			UserID:          req.UserID,
-			PricingMode:     req.PricingMode,
-			TokenID:         req.TokenID,
-			ExternalModel:   req.ExternalModel,
-			AutoModelName:   req.AutoModelName,
-			InternalModelID: req.InternalModelID,
-			ChannelKeyID:    req.ChannelKeyID,
-			SessionID:       req.SessionID,
-			SessionName:     req.SessionName,
-			CallTime:        req.CallTime,
-			Tokens:          req.Tokens,
-			Status:          StatusFailed,
-			ErrorMessage:    req.ErrorMessage,
-			DurationMs:      req.DurationMs,
-			FirstTokenMs:    req.FirstTokenMs,
+			BillingID:        req.BillingID,
+			UserID:           req.UserID,
+			PricingMode:      req.PricingMode,
+			TokenID:          req.TokenID,
+			ExternalModel:    req.ExternalModel,
+			AutoModelName:    req.AutoModelName,
+			InternalModelID:  req.InternalModelID,
+			ChannelKeyID:     req.ChannelKeyID,
+			SessionID:        req.SessionID,
+			SessionName:      req.SessionName,
+			CallTime:         req.CallTime,
+			Tokens:           req.Tokens,
+			Status:           StatusFailed,
+			ErrorMessage:     req.ErrorMessage,
+			DurationMs:       req.DurationMs,
+			FirstTokenMs:     req.FirstTokenMs,
+			RequestID:        req.RequestID,
+			UpstreamProvider: req.UpstreamProvider,
+			UpstreamAccount:  req.UpstreamAccount,
+			UpstreamProtocol: req.UpstreamProtocol,
+			UpstreamModel:    req.UpstreamModel,
+			LedgerEntryID:    req.LedgerEntryID,
+			CostSource:       req.CostSource,
 		}
 		if _, err := s.store.Insert(ctx, rec); err != nil {
 			if isUniqueViolation(err) {
@@ -240,7 +305,7 @@ func (s *Service) Record(ctx context.Context, req RecordReq) (*Record, error) {
 	}
 
 	// 1) 幂等快速路径。
-	existing, err := s.store.GetByBillingID(ctx, req.BillingID)
+	existing, err := s.recordByBillingID(ctx, req.BillingID)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
 	}
@@ -293,6 +358,14 @@ func (s *Service) Record(ctx context.Context, req RecordReq) (*Record, error) {
 		DurationMs:   req.DurationMs,
 		FirstTokenMs: req.FirstTokenMs,
 		ErrorMessage: req.ErrorMessage,
+
+		RequestID:        req.RequestID,
+		UpstreamProvider: req.UpstreamProvider,
+		UpstreamAccount:  req.UpstreamAccount,
+		UpstreamProtocol: req.UpstreamProtocol,
+		UpstreamModel:    req.UpstreamModel,
+		LedgerEntryID:    req.LedgerEntryID,
+		CostSource:       req.CostSource,
 	}
 	// 只要提供了成本单价就记录成本积分（仅展示/毛利差异，不参与扣减）：
 	// sale 模式 cost_credits 反映真实成本（区别于售价积分的毛利段），
@@ -337,11 +410,30 @@ func (s *Service) settleLedger(ctx context.Context, rec *Record, req RecordReq, 
 func (s *Service) settleTx(ctx context.Context, rec *Record, req RecordReq, credits float64) (out *Record, err error, done bool) {
 	tx, berr := s.txdb.BeginTx(ctx, nil)
 	if berr != nil {
-		return nil, berr, false
+		// ⚠️ 资金底线（2026-11-15 复审 R3）：事务开不起来时**绝不退回非事务路径**——
+		// 那条路是「先 Consume 真扣钱、再 Insert 落账」，事务不可用往往伴随库不可用，
+		// 于是钱扣了、账单写不进去（重试队列对确定性错误永远重试不成功）。
+		// 取舍：宁可不成交（本次不扣款、不落账，请求报错），也不出现「扣了钱没账」。
+		// 这里不重试 BeginTx：连接层问题由上层请求重试/连接池负责，账单侧重试没有意义。
+		slog.ErrorContext(ctx, "billing tx begin failed, abort without charging",
+			"billing_id", rec.BillingID, "user_id", rec.UserID, "err", berr)
+		return nil, fmt.Errorf("begin billing tx: %w", berr), true
 	}
 	defer tx.Rollback() //nolint:errcheck // Commit 成功后 Rollback 是 no-op
 
-	before, after, err := s.consumeInTx(ctx, tx, rec, req, credits)
+	// 预扣终结必须与本次结算同事务、且**先于扣款**（Owl 复审 P1，2026-11-16）：
+	// 旧写法把终结放在事务尾、且丢弃 owned=false，于是「请求活过 15 分钟 → ExpireHolds 已全额退回
+	// 预扣 → 本次结算又按 credits-PreConsumed 减一次预扣」= **重复退款**（实测 credits=12/预扣 10
+	// 时余额多出 10）。先抢终结权后，未被终结（owned=false）说明预扣已经退过，本次必须按全额扣。
+	holdOwned, herr := closeHoldInTx(ctx, tx, req.Hold)
+	if herr != nil {
+		_ = tx.Rollback()
+		slog.ErrorContext(ctx, "billing tx rolled back: hold close failed",
+			"billing_id", rec.BillingID, "user_id", rec.UserID, "err", herr)
+		return nil, herr, true
+	}
+
+	before, after, err := s.consumeInTx(ctx, tx, rec, req, credits, holdOwned)
 	if err != nil {
 		// 扣款失败（40201 余额不足 / 40401 钱包缺失等）：先回滚，再在事务外落 failed 账单
 		// （否则 failed 记录会随回滚一起丢掉），并透传原始错误（网关据此映射 402）。
@@ -359,13 +451,22 @@ func (s *Service) settleTx(ctx context.Context, rec *Record, req RecordReq, cred
 		// 并发竞态兜底：两个请求可能都通过幂等快速路径，billing_id 唯一索引保证其一写库成功、
 		// 另一侧撞唯一约束（23505）。撞库方本次扣款已随事务回滚（未重复扣），重查已落库记录返回。
 		if isUniqueViolation(ierr) {
-			existing, gerr := s.store.GetByBillingID(ctx, rec.BillingID)
+			existing, gerr := s.recordByBillingID(ctx, rec.BillingID)
 			if gerr == nil && existing != nil && existing.Status == StatusCompleted {
 				return existing, nil, true
 			}
 			return nil, ierr, true
 		}
-		// 真实写入失败：本次扣款已回滚（余额不变），退回非事务路径重试；其失败由重试队列兜底。
+		// 非「可重投」类写入失败（约束/非法值等确定性错误）：事务已回滚、余额不变，
+		// **不许**退回非事务路径——那条路会先真扣钱再落库，一失败就变成「钱扣了账没落」。
+		// 交回调用方按失败处理（含重试队列），不再二次扣款。
+		if isDeterministicWriteError(ierr) {
+			slog.ErrorContext(ctx, "billing insert rejected, no retry on non-transactional path",
+				"billing_id", rec.BillingID, "user_id", rec.UserID, "err", ierr)
+			return nil, ierr, true
+		}
+		// 其它写入失败（连接/超时等）：本次扣款已回滚（余额不变），退回非事务路径重试；
+		// 其失败由重试队列兜底。
 		return nil, ierr, false
 	}
 	if cerr := tx.Commit(); cerr != nil {
@@ -375,9 +476,59 @@ func (s *Service) settleTx(ctx context.Context, rec *Record, req RecordReq, cred
 	return rec, nil, true
 }
 
+// closeHoldInTx 在结算事务内终结预扣登记，返回「本次是否真的由我终结」。
+//
+// req 为 nil 或无 Closer 时返回 true：调用方没有预扣登记（如历史 V1 链路），
+// 扣款按「有预扣」的差额口径走（保持既有行为），不因缺 hold 而多扣。
+func closeHoldInTx(ctx context.Context, ex dbx.Execer, req *HoldCloseReq) (bool, error) {
+	if req == nil || req.Closer == nil {
+		return true, nil
+	}
+	owned, err := req.Closer.CloseHoldTx(ctx, ex, req.BillingID, req.Status, req.LedgerEntryID)
+	if err != nil {
+		return false, fmt.Errorf("结算事务内终结预扣失败：%w", err)
+	}
+	return owned, nil
+}
+
+// isDeterministicWriteError 判断账单写入失败是否属于「重投也没用」的确定性错误：
+// 约束冲突（23514 CHECK / 23503 外键 / 23502 NOT NULL / 22xxx 数据类型）与一切非连接类错误。
+//
+// 为什么单独判：事务路径回滚后有一条「退回非事务路径」的保底，那条路会**重新扣一次钱**。
+// 对确定性错误重投必然再失败，等于把「扣了钱没账单」做实（预审 P1 资金事故）。
+func isDeterministicWriteError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// 连接类（可重投）：坏连接 / 连接已关 / 上下文取消超时 / PG 的 08 连接异常、57 运维中断、53 资源不足。
+	if errors.Is(err, driver.ErrBadConn) || errors.Is(err, sql.ErrConnDone) ||
+		errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		switch {
+		case strings.HasPrefix(pgErr.Code, "08"),
+			strings.HasPrefix(pgErr.Code, "57"),
+			strings.HasPrefix(pgErr.Code, "53"):
+			return false
+		}
+	}
+	// 其余（约束冲突 23xxx、数据异常 22xxx、编码/参数/校验类）：确定性错误，重投必然再失败。
+	return true
+}
+
 // settlePlain 非事务路径（txdb 未注入）：扣款与落库独立执行，语义与历史行为一致。
 func (s *Service) settlePlain(ctx context.Context, rec *Record, req RecordReq, credits float64) (*Record, error) {
-	before, after, err := s.consumeInTx(ctx, nil, rec, req, credits)
+	// 非事务路径没有原子性可言（仅测试/未装配 txdb 时走到这里）：终结与扣款无法同事务，
+	// 但仍要先终结再扣款 —— 只有先拿到 owned 才能判断「预扣是否已被过期扫描退回」。
+	// 失败不阻断（历史行为），但要留下 ERROR 级痕迹，别让「钱扣了 hold 还 held」静默发生。
+	holdOwned, herr := closeHoldInTx(ctx, nil, req.Hold)
+	if herr != nil {
+		slog.ErrorContext(ctx, "hold close failed on non-transactional path",
+			"billing_id", rec.BillingID, "err", herr)
+	}
+	before, after, err := s.consumeInTx(ctx, nil, rec, req, credits, holdOwned)
 	if err != nil {
 		return s.insertFailedOutOfTx(ctx, rec, err)
 	}
@@ -387,7 +538,7 @@ func (s *Service) settlePlain(ctx context.Context, rec *Record, req RecordReq, c
 	rec.BalanceAfter = after
 	if _, err := s.store.Insert(ctx, rec); err != nil {
 		if isUniqueViolation(err) {
-			if existing, gerr := s.store.GetByBillingID(ctx, rec.BillingID); gerr == nil &&
+			if existing, gerr := s.recordByBillingID(ctx, rec.BillingID); gerr == nil &&
 				existing != nil && existing.Status == StatusCompleted {
 				return existing, nil
 			}
@@ -401,13 +552,23 @@ func (s *Service) settlePlain(ctx context.Context, rec *Record, req RecordReq, c
 
 // consumeInTx 执行钱包扣减/差额结算：ex 为 nil 时走非事务版本（无 Tx 能力的 credit 桩）。
 // 返回扣减前后的余额。
-func (s *Service) consumeInTx(ctx context.Context, ex dbx.Execer, rec *Record, req RecordReq, credits float64) (before, after float64, err error) {
-	if req.PreConsumed > 0 {
+// holdOwned 表示「预扣登记是本次结算终结的」（见 closeHoldInTx）。
+//
+// false 的语义是**预扣已经不在 held 状态**：最典型的是请求活超过 15 分钟、
+// ExpireHolds 已把整笔预扣全额退回钱包。此时再按 credits-PreConsumed 结算
+// 等于把已经退过的预扣又减一次（重复退款），所以必须按全额扣。
+func (s *Service) consumeInTx(ctx context.Context, ex dbx.Execer, rec *Record, req RecordReq, credits float64, holdOwned bool) (before, after float64, err error) {
+	if req.PreConsumed > 0 && holdOwned {
 		delta := credits - req.PreConsumed
 		if ex != nil {
 			return s.credit.SettleTx(ctx, ex, req.UserID, delta, req.SessionID, "实际调用差额")
 		}
 		return s.credit.Settle(ctx, req.UserID, delta, req.SessionID, "实际调用差额")
+	}
+	if req.PreConsumed > 0 {
+		// 预扣已被别的路径终结（过期退回）：按全额扣，绝不再退预扣。
+		slog.WarnContext(ctx, "pre-consumed hold already closed before settle, charging full amount",
+			"billing_id", rec.BillingID, "user_id", req.UserID, "pre_consumed", req.PreConsumed, "credits", credits)
 	}
 	if ex != nil {
 		return s.credit.ConsumeTx(ctx, ex, req.UserID, credits, rec.BillingID, req.SessionID, "实际调用差额")
@@ -885,8 +1046,11 @@ func (s *SqlStore) SetConfigWriteHook(fn func()) {
 }
 
 // recordCols 查询 billing_records 使用的全部列。
+//
+// ⚠️ 这里**不再有 channel_key_id**：0024 已删该列；渠道维度只剩 call_logs 的历史快照
+// （call_logs 与账单按 billing_id 1:1），见 fillChannelKeys。写路径同样不再写该列。
 const recordCols = `id, billing_id, user_id, pricing_mode, token_id, external_model_name,
-	auto_model_name, internal_model_id, channel_key_id, session_id, session_name, call_time, tokens, rates, coefficients, r_value,
+	auto_model_name, internal_model_id, session_id, session_name, call_time, tokens, rates, coefficients, r_value,
 	raw_total, credits_consumed, cost_credits, balance_before, balance_after, status, error_message, duration_ms, first_token_ms`
 
 // GetConfig 读取 sys_configs 单键值；key 不存在返回错误。
@@ -903,14 +1067,24 @@ func (s *SqlStore) GetConfig(ctx context.Context, key string) ([]byte, error) {
 }
 
 // GetByBillingID 按 billing_id 查询；无记录返回 sql.ErrNoRows。
+// 展示用的渠道密钥维度由 call_logs 快照回填（billing_records 已无该列）。
 func (s *SqlStore) GetByBillingID(ctx context.Context, billingID string) (*Record, error) {
-	row := s.db.QueryRowContext(ctx,
-		`SELECT `+recordCols+` FROM billing_records WHERE billing_id=$1`, billingID)
-	rec, err := sqlScan(row)
+	rec, err := s.scanByBillingID(ctx, billingID)
 	if err != nil {
 		return nil, err
 	}
+	if err := fillChannelKeys(ctx, s.db, []*Record{rec}); err != nil {
+		return nil, err
+	}
 	return rec, nil
+}
+
+// scanByBillingID 只读 billing_records 本表（不回填展示维度）。
+// 写路径的幂等预检查用它：那里只关心「是否已存在、状态如何」，不需要为了展示多查一次 call_logs。
+func (s *SqlStore) scanByBillingID(ctx context.Context, billingID string) (*Record, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT `+recordCols+` FROM billing_records WHERE billing_id=$1`, billingID)
+	return sqlScan(row)
 }
 
 // Insert 插入一条计费记录（billing_id 唯一约束冲突返回错误）。
@@ -943,11 +1117,6 @@ func (s *SqlStore) insertOn(ctx context.Context, ex dbx.Execer, rec *Record) (*R
 	if rec.TokenID != nil {
 		tokenID = *rec.TokenID
 	}
-	// 未进入渠道的拒绝类账单 channel_key_id 为 0 → 写 NULL（列可空，0 不满足外键）。
-	var channelKeyID any
-	if rec.ChannelKeyID > 0 {
-		channelKeyID = rec.ChannelKeyID
-	}
 	var sessionID any
 	if rec.SessionID != "" {
 		sessionID = rec.SessionID
@@ -965,6 +1134,13 @@ func (s *SqlStore) insertOn(ctx context.Context, ex dbx.Execer, rec *Record) (*R
 	}
 	durationMs := nullableInt64For(rec.DurationMs)
 	firstTokenMs := nullableInt64For(rec.FirstTokenMs)
+	// ⚠️ 0024_v2_drop_legacy 已删 billing_records.channel_key_id：这里**不再写**该列。
+	// 渠道维度只剩 call_logs.channel_key_id 的历史快照（读路径见 fillChannelKeys），
+	// 新账单的渠道维度恒为空 —— 这是「渠道体系下线」的必然结果，不是丢数据。
+
+	// V2 归因七列：写库前归一（非法协议 → NULL、非法 cost_source → none + WARN）。
+	// 归因是解释性字段，**不许**因为它的取值问题让账单写不进去（会让扣款与落账不一致）。
+	attr := attributionArgs(ctx, rec)
 
 	var created time.Time
 	if rec.ID == 0 {
@@ -972,19 +1148,80 @@ func (s *SqlStore) insertOn(ctx context.Context, ex dbx.Execer, rec *Record) (*R
 	}
 	err = ex.QueryRowContext(ctx,
 		`INSERT INTO billing_records(id, billing_id, user_id, pricing_mode, token_id, external_model_name,
-			auto_model_name, internal_model_id, channel_key_id, session_id, session_name, call_time, tokens, rates, coefficients, r_value,
-			raw_total, credits_consumed, cost_credits, balance_before, balance_after, status, error_message, duration_ms, first_token_ms)
-		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
+			auto_model_name, internal_model_id, session_id, session_name, call_time, tokens, rates, coefficients, r_value,
+			raw_total, credits_consumed, cost_credits, balance_before, balance_after, status, error_message, duration_ms, first_token_ms,
+			request_id, upstream_provider, upstream_account, upstream_protocol, upstream_model, ledger_entry_id, cost_source)
+		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,
+			$25,$26,$27,$28,$29,$30,$31)
 		 RETURNING id, created_at`,
-		rec.ID, rec.BillingID, rec.UserID, rec.PricingMode, tokenID, rec.ExternalModel, autoModelName,
-		rec.InternalModelID, channelKeyID, sessionID, sessionName, rec.CallTime, tokensRaw, ratesRaw, coeffRaw,
-		rec.RValue, rec.RawTotal, rec.CreditsConsumed, rec.CostCredits,
-		rec.BalanceBefore, rec.BalanceAfter, rec.Status, errMsg, durationMs, firstTokenMs).
+		append([]any{
+			rec.ID, rec.BillingID, rec.UserID, rec.PricingMode, tokenID, rec.ExternalModel, autoModelName,
+			rec.InternalModelID, sessionID, sessionName, rec.CallTime, tokensRaw, ratesRaw, coeffRaw,
+			rec.RValue, rec.RawTotal, rec.CreditsConsumed, rec.CostCredits,
+			rec.BalanceBefore, rec.BalanceAfter, rec.Status, errMsg, durationMs, firstTokenMs,
+		}, attr...)...).
 		Scan(&rec.ID, &created)
 	if err != nil {
 		return nil, err
 	}
 	return rec, nil
+}
+
+// fillChannelKeys 用 call_logs 的 1:1 历史快照回填渠道密钥维度（0024 之后**唯一**来源）。
+//
+// 为什么不写成 recordCols 里的标量子查询：recordCols 会被多表 JOIN/归并查询复用，加子查询要么
+// 需要给外层表起别名（三处查询各一套），要么在归并 CTE 里落到错误的表上；批量回填只有一次查询，
+// 且「值不变」这件事只在一个函数里说得清（迁移前 billing_records 与该快照同值）。
+// 缺 call_logs 行（拒绝类账单没有日志）时留 0，与历史「未进入渠道」的语义一致。
+func fillChannelKeys(ctx context.Context, ex dbx.Execer, recs []*Record) error {
+	if len(recs) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(recs))
+	pos := make(map[string][]int, len(recs))
+	for i, rec := range recs {
+		if rec == nil || rec.BillingID == "" {
+			continue
+		}
+		bid := rec.BillingID
+		if _, ok := pos[bid]; !ok {
+			ids = append(ids, bid)
+		}
+		pos[bid] = append(pos[bid], i)
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	// 用 IN($1..$n) 而不是 ANY($1::text[])：不依赖驱动对切片参数的编码，
+	// 也让用例（sqlmock）与生产（pgx）走同一条 SQL 形状。
+	marks := make([]string, len(ids))
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		marks[i] = fmt.Sprintf("$%d", i+1)
+		args[i] = id
+	}
+	// 0024 之后 billing_records 已无 channel_key_id，快照（call_logs）是唯一来源：
+	// 新账单（call_logs 停写之后）恒查不到 → 渠道维度留 0，符合「渠道体系下线」的口径。
+	rows, err := ex.QueryContext(ctx,
+		`SELECT cl.billing_id, cl.channel_key_id
+		   FROM call_logs cl
+		  WHERE cl.billing_id IN (`+strings.Join(marks, ", ")+`)
+		    AND cl.channel_key_id IS NOT NULL`, args...)
+	if err != nil {
+		return fmt.Errorf("读取调用日志的渠道密钥维度失败：%w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var bid string
+		var keyID int64
+		if err := rows.Scan(&bid, &keyID); err != nil {
+			return fmt.Errorf("扫描调用日志的渠道密钥维度失败：%w", err)
+		}
+		for _, i := range pos[bid] {
+			recs[i].ChannelKeyID = keyID
+		}
+	}
+	return rows.Err()
 }
 
 // nullableInt64For 把 *int64 转为可入库的 any（nil → nil）。
@@ -999,7 +1236,6 @@ func nullableInt64For(v *int64) any {
 func sqlScan(row interface{ Scan(...any) error }) (*Record, error) {
 	var rec Record
 	var tokenID sql.NullInt64
-	var channelKeyID sql.NullInt64
 	var sessionID sql.NullString
 	var sessionName sql.NullString
 	var autoModelName sql.NullString
@@ -1010,7 +1246,7 @@ func sqlScan(row interface{ Scan(...any) error }) (*Record, error) {
 	var callTime time.Time
 
 	err := row.Scan(&rec.ID, &rec.BillingID, &rec.UserID, &rec.PricingMode, &tokenID,
-		&rec.ExternalModel, &autoModelName, &rec.InternalModelID, &channelKeyID, &sessionID, &sessionName, &callTime,
+		&rec.ExternalModel, &autoModelName, &rec.InternalModelID, &sessionID, &sessionName, &callTime,
 		&tokensRaw, &ratesRaw, &coeffRaw, &rec.RValue,
 		&rawTotal, &consCred, &costCred, &balBefore, &balAfter, &rec.Status, &errMsg,
 		&durationMs, &firstTokenMs)
@@ -1020,9 +1256,6 @@ func sqlScan(row interface{ Scan(...any) error }) (*Record, error) {
 	if tokenID.Valid {
 		v := tokenID.Int64
 		rec.TokenID = &v
-	}
-	if channelKeyID.Valid {
-		rec.ChannelKeyID = channelKeyID.Int64
 	}
 	if rawTotal.Valid {
 		rec.RawTotal = rawTotal.Float64

@@ -49,6 +49,12 @@ type Result struct {
 	NoContent bool
 	// Billable 表示该端点参与计费（count_tokens 类为 false）。
 	Billable bool
+	// DownstreamBytes 是**已经写给下游**的响应体字节数（不含状态行/头，含 SSE 帧）。
+	//
+	// 为什么要有它：无 usage 时本网关不计费（整笔退预扣），于是「上游没给 usage 但确实
+	// 吐了内容」对租户是白送。只有 `error_message='no-usage'` 这一条线索时，连
+	// 「白送了多少」都量不出来 —— 这个字段是那条链路的唯一度量（落 WARN 日志）。
+	DownstreamBytes int64
 	// CredentialMasked 表示响应体命中了「本次凭据回显」并已替换为 <redacted>
 	// （契约 §8.1 的唯一豁免项；未命中时字节完全不变）。
 	CredentialMasked bool
@@ -58,18 +64,40 @@ type Result struct {
 
 	Duration time.Duration
 	Err      error
+
+	// RequestBody 是**改写后**的请求体（只给计费预扣估算输入规模用；只读，不许改写）。
+	RequestBody []byte
+	// SessionID 是入站会话标识（空 = 无会话）。
+	SessionID string
+	// Reservation 是入口预扣句柄（OnReserve 产出，原样带回给 OnComplete）。
+	Reservation any
 }
 
-// Hook 是转发结束回调（第③件的接入点：计费/退预扣/对账在这里接）。
-// 本件不注入（nil），因此不会产生任何账单或扣费动作。
+// ReserveInput 是预扣输入（准入 + 改写之后才拿得到：售价来自命中模型，规模来自实际请求体）。
+type ReserveInput struct {
+	UserID        int64
+	TokenID       int64
+	ExternalModel string
+	Protocol      string
+	Endpoint      string
+	SessionID     string
+	RequestBody   []byte
+}
+
+// ReserveHook 是预扣钩子：返回句柄（原样交回 Hook）或 Deny（拒绝转发）。
+type ReserveHook func(ctx context.Context, in ReserveInput) (any, *Deny)
+
+// Hook 是转发结束回调（计费结算 / 退预扣的落点）。
+// 注入 nil 时不产生任何账单或扣费动作。
 type Hook func(ctx context.Context, res Result)
 
 // Proxy 是无状态的转发执行器（并发安全）。
 type Proxy struct {
-	cfg   Config
-	plain *http.Client
-	sse   *http.Client
-	hook  Hook
+	cfg     Config
+	plain   *http.Client
+	sse     *http.Client
+	hook    Hook
+	reserve ReserveHook
 }
 
 // NewProxy 装配转发执行器：两个 client 只在「响应头超时」上不同
@@ -98,8 +126,11 @@ func NewProxy(cfg Config) *Proxy {
 	}
 }
 
-// SetOnComplete 注入转发结束回调（第③件使用；本件保持 nil）。
+// SetOnComplete 注入转发结束回调（计费结算 / 退预扣）。
 func (p *Proxy) SetOnComplete(fn Hook) { p.hook = fn }
+
+// SetOnReserve 注入预扣钩子（由 handler 在改写后调用，句柄经 Result 带回）。
+func (p *Proxy) SetOnReserve(fn ReserveHook) { p.reserve = fn }
 
 // Forward 执行一次转发。prep 是准入/改写后的产物。
 //
@@ -115,6 +146,9 @@ func (p *Proxy) Forward(w http.ResponseWriter, r *http.Request, route Route, pre
 		MagpieModel:   prep.MagpieModel,
 		CallerKeyName: prep.CallerKeyName,
 		Billable:      route.Billable,
+		RequestBody:   prep.Body,
+		SessionID:     prep.SessionID,
+		Reservation:   prep.Reservation,
 	}
 	defer func() {
 		res.Duration = time.Since(start)
@@ -184,6 +218,10 @@ func (p *Proxy) Forward(w http.ResponseWriter, r *http.Request, route Route, pre
 	needle := prep.CallerKey
 	body := io.Reader(resp.Body)
 	decoded := false
+	// stripEncoding 只在「声明的编码被解码器在**读取头部时**就拒绝」时置真：
+	// 那些字节根本不是该编码（典型：中间层硬加 `Content-Encoding: gzip`，而体已被它解压成明文）。
+	// 此时体按原字节转发，编码头必须剥掉，否则下游按 gzip 解一段明文直接报错（见下面的响应头段）。
+	stripEncoding := false
 	isSSE := isEventStream(resp.Header.Get("Content-Type"))
 	// decodeReplay 非空表示「解码器坐在快照 reader 上」：解码失败（无论 NewReader 就失败，
 	// 还是读到中途失败，如声称 gzip 但流被截断）都还能从快照回退到上游原始字节。
@@ -205,8 +243,11 @@ func (p *Proxy) Forward(w http.ResponseWriter, r *http.Request, route Route, pre
 				// 一段字节读走，直接回空壳等于把整段响应丢光（实测 1500 字节 → 0 字节）。
 				// 回退到「已消费前缀 + 剩余」的原始字节（不丢字节），
 				// 遮蔽豁免在该响应上不成立 → 记 UnmaskableEncoding 让 handler 落告警。
+				// 同时判定「头与体不自洽」（NewReader 只读前 10 字节的魔数就失败，
+				// 说明这些字节根本不是 gzip）→ 剥 Content-Encoding，见下方响应头段。
 				body = rr.replay()
 				res.UnmaskableEncoding = enc
+				stripEncoding = true
 			}
 		case "deflate":
 			rr := &replayReader{r: resp.Body}
@@ -218,6 +259,7 @@ func (p *Proxy) Forward(w http.ResponseWriter, r *http.Request, route Route, pre
 			} else {
 				body = rr.replay()
 				res.UnmaskableEncoding = enc
+				stripEncoding = true
 			}
 		default:
 			res.UnmaskableEncoding = enc
@@ -234,6 +276,15 @@ func (p *Proxy) Forward(w http.ResponseWriter, r *http.Request, route Route, pre
 		// 已解压：编码头与压缩前长度都不再成立。
 		w.Header().Del("Content-Encoding")
 		w.Header().Del("Content-Length")
+	}
+	if stripEncoding {
+		// 声明的编码被解码器在**读头部时**就拒绝（这些字节根本不是该编码）：
+		// 体按上游原始字节转发（未解压，也没改写），留着编码头会让下游按 gzip 解一段明文
+		// → `gzip: invalid header`，客户端侧表现为「流断了」（最难查的一类）。
+		// 只删编码头：转发的是原字节，Content-Length 仍然成立，不动。
+		// 与「头合法但解压中途失败（如截断）」区分：那条路保留编码头（字节确实是该编码），
+		// 见 serveMaskedBuffered 的回退分支——那条路上剥头会让下游把 gzip 字节当明文。
+		w.Header().Del("Content-Encoding")
 	}
 	if res.NoContent {
 		w.WriteHeader(resp.StatusCode)
@@ -348,6 +399,7 @@ func (p *Proxy) serveMaskedBuffered(w http.ResponseWriter, body io.Reader, colle
 				res.Canceled = true
 				return
 			}
+			res.DownstreamBytes += int64(len(out))
 		}
 		buf := make([]byte, 32*1024)
 		for {
@@ -361,6 +413,7 @@ func (p *Proxy) serveMaskedBuffered(w http.ResponseWriter, body io.Reader, colle
 						res.Canceled = true
 						return
 					}
+					res.DownstreamBytes += int64(len(out))
 				}
 			}
 			if rerr != nil {
@@ -368,6 +421,8 @@ func (p *Proxy) serveMaskedBuffered(w http.ResponseWriter, body io.Reader, colle
 					if tail := masker.flush(); len(tail) > 0 {
 						if _, werr := w.Write(tail); werr != nil {
 							res.Canceled = true
+						} else {
+							res.DownstreamBytes += int64(len(tail))
 						}
 					}
 					if masker.replaced {
@@ -393,6 +448,8 @@ func (p *Proxy) serveMaskedBuffered(w http.ResponseWriter, body io.Reader, colle
 	w.WriteHeader(res.Status)
 	if _, werr := w.Write(masked); werr != nil {
 		res.Canceled = true
+	} else {
+		res.DownstreamBytes += int64(len(masked))
 	}
 }
 
@@ -520,6 +577,7 @@ func (p *Proxy) copyBody(w http.ResponseWriter, body io.Reader, collector *usage
 					cancel()
 					return nil
 				}
+				res.DownstreamBytes += int64(len(out))
 			}
 			if isSSE && flusher != nil {
 				flusher.Flush()
@@ -534,6 +592,7 @@ func (p *Proxy) copyBody(w http.ResponseWriter, body io.Reader, collector *usage
 						cancel()
 						return nil
 					}
+					res.DownstreamBytes += int64(len(tail))
 					if isSSE && flusher != nil {
 						flusher.Flush()
 					}

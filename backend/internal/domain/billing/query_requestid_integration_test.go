@@ -83,9 +83,11 @@ func TestListRecords_RequestIDFilter_Integrated(t *testing.T) {
 	}
 	exec(`INSERT INTO users(id, username, password_hash, role) VALUES (1, 'u1', 'x', 'ADMIN')`)
 	// 三条账单：A 组两次尝试（一次失败、一次成功），B 组一次成功。
+	// cost_source 必须显式给 'none'：F10 的跨列 CHECK（NOT VALID 只放过存量行）要求
+	// 「无成本则来源必须恰好是 none」，夹具漏给会 23514（Gate 复验里 2 条红就是这个）。
 	insertBill := `INSERT INTO billing_records(
-		id, billing_id, user_id, pricing_mode, external_model_name, internal_model_id, r_value, status, call_time)
-		VALUES ($1,$2,$3,'sale','gpt-4','gpt-4-int',10000,$4,$5)`
+		id, billing_id, user_id, pricing_mode, external_model_name, internal_model_id, r_value, status, call_time, cost_source)
+		VALUES ($1,$2,$3,'sale','gpt-4','gpt-4-int',10000,$4,$5,'none')`
 	now := time.Now()
 	exec(insertBill, int64(1), "bill-a1", int64(1), "failed", now.Add(-2*time.Second))
 	exec(insertBill, int64(2), "bill-a2", int64(1), "completed", now.Add(-time.Second))
@@ -160,9 +162,10 @@ func TestListRecords_GroupByRequest_UserIsolation_Integrated(t *testing.T) {
 		}
 	}
 	exec(`INSERT INTO users(id, username, password_hash, role) VALUES (1,'u1','x','ADMIN'), (2,'u2','x','DEVELOPER')`)
+	// 同上：F10 跨列 CHECK 要求无成本的账单显式标 'none'。
 	insertBill := `INSERT INTO billing_records(
-		id, billing_id, user_id, pricing_mode, external_model_name, internal_model_id, r_value, status, call_time)
-		VALUES ($1,$2,$3,'sale','gpt-4','gpt-4-int',10000,$4,now())`
+		id, billing_id, user_id, pricing_mode, external_model_name, internal_model_id, r_value, status, call_time, cost_source)
+		VALUES ($1,$2,$3,'sale','gpt-4','gpt-4-int',10000,$4,now(),'none')`
 	insertLog := `INSERT INTO call_logs(id, billing_id, request_id) VALUES ($1,$2,$3)`
 
 	id := int64(100)

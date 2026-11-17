@@ -87,10 +87,6 @@ async function onRotate() {
           <el-descriptions-item label="标识">
             <span class="mono">{{ token.TokenDisplay }}</span>
           </el-descriptions-item>
-          <el-descriptions-item label="路由">
-            <el-tag v-if="!token.TagID" size="small" type="info" effect="plain">默认路由</el-tag>
-            <el-tag v-else size="small" effect="plain">已绑定标签</el-tag>
-          </el-descriptions-item>
           <el-descriptions-item label="状态"><StatusTag :value="statusDesc" /></el-descriptions-item>
           <el-descriptions-item label="创建时间">{{ token.CreatedAt }}</el-descriptions-item>
           <el-descriptions-item label="最近使用">{{ token.LastUsedAt || '-' }}</el-descriptions-item>

@@ -7,7 +7,7 @@
 import { onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue'
 import * as echarts from 'echarts/core'
 import type { EChartsCoreOption } from 'echarts/core'
-import { LineChart, BarChart, PieChart, ScatterChart } from 'echarts/charts'
+import { LineChart, BarChart, PieChart, ScatterChart, LinesChart } from 'echarts/charts'
 import {
   GridComponent,
   TooltipComponent,
@@ -23,6 +23,8 @@ echarts.use([
   PieChart,
   // 散点：失败轮 / 真实切换点 / 预测打平点等「标记类」序列都要它，缺了会被 ECharts 静默忽略。
   ScatterChart,
+  // 关系连线：拓扑画布「内部模型 ↔ 对外模型落位」用它，缺了同样会被静默忽略。
+  LinesChart,
   GridComponent,
   TooltipComponent,
   LegendComponent,
