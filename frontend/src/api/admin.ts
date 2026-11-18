@@ -479,6 +479,20 @@ export function putSystemConfig(payload: SystemConfigPayload) {
   return http.put<{ Affected: number }, ApiRes<{ Affected: number }>>('/admin/configs/system', payload)
 }
 
+// ===== 代理侧（magpie）管理面一键跳转 =====
+// 后端先校验会话是 ADMIN，再签一张 8 小时的票据（HttpOnly cookie `magpie_gate`），
+// 回一个**同源相对路径**。代理侧的页面口令由 nginx 在服务端代填，URL 里不含任何凭据。
+export interface MagpieAccessData {
+  Url: string
+  ExpiresAt: string
+}
+// 503 = 代理侧还没接入（magpie.base_url 没配）：页面自己出引导文案，不弹全局红条。
+export function requestMagpieConsole() {
+  return http.post<MagpieAccessData, ApiRes<MagpieAccessData>>('/admin/ops/magpie-access', undefined, {
+    silentStatuses: [503],
+  })
+}
+
 // ===== 公告（字段名 = Go 字段名）=====
 export interface AdminAnnouncement {
   ID: string

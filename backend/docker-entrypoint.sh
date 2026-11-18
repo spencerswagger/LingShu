@@ -2,8 +2,9 @@
 # 容器启动脚本：零配置开箱即用，同时不落公开默认密钥。
 #   1) SM4 渠道凭据密钥：优先生效 SM4_KEY 环境变量；未提供则首次启动生成强随机密钥并持久化到 keys 卷
 #   2) JWT RSA 密钥对：缺失时生成并持久化（重新生成会使已签发令牌失效）
-#   3) 由环境变量渲染 config.yaml（DSN、监听地址等）
-#   4) 主进程以非特权用户 app 运行：root 启动时先修复卷属主（兼容旧 root 卷）、完成初始化，
+#   3) 代理侧（magpie）管理密钥：留空则读共享卷里 magpie-init 首次生成的那一份
+#   4) 由环境变量渲染 config.yaml（DSN、监听地址等）
+#   5) 主进程以非特权用户 app 运行：root 启动时先修复卷属主（兼容旧 root 卷）、完成初始化，
 #      再 exec 降权；迁移与初始管理员种子由程序自身在启动时自动完成
 set -eu
 
@@ -47,6 +48,22 @@ fi
 # 密钥文件统一收紧到 600（目录已为 700）
 chmod 600 "$KEYS_DIR/jwt_rsa" "$KEYS_DIR/jwt_rsa.pub"
 
+# 3) 代理侧（magpie）接入参数
+#    基址由 MAGPIE_BASE_URL 提供（compose 里默认 http://magpie:3425）。
+#    管理密钥 MAGPIE_ADMIN_KEY 的口径：
+#      - 环境变量显式给出（手工在 magpie 管理面建 key 的场景）→ 用它；
+#      - 否则读共享卷里 magpie-init 首次生成的那一份 —— magpie 与 backend 读的是同一把，
+#        因此无需任何人工填值（重置方式见 docs/deploy/magpie-container.md）。
+#    账本变更流（UPSTREAM_ADMIN_KEY）打的是同一个代理侧，默认复用同一把密钥。
+MAGPIE_ADMIN_KEY_FILE="${MAGPIE_ADMIN_KEY_FILE:-/run/magpie-secret/admin_key}"
+if [ -z "${MAGPIE_ADMIN_KEY:-}" ] && [ -r "$MAGPIE_ADMIN_KEY_FILE" ]; then
+  MAGPIE_ADMIN_KEY=$(cat "$MAGPIE_ADMIN_KEY_FILE")
+fi
+if [ -z "${UPSTREAM_ADMIN_KEY:-}" ] && [ -n "${MAGPIE_ADMIN_KEY:-}" ]; then
+  UPSTREAM_ADMIN_KEY="$MAGPIE_ADMIN_KEY"
+fi
+export MAGPIE_ADMIN_KEY UPSTREAM_ADMIN_KEY
+
 # DSN 统一附加时区参数：已有 timezone 则不重复；已有 query 用 & 连接，避免破坏 sslmode 等已有参数
 dsn_with_timezone() {
   case "$1" in
@@ -56,7 +73,7 @@ dsn_with_timezone() {
   esac
 }
 
-# 3) 渲染配置
+# 4) 渲染配置
 cat > "$CONFIG_PATH" <<EOF
 server:
   addr: "${SERVER_ADDR:-:8080}"
@@ -69,6 +86,11 @@ jwt:
   ttl_minutes: ${JWT_TTL_MINUTES:-360}
 security:
   sm4_key: "$SM4_KEY"
+magpie:
+  # 代理侧基址（空 = 对外转发接口停用）；默认由 compose 的 MAGPIE_BASE_URL 提供
+  base_url: "${MAGPIE_BASE_URL:-}"
+  # 管理/用量/拓扑用的网关密钥：与 magpie 容器内的那把是同一个值
+  admin_key: "${MAGPIE_ADMIN_KEY:-}"
 sync:
   price_source_url: "${PRICE_SOURCE_URL:-https://models.dev/api.json}"
   interval_minutes: ${SYNC_INTERVAL_MINUTES:-60}
@@ -81,7 +103,7 @@ preset:
 EOF
 chmod 600 "$CONFIG_PATH"
 
-# 4) 启动（相对路径的读取需在工作目录下）；root 场景先 chown 生成的密钥/配置，再降权执行
+# 5) 启动（相对路径的读取需在工作目录下）；root 场景先 chown 生成的密钥/配置，再降权执行
 cd "$APP_DIR"
 if [ "$(id -u)" -eq 0 ]; then
   chown -R "$APP_USER:$APP_GROUP" "$KEYS_DIR" "$DATA_DIR"

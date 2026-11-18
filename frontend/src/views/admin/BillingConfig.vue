@@ -16,7 +16,9 @@ import {
   type SessionExpirationData,
   type SystemConfigPayload,
   type UpstreamConfigData,
+  requestMagpieConsole,
 } from '@/api/admin'
+import { useAuthStore } from '@/stores/auth'
 import ModelPricing from '@/components/ModelPricing.vue'
 import ErrorBubble from '@/components/ErrorBubble.vue'
 
@@ -68,6 +70,39 @@ const sessionCost = ref<SessionCostConfig>({
   fallback_note: '',
 })
 const advancedOpen = ref<string[]>([]) // 「高级参数」折叠区，默认收起
+
+// ===== 代理侧管理台 =====
+// 只有 ADMIN 才看得到入口（路由本身也已限管理员，这里再判一次，避免以后挪到公共页时漏掉）。
+const auth = useAuthStore()
+const isAdmin = computed(() => auth.role === 'ADMIN')
+const magpieBusy = ref(false)
+const magpieHint = ref('')
+// 管理台里能直接看到上游渠道与**明文凭据**，所以入口要显式提示，而不是一个无说明的按钮。
+async function openMagpieConsole() {
+  // 先同步开一个空白页占住「用户手势」，否则 await 之后再 window.open 会被浏览器拦成弹窗。
+  const tab = window.open('about:blank', '_blank')
+  magpieBusy.value = true
+  magpieHint.value = ''
+  try {
+    const res = await requestMagpieConsole()
+    const url = res.Data.Url
+    if (tab) {
+      tab.opener = null
+      tab.location.replace(url)
+    } else {
+      window.location.href = url
+    }
+  } catch (e) {
+    if (tab) tab.close()
+    const err = e as { status?: number; message?: string }
+    magpieHint.value =
+      err.status === 503
+        ? '代理侧还没接入（后端未配置上游基址），管理台暂不可用。'
+        : err.message || '打开管理台失败'
+  } finally {
+    magpieBusy.value = false
+  }
+}
 
 // ===== 上游（V2）tab：只读 =====
 // undefined = 后端还没返回该块（V2 键未上线）；空对象 = 上线了但没配过。
@@ -593,6 +628,28 @@ async function saveFallback() {
             <template #label>
               <span class="tab-label">上游（V2）</span>
             </template>
+
+            <!-- 代理侧管理台：magpie 自己的 web 页面，经 nginx 子路径反代 + ADMIN 票据鉴权 -->
+            <div v-if="isAdmin" class="config-block">
+              <div class="block-title">代理侧管理台</div>
+              <div class="block-desc">
+                渠道选路、协议互译、上游凭据与用量都在代理侧配置，这里可以直接打开它的管理页面。
+                入口每次点击都会换一张 8 小时有效的门票，过期回本页再点一次即可。
+              </div>
+              <el-alert
+                type="warning"
+                :closable="false"
+                show-icon
+                title="管理台里能看到上游明文凭据"
+                description="只给管理员开。不要把它的页面链接转给别人——链接本身带着访问门票的会话。"
+              />
+              <div class="form-row">
+                <el-button type="primary" :loading="magpieBusy" @click="openMagpieConsole">
+                  打开代理侧管理台
+                </el-button>
+                <span v-if="magpieHint" class="dirty-hint">{{ magpieHint }}</span>
+              </div>
+            </div>
 
             <div class="config-block">
               <div class="block-title">上游接入</div>
