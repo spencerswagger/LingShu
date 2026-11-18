@@ -121,11 +121,15 @@ const graph = computed<{ nodes: Node[]; edges: Edge[] }>(() => {
   return { nodes, edges }
 })
 
+let justConnected = false
 function pick(kind: string, ref: string, data: Record<string, unknown>) {
+  if (justConnected) return // 拖线落在目标节点上时，不要顺带打开抽屉
   emit('select', { kind, ref, data })
 }
 function onConnectEvt(e: { source: string; sourceHandle?: string | null }) {
   if (!e.source) return
+  justConnected = true
+  setTimeout(() => (justConnected = false), 350)
   const ref = (e.sourceHandle || '').replace(/^m:/, '') || e.source.replace(/^[a-z]:/, '')
   emit('connect', ref)
 }
@@ -162,7 +166,7 @@ function onConnectEvt(e: { source: string; sourceHandle?: string | null }) {
           <Handle type="target" :position="Position.Left" />
           <div class="pv-head" @click="pick('provider', p.data.Ref, p.data)">
             <span class="nd-title">{{ p.data.Ref }}</span>
-            <span class="txt">{{ p.data.Accounts }} 账号<template v-if="p.data.StaleCount"> · 未见 {{ p.data.StaleCount }}</template></span>
+            <span class="txt">{{ p.data.Accounts ? p.data.Accounts + ' 账号' : '账号待同步' }}<template v-if="p.data.StaleCount"> · 未见 {{ p.data.StaleCount }}</template></span>
           </div>
           <div v-for="r in p.data.Rows" :key="r.Ref" class="pv-row" :class="{ 'is-stale': r.Stale }">
             <span class="pv-row-name" @click="pick('model', r.Ref, r)">{{ r.Name }}</span>
