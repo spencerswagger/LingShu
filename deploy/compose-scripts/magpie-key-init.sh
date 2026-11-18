@@ -4,6 +4,9 @@
 set -u
 NAME="${MAGPIE_ADMIN_KEY_NAME:-lingshu-backend}"
 ADDR="${MAGPIE_ADDR:-http://magpie:3425}"
+HOST=$(printf '%s' "$ADDR" | sed -E 's#^[a-z]+://##; s#/.*$##; s#:.*$##')
+PORT=$(printf '%s' "$ADDR" | sed -nE 's#^[a-z]+://[^:/]+:([0-9]+).*#\1#p'); PORT=${PORT:-3425}
+MAGPIE_BIN=$(command -v magpie || echo /magpie)
 KEY_FILE=/secret/admin_key
 WEB_KEY_FILE=/secret/admin_web_key
 fix_owner() {
@@ -31,14 +34,18 @@ if [ -n "${MAGPIE_ADMIN_KEY:-}" ]; then K="$MAGPIE_ADMIN_KEY"
 elif [ -s "$KEY_FILE" ]; then K="$(cat "$KEY_FILE")"
 else K="$(gen_hex)"; fi
 
-probe() { curl -fsS -o /dev/null -H "Authorization: Bearer $1" "$ADDR/v1/models" 2>/dev/null; }
+probe() {
+  local key="$1" line
+  exec 3<>"/dev/tcp/$HOST/$PORT" 2>/dev/null || return 1
+  printf 'GET /v1/models HTTP/1.0\r\nHost: %s\r\nAuthorization: Bearer %s\r\n\r\n' "$HOST" "$key" >&3
+  IFS= read -r line <&3 || true
+  exec 3<&- 3>&- 2>/dev/null || true
+  printf '%s' "$line" | grep -q ' 200'
+}
+up() { (exec 3<>"/dev/tcp/$HOST/$PORT") 2>/dev/null && { exec 3<&- 3>&- 2>/dev/null; return 0; }; return 1; }
 
 # 让 magpie 就绪（healthcheck 已经等过，这里再兜一层）
-for i in $(seq 1 20); do
-  curl -fsS -o /dev/null "$ADDR/healthz" 2>/dev/null && break
-  curl -fsS -o /dev/null "$ADDR/v1/models" 2>/dev/null && break
-  sleep 1
-done
+for i in $(seq 1 20); do up && break; sleep 1; done
 
 if probe "$K"; then
   printf '%s' "$K" > "$KEY_FILE"; fix_owner
@@ -46,16 +53,19 @@ if probe "$K"; then
 fi
 
 echo "[magpie-init] 现有密钥未被 magpie 接受，开始重建网关密钥 $NAME …" >&2
-# 删掉同名旧 key（存在则删），再用我们自己的值新建；都基于运行中的实例
-id=$(magpie gateway-key list 2>/dev/null | awk -v n="$NAME" 'index($0,n){print $1; exit}')
-[ -n "$id" ] && magpie gateway-key remove "$id" >/dev/null 2>&1 || true
+"$MAGPIE_BIN" gateway-key remove "$NAME" >/dev/null 2>&1 || true
 usable=1; case "$K" in sk-magpie-*) usable=0;; esac; [ "${#K}" -lt 8 ] && usable=0
-if [ "$usable" = 1 ]; then out=$(printf '%s' "$K" | magpie gateway-key add "$NAME" --key - 2>&1) || true; fi
+if [ "$usable" = 1 ]; then out=$(printf '%s' "$K" | "$MAGPIE_BIN" gateway-key add "$NAME" --key - 2>&1) || true; fi
 if ! probe "$K"; then
-  # 退一步：让 magpie 自己生成一把，抓出它的值
-  out=$(magpie gateway-key add "$NAME" 2>&1) || true
+  out=$("$MAGPIE_BIN" gateway-key add "$NAME" 2>&1) || true
   k2=$(printf '%s\n' "$out" | grep -o 'sk-magpie-key-[A-Za-z0-9._-]*' | head -n 1 || true)
-  if [ -n "$k2" ]; then K="$k2"; fi
+  [ -n "$k2" ] && K="$k2"
+fi
+if ! probe "$K"; then
+  N2="$NAME-$(date +%s)"
+  out=$("$MAGPIE_BIN" gateway-key add "$N2" 2>&1) || true
+  k2=$(printf '%s\n' "$out" | grep -o 'sk-magpie-key-[A-Za-z0-9._-]*' | head -n 1 || true)
+  [ -n "$k2" ] && K="$k2"
 fi
 if probe "$K"; then
   printf '%s' "$K" > "$KEY_FILE"; fix_owner
@@ -66,4 +76,6 @@ echo "[magpie-init] 仍然 401：magpie 拒绝这把密钥。" >&2
 printf '%s\n' "$out" >&2
 echo "[magpie-init] 处置：打开 http://127.0.0.1:${MAGPIE_UI_PORT:-3430}/ 建一把 key，" >&2
 echo "  写进 .env 的 MAGPIE_ADMIN_KEY=<key>，再 docker compose up -d。" >&2
-exit 1
+# 不让整套编排因为这一把密钥起不来：灵枢管理面照常可用，只是转发/同步暂时 401。
+# 真正修好请按上面的处置手工建 key；下次 up 会自动再试一次自愈。
+exit 0
