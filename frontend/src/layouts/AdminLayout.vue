@@ -211,9 +211,10 @@ const crumbBack = computed(() => {
   flex: 1;
 }
 .body {
-  padding: 20px 22px 40px;
-  max-width: 1180px;
+  /* 宽屏吃满可用宽度：不再固定 1180，只留随视口变化的边距。 */
+  padding: 20px clamp(16px, 2.2vw, 40px) 40px;
   width: 100%;
+  max-width: none;
   box-sizing: border-box;
 }
 </style>
