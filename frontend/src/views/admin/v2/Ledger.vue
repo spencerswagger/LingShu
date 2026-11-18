@@ -127,7 +127,7 @@ async function copy(text: string) {
 <template>
   <V2Page
     title="账本流水"
-    intro="上游网关账本的镜像（只读，九字段），也是变动成本的唯一真源。本页回答一件事：成本数据是不是最新的。"
+    intro="上游账本镜像，变动成本的来源。"
     source="数据层契约 §6.1（ledger_entries）· Spec P05 / L1·L2"
     :deps="deps"
     :state="ledger.state.value"
@@ -273,15 +273,15 @@ async function copy(text: string) {
   padding: 10px 12px;
   border-radius: var(--radius-s);
   border: 1px solid var(--color-border);
-  background: #fafbfd;
+  background: #0b101c;
   font-size: 13px;
 }
 .fresh.is-warn {
-  background: #fff8e6;
+  background: rgba(201,162,39,.08);
   border-color: #ffe0a3;
 }
 .fresh.is-danger {
-  background: #fef3f2;
+  background: rgba(196,85,63,.1);
   border-color: #fecdca;
 }
 .fresh-item {
@@ -300,7 +300,7 @@ async function copy(text: string) {
   background: var(--color-surface);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-m);
-  box-shadow: var(--shadow-card);
+  box-shadow: none;
   padding: 12px 14px;
 }
 .table-wrap {

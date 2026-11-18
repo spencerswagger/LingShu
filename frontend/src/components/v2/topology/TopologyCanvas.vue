@@ -315,7 +315,7 @@ function openExternal(id: string) {
   height: 560px;
   border: 1px solid var(--color-border);
   border-radius: var(--radius-m);
-  background: #fbfcfe;
+  background: var(--bg);
   overflow: hidden;
 }
 .canvas {
@@ -325,19 +325,19 @@ function openExternal(id: string) {
 
 /* ===== 节点通用 ===== */
 .nd {
-  background: #fff;
+  background: var(--panel);
   border: 1px solid var(--color-border-strong);
   border-radius: 10px;
   padding: 8px 10px;
   font-size: 12px;
   line-height: 1.45;
-  box-shadow: var(--shadow-card);
+  box-shadow: none;
   color: var(--color-text);
 }
 .nd.is-stale {
   opacity: 0.55;
   border-style: dashed;
-  background: #f6f7fa;
+  background: #0b101c;
 }
 .nd-tag {
   font-size: 10.5px;
@@ -374,25 +374,25 @@ function openExternal(id: string) {
   height: 17px;
   border-radius: 999px;
   font-size: 10.5px;
-  background: #eef0f6;
-  color: #4b5565;
+  background: #161d29;
+  color: var(--ink-2);
   white-space: nowrap;
 }
 .chip-plan {
-  background: #eef0fe;
+  background: rgba(76,111,232,.14);
   color: #4b4dd6;
 }
 .chip-sold {
-  background: #e8f5ec;
-  color: #2f7350;
+  background: rgba(95,158,110,.14);
+  color: #8fbf9f;
 }
 .chip-idle {
-  background: #f2f4f7;
-  color: #98a2b3;
+  background: #141b26;
+  color: var(--ink-3);
 }
 .chip-warn {
-  background: #fef4e5;
-  color: #b54708;
+  background: rgba(201,162,39,.1);
+  color: #d6bd80;
 }
 
 /* 账号：蓝 */
@@ -413,7 +413,7 @@ function openExternal(id: string) {
   justify-content: space-between;
   gap: 8px;
   padding: 8px 10px;
-  background: #f3f5fa;
+  background: #0b101c;
   border-bottom: 1px solid var(--color-border);
 }
 .pv-meta {
@@ -461,7 +461,7 @@ function openExternal(id: string) {
   padding: 6px 10px 8px;
   font-size: 10.5px;
   color: var(--color-text-tertiary);
-  background: #fafbfd;
+  background: #0c1220;
 }
 
 /* 路由组：紫 */
@@ -481,16 +481,16 @@ function openExternal(id: string) {
   box-shadow: var(--shadow-pop);
 }
 .nd-external.is-unbound {
-  border-left-color: #d0d5dd;
-  background: #fbfbfc;
+  border-left-color: var(--line-2);
+  background: #0b101c;
 }
 .nd-external.is-off {
   opacity: 0.6;
 }
 /* 绑定悬空：目标已从网关下线/改名 —— 橙边，别和「正常在售」混在一起 */
 .nd-external.is-dangling {
-  border-left-color: #f79009;
-  background: #fffcf5;
+  border-left-color: var(--warn);
+  background: rgba(201,162,39,.06);
 }
 
 /* vue-flow 默认节点内边距会挤压卡片，这里清掉 */

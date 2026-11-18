@@ -308,7 +308,7 @@ function fixBy(reason: BlockReasonCode) {
 <template>
   <V2Page
     title="订阅账本"
-    intro="录入上游账号的固定订阅费，让 A5 月费分摊真正有数据；并让「摊不出去」这件事在页面上可见——不录 = 盈亏页成本永远少一笔固定支出。"
+    intro="录入账号的固定订阅费，用于月费分摊。"
     source="Spec 2026-11-16《订阅录入标准》§2.1/§2.3/§3.1/§5.2/§8 · 数据层契约 §2.4"
     :deps="deps"
     :state="state"
@@ -553,7 +553,7 @@ function fixBy(reason: BlockReasonCode) {
   background: var(--color-surface);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-m);
-  box-shadow: var(--shadow-card);
+  box-shadow: none;
   padding: 12px 14px;
 }
 .table-wrap {
@@ -569,7 +569,7 @@ function fixBy(reason: BlockReasonCode) {
   gap: 10px;
   padding: 8px 12px;
   border-radius: var(--radius-s);
-  background: #fff8e6;
+  background: rgba(201,162,39,.08);
   border: 1px solid #ffe0a3;
   color: #8a5a00;
   font-size: 13px;
@@ -626,15 +626,15 @@ function fixBy(reason: BlockReasonCode) {
   padding: 10px 12px;
   border-radius: var(--radius-s);
   border: 1px solid var(--color-border);
-  background: #fafbfd;
+  background: #0b101c;
 }
 .verdict.is-ok {
   border-color: #b7ebc6;
-  background: #f2fcf5;
+  background: rgba(95,158,110,.1);
 }
 .verdict.is-block {
   border-color: #ffd8a8;
-  background: #fffaf2;
+  background: rgba(201,162,39,.06);
 }
 .verdict-head {
   display: flex;

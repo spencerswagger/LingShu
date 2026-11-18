@@ -136,7 +136,7 @@ function openExternal(id: string) {
 <template>
   <V2Page
     title="拓扑"
-    intro="网关侧「账号 → 供应商 → 实际模型 → 路由组 / 对外模型」四层关系与同步新鲜度。实际模型清单随网关同步、只读；灵枢只维护「实际模型 → 对外模型」这一段与节点坐标。"
+    intro="账号 → 供应商 → 实际模型 → 对外模型，实际模型随网关同步。"
     source="数据层契约 §2.1–§2.3（internal_models / model_links / external_models.bound_internal_ref）"
     :deps="deps"
     :state="state"
@@ -263,7 +263,7 @@ function openExternal(id: string) {
   background: var(--color-surface);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-m);
-  box-shadow: var(--shadow-card);
+  box-shadow: none;
   padding: 12px 14px;
 }
 .card-head {
@@ -315,15 +315,15 @@ function openExternal(id: string) {
   padding: 8px 12px;
   border-radius: var(--radius-s);
   border: 1px solid var(--color-border);
-  background: #fafbfd;
+  background: #0b101c;
   font-size: 13px;
 }
 .sync-bar.is-warn {
-  background: #fff8e6;
+  background: rgba(201,162,39,.08);
   border-color: #ffe0a3;
 }
 .sync-bar.is-danger {
-  background: #fef3f2;
+  background: rgba(196,85,63,.1);
   border-color: #fecdca;
 }
 .sync-item {
@@ -343,15 +343,15 @@ function openExternal(id: string) {
   line-height: 1.5;
 }
 .sync-result.is-ok {
-  background: #e8f8f0;
+  background: rgba(95,158,110,.12);
   color: #0e7a45;
 }
 .sync-result.is-warn {
-  background: #fff8e6;
+  background: rgba(201,162,39,.08);
   color: #8a5a00;
 }
 .sync-result.is-danger {
-  background: #fef3f2;
+  background: rgba(196,85,63,.1);
   color: #b42318;
 }
 .table-wrap {

@@ -113,22 +113,14 @@ function safeRedirect(v: unknown): string {
               />
             </svg>
           </span>
-          <span class="brand-name">AI网关</span>
         </div>
 
         <div class="brand-body">
-          <h1 class="brand-title">统一 AI 调用平面</h1>
-          <p class="brand-desc">
-            渠道接入 · 模型定价 · 令牌鉴权 · 智能路由 · 全链路计费，一处掌控
-          </p>
-          <ul class="brand-points">
-            <li>OpenAI 兼容统一网关入口</li>
-            <li>语义标签智能路由与会话亲和</li>
-            <li>国密加密与安全合规默认内置</li>
-          </ul>
+          <h1 class="brand-title">灵枢</h1>
+          <p class="brand-desc">统一 AI 调用网关</p>
         </div>
 
-        <div class="brand-foot">© 2026 AI Gateway · Internal Console</div>
+        <div class="brand-foot">内部系统</div>
       </div>
     </aside>
 
@@ -138,7 +130,7 @@ function safeRedirect(v: unknown): string {
         <div v-if="step === 'password'">
           <div class="form-head">
             <div class="form-title">欢迎回来</div>
-            <div class="form-sub">请使用你的账号登录控制台</div>
+            <div class="form-sub">登录控制台</div>
           </div>
           <el-form ref="formRef" :model="form" :rules="rules" size="large" @keyup.enter="onLogin">
             <el-form-item prop="username">
