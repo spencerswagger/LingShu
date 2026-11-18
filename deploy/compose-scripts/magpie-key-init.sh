@@ -29,9 +29,10 @@ fi
 cur=$(cat "$WEB_KEY_FILE")
 if [ "${#cur}" -lt 16 ]; then printf '%s%s' "$cur" "$(gen_hex)" > "$WEB_KEY_FILE"; fi
 
-# 期望的网关密钥：环境变量 > 卷里已有的 > 新生成（不依赖 magpie CLI 的格式）
-if [ -n "${MAGPIE_ADMIN_KEY:-}" ]; then K="$MAGPIE_ADMIN_KEY"
-elif [ -s "$KEY_FILE" ]; then K="$(cat "$KEY_FILE")"
+# 期望的网关密钥：**卷里已有的优先**，其次环境变量，最后新生成。
+# 环境变量只是候选，下面一定会实测；不通过就重建（旧版“有环境变量就直接信”是 401 之源）。
+if [ -s "$KEY_FILE" ]; then K="$(cat "$KEY_FILE")"
+elif [ -n "${MAGPIE_ADMIN_KEY:-}" ]; then K="$MAGPIE_ADMIN_KEY"
 else K="$(gen_hex)"; fi
 
 probe() {
