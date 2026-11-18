@@ -109,9 +109,33 @@ async function openNode(s: Sel) {
   }
 }
 
-async function openConnect(ref: string) {
-  const item = data.value?.Items.find((m) => m.Ref === ref)
-  await openNode({ kind: item?.Kind === 'group' ? 'group' : 'model', ref, data: { Name: item?.DisplayName || ref } })
+async function openConnect(payload: { ref: string }) {
+  const item = data.value?.Items.find((m) => m.Ref === payload.ref)
+  await openNode({ kind: item?.Kind === 'group' ? 'group' : 'model', ref: payload.ref, data: { Name: item?.DisplayName || payload.ref } })
+}
+
+// 拖线到已有对外模型 = 绑定，不再弹抽屉
+async function bindExisting(payload: { ref: string; externalId: string }) {
+  await ensureExternals()
+  const m = externals.value.find((x) => x.ID === payload.externalId)
+  if (!m) return ElMessage.error('找不到目标对外模型')
+  try {
+    await updateExternalModel(m.ID, {
+      ExternalName: m.ExternalName,
+      Description: m.Description || '',
+      Enabled: m.Enabled,
+      SaleRates: m.SaleRates || {},
+      TimeConfig: m.TimeConfig ?? null,
+      ContextTiers: m.ContextTiers ?? null,
+      Aliases: m.Aliases || [],
+      BoundInternalRef: payload.ref,
+    } as never)
+    ElMessage.success(`已绑定到 ${payload.ref}`)
+    await ensureExternals(true)
+    await load()
+  } catch (e) {
+    ElMessage.error('绑定失败：' + (e instanceof Error ? e.message : String(e)))
+  }
 }
 
 async function save() {
@@ -166,11 +190,11 @@ const selKindLabel = computed(() => {
 
     <div v-if="state === 'error'" class="tp-err">数据没取到，先看错误再刷新。</div>
     <div v-else class="tp-canvas">
-      <TopologyCanvas v-if="data" :view="data" :prices="priceMap" @select="openNode" @connect="openConnect" />
+      <TopologyCanvas v-if="data" :view="data" :prices="priceMap" @select="openNode" @connect="openConnect" @bind="bindExisting" />
       <div v-else class="tp-empty">还没有拓扑数据</div>
     </div>
 
-    <el-drawer v-model="drawer" :title="selKindLabel" size="400px" direction="rtl">
+    <el-drawer v-model="drawer" :title="selKindLabel" size="560px" direction="rtl">
       <template v-if="sel">
         <div v-if="sel.kind === 'external' || sel.kind === 'model' || sel.kind === 'group'">
           <el-form label-position="top" size="small">
