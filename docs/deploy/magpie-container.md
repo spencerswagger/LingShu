@@ -85,6 +85,14 @@ magpie 的管理页面是按「自己占着域名根」写的，挂到子路径�
 
 ---
 
+
+### 2.5 compose 用到的脚本
+
+`docker-compose.yml` 里的 magpie 相关启动脚本不内联在 YAML 里，放在 `deploy/compose-scripts/`：
+`magpie-secret-init.sh`（页面口令）、`magpie-key-init.sh`（网关密钥校验/自愈）、`magpie-web-start.sh`（起 magpie web）。
+compose 以只读方式挂进容器 `/opt/lingshu`。**部署机上除了 `docker-compose.yml`，还要有 `deploy/compose-scripts/` 这三个文件**
+（`git clone` 或单独下载到同目录）。缺了会报 `no such file or directory`。
+
 ## 3 凭据都在哪
 
 | 凭据 | 用途 | 存放位置 | 能否再取回 |

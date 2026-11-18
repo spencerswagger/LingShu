@@ -48,26 +48,16 @@ services:
     image: ${MAGPIE_IMAGE:-ghcr.io/yetone/magpie:0.1.4458}
     user: "0:0"
     restart: "no"
-    entrypoint: ["/bin/bash", "-c"]
-    command:
-      - |
-        set -u
-        WEB=/secret/admin_web_key
-        mkdir -p /secret /config; chmod 700 /secret || true
-        gen() { if command -v openssl >/dev/null 2>&1; then openssl rand -hex 16
-                else head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n'; fi; }
-        if [ -n "$${MAGPIE_WEB_KEY:-}" ]; then printf '%s' "$$MAGPIE_WEB_KEY" > "$$WEB"
-        elif [ ! -s "$$WEB" ]; then gen > "$$WEB"; fi
-        cur=$$(cat "$$WEB"); if [ "$${#cur}" -lt 16 ]; then printf '%s%s' "$$cur" "$$(gen)" > "$$WEB"; fi
-        chown -R 65532:65532 /config 2>/dev/null || true
-        chown 65532:65532 "$$WEB" 2>/dev/null || true; chmod 600 "$$WEB" 2>/dev/null || true
-        echo "[magpie-secret-init] 页面口令就绪"
+    entrypoint: ["/bin/bash", "/opt/lingshu/magpie-secret-init.sh"]
+    # 脚本在 ./deploy/compose-scripts/ 下，只读挂进容器；改脚本不用改 compose。
+    # 部署机没跟着下载这些脚本时，compose 起不来（见 docs/deploy/magpie-container.md）。
     environment:
       MAGPIE_WEB_KEY: ${MAGPIE_WEB_KEY:-}
       TZ: ${TZ:-Asia/Shanghai}
     volumes:
       - magpie_config:/config
       - magpie_secret:/secret
+      - ./deploy/compose-scripts:/opt/lingshu:ro
 
   # 代理侧管理密钥自举 + 自愈。
   #
@@ -84,74 +74,9 @@ services:
     depends_on:
       magpie:
         condition: service_healthy
-    entrypoint: ["/bin/bash", "-c"]
-    command:
-      - |
-        set -u
-        NAME="$${MAGPIE_ADMIN_KEY_NAME:-lingshu-backend}"
-        ADDR="$${MAGPIE_ADDR:-http://magpie:3425}"
-        KEY_FILE=/secret/admin_key
-        WEB_KEY_FILE=/secret/admin_web_key
-        fix_owner() {
-          chown -R 65532:65532 /config 2>/dev/null || true
-          chown 65532:65532 "$$KEY_FILE" "$$WEB_KEY_FILE" 2>/dev/null || true
-          chmod 600 "$$KEY_FILE" "$$WEB_KEY_FILE" 2>/dev/null || true
-        }
-        gen_hex() {
-          if command -v openssl >/dev/null 2>&1; then openssl rand -hex 16
-          else head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n'; fi
-        }
-        mkdir -p /secret /config; chmod 700 /secret || true
-
-        # 页面口令：手填优先，其次卷里，最后生成；<16 位补齐（magpie 硬要求）
-        if [ -n "$${MAGPIE_WEB_KEY:-}" ]; then
-          printf '%s' "$$MAGPIE_WEB_KEY" > "$$WEB_KEY_FILE"
-        elif [ ! -s "$$WEB_KEY_FILE" ]; then
-          gen_hex > "$$WEB_KEY_FILE"
-        fi
-        cur=$$(cat "$$WEB_KEY_FILE")
-        if [ "$${#cur}" -lt 16 ]; then printf '%s%s' "$$cur" "$$(gen_hex)" > "$$WEB_KEY_FILE"; fi
-
-        # 期望的网关密钥：环境变量 > 卷里已有的 > 新生成（不依赖 magpie CLI 的格式）
-        if [ -n "$${MAGPIE_ADMIN_KEY:-}" ]; then K="$$MAGPIE_ADMIN_KEY"
-        elif [ -s "$$KEY_FILE" ]; then K="$$(cat "$$KEY_FILE")"
-        else K="$$(gen_hex)"; fi
-
-        probe() { curl -fsS -o /dev/null -H "Authorization: Bearer $$1" "$$ADDR/v1/models" 2>/dev/null; }
-
-        # 让 magpie 就绪（healthcheck 已经等过，这里再兜一层）
-        for i in $$(seq 1 20); do
-          curl -fsS -o /dev/null "$$ADDR/healthz" 2>/dev/null && break
-          curl -fsS -o /dev/null "$$ADDR/v1/models" 2>/dev/null && break
-          sleep 1
-        done
-
-        if probe "$$K"; then
-          printf '%s' "$$K" > "$$KEY_FILE"; fix_owner
-          echo "[magpie-init] 密钥有效，复用：$$KEY_FILE"; exit 0
-        fi
-
-        echo "[magpie-init] 现有密钥未被 magpie 接受，开始重建网关密钥 $$NAME …" >&2
-        # 删掉同名旧 key（存在则删），再用我们自己的值新建；都基于运行中的实例
-        id=$$(magpie gateway-key list 2>/dev/null | awk -v n="$$NAME" 'index($$0,n){print $$1; exit}')
-        [ -n "$$id" ] && magpie gateway-key remove "$$id" >/dev/null 2>&1 || true
-        out=$$(printf '%s' "$$K" | magpie gateway-key add "$$NAME" --key - 2>&1) || true
-        if ! probe "$$K"; then
-          # 退一步：让 magpie 自己生成一把，抓出它的值
-          out=$$(magpie gateway-key add "$$NAME" 2>&1) || true
-          k2=$$(printf '%s\n' "$$out" | grep -o 'sk-magpie-key-[A-Za-z0-9._-]*' | head -n 1 || true)
-          if [ -n "$$k2" ]; then K="$$k2"; fi
-        fi
-        if probe "$$K"; then
-          printf '%s' "$$K" > "$$KEY_FILE"; fix_owner
-          echo "[magpie-init] 已重建网关密钥 $$NAME 并回写 $$KEY_FILE"; exit 0
-        fi
-        fix_owner
-        echo "[magpie-init] 仍然 401：magpie 拒绝这把密钥。" >&2
-        printf '%s\n' "$$out" >&2
-        echo "[magpie-init] 处置：打开 http://127.0.0.1:$${MAGPIE_UI_PORT:-3430}/ 建一把 key，" >&2
-        echo "  写进 .env 的 MAGPIE_ADMIN_KEY=<key>，再 docker compose up -d。" >&2
-        exit 1
+    entrypoint: ["/bin/bash", "/opt/lingshu/magpie-key-init.sh"]
+    # 脚本在 ./deploy/compose-scripts/ 下，只读挂进容器；改脚本不用改 compose。
+    # 部署机没跟着下载这些脚本时，compose 起不来（见 docs/deploy/magpie-container.md）。
     environment:
       MAGPIE_ADMIN_KEY: ${MAGPIE_ADMIN_KEY:-}
       MAGPIE_ADMIN_KEY_NAME: ${MAGPIE_ADMIN_KEY_NAME:-lingshu-backend}
@@ -162,6 +87,7 @@ services:
     volumes:
       - magpie_config:/config
       - magpie_secret:/secret
+      - ./deploy/compose-scripts:/opt/lingshu:ro
 
   # 代理侧：选渠道、failover、四协议互译都在这里；灵枢只做 facade。
   magpie:
@@ -174,25 +100,7 @@ services:
     # 取值顺序是**卷优先**（不是环境变量优先）：magpie-init 已经把手填的短口令补齐到 16 位
     # 以上，只认卷里那份，才能保证 magpie 与 nginx 用的是同一把（否则环境变量里的短口令
     # 会让 magpie 直接起不来，而 nginx 注入的是补齐后的值）。
-    entrypoint: ["/bin/bash", "-c"]
-    command:
-      - |
-        set -e
-        if [ -s /secret/admin_web_key ]; then
-          MAGPIE_WEB_KEY=$$(cat /secret/admin_web_key)
-          export MAGPIE_WEB_KEY
-          echo "[magpie] 管理面口令来自 /secret/admin_web_key" >&2
-        elif [ -n "$${MAGPIE_WEB_KEY:-}" ]; then
-          echo "[magpie] 管理面口令来自环境变量 MAGPIE_WEB_KEY" >&2
-        else
-          echo "[magpie] 未取到管理面口令：magpie 会自行生成一个随机值（每次重启都会变，/magpie/ 入口需手工粘贴）" >&2
-        fi
-        # magpie 要求口令至少 16 个字符，短了它会拒绝启动。这里不改值（改了 nginx 就对不上），
-        # 只把原因喊出来，免得只看到一行 "web key too short" 不知所措。
-        if [ -n "$${MAGPIE_WEB_KEY:-}" ] && [ "$${#MAGPIE_WEB_KEY}" -lt 16 ]; then
-          echo "[magpie] 警告：管理面口令只有 $${#MAGPIE_WEB_KEY} 个字符，magpie 要求至少 16，会拒绝启动；清空 .env 的 MAGPIE_WEB_KEY 让 magpie-init 重新生成（或填 >=16 位）" >&2
-        fi
-        exec magpie web --addr 0.0.0.0:3430 --no-open
+    entrypoint: ["/bin/bash", "/opt/lingshu/magpie-web-start.sh"]
     environment:
       # 网关端口（容器内固定 3425；不发布到宿主，只有 compose 内网能到）
       MAGPIE_ADDR: 0.0.0.0:3425
@@ -210,7 +118,8 @@ services:
       - "127.0.0.1:${MAGPIE_UI_PORT:-3430}:3430"
     volumes:
       - magpie_config:/config # providers / 网关密钥 / 登录态 / 用量（含明文上游凭据，按密钥卷对待）
-      - magpie_secret:/secret:ro # admin_web_key：管理面口令（magpie-init 生成，这里只读）
+      - magpie_secret:/secret:ro # admin_web_key：管理面口令（magpie-secret-init 生成，这里只读）
+      - ./deploy/compose-scripts:/opt/lingshu:ro
     healthcheck:
       test: ["CMD", "magpie", "healthcheck"]
       interval: 15s
