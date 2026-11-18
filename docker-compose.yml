@@ -148,6 +148,8 @@ services:
       # /run/magpie-secret/admin_key 取），因此两边永远是同一把；只有「手工在管理面
       # 建 key」的场景才需要在这里填。
       MAGPIE_ADMIN_KEY: ${MAGPIE_ADMIN_KEY:-}
+      # magpie 页面口令：拓扑要拉 /api/groups（页面接口，认 ?k=），从只读卷读同一份
+      MAGPIE_WEB_KEY_FILE: /run/magpie-secret/admin_web_key
       # 账本变更流：同一个代理侧、同一把网关密钥（entrypoint 会把两者对齐）
       UPSTREAM_LEDGER_URL: ${UPSTREAM_LEDGER_URL:-http://magpie:3425}
       UPSTREAM_ADMIN_KEY: ${UPSTREAM_ADMIN_KEY:-}
