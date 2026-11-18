@@ -5,11 +5,15 @@
 // 而 billing 已经 import upstream（归因枚举），把对账放进 upstream 会形成循环依赖；
 // 放进 billing 又会让「账单域」知道窗口表。单独一层只依赖两者的**导出 SQL 片段与结构**。
 //
-// 口径（与 0023 文件头一致）：
+// 口径（与 0023 文件头一致，token 口径按 2026-11-17 账本适配修正）：
 //   - 只比 token 合计与请求笔数，**不比金额**（账本币种/牌价与灵枢积分不等价）；
 //   - 灵枢侧 tokens = input + cache_read + output（三段互斥，唯一来源是 billing.TokenSumExpr）；
-//   - 账本侧 tokens = tokens_in + tokens_out（求和不受「含不含缓存读」的口径影响）；
-//   - 偏差率 = |local - upstream| / max(upstream, 1)，超过阈值 → alarm；
+//   - 账本侧 tokens = tokens_in + tokens_out，其中 `tokens_in` 在适配层已把
+//     `cache_read + cache_write` 并入（代理侧的 `in` 是「未缓存输入」，缓存是独立字段）。
+//     两侧合计因此同口径 —— 早期版本假设「in 含缓存读」，实测账本恒小于本地（10200 vs 20440），
+//     开缓存的租户每窗误判 alarm；
+//   - 偏差率 = |local - upstream| / max(upstream, 1)，超过阈值 → alarm，但**两侧较大者低于
+//     MinAlarmTokens 的窗口不告警**（几十个 token 上 1% 就是零点几个 token，取整/估算噪声必然超阈）；
 //   - 连续 alarm 累加 alarm_streak（>=3 升级审计），ok 归 0；
 //   - 账本关闭/降级 → skipped（本窗不参与比对），**不是 blocked**：
 //     skipped 是「按口径不比」，blocked 是「该比但没拉完」，混用会让漏账看起来像正常；
@@ -34,6 +38,13 @@ const (
 	DefaultLookback = 10
 	// DefaultTolerance 是 token 偏差率阈值（1%）。
 	DefaultTolerance = 0.01
+	// MinAlarmTokens 是告警的**最小 token 门槛**（两侧较大者低于它就不告警）。
+	//
+	// 为什么需要：60s 窗口里几十到几百个 token 时，1% 只有零点几个 token ——「无 usage 走估算」
+	// 与 PG/上游取整带来的差异必然超阈，开缓存的租户（缓存读不进 `in`）曾经每窗必红。
+	// 1000 ≈ 17 token/s：低于这个量的窗口，偏差不构成漏账信号。
+	// 本期是包常量（无配置入口）；要按租户/时段调，再走 sys_configs。
+	MinAlarmTokens = 1000
 	// StreakUpgrade 是连击升级阈值（连续 3 窗告警）。
 	StreakUpgrade = 3
 )
@@ -258,6 +269,17 @@ func decide(local, up Agg, prevStreak int16, ledgerOn bool, tolerance float64) (
 	rate := float64(diff) / float64(denom)
 	detail["deviation_rate"] = rate
 	detail["tolerance"] = tolerance
+	detail["min_tokens"] = MinAlarmTokens
+	// 小样本门槛：比的是「两侧较大者」，否则「本地有量、账本 0」被 up.Tokens=0 永远挡住门槛，
+	// 真正的整段漏账反而告不出来。
+	scale := local.Tokens
+	if up.Tokens > scale {
+		scale = up.Tokens
+	}
+	if scale < MinAlarmTokens {
+		detail["below_min_tokens"] = true
+		return upstream.WindowOK, 0, detail
+	}
 	if rate > tolerance {
 		return upstream.WindowAlarm, prevStreak + 1, detail
 	}
@@ -290,6 +312,9 @@ func NewLocalSource(db *sql.DB) *SQLWindowAgg {
 }
 
 // NewUpstreamSource 是账本侧（ledger_entries）：笔数 + in+out 合计。
+//
+// `tokens_in` 在适配层是**提示词侧总量**（in + cache_read + cache_write，见
+// upstream.LedgerEntry.TokensIn），所以 `tokens_in + tokens_out` 与本地三段合计同口径。
 func NewUpstreamSource(db *sql.DB) *SQLWindowAgg {
 	return &SQLWindowAgg{
 		db:        db,

@@ -166,7 +166,7 @@ func (s *SqlStore) WindowTotals(ctx context.Context, from, to time.Time, userID 
 		    COALESCE(sum(COALESCE(NULLIF(tokens->>'cache_read','')::bigint,0)),0),
 		    COALESCE(sum(credits_consumed),0),
 		    count(*),
-		    COALESCE(sum((status='failed')::int),0),
+		    COALESCE(sum((status IN ('failed','upstream_error'))::int),0),
 		    COALESCE(sum(duration_ms),0),
 		    COALESCE(sum(first_token_ms),0),
 		    COALESCE(sum((duration_ms IS NOT NULL)::int),0),
@@ -257,7 +257,7 @@ func (s *SqlStore) dashboardDaily(ctx context.Context, from, to time.Time, userI
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT date_trunc('day', call_time AT TIME ZONE 'Asia/Shanghai')::date,
 		        count(*),
-		        COALESCE(sum((status='failed')::int),0),
+		        COALESCE(sum((status IN ('failed','upstream_error'))::int),0),
 		        COALESCE(sum(credits_consumed),0),
 		        COALESCE(sum(`+tokenSum("")+`),0),
 		        COALESCE(sum(duration_ms),0)
@@ -307,7 +307,7 @@ func (s *SqlStore) dashboardTop(ctx context.Context, from, to time.Time, userID 
 	// 按模型（ORDER BY tokens）
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT external_model_name,
-		        count(*), COALESCE(sum((status='failed')::int),0),
+		        count(*), COALESCE(sum((status IN ('failed','upstream_error'))::int),0),
 		        COALESCE(sum(credits_consumed),0),
 		        COALESCE(sum(`+tokenSum("")+`),0) AS tokens
 		 FROM billing_records `+dashWhere("")+`
@@ -340,7 +340,7 @@ func (s *SqlStore) dashboardTop(ctx context.Context, from, to time.Time, userID 
 	if userID == nil {
 		rows, err = s.db.QueryContext(ctx,
 			`SELECT u.username, u.nickname,
-			        count(*), COALESCE(sum((br.status='failed')::int),0),
+			        count(*), COALESCE(sum((br.status IN ('failed','upstream_error'))::int),0),
 			        COALESCE(sum(br.credits_consumed),0),
 			        COALESCE(sum(`+tokenSum("br.")+`),0) AS tokens
 			 FROM billing_records br
@@ -369,7 +369,7 @@ func (s *SqlStore) dashboardTop(ctx context.Context, from, to time.Time, userID 
 	// 计费模式
 	rows, err = s.db.QueryContext(ctx,
 		`SELECT pricing_mode,
-		        count(*), COALESCE(sum((status='failed')::int),0),
+		        count(*), COALESCE(sum((status IN ('failed','upstream_error'))::int),0),
 		        COALESCE(sum(credits_consumed),0),
 		        COALESCE(sum(`+tokenSum("")+`),0) AS tokens
 		 FROM billing_records `+dashWhere("")+`
@@ -397,7 +397,7 @@ func (s *SqlStore) dashboardTop(ctx context.Context, from, to time.Time, userID 
 		`SELECT COALESCE(NULLIF(error_message,''),'(未记录)') AS msg,
 		        count(*) AS c
 		 FROM billing_records
-		 WHERE status='failed' AND call_time >= $2 AND call_time <= $3
+		 WHERE status IN ('failed','upstream_error') AND call_time >= $2 AND call_time <= $3
 		   AND ($1::bigint IS NULL OR user_id = $1)
 		 GROUP BY 1 ORDER BY c DESC LIMIT $4`, dashArgs(userID, from, to, limit)...)
 	if err != nil {
@@ -601,7 +601,7 @@ func (s *SqlStore) DashboardHourly(ctx context.Context, from, to time.Time, user
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT date_trunc('hour', call_time AT TIME ZONE 'Asia/Shanghai'),
 		        count(*),
-		        COALESCE(sum((status='failed')::int),0),
+		        COALESCE(sum((status IN ('failed','upstream_error'))::int),0),
 		        COALESCE(sum(credits_consumed),0),
 		        COALESCE(sum(`+tokenSum("")+`),0),
 		        COALESCE(sum(duration_ms),0)
@@ -650,7 +650,7 @@ func (s *SqlStore) DashboardCompare(ctx context.Context, to time.Time, userID *i
 		`SELECT date_trunc('day', call_time AT TIME ZONE 'Asia/Shanghai')::date,
 		        EXTRACT(hour FROM call_time AT TIME ZONE 'Asia/Shanghai')::int,
 		        count(*),
-		        COALESCE(sum((status='failed')::int),0),
+		        COALESCE(sum((status IN ('failed','upstream_error'))::int),0),
 		        COALESCE(sum(credits_consumed),0),
 		        COALESCE(sum(`+tokenSum("")+`),0),
 		        COALESCE(sum(duration_ms),0)
@@ -770,7 +770,7 @@ func (s *SqlStore) DashboardModels(ctx context.Context, from, to time.Time, user
            -- 的用量会两头落空（既不在目录行里，也不进未匹配行），静默丢量（PR #61 Gate 复验）。
            (cat.id IS NOT NULL) AS in_catalog,
            count(*) AS calls,
-           COALESCE(sum((b.status='failed')::int),0) AS failed,
+           COALESCE(sum((b.status IN ('failed','upstream_error'))::int),0) AS failed,
            COALESCE(sum(b.credits_consumed),0) AS credits,
            COALESCE(sum(` + tokenSum("b.") + `),0) AS tokens,
            COALESCE(count(*) FILTER (WHERE ` + busyFilterOn("b.") + `),0) AS busy_calls,

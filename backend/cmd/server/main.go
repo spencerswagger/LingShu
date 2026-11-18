@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	stdsync "sync"
 	"syscall"
 	"time"
 
@@ -498,41 +499,56 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 		LedgerEnabled: func() bool { return gate.LedgerActive(context.Background()) },
 		Logger:        logr,
 	})
-	// F9：账本同步轮次（拉上游用量 → 幂等落 ledger_entries）。
+	// F9：账本同步轮次（拉代理侧用量变更流 → 幂等落 ledger_entries）。
 	//
-	// 装配三件事，缺一件就等于「同步跑不起来但没人知道」：
-	//  ① 分页源（上游用量接口，offset 翻页）；
-	//  ② **启动时跑一次排序能力探测**：结论不是 supported 时每轮只记 blocked、不翻页
-	//     （不许自己造排序，见 upstream.ProbeLedgerOrder）；
-	//  ③ 60s ticker + 空轮告警（`RunOnce` 的 Empty 会打 WARN，不再 0 行 + nil 静默空转）。
-	syncSrc := upstream.NewHTTPLedgerSource(
-		strings.TrimSpace(os.Getenv("UPSTREAM_LEDGER_URL")),
-		strings.TrimSpace(os.Getenv("UPSTREAM_ADMIN_KEY")),
-		strings.TrimSpace(os.Getenv("UPSTREAM_ADMIN_AUTH_HEADER")),
-		nil,
-	)
-	// 能力探测：拿最近 30 分钟当样本窗（真有一批数据才证得出排序）。
-	var order upstream.LedgerOrder
-	var orderWhy string
-	if strings.TrimSpace(os.Getenv("UPSTREAM_LEDGER_URL")) != "" {
-		probeWin := upstream.Window{Start: time.Now().Add(-30 * time.Minute), End: time.Now()}
-		probe := upstream.ProbeLedgerOrder(context.Background(), syncSrc, probeWin, 200)
-		order, orderWhy = probe.Order, probe.Reason
-		logr.Info("上游账本排序能力探测完成",
-			"order", probe.Order.String(), "samples", probe.Samples, "reason", probe.Reason)
-	} else {
-		orderWhy = "未配置 UPSTREAM_LEDGER_URL，未做能力探测"
-		logr.Warn("未配置上游账本端点，同步轮次将只记 blocked（不翻页）",
+	// 口径（2026-11-17 按代理侧真实报文适配）：
+	//  ① 用官方 cursor 变更流（cursor=start|now|<next_cursor>），不再用 from/to 时刻过滤
+	//     （代理侧没有这两个参数，只有 period/day；cursor 才是「自建账本」的官方方式）；
+	//  ② 排序不再依赖 occurred_at ASC：cursor feed 按 seq 推变更，按 id upsert 天然幂等；
+	//  ③ 续读游标持久化在 reconcile_windows.detail->>'ledger_cursor'，重启不重放整本账；
+	//  ④ 60s ticker + 空轮告警（`RunOnce` 的 Empty 会打 WARN，不再 0 行 + nil 静默空转）。
+	ledgerURL := strings.TrimSpace(os.Getenv("UPSTREAM_LEDGER_URL"))
+	adminKey := strings.TrimSpace(os.Getenv("UPSTREAM_ADMIN_KEY"))
+	adminHeader := strings.TrimSpace(os.Getenv("UPSTREAM_ADMIN_AUTH_HEADER"))
+	if ledgerURL == "" {
+		logr.Warn("未配置上游账本端点，账本同步轮次不运行（不落 blocked、不产生假告警）",
 			"env", "UPSTREAM_LEDGER_URL")
 	}
+	// 代理侧 cost 是 USD；灵枢账本列是积分。换算与订阅录入同源（积分 = 元 × 1e6 ÷ R，
+	// USD 先按 billing.cny_rate 折成人民币），配置缺失时该页报错（blocked），不静默写 0 成本。
+	// 换算按页缓存：CostConverter 是**逐行**调用的，直接读配置会让一页 500 行打 1000 次库。
+	var (
+		convMu     stdsync.Mutex
+		convRate   float64
+		convR      int64
+		convLoaded time.Time
+	)
+	costConv := func(usd float64) (float64, error) {
+		convMu.Lock()
+		defer convMu.Unlock()
+		if convRate <= 0 || time.Since(convLoaded) > time.Minute {
+			rate, err := billCfgProvider.CnyRate()
+			if err != nil {
+				return 0, fmt.Errorf("读取 billing.cny_rate 失败：%w", err)
+			}
+			r, err := billCfgProvider.R()
+			if err != nil {
+				return 0, fmt.Errorf("读取 billing.r 失败：%w", err)
+			}
+			if rate <= 0 || r <= 0 {
+				return 0, fmt.Errorf("汇率/R 非法（cny_rate=%v r=%d）", rate, r)
+			}
+			convRate, convR, convLoaded = rate, r, time.Now()
+		}
+		return usd * convRate * 1e6 / float64(convR), nil
+	}
+	syncSrc := upstream.NewMagpieLedgerSource(ledgerURL, adminKey, adminHeader, nil, costConv)
 	rounder := upstream.NewRounder(upstream.RounderOptions{
-		Source:            syncSrc,
-		Ledger:            upstream.NewLedgerStore(d),
-		Windows:           windowStore,
-		Now:               time.Now,
-		Logger:            logr,
-		LedgerOrder:       order,
-		LedgerOrderReason: orderWhy,
+		Feed:    syncSrc,
+		Ledger:  upstream.NewLedgerStore(d),
+		Windows: windowStore,
+		Now:     time.Now,
+		Logger:  logr,
 	})
 	go func() {
 		// 60s 一跳：与窗口宽度同量级。
@@ -545,6 +561,11 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 						logr.Error("账本同步轮次 panic", "panic", rec)
 					}
 				}()
+				// 端点没配 = 不拉取、也不落 blocked（落 blocked 会每分钟制造一次假告警，
+				// 运营会以为「积压没拉完」，实际是没配置）。
+				if ledgerURL == "" {
+					return
+				}
 				// 降级开关：sync 关 = 停摆（沿用上期数据），不是失败。
 				if c, _ := upstreamCfg.Load(context.Background()); !c.SyncActive() {
 					return

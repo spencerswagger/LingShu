@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -136,7 +137,14 @@ type WindowRecord struct {
 	Reason string
 	// ScrollOffset 是该行对应窗口的下次补拉 offset（F9：持久化，ok 后归 0）。
 	// 语义：本轮扫描起点 = 本行 window_start 时，下一次从第 ScrollOffset 条开始拉。
+	// cursor feed 模式（代理侧账本）不用它，改用 LedgerCursor。
 	ScrollOffset int64
+	// LedgerCursor 是代理侧 cursor feed 的续读位置（cursor feed 模式专用）。
+	//
+	// 为什么单独存：cursor 是**不透明字符串**，塞不进 BIGINT 的 scroll_offset；
+	// 它也不属于窗口统计，放进 detail 的 `ledger_cursor` 键（detail 本来就是排障/非判定数据）。
+	// 空串 = 本行没有游标（旧的 offset 模式 / 对账服务建的行），读取方应回落 LastLedgerCursor。
+	LedgerCursor string
 	// RecordedAt 写 checked_at。
 	RecordedAt time.Time
 	// ClearFrom 仅在 status=ok 时有意义：把 [ClearFrom, End) 内仍为 blocked 的窗口一并置 ok
@@ -183,6 +191,9 @@ type WindowStore interface {
 	Save(ctx context.Context, rec WindowRecord) error
 	// SaveTx 在同一事务里写窗口行（成功路径用，契约 §6.2）。
 	SaveTx(ctx context.Context, ex dbx.Execer, rec WindowRecord) error
+	// LastLedgerCursor 返回最近一次**同步轮次**写下的代理侧续读游标（cursor feed 模式）。
+	// 无记录时 ok=false；读取失败返回错误（不许把「读不到」当成「从头开始」静默吞掉）。
+	LastLedgerCursor(ctx context.Context) (cursor string, ok bool, err error)
 }
 
 // WindowCounts 是一次对账的落库形态（D4：四个计数列由对账服务在每窗结束时统一写）。
@@ -198,7 +209,8 @@ type WindowCounts struct {
 	// LocalCount / LocalTokens 是灵枢侧（billing_records）的笔数与三段 token 合计。
 	LocalCount  int64
 	LocalTokens int64
-	// UpstreamCount / UpstreamTokens 是账本侧（ledger_entries）的笔数与 in+out 合计。
+	// UpstreamCount / UpstreamTokens 是账本侧（ledger_entries）的笔数与 tokens_in+tokens_out 合计
+	// （tokens_in 已含 cache_read/cache_write，与本地三段合计同口径）。
 	UpstreamCount  int64
 	UpstreamTokens int64
 	// Status 是判定结果：ok / alarm / skipped（blocked / error 由同步轮次持有，对账不得覆盖）。
@@ -282,6 +294,36 @@ func (m *MemoryWindowStore) Save(ctx context.Context, rec WindowRecord) error {
 	return m.SaveTx(ctx, nil, rec)
 }
 
+// LastLedgerCursor 实现 WindowStore：取 window_start 最大且带游标的那一行（内存实现的顺序无关）。
+func (m *MemoryWindowStore) LastLedgerCursor(_ context.Context) (string, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var (
+		best  time.Time
+		found bool
+	)
+	cursor := ""
+	for _, rec := range m.records {
+		if strings.TrimSpace(rec.LedgerCursor) == "" {
+			continue
+		}
+		// 比「写入时刻」而不是 window_start：cursor 断点可能写在比上次成功行更早的窗口。
+		at := rec.RecordedAt
+		if at.IsZero() {
+			at = rec.Start
+		}
+		if !found || at.After(best) {
+			best = at
+			cursor = rec.LedgerCursor
+			found = true
+		}
+	}
+	if !found {
+		return "", false, nil
+	}
+	return cursor, true, nil
+}
+
 // SaveTx 实现 WindowStore：ex 被忽略（内存实现没有事务概念）。
 func (m *MemoryWindowStore) SaveTx(_ context.Context, _ dbx.Execer, rec WindowRecord) error {
 	if err := rec.Validate(); err != nil {
@@ -358,15 +400,21 @@ type ErrWindowBlocked struct {
 	Fetched int
 	// ScrollOffset 是下一轮继续拉的位置（持久化进 reconcile_windows.scroll_offset）。
 	ScrollOffset int64
+	// Cursor 是 cursor feed 模式下一轮继续读的游标（与 ScrollOffset 二选一）。
+	Cursor string
 }
 
 func (e *ErrWindowBlocked) Error() string {
 	if e == nil {
 		return "同步窗口 blocked"
 	}
+	pos := fmt.Sprintf("scroll_offset=%d", e.ScrollOffset)
+	if e.Cursor != "" {
+		pos = fmt.Sprintf("cursor=%q", e.Cursor)
+	}
 	return fmt.Sprintf("同步窗口 %s 在单轮上限（%d 页 / %d 条）内未拉完（已拉 %d 条），本轮已回滚；"+
-		"下一轮从 scroll_offset=%d 继续补拉，直到清零（不引入人工介入）",
-		e.Window, MaxPagesPerRound, MaxRowsPerRound, e.Fetched, e.ScrollOffset)
+		"下一轮从 %s 继续补拉，直到清零（不引入人工介入）",
+		e.Window, MaxPagesPerRound, MaxRowsPerRound, e.Fetched, pos)
 }
 
 // RoundResult 是一轮同步的结果（也用于日志/排障）。
@@ -388,6 +436,13 @@ type RoundResult struct {
 	ScanStart time.Time
 	// ResumeOffset 是本轮开始时的 offset（0 = 从头拉；>0 = 上一轮 blocked 留下的位置）。
 	ResumeOffset int64
+	// Cursor 是 cursor feed 模式本轮的续读游标（空 = 未使用 feed 模式）。
+	Cursor string
+	// Replaced 是「游标失效重放」时清掉的本地账本条数（0 = 本轮没发生整段替换）。
+	//
+	// 这个数字必须可观测：一次 410 会把本地账本清空再按代理侧重建，运营/排障要能从日志与
+	// 返回值里看出「哪一轮把账本换了」，而不是只看到一下少了多少行。
+	Replaced int64
 	// Empty 表示本轮**一条都没拉到**（Fetched == Inserted == 0）。
 	//
 	// 这个字段存在的理由：以前「空轮」与「正常轮」返回值完全一样（0 行 + nil），
@@ -398,7 +453,11 @@ type RoundResult struct {
 
 // RounderOptions 是 NewRounder 的入参。
 type RounderOptions struct {
-	Source  PageSource
+	Source PageSource
+	// Feed 非 nil 时走代理侧 cursor 变更流（推荐）：按 id upsert、按 deleted 删除，
+	// 续读位置是不透明 cursor（见 WindowRecord.LedgerCursor）。
+	// 与 Source 二选一；两个都给时优先 Feed。
+	Feed    LedgerFeed
 	Ledger  LedgerTxBeginner
 	Windows WindowStore
 	// PageSize 为 0 时用 DefaultPageSize。
@@ -419,6 +478,7 @@ type RounderOptions struct {
 // Rounder 执行一轮「算窗口 → 翻页拉取 → 单事务幂等写入 + 落窗口行」。
 type Rounder struct {
 	source   PageSource
+	feed     LedgerFeed
 	ledger   LedgerTxBeginner
 	windows  WindowStore
 	pageSize int
@@ -449,6 +509,7 @@ func NewRounder(opts RounderOptions) *Rounder {
 	}
 	return &Rounder{
 		source:   opts.Source,
+		feed:     opts.Feed,
 		ledger:   opts.Ledger,
 		windows:  opts.Windows,
 		pageSize: pageSize,
@@ -477,6 +538,9 @@ func NewRounder(opts RounderOptions) *Rounder {
 func (r *Rounder) RunOnce(ctx context.Context) (RoundResult, error) {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if r.feed != nil {
+		return r.runFeedOnce(ctx)
 	}
 	log := r.log
 
@@ -675,6 +739,264 @@ func (r *Rounder) RunOnce(ctx context.Context) (RoundResult, error) {
 	return result, nil
 }
 
+// runFeedOnce 是 cursor feed 模式的一轮同步。
+//
+// 与 offset 模式的区别（这是对代理侧真实口径的适配，不是可选优化）：
+//   - 拉取不再是「[上次水位线-120s, now) 的第 N 条」，而是「从上次 cursor 继续读变更流」；
+//   - 续读位置是**不透明 cursor**（持久化在 reconcile_windows.detail->>'ledger_cursor'）；
+//   - 一页里同时有 rows（按 id upsert）与 deleted（按 id 删除），两者与窗口行同事务提交；
+//   - 游标失效（410/400 cursor_*）从 `start` 全量重放一次：按 id 幂等 + deleted 列表保证不漏。
+//
+// 窗口/水位线仍然写，但它的语义退化为「这一轮什么时候跑过、拉了多少」——真正的进度在 cursor。
+func (r *Rounder) runFeedOnce(ctx context.Context) (RoundResult, error) {
+	if r.windows == nil {
+		return RoundResult{}, fmt.Errorf("同步轮次缺少窗口存储")
+	}
+	if r.ledger == nil {
+		return RoundResult{}, fmt.Errorf("同步轮次缺少账本存储")
+	}
+	log := r.log
+
+	lastEnd, hasLast, err := r.windows.LastSuccessEnd(ctx)
+	if err != nil {
+		return RoundResult{}, fmt.Errorf("读取同步水位线失败：%w", err)
+	}
+	blocked, err := r.windows.PendingWindows(ctx, blockedProbeLimit)
+	if err != nil {
+		return RoundResult{}, fmt.Errorf("读取待补拉窗口失败：%w", err)
+	}
+
+	now := r.now()
+	w := WindowFor(lastEnd, now)
+	result := RoundResult{Window: w, Status: WindowOK, BlockedPending: len(blocked)}
+	clearFrom := w.Start
+	if len(blocked) > 0 {
+		oldest := blocked[0].Start
+		for _, rec := range blocked[1:] {
+			if rec.Start.Before(oldest) {
+				oldest = rec.Start
+			}
+		}
+		if oldest.Before(clearFrom) {
+			clearFrom = oldest
+			w.Start = oldest
+			result.Window = w
+		}
+		log.Warn("存在未补平的 blocked 窗口，本轮继续从断点游标补拉",
+			"blocked", len(blocked), "oldest", oldest.Format(time.RFC3339),
+			"window", w.String())
+	}
+	if hasLast && !w.Start.Before(w.End) {
+		return RoundResult{}, &SkipError{Op: "上游同步", Reason: "同步窗口为空（时钟回拨或水位线超前）"}
+	}
+	// cursor feed 不需要「补历史窗口」：进度就是游标。落库窗口取**当前**那一格，
+	// 这样 LastSuccessEnd 会随轮次推进（否则水位线永远停在第一次 blocked 的位置），
+	// 而清假告警靠 ClearFrom 从最旧 blocked 一直扫到这一格。
+	savedStart := now.Truncate(WindowSize).Add(-WindowSize)
+	saved := Window{Start: savedStart, End: savedStart.Add(WindowSize)}
+	result.Saved = saved
+	scanStart := w.Start.Truncate(WindowSize)
+	result.ScanStart = scanStart
+	if scanStart.Before(clearFrom) {
+		clearFrom = scanStart
+	}
+
+	// 断点优先级：最近一次写下的 blocked 断点 cursor → 最近一次成功轮的 cursor → start。
+	// 注意不能取「最旧 blocked 行」的游标：分页断点可能写在比上次成功行更早的窗口里，
+	// 而真正最新的断点是 recorded_at 最大的那一条。
+	cursor := ""
+	var cursorAt time.Time
+	for _, rec := range blocked {
+		if strings.TrimSpace(rec.LedgerCursor) == "" {
+			continue
+		}
+		at := rec.RecordedAt
+		if at.IsZero() {
+			at = rec.Start
+		}
+		if cursor == "" || at.After(cursorAt) {
+			cursor, cursorAt = rec.LedgerCursor, at
+		}
+	}
+	if cursor == "" {
+		c, ok, cerr := r.windows.LastLedgerCursor(ctx)
+		if cerr != nil {
+			return RoundResult{}, fmt.Errorf("读取账本续读游标失败：%w", cerr)
+		}
+		if ok {
+			cursor = c
+		}
+	}
+	if cursor == "" {
+		cursor = MagpieCursorStart
+	}
+	result.Cursor = cursor
+
+	resetUsed := false
+	// replacing 表示「本次 reset 的整段替换还没做」：重放的第一页提交时先清空本地账本，
+	// 之后各页只 upsert（重放可能跨轮，清空只能发生一次，否则会把已重放的页一起删掉）。
+	replacing := false
+	for {
+		page, ferr := r.feed.FetchFeed(ctx, cursor, r.pageSize)
+		if ferr != nil {
+			var ce *MagpieCursorError
+			if errors.As(ferr, &ce) && ce.Reset() {
+				if cursor == MagpieCursorStart || resetUsed {
+					r.saveStatus(ctx, &result, WindowError, ferr.Error(), 0, scanStart)
+					return result, fmt.Errorf("代理侧账本游标反复失效（已从 start 重放一次仍失败）：%w", ferr)
+				}
+				resetUsed = true
+				replacing = true
+				log.Warn("代理侧账本游标失效，从 start 重放并整段替换本地账本",
+					"err", ferr.Error(), "old_cursor", cursor,
+					"why", "cursor=start 不返回 deleted 列表，只 upsert 会让已删除/合并的旧 id 永久残留并双计")
+				cursor = MagpieCursorStart
+				result.Cursor = cursor
+				continue
+			}
+			r.saveStatus(ctx, &result, WindowError, ferr.Error(), 0, scanStart)
+			return result, fmt.Errorf("拉取代理侧账本失败（cursor=%q）：%w", cursor, ferr)
+		}
+		result.Pages++
+		if page.Skipped > 0 {
+			log.Warn("代理侧账本有行缺少幂等键/时间或为 handed_on，已跳过",
+				"skipped", page.Skipped, "cursor", cursor)
+		}
+
+		if len(page.Entries) > 0 || len(page.Deleted) > 0 || replacing {
+			nextCursor := strings.TrimSpace(page.NextCursor)
+			if nextCursor == "" {
+				// 空 cursor 写进去会把断点抹成「从头开始」，下一轮重放整本账。
+				// 没有 next_cursor 说明这已经是最后一页：不写游标，保留旧断点（或 start）。
+				nextCursor = cursor
+			}
+			tx, terr := r.ledger.Begin(ctx)
+			if terr != nil {
+				r.saveStatus(ctx, &result, WindowError, terr.Error(), 0, scanStart)
+				return result, terr
+			}
+			if replacing {
+				removed, rerr := tx.Truncate(ctx)
+				if rerr != nil {
+					_ = tx.Rollback()
+					r.saveStatus(ctx, &result, WindowError, rerr.Error(), 0, scanStart)
+					return result, fmt.Errorf("游标失效重放：清空本地账本失败（本页未写）：%w", rerr)
+				}
+				result.Replaced = removed
+				log.Warn("游标失效重放：本地账本已整段清空，按重放结果重建",
+					"removed", removed, "cursor", cursor)
+			}
+			n, uerr := tx.Upsert(ctx, page.Entries)
+			if uerr != nil {
+				_ = tx.Rollback()
+				r.saveStatus(ctx, &result, WindowError, uerr.Error(), 0, scanStart)
+				return result, uerr
+			}
+			deleted, derr := tx.Delete(ctx, page.Deleted)
+			if derr != nil {
+				_ = tx.Rollback()
+				r.saveStatus(ctx, &result, WindowError, derr.Error(), 0, scanStart)
+				return result, derr
+			}
+			if serr := r.windows.SaveTx(ctx, tx.Execer(), WindowRecord{
+				Start:        scanStart,
+				End:          scanStart.Add(WindowSize),
+				Status:       WindowBlocked, // 未跑完前不标 ok：水位线只能由完整轮次推进
+				Pages:        result.Pages,
+				Fetched:      result.Fetched + len(page.Entries) + len(page.Deleted),
+				Inserted:     result.Inserted + n,
+				Reason:       "cursor feed 分页进行中（本页已提交，下一轮从 ledger_cursor 续读）",
+				LedgerCursor: nextCursor,
+				RecordedAt:   r.now(),
+			}); serr != nil {
+				_ = tx.Rollback()
+				r.saveStatus(ctx, &result, WindowError, serr.Error(), 0, scanStart)
+				return result, fmt.Errorf("写游标断点失败（本页已回滚）：%w", serr)
+			}
+			if cerr := tx.Commit(); cerr != nil {
+				r.saveStatus(ctx, &result, WindowError, cerr.Error(), 0, scanStart)
+				return result, fmt.Errorf("提交游标分页事务失败：%w", cerr)
+			}
+			// 清空与第一页在同一事务里提交成功后才解除标记：之后各页只 upsert。
+			replacing = false
+			result.Inserted += n
+			result.Fetched += len(page.Entries) + len(page.Deleted)
+			log.Debug("代理侧账本分页已提交",
+				"cursor", cursor, "next_cursor", nextCursor,
+				"rows", len(page.Entries), "deleted", len(page.Deleted),
+				"upserted", n, "deleted_rows", deleted)
+		}
+
+		next := strings.TrimSpace(page.NextCursor)
+		if next == "" && page.HasMore {
+			reason := fmt.Sprintf("代理侧账本返回 has_more 但没有 next_cursor（cursor=%q）", cursor)
+			r.saveStatus(ctx, &result, WindowError, reason, 0, scanStart)
+			return result, fmt.Errorf("%s", reason)
+		}
+		if next != "" {
+			cursor = next
+		}
+		result.Cursor = cursor
+
+		if !page.HasMore {
+			break
+		}
+		if len(page.Entries) == 0 && len(page.Deleted) == 0 {
+			reason := fmt.Sprintf("代理侧账本返回空页但标记 has_more（cursor=%q）", cursor)
+			r.saveStatus(ctx, &result, WindowError, reason, 0, scanStart)
+			return result, fmt.Errorf("%s", reason)
+		}
+		if result.Pages >= r.maxPages || result.Fetched >= MaxRowsPerRound {
+			blockedErr := &ErrWindowBlocked{
+				Window: w, Pages: result.Pages, Fetched: result.Fetched, Cursor: cursor,
+			}
+			r.saveStatus(ctx, &result, WindowBlocked, blockedErr.Error(), 0, scanStart)
+			log.Error("代理侧账本同步 blocked（单轮上限）",
+				"window", w.String(), "pages", result.Pages, "max_pages", r.maxPages,
+				"max_rows", MaxRowsPerRound, "fetched", result.Fetched, "cursor", cursor)
+			return result, blockedErr
+		}
+	}
+
+	if result.Status == WindowOK && result.Fetched == 0 && result.Inserted == 0 {
+		result.Empty = true
+		log.Warn("本轮同步未拉到任何账本变更（空轮）",
+			"window", w.String(), "cursor", result.Cursor, "pages", result.Pages,
+			"hint", "上游无新数据 / 游标已到最新 / 凭据或端点配置错误")
+	}
+
+	tx, err := r.ledger.Begin(ctx)
+	if err != nil {
+		r.saveStatus(ctx, &result, WindowError, err.Error(), 0, scanStart)
+		return result, err
+	}
+	okRec := WindowRecord{
+		Start:        saved.Start,
+		End:          saved.End,
+		Status:       WindowOK,
+		Pages:        result.Pages,
+		Fetched:      result.Fetched,
+		Inserted:     result.Inserted,
+		LedgerCursor: result.Cursor,
+		RecordedAt:   r.now(),
+		ClearFrom:    clearFrom,
+	}
+	if err := r.windows.SaveTx(ctx, tx.Execer(), okRec); err != nil {
+		_ = tx.Rollback()
+		log.Error("写同步窗口行失败，本轮已回滚", "window", saved.String(), "err", err)
+		return result, fmt.Errorf("写同步窗口行失败（本轮已回滚）：%w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		r.saveStatus(ctx, &result, WindowError, err.Error(), 0, scanStart)
+		return result, fmt.Errorf("提交窗口收尾事务失败：%w", err)
+	}
+	result.Status = WindowOK
+	log.Info("代理侧账本同步完成",
+		"window", w.String(), "saved", saved.String(), "pages", result.Pages,
+		"fetched", result.Fetched, "inserted", result.Inserted, "cursor", result.Cursor)
+	return result, nil
+}
+
 // savedWindowFor 把拉取区间收敛成落库的 60s 窗口（reconcile_windows 的 CHECK 要求整 60s）。
 //
 // 取「拉取终点向下取整」那一窗：它代表本轮最新进度，水位线 = 它的 window_end。
@@ -714,6 +1036,7 @@ func (r *Rounder) saveStatus(ctx context.Context, result *RoundResult, status Wi
 		Inserted:     result.Inserted,
 		Reason:       reason,
 		ScrollOffset: offset,
+		LedgerCursor: result.Cursor,
 		RecordedAt:   r.now(),
 	}
 	if err := r.windows.Save(ctx, rec); err != nil {

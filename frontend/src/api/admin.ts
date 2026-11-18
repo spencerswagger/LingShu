@@ -600,7 +600,7 @@ export function getCostCurves(params: {
 export interface SessionPoint {
   Turn: number
   TurnNo: number
-  Status: string // completed | failed
+  Status: string // completed | failed | upstream_error（上游 4xx/5xx，金额 0）
   Failed: boolean
   CallTime: string
   ChannelName: string
@@ -746,7 +746,7 @@ export function getCostPricingCurve(
 export interface CostTracePoint {
   Turn: number
   TurnNo: number
-  Status: string // completed | failed
+  Status: string // completed | failed | upstream_error（上游 4xx/5xx，金额 0）
   Failed: boolean
   CallTime: string
   ChannelID: number

@@ -857,12 +857,13 @@ function creditLines(row: AdminBillingItem): string[] {
               <el-select v-model="filters.status" placeholder="账单状态" clearable size="small">
                 <el-option label="成功" value="completed" />
                 <el-option label="失败" value="failed" />
+                <el-option label="上游错误" value="upstream_error" />
               </el-select>
             </ColumnFilter>
           </template>
           <template #default="{ row }">
             <span :class="['st', row.Status === 'completed' ? 'st-ok' : 'st-fail']">
-              {{ row.Status === 'completed' ? '成功' : '失败' }}
+              {{ row.Status === 'completed' ? '成功' : row.Status === 'upstream_error' ? '上游错误' : '失败' }}
             </span>
           </template>
         </el-table-column>        <!-- 积分 -->
@@ -893,7 +894,7 @@ function creditLines(row: AdminBillingItem): string[] {
           <div class="bc-head">
             <span class="bc-time">{{ fmtDate(row.CallTime) }} {{ fmtTime(row.CallTime) }}</span>
             <span :class="['st', row.Status === 'completed' ? 'st-ok' : 'st-fail']">
-              {{ row.Status === 'completed' ? '成功' : '失败' }}
+              {{ row.Status === 'completed' ? '成功' : row.Status === 'upstream_error' ? '上游错误' : '失败' }}
             </span>
           </div>
           <div class="bc-line">

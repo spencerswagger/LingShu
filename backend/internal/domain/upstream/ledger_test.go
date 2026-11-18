@@ -47,7 +47,7 @@ func TestLedgerEntry_Validate(t *testing.T) {
 	}
 }
 
-// TestBuildLedgerInsert_IdempotentShape 断言写入 SQL 的幂等形状：九列 + ON CONFLICT (ledger_id) DO NOTHING。
+// TestBuildLedgerInsert_IdempotentShape 断言写入 SQL 的幂等形状：九列 + ON CONFLICT (ledger_id) DO UPDATE。
 func TestBuildLedgerInsert_IdempotentShape(t *testing.T) {
 	e1, e2 := validEntry("led-1"), validEntry("led-2")
 	query, args := buildLedgerInsert([]LedgerEntry{e1, e2})
@@ -55,8 +55,8 @@ func TestBuildLedgerInsert_IdempotentShape(t *testing.T) {
 	if !strings.Contains(query, "INSERT INTO "+LedgerTable) {
 		t.Fatalf("SQL 应写入 %s：%s", LedgerTable, query)
 	}
-	if !strings.Contains(query, "ON CONFLICT (ledger_id) DO NOTHING") {
-		t.Fatalf("SQL 必须用 ledger_id 做幂等冲突键：%s", query)
+	if !strings.Contains(query, "ON CONFLICT (ledger_id) DO UPDATE") {
+		t.Fatalf("SQL 必须用 ledger_id 做幂等冲突键，并覆盖同 id 的高 seq 新值：%s", query)
 	}
 	if !strings.Contains(query, "($1,") || !strings.Contains(query, "($10,") {
 		t.Fatalf("两行应占 18 个占位参数（每行九列）：%s", query)
@@ -71,7 +71,7 @@ func TestBuildLedgerInsert_IdempotentShape(t *testing.T) {
 }
 
 // TestLedgerStore_UpsertIdempotent_DuplicateNotCounted 是真实库用例：同一 ledger_id 重复写入
-// 只算一次（ON CONFLICT DO NOTHING 的 RowsAffected 语义），并验证 offset 分页边界。
+// 不新增行，但同 id 的新值要覆盖旧值（代理侧同一 id 高 seq = 这一行被改过），并验证 offset 分页边界。
 //
 // 未设置 LLMGATEWAY_TEST_PG_DSN 时跳过（不阻塞普通 go test）。
 // 表由本用例按架构侧定稿的九字段在**临时库**里就地建——迁移文件归架构侧 0019–0023，
@@ -104,22 +104,27 @@ func TestLedgerStore_UpsertIdempotent_DuplicateNotCounted(t *testing.T) {
 		t.Fatalf("首次写入应插入 2 条，got %d", n)
 	}
 
-	// 第二轮：同一条账本重复出现（窗口重叠导致）→ 只算 1 条新（另一条被幂等键吃掉）。
+	// 第二轮：同一条账本再次出现（游标重放/窗口重叠）→ 不新增行；同 id 的新值覆盖旧值。
 	tx, err = store.Begin(ctx)
 	if err != nil {
 		t.Fatalf("开事务失败: %v", err)
 	}
+	firstUpdated := first
+	firstUpdated.TokensIn = 999
 	third := validEntry("led-third")
 	third.OccurredAt = second.OccurredAt.Add(time.Second)
-	n, err = tx.Upsert(ctx, []LedgerEntry{first, second, third})
-	if err != nil {
+	if _, err = tx.Upsert(ctx, []LedgerEntry{firstUpdated, second, third}); err != nil {
 		t.Fatalf("重复写入失败: %v", err)
 	}
 	if err := tx.Commit(); err != nil {
 		t.Fatalf("提交失败: %v", err)
 	}
-	if n != 1 {
-		t.Fatalf("重复的 ledger_id 不应重复计数：应只插入 1 条，got %d", n)
+	var updatedIn int64
+	if err := conn.QueryRowContext(ctx, fmt.Sprintf(`SELECT tokens_in FROM %s WHERE ledger_id=$1`, LedgerTable), first.LedgerID).Scan(&updatedIn); err != nil {
+		t.Fatalf("读取覆盖后的账本失败: %v", err)
+	}
+	if updatedIn != 999 {
+		t.Fatalf("同 id 的新值必须覆盖旧值，got tokens_in=%d", updatedIn)
 	}
 
 	// 库里总数 = 3（重复写入没有多出记录）；真实迁移建的 uq_ledger_entries_ledger_id 在守。
@@ -153,6 +158,81 @@ func TestLedgerStore_UpsertIdempotent_DuplicateNotCounted(t *testing.T) {
 	if len(page3) != 0 {
 		t.Fatalf("越界 offset 应返回空页，got %d 条", len(page3))
 	}
+}
+
+// TestLedgerStore_TruncateReplacesWholeLedger 是真实库用例：游标失效重放时「整段替换」的语义 ——
+// 同一事务里先 DELETE 全表再写入重放结果；回滚时旧账本原样保留（不能留下「清空了但没重放」的空账）。
+func TestLedgerStore_TruncateReplacesWholeLedger(t *testing.T) {
+	conn := openMigratedTempDB(t)
+	ctx := context.Background()
+	store := NewLedgerStore(conn)
+
+	stale := validEntry("u_session")
+	keep := validEntry("u_gateway")
+	keep.OccurredAt = stale.OccurredAt.Add(time.Second)
+	tx, err := store.Begin(ctx)
+	if err != nil {
+		t.Fatalf("开事务失败: %v", err)
+	}
+	if _, err := tx.Upsert(ctx, []LedgerEntry{stale, keep}); err != nil {
+		t.Fatalf("预置账本失败: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("提交失败: %v", err)
+	}
+
+	// 回滚路径：清空必须跟着事务一起回滚。
+	tx, err = store.Begin(ctx)
+	if err != nil {
+		t.Fatalf("开事务失败: %v", err)
+	}
+	if _, err := tx.Truncate(ctx); err != nil {
+		t.Fatalf("清空失败: %v", err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("回滚失败: %v", err)
+	}
+	if got := countLedgerRows(t, ctx, conn); got != 2 {
+		t.Fatalf("回滚后旧账本必须原样保留，got %d 条", got)
+	}
+
+	// 提交路径：清空 + 只写重放回来的那一行 → 代理侧已删除的旧 id 不再残留。
+	tx, err = store.Begin(ctx)
+	if err != nil {
+		t.Fatalf("开事务失败: %v", err)
+	}
+	removed, err := tx.Truncate(ctx)
+	if err != nil {
+		t.Fatalf("清空失败: %v", err)
+	}
+	if removed != 2 {
+		t.Fatalf("应报告清空 2 条，got %d", removed)
+	}
+	if _, err := tx.Upsert(ctx, []LedgerEntry{keep}); err != nil {
+		t.Fatalf("重放写入失败: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("提交失败: %v", err)
+	}
+	if got := countLedgerRows(t, ctx, conn); got != 1 {
+		t.Fatalf("整段替换后应只剩重放回来的 1 条，got %d", got)
+	}
+	var left string
+	if err := conn.QueryRowContext(ctx, fmt.Sprintf(`SELECT ledger_id FROM %s`, LedgerTable)).Scan(&left); err != nil {
+		t.Fatalf("读取剩余行失败: %v", err)
+	}
+	if left != keep.LedgerID {
+		t.Fatalf("残留的应是重放回来的 %s，got %s", keep.LedgerID, left)
+	}
+}
+
+func countLedgerRows(t *testing.T, ctx context.Context, conn *sql.DB) int {
+	t.Helper()
+	var n int
+	if err := conn.QueryRowContext(ctx, fmt.Sprintf(`SELECT count(*) FROM %s`, LedgerTable)).Scan(&n); err != nil {
+		t.Fatalf("统计账本行数失败: %v", err)
+	}
+	return n
 }
 
 // TestLedgerStore_UnassembledDB 断言未装配数据库时返回错误而不是 panic。

@@ -144,11 +144,11 @@ func TestHandleListBillings_FilterParams(t *testing.T) {
 		"auto_model_name", "internal_model_id", "session_id", "session_name", "call_time", "tokens", "rates",
 		"coefficients", "r_value", "raw_total", "credits_consumed", "cost_credits",
 		"balance_before", "balance_after", "status", "error_message", "duration_ms",
-		"first_token_ms", "rid", "cnt",
+		"first_token_ms", "upstream_status", "upstream_error_summary", "rid", "cnt",
 	}).AddRow(
 		int64(1), "b1", int64(1), "sale", nil, "ext", nil, "int", "sess-1", "",
 		time.Now(), `{}`, `{}`, `{"time":1,"context":1}`, int64(10000),
-		nil, nil, nil, nil, nil, "completed", nil, nil, nil,
+		nil, nil, nil, nil, nil, "completed", nil, nil, nil, nil, nil,
 		"req-1", int64(1),
 	)
 

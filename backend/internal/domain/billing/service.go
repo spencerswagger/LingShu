@@ -21,11 +21,50 @@ import (
 	"github.com/team/llmgateway/internal/pkg/money"
 )
 
-// 记账状态。
+// 记账状态（值域与 0025 的 ck_billing_status 逐字一致）。
 const (
 	StatusCompleted = "completed"
 	StatusFailed    = "failed"
+	// StatusUpstreamError 表示上游 4xx/5xx / 传输失败 / 超时。
+	// 与 StatusFailed 的区别只在「为什么没计费」：两者都可以是金额 0，
+	// 但 upstream_error 要在账单上保留上游状态码与错误体摘要，供运营分派。
+	StatusUpstreamError = "upstream_error"
 )
+
+// ValidStatus 判断状态是否在 0025 的值域内。
+func ValidStatus(status string) bool {
+	switch status {
+	case StatusCompleted, StatusFailed, StatusUpstreamError:
+		return true
+	default:
+		return false
+	}
+}
+
+// upstreamErrorSummaryMaxBytes 是上游错误体摘要的落库上限（与网关侧 capture 上限同量级）。
+const upstreamErrorSummaryMaxBytes = 512
+
+// statusOrCompleted 把空状态归一成 completed（非空且非法由调用方先校验）。
+func statusOrCompleted(status string) string {
+	if status == "" {
+		return StatusCompleted
+	}
+	return status
+}
+
+// truncateUpstreamSummary 做写入侧最后一道兜底：非法 UTF-8 → U+FFFD，按 UTF-8 边界截到 512B。
+// 调用方（网关）已经遮蔽过凭据；这里不重复遮蔽，避免把正常文本误伤成 ***。
+func truncateUpstreamSummary(s string) string {
+	s = strings.ToValidUTF8(strings.TrimSpace(s), "�")
+	if len(s) <= upstreamErrorSummaryMaxBytes {
+		return s
+	}
+	cut := upstreamErrorSummaryMaxBytes
+	for cut > 0 && (s[cut]&0xC0) == 0x80 {
+		cut--
+	}
+	return s[:cut]
+}
 
 // validateStoredMoney 校验金额在可存储范围内且非 NaN/Inf（实现迁移至 internal/pkg/money）。
 func validateStoredMoney(v float64, what string) error {
@@ -135,8 +174,12 @@ type Record struct {
 	BalanceAfter    float64
 	Status          string
 	ErrorMessage    string
-	DurationMs      *int64 // 总耗时（毫秒）
-	FirstTokenMs    *int64 // 首字耗时（毫秒）
+	// UpstreamStatus 是上游 HTTP 状态码（NULL/0 = 没收到响应）；仅 upstream_error 行有值。
+	UpstreamStatus *int
+	// UpstreamErrorSummary 是上游错误体摘要（已遮蔽凭据、折叠空白、截断 512B）。
+	UpstreamErrorSummary string
+	DurationMs           *int64 // 总耗时（毫秒）
+	FirstTokenMs         *int64 // 首字耗时（毫秒）
 	// RequestID 网关请求链路 ID：写入侧落 billing_records.request_id（V2 归因列，空写 NULL），
 	// 列表查询侧仍按既有口径从 call_logs 归并（两者同值；统一读取口径属后续切片）。
 	// 让一次请求在账单可被直接定位（多候选尝试共享同一 request_id）。
@@ -174,9 +217,16 @@ type RecordReq struct {
 	Rates           Rates // 计费单价（sale 或 cost，由调用方选好模式传入）
 	CostRates       Rates // cost 模式下用于记录成本积分，可为 nil
 	ErrorMessage    string
-	DurationMs      *int64
-	FirstTokenMs    *int64
-	// Fail 为 true 时不扣积分、不计算公式，直接落一条 failed 记录（记录上游/下游失败原因）。
+	// Status 为空时按 Fail 推导（Fail=true → failed，否则 completed）。
+	// upstream_error 由调用方显式传入（上游 4xx/5xx / 传输失败）。
+	Status string
+	// UpstreamStatus 是上游 HTTP 状态码（0 表示没收到响应，落 NULL）。
+	UpstreamStatus *int
+	// UpstreamErrorSummary 是上游错误体摘要（调用方负责遮蔽/截断；写入侧再截一次兜底）。
+	UpstreamErrorSummary string
+	DurationMs           *int64
+	FirstTokenMs         *int64
+	// Fail 为 true 时不扣积分、不计算公式，直接落一条失败记录（记录上游/下游失败原因）。
 	Fail bool
 	// 模型级覆盖（可空）。非空时本单次优先使用模型级时段/分档，
 	// 否则回落全局 sys_configs（billing.time_config / billing.context_tiers）。
@@ -266,33 +316,45 @@ func (s *Service) Record(ctx context.Context, req RecordReq) (*Record, error) {
 	if req.CallTime.IsZero() {
 		req.CallTime = s.clock()
 	}
+	if req.Status != "" && !ValidStatus(req.Status) {
+		return nil, fmt.Errorf("非法账单状态 %q（只允许 completed/failed/upstream_error）", req.Status)
+	}
 
-	// 失败记录快速通道（上游/下游失败不扣积分）：直接落 failed 并携带原因。
+	// 失败记录快速通道（上游/下游失败不扣积分）：直接落失败状态并携带原因。
 	if req.Fail {
+		status := req.Status
+		if status == "" {
+			status = StatusFailed
+		}
+		if !ValidStatus(status) {
+			return nil, fmt.Errorf("非法账单状态 %q（只允许 completed/failed/upstream_error）", status)
+		}
 		rec := &Record{
-			BillingID:        req.BillingID,
-			UserID:           req.UserID,
-			PricingMode:      req.PricingMode,
-			TokenID:          req.TokenID,
-			ExternalModel:    req.ExternalModel,
-			AutoModelName:    req.AutoModelName,
-			InternalModelID:  req.InternalModelID,
-			ChannelKeyID:     req.ChannelKeyID,
-			SessionID:        req.SessionID,
-			SessionName:      req.SessionName,
-			CallTime:         req.CallTime,
-			Tokens:           req.Tokens,
-			Status:           StatusFailed,
-			ErrorMessage:     req.ErrorMessage,
-			DurationMs:       req.DurationMs,
-			FirstTokenMs:     req.FirstTokenMs,
-			RequestID:        req.RequestID,
-			UpstreamProvider: req.UpstreamProvider,
-			UpstreamAccount:  req.UpstreamAccount,
-			UpstreamProtocol: req.UpstreamProtocol,
-			UpstreamModel:    req.UpstreamModel,
-			LedgerEntryID:    req.LedgerEntryID,
-			CostSource:       req.CostSource,
+			BillingID:            req.BillingID,
+			UserID:               req.UserID,
+			PricingMode:          req.PricingMode,
+			TokenID:              req.TokenID,
+			ExternalModel:        req.ExternalModel,
+			AutoModelName:        req.AutoModelName,
+			InternalModelID:      req.InternalModelID,
+			ChannelKeyID:         req.ChannelKeyID,
+			SessionID:            req.SessionID,
+			SessionName:          req.SessionName,
+			CallTime:             req.CallTime,
+			Tokens:               req.Tokens,
+			Status:               status,
+			ErrorMessage:         req.ErrorMessage,
+			UpstreamStatus:       req.UpstreamStatus,
+			UpstreamErrorSummary: truncateUpstreamSummary(req.UpstreamErrorSummary),
+			DurationMs:           req.DurationMs,
+			FirstTokenMs:         req.FirstTokenMs,
+			RequestID:            req.RequestID,
+			UpstreamProvider:     req.UpstreamProvider,
+			UpstreamAccount:      req.UpstreamAccount,
+			UpstreamProtocol:     req.UpstreamProtocol,
+			UpstreamModel:        req.UpstreamModel,
+			LedgerEntryID:        req.LedgerEntryID,
+			CostSource:           req.CostSource,
 		}
 		if _, err := s.store.Insert(ctx, rec); err != nil {
 			if isUniqueViolation(err) {
@@ -353,11 +415,14 @@ func (s *Service) Record(ctx context.Context, req RecordReq) (*Record, error) {
 			Time    float64 `json:"time"`
 			Context float64 `json:"context"`
 		}{Time: timeCoeff, Context: ctxCoeff},
-		RValue:       r,
-		RawTotal:     rawTotal,
-		DurationMs:   req.DurationMs,
-		FirstTokenMs: req.FirstTokenMs,
-		ErrorMessage: req.ErrorMessage,
+		RValue:               r,
+		RawTotal:             rawTotal,
+		DurationMs:           req.DurationMs,
+		FirstTokenMs:         req.FirstTokenMs,
+		ErrorMessage:         req.ErrorMessage,
+		Status:               statusOrCompleted(req.Status),
+		UpstreamStatus:       req.UpstreamStatus,
+		UpstreamErrorSummary: truncateUpstreamSummary(req.UpstreamErrorSummary),
 
 		RequestID:        req.RequestID,
 		UpstreamProvider: req.UpstreamProvider,
@@ -1051,7 +1116,8 @@ func (s *SqlStore) SetConfigWriteHook(fn func()) {
 // （call_logs 与账单按 billing_id 1:1），见 fillChannelKeys。写路径同样不再写该列。
 const recordCols = `id, billing_id, user_id, pricing_mode, token_id, external_model_name,
 	auto_model_name, internal_model_id, session_id, session_name, call_time, tokens, rates, coefficients, r_value,
-	raw_total, credits_consumed, cost_credits, balance_before, balance_after, status, error_message, duration_ms, first_token_ms`
+	raw_total, credits_consumed, cost_credits, balance_before, balance_after, status, error_message, duration_ms, first_token_ms,
+	upstream_status, upstream_error_summary`
 
 // GetConfig 读取 sys_configs 单键值；key 不存在返回错误。
 func (s *SqlStore) GetConfig(ctx context.Context, key string) ([]byte, error) {
@@ -1146,20 +1212,25 @@ func (s *SqlStore) insertOn(ctx context.Context, ex dbx.Execer, rec *Record) (*R
 	if rec.ID == 0 {
 		rec.ID = idgen.New()
 	}
+	// 两个新列放在最后，避免打乱既有 31 个参数的位置（重试队列/单测都按位置构造）。
+	// upstream_status 为 0 时写 NULL（0 不是合法的 HTTP 码，写 0 会让统计误以为有响应）。
+	args := append([]any{
+		rec.ID, rec.BillingID, rec.UserID, rec.PricingMode, tokenID, rec.ExternalModel, autoModelName,
+		rec.InternalModelID, sessionID, sessionName, rec.CallTime, tokensRaw, ratesRaw, coeffRaw,
+		rec.RValue, rec.RawTotal, rec.CreditsConsumed, rec.CostCredits,
+		rec.BalanceBefore, rec.BalanceAfter, rec.Status, errMsg, durationMs, firstTokenMs,
+	}, attr...)
+	args = append(args, nullableUpstreamStatus(rec.UpstreamStatus), nullableText(rec.UpstreamErrorSummary))
+
 	err = ex.QueryRowContext(ctx,
 		`INSERT INTO billing_records(id, billing_id, user_id, pricing_mode, token_id, external_model_name,
 			auto_model_name, internal_model_id, session_id, session_name, call_time, tokens, rates, coefficients, r_value,
 			raw_total, credits_consumed, cost_credits, balance_before, balance_after, status, error_message, duration_ms, first_token_ms,
-			request_id, upstream_provider, upstream_account, upstream_protocol, upstream_model, ledger_entry_id, cost_source)
+			request_id, upstream_provider, upstream_account, upstream_protocol, upstream_model, ledger_entry_id, cost_source,
+			upstream_status, upstream_error_summary)
 		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,
-			$25,$26,$27,$28,$29,$30,$31)
-		 RETURNING id, created_at`,
-		append([]any{
-			rec.ID, rec.BillingID, rec.UserID, rec.PricingMode, tokenID, rec.ExternalModel, autoModelName,
-			rec.InternalModelID, sessionID, sessionName, rec.CallTime, tokensRaw, ratesRaw, coeffRaw,
-			rec.RValue, rec.RawTotal, rec.CreditsConsumed, rec.CostCredits,
-			rec.BalanceBefore, rec.BalanceAfter, rec.Status, errMsg, durationMs, firstTokenMs,
-		}, attr...)...).
+			$25,$26,$27,$28,$29,$30,$31,$32,$33)
+		 RETURNING id, created_at`, args...).
 		Scan(&rec.ID, &created)
 	if err != nil {
 		return nil, err
@@ -1224,6 +1295,14 @@ func fillChannelKeys(ctx context.Context, ex dbx.Execer, recs []*Record) error {
 	return rows.Err()
 }
 
+// nullableUpstreamStatus 把上游状态码转为可入库的 any：nil/0 → NULL（0 = 没收到响应）。
+func nullableUpstreamStatus(v *int) any {
+	if v == nil || *v <= 0 {
+		return nil
+	}
+	return *v
+}
+
 // nullableInt64For 把 *int64 转为可入库的 any（nil → nil）。
 func nullableInt64For(v *int64) any {
 	if v == nil {
@@ -1242,6 +1321,8 @@ func sqlScan(row interface{ Scan(...any) error }) (*Record, error) {
 	var rawTotal, consCred, costCred, balBefore, balAfter sql.NullFloat64
 	var errMsg sql.NullString
 	var durationMs, firstTokenMs sql.NullInt64
+	var upstreamStatus sql.NullInt64
+	var upstreamSummary sql.NullString
 	var tokensRaw, ratesRaw, coeffRaw []byte
 	var callTime time.Time
 
@@ -1249,7 +1330,7 @@ func sqlScan(row interface{ Scan(...any) error }) (*Record, error) {
 		&rec.ExternalModel, &autoModelName, &rec.InternalModelID, &sessionID, &sessionName, &callTime,
 		&tokensRaw, &ratesRaw, &coeffRaw, &rec.RValue,
 		&rawTotal, &consCred, &costCred, &balBefore, &balAfter, &rec.Status, &errMsg,
-		&durationMs, &firstTokenMs)
+		&durationMs, &firstTokenMs, &upstreamStatus, &upstreamSummary)
 	if err != nil {
 		return nil, err
 	}
@@ -1280,6 +1361,11 @@ func sqlScan(row interface{ Scan(...any) error }) (*Record, error) {
 		v := firstTokenMs.Int64
 		rec.FirstTokenMs = &v
 	}
+	if upstreamStatus.Valid {
+		v := int(upstreamStatus.Int64)
+		rec.UpstreamStatus = &v
+	}
+	rec.UpstreamErrorSummary = upstreamSummary.String
 	rec.ErrorMessage = errMsg.String
 	rec.SessionID = sessionID.String
 	rec.SessionName = sessionName.String

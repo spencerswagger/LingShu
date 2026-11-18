@@ -484,8 +484,8 @@ const (
 type costSessionPoint struct {
 	Turn            int     `json:"Turn"`
 	TurnNo          int     `json:"TurnNo"`
-	Status          string  `json:"Status"` // completed | failed（billing_records.status 的实际取值）
-	Failed          bool    `json:"Failed"` // = Status=='failed'，供前端直接判红点
+	Status          string  `json:"Status"` // completed | failed | upstream_error（billing_records.status 的实际取值）
+	Failed          bool    `json:"Failed"` // = Status!='completed'（failed/upstream_error 都判红点）
 	CallTime        string  `json:"CallTime"`
 	ChannelName     string  `json:"ChannelName"`
 	InternalModelID string  `json:"InternalModelID"`

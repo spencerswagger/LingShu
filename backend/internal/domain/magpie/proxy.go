@@ -61,6 +61,9 @@ type Result struct {
 	// UnmaskableEncoding 非空表示上游用了 stdlib 解不了的压缩编码（如 br），
 	// 只能按原字节透传，遮蔽豁免在该响应上不成立——handler 会落告警。
 	UnmaskableEncoding string
+	// UpstreamErrorSummary 是上游 4xx/5xx 错误体摘要（已遮蔽本次凭据、折叠空白、≤512B）。
+	// 只在错误状态码上捕获；给计费侧落 `billing_records.upstream_error_summary`，运营据此分派。
+	UpstreamErrorSummary string
 
 	Duration time.Duration
 	Err      error
@@ -268,6 +271,27 @@ func (p *Proxy) Forward(w http.ResponseWriter, r *http.Request, route Route, pre
 
 	// 3) 透传响应头与状态码（上游错误同样原样回流，不二次包装）。
 	res.Status = resp.StatusCode
+	// 上游错误体摘要：给计费侧落账单。旁路 tee，不改写转发字节。
+	// 只有「能拿到明文」的编码才捕：解压成功 / 头与体不自洽（实际是明文）/ 无编码。
+	// 压缩体（br、或没配凭据时的 gzip）捕到的是压缩字节，写摘要只会误导运营。
+	encHeader := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding")))
+	var errCap *errorBodyCapture
+	if resp.StatusCode >= 400 {
+		switch {
+		case encHeader == "" || encHeader == "identity" || stripEncoding || decoded:
+			errCap = newErrorBodyCapture(needle)
+			body = io.TeeReader(body, errCap)
+		default:
+			res.UpstreamErrorSummary = fmt.Sprintf("（上游响应体编码为 %s，未解析）", encHeader)
+		}
+	}
+	// 注意：不能用 defer 收尾 —— `return res` 在 defer 之前已把 res 复制出去，
+	// defer 里改的是局部变量，调用方拿到的仍是空摘要（实测踩过）。所以在每个返回点前收尾。
+	finalizeErrorSummary := func() {
+		if errCap != nil && res.UpstreamErrorSummary == "" {
+			res.UpstreamErrorSummary = errCap.Summary()
+		}
+	}
 	res.NoContent = resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusNotModified
 	res.Streamed = isSSE
 	collector := newUsageCollector(route.Protocol, isSSE)
@@ -288,6 +312,7 @@ func (p *Proxy) Forward(w http.ResponseWriter, r *http.Request, route Route, pre
 	}
 	if res.NoContent {
 		w.WriteHeader(resp.StatusCode)
+		finalizeErrorSummary()
 		return res
 	}
 
@@ -319,6 +344,7 @@ func (p *Proxy) Forward(w http.ResponseWriter, r *http.Request, route Route, pre
 			res.Usage, res.HasUsage = u, true
 		}
 	}
+	finalizeErrorSummary()
 	return res
 }
 
@@ -387,6 +413,16 @@ func (p *Proxy) serveMaskedBuffered(w http.ResponseWriter, body io.Reader, colle
 	}
 	if collector != nil {
 		collector.Feed(raw)
+	}
+	// 非流式的错误体已经在内存里：直接按最终字节生成摘要（比 tee 的 8KB 前缀更完整），
+	// 也覆盖「解码中途失败后回退原始字节」的情况（此时不能解析，只能说明编码）。
+	if res.Status >= 400 && !strings.Contains(res.UpstreamErrorSummary, "未解析") {
+		// 「未解析」是上游压缩且本路径没有解压（没配凭据 / br）时打的标注，不许被压缩字节覆盖。
+		if res.UnmaskableEncoding != "" {
+			res.UpstreamErrorSummary = fmt.Sprintf("（上游响应体编码为 %s，未解析）", res.UnmaskableEncoding)
+		} else {
+			res.UpstreamErrorSummary = summarizeUpstreamError(raw, needle)
+		}
 	}
 	if int64(len(raw)) > maskBufferLimit {
 		// 超大响应：已读部分走缓冲遮蔽，剩余**继续流式转发到底**（不丢字节）。

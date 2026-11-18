@@ -45,7 +45,12 @@ type LedgerEntry struct {
 	ProviderAccount string
 	// Model 是上游模型名；缺失为空串。
 	Model string
-	// TokensIn / TokensOut 是上游口径的输入/输出 token 数。
+	// TokensIn / TokensOut 是**提示词侧总量 / 输出**。
+	//
+	// TokensIn 不是代理侧的 `in` 原值，而是 `in + cache_read + cache_write`（缓存并入输入侧）：
+	// 灵枢 billing_records 的三段口径是纯输入（含 cache_write）+ cache_read + output，
+	// 只有把缓存并进 tokens_in，`tokens_in + tokens_out` 才与 `billing.TokenSumExpr` 同口径
+	// （代理侧 `in` 不含缓存）。适配层的合并点见 magpie_ledger.go 的 mapMagpieFeedRow。
 	TokensIn  int64
 	TokensOut int64
 	// CostCredits 是上游口径的成本积分（NUMERIC(20,5)）。
@@ -73,8 +78,20 @@ func (e LedgerEntry) Validate() error {
 
 // LedgerTx 是一轮同步的事务边界：跨页写入同一事务，失败/超限整轮回滚（不留半条账）。
 type LedgerTx interface {
-	// Upsert 幂等写入一批账本（ON CONFLICT (ledger_id) DO NOTHING），返回实际插入条数。
+	// Upsert 幂等写入一批账本（ON CONFLICT (ledger_id) DO UPDATE；同 id 高 seq 覆盖旧值），
+	// 返回受影响的条数（新插入 + 覆盖；仅用于观测，不参与正确性判断）。
 	Upsert(ctx context.Context, entries []LedgerEntry) (int, error)
+	// Delete 按代理侧 deleted 列表删除账本 id（行被合并/清除时必须同步删除，否则重复计数）。
+	// 返回实际删除条数。
+	Delete(ctx context.Context, ledgerIDs []string) (int, error)
+	// Truncate 清空本地账本（返回删除条数）。
+	//
+	// 只在**游标失效重放**时用：代理侧 `cursor=start` 返回的是「账本现在的样子」，且明确
+	// 「不给 deleted 列表」（docs/reference.md：Reading with `cursor=start` lists the ledger as
+	// it is and no deleted ids）。只 upsert 的话，代理侧已经删掉/合并掉的旧 id 会永久留在本地，
+	// 与重放出来的新 id 并存 → 同一通调用被计两次（实测 u_session 与 u_gateway 并存）。
+	// 所以 reset 语义是「整段替换」：同一个事务里先 Truncate 再 Upsert。
+	Truncate(ctx context.Context) (int64, error)
 	Commit() error
 	Rollback() error
 	// Execer 返回事务执行器：窗口行必须与账本同事务写（契约 §6.2），
@@ -192,6 +209,56 @@ func (t *ledgerTx) Upsert(ctx context.Context, entries []LedgerEntry) (int, erro
 	return inserted, nil
 }
 
+// Delete 按代理侧 deleted 列表删除账本 id（同事务，与 upsert 一起提交）。
+//
+// 用 IN($1..$n) 而不是 ANY($1::text[])：不依赖驱动对切片参数的编码，sqlmock 也能断言。
+func (t *ledgerTx) Delete(ctx context.Context, ledgerIDs []string) (int, error) {
+	if len(ledgerIDs) == 0 {
+		return 0, nil
+	}
+	deleted := 0
+	for start := 0; start < len(ledgerIDs); start += ledgerBatchRows {
+		end := start + ledgerBatchRows
+		if end > len(ledgerIDs) {
+			end = len(ledgerIDs)
+		}
+		ids := ledgerIDs[start:end]
+		marks := make([]string, len(ids))
+		args := make([]any, len(ids))
+		for i, id := range ids {
+			marks[i] = "$" + strconv.Itoa(i+1)
+			args[i] = id
+		}
+		res, err := t.tx.ExecContext(ctx,
+			`DELETE FROM `+LedgerTable+` WHERE ledger_id IN (`+strings.Join(marks, ", ")+`)`, args...)
+		if err != nil {
+			return deleted, fmt.Errorf("删除账本失败（%s 起 %d 条）：%w", ids[0], len(ids), err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return deleted, fmt.Errorf("读取账本删除行数失败：%w", err)
+		}
+		deleted += int(n)
+	}
+	return deleted, nil
+}
+
+// Truncate 清空本地账本（游标失效重放时用，见 LedgerTx.Truncate 的说明）。
+//
+// 与 Upsert 同事务：先删后写要么都生效、要么都不生效 —— 中途失败时旧账本原样保留，
+// 不会留下「清空了但没重放」的空账（那会让对账把整段流量当成年账本侧缺失）。
+func (t *ledgerTx) Truncate(ctx context.Context) (int64, error) {
+	res, err := t.tx.ExecContext(ctx, `DELETE FROM `+LedgerTable)
+	if err != nil {
+		return 0, fmt.Errorf("清空本地账本失败：%w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("读取清空账本行数失败：%w", err)
+	}
+	return n, nil
+}
+
 // Commit 提交整轮账本写入。
 func (t *ledgerTx) Commit() error { return t.tx.Commit() }
 
@@ -222,6 +289,15 @@ func buildLedgerInsert(entries []LedgerEntry) (string, []any) {
 		args = append(args, e.ID, e.LedgerID, e.Provider, e.ProviderAccount, e.Model,
 			e.TokensIn, e.TokensOut, e.CostCredits, e.OccurredAt)
 	}
-	b.WriteString(` ON CONFLICT (ledger_id) DO NOTHING`)
+	// 同一 id 以更高 seq 再次出现 = 代理侧这一行被改过（例如成本补齐、账号修正），
+	// 必须覆盖；DO NOTHING 会让灵枢永久保留第一次读到的旧值。
+	b.WriteString(` ON CONFLICT (ledger_id) DO UPDATE SET
+		provider = EXCLUDED.provider,
+		provider_account = EXCLUDED.provider_account,
+		model = EXCLUDED.model,
+		tokens_in = EXCLUDED.tokens_in,
+		tokens_out = EXCLUDED.tokens_out,
+		cost_credits = EXCLUDED.cost_credits,
+		occurred_at = EXCLUDED.occurred_at`)
 	return b.String(), args
 }
