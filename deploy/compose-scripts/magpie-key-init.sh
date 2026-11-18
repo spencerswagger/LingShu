@@ -4,7 +4,10 @@
 set -u
 NAME="${MAGPIE_ADMIN_KEY_NAME:-lingshu-backend}"
 ADDR="${MAGPIE_ADDR:-http://magpie:3425}"
-HOST=$(printf '%s' "$ADDR" | sed -E 's#^[a-z]+://##; s#/.*$##; s#:.*$##')
+HOST_NAME=$(printf '%s' "$ADDR" | sed -E 's#^[a-z]+://##; s#/.*$##; s#:.*$##')
+# bash 的 /dev/tcp 不做 DNS 解析：必须先把容器名（magpie）解析成 IP，否则探活永远失败。
+HOST=$(getent hosts "$HOST_NAME" 2>/dev/null | awk '{print $1; exit}')
+[ -n "${HOST:-}" ] || HOST="$HOST_NAME"
 PORT=$(printf '%s' "$ADDR" | sed -nE 's#^[a-z]+://[^:/]+:([0-9]+).*#\1#p'); PORT=${PORT:-3425}
 MAGPIE_BIN=$(command -v magpie || echo /magpie)
 KEY_FILE=/secret/admin_key
