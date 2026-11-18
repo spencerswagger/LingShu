@@ -12,7 +12,7 @@ import '@vue-flow/controls/dist/style.css'
 import type { InternalModel, InternalModelView } from '@/api/v2'
 import { fmtCompact } from '@/utils/format'
 
-const props = defineProps<{ view: InternalModelView }>()
+const props = defineProps<{ view: InternalModelView; prices?: Record<string, { Input?: number; Output?: number }> }>()
 const emit = defineEmits<{ select: [node: { kind: string; ref: string; data: Record<string, unknown> }]; connect: [ref: string] }>()
 
 const X_ACCOUNT = 0
@@ -195,6 +195,7 @@ function onConnectEvt(e: { source: string; sourceHandle?: string | null }) {
             <span v-if="p.data.Dangling" class="chip chip-warn">悬空</span>
             <span v-else-if="p.data.Enabled === false" class="chip chip-idle">停用</span>
             <span v-else class="chip chip-sold">在售</span>
+            <span v-if="p.data.In != null" class="price">入 {{ p.data.In }} / 出 {{ p.data.Out }}</span>
           </div>
         </div>
       </template>
@@ -227,6 +228,7 @@ function onConnectEvt(e: { source: string; sourceHandle?: string | null }) {
 .chip-sold { border-color: #26402f; color: #8fbf9f; background: rgba(95,158,110,.08); }
 .chip-idle { color: var(--ink-3); }
 .chip-plan { border-color: #2d3d68; color: #a8bdf5; background: rgba(76,111,232,.1); }
+.price { margin-left: 6px; color: var(--ink-3); font-size: 10.5px; font-variant-numeric: tabular-nums; }
 .chip-warn { border-color: #443718; color: #d6bd80; background: rgba(201,162,39,.08); }
 :deep(.vue-flow__handle) { width: 7px; height: 7px; background: #2a3346; border: 1px solid #3a4a6b; }
 :deep(.vue-flow__edge-path) { stroke-linecap: round; }
