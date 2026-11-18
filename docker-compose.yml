@@ -1,4 +1,4 @@
-# 一键部署：前端 + 后端 + PostgreSQL
+# 一键部署：前端 + 后端 + PostgreSQL + 代理侧（magpie）
 #
 #   docker compose up -d --build     # 启动（首次会构建前后端镜像）
 #   docker compose logs -f backend   # 查看后端日志
@@ -7,6 +7,12 @@
 # 对外仅暴露 web 一个端口（默认 80，可用 APP_PORT 覆盖），前端静态资源与
 # 管理端 /api、网关 /v1 均由 nginx 在同一端口下反代到后端。
 # 后端启动时自动执行数据库迁移与初始管理员种子，无需手工操作。
+#
+# 代理侧（magpie）随 compose 自带，不需要手工配环境变量，端口/凭据/重置方式见
+# docs/deploy/magpie-container.md：
+#   - 网关 :3425 只在 compose 内网可达（backend → http://magpie:3425），不发布到宿主；
+#   - 管理面 :3430 只发布到宿主机回环（127.0.0.1），仅供人工在浏览器里配置，不经 nginx；
+#   - 管理密钥首次 up 时自动生成并落在 magpie_secret 卷，magpie 与 backend 读同一份。
 
 services:
   postgres:
@@ -25,6 +31,99 @@ services:
       retries: 10
     restart: unless-stopped
 
+  # 代理侧管理密钥自举（一次性任务，跑完即退出）。
+  #
+  # 为什么需要它：magpie 的网关密钥必须由 magpie 自己签发（值是 sk-magpie-key-…，
+  # 由它的 /config 里的密钥库维护），我们无法凭空造一把双方都认的值。所以首次 up 时
+  # 用同一个镜像、同一个 /config 卷，在网关启动之前建一把名为 ${MAGPIE_ADMIN_KEY_NAME:-lingshu-backend}
+  # 的网关密钥，把值写进共享卷 magpie_secret；backend 启动时从该文件读取。
+  # 之后每次 up 发现文件已存在就直接复用 —— 两边永远是同一把，无需人工填任何变量。
+  magpie-init:
+    image: ${MAGPIE_IMAGE:-ghcr.io/yetone/magpie:latest}
+    user: "0:0" # 需要 chown 卷（magpie 以 uid 65532 运行）
+    restart: "no"
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -u
+        KEY_FILE=/secret/admin_key
+        NAME="$${MAGPIE_ADMIN_KEY_NAME:-lingshu-backend}"
+        fix_owner() { chown -R 65532:65532 /config 2>/dev/null || true; }
+
+        mkdir -p /secret /config
+        chmod 700 /secret || true
+
+        # 1) 显式给了 MAGPIE_ADMIN_KEY（手工在管理面建好不可恢复的 key）→ 以环境变量为准
+        if [ -n "$${MAGPIE_ADMIN_KEY:-}" ]; then
+          printf '%s' "$$MAGPIE_ADMIN_KEY" > "$$KEY_FILE"
+          chmod 600 "$$KEY_FILE" || true
+          fix_owner
+          echo "[magpie-init] 使用环境变量 MAGPIE_ADMIN_KEY（不自动生成）"
+          exit 0
+        fi
+
+        # 2) 已经生成过 → 复用（卷还在就永不重生成，两个容器的值因此始终一致）
+        if [ -s "$$KEY_FILE" ]; then
+          fix_owner
+          echo "[magpie-init] 复用已有管理密钥：$$KEY_FILE"
+          exit 0
+        fi
+
+        # 3) 首次：在 magpie 的配置里建一把网关密钥（Docker 模式下不需要开 sharing）
+        out=$$(magpie gateway-key add "$$NAME" 2>&1) || true
+        key=$$(printf '%s\n' "$$out" | grep -o 'sk-magpie-key-[A-Za-z0-9._-]*' | head -n 1 || true)
+        if [ -z "$$key" ]; then
+          fix_owner
+          echo "[magpie-init] 自动创建网关密钥失败，转发与拓扑/账本同步会拿不到凭据。" >&2
+          printf '%s\n' "$$out" >&2
+          echo "[magpie-init] 兜底（二选一）：" >&2
+          echo "  a) 稍后重跑：docker compose up -d" >&2
+          echo "  b) 打开 http://127.0.0.1:$${MAGPIE_UI_PORT:-3430}/ 建一把 key，" >&2
+          echo "     写进 .env 的 MAGPIE_ADMIN_KEY=<key> 后 docker compose up -d" >&2
+          exit 0
+        fi
+        printf '%s' "$$key" > "$$KEY_FILE"
+        chmod 600 "$$KEY_FILE" || true
+        fix_owner
+        echo "[magpie-init] 已创建网关密钥 $$NAME 并写入 $$KEY_FILE"
+    environment:
+      MAGPIE_ADMIN_KEY: ${MAGPIE_ADMIN_KEY:-}
+      MAGPIE_ADMIN_KEY_NAME: ${MAGPIE_ADMIN_KEY_NAME:-lingshu-backend}
+      MAGPIE_UI_PORT: ${MAGPIE_UI_PORT:-3430}
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      - magpie_config:/config
+      - magpie_secret:/secret
+
+  # 代理侧：选渠道、failover、四协议互译都在这里；灵枢只做 facade。
+  magpie:
+    image: ${MAGPIE_IMAGE:-ghcr.io/yetone/magpie:latest}
+    # web 子命令 = 网关 + 浏览器管理面；管理面同时应答 /v1 路由
+    command: ["web", "--addr", "0.0.0.0:3430", "--no-open"]
+    environment:
+      # 网关端口（容器内固定 3425；不发布到宿主，只有 compose 内网能到）
+      MAGPIE_ADDR: 0.0.0.0:3425
+      # 浏览器管理面的口令：建议在 .env 里固定一次（见 docs）；
+      # 留空则每次重启换一个新值，链接在 `docker compose logs magpie` 里
+      MAGPIE_WEB_KEY: ${MAGPIE_WEB_KEY:-}
+      MAGPIE_NAME: ${MAGPIE_NAME:-lingshu-magpie}
+      TZ: ${TZ:-Asia/Shanghai}
+    ports:
+      # 只绑宿主机回环：管理面供人工在浏览器里配置，不经 nginx、不对公网
+      - "127.0.0.1:${MAGPIE_UI_PORT:-3430}:3430"
+    volumes:
+      - magpie_config:/config # providers / 网关密钥 / 登录态 / 用量（含明文上游凭据，按密钥卷对待）
+    healthcheck:
+      test: ["CMD", "magpie", "healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    depends_on:
+      magpie-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
   backend:
     build:
       context: ./backend
@@ -33,6 +132,15 @@ services:
       DATABASE_URL: postgres://${POSTGRES_USER:-llmgw}:${POSTGRES_PASSWORD:-llmgw}@postgres:5432/${POSTGRES_DB:-llmgw}?sslmode=disable
       # 留空则首次启动自动生成强随机 SM4 密钥并持久化到 backend_keys 卷
       SM4_KEY: ${SM4_KEY:-}
+      # 代理侧基址：默认指向 compose 内的 magpie 服务，无需手填
+      MAGPIE_BASE_URL: ${MAGPIE_BASE_URL:-http://magpie:3425}
+      # 代理侧管理密钥：留空表示读 magpie-init 生成的那份（entrypoint 会从
+      # /run/magpie-secret/admin_key 取），因此两边永远是同一把；只有「手工在管理面
+      # 建 key」的场景才需要在这里填。
+      MAGPIE_ADMIN_KEY: ${MAGPIE_ADMIN_KEY:-}
+      # 账本变更流：同一个代理侧、同一把网关密钥（entrypoint 会把两者对齐）
+      UPSTREAM_LEDGER_URL: ${UPSTREAM_LEDGER_URL:-http://magpie:3425}
+      UPSTREAM_ADMIN_KEY: ${UPSTREAM_ADMIN_KEY:-}
       # 可信代理网段（逗号分隔 CIDR）：仅当直连对端属于这些网段时才采信 X-Real-IP。
       # 代码默认只信任回环；此处显式声明本 compose 网络（docker 默认从 172.16/12 分配）。
       # 若实际网络落在其他段（如 192.168/16），请用 `docker network inspect` 查明后覆盖，
@@ -45,9 +153,14 @@ services:
     volumes:
       - backend_keys:/app/keys # JWT RSA 密钥对 + SM4 密钥
       - backend_data:/app/data # 账单重试队列（WAL）
+      - magpie_secret:/run/magpie-secret:ro # 代理侧管理密钥（只读，只放这一把）
     depends_on:
       postgres:
         condition: service_healthy
+      # 只等「启动」不等「健康」：magpie 起不来时后端仍要能提供管理面，
+      # 转发接口会返回 503，拓扑同步会在 10 分钟后再试（也可手动触发）。
+      magpie:
+        condition: service_started
     restart: unless-stopped
 
   web:
@@ -63,3 +176,5 @@ volumes:
   pgdata:
   backend_keys:
   backend_data:
+  magpie_config: # magpie 自己的配置/密钥/登录态/用量
+  magpie_secret: # 只放一把代理侧管理密钥（admin_key），供 backend 只读挂载
