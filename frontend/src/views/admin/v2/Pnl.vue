@@ -158,7 +158,7 @@ const chartOption = computed(() => {
 <template>
   <V2Page
     title="盈亏"
-    intro="按供应商 / 账号 / 模型看「收入 − 成本」。成本拆成账本实付（变动）与订阅摊销（固定）两段；无成本口径的请求单独计数，它会让毛利偏高。"
+    intro="收入减成本；成本分账本实付与订阅摊销。"
     source="backend/internal/domain/console/ops.go（GET /admin/ops/pnl）+ 数据层契约 §9（cost_source）"
     :deps="deps"
     :state="state"
@@ -289,7 +289,7 @@ const chartOption = computed(() => {
   background: var(--color-surface);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-m);
-  box-shadow: var(--shadow-card);
+  box-shadow: none;
   padding: 12px 14px;
 }
 .card-title {
@@ -314,15 +314,15 @@ const chartOption = computed(() => {
   border-radius: var(--radius-s);
   font-size: 13px;
   border: 1px solid var(--color-border);
-  background: #fafbfd;
+  background: #0b101c;
 }
 .identity.is-ok {
   border-color: #b7ebc6;
-  background: #f2fcf5;
+  background: rgba(95,158,110,.1);
 }
 .identity.is-bad {
   border-color: #fecdca;
-  background: #fef3f2;
+  background: rgba(196,85,63,.1);
   color: #b42318;
 }
 .neg {

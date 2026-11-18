@@ -3,62 +3,46 @@ import { computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import UserPanel from '@/components/UserPanel.vue'
-import {
-  Odometer,
-  Cpu,
-  User,
-  Key,
-  Tickets,
-  Setting,
-  Bell,
-  Share,
-  Box,
-  Notebook,
-  DataAnalysis,
-  TrendCharts,
-} from '@element-plus/icons-vue'
 
 const route = useRoute()
 const router = useRouter()
 const auth = useAuthStore()
 
-// 管理端菜单（对齐已确认原型：运营 / 系统两组）
-// 会话页与 V1 成本页在 V2 下线（Spec §1.2：新链路不写 sessions；成本由盈亏页取代），菜单摘除，
-// 路由保留 redirect 兜底老书签。渠道族 / 标签 / Auto 模型 / 服务状态同理（页面文件已删）。
-const menus = [
-  { path: '/admin/dashboard', title: '统计', icon: Odometer },
-  { path: '/admin/topology', title: '拓扑', icon: Share },
-  { path: '/admin/models', title: '模型', icon: Cpu },
-  { path: '/admin/subscriptions', title: '订阅', icon: Box },
-  { path: '/admin/ledger', title: '账本', icon: Notebook },
-  { path: '/admin/users', title: '用户', icon: User },
-  { path: '/admin/tokens', title: '令牌', icon: Key },
-  { path: '/admin/billings', title: '账单', icon: Tickets },
-  { path: '/admin/pnl', title: '盈亏与对账', icon: TrendCharts },
-  { path: '/admin/reconcile', title: '对账', icon: DataAnalysis },
-  { path: '/admin/announcements', title: '公告', icon: Bell },
-  { path: '/admin/system', title: '系统', icon: Setting },
+// 管理端菜单：分「运营 / 系统」两组，与已确认原型一致。
+// 会话页与 V1 成本页在 V2 下线，渠道族/标签/Auto 模型/服务状态同理（页面已删）。
+type Item = { path: string; title: string }
+const groups: { label: string; items: Item[] }[] = [
+  {
+    label: '运营',
+    items: [
+      { path: '/admin/dashboard', title: '统计' },
+      { path: '/admin/topology', title: '拓扑' },
+      { path: '/admin/models', title: '模型' },
+      { path: '/admin/subscriptions', title: '订阅' },
+      { path: '/admin/ledger', title: '账本' },
+      { path: '/admin/pnl', title: '盈亏与对账' },
+      { path: '/admin/reconcile', title: '对账' },
+    ],
+  },
+  {
+    label: '系统',
+    items: [
+      { path: '/admin/users', title: '用户' },
+      { path: '/admin/tokens', title: '令牌' },
+      { path: '/admin/billings', title: '账单' },
+      { path: '/admin/announcements', title: '公告' },
+      { path: '/admin/system', title: '系统' },
+    ],
+  },
 ]
 
 function activeMenu() {
-  // 子页（新建/编辑/详情）高亮所属列表菜单
   const p = route.path
-  for (const m of [
-    '/admin/models',
-    '/admin/topology',
-    '/admin/subscriptions',
-    '/admin/ledger',
-    '/admin/reconcile',
-    '/admin/pnl',
-    '/admin/users',
-    '/admin/tokens',
-    '/admin/billings',
-    '/admin/announcements',
-  ]) {
-    if (p.startsWith(m)) return m
+  for (const g of groups) {
+    for (const m of g.items) {
+      if (p === m.path || p.startsWith(m.path + '/')) return m.path
+    }
   }
-  // Auto 模型族已下线（老书签由路由 redirect 兜底到模型列表），无需再映射高亮
-  if (p.startsWith('/admin/system')) return '/admin/system'
   return p
 }
 
@@ -66,203 +50,173 @@ onMounted(() => {
   auth.fetchProfile()
 })
 
-// 子页（新建/编辑/详情）时，当前页标题可作为「返回父列表」的链接
 const crumbBack = computed(() => {
   const parent = activeMenu()
-  // 非列表页本身且属于某父菜单 → 提供返回父列表路径
   if (route.path !== parent && parent.startsWith('/admin/')) return parent
   return ''
 })
 </script>
 
 <template>
-  <el-container class="layout">
-    <el-aside width="160px" class="aside">
-      <div class="logo">
-        <span class="logo-text">
-          <span class="logo-title">AI网关</span>
-          <span class="logo-sub">AI Gateway</span>
-        </span>
+  <div class="layout">
+    <aside class="side">
+      <div class="brand">
+        <img src="/brand/lockup.svg" alt="灵枢" />
       </div>
+      <nav class="nav">
+        <template v-for="g in groups" :key="g.label">
+          <div class="grp">{{ g.label }}</div>
+          <router-link
+            v-for="m in g.items"
+            :key="m.path"
+            :to="m.path"
+            class="it"
+            :class="{ on: activeMenu() === m.path }"
+          >{{ m.title }}</router-link>
+        </template>
+      </nav>
+      <div class="side-foot">v0.14 · 网关</div>
+    </aside>
 
-      <div class="menu-wrap">
-        <el-menu :default-active="activeMenu()" router class="menu">
-          <el-menu-item v-for="m in menus" :key="m.path" :index="m.path">
-            <el-icon><component :is="m.icon" /></el-icon>
-            <span>{{ m.title }}</span>
-          </el-menu-item>
-        </el-menu>
-      </div>
-
-      <div class="aside-foot">
-        <span class="dot" /> 系统运行正常
-      </div>
-    </el-aside>
-
-    <el-container class="body">
-      <el-header class="header">
+    <div class="main">
+      <header class="top">
         <div class="crumb">
-          <span class="crumb-home crumb-link" @click="router.push('/admin/dashboard')">首页</span>
-          <span class="crumb-sep">/</span>
-          <span v-if="crumbBack" class="crumb-cur crumb-link" @click="router.push(crumbBack)">{{ route.meta.title || '' }}</span>
-          <span v-else class="crumb-cur">{{ route.meta.title || '' }}</span>
+          <span class="crumb-link" @click="router.push('/admin/dashboard')">首页</span>
+          <span class="sep">/</span>
+          <span v-if="crumbBack" class="crumb-link" @click="router.push(crumbBack)">{{ route.meta.title || '' }}</span>
+          <span v-else class="cur">{{ route.meta.title || '' }}</span>
         </div>
-        <div class="user-box">
-          <UserPanel />
-        </div>
-      </el-header>
-      <el-main class="main">
+        <div class="sp" />
+        <UserPanel />
+      </header>
+      <main class="body">
         <router-view />
-      </el-main>
-    </el-container>
-  </el-container>
+      </main>
+    </div>
+  </div>
 </template>
 
 <style scoped>
 .layout {
+  display: flex;
+  min-height: 100vh;
+}
+
+/* ---------- 侧栏 ---------- */
+.side {
+  width: 212px;
+  flex: none;
+  border-right: 1px solid var(--line);
+  background: var(--bg-2);
+  display: flex;
+  flex-direction: column;
+  position: sticky;
+  top: 0;
   height: 100vh;
 }
-
-/* ===== 侧边栏 ===== */
-.aside {
-  background: linear-gradient(180deg, #171c3b 0%, #10142b 100%);
-  display: flex;
-  flex-direction: column;
-}
-
-.logo {
-  height: 48px;
+.brand {
   display: flex;
   align-items: center;
-  padding: 0 14px;
-  flex-shrink: 0;
+  padding: 16px 16px 14px;
 }
-
-.logo-text {
-  display: flex;
-  flex-direction: column;
-  line-height: 1.2;
+.brand img {
+  width: 126px;
+  height: auto;
+  display: block;
 }
-
-.logo-title {
-  color: #fff;
-  font-size: 15px;
-  font-weight: 700;
-  letter-spacing: 0.4px;
-}
-
-.logo-sub {
-  color: rgba(255, 255, 255, 0.45);
-  font-size: 10px;
-  letter-spacing: 0.6px;
-}
-
-.menu-wrap {
+.nav {
+  padding: 4px 10px;
+  overflow: auto;
   flex: 1;
-  overflow-y: auto;
-  padding: 6px 8px;
 }
-
-.menu {
-  background: transparent;
-  border-right: none;
-  --el-menu-bg-color: transparent;
-  --el-menu-text-color: rgba(255, 255, 255, 0.62);
-  --el-menu-hover-text-color: #fff;
-  --el-menu-active-color: #fff;
-  --el-menu-hover-bg-color: rgba(255, 255, 255, 0.07);
-  --el-menu-item-height: 38px;
-  --el-menu-base-level-padding: 12px;
+.grp {
+  font-size: 10px;
+  letter-spacing: 1px;
+  color: var(--ink-4);
+  padding: 12px 8px 5px;
 }
-
-.menu :deep(.el-menu-item) {
+.it {
+  display: flex;
+  align-items: center;
+  height: 33px;
+  padding: 0 9px 0 12px;
   border-radius: 8px;
+  color: var(--ink-2);
+  font-size: 12.5px;
   margin-bottom: 2px;
-  font-size: 14px;
-  padding-right: 12px;
+  border: 1px solid transparent;
+  position: relative;
+}
+.it:hover {
+  background: #0f1626;
+  color: var(--ink);
+}
+.it.on {
+  background: #101728;
+  border-color: #243357;
+  color: #dbe6ff;
+}
+.it.on::before {
+  content: '';
+  position: absolute;
+  left: 4px;
+  width: 3px;
+  height: 14px;
+  border-radius: 2px;
+  background: var(--acc-2);
+}
+.side-foot {
+  padding: 11px 14px;
+  border-top: 1px solid var(--line);
+  font-size: 10.5px;
+  color: var(--ink-4);
 }
 
-.menu :deep(.el-menu-item.is-active) {
-  background: linear-gradient(90deg, rgba(99, 102, 241, 0.95), rgba(139, 92, 246, 0.75));
-  color: #fff;
-  font-weight: 600;
-  box-shadow: 0 4px 12px rgba(99, 102, 241, 0.35);
+/* ---------- 主区 ---------- */
+.main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
 }
-
-.aside-foot {
-  flex-shrink: 0;
-  padding: 10px 14px;
-  font-size: 12px;
-  color: rgba(255, 255, 255, 0.4);
+.top {
   display: flex;
   align-items: center;
-  gap: 8px;
-  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  gap: 12px;
+  padding: 13px 22px;
+  border-bottom: 1px solid var(--line);
+  background: rgba(8, 12, 23, 0.86);
+  position: sticky;
+  top: 0;
+  z-index: 5;
 }
-
-.dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: #34d399;
-  box-shadow: 0 0 0 3px rgba(52, 211, 153, 0.18);
-}
-
-/* ===== 主体 ===== */
-.body {
-  background: var(--color-bg);
-}
-
-.header {
-  background: var(--color-surface);
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  border-bottom: 1px solid var(--color-border);
-  height: 64px;
-  padding: 0 24px;
-}
-
 .crumb {
-  font-size: 13px;
-  color: var(--color-text-secondary);
+  font-size: 12px;
+  color: var(--ink-3);
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 7px;
 }
-
-.crumb-home {
-  color: var(--color-text-tertiary);
-}
-
 .crumb-link {
   cursor: pointer;
-  border-radius: 6px;
-  padding: 2px 6px;
-  transition: background 0.15s, color 0.15s;
 }
-
 .crumb-link:hover {
-  background: var(--color-fill, #f6f7fa);
-  color: var(--brand-primary, #5a5ce8);
+  color: var(--ink);
 }
-
-.crumb-sep {
-  color: var(--color-border-dark, #d0d3da);
+.crumb .cur {
+  color: var(--ink);
 }
-
-.crumb-cur {
-  color: var(--color-text);
-  font-weight: 600;
+.crumb .sep {
+  color: var(--ink-4);
 }
-
-.user-box {
-  display: flex;
-  align-items: center;
+.sp {
+  flex: 1;
 }
-
-.main {
-  padding: 0;
-  overflow: auto;
+.body {
+  padding: 20px 22px 40px;
+  max-width: 1180px;
+  width: 100%;
+  box-sizing: border-box;
 }
 </style>

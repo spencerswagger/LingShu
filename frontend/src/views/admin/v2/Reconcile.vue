@@ -131,7 +131,7 @@ function devClass(v: number | null): string {
 <template>
   <V2Page
     title="对账窗口"
-    intro="60 秒一窗，只比 token 与笔数（不比金额）。计数列为空 = 还没算过；blocked = 预算用尽待补拉；skipped = 没有结论。"
+    intro="60 秒一窗，只比 token 与笔数。"
     source="数据层契约 §7 + backend/internal/domain/console/ops.go（GET /admin/ops/reconcile-windows）"
     :deps="deps"
     :state="state"
@@ -246,7 +246,7 @@ function devClass(v: number | null): string {
   background: var(--color-surface);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-m);
-  box-shadow: var(--shadow-card);
+  box-shadow: none;
   padding: 12px 14px;
 }
 .table-wrap {
@@ -280,7 +280,7 @@ function devClass(v: number | null): string {
 .detail-json {
   margin: 0;
   padding: 8px 10px;
-  background: #f7f8fb;
+  background: #0b101c;
   border: 1px solid var(--color-border);
   border-radius: var(--radius-s);
   font-size: 12px;
@@ -299,7 +299,7 @@ function devClass(v: number | null): string {
   margin-bottom: 2px;
 }
 :deep(.el-table .is-critical) {
-  --el-table-tr-bg-color: #fef6f6;
+  --el-table-tr-bg-color: rgba(196,85,63,.08);
 }
 .neg {
   color: var(--color-danger);
