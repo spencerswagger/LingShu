@@ -1,0 +1,23 @@
+# 可选：在部署机上用**源码**本地构建前后端镜像（默认不用这一层）。
+#
+# 默认部署路径是「拉 ACR 镜像、零构建」（见 docker-compose.yml 的 image:），
+# 镜像由 .github/workflows/build-images.yml 在打 tag 时构建并推送。
+# 只有这两类情况才需要本文件：① 改完代码想立刻在部署机验证，不想等 CI；
+# ② 部署机连不上 ACR，只能本地构建。
+#
+# 用法（必须显式带上两个 -f，单用本文件不是完整 compose）：
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml build
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d
+#
+# 构建产物按 docker-compose.yml 里的 image: 命名（含 ${LINGSHU_IMAGE_TAG}），
+# 即本地构建会覆盖同 tag 的本地镜像；不会自动推到 ACR，也不会改部署机以外的地方。
+services:
+  backend:
+    build:
+      context: ./backend
+      # 与镜像同样的 tag 语义：本地构建出来的镜像名 = 基础文件里的 image:
+      # （compose 会用 image: 作为构建结果的 tag，这里不需要重复写）
+
+  web:
+    build:
+      context: ./frontend

@@ -1,6 +1,6 @@
 # 自带代理侧（magpie）：容器、端口、管理台入口与凭据
 
-适用：`docker compose up -d --build` 一键部署（compose 文件在仓库根，V2 起自带 magpie）。
+适用：`docker compose up -d` 拉镜像部署（compose 文件在仓库根，V2 起自带 magpie；部署机不构建，见 [部署与升级](./README.md)）。
 
 **结论先说：不需要手工配任何环境变量。** 首次 `up -d` 会自动把代理侧的网关密钥
 （`admin_key`）与管理台口令（`admin_web_key`）生成好并落在卷里；magpie、backend、nginx
@@ -125,7 +125,7 @@ magpie 的管理页面是按「自己占着域名根」写的，挂到子路径�
 ## 4 首次启动自检
 
 ```bash
-docker compose up -d --build
+docker compose up -d
 docker compose ps                        # magpie 应为 healthy；magpie-init 为 exited (0)
 docker compose logs magpie-init          # 期望：已生成管理面口令 / 已创建网关密钥
 docker compose logs web | head           # 期望：/magpie/ 入口已注入管理面口令
@@ -197,8 +197,8 @@ MAGPIE_WEB_KEY=<你自己定的管理台口令>      # 可只填这一项，另�
 | 变更 | 怎么做 |
 | --- | --- |
 | 只升代理侧 | 改 `MAGPIE_IMAGE`（或 compose 里的默认 tag）→ `docker compose pull magpie magpie-init && docker compose up -d` |
-| 只升灵枢 | 改镜像 tag（或 `--build`）→ `docker compose up -d`；**数据库迁移由后端启动时自动执行**，不需要手工跑 |
-| 一起升 | `docker compose pull && docker compose up -d --build` |
+| 只升灵枢 | 改 `LINGSHU_IMAGE_TAG`（或 compose 里 `image:` 的默认 tag）→ `docker compose pull && docker compose up -d`；**数据库迁移由后端启动时自动执行**，不需要手工跑。迁移不可逆，升级前先备份（见 [部署与升级 §2](./README.md)） |
+| 一起升 | `docker compose pull && docker compose up -d`（两个 tag 都改好再执行） |
 
 升级不需要新增或修改任何环境变量；`magpie_secret` 与 `magpie_config` 两个卷保留即可，
 两把密钥升级后继续有效。若新版本改了口令/密钥格式导致 401，按 §5.1 / §5.2 重建。
