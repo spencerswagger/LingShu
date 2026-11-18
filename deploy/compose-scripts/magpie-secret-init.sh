@@ -49,5 +49,7 @@ if [ -n "$want" ]; then printf '%s' "$want" > "$KEY_FILE"; fi
 chown -R 65532:65532 /config 2>/dev/null || true
 find /config -type f -exec chmod 600 {} \; 2>/dev/null || true
 chown 65532:65532 "$WEB_FILE" "$KEY_FILE" 2>/dev/null || true
-chmod 600 "$WEB_FILE" "$KEY_FILE" 2>/dev/null || true
+chmod 600 "$KEY_FILE" 2>/dev/null || true
+# 页面口令要给 backend 读（它用 ?k= 拉 /api/groups），backend 以非 root 运行，600 读不到 -> 0644
+chmod 644 "$WEB_FILE" 2>/dev/null || true
 echo "[magpie-secret-init] 准备完成（key 尾号 ${want: -4}）"

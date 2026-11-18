@@ -13,7 +13,11 @@ import type { InternalModel, InternalModelView } from '@/api/v2'
 import { fmtCompact } from '@/utils/format'
 
 const props = defineProps<{ view: InternalModelView; prices?: Record<string, { Input?: number; Output?: number }> }>()
-const emit = defineEmits<{ select: [node: { kind: string; ref: string; data: Record<string, unknown> }]; connect: [ref: string] }>()
+const emit = defineEmits<{
+  select: [node: { kind: string; ref: string; data: Record<string, unknown> }]
+  connect: [payload: { ref: string; target?: string | null }]
+  bind: [payload: { ref: string; externalId: string }]
+}>()
 
 const X_ACCOUNT = 0
 const X_PROVIDER = 200
@@ -126,12 +130,17 @@ function pick(kind: string, ref: string, data: Record<string, unknown>) {
   if (justConnected) return // 拖线落在目标节点上时，不要顺带打开抽屉
   emit('select', { kind, ref, data })
 }
-function onConnectEvt(e: { source: string; sourceHandle?: string | null }) {
+function onConnectEvt(e: { source: string; sourceHandle?: string | null; target?: string | null }) {
   if (!e.source) return
   justConnected = true
   setTimeout(() => (justConnected = false), 350)
   const ref = (e.sourceHandle || '').replace(/^m:/, '') || e.source.replace(/^[a-z]:/, '')
-  emit('connect', ref)
+  // 拖到某个已存在的对外模型节点上 = 直接绑定；拖到空白 = 新建一个绑定该模型的对外模型。
+  if (e.target && e.target.startsWith('x:')) {
+    emit('bind', { ref, externalId: e.target.slice(2) })
+    return
+  }
+  emit('connect', { ref, target: e.target })
 }
 </script>
 
