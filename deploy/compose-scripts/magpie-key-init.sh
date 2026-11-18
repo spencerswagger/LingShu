@@ -53,7 +53,10 @@ if probe "$K"; then
 fi
 
 echo "[magpie-init] 现有密钥未被 magpie 接受，开始重建网关密钥 $NAME …" >&2
+# 按名字删；有的版本只认 id，再从 list 里按名字找 id 删一次
 "$MAGPIE_BIN" gateway-key remove "$NAME" >/dev/null 2>&1 || true
+kid=$("$MAGPIE_BIN" gateway-key list 2>/dev/null | grep -F -- "$NAME" | awk '{print $1}' | head -n 1 || true)
+if [ -n "$kid" ] && [ "$kid" != "$NAME" ]; then "$MAGPIE_BIN" gateway-key remove "$kid" >/dev/null 2>&1 || true; fi
 usable=1; case "$K" in sk-magpie-*) usable=0;; esac; [ "${#K}" -lt 8 ] && usable=0
 if [ "$usable" = 1 ]; then out=$(printf '%s' "$K" | "$MAGPIE_BIN" gateway-key add "$NAME" --key - 2>&1) || true; fi
 if ! probe "$K"; then
