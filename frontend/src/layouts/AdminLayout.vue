@@ -17,10 +17,7 @@ const groups: { label: string; items: Item[] }[] = [
     items: [
       { path: '/admin/dashboard', title: '统计' },
       { path: '/admin/topology', title: '拓扑' },
-      { path: '/admin/models', title: '模型' },
-      { path: '/admin/subscriptions', title: '订阅' },
       { path: '/admin/ledger', title: '账本' },
-      { path: '/admin/pnl', title: '盈亏与对账' },
       { path: '/admin/reconcile', title: '对账' },
     ],
   },
@@ -104,7 +101,7 @@ const crumbBack = computed(() => {
 
 /* ---------- 侧栏 ---------- */
 .side {
-  width: 212px;
+  width: 176px;
   flex: none;
   border-right: 1px solid var(--line);
   background: var(--bg-2);
@@ -120,7 +117,7 @@ const crumbBack = computed(() => {
   padding: 16px 16px 14px;
 }
 .brand img {
-  width: 126px;
+  width: 112px;
   height: auto;
   display: block;
 }

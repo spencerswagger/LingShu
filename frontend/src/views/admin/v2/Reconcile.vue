@@ -8,7 +8,7 @@
 //   - error = 本窗没拉完（拉取/落库失败）；skipped = 没有对账结论（账本关闭/不可用/仍 blocked）；
 //   - 只比 token 与笔数，**不比金额**（账本币种与积分不等价，比金额必然误报）。
 import { computed, onMounted, ref } from 'vue'
-import { getReconcileWindows, type ReconcileView, type ReconcileWindow } from '@/api/v2'
+import { getReconcileWindows, getPnl, type ReconcileView, type ReconcileWindow } from '@/api/v2'
 import { mockReconcile } from '@/mock/reconcile'
 import { useV2Load } from '@/composables/useV2Load'
 import V2Page from '@/components/v2/V2Page.vue'
@@ -52,6 +52,15 @@ function rangeParams() {
   return { From: from.toISOString(), To: to.toISOString(), Limit: limit.value }
 }
 
+const pnlTotals = ref<{ revenue: number; cost: number } | null>(null)
+async function loadPnl() {
+  try {
+    const r = await getPnl({ From: rangeParams().From, To: rangeParams().To, GroupBy: 'provider' })
+    if (r && r.data) pnlTotals.value = { revenue: Number(r.data.Revenue || 0), cost: Number(r.data.Cost || 0) }
+  } catch { pnlTotals.value = null }
+}
+onMounted(() => void loadPnl())
+
 const { state, data, error, load, showDemo, exitDemo } = useV2Load<ReconcileView>(
   () => getReconcileWindows(rangeParams()),
   mockReconcile,
@@ -60,8 +69,6 @@ const { state, data, error, load, showDemo, exitDemo } = useV2Load<ReconcileView
 function reload() {
   void load(() => getReconcileWindows(rangeParams()))
 }
-
-onMounted(() => void load())
 
 const deps = computed<V2Dep[]>(() => [
   {
@@ -156,6 +163,11 @@ function devClass(v: number | null): string {
     </template>
 
     <template v-if="data">
+      <div class="pnl-strip">
+        <div class="cell"><span>收入</span><b>{{ pnlTotals ? pnlTotals.revenue.toLocaleString('zh-CN') : '—' }}</b></div>
+        <div class="cell"><span>成本</span><b>{{ pnlTotals ? pnlTotals.cost.toLocaleString('zh-CN') : '—' }}</b></div>
+        <div class="cell"><span>毛利</span><b>{{ pnlTotals ? (pnlTotals.revenue - pnlTotals.cost).toLocaleString('zh-CN') : '—' }}</b></div>
+      </div>
       <StatCards :items="stats" :columns="3" />
 
       <div class="agg-note">
@@ -242,6 +254,10 @@ function devClass(v: number | null): string {
 </template>
 
 <style scoped>
+.pnl-strip { display: flex; gap: 24px; padding: 10px 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
+.pnl-strip .cell { display: flex; flex-direction: column; gap: 2px; }
+.pnl-strip span { font-size: 11px; color: var(--ink-3); }
+.pnl-strip b { font-size: 16px; font-weight: 500; font-variant-numeric: tabular-nums; }
 .card {
   background: var(--color-surface);
   border: 1px solid var(--color-border);
