@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"sort"
 	"strings"
@@ -39,6 +40,7 @@ type HTTPGatewaySource struct {
 	authHeader string
 	modelsPath string
 	groupsPath string
+	webKey     string // magpie 页面口令：/api/* 属页面接口，需要它（网关 key 不够）
 	client     *http.Client
 }
 
@@ -59,12 +61,21 @@ func NewHTTPGatewaySource(baseURL, adminKey, authHeader string, client *http.Cli
 	if groupsPath == "" {
 		groupsPath = DefaultGroupsPath
 	}
+	webKey := strings.TrimSpace(os.Getenv("MAGPIE_WEB_KEY"))
+	if webKey == "" {
+		if f := strings.TrimSpace(os.Getenv("MAGPIE_WEB_KEY_FILE")); f != "" {
+			if b, err := os.ReadFile(f); err == nil {
+				webKey = strings.TrimSpace(string(b))
+			}
+		}
+	}
 	return &HTTPGatewaySource{
 		baseURL:    strings.TrimRight(strings.TrimSpace(baseURL), "/"),
 		adminKey:   strings.TrimSpace(adminKey),
 		authHeader: authHeader,
 		modelsPath: modelsPath,
 		groupsPath: groupsPath,
+		webKey:     webKey,
 		client:     client,
 	}
 }
@@ -122,7 +133,17 @@ func (s *HTTPGatewaySource) get(ctx context.Context, path string) ([]byte, error
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.baseURL+path, nil)
+	url := s.baseURL + path
+	// magpie 的 /api/* 是**页面接口**，认页面口令（?k=），不认网关 Bearer key。
+	// 不补这一步，/api/groups 会 401/404，路由组整层永远是空的。
+	if s.webKey != "" && strings.HasPrefix(path, "/api/") {
+		sep := "?"
+		if strings.Contains(url, "?") {
+			sep = "&"
+		}
+		url += sep + "k=" + neturl.QueryEscape(s.webKey)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("构建拓扑请求失败：%w", err)
 	}
