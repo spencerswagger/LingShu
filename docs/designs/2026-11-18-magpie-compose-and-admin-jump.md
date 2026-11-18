@@ -1,397 +1,237 @@
 # 代理侧（magpie）随 compose 自举凭据 + 管理面一键跳转
 
-日期：2026-11-18　作者：Core　状态：**待确认（未动代码）**
+状态：**已实现**（分支 `feat/compose-bundled-magpie`）。部署侧操作手册见
+`docs/deploy/magpie-container.md`，本文只记设计与事实依据。
 
 ---
 
 ## 0 结论先说
 
-1. **A（自举凭据）可行，且比现状更稳**：改为「先 `openssl rand -hex 32` 造值 → `magpie gateway-key add admin --key -` 从 stdin 注册 → 成功后原子落卷」，
-   不再解析 CLI 的打印输出；`magpie gateway-key add <name> --key -` 是官方文档里明写的用法（见 §1.1）。
-2. **B 的推荐方案 B1（`/magpie/` 子路径 + auth_request + `MAGPIE_TRUST_PROXY=1`）按原样做不出来**，三个各自独立的硬原因（§3.2）：
-   目标端口错、子路径会把页面自身的 `/api` 撞掉、nginx 拿不到灵枢的会话（Bearer 在 localStorage）。
-   另外 `MAGPIE_TRUST_PROXY=1` **不解决页面要口令这件事**，它只作用于网关的客户端路由（§1.3）。
-3. **可行的替代 = B1′**：把管理面放到**独立端口**（root 挂载，不撞路径），入口用**一次性票据**（灵枢 ADMIN 会话换取），
-   nginx 校验后**服务端注入 page key**，浏览器永远看不到任何 key。代价是 web 容器持有 page key（§3.5），
-   以及新增约 150 行后端代码、一个前端按钮、一段 nginx server 块。
-4. **升级不需要人工加任何变量**（§4）：所有凭据首次 `up -d` 自动生成并落在卷里，已有 `.env` 里的手工值仍然优先。
-
-> 本文中 magpie 侧的所有结论均出自官方文档（`usemagpie.ai/docs/docker`、`usemagpie.ai/docs/remote`、仓库 `docs/reference.md`，对应 release 0.1.4454）。
-> 沙盒里没有 docker、CLI 二进制 93 MB 且镜像站限速到几十 KB/s，**magpie 侧没有做真机实测**；落地前必须先在宿主机跑 §1.7 的 3 条命令。
+1. **凭据全部自举，不需要人填任何变量**：网关密钥 `admin_key` 与**管理台口令**
+   `admin_web_key` 都由 `magpie-init` 首次 `up` 时生成并落在 `magpie_secret` 卷里，
+   magpie / backend / nginx 读同一份；重启不换值。
+2. **管理台入口 = 灵枢同源的 `/magpie/`，只有 ADMIN 能进**：
+   灵枢签发 8 小时票据（HttpOnly cookie），nginx 用 `auth_request` 回灵枢验签，
+   再由 **nginx 在服务端代填页面口令**。浏览器地址栏、前端存储里都没有口令。
+3. **`MAGPIE_TRUST_PROXY` 我们不用**，而且**绝不能**在「把 `/v1` 反代给 magpie」的链路上开：
+   它按请求头判定，开了之后 nginx 转来的请求会被当成「本地」= 免网关密钥（§1.3 有判定表）。
+4. 子路径反代**能做，但必须补三处改写**（`/api/` 前缀、`Location`、`Host`），
+   而且要把上游 gzip 关掉才能 `sub_filter`（§2.2）。
 
 ---
 
-## 1 事实核查（每条都给出处）
+## 1 事实依据（每条都指出处）
 
-### 1.1 网关密钥可以先有值再注册
+### 1.1 两个端口的分工
 
-`reference.md`「Gateway keys」：
-
-```sh
-magpie gateway-key add "Remote laptop"   # prints the new credential once
-magpie gateway-key add Family --key -    # keeps a key clients already send, read from stdin
-magpie gateway-key rotate <id> --key -   # gives it a value of your own instead, read from stdin
-```
-
-自定值的校验口径（页面上的同一条规则，CLI 同源）：**8–256 个可打印 ASCII、不含空格、不以 `sk-magpie-` 开头、不能与其他网关密钥或 provider key 重复**。
-`openssl rand -hex 32` 产出 64 个十六进制字符，满足全部条件。
-
-结论：`openssl rand -hex 32` + `--key -` 是官方支持的姿势，**比现在 grep `sk-magpie-key-[…]` 的解析稳**（打印格式变了就会静默失败）。
-
-### 1.2 两个端口的分工
-
-`usemagpie.ai/docs/docker`：
-
-- `3425` = 网关门（网关 API；容器默认 `magpie serve` 就是它）；
-- `3430` = `magpie web` 的浏览器管理面，**它也顺带应答网关的 `/v1` 路由**，「so a reverse proxy needs only this port」。
-
-结论：要反代管理页，目标必须是 **3430**，`http://magpie:3425/` 打开只会是 API 404。**B1 原文里写的 `proxy_pass http://magpie:3425/` 是错的。**
-
-### 1.3 `MAGPIE_TRUST_PROXY=1` 到底管什么
-
-`reference.md`「Providers and the gateway」：
-
-> A request that reaches loopback through a proxy or tunnel … is someone else's … it carries a forwarding header
-> (`Forwarded`, `X-Forwarded-For`, `X-Real-IP`, `Cf-Connecting-IP`, `True-Client-IP`, `Tailscale-User-Login`) …
-> **A proxy here that signs its clients in itself can be trusted with `MAGPIE_TRUST_PROXY=1`, which keeps what it forwards local, as before.**
-
-同一节关于页面端口：
-
-> On the page's port every one of those routes is answered as a request from another machine, from loopback too …
-> The page's sign-in cookie is no gateway key, and **the page and its `/api` still need the page's key**.
-
-结论（三条，都要写进部署文档）：
-
-1. `MAGPIE_TRUST_PROXY=1` 的作用面是**网关的客户端路由**（`/v1`、`/mcp`、配额等）：开了之后，代理转发过来的请求按本地处理（不再要求网关密钥）。
-2. 它**不会**免掉管理页自己的口令（`MAGPIE_WEB_KEY`，即 `?k=`）。所以「auth_request 过了就不会看到登录页」这个预期不成立。
-3. 它对待的是**请求头**：任何带 `X-Forwarded-For`/`Forwarded`/`X-Real-IP` 的请求默认就按「别处的机器」处理（这是 #1022 的判定）。
-   我们把 `/v1` 反代给 magpie 时反而**绝对不该**开它——那等于给任意能访问 nginx 的人免掉网关密钥。
-
-**本设计不设 `MAGPIE_TRUST_PROXY`。** 记一条：以后若有人把 `/v1` 也挂到 magpie 上，这条开关就是静默放开鉴权的坑。
-
-### 1.4 页面口令（page key）的语义
-
-- `MAGPIE_WEB_KEY`：16+ 字符（字母数字或 `- . _ ~`），设了之后**跨重启不变**、浏览器登录态 400 天；不设则每次启动换一把，链接打在 `docker compose logs magpie`。
-- 页面打开时带 `?k=<key>`，magpie 把它换成 cookie 并从地址里去掉；不带 key 打开会被 401 挡下并给一个输入框。
-- 文档反复强调：**任何拿到这个链接的人都能改 magpie、能看到上游 provider 的明文 key**。
-
-### 1.5 唯一「免口令」的官方路径是 LazyCat 平台集成，不能用
-
-`reference.md`「LazyCat」：`MAGPIE_WEB_SIGN_IN=lazycat` 会读平台 ingress 注入的 `X-HC-User-ID` / `X-HC-User-Role` / `X-HC-Source`，
-只认 `ADMIN`，并做 `Sec-Fetch-Site` 判定；`magpie web` 在缺 `LAZYCAT_APP_DOMAIN` 时拒绝启动。
-
-不用它的理由：它信任的是**请求头**，任何能直连 3430 的容器都能伪造；而 compose 里所有容器都在同一个网段，
-没有「只让 nginx 连、别人连不上」的网络手段（除非再拆一个 network + 只挂 nginx，那属于给平台特性打补丁）。
-文档里也写明这是平台专属行为。→ 记为**否决**，免得后面又有人提。
-
-### 1.6 子路径（`/magpie/`）不可行
-
-- `magpie web` 的启动参数只有 `--lan / --addr / --no-open / --gateway / --tls-cert / --tls-key`，**没有 base-path**。
-- 页面自己的接口就占根 `/api`（文档：单一公网 URL 下「`/api` goes to `magpie web`'s page」），与灵枢的 `/api` 直接冲突；
-  页面静态资源同样是根路径。挂到 `/magpie/` 后，页面资源与 XHR 会全部 404 或打到灵枢后端。
-- 官方给出的反代姿势都是「一个域名/端口的根」：`https://magpie.example.com/` + `/v1` 同址。
-
-结论：**只能独立端口或独立域名**。本文选独立端口（单机 compose 里不需要 DNS/TLS 就能用）。
-
-### 1.7 落地前必须在宿主机实测的 3 条（沙盒做不了）
-
-```sh
-# ① --key - 能从 stdin 注册、且重复注册会报错（决定 init 的幂等分支怎么写）
-printf '%s' "$(openssl rand -hex 32)" | docker compose run --rm --entrypoint sh magpie-init -lc \
-  'cat > /tmp/k; magpie gateway-key add probe --key - < /tmp/k; magpie gateway-key list; magpie gateway-key add probe2 --key - < /tmp/k'
-
-# ② 页面端口经代理后仍要口令（预期：无 cookie 时 401，带 ?k= 时 302→cookie）
-curl -si http://127.0.0.1:3432/ | head -5
-curl -si "http://127.0.0.1:3432/?k=$(docker compose exec -T -u 0 backend cat /run/magpie-secret/admin_web_key)" | head -5
-
-# ③ TRUST_PROXY 的作用面（预期：只影响 3425 的客户端路由，不影响页面口令）
-#    开与不开各跑一次，比较 /v1/models 的 401/200 与页面 / 的 401
-```
-
-任何一条与 §1 的结论不符 → 退回 **B2**（§3.4），其余设计不变。
-
----
-
-## 2 【A】compose 自举凭据（改法）
-
-### 2.1 与现状的差异
-
-| 项 | 现状（分支 `feat/compose-bundled-magpie`，commit 27db85a） | 本次改法 |
+| 端口 | 谁在听 | 内容 |
 | --- | --- | --- |
-| 网关密钥来源 | 跑 `magpie gateway-key add <name>`，**grep 打印出的 `sk-magpie-key-…`** | `openssl rand -hex 32` 造值，`gateway-key add <name> --key -` 注册 |
-| 落盘时机 | 拿到打印值后写 `admin.key` | 先写 `admin.key.tmp`，**注册成功才 `mv` 成 `admin.key`** |
-| 幂等 | 文件在 → 直接复用 | 同（文件在就什么都不做） |
-| 失败语义 | 软失败（exit 0 + 指引） | 保持软失败，但**绝不留下「backend 有值、magpie 不认」的状态**：注册失败就删临时文件 |
-| 页面口令 | `.env` 里可选，留空则每次重启变 | **也自举**：`admin_web_key`，首次生成、之后复用 |
+| `3425` | 网关 | `/v1/*`、`/mcp`、健康检查；**没有管理页面** |
+| `3430` | `magpie web` | 管理页面 + 页面自己的 `/api/**` + 登录表单；也会应答 `/v1` 路由 |
 
-### 2.2 卷里的文件
+出处：`internal/gateway/oneport.go`。页面端口转交的请求**永远不算「本地」**（`viaPagePort`），
+`MAGPIE_TRUST_PROXY` 也改变不了这一点。
+
+### 1.2 管理台口令的语义
+
+- 口令由 `MAGPIE_WEB_KEY` 提供（16+ 字符）；不设则每次启动随机生成。
+- `?k=<口令>` 校验通过后 magpie **种 cookie 并 303/302 回去掉 `k` 的地址**
+  （cookie 名 `magpie_web_<页面端口>`，HttpOnly、`Path=/`）；无 cookie 时回 401 + 粘口令表单
+  （表单 POST 到 `/_magpie/sign-in`）；免口令白名单只有 `manifest.json` 与两个 icon。
+- **它是长期凭据、且只有「知道 / 不知道」两态**，没有用户维度 —— 所以不能直接给浏览器看，
+  必须有一层「是谁」的判定（这就是灵枢票据的唯一理由）。
+
+出处：`internal/gui/web.go` 的 `webGuard`。
+
+### 1.3 `MAGPIE_TRUST_PROXY=1` 到底管什么（这是本轮的关键结论）
+
+它管的是**网关的客户端路由**：`internal/gateway/lan.go` 里
 
 ```
-magpie_secret/
-  admin.key          # 网关密钥（backend 的 MAGPIE_ADMIN_KEY / UPSTREAM_ADMIN_KEY、magpie 的调用方）
-  admin_web_key      # 管理页口令（magpie 的 MAGPIE_WEB_KEY、web 的 nginx 注入）
+local() = 回环地址 && !proxied(r) && !viaPagePort(r)
+proxied(r) = trustProxy() ? false : 请求带了那 7 个转发头里的任意一个
 ```
 
-两个值**分权**：网关密钥只给 backend，页面口令只给 magpie 与 web。互不越界。
+`Forwarded`、`X-Forwarded-For`、`X-Forwarded-Host`、`X-Real-IP`、`Cf-Connecting-IP`、
+`True-Client-IP`、`Tailscale-User-Login`。也就是**只看头、不看来源 IP**。
 
-### 2.3 优先级（与现有 entrypoint 一致）
+按这段逻辑复刻的判定表（`generated/trustproxy/sim.py`，可复跑）：
 
-```
-环境变量（.env）> 卷里已有文件 > 首次生成
-```
+| 场景 | `TRUST_PROXY=0` | `TRUST_PROXY=1` |
+| --- | --- | --- |
+| 直连网关端口、无转发头 | 本地（免密钥） | 本地（免密钥） |
+| nginx 反代，带 `X-Forwarded-For`/`X-Real-IP` | **别处（要网关密钥）** | **本地（免密钥）** |
+| nginx 反代，只带 `Forwarded` | 别处（要密钥） | **本地（免密钥）** |
+| 同网段容器直连（非回环） | 别处 | 别处 |
+| 页面端口 `3430` 转交的 `/v1` | 别处 | 别处 |
 
-已有部署手工设过 `MAGPIE_ADMIN_KEY` / `MAGPIE_WEB_KEY` 的，行为不变。
+结论：**在「nginx → magpie `/v1`」这种拓扑下一开就是静默放开鉴权**（任何能给 nginx 塞一个
+`X-Forwarded-For` 的调用方都变成「本地」）。而且它**不免管理页面口令** —— 页面和它的 `/api`
+永远要口令（官方文档原话：「the page and its `/api` still need the page's key」）。
 
-### 2.4 不变的东西
+因此本方案 **不设** 这个变量。要免网关密钥请走「给令牌绑 callerKey」这条正规路径。
 
-- `MAGPIE_BASE_URL` 默认 `http://magpie:3425`（已是默认）。
-- `UPSTREAM_ADMIN_KEY` 继续与 `MAGPIE_ADMIN_KEY` 对齐成同一把（账本/拓扑打的是同一个代理侧）。
-- 迁移、计费、转发主链零改动。
+> 沙盒里没有 docker，**magpie 镜像本体未实测**；上表是按源码判定逻辑的复刻 + nginx 侧实测。
+> 宿主机复测命令见 §5.2。
+
+### 1.4 唯一的「免口令」官方路径是 LazyCat 平台集成，不能用
+
+`MAGPIE_WEB_SIGN_IN=lazycat` 信任 `X-HC-User-Role` 这类平台头（缺 `LAZYCAT_APP_DOMAIN`
+直接拒绝启动）。同网段任何容器都能伪造这些头 → 否决。
+
+### 1.5 子路径 `/magpie/` 能挂，但有三个硬约束
+
+| 约束 | 出处 / 现象 |
+| --- | --- |
+| `magpie web` **没有 base-path 参数**，页面自己占根：静态资源是相对路径（`app.css`、`boot.js`），请求是绝对路径 `fetch("/api/"+p)` | `internal/gui/assets/index.html`、`app.js` |
+| 换 cookie 后 302 到 `/` | `webGuard` |
+| 页面自己的写请求校验 `Origin` vs `Host`、`Sec-Fetch-Site` | `webOwnPage`（`http.CrossOriginProtection`） |
+
+所以「挂上去就完事」不行，必须 §2.2 的三处改写 + 关闭上游 gzip。
 
 ---
 
-## 3 【B】管理面一键跳转
+## 2 落地形态
 
-### 3.1 暴露面模型（先定这个，再谈方案）
-
-| 凭据 | 能做什么 | 现在谁持有 |
-| --- | --- | --- |
-| 网关密钥（`admin.key`） | 调网关 API、拉拓扑/账本 | magpie（校验方）+ backend |
-| 页面口令（`admin_web_key`） | **完全管理 magpie**：加 provider、看上游明文 key、删网关密钥 | magpie（校验方）+ **操作者浏览器**（URL/cookie） |
-| 租户 callerKey（一令牌一把） | 只转发，不能管理 | magpie + backend（密文存 `magpie_keys`） |
-
-页面口令 = 最高权限。**「key 不进浏览器」只对页面口令有意义**，这也是 B1 的出发点。
-
-### 3.2 B1 原样为什么做不出来
-
-1. **端口错**：管理面在 3430，`proxy_pass http://magpie:3425/` 只会拿到 API 404（§1.2）。
-2. **子路径撞车**：页面与它的 `/api`、静态资源都在根上，`/magpie/` 前缀会把它们打断（§1.6）。
-3. **auth_request 拿不到会话**：灵枢的登录态是 `localStorage` 里的 Bearer JWT（`frontend/src/stores/auth.ts`），
-   浏览器**导航**不会带 `Authorization` 头，`auth_request` 子请求必然是 401 → 管理员也被 403。
-4. **即使前三条都绕过去，页面仍然要口令**：`MAGPIE_TRUST_PROXY=1` 不免页面口令（§1.3），用户还是会被 magpie 的 401 页挡一次。
-
-### 3.3 方案对比
-
-| 方案 | ADMIN 门禁 | 页面口令进浏览器 | magpie 侧改动 | 暴露面 | 工作量 |
-| --- | --- | --- | --- | --- | --- |
-| **B0 现状**：`127.0.0.1:3430/?k=…` 手输 | 无（只靠回环 + 口令） | 手输到输入框，不进 URL | 无 | 回环 | 0 |
-| **B1 原样** | — | — | — | — | **不可行** |
-| **B1′ 推荐**：独立端口 + 一次性票据 + 服务端注入口令 | ✅ auth_request → 灵枢 ADMIN | ❌ 不进（浏览器只见 `?t=<120s 票据>`） | 无（不设 TRUST_PROXY） | 回环（可配 LAN/VPN） | 中 |
-| **B2 备选**：系统页给一条 `?k=` 链接 | ✅ 按钮可见性（事后不可控） | ✅ 会进（历史/复制/截图） | 无 | 回环（或 LAN） | 小 |
-
-选 **B1′**：它是 B1 想达到的效果，且不扩大网络暴露（默认仍只绑回环）。B2 作为 B1′ 的前置退路（§1.7 实测不过时用）。
-
-### 3.4 B2（备选，一句话）
-
-`GET /api/v1/admin/ops/magpie-access` 直接返回 `http://<host>:<MAGPIE_UI_PORT>/?k=<admin_web_key>`，前端按钮 `window.open`。
-优点：半天能上线、不碰 nginx。缺点：口令进浏览器历史、可被截图/转发；链接**永不过期**。
-
-### 3.5 B1′ 的时序
+### 2.1 访问链路
 
 ```
-浏览器（管理员）                      nginx(web:3431)                backend                    magpie:3430
-   │ 点「打开代理侧管理面」                 │                             │                          │
-   │──POST /api/v1/admin/ops/magpie-access─┼────────────────────────────▶│ 校验会话=ADMIN            │
-   │◀──────────── {url:"http://h:3430/?t=<entry,120s>"} ─────────────────│                          │
-   │──GET /?t=<entry>─────────────────────▶│                             │                          │
-   │                                      │─auth_request /internal/…/verify?t=▶│ 验签+换发 gate(8h)   │
-   │                                      │◀──── 204 + X-Magpie-Gate ───│                          │
-   │◀─ 302 /  + Set-Cookie magpie_gate ────│──GET /?k=<page key>─────────────────────────────────────▶│
-   │                                      │                             │        Set-Cookie(自己的) │
-   │──GET / (带 magpie_gate + 自己的 cookie)─▶│─verify(cookie)─▶ 204 ──┼──GET / ─────────────────▶│
-   │◀──────────────────────── 页面 ────────│                             │◀─────────────────────────│
+浏览器（管理员）
+  │ ① 点「打开代理侧管理台」
+  ├── POST /api/v1/admin/ops/magpie-access   （Authorization: Bearer <灵枢 JWT>）
+  │     后端：会话必须是 ADMIN → 签 8h 票据 → Set-Cookie: magpie_gate=…; Path=/magpie/; HttpOnly; SameSite=Lax
+  │     响应：{ Url: "/magpie/", ExpiresAt }
+  │ ② window.open('/magpie/')（同源，自动带 cookie）
+  ├── nginx: auth_request → GET /internal/magpie-access/verify （验签，2xx 放行）
+  │     验不过 → 403，请求根本到不了 magpie
+  ├── nginx → magpie:3430 （无 magpie 页面 cookie 时把 ?k=<口令> 拼在上游 URL 上）
+  │     magpie: 换 cookie + 302 → Location: /
+  ├── nginx: proxy_redirect 把 Location 改成 /magpie/
+  └── 页面加载；JS 里的 "/api/…" 已被 sub_filter 改写成 "/magpie/api/…"
 ```
 
-要点：
+### 2.2 nginx（`frontend/nginx.conf`）
 
-- **入口只认票据**：`/?t=` 通过后 nginx 才把 page key 拼进**上游** URL；浏览器地址栏里始终是 `?t=`（120 秒后失效）。
-- **后续请求靠 nginx 自己发的 `magpie_gate` cookie**（HttpOnly，8 小时），`auth_request` 每个请求都验一次签。
-- **页面自身的 cookie** 仍然是最后一道：不经入口、直接访问其它路径的请求，magpie 自己会 401。
-- 已知边角：只有 `magpie_gate` 而没有 magpie 自己的 cookie（例：清了站点数据、或 magpie 换了 cookie 签名）时，
-  `/` 会被 401 挡住（此时 nginx 不注入口令），需要回灵枢再点一次按钮。这条写进运维文档。
+- `location = /magpie/`（精确）：`auth_request` + `proxy_pass http://$magpie_page/$magpie_entry_qs`
+  + `proxy_redirect ~^/(?!magpie/)(.*)$ /magpie/$1`。
+- `location /magpie/`（前缀）：`rewrite ^/magpie/(.*)$ /$1 break` 剥前缀，
+  `proxy_set_header Host $http_host`（**不能**改成 `magpie:3430`，否则写请求全 403），
+  `proxy_set_header Accept-Encoding ""` + `sub_filter '"/api/' '"/magpie/api/'`
+  + `sub_filter 'action="/_magpie/sign-in"' …`，并 `proxy_hide_header ETag`（内容已变）。
+- `location = /_magpie_gate`（internal）：把子请求转给 backend 的验签端点；cookie 随请求自动带上。
+- 口令注入走**生成出来的 `map`**（`/etc/nginx/conf.d/00-magpie-key.conf`），
+  不用 nginx 的 envsubst 模板机制（那会连带替换 `$host`/`$uri` 之类）：
 
-### 3.6 nginx 配置片段（web 镜像，`/etc/nginx/templates/default.conf.template`）
-
-```nginx
-# ---- http 上下文：模板里由 envsubst 注入 ${MAGPIE_WEB_KEY}（NGINX_ENVSUBST_FILTER=^MAGPIE_ 限定范围）----
-map $arg_t $magpie_entry_uri {
-    ""      "/";                              # 没有票据：不注入口令，页面自己会 401（等价于没登录）
-    default "/?k=${MAGPIE_WEB_KEY}";           # 有票据：注入页面口令（只出现在上游请求里）
-}
-
-map $magpie_gate_value $magpie_gate_cookie {
-    ""      "";                               # auth_request 没换发 → 不发 Set-Cookie
-    default "magpie_gate=$magpie_gate_value; Path=/; HttpOnly; SameSite=Lax; Max-Age=28800";
-}
-
-server {
-    listen 3431;                     # 宿主 127.0.0.1:${MAGPIE_UI_PORT:-3430}
-    server_name _;
-    server_tokens off;
-
-    resolver 127.0.0.11 valid=10s ipv6=off;
-    set $magpie_page magpie:3430;        # 用变量：容器 IP 变了不用重启 nginx
-    set $backend_upstream backend:8080;  # 每个 server 块各自 set（变量不跨 server 继承）
-
-    set $magpie_ticket $arg_t;
-    if ($magpie_ticket = "") { set $magpie_ticket $cookie_magpie_gate; }
-
-    location = /_magpie_gate {        # 只给 auth_request 用
-        internal;
-        proxy_pass http://$backend_upstream/internal/magpie-access/verify?t=$magpie_ticket;
-        proxy_set_header Host $host;
-    }
-
-    # 入口 / 页面本身
-    location = / {
-        auth_request /_magpie_gate;
-        auth_request_set $magpie_gate_value $upstream_http_x_magpie_gate;
-        add_header Set-Cookie $magpie_gate_cookie always;
-        add_header Cache-Control "no-store" always;
-
-        proxy_pass http://$magpie_page$magpie_entry_uri;
-        proxy_http_version 1.1;
-        proxy_set_header Host $http_host;              # 带端口，magpie 生成的跳转才对
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $remote_addr;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_read_timeout 300s;
-    }
-
-    # 页面资源与页面自己的 /api：不注入口令，靠 magpie 自己的 cookie 把关
-    location / {
-        proxy_pass http://$magpie_page$request_uri;
-        proxy_http_version 1.1;
-        proxy_set_header Host $http_host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $remote_addr;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_read_timeout 300s;
-        proxy_buffering off;                           # 管理面有 SSE（用量/会话实时）
-    }
+```
+map "$cookie_magpie_web_3430|$arg_k" $magpie_entry_qs {
+    "|"     "?k=<口令>";
+    default "";
 }
 ```
+即：**没有 magpie 自己的 cookie、用户也没手动带 `?k=`** 时才代填；带了就原样交给 magpie 判
+（自己填错就该被拒，不能「填错反而进去了」）。
+`magpie_web_3430` 里的端口是 magpie 的**页面端口**，改端口要同步改这里的 cookie 名与生成脚本。
 
-注意：**不要**在这一层写 `X-Forwarded-For` 之外的转发头（`Forwarded`/`True-Client-IP` 等），也不要设 `MAGPIE_TRUST_PROXY`（§1.3）。
+### 2.3 后端（`internal/domain/magpieaccess`）
 
-### 3.7 compose 片段
-
-```yaml
-  magpie:
-    # 管理面不再发布到宿主：只经 web 的 3431 进入（下面 break-glass 端口除外）
-    ports:
-      - "${MAGPIE_UI_DIRECT_BIND:-127.0.0.1:3432}:3430"   # break-glass：直连页面（仍要口令），排障用
-    environment:
-      MAGPIE_WEB_KEY: ${MAGPIE_WEB_KEY:-}   # 空 → 由 deploy/magpie/entrypoint.sh 从卷里读
-    volumes:
-      - magpie_config:/config
-      - magpie_secret:/secret:ro            # 只读：页面口令
-    entrypoint: ["/bin/bash", "/usr/local/bin/magpie-entrypoint"]
-    # command 仍由脚本 exec：magpie web --addr 0.0.0.0:3430 --no-open
-
-  web:
-    ports:
-      - "${APP_PORT:-80}:80"
-      - "127.0.0.1:${MAGPIE_UI_PORT:-3430}:3431"          # 正式入口（票据 + 服务端注入口令）
-    environment:
-      MAGPIE_WEB_KEY_FILE: /run/magpie-secret/admin_web_key
-      NGINX_ENVSUBST_FILTER: "^MAGPIE_"
-    volumes:
-      - magpie_secret:/run/magpie-secret:ro
-
-  backend:
-    environment:
-      MAGPIE_ADMIN_PUBLIC_URL: ${MAGPIE_ADMIN_PUBLIC_URL:-}  # 空 → 用请求 Host + MAGPIE_UI_PORT 拼
-      MAGPIE_UI_PORT: ${MAGPIE_UI_PORT:-3430}
-```
-
-> `web` 需要读一次卷里的口令渲染模板（`docker-entrypoint.d` 里一个 40 行小脚本），因此 web 容器**持有页面口令** —— 这是 B1′ 的固有代价（§3.8）。
-
-### 3.8 后端接口契约（新增 2 个）
-
-```
-POST /api/v1/admin/ops/magpie-access          （WithAuth, RoleAdmin）
-  → 200 {"url":"http://<host>:3430/?t=<entry>","expires_at":"2026-11-18T09:12:00Z"}
-  → 503 {"code":50301,"reason":"magpie_admin_url_unconfigured"}   # 既没 env 也拼不出来
-
-GET  /internal/magpie-access/verify?t=<token> （**无鉴权**，只给 nginx 的 auth_request 调）
-  → 204 + 头 X-Magpie-Gate: <gate>   # 验过的是「入口票据」→ 换发 8h 的门票
-  → 204                              # 验过的是「门票」→ 不再换发
-  → 403                              # 其余一律
-```
-
-票据：`HMAC-SHA256(secret, payload)`，payload = `{v:1, uid, role, aud:"magpie-entry"|"magpie-gate", iat, exp}`；
-密钥 `magpie_jump.key` 与 `sm4.key` 同法自动生成并持久化在 `backend_keys` 卷。
-
-安全口径：
-
-- 票据**不含**会话 JWT，不能被拿去调灵枢接口（`aud` 独立）。
-- 入口票据 120 秒、**短时内可重放**（无状态，不做单次消费；消费需要存储，本期不做）——知道这条，别在别处写「一次性」。
-- 门票 8 小时、不可吊销；轮换 = 换 `magpie_jump.key`（重启 backend 即全员重进）。
-- `verify` 无鉴权是有意的（它只回答「签是不是我签的」），但它**不在** `/api/` 前缀下，外网经 nginx 只会落到 SPA 兜底。
-
-### 3.9 前端
-
-`系统 → 上游（V2）` 页签顶部加一块「代理侧（magpie）管理面」：
-
-- 按钮「打开代理侧管理面」→ 调上面的接口 → `window.open(url, '_blank', 'noopener')`；
-- 接口 503 / 网络失败 → 按钮置灰 + 原因（与页面既有 `v2Get` 的 pending 归一一致，不新增死链）；
-- 文案要写明：**这是代理侧的完整管理面，能看上游 provider 的明文 key**。
-
-### 3.10 残留风险（必须写进部署文档）
-
-| 风险 | 说明 | 处置 |
+| 端点 | 鉴权 | 行为 |
 | --- | --- | --- |
-| web 容器持有页面口令 | nginx 必须能拼 `?k=`；web 被拿下 = 管理面被拿下 | 接受；web 容器只跑 nginx，不挂别的卷 |
-| 门票 8h 不可吊销 | 管理员角色被撤后，已发的门票仍有效至多 8h | 缩短 TTL / 换密钥；写进文档 |
-| `magpie_gate` cookie 按主机不按端口 | 会随请求发到灵枢 80 端口（HttpOnly，灵枢不读） | 接受（magpie 自己的 cookie 同理，文档已提示） |
-| break-glass 端口 | `127.0.0.1:3432` 直连 magpie，只要口令 | 只绑回环；不需要时从 compose 删一行 |
+| `POST /api/v1/admin/ops/magpie-access` | `WithAuth(RoleAdmin)` + 处理器内再判一次角色 | 签 8h 票据并种 cookie；未接入（`magpie.base_url` 空）→ 503 + `reason=magpie_admin_unconfigured`（前端把按钮置灰）；响应体**不含**票据 |
+| `GET /internal/magpie-access/verify` | **无**（只给 nginx 的 `auth_request`） | 验签 → 204；否则 403；`Cache-Control: no-store`；**不在 `/api/` 前缀下**（否则会被 SPA 兜底/中间件吃掉） |
+
+- 票据 = `v1.<base64url(payload)>.<hmac>`，载荷只有 `{uid, role, iss, exp, nonce}`；
+  **不是**灵枢会话 JWT，拿去调 `/api/v1/**` 一律 401。
+- 密钥 `keys/magpie_jump.key` 首次启动自动生成（32 字节 hex，`chmod 600`），
+  与 SM4/JWT 密钥同法自举；删掉即让所有已发出的票据失效。
+- 校验端点**无条件注册**：未装配时也回 403 而不是 404 —— 404 会让 nginx 侧看起来像「后端挂了」。
+
+### 2.4 前端（`views/admin/BillingConfig.vue` 的「上游（V2）」页签）
+
+按钮「打开代理侧管理台」，`v-if="isAdmin"`（路由本身也限管理员，这里再判一次）。
+点击先同步 `window.open('about:blank')` 占住用户手势，拿到 `Url` 后再 `location.replace`；
+503 时提示「代理侧还没接入」。旁边有醒目提示：**管理台里能看到上游明文凭据**。
+
+### 2.5 compose
+
+- `magpie-init`：`admin_key`（抓 `sk-magpie-key-…`）+ `admin_web_key`（`openssl rand -hex 16`），
+  两文件 `chown 65532` + `chmod 600`。
+- `magpie`：`entrypoint: bash -c` 在 `exec magpie web …` 之前把 `/secret/admin_web_key` 读进
+  `MAGPIE_WEB_KEY`（magpie 只认环境变量）。
+- `web`：只读挂 `magpie_secret`，启动时生成 §2.2 的 map。**代价：web 容器持有管理台口令。**
+- 宿主机 `127.0.0.1:${MAGPIE_UI_PORT:-3430}` 保留为 break-glass（删掉这行不影响功能）。
 
 ---
 
-## 4 升级是否还需要人手工加任何变量？——**不需要**
+## 3 为什么不把口令交给浏览器（被否决的两个做法）
 
-| 项目 | 首次 `up -d` 之后 | 需要人工？ |
-| --- | --- | --- |
-| 网关密钥（`admin.key`） | 自动生成 + 注册进 magpie + backend 读取 | 否 |
-| 页面口令（`admin_web_key`） | 自动生成，magpie 与 nginx 共用 | 否 |
-| `MAGPIE_BASE_URL` | 默认 `http://magpie:3425` | 否 |
-| 跳转入口 | 默认 `http://<灵枢访问地址>:3430/`，`MAGPIE_ADMIN_PUBLIC_URL` 可覆盖 | 否 |
-| SM4 / JWT / 数据库口令 | 既有自举逻辑不变 | 否 |
-
-仍然需要人做的**只有两件业务动作**（与变量无关）：在管理面加上游 provider、给每个租户令牌绑 callerKey。
-
-升级已有部署（`.env` 里已有 `MAGPIE_ADMIN_KEY` / `MAGPIE_WEB_KEY`）时：**env 优先，卷里不再生成**，行为与现在一致；
-只有两者都没有时才走自举。迁移不需要动（本次无新迁移）。
+| 做法 | 为什么否决 |
+| --- | --- |
+| 按钮直接 `window.open('/magpie/?k=<口令>')` | 口令进了浏览器地址栏/history/截图，等于把「长期凭据」泄漏给任何能看屏幕或日志的人；且口令只代表「能进」，不区分是谁 |
+| 用灵枢 JWT 直接做 `auth_request` 的凭据 | 灵枢登录态在 localStorage，浏览器**导航**不带 `Authorization`，子请求必然 401（这是「直接上 auth_request」做不出来的根本原因） |
 
 ---
 
-## 5 实施顺序与验收
+## 4 残留风险（已在部署文档同步）
 
-1. A 改造 `magpie-init` + 新增 `deploy/magpie/entrypoint.sh`（读 `/secret/admin_web_key`）。
-2. 后端：`magpieaccess` 包（票据签发/校验）+ 两个路由 + 单测（签验、过期、aud 混用、非 ADMIN）。
-3. nginx：模板化 + 3431 server 块；web 启动脚本读卷口令。
-4. compose：端口/卷/env 重排（magpie 不再发布 3430）。
-5. 前端：一个按钮 + 失败态。
-6. 文档：`docs/deploy/magpie-container.md` 重写 §1/§2/§4，并补 §3.10 的风险表。
+1. **web 容器持有管理台口令**：能 `exec` 进 web 的人等于能开管理台。它只跑 nginx、不挂别的卷。
+2. **票据不可单独吊销**：8 小时内有效，只能靠轮换 `keys/magpie_jump.key` 全量作废（会让所有人重开一次）。
+3. **口令以 URL 形式进入 nginx→magpie 这一跳**（`?k=` 在容器内网、不到浏览器）。这是 magpie 唯一的入口形态，不是可选项。
+4. **`sub_filter` 依赖 magpie 页面里字面量 `"/api/`**：magpie 改写法（例如改成 `fetch(location.origin + "/api/")` 或构建期注入前缀）会让改写失效 → 页面 401。
+   自检脚本 `frontend/scripts/magpie-ui-proxy-selftest.sh` 用忠实 stub 覆盖这条；**升级 magpie 后应在宿主机复跑一次**（§5.2）。
+5. **`cookie magpie_web_3430` 里的端口与 compose 的 `--addr 0.0.0.0:3430` 绑定**：改端口要同步改 `frontend/00-magpie-key.conf` 与 `19-magpie-key.sh`。
+6. 页面自身仍是「单口令」模型：管理台内部没有审计/角色。谁能用管理台，就是全权。
 
-验收（真机，宿主机）：
+---
 
-- `up -d` 后 `magpie-init` 退出 0，`admin.key` / `admin_web_key` 都在卷里；`docker compose logs magpie-init` 不再出现解析失败；
-- 灵枢非管理员调 `POST /api/v1/admin/ops/magpie-access` → 403；管理员 → 200 且 `url` 可用；
-- 浏览器打开 `url`：**地址栏里没有 `k=`**，页面正常，`document.cookie` 里没有页面口令（HttpOnly）；
-- 直接访问 `http://127.0.0.1:3430/`（不带票据、不带 cookie）→ 403（nginx 挡）；
-- 清掉 `magpie_gate` cookie 后刷新 → 403；再点按钮 → 正常（票据 120 秒过期后同样 403）；
-- `docker compose down -v && up -d` → 两把 key 重新生成，全程零人工变量。
+## 5 验收
+
+### 5.1 仓库里可复跑的（沙盒已跑通）
+
+```bash
+# 后端：票据签验 + 两条路由口径
+go test ./internal/domain/magpieaccess/ ./internal/server/ -run 'MagpieAccess|Ticket|Verify|Issue'
+# nginx：真实配置 + 忠实 stub（需要 nginx、python3、端口 3430 空闲）
+bash frontend/scripts/magpie-ui-proxy-selftest.sh
+```
+
+自检覆盖：无票据/伪票据 403、票据换口令 302 且 `Location` 改回 `/magpie/`、页面 200、
+JS 里 `/api/` 全量改写、页面 API 前缀剥净且 `Host` 原样、同源 POST 200 / 外站 POST 403、
+灵枢自己的 `/api/` 不受影响。
+**变异验证**（做过的四条，改回即红）：删 `auth_request`、删 `sub_filter`、
+`Host` 换成 `magpie:3430`、删 `proxy_redirect`。
+
+### 5.2 宿主机需要补的三条（沙盒无 docker）
+
+```bash
+# ① 管理台口令与端口分工：3425 打开应当 404（没有页面），3430 才是页面
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:3425/
+curl -s -o /dev/null -w '%{http_code}\n' "http://127.0.0.1:3430/?k=$(docker compose exec -u 0 web cat /run/magpie-secret/admin_web_key)"
+
+# ② TRUST_PROXY 的作用面：开与不开各跑一次，比较 /v1/models 的 401/200 与页面 / 的 401
+#    （结论应为：只影响 3425 的客户端路由，页面口令不受影响）
+TRUST_PROXY=0 docker compose up -d magpie && curl -s -o /dev/null -w 'v1=%{http_code} ' \
+  -H 'X-Forwarded-For: 10.0.0.7' http://magpie:3425/v1/models
+TRUST_PROXY=1 docker compose up -d magpie && curl -s -o /dev/null -w 'v1=%{http_code} ' \
+  -H 'X-Forwarded-For: 10.0.0.7' http://magpie:3425/v1/models
+
+# ③ magpie 升级后复跑子路径自检 + 手工点一次按钮
+bash frontend/scripts/magpie-ui-proxy-selftest.sh
+```
+
+---
 
 ## 6 回滚
 
-无迁移、无数据结构变更。回滚 = 还原 `docker-compose.yml` / `frontend/nginx.conf`（模板）/ 新目录 + revert 后端与前端各一个提交；
-卷里多出来的 `admin_web_key` 无害（旧的 magpie 服务不再读它）。
-若只想暂时关掉入口：把 `web` 的 `127.0.0.1:3430:3431` 映射删掉，改回 magpie 的 `127.0.0.1:3430:3430` + 手输口令即可。
+- 纯前端/编排改动 + 一个新包：回滚 = revert 分支上的提交（`/magpie/` 入口消失、
+  按钮消失），**没有数据库迁移**，不影响转发与计费。
+- 只想临时关掉入口：删 compose 里 `web` 的 `magpie_secret` 挂载 → `/magpie/` 会停在
+  「要口令」的登录表单（仍受 ADMIN 票据保护）；或直接删 `nginx.conf` 里两个 `/magpie/` location。
+- 票据密钥损坏：删 `keys/magpie_jump.key` 重启 backend。
 
-## 7 待拍板
+---
 
-1. **B1′ 还是 B2**（本文推荐 B1′）。若选 B2，§3.8/§3.9 全部砍掉，只留一个返回链接的接口。
-2. 门票 TTL：默认 **8 小时**（可配），是否接受「撤管理员后 8 小时内仍能进」。
-3. 管理面入口默认只绑 `127.0.0.1`（现状口径）。若运营要从别的机器直接用浏览器打开，需要改成 LAN/VPN 绑定 + 反代加 TLS —— 这是另一个决定。
+## 7 待拍板 / 后续
+
+1. 要不要在管理台入口处加二次确认（当前只有页面上的文字提示「能看到明文凭据」）。
+2. 要不要把票据有效期做成可配（`MAGPIE_JUMP_TTL`），当前固定 8h。
+3. 多副本时票据密钥怎么共享（现在跟 `keys/sm4.key` 一样是单副本落盘；多副本需要外部密钥源）。

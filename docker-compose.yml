@@ -11,8 +11,9 @@
 # 代理侧（magpie）随 compose 自带，不需要手工配环境变量，端口/凭据/重置方式见
 # docs/deploy/magpie-container.md：
 #   - 网关 :3425 只在 compose 内网可达（backend → http://magpie:3425），不发布到宿主；
-#   - 管理面 :3430 只发布到宿主机回环（127.0.0.1），仅供人工在浏览器里配置，不经 nginx；
-#   - 管理密钥首次 up 时自动生成并落在 magpie_secret 卷，magpie 与 backend 读同一份。
+#   - 管理台 :3430 走灵枢同源的 /magpie/（nginx 反代 + ADMIN 票据，页面口令由 nginx 服务端代填），
+#     宿主回环上的 3430 只是应急直连；
+#   - 网关密钥与管理台口令首次 up 时自动生成并落在 magpie_secret 卷，三个容器读同一份。
 
 services:
   postgres:
@@ -47,11 +48,33 @@ services:
       - |
         set -u
         KEY_FILE=/secret/admin_key
+        WEB_KEY_FILE=/secret/admin_web_key
         NAME="$${MAGPIE_ADMIN_KEY_NAME:-lingshu-backend}"
-        fix_owner() { chown -R 65532:65532 /config 2>/dev/null || true; }
+        fix_owner() {
+          chown -R 65532:65532 /config 2>/dev/null || true
+          # 页面口令要能被 magpie（uid 65532）和 web/nginx（root）读；/secret 目录本身保持 700
+          chown 65532:65532 /secret/admin_key /secret/admin_web_key 2>/dev/null || true
+          chmod 600 /secret/admin_key /secret/admin_web_key 2>/dev/null || true
+        }
 
         mkdir -p /secret /config
         chmod 700 /secret || true
+
+        # 0) 页面口令（管理面 /magpie/ 入口由 nginx 代填，必须两边一致）—— 与网关密钥分开管：
+        #    手填优先，其次复用卷里的，最后首次随机生成（32 位 hex，magpie 只接受字母数字与 - . _ ~）
+        if [ -n "$${MAGPIE_WEB_KEY:-}" ]; then
+          printf '%s' "$$MAGPIE_WEB_KEY" > "$$WEB_KEY_FILE"
+          echo "[magpie-init] 使用环境变量 MAGPIE_WEB_KEY 作为管理面口令"
+        elif [ -s "$$WEB_KEY_FILE" ]; then
+          echo "[magpie-init] 复用已有管理面口令：$$WEB_KEY_FILE"
+        else
+          if command -v openssl >/dev/null 2>&1; then
+            openssl rand -hex 16 > "$$WEB_KEY_FILE"
+          else
+            head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$$WEB_KEY_FILE"
+          fi
+          echo "[magpie-init] 已生成管理面口令并写入 $$WEB_KEY_FILE"
+        fi
 
         # 1) 显式给了 MAGPIE_ADMIN_KEY（手工在管理面建好不可恢复的 key）→ 以环境变量为准
         if [ -n "$${MAGPIE_ADMIN_KEY:-}" ]; then
@@ -89,6 +112,7 @@ services:
     environment:
       MAGPIE_ADMIN_KEY: ${MAGPIE_ADMIN_KEY:-}
       MAGPIE_ADMIN_KEY_NAME: ${MAGPIE_ADMIN_KEY_NAME:-lingshu-backend}
+      MAGPIE_WEB_KEY: ${MAGPIE_WEB_KEY:-}
       MAGPIE_UI_PORT: ${MAGPIE_UI_PORT:-3430}
       TZ: ${TZ:-Asia/Shanghai}
     volumes:
@@ -98,21 +122,42 @@ services:
   # 代理侧：选渠道、failover、四协议互译都在这里；灵枢只做 facade。
   magpie:
     image: ${MAGPIE_IMAGE:-ghcr.io/yetone/magpie:latest}
-    # web 子命令 = 网关 + 浏览器管理面；管理面同时应答 /v1 路由
-    command: ["web", "--addr", "0.0.0.0:3430", "--no-open"]
+    # web 子命令 = 网关 + 浏览器管理面；管理面同时应答 /v1 路由。
+    # 页面口令由 magpie-init 落在 magpie_secret 卷里，这里在进程启动前读进环境变量
+    # （magpie 只认环境变量，没有「从文件读口令」的开关），这样重启不会换口令，
+    # nginx 那边注入的也永远是同一把。
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        if [ -n "$${MAGPIE_WEB_KEY:-}" ]; then
+          echo "[magpie] 管理面口令来自环境变量 MAGPIE_WEB_KEY" >&2
+        elif [ -s /secret/admin_web_key ]; then
+          MAGPIE_WEB_KEY=$$(cat /secret/admin_web_key)
+          export MAGPIE_WEB_KEY
+          echo "[magpie] 管理面口令来自 /secret/admin_web_key" >&2
+        else
+          echo "[magpie] 未取到管理面口令：magpie 会自行生成一个随机值（每次重启都会变，/magpie/ 入口需手工粘贴）" >&2
+        fi
+        exec magpie web --addr 0.0.0.0:3430 --no-open
     environment:
       # 网关端口（容器内固定 3425；不发布到宿主，只有 compose 内网能到）
       MAGPIE_ADDR: 0.0.0.0:3425
-      # 浏览器管理面的口令：建议在 .env 里固定一次（见 docs）；
-      # 留空则每次重启换一个新值，链接在 `docker compose logs magpie` 里
+      # 手工固定口令时才填（留空 = 用 magpie_secret 卷里那份，见 docs/deploy/magpie-container.md）
       MAGPIE_WEB_KEY: ${MAGPIE_WEB_KEY:-}
       MAGPIE_NAME: ${MAGPIE_NAME:-lingshu-magpie}
+      # 刻意不设 MAGPIE_TRUST_PROXY：它按「有没有转发头」判定请求是不是本地，
+      # 开了之后 nginx 转来的 /v1 会被当成本地（免网关密钥）。详见
+      # docs/designs/2026-11-18-magpie-compose-and-admin-jump.md §1.3。
       TZ: ${TZ:-Asia/Shanghai}
     ports:
-      # 只绑宿主机回环：管理面供人工在浏览器里配置，不经 nginx、不对公网
+      # 应急直连（break-glass）：只绑宿主机回环，仍需 magpie 自己的页面口令。
+      # 日常入口是灵枢同源的 https://<灵枢地址>/magpie/（ADMIN 票据 + auth_request），
+      # 不走这里；排障时（例如 nginx 挂了）才用它。不需要就删掉这一行。
       - "127.0.0.1:${MAGPIE_UI_PORT:-3430}:3430"
     volumes:
       - magpie_config:/config # providers / 网关密钥 / 登录态 / 用量（含明文上游凭据，按密钥卷对待）
+      - magpie_secret:/secret:ro # admin_web_key：管理面口令（magpie-init 生成，这里只读）
     healthcheck:
       test: ["CMD", "magpie", "healthcheck"]
       interval: 15s
@@ -168,6 +213,16 @@ services:
       context: ./frontend
     ports:
       - "${APP_PORT:-80}:80"
+    environment:
+      # 代理侧管理面（/magpie/）的页面口令：留空则读 magpie_secret 卷里的 admin_web_key
+      # （magpie-init 首次 up 时自动生成，与 magpie 自己用的是同一把）。
+      MAGPIE_WEB_KEY: ${MAGPIE_WEB_KEY:-}
+      MAGPIE_WEB_KEY_FILE: /run/magpie-secret/admin_web_key
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      # 只读：nginx 启动时把页面口令编译成一个 map 文件，用于 /magpie/ 入口的服务端注入。
+      # 代价要说清：web 容器因此持有页面口令（它能开代理侧管理面）——只跑 nginx，不挂别的卷。
+      - magpie_secret:/run/magpie-secret:ro
     depends_on:
       - backend
     restart: unless-stopped
@@ -177,4 +232,4 @@ volumes:
   backend_keys:
   backend_data:
   magpie_config: # magpie 自己的配置/密钥/登录态/用量
-  magpie_secret: # 只放一把代理侧管理密钥（admin_key），供 backend 只读挂载
+  magpie_secret: # 两把：网关密钥 admin_key（backend 读）+ 管理台口令 admin_web_key（magpie/web 读）
