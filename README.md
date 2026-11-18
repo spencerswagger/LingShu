@@ -65,9 +65,14 @@ docker compose up -d --build
 |------|------|---------|
 | `web` | nginx：托管前端静态资源，并把 `/api`、`/v1` 反代到后端 | 唯一对外端口（默认 80） |
 | `backend` | Go 服务，容器内 `:8080` | 仅内网 |
+| `magpie` | 代理侧（上游网关：选渠道 / failover / 四协议互译），容器内 `:3425` | 仅内网；管理面 `127.0.0.1:3430`（仅供人工在浏览器配置） |
+| `magpie-init` | 一次性任务：首次启动自动生成代理侧网关密钥后退出 | 无 |
 | `postgres` | PostgreSQL 16，数据持久化在 `pgdata` 卷 | 仅内网 |
 
 前端与后端**共用同一端口**：管理端接口 `/api/v1/*`、OpenAI 兼容网关 `/v1/*` 与前端静态页面都在该端口下，无需额外跨域配置。
+
+代理侧随 compose 自带、**无需手工配环境变量**（首次 `up -d` 自动生成管理密钥并让两个容器读同一把）；
+端口、凭据位置、如何重置管理密钥、如何升级见 [`docs/deploy/magpie-container.md`](docs/deploy/magpie-container.md)。
 
 ### 自动化行为（开箱即用）
 
@@ -90,8 +95,15 @@ docker compose up -d --build
 | `JWT_TTL_MINUTES` | `360` | 登录令牌有效期（分钟） |
 | `SYNC_INTERVAL_MINUTES` | `60` | 外部价格源同步周期 |
 | `TRUSTED_PROXY_CIDRS` | `172.16.0.0/12`（compose 内设定） | 可信代理网段（逗号分隔 CIDR）。仅当直连对端属于这些网段时才采信 `X-Real-IP`，用于登录限流与审计的客户端 IP。**代码默认只信任回环**；若实际 Docker 网络不在默认段（可用 `docker network inspect <项目>_default` 查看），必须显式配置，否则审计 IP 会退化为 nginx 容器 IP、限流的 IP 维度也会退化。启动日志会打印生效网段 |
+| `MAGPIE_IMAGE` | `ghcr.io/yetone/magpie:0.1.4458` | 代理侧镜像。tag **不带 `v` 前缀**（`0.1.4458` 对、`v0.1.4458` 拉不到）；`stable` / `latest` 是浮动 tag，生产建议钉版本 |
+| `MAGPIE_UI_PORT` | `3430` | 代理侧管理台的宿主机 port（break-glass 直连，只绑 `127.0.0.1`）。日常入口是灵枢同源的 `/magpie/`（仅 ADMIN 可见） |
+| `MAGPIE_WEB_KEY` | 空（首次启动自动生成并落在 `magpie_secret` 卷，重启不变） | 管理台口令；只有「手工接管」时才填。**至少 16 字符**（短了 magpie 起不来，会被自动补齐并告警），只接受字母数字与 `- . _ ~`；实际生效值以卷里 `admin_web_key` 为准 |
+| `MAGPIE_ADMIN_PUBLIC_URL` | 空（用同源相对路径 `/magpie/`） | 灵枢对外地址（如 `https://lingshu.example.com`）。只有前端与后端不同源时才需要 |
+| `MAGPIE_BASE_URL` | `http://magpie:3425`（compose 内设定） | 代理侧基址；留空则 `/v1` 转发停用（410） |
+| `MAGPIE_ADMIN_KEY` | 空（首次启动自动生成，两个容器读同一份） | 代理侧管理密钥；只有「手工在管理面建 key」时才需要填 |
 
 > 生产环境请修改 `POSTGRES_PASSWORD` 与 `APP_PORT`，并在首次登录后立即改掉默认口令。
+> 代理侧的凭据位置、重置与升级步骤见 [`docs/deploy/magpie-container.md`](docs/deploy/magpie-container.md)。
 
 ### 常用运维命令
 

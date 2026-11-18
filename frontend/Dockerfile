@@ -15,4 +15,8 @@ RUN npm run build
 FROM nginx:1.27-alpine
 COPY --from=build /app/dist /usr/share/nginx/html
 COPY nginx.conf /etc/nginx/conf.d/default.conf
+# 代理侧管理面（/magpie/）：默认「不注入口令」的 map，容器启动时由 19-magpie-key.sh 覆盖。
+COPY 00-magpie-key.conf /etc/nginx/conf.d/00-magpie-key.conf
+COPY docker-entrypoint.d/19-magpie-key.sh /docker-entrypoint.d/19-magpie-key.sh
+RUN chmod +x /docker-entrypoint.d/19-magpie-key.sh
 EXPOSE 80
