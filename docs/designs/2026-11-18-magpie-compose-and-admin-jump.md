@@ -34,8 +34,9 @@
 
 ### 1.2 管理台口令的语义
 
-- 口令由 `MAGPIE_WEB_KEY` 提供（16+ 字符）；不设则每次启动随机生成。
-- `?k=<口令>` 校验通过后 magpie **种 cookie 并 303/302 回去掉 `k` 的地址**
+- 口令由 `MAGPIE_WEB_KEY` 提供，**至少 16 字符**（真机实测 13 位直接拒绝启动）；不设则每次启动随机生成。
+  手填不足 16 位时由 `magpie-init` 追加随机 hex 补齐后落卷（`/secret/admin_web_key` 是唯一真源）。
+- `?k=<口令>` 校验通过后 magpie **种 cookie 并 303（旧版 302）回去掉 `k` 的地址**
   （cookie 名 `magpie_web_<页面端口>`，HttpOnly、`Path=/`）；无 cookie 时回 401 + 粘口令表单
   （表单 POST 到 `/_magpie/sign-in`）；免口令白名单只有 `manifest.json` 与两个 icon。
 - **它是长期凭据、且只有「知道 / 不知道」两态**，没有用户维度 —— 所以不能直接给浏览器看，
@@ -84,7 +85,7 @@ proxied(r) = trustProxy() ? false : 请求带了那 7 个转发头里的任意�
 | 约束 | 出处 / 现象 |
 | --- | --- |
 | `magpie web` **没有 base-path 参数**，页面自己占根：静态资源是相对路径（`app.css`、`boot.js`），请求是绝对路径 `fetch("/api/"+p)` | `internal/gui/assets/index.html`、`app.js` |
-| 换 cookie 后 302 到 `/` | `webGuard` |
+| 换 cookie 后 303 到 `/`（旧版 302） | `webGuard` |
 | 页面自己的写请求校验 `Origin` vs `Host`、`Sec-Fetch-Site` | `webOwnPage`（`http.CrossOriginProtection`） |
 
 所以「挂上去就完事」不行，必须 §2.2 的三处改写 + 关闭上游 gzip。
@@ -105,7 +106,7 @@ proxied(r) = trustProxy() ? false : 请求带了那 7 个转发头里的任意�
   ├── nginx: auth_request → GET /internal/magpie-access/verify （验签，2xx 放行）
   │     验不过 → 403，请求根本到不了 magpie
   ├── nginx → magpie:3430 （无 magpie 页面 cookie 时把 ?k=<口令> 拼在上游 URL 上）
-  │     magpie: 换 cookie + 302 → Location: /
+  │     magpie: 换 cookie + 303（旧版 302）→ Location: /
   ├── nginx: proxy_redirect 把 Location 改成 /magpie/
   └── 页面加载；JS 里的 "/api/…" 已被 sub_filter 改写成 "/magpie/api/…"
 ```
@@ -156,7 +157,8 @@ map "$cookie_magpie_web_3430|$arg_k" $magpie_entry_qs {
 - `magpie-init`：`admin_key`（抓 `sk-magpie-key-…`）+ `admin_web_key`（`openssl rand -hex 16`），
   两文件 `chown 65532` + `chmod 600`。
 - `magpie`：`entrypoint: bash -c` 在 `exec magpie web …` 之前把 `/secret/admin_web_key` 读进
-  `MAGPIE_WEB_KEY`（magpie 只认环境变量）。
+  `MAGPIE_WEB_KEY`（magpie 只认环境变量）。取的是**卷里那份**（不是 `.env` 原值）：`magpie-init`
+  已把不足 16 位的口令补齐，读同一份才能与 nginx 注入的 `?k=` 一致。
 - `web`：只读挂 `magpie_secret`，启动时生成 §2.2 的 map。**代价：web 容器持有管理台口令。**
 - 宿主机 `127.0.0.1:${MAGPIE_UI_PORT:-3430}` 保留为 break-glass（删掉这行不影响功能）。
 
@@ -194,7 +196,8 @@ go test ./internal/domain/magpieaccess/ ./internal/server/ -run 'MagpieAccess|Ti
 bash frontend/scripts/magpie-ui-proxy-selftest.sh
 ```
 
-自检覆盖：无票据/伪票据 403、票据换口令 302 且 `Location` 改回 `/magpie/`、页面 200、
+自检覆盖：无票据/伪票据 403、票据换口令 **3xx（stub 照真机返回 303）** 且 `Location` 改回 `/magpie/`、
+口令不足 16 位时告警且不注入、页面 200、
 JS 里 `/api/` 全量改写、页面 API 前缀剥净且 `Host` 原样、同源 POST 200 / 外站 POST 403、
 灵枢自己的 `/api/` 不受影响。
 **变异验证**（做过的四条，改回即红）：删 `auth_request`、删 `sub_filter`、

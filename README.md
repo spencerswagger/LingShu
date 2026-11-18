@@ -95,9 +95,9 @@ docker compose up -d --build
 | `JWT_TTL_MINUTES` | `360` | 登录令牌有效期（分钟） |
 | `SYNC_INTERVAL_MINUTES` | `60` | 外部价格源同步周期 |
 | `TRUSTED_PROXY_CIDRS` | `172.16.0.0/12`（compose 内设定） | 可信代理网段（逗号分隔 CIDR）。仅当直连对端属于这些网段时才采信 `X-Real-IP`，用于登录限流与审计的客户端 IP。**代码默认只信任回环**；若实际 Docker 网络不在默认段（可用 `docker network inspect <项目>_default` 查看），必须显式配置，否则审计 IP 会退化为 nginx 容器 IP、限流的 IP 维度也会退化。启动日志会打印生效网段 |
-| `MAGPIE_IMAGE` | `ghcr.io/yetone/magpie:latest` | 代理侧镜像（生产建议钉具体版本或 `stable`） |
+| `MAGPIE_IMAGE` | `ghcr.io/yetone/magpie:0.1.4458` | 代理侧镜像。tag **不带 `v` 前缀**（`0.1.4458` 对、`v0.1.4458` 拉不到）；`stable` / `latest` 是浮动 tag，生产建议钉版本 |
 | `MAGPIE_UI_PORT` | `3430` | 代理侧管理台的宿主机 port（break-glass 直连，只绑 `127.0.0.1`）。日常入口是灵枢同源的 `/magpie/`（仅 ADMIN 可见） |
-| `MAGPIE_WEB_KEY` | 空（首次启动自动生成并落在 `magpie_secret` 卷，重启不变） | 管理台口令；只有「手工接管」时才填（只接受字母数字与 `- . _ ~`） |
+| `MAGPIE_WEB_KEY` | 空（首次启动自动生成并落在 `magpie_secret` 卷，重启不变） | 管理台口令；只有「手工接管」时才填。**至少 16 字符**（短了 magpie 起不来，会被自动补齐并告警），只接受字母数字与 `- . _ ~`；实际生效值以卷里 `admin_web_key` 为准 |
 | `MAGPIE_ADMIN_PUBLIC_URL` | 空（用同源相对路径 `/magpie/`） | 灵枢对外地址（如 `https://lingshu.example.com`）。只有前端与后端不同源时才需要 |
 | `MAGPIE_BASE_URL` | `http://magpie:3425`（compose 内设定） | 代理侧基址；留空则 `/v1` 转发停用（410） |
 | `MAGPIE_ADMIN_KEY` | 空（首次启动自动生成，两个容器读同一份） | 代理侧管理密钥；只有「手工在管理面建 key」时才需要填 |

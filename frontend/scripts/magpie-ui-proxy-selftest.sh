@@ -23,6 +23,14 @@ ck() { # ck <名字> <期望> <实际>
     if [ "$3" = "$2" ]; then printf '  ok   %s\n' "$1"
     else printf '  FAIL %s（期望 %s，实际 %s）\n' "$1" "$2" "$3"; fail=1; fi
 }
+# ck3 <名字> <实际>：只要求是 3xx 重定向。真机 magpie 换完 cookie 返回的是 **303**（文档里写的
+# 302 是旧版行为），所以这里不断言具体码，只断言「是重定向」，并把实测码打印出来。
+ck3() {
+    case "$2" in
+        3??) printf '  ok   %s（实测 %s）\n' "$1" "$2" ;;
+        *)   printf '  FAIL %s（期望 3xx，实际 %s）\n' "$1" "$2"; fail=1 ;;
+    esac
+}
 # curl -D 写出的是 CRLF 头，先转成 LF 再比（否则 /magpie/$ 这种锚点永远不匹配）
 code() { curl -s -o "$TMP/body" -D "$TMP/hdr.raw" -w '%{http_code}' "$@"; tr -d '\r' <"$TMP/hdr.raw" >"$TMP/hdr"; }
 
@@ -62,7 +70,8 @@ class H(BaseHTTPRequestHandler):
         if "k" in q:
             if q["k"][0] != KEY:
                 return self.send(401, b"wrong key")
-            return self.send(302, extra=[("Location", "/"), ("Set-Cookie", f"{COOKIE}={KEY}; Path=/; HttpOnly")])
+            # 真机 magpie 回的是 303（See Other），不是 302 —— stub 必须照抄，否则自检覆盖不到 303
+            return self.send(303, extra=[("Location", "/"), ("Set-Cookie", f"{COOKIE}={KEY}; Path=/; HttpOnly")])
         if path in ("/manifest.json", "/icons/icon-512.png"):
             return self.send(200, b"{}", "application/json")
         if f"{COOKIE}={KEY}" not in cookies:
@@ -137,7 +146,9 @@ for pat in "listen $WEB_PORT;" "127.0.0.1:$BE_PORT;" "127.0.0.1:$MG_PORT;"; do
 done
 
 # 用真实的 19-magpie-key.sh 生成注入规则（不是测试里另写一份）
-MAGPIE_WEB_KEY=$KEY MAGPIE_KEY_CONF_OUT=$TMP/conf.d/00-magpie-key.conf \
+# MAGPIE_WEB_KEY_FILE 指到不存在的路径 → 走「环境变量」分支（脚本口径是卷优先，宿主机上可能真有那个文件）
+MAGPIE_WEB_KEY=$KEY MAGPIE_WEB_KEY_FILE=$TMP/no-such-key \
+    MAGPIE_KEY_CONF_OUT=$TMP/conf.d/00-magpie-key.conf \
     sh "$HERE/../docker-entrypoint.d/19-magpie-key.sh"
 
 cat >"$TMP/nginx.conf" <<EOF
@@ -176,8 +187,14 @@ ck "伪票据 → 403" 403 "$(code -H 'Cookie: magpie_gate=bogus' "$B/magpie/")"
 ck "伪票据 + API → 403" 403 "$(code -H 'Cookie: magpie_gate=bogus' "$B/magpie/api/x")"
 
 echo "== 票换口令（服务端注入）"
-ck "票据 + 无页面 cookie → 302" 302 "$(code -H "Cookie: $GATE" "$B/magpie/")"
-grep -qi "^location: /magpie/$" "$TMP/hdr" || { echo "  FAIL Location 没改回 /magpie/，实际：$(grep -i '^location:' "$TMP/hdr")"; fail=1; }
+REDIR=$(code -H "Cookie: $GATE" "$B/magpie/")
+ck3 "票据 + 无页面 cookie → 3xx（真机 magpie 实测 303）" "$REDIR"
+# 303 的 Location 必须同样被 proxy_redirect 改写（302 时代已验证，303 是新增断言）
+if grep -qi "^location: /magpie/$" "$TMP/hdr"; then
+    printf '  ok   3xx 的 Location 已改写为 /magpie/\n'
+else
+    echo "  FAIL 3xx 的 Location 没改回 /magpie/，实际：$(grep -i '^location:' "$TMP/hdr" | tr -d '\r')"; fail=1
+fi
 ck "票据 + 页面 cookie → 200" 200 "$(code -H "Cookie: $GATE; $MC" "$B/magpie/")"
 grep -qi 'magpie page' "$TMP/body" || { echo "  FAIL 没拿到页面"; fail=1; }
 ck "/magpie（无斜杠）→ 301" 301 "$(code -H "Cookie: $GATE" "$B/magpie")"
@@ -197,6 +214,18 @@ ck "/api/ 仍归后端 → 401" 401 "$(code "$B/api/v1/auth/me")"
 
 echo "== 口令不落前端"
 ck "响应头里没有明文口令的 Set-Cookie（只有 magpie 自己的）" 0 "$(grep -ci "set-cookie: .*magpie_gate" "$TMP/hdr")"
+
+echo "== 口令长度守卫（真机 magpie 要求 MAGPIE_WEB_KEY ≥16 字符，短了直接起不来）"
+SHORT_LOG=$(MAGPIE_WEB_KEY=short12345678 MAGPIE_WEB_KEY_FILE=$TMP/no-such-key \
+    MAGPIE_KEY_CONF_OUT=$TMP/short.conf \
+    sh "$HERE/../docker-entrypoint.d/19-magpie-key.sh" 2>&1 || true)
+case "$SHORT_LOG" in
+    *"要求 ≥16"*) printf '  ok   13 位口令 → 告警且不注入\n' ;;
+    *) printf '  FAIL 13 位口令没有告警，实际输出：%s\n' "$SHORT_LOG"; fail=1 ;;
+esac
+if [ -f "$TMP/short.conf" ] && grep -q '?k=' "$TMP/short.conf"; then
+    echo "  FAIL 不足 16 位的口令仍被注入进 map"; fail=1
+fi
 
 echo
 if [ "$fail" -ne 0 ]; then echo "自检失败"; exit 1; fi

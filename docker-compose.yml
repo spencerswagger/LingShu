@@ -40,7 +40,9 @@ services:
   # 的网关密钥，把值写进共享卷 magpie_secret；backend 启动时从该文件读取。
   # 之后每次 up 发现文件已存在就直接复用 —— 两边永远是同一把，无需人工填任何变量。
   magpie-init:
-    image: ${MAGPIE_IMAGE:-ghcr.io/yetone/magpie:latest}
+    # 镜像 tag 是**不带 v 前缀**的版本号（正确：0.1.4458；`v0.1.4458` 不存在，拉了会 404）。
+    # 另有 latest / stable / daily 三个浮动 tag；这里钉具体版本，升级时改这两处（或写 MAGPIE_IMAGE）。
+    image: ${MAGPIE_IMAGE:-ghcr.io/yetone/magpie:0.1.4458}
     user: "0:0" # 需要 chown 卷（magpie 以 uid 65532 运行）
     restart: "no"
     entrypoint: ["/bin/bash", "-c"]
@@ -62,17 +64,39 @@ services:
 
         # 0) 页面口令（管理面 /magpie/ 入口由 nginx 代填，必须两边一致）—— 与网关密钥分开管：
         #    手填优先，其次复用卷里的，最后首次随机生成（32 位 hex，magpie 只接受字母数字与 - . _ ~）
+        #
+        #    长度是硬要求：magpie 要求 MAGPIE_WEB_KEY **至少 16 个字符**，短了它会直接拒绝启动
+        #    （真机实测 13 位起不来）。所以手填值不足 16 位时在这里补齐（追加随机 hex）并告警——
+        #    补齐后的值只存在卷里，magpie 与 nginx 都读这一份，口令本身不以 URL 形式进浏览器。
+        gen_hex() {
+          if command -v openssl >/dev/null 2>&1; then
+            openssl rand -hex 16
+          else
+            head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n'
+          fi
+        }
+        pad_web_key() { # 参数：原始口令。不足 16 位就追加随机 hex（只往长里补，不改已有字符）
+          wk="$$1"
+          if [ "$${#wk}" -ge 16 ]; then
+            printf '%s' "$$wk"
+            return 0
+          fi
+          echo "[magpie-init] 警告：管理面口令只有 $${#wk} 个字符，magpie 要求至少 16，已自动补齐（以卷里 /secret/admin_web_key 为准，请勿按原值手输）" >&2
+          printf '%s%s' "$$wk" "$$(gen_hex)"
+        }
+
         if [ -n "$${MAGPIE_WEB_KEY:-}" ]; then
-          printf '%s' "$$MAGPIE_WEB_KEY" > "$$WEB_KEY_FILE"
+          pad_web_key "$$MAGPIE_WEB_KEY" > "$$WEB_KEY_FILE"
           echo "[magpie-init] 使用环境变量 MAGPIE_WEB_KEY 作为管理面口令"
         elif [ -s "$$WEB_KEY_FILE" ]; then
+          # 老部署可能留着不足 16 位的口令（magpie 会起不来）→ 就地补齐后覆写
+          cur=$$(cat "$$WEB_KEY_FILE")
+          if [ "$${#cur}" -lt 16 ]; then
+            pad_web_key "$$cur" > "$$WEB_KEY_FILE"
+          fi
           echo "[magpie-init] 复用已有管理面口令：$$WEB_KEY_FILE"
         else
-          if command -v openssl >/dev/null 2>&1; then
-            openssl rand -hex 16 > "$$WEB_KEY_FILE"
-          else
-            head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$$WEB_KEY_FILE"
-          fi
+          gen_hex > "$$WEB_KEY_FILE"
           echo "[magpie-init] 已生成管理面口令并写入 $$WEB_KEY_FILE"
         fi
 
@@ -121,23 +145,32 @@ services:
 
   # 代理侧：选渠道、failover、四协议互译都在这里；灵枢只做 facade。
   magpie:
-    image: ${MAGPIE_IMAGE:-ghcr.io/yetone/magpie:latest}
+    image: ${MAGPIE_IMAGE:-ghcr.io/yetone/magpie:0.1.4458} # 同上：tag 无 v 前缀
     # web 子命令 = 网关 + 浏览器管理面；管理面同时应答 /v1 路由。
     # 页面口令由 magpie-init 落在 magpie_secret 卷里，这里在进程启动前读进环境变量
     # （magpie 只认环境变量，没有「从文件读口令」的开关），这样重启不会换口令，
     # nginx 那边注入的也永远是同一把。
+    #
+    # 取值顺序是**卷优先**（不是环境变量优先）：magpie-init 已经把手填的短口令补齐到 16 位
+    # 以上，只认卷里那份，才能保证 magpie 与 nginx 用的是同一把（否则环境变量里的短口令
+    # 会让 magpie 直接起不来，而 nginx 注入的是补齐后的值）。
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |
         set -e
-        if [ -n "$${MAGPIE_WEB_KEY:-}" ]; then
-          echo "[magpie] 管理面口令来自环境变量 MAGPIE_WEB_KEY" >&2
-        elif [ -s /secret/admin_web_key ]; then
+        if [ -s /secret/admin_web_key ]; then
           MAGPIE_WEB_KEY=$$(cat /secret/admin_web_key)
           export MAGPIE_WEB_KEY
           echo "[magpie] 管理面口令来自 /secret/admin_web_key" >&2
+        elif [ -n "$${MAGPIE_WEB_KEY:-}" ]; then
+          echo "[magpie] 管理面口令来自环境变量 MAGPIE_WEB_KEY" >&2
         else
           echo "[magpie] 未取到管理面口令：magpie 会自行生成一个随机值（每次重启都会变，/magpie/ 入口需手工粘贴）" >&2
+        fi
+        # magpie 要求口令至少 16 个字符，短了它会拒绝启动。这里不改值（改了 nginx 就对不上），
+        # 只把原因喊出来，免得只看到一行 "web key too short" 不知所措。
+        if [ -n "$${MAGPIE_WEB_KEY:-}" ] && [ "$${#MAGPIE_WEB_KEY}" -lt 16 ]; then
+          echo "[magpie] 警告：管理面口令只有 $${#MAGPIE_WEB_KEY} 个字符，magpie 要求至少 16，会拒绝启动；清空 .env 的 MAGPIE_WEB_KEY 让 magpie-init 重新生成（或填 >=16 位）" >&2
         fi
         exec magpie web --addr 0.0.0.0:3430 --no-open
     environment:

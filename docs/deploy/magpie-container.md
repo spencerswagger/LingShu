@@ -41,8 +41,8 @@
    签一张 8 小时的票据，用 **HttpOnly cookie `magpie_gate`**（`Path=/magpie/`）种到浏览器，
    回同源路径 `/magpie/`；
 3. 浏览器打开 `/magpie/`：nginx 先 `auth_request` 回灵枢验签（验不过 403，请求到不了 magpie），
-   再把管理台口令**在服务端**拼进上游 URL；magpie 换成它自己的页面 cookie 后 302 回
-   `/magpie/`，**浏览器地址栏里从来没有口令**。
+   再把管理台口令**在服务端**拼进上游 URL；magpie 换成它自己的页面 cookie 后重定向（真机实测
+   **303**，旧版是 302）回 `/magpie/`，**浏览器地址栏里从来没有口令**。
 
 票据过期（8 小时）或换了 `keys/magpie_jump.key` 之后，页面会变成 403：回灵枢再点一次按钮即可。
 非管理员看不到按钮，直接访问 `/magpie/` 也是 403。
@@ -56,7 +56,8 @@ http://127.0.0.1:${MAGPIE_UI_PORT:-3430}/?k=<管理台口令>
 ```
 
 口令取值：`docker compose exec -u 0 web cat /run/magpie-secret/admin_web_key`
-（它就是 `magpie_secret` 卷里的 `admin_web_key`；`MAGPIE_WEB_KEY` 若在 `.env` 里手填过，以 `.env` 为准）。
+（它就是 `magpie_secret` 卷里的 `admin_web_key`；`.env` 里手填的 `MAGPIE_WEB_KEY` 会在首次 up 时写进
+这个文件，**以文件为准** —— 手填值不足 16 位时会被补齐，按日志里提示的那份读）。
 这条路径**没有灵枢的 ADMIN 校验**，只认口令本身 —— 别把链接发给别人，用完即弃。
 不需要 break-glass 就从 compose 里删掉那行 `ports`。
 
@@ -68,7 +69,7 @@ magpie 的管理页面是按「自己占着域名根」写的，挂到子路径�
 | magpie 的原行为 | 不处理的后果 | 我们的处置 |
 | --- | --- | --- |
 | 页面 JS 里写死 `fetch("/api/"+path)`（绝对路径） | 点任何东西都打到灵枢的 `/api`，一路 401 | `sub_filter` 把 `"/api/` 改写成 `"/magpie/api/`（因此上游必须关 gzip，由 nginx 重新压缩） |
-| `?k=` 换完 cookie 后 302 到 `/` | 一跳就跳出管理台 | `proxy_redirect` 把 `Location: /…` 改回 `/magpie/…` |
+| `?k=` 换完 cookie 后重定向到 `/`（真机返回 **303**，旧版 302） | 一跳就跳出管理台 | `proxy_redirect` 把 `Location: /…` 改回 `/magpie/…`（nginx 对 301/302/303/307/308 一视同仁） |
 | 页面自己的写请求校验 `Origin` / `Sec-Fetch-Site` | `Host` 被改成 `magpie:3430` 时所有写请求 403 | `proxy_set_header Host $http_host` 原样转发 |
 
 页面口令的注入是**每次请求动态判断**的：浏览器还没有 magpie 自己的页面 cookie（`magpie_web_3430`）、
@@ -105,6 +106,8 @@ magpie 的管理页面是按「自己占着域名根」写的，挂到子路径�
 1. `magpie-init`（同镜像、`user: 0:0`、同 `/config` 卷）在网关启动前跑一次：
    - 网关密钥：`magpie gateway-key add lingshu-backend`，从输出里抓 `sk-magpie-key-…` 写 `/secret/admin_key`；
    - 管理台口令：`openssl rand -hex 16` 写 `/secret/admin_web_key`（32 字符，只含 `0-9a-f`）；
+     手填（`.env` 的 `MAGPIE_WEB_KEY`）优先，但**不足 16 位会被追加随机 hex 补齐**并打警告——
+     magpie 对长度有硬要求，短口令让它根本起不来；
    - 两个文件都 `chown 65532` + `chmod 600`（magpie 以 uid 65532 运行）。
 2. `magpie` 的启动脚本在 `exec` 之前把 `/secret/admin_web_key` 读进 `MAGPIE_WEB_KEY`
    （magpie 只认环境变量，没有「从文件读口令」的开关），所以**重启不会换口令**。
@@ -175,12 +178,17 @@ docker compose logs magpie-init          # 期望：已创建网关密钥 lingsh
 
 ```
 MAGPIE_ADMIN_KEY=<你填的那把>
-MAGPIE_WEB_KEY=<你自己定的管理台口令>      # 可只填这一项，另一项继续自动
+MAGPIE_WEB_KEY=<你自己定的管理台口令>      # 可只填这一项，另一项继续自动；**至少 16 个字符**
 ```
 
 `docker compose up -d` 之后 `magpie-init` 以环境变量为准（不自动生成），backend / magpie / web
-都用同一把。注意 `MAGPIE_WEB_KEY` 只接受字母数字与 `- . _ ~`（magpie 的规则；其它字符
-nginx 会拒绝注入并在 `docker compose logs web` 里报警，此时管理台需手工粘口令）。
+都用同一把。注意两条 magpie 的硬规则：
+
+- **长度 ≥16 字符**（真机实测 13 位直接起不来）。手填不足 16 位时 `magpie-init` 会追加随机 hex
+  补齐并打警告，补齐后的值只存在 `/secret/admin_web_key` 里 —— 别按 `.env` 里的原值手输，
+  要用 `docker compose exec -u 0 web cat /run/magpie-secret/admin_web_key` 取。
+- 只接受字母数字与 `- . _ ~`（其它字符 nginx 会拒绝注入并在 `docker compose logs web` 里报警，
+  此时管理台需手工粘口令）。
 
 ---
 
@@ -195,8 +203,9 @@ nginx 会拒绝注入并在 `docker compose logs web` 里报警，此时管理�
 升级不需要新增或修改任何环境变量；`magpie_secret` 与 `magpie_config` 两个卷保留即可，
 两把密钥升级后继续有效。若新版本改了口令/密钥格式导致 401，按 §5.1 / §5.2 重建。
 
-> magpie 官方 tag：`latest`（最新）/ `stable`（一周一版、先放三天）/ `daily` / 具体版本号（如 `0.1.1150`）。
-> 生产建议钉具体版本或 `stable`，避免 `latest` 一天多变。国内网络拉不到 ghcr 时用
+> magpie 官方 tag：具体版本号（如 `0.1.4458`，**不带 `v` 前缀** —— 写成 `v0.1.4458` 会拉不到镜像）、
+> `latest`（最新）/ `stable`（一周一版、先放三天）/ `daily`。compose 默认已钉 `0.1.4458`；
+> 想跟新就用 `stable`，别用 `latest`（一天多变）。国内网络拉不到 ghcr 时用
 > `MAGPIE_IMAGE=<你的镜像源>/yetone/magpie:<tag>` 覆盖。
 
 灵枢侧不需要跟着改：`MAGPIE_BASE_URL` 默认值就是 `http://magpie:3425`，容器名不变就永远对得上。
@@ -212,6 +221,7 @@ nginx 会拒绝注入并在 `docker compose logs web` 里报警，此时管理�
 | 管理台页面能开，但点任何东西都报错/一片 401 | `sub_filter` 没生效：多半是 nginx 之外又加了一层 gzip/压缩代理，或者 magpie 改了 JS 里的路径写法 → 跑 `bash frontend/scripts/magpie-ui-proxy-selftest.sh` 定位 |
 | 管理台写操作全部 403（页面能看不能改） | `Host` 没原样转发（magpie 用 `Origin` vs `Host` 挡跨站写）：确认 `proxy_set_header Host $http_host` |
 | 点按钮提示「代理侧还没接入」 | 后端 `MAGPIE_BASE_URL` 为空（`/v1` 也是 410）。`docker compose config` 里确认它渲染成 `http://magpie:3425` |
+| `magpie` 起不来、日志说页面口令太短 | `MAGPIE_WEB_KEY` 不足 16 字符（magpie 硬要求）。清空 `.env` 里这一项后 `docker compose up -d`，让 `magpie-init` 重新生成（或直接写 ≥16 位）；日志里出现「已自动补齐」就说明用的是补齐后的值 |
 | `magpie-init` 日志「自动创建网关密钥失败」 | 该版本 CLI 输出变了或名字重复。先删同名 key 重跑 `up -d`，或在管理台建 key 后写 `MAGPIE_ADMIN_KEY` |
 | 转发返回 `403 magpie_key_missing` | 该租户令牌还没绑 magpie 网关密钥（§2.4 之二） |
 | 转发返回 401 / 上游报错 | 管理台里没加 provider，或 provider 凭据失效 |
