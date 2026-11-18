@@ -29,11 +29,11 @@ const router = createRouter({
         },
         // ===== V2 运营台（阶段三）=====
         // 与阶段二后端接口一一对应；接口未上线时页面自行出空态（不弹红条、不显示 0）。
-        { path: 'topology', name: 'admin-topology', component: () => import('@/views/admin/v2/Topology.vue'), meta: { title: '内部模型' } },
+        { path: 'topology', name: 'admin-topology', component: () => import('@/views/admin/v2/Topology.vue'), meta: { title: '拓扑' } },
         { path: 'subscriptions', name: 'admin-subscriptions', component: () => import('@/views/admin/v2/Subscriptions.vue'), meta: { title: '订阅' } },
         { path: 'ledger', name: 'admin-ledger', component: () => import('@/views/admin/v2/Ledger.vue'), meta: { title: '账本' } },
         { path: 'reconcile', name: 'admin-reconcile', component: () => import('@/views/admin/v2/Reconcile.vue'), meta: { title: '对账' } },
-        { path: 'pnl', name: 'admin-pnl', component: () => import('@/views/admin/v2/Pnl.vue'), meta: { title: '盈亏' } },
+        { path: 'pnl', redirect: '/admin/reconcile' },
         // 渠道族（渠道 / 渠道协议 / 渠道密钥 / 渠道模型）与标签、服务状态页在 V2 整体下线：
         // 后端接口 410、表已删（0024），页面文件已删除。这里只保留 **1 行老书签兜底**，
         // 让历史链接落到「上游拓扑」而不是撞登录页（无页面、无接口调用）。
