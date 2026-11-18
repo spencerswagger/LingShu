@@ -166,6 +166,18 @@ docker compose logs magpie-init          # 期望：已创建网关密钥 lingsh
 
 第 ② 步不能省：文件还在时 init 按设计直接复用旧值，不会去碰 magpie 里的 key。
 
+
+### 5.5 网关密钥对不上（灵枢同步报 401 not an enabled magpie gateway key）
+
+`magpie-init` 现在**等 magpie healthy 之后**才校验：用这把密钥真实请求一次 `/v1/models`。
+- 通了 → 复用，正常启动；
+- 401/404 → 自动删除同名旧 key、用卷里的值重建一把，再验一次；仍不行就让 magpie
+  自己签发一把并回写卷。修好后 backend 才会启动，所以不会再出现「卷里有密钥但 magpie 不认」。
+
+常见根因：magpie 首次启动迁移/导入旧配置，把先前生成的 caller key 顶掉了。若自动重建
+仍失败（`docker compose logs magpie-init` 有「仍然 401」），按 §5.2 手工建 key 并写
+`MAGPIE_ADMIN_KEY` 后 `up -d`。
+
 ### 5.3 管理台票据密钥（`keys/magpie_jump.key`）
 
 `docker compose exec -u 0 backend rm keys/magpie_jump.key && docker compose restart backend`

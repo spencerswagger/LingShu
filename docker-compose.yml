@@ -42,111 +42,121 @@ services:
       retries: 10
     restart: unless-stopped
 
-  # 代理侧管理密钥自举（一次性任务，跑完即退出）。
-  #
-  # 为什么需要它：magpie 的网关密钥必须由 magpie 自己签发（值是 sk-magpie-key-…，
-  # 由它的 /config 里的密钥库维护），我们无法凭空造一把双方都认的值。所以首次 up 时
-  # 用同一个镜像、同一个 /config 卷，在网关启动之前建一把名为 ${MAGPIE_ADMIN_KEY_NAME:-lingshu-backend}
-  # 的网关密钥，把值写进共享卷 magpie_secret；backend 启动时从该文件读取。
-  # 之后每次 up 发现文件已存在就直接复用 —— 两边永远是同一把，无需人工填任何变量。
-  magpie-init:
-    # 镜像 tag 是**不带 v 前缀**的版本号（正确：0.1.4458；`v0.1.4458` 不存在，拉了会 404）。
-    # 另有 latest / stable / daily 三个浮动 tag；这里钉具体版本，升级时改这两处（或写 MAGPIE_IMAGE）。
+  # 页面口令预置（一次性任务，magpie 启动前跑）：保证 magpie 起来时 /secret/admin_web_key
+  # 已存在且 >=16 位，避免每次重启 magpie 自己随机换一个页面口令。只做文件与权限，不碰 CLI。
+  magpie-secret-init:
     image: ${MAGPIE_IMAGE:-ghcr.io/yetone/magpie:0.1.4458}
-    user: "0:0" # 需要 chown 卷（magpie 以 uid 65532 运行）
+    user: "0:0"
     restart: "no"
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |
         set -u
+        WEB=/secret/admin_web_key
+        mkdir -p /secret /config; chmod 700 /secret || true
+        gen() { if command -v openssl >/dev/null 2>&1; then openssl rand -hex 16
+                else head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n'; fi; }
+        if [ -n "$${MAGPIE_WEB_KEY:-}" ]; then printf '%s' "$$MAGPIE_WEB_KEY" > "$$WEB"
+        elif [ ! -s "$$WEB" ]; then gen > "$$WEB"; fi
+        cur=$$(cat "$$WEB"); if [ "$${#cur}" -lt 16 ]; then printf '%s%s' "$$cur" "$$(gen)" > "$$WEB"; fi
+        chown -R 65532:65532 /config 2>/dev/null || true
+        chown 65532:65532 "$$WEB" 2>/dev/null || true; chmod 600 "$$WEB" 2>/dev/null || true
+        echo "[magpie-secret-init] 页面口令就绪"
+    environment:
+      MAGPIE_WEB_KEY: ${MAGPIE_WEB_KEY:-}
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      - magpie_config:/config
+      - magpie_secret:/secret
+
+  # 代理侧管理密钥自举 + 自愈。
+  #
+  # 为什么必须「等 magpie 起来之后再校验」：magpie 首次启动会迁移/导入旧配置
+  # （settings.json + caller-keys.json），这个过程可能把先前生成的网关密钥顶掉，
+  # 表现为灵枢同步时报 401「key ... is not an enabled magpie gateway key」。
+  # 所以这一步不是「启动前建一把就走」，而是「magpie healthy 之后，用真实请求
+  # 验一次 /v1/models：通了就复用；401/404 就重建一把并回写共享卷」。
+  # backend 等这一步成功后才启动，因此它读到的密钥一定是当前 magpie 认的。
+  magpie-init:
+    image: ${MAGPIE_IMAGE:-ghcr.io/yetone/magpie:0.1.4458}
+    user: "0:0"
+    restart: "no"
+    depends_on:
+      magpie:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -u
+        NAME="$${MAGPIE_ADMIN_KEY_NAME:-lingshu-backend}"
+        ADDR="$${MAGPIE_ADDR:-http://magpie:3425}"
         KEY_FILE=/secret/admin_key
         WEB_KEY_FILE=/secret/admin_web_key
-        NAME="$${MAGPIE_ADMIN_KEY_NAME:-lingshu-backend}"
         fix_owner() {
           chown -R 65532:65532 /config 2>/dev/null || true
-          # 页面口令要能被 magpie（uid 65532）和 web/nginx（root）读；/secret 目录本身保持 700
-          chown 65532:65532 /secret/admin_key /secret/admin_web_key 2>/dev/null || true
-          chmod 600 /secret/admin_key /secret/admin_web_key 2>/dev/null || true
+          chown 65532:65532 "$$KEY_FILE" "$$WEB_KEY_FILE" 2>/dev/null || true
+          chmod 600 "$$KEY_FILE" "$$WEB_KEY_FILE" 2>/dev/null || true
         }
-
-        mkdir -p /secret /config
-        chmod 700 /secret || true
-
-        # 0) 页面口令（管理面 /magpie/ 入口由 nginx 代填，必须两边一致）—— 与网关密钥分开管：
-        #    手填优先，其次复用卷里的，最后首次随机生成（32 位 hex，magpie 只接受字母数字与 - . _ ~）
-        #
-        #    长度是硬要求：magpie 要求 MAGPIE_WEB_KEY **至少 16 个字符**，短了它会直接拒绝启动
-        #    （真机实测 13 位起不来）。所以手填值不足 16 位时在这里补齐（追加随机 hex）并告警——
-        #    补齐后的值只存在卷里，magpie 与 nginx 都读这一份，口令本身不以 URL 形式进浏览器。
         gen_hex() {
-          if command -v openssl >/dev/null 2>&1; then
-            openssl rand -hex 16
-          else
-            head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n'
-          fi
+          if command -v openssl >/dev/null 2>&1; then openssl rand -hex 16
+          else head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n'; fi
         }
-        pad_web_key() { # 参数：原始口令。不足 16 位就追加随机 hex（只往长里补，不改已有字符）
-          wk="$$1"
-          if [ "$${#wk}" -ge 16 ]; then
-            printf '%s' "$$wk"
-            return 0
-          fi
-          echo "[magpie-init] 警告：管理面口令只有 $${#wk} 个字符，magpie 要求至少 16，已自动补齐（以卷里 /secret/admin_web_key 为准，请勿按原值手输）" >&2
-          printf '%s%s' "$$wk" "$$(gen_hex)"
-        }
+        mkdir -p /secret /config; chmod 700 /secret || true
 
+        # 页面口令：手填优先，其次卷里，最后生成；<16 位补齐（magpie 硬要求）
         if [ -n "$${MAGPIE_WEB_KEY:-}" ]; then
-          pad_web_key "$$MAGPIE_WEB_KEY" > "$$WEB_KEY_FILE"
-          echo "[magpie-init] 使用环境变量 MAGPIE_WEB_KEY 作为管理面口令"
-        elif [ -s "$$WEB_KEY_FILE" ]; then
-          # 老部署可能留着不足 16 位的口令（magpie 会起不来）→ 就地补齐后覆写
-          cur=$$(cat "$$WEB_KEY_FILE")
-          if [ "$${#cur}" -lt 16 ]; then
-            pad_web_key "$$cur" > "$$WEB_KEY_FILE"
-          fi
-          echo "[magpie-init] 复用已有管理面口令：$$WEB_KEY_FILE"
-        else
+          printf '%s' "$$MAGPIE_WEB_KEY" > "$$WEB_KEY_FILE"
+        elif [ ! -s "$$WEB_KEY_FILE" ]; then
           gen_hex > "$$WEB_KEY_FILE"
-          echo "[magpie-init] 已生成管理面口令并写入 $$WEB_KEY_FILE"
+        fi
+        cur=$$(cat "$$WEB_KEY_FILE")
+        if [ "$${#cur}" -lt 16 ]; then printf '%s%s' "$$cur" "$$(gen_hex)" > "$$WEB_KEY_FILE"; fi
+
+        # 期望的网关密钥：环境变量 > 卷里已有的 > 新生成（不依赖 magpie CLI 的格式）
+        if [ -n "$${MAGPIE_ADMIN_KEY:-}" ]; then K="$$MAGPIE_ADMIN_KEY"
+        elif [ -s "$$KEY_FILE" ]; then K="$$(cat "$$KEY_FILE")"
+        else K="$$(gen_hex)"; fi
+
+        probe() { curl -fsS -o /dev/null -H "Authorization: Bearer $$1" "$$ADDR/v1/models" 2>/dev/null; }
+
+        # 让 magpie 就绪（healthcheck 已经等过，这里再兜一层）
+        for i in $$(seq 1 20); do
+          curl -fsS -o /dev/null "$$ADDR/healthz" 2>/dev/null && break
+          curl -fsS -o /dev/null "$$ADDR/v1/models" 2>/dev/null && break
+          sleep 1
+        done
+
+        if probe "$$K"; then
+          printf '%s' "$$K" > "$$KEY_FILE"; fix_owner
+          echo "[magpie-init] 密钥有效，复用：$$KEY_FILE"; exit 0
         fi
 
-        # 1) 显式给了 MAGPIE_ADMIN_KEY（手工在管理面建好不可恢复的 key）→ 以环境变量为准
-        if [ -n "$${MAGPIE_ADMIN_KEY:-}" ]; then
-          printf '%s' "$$MAGPIE_ADMIN_KEY" > "$$KEY_FILE"
-          chmod 600 "$$KEY_FILE" || true
-          fix_owner
-          echo "[magpie-init] 使用环境变量 MAGPIE_ADMIN_KEY（不自动生成）"
-          exit 0
+        echo "[magpie-init] 现有密钥未被 magpie 接受，开始重建网关密钥 $$NAME …" >&2
+        # 删掉同名旧 key（存在则删），再用我们自己的值新建；都基于运行中的实例
+        id=$$(magpie gateway-key list 2>/dev/null | awk -v n="$$NAME" 'index($$0,n){print $$1; exit}')
+        [ -n "$$id" ] && magpie gateway-key remove "$$id" >/dev/null 2>&1 || true
+        out=$$(printf '%s' "$$K" | magpie gateway-key add "$$NAME" --key - 2>&1) || true
+        if ! probe "$$K"; then
+          # 退一步：让 magpie 自己生成一把，抓出它的值
+          out=$$(magpie gateway-key add "$$NAME" 2>&1) || true
+          k2=$$(printf '%s\n' "$$out" | grep -o 'sk-magpie-key-[A-Za-z0-9._-]*' | head -n 1 || true)
+          if [ -n "$$k2" ]; then K="$$k2"; fi
         fi
-
-        # 2) 已经生成过 → 复用（卷还在就永不重生成，两个容器的值因此始终一致）
-        if [ -s "$$KEY_FILE" ]; then
-          fix_owner
-          echo "[magpie-init] 复用已有管理密钥：$$KEY_FILE"
-          exit 0
+        if probe "$$K"; then
+          printf '%s' "$$K" > "$$KEY_FILE"; fix_owner
+          echo "[magpie-init] 已重建网关密钥 $$NAME 并回写 $$KEY_FILE"; exit 0
         fi
-
-        # 3) 首次：在 magpie 的配置里建一把网关密钥（Docker 模式下不需要开 sharing）
-        out=$$(magpie gateway-key add "$$NAME" 2>&1) || true
-        key=$$(printf '%s\n' "$$out" | grep -o 'sk-magpie-key-[A-Za-z0-9._-]*' | head -n 1 || true)
-        if [ -z "$$key" ]; then
-          fix_owner
-          echo "[magpie-init] 自动创建网关密钥失败，转发与拓扑/账本同步会拿不到凭据。" >&2
-          printf '%s\n' "$$out" >&2
-          echo "[magpie-init] 兜底（二选一）：" >&2
-          echo "  a) 稍后重跑：docker compose up -d" >&2
-          echo "  b) 打开 http://127.0.0.1:$${MAGPIE_UI_PORT:-3430}/ 建一把 key，" >&2
-          echo "     写进 .env 的 MAGPIE_ADMIN_KEY=<key> 后 docker compose up -d" >&2
-          exit 0
-        fi
-        printf '%s' "$$key" > "$$KEY_FILE"
-        chmod 600 "$$KEY_FILE" || true
         fix_owner
-        echo "[magpie-init] 已创建网关密钥 $$NAME 并写入 $$KEY_FILE"
+        echo "[magpie-init] 仍然 401：magpie 拒绝这把密钥。" >&2
+        printf '%s\n' "$$out" >&2
+        echo "[magpie-init] 处置：打开 http://127.0.0.1:$${MAGPIE_UI_PORT:-3430}/ 建一把 key，" >&2
+        echo "  写进 .env 的 MAGPIE_ADMIN_KEY=<key>，再 docker compose up -d。" >&2
+        exit 1
     environment:
       MAGPIE_ADMIN_KEY: ${MAGPIE_ADMIN_KEY:-}
       MAGPIE_ADMIN_KEY_NAME: ${MAGPIE_ADMIN_KEY_NAME:-lingshu-backend}
       MAGPIE_WEB_KEY: ${MAGPIE_WEB_KEY:-}
+      MAGPIE_ADDR: http://magpie:3425
       MAGPIE_UI_PORT: ${MAGPIE_UI_PORT:-3430}
       TZ: ${TZ:-Asia/Shanghai}
     volumes:
@@ -157,7 +167,7 @@ services:
   magpie:
     image: ${MAGPIE_IMAGE:-ghcr.io/yetone/magpie:0.1.4458} # 同上：tag 无 v 前缀
     # web 子命令 = 网关 + 浏览器管理面；管理面同时应答 /v1 路由。
-    # 页面口令由 magpie-init 落在 magpie_secret 卷里，这里在进程启动前读进环境变量
+    # 页面口令由 magpie-secret-init 落在 magpie_secret 卷里，这里在进程启动前读进环境变量
     # （magpie 只认环境变量，没有「从文件读口令」的开关），这样重启不会换口令，
     # nginx 那边注入的也永远是同一把。
     #
@@ -208,7 +218,7 @@ services:
       retries: 10
       start_period: 20s
     depends_on:
-      magpie-init:
+      magpie-secret-init:
         condition: service_completed_successfully
     restart: unless-stopped
 
@@ -246,10 +256,9 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      # 只等「启动」不等「健康」：magpie 起不来时后端仍要能提供管理面，
-      # 转发接口会返回 503，拓扑同步会在 10 分钟后再试（也可手动触发）。
-      magpie:
-        condition: service_started
+      # 等密钥自举成功再起：保证后端启动时读到的代理侧密钥一定是当前 magpie 认的。
+      magpie-init:
+        condition: service_completed_successfully
     restart: unless-stopped
 
   web:
