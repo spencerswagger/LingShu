@@ -49,7 +49,8 @@ echo "[magpie-init] 现有密钥未被 magpie 接受，开始重建网关密钥 
 # 删掉同名旧 key（存在则删），再用我们自己的值新建；都基于运行中的实例
 id=$(magpie gateway-key list 2>/dev/null | awk -v n="$NAME" 'index($0,n){print $1; exit}')
 [ -n "$id" ] && magpie gateway-key remove "$id" >/dev/null 2>&1 || true
-out=$(printf '%s' "$K" | magpie gateway-key add "$NAME" --key - 2>&1) || true
+usable=1; case "$K" in sk-magpie-*) usable=0;; esac; [ "${#K}" -lt 8 ] && usable=0
+if [ "$usable" = 1 ]; then out=$(printf '%s' "$K" | magpie gateway-key add "$NAME" --key - 2>&1) || true; fi
 if ! probe "$K"; then
   # 退一步：让 magpie 自己生成一把，抓出它的值
   out=$(magpie gateway-key add "$NAME" 2>&1) || true
