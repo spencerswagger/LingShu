@@ -148,6 +148,36 @@ func shouldDropResponseHeader(name, value string) bool {
 	return false
 }
 
+// connectionNamedHeaders 解析 `Connection` 头**点名的字段**（RFC 7230 §6.1）。
+//
+// 为什么不能只靠固定黑名单：`Connection` 是「逐跳声明」，它点名的每一个字段都只对**本跳**有意义，
+// 代理不许转发。名字可以是任意扩展头（`Connection: x-trace-id` / `Connection: x-foo, x-bar`），
+// 固定表（connection/keep-alive/te/trailer/transfer-encoding/upgrade）挡不住这些自定义点名。
+// 只按固定表剥 → 上游把内部链路字段挂在 `Connection: x-internal-*` 上就能漏到下游。
+//
+// 口径细节：
+//   - 多值头、逗号分隔、大小写混用都要处理（`Header.Values` 拿全部值，逐个 split(',')）；
+//   - 返回值是**小写头名集合**，调用方按小写比对；
+//   - `close` / `keep-alive` 这类是**连接选项**不是字段名，收进来也无害（没有同名头会被误删）；
+//   - ⚠️ `content-length` **即使被点名也不剥**（见 withoutLengthExemption 的说明）：
+//     响应体未被改写时长度仍然成立，剥掉只会让 Go 退化成 chunked，下游得自己重算。
+func connectionNamedHeaders(h http.Header) map[string]bool {
+	var out map[string]bool
+	for _, value := range h.Values("Connection") {
+		for _, part := range strings.Split(value, ",") {
+			name := strings.ToLower(strings.TrimSpace(part))
+			if name == "" || name == "content-length" {
+				continue // content-length 永不由 Connection 剥（见函数头注释）
+			}
+			if out == nil {
+				out = make(map[string]bool, 4)
+			}
+			out[name] = true
+		}
+	}
+	return out
+}
+
 // copyRequestHeaders 把入站 header 原样带到出站请求上，只做三类处理：
 //  1. 命中强制丢弃表的头一律不带（凭据头由 credHeaderValue 重新注入）；
 //  2. Content-Type 按下游原值重设（body 没变，不换类型）；
@@ -155,8 +185,10 @@ func shouldDropResponseHeader(name, value string) bool {
 //
 // 其余头（anthropic-version / anthropic-beta / openai-beta / user-agent / accept 等）逐值透传。
 func copyRequestHeaders(dst, src http.Header) {
+	// 客户端点名的逐跳字段：`Connection: x-foo` 时 x-foo 不许带到上游（自定义扩展头同样适用）。
+	named := connectionNamedHeaders(src)
 	for name, values := range src {
-		if IsForcedBlacklist(name) {
+		if IsForcedBlacklist(name) || named[strings.ToLower(name)] {
 			continue
 		}
 		for _, v := range values {
@@ -172,19 +204,46 @@ func copyRequestHeaders(dst, src http.Header) {
 }
 
 // copyResponseHeaders 透传上游响应头，按口径②剔除，再叠加原有 hop-by-hop 丢弃：
+//
 //   - 灵枢/代理内部标识（`x-magpie-*` 前缀）；
+//
 //   - 上游实现暴露（`server` / `x-powered-by`）；
+//
 //   - 头名或任一取值含供应商名/身份类特征词的头（`X-Vendor-Trace` / `x-provider: openai` 等）；
+//
 //   - `x-request-id` 只保留灵枢自己的：全局中间件（server.WithRequestID）已在最外层把
 //     链路 ID 写入响应头，这里丢掉上游同名头（再 Add 会并成第二值，下游拿到两个 ID）。
 //     中间件未挂载时（如单测裸 mux）不动，上游的原样透传，不算误删。
 //
-// 其余头逐值透传。Content-Length 保留（本链路不改写响应体，长度仍然成立）；上游未给则由
-// Go 传输层决定（SSE 走 chunked，长度本来就未知）。
+//   - `Connection` 头**点名的字段**同样丢（逐跳转发语义，见 connectionNamedHeaders）。
+//
+// 其余头逐值透传。两个头的处置是刻意分开写的，改动前先读这两段：
+//
+//   - `Content-Length`：**保留**，不参与任何剔除（包括 Connection 点名、身份类特征词判定）。
+//     依据：本链路在不遮蔽/不解压时**不改写响应体**，上游给的字节数仍然成立；剥掉只会让 Go
+//     退化成 chunked，下游流式库要重算长度、HTTP/1.0 客户端甚至拿不到长度。
+//     真正需要改长度的场合由转发层显式处理（见下一条与 proxy.go 的遮蔽分支）。
+//   - `Content-Encoding`（**强制 gzip 时**）：不属于「透传决策」，由转发层按实际字节决定。
+//     判据是**头与体自洽**，不是「头该不该透传」——体是什么，头就必须说什么。三态：
+//     ① 解压成功（上游无视 `Accept-Encoding: identity` 仍压缩）→ **剥编码头**（body 已是明文，
+//     留着等于让下游再解一次 → `gzip: invalid header`），`Content-Length` 一并剥（压缩前长度
+//     对解压后的字节不成立，交 Go 重算/chunked）；
+//     ② 解码器在**读头部时**就拒绝（`gzip.NewReader` 只看魔数，失败即证明这些字节不是该编码，
+//     典型是中间层硬加 `Content-Encoding: gzip` 而体已被它解压）→ **剥编码头**、原字节转发、
+//     `Content-Length` 保留（转发的是上游原字节，长度成立）；
+//     ③ 解不开也**不该解**（br 等 stdlib 不支持的编码）或**头合法但解到中途失败**（截断）→
+//     **保留编码头**，原字节透传 + 记 `UnmaskableEncoding` 告警（剥头会让下游把压缩字节当明文，
+//     比「下游解压报错」更糟）。
+//     处置点全在 proxy.go（decoded / stripEncoding / UnmaskableEncoding 三条分支），
+//     本函数不碰这两个头。
 func copyResponseHeaders(dst, src http.Header) {
+	named := connectionNamedHeaders(src)
 	for name, values := range src {
 		if strings.EqualFold(name, "x-request-id") && dst.Get("X-Request-Id") != "" {
 			continue
+		}
+		if named[strings.ToLower(name)] {
+			continue // Connection 点名的逐跳字段
 		}
 		if shouldDropResponseHeader(name, "") {
 			continue

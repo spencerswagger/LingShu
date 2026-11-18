@@ -8,14 +8,14 @@ import (
 	"github.com/DATA-DOG/go-sqlmock"
 )
 
-// groupedRows 构造归并查询的返回行：recordCols（25 列）+ rid + cnt。
+// groupedRows 构造归并查询的返回行：recordCols（26 列，含 0025 两列）+ rid + cnt。
 func groupedRows(t *testing.T, rid string, cnt int) *sqlmock.Rows {
 	t.Helper()
 	cols := append(append([]string{}, recordColsForTest...), "rid", "cnt")
 	return sqlmock.NewRows(cols).AddRow(
-		int64(9), "bill-main", int64(7), "sale", nil, "ext-model", nil, "int-model", int64(1), nil, "",
+		int64(9), "bill-main", int64(7), "sale", nil, "ext-model", nil, "int-model", nil, "",
 		time.Now(), `{}`, `{}`, []byte(`{"time":1,"context":1}`), int64(10000),
-		nil, nil, nil, nil, nil, "completed", nil, nil, nil,
+		nil, nil, nil, nil, nil, "completed", nil, nil, nil, nil, nil,
 		rid, int64(cnt),
 	)
 }
@@ -43,6 +43,7 @@ func TestListRecords_GroupByRequestMergesAttempts(t *testing.T) {
 	mock.ExpectQuery(`WITH grp AS \(\s*SELECT \(br.user_id::text \|\| ':' \|\| COALESCE\(NULLIF\(cl.request_id, ''\), br.billing_id\)\) AS g,.*array_agg\(br.billing_id ORDER BY \(br.status = 'completed'\) DESC, br.id DESC\)\)\[1\] AS main_bid,.*count\(\*\)::int AS cnt.*SELECT .*grp.rid, grp.cnt.*ORDER BY billing_records.id DESC LIMIT \$10 OFFSET \$11`).
 		WithArgs(nil, nil, nil, "", "", "", "", nil, nil, 20, 0).
 		WillReturnRows(groupedRows(t, "req-1", 2))
+	expectChannelKeyFill(mock, "bill-main", int64(2))
 
 	list, total, err := store.ListRecords(context.Background(), f)
 	if err != nil {
@@ -83,6 +84,7 @@ func TestListRecords_FilterByRequestID(t *testing.T) {
 	mock.ExpectQuery(`SELECT .* FROM billing_records .*clr.request_id = \$10.*ORDER BY id DESC LIMIT \$11 OFFSET \$12`).
 		WithArgs(nil, nil, nil, "", "", "", "", nil, nil, "req-xyz", 10, 0).
 		WillReturnRows(completedRow(t))
+	expectChannelKeyFill(mock, billingID, int64(5))
 
 	list, total, err := store.ListRecords(context.Background(), f)
 	if err != nil {
@@ -131,18 +133,26 @@ func TestRecordWhere_RequestIDQualified(t *testing.T) {
 	if len(args) != 10 {
 		t.Fatalf("args=%d, want 10", len(args))
 	}
-	for _, frag := range []string{"br.user_id = $1", "br.channel_key_id = $2", "br.status = $7", "clr.request_id = $10"} {
+	for _, frag := range []string{"br.user_id = $1", "clk.billing_id = br.billing_id", "clk.billing_id = br.billing_id) = $2", "br.status = $7", "clr.request_id = $10"} {
 		if !containsAll(where, frag) {
 			t.Fatalf("where missing %q: %s", frag, where)
 		}
 	}
-	// 未指定 request_id 时保持历史口径（9 个参数、无 EXISTS）。
+	// 未指定 request_id 时保持历史参数位（9 个），且密钥维度的 EXISTS 仍然限定到外层表名
+	// （无别名时必须是 billing_records.billing_id，写成裸 billing_id 会退化成恒真）。
 	where2, args2 := recordWhereOn("", RecordFilter{})
 	if len(args2) != 9 {
 		t.Fatalf("args=%d, want 9", len(args2))
 	}
-	if containsAll(where2, "EXISTS") {
-		t.Fatalf("no request id should not add EXISTS: %s", where2)
+	if !containsAll(where2, "clk.billing_id = billing_records.billing_id") {
+		t.Fatalf("无别名时密钥维度必须限定到外层表（写成裸 billing_id 会恒真）: %s", where2)
+	}
+	// 0024 之后 billing_records 已无 channel_key_id：WHERE 里不许再出现它（否则 42703）。
+	if containsAll(where2, "billing_records.channel_key_id") {
+		t.Fatalf("WHERE 里不许再引用 billing_records.channel_key_id（列已删除）: %s", where2)
+	}
+	if containsAll(where2, "clr.request_id") {
+		t.Fatalf("no request id should not add the request_id EXISTS: %s", where2)
 	}
 }
 

@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"errors"
+	"io"
+	"log/slog"
 	"math"
 	"path/filepath"
 	"regexp"
@@ -12,6 +14,8 @@ import (
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/jackc/pgx/v5/pgconn"
+
 	"github.com/team/llmgateway/internal/pkg/dbx"
 )
 
@@ -100,22 +104,36 @@ const (
 // recordColsForTest 与 recordCols 一致，仅供构造 mock 行。
 var recordColsForTest = []string{
 	"id", "billing_id", "user_id", "pricing_mode", "token_id", "external_model_name",
-	"auto_model_name", "internal_model_id", "channel_key_id", "session_id", "session_name", "call_time", "tokens", "rates",
+	"auto_model_name", "internal_model_id", "session_id", "session_name", "call_time", "tokens", "rates",
 	"coefficients", "r_value", "raw_total", "credits_consumed", "cost_credits",
 	"balance_before", "balance_after", "status", "error_message", "duration_ms",
-	"first_token_ms",
+	"first_token_ms", "upstream_status", "upstream_error_summary",
 }
 
 func completedRow(t *testing.T) *sqlmock.Rows {
 	t.Helper()
 	return sqlmock.NewRows(recordColsForTest).AddRow(
-		int64(5), billingID, int64(7), "sale", nil, "ext-model", nil, "int-model", int64(1), nil, "",
+		int64(5), billingID, int64(7), "sale", nil, "ext-model", nil, "int-model", nil, "",
 		time.Now(), `{}`, `{}`, []byte(`{"time":1,"context":1}`), int64(10000),
-		nil, nil, nil, nil, nil, "completed", nil, nil, nil,
+		nil, nil, nil, nil, nil, "completed", nil, nil, nil, nil, nil,
 	)
 }
 
-func newTestService(db *sql.DB, credit *fakeCredit, cfg ConfigProvider, now time.Time) *Service {
+// expectChannelKeyFill 期望一次「渠道密钥维度回填」查询（billing_records 已无该列，
+// 维度来自 call_logs 的 1:1 快照）。pairs 依次为 billingID、channelKeyID。
+func expectChannelKeyFill(mock sqlmock.Sqlmock, pairs ...any) {
+	args := make([]driver.Value, 0, len(pairs)/2)
+	rows := sqlmock.NewRows([]string{"billing_id", "channel_key_id"})
+	for i := 0; i+1 < len(pairs); i += 2 {
+		args = append(args, pairs[i])
+		rows.AddRow(pairs[i], pairs[i+1])
+	}
+	mock.ExpectQuery(`SELECT cl\.billing_id, cl\.channel_key_id`).
+		WithArgs(args...).
+		WillReturnRows(rows)
+}
+
+func newTestService(db *sql.DB, credit CreditService, cfg ConfigProvider, now time.Time) *Service {
 	return &Service{
 		store:  NewSqlStore(db),
 		cfg:    cfg,
@@ -125,7 +143,7 @@ func newTestService(db *sql.DB, credit *fakeCredit, cfg ConfigProvider, now time
 }
 
 // newTxTestService 装配事务路径的 Service（txdb 注入 *sql.DB）。
-func newTxTestService(db *sql.DB, credit *fakeCredit, cfg ConfigProvider, now time.Time) *Service {
+func newTxTestService(db *sql.DB, credit CreditService, cfg ConfigProvider, now time.Time) *Service {
 	svc := newTestService(db, credit, cfg, now)
 	svc.SetTxBeginner(db)
 	return svc
@@ -184,7 +202,7 @@ func TestRecord_Success(t *testing.T) {
 	// Insert completed（断言关键字段）。
 	mock.ExpectQuery(insertBill.String()).WithArgs(
 		sqlmock.AnyArg(), // id
-		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model", int64(1),
+		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model",
 		sqlmock.AnyArg(),                 // session_id
 		sqlmock.AnyArg(),                 // session_name
 		sqlmock.AnyArg(),                 // call_time
@@ -201,7 +219,9 @@ func TestRecord_Success(t *testing.T) {
 		sqlmock.AnyArg(),                 // error_message
 		sqlmock.AnyArg(),                 // duration_ms
 		sqlmock.AnyArg(),                 // first_token_ms
-	).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(1), time.Now()))
+
+		// ===== V2 归因六列（未传值）：request_id/upstream_* 落 NULL，cost_source 归一 none =====
+		nil, nil, nil, nil, nil, nil, CostSourceNone, nil, nil).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(1), time.Now()))
 
 	credit := &fakeCredit{before: before, after: after}
 	now := time.Date(2026, 1, 2, 12, 0, 0, 0, shLocForTest(t))
@@ -256,13 +276,15 @@ func TestRecord_ConsumeError_RecordsFailed(t *testing.T) {
 	// 失败 → Insert failed；内部错误细节只进日志，落库统一为中文业务文案。
 	mock.ExpectQuery(insertBill.String()).WithArgs(
 		sqlmock.AnyArg(), // id
-		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model", int64(1),
+		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model",
 		sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), []byte(`{"time":1,"context":1}`),
 		int64(10000), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(),
 		sqlmock.AnyArg(), sqlmock.AnyArg(),
 		"failed", "计费结算失败",
 		sqlmock.AnyArg(), sqlmock.AnyArg(),
-	).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(2), time.Now()))
+
+		// ===== V2 归因六列（未传值）：request_id/upstream_* 落 NULL，cost_source 归一 none =====
+		nil, nil, nil, nil, nil, nil, CostSourceNone, nil, nil).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(2), time.Now()))
 
 	credit := &fakeCredit{err: consumeErr}
 	svc := newTestService(db, credit, newFakeConfig(), time.Date(2026, 1, 2, 12, 0, 0, 0, shLocForTest(t)))
@@ -312,9 +334,9 @@ func TestRecord_FailedHistorical_NoDoubleConsume(t *testing.T) {
 	// 历史 failed 记录。
 	mock.ExpectQuery(selectByBillingID.String()).WithArgs(billingID).
 		WillReturnRows(sqlmock.NewRows(recordColsForTest).AddRow(
-			int64(9), billingID, testUserID, "sale", nil, "ext-model", nil, "int-model", int64(1), nil, "",
+			int64(9), billingID, testUserID, "sale", nil, "ext-model", nil, "int-model", nil, "",
 			time.Now(), `{}`, `{}`, []byte(`{"time":1,"context":1}`), int64(10000),
-			nil, nil, nil, nil, nil, "failed", "40201: 余额不足", nil, nil,
+			nil, nil, nil, nil, nil, "failed", "40201: 余额不足", nil, nil, nil, nil,
 		))
 
 	credit := &fakeCredit{}
@@ -358,12 +380,14 @@ func TestRecord_CostMode_RecordsCostCredits(t *testing.T) {
 	// cost 模式：cost_credits 记录成本积分。
 	mock.ExpectQuery(insertBill.String()).WithArgs(
 		sqlmock.AnyArg(), // id
-		billingID, testUserID, "cost", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model", int64(1),
+		billingID, testUserID, "cost", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model",
 		sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), []byte(`{"time":1,"context":1}`),
 		int64(10000), sqlmock.AnyArg(), credits, costCredits,
 		sqlmock.AnyArg(), sqlmock.AnyArg(), "completed", sqlmock.AnyArg(),
 		sqlmock.AnyArg(), sqlmock.AnyArg(),
-	).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(3), time.Now()))
+
+		// ===== V2 归因六列（未传值）：request_id/upstream_* 落 NULL，cost_source 归一 none =====
+		nil, nil, nil, nil, nil, nil, CostSourceNone, nil, nil).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(3), time.Now()))
 
 	credit := &fakeCredit{before: 10, after: 10 - credits}
 	svc := newTestService(db, credit, newFakeConfig(), time.Date(2026, 1, 2, 12, 0, 0, 0, shLocForTest(t)))
@@ -412,12 +436,14 @@ func TestRecord_SaleMode_CostCreditsDistinctFromCredits(t *testing.T) {
 	// sale 模式：credits_consumed 按售价扣，cost_credits 记录成本（与售价不同）。
 	mock.ExpectQuery(insertBill.String()).WithArgs(
 		sqlmock.AnyArg(), // id
-		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model", int64(1),
+		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model",
 		sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), []byte(`{"time":1,"context":1}`),
 		int64(10000), sqlmock.AnyArg(), credits, costCredits,
 		sqlmock.AnyArg(), sqlmock.AnyArg(), "completed", sqlmock.AnyArg(),
 		sqlmock.AnyArg(), sqlmock.AnyArg(),
-	).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(4), time.Now()))
+
+		// ===== V2 归因六列（未传值）：request_id/upstream_* 落 NULL，cost_source 归一 none =====
+		nil, nil, nil, nil, nil, nil, CostSourceNone, nil, nil).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(4), time.Now()))
 
 	credit := &fakeCredit{before: 10, after: 10 - credits}
 	svc := newTestService(db, credit, newFakeConfig(), time.Date(2026, 1, 2, 12, 0, 0, 0, shLocForTest(t)))
@@ -548,11 +574,13 @@ func TestSqlStore_Insert_MarshalError(t *testing.T) {
 
 // ---- 事务路径：扣款 + 积分流水 + 账单同事务 ----
 
-// txInsertArgs 组装 insertBill 的完整 25 参数匹配（事务路径用例复用；首参为应用层雪花 ID）。
+// txInsertArgs 组装 insertBill 的完整 33 参数匹配（0024 删了 channel_key_id；0025 末尾加
+// upstream_status / upstream_error_summary），首参为应用层雪花 ID。
+// 末 6 位是 V2 归因列（request_id / upstream_* / cost_source）：本用例经 RecordReq 不传 → 全 NULL/none。
 func txInsertArgs(credits, before, after float64, status string) []driver.Value {
 	return []driver.Value{
 		sqlmock.AnyArg(), // id（应用层雪花 ID）
-		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model", int64(1),
+		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model",
 		sqlmock.AnyArg(),                 // session_id
 		sqlmock.AnyArg(),                 // session_name
 		sqlmock.AnyArg(),                 // call_time
@@ -569,6 +597,17 @@ func txInsertArgs(credits, before, after float64, status string) []driver.Value 
 		sqlmock.AnyArg(),                 // error_message
 		sqlmock.AnyArg(),                 // duration_ms
 		sqlmock.AnyArg(),                 // first_token_ms
+		// ===== V2 归因七列：未传值 → request_id/upstream_*/ledger_entry_id 落 NULL，cost_source 归一为 none =====
+		nil,            // request_id
+		nil,            // upstream_provider
+		nil,            // upstream_account
+		nil,            // upstream_protocol
+		nil,            // upstream_model
+		nil,            // ledger_entry_id
+		CostSourceNone, // cost_source
+		// ===== 0025 新增：上游错误状态码 / 错误体摘要（本用例不传 → 全 NULL）=====
+		nil, // upstream_status
+		nil, // upstream_error_summary
 	}
 }
 
@@ -632,9 +671,8 @@ func TestRecord_TxPath_ConsumeError_RollsBackAndRecordsFailed(t *testing.T) {
 	mock.ExpectQuery(selectByBillingID.String()).WithArgs(billingID).WillReturnError(sql.ErrNoRows)
 	mock.ExpectBegin()
 	mock.ExpectRollback() // 扣款失败先回滚
-	mock.ExpectQuery(insertBill.String()).WithArgs(
-		txInsertArgs(0, 0, 0, "failed")...,
-	).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(2), time.Now()))
+	mock.ExpectQuery(insertBill.String()).WithArgs(txInsertArgs(0, 0, 0, "failed")...).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(2), time.Now()))
 
 	credit := &fakeCredit{err: consumeErr}
 	svc := newTxTestService(db, credit, newFakeConfig(), time.Date(2026, 1, 2, 12, 0, 0, 0, shLocForTest(t)))
@@ -658,8 +696,8 @@ func TestRecord_TxPath_ConsumeError_RollsBackAndRecordsFailed(t *testing.T) {
 	}
 }
 
-// 事务路径账单写入失败：Rollback（扣款一并回滚，余额不变）后回退非事务路径，
-// 由重试队列兜底；本次只应扣款一次（事务内的那次已回滚）。
+// 事务路径账单写入失败（**可重投类**：连接/驱动层错误）：Rollback（扣款一并回滚，余额不变）
+// 后回退非事务路径，由重试队列兜底；本次只应扣款一次（事务内的那次已回滚）。
 func TestRecord_TxPath_InsertFailure_FallsBackToPlain(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
@@ -676,9 +714,9 @@ func TestRecord_TxPath_InsertFailure_FallsBackToPlain(t *testing.T) {
 	before, after := 10.0, 9.7632
 
 	mock.ExpectQuery(selectByBillingID.String()).WithArgs(billingID).WillReturnError(sql.ErrNoRows)
-	// 事务内账单写入失败 → 回滚。
+	// 事务内账单写入失败（驱动层坏连接，属可重投类）→ 回滚。
 	mock.ExpectBegin()
-	mock.ExpectQuery(insertBill.String()).WillReturnError(errors.New("tx insert boom"))
+	mock.ExpectQuery(insertBill.String()).WillReturnError(driver.ErrBadConn)
 	mock.ExpectRollback()
 	// 回退非事务路径：扣款 + 账单 Insert 成功。
 	mock.ExpectQuery(insertBill.String()).WithArgs(txInsertArgs(credits, before, after, "completed")...).
@@ -700,6 +738,96 @@ func TestRecord_TxPath_InsertFailure_FallsBackToPlain(t *testing.T) {
 	}
 	if credit.txCalls != 1 || credit.calls != 1 {
 		t.Fatalf("应事务一次 + 回退一次, tx=%d plain=%d", credit.txCalls, credit.calls)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("mock expectations: %v", err)
+	}
+}
+
+// failingBeginner 模拟「事务开不起来」：BeginTx 直接失败（库不可用/连接池耗尽/只读副本）。
+type failingBeginner struct{ err error }
+
+func (f failingBeginner) BeginTx(context.Context, *sql.TxOptions) (*sql.Tx, error) {
+	return nil, f.err
+}
+
+// TestRecord_BeginTxFailure_NeverCharges 是复审 R3 的探针用例（资金底线的第二道活路）：
+// BeginTx 失败时**不得**退回 settlePlain —— 那条路先真扣钱、再落库，事务不可用往往意味着库也不可用，
+// 结果是「钱扣了账没落」，且确定性错误进重试队列永远重试不成功。
+// 断言：plain 扣款 0 次、事务扣款 0 次、返回错误、账单未写。
+func TestRecord_BeginTxFailure_NeverCharges(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	// 只允许幂等预检查这一次读；任何 Insert/Begin 都不该发生。
+	mock.ExpectQuery(selectByBillingID.String()).WithArgs(billingID).WillReturnError(sql.ErrNoRows)
+
+	credit := &fakeCredit{before: 10, after: 9.9}
+	svc := newTestService(db, credit, newFakeConfig(), time.Date(2026, 11, 15, 12, 0, 0, 0, shLocForTest(t)))
+	svc.SetTxBeginner(failingBeginner{err: errors.New("dial tcp: connection refused")})
+	svc.SetRetryQueue(NewRetryQueue(t.TempDir()+"/retry.json", slog.New(slog.NewTextHandler(io.Discard, nil))))
+
+	rec, err := svc.Record(context.Background(), RecordReq{
+		BillingID: billingID, UserID: testUserID, PricingMode: "sale",
+		ExternalModel: "ext-model", InternalModelID: "int-model", ChannelKeyID: 1, SessionID: "sess-1",
+		Tokens: Usage{Input: 100}, Rates: fullRates(),
+	})
+	if err == nil {
+		t.Fatal("事务开不起来应报错（本次不成交），不能静默成功")
+	}
+	if rec != nil {
+		t.Fatalf("不成交时应返回 nil 记录，got %+v", rec)
+	}
+	if credit.calls != 0 {
+		t.Fatalf("BeginTx 失败不得走非事务扣款路径：plain consume=%d, want 0", credit.calls)
+	}
+	if credit.txCalls != 0 || credit.settleCalls != 0 {
+		t.Fatalf("不应发生任何扣款：tx=%d settle=%d, want 0/0", credit.txCalls, credit.settleCalls)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("不应发生任何写入（账单未落库即无重试），mock expectations: %v", err)
+	}
+}
+
+// TestRecord_TxPath_DeterministicInsertError_NoPlainFallback 是预审 P1（资金事故）的回归用例：
+// 账单写入失败属于**确定性**错误（约束冲突/非法值）时，绝不回退到非事务路径——
+// 那条路会先真扣钱、再落库失败，结果是「钱扣了账没落」。断言：只扣一次事务款且整体回滚。
+func TestRecord_TxPath_DeterministicInsertError_NoPlainFallback(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	rec := newRealStoreRecord(billingID) // 复用真库用例的构造器（归因值齐全）
+	checkViolation := &pgconn.PgError{Code: "23514", Message: `new row violates check constraint "billing_records_cost_source_check"`}
+
+	mock.ExpectQuery(selectByBillingID.String()).WithArgs(billingID).WillReturnError(sql.ErrNoRows)
+	mock.ExpectBegin()
+	mock.ExpectQuery(insertBill.String()).WillReturnError(checkViolation)
+	mock.ExpectRollback()
+
+	credit := &fakeCredit{before: 10, after: 9.9999}
+	svc := newTxTestService(db, credit, newFakeConfig(), time.Date(2026, 11, 15, 12, 0, 0, 0, shLocForTest(t)))
+	svc.SetRetryQueue(NewRetryQueue(t.TempDir()+"/retry.json", slog.New(slog.NewTextHandler(io.Discard, nil))))
+
+	_, err = svc.Record(context.Background(), RecordReq{
+		BillingID: rec.BillingID, UserID: rec.UserID, PricingMode: rec.PricingMode,
+		ExternalModel: rec.ExternalModel, InternalModelID: rec.InternalModelID,
+		Tokens: rec.Tokens, Rates: rec.Rates, CallTime: rec.CallTime,
+	})
+	if err == nil {
+		t.Fatal("确定性写入失败应报错（不吞）")
+	}
+	// 资金底线：只发生过一次「事务内扣款」，且**没有**走非事务路径再扣一次。
+	if credit.txCalls != 1 {
+		t.Fatalf("事务内扣款次数=%d, want 1", credit.txCalls)
+	}
+	if credit.calls != 0 || credit.settleCalls != 0 {
+		t.Fatalf("不得回退非事务路径：plain consume=%d plain settle=%d, want 0/0", credit.calls, credit.settleCalls)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("mock expectations: %v", err)
@@ -1190,12 +1318,14 @@ func TestRecord_ModelLevelOverride(t *testing.T) {
 		WillReturnError(sql.ErrNoRows)
 	mock.ExpectQuery(insertBill.String()).WithArgs(
 		sqlmock.AnyArg(), // id
-		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model", int64(1),
+		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model",
 		sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), []byte(`{"time":1.5,"context":2}`),
 		int64(10000), sqlmock.AnyArg(), credits, sqlmock.AnyArg(),
 		sqlmock.AnyArg(), sqlmock.AnyArg(), "completed", sqlmock.AnyArg(),
 		sqlmock.AnyArg(), sqlmock.AnyArg(),
-	).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(7), time.Now()))
+
+		// ===== V2 归因六列（未传值）：request_id/upstream_* 落 NULL，cost_source 归一 none =====
+		nil, nil, nil, nil, nil, nil, CostSourceNone, nil, nil).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(7), time.Now()))
 
 	credit := &fakeCredit{before: 10, after: 9.7}
 	svc := newTestService(db, credit, newFakeConfig(), time.Date(2026, 1, 2, 12, 0, 0, 0, shLocForTest(t)))
@@ -1239,10 +1369,10 @@ func TestRecord_Dimension(t *testing.T) {
 	mock.ExpectQuery(selectByBillingID.String()).WithArgs(billingID).
 		WillReturnError(sql.ErrNoRows)
 
-	// 关键断言：channel_key_id=42，session_id="sess-dim"（auto_model_name 插入后列位后移一位）。
+	// 关键断言：session_id="sess-dim" 落库；（0024 删了 channel_key_id，Req 里传 42 也不会写）
 	mock.ExpectQuery(insertBill.String()).WithArgs(
 		sqlmock.AnyArg(), // id
-		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model", int64(42),
+		billingID, testUserID, "sale", sqlmock.AnyArg(), "ext-model", sqlmock.AnyArg(), "int-model",
 		"sess-dim",
 		sqlmock.AnyArg(),                 // session_name
 		sqlmock.AnyArg(),                 // call_time
@@ -1259,7 +1389,9 @@ func TestRecord_Dimension(t *testing.T) {
 		sqlmock.AnyArg(),                 // error_message
 		sqlmock.AnyArg(),                 // duration_ms
 		sqlmock.AnyArg(),                 // first_token_ms
-	).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(8), time.Now()))
+
+		// ===== V2 归因六列（未传值）：request_id/upstream_* 落 NULL，cost_source 归一 none =====
+		nil, nil, nil, nil, nil, nil, CostSourceNone, nil, nil).WillReturnRows(sqlmock.NewRows([]string{"id", "created_at"}).AddRow(int64(8), time.Now()))
 
 	credit := &fakeCredit{before: 10, after: 10 - credits}
 	svc := newTestService(db, credit, newFakeConfig(), time.Date(2026, 1, 2, 12, 0, 0, 0, shLocForTest(t)))
@@ -1274,8 +1406,11 @@ func TestRecord_Dimension(t *testing.T) {
 	if err != nil {
 		t.Fatalf("record: %v", err)
 	}
-	if rec.ChannelKeyID != 42 || rec.SessionID != "sess-dim" {
-		t.Fatalf("维度未落库: channel_key_id=%d session_id=%q", rec.ChannelKeyID, rec.SessionID)
+	// 0024 已删 billing_records.channel_key_id：写路径不再写该列（Req 里传 42 也不会进 INSERT，
+	// 上面 WithArgs 的列位已证明这点）；渠道维度只剩 call_logs 历史快照（读路径回填）。
+	// 返回值是入参回显（不是库里的值），所以这里只断言会话维度照常落库。
+	if rec.SessionID != "sess-dim" {
+		t.Fatalf("会话维度未落库: session_id=%q", rec.SessionID)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("mock expectations: %v", err)

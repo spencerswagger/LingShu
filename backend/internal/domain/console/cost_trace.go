@@ -147,9 +147,9 @@ func (h *Admin) HandleCostSessionTrace(w http.ResponseWriter, r *http.Request) {
 		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, err.Error())
 		return
 	}
-	params, err := parsePricingCurveParams(r.URL.Query(), h.now())
-	if err != nil {
-		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, err.Error())
+	// 采样参数仍做校验（前端一直在传，非法值要继续 400），但预测已停用，值本身不再使用。
+	if _, perr := parsePricingCurveParams(r.URL.Query(), h.now()); perr != nil {
+		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, perr.Error())
 		return
 	}
 	// 「能力未启用」是预期内的拒绝，不落异常日志（否则 4xx 告警会把正常关开关算成故障）。
@@ -190,18 +190,23 @@ func (h *Admin) HandleCostSessionTrace(w http.ResponseWriter, r *http.Request) {
 	// 基准取第一条**成功且有渠道内部模型**的记录：首条常是拒绝/余额不足账单（无 channel_key_id），
 	// 拿它当基准会让整通会话误判成「配置缺失」，把主打能力整块废掉。
 	// 一条合格记录都没有时，predictBreakEven 会回一个 Matched=false + Reason 的对象（不是 null）。
-	if len(out.ActualSwitches) == 0 && len(points) > 0 {
-		base, _ := firstTraceAnchor(points)
-		out.PredictedBreakEven = h.predictBreakEven(r.Context(), base, params, h.resolveR())
-		// 轨迹被 Limit 截断时如实标注：切换点可能落在未加载的尾部，预测结论只覆盖已加载部分。
-		if out.Truncated && out.PredictedBreakEven != nil {
-			out.PredictedBreakEven.Reason = truncateReason(out.PredictedBreakEven.Reason, len(points), total)
+	// 预测打平点：**渠道体系下线后不再具备计算前提**（0024 删了 channels/channel_keys/channel_models，
+	// 没有「同一内部模型在其它渠道的成本配置」这个对象）。这里回一个显式的不可用对象而不是 null，
+	// 让前端能把结论区置灰并给出原因，而不是显示成「算出来是 0」。
+	if len(points) > 0 {
+		out.PredictedBreakEven = &costTraceBreakEven{
+			Kind:      traceKindPredicted,
+			Predicted: false,
+			Reason:    "渠道体系已下线（迁移 0024）：没有多渠道成本配置可对比，打平点预测不再适用；成本请以账本口径为准",
 		}
 	}
 	resp.OK(w, r, out)
 }
 
-// firstTraceAnchor 取轨迹里第一条「成功且解析到渠道内部模型」的记录，作为**预测打平点**的基准。
+// firstTraceAnchor 取轨迹里第一条「成功且解析到渠道内部模型」的记录。
+//
+// ⚠️ 渠道体系下线后它已无调用方（预测打平点整体停用），保留函数只为不打断既有用例；
+// 后续清理可整块删除。
 // 第二个返回值为 false 表示整段轨迹没有合格记录（全是失败/拒绝）。
 // 注意：切换判定用的基准更宽松（只要求「成功且有渠道」），见 buildTraceSegments。
 func firstTraceAnchor(points []costTracePoint) (costTracePoint, bool) {
@@ -222,13 +227,14 @@ func truncateReason(reason string, loaded int, total int64) string {
 
 // loadTracePoints 取会话逐条账单并解析渠道/渠道内部模型。
 func (h *Admin) loadTracePoints(ctx context.Context, sid string, limit int) ([]costTracePoint, error) {
+	// 渠道维度已下线：channel_id / channel_name / channel_model_id 恒为 0 / 空串
+	// （历史账单的渠道归属随表一起消失，没有留档），轨迹因此只剩「时间 × 模型 × 金额」。
 	sqlText := fmt.Sprintf(`
-WITH res AS (`+costEntityResolveBody+`)
 SELECT b.call_time,
        b.status,
-       COALESCE(k.channel_id, 0)       AS channel_id,
-       COALESCE(c.name, '')            AS channel_name,
-       COALESCE(r.cm_id, 0)            AS channel_model_id,
+       0::bigint                       AS channel_id,
+       ''::text                        AS channel_name,
+       0::bigint                       AS channel_model_id,
        b.internal_model_id,
        %s AS input_tokens,
        %s AS cache_read_tokens,
@@ -236,9 +242,6 @@ SELECT b.call_time,
        COALESCE(b.cost_credits, 0)     AS cost_credits,
        COALESCE(b.credits_consumed, 0) AS sale_credits
 FROM billing_records b
-LEFT JOIN channel_keys k ON k.id = b.channel_key_id
-LEFT JOIN channels c ON c.id = k.channel_id
-LEFT JOIN res r ON r.channel_id = k.channel_id AND r.internal_model_id = b.internal_model_id
 WHERE b.session_id = $1
 ORDER BY b.call_time ASC, b.id ASC
 LIMIT $2`,
@@ -380,232 +383,4 @@ func buildTraceSegments(points []costTracePoint) ([]costTraceSegment, []costTrac
 		segments[i].SaleCredits = decimalx.Round5(segments[i].SaleCredits)
 	}
 	return segments, switches
-}
-
-// predictBreakEven 计算预测打平点：同一内部模型的其它渠道里，谁能在最小的上下文长度上反超会话实际渠道。
-//
-// 曲线与定价曲线同一套公式与采样参数（buildPricingLine），不另立口径。
-// 单点成本相等的处理：要求严格小于才算「反超」，相等继续往后找（避免把打平前的重合段当切换点）。
-func (h *Admin) predictBreakEven(ctx context.Context, first costTracePoint,
-	p pricingCurveParams, r int64) *costTraceBreakEven {
-	// 先把采样横轴定成「实际会用的值」：未显式传 MaxTokens 时按分档推导、再按点数上限收敛
-	// （与定价曲线接口同一套规则）。这样响应里的 Step/MaxTokens 永远是真实采样参数，
-	// 不会出现前端显示「上限 0」这种半成品——包括下面各条提前返回的分支。
-	requestedMax := p.MaxTokens // 记下调用方是否显式指定（0 = 未指定）
-	resolvePredictionAxis(&p, nil)
-	out := &costTraceBreakEven{
-		Kind:            traceKindPredicted,
-		Predicted:       true,
-		ChannelModelID:  first.ChannelModelID,
-		ChannelID:       first.ChannelID,
-		ChannelName:     first.ChannelName,
-		InternalModelID: first.InternalModelID,
-		Step:            p.Step,
-		MaxTokens:       p.MaxTokens,
-	}
-	if first.ChannelModelID <= 0 || first.InternalModelID == "" {
-		out.Reason = "会话里没有「成功且解析到渠道内部模型」的记录（首条可能是拒绝/失败账单），无法预测打平点"
-		return out
-	}
-	if h.db == nil {
-		out.Reason = "未装配数据库，无法预测打平点"
-		return out
-	}
-
-	globalTime := billing.TimeCoeffConfig{Timezone: cnLocation().String(), Default: 1}
-	if cfg, err := h.loadGlobalTimeConfig(ctx); err == nil {
-		globalTime = cfg
-	}
-	globalTiers := h.loadGlobalContextTiers(ctx)
-
-	candidates, err := h.loadSiblingChannelModels(ctx, first.InternalModelID, first.ChannelModelID, globalTime, globalTiers)
-	if err != nil {
-		out.Reason = "查询同模型其它渠道配置失败，无法预测打平点"
-		return out
-	}
-	var current *pricingModelConfig
-	for i := range candidates {
-		if candidates[i].ChannelModelID == first.ChannelModelID {
-			current = &candidates[i]
-			break
-		}
-	}
-	if current == nil {
-		out.Reason = "会话实际用的渠道内部模型配置已不存在，无法预测打平点"
-		return out
-	}
-	if len(candidates) < 2 {
-		out.Reason = "该内部模型只有一条渠道配置，无对比对象"
-		return out
-	}
-
-	// 拿到实际渠道的分档后定一次横轴：只有「调用方没显式指定 MaxTokens」时才按该模型的分档重推
-	// （显式值只做上限收敛，不被改大）；推导结果同时回吐到响应里，前端按值渲染即可。
-	if requestedMax <= 0 {
-		p.MaxTokens = resolveCurveMaxTokens(0, p.Step, current.Tiers)
-	}
-	out.Step = p.Step
-	out.MaxTokens = p.MaxTokens
-
-	curLine, err := buildPricingLine(*current, p, r)
-	if err != nil || !curLine.Available {
-		out.Reason = "会话实际渠道的成本费率缺失，无法预测打平点"
-		return out
-	}
-
-	var best *costTraceBreakEven
-	for i := range candidates {
-		alt := &candidates[i]
-		if alt.ChannelModelID == current.ChannelModelID {
-			continue
-		}
-		altLine, aerr := buildPricingLine(*alt, p, r)
-		if aerr != nil || !altLine.Available {
-			continue
-		}
-		tokens, matched := firstCrossTokens(curLine.Points, altLine.Points)
-		if !matched {
-			continue
-		}
-		if best == nil || tokens < best.Tokens {
-			best = &costTraceBreakEven{
-				Kind:                      traceKindPredicted,
-				Predicted:                 true,
-				ChannelModelID:            current.ChannelModelID,
-				ChannelID:                 current.ChannelID,
-				ChannelName:               current.ChannelName,
-				InternalModelID:           current.InternalModelID,
-				AlternativeChannelModelID: alt.ChannelModelID,
-				AlternativeChannelID:      alt.ChannelID,
-				AlternativeChannelName:    alt.ChannelName,
-				Tokens:                    tokens,
-				Matched:                   true,
-				Step:                      p.Step,
-				MaxTokens:                 p.MaxTokens,
-				Reason:                    "会话从未切换渠道；该上下文长度起，替代渠道的单次成本开始低于实际渠道（按当前费率与分档推算）",
-			}
-		}
-	}
-	if best == nil {
-		out.Reason = "采样范围内（Step/MaxTokens）没有出现替代渠道更便宜的点，可放大 MaxTokens 或缩小 Step 再试"
-		return out
-	}
-	return best
-}
-
-// resolvePredictionAxis 把采样横轴定成「实际会用的值」：Step 缺省 1000；MaxTokens 未显式给时按分档推导
-// （defaultCurveMaxTokens），再按总点数上限 pricingCurveMaxPoints 收敛。
-//
-// 与 pricing-curve 接口的推导完全同规则，抽出来只给预测打平点用，避免两处口径漂移。
-func resolvePredictionAxis(p *pricingCurveParams, tiers []billing.TierRule) {
-	if p.Step <= 0 {
-		p.Step = pricingCurveDefaultStep
-	}
-	p.MaxTokens = resolveCurveMaxTokens(p.MaxTokens, p.Step, tiers)
-}
-
-// resolveCurveMaxTokens 把请求的横轴上限收敛成**实际使用的值**：
-// <=0（未指定）时按分档推导；再按点数上限收敛（Step 不变，点的 token 语义不变）。
-// 显式值小于上限时原样返回（不会被改大）。
-func resolveCurveMaxTokens(maxTokens, step int64, tiers []billing.TierRule) int64 {
-	if maxTokens <= 0 {
-		maxTokens = defaultCurveMaxTokens(tiers)
-	}
-	if step > 0 && maxTokens/step > pricingCurveMaxPoints {
-		maxTokens = step * pricingCurveMaxPoints
-	}
-	return maxTokens
-}
-
-// firstCrossTokens 在两条同轴成本曲线上找「替代线第一次严格低于实际线」的上下文长度（线性插值）。
-// 返回 (tokens, true)；没有任何反超点返回 (0, false)。任一点命中超档（OverTier）一律跳过。
-func firstCrossTokens(current, alternative []pricingPoint) (int64, bool) {
-	n := len(current)
-	if len(alternative) < n {
-		n = len(alternative)
-	}
-	prevDiff := 0.0
-	hasPrev := false
-	for i := 0; i < n; i++ {
-		if current[i].OverTier || alternative[i].OverTier {
-			hasPrev = false // 超档段不成曲线，打断插值
-			continue
-		}
-		diff := alternative[i].Credits - current[i].Credits // <0 表示替代更便宜
-		if diff < 0 {
-			if !hasPrev {
-				// 起点就已经更便宜：打平点即曲线左端（再往左不在采样范围内）。
-				return current[i].Tokens, true
-			}
-			// 在 [i-1, i] 之间线性插值出 diff=0 的横轴位置。
-			span := prevDiff - diff
-			if span <= 0 {
-				return current[i].Tokens, true
-			}
-			frac := prevDiff / span
-			if frac < 0 {
-				frac = 0
-			}
-			if frac > 1 {
-				frac = 1
-			}
-			from := float64(current[i-1].Tokens)
-			to := float64(current[i].Tokens)
-			return int64(roundHalfUp(from + frac*(to-from))), true
-		}
-		prevDiff = diff
-		hasPrev = true
-	}
-	return 0, false
-}
-
-// loadSiblingChannelModels 取同一内部模型在所有**当前可服务**渠道下的成本配置（预测打平点的候选线）。
-//
-// 过滤口径（PR #65 Owl P2-2）：
-//   - 渠道内部模型自身不能软删（`cm.deleted_at IS NULL`）；
-//   - 候选渠道必须没被软删、且不是 DISABLED（停用的渠道不可能承接切换，指过去就是误导性建议）；
-//   - **当前渠道那条始终保留**（`cm.id = $2`）：即使它已被删/停用，也要让它出现在候选里，
-//     否则 base 会被判成「配置不存在」，把真实原因掩盖成配置缺失。
-func (h *Admin) loadSiblingChannelModels(ctx context.Context, internalModelID string, keepChannelModelID int64,
-	globalTime billing.TimeCoeffConfig, globalTiers []billing.TierRule) ([]pricingModelConfig, error) {
-	rows, err := h.db.QueryContext(ctx, `
-SELECT cm.id, cm.channel_id, COALESCE(c.name, ''), cm.internal_model_id, cm.cost_rates, cm.time_config, cm.context_tiers
-FROM channel_models cm
-LEFT JOIN channels c ON c.id = cm.channel_id
-WHERE cm.deleted_at IS NULL AND cm.internal_model_id = $1
-  AND (cm.id = $2 OR (c.deleted_at IS NULL AND c.state <> 'DISABLED'))
-ORDER BY cm.id`, internalModelID, keepChannelModelID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	out := make([]pricingModelConfig, 0, 4)
-	for rows.Next() {
-		var (
-			cfg               pricingModelConfig
-			ratesRaw          []byte
-			timeRaw, tiersRaw []byte
-			channelName       string
-		)
-		if err := rows.Scan(&cfg.ChannelModelID, &cfg.ChannelID, &channelName, &cfg.InternalModelID,
-			&ratesRaw, &timeRaw, &tiersRaw); err != nil {
-			return nil, err
-		}
-		cfg.Source = "channel_model"
-		cfg.ChannelName = channelName
-		cfg.Name = cfg.InternalModelID
-		cfg.Rates = parseRates(ratesRaw)
-		cfg.TimeConfig, cfg.TimeConfigSource = mergeTimeConfig(timeRaw, globalTime)
-		cfg.Tiers, cfg.TierSource = mergeTiers(tiersRaw, globalTiers)
-		cfg.Available = hasNonZeroRates(cfg.Rates)
-		if !cfg.Available {
-			cfg.Reason = "渠道内部模型未配置成本费率"
-		}
-		out = append(out, cfg)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return out, nil
 }

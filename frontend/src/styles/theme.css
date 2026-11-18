@@ -225,6 +225,17 @@ body {
   background: rgba(99, 102, 241, 0.1);
 }
 
+/* 禁用态（能力可见但接口未就绪）：不响应 hover、不显示手型，靠 tooltip 解释原因 */
+.op-icon.is-disabled {
+  color: var(--color-text-tertiary, #b8bcc7);
+  cursor: not-allowed;
+}
+
+.op-icon.is-disabled:hover {
+  color: var(--color-text-tertiary, #b8bcc7);
+  background: transparent;
+}
+
 .op-icon.danger {
   color: var(--color-danger, #f56c6c);
 }

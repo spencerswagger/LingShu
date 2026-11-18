@@ -358,7 +358,12 @@ function onRowClick(row: AdminUser, _column: unknown, event: Event) {
                 <span class="pop-label">修改计价模式</span>
                 <div class="pop-actions">
                   <el-button v-if="row.PricingMode !== 'sale'" size="small" type="success" plain @click="saveAttr(row, { PricingMode: 'sale' }, '已切换为按售价')">按售价</el-button>
-                  <el-button v-if="row.PricingMode !== 'cost'" size="small" type="warning" plain @click="saveAttr(row, { PricingMode: 'cost' }, '已切换为按成本')">按成本</el-button>
+                  <!-- 口径 D-1：V2 无成本单价真源 → 成本模式停用。按钮保留但禁用，让「为什么切不了」可解释。 -->
+                  <el-tooltip content="成本模式已停用：V2 无成本单价真源（口径 D-1）。已有 cost 用户的新请求会被拒绝。" placement="top">
+                    <span>
+                      <el-button v-if="row.PricingMode !== 'cost'" size="small" type="warning" plain disabled>按成本</el-button>
+                    </span>
+                  </el-tooltip>
                 </div>
               </div>
             </el-popover>

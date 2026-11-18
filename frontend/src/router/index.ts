@@ -27,37 +27,35 @@ const router = createRouter({
           component: () => import('@/views/StatsDashboard.vue'),
           meta: { title: '统计' },
         },
-        // 渠道（列表内含「渠道 / 渠道协议」页内切换）
-        { path: 'channels', name: 'admin-channels', component: () => import('@/views/admin/ChannelsPage.vue'), meta: { title: '渠道' } },
-        { path: 'channels/create', name: 'admin-channel-create', component: () => import('@/views/admin/ChannelCreate.vue'), meta: { title: '新建渠道' } },
-        { path: 'channels/:id', name: 'admin-channel-edit', component: () => import('@/views/admin/ChannelEdit.vue'), meta: { title: '渠道' } },
-        // 渠道协议（列表已并入「渠道」页内切换，这里仅保留新建/编辑子页）
-        { path: 'channel-protocols', redirect: '/admin/channels' },
-        { path: 'channel-protocols/create', name: 'admin-channel-protocol-create', component: () => import('@/views/admin/ChannelProtocolEdit.vue'), meta: { title: '新建渠道协议' } },
-        { path: 'channel-protocols/:id/edit', name: 'admin-channel-protocol-edit', component: () => import('@/views/admin/ChannelProtocolEdit.vue'), meta: { title: '编辑渠道协议' } },
-        // 状态（渠道侧通路矩阵；菜单排在「统计」下方）
-        { path: 'service-status', name: 'admin-service-status', component: () => import('@/views/admin/ServiceStatus.vue'), meta: { title: '状态' } },
-        // 模型（列表内含「模型 / Auto 模型」页内切换）
-        { path: 'models', name: 'admin-models', component: () => import('@/views/admin/ModelsPage.vue'), meta: { title: '模型' } },
+        // ===== V2 运营台（阶段三）=====
+        // 与阶段二后端接口一一对应；接口未上线时页面自行出空态（不弹红条、不显示 0）。
+        { path: 'topology', name: 'admin-topology', component: () => import('@/views/admin/v2/Topology.vue'), meta: { title: '内部模型' } },
+        { path: 'subscriptions', name: 'admin-subscriptions', component: () => import('@/views/admin/v2/Subscriptions.vue'), meta: { title: '订阅' } },
+        { path: 'ledger', name: 'admin-ledger', component: () => import('@/views/admin/v2/Ledger.vue'), meta: { title: '账本' } },
+        { path: 'reconcile', name: 'admin-reconcile', component: () => import('@/views/admin/v2/Reconcile.vue'), meta: { title: '对账' } },
+        { path: 'pnl', name: 'admin-pnl', component: () => import('@/views/admin/v2/Pnl.vue'), meta: { title: '盈亏' } },
+        // 渠道族（渠道 / 渠道协议 / 渠道密钥 / 渠道模型）与标签、服务状态页在 V2 整体下线：
+        // 后端接口 410、表已删（0024），页面文件已删除。这里只保留 **1 行老书签兜底**，
+        // 让历史链接落到「上游拓扑」而不是撞登录页（无页面、无接口调用）。
+        { path: 'channels/:pathMatch(.*)*', redirect: '/admin/topology' },
+        { path: 'channel-protocols/:pathMatch(.*)*', redirect: '/admin/topology' },
+        { path: 'tags/:pathMatch(.*)*', redirect: '/admin/topology' },
+        { path: 'service-status', redirect: '/admin/topology' },
+        // 模型（Auto 模型族已与渠道族同批退役：页内切换与 Auto 页一并删除，这里只剩对外模型列表）
+        { path: 'models', name: 'admin-models', component: () => import('@/views/admin/ModelList.vue'), meta: { title: '模型' } },
         { path: 'models/create', name: 'admin-model-create', component: () => import('@/views/admin/ModelCreate.vue'), meta: { title: '新建模型' } },
         { path: 'models/:id/edit', name: 'admin-model-edit', component: () => import('@/views/admin/ModelEdit.vue'), meta: { title: '编辑模型' } },
-        // Auto 模型（列表已并入「模型」页内切换，这里仅保留新建/编辑子页）
-        { path: 'auto-models', redirect: '/admin/models' },
-        { path: 'auto-models/create', name: 'admin-auto-model-create', component: () => import('@/views/admin/AutoModelCreate.vue'), meta: { title: '新建 Auto 模型' } },
-        { path: 'auto-models/:id/edit', name: 'admin-auto-model-edit', component: () => import('@/views/admin/AutoModelEdit.vue'), meta: { title: '编辑 Auto 模型' } },
-        // 语义标签
-        { path: 'tags', name: 'admin-tags', component: () => import('@/views/admin/TagList.vue'), meta: { title: '标签' } },
-        { path: 'tags/create', name: 'admin-tag-create', component: () => import('@/views/admin/TagCreate.vue'), meta: { title: '新建标签' } },
-        { path: 'tags/:id/edit', name: 'admin-tag-edit', component: () => import('@/views/admin/TagEdit.vue'), meta: { title: '编辑标签' } },
+        // Auto 模型（auto_models / auto_model_members，0024 删表、接口 410）整体下线：
+        // 与渠道族同一套「1 行老书签兜底」，落到对外模型列表，不留死链。
+        { path: 'auto-models/:pathMatch(.*)*', redirect: '/admin/models' },
         // 用户管理
         { path: 'users', name: 'admin-users', component: () => import('@/views/admin/UserList.vue'), meta: { title: '用户' } },
         { path: 'users/create', name: 'admin-user-create', component: () => import('@/views/admin/UserCreate.vue'), meta: { title: '新建用户' } },
         { path: 'users/:id', name: 'admin-user-detail', component: () => import('@/views/admin/UserDetail.vue'), meta: { title: '用户详情' } },
         // 令牌管理
         { path: 'tokens', name: 'admin-tokens', component: () => import('@/views/admin/AdminTokenList.vue'), meta: { title: '令牌' } },
-        // 会话管理
-        { path: 'sessions', name: 'admin-sessions', component: () => import('@/views/admin/SessionList.vue'), meta: { title: '会话' } },
-        { path: 'sessions/:id', name: 'admin-session-detail', component: () => import('@/views/admin/SessionDetail.vue'), meta: { title: '会话详情' } },
+        // 会话管理（V2 下线：新链路不写 sessions，Spec §1.2）——只留老书签兜底，菜单已摘除。
+        { path: 'sessions/:pathMatch(.*)*', redirect: '/admin/dashboard' },
         // 账单
         { path: 'billings', name: 'admin-billings', component: () => import('@/views/admin/BillingQuery.vue'), meta: { title: '账单' } },
         { path: 'billings/:id', name: 'admin-billing-detail', component: () => import('@/views/admin/BillingDetail.vue'), meta: { title: '账单详情' } },
@@ -65,8 +63,9 @@ const router = createRouter({
         { path: 'system', name: 'admin-system', component: () => import('@/views/admin/BillingConfig.vue'), meta: { title: '系统' } },
         { path: 'system/config', redirect: '/admin/system' },
         { path: 'system/gateway', redirect: '/admin/system' },
-        // 成本（只读：成本统计 + 定价曲线 + 会话成本曲线）
-        { path: 'cost', name: 'admin-cost', component: () => import('@/views/admin/Cost.vue'), meta: { title: '成本' } },
+        // 成本（V1 页 JOIN channel_keys/channels，0024 后必 500）：由盈亏页取代（Spec §1.2），
+        // 老书签兜底到盈亏，菜单已摘除。
+        { path: 'cost/:pathMatch(.*)*', redirect: '/admin/pnl' },
         // 公告
         { path: 'announcements', name: 'admin-announcements', component: () => import('@/views/admin/AnnouncementList.vue'), meta: { title: '公告' } },
         { path: 'announcements/create', name: 'admin-announcement-create', component: () => import('@/views/admin/AnnouncementEdit.vue'), meta: { title: '新建公告' } },
@@ -100,39 +99,21 @@ const router = createRouter({
         {
           path: 'models',
           name: 'dev-model-list',
-          component: () => import('@/views/admin/ModelsPage.vue'),
+          component: () => import('@/views/admin/ModelList.vue'),
           meta: { title: '模型' },
           props: { mode: 'self' },
         },
-        // Auto 模型（开发者端：global 只读 + 本人 private 可写；列表已并入「模型」页内切换）
-        { path: 'auto-models', redirect: '/dev/models' },
+        // Auto 模型族整体下线（同管理端）：老书签兜底到模型列表。
+        { path: 'auto-models/:pathMatch(.*)*', redirect: '/dev/models' },
+        // 会话页在 V2 下线（Spec §1.2）：老书签兜底到统计，菜单已摘除。
+        { path: 'sessions/:pathMatch(.*)*', redirect: '/dev/dashboard' },
+        // 公告：开发者端**只读**一页（Spec P13 / A-5 —— 之前只有 api/dev.ts 的封装，
+        // 路由与入口都没有，导致「发布后开发端可见」在页面上不可达）。
         {
-          path: 'auto-models/create',
-          name: 'dev-auto-model-create',
-          component: () => import('@/views/admin/AutoModelCreate.vue'),
-          meta: { title: '新建 Auto 模型' },
-          props: { mode: 'self' },
-        },
-        {
-          path: 'auto-models/:id/edit',
-          name: 'dev-auto-model-edit',
-          component: () => import('@/views/admin/AutoModelEdit.vue'),
-          meta: { title: '编辑 Auto 模型' },
-          props: { mode: 'self' },
-        },
-        {
-          path: 'sessions',
-          name: 'dev-sessions',
-          component: () => import('@/views/admin/SessionList.vue'),
-          meta: { title: '会话' },
-          props: { mode: 'self' },
-        },
-        {
-          path: 'sessions/:id',
-          name: 'dev-session-detail',
-          component: () => import('@/views/admin/SessionDetail.vue'),
-          meta: { title: '会话详情' },
-          props: { mode: 'self' },
+          path: 'announcements',
+          name: 'dev-announcements',
+          component: () => import('@/views/dev/AnnouncementList.vue'),
+          meta: { title: '公告' },
         },
         {
           path: 'billings',

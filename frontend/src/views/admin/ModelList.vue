@@ -2,7 +2,7 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Edit, Delete } from '@element-plus/icons-vue'
+import { Link, Edit, Delete } from '@element-plus/icons-vue'
 import {
   listExternalModels,
   batchDeleteExternalModels,
@@ -22,6 +22,16 @@ const loading = ref(false)
 const list = ref<ExternalModel[]>([])
 const errInfo = ref<{ message: string; requestId: string }>({ message: '', requestId: '' })
 const selected = ref<ExternalModel[]>([])
+
+// V2 绑定列是否可用：后端返回了 BoundInternalRef 才渲染（未上线时不新增列，页面保持原样）。
+// 口径（2026-11-16 Owl 复审裁定）：本批**不拦截**，且绑定能力**尚未上线**——全仓 0 处写
+// `bound_internal_ref`（只有迁移建列 + 部分索引，注释写明只读）。因此页面只能说事实：
+// 「未绑定」，不写「不售卖 / 请求 404」，也不承诺系统会拦；否则运维分不清
+// 「真没绑」和「绑定功能还没做」。
+const hasBinding = computed(() => list.value.some((m) => m.BoundInternalRef !== undefined))
+const unboundEnabled = computed(
+  () => list.value.filter((m) => m.Enabled && m.BoundInternalRef !== undefined && !m.BoundInternalRef).length,
+)
 
 const filters = reactive({
   q: '',
@@ -176,6 +186,16 @@ async function onSyncPrices() {
       <el-button v-if="!isSelf" type="primary" @click="router.push('/admin/models/create')">新建</el-button>
     </div>
 
+    <el-alert
+      v-if="hasBinding && unboundEnabled > 0"
+      class="bind-alert"
+      type="error"
+      :closable="false"
+      show-icon
+      title="有启用中的对外模型未绑定内部模型（仅提示，不拦截）"
+      :description="`${unboundEnabled} 个：绑定能力尚未上线，当前不拦截、不影响调用；等绑定功能上线后再要求这个数为 0。`"
+    />
+
     <div v-loading="loading" class="card">
       <el-table
         :data="displayList"
@@ -204,6 +224,14 @@ async function onSyncPrices() {
               <span class="t-date">{{ row.ExternalName }}</span>
               <span class="t-clock ellipsis">{{ row.Description || '-' }}</span>
             </div>
+          </template>
+        </el-table-column>
+        <el-table-column v-if="hasBinding" label="内部模型绑定" min-width="180">
+          <template #default="{ row }">
+            <span v-if="row.BoundInternalRef" class="bound-ref">{{ row.BoundInternalRef }}</span>
+            <el-tag v-else type="info" size="small" effect="plain" title="未绑定内部模型：绑定能力尚未上线，当前不拦截">
+              未绑定
+            </el-tag>
           </template>
         </el-table-column>
         <el-table-column label="售价·输入" width="110" align="right">
@@ -242,9 +270,14 @@ async function onSyncPrices() {
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column v-if="!isSelf" label="操作" width="90" align="right" fixed="right">
+        <el-table-column v-if="!isSelf" label="操作" width="130" align="right" fixed="right">
           <template #default="{ row }">
             <div class="op-cell" @click.stop>
+              <!-- 绑定能力的唯一真源是 external_models.bound_internal_ref，写入口是 T5（PUT /admin/models/{id}/binding）；
+                   T4/T5 未上线前按钮禁用并说明，不做「点了没反应」。 -->
+              <el-tooltip :content="hasBinding ? '绑定内部模型（T5 /models/{id}/binding 待上线）' : '绑定内部模型（后端未返回 bound_internal_ref，接口待上线）'" placement="top">
+                <el-icon class="op-icon is-disabled"><Link /></el-icon>
+              </el-tooltip>
               <el-tooltip content="编辑" placement="top">
                 <el-icon class="op-icon" @click="router.push(`/admin/models/${row.ID}/edit`)"><Edit /></el-icon>
               </el-tooltip>
@@ -256,7 +289,10 @@ async function onSyncPrices() {
         </el-table-column>
       </el-table>
 
-      <el-empty v-if="!loading && !displayList.length" description="暂无对外模型" />
+      <!-- 空态分两种人（Spec P03）：开发者端「暂无可用模型，请联系管理员」；管理端先去同步拓扑 -->
+      <el-empty v-if="!loading && !displayList.length" :description="isSelf ? '暂无可用模型，请联系管理员' : '还没有对外模型'">
+        <el-button v-if="!isSelf" @click="router.push('/admin/topology')">先去同步上游拓扑</el-button>
+      </el-empty>
       <ErrorBubble
         v-if="errInfo.message || errInfo.requestId"
         :message="errInfo.message"

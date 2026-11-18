@@ -4,24 +4,18 @@ import { useRoute, useRouter } from 'vue-router'
 import {
   listBillings,
   getBillingStats,
-  listChannels,
-  listChannelKeys,
   listExternalModels,
-  listAutoModels,
-  listSessions,
   listTokens,
   type AdminBillingItem,
-  type AdminChannel,
-  type AdminSession,
   type AdminToken,
   type BillingStats,
-  type ChannelKey,
   type ExternalModel,
 } from '@/api/admin'
 import ErrorBubble from '@/components/ErrorBubble.vue'
 import UserSelect from '@/components/UserSelect.vue'
 import ColumnFilter from '@/components/ColumnFilter.vue'
 import FilterBar from '@/components/FilterBar.vue'
+import StatusPill from '@/components/v2/StatusPill.vue'
 import { fmtDate, fmtTime } from '@/utils/format'
 import { resolveBillingRange } from '@/utils/range'
 import { useIsNarrow } from '@/composables/useIsNarrow'
@@ -45,6 +39,11 @@ const page = ref(1)
 const size = ref(20)
 const errInfo = ref<{ message: string; requestId: string }>({ message: '', requestId: '' })
 
+// V2 归因列是否渲染：后端返回了 UpstreamProvider / CostSource 才出现（老后端页面保持原样）
+const hasAttribution = computed(() =>
+  list.value.some((r) => r.UpstreamProvider !== undefined || r.CostSource !== undefined),
+)
+
 const stats = ref<BillingStats>({
   Requests: 0,
   CreditsTotal: 0,
@@ -60,23 +59,19 @@ const stats = ref<BillingStats>({
 })
 
 // ===== 列头筛选选项数据 =====
-const channels = ref<AdminChannel[]>([])
-const channelKeys = ref<ChannelKey[]>([])
+// 渠道 / 渠道密钥在 V2 整体下线（后端接口 410、表已删 0024）：不再加载候选，也不再提供这两个筛选项。
+// 账单行上的 channel_name / key_name 字段仍由后端返回（结构不删），拿到就显示，拿不到显示 '-'。
 const models = ref<ExternalModel[]>([])
-const autoNames = ref<string[]>([])
 const tokens = ref<AdminToken[]>([])
-const sessions = ref<AdminSession[]>([])
 // 当前所选用户名（用于筛选标签展示）
 const userName = ref('')
 
 const filters = reactive({
   user_id: (route.query.user_id ? String(route.query.user_id) : undefined) as string | undefined,
-  token_id: undefined as string | undefined,
-  channel_id: undefined as string | undefined,
-  channel_key_id: undefined as string | undefined,
-  session_id: undefined as string | undefined,
-  model: undefined as string | undefined,
-  status: undefined as string | undefined,
+  // 下列各项同样从 URL 还原（G4：刷新/分享/后退结果一致）
+  token_id: (route.query.token_id ? String(route.query.token_id) : undefined) as string | undefined,
+  model: (route.query.model ? String(route.query.model) : undefined) as string | undefined,
+  status: (route.query.status ? String(route.query.status) : undefined) as string | undefined,
   // 请求链路 ID：调用方把网关错误体里的 request_id 贴进来，直接定位这一次请求
   request_id: (route.query.request_id ? String(route.query.request_id).trim() : undefined) as
     | string
@@ -84,15 +79,24 @@ const filters = reactive({
   range: null as [string, string] | null,
 })
 
-// URL 带 range（today|yesterday|month）时据此设置时间区间初值（Asia/Shanghai），首次 load 即生效
-filters.range = resolveBillingRange(route.query.range)
+// URL 带 range（today|yesterday|month）或 from/to（RFC3339）时据此设置时间区间初值
+// （Asia/Shanghai），首次 load 即生效。G4：筛选条件必须可还原——刷新 / 分享 / 后退结果一致。
+filters.range = rangeFromQuery(route.query)
+
+function rangeFromQuery(q: Record<string, unknown>): [string, string] | null {
+  const named = resolveBillingRange(q.range)
+  if (named) return named
+  // 自定义区间用 from/to 存 URL（分享一个时间窗不会因为「今天」变成明天就漂移）
+  if (typeof q.from === 'string' && typeof q.to === 'string' && q.from && q.to) {
+    return [q.from, q.to]
+  }
+  return null
+}
 
 // 前端筛选态键 → 后端 query 参数键（PascalCase 契约）
 const paramKeyMap: Record<string, string> = {
   user_id: 'UserID',
   token_id: 'TokenID',
-  channel_key_id: 'ChannelKeyID',
-  session_id: 'SessionID',
   model: 'Model',
   status: 'Status',
   request_id: 'RequestID',
@@ -102,7 +106,6 @@ function buildParams(extra: Record<string, unknown> = {}): Record<string, unknow
   const p: Record<string, unknown> = { ...extra }
   for (const [k, v] of Object.entries(filters)) {
     if (v === undefined || v === null || v === '') continue
-    if (k === 'channel_id') continue // 后端按 channel_key_id 过滤，渠道仅作级联
     if (k === 'range') {
       if (filters.range) {
         p.From = filters.range[0]
@@ -238,33 +241,12 @@ async function load() {
 }
 
 // ===== 选项加载 =====
-async function loadChannels() {
-  // self 模式仅服务端只读接口（无 /dev/channels），直接跳过，避免 403 噪音。
-  if (isSelf.value) return
-  if (channels.value.length) return
-  try {
-    channels.value = (await listChannels()).Data || []
-  } catch {
-    channels.value = []
-  }
-}
 async function loadModels() {
   if (models.value.length) return
   try {
     models.value = (await listExternalModels({}, base.value)).Data || []
   } catch {
     models.value = []
-  }
-}
-// Auto 名一并作为模型筛选项：Auto 请求的账单 external_model_name 记命中成员名，
-// 但用户按 Auto 名也应能搜到（后端 Model 过滤同时匹配 auto_model_name）。
-async function loadAutoNames() {
-  if (autoNames.value.length) return
-  try {
-    const res = await listAutoModels({}, base.value)
-    autoNames.value = (res.Data || []).map((a) => a.Name)
-  } catch {
-    autoNames.value = []
   }
 }
 async function loadTokensOfUser() {
@@ -282,54 +264,16 @@ async function loadTokensOfUser() {
     tokens.value = []
   }
 }
-async function searchSessions(q: string) {
-  try {
-    const res = await listSessions({ Q: q, Page: 1, Size: 50 }, base.value)
-    sessions.value = res.Data.List || []
-  } catch {
-    sessions.value = []
-  }
-}
-async function onChannelChange(id?: string) {
-  filters.channel_key_id = undefined
-  channelKeys.value = []
-  if (!id) return
-  try {
-    channelKeys.value = (await listChannelKeys(id)).Data || []
-  } catch {
-    channelKeys.value = []
-  }
-}
-
 // 列头浮窗「清除」：还原对应筛选条件并保持级联下拉一致。
 function clearUserKey() {
   filters.user_id = undefined
   filters.token_id = undefined
 }
-function clearChannelKey() {
-  filters.channel_id = undefined
-  filters.channel_key_id = undefined
-  channelKeys.value = []
-}
-
 // ===== 生效筛选标签 =====
-function channelLabel(id?: string) {
-  if (!id) return ''
-  return channels.value.find((c) => c.ID === id)?.Name || id
-}
-function channelKeyLabel(id?: string) {
-  if (!id) return ''
-  return channelKeys.value.find((k) => k.ID === id)?.Name || id
-}
 function tokenTagLabel(id?: string) {
   if (!id) return ''
   const tk = tokens.value.find((x) => x.ID === id)
   return tk ? tk.DisplayName || tk.TokenDisplay : id
-}
-function sessionTagLabel(id?: string) {
-  if (!id) return ''
-  const s = sessions.value.find((x) => x.SessionID === id)
-  return s ? sessionLabel(s) : id
 }
 
 const activeTags = computed(() => {
@@ -342,13 +286,6 @@ const activeTags = computed(() => {
   }
   if (filters.user_id) out.push({ key: 'user_id', label: `用户: ${userName.value || filters.user_id}` })
   if (filters.token_id) out.push({ key: 'token_id', label: `密钥: ${tokenTagLabel(filters.token_id)}` })
-  if (filters.channel_key_id) {
-    const parts = [channelLabel(filters.channel_id), channelKeyLabel(filters.channel_key_id)].filter(Boolean).join(' · ')
-    out.push({ key: 'channel_key_id', label: `渠道密钥: ${parts || filters.channel_key_id}` })
-  } else if (filters.channel_id) {
-    out.push({ key: 'channel_id', label: `渠道: ${channelLabel(filters.channel_id)}` })
-  }
-  if (filters.session_id) out.push({ key: 'session_id', label: `会话: ${sessionTagLabel(filters.session_id)}` })
   if (filters.model) out.push({ key: 'model', label: `模型: ${filters.model}` })
   if (filters.status) out.push({ key: 'status', label: `状态: ${filters.status === 'completed' ? '成功' : '失败'}` })
   if (filters.request_id) out.push({ key: 'request_id', label: `请求 ID: ${filters.request_id}` })
@@ -367,17 +304,6 @@ function clearTag(key: string) {
     case 'token_id':
       filters.token_id = undefined
       break
-    case 'channel_id':
-      filters.channel_id = undefined
-      break
-    case 'channel_key_id':
-      filters.channel_id = undefined
-      filters.channel_key_id = undefined
-      channelKeys.value = []
-      break
-    case 'session_id':
-      filters.session_id = undefined
-      break
     case 'model':
       filters.model = undefined
       break
@@ -391,13 +317,46 @@ function clearTag(key: string) {
   }
 }
 
-// ===== 筛选变化自动刷新 =====
+// ===== G4：筛选条件写回 URL（刷新 / 分享 / 后退结果一致）=====
+// 只写「可还原」的六项；旧链接里的 channel_key_id / channel_id 等已下线参数一律不读不写
+// （不带进请求，后端不会因为旧参数报 400/500）。
+const QUERY_KEYS = ['user_id', 'token_id', 'model', 'status', 'request_id', 'from', 'to'] as const
+
+function desiredQuery(): Record<string, string> {
+  const q: Record<string, string> = {}
+  if (filters.user_id) q.user_id = filters.user_id
+  if (filters.token_id) q.token_id = filters.token_id
+  if (filters.model) q.model = filters.model
+  if (filters.status) q.status = filters.status
+  if (filters.request_id) q.request_id = filters.request_id
+  if (filters.range) {
+    q.from = filters.range[0]
+    q.to = filters.range[1]
+  }
+  return q
+}
+
+function currentQuery(): Record<string, string> {
+  const q: Record<string, string> = {}
+  for (const k of QUERY_KEYS) {
+    const v = route.query[k]
+    if (typeof v === 'string' && v) q[k] = v
+  }
+  return q
+}
+
+function syncQuery() {
+  const next = desiredQuery()
+  // 值相同就不写，避免「写 URL → 触发路由 watch → 再写」的抖动
+  if (JSON.stringify(next) === JSON.stringify(currentQuery())) return
+  void router.replace({ query: next })
+}
+
+// 筛选变化自动刷新
 watch(
   () => ({
     user_id: filters.user_id,
     token_id: filters.token_id,
-    channel_key_id: filters.channel_key_id,
-    session_id: filters.session_id,
     model: filters.model,
     status: filters.status,
     request_id: filters.request_id,
@@ -405,20 +364,23 @@ watch(
   }),
   () => {
     page.value = 1
+    syncQuery()
     load()
   },
 )
 watch(() => filters.user_id, loadTokensOfUser)
 
-// 同一页面内再次从用户面板跳转（URL query 变化）时同步筛选；上面的 filters watch 会自动刷新
+// 同一页面内再次从用户面板跳转（URL query 变化）时同步筛选；上面的 filters watch 会自动刷新。
+// 逐项**比过值再赋值**：否则把自己写回 URL 的动作当成「外部跳转」，会多打一次接口。
 watch(
-  () => [route.query.range, route.query.user_id, route.query.request_id],
-  ([r, u, rid]) => {
-    const rng = resolveBillingRange(r)
-    if (rng) filters.range = rng
-    filters.user_id = u ? String(u) : undefined
+  () => route.query,
+  (q) => {
+    const rng = rangeFromQuery(q)
+    if (JSON.stringify(rng) !== JSON.stringify(filters.range)) filters.range = rng
+    const nextUser = typeof q.user_id === 'string' && q.user_id ? q.user_id : undefined
+    if (nextUser !== filters.user_id) filters.user_id = nextUser
     // 从会话详情/调用详情点「在账单中定位」跳过来时，直接把 request_id 填进搜索框
-    const nextRid = rid ? String(rid).trim() : ''
+    const nextRid = typeof q.request_id === 'string' ? q.request_id.trim() : ''
     if (nextRid !== (filters.request_id || '')) {
       filters.request_id = nextRid || undefined
       requestIdInput.value = nextRid
@@ -431,8 +393,6 @@ function reset() {
   const wasActive = !!(
     filters.user_id ||
     filters.token_id ||
-    filters.channel_key_id ||
-    filters.session_id ||
     filters.model ||
     filters.status ||
     filters.request_id ||
@@ -440,15 +400,11 @@ function reset() {
   )
   filters.user_id = undefined
   filters.token_id = undefined
-  filters.channel_id = undefined
-  filters.channel_key_id = undefined
-  filters.session_id = undefined
   filters.model = undefined
   filters.status = undefined
   filters.request_id = undefined
   requestIdInput.value = ''
   filters.range = null
-  channelKeys.value = []
   if (!wasActive) {
     page.value = 1
     load()
@@ -456,10 +412,7 @@ function reset() {
 }
 
 onMounted(() => {
-  loadChannels()
   loadModels()
-  loadAutoNames()
-  searchSessions('')
   loadTokensOfUser()
   load()
 })
@@ -587,10 +540,6 @@ function creditLines(row: AdminBillingItem): string[] {
   ]
 }
 
-// 会话选项展示：名称优先，缺失用「未命名」。
-function sessionLabel(s: AdminSession): string {
-  return s.SessionName || '未命名'
-}
 </script>
 
 <template>
@@ -821,12 +770,6 @@ function sessionLabel(s: AdminSession): string {
                 size="small"
               >
                 <el-option v-for="m in models" :key="m.ID" :label="m.ExternalName" :value="m.ExternalName" />
-                <el-option
-                  v-for="n in autoNames"
-                  :key="'auto-' + n"
-                  :label="n + '（Auto）'"
-                  :value="n"
-                />
               </el-select>
             </ColumnFilter>
           </template>
@@ -841,41 +784,14 @@ function sessionLabel(s: AdminSession): string {
           </template>
         </el-table-column>
 
-        <!-- 渠道 / 密钥：渠道显示名开发者端也可见（白名单），密钥维度仅管理端 -->
+        <!-- 渠道 / 密钥：V2 已下线渠道族（0024 删表、接口 410）。
+             列保留、不再提供筛选项（已无法筛）；历史行有值就显示，新行恒空显示 '-'。
+             按上游维度筛单请用右侧「归因 / 成本来源」列（upstream_provider/account）。 -->
         <el-table-column :label="isSelf ? '渠道' : '渠道 / 密钥'" min-width="150">
           <template #header>
-            <!-- 开发者端没有渠道/密钥列表接口（也无该维度权限），表头只留纯文本 -->
-            <span v-if="isSelf">渠道</span>
-            <ColumnFilter
-              v-else
-              label="渠道 / 密钥"
-              :active="!!filters.channel_id || !!filters.channel_key_id"
-
-              @clear="clearChannelKey"
-            >
-              <div class="f-stack">
-                <el-select
-                  v-model="filters.channel_id"
-                  placeholder="渠道"
-                  filterable
-                  clearable
-                  size="small"
-                  @change="onChannelChange"
-                >
-                  <el-option v-for="c in channels" :key="c.ID" :label="c.Name" :value="c.ID" />
-                </el-select>
-                <el-select
-                  v-model="filters.channel_key_id"
-                  placeholder="密钥"
-                  filterable
-                  clearable
-                  size="small"
-                  :disabled="!filters.channel_id"
-                >
-                  <el-option v-for="k in channelKeys" :key="k.ID" :label="k.Name" :value="k.ID" />
-                </el-select>
-              </div>
-            </ColumnFilter>
+            <el-tooltip content="渠道族已在 V2 下线：历史行可能仍有值，新账单恒空；按上游维度筛请用「归因 / 成本来源」列" placement="top">
+              <span>{{ isSelf ? '渠道' : '渠道 / 密钥（已下线）' }}</span>
+            </el-tooltip>
           </template>
           <template #default="{ row }">
             <div class="t-time">
@@ -885,33 +801,24 @@ function sessionLabel(s: AdminSession): string {
           </template>
         </el-table-column>
 
-        <!-- 会话（带搜索下拉） -->
-        <el-table-column label="会话" min-width="120">
-          <template #header>
-            <ColumnFilter
-              label="会话"
-              :active="!!filters.session_id"
-
-              @clear="() => (filters.session_id = undefined)"
-            >
-              <el-select
-                :model-value="filters.session_id ?? undefined"
-                placeholder="搜索会话"
-                filterable
-                remote
-                clearable
-                size="small"
-                :remote-method="(q: string) => searchSessions(q)"
-                @update:model-value="(v: any) => (filters.session_id = v ?? undefined)"
-              >
-                <el-option v-for="s in sessions" :key="s.SessionID" :label="sessionLabel(s)" :value="s.SessionID" />
-              </el-select>
-            </ColumnFilter>
-          </template>
+        <!-- 归因 / 成本来源：成本侧字段（CostSource / UpstreamAccount）在开发者端属敏感键，
+             开发者端整列不渲染（Spec P08 负向断言：无 Cost / CostSource / UpstreamAccount）。 -->
+        <el-table-column v-if="hasAttribution && !isSelf" label="归因 / 成本来源" min-width="180">
           <template #default="{ row }">
-            <span class="tok">{{ row.SessionName || '-' }}</span>
+            <div class="t-time">
+              <span class="t-date">
+                <template v-if="row.UpstreamProvider">
+                  {{ row.UpstreamProvider }}<template v-if="row.UpstreamAccount"> / {{ row.UpstreamAccount }}</template>
+                </template>
+                <span v-else class="t-clock">未归因</span>
+              </span>
+              <!-- 不加 `|| 'none'` 兜底：null（历史未知）与 none（明确无成本口径）是两种账务结论（Spec P08/G2） -->
+              <span class="t-clock"><StatusPill domain="costSource" :value="row.CostSource ?? ''" /></span>
+            </div>
           </template>
         </el-table-column>
+
+        <!-- 会话列在 V2 下线（Spec §1.2：新链路不写 sessions，这一列永远是空）；要按上游定位请用「归因 / 成本来源」 -->
 
         <!-- Token（双行：输入/输出 + 缓存读） -->
         <el-table-column label="Token" min-width="150" align="right">
@@ -950,12 +857,13 @@ function sessionLabel(s: AdminSession): string {
               <el-select v-model="filters.status" placeholder="账单状态" clearable size="small">
                 <el-option label="成功" value="completed" />
                 <el-option label="失败" value="failed" />
+                <el-option label="上游错误" value="upstream_error" />
               </el-select>
             </ColumnFilter>
           </template>
           <template #default="{ row }">
             <span :class="['st', row.Status === 'completed' ? 'st-ok' : 'st-fail']">
-              {{ row.Status === 'completed' ? '成功' : '失败' }}
+              {{ row.Status === 'completed' ? '成功' : row.Status === 'upstream_error' ? '上游错误' : '失败' }}
             </span>
           </template>
         </el-table-column>        <!-- 积分 -->
@@ -986,7 +894,7 @@ function sessionLabel(s: AdminSession): string {
           <div class="bc-head">
             <span class="bc-time">{{ fmtDate(row.CallTime) }} {{ fmtTime(row.CallTime) }}</span>
             <span :class="['st', row.Status === 'completed' ? 'st-ok' : 'st-fail']">
-              {{ row.Status === 'completed' ? '成功' : '失败' }}
+              {{ row.Status === 'completed' ? '成功' : row.Status === 'upstream_error' ? '上游错误' : '失败' }}
             </span>
           </div>
           <div class="bc-line">

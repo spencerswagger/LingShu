@@ -70,7 +70,9 @@ func TestToListItem_KeySession(t *testing.T) {
 	}
 }
 
-// TestDecorateList_KeyName 断言 decorateList 反查密钥名/渠道名，并对缺失密钥兜底 #<id>。
+// TestDecorateList_KeyName 渠道体系已下线（0024 删了 channel_keys / channels）：
+// decorateList 反查不到任何密钥名/渠道名，两个字段都是空串；**不许**再退化成 `#<id>` 这种
+// 看起来像真名的兜底（那会让运营以为渠道还在）。
 func TestDecorateList_KeyName(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
@@ -89,31 +91,27 @@ func TestDecorateList_KeyName(t *testing.T) {
 		list = append(list, toListItem(&recs[i]))
 	}
 
+	// 只剩用户名这一条反查（渠道名/密钥名已无来源，不再发查询）。
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, username, nickname FROM users WHERE id = ANY('{1}'::bigint[])`)).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "username", "nickname"}).AddRow(int64(1), "u1", "昵称A"))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, channel_id, name FROM channel_keys WHERE id = ANY('{1,99}'::bigint[])`)).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "channel_id", "name"}).
-			AddRow(int64(1), int64(10), "主密钥"))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, name FROM channels WHERE id = ANY('{10}'::bigint[])`)).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "name"}).AddRow(int64(10), "渠道A"))
 
 	admin.decorateList(context.Background(), list, recs)
 
-	if list[0].KeyName != "主密钥" {
-		t.Fatalf("key_name=%q, want 主密钥", list[0].KeyName)
+	for i := range list {
+		if list[i].KeyName != "" || list[i].ChannelName != "" {
+			t.Fatalf("第 %d 行渠道相关名称必须为空（表已删），实际 key=%q channel=%q",
+				i, list[i].KeyName, list[i].ChannelName)
+		}
 	}
-	if list[0].ChannelName != "渠道A" {
-		t.Fatalf("channel_name=%q, want 渠道A", list[0].ChannelName)
-	}
-	if list[1].KeyName != "#99" {
-		t.Fatalf("兜底 key_name=%q, want #99", list[1].KeyName)
+	if list[0].Username != "u1" {
+		t.Fatalf("用户名不该受影响: %q", list[0].Username)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("mock expectations: %v", err)
 	}
 }
 
-// TestChannelNameByKeyID 断言由密钥 ID 反查渠道名（join channel_keys）。
+// TestChannelNameByKeyID 渠道体系已下线：反查恒返回空串，且**不发任何 SQL**（表都删了）。
 func TestChannelNameByKeyID(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
@@ -122,21 +120,11 @@ func TestChannelNameByKeyID(t *testing.T) {
 	defer db.Close()
 
 	admin := NewAdmin(db, billing.NewSqlStore(db), nil)
-
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT c.name FROM channels c JOIN channel_keys k ON k.channel_id = c.id WHERE k.id = $1`)).
-		WithArgs(int64(7)).WillReturnRows(sqlmock.NewRows([]string{"name"}).AddRow("渠道B"))
-
-	if got := admin.channelNameByKeyID(context.Background(), 7); got != "渠道B" {
-		t.Fatalf("channel_name=%q, want 渠道B", got)
+	if got := admin.channelNameByKeyID(context.Background(), 7); got != "" {
+		t.Fatalf("渠道体系已下线，必须返回空串, got %q", got)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("mock expectations: %v", err)
-	}
-
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT c.name FROM channels c JOIN channel_keys k ON k.channel_id = c.id WHERE k.id = $1`)).
-		WithArgs(int64(999)).WillReturnError(sqlmock.ErrCancelled)
-	if got := admin.channelNameByKeyID(context.Background(), 999); got != "" {
-		t.Fatalf("缺失密钥应返回空串, got %q", got)
+		t.Fatalf("不应发出任何查询: %v", err)
 	}
 }
 
@@ -153,29 +141,32 @@ func TestHandleListBillings_FilterParams(t *testing.T) {
 
 	rows := sqlmock.NewRows([]string{
 		"id", "billing_id", "user_id", "pricing_mode", "token_id", "external_model_name",
-		"auto_model_name", "internal_model_id", "channel_key_id", "session_id", "session_name", "call_time", "tokens", "rates",
+		"auto_model_name", "internal_model_id", "session_id", "session_name", "call_time", "tokens", "rates",
 		"coefficients", "r_value", "raw_total", "credits_consumed", "cost_credits",
 		"balance_before", "balance_after", "status", "error_message", "duration_ms",
-		"first_token_ms", "rid", "cnt",
+		"first_token_ms", "upstream_status", "upstream_error_summary", "rid", "cnt",
 	}).AddRow(
-		int64(1), "b1", int64(1), "sale", nil, "ext", nil, "int", int64(3), "sess-1", "",
+		int64(1), "b1", int64(1), "sale", nil, "ext", nil, "int", "sess-1", "",
 		time.Now(), `{}`, `{}`, `{"time":1,"context":1}`, int64(10000),
-		nil, nil, nil, nil, nil, "completed", nil, nil, nil,
+		nil, nil, nil, nil, nil, "completed", nil, nil, nil, nil, nil,
 		"req-1", int64(1),
 	)
 
 	// 列表默认按 request_id 归并（Group 缺省开启）：SQL 走 CTE grp，参数位不变。
-	mock.ExpectQuery(`SELECT count\(\*\) FROM \(\s*SELECT 1 FROM billing_records br LEFT JOIN call_logs cl .*channel_key_id = \$2.*session_id = \$4.*GROUP BY \(br.user_id::text \|\| ':' \|\| COALESCE`).
+	mock.ExpectQuery(`SELECT count\(\*\) FROM \(\s*SELECT 1 FROM billing_records br LEFT JOIN call_logs cl .*\(SELECT clk\.channel_key_id FROM call_logs clk.*br\.billing_id\) = \$2.*session_id = \$4.*GROUP BY \(br.user_id::text \|\| ':' \|\| COALESCE`).
 		WithArgs(nil, int64(3), nil, "sess-1", "", "", "", nil, nil).
 		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(1)))
 	mock.ExpectQuery(`WITH grp AS \(.*grp.rid, grp.cnt.*LIMIT \$10 OFFSET \$11`).
 		WithArgs(nil, int64(3), nil, "sess-1", "", "", "", nil, nil, 20, 0).
 		WillReturnRows(rows)
+	// 渠道密钥维度回填（billing_records 已无该列，来自 call_logs 的 1:1 快照）。
+	mock.ExpectQuery(`SELECT cl\.billing_id, cl\.channel_key_id`).
+		WithArgs("b1").
+		WillReturnRows(sqlmock.NewRows([]string{"billing_id", "channel_key_id"}).AddRow("b1", int64(3)))
 	// decorateList 反查（空结果：用户名缺失、密钥缺失触发 #<id> 兜底）。
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, username, nickname FROM users WHERE id = ANY('{1}'::bigint[])`)).
 		WillReturnRows(sqlmock.NewRows([]string{"id", "username", "nickname"}))
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, channel_id, name FROM channel_keys WHERE id = ANY('{3}'::bigint[])`)).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "channel_id", "name"}))
+	// 渠道密钥/渠道名反查已无来源（0024 删表）：decorateList 不再发这两条查询。
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/billings?ChannelKeyID=3&SessionID=sess-1", nil)
 	rec := httptest.NewRecorder()

@@ -326,6 +326,7 @@ type costStatsBody struct {
 }
 
 // TestHandleCostStats_EntityRows 断言实体聚合行：稳定键、解析出的 ID、曾用名快照、金额与合计逐位相等。
+// TestHandleCostStats_EntityRows 成本统计的行装配：实体键 = 对外模型 + 内部模型（渠道维度已下线）。
 func TestHandleCostStats_EntityRows(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
@@ -341,12 +342,12 @@ func TestHandleCostStats_EntityRows(t *testing.T) {
 			"internal_model_id", "external_model_name", "cost_credits", "sale_credits", "requests",
 			"input_tokens", "cache_read_tokens", "output_tokens", "snapshot_names",
 		}).
-			// 解析成功的实体（含 1 个曾用名）：金额 0.00001
-			AddRow("cm:900", int64(5), "渠道A", int64(900), int64(31), "gpt-4o-int", "gpt-4o",
+			// 金额 0.00001（验证 5 位小数不被抹平）+ 曾用名快照
+			AddRow("name:gpt-4o#gpt-4o-int", int64(0), "", int64(0), int64(31), "gpt-4o-int", "gpt-4o",
 				float64(0.00001), float64(0.00002), int64(3), int64(100), int64(20), int64(30),
 				`["gpt-4o","gpt-4o-legacy"]`).
-			// 解析不到的降级桶（带渠道维度；跨渠道同名会分成两行）
-			AddRow("name:ghost-model#ghost-int@0", nil, "", int64(0), int64(0), "ghost-int", "ghost-model",
+			// 解析不到对外模型的账单：仍按文本成桶
+			AddRow("name:ghost-model#ghost-int", nil, "", int64(0), int64(0), "ghost-int", "ghost-model",
 				float64(0.00002), float64(0.00003), int64(1), int64(10), int64(0), int64(5),
 				`["ghost-model"]`))
 
@@ -364,73 +365,64 @@ func TestHandleCostStats_EntityRows(t *testing.T) {
 	}
 
 	resolved := body.Data.Rows[0]
-	if resolved.EntityKey != "cm:900" || resolved.ChannelModelID != 900 || resolved.ExternalModelID != 31 {
+	if resolved.EntityKey != "name:gpt-4o#gpt-4o-int" || resolved.ExternalModelID != 31 {
 		t.Fatalf("实体键/解析 ID 错: %+v", resolved)
 	}
-	if resolved.ChannelID != 5 || resolved.ChannelName != "渠道A" || resolved.InternalModelID != "gpt-4o-int" {
-		t.Fatalf("维度字段错: %+v", resolved)
+	if resolved.ChannelID != 0 || resolved.ChannelName != "" || resolved.ChannelModelID != 0 {
+		t.Fatalf("渠道维度必须恒空（0024 已删表）: %+v", resolved)
 	}
-	if len(resolved.SnapshotNames) != 2 || resolved.SnapshotNames[0] != "gpt-4o" || resolved.SnapshotNames[1] != "gpt-4o-legacy" {
+	if resolved.CostCredits != 0.00001 || resolved.SaleCredits != 0.00002 {
+		t.Fatalf("金额被抹平: %+v", resolved)
+	}
+	if len(resolved.SnapshotNames) != 2 || resolved.SnapshotNames[0] != "gpt-4o" {
 		t.Fatalf("曾用名快照错: %+v", resolved.SnapshotNames)
 	}
 
 	fallback := body.Data.Rows[1]
-	if fallback.EntityKey != "name:ghost-model#ghost-int@0" {
-		t.Fatalf("降级桶键错: %q", fallback.EntityKey)
+	if fallback.EntityKey != "name:ghost-model#ghost-int" || fallback.ExternalModelID != 0 {
+		t.Fatalf("降级桶错: %+v", fallback)
 	}
-	if fallback.ChannelName != "(无渠道)" || fallback.ChannelModelID != 0 || fallback.ExternalModelID != 0 {
-		t.Fatalf("降级桶维度错: %+v", fallback)
-	}
-	if fallback.ExternalModelName != "ghost-model" {
-		t.Fatalf("降级桶展示名应取原始文本: %q", fallback.ExternalModelName)
+	if fallback.ChannelName != "" {
+		t.Fatalf("降级桶渠道名必须为空: %+v", fallback)
 	}
 
-	// 金额逐位相等：合计 = 各行的精确和（这里刻意用 5 位小数的最小单位验证不丢精度）。
-	if body.Data.Total.SaleCredits != 0.00005 {
-		t.Fatalf("售价合计=%v，want 0.00005", body.Data.Total.SaleCredits)
-	}
-	if body.Data.Total.CostCredits != 0.00003 {
-		t.Fatalf("成本合计=%v，want 0.00003", body.Data.Total.CostCredits)
-	}
-	if body.Data.Total.Requests != 4 {
-		t.Fatalf("请求数=%d，want 4", body.Data.Total.Requests)
-	}
-	if body.Data.Total.InputTokens != 110 || body.Data.Total.CacheReadTokens != 20 || body.Data.Total.OutputTokens != 35 {
-		t.Fatalf("token 合计错: %+v", body.Data.Total)
+	// 合计 = 全表同口径求和（不含渠道维度）。
+	if body.Data.Total.CostCredits != 0.00003 || body.Data.Total.Requests != 4 {
+		t.Fatalf("合计错: %+v", body.Data.Total)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
-		t.Fatalf("未满足的期望: %v", err)
+		t.Fatalf("unmet expectations: %v", err)
 	}
 }
 
-// TestCostStatsQuery_ProbeExclusion 守护探测行剔除口径：SQL 必须同时带上
-// 「cost 模式 + 系统探测身份 + 无 call_log」三个条件，外加 status='completed'。
 func TestCostStatsQuery_ProbeExclusion(t *testing.T) {
 	sql := costStatsQuerySQL
+	// 仍必须保留的过滤条件（探测行剔除 + 只统计 completed）。
 	for _, want := range []string{
 		"b.pricing_mode = 'cost'",
 		"u.is_system",
 		"t.display_name = 'system-probe'",
 		"NOT EXISTS (SELECT 1 FROM call_logs cl WHERE cl.billing_id = b.billing_id)",
 		"b.status = 'completed'",
-		"LEFT JOIN channel_keys k ON k.id = b.channel_key_id",
-		"DISTINCT ON (cm.channel_id, cm.internal_model_id)",
 	} {
 		if !contains(sql, want) {
 			t.Fatalf("成本统计 SQL 缺少关键条件：%s", want)
 		}
 	}
-	// 降级桶与实体键表达式必须在，且降级桶必须带渠道维度（否则跨渠道同名会被并成一行）。
-	if !contains(sql, "'cm:' || r.cm_id::text") || !contains(sql, "'name:' || b.external_model_name") {
+	// 渠道体系已下线：这些对象一个都不许再出现（出现就是 42P01 / 42703）。
+	for _, forbidden := range []string{
+		"channel_keys", "channel_models", "JOIN channels", "b.channel_key_id",
+	} {
+		if contains(sql, forbidden) {
+			t.Fatalf("成本统计 SQL 仍在引用已删除的渠道对象 %q（0024 会 42P01/42703）：%s", forbidden, sql)
+		}
+	}
+	// 实体键：只用「对外模型文本 + 内部模型」，不再带渠道段。
+	if !contains(sql, "'name:' || b.external_model_name") {
 		t.Fatalf("实体键表达式缺失：%s", sql)
 	}
-	for _, want := range []string{
-		"|| '@' || COALESCE(k.channel_id, 0)::text",
-		"'#' || b.internal_model_id || '@' || COALESCE(k.channel_id, 0)::text",
-	} {
-		if !contains(sql, want) {
-			t.Fatalf("降级桶缺少渠道维度：%s", want)
-		}
+	if contains(sql, "'@' || COALESCE(k.channel_id") {
+		t.Fatalf("实体键不应再带渠道段（渠道维度已下线）：%s", sql)
 	}
 }
 
@@ -480,7 +472,9 @@ func TestHandleCostPricingCurve_BadParam(t *testing.T) {
 
 // TestHandleCostPricingCurve_WithChannelModel 断言完整链路：全局时段/分档 → 渠道内部模型 → 反查对外模型，
 // 两条线都出点，拐点来自分档，时段系数按 At 命中高峰。
-func TestHandleCostPricingCurve_WithChannelModel(t *testing.T) {
+// TestHandleCostPricingCurve_SaleOnlyWithChannelModelParam 定价曲线：**成本线已无配置源**
+// （channel_models 被 0024 删除），传 ChannelModelID 也只能画出售价线；成本线恒不可用并带原因。
+func TestHandleCostPricingCurve_SaleOnlyWithChannelModelParam(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock: %v", err)
@@ -497,21 +491,17 @@ func TestHandleCostPricingCurve_WithChannelModel(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT value FROM sys_configs WHERE key = $1`)).
 		WithArgs("billing.context_tiers").
 		WillReturnRows(sqlmock.NewRows([]string{"value"}).AddRow([]byte(`[{"Min":0,"Max":8000,"Coeff":1.0},{"Min":8001,"Max":null,"Coeff":1.5}]`)))
-	// 3) 成本线模型
-	mock.ExpectQuery(regexp.QuoteMeta(`FROM channel_models cm`)).
-		WillReturnRows(sqlmock.NewRows([]string{"id", "channel_id", "name", "internal_model_id", "cost_rates", "time_config", "context_tiers"}).
-			AddRow(int64(900), int64(5), "渠道A", "gpt-4o-int",
-				[]byte(`{"input":1,"output":4,"cache_read":0.1}`), nil, nil))
-	// 4) 反查对外模型（售价线）
-	mock.ExpectQuery(regexp.QuoteMeta(`SELECT cm.external_model_id, em.external_name`)).
+	// 3) 售价线（对外模型）——成本线不再查库
+	mock.ExpectQuery(regexp.QuoteMeta(`FROM external_models`)).
 		WillReturnRows(sqlmock.NewRows([]string{"external_model_id", "external_name", "sale_rates", "time_config", "context_tiers"}).
 			AddRow(int64(31), "gpt-4o", []byte(`{"input":1.5,"output":6,"cache_read":0.15}`), nil, nil))
 
 	h := NewAdmin(db, nil, nil)
 	h.now = func() time.Time { return pricingTestAt(t) }
 	rec := httptest.NewRecorder()
+	// 旧前端仍会传 ChannelModelID：接受、不报错，只是不再能确定成本线。
 	h.HandleCostPricingCurve(rec, httptest.NewRequest(http.MethodGet,
-		"/api/v1/admin/cost/pricing-curve?ChannelModelID=900&Step=1000&MaxTokens=40000&HitRate=0&InOutRatio=10&At=19:30", nil))
+		"/api/v1/admin/cost/pricing-curve?ExternalModelName=gpt-4o&ChannelModelID=900&Step=1000&MaxTokens=40000&HitRate=0&InOutRatio=10&At=19:30", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -523,40 +513,29 @@ func TestHandleCostPricingCurve_WithChannelModel(t *testing.T) {
 		t.Fatalf("unmarshal: %v", err)
 	}
 	d := body.Data
-	if !d.Sale.Available || !d.Cost.Available {
-		t.Fatalf("两条线都应可用: sale=%+v cost=%+v", d.Sale, d.Cost)
+	if !d.Sale.Available {
+		t.Fatalf("售价线应可用: %+v", d.Sale)
+	}
+	if d.Cost.Available {
+		t.Fatalf("成本线必须不可用（成本价无配置源）: %+v", d.Cost)
+	}
+	if d.Cost.Reason == "" {
+		t.Fatalf("不可用的成本线必须给出原因（前端要展示）: %+v", d.Cost)
 	}
 	if d.R != costDefaultR {
-		t.Fatalf("R=%d，want %d（未注入 rProvider 时回退默认）", d.R, costDefaultR)
+		t.Fatalf("R=%d，want %d", d.R, costDefaultR)
 	}
-	if d.Sale.TimeCoeff != 1.5 || d.Cost.TimeCoeff != 1.5 {
-		t.Fatalf("19:30 应命中高峰 1.5：sale=%v cost=%v", d.Sale.TimeCoeff, d.Cost.TimeCoeff)
+	if d.Sale.TimeCoeff != 1.5 {
+		t.Fatalf("19:30 应命中高峰 1.5：%v", d.Sale.TimeCoeff)
 	}
-	if len(d.Sale.Points) != 40 || d.PointCount != 40 || d.MaxTokens != 40000 {
-		t.Fatalf("采样参数错: points=%d count=%d max=%d", len(d.Sale.Points), d.PointCount, d.MaxTokens)
+	if len(d.Sale.Points) != 40 || d.MaxTokens != 40000 {
+		t.Fatalf("采样参数错: points=%d max=%d", len(d.Sale.Points), d.MaxTokens)
 	}
-	if len(d.Sale.TierBreaks) != 1 || d.Sale.TierBreaks[0].Tokens != 8001 ||
-		d.Sale.TierBreaks[0].FromCoeff != 1.0 || d.Sale.TierBreaks[0].ToCoeff != 1.5 {
+	if len(d.Sale.TierBreaks) != 1 || d.Sale.TierBreaks[0].Tokens != 8001 {
 		t.Fatalf("拐点错: %+v", d.Sale.TierBreaks)
-	}
-	if len(d.Sale.OverTier) != 0 {
-		t.Fatalf("最后一档无上限时不应有超档: %+v", d.Sale.OverTier)
 	}
 	if d.Sale.ExternalModelID != 31 || d.Sale.Name != "gpt-4o" {
 		t.Fatalf("售价线维度错: %+v", d.Sale)
-	}
-	if d.Cost.ChannelModelID != 900 || d.Cost.ChannelID != 5 || d.Cost.ChannelName != "渠道A" {
-		t.Fatalf("成本线维度错: %+v", d.Cost)
-	}
-	// 售价必须高于成本（同一 token 下），且含系数线 > 不含系数线（系数 1.5×1.0 或 1.5×1.5）。
-	for i := range d.Sale.Points {
-		if d.Sale.Points[i].Credits <= d.Cost.Points[i].Credits {
-			t.Fatalf("第 %d 点售价应高于成本: sale=%v cost=%v", i,
-				d.Sale.Points[i].Credits, d.Cost.Points[i].Credits)
-		}
-		if d.Sale.Points[i].Credits <= d.Sale.Points[i].CreditsNoCoeff {
-			t.Fatalf("第 %d 点含系数金额应大于不含系数金额: %+v", i, d.Sale.Points[i])
-		}
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("未满足的期望: %v", err)

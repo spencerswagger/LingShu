@@ -14,21 +14,28 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	stdsync "sync"
 	"syscall"
 	"time"
 
 	"github.com/team/llmgateway/internal/config"
 	"github.com/team/llmgateway/internal/db"
+	"github.com/team/llmgateway/internal/domain/amortize"
 	"github.com/team/llmgateway/internal/domain/audit"
 	"github.com/team/llmgateway/internal/domain/billing"
 	"github.com/team/llmgateway/internal/domain/calllog"
 	"github.com/team/llmgateway/internal/domain/console"
+	"github.com/team/llmgateway/internal/domain/facadebill"
 	"github.com/team/llmgateway/internal/domain/identity"
+	"github.com/team/llmgateway/internal/domain/ledgersettle"
 	"github.com/team/llmgateway/internal/domain/magpie"
 	"github.com/team/llmgateway/internal/domain/model"
+	"github.com/team/llmgateway/internal/domain/reconcile"
 	"github.com/team/llmgateway/internal/domain/router"
+	"github.com/team/llmgateway/internal/domain/subscription"
 	"github.com/team/llmgateway/internal/domain/sync"
-	"github.com/team/llmgateway/internal/domain/tag"
+	"github.com/team/llmgateway/internal/domain/topology"
+	"github.com/team/llmgateway/internal/domain/upstream"
 	"github.com/team/llmgateway/internal/pkg/asyncwrite"
 	"github.com/team/llmgateway/internal/pkg/clientip"
 	"github.com/team/llmgateway/internal/pkg/idgen"
@@ -333,11 +340,9 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	announceSvc := identity.NewAnnouncementService(announceStore)
 	announceHandler := identity.NewAnnouncementHandler(announceSvc, userIDFrom)
 
-	// tag / model
-	tagStore := tag.NewStore(d)
-	tagSvc := tag.NewService(tagStore)
-	tagSvc.SetReadCacheEnabled(readCacheOn)
-	tagHandler := tag.NewHandler(tagSvc)
+	// model
+	// 标签域（tag）随 0024 下线：semantic_tags / channel_tags / tokens.tag_id 均已删除，
+	// 对应接口在 server.routes() 里以 410 显式停用（不再装配 Service/Handler）。
 	modelSvc := model.NewService(model.NewStore(d))
 	modelSvc.SetReadCacheEnabled(readCacheOn)
 	modelHandler := model.NewHandler(modelSvc)
@@ -407,6 +412,25 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 		cnyRate: billCfgProvider.CnyRate,
 	})
 
+	// facade 计费钩子（预扣 → 结算 / 退预扣）。口径：**无 usage 一律不计费**（整笔退预扣 +
+	// failed/no-usage 账单），估算只用于预扣，绝不出估算账。依赖不全时返回 nil → 不产生计费动作。
+	facadeBiller := facadebill.New(facadebill.Options{
+		Ledger: billSvc,
+		Wallet: creditSvc,
+		Pricer: facadeSaleRates{svc: modelSvc},
+		Logger: logr,
+	})
+	var (
+		facadeReserve  magpie.ReserveHook
+		facadeComplete magpie.Hook
+	)
+	if facadeBiller != nil {
+		facadeReserve = facadeBiller.Reserve
+		facadeComplete = facadeBiller.OnComplete
+	} else {
+		logr.Warn("facade 计费钩子未装配：/v1 转发不会产生账单与扣费")
+	}
+
 	// 代理侧 callerKey 映射的管理端入口：运维在 magpie 侧创建 callerKey 后录入灵枢
 	// （灵枢不自行签发凭据；未绑定的令牌在转发时返回 403 magpie_key_missing）。
 	magpieKeyAdmin := magpie.NewKeyAdminHandler(magpie.NewKeyStore(d), sm4Key)
@@ -421,27 +445,327 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 		Keys:          magpie.NewKeyStore(d),
 		CredentialKey: sm4Key,
 		Prefixes:      magpiePrefixes,
+		OnReserve:     facadeReserve,
+		OnComplete:    facadeComplete,
 		Logger:        logr,
 	})
 	if magpieHandler == nil {
 		logr.Info("未配置 magpie.base_url：对外转发接口保持停用（410）")
 	}
 
+	// V2 运行参数（F1 三键：基址 / 两段超时 / 三开关）。凭据不进配置表：
+	// 上游鉴权头只在装配层从环境变量取，转发链逐请求注入。
+	// 注：/v1 转发基址由 magpie.* 配置提供；upstream.* 只服务账本同步 / 对账 / 结算三条后台链。
+	upstreamCfg := upstream.NewConfigProvider(billStore)
+	if upCfg, problems := upstreamCfg.Load(context.Background()); true {
+		for _, pb := range problems {
+			logr.Warn("上游配置有问题（已按字段回落默认值）", "problem", pb)
+		}
+		logr.Info("账本同步运行参数",
+			"base_url_set", upCfg.BaseURL != "",
+			"stream_first_byte_ms", upCfg.Timeouts.StreamFirstByte.Milliseconds(),
+			"stream_idle_ms", upCfg.Timeouts.StreamIdle.Milliseconds())
+	}
+
+	// 降级开关的热生效读取器（TTL 5s）：`ConfigProvider.Load` 的缓存**没有 TTL**，
+	// `Invalidate()` 今天没有生产调用点（`/admin/configs/system` 不写 upstream.* 三键），
+	// 所以每请求直接 Load 拿到的是**启动时冻结的值** —— 运维关掉开关不重启就无效（真机复现过）。
+	// 这层每 TTL 周期至多一次 DB 读，改动 5s 内生效。
+	gate := upstream.NewDegradeGate(upstreamCfg, 5*time.Second)
+
+	// 转发降级开关（sys_configs：upstream.degrade.passthrough_enabled）。
+	//
+	// 只读开关本身，**不看** upstream.base_url：那个基址只服务账本同步/对账，
+	// 未配置（默认空串）是正常态，拿它当门会把所有 /v1 请求关成 503。
+	// 开关关 → /v1 与 /v1beta 返回 503 + 明确文案（不代理、不计费、不落账单）。
+	if magpieHandler != nil {
+		magpieHandler.SetGate(func() bool { return gate.Passthrough(context.Background()) })
+	}
+
+	// D4：对账窗口的四列计数由对账服务在窗口结束时写入（四个 0 等于「漏账不可见」）。
+	// 只落计数与状态；七列归因的读取方属阶段二（本期不做）。
+	windowStore := upstream.NewSQLWindowStore(d)
+	recon := reconcile.NewReconciler(reconcile.Options{
+		Local:    reconcile.NewLocalSource(d),
+		Upstream: reconcile.NewUpstreamSource(d),
+		Counts:   windowStore,
+		States:   windowStore,
+		Streaks:  windowStore,
+		// ⚠️ 必须用 LedgerActive（= 基址已配 && 开关开），不是裸的账本开关字段：
+		// `upstream.base_url` 默认是空串（且没有管理端写入口），只看开关的话每轮都会「成功跑完
+		// 0 笔」并把窗口写成 status=ok / 0 对 0 —— 漏账从此看起来像正常，正是 0023/D4 要防的那种假绿。
+		// 基址没配 ⇒ 账本拉取停摆 ⇒ 窗口落 skipped（不是 blocked，不冒充「已对平」）。
+		// 走 gate（TTL 5s）而不是每请求 Load：后者拿到的是启动时冻结的配置。
+		LedgerEnabled: func() bool { return gate.LedgerActive(context.Background()) },
+		Logger:        logr,
+	})
+	// F9：账本同步轮次（拉代理侧用量变更流 → 幂等落 ledger_entries）。
+	//
+	// 口径（2026-11-17 按代理侧真实报文适配）：
+	//  ① 用官方 cursor 变更流（cursor=start|now|<next_cursor>），不再用 from/to 时刻过滤
+	//     （代理侧没有这两个参数，只有 period/day；cursor 才是「自建账本」的官方方式）；
+	//  ② 排序不再依赖 occurred_at ASC：cursor feed 按 seq 推变更，按 id upsert 天然幂等；
+	//  ③ 续读游标持久化在 reconcile_windows.detail->>'ledger_cursor'，重启不重放整本账；
+	//  ④ 60s ticker + 空轮告警（`RunOnce` 的 Empty 会打 WARN，不再 0 行 + nil 静默空转）。
+	ledgerURL := strings.TrimSpace(os.Getenv("UPSTREAM_LEDGER_URL"))
+	adminKey := strings.TrimSpace(os.Getenv("UPSTREAM_ADMIN_KEY"))
+	adminHeader := strings.TrimSpace(os.Getenv("UPSTREAM_ADMIN_AUTH_HEADER"))
+	if ledgerURL == "" {
+		logr.Warn("未配置上游账本端点，账本同步轮次不运行（不落 blocked、不产生假告警）",
+			"env", "UPSTREAM_LEDGER_URL")
+	}
+	// 代理侧 cost 是 USD；灵枢账本列是积分。换算与订阅录入同源（积分 = 元 × 1e6 ÷ R，
+	// USD 先按 billing.cny_rate 折成人民币），配置缺失时该页报错（blocked），不静默写 0 成本。
+	// 换算按页缓存：CostConverter 是**逐行**调用的，直接读配置会让一页 500 行打 1000 次库。
+	var (
+		convMu     stdsync.Mutex
+		convRate   float64
+		convR      int64
+		convLoaded time.Time
+	)
+	costConv := func(usd float64) (float64, error) {
+		convMu.Lock()
+		defer convMu.Unlock()
+		if convRate <= 0 || time.Since(convLoaded) > time.Minute {
+			rate, err := billCfgProvider.CnyRate()
+			if err != nil {
+				return 0, fmt.Errorf("读取 billing.cny_rate 失败：%w", err)
+			}
+			r, err := billCfgProvider.R()
+			if err != nil {
+				return 0, fmt.Errorf("读取 billing.r 失败：%w", err)
+			}
+			if rate <= 0 || r <= 0 {
+				return 0, fmt.Errorf("汇率/R 非法（cny_rate=%v r=%d）", rate, r)
+			}
+			convRate, convR, convLoaded = rate, r, time.Now()
+		}
+		return usd * convRate * 1e6 / float64(convR), nil
+	}
+	syncSrc := upstream.NewMagpieLedgerSource(ledgerURL, adminKey, adminHeader, nil, costConv)
+	rounder := upstream.NewRounder(upstream.RounderOptions{
+		Feed:    syncSrc,
+		Ledger:  upstream.NewLedgerStore(d),
+		Windows: windowStore,
+		Now:     time.Now,
+		Logger:  logr,
+	})
+	go func() {
+		// 60s 一跳：与窗口宽度同量级。
+		t := time.NewTicker(time.Minute)
+		defer t.Stop()
+		for range t.C {
+			func() {
+				defer func() {
+					if rec := recover(); rec != nil {
+						logr.Error("账本同步轮次 panic", "panic", rec)
+					}
+				}()
+				// 端点没配 = 不拉取、也不落 blocked（落 blocked 会每分钟制造一次假告警，
+				// 运营会以为「积压没拉完」，实际是没配置）。
+				if ledgerURL == "" {
+					return
+				}
+				// 降级开关：sync 关 = 停摆（沿用上期数据），不是失败。
+				if c, _ := upstreamCfg.Load(context.Background()); !c.SyncActive() {
+					return
+				}
+				res, err := rounder.RunOnce(context.Background())
+				switch {
+				case res.Empty && err == nil:
+					// RunOnce 内部已打 WARN（sync.round empty），这里只补一条可聚合的计数口径。
+					logr.Warn("账本同步空轮（计数器）", "sync_round_empty", 1,
+						"window", res.Window.String())
+				case err != nil:
+					logr.Warn("账本同步轮次未完成", "err", err,
+						"window", res.Window.String(), "pages", res.Pages,
+						"fetched", res.Fetched, "inserted", res.Inserted)
+				}
+			}()
+		}
+	}()
+
+	// 阶段二 A1：预扣过期扫描（15 分钟未终结 → 全额退回）。
+	// 一跳 60s：过期点是「15 分钟 + 最多 1 分钟」，对资金回收足够；单轮走一个事务 + SKIP LOCKED，多副本安全。
+	go func() {
+		t := time.NewTicker(time.Minute)
+		defer t.Stop()
+		for range t.C {
+			func() {
+				defer func() {
+					if rec := recover(); rec != nil {
+						logr.Error("预扣过期扫描 panic", "panic", rec)
+					}
+				}()
+				res, err := creditSvc.ExpireHolds(context.Background(), time.Now(), 200)
+				if err != nil {
+					logr.Warn("预扣过期扫描失败（下轮重试）", "err", err)
+					return
+				}
+				if res.Expired > 0 {
+					logr.Info("退回超时未结算的预扣", "holds", res.Expired, "credits", res.Amount)
+				}
+			}()
+		}
+	}()
+
+	// 阶段二 A3：账本结算（账本条目 → 账单成本列 + 预扣登记）。
+	// 与同步轮次分开的 60s 循环：同步负责「拉」，结算负责「挂」，两者失败互不影响。
+	settler := ledgersettle.NewMatcher(ledgersettle.Options{
+		Store:  ledgersettle.NewSQLStore(d),
+		Now:    time.Now,
+		Logger: logr,
+	})
+	go func() {
+		t := time.NewTicker(time.Minute)
+		defer t.Stop()
+		for range t.C {
+			func() {
+				defer func() {
+					if rec := recover(); rec != nil {
+						logr.Error("账本结算轮次 panic", "panic", rec)
+					}
+				}()
+				res, err := settler.RunOnce(context.Background())
+				if err != nil {
+					logr.Warn("账本结算轮次失败（窗口保留待下轮）", "err", err)
+					return
+				}
+				if res.Linked > 0 || res.UnmatchedBilling > 0 || res.UnmatchedLedger > 0 {
+					logr.Info("账本结算轮次完成",
+						"linked", res.Linked, "skipped", res.Skipped,
+						"unmatched_billing", res.UnmatchedBilling,
+						"unmatched_ledger", res.UnmatchedLedger, "cost", res.Cost)
+				}
+			}()
+		}
+	}()
+
+	// 阶段二 A5：订阅月费分摊（固定成本摊到当期账单）。
+	// 5 分钟一跳：账本条目迟到会让某些行从「可摊」变成「已挂账本」，重算即收敛；
+	// 写的是 SET 不是累加，频率高低都不影响结果。
+	amortizer := amortize.NewAllocator(amortize.Options{
+		Store:  amortize.NewSQLStore(d),
+		Now:    time.Now,
+		Logger: logr,
+	})
+	go func() {
+		t := time.NewTicker(5 * time.Minute)
+		defer t.Stop()
+		for range t.C {
+			func() {
+				defer func() {
+					if rec := recover(); rec != nil {
+						logr.Error("月费分摊轮次 panic", "panic", rec)
+					}
+				}()
+				res, err := amortizer.RunOnce(context.Background())
+				if err != nil {
+					logr.Warn("月费分摊轮次失败（下轮重试）", "err", err)
+					return
+				}
+				if res.Updated > 0 || res.Unallocated > 0 {
+					logr.Info("月费分摊轮次完成",
+						"subscriptions", res.Subscriptions, "skipped", res.Skipped,
+						"updated", res.Updated, "allocated", res.Allocated,
+						"unallocated", res.Unallocated)
+				}
+			}()
+		}
+	}()
+
+	go func() {
+		// 60s 一跳：与窗口宽度同量级，窗口结束后下一跳就能被算上。
+		t := time.NewTicker(time.Minute)
+		defer t.Stop()
+		for range t.C {
+			func() {
+				// 单轮 panic 不许带走进程（对账是后台任务，崩了应告警继续）。
+				defer func() {
+					if rec := recover(); rec != nil {
+						logr.Error("对账轮次 panic", "panic", rec)
+					}
+				}()
+				if _, err := recon.RunOnce(context.Background()); err != nil {
+					logr.Warn("对账轮次失败（窗口保持待重算）", "err", err)
+				}
+			}()
+		}
+	}()
+
+	// 阶段三 T1/T3：上游拓扑（internal_models 镜像）。
+	//
+	// 真源在网关：模型清单 `/v1/models` + 组清单 `/api/groups`（口径见《2026-11-15-v2-upgrade》）。
+	// 基址默认取 magpie 基址，可用 TOPOLOGY_SOURCE_URL / TOPOLOGY_SOURCE_KEY 覆盖
+	// （网关与转发口不同源时用得上；密钥永远来自环境变量，不进 sys_configs）。
+	topoURL := strings.TrimSpace(os.Getenv("TOPOLOGY_SOURCE_URL"))
+	if topoURL == "" {
+		topoURL = cfg.Magpie.BaseURL
+	}
+	topoKey := strings.TrimSpace(os.Getenv("TOPOLOGY_SOURCE_KEY"))
+	if topoKey == "" {
+		topoKey = cfg.Magpie.AdminKey
+	}
+	topoStore := topology.NewSQLStore(d)
+	topoSource := topology.NewHTTPGatewaySource(topoURL, topoKey, cfg.Magpie.AuthHeader, nil)
+	topoSyncer := topology.NewSyncer(topology.SyncerOptions{
+		Source: topoSource,
+		Store:  topoStore,
+		Now:    time.Now,
+		Logger: logr,
+	})
+	topologyHandler := topology.NewHandler(topoStore, topoSyncer)
+	if topoSource.Configured() {
+		// 10 分钟一跳：拓扑变动（上/下线模型）远慢于账单；手动 T3 随时可触发同一份实现。
+		go func() {
+			t := time.NewTicker(10 * time.Minute)
+			defer t.Stop()
+			for range t.C {
+				func() {
+					defer func() {
+						if rec := recover(); rec != nil {
+							logr.Error("拓扑同步轮次 panic", "panic", rec)
+						}
+					}()
+					if _, err := topoSyncer.RunOnce(context.Background()); err != nil {
+						logr.Warn("拓扑同步轮次失败（保留上期快照）", "err", err)
+					}
+				}()
+			}
+		}()
+	} else {
+		// 不静默：没配基址时 T3 会明确报 topology_source_not_configured，
+		// 这里再留一条启动日志，免得运维以为是同步器坏了。
+		logr.Warn("未配置网关拓扑源（magpie.base_url / TOPOLOGY_SOURCE_URL）：拓扑同步不可用",
+			"topology", "disabled")
+	}
+
+	// 阶段三 S2/S6：订阅录入（A5 月费分摊的唯一入口）+ 手工重算。
+	// 录入端收「元/美元」，落库 price_amount 是积分（×1e6÷R，USD 先 × cny_rate）。
+	subscriptionSvc := subscription.NewService(subscription.Options{
+		Store:  subscription.NewSQLStore(d),
+		Config: billCfgProvider,
+		Audit:  auditStore,
+		Logger: logr,
+	})
+	subscriptionHandler := subscription.NewHandler(subscriptionSvc, amortizer, auditStore, logr)
+
 	return &app{
 		deps: server.Deps{
-			Identity:     identityHandler,
-			AdminUser:    adminUserHandler,
-			Credit:       creditHandler,
-			TokenAdmin:   tokenAdminHandler,
-			TokenDev:     tokenDevHandler,
-			Tag:          tagHandler,
-			Model:        modelHandler,
-			Announcement: announceHandler,
-			Console:      consoleAdmin,
-			DevConsole:   consoleDev,
-			SyncAdmin:    syncHandler,
-			Facade:       magpieHandler,
-			MagpieKey:    magpieKeyAdmin,
+			Identity:      identityHandler,
+			AdminUser:     adminUserHandler,
+			Credit:        creditHandler,
+			TokenAdmin:    tokenAdminHandler,
+			TokenDev:      tokenDevHandler,
+			Model:         modelHandler,
+			Announcement:  announceHandler,
+			Console:       consoleAdmin,
+			DevConsole:    consoleDev,
+			SyncAdmin:     syncHandler,
+			Facade:        magpieHandler,
+			MagpieKey:     magpieKeyAdmin,
+			Topology:      topologyHandler,
+			Subscriptions: subscriptionHandler,
 		},
 		syncer:     syncer,
 		sess:       sess,
@@ -450,6 +774,43 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 		auditStore: auditStore,
 		writer:     asyncWriter,
 	}, nil
+}
+
+// creditHoldAdapter 把 identity.CreditService 的预扣登记能力适配为 gateway.HoldOps（阶段二 A1）。
+type creditHoldAdapter struct {
+	svc *identity.CreditService
+}
+
+func (a *creditHoldAdapter) ReserveHold(ctx context.Context, billingID string, userID, tokenID int64, amount float64, sessionID, remark string) error {
+	var tid *int64
+	if tokenID != 0 {
+		id := tokenID
+		tid = &id
+	}
+	_, err := a.svc.PreConsumeHold(ctx, identity.HoldRequest{
+		BillingID: billingID,
+		UserID:    userID,
+		TokenID:   tid,
+		Amount:    amount,
+		SessionID: sessionID,
+		Remark:    remark,
+	})
+	return err
+}
+
+func (a *creditHoldAdapter) CloseHold(ctx context.Context, billingID, status, ledgerEntryID string) (bool, error) {
+	return a.svc.CloseHold(ctx, billingID, status, ledgerEntryID)
+}
+
+// facadeSaleRates 把 model.Service 适配为 facadebill.Pricer（售价 + 模型级时段/分档）。
+type facadeSaleRates struct{ svc *model.Service }
+
+func (a facadeSaleRates) SaleRatesFor(ctx context.Context, externalModel string) (billing.Rates, *billing.TimeCoeffConfig, []billing.TierRule, error) {
+	m, err := a.svc.GetByExternalName(ctx, externalModel)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return m.SaleRates, m.TimeConfig, m.ContextTiers, nil
 }
 
 // priceRefAdapter 把 sync.Syncer 适配为 model.PriceSource，供对外模型价格参考/应用售价接口使用。
@@ -501,28 +862,16 @@ func (a priceRefAdapter) LastUpdated() time.Time {
 	return a.syncer.LastUpdated()
 }
 
-// keyNameResolver 装配渠道密钥名称批量反查钩子（console.Admin.SetKeyNameResolver）：
-// 会话列表/账单展示的 channel_key_name 由任一 channel_keys 批量查询填充；空列表直接返回。
+// keyNameResolver 装配渠道密钥名称批量反查钩子（console.Admin.SetKeyNameResolver）。
+//
+// ⚠️ 渠道体系已下线（0024 删了 channel_keys）：**没有来源了**，恒返回空 map，
+// 于是 channel_key_name 在各列表/详情里恒为空串（前端按空串渲染，结构不变）。
+// 保留装配点是为了让 console 的既有调用链不变；后续可连同钩子一起删。
 func keyNameResolver(db *sql.DB) func(ctx context.Context, ids []int64) (map[int64]string, error) {
+	_ = db
 	return func(ctx context.Context, ids []int64) (map[int64]string, error) {
-		if len(ids) == 0 {
-			return nil, nil
-		}
-		rows, err := db.QueryContext(ctx,
-			`SELECT id, name FROM channel_keys WHERE id = ANY($1)`, ids)
-		if err != nil {
-			return nil, err
-		}
-		defer rows.Close()
-		out := make(map[int64]string, len(ids))
-		for rows.Next() {
-			var id int64
-			var name string
-			if err := rows.Scan(&id, &name); err != nil {
-				return nil, err
-			}
-			out[id] = name
-		}
-		return out, rows.Err()
+		_ = ctx
+		_ = ids
+		return nil, nil
 	}
 }

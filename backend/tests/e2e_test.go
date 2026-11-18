@@ -39,7 +39,6 @@ import (
 	"github.com/team/llmgateway/internal/domain/identity"
 	"github.com/team/llmgateway/internal/domain/model"
 	"github.com/team/llmgateway/internal/domain/sync"
-	"github.com/team/llmgateway/internal/domain/tag"
 	"github.com/team/llmgateway/internal/pkg/jwtx"
 	"github.com/team/llmgateway/internal/pkg/logger"
 	"github.com/team/llmgateway/internal/pkg/ratelimit"
@@ -182,9 +181,6 @@ func buildTestServer(t *testing.T, dsn string) (*httptest.Server, func()) {
 	announceSvc := identity.NewAnnouncementService(announceStore)
 	announceHandler := identity.NewAnnouncementHandler(announceSvc, userIDFrom)
 
-	tagStore := tag.NewStore(d)
-	tagSvc := tag.NewService(tagStore)
-	tagHandler := tag.NewHandler(tagSvc)
 	modelSvc := model.NewService(model.NewStore(d))
 	modelHandler := model.NewHandler(modelSvc)
 
@@ -205,7 +201,6 @@ func buildTestServer(t *testing.T, dsn string) (*httptest.Server, func()) {
 			Credit:       creditHandler,
 			TokenAdmin:   tokenAdminHandler,
 			TokenDev:     tokenDevHandler,
-			Tag:          tagHandler,
 			Model:        modelHandler,
 			Announcement: announceHandler,
 			Console:      consoleAdmin,

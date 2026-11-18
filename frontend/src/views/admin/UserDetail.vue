@@ -324,7 +324,12 @@ async function onResetTotp() {
                       <span class="pop-label">修改计价模式</span>
                       <div class="pop-actions">
                         <el-button v-if="user.PricingMode !== 'sale'" size="small" type="success" plain @click="saveAttr({ PricingMode: 'sale' }, '已切换为按售价')">按售价</el-button>
-                        <el-button v-if="user.PricingMode !== 'cost'" size="small" type="warning" plain @click="saveAttr({ PricingMode: 'cost' }, '已切换为按成本')">按成本</el-button>
+                        <!-- 口径 D-1（Spec P10）：V2 无成本单价真源 → cost 不可选，只能从 cost 切走。 -->
+                        <el-tooltip content="成本模式已停用：V2 无成本单价真源（口径 D-1）。已有 cost 用户的新请求会被拒绝。" placement="top">
+                          <span>
+                            <el-button v-if="user.PricingMode !== 'cost'" size="small" type="warning" plain disabled>按成本</el-button>
+                          </span>
+                        </el-tooltip>
                       </div>
                     </div>
                   </el-popover>

@@ -20,7 +20,6 @@ import (
 	"github.com/team/llmgateway/internal/domain/identity"
 	"github.com/team/llmgateway/internal/domain/model"
 	"github.com/team/llmgateway/internal/domain/sync"
-	"github.com/team/llmgateway/internal/domain/tag"
 	"github.com/team/llmgateway/internal/pkg/resp"
 )
 
@@ -35,7 +34,6 @@ func newGoneTestServer(t *testing.T) *Server {
 		Credit:       &identity.CreditHandler{},
 		TokenAdmin:   &identity.TokenHandler{},
 		TokenDev:     &identity.TokenHandler{},
-		Tag:          &tag.Handler{},
 		Model:        &model.Handler{},
 		Announcement: &identity.AnnouncementHandler{},
 		Console:      &console.Admin{},

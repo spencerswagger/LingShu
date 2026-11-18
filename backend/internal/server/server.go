@@ -14,8 +14,9 @@ import (
 	"github.com/team/llmgateway/internal/domain/identity"
 	"github.com/team/llmgateway/internal/domain/magpie"
 	"github.com/team/llmgateway/internal/domain/model"
+	"github.com/team/llmgateway/internal/domain/subscription"
 	"github.com/team/llmgateway/internal/domain/sync"
-	"github.com/team/llmgateway/internal/domain/tag"
+	"github.com/team/llmgateway/internal/domain/topology"
 	"github.com/team/llmgateway/internal/pkg/jwtx"
 	"github.com/team/llmgateway/internal/pkg/reqmeta"
 	"github.com/team/llmgateway/internal/pkg/resp"
@@ -32,7 +33,6 @@ type Deps struct {
 	Credit       *identity.CreditHandler
 	TokenAdmin   *identity.TokenHandler
 	TokenDev     *identity.TokenHandler
-	Tag          *tag.Handler
 	Model        *model.Handler
 	Announcement *identity.AnnouncementHandler
 	Console      *console.Admin
@@ -40,6 +40,10 @@ type Deps struct {
 	// MagpieKey 是代理侧 callerKey 映射的管理端接口（nil = 不挂载）。
 	MagpieKey *magpie.KeyAdminHandler
 	SyncAdmin *sync.Handler
+	// Topology 是上游拓扑（T1 查询 / T3 手动同步）；nil = 不挂载。
+	Topology *topology.Handler
+	// Subscriptions 是订阅录入（S2）与手工重算（S6）；nil = 不挂载。
+	Subscriptions *subscription.Handler
 	// Facade 是代理侧转发入口（/v1 与 /v1beta）。nil = 未配置 magpie.base_url，
 	// 此时 /v1 保持 410 停用口径（不半残挂载：转发链与准入是一体的，缺一即不可用）。
 	Facade *magpie.Handler
@@ -185,11 +189,13 @@ func (s *Server) routes() {
 	// 会话渠道轨迹（只读，恒可用）。
 	admin.HandleFunc("GET /api/v1/admin/cost/session/{id}/trace", d.Console.HandleCostSessionTrace)
 
-	// tags
-	admin.HandleFunc("GET /api/v1/admin/tags", d.Tag.HandleList)
-	admin.HandleFunc("POST /api/v1/admin/tags", d.Tag.HandleCreate)
-	admin.HandleFunc("PUT /api/v1/admin/tags/{id}", d.Tag.HandleUpdate)
-	admin.HandleFunc("POST /api/v1/admin/tags/batch-delete", d.Tag.HandleBatchDelete)
+	// 标签（semantic_tags / channel_tags·已停用）：0024 已删这两张表，标签路由能力整体下线。
+	for _, path := range []string{
+		"GET /api/v1/admin/tags", "POST /api/v1/admin/tags",
+		"PUT /api/v1/admin/tags/{id}", "POST /api/v1/admin/tags/batch-delete",
+	} {
+		admin.HandleFunc(path, goneHandler)
+	}
 
 	// models（对外模型）
 	admin.HandleFunc("GET /api/v1/admin/models", d.Model.HandleListAdmin)
@@ -209,6 +215,24 @@ func (s *Server) routes() {
 	// billings / stats / configs / sessions
 	admin.HandleFunc("GET /api/v1/admin/billings", d.Console.HandleListBillings)
 	admin.HandleFunc("GET /api/v1/admin/billings/stats", d.Console.HandleBillingsStats)
+	// 阶段二 A6：盈亏（收入 vs 成本）与对账窗口（漏账可见）。
+	admin.HandleFunc("GET /api/v1/admin/ops/pnl", d.Console.HandlePnL)
+	admin.HandleFunc("GET /api/v1/admin/ops/reconcile-windows", d.Console.HandleReconcileWindows)
+	// 阶段三 T1/T3：上游拓扑（四层聚合 + 手动同步）。与后台定时同步共用一份实现。
+	if d.Topology != nil {
+		admin.HandleFunc("GET /api/v1/admin/topology", d.Topology.HandleGet)
+		admin.HandleFunc("POST /api/v1/admin/topology/sync", d.Topology.HandleSync)
+		// T2：画布落位（只写坐标，不写绑定 —— 绑定真源是 external_models.bound_internal_ref）。
+		admin.HandleFunc("PUT /api/v1/admin/topology/links", d.Topology.HandlePutLinks)
+	}
+	// 阶段三 S2/S6：订阅录入（A5 月费分摊的唯一入口）与手工重算。
+	// 成本侧数据只给 ADMIN：整段已由 /api/v1/admin 前缀守卫，不提供 /dev 同义端点。
+	if d.Subscriptions != nil {
+		admin.HandleFunc("GET /api/v1/admin/subscriptions", d.Subscriptions.HandleList)
+		admin.HandleFunc("GET /api/v1/admin/subscriptions/form-options", d.Subscriptions.HandleFormOptions)
+		admin.HandleFunc("POST /api/v1/admin/subscriptions", d.Subscriptions.HandleCreate)
+		admin.HandleFunc("POST /api/v1/admin/subscriptions/amortize/run", d.Subscriptions.HandleAmortizeRun)
+	}
 	admin.HandleFunc("GET /api/v1/admin/billings/{billing_id}", d.Console.HandleGetBilling)
 	admin.HandleFunc("GET /api/v1/admin/stats/dashboard", d.Console.HandleStatsDashboard)
 	admin.HandleFunc("GET /api/v1/admin/stats/live", d.Console.HandleStatsLive)
@@ -243,7 +267,8 @@ func (s *Server) routes() {
 	dev.HandleFunc("POST /api/v1/dev/tokens/{id}/rotate", d.TokenDev.HandleDevRotate)
 	dev.HandleFunc("POST /api/v1/dev/tokens/{id}/toggle", d.TokenDev.HandleDevToggle)
 	dev.Handle("GET /api/v1/dev/tokens/{id}/secret", WithAuditSensitiveRead(s.audit, s.logger)(http.HandlerFunc(d.TokenDev.HandleDevSecret)))
-	dev.HandleFunc("GET /api/v1/dev/tags", d.Tag.HandleList) // 列表过滤由 query enabled=true 控制
+	// 标签（语义标签·已停用；0024 删表）
+	dev.HandleFunc("GET /api/v1/dev/tags", gonePublicHandler)
 	// 只读“可用模型”：服务端强制仅返回启用项，忽略客户端 ?Enabled= 覆盖。
 	dev.HandleFunc("GET /api/v1/dev/models", func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()

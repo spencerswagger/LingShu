@@ -39,6 +39,8 @@ const (
 	CodeServiceUnavailable = "service_unavailable"
 	CodeUpstreamTimeout    = "upstream_timeout"
 	CodeInternal           = "internal_error"
+	// CodeInsufficientQuota 是「预扣/余额不足」（402）。与上游的 402 区分：这是我们自己的账。
+	CodeInsufficientQuota = "insufficient_quota"
 )
 
 // WriteDeny 按入站协议形状写出拒绝/失败响应。

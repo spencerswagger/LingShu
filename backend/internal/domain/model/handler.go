@@ -51,6 +51,13 @@ type adminViewModel struct {
 	viewModel
 	// MagpieModel 为代理侧模型名；nil = 未映射（不转发）。
 	MagpieModel *string `json:"MagpieModel"`
+	// BoundInternalRef 为绑定的内部模型 ref；null = 未绑定（绑定功能未上线，暂不拦截）。
+	// 管理端列表必须返回它：前端靠「字段存在且为空」渲染「未绑定」提醒条，
+	// 字段缺失时该提醒永不出现，运营就看不到哪些模型还没绑内部模型。
+	// 口径：本期只登记与展示，**不做拦截**（未绑定的启用模型仍可被调用，
+	// 见 0019_v2_topology.sql 头部「事实校正」）；要改成「未绑定即不售卖」需产品拍板。
+	// 无一处 omitempty —— 未绑定要显式给 null，而不是「字段不存在」。
+	BoundInternalRef *string `json:"BoundInternalRef"`
 }
 
 func toView(m *ExternalModel) viewModel {
@@ -70,7 +77,7 @@ func toView(m *ExternalModel) viewModel {
 
 // toAdminView 在对外视图上补代理侧映射（只用于管理端响应）。
 func toAdminView(m *ExternalModel) adminViewModel {
-	return adminViewModel{viewModel: toView(m), MagpieModel: m.MagpieModel}
+	return adminViewModel{viewModel: toView(m), MagpieModel: m.MagpieModel, BoundInternalRef: m.BoundInternalRef}
 }
 
 type createModelRequest struct {

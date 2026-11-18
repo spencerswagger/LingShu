@@ -485,6 +485,28 @@ const bigStats = computed<BigStat[]>(() => {
   ]
 })
 
+// ===== ②+ 成本与毛利（P01）=====
+// 只在后端真的返回了 Revenue / Cost 时才渲染数字；否则整块退化成一句说明 + 指路盈亏页。
+// 理由：成本是账本实付 + 订阅摊销两条真源，拿「消费积分」当成本会把毛利率算成 0%。
+function money5(v: number | null | undefined): string {
+  if (v == null) return '—'
+  return v.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 5 })
+}
+
+const costBlock = computed(() => {
+  const k = data.value?.KPI
+  if (!k || (k.Revenue == null && k.Cost == null)) return null
+  return {
+    Revenue: money5(k.Revenue),
+    Cost: money5(k.Cost),
+    Ledger: money5(k.LedgerCost),
+    Amortized: money5(k.AmortizedCost),
+    // 收入 ≤ 0 时后端返回 null → 显示「—」，不是 0%
+    MarginPct: k.MarginPct == null ? '—' : `${(k.MarginPct * 100).toFixed(2)}%`,
+    Uncosted: k.Uncosted ?? 0,
+  }
+})
+
 // ===== ② 小指标行 =====
 interface MiniStat {
   label: string
@@ -1053,6 +1075,37 @@ const modeLabel = (m: string) =>
         </div>
       </div>
 
+      <!-- ②+' 成本与毛利（P01）：只有管理端看得到。
+           后端现状：/stats/dashboard 不返回 Revenue/Cost/MarginPct（M1 未改造），
+           所以这里**不推断、不用消费积分冒充成本**，改为如实说明并指路盈亏页。 -->
+      <div v-if="isAdmin" class="cost-strip">
+        <template v-if="costBlock">
+          <div class="cost-item">
+            <span class="cost-label">收入（积分）</span>
+            <strong>{{ costBlock.Revenue }}</strong>
+          </div>
+          <div class="cost-item">
+            <span class="cost-label">成本（积分）</span>
+            <strong>{{ costBlock.Cost }}</strong>
+            <span class="cost-sub">账本 {{ costBlock.Ledger }} · 摊销 {{ costBlock.Amortized }}</span>
+          </div>
+          <div class="cost-item">
+            <span class="cost-label">毛利率</span>
+            <strong>{{ costBlock.MarginPct }}</strong>
+            <span v-if="costBlock.Uncosted" class="cost-sub is-warn">
+              {{ costBlock.Uncosted }} 次请求无成本口径，毛利偏高
+            </span>
+          </div>
+        </template>
+        <template v-else>
+          <span class="cost-note">
+            成本/毛利不在本页：统计接口当前只返回收入侧（消费积分），成本真源在盈亏页
+            （账本实付 + 订阅摊销）。这里不拿消费积分反推成本。
+          </span>
+          <el-button size="small" text type="primary" @click="$router.push('/admin/pnl')">去盈亏页</el-button>
+        </template>
+      </div>
+
       <!-- ③ 两张图：四日对比趋势 + 模型广场 -->
       <div class="chart-stack">
         <div class="card">
@@ -1526,6 +1579,45 @@ const modeLabel = (m: string) =>
   grid-template-columns: repeat(auto-fit, minmax(168px, 1fr));
   gap: 10px;
   margin-bottom: 14px;
+}
+/* 成本与毛利条（P01）：真数据是三个格子，未就绪时是一行说明 */
+.cost-strip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 24px;
+  padding: 10px 14px;
+  margin-bottom: 14px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-m);
+  font-size: 13px;
+}
+.cost-item {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.cost-label {
+  color: var(--color-text-tertiary);
+}
+.cost-item strong {
+  font-size: 16px;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text);
+}
+.cost-sub {
+  font-size: 12px;
+  color: var(--color-text-tertiary);
+}
+.cost-sub.is-warn {
+  color: var(--color-warning);
+}
+.cost-note {
+  color: var(--color-text-secondary);
+  line-height: 1.6;
+  flex: 1;
+  min-width: 240px;
 }
 .mini-card {
   display: flex;
