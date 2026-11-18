@@ -29,6 +29,7 @@ import (
 	"github.com/team/llmgateway/internal/domain/identity"
 	"github.com/team/llmgateway/internal/domain/ledgersettle"
 	"github.com/team/llmgateway/internal/domain/magpie"
+	"github.com/team/llmgateway/internal/domain/magpieaccess"
 	"github.com/team/llmgateway/internal/domain/model"
 	"github.com/team/llmgateway/internal/domain/reconcile"
 	"github.com/team/llmgateway/internal/domain/router"
@@ -104,9 +105,60 @@ func sm4KeyFromConfig(cfg *config.Config) []byte {
 	return kb
 }
 
+// magpieJumpKey 读取代理侧管理面票据的 HMAC 密钥（32 字节，即 64 个 hex 字符）。
+//
+// 与 SM4/JWT 密钥同法自举：环境变量 > keys/magpie_jump.key > 首次生成并落盘（chmod 600）。
+// 独立于 sm4.key：轮换它只会让已发出的门票全部失效（所有人回灵枢再点一次按钮），
+// 不会影响渠道凭据解密——两件事不该共用一把钥匙。
+func magpieJumpKey() []byte {
+	const (
+		envName = "MAGPIE_JUMP_KEY"
+		keyPath = "keys/magpie_jump.key"
+	)
+	if v := strings.TrimSpace(os.Getenv(envName)); v != "" {
+		b, err := hex.DecodeString(v)
+		if err != nil || len(b) != 32 {
+			slog.Error("MAGPIE_JUMP_KEY 非法：必须为 64 位 hex（32 字节）。留空则自动从 keys/magpie_jump.key 生成/复用", "env", envName)
+			os.Exit(1)
+		}
+		return b
+	}
+	if raw, err := os.ReadFile(keyPath); err == nil {
+		b, derr := hex.DecodeString(strings.TrimSpace(string(raw)))
+		if derr != nil || len(b) != 32 {
+			slog.Error("keys/magpie_jump.key 内容非法：必须为 64 位 hex（32 字节）。请修正或删除该文件后重启以重新生成", "path", keyPath)
+			os.Exit(1)
+		}
+		return b
+	} else if !errors.Is(err, os.ErrNotExist) {
+		slog.Error("读取 keys/magpie_jump.key 失败", "error", err)
+		os.Exit(1)
+	}
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		slog.Error("生成管理面票据密钥失败", "error", err)
+		os.Exit(1)
+	}
+	if err := os.MkdirAll("keys", 0o755); err != nil {
+		slog.Error("创建 keys 目录失败", "error", err)
+		os.Exit(1)
+	}
+	if err := os.WriteFile(keyPath, []byte(hex.EncodeToString(b)), 0o600); err != nil {
+		slog.Error("写入 keys/magpie_jump.key 失败", "error", err)
+		os.Exit(1)
+	}
+	slog.Info("未配置 MAGPIE_JUMP_KEY，已自动生成强随机密钥并写入 keys/magpie_jump.key（后续重启复用）")
+	return b
+}
+
 // userIDFrom 从请求上下文读取当前登录用户（server.UserIDFrom 适配）。
 var userIDFrom = func(ctx context.Context) (int64, bool) {
 	return server.UserIDFrom(ctx)
+}
+
+// roleFrom 从请求上下文读取当前登录用户角色（server.RoleFrom 适配）。
+var roleFrom = func(ctx context.Context) (string, bool) {
+	return server.RoleFrom(ctx)
 }
 
 func main() {
@@ -434,6 +486,21 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	// 代理侧 callerKey 映射的管理端入口：运维在 magpie 侧创建 callerKey 后录入灵枢
 	// （灵枢不自行签发凭据；未绑定的令牌在转发时返回 403 magpie_key_missing）。
 	magpieKeyAdmin := magpie.NewKeyAdminHandler(magpie.NewKeyStore(d), sm4Key)
+
+	// 代理侧管理面「一键跳转」：签发入口票据 + 给 nginx 的 auth_request 提供校验端点。
+	// 代理侧未接入（magpie.base_url 为空）时签发接口给 503 + reason，前端把按钮置灰，
+	// 不制造「点开是 502」的死链。
+	magpieAccessHandler := magpieaccess.NewHandler(magpieaccess.Options{
+		Signer:     magpieaccess.NewSigner(magpieJumpKey()),
+		Enabled:    cfg.MagpieEnabled,
+		PublicBase: strings.TrimSpace(os.Getenv("MAGPIE_ADMIN_PUBLIC_URL")),
+		UserID:     userIDFrom,
+		Role:       roleFrom,
+		Logger:     logr,
+	})
+	if !cfg.MagpieEnabled() {
+		logr.Info("代理侧未接入：管理面跳转接口返回 503（按钮置灰），/magpie/ 反代不会被使用")
+	}
 
 	// 对外转发入口（/v1 与 /v1beta）：灵枢只做 facade，转发与协议互译在代理侧。
 	// 未配置 magpie.base_url 时 NewHandler 返回 nil，server 侧保持 410 停用口径。
@@ -764,6 +831,7 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 			SyncAdmin:     syncHandler,
 			Facade:        magpieHandler,
 			MagpieKey:     magpieKeyAdmin,
+			MagpieAccess:  magpieAccessHandler,
 			Topology:      topologyHandler,
 			Subscriptions: subscriptionHandler,
 		},

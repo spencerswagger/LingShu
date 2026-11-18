@@ -13,6 +13,7 @@ import (
 	"github.com/team/llmgateway/internal/domain/console"
 	"github.com/team/llmgateway/internal/domain/identity"
 	"github.com/team/llmgateway/internal/domain/magpie"
+	"github.com/team/llmgateway/internal/domain/magpieaccess"
 	"github.com/team/llmgateway/internal/domain/model"
 	"github.com/team/llmgateway/internal/domain/subscription"
 	"github.com/team/llmgateway/internal/domain/sync"
@@ -39,7 +40,9 @@ type Deps struct {
 	DevConsole   *console.Dev
 	// MagpieKey 是代理侧 callerKey 映射的管理端接口（nil = 不挂载）。
 	MagpieKey *magpie.KeyAdminHandler
-	SyncAdmin *sync.Handler
+	// MagpieAccess 是代理侧管理面「一键跳转」的票据签发/校验（nil = 只保留校验端点，返回 403）。
+	MagpieAccess *magpieaccess.Handler
+	SyncAdmin    *sync.Handler
 	// Topology 是上游拓扑（T1 查询 / T3 手动同步）；nil = 不挂载。
 	Topology *topology.Handler
 	// Subscriptions 是订阅录入（S2）与手工重算（S6）；nil = 不挂载。
@@ -211,6 +214,15 @@ func (s *Server) routes() {
 	admin.HandleFunc("POST /api/v1/admin/models/{id}/apply-price", d.Model.HandleApplyPrice)
 	admin.HandleFunc("POST /api/v1/admin/models/sync-prices", d.Model.HandleSyncPrices)
 	admin.HandleFunc("GET /api/v1/admin/models/price-catalog", d.Model.HandlePriceCatalog)
+
+	// 代理侧管理面一键跳转：签发入口票据（前端按钮 → /magpie/?t=…）。
+	// 校验端点**不在 /api/ 前缀下**、也不走鉴权中间件：它只给 nginx 的 auth_request 调，
+	// 回答的是「这串票据是不是我签的」，不含任何用户数据（见 magpieaccess 包说明）。
+	// 无条件注册：未装配时返回 403，而不是让 nginx 拿到 404（那会被当成「后端挂了」）。
+	s.mux.HandleFunc("GET /internal/magpie-access/verify", d.MagpieAccess.HandleVerify)
+	if d.MagpieAccess != nil {
+		admin.HandleFunc("POST /api/v1/admin/ops/magpie-access", d.MagpieAccess.HandleIssue)
+	}
 
 	// billings / stats / configs / sessions
 	admin.HandleFunc("GET /api/v1/admin/billings", d.Console.HandleListBillings)
