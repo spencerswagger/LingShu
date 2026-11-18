@@ -49,6 +49,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Check compose default tag matches this release
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          # 防止「打了新 tag，但 docker-compose.yml 里的默认 LINGSHU_IMAGE_TAG 还是旧版本」——
+          # 那样有人 wget compose 后直接 up -d 就会拉回旧镜像（rc1 踩过）。
+          want="${GITHUB_REF_NAME}"
+          got=$(grep -o 'LINGSHU_IMAGE_TAG:-[^}]*' docker-compose.yml | sed 's/.*:-//' | sort -u | tr '\n' ' ')
+          echo "tag=$want compose默认=$got"
+          for g in $got; do
+            if [ "$g" != "$want" ]; then
+              echo "::error::docker-compose.yml 默认镜像 tag ($g) 与发布 tag ($want) 不一致，请先把默认值改成 $want 再打 tag"
+              exit 1
+            fi
+          done
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
