@@ -136,7 +136,7 @@ services:
   backend:
     # 镜像来自 ACR（GitHub Actions 打 tag 时构建推送），部署机不构建。
     # 升级：只改 LINGSHU_IMAGE_TAG（或这行的默认值）；本地构建见 docker-compose.build.yml。
-    image: ${LINGSHU_REGISTRY:-registry.cn-hangzhou.aliyuncs.com/spencerswagger}/lingshu-backend:${LINGSHU_IMAGE_TAG:-v0.14.0-rc6}
+    image: ${LINGSHU_REGISTRY:-registry.cn-hangzhou.aliyuncs.com/spencerswagger}/lingshu-backend:${LINGSHU_IMAGE_TAG:-v0.14.0-rc7}
     environment:
       # 数据库连接（默认指向本 compose 内的 postgres）
       DATABASE_URL: postgres://${POSTGRES_USER:-llmgw}:${POSTGRES_PASSWORD:-llmgw}@postgres:5432/${POSTGRES_DB:-llmgw}?sslmode=disable
@@ -174,7 +174,7 @@ services:
 
   web:
     # 同 backend：镜像来自 ACR，部署机不构建（本地构建见 docker-compose.build.yml）。
-    image: ${LINGSHU_REGISTRY:-registry.cn-hangzhou.aliyuncs.com/spencerswagger}/lingshu-web:${LINGSHU_IMAGE_TAG:-v0.14.0-rc6}
+    image: ${LINGSHU_REGISTRY:-registry.cn-hangzhou.aliyuncs.com/spencerswagger}/lingshu-web:${LINGSHU_IMAGE_TAG:-v0.14.0-rc7}
     ports:
       - "${APP_PORT:-80}:80"
     environment:

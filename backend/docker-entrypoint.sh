@@ -56,8 +56,13 @@ chmod 600 "$KEYS_DIR/jwt_rsa" "$KEYS_DIR/jwt_rsa.pub"
 #        因此无需任何人工填值（重置方式见 docs/deploy/magpie-container.md）。
 #    账本变更流（UPSTREAM_ADMIN_KEY）打的是同一个代理侧，默认复用同一把密钥。
 MAGPIE_ADMIN_KEY_FILE="${MAGPIE_ADMIN_KEY_FILE:-/run/magpie-secret/admin_key}"
-if [ -z "${MAGPIE_ADMIN_KEY:-}" ] && [ -r "$MAGPIE_ADMIN_KEY_FILE" ]; then
+# 优先级：共享卷里的密钥 > 环境变量。原因：卷里那份由 magpie-init 在启动后**实测 /v1/models 通过**
+# 才写入，是当下 magpie 真正认的值；而环境变量可能是旧的/被顶掉的（历史上正是它在覆盖，导致
+# 一直报 401 而自愈结果被忽略）。只有卷里没有文件时才用环境变量（手工接管场景）。
+if [ -r "$MAGPIE_ADMIN_KEY_FILE" ] && [ -s "$MAGPIE_ADMIN_KEY_FILE" ]; then
   MAGPIE_ADMIN_KEY=$(cat "$MAGPIE_ADMIN_KEY_FILE")
+elif [ -n "${MAGPIE_ADMIN_KEY:-}" ]; then
+  echo "[entrypoint] 警告：没有 $MAGPIE_ADMIN_KEY_FILE，使用环境变量 MAGPIE_ADMIN_KEY"
 fi
 if [ -z "${UPSTREAM_ADMIN_KEY:-}" ] && [ -n "${MAGPIE_ADMIN_KEY:-}" ]; then
   UPSTREAM_ADMIN_KEY="$MAGPIE_ADMIN_KEY"
