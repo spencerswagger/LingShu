@@ -51,13 +51,33 @@
 
 ## Docker 一键部署
 
-前置：安装 Docker 与 Docker Compose v2。**无需任何配置文件**，一条命令即可起全栈：
+前置：安装 Docker 与 Docker Compose v2。**部署机不构建，只拉镜像**：前后端镜像由 GitHub Actions
+（`.github/workflows/build-images.yml`）在打 tag 时构建并推到阿里云 ACR。
+
+三步起全栈：
 
 ```bash
-docker compose up -d --build
+# ① 取两个文件（部署机上只要有它们，不需要源码目录）
+wget https://raw.githubusercontent.com/spencerswagger/LingShu/v2/docker-compose.yml
+wget https://raw.githubusercontent.com/spencerswagger/LingShu/v2/.env.example -O .env   # 可选
+# ② ACR 是私有仓库，登录一次
+docker login registry.cn-hangzhou.aliyuncs.com
+# ③ 起服务（首次自动建库/迁移/种子）
+docker compose up -d
 ```
 
 默认访问 **`http://<主机IP>:80`**，首登 `admin / admin123`。
+
+**升级 = 改 `.env` 的 `LINGSHU_IMAGE_TAG`（或 compose 里 `image:` 的默认 tag）→ `docker compose pull && docker compose up -d`。**
+数据库迁移随后端启动自动执行；但 `0024` 会删表删列、**不可逆**，升级前必须整库备份 ——
+完整步骤（含备份与回滚）见 [`docs/deploy/README.md`](docs/deploy/README.md)。
+
+需要在部署机上用源码本地构建（默认不用）：
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.build.yml build
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d
+```
 
 ### 容器编排
 
@@ -88,6 +108,8 @@ docker compose up -d --build
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
+| `LINGSHU_IMAGE_TAG` | `v0.14.0-rc1` | 前后端镜像 tag（ACR 上由打 tag 的 CI 推送）。**升级就是改它** → `docker compose pull && docker compose up -d` |
+| `LINGSHU_REGISTRY` | `registry.cn-hangzhou.aliyuncs.com/spencerswagger` | 镜像仓库前缀（含命名空间）；换私有仓库/镜像源时覆盖 |
 | `APP_PORT` | `80` | 对外唯一端口 |
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | `llmgw` | 数据库账号与库名 |
 | `SM4_KEY` | 空（自动生成） | 32 位 hex；如需固定密钥（多环境共用渠道凭据）可显式指定 |

@@ -1,7 +1,11 @@
-.PHONY: up down logs migrate run test frontend-dev keys e2e build-frontend deploy
+.PHONY: up up-build down logs migrate run test frontend-dev keys e2e build-frontend deploy
 # 一键部署全部服务（前端 + 后端 + PostgreSQL），对外仅 web 一个端口（默认 80）
+# 只拉 ACR 镜像、不构建；镜像 tag 由 LINGSHU_IMAGE_TAG 决定（见 docs/deploy/README.md）
 up:
-	docker compose up -d --build
+	docker compose pull && docker compose up -d
+# 用本地源码构建镜像再起（默认部署不用这一条）
+up-build:
+	docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 down:
 	docker compose down
 logs:
