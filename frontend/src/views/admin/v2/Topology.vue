@@ -15,6 +15,8 @@ import { mockTopology } from '@/mock/topology'
 import { useV2Load } from '@/composables/useV2Load'
 import { fmtDateTime } from '@/utils/format'
 import TopologyCanvas from '@/components/v2/topology/TopologyCanvas.vue'
+import ModelPricing from '@/components/ModelPricing.vue'
+import StringListEditor from '@/components/StringListEditor.vue'
 
 const { state, data, load } = useV2Load<InternalModelView>(getTopology, mockTopology)
 onMounted(async () => {
@@ -65,31 +67,25 @@ const sel = ref<Sel | null>(null)
 const drawer = ref(false)
 const saving = ref(false)
 
-const RATE_KEYS = ['Input', 'Output', 'CacheRead', 'CacheWrite'] as const
-
 const form = reactive({
   id: '',
   name: '',
   desc: '',
   enabled: true,
-  aliases: '',
+  aliases: [] as string[],
   bound: '',
   isNew: false,
-  rates: { Input: 0, Output: 0, CacheRead: 0, CacheWrite: 0 } as Record<string, number>,
-  timeConfig: '' as string,
-  tiers: '' as string,
 })
+const pricing = reactive<Record<string, unknown>>({ SaleRates: { Input: 0, Output: 0, CacheRead: 0 }, TimeConfig: null, ContextTiers: null })
 
 async function openNode(s: Sel) {
   sel.value = s
   drawer.value = true
   form.isNew = false
   form.bound = ''
-  form.timeConfig = ''
-  form.tiers = ''
-  form.aliases = ''
+  form.aliases = []
   form.desc = ''
-  form.rates = { Input: 0, Output: 0, CacheRead: 0, CacheWrite: 0 }
+  Object.assign(pricing, { SaleRates: { Input: 0, Output: 0, CacheRead: 0 }, TimeConfig: null, ContextTiers: null })
   if (s.kind === 'external') {
     await ensureExternals()
     const m = externals.value.find((x) => x.ID === s.ref)
@@ -97,11 +93,13 @@ async function openNode(s: Sel) {
     form.name = m?.ExternalName || String(s.data.Name || '')
     form.desc = m?.Description || ''
     form.enabled = m ? m.Enabled : true
-    form.aliases = (m?.Aliases || []).join(', ')
+    form.aliases = m?.Aliases ? [...m.Aliases] : []
     form.bound = (m?.BoundInternalRef as string) || ''
-    form.rates = { Input: 0, Output: 0, CacheRead: 0, CacheWrite: 0, ...(m?.SaleRates || {}) }
-    form.timeConfig = m?.TimeConfig ? JSON.stringify(m.TimeConfig, null, 2) : ''
-    form.tiers = m?.ContextTiers ? JSON.stringify(m.ContextTiers, null, 2) : ''
+    Object.assign(pricing, {
+      SaleRates: { Input: 0, Output: 0, CacheRead: 0, CacheWrite: 0, ...(m?.SaleRates || {}) },
+      TimeConfig: m?.TimeConfig ?? null,
+      ContextTiers: m?.ContextTiers ?? null,
+    })
   } else if (s.kind === 'model' || s.kind === 'group') {
     form.isNew = true
     form.id = ''
@@ -116,36 +114,18 @@ async function openConnect(ref: string) {
   await openNode({ kind: item?.Kind === 'group' ? 'group' : 'model', ref, data: { Name: item?.DisplayName || ref } })
 }
 
-function parseJson(text: string, label: string) {
-  if (!text.trim()) return null
-  try {
-    return JSON.parse(text)
-  } catch {
-    throw new Error(`${label} 不是合法 JSON`)
-  }
-}
-
 async function save() {
   if (!form.name.trim()) return ElMessage.warning('名称不能为空')
   saving.value = true
   try {
-    let timeConfig = null
-    let tiers = null
-    try {
-      timeConfig = parseJson(form.timeConfig, '时段系数')
-      tiers = parseJson(form.tiers, '上下文阶梯')
-    } catch (e) {
-      saving.value = false
-      return ElMessage.error((e as Error).message)
-    }
     const base = {
       ExternalName: form.name.trim(),
       Description: form.desc || '',
       Enabled: form.enabled,
-      SaleRates: { ...form.rates },
-      TimeConfig: timeConfig,
-      ContextTiers: tiers,
-      Aliases: form.aliases.split(',').map((x) => x.trim()).filter(Boolean),
+      SaleRates: (pricing.SaleRates as Record<string, number>) || {},
+      TimeConfig: pricing.TimeConfig ?? null,
+      ContextTiers: pricing.ContextTiers ?? null,
+      Aliases: form.aliases,
       BoundInternalRef: form.bound || null,
     }
     if (form.isNew) {
@@ -179,6 +159,7 @@ const selKindLabel = computed(() => {
       <span class="meta">最后同步 {{ lastSync }}</span>
       <span v-if="syncMsg" class="meta">{{ syncMsg }}</span>
       <div class="sp" />
+      <el-button size="small" type="primary" @click="openNode({ kind: 'model', ref: '', data: { Name: '' } })">新建模型</el-button>
       <el-button size="small" :loading="syncing" @click="runSync">同步</el-button>
       <el-button size="small" :loading="state === 'loading'" @click="load()">刷新</el-button>
     </div>
@@ -206,22 +187,9 @@ const selKindLabel = computed(() => {
               <el-switch v-model="form.enabled" />
             </el-form-item>
 
-            <div class="sec">售价（积分 / 百万 token）</div>
-            <div class="rates">
-              <label v-for="k in RATE_KEYS" :key="k" class="rate">
-                <span>{{ k }}</span>
-                <el-input-number v-model="form.rates[k]" :min="0" :step="0.1" controls-position="right" />
-              </label>
-            </div>
-
-            <el-form-item label="别名（逗号分隔）">
-              <el-input v-model="form.aliases" placeholder="如 gpt-5, gpt5" />
-            </el-form-item>
-            <el-form-item label="时段系数 JSON（可空）">
-              <el-input v-model="form.timeConfig" type="textarea" :rows="3" placeholder='{"Night": 0.8}' />
-            </el-form-item>
-            <el-form-item label="上下文阶梯 JSON（可空）">
-              <el-input v-model="form.tiers" type="textarea" :rows="3" placeholder='[{"MinTokens":0,"Rate":1}]' />
+            <ModelPricing v-model="pricing" show-rates-key="SaleRates" title="售价" />
+            <el-form-item label="别名（命中任一名即路由到本模型）">
+              <StringListEditor v-model="form.aliases" placeholder="每行一个别名，如 gpt-5.2" />
             </el-form-item>
           </el-form>
           <el-button type="primary" :loading="saving" style="width: 100%" @click="save">
