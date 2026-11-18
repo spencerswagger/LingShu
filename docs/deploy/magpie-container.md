@@ -85,6 +85,14 @@ magpie 的管理页面是按「自己占着域名根」写的，挂到子路径�
 
 ---
 
+
+### 2.5 compose 用到的脚本
+
+`docker-compose.yml` 里的 magpie 相关启动脚本不内联在 YAML 里，放在 `deploy/compose-scripts/`：
+`magpie-secret-init.sh`（页面口令）、`magpie-key-init.sh`（网关密钥校验/自愈）、`magpie-web-start.sh`（起 magpie web）。
+compose 以只读方式挂进容器 `/opt/lingshu`。**部署机上除了 `docker-compose.yml`，还要有 `deploy/compose-scripts/` 这三个文件**
+（`git clone` 或单独下载到同目录）。缺了会报 `no such file or directory`。
+
 ## 3 凭据都在哪
 
 | 凭据 | 用途 | 存放位置 | 能否再取回 |
@@ -165,6 +173,18 @@ docker compose logs magpie-init          # 期望：已创建网关密钥 lingsh
 ```
 
 第 ② 步不能省：文件还在时 init 按设计直接复用旧值，不会去碰 magpie 里的 key。
+
+
+### 5.5 网关密钥对不上（灵枢同步报 401 not an enabled magpie gateway key）
+
+`magpie-init` 现在**等 magpie healthy 之后**才校验：用这把密钥真实请求一次 `/v1/models`。
+- 通了 → 复用，正常启动；
+- 401/404 → 自动删除同名旧 key、用卷里的值重建一把，再验一次；仍不行就让 magpie
+  自己签发一把并回写卷。修好后 backend 才会启动，所以不会再出现「卷里有密钥但 magpie 不认」。
+
+常见根因：magpie 首次启动迁移/导入旧配置，把先前生成的 caller key 顶掉了。若自动重建
+仍失败（`docker compose logs magpie-init` 有「仍然 401」），按 §5.2 手工建 key 并写
+`MAGPIE_ADMIN_KEY` 后 `up -d`。
 
 ### 5.3 管理台票据密钥（`keys/magpie_jump.key`）
 
