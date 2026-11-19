@@ -4,7 +4,7 @@
 // 从模型或路由组右侧句柄拖一条线出来 = 新建一个绑定它的对外模型。
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { getTopology, syncTopology, type InternalModelView } from '@/api/v2'
+import { getTopology, getGatewayView, syncTopology, type InternalModelView, type GatewayView } from '@/api/v2'
 import {
   listExternalModels,
   updateExternalModel,
@@ -20,8 +20,17 @@ import ModelPricing from '@/components/ModelPricing.vue'
 import StringListEditor from '@/components/StringListEditor.vue'
 
 const { state, data, load } = useV2Load<InternalModelView>(getTopology, mockTopology)
+const gw = ref<GatewayView | null>(null)
+async function loadGateway() {
+  try {
+    const r = await getGatewayView()
+    if (r.state === 'live' && r.data) gw.value = r.data
+  } catch {
+    gw.value = null
+  }
+}
 onMounted(async () => {
-  await load()
+  await Promise.all([load(), loadGateway()])
   await ensureExternals()
 })
 
@@ -36,7 +45,7 @@ async function runSync() {
     const d = res.data
     syncMsg.value =
       d.State === 'failed' ? `同步失败：${d.Message || '网关未给原因'}（沿用上一轮快照）` : `拉取 ${d.Fetched} · 新增 ${d.Created} · 失效 ${d.Stale}`
-    await load()
+    await Promise.all([load(), loadGateway()])
     await ensureExternals()
   } else {
     syncMsg.value = res.state === 'pending' ? '同步接口未上线' : '同步失败'
@@ -209,7 +218,7 @@ const selKindLabel = computed(() => {
 
     <div v-if="state === 'error'" class="tp-err">数据没取到，先看错误再刷新。</div>
     <div v-else class="tp-canvas">
-      <TopologyCanvas v-if="data" :view="data" :prices="priceMap" @select="openNode" @connect="openConnect" @bind="bindExisting" />
+      <TopologyCanvas v-if="data" :view="data" :gw="gw" :prices="priceMap" @select="openNode" @connect="openConnect" @bind="bindExisting" />
       <div v-else class="tp-empty">还没有拓扑数据</div>
     </div>
 

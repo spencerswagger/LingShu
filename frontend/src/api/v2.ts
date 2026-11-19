@@ -874,3 +874,23 @@ export function priceToCredits(price: number, currency: PriceCurrency, cnyRate: 
 }
 
 export { ymd as formatYmd }
+
+
+// ===== 网关原样视图（账号 / 路由组 / 成员 / 模型） =====
+// 直接取 magpie /api/groups（后端代取，带页面口令）。四层图里账号与组只有这里有真源。
+export interface GwAccount { id: string; name: string; provider: string; providerName?: string; plan?: string; key?: boolean }
+export interface GwModel { id: string; name: string; provider: string; providerName?: string; context?: number }
+export interface GwGroup { id: string; name: string; members: string[]; ref: string; auto?: boolean; hidden?: boolean; ready?: boolean }
+export interface GatewayView {
+  accounts: Record<string, GwAccount[]>
+  models: GwModel[]
+  groups: GwGroup[]
+}
+
+export function getGatewayView() {
+  return v2Get<GatewayView>('/admin/topology/gateway', undefined, (raw) => ({
+    accounts: (raw.accounts as Record<string, GwAccount[]>) || {},
+    models: (raw.models as GwModel[]) || [],
+    groups: (raw.groups as GwGroup[]) || [],
+  }))
+}
