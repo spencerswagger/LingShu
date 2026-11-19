@@ -159,15 +159,21 @@ func (s *HTTPGatewaySource) get(ctx context.Context, path string) ([]byte, error
 			}
 		}
 	}
-	var lastErr error
+	var errs []string
 	for _, base := range bases {
 		body, err := s.doGet(ctx, base, path)
 		if err == nil {
 			return body, nil
 		}
-		lastErr = err
+		es := err.Error()
+		errs = append(errs, base+" -> "+es)
+		// 401/403 说明端口找对了、只是鉴权不对：不要再退回网关端口掩盖真因。
+		if strings.Contains(es, "返回 401") || strings.Contains(es, "返回 403") {
+			break
+		}
 	}
-	return nil, lastErr
+	// 把每个候选的错误都带出来：只报最后一个会把「3430 返回 401」误诊成「3425 返回 404」。
+	return nil, fmt.Errorf("全部候选都失败：%s", strings.Join(errs, "；"))
 }
 
 func (s *HTTPGatewaySource) doGet(ctx context.Context, base, path string) ([]byte, error) {
@@ -187,7 +193,9 @@ func (s *HTTPGatewaySource) doGet(ctx context.Context, base, path string) ([]byt
 	if s.webKey != "" && strings.HasPrefix(path, "/api/") {
 		req.Header.Set("Cookie", "magpie_web_3430="+s.webKey)
 	}
-	if s.adminKey != "" {
+	// /api/* 是页面接口：只带页面口令（?k= + Cookie）。带上网关 Bearer 反而会被当成
+	// 一个非页面凭据拒掉，所以这条路不发 Authorization。
+	if s.adminKey != "" && !strings.HasPrefix(path, "/api/") {
 		v := s.adminKey
 		if !strings.Contains(v, " ") {
 			v = "Bearer " + v
