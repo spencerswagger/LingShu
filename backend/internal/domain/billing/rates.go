@@ -88,6 +88,32 @@ func (w WireRates) MarshalJSON() ([]byte, error) {
 	return json.Marshal(m)
 }
 
+// NormalizeRatesJSON 把单价表 JSON 归一为 snake 键形态（存储契约：billing_records.tokens /
+// external_models.sale_rates / internal_models.cost_rates 的键一律 snake）。
+//
+// 为什么必须有它：HTTP 边界（如 PUT cost-rates）允许 PascalCase 进来，如果原样落库，
+// 读取侧 `billing.Rates` 的普通 Unmarshal 只认 snake 键 → 成本静默算 0。
+// 写入即归一 + 读取侧兜底再归一（两处同用本函数，单一来源）。
+// 无法解析时原样返回（形状校验归调用方）。
+func NormalizeRatesJSON(raw []byte) []byte {
+	var m map[string]float64
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return raw
+	}
+	out := make(map[string]float64, len(m))
+	for k, v := range m {
+		if s, ok := rateKeySnake[k]; ok {
+			k = s
+		}
+		out[k] = v
+	}
+	b, err := json.Marshal(out)
+	if err != nil {
+		return raw
+	}
+	return b
+}
+
 // UnmarshalJSON 接受 PascalCase 键（新契约），也兼容 snake 键（旧客户端/存储），
 // 统一归一为内部 snake 键保存。
 func (w *WireRates) UnmarshalJSON(b []byte) error {

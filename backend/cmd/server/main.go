@@ -699,6 +699,18 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 		// 60s 一跳：与窗口宽度同量级。
 		t := time.NewTicker(time.Minute)
 		defer t.Stop()
+		// 拉完即结：账本拉取成功后**立即**结算一次，不等 poller 自己的 60s ticker——
+		// 否则「拉取 60s + 结算 60s」串行两跳，端到端账单耗时会在 120s 验收线上抖。
+		settleNow := func() {
+			defer func() {
+				if rec := recover(); rec != nil {
+					logr.Error("V3 计费轮次 panic", "panic", rec)
+				}
+			}()
+			if n, err := v3Poller.Once(context.Background()); err != nil {
+				logr.Error("V3 计费轮次失败（账本同步后触发）", "err", err, "settled", n)
+			}
+		}
 		// 连续空轮告警器：端点已配但连续 5 轮 0 行 → 提示一次「疑似未通/无新行」（带最近 HTTP 状态/错误）。
 		emptyWarner := upstream.NewEmptyRoundWarner(5)
 		// 端点未配置时的「每轮 WARN」计数（可聚合，避免静默停摆）。
@@ -741,6 +753,10 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 					}
 				default:
 					emptyWarner.Observe(false, res.LastHTTPStatus, nil)
+				}
+				// 拉取完成（无论有无新行）都结算一次：空轮的结算是一次廉价 SELECT，成本可忽略。
+				if err == nil {
+					settleNow()
 				}
 			}()
 		}

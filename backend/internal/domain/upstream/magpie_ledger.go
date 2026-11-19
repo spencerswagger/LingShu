@@ -385,6 +385,12 @@ func mapMagpieFeedRow(row magpieFeedRow, convert CostConverter) (LedgerEntry, bo
 		TokensOut:       row.Out,
 		CostCredits:     decimalx.Round5(cost),
 		OccurredAt:      occurred,
+		// 五个细分维度原样搬运（缺 caller_key_name 会让 poller settleOne 无法归属令牌，账单出不来）：
+		ReqModel:      strings.TrimSpace(row.Req),
+		ServedModel:   strings.TrimSpace(row.Served),
+		CallerKeyName: strings.TrimSpace(row.CallerKeyName),
+		CacheRead:     row.CacheRead,
+		CacheWrite:    row.CacheWrite,
 	}, true, nil
 }
 
