@@ -128,10 +128,27 @@ async function submitCreate() {
   }
 }
 
+// 复制兜底：非 HTTPS / 非 localhost 下 navigator.clipboard 不可用，退回 textarea + execCommand
+function copyFallback(text: string): boolean {
+  try {
+    const ta = document.createElement('textarea')
+    ta.value = text
+    ta.style.position = 'fixed'
+    ta.style.opacity = '0'
+    document.body.appendChild(ta)
+    ta.select()
+    const ok = document.execCommand('copy')
+    document.body.removeChild(ta)
+    return ok
+  } catch {
+    return false
+  }
+}
+
 async function copyText(text: string) {
   try {
-    await navigator.clipboard.writeText(text)
-    ElMessage.success('密钥已复制')
+    const ok = await navigator.clipboard?.writeText(text).then(()=>true).catch(()=>copyFallback(text))
+    ElMessage.success(ok ? '密钥已复制' : '请手动复制：' + text)
   } catch {
     ElMessage.warning('复制失败，请手动选择复制')
   }
@@ -140,8 +157,10 @@ async function copyText(text: string) {
 // 复制 API Base URL（网关 OpenAI 兼容入口，前端同域时取 location.origin）
 function copyBaseUrl() {
   const url = `${window.location.origin}/v1`
-  navigator.clipboard.writeText(url)
-  ElMessage.success('Base URL 已复制：' + url)
+  const ok = copyFallback(url)
+  navigator.clipboard?.writeText(url).catch(() => undefined)
+  if (ok) ElMessage.success('Base URL 已复制：' + url)
+  else ElMessage.warning('复制失败，请手动复制：' + url)
 }
 </script>
 

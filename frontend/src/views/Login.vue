@@ -116,8 +116,14 @@ function safeRedirect(v: unknown): string {
         </div>
 
         <div class="brand-body">
-          <h1 class="brand-title">灵枢</h1>
-          <p class="brand-desc">统一 AI 调用网关</p>
+          <img class="brand-lockup" src="/brand/lockup.svg" alt="灵枢" />
+          <h1 class="brand-title">统一 AI 调用网关</h1>
+          <p class="brand-desc">面向团队的模型接入、计费与路由控制台</p>
+          <ul class="brand-points">
+            <li>四协议透传 · 上游与本地一致</li>
+            <li>预扣与结算分离 · 账本对账</li>
+            <li>按内部模型 / 路由组编排售卖</li>
+          </ul>
         </div>
 
         <div class="brand-foot">内部系统</div>
@@ -174,148 +180,55 @@ function safeRedirect(v: unknown): string {
 .login-page {
   display: flex;
   min-height: 100vh;
-  background: #f4f5fa;
-}
-
-/* ===== 品牌区 ===== */
-.brand {
-  flex: 1.1;
   background:
-    radial-gradient(900px 520px at 8% 0%, rgba(99, 102, 241, 0.45) 0%, transparent 60%),
-    radial-gradient(700px 480px at 100% 100%, rgba(139, 92, 246, 0.30) 0%, transparent 55%),
-    linear-gradient(160deg, #171c3b 0%, #10142b 100%);
+    radial-gradient(1100px 640px at 12% -10%, #16213c 0%, transparent 58%),
+    radial-gradient(900px 520px at 100% 110%, #101a30 0%, transparent 55%),
+    #070a14;
+  color: var(--ink);
+}
+.brand {
+  flex: 1.15;
   display: flex;
   align-items: center;
   justify-content: center;
-  color: #fff;
+  border-right: 1px solid var(--line);
 }
-
 .brand-inner {
   max-width: 460px;
-  padding: 48px 32px;
+  padding: 56px 40px;
   display: flex;
   flex-direction: column;
-  min-height: 78vh;
+  gap: 28px;
+  min-height: 70vh;
 }
-
-.brand-head {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
-
-.brand-mark {
-  width: 40px;
-  height: 40px;
-  border-radius: 12px;
-  background: var(--brand-gradient);
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  box-shadow: 0 6px 18px rgba(99, 102, 241, 0.5);
-}
-
-.brand-name {
-  font-size: 20px;
-  font-weight: 700;
-  letter-spacing: 1px;
-}
-
-.brand-body {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  padding: 48px 0;
-}
-
-.brand-title {
-  font-size: 34px;
-  font-weight: 800;
-  line-height: 1.25;
-  margin: 0 0 16px;
-  letter-spacing: 0.5px;
-}
-
-.brand-desc {
-  font-size: 15px;
-  line-height: 1.8;
-  color: rgba(255, 255, 255, 0.72);
-  margin: 0 0 32px;
-}
-
-.brand-points {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: grid;
-  gap: 12px;
-}
-
-.brand-points li {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  font-size: 14px;
-  color: rgba(255, 255, 255, 0.85);
-}
-
-.brand-points li::before {
-  content: '';
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--brand-gradient);
-  box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.28);
-  flex-shrink: 0;
-}
-
-.brand-foot {
-  font-size: 12px;
-  color: rgba(255, 255, 255, 0.35);
-}
-
-/* ===== 表单区 ===== */
-.form-side {
-  flex: 1;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 32px;
-}
-
+.brand-mark svg { display: block; }
+.brand-lockup { width: 150px; height: auto; display: block; margin-bottom: 26px; }
+.brand-title { font-size: 26px; font-weight: 600; letter-spacing: -.01em; margin: 0 0 8px; }
+.brand-desc { font-size: 13.5px; color: var(--ink-2); margin: 0 0 24px; line-height: 1.7; }
+.brand-points { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 10px; }
+.brand-points li { font-size: 12.5px; color: var(--ink-2); padding-left: 18px; position: relative; }
+.brand-points li::before { content: ''; position: absolute; left: 0; top: 7px; width: 6px; height: 6px; border-radius: 50%; background: var(--acc-2); }
+.brand-foot { font-size: 11px; color: var(--ink-4); }
+.form-side { flex: .85; display: flex; align-items: center; justify-content: center; padding: 40px; }
 .form-box {
   width: 100%;
   max-width: 380px;
+  background: linear-gradient(175deg, #101728, #0b0f18);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 32px 28px;
+  box-shadow: 0 30px 80px -40px rgba(0,0,0,.9);
 }
-
-.form-head {
-  margin-bottom: 28px;
-}
-
-.form-title {
-  font-size: 26px;
-  font-weight: 800;
-  color: var(--color-text);
-  letter-spacing: 0.3px;
-}
-
-.form-sub {
-  margin-top: 8px;
-  font-size: 14px;
-  color: var(--color-text-secondary);
-}
-
-.login-btn {
-  width: 100%;
-  border-radius: 10px;
-  font-size: 15px;
-  letter-spacing: 4px;
-}
-
+.form-head { margin-bottom: 22px; }
+.form-title { font-size: 18px; font-weight: 600; }
+.form-sub { font-size: 12px; color: var(--ink-3); margin-top: 6px; }
+.login-btn { width: 100%; height: 40px; font-size: 14px; }
+:deep(.el-input__wrapper) { background: #0b101c; box-shadow: 0 0 0 1px var(--line-2) inset; }
+:deep(.el-input__inner) { color: var(--ink); }
 @media (max-width: 900px) {
-  .brand {
-    display: none;
-  }
+  .login-page { flex-direction: column; }
+  .brand { border-right: 0; border-bottom: 1px solid var(--line); }
+  .brand-inner { min-height: auto; padding: 36px 24px; }
+  .form-side { padding: 28px 18px 48px; }
 }
 </style>

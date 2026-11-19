@@ -80,11 +80,11 @@ const graph = computed<{ nodes: Node[]; edges: Edge[] }>(() => {
       id: pid,
       type: 'provider',
       position: { x: X_PROVIDER, y: providerY },
-      data: { Ref: p, Name: providerName[p], Accounts: accts.length, Rows: models.map(shortModel) },
+      data: { Ref: p, Name: providerName[p], Accounts: accts.length, Rows: models.map(shortModel) }, connectable: true,
     })
     accts.forEach((a, i) => {
       const aid = `a:${p}:${a.name}`
-      nodes.push({ id: aid, type: 'account', position: { x: X_ACCOUNT, y: providerY + 8 + i * 44 }, data: { Account: a.name, Provider: providerName[p], Plan: a.plan } })
+      nodes.push({ id: aid, type: 'account', position: { x: X_ACCOUNT, y: providerY + 8 + i * 44 }, data: { Account: a.name, Provider: providerName[p], Plan: a.plan }, connectable: false })
       edges.push({ id: `e:${aid}->${pid}`, source: aid, target: pid, type: 'default', animated: true, style: { stroke: '#2f3d58', strokeWidth: 1, strokeDasharray: '3 5' } })
     })
     providerY += Math.max(cardH, accts.length * 44 + 12) + 40
@@ -100,7 +100,7 @@ const graph = computed<{ nodes: Node[]; edges: Edge[] }>(() => {
       id: gid,
       type: 'group',
       position: { x: X_GROUP, y: groupY },
-      data: { Ref: g.ref, Name: g.name, Auto: !!g.auto, Members: g.members.length, Sold: 0 },
+      data: { Ref: g.ref, Name: g.name, Auto: !!g.auto, Members: g.members.length, Sold: 0 }, connectable: true,
     })
     // 成员模型 → 组
     for (const mid of g.members) {
@@ -129,7 +129,7 @@ const graph = computed<{ nodes: Node[]; edges: Edge[] }>(() => {
       id: xid,
       type: 'external',
       position: { x: X_EXTERNAL, y: extY },
-      data: { ID: e.ID, Name: e.ExternalName, Bound: bound, Enabled: e.Enabled, Dangling: dang, In: props.prices?.[e.ID]?.Input, Out: props.prices?.[e.ID]?.Output },
+      data: { ID: e.ID, Name: e.ExternalName, Bound: bound, Enabled: e.Enabled, Dangling: dang, In: props.prices?.[e.ID]?.Input, Out: props.prices?.[e.ID]?.Output }, connectable: false,
     })
     extY += 108
     if (!bound || dang) continue
@@ -146,6 +146,19 @@ const graph = computed<{ nodes: Node[]; edges: Edge[] }>(() => {
   return { nodes, edges }
 })
 
+// 只允许：模型行(m:*) 或 路由组(g:*) → 对外模型(x:*)。其它一律拒绝（外部→外部、入口→入口都不行）。
+function isValidConnection(c: { source?: string | null; sourceHandle?: string | null; target?: string | null }) {
+  const src = c.source || ''
+  const tgt = c.target || ''
+  if (!src || !tgt || src === tgt) return false
+  if (src.startsWith('x:') || src.startsWith('a:')) return false
+  if (!tgt.startsWith('x:')) return false
+  if (src.startsWith('m:') || src.startsWith('g:')) return true
+  // 供应商节点只有在带了模型行句柄(m:*)时才算合法
+  if (src.startsWith('p:')) return !!c.sourceHandle && c.sourceHandle.startsWith('m:')
+  return false
+}
+
 let justConnected = false
 function pick(kind: string, ref: string, data: Record<string, unknown>) {
   if (justConnected) return
@@ -153,6 +166,7 @@ function pick(kind: string, ref: string, data: Record<string, unknown>) {
 }
 function onConnectEvt(e: { source: string; sourceHandle?: string | null; target?: string | null }) {
   if (!e.source) return
+  if (e.target && !isValidConnection(e)) return
   justConnected = true
   setTimeout(() => (justConnected = false), 350)
   const ref = (e.sourceHandle || '').replace(/^m:/, '') || e.source.replace(/^[a-z]:/, '')
@@ -168,7 +182,7 @@ function onConnectEvt(e: { source: string; sourceHandle?: string | null; target?
   <div class="canvas-wrap">
     <VueFlow :nodes="graph.nodes" :edges="graph.edges" :min-zoom="0.2" :max-zoom="1.5"
       :nodes-draggable="true" :nodes-connectable="true" :elements-selectable="true" fit-view-on-init class="canvas"
-      @connect="onConnectEvt">
+      :is-valid-connection="isValidConnection" @connect="onConnectEvt">
       <Background pattern-color="#161d29" :gap="20" :size="1.1" />
       <Controls />
 
