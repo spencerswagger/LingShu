@@ -69,6 +69,17 @@ if [ -z "${UPSTREAM_ADMIN_KEY:-}" ] && [ -n "${MAGPIE_ADMIN_KEY:-}" ]; then
 fi
 export MAGPIE_ADMIN_KEY UPSTREAM_ADMIN_KEY
 
+# 代理侧页面口令（/api/* 用 ?k= 登录 magpie）：这里以 root 身份读出并 export，
+# 后续进程即使降权也能用——避免 /secret 里 600 root 文件对非 root 不可读导致 topology 401。
+MAGPIE_WEB_KEY_FILE="${MAGPIE_WEB_KEY_FILE:-/run/magpie-secret/admin_web_key}"
+if [ -z "${MAGPIE_WEB_KEY:-}" ] && [ -r "$MAGPIE_WEB_KEY_FILE" ]; then
+  MAGPIE_WEB_KEY=$(cat "$MAGPIE_WEB_KEY_FILE")
+  export MAGPIE_WEB_KEY
+  echo "[entrypoint] magpie 页面口令已加载（${#MAGPIE_WEB_KEY} 字符）"
+else
+  echo "[entrypoint] 警告：未读到 $MAGPIE_WEB_KEY_FILE，拓扑 /api/groups 会 401"
+fi
+
 # DSN 统一附加时区参数：已有 timezone 则不重复；已有 query 用 & 连接，避免破坏 sslmode 等已有参数
 dsn_with_timezone() {
   case "$1" in
