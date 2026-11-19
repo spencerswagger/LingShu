@@ -109,7 +109,7 @@ function safeRedirect(v: unknown): string {
       </div>
       <div v-if="step === 'password'">
         <div class="form-head">
-          <h1>登录灵枢</h1>
+          
           <p>统一 AI 调用网关控制台</p>
         </div>
         <el-form ref="formRef" :model="form" :rules="rules" size="large" @keyup.enter="onLogin">
@@ -122,7 +122,7 @@ function safeRedirect(v: unknown): string {
         <div class="foot"><el-link type="primary" @click="router.push('/register')">还没有账号？注册</el-link></div>
       </div>
       <div v-else>
-        <div class="form-head"><h1>多因素认证</h1><p>输入身份验证器中的动态码（或恢复码）</p></div>
+        <div class="form-head"><p>多因素认证：输入身份验证器中的动态码（或恢复码）</p></div>
         <el-alert v-if="mustChange" type="warning" :closable="false" show-icon style="margin-bottom: 16px" title="验证通过后需先修改默认密码" />
         <el-input v-model="totpCode" placeholder="6 位动态码" size="large" @keyup.enter="onLoginTotp" />
         <el-button type="primary" class="login-btn" :loading="loading" style="margin-top: 16px" @click="onLoginTotp">验 证</el-button>
@@ -180,7 +180,7 @@ function safeRedirect(v: unknown): string {
 .brand { display: flex; justify-content: center; margin-bottom: 22px; }
 .brand img { width: 132px; height: auto; }
 .form-head { text-align: center; margin-bottom: 20px; }
-.form-head h1 { font-size: 19px; font-weight: 600; margin: 0 0 6px; color: var(--ink); }
+
 .form-head p { font-size: 12px; color: var(--ink-3); margin: 0; }
 .login-btn { width: 100%; height: 40px; font-size: 14px; }
 .foot { margin-top: 14px; text-align: center; }
