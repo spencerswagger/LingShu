@@ -98,7 +98,9 @@ type nodeView struct {
 	LastSeenAt  string          `json:"LastSeenAt"`
 	Stale       bool            `json:"Stale"`
 	Caps        json.RawMessage `json:"Caps,omitempty"`
-	ListPrice   json.RawMessage `json:"ListPrice,omitempty"`
+	// CostRates 是灵枢可写的成本价（V3）；其余字段仍来自网关镜像。
+	CostRates json.RawMessage `json:"CostRates,omitempty"`
+	ListPrice json.RawMessage `json:"ListPrice,omitempty"`
 }
 
 // linkView 是 T1 的一条画布落位（只影响观感，不影响售卖与计费）。

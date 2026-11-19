@@ -67,6 +67,8 @@ type Node struct {
 	PosY        float64
 	LastSeenAt  time.Time
 	Stale       bool
+	// CostRates 是灵枢可写的成本价（V3）；同步器不覆盖它。
+	CostRates json.RawMessage
 }
 
 // Link 是 model_links 的一行（画布落位，不含绑定语义）。

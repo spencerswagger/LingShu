@@ -55,7 +55,7 @@ func (s *SQLStore) Nodes(ctx context.Context) ([]Node, error) {
 	}
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT ref, provider_ref, kind, display_name, context_len, caps, list_price,
-		        pos_x, pos_y, last_seen_at, stale
+		        pos_x, pos_y, last_seen_at, stale, cost_rates
 		   FROM internal_models
 		  ORDER BY provider_ref, ref`)
 	if err != nil {
@@ -69,14 +69,16 @@ func (s *SQLStore) Nodes(ctx context.Context) ([]Node, error) {
 			n      Node
 			caps   []byte
 			price  []byte
+			cost   []byte
 			lastAt sql.NullTime
 		)
 		if err := rows.Scan(&n.Ref, &n.ProviderRef, &n.Kind, &n.DisplayName, &n.ContextLen,
-			&caps, &price, &n.PosX, &n.PosY, &lastAt, &n.Stale); err != nil {
+			&caps, &price, &n.PosX, &n.PosY, &lastAt, &n.Stale, &cost); err != nil {
 			return nil, fmt.Errorf("扫描内部模型失败：%w", err)
 		}
 		n.Caps = rawOrEmpty(caps)
 		n.ListPrice = rawOrEmpty(price)
+		n.CostRates = rawOrEmpty(cost)
 		if lastAt.Valid {
 			n.LastSeenAt = lastAt.Time
 		}
