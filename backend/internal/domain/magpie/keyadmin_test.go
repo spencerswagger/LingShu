@@ -51,7 +51,7 @@ func (f *fakeBinder) Disable(context.Context, int64) error {
 	return nil
 }
 
-func newKeyAdminWith(b KeyBinder) *KeyAdminHandler { return NewKeyAdminHandler(b, testCredKey) }
+func newKeyAdminWith(b KeyBinder) *KeyAdminHandler { return NewKeyAdminHandler(b, testCredKey, "") }
 
 func keyReq(method, tokenID, body string) *http.Request {
 	r := httptest.NewRequest(method, "/api/v1/admin/tokens/"+tokenID+"/magpie-key", strings.NewReader(body))
@@ -128,7 +128,7 @@ func TestKeyAdmin_PutValidation(t *testing.T) {
 
 // 未配置 SM4 密钥 → 500（不能静默存明文）。
 func TestKeyAdmin_PutWithoutCredKeyFails(t *testing.T) {
-	h := NewKeyAdminHandler(&fakeBinder{}, nil)
+	h := NewKeyAdminHandler(&fakeBinder{}, nil, "")
 	w := httptest.NewRecorder()
 	h.HandlePut(w, keyReq(http.MethodPut, "7", `{"KeyName":"k1","CallerKey":"s"}`))
 	if w.Code != http.StatusInternalServerError {

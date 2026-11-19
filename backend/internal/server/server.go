@@ -205,6 +205,7 @@ func (s *Server) routes() {
 	if d.MagpieKey != nil {
 		admin.HandleFunc("GET /api/v1/admin/tokens/{id}/magpie-key", d.MagpieKey.HandleGet)
 		admin.HandleFunc("PUT /api/v1/admin/tokens/{id}/magpie-key", d.MagpieKey.HandlePut)
+		admin.HandleFunc("POST /api/v1/admin/tokens/{id}/magpie-key/auto", d.MagpieKey.HandleAutoPut)
 		admin.HandleFunc("DELETE /api/v1/admin/tokens/{id}/magpie-key", d.MagpieKey.HandleDelete)
 	}
 	admin.HandleFunc("POST /api/v1/admin/models", d.Model.HandleCreate)

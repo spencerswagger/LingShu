@@ -282,7 +282,7 @@ const selKindLabel = computed(() => {
 
     <div v-if="state === 'error'" class="tp-err">数据没取到，先看错误再刷新。</div>
     <div v-else class="tp-canvas">
-      <TopologyCanvas v-if="data" :view="data" :gw="gw" :prices="priceMap" @select="openNode" @connect="openConnect" @bind="bindExisting" />
+      <TopologyCanvas v-if="data && gw" :view="data" :gw="gw" :prices="priceMap" @select="openNode" @connect="openConnect" @bind="bindExisting" />
       <div v-else class="tp-empty">还没有拓扑数据</div>
     </div>
 
