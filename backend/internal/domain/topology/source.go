@@ -63,7 +63,8 @@ func NewHTTPGatewaySource(baseURL, adminKey, authHeader string, client *http.Cli
 		groupsPath = DefaultGroupsPath
 	}
 	webBase := strings.TrimRight(strings.TrimSpace(os.Getenv("MAGPIE_WEB_BASE_URL")), "/")
-	if webBase == "" {
+	// 只有看起来像 URL 才用；compose 变量没插值时会是一串 "${...}"，那种直接忽略。
+	if !strings.HasPrefix(webBase, "http://") && !strings.HasPrefix(webBase, "https://") {
 		webBase = "http://magpie:3430"
 	}
 	webKey := strings.TrimSpace(os.Getenv("MAGPIE_WEB_KEY"))
@@ -146,9 +147,17 @@ func (s *HTTPGatewaySource) FetchRawGroups(ctx context.Context) ([]byte, error) 
 func (s *HTTPGatewaySource) get(ctx context.Context, path string) ([]byte, error) {
 	bases := []string{s.baseURL}
 	// /api/* 是 magpie 的**页面接口**，跑在 web 端口（默认 3430）；3425 只有 /v1。
-	// 顺序：web 端口优先，失败再退回网关基址（单端口部署时两者相同）。
-	if strings.HasPrefix(path, "/api/") && s.webBase != "" && s.webBase != s.baseURL {
-		bases = []string{s.webBase, s.baseURL}
+	// 容器网优先按服务名，再试宿主机网关（page 端口已发布到宿主），最后退回网关基址。
+	if strings.HasPrefix(path, "/api/") {
+		cand := []string{s.webBase, "http://host.docker.internal:3430", s.baseURL}
+		bases = bases[:0]
+		seen := map[string]bool{}
+		for _, b := range cand {
+			if b != "" && !seen[b] {
+				seen[b] = true
+				bases = append(bases, b)
+			}
+		}
 	}
 	var lastErr error
 	for _, base := range bases {
