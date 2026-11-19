@@ -321,10 +321,12 @@ type groupItem struct {
 	ID          string `json:"id"`
 	Name        string `json:"name"`
 	DisplayName string `json:"display_name"`
+	// Ref 是 magpie 给组定的对外引用：auto/<model> 或 group/<id>；绑定对外模型用它最稳。
+	Ref string `json:"ref"`
 }
 
 func (g groupItem) ref() string {
-	for _, v := range []string{g.Name, g.ID} {
+	for _, v := range []string{g.Ref, g.Name, g.ID} {
 		if strings.TrimSpace(v) != "" {
 			return strings.TrimSpace(v)
 		}
