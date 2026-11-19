@@ -77,6 +77,11 @@ func NewHTTPGatewaySource(baseURL, adminKey, authHeader string, client *http.Cli
 			}
 		}
 	}
+	if webKey == "" {
+		fmt.Println("[topology] 警告：页面口令为空，/api/groups 会 401（检查 /run/magpie-secret/admin_web_key 权限）")
+	} else {
+		fmt.Printf("[topology] 页面口令已加载（%d 字符），页面基址 %s\n", len(webKey), webBase)
+	}
 	return &HTTPGatewaySource{
 		baseURL:    strings.TrimRight(strings.TrimSpace(baseURL), "/"),
 		adminKey:   strings.TrimSpace(adminKey),
