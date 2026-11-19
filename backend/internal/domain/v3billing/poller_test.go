@@ -160,6 +160,17 @@ func (f *fixture) expectSettled(ledgerID string, cost float64) {
 		WillReturnResult(sqlmock.NewResult(0, 1))
 }
 
+// bindingValues 取候选里的绑定档值（测试断言输出用）。
+func bindingValues(cands []priceCandidate) []string {
+	var out []string
+	for _, c := range cands {
+		if c.byBinding {
+			out = append(out, c.value)
+		}
+	}
+	return out
+}
+
 func TestSettleRouteGroupPricing(t *testing.T) {
 	// 共用随机量：期望与夹具用同一组随机值（本次运行内确定）。
 	autoModel := "GPT " + rseg(t) // auto 组的模型名（含空格与大写 → 与 slug 形态不同）
@@ -192,20 +203,25 @@ func TestSettleRouteGroupPricing(t *testing.T) {
 				f.expectGroups([2]string{autoRef, autoModel})
 				f.expectToken(caller)
 				f.expectCostMiss(provider, served)
-				// 绑定候选逐个落空，slug 形态命中。
+				// 绑定候选逐个落空，slug 形态命中（命中即停：只注册命中位之前的落空）。
 				cands := priceCandidates("auto/"+autoModel, served, nil, 321)
-				var autoBinding []string
-				for _, c := range cands {
-					if !c.byBinding || !strings.HasPrefix(c.value, "group/auto-") {
+				drawerForm := "auto/" + autoModel
+				idxDrawer, idxSlug := -1, -1
+				for i, c := range cands {
+					if !c.byBinding {
 						continue
 					}
-					autoBinding = append(autoBinding, c.value)
-					if c.value != autoRef {
-						f.expectPriceMiss(true, c.value)
+					if c.value == autoRef {
+						idxSlug = i
+						break
 					}
+					if c.value == drawerForm {
+						idxDrawer = i
+					}
+					f.expectPriceMiss(true, c.value)
 				}
-				if len(autoBinding) == 0 || autoBinding[len(autoBinding)-1] != autoRef {
-					t.Fatalf("auto/<model> 应能归一出 slug 组 ref %s，实际候选 %v", autoRef, autoBinding)
+				if idxDrawer < 0 || idxSlug < 0 || idxDrawer > idxSlug {
+					t.Fatalf("auto/<model> 应归一出抽屉形态 %s 与 slug 组 ref %s，实际候选 %v", drawerForm, autoRef, bindingValues(cands))
 				}
 				f.expectPriceHit(true, autoRef, plainExt, groupRates)
 				f.expectSettled(lg, 1.25)
@@ -235,6 +251,66 @@ func TestSettleRouteGroupPricing(t *testing.T) {
 				got, err := billing.ComputeCredits(usage, req.Rates, 1, 1, 10000)
 				if err != nil || got != want {
 					t.Fatalf("组计价金额不符：got=%v want=%v", got, want)
+				}
+			},
+		},
+		{
+			// PR #169 阻断项回归：售价抽屉保存的绑定形态是网关的 auto/<组名>（Gate 真机
+			// A/B 实锤：绑旧形态全绿、绑抽屉形态即断）。候选链必须把抽屉形态本身作为
+			// 绑定候选（且排最前），镜像 slug 形态与抽屉形态互相归一。
+			name: "抽屉auto形态绑定命中",
+			run: func(t *testing.T) {
+				f := newFixture(t)
+				autoModel := "Flash " + rseg(t) // 含空格与大写：形态之间字符串不相等才有效
+				served2 := "served-" + rseg(t)
+				groupRates := map[string]float64{
+					"input": rand.Float64()*9 + 1, "output": rand.Float64()*9 + 1, "cache_read": rand.Float64() + 0.1}
+				lg := "lg-" + rseg(t)
+				f.expectOnceRows([]any{lg, time.Now(), provider, served2, "auto/" + autoModel, caller, int64(77),
+					int64(800), int64(300), int64(120), int64(30), 0.75})
+				f.expectGroups() // 快照被同步侧过滤（auto 组），必须靠形态归一命中，不许依赖快照
+				f.expectToken(caller)
+				f.expectCostMiss(provider, served2)
+				// 命中即停：抽屉形态排最前，注册它之前落的候选（镜像原样形态）。
+				for _, c := range priceCandidates("auto/"+autoModel, served2, nil, 77) {
+					if c.byBinding && c.value == "auto/"+autoModel {
+						break
+					}
+					if c.byBinding {
+						f.expectPriceMiss(true, c.value)
+					}
+				}
+				f.expectPriceHit(true, "auto/"+autoModel, plainExt, groupRates)
+				f.expectSettled(lg, 0.75)
+
+				if _, err := f.p.Once(context.Background()); err != nil {
+					t.Fatalf("Once 失败：%v", err)
+				}
+				if len(f.rec.reqs) != 1 {
+					t.Fatalf("Record 调用次数 = %d，期望 1", len(f.rec.reqs))
+				}
+				req := f.rec.reqs[0]
+				if req.Fail || req.Status != billing.StatusCompleted {
+					t.Fatalf("抽屉形态应命中组售价：status=%q fail=%v", req.Status, req.Fail)
+				}
+				if !reflect.DeepEqual(map[string]float64(req.Rates), groupRates) {
+					t.Fatalf("没走抽屉形态绑定的组售价：rates=%v", req.Rates)
+				}
+				// 双向归一自校验（补收链 rebillMatchesRow 同源）。注意方向性：
+				// slug 有损（"Flash x" → "flash-x"），从 slug 串**还原不出**原样的抽屉形态，
+				// 只断言无损方向；slug 形态两边互推用 slug 安全的模型名另测。
+				mirror := "group/auto-" + autoModel // 原样镜像形态（无损）
+				if !rebillMatchesRow(rebillRow{ReqModel: mirror}, "auto/"+autoModel, nil) {
+					t.Fatalf("镜像形态 %s 应能匹配抽屉绑定 auto/%s", mirror, autoModel)
+				}
+				if !rebillMatchesRow(rebillRow{ReqModel: "auto/" + autoModel}, mirror, nil) {
+					t.Fatalf("抽屉形态行应能匹配镜像绑定 %s", mirror)
+				}
+				slugModel := groupSlug(autoModel)
+				slugMirror := "group/auto-" + slugModel
+				if !rebillMatchesRow(rebillRow{ReqModel: slugMirror}, slugMirror, nil) ||
+					!rebillMatchesRow(rebillRow{ReqModel: "auto/" + slugModel}, slugMirror, nil) {
+					t.Fatalf("slug 形态自反匹配失败：%s", slugMirror)
 				}
 			},
 		},

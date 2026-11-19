@@ -15,7 +15,8 @@ import "strings"
 //
 // 解析顺序（纯结构规则，**禁止对任何具体名字特判** —— 随机的组名/前缀组合必须按同一规则工作）：
 //  1. route_id > 0：这行账是网关按路由组转发的，先按**组 ref 匹配绑定**（绑定的售价才是
-//     这行账的计费口径），再退回按名字匹配；
+//     这行账的计费口径；绑定真源可能是售价抽屉保存的 auto/<组名> 或镜像的 group/auto-<slug>，
+//     两种形态互相归一，见 groupRefForms），再退回按名字匹配；
 //  2. route_id == 0：session/reported 来源，客户端点名单个模型 → 先按名字匹配，再按组 ref 兜底；
 //  3. 组快照（internal_models, kind='group'）只用于把「人可读名」映射到 ref —— 名字无法靠
 //     前缀规则推导，必须查快照；快照缺失不报错，只是少这一档候选。
@@ -67,11 +68,19 @@ func groupRefForm(name string) string {
 }
 
 // groupRefForms 返回一个名字可能对应的全部组 ref 形态（去重、保持顺序）。
-// auto/<model> 的 slug 规则由 magpie 定义（小写字母/数字/点/横线），这里只做最保守的近似：
-// 原样与「小写并把非 [a-z0-9.-] 换成 -」两种都给出，命中哪个算哪个（多一个候选不会算错账，
-// 少一个候选会让这行账结算不出去）。
+//
+// 三种形态必须互相归一（Gate 真机实锤，PR #169：前端售价抽屉保存的绑定是网关形态
+// auto/<组名>，而镜像/账本里同一组的 id 是 auto-<slug>）：
+//   - 网关/抽屉形态：auto/<组名>（绑定真源可能就是它本身）；
+//   - 镜像形态原样：group/auto-<组名原样>；
+//   - 镜像形态 slug：group/auto-<slug(组名)>（小写、非 [a-z0-9.-] 转 -）。
+//
+// slug 规则由 magpie 定义，这里只做最保守的近似，三种都给出：多一个候选不会算错账
+// （查询的是运营配置的绑定/名字，命中哪条都是那组自己的售价），少一个候选会让这行账
+// 结算不出去（回到 unpriced 堆积，真机事故）。
 func groupRefForms(name string) []string {
-	out := make([]string, 0, 2)
+	s := strings.TrimSpace(name)
+	out := make([]string, 0, 3)
 	seen := map[string]bool{}
 	add := func(v string) {
 		if v == "" || seen[v] {
@@ -80,9 +89,20 @@ func groupRefForms(name string) []string {
 		seen[v] = true
 		out = append(out, v)
 	}
-	add(groupRefForm(name))
-	if rest, ok := cutPrefixFold(strings.TrimSpace(name), "auto/"); ok {
-		add("group/auto-" + groupSlug(rest))
+	add(groupRefForm(s))
+	if rest, ok := cutPrefixFold(s, "auto/"); ok {
+		rest = strings.TrimSpace(rest)
+		if rest != "" {
+			// 网关/抽屉形态本身（绑定真源可能原样存 auto/<组名>）。
+			add("auto/" + rest)
+			// 镜像 id 的 slug 形态。
+			add("group/auto-" + groupSlug(rest))
+		}
+	} else if id, ok := cutPrefixFold(s, "group/auto-"); ok && id != "" {
+		// 镜像形态反推网关形态：group/auto-<id> ⇄ auto/<id>（同一组的两种写法）。
+		add("auto/" + id)
+		// 历史原样落库的镜像形态（含非 slug 字符）也补 slug 档；真 slug 的 id 会去重掉。
+		add("group/auto-" + groupSlug(id))
 	}
 	return out
 }
