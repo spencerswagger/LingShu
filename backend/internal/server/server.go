@@ -18,6 +18,7 @@ import (
 	"github.com/team/llmgateway/internal/domain/subscription"
 	"github.com/team/llmgateway/internal/domain/sync"
 	"github.com/team/llmgateway/internal/domain/topology"
+	"github.com/team/llmgateway/internal/domain/v3billing"
 	"github.com/team/llmgateway/internal/pkg/jwtx"
 	"github.com/team/llmgateway/internal/pkg/reqmeta"
 	"github.com/team/llmgateway/internal/pkg/resp"
@@ -47,6 +48,8 @@ type Deps struct {
 	Topology *topology.Handler
 	// Subscriptions 是订阅录入（S2）与手工重算（S6）；nil = 不挂载。
 	Subscriptions *subscription.Handler
+	// V3Rebill 是 unpriced 账单补收（B 方案·手动触发）；nil = 不挂载。
+	V3Rebill *v3billing.RebillHandler
 	// Facade 是代理侧转发入口（/v1 与 /v1beta）。nil = 未配置 magpie.base_url，
 	// 此时 /v1 保持 410 停用口径（不半残挂载：转发链与准入是一体的，缺一即不可用）。
 	Facade *magpie.Handler
@@ -228,6 +231,10 @@ func (s *Server) routes() {
 	// billings / stats / configs / sessions
 	admin.HandleFunc("GET /api/v1/admin/billings", d.Console.HandleListBillings)
 	admin.HandleFunc("GET /api/v1/admin/billings/stats", d.Console.HandleBillingsStats)
+	// V3 unpriced 账单补收（B 方案·手动触发）：组定价后按当前售价开新账单（不改旧行）。
+	if d.V3Rebill != nil {
+		admin.HandleFunc("POST /api/v1/admin/billings/rebill-unpriced", d.V3Rebill.HandleRebillUnpriced)
+	}
 	// 阶段二 A6：盈亏（收入 vs 成本）与对账窗口（漏账可见）。
 	admin.HandleFunc("GET /api/v1/admin/ops/pnl", d.Console.HandlePnL)
 	admin.HandleFunc("GET /api/v1/admin/ops/reconcile-windows", d.Console.HandleReconcileWindows)

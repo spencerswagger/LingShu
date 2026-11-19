@@ -431,6 +431,8 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	// V3 旁路计费：每 60s 把未计费账本行落成账单（幂等：magpie_request_id）
 	v3Poller := v3billing.NewPoller(d, billSvc, keySync, logr)
 	go v3Poller.Run(context.Background())
+	// unpriced 账单补收（B 方案·手动触发）：组定价后按当前售价给历史 unpriced 账单开新账单。
+	v3RebillHandler := v3billing.NewRebillHandler(v3Poller)
 	// 账单落库失败时的本地持久重试队列：DB 抖动不丢账单（billing_id 唯一索引保证重投幂等）。
 	billSvc.SetRetryQueue(billing.NewRetryQueue(cfg.Billing.RetryQueuePath, logr))
 	// 「扣款 + 积分流水 + 账单」同事务提交：消灭「扣了钱没账单」。
@@ -945,6 +947,7 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 			MagpieAccess:  magpieAccessHandler,
 			Topology:      topologyHandler,
 			Subscriptions: subscriptionHandler,
+			V3Rebill:      v3RebillHandler,
 		},
 		syncer:     syncer,
 		sess:       sess,

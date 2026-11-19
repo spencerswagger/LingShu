@@ -52,7 +52,9 @@ func (f *fakeRec) Record(_ context.Context, req billing.RecordReq) (*billing.Rec
 		}
 		bal = f.bals[i]
 	}
-	return &billing.Record{BillingID: req.BillingID, BalanceAfter: bal}, nil
+	// CreditsConsumed 按真实公式回填（rates 缺失时为 0）：补收汇总的金额合计依赖它。
+	credits, _ := billing.ComputeCredits(req.Tokens, req.Rates, 1, 1, 10000)
+	return &billing.Record{BillingID: req.BillingID, BalanceAfter: bal, CreditsConsumed: credits}, nil
 }
 
 func testLogger(buf *strings.Builder) *slog.Logger {
