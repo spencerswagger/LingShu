@@ -27,9 +27,7 @@ type fakeCredit struct {
 	amount        float64
 	delta         float64
 	calls         int
-	settleCalls   int
 	txCalls       int // ConsumeTx 调用次数（事务路径）
-	txSettleCalls int // SettleTx 调用次数（事务路径）
 }
 
 func (f *fakeCredit) Consume(_ context.Context, _ int64, amount float64, _, _, _ string) (float64, float64, error) {
@@ -38,21 +36,9 @@ func (f *fakeCredit) Consume(_ context.Context, _ int64, amount float64, _, _, _
 	return f.before, f.after, f.err
 }
 
-func (f *fakeCredit) Settle(_ context.Context, _ int64, delta float64, _, _ string) (float64, float64, error) {
-	f.settleCalls++
-	f.delta = delta
-	return f.before, f.after, f.err
-}
-
 func (f *fakeCredit) ConsumeTx(_ context.Context, _ dbx.Execer, _ int64, amount float64, _, _, _ string) (float64, float64, error) {
 	f.txCalls++
 	f.amount = amount
-	return f.before, f.after, f.err
-}
-
-func (f *fakeCredit) SettleTx(_ context.Context, _ dbx.Execer, _ int64, delta float64, _, _ string) (float64, float64, error) {
-	f.txSettleCalls++
-	f.delta = delta
 	return f.before, f.after, f.err
 }
 
@@ -784,8 +770,8 @@ func TestRecord_BeginTxFailure_NeverCharges(t *testing.T) {
 	if credit.calls != 0 {
 		t.Fatalf("BeginTx 失败不得走非事务扣款路径：plain consume=%d, want 0", credit.calls)
 	}
-	if credit.txCalls != 0 || credit.settleCalls != 0 {
-		t.Fatalf("不应发生任何扣款：tx=%d settle=%d, want 0/0", credit.txCalls, credit.settleCalls)
+	if credit.txCalls != 0 {
+		t.Fatalf("不应发生任何扣款：tx=%d, want 0", credit.txCalls)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("不应发生任何写入（账单未落库即无重试），mock expectations: %v", err)
@@ -826,8 +812,8 @@ func TestRecord_TxPath_DeterministicInsertError_NoPlainFallback(t *testing.T) {
 	if credit.txCalls != 1 {
 		t.Fatalf("事务内扣款次数=%d, want 1", credit.txCalls)
 	}
-	if credit.calls != 0 || credit.settleCalls != 0 {
-		t.Fatalf("不得回退非事务路径：plain consume=%d plain settle=%d, want 0/0", credit.calls, credit.settleCalls)
+	if credit.calls != 0 {
+		t.Fatalf("不得回退非事务路径：plain consume=%d, want 0", credit.calls)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("mock expectations: %v", err)
@@ -1249,8 +1235,8 @@ func TestConfigProvider_StaleFillAfterInvalidateRejected(t *testing.T) {
 
 // TestRequestCredits_ContextTierUsesInputPlusCacheRead 锁定 requestCredits 的上下文分档输入口径
 // （三段口径下 Input 只是纯输入，实际处理的上下文规模 = Input + CacheRead）——防止 3facce6 那类
-// 仅用 Input 分档的误改回归。构造「仅当计入 CacheRead 才命中高倍率分档」的用例，以
-// EstimateBreakdown（与 Record 同一 requestCredits 路径）返回的 ctxCoeff 断言。
+// 仅用 Input 分档的误改回归。构造「仅当计入 CacheRead 才命中高倍率分档」的用例，
+// 与 Record 结算同走 requestCredits 路径断言 ctxCoeff。
 func TestRequestCredits_ContextTierUsesInputPlusCacheRead(t *testing.T) {
 	db, _, err := sqlmock.New()
 	if err != nil {
@@ -1267,7 +1253,7 @@ func TestRequestCredits_ContextTierUsesInputPlusCacheRead(t *testing.T) {
 	svc := newTestService(db, &fakeCredit{}, cfg, time.Date(2026, 1, 2, 12, 0, 0, 0, shLocForTest(t)))
 
 	// Input=600 < 1000；Input+CacheRead=1200 ≥ 1000 ⇒ 应命中 Coeff=3.0 分档。
-	_, _, ctxCoeff, _, err := svc.EstimateBreakdown(context.Background(), RecordReq{
+	_, _, ctxCoeff, _, err := svc.requestCredits(RecordReq{
 		ExternalModel: "ext-model",
 		Tokens:        Usage{Input: 600, CacheRead: 600},
 		Rates:         fullRates(),
@@ -1414,39 +1400,5 @@ func TestRecord_Dimension(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("mock expectations: %v", err)
-	}
-}
-
-// TestService_EstimateCredits_MatchesRecordFormula 预扣估算与结算 Record 同一口径：
-// 输入 token 代入本地公式（时段×分档×倍率÷R）；输出不参与预扣；不落库、不扣费。
-func TestService_EstimateCredits_MatchesRecordFormula(t *testing.T) {
-	db, _, err := sqlmock.New()
-	if err != nil {
-		t.Fatalf("sqlmock: %v", err)
-	}
-	defer db.Close()
-
-	now := time.Date(2026, 1, 2, 12, 0, 0, 0, shLocForTest(t))
-	svc := newTestService(db, &fakeCredit{before: 10, after: 10}, newFakeConfig(), now)
-
-	inputOnly := Usage{Input: 1234, Output: 0}
-	est, err := svc.EstimateCredits(context.Background(), RecordReq{
-		ExternalModel: "ext-model",
-		Tokens:        inputOnly,
-		Rates:         fullRates(),
-		CallTime:      now,
-	})
-	if err != nil {
-		t.Fatalf("estimate: %v", err)
-	}
-	want, err := ComputeCredits(inputOnly, fullRates(), 1.0, 1.0, 10000)
-	if err != nil {
-		t.Fatalf("compute: %v", err)
-	}
-	if math.Abs(est-want) > 0.00001 {
-		t.Fatalf("estimate=%v, want %v", est, want)
-	}
-	if est <= 0 {
-		t.Fatalf("estimate must be positive, got %v", est)
 	}
 }

@@ -23,8 +23,8 @@ import (
 // legacyBillingColumns 是本期保留但禁止写入的三列。
 var legacyBillingColumns = []string{"magpie_key_name", "estimated", "upstream_usage"}
 
-// billingDomains 是「账单写入/读取」所在的两个包：这里的代码一旦提到这三列，就是写入方或引用方。
-var billingDomains = []string{"billing", "facadebill"}
+// billingDomains 是「账单写入/读取」所在的包：这里的代码一旦提到这三列，就是写入方或引用方。
+var billingDomains = []string{"billing"}
 
 // TestBilling_LegacyColumnsHaveNoWriter 守 0024 探测②的新口径（列存在可以，写入/引用必须为 0）。
 //

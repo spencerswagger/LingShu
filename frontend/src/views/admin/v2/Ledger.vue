@@ -250,7 +250,7 @@ async function copy(text: string) {
       v-else-if="ledger.state.value === 'live'"
       :description="
         statusView && !statusView.LedgerEnabled
-          ? '账本拉取已关闭（upstream.degrade.ledger_enabled=false）：成本只剩订阅摊销。去「系统设置 → 上游（V2）」开启。'
+          ? '账本拉取已关闭（环境变量 UPSTREAM_LEDGER_URL 未配置）：成本只剩订阅摊销。在部署环境配置该变量后重启后端。'
           : statusView && !statusView.LastSuccessAt
             ? '账本为空：从未成功拉取，成本只剩订阅摊销。'
             : '区间内没有账本条目'

@@ -71,43 +71,27 @@ func (c *Config) TokenCacheTTL() time.Duration {
 	return DefaultTokenCacheTTLSeconds * time.Second
 }
 
-// MagpieConfig 是灵枢 → 代理侧（magpie）转发链的接入参数。
+// MagpieConfig 是代理侧（magpie）的接入参数。
 //
-// 灵枢只做 facade（鉴权、模型准入、model 改写、计费），转发与协议互译由 magpie 承担；
-// 因此这里只描述「怎么连它」，不含任何渠道路由配置。
+// V3 起对外转发由 nginx 直连代理侧网关端口（灵枢的逐请求代理链已下线），
+// 这里只保留「服务端连它」需要的部分：基址（拓扑源回落）、上游鉴权头名（拓扑源）、
+// 管理密钥（callerKey 绑定 / 页面 API / 拓扑源）。转发专用的 auth_scheme 与
+// 四段超时随代理链一并移除。
 //
-// 全部字段有代码默认值（见 normalize），配置文件只覆盖需要改的项；环境变量
-// MAGPIE_BASE_URL / MAGPIE_ADMIN_KEY 优先级高于配置文件（便于容器化部署）。
+// 环境变量 MAGPIE_BASE_URL / MAGPIE_ADMIN_KEY 优先级高于配置文件（便于容器化部署）。
 type MagpieConfig struct {
 	// BaseURL 是 magpie 基址（单端口，四协议同口），例如 http://127.0.0.1:3425。
+	// 现用途：拓扑源回落地址（TOPOLOGY_SOURCE_URL 未配置时）。
 	BaseURL string `yaml:"base_url"`
-	// AuthHeader/AuthScheme 是逐请求注入 callerKey 的头名与前缀。
-	// 上游头名以 POC 实测为准，故不进代码常量。
+	// AuthHeader 是访问代理侧 API 时注入凭据的头名（拓扑源用）。
 	AuthHeader string `yaml:"auth_header"`
-	AuthScheme string `yaml:"auth_scheme"`
-	// AdminKey 仅服务端使用（管理面/用量统计），不参与转发鉴权。
+	// AdminKey 仅服务端使用（管理面/用量统计/拓扑源），不参与转发鉴权。
 	AdminKey string `yaml:"admin_key"`
-	// ConnectTimeoutMS 建连（含 DNS/TCP/TLS）超时。
-	ConnectTimeoutMS int `yaml:"connect_timeout_ms"`
-	// RequestTimeoutMS 非流式请求总超时。长输出模型 60s 会误杀，故默认给到 600s。
-	RequestTimeoutMS int `yaml:"request_timeout_ms"`
-	// StreamFirstByteMS 流式请求「收到响应头」超时（首包）。
-	StreamFirstByteMS int `yaml:"stream_first_byte_ms"`
-	// StreamIdleMS 流式响应读空闲超时：连续空闲超过该值即中断。
-	StreamIdleMS int `yaml:"stream_idle_ms"`
-	// CountTokensTimeoutMS 令牌计数端点超时（不计费、无 usage）。
-	CountTokensTimeoutMS int `yaml:"count_tokens_timeout_ms"`
 }
 
 // Magpie 默认接入参数（配置项缺省时使用）。
 const (
-	DefaultMagpieAuthHeader           = "Authorization"
-	DefaultMagpieAuthScheme           = "Bearer"
-	DefaultMagpieConnectTimeoutMS     = 10000
-	DefaultMagpieRequestTimeoutMS     = 600000
-	DefaultMagpieStreamFirstByteMS    = 30000
-	DefaultMagpieStreamIdleMS         = 120000
-	DefaultMagpieCountTokensTimeoutMS = 30000
+	DefaultMagpieAuthHeader = "Authorization"
 )
 
 // normalize 为缺省项填默认值（零值可用），并把环境变量覆盖应用到 BaseURL/AdminKey。
@@ -122,31 +106,13 @@ func (m MagpieConfig) normalize() MagpieConfig {
 	if strings.TrimSpace(m.AuthHeader) == "" {
 		m.AuthHeader = DefaultMagpieAuthHeader
 	}
-	if strings.TrimSpace(m.AuthScheme) == "" {
-		m.AuthScheme = DefaultMagpieAuthScheme
-	}
-	if m.ConnectTimeoutMS <= 0 {
-		m.ConnectTimeoutMS = DefaultMagpieConnectTimeoutMS
-	}
-	if m.RequestTimeoutMS <= 0 {
-		m.RequestTimeoutMS = DefaultMagpieRequestTimeoutMS
-	}
-	if m.StreamFirstByteMS <= 0 {
-		m.StreamFirstByteMS = DefaultMagpieStreamFirstByteMS
-	}
-	if m.StreamIdleMS <= 0 {
-		m.StreamIdleMS = DefaultMagpieStreamIdleMS
-	}
-	if m.CountTokensTimeoutMS <= 0 {
-		m.CountTokensTimeoutMS = DefaultMagpieCountTokensTimeoutMS
-	}
 	return m
 }
 
 // Resolved 返回填过默认值与环境变量覆盖后的接入参数。
 func (c *Config) ResolvedMagpie() MagpieConfig { return c.Magpie.normalize() }
 
-// MagpieEnabled 表示是否配置了 magpie 基址（未配置时 /v1 保持停用，返回 410）。
+// MagpieEnabled 表示是否配置了 magpie 基址（管理面跳转接口据此决定 503 还是签发票据）。
 func (c *Config) MagpieEnabled() bool {
 	return strings.TrimSpace(c.ResolvedMagpie().BaseURL) != ""
 }

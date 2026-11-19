@@ -47,9 +47,8 @@ type Deps struct {
 	Topology *topology.Handler
 	// Subscriptions 是订阅录入（S2）与手工重算（S6）；nil = 不挂载。
 	Subscriptions *subscription.Handler
-	// Facade 是代理侧转发入口（/v1 与 /v1beta）。nil = 未配置 magpie.base_url，
-	// 此时 /v1 保持 410 停用口径（不半残挂载：转发链与准入是一体的，缺一即不可用）。
-	Facade *magpie.Handler
+	// V2 逐请求转发链（Facade，/v1 与 /v1beta 由灵枢代理）已随 V3 下线：
+	// /v1 由 nginx 直连代理侧网关端口，本服务对 /v1 恒 410（见 routes()）。
 }
 
 // Server 汇聚 HTTP 服务所需依赖。
@@ -311,15 +310,10 @@ func (s *Server) routes() {
 	}
 
 	// ---- 对外转发入口（/v1 与 /v1beta）----
-	// 配了转发组件（Facade 非 nil）时由它接管：鉴权 → 模型准入 → 改写 → 转发。
-	// 未配置时保持 410 停用，而不是 404 或「转发到空地址」。两条路都挂在**根 mux 且无鉴权**，
-	// 停用文案一律用公开口径（不暴露内部组件名与迁移去向）。
-	if d.Facade != nil {
-		d.Facade.Mount(s.mux)
-	} else {
-		s.mux.HandleFunc("/v1/", gonePublicHandler)
-		s.mux.HandleFunc("/v1beta/", gonePublicHandler)
-	}
+	// V3 起转发由 nginx 直连代理侧网关端口（不再经过灵枢）；未走 nginx 的直连流量
+	// 一律 410 停用，公开文案不暴露内部组件名。挂在**根 mux 且无鉴权**。
+	s.mux.HandleFunc("/v1/", gonePublicHandler)
+	s.mux.HandleFunc("/v1beta/", gonePublicHandler)
 
 	s.mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)

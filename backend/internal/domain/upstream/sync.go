@@ -77,7 +77,7 @@ type SyncerOptions struct {
 	Sleep backoff.SleepFunc
 	// Logger 为 nil 时用默认 logger。
 	Logger *slog.Logger
-	// Gate 可选：返回 *SkipError 时本轮整体跳过（配置/降级开关的接入点，见 ConfigGate）。
+	// Gate 可选：返回 *SkipError 时本轮整体跳过（可用性闸门的接入点，见 LedgerGate）。
 	// 返回其它错误视为真故障（不重试，直接返回给调用方）。
 	Gate func(ctx context.Context) error
 }

@@ -23,8 +23,8 @@ func mustTime(t *testing.T, s string) time.Time {
 func TestMatchRows_NearestWithinTolerance(t *testing.T) {
 	t0 := mustTime(t, "2026-11-16T10:00:00Z")
 	bills := []BillingRow{
-		{BillingID: "b1", RequestID: "r1", Provider: "p", Account: "a", Model: "m", CallTime: t0, Tokens: 100},
-		{BillingID: "b2", RequestID: "r2", Provider: "p", Account: "a", Model: "m", CallTime: t0.Add(30 * time.Second), Tokens: 200},
+		{BillingID: "b1", Provider: "p", Account: "a", Model: "m", CallTime: t0, Tokens: 100},
+		{BillingID: "b2", Provider: "p", Account: "a", Model: "m", CallTime: t0.Add(30 * time.Second), Tokens: 200},
 	}
 	ledgers := []LedgerRow{
 		{LedgerID: "l2", Provider: "p", Account: "a", Model: "m", TokensIn: 150, TokensOut: 40, Cost: 1.5, OccurredAt: t0.Add(32 * time.Second)},
@@ -204,13 +204,10 @@ const (
 		        cost_source     = 'ledger'
 		  WHERE billing_id = $1
 		    AND ledger_entry_id IS NULL`
-
-	linkHoldSQL = `UPDATE credit_holds SET ledger_entry_id = $2
-			  WHERE billing_id = $1 AND status = 'settled'`
 )
 
-// TestSQLStore_Link_WritesCostAndHold：成本列与登记在同一事务里写。
-func TestSQLStore_Link_WritesCostAndHold(t *testing.T) {
+// TestSQLStore_Link_WritesCost：成本列在同一事务里写（账本已占用则不碰）。
+func TestSQLStore_Link_WritesCost(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock: %v", err)
@@ -221,13 +218,10 @@ func TestSQLStore_Link_WritesCostAndHold(t *testing.T) {
 	mock.ExpectExec(regexp.QuoteMeta(linkBillingSQL)).
 		WithArgs("bill-1", "led-1", 3.5).
 		WillReturnResult(sqlmock.NewResult(0, 1))
-	mock.ExpectExec(regexp.QuoteMeta(linkHoldSQL)).
-		WithArgs("req-1", "led-1").
-		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
 
 	store := NewSQLStore(db)
-	ok, err := store.Link(context.Background(), Match{BillingID: "bill-1", RequestID: "req-1", LedgerID: "led-1", Cost: 3.5})
+	ok, err := store.Link(context.Background(), Match{BillingID: "bill-1", LedgerID: "led-1", Cost: 3.5})
 	if err != nil || !ok {
 		t.Fatalf("落库应成功：ok=%v err=%v", ok, err)
 	}
@@ -251,7 +245,7 @@ func TestSQLStore_Link_SkipsWhenAlreadyLinked(t *testing.T) {
 	mock.ExpectRollback()
 
 	store := NewSQLStore(db)
-	ok, err := store.Link(context.Background(), Match{BillingID: "bill-1", RequestID: "req-1", LedgerID: "led-1", Cost: 1})
+	ok, err := store.Link(context.Background(), Match{BillingID: "bill-1", LedgerID: "led-1", Cost: 1})
 	if err != nil {
 		t.Fatalf("已被占用不是错误：%v", err)
 	}

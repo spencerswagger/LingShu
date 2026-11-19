@@ -176,7 +176,7 @@ func TestSyncer_GateSkipsWithoutCallingSteps(t *testing.T) {
 		Logger: testLogger(),
 		Sleep:  sleep.sleep,
 		Gate: func(context.Context) error {
-			return &SkipError{Op: "上游同步", Reason: ConfigKeyDegrade + "=true（降级）"}
+			return &SkipError{Op: "上游同步", Reason: "降级开关关闭"}
 		},
 	})
 	var ran int32
@@ -190,8 +190,8 @@ func TestSyncer_GateSkipsWithoutCallingSteps(t *testing.T) {
 	if !IsSkip(err) {
 		t.Fatalf("闸门跳过应返回跳过错误，got %T %v", err, err)
 	}
-	if !strings.Contains(err.Error(), ConfigKeyDegrade) {
-		t.Fatalf("跳过原因应点名配置键，got %v", err)
+	if !strings.Contains(err.Error(), "降级") {
+		t.Fatalf("跳过原因应说明原因，got %v", err)
 	}
 	if atomic.LoadInt32(&ran) != 0 {
 		t.Fatal("跳过时不应执行任何步骤")

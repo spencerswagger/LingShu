@@ -6,7 +6,6 @@
 //
 //	① 成本：billing_records.cost_credits + cost_source='ledger' + ledger_entry_id
 //	   —— 盈亏页的成本口径只有这一个真源（估算不算成本）；
-//	② 预扣登记：credit_holds.ledger_entry_id（一请求一预扣「已匹配到账本」的证据）。
 //
 // 匹配口径（刻意的严格）：
 //   - 键 = provider + account + model **三列全等**。缺一列就不匹配（宁可留 unmatched 让人看见，
@@ -46,7 +45,6 @@ const (
 // BillingRow 是一条待匹配的账单（只取匹配需要的列）。
 type BillingRow struct {
 	BillingID string
-	RequestID string
 	Provider  string
 	Account   string
 	Model     string
@@ -73,7 +71,6 @@ type LedgerRow struct {
 // Match 是一对已匹配的（账单, 账本条目）。
 type Match struct {
 	BillingID string
-	RequestID string
 	LedgerID  string
 	Cost      float64
 	// Skew 是两侧时间差（账本 − 账单），排障用。
@@ -182,8 +179,8 @@ func MatchRows(bills []BillingRow, ledgers []LedgerRow, tolerance time.Duration)
 			used[bestIdx] = true
 			b := bills[bestIdx]
 			out.Matched = append(out.Matched, Match{
-				BillingID:  b.BillingID,
-				RequestID:  b.RequestID,
+				BillingID: b.BillingID,
+
 				LedgerID:   l.LedgerID,
 				Cost:       decimalx.Round5(l.Cost),
 				Skew:       l.OccurredAt.Sub(b.CallTime),
@@ -323,7 +320,6 @@ func (s *SQLStore) UnmatchedBilling(ctx context.Context, from, to time.Time) ([]
 	}
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT billing_id,
-		        COALESCE(request_id, ''),
 		        COALESCE(upstream_provider, ''),
 		        COALESCE(upstream_account, ''),
 		        COALESCE(upstream_model, ''),
@@ -343,7 +339,7 @@ func (s *SQLStore) UnmatchedBilling(ctx context.Context, from, to time.Time) ([]
 	out := make([]BillingRow, 0, 64)
 	for rows.Next() {
 		var b BillingRow
-		if err := rows.Scan(&b.BillingID, &b.RequestID, &b.Provider, &b.Account, &b.Model, &b.CallTime, &b.Tokens); err != nil {
+		if err := rows.Scan(&b.BillingID, &b.Provider, &b.Account, &b.Model, &b.CallTime, &b.Tokens); err != nil {
 			return nil, fmt.Errorf("扫描待结算账单失败：%w", err)
 		}
 		out = append(out, b)
@@ -419,13 +415,6 @@ func (s *SQLStore) Link(ctx context.Context, m Match) (bool, error) {
 	}
 	if n == 0 {
 		return false, nil
-	}
-	if m.RequestID != "" {
-		if _, err := tx.ExecContext(ctx,
-			`UPDATE credit_holds SET ledger_entry_id = $2
-			  WHERE billing_id = $1 AND status = 'settled'`, m.RequestID, m.LedgerID); err != nil {
-			return false, fmt.Errorf("写入预扣登记的账本条目失败（%s）：%w", m.RequestID, err)
-		}
 	}
 	if err := tx.Commit(); err != nil {
 		return false, fmt.Errorf("提交账本结算事务失败：%w", err)

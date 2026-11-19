@@ -121,7 +121,7 @@ docker compose -f docker-compose.yml -f docker-compose.build.yml up -d
 | `MAGPIE_UI_PORT` | `3430` | 代理侧管理台的宿主机 port（break-glass 直连，只绑 `127.0.0.1`）。日常入口是灵枢同源的 `/magpie/`（仅 ADMIN 可见） |
 | `MAGPIE_WEB_KEY` | 空（首次启动自动生成并落在 `magpie_secret` 卷，重启不变） | 管理台口令；只有「手工接管」时才填。**至少 16 字符**（短了 magpie 起不来，会被自动补齐并告警），只接受字母数字与 `- . _ ~`；实际生效值以卷里 `admin_web_key` 为准 |
 | `MAGPIE_ADMIN_PUBLIC_URL` | 空（用同源相对路径 `/magpie/`） | 灵枢对外地址（如 `https://lingshu.example.com`）。只有前端与后端不同源时才需要 |
-| `MAGPIE_BASE_URL` | `http://magpie:3425`（compose 内设定） | 代理侧基址；留空则 `/v1` 转发停用（410） |
+| `MAGPIE_BASE_URL` | `http://magpie:3425`（compose 内设定） | 代理侧基址（拓扑源回落地址）；`/v1` 由 nginx 直连代理侧网关端口，不走本服务 |
 | `MAGPIE_ADMIN_KEY` | 空（首次启动自动生成，两个容器读同一份） | 代理侧管理密钥；只有「手工在管理面建 key」时才需要填 |
 
 > 生产环境请修改 `POSTGRES_PASSWORD` 与 `APP_PORT`，并在首次登录后立即改掉默认口令。
