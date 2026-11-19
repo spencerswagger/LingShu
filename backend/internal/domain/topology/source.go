@@ -193,7 +193,9 @@ func (s *HTTPGatewaySource) doGet(ctx context.Context, base, path string) ([]byt
 	if s.webKey != "" && strings.HasPrefix(path, "/api/") {
 		req.Header.Set("Cookie", "magpie_web_3430="+s.webKey)
 	}
-	if s.adminKey != "" {
+	// /api/* 是页面接口：只带页面口令（?k= + Cookie）。带上网关 Bearer 反而会被当成
+	// 一个非页面凭据拒掉，所以这条路不发 Authorization。
+	if s.adminKey != "" && !strings.HasPrefix(path, "/api/") {
 		v := s.adminKey
 		if !strings.Contains(v, " ") {
 			v = "Bearer " + v
