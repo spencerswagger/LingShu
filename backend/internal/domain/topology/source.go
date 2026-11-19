@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/cookiejar"
 	neturl "net/url"
 	"os"
 	"sort"
@@ -49,7 +50,8 @@ type HTTPGatewaySource struct {
 // （而不是「成功同步 0 条」——那会把存量节点全标 stale）。
 func NewHTTPGatewaySource(baseURL, adminKey, authHeader string, client *http.Client) *HTTPGatewaySource {
 	if client == nil {
-		client = &http.Client{Timeout: fetchTimeout}
+		jar, _ := cookiejar.New(nil)
+		client = &http.Client{Timeout: fetchTimeout, Jar: jar}
 	}
 	if strings.TrimSpace(authHeader) == "" {
 		authHeader = "Authorization"
@@ -177,6 +179,18 @@ func (s *HTTPGatewaySource) get(ctx context.Context, path string) ([]byte, error
 }
 
 func (s *HTTPGatewaySource) doGet(ctx context.Context, base, path string) ([]byte, error) {
+	// 页面接口（/api/*）要求浏览器登录态的 cookie：先访问一次 /?k=<页面口令>，
+	// magpie 会 Set-Cookie，交给 client 的 cookie jar 记下，再用同一 jar 请求 /api。
+	// 直接塞 Cookie 头不被认（magpie 只认它自己签发的那张会话 cookie）。
+	if s.webKey != "" && strings.HasPrefix(path, "/api/") && base != s.baseURL {
+		signin := base + "/?k=" + neturl.QueryEscape(s.webKey)
+		if req0, e0 := http.NewRequestWithContext(ctx, http.MethodGet, signin, nil); e0 == nil {
+			if resp0, e1 := s.client.Do(req0); e1 == nil {
+				io.Copy(io.Discard, io.LimitReader(resp0.Body, 4096))
+				resp0.Body.Close()
+			}
+		}
+	}
 	url := base + path
 	if s.webKey != "" && strings.HasPrefix(path, "/api/") {
 		sep := "?"
@@ -190,9 +204,6 @@ func (s *HTTPGatewaySource) doGet(ctx context.Context, base, path string) ([]byt
 		return nil, fmt.Errorf("构建拓扑请求失败：%w", err)
 	}
 	req.Header.Set("Accept", "application/json")
-	if s.webKey != "" && strings.HasPrefix(path, "/api/") {
-		req.Header.Set("Cookie", "magpie_web_3430="+s.webKey)
-	}
 	// /api/* 是页面接口：只带页面口令（?k= + Cookie）。带上网关 Bearer 反而会被当成
 	// 一个非页面凭据拒掉，所以这条路不发 Authorization。
 	if s.adminKey != "" && !strings.HasPrefix(path, "/api/") {
