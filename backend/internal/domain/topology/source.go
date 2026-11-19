@@ -41,6 +41,7 @@ type HTTPGatewaySource struct {
 	modelsPath string
 	groupsPath string
 	webKey     string // magpie 页面口令：/api/* 属页面接口，需要它（网关 key 不够）
+	webBase    string // 页面端口基址（magpie web，默认 3430）；/api/* 走这里，3425 只有 /v1
 	client     *http.Client
 }
 
@@ -61,6 +62,10 @@ func NewHTTPGatewaySource(baseURL, adminKey, authHeader string, client *http.Cli
 	if groupsPath == "" {
 		groupsPath = DefaultGroupsPath
 	}
+	webBase := strings.TrimRight(strings.TrimSpace(os.Getenv("MAGPIE_WEB_BASE_URL")), "/")
+	if webBase == "" {
+		webBase = "http://magpie:3430"
+	}
 	webKey := strings.TrimSpace(os.Getenv("MAGPIE_WEB_KEY"))
 	if webKey == "" {
 		if f := strings.TrimSpace(os.Getenv("MAGPIE_WEB_KEY_FILE")); f != "" {
@@ -76,6 +81,7 @@ func NewHTTPGatewaySource(baseURL, adminKey, authHeader string, client *http.Cli
 		modelsPath: modelsPath,
 		groupsPath: groupsPath,
 		webKey:     webKey,
+		webBase:    webBase,
 		client:     client,
 	}
 }
@@ -138,12 +144,25 @@ func (s *HTTPGatewaySource) FetchRawGroups(ctx context.Context) ([]byte, error) 
 // get 发一次 GET 并读全量响应体；非 2xx 转成含状态码与截断响应体的可读错误
 // （排障时最需要的就是「网关到底回了什么」）。
 func (s *HTTPGatewaySource) get(ctx context.Context, path string) ([]byte, error) {
-	if !strings.HasPrefix(path, "/") {
-		path = "/" + path
+	bases := []string{s.baseURL}
+	// /api/* 是 magpie 的**页面接口**，跑在 web 端口（默认 3430）；3425 只有 /v1。
+	// 顺序：web 端口优先，失败再退回网关基址（单端口部署时两者相同）。
+	if strings.HasPrefix(path, "/api/") && s.webBase != "" && s.webBase != s.baseURL {
+		bases = []string{s.webBase, s.baseURL}
 	}
-	url := s.baseURL + path
-	// magpie 的 /api/* 是**页面接口**，认页面口令（?k=），不认网关 Bearer key。
-	// 不补这一步，/api/groups 会 401/404，路由组整层永远是空的。
+	var lastErr error
+	for _, base := range bases {
+		body, err := s.doGet(ctx, base, path)
+		if err == nil {
+			return body, nil
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
+func (s *HTTPGatewaySource) doGet(ctx context.Context, base, path string) ([]byte, error) {
+	url := base + path
 	if s.webKey != "" && strings.HasPrefix(path, "/api/") {
 		sep := "?"
 		if strings.Contains(url, "?") {
