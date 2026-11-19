@@ -123,6 +123,7 @@ async function savePrice() {
 function onApplyCatalog(rates: Record<string, number>) {
   const cur = (pricing.SaleRates as Record<string, number>) || {}
   pricing.SaleRates = { ...cur, ...rates }
+  ElMessage.success('已套用 models.dev 参考价')
 }
 
 async function saveCost() {

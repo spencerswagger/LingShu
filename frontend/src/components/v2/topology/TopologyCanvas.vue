@@ -205,7 +205,7 @@ function pick(kind: string, ref: string, data: Record<string, unknown>) {
             <div class="sub">
               <span>{{ p.data.Members }} 成员</span>
               <span v-if="p.data.Price" class="priced">i/o {{ p.data.Price.In }} / {{ p.data.Price.Out }}</span>
-              <span v-else class="unpriced">未定价</span>
+              <span v-else class="unpriced">⚠ 未定价</span>
             </div>
           </div>
         </div>
@@ -231,7 +231,7 @@ function pick(kind: string, ref: string, data: Record<string, unknown>) {
 .grp { width: 300px; }
 .grp .ic { color: #9d8be0; border-color: #2f3750; background: #14182a; }
 .priced { color: #8fbf9f; font-family: ui-monospace, Menlo, monospace; }
-.unpriced { color: #c9a227; }
+.unpriced { color: #f56c6c; font-weight: 700; background: #f56c6c1f; border: 1px solid #f56c6c59; border-radius: 8px; padding: 0 5px; }
 .prov { width: 268px; border-radius: 11px; border: 1px solid #22304a; background: linear-gradient(175deg, #111a2bf7, #090e18fa); box-shadow: inset 0 1px #ffffff08, 0 20px 44px -34px #4c6fe8e6; }
 .prov-hd { display: flex; align-items: center; gap: 8px; padding: 8px 10px 6px; cursor: pointer; }
 .prov-hd .ic { flex: none; width: 21px; height: 21px; border-radius: 5px; display: flex; align-items: center; justify-content: center; border: 1px solid #2b3a55; background: #121b2c; color: #88a8d4; }
