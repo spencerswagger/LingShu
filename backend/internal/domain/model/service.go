@@ -332,6 +332,13 @@ func (s *Service) CreateModel(ctx context.Context, in ExternalModelInput) (*Exte
 		return nil, err
 	}
 
+	bound := normalizeBound(in.BoundInternalRef)
+	magpieModel := normalizeMagpieModel(in.MagpieModel)
+	if magpieModel == nil && bound != nil {
+		// 绑定到内部模型即等于「转发到该上游模型」：MagpieModel 是转发真源，
+		// 不填会让调用直接报「模型尚未接入转发服务」。这里自动补齐，避免两处手填不一致。
+		magpieModel = bound
+	}
 	created, err := s.store.Insert(ctx, &ExternalModel{
 		ExternalName:     in.ExternalName,
 		Description:      in.Description,
@@ -412,6 +419,10 @@ func (s *Service) UpdateModel(ctx context.Context, id int64, in ExternalModelInp
 		m.BoundInternalRef = normalizeBound(in.BoundInternalRef)
 	} else {
 		m.BoundInternalRef = existing.BoundInternalRef
+	}
+	// 转发真源 MagpieModel 与绑定保持一致：没显式给 MagpieModel 时，跟随绑定值。
+	if normalizeMagpieModel(in.MagpieModel) == nil && m.BoundInternalRef != nil {
+		m.MagpieModel = m.BoundInternalRef
 	}
 	if err := s.store.Update(ctx, m); err != nil {
 		if errors.Is(err, ErrNameExists) {
