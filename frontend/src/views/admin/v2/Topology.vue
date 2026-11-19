@@ -10,6 +10,7 @@ import {
   updateExternalModel,
   createExternalModel,
   batchDeleteExternalModels,
+  syncModelsPrices,
   type ExternalModel,
 } from '@/api/admin'
 import { mockTopology } from '@/mock/topology'
@@ -17,6 +18,7 @@ import { useV2Load } from '@/composables/useV2Load'
 import { fmtDateTime } from '@/utils/format'
 import TopologyCanvas from '@/components/v2/topology/TopologyCanvas.vue'
 import ModelPricing from '@/components/ModelPricing.vue'
+import ModelPriceCatalog from '@/components/ModelPriceCatalog.vue'
 import StringListEditor from '@/components/StringListEditor.vue'
 
 const { state, data, load } = useV2Load<InternalModelView>(getTopology, mockTopology)
@@ -35,6 +37,7 @@ onMounted(async () => {
 })
 
 const syncing = ref(false)
+const catalogRef = ref<InstanceType<typeof ModelPriceCatalog> | null>(null)
 const syncMsg = ref('')
 async function runSync() {
   if (syncing.value) return
@@ -110,18 +113,42 @@ async function openNode(s: Sel) {
       TimeConfig: m?.TimeConfig ?? null,
       ContextTiers: m?.ContextTiers ?? null,
     })
-  } else if (s.kind === 'model' || s.kind === 'group') {
-    form.isNew = true
-    form.id = ''
-    form.name = String((s.data as Record<string, unknown>).Name || s.ref) + '-售'
-    form.enabled = true
-    form.bound = s.ref
+  }
+}
+
+// 显式「新建对外模型」（从按钮或拖线触发），可预绑定到某个内部模型/组
+async function openCreate(bound: string, name?: string) {
+  sel.value = { kind: 'model', ref: bound, data: { Name: name || bound } }
+  drawer.value = true
+  form.isNew = true
+  form.id = ''
+  form.name = name || (bound ? bound.split('/').pop() + '-售' : '')
+  form.desc = ''
+  form.enabled = true
+  form.aliases = []
+  form.bound = bound
+  Object.assign(pricing, { SaleRates: { Input: 0, Output: 0, CacheRead: 0 }, TimeConfig: null, ContextTiers: null })
+}
+
+function onApplyCatalog(rates: Record<string, number>) {
+  const cur = (pricing.SaleRates as Record<string, number>) || {}
+  pricing.SaleRates = { ...cur, ...rates }
+  ElMessage.success('已套用 models.dev 参考价')
+}
+
+async function syncAllPrices() {
+  try {
+    const r = await syncModelsPrices()
+    const d = (r as unknown as { Data?: { Updated?: string[]; Skipped?: string[] } }).Data || {}
+    ElMessage.success(`价目同步完成：更新 ${d.Updated?.length || 0}，跳过 ${d.Skipped?.length || 0}`)
+    await ensureExternals(true)
+  } catch (e) {
+    ElMessage.error('同步失败：' + (e instanceof Error ? e.message : String(e)))
   }
 }
 
 async function openConnect(payload: { ref: string }) {
-  const item = data.value?.Items.find((m) => m.Ref === payload.ref)
-  await openNode({ kind: item?.Kind === 'group' ? 'group' : 'model', ref: payload.ref, data: { Name: item?.DisplayName || payload.ref } })
+  await openCreate(payload.ref)
 }
 
 // 拖线到已有对外模型 = 绑定，不再弹抽屉
@@ -243,7 +270,8 @@ const selKindLabel = computed(() => {
       <span v-if="syncMsg" class="meta">{{ syncMsg }}</span>
       <div class="sp" />
       <el-button size="small" @click="syncGroupModels">补全对外模型</el-button>
-      <el-button size="small" type="primary" @click="openNode({ kind: 'model', ref: '', data: { Name: '' } })">新建模型</el-button>
+      <el-button size="small" @click="syncAllPrices">同步价目</el-button>
+      <el-button size="small" type="primary" @click="openCreate('')">新建模型</el-button>
       <el-button size="small" :loading="syncing" @click="runSync">同步</el-button>
       <el-button size="small" :loading="state === 'loading'" @click="load()">刷新</el-button>
     </div>
@@ -256,7 +284,7 @@ const selKindLabel = computed(() => {
 
     <el-drawer v-model="drawer" :title="selKindLabel" size="560px" direction="rtl">
       <template v-if="sel">
-        <div v-if="sel.kind === 'external' || sel.kind === 'model' || sel.kind === 'group'">
+        <div v-if="form.isNew || sel.kind === 'external'">
           <el-form label-position="top" size="small">
             <el-form-item label="对外名称">
               <el-input v-model="form.name" />
@@ -271,7 +299,11 @@ const selKindLabel = computed(() => {
               <el-switch v-model="form.enabled" />
             </el-form-item>
 
-            <ModelPricing v-model="pricing" show-rates-key="SaleRates" title="售价" />
+            <ModelPricing v-model="pricing" show-rates-key="SaleRates" title="售价">
+              <template #title-extra>
+                <el-button size="small" @click="catalogRef?.open()">从 models.dev 获取参考价</el-button>
+              </template>
+            </ModelPricing>
             <el-form-item label="别名（命中任一名即路由到本模型）">
               <StringListEditor v-model="form.aliases" placeholder="每行一个别名，如 gpt-5.2" />
             </el-form-item>
@@ -284,13 +316,16 @@ const selKindLabel = computed(() => {
           </div>
         </div>
         <div v-else class="ro">
-          <div class="ro-row"><span>名称</span><b>{{ sel.data.Account || sel.data.Ref || sel.ref }}</b></div>
+          <div class="ro-row"><span>名称</span><b>{{ sel.data.Name || sel.data.Account || sel.ref }}</b></div>
           <div v-if="sel.data.Provider" class="ro-row"><span>供应商</span><b>{{ sel.data.Provider }}</b></div>
-          <div v-if="sel.kind === 'account'" class="ro-row"><span>类型</span><b>{{ sel.data.Subscribed ? '订阅' : '按量' }}</b></div>
-          <div v-if="sel.kind === 'provider'" class="ro-row"><span>账号数</span><b>{{ sel.data.Accounts }}</b></div>
+          <div v-if="sel.kind === 'group'" class="ro-row"><span>成员</span><b>{{ sel.data.Members }}</b></div>
+          <div v-if="sel.kind === 'account'" class="ro-row"><span>类型</span><b>{{ sel.data.Plan || '按量' }}</b></div>
           <p class="ro-hint">只读：这一层由网关同步过来。</p>
+          <el-button v-if="sel.kind === 'model' || sel.kind === 'group'" type="primary" style="width:100%;margin-top:12px"
+            @click="openCreate(sel.ref, String(sel.data.Name || ''))">新建对外模型并绑定它</el-button>
         </div>
       </template>
+      <ModelPriceCatalog ref="catalogRef" :model-name="form.name" label="售价" @apply="onApplyCatalog" />
     </el-drawer>
   </div>
 </template>

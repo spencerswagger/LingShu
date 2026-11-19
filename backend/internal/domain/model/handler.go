@@ -90,6 +90,8 @@ type createModelRequest struct {
 	Aliases      []string                 `json:"Aliases"`
 	// MagpieModel 传空串或 null 表示「不映射」（不转发到代理侧）。
 	MagpieModel *string `json:"MagpieModel"`
+	// BoundInternalRef 绑定到内部模型（网关 ref）；不传=不改，""=解绑。
+	BoundInternalRef *string `json:"BoundInternalRef"`
 }
 
 func decodeBody(w http.ResponseWriter, r *http.Request, v any) bool {
@@ -102,14 +104,15 @@ func decodeBody(w http.ResponseWriter, r *http.Request, v any) bool {
 
 func toInput(req *createModelRequest) ExternalModelInput {
 	return ExternalModelInput{
-		ExternalName: req.ExternalName,
-		Description:  req.Description,
-		Enabled:      req.Enabled,
-		SaleRates:    billing.Rates(req.SaleRates),
-		TimeConfig:   req.TimeConfig,
-		ContextTiers: req.ContextTiers,
-		Aliases:      req.Aliases,
-		MagpieModel:  req.MagpieModel,
+		ExternalName:     req.ExternalName,
+		Description:      req.Description,
+		Enabled:          req.Enabled,
+		SaleRates:        billing.Rates(req.SaleRates),
+		TimeConfig:       req.TimeConfig,
+		ContextTiers:     req.ContextTiers,
+		Aliases:          req.Aliases,
+		MagpieModel:      req.MagpieModel,
+		BoundInternalRef: req.BoundInternalRef,
 	}
 }
 

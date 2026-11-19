@@ -100,8 +100,8 @@ func TestCreateModel_SetsMagpieModel(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT ` + cols + ` FROM external_models WHERE external_name = $1`)).
 		WithArgs("tenant-model").WillReturnError(sql.ErrNoRows)
 	expectAliasOtherNone(mock, "tenant-model", 0)
-	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO external_models(id, external_name, description, enabled, sale_rates, time_config, context_tiers, aliases, magpie_model) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING `+cols)).
-		WithArgs(sqlmock.AnyArg(), "tenant-model", "", true, sqlmock.AnyArg(), nil, nil, sqlmock.AnyArg(), "upstream/gpt-4o").
+	mock.ExpectQuery(regexp.QuoteMeta(`INSERT INTO external_models(id, external_name, description, enabled, sale_rates, time_config, context_tiers, aliases, magpie_model, bound_internal_ref) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING `+cols)).
+		WithArgs(sqlmock.AnyArg(), "tenant-model", "", true, sqlmock.AnyArg(), nil, nil, sqlmock.AnyArg(), "upstream/gpt-4o", nil).
 		WillReturnRows(extRow(&ExternalModel{
 			ID: 1, ExternalName: "tenant-model", Enabled: true,
 			MagpieModel: strPtr("upstream/gpt-4o"), CreatedAt: now, UpdatedAt: now,

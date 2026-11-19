@@ -380,10 +380,10 @@ func (s *Store) Insert(ctx context.Context, m *ExternalModel) (*ExternalModel, e
 		m.ID = idgen.New()
 	}
 	row := s.db.QueryRowContext(ctx,
-		`INSERT INTO external_models(id, external_name, description, enabled, sale_rates, time_config, context_tiers, aliases, magpie_model)
-		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING `+cols,
+		`INSERT INTO external_models(id, external_name, description, enabled, sale_rates, time_config, context_tiers, aliases, magpie_model, bound_internal_ref)
+		 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING `+cols,
 		m.ID, m.ExternalName, m.Description, m.Enabled, jsonB(m.SaleRates),
-		nullableJSON(m.TimeConfig), nullableJSON(m.ContextTiers), jsonAliases(m.Aliases), nullableText(m.MagpieModel))
+		nullableJSON(m.TimeConfig), nullableJSON(m.ContextTiers), jsonAliases(m.Aliases), nullableText(m.MagpieModel), nullableText(m.BoundInternalRef))
 	created, err := scanExternal(row)
 	if err != nil {
 		if e := mapUniqueViolation(err); e != nil {
@@ -405,11 +405,11 @@ func (s *Store) Update(ctx context.Context, m *ExternalModel) error {
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE external_models SET external_name=$1, description=$2, enabled=$3,
 		        sale_rates=$4, time_config=$5, context_tiers=$6, aliases=$7,
-		        magpie_model=$8, updated_at=now()
-		 WHERE id=$9`,
+		        magpie_model=$8, bound_internal_ref=$9, updated_at=now()
+		 WHERE id=$10`,
 		m.ExternalName, m.Description, m.Enabled, jsonB(m.SaleRates),
 		nullableJSON(m.TimeConfig), nullableJSON(m.ContextTiers), jsonAliases(m.Aliases),
-		nullableText(m.MagpieModel), m.ID)
+		nullableText(m.MagpieModel), nullableText(m.BoundInternalRef), m.ID)
 	if err != nil {
 		if e := mapUniqueViolation(err); e != nil {
 			return e
