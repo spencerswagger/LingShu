@@ -11,6 +11,7 @@ import '@vue-flow/core/dist/theme-default.css'
 import '@vue-flow/controls/dist/style.css'
 import type { InternalModelView, GatewayView, GwModel } from '@/api/v2'
 import { fmtCompact } from '@/utils/format'
+import FlowEdgeParticle from './FlowEdgeParticle.vue'
 
 const props = defineProps<{
   view: InternalModelView
@@ -20,9 +21,12 @@ const props = defineProps<{
 }>()
 const emit = defineEmits<{ select: [node: { kind: string; ref: string; data: Record<string, unknown> }] }>()
 
-const X_ACCOUNT = 0
-const X_PROVIDER = 260
-const X_GROUP = 780
+// 三列坐标（对齐原型）：账号 20 / 供应商 250 / 路由组 600；嵌套组再往右一列。
+const X_ACCOUNT = 20
+const X_PROVIDER = 250
+const X_GROUP = 600
+const X_NESTED_STEP = 320
+const EDGE = 'particle' as const
 
 function shortModel(m: GwModel) {
   return { id: m.id, name: m.name, provider: m.provider, context: m.context || 0 }
@@ -72,32 +76,74 @@ const graph = computed<{ nodes: Node[]; edges: Edge[] }>(() => {
     accts.forEach((a, i) => {
       const aid = `a:${p}:${a.name}`
       nodes.push({ id: aid, type: 'account', connectable: false, position: { x: X_ACCOUNT, y: providerY + 8 + i * 44 }, data: { Account: a.name, Provider: providerName[p], Plan: a.plan } })
-      edges.push({ id: `e:${aid}->${pid}`, source: aid, sourceHandle: 'out', target: pid, targetHandle: 'in', type: 'smoothstep', animated: true, style: { stroke: '#2f3d58', strokeWidth: 1 } })
+      edges.push({ id: `e:${aid}->${pid}`, source: aid, sourceHandle: 'out', target: pid, targetHandle: 'in', type: EDGE, animated: true, style: { stroke: '#2f3d58', strokeWidth: 1 } })
     })
     providerY += Math.max(cardH, accts.length * 44 + 12) + 34
   }
 
-  // 右列：路由组 / Auto（可直接调用）
+  // 右列：路由组 / Auto（可直接调用）。hidden 组不渲染（节点与边一并不出）。
+  const visible = gw.groups.filter((g) => !g.hidden)
+  const groupRefs = new Set(visible.map((g) => g.ref))
+  // 嵌套组：被其它组当成员引用的组，往右挪一列；深度 = 1 + 最深父组。
+  const parentOf = new Map<string, string[]>()
+  for (const g of visible) {
+    for (const mid of g.members) {
+      if (groupRefs.has(mid)) {
+        if (!parentOf.has(mid)) parentOf.set(mid, [])
+        parentOf.get(mid)!.push(g.ref)
+      }
+    }
+  }
+  const depthOf = new Map<string, number>()
+  const depthOfRef = (ref: string, seen: Set<string>): number => {
+    if (depthOf.has(ref)) return depthOf.get(ref)!
+    if (seen.has(ref)) return 0 // 防环
+    seen.add(ref)
+    const parents = parentOf.get(ref) || []
+    const d = parents.length ? Math.max(...parents.map((r) => depthOfRef(r, seen))) + 1 : 0
+    depthOf.set(ref, d)
+    return d
+  }
+  for (const g of visible) depthOfRef(g.ref, new Set())
+
+  // 第 0 列组按纵向排；每个更深的嵌套列各自纵向排。
   let groupY = 0
-  for (const g of gw.groups) {
+  const nestedY = new Map<number, number>()
+  for (const g of visible) {
     const gid = `g:${g.ref}`
     const price = props.groupPrice?.[g.ref] ?? null
+    const d = depthOf.get(g.ref) || 0
+    let y: number
+    if (d === 0) {
+      y = groupY
+      groupY += 92
+    } else {
+      y = nestedY.get(d) || 0
+      nestedY.set(d, y + 92)
+    }
     nodes.push({
       id: gid, type: 'group', connectable: false,
-      position: { x: X_GROUP, y: groupY },
+      position: { x: X_GROUP + X_NESTED_STEP * d, y },
       data: { Ref: g.ref, Name: g.name, Auto: !!g.auto, Members: g.members.length, Price: price },
     })
-    // 成员模型 → 组（从供应商卡的模型行右侧连到组左侧）
+    // 成员模型 → 组（从供应商卡的模型行右侧连到组左侧）；成员若是组（嵌套），父组 → 子组连线
     for (const mid of g.members) {
+      if (groupRefs.has(mid)) {
+        edges.push({
+          id: `e:${gid}->g:${mid}`, source: gid, sourceHandle: 'out',
+          target: `g:${mid}`, targetHandle: 'in', type: EDGE, animated: true,
+          style: { stroke: '#4a4472', strokeWidth: 1.1, strokeDasharray: '4 3' },
+        })
+        continue
+      }
       const prov = mid.split('/')[0]
       if (!byProvider.has(prov)) continue
       edges.push({
         id: `e:${mid}->${gid}`, source: `p:${prov}`, sourceHandle: `m:${mid}`,
-        target: gid, targetHandle: 'in', type: 'smoothstep', animated: true,
+        target: gid, targetHandle: 'in', type: EDGE, animated: true,
         style: { stroke: g.auto ? '#5b47a8' : '#33415e', strokeWidth: 1.1 },
       })
     }
-    groupY += 92
   }
 
   return { nodes, edges }
@@ -114,6 +160,10 @@ function pick(kind: string, ref: string, data: Record<string, unknown>) {
       :elements-selectable="true" fit-view-on-init class="canvas">
       <Background pattern-color="#141b28" :gap="22" :size="1" />
       <Controls />
+
+      <template #edge-particle="p">
+        <FlowEdgeParticle v-bind="p" />
+      </template>
 
       <template #node-account="p">
         <div class="n acct" @click="pick('account', p.data.Account, p.data)">
@@ -148,6 +198,7 @@ function pick(kind: string, ref: string, data: Record<string, unknown>) {
       <template #node-group="p">
         <div class="n grp" @click="pick('group', p.data.Ref, p.data)">
           <Handle type="target" :position="Position.Left" id="in" />
+          <Handle type="source" :position="Position.Right" id="out" />
           <div class="ic"><svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><path d="M2 4.4h3.6M8.2 4.4H14"></path><circle cx="6.9" cy="4.4" r="1.5"></circle><path d="M2 11.6h4.4M8.9 11.6H14"></path><circle cx="7.7" cy="11.6" r="1.5"></circle></svg></div>
           <div class="bd">
             <div class="hd"><b>{{ p.data.Name }}</b><span class="bg group">{{ p.data.Auto ? 'AUTO' : '路由组' }}</span></div>
@@ -181,7 +232,7 @@ function pick(kind: string, ref: string, data: Record<string, unknown>) {
 .grp .ic { color: #9d8be0; border-color: #2f3750; background: #14182a; }
 .priced { color: #8fbf9f; font-family: ui-monospace, Menlo, monospace; }
 .unpriced { color: #c9a227; }
-.prov { width: 470px; border-radius: 11px; border: 1px solid #22304a; background: linear-gradient(175deg, #111a2bf7, #090e18fa); box-shadow: inset 0 1px #ffffff08, 0 20px 44px -34px #4c6fe8e6; }
+.prov { width: 268px; border-radius: 11px; border: 1px solid #22304a; background: linear-gradient(175deg, #111a2bf7, #090e18fa); box-shadow: inset 0 1px #ffffff08, 0 20px 44px -34px #4c6fe8e6; }
 .prov-hd { display: flex; align-items: center; gap: 8px; padding: 8px 10px 6px; cursor: pointer; }
 .prov-hd .ic { flex: none; width: 21px; height: 21px; border-radius: 5px; display: flex; align-items: center; justify-content: center; border: 1px solid #2b3a55; background: #121b2c; color: #88a8d4; }
 .prov-hd .ti { min-width: 0; flex: 1; }
@@ -195,7 +246,4 @@ function pick(kind: string, ref: string, data: Record<string, unknown>) {
 .prov .row em { font-style: normal; font-family: ui-monospace, Menlo, monospace; font-size: 9.5px; color: #5f6a80; }
 :deep(.vue-flow__handle) { width: 6px; height: 6px; background: #2a3346; border: 1px solid #3a4a6b; pointer-events: none; }
 :deep(.vue-flow__edge-path) { stroke-linecap: round; }
-/* demo 的粒子（虚线流动）效果 */
-@keyframes dashdraw { to { stroke-dashoffset: -10; } }
-:deep(.vue-flow__edge.animated .vue-flow__edge-path) { stroke-dasharray: 5; animation: dashdraw .5s linear infinite; }
 </style>
