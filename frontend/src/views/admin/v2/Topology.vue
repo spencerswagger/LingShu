@@ -148,6 +148,37 @@ async function bindExisting(payload: { ref: string; externalId: string }) {
   }
 }
 
+// 按网关的组补全对外模型：每个组若还没有对外模型绑定它，就建一个同名的
+// （Auto 组加 " (auto)" 后缀），价格 0 可在抽屉里改。
+async function syncGroupModels() {
+  if (!gw.value) return ElMessage.warning('还没拿到网关的组数据')
+  await ensureExternals(true)
+  const boundRefs = new Set(externals.value.map((e) => (e.BoundInternalRef || '')).filter(Boolean))
+  const todo = gw.value.groups.filter((g) => !boundRefs.has(g.ref))
+  if (!todo.length) return ElMessage.info('每个组都已有对外模型')
+  let ok = 0
+  for (const g of todo) {
+    try {
+      await createExternalModel({
+        ExternalName: g.auto ? `${g.name} (auto)` : g.name,
+        Description: '',
+        Enabled: true,
+        SaleRates: { Input: 0, Output: 0, CacheRead: 0 },
+        TimeConfig: null,
+        ContextTiers: null,
+        Aliases: [],
+        BoundInternalRef: g.ref,
+      } as never)
+      ok++
+    } catch {
+      /* 跳过失败的，最后一起提示 */
+    }
+  }
+  await ensureExternals(true)
+  await load()
+  ElMessage.success(`已补全 ${ok} / ${todo.length} 个组的对外模型`)
+}
+
 async function removeModel() {
   if (!form.id) return
   try {
@@ -211,6 +242,7 @@ const selKindLabel = computed(() => {
       <span class="meta">最后同步 {{ lastSync }}</span>
       <span v-if="syncMsg" class="meta">{{ syncMsg }}</span>
       <div class="sp" />
+      <el-button size="small" @click="syncGroupModels">补全对外模型</el-button>
       <el-button size="small" type="primary" @click="openNode({ kind: 'model', ref: '', data: { Name: '' } })">新建模型</el-button>
       <el-button size="small" :loading="syncing" @click="runSync">同步</el-button>
       <el-button size="small" :loading="state === 'loading'" @click="load()">刷新</el-button>
