@@ -492,6 +492,56 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	// （灵枢不自行签发凭据；未绑定的令牌在转发时返回 403 magpie_key_missing）。
 	magpieKeyAdmin := magpie.NewKeyAdminHandler(magpie.NewKeyStore(d), sm4Key, cfg.Magpie.AdminKey)
 
+	// V3：令牌 ↔ callerKey 同步（页面接口 + magpie_keys）。
+	// 页面口令来源：entrypoint 以 root 读出的 $MAGPIE_WEB_KEY，或直接读卷里的文件。
+	// 缺口令就只跳过同步，不影响启动。
+	{
+		webBase := strings.TrimRight(strings.TrimSpace(os.Getenv("MAGPIE_WEB_BASE_URL")), "/")
+		if !strings.HasPrefix(webBase, "http://") && !strings.HasPrefix(webBase, "https://") {
+			webBase = "http://magpie:3430"
+		}
+		webKey := strings.TrimSpace(os.Getenv("MAGPIE_WEB_KEY"))
+		if webKey == "" {
+			if f := strings.TrimSpace(os.Getenv("MAGPIE_WEB_KEY_FILE")); f != "" {
+				if b, err := os.ReadFile(f); err == nil {
+					webKey = strings.TrimSpace(string(b))
+				}
+			}
+		}
+		if webKey == "" {
+			logr.Warn("未取到 magpie 页面口令：令牌不会自动开通代理访问（检查 /run/magpie-secret/admin_web_key 权限）")
+		} else {
+			page := magpie.NewPageAdmin(webBase, webKey, nil)
+			keySync = magpie.NewCallerKeySync(page, magpie.NewKeyStore(d), sm4Key)
+			tokenSvc.SetCallerKeySyncer(keySync)
+			keyStoreForLookup := magpie.NewKeyStore(d)
+			tokenSvc.SetCallerKeyLookup(func(ctx context.Context, tokenID int64) (bool, error) {
+				k, err := keyStoreForLookup.ByTokenID(ctx, tokenID)
+				if err != nil || k == nil {
+					return false, nil
+				}
+				return k.State == "ACTIVE", nil
+			})
+			magpieKeyAdmin.SetAutoSync(tokenSvc.Secret, keySync)
+			v3Poller.SetKeySync(keySync)
+			// 升级自动补建：启动即把存量令牌注册为代理侧 callerKey（指数退避，最多约 1h）
+			go func() {
+				for i := 0; i < 10; i++ {
+					created, skipped, failed, err := tokenSvc.BackfillCallerKeys(context.Background(), 0)
+					if err == nil {
+						logr.Info("V3 存量令牌补建完成", "created", created, "skipped", skipped, "failed", len(failed))
+						if len(failed) == 0 {
+							return
+						}
+					} else {
+						logr.Warn("V3 存量令牌补建失败（下轮重试）", "err", err)
+					}
+					time.Sleep(time.Duration(10*(i+1)) * time.Second)
+				}
+			}()
+		}
+	}
+
 	// 代理侧管理面「一键跳转」：签发入口票据 + 给 nginx 的 auth_request 提供校验端点。
 	// 代理侧未接入（magpie.base_url 为空）时签发接口给 503 + reason，前端把按钮置灰，
 	// 不制造「点开是 502」的死链。
