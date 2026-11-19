@@ -32,6 +32,39 @@ type RawSource interface {
 // SetRawSource 注入原始组数据源（不起作用时页面只显示镜像层，不报错）。
 func (h *Handler) SetRawSource(src RawSource) { h.raw = src }
 
+// HandlePutCostRates PUT /api/v1/admin/internal-models/{ref}/cost-rates
+// 仅修改对内模型的成本价（其余字段始终保持网关镜像只读）。
+func (h *Handler) HandlePutCostRates(w http.ResponseWriter, r *http.Request) {
+	ref := strings.TrimSpace(r.PathValue("ref"))
+	if ref == "" {
+		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "缺少内部模型 ref")
+		return
+	}
+	var body map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "请求体必须是 JSON 对象（成本价）")
+		return
+	}
+	raw, _ := json.Marshal(body)
+	up, ok := h.store.(interface {
+		SetCostRates(ctx context.Context, ref string, costJSON []byte) (int64, error)
+	})
+	if !ok {
+		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "存储不支持成本价写入")
+		return
+	}
+	n, err := up.SetCostRates(r.Context(), ref, raw)
+	if err != nil {
+		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, err.Error())
+		return
+	}
+	if n == 0 {
+		resp.Err(w, r, http.StatusNotFound, resp.CodeNotFound, "内部模型不存在（先同步一轮拓扑）")
+		return
+	}
+	resp.OK(w, r, map[string]any{"Ref": ref, "CostRates": json.RawMessage(raw)})
+}
+
 // HandleGateway 原样下发网关的 /api/groups（账号、路由组、成员、模型都在这份里）。
 func (h *Handler) HandleGateway(w http.ResponseWriter, r *http.Request) {
 	if h.raw == nil {

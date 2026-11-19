@@ -447,3 +447,15 @@ func jsonOrEmpty(raw json.RawMessage) []byte {
 	}
 	return raw
 }
+
+// SetCostRates 仅更新内部模型的成本价（灵枢可写字段，其余仍为网关镜像）。
+func (s *SQLStore) SetCostRates(ctx context.Context, ref string, costJSON []byte) (int64, error) {
+	if s == nil || s.db == nil {
+		return 0, errors.New("拓扑存储未装配数据库连接")
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE internal_models SET cost_rates = $1, updated_at = now() WHERE ref = $2`, costJSON, ref)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}

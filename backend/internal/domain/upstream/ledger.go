@@ -25,8 +25,8 @@ import (
 const (
 	// LedgerTable 是账本表名（实施计划 §3 的 0022 口径）。
 	LedgerTable = "ledger_entries"
-	// LedgerFieldCount 是账本字段数（九）。
-	LedgerFieldCount = 9
+	// LedgerFieldCount 是账本字段数（十四：九字段 + req/served/caller/cache_read/cache_write）。
+	LedgerFieldCount = 14
 	// ledgerBatchRows 是单条 INSERT 的最大行数（9 列 × 200 行 = 1800 个参数，远低于上限）。
 	ledgerBatchRows = 200
 	// ledgerListDefaultLimit / ledgerListMaxLimit 是 offset 分页的默认与上限。
@@ -53,6 +53,14 @@ type LedgerEntry struct {
 	// （代理侧 `in` 不含缓存）。适配层的合并点见 magpie_ledger.go 的 mapMagpieFeedRow。
 	TokensIn  int64
 	TokensOut int64
+	// ReqModel 是客户端请求的模型名（=对外模型/路由组名，算营收），ServedModel 是厂商回执自称的模型。
+	ReqModel    string
+	ServedModel string
+	// CallerKeyName 是代理侧 callerKey 名（=灵枢令牌映射，ls-token-<id>）。
+	CallerKeyName string
+	// CacheRead / CacheWrite 是缓存读/写 token（tokens_in 已含 cache_write，用于成本细分时使用）。
+	CacheRead  int64
+	CacheWrite int64
 	// CostCredits 是上游口径的成本积分（NUMERIC(20,5)）。
 	CostCredits float64
 	// OccurredAt 是上游发生时刻；**必须显式给**，不拿 now() 兜底（猜时间会把账算错位）。
@@ -148,7 +156,8 @@ func (s *LedgerStore) List(ctx context.Context, offset, limit int) ([]LedgerEntr
 		limit = ledgerListMaxLimit
 	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, ledger_id, provider, provider_account, model, tokens_in, tokens_out, cost_credits, occurred_at
+		`SELECT id, ledger_id, provider, provider_account, model, tokens_in, tokens_out, cost_credits, occurred_at,
+		        req_model, served_model, caller_key_name, cache_read, cache_write
 		   FROM `+LedgerTable+`
 		  ORDER BY occurred_at DESC, id DESC
 		  LIMIT $1 OFFSET $2`, limit, offset)
@@ -161,7 +170,8 @@ func (s *LedgerStore) List(ctx context.Context, offset, limit int) ([]LedgerEntr
 	for rows.Next() {
 		var e LedgerEntry
 		if err := rows.Scan(&e.ID, &e.LedgerID, &e.Provider, &e.ProviderAccount, &e.Model,
-			&e.TokensIn, &e.TokensOut, &e.CostCredits, &e.OccurredAt); err != nil {
+			&e.TokensIn, &e.TokensOut, &e.CostCredits, &e.OccurredAt,
+			&e.ReqModel, &e.ServedModel, &e.CallerKeyName, &e.CacheRead, &e.CacheWrite); err != nil {
 			return nil, fmt.Errorf("读取账本行失败：%w", err)
 		}
 		out = append(out, e)
@@ -272,7 +282,8 @@ func (t *ledgerTx) Execer() dbx.Execer { return t.tx }
 func buildLedgerInsert(entries []LedgerEntry) (string, []any) {
 	var b strings.Builder
 	b.WriteString(`INSERT INTO ` + LedgerTable + ` (id, ledger_id, provider, provider_account, model,
-		tokens_in, tokens_out, cost_credits, occurred_at) VALUES `)
+		tokens_in, tokens_out, cost_credits, occurred_at,
+		req_model, served_model, caller_key_name, cache_read, cache_write) VALUES `)
 	args := make([]any, 0, len(entries)*LedgerFieldCount)
 	for i := range entries {
 		e := &entries[i]
@@ -283,11 +294,14 @@ func buildLedgerInsert(entries []LedgerEntry) (string, []any) {
 			b.WriteString(",")
 		}
 		base := i * LedgerFieldCount
-		b.WriteString("($" + strconv.Itoa(base+1) + ",$" + strconv.Itoa(base+2) + ",$" + strconv.Itoa(base+3) +
-			",$" + strconv.Itoa(base+4) + ",$" + strconv.Itoa(base+5) + ",$" + strconv.Itoa(base+6) +
-			",$" + strconv.Itoa(base+7) + ",$" + strconv.Itoa(base+8) + ",$" + strconv.Itoa(base+9) + ")")
+		ph := make([]string, LedgerFieldCount)
+		for j := 0; j < LedgerFieldCount; j++ {
+			ph[j] = "$" + strconv.Itoa(base+j+1)
+		}
+		b.WriteString("(" + strings.Join(ph, ",") + ")")
 		args = append(args, e.ID, e.LedgerID, e.Provider, e.ProviderAccount, e.Model,
-			e.TokensIn, e.TokensOut, e.CostCredits, e.OccurredAt)
+			e.TokensIn, e.TokensOut, e.CostCredits, e.OccurredAt,
+			e.ReqModel, e.ServedModel, e.CallerKeyName, e.CacheRead, e.CacheWrite)
 	}
 	// 同一 id 以更高 seq 再次出现 = 代理侧这一行被改过（例如成本补齐、账号修正），
 	// 必须覆盖；DO NOTHING 会让灵枢永久保留第一次读到的旧值。
@@ -298,6 +312,11 @@ func buildLedgerInsert(entries []LedgerEntry) (string, []any) {
 		tokens_in = EXCLUDED.tokens_in,
 		tokens_out = EXCLUDED.tokens_out,
 		cost_credits = EXCLUDED.cost_credits,
-		occurred_at = EXCLUDED.occurred_at`)
+		occurred_at = EXCLUDED.occurred_at,
+		req_model = EXCLUDED.req_model,
+		served_model = EXCLUDED.served_model,
+		caller_key_name = EXCLUDED.caller_key_name,
+		cache_read = EXCLUDED.cache_read,
+		cache_write = EXCLUDED.cache_write`)
 	return b.String(), args
 }

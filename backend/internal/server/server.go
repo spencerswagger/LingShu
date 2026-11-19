@@ -235,6 +235,7 @@ func (s *Server) routes() {
 	if d.Topology != nil {
 		admin.HandleFunc("GET /api/v1/admin/topology", d.Topology.HandleGet)
 		admin.HandleFunc("GET /api/v1/admin/topology/gateway", d.Topology.HandleGateway)
+		admin.HandleFunc("PUT /api/v1/admin/internal-models/{ref}/cost-rates", d.Topology.HandlePutCostRates)
 		admin.HandleFunc("POST /api/v1/admin/topology/sync", d.Topology.HandleSync)
 		// T2：画布落位（只写坐标，不写绑定 —— 绑定真源是 external_models.bound_internal_ref）。
 		admin.HandleFunc("PUT /api/v1/admin/topology/links", d.Topology.HandlePutLinks)
