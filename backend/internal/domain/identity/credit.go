@@ -330,41 +330,6 @@ func (s *CreditService) consumeOn(ctx context.Context, ex dbx.Execer, userID int
 	return before, after, nil
 }
 
-func (s *CreditService) settleOn(ctx context.Context, ex dbx.Execer, userID int64, delta float64, sessionID, remark string) (before, after float64, err error) {
-	delta = decimalx.Round5(delta)
-	if err := money.Validate(delta, "结算差额"); err != nil {
-		return 0, 0, errBadRequest(err.Error())
-	}
-	before, gErr := getBalanceOn(ctx, ex, userID)
-	if gErr != nil {
-		return 0, 0, gErr
-	}
-	if delta == 0 {
-		return before, before, nil
-	}
-	if delta < 0 {
-		if _, e := changeBalanceOn(ctx, ex, userID, -delta, false); e != nil {
-			return 0, 0, fmt.Errorf("settle refund: %w", e)
-		}
-	} else {
-		changed, e := changeBalanceOn(ctx, ex, userID, -delta, true)
-		if e != nil {
-			return 0, 0, fmt.Errorf("settle charge: %w", e)
-		}
-		if !changed {
-			return before, before, errInsufficient(delta)
-		}
-	}
-	after, gErr = getBalanceOn(ctx, ex, userID)
-	if gErr != nil {
-		return 0, 0, gErr
-	}
-	if err := s.insertFlowOn(ctx, ex, FlowTypeAdjust, userID, -delta, nil, sessionID, remark, false); err != nil {
-		return 0, 0, err
-	}
-	return before, after, nil
-}
-
 // Recharge 充值积分（amount > 0），写入 recharge 流水，operatorID 为操作管理员。
 // 改余额 + 写流水在同一事务内原子提交；operatorID 写入流水备注（操作员#<id>）。
 func (s *CreditService) Recharge(ctx context.Context, userID, operatorID int64, amount float64, remark string) error {

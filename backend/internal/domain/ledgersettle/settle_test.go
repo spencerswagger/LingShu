@@ -23,8 +23,8 @@ func mustTime(t *testing.T, s string) time.Time {
 func TestMatchRows_NearestWithinTolerance(t *testing.T) {
 	t0 := mustTime(t, "2026-11-16T10:00:00Z")
 	bills := []BillingRow{
-		{BillingID: "b1", RequestID: "r1", Provider: "p", Account: "a", Model: "m", CallTime: t0, Tokens: 100},
-		{BillingID: "b2", RequestID: "r2", Provider: "p", Account: "a", Model: "m", CallTime: t0.Add(30 * time.Second), Tokens: 200},
+		{BillingID: "b1", Provider: "p", Account: "a", Model: "m", CallTime: t0, Tokens: 100},
+		{BillingID: "b2", Provider: "p", Account: "a", Model: "m", CallTime: t0.Add(30 * time.Second), Tokens: 200},
 	}
 	ledgers := []LedgerRow{
 		{LedgerID: "l2", Provider: "p", Account: "a", Model: "m", TokensIn: 150, TokensOut: 40, Cost: 1.5, OccurredAt: t0.Add(32 * time.Second)},

@@ -45,7 +45,6 @@ const (
 // BillingRow 是一条待匹配的账单（只取匹配需要的列）。
 type BillingRow struct {
 	BillingID string
-	RequestID string
 	Provider  string
 	Account   string
 	Model     string
@@ -321,7 +320,6 @@ func (s *SQLStore) UnmatchedBilling(ctx context.Context, from, to time.Time) ([]
 	}
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT billing_id,
-		        COALESCE(request_id, ''),
 		        COALESCE(upstream_provider, ''),
 		        COALESCE(upstream_account, ''),
 		        COALESCE(upstream_model, ''),
@@ -341,7 +339,7 @@ func (s *SQLStore) UnmatchedBilling(ctx context.Context, from, to time.Time) ([]
 	out := make([]BillingRow, 0, 64)
 	for rows.Next() {
 		var b BillingRow
-		if err := rows.Scan(&b.BillingID, &b.RequestID, &b.Provider, &b.Account, &b.Model, &b.CallTime, &b.Tokens); err != nil {
+		if err := rows.Scan(&b.BillingID, &b.Provider, &b.Account, &b.Model, &b.CallTime, &b.Tokens); err != nil {
 			return nil, fmt.Errorf("扫描待结算账单失败：%w", err)
 		}
 		out = append(out, b)
