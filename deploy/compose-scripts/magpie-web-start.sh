@@ -2,7 +2,11 @@
 # magpie 容器启动脚本：把页面口令送进环境，然后 exec magpie web。
 # 由 docker-compose.yml 以 `entrypoint: ["/bin/bash","/opt/lingshu/magpie-web-start.sh"]` 调用。
 set -e
-if [ -s /secret/admin_web_key ]; then
+if [ -s /config/.magpie_web_key ]; then
+  MAGPIE_WEB_KEY=$(cat /config/.magpie_web_key)
+  export MAGPIE_WEB_KEY
+  echo "[magpie] 管理面口令来自 /config/.magpie_web_key" >&2
+elif [ -s /secret/admin_web_key ]; then
   MAGPIE_WEB_KEY=$(cat /secret/admin_web_key)
   export MAGPIE_WEB_KEY
   echo "[magpie] 管理面口令来自 /secret/admin_web_key" >&2
