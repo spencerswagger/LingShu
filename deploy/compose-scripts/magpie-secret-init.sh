@@ -49,7 +49,10 @@ if [ -n "$want" ]; then printf '%s' "$want" > "$KEY_FILE"; fi
 chown -R 65532:65532 /config 2>/dev/null || true
 find /config -type f -exec chmod 600 {} \; 2>/dev/null || true
 chown 65532:65532 "$WEB_FILE" "$KEY_FILE" 2>/dev/null || true
-chmod 600 "$KEY_FILE" 2>/dev/null || true
-# 页面口令要给 backend 读（它用 ?k= 拉 /api/groups），backend 以非 root 运行，600 读不到 -> 0644
-chmod 644 "$WEB_FILE" 2>/dev/null || true
+chmod 600 "$WEB_FILE" "$KEY_FILE" 2>/dev/null || true
+# magpie 以 65532 运行，自己在 /config 下有读写权：给它一份 600 的同值口令，
+# 避免 /secret(700 root) 跨用户读不到导致它自造随机口令（那会让 /magpie/ 与 /api 全部 401）。
+printf '%s' "$(cat "$WEB_FILE")" > /config/.magpie_web_key
+chown 65532:65532 /config/.magpie_web_key 2>/dev/null || true
+chmod 600 /config/.magpie_web_key 2>/dev/null || true
 echo "[magpie-secret-init] 准备完成（key 尾号 ${want: -4}）"
