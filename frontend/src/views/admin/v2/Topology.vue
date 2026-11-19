@@ -216,7 +216,8 @@ async function runRebill() {
   const n = unpricedCount.value
   try {
     await ElMessageBox.confirm(
-      `将为「${String(sel.value.data.Name || refStr)}」按当前售价补开 ${n} 张新账单并从对应用户余额扣款，原有 unpriced 账单保持不变。是否继续？`,
+      // Owl P3：N 是前端预估，弹窗必须写明「预计」，实际条数与金额以后端返回为准（防授权歧义）
+      `将为「${String(sel.value.data.Name || refStr)}」按当前售价预计补收 ${n} 条，实际条数与金额以后端返回为准；补收将从对应用户余额扣款，原有 unpriced 账单保持不变。是否继续？`,
       '按当前售价补收',
       { confirmButtonText: '确认补收', cancelButtonText: '取消', type: 'warning' },
     )
