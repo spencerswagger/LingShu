@@ -485,7 +485,7 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 
 	// 代理侧 callerKey 映射的管理端入口：运维在 magpie 侧创建 callerKey 后录入灵枢
 	// （灵枢不自行签发凭据；未绑定的令牌在转发时返回 403 magpie_key_missing）。
-	magpieKeyAdmin := magpie.NewKeyAdminHandler(magpie.NewKeyStore(d), sm4Key)
+	magpieKeyAdmin := magpie.NewKeyAdminHandler(magpie.NewKeyStore(d), sm4Key, cfg.Magpie.AdminKey)
 
 	// 代理侧管理面「一键跳转」：签发入口票据 + 给 nginx 的 auth_request 提供校验端点。
 	// 代理侧未接入（magpie.base_url 为空）时签发接口给 503 + reason，前端把按钮置灰，
