@@ -24,9 +24,9 @@ const emit = defineEmits<{
 }>()
 
 const X_ACCOUNT = 0
-const X_PROVIDER = 240
-const X_GROUP = 720
-const X_EXTERNAL = 1010
+const X_PROVIDER = 260
+const X_GROUP = 790
+const X_EXTERNAL = 1120
 
 function shortModel(m: GwModel) {
   return { id: m.id, name: m.name, provider: m.provider, context: m.context || 0 }
@@ -84,10 +84,10 @@ const graph = computed<{ nodes: Node[]; edges: Edge[] }>(() => {
     })
     accts.forEach((a, i) => {
       const aid = `a:${p}:${a.name}`
-      nodes.push({ id: aid, type: 'account', position: { x: X_ACCOUNT, y: providerY + 8 + i * 38 }, data: { Account: a.name, Provider: providerName[p], Plan: a.plan } })
-      edges.push({ id: `e:${aid}->${pid}`, source: aid, target: pid, type: 'smoothstep', animated: true, style: { stroke: '#2f3d58', strokeWidth: 1, strokeDasharray: '3 5' } })
+      nodes.push({ id: aid, type: 'account', position: { x: X_ACCOUNT, y: providerY + 8 + i * 44 }, data: { Account: a.name, Provider: providerName[p], Plan: a.plan } })
+      edges.push({ id: `e:${aid}->${pid}`, source: aid, target: pid, type: 'default', animated: true, style: { stroke: '#2f3d58', strokeWidth: 1, strokeDasharray: '3 5' } })
     })
-    providerY += Math.max(cardH, accts.length * 38 + 10) + 26
+    providerY += Math.max(cardH, accts.length * 44 + 12) + 40
   }
 
   // 路由组 / Auto
@@ -111,12 +111,12 @@ const graph = computed<{ nodes: Node[]; edges: Edge[] }>(() => {
         source: `p:${prov}`,
         sourceHandle: `m:${mid}`,
         target: gid,
-        type: 'smoothstep',
+        type: 'default',
         animated: true,
         style: { stroke: g.auto ? '#6b4fa8' : '#3a4a6b', strokeWidth: 1.1, strokeDasharray: '4 4' },
       })
     }
-    groupY += 92
+    groupY += 116
   }
 
   // 对外模型
@@ -131,14 +131,14 @@ const graph = computed<{ nodes: Node[]; edges: Edge[] }>(() => {
       position: { x: X_EXTERNAL, y: extY },
       data: { ID: e.ID, Name: e.ExternalName, Bound: bound, Enabled: e.Enabled, Dangling: dang, In: props.prices?.[e.ID]?.Input, Out: props.prices?.[e.ID]?.Output },
     })
-    extY += 92
+    extY += 108
     if (!bound || dang) continue
     if (groupRefs.has(bound)) {
-      edges.push({ id: `e:${bound}->${xid}`, source: `g:${bound}`, target: xid, type: 'smoothstep', animated: true, style: { stroke: '#5f9e6e', strokeWidth: 1.4, strokeDasharray: '5 4' } })
+      edges.push({ id: `e:${bound}->${xid}`, source: `g:${bound}`, target: xid, type: 'default', animated: true, style: { stroke: '#5f9e6e', strokeWidth: 1.4, strokeDasharray: '5 4' } })
     } else {
       const prov = bound.split('/')[0]
       if (byProvider.has(prov)) {
-        edges.push({ id: `e:${bound}->${xid}`, source: `p:${prov}`, sourceHandle: `m:${bound}`, target: xid, type: 'smoothstep', animated: true, style: { stroke: '#5f9e6e', strokeWidth: 1.4, strokeDasharray: '5 4' } })
+        edges.push({ id: `e:${bound}->${xid}`, source: `p:${prov}`, sourceHandle: `m:${bound}`, target: xid, type: 'default', animated: true, style: { stroke: '#5f9e6e', strokeWidth: 1.4, strokeDasharray: '5 4' } })
       }
     }
   }
@@ -223,9 +223,9 @@ function onConnectEvt(e: { source: string; sourceHandle?: string | null; target?
 .canvas { height: 100%; background: transparent; }
 .nd { background: linear-gradient(175deg, #151a27, #0b0f18); border: 1px solid #2c3a52; border-radius: 10px; padding: 8px 10px; color: var(--ink); font-size: 12px; cursor: pointer; }
 .nd:hover { border-color: #3d5170; }
-.nd-account { width: 190px; }
-.nd-provider { width: 430px; }
-.nd-group { width: 240px; border-color: #3a3560; }
+.nd-account { width: 210px; }
+.nd-provider { width: 470px; }
+.nd-group { width: 270px; border-color: #3a3560; }
 .nd-group.is-auto { border-style: dashed; border-color: #5b47a8; }
 .nd-head { display: flex; align-items: center; justify-content: space-between; }
 .nd-tag { font-size: 9.5px; letter-spacing: .8px; color: #a78bfa; }
@@ -234,10 +234,10 @@ function onConnectEvt(e: { source: string; sourceHandle?: string | null; target?
 .nd-sub { margin-top: 3px; }
 .txt { color: var(--ink-3); font-size: 11px; }
 .pv-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; padding-bottom: 6px; border-bottom: 1px solid #1b2331; }
-.pv-row { position: relative; display: flex; align-items: center; gap: 8px; height: 26px; border-bottom: 1px dashed #141b26; padding-right: 10px; }
+.pv-row { position: relative; display: flex; align-items: center; gap: 8px; height: 28px; border-bottom: 1px dashed #141b26; padding-right: 12px; }
 .pv-row:last-child { border-bottom: 0; }
 .pv-row-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.nd-external { width: 220px; }
+.nd-external { width: 250px; }
 .is-dangling { border-color: #443718; }
 .chip { display: inline-flex; align-items: center; height: 16px; padding: 0 6px; border-radius: 8px; font-size: 10px; border: 1px solid #2a3346; color: var(--ink-2); }
 .chip-sold { border-color: #26402f; color: #8fbf9f; background: rgba(95,158,110,.08); }
