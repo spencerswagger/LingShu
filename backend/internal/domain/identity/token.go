@@ -478,9 +478,10 @@ func (s *TokenService) Create(ctx context.Context, userID int64, displayName str
 
 // BackfillCallerKeys 为缺映射的存量令牌补建 callerKey（V3 迁移用）。
 // 返回 created/skipped/failed；历史无密文的令牌计入 skipped（无法恢复明文，只能轮换）。
-func (s *TokenService) BackfillCallerKeys(ctx context.Context, limit int) (created, skipped int, failed []map[string]any, err error) {
+func (s *TokenService) BackfillCallerKeys(ctx context.Context, limit int) (created int, skipped map[string]int, failed []map[string]any, err error) {
+	skipped = map[string]int{}
 	if s.callerKey == nil {
-		return 0, 0, nil, fmt.Errorf("未装配 callerKey 同步（缺页面口令）")
+		return 0, skipped, nil, fmt.Errorf("未装配 callerKey 同步（缺页面口令）")
 	}
 	if limit <= 0 {
 		limit = 100000
@@ -497,19 +498,21 @@ func (s *TokenService) BackfillCallerKeys(ctx context.Context, limit int) (creat
 		}
 		for i := range list {
 			t := list[i].Token
-			if created+skipped+len(failed) >= limit {
+			if created+skipped["already-bound"]+skipped["no-cipher"]+len(failed) >= limit {
 				return created, skipped, failed, nil
 			}
 			// 已有 ACTIVE 映射则跳过（幂等）
 			if s.callerKeyLookup != nil {
 				if ok, _ := s.callerKeyLookup(ctx, t.ID); ok {
-					skipped++
+					skipped["already-bound"]++
 					continue
 				}
 			}
 			plain, serr := s.Secret(ctx, t.ID)
 			if serr != nil || plain == "" {
-				skipped++
+				// 历史令牌没有密文：拿不到明文，无法注册 callerKey（只能轮换后自动开通）
+				skipped["no-cipher"]++
+				failed = append(failed, map[string]any{"TokenID": t.ID, "Reason": "no-cipher（该令牌未备份密钥，需轮换后自动开通）"})
 				continue
 			}
 			if kerr := s.callerKey.Ensure(ctx, t.ID, plain); kerr != nil {

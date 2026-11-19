@@ -449,6 +449,9 @@ type RoundResult struct {
 	// 后台 ticker 每分钟静默空转，账本/计数列永远是 NULL 也没人知道。
 	// 现在空轮会打一条 WARN（sync.round empty）并置位，调用方可以据此做指标/告警。
 	Empty bool
+	// LastHTTPStatus 是本轮最后一次从上游成功读到的 HTTP 状态（0 = 未知 / 非 HTTP 源）。
+	// 连续空轮告警要带上它：200 空页（上游确实没新行）与连接/鉴权问题的排查方向完全不同。
+	LastHTTPStatus int
 }
 
 // RounderOptions 是 NewRounder 的入参。
@@ -858,6 +861,9 @@ func (r *Rounder) runFeedOnce(ctx context.Context) (RoundResult, error) {
 			return result, fmt.Errorf("拉取代理侧账本失败（cursor=%q）：%w", cursor, ferr)
 		}
 		result.Pages++
+		if page.StatusCode > 0 {
+			result.LastHTTPStatus = page.StatusCode
+		}
 		if page.Skipped > 0 {
 			log.Warn("代理侧账本有行缺少幂等键/时间或为 handed_on，已跳过",
 				"skipped", page.Skipped, "cursor", cursor)

@@ -2,6 +2,8 @@ package billing
 
 import (
 	"encoding/json"
+	"fmt"
+	"math/rand"
 	"reflect"
 	"testing"
 )
@@ -85,5 +87,34 @@ func TestWireUsage_ZeroMigration(t *testing.T) {
 	// 视图与存储结构可直接互转（字段同名同类型，仅 tag 不同）。
 	if !reflect.DeepEqual(Usage(WireUsage(u)), u) {
 		t.Fatalf("WireUsage<->Usage 转换不等价: %+v", Usage(WireUsage(u)))
+	}
+}
+
+// TestNormalizeRatesJSON_BothKeyStylesSameCost：PascalCase 与 snake 两种键名输入
+// 必须归一成同一份 snake JSON——否则 cost-rates 落库 Pascal 后 poller 读不出 → 成本静默算 0。
+func TestNormalizeRatesJSON_BothKeyStylesSameCost(t *testing.T) {
+	rnd := func() float64 { return float64(rand.Intn(10_000)) / 100 }
+	for i := 0; i < 20; i++ {
+		input, output, cacheRead := rnd(), rnd(), rnd()
+		pascal := []byte(fmt.Sprintf(`{"Input":%v,"Output":%v,"CacheRead":%v}`, input, output, cacheRead))
+		snake := []byte(fmt.Sprintf(`{"input":%v,"output":%v,"cache_read":%v}`, input, output, cacheRead))
+
+		var rp, rs Rates
+		if err := json.Unmarshal(NormalizeRatesJSON(pascal), &rp); err != nil {
+			t.Fatalf("round %d pascal: %v", i, err)
+		}
+		if err := json.Unmarshal(NormalizeRatesJSON(snake), &rs); err != nil {
+			t.Fatalf("round %d snake: %v", i, err)
+		}
+		if rp["input"] != rs["input"] || rp["output"] != rs["output"] || rp["cache_read"] != rs["cache_read"] {
+			t.Fatalf("round %d 两种键名归一后不一致：pascal=%v snake=%v", i, rp, rs)
+		}
+		// 与 poller 同口径的成本计算：两种键名输入必须算出同一成本。
+		u := Usage{Input: rand.Int63n(1_000_000), Output: rand.Int63n(1_000_000), CacheRead: rand.Int63n(1_000_000)}
+		cp := float64(u.Input)*rp["input"] + float64(u.Output)*rp["output"] + float64(u.CacheRead)*rp["cache_read"]
+		cs := float64(u.Input)*rs["input"] + float64(u.Output)*rs["output"] + float64(u.CacheRead)*rs["cache_read"]
+		if cp != cs {
+			t.Fatalf("round %d 成本不一致：pascal=%v snake=%v", i, cp, cs)
+		}
 	}
 }

@@ -138,7 +138,7 @@ func (p *Poller) settleOne(ctx context.Context, r row) (bool, error) {
 	var costRaw []byte
 	_ = p.db.QueryRowContext(ctx, `SELECT COALESCE(cost_rates,'{}'::jsonb) FROM internal_models WHERE ref = $1`, ref).Scan(&costRaw)
 	var costRates map[string]float64
-	_ = json.Unmarshal(costRaw, &costRates)
+	_ = json.Unmarshal(billing.NormalizeRatesJSON(costRaw), &costRates) // 兼容历史 PascalCase 落库（写入侧已归一，这里是读取兜底）
 
 	// tokens_in 含 cache_read+cache_write；billing.Usage 的 Input 是「纯输入（含 cache_write）」
 	input := r.tokensIn - r.cacheRead
