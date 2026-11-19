@@ -166,6 +166,7 @@ async function bindExisting(payload: { ref: string; externalId: string }) {
       ContextTiers: m.ContextTiers ?? null,
       Aliases: m.Aliases || [],
       BoundInternalRef: payload.ref,
+      MagpieModel: payload.ref,
     } as never)
     ElMessage.success(`已绑定到 ${payload.ref}`)
     await ensureExternals(true)
@@ -195,6 +196,7 @@ async function syncGroupModels() {
         ContextTiers: null,
         Aliases: [],
         BoundInternalRef: g.ref,
+        MagpieModel: g.ref,
       } as never)
       ok++
     } catch {
@@ -237,6 +239,7 @@ async function save() {
       ContextTiers: pricing.ContextTiers ?? null,
       Aliases: form.aliases,
       BoundInternalRef: form.bound || null,
+      MagpieModel: form.bound || null,
     }
     if (form.isNew) {
       await createExternalModel(base as never)
@@ -264,16 +267,17 @@ const selKindLabel = computed(() => {
 
 <template>
   <div class="tp">
-    <div class="tp-bar">
-      <h2>拓扑</h2>
-      <span class="meta">最后同步 {{ lastSync }}</span>
-      <span v-if="syncMsg" class="meta">{{ syncMsg }}</span>
-      <div class="sp" />
-      <el-button size="small" @click="syncGroupModels">补全对外模型</el-button>
-      <el-button size="small" @click="syncAllPrices">同步价目</el-button>
-      <el-button size="small" type="primary" @click="openCreate('')">新建模型</el-button>
-      <el-button size="small" :loading="syncing" @click="runSync">同步</el-button>
-      <el-button size="small" :loading="state === 'loading'" @click="load()">刷新</el-button>
+    <div class="bar">
+      <span class="brand"><i></i>拓扑</span>
+      <span class="tip">账号 → 供应商 → 路由组 / AUTO → 对外模型</span>
+      <span class="sp" />
+      <span class="live"><em>最后同步</em><b>{{ lastSync }}</b></span>
+      <span v-if="syncMsg" class="tip">{{ syncMsg }}</span>
+      <button @click="syncGroupModels">补全对外模型</button>
+      <button @click="syncAllPrices">同步价目</button>
+      <button class="pri" @click="openCreate('')">新建模型</button>
+      <button @click="runSync">同步</button>
+      <button @click="load()">刷新</button>
     </div>
 
     <div v-if="state === 'error'" class="tp-err">数据没取到，先看错误再刷新。</div>
@@ -332,8 +336,17 @@ const selKindLabel = computed(() => {
 
 <style scoped>
 .tp { display: flex; flex-direction: column; height: calc(100vh - 92px); }
-.tp-bar { display: flex; align-items: center; gap: 10px; padding: 0 0 10px; }
-.tp-bar h2 { font-size: 15px; margin: 0; }
+.bar { display: flex; align-items: center; gap: 10px; padding: 9px 14px; border: 1px solid var(--line); border-radius: 10px; margin-bottom: 10px; font-size: 12px; color: var(--ink-3); }
+.brand { display: flex; align-items: center; gap: 8px; color: var(--ink); font-weight: 600; font-size: 13px; white-space: nowrap; }
+.brand i { width: 20px; height: 20px; border-radius: 6px; border: 1px solid var(--line-2); position: relative; background: linear-gradient(150deg, #18213a, transparent); }
+.brand i:after { content: ''; position: absolute; left: 50%; top: 50%; width: 3px; height: 3px; margin: -1.5px; border-radius: 50%; background: var(--acc-2); box-shadow: 0 0 6px #a78bfaa6; }
+.tip { font-size: 11.5px; padding: 3px 9px; border-radius: 11px; border: 1px solid var(--line); white-space: nowrap; }
+.live { display: flex; align-items: baseline; gap: 6px; }
+.live em { font-style: normal; font-size: 10px; letter-spacing: .6px; color: #4d5566; }
+.live b { font-family: ui-monospace, Menlo, monospace; font-size: 11.5px; color: #d3dcf0; }
+.bar button { height: 26px; padding: 0 10px; border-radius: 7px; border: 1px solid #28334a; background: #16203a; color: var(--ink); font: inherit; font-size: 11.5px; cursor: pointer; }
+.bar button:hover { background: #1d2a48; }
+.bar button.pri { border-color: #3a56b8; background: linear-gradient(180deg, #3f5fd4, #3450bd); }
 .meta { font-size: 11px; color: var(--ink-3); }
 .sp { flex: 1; }
 .tp-canvas { flex: 1; min-height: 0; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }

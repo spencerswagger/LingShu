@@ -24,9 +24,9 @@ const emit = defineEmits<{
 }>()
 
 const X_ACCOUNT = 0
-const X_PROVIDER = 260
-const X_GROUP = 790
-const X_EXTERNAL = 1120
+const X_PROVIDER = 220
+const X_GROUP = 640
+const X_EXTERNAL = 980
 
 function shortModel(m: GwModel) {
   return { id: m.id, name: m.name, provider: m.provider, context: m.context || 0 }
@@ -84,10 +84,10 @@ const graph = computed<{ nodes: Node[]; edges: Edge[] }>(() => {
     })
     accts.forEach((a, i) => {
       const aid = `a:${p}:${a.name}`
-      nodes.push({ id: aid, type: 'account', position: { x: X_ACCOUNT, y: providerY + 8 + i * 44 }, data: { Account: a.name, Provider: providerName[p], Plan: a.plan }, connectable: false })
+      nodes.push({ id: aid, type: 'account', position: { x: X_ACCOUNT, y: providerY + 8 + i * 42 }, data: { Account: a.name, Provider: providerName[p], Plan: a.plan }, connectable: false })
       edges.push({ id: `e:${aid}->${pid}`, source: aid, target: pid, type: 'default', animated: true, style: { stroke: '#2f3d58', strokeWidth: 1, strokeDasharray: '3 5' } })
     })
-    providerY += Math.max(cardH, accts.length * 44 + 12) + 40
+    providerY += Math.max(cardH, accts.length * 42 + 12) + 34
   }
 
   // 路由组 / Auto
@@ -113,10 +113,10 @@ const graph = computed<{ nodes: Node[]; edges: Edge[] }>(() => {
         target: gid,
         type: 'default',
         animated: true,
-        style: { stroke: g.auto ? '#6b4fa8' : '#3a4a6b', strokeWidth: 1.1, strokeDasharray: '4 4' },
+        style: { stroke: g.auto ? '#5b47a8' : '#33415e', strokeWidth: 1.1 },
       })
     }
-    groupY += 116
+    groupY += 84
   }
 
   // 对外模型
@@ -131,14 +131,14 @@ const graph = computed<{ nodes: Node[]; edges: Edge[] }>(() => {
       position: { x: X_EXTERNAL, y: extY },
       data: { ID: e.ID, Name: e.ExternalName, Bound: bound, Enabled: e.Enabled, Dangling: dang, In: props.prices?.[e.ID]?.Input, Out: props.prices?.[e.ID]?.Output }, connectable: false,
     })
-    extY += 108
+    extY += 96
     if (!bound || dang) continue
     if (groupRefs.has(bound)) {
-      edges.push({ id: `e:${bound}->${xid}`, source: `g:${bound}`, target: xid, type: 'default', animated: true, style: { stroke: '#5f9e6e', strokeWidth: 1.4, strokeDasharray: '5 4' } })
+      edges.push({ id: `e:${bound}->${xid}`, source: `g:${bound}`, target: xid, type: 'default', animated: true, style: { stroke: '#5f9e6e', strokeWidth: 1.4 } })
     } else {
       const prov = bound.split('/')[0]
       if (byProvider.has(prov)) {
-        edges.push({ id: `e:${bound}->${xid}`, source: `p:${prov}`, sourceHandle: `m:${bound}`, target: xid, type: 'default', animated: true, style: { stroke: '#5f9e6e', strokeWidth: 1.4, strokeDasharray: '5 4' } })
+        edges.push({ id: `e:${bound}->${xid}`, source: `p:${prov}`, sourceHandle: `m:${bound}`, target: xid, type: 'default', animated: true, style: { stroke: '#5f9e6e', strokeWidth: 1.4 } })
       }
     }
   }
@@ -181,50 +181,60 @@ function onConnectEvt(e: { source: string; sourceHandle?: string | null; target?
 <template>
   <div class="canvas-wrap">
     <VueFlow :nodes="graph.nodes" :edges="graph.edges" :min-zoom="0.2" :max-zoom="1.5"
-      :nodes-draggable="true" :nodes-connectable="true" :elements-selectable="true" fit-view-on-init class="canvas"
-      :is-valid-connection="isValidConnection" @connect="onConnectEvt">
-      <Background pattern-color="#161d29" :gap="20" :size="1.1" />
+      :nodes-draggable="true" :is-valid-connection="isValidConnection" :elements-selectable="true"
+      fit-view-on-init class="canvas" @connect="onConnectEvt">
+      <Background pattern-color="#141b28" :gap="22" :size="1" />
       <Controls />
 
       <template #node-account="p">
-        <div class="nd nd-account" @click="pick('account', p.data.Account, p.data)">
-          <Handle type="source" :position="Position.Right" />
-          <div class="nd-title">{{ p.data.Account }}</div>
-          <div class="nd-sub"><span class="txt">{{ p.data.Plan || p.data.Provider }}</span></div>
+        <div class="n acct" @click="pick('account', p.data.Account, p.data)">
+          <div class="ic"><svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><circle cx="8" cy="5.4" r="2.6"></circle><path d="M2.8 13.6c.6-2.6 2.7-4 5.2-4s4.6 1.4 5.2 4"></path></svg></div>
+          <div class="bd">
+            <div class="hd"><b>{{ p.data.Account }}</b><span class="ro">只读</span></div>
+            <div class="sub"><span>{{ p.data.Provider }}</span><span v-if="p.data.Plan">· {{ p.data.Plan }}</span></div>
+          </div>
+          <Handle type="source" :position="Position.Right" id="out" />
         </div>
       </template>
 
       <template #node-provider="p">
-        <div class="nd nd-provider">
-          <Handle type="target" :position="Position.Left" />
-          <div class="pv-head" @click="pick('provider', p.data.Ref, p.data)">
-            <span class="nd-title">{{ p.data.Name }}</span>
-            <span class="txt">{{ p.data.Accounts }} 账号</span>
+        <div class="prov">
+          <Handle type="target" :position="Position.Left" id="in" />
+          <div class="prov-hd" @click="pick('provider', p.data.Ref, p.data)">
+            <div class="ic"><svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><circle cx="8" cy="8" r="5.6"></circle><path d="M2.4 8h11.2M8 2.4c1.8 1.8 1.8 9.4 0 11.2M8 2.4c-1.8 1.8-1.8 9.4 0 11.2"></path></svg></div>
+            <div class="ti"><b>{{ p.data.Name }}</b><span>{{ p.data.Accounts }} 账号</span></div>
+            <span class="ro">只读</span>
           </div>
-          <div v-for="r in p.data.Rows" :key="r.id" class="pv-row">
-            <span class="pv-row-name" @click="pick('model', r.id, r)">{{ r.name }}</span>
-            <span class="txt">{{ r.context ? fmtCompact(r.context) : '—' }}</span>
-            <Handle :id="`m:${r.id}`" type="source" :position="Position.Right" />
+          <div class="rows">
+            <div v-for="r in p.data.Rows" :key="r.id" class="row">
+              <span class="rn"><svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><rect x="4.4" y="4.4" width="7.2" height="7.2" rx="1.5"></rect><path d="M6.4 1.8v1.8M9.6 1.8v1.8M6.4 12.4v1.8M9.6 12.4v1.8"></path></svg></span>
+              <b @click="pick('model', r.id, r)">{{ r.name }}</b>
+              <em>{{ r.context ? fmtCompact(r.context) : '—' }}</em>
+              <Handle :id="`m:${r.id}`" type="source" :position="Position.Right" />
+            </div>
           </div>
         </div>
       </template>
 
       <template #node-group="p">
-        <div class="nd nd-group" :class="{ 'is-auto': p.data.Auto }" @click="pick('group', p.data.Ref, p.data)">
-          <Handle type="target" :position="Position.Left" />
-          <div class="nd-head"><span class="nd-tag">{{ p.data.Auto ? 'AUTO' : '组' }}</span><span class="txt">{{ p.data.Members }} 成员</span></div>
-          <div class="nd-title">{{ p.data.Name }}</div>
-          <Handle type="source" :position="Position.Right" />
+        <div class="n grp" @click="pick('group', p.data.Ref, p.data)">
+          <Handle type="target" :position="Position.Left" id="in" />
+          <div class="ic"><svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><path d="M2 4.4h3.6M8.2 4.4H14"></path><circle cx="6.9" cy="4.4" r="1.5"></circle><path d="M2 11.6h4.4M8.9 11.6H14"></path><circle cx="7.7" cy="11.6" r="1.5"></circle></svg></div>
+          <div class="bd">
+            <div class="hd"><b>{{ p.data.Name }}</b><span class="bg group">{{ p.data.Auto ? 'AUTO' : '路由组' }}</span></div>
+            <div class="sub"><span>{{ p.data.Members }} 个成员</span></div>
+          </div>
+          <Handle type="source" :position="Position.Right" id="out" />
         </div>
       </template>
 
       <template #node-external="p">
-        <div class="nd nd-external" :class="{ 'is-dangling': p.data.Dangling }" @click="pick('external', p.data.ID, p.data)">
-          <Handle type="target" :position="Position.Left" />
-          <div class="nd-title">{{ p.data.Name || '(未命名)' }}</div>
-          <div class="nd-sub">
-            <span class="chip" :class="p.data.Enabled === false ? 'chip-idle' : 'chip-sold'">{{ p.data.Enabled === false ? '停用' : '在售' }}</span>
-            <span v-if="p.data.In != null" class="price">入 {{ p.data.In }} / 出 {{ p.data.Out }}</span>
+        <div class="n ext" :class="{ off: p.data.Enabled === false, dashed: p.data.Dangling }" @click="pick('external', p.data.ID, p.data)">
+          <Handle type="target" :position="Position.Left" id="in" />
+          <div class="ic"><svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><path d="M7.6 2H2.6A.6.6 0 0 0 2 2.6v10.8a.6.6 0 0 0 .6.6h10.8a.6.6 0 0 0 .6-.6V8.4"></path><path d="M9.4 2h4.6v4.6"></path><path d="M14 2 7.8 8.2"></path></svg></div>
+          <div class="bd">
+            <div class="hd"><b>{{ p.data.Name || '(未命名)' }}</b><span :class="p.data.Enabled === false ? 'warn' : 'ok'">{{ p.data.Enabled === false ? '停用' : '在售' }}</span></div>
+            <div class="sub"><span>i/o {{ p.data.In ?? 0 }} / {{ p.data.Out ?? 0 }}</span><span v-if="p.data.Dangling" class="warn">绑定悬空</span></div>
           </div>
         </div>
       </template>
@@ -234,28 +244,38 @@ function onConnectEvt(e: { source: string; sourceHandle?: string | null; target?
 
 <style scoped>
 .canvas-wrap { height: 100%; min-height: 480px; }
-.canvas { height: 100%; background: transparent; }
-.nd { background: linear-gradient(175deg, #151a27, #0b0f18); border: 1px solid #2c3a52; border-radius: 10px; padding: 8px 10px; color: var(--ink); font-size: 12px; cursor: pointer; }
-.nd:hover { border-color: #3d5170; }
-.nd-account { width: 210px; }
-.nd-provider { width: 470px; }
-.nd-group { width: 270px; border-color: #3a3560; }
-.nd-group.is-auto { border-style: dashed; border-color: #5b47a8; }
-.nd-head { display: flex; align-items: center; justify-content: space-between; }
-.nd-tag { font-size: 9.5px; letter-spacing: .8px; color: #a78bfa; }
-.nd-group.is-auto .nd-tag { color: #c4b5fd; }
-.nd-title { font-size: 12.5px; font-weight: 500; }
-.nd-sub { margin-top: 3px; }
-.txt { color: var(--ink-3); font-size: 11px; }
-.pv-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; padding-bottom: 6px; border-bottom: 1px solid #1b2331; }
-.pv-row { position: relative; display: flex; align-items: center; gap: 8px; height: 28px; border-bottom: 1px dashed #141b26; padding-right: 12px; }
-.pv-row:last-child { border-bottom: 0; }
-.pv-row-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.nd-external { width: 250px; }
-.is-dangling { border-color: #443718; }
-.chip { display: inline-flex; align-items: center; height: 16px; padding: 0 6px; border-radius: 8px; font-size: 10px; border: 1px solid #2a3346; color: var(--ink-2); }
-.chip-sold { border-color: #26402f; color: #8fbf9f; background: rgba(95,158,110,.08); }
-.chip-idle { color: var(--ink-3); }
-.price { margin-left: 6px; color: var(--ink-3); font-size: 10.5px; font-variant-numeric: tabular-nums; }
-:deep(.vue-flow__handle) { width: 7px; height: 7px; background: #2a3346; border: 1px solid #3a4a6b; }
+.canvas { height: 100%; background: radial-gradient(120% 90% at 76% -12%, #101a30, #080c17 56%, #06080f); }
+.n { display: flex; align-items: center; gap: 8px; padding: 7px 10px; border-radius: 9px; border: 1px solid #1d2534; background: linear-gradient(175deg, #101622, #0a0e17); color: #a2adc6; cursor: pointer; }
+.n .ic { flex: none; width: 20px; height: 20px; border-radius: 5px; display: flex; align-items: center; justify-content: center; border: 1px solid #253049; background: #111828; color: #7f93b8; }
+.n .bd { min-width: 0; flex: 1; }
+.n .hd { display: flex; align-items: center; gap: 6px; }
+.n .hd b { font-size: 11.8px; font-weight: 600; color: #dbe2ef; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.n .sub { margin-top: 1px; display: flex; gap: 7px; font-size: 10.4px; color: #65708a; white-space: nowrap; }
+.n .ro { flex: none; font-size: 9px; letter-spacing: .5px; color: #5a6377; border: 1px solid #232c3e; border-radius: 7px; padding: 0 4px; }
+.n .hd .ok { color: #8fbf9f; font-size: 9.5px; }
+.n .hd .warn { color: #c9a227; font-size: 9.5px; }
+.n .bg { flex: none; height: 15px; padding: 0 5px; border-radius: 8px; font-size: 9.5px; display: inline-flex; align-items: center; border: 1px solid #26402f; color: #8fbf9f; }
+.n .bg.group { border-color: #3a3358; color: #b3a4f0; background: #a78bfa17; }
+.acct { width: 186px; }
+.acct .ic { color: #8d9cc0; }
+.grp { width: 268px; }
+.grp .ic { color: #9d8be0; border-color: #2f3750; background: #14182a; }
+.ext { width: 220px; border-color: #1f2a3b; background: linear-gradient(175deg, #0f1421, #090d15); }
+.ext .ic { color: #7fbf95; border-color: #2a3b31; background: #101a16; }
+.ext.off { opacity: .62; border-style: dashed; }
+.ext.dashed { border-color: #4a3d18; }
+.prov { width: 300px; border-radius: 11px; border: 1px solid #22304a; background: linear-gradient(175deg, #111a2bf7, #090e18fa); box-shadow: inset 0 1px #ffffff08, 0 20px 44px -34px #4c6fe8e6; }
+.prov-hd { display: flex; align-items: center; gap: 8px; padding: 8px 10px 6px; cursor: pointer; }
+.prov-hd .ic { flex: none; width: 21px; height: 21px; border-radius: 5px; display: flex; align-items: center; justify-content: center; border: 1px solid #2b3a55; background: #121b2c; color: #88a8d4; }
+.prov-hd .ti { min-width: 0; flex: 1; }
+.prov-hd b { display: block; font-size: 12px; font-weight: 600; color: #dbe2ef; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.prov-hd .ti span { font-size: 10px; color: #65708a; }
+.prov-hd .ro { flex: none; font-size: 9px; letter-spacing: .5px; color: #5a6377; border: 1px solid #232c3e; border-radius: 7px; padding: 0 4px; }
+.prov .rows { display: flex; flex-direction: column; gap: 4px; padding: 0 8px 8px; }
+.prov .row { position: relative; display: flex; align-items: center; gap: 6px; padding: 5px 9px; border-radius: 7px; border: 1px solid #1c2433; background: #0c111c; font-size: 11px; color: #c3ccdd; }
+.prov .row .rn { display: flex; flex: none; color: #8d7fd0; }
+.prov .row b { flex: 1; min-width: 0; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+.prov .row em { font-style: normal; font-family: ui-monospace, Menlo, monospace; font-size: 9.5px; color: #5f6a80; }
+:deep(.vue-flow__handle) { width: 6px; height: 6px; background: #2a3346; border: 1px solid #3a4a6b; }
+:deep(.vue-flow__edge-path) { stroke-linecap: round; }
 </style>
