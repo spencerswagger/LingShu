@@ -148,6 +148,9 @@ func (s *HTTPGatewaySource) get(ctx context.Context, path string) ([]byte, error
 		return nil, fmt.Errorf("构建拓扑请求失败：%w", err)
 	}
 	req.Header.Set("Accept", "application/json")
+	if s.webKey != "" && strings.HasPrefix(path, "/api/") {
+		req.Header.Set("Cookie", "magpie_web_3430="+s.webKey)
+	}
 	if s.adminKey != "" {
 		v := s.adminKey
 		if !strings.Contains(v, " ") {
