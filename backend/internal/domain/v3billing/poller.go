@@ -29,6 +29,9 @@ func NewPoller(db *sql.DB, bill *billing.Service, keySync *magpie.CallerKeySync,
 	return &Poller{db: db, bill: bill, keySync: keySync, log: log, interval: 60 * time.Second, batch: 200}
 }
 
+// SetKeySync 注入 callerKey 同步器（余额≤0 时删代理凭据）；装配顺序晚于构造，故单独 setter。
+func (p *Poller) SetKeySync(k *magpie.CallerKeySync) { p.keySync = k }
+
 // Run 阻塞循环；ctx 取消退出。
 func (p *Poller) Run(ctx context.Context) {
 	t := time.NewTicker(p.interval)
