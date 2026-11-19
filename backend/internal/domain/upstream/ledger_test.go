@@ -47,7 +47,7 @@ func TestLedgerEntry_Validate(t *testing.T) {
 	}
 }
 
-// TestBuildLedgerInsert_IdempotentShape 断言写入 SQL 的幂等形状：九列 + ON CONFLICT (ledger_id) DO UPDATE。
+// TestBuildLedgerInsert_IdempotentShape 断言写入 SQL 的幂等形状：十四列 + ON CONFLICT (ledger_id) DO UPDATE。
 func TestBuildLedgerInsert_IdempotentShape(t *testing.T) {
 	e1, e2 := validEntry("led-1"), validEntry("led-2")
 	query, args := buildLedgerInsert([]LedgerEntry{e1, e2})
@@ -58,8 +58,8 @@ func TestBuildLedgerInsert_IdempotentShape(t *testing.T) {
 	if !strings.Contains(query, "ON CONFLICT (ledger_id) DO UPDATE") {
 		t.Fatalf("SQL 必须用 ledger_id 做幂等冲突键，并覆盖同 id 的高 seq 新值：%s", query)
 	}
-	if !strings.Contains(query, "($1,") || !strings.Contains(query, "($10,") {
-		t.Fatalf("两行应占 18 个占位参数（每行九列）：%s", query)
+	if !strings.Contains(query, "($1,") || !strings.Contains(query, "($15,") {
+		t.Fatalf("两行应占 28 个占位参数（每行十四列）：%s", query)
 	}
 	if len(args) != 2*LedgerFieldCount {
 		t.Fatalf("参数个数应为 %d，got %d", 2*LedgerFieldCount, len(args))

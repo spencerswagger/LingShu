@@ -347,6 +347,11 @@ type TokenService struct {
 	// secretKey 为令牌明文 SM4 加密密钥（与渠道凭据同源）。nil 时创建仍返回明文但不落库，
 	// 事后无法查看/复制密钥（历史/测试场景）。
 	secretKey []byte
+	// callerKey 是「令牌 ↔ 代理侧 callerKey」同步钩子（nil=不同步，用于测试/旧部署）。
+	// V3 起：创建令牌即建 callerKey、删除/停用即删，令牌明文就是 callerKey。
+	callerKey CallerKeySyncer
+	// callerKeyLookup 判断令牌是否已有 ACTIVE 的代理凭据（补建幂等）。
+	callerKeyLookup func(ctx context.Context, tokenID int64) (bool, error)
 	// cache 为 LookupByPlain 的两级读缓存（plain→entry + userID→hashes）；默认启用。
 	// 命中即 0 DB；失效由各写路径显式钩子保证（见 token_cache.go 失效矩阵）。nil 时退回纯直查。
 	cache *tokenCache
@@ -391,6 +396,15 @@ func (s *TokenService) InvalidateAll() {
 		s.cache.invalidateAll()
 	}
 }
+
+// CallerKeySyncer 令牌与代理侧 callerKey 的同步能力（由 magpie 包实现）。
+type CallerKeySyncer interface {
+	Ensure(ctx context.Context, tokenID int64, secret string) error
+	Remove(ctx context.Context, tokenID int64) error
+}
+
+// SetCallerKeySyncer 注入同步钩子。
+func (s *TokenService) SetCallerKeySyncer(c CallerKeySyncer) { s.callerKey = c }
 
 // SetSecretKey 注入 SM4 密钥（创建令牌时加密明文落库，支持事后查看/复制密钥）。
 func (s *TokenService) SetSecretKey(key []byte) {
@@ -450,9 +464,70 @@ func (s *TokenService) Create(ctx context.Context, userID int64, displayName str
 	if err := s.store.CreateToken(ctx, t); err != nil {
 		return "", fmt.Errorf("create token: %w", err)
 	}
+	// V3：令牌明文即代理侧 callerKey，创建后立即同步（失败则回滚删除令牌，避免「有令牌但调不通」）。
+	if s.callerKey != nil {
+		if kerr := s.callerKey.Ensure(ctx, t.ID, plain); kerr != nil {
+			_, _ = s.store.DeleteTokens(ctx, []int64{t.ID})
+			return "", fmt.Errorf("令牌已创建但开通代理访问失败（已回滚）：%w", kerr)
+		}
+	}
 	// 写路径失效：新令牌使该用户令牌视图变化，按 userID 保守全清（含最短化「创建后立即使用」的缓存口径）。
 	s.InvalidateByUserID(userID)
 	return plain, nil
+}
+
+// BackfillCallerKeys 为缺映射的存量令牌补建 callerKey（V3 迁移用）。
+// 返回 created/skipped/failed；历史无密文的令牌计入 skipped（无法恢复明文，只能轮换）。
+func (s *TokenService) BackfillCallerKeys(ctx context.Context, limit int) (created, skipped int, failed []map[string]any, err error) {
+	if s.callerKey == nil {
+		return 0, 0, nil, fmt.Errorf("未装配 callerKey 同步（缺页面口令）")
+	}
+	if limit <= 0 {
+		limit = 100000
+	}
+	failed = []map[string]any{}
+	const batch = 50
+	for page := 1; ; page++ {
+		list, total, lerr := s.store.ListTokens(ctx, nil, "", page, batch)
+		if lerr != nil {
+			return created, skipped, failed, lerr
+		}
+		if len(list) == 0 {
+			break
+		}
+		for i := range list {
+			t := list[i].Token
+			if created+skipped+len(failed) >= limit {
+				return created, skipped, failed, nil
+			}
+			// 已有 ACTIVE 映射则跳过（幂等）
+			if s.callerKeyLookup != nil {
+				if ok, _ := s.callerKeyLookup(ctx, t.ID); ok {
+					skipped++
+					continue
+				}
+			}
+			plain, serr := s.Secret(ctx, t.ID)
+			if serr != nil || plain == "" {
+				skipped++
+				continue
+			}
+			if kerr := s.callerKey.Ensure(ctx, t.ID, plain); kerr != nil {
+				failed = append(failed, map[string]any{"TokenID": t.ID, "Reason": kerr.Error()})
+				continue
+			}
+			created++
+		}
+		if int64(page*batch) >= total {
+			break
+		}
+	}
+	return created, skipped, failed, nil
+}
+
+// SetCallerKeyLookup 注入「该令牌是否已有 ACTIVE callerKey」查询（补建幂等用）。
+func (s *TokenService) SetCallerKeyLookup(fn func(ctx context.Context, tokenID int64) (bool, error)) {
+	s.callerKeyLookup = fn
 }
 
 // Secret 返回令牌明文密钥（解密 secret_cipher）。未配置 SM4 密钥或历史令牌无密文时报错。
@@ -554,6 +629,12 @@ func (s *TokenService) BatchDelete(ctx context.Context, ids []int64) (int64, err
 	if err != nil {
 		return 0, fmt.Errorf("batch delete tokens: %w", err)
 	}
+	// V3：同步删除代理侧 callerKey（尽力而为；失败由重试/补建兜底）。
+	if s.callerKey != nil {
+		for _, id := range ids {
+			_ = s.callerKey.Remove(ctx, id)
+		}
+	}
 	for _, h := range hashes {
 		s.InvalidateByHash(h)
 	}
@@ -598,6 +679,14 @@ func (s *TokenService) Toggle(ctx context.Context, userID, tokenID int64) (*Toke
 	}
 	if err := s.store.UpdateStatus(ctx, tokenID, newStatus); err != nil {
 		return nil, fmt.Errorf("toggle token: %w", err)
+	}
+	// V3：停用 ⇒ 删 callerKey；启用 ⇒ 重新确保（明文从密文解出）。
+	if s.callerKey != nil {
+		if newStatus == StatusTokenDisabled {
+			_ = s.callerKey.Remove(ctx, tokenID)
+		} else if plain, serr := s.Secret(ctx, tokenID); serr == nil {
+			_ = s.callerKey.Ensure(ctx, tokenID, plain)
+		}
 	}
 	// 写路径失效：状态已翻转，立即按哈希清除其缓存项。
 	s.InvalidateByHash(t.TokenHash)
@@ -717,6 +806,17 @@ func (h *TokenHandler) HandleAdminCreate(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	resp.OK(w, r, createdTokenResponse{Plain: plain, Display: tokenDisplay(plain)})
+}
+
+// HandleAdminBackfillMagpieKeys POST /api/v1/admin/tokens/magpie-keys/backfill
+// 为存量令牌补建代理侧 callerKey（幂等，可重跑）；返回 created/skipped/failed。
+func (h *TokenHandler) HandleAdminBackfillMagpieKeys(w http.ResponseWriter, r *http.Request) {
+	created, skipped, failed, err := h.svc.BackfillCallerKeys(r.Context(), 0)
+	if err != nil {
+		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, err.Error())
+		return
+	}
+	resp.OK(w, r, map[string]any{"Created": created, "Skipped": skipped, "Failed": failed})
 }
 
 // HandleAdminBatchDelete POST /api/v1/admin/tokens/batch-delete 批量删除令牌。

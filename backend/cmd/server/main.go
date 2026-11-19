@@ -37,6 +37,7 @@ import (
 	"github.com/team/llmgateway/internal/domain/sync"
 	"github.com/team/llmgateway/internal/domain/topology"
 	"github.com/team/llmgateway/internal/domain/upstream"
+	"github.com/team/llmgateway/internal/domain/v3billing"
 	"github.com/team/llmgateway/internal/pkg/asyncwrite"
 	"github.com/team/llmgateway/internal/pkg/clientip"
 	"github.com/team/llmgateway/internal/pkg/idgen"
@@ -417,7 +418,11 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 		billCfgProvider.InvalidateCostConfig()
 		magpiePrefixes.Invalidate()
 	})
+	var keySync *magpie.CallerKeySync
 	billSvc := billing.NewService(billStore, billCfgProvider, creditSvc)
+	// V3 旁路计费：每 60s 把未计费账本行落成账单（幂等：magpie_request_id）
+	v3Poller := v3billing.NewPoller(d, billSvc, keySync, logr)
+	go v3Poller.Run(context.Background())
 	// 账单落库失败时的本地持久重试队列：DB 抖动不丢账单（billing_id 唯一索引保证重投幂等）。
 	billSvc.SetRetryQueue(billing.NewRetryQueue(cfg.Billing.RetryQueuePath, logr))
 	// 「扣款 + 积分流水 + 账单」同事务提交：消灭「扣了钱没账单」。

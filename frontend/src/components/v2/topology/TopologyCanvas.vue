@@ -3,7 +3,7 @@
 // 账号/模型/组 取自网关原样视图（gw）；对外模型与绑定取自灵枢（view）。
 // 拖线：从模型行或组右侧拖到空白 = 新建绑定该模型/组的对外模型；拖到已有对外模型 = 直接绑定。
 import { computed } from 'vue'
-import { VueFlow, Handle, Position, type Node, type Edge } from '@vue-flow/core'
+import { VueFlow, type Node, type Edge } from '@vue-flow/core'
 import { Background } from '@vue-flow/background'
 import { Controls } from '@vue-flow/controls'
 import '@vue-flow/core/dist/style.css'
@@ -19,14 +19,12 @@ const props = defineProps<{
 }>()
 const emit = defineEmits<{
   select: [node: { kind: string; ref: string; data: Record<string, unknown> }]
-  connect: [payload: { ref: string; target?: string | null }]
-  bind: [payload: { ref: string; externalId: string }]
 }>()
 
 const X_ACCOUNT = 0
-const X_PROVIDER = 260
-const X_GROUP = 780
-const X_EXTERNAL = 1130
+const X_PROVIDER = 220
+const X_GROUP = 640
+const X_EXTERNAL = 980
 
 function shortModel(m: GwModel) {
   return { id: m.id, name: m.name, provider: m.provider, context: m.context || 0 }
@@ -84,8 +82,8 @@ const graph = computed<{ nodes: Node[]; edges: Edge[] }>(() => {
     })
     accts.forEach((a, i) => {
       const aid = `a:${p}:${a.name}`
-      nodes.push({ id: aid, type: 'account', position: { x: X_ACCOUNT, y: providerY + 8 + i * 42 }, data: { Account: a.name, Provider: providerName[p], Plan: a.plan } })
-      edges.push({ id: `e:${aid}->${pid}`, source: aid, sourceHandle: 'out', target: pid, targetHandle: 'in', type: 'smoothstep', animated: true, style: { stroke: '#2f3d58', strokeWidth: 1, strokeDasharray: '3 5' } })
+      nodes.push({ id: aid, type: 'account', position: { x: X_ACCOUNT, y: providerY + 8 + i * 42 }, data: { Account: a.name, Provider: providerName[p], Plan: a.plan }, connectable: false })
+      edges.push({ id: `e:${aid}->${pid}`, source: aid, target: pid, type: 'default', animated: true, style: { stroke: '#2f3d58', strokeWidth: 1, strokeDasharray: '3 5' } })
     })
     providerY += Math.max(cardH, accts.length * 42 + 12) + 34
   }
@@ -111,13 +109,12 @@ const graph = computed<{ nodes: Node[]; edges: Edge[] }>(() => {
         source: `p:${prov}`,
         sourceHandle: `m:${mid}`,
         target: gid,
-        targetHandle: 'in',
-        type: 'smoothstep',
+        type: 'default',
         animated: true,
         style: { stroke: g.auto ? '#5b47a8' : '#33415e', strokeWidth: 1.1 },
       })
     }
-    groupY += 92
+    groupY += 84
   }
 
   // 对外模型
@@ -132,14 +129,14 @@ const graph = computed<{ nodes: Node[]; edges: Edge[] }>(() => {
       position: { x: X_EXTERNAL, y: extY },
       data: { ID: e.ID, Name: e.ExternalName, Bound: bound, Enabled: e.Enabled, Dangling: dang, In: props.prices?.[e.ID]?.Input, Out: props.prices?.[e.ID]?.Output }, connectable: false,
     })
-    extY += 100
+    extY += 96
     if (!bound || dang) continue
     if (groupRefs.has(bound)) {
-      edges.push({ id: `e:${bound}->${xid}`, source: `g:${bound}`, sourceHandle: 'out', target: xid, targetHandle: 'in', type: 'smoothstep', animated: true, style: { stroke: '#5f9e6e', strokeWidth: 1.4 } })
+      edges.push({ id: `e:${bound}->${xid}`, source: `g:${bound}`, target: xid, type: 'default', animated: true, style: { stroke: '#5f9e6e', strokeWidth: 1.4 } })
     } else {
       const prov = bound.split('/')[0]
       if (byProvider.has(prov)) {
-        edges.push({ id: `e:${bound}->${xid}`, source: `p:${prov}`, sourceHandle: `m:${bound}`, target: xid, targetHandle: 'in', type: 'smoothstep', animated: true, style: { stroke: '#5f9e6e', strokeWidth: 1.4 } })
+        edges.push({ id: `e:${bound}->${xid}`, source: `p:${prov}`, sourceHandle: `m:${bound}`, target: xid, type: 'default', animated: true, style: { stroke: '#5f9e6e', strokeWidth: 1.4 } })
       }
     }
   }
@@ -147,45 +144,16 @@ const graph = computed<{ nodes: Node[]; edges: Edge[] }>(() => {
   return { nodes, edges }
 })
 
-// 只允许：模型行(m:*) 或 路由组(g:*) → 对外模型(x:*)。其它一律拒绝（外部→外部、入口→入口都不行）。
-function isValidConnection(c: { source?: string | null; sourceHandle?: string | null; target?: string | null }) {
-  const src = c.source || ''
-  const tgt = c.target || ''
-  if (!src || !tgt || src === tgt) return false
-  if (src.startsWith('x:') || src.startsWith('a:')) return false
-  if (!tgt.startsWith('x:')) return false
-  if (src.startsWith('m:') || src.startsWith('g:')) return true
-  // 供应商节点只有在带了模型行句柄(m:*)时才算合法
-  if (src.startsWith('p:')) return !!c.sourceHandle && c.sourceHandle.startsWith('m:')
-  return false
-}
-
-const graphKey = computed(() => `${graph.value.nodes.length}-${graph.value.edges.length}`)
-
-let justConnected = false
 function pick(kind: string, ref: string, data: Record<string, unknown>) {
-  if (justConnected) return
   emit('select', { kind, ref, data })
-}
-function onConnectEvt(e: { source: string; sourceHandle?: string | null; target?: string | null }) {
-  if (!e.source) return
-  if (e.target && !isValidConnection(e)) return
-  justConnected = true
-  setTimeout(() => (justConnected = false), 350)
-  const ref = (e.sourceHandle || '').replace(/^m:/, '') || e.source.replace(/^[a-z]:/, '')
-  if (e.target && e.target.startsWith('x:')) {
-    emit('bind', { ref, externalId: e.target.slice(2) })
-    return
-  }
-  emit('connect', { ref, target: e.target })
 }
 </script>
 
 <template>
   <div class="canvas-wrap">
-    <VueFlow :key="graphKey" :nodes="graph.nodes" :edges="graph.edges" :min-zoom="0.2" :max-zoom="1.5"
-      :nodes-draggable="true" :elements-selectable="true"
-      fit-view-on-init class="canvas" @connect="onConnectEvt">
+    <VueFlow :nodes="graph.nodes" :edges="graph.edges" :min-zoom="0.2" :max-zoom="1.5"
+      :elements-selectable="true"
+      fit-view-on-init class="canvas">
       <Background pattern-color="#141b28" :gap="22" :size="1" />
       <Controls />
 
@@ -196,13 +164,11 @@ function onConnectEvt(e: { source: string; sourceHandle?: string | null; target?
             <div class="hd"><b>{{ p.data.Account }}</b><span class="ro">只读</span></div>
             <div class="sub"><span>{{ p.data.Provider }}</span><span v-if="p.data.Plan">· {{ p.data.Plan }}</span></div>
           </div>
-          <Handle type="source" :position="Position.Right" id="out" />
         </div>
       </template>
 
       <template #node-provider="p">
         <div class="prov">
-          <Handle type="target" :position="Position.Left" id="in" />
           <div class="prov-hd" @click="pick('provider', p.data.Ref, p.data)">
             <div class="ic"><svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><circle cx="8" cy="8" r="5.6"></circle><path d="M2.4 8h11.2M8 2.4c1.8 1.8 1.8 9.4 0 11.2M8 2.4c-1.8 1.8-1.8 9.4 0 11.2"></path></svg></div>
             <div class="ti"><b>{{ p.data.Name }}</b><span>{{ p.data.Accounts }} 账号</span></div>
@@ -213,7 +179,6 @@ function onConnectEvt(e: { source: string; sourceHandle?: string | null; target?
               <span class="rn"><svg viewBox="0 0 16 16" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><rect x="4.4" y="4.4" width="7.2" height="7.2" rx="1.5"></rect><path d="M6.4 1.8v1.8M9.6 1.8v1.8M6.4 12.4v1.8M9.6 12.4v1.8"></path></svg></span>
               <b @click="pick('model', r.id, r)">{{ r.name }}</b>
               <em>{{ r.context ? fmtCompact(r.context) : '—' }}</em>
-              <Handle :id="`m:${r.id}`" type="source" :position="Position.Right" />
             </div>
           </div>
         </div>
@@ -221,19 +186,16 @@ function onConnectEvt(e: { source: string; sourceHandle?: string | null; target?
 
       <template #node-group="p">
         <div class="n grp" @click="pick('group', p.data.Ref, p.data)">
-          <Handle type="target" :position="Position.Left" id="in" />
           <div class="ic"><svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><path d="M2 4.4h3.6M8.2 4.4H14"></path><circle cx="6.9" cy="4.4" r="1.5"></circle><path d="M2 11.6h4.4M8.9 11.6H14"></path><circle cx="7.7" cy="11.6" r="1.5"></circle></svg></div>
           <div class="bd">
             <div class="hd"><b>{{ p.data.Name }}</b><span class="bg group">{{ p.data.Auto ? 'AUTO' : '路由组' }}</span></div>
             <div class="sub"><span>{{ p.data.Members }} 个成员</span></div>
           </div>
-          <Handle type="source" :position="Position.Right" id="out" />
         </div>
       </template>
 
       <template #node-external="p">
         <div class="n ext" :class="{ off: p.data.Enabled === false, dashed: p.data.Dangling }" @click="pick('external', p.data.ID, p.data)">
-          <Handle type="target" :position="Position.Left" id="in" />
           <div class="ic"><svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><path d="M7.6 2H2.6A.6.6 0 0 0 2 2.6v10.8a.6.6 0 0 0 .6.6h10.8a.6.6 0 0 0 .6-.6V8.4"></path><path d="M9.4 2h4.6v4.6"></path><path d="M14 2 7.8 8.2"></path></svg></div>
           <div class="bd">
             <div class="hd"><b>{{ p.data.Name || '(未命名)' }}</b><span :class="p.data.Enabled === false ? 'warn' : 'ok'">{{ p.data.Enabled === false ? '停用' : '在售' }}</span></div>

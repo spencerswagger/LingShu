@@ -18,7 +18,6 @@ const groups: { label: string; items: Item[] }[] = [
       { path: '/admin/dashboard', title: '统计' },
       { path: '/admin/topology', title: '拓扑' },
       { path: '/admin/ledger', title: '账本' },
-      { path: '/admin/reconcile', title: '对账' },
     ],
   },
   {

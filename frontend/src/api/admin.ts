@@ -849,6 +849,12 @@ export function getCostSessionTrace(
 }
 
 
+// V3：对内模型成本价（唯一可写的镜像字段）
+export function updateInternalCostRates(ref: string, rates: { input: number; output: number; cache_read: number }) {
+  return http.put<unknown, unknown>(`/admin/internal-models/${encodeURIComponent(ref)}/cost-rates`, rates)
+}
+
+
 // 一键开通该令牌的代理访问（用系统配置的 callerKey 绑定；共享 key，按需再换独立 key）
 export function autoBindMagpieKey(id: number | string) {
   return http.post<unknown, unknown>(`/admin/tokens/${id}/magpie-key/auto`, {})
