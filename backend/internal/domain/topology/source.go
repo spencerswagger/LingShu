@@ -127,6 +127,14 @@ func (s *HTTPGatewaySource) Fetch(ctx context.Context) ([]Node, error) {
 	return out, nil
 }
 
+// FetchRawGroups 原样返回网关 /api/groups 的响应体（页面用于账号/路由组/成员的真实视图）。
+func (s *HTTPGatewaySource) FetchRawGroups(ctx context.Context) ([]byte, error) {
+	if !s.Configured() {
+		return nil, ErrSourceNotConfigured
+	}
+	return s.get(ctx, s.groupsPath)
+}
+
 // get 发一次 GET 并读全量响应体；非 2xx 转成含状态码与截断响应体的可读错误
 // （排障时最需要的就是「网关到底回了什么」）。
 func (s *HTTPGatewaySource) get(ctx context.Context, path string) ([]byte, error) {

@@ -782,6 +782,7 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 		Logger: logr,
 	})
 	topologyHandler := topology.NewHandler(topoStore, topoSyncer)
+	topologyHandler.SetRawSource(topoSource)
 	if topoSource.Configured() {
 		// 10 分钟一跳：拓扑变动（上/下线模型）远慢于账单；手动 T3 随时可触发同一份实现。
 		go func() {
