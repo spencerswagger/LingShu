@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { onMounted, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Delete, Key, Link, Plus } from '@element-plus/icons-vue'
-import { listTokens, batchDeleteTokens, createToken, getTokenSecret, type AdminToken } from '@/api/admin'
+import { Delete, Key, Link, Plus, Connection } from '@element-plus/icons-vue'
+import { listTokens, batchDeleteTokens, createToken, getTokenSecret, autoBindMagpieKey, type AdminToken } from '@/api/admin'
 import { fmtDate, fmtTime } from '@/utils/format'
 import ErrorBubble from '@/components/ErrorBubble.vue'
 import UserSelect from '@/components/UserSelect.vue'
@@ -142,6 +142,15 @@ async function onViewSecret(row: AdminToken) {
   }
 }
 
+async function onAutoBind(row: AdminToken) {
+  try {
+    await autoBindMagpieKey(row.ID)
+    ElMessage.success('已开通代理访问')
+  } catch (e: any) {
+    ElMessage.error('开通失败：' + (e?.message || String(e)))
+  }
+}
+
 async function onDelete(row: AdminToken) {
   try {
     await ElMessageBox.confirm(
@@ -275,6 +284,9 @@ function copyBaseUrl() {
             <div class="op-cell" @click.stop>
               <el-tooltip content="查看密钥" placement="top">
                 <el-icon class="op-icon" @click="onViewSecret(row)"><Key /></el-icon>
+              </el-tooltip>
+              <el-tooltip content="开通代理访问" placement="top">
+                <el-icon class="op-icon" @click="onAutoBind(row)"><Connection /></el-icon>
               </el-tooltip>
               <el-tooltip content="删除" placement="top">
                 <el-icon class="op-icon danger" @click="onDelete(row)"><Delete /></el-icon>

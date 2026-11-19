@@ -24,9 +24,9 @@ const emit = defineEmits<{
 }>()
 
 const X_ACCOUNT = 0
-const X_PROVIDER = 220
-const X_GROUP = 640
-const X_EXTERNAL = 980
+const X_PROVIDER = 260
+const X_GROUP = 780
+const X_EXTERNAL = 1130
 
 function shortModel(m: GwModel) {
   return { id: m.id, name: m.name, provider: m.provider, context: m.context || 0 }
@@ -84,8 +84,8 @@ const graph = computed<{ nodes: Node[]; edges: Edge[] }>(() => {
     })
     accts.forEach((a, i) => {
       const aid = `a:${p}:${a.name}`
-      nodes.push({ id: aid, type: 'account', position: { x: X_ACCOUNT, y: providerY + 8 + i * 42 }, data: { Account: a.name, Provider: providerName[p], Plan: a.plan }, connectable: false })
-      edges.push({ id: `e:${aid}->${pid}`, source: aid, target: pid, type: 'default', animated: true, style: { stroke: '#2f3d58', strokeWidth: 1, strokeDasharray: '3 5' } })
+      nodes.push({ id: aid, type: 'account', position: { x: X_ACCOUNT, y: providerY + 8 + i * 42 }, data: { Account: a.name, Provider: providerName[p], Plan: a.plan } })
+      edges.push({ id: `e:${aid}->${pid}`, source: aid, sourceHandle: 'out', target: pid, targetHandle: 'in', type: 'smoothstep', animated: true, style: { stroke: '#2f3d58', strokeWidth: 1, strokeDasharray: '3 5' } })
     })
     providerY += Math.max(cardH, accts.length * 42 + 12) + 34
   }
@@ -111,12 +111,13 @@ const graph = computed<{ nodes: Node[]; edges: Edge[] }>(() => {
         source: `p:${prov}`,
         sourceHandle: `m:${mid}`,
         target: gid,
-        type: 'default',
+        targetHandle: 'in',
+        type: 'smoothstep',
         animated: true,
         style: { stroke: g.auto ? '#5b47a8' : '#33415e', strokeWidth: 1.1 },
       })
     }
-    groupY += 84
+    groupY += 92
   }
 
   // 对外模型
@@ -131,14 +132,14 @@ const graph = computed<{ nodes: Node[]; edges: Edge[] }>(() => {
       position: { x: X_EXTERNAL, y: extY },
       data: { ID: e.ID, Name: e.ExternalName, Bound: bound, Enabled: e.Enabled, Dangling: dang, In: props.prices?.[e.ID]?.Input, Out: props.prices?.[e.ID]?.Output }, connectable: false,
     })
-    extY += 96
+    extY += 100
     if (!bound || dang) continue
     if (groupRefs.has(bound)) {
-      edges.push({ id: `e:${bound}->${xid}`, source: `g:${bound}`, target: xid, type: 'default', animated: true, style: { stroke: '#5f9e6e', strokeWidth: 1.4 } })
+      edges.push({ id: `e:${bound}->${xid}`, source: `g:${bound}`, sourceHandle: 'out', target: xid, targetHandle: 'in', type: 'smoothstep', animated: true, style: { stroke: '#5f9e6e', strokeWidth: 1.4 } })
     } else {
       const prov = bound.split('/')[0]
       if (byProvider.has(prov)) {
-        edges.push({ id: `e:${bound}->${xid}`, source: `p:${prov}`, sourceHandle: `m:${bound}`, target: xid, type: 'default', animated: true, style: { stroke: '#5f9e6e', strokeWidth: 1.4 } })
+        edges.push({ id: `e:${bound}->${xid}`, source: `p:${prov}`, sourceHandle: `m:${bound}`, target: xid, targetHandle: 'in', type: 'smoothstep', animated: true, style: { stroke: '#5f9e6e', strokeWidth: 1.4 } })
       }
     }
   }
@@ -158,6 +159,8 @@ function isValidConnection(c: { source?: string | null; sourceHandle?: string | 
   if (src.startsWith('p:')) return !!c.sourceHandle && c.sourceHandle.startsWith('m:')
   return false
 }
+
+const graphKey = computed(() => `${graph.value.nodes.length}-${graph.value.edges.length}`)
 
 let justConnected = false
 function pick(kind: string, ref: string, data: Record<string, unknown>) {
@@ -180,8 +183,8 @@ function onConnectEvt(e: { source: string; sourceHandle?: string | null; target?
 
 <template>
   <div class="canvas-wrap">
-    <VueFlow :nodes="graph.nodes" :edges="graph.edges" :min-zoom="0.2" :max-zoom="1.5"
-      :nodes-draggable="true" :is-valid-connection="isValidConnection" :elements-selectable="true"
+    <VueFlow :key="graphKey" :nodes="graph.nodes" :edges="graph.edges" :min-zoom="0.2" :max-zoom="1.5"
+      :nodes-draggable="true" :elements-selectable="true"
       fit-view-on-init class="canvas" @connect="onConnectEvt">
       <Background pattern-color="#141b28" :gap="22" :size="1" />
       <Controls />
