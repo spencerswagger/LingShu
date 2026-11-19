@@ -60,9 +60,9 @@ func TestStage3Routes_NoDevMirror(t *testing.T) {
 			t.Errorf("阶段三端点必须挂在 /api/v1/admin 下：%s", trimmed)
 		}
 	}
-	// 防空转：路由表里只应剩这 7 条（T1/T2/T3 + S1/S2/S6/S7）；数量变了说明有人加了端点，
+	// 防空转：路由表里只应剩这 8 条（T1/T1-gateway/T2/T3 + S1/S2/S6/S7）；数量变了说明有人加了端点，
 	// 那也该重新按 Spec 复核一遍权限与成本口径。
-	if checked != 7 {
-		t.Fatalf("扫描到 %d 条阶段三路由注册，期望 7 条（T1/T2/T3/S1/S2/S6/S7）", checked)
+	if checked != 8 {
+		t.Fatalf("扫描到 %d 条阶段三路由注册，期望 8 条（T1/T1-gateway/T2/T3/S1/S2/S6/S7）", checked)
 	}
 }
