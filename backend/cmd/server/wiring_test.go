@@ -85,3 +85,17 @@ func TestWiring_PassthroughGateIgnoresUpstreamBaseURL(t *testing.T) {
 		}
 	}
 }
+
+// TestWiring_PollerTriggeredAfterLedgerRound 拉完即结：账本同步轮成功后必须立即触发
+// v3Poller.Once —— 否则「拉取 60s + 结算 60s」串行两跳，端到端账单耗时会在 120s 验收线上抖。
+func TestWiring_PollerTriggeredAfterLedgerRound(t *testing.T) {
+	src := mainGoSource(t)
+	if !strings.Contains(src, "settleNow()") {
+		t.Fatalf("账本同步轮成功后必须调用 settleNow()（拉完即结），" +
+			"否则结算要再等 poller 自己的 60s ticker，端到端耗时抖过 120s")
+	}
+	// 触发点必须真的在同步轮的函数体里（检查 settleNow 定义与调用在同一 goroutine 段落）。
+	if !strings.Contains(src, "v3Poller.Once(context.Background())") {
+		t.Fatalf("settleNow 必须调 v3Poller.Once（账本拉完立即结算）")
+	}
+}

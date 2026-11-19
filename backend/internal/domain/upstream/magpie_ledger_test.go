@@ -3,6 +3,8 @@ package upstream
 import (
 	"context"
 	"errors"
+	"fmt"
+	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -358,5 +360,49 @@ func TestParseMagpieFeed_CanceledAndRejectedIncluded(t *testing.T) {
 	}
 	if page.Entries[0].LedgerID != "u_499" || page.Entries[1].LedgerID != "u_rejected" {
 		t.Fatalf("顺序/幂等键错误：%+v", page.Entries)
+	}
+}
+
+// TestParseMagpieFeed_FiveDimensionFields 随机驱动：五个细分维度字段必须原样写入账本行
+// （req_model/served_model/caller_key_name/cache_read/cache_write）。
+// 缺 caller_key_name 时 poller settleOne 报「缺 caller_key_name，无法归属令牌」，账单出不来。
+// 值全部随机生成，禁止按具体样本特判。
+func TestParseMagpieFeed_FiveDimensionFields(t *testing.T) {
+	// 负值会被夹到 0，随机域避开；其余完全随机。
+	rndIn := func() int64 { return rand.Int63n(1_000_000) }
+	for i := 0; i < 20; i++ {
+		id := fmt.Sprintf("u_rand_%d", rand.Int63())
+		reqModel := fmt.Sprintf("model-%d", rand.Int63n(1<<32))
+		servedModel := fmt.Sprintf("served-%d", rand.Int63n(1<<32))
+		callerKey := fmt.Sprintf("ls-token-%d", rand.Int63n(1<<32))
+		in, out, cr, cw := rndIn(), rndIn(), rndIn(), rndIn()
+		payload := fmt.Sprintf(`{"rows":[{"id":%q,"t":"2026-11-17T10:00:00Z",
+			"provider":"openai","providerAccount":"acct","model":"m",
+			"req":%q,"served":%q,"callerKeyName":%q,
+			"in":%d,"out":%d,"cache_read":%d,"cache_write":%d,"priced":false}],"has_more":false}`,
+			id, reqModel, servedModel, callerKey, in, out, cr, cw)
+		page, err := parseMagpieFeed([]byte(payload), nil)
+		if err != nil {
+			t.Fatalf("round %d parse: %v", i, err)
+		}
+		if len(page.Entries) != 1 {
+			t.Fatalf("round %d 应解析 1 条，实际 %d", i, len(page.Entries))
+		}
+		e := page.Entries[0]
+		if e.ReqModel != reqModel {
+			t.Fatalf("round %d req_model = %q，期望 %q", i, e.ReqModel, reqModel)
+		}
+		if e.ServedModel != servedModel {
+			t.Fatalf("round %d served_model = %q，期望 %q", i, e.ServedModel, servedModel)
+		}
+		if e.CallerKeyName != callerKey {
+			t.Fatalf("round %d caller_key_name = %q，期望 %q", i, e.CallerKeyName, callerKey)
+		}
+		if e.CacheRead != cr {
+			t.Fatalf("round %d cache_read = %d，期望 %d", i, e.CacheRead, cr)
+		}
+		if e.CacheWrite != cw {
+			t.Fatalf("round %d cache_write = %d，期望 %d", i, e.CacheWrite, cw)
+		}
 	}
 }

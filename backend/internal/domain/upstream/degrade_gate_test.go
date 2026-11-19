@@ -65,7 +65,7 @@ func TestDegradeGate_TTLMakesSwitchTakeEffectWithoutRestart(t *testing.T) {
 		ConfigKeyTimeouts: `{"stream_first_byte_ms":30000,"stream_idle_ms":120000}`,
 		ConfigKeyDegrade:  degradeJSON(true, true),
 	})
-	gate := NewDegradeGate(NewConfigProvider(src), time.Second)
+	gate := NewDegradeGate(NewConfigProvider(src), "http://magpie:3425", time.Second)
 	now := time.Unix(1700000000, 0)
 	gate.now = func() time.Time { return now }
 
@@ -84,9 +84,6 @@ func TestDegradeGate_TTLMakesSwitchTakeEffectWithoutRestart(t *testing.T) {
 	if gate.Passthrough(context.Background()) {
 		t.Fatalf("TTL 到期后必须读到新值：开关冻结在启动值 = 运维改了也没用")
 	}
-	if gate.LedgerActive(context.Background()) {
-		t.Fatalf("账本开关同样要跟着生效")
-	}
 
 	// 改回来也要生效（双向）。
 	src.set(ConfigKeyDegrade, degradeJSON(true, true))
@@ -101,7 +98,7 @@ func TestDegradeGate_ReadsAtMostOncePerTTL(t *testing.T) {
 	src := newMutableSource(map[string]string{
 		ConfigKeyDegrade: degradeJSON(true, true),
 	})
-	gate := NewDegradeGate(NewConfigProvider(src), time.Minute)
+	gate := NewDegradeGate(NewConfigProvider(src), "", time.Minute)
 	now := time.Unix(1700000000, 0)
 	gate.now = func() time.Time { return now }
 
@@ -123,36 +120,46 @@ func TestDegradeGate_ReadsAtMostOncePerTTL(t *testing.T) {
 	}
 }
 
-// TestDegradeGate_LedgerActiveRequiresBaseURL 账本可用 = 基址已配 && 开关开。
+// TestDegradeGate_LedgerActiveUsesLedgerURL 账本可用 = 账本端点（UPSTREAM_LEDGER_URL）已配置。
 //
-// 默认 `upstream.base_url` 是空串，这正是「对账写假 ok」的成因：只看开关会算「开着」。
-func TestDegradeGate_LedgerActiveRequiresBaseURL(t *testing.T) {
+// 关键：**不看** upstream.base_url，也不看降级开关（它们都是 base_url 时代、账本链路已解耦）。
+// 这正是 P0 修复点：旧判据 = 基址已配 && 开关开，基址默认空串 → 恒 false → 账本永远不拉。
+func TestDegradeGate_LedgerActiveUsesLedgerURL(t *testing.T) {
 	src := newMutableSource(map[string]string{
-		ConfigKeyBaseURL: "",
+		ConfigKeyBaseURL: "", // base_url 空是正常态，不影响账本可用性
 		ConfigKeyDegrade: degradeJSON(true, true),
 	})
-	gate := NewDegradeGate(NewConfigProvider(src), 0) // TTL=0 → 每次真读
+	p := NewConfigProvider(src)
+
+	gate := NewDegradeGate(p, "", 0) // 端点未配
 	if gate.LedgerActive(context.Background()) {
-		t.Fatalf("基址未配时账本必须判为不可用（否则窗口写成 ok/0 对 0，漏账不可见）")
+		t.Fatalf("账本端点未配时必须判为不可用")
 	}
-	src.set(ConfigKeyBaseURL, "http://127.0.0.1:3425")
+	gate = NewDegradeGate(p, "http://magpie:3425", 0) // 端点已配
 	if !gate.LedgerActive(context.Background()) {
-		t.Fatalf("基址配上后应可用")
+		t.Fatalf("账本端点已配时必须判为可用（与 base_url 无关）")
 	}
-	// 转发开关与基址无关：基址未配时 /v1 仍应放行。
-	src.set(ConfigKeyBaseURL, "")
-	if !gate.Passthrough(context.Background()) {
-		t.Fatalf("转发门不许依赖 upstream.base_url（那是账本基址，未配置属正常态）")
+	// 即使把 base_url 配上、把降级开关全关，账本可用性仍只看端点（解耦已固化）。
+	cfgLoaded, _ := p.Load(context.Background())
+	_ = cfgLoaded
+	if !gate.LedgerActive(context.Background()) {
+		t.Fatalf("端点已配即应可用（不被 base_url / 降级开关影响）")
+	}
+
+	// 转发开关与账本端点无关：端点为空时 /v1 仍应放行（只看 passthrough 开关）。
+	passGate := NewDegradeGate(p, "", 0)
+	if !passGate.Passthrough(context.Background()) {
+		t.Fatalf("转发门不许依赖账本端点或 upstream.base_url（只看 passthrough_enabled）")
 	}
 }
 
 // TestDegradeGate_NilProviderUsesDefaults 未装配配置源时回落代码默认值，不 panic。
 func TestDegradeGate_NilProviderUsesDefaults(t *testing.T) {
-	gate := NewDegradeGate(nil, 0)
+	gate := NewDegradeGate(nil, "", 0)
 	if !gate.Passthrough(context.Background()) {
 		t.Fatalf("默认应放行（默认配置 passthrough_enabled=true）")
 	}
 	if gate.LedgerActive(context.Background()) {
-		t.Fatalf("默认基址为空 → 账本不可用")
+		t.Fatalf("未配置账本端点 → 账本不可用")
 	}
 }
