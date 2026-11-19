@@ -15,9 +15,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
 
@@ -34,13 +36,54 @@ type KeyBinder interface {
 
 // KeyAdminHandler 暴露 callerKey 映射的管理端接口。
 type KeyAdminHandler struct {
-	store   KeyBinder
-	credKey []byte
+	store    KeyBinder
+	credKey  []byte
+	adminKey string // 代理侧共享 callerKey（一键开通用；未配置则不能自动开通）
 }
 
 // NewKeyAdminHandler 装配管理端处理器（credKey 为 security.sm4_key）。
-func NewKeyAdminHandler(store KeyBinder, credKey []byte) *KeyAdminHandler {
-	return &KeyAdminHandler{store: store, credKey: credKey}
+func NewKeyAdminHandler(store KeyBinder, credKey []byte, adminKey string) *KeyAdminHandler {
+	return &KeyAdminHandler{store: store, credKey: credKey, adminKey: strings.TrimSpace(adminKey)}
+}
+
+// HandleAutoPut POST /api/v1/admin/tokens/{id}/magpie-key/auto
+// 一键开通：用系统已配置的代理侧 callerKey（MAGPIE_ADMIN_KEY / 卷里那份）绑定到该令牌。
+// 注意：共享同一把 callerKey 时，代理侧用量会归到同一把 key 上（分组不细分）；
+// 需要按令牌细分用量时，仍应手工在 magpie 建独立 callerKey 再用 PUT 绑定。
+func (h *KeyAdminHandler) HandleAutoPut(w http.ResponseWriter, r *http.Request) {
+	tokenID, ok := h.tokenID(w, r)
+	if !ok {
+		return
+	}
+	if len(h.credKey) == 0 {
+		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "凭据加密密钥未配置")
+		return
+	}
+	if h.adminKey == "" {
+		resp.Err(w, r, http.StatusConflict, resp.CodeConflict, "系统未配置代理侧 callerKey，请手工在 magpie 建 key 后用 PUT 绑定")
+		return
+	}
+	keyName := fmt.Sprintf("ls-token-%d", tokenID)
+	cipher, err := crypto.SM4Encrypt(h.credKey, []byte(h.adminKey))
+	if err != nil {
+		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "凭据加密失败")
+		return
+	}
+	k, err := h.store.Provision(r.Context(), tokenID, keyName, cipher)
+	if err != nil {
+		if isUniqueKeyName(err) {
+			// 名字被别人占了：换成带时间后缀的唯一名再试一次
+			keyName = fmt.Sprintf("ls-token-%d-%d", tokenID, time.Now().Unix())
+			if k, err = h.store.Provision(r.Context(), tokenID, keyName, cipher); err != nil {
+				resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "保存代理凭据映射失败")
+				return
+			}
+		} else {
+			resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "保存代理凭据映射失败")
+			return
+		}
+	}
+	resp.OK(w, r, keyBindingView{TokenID: k.TokenID, KeyName: k.KeyName, State: k.State, Bound: true, HasKeyID: k.KeyID != ""})
 }
 
 // 绑定入参的边界（过短=误填，过长=拒绝，避免把整段配置粘贴进来）。
