@@ -1,6 +1,7 @@
 package topology
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -20,6 +21,31 @@ import (
 type Handler struct {
 	store  Store
 	syncer *Syncer
+	raw    RawSource // 可选：直接读网关 /api/groups 原样返回
+}
+
+// RawSource 是最小接口：拿网关 /api/groups 的原始 JSON。
+type RawSource interface {
+	FetchRawGroups(ctx context.Context) ([]byte, error)
+}
+
+// SetRawSource 注入原始组数据源（不起作用时页面只显示镜像层，不报错）。
+func (h *Handler) SetRawSource(src RawSource) { h.raw = src }
+
+// HandleGateway 原样下发网关的 /api/groups（账号、路由组、成员、模型都在这份里）。
+func (h *Handler) HandleGateway(w http.ResponseWriter, r *http.Request) {
+	if h.raw == nil {
+		resp.Err(w, r, http.StatusServiceUnavailable, 50301, "拓扑原样视图不可用")
+		return
+	}
+	body, err := h.raw.FetchRawGroups(r.Context())
+	if err != nil {
+		resp.Err(w, r, http.StatusBadGateway, 50201, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`{"Data":` + string(body) + `}`))
 }
 
 // NewHandler 创建拓扑处理器。
