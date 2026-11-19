@@ -74,6 +74,21 @@ type ExternalModelInput struct {
 	Aliases []string
 	// MagpieModel 为代理侧模型名；nil/空串 = 未映射（不转发）。写入前会 trim 并归一空串为 nil。
 	MagpieModel *string
+	// BoundInternalRef 绑定到哪个内部模型（网关 ref，如 group/x 或 provider/model）。
+	// nil = 不修改（更新时保留原值）；指向空串 = 解绑。
+	BoundInternalRef *string
+}
+
+// normalizeBound：trim；空串归一为 nil（未绑定只有一种表示）。
+func normalizeBound(v *string) *string {
+	if v == nil {
+		return nil
+	}
+	t := strings.TrimSpace(*v)
+	if t == "" {
+		return nil
+	}
+	return &t
 }
 
 // Service 承载对外模型 CRUD 与价格应用业务逻辑。
@@ -318,14 +333,15 @@ func (s *Service) CreateModel(ctx context.Context, in ExternalModelInput) (*Exte
 	}
 
 	created, err := s.store.Insert(ctx, &ExternalModel{
-		ExternalName: in.ExternalName,
-		Description:  in.Description,
-		Enabled:      normalizeEnabled(in.Enabled, true),
-		SaleRates:    in.SaleRates,
-		TimeConfig:   in.TimeConfig,
-		ContextTiers: in.ContextTiers,
-		Aliases:      aliases,
-		MagpieModel:  normalizeMagpieModel(in.MagpieModel),
+		ExternalName:     in.ExternalName,
+		Description:      in.Description,
+		Enabled:          normalizeEnabled(in.Enabled, true),
+		SaleRates:        in.SaleRates,
+		TimeConfig:       in.TimeConfig,
+		ContextTiers:     in.ContextTiers,
+		Aliases:          aliases,
+		MagpieModel:      normalizeMagpieModel(in.MagpieModel),
+		BoundInternalRef: normalizeBound(in.BoundInternalRef),
 	})
 	if err != nil {
 		if errors.Is(err, ErrNameExists) {
@@ -390,6 +406,12 @@ func (s *Service) UpdateModel(ctx context.Context, id int64, in ExternalModelInp
 		ContextTiers: in.ContextTiers,
 		Aliases:      aliases,
 		MagpieModel:  normalizeMagpieModel(in.MagpieModel),
+	}
+	// nil = 不改动绑定；""（显式空）→ 解绑。
+	if in.BoundInternalRef != nil {
+		m.BoundInternalRef = normalizeBound(in.BoundInternalRef)
+	} else {
+		m.BoundInternalRef = existing.BoundInternalRef
 	}
 	if err := s.store.Update(ctx, m); err != nil {
 		if errors.Is(err, ErrNameExists) {
