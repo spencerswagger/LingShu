@@ -101,221 +101,89 @@ function safeRedirect(v: unknown): string {
 
 <template>
   <div class="login-page">
-    <!-- 左：品牌区 -->
-    <aside class="brand">
-      <div class="brand-inner">
-        <div class="brand-head">
-          <span class="brand-mark">
-            <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
-              <path
-                d="M12 2 4 6.5v11L12 22l8-4.5v-11L12 2Zm0 2.6 5.6 3.15v6.5L12 17.4l-5.6-3.15v-6.5L12 4.6Zm-2.2 5.05L12 7.65l2.2 2v2.7L12 14.35l-2.2-2v-2.7Z"
-                fill="#fff"
-              />
-            </svg>
-          </span>
-        </div>
-
-        <div class="brand-body">
-          <h1 class="brand-title">灵枢</h1>
-          <p class="brand-desc">统一 AI 调用网关</p>
-        </div>
-
-        <div class="brand-foot">内部系统</div>
+    <div class="aura" aria-hidden="true"></div>
+    <div class="grid" aria-hidden="true"></div>
+    <main class="login-card">
+      <div class="brand">
+        <img src="/brand/lockup.svg" alt="灵枢" />
       </div>
-    </aside>
-
-    <!-- 右：登录表单 -->
-    <main class="form-side">
-      <div class="form-box">
-        <div v-if="step === 'password'">
-          <div class="form-head">
-            <div class="form-title">欢迎回来</div>
-            <div class="form-sub">登录控制台</div>
-          </div>
-          <el-form ref="formRef" :model="form" :rules="rules" size="large" @keyup.enter="onLogin">
-            <el-form-item prop="username">
-              <el-input v-model="form.username" placeholder="用户名" clearable />
-            </el-form-item>
-            <el-form-item prop="password">
-              <el-input v-model="form.password" type="password" placeholder="密码" show-password />
-            </el-form-item>
-            <el-form-item>
-              <el-button type="primary" class="login-btn" :loading="loading" @click="onLogin">
-                登 录
-              </el-button>
-            </el-form-item>
-          </el-form>
-          <div class="form-sub" style="margin-top: 16px; text-align: center">
-            <el-link type="primary" @click="router.push('/register')">还没有账号？注册</el-link>
-          </div>
+      <div v-if="step === 'password'">
+        <div class="form-head">
+          <h1>登录灵枢</h1>
+          <p>统一 AI 调用网关控制台</p>
         </div>
-        <div v-else>
-          <div class="form-head">
-            <div class="form-title">多因素认证</div>
-            <div class="form-sub">请输入身份验证器中的动态码（或恢复码）</div>
-          </div>
-          <el-alert v-if="mustChange" type="warning" :closable="false" show-icon style="margin-bottom: 16px"
-            title="验证通过后需先修改默认密码" />
-          <el-input v-model="totpCode" placeholder="6 位动态码" size="large" @keyup.enter="onLoginTotp" />
-          <el-button type="primary" class="login-btn" :loading="loading" style="margin-top: 16px" @click="onLoginTotp">
-            验 证
-          </el-button>
-          <div class="form-sub" style="margin-top: 12px; text-align: center">
-            <el-link type="info" @click="step = 'password'">返回上一步</el-link>
-          </div>
-        </div>
-        <ErrorBubble v-if="errMsg || errReqId" :message="errMsg" :request-id="errReqId" />
+        <el-form ref="formRef" :model="form" :rules="rules" size="large" @keyup.enter="onLogin">
+          <el-form-item prop="username"><el-input v-model="form.username" placeholder="用户名" clearable /></el-form-item>
+          <el-form-item prop="password"><el-input v-model="form.password" type="password" placeholder="密码" show-password /></el-form-item>
+          <el-form-item>
+            <el-button type="primary" class="login-btn" :loading="loading" @click="onLogin">登 录</el-button>
+          </el-form-item>
+        </el-form>
+        <div class="foot"><el-link type="primary" @click="router.push('/register')">还没有账号？注册</el-link></div>
       </div>
+      <div v-else>
+        <div class="form-head"><h1>多因素认证</h1><p>输入身份验证器中的动态码（或恢复码）</p></div>
+        <el-alert v-if="mustChange" type="warning" :closable="false" show-icon style="margin-bottom: 16px" title="验证通过后需先修改默认密码" />
+        <el-input v-model="totpCode" placeholder="6 位动态码" size="large" @keyup.enter="onLoginTotp" />
+        <el-button type="primary" class="login-btn" :loading="loading" style="margin-top: 16px" @click="onLoginTotp">验 证</el-button>
+        <div class="foot"><el-link type="info" @click="step = 'password'">返回上一步</el-link></div>
+      </div>
+      <ErrorBubble v-if="errMsg || errReqId" :message="errMsg" :request-id="errReqId" />
     </main>
   </div>
 </template>
 
 <style scoped>
 .login-page {
-  display: flex;
+  position: relative;
   min-height: 100vh;
-  background: #f4f5fa;
-}
-
-/* ===== 品牌区 ===== */
-.brand {
-  flex: 1.1;
-  background:
-    radial-gradient(900px 520px at 8% 0%, rgba(99, 102, 241, 0.45) 0%, transparent 60%),
-    radial-gradient(700px 480px at 100% 100%, rgba(139, 92, 246, 0.30) 0%, transparent 55%),
-    linear-gradient(160deg, #171c3b 0%, #10142b 100%);
   display: flex;
   align-items: center;
   justify-content: center;
-  color: #fff;
+  overflow: hidden;
+  background: #06080f;
 }
-
-.brand-inner {
-  max-width: 460px;
-  padding: 48px 32px;
-  display: flex;
-  flex-direction: column;
-  min-height: 78vh;
+/* 呼吸渐变光晕 */
+.aura {
+  position: absolute;
+  width: 120vmax;
+  height: 120vmax;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  background: conic-gradient(from 0deg at 50% 50%,
+      #4c6fe8 0%, #7b5cf0 18%, #101a30 32%, #06080f 45%, #06080f 55%, #101a30 68%, #4c6fe8 84%, #4c6fe8 100%);
+  filter: blur(90px);
+  opacity: .38;
+  animation: breathe 14s ease-in-out infinite, spin 46s linear infinite;
 }
-
-.brand-head {
-  display: flex;
-  align-items: center;
-  gap: 12px;
+@keyframes breathe { 0%,100% { opacity: .26; transform: translate(-50%, -50%) scale(1); } 50% { opacity: .5; transform: translate(-50%, -50%) scale(1.08); } }
+@keyframes spin { to { transform: translate(-50%, -50%) rotate(360deg) scale(1.04); } }
+.grid {
+  position: absolute; inset: 0;
+  background-image: linear-gradient(#ffffff08 1px, transparent 1px), linear-gradient(90deg, #ffffff08 1px, transparent 1px);
+  background-size: 44px 44px;
+  mask-image: radial-gradient(70% 60% at 50% 45%, #000 0%, transparent 100%);
 }
-
-.brand-mark {
-  width: 40px;
-  height: 40px;
-  border-radius: 12px;
-  background: var(--brand-gradient);
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  box-shadow: 0 6px 18px rgba(99, 102, 241, 0.5);
-}
-
-.brand-name {
-  font-size: 20px;
-  font-weight: 700;
-  letter-spacing: 1px;
-}
-
-.brand-body {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  padding: 48px 0;
-}
-
-.brand-title {
-  font-size: 34px;
-  font-weight: 800;
-  line-height: 1.25;
-  margin: 0 0 16px;
-  letter-spacing: 0.5px;
-}
-
-.brand-desc {
-  font-size: 15px;
-  line-height: 1.8;
-  color: rgba(255, 255, 255, 0.72);
-  margin: 0 0 32px;
-}
-
-.brand-points {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: grid;
-  gap: 12px;
-}
-
-.brand-points li {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  font-size: 14px;
-  color: rgba(255, 255, 255, 0.85);
-}
-
-.brand-points li::before {
-  content: '';
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--brand-gradient);
-  box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.28);
-  flex-shrink: 0;
-}
-
-.brand-foot {
-  font-size: 12px;
-  color: rgba(255, 255, 255, 0.35);
-}
-
-/* ===== 表单区 ===== */
-.form-side {
-  flex: 1;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 32px;
-}
-
-.form-box {
+.login-card {
+  position: relative;
   width: 100%;
   max-width: 380px;
+  margin: 24px;
+  padding: 34px 30px 26px;
+  border-radius: 16px;
+  border: 1px solid #26324a;
+  background: linear-gradient(175deg, rgba(16,23,40,.92), rgba(9,13,21,.94));
+  box-shadow: 0 40px 90px -46px #4c6fe8aa, inset 0 1px #ffffff0a;
+  backdrop-filter: blur(10px);
 }
-
-.form-head {
-  margin-bottom: 28px;
-}
-
-.form-title {
-  font-size: 26px;
-  font-weight: 800;
-  color: var(--color-text);
-  letter-spacing: 0.3px;
-}
-
-.form-sub {
-  margin-top: 8px;
-  font-size: 14px;
-  color: var(--color-text-secondary);
-}
-
-.login-btn {
-  width: 100%;
-  border-radius: 10px;
-  font-size: 15px;
-  letter-spacing: 4px;
-}
-
-@media (max-width: 900px) {
-  .brand {
-    display: none;
-  }
-}
+.brand { display: flex; justify-content: center; margin-bottom: 22px; }
+.brand img { width: 132px; height: auto; }
+.form-head { text-align: center; margin-bottom: 20px; }
+.form-head h1 { font-size: 19px; font-weight: 600; margin: 0 0 6px; color: var(--ink); }
+.form-head p { font-size: 12px; color: var(--ink-3); margin: 0; }
+.login-btn { width: 100%; height: 40px; font-size: 14px; }
+.foot { margin-top: 14px; text-align: center; }
+:deep(.el-input__wrapper) { background: #0b101c; box-shadow: 0 0 0 1px #222c40 inset; }
+:deep(.el-input__inner) { color: var(--ink); }
 </style>
