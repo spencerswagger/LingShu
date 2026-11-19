@@ -9,6 +9,7 @@ import { useV2Load } from '@/composables/useV2Load'
 import { fmtDateTime } from '@/utils/format'
 import TopologyCanvas from '@/components/v2/topology/TopologyCanvas.vue'
 import ModelPricing from '@/components/ModelPricing.vue'
+import ModelPriceCatalog from '@/components/ModelPriceCatalog.vue'
 
 const { state, data, load } = useV2Load<InternalModelView>(getTopology, mockTopology)
 const gw = ref<GatewayView | null>(null)
@@ -21,6 +22,7 @@ async function loadGateway() {
 onMounted(async () => { await Promise.all([load(), loadGateway()]); await ensureExternals() })
 
 const syncing = ref(false)
+const catalogRef = ref<InstanceType<typeof ModelPriceCatalog> | null>(null)
 const syncMsg = ref('')
 async function runSync() {
   if (syncing.value) return
@@ -117,6 +119,12 @@ async function savePrice() {
   } catch (e) { ElMessage.error('保存失败：' + (e instanceof Error ? e.message : String(e))) } finally { saving.value = false }
 }
 
+// models.dev 参考价套用到售价表单（只覆盖目录给出的价段，其余保留原值）
+function onApplyCatalog(rates: Record<string, number>) {
+  const cur = (pricing.SaleRates as Record<string, number>) || {}
+  pricing.SaleRates = { ...cur, ...rates }
+}
+
 async function saveCost() {
   if (!sel.value) return
   saving.value = true
@@ -156,7 +164,11 @@ const selKindLabel = computed(() => {
       <template v-if="sel">
         <div v-if="sel.kind === 'group'">
           <div class="ro-row"><span>路由组</span><b>{{ sel.data.Name }}</b></div>
-          <ModelPricing v-model="pricing" show-rates-key="SaleRates" title="售价" />
+          <ModelPricing v-model="pricing" show-rates-key="SaleRates" title="售价">
+            <template #title-extra>
+              <el-button size="small" @click="catalogRef?.open()">从 models.dev 获取参考价</el-button>
+            </template>
+          </ModelPricing>
           <el-button type="primary" :loading="saving" style="width:100%" @click="savePrice">保存售价</el-button>
         </div>
         <div v-else-if="sel.kind === 'model' || sel.kind === 'group'">
@@ -174,6 +186,7 @@ const selKindLabel = computed(() => {
           <p class="ro-hint">只读：这一层由网关同步。</p>
         </div>
       </template>
+      <ModelPriceCatalog ref="catalogRef" :model-name="String(sel?.data?.Name || sel?.ref || '')" label="售价" @apply="onApplyCatalog" />
     </el-drawer>
   </div>
 </template>
