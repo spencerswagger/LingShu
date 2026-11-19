@@ -25,7 +25,6 @@ import (
 	"github.com/team/llmgateway/internal/domain/billing"
 	"github.com/team/llmgateway/internal/domain/calllog"
 	"github.com/team/llmgateway/internal/domain/console"
-	"github.com/team/llmgateway/internal/domain/facadebill"
 	"github.com/team/llmgateway/internal/domain/identity"
 	"github.com/team/llmgateway/internal/domain/ledgersettle"
 	"github.com/team/llmgateway/internal/domain/magpie"
@@ -322,7 +321,7 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 		return nil, fmt.Errorf("asyncwrite WAL 不可用（拒绝静默降级为内存模式）: %w", err)
 	}
 
-	// 安全组件：会话注册表 / 审计 / 限流 / preauth / TOTP
+	// 安全组件：会话注册表 / 审计 / 限流 / TOTP
 	sessions := session.NewRegistry(func(ctx context.Context, userID int64) (session.Entry, error) {
 		var e session.Entry
 		err := d.QueryRowContext(ctx,
@@ -420,11 +419,8 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	// 只读配置缓存开关：关闭时 R/context_tiers/时段/样值 均退回直查。
 	billCfgProvider.SetCacheEnabled(readCacheOn)
 	// 失效钩子：sys_configs 写入（console 经 billing.UpsertConfig）后清空计费配置读缓存，即时生效。
-	// 订阅池前缀名单（magpie.subscription_prefixes）：低频变更，读侧缓存，写入后失效即生效。
-	magpiePrefixes := magpie.NewPrefixProvider(billStore.GetConfig)
 	billStore.SetConfigWriteHook(func() {
 		billCfgProvider.InvalidateCostConfig()
-		magpiePrefixes.Invalidate()
 	})
 	var keySync *magpie.CallerKeySync
 	billSvc := billing.NewService(billStore, billCfgProvider, creditSvc)
@@ -477,27 +473,10 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 		cnyRate: billCfgProvider.CnyRate,
 	})
 
-	// facade 计费钩子（预扣 → 结算 / 退预扣）。口径：**无 usage 一律不计费**（整笔退预扣 +
-	// failed/no-usage 账单），估算只用于预扣，绝不出估算账。依赖不全时返回 nil → 不产生计费动作。
-	facadeBiller := facadebill.New(facadebill.Options{
-		Ledger: billSvc,
-		Wallet: creditSvc,
-		Pricer: facadeSaleRates{svc: modelSvc},
-		Logger: logr,
-	})
-	var (
-		facadeReserve  magpie.ReserveHook
-		facadeComplete magpie.Hook
-	)
-	if facadeBiller != nil {
-		facadeReserve = facadeBiller.Reserve
-		facadeComplete = facadeBiller.OnComplete
-	} else {
-		logr.Warn("facade 计费钩子未装配：/v1 转发不会产生账单与扣费")
-	}
-
-	// 代理侧 callerKey 映射的管理端入口：运维在 magpie 侧创建 callerKey 后录入灵枢
-	// （灵枢不自行签发凭据；未绑定的令牌在转发时返回 403 magpie_key_missing）。
+	// V2 逐请求代理链（/v1 facade 转发）与预扣（preauth）已随 V3 下线：
+	// /v1 由 nginx 直连代理侧网关端口，计费统一走账本轮询（v3billing，60s）。
+	// 代理侧 callerKey 映射的管理端入口保留：运维在 magpie 侧创建 callerKey 后录入灵枢
+	// （灵枢不自行签发凭据）。
 	magpieKeyAdmin := magpie.NewKeyAdminHandler(magpie.NewKeyStore(d), sm4Key, cfg.Magpie.AdminKey)
 
 	// V3：令牌 ↔ callerKey 同步（页面接口 + magpie_keys）。
@@ -565,42 +544,8 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 		logr.Info("代理侧未接入：管理面跳转接口返回 503（按钮置灰），/magpie/ 反代不会被使用")
 	}
 
-	// 对外转发入口（/v1 与 /v1beta）：灵枢只做 facade，转发与协议互译在代理侧。
-	// 未配置 magpie.base_url 时 NewHandler 返回 nil，server 侧保持 410 停用口径。
-	// OnComplete 刻意不注入：扣费/退预扣属第③件，本件只产出 Result 事实。
-	magpieHandler := magpie.NewHandler(magpie.Deps{
-		Config:        magpie.FromApp(cfg),
-		Tokens:        tokenSvc,
-		Models:        modelSvc,
-		Keys:          magpie.NewKeyStore(d),
-		CredentialKey: sm4Key,
-		Prefixes:      magpiePrefixes,
-		OnReserve:     facadeReserve,
-		OnComplete:    facadeComplete,
-		Logger:        logr,
-	})
-	if magpieHandler == nil {
-		logr.Info("未配置 magpie.base_url：对外转发接口保持停用（410）")
-	}
-
-	// V2 运行参数（F1 三键：基址 / 两段超时 / 三开关）。凭据不进配置表：
-	// 上游鉴权头只在装配层从环境变量取，转发链逐请求注入。
-	// 注：/v1 转发基址由 magpie.* 配置提供；upstream.* 只服务账本同步 / 对账 / 结算三条后台链。
-	upstreamCfg := upstream.NewConfigProvider(billStore)
-	if upCfg, problems := upstreamCfg.Load(context.Background()); true {
-		for _, pb := range problems {
-			logr.Warn("上游配置有问题（已按字段回落默认值）", "problem", pb)
-		}
-		// 注意：base_url 只作参考，**不**再是账本链路可用性判据（见下方 UPSTREAM_LEDGER_URL）。
-		logr.Info("上游运行参数（账本链路可用性见 UPSTREAM_LEDGER_URL，不看 base_url）",
-			"base_url_set", upCfg.BaseURL != "",
-			"stream_first_byte_ms", upCfg.Timeouts.StreamFirstByte.Milliseconds(),
-			"stream_idle_ms", upCfg.Timeouts.StreamIdle.Milliseconds())
-	}
-
 	// 账本链路端点（账本链路可用性的唯一判据）。V3 起转发由 nginx 直连代理侧，
-	// upstream.base_url 不再参与任何链路；账本同步/对账是否可跑只看这个端点是否配置，
-	// 彻底不再依赖 upstream.base_url（旧闸门 SyncActive() 依赖它 → 恒 false → 账本永远空）。
+	// upstream.base_url 不再参与任何链路；账本同步/对账是否可跑只看这个端点是否配置。
 	// 凭据只从环境变量取（不进配置表）：UPSTREAM_ADMIN_KEY 由 entrypoint 与代理侧 admin_key 对齐。
 	ledgerURL := strings.TrimSpace(os.Getenv("UPSTREAM_LEDGER_URL"))
 	adminKey := strings.TrimSpace(os.Getenv("UPSTREAM_ADMIN_KEY"))
@@ -620,20 +565,8 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 			"auth_header", authHeader)
 	}
 
-	// 降级开关的热生效读取器（TTL 5s）：`ConfigProvider.Load` 的缓存**没有 TTL**，
-	// `Invalidate()` 今天没有生产调用点（`/admin/configs/system` 不写 upstream.* 三键），
-	// 所以每请求直接 Load 拿到的是**启动时冻结的值** —— 运维关掉开关不重启就无效（真机复现过）。
-	// 这层每 TTL 周期至多一次 DB 读，改动 5s 内生效。账本可用性由 ledgerURL 决定（见 LedgerActive）。
-	gate := upstream.NewDegradeGate(upstreamCfg, ledgerURL, 5*time.Second)
-
-	// 转发降级开关（sys_configs：upstream.degrade.passthrough_enabled）。
-	//
-	// 只读开关本身，**不看** upstream.base_url：那个基址只服务账本同步/对账，
-	// 未配置（默认空串）是正常态，拿它当门会把所有 /v1 请求关成 503。
-	// 开关关 → /v1 与 /v1beta 返回 503 + 明确文案（不代理、不计费、不落账单）。
-	if magpieHandler != nil {
-		magpieHandler.SetGate(func() bool { return gate.Passthrough(context.Background()) })
-	}
+	// 账本链路可用性闸门（env UPSTREAM_LEDGER_URL，唯一判据）。
+	gate := upstream.NewLedgerGate(ledgerURL)
 
 	// D4：对账窗口的四列计数由对账服务在窗口结束时写入（四个 0 等于「漏账不可见」）。
 	// 只落计数与状态；七列归因的读取方属阶段二（本期不做）。
@@ -644,9 +577,8 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 		Counts:   windowStore,
 		States:   windowStore,
 		Streaks:  windowStore,
-		// ⚠️ 账本可用性必须走 gate.LedgerActive（= 账本端点 UPSTREAM_LEDGER_URL 已配置），
-		// 不再依赖 upstream.base_url（默认空串、无管理端写入口 → 旧判据恒 false → 账本永不拉、
-		// 窗口全 skipped）。端点未配 ⇒ 账本拉取停摆 ⇒ 窗口落 skipped（不是 blocked，不冒充「已对平」）。
+		// ⚠️ 账本可用性必须走 gate.LedgerActive（= 账本端点 UPSTREAM_LEDGER_URL 已配置）。
+		// 端点未配 ⇒ 账本拉取停摆 ⇒ 窗口落 skipped（不是 blocked，不冒充「已对平」）。
 		LedgerEnabled: func() bool { return gate.LedgerActive(context.Background()) },
 		Logger:        logr,
 	})
@@ -757,30 +689,6 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 				// 拉取完成（无论有无新行）都结算一次：空轮的结算是一次廉价 SELECT，成本可忽略。
 				if err == nil {
 					settleNow()
-				}
-			}()
-		}
-	}()
-
-	// 阶段二 A1：预扣过期扫描（15 分钟未终结 → 全额退回）。
-	// 一跳 60s：过期点是「15 分钟 + 最多 1 分钟」，对资金回收足够；单轮走一个事务 + SKIP LOCKED，多副本安全。
-	go func() {
-		t := time.NewTicker(time.Minute)
-		defer t.Stop()
-		for range t.C {
-			func() {
-				defer func() {
-					if rec := recover(); rec != nil {
-						logr.Error("预扣过期扫描 panic", "panic", rec)
-					}
-				}()
-				res, err := creditSvc.ExpireHolds(context.Background(), time.Now(), 200)
-				if err != nil {
-					logr.Warn("预扣过期扫描失败（下轮重试）", "err", err)
-					return
-				}
-				if res.Expired > 0 {
-					logr.Info("退回超时未结算的预扣", "holds", res.Expired, "credits", res.Amount)
 				}
 			}()
 		}
@@ -940,7 +848,6 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 			Console:       consoleAdmin,
 			DevConsole:    consoleDev,
 			SyncAdmin:     syncHandler,
-			Facade:        magpieHandler,
 			MagpieKey:     magpieKeyAdmin,
 			MagpieAccess:  magpieAccessHandler,
 			Topology:      topologyHandler,
@@ -953,43 +860,6 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 		auditStore: auditStore,
 		writer:     asyncWriter,
 	}, nil
-}
-
-// creditHoldAdapter 把 identity.CreditService 的预扣登记能力适配为 gateway.HoldOps（阶段二 A1）。
-type creditHoldAdapter struct {
-	svc *identity.CreditService
-}
-
-func (a *creditHoldAdapter) ReserveHold(ctx context.Context, billingID string, userID, tokenID int64, amount float64, sessionID, remark string) error {
-	var tid *int64
-	if tokenID != 0 {
-		id := tokenID
-		tid = &id
-	}
-	_, err := a.svc.PreConsumeHold(ctx, identity.HoldRequest{
-		BillingID: billingID,
-		UserID:    userID,
-		TokenID:   tid,
-		Amount:    amount,
-		SessionID: sessionID,
-		Remark:    remark,
-	})
-	return err
-}
-
-func (a *creditHoldAdapter) CloseHold(ctx context.Context, billingID, status, ledgerEntryID string) (bool, error) {
-	return a.svc.CloseHold(ctx, billingID, status, ledgerEntryID)
-}
-
-// facadeSaleRates 把 model.Service 适配为 facadebill.Pricer（售价 + 模型级时段/分档）。
-type facadeSaleRates struct{ svc *model.Service }
-
-func (a facadeSaleRates) SaleRatesFor(ctx context.Context, externalModel string) (billing.Rates, *billing.TimeCoeffConfig, []billing.TierRule, error) {
-	m, err := a.svc.GetByExternalName(ctx, externalModel)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	return m.SaleRates, m.TimeConfig, m.ContextTiers, nil
 }
 
 // priceRefAdapter 把 sync.Syncer 适配为 model.PriceSource，供对外模型价格参考/应用售价接口使用。

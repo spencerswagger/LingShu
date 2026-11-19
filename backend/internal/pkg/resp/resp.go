@@ -61,7 +61,6 @@ const (
 	CodeGone               = 41001 // 接口已停用（见 server.goneHandler / gonePublicHandler）
 	CodeInsufficient       = 40201 // 余额不足
 	CodeRateLimited        = 42901
-	CodeNoRoute            = 50301 // 无匹配渠道
 	CodeInternalError      = 50001
 )
 

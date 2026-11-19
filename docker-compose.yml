@@ -145,7 +145,7 @@ services:
       DATABASE_URL: postgres://${POSTGRES_USER:-llmgw}:${POSTGRES_PASSWORD:-llmgw}@postgres:5432/${POSTGRES_DB:-llmgw}?sslmode=disable
       # 留空则首次启动自动生成强随机 SM4 密钥并持久化到 backend_keys 卷
       SM4_KEY: ${SM4_KEY:-}
-      # 代理侧基址：默认指向 compose 内的 magpie 服务，无需手填
+      # 代理侧基址：拓扑源回落地址（TOPOLOGY_SOURCE_URL 未配置时使用），无需手填
       MAGPIE_BASE_URL: ${MAGPIE_BASE_URL:-http://magpie:3425}
       # 代理侧管理密钥：留空表示读 magpie-init 生成的那份（entrypoint 会从
       # /run/magpie-secret/admin_key 取），因此两边永远是同一把；只有「手工在管理面

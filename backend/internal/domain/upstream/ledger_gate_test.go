@@ -20,59 +20,30 @@ func randomURL(t *testing.T) string {
 	return fmt.Sprintf("http://%s.internal:%d", hex.EncodeToString(b), 30000+int(b[0])%2000)
 }
 
-// degradeJSONFull 生成三段开关的 JSON（passthrough/ledger/sync）。
-func degradeJSONFull(passthrough, ledger, sync bool) string {
-	return fmt.Sprintf(`{"passthrough_enabled":%t,"ledger_enabled":%t,"sync_enabled":%t}`,
-		passthrough, ledger, sync)
-}
-
 // TestLedgerGate_TableDriven 是账本闸门的表驱动守卫（P0 回归核心）。
 //
-// 维度：账本端点（配/不配）× 降级开关（开/关）× upstream.base_url（空/非空）。
-// 断言：
-//   - 只要 UPSTREAM_LEDGER_URL 配了就拉（LedgerActive=true / ok=true），**无论** base_url 空不空、
-//     降级开关开不开——base_url 与降级开关都不再是账本链路闸门；
-//   - 没配必须 ok=false 且 reason 非空（装配层据此 WARN），绝不冒充成功。
+// 断言：只要 UPSTREAM_LEDGER_URL 配了就拉（LedgerActive=true / ok=true），
+// 没配必须 ok=false 且 reason 非空（装配层据此 WARN），绝不冒充成功。
 func TestLedgerGate_TableDriven(t *testing.T) {
 	ctx := context.Background()
 	randURL := randomURL(t)
-	randBase := randomURL(t)
 
 	type tc struct {
 		name      string
 		ledgerURL string
-		baseURL   string
-		passth    bool
-		ledgerOn  bool
-		syncOn    bool
 		want      bool
 	}
 	cases := []tc{
-		// —— 端点已配：base_url 空/非空、开关任意组合都应「拉」——
-		{"url+base空+全开", randURL, "", true, true, true, true},
-		{"url+base非空+全开", randURL, randBase, true, true, true, true},
-		{"url+base空+账本开关关", randURL, "", true, false, true, true},
-		{"url+base非空+账本开关关", randURL, randBase, true, false, true, true},
-		{"url+base空+同步开关关", randURL, "", true, true, false, true},
-		{"url+base非空+同步开关关", randURL, randBase, true, true, false, true},
-		{"url+base空+转发开关关", randURL, "", false, true, true, true},
-		// —— 端点未配：base_url 空/非空、开关任意组合都应「不拉」——
-		{"无url+base空+全开", "", "", true, true, true, false},
-		{"无url+base非空+全开", "", randBase, true, true, true, false},
-		{"无url+base非空+开关全关", "", randBase, false, false, false, false},
+		{"端点已配", randURL, true},
+		{"端点未配", "", false},
+		{"端点全空白", "   ", false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			src := &fakeConfigSource{vals: map[string]string{
-				ConfigKeyBaseURL:  fmt.Sprintf("%q", c.baseURL),
-				ConfigKeyTimeouts: `{"stream_first_byte_ms":30000,"stream_idle_ms":120000}`,
-				ConfigKeyDegrade:  degradeJSONFull(c.passth, c.ledgerOn, c.syncOn),
-			}}
-			gate := NewDegradeGate(NewConfigProvider(src), c.ledgerURL, 0)
+			gate := NewLedgerGate(c.ledgerURL)
 
 			if got := gate.LedgerActive(ctx); got != c.want {
-				t.Fatalf("LedgerActive=%v，期望 %v（ledgerURL=%q baseURL=%q degrade={p:%v,l:%v,s:%v}）",
-					got, c.want, c.ledgerURL, c.baseURL, c.passth, c.ledgerOn, c.syncOn)
+				t.Fatalf("LedgerActive=%v，期望 %v（ledgerURL=%q）", got, c.want, c.ledgerURL)
 			}
 			ok, reason := gate.LedgerAvailability()
 			if ok != c.want {
@@ -91,25 +62,6 @@ func TestLedgerGate_TableDriven(t *testing.T) {
 				}
 			}
 		})
-	}
-}
-
-// TestLedgerGate_BaseURLIsIrrelevant 显式钉住：base_url 从前是闸门，现在完全不影响账本判定。
-func TestLedgerGate_BaseURLIsIrrelevant(t *testing.T) {
-	ctx := context.Background()
-	url := randomURL(t)
-	deg := degradeJSONFull(true, true, true)
-
-	withBase := &fakeConfigSource{vals: map[string]string{
-		ConfigKeyBaseURL: fmt.Sprintf("%q", randomURL(t)), ConfigKeyDegrade: deg,
-	}}
-	noBase := &fakeConfigSource{vals: map[string]string{
-		ConfigKeyBaseURL: `""`, ConfigKeyDegrade: deg,
-	}}
-	g1 := NewDegradeGate(NewConfigProvider(withBase), url, 0)
-	g2 := NewDegradeGate(NewConfigProvider(noBase), url, 0)
-	if !g1.LedgerActive(ctx) || !g2.LedgerActive(ctx) {
-		t.Fatalf("base_url 空/非空都必须判为可用（base_url 已不参与账本链路）")
 	}
 }
 

@@ -149,6 +149,6 @@ docker compose down -v                  # ⚠️ 连数据卷一起删（数据�
 | --- | --- |
 | `pull` 报 `unauthorized` / `denied` | 没登录 ACR：`docker login registry.cn-hangzhou.aliyuncs.com` 后重试 |
 | `manifest unknown` | tag 打错（预发布 tag 不打 `latest`，请用具体版本号如 `v0.14.0-rc1`） |
-| 容器起来但 `/v1` 一直 410 | 代理侧没接上：`docker compose config \| grep MAGPIE_BASE_URL` 应为 `http://magpie:3425` |
+| `/v1` 一直 410 | `/v1` 由 nginx 直连代理侧网关端口（`magpie:3425`），不经过灵枢后端；直连灵枢端口本来就是 410。确认 nginx 容器已启动、`frontend` 能解析 `magpie` |
 | 后端启动即退出、日志有 `42P01` / `42703` | 代码与数据库版本不匹配（升级只换了一半）→ 按回滚说明「代码与数据一起退」 |
 | 升级后登录令牌全失效 / 渠道凭据解不开 | `backend_keys` 卷被删过，需要重新登录与重配凭据 |

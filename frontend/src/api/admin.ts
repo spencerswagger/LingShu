@@ -440,21 +440,12 @@ export interface SessionCostConfig {
 export interface RoutingConfigData {
   SessionCost: SessionCostConfig
 }
-// V2 上游三键（sys_configs）：base_url / timeouts / degrade.{passthrough,ledger,sync}
-// + 订阅池前缀名单。老后端不返回该块 → undefined（页面显示「V2 配置未上线」，不显示 0/false）。
-export interface UpstreamConfigData {
-  base_url?: string
-  timeouts?: { stream_first_byte_ms?: number; stream_idle_ms?: number }
-  degrade?: { passthrough_enabled?: boolean; ledger_enabled?: boolean; sync_enabled?: boolean }
-  subscription_prefixes?: string[]
-}
 
 export interface SystemConfigData {
   Billing: BillingConfigData
   Routing: RoutingConfigData
   SessionExpiration: SessionExpirationData
   UpstreamResponseHeaderWhitelist: string[]
-  Upstream?: UpstreamConfigData
 }
 export function getSystemConfig() {
   return http.get<SystemConfigData, ApiRes<SystemConfigData>>('/admin/configs/system')

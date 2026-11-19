@@ -330,41 +330,6 @@ func (s *CreditService) consumeOn(ctx context.Context, ex dbx.Execer, userID int
 	return before, after, nil
 }
 
-// Settle 为 SettleBalance 的别名，满足 billing.CreditService 接口。
-// 未传外部事务时内部开启事务，保证「改余额 + 写流水」原子提交。
-func (s *CreditService) Settle(ctx context.Context, userID int64, delta float64, sessionID, remark string) (before, after float64, err error) {
-	return s.settleWithTx(ctx, userID, delta, sessionID, remark)
-}
-
-// SettleTx 在调用方给定执行器（事务）内完成差额结算与流水写入。
-func (s *CreditService) SettleTx(ctx context.Context, ex dbx.Execer, userID int64, delta float64, sessionID, remark string) (before, after float64, err error) {
-	return s.settleOn(ctx, ex, userID, delta, sessionID, remark)
-}
-
-// SettleBalance 在预扣基础上多退少补：delta > 0 补扣（需余额充足），delta < 0 退回。
-// 返回差额流水的前后余额；补扣余额不足返回错误（计费落 failed）。
-// 未传外部事务时内部开启事务，保证「改余额 + 写流水」原子提交。
-func (s *CreditService) SettleBalance(ctx context.Context, userID int64, delta float64, sessionID, remark string) (before, after float64, err error) {
-	return s.settleWithTx(ctx, userID, delta, sessionID, remark)
-}
-
-// settleWithTx 内部开启事务执行差额结算（非 Tx 入口共用）。
-func (s *CreditService) settleWithTx(ctx context.Context, userID int64, delta float64, sessionID, remark string) (before, after float64, err error) {
-	tx, err := s.store.db.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, 0, fmt.Errorf("begin settle tx: %w", err)
-	}
-	defer tx.Rollback()
-	before, after, err = s.settleOn(ctx, tx, userID, delta, sessionID, remark)
-	if err != nil {
-		return 0, 0, err
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, 0, fmt.Errorf("commit settle tx: %w", err)
-	}
-	return before, after, nil
-}
-
 func (s *CreditService) settleOn(ctx context.Context, ex dbx.Execer, userID int64, delta float64, sessionID, remark string) (before, after float64, err error) {
 	delta = decimalx.Round5(delta)
 	if err := money.Validate(delta, "结算差额"); err != nil {

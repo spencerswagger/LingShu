@@ -103,7 +103,7 @@ jwt:
 security:
   sm4_key: "$SM4_KEY"
 magpie:
-  # 代理侧基址（空 = 对外转发接口停用）；默认由 compose 的 MAGPIE_BASE_URL 提供
+  # 代理侧基址：拓扑源回落地址（TOPOLOGY_SOURCE_URL 未配置时使用）；默认由 compose 的 MAGPIE_BASE_URL 提供
   base_url: "${MAGPIE_BASE_URL:-}"
   # 管理/用量/拓扑用的网关密钥：与 magpie 容器内的那把是同一个值
   admin_key: "${MAGPIE_ADMIN_KEY:-}"

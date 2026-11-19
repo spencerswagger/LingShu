@@ -15,7 +15,6 @@ import {
   type SessionCostConfig,
   type SessionExpirationData,
   type SystemConfigPayload,
-  type UpstreamConfigData,
   requestMagpieConsole,
 } from '@/api/admin'
 import { useAuthStore } from '@/stores/auth'
@@ -106,7 +105,6 @@ async function openMagpieConsole() {
 
 // ===== 上游（V2）tab：只读 =====
 // undefined = 后端还没返回该块（V2 键未上线）；空对象 = 上线了但没配过。
-const upstream = ref<UpstreamConfigData | null | undefined>(undefined)
 
 // ===== 网关 tab（会话过期 + 上游响应头白名单）=====
 const sessionExpiration = ref<SessionExpirationData>({ default_ttl_minutes: 5, context_tiers: [], turn_tiers: [] })
@@ -153,7 +151,7 @@ const gatewayPayload = computed(() => ({
   UpstreamResponseHeaderWhitelist: whitelist.value,
 }))
 
-// 有 sys_configs 字段、可保存的页签（upstream 目前只读）
+// 有 sys_configs 字段、可保存的页签（upstream 页签只读、无配置）
 type ConfigTab = Exclude<TabKey, 'upstream'>
 const isConfigTab = (t: TabKey): t is ConfigTab => t !== 'upstream'
 
@@ -196,7 +194,6 @@ async function load() {
       turn_tiers: se?.turn_tiers || [],
     }
     whitelist.value = res.Data.UpstreamResponseHeaderWhitelist || []
-    upstream.value = res.Data.Upstream ?? null
 
     // 快照必须在状态写完后再取，否则首屏就被判成「有改动」
     snap.value = {
@@ -623,7 +620,7 @@ async function saveFallback() {
             </div>
           </el-tab-pane>
 
-          <!-- ④ 上游（V2）：只读展示三个键 + 订阅池前缀名单（写入白名单待 Core 开放） -->
+          <!-- ④ 上游（V2）：只读说明（逐请求代理链已下线，无运行参数） -->
           <el-tab-pane name="upstream">
             <template #label>
               <span class="tab-label">上游（V2）</span>
@@ -652,55 +649,10 @@ async function saveFallback() {
             </div>
 
             <div class="config-block">
-              <div class="block-title">上游接入</div>
               <div class="block-desc">
-                运行期唯一数据源是这三个键（不读应用配置文件/环境变量）。凭据不落在这里——上游鉴权头值由装配层逐请求注入。
+                V2 逐请求代理链与预扣已随 V3 下线：/v1 由 nginx 直连代理侧网关端口，账本链路由环境变量
+                UPSTREAM_LEDGER_URL 配置，不再有 sys_configs 运行参数可展示。
               </div>
-
-              <el-alert
-                type="info"
-                :closable="false"
-                show-icon
-                title="本页签当前只读"
-                description="写入白名单（upstream.base_url / upstream.timeouts / upstream.degrade.*）还没在后端开放，先只读展示；开放后在此直接编辑。"
-              />
-
-              <template v-if="upstream">
-                <div class="form-row">
-                  <span class="label">网关基址</span>
-                  <code class="ro-value">{{ upstream.base_url || '未配置（未配置时 /v1 保持 410）' }}</code>
-                </div>
-                <div class="form-row">
-                  <span class="label">流式首包上限</span>
-                  <code class="ro-value">{{ upstream.timeouts?.stream_first_byte_ms ?? '—' }} ms</code>
-                </div>
-                <div class="form-row">
-                  <span class="label">流式空闲上限</span>
-                  <code class="ro-value">{{ upstream.timeouts?.stream_idle_ms ?? '—' }} ms</code>
-                </div>
-                <div class="form-row">
-                  <span class="label">降级开关</span>
-                  <span class="ro-tags">
-                    <el-tag :type="upstream.degrade?.passthrough_enabled ? 'success' : 'danger'" size="small" effect="plain">
-                      透传 {{ upstream.degrade?.passthrough_enabled ? '开' : '停' }}
-                    </el-tag>
-                    <el-tag :type="upstream.degrade?.ledger_enabled ? 'success' : 'danger'" size="small" effect="plain">
-                      账本 {{ upstream.degrade?.ledger_enabled ? '开' : '停' }}
-                    </el-tag>
-                    <el-tag :type="upstream.degrade?.sync_enabled ? 'success' : 'danger'" size="small" effect="plain">
-                      同步 {{ upstream.degrade?.sync_enabled ? '开' : '停' }}
-                    </el-tag>
-                  </span>
-                </div>
-                <div class="form-row">
-                  <span class="label">订阅池前缀</span>
-                  <span class="ro-tags">
-                    <el-tag v-for="p in upstream.subscription_prefixes || []" :key="p" size="small" effect="plain">{{ p }}</el-tag>
-                    <span v-if="!(upstream.subscription_prefixes || []).length" class="ro-empty">未配置（回落默认名单，方向是继续拦截）</span>
-                  </span>
-                </div>
-              </template>
-              <el-empty v-else description="V2 上游配置块未返回：后端该块未上线" :image-size="60" />
             </div>
           </el-tab-pane>
 

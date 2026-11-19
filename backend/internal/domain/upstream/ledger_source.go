@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-// LedgerPath 是上游（代理侧）用量查询端点，相对 `upstream.base_url`。
+// LedgerPath 是上游（代理侧）用量查询端点（账本链路端点 UPSTREAM_LEDGER_URL 下的路径）。
 //
 // 契约来源：代理侧已提供的 `GET /v1/magpie/usage/requests`（同 `usagebilling` 分支的
 // `LedgerPath`）。本文件的字段名假设与该分支收敛到同一处，不另立一套。

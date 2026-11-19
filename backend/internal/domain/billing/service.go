@@ -232,14 +232,7 @@ type RecordReq struct {
 	// 否则回落全局 sys_configs（billing.time_config / billing.context_tiers）。
 	TimeConfig   *TimeCoeffConfig
 	ContextTiers []TierRule
-	// PreConsumed 为本次请求已预扣冻结的积分：>0 时实际只增减差额（多退少补），
-	// =0 时（健康探测/直接计费等无预扣场景）按全额扣减。
-	PreConsumed float64
-	Remark      string
-	// Hold 非 nil 时，在**结算事务内**顺带终结对应的预扣登记（通常 status=settled）。
-	// 见 HoldCloseReq 的注释：终结与结算必须同一个事务，否则「钱已结算、hold 未落」
-	// 会被过期扫描当成未结算、把整笔预扣再退一次。
-	Hold *HoldCloseReq
+	Remark       string
 	// ===== V2 归因（由网关在调用完成后传入；未接线时全空 → 落 NULL / none）=====
 	RequestID        string
 	UpstreamProvider string
@@ -253,26 +246,8 @@ type RecordReq struct {
 // CreditService 抽象钱包扣减/差额结算，由 identity 包实现。
 type CreditService interface {
 	Consume(ctx context.Context, userID int64, amount float64, billingID, sessionID, remark string) (before, after float64, err error)
-	Settle(ctx context.Context, userID int64, delta float64, sessionID, remark string) (before, after float64, err error)
-	// Tx 变体：在调用方事务内完成扣减/差额结算与积分流水写入，供 Record 同事务提交。
+	// Tx 变体：在调用方事务内完成扣减与积分流水写入，供 Record 同事务提交。
 	ConsumeTx(ctx context.Context, ex dbx.Execer, userID int64, amount float64, billingID, sessionID, remark string) (before, after float64, err error)
-	SettleTx(ctx context.Context, ex dbx.Execer, userID int64, delta float64, sessionID, remark string) (before, after float64, err error)
-}
-
-// HoldCloser 是「在给定事务内终结预扣登记」的能力（identity.CreditService 实现）。
-//
-// 单独抽出来的理由：billing 不认识 credit_holds 表，也不该认识；它只需要一个能在
-// 自己的结算事务里被调用的终结入口。
-type HoldCloser interface {
-	CloseHoldTx(ctx context.Context, ex dbx.Execer, billingID, status, ledgerEntryID string) (bool, error)
-}
-
-// HoldCloseReq 描述「这次结算要顺带终结哪条预扣登记」。
-type HoldCloseReq struct {
-	BillingID     string // 预扣登记的键（与账单同号）
-	Status        string // settled / refunded
-	LedgerEntryID string
-	Closer        HoldCloser
 }
 
 // Service 计费服务：记账 + 钱包扣减 + 幂等。
@@ -442,9 +417,7 @@ func (s *Service) Record(ctx context.Context, req RecordReq) (*Record, error) {
 	}
 
 	// 3) 钱包扣减 + 账单落库（同一数据库事务：扣款、积分流水、账单要么全部成功要么全部回滚）。
-	// 已预扣 → 只增减实际应付与预扣的差额（多退少补，不产生「结算退回」全额退款）；
-	// 无预扣 → 按全额扣减。
-	// 预扣（PreConsume/Refund）在候选循环之前执行、必须立即生效，不在此事务内。
+	// V2 的预扣差额结算已下线，现存调用方一律按全额扣减。
 	rec, err = s.settleLedger(ctx, rec, req, credits)
 	if err != nil {
 		return nil, err
@@ -486,19 +459,7 @@ func (s *Service) settleTx(ctx context.Context, rec *Record, req RecordReq, cred
 	}
 	defer tx.Rollback() //nolint:errcheck // Commit 成功后 Rollback 是 no-op
 
-	// 预扣终结必须与本次结算同事务、且**先于扣款**（Owl 复审 P1，2026-11-16）：
-	// 旧写法把终结放在事务尾、且丢弃 owned=false，于是「请求活过 15 分钟 → ExpireHolds 已全额退回
-	// 预扣 → 本次结算又按 credits-PreConsumed 减一次预扣」= **重复退款**（实测 credits=12/预扣 10
-	// 时余额多出 10）。先抢终结权后，未被终结（owned=false）说明预扣已经退过，本次必须按全额扣。
-	holdOwned, herr := closeHoldInTx(ctx, tx, req.Hold)
-	if herr != nil {
-		_ = tx.Rollback()
-		slog.ErrorContext(ctx, "billing tx rolled back: hold close failed",
-			"billing_id", rec.BillingID, "user_id", rec.UserID, "err", herr)
-		return nil, herr, true
-	}
-
-	before, after, err := s.consumeInTx(ctx, tx, rec, req, credits, holdOwned)
+	before, after, err := s.consumeInTx(ctx, tx, rec, req, credits)
 	if err != nil {
 		// 扣款失败（40201 余额不足 / 40401 钱包缺失等）：先回滚，再在事务外落 failed 账单
 		// （否则 failed 记录会随回滚一起丢掉），并透传原始错误（网关据此映射 402）。
@@ -541,21 +502,6 @@ func (s *Service) settleTx(ctx context.Context, rec *Record, req RecordReq, cred
 	return rec, nil, true
 }
 
-// closeHoldInTx 在结算事务内终结预扣登记，返回「本次是否真的由我终结」。
-//
-// req 为 nil 或无 Closer 时返回 true：调用方没有预扣登记（如历史 V1 链路），
-// 扣款按「有预扣」的差额口径走（保持既有行为），不因缺 hold 而多扣。
-func closeHoldInTx(ctx context.Context, ex dbx.Execer, req *HoldCloseReq) (bool, error) {
-	if req == nil || req.Closer == nil {
-		return true, nil
-	}
-	owned, err := req.Closer.CloseHoldTx(ctx, ex, req.BillingID, req.Status, req.LedgerEntryID)
-	if err != nil {
-		return false, fmt.Errorf("结算事务内终结预扣失败：%w", err)
-	}
-	return owned, nil
-}
-
 // isDeterministicWriteError 判断账单写入失败是否属于「重投也没用」的确定性错误：
 // 约束冲突（23514 CHECK / 23503 外键 / 23502 NOT NULL / 22xxx 数据类型）与一切非连接类错误。
 //
@@ -585,15 +531,7 @@ func isDeterministicWriteError(err error) bool {
 
 // settlePlain 非事务路径（txdb 未注入）：扣款与落库独立执行，语义与历史行为一致。
 func (s *Service) settlePlain(ctx context.Context, rec *Record, req RecordReq, credits float64) (*Record, error) {
-	// 非事务路径没有原子性可言（仅测试/未装配 txdb 时走到这里）：终结与扣款无法同事务，
-	// 但仍要先终结再扣款 —— 只有先拿到 owned 才能判断「预扣是否已被过期扫描退回」。
-	// 失败不阻断（历史行为），但要留下 ERROR 级痕迹，别让「钱扣了 hold 还 held」静默发生。
-	holdOwned, herr := closeHoldInTx(ctx, nil, req.Hold)
-	if herr != nil {
-		slog.ErrorContext(ctx, "hold close failed on non-transactional path",
-			"billing_id", rec.BillingID, "err", herr)
-	}
-	before, after, err := s.consumeInTx(ctx, nil, rec, req, credits, holdOwned)
+	before, after, err := s.consumeInTx(ctx, nil, rec, req, credits)
 	if err != nil {
 		return s.insertFailedOutOfTx(ctx, rec, err)
 	}
@@ -615,26 +553,12 @@ func (s *Service) settlePlain(ctx context.Context, rec *Record, req RecordReq, c
 	return rec, nil
 }
 
-// consumeInTx 执行钱包扣减/差额结算：ex 为 nil 时走非事务版本（无 Tx 能力的 credit 桩）。
+// consumeInTx 执行钱包扣减：ex 为 nil 时走非事务版本（无 Tx 能力的 credit 桩）。
 // 返回扣减前后的余额。
-// holdOwned 表示「预扣登记是本次结算终结的」（见 closeHoldInTx）。
 //
-// false 的语义是**预扣已经不在 held 状态**：最典型的是请求活超过 15 分钟、
-// ExpireHolds 已把整笔预扣全额退回钱包。此时再按 credits-PreConsumed 结算
-// 等于把已经退过的预扣又减一次（重复退款），所以必须按全额扣。
-func (s *Service) consumeInTx(ctx context.Context, ex dbx.Execer, rec *Record, req RecordReq, credits float64, holdOwned bool) (before, after float64, err error) {
-	if req.PreConsumed > 0 && holdOwned {
-		delta := credits - req.PreConsumed
-		if ex != nil {
-			return s.credit.SettleTx(ctx, ex, req.UserID, delta, req.SessionID, "实际调用差额")
-		}
-		return s.credit.Settle(ctx, req.UserID, delta, req.SessionID, "实际调用差额")
-	}
-	if req.PreConsumed > 0 {
-		// 预扣已被别的路径终结（过期退回）：按全额扣，绝不再退预扣。
-		slog.WarnContext(ctx, "pre-consumed hold already closed before settle, charging full amount",
-			"billing_id", rec.BillingID, "user_id", req.UserID, "pre_consumed", req.PreConsumed, "credits", credits)
-	}
+// V2 的预扣（preauth）差额结算（PreConsumed/Hold 管线）已随逐请求代理链下线：
+// 现存所有调用方（V3 账本轮询、对账补偿、探测计费）都无预扣，一律按全额扣减。
+func (s *Service) consumeInTx(ctx context.Context, ex dbx.Execer, rec *Record, req RecordReq, credits float64) (before, after float64, err error) {
 	if ex != nil {
 		return s.credit.ConsumeTx(ctx, ex, req.UserID, credits, rec.BillingID, req.SessionID, "实际调用差额")
 	}
@@ -727,7 +651,7 @@ func (s *Service) flushRetryOnce(ctx context.Context) {
 	}
 }
 
-// requestCredits 解析一次请求的应付积分与系数（Record 结算与 EstimateCredits 预扣共用同一口径）：
+// requestCredits 解析一次请求的应付积分与系数（Record 结算的唯一计价口径）：
 // 模型级 time_config/context_tiers 非空则优先，否则回落全局；
 // ctxCoeff 按总输入 token（Input + CacheRead）分档——分档语义是「上下文长度」，
 // 三段口径下 Input 只是纯输入，必须加上缓存读才是本次请求实际处理的上下文规模。
@@ -768,21 +692,6 @@ func (s *Service) requestCredits(req RecordReq) (credits, timeCoeff, ctxCoeff fl
 		return 0, 0, 0, 0, err
 	}
 	return credits, timeCoeff, ctxCoeff, r, nil
-}
-
-// EstimateCredits 预扣金额估算：与 Record 使用完全相同的计费公式与系数
-// （时段系数 × 上下文分档 × 全部倍率 ÷ R），以请求预估用量（输入 token 估算 + 输出按需传值）算出冻结额。
-// 不落库、不扣费，供网关三层计费的 pre-consume 阶段使用。
-func (s *Service) EstimateCredits(ctx context.Context, req RecordReq) (float64, error) {
-	credits, _, _, _, err := s.EstimateBreakdown(ctx, req)
-	return credits, err
-}
-
-// EstimateBreakdown 预扣金额估算与系数明细：与 Record/EstimateCredits 同一口径
-// （时段 × 分档 × 全部倍率 ÷ R），额外返回本次估算实际采用的时段系数、分档系数与 R，
-// 供网关在预扣不足落 failed 账单时渲染与正常结算账单一致的多行公式。不落库、不扣费。
-func (s *Service) EstimateBreakdown(ctx context.Context, req RecordReq) (credits, timeCoeff, ctxCoeff float64, r int64, err error) {
-	return s.requestCredits(req)
 }
 
 // isUniqueViolation 判断数据库错误是否为 billing_id 唯一索引冲突。
