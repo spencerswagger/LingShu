@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/team/llmgateway/internal/domain/billing"
 	"github.com/team/llmgateway/internal/pkg/resp"
 )
 
@@ -46,6 +47,8 @@ func (h *Handler) HandlePutCostRates(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	raw, _ := json.Marshal(body)
+	// 写入即归一为 snake 键：读取侧（v3billing poller）只认 snake，PascalCase 落库会让成本静默算 0。
+	raw = billing.NormalizeRatesJSON(raw)
 	up, ok := h.store.(interface {
 		SetCostRates(ctx context.Context, ref string, costJSON []byte) (int64, error)
 	})

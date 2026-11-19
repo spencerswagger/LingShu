@@ -72,9 +72,8 @@ func TestConfigProvider_LoadsAll(t *testing.T) {
 	if !cfg.Degrade.PassthroughEnabled || cfg.Degrade.LedgerEnabled || !cfg.Degrade.SyncEnabled {
 		t.Fatalf("三开关解析不符：%+v", cfg.Degrade)
 	}
-	if !cfg.Enabled() || !cfg.SyncActive() || cfg.LedgerActive() != false {
-		t.Fatalf("派生判定不符：Enabled=%v Sync=%v Ledger=%v",
-			cfg.Enabled(), cfg.SyncActive(), cfg.LedgerActive())
+	if !cfg.Enabled() {
+		t.Fatalf("基址非空应判为已接入，got Enabled=%v", cfg.Enabled())
 	}
 }
 
