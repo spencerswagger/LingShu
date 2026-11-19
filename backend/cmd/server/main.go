@@ -162,6 +162,14 @@ var roleFrom = func(ctx context.Context) (string, bool) {
 	return server.RoleFrom(ctx)
 }
 
+// errText 把 error 渲染成日志字段值（nil → 空串，避免日志里出现 `<nil>`）。
+func errText(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
 func main() {
 	cfgPath := flag.String("config", "config.yaml", "config file path")
 	migrateOnly := flag.Bool("migrate-only", false, "run migrations and exit")
@@ -583,17 +591,40 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 		for _, pb := range problems {
 			logr.Warn("上游配置有问题（已按字段回落默认值）", "problem", pb)
 		}
-		logr.Info("账本同步运行参数",
+		// 注意：base_url 只作参考，**不**再是账本链路可用性判据（见下方 UPSTREAM_LEDGER_URL）。
+		logr.Info("上游运行参数（账本链路可用性见 UPSTREAM_LEDGER_URL，不看 base_url）",
 			"base_url_set", upCfg.BaseURL != "",
 			"stream_first_byte_ms", upCfg.Timeouts.StreamFirstByte.Milliseconds(),
 			"stream_idle_ms", upCfg.Timeouts.StreamIdle.Milliseconds())
 	}
 
+	// 账本链路端点（账本链路可用性的唯一判据）。V3 起转发由 nginx 直连代理侧，
+	// upstream.base_url 不再参与任何链路；账本同步/对账是否可跑只看这个端点是否配置，
+	// 彻底不再依赖 upstream.base_url（旧闸门 SyncActive() 依赖它 → 恒 false → 账本永远空）。
+	// 凭据只从环境变量取（不进配置表）：UPSTREAM_ADMIN_KEY 由 entrypoint 与代理侧 admin_key 对齐。
+	ledgerURL := strings.TrimSpace(os.Getenv("UPSTREAM_LEDGER_URL"))
+	adminKey := strings.TrimSpace(os.Getenv("UPSTREAM_ADMIN_KEY"))
+	adminHeader := strings.TrimSpace(os.Getenv("UPSTREAM_ADMIN_AUTH_HEADER"))
+	// 启动即把「端点 + 是否启用 + 原因」打出来，别让账本链路静默停摆。
+	if ledgerURL == "" {
+		logr.Warn("账本链路未启用：未配置 UPSTREAM_LEDGER_URL（账本同步/对账停摆，不写假账单）",
+			"env", "UPSTREAM_LEDGER_URL")
+	} else {
+		authHeader := adminHeader
+		if authHeader == "" {
+			authHeader = "Authorization"
+		}
+		logr.Info("账本链路已启用",
+			"endpoint", ledgerURL,
+			"admin_key_set", adminKey != "",
+			"auth_header", authHeader)
+	}
+
 	// 降级开关的热生效读取器（TTL 5s）：`ConfigProvider.Load` 的缓存**没有 TTL**，
 	// `Invalidate()` 今天没有生产调用点（`/admin/configs/system` 不写 upstream.* 三键），
 	// 所以每请求直接 Load 拿到的是**启动时冻结的值** —— 运维关掉开关不重启就无效（真机复现过）。
-	// 这层每 TTL 周期至多一次 DB 读，改动 5s 内生效。
-	gate := upstream.NewDegradeGate(upstreamCfg, 5*time.Second)
+	// 这层每 TTL 周期至多一次 DB 读，改动 5s 内生效。账本可用性由 ledgerURL 决定（见 LedgerActive）。
+	gate := upstream.NewDegradeGate(upstreamCfg, ledgerURL, 5*time.Second)
 
 	// 转发降级开关（sys_configs：upstream.degrade.passthrough_enabled）。
 	//
@@ -613,11 +644,9 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 		Counts:   windowStore,
 		States:   windowStore,
 		Streaks:  windowStore,
-		// ⚠️ 必须用 LedgerActive（= 基址已配 && 开关开），不是裸的账本开关字段：
-		// `upstream.base_url` 默认是空串（且没有管理端写入口），只看开关的话每轮都会「成功跑完
-		// 0 笔」并把窗口写成 status=ok / 0 对 0 —— 漏账从此看起来像正常，正是 0023/D4 要防的那种假绿。
-		// 基址没配 ⇒ 账本拉取停摆 ⇒ 窗口落 skipped（不是 blocked，不冒充「已对平」）。
-		// 走 gate（TTL 5s）而不是每请求 Load：后者拿到的是启动时冻结的配置。
+		// ⚠️ 账本可用性必须走 gate.LedgerActive（= 账本端点 UPSTREAM_LEDGER_URL 已配置），
+		// 不再依赖 upstream.base_url（默认空串、无管理端写入口 → 旧判据恒 false → 账本永不拉、
+		// 窗口全 skipped）。端点未配 ⇒ 账本拉取停摆 ⇒ 窗口落 skipped（不是 blocked，不冒充「已对平」）。
 		LedgerEnabled: func() bool { return gate.LedgerActive(context.Background()) },
 		Logger:        logr,
 	})
@@ -629,13 +658,7 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	//  ② 排序不再依赖 occurred_at ASC：cursor feed 按 seq 推变更，按 id upsert 天然幂等；
 	//  ③ 续读游标持久化在 reconcile_windows.detail->>'ledger_cursor'，重启不重放整本账；
 	//  ④ 60s ticker + 空轮告警（`RunOnce` 的 Empty 会打 WARN，不再 0 行 + nil 静默空转）。
-	ledgerURL := strings.TrimSpace(os.Getenv("UPSTREAM_LEDGER_URL"))
-	adminKey := strings.TrimSpace(os.Getenv("UPSTREAM_ADMIN_KEY"))
-	adminHeader := strings.TrimSpace(os.Getenv("UPSTREAM_ADMIN_AUTH_HEADER"))
-	if ledgerURL == "" {
-		logr.Warn("未配置上游账本端点，账本同步轮次不运行（不落 blocked、不产生假告警）",
-			"env", "UPSTREAM_LEDGER_URL")
-	}
+	// 端点/凭据已在上面（gate 创建前）从环境变量读出，此处直接使用。
 	// 代理侧 cost 是 USD；灵枢账本列是积分。换算与订阅录入同源（积分 = 元 × 1e6 ÷ R，
 	// USD 先按 billing.cny_rate 折成人民币），配置缺失时该页报错（blocked），不静默写 0 成本。
 	// 换算按页缓存：CostConverter 是**逐行**调用的，直接读配置会让一页 500 行打 1000 次库。
@@ -676,6 +699,10 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 		// 60s 一跳：与窗口宽度同量级。
 		t := time.NewTicker(time.Minute)
 		defer t.Stop()
+		// 连续空轮告警器：端点已配但连续 5 轮 0 行 → 提示一次「疑似未通/无新行」（带最近 HTTP 状态/错误）。
+		emptyWarner := upstream.NewEmptyRoundWarner(5)
+		// 端点未配置时的「每轮 WARN」计数（可聚合，避免静默停摆）。
+		unconfiguredRounds := 0
 		for range t.C {
 			func() {
 				defer func() {
@@ -683,25 +710,37 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 						logr.Error("账本同步轮次 panic", "panic", rec)
 					}
 				}()
-				// 端点没配 = 不拉取、也不落 blocked（落 blocked 会每分钟制造一次假告警，
-				// 运营会以为「积压没拉完」，实际是没配置）。
-				if ledgerURL == "" {
+				// 账本可用性只看 UPSTREAM_LEDGER_URL（不再看 upstream.base_url / 降级开关）。
+				// 端点没配 = 不拉取（不落 blocked，避免每分钟制造假告警），但**每轮 WARN** 不静默。
+				if ok, reason := gate.LedgerAvailability(); !ok {
+					unconfiguredRounds++
+					logr.Warn("账本链路未配置，本轮跳过（账本同步不运行）",
+						"reason", reason, "env", "UPSTREAM_LEDGER_URL", "round", unconfiguredRounds)
 					return
 				}
-				// 降级开关：sync 关 = 停摆（沿用上期数据），不是失败。
-				if c, _ := upstreamCfg.Load(context.Background()); !c.SyncActive() {
-					return
-				}
+				unconfiguredRounds = 0
 				res, err := rounder.RunOnce(context.Background())
 				switch {
-				case res.Empty && err == nil:
-					// RunOnce 内部已打 WARN（sync.round empty），这里只补一条可聚合的计数口径。
-					logr.Warn("账本同步空轮（计数器）", "sync_round_empty", 1,
-						"window", res.Window.String())
 				case err != nil:
+					// 失败：记错误（下次空轮告警会带上），本轮不推进账本。
+					emptyWarner.Observe(false, res.LastHTTPStatus, err)
 					logr.Warn("账本同步轮次未完成", "err", err,
 						"window", res.Window.String(), "pages", res.Pages,
 						"fetched", res.Fetched, "inserted", res.Inserted)
+				case res.Empty:
+					// 空轮：RunOnce 内部已打 WARN（sync.round empty），这里补可聚合计数，
+					// 并在连续多轮 0 行时提示一次「疑似未通/无新行」。
+					logr.Warn("账本同步空轮（计数器）", "sync_round_empty", 1,
+						"streak", emptyWarner.Streak()+1,
+						"window", res.Window.String())
+					if emptyWarner.Observe(true, res.LastHTTPStatus, nil) {
+						logr.Warn("账本疑似未通/无新行（端点已配但连续多轮 0 行）",
+							"streak", emptyWarner.Streak(),
+							"last_http_status", emptyWarner.LastStatus(),
+							"last_err", errText(emptyWarner.LastError()))
+					}
+				default:
+					emptyWarner.Observe(false, res.LastHTTPStatus, nil)
 				}
 			}()
 		}

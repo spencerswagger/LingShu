@@ -132,17 +132,16 @@ func DefaultRuntimeConfig() RuntimeConfig {
 	}
 }
 
-// Enabled 表示基址已配置（未配置时同步不启动，避免对着空地址狂重试）。
+// Enabled 表示基址已配置（未配置时模型镜像同步不启动，避免对着空地址狂重试）。
+// 注意：它**不**参与账本链路可用性判定——账本链路只看 `DegradeGate.LedgerActive`（env 端点）。
 func (c RuntimeConfig) Enabled() bool { return strings.TrimSpace(c.BaseURL) != "" }
 
-// SyncActive 表示「基址已配置且同步开关未关」——同步轮的闸门。
-func (c RuntimeConfig) SyncActive() bool { return c.Enabled() && c.Degrade.SyncEnabled }
-
-// LedgerActive 表示账本拉取可用（基址 + 账本开关）。
-func (c RuntimeConfig) LedgerActive() bool { return c.Enabled() && c.Degrade.LedgerEnabled }
-
-// PassthroughActive 表示转发可用（基址 + 转发开关）。
-func (c RuntimeConfig) PassthroughActive() bool { return c.Enabled() && c.Degrade.PassthroughEnabled }
+// 注：账本链路可用性/转发可用性**不再**由 RuntimeConfig 派生：
+//   - 旧版 `LedgerActive` = 基址已配 && 账本开关，base_url 默认空串且无管理端写入口 → 恒 false
+//     → 账本同步恒停摆（P0 缺陷）。V3 起账本可用性只看 env `UPSTREAM_LEDGER_URL`，统一收敛到
+//     `DegradeGate.LedgerActive`（见文末）。旧 `SyncActive()`（= 基址已配 && sync 开）已删除，
+//     不再有任何 base_url 判据参与同步轮/对账闸门。
+//   - 转发可用性不该看 base_url（那是账本基址），统一由 `DegradeGate.Passthrough` 只看开关。
 
 // ConfigSource 是 sys_configs 单键读取能力（billing.SqlStore 的 GetConfig 满足）。
 type ConfigSource interface {
@@ -500,9 +499,13 @@ func parseInt64(s string) (int64, error) {
 // 注意：这不是「把配置做成可热更」的完整方案（那要接写钩子）；它只保证
 // **开关这类安全相关的值不会永远停在启动值**。
 type DegradeGate struct {
-	p   *ConfigProvider
-	ttl time.Duration
-	now func() time.Time
+	p *ConfigProvider
+	// ledgerURL 是账本链路端点（env `UPSTREAM_LEDGER_URL`），是账本链路**唯一**可用性判据。
+	// V3 起转发由 nginx 直连代理侧，`upstream.base_url` 不再参与任何链路；账本拉取也不再依赖它
+	// （也不再依赖 base_url 时代的降级开关）。空 = 未配置 = 不拉取（装配层每轮 WARN，不冒充成功）。
+	ledgerURL string
+	ttl       time.Duration
+	now       func() time.Time
 
 	mu     sync.Mutex
 	at     time.Time
@@ -510,9 +513,12 @@ type DegradeGate struct {
 	cfg    RuntimeConfig
 }
 
-// NewDegradeGate 创建读取器；ttl <= 0 时每次调用都重新读（测试与「宁可多读」的场景）。
-func NewDegradeGate(p *ConfigProvider, ttl time.Duration) *DegradeGate {
-	return &DegradeGate{p: p, ttl: ttl, now: time.Now}
+// NewDegradeGate 创建读取器。
+//
+//   - ledgerURL 是账本端点（env `UPSTREAM_LEDGER_URL`），账本链路是否可跑只看它；
+//   - ttl 是转发开关的缓存 TTL；ttl <= 0 时每次调用都重新读配置（测试与「宁可多读」的场景）。
+func NewDegradeGate(p *ConfigProvider, ledgerURL string, ttl time.Duration) *DegradeGate {
+	return &DegradeGate{p: p, ledgerURL: strings.TrimSpace(ledgerURL), ttl: ttl, now: time.Now}
 }
 
 // read 返回 TTL 内有效的配置快照。
@@ -541,10 +547,29 @@ func (g *DegradeGate) Passthrough(ctx context.Context) bool {
 	return g.read(ctx).Degrade.PassthroughEnabled
 }
 
-// LedgerActive 报告账本拉取是否可用（基址已配 && 开关开）。
+// LedgerActive 报告账本拉取是否可用 —— **只看账本端点是否配置**（env `UPSTREAM_LEDGER_URL`）。
 //
-// 必须用这个而不是裸 `Degrade.LedgerEnabled`：基址默认空串且没有管理端写入口，
-// 只看开关会让每轮「成功跑完 0 笔」并把窗口写成 ok / 0 对 0 —— 漏账看起来像正常。
-func (g *DegradeGate) LedgerActive(ctx context.Context) bool {
-	return g.read(ctx).LedgerActive()
+// 为什么不再看 upstream.base_url / 降级开关（关键修复）：
+//   - V3 起转发已由 nginx 直连代理侧，base_url 不参与任何链路；
+//   - 旧同步轮闸门 `SyncActive()` = base_url 已配 && sync 开；base_url 默认空串（seeding 播种 ""）
+//     且没有管理端写入口 → 闸门恒 false → 每 60s 静默 return → ledger_entries 永远空 →
+//     v3billing.Poller 无行可结算 → 账单不出、对账窗口 skipped；
+//   - 可用性判据统一收敛到本方法（同步轮 / 对账 LedgerEnabled 都用它）：
+//     端点配了就拉，没配就停（装配层每轮 WARN，不冒充成功）。
+//
+// 账本端点来自环境变量（非 sys_configs），是静态值，不需要读库 / TTL。
+func (g *DegradeGate) LedgerActive(_ context.Context) bool {
+	ok, _ := g.LedgerAvailability()
+	return ok
+}
+
+// LedgerAvailability 返回账本链路是否可跑与不可跑的原因（装配层据此决定是否打 WARN）。
+//
+// ok=false 且 reason 非空 ⇒ 本轮跳过并打 WARN，**绝不冒充成功**（不落 blocked、不写假账单）。
+// LedgerActive 与它同源，保证「同步轮闸门」与「对账 LedgerEnabled」判定一致。
+func (g *DegradeGate) LedgerAvailability() (ok bool, reason string) {
+	if g == nil || strings.TrimSpace(g.ledgerURL) == "" {
+		return false, "未配置 UPSTREAM_LEDGER_URL（账本同步/对账停摆，不写假账单）"
+	}
+	return true, ""
 }

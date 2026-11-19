@@ -67,6 +67,9 @@ type FeedPage struct {
 	HasMore    bool
 	// Skipped 是本页因缺幂等键/时间或 handed_on 而跳过的行数（可观测，不静默）。
 	Skipped int
+	// StatusCode 是本页对应上游 HTTP 状态（正常 2xx；伪源/内存源可留 0）。
+	// 用途：连续空轮告警要能给出「最近一次 HTTP 状态」——200 空页 vs 连接层面的问题能区分开。
+	StatusCode int
 }
 
 // LedgerFeed 是「按游标读变更」的账本源（代理侧 cursor feed 的实现）。
@@ -192,6 +195,7 @@ func (s *MagpieLedgerSource) FetchFeed(ctx context.Context, cursor string, limit
 	if err != nil {
 		return FeedPage{}, err
 	}
+	page.StatusCode = resp.StatusCode
 	return page, nil
 }
 
