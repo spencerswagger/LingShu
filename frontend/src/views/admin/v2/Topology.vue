@@ -1,9 +1,13 @@
 <script setup lang="ts">
 // 拓扑（V3 只读）。唯一可写：对外模型「售价」、对内模型「成本价」。
 import { computed, onMounted, reactive, ref } from 'vue'
-import { ElMessage } from 'element-plus'
-import { getTopology, getGatewayView, syncTopology, type InternalModelView, type GatewayView } from '@/api/v2'
-import { listExternalModels, updateExternalModel, createExternalModel, updateInternalCostRates, type ExternalModel } from '@/api/admin'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { getTopology, getGatewayView, syncTopology, type InternalModelView, type GatewayView, type GwGroup } from '@/api/v2'
+import {
+  listExternalModels, updateExternalModel, createExternalModel, updateInternalCostRates,
+  listBillings, rebillUnpriced, type ExternalModel, type AdminBillingItem, type RebillResult,
+} from '@/api/admin'
+import type { ApiError } from '@/api/http'
 import { mockTopology } from '@/mock/topology'
 import { useV2Load } from '@/composables/useV2Load'
 import { fmtDateTime } from '@/utils/format'
@@ -65,6 +69,8 @@ const costName = ref('')
 
 async function openNode(s: Sel) {
   sel.value = s; drawer.value = true
+  // 换节点先清补收状态，别把上一组的结果/报错带过来
+  unpricedCount.value = 0; rebillDone.value = null; rebillError.value = ''; checkToken++
   if (s.kind === 'group') {
     await ensureExternals()
     const m = externals.value.find((x) => (x.BoundInternalRef || '') === s.ref)
@@ -115,8 +121,119 @@ async function savePrice() {
       } as never)
     }
     ElMessage.success('售价已保存')
-    await ensureExternals(true); drawer.value = false
+    await ensureExternals(true)
+    // 保存成功 → 检测该组历史 unpriced 账单：有则**留在抽屉里**引导补收，没有才按原行为关掉
+    // （spencer 拍板的 B 方案交互顺序：先保存售价，再问要不要补收历史账）
+    const n = await checkUnpricedAfterSave()
+    if (n === 0) drawer.value = false
   } catch (e) { ElMessage.error('保存失败：' + (e instanceof Error ? e.message : String(e))) } finally { saving.value = false }
+}
+
+// ===== unpriced 账单补收 =====
+//
+// 检测方式（不改后端，全部用现成接口）：GET /admin/billings?Status=unpriced&Model=<组名形态>&Group=0
+// 取 Total。两处口径缺口如实接受（补收接口按同一套候选链匹配，前端多检测只是提示数偏宽，
+// 实际补收条数以返回的 Rebilled 为准）：
+//   1. Model 是 external_model_name/auto_model_name 精确匹配，而补收扫描还要匹配组快照
+//      display_name ↔ ref 双向 —— 快照缺失时前端数不到，补收却能算到；
+//   2. 已补收的行 status 仍是 unpriced（原行只追加 error_message 标记）→ Size=200 拉一页
+//      用行内 ErrorMessage 是否含「已补收:」剔除，超过 200 条不再往下翻（手动触发场景可接受）。
+const unpricedCount = ref(0)
+const unpricedChecking = ref(false)
+let checkToken = 0 // 组切换竞态守卫：慢响应回来时别覆盖新组的检测结果
+
+// groupNameForms 派生该组可能的全部名字形态（对齐后端 groupRefForms 的保守近似）。
+// groupNames 拿不到时退回 ref 与去前缀组 id 两档（ref/id 与 auto slug 归一仍是主命中档）。
+function groupNameForms(g: GwGroup): string[] {
+  const out: string[] = []
+  const add = (v: string) => { if (v && !out.includes(v)) out.push(v) }
+  add(g.ref)
+  add(g.ref.replace(/^group\//, ''))
+  const m = /^auto\/(.+)$/.exec(g.ref)
+  if (m) {
+    add('group/auto-' + m[1])
+    // magpie slug 近似：小写，[a-z0-9.-] 之外的字符替换为 '-'（与后端 groupSlug 同规则）
+    add('group/auto-' + m[1].toLowerCase().replace(/[^a-z0-9.-]/g, '-'))
+    add(m[1])
+  }
+  add(g.name)
+  add(g.id)
+  return out
+}
+
+async function countUnpricedFor(refStr: string): Promise<number> {
+  const g = gw.value?.groups.find((x) => x.ref === refStr)
+  const forms = g ? groupNameForms(g) : [refStr, refStr.replace(/^group\//, '')]
+  // 同一行会在多个名字形态下重复出现（ref / 组 id / display_name 指向同一批账单），按 BillingID 去重
+  const seen = new Set<string>()
+  let n = 0
+  for (const name of forms) {
+    const res = await listBillings({ Status: 'unpriced', Model: name, Page: 1, Size: 200, Group: 0 }, '/admin')
+    const rows: AdminBillingItem[] = res.Data?.List || []
+    for (const r of rows) {
+      if (seen.has(r.BillingID)) continue
+      seen.add(r.BillingID)
+      // Total 含已补收行（补收不改 status，只在 ErrorMessage 追加标记），必须逐行剔除
+      if ((r.ErrorMessage || '').includes('已补收:')) continue
+      n++
+    }
+    if (rows.length >= 200) break // 该形态已超一页，手动触发场景不再深翻
+  }
+  return n
+}
+
+async function checkUnpricedAfterSave(): Promise<number> {
+  const refStr = sel.value?.ref || ''
+  if (!refStr) return 0
+  unpricedCount.value = 0
+  rebillDone.value = null // 新检测周期作废上一轮结果/报错（同一抽屉里连续保存的场景）
+  rebillError.value = ''
+  unpricedChecking.value = true
+  const token = ++checkToken
+  try {
+    const n = await countUnpricedFor(refStr)
+    if (token === checkToken && sel.value?.ref === refStr) unpricedCount.value = n
+    return unpricedCount.value
+  } catch { unpricedCount.value = 0; return 0 } finally {
+    if (token === checkToken) unpricedChecking.value = false
+  }
+}
+
+const rebilling = ref(false)
+// 补收成功后的展示数据（条数/金额/新单号，全部来自后端返回）
+const rebillDone = ref<RebillResult | null>(null)
+// 后端拒绝原因（Message 中文文案 + Reason 机器键，两者都展示）
+const rebillError = ref('')
+
+const REBILL_REASON_TEXT: Record<string, string> = {
+  rebill_group_unpriced: '该组当前没有可用的售价口径，请先绑定售价后再补收',
+  rebill_row_unresolvable: '部分账单按当前配置仍解析不到售价，未能全部补收',
+}
+
+async function runRebill() {
+  if (!sel.value || rebilling.value) return
+  const refStr = sel.value.ref
+  const n = unpricedCount.value
+  try {
+    await ElMessageBox.confirm(
+      `将为「${String(sel.value.data.Name || refStr)}」按当前售价补开 ${n} 张新账单并从对应用户余额扣款，原有 unpriced 账单保持不变。是否继续？`,
+      '按当前售价补收',
+      { confirmButtonText: '确认补收', cancelButtonText: '取消', type: 'warning' },
+    )
+  } catch { return } // 用户取消
+  rebilling.value = true
+  rebillDone.value = null
+  rebillError.value = ''
+  try {
+    const res = await rebillUnpriced(refStr)
+    rebillDone.value = res.Data
+    unpricedCount.value = 0
+    ElMessage.success(`补收完成：${res.Data?.Rebilled ?? 0} 条`)
+  } catch (e) {
+    const err = e as ApiError
+    const byReason = err.reason ? REBILL_REASON_TEXT[err.reason] : ''
+    rebillError.value = byReason ? `${byReason}（${err.message}）` : (err.message || '补收失败')
+  } finally { rebilling.value = false }
 }
 
 // models.dev 参考价套用到售价表单（只覆盖目录给出的价段，其余保留原值）
@@ -137,6 +254,8 @@ async function saveCost() {
 }
 
 const lastSync = computed(() => (data.value?.SyncedAt ? fmtDateTime(data.value.SyncedAt) : '—'))
+// 抽屉宽度：窄屏占满（560px 固定宽会横向溢出 390px 视口），桌面固定 560px
+const drawerSize = typeof window !== 'undefined' && window.innerWidth < 640 ? '100%' : '560px'
 const selKindLabel = computed(() => {
   const m: Record<string, string> = { account: '账号', provider: '供应商', model: '对内模型', group: '路由组（售价）' }
   return m[sel.value?.kind || ''] || '节点'
@@ -161,7 +280,7 @@ const selKindLabel = computed(() => {
       <div v-else class="tp-empty">还没有拓扑数据</div>
     </div>
 
-    <el-drawer v-model="drawer" :title="selKindLabel" size="560px" direction="rtl">
+    <el-drawer v-model="drawer" :title="selKindLabel" :size="drawerSize" direction="rtl">
       <template v-if="sel">
         <div v-if="sel.kind === 'group'">
           <div class="ro-row"><span>路由组</span><b>{{ sel.data.Name }}</b></div>
@@ -171,6 +290,33 @@ const selKindLabel = computed(() => {
             </template>
           </ModelPricing>
           <el-button type="primary" :loading="saving" style="width:100%" @click="savePrice">保存售价</el-button>
+
+          <!-- unpriced 补收（保存成功且检测到 N 条才出现；条数来自账单列表统计，金额/条数结果以后端返回为准） -->
+          <div v-if="unpricedChecking" class="rebill">
+            <span class="rebill-hint">正在检测历史未定价账单…</span>
+          </div>
+          <div v-else-if="rebillDone" class="rebill">
+            <div class="rebill-title">✓ 补收完成</div>
+            <div class="rebill-row"><span>补收条数</span><b>{{ rebillDone.Rebilled }}</b></div>
+            <div class="rebill-row"><span>金额合计</span><b>{{ rebillDone.TotalCredits }} 积分</b></div>
+            <div v-if="rebillDone.AlreadyMarked > 0" class="rebill-row"><span>此前已补收（跳过）</span><b>{{ rebillDone.AlreadyMarked }} 条</b></div>
+            <div class="rebill-ids">
+              <span>新账单</span>
+              <code v-for="id in rebillDone.NewBillingIDs" :key="id">{{ id }}</code>
+              <span v-if="!rebillDone.NewBillingIDs?.length" class="rebill-none">无（可能全部已被补收过）</span>
+            </div>
+          </div>
+          <div v-else-if="rebillError" class="rebill">
+            <div class="rebill-title rebill-fail">补收失败</div>
+            <p class="rebill-note">{{ rebillError }}</p>
+          </div>
+          <div v-else-if="unpricedCount > 0" class="rebill">
+            <div class="rebill-title">检测到 {{ unpricedCount }} 条未定价账单</div>
+            <p class="rebill-note">按当前售价为这批历史账单补开新账单，将从对应用户余额扣款；原有账单保持不变。</p>
+            <el-button type="warning" :loading="rebilling" style="width:100%" @click="runRebill">
+              检测到 {{ unpricedCount }} 条未定价账单，按当前售价补收？
+            </el-button>
+          </div>
         </div>
         <div v-else-if="sel.kind === 'model' || sel.kind === 'group'">
           <div class="ro-row"><span>对内模型</span><b>{{ costName }}</b></div>
@@ -194,7 +340,8 @@ const selKindLabel = computed(() => {
 
 <style scoped>
 .tp { display: flex; flex-direction: column; height: calc(100vh - 92px); }
-.bar { display: flex; align-items: center; gap: 10px; padding: 9px 14px; border: 1px solid var(--line); border-radius: 10px; margin-bottom: 10px; font-size: 12px; color: var(--ink-3); }
+.bar { display: flex; align-items: center; gap: 10px; padding: 9px 14px; border: 1px solid var(--line); border-radius: 10px; margin-bottom: 10px; font-size: 12px; color: var(--ink-3); flex-wrap: wrap; min-width: 0; }
+.bar .tip { white-space: normal; }
 .brand { display: flex; align-items: center; gap: 8px; color: var(--ink); font-weight: 600; font-size: 13px; white-space: nowrap; }
 .brand i { width: 20px; height: 20px; border-radius: 6px; border: 1px solid var(--line-2); position: relative; background: linear-gradient(150deg, #18213a, transparent); }
 .brand i:after { content: ''; position: absolute; left: 50%; top: 50%; width: 3px; height: 3px; margin: -1.5px; border-radius: 50%; background: var(--acc-2); box-shadow: 0 0 6px #a78bfaa6; }
@@ -212,4 +359,15 @@ const selKindLabel = computed(() => {
 .sec { font-size: 11px; color: var(--ink-3); margin: 10px 0 6px; letter-spacing: .5px; }
 .rates { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 12px; }
 .rate { display: flex; flex-direction: column; gap: 3px; font-size: 11px; color: var(--ink-3); }
+.rebill { margin-top: 12px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 9px; background: rgba(255, 176, 32, .05); }
+.rebill-title { font-size: 12.5px; font-weight: 600; color: #f3b04a; margin-bottom: 4px; }
+.rebill-title.rebill-fail { color: #f56c6c; }
+.rebill-hint { font-size: 11.5px; color: var(--ink-3); }
+.rebill-note { font-size: 11.5px; color: var(--ink-3); margin: 4px 0 10px; line-height: 1.6; }
+.rebill-row { display: flex; justify-content: space-between; font-size: 12px; padding: 3px 0; }
+.rebill-row span { color: var(--ink-3); }
+.rebill-row b { font-family: ui-monospace, Menlo, monospace; color: var(--ink); }
+.rebill-ids { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; font-size: 10.5px; color: var(--ink-3); align-items: center; }
+.rebill-ids code { font-family: ui-monospace, Menlo, monospace; padding: 1px 6px; border: 1px solid var(--line); border-radius: 5px; color: var(--ink); word-break: break-all; }
+.rebill-none { color: var(--ink-3); }
 </style>
