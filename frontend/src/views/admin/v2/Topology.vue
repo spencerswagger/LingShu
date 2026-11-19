@@ -3,12 +3,13 @@
 // 点节点在右侧抽屉里查看/编辑（对外模型：完整售价、别名、时段系数、上下文阶梯都在这）；
 // 从模型或路由组右侧句柄拖一条线出来 = 新建一个绑定它的对外模型。
 import { computed, onMounted, reactive, ref } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { getTopology, syncTopology, type InternalModelView } from '@/api/v2'
 import {
   listExternalModels,
   updateExternalModel,
   createExternalModel,
+  batchDeleteExternalModels,
   type ExternalModel,
 } from '@/api/admin'
 import { mockTopology } from '@/mock/topology'
@@ -138,6 +139,24 @@ async function bindExisting(payload: { ref: string; externalId: string }) {
   }
 }
 
+async function removeModel() {
+  if (!form.id) return
+  try {
+    await ElMessageBox.confirm(`删除对外模型「${form.name}」？此操作不可撤销。`, '删除确认', { type: 'warning' })
+  } catch {
+    return
+  }
+  try {
+    await batchDeleteExternalModels([form.id])
+    ElMessage.success('已删除')
+    await ensureExternals(true)
+    await load()
+    drawer.value = false
+  } catch (e) {
+    ElMessage.error('删除失败：' + (e instanceof Error ? e.message : String(e)))
+  }
+}
+
 async function save() {
   if (!form.name.trim()) return ElMessage.warning('名称不能为空')
   saving.value = true
@@ -216,9 +235,12 @@ const selKindLabel = computed(() => {
               <StringListEditor v-model="form.aliases" placeholder="每行一个别名，如 gpt-5.2" />
             </el-form-item>
           </el-form>
-          <el-button type="primary" :loading="saving" style="width: 100%" @click="save">
-            {{ form.isNew ? '新建对外模型' : '保存' }}
-          </el-button>
+          <div class="drawer-actions">
+            <el-button type="primary" :loading="saving" @click="save">
+              {{ form.isNew ? '新建对外模型' : '保存' }}
+            </el-button>
+            <el-button v-if="!form.isNew && sel.kind === 'external'" type="danger" plain @click="removeModel">删除</el-button>
+          </div>
         </div>
         <div v-else class="ro">
           <div class="ro-row"><span>名称</span><b>{{ sel.data.Account || sel.data.Ref || sel.ref }}</b></div>
@@ -242,6 +264,8 @@ const selKindLabel = computed(() => {
 .tp-empty, .tp-err { flex: 1; display: flex; align-items: center; justify-content: center; color: var(--ink-3); font-size: 12px; }
 .ro-row { display: flex; justify-content: space-between; padding: 7px 0; border-bottom: 1px solid var(--line); font-size: 12.5px; }
 .ro-row span { color: var(--ink-3); }
+.drawer-actions { display: flex; gap: 8px; }
+.drawer-actions .el-button:first-child { flex: 1; }
 .ro-hint { color: var(--ink-3); font-size: 11px; margin-top: 12px; }
 .sec { font-size: 11px; color: var(--ink-3); margin: 10px 0 6px; letter-spacing: .5px; }
 .rates { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 12px; }
