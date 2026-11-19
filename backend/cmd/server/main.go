@@ -529,7 +529,7 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 				for i := 0; i < 10; i++ {
 					created, skipped, failed, err := tokenSvc.BackfillCallerKeys(context.Background(), 0)
 					if err == nil {
-						logr.Info("V3 存量令牌补建完成", "created", created, "skipped", skipped, "failed", len(failed))
+						logr.Info("V3 存量令牌补建完成", "created", created, "skipped_already_bound", skipped["already-bound"], "skipped_no_cipher", skipped["no-cipher"], "failed", len(failed))
 						if len(failed) == 0 {
 							return
 						}
