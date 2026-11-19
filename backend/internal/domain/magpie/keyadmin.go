@@ -15,11 +15,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
 
@@ -38,7 +36,10 @@ type KeyBinder interface {
 type KeyAdminHandler struct {
 	store    KeyBinder
 	credKey  []byte
-	adminKey string // 代理侧共享 callerKey（一键开通用；未配置则不能自动开通）
+	adminKey string // 兼容保留（auto 不再使用）
+	// secretOf 取令牌明文（identity 注入）；sync 把令牌明文注册为代理侧 callerKey。
+	secretOf func(ctx context.Context, tokenID int64) (string, error)
+	sync     *CallerKeySync
 }
 
 // NewKeyAdminHandler 装配管理端处理器（credKey 为 security.sm4_key）。
@@ -46,42 +47,38 @@ func NewKeyAdminHandler(store KeyBinder, credKey []byte, adminKey string) *KeyAd
 	return &KeyAdminHandler{store: store, credKey: credKey, adminKey: strings.TrimSpace(adminKey)}
 }
 
+// SetAutoSync 注入令牌明文读取与同步器（auto 端点用；不注入则 auto 拒绝）。
+func (h *KeyAdminHandler) SetAutoSync(secretOf func(ctx context.Context, tokenID int64) (string, error), sync *CallerKeySync) {
+	h.secretOf = secretOf
+	h.sync = sync
+}
+
 // HandleAutoPut POST /api/v1/admin/tokens/{id}/magpie-key/auto
-// 一键开通：用系统已配置的代理侧 callerKey（MAGPIE_ADMIN_KEY / 卷里那份）绑定到该令牌。
-// 注意：共享同一把 callerKey 时，代理侧用量会归到同一把 key 上（分组不细分）；
-// 需要按令牌细分用量时，仍应手工在 magpie 建独立 callerKey 再用 PUT 绑定。
+// 一键开通：把**该令牌自己的明文**注册为代理侧 callerKey（名字 ls-token-<id>）。
+// 客户端用令牌直连 /v1，magpie 看到的就是这把有效 callerKey。
+// 历史令牌无密文（取不到明文）时明确提示「轮换后开通」，而不是绑共享 key 造成 401。
 func (h *KeyAdminHandler) HandleAutoPut(w http.ResponseWriter, r *http.Request) {
 	tokenID, ok := h.tokenID(w, r)
 	if !ok {
 		return
 	}
-	if len(h.credKey) == 0 {
-		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "凭据加密密钥未配置")
+	if h.sync == nil || h.secretOf == nil {
+		resp.Err(w, r, http.StatusServiceUnavailable, resp.CodeInternalError, "未装配代理凭据同步（缺页面口令或 SM4）")
 		return
 	}
-	if h.adminKey == "" {
-		resp.Err(w, r, http.StatusConflict, resp.CodeConflict, "系统未配置代理侧 callerKey，请手工在 magpie 建 key 后用 PUT 绑定")
+	plain, err := h.secretOf(r.Context(), tokenID)
+	if err != nil || strings.TrimSpace(plain) == "" {
+		resp.Err(w, r, http.StatusNotFound, resp.CodeNotFound, "该令牌未备份密钥（历史令牌），请轮换令牌后再开通")
 		return
 	}
-	keyName := fmt.Sprintf("ls-token-%d", tokenID)
-	cipher, err := crypto.SM4Encrypt(h.credKey, []byte(h.adminKey))
-	if err != nil {
-		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "凭据加密失败")
+	if err := h.sync.Ensure(r.Context(), tokenID, plain); err != nil {
+		resp.Err(w, r, http.StatusBadGateway, resp.CodeInternalError, "开通失败："+err.Error())
 		return
 	}
-	k, err := h.store.Provision(r.Context(), tokenID, keyName, cipher)
-	if err != nil {
-		if isUniqueKeyName(err) {
-			// 名字被别人占了：换成带时间后缀的唯一名再试一次
-			keyName = fmt.Sprintf("ls-token-%d-%d", tokenID, time.Now().Unix())
-			if k, err = h.store.Provision(r.Context(), tokenID, keyName, cipher); err != nil {
-				resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "保存代理凭据映射失败")
-				return
-			}
-		} else {
-			resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "保存代理凭据映射失败")
-			return
-		}
+	k, err := h.store.ByTokenID(r.Context(), tokenID)
+	if err != nil || k == nil {
+		resp.OK(w, r, keyBindingView{TokenID: tokenID, Bound: true})
+		return
 	}
 	resp.OK(w, r, keyBindingView{TokenID: k.TokenID, KeyName: k.KeyName, State: k.State, Bound: true, HasKeyID: k.KeyID != ""})
 }

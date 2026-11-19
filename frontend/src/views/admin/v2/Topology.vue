@@ -3,7 +3,7 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { getTopology, getGatewayView, syncTopology, type InternalModelView, type GatewayView } from '@/api/v2'
-import { listExternalModels, updateExternalModel, updateInternalCostRates, type ExternalModel } from '@/api/admin'
+import { listExternalModels, updateExternalModel, createExternalModel, updateInternalCostRates, type ExternalModel } from '@/api/admin'
 import { mockTopology } from '@/mock/topology'
 import { useV2Load } from '@/composables/useV2Load'
 import { fmtDateTime } from '@/utils/format'
@@ -43,9 +43,13 @@ async function ensureExternals(force = false) {
     externals.value = raw.Data || raw.data || []
   } catch { externals.value = [] }
 }
-const priceMap = computed(() => {
-  const m: Record<string, { Input?: number; Output?: number }> = {}
-  for (const e of externals.value) m[e.ID] = { Input: Number(e.SaleRates?.Input ?? 0), Output: Number(e.SaleRates?.Output ?? 0) }
+// 组 ref → 售价（外部模型 BoundInternalRef == 组 ref；null = 未定价）
+const groupPrice = computed(() => {
+  const m: Record<string, { In: number; Out: number } | null> = {}
+  for (const g of gw.value?.groups || []) {
+    const e = externals.value.find((x) => (x.BoundInternalRef || '') === g.ref)
+    m[g.ref] = e ? { In: Number(e.SaleRates?.Input ?? 0), Out: Number(e.SaleRates?.Output ?? 0) } : null
+  }
   return m
 })
 
@@ -59,16 +63,16 @@ const costName = ref('')
 
 async function openNode(s: Sel) {
   sel.value = s; drawer.value = true
-  if (s.kind === 'external') {
+  if (s.kind === 'group') {
     await ensureExternals()
-    const m = externals.value.find((x) => x.ID === s.ref)
+    const m = externals.value.find((x) => (x.BoundInternalRef || '') === s.ref)
     const rates = (m?.SaleRates || {}) as Record<string, number>
     Object.assign(pricing, {
       SaleRates: { Input: rates.Input ?? 0, Output: rates.Output ?? 0, CacheRead: rates.CacheRead ?? 0 },
       TimeConfig: m?.TimeConfig ?? null,
       ContextTiers: m?.ContextTiers ?? null,
     })
-  } else if (s.kind === 'model' || s.kind === 'group') {
+  } else if (s.kind === 'model') {
     const ref = String(s.ref || '')
     costName.value = String(s.data?.Name || ref)
     // 成本价读自后端视图的 CostRates（如未下发则显示 0）
@@ -78,20 +82,36 @@ async function openNode(s: Sel) {
 }
 
 async function savePrice() {
-  if (!sel.value || sel.value.kind !== 'external') return
+  if (!sel.value || sel.value.kind !== 'group') return
   saving.value = true
   try {
-    const m = externals.value.find((x) => x.ID === sel.value!.ref)
-    if (!m) throw new Error('找不到对外模型')
-    await updateExternalModel(m.ID, {
+    const m = externals.value.find((x) => (x.BoundInternalRef || '') === sel.value!.ref)
+    if (m) {
+      await updateExternalModel(m.ID, {
       ExternalName: m.ExternalName,
       Description: m.Description || '',
       Enabled: m.Enabled,
       SaleRates: pricing.SaleRates as Record<string, number>,
       TimeConfig: (pricing.TimeConfig as never) ?? null,
       ContextTiers: (pricing.ContextTiers as never) ?? null,
-      Aliases: m.Aliases || [],
-    } as never)
+        Aliases: m.Aliases || [],
+        BoundInternalRef: sel.value.ref,
+        MagpieModel: sel.value.ref,
+      } as never)
+    } else {
+      // 组还没定价：保存即创建一个绑定到该组的外部模型（名称=组名）
+      await createExternalModel({
+        ExternalName: String(sel.value.data.Name || sel.value.ref),
+        Description: '',
+        Enabled: true,
+        SaleRates: pricing.SaleRates as Record<string, number>,
+        TimeConfig: (pricing.TimeConfig as never) ?? null,
+        ContextTiers: (pricing.ContextTiers as never) ?? null,
+        Aliases: [],
+        BoundInternalRef: sel.value.ref,
+        MagpieModel: sel.value.ref,
+      } as never)
+    }
     ElMessage.success('售价已保存')
     await ensureExternals(true); drawer.value = false
   } catch (e) { ElMessage.error('保存失败：' + (e instanceof Error ? e.message : String(e))) } finally { saving.value = false }
@@ -109,7 +129,7 @@ async function saveCost() {
 
 const lastSync = computed(() => (data.value?.SyncedAt ? fmtDateTime(data.value.SyncedAt) : '—'))
 const selKindLabel = computed(() => {
-  const m: Record<string, string> = { account: '账号', provider: '供应商', model: '对内模型', group: '路由组', external: '对外模型' }
+  const m: Record<string, string> = { account: '账号', provider: '供应商', model: '对内模型', group: '路由组（售价）' }
   return m[sel.value?.kind || ''] || '节点'
 })
 </script>
@@ -128,14 +148,14 @@ const selKindLabel = computed(() => {
 
     <div v-if="state === 'error'" class="tp-err">数据没取到，先看错误再刷新。</div>
     <div v-else class="tp-canvas">
-      <TopologyCanvas v-if="data && gw" :view="data" :gw="gw" :prices="priceMap" @select="openNode" />
+      <TopologyCanvas v-if="data && gw" :view="data" :gw="gw" :group-price="groupPrice" @select="openNode" />
       <div v-else class="tp-empty">还没有拓扑数据</div>
     </div>
 
     <el-drawer v-model="drawer" :title="selKindLabel" size="560px" direction="rtl">
       <template v-if="sel">
-        <div v-if="sel.kind === 'external'">
-          <div class="ro-row"><span>对外模型</span><b>{{ sel.data.Name }}</b></div>
+        <div v-if="sel.kind === 'group'">
+          <div class="ro-row"><span>路由组</span><b>{{ sel.data.Name }}</b></div>
           <ModelPricing v-model="pricing" show-rates-key="SaleRates" title="售价" />
           <el-button type="primary" :loading="saving" style="width:100%" @click="savePrice">保存售价</el-button>
         </div>
