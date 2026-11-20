@@ -142,4 +142,26 @@ func TestPG_MigrationAndRollbackDrill(t *testing.T) {
 		"ls-ghost").Scan(&cnt); err != nil || cnt != 0 {
 		t.Fatalf("未知名应零命中：cnt=%d err=%v", cnt, err)
 	}
+
+	// (d) 评审追加 P1 的缝（真库行为锚）：停用行占名 → NameOccupied 必须判占用。
+	// 0019b 的 key_name 是全列 UNIQUE、不排 DISABLED；查询若排除停用行，
+	// 新令牌 Provision 会直接撞 23505（Create 回滚删令牌）。
+	cipher2, err := encryptForTest("secret-pg2")
+	if err != nil {
+		t.Fatalf("sm4：%v", err)
+	}
+	if _, err := target.ExecContext(ctx, `INSERT INTO tokens (id, user_id, token_hash, token_display, display_name, status)
+		VALUES (8, 12, 'hash-pg-8', 'disp-pg-8', '机', 'ACTIVE')`); err != nil {
+		t.Fatalf("seed token 8：%v", err)
+	}
+	if _, err := store.Provision(ctx, 8, "zhangsan-pg", cipher2); err != nil {
+		t.Fatalf("provision 8：%v", err)
+	}
+	if err := store.Disable(ctx, 8); err != nil {
+		t.Fatalf("disable 8：%v", err)
+	}
+	occupied, err := store.NameOccupied(ctx, "zhangsan-pg", 999)
+	if err != nil || !occupied {
+		t.Fatalf("停用行占名必须判占用（否则 Provision 撞 23505）：occupied=%v err=%v", occupied, err)
+	}
 }

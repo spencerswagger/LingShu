@@ -430,6 +430,10 @@ type CallerKeySyncer interface {
 	// Reactivate 与 Ensure 的唯一差别：允许把 DISABLED 行翻回 ACTIVE（显式动作专用）。
 	Reactivate(ctx context.Context, userID int64, t CallerKeyToken, username, secret string) error
 	Remove(ctx context.Context, tokenID int64) error
+	// ProbeName 预演执行态会分配的名字（零写零代理侧动作）：撞名消歧耗尽返回
+	// ErrCallerKeyNameTaken——rename 端点 dry-run 借它探出 Conflict（评审必改：
+	// dry-run 不能只比名不查占用，否则冲突令牌在预览里隐形）。
+	ProbeName(ctx context.Context, userID int64, t CallerKeyToken, username string) (string, error)
 }
 
 // ErrCallerKeyNameTaken callerKey 存储名消歧重试一轮后仍撞名
@@ -520,20 +524,27 @@ func (s *TokenService) Create(ctx context.Context, userID int64, displayName str
 // 返回 created/skipped/failed；历史无密文的令牌计入 skipped（无法恢复明文，只能轮换）。
 // renameCount 是本次实际执行了「旧名→新名」改名的令牌数（改名=代理侧 rename-key 原地改，值不变）。
 // 已是新名的令牌跳过（幂等）；dryRun=true 只做判定与统计，不打代理侧、不改库。
-func (s *TokenService) BackfillCallerKeys(ctx context.Context, limit int, dryRun bool) (created int, renamed int, skipped map[string]int, failed []map[string]any, err error) {
+// BackfillCallerKeys 为存量令牌补建/改名 callerKey（M2 存量回填，幂等可重跑）。
+//
+// dry-run 与执行态同判：dry-run 用 ProbeName 预演分配（零写零代理侧动作），
+// 撞名令牌进 Conflicts 明细（含 TokenID/DisplayName/Reason）——与执行态 failed 的
+// Conflict:true 同源，运维看桶分布的同时能直接看到冲突名单（评审必改：预览与执行
+// 必须同口径，否则「放行后才发现 409」）。
+func (s *TokenService) BackfillCallerKeys(ctx context.Context, limit int, dryRun bool) (created int, renamed int, skipped map[string]int, conflicts []map[string]any, failed []map[string]any, err error) {
 	skipped = map[string]int{}
 	if s.callerKey == nil {
-		return 0, 0, skipped, nil, fmt.Errorf("未装配 callerKey 同步（缺页面口令）")
+		return 0, 0, skipped, nil, nil, fmt.Errorf("未装配 callerKey 同步（缺页面口令）")
 	}
 	if limit <= 0 {
 		limit = 100000
 	}
 	failed = []map[string]any{}
+	conflicts = []map[string]any{}
 	const batch = 50
 	for page := 1; ; page++ {
 		list, total, lerr := s.store.ListTokens(ctx, nil, "", page, batch)
 		if lerr != nil {
-			return created, renamed, skipped, failed, lerr
+			return created, renamed, skipped, conflicts, failed, lerr
 		}
 		if len(list) == 0 {
 			break
@@ -541,8 +552,8 @@ func (s *TokenService) BackfillCallerKeys(ctx context.Context, limit int, dryRun
 		for i := range list {
 			ti := list[i]
 			t := ti.Token
-			if created+renamed+skipped["already-bound"]+skipped["renamed"]+skipped["manual-named"]+skipped["no-cipher"]+skipped["disabled"]+len(failed) >= limit {
-				return created, renamed, skipped, failed, nil
+			if created+renamed+skipped["already-bound"]+skipped["renamed"]+skipped["manual-named"]+skipped["no-cipher"]+skipped["disabled"]+len(failed)+len(conflicts) >= limit {
+				return created, renamed, skipped, conflicts, failed, nil
 			}
 			// 停用映射（令牌停用时 Remove 删过代理 key）：自动回填不碰它，
 			// 单独分桶（评审必改①）；显式恢复走 Toggle 启用（Reactivate）或管理端一键开通。
@@ -579,6 +590,22 @@ func (s *TokenService) BackfillCallerKeys(ctx context.Context, limit int, dryRun
 				default:
 					skipped["manual-named"]++
 				}
+				// 冲突预演（评审必改）：只对「执行会发生动作」的桶探测——
+				// no-binding（将新建）与 qualifies（将改名）走与执行态相同的消歧分配；
+				// already-bound / manual-named 名字已定、不产生新分配，无需探测。
+				if curName == "" || qualifies {
+					if _, perr := s.callerKey.ProbeName(ctx, ti.UserID, CallerKeyToken{ID: t.ID, DisplayName: t.DisplayName}, ti.Username); perr != nil {
+						if errors.Is(perr, ErrCallerKeyNameTaken) {
+							conflicts = append(conflicts, map[string]any{
+								"TokenID": t.ID, "DisplayName": t.DisplayName, "Reason": perr.Error(),
+							})
+						} else if errors.Is(perr, ErrCallerKeyDisabled) {
+							skipped["disabled"]++
+						} else {
+							failed = append(failed, map[string]any{"TokenID": t.ID, "Reason": "probe：" + perr.Error()})
+						}
+					}
+				}
 				continue
 			}
 			// 已是终态名（前轮回填产物或新路径首建）：名字与值都已收敛，跳过不动。
@@ -597,6 +624,9 @@ func (s *TokenService) BackfillCallerKeys(ctx context.Context, limit int, dryRun
 				if errors.Is(err, ErrCallerKeyNameTaken) {
 					// 契约 §1.2：消歧重试一轮仍撞 → 409 挂起人工（响应级冲突由 handler 判）。
 					entry["Conflict"] = true
+					conflicts = append(conflicts, map[string]any{
+						"TokenID": t.ID, "DisplayName": t.DisplayName, "Reason": err.Error(),
+					})
 				}
 				failed = append(failed, entry)
 				continue
@@ -611,7 +641,7 @@ func (s *TokenService) BackfillCallerKeys(ctx context.Context, limit int, dryRun
 			break
 		}
 	}
-	return created, renamed, skipped, failed, nil
+	return created, renamed, skipped, conflicts, failed, nil
 }
 
 // SetCallerKeyNameOf 注入「该令牌当前映射的 callerKey 名」（回填 skip 判定用；空串=无映射）。
@@ -979,6 +1009,7 @@ func (h *TokenHandler) HandleAdminCreate(w http.ResponseWriter, r *http.Request)
 	}
 	plain, err := h.svc.Create(r.Context(), req.UserID, req.DisplayName, req.TagID, req.ExpiresAt)
 	if err != nil {
+		// 撞名（ErrCallerKeyNameTaken）在 writeServiceErr 单点映射 409（Gate 遗留②）。
 		writeServiceErr(w, r, err)
 		return
 	}
@@ -1008,20 +1039,30 @@ func (h *TokenHandler) HandleAdminBackfillMagpieKeys(w http.ResponseWriter, r *h
 	if req.DryRun != nil {
 		dryRun = *req.DryRun
 	}
-	created, renamed, skipped, failed, err := h.svc.BackfillCallerKeys(r.Context(), 0, dryRun)
+	created, renamed, skipped, conflicts, failed, err := h.svc.BackfillCallerKeys(r.Context(), 0, dryRun)
 	if err != nil {
 		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, err.Error())
 		return
 	}
+	// 响应 payload 单一来源：OK 与 409 同构（评审必改：409 必须带全量明细，
+	// 「见 Failed 明细」不再是文案——失败/冲突令牌号就在响应体里）。
+	payload := map[string]any{
+		"Created": created, "Renamed": renamed, "Skipped": skipped,
+		"Conflicts": conflicts, "Failed": failed, "DryRun": dryRun,
+	}
 	for _, f := range failed {
 		if c, _ := f["Conflict"].(bool); c {
-			// 有令牌撞名即响应级 409：其余令牌的结果照常带回（Failed 明细）。
-			resp.Err(w, r, http.StatusConflict, resp.CodeConflict,
-				"存在 callerKey 名字消歧后仍撞名的令牌，请人工处理（见 Failed 明细）")
+			// 有令牌撞名即响应级 409：其余令牌的结果照常带回（data 全量）。
+			resp.ErrReason(w, r, http.StatusConflict, resp.CodeConflict, "caller_key_name_conflict",
+				"存在 callerKey 名字消歧后仍撞名的令牌，请人工处理（明细见 data.Conflicts / data.Failed）", payload)
 			return
 		}
 	}
-	resp.OK(w, r, map[string]any{"Created": created, "Renamed": renamed, "Skipped": skipped, "Failed": failed, "DryRun": dryRun})
+	if len(conflicts) > 0 && dryRun {
+		// dry-run 探出冲突：不 409（预览不是动作），但 Conflicts 明细必须可见。
+		payload["Message"] = "dry-run 预览探出撞名令牌，执行前请先人工处理（明细见 data.Conflicts）"
+	}
+	resp.OK(w, r, payload)
 }
 
 // HandleAdminBatchDelete POST /api/v1/admin/tokens/batch-delete 批量删除令牌。
@@ -1103,6 +1144,7 @@ func (h *TokenHandler) HandleDevCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	plain, err := h.svc.Create(r.Context(), userID, req.DisplayName, req.TagID, req.ExpiresAt)
 	if err != nil {
+		// 撞名（ErrCallerKeyNameTaken）在 writeServiceErr 单点映射 409（Gate 遗留②）。
 		writeServiceErr(w, r, err)
 		return
 	}

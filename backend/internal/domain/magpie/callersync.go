@@ -11,8 +11,10 @@ package magpie
 // 本地 magpie_keys 原行改 key_name 并把旧名存进 legacy_key_name（结算反查兜底）。
 //
 // 改名资格（不许凭名字猜测/样本特判）：仅当当前名 == 历史自动名格式
-// ls-token-<tokenID>（旧代码唯一生成点）时才自动改名；
-// 其它名字一律视为运维手工绑定，保持不动（skip 口径在 identity 回填侧）。
+// ls-token-<tokenID>（旧代码唯一生成点）时才自动改名；其它名字一律视为运维
+// 手工绑定——**名字保持不动**，但执行态 Ensure 仍会把代理侧同名 key 的值收敛
+// 为该令牌当前明文（值对齐，改名资格≠零动作）。是否连值轮换也跳过属口径
+// 拍板项（见 PR/任务书），拍板前 dry-run 报 manual-named、执行照常值对齐。
 import (
 	"context"
 	"errors"
@@ -225,6 +227,24 @@ func (c *CallerKeySync) Reactivate(ctx context.Context, userID int64, t TokenRef
 	}
 	// 行已 ACTIVE（或本就未停用）：走常规收敛（改名/对齐/终态快检）。
 	return c.Ensure(ctx, userID, t, username, secret)
+}
+
+// ProbeName 预演「该令牌此刻执行 Ensure 会分到什么名」：终态名（手工绑定/已分配）原样返回；
+// 无映射或旧自动名则跑与 Ensure 相同的消歧分配。撞名消歧耗尽 → ErrCallerKeyNameTaken
+// （identity 哨兵）。零写零代理侧动作（只读本地行 + 名字占用查询）——rename 端点
+// dry-run 探 Conflict 用；dry-run 因此能给出与执行态一致的冲突预览。
+func (c *CallerKeySync) ProbeName(ctx context.Context, userID int64, t TokenRef, username string) (string, error) {
+	k, lerr := c.keys.ByTokenID(ctx, t.ID)
+	if lerr != nil && !errors.Is(lerr, ErrKeyNotProvisioned) {
+		return "", fmt.Errorf("查询 callerKey 映射失败：%w", lerr)
+	}
+	if k != nil && k.State == KeyStateDisabled {
+		return "", ErrKeyDisabled
+	}
+	if k == nil || k.KeyName == LegacyAutoName(t.ID) {
+		return c.EnsureNameUnique(ctx, userID, t.ID, username, t.DisplayName)
+	}
+	return k.KeyName, nil
 }
 
 // RollbackToken 把该令牌的映射按 legacy_key_name 复原旧名（终表 §3.5：三步与正向镜像、可幂等重跑）：

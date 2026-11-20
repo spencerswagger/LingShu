@@ -111,10 +111,11 @@ func TestKeyAdmin_PutStoresCipherOnly(t *testing.T) {
 func TestKeyAdmin_PutValidation(t *testing.T) {
 	h := newKeyAdminWith(&fakeBinder{})
 	cases := map[string]string{
-		"空 KeyName":    `{"KeyName":"  ","CallerKey":"k"}`,
-		"空 CallerKey":  `{"KeyName":"core-k1","CallerKey":" "}`,
-		"坏 JSON":       `{`,
-		"KeyName 过长":   `{"KeyName":"` + strings.Repeat("k", maxKeyNameLen+1) + `","CallerKey":"k"}`,
+		"空 KeyName":   `{"KeyName":"  ","CallerKey":"k"}`,
+		"空 CallerKey": `{"KeyName":"core-k1","CallerKey":" "}`,
+		"坏 JSON":      `{`,
+		"KeyName 过长":  `{"KeyName":"` + strings.Repeat("k", maxKeyNameLen+1) + `","CallerKey":"k"}`,
+		"KeyName 121 个非 ASCII 字符（按字符数拒，不再按字节误拦）": `{"KeyName":"` + strings.Repeat("名", maxKeyNameLen+1) + `","CallerKey":"k"}`,
 		"CallerKey 过长": `{"KeyName":"core-k1","CallerKey":"` + strings.Repeat("c", maxCallerKeyLen+1) + `"}`,
 	}
 	for name, body := range cases {
@@ -123,6 +124,23 @@ func TestKeyAdmin_PutValidation(t *testing.T) {
 		if w.Code != http.StatusBadRequest {
 			t.Fatalf("%s: status=%d body=%s", name, w.Code, w.Body.String())
 		}
+	}
+}
+
+// PUT 长度按字符数（真机 0.1.4454 按 1..120 字符收）：120 个中文字 = 360 字节，
+// 按字节的旧校验会误拒合法名；修后应通过长度校验（进入后续凭据步骤，
+// 用空 CallerKey 在必填校验处精确断言「没被长度拦」）。
+func TestKeyAdmin_PutLenByCharsNotBytes(t *testing.T) {
+	h := newKeyAdminWith(&fakeBinder{})
+	// 120 个中文字 + 空 CallerKey：长度必须放行（被拦则是按字节），
+	// 然后在 CallerKey 必填处 400 —— 失败信息区分「哪一步拦的」。
+	w := httptest.NewRecorder()
+	h.HandlePut(w, keyReq(http.MethodPut, "7", `{"KeyName":"`+strings.Repeat("名", maxKeyNameLen)+`","CallerKey":" "}`))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("120 个中文字应通过长度校验（后续步骤才会失败）：status=%d body=%s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "过长") {
+		t.Fatalf("长度校验不得拦截 120 字符名（按字节误拒回归）：%s", w.Body.String())
 	}
 }
 

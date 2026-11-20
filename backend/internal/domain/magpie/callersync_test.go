@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/team/llmgateway/internal/domain/identity"
 )
 
 // fakeKeyStore 记录全部写入动作（renames / provisions / disables），可注入故障。
@@ -333,6 +335,57 @@ func TestEnsureNameUnique_Exhausted(t *testing.T) {
 	got, err := s.EnsureNameUnique(context.Background(), 12, 7, "zhangsan", "bot")
 	if got != "" || !errors.Is(err, ErrNameUnavailable) {
 		t.Fatalf("期望 ErrNameUnavailable：got=%q err=%v", got, err)
+	}
+}
+
+// TestProbeName_ThreeBranches dry-run 冲突预演的三分支（评审必改：dry-run 探
+// Conflict 的数据源）：终态名原样返回（零消歧）；旧自动名走与 Ensure 相同的消歧
+// 分配；消歧耗尽返回 ErrNameUnavailable（=identity.ErrCallerKeyNameTaken 哨兵同源）。
+func TestProbeName_ThreeBranches(t *testing.T) {
+	s := newSyncForTest(t, mustFakePage(t), newFakeKeyStore())
+	fk := s.keys.(*fakeKeyStore)
+	cipher, err := encryptForTest("secret-p")
+	if err != nil {
+		t.Fatalf("sm4: %v", err)
+	}
+	// 分支①：终态名（手工绑定）→ 原样返回，不参与消歧（名字已固化）。
+	fk.Provision(context.Background(), 9, "ops-key", cipher)
+	got, perr := s.ProbeName(context.Background(), 12, TokenRef{ID: 9, DisplayName: "机密项目"}, "zhangsan")
+	if perr != nil || got != "ops-key" {
+		t.Fatalf("终态名应原样返回：got=%q err=%v", got, perr)
+	}
+	// 分支②：旧自动名 → 消歧分配（基础名空闲 → 基础名）。
+	fk.Provision(context.Background(), 7, "ls-token-7", cipher)
+	got, perr = s.ProbeName(context.Background(), 12, TokenRef{ID: 7, DisplayName: "bot"}, "zhangsan")
+	if perr != nil || got != "zhangsan-bot" {
+		t.Fatalf("旧自动名应走消歧分配：got=%q err=%v", got, perr)
+	}
+	// 分支③：候选占满 → ErrNameUnavailable（与 identity 哨兵同源，dry-run 借此探 Conflict）。
+	// 基础名 = u3-w-329d（用户名无 ASCII → u<uid>；令牌名无 ASCII → w-+4hex(tokenID=4)）。
+	for i := 0; i < maxDisambiguationTries+1; i++ {
+		name := "u3-w-329d"
+		if i > 0 {
+			name = fmt.Sprintf("%s-%d", name, i+1)
+		}
+		fk.occupied[name] = true
+	}
+	got, perr = s.ProbeName(context.Background(), 3, TokenRef{ID: 4, DisplayName: "机密项目"}, "李四")
+	if got != "" || !errors.Is(perr, ErrNameUnavailable) || !errors.Is(perr, identity.ErrCallerKeyNameTaken) {
+		t.Fatalf("耗尽应返回哨兵（identity 同源）：got=%q err=%v", got, perr)
+	}
+}
+
+// TestProbeName_DisabledRejected 停用行预演直接拒绝（自动路径不碰停用行）。
+func TestProbeName_DisabledRejected(t *testing.T) {
+	s := newSyncForTest(t, mustFakePage(t), newFakeKeyStore())
+	fk := s.keys.(*fakeKeyStore)
+	fk.Provision(context.Background(), 7, "ls-token-7", "")
+	if err := fk.Disable(context.Background(), 7); err != nil {
+		t.Fatalf("disable: %v", err)
+	}
+	got, perr := s.ProbeName(context.Background(), 12, TokenRef{ID: 7, DisplayName: "bot"}, "zhangsan")
+	if got != "" || !errors.Is(perr, ErrKeyDisabled) {
+		t.Fatalf("停用行应拒绝：got=%q err=%v", got, perr)
 	}
 }
 

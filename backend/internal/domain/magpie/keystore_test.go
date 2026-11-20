@@ -19,6 +19,42 @@ var (
 	disableStmt   = regexp.MustCompile(`UPDATE magpie_keys SET state = 'DISABLED'`)
 )
 
+// TestKeyStore_NameOccupied_AnchorsSQL 评审追加 P1 的口径锚：NameOccupied 的查询
+// **不得排停用行**（0019b 的 key_name 是全列 UNIQUE、不排 DISABLED；查询若排除
+// 停用行，会出现「判空闲但 Provision 撞 23505」）。核心谓词全文锚定（不引用实现
+// 常量，防同源假绿），并锚定停用行占名即占用（count=1 → true）。
+func TestKeyStore_NameOccupied_AnchorsSQL(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	store := NewKeyStore(db)
+
+	// 全文锚定：谓词逐字一致，任何把 state 过滤加回来的改动都会红
+	//（\s+ 桥接源码换行缩进，不依赖缩进格式）。
+	// 尾部 \$ 行尾锚：任何在 token_id <> $2 之后追加的谓词（如评审缝的
+	// state <> 'DISABLED'）都不再匹配——子串匹配会放过它。
+	nameOccupiedSQL := `SELECT count\(\*\) FROM magpie_keys\s+WHERE \(key_name = \$1 OR legacy_key_name = \$1\) AND token_id <> \$2$`
+	mock.ExpectQuery(nameOccupiedSQL).WithArgs("alice-bot", int64(102)).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(1)))
+	occupied, err := store.NameOccupied(context.Background(), "alice-bot", 102)
+	if err != nil || !occupied {
+		t.Fatalf("占用行（含停用）必须判占用：occupied=%v err=%v", occupied, err)
+	}
+
+	// 排除本令牌：行属于自己 → 空闲。
+	mock.ExpectQuery(nameOccupiedSQL).WithArgs("alice-bot", int64(7)).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(0)))
+	occupied, err = store.NameOccupied(context.Background(), "alice-bot", 7)
+	if err != nil || occupied {
+		t.Fatalf("排除本令牌后应空闲：occupied=%v err=%v", occupied, err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("%v", err)
+	}
+}
+
 func keyColumns() []string {
 	return []string{"id", "token_id", "key_name", "legacy_key_name", "key_id", "key_cipher", "state"}
 }

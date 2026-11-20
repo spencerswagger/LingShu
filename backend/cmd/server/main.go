@@ -586,7 +586,7 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 			if envFlagOn("CALLERKEY_BACKFILL_ON_BOOT") {
 				go func() {
 					for i := 0; i < 10; i++ {
-						created, renamed, skipped, failed, err := tokenSvc.BackfillCallerKeys(context.Background(), 0, false)
+						created, renamed, skipped, conflicts, failed, err := tokenSvc.BackfillCallerKeys(context.Background(), 0, false)
 						if err == nil {
 							logr.Info("V3 存量令牌补建/改名完成",
 								"created", created, "renamed", renamed,
@@ -594,7 +594,15 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 								"skipped_renamed", skipped["renamed"],
 								"skipped_manual_named", skipped["manual-named"],
 								"skipped_disabled", skipped["disabled"],
-								"skipped_no_cipher", skipped["no-cipher"], "failed", len(failed))
+								"skipped_no_cipher", skipped["no-cipher"],
+								"conflicts", len(conflicts), "failed", len(failed))
+							// 撞名令牌（消歧耗尽）属人工事项：日志必须带令牌号
+							//（评审必改：可观测闭环不能只靠响应体，自动轮次无人看响应）。
+							for _, c := range conflicts {
+								logr.Warn("V3 存量补建撞名（挂人工）",
+									"token_id", c["TokenID"], "display_name", c["DisplayName"],
+									"reason", c["Reason"])
+							}
 							if len(failed) == 0 {
 								return
 							}

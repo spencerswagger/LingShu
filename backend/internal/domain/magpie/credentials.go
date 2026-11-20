@@ -140,11 +140,14 @@ func (s *KeyStore) ByTokenID(ctx context.Context, tokenID int64) (*Key, error) {
 // tokenID 传 0 或未绑定的 ID 即查全表语义——占用的行属于「其它令牌」才返回 true）。
 // 名字同时出现在 key_name 与 legacy_key_name 都算占用：消歧要避开的不只是
 // 当前名，还有历史名（否则消歧结果会撞上某令牌的旧名，回滚时无法复原）。
+// 不排停用行（评审追加 P1）：0019b 的 key_name 是全列 UNIQUE、不排 DISABLED——
+// 查询若排除停用行，会出现「判空闲但 Provision 撞 23505」的口径缝
+// （停用令牌占名即占用，消歧尾号 -2 可正常逃逸，探针已验）。
 func (s *KeyStore) NameOccupied(ctx context.Context, keyName string, excludeTokenID int64) (bool, error) {
 	var n int
 	if err := s.db.QueryRowContext(ctx, `
 		SELECT count(*) FROM magpie_keys
-		 WHERE (key_name = $1 OR legacy_key_name = $1) AND token_id <> $2 AND state <> 'DISABLED'`,
+		 WHERE (key_name = $1 OR legacy_key_name = $1) AND token_id <> $2`,
 		keyName, excludeTokenID).Scan(&n); err != nil {
 		return false, fmt.Errorf("query key name occupation: %w", err)
 	}

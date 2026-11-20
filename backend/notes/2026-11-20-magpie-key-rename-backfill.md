@@ -141,3 +141,46 @@ P2-2b：RenameAndActivate 的 legacy 兜底列写入钉死——
   变异（legacy_key_name 写 ''）→ 全文锚定红；还原绿。
 
 P2-3：任务书口径待 spencer 确认，不动代码。
+
+---
+
+## 补记三（评审必改收口，2026-11-20 第 5 提交）
+
+Owl II 第二轮必改（409 无明细/断言假绿）+ 复审追加 P1（NameOccupied 缝）+ Gate 遗留②（创建侧 500）：
+
+- **409 带全量明细（必改）**：rename 端点执行态撞名 → `resp.ErrReason(409, 40901, "caller_key_name_conflict", msg, data)`，
+  data = {Created, Renamed, Skipped, Conflicts, Failed, DryRun} —— 其余令牌的结果照常带回，
+  撞名令牌号在 `data.Failed[].TokenID`（Conflict:true）与 `data.Conflicts[].TokenID`（带 DisplayName/Reason）。
+  原来的 `resp.Err(409, "…（见 Failed 明细）")` 只有 Code/Message/RequestID，文案承诺的明细不在响应里。
+- **dry-run 探出 Conflict（必改）**：`CallerKeySyncer` 新增 `ProbeName`（零写零代理侧动作）——
+  终态名原样返回；无映射/旧自动名跑与 Ensure 相同的消歧分配；耗尽返回 `ErrCallerKeyNameTaken`。
+  dry-run 对「会动作的桶」（no-binding / renamed）逐一预演，冲突进 `Conflicts` 明细（HTTP 200 预览，
+  不 409）；already-bound / manual-named 名字已定不探测。dry-run 与执行态同口径：预览看得见冲突，
+  不再「放行后执行才发现 409」。
+- **NameOccupied 不排停用行（追加 P1，一行）**：0019b 的 key_name 是全列 UNIQUE、不排 DISABLED；
+  查询排除停用行 →「判空闲但 Provision 撞 23505」→ Create 回滚删令牌（真库探针双证）。
+  停用行占名即占用，消歧尾号 -2 可正常逃逸。SQL 全文锚定用例（尾部行尾锚，追加谓词即红）+ 真库行为锚。
+- **创建侧撞名可辨识（Gate 遗留②）**：`writeServiceErr` 单点判定 `ErrCallerKeyNameTaken` →
+  409 + `caller_key_name_conflict`（admin/dev 两个创建端点同走此出口；此前统一 500，调用方看不出
+  「换个令牌名再试」能解）。
+- **断言升级**：`Contains(body, "Failed")`（文案子串，假绿）删除 → 解 JSON 断言
+  `data.Failed[0].TokenID==1 && Conflict==true`、`data.Conflicts[0].TokenID==1`、`Reason=="caller_key_name_conflict"`。
+  变异×3 全过：①NameOccupied 加回 state 过滤 → 锚定用例红；②409 改回无 data → 结构断言红；
+  ③dry-run 去掉探测 → 预览用例红。还原全绿。
+- **启动补建自动轮次的可观测**：goroutine 对 conflicts 逐条 `WARN token_id/display_name/reason`
+  （自动轮次无人看响应体，日志必须带令牌号）。
+- **P3 顺手修**：①keyadmin HandlePut 长度改按字符数（真机 0.1.4454 按 1..120 字符收；按字节会误拒
+  合法的非 ASCII 名——120 个中文字 = 360 字节，用例钉「长度校验不得拦」）；②callersync 头注改为
+  「手工绑定：名字不动、执行态值收敛」与行为一致（原文「保持不动」与 Ensure 值对齐矛盾）；③回填执行用例
+  头注改为「旧自动名与手工名都会进 Ensure」与自身断言（2 次调用）一致。
+- **P3-1 回滚窗口孤儿行（留，理由如下）**：Owl 判「当前取舍自洽」。清空 legacy_key_name 是回滚终态的
+  组成部分——不清空则二次回滚会把已回滚行再次当待回滚处理（向前滚），幂等性破坏；
+  代价是「改名窗口内按新名落账、尚未结算」的账本行在回滚后两段反查双 miss、每轮 WARN 跳过
+  （不炸整轮、可观测）。回滚是显式运维动作（dry-run 先看名单），执行前本就应核对窗口内未结算行；
+  且回滚后账本行若快照的是旧名（改名窗口之前的行）反查直接命中，双 miss 只限改名窗口内的少量新名行。
+  维持现设计：清空 legacy + 双 miss WARN。
+- **P2 口径拍板项（未动，等 spencer）**：手工名令牌 dry-run 报 manual-named（跳过）vs 执行态 Ensure
+  做真机值轮换——代码与测试钉法均未改动；拍板后再统一。
+
+门禁：gofmt / go vet / `go test -race` 36 包 0 FAIL / `go test ./tests/` / vue-tsc 全绿；
+真库（LLMGATEWAY_TEST_PG_DSN 临时库全链迁移）回滚演练 + 停用行占名行为锚 PASS。

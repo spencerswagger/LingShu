@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5/pgconn"
 
@@ -194,8 +195,9 @@ func (h *KeyAdminHandler) HandlePut(w http.ResponseWriter, r *http.Request) {
 	case plain == "":
 		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "CallerKey 不能为空")
 		return
-	case len(keyName) > maxKeyNameLen:
-		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "KeyName 过长")
+	case utf8.RuneCountInString(keyName) > maxKeyNameLen:
+		// 真机按字符数收 1..120（0.1.4454 探针）；按字节拦会误拒合法的非 ASCII 名。
+		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "KeyName 过长（按字符数上限 120）")
 		return
 	case len(plain) > maxCallerKeyLen:
 		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "CallerKey 过长")

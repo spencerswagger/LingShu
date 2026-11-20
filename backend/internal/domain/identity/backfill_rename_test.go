@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"regexp"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -22,12 +21,13 @@ import (
 	"github.com/team/llmgateway/internal/pkg/crypto"
 )
 
-// fakeSyncer 记录 Ensure/Reactivate 调用（回填执行断言），可注入失败。
+// fakeSyncer 记录 Ensure/Reactivate/ProbeName 调用（回填执行断言），可注入失败。
 type fakeSyncer struct {
 	mu             sync.Mutex
 	calls          []string // "uid:tokid:disp:username"（Ensure）/ "R uid:tokid:disp"（Reactivate）
 	fail           map[int64]error
-	EnsureDisabled bool // true 时 Ensure 返回 ErrCallerKeyDisabled（模拟自动路径守卫）
+	probeTaken     map[int64]error // ProbeName 对这些令牌返回注入错误（dry-run 探 Conflict）
+	EnsureDisabled bool            // true 时 Ensure 返回 ErrCallerKeyDisabled（模拟自动路径守卫）
 }
 
 func (f *fakeSyncer) Ensure(_ context.Context, userID int64, tok CallerKeyToken, username, _ string) error {
@@ -44,6 +44,17 @@ func (f *fakeSyncer) Ensure(_ context.Context, userID int64, tok CallerKeyToken,
 }
 
 func (f *fakeSyncer) Remove(context.Context, int64) error { return nil }
+
+// ProbeName dry-run 冲突预演：默认按「令牌名转写」给出拟分配名；
+// probeTaken 里的令牌返回 ErrCallerKeyNameTaken（探出 Conflict 的断言源）。
+func (f *fakeSyncer) ProbeName(_ context.Context, userID int64, tok CallerKeyToken, username string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err, ok := f.probeTaken[tok.ID]; ok {
+		return "", err
+	}
+	return fmt.Sprintf("%d:%d:%s:%s", userID, tok.ID, tok.DisplayName, username), nil
+}
 
 // Reactivate 显式启用路径（Toggle 启用侧）；回填用例里不应被调用（停用行走分桶）。
 func (f *fakeSyncer) Reactivate(_ context.Context, userID int64, tok CallerKeyToken, _ string, _ string) error {
@@ -96,7 +107,7 @@ func newBackfillSvc(t *testing.T, ids []int64, names map[int64]string, secrets m
 
 	svc := NewTokenService(NewTokenStore(db))
 	svc.SetSecretKey([]byte("0123456789abcdef")) // Secret 需要 SM4 密钥解密密文
-	fs := &fakeSyncer{fail: map[int64]error{}}
+	fs := &fakeSyncer{fail: map[int64]error{}, probeTaken: map[int64]error{}}
 	svc.SetCallerKeySyncer(fs)
 	svc.SetCallerKeyNameOf(func(ctx context.Context, tokenID int64) string { return names[tokenID] })
 	svc.SetCallerWantNameOf(func(ctx context.Context, userID, tokenID int64, displayName string) string {
@@ -144,7 +155,7 @@ func newBackfillSvcStates(t *testing.T, ids []int64, names, secrets, states map[
 
 	svc := NewTokenService(NewTokenStore(db))
 	svc.SetSecretKey([]byte("0123456789abcdef"))
-	fs := &fakeSyncer{fail: map[int64]error{}}
+	fs := &fakeSyncer{fail: map[int64]error{}, probeTaken: map[int64]error{}}
 	svc.SetCallerKeySyncer(fs)
 	svc.SetCallerKeyNameOf(func(ctx context.Context, tokenID int64) string { return names[tokenID] })
 	svc.SetCallerKeyStateOf(func(ctx context.Context, tokenID int64) string { return states[tokenID] })
@@ -165,7 +176,7 @@ func TestBackfill_DryRunBuckets(t *testing.T) {
 	secrets := map[int64]string{1: "s1", 2: "s2", 3: "s3"} // 4 无密文
 	svc, mock, fs := newBackfillSvc(t, ids, names, secrets)
 
-	created, renamed, skipped, failed, err := svc.BackfillCallerKeys(context.Background(), 0, true)
+	created, renamed, skipped, conflicts, failed, err := svc.BackfillCallerKeys(context.Background(), 0, true)
 	if err != nil {
 		t.Fatalf("backfill: %v", err)
 	}
@@ -178,20 +189,24 @@ func TestBackfill_DryRunBuckets(t *testing.T) {
 	if skipped["renamed"] != 1 || skipped["already-bound"] != 1 || skipped["manual-named"] != 1 || skipped["no-cipher"] != 1 {
 		t.Fatalf("分桶不符：%v (failed=%v)", skipped, failed)
 	}
+	if len(conflicts) != 0 {
+		t.Fatalf("无注入撞名时 dry-run 不应探出冲突：%v", conflicts)
+	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("%v", err)
 	}
 }
 
-// TestBackfill_ExecuteRenamesLegacyOnly 执行态：只有旧自动名被送进 Ensure（改名），
-// 手工名与已是新名的都不动；无密文进 failed。
+// TestBackfill_ExecuteRenamesLegacyOnly 执行态：旧自动名与手工名**都会**进 Ensure
+// （旧自动名 → 消歧改名；手工名 → 名字不动只对齐值），已是新名的提前 skip；
+// 无密文进 failed。
 func TestBackfill_ExecuteRenamesLegacyOnly(t *testing.T) {
 	ids := []int64{1, 2, 3, 4}
 	names := map[int64]string{1: "ls-token-1", 2: "want-u102-t2", 3: "ops-manual-key"}
 	secrets := map[int64]string{1: "s1", 2: "s2", 3: "s3"}
 	svc, mock, fs := newBackfillSvc(t, ids, names, secrets)
 
-	created, renamed, skipped, failed, err := svc.BackfillCallerKeys(context.Background(), 0, false)
+	created, renamed, skipped, conflicts, failed, err := svc.BackfillCallerKeys(context.Background(), 0, false)
 	if err != nil {
 		t.Fatalf("backfill: %v", err)
 	}
@@ -212,6 +227,9 @@ func TestBackfill_ExecuteRenamesLegacyOnly(t *testing.T) {
 	if created != 1 || renamed != 1 {
 		t.Fatalf("created=%d renamed=%d（应各 1：手工名对齐 + 旧名改名）", created, renamed)
 	}
+	if len(conflicts) != 0 {
+		t.Fatalf("执行态无撞名注入不应有冲突：%v", conflicts)
+	}
 	if len(failed) != 1 || failed[0]["TokenID"] != int64(4) {
 		t.Fatalf("无密文应进 failed：%v", failed)
 	}
@@ -225,12 +243,12 @@ func TestBackfill_IdempotentRerun(t *testing.T) {
 	ids := []int64{1}
 	// 第一轮：旧名。
 	svc1, mock1, fs1 := newBackfillSvc(t, ids, map[int64]string{1: "ls-token-1"}, map[int64]string{1: "s1"})
-	c1, r1, sk1, f1, err := svc1.BackfillCallerKeys(context.Background(), 0, false)
+	c1, r1, sk1, cf1, f1, err := svc1.BackfillCallerKeys(context.Background(), 0, false)
 	if err != nil || len(f1) != 0 {
 		t.Fatalf("first: err=%v failed=%v", err, f1)
 	}
-	if c1 != 0 || r1 != 1 || sk1["renamed"] != 0 {
-		t.Fatalf("first: created=%d renamed=%d skipped=%v", c1, r1, sk1)
+	if c1 != 0 || r1 != 1 || sk1["renamed"] != 0 || len(cf1) != 0 {
+		t.Fatalf("first: created=%d renamed=%d skipped=%v conflicts=%v", c1, r1, sk1, cf1)
 	}
 	_ = fs1
 	if err := mock1.ExpectationsWereMet(); err != nil {
@@ -238,12 +256,12 @@ func TestBackfill_IdempotentRerun(t *testing.T) {
 	}
 	// 第二轮：当前名已是新口径（Ensure 已推进）。
 	svc2, mock2, _ := newBackfillSvc(t, ids, map[int64]string{1: "want-u101-t1"}, map[int64]string{1: "s1"})
-	c2, r2, sk2, f2, err := svc2.BackfillCallerKeys(context.Background(), 0, false)
+	c2, r2, sk2, cf2, f2, err := svc2.BackfillCallerKeys(context.Background(), 0, false)
 	if err != nil {
 		t.Fatalf("second: %v", err)
 	}
-	if c2 != 0 || r2 != 0 || sk2["already-bound"] != 1 || len(f2) != 0 {
-		t.Fatalf("second: created=%d renamed=%d skipped=%v failed=%v", c2, r2, sk2, f2)
+	if c2 != 0 || r2 != 0 || sk2["already-bound"] != 1 || len(f2) != 0 || len(cf2) != 0 {
+		t.Fatalf("second: created=%d renamed=%d skipped=%v failed=%v conflicts=%v", c2, r2, sk2, f2, cf2)
 	}
 	if err := mock2.ExpectationsWereMet(); err != nil {
 		t.Fatalf("%v", err)
@@ -321,8 +339,10 @@ func TestRenameHandler_ExecuteByQueryParam(t *testing.T) {
 	}
 }
 
-// TestRenameHandler_Conflict409 消歧重试一轮仍撞 → 409（契约：挂起人工，明细在 Failed）。
-func TestRenameHandler_Conflict409(t *testing.T) {
+// TestRenameHandler_Conflict409Details 消歧重试一轮仍撞 → 409（契约：挂起人工）。
+// 评审必改：断言必须是**响应结构**而非文案子串——data.Failed[].TokenID / Conflict:true、
+// data.Conflicts[].TokenID 都要真实可读（「409 挂人工」的闭环靠响应体给令牌号）。
+func TestRenameHandler_Conflict409Details(t *testing.T) {
 	ids := []int64{1}
 	names := map[int64]string{1: "ls-token-1"}
 	svc, _, fs := newBackfillSvc(t, ids, names, map[int64]string{1: "s1"})
@@ -333,8 +353,81 @@ func TestRenameHandler_Conflict409(t *testing.T) {
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("消歧撞名应 409：%d %s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), "Failed") {
-		t.Fatalf("409 响应应带 Failed 明细：%s", rec.Body.String())
+	var body struct {
+		Code   int    `json:"Code"`
+		Reason string `json:"Reason"`
+		Data   struct {
+			Created   int              `json:"Created"`
+			Renamed   int              `json:"Renamed"`
+			Failed    []map[string]any `json:"Failed"`
+			Conflicts []map[string]any `json:"Conflicts"`
+			DryRun    bool             `json:"DryRun"`
+		} `json:"Data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("409 响应应可解析：%v %s", err, rec.Body.String())
+	}
+	if body.Reason != "caller_key_name_conflict" {
+		t.Fatalf("409 应带机器可读 Reason：%s", rec.Body.String())
+	}
+	if len(body.Data.Failed) != 1 {
+		t.Fatalf("data.Failed 应含撞名令牌：%s", rec.Body.String())
+	}
+	if got, _ := body.Data.Failed[0]["TokenID"].(float64); int64(got) != 1 {
+		t.Fatalf("data.Failed[0].TokenID 应为 1：%s", rec.Body.String())
+	}
+	if c, _ := body.Data.Failed[0]["Conflict"].(bool); !c {
+		t.Fatalf("data.Failed[0].Conflict 应为 true：%s", rec.Body.String())
+	}
+	if len(body.Data.Conflicts) != 1 {
+		t.Fatalf("data.Conflicts 应含撞名令牌明细：%s", rec.Body.String())
+	}
+	if got, _ := body.Data.Conflicts[0]["TokenID"].(float64); int64(got) != 1 {
+		t.Fatalf("data.Conflicts[0].TokenID 应为 1：%s", rec.Body.String())
+	}
+	if body.Data.Conflicts[0]["Reason"] == nil || body.Data.Conflicts[0]["DisplayName"] == nil {
+		t.Fatalf("Conflicts 明细应带 Reason 与 DisplayName：%s", rec.Body.String())
+	}
+	if body.Data.DryRun {
+		t.Fatalf("执行态响应 DryRun 应为 false：%s", rec.Body.String())
+	}
+}
+
+// TestRenameHandler_DryRunProbesConflict dry-run 必须能探出 Conflict 并带明细
+// （评审必改：dry-run 只比名不查占用 → 冲突令牌在预览里隐形，放行后执行才发现 409）。
+// 探测走 ProbeName（零写零代理侧动作），HTTP 200 + data.Conflicts 可见。
+func TestRenameHandler_DryRunProbesConflict(t *testing.T) {
+	ids := []int64{1}
+	names := map[int64]string{1: "ls-token-1"}
+	svc, _, fs := newBackfillSvc(t, ids, names, map[int64]string{1: "s1"})
+	fs.probeTaken[1] = ErrCallerKeyNameTaken // 注入：预演即撞名
+	_, mux := newBackfillHandler(t, svc)
+
+	rec := postRename(t, mux, "/api/v1/admin/tokens/magpie-keys/rename", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("dry-run 预览不执行动作、不应 409：%d %s", rec.Code, rec.Body.String())
+	}
+	if len(fs.calls) != 0 {
+		t.Fatalf("dry-run 不得触发执行动作：%v", fs.calls)
+	}
+	var body struct {
+		Data struct {
+			Skipped   map[string]int   `json:"Skipped"`
+			Conflicts []map[string]any `json:"Conflicts"`
+			DryRun    bool             `json:"DryRun"`
+		} `json:"Data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("解析失败：%v %s", err, rec.Body.String())
+	}
+	if !body.Data.DryRun || body.Data.Skipped["renamed"] != 1 {
+		t.Fatalf("dry-run 预览分桶应保留：%s", rec.Body.String())
+	}
+	if len(body.Data.Conflicts) != 1 {
+		t.Fatalf("dry-run 应探出 Conflict 明细：%s", rec.Body.String())
+	}
+	if got, _ := body.Data.Conflicts[0]["TokenID"].(float64); int64(got) != 1 {
+		t.Fatalf("Conflicts[0].TokenID 应为 1：%s", rec.Body.String())
 	}
 }
 
@@ -365,15 +458,15 @@ func TestBackfill_DisabledBucketSkips(t *testing.T) {
 
 	// dry-run：分桶 + 零执行。
 	svc, mock, fs := newBackfillSvcStates(t, ids, names, secrets, states)
-	created, renamed, skipped, failed, err := svc.BackfillCallerKeys(context.Background(), 0, true)
+	created, renamed, skipped, conflicts, failed, err := svc.BackfillCallerKeys(context.Background(), 0, true)
 	if err != nil {
 		t.Fatalf("dry-run: %v", err)
 	}
 	if created != 0 || renamed != 0 || len(failed) != 0 || len(fs.calls) != 0 {
 		t.Fatalf("dry-run 不得执行/报错：created=%d renamed=%d failed=%v calls=%v", created, renamed, failed, fs.calls)
 	}
-	if skipped["disabled"] != 2 {
-		t.Fatalf("停用行应双双进 disabled 桶：%v", skipped)
+	if skipped["disabled"] != 2 || len(conflicts) != 0 {
+		t.Fatalf("停用行应双双进 disabled 桶：%v conflicts=%v", skipped, conflicts)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("%v", err)
@@ -381,7 +474,7 @@ func TestBackfill_DisabledBucketSkips(t *testing.T) {
 
 	// 执行态：同样分桶跳过、Ensure 零调用、无 failed（不产生重试压力）。
 	svc2, mock2, fs2 := newBackfillSvcStates(t, ids, names, secrets, states)
-	created, renamed, skipped, failed, err = svc2.BackfillCallerKeys(context.Background(), 0, false)
+	created, renamed, skipped, conflicts, failed, err = svc2.BackfillCallerKeys(context.Background(), 0, false)
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -406,12 +499,12 @@ func TestBackfill_DisabledBySentinel(t *testing.T) {
 	// 不注入 state 钩子；Ensure 对停用行返回 ErrCallerKeyDisabled（自动路径守卫）。
 	fs.EnsureDisabled = true
 
-	created, renamed, skipped, failed, err := svc.BackfillCallerKeys(context.Background(), 0, false)
+	created, renamed, skipped, conflicts, failed, err := svc.BackfillCallerKeys(context.Background(), 0, false)
 	if err != nil {
 		t.Fatalf("backfill: %v", err)
 	}
-	if created != 0 || renamed != 0 || len(failed) != 0 {
-		t.Fatalf("哨兵应进 disabled 桶而非 failed：created=%d renamed=%d failed=%v", created, renamed, failed)
+	if created != 0 || renamed != 0 || len(failed) != 0 || len(conflicts) != 0 {
+		t.Fatalf("哨兵应进 disabled 桶而非 failed：created=%d renamed=%d failed=%v conflicts=%v", created, renamed, failed, conflicts)
 	}
 	if skipped["disabled"] != 1 {
 		t.Fatalf("disabled 桶不符：%v", skipped)
@@ -420,4 +513,32 @@ func TestBackfill_DisabledBySentinel(t *testing.T) {
 		t.Fatalf("Ensure 之外的调用不应发生：%v", fs.calls)
 	}
 	_ = mock
+}
+
+// TestWriteServiceErr_CallerKeyConflict409 创建侧撞名对外可辨识（Gate 遗留②）：
+// Create 的回滚包装错误经 writeServiceErr 必须映射 409 + CodeConflict + 机器可读
+// Reason（此前统一 500，调用方看不出「换令牌名重试」能解）。
+func TestWriteServiceErr_CallerKeyConflict409(t *testing.T) {
+	wrapped := fmt.Errorf("令牌已创建但开通代理访问失败（已回滚）：%w", ErrCallerKeyNameTaken)
+	rec := httptest.NewRecorder()
+	writeServiceErr(rec, httptest.NewRequest(http.MethodPost, "/api/v1/admin/tokens", nil), wrapped)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("撞名应 409：status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Code   int    `json:"Code"`
+		Reason string `json:"Reason"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("解析失败：%v %s", err, rec.Body.String())
+	}
+	if body.Code != 40901 || body.Reason != "caller_key_name_conflict" {
+		t.Fatalf("409 应带业务码与 Reason：%s", rec.Body.String())
+	}
+	// 非哨兵错误不受影响（回归锚：普通 wrap 仍 500）。
+	rec2 := httptest.NewRecorder()
+	writeServiceErr(rec2, httptest.NewRequest(http.MethodPost, "/api/v1/admin/tokens", nil), fmt.Errorf("别的错误"))
+	if rec2.Code != http.StatusInternalServerError {
+		t.Fatalf("非撞名错误应保持 500：%d", rec2.Code)
+	}
 }
