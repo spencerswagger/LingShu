@@ -538,3 +538,66 @@ func TestMigrate_0028_0029_UnpricedAndRouteID(t *testing.T) {
 		t.Fatalf("重跑后 unpriced 行数应仍为 1，实际 %d", rows)
 	}
 }
+
+// TestMigrate_0031_V2BillingCatalog 断言 v2 目录对齐四列（models.dev v2，四项定案 2026-11-20）：
+// internal_models.cost_v2 / external_models.sale_v2 / billing_records.price_eval 加列可写可读；
+// 幂等重跑不报错。列值形状由 billing.ParseV2Cost 把关（见 costv2_test），这里只守 schema。
+func TestMigrate_0031_V2BillingCatalog(t *testing.T) {
+	tempDB := openTempDB(t)
+	migDir := filepath.Join(filepath.Dir(mustCallerFile(t)), "migrations")
+	for _, n := range migrationNames(t, migDir) {
+		runMigration(t, tempDB, migDir, n)
+	}
+
+	for _, tc := range []struct{ table, col string }{
+		{"internal_models", "cost_v2"},
+		{"internal_models", "ext_meta"},
+		{"external_models", "sale_v2"},
+		{"billing_records", "price_eval"},
+	} {
+		var nullOK string
+		if err := tempDB.QueryRow(
+			`SELECT is_nullable FROM information_schema.columns
+			  WHERE table_name=$1 AND column_name=$2`, tc.table, tc.col).Scan(&nullOK); err != nil {
+			t.Fatalf("%s.%s 缺列: %v", tc.table, tc.col, err)
+		}
+		if nullOK != "YES" {
+			t.Fatalf("%s.%s 必须可空（纯增列、旧行 NULL=回落旧三段）", tc.table, tc.col)
+		}
+	}
+
+	if _, err := tempDB.Exec(
+		`INSERT INTO users(id, username, password_hash, role) VALUES (1,'u','h','DEVELOPER') ON CONFLICT DO NOTHING`); err != nil {
+		t.Fatalf("插入用户失败: %v", err)
+	}
+	// 列可写可读（v2 形状原文落库、NULL 行照常）。
+	if _, err := tempDB.Exec(
+		`INSERT INTO internal_models(ref, kind, cost_v2, ext_meta)
+		 VALUES ('prov/v2m', 'direct', '{"text":{"input":{"price":1,"cache":{"read":0.1}},"output":{"price":2}}}'::jsonb, '{}'::jsonb)`); err != nil {
+		t.Fatalf("cost_v2 应可写入: %v", err)
+	}
+	if _, err := tempDB.Exec(
+		`INSERT INTO external_models(id, external_name, sale_v2)
+		 VALUES (302, 'ext-v2m', '{"text":{"input":{"price":1,"cache":{"read":0.1}},"output":{"price":2}}}'::jsonb)`); err != nil {
+		t.Fatalf("sale_v2 应可写入: %v", err)
+	}
+	if _, err := tempDB.Exec(
+		`INSERT INTO billing_records(id, billing_id, user_id, pricing_mode, external_model_name, internal_model_id,
+		                            r_value, status, cost_source, price_eval)
+		 VALUES (203, 'bill-v2m-1', 1, 'sale', 'ext-v2m', 'prov/v2m', 10000, 'completed', 'none',
+		         '{"kind":"v2"}'::jsonb)`); err != nil {
+		t.Fatalf("price_eval 应可写入: %v", err)
+	}
+	var n int
+	if err := tempDB.QueryRow(
+		`SELECT count(*) FROM billing_records WHERE price_eval->>'kind'='v2'`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("price_eval 回读不符: n=%d err=%v", n, err)
+	}
+
+	// 幂等重跑。
+	runMigration(t, tempDB, migDir, "0031_v2_billing_catalog_m1.sql")
+	var cnt int
+	if err := tempDB.QueryRow(`SELECT count(*) FROM internal_models WHERE cost_v2 IS NOT NULL`).Scan(&cnt); err != nil || cnt != 1 {
+		t.Fatalf("重跑后 cost_v2 行数应仍为 1: n=%d err=%v", cnt, err)
+	}
+}

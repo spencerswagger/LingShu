@@ -217,9 +217,16 @@ type RecordReq struct {
 	SessionName     string // 会话可读名快照（写入账单时固化，历史可查）
 	CallTime        time.Time
 	Tokens          Usage
-	Rates           Rates // 计费单价（sale 或 cost，由调用方选好模式传入）
+	Rates           Rates // 计费单价（sale 或 cost，由调用方选好模式传入）；v2 计价行=四价的 LegacyView（留痕兼容）
 	CostRates       Rates // cost 模式下用于记录成本积分，可为 nil
-	ErrorMessage    string
+	// V2 / CostV2 是 v2 目录计价输入（models.dev v2 对齐，四项定案 2026-11-20）：
+	// 非空时本单按四段价 × multipliers 连乘 ÷ R 计价，TimeConfig/ContextTiers 不参与
+	// （其时间与上下文条件由 multipliers 吸收）；为空时走旧三段公式（行为逐字节不变）。
+	// Sale 侧 V2.ServiceTier 恒空（售卖层不做 tier 差价，四项定案②）；
+	// Cost 侧预留账本归因位。Rates 字段同时保留（=LegacyView），账单 rates 列渲染兼容。
+	V2           *V2Pricing
+	CostV2       *V2Pricing
+	ErrorMessage string
 	// Status 为空时按 Fail 推导（Fail=true → failed，否则 completed）。
 	// upstream_error 由调用方显式传入（上游 4xx/5xx / 传输失败）。
 	Status string
@@ -391,7 +398,13 @@ func (s *Service) Record(ctx context.Context, req RecordReq) (*Record, error) {
 	if err != nil {
 		return nil, err
 	}
-	rawTotal, err := RawTotal(req.Tokens, req.Rates, timeCoeff, ctxCoeff)
+	// v2 计价行（cost_v2/sale_v2 存在）四段价 × 因子连乘；raw_total 与 credits 同口径。
+	var rawTotal float64
+	if req.V2 != nil {
+		rawTotal, err = RawTotalV2(req.Tokens, req.V2.Prices, req.V2.Eval.FactorFor("text"))
+	} else {
+		rawTotal, err = RawTotal(req.Tokens, req.Rates, timeCoeff, ctxCoeff)
+	}
 	if err != nil {
 		// rates 已在上一步校验过，此处不会触发；防御性返回。
 		return nil, err
@@ -438,7 +451,16 @@ func (s *Service) Record(ctx context.Context, req RecordReq) (*Record, error) {
 	// 只要提供了成本单价就记录成本积分（仅展示/毛利差异，不参与扣减）：
 	// sale 模式 cost_credits 反映真实成本（区别于售价积分的毛利段），
 	// cost 模式与扣减积分一致（按成本计费）。
-	if req.CostRates != nil {
+	// v2 成本口径（四项定案①：四价与 magpie 逐档对齐、写缓存段独立计价、
+	// multipliers 只挂模型层）优先于旧三段 CostRates。
+	switch {
+	case req.CostV2 != nil:
+		req.CostV2.Eval = EvaluateV2(req.CostV2, req.Tokens)
+		req.CostV2.evaluated = true
+		if c, cerr := ComputeCreditsV2(req.Tokens, req.CostV2.Prices, req.CostV2.Eval.FactorFor("text"), r); cerr == nil {
+			rec.CostCredits = c
+		}
+	case req.CostRates != nil:
 		if c, cerr := ComputeCredits(req.Tokens, req.CostRates, timeCoeff, ctxCoeff, r); cerr == nil {
 			rec.CostCredits = c
 		}
@@ -739,6 +761,13 @@ func (s *Service) requestCredits(req RecordReq) (credits, timeCoeff, ctxCoeff fl
 	if err != nil {
 		return 0, 0, 0, 0, err
 	}
+	// v2 计价行（cost_v2/sale_v2 存在）：走四段价 × multipliers 引擎，
+	// 不叠加 time_config/context_tiers（时间与上下文条件由规则键 utc_hours/utc_days/date/context 吸收）。
+	// 返回的 timeCoeff/ctxCoeff 为乘法单位元 1，账单 coefficients 列如实存 1（因子明细在 price_eval）。
+	if req.V2 != nil {
+		credits, timeCoeff, ctxCoeff, err = s.requestCreditsV2(req, r)
+		return credits, timeCoeff, ctxCoeff, r, err
+	}
 	tiers := req.ContextTiers
 	if len(tiers) == 0 {
 		tiers, err = s.cfg.ContextTiers()
@@ -771,6 +800,31 @@ func (s *Service) requestCredits(req RecordReq) (credits, timeCoeff, ctxCoeff fl
 		return 0, 0, 0, 0, err
 	}
 	return credits, timeCoeff, ctxCoeff, r, nil
+}
+
+// requestCreditsV2 v2 计价公式：四段 token×段价之和 × 命中因子连乘 ÷ R（Round5）。
+// 求值时刻 = V2.EvalAt（v3 结算 = 账本 occurred_at；预扣估算 = 传入时刻），一律按 UTC 判定；
+// 求值结果写回 V2.Eval 供 price_eval 留痕与 raw_total 复算。
+// 预扣与结算同口径（EstimateCredits 预扣估算**不含 cache_write 段**：
+// 该段是已发生事实才计价的量，估算时 CacheWrite 恒 0，差额多退少补已有机制兜底）。
+func (s *Service) requestCreditsV2(req RecordReq, r int64) (credits, timeCoeff, ctxCoeff float64, err error) {
+	v2 := req.V2
+	if v2.EvalAt.IsZero() {
+		// 求值时刻是计价输入的一部分（时间条件因子按它判定），零值必须拒绝，
+		// 否则 utc_hours/date 类规则会全部按 0001-01-01 判定（静默漏因子）。
+		return 0, 0, 0, errors.New("v2 计价缺求值时刻 EvalAt")
+	}
+	v2.Eval = EvaluateV2(v2, req.Tokens)
+	v2.evaluated = true
+	credits, err = ComputeCreditsV2(req.Tokens, v2.Prices, v2.Eval.FactorFor("text"), r)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	if err := validateStoredMoney(credits, "计费积分"); err != nil {
+		return 0, 0, 0, err
+	}
+	// v2 路径的 coefficients 列固定 1/1：实际时间与上下文因子在 price_eval 留痕里。
+	return credits, 1, 1, nil
 }
 
 // EstimateCredits 预扣金额估算：与 Record 使用完全相同的计费公式与系数

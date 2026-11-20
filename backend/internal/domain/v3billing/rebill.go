@@ -411,27 +411,16 @@ func (p *Poller) rebillOne(ctx context.Context, r rebillRow, groups []groupNode)
 		UserID:          r.UserID,
 		PricingMode:     "sale",
 		TokenID:         r.TokenID,
-		ExternalModel:   price.externalName,
 		InternalModelID: r.InternalModelID,
 		CallTime:        time.Now(),
 		Tokens:          r.Tokens,
-		Rates:           billing.Rates(price.saleRates),
 		Status:          billing.StatusCompleted,
 		ErrorMessage:    rebillNewRemark + r.BillingID,
 	}
-	// 时段/分档随当前售价走（补收时刻口径）。
-	if len(price.timeRaw) > 0 && string(price.timeRaw) != "null" {
-		var tc billing.TimeCoeffConfig
-		if json.Unmarshal(price.timeRaw, &tc) == nil {
-			req.TimeConfig = &tc
-		}
-	}
-	if len(price.tiersRaw) > 0 && string(price.tiersRaw) != "null" {
-		var tiers []billing.TierRule
-		if json.Unmarshal(price.tiersRaw, &tiers) == nil {
-			req.ContextTiers = tiers
-		}
-	}
+	// 售价（含时段/分档或 v2 四段价）随当前配置走（补收时刻口径）：
+	// v2 行求值时刻 = 补收时刻（与旧时段口径同语义）；tokens 沿用原账单行的 JSONB，
+	// 历史三段行无 cache_write 键 → 该段按 0 计（分桶在落账单时已定，不可复原）。
+	p.attachSale(&req, price, time.Now(), "补收 "+r.BillingID)
 
 	rec, err := p.bill.Record(ctx, req)
 	if err != nil {

@@ -486,11 +486,12 @@ func TestRebill_PartialResultHTTP(t *testing.T) {
 	}
 }
 
-// priceRow 构造售价命中行。
+// priceRow 构造售价命中行。第 5 列 sale_v2 恒 nil（这些用例都是旧三段口径；
+// v2 行为在 settle v2 专项用例里构造）。
 func priceRow(extName string, rates map[string]float64) *sqlmock.Rows {
 	raw, _ := json.Marshal(rates)
-	return sqlmock.NewRows([]string{"external_name", "sale_rates", "time_config", "context_tiers"}).
-		AddRow(extName, raw, []byte("null"), []byte("null"))
+	return sqlmock.NewRows([]string{"external_name", "sale_rates", "time_config", "context_tiers", "sale_v2"}).
+		AddRow(extName, raw, []byte("null"), []byte("null"), nil)
 }
 
 func int64Ptr(v int64) *int64 { return &v }
