@@ -382,3 +382,66 @@ func openMigratedTempDB(t *testing.T) *sql.DB {
 	}
 	return target
 }
+
+// TestReconciler_RealSQL_CacheWriteFourBucket 四桶行对账不变式（四项定案①回归）：
+// v2 计价行的 billing_records.tokens 带 cache_write 独立键，本地合计必须把它算进去，
+// 才与账本侧 tokens_in（=in+cache_read+cache_write 合并存）+tokens_out 相等。
+// 修复前 TokenSumExpr 只求三键 → 本地恒少一个缓存写量（本例 160 vs 190，偏差 15.8% 必 alarm）。
+func TestReconciler_RealSQL_CacheWriteFourBucket(t *testing.T) {
+	conn := openMigratedTempDB(t)
+	ctx := context.Background()
+
+	win := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	winEnd := win.Add(upstream.WindowSize)
+
+	if _, err := conn.ExecContext(ctx,
+		`INSERT INTO users(id, username, password_hash, role) VALUES (1,'u2','x','DEVELOPER')`); err != nil {
+		t.Fatalf("插入用户失败: %v", err)
+	}
+	// v2 计价行形状：cache_write 独立分桶（input 不含缓存写）。
+	if _, err := conn.ExecContext(ctx,
+		`INSERT INTO billing_records(id, billing_id, user_id, pricing_mode, external_model_name,
+		     internal_model_id, r_value, tokens, call_time, cost_source)
+		 VALUES (1, 'b-4k', 1, 'sale', 'm', 'im', 1,
+		         '{"input":100,"cache_read":10,"cache_write":30,"output":20}'::jsonb, $1, 'none')`, win.Add(time.Second)); err != nil {
+		t.Fatalf("插入账单失败: %v", err)
+	}
+	// 账本侧 tokens_in = in(100)+cache_read(10)+cache_write(30) = 140（适配层合并口径）。
+	if _, err := conn.ExecContext(ctx,
+		`INSERT INTO ledger_entries(id, ledger_id, provider, provider_account, model,
+		     tokens_in, tokens_out, cost_credits, occurred_at)
+		 VALUES (1, 'led-4k', 'p', 'a', 'm', 140, 20, 1, $1)`, win.Add(2*time.Second)); err != nil {
+		t.Fatalf("插入账本条目失败: %v", err)
+	}
+
+	wins := upstream.NewSQLWindowStore(conn)
+	if err := wins.Save(ctx, upstream.WindowRecord{
+		Start: win, End: winEnd, Status: upstream.WindowOK, RecordedAt: winEnd,
+	}); err != nil {
+		t.Fatalf("写入窗口行失败: %v", err)
+	}
+
+	r := NewReconciler(Options{
+		Local: NewLocalSource(conn), Upstream: NewUpstreamSource(conn),
+		Counts: wins, States: wins, Streaks: wins,
+		LookbackWindowCount: 1, Now: func() time.Time { return winEnd },
+	})
+	if _, err := r.RunOnce(ctx); err != nil {
+		t.Fatalf("对账失败: %v", err)
+	}
+
+	var localTokens, upTokens int64
+	var status string
+	if err := conn.QueryRowContext(ctx,
+		`SELECT local_tokens, upstream_tokens, status
+		   FROM reconcile_windows WHERE window_start = $1`, win).
+		Scan(&localTokens, &upTokens, &status); err != nil {
+		t.Fatalf("读取对账结果失败: %v", err)
+	}
+	if localTokens != 160 || upTokens != 160 {
+		t.Fatalf("四桶行两侧合计必须相等（160）：local=%d upstream=%d", localTokens, upTokens)
+	}
+	if status != string(upstream.WindowOK) {
+		t.Fatalf("两侧一致应为 ok，got %s", status)
+	}
+}

@@ -69,3 +69,54 @@
 - 带 DSN 与无 DSN `-race` 全仓 37 包 0 FAIL；`tests` 绿；gofmt/vet/build 干净。
 - 变异四组（删四桶拆分 / 删 attach v2 / 删留痕 / 删 output 判存）各自红、还原绿。
 - CI run 44729856625 双 job success（Frontend typecheck + Backend with Postgres）。
+
+## 收尾补充（同日批次④收口：合计口径级联修复 + 正本核对）
+
+### 合计口径级联修复（四项定案①的下游不变式）
+
+M1 只改了**计价**（四段价 × 因子），漏了**合计类读路径**——它们仍按三键求和，v2 计价行
+（tokens 带 cache_write 键）会系统性漏计一个缓存写量：
+
+| 读路径 | 修复前 | 修复后 |
+| --- | --- | --- |
+| `billing.TokenSumExpr`（对账 + console 实时会话/在线用户） | input+cache_read+output | + cache_write（缺键按 0） |
+| `reconcile` 本地合计 | 同上 → 与账本 tokens_in **每窗必差** → 假告警 | 两侧同口径，四桶行 ok |
+| `billing.Summarize`（账单页统计栏 Tokens/BusyTokens） | 三键 | + cache_write |
+| `console.sessionRuntimes`（会话 Token/窗口 Token/上下文长度） | 三键；上下文 = input+cache_read | 合计 + cache_write；上下文 = input+cache_read+cache_write |
+| `InputTokensExpr` | input+cache_read | + cache_write |
+
+全部是**纯增量**（0011 三段行没有 cache_write 键，COALESCE 缺键按 0，历史行合计逐值不变；
+v2 计价行 cache_write 独立分桶，并入才是完整提示词侧总量）。账本侧 tokens_in 合并存
+（in+cache_read+cache_write）不动——两侧合计仍同口径。
+
+回归钉子：`reconcile` 真库用例 `TestReconciler_RealSQL_CacheWriteFourBucket`
+（四桶行两侧合计必须相等且 ok；修复前 local=160 vs upstream=190、偏差 15.8% 必 alarm——
+此处账本侧 tokens_in 按合并口径 140+20=160 对齐）与 `billing` 口径守卫
+`TestTokenSumExpr_FourKeys` / `TestInputTokensExpr_ContextShape`（键齐全 + 前缀作用 + 不混 output）。
+
+### 与正本的核对（只标注差异，不改口径定义）
+
+- **四项定案本身**：任务书四条口径与 modelsdev-v2-billing-plan 报告 §6 逐条一致，
+  本 PR 实现与其口径无冲突；§6 明示「无遗留开放项」。
+- **差异 ①（精度表述）**：任务书约束「全链路无 float（BIGINT 微元 + INTEGER ppm）」与
+  报告 §4-b「引擎内 float64、出账 Round5、落库 NUMERIC(20,5)（沿现状）」不一致。本实现按
+  **报告现状口径**（float64 + decimalx.Round5 + NUMERIC(20,5)，与既有 ComputeCredits 同基线，
+  不是新引入的浮点），差异如实标注，两份口径定义均未改动；若拍板转微元整数属 M2 重构。
+- **差异 ②（S1 范围）**：任务书 S1 含 catalog_models/catalog_match 两表与「60min 同步器换
+  v2 URL（只落暂存区）」；M1 正本口径未含（见未修项 3）。排期差异，不影响四项计价语义
+  （目录同步是参考价基础设施，计费字段永不自动覆盖）。M2 立迁移时从 0032 起号。
+- **展示形状**：dashboard/统计的**分段展示**（UsageSplit 三段、Input/CacheRead 分列）
+  维持三段形状——加 cache_write 展示列属前端契约变更，归 View 协调（M2 登记），合计口径
+  已按四键修复、不受展示形状影响。
+- **上下文条件键**：mult 引擎 `context` = input+cache_read（与报告 §2.3、现 ContextTierCoeff
+  同源）——**不含** cache_write；「上下文长度」展示口径（InputTokensExpr）与其是两回事，
+  后者并入 cache_write 是展示语义（提示词侧总量），不改计价条件键。
+
+### 真机项（MANUAL/AUDIT 位，不在本批动）
+
+- M2/S2 前置：dev/test/staging 三库迁移演练（0031 四列 + FullChain）。
+- S2 进入条件：v2 计价行灰度后「对账告警连续 3 窗零误报」（本批的四桶对账不变式用例
+  已在真库 PG17 验证两侧合计相等）。
+- 验收 3（余额守恒 ≤0.01）与验收 2 的生产口径（cache_write 段与 magpie 账本 60s 窗差异 = 0）
+  依赖真机流量与账本窗口，变更窗内执行。
+- facadebill 预扣链拆段（usage 采集口径扩展）见未修项 1，M2 范围。
