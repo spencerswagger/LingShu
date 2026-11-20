@@ -298,6 +298,40 @@ export function getCallLog(billingId: string) {
   return http.get<CallLogView, ApiRes<CallLogView>>(`/admin/billings/${billingId}`)
 }
 
+// ===== unpriced 账单补收（B 方案·手动触发；后端 rebill_handler.go 同源） =====
+// 补收汇总：条数与金额合计一律用后端返回值，前端不自己算。
+export interface RebillResult {
+  GroupRef: string
+  // 扫描到的本组待补收行数（含已带标记的）
+  Scanned: number
+  // 本次实际补开的新账单条数
+  Rebilled: number
+  // 新开账单的积分合计
+  TotalCredits: number
+  // 新账单号清单（rebill-<原账单id>-v1）
+  NewBillingIDs: string[]
+  // 已补收过、本次跳过的条数（幂等跳过 ≠ 新补收）
+  AlreadyMarked: number
+  // 逐行失败明细（毒行不堵整批；omitempty = 无失败时整个字段缺席，六字段契约不变）。
+  // Reason 键以 rebill_handler.go 常量实码为准（Owl P1 教训：rebill.go 的 RebillRowFailure
+  // 注释键与 wire 实发曾零交集，不认注释）：rebill_row_unresolvable（解析不到售价/缺 user_id）/
+  // rebill_no_wallet（用户无钱包）/ rebill_broken_row（扫描层毒行）/ rebill_record_error
+  // （计费落库错误）/ rebill_already_rebilled（幂等撞号 23505）。
+  Failed?: RebillRowFailure[]
+}
+export interface RebillRowFailure {
+  // 原账单号（运营照单修复后重放补齐）
+  BillingID: string
+  Reason: string
+  Message: string
+}
+// 对指定组执行补收：按当前售价给该组历史 unpriced 账单逐条开新账单并扣款。
+// 批次级失败（组未定价）→ 400 + Reason（rebill_group_unpriced），Message 中文原因，
+// 调用方把 Reason 文案与 Message 一起展示；毒行走部分成功（HTTP 200），失败行进 Failed[]。
+export function rebillUnpriced(ref: string) {
+  return http.post<RebillResult, ApiRes<RebillResult>>('/admin/billings/rebill-unpriced', { Ref: ref })
+}
+
 // ===== 会话（内存注册表 + DB 投影；按用户/令牌/密钥维度过滤与踢下线） =====
 export interface AdminSession {
   SessionID: string

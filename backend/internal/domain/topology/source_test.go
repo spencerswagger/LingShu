@@ -3,12 +3,24 @@ package topology
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
 )
+
+// rname 生成一个随机短名（测试组名的随机驱动：归一规则必须对任意名字成立）。
+func rname() string {
+	const chars = "abcdefghijklmnopqrstuvwxyz0123456789"
+	b := make([]byte, 6)
+	for i := range b {
+		b[i] = chars[rand.Intn(len(chars))]
+	}
+	return string(b)
+}
 
 // 网关字段有两套命名（OpenAI 兼容层 + 网关自有），这里覆盖「多别名」与「组接口不可用不致命」。
 func TestHTTPGatewaySource_Fetch_ParsesAliases(t *testing.T) {
@@ -148,5 +160,50 @@ func TestParseGroups_AutoFiltered(t *testing.T) {
 	if len(groups) != 1 || groups[0].Ref != "group/g1" {
 		raw, _ := json.Marshal(groups)
 		t.Fatalf("auto 组未被过滤：%s", raw)
+	}
+}
+
+// 组 ref 必须与账本 req_model 同形态（group/<id>）：绑定真源（external_models.bound_internal_ref）
+// 与结算侧都按这个形态匹配。历史上「优先用 magpie 的 ref」出过两种坏形态：
+//   - 用户组 ref="group/team-a" 再拼一层 "group/" → "group/group/team-a"（双前缀，永远匹配不到）；
+//   - auto 组 ref="auto/flash" → "group/auto/flash"（错误形态，且绕过了 auto 组过滤）。
+//
+// 随机组名都要按同一规则归一，禁止对任何具体名字特判。
+func TestParseGroups_CanonicalRef(t *testing.T) {
+	team, auto, legacy, dup, noid := rname(), rname(), rname(), rname(), rname()
+	raw := fmt.Sprintf(`[
+		{"id":"team-%s","ref":"group/team-%s","display_name":"Team %s"},
+		{"id":"auto-%s","ref":"auto/%s","display_name":"Auto %s"},
+		{"name":"legacy-%s"},
+		{"ref":"group/dup-%s"},
+		{"ref":"auto/%s","display_name":"无 id 的 auto 组"}
+	]`, team, team, team, auto, auto, auto, legacy, dup, noid)
+	groups, err := parseGroups([]byte(raw))
+	if err != nil {
+		t.Fatalf("parseGroups 失败：%v", err)
+	}
+	// auto 组（id 与 ref 两种形态）都要被过滤；剩下的组 ref 必须是 group/<id> 形态。
+	if len(groups) != 3 {
+		b, _ := json.Marshal(groups)
+		t.Fatalf("组数 = %d，期望 3：%s", len(groups), b)
+	}
+	byRef := map[string]Node{}
+	for _, n := range groups {
+		if !strings.HasPrefix(n.Ref, "group/") {
+			t.Fatalf("组 ref 不是 group/ 形态：%+v", n)
+		}
+		if strings.HasPrefix(strings.TrimPrefix(n.Ref, "group/"), "group/") {
+			t.Fatalf("组 ref 双前缀：%+v", n)
+		}
+		byRef[n.Ref] = n
+	}
+	if _, ok := byRef["group/team-"+team]; !ok {
+		t.Fatalf("用户组 ref 应为 group/<id>（原始 ref 已是同形态，不得双前缀）：%+v", groups)
+	}
+	if _, ok := byRef["group/legacy-"+legacy]; !ok {
+		t.Fatalf("只有 name 的组应回落 group/<name>：%+v", groups)
+	}
+	if _, ok := byRef["group/dup-"+dup]; !ok {
+		t.Fatalf("裸 ref 组应原样归一（不重复加前缀）：%+v", groups)
 	}
 }

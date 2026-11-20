@@ -21,6 +21,9 @@ export interface ApiError {
   requestId: string
   code?: number
   status?: number
+  // 后端机器可读的细分原因键（如 invalid_field / rebill_group_unpriced）。
+  // 契约来源：订阅录入标准 §6.2 —— Code 只判大类，前端按 Reason 分支文案。
+  reason?: string
 }
 
 // 逐请求错误提示配置（可选，默认行为不变）：
@@ -74,6 +77,7 @@ http.interceptors.response.use(
       requestId,
       code: body?.Code,
       status,
+      reason: body?.Reason || '',
     })
   },
 )

@@ -470,3 +470,71 @@ func TestMigrate_0025_BillingUpstreamError(t *testing.T) {
 		t.Fatalf("重跑后 upstream_error 行数应仍为 1，实际 %d", rows)
 	}
 }
+
+// TestMigrate_0028_0029_UnpricedAndRouteID 断言 V3 旁路计费两件事：
+//  1. 0028：billing_records 的 status 值域放开 'unpriced'（非法值仍被 CHECK 拒）；
+//  2. 0029：ledger_entries.route_id 列存在（BIGINT，默认 0），插入带 route_id 的账本行可回读。
+//  3. 两个迁移都可重复执行（DROP IF EXISTS / ADD COLUMN IF NOT EXISTS）。
+func TestMigrate_0028_0029_UnpricedAndRouteID(t *testing.T) {
+	tempDB := openTempDB(t)
+	migDir := filepath.Join(filepath.Dir(mustCallerFile(t)), "migrations")
+	for _, n := range migrationNames(t, migDir) {
+		runMigration(t, tempDB, migDir, n)
+	}
+
+	var def string
+	if err := tempDB.QueryRow(
+		`SELECT column_default FROM information_schema.columns
+		  WHERE table_name='ledger_entries' AND column_name='route_id'`).Scan(&def); err != nil {
+		t.Fatalf("ledger_entries 缺少 route_id 列: %v", err)
+	}
+	if !strings.Contains(def, "0") {
+		t.Fatalf("route_id 默认值应为 0（无路由请求）: %q", def)
+	}
+
+	var status string
+	if err := tempDB.QueryRow(
+		`SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname='ck_billing_status'`).Scan(&status); err != nil {
+		t.Fatalf("缺少 ck_billing_status 约束: %v", err)
+	}
+	if !strings.Contains(status, "unpriced") {
+		t.Fatalf("ck_billing_status 未放开 unpriced: %s", status)
+	}
+
+	if _, err := tempDB.Exec(
+		`INSERT INTO users(id, username, password_hash, role) VALUES (1,'u','h','DEVELOPER') ON CONFLICT DO NOTHING`); err != nil {
+		t.Fatalf("插入用户失败: %v", err)
+	}
+	if _, err := tempDB.Exec(
+		`INSERT INTO ledger_entries(id, ledger_id, occurred_at, route_id)
+		 VALUES (901, 'lg-unpriced-1', now(), 77)`); err != nil {
+		t.Fatalf("带 route_id 的账本行应可写入: %v", err)
+	}
+	var routeID int64
+	if err := tempDB.QueryRow(`SELECT route_id FROM ledger_entries WHERE ledger_id='lg-unpriced-1'`).Scan(&routeID); err != nil || routeID != 77 {
+		t.Fatalf("route_id 回读不符: got=%v err=%v", routeID, err)
+	}
+	if _, err := tempDB.Exec(
+		`INSERT INTO billing_records(id, billing_id, user_id, pricing_mode, external_model_name, internal_model_id,
+		                            r_value, status, cost_source)
+		 VALUES (201, 'bill-unpriced-1', 1, 'sale', 'ext', 'int', 0, 'unpriced', 'none')`); err != nil {
+		t.Fatalf("unpriced 应可写入: %v", err)
+	}
+	if _, err := tempDB.Exec(
+		`INSERT INTO billing_records(id, billing_id, user_id, pricing_mode, external_model_name, internal_model_id,
+		                            r_value, status, cost_source)
+		 VALUES (202, 'bill-unpriced-2', 1, 'sale', 'ext', 'int', 0, 'bogus', 'none')`); err == nil {
+		t.Fatalf("非法状态必须被 CHECK 拒绝")
+	}
+
+	// 幂等：两份迁移各自重跑不报错。
+	runMigration(t, tempDB, migDir, "0028_v3_billing_unpriced.sql")
+	runMigration(t, tempDB, migDir, "0029_v3_ledger_route_id.sql")
+	var rows int
+	if err := tempDB.QueryRow(`SELECT count(*) FROM billing_records WHERE status='unpriced'`).Scan(&rows); err != nil {
+		t.Fatalf("统计失败: %v", err)
+	}
+	if rows != 1 {
+		t.Fatalf("重跑后 unpriced 行数应仍为 1，实际 %d", rows)
+	}
+}

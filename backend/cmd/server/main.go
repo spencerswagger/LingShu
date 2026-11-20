@@ -430,7 +430,23 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	billSvc := billing.NewService(billStore, billCfgProvider, creditSvc)
 	// V3 旁路计费：每 60s 把未计费账本行落成账单（幂等：magpie_request_id）
 	v3Poller := v3billing.NewPoller(d, billSvc, keySync, logr)
+	// 结算链路 kill-switch（2026-11-20 拍板）：新结算链路默认**关**——未设置
+	// V3_SETTLE_ENABLED 时走旧链路（= v0.15.0-rc4 的结算口径：名字直查、查不到留行
+	// 重试、无 unpriced 兜底），补收入口一并 400。显式置 1/true/on/yes 才启用新链路
+	// （组 ref 多形态候选链、route_id 绑定优先、unpriced 兜底、补收可用）。
+	// 判定在 v3billing.SettleEnabledFromEnv 单源实现（fail-closed：打错字不得静默
+	// 启用新链路）。开关状态启动即点名，不留「部署完为什么没出账单」的猜。
+	if v3billing.SettleEnabledFromEnv() {
+		v3Poller.SetNewSettleEnabled(true)
+		logr.Info("V3 结算链路：新链路已启用", "env", v3billing.EnvSettleEnabled)
+	} else {
+		v3Poller.SetNewSettleEnabled(false)
+		logr.Info("V3 结算链路：新链路未启用（默认关，走旧结算口径；置 "+v3billing.EnvSettleEnabled+"=1 启用）",
+			"env", v3billing.EnvSettleEnabled)
+	}
 	go v3Poller.Run(context.Background())
+	// unpriced 账单补收（B 方案·手动触发）：组定价后按当前售价给历史 unpriced 账单开新账单。
+	v3RebillHandler := v3billing.NewRebillHandler(v3Poller)
 	// 账单落库失败时的本地持久重试队列：DB 抖动不丢账单（billing_id 唯一索引保证重投幂等）。
 	billSvc.SetRetryQueue(billing.NewRetryQueue(cfg.Billing.RetryQueuePath, logr))
 	// 「扣款 + 积分流水 + 账单」同事务提交：消灭「扣了钱没账单」。
@@ -945,6 +961,7 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 			MagpieAccess:  magpieAccessHandler,
 			Topology:      topologyHandler,
 			Subscriptions: subscriptionHandler,
+			V3Rebill:      v3RebillHandler,
 		},
 		syncer:     syncer,
 		sess:       sess,

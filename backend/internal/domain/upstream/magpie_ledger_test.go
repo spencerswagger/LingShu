@@ -406,3 +406,31 @@ func TestParseMagpieFeed_FiveDimensionFields(t *testing.T) {
 		}
 	}
 }
+
+// TestParseMagpieFeed_RouteIDCarriedThrough 断言 route_id 端到端搬运：
+// 报文里的 route_id 进 LedgerEntry（负值归 0）；缺字段 = 0（session/reported 来源行）。
+func TestParseMagpieFeed_RouteIDCarriedThrough(t *testing.T) {
+	seg := func(id string, route int64) string {
+		if route > 0 {
+			return fmt.Sprintf(`{"id":%q,"t":"2026-11-19T10:00:00Z","route_id":%d,"priced":true}`, id, route)
+		}
+		return fmt.Sprintf(`{"id":%q,"t":"2026-11-19T10:00:00Z","priced":true}`, id)
+	}
+	payload := `{"rows":[` + seg("u_r", 321) + `,` + seg("u_neg", -5) + `,` + seg("u_none", 0) + `],"has_more":false}`
+	page, err := parseMagpieFeed([]byte(payload), nil)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(page.Entries) != 3 {
+		t.Fatalf("应解析 3 条，实际 %d", len(page.Entries))
+	}
+	if got := page.Entries[0].RouteID; got != 321 {
+		t.Fatalf("route_id 搬运丢失：got=%d 期望 321", got)
+	}
+	if got := page.Entries[1].RouteID; got != 0 {
+		t.Fatalf("负 route_id 应归 0：got=%d", got)
+	}
+	if got := page.Entries[2].RouteID; got != 0 {
+		t.Fatalf("缺 route_id 应为 0：got=%d", got)
+	}
+}

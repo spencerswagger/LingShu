@@ -29,12 +29,15 @@ const (
 	// 与 StatusFailed 的区别只在「为什么没计费」：两者都可以是金额 0，
 	// 但 upstream_error 要在账单上保留上游状态码与错误体摘要，供运营分派。
 	StatusUpstreamError = "upstream_error"
+	// StatusUnpriced 表示请求成功但灵枢侧没有定价口径（解析不到对外模型）：
+	// 营收 0、成本按账本 cost 兜底；值域在 0028 的 ck_billing_status 里放开。
+	StatusUnpriced = "unpriced"
 )
 
-// ValidStatus 判断状态是否在 0025 的值域内。
+// ValidStatus 判断状态是否在 0028 的值域内。
 func ValidStatus(status string) bool {
 	switch status {
-	case StatusCompleted, StatusFailed, StatusUpstreamError:
+	case StatusCompleted, StatusFailed, StatusUpstreamError, StatusUnpriced:
 		return true
 	default:
 		return false
@@ -317,7 +320,7 @@ func (s *Service) Record(ctx context.Context, req RecordReq) (*Record, error) {
 		req.CallTime = s.clock()
 	}
 	if req.Status != "" && !ValidStatus(req.Status) {
-		return nil, fmt.Errorf("非法账单状态 %q（只允许 completed/failed/upstream_error）", req.Status)
+		return nil, fmt.Errorf("非法账单状态 %q（只允许 completed/failed/upstream_error/unpriced）", req.Status)
 	}
 
 	// 失败记录快速通道（上游/下游失败不扣积分）：直接落失败状态并携带原因。
@@ -327,7 +330,7 @@ func (s *Service) Record(ctx context.Context, req RecordReq) (*Record, error) {
 			status = StatusFailed
 		}
 		if !ValidStatus(status) {
-			return nil, fmt.Errorf("非法账单状态 %q（只允许 completed/failed/upstream_error）", status)
+			return nil, fmt.Errorf("非法账单状态 %q（只允许 completed/failed/upstream_error/unpriced）", status)
 		}
 		rec := &Record{
 			BillingID:            req.BillingID,

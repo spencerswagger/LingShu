@@ -254,27 +254,29 @@ type magpieFeedRow struct {
 		SessionID        string `json:"session_id"`
 		NativeSessionID  string `json:"native_session_id"`
 	} `json:"original_ids"`
-	T               string  `json:"t"`
-	Provider        string  `json:"provider"`
-	ProviderAccount string  `json:"providerAccount"`
-	ProviderKeyName string  `json:"providerKeyName"`
-	CallerKeyName   string  `json:"callerKeyName"`
-	Model           string  `json:"model"`
-	Req             string  `json:"req"`
-	Served          string  `json:"served"`
-	In              int64   `json:"in"`
-	Out             int64   `json:"out"`
-	CacheRead       int64   `json:"cache_read"`
-	CacheWrite      int64   `json:"cache_write"`
-	CacheWrite1h    int64   `json:"cache_write_1h"`
-	Reasoning       int64   `json:"reasoning"`
-	Status          int     `json:"status"`
-	Err             string  `json:"err"`
-	ErrType         string  `json:"err_type"`
-	HandedOn        bool    `json:"handed_on"`
-	Rejected        bool    `json:"rejected"`
-	Cost            float64 `json:"cost"`
-	Priced          bool    `json:"priced"`
+	T               string `json:"t"`
+	Provider        string `json:"provider"`
+	ProviderAccount string `json:"providerAccount"`
+	ProviderKeyName string `json:"providerKeyName"`
+	CallerKeyName   string `json:"callerKeyName"`
+	Model           string `json:"model"`
+	Req             string `json:"req"`
+	Served          string `json:"served"`
+	In              int64  `json:"in"`
+	Out             int64  `json:"out"`
+	CacheRead       int64  `json:"cache_read"`
+	CacheWrite      int64  `json:"cache_write"`
+	CacheWrite1h    int64  `json:"cache_write_1h"`
+	Reasoning       int64  `json:"reasoning"`
+	Status          int    `json:"status"`
+	Err             string `json:"err"`
+	ErrType         string `json:"err_type"`
+	HandedOn        bool   `json:"handed_on"`
+	Rejected        bool   `json:"rejected"`
+	// RouteID 是网关为本请求分配的路由 id（同一路由的多次 try 共享）；session/reported 行没有 → 0。
+	RouteID int64   `json:"route_id"`
+	Cost    float64 `json:"cost"`
+	Priced  bool    `json:"priced"`
 }
 
 // parseMagpieFeed 把代理侧真实报文映射成 FeedPage。
@@ -376,6 +378,10 @@ func mapMagpieFeedRow(row magpieFeedRow, convert CostConverter) (LedgerEntry, bo
 	// `cache_write_1h` 是 `cache_write` 按 TTL 的**拆分**（子集），不能重复相加；
 	// `reasoning` 已经包含在 `out` 里，也不再另加。
 	promptTokens := row.In + row.CacheRead + row.CacheWrite
+	// route_id：网关为本请求分配的路由 id；负值是脏数据，归 0（0 = 无/未知，结算侧走回退链）。
+	if row.RouteID < 0 {
+		row.RouteID = 0
+	}
 	return LedgerEntry{
 		LedgerID:        id,
 		Provider:        strings.TrimSpace(row.Provider),
@@ -391,6 +397,7 @@ func mapMagpieFeedRow(row magpieFeedRow, convert CostConverter) (LedgerEntry, bo
 		CallerKeyName: strings.TrimSpace(row.CallerKeyName),
 		CacheRead:     row.CacheRead,
 		CacheWrite:    row.CacheWrite,
+		RouteID:       row.RouteID,
 	}, true, nil
 }
 
