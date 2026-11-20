@@ -14,8 +14,12 @@
 5. 部分失败（毒行隔离，后端 `a9c8a0e` 起）：HTTP 仍 200，响应多 `Failed[]`
    （元素 `{BillingID, Reason, Message}`；`omitempty`，全部成功时字段缺席、展示不变）。
    结果块在成功条数之下追加红色失败清单：账单标识 + `Reason` 映射中文 + 「后端说明：Message」双展示。
-   行级 Reason 键：`unpriced_row`（仍解析不到售价）/ `unresolved_user`（缺合法用户归属无法扣款）/
-   `record_error`（计费落库出错）；未知键兜底展示原文 Message。
+   行级 Reason 键（**以 `rebill_handler.go` 常量实码为准，不认 rebill.go 注释**——注释键与
+   wire 实发零交集，前端曾照抄导致映射全死，Owl P1）：
+   `rebill_row_unresolvable`（解析不到售价/缺 user_id，rebill.go:357/362）/
+   `rebill_no_wallet`（用户无积分钱包无法扣款，:341）/ `rebill_broken_row`（扫描层毒行，
+   :187）/ `rebill_record_error`（计费落库出错，:423）/ `rebill_already_rebilled`
+   （幂等撞号 23505，:421）；未知键兜底展示原文 Message。
 6. 批次级失败（组未定价，400 + `rebill_group_unpriced`）：抽屉内红色块——Reason 映射中文处置文案 +
    后端 `Message` 原文。批次级 `rebill_row_unresolvable` 已随毒行隔离废弃（改走 Failed[]）。
 7. 切组/再保存会重置上一轮检测与结果（含竞态 token 守卫），不残留旧状态。
@@ -46,6 +50,6 @@
 ## 走查
 
 `/data/pv/rebill-check.mjs`（一次性脚本，不进仓库）：vite + puppeteer 拦 `/api/v1/**` 回桩，
-29 项断言全过——保存后检测（多形态去重、剔除已补收行）、确认弹窗文案、部分失败
-（成功合计与失败明细并列：账单标识 + Reason 中文 + Message）、全部成功展示不变、失败 Reason 展示、
-N=0 抽屉照旧关闭、390px 页面与抽屉内均无横向溢出。
+31 项断言全过——保存后检测（多形态去重、剔除已补收行）、确认弹窗文案、部分失败
+（成功合计与失败明细并列：三个真键各验中文映射 + 未映射键兜底展示 Message + 「后端说明」副块渲染）、
+全部成功展示不变、失败 Reason 展示、N=0 抽屉照旧关闭、390px 页面与抽屉内均无横向溢出。

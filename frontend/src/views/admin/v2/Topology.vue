@@ -207,10 +207,16 @@ const rebillError = ref('')
 
 const REBILL_REASON_TEXT: Record<string, string> = {
   rebill_group_unpriced: '该组当前没有可用的售价口径，请先绑定售价后再补收',
-  // 逐行失败键（a9c8a0e 起：毒行不堵整批，失败行带原因进 Failed[]，HTTP 仍 200）
-  unpriced_row: '按当前售价仍解析不到该行的售价，未补收',
-  unresolved_user: '原账单缺合法用户归属，无法扣款，未补收',
-  record_error: '计费落库出错，未补收',
+  // 行级真键——取值以 rebill_handler.go 的常量为准（Owl P1：rebill.go 里 RebillRowFailure
+  // 的注释键是错的，前端曾照抄导致映射全死；键值只认 handler 实码）。
+  // 触发点见 rebill.go：row_unresolvable=解析不到售价/缺 user_id(357/362)、
+  // no_wallet=用户无钱包(341)、broken_row=扫描层毒行(187)、record_error=计费落库(423)、
+  // already_rebilled=幂等撞号 23505(421)。
+  rebill_row_unresolvable: '按当前配置仍解析不到该行售价或用户归属，未补收',
+  rebill_no_wallet: '该行用户没有积分钱包，无法扣款（开通钱包后可重放补齐）',
+  rebill_broken_row: '该行原始数据损坏，无法计价，未补收',
+  rebill_record_error: '计费或落库出错，未补收',
+  rebill_already_rebilled: '该行此前已被补收过，本次不重复补收',
   // 兜底：后端未来新增键时展示原文 Message，不吞掉
 }
 
