@@ -373,13 +373,53 @@ type groupItem struct {
 	Ref string `json:"ref"`
 }
 
-func (g groupItem) ref() string {
-	for _, v := range []string{g.Ref, g.Name, g.ID} {
-		if strings.TrimSpace(v) != "" {
-			return strings.TrimSpace(v)
+// canonicalRef 把 magpie 的一个组归一成「账本/绑定用的组 ref」：group/<组 id>。
+//
+// magpie 对同一个组有两套字符串：
+//   - 组 id：用户组 = slug(name)；auto 组 = "auto-"+slug(model)。**账本 req_model 与
+//     镜像（internal_models.ref）用它**，结算侧按它匹配 external_models.bound_internal_ref；
+//   - 页面/agent 用的 ref：用户组 "group/<id>"、auto 组 "auto/<model>"。
+//
+// 绑定真源必须与账本用同一种形态，否则组路由的账永远匹配不到售价（结算侧解析链会退化成
+// unpriced）。所以这里统一取 group/<组 id>：优先原始 id；没有 id 时从 ref 形态归一
+// （剥掉重复的 group/ 前缀、auto/<m> → auto-<m>）；再没有才回落到 name。
+func (g groupItem) canonicalRef() string {
+	if id := strings.TrimSpace(g.ID); id != "" {
+		return "group/" + id
+	}
+	if r := strings.TrimSpace(g.Ref); r != "" {
+		lower := strings.ToLower(r)
+		switch {
+		case strings.HasPrefix(lower, "group/"):
+			if rest := strings.TrimSpace(r[len("group/"):]); rest != "" {
+				return "group/" + rest
+			}
+		case strings.HasPrefix(lower, "auto/"):
+			if rest := strings.TrimSpace(r[len("auto/"):]); rest != "" {
+				return "group/auto-" + rest
+			}
+		default:
+			return "group/" + r
 		}
 	}
+	if n := strings.TrimSpace(g.Name); n != "" {
+		return "group/" + n
+	}
 	return ""
+}
+
+// isAutoGroup 判断这条组数据是不是 magpie 自动聚合的 auto 组（含 "auto" 这个裸名）。
+func isAutoGroup(g groupItem) bool {
+	for _, v := range []string{g.ID, g.Ref, g.Name} {
+		v = strings.ToLower(strings.TrimSpace(v))
+		if v == "" {
+			continue
+		}
+		if v == "auto" || strings.HasPrefix(v, "auto-") || strings.HasPrefix(v, "auto/") {
+			return true
+		}
+	}
+	return false
 }
 
 func parseGroups(raw []byte) ([]Node, error) {
@@ -393,12 +433,14 @@ func parseGroups(raw []byte) ([]Node, error) {
 		if err := json.Unmarshal(it, &g); err != nil {
 			continue
 		}
-		ref := g.ref()
-		if ref == "" {
+		// auto 组是网关自动聚合的产物，V2 明确不使用（见 0019 头注），同步侧直接过滤。
+		// 用归一后的组 id 判（不能只看原始字符串）：同一组有两套字符串，
+		// agent 形态 auto/<model> 与账本/镜像形态 group/auto-<slug>，两种都要拦住。
+		if isAutoGroup(g) {
 			continue
 		}
-		// auto 组是网关自动聚合的产物，V2 明确不使用（见 0019 头注），同步侧直接过滤。
-		if strings.EqualFold(ref, "auto") || strings.HasPrefix(strings.ToLower(ref), "auto-") {
+		ref := g.canonicalRef()
+		if ref == "" {
 			continue
 		}
 		name := strings.TrimSpace(g.DisplayName)
@@ -406,7 +448,7 @@ func parseGroups(raw []byte) ([]Node, error) {
 			name = ref
 		}
 		out = append(out, Node{
-			Ref:         "group/" + ref,
+			Ref:         ref,
 			ProviderRef: "", // 组是跨供应商的聚合层，不归属单一供应商
 			Kind:        KindGroup,
 			DisplayName: name,
