@@ -61,3 +61,50 @@ billing_id 改随机派生 → 固定派生断言红；匹配去形态归一 →
   量级失控时再收紧 SQL 侧过滤，但**必须**保持与 `groupRefForms` 同源（不许 SQL 里另写一套 LIKE）。
 - route_id → 组 ref 的权威映射只在网关内存里；扫描侧不引入额外名字（与主链口径一致）。
 - 前端（View）按任务书加「检测到 N 条未定价账单」按钮与确认弹窗，后端只提供本接口。
+
+## 7. 结算链路 kill-switch（2026-11-20 拍板落地）
+
+**口径**：新结算链路开关按 env 闸门控制、**默认关**——未设置 `V3_SETTLE_ENABLED` 时走
+旧链路（= `main` v0.15.0-rc4 的结算语义，逐条复刻在 `settleOneLegacy`：req/served 名字直查、
+查不到留行下轮重试、无 unpriced 兜底、无补收），显式置 `1/true/on/yes` 才启用新链路
+（组 ref 多形态候选链、route_id 绑定优先、unpriced 兜底、补收入口）。
+
+- **判定单源** `v3billing.SettleEnabledFromEnv()`（装配与测试共用）；**fail-closed**：
+  只有显式真值才开，打错字（如 `ture`）落回旧链路——新链路写账单动钱包，不许静默启用
+  （刻意区别于 CALLERKEY_BACKFILL_ON_BOOT 的「非空即开」）。
+- **两个结算触发点都吃同一个开关**（开关长在 Poller 上）：60s ticker 与账本同步轮内的
+  `settleNow`（拉完即结）；装配层 `cmd/server` 启动即按 env 设置并打点两条 INFO 日志
+  （「新链路已启用 / 未启用」），不留「部署完为什么没出账单」的猜。
+- **补收入口**：关闭时 `Rebill` 返回 `ErrRebillDisabled` → HTTP `400 + Reason=rebill_disabled`。
+  补收定价逻辑 = 新链路 `resolvePrice`；开关关闭通常意味着对新链路定价存疑，放行等于把
+  同一套存疑逻辑重放进账本，故一并拒绝（不是 500——这是部署形态问题，不是服务故障）。
+- **部署面**：`docker-compose.yml` backend.environment 透传 `V3_SETTLE_ENABLED`（默认空），
+  `.env.example` 有注释条目。dry-run 分桶结果确认后再开；出账异常应急回退 = 清空该变量重启。
+- **旧链路纪律**：`settleOneLegacy` 刻意不复用新链路的 resolvePrice/候选链——kill-switch 的
+  价值就在两条路径互不借用，防行为漂移。新链路的解析增强一律不得泄漏进这条路径。
+
+测试（`gate_test.go` + `wiring_test.go`）：env 判定表（含打错字）/ 包内默认新链路 /
+**同一行数据的开/关 A/B**（关 = 名字直查不到绑定 → 留行重试零账单；开 = 绑定命中正常结算）/
+关时无 unpriced 兜底 / 关时补收拒绝且零 DB 访问 + HTTP 400 reason / 装配层源码级守卫
+（判定必须走单源、两条分支都要显式 SetNewSettleEnabled、两条启动日志都要在）。
+变异验证：删 Once 分流 / 删 Rebill 闸门 / 删裸名反推分支 → 各自用例红，还原全绿。
+
+## 8. 补收入口多形态归一（评审 P3，2026-11-20）
+
+**问题**：入口 `Rebill()` 预检把目标组折叠成单一 ref 形态（`groupRefForm`），无组快照桥时
+`Ref=auto/<m>` 与 `Ref=<裸名>` 都会被误判成「该组当前没有售价口径」直接 400——而同一组
+的绑定/镜像形态其实有价。Gate 真机实测：网关 auto 组账本行 `req_model` 是**裸组名**，
+裸名归一只出 `group/<名>`，与抽屉绑定形态之间全靠组快照桥接，桥缺失即断链。
+
+**修法（与行匹配同源）**：
+1. `groupRefForms` 补**第三向**：裸名也反推抽屉绑定形态（`auto/<裸名>`）与镜像 slug 档
+   （`group/auto-<slug>`）——主链结算与补收共用同一归一，裸名行在没有桥时也能按绑定/镜像
+   形态命中售价。`group/<名>`（非 auto 组 ref）刻意**不**反推 auto/：「组名叫 X」与
+   「auto 组名叫 X」是两个不同对象。
+2. 入口目标从单 ref 改为 **refs 集合**：预检逐形态尝试（任一命中售价即通过），行匹配
+   （`rebillMatchesRow`）按集合比对；响应 `GroupRef` 取首位（= 旧版 `groupRefForm` 归一结果，
+   wire 兼容）。
+
+**已知局限保持**：slug 有损（`Flash x` → `flash-x`），从 slug 串还原不出非 slug 绑定——
+该方向仍走组快照桥（display_name），与既有用例的「只断言无损方向」口径一致
+（`TestRebillEntrance_MultiFormNoSnapshot` 第三子用例钉住这一边界，防未来误当 bug 修）。

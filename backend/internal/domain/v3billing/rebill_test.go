@@ -335,12 +335,14 @@ func TestRebill_MatchingAsymmetryIsDocumented(t *testing.T) {
 	g := "group/auto-" + rseg(t)
 	extOnlyName := "ext-only-" + rseg(t) // 只出现在账单 external_model_name 上的名字
 	// 匹配侧：external 名命中组 ref 形态 → 该行进扫描（最大召回）。
-	if !rebillMatchesRow(rebillRow{ExternalModel: g}, g, nil) {
+	if !rebillMatchesRow(rebillRow{ExternalModel: g}, []string{g}, nil) {
 		t.Fatalf("external 名应参与匹配（最大召回）")
 	}
 	// 解析侧：req/served 之外没有第三个独立档 —— served=extOnlyName（req 是组 ref）时，
-	// 候选集合里针对 extOnlyName 只有它作为「已知名」自己的档，extOnlyName 若独立成档
-	// 会多出「按 extOnlyName 查 external_name」之外的组化候选；钉住候选总数形态。
+	// 候选集合里针对 extOnlyName 只有它作为「已知名」自己的档（裸名归一出的绑定/镜像
+	// 形态是对**所有**已知名统一生效的归一规则，不是 external 独有的第三档）；
+	// extOnlyName 若独立成档会多出「按 extOnlyName 查 external_name」的独立 plain 档。
+	// 钉住候选总数形态。
 	cands := priceCandidates(g, extOnlyName, nil, 0)
 	want := []priceCandidate{
 		{value: g, byBinding: false},
@@ -348,6 +350,9 @@ func TestRebill_MatchingAsymmetryIsDocumented(t *testing.T) {
 		{value: g, byBinding: true},
 		{value: "auto/" + strings.TrimPrefix(g, "group/auto-"), byBinding: true},
 		{value: "group/ext-only-" + strings.TrimPrefix(extOnlyName, "ext-only-"), byBinding: true},
+		// 裸名归一（评审 P3 第三向）：抽屉形态 + 镜像 slug 档，对所有已知名统一生效。
+		{value: "auto/" + extOnlyName, byBinding: true},
+		{value: "group/auto-" + groupSlug(extOnlyName), byBinding: true},
 	}
 	if !reflect.DeepEqual(cands, want) {
 		t.Fatalf("解析候选形态不符（external 名不应有独立第三档）：\ngot  %+v\nwant %+v", cands, want)
@@ -588,7 +593,7 @@ func TestRebill_Matching(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := rebillMatchesRow(tc.row, ref, []groupNode{g}); got != tc.want {
+			if got := rebillMatchesRow(tc.row, []string{ref}, []groupNode{g}); got != tc.want {
 				t.Fatalf("匹配结果 = %v，期望 %v", got, tc.want)
 			}
 		})

@@ -317,16 +317,24 @@ func TestSettleRouteGroupPricing(t *testing.T) {
 				// slug 有损（"Flash x" → "flash-x"），从 slug 串**还原不出**原样的抽屉形态，
 				// 只断言无损方向；slug 形态两边互推用 slug 安全的模型名另测。
 				mirror := "group/auto-" + autoModel // 原样镜像形态（无损）
-				if !rebillMatchesRow(rebillRow{ReqModel: mirror}, "auto/"+autoModel, nil) {
+				if !rebillMatchesRow(rebillRow{ReqModel: mirror}, []string{"auto/" + autoModel}, nil) {
 					t.Fatalf("镜像形态 %s 应能匹配抽屉绑定 auto/%s", mirror, autoModel)
 				}
-				if !rebillMatchesRow(rebillRow{ReqModel: "auto/" + autoModel}, mirror, nil) {
+				if !rebillMatchesRow(rebillRow{ReqModel: "auto/" + autoModel}, []string{mirror}, nil) {
 					t.Fatalf("抽屉形态行应能匹配镜像绑定 %s", mirror)
+				}
+				// 裸名方向（评审 P3 第三向）：账本行 req_model 是裸组名时，同样能匹配
+				// 抽屉绑定与镜像 slug 形态（无组快照桥时不丢账）。
+				if !rebillMatchesRow(rebillRow{ReqModel: autoModel}, []string{"auto/" + autoModel}, nil) {
+					t.Fatalf("裸名行 %s 应能匹配抽屉绑定 auto/%s", autoModel, autoModel)
 				}
 				slugModel := groupSlug(autoModel)
 				slugMirror := "group/auto-" + slugModel
-				if !rebillMatchesRow(rebillRow{ReqModel: slugMirror}, slugMirror, nil) ||
-					!rebillMatchesRow(rebillRow{ReqModel: "auto/" + slugModel}, slugMirror, nil) {
+				if !rebillMatchesRow(rebillRow{ReqModel: slugModel}, []string{slugMirror}, nil) {
+					t.Fatalf("裸 slug 名行 %s 应能匹配镜像绑定 %s", slugModel, slugMirror)
+				}
+				if !rebillMatchesRow(rebillRow{ReqModel: slugMirror}, []string{slugMirror}, nil) ||
+					!rebillMatchesRow(rebillRow{ReqModel: "auto/" + slugModel}, []string{slugMirror}, nil) {
 					t.Fatalf("slug 形态自反匹配失败：%s", slugMirror)
 				}
 			},

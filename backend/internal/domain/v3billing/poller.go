@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"strings"
 	"time"
 
@@ -37,12 +38,37 @@ type Poller struct {
 	log      *slog.Logger
 	interval time.Duration
 	batch    int
+	// newSettle 是否走**新结算链路**（kill-switch，2026-11-20 拍板）：env V3_SETTLE_ENABLED
+	// 默认关——未设置时装配层把这里翻成 false，结算走旧链路（settleOneLegacy，
+	// = main 版 v0.15.0-rc4 的口径），补收入口一并拒绝。构造默认 true 只为让包内
+	// 既有用例不经装配就能测新链路；生产模式**只能**由 cmd/server 按 env 显式设置。
+	newSettle bool
+}
+
+// EnvSettleEnabled 新结算链路 kill-switch 的环境变量名（与 UPSTREAM_LEDGER_URL 同风格）。
+// 语义（kill-switch 定案，2026-11-20）：未设置/空/0/false/off/no（大小写不敏感）= 关
+// （走旧链路）；**只有显式真值** 1/true/on/yes = 开（新链路 + 补收可用）。
+// 刻意 fail-closed（与 CALLERKEY_BACKFILL_ON_BOOT 的「非空即开」不同）：新链路写账单、
+// 动钱包，env 打错字（如 "ture"）必须落回旧链路而不是静默启用新链路。
+const EnvSettleEnabled = "V3_SETTLE_ENABLED"
+
+// SettleEnabledFromEnv 报告新结算链路是否启用（env 判定单源；装配与测试共用）。
+func SettleEnabledFromEnv() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(EnvSettleEnabled))) {
+	case "1", "true", "on", "yes":
+		return true
+	}
+	return false
 }
 
 // NewPoller 创建结算轮询器。
 func NewPoller(db *sql.DB, bill *billing.Service, keySync *magpie.CallerKeySync, log *slog.Logger) *Poller {
-	return &Poller{db: db, bill: bill, keySync: keySync, log: log, interval: 60 * time.Second, batch: 200}
+	return &Poller{db: db, bill: bill, keySync: keySync, log: log, interval: 60 * time.Second, batch: 200, newSettle: true}
 }
+
+// SetNewSettleEnabled 设置结算链路模式（生产由 cmd/server 按 env V3_SETTLE_ENABLED 注入）。
+// 关 = 旧链路：req/served 名字直查、查不到留行下轮重试、没有 unpriced 兜底、补收拒绝。
+func (p *Poller) SetNewSettleEnabled(on bool) { p.newSettle = on }
 
 // SetKeySync 注入 callerKey 同步器（余额≤0 时删代理凭据）；装配顺序晚于构造，故单独 setter。
 func (p *Poller) SetKeySync(k *magpie.CallerKeySync) { p.keySync = k }
@@ -105,6 +131,24 @@ func (p *Poller) Once(ctx context.Context) (int, error) {
 		return 0, nil
 	}
 
+	// kill-switch（默认关，2026-11-20 拍板）：旧链路 = main 版结算语义——组快照/候选链/
+	// unpriced 兜底都不用，req（空则 served）直查对外模型名，查不到返回错误、行留下轮
+	// 重试。新链路的解析增强一律不得泄漏进这条路径（两条路径独立，防行为漂移）。
+	if !p.newSettle {
+		settled := 0
+		for _, r := range list {
+			ok, err := p.settleOneLegacy(ctx, r)
+			if err != nil {
+				p.log.Warn("单条结算失败（下轮重试，旧链路）", "ledger_id", r.ledgerID, "err", err)
+				continue
+			}
+			if ok {
+				settled++
+			}
+		}
+		return settled, nil
+	}
+
 	// 组快照每轮读一次（不是每行一次）：它只用来把「人可读名」映射到组 ref。
 	// 读不到不阻塞结算 —— 直接模型仍能按名字命中，组路由行退化成 unpriced（可观测，不堵批次）。
 	groups, err := p.loadGroupNodes(ctx)
@@ -159,6 +203,9 @@ type priceInfo struct {
 	saleRates    map[string]float64
 	timeRaw      []byte
 	tiersRaw     []byte
+	// byBinding 命中候选是绑定列（bound_internal_ref）而不是名字列。dry-run 分桶用：
+	// route_id>0 且绑定命中 = 「route_id 直接命中」桶；其余定价形态都算回退链命中。
+	byBinding bool
 }
 
 // resolvePrice 按候选链找售价来源。返回 (nil, 试过的候选, nil) 表示一个都没命中（= 未定价）。
@@ -185,6 +232,7 @@ func (p *Poller) resolvePrice(ctx context.Context, r row, groups []groupNode) (*
 		if info.saleRates == nil {
 			info.saleRates = map[string]float64{}
 		}
+		info.byBinding = c.byBinding
 		return &info, tried, nil
 	}
 	return nil, tried, nil
@@ -339,4 +387,113 @@ func unpricedReason(r row, tried []string) string {
 		b.WriteString("；已尝试：" + strings.Join(tried, ", "))
 	}
 	return b.String()
+}
+
+// settleOneLegacy 旧链路结算（kill-switch 关闭时使用）。
+//
+// 语义与 main 版（v0.15.0-rc4）逐条一致——这是它存在的全部意义：新链路在真机上出问题时，
+// 运维把 env V3_SETTLE_ENABLED 清掉重启，回到**已经在线上验证过的结算口径**，而不是回到
+// 一个「看起来差不多」的混合体：
+//   - 售价按 req_model（空则 served_model）直查 external_models.external_name，单候选，
+//     不走组快照、不做绑定/名字多形态归一；查不到返回错误，该行留待下轮重试（没有
+//     unpriced 兜底）；
+//   - usage 三段口径（Input 含缓存写），cache_write 不拆段；
+//   - 成本兜底 UPDATE 不写 cost_source（main 版没有这一列的写动作）；
+//   - 余额 ≤0 禁用令牌；禁用 UPDATE 失败静默跳过（main 版口径，不加告警）。
+//
+// 刻意不复用新链路的 resolvePrice/候选链：kill-switch 的价值就在两条路径互不借用。
+func (p *Poller) settleOneLegacy(ctx context.Context, r row) (bool, error) {
+	if r.callerKey == "" {
+		return false, fmt.Errorf("缺 caller_key_name，无法归属令牌")
+	}
+	var tokenID int64
+	var userID int64
+	if err := p.db.QueryRowContext(ctx, `
+		SELECT k.token_id, t.user_id FROM magpie_keys k JOIN tokens t ON t.id = k.token_id
+		 WHERE k.key_name = $1 AND k.state = 'ACTIVE' LIMIT 1`, r.callerKey).Scan(&tokenID, &userID); err != nil {
+		return false, fmt.Errorf("找不到 callerKey=%s 对应令牌：%w", r.callerKey, err)
+	}
+
+	// 售价（req_model；为空则用 model 兜底）——单候选，查不到即失败。
+	extName := r.reqModel
+	if extName == "" {
+		extName = r.model
+	}
+	var saleRaw, timeRaw, tiersRaw []byte
+	err := p.db.QueryRowContext(ctx, `
+		SELECT sale_rates, COALESCE(time_config,'null'::jsonb), COALESCE(context_tiers,'null'::jsonb)
+		  FROM external_models WHERE external_name = $1 AND deleted_at IS NULL LIMIT 1`, extName).
+		Scan(&saleRaw, &timeRaw, &tiersRaw)
+	if err != nil {
+		return false, fmt.Errorf("找不到对外模型 %s：%w", extName, err)
+	}
+	var saleRates map[string]float64
+	_ = json.Unmarshal(saleRaw, &saleRates)
+	if saleRates == nil {
+		saleRates = map[string]float64{}
+	}
+
+	// 成本价（内部模型 ref = provider/model），缺价回落账本 cost。
+	internalRef := r.provider + "/" + r.model
+	var costRaw []byte
+	_ = p.db.QueryRowContext(ctx, `SELECT COALESCE(cost_rates,'{}'::jsonb) FROM internal_models WHERE ref = $1`, internalRef).Scan(&costRaw)
+	var costRates map[string]float64
+	_ = json.Unmarshal(billing.NormalizeRatesJSON(costRaw), &costRates) // 兼容历史 PascalCase 落库
+
+	// tokens_in 含 cache_read+cache_write；三段口径 Input 含缓存写（main 版语义，不拆段）。
+	input := r.tokensIn - r.cacheRead
+	if input < 0 {
+		input = r.tokensIn
+	}
+	req := billing.RecordReq{
+		BillingID:       "v3-" + r.ledgerID,
+		UserID:          userID,
+		PricingMode:     "sale",
+		TokenID:         &tokenID,
+		ExternalModel:   extName,
+		InternalModelID: internalRef,
+		CallTime:        r.occurredAt,
+		Tokens:          billing.Usage{Input: input, Output: r.tokensOut, CacheRead: r.cacheRead},
+		Rates:           billing.Rates(saleRates),
+		Status:          billing.StatusCompleted,
+		Remark:          "v3-bypass",
+	}
+	if len(costRates) > 0 {
+		req.CostRates = billing.Rates(costRates)
+	}
+	if len(timeRaw) > 0 && string(timeRaw) != "null" {
+		var tc billing.TimeCoeffConfig
+		if json.Unmarshal(timeRaw, &tc) == nil {
+			req.TimeConfig = &tc
+		}
+	}
+	if len(tiersRaw) > 0 && string(tiersRaw) != "null" {
+		var tiers []billing.TierRule
+		if json.Unmarshal(tiersRaw, &tiers) == nil {
+			req.ContextTiers = tiers
+		}
+	}
+
+	rec, err := p.bill.Record(ctx, req)
+	if err != nil {
+		return false, err
+	}
+	// 幂等键 + 成本兜底（没填成本价时用账本 cost；main 版不写 cost_source）。
+	if _, err := p.db.ExecContext(ctx, `
+		UPDATE billing_records SET magpie_request_id = $1,
+		       cost_credits = CASE WHEN $2::numeric > 0 THEN $2::numeric ELSE cost_credits END
+		 WHERE billing_id = $3`, r.ledgerID, r.costCredits, rec.BillingID); err != nil {
+		return false, err
+	}
+
+	// 余额 ≤0 → 禁用令牌并删代理 key（main 版口径：禁用失败静默跳过）。
+	if rec.BalanceAfter <= 0 {
+		if _, err := p.db.ExecContext(ctx, `UPDATE tokens SET status = 'DISABLED', updated_at = now() WHERE id = $1 AND status = 'ACTIVE'`, tokenID); err == nil {
+			if p.keySync != nil {
+				_ = p.keySync.Remove(ctx, tokenID)
+			}
+			p.log.Warn("令牌余额为 0，已禁用并删除代理凭据", "token_id", tokenID, "balance_after", rec.BalanceAfter)
+		}
+	}
+	return true, nil
 }

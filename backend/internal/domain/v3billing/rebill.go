@@ -71,6 +71,10 @@ const (
 var (
 	// ErrRebillGroupUnpriced 该组当前没有售价：先定价再补收（客户端问题 → 400）。
 	ErrRebillGroupUnpriced = errors.New("该组当前没有可用的售价口径，请先在拓扑页绑定售价后再补收")
+	// ErrRebillDisabled kill-switch 关闭（env V3_SETTLE_ENABLED 未设置走旧链路）。
+	// 补收的定价逻辑 = 新链路 resolvePrice：开关关闭通常意味着对新链路定价存疑（真机
+	// 出账异常时的应急动作），此时放行补收等于把同一套存疑逻辑重放进账本 → 一并拒绝（400）。
+	ErrRebillDisabled = fmt.Errorf("新结算链路未启用（%s 未设置，走旧链路），补收不可用", EnvSettleEnabled)
 )
 
 // rebillRow 是扫描到的一条待补收 unpriced 账单（req/served/route_id 来自账本行 JOIN）。
@@ -142,11 +146,22 @@ const rebillScanSQL = `
 
 // Rebill 对一个组执行补收：扫描 → 预检售价 → 逐条新账单（扣款同事务）→ 原行标记。
 // 返回汇总；个别行失败时报错并携带已完成的进度（重放自愈，见文件头「幂等三层」）。
+//
+// 入口归一（评审 P3，2026-11-20）：目标组用 groupRefForms **多形态**集合表达（组 ref /
+// 去前缀组 id / auto\<model\> / 裸名 → 抽屉形态 / slug 档全部互认），预检与行匹配共用同一
+// 集合——不再折叠成单一 ref 形态。此前单形态归一在「无组快照桥」时会把能按绑定定价的
+// Ref（auto/<m>、裸名）误判成「该组没有售价口径」直接 400。
 func (p *Poller) Rebill(ctx context.Context, groupName string) (*RebillResult, error) {
-	ref := groupRefForm(groupName)
-	if ref == "" {
+	if !p.newSettle {
+		return nil, ErrRebillDisabled
+	}
+	refs := groupRefForms(groupName)
+	if len(refs) == 0 {
 		return nil, errors.New("组名不能为空（支持组 ref、组 id 或 auto/<model> 形态）")
 	}
+	// 展示用代表形态：groupRefForms 首位恒为 groupRefForm 的归一结果（响应 GroupRef
+	// 语义与旧版逐字节兼容）；预检与行匹配按整个集合生效。
+	ref := refs[0]
 	res := &RebillResult{GroupRef: ref}
 
 	groups, err := p.loadGroupNodes(ctx)
@@ -156,21 +171,29 @@ func (p *Poller) Rebill(ctx context.Context, groupName string) (*RebillResult, e
 		groups = nil
 	}
 
-	// 预检：该组此刻是否有售价。解析输入 = ref 本身 + 组显示名（覆盖全部候选档，与行级
-	// 解析同一实现 resolvePrice）。没有就整体拒绝，避免「扣了几行才发现组还没定价」。
+	// 预检：该组此刻是否有售价。解析输入 = 全部 ref 形态 + 组显示名（覆盖全部候选档，
+	// 与行级解析同一实现 resolvePrice）。没有就整体拒绝，避免「扣了几行才发现组还没定价」。
 	displayName := ""
 	for _, g := range groups {
-		if strings.EqualFold(strings.TrimSpace(g.Ref), ref) {
-			displayName = strings.TrimSpace(g.DisplayName)
+		if !refInSet(strings.TrimSpace(g.Ref), refs) {
+			continue
+		}
+		displayName = strings.TrimSpace(g.DisplayName)
+		break
+	}
+	var priced bool
+	for _, rf := range refs {
+		price, _, err := p.resolvePrice(ctx, row{reqModel: rf, model: displayName, routeID: 1}, groups)
+		if err != nil {
+			return nil, err
+		}
+		if price != nil {
+			priced = true
 			break
 		}
 	}
-	price, _, err := p.resolvePrice(ctx, row{reqModel: ref, model: displayName, routeID: 1}, groups)
-	if err != nil {
-		return nil, err
-	}
-	if price == nil {
-		return nil, fmt.Errorf("%w：%s", ErrRebillGroupUnpriced, ref)
+	if !priced {
+		return nil, fmt.Errorf("%w：%s", ErrRebillGroupUnpriced, strings.Join(refs, " / "))
 	}
 
 	rows, err := p.db.QueryContext(ctx, rebillScanSQL)
@@ -183,7 +206,7 @@ func (p *Poller) Rebill(ctx context.Context, groupName string) (*RebillResult, e
 	}
 
 	for _, r := range all {
-		if !rebillMatchesRow(r, ref, groups) {
+		if !rebillMatchesRow(r, refs, groups) {
 			continue
 		}
 		res.Scanned++
@@ -242,8 +265,9 @@ func (p *Poller) Rebill(ctx context.Context, groupName string) (*RebillResult, e
 	return res, nil
 }
 
-// rebillMatchesRow 判断一条 unpriced 账单是否属于目标组。
-// 口径与主链候选链同源：名字形态归一（ref/组 id/auto slug）+ 组快照（display_name 双向）。
+// rebillMatchesRow 判断一条 unpriced 账单是否属于目标组（目标组 = refs 多形态集合，
+// 与补收入口 Rebill 的预检共用同一集合）。
+// 口径与主链候选链同源：名字形态归一（ref/组 id/auto slug/抽屉形态）+ 组快照（display_name 双向）。
 //
 // 候选集不对称的说明（评审 P2-1 顺手项，刻意保持现状）：
 //   - 匹配侧（本函数）扫 req/served/external 三名——扫描需要「这行账是不是这组」的
@@ -256,21 +280,31 @@ func (p *Poller) Rebill(ctx context.Context, groupName string) (*RebillResult, e
 //     （结算按主链口径落不出去、补收却能算出价），账目两边对不上。
 //   - 两名单集差异不产生误伤：external 名与 req/served 名不同时，匹配进来的行在
 //     解析侧自然落 Failed 明细（Reason=rebill_row_unresolvable），不会错算价。
-func rebillMatchesRow(r rebillRow, ref string, groups []groupNode) bool {
+func rebillMatchesRow(r rebillRow, refs []string, groups []groupNode) bool {
 	for _, name := range []string{r.ReqModel, r.ServedModel, r.ExternalModel} {
 		name = strings.TrimSpace(name)
 		if name == "" {
 			continue
 		}
 		for _, f := range groupRefForms(name) {
-			if strings.EqualFold(f, ref) {
+			if refInSet(f, refs) {
 				return true
 			}
 		}
 		for _, g := range groups {
-			if strings.TrimSpace(g.Ref) == ref && groupMatches(g, name) {
+			if refInSet(strings.TrimSpace(g.Ref), refs) && groupMatches(g, name) {
 				return true
 			}
+		}
+	}
+	return false
+}
+
+// refInSet 判定 ref 是否命中目标集合（大小写不敏感；集合来自 groupRefForms）。
+func refInSet(ref string, refs []string) bool {
+	for _, rf := range refs {
+		if strings.EqualFold(ref, rf) {
+			return true
 		}
 	}
 	return false

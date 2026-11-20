@@ -99,3 +99,22 @@ func TestWiring_PollerTriggeredAfterLedgerRound(t *testing.T) {
 		t.Fatalf("settleNow 必须调 v3Poller.Once（账本拉完立即结算）")
 	}
 }
+
+// TestWiring_V3SettleKillSwitch 结算链路 kill-switch（2026-11-20 拍板）必须接线：
+// NewPoller 的包内默认是新链路（既有用例依赖），生产模式**只能**由装配层按 env 显式
+// 设置——漏掉这组接线 = 新链路在未拍板的部署上静默启用（或写反 = 拍板要开时开不了）。
+// 判定单源在 v3billing.SettleEnabledFromEnv（fail-closed：打错字落回旧链路）。
+func TestWiring_V3SettleKillSwitch(t *testing.T) {
+	src := mainGoSource(t)
+	if !strings.Contains(src, "v3billing.SettleEnabledFromEnv()") {
+		t.Fatalf("kill-switch 判定必须走 v3billing.SettleEnabledFromEnv（单源 fail-closed），" +
+			"不许在装配层手写第二份 env 解析")
+	}
+	if !strings.Contains(src, "SetNewSettleEnabled(true)") || !strings.Contains(src, "SetNewSettleEnabled(false)") {
+		t.Fatalf("装配层必须两条分支都显式 SetNewSettleEnabled（开/关），缺一条 = 模式漂移")
+	}
+	// 开关状态必须进启动日志（「部署完为什么没出账单」的排查锚点）。
+	if !strings.Contains(src, "新链路已启用") || !strings.Contains(src, "新链路未启用") {
+		t.Fatalf("开关状态必须启动即点名（两条日志分支都要有）")
+	}
+}

@@ -69,18 +69,21 @@ func groupRefForm(name string) string {
 
 // groupRefForms 返回一个名字可能对应的全部组 ref 形态（去重、保持顺序）。
 //
-// 三种形态必须互相归一（Gate 真机实锤，PR #169：前端售价抽屉保存的绑定是网关形态
-// auto/<组名>，而镜像/账本里同一组的 id 是 auto-<slug>）：
+// 四种形态必须互相归一（Gate 真机实锤，PR #169：前端售价抽屉保存的绑定是网关形态
+// auto/<组名>，而镜像/账本里同一组的 id 是 auto-<slug>；评审 P3 补第三向：网关 auto 组
+// 账本行 req_model 是**裸组名**——裸名也要反推抽屉形态与 slug 档，否则无组快照桥时
+// 裸名行结算不出、补收入口 400）：
 //   - 网关/抽屉形态：auto/<组名>（绑定真源可能就是它本身）；
 //   - 镜像形态原样：group/auto-<组名原样>；
-//   - 镜像形态 slug：group/auto-<slug(组名)>（小写、非 [a-z0-9.-] 转 -）。
+//   - 镜像形态 slug：group/auto-<slug(组名)>（小写、非 [a-z0-9.-] 转 -）；
+//   - 裸名直接档：group/<组名>（不带头的历史写法）。
 //
-// slug 规则由 magpie 定义，这里只做最保守的近似，三种都给出：多一个候选不会算错账
+// slug 规则由 magpie 定义，这里只做最保守的近似，四种都给出：多一个候选不会算错账
 // （查询的是运营配置的绑定/名字，命中哪条都是那组自己的售价），少一个候选会让这行账
 // 结算不出去（回到 unpriced 堆积，真机事故）。
 func groupRefForms(name string) []string {
 	s := strings.TrimSpace(name)
-	out := make([]string, 0, 3)
+	out := make([]string, 0, 4)
 	seen := map[string]bool{}
 	add := func(v string) {
 		if v == "" || seen[v] {
@@ -103,6 +106,14 @@ func groupRefForms(name string) []string {
 		add("auto/" + id)
 		// 历史原样落库的镜像形态（含非 slug 字符）也补 slug 档；真 slug 的 id 会去重掉。
 		add("group/auto-" + groupSlug(id))
+	} else if strings.HasPrefix(strings.ToLower(s), "group/") {
+		// 已是组 ref 形态但非 auto 组（group/<名>）：只按原样，不反推 auto/ ——
+		// 「组名叫 X」与「auto 组名叫 X」是两个不同对象，反推会把不相关的账并进来。
+	} else if s != "" {
+		// 裸名（网关 auto 组账本行 req_model 的形态，评审 P3）：反推抽屉绑定形态与
+		// 镜像 slug 档——无组快照桥时裸名行也能按绑定/镜像形态命中售价。
+		add("auto/" + s)
+		add("group/auto-" + groupSlug(s))
 	}
 	return out
 }

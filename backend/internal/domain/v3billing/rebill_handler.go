@@ -40,6 +40,10 @@ const (
 	ReasonRebillRecordError = "rebill_record_error"
 	// ReasonRebillAlreadyRebilled 行级失败里撞上「已被补收」的形态（进 Failed 明细）。
 	ReasonRebillAlreadyRebilled = "rebill_already_rebilled"
+	// ReasonRebillDisabled kill-switch 关闭（env V3_SETTLE_ENABLED 未设置走旧链路）：
+	// 整批拒绝（400），不进 Failed 明细。补收定价逻辑 = 新链路 resolvePrice，开关关闭
+	// 通常意味着对新链路定价存疑，放行会把同一套存疑逻辑重放进账本。
+	ReasonRebillDisabled = "rebill_disabled"
 )
 
 // RebillHandler 是补收接口（nil = 不挂载）。
@@ -75,6 +79,11 @@ func (h *RebillHandler) HandleRebillUnpriced(w http.ResponseWriter, r *http.Requ
 	out, err := h.poller.Rebill(r.Context(), ref)
 	if err != nil {
 		switch {
+		case errors.Is(err, ErrRebillDisabled):
+			// kill-switch 关闭：新链路（含补收）整体不可用。400（客户端可见的形态问题：
+			// 该功能在当前部署未启用），不是 500。
+			resp.ErrReason(w, r, http.StatusBadRequest, resp.CodeBadRequest, ReasonRebillDisabled,
+				err.Error(), map[string]any{"Ref": ref})
 		case errors.Is(err, ErrRebillGroupUnpriced):
 			resp.ErrReason(w, r, http.StatusBadRequest, resp.CodeBadRequest, ReasonRebillGroupUnpriced,
 				err.Error(), map[string]any{"Ref": ref})
