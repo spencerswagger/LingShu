@@ -113,7 +113,9 @@ func (h *KeyAdminHandler) HandleAutoPut(w http.ResponseWriter, r *http.Request) 
 			userID = uid
 		}
 	}
-	if err := h.sync.Ensure(r.Context(), userID, TokenRef{ID: tokenID, DisplayName: h.tokenDisplayName(r.Context(), tokenID)}, h.tokenUsername(r.Context(), tokenID), plain); err != nil {
+	// 一键开通是显式管理动作：停用行（令牌停用时 Remove 删过）允许翻回 ACTIVE
+	// （自动路径的 Ensure 会拒绝；评审必改①的状态纪律只在自动侧收口）。
+	if err := h.sync.Reactivate(r.Context(), userID, TokenRef{ID: tokenID, DisplayName: h.tokenDisplayName(r.Context(), tokenID)}, h.tokenUsername(r.Context(), tokenID), plain); err != nil {
 		resp.Err(w, r, http.StatusBadGateway, resp.CodeInternalError, "开通失败："+err.Error())
 		return
 	}

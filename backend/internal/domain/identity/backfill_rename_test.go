@@ -22,16 +22,20 @@ import (
 	"github.com/team/llmgateway/internal/pkg/crypto"
 )
 
-// fakeSyncer 记录 Ensure 调用（回填执行断言），可注入失败。
+// fakeSyncer 记录 Ensure/Reactivate 调用（回填执行断言），可注入失败。
 type fakeSyncer struct {
-	mu    sync.Mutex
-	calls []string // "uid:tokid:disp:username"
-	fail  map[int64]error
+	mu             sync.Mutex
+	calls          []string // "uid:tokid:disp:username"（Ensure）/ "R uid:tokid:disp"（Reactivate）
+	fail           map[int64]error
+	EnsureDisabled bool // true 时 Ensure 返回 ErrCallerKeyDisabled（模拟自动路径守卫）
 }
 
 func (f *fakeSyncer) Ensure(_ context.Context, userID int64, tok CallerKeyToken, username, _ string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.EnsureDisabled {
+		return ErrCallerKeyDisabled
+	}
 	if err, ok := f.fail[tok.ID]; ok {
 		return err
 	}
@@ -40,6 +44,14 @@ func (f *fakeSyncer) Ensure(_ context.Context, userID int64, tok CallerKeyToken,
 }
 
 func (f *fakeSyncer) Remove(context.Context, int64) error { return nil }
+
+// Reactivate 显式启用路径（Toggle 启用侧）；回填用例里不应被调用（停用行走分桶）。
+func (f *fakeSyncer) Reactivate(_ context.Context, userID int64, tok CallerKeyToken, _ string, _ string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, fmt.Sprintf("R%d:%d:%s", userID, tok.ID, tok.DisplayName))
+	return nil
+}
 
 const listTokensPageSQL = `SELECT ` + tokenInfoCols + ` FROM tokens t JOIN users u ON u.id = t.user_id
 		 WHERE t.deleted_at IS NULL AND u.deleted_at IS NULL
@@ -87,6 +99,55 @@ func newBackfillSvc(t *testing.T, ids []int64, names map[int64]string, secrets m
 	fs := &fakeSyncer{fail: map[int64]error{}}
 	svc.SetCallerKeySyncer(fs)
 	svc.SetCallerKeyNameOf(func(ctx context.Context, tokenID int64) string { return names[tokenID] })
+	svc.SetCallerWantNameOf(func(ctx context.Context, userID, tokenID int64, displayName string) string {
+		return fmt.Sprintf("want-u%d-t%d", userID, tokenID)
+	})
+	return svc, mock, fs
+}
+
+// newBackfillSvcStates 同 newBackfillSvc，额外注入映射行状态（disabled 分桶用例）。
+func newBackfillSvcStates(t *testing.T, ids []int64, names, secrets, states map[int64]string) (*TokenService, sqlmock.Sqlmock, *fakeSyncer) {
+	t.Helper()
+	var err2 error
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	mock.ExpectQuery(`SELECT count\(\*\) FROM tokens t JOIN users u ON u.id = t.user_id WHERE t.deleted_at IS NULL AND u.deleted_at IS NULL`).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(int64(len(ids))))
+	rows := sqlmock.NewRows([]string{"t.id", "t.token_hash", "t.token_display", "t.user_id", "t.display_name",
+		"t.expires_at", "t.last_used_at", "t.status", "t.created_at", "u.username", "u.nickname"})
+	for _, id := range ids {
+		uid := int64(100 + id%3)
+		rows.AddRow(id, fmt.Sprintf("hash-%d", id), fmt.Sprintf("disp-%d", id), uid,
+			fmt.Sprintf("name-%d", id), nil, nil, "ACTIVE", time.Now(), fmt.Sprintf("user-%d", uid), "")
+	}
+	mock.ExpectQuery(regexp.QuoteMeta(listTokensPageSQL)).WithArgs(nil, "", 50, 0).
+		WillReturnRows(rows)
+	for _, id := range ids {
+		if states[id] == "DISABLED" {
+			continue // 停用行走分桶：不查密文（省一次往返，行为与实现一致）
+		}
+		cipher := ""
+		if secrets[id] != "" {
+			cipher, err2 = crypto.SM4Encrypt([]byte("0123456789abcdef"), []byte(secrets[id]))
+			if err2 != nil {
+				t.Fatalf("sm4: %v", err2)
+			}
+		}
+		mock.ExpectQuery(regexp.QuoteMeta(`SELECT COALESCE(secret_cipher, '') FROM tokens WHERE id = $1 AND deleted_at IS NULL`)).
+			WithArgs(id).
+			WillReturnRows(sqlmock.NewRows([]string{"cipher"}).AddRow(cipher))
+	}
+
+	svc := NewTokenService(NewTokenStore(db))
+	svc.SetSecretKey([]byte("0123456789abcdef"))
+	fs := &fakeSyncer{fail: map[int64]error{}}
+	svc.SetCallerKeySyncer(fs)
+	svc.SetCallerKeyNameOf(func(ctx context.Context, tokenID int64) string { return names[tokenID] })
+	svc.SetCallerKeyStateOf(func(ctx context.Context, tokenID int64) string { return states[tokenID] })
 	svc.SetCallerWantNameOf(func(ctx context.Context, userID, tokenID int64, displayName string) string {
 		return fmt.Sprintf("want-u%d-t%d", userID, tokenID)
 	})
@@ -288,4 +349,75 @@ func TestRenameHandler_BodyDryRunFalse(t *testing.T) {
 	if rec.Code != http.StatusOK || len(fs.calls) != 1 {
 		t.Fatalf("body 显式 false 应执行：%d calls=%v", rec.Code, fs.calls)
 	}
+}
+
+// TestBackfill_DisabledBucketSkips 停用映射行（令牌停用时 Remove 删过代理 key）：
+// dry-run 与执行态都进 disabled 桶、Ensure 零调用、不进 failed（评审必改①的行为锚）。
+// 旧自动名的停用行也必须走这里 —— 自动路径不碰它（改名只在显式启用/管理端开通后发生）。
+func TestBackfill_DisabledBucketSkips(t *testing.T) {
+	ids := []int64{1, 2}
+	names := map[int64]string{
+		1: "ops-manual-key", // 停用 + 手工名
+		2: "ls-token-2",     // 停用 + 旧自动名（评审洞②形状：自动改名绝不能碰到它）
+	}
+	secrets := map[int64]string{1: "s1", 2: "s2"}
+	states := map[int64]string{1: "DISABLED", 2: "DISABLED"}
+
+	// dry-run：分桶 + 零执行。
+	svc, mock, fs := newBackfillSvcStates(t, ids, names, secrets, states)
+	created, renamed, skipped, failed, err := svc.BackfillCallerKeys(context.Background(), 0, true)
+	if err != nil {
+		t.Fatalf("dry-run: %v", err)
+	}
+	if created != 0 || renamed != 0 || len(failed) != 0 || len(fs.calls) != 0 {
+		t.Fatalf("dry-run 不得执行/报错：created=%d renamed=%d failed=%v calls=%v", created, renamed, failed, fs.calls)
+	}
+	if skipped["disabled"] != 2 {
+		t.Fatalf("停用行应双双进 disabled 桶：%v", skipped)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("%v", err)
+	}
+
+	// 执行态：同样分桶跳过、Ensure 零调用、无 failed（不产生重试压力）。
+	svc2, mock2, fs2 := newBackfillSvcStates(t, ids, names, secrets, states)
+	created, renamed, skipped, failed, err = svc2.BackfillCallerKeys(context.Background(), 0, false)
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if created != 0 || renamed != 0 || len(failed) != 0 || len(fs2.calls) != 0 {
+		t.Fatalf("执行态停用行必须跳过：created=%d renamed=%d failed=%v calls=%v", created, renamed, failed, fs2.calls)
+	}
+	if skipped["disabled"] != 2 {
+		t.Fatalf("执行态停用桶不符：%v", skipped)
+	}
+	if err := mock2.ExpectationsWereMet(); err != nil {
+		t.Fatalf("%v", err)
+	}
+}
+
+// TestBackfill_DisabledBySentinel 状态钩子缺位（未注入 SetCallerKeyStateOf）时，
+// Ensure 自带的 state 守卫兜底：停用行进 disabled 桶，不进 failed。
+func TestBackfill_DisabledBySentinel(t *testing.T) {
+	ids := []int64{1}
+	names := map[int64]string{1: "ls-token-1"}
+	secrets := map[int64]string{1: "s1"}
+	svc, mock, fs := newBackfillSvc(t, ids, names, secrets)
+	// 不注入 state 钩子；Ensure 对停用行返回 ErrCallerKeyDisabled（自动路径守卫）。
+	fs.EnsureDisabled = true
+
+	created, renamed, skipped, failed, err := svc.BackfillCallerKeys(context.Background(), 0, false)
+	if err != nil {
+		t.Fatalf("backfill: %v", err)
+	}
+	if created != 0 || renamed != 0 || len(failed) != 0 {
+		t.Fatalf("哨兵应进 disabled 桶而非 failed：created=%d renamed=%d failed=%v", created, renamed, failed)
+	}
+	if skipped["disabled"] != 1 {
+		t.Fatalf("disabled 桶不符：%v", skipped)
+	}
+	if len(fs.calls) != 0 {
+		t.Fatalf("Ensure 之外的调用不应发生：%v", fs.calls)
+	}
+	_ = mock
 }

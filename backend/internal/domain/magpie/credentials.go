@@ -208,32 +208,18 @@ func (s *KeyStore) Disable(ctx context.Context, tokenID int64) error {
 	return nil
 }
 
-// Rename 原地改名该令牌的映射：key_name 换新名，旧名落 legacy_key_name（结算反查兜底）。
-// 行不存在返回 ErrKeyNotProvisioned。幂等：重复执行结果一致。
-//
-// 前提：代理侧已 rename 成功（调用方顺序保证）；单语句原子。
-func (s *KeyStore) Rename(ctx context.Context, tokenID int64, oldName, newName string) (*Key, error) {
-	k, err := scanKey(s.db.QueryRowContext(ctx,
-		`UPDATE magpie_keys SET key_name = $3, legacy_key_name = $2, updated_at = now()
-		 WHERE token_id = $1 AND state <> 'DISABLED'
-		 RETURNING `+keyScanCols, tokenID, oldName, newName))
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, ErrKeyNotProvisioned
-		}
-		return nil, fmt.Errorf("rename magpie key: %w", err)
-	}
-	return k, nil
-}
-
-// RenameAndActivate = Rename + 保存密文并置 ACTIVE（改名回填第③步的完整语义）。
-// 幂等：重复执行同值收敛；停用行（DISABLED）不抬升（启用走 Provision）。
-func (s *KeyStore) RenameAndActivate(ctx context.Context, tokenID int64, oldName, newName, keyCipher string) (*Key, error) {
-	k, err := scanKey(s.db.QueryRowContext(ctx,
-		`UPDATE magpie_keys SET key_name = $3, legacy_key_name = $2, key_cipher = $4,
+// renameAndActivateSQL 改名+激活的完整语句（评审 P2：测试侧用**逐字拷贝的字面量**
+// 全文锚定 —— 不许引用本常量拼正则，否则实现与期望同源、变异抓不到）。
+// 兜底列写入语义：legacy_key_name = $2（旧名快照，结算反查兜底键）。
+const renameAndActivateSQL = `UPDATE magpie_keys SET key_name = $3, legacy_key_name = $2, key_cipher = $4,
 		        state = 'ACTIVE', last_synced_at = now(), last_error = NULL, updated_at = now()
 		 WHERE token_id = $1 AND state <> 'DISABLED'
-		 RETURNING `+keyScanCols, tokenID, oldName, newName, keyCipher))
+		 RETURNING ` + keyScanCols
+
+// RenameAndActivate = 改名 + 保存密文并置 ACTIVE（改名回填第③步的完整语义）。
+// 幂等：重复执行同值收敛；停用行（DISABLED）不抬升（启用走 Reactivate/Provision）。
+func (s *KeyStore) RenameAndActivate(ctx context.Context, tokenID int64, oldName, newName, keyCipher string) (*Key, error) {
+	k, err := scanKey(s.db.QueryRowContext(ctx, renameAndActivateSQL, tokenID, oldName, newName, keyCipher))
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrKeyNotProvisioned

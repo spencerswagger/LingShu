@@ -123,7 +123,14 @@ func TestKeyStore_ProvisionKeepsKeyID(t *testing.T) {
 	}
 }
 
-var renameStmt = regexp.MustCompile(`UPDATE magpie_keys SET key_name = \$3`)
+// renameAndActivateStmt 是 RenameAndActivate 完整语句的**逐字拷贝**（含 keyScanCols 展开）。
+// 故意不引用 renameAndActivateSQL 常量：期望与实现同源会让「改实现」的变异也改掉期望（假绿）。
+// 全文 ^…$ 锚定后，任何谓词/兜底列写入被静默改写（如 legacy_key_name = $2 改成 ”）
+// 都会因不再匹配而红 —— 这是评审 P2 指出的「用例只钉 SQL 前缀」缺口的堵法。
+var renameAndActivateStmt = regexp.MustCompile(`^UPDATE magpie_keys SET key_name = \$3, legacy_key_name = \$2, key_cipher = \$4,
+		        state = 'ACTIVE', last_synced_at = now\(\), last_error = NULL, updated_at = now\(\)
+		 WHERE token_id = \$1 AND state <> 'DISABLED'
+		 RETURNING id, token_id, key_name, coalesce\(legacy_key_name,''\), coalesce\(key_id,''\), coalesce\(key_cipher,''\), state$`)
 
 // renameColumns 与 keyColumns 同形状（+legacy_key_name）。
 func TestKeyStore_RenameAndActivate(t *testing.T) {
@@ -135,7 +142,8 @@ func TestKeyStore_RenameAndActivate(t *testing.T) {
 	s := NewKeyStore(db)
 
 	// rename + activate 一条 UPDATE：旧名落 legacy_key_name、新名生效、state ACTIVE。
-	mock.ExpectQuery(renameStmt.String()).
+	// WithArgs 逐位钉死 $2=旧名（兜底列写入值）——参数位序错或写空串都会红。
+	mock.ExpectQuery(renameAndActivateStmt.String()).
 		WithArgs(int64(7), "ls-token-7", "ls-u1-t7-alpha", "new-cipher").
 		WillReturnRows(sqlmock.NewRows(keyColumns()).
 			AddRow(int64(1), int64(7), "ls-u1-t7-alpha", "ls-token-7", "", "new-cipher", KeyStateActive))
@@ -160,7 +168,7 @@ func TestKeyStore_RenameAndActivate_NotProvisioned(t *testing.T) {
 	}
 	defer db.Close()
 	s := NewKeyStore(db)
-	mock.ExpectQuery(renameStmt.String()).
+	mock.ExpectQuery(renameAndActivateStmt.String()).
 		WithArgs(int64(7), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
 		WillReturnError(sql.ErrNoRows)
 	if _, err := s.RenameAndActivate(context.Background(), 7, "o", "n", "c"); !errors.Is(err, ErrKeyNotProvisioned) {
@@ -230,5 +238,13 @@ func TestKeyStore_NamesByTokenIDs_Empty(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("空入参不应发 SQL：%v", err)
+	}
+}
+
+// TestKeyStateLiterals 状态字面量锚（identity.backfill 的 disabled 分桶用同值字符串比较，
+// 两侧漂移会让「停用行跳过」静默失效——按字面量钉死）。
+func TestKeyStateLiterals(t *testing.T) {
+	if KeyStateActive != "ACTIVE" || KeyStateDisabled != "DISABLED" {
+		t.Fatalf("状态字面量漂移：ACTIVE=%q DISABLED=%q", KeyStateActive, KeyStateDisabled)
 	}
 }

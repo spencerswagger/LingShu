@@ -106,6 +106,16 @@ func sm4KeyFromConfig(cfg *config.Config) []byte {
 	return kb
 }
 
+// envFlagOn 判定「默认 off 的显式开关」env：非空且不是 0/false/off（大小写不敏感）才视为开。
+// 用于 CALLERKEY_BACKFILL_ON_BOOT 这类「不设 = 保守关闭」的闸门（评审 P2-1）。
+func envFlagOn(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "", "0", "false", "off", "no":
+		return false
+	}
+	return true
+}
+
 // magpieJumpKey 读取代理侧管理面票据的 HMAC 密钥（32 字节，即 64 个 hex 字符）。
 //
 // 与 SM4/JWT 密钥同法自举：环境变量 > keys/magpie_jump.key > 首次生成并落盘（chmod 600）。
@@ -541,6 +551,14 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 				}
 				return k.KeyName
 			})
+			// 停用分桶（评审必改①）：令牌停用时 Remove 删过代理 key 的行，自动回填不碰。
+			tokenSvc.SetCallerKeyStateOf(func(ctx context.Context, tokenID int64) string {
+				k, err := keyStoreForLookup.ByTokenID(ctx, tokenID)
+				if err != nil || k == nil {
+					return ""
+				}
+				return k.State
+			})
 			tokenSvc.SetCallerWantNameOf(func(ctx context.Context, userID, tokenID int64, displayName string) string {
 				return magpie.KeyNameFor(userID, tokenID, tokenSvc.UsernameOfToken(ctx, tokenID), displayName)
 			})
@@ -557,28 +575,39 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 			magpieKeyAdmin.SetOwnerOf(tokenSvc.UserIDOfToken)
 			magpieKeyAdmin.SetAutoSync(tokenSvc.Secret, keySync, tokenSvc.DisplayNameOf)
 			v3Poller.SetKeySync(keySync)
-			// 升级自动补建：启动即把存量令牌注册/改名代理侧 callerKey（线性退避，最多约 1h）。
-			// 改名口径（2026-11-20 定案①④）：ls-token-<id> → ls-u<uid>-t<tid>-<slug>，
-			// magpie 侧 rename-key 原地改（值不变），旧名落 legacy_key_name 供结算反查。
-			go func() {
-				for i := 0; i < 10; i++ {
-					created, renamed, skipped, failed, err := tokenSvc.BackfillCallerKeys(context.Background(), 0, false)
-					if err == nil {
-						logr.Info("V3 存量令牌补建/改名完成",
-							"created", created, "renamed", renamed,
-							"skipped_already_bound", skipped["already-bound"],
-							"skipped_renamed", skipped["renamed"],
-							"skipped_manual_named", skipped["manual-named"],
-							"skipped_no_cipher", skipped["no-cipher"], "failed", len(failed))
-						if len(failed) == 0 {
-							return
+			// 升级自动补建【默认关闭（评审 P2-1 拍板）】：启动即对存量令牌执行真机改名，
+			// 属真实环境数据操作 —— 必须「先 dry-run、经确认再放开」：
+			//   ① 部署后先跑 dry-run：POST /api/v1/admin/tokens/magpie-keys/rename {"DryRun":true}
+			//      （只分桶不执行；关注 renamed / disabled / no-cipher / Conflict 分布）；
+			//   ② 桶分布经确认后，设 CALLERKEY_BACKFILL_ON_BOOT=1 重启（或一次性手动执行
+			//      rename 接口 {"DryRun":false}），自动补建才开始跑（线性退避，最多约 1h）。
+			// 改名口径（2026-11-20 定案①④）：旧自动名 → 新契约名，magpie 侧 rename-key
+			// 原地改（值不变），旧名落 legacy_key_name 供结算反查；停用行自动跳过（disabled 桶）。
+			if envFlagOn("CALLERKEY_BACKFILL_ON_BOOT") {
+				go func() {
+					for i := 0; i < 10; i++ {
+						created, renamed, skipped, failed, err := tokenSvc.BackfillCallerKeys(context.Background(), 0, false)
+						if err == nil {
+							logr.Info("V3 存量令牌补建/改名完成",
+								"created", created, "renamed", renamed,
+								"skipped_already_bound", skipped["already-bound"],
+								"skipped_renamed", skipped["renamed"],
+								"skipped_manual_named", skipped["manual-named"],
+								"skipped_disabled", skipped["disabled"],
+								"skipped_no_cipher", skipped["no-cipher"], "failed", len(failed))
+							if len(failed) == 0 {
+								return
+							}
+						} else {
+							logr.Warn("V3 存量令牌补建失败（下轮重试）", "err", err)
 						}
-					} else {
-						logr.Warn("V3 存量令牌补建失败（下轮重试）", "err", err)
+						time.Sleep(time.Duration(10*(i+1)) * time.Second)
 					}
-					time.Sleep(time.Duration(10*(i+1)) * time.Second)
-				}
-			}()
+				}()
+			} else {
+				logr.Info("启动自动补建未开启（CALLERKEY_BACKFILL_ON_BOOT 默认 off）：" +
+					"先跑 rename 接口 dry-run 确认桶分布、经确认后再设该变量放开")
+			}
 		}
 	}
 

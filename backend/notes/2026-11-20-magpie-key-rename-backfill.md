@@ -101,3 +101,43 @@ legacy_key_name 兜底列）。回滚同理由 rename-key 反向改回。
   真实环境同名令牌超过 8 个才会触发（触发时 failed 明细给出 tokenID）。
 - 启动补建 goroutine 自动改名风险不变（部署前先 POST rename 默认 dry-run 看桶分布；
   需要完全手动可协商 kill-switch）。
+
+---
+
+## Owl II 评审修复（2026-11-20 夜，锚 head e2c77d2 之上）
+
+必改 1（停用令牌两洞）——Ensure 加 state 守卫，DISABLED 行一律拒绝（ErrKeyDisabled）：
+- 洞①：手工名/终态名分支 Provision upsert 无守卫，自动回填把停用行翻回 ACTIVE、
+  代理侧 key 被重建（Toggle 刚删的被原样搬回）。
+- 洞②：旧自动名分支先 rename 代理侧、本地 RenameAndActivate 被 state<>'DISABLED' 拒
+  → 本地永远追不上、启动 goroutine 每轮重试死循环。
+- 修法：Ensure 取行后先判 state（在任何代理侧动作与本地写之前）停用即返回哨兵；
+  显式启用（Toggle 启用侧 / 管理端一键开通）改走新增 Reactivate —— 唯一允许把
+  DISABLED 行翻回 ACTIVE 的入口（先按当前名恢复代理 key + 本地翻 ACTIVE，再复用
+  Ensure 收敛改名/对齐）。
+- 回填侧配套：新 disabled 分桶（dry-run 与执行态都跳过、不进 failed、不触发密文查询）；
+  状态钩子（SetCallerKeyStateOf）缺位时由 Ensure 哨兵兜底（第二道防线）。
+- 测试钉住：TestEnsure_DisabledRowUntouched（不翻状态/代理零调用/重复调用无副作用）、
+  TestEnsure_DisabledLegacyRowNoProxyRename（洞②锚：绝不先 rename 代理侧）、
+  TestReactivate_DisabledRowFlipsAndConverges（显式启用终态=从未停用）、
+  TestReactivate_ActiveRowIsPlainEnsure、
+  identity：TestBackfill_DisabledBucketSkips（两态分桶/Ensure 零调用）、
+  TestBackfill_DisabledBySentinel（钩子缺位兜底）。
+- 变异验证：删 state 守卫 → 两条 Ensure 用例红；还原全绿。
+
+P2-1（主持人拍板：env 闸门默认关）：启动自动补建 goroutine 包进
+  `if envFlagOn("CALLERKEY_BACKFILL_ON_BOOT")`（未设/0/false/off = 关，启动打 Info 说明
+  「先 dry-run 再放开」）；部署顺序写进 main.go 注释与本 notes；
+  cmd/server/wiring_test.go 新增 TestWiring_StartupBackfillGatedByEnv 源码级守卫
+  （按行首 `if envFlagOn(...)` 判定，注释里提到变量名不算）。
+  变异（闸门改 `if true`）→ 守卫红；还原绿。
+
+P2-2a：KeyStore.Rename 零生产调用，已删（fake 同步清理）。
+
+P2-2b：RenameAndActivate 的 legacy 兜底列写入钉死——
+  ① keystore_test 期望改全文 ^…$ 锚定（逐字拷贝实现语句，故意不引用实现常量，
+  防同源假绿）；② WithArgs 逐位钉 $2=旧名；③ 真库回写断言沿用
+  rename_rollback_pg_test 的 RenameAndActivate → ByTokenID 往返（legacy 值逐字校验）。
+  变异（legacy_key_name 写 ''）→ 全文锚定红；还原绿。
+
+P2-3：任务书口径待 spencer 确认，不动代码。

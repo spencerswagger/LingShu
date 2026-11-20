@@ -64,10 +64,6 @@ func (f *fakeKeyStore) Disable(_ context.Context, tokenID int64) error {
 	return nil
 }
 
-func (f *fakeKeyStore) Rename(_ context.Context, tokenID int64, oldName, newName string) (*Key, error) {
-	return f.RenameAndActivate(context.Background(), tokenID, oldName, newName, "")
-}
-
 func (f *fakeKeyStore) RenameAndActivate(_ context.Context, tokenID int64, oldName, newName, keyCipher string) (*Key, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -433,3 +429,129 @@ func mustFakePage(t *testing.T) string {
 }
 
 var _ = strings.TrimSpace // 保持 import 稳定（防用例删减后 import 失配）
+
+// TestEnsure_DisabledRowUntouched 停用行守卫（评审必改①·洞①锚）：
+// 手工名停用行被 Ensure 拒（ErrKeyDisabled），本地行不翻 ACTIVE、代理侧零调用、
+// 重复调用无副作用（自动回填每轮都撞同一堵墙，不会推进任何状态）。
+func TestEnsure_DisabledRowUntouched(t *testing.T) {
+	srv, pageKeys := fakeMagpiePage(t, syncTestPageKey)
+	fk := newFakeKeyStore()
+	// 预置：手工名映射，令牌停用时 Remove 过（代理侧已删、本地 DISABLED）。
+	fk.Provision(context.Background(), 9, "ops-manual-key", "old-cipher")
+	fk.Disable(context.Background(), 9)
+	s := newSyncForTest(t, srv.URL, fk)
+	ctx := context.Background()
+
+	for i := 0; i < 3; i++ { // 重复调用 = 启动补建多轮重试的形状
+		err := s.Ensure(ctx, 3, TokenRef{ID: 9, DisplayName: "x"}, "user3", "secret-9")
+		if !errors.Is(err, ErrKeyDisabled) {
+			t.Fatalf("第 %d 轮：停用行应被拒（ErrKeyDisabled），got %v", i, err)
+		}
+	}
+	k, _ := fk.ByTokenID(ctx, 9)
+	if k.State != KeyStateDisabled || k.KeyName != "ops-manual-key" {
+		t.Fatalf("停用行被动了：%+v", k)
+	}
+	if fk.provision != 1 { // 只有预置那一次，Ensure 未走 Provision
+		t.Fatalf("Ensure 不得对停用行 Provision（翻状态）：provision=%d", fk.provision)
+	}
+	if len(fk.renames) != 0 {
+		t.Fatalf("Ensure 不得对停用行改名：%v", fk.renames)
+	}
+	if mapCount(pageKeys) != 0 {
+		t.Fatalf("代理侧零调用（不得重建 key）：%d", mapCount(pageKeys))
+	}
+}
+
+// TestEnsure_DisabledLegacyRowNoProxyRename 停用 + 旧自动名（评审必改①·洞②锚）：
+// 绝不先 rename 代理侧 —— 否则代理侧已改、本地被 state 守卫拒，每轮重试死循环。
+func TestEnsure_DisabledLegacyRowNoProxyRename(t *testing.T) {
+	srv, pageKeys := fakeMagpiePage(t, syncTestPageKey)
+	fk := newFakeKeyStore()
+	fk.Provision(context.Background(), 7, "ls-token-7", "old-cipher")
+	fk.Disable(context.Background(), 7)
+	s := newSyncForTest(t, srv.URL, fk)
+	ctx := context.Background()
+
+	for i := 0; i < 3; i++ {
+		if err := s.Ensure(ctx, 12, TokenRef{ID: 7, DisplayName: "bot"}, "zhangsan", "secret-xyz"); !errors.Is(err, ErrKeyDisabled) {
+			t.Fatalf("第 %d 轮：got %v", i, err)
+		}
+	}
+	// 代理侧必须零动作：旧名不存在（Toggle 停用时删过）、新名也绝不能被创建/改名出来。
+	if mapCount(pageKeys) != 0 {
+		t.Fatalf("停用行不得碰代理侧（rename 会造成本地永远追不上的死循环）：%v", snapshotNames(pageKeys))
+	}
+	if len(fk.renames) != 0 || fk.provision != 1 {
+		t.Fatalf("本地零写：renames=%v provision=%d", fk.renames, fk.provision)
+	}
+	k, _ := fk.ByTokenID(ctx, 7)
+	if k.State != KeyStateDisabled || k.KeyName != "ls-token-7" {
+		t.Fatalf("停用行被动了：%+v", k)
+	}
+}
+
+// TestReactivate_DisabledRowFlipsAndConverges 显式启用（Toggle 启用侧 / 管理端一键开通）：
+// 停用行先按**当前名**恢复代理 key + 本地翻 ACTIVE，随后常规收敛（旧自动名 → 改名三步），
+// 终态与从未停用过的行一致。
+func TestReactivate_DisabledRowFlipsAndConverges(t *testing.T) {
+	srv, pageKeys := fakeMagpiePage(t, syncTestPageKey)
+	fk := newFakeKeyStore()
+	fk.Provision(context.Background(), 7, "ls-token-7", "old-cipher")
+	fk.Disable(context.Background(), 7)
+	s := newSyncForTest(t, srv.URL, fk)
+	ctx := context.Background()
+
+	if err := s.Reactivate(ctx, 12, TokenRef{ID: 7, DisplayName: "bot"}, "zhangsan", "secret-xyz"); err != nil {
+		t.Fatalf("Reactivate: %v", err)
+	}
+	k, _ := fk.ByTokenID(ctx, 7)
+	want := KeyNameFor(12, 7, "zhangsan", "bot")
+	if k.State != KeyStateActive || k.KeyName != want || k.LegacyKeyName != "ls-token-7" {
+		t.Fatalf("显式启用终态不符：%+v want=%s", k, want)
+	}
+	if v, ok := pageKeys.Load(want); !ok || v != "secret-xyz" {
+		t.Fatalf("代理侧终态不符：ok=%v v=%v", ok, v)
+	}
+	// 幂等：再跑一次零写收敛。
+	p1, r1 := fk.provision, len(fk.renames)
+	if err := s.Reactivate(ctx, 12, TokenRef{ID: 7, DisplayName: "bot"}, "zhangsan", "secret-xyz"); err != nil {
+		t.Fatalf("Reactivate rerun: %v", err)
+	}
+	if fk.provision != p1 || len(fk.renames) != r1 {
+		t.Fatalf("重跑产生了新写动作：provision=%d→%d renames=%d→%d", p1, fk.provision, r1, len(fk.renames))
+	}
+}
+
+// TestReactivate_ActiveRowIsPlainEnsure 未停用的行：Reactivate 与 Ensure 等价（终态快检零写）。
+func TestReactivate_ActiveRowIsPlainEnsure(t *testing.T) {
+	srv, _ := fakeMagpiePage(t, syncTestPageKey)
+	fk := newFakeKeyStore()
+	fk.Provision(context.Background(), 7, "ls-token-7", "old-cipher")
+	s := newSyncForTest(t, srv.URL, fk)
+	ctx := context.Background()
+
+	if err := s.Reactivate(ctx, 12, TokenRef{ID: 7, DisplayName: "bot"}, "zhangsan", "secret-xyz"); err != nil {
+		t.Fatalf("Reactivate: %v", err)
+	}
+	want := KeyNameFor(12, 7, "zhangsan", "bot")
+	k, _ := fk.ByTokenID(ctx, 7)
+	if k.State != KeyStateActive || k.KeyName != want {
+		t.Fatalf("终态不符：%+v", k)
+	}
+	// 再跑：终态快检零写。
+	p1, r1 := fk.provision, len(fk.renames)
+	if err := s.Reactivate(ctx, 12, TokenRef{ID: 7, DisplayName: "bot"}, "zhangsan", "secret-xyz"); err != nil {
+		t.Fatalf("rerun: %v", err)
+	}
+	if fk.provision != p1 || len(fk.renames) != r1 {
+		t.Fatalf("终态重跑零写：provision=%d→%d renames=%d→%d", p1, fk.provision, r1, len(fk.renames))
+	}
+}
+
+// snapshotNames 取 fake 代理侧当前全部名字（失败信息用）。
+func snapshotNames(m *sync.Map) []string {
+	var out []string
+	m.Range(func(k, _ any) bool { out = append(out, k.(string)); return true })
+	return out
+}

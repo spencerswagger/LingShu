@@ -48,6 +48,11 @@ func NewCallerKeySync(page *PageAdmin, keys CallerKeyStore, secretKey []byte) *C
 // 回填层按 errors.Is 判定后映射 409）；此处为既有调用点保留别名。
 var ErrNameUnavailable = identity.ErrCallerKeyNameTaken
 
+// ErrKeyDisabled 表示该令牌的映射行已停用（令牌停用时 Remove 删过代理侧 key）。
+// Ensure（自动路径）对停用行返回它、不碰代理侧、不翻状态；显式启用走 Reactivate。
+// 哨兵实体在 identity.ErrCallerKeyDisabled（同 ErrNameUnavailable 的循环依赖口径）。
+var ErrKeyDisabled = identity.ErrCallerKeyDisabled
+
 // LegacyAutoName 是旧口径自动名（ls-token-<id>，旧代码唯一生成点）。
 // 改名资格判定与 Remove 的无行兜底都用它。
 func LegacyAutoName(tokenID int64) string { return fmt.Sprintf("ls-token-%d", tokenID) }
@@ -86,6 +91,12 @@ const maxDisambiguationTries = 8
 //     （值不变），本地行改名并记 legacy_key_name（改名回填三步，幂等可重跑）；
 //   - 有映射且是其它名字（运维手工绑定）→ 名字不动，只确保代理侧同名 key 存在且明文一致。
 //
+// 状态纪律（评审必改①）：DISABLED 行一律拒绝（ErrKeyDisabled），不碰代理侧、不翻状态。
+// 此前两洞：①手工名/终态名分支 Provision upsert 会把停用行翻回 ACTIVE 并重建代理 key
+// （Toggle 刚删的被搬回）；②旧自动名分支先 rename 代理侧、本地 RenameAndActivate 被
+// state<>'DISABLED' 拒 → 本地永远追不上、每轮重试死循环。
+// 显式重新启用（Toggle 启用 / 管理端一键开通）走 Reactivate。
+//
 // 幂等：重复执行要么命中「已是终态」提前收敛，要么从当前实际状态继续推进；
 // 顺序是 magpie 侧先改名、本地后改（任何一步中断，重跑都能从实际状态续上）。
 func (c *CallerKeySync) Ensure(ctx context.Context, userID int64, t TokenRef, username, secret string) error {
@@ -100,6 +111,10 @@ func (c *CallerKeySync) Ensure(ctx context.Context, userID int64, t TokenRef, us
 	k, lerr := c.keys.ByTokenID(ctx, t.ID)
 	if lerr != nil && !errors.Is(lerr, ErrKeyNotProvisioned) {
 		return fmt.Errorf("查询 callerKey 映射失败：%w", lerr)
+	}
+	// 停用行守卫：在任何代理侧动作（ensure/rename）与本地写（Provision 翻状态）之前。
+	if k != nil && k.State == KeyStateDisabled {
+		return ErrKeyDisabled
 	}
 	var wantName string
 	switch {
@@ -175,6 +190,41 @@ func (c *CallerKeySync) Ensure(ctx context.Context, userID int64, t TokenRef, us
 		}
 		return nil
 	}
+}
+
+// Reactivate 显式重新启用该令牌的 callerKey 映射（Toggle 启用侧 / 管理端一键开通专用）。
+// 与 Ensure 的唯一差别：允许把 DISABLED 行翻回 ACTIVE —— 自动路径（存量回填/启动补建）
+// 一律走 Ensure（停用行拒绝），只有用户/管理员显式动作可以恢复映射。
+//
+// 顺序与其它分支一致（代理侧先行）：先确保代理侧**当前名**的 key 存在，本地行翻回 ACTIVE
+// （不抬名）；随后复用 Ensure 推进剩余收敛（旧自动名 → 改名三步；明文/密文对齐）。
+// 幂等：重复执行命中 Ensure 的终态快检零写返回。
+func (c *CallerKeySync) Reactivate(ctx context.Context, userID int64, t TokenRef, username, secret string) error {
+	if len(c.secretKey) == 0 {
+		return fmt.Errorf("未配置 SM4 密钥，无法保存 callerKey 密文")
+	}
+	if strings.TrimSpace(secret) == "" {
+		return fmt.Errorf("secret 不能为空")
+	}
+	k, lerr := c.keys.ByTokenID(ctx, t.ID)
+	if lerr != nil && !errors.Is(lerr, ErrKeyNotProvisioned) {
+		return fmt.Errorf("查询 callerKey 映射失败：%w", lerr)
+	}
+	if lerr == nil && k != nil && k.State == KeyStateDisabled {
+		cipher, err := crypto.SM4Encrypt(c.secretKey, []byte(secret))
+		if err != nil {
+			return fmt.Errorf("加密 callerKey 失败：%w", err)
+		}
+		// 先代理后本地：代理侧当前名 key 存在后，本地行才翻 ACTIVE（不抬名）。
+		if _, err := c.page.EnsureCallerKey(ctx, k.KeyName, secret); err != nil {
+			return err
+		}
+		if _, err := c.keys.Provision(ctx, t.ID, k.KeyName, cipher); err != nil {
+			return fmt.Errorf("恢复 callerKey 映射失败：%w", err)
+		}
+	}
+	// 行已 ACTIVE（或本就未停用）：走常规收敛（改名/对齐/终态快检）。
+	return c.Ensure(ctx, userID, t, username, secret)
 }
 
 // RollbackToken 把该令牌的映射按 legacy_key_name 复原旧名（终表 §3.5：三步与正向镜像、可幂等重跑）：

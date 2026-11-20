@@ -360,6 +360,8 @@ type TokenService struct {
 	callerKeyLookup func(ctx context.Context, tokenID int64) (bool, error)
 	// callerKeyNameOf 取令牌当前映射的 callerKey 名（回填 skip 判定；空串=无映射）。
 	callerKeyNameOf func(ctx context.Context, tokenID int64) string
+	// callerKeyStateOf 取令牌当前映射行的状态（回填 disabled 分桶；空串=无映射/未注入）。
+	callerKeyStateOf func(ctx context.Context, tokenID int64) string
 	// callerWantNameOf 取令牌按新口径应有的 callerKey 名（回填改名资格判定）。
 	callerWantNameOf func(ctx context.Context, userID, tokenID int64, displayName string) string
 	// callerUsernameOf 取令牌所属用户的用户名（key 名第一段原料；空=段退化 u<uid>）。
@@ -419,8 +421,14 @@ type CallerKeyToken struct {
 // CallerKeySyncer 令牌与代理侧 callerKey 的同步能力（由 magpie 包实现）。
 // Ensure 需要 userID（用户段退化坐标）、令牌 display_name（令牌段原料）与
 // 所属用户名（key 名第一段原料；契约定稿：key 名 = 用户名转写-令牌名转写）。
+//
+// 状态纪律（评审必改①）：Ensure 是「自动路径」（创建令牌/存量回填/启动补建），
+// 对 DISABLED 映射行返回 ErrCallerKeyDisabled、不碰代理侧、不翻状态；
+// 显式重新启用（Toggle 启用侧、管理端一键开通）必须走 Reactivate。
 type CallerKeySyncer interface {
 	Ensure(ctx context.Context, userID int64, t CallerKeyToken, username, secret string) error
+	// Reactivate 与 Ensure 的唯一差别：允许把 DISABLED 行翻回 ACTIVE（显式动作专用）。
+	Reactivate(ctx context.Context, userID int64, t CallerKeyToken, username, secret string) error
 	Remove(ctx context.Context, tokenID int64) error
 }
 
@@ -429,6 +437,11 @@ type CallerKeySyncer interface {
 // 哨兵放 identity（magpie 已 import identity，反向会造成循环依赖）；
 // magpie.ErrNameUnavailable 是它的别名。
 var ErrCallerKeyNameTaken = errors.New("callerKey 名字消歧失败：重试一轮后仍撞名")
+
+// ErrCallerKeyDisabled 该令牌的 callerKey 映射已停用（令牌停用时 Remove 删过代理侧 key）。
+// 自动路径（存量回填/启动补建）对停用行一律跳过（回填分桶 disabled）；显式启用走
+// Reactivate。哨兵放 identity（同 ErrCallerKeyNameTaken 的循环依赖口径）；magpie.ErrKeyDisabled 是别名。
+var ErrCallerKeyDisabled = errors.New("callerKey 映射已停用（令牌停用时被删；启用令牌或管理端一键开通后恢复）")
 
 // SetCallerKeySyncer 注入同步钩子。
 func (s *TokenService) SetCallerKeySyncer(c CallerKeySyncer) { s.callerKey = c }
@@ -528,8 +541,14 @@ func (s *TokenService) BackfillCallerKeys(ctx context.Context, limit int, dryRun
 		for i := range list {
 			ti := list[i]
 			t := ti.Token
-			if created+renamed+skipped["already-bound"]+skipped["renamed"]+skipped["manual-named"]+skipped["no-cipher"]+len(failed) >= limit {
+			if created+renamed+skipped["already-bound"]+skipped["renamed"]+skipped["manual-named"]+skipped["no-cipher"]+skipped["disabled"]+len(failed) >= limit {
 				return created, renamed, skipped, failed, nil
+			}
+			// 停用映射（令牌停用时 Remove 删过代理 key）：自动回填不碰它，
+			// 单独分桶（评审必改①）；显式恢复走 Toggle 启用（Reactivate）或管理端一键开通。
+			if s.callerKeyStateOf != nil && s.callerKeyStateOf(ctx, t.ID) == magpieKeyStateDisabled {
+				skipped["disabled"]++
+				continue
 			}
 			plain, serr := s.Secret(ctx, t.ID)
 			if serr != nil || plain == "" {
@@ -569,6 +588,11 @@ func (s *TokenService) BackfillCallerKeys(ctx context.Context, limit int, dryRun
 				continue
 			}
 			if err := s.callerKey.Ensure(ctx, ti.UserID, CallerKeyToken{ID: t.ID, DisplayName: t.DisplayName}, ti.Username, plain); err != nil {
+				// 停用行：Ensure 自带 state 守卫（评审必改①，钩子缺位时的第二道防线）。
+				if errors.Is(err, ErrCallerKeyDisabled) {
+					skipped["disabled"]++
+					continue
+				}
 				entry := map[string]any{"TokenID": t.ID, "Reason": err.Error()}
 				if errors.Is(err, ErrCallerKeyNameTaken) {
 					// 契约 §1.2：消歧重试一轮仍撞 → 409 挂起人工（响应级冲突由 handler 判）。
@@ -593,6 +617,15 @@ func (s *TokenService) BackfillCallerKeys(ctx context.Context, limit int, dryRun
 // SetCallerKeyNameOf 注入「该令牌当前映射的 callerKey 名」（回填 skip 判定用；空串=无映射）。
 func (s *TokenService) SetCallerKeyNameOf(fn func(ctx context.Context, tokenID int64) string) {
 	s.callerKeyNameOf = fn
+}
+
+// magpieKeyStateDisabled 与 magpie.KeyStateDisabled 同值（identity 不能 import magpie，
+// 字符串字面量由两侧测试锁一致：见 magpie 包 keystore 常量用例）。
+const magpieKeyStateDisabled = "DISABLED"
+
+// SetCallerKeyStateOf 注入「该令牌当前映射行的状态」（回填 disabled 分桶用；空串=无映射/未注入）。
+func (s *TokenService) SetCallerKeyStateOf(fn func(ctx context.Context, tokenID int64) string) {
+	s.callerKeyStateOf = fn
 }
 
 // SetCallerWantNameOf 注入「该令牌按新口径应有的 callerKey 名」（回填改名资格判定用）。
@@ -799,12 +832,13 @@ func (s *TokenService) Toggle(ctx context.Context, userID, tokenID int64) (*Toke
 	if err := s.store.UpdateStatus(ctx, tokenID, newStatus); err != nil {
 		return nil, fmt.Errorf("toggle token: %w", err)
 	}
-	// V3：停用 ⇒ 删 callerKey；启用 ⇒ 重新确保（明文从密文解出）。
+	// V3：停用 ⇒ 删 callerKey；启用 ⇒ 显式重新启用（Reactivate：允许把 DISABLED
+	// 映射行翻回 ACTIVE；自动路径的 Ensure 对停用行会拒绝）。
 	if s.callerKey != nil {
 		if newStatus == StatusTokenDisabled {
 			_ = s.callerKey.Remove(ctx, tokenID)
 		} else if plain, serr := s.Secret(ctx, tokenID); serr == nil {
-			_ = s.callerKey.Ensure(ctx, t.UserID, CallerKeyToken{ID: t.ID, DisplayName: t.DisplayName}, s.usernameForToken(ctx, t.UserID), plain)
+			_ = s.callerKey.Reactivate(ctx, t.UserID, CallerKeyToken{ID: t.ID, DisplayName: t.DisplayName}, s.usernameForToken(ctx, t.UserID), plain)
 		}
 	}
 	// 写路径失效：状态已翻转，立即按哈希清除其缓存项。
