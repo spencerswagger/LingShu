@@ -29,3 +29,22 @@ magpie callerKey 改名 + 存量回填（0030）
 - 启动补建 goroutine 会在部署后自动对存量令牌执行真机改名。需要先对真实环境跑 dry-run（POST backfill {"DryRun":true}）并确认桶分布，再决定是否放开自动执行；如需完全手动，可在部署前协商 kill-switch。
 - legacy_key_name 只存「最近一次改名前的名字」；同一名多次改名只保留最近旧名（当前场景只有 ls-token-<id>→新名一次改名，够用）。
 - magpie 页面接口无 rename 文档保证，属 UI 通道；magpie 升级若移除该端点，改名三步会在第一步失败（可观测，重跑可续，不影响已改名令牌）。
+
+---
+
+## 补记（同 PR 第二提交，2026-11-20）
+
+- 管理端令牌列表（GET /api/v1/admin/tokens）每行补 `MagpieKeyName`（omitempty）；解析走
+  `magpie.KeyStore.NamesByTokenIDs`（批量 IN 分批 500，只读）。装配层只注入管理端 handler，
+  dev 列表与创建/轮换响应不带该字段。前端令牌列表加「代理侧 Key」列（未绑定显示占位）。
+  ——对应命名定案①「UI 直接显示人可读的名字」。
+- 真机核验复跑于 magpie **0.1.4454**（官方 magpie-cli-linux-amd64，sha256 校验通过；
+  本机隔离 HOME 起 `magpie web --gateway`，页面会话 + 网关 3425 同进程实测）：
+  - 名称上限：add 边界二分 120 成功 / 121 拒（`Use a name between 1 and 120 characters`）；
+    1 成功 / 空（0）拒 —— 与 `MagpieKeyNameLimit=120` 一致，代码未改。
+  - rename-key 端点：改 120 字目标名 200；id 与 masked secret 不变；重复改名幂等（两次 200）；
+    121 目标名 400。改名后旧 secret 打 3425 /v1/models 仍 200（原地改、无 401 空窗）。
+  - 0.1.4454 的 CLI `gateway-key` **没有 rename 子命令**（usage 已变）；回退/运维脚本不能依赖 CLI 改名。
+  - magpie 仓文档副本 docs/reference.md 管理面路由表记载 gateway-keys/{action} 含 rename-key
+    ——该端点有官方文档出处。
+- CI：PR base 已改 v2（分支 rebase 到 origin/v2 后 force-with-lease 推送），head 双 job success。
