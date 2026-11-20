@@ -226,6 +226,12 @@ function copyBaseUrl() {
             </div>
           </template>
         </el-table-column>
+        <el-table-column label="代理侧 Key" min-width="150">
+          <template #default="{ row }">
+            <span v-if="row.MagpieKeyName" class="t-clock mono">{{ row.MagpieKeyName }}</span>
+            <span v-else class="t-clock">未绑定</span>
+          </template>
+        </el-table-column>
         <el-table-column label="所属用户" min-width="100">
           <template #header>
             <ColumnFilter label="所属用户" :active="!!filters.user_id" @clear="() => (filters.user_id = undefined)">

@@ -11,6 +11,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/team/llmgateway/internal/pkg/crypto"
 	"github.com/team/llmgateway/internal/pkg/idgen"
@@ -40,8 +41,7 @@ var ErrKeyNotProvisioned = errors.New("magpie key not provisioned")
 // ErrKeyCipherUnavailable 表示凭据密文缺失或解密失败（配置/密钥不匹配）。
 var ErrKeyCipherUnavailable = errors.New("magpie key cipher unavailable")
 
-// KeyStore 提供 magpie_keys 的读写。
-//
+// KeyStore 提供 magpie_keys 的读写。//
 // 写入方 = 管理端绑定端点（keyadmin.go）：代理侧的 callerKey 由运维在 magpie 侧创建，
 // 灵枢只负责「落库 + 加密保存 + 一令牌一把」的映射，不自行签发凭据
 // （自造一把 magpie 不认的 key 只会把失败推迟到转发时）。
@@ -54,6 +54,52 @@ func NewKeyStore(db *sql.DB) *KeyStore { return &KeyStore{db: db} }
 
 // keyScanCols 是 magpie_keys 查询列（含 0030 的 legacy_key_name）。
 const keyScanCols = `id, token_id, key_name, coalesce(legacy_key_name,''), coalesce(key_id,''), coalesce(key_cipher,''), state`
+
+// NamesByTokenIDs 批量取令牌当前映射的 callerKey 名（管理端令牌列表展示用；
+// 只读，不区分 state——绑定端点语义是「查看映射」，停用的映射名字照样显示）。
+// 无映射的令牌不出现在返回 map 里（展示层按空串渲染）。
+func (s *KeyStore) NamesByTokenIDs(ctx context.Context, tokenIDs []int64) (map[int64]string, error) {
+	out := make(map[int64]string, len(tokenIDs))
+	if len(tokenIDs) == 0 {
+		return out, nil
+	}
+	const batchSize = 500
+	for start := 0; start < len(tokenIDs); start += batchSize {
+		end := start + batchSize
+		if end > len(tokenIDs) {
+			end = len(tokenIDs)
+		}
+		batch := tokenIDs[start:end]
+		// IN ($1..$n) 而不是 ANY($1::text[])：sqlmock 不支持切片参数（生产 pgx 可以）。
+		placeholders := make([]string, len(batch))
+		args := make([]any, len(batch))
+		for i, id := range batch {
+			placeholders[i] = fmt.Sprintf("$%d", i+1)
+			args[i] = id
+		}
+		rows, err := s.db.QueryContext(ctx,
+			`SELECT token_id, key_name FROM magpie_keys WHERE token_id IN (`+strings.Join(placeholders, ",")+`)`,
+			args...)
+		if err != nil {
+			return nil, fmt.Errorf("query magpie key names: %w", err)
+		}
+		for rows.Next() {
+			var id int64
+			var name string
+			if err := rows.Scan(&id, &name); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("scan magpie key name: %w", err)
+			}
+			out[id] = name
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("iterate magpie key names: %w", err)
+		}
+		rows.Close()
+	}
+	return out, nil
+}
 
 func scanKey(row interface{ Scan(...any) error }) (*Key, error) {
 	var k Key

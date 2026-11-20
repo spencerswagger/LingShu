@@ -770,11 +770,19 @@ type TokenHandler struct {
 	svc            *TokenService
 	userIDFrom     func(ctx context.Context) (int64, bool)
 	verifyPassword func(ctx context.Context, userID int64, password string) error
+	// magpieKeyNameOf 批量取令牌当前映射的 callerKey 名（管理端列表展示用；
+	// nil=不补该字段，dev 列表刻意不带）。key 由 token.go 的 tokenResponse 契约说明。
+	magpieKeyNameOf func(ctx context.Context, tokenIDs []int64) (map[int64]string, error)
 }
 
 // NewTokenHandler 创建令牌处理器。
 func NewTokenHandler(svc *TokenService, userIDFrom func(ctx context.Context) (int64, bool)) *TokenHandler {
 	return &TokenHandler{svc: svc, userIDFrom: userIDFrom}
+}
+
+// SetMagpieKeyNameOf 注入 callerKey 名批量解析钩子（管理端列表展示 key_name；nil=不补）。
+func (h *TokenHandler) SetMagpieKeyNameOf(fn func(ctx context.Context, tokenIDs []int64) (map[int64]string, error)) {
+	h.magpieKeyNameOf = fn
 }
 
 // SetPasswordVerifier 注入当前口令校验（查看明文密钥等高危操作二次验证；nil=跳过校验）。
@@ -794,6 +802,9 @@ type tokenResponse struct {
 	LastUsedAt   *time.Time `json:"LastUsedAt,omitempty"`
 	Status       string     `json:"Status"`
 	CreatedAt    time.Time  `json:"CreatedAt"`
+	// MagpieKeyName 该令牌当前映射的代理侧 callerKey 名（管理端展示「谁的 key」）。
+	// 未绑定/未同步为空串。仅管理端列表补，dev 列表与创建/轮换响应不带。
+	MagpieKeyName string `json:"MagpieKeyName,omitempty"`
 }
 
 func (t *Token) response() tokenResponse {
@@ -859,6 +870,19 @@ func (h *TokenHandler) HandleAdminList(w http.ResponseWriter, r *http.Request) {
 	items := make([]tokenResponse, 0, len(list))
 	for i := range list {
 		items = append(items, list[i].response())
+	}
+	// 定案①（2026-11-20）：管理端令牌列表直接展示人可读的 callerKey 名。
+	// 批量解析一次注入；nil/失败按空串渲染（展示缺口，不挡列表）。dev 列表不带。
+	if h.magpieKeyNameOf != nil && len(list) > 0 {
+		ids := make([]int64, len(list))
+		for i := range list {
+			ids[i] = list[i].ID
+		}
+		if names, err := h.magpieKeyNameOf(r.Context(), ids); err == nil && names != nil {
+			for i := range items {
+				items[i].MagpieKeyName = names[list[i].ID]
+			}
+		}
 	}
 	resp.OK(w, r, map[string]any{"List": items, "Total": total, "Page": page, "Size": size})
 }

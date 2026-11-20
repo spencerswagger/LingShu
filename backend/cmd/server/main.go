@@ -390,6 +390,9 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 	tokenSvc.SetTokenCacheTTL(cfg.TokenCacheTTL())
 	tokenAdminHandler := identity.NewTokenHandler(tokenSvc, userIDFrom)
 	tokenDevHandler := identity.NewTokenHandler(tokenSvc, userIDFrom)
+	// 定案①：管理端令牌列表展示 callerKey 名（ls-u<uid>-t<tid>-<slug>）；
+	// dev 列表不注入（MagpieKeyName 不出现在开发者侧响应）。
+	tokenAdminHandler.SetMagpieKeyNameOf(magpie.NewKeyStore(d).NamesByTokenIDs)
 	// 查看明文密钥属敏感操作：需当前口令二次验证。
 	tokenAdminHandler.SetPasswordVerifier(identitySvc.VerifyCurrentPassword)
 	tokenDevHandler.SetPasswordVerifier(identitySvc.VerifyCurrentPassword)

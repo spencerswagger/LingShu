@@ -187,3 +187,48 @@ func TestKeyStore_ByTokenID_ScansLegacyName(t *testing.T) {
 		t.Fatalf("legacy 名未扫到：%+v", k)
 	}
 }
+
+// NamesByTokenIDs 批量取名：有映射的进 map，无映射的缺席（展示层按空串渲染）。
+func TestKeyStore_NamesByTokenIDs(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+	s := NewKeyStore(db)
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT token_id, key_name FROM magpie_keys WHERE token_id IN ($1,$2,$3)`)).
+		WithArgs(int64(7), int64(8), int64(9)).
+		WillReturnRows(sqlmock.NewRows([]string{"token_id", "key_name"}).
+			AddRow(int64(7), "ls-u1-t7-alpha").
+			AddRow(int64(8), "ops-manual"))
+	names, err := s.NamesByTokenIDs(context.Background(), []int64{7, 8, 9})
+	if err != nil {
+		t.Fatalf("NamesByTokenIDs: %v", err)
+	}
+	if names[7] != "ls-u1-t7-alpha" || names[8] != "ops-manual" {
+		t.Fatalf("names = %v", names)
+	}
+	if _, present := names[9]; present {
+		t.Fatalf("无映射令牌不得出现在 map：%v", names)
+	}
+}
+
+// NamesByTokenIDs 空入参直接返回空 map（不发 SQL）。
+func TestKeyStore_NamesByTokenIDs_Empty(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+	s := NewKeyStore(db)
+	names, err := s.NamesByTokenIDs(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("NamesByTokenIDs: %v", err)
+	}
+	if len(names) != 0 {
+		t.Fatalf("names = %v", names)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("空入参不应发 SQL：%v", err)
+	}
+}
