@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -59,22 +60,29 @@ func (f *fixture) expectScan(rows ...rebillRow) {
 	f.mock.ExpectQuery("FROM billing_records b").WillReturnRows(rs)
 }
 
-// expectState 装配行内新鲜判定（标记 NULL / 新账单不存在 = 可补收）。
+// expectState 装配行内新鲜判定（标记 NULL / 新账单不存在 / 有钱包 = 可补收）。
 func (f *fixture) expectState() {
 	f.mock.ExpectQuery("SELECT \\(SELECT error_message FROM billing_records").
-		WillReturnRows(f.mock.NewRows([]string{"error_message", "exists"}).AddRow(nil, false))
+		WillReturnRows(f.mock.NewRows([]string{"error_message", "status", "exists"}).AddRow(nil, nil, true))
+}
+
+// expectStateNoWallet 装配「用户没有积分钱包」的新鲜判定（Record 前拦截，不落 failed 残单）。
+func (f *fixture) expectStateNoWallet() {
+	f.mock.ExpectQuery("SELECT \\(SELECT error_message FROM billing_records").
+		WillReturnRows(f.mock.NewRows([]string{"error_message", "status", "exists"}).AddRow(nil, nil, false))
 }
 
 // expectStateMarked 装配「原行已带标记」的新鲜判定。
 func (f *fixture) expectStateMarked(mark string) {
 	f.mock.ExpectQuery("SELECT \\(SELECT error_message FROM billing_records").
-		WillReturnRows(f.mock.NewRows([]string{"error_message", "exists"}).AddRow(mark, true))
+		WillReturnRows(f.mock.NewRows([]string{"error_message", "status", "exists"}).AddRow(mark, nil, true))
 }
 
-// expectStateNewExists 装配「新账单已存在」的新鲜判定（重放形态）。
+// expectStateNewExists 装配「新账单已完成」的新鲜判定（重放形态）。
 func (f *fixture) expectStateNewExists(origID string, cost float64) {
 	f.mock.ExpectQuery("SELECT \\(SELECT error_message FROM billing_records").
-		WillReturnRows(f.mock.NewRows([]string{"error_message", "exists"}).AddRow(nil, true))
+		WillReturnRows(f.mock.NewRows([]string{"error_message", "status", "exists"}).
+			AddRow(nil, billing.StatusCompleted, true))
 	f.mock.ExpectExec("UPDATE billing_records SET cost_credits").
 		WithArgs(cost, rebillNewBillingID(origID)).
 		WillReturnResult(sqlmock.NewResult(0, 1))
@@ -251,7 +259,7 @@ func TestRebill_HappyPathAndIdempotent(t *testing.T) {
 		}
 	})
 
-	t.Run("标记守卫归零必须报错", func(t *testing.T) {
+	t.Run("标记守卫归零进失败明细", func(t *testing.T) {
 		f := newFixture(t)
 		groups := []groupNode{{Ref: groupRef, DisplayName: display}}
 		f.expectGroups([2]string{groupRef, display})
@@ -266,13 +274,211 @@ func TestRebill_HappyPathAndIdempotent(t *testing.T) {
 		f.mock.ExpectExec(rebillMarkSQLPattern).
 			WillReturnResult(sqlmock.NewResult(0, 0))
 		res, err := f.p.Rebill(context.Background(), groupRef)
-		if err == nil || !strings.Contains(err.Error(), "拒绝重复补收") {
-			t.Fatalf("守卫归零应报错，实际：%v", err)
+		if err != nil {
+			t.Fatalf("毒行隔离：守卫归零不应失败整批：%v", err)
 		}
-		if res.Rebilled != 0 {
-			t.Fatalf("失败行不计入 Rebilled")
+		if res.Rebilled != 0 || len(res.Failed) != 1 {
+			t.Fatalf("失败行应进明细不计 Rebilled：%+v", res)
+		}
+		if res.Failed[0].BillingID != "bill-m" ||
+			!strings.Contains(res.Failed[0].Message, "拒绝重复补收") ||
+			res.Failed[0].Reason != ReasonRebillRecordError {
+			t.Fatalf("失败明细缺原因/定位：%+v", res.Failed[0])
 		}
 	})
+}
+
+// TestRebill_PriceLookupDeterministic 售价查询的两条语句都必须带确定性 ORDER BY（评审 P2-2）：
+// 绑定列 bound_internal_ref 上只有非唯一索引，同 ref 重复绑定时 LIMIT 1 无 ORDER BY 的取价
+// 不确定（结算与补收同源）；名字列唯一索引兜底，但同样把确定性写显式。
+func TestRebill_PriceLookupDeterministic(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		sql  string
+	}{
+		{"名字匹配", extByNameSQL},
+		{"绑定匹配", extByBindingSQL},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if !strings.Contains(tc.sql, "ORDER BY id ASC LIMIT 1") {
+				t.Fatalf("售价查询缺确定性排序（同 ref 重复绑定时取价不确定）：\n%s", tc.sql)
+			}
+		})
+	}
+	// 列清单一致（同函数共享 Scan 目标数）：改一条加列必红。
+	if strings.Count(extByNameSQL, ",") != strings.Count(extByBindingSQL, ",") {
+		t.Fatalf("两条售价查询的列清单不一致：\n%s\n%s", extByNameSQL, extByBindingSQL)
+	}
+	// 注释不得声称不存在的唯一索引（评审 P2-2：uq_external_models_bound_ref 不存在）。
+	src, err := readPollerSource(t)
+	if err != nil {
+		t.Fatalf("读取 poller.go 失败：%v", err)
+	}
+	if strings.Contains(src, "uq_external_models_bound_ref") {
+		t.Fatalf("poller.go 声称不存在的索引 uq_external_models_bound_ref（绑定列只有非唯一 idx_external_models_bound）")
+	}
+}
+
+func readPollerSource(t *testing.T) (string, error) {
+	t.Helper()
+	b, err := os.ReadFile("poller.go")
+	return string(b), err
+}
+
+// TestRebill_MatchingAsymmetryIsDocumented 匹配侧三名（req/served/external）与售价解析侧
+// 的**刻意**不对称：解析侧输入 = 账本行的 req/served 两名（与主链 settleOne 完全同源），
+// 账单的 external_model_name 只在 req 空缺时作回落、**不当独立候选**。external 名通常是
+// unpricedName 的兜底产物（req→served→"unknown"），若给它开独立档，同一行会出现
+// 「结算按主链口径落 unpriced、补收却能算出价」的口径分叉，账目两边对不上。
+// 这里钉行为事实：external 名能参与匹配（最大召回），但不出现在解析候选里。
+func TestRebill_MatchingAsymmetryIsDocumented(t *testing.T) {
+	g := "group/auto-" + rseg(t)
+	extOnlyName := "ext-only-" + rseg(t) // 只出现在账单 external_model_name 上的名字
+	// 匹配侧：external 名命中组 ref 形态 → 该行进扫描（最大召回）。
+	if !rebillMatchesRow(rebillRow{ExternalModel: g}, g, nil) {
+		t.Fatalf("external 名应参与匹配（最大召回）")
+	}
+	// 解析侧：req/served 之外没有第三个独立档 —— served=extOnlyName（req 是组 ref）时，
+	// 候选集合里针对 extOnlyName 只有它作为「已知名」自己的档，extOnlyName 若独立成档
+	// 会多出「按 extOnlyName 查 external_name」之外的组化候选；钉住候选总数形态。
+	cands := priceCandidates(g, extOnlyName, nil, 0)
+	want := []priceCandidate{
+		{value: g, byBinding: false},
+		{value: extOnlyName, byBinding: false},
+		{value: g, byBinding: true},
+		{value: "auto/" + strings.TrimPrefix(g, "group/auto-"), byBinding: true},
+		{value: "group/ext-only-" + strings.TrimPrefix(extOnlyName, "ext-only-"), byBinding: true},
+	}
+	if !reflect.DeepEqual(cands, want) {
+		t.Fatalf("解析候选形态不符（external 名不应有独立第三档）：\ngot  %+v\nwant %+v", cands, want)
+	}
+	// req 空缺时 external 作回落（口径：回落 ≠ 独立候选）。
+	lr := row{reqModel: "", model: extOnlyName}
+	if lr.reqModel == "" {
+		lr.reqModel = extOnlyName
+	}
+	if lr.reqModel != extOnlyName {
+		t.Fatalf("external 回落口径被破坏")
+	}
+}
+
+// TestRebill_PoisonRowIsolation 毒行不堵整批：坏行带原因进明细，好行照常补收。
+// 覆盖四类毒行：tokens 损坏（扫描层）、解析不到售价（确定性行级）、缺 user_id、计费错误。
+func TestRebill_PoisonRowIsolation(t *testing.T) {
+	groupRef := "group/" + rseg(t)
+	extName := "ext-" + rseg(t)
+	rates := map[string]float64{"input": 2, "output": 4, "cache_read": 0.2}
+	goodID, badTokensID, unresolvableID, noUserID, recFailID :=
+		"bill-good", "bill-badtok", "bill-unres", "bill-nouser", "bill-recfail"
+	usable := billing.Usage{Input: 100, Output: 50}
+
+	t.Run("tokens损坏+解析失败+计费错误不堵整批", func(t *testing.T) {
+		f := newFixture(t)
+		f.expectGroups([2]string{groupRef, groupRef})
+		// 预检命中绑定档。
+		f.mock.ExpectQuery("WHERE bound_internal_ref =").WithArgs(groupRef).
+			WillReturnRows(priceRow(extName, rates))
+		// 5 行同组（扫描按 call_time 序）：坏 tokens / 正常 / 解析不到 / 缺 user / 计费错误。
+		// 坏 tokens 行无法经 expectScan（它会 Marshal），手工构造含非法 JSON 的行。
+		usableRaw, _ := json.Marshal(usable)
+		ghost := "group/ghost-" + rseg(t)
+		rs := f.mock.NewRows([]string{
+			"billing_id", "user_id", "token_id", "external_model_name", "internal_model_id",
+			"tokens", "cost_credits", "error_message", "req_model", "served_model", "route_id",
+		})
+		rs.AddRow(badTokensID, 42, nil, groupRef, "", []byte("{not-json"), nil, "未定价组", groupRef, "", 0)
+		rs.AddRow(goodID, 42, nil, groupRef, "", usableRaw, nil, "未定价组", groupRef, "", 0)
+		rs.AddRow(unresolvableID, 42, nil, groupRef, "", usableRaw, nil, "未定价组", ghost, "", 0)
+		rs.AddRow(noUserID, 0, nil, groupRef, "", usableRaw, nil, "未定价组", groupRef, "", 0)
+		rs.AddRow(recFailID, 42, nil, groupRef, "", usableRaw, nil, "未定价组", groupRef, "", 0)
+		f.mock.ExpectQuery("FROM billing_records b").WillReturnRows(rs)
+		// 正常行：完整链（行级 routeID=0 → 名字档先查）。
+		f.expectState()
+		f.expectPriceChain(groupRef, "", nil, 0, groupRef, extName, rates)
+		f.rec.bals = []float64{80}
+		f.expectMark(goodID, rebillNewBillingID(goodID))
+		// 解析不到行：先 state 判定再整链落空（req 是无关 ref，served/route 空）。
+		f.expectState()
+		f.expectAllPriceMiss(ghost, "", nil, 0)
+		// 缺 user 行：解析命中后再拒（无 user_id 不许扣款）。
+		f.expectState()
+		f.expectPriceChain(groupRef, "", nil, 0, groupRef, extName, rates)
+		// 计费错误行：解析命中后 Record 报错（errSeq 按调用序：第 1 次好行成功、第 2 次报错）。
+		f.expectState()
+		f.expectPriceChain(groupRef, "", nil, 0, groupRef, extName, rates)
+		f.rec.errSeq = []error{nil, errors.New("余额不足（40201）")}
+
+		res, err := f.p.Rebill(context.Background(), groupRef)
+		if err != nil {
+			t.Fatalf("毒行不应失败整批：%v", err)
+		}
+		if res.Rebilled != 1 || len(res.NewBillingIDs) != 1 {
+			t.Fatalf("好行应照常补收：%+v", res)
+		}
+		if res.Scanned != 5 {
+			t.Fatalf("Scanned 应含全部同组行（含毒行）：%d", res.Scanned)
+		}
+		if len(res.Failed) != 4 {
+			t.Fatalf("失败明细应 4 行：%+v", res.Failed)
+		}
+		byID := map[string]RebillRowFailure{}
+		for _, fl := range res.Failed {
+			byID[fl.BillingID] = fl
+		}
+		if fl := byID[badTokensID]; fl.Reason != ReasonRebillBrokenRow ||
+			!strings.Contains(fl.Message, "tokens") {
+			t.Fatalf("坏 tokens 行明细不符：%+v", fl)
+		}
+		if fl := byID[unresolvableID]; fl.Reason != ReasonRebillRowUnresolvable ||
+			!strings.Contains(fl.Message, "解析不到售价") {
+			t.Fatalf("解析不到行明细不符：%+v", fl)
+		}
+		if fl := byID[noUserID]; fl.Reason != ReasonRebillRowUnresolvable ||
+			!strings.Contains(fl.Message, "user_id") {
+			t.Fatalf("缺 user 行明细不符：%+v", fl)
+		}
+		if fl := byID[recFailID]; fl.Reason != ReasonRebillRecordError ||
+			!strings.Contains(fl.Message, "余额不足") {
+			t.Fatalf("计费错误行明细不符：%+v", fl)
+		}
+		// Record 只被「可计价且 user 合法」的两行调用（好行成功 + 计费错误行失败）；
+		// 坏 tokens / 解析不到 / 缺 user 三行不得触发计费。
+		if n := f.rec.callCount(); n != 2 {
+			t.Fatalf("Record 应被好行与计费错误行各调 1 次（共 2），实际 %d", n)
+		}
+		if f.rec.reqs[0].BillingID != rebillNewBillingID(goodID) {
+			t.Fatalf("第 1 次 Record 应是好行：%s", f.rec.reqs[0].BillingID)
+		}
+	})
+}
+
+// TestRebill_PartialResultHTTP 200 + 部分结果 + Failed 明细（HTTP 契约，毒行不堵整批）。
+func TestRebill_PartialResultHTTP(t *testing.T) {
+	g := "group/" + rseg(t)
+	f := newFixture(t)
+	f.expectGroups([2]string{g, g})
+	f.mock.ExpectQuery("WHERE bound_internal_ref =").WithArgs(g).
+		WillReturnRows(priceRow("ext", map[string]float64{"input": 1, "output": 2, "cache_read": 0.1}))
+	f.expectScan(
+		rebillRow{BillingID: "b-ok", UserID: 42, ExternalModel: g, Tokens: billing.Usage{Input: 8}, ReqModel: g},
+		rebillRow{BillingID: "b-bad", UserID: 42, ExternalModel: g,
+			Tokens: billing.Usage{Input: 3}, ReqModel: g},
+	)
+	f.expectState()
+	f.expectPriceChain(g, "", nil, 0, g, "ext", map[string]float64{"input": 1, "output": 2, "cache_read": 0.1})
+	f.rec.bals = []float64{60}
+	f.expectMark("b-ok", rebillNewBillingID("b-ok"))
+	f.expectAllPriceMiss(g, "", nil, 0)
+
+	h := NewRebillHandler(f.p)
+	rec, body := doRebillRequest(t, h, `{"Ref":"`+g+`"}`)
+	if rec.Code != 200 {
+		t.Fatalf("部分成功应 200（不丢已扣结果），实际 %d：%s", rec.Code, body)
+	}
+	if !strings.Contains(body, `"Rebilled":1`) || !strings.Contains(body, `"Failed"`) ||
+		!strings.Contains(body, `"Reason"`) || !strings.Contains(body, "b-bad") {
+		t.Fatalf("响应缺部分结果/失败明细：%s", body)
+	}
 }
 
 // priceRow 构造售价命中行。
@@ -455,7 +661,7 @@ func TestRebillHandler_HTTP(t *testing.T) {
 			t.Fatalf("status=%d body=%s", rec.Code, body)
 		}
 	})
-	t.Run("行级解析失败映射400+reason", func(t *testing.T) {
+	t.Run("行级解析失败进明细不再400", func(t *testing.T) {
 		f := newFixture(t)
 		g := "group/" + rseg(t)
 		f.expectGroups([2]string{g, g})
@@ -463,12 +669,15 @@ func TestRebillHandler_HTTP(t *testing.T) {
 			WillReturnRows(priceRow("ext", map[string]float64{"input": 1, "output": 1, "cache_read": 0.1}))
 		f.expectScan(rebillRow{BillingID: "b1", UserID: 42, ExternalModel: g, Tokens: billing.Usage{Input: 5}, ReqModel: g})
 		f.expectState()
-		// 行级解析：整条候选链全落空。
+		// 行级解析：整条候选链全落空 → 行进 Failed 明细、整批仍 200。
 		f.expectAllPriceMiss(g, "", nil, 0)
 		h := NewRebillHandler(f.p)
 		rec, body := doRebillRequest(t, h, `{"Ref":"`+g+`"}`)
-		if rec.Code != 400 || !strings.Contains(body, ReasonRebillRowUnresolvable) {
-			t.Fatalf("status=%d body=%s", rec.Code, body)
+		if rec.Code != 200 {
+			t.Fatalf("行级失败随批次走完应 200，实际 %d：%s", rec.Code, body)
+		}
+		if !strings.Contains(body, ReasonRebillRowUnresolvable) || !strings.Contains(body, `"Rebilled":0`) {
+			t.Fatalf("响应应含失败明细键：%s", body)
 		}
 	})
 	t.Run("未装配返回503", func(t *testing.T) {
@@ -499,7 +708,7 @@ func TestRebill_DuplicateDBEcho(t *testing.T) {
 	}
 }
 
-// TestRebill_23505IsDuplicate 其他错误不吞：余额不足必须原样返回。
+// TestRebill_23505IsDuplicate 其他错误不吞：余额不足进失败明细（毒行不堵整批）。
 func TestRebill_23505IsDuplicate(t *testing.T) {
 	f := newFixture(t)
 	g := "group/" + rseg(t)
@@ -509,8 +718,14 @@ func TestRebill_23505IsDuplicate(t *testing.T) {
 	f.expectState()
 	f.expectPriceChain(g, "", nil, 0, g, "ext", map[string]float64{"input": 1, "output": 2, "cache_read": 0.1})
 	f.rec.err = errors.New("余额不足（40201）")
-	_, err := f.p.Rebill(context.Background(), g)
-	if err == nil || !strings.Contains(err.Error(), "余额不足") {
-		t.Fatalf("余额不足必须透传：%v", err)
+	res, err := f.p.Rebill(context.Background(), g)
+	if err != nil {
+		t.Fatalf("行级失败不失败整批：%v", err)
+	}
+	if len(res.Failed) != 1 || !strings.Contains(res.Failed[0].Message, "余额不足") {
+		t.Fatalf("余额不足必须进失败明细原样透传：%+v", res.Failed)
+	}
+	if res.Failed[0].Reason != ReasonRebillRecordError || res.Rebilled != 0 {
+		t.Fatalf("失败明细键/计数不符：%+v", res)
 	}
 }

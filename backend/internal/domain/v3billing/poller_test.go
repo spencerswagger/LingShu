@@ -31,18 +31,28 @@ import (
 
 // fakeRec 记录 Record 调用并返回可控结果（余额按调用序取自 bals，用来驱动禁用令牌分支）。
 type fakeRec struct {
-	mu   sync.Mutex
-	reqs []billing.RecordReq
-	bals []float64 // 第 n 次调用返回 bals[min(n, len-1)]；空 = 恒 100
-	err  error
+	mu     sync.Mutex
+	reqs   []billing.RecordReq
+	bals   []float64 // 第 n 次调用返回 bals[min(n, len-1)]；空 = 恒 100
+	err    error     // 恒定错误（每次调用都返回）
+	errSeq []error   // 按调用序的错误（第 n 次取 errSeq[n-1]，越界回落 err）；非 nil 时优先
 }
 
 func (f *fakeRec) Record(_ context.Context, req billing.RecordReq) (*billing.Record, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	n := len(f.reqs)
 	f.reqs = append(f.reqs, req)
-	if f.err != nil {
-		return nil, f.err
+	var e error
+	if f.errSeq != nil {
+		if n < len(f.errSeq) {
+			e = f.errSeq[n]
+		}
+	} else {
+		e = f.err
+	}
+	if e != nil {
+		return nil, e
 	}
 	bal := 100.0
 	if len(f.bals) > 0 {
@@ -55,6 +65,13 @@ func (f *fakeRec) Record(_ context.Context, req billing.RecordReq) (*billing.Rec
 	// CreditsConsumed 按真实公式回填（rates 缺失时为 0）：补收汇总的金额合计依赖它。
 	credits, _ := billing.ComputeCredits(req.Tokens, req.Rates, 1, 1, 10000)
 	return &billing.Record{BillingID: req.BillingID, BalanceAfter: bal, CreditsConsumed: credits}, nil
+}
+
+// callCount 返回 Record 被调用次数（毒行隔离断言：坏行不得触发计费）。
+func (f *fakeRec) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.reqs)
 }
 
 func testLogger(buf *strings.Builder) *slog.Logger {

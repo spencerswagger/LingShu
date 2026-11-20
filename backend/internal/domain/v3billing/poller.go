@@ -190,15 +190,19 @@ func (p *Poller) resolvePrice(ctx context.Context, r row, groups []groupNode) (*
 	return nil, tried, nil
 }
 
-// 名字匹配与绑定匹配分两条语句：绑定匹配走 uq_external_models_bound_ref（部分唯一索引），
-// 名字匹配走 uq_external_models_active。两条都排除软删行。
+// 名字匹配与绑定匹配分两条语句。绑定匹配列 bound_internal_ref 上只有 0019_topology 建的
+// **非唯一**部分索引 idx_external_models_bound（评审 P2-2 证实不存在绑定列的唯一索引），
+// 同一 ref 重复绑定时库里允许多行：必须给 LIMIT 1 配确定性 ORDER BY id ASC
+// （与 model/store.go:296 的既有排序惯例同源），取价才不随物理行序漂移（结算与补收同源）。
+// 名字匹配列有 uq_external_models_active 唯一索引兜底（活动行至多 1 条），同样带上
+// ORDER BY 不改变结果、只把确定性写显式。两条都排除软删行。
 const extByNameSQL = `
 	SELECT external_name, sale_rates, COALESCE(time_config,'null'::jsonb), COALESCE(context_tiers,'null'::jsonb)
-	  FROM external_models WHERE external_name = $1 AND deleted_at IS NULL LIMIT 1`
+	  FROM external_models WHERE external_name = $1 AND deleted_at IS NULL ORDER BY id ASC LIMIT 1`
 
 const extByBindingSQL = `
 	SELECT external_name, sale_rates, COALESCE(time_config,'null'::jsonb), COALESCE(context_tiers,'null'::jsonb)
-	  FROM external_models WHERE bound_internal_ref = $1 AND deleted_at IS NULL LIMIT 1`
+	  FROM external_models WHERE bound_internal_ref = $1 AND deleted_at IS NULL ORDER BY id ASC LIMIT 1`
 
 func (p *Poller) settleOne(ctx context.Context, r row, groups []groupNode) (settled bool, unpriced bool, err error) {
 	if r.callerKey == "" {
