@@ -312,9 +312,11 @@ export interface RebillResult {
   NewBillingIDs: string[]
   // 已补收过、本次跳过的条数（幂等跳过 ≠ 新补收）
   AlreadyMarked: number
-  // 逐行失败明细（毒行不堵整批，a9c8a0e 起；omitempty = 无失败时整个字段缺席，六字段契约不变）。
-  // wire 与后端 RebillRowFailure 同源：Reason ∈ unpriced_row（按当前配置仍解析不到售价）/
-  // unresolved_user（原行缺合法 user_id 无法归属扣款）/ record_error（计费/落库错误）。
+  // 逐行失败明细（毒行不堵整批；omitempty = 无失败时整个字段缺席，六字段契约不变）。
+  // Reason 键以 rebill_handler.go 常量实码为准（Owl P1 教训：rebill.go 的 RebillRowFailure
+  // 注释键与 wire 实发曾零交集，不认注释）：rebill_row_unresolvable（解析不到售价/缺 user_id）/
+  // rebill_no_wallet（用户无钱包）/ rebill_broken_row（扫描层毒行）/ rebill_record_error
+  // （计费落库错误）/ rebill_already_rebilled（幂等撞号 23505）。
   Failed?: RebillRowFailure[]
 }
 export interface RebillRowFailure {
