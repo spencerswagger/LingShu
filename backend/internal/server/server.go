@@ -123,7 +123,8 @@ func (s *Server) routes() {
 	admin.HandleFunc("GET /api/v1/admin/tokens", d.TokenAdmin.HandleAdminList)
 	admin.HandleFunc("POST /api/v1/admin/tokens", d.TokenAdmin.HandleAdminCreate)
 	admin.HandleFunc("POST /api/v1/admin/tokens/batch-delete", d.TokenAdmin.HandleAdminBatchDelete)
-	admin.HandleFunc("POST /api/v1/admin/tokens/magpie-keys/backfill", d.TokenAdmin.HandleAdminBackfillMagpieKeys)
+	// M2 存量改名（dry-run 默认开启，?dry_run=false 执行）。
+	admin.HandleFunc("POST /api/v1/admin/tokens/magpie-keys/rename", d.TokenAdmin.HandleAdminBackfillMagpieKeys)
 	admin.Handle("GET /api/v1/admin/tokens/{id}/secret", WithAuditSensitiveRead(s.audit, s.logger)(http.HandlerFunc(d.TokenAdmin.HandleAdminSecret)))
 
 	// ---- 已停用的渠道族接口（V2 第一期：渠道/密钥/模型/探测/协议整体迁出）----
@@ -204,6 +205,8 @@ func (s *Server) routes() {
 	// models（对外模型）
 	admin.HandleFunc("GET /api/v1/admin/models", d.Model.HandleListAdmin)
 	if d.MagpieKey != nil {
+		// 按 legacy_key_name 回滚（dry-run 默认开启；三步与正向改名镜像、幂等可重跑）。
+		admin.HandleFunc("POST /api/v1/admin/tokens/magpie-keys/rename-rollback", d.MagpieKey.HandleRenameRollback)
 		admin.HandleFunc("GET /api/v1/admin/tokens/{id}/magpie-key", d.MagpieKey.HandleGet)
 		admin.HandleFunc("PUT /api/v1/admin/tokens/{id}/magpie-key", d.MagpieKey.HandlePut)
 		admin.HandleFunc("POST /api/v1/admin/tokens/{id}/magpie-key/auto", d.MagpieKey.HandleAutoPut)

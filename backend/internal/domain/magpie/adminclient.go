@@ -51,30 +51,52 @@ func (a *PageAdmin) login(ctx context.Context) error {
 	return nil
 }
 
+// pageRetryBackoff 是限流/上游故障的指数退避序列（契约 §2.5 全链路统一口径：
+// 5s→20s→60s，最多 3 次重试）。包级变量便于测试缩短。
+var pageRetryBackoff = []time.Duration{5 * time.Second, 20 * time.Second, 60 * time.Second}
+
+// retryablePageStatus 判定哪些响应值得退避重试（429 限流与 5xx 上游故障）。
+func retryablePageStatus(code int) bool {
+	return code == http.StatusTooManyRequests || code >= 500
+}
+
 func (a *PageAdmin) doJSON(ctx context.Context, method, path string, body any, out any) error {
 	if err := a.login(ctx); err != nil {
 		return err
 	}
-	var buf io.Reader
+	var payload []byte
 	if body != nil {
-		b, _ := json.Marshal(body)
-		buf = bytes.NewReader(b)
+		payload, _ = json.Marshal(body)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, a.base+path, buf)
-	if err != nil {
-		return err
-	}
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	resp, err := a.hc.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("magpie %s %s 返回 %d：%s", method, path, resp.StatusCode, truncate(string(raw), 200))
+	var raw []byte
+	for attempt := 0; ; attempt++ {
+		var buf io.Reader
+		if payload != nil {
+			buf = bytes.NewReader(payload)
+		}
+		req, err := http.NewRequestWithContext(ctx, method, a.base+path, buf)
+		if err != nil {
+			return err
+		}
+		if payload != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		resp, err := a.hc.Do(req)
+		if err != nil {
+			return err
+		}
+		raw, _ = io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+		resp.Body.Close()
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			if attempt < len(pageRetryBackoff) && retryablePageStatus(resp.StatusCode) {
+				if err := sleepCtx(ctx, pageRetryBackoff[attempt]); err != nil {
+					return err
+				}
+				continue
+			}
+			return fmt.Errorf("magpie %s %s 返回 %d：%s", method, path, resp.StatusCode, truncate(string(raw), 200))
+		}
+		break
 	}
 	if out != nil {
 		if err := json.Unmarshal(raw, out); err != nil {
@@ -82,6 +104,18 @@ func (a *PageAdmin) doJSON(ctx context.Context, method, path string, body any, o
 		}
 	}
 	return nil
+}
+
+// sleepCtx 可中断的等待（ctx 取消时立即返回错误；测试外不可跳过）。
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }
 
 type callerKeyRow struct {
@@ -108,15 +142,10 @@ func (a *PageAdmin) EnsureCallerKey(ctx context.Context, name, secret string) (s
 	if strings.TrimSpace(name) == "" || strings.TrimSpace(secret) == "" {
 		return "", fmt.Errorf("name/secret 不能为空")
 	}
-	// 先 add-key（自带我们的 secret）；成功即返回。
-	var add callerKeysResp
-	err := a.doJSON(ctx, http.MethodPost, "/api/caller-keys/add-key", map[string]any{"name": name, "secret": secret}, &add)
-	if err == nil {
-		return secret, nil
-	}
-	// 已存在：找到 id 后 rotate-key 成我们的 secret。
-	keys, lerr := a.listCallerKeys(ctx)
-	if lerr != nil {
+	// 先 list 判存在（幂等读，2xx），再决定 add 还是 rotate——
+	// 不用「先 add 等失败」探测：真机 add-key 撞名回 5xx，会被统一退避重试拖慢。
+	keys, err := a.listCallerKeys(ctx)
+	if err != nil {
 		return "", err
 	}
 	for _, k := range keys {
@@ -128,7 +157,11 @@ func (a *PageAdmin) EnsureCallerKey(ctx context.Context, name, secret string) (s
 			return secret, nil
 		}
 	}
-	return "", err
+	var add callerKeysResp
+	if err := a.doJSON(ctx, http.MethodPost, "/api/caller-keys/add-key", map[string]any{"name": name, "secret": secret}, &add); err != nil {
+		return "", err
+	}
+	return secret, nil
 }
 
 // DeleteCallerKey 按名字删除 callerKey；不存在视为成功。幂等。

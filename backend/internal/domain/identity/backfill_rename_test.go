@@ -5,9 +5,14 @@
 package identity
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"regexp"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -20,17 +25,17 @@ import (
 // fakeSyncer 记录 Ensure 调用（回填执行断言），可注入失败。
 type fakeSyncer struct {
 	mu    sync.Mutex
-	calls []string // "uid:tokid:disp"
+	calls []string // "uid:tokid:disp:username"
 	fail  map[int64]error
 }
 
-func (f *fakeSyncer) Ensure(_ context.Context, userID int64, tok CallerKeyToken, _ string) error {
+func (f *fakeSyncer) Ensure(_ context.Context, userID int64, tok CallerKeyToken, username, _ string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err, ok := f.fail[tok.ID]; ok {
 		return err
 	}
-	f.calls = append(f.calls, fmt.Sprintf("%d:%d:%s", userID, tok.ID, tok.DisplayName))
+	f.calls = append(f.calls, fmt.Sprintf("%d:%d:%s:%s", userID, tok.ID, tok.DisplayName, username))
 	return nil
 }
 
@@ -135,8 +140,8 @@ func TestBackfill_ExecuteRenamesLegacyOnly(t *testing.T) {
 	if len(fs.calls) != 2 {
 		t.Fatalf("Ensure 调用数不符：%v", fs.calls)
 	}
-	if fs.calls[0] != "101:1:name-1" || fs.calls[1] != "100:3:name-3" {
-		t.Fatalf("Ensure 调用序不符（令牌1 改名 + 令牌3 手工名对齐）：%v", fs.calls)
+	if fs.calls[0] != "101:1:name-1:user-101" || fs.calls[1] != "100:3:name-3:user-100" {
+		t.Fatalf("Ensure 调用序不符（令牌1 改名 + 令牌3 手工名对齐，末段=username）：%v", fs.calls)
 	}
 	// already-bound 提前 skip（不走 Ensure）；manual 名由 Ensure 语义保证名字不动。
 	if skipped["already-bound"] != 1 || skipped["manual-named"] != 0 {
@@ -181,5 +186,106 @@ func TestBackfill_IdempotentRerun(t *testing.T) {
 	}
 	if err := mock2.ExpectationsWereMet(); err != nil {
 		t.Fatalf("%v", err)
+	}
+}
+
+// newBackfillHandler 装配走 HTTP 层的 TokenHandler（rename 端点行为用例）。
+func newBackfillHandler(t *testing.T, svc *TokenService) (*TokenHandler, http.Handler) {
+	t.Helper()
+	h := NewTokenHandler(svc, func(ctx context.Context) (int64, bool) { return 1, true })
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/v1/admin/tokens/magpie-keys/rename", h.HandleAdminBackfillMagpieKeys)
+	return h, mux
+}
+
+func postRename(t *testing.T, h http.Handler, rawURL, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	var rdr *bytes.Reader
+	if body == "" {
+		rdr = bytes.NewReader(nil)
+	} else {
+		rdr = bytes.NewReader([]byte(body))
+	}
+	req := httptest.NewRequest(http.MethodPost, rawURL, rdr)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+// TestRenameHandler_DryRunDefault HTTP 层锁「dry-run 默认开启」：无参调用只分桶不执行。
+func TestRenameHandler_DryRunDefault(t *testing.T) {
+	ids := []int64{1}
+	names := map[int64]string{1: "ls-token-1"}
+	svc, _, fs := newBackfillSvc(t, ids, names, map[int64]string{1: "s1"})
+	_, mux := newBackfillHandler(t, svc)
+
+	rec := postRename(t, mux, "/api/v1/admin/tokens/magpie-keys/rename", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("默认 dry-run 应 200：%d %s", rec.Code, rec.Body.String())
+	}
+	var m struct {
+		Data struct {
+			DryRun  bool           `json:"DryRun"`
+			Renamed int            `json:"Renamed"`
+			Skipped map[string]int `json:"Skipped"`
+		} `json:"Data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &m); err != nil {
+		t.Fatalf("响应解析：%v", err)
+	}
+	if !m.Data.DryRun {
+		t.Fatalf("DryRun 应默认 true：%s", rec.Body.String())
+	}
+	if m.Data.Renamed != 0 || m.Data.Skipped["renamed"] != 1 {
+		t.Fatalf("dry-run 只分桶不执行：%+v", m.Data)
+	}
+	if len(fs.calls) != 0 {
+		t.Fatalf("dry-run 不应触发 Ensure：%v", fs.calls)
+	}
+}
+
+// TestRenameHandler_ExecuteByQueryParam ?dry_run=false 才执行。
+func TestRenameHandler_ExecuteByQueryParam(t *testing.T) {
+	ids := []int64{1}
+	names := map[int64]string{1: "ls-token-1"}
+	svc, _, fs := newBackfillSvc(t, ids, names, map[int64]string{1: "s1"})
+	_, mux := newBackfillHandler(t, svc)
+
+	rec := postRename(t, mux, "/api/v1/admin/tokens/magpie-keys/rename?dry_run=false", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("执行应 200：%d %s", rec.Code, rec.Body.String())
+	}
+	if len(fs.calls) != 1 {
+		t.Fatalf("执行应触发 Ensure：%v", fs.calls)
+	}
+}
+
+// TestRenameHandler_Conflict409 消歧重试一轮仍撞 → 409（契约：挂起人工，明细在 Failed）。
+func TestRenameHandler_Conflict409(t *testing.T) {
+	ids := []int64{1}
+	names := map[int64]string{1: "ls-token-1"}
+	svc, _, fs := newBackfillSvc(t, ids, names, map[int64]string{1: "s1"})
+	fs.fail[1] = ErrCallerKeyNameTaken // 注入：该令牌消歧耗尽
+	_, mux := newBackfillHandler(t, svc)
+
+	rec := postRename(t, mux, "/api/v1/admin/tokens/magpie-keys/rename?dry_run=false", "")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("消歧撞名应 409：%d %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "Failed") {
+		t.Fatalf("409 响应应带 Failed 明细：%s", rec.Body.String())
+	}
+}
+
+// TestRenameHandler_BodyDryRunFalse 请求体 {"DryRun":false} 等效执行（指针区分未传）。
+func TestRenameHandler_BodyDryRunFalse(t *testing.T) {
+	ids := []int64{1}
+	names := map[int64]string{1: "ls-token-1"}
+	svc, _, fs := newBackfillSvc(t, ids, names, map[int64]string{1: "s1"})
+	_, mux := newBackfillHandler(t, svc)
+
+	rec := postRename(t, mux, "/api/v1/admin/tokens/magpie-keys/rename", `{"DryRun":false}`)
+	if rec.Code != http.StatusOK || len(fs.calls) != 1 {
+		t.Fatalf("body 显式 false 应执行：%d calls=%v", rec.Code, fs.calls)
 	}
 }

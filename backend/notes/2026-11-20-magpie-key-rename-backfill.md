@@ -48,3 +48,56 @@ magpie callerKey 改名 + 存量回填（0030）
   - magpie 仓文档副本 docs/reference.md 管理面路由表记载 gateway-keys/{action} 含 rename-key
     ——该端点有官方文档出处。
 - CI：PR base 已改 v2（分支 rebase 到 origin/v2 后 force-with-lease 推送），head 双 job success。
+
+---
+
+## 补记二（契约定稿对齐批，2026-11-20 第 3 提交）
+
+命名形状按契约定稿 §1.1 重做（推翻首提交的 ls-u<uid>-t<tid>-<slug> 形状）：
+
+- **key 名 = 「用户名转写-令牌名转写」**（uid/tid 不进名；唯一性由 magpie_keys UNIQUE(token_id) 承担）。
+  转写：小写 → 非 [a-z0-9] 折 '-' → 连续 '-' 合一 → 去首尾 '-'。
+- 段空退化（契约 §1.1 转写规则行）：用户名无 ASCII → `u<uid>` 段；**令牌名无 ASCII → `w-`+4hex 段**
+  （4hex = sha256("lingshu:caller-key:<tokenID>") 前 4 hex，确定性派生——回填重算可比对、无 PII）；
+  两段全空（防御分支）→ `w-`+随机 4hex。示例（od 字节级核验）：zhangsan/办公室台式机 → `zhangsan-w-5866`；
+  王五/机密项目 → `u9-w-8433`；李四/Claude Code → `u3-claude-code`。
+- 64 封顶：先截转写段再拼消歧尾号，尾号永不截（reserve=4）。消歧：撞名 → `-2/-3…-9` 顺延
+  （8 候选耗尽 → ErrNameUnavailable，不自动放大轮次）。
+- 契约 §1.2 的 rename 端点补齐并改默认：`POST /api/v1/admin/tokens/magpie-keys/rename`
+  **dry-run 默认开启**，`?dry_run=false`（或请求体 {"DryRun":false}）才执行；消歧耗尽 → **409**
+  （resp.CodeConflict，明细在 Failed[].Conflict）。旧 /backfill 路由未合入过任何环境，直接更名替换。
+- **回滚端点**：`POST /api/v1/admin/tokens/magpie-keys/rename-rollback`（dry-run 默认开启）。
+  执行=按 legacy_key_name 复原旧名（RollbackToken：代理侧旧名复原值不变 → 本地行 key_name=旧名 →
+  legacy 清空），三步与正向改名镜像、幂等可重跑；已复原行再跑返回 skipped 不报错。
+- **契约 §2.5 限流退避**落进 PageAdmin.doJSON：429/5xx 指数退避 5s→20s→60s、最多 3 次、ctx 可中断。
+  EnsureCallerKey 改为「先 list 判存在再 add/rotate」（真机 add-key 撞名回 5xx，直接探测会被退避拖 85s；
+  单测锁 85s→0.01s）。
+- identity 哨兵 ErrCallerKeyNameTaken 放 identity（magpie 已 import identity，反向成环）；
+  magpie.ErrNameUnavailable 是它的别名。回填 failed 条目带 Conflict:true，handler 聚合成 409。
+- Ensure 签名带 username（key 名第一段原料）；keyadmin auto 端点补 ownerOf（u<uid> 退化坐标）。
+
+**契约条目的实现偏差（有意，报备）**：契约 §1.2 rename 流程写的是
+「Ensure(新名)→Provision→DeleteCallerKey(旧名)」三步；实测（0.1.4454 真机）magpie 页面有
+rename-key 原地改名端点（官方 reference.md 管理面路由表记载），原地改 ID/secret/限额不变、
+无 401 空窗；add-then-delete 两步之间存在「新名已建、旧名还在」的双活窗口且 secret 全局唯一
+会堵死同值迁移。故实现取 rename-key 原地改，终态与契约一致（新名生效、旧名只留在
+legacy_key_name 兜底列）。回滚同理由 rename-key 反向改回。
+
+怎么验证（本批）：
+- 单测重写：keyname 形状/退化/封顶/无 PII；Ensure 改名主链/重跑收敛/中断续跑/手工名不动/新建/消歧
+  （-2、-3、本令牌豁免、8 候选耗尽）；RollbackToken 复原/重跑幂等/无旧名跳过；rename 端点
+  dry-run 默认/执行/409/body 显式 false；rollback 端点 dry-run 默认/执行/缺 sync 503；
+  doJSON 429 重试/耗尽/4xx 不重试/ctx 取消；Once 层「两段皆空 Warn 跳过」。
+- 变异：删 legacy 兜底 → 2 例红；删 dry-run 默认 → 红；还原全绿。
+- 真库（LLMGATEWAY_TEST_PG_DSN 临时库全链迁移）：0030 两遍幂等（第二遍零报错）；
+  RenameAndActivate → key_name/legacy 同行；RollbackToken 演练复原（代理侧旧名 + 本地行 +
+  legacy 清空）；settleOne 两段反查 SQL 真库三态（新名命中 / 旧名经 legacy 兜底命中 / 未知名零命中）。
+- 门禁：gofmt / go vet / `go test -race` 36 包 0 FAIL / `go test ./tests/` / vue-tsc 全绿。
+- 日志样例（两段皆空 Warn 跳过，errbody 实录）：
+  `time=2026-11-20T07:57:45.214Z level=WARN msg=单条结算失败（下轮重试） ledger_id=lg-evidence err="找不到 callerKey=ls-ghost 对应令牌：no rows"`
+
+风险点（新增）：
+- 消歧耗尽（409）后该令牌挂起人工：当前 8 候选覆盖同基础名 9 连撞之外的场景；
+  真实环境同名令牌超过 8 个才会触发（触发时 failed 明细给出 tokenID）。
+- 启动补建 goroutine 自动改名风险不变（部署前先 POST rename 默认 dry-run 看桶分布；
+  需要完全手动可协商 kill-switch）。

@@ -542,8 +542,19 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 				return k.KeyName
 			})
 			tokenSvc.SetCallerWantNameOf(func(ctx context.Context, userID, tokenID int64, displayName string) string {
-				return magpie.KeyNameFor(userID, tokenID, displayName)
+				return magpie.KeyNameFor(userID, tokenID, tokenSvc.UsernameOfToken(ctx, tokenID), displayName)
 			})
+			// key 名第一段原料：令牌所属用户名（契约定稿 §1.1：用户名转写-令牌名转写）。
+			tokenSvc.SetCallerUsernameOf(func(ctx context.Context, userID int64) string {
+				u, err := userStore.GetByID(ctx, userID)
+				if err != nil || u == nil {
+					return ""
+				}
+				return u.Username
+			})
+			magpieKeyAdmin.SetUsernameOf(tokenSvc.UsernameOfToken)
+			// key 名段退化坐标：令牌所属用户 ID（u<uid>；auto 开通链用）。
+			magpieKeyAdmin.SetOwnerOf(tokenSvc.UserIDOfToken)
 			magpieKeyAdmin.SetAutoSync(tokenSvc.Secret, keySync, tokenSvc.DisplayNameOf)
 			v3Poller.SetKeySync(keySync)
 			// 升级自动补建：启动即把存量令牌注册/改名代理侧 callerKey（线性退避，最多约 1h）。

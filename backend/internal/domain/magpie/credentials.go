@@ -136,6 +136,46 @@ func (s *KeyStore) ByTokenID(ctx context.Context, tokenID int64) (*Key, error) {
 	return k, nil
 }
 
+// NameOccupied 查该存储名是否已被其它令牌占用（重命名消歧用；调用方把
+// tokenID 传 0 或未绑定的 ID 即查全表语义——占用的行属于「其它令牌」才返回 true）。
+// 名字同时出现在 key_name 与 legacy_key_name 都算占用：消歧要避开的不只是
+// 当前名，还有历史名（否则消歧结果会撞上某令牌的旧名，回滚时无法复原）。
+func (s *KeyStore) NameOccupied(ctx context.Context, keyName string, excludeTokenID int64) (bool, error) {
+	var n int
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT count(*) FROM magpie_keys
+		 WHERE (key_name = $1 OR legacy_key_name = $1) AND token_id <> $2 AND state <> 'DISABLED'`,
+		keyName, excludeTokenID).Scan(&n); err != nil {
+		return false, fmt.Errorf("query key name occupation: %w", err)
+	}
+	return n > 0, nil
+}
+
+// RenameRollbackTargets 列出「旧名仍是 legacy_key_name」的映射行（回滚演练/执行的数据源）。
+// 只取 ACTIVE 行：停用行的旧名复原无意义（代理侧 key 已删）。
+func (s *KeyStore) RenameRollbackTargets(ctx context.Context, limit int) ([]Key, error) {
+	if limit <= 0 {
+		limit = 500
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT `+keyScanCols+` FROM magpie_keys
+		 WHERE state = 'ACTIVE' AND legacy_key_name <> ''
+		 ORDER BY updated_at DESC LIMIT $1`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query rename rollback targets: %w", err)
+	}
+	defer rows.Close()
+	var out []Key
+	for rows.Next() {
+		k, err := scanKey(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *k)
+	}
+	return out, rows.Err()
+}
+
 // Provision 写入/更新该令牌的 callerKey 映射并置为 ACTIVE（幂等：唯一键是 token_id）。
 //
 // keyName 冲突（另一令牌已占用同名 callerKey，key_name 有 UNIQUE）由调用方翻成 409。
@@ -201,6 +241,20 @@ func (s *KeyStore) RenameAndActivate(ctx context.Context, tokenID int64, oldName
 		return nil, fmt.Errorf("rename+activate magpie key: %w", err)
 	}
 	return k, nil
+}
+
+// ClearLegacyName 清空该令牌映射行的 legacy_key_name（回滚复原完成的收尾步；
+// 回滚后旧名回到 key_name，旧名不再是「历史名」）。行不存在返回 ErrKeyNotProvisioned。
+func (s *KeyStore) ClearLegacyName(ctx context.Context, tokenID int64) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE magpie_keys SET legacy_key_name = '', updated_at = now() WHERE token_id = $1`, tokenID)
+	if err != nil {
+		return fmt.Errorf("clear legacy key name: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrKeyNotProvisioned
+	}
+	return nil
 }
 
 // CallerKey 解密出 callerKey 明文；密文缺失或密钥不匹配一律 ErrKeyCipherUnavailable。

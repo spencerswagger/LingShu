@@ -105,3 +105,33 @@ func TestSettleOne_UnknownNameFails(t *testing.T) {
 
 // 编译期断言：billing.Usage / billing.Rates 引用仍在（防包漂移导致用例空转）。
 var _ = billing.Usage{}
+
+// TestOnce_WarnSkipsUnknownKey 整轮口径：两段皆空（key_name 与 legacy_key_name 都查不到）
+// → 该行只 Warn 跳过、整轮不炸、下轮重试（任务书：日志样例须含一次该形态）。
+func TestOnce_WarnSkipsUnknownKey(t *testing.T) {
+	p, mock, buf := newSettlePoller(t)
+
+	// 一轮：一行未知 key 的账本行。
+	mock.ExpectQuery(`SELECT e.ledger_id, e.occurred_at`).
+		WithArgs(200).
+		WillReturnRows(sqlmock.NewRows([]string{"ledger_id", "occurred_at", "provider", "model",
+			"req_model", "caller_key_name", "tokens_in", "tokens_out", "cache_read", "cache_write", "cost_credits"}).
+			AddRow("lg-warn", time.Now(), "prov", "m", "m", "ls-ghost", 10, 20, 0, 0, 0.1))
+	mock.ExpectQuery(regexp.QuoteMeta(tokenByNameSQL)).WithArgs("ls-ghost").WillReturnError(fmt.Errorf("no rows"))
+	mock.ExpectQuery(regexp.QuoteMeta(tokenByLegacySQL)).WithArgs("ls-ghost").WillReturnError(fmt.Errorf("no rows"))
+
+	n, err := p.Once(context.Background())
+	if err != nil {
+		t.Fatalf("单行不可归属不应炸整轮：%v", err)
+	}
+	if n != 0 {
+		t.Fatalf("不可归属行不应计 settled=%d", n)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("%v", err)
+	}
+	// 日志样例断言：WARN 行 + 原因含 key 名（运营可见）。
+	if !strings.Contains(buf.String(), "单条结算失败（下轮重试）") || !strings.Contains(buf.String(), "ls-ghost") {
+		t.Fatalf("Warn 日志应含跳过原因与 key 名：%s", buf.String())
+	}
+}
