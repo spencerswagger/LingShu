@@ -112,8 +112,14 @@ type RebillResult struct {
 // RebillRowFailure 是一条补收失败的原行（按 billing_id 定位，运营照单修复后重放补齐）。
 type RebillRowFailure struct {
 	BillingID string `json:"BillingID"`
-	// Reason 机器可读键：unpriced_row（按当前配置仍解析不到售价）／unresolved_user
-	// （原行缺合法 user_id，无法归属扣款）／record_error（计费/落库错误，含原文）。
+	// Reason 机器可读键：**以 rebill_handler.go 常量实码为准**（前端按键分支，注释不参与
+	// wire —— 键列表曾写错导致前端映射全死，Owl P1 教训）。行级实发五键及触发条件：
+	//   rebill_row_unresolvable —— 行级解析不到售价（候选链落空）或 user_id 守卫兜底（见下）；
+	//   rebill_no_wallet        —— 用户没有积分钱包（Record 前拦截，避免失败残单堵死重放）；
+	//   rebill_broken_row       —— 扫描层毒行（tokens 损坏等，该行进不了计价）；
+	//   rebill_record_error     —— 计费/落库层错误（余额不足、标记守卫拒绝等，含原因原文）；
+	//   rebill_already_rebilled —— 行级撞上「已被补收」（billing_id 唯一索引 23505 回声）。
+	// 批次级键 rebill_group_unpriced 不进本明细（整批未开始时走 400 + Reason）。
 	Reason  string `json:"Reason"`
 	Message string `json:"Message"`
 }
@@ -249,7 +255,7 @@ func (p *Poller) Rebill(ctx context.Context, groupName string) (*RebillResult, e
 //     主链没有的档，同一行在「结算落 unpriced」与「补收能算价」之间出现口径分叉
 //     （结算按主链口径落不出去、补收却能算出价），账目两边对不上。
 //   - 两名单集差异不产生误伤：external 名与 req/served 名不同时，匹配进来的行在
-//     解析侧自然落 Failed 明细（Reason=unpriced_row），不会错算价。
+//     解析侧自然落 Failed 明细（Reason=rebill_row_unresolvable），不会错算价。
 func rebillMatchesRow(r rebillRow, ref string, groups []groupNode) bool {
 	for _, name := range []string{r.ReqModel, r.ServedModel, r.ExternalModel} {
 		name = strings.TrimSpace(name)
@@ -359,6 +365,9 @@ func (p *Poller) rebillOne(ctx context.Context, r rebillRow, groups []groupNode)
 				r.BillingID, strings.Join(tried, ", ")), nil
 	}
 	if r.UserID <= 0 {
+		// 事实注明（Owl P1 注释纠偏）：这个分支**当前不可达**——billing_records.user_id
+		// 是 NOT NULL + FK→users(id)，库里不存在 user_id≤0 的账单；留着是纵深防御
+		// （万一未来出现无外键的导入通道），真触发时按解析失败口径进明细。行为不改。
 		return "", 0, false, ReasonRebillRowUnresolvable,
 			fmt.Sprintf("账单 %s 缺合法 user_id，无法归属扣款", r.BillingID), nil
 	}

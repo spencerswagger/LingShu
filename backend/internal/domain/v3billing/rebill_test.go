@@ -687,6 +687,27 @@ func TestRebillHandler_HTTP(t *testing.T) {
 			t.Fatalf("status=%d body=%s", rec.Code, body)
 		}
 	})
+	t.Run("批次级库故障500不裸吐原文", func(t *testing.T) {
+		// 不注册任何价格/扫描期望 → 预检查询报错 → Rebill 上抛 → default 兜底 500；
+		// 响应只给通用文案，库层错误原文不得进响应（进日志）。
+		f := newFixture(t)
+		h := NewRebillHandler(f.p)
+		rec, body := doRebillRequest(t, h, `{"Ref":"group/`+rseg(t)+`"}`)
+		if rec.Code != 500 {
+			t.Fatalf("status=%d body=%s", rec.Code, body)
+		}
+		if strings.Contains(body, "sqlmock") || strings.Contains(body, "was not expected") ||
+			strings.Contains(body, "Query") {
+			t.Fatalf("500 不得裸吐内部错误原文：%s", body)
+		}
+		if !strings.Contains(body, "补收执行失败") {
+			t.Fatalf("500 应给通用文案：%s", body)
+		}
+		// 原文必须在服务端日志里留痕（排障不能丢现场）。
+		if !strings.Contains(f.logs.String(), "V3 补收批次级失败") {
+			t.Fatalf("批次级错误应进服务端日志：%s", f.logs.String())
+		}
+	})
 }
 
 // TestRebill_DuplicateDBEcho 库层 23505 回声：Record 撞 billing_id 唯一索引 → 视为已补收跳过。

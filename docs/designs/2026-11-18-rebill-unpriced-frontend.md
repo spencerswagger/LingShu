@@ -14,15 +14,31 @@
 5. 部分失败（毒行隔离，后端 `a9c8a0e` 起）：HTTP 仍 200，响应多 `Failed[]`
    （元素 `{BillingID, Reason, Message}`；`omitempty`，全部成功时字段缺席、展示不变）。
    结果块在成功条数之下追加红色失败清单：账单标识 + `Reason` 映射中文 + 「后端说明：Message」双展示。
-   行级 Reason 键（**以 `rebill_handler.go` 常量实码为准，不认 rebill.go 注释**——注释键与
-   wire 实发零交集，前端曾照抄导致映射全死，Owl P1）：
-   `rebill_row_unresolvable`（解析不到售价/缺 user_id，rebill.go:357/362）/
-   `rebill_no_wallet`（用户无积分钱包无法扣款，:341）/ `rebill_broken_row`（扫描层毒行，
-   :187）/ `rebill_record_error`（计费落库出错，:423）/ `rebill_already_rebilled`
-   （幂等撞号 23505，:421）；未知键兜底展示原文 Message。
+   行级 Reason 键（**以 `rebill_handler.go` 常量实码为准，不认 rebill.go 注释**——注释键曾与
+   wire 实发零交集（本批 Owl P1 注释纠偏已对齐），前端曾照抄导致映射全死）：
+   `rebill_row_unresolvable`（解析不到售价/缺 user_id，rebill.go:363/371）/
+   `rebill_no_wallet`（用户无积分钱包无法扣款，:347）/ `rebill_broken_row`（扫描层毒行，
+   :193）/ `rebill_record_error`（计费落库出错，:432）/ `rebill_already_rebilled`
+   （幂等撞号 23505，:430）；未知键兜底展示原文 Message。
 6. 批次级失败（组未定价，400 + `rebill_group_unpriced`）：抽屉内红色块——Reason 映射中文处置文案 +
    后端 `Message` 原文。批次级 `rebill_row_unresolvable` 已随毒行隔离废弃（改走 Failed[]）。
 7. 切组/再保存会重置上一轮检测与结果（含竞态 token 守卫），不残留旧状态。
+
+### 后端侧 Reason 键契约（与前端侧同一份实码，两侧各自维护、键名互为镜像）
+
+键的唯一权威来源：`rebill_handler.go` 常量实码 + `rebill.go` 触发分支（Owl P1 注释纠偏后，
+`rebill.go` 结构体注释与实码一致；注释仅辅助阅读，wire 以后端常量为准）：
+
+| 键（wire 字面） | 触发条件 | 语义（运营视角） |
+| --- | --- | --- |
+| `rebill_row_unresolvable` | 行级候选链落空（解析不到售价）；`user_id≤0` 守卫兜底（当前不可达：`billing_records.user_id` NOT NULL+FK，留着是纵深防御） | 该行按当前配置算不出价，核对绑定与售价后重放 |
+| `rebill_no_wallet` | 用户无积分钱包（Record 前拦截） | 开通钱包后重放补齐；拦截是为了不让 billing 失败残单堵死重放 |
+| `rebill_broken_row` | 扫描层毒行（tokens 损坏等，进不了计价） | 行数据坏了，修数据后重放 |
+| `rebill_record_error` | 计费/落库层错误兜底（余额不足、标记守卫拒绝等） | 看 Message 原因处置后重放；已成功行不受影响 |
+| `rebill_already_rebilled` | 行级撞「已被补收」（billing_id 唯一索引 23505 回声） | 无需处理（幂等保护，不应出现在常规操作里） |
+
+批次级：`rebill_group_unpriced`（400 + Reason + Ref，整批未开始）；HTTP 层契约 = 「部分失败仍 200、
+失败明细走 `Failed[]`」，键名与行为均不以本文档为源（文档只描述，不定义）。
 
 ## 检测方式（不改后端，用现成接口）
 

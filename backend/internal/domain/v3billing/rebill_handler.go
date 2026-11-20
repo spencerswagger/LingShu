@@ -79,7 +79,14 @@ func (h *RebillHandler) HandleRebillUnpriced(w http.ResponseWriter, r *http.Requ
 			resp.ErrReason(w, r, http.StatusBadRequest, resp.CodeBadRequest, ReasonRebillGroupUnpriced,
 				err.Error(), map[string]any{"Ref": ref})
 		default:
-			resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, err.Error())
+			// P3（Owl 建议）：兜底 500 不裸吐 err.Error()（可能带库层细节，admin-only 面
+			// 也别外漏原文）；错误全文进服务端日志，对外给通用文案。可达错误只有批次级
+			// 扫描/解析预检的库故障——原文留在日志里排障，不进响应。
+			if h.poller.log != nil {
+				h.poller.log.Error("V3 补收批次级失败", "ref", ref, "err", err.Error())
+			}
+			resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError,
+				"补收执行失败，请稍后重试；持续失败请联系管理员核对服务端日志")
 		}
 		return
 	}
