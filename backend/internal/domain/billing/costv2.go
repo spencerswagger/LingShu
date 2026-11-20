@@ -120,7 +120,11 @@ func ParseV2Cost(raw []byte) (*V2Cost, error) {
 		p := *tree.WebSearch.Price
 		c.WebSearch = &p
 	}
-	c.Multipliers, c.Warnings = mult.ParseRules(tree.Multipliers)
+	// 键缺省（raw 为空）= 合法「无规则」，不进 ParseRules——否则空输入也会触发
+	// 「非数组」告警，每个干净形状都背一条噪音（真值非数组仍由 ParseRules 告警）。
+	if len(tree.Multipliers) > 0 {
+		c.Multipliers, c.Warnings = mult.ParseRules(tree.Multipliers)
+	}
 	return c, nil
 }
 

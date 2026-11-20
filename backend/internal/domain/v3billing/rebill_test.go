@@ -150,10 +150,10 @@ func TestRebill_HappyPathAndIdempotent(t *testing.T) {
 		f.expectState()
 		// 行级解析：req=组ref 直中绑定档。
 		f.expectPriceChain(groupRef, "served-m", groups, 5, groupRef, extName, rates)
-		// Record → 新账单；成本沿用原行。
+		// Record → 新账单；成本沿用原行；留痕参数恒 nil（旧三段行不落 price_eval）。
 		f.rec.bals = []float64{88.5}
 		f.mock.ExpectExec("UPDATE billing_records SET cost_credits").
-			WithArgs(cost, newID).WillReturnResult(sqlmock.NewResult(0, 1))
+			WithArgs(cost, newID, nil).WillReturnResult(sqlmock.NewResult(0, 1))
 		f.expectMark("bill-x", newID)
 
 		res, err := f.p.Rebill(context.Background(), groupRef)
@@ -530,7 +530,7 @@ func TestRebill_Random20(t *testing.T) {
 			credits := rfloat(0.01, 500)
 			f.rec.bals = []float64{credits}
 			f.mock.ExpectExec("UPDATE billing_records SET cost_credits").
-				WithArgs(cost, rebillNewBillingID(origID)).WillReturnResult(sqlmock.NewResult(0, 1))
+				WithArgs(cost, rebillNewBillingID(origID), nil).WillReturnResult(sqlmock.NewResult(0, 1))
 			f.expectMark(origID, rebillNewBillingID(origID))
 
 			res, err := f.p.Rebill(context.Background(), groupRef)

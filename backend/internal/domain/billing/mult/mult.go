@@ -146,7 +146,9 @@ func (w Warning) String() string { return w.Rule + ": " + w.Reason }
 func ParseRules(raw []byte) (Rules, []Warning) {
 	var raws []json.RawMessage
 	if err := json.Unmarshal(raw, &raws); err != nil {
-		return nil, nil
+		// 非数组形状（对象/字符串/数字）整段忽略——与逐条丢弃同可见性口径，必须告警；
+		// JSON null 是合法的「无规则」，Unmarshal 成功且 raws 为 nil，不在此分支。
+		return nil, []Warning{{Rule: "multipliers", Reason: "multipliers 必须是数组形状，当前值被整段忽略"}}
 	}
 	var (
 		rules Rules
@@ -340,7 +342,9 @@ func parseUTCHour(raw json.RawMessage) (int64, string) {
 		return 0, "值必须是 \"HH:MM\" 字符串（UTC）"
 	}
 	var h, m int
-	if n, _ := fmt.Sscanf(s, "%d:%d", &h, &m); n != 2 {
+	// 两段校验缺一不可：Sscanf 读满 2 值即停（"12:30:45" 会被收下），
+	// 必须再钉「有且只有一段冒号」；"9:5" 由下方长度守卫拒（与既有用例一致）。
+	if n, _ := fmt.Sscanf(s, "%d:%d", &h, &m); n != 2 || len(strings.Split(s, ":")) != 2 {
 		return 0, fmt.Sprintf("%q 不是 HH:MM 形态", s)
 	}
 	if len(s) < 4 || !strings.Contains(s, ":") || h < 0 || h > 23 || m < 0 || m > 59 {
@@ -467,7 +471,8 @@ type Ctx struct {
 }
 
 // HolidayTable 静态节假日表（已定案只做静态映射，不做自动地理库）：
-// 国别 → 日期集合（"YYYY-MM-DD"，UTC 日）。DefaultHolidays 是内置缺省表。
+// 国别 → 日期集合（"YYYY-MM-DD"，UTC 日）。表由调用方自带（包内不内置
+// 缺省表）；nil/缺国别 → 含 holiday 条件的规则不命中。
 type HolidayTable map[string]map[string]bool
 
 // Hit 一条命中规则的留痕：数字形式 Global=true 且 Factor 为整体因子；

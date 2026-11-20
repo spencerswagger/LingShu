@@ -13,6 +13,7 @@ package v3billing
 
 import (
 	"context"
+	"database/sql/driver"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -21,6 +22,24 @@ import (
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/team/llmgateway/internal/domain/billing"
 )
+
+// tracePins 留痕字节参数的内容钉（go-sqlmock v1.5.2 无 MatchedBy，用 Argument 接口自写）：
+// 补收求值时刻是 time.Now 非确定 → 不能逐字节比，按 pins 子串钉内容。
+type tracePins struct{ pins []string }
+
+func (m tracePins) Match(v driver.Value) bool {
+	b, ok := v.([]byte)
+	if !ok {
+		return false
+	}
+	got := string(b)
+	for _, p := range m.pins {
+		if !strings.Contains(got, p) {
+			return false
+		}
+	}
+	return true
+}
 
 // evalRec 包着 *fakeRec：模拟「requestCredits 已求值」的下游效果
 // （真 requestCreditsV2 的行为由 billing 包用例钉死，这里只补下游形态）。
@@ -71,6 +90,18 @@ func (f *fixture) expectCostHitV2(provider, model string, costRates map[string]f
 	f.mock.ExpectQuery("FROM internal_models WHERE ref =").
 		WithArgs(provider + "/" + model).
 		WillReturnRows(f.mock.NewRows([]string{"cost_rates", "cost_v2"}).AddRow(raw, []byte(costV2)))
+}
+
+// expectCostHitLegacy 装配带旧三段 cost_rates 的成本命中行（cost_v2 为空）——
+// 混合层用例（售价 v2 + 成本旧三段）。
+func (f *fixture) expectCostHitLegacy(provider, model string, rates map[string]float64) {
+	raw, err := json.Marshal(rates)
+	if err != nil {
+		f.t.Fatalf("rates 序列化失败：%v", err)
+	}
+	f.mock.ExpectQuery("FROM internal_models WHERE ref =").
+		WithArgs(provider + "/" + model).
+		WillReturnRows(f.mock.NewRows([]string{"cost_rates", "cost_v2"}).AddRow(raw, nil))
 }
 
 // expectSettledV2 断言留痕 UPDATE 的第 4 参逐字节等于期望 JSON。
@@ -276,6 +307,111 @@ func TestSettleV2_IdempotentKeepsTrace(t *testing.T) {
 
 // TestRebillV2_AttachesSale 补收链 v2：售价解析复用 attachSale（求值时刻=补收时刻），
 // tokens 沿用原账单行 JSONB——历史三段行无 cache_write 键 → 该段按 0 计（不可复原）。
+// TestSettleV2_MixedCostLegacy 定案②④「两层独立可配」的混合形态一：
+// 售价 v2 + 成本旧三段。任一层 v2 即四桶拆分；旧三段成本把 CacheWrite 折回
+// input（历史口径=按输入价计）——否则该段从成本整段消失（Owl P1 探针 0.063）。
+func TestSettleV2_MixedCostLegacy(t *testing.T) {
+	f := newFixture(t)
+	inner := f.rec
+	f.p.bill = &evalRec{inner: inner}
+	lg := "lg-v2mcl"
+	served := "gpt-mcl"
+	caller := "ck-mcl"
+	// tokens_in=1000（含 cache_read 100 + cache_write 50）。
+	f.expectOnceRows([]any{lg, v2EvalAt, "prov", served, served, caller,
+		int64(1), int64(1000), int64(200), int64(100), int64(50), float64(0)})
+	f.expectGroups()
+	f.expectToken(caller)
+	f.expectCostHitLegacy("prov", served, map[string]float64{"input": 0.5, "output": 1, "cache_read": 0.05})
+	saleShape := `{"text":{"input":{"price":1,"cache":{"read":0.1,"write":0.2}},"output":{"price":2}},"multipliers":[]}`
+	f.expectPriceChainV2(served, served, nil, 1, "group/"+served, "ext-mcl",
+		map[string]float64{"input": 9, "output": 9, "cache_read": 9}, saleShape)
+
+	wantUsage := billing.Usage{Input: 850, Output: 200, CacheRead: 100, CacheWrite: 50}
+	saleWant := mustV2(t, saleShape, v2EvalAt)
+	saleWant.Eval = billing.EvaluateV2(saleWant, wantUsage)
+	saleWant.SetEvaluatedForTest()
+	wantBytes, err := json.Marshal(billing.PriceEvalTrace(saleWant, nil, wantUsage, 10000))
+	if err != nil {
+		t.Fatalf("trace 序列化：%v", err)
+	}
+	// 结算 UPDATE 的 cost 参数是账本成本（0），公式成本进 Record——两侧分开断言。
+	f.expectSettledV2(lg, 0, string(wantBytes))
+
+	if _, err := f.p.Once(context.Background()); err != nil {
+		t.Fatalf("Once：%v", err)
+	}
+	if err := f.mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("DB 期望未对齐：%v", err)
+	}
+	req := inner.reqs[0]
+	// 拆桶键：售价层 v2 ⇒ 四桶（本用例即混合层的拆分来源）。
+	if req.Tokens != wantUsage {
+		t.Fatalf("混合层拆桶不符：got %+v want %+v", req.Tokens, wantUsage)
+	}
+	// 售价复算（v2 四价、无因子）：(850+400+10+10)/10000 = 0.127。
+	gotSale, err := billing.ComputeCreditsV2(req.Tokens, req.V2.Prices, req.V2.Eval.FactorFor("text"), 10000)
+	if err != nil || gotSale != 0.127 {
+		t.Fatalf("混合层售价不符：got %v want 0.127 err %v", gotSale, err)
+	}
+	// 成本复算（旧三段 + 折回 input）：(850+50)×0.5+200×1+100×0.05 = 655 → 0.0655。
+	// 不折（修复前）= 850×0.5+200+5 = 630 → 0.063 —— cache_write 整段消失。
+	gotCost, err := billing.ComputeCredits(req.Tokens, req.CostRates, 1, 1, 10000)
+	if err != nil || gotCost != 0.0655 {
+		t.Fatalf("混合层成本应折回 input：got %v want 0.0655 err %v", gotCost, err)
+	}
+}
+
+// TestSettleV2_MixedCostV2 混合形态二：售价旧三段 + 成本 v2。
+// 成本层 v2 同样触发拆桶（修复前只看售价层 → cache_write 按 input 价计而非 write 价）。
+func TestSettleV2_MixedCostV2(t *testing.T) {
+	f := newFixture(t)
+	inner := f.rec
+	f.p.bill = &evalRec{inner: inner}
+	lg := "lg-v2mcv"
+	served := "gpt-mcv"
+	caller := "ck-mcv"
+	f.expectOnceRows([]any{lg, v2EvalAt, "prov", served, served, caller,
+		int64(1), int64(1000), int64(200), int64(100), int64(50), float64(0)})
+	f.expectGroups()
+	f.expectToken(caller)
+	// 成本 v2：cache_write 独立价 0.8（与 input 0.5 区分——修复前按 0.5 计）。
+	costShape := `{"text":{"input":{"price":0.5,"cache":{"read":0.05,"write":0.8}},"output":{"price":1}},"multipliers":[]}`
+	f.expectCostHitV2("prov", served, map[string]float64{"input": 0.5}, costShape)
+	// 售价旧三段。
+	f.expectPriceChain(served, served, nil, 1, "group/"+served, "ext-mcv",
+		map[string]float64{"input": 1, "output": 2, "cache_read": 0.1})
+	// 售价非 v2 ⇒ 不落留痕（priceEvalRaw nil）。
+	f.expectSettled(lg, 0)
+
+	if _, err := f.p.Once(context.Background()); err != nil {
+		t.Fatalf("Once：%v", err)
+	}
+	if err := f.mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("DB 期望未对齐：%v", err)
+	}
+	req := inner.reqs[0]
+	wantUsage := billing.Usage{Input: 850, Output: 200, CacheRead: 100, CacheWrite: 50}
+	// 拆桶键：成本层 v2 ⇒ 四桶（修复前不拆 → CacheWrite 折在 input）。
+	if req.Tokens != wantUsage {
+		t.Fatalf("成本层 v2 也应拆桶：got %+v want %+v", req.Tokens, wantUsage)
+	}
+	if req.V2 != nil {
+		t.Fatalf("售价旧三段不应挂 V2：%+v", req.V2)
+	}
+	// 售价复算（旧三段 + 折回 input）：900×1+200×2+100×0.1 = 1310 → 0.131。
+	gotSale, err := billing.ComputeCredits(req.Tokens, req.Rates, 1, 1, 10000)
+	if err != nil || gotSale != 0.131 {
+		t.Fatalf("混合层售价不符：got %v want 0.131 err %v", gotSale, err)
+	}
+	// 成本复算（v2 write 价）：850×0.5+50×0.8+200×1+100×0.05 = 670 → 0.067。
+	// 修复前（不拆桶）cache_write 按 input 价：(850+50)×0.5+200+5 = 655 → 0.0655。
+	gotCost, err := billing.ComputeCreditsV2(req.Tokens, req.CostV2.Prices, req.CostV2.Eval.FactorFor("text"), 10000)
+	if err != nil || gotCost != 0.067 {
+		t.Fatalf("混合层成本应按 write 价：got %v want 0.067 err %v", gotCost, err)
+	}
+}
+
 func TestRebillV2_AttachesSale(t *testing.T) {
 	f := newFixture(t)
 	inner := f.rec
@@ -304,10 +440,13 @@ func TestRebillV2_AttachesSale(t *testing.T) {
 	f.expectState()
 	// 行级解析：同候选链。
 	f.expectPriceChainV2(groupRef, "served-v2", groups, 5, groupRef, extName, rates, saleShape)
-	// Record → 新账单；成本沿用原行。
+	// Record → 新账单；成本沿用原行；留痕（price_eval）与成本同条 UPDATE 落库。
+	// 补收求值时刻 = 补收时刻（time.Now）非确定 → 留痕按内容钉（kind/价/因子/R），不逐字节。
 	f.rec.bals = []float64{88.5}
 	f.mock.ExpectExec("UPDATE billing_records SET cost_credits").
-		WithArgs(rebillCost, newID).WillReturnResult(sqlmock.NewResult(0, 1))
+		WithArgs(rebillCost, newID, tracePins{pins: []string{
+			`"kind":"v2"`, `"input":3`, `"output":4`, `"factor":1`, `"r":10000`,
+		}}).WillReturnResult(sqlmock.NewResult(0, 1))
 	f.expectMark("bill-v2r", newID)
 
 	res, err := f.p.Rebill(context.Background(), groupRef)
@@ -339,6 +478,51 @@ func TestRebillV2_AttachesSale(t *testing.T) {
 }
 
 // mustV2 由形状构造求值输入（测试脚手架）。
+// TestRebillV2_TraceWithoutCost 补收链留痕的另一半：原行没有成本值时，
+// 留痕走独立的 price_eval UPDATE（与成本补写分支互斥）。
+func TestRebillV2_TraceWithoutCost(t *testing.T) {
+	f := newFixture(t)
+	inner := f.rec
+	f.p.bill = &evalRec{inner: inner}
+	groupID := rseg(t)
+	groupRef := "group/" + groupID
+	display := "组" + rseg(t)
+	extName := "ext-" + rseg(t)
+	rates := map[string]float64{"input": 1, "output": 2, "cache_read": 0.1}
+	saleShape := `{"text":{"input":{"price":3,"cache":{"read":0.5}},"output":{"price":4}},"multipliers":[]}`
+	groups := []groupNode{{Ref: groupRef, DisplayName: display}}
+	newID := rebillNewBillingID("bill-v2nc")
+
+	f.expectGroups([2]string{groupRef, display})
+	f.expectPriceChainV2(groupRef, display, groups, 1, groupRef, extName, rates, saleShape)
+	f.expectScan(rebillRow{
+		BillingID: "bill-v2nc", UserID: 42, TokenID: int64Ptr(7),
+		ExternalModel: groupRef, InternalModelID: "prov/m",
+		Tokens:       billing.Usage{Input: 900, Output: 200, CacheRead: 100},
+		ErrorMessage: "未定价组：" + groupRef,
+		ReqModel:     groupRef, ServedModel: "served-v2nc", RouteID: 5,
+	})
+	f.expectState()
+	f.expectPriceChainV2(groupRef, "served-v2nc", groups, 5, groupRef, extName, rates, saleShape)
+	f.rec.bals = []float64{88.5}
+	// 无成本值：只有留痕 UPDATE（不带 cost_credits 守卫条件）。
+	f.mock.ExpectExec("UPDATE billing_records SET price_eval").
+		WithArgs(newID, tracePins{pins: []string{`"kind":"v2"`, `"output":4`}}).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	f.expectMark("bill-v2nc", newID)
+
+	res, err := f.p.Rebill(context.Background(), groupRef)
+	if err != nil {
+		t.Fatalf("Rebill 失败：%v", err)
+	}
+	if res.Rebilled != 1 {
+		t.Fatalf("汇总不符：%+v", res)
+	}
+	if err := f.mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("DB 期望未对齐：%v", err)
+	}
+}
+
 func mustV2(t *testing.T, shape string, at time.Time) *billing.V2Pricing {
 	t.Helper()
 	c, err := billing.ParseV2Cost([]byte(shape))

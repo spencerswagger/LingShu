@@ -158,8 +158,13 @@ func ValidateRates(r Rates) error {
 // sumRates 计算三段 token×单价 之和。
 // 三段互斥（Input 为纯输入、不含缓存读），直接相加即可，
 // 不存在缓存命中 token 被输出价与缓存价重复累计的问题。
+//
+// CacheWrite 折回 input：混合层形态（售价 v2 + 成本旧三段，或反向）下 tokens 已是
+// 四桶拆分（cache_write 独立成段）；旧三段价没有 write 档，按**历史口径**把该段
+// token 以 input 价计——否则该段从成本整段消失。CacheWrite=0（全部旧路径）时 no-op，
+// 行为逐字节不变。
 func sumRates(u Usage, r Rates) float64 {
-	return float64(u.Input)*r["input"] +
+	return float64(u.Input+u.CacheWrite)*r["input"] +
 		float64(u.Output)*r["output"] +
 		float64(u.CacheRead)*r["cache_read"]
 }

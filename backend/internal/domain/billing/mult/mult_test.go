@@ -50,6 +50,20 @@ func TestParse_EmptyWhenRejected(t *testing.T) {
 	}
 }
 
+func TestParse_NonArrayShapeWarns(t *testing.T) {
+	// multipliers 非数组形状整段忽略——与逐条丢弃同可见性口径，必须告警。
+	for _, raw := range []string{`{"a":1}`, `"x"`, `1.5`} {
+		rs, warns := ParseRules([]byte(raw))
+		if len(rs) != 0 || len(warns) != 1 || !strings.Contains(warns[0].Reason, "数组") {
+			t.Fatalf("非数组形状 %q 应整段告警：rs=%d warns=%+v", raw, len(rs), warns)
+		}
+	}
+	// JSON null = 合法「无规则」，不告警。
+	if rs, warns := ParseRules([]byte(`null`)); len(rs) != 0 || len(warns) != 0 {
+		t.Fatalf("null 应按无规则处理：rs=%d warns=%+v", len(rs), warns)
+	}
+}
+
 func TestParse_LeafOneKeyOneOperator(t *testing.T) {
 	// when 多键 → 拒绝（组合必须显式 all/any）。
 	if _, warns := rules(t, `[{"when":{"utc_days":{"equals":"fri"},"region":{"equals":"CN"}},"factor":1}]`); len(warns) != 1 {
@@ -73,6 +87,7 @@ func TestParse_BadValuesRejected(t *testing.T) {
 	bad := []string{
 		`[{"when":{"utc_hours":{"equals":"25:00"}},"factor":1}]`,
 		`[{"when":{"utc_hours":{"equals":"9:5"}},"factor":1}]`,
+		`[{"when":{"utc_hours":{"equals":"12:30:45"}},"factor":1}]`,
 		`[{"when":{"utc_days":{"equals":"funday"}},"factor":1}]`,
 		`[{"when":{"date":{"equals":"2026-13-01"}},"factor":1}]`,
 		`[{"when":{"context":{"gt":-1}},"factor":1}]`,
@@ -94,9 +109,10 @@ func TestParse_BadValuesRejected(t *testing.T) {
 }
 
 func TestParse_NotArrayMeansNoRules(t *testing.T) {
-	// 整体不是数组（如手滑存了对象）→ 视为无规则，等价恒 1 因子，不报错。
-	if rs, warns := rules(t, `{"multipliers":[]}`); rs != nil || warns != nil {
-		t.Fatalf("非数组应返回 (nil,nil)，得到 %v %v", rs, warns)
+	// 整体不是数组（如手滑存了对象）→ 视为无规则，等价恒 1 因子；与逐条丢弃同
+	// 可见性口径，必须带一条形状告警（评审 P3：静默忽略 = 规则漂移不可见）。
+	if rs, warns := rules(t, `{"multipliers":[]}`); rs != nil || len(warns) != 1 {
+		t.Fatalf("非数组应返回 (nil,1 条形状告警)，得到 %v %v", rs, warns)
 	}
 	if rs, _ := rules(t, `[]`); len(rs) != 0 {
 		t.Fatalf("空数组 = 无规则")

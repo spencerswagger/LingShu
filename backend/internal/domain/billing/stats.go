@@ -12,16 +12,18 @@ import (
 	"time"
 )
 
-// UsageSplit 三段 Token 用量。
+// UsageSplit 四段 Token 用量。
 type UsageSplit struct {
-	Input     int64 `json:"Input"`
-	Output    int64 `json:"Output"`
-	CacheRead int64 `json:"CacheRead"`
+	Input      int64 `json:"Input"`
+	Output     int64 `json:"Output"`
+	CacheRead  int64 `json:"CacheRead"`
+	CacheWrite int64 `json:"CacheWrite"` // v2 计价行独立分桶（定案①）；旧三段行=0
 }
 
-// Total 求总量：三段互斥（Input 为纯输入、不含缓存读），直接求和。
+// Total 求总量：四段互斥（Input 为纯输入、不含缓存读/写），直接求和。
+// 与 tokenSum 同口径（对账 / console 统计唯一来源，缺一即两侧漂移）。
 func (u UsageSplit) Total() int64 {
-	return u.Input + u.CacheRead + u.Output
+	return u.Input + u.CacheRead + u.CacheWrite + u.Output
 }
 
 // DashDay 按天聚合行（趋势 / 成功率 / 吞吐量）。
@@ -171,6 +173,7 @@ func (s *SqlStore) WindowTotals(ctx context.Context, from, to time.Time, userID 
 		    COALESCE(sum(COALESCE(NULLIF(tokens->>'input','')::bigint,0)),0),
 		    COALESCE(sum(COALESCE(NULLIF(tokens->>'output','')::bigint,0)),0),
 		    COALESCE(sum(COALESCE(NULLIF(tokens->>'cache_read','')::bigint,0)),0),
+		    COALESCE(sum(COALESCE(NULLIF(tokens->>'cache_write','')::bigint,0)),0),
 		    COALESCE(sum(credits_consumed),0),
 		    count(*),
 		    COALESCE(sum((status IN ('failed','upstream_error'))::int),0),
@@ -183,7 +186,7 @@ func (s *SqlStore) WindowTotals(ctx context.Context, from, to time.Time, userID 
 		    COALESCE(sum(duration_ms) FILTER (WHERE `+busyFilter+`),0)
 		 FROM billing_records `+dashWhere(""),
 		dashArgs(userID, from, to)...).
-		Scan(&out.Total.Input, &out.Total.Output, &out.Total.CacheRead,
+		Scan(&out.Total.Input, &out.Total.Output, &out.Total.CacheRead, &out.Total.CacheWrite,
 			&out.Credits, &out.Calls, &out.Failed, &sumDur, &sumFirst, &okDur, &okFirst,
 			&busyRequests, &busyTokens, &busyDur)
 	if err != nil {

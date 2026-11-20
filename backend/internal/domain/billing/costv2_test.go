@@ -60,6 +60,29 @@ func TestParseV2Cost_CacheWriteMissingFallsBackZero(t *testing.T) {
 	}
 }
 
+func TestParseV2Cost_AbsentMultipliersNoWarning(t *testing.T) {
+	// multipliers 键缺省 = 合法「无规则」：不得背「非数组」噪音告警
+	// （每个干净形状都会被 warnMult 打日志——回归钉）。
+	c, err := ParseV2Cost([]byte(`{"text":{"input":{"price":1,"cache":{"read":0.1}},"output":{"price":2}}}`))
+	if err != nil {
+		t.Fatalf("解析：%v", err)
+	}
+	if len(c.Warnings) != 0 {
+		t.Fatalf("键缺省不应告警：%+v", c.Warnings)
+	}
+	if len(c.Multipliers) != 0 {
+		t.Fatalf("无规则应为空：%d", len(c.Multipliers))
+	}
+	// 真的非数组仍告警（穿到 v2Parse 的可见性口径不变）。
+	c2, err := ParseV2Cost([]byte(`{"text":{"input":{"price":1,"cache":{"read":0.1}},"output":{"price":2}},"multipliers":{"a":1}}`))
+	if err != nil {
+		t.Fatalf("解析：%v", err)
+	}
+	if len(c2.Warnings) != 1 {
+		t.Fatalf("非数组形状应告警：%+v", c2.Warnings)
+	}
+}
+
 func TestParseV2Cost_RequiredFields(t *testing.T) {
 	bad := map[string]string{
 		"缺 text 节点":       `{}`,

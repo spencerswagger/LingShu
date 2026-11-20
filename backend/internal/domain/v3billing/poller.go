@@ -399,8 +399,10 @@ func (p *Poller) settleOne(ctx context.Context, r row, groups []groupNode) (sett
 		label := "结算 " + r.ledgerID
 		saleV2 = p.attachSale(&req, price, r.occurredAt, label)
 		costV2 = p.attachCost(&req, costV2Raw, costRates, r.occurredAt, label)
-		if saleV2 != nil {
-			// v2 行四桶互斥：cache_write 从 tokens_in 拆出独立分桶（定案①）。
+		if saleV2 != nil || costV2 != nil {
+			// 任一层 v2 即四桶互斥拆分（定案②④：两层独立可配——cost-only-v2 是规划内形态，
+			// 只按售价层拆桶会让 cache_write 从成本整段消失/按错价计）。混合层的旧三段价
+			// 由 sumRates 把 CacheWrite 折回 input（历史口径=按输入价计），v2 层按 write 价。
 			req.Tokens = splitV2Usage(r)
 		}
 	} else {
