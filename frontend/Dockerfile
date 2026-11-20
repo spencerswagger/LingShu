@@ -15,6 +15,9 @@ RUN npm run build
 FROM nginx:1.27-alpine
 COPY --from=build /app/dist /usr/share/nginx/html
 COPY nginx.conf /etc/nginx/conf.d/default.conf
+# /v1 白名单公共转发段：被 default.conf 的 5 个放行 location include（.inc 后缀不会被
+# conf.d/*.conf 顶层装载）。缺这一行 = 容器起不来（include 找不到文件）。
+COPY v1-proxy.inc /etc/nginx/conf.d/v1-proxy.inc
 # 代理侧管理面（/magpie/）：默认「不注入口令」的 map，容器启动时由 19-magpie-key.sh 覆盖。
 COPY 00-magpie-key.conf /etc/nginx/conf.d/00-magpie-key.conf
 COPY docker-entrypoint.d/19-magpie-key.sh /docker-entrypoint.d/19-magpie-key.sh
