@@ -11,9 +11,14 @@
 3. 点击 → `ElMessageBox.confirm` 确认（写明：按当前售价开新账单、从对应用户余额扣款、原账单保持不变）。
 4. 成功：抽屉内展示补收条数 / 金额合计 / 跳过条数（此前已补收）/ 新账单号清单——**全部用后端返回
    `Rebilled / TotalCredits / AlreadyMarked / NewBillingIDs`，前端不自算**；同时清零本地计数。
-5. 失败（400 + Reason）：抽屉内红色块展示——`Reason` 映射的中文处置文案 + 后端 `Message` 原文。
-   已识别 Reason：`rebill_group_unpriced`（先绑售价）、`rebill_row_unresolvable`（部分行仍解析不到售价）。
-6. 切组/再保存会重置上一轮检测与结果（含竞态 token 守卫），不残留旧状态。
+5. 部分失败（毒行隔离，后端 `a9c8a0e` 起）：HTTP 仍 200，响应多 `Failed[]`
+   （元素 `{BillingID, Reason, Message}`；`omitempty`，全部成功时字段缺席、展示不变）。
+   结果块在成功条数之下追加红色失败清单：账单标识 + `Reason` 映射中文 + 「后端说明：Message」双展示。
+   行级 Reason 键：`unpriced_row`（仍解析不到售价）/ `unresolved_user`（缺合法用户归属无法扣款）/
+   `record_error`（计费落库出错）；未知键兜底展示原文 Message。
+6. 批次级失败（组未定价，400 + `rebill_group_unpriced`）：抽屉内红色块——Reason 映射中文处置文案 +
+   后端 `Message` 原文。批次级 `rebill_row_unresolvable` 已随毒行隔离废弃（改走 Failed[]）。
+7. 切组/再保存会重置上一轮检测与结果（含竞态 token 守卫），不残留旧状态。
 
 ## 检测方式（不改后端，用现成接口）
 
@@ -26,6 +31,7 @@
 
 1. **检测数偏窄**：补收扫描还匹配组快照 `display_name ↔ ref` 双向；快照缺失时前端数不到、
    补收却能算到 → 按钮上的 N 可能小于实际补收条数。
+   → 差异不静默：预估差体现在返回 `Rebilled` 与 N 之差；数不到且解析失败的行会进 `Failed[]` 显性展示。
 2. **检测数偏宽**：模型级售价覆盖组 ref 候选时，个别行实际能解析到（模型名形态命中），
    前端按组形态数到了 → N 可能大于实际补收条数。
    → 弹窗文案已写明「实际补收结果以执行后返回为准」，真实条数/金额以 `Rebilled/TotalCredits` 展示。
@@ -40,5 +46,6 @@
 ## 走查
 
 `/data/pv/rebill-check.mjs`（一次性脚本，不进仓库）：vite + puppeteer 拦 `/api/v1/**` 回桩，
-20 项断言全过——保存后检测（多形态去重、剔除已补收行）、确认弹窗文案、成功结果四件套、
-失败 Reason 展示、N=0 抽屉照旧关闭、390px 页面与抽屉内均无横向溢出。
+29 项断言全过——保存后检测（多形态去重、剔除已补收行）、确认弹窗文案、部分失败
+（成功合计与失败明细并列：账单标识 + Reason 中文 + Message）、全部成功展示不变、失败 Reason 展示、
+N=0 抽屉照旧关闭、390px 页面与抽屉内均无横向溢出。

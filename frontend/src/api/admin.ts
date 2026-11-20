@@ -312,10 +312,20 @@ export interface RebillResult {
   NewBillingIDs: string[]
   // 已补收过、本次跳过的条数（幂等跳过 ≠ 新补收）
   AlreadyMarked: number
+  // 逐行失败明细（毒行不堵整批，a9c8a0e 起；omitempty = 无失败时整个字段缺席，六字段契约不变）。
+  // wire 与后端 RebillRowFailure 同源：Reason ∈ unpriced_row（按当前配置仍解析不到售价）/
+  // unresolved_user（原行缺合法 user_id 无法归属扣款）/ record_error（计费/落库错误）。
+  Failed?: RebillRowFailure[]
+}
+export interface RebillRowFailure {
+  // 原账单号（运营照单修复后重放补齐）
+  BillingID: string
+  Reason: string
+  Message: string
 }
 // 对指定组执行补收：按当前售价给该组历史 unpriced 账单逐条开新账单并扣款。
-// 失败（组未定价/个别行仍解析不到售价）→ 400 + Reason（rebill_group_unpriced / rebill_row_unresolvable），
-// Message 是给人看的中文原因，调用方把两者一起展示。
+// 批次级失败（组未定价）→ 400 + Reason（rebill_group_unpriced），Message 中文原因，
+// 调用方把 Reason 文案与 Message 一起展示；毒行走部分成功（HTTP 200），失败行进 Failed[]。
 export function rebillUnpriced(ref: string) {
   return http.post<RebillResult, ApiRes<RebillResult>>('/admin/billings/rebill-unpriced', { Ref: ref })
 }

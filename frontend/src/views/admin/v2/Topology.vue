@@ -207,7 +207,11 @@ const rebillError = ref('')
 
 const REBILL_REASON_TEXT: Record<string, string> = {
   rebill_group_unpriced: '该组当前没有可用的售价口径，请先绑定售价后再补收',
-  rebill_row_unresolvable: '部分账单按当前配置仍解析不到售价，未能全部补收',
+  // 逐行失败键（a9c8a0e 起：毒行不堵整批，失败行带原因进 Failed[]，HTTP 仍 200）
+  unpriced_row: '按当前售价仍解析不到该行的售价，未补收',
+  unresolved_user: '原账单缺合法用户归属，无法扣款，未补收',
+  record_error: '计费落库出错，未补收',
+  // 兜底：后端未来新增键时展示原文 Message，不吞掉
 }
 
 async function runRebill() {
@@ -306,6 +310,15 @@ const selKindLabel = computed(() => {
               <code v-for="id in rebillDone.NewBillingIDs" :key="id">{{ id }}</code>
               <span v-if="!rebillDone.NewBillingIDs?.length" class="rebill-none">无（可能全部已被补收过）</span>
             </div>
+            <!-- 部分失败（毒行不堵整批）：失败行与成功条数并列展示，防止运营误判全部成功 -->
+            <div v-if="rebillDone.Failed?.length" class="rebill-failed">
+              <div class="rebill-failed-title">{{ rebillDone.Failed.length }} 条未能补收</div>
+              <div v-for="f in rebillDone.Failed" :key="f.BillingID" class="rebill-fail-row">
+                <span class="rebill-fail-id">{{ f.BillingID }}</span>
+                <span class="rebill-fail-txt">{{ REBILL_REASON_TEXT[f.Reason] || f.Message }}</span>
+              </div>
+              <div v-for="f in rebillDone.Failed.filter((x) => REBILL_REASON_TEXT[x.Reason])" :key="'m' + f.BillingID" class="rebill-fail-msg">后端说明：{{ f.Message }}</div>
+            </div>
           </div>
           <div v-else-if="rebillError" class="rebill">
             <div class="rebill-title rebill-fail">补收失败</div>
@@ -371,4 +384,11 @@ const selKindLabel = computed(() => {
 .rebill-ids { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; font-size: 10.5px; color: var(--ink-3); align-items: center; }
 .rebill-ids code { font-family: ui-monospace, Menlo, monospace; padding: 1px 6px; border: 1px solid var(--line); border-radius: 5px; color: var(--ink); word-break: break-all; }
 .rebill-none { color: var(--ink-3); }
+/* 部分失败明细：红色调沿用 Element Plus danger，与失败块 .rebill-fail 同源 */
+.rebill-failed { margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--line); }
+.rebill-failed-title { font-size: 12px; font-weight: 600; color: #f56c6c; margin-bottom: 4px; }
+.rebill-fail-row { display: flex; gap: 8px; align-items: baseline; font-size: 11.5px; padding: 2px 0; min-width: 0; }
+.rebill-fail-id { font-family: ui-monospace, Menlo, monospace; color: var(--ink); flex-shrink: 0; word-break: break-all; }
+.rebill-fail-txt { color: #f56c6c; line-height: 1.5; }
+.rebill-fail-msg { font-size: 11px; color: var(--ink-3); line-height: 1.5; word-break: break-all; }
 </style>
