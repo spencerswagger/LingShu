@@ -106,11 +106,19 @@ func (p *Poller) settleOne(ctx context.Context, r row) (bool, error) {
 	}
 	var tokenID int64
 	var userID int64
-	// callerKeyName = magpie_keys.key_name；据此找令牌与用户
+	// callerKeyName = magpie_keys.key_name；据此找令牌与用户。
+	// 改名兜底：改名窗口之前的账本行是旧名快照（legacy_key_name），先按当前名查，
+	// 查不到再按旧名查（0030 加列）。两步都是 LIMIT 1 且按名精确等值，不猜名。
 	if err := p.db.QueryRowContext(ctx, `
 		SELECT k.token_id, t.user_id FROM magpie_keys k JOIN tokens t ON t.id = k.token_id
 		 WHERE k.key_name = $1 AND k.state = 'ACTIVE' LIMIT 1`, r.callerKey).Scan(&tokenID, &userID); err != nil {
-		return false, fmt.Errorf("找不到 callerKey=%s 对应令牌：%w", r.callerKey, err)
+		// 旧名兜底：legacy_key_name 只在改名过的行上非空（部分索引）。
+		if lerr := p.db.QueryRowContext(ctx, `
+			SELECT k.token_id, t.user_id FROM magpie_keys k JOIN tokens t ON t.id = k.token_id
+			 WHERE k.legacy_key_name = $1 AND k.state = 'ACTIVE' LIMIT 1`, r.callerKey).Scan(&tokenID, &userID); lerr != nil {
+			return false, fmt.Errorf("找不到 callerKey=%s 对应令牌：%w", r.callerKey, err)
+		}
+		p.log.Warn("账本行按旧名结算（改名窗口内）", "caller_key_name", r.callerKey, "ledger_id", r.ledgerID)
 	}
 
 	// 售价（req_model；为空则用 model 兜底）

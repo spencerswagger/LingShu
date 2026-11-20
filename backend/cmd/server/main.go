@@ -530,14 +530,32 @@ func buildApp(d *sql.DB, cfg *config.Config, jwtMgr *jwtx.Manager, logr *slog.Lo
 				}
 				return k.State == "ACTIVE", nil
 			})
-			magpieKeyAdmin.SetAutoSync(tokenSvc.Secret, keySync)
+			// 回填/改名判定：当前映射名 + 按新口径应有名（映射关系确定性推导，不猜名）。
+			tokenSvc.SetCallerKeyNameOf(func(ctx context.Context, tokenID int64) string {
+				k, err := keyStoreForLookup.ByTokenID(ctx, tokenID)
+				if err != nil || k == nil {
+					return ""
+				}
+				return k.KeyName
+			})
+			tokenSvc.SetCallerWantNameOf(func(ctx context.Context, userID, tokenID int64, displayName string) string {
+				return magpie.KeyNameFor(userID, tokenID, displayName)
+			})
+			magpieKeyAdmin.SetAutoSync(tokenSvc.Secret, keySync, tokenSvc.DisplayNameOf)
 			v3Poller.SetKeySync(keySync)
-			// 升级自动补建：启动即把存量令牌注册为代理侧 callerKey（指数退避，最多约 1h）
+			// 升级自动补建：启动即把存量令牌注册/改名代理侧 callerKey（线性退避，最多约 1h）。
+			// 改名口径（2026-11-20 定案①④）：ls-token-<id> → ls-u<uid>-t<tid>-<slug>，
+			// magpie 侧 rename-key 原地改（值不变），旧名落 legacy_key_name 供结算反查。
 			go func() {
 				for i := 0; i < 10; i++ {
-					created, skipped, failed, err := tokenSvc.BackfillCallerKeys(context.Background(), 0)
+					created, renamed, skipped, failed, err := tokenSvc.BackfillCallerKeys(context.Background(), 0, false)
 					if err == nil {
-						logr.Info("V3 存量令牌补建完成", "created", created, "skipped_already_bound", skipped["already-bound"], "skipped_no_cipher", skipped["no-cipher"], "failed", len(failed))
+						logr.Info("V3 存量令牌补建/改名完成",
+							"created", created, "renamed", renamed,
+							"skipped_already_bound", skipped["already-bound"],
+							"skipped_renamed", skipped["renamed"],
+							"skipped_manual_named", skipped["manual-named"],
+							"skipped_no_cipher", skipped["no-cipher"], "failed", len(failed))
 						if len(failed) == 0 {
 							return
 						}

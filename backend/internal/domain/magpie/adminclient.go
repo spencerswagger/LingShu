@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // PageAdmin 调 magpie 的页面接口。
@@ -140,6 +141,49 @@ func (a *PageAdmin) DeleteCallerKey(ctx context.Context, name string) error {
 		if k.Name == name {
 			return a.doJSON(ctx, http.MethodPost, "/api/caller-keys/remove-key", map[string]any{"key": k.ID, "name": name}, nil)
 		}
+	}
+	return nil
+}
+
+// RenameCallerKey 原地改名 callerKey：ID 与 secret 都不变（真机实测，
+// UI Rename 按钮同款端点 POST /api/caller-keys/rename-key {key,name}）。
+// 名字已是目标名视为成功（幂等）；旧名不存在时按「已是目标名」幂等通过，
+// 避免「rename 之前旧名已被删」的竞态卡死回填。
+func (a *PageAdmin) RenameCallerKey(ctx context.Context, oldName, newName string) error {
+	if strings.TrimSpace(oldName) == "" || strings.TrimSpace(newName) == "" {
+		return fmt.Errorf("old/new name 不能为空")
+	}
+	if oldName == newName {
+		return nil
+	}
+	if err := a.checkKeyNameLimit(newName); err != nil {
+		return err
+	}
+	keys, err := a.listCallerKeys(ctx)
+	if err != nil {
+		return err
+	}
+	var id string
+	for _, k := range keys {
+		if k.Name == newName {
+			// 目标名已存在（同名可重复是 magpie 允许的形态）：以「目标名存在」为幂等成功。
+			return nil
+		}
+		if k.Name == oldName {
+			id = k.ID
+		}
+	}
+	if id == "" {
+		// 旧名在代理侧不存在：视为已改名（幂等；本地映射行由调用方推进）。
+		return nil
+	}
+	return a.doJSON(ctx, http.MethodPost, "/api/caller-keys/rename-key", map[string]any{"key": id, "name": newName}, nil)
+}
+
+// checkKeyNameLimit 按 magpie 真机上限（120 字符）拦截，避免把必然失败的请求打到代理侧。
+func (a *PageAdmin) checkKeyNameLimit(name string) error {
+	if n := utf8.RuneCountInString(name); n > MagpieKeyNameLimit {
+		return fmt.Errorf("callerKey 名字 %d 字符超过代理侧上限 %d", n, MagpieKeyNameLimit)
 	}
 	return nil
 }

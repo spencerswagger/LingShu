@@ -20,7 +20,7 @@ var (
 )
 
 func keyColumns() []string {
-	return []string{"id", "token_id", "key_name", "key_id", "key_cipher", "state"}
+	return []string{"id", "token_id", "key_name", "legacy_key_name", "key_id", "key_cipher", "state"}
 }
 
 // Provision 走 ON CONFLICT (token_id)：重复绑定只更新，不新增行。
@@ -34,7 +34,7 @@ func TestKeyStore_ProvisionUpserts(t *testing.T) {
 
 	mock.ExpectQuery(provisionStmt.String()).
 		WithArgs(sqlmock.AnyArg(), int64(7), "core-k1", "cipher-text").
-		WillReturnRows(sqlmock.NewRows(keyColumns()).AddRow(int64(1), int64(7), "core-k1", "", "cipher-text", KeyStateActive))
+		WillReturnRows(sqlmock.NewRows(keyColumns()).AddRow(int64(1), int64(7), "core-k1", "", "", "cipher-text", KeyStateActive))
 
 	k, err := s.Provision(context.Background(), 7, "core-k1", "cipher-text")
 	if err != nil {
@@ -73,7 +73,7 @@ func TestKeyStore_ByTokenID_IncludesDisabled(t *testing.T) {
 	s := NewKeyStore(db)
 
 	mock.ExpectQuery(anyByTokenSQL.String()).WithArgs(int64(7)).
-		WillReturnRows(sqlmock.NewRows(keyColumns()).AddRow(int64(1), int64(7), "core-k1", "", "cipher", KeyStateDisabled))
+		WillReturnRows(sqlmock.NewRows(keyColumns()).AddRow(int64(1), int64(7), "core-k1", "", "", "cipher", KeyStateDisabled))
 	k, err := s.ByTokenID(context.Background(), 7)
 	if err != nil {
 		t.Fatalf("ByTokenID: %v", err)
@@ -113,12 +113,77 @@ func TestKeyStore_ProvisionKeepsKeyID(t *testing.T) {
 	s := NewKeyStore(db)
 
 	mock.ExpectQuery(provisionStmt.String()).WithArgs(sqlmock.AnyArg(), int64(9), "k2", "c").
-		WillReturnRows(sqlmock.NewRows(keyColumns()).AddRow(int64(2), int64(9), "k2", "remote-id", "c", KeyStateActive))
+		WillReturnRows(sqlmock.NewRows(keyColumns()).AddRow(int64(2), int64(9), "k2", "", "remote-id", "c", KeyStateActive))
 	k, err := s.Provision(context.Background(), 9, "k2", "c")
 	if err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
 	if k.KeyID != "remote-id" {
 		t.Fatalf("key_id=%q", k.KeyID)
+	}
+}
+
+var renameStmt = regexp.MustCompile(`UPDATE magpie_keys SET key_name = \$3`)
+
+// renameColumns 与 keyColumns 同形状（+legacy_key_name）。
+func TestKeyStore_RenameAndActivate(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+	s := NewKeyStore(db)
+
+	// rename + activate 一条 UPDATE：旧名落 legacy_key_name、新名生效、state ACTIVE。
+	mock.ExpectQuery(renameStmt.String()).
+		WithArgs(int64(7), "ls-token-7", "ls-u1-t7-alpha", "new-cipher").
+		WillReturnRows(sqlmock.NewRows(keyColumns()).
+			AddRow(int64(1), int64(7), "ls-u1-t7-alpha", "ls-token-7", "", "new-cipher", KeyStateActive))
+
+	k, err := s.RenameAndActivate(context.Background(), 7, "ls-token-7", "ls-u1-t7-alpha", "new-cipher")
+	if err != nil {
+		t.Fatalf("RenameAndActivate: %v", err)
+	}
+	if k.KeyName != "ls-u1-t7-alpha" || k.LegacyKeyName != "ls-token-7" || k.State != KeyStateActive {
+		t.Fatalf("返回=%+v", k)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("%v", err)
+	}
+}
+
+// 无行（DISABLED 或不存在）→ ErrKeyNotProvisioned，不是 nil,nil。
+func TestKeyStore_RenameAndActivate_NotProvisioned(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+	s := NewKeyStore(db)
+	mock.ExpectQuery(renameStmt.String()).
+		WithArgs(int64(7), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+		WillReturnError(sql.ErrNoRows)
+	if _, err := s.RenameAndActivate(context.Background(), 7, "o", "n", "c"); !errors.Is(err, ErrKeyNotProvisioned) {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+// scanKey 全列扫描：legacy_key_name 空 → 空串（NOT NULL DEFAULT ”）。
+func TestKeyStore_ByTokenID_ScansLegacyName(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+	s := NewKeyStore(db)
+	mock.ExpectQuery(anyByTokenSQL.String()).WithArgs(int64(7)).
+		WillReturnRows(sqlmock.NewRows(keyColumns()).
+			AddRow(int64(1), int64(7), "ls-u1-t7-x", "ls-token-7", "", "c", KeyStateActive))
+	k, err := s.ByTokenID(context.Background(), 7)
+	if err != nil {
+		t.Fatalf("ByTokenID: %v", err)
+	}
+	if k.LegacyKeyName != "ls-token-7" {
+		t.Fatalf("legacy 名未扫到：%+v", k)
 	}
 }

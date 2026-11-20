@@ -39,7 +39,9 @@ type KeyAdminHandler struct {
 	adminKey string // 兼容保留（auto 不再使用）
 	// secretOf 取令牌明文（identity 注入）；sync 把令牌明文注册为代理侧 callerKey。
 	secretOf func(ctx context.Context, tokenID int64) (string, error)
-	sync     *CallerKeySync
+	// displayNameOf 取令牌 display_name（auto 改名时做 slug 原料；identity 注入）。
+	displayNameOf func(ctx context.Context, tokenID int64) string
+	sync          *CallerKeySync
 }
 
 // NewKeyAdminHandler 装配管理端处理器（credKey 为 security.sm4_key）。
@@ -47,10 +49,21 @@ func NewKeyAdminHandler(store KeyBinder, credKey []byte, adminKey string) *KeyAd
 	return &KeyAdminHandler{store: store, credKey: credKey, adminKey: strings.TrimSpace(adminKey)}
 }
 
-// SetAutoSync 注入令牌明文读取与同步器（auto 端点用；不注入则 auto 拒绝）。
-func (h *KeyAdminHandler) SetAutoSync(secretOf func(ctx context.Context, tokenID int64) (string, error), sync *CallerKeySync) {
+// SetAutoSync 注入令牌明文读取、令牌名读取与同步器（auto 端点用；不注入则 auto 拒绝）。
+func (h *KeyAdminHandler) SetAutoSync(secretOf func(ctx context.Context, tokenID int64) (string, error), sync *CallerKeySync, displayNameOf ...func(ctx context.Context, tokenID int64) string) {
 	h.secretOf = secretOf
 	h.sync = sync
+	if len(displayNameOf) > 0 {
+		h.displayNameOf = displayNameOf[0]
+	}
+}
+
+// tokenDisplayName 取令牌 display_name；未注入读取器时返回空（slug 退化为随机段，名字仍唯一）。
+func (h *KeyAdminHandler) tokenDisplayName(ctx context.Context, tokenID int64) string {
+	if h.displayNameOf == nil {
+		return ""
+	}
+	return h.displayNameOf(ctx, tokenID)
 }
 
 // HandleAutoPut POST /api/v1/admin/tokens/{id}/magpie-key/auto
@@ -71,7 +84,7 @@ func (h *KeyAdminHandler) HandleAutoPut(w http.ResponseWriter, r *http.Request) 
 		resp.Err(w, r, http.StatusNotFound, resp.CodeNotFound, "该令牌未备份密钥（历史令牌），请轮换令牌后再开通")
 		return
 	}
-	if err := h.sync.Ensure(r.Context(), tokenID, plain); err != nil {
+	if err := h.sync.Ensure(r.Context(), tokenID, TokenRef{ID: tokenID, DisplayName: h.tokenDisplayName(r.Context(), tokenID)}, plain); err != nil {
 		resp.Err(w, r, http.StatusBadGateway, resp.CodeInternalError, "开通失败："+err.Error())
 		return
 	}
@@ -84,8 +97,10 @@ func (h *KeyAdminHandler) HandleAutoPut(w http.ResponseWriter, r *http.Request) 
 }
 
 // 绑定入参的边界（过短=误填，过长=拒绝，避免把整段配置粘贴进来）。
+// maxKeyNameLen 按 magpie 真机上限收紧：0.1.4353 实测 120 字符（原 128 会在
+// magpie 侧被 "Use a name between 1 and 120 characters" 拒掉）。
 const (
-	maxKeyNameLen   = 128
+	maxKeyNameLen   = MagpieKeyNameLimit // 120（真机实测，见 notes/magpie-keyname-limit-2026-11-20.md）
 	maxCallerKeyLen = 512
 )
 

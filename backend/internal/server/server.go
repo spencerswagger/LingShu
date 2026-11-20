@@ -123,6 +123,7 @@ func (s *Server) routes() {
 	admin.HandleFunc("GET /api/v1/admin/tokens", d.TokenAdmin.HandleAdminList)
 	admin.HandleFunc("POST /api/v1/admin/tokens", d.TokenAdmin.HandleAdminCreate)
 	admin.HandleFunc("POST /api/v1/admin/tokens/batch-delete", d.TokenAdmin.HandleAdminBatchDelete)
+	admin.HandleFunc("POST /api/v1/admin/tokens/magpie-keys/backfill", d.TokenAdmin.HandleAdminBackfillMagpieKeys)
 	admin.Handle("GET /api/v1/admin/tokens/{id}/secret", WithAuditSensitiveRead(s.audit, s.logger)(http.HandlerFunc(d.TokenAdmin.HandleAdminSecret)))
 
 	// ---- 已停用的渠道族接口（V2 第一期：渠道/密钥/模型/探测/协议整体迁出）----
