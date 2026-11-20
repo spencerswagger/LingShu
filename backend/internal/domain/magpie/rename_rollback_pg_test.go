@@ -165,3 +165,54 @@ func TestPG_MigrationAndRollbackDrill(t *testing.T) {
 		t.Fatalf("停用行占名必须判占用（否则 Provision 撞 23505）：occupied=%v err=%v", occupied, err)
 	}
 }
+
+// TestPG_NewTokenSkipsDisabledOccupiedName 评审追加 P1 的真库行为锚（建令牌路径）：
+// 停用行占住基础名时，新令牌的 callerKey 分配必须靠消歧 -2 逃逸——
+// 修复前 NameOccupied 排除停用行 → 判「空闲」→ Provision INSERT 直接撞
+// key_name 全列 UNIQUE（23505）→ CreateToken 回滚删令牌；修复后检查期即占用。
+func TestPG_NewTokenSkipsDisabledOccupiedName(t *testing.T) {
+	target := openRenameTempDB(t)
+	ctx := context.Background()
+	store := NewKeyStore(target)
+	must := func(q string, args ...any) {
+		t.Helper()
+		if _, err := target.ExecContext(ctx, q, args...); err != nil {
+			t.Fatalf("seed exec：%v（%s）", err, q)
+		}
+	}
+	must(`INSERT INTO users (id, username, password_hash, role) VALUES (12, 'lisi-pg', 'x', 'DEVELOPER')
+	      ON CONFLICT DO NOTHING`)
+	must(`INSERT INTO tokens (id, user_id, token_hash, token_display, display_name, status)
+	      VALUES (9, 12, 'hash-pg-9', 'disp-pg-9', '旧令牌', 'ACTIVE')`)
+	must(`INSERT INTO tokens (id, user_id, token_hash, token_display, display_name, status)
+	      VALUES (31, 12, 'hash-pg-31', 'disp-pg-31', '新令牌', 'ACTIVE')`)
+
+	base := KeyNameFor(12, 31, "lisi", "新令牌")
+	cipher9, err := encryptForTest("secret-old")
+	if err != nil {
+		t.Fatalf("sm4：%v", err)
+	}
+	if _, err := store.Provision(ctx, 9, base, cipher9); err != nil {
+		t.Fatalf("provision 9：%v", err)
+	}
+	if err := store.Disable(ctx, 9); err != nil {
+		t.Fatalf("disable 9：%v", err)
+	}
+
+	srv, pageKeys := fakeMagpiePage(t, syncTestPageKey)
+	sync := NewCallerKeySync(NewPageAdmin(srv.URL, syncTestPageKey, nil), store, testCredKey)
+	if err := sync.Ensure(ctx, 12, TokenRef{ID: 31, DisplayName: "新令牌"}, "lisi", "secret-new"); err != nil {
+		t.Fatalf("停用占名下新建必须消歧成功（修复前此处 23505 回滚）：%v", err)
+	}
+	got, err := store.ByTokenID(ctx, 31)
+	if err != nil || got == nil || got.KeyName != base+"-2" || got.State != KeyStateActive {
+		t.Fatalf("新映射应落 -2 尾号：got=%+v base=%s err=%v", got, base, err)
+	}
+	if v, ok := pageKeys.Load(base + "-2"); !ok || v != "secret-new" {
+		t.Fatalf("代理侧 -2 名不符：ok=%v v=%v", ok, v)
+	}
+	occ, err := store.NameOccupied(ctx, base, 999)
+	if err != nil || !occ {
+		t.Fatalf("停用行占名必须仍判占用：occ=%v err=%v", occ, err)
+	}
+}

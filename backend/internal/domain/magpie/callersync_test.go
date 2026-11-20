@@ -608,3 +608,66 @@ func snapshotNames(m *sync.Map) []string {
 	m.Range(func(k, _ any) bool { out = append(out, k.(string)); return true })
 	return out
 }
+
+// TestEnsure_NewTokenSkipsDisabledOccupiedName 评审追加 P1 的行为锚（建令牌路径）：
+// 停用行占住基础名 → 新令牌（CreateToken 后的 Ensure 形状）必须靠消歧 -2 逃逸，
+// 而不是判「空闲」后 Provision 撞 UNIQUE 回滚炸错。
+func TestEnsure_NewTokenSkipsDisabledOccupiedName(t *testing.T) {
+	srv, pageKeys := fakeMagpiePage(t, syncTestPageKey)
+	fk := newFakeKeyStore()
+	ctx := context.Background()
+	base := KeyNameFor(12, 9, "lisi", "bot")
+	// 令牌 8（他人）停用，但名字占着 base——全列 UNIQUE 下这就是占用。
+	fk.Provision(ctx, 8, base, "cipher-8")
+	fk.Disable(ctx, 8)
+	s := newSyncForTest(t, srv.URL, fk)
+
+	if err := s.Ensure(ctx, 12, TokenRef{ID: 9, DisplayName: "bot"}, "lisi", "secret-9"); err != nil {
+		t.Fatalf("停用占名下新建必须靠消歧成功而非报错：err=%v", err)
+	}
+	k, _ := fk.ByTokenID(ctx, 9)
+	if k == nil || k.KeyName != base+"-2" || k.State != KeyStateActive {
+		t.Fatalf("新映射应落 -2 尾号：k=%+v want=%s", k, base+"-2")
+	}
+	if v, ok := pageKeys.Load(base + "-2"); !ok || v != "secret-9" {
+		t.Fatalf("代理侧 -2 名不符：ok=%v v=%v", ok, v)
+	}
+	// 占名行保持原样（不被翻状态、不改名）。
+	k8, _ := fk.ByTokenID(ctx, 8)
+	if k8.State != KeyStateDisabled || k8.KeyName != base {
+		t.Fatalf("停用占名行被动了：%+v", k8)
+	}
+}
+
+// TestEnsure_RenameSkipsDisabledOccupiedName 评审追加 P1 的行为锚（回填改名路径）：
+// 旧自动名令牌的目标名被停用行占住 → 消歧 -2 改名成功；否则回填会把它记成
+// 不带 Conflict 的 failed（每轮重试、永远消不掉——真库上是 Provision 23505）。
+func TestEnsure_RenameSkipsDisabledOccupiedName(t *testing.T) {
+	srv, pageKeys := fakeMagpiePage(t, syncTestPageKey)
+	fk := newFakeKeyStore()
+	ctx := context.Background()
+	fk.Provision(ctx, 7, "ls-token-7", "old-cipher")
+	// 代理侧预置旧名（真机先有）。
+	if _, err := NewPageAdmin(srv.URL, syncTestPageKey, nil).EnsureCallerKey(ctx, "ls-token-7", "secret-xyz"); err != nil {
+		t.Fatalf("preset: %v", err)
+	}
+	base := KeyNameFor(12, 7, "zhangsan", "bot")
+	// 令牌 8 停用但占住 base。
+	fk.Provision(ctx, 8, base, "cipher-8")
+	fk.Disable(ctx, 8)
+	s := newSyncForTest(t, srv.URL, fk)
+
+	if err := s.Ensure(ctx, 12, TokenRef{ID: 7, DisplayName: "bot"}, "zhangsan", "secret-xyz"); err != nil {
+		t.Fatalf("停用占名下改名必须靠消歧成功：err=%v", err)
+	}
+	k, _ := fk.ByTokenID(ctx, 7)
+	if k.KeyName != base+"-2" || k.LegacyKeyName != "ls-token-7" || k.State != KeyStateActive {
+		t.Fatalf("改名应落 -2 尾号并留 legacy：%+v", k)
+	}
+	if _, ok := pageKeys.Load(base); ok {
+		t.Fatalf("停用行占名不得被动：base=%s 仍被占但代理侧出现同名", base)
+	}
+	if v, ok := pageKeys.Load(base + "-2"); !ok || v != "secret-xyz" {
+		t.Fatalf("代理侧 -2 名不符：ok=%v v=%v", ok, v)
+	}
+}
