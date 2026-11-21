@@ -48,7 +48,8 @@ type LedgerEntry struct {
 	// TokensIn / TokensOut 是**提示词侧总量 / 输出**。
 	//
 	// TokensIn 不是代理侧的 `in` 原值，而是 `in + cache_read + cache_write`（缓存并入输入侧）：
-	// 灵枢 billing_records 的三段口径是纯输入（含 cache_write）+ cache_read + output，
+	// 灵枢 billing_records 的合计口径 = 四键求和（0011 三段行缓存写折在 input、无独立键；
+	// v2 计价行 cache_write 独立分桶——四项定案①），
 	// 只有把缓存并进 tokens_in，`tokens_in + tokens_out` 才与 `billing.TokenSumExpr` 同口径
 	// （代理侧 `in` 不含缓存）。适配层的合并点见 magpie_ledger.go 的 mapMagpieFeedRow。
 	TokensIn  int64

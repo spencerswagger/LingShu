@@ -1,5 +1,14 @@
 -- 0011_unify_usage_three_segments：把 usage 与定价从「五段」统一为「三段」（输入/缓存读/输出）。
 --
+-- 【2026-11-20 拆段口径更新（四项定案，本注记不改变本迁移已执行的内容）】：
+--   cache_write 自 0031（v2 计价目录）起**独立分桶计价**——v2 计价行的 billing_records.tokens
+--   增加可选键 cache_write（同一 token 只落 input/cache_write/cache_read 一个桶），售价/成本
+--   四价（input/output/cache_read/cache_write）与 magpie 逐档对齐。本迁移的历史行**不重算、
+--   不改形状**（缓存写仍折在 input 里）；合计类查询（TokenSumExpr 等）按「缺键 = 0」求和，
+--   历史行合计逐值不变。现行口径正本见 docs/designs/2026-11-20-v2-billing-catalog-m1.md
+--   与 modelsdev-v2-billing-plan 报告 §4-c（cache_write 拆段口径）。
+--
+--
 -- 三段口径（与 billing.Usage 注释一致）：
 --   input     = 纯输入，不含缓存读；上游的「缓存写」token 属于输入 token，计入本段；
 --   cache_read= 命中提示词缓存读取的输入；

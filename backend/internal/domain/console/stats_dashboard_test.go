@@ -67,9 +67,9 @@ func TestHandleStatsDashboard_HourlyComparePlaza(t *testing.T) {
 	// 1) 日界口径聚合（Usage 块）
 	mock.ExpectQuery(regexp.QuoteMeta(`COALESCE(sum((first_token_ms IS NOT NULL)::int),0)`)).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"input", "output", "cache_read", "credits", "calls", "failed",
+			"input", "output", "cache_read", "cache_write", "credits", "calls", "failed",
 			"sumdur", "sumfirst", "okdur", "okfirst", "busyreq", "busytok", "busydur",
-		}).AddRow(int64(100), int64(50), int64(20), float64(12.5), int64(10), int64(1),
+		}).AddRow(int64(100), int64(50), int64(20), int64(0), float64(12.5), int64(10), int64(1),
 			int64(180000), int64(400), int64(10), int64(10), int64(9), int64(160), int64(120000)))
 	// 2) 按天（老字段必须保持）
 	mock.ExpectQuery(regexp.QuoteMeta(`date_trunc('day', call_time AT TIME ZONE 'Asia/Shanghai')::date`)).
@@ -96,9 +96,9 @@ func TestHandleStatsDashboard_HourlyComparePlaza(t *testing.T) {
 	// 1b) KPI 窗口口径（严格按请求区间，同一份 SQL 的第二跑）
 	mock.ExpectQuery(regexp.QuoteMeta(`COALESCE(sum((first_token_ms IS NOT NULL)::int),0)`)).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"input", "output", "cache_read", "credits", "calls", "failed",
+			"input", "output", "cache_read", "cache_write", "credits", "calls", "failed",
 			"sumdur", "sumfirst", "okdur", "okfirst", "busyreq", "busytok", "busydur",
-		}).AddRow(int64(200), int64(50), int64(20), float64(20.5), int64(12), int64(2),
+		}).AddRow(int64(200), int64(50), int64(20), int64(0), float64(20.5), int64(12), int64(2),
 			int64(200000), int64(500), int64(12), int64(12), int64(11), int64(200), int64(100000)))
 	// 10) 上期总量（环比）
 	mock.ExpectQuery(regexp.QuoteMeta(`SELECT count(*),`)).

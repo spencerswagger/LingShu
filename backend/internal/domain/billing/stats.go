@@ -12,16 +12,18 @@ import (
 	"time"
 )
 
-// UsageSplit 三段 Token 用量。
+// UsageSplit 四段 Token 用量。
 type UsageSplit struct {
-	Input     int64 `json:"Input"`
-	Output    int64 `json:"Output"`
-	CacheRead int64 `json:"CacheRead"`
+	Input      int64 `json:"Input"`
+	Output     int64 `json:"Output"`
+	CacheRead  int64 `json:"CacheRead"`
+	CacheWrite int64 `json:"CacheWrite"` // v2 计价行独立分桶（定案①）；旧三段行=0
 }
 
-// Total 求总量：三段互斥（Input 为纯输入、不含缓存读），直接求和。
+// Total 求总量：四段互斥（Input 为纯输入、不含缓存读/写），直接求和。
+// 与 tokenSum 同口径（对账 / console 统计唯一来源，缺一即两侧漂移）。
 func (u UsageSplit) Total() int64 {
-	return u.Input + u.CacheRead + u.Output
+	return u.Input + u.CacheRead + u.CacheWrite + u.Output
 }
 
 // DashDay 按天聚合行（趋势 / 成功率 / 吞吐量）。
@@ -111,24 +113,31 @@ func dashArgs(userID *int64, from, to time.Time, extra ...any) []any {
 }
 
 // tokenSum token 求和 SQL 表达式（prefix 为表别名前缀）。
-// 口径与 UsageSplit.Total() 一致：三段互斥（输入为纯输入、不含缓存读），求和 input/cache_read/output。
+// 求和 input/cache_read/cache_write/output 四键：v2 计价行 cache_write 独立分桶
+// （四项定案①，0011 旧三段行没有该键），COALESCE 缺键按 0 —— 历史行合计逐值不变，
+// 新四段行不再漏计缓存写（对账与账本 tokens_in 才能同口径，见 reconcile 头注）。
 func tokenSum(prefix string) string {
 	p := prefix + "tokens"
 	return `(COALESCE(NULLIF(` + p + `->>'input','')::bigint,0)
 		+ COALESCE(NULLIF(` + p + `->>'cache_read','')::bigint,0)
+		+ COALESCE(NULLIF(` + p + `->>'cache_write','')::bigint,0)
 		+ COALESCE(NULLIF(` + p + `->>'output','')::bigint,0))`
 }
 
-// TokenSumExpr 导出三段 Token 求和表达式（同一口径的唯一实现），
-// 供 console 层（实时会话 / 在线用户聚合）复用，避免各处再抄一份 SQL 造成口径漂移。
+// TokenSumExpr 导出 Token 求和表达式（同一口径的唯一实现），
+// 供 console 层（实时会话 / 在线用户聚合）与对账（reconcile）复用，
+// 避免各处再抄一份 SQL 造成口径漂移。
 func TokenSumExpr(prefix string) string { return tokenSum(prefix) }
 
-// InputTokensExpr 输入 Token 表达式（input + cache_read，三段互斥口径），
+// InputTokensExpr 输入 Token 表达式（input + cache_read + cache_write），
 // 即「上下文长度」：一次请求送进模型的历史 + 本轮输入。
+// 三段口径（0011）行 cache_write 折在 input 里、无独立键 → 缺键按 0，合计不变；
+// v2 计价行 cache_write 独立分桶，必须并入才是完整提示词侧总量。
 func InputTokensExpr(prefix string) string {
 	p := prefix + "tokens"
 	return `(COALESCE(NULLIF(` + p + `->>'input','')::bigint,0)
-		+ COALESCE(NULLIF(` + p + `->>'cache_read','')::bigint,0))`
+		+ COALESCE(NULLIF(` + p + `->>'cache_read','')::bigint,0)
+		+ COALESCE(NULLIF(` + p + `->>'cache_write','')::bigint,0))`
 }
 
 // WindowTotals 区间总量与速率（KPI 口径）。
@@ -164,6 +173,7 @@ func (s *SqlStore) WindowTotals(ctx context.Context, from, to time.Time, userID 
 		    COALESCE(sum(COALESCE(NULLIF(tokens->>'input','')::bigint,0)),0),
 		    COALESCE(sum(COALESCE(NULLIF(tokens->>'output','')::bigint,0)),0),
 		    COALESCE(sum(COALESCE(NULLIF(tokens->>'cache_read','')::bigint,0)),0),
+		    COALESCE(sum(COALESCE(NULLIF(tokens->>'cache_write','')::bigint,0)),0),
 		    COALESCE(sum(credits_consumed),0),
 		    count(*),
 		    COALESCE(sum((status IN ('failed','upstream_error'))::int),0),
@@ -176,7 +186,7 @@ func (s *SqlStore) WindowTotals(ctx context.Context, from, to time.Time, userID 
 		    COALESCE(sum(duration_ms) FILTER (WHERE `+busyFilter+`),0)
 		 FROM billing_records `+dashWhere(""),
 		dashArgs(userID, from, to)...).
-		Scan(&out.Total.Input, &out.Total.Output, &out.Total.CacheRead,
+		Scan(&out.Total.Input, &out.Total.Output, &out.Total.CacheRead, &out.Total.CacheWrite,
 			&out.Credits, &out.Calls, &out.Failed, &sumDur, &sumFirst, &okDur, &okFirst,
 			&busyRequests, &busyTokens, &busyDur)
 	if err != nil {

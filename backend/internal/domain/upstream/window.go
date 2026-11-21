@@ -210,7 +210,8 @@ type WindowCounts struct {
 	LocalCount  int64
 	LocalTokens int64
 	// UpstreamCount / UpstreamTokens 是账本侧（ledger_entries）的笔数与 tokens_in+tokens_out 合计
-	// （tokens_in 已含 cache_read/cache_write，与本地三段合计同口径）。
+	// （tokens_in 已含 cache_read/cache_write；本地侧按四键求和——cache_write 独立分桶、
+	// 三段历史行缺键按 0——两侧合计同口径，见 billing.TokenSumExpr）。
 	UpstreamCount  int64
 	UpstreamTokens int64
 	// Status 是判定结果：ok / alarm / skipped（blocked / error 由同步轮次持有，对账不得覆盖）。

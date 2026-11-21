@@ -9,12 +9,17 @@ import (
 	"github.com/DATA-DOG/go-sqlmock"
 )
 
-// TestUsageSplitTotal 断言三段互斥直接求和：
-// 输入为纯输入、不含缓存读，Total = Input + CacheRead + Output。
+// TestUsageSplitTotal 断言四段互斥直接求和：
+// 输入为纯输入、不含缓存读/写，Total = Input + CacheRead + CacheWrite + Output
+// （v2 计价行 cache_write 独立分桶；旧三段行 CacheWrite=0，合计不变）。
 func TestUsageSplitTotal(t *testing.T) {
-	u := UsageSplit{Input: 100, Output: 50, CacheRead: 30}
-	if got := u.Total(); got != 180 {
-		t.Fatalf("Total()=%d, want 180（100+30+50）", got)
+	u := UsageSplit{Input: 100, Output: 50, CacheRead: 30, CacheWrite: 20}
+	if got := u.Total(); got != 200 {
+		t.Fatalf("Total()=%d, want 200（100+30+20+50）", got)
+	}
+	legacy := UsageSplit{Input: 100, Output: 50, CacheRead: 30}
+	if got := legacy.Total(); got != 180 {
+		t.Fatalf("旧三段行 Total()=%d, want 180（CacheWrite=0 行合计不变）", got)
 	}
 }
 
@@ -38,10 +43,10 @@ func TestDashboard_Aggregates(t *testing.T) {
 	// 说明「失败哪怕带耗时也不计入忙时」。
 	mock.ExpectQuery(regexp.QuoteMeta(`COALESCE(sum((first_token_ms IS NOT NULL)::int),0)`)).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"input", "output", "cache_read",
+			"input", "output", "cache_read", "cache_write",
 			"credits", "calls", "failed", "sumdur", "sumfirst", "okdur", "okfirst",
 			"busyrequests", "busytokens", "busydur",
-		}).AddRow(int64(100), int64(50), int64(20),
+		}).AddRow(int64(100), int64(50), int64(20), int64(5),
 			float64(12.5), int64(10), int64(1), int64(180000), int64(400), int64(10), int64(10),
 			int64(9), int64(160), int64(120000)))
 
@@ -86,9 +91,10 @@ func TestDashboard_Aggregates(t *testing.T) {
 	if out.TotalCall != 10 || out.Failed != 1 {
 		t.Fatalf("calls=%d failed=%d, want 10/1", out.TotalCall, out.Failed)
 	}
-	// 三段互斥：Total = input(100) + cache_read(20) + output(50) = 170。
-	if out.Total.Total() != 170 {
-		t.Fatalf("tokens=%d, want 170", out.Total.Total())
+	// 四段互斥：Total = input(100) + cache_read(20) + cache_write(5) + output(50) = 175
+	// （v2 行 cache_write 独立分桶进合计——对账与账本 tokens_in 同口径）。
+	if out.Total.Total() != 175 {
+		t.Fatalf("tokens=%d, want 175", out.Total.Total())
 	}
 	if out.Success != 0.9 {
 		t.Fatalf("success=%v, want 0.9", out.Success)
@@ -141,10 +147,10 @@ func TestDashboard_UserScope(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(`COALESCE(sum((first_token_ms IS NOT NULL)::int),0)`)).
 		WithArgs(uid, from, to).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"input", "output", "cache_read",
+			"input", "output", "cache_read", "cache_write",
 			"credits", "calls", "failed", "sumdur", "sumfirst", "okdur", "okfirst",
 			"busyrequests", "busytokens", "busydur",
-		}).AddRow(int64(0), int64(0), int64(0),
+		}).AddRow(int64(0), int64(0), int64(0), int64(0),
 			float64(0), int64(0), int64(0), int64(0), int64(0), int64(0), int64(0),
 			int64(0), int64(0), int64(0)))
 

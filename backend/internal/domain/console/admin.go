@@ -1177,7 +1177,8 @@ func (r sessionRuntime) CacheHitRate() float64 {
 	return float64(r.CacheRead) / float64(totalIn)
 }
 
-// sessionRuntimes 批量聚合会话实时状态：billing_records（次数/Token/积分/上下文/窗口速率）
+// sessionRuntimes 批量聚合会话实时状态：billing_records（次数/Token/积分/上下文/窗口速率）。
+// Token/窗口 Token 合计 = 四键求和（与 TokenSumExpr 同口径，v2 计价行 cache_write 不漏计）
 // 与 call_logs（用户消息数/工具调用数）。查询失败仅返回已得部分，不影响会话列表主流程。
 func sessionRuntimes(ctx context.Context, db *sql.DB, ids []string, windowStart time.Time) map[string]sessionRuntime {
 	out := make(map[string]sessionRuntime, len(ids))
@@ -1192,6 +1193,7 @@ SELECT session_id,
        COALESCE(sum(
            COALESCE(NULLIF(tokens->>'input','')::bigint, 0) +
            COALESCE(NULLIF(tokens->>'cache_read','')::bigint, 0) +
+           COALESCE(NULLIF(tokens->>'cache_write','')::bigint, 0) +
            COALESCE(NULLIF(tokens->>'output','')::bigint, 0)), 0),
        COALESCE(sum(COALESCE(NULLIF(tokens->>'input','')::bigint, 0)), 0),
        COALESCE(sum(COALESCE(NULLIF(tokens->>'cache_read','')::bigint, 0)), 0),
@@ -1199,6 +1201,7 @@ SELECT session_id,
        COALESCE(sum(
            COALESCE(NULLIF(tokens->>'input','')::bigint, 0) +
            COALESCE(NULLIF(tokens->>'cache_read','')::bigint, 0) +
+           COALESCE(NULLIF(tokens->>'cache_write','')::bigint, 0) +
            COALESCE(NULLIF(tokens->>'output','')::bigint, 0)) FILTER (WHERE call_time >= $2), 0)
 FROM billing_records
 WHERE session_id = ANY($1)
@@ -1215,10 +1218,12 @@ GROUP BY session_id`, ids, windowStart)
 			out[sid] = rt
 		}
 	}
-	// 上下文长度：最近一次请求的总输入 Token 数（输入 + 缓存读，三段口径下二者互斥）。
+	// 上下文长度：最近一次请求的总输入 Token 数（input + cache_read + cache_write；
+	// 三段口径行缓存写折在 input、缺键按 0，v2 计价行独立分桶须并入，与 InputTokensExpr 同口径）。
 	crows, err := db.QueryContext(ctx, `
 SELECT DISTINCT ON (session_id) session_id,
        COALESCE(NULLIF(tokens->>'input','')::bigint, 0) + COALESCE(NULLIF(tokens->>'cache_read','')::bigint, 0)
+       + COALESCE(NULLIF(tokens->>'cache_write','')::bigint, 0)
 FROM billing_records
 WHERE session_id = ANY($1)
 ORDER BY session_id, call_time DESC, id DESC`, ids)

@@ -264,6 +264,8 @@ func BusyRate(count float64, sumDurationMS int64) float64 {
 }
 
 // Summarize 按与列表完全相同的过滤条件聚合统计（不分页），供账单页统计栏展示。
+// Tokens/BusyTokens 合计口径 = 四键求和（cache_write 独立分桶，历史行缺键按 0，
+// 与 TokenSumExpr/对账同口径）；Input/CacheRead 分段列维持三段展示形状。
 // 忙时口径：请求数/token/耗时三者都用 FILTER (WHERE status='completed' AND duration_ms IS NOT NULL) 统计，
 // 分母为 0 时 BusyRPM/BusyTPM 返回 0（其余统计口径不受 status 影响）。
 func (s *SqlStore) Summarize(ctx context.Context, f RecordFilter) (RecordSummary, error) {
@@ -275,6 +277,7 @@ func (s *SqlStore) Summarize(ctx context.Context, f RecordFilter) (RecordSummary
 		        COALESCE(sum(
 		            COALESCE(NULLIF(tokens->>'input','')::bigint, 0) +
 		            COALESCE(NULLIF(tokens->>'cache_read','')::bigint, 0) +
+		            COALESCE(NULLIF(tokens->>'cache_write','')::bigint, 0) +
 		            COALESCE(NULLIF(tokens->>'output','')::bigint, 0)), 0),
 		        COALESCE(sum(duration_ms), 0),
 		        COALESCE(sum(COALESCE(NULLIF(tokens->>'input','')::bigint, 0)), 0),
@@ -283,6 +286,7 @@ func (s *SqlStore) Summarize(ctx context.Context, f RecordFilter) (RecordSummary
 		        COALESCE(sum(
 		            COALESCE(NULLIF(tokens->>'input','')::bigint, 0) +
 		            COALESCE(NULLIF(tokens->>'cache_read','')::bigint, 0) +
+		            COALESCE(NULLIF(tokens->>'cache_write','')::bigint, 0) +
 		            COALESCE(NULLIF(tokens->>'output','')::bigint, 0)
 		        ) FILTER (WHERE `+busyFilter+`), 0),
 		        COALESCE(sum(duration_ms) FILTER (WHERE `+busyFilter+`), 0)

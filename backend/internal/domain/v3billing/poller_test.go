@@ -144,9 +144,10 @@ func (f *fixture) expectToken(callerKey string) {
 }
 
 func (f *fixture) expectCostMiss(provider, model string) {
+	// cost 查询带 cost_v2 列（0031）：本夹具恒 miss（{} + nil = 旧三段空价）。
 	f.mock.ExpectQuery("FROM internal_models WHERE ref =").
 		WithArgs(provider + "/" + model).
-		WillReturnRows(f.mock.NewRows([]string{"cost_rates"}).AddRow([]byte(`{}`)))
+		WillReturnRows(f.mock.NewRows([]string{"cost_rates", "cost_v2"}).AddRow([]byte(`{}`), nil))
 }
 
 // expectPriceHit 装配一次命中（byBinding 决定走绑定列还是名字列）。
@@ -156,8 +157,8 @@ func (f *fixture) expectPriceHit(byBinding bool, wantValue, extName string, rate
 		f.t.Fatalf("rates 序列化失败：%v", err)
 	}
 	f.mock.ExpectQuery(priceQueryPattern(byBinding)).WithArgs(wantValue).
-		WillReturnRows(f.mock.NewRows([]string{"external_name", "sale_rates", "time_config", "context_tiers"}).
-			AddRow(extName, raw, []byte("null"), []byte("null")))
+		WillReturnRows(f.mock.NewRows([]string{"external_name", "sale_rates", "time_config", "context_tiers", "sale_v2"}).
+			AddRow(extName, raw, []byte("null"), []byte("null"), nil))
 }
 
 func (f *fixture) expectPriceMiss(byBinding bool, wantValue string) {
@@ -172,8 +173,9 @@ func priceQueryPattern(byBinding bool) string {
 }
 
 func (f *fixture) expectSettled(ledgerID string, cost float64) {
+	// 第 4 参 price_eval：本夹具都是旧三段口径（sale_v2 nil）→ COALESCE 不落留痕。
 	f.mock.ExpectExec("UPDATE billing_records SET magpie_request_id").
-		WithArgs(ledgerID, cost, "v3-"+ledgerID).
+		WithArgs(ledgerID, cost, "v3-"+ledgerID, nil).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 }
 

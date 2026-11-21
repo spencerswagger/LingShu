@@ -7,7 +7,9 @@
 //
 // 口径（与 0023 文件头一致，token 口径按 2026-11-17 账本适配修正）：
 //   - 只比 token 合计与请求笔数，**不比金额**（账本币种/牌价与灵枢积分不等价）；
-//   - 灵枢侧 tokens = input + cache_read + output（三段互斥，唯一来源是 billing.TokenSumExpr）；
+//   - 灵枢侧 tokens = input + cache_read + cache_write + output（四键求和，唯一来源是
+//     billing.TokenSumExpr；0011 三段行无 cache_write 键 → 缺键按 0，历史行合计不变；
+//     v2 计价行 cache_write 独立分桶，不并入即漏计 → 与账本 tokens_in 永差一个缓存写量）；
 //   - 账本侧 tokens = tokens_in + tokens_out，其中 `tokens_in` 在适配层已把
 //     `cache_read + cache_write` 并入（代理侧的 `in` 是「未缓存输入」，缓存是独立字段）。
 //     两侧合计因此同口径 —— 早期版本假设「in 含缓存读」，实测账本恒小于本地（10200 vs 20440），
@@ -299,7 +301,8 @@ type SQLWindowAgg struct {
 
 // NewLocalSource 是灵枢侧（billing_records）：笔数 + 三段 token 合计。
 //
-// token 表达式复用 billing.TokenSumExpr（唯一来源）：三段互斥口径（input 不含缓存读）只在一处定义，
+// token 表达式复用 billing.TokenSumExpr（唯一来源）：合计口径（input+cache_read+cache_write+output，
+// 三段行缺 cache_write 键按 0）只在一处定义，
 // 这里另写一份 SQL，迟早与账单页/统计页读出两种数。
 func NewLocalSource(db *sql.DB) *SQLWindowAgg {
 	return &SQLWindowAgg{
