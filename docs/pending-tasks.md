@@ -1,11 +1,111 @@
-# 待办任务书（Pending Tasks）
+# 灵枢 pending-tasks 队列
 
-> 维护人：主持人。格式见团队标准作业手册（`docs/` 内作业口径）：每条一个区块，
-> 字段固定为 背景 / 验收标准 / 约束 / 状态 / 负责人。
-> 状态取值：待确认 / 已确认 / 进行中 / 已完成 / 已回收。
-> 忙时（08:00–22:00）只做方案确认与任务书维护，闲时按优先级取任务实现。
+> 队列惯例见团队手册 §1。格式：每条一个区块，字段 = 背景 / 验收标准 / 约束 / 状态 / 负责人；状态取值：待确认 / 已确认 / 进行中 / 已完成 / 已回收。
+> **本文件自 2026-11-20 起随分支维护**（Owl II 对 PR #171 的 P2 建议：设计依据须随分支可见；此前「本地暂存区、不进 git」口径作废）。
+> 设计依据：`magpie-key-naming-agent-id` 与 `modelsdev-v2-billing-plan` 两份报告（lingshu-preview.pages.dev，2026-11-20 已定案版）。报告与本文冲突时，以本文定案口径为准。
+> 白名单终表与接口契约定稿（2026-11-20 spencer 批准后落定）：`docs/designs/magpie-whitelist-final-table.md`、`docs/designs/magpie-passthrough-contract-final.md`；与本文冲突时，以本文为准。
+
+## [P0] ① key 改名 = 用户名-令牌名 + 存量令牌回填迁移（2026-11-20）
+
+- 背景：spencer 定案①②（原话摘要：「key 名 = 用户名-令牌名，如 张三-办公室台式机；重名时在 key 尾部追加序号消歧；存量令牌一并回填改名」）。现状 `ls-token-<id>` 分不出是谁的（报告 §2.1 代码证据）。
+- 负责人：Core（后端主责）+ View（令牌列表展示列）+ Gate（验收）；Ark 设计已定稿不再改。
+- 实施步骤（报告 §2.3 M1–M4 原样执行）：
+  1. M1 代码期：`keyNameFor(username, displayName, tokenID)`（ASCII 转写 + 尾号消歧，规则=报告 §2.2 表）；`Ensure/Remove` 扩签名带 username + displayName；`magpie_keys` 加 `legacy_key_name TEXT`（纯 ADD 迁移，编号顺现行链取未用号）。
+  2. M2 回填期：`POST /api/v1/admin/tokens/magpie-keys/rename`（dry-run 默认开启）；逐令牌 `Ensure(新名,同一明文)` → `Provision` → `DeleteCallerKey(旧名)`，失败停在中间态可幂等重跑。
+  3. M3 对账期：`poller.settleOne` 反查 `key_name` 失败后回退 `legacy_key_name`（救改名窗口前的账本行）。
+  4. M4 收尾：旧名全部删除、报表口径统一按新名。
+- 验收标准（可量化）：
+  1. 新建令牌 key_name 100% 命中「用户名转写-令牌名转写」格式；纯中文退化为 ID 段/`w-`+4hex（各有单测）。
+  2. 同用户重名令牌追加尾号 `-2`；跨用户撞名消歧成功；UNIQUE 409 次数 = 0。
+  3. 存量令牌回填成功率 100%；回滚演练通过（`legacy_key_name` 可复原旧名）。
+  4. M3 上线后改名窗口前未结算账本行清零（改名前后「未结算行数」对比相等）。
+  5. 调用方无感：改名前后同一令牌请求均 200，密钥值不变。
+  6. 门禁四步全绿（gofmt / vet / race 单测 / vue-tsc）。
+- 约束：不许动 tokens 表结构；不许用 rotate-key 换值；新旧名不得同时 ACTIVE；账本历史行不重算；迁移零 DROP。
+- 状态：已确认（spencer 2026-11-20 确认设计，本日转任务书）
+- 前置依赖：无。
+
+## [P0] ② nginx 白名单收紧：只放推理四协议 + /v1/models + Codex WS（2026-11-20）
+
+- 背景：定案③（原话摘要：「nginx 白名单只放推理四协议 + /v1/models + Codex WS，health 仅内网，其余默认拒绝」）。安全缺口：现网 `/v1/` 前缀整段转发，`/v1/magpie/*` 管理面暴露——任一租户令牌可读全站聚合用量（报告 §4.5）。
+- 负责人：spencer/运维（nginx 属宿主机变更）+ Gate（冒烟验收）。
+- 实施步骤（草案照报告 §4.7 执行）：
+  1. 落地白名单 6 类点位：OpenAI chat/completions、OpenAI responses（HTTP/SSE + WS，补 Upgrade/Connection 头）、Anthropic messages(+count_tokens)、Gemini generateContent/streamGenerateContent/countTokens、/v1/models；白名单外 `/v1/*` 一律 404。
+  2. health 仅内网：`location = /healthz` 反代灵枢后端，不在 /v1/ 前缀内，确认不进对外白名单、维持现状。
+  3. 低峰灰度生效，观察 1 个低峰窗再转常态。
+- 验收标准（可量化）：
+  1. 白名单 6 类点位四协议冒烟全 200 / WS 握手 101（含 Codex 实连）。
+  2. 白名单外抽样全部 404：`/v1/magpie/usage`、`/v1/magpie/admin/*`、`/v1/embeddings`、`/v1/completions`。
+  3. `/healthz` 外网不可达（404/403）、内网正常。
+  4. 四家官方 SDK 初始化各跑一次零报错。
+- 约束：`MAGPIE_TRUST_PROXY` 保持不设；Host 头不改内部名；不装 headers-more 模块；沙盒不动手，变更在宿主机执行。
+- 状态：已确认
+- 前置依赖：无硬依赖；建议排在①之后，避免入口与账本归属同时变更难归因。
+
+## [P0] ③ 响应头剥除：X-Magpie-* 全剥 + 品牌/版本头（2026-11-20）
+
+- 背景：定案④（原话摘要：「剥除 X-Magpie-* 与一切品牌/版本响应头（Server 等）」）。动机：防外部按 magpie 已知漏洞对灵枢入口定向攻击（报告 §4.4）。
+- 负责人：spencer/运维（与②同一 nginx 变更窗执行）+ Gate（验收断言）。
+- 实施步骤：
+  1. `proxy_hide_header` 枚举全量 `X-Magpie-*`（实现时从 magpie 源码 + 抓包核全清单，现网已知 7+ 个）。
+  2. `Server` / `X-Powered-By` 维持剥除（server_tokens off 已生效）；供应商身份类响应头按 F8 名单剥（保留 `x-ratelimit-*` / `Retry-After` 等通用头）。
+  3. 429 提示兜底：`X-Magpie-Limit-Reset` 剥除后由 nginx `add_header Retry-After` 补（或接受无提示，实现时定）。
+- 验收标准（可量化）：
+  1. 对外响应头零「magpie」字样（大小写不敏感全量断言）。
+  2. `Server` 头不含版本号。
+  3. SSE 流式响应不受剥头影响（四协议流式冒烟正常）。
+  4. 抓包核对的剥头清单归档进报告附件。
+- 约束：不动请求头透传（Authorization / UA / anthropic-beta 等 P0 清单=报告 §4.2）；错误体 sub_filter 不做（Content-Length/SSE 风险）。
+- 状态：已确认
+- 前置依赖：与②同窗合一次变更（同一 nginx 文件、一次 reload）。
+
+## [P1] ④ 计费四项落地（modelsdev-v2 方案）（2026-11-20）
+
+- 背景：定案⑤，计费按报告四项执行：① cache_write 启用、四价（input/output/cache_read/cache_write）与 magpie 逐档对齐、token 分桶互斥（OpenAI 类自动写、Anthropic 类请求内 cache_control 触发）；② service_tier 差价不在售卖层做（magpie 不感知该字段）；③ web_search 不做独立计价段（预留 MCP/工具调用）；④ multipliers 按模型区分、不开放用户组层。
+- 负责人：Core（后端主责）+ View（计费配置页）+ Gate（守恒/对账测试）。
+- 实施步骤（报告 §5 三步走）：
+  1. S1 落库：迁移 ≥0028（纯 ADD：ext_meta/cost_v2/sale_v2/price_eval 4 列 + catalog_models/catalog_match 2 表）；usage 拆段先行（`billing_records.tokens` 增 cache_write 键，历史行缺键按 0、不重算）；Resolver 求值器 + 60min 同步器换 v2 URL（只落暂存区）。
+  2. S2 双读：预扣 EstimateBreakdown 与 v3 结算 settleOne 切 Resolver（预扣不含 cache_write 段，结算笔笔计）；对账告警连续 3 窗零误报才进 S3。
+  3. S3 切换：新计价正式生效，旧列只读归档；ApplyCatalog（diff 预览→人工确认→写入）替代一键 ApplyPrice。
+- 验收标准（可量化）：
+  1. token 分桶互斥：同一 token 只落 input/cache_read/cache_write 之一（新增单测断言）。
+  2. 成本对账：cache_write 段与 magpie 账本逐档一致（60s 窗差异 = 0）。
+  3. 余额守恒：切换窗口前后用户积分差 ≤ 0.01。
+  4. 回归：service_tier 不同的请求售价不变；web_search 调用不计费、元数据照存；multipliers 无用户组配置入口。
+  5. 迁移在 dev/test/staging 三库演练通过、编号无撞号（对照 R8 占用清单）。
+- 约束：全链路无 float（BIGINT 微元 + INTEGER ppm）；magpie 代码不改；计费字段永不自动覆盖；0011 历史行不动。
+- 状态：已确认
+- 前置依赖：S1 可先行；S3 切换排在②③稳定之后，且避开①的回填窗。
+
+## [P0] ⑤ 白名单终表 + 接口契约定稿落地执行（2026-11-20，spencer 已批准「系统配置改造」设计）
+
+- 背景：spencer 2026-11-20 09:30 批准开工（原话摘要：「设计通过，批准按任务书开工；Ark 出白名单终表（含 count_tokens 两点）+ 契约定稿后合成正式任务书；实施按 Core 排期串行推进」）。终表与契约已定稿：`docs/designs/magpie-whitelist-final-table.md`（24 条点位 + count_tokens 两点 + legacy_key_name 反查）、`docs/designs/magpie-passthrough-contract-final.md`（分层分工：nginx 拦路径/剥头/WS 升级，应用管鉴权/预扣/`?key=` 剔除）。
+- 负责人：Core（串行排期：命名+存量回填（legacy_key_name 反查）→ nginx 白名单+剥头 → 前端展示）+ Gate（每批证据）+ spencer（合入点头）。
+- 实施步骤（按批准排期串行，三批）：
+  1. 第 1 批 = 任务①（M1–M4 命名+回填，反查按终表 §3：先 key_name 后 legacy_key_name，都查不到才跳过；rename 端点 dry-run 默认开启）。
+  2. 第 2 批 = 任务②+③ 同一 nginx 变更窗（白名单 6 类 + count_tokens×2 按 §1.1 location 正则 + Upgrade/Connection 头 + proxy_hide_header 枚举剥头）。
+  3. 第 3 批 = 前端展示（逻辑名列 + 尾号淡显/tooltip，窄宽截断按报告 §2.2 示例）。
+- 验收标准（可量化，逐条出自终表 §4）：
+  1. 每批完成出证据（接口实测/日志/截图），缺证据不进下一批；四 SDK 冒烟零报错 + Codex WS 101。
+  2. count_tokens 两点实测 200 且不产生账本行（前后 ledger_entries 计数不变）。
+  3. 白名单外抽样 404（/v1/magpie/usage、/v1/embeddings、/v1/completions）；/healthz 外网不可达内网正常；对外响应头零 magpie 字样。
+  4. M3 后改名窗口前未结算行清零（前后「未结算行数」对比相等）。
+- 约束：MR 挂 Owl II 评审、spencer 点头才合入；429/5xx 指数退避 5s→20s→60s 最多 3 次；nginx 变更宿主机执行、沙盒不动手；本条登记本身只动 docs/。
+- 状态：已确认
+- 前置依赖：任务①②③ 为其实施载体，本条是排期与验收总纲；与①②③冲突时以本条排期为准。
+
+## 建议排期顺序（按优先级与人力，不承诺到小时）
+
+1. **① key 改名**（第 1 单开工，即 ⑤ 的第 1 批）：纯代码不依赖运维窗口；Core 主力，View 跟展示列。
+2. **②+③ nginx 白名单 + 剥头**（第 2 步，即 ⑤ 的第 2 批）：合并为同一次宿主机变更窗；spencer/运维执行，Gate 冒烟。
+3. **前端展示列**（⑤ 的第 3 批，随①收尾）。
+4. **④ 计费四项**（第 3 步）：S1 落库可与①并行启动；S3 切换最后做，前置 ②③ 稳定 + 三库演练通过。
 
 ---
+
+# 历史条目（2026-10-26 ~ 10-30 · 合并入仓前仓库既有，原样保留）
+
+> 以下条目为合并前的仓库版本原样快照，状态与交付记录未随合并刷新；「进行中 / 待确认」项由主持人按需收口。
 
 ## [P1] 账单详情页请求定位改造（2026-10-26）
 

@@ -262,7 +262,14 @@ func (p *Poller) settleOne(ctx context.Context, r row, groups []groupNode) (sett
 	if err := p.db.QueryRowContext(ctx, `
 		SELECT k.token_id, t.user_id FROM magpie_keys k JOIN tokens t ON t.id = k.token_id
 		 WHERE k.key_name = $1 AND k.state = 'ACTIVE' LIMIT 1`, r.callerKey).Scan(&tokenID, &userID); err != nil {
-		return false, false, fmt.Errorf("找不到 callerKey=%s 对应令牌：%w", r.callerKey, err)
+		// 旧名兜底：legacy_key_name 只在改名过的行上非空（部分索引）。
+		// 改名窗口之前的账本行是旧名快照，先按当前名查、查不到再按旧名查（0030 加列）。
+		if lerr := p.db.QueryRowContext(ctx, `
+			SELECT k.token_id, t.user_id FROM magpie_keys k JOIN tokens t ON t.id = k.token_id
+			 WHERE k.legacy_key_name = $1 AND k.state = 'ACTIVE' LIMIT 1`, r.callerKey).Scan(&tokenID, &userID); lerr != nil {
+			return false, false, fmt.Errorf("找不到 callerKey=%s 对应令牌：%w", r.callerKey, err)
+		}
+		p.log.Warn("账本行按旧名结算（改名窗口内）", "caller_key_name", r.callerKey, "ledger_id", r.ledgerID)
 	}
 
 	// 成本价（内部模型 ref = provider/model）

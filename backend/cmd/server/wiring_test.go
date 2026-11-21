@@ -118,3 +118,36 @@ func TestWiring_V3SettleKillSwitch(t *testing.T) {
 		t.Fatalf("开关状态必须启动即点名（两条日志分支都要有）")
 	}
 }
+
+// TestWiring_StartupBackfillGatedByEnv 启动自动补建必须被 CALLERKEY_BACKFILL_ON_BOOT 闸住（默认 off）。
+// 评审 P2-1：部署即对存量令牌执行真机改名，属真实环境数据操作 —— 必须先 dry-run、经确认再放开；
+// 闸门丢掉（回退成无条件 go func）会让「升级即自动改名」重新出现。
+// 断言按「行首是 if envFlagOn(...)」判定，注释里提到变量名不算数（源码断言怕注释的坑）。
+func TestWiring_StartupBackfillGatedByEnv(t *testing.T) {
+	src := mainGoSource(t)
+	lines := strings.Split(src, "\n")
+	gateLine, callLine := -1, -1
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, `if envFlagOn("CALLERKEY_BACKFILL_ON_BOOT")`) {
+			gateLine = i
+		}
+		if strings.Contains(trimmed, "tokenSvc.BackfillCallerKeys(") && !strings.HasPrefix(trimmed, "//") && callLine < 0 {
+			callLine = i
+		}
+	}
+	if gateLine < 0 {
+		t.Fatalf("启动自动补建必须走 env 闸门 if envFlagOn(\"CALLERKEY_BACKFILL_ON_BOOT\")（默认 off；" +
+			"先 dry-run 确认桶分布再放开）。注释里提到变量名不算 —— 必须存在这条可执行判定")
+	}
+	if callLine < 0 {
+		t.Fatalf("装配层应保留启动补建调用 tokenSvc.BackfillCallerKeys（在闸门内）")
+	}
+	if callLine < gateLine {
+		t.Fatalf("BackfillCallerKeys 必须出现在闸门行之后（门内调用），当前顺序相反 = 无条件执行")
+	}
+	// 闸门必须默认关：envFlagOn 判定里要含 ""/0/false/off 的关闭语义。
+	if !strings.Contains(src, "func envFlagOn") {
+		t.Fatalf("缺少 envFlagOn：闸门判定必须是「非空且非 0/false/off」的保守语义")
+	}
+}

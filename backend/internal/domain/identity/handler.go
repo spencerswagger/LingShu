@@ -402,6 +402,14 @@ func (h *Handler) HandleUpdateMe(w http.ResponseWriter, r *http.Request) {
 
 // writeServiceErr 将 identity.Service 返回的错误映射为统一响应。
 func writeServiceErr(w http.ResponseWriter, r *http.Request, err error) {
+	// 创建侧撞名（Gate 遗留②）：消歧耗尽仍撞 → 409 可辨识（此前统一 500，
+	// 调用方看不出「换个令牌名再试」能解）。令牌已在服务层回滚删除，重试即安全。
+	// 两个创建端点（admin/dev）都经此出口，哨兵判定单点维护。
+	if errors.Is(err, ErrCallerKeyNameTaken) {
+		resp.ErrReason(w, r, http.StatusConflict, resp.CodeConflict, "caller_key_name_conflict",
+			"该令牌名与已有令牌的代理侧 Key 名撞名且消歧名额已满，请更换令牌名后重试（本次创建已回滚）", nil)
+		return
+	}
 	var apiErr *APIError
 	if errors.As(err, &apiErr) {
 		resp.Err(w, r, apiErr.HTTPStatus, apiErr.Code, apiErr.Message)
