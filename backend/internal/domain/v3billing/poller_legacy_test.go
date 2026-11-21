@@ -42,7 +42,7 @@ const tokenByNameSQL = `SELECT k.token_id, t.user_id FROM magpie_keys k JOIN tok
 const tokenByLegacySQL = `SELECT k.token_id, t.user_id FROM magpie_keys k JOIN tokens t ON t.id = k.token_id
 			 WHERE k.legacy_key_name = $1 AND k.state = 'ACTIVE' LIMIT 1`
 
-const costRatesSQL = `SELECT COALESCE(cost_rates,'{}'::jsonb) FROM internal_models WHERE ref = $1`
+const costRatesSQL = `SELECT COALESCE(cost_rates,'{}'::jsonb), cost_v2 FROM internal_models WHERE ref = $1`
 
 func tokenRow() *sqlmock.Rows {
 	return sqlmock.NewRows([]string{"token_id", "user_id"}).AddRow(int64(7), int64(12))
@@ -52,7 +52,7 @@ func tokenRow() *sqlmock.Rows {
 func expectPriceMisses(t *testing.T, mock sqlmock.Sqlmock) {
 	t.Helper()
 	mock.ExpectQuery(regexp.QuoteMeta(costRatesSQL)).WithArgs("p/m").
-		WillReturnRows(sqlmock.NewRows([]string{"cost_rates"}).AddRow([]byte("{}")))
+		WillReturnRows(sqlmock.NewRows([]string{"cost_rates", "cost_v2"}).AddRow([]byte("{}"), nil))
 	mock.ExpectQuery(regexp.QuoteMeta(extByNameSQL)).WithArgs("m").WillReturnError(sql.ErrNoRows)
 	mock.ExpectQuery(regexp.QuoteMeta(extByBindingSQL)).WithArgs("group/m").WillReturnError(sql.ErrNoRows)
 	mock.ExpectQuery(regexp.QuoteMeta(extByBindingSQL)).WithArgs("auto/m").WillReturnError(sql.ErrNoRows)
