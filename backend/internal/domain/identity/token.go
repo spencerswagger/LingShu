@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -23,6 +24,11 @@ import (
 	"github.com/team/llmgateway/internal/pkg/idgen"
 	"github.com/team/llmgateway/internal/pkg/resp"
 )
+
+// LegacyAutoKeyName 是旧口径 callerKey 自动名（ls-token-<id>），与新口径判定共用常量语义。
+// identity 不能 import magpie（magpie 已 import identity，反向会成环），所以这里按格式本地实现，
+// magpie.LegacyAutoName 与它逐字一致（有测试锁住两边不漂移）。
+func LegacyAutoKeyName(tokenID int64) string { return "ls-token-" + strconv.FormatInt(tokenID, 10) }
 
 // 令牌状态常量。
 const (
@@ -352,6 +358,14 @@ type TokenService struct {
 	callerKey CallerKeySyncer
 	// callerKeyLookup 判断令牌是否已有 ACTIVE 的代理凭据（补建幂等）。
 	callerKeyLookup func(ctx context.Context, tokenID int64) (bool, error)
+	// callerKeyNameOf 取令牌当前映射的 callerKey 名（回填 skip 判定；空串=无映射）。
+	callerKeyNameOf func(ctx context.Context, tokenID int64) string
+	// callerKeyStateOf 取令牌当前映射行的状态（回填 disabled 分桶；空串=无映射/未注入）。
+	callerKeyStateOf func(ctx context.Context, tokenID int64) string
+	// callerWantNameOf 取令牌按新口径应有的 callerKey 名（回填改名资格判定）。
+	callerWantNameOf func(ctx context.Context, userID, tokenID int64, displayName string) string
+	// callerUsernameOf 取令牌所属用户的用户名（key 名第一段原料；空=段退化 u<uid>）。
+	callerUsernameOf func(ctx context.Context, tokenID int64) string
 	// cache 为 LookupByPlain 的两级读缓存（plain→entry + userID→hashes）；默认启用。
 	// 命中即 0 DB；失效由各写路径显式钩子保证（见 token_cache.go 失效矩阵）。nil 时退回纯直查。
 	cache *tokenCache
@@ -397,11 +411,41 @@ func (s *TokenService) InvalidateAll() {
 	}
 }
 
-// CallerKeySyncer 令牌与代理侧 callerKey 的同步能力（由 magpie 包实现）。
-type CallerKeySyncer interface {
-	Ensure(ctx context.Context, tokenID int64, secret string) error
-	Remove(ctx context.Context, tokenID int64) error
+// CallerKeyToken 是同步钩子需要的令牌最小信息：ID + DisplayName（可读段原料）。
+// *Token 隐式满足（字段同名），identity 不反依赖 magpie（magpie 已 import identity）。
+type CallerKeyToken struct {
+	ID          int64
+	DisplayName string
 }
+
+// CallerKeySyncer 令牌与代理侧 callerKey 的同步能力（由 magpie 包实现）。
+// Ensure 需要 userID（用户段退化坐标）、令牌 display_name（令牌段原料）与
+// 所属用户名（key 名第一段原料；契约定稿：key 名 = 用户名转写-令牌名转写）。
+//
+// 状态纪律（评审必改①）：Ensure 是「自动路径」（创建令牌/存量回填/启动补建），
+// 对 DISABLED 映射行返回 ErrCallerKeyDisabled、不碰代理侧、不翻状态；
+// 显式重新启用（Toggle 启用侧、管理端一键开通）必须走 Reactivate。
+type CallerKeySyncer interface {
+	Ensure(ctx context.Context, userID int64, t CallerKeyToken, username, secret string) error
+	// Reactivate 与 Ensure 的唯一差别：允许把 DISABLED 行翻回 ACTIVE（显式动作专用）。
+	Reactivate(ctx context.Context, userID int64, t CallerKeyToken, username, secret string) error
+	Remove(ctx context.Context, tokenID int64) error
+	// ProbeName 预演执行态会分配的名字（零写零代理侧动作）：撞名消歧耗尽返回
+	// ErrCallerKeyNameTaken——rename 端点 dry-run 借它探出 Conflict（评审必改：
+	// dry-run 不能只比名不查占用，否则冲突令牌在预览里隐形）。
+	ProbeName(ctx context.Context, userID int64, t CallerKeyToken, username string) (string, error)
+}
+
+// ErrCallerKeyNameTaken callerKey 存储名消歧重试一轮后仍撞名
+// （契约 §1.2：不换名硬闯，409 挂起人工处理）。
+// 哨兵放 identity（magpie 已 import identity，反向会造成循环依赖）；
+// magpie.ErrNameUnavailable 是它的别名。
+var ErrCallerKeyNameTaken = errors.New("callerKey 名字消歧失败：重试一轮后仍撞名")
+
+// ErrCallerKeyDisabled 该令牌的 callerKey 映射已停用（令牌停用时 Remove 删过代理侧 key）。
+// 自动路径（存量回填/启动补建）对停用行一律跳过（回填分桶 disabled）；显式启用走
+// Reactivate。哨兵放 identity（同 ErrCallerKeyNameTaken 的循环依赖口径）；magpie.ErrKeyDisabled 是别名。
+var ErrCallerKeyDisabled = errors.New("callerKey 映射已停用（令牌停用时被删；启用令牌或管理端一键开通后恢复）")
 
 // SetCallerKeySyncer 注入同步钩子。
 func (s *TokenService) SetCallerKeySyncer(c CallerKeySyncer) { s.callerKey = c }
@@ -466,7 +510,7 @@ func (s *TokenService) Create(ctx context.Context, userID int64, displayName str
 	}
 	// V3：令牌明文即代理侧 callerKey，创建后立即同步（失败则回滚删除令牌，避免「有令牌但调不通」）。
 	if s.callerKey != nil {
-		if kerr := s.callerKey.Ensure(ctx, t.ID, plain); kerr != nil {
+		if kerr := s.callerKey.Ensure(ctx, userID, CallerKeyToken{ID: t.ID, DisplayName: t.DisplayName}, s.usernameForToken(ctx, userID), plain); kerr != nil {
 			_, _ = s.store.DeleteTokens(ctx, []int64{t.ID})
 			return "", fmt.Errorf("令牌已创建但开通代理访问失败（已回滚）：%w", kerr)
 		}
@@ -476,37 +520,46 @@ func (s *TokenService) Create(ctx context.Context, userID int64, displayName str
 	return plain, nil
 }
 
-// BackfillCallerKeys 为缺映射的存量令牌补建 callerKey（V3 迁移用）。
+// BackfillCallerKeys 为存量令牌补建/改名 callerKey（V3 迁移用）。
 // 返回 created/skipped/failed；历史无密文的令牌计入 skipped（无法恢复明文，只能轮换）。
-func (s *TokenService) BackfillCallerKeys(ctx context.Context, limit int) (created int, skipped map[string]int, failed []map[string]any, err error) {
+// renameCount 是本次实际执行了「旧名→新名」改名的令牌数（改名=代理侧 rename-key 原地改，值不变）。
+// 已是新名的令牌跳过（幂等）；dryRun=true 只做判定与统计，不打代理侧、不改库。
+// BackfillCallerKeys 为存量令牌补建/改名 callerKey（M2 存量回填，幂等可重跑）。
+//
+// dry-run 与执行态同判：dry-run 用 ProbeName 预演分配（零写零代理侧动作），
+// 撞名令牌进 Conflicts 明细（含 TokenID/DisplayName/Reason）——与执行态 failed 的
+// Conflict:true 同源，运维看桶分布的同时能直接看到冲突名单（评审必改：预览与执行
+// 必须同口径，否则「放行后才发现 409」）。
+func (s *TokenService) BackfillCallerKeys(ctx context.Context, limit int, dryRun bool) (created int, renamed int, skipped map[string]int, conflicts []map[string]any, failed []map[string]any, err error) {
 	skipped = map[string]int{}
 	if s.callerKey == nil {
-		return 0, skipped, nil, fmt.Errorf("未装配 callerKey 同步（缺页面口令）")
+		return 0, 0, skipped, nil, nil, fmt.Errorf("未装配 callerKey 同步（缺页面口令）")
 	}
 	if limit <= 0 {
 		limit = 100000
 	}
 	failed = []map[string]any{}
+	conflicts = []map[string]any{}
 	const batch = 50
 	for page := 1; ; page++ {
 		list, total, lerr := s.store.ListTokens(ctx, nil, "", page, batch)
 		if lerr != nil {
-			return created, skipped, failed, lerr
+			return created, renamed, skipped, conflicts, failed, lerr
 		}
 		if len(list) == 0 {
 			break
 		}
 		for i := range list {
-			t := list[i].Token
-			if created+skipped["already-bound"]+skipped["no-cipher"]+len(failed) >= limit {
-				return created, skipped, failed, nil
+			ti := list[i]
+			t := ti.Token
+			if created+renamed+skipped["already-bound"]+skipped["renamed"]+skipped["manual-named"]+skipped["no-cipher"]+skipped["disabled"]+len(failed)+len(conflicts) >= limit {
+				return created, renamed, skipped, conflicts, failed, nil
 			}
-			// 已有 ACTIVE 映射则跳过（幂等）
-			if s.callerKeyLookup != nil {
-				if ok, _ := s.callerKeyLookup(ctx, t.ID); ok {
-					skipped["already-bound"]++
-					continue
-				}
+			// 停用映射（令牌停用时 Remove 删过代理 key）：自动回填不碰它，
+			// 单独分桶（评审必改①）；显式恢复走 Toggle 启用（Reactivate）或管理端一键开通。
+			if s.callerKeyStateOf != nil && s.callerKeyStateOf(ctx, t.ID) == magpieKeyStateDisabled {
+				skipped["disabled"]++
+				continue
 			}
 			plain, serr := s.Secret(ctx, t.ID)
 			if serr != nil || plain == "" {
@@ -515,22 +568,148 @@ func (s *TokenService) BackfillCallerKeys(ctx context.Context, limit int) (creat
 				failed = append(failed, map[string]any{"TokenID": t.ID, "Reason": "no-cipher（该令牌未备份密钥，需轮换后自动开通）"})
 				continue
 			}
-			if kerr := s.callerKey.Ensure(ctx, t.ID, plain); kerr != nil {
-				failed = append(failed, map[string]any{"TokenID": t.ID, "Reason": kerr.Error()})
+			// 判定（确定性，不猜名）：当前映射名 == 新口径名 → already-bound；
+			// == 旧口径自动名 → 可改名；其它 → 手工绑定名，跳过不动。
+			curName := ""
+			if s.callerKeyNameOf != nil {
+				curName = s.callerKeyNameOf(ctx, t.ID)
+			}
+			wantName := ""
+			if s.callerWantNameOf != nil {
+				wantName = s.callerWantNameOf(ctx, ti.UserID, t.ID, t.DisplayName)
+			}
+			qualifies := curName != "" && wantName != "" && curName != wantName && curName == LegacyAutoKeyName(t.ID)
+			if dryRun {
+				switch {
+				case curName == "":
+					skipped["no-binding"]++
+				case curName == wantName:
+					skipped["already-bound"]++
+				case qualifies:
+					skipped["renamed"]++
+				default:
+					skipped["manual-named"]++
+				}
+				// 冲突预演（评审必改）：只对「执行会发生动作」的桶探测——
+				// no-binding（将新建）与 qualifies（将改名）走与执行态相同的消歧分配；
+				// already-bound / manual-named 名字已定、不产生新分配，无需探测。
+				if curName == "" || qualifies {
+					if _, perr := s.callerKey.ProbeName(ctx, ti.UserID, CallerKeyToken{ID: t.ID, DisplayName: t.DisplayName}, ti.Username); perr != nil {
+						if errors.Is(perr, ErrCallerKeyNameTaken) {
+							conflicts = append(conflicts, map[string]any{
+								"TokenID": t.ID, "DisplayName": t.DisplayName, "Reason": perr.Error(),
+							})
+						} else if errors.Is(perr, ErrCallerKeyDisabled) {
+							skipped["disabled"]++
+						} else {
+							failed = append(failed, map[string]any{"TokenID": t.ID, "Reason": "probe：" + perr.Error()})
+						}
+					}
+				}
 				continue
 			}
-			created++
+			// 已是终态名（前轮回填产物或新路径首建）：名字与值都已收敛，跳过不动。
+			// （值对齐发生在首建/改名那一轮的 Ensure；此处再调 Ensure 只会零写空转。）
+			if curName == wantName {
+				skipped["already-bound"]++
+				continue
+			}
+			if err := s.callerKey.Ensure(ctx, ti.UserID, CallerKeyToken{ID: t.ID, DisplayName: t.DisplayName}, ti.Username, plain); err != nil {
+				// 停用行：Ensure 自带 state 守卫（评审必改①，钩子缺位时的第二道防线）。
+				if errors.Is(err, ErrCallerKeyDisabled) {
+					skipped["disabled"]++
+					continue
+				}
+				entry := map[string]any{"TokenID": t.ID, "Reason": err.Error()}
+				if errors.Is(err, ErrCallerKeyNameTaken) {
+					// 契约 §1.2：消歧重试一轮仍撞 → 409 挂起人工（响应级冲突由 handler 判）。
+					entry["Conflict"] = true
+					conflicts = append(conflicts, map[string]any{
+						"TokenID": t.ID, "DisplayName": t.DisplayName, "Reason": err.Error(),
+					})
+				}
+				failed = append(failed, entry)
+				continue
+			}
+			if qualifies {
+				renamed++
+			} else {
+				created++
+			}
 		}
 		if int64(page*batch) >= total {
 			break
 		}
 	}
-	return created, skipped, failed, nil
+	return created, renamed, skipped, conflicts, failed, nil
+}
+
+// SetCallerKeyNameOf 注入「该令牌当前映射的 callerKey 名」（回填 skip 判定用；空串=无映射）。
+func (s *TokenService) SetCallerKeyNameOf(fn func(ctx context.Context, tokenID int64) string) {
+	s.callerKeyNameOf = fn
+}
+
+// magpieKeyStateDisabled 与 magpie.KeyStateDisabled 同值（identity 不能 import magpie，
+// 字符串字面量由两侧测试锁一致：见 magpie 包 keystore 常量用例）。
+const magpieKeyStateDisabled = "DISABLED"
+
+// SetCallerKeyStateOf 注入「该令牌当前映射行的状态」（回填 disabled 分桶用；空串=无映射/未注入）。
+func (s *TokenService) SetCallerKeyStateOf(fn func(ctx context.Context, tokenID int64) string) {
+	s.callerKeyStateOf = fn
+}
+
+// SetCallerWantNameOf 注入「该令牌按新口径应有的 callerKey 名」（回填改名资格判定用）。
+func (s *TokenService) SetCallerWantNameOf(fn func(ctx context.Context, userID, tokenID int64, displayName string) string) {
+	s.callerWantNameOf = fn
+}
+
+// SetCallerUsernameOf 注入「用户 ID → 用户名」读取器（key 名第一段原料；nil=段退化 u<uid>）。
+// 注入源 = identity 用户存储（GetByID），避免 TokenService 直依赖用户服务层。
+func (s *TokenService) SetCallerUsernameOf(fn func(ctx context.Context, userID int64) string) {
+	s.callerUsernameOf = fn
+}
+
+// usernameForToken 取该用户的用户名（创建/启停路径兜底取；空串 → key 名段退化 u<uid>）。
+func (s *TokenService) usernameForToken(ctx context.Context, userID int64) string {
+	if s.callerUsernameOf != nil {
+		return s.callerUsernameOf(ctx, userID)
+	}
+	return ""
 }
 
 // SetCallerKeyLookup 注入「该令牌是否已有 ACTIVE callerKey」查询（补建幂等用）。
 func (s *TokenService) SetCallerKeyLookup(fn func(ctx context.Context, tokenID int64) (bool, error)) {
 	s.callerKeyLookup = fn
+}
+
+// DisplayNameOf 取令牌 display_name（callerKey 名可读段的原料；查不到返回空串）。
+// 供 magpie 管理端 auto 开通使用（identity 注入，避免 magpie 反向依赖 identity 的服务层）。
+func (s *TokenService) DisplayNameOf(ctx context.Context, tokenID int64) string {
+	t, err := s.store.GetByID(ctx, tokenID)
+	if err != nil || t == nil {
+		return ""
+	}
+	return t.DisplayName
+}
+
+// UsernameOfToken 取令牌所属用户的用户名（key 名第一段原料；查不到返回空串，
+// key 名用户段按契约退化 u<uid>）。identity 注入给 magpie 管理端 auto 开通用。
+func (s *TokenService) UsernameOfToken(ctx context.Context, tokenID int64) string {
+	t, err := s.store.GetByID(ctx, tokenID)
+	if err != nil || t == nil {
+		return ""
+	}
+	return s.usernameForToken(ctx, t.UserID)
+}
+
+// UserIDOfToken 取令牌所属用户 ID（key 名段退化坐标 u<uid>；auto 开通链用）。
+// 令牌不存在返回 (0,false)。
+func (s *TokenService) UserIDOfToken(ctx context.Context, tokenID int64) (int64, bool) {
+	t, err := s.store.GetByID(ctx, tokenID)
+	if err != nil || t == nil {
+		return 0, false
+	}
+	return t.UserID, true
 }
 
 // Secret 返回令牌明文密钥（解密 secret_cipher）。未配置 SM4 密钥或历史令牌无密文时报错。
@@ -683,12 +862,13 @@ func (s *TokenService) Toggle(ctx context.Context, userID, tokenID int64) (*Toke
 	if err := s.store.UpdateStatus(ctx, tokenID, newStatus); err != nil {
 		return nil, fmt.Errorf("toggle token: %w", err)
 	}
-	// V3：停用 ⇒ 删 callerKey；启用 ⇒ 重新确保（明文从密文解出）。
+	// V3：停用 ⇒ 删 callerKey；启用 ⇒ 显式重新启用（Reactivate：允许把 DISABLED
+	// 映射行翻回 ACTIVE；自动路径的 Ensure 对停用行会拒绝）。
 	if s.callerKey != nil {
 		if newStatus == StatusTokenDisabled {
 			_ = s.callerKey.Remove(ctx, tokenID)
 		} else if plain, serr := s.Secret(ctx, tokenID); serr == nil {
-			_ = s.callerKey.Ensure(ctx, tokenID, plain)
+			_ = s.callerKey.Reactivate(ctx, t.UserID, CallerKeyToken{ID: t.ID, DisplayName: t.DisplayName}, s.usernameForToken(ctx, t.UserID), plain)
 		}
 	}
 	// 写路径失效：状态已翻转，立即按哈希清除其缓存项。
@@ -703,11 +883,19 @@ type TokenHandler struct {
 	svc            *TokenService
 	userIDFrom     func(ctx context.Context) (int64, bool)
 	verifyPassword func(ctx context.Context, userID int64, password string) error
+	// magpieKeyNameOf 批量取令牌当前映射的 callerKey 名（管理端列表展示用；
+	// nil=不补该字段，dev 列表刻意不带）。key 由 token.go 的 tokenResponse 契约说明。
+	magpieKeyNameOf func(ctx context.Context, tokenIDs []int64) (map[int64]string, error)
 }
 
 // NewTokenHandler 创建令牌处理器。
 func NewTokenHandler(svc *TokenService, userIDFrom func(ctx context.Context) (int64, bool)) *TokenHandler {
 	return &TokenHandler{svc: svc, userIDFrom: userIDFrom}
+}
+
+// SetMagpieKeyNameOf 注入 callerKey 名批量解析钩子（管理端列表展示 key_name；nil=不补）。
+func (h *TokenHandler) SetMagpieKeyNameOf(fn func(ctx context.Context, tokenIDs []int64) (map[int64]string, error)) {
+	h.magpieKeyNameOf = fn
 }
 
 // SetPasswordVerifier 注入当前口令校验（查看明文密钥等高危操作二次验证；nil=跳过校验）。
@@ -727,6 +915,9 @@ type tokenResponse struct {
 	LastUsedAt   *time.Time `json:"LastUsedAt,omitempty"`
 	Status       string     `json:"Status"`
 	CreatedAt    time.Time  `json:"CreatedAt"`
+	// MagpieKeyName 该令牌当前映射的代理侧 callerKey 名（管理端展示「谁的 key」）。
+	// 未绑定/未同步为空串。仅管理端列表补，dev 列表与创建/轮换响应不带。
+	MagpieKeyName string `json:"MagpieKeyName,omitempty"`
 }
 
 func (t *Token) response() tokenResponse {
@@ -793,6 +984,19 @@ func (h *TokenHandler) HandleAdminList(w http.ResponseWriter, r *http.Request) {
 	for i := range list {
 		items = append(items, list[i].response())
 	}
+	// 定案①（2026-11-20）：管理端令牌列表直接展示人可读的 callerKey 名。
+	// 批量解析一次注入；nil/失败按空串渲染（展示缺口，不挡列表）。dev 列表不带。
+	if h.magpieKeyNameOf != nil && len(list) > 0 {
+		ids := make([]int64, len(list))
+		for i := range list {
+			ids[i] = list[i].ID
+		}
+		if names, err := h.magpieKeyNameOf(r.Context(), ids); err == nil && names != nil {
+			for i := range items {
+				items[i].MagpieKeyName = names[list[i].ID]
+			}
+		}
+	}
 	resp.OK(w, r, map[string]any{"List": items, "Total": total, "Page": page, "Size": size})
 }
 
@@ -805,21 +1009,60 @@ func (h *TokenHandler) HandleAdminCreate(w http.ResponseWriter, r *http.Request)
 	}
 	plain, err := h.svc.Create(r.Context(), req.UserID, req.DisplayName, req.TagID, req.ExpiresAt)
 	if err != nil {
+		// 撞名（ErrCallerKeyNameTaken）在 writeServiceErr 单点映射 409（Gate 遗留②）。
 		writeServiceErr(w, r, err)
 		return
 	}
 	resp.OK(w, r, createdTokenResponse{Plain: plain, Display: tokenDisplay(plain)})
 }
 
-// HandleAdminBackfillMagpieKeys POST /api/v1/admin/tokens/magpie-keys/backfill
-// 为存量令牌补建代理侧 callerKey（幂等，可重跑）；返回 created/skipped/failed。
+// HandleAdminBackfillMagpieKeys POST /api/v1/admin/tokens/magpie-keys/rename
+// 为存量令牌补建/改名代理侧 callerKey（M2 存量回填，幂等，可重跑）；
+// 返回 created/renamed/skipped/failed。
+// 契约 §1.2：dry-run 默认开启，?dry_run=false 才执行（或请求体 {"DryRun":false}）；
+// DryRun 的 Skipped/Renamed 计数即「执行会发生什么」的只读预览。
+// 消歧重试一轮仍撞名（failed 含 Conflict:true）→ 409 挂起人工。
 func (h *TokenHandler) HandleAdminBackfillMagpieKeys(w http.ResponseWriter, r *http.Request) {
-	created, skipped, failed, err := h.svc.BackfillCallerKeys(r.Context(), 0)
+	dryRun := true // 默认只判定不执行
+	if v := strings.TrimSpace(r.URL.Query().Get("dry_run")); v != "" {
+		dryRun = !strings.EqualFold(v, "false") && v != "0"
+	}
+	var req struct {
+		DryRun *bool `json:"DryRun"` // 显式 false 才执行（指针区分「未传」与「false」）
+	}
+	if r.Body != nil {
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&req); err != nil && err != io.EOF {
+			resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "请求体格式错误")
+			return
+		}
+	}
+	if req.DryRun != nil {
+		dryRun = *req.DryRun
+	}
+	created, renamed, skipped, conflicts, failed, err := h.svc.BackfillCallerKeys(r.Context(), 0, dryRun)
 	if err != nil {
 		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, err.Error())
 		return
 	}
-	resp.OK(w, r, map[string]any{"Created": created, "Skipped": skipped, "Failed": failed})
+	// 响应 payload 单一来源：OK 与 409 同构（评审必改：409 必须带全量明细，
+	// 「见 Failed 明细」不再是文案——失败/冲突令牌号就在响应体里）。
+	payload := map[string]any{
+		"Created": created, "Renamed": renamed, "Skipped": skipped,
+		"Conflicts": conflicts, "Failed": failed, "DryRun": dryRun,
+	}
+	for _, f := range failed {
+		if c, _ := f["Conflict"].(bool); c {
+			// 有令牌撞名即响应级 409：其余令牌的结果照常带回（data 全量）。
+			resp.ErrReason(w, r, http.StatusConflict, resp.CodeConflict, "caller_key_name_conflict",
+				"存在 callerKey 名字消歧后仍撞名的令牌，请人工处理（明细见 data.Conflicts / data.Failed）", payload)
+			return
+		}
+	}
+	if len(conflicts) > 0 && dryRun {
+		// dry-run 探出冲突：不 409（预览不是动作），但 Conflicts 明细必须可见。
+		payload["Message"] = "dry-run 预览探出撞名令牌，执行前请先人工处理（明细见 data.Conflicts）"
+	}
+	resp.OK(w, r, payload)
 }
 
 // HandleAdminBatchDelete POST /api/v1/admin/tokens/batch-delete 批量删除令牌。
@@ -901,6 +1144,7 @@ func (h *TokenHandler) HandleDevCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	plain, err := h.svc.Create(r.Context(), userID, req.DisplayName, req.TagID, req.ExpiresAt)
 	if err != nil {
+		// 撞名（ErrCallerKeyNameTaken）在 writeServiceErr 单点映射 409（Gate 遗留②）。
 		writeServiceErr(w, r, err)
 		return
 	}

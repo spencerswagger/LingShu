@@ -15,9 +15,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5/pgconn"
 
@@ -39,7 +41,13 @@ type KeyAdminHandler struct {
 	adminKey string // 兼容保留（auto 不再使用）
 	// secretOf 取令牌明文（identity 注入）；sync 把令牌明文注册为代理侧 callerKey。
 	secretOf func(ctx context.Context, tokenID int64) (string, error)
-	sync     *CallerKeySync
+	// displayNameOf 取令牌 display_name（auto 改名时做可读段原料；identity 注入）。
+	displayNameOf func(ctx context.Context, tokenID int64) string
+	// usernameOf 取令牌所属用户的用户名（key 名第一段原料；identity 注入）。
+	usernameOf func(ctx context.Context, tokenID int64) string
+	// ownerOf 取令牌所属用户 ID（key 名段退化坐标 u<uid>；identity 注入）。
+	ownerOf func(ctx context.Context, tokenID int64) (int64, bool)
+	sync    *CallerKeySync
 }
 
 // NewKeyAdminHandler 装配管理端处理器（credKey 为 security.sm4_key）。
@@ -47,10 +55,39 @@ func NewKeyAdminHandler(store KeyBinder, credKey []byte, adminKey string) *KeyAd
 	return &KeyAdminHandler{store: store, credKey: credKey, adminKey: strings.TrimSpace(adminKey)}
 }
 
-// SetAutoSync 注入令牌明文读取与同步器（auto 端点用；不注入则 auto 拒绝）。
-func (h *KeyAdminHandler) SetAutoSync(secretOf func(ctx context.Context, tokenID int64) (string, error), sync *CallerKeySync) {
+// SetAutoSync 注入令牌明文、令牌名、所属用户名读取器与同步器（auto 端点用；不注入则 auto 拒绝）。
+func (h *KeyAdminHandler) SetAutoSync(secretOf func(ctx context.Context, tokenID int64) (string, error), sync *CallerKeySync, displayNameOf ...func(ctx context.Context, tokenID int64) string) {
 	h.secretOf = secretOf
 	h.sync = sync
+	if len(displayNameOf) > 0 {
+		h.displayNameOf = displayNameOf[0]
+	}
+}
+
+// SetUsernameOf 注入令牌所属用户名的读取器（key 名第一段原料；不注入则段退化为 u<uid> 口径）。
+func (h *KeyAdminHandler) SetUsernameOf(fn func(ctx context.Context, tokenID int64) string) {
+	h.usernameOf = fn
+}
+
+// SetOwnerOf 注入令牌所属用户 ID 的读取器（key 名段退化坐标；auto 开通链用）。
+func (h *KeyAdminHandler) SetOwnerOf(fn func(ctx context.Context, tokenID int64) (int64, bool)) {
+	h.ownerOf = fn
+}
+
+// tokenUsername 取令牌所属用户名；未注入读取器时返回空（key 名用户段退化为 u<uid>）。
+func (h *KeyAdminHandler) tokenUsername(ctx context.Context, tokenID int64) string {
+	if h.usernameOf == nil {
+		return ""
+	}
+	return h.usernameOf(ctx, tokenID)
+}
+
+// tokenDisplayName 取令牌 display_name；未注入读取器时返回空（slug 退化为随机段，名字仍唯一）。
+func (h *KeyAdminHandler) tokenDisplayName(ctx context.Context, tokenID int64) string {
+	if h.displayNameOf == nil {
+		return ""
+	}
+	return h.displayNameOf(ctx, tokenID)
 }
 
 // HandleAutoPut POST /api/v1/admin/tokens/{id}/magpie-key/auto
@@ -71,7 +108,15 @@ func (h *KeyAdminHandler) HandleAutoPut(w http.ResponseWriter, r *http.Request) 
 		resp.Err(w, r, http.StatusNotFound, resp.CodeNotFound, "该令牌未备份密钥（历史令牌），请轮换令牌后再开通")
 		return
 	}
-	if err := h.sync.Ensure(r.Context(), tokenID, plain); err != nil {
+	userID := tokenID
+	if h.ownerOf != nil {
+		if uid, ok := h.ownerOf(r.Context(), tokenID); ok && uid > 0 {
+			userID = uid
+		}
+	}
+	// 一键开通是显式管理动作：停用行（令牌停用时 Remove 删过）允许翻回 ACTIVE
+	// （自动路径的 Ensure 会拒绝；评审必改①的状态纪律只在自动侧收口）。
+	if err := h.sync.Reactivate(r.Context(), userID, TokenRef{ID: tokenID, DisplayName: h.tokenDisplayName(r.Context(), tokenID)}, h.tokenUsername(r.Context(), tokenID), plain); err != nil {
 		resp.Err(w, r, http.StatusBadGateway, resp.CodeInternalError, "开通失败："+err.Error())
 		return
 	}
@@ -84,8 +129,10 @@ func (h *KeyAdminHandler) HandleAutoPut(w http.ResponseWriter, r *http.Request) 
 }
 
 // 绑定入参的边界（过短=误填，过长=拒绝，避免把整段配置粘贴进来）。
+// maxKeyNameLen 按 magpie 真机上限收紧：0.1.4353 实测 120 字符（原 128 会在
+// magpie 侧被 "Use a name between 1 and 120 characters" 拒掉）。
 const (
-	maxKeyNameLen   = 128
+	maxKeyNameLen   = MagpieKeyNameLimit // 120（真机实测，见 notes/magpie-keyname-limit-2026-11-20.md）
 	maxCallerKeyLen = 512
 )
 
@@ -148,8 +195,9 @@ func (h *KeyAdminHandler) HandlePut(w http.ResponseWriter, r *http.Request) {
 	case plain == "":
 		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "CallerKey 不能为空")
 		return
-	case len(keyName) > maxKeyNameLen:
-		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "KeyName 过长")
+	case utf8.RuneCountInString(keyName) > maxKeyNameLen:
+		// 真机按字符数收 1..120（0.1.4454 探针）；按字节拦会误拒合法的非 ASCII 名。
+		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "KeyName 过长（按字符数上限 120）")
 		return
 	case len(plain) > maxCallerKeyLen:
 		resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "CallerKey 过长")
@@ -219,4 +267,79 @@ func isForeignKeyViolation(err error) bool {
 		return pgErr.Code == "23503"
 	}
 	return false
+}
+
+// rollbackLister 是回滚端点需要的附加存储能力（*KeyStore 满足；handler 侧类型升级获取）。
+type rollbackLister interface {
+	RenameRollbackTargets(ctx context.Context, limit int) ([]Key, error)
+}
+
+// rollbackTargetView 回滚目标的只读预览行（dry-run 与执行响应共用）。
+type rollbackTargetView struct {
+	TokenID     int64  `json:"TokenID,string"`
+	CurrentName string `json:"CurrentName"`
+	LegacyName  string `json:"LegacyName"`
+}
+
+// rollbackResultView 回滚响应。
+type rollbackResultView struct {
+	DryRun   bool                 `json:"DryRun"`
+	Targets  []rollbackTargetView `json:"Targets"`
+	Restored int                  `json:"Restored"`
+	Skipped  int                  `json:"Skipped"`
+	Failed   []map[string]any     `json:"Failed"`
+}
+
+// HandleRenameRollback POST /api/v1/admin/tokens/magpie-keys/rename-rollback
+// 按 legacy_key_name 复原旧名（终表 §3.5，与正向改名三步镜像、幂等可重跑）。
+// dry-run 默认开启：只列出目标（当前名/旧名），?dry_run=false 或请求体 {"DryRun":false} 执行。
+// 执行语义：逐令牌 RollbackToken——代理侧旧名复原（值不变）→ 本地行 key_name=旧名 → legacy 清空。
+func (h *KeyAdminHandler) HandleRenameRollback(w http.ResponseWriter, r *http.Request) {
+	dryRun := true // 默认只判定不执行
+	if v := strings.TrimSpace(r.URL.Query().Get("dry_run")); v != "" {
+		dryRun = !strings.EqualFold(v, "false") && v != "0"
+	}
+	if r.Body != nil {
+		var req struct {
+			DryRun *bool `json:"DryRun"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+			resp.Err(w, r, http.StatusBadRequest, resp.CodeBadRequest, "请求体格式错误")
+			return
+		} else if req.DryRun != nil {
+			dryRun = *req.DryRun
+		}
+	}
+	rs, ok := h.store.(rollbackLister)
+	if !ok {
+		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "存储不支持回滚清单查询")
+		return
+	}
+	if !dryRun && (h.sync == nil || len(h.credKey) == 0) {
+		resp.Err(w, r, http.StatusServiceUnavailable, resp.CodeInternalError, "未装配代理凭据同步（缺页面口令或 SM4）")
+		return
+	}
+	const limit = 5000 // 一轮上限；更大规模分轮跑（幂等，重跑续上）
+	keys, err := rs.RenameRollbackTargets(r.Context(), limit)
+	if err != nil {
+		resp.Err(w, r, http.StatusInternalServerError, resp.CodeInternalError, "查询回滚目标失败")
+		return
+	}
+	view := rollbackResultView{DryRun: dryRun, Targets: []rollbackTargetView{}, Failed: []map[string]any{}}
+	for _, k := range keys {
+		view.Targets = append(view.Targets, rollbackTargetView{TokenID: k.TokenID, CurrentName: k.KeyName, LegacyName: k.LegacyKeyName})
+		if dryRun {
+			continue
+		}
+		done, rerr := h.sync.RollbackToken(r.Context(), k.TokenID)
+		switch {
+		case rerr != nil:
+			view.Failed = append(view.Failed, map[string]any{"TokenID": k.TokenID, "Reason": rerr.Error()})
+		case done:
+			view.Restored++
+		default:
+			view.Skipped++ // 无旧名可复原（并发下已回滚）：幂等跳过
+		}
+	}
+	resp.OK(w, r, view)
 }

@@ -101,6 +101,8 @@ export interface AdminToken {
   Username: string
   UserNickname?: string
   DisplayName: string
+  // 代理侧 callerKey 名（ls-u<uid>-t<tid>-<slug>；未绑定/未同步为空不显示）
+  MagpieKeyName?: string
   ExpiresAt: string | null
   LastUsedAt: string | null
   Status: string // ACTIVE | DISABLED
