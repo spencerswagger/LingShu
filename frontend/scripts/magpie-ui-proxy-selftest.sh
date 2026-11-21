@@ -140,7 +140,10 @@ sed -e "s#listen 80;#listen $WEB_PORT;#" \
     -e "s#set \$magpie_page magpie:3430;#set \$magpie_page 127.0.0.1:$MG_PORT;#" \
     -e "s#root /usr/share/nginx/html;#root $TMP/html;#" \
     -e "s#resolver 127.0.0.11 #resolver 127.0.0.11 #" \
+    -e "s#include /etc/nginx/conf.d/v1-proxy.inc#include $TMP/conf.d/v1-proxy.inc#g" \
     "$CONF" >"$TMP/conf.d/default.conf"
+# /v1 白名单公共段（本脚本不测 /v1，但 default.conf 引用它，缺文件 nginx -t 直接失败）
+cp "$HERE/../v1-proxy.inc" "$TMP/conf.d/v1-proxy.inc"
 for pat in "listen $WEB_PORT;" "127.0.0.1:$BE_PORT;" "127.0.0.1:$MG_PORT;"; do
     grep -q -- "$pat" "$TMP/conf.d/default.conf" || { echo "配置替换失败（找不到 $pat）：nginx.conf 结构变了？"; exit 1; }
 done
