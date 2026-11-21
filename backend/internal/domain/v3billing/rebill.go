@@ -411,27 +411,16 @@ func (p *Poller) rebillOne(ctx context.Context, r rebillRow, groups []groupNode)
 		UserID:          r.UserID,
 		PricingMode:     "sale",
 		TokenID:         r.TokenID,
-		ExternalModel:   price.externalName,
 		InternalModelID: r.InternalModelID,
 		CallTime:        time.Now(),
 		Tokens:          r.Tokens,
-		Rates:           billing.Rates(price.saleRates),
 		Status:          billing.StatusCompleted,
 		ErrorMessage:    rebillNewRemark + r.BillingID,
 	}
-	// 时段/分档随当前售价走（补收时刻口径）。
-	if len(price.timeRaw) > 0 && string(price.timeRaw) != "null" {
-		var tc billing.TimeCoeffConfig
-		if json.Unmarshal(price.timeRaw, &tc) == nil {
-			req.TimeConfig = &tc
-		}
-	}
-	if len(price.tiersRaw) > 0 && string(price.tiersRaw) != "null" {
-		var tiers []billing.TierRule
-		if json.Unmarshal(price.tiersRaw, &tiers) == nil {
-			req.ContextTiers = tiers
-		}
-	}
+	// 售价（含时段/分档或 v2 四段价）随当前配置走（补收时刻口径）：
+	// v2 行求值时刻 = 补收时刻（与旧时段口径同语义）；tokens 沿用原账单行的 JSONB，
+	// 历史三段行无 cache_write 键 → 该段按 0 计（分桶在落账单时已定，不可复原）。
+	p.attachSale(&req, price, time.Now(), "补收 "+r.BillingID)
 
 	rec, err := p.bill.Record(ctx, req)
 	if err != nil {
@@ -445,11 +434,30 @@ func (p *Poller) rebillOne(ctx context.Context, r rebillRow, groups []groupNode)
 		return "", 0, false, "", "", errors.New("计费服务未返回账单号")
 	}
 
-	// 成本沿用原行（不重算，避免漂移）：Record 不带 CostRates（不走公式），这里直接补写。
+	// v2 行求值留痕（price_eval）：与结算链同一收口——幂等命中（Record 未重新求值）
+	// 时 Evaluated=false、不写留痕；priceEvalRaw 用 any（nil→driver.Value nil），
+	// COALESCE 不动首次写入的值（补收链同样遵守「不覆盖既有留痕」）。
+	var priceEvalRaw any
+	if req.V2 != nil && req.V2.Evaluated() {
+		trace := billing.PriceEvalTrace(req.V2, req.CostV2, req.Tokens, rec.RValue)
+		if b, merr := json.Marshal(trace); merr == nil {
+			priceEvalRaw = b
+		}
+	}
+	// 成本沿用原行（不重算，避免漂移）：Record 不带 CostRates（不走公式），这里直接补写；
+	// 有留痕时与成本补写同一条 UPDATE（补收单只打一轮库）。
 	if r.CostCredits != nil && *r.CostCredits > 0 {
-		if _, err := p.db.ExecContext(ctx, `UPDATE billing_records SET cost_credits = $1, cost_source = 'ledger'
-			 WHERE billing_id = $2 AND COALESCE(cost_credits,0) = 0`, *r.CostCredits, rec.BillingID); err != nil {
+		if _, err := p.db.ExecContext(ctx, `UPDATE billing_records SET cost_credits = $1, cost_source = 'ledger',
+				 price_eval = COALESCE($3::jsonb, price_eval)
+			 WHERE billing_id = $2 AND COALESCE(cost_credits,0) = 0`, *r.CostCredits, rec.BillingID, priceEvalRaw); err != nil {
 			return "", 0, false, "", "", fmt.Errorf("回填补收账单 %s 的成本失败：%w", rec.BillingID, err)
+		}
+	} else if priceEvalRaw != nil {
+		// 原行无成本值：只补留痕（条件不带 cost 守卫，与 settleOne 的补写守卫一致——
+		// 首次结算行 cost 由 Record 自带，重放窗口下该 UPDATE 走 COALESCE 幂等）。
+		if _, err := p.db.ExecContext(ctx, `UPDATE billing_records SET price_eval = COALESCE($2::jsonb, price_eval)
+			 WHERE billing_id = $1`, rec.BillingID, priceEvalRaw); err != nil {
+			return "", 0, false, "", "", fmt.Errorf("回填补收账单 %s 的留痕失败：%w", rec.BillingID, err)
 		}
 	}
 	return rec.BillingID, rec.CreditsConsumed, false, "", "", nil

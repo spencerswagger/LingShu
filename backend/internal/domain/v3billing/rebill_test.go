@@ -150,10 +150,10 @@ func TestRebill_HappyPathAndIdempotent(t *testing.T) {
 		f.expectState()
 		// 行级解析：req=组ref 直中绑定档。
 		f.expectPriceChain(groupRef, "served-m", groups, 5, groupRef, extName, rates)
-		// Record → 新账单；成本沿用原行。
+		// Record → 新账单；成本沿用原行；留痕参数恒 nil（旧三段行不落 price_eval）。
 		f.rec.bals = []float64{88.5}
 		f.mock.ExpectExec("UPDATE billing_records SET cost_credits").
-			WithArgs(cost, newID).WillReturnResult(sqlmock.NewResult(0, 1))
+			WithArgs(cost, newID, nil).WillReturnResult(sqlmock.NewResult(0, 1))
 		f.expectMark("bill-x", newID)
 
 		res, err := f.p.Rebill(context.Background(), groupRef)
@@ -486,11 +486,12 @@ func TestRebill_PartialResultHTTP(t *testing.T) {
 	}
 }
 
-// priceRow 构造售价命中行。
+// priceRow 构造售价命中行。第 5 列 sale_v2 恒 nil（这些用例都是旧三段口径；
+// v2 行为在 settle v2 专项用例里构造）。
 func priceRow(extName string, rates map[string]float64) *sqlmock.Rows {
 	raw, _ := json.Marshal(rates)
-	return sqlmock.NewRows([]string{"external_name", "sale_rates", "time_config", "context_tiers"}).
-		AddRow(extName, raw, []byte("null"), []byte("null"))
+	return sqlmock.NewRows([]string{"external_name", "sale_rates", "time_config", "context_tiers", "sale_v2"}).
+		AddRow(extName, raw, []byte("null"), []byte("null"), nil)
 }
 
 func int64Ptr(v int64) *int64 { return &v }
@@ -529,7 +530,7 @@ func TestRebill_Random20(t *testing.T) {
 			credits := rfloat(0.01, 500)
 			f.rec.bals = []float64{credits}
 			f.mock.ExpectExec("UPDATE billing_records SET cost_credits").
-				WithArgs(cost, rebillNewBillingID(origID)).WillReturnResult(sqlmock.NewResult(0, 1))
+				WithArgs(cost, rebillNewBillingID(origID), nil).WillReturnResult(sqlmock.NewResult(0, 1))
 			f.expectMark(origID, rebillNewBillingID(origID))
 
 			res, err := f.p.Rebill(context.Background(), groupRef)
