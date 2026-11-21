@@ -8,8 +8,9 @@
 //     成本 `cost`（USD，`priced=false` 时无意义）；模型 `model`。
 //   - token 口径：`in` 是**未缓存输入**，缓存读/写是独立字段 `cache_read`/`cache_write`
 //     （代理侧 docs/reference.md：tokens counted are a call's uncached input, output and
-//     cache writes, plus cache reads）。灵枢账单侧是「input（含 cache_write）+ cache_read + output」，
-//     所以账本侧必须把缓存并进 `tokens_in`，否则两侧合计永远不等（见 mapMagpieFeedRow）。
+//     cache writes, plus cache reads）。灵枢合计口径是四键求和（三段行缓存写折在 input、
+//     v2 计价行独立分桶），所以账本侧必须把缓存并进 `tokens_in`，否则两侧合计永远不等
+//     （见 mapMagpieFeedRow）。
 //   - 排序：offset 账本是**最新在前**（newest first），不是 `occurred_at ASC`。
 //     cursor feed 是「按 seq 的变更流」，本身不承诺业务时间序。
 //   - 幂等键：`id`（u_…）是代理侧自己的行 id，跨读取/重启不变；`original_ids.request_id`
@@ -371,8 +372,9 @@ func mapMagpieFeedRow(row magpieFeedRow, convert CostConverter) (LedgerEntry, bo
 	}
 	// tokens_in 存**提示词侧总量** = in + cache_read + cache_write。
 	//
-	// 为什么合并而不是原样搬 `in`：灵枢 billing_records 的三段口径是「纯输入（含 cache_write）
-	// + cache_read + output」，对账/结算都按 `billing.TokenSumExpr` 求和。代理侧的 `in`
+	// 为什么合并而不是原样搬 `in`：灵枢合计口径是四键求和（0011 三段行缓存写折在 input、
+	// 无独立键；v2 计价行 cache_write 独立分桶——四项定案①，TokenSumExpr 两种行都求和
+	// input/cache_read/cache_write/output），对账都按 `billing.TokenSumExpr`。代理侧的 `in`
 	// **不含**缓存（缓存读/写是独立字段），原样搬会让账本侧恒小于本地（真库实测 10200 vs 20440），
 	// 对账每窗误判 alarm。合并后两侧合计同口径，且账本表仍是九字段（不新增缓存列）。
 	// `cache_write_1h` 是 `cache_write` 按 TTL 的**拆分**（子集），不能重复相加；

@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/team/llmgateway/internal/domain/billing"
+	"github.com/team/llmgateway/internal/domain/billing/mult"
 	"github.com/team/llmgateway/internal/domain/magpie"
 )
 
@@ -203,6 +204,9 @@ type priceInfo struct {
 	saleRates    map[string]float64
 	timeRaw      []byte
 	tiersRaw     []byte
+	// saleV2Raw 是 external_models.sale_v2（models.dev v2 售价形状，四项定案 2026-11-20）。
+	// NULL/空/解析失败 = 非 v2 行，回落旧三段（saleRates/timeRaw/tiersRaw）。
+	saleV2Raw []byte
 	// byBinding 命中候选是绑定列（bound_internal_ref）而不是名字列。dry-run 分桶用：
 	// route_id>0 且绑定命中 = 「route_id 直接命中」桶；其余定价形态都算回退链命中。
 	byBinding bool
@@ -221,7 +225,7 @@ func (p *Poller) resolvePrice(ctx context.Context, r row, groups []groupNode) (*
 		}
 		var info priceInfo
 		var saleRaw []byte
-		err := p.db.QueryRowContext(ctx, query, c.value).Scan(&info.externalName, &saleRaw, &info.timeRaw, &info.tiersRaw)
+		err := p.db.QueryRowContext(ctx, query, c.value).Scan(&info.externalName, &saleRaw, &info.timeRaw, &info.tiersRaw, &info.saleV2Raw)
 		if errors.Is(err, sql.ErrNoRows) {
 			continue
 		}
@@ -244,13 +248,106 @@ func (p *Poller) resolvePrice(ctx context.Context, r row, groups []groupNode) (*
 // （与 model/store.go:296 的既有排序惯例同源），取价才不随物理行序漂移（结算与补收同源）。
 // 名字匹配列有 uq_external_models_active 唯一索引兜底（活动行至多 1 条），同样带上
 // ORDER BY 不改变结果、只把确定性写显式。两条都排除软删行。
+// 0031 起各带 sale_v2（v2 售价形状，NULL=非 v2 行回落旧三段）；两条列清单必须逐列一致
+// （rebill_test 钉 comma 守卫）。
 const extByNameSQL = `
-	SELECT external_name, sale_rates, COALESCE(time_config,'null'::jsonb), COALESCE(context_tiers,'null'::jsonb)
+	SELECT external_name, sale_rates, COALESCE(time_config,'null'::jsonb), COALESCE(context_tiers,'null'::jsonb), sale_v2
 	  FROM external_models WHERE external_name = $1 AND deleted_at IS NULL ORDER BY id ASC LIMIT 1`
 
 const extByBindingSQL = `
-	SELECT external_name, sale_rates, COALESCE(time_config,'null'::jsonb), COALESCE(context_tiers,'null'::jsonb)
+	SELECT external_name, sale_rates, COALESCE(time_config,'null'::jsonb), COALESCE(context_tiers,'null'::jsonb), sale_v2
 	  FROM external_models WHERE bound_internal_ref = $1 AND deleted_at IS NULL ORDER BY id ASC LIMIT 1`
+
+// v2Parse 按失败方向解析 v2 形状：raw 为空/解析失败 → 返回 nil（调用方回落旧三段），
+// 解析期被丢弃的 multiplier 规则以 Warning 逐条透出（不中断计费）。
+func v2Parse(raw []byte) (*billing.V2Cost, []mult.Warning) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, nil
+	}
+	c, err := billing.ParseV2Cost(raw)
+	if err != nil {
+		return nil, []mult.Warning{{Rule: "shape", Reason: "v2 形状不合法，回落旧三段：" + err.Error()}}
+	}
+	return c, c.Warnings
+}
+
+// warnMult 把 v2 解析告警打出来（label 带定位：结算=ledger_id、补收=账单号）。
+// 告警不中断计费（mult 失败方向），但必须可观测——静默丢规则 = 价格悄悄漂移。
+func (p *Poller) warnMult(label string, warns []mult.Warning) {
+	for _, w := range warns {
+		p.log.Warn("V3 计价 v2 规则被跳过", "where", label, "rule", w.Rule, "reason", w.Reason)
+	}
+}
+
+// attachSale 把解析到的售价挂到 req：v2 形状存在 → 四段价 + multipliers（四项定案①④），
+// 并**清空**时段/分档（v2 行的时间与上下文条件由规则键 utc_hours/utc_days/date/context 吸收，
+// 再叠加 time_config/context_tiers 就是双重折价）；否则旧三段 + 时段/分档原样。
+// 返回 v2 求值输入（非 v2 行返回 nil）。req.Rates 恒被赋值：v2 行 = LegacyView 三段视图
+// （账单 rates 列渲染兼容，完整口径看 price_eval 留痕）。
+func (p *Poller) attachSale(req *billing.RecordReq, price *priceInfo, evalAt time.Time, label string) *billing.V2Pricing {
+	req.ExternalModel = price.externalName
+	if len(price.timeRaw) > 0 && string(price.timeRaw) != "null" {
+		var tc billing.TimeCoeffConfig
+		if json.Unmarshal(price.timeRaw, &tc) == nil {
+			req.TimeConfig = &tc
+		}
+	}
+	if len(price.tiersRaw) > 0 && string(price.tiersRaw) != "null" {
+		var tiers []billing.TierRule
+		if json.Unmarshal(price.tiersRaw, &tiers) == nil {
+			req.ContextTiers = tiers
+		}
+	}
+	c, warns := v2Parse(price.saleV2Raw)
+	if c != nil {
+		p.warnMult(label, warns)
+		v2 := billing.PricingFromV2Cost(c, evalAt)
+		req.V2 = v2
+		req.Rates = v2.Prices.LegacyView()
+		req.TimeConfig = nil
+		req.ContextTiers = nil
+		return v2
+	}
+	// 形状不合法：告警同样必须打（否则价格静默回落旧三段、不可观测），再回落。
+	p.warnMult(label, warns)
+	req.Rates = billing.Rates(price.saleRates)
+	return nil
+}
+
+// attachCost 成本侧同口径：cost_v2 存在 → CostV2（四项定案② service_tier 差价只在成本层：
+// 该条件因子由账本归因位 CostV2.ServiceTier 提供，当前 v3 账本无此字段、恒空=相关规则不命中）；
+// 否则沿用旧 CostRates。返回 v2 成本求值输入（非 v2 行 nil）。
+func (p *Poller) attachCost(req *billing.RecordReq, costV2Raw []byte, costRates map[string]float64, evalAt time.Time, label string) *billing.V2Pricing {
+	c, warns := v2Parse(costV2Raw)
+	if c != nil {
+		p.warnMult(label, warns)
+		costV2 := billing.PricingFromV2Cost(c, evalAt)
+		req.CostV2 = costV2
+		return costV2
+	}
+	// 形状不合法：同售价口径，告警必须打（成本静默回落 = 毛利失真不可见）。
+	p.warnMult(label, warns)
+	if len(costRates) > 0 {
+		req.CostRates = billing.Rates(costRates)
+	}
+	return nil
+}
+
+// splitV2Usage 四桶互斥拆分（四项定案①：同一 token 只落 input/cache_write/cache_read 一个桶）。
+// 账本口径 tokens_in 含 cache_read+cache_write；v2 行把 cache_write 拆出独立分桶。
+// 数据异常（tokens_in < cache_read+cache_write）时分桶不成立，回退三段口径：
+// cache_write 不拆（仍折在 input 里）、input 沿用旧防御链（再负则当纯输入）。
+func splitV2Usage(r row) billing.Usage {
+	input := r.tokensIn - r.cacheRead - r.cacheWrite
+	if input >= 0 {
+		return billing.Usage{Input: input, Output: r.tokensOut, CacheRead: r.cacheRead, CacheWrite: r.cacheWrite}
+	}
+	input = r.tokensIn - r.cacheRead
+	if input < 0 {
+		input = r.tokensIn
+	}
+	return billing.Usage{Input: input, Output: r.tokensOut, CacheRead: r.cacheRead}
+}
 
 func (p *Poller) settleOne(ctx context.Context, r row, groups []groupNode) (settled bool, unpriced bool, err error) {
 	if r.callerKey == "" {
@@ -272,10 +369,11 @@ func (p *Poller) settleOne(ctx context.Context, r row, groups []groupNode) (sett
 		p.log.Warn("账本行按旧名结算（改名窗口内）", "caller_key_name", r.callerKey, "ledger_id", r.ledgerID)
 	}
 
-	// 成本价（内部模型 ref = provider/model）
+	// 成本价（内部模型 ref = provider/model）：cost_v2 优先（v2 目录对齐），否则 cost_rates 旧三段。
 	internalRef := r.provider + "/" + r.model
 	var costRaw []byte
-	_ = p.db.QueryRowContext(ctx, `SELECT COALESCE(cost_rates,'{}'::jsonb) FROM internal_models WHERE ref = $1`, internalRef).Scan(&costRaw)
+	var costV2Raw []byte
+	_ = p.db.QueryRowContext(ctx, `SELECT COALESCE(cost_rates,'{}'::jsonb), cost_v2 FROM internal_models WHERE ref = $1`, internalRef).Scan(&costRaw, &costV2Raw)
 	var costRates map[string]float64
 	_ = json.Unmarshal(billing.NormalizeRatesJSON(costRaw), &costRates) // 兼容历史 PascalCase 落库（写入侧已归一，这里是读取兜底）
 
@@ -295,31 +393,24 @@ func (p *Poller) settleOne(ctx context.Context, r row, groups []groupNode) (sett
 		Tokens:      usage,
 		Remark:      "v3-bypass",
 	}
-	if len(costRates) > 0 {
-		req.CostRates = billing.Rates(costRates)
-	}
 
 	price, tried, err := p.resolvePrice(ctx, r, groups)
 	if err != nil {
 		return false, false, err
 	}
+	var saleV2, costV2 *billing.V2Pricing
 	if price != nil {
-		req.ExternalModel = price.externalName
 		req.InternalModelID = internalRef
-		req.Rates = billing.Rates(price.saleRates)
 		req.Status = billing.StatusCompleted
-		// 时段/分档（可空）
-		if len(price.timeRaw) > 0 && string(price.timeRaw) != "null" {
-			var tc billing.TimeCoeffConfig
-			if json.Unmarshal(price.timeRaw, &tc) == nil {
-				req.TimeConfig = &tc
-			}
-		}
-		if len(price.tiersRaw) > 0 && string(price.tiersRaw) != "null" {
-			var tiers []billing.TierRule
-			if json.Unmarshal(price.tiersRaw, &tiers) == nil {
-				req.ContextTiers = tiers
-			}
+		// 售价：v2 形状存在 → 四段价 + multipliers；否则旧三段 + 时段/分档（attachSale 内收敛）。
+		label := "结算 " + r.ledgerID
+		saleV2 = p.attachSale(&req, price, r.occurredAt, label)
+		costV2 = p.attachCost(&req, costV2Raw, costRates, r.occurredAt, label)
+		if saleV2 != nil || costV2 != nil {
+			// 任一层 v2 即四桶互斥拆分（定案②④：两层独立可配——cost-only-v2 是规划内形态，
+			// 只按售价层拆桶会让 cache_write 从成本整段消失/按错价计）。混合层的旧三段价
+			// 由 sumRates 把 CacheWrite 折回 input（历史口径=按输入价计），v2 层按 write 价。
+			req.Tokens = splitV2Usage(r)
 		}
 	} else {
 		// 未定价：照样出账单（否则这行永远占着批次头位，把后面的正常账单全部堵死）。
@@ -338,12 +429,24 @@ func (p *Poller) settleOne(ctx context.Context, r row, groups []groupNode) (sett
 	if err != nil {
 		return false, false, err
 	}
+	// v2 计价行的求值留痕（price_eval）：幂等命中（Record 未重新求值）时 Evaluated=false，
+	// 不写留痕、保留首次结算写入的值。priceEvalRaw 用 any：nil（driver.Value）才让
+	// COALESCE 不动 price_eval——[]byte(nil) 会被 database/sql 当空 []uint8 传下去，
+	// PG 侧虽然同样落 NULL，但参数形态必须在门口就钉死。
+	var priceEvalRaw any
+	if saleV2 != nil && saleV2.Evaluated() {
+		trace := billing.PriceEvalTrace(saleV2, costV2, req.Tokens, rec.RValue)
+		if b, merr := json.Marshal(trace); merr == nil {
+			priceEvalRaw = b
+		}
+	}
 	// 幂等键 + 成本兜底（没填成本价时用账本 cost；用了账本成本就把来源标成 ledger）
 	if _, err := p.db.ExecContext(ctx, `
 		UPDATE billing_records SET magpie_request_id = $1,
 		       cost_credits = CASE WHEN $2::numeric > 0 THEN $2::numeric ELSE cost_credits END,
-		       cost_source  = CASE WHEN $2::numeric > 0 THEN 'ledger' ELSE cost_source END
-		 WHERE billing_id = $3`, r.ledgerID, r.costCredits, rec.BillingID); err != nil {
+		       cost_source  = CASE WHEN $2::numeric > 0 THEN 'ledger' ELSE cost_source END,
+		       price_eval   = COALESCE($4::jsonb, price_eval)
+		 WHERE billing_id = $3`, r.ledgerID, r.costCredits, rec.BillingID, priceEvalRaw); err != nil {
 		return false, false, err
 	}
 

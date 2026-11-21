@@ -8,29 +8,34 @@ import (
 	"strings"
 )
 
-// Usage 一次调用的三段 token 用量（单位：个）。
-// 口径（全平台统一，各上游协议的 usage 归一到这里）：
-//   - Input：纯输入，不含缓存读；上游的「缓存写」token（Anthropic 的
-//     cache_creation_input_tokens、百炼显式缓存的 cache_creation_input_tokens）
-//     属于输入 token，计入本段。
+// Usage 一次调用的 token 用量（单位：个）。基线三段 + v2 增量段：
+//   - Input：纯输入，不含缓存读；**不含缓存写**（v2 计价行缓存写独立分桶后）。
+//     旧三段口径（0011）上游的「缓存写」token（Anthropic cache_creation_input_tokens、
+//     百炼显式缓存 cache_creation_input_tokens）计入本段——该口径在 v2 计价行上
+//     由 v3 结算拆出进 CacheWrite（四项定案①：token 分桶互斥，同一 token 只落一个桶）。
 //   - CacheRead：命中提示词缓存读取的输入。
+//   - CacheWrite：写缓存的 token（v2 计价行才有值；账本行来自 ledger_entries.cache_write，
+//     与 Input 互斥分桶）。omitempty：0 时不输出键，旧三段行的 JSONB 形状逐字节不变，
+//     历史行缺键按 0 计。
 //   - Output：生成 token，含推理（Anthropic 无独立推理字段，推理本就在 output 内）。
 //
 // 该结构同时是 billing_records.tokens 的 JSONB 存储值，键必须保持 snake（存储契约），
 // 对外（HTTP）一律使用 WireUsage。
 type Usage struct {
-	Input     int64 `json:"input"`
-	Output    int64 `json:"output"`
-	CacheRead int64 `json:"cache_read"`
+	Input      int64 `json:"input"`
+	Output     int64 `json:"output"`
+	CacheRead  int64 `json:"cache_read"`
+	CacheWrite int64 `json:"cache_write,omitempty"`
 }
 
 // WireUsage 是 Usage 的对外视图：JSON 键为 PascalCase（内部 API 契约），
 // 与 DB 存储（billing_records.tokens 的 snake 键）区分。仅用于 HTTP 响应/请求边界。
 // 与 Usage 之间可直接类型转换（字段同名同类型，仅 tag 不同）。
 type WireUsage struct {
-	Input     int64 `json:"Input"`
-	Output    int64 `json:"Output"`
-	CacheRead int64 `json:"CacheRead"`
+	Input      int64 `json:"Input"`
+	Output     int64 `json:"Output"`
+	CacheRead  int64 `json:"CacheRead"`
+	CacheWrite int64 `json:"CacheWrite,omitempty"`
 }
 
 // Rates 三段 token 的倍率表（倍率 = 人民币每百万 token 价格，无单位纯数字），键只能是三个 rateKey。
@@ -153,8 +158,13 @@ func ValidateRates(r Rates) error {
 // sumRates 计算三段 token×单价 之和。
 // 三段互斥（Input 为纯输入、不含缓存读），直接相加即可，
 // 不存在缓存命中 token 被输出价与缓存价重复累计的问题。
+//
+// CacheWrite 折回 input：混合层形态（售价 v2 + 成本旧三段，或反向）下 tokens 已是
+// 四桶拆分（cache_write 独立成段）；旧三段价没有 write 档，按**历史口径**把该段
+// token 以 input 价计——否则该段从成本整段消失。CacheWrite=0（全部旧路径）时 no-op，
+// 行为逐字节不变。
 func sumRates(u Usage, r Rates) float64 {
-	return float64(u.Input)*r["input"] +
+	return float64(u.Input+u.CacheWrite)*r["input"] +
 		float64(u.Output)*r["output"] +
 		float64(u.CacheRead)*r["cache_read"]
 }
