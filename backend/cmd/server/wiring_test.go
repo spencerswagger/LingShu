@@ -151,3 +151,75 @@ func TestWiring_StartupBackfillGatedByEnv(t *testing.T) {
 		t.Fatalf("缺少 envFlagOn：闸门判定必须是「非空且非 0/false/off」的保守语义")
 	}
 }
+
+// TestWiring_ComposePassesFeatureGates 部署面必须把功能闸门变量透传进 backend 容器。
+//
+// docker compose 只把 environment: 里声明的变量注入容器；.env 仅用于 ${...} 替换。
+// 事故（2026-11-23）：CALLERKEY_BACKFILL_ON_BOOT 在 main.go 被 envFlagOn 读取、注释也写了
+// 「设该变量重启」，但 compose 没声明 —— 设了也进不了容器，表现为「改了没生效」。
+// 这里钉住「代码读的闸门 = compose 声明的」这条部署契约；两个闸门默认必须为空
+// （不设置 = 关闭），防止升级镜像即静默改变线上结算/改名行为。
+func TestWiring_ComposePassesFeatureGates(t *testing.T) {
+	env := composeBackendEnv(t)
+	for _, key := range []string{
+		"V3_SETTLE_ENABLED",          // 结算链路：开=新链路，默认关=旧链路
+		"CALLERKEY_BACKFILL_ON_BOOT", // 启动存量 callerKey 改名/补建，默认关
+	} {
+		ref, ok := env[key]
+		if !ok {
+			t.Fatalf("docker-compose.yml 的 backend.environment 未声明 %s："+
+				"compose 只注入这里列出的变量，代码里的 env 判定读不到，"+
+				"按部署文档设置后重启也不会生效", key)
+		}
+		// 值必须引用同名变量且默认空（不设置即关闭）：写死字面量或给真值默认，
+		// 都会让「升级镜像」悄悄改变线上行为。
+		if !strings.Contains(ref, "${"+key+":-}") {
+			t.Fatalf("backend.environment.%s 必须是 ${%s:-}（引用同名变量、默认空=关闭），实际 %q",
+				key, key, ref)
+		}
+	}
+}
+
+// composeBackendEnv 取 docker-compose.yml 里 backend 服务 environment 段的键值。
+// 不做完整 YAML 解析：只按缩进扫 backend 块（服务在 2 空格、environment 在 4 空格、
+// 键在 6 空格），注释与空行跳过 —— 足够钉住「是否声明」这条契约。
+func composeBackendEnv(t *testing.T) map[string]string {
+	t.Helper()
+	body, err := os.ReadFile("../../../docker-compose.yml")
+	if err != nil {
+		t.Fatalf("读取 docker-compose.yml 失败: %v", err)
+	}
+	out := map[string]string{}
+	inBackend, inEnv := false, false
+	for _, raw := range strings.Split(string(body), "\n") {
+		line := strings.TrimRight(raw, "\r")
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		indent := len(line) - len(strings.TrimLeft(line, " "))
+		if indent == 2 && strings.HasSuffix(trimmed, ":") {
+			inBackend = trimmed == "backend:"
+			inEnv = false
+			continue
+		}
+		if !inBackend {
+			continue
+		}
+		if indent == 4 && strings.HasSuffix(trimmed, ":") {
+			inEnv = trimmed == "environment:"
+			continue
+		}
+		if !inEnv {
+			continue
+		}
+		if indent <= 4 {
+			inEnv = false
+			continue
+		}
+		if k, v, ok := strings.Cut(trimmed, ":"); ok {
+			out[strings.TrimSpace(k)] = strings.TrimSpace(v)
+		}
+	}
+	return out
+}
